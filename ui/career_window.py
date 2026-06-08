@@ -60,8 +60,13 @@ class CareerWindow(QDialog):
         conn = get_conn(); c = conn.cursor()
         entries  = [dict(r) for r in c.execute("SELECT * FROM career_entries ORDER BY id").fetchall()]
         trophies = [dict(r) for r in c.execute("SELECT * FROM trophy_log ORDER BY id").fetchall()]
-        promos   = [dict(r) for r in c.execute(
-            "SELECT * FROM trophy_log WHERE competition LIKE '%우승%' ORDER BY id").fetchall()]
+        my_team_names = list({e["team_name"] for e in entries})
+        if my_team_names:
+            promos = [dict(r) for r in c.execute(
+                f"SELECT * FROM promotion_log WHERE team_name IN ({','.join('?'*len(my_team_names))}) ORDER BY id",
+                my_team_names).fetchall()]
+        else:
+            promos = []
         conn.close()
 
         tabs = QTabWidget()
@@ -197,8 +202,18 @@ class CareerWindow(QDialog):
         cols = ["연도","팀명","리그","내용"]
         tbl  = self._make_table(len(promos), cols)
         for i, t in enumerate(promos):
-            for j, v in enumerate([str(t.get("year","")), t.get("team_name",""),
-                                    t.get("league_name",""), t.get("competition","")]):
-                self._set(tbl, i, j, v)
+            from_tier = t.get("from_tier", 0)
+            to_tier   = t.get("to_tier", 0)
+            if to_tier < from_tier:
+                arrow = "🔼 승격"
+                color = "#00cc44"
+            else:
+                arrow = "🔽 강등"
+                color = "#ff6666"
+            content = f"{from_tier}부 → {to_tier}부  {arrow}"
+            vals = [str(t.get("year","")), t.get("team_name",""),
+                    t.get("league_name",""), content]
+            for j, v in enumerate(vals):
+                self._set(tbl, i, j, v, color if j == 3 else None)
         lay.addWidget(tbl)
         return w

@@ -1013,6 +1013,25 @@ def generate_season_schedule(league_id, season, year, force=False):
     conn.close()
 
 
+def _generate_adjacent_schedules(my_lid, season, year):
+    """내 리그 + 같은 국가 위아래 1티어 리그 일정을 함께 생성.
+    승강 처리 시 인접 리그 순위가 필요하므로 반드시 함께 생성해야 함."""
+    generate_season_schedule(my_lid, season, year)
+    conn = get_conn()
+    c = conn.cursor()
+    row = c.execute("SELECT country_id, tier FROM leagues WHERE id=?", (my_lid,)).fetchone()
+    if row:
+        cid, tier = row["country_id"], row["tier"]
+        for adj_tier in [tier - 1, tier + 1]:
+            if adj_tier < 1: continue
+            adj = c.execute(
+                "SELECT id FROM leagues WHERE country_id=? AND tier=?",
+                (cid, adj_tier)).fetchone()
+            if adj:
+                generate_season_schedule(adj["id"], season, year)
+    conn.close()
+
+
 def get_schedule(league_id, season):
     conn = get_conn()
     c = conn.cursor()
@@ -1071,11 +1090,11 @@ def _advance_week(p, base_week):
     set_state(current_year=new_year, current_week=new_week,
               current_season=new_season)
 
-    # 새 시즌 시작 시 최신 league_id로 일정 생성 (승강 후 league_id 변경 반영)
+    # 새 시즌 시작 시 내 리그 + 인접 리그(위아래 1티어) 일정 생성
     if new_week <= 4 and p.get("current_team_id"):
         p_fresh = get_player()
         if p_fresh and p_fresh.get("current_league_id"):
-            generate_season_schedule(
+            _generate_adjacent_schedules(
                 p_fresh["current_league_id"], new_season, new_year)
 
 
@@ -1166,6 +1185,46 @@ def _process_promotion_relegation(year):
     pending_logs  = []
     my_new_league = None
 
+    # 1부 리그 우승 기록 (승강과 무관하게 1위 팀)
+    for cid in cids:
+        c.execute("SELECT id FROM leagues WHERE country_id=? AND tier=1", (cid,))
+        top_lid_row = c.fetchone()
+        if not top_lid_row:
+            continue
+        top_lid = top_lid_row["id"]
+
+        def _league_standings_1(lid, _conn=conn, _season=season):
+            cx = _conn.cursor()
+            cx.execute("SELECT id, name FROM teams WHERE league_id=?", (lid,))
+            teams = {r["id"]: {"id":r["id"],"name":r["name"],"pts":0,"gd":0,"gf":0}
+                     for r in cx.fetchall()}
+            if not teams: return []
+            cx2 = _conn.cursor()
+            cx2.execute("""SELECT home_team_id,away_team_id,home_score,away_score
+                           FROM match_results WHERE league_id=? AND season=? AND home_score>=0""",
+                        (lid, _season))
+            for row in cx2.fetchall():
+                hid,aid,hs,as_ = (row["home_team_id"],row["away_team_id"],
+                                  row["home_score"],row["away_score"])
+                for tid,gf,ga in [(hid,hs,as_),(aid,as_,hs)]:
+                    if tid not in teams: continue
+                    teams[tid]["gf"] += gf
+                    teams[tid]["gd"] += gf - ga
+                    if gf > ga:    teams[tid]["pts"] += 3
+                    elif gf == ga: teams[tid]["pts"] += 1
+            return sorted(teams.values(), key=lambda x: (-x["pts"],-x["gd"],-x["gf"]))
+
+        top1_rows = _league_standings_1(top_lid)
+        if top1_rows and top1_rows[0]["pts"] > 0 and top1_rows[0]["id"] == my_team_id:
+            ci = conn.cursor()
+            ci.execute("SELECT t.name, l.name as lname FROM teams t JOIN leagues l ON t.league_id=l.id WHERE t.id=?", (my_team_id,))
+            winner_info = ci.fetchone()
+            if winner_info:
+                c.execute("INSERT INTO trophy_log(year,team_name,league_name,tier,competition) VALUES(?,?,?,?,?)",
+                          (year, winner_info["name"], winner_info["lname"], 1,
+                           f"{winner_info['lname']} 우승 (1부 리그 챔피언)"))
+                pending_logs.append((f"🏆 {year}년  {winner_info['name']}  1부 리그 우승!", "event"))
+
     for cid in cids:
         for tier in [1, 2]:
             ntier = tier + 1
@@ -1208,8 +1267,10 @@ def _process_promotion_relegation(year):
 
             if not upper_rows or not lower_rows:
                 continue
-            # 경기 한 번도 안 한 리그 건너뜀
+            # 경기 한 번도 안 한 리그 건너뜀 (상위/하위 모두 체크)
             if upper_rows[0]["pts"] == 0 and upper_rows[-1]["pts"] == 0:
+                continue
+            if lower_rows[0]["pts"] == 0 and lower_rows[-1]["pts"] == 0:
                 continue
 
             bottom_upper = upper_rows[-1]  # 상위 리그 꼴찌
@@ -1234,7 +1295,7 @@ def _process_promotion_relegation(year):
                 my_new_league = upper_lid
                 c.execute("INSERT INTO trophy_log(year,team_name,league_name,tier,competition) VALUES(?,?,?,?,?)",
                           (year, tl_info["name"], tl_info["lname"], ntier,
-                           f"{tl_info['lname']} 우승 ({ntier}부→{tier}부)"))
+                           f"{tl_info['lname']} 우승 ({ntier}부 1위 → {tier}부 승격)"))
 
             # 강등: bottom_upper → lower
             c.execute("UPDATE teams SET league_id=?,current_tier=? WHERE id=?",
@@ -1245,6 +1306,9 @@ def _process_promotion_relegation(year):
                 pending_logs.append((f"🔽 {year}년  {bu_info['name']}  {tier}부→{ntier}부  (강등)", "event"))
             if bottom_upper["id"] == my_team_id:
                 my_new_league = lower_lid
+                c.execute("INSERT INTO trophy_log(year,team_name,league_name,tier,competition) VALUES(?,?,?,?,?)",
+                          (year, bu_info["name"], bu_info["lname"], tier,
+                           f"{bu_info['lname']} 강등 ({tier}부 꼴찌 → {ntier}부)"))
 
         # teams 전적 초기화
         c.execute("""UPDATE teams SET wins=0,draws=0,losses=0,goals_for=0,goals_against=0
@@ -1796,8 +1860,8 @@ def join_team(team_id, salary):
     # 새 팀 커리어 항목은 첫 4주 진행 시 생성 (advance_4weeks에서 처리)
     # 즉시 생성하면 입단 즉시 1~0/0주 같은 이상한 기록이 남음
 
-    # 새 리그 일정 생성 (기존 경기 보존, 내 팀 포함 경기 추가)
-    generate_season_schedule(row["lid"], st["current_season"], st["current_year"])
+    # 새 리그 일정 생성 (내 리그 + 인접 리그)
+    _generate_adjacent_schedules(row["lid"], st["current_season"], st["current_year"])
 
     # 이적 시점 이전에 이미 지나간 주차의 미완료 경기를 일괄 시뮬
     _backfill_past_matches(row["lid"], st["current_season"], cur_week, team_id)
