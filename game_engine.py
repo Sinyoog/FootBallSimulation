@@ -206,6 +206,23 @@ def create_player(name: str, position: str, sub_role: str,
 # 4주 진행
 # ═══════════════════════════════════════════
 
+def _find_open_entry(c, tid, team_name):
+    """열린 커리어 항목(end_year=0) 조회.
+    team_id 우선 매칭, 구버전 세이브(team_id=0) 행은 팀명으로 폴백.
+    (동명 팀이 여러 나라에 존재하므로 이름 단독 매칭은 금지)"""
+    row = c.execute(
+        """SELECT id FROM career_entries
+           WHERE team_id=? AND end_year=0 ORDER BY id DESC LIMIT 1""",
+        (tid,)).fetchone()
+    if row:
+        return row
+    return c.execute(
+        """SELECT id FROM career_entries
+           WHERE team_id=0 AND team_name=? AND end_year=0
+           ORDER BY id DESC LIMIT 1""",
+        (team_name,)).fetchone()
+
+
 def _calc_clean_sheets(c, tid, season):
     """해당 시즌 소속 팀의 클린시트(무실점 경기) 수 집계."""
     row = c.execute("SELECT league_id FROM teams WHERE id=?", (tid,)).fetchone()
@@ -231,9 +248,7 @@ def _update_career_stats(p, year, week):
                              WHERE t.id=?""", (tid,)).fetchone()
     if not team_row:
         conn.close(); return
-    existing = c.execute(
-        "SELECT id FROM career_entries WHERE team_name=? AND end_year=0 ORDER BY id DESC LIMIT 1",
-        (team_row["name"],)).fetchone()
+    existing = _find_open_entry(c, tid, team_row["name"])
     if not existing:
         conn.close(); return
 
@@ -273,9 +288,10 @@ def _update_career_stats(p, year, week):
 
     c.execute("""UPDATE career_entries SET
         matches=?, goals=?, assists=?, saves=?, goals_against=?,
-        avg_rating=?, team_rank=?, wins=?, draws=?, losses=?, clean_sheets=?
+        avg_rating=?, team_rank=?, wins=?, draws=?, losses=?, clean_sheets=?,
+        team_id=?
         WHERE id=?""",
-        (sm, sg, sa, ss, sga, avg_r, rn, tw, td, tl, cs, existing["id"]))
+        (sm, sg, sa, ss, sga, avg_r, rn, tw, td, tl, cs, tid, existing["id"]))
     conn.commit()
     conn.close()
 
@@ -294,9 +310,7 @@ def _close_career_entry(p, year, week):
     if not team_row:
         conn.close(); return
 
-    existing = c.execute(
-        "SELECT id FROM career_entries WHERE team_name=? AND end_year=0 ORDER BY id DESC LIMIT 1",
-        (team_row["name"],)).fetchone()
+    existing = _find_open_entry(c, tid, team_row["name"])
     if not existing:
         conn.close(); return
 
@@ -340,11 +354,11 @@ def _close_career_entry(p, year, week):
     c.execute("""UPDATE career_entries SET
         end_year=?, end_week=?, matches=?, goals=?, assists=?, saves=?, goals_against=?,
         avg_rating=?, team_rank=?, wins=?, draws=?, losses=?, clean_sheets=?,
-        league_name=?, tier=?, salary=?, position=?
+        league_name=?, tier=?, salary=?, position=?, team_id=?
         WHERE id=?""",
         (year, week, sm, sg, sa, ss, sga, avg_r, rn, tw, td, tl, cs,
          team_row["lname"], team_row["tier"], p.get("salary", 0),
-         p.get("position", ""), existing["id"]))
+         p.get("position", ""), tid, existing["id"]))
 
     conn.commit()
     conn.close()
@@ -366,9 +380,7 @@ def _ensure_career_entry(p, st):
         conn.close(); return
 
     # 이미 열린 항목 있으면 스킵
-    existing = c.execute(
-        "SELECT id FROM career_entries WHERE team_name=? AND end_year=0 LIMIT 1",
-        (team_row["name"],)).fetchone()
+    existing = _find_open_entry(c, tid, team_row["name"])
     if existing:
         conn.close(); return
 
@@ -380,12 +392,12 @@ def _ensure_career_entry(p, st):
         (age, position, team_name, league_name, tier, salary,
          start_year, start_week, end_year, end_week,
          matches, goals, assists, avg_rating, team_rank, wins, draws, losses,
-         contract_years, transfer_type)
-        VALUES (?,?,?,?,?,?,?,?,0,0,0,0,0,0,0,0,0,0,?,?)""",
+         contract_years, transfer_type, team_id)
+        VALUES (?,?,?,?,?,?,?,?,0,0,0,0,0,0,0,0,0,0,?,?,?)""",
         (p["age"], p.get("position",""), team_row["name"], team_row["lname"],
          tier_e, p.get("salary",0),
          st["current_year"], st["current_week"],
-         c_yrs_e, tt_e))
+         c_yrs_e, tt_e, tid))
     conn.commit()
     conn.close()
 
@@ -2277,20 +2289,18 @@ def _save_career_entry(p, year, week, force_new=False, transfer_type=None,
     pos = p.get("position", "")
     cs  = _calc_clean_sheets(c, tid, season)
 
-    # end_year=0인 열린 항목 찾기 (팀명으로)
-    existing = c.execute(
-        """SELECT id FROM career_entries
-           WHERE team_name=? AND end_year=0 ORDER BY id DESC LIMIT 1""",
-        (team_row["name"],)).fetchone()
+    # end_year=0인 열린 항목 찾기 (team_id 우선, 구버전 행은 이름 폴백)
+    existing = _find_open_entry(c, tid, team_row["name"])
 
     if existing:
         c.execute("""UPDATE career_entries SET
             end_year=?, end_week=?, matches=?, goals=?, assists=?, saves=?, goals_against=?,
             avg_rating=?, team_rank=?, wins=?, draws=?, losses=?, clean_sheets=?,
-            league_name=?, tier=?, salary=?, position=?
+            league_name=?, tier=?, salary=?, position=?, team_id=?
             WHERE id=?""",
             (year, week, sm, sg, sa, ss, sga, avg_r, rn, tw, td, tl, cs,
-             team_row["lname"], team_row["tier"], p.get("salary", 0), pos, existing["id"]))
+             team_row["lname"], team_row["tier"], p.get("salary", 0), pos, tid,
+             existing["id"]))
     elif not allow_insert:
         # 이미 닫힌 항목만 존재 → 중복 행 생성 방지
         conn.close()
@@ -2307,12 +2317,12 @@ def _save_career_entry(p, year, week, force_new=False, transfer_type=None,
              start_year, start_week, end_year, end_week,
              matches, goals, assists, saves, goals_against,
              avg_rating, team_rank, wins, draws, losses,
-             contract_years, transfer_type, clean_sheets)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             contract_years, transfer_type, clean_sheets, team_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (p["age"], pos, team_row["name"], team_row["lname"], saved_tier,
              p.get("salary", 0), cur_year, cur_week,
              year, week, sm, sg, sa, ss, sga, avg_r, rn, tw, td, tl,
-             c_yrs_save, pending_tt, cs))
+             c_yrs_save, pending_tt, cs, tid))
 
     conn.commit()
     conn.close()

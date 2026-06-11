@@ -146,6 +146,7 @@ def init_db():
         "ALTER TABLE career_entries ADD COLUMN contract_years INTEGER DEFAULT 0",
         "ALTER TABLE career_entries ADD COLUMN transfer_type TEXT DEFAULT '입단'",
         "ALTER TABLE career_entries ADD COLUMN clean_sheets INTEGER DEFAULT 0",
+        "ALTER TABLE career_entries ADD COLUMN team_id INTEGER DEFAULT 0",
     ]:
         try: c.execute(migration)
         except: pass
