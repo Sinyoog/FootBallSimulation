@@ -415,21 +415,34 @@ def advance_4weeks(schedule: list):
 
     for (week, stype, detail) in schedule:
         p = get_player()
+        import intl_engine
 
         # 부상 중
         if p.get("injured"):
             _process_injury_week(p, week)
-            if stype == "경기":
+            if stype == "경기" and not (isinstance(detail, dict) and detail.get("intl")):
                 _sim_my_team_match_as_ai(week, p, st["current_season"])
             else:
                 # 훈련 주차인데 내 팀 경기가 실제로 있으면 AI로 처리
                 _sim_my_unscheduled_match(week, p, st["current_season"])
+            # 내 국가대표 경기는 process_intl_week가 결장 처리로 시뮬
         elif stype == "경기":
-            _simulate_match(p, week, detail)
+            if isinstance(detail, dict) and detail.get("intl"):
+                intl_engine.simulate_my_match(week, p)
+            else:
+                _simulate_match(p, week, detail)
         else:
-            _process_training(p, week, stype, detail)
-            # 훈련으로 잡혔지만 실제 내 팀 경기가 있는 경우 AI로 처리
-            _sim_my_unscheduled_match(week, p, st["current_season"])
+            # 훈련 주차여도 토너먼트 진출로 동적으로 생긴 국대 경기가 있으면 우선
+            im = intl_engine.get_my_match(week)
+            if im:
+                intl_engine.simulate_my_match(week, p)
+            else:
+                _process_training(p, week, stype, detail)
+                # 훈련으로 잡혔지만 실제 내 팀 경기가 있는 경우 AI로 처리
+                _sim_my_unscheduled_match(week, p, st["current_season"])
+
+        # 이 주차의 국제대회 AI 경기 + 라운드 진행 처리
+        intl_engine.process_intl_week(week)
 
         # 이 주차의 다른 모든 리그 AI 경기 자동 처리
         _sim_all_ai_matches(week, p.get("current_league_id", 0), st["current_season"])
@@ -439,6 +452,12 @@ def advance_4weeks(schedule: list):
     p = get_player()
     _pay_salary(p, base_week)
     _advance_week(p, base_week)
+
+    # 진행 중 커리어 행 실시간 갱신 (열린 항목이 없으면 내부에서 무시됨)
+    p_fin = get_player()
+    if p_fin and p_fin.get("current_team_id"):
+        st_fin = get_state()
+        _update_career_stats(p_fin, st_fin["current_year"], st_fin["current_week"])
 
 
 def _sim_my_team_match_as_ai(week, p, season):
@@ -1129,6 +1148,38 @@ def _write_match_log(p, week, league_name, is_home,
 # 순위
 # ─────────────────────────────────────────
 
+def get_my_promotions():
+    """내가 실제 재직한 기간의 승강 기록 조회 (커리어 창 / 은퇴 창 공용).
+    연말(52주)까지 재직한 해의 연말 승강은 포함, 시즌 중 떠난 해의 연말 승강은 제외."""
+    conn = get_conn(); c = conn.cursor()
+    entries = c.execute(
+        "SELECT team_name, start_year, end_year, end_week FROM career_entries ORDER BY id"
+    ).fetchall()
+    conds, params = [], []
+    for e in entries:
+        tn, sy = e["team_name"], e["start_year"]
+        ey, ew = e["end_year"], e["end_week"]
+        if ey == 0:
+            conds.append("(team_name=? AND year>=?)"); params.extend([tn, sy])
+        elif ew >= 52:
+            conds.append("(team_name=? AND year>=? AND year<=?)"); params.extend([tn, sy, ey])
+        else:
+            conds.append("(team_name=? AND year>=? AND year<?)"); params.extend([tn, sy, ey])
+    promos = []
+    if conds:
+        rows = c.execute(
+            f"SELECT * FROM promotion_log WHERE {' OR '.join(conds)} ORDER BY id",
+            params).fetchall()
+        seen = set()
+        for r in rows:
+            key = (r["year"], r["team_name"], r["from_tier"], r["to_tier"])
+            if key not in seen:
+                seen.add(key)
+                promos.append(dict(r))
+    conn.close()
+    return promos
+
+
 def get_team_rank(team_id) -> str:
     if not team_id:
         return "정보 없음"
@@ -1372,6 +1423,15 @@ def _advance_week(p, base_week):
             rs_s = p_snap.get("season_rating_sum", 0.0)
             update_player(first_half_rating=round(rs_s/rc_s, 2) if rc_s else 0.0)
 
+    # 17주차 진입: 국제대회 윈도우 시작 (월드컵/대륙컵 해당 연도면 생성)
+    from constants import INTL_CALLUP_WEEK
+    if new_week == INTL_CALLUP_WEEK:
+        try:
+            import intl_engine
+            intl_engine.start_intl_tournament(new_year)
+        except Exception as e:
+            add_log(f"⚠ 국제대회 생성 오류: {e}", "event")
+
     # 새 시즌 시작 시 내 리그 + 인접 리그(위아래 1티어) 일정 생성
     if new_week <= 4 and p.get("current_team_id"):
         p_fresh = get_player()
@@ -1439,8 +1499,7 @@ def _end_of_season(p, year):
     _sim_all_leagues_for_season_end(p.get("current_season", 1))
     _process_promotion_relegation(year)
 
-    # 7. 국제대회
-    _process_intl_tournament(year)
+    # 7. (구) 연말 국제대회 일괄 시뮬 → 시즌 중 17~24주 실경기 방식으로 대체됨 (intl_engine)
 
     # 8. 계약 만료 체크
     p2 = get_player()
@@ -1613,10 +1672,12 @@ def _process_promotion_relegation(year):
             lower_lid = lower_lid_row["id"]
 
             # match_results 기반 순위 계산 - 별도 커서 사용
+            # 이 리그에서 실제 경기한 팀만 포함 (방금 승강으로 이동해온 팀이
+            # 승점 0 꼴찌로 잡혀 2↔3부 교환이 스킵되는 버그 방지)
             def _league_standings(lid, _conn=conn, _season=season):
                 cx = _conn.cursor()
                 cx.execute("SELECT id, name FROM teams WHERE league_id=?", (lid,))
-                teams = {r["id"]: {"id":r["id"],"name":r["name"],"pts":0,"gd":0,"gf":0}
+                teams = {r["id"]: {"id":r["id"],"name":r["name"],"pts":0,"gd":0,"gf":0,"gp":0}
                          for r in cx.fetchall()}
                 if not teams: return []
                 cx2 = _conn.cursor()
@@ -1628,11 +1689,13 @@ def _process_promotion_relegation(year):
                                       row["home_score"],row["away_score"])
                     for tid,gf,ga in [(hid,hs,as_),(aid,as_,hs)]:
                         if tid not in teams: continue
+                        teams[tid]["gp"] += 1
                         teams[tid]["gf"] += gf
                         teams[tid]["gd"] += gf - ga
                         if gf > ga:    teams[tid]["pts"] += 3
                         elif gf == ga: teams[tid]["pts"] += 1
-                return sorted(teams.values(), key=lambda x: (-x["pts"],-x["gd"],-x["gf"]))
+                rows = [t for t in teams.values() if t["gp"] > 0]
+                return sorted(rows, key=lambda x: (-x["pts"],-x["gd"],-x["gf"]))
 
             upper_rows = _league_standings(upper_lid)
             lower_rows = _league_standings(lower_lid)
@@ -1988,15 +2051,21 @@ def generate_offers(count=5) -> list:
     cur_week = st["current_week"] if st else 1
     offer_league_ids = list({o["league_id"] for o in offers})
 
-    if cur_week >= 5:  # 상반기 이후: 현재 시즌 시뮬
+    if cur_week >= 5:
         for lid in offer_league_ids:
-            _generate_first_half_schedule(lid, st["current_season"], st["current_year"])
+            if cur_week >= SECOND_HALF_START + 7:
+                # 36주~ 시즌 종료 후: '작년 성적'이 풀 시즌이 되도록 전체 일정 생성
+                generate_season_schedule(lid, st["current_season"], st["current_year"])
+            else:
+                # 시즌 중: 상반기 일정만 (입단 후 경기 일정 영향 방지)
+                _generate_first_half_schedule(lid, st["current_season"], st["current_year"])
             _sim_league_full(lid, st["current_season"])
     else:  # 이슈5: 1~4주차는 작년 시즌(prev_season) 결과로 rank_info 계산
         prev_season = st["current_season"] - 1 if st["current_season"] > 1 else None
         if prev_season:
             for lid in offer_league_ids:
-                _generate_first_half_schedule(lid, prev_season, st["current_year"] - 1)
+                # 작년 시즌은 끝난 시즌이므로 전체 일정 생성 + 풀 시뮬
+                generate_season_schedule(lid, prev_season, st["current_year"] - 1)
                 _sim_league_full(lid, prev_season)
 
     for offer in offers:
@@ -2027,6 +2096,10 @@ def _offer_probability(p, week: int) -> float:
         ).fetchone()
         conn2.close()
         rating = row2["avg_rating"] if row2 and row2["avg_rating"] else 6.0
+    elif week >= 36:
+        # 여름 이적시장(포스트시즌): 풀시즌 평점 사용
+        rc = p.get("season_rating_cnt",0); rs = p.get("season_rating_sum",0.0)
+        rating = round(rs/rc,2) if rc else p.get("first_half_rating", 0) or 6.0
     else:
         rating = p.get("first_half_rating", 0)
         if not rating:
@@ -2084,8 +2157,8 @@ def _get_team_rank_info(c, team_id) -> str:
     cur_season = ss["current_season"] if ss else 1
 
     # 집계할 시즌과 주차 범위 결정
-    if 12 <= cur_week <= 25:
-        # 상반기 비시즌: 이번 시즌 상반기(5~11주)만
+    if 12 <= cur_week < SECOND_HALF_START:
+        # 상반기 비시즌(미드시즌): 이번 시즌 상반기(5~11주)만
         season   = cur_season
         week_min = FIRST_HALF_START
         week_max = FIRST_HALF_START + 6
@@ -2106,8 +2179,9 @@ def _get_team_rank_info(c, team_id) -> str:
         week_max = SECOND_HALF_START + 6
         label    = "작년 성적"
     else:
-        # 37~52주(시즌 후): 직전 시즌 전체
-        season   = cur_season - 1 if cur_season > 1 else 1
+        # 36~52주(시즌 후): 방금 끝난 현재 시즌 전체
+        # (시즌 번호는 52→1주에 넘어가므로 직전 시즌 = cur_season ─ 버그 수정)
+        season   = cur_season
         week_min = FIRST_HALF_START
         week_max = SECOND_HALF_START + 6
         label    = "작년 성적"
@@ -2328,188 +2402,6 @@ def _save_career_entry(p, year, week, force_new=False, transfer_type=None,
     conn.close()
 
 
-def _process_intl_tournament(year):
-    """4년마다 월드컵 + 4년마다 대륙 대회 (오세아니아 제외, 남북미 통합)"""
-    p = get_player()
-    if not p: return
-
-    nat       = p.get("nationality", "")
-    flag      = p.get("flag", "")
-    ovr       = p.get("ovr", 40)
-    age       = p.get("age", 17)
-    tot_mat   = p.get("total_matches", 0)
-
-    conn = get_conn()
-    row = conn.execute(
-        "SELECT continent, fifa_rank, grade FROM countries WHERE name=?", (nat,)).fetchone()
-    conn.close()
-    if not row: return
-
-    continent  = row["continent"]
-    fifa_rank  = row["fifa_rank"]
-    nat_grade  = row["grade"]  # S/A/B/C/D/E/F
-
-    # 국가대표 선발 기준
-    # 1) OVR 기준 (국가 등급별)
-    SELECTION_OVR = {"S":75, "A":65, "B":55, "C":48, "D":42, "E":37, "F":32}
-    min_ovr = SELECTION_OVR.get(nat_grade, 40)
-
-    # 2) 리그 등급 기준 (강한 나라일수록 더 좋은 리그 필요)
-    # 내 현재 팀 리그 tier 확인
-    conn2 = get_conn()
-    tier_row = conn2.execute(
-        """SELECT l.tier FROM teams t JOIN leagues l ON t.league_id=l.id
-           WHERE t.id=?""", (p.get("current_team_id", 0),)).fetchone()
-    my_tier = tier_row["tier"] if tier_row else 3
-    conn2.close()
-
-    # 국가 등급별 최대 허용 리그 티어
-    MAX_TIER = {"S":1, "A":1, "B":2, "C":2, "D":3, "E":3, "F":3}
-    max_tier = MAX_TIER.get(nat_grade, 3)
-
-    # 3) 출전 경기 5경기 이상
-    selected = (ovr >= min_ovr and tot_mat >= 5 and my_tier <= max_tier)
-
-    CONTINENT_KO = {
-        "유럽": "유럽 챔피언십",
-        "남미": "남북미 대륙컵",
-        "북미": "남북미 대륙컵",
-        "아프리카": "아프리카 네이션스컵",
-        "아시아": "아시안컵",
-        "오세아니아": None,
-    }
-
-    # ── 월드컵: 1994년부터 4년마다 ──
-    if year >= 1994 and (year - 1994) % 4 == 0:
-        if selected:
-            wc_result = _sim_intl_result(ovr, age, "world", nat_grade)
-            _save_intl_trophy(nat, year, "월드컵", wc_result)
-            add_log(f"🌍 {year}년 월드컵: {wc_result}  ({flag} {nat})", "event", year, 52)
-        else:
-            _save_intl_trophy(nat, year, "월드컵", "국가대표 탈락")
-            add_log(f"📋 {year}년 월드컵: 국가대표 미선발  ({flag} {nat})", "event", year, 52)
-
-    # ── 대륙 대회: 1996년부터 4년마다, 오세아니아 제외 ──
-    cont_name = CONTINENT_KO.get(continent)
-    if cont_name and year >= 1996 and (year - 1996) % 4 == 0:
-        if selected:
-            cont_result = _sim_intl_result(ovr, age, "continent", nat_grade)
-            _save_intl_trophy(nat, year, cont_name, cont_result)
-            add_log(f"🌐 {year}년 {cont_name}: {cont_result}  ({flag} {nat})", "event", year, 52)
-        else:
-            _save_intl_trophy(nat, year, cont_name, "국가대표 탈락")
-            add_log(f"📋 {year}년 {cont_name}: 국가대표 미선발  ({flag} {nat})", "event", year, 52)
-
-
-def _sim_intl_result(ovr, age, level, nat_grade="C"):
-    """국제대회 결과 시뮬.
-
-    결과는 국가 전력(70%) + 선수 OVR 보정(15%) + 나이 보정(5%) + 운(10%)으로 결정.
-    약소국(D~F)은 선수가 OVR 100이어도 조별 탈락~16강이 현실적 한계.
-    강호국(S~A)은 선수가 부진해도 8강 이상 진출 가능.
-
-    월드컵 등급별 현실 기댓값:
-      S: 우승~4강권  A: 4강~8강권  B: 8강~16강권
-      C: 16강~본선권  D~F: 본선 실패~조별 탈락
-    """
-    # ── 1. 국가 등급 → 기준 점수 (0~1) ─────────────────────────
-    # 이 값이 결과의 핵심. 국가 자체 전력.
-    nat_score = {
-        "S": random.uniform(0.78, 0.95),
-        "A": random.uniform(0.62, 0.80),
-        "B": random.uniform(0.48, 0.65),
-        "C": random.uniform(0.35, 0.52),
-        "D": random.uniform(0.22, 0.38),
-        "E": random.uniform(0.12, 0.28),
-        "F": random.uniform(0.05, 0.20),
-    }.get(nat_grade, 0.30)
-
-    # ── 2. 선수 OVR 보정 (최대 ±0.10) ──────────────────────────
-    # OVR 65 기준. 100이면 +0.10, 40이면 -0.06
-    ovr_bonus = (ovr - 65) / 100 * 0.28
-    ovr_bonus = max(-0.06, min(0.10, ovr_bonus))
-
-    # ── 3. 나이 보정 ─────────────────────────────────────────────
-    if 24 <= age <= 30:
-        age_bonus = 0.03
-    elif age < 20:
-        age_bonus = -0.05   # 20세 미만: 경험 부족 패널티
-    elif age > 33:
-        age_bonus = -0.03
-    else:
-        age_bonus = 0.0
-
-    # ── 4. 국가 등급별 결과 상한선 ───────────────────────────────
-    # 아무리 선수가 좋아도 약소국이 넘을 수 없는 현실적 한계
-    MAX_RESULT = {
-        "S": "우승", "A": "우승",
-        "B": "4강",
-        "C": "8강",   # C등급은 최대 8강
-        "D": "16강",  # D등급은 최대 16강 (월드컵만)
-        "E": "본선 실패" if level == "world" else "8강",
-        "F": "본선 실패",
-    }
-    # 대륙컵은 상한 한 단계 완화 (약소국끼리 겨루므로)
-    if level != "world":
-        MAX_RESULT["D"] = "8강"
-        MAX_RESULT["E"] = "8강"
-        MAX_RESULT["F"] = "16강" if level != "world" else "본선 실패"
-
-    final_score = max(0.02, min(0.97, nat_score + ovr_bonus + age_bonus))
-
-    if level == "world":
-        ladder = ["우승","준우승","4강","8강","16강","본선 실패"]
-        thresholds = {
-            "우승":    0.88,
-            "준우승":  0.76,
-            "4강":     0.63,
-            "8강":     0.50,
-            "16강":    0.36,
-            "본선 실패": 0.0,
-        }
-    else:
-        ladder = ["우승","준우승","4강","8강","본선 실패"]
-        thresholds = {
-            "우승":    0.84,
-            "준우승":  0.72,
-            "4강":     0.58,
-            "8강":     0.42,
-            "본선 실패": 0.0,
-        }
-
-    # 점수로 결과 결정
-    result = ladder[-1]
-    for stage in ladder:
-        if final_score >= thresholds[stage]:
-            result = stage
-            break
-
-    # 상한선 적용: 약소국이 상한 초과 결과 나오면 한 단계 낮춤
-    max_r = MAX_RESULT.get(nat_grade, "본선 실패")
-    if max_r in ladder and ladder.index(result) > ladder.index(max_r):
-        # result가 max_r보다 낮은 성적(index 더 큼)이면 그대로
-        pass
-    elif max_r in ladder and ladder.index(result) < ladder.index(max_r):
-        # 상한 초과 → 상한으로 클리핑
-        result = max_r
-
-    return result
-
-
-def _save_intl_trophy(nat, year, competition, result):
-    conn = get_conn()
-    # 같은 연도·같은 대회 기록이 이미 있으면 중복 삽입 방지
-    existing = conn.execute(
-        "SELECT id FROM trophy_log WHERE year=? AND competition=?",
-        (year, competition)).fetchone()
-    if not existing:
-        conn.execute("""INSERT INTO trophy_log(year, team_name, league_name, tier, competition)
-                        VALUES(?,?,?,?,?)""",
-                     (year, nat, result, 0, competition))
-        conn.commit()
-    conn.close()
-
-
 def join_team(team_id, salary, transfer_type: str = "입단"):
     p = get_player()
     conn = get_conn()
@@ -2646,16 +2538,19 @@ def _sim_league_full(league_id, season):
     """오퍼 창용: 해당 리그의 현재 주차까지 미완료 경기만 AI 시뮬.
     match_results에만 결과 저장, teams 테이블은 건드리지 않음.
     (순위는 _get_team_rank_info에서 match_results 기준으로 계산)
+    과거 시즌이면 전체 주차를 시뮬 (1~4주차 '작년 성적' 계산용 ─ 버그 수정)
     """
     st = get_state()
-    cur_week = st["current_week"] if st else 11
+    cur_week   = st["current_week"]   if st else 11
+    cur_season = st["current_season"] if st else 1
+    week_cap = 99 if season < cur_season else cur_week
 
     conn = get_conn()
     c = conn.cursor()
     c.execute("""SELECT id, home_team_id, away_team_id
                  FROM match_results
                  WHERE league_id=? AND season=? AND home_score=-1 AND week<=?""",
-              (league_id, season, cur_week))
+              (league_id, season, week_cap))
     matches = c.fetchall()
 
     for m in matches:

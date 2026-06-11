@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
 
-from game_engine import get_player, fmt_money
+from game_engine import get_player, fmt_money, get_my_promotions
 from database import get_conn
 
 STYLE = """
@@ -66,43 +66,18 @@ class CareerWindow(QDialog):
         conn = get_conn(); c = conn.cursor()
         entries  = [dict(r) for r in c.execute("SELECT * FROM career_entries ORDER BY id").fetchall()]
         trophies = [dict(r) for r in c.execute("SELECT * FROM trophy_log ORDER BY id").fetchall()]
-        # 내가 그 팀에 실제로 있던 기간의 승강 기록만 조회
-        # year >= start_year AND year < end_year (end_year=0이면 현재 팀)
-        promo_conditions = []
-        promo_params = []
-        for e in entries:
-            tn = e["team_name"]
-            sy = e.get("start_year", 0)
-            ey = e.get("end_year", 0)
-            if ey == 0:  # 현재 팀
-                promo_conditions.append("(team_name=? AND year>=?)")
-                promo_params.extend([tn, sy])
-            else:
-                # 시즌 종료(승강 처리)는 그 해 연말 → year가 재직 기간 내여야 함
-                # start_year <= year < end_year (이적한 해는 새 팀 기록)
-                promo_conditions.append("(team_name=? AND year>=? AND year<?)")
-                promo_params.extend([tn, sy, ey])
-        if promo_conditions:
-            promos = [dict(r) for r in c.execute(
-                f"SELECT * FROM promotion_log WHERE {' OR '.join(promo_conditions)} ORDER BY id",
-                promo_params).fetchall()]
-            # 중복 제거
-            seen = set()
-            unique_promos = []
-            for p2 in promos:
-                key = (p2["year"], p2["team_name"], p2["from_tier"], p2["to_tier"])
-                if key not in seen:
-                    seen.add(key)
-                    unique_promos.append(p2)
-            promos = unique_promos
-        else:
-            promos = []
+        # 내가 그 팀에 실제로 있던 기간의 승강 기록 (공용 헬퍼)
+        promos = get_my_promotions()
         conn.close()
 
         tabs = QTabWidget()
         tabs.addTab(self._team_tab(entries),  "팀 이력")
         tabs.addTab(self._trophy_tab(trophies), f"수상 ({len(trophies)})")
         tabs.addTab(self._promo_tab(promos),  f"승강 ({len(promos)})")
+
+        import intl_engine
+        intl_ms = intl_engine.get_my_intl_matches()
+        tabs.addTab(self._intl_tab(intl_ms, p), f"국제전 ({len(intl_ms)})")
         root.addWidget(tabs)
         tabs.currentChanged.connect(lambda: self._fit_width())
 
@@ -160,19 +135,16 @@ class CareerWindow(QDialog):
                 league_country[ln] = f"{row['flag']} {row['cname']}" if row else ""
         conn.close()
 
-        cols = ["기간","포지션","국가","리그","팀명","연봉","출전","골/선방","어시/실점","선방률","평균평점","팀순위","승무패","계약","이적"]
+        cols = ["기간","포지션","국가","리그","팀명","연봉","출전","골","어시","선방","실점","선방률","CS","평균평점","팀순위","승무패","계약","이적"]
 
-        # 이슈3: 1~4주차에 이적해서 경기 0인 단기 항목 제거
+        # 이슈3: 1~4주차 이적 노이즈만 숨김 (4주 이하 머문 0경기 항목)
+        # 여름 이적시장(37주~) 입단처럼 경기 없이 보낸 정상 재직 기간은 표시
         def _is_empty_short(e):
-            # 경기가 0이고 종료된 항목은 숨김
-            if e.get("matches", 0) == 0 and e.get("end_year", 0) != 0:
-                return True
-            # 같은 연도 내 1주 미만 머문 빈 항목
-            sw = e.get("start_week", 1)
-            ey = e.get("end_year", 0)
-            ew = e.get("end_week", 0)
-            sy = e.get("start_year", 0)
-            return (ey != 0 and sy == ey and abs(ew - sw) <= 1 and e.get("matches", 0) == 0)
+            if e.get("end_year", 0) == 0:  return False  # 현재 팀
+            if e.get("matches", 0) != 0:   return False
+            sy = e.get("start_year", 0); ey = e.get("end_year", 0)
+            sw = e.get("start_week", 1); ew = e.get("end_week", 0)
+            return sy == ey and (ew - sw) <= 4
 
         visible = [e for e in entries if not _is_empty_short(e)]
         tbl = self._make_table(len(visible), cols)
@@ -197,27 +169,22 @@ class CareerWindow(QDialog):
 
             pos   = e.get("position","")
             is_gk = pos == "GK"
-            # CB/CDM만 클린시트+평점 표시 (LB/RB는 어시 포함이라 일반 표시)
-            DEF_POS = {"CB","CDM"}
+            # CS(클린시트)는 GK + 중앙 수비 라인(CB/CDM)만 표시
+            CS_POS = {"GK","CB","CDM"}
             sv  = e.get("saves", 0)
             ga  = e.get("goals_against", 0)
             total_shots = sv + ga
             save_rate = f"{round(sv/total_shots*100,1)}%" if total_shots > 0 else "—"
 
             if is_gk:
-                col_stat1 = f"{sv}선방"
-                col_stat2 = f"{ga}실점"
-                col_rate  = save_rate
-            elif pos in DEF_POS:
-                cs = e.get("clean_sheets", 0)
-                ar = e.get("avg_rating", 0.0)
-                col_stat1 = f"{cs}CS"
-                col_stat2 = "—"
-                col_rate  = f"{ar:.1f}평점" if ar else "—"
+                col_goal, col_asst = "—", "—"
+                col_save, col_conc = str(sv), str(ga)
+                col_rate = save_rate
             else:
-                col_stat1 = f"{e.get('goals',0)}골"
-                col_stat2 = f"{e.get('assists',0)}A"
-                col_rate  = "—"
+                col_goal = str(e.get("goals", 0))
+                col_asst = str(e.get("assists", 0))
+                col_save, col_conc, col_rate = "—", "—", "—"
+            col_cs = str(e.get("clean_sheets", 0)) if pos in CS_POS else "—"
 
             tn = e.get("team_name","")
             ln = e.get("league_name","")
@@ -234,12 +201,28 @@ class CareerWindow(QDialog):
                 prev_team = cur_team
             vals = [period, pos, country_str, league_str, tn,
                     fmt_money(e.get("salary",0)),
-                    str(e.get("matches",0)), col_stat1, col_stat2, col_rate,
+                    str(e.get("matches",0)),
+                    col_goal, col_asst, col_save, col_conc, col_rate, col_cs,
                     str(avg), f"{e.get('team_rank',0)}위", wdl, c_str, t_type]
             for j, v in enumerate(vals):
                 self._set(tbl, i, j, v)
         lay.addWidget(tbl)
         return w
+
+    def _country_of_league(self, league_name):
+        """리그명 → 국가명. 조회 결과 캐싱."""
+        if not hasattr(self, "_lc_cache"):
+            self._lc_cache = {}
+        if league_name in self._lc_cache:
+            return self._lc_cache[league_name]
+        conn = get_conn()
+        row = conn.execute("""SELECT cn.name as cname
+                              FROM leagues l JOIN countries cn ON l.country_id=cn.id
+                              WHERE l.name=? LIMIT 1""", (league_name,)).fetchone()
+        conn.close()
+        name = row["cname"] if row else ""
+        self._lc_cache[league_name] = name
+        return name
 
     def _trophy_tab(self, trophies):
         w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(0,0,0,0)
@@ -248,16 +231,29 @@ class CareerWindow(QDialog):
         cols = ["기간","팀/국가","대회","결과"]
         tbl  = self._make_table(len(trophies), cols)
         for i, t in enumerate(trophies):
-            yr  = str(t.get("year",""))
-            sw  = t.get("start_week", "")
-            ew  = t.get("end_week", "")
-            period = f"{yr}/{sw}주~{ew}주" if sw and ew else yr
+            yr     = str(t.get("year",""))
             tier_t = t.get("tier", 0)
-            tier_str = f" ({tier_t}부)" if tier_t else ""
-            comp_str = t.get("competition","")
-            result_str = t.get("league_name","") + tier_str
-            for j, v in enumerate([period, t.get("team_name",""), comp_str, result_str]):
-                self._set(tbl, i, j, v)
+            tname  = t.get("team_name","")
+            lname  = t.get("league_name","")
+
+            if tier_t and tier_t > 0:
+                # 리그 우승: 팀 (국가) / 리그 (N부) / 우승
+                country  = self._country_of_league(lname)
+                team_str = f"{tname} ({country})" if country else tname
+                comp_str = f"{lname} ({tier_t}부)"
+                result   = "우승"
+                color    = "#00cc44"
+            else:
+                # 국제대회: 국가 / 대회 / 결과
+                team_str = tname
+                comp_str = t.get('competition','')
+                result   = lname  # league_name 자리에 결과 저장됨
+                if "우승" in result:   color = "#00cc44"
+                elif "탈락" in result: color = "#ff6666"
+                else:                  color = None
+
+            for j, v in enumerate([yr, team_str, comp_str, result]):
+                self._set(tbl, i, j, v, color if j == 3 else None)
         lay.addWidget(tbl)
         return w
 
@@ -265,21 +261,61 @@ class CareerWindow(QDialog):
         w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(0,0,0,0)
         if not promos:
             lay.addWidget(QLabel("승강 기록 없음")); return w
-        cols = ["연도","팀명","리그","내용"]
+        cols = ["기간","팀/국가","대회","결과"]
         tbl  = self._make_table(len(promos), cols)
         for i, t in enumerate(promos):
             ft = t.get("from_tier", 0)
             tt = t.get("to_tier", 0)
-            if tt < ft:
-                arrow = "🔼 승격"; color = "#00cc44"
-            else:
-                arrow = "🔽 강등"; color = "#ff6666"
-            content = f"{ft}부 → {tt}부  {arrow}"
-            league_str = t.get("league_name","")
-            if ft: league_str = f"{league_str} ({ft}부)"
-            vals = [str(t.get("year","")), t.get("team_name",""),
-                    league_str, content]
+            color  = "#00cc44" if tt < ft else "#ff6666"
+            result = f"{ft}부 → {tt}부"
+            lname  = t.get("league_name","")
+            tname  = t.get("team_name","")
+            country  = self._country_of_league(lname)
+            team_str = f"{tname} ({country})" if country else tname
+            comp_str = f"{lname} ({ft}부)" if ft else lname
+            vals = [str(t.get("year","")), team_str, comp_str, result]
             for j, v in enumerate(vals):
                 self._set(tbl, i, j, v, color if j == 3 else None)
+        lay.addWidget(tbl)
+        return w
+
+    def _intl_tab(self, matches, p):
+        """국제전(A매치) 경기별 기록: 기간/포지션/국가/대회/상대/스탯/평점/스코어/결과."""
+        w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(0,0,0,0)
+        if not matches:
+            lay.addWidget(QLabel("국제전 기록 없음")); return w
+
+        # 통산 A매치 요약
+        caps = p.get("intl_caps", 0)
+        if p.get("position") == "GK":
+            sv = sum(m["saves"] for m in matches)
+            ga = sum(m["conceded"] for m in matches)
+            summary = f"통산 A매치 {caps}경기  |  선방 {sv}  실점 {ga}"
+        else:
+            summary = (f"통산 A매치 {caps}경기  |  {p.get('intl_goals',0)}골 "
+                       f"{p.get('intl_assists',0)}어시")
+        ratings = [m["rating"] for m in matches if m["rating"]]
+        if ratings:
+            summary += f"  |  평균 평점 {sum(ratings)/len(ratings):.1f}"
+        sl = QLabel(f"🌍 {summary}")
+        sl.setStyleSheet("color:#66ccff;font-size:12px;font-weight:bold;padding:4px;")
+        lay.addWidget(sl)
+
+        cols = ["기간","포지션","국가","대회","상대","골/선방","어시/실점","평점","스코어","결과"]
+        tbl = self._make_table(len(matches), cols)
+        for i, m in enumerate(matches):
+            is_gk = m["position"] == "GK"
+            stat1 = f"{m['saves']}선방"   if is_gk else f"{m['goals']}골"
+            stat2 = f"{m['conceded']}실점" if is_gk else f"{m['assists']}A"
+            res   = m["result"]
+            color = ("#00cc44" if res.startswith("승")
+                     else "#888888" if res == "무" else "#cc4444")
+            vals = [f"{m['year']} {m['week']}주차", m["position"],
+                    f"{m['nat_flag']}{m['nat']}",
+                    f"{m['comp']} {m['stage']}",
+                    f"{m['opp_flag']}{m['opp']}",
+                    stat1, stat2, str(m["rating"]), m["score"], res]
+            for j, v in enumerate(vals):
+                self._set(tbl, i, j, v, color if j == len(vals) - 1 else None)
         lay.addWidget(tbl)
         return w

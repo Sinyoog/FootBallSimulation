@@ -253,7 +253,9 @@ class NewPlayerDialog(QDialog):
         """랜덤 생성 → 바로 인게임 진입"""
         conn = get_conn()
         c = conn.cursor()
-        c.execute("SELECT id, name, flag FROM countries ORDER BY RANDOM() LIMIT 1")
+        c.execute("""SELECT id, name, flag FROM countries
+                     WHERE id IN (SELECT DISTINCT country_id FROM leagues)
+                     ORDER BY RANDOM() LIMIT 1""")  # 이름만 국가 제외
         crow = c.fetchone()
         cid, cname, cflag = crow["id"], crow["name"], crow["flag"]
         c.execute("SELECT name FROM player_names WHERE country_id=? ORDER BY RANDOM() LIMIT 1",

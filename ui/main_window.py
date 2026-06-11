@@ -315,8 +315,9 @@ class MainWindow(QMainWindow):
 # ── 유틸 ──────────────────────────────────────────────────────
 
 def _phase_label(week, lang):
-    if   1  <= week <= 4:  return "비시즌"  if lang=="ko" else "Pre-Season"
-    elif 5  <= week <= 11: return "상반기"  if lang=="ko" else "First Half"
-    elif 12 <= week <= 25: return "비시즌"  if lang=="ko" else "Mid-Season"
-    elif 26 <= week <= 32: return "하반기"  if lang=="ko" else "Second Half"
-    else:                  return "비시즌"  if lang=="ko" else "Off-Season"
+    fs, fe = SEASON_PHASES["first_half"]; ss, se = SEASON_PHASES["second_half"]
+    if   1  <= week <= 4:   return "비시즌"  if lang=="ko" else "Pre-Season"
+    elif fs <= week <= fe:  return "상반기"  if lang=="ko" else "First Half"
+    elif week < ss:         return "비시즌"  if lang=="ko" else "Mid-Season"
+    elif week <= se:        return "하반기"  if lang=="ko" else "Second Half"
+    else:                   return "비시즌"  if lang=="ko" else "Off-Season"

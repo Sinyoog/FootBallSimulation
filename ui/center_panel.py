@@ -204,14 +204,28 @@ class CenterPanel(QWidget):
             hl = self.week_hints[i]
 
             if match_info:
-                league_name = match_info.get("league_name", "")
-                loc = "홈" if match_info.get("is_home") else "원정"
-                stress_val = 5 if match_info.get("is_home") else 8
                 cb.hide()
-                hl.setText(f"스트레스 +{stress_val}")
-                if ml:
-                    ml.setText(f"⚽ {league_name}\n({loc})")
-                    ml.show()
+                if match_info.get("intl"):
+                    # 국가대표 경기 (월드컵/대륙컵)
+                    stage = match_info.get("stage_ko", "")
+                    grp   = f" {match_info['grp']}조" if match_info.get("grp") else ""
+                    opp   = f"{match_info.get('opp_flag','')}{match_info.get('opp','')}"
+                    hl.setText("스트레스 +8")
+                    if ml:
+                        ml.setText(f"🌍 {match_info['league_name']} {stage}{grp}\nvs {opp}")
+                        ml.setStyleSheet("color:#66ccff;font-weight:bold;font-size:12px;"
+                                         "background:#1a2a3a;border-radius:4px;padding:4px;")
+                        ml.show()
+                else:
+                    league_name = match_info.get("league_name", "")
+                    loc = "홈" if match_info.get("is_home") else "원정"
+                    stress_val = 5 if match_info.get("is_home") else 8
+                    hl.setText(f"스트레스 +{stress_val}")
+                    if ml:
+                        ml.setText(f"⚽ {league_name}\n({loc})")
+                        ml.setStyleSheet("color:#ffcc00;font-weight:bold;font-size:12px;"
+                                         "background:#1a3a1a;border-radius:4px;padding:4px;")
+                        ml.show()
             else:
                 if ml: ml.hide()
                 cb.show()
@@ -259,7 +273,10 @@ class CenterPanel(QWidget):
             "AND week BETWEEN ? AND ? AND (home_team_id=? OR away_team_id=?)",
             (lid, week, week+3, tid, tid)).fetchone()
         conn.close()
-        return row["n"] > 0
+        if row["n"] > 0:
+            return True
+        import intl_engine
+        return intl_engine.has_my_match_between(week, week+3)
 
     def _update_preview(self):
         total_stress = 0
@@ -319,7 +336,7 @@ class CenterPanel(QWidget):
         from constants import MIN_JOIN_AGE
 
         # 구간 경계 진입 시 자동 오퍼 플래그 리셋
-        OFFER_ZONES = [(1,4),(13,16),(17,20),(21,24)]
+        from constants import OFFER_ZONES
 
         def _which_zone(w):
             for s, e in OFFER_ZONES:
@@ -371,7 +388,10 @@ class CenterPanel(QWidget):
             "AND (home_team_id=? OR away_team_id=?) AND home_score=-1 AND season=?",
             (lid, week, tid, tid, cur_season)).fetchone()
         conn.close()
-        if not row: return None
+        if not row:
+            # 클럽 경기 없음 → 국가대표 경기 확인 (월드컵/대륙컵 윈도우)
+            import intl_engine
+            return intl_engine.get_my_match(week)
 
         return {
             "home_id":     row["home_team_id"],
@@ -576,13 +596,16 @@ class CenterPanel(QWidget):
 # ── 헬퍼 ──────────────────────────────────────────────────────
 
 def _half(week, lang):
-    if 5<=week<=11:  return "🏆 상반기"  if lang=="ko" else "🏆 First Half"
-    if 26<=week<=32: return "🏆 하반기"  if lang=="ko" else "🏆 Second Half"
+    from constants import SEASON_PHASES
+    fs, fe = SEASON_PHASES["first_half"]; ss, se = SEASON_PHASES["second_half"]
+    if fs<=week<=fe: return "🏆 상반기"  if lang=="ko" else "🏆 First Half"
+    if ss<=week<=se: return "🏆 하반기"  if lang=="ko" else "🏆 Second Half"
     return "☀ 비시즌" if lang=="ko" else "☀ Off-Season"
 
 def _phase_short(week, lang):
+    from constants import SEASON_PHASES
+    fs, fe = SEASON_PHASES["first_half"]; ss, se = SEASON_PHASES["second_half"]
     if 1<=week<=4:   return "비시즌" if lang=="ko" else "Pre"
-    if 5<=week<=11:  return "상반기" if lang=="ko" else "1st"
-    if 12<=week<=25: return "비시즌" if lang=="ko" else "Mid"
-    if 26<=week<=32: return "하반기" if lang=="ko" else "2nd"
+    if fs<=week<=fe: return "상반기" if lang=="ko" else "1st"
+    if ss<=week<=se: return "하반기" if lang=="ko" else "2nd"
     return "비시즌" if lang=="ko" else "Off"
