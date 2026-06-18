@@ -66,13 +66,19 @@ class CareerWindow(QDialog):
         conn = get_conn(); c = conn.cursor()
         entries  = [dict(r) for r in c.execute("SELECT * FROM career_entries ORDER BY id").fetchall()]
         trophies = [dict(r) for r in c.execute("SELECT * FROM trophy_log ORDER BY id").fetchall()]
+        try:
+            awards = [dict(r) for r in c.execute(
+                "SELECT * FROM awards WHERE is_mine=1 ORDER BY year").fetchall()]
+        except Exception:
+            awards = []
         # 내가 그 팀에 실제로 있던 기간의 승강 기록 (공용 헬퍼)
         promos = get_my_promotions()
         conn.close()
 
         tabs = QTabWidget()
         tabs.addTab(self._team_tab(entries),  "팀 이력")
-        tabs.addTab(self._trophy_tab(trophies), f"수상 ({len(trophies)})")
+        tabs.addTab(self._trophy_tab(trophies), f"우승 ({len(trophies)})")
+        tabs.addTab(self._award_tab(awards), f"개인 수상 ({len(awards)})")
         tabs.addTab(self._promo_tab(promos),  f"승강 ({len(promos)})")
 
         import intl_engine
@@ -153,7 +159,15 @@ class CareerWindow(QDialog):
             rc  = e.get("season_rating_cnt", 0)
             rs  = e.get("season_rating_sum", 0) or e.get("avg_rating", 0)
             avg = round(rs/rc, 1) if rc > 0 else (round(float(rs), 1) if rs else "—")
-            wdl = f"{e.get('wins',0)}승{e.get('draws',0)}무{e.get('losses',0)}패"
+            # 출전이 없으면(여름 이적시장 입단 등) 팀 순위·승무패는 그 선수의
+            # 성적이 아니므로 — 로 표시 (안 뛴 경기의 팀 기록을 본인 기록처럼
+            # 보여주지 않도록)
+            if e.get("matches", 0) > 0:
+                wdl       = f"{e.get('wins',0)}승{e.get('draws',0)}무{e.get('losses',0)}패"
+                rank_disp = f"{e.get('team_rank',0)}위"
+            else:
+                wdl       = "—"
+                rank_disp = "—"
 
             sy = e.get("start_year", ""); sw = e.get("start_week", 1)
             ey = e.get("end_year", 0);    ew = e.get("end_week", 0)
@@ -161,7 +175,10 @@ class CareerWindow(QDialog):
             if ey == 0:
                 period = f"{sy}  {sw}주~현재"
             else:
-                ew_disp = 52 if ew >= 37 else ew
+                # 실제 종료 주차를 그대로 표시. (예전엔 37주 이상이면 무조건 52로
+                # 뭉개서, 44주에 이적해도 '52주'로 잘못 보였다.) 50주 이상만
+                # 시즌 끝까지 채운 것으로 보고 52로 정리.
+                ew_disp = 52 if ew >= 50 else ew
                 if sy == ey:
                     period = f"{sy}  {sw}~{ew_disp}주"
                 else:
@@ -192,20 +209,33 @@ class CareerWindow(QDialog):
             league_str  = f"{ln} ({e.get('tier','')}부)"
 
             c_yrs  = e.get("contract_years", 0)
-            t_type = e.get("transfer_type", "입단")
+            in_type  = e.get("transfer_type", "입단")   # 들어온 경로
+            exit_t   = e.get("exit_type", "")            # 나간 경로
+            # 이적란: 나간 경로가 있으면 그걸 우선 표시(팔림/방출/이적/계약만료),
+            # 없으면(재직 중이거나 정상) 들어온 경로 표시
+            t_type = exit_t if exit_t else in_type
             cur_team = e.get("team_name", "")
-            if cur_team == prev_team:
-                c_str = "—"
-            else:
+            
+            # 계약 컬럼: 팀 변경 또는 연장 시에만 년수 표시
+            if i == 0 or cur_team != entries[i-1].get("team_name"):
+                # 팀이 바뀌었거나 첫 행 → 입단 (년수 표시)
                 c_str = f"{c_yrs}년" if c_yrs else "—"
                 prev_team = cur_team
+            elif in_type == "연장" or t_type == "연장":
+                # 같은 팀에서 연장 (연장 년수 표시)
+                c_str = f"{c_yrs}년" if c_yrs else "—"
+            else:
+                # 같은 팀 계속 (대시)
+                c_str = "—"
             vals = [period, pos, country_str, league_str, tn,
                     fmt_money(e.get("salary",0)),
                     str(e.get("matches",0)),
                     col_goal, col_asst, col_save, col_conc, col_rate, col_cs,
-                    str(avg), f"{e.get('team_rank',0)}위", wdl, c_str, t_type]
+                    str(avg), rank_disp, wdl, c_str, t_type]
+            # 팔림/방출/계약만료는 빨간색 강조
+            tt_color = "#cc4444" if t_type in ("팔림", "방출", "계약만료") else None
             for j, v in enumerate(vals):
-                self._set(tbl, i, j, v)
+                self._set(tbl, i, j, v, tt_color if j == len(vals)-1 else None)
         lay.addWidget(tbl)
         return w
 
@@ -254,6 +284,40 @@ class CareerWindow(QDialog):
 
             for j, v in enumerate([yr, team_str, comp_str, result]):
                 self._set(tbl, i, j, v, color if j == 3 else None)
+        lay.addWidget(tbl)
+        return w
+
+    def _award_tab(self, awards):
+        w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(0,0,0,0)
+        if not awards:
+            lay.addWidget(QLabel("개인 수상 기록 없음")); return w
+
+        # 수상 종류별 횟수 요약
+        from collections import Counter
+        cnt = Counter(a.get("award_type","") for a in awards)
+        order = ["발롱도르","MVP","득점왕","도움왕","베스트11","골든글러브","영플레이어"]
+        summary_parts = []
+        for k in order:
+            if cnt.get(k):
+                summary_parts.append(f"{k} {cnt[k]}회")
+        if summary_parts:
+            sl = QLabel("  ·  ".join(summary_parts))
+            sl.setStyleSheet("color:#ffcc00;font-size:14px;font-weight:bold;padding:6px;")
+            lay.addWidget(sl)
+
+        cols = ["연도","수상","리그","상세"]
+        tbl  = self._make_table(len(awards), cols)
+        icon = {"득점왕":"⚽","도움왕":"🎯","베스트11":"⭐","MVP":"🏅",
+                "발롱도르":"🏆","영플레이어":"🌟","골든글러브":"🧤"}
+        for i, a in enumerate(awards):
+            atype = a.get("award_type","")
+            label = f"{icon.get(atype,'🏅')} {atype}"
+            # 발롱도르/MVP/득점왕은 강조색
+            color = "#ffcc00" if atype in ("발롱도르","MVP") else (
+                    "#00cc44" if atype in ("득점왕","도움왕") else None)
+            vals = [str(a.get("year","")), label, a.get("league_name",""), a.get("detail","")]
+            for j, v in enumerate(vals):
+                self._set(tbl, i, j, v, color if j == 1 else None)
         lay.addWidget(tbl)
         return w
 

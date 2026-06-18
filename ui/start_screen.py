@@ -223,7 +223,7 @@ class NewPlayerDialog(QDialog):
         lay.addLayout(role_row)
         self._update_roles(POSITIONS[0])
 
-        note = QLabel("※ 국적 · 신체 · 성격 · 스탯은 자동 랜덤")
+        note = QLabel("※ 국적 · 신체 · 성격 · 특징 · 스탯은 자동 랜덤")
         note.setStyleSheet("color: #666666; font-size: 11px;")
         lay.addWidget(note)
 

@@ -48,10 +48,19 @@ QComboBox   { background-color:#2a2a2a; color:#cccccc;
               border:1px solid #444; border-radius:4px; padding:4px; }
 QComboBox QAbstractItemView { background-color:#2a2a2a; color:#cccccc;
                                selection-background-color:#3a6a3a; }
+QComboBox:disabled { color:#666; background-color:#222; }
 #stressHint { color: #888888; font-size: 10px; }
 #advBtn     { background-color:#006622; color:white; font-size:14px;
               font-weight:bold; padding:10px; border-radius:6px; border:none; }
 #advBtn:hover { background-color:#008833; }
+#modeBtn    { background-color:#333; color:#cccccc; font-size:12px;
+              font-weight:bold; padding:10px; border-radius:6px; border:1px solid #555; }
+#modeBtn:hover  { background-color:#444; }
+#modeBtn:checked { background-color:#664400; color:#ffdd88; border:1px solid #886600; }
+/* 전환 가능할 때(묶음 시작 전) 파란색으로 강조 */
+#modeBtn[switchable="true"] { background-color:#1a4d8f; color:#ffffff; border:1px solid #3a7fd5; }
+#modeBtn[switchable="true"]:hover { background-color:#2360ad; }
+#modeBtn:disabled { background-color:#2a2a2a; color:#555; border:1px solid #3a3a3a; }
 #previewBox { background-color:#252525; border:1px solid #333; border-radius:6px; }
 #actBtn     { background-color:#2a2a2a; color:#cccccc;
               border:1px solid #444; border-radius:4px; padding:6px; font-size:12px; }
@@ -59,6 +68,30 @@ QComboBox QAbstractItemView { background-color:#2a2a2a; color:#cccccc;
 #actBtn:disabled { color:#444; }
 #mgrLabel   { color: #888888; font-size: 12px; }
 QFrame#div  { background-color: #2a2a2a; }
+"""
+
+# 팝업(재계약·대표팀 선택) 공용 다크 스타일 — offer_window 톤과 통일
+_DIALOG_STYLE = """
+QDialog { background:#1e1e1e; color:#ccc; }
+QLabel  { color:#cccccc; font-size:13px; }
+#dlgHeader { color:#00cc44; font-size:15px; font-weight:bold; }
+#dlgCard   { background:#252525; border:1px solid #333; border-radius:8px; }
+#dlgSpin   { background:#2a2a2a; color:#fff; border:1px solid #444;
+             border-radius:4px; padding:6px; font-size:13px; }
+#dlgSpin::up-button, #dlgSpin::down-button { width:18px; background:#333; border:none; }
+#dlgSpin::up-arrow   { image:none; border-left:4px solid transparent; border-right:4px solid transparent;
+                       border-bottom:6px solid #aaa; }
+#dlgSpin::down-arrow { image:none; border-left:4px solid transparent; border-right:4px solid transparent;
+                       border-top:6px solid #aaa; }
+#dlgOk   { background:#2a6a2a; color:white; border:none; border-radius:6px;
+           padding:9px 14px; font-size:13px; font-weight:bold; }
+#dlgOk:hover { background:#3a8a3a; }
+#dlgNo   { background:#7a2222; color:white; border:none; border-radius:6px;
+           padding:9px 14px; font-size:13px; font-weight:bold; }
+#dlgNo:hover { background:#9a3030; }
+#dlgChoice { background:#1a4d8f; color:white; border:1px solid #3a7fd5;
+             border-radius:6px; padding:12px 14px; font-size:14px; font-weight:bold; }
+#dlgChoice:hover { background:#2360ad; }
 """
 
 
@@ -69,6 +102,13 @@ class CenterPanel(QWidget):
         self.setStyleSheet(CENTER_STYLE)
         self._join_used        = False   # 이번 달 팀 입단 버튼 사용 여부
         self._auto_offer_shown = False   # 이번 구간 자동 오퍼 표시 여부
+        # ── 1주씩 보기 상태 ──
+        # _step_mode : 1주씩 보기 on/off
+        # _locked_sched : 1주씩 진행 시작 시 고정한 4주 일정 (4개)
+        # _step_idx : 현재 묶음에서 진행한 주 수 (0~3). 0이면 묶음 시작 전.
+        self._step_mode    = False
+        self._locked_sched = None
+        self._step_idx     = 0
         self._build()
 
     # ── 빌드 ─────────────────────────────────────
@@ -123,11 +163,21 @@ class CenterPanel(QWidget):
 
         self.lay.addLayout(sched_row)
 
-        # 진행 버튼
+        # 진행 버튼 + 모드 토글
+        adv_row = QHBoxLayout(); adv_row.setSpacing(8)
         self.adv_btn = QPushButton("▶▶  이번 달 진행 (4주)")
         self.adv_btn.setObjectName("advBtn")
         self.adv_btn.clicked.connect(self._advance)
-        self.lay.addWidget(self.adv_btn)
+        adv_row.addWidget(self.adv_btn, 1)
+
+        # 1주/4주 모드 토글
+        self.btn_mode = QPushButton("📅 4주씩")
+        self.btn_mode.setObjectName("modeBtn")
+        self.btn_mode.setCheckable(True)
+        self.btn_mode.setToolTip("클릭하면 1주씩 보기 / 4주씩 보기 전환")
+        self.btn_mode.clicked.connect(self._toggle_mode)
+        adv_row.addWidget(self.btn_mode)
+        self.lay.addLayout(adv_row)
 
         # 예상 변화 박스
         pvbox = QFrame(); pvbox.setObjectName("previewBox")
@@ -187,18 +237,51 @@ class CenterPanel(QWidget):
         season = st["current_season"]
         lang   = p.get("language","ko")
 
-        phase = _half(week, lang)
-        self.lbl_phase.setText(f"{phase}  |  {year}년 {season}시즌  {week}~{week+3}주")
+        # 1주씩 모드인데 묶음 일정이 없으면(로드 직후 등) 현재 주차 기준으로 정렬.
+        # 묶음 시작은 항상 4주 경계(1,5,9…)이므로 idx = (week-1) % 4.
+        if self._step_mode and self._locked_sched is None:
+            self._step_idx = (week - 1) % 4
 
-        # 주차별 경기 여부 확인 → 경기 있으면 라벨, 없으면 콤보
+        # 표시 기준 묶음 시작 주차 = 현재주 - 진행한 주수
+        bundle_start = week - self._step_idx if self._step_mode else week
+
+        phase = _half(bundle_start, lang)
+
+        if self._step_mode:
+            done = self._step_idx
+            self.lbl_phase.setText(
+                f"{phase}  |  {year}년 {season}시즌  "
+                f"{bundle_start}~{bundle_start+3}주  (1주씩 {done}/4)")
+            self.adv_btn.setText(f"▶  1주 진행  ({done+1}/4주차)")
+        else:
+            self.lbl_phase.setText(
+                f"{phase}  |  {year}년 {season}시즌  {week}~{week+3}주")
+            self.adv_btn.setText("▶▶  이번 달 진행 (4주)")
+
+        # 주차별 표시 (프레임 4칸은 항상 [묶음 시작 ~ +3])
         for i, (f, cb) in enumerate(zip(self.week_frames, self.week_combos)):
-            w = week + i
+            w  = bundle_start + i
             ph = _phase_short(w, lang)
             labels = f.findChildren(QLabel)
             # labels[0]=주차타이틀, labels[1]=matchLabel, labels[2]=stressHint
-            if labels: labels[0].setText(f"{w}주차 [{ph}]")
 
-            match_info = self._get_match(w, p) if p.get("current_team_id") else None
+            if self._step_mode:
+                # 1주씩: 콤보 잠금(묶음 일정 고정), 진행 상태 표시
+                cb.setEnabled(False)
+                if i < self._step_idx:
+                    tag = "✓ 완료"; f.setEnabled(False)
+                elif i == self._step_idx:
+                    tag = "▶ 진행할 주"; f.setEnabled(True)
+                else:
+                    tag = "대기"; f.setEnabled(False)
+                if labels: labels[0].setText(f"{w}주차 [{ph}]  {tag}")
+            else:
+                cb.setEnabled(True)
+                f.setEnabled(True)
+                if labels: labels[0].setText(f"{w}주차 [{ph}]")
+
+            match_info = (self._get_match(w, p)
+                          if p.get("current_team_id") else None)
             # matchLabel, stressHint 찾기
             ml = next((l for l in labels if l.objectName()=="matchLabel"), None)
             hl = self.week_hints[i]
@@ -249,6 +332,14 @@ class CenterPanel(QWidget):
         self.btn_standing.setEnabled(has_team)
         self.btn_schedule.setEnabled(has_team)
 
+        # 모드 토글 버튼: 묶음 진행 중(_step_idx>0)엔 전환 불가 → 회색 비활성.
+        # 전환 가능할 때(묶음 시작 전)는 파란색으로 강조.
+        switchable = (self._step_idx == 0)
+        self.btn_mode.setEnabled(switchable)
+        self.btn_mode.setProperty("switchable", "true" if switchable else "false")
+        self.btn_mode.style().unpolish(self.btn_mode)
+        self.btn_mode.style().polish(self.btn_mode)
+
         # 경기 있는지
         has_match = self._check_match(week, p)
         self.lbl_no_match.setVisible(not has_match)
@@ -296,7 +387,29 @@ class CenterPanel(QWidget):
         self.lbl_pv_stress.setText(f"예상 스트레스: {ss}{total_stress}")
         self.lbl_pv_happy.setText(f"예상 행복도: {hs}{total_happy}")
 
-    # ── 4주 진행 ─────────────────────────────────
+    # ── 모드 토글 ────────────────────────────────
+
+    def _toggle_mode(self):
+        """1주씩 보기 ↔ 4주씩 보기 전환.
+        단, 1주씩 진행 도중(묶음 일부만 진행)에는 전환 불가."""
+        if self._step_idx > 0:
+            # 묶음 진행 중 → 전환 막고 버튼 상태 원위치
+            self.btn_mode.setChecked(self._step_mode)
+            show_toast(self, "⚠  진행 중인 4주를 끝낸 뒤 전환할 수 있습니다", "#cc6600", 1600)
+            return
+
+        self._step_mode = self.btn_mode.isChecked()
+        if self._step_mode:
+            self.btn_mode.setText("📆 1주씩")
+            show_toast(self, "🔍 1주씩 보기  —  4주 일정대로 한 주씩 진행", "#664400", 1500)
+        else:
+            self.btn_mode.setText("📅 4주씩")
+            self._locked_sched = None
+            self._step_idx     = 0
+            show_toast(self, "📅 4주씩 보기  —  한 달씩 진행", "#006622", 1400)
+        self.refresh()
+
+    # ── 진행 ─────────────────────────────────────
 
     def _advance(self):
         p  = get_player()
@@ -311,25 +424,54 @@ class CenterPanel(QWidget):
             show_toast(self, "⚠  먼저 팀에 입단해야 합니다!", "#cc6600", 1500)
             return
 
-        schedule = []
-        for i, cb in enumerate(self.week_combos):
-            w     = week + i
-            sel   = cb.currentText()
-            ttype = TRAIN_MAP_KO.get(sel, "중강도")
-            match_info = self._get_match(w, p)
-            if match_info:
-                schedule.append((w, "경기", match_info))
-            else:
-                detail = None
-                if ttype == "집중훈련":
-                    pool = FOCUS_TRAIN_STATS.get(p["position"], ALL_STATS[:3])
-                    detail = pool[0]
-                schedule.append((w, ttype, detail))
+        # ── 진행할 일정 결정 ──
+        # 4주씩 모드: 현재 콤보 4개로 일정 만들어 한 번에 진행.
+        # 1주씩 모드: 묶음 시작 시 4주 일정을 확정·고정하고,
+        #            누를 때마다 그 중 한 주만 진행. 4주 다 지나면 자동 4주 복귀.
+        def _build_4week_sched():
+            sched = []
+            for i in range(4):
+                cb    = self.week_combos[i]
+                w     = week + i
+                sel   = cb.currentText()
+                ttype = TRAIN_MAP_KO.get(sel, "중강도")
+                mi = self._get_match(w, p)
+                if mi:
+                    sched.append((w, "경기", mi))
+                else:
+                    detail = None
+                    if ttype == "집중훈련":
+                        pool = FOCUS_TRAIN_STATS.get(p["position"], ALL_STATS[:3])
+                        detail = pool[0]
+                    sched.append((w, ttype, detail))
+            return sched
+
+        if not self._step_mode:
+            # 4주 한 번에
+            schedule = _build_4week_sched()
+        else:
+            # 1주씩: 묶음 시작이면 4주 일정 확정·고정
+            if self._step_idx == 0:
+                self._locked_sched = _build_4week_sched()
+            # 고정된 일정에서 이번 주 한 개만 꺼냄
+            schedule = [self._locked_sched[self._step_idx]]
 
         advance_4weeks(schedule)
 
-        # 4주 진행 후 플래그 초기화
-        self._join_used = False
+        # ── 묶음 진행 상태 갱신 ──
+        if self._step_mode:
+            self._step_idx += 1
+            if self._step_idx >= 4:
+                # 4주 묶음 완료 → 잠금 해제, 다음 4주 묶음으로
+                self._step_idx     = 0
+                self._locked_sched = None
+
+        # 묶음(4주)이 완전히 끝났는가? (4주 모드는 항상 True)
+        bundle_done = (not self._step_mode) or (self._step_idx == 0)
+
+        # 입단 플래그는 묶음 완료 시에만 초기화
+        if bundle_done:
+            self._join_used = False
 
         p2 = get_player(); st2 = get_state()
         new_week = st2["current_week"]
@@ -345,9 +487,11 @@ class CenterPanel(QWidget):
             return None
 
         in_zone  = _which_zone(new_week)
-        prev_week = new_week - 4
+        # zone 판정: 묶음 완료면 한 달 전, 진행 중이면 직전 주 기준
+        prev_week = (new_week - 4) if bundle_done else (new_week - 1)
+        if prev_week < 1:
+            prev_week += 52
         prev_zone = _which_zone(prev_week)
-        # 새 구간에 진입했으면 리셋 (이전 구간과 다른 구간이거나 구간 밖→안)
         if in_zone and in_zone != prev_zone:
             self._auto_offer_shown = False
 
@@ -355,13 +499,19 @@ class CenterPanel(QWidget):
         if 1 <= new_week <= 4 and p2.get("age",0) >= MIN_JOIN_AGE and not p2.get("current_team_id"):
             show_toast(self, f"⭐ {st2['current_year']}년 새 시즌!  팀 입단 기간입니다", "#006622", 2000)
 
-        # 재계약 오퍼 팝업 체크
-        if p2.get("_contract_renew_offer", 0) > 0:
-            self._show_renew_dialog(p2)
+        # [복수국적] 두 나라 다 본선 진출 → 대표팀 선택 팝업 (선택 전까지 차출 보류)
+        import intl_engine
+        pend = intl_engine.get_pending_choice()
+        if pend:
+            self._show_nat_choice(pend)
 
-        # 자동 오퍼 타이밍 체크
-        if p2.get("current_team_id") and in_zone:
-            self._show_auto_offer(new_week)  # in_zone이 tuple이면 truthy
+        # 오퍼·재계약 팝업은 4주 묶음이 완료됐을 때만
+        # (1주씩 본다고 매주 오퍼가 뜨지 않음)
+        if bundle_done:
+            if p2.get("_contract_renew_offer", 0) > 0:
+                self._show_renew_dialog(p2)
+            if p2.get("current_team_id") and in_zone:
+                self._show_auto_offer(new_week)
 
         if self.main_win:
             self.main_win.refresh_all()
@@ -406,9 +556,9 @@ class CenterPanel(QWidget):
     # ── 액션 ─────────────────────────────────────
 
     def _show_renew_dialog(self, p):
-        """재계약 팝업: 연봉 확인 + 계약 기간 선택 (1~5년)."""
+        """재계약 팝업: 연봉 확인 + 계약 기간 선택 (1~5년). 게임 톤 다크 스타일."""
         from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
-                                      QLabel, QSpinBox, QPushButton)
+                                      QLabel, QSpinBox, QPushButton, QFrame)
         from game_engine import join_team, update_player, get_state
 
         offer_sal = p.get("_contract_renew_offer", 0)
@@ -420,24 +570,32 @@ class CenterPanel(QWidget):
 
         dlg = QDialog(self)
         dlg.setWindowTitle("📋 재계약 제안")
-        dlg.setMinimumWidth(320)
+        dlg.setMinimumWidth(360)
+        dlg.setStyleSheet(_DIALOG_STYLE)
         lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(18,16,18,16); lay.setSpacing(10)
 
-        lay.addWidget(QLabel(f"<b>{team_name}</b>에서 재계약을 제안합니다."))
-        lay.addWidget(QLabel(f"제시 연봉: <span style='color:#00cc44'>{offer_sal:,}만원 / 년</span>"))
-        lay.addWidget(QLabel("계약 기간을 선택하세요:"))
+        hdr = QLabel("📋 재계약 제안"); hdr.setObjectName("dlgHeader")
+        lay.addWidget(hdr)
 
+        card = QFrame(); card.setObjectName("dlgCard")
+        cl = QVBoxLayout(card); cl.setContentsMargins(14,12,14,12); cl.setSpacing(6)
+        cl.addWidget(QLabel(f"<b style='color:#fff'>{team_name}</b><span style='color:#bbb'>에서 재계약을 제안합니다.</span>"))
+        cl.addWidget(QLabel(f"<span style='color:#bbb'>제시 연봉</span>  "
+                            f"<b style='color:#00cc66'>{fmt_money(offer_sal)} / 년</b>"))
+        lay.addWidget(card)
+
+        lay.addWidget(QLabel("<span style='color:#bbb'>계약 기간을 선택하세요</span>"))
         spin = QSpinBox()
-        spin.setRange(1, 5); spin.setValue(3)
-        spin.setSuffix("년")
+        spin.setObjectName("dlgSpin")
+        spin.setRange(1, 5); spin.setValue(3); spin.setSuffix(" 년")
+        spin.setButtonSymbols(QSpinBox.ButtonSymbols.UpDownArrows)
         lay.addWidget(spin)
 
-        btn_row = QHBoxLayout()
-        btn_accept = QPushButton("✅ 수락")
-        btn_reject = QPushButton("❌ 거절 (소속 없음)")
-        btn_accept.setStyleSheet("background:#006622;color:white;padding:6px 16px;")
-        btn_reject.setStyleSheet("background:#660000;color:white;padding:6px 16px;")
-        btn_row.addWidget(btn_accept); btn_row.addWidget(btn_reject)
+        btn_row = QHBoxLayout(); btn_row.setSpacing(8)
+        btn_accept = QPushButton("✅ 수락"); btn_accept.setObjectName("dlgOk")
+        btn_reject = QPushButton("❌ 거절 (소속 없음)"); btn_reject.setObjectName("dlgNo")
+        btn_row.addWidget(btn_accept, 1); btn_row.addWidget(btn_reject, 1)
         lay.addLayout(btn_row)
 
         def _accept():
@@ -447,6 +605,13 @@ class CenterPanel(QWidget):
             from game_engine import update_player as upd
             upd(contract_years=yrs, contract_end_year=end,
                 salary=offer_sal, _contract_renew_offer=0)
+            # 재계약(연장) 흔적을 커리어 이력에 남긴다.
+            #  - 같은 팀에 계속 머무는 경우, 매 시즌 새 줄의 transfer_type이
+            #    과거 입단 경로("오퍼")로 복사돼 연장 표시가 안 됐다.
+            #  - mark_contract_extension이 '현재 시즌'의 열린 항목에 "연장"/연수를
+            #    박고, 잔류 방지용 _pending_transfer_type 처리까지 담당한다.
+            from game_engine import mark_contract_extension
+            mark_contract_extension(yrs)
             from game_engine import add_log, fmt_money
             add_log(f"✅ 재계약 완료! {yrs}년 계약  |  연봉 {fmt_money(offer_sal)}", "event")
             dlg.accept()
@@ -470,6 +635,59 @@ class CenterPanel(QWidget):
 
         btn_accept.clicked.connect(_accept)
         btn_reject.clicked.connect(_reject)
+        dlg.exec()
+
+    def _show_nat_choice(self, pend):
+        """[복수국적] 두 나라 다 본선 진출 시 대표팀 선택 팝업.
+        선택하면 그 나라로 영구 고정(A매치 출전 = cap-tie)된다."""
+        from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
+                                      QLabel, QPushButton, QFrame)
+        import intl_engine
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("🌍 대표팀 선택")
+        dlg.setMinimumWidth(380)
+        dlg.setStyleSheet(_DIALOG_STYLE)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(18,16,18,16); lay.setSpacing(10)
+
+        hdr = QLabel(f"🌍 {pend['name']} 대표팀 선택"); hdr.setObjectName("dlgHeader")
+        lay.addWidget(hdr)
+
+        info = QLabel(
+            "<span style='color:#bbb'>두 나라 모두 본선에 진출했습니다.<br>"
+            "어느 대표팀으로 뛸지 선택하세요.<br>"
+            "<b style='color:#ffcc66'>한 번 출전하면 그 나라로 영구 고정</b>되어<br>"
+            "다른 나라 대표로는 뛸 수 없습니다.</span>")
+        info.setWordWrap(True)
+        card = QFrame(); card.setObjectName("dlgCard")
+        cl = QVBoxLayout(card); cl.setContentsMargins(14,12,14,12)
+        cl.addWidget(info)
+        lay.addWidget(card)
+
+        btn_row = QHBoxLayout(); btn_row.setSpacing(8)
+
+        def _make_choice(nat):
+            def _do():
+                res = intl_engine.choose_national_team(pend["tournament_id"], nat)
+                dlg.accept()
+                if res:
+                    if res["selected"]:
+                        show_toast(self, f"🌍 {nat} 대표로 발탁되었습니다!", "#1a4d8f", 1800)
+                    else:
+                        show_toast(self, f"🌍 {nat} 대표를 선택했지만 이번엔 미발탁", "#664400", 1800)
+                if self.main_win: self.main_win.refresh_all()
+            return _do
+
+        for opt in pend["options"]:
+            b = QPushButton(f"{opt.get('flag','')} {opt['nat']}")
+            b.setObjectName("dlgChoice")
+            b.clicked.connect(_make_choice(opt["nat"]))
+            btn_row.addWidget(b, 1)
+        lay.addLayout(btn_row)
+
+        # 선택을 강제 (닫기 비활성)
+        dlg.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
         dlg.exec()
 
     def _do_join(self):

@@ -6,9 +6,10 @@ import sqlite3, os, random
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "game.db")
 
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
@@ -106,6 +107,13 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         year INTEGER, team_name TEXT, league_name TEXT,
         tier INTEGER, competition TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS awards(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        year INTEGER,
+        award_type TEXT,
+        league_name TEXT,
+        detail TEXT,
+        is_mine INTEGER DEFAULT 1)""")
     c.execute("""CREATE TABLE IF NOT EXISTS game_log(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         entry TEXT, log_type TEXT DEFAULT 'normal',
@@ -148,6 +156,9 @@ def init_db():
         my_rating REAL DEFAULT 0)""")
     c.execute("""CREATE TABLE IF NOT EXISTS meta(
         key TEXT PRIMARY KEY, value TEXT)""")
+    # 오퍼 거절 기록 (기존 코드가 참조하나 생성 누락되어 있던 테이블)
+    c.execute("""CREATE TABLE IF NOT EXISTS offer_refused(
+        team_id INTEGER, year INTEGER)""")
     # 마이그레이션: 컬럼 추가
     for migration in [
         "ALTER TABLE career_entries ADD COLUMN position TEXT DEFAULT ''",
@@ -179,12 +190,95 @@ def init_db():
         "ALTER TABLE intl_matches ADD COLUMN my_saves INTEGER DEFAULT 0",
         "ALTER TABLE intl_history ADD COLUMN caps INTEGER DEFAULT 0",
         "ALTER TABLE intl_history ADD COLUMN rating REAL DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN talent_cap INTEGER DEFAULT 88",
+        "ALTER TABLE my_player ADD COLUMN talent_tier TEXT DEFAULT 'normal'",
+        # [기능1] 이적 오퍼 맥락 — 입단 시 확정된 계약 조건 저장
+        "ALTER TABLE my_player ADD COLUMN contract_role TEXT DEFAULT '주전 경쟁'",
+        "ALTER TABLE my_player ADD COLUMN club_ambition TEXT DEFAULT '중위권 안정'",
+        "ALTER TABLE my_player ADD COLUMN appearance_bonus_k INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN goal_bonus_k INTEGER DEFAULT 0",
+        # [기능2] 감독 성향 — 현재 소속팀 감독 타입
+        "ALTER TABLE my_player ADD COLUMN manager_type TEXT DEFAULT '베테랑 신뢰'",
+        # [기능3] 능동 액션 — 이적 요청 플래그(다음 오퍼 창에 반영)
+        "ALTER TABLE my_player ADD COLUMN transfer_requested INTEGER DEFAULT 0",
+        # [커리어 보강] 각 소속의 역할·감독성향·구단야망 기록 → AI 요약 서사 재료
+        "ALTER TABLE career_entries ADD COLUMN contract_role TEXT DEFAULT ''",
+        "ALTER TABLE career_entries ADD COLUMN manager_type TEXT DEFAULT ''",
+        "ALTER TABLE career_entries ADD COLUMN club_ambition TEXT DEFAULT ''",
+        # [나간 경로] 그 팀에서 어떻게 떠났는지: ''(재직중/정상) / '팔림' / '방출' / '이적' / '계약만료'
+        "ALTER TABLE career_entries ADD COLUMN exit_type TEXT DEFAULT ''",
+        # [신체 특징] 성격과 별개의 신체 특성 (부상체질/강철체질/신체천재 등)
+        "ALTER TABLE my_player ADD COLUMN physical_trait TEXT DEFAULT '무난함'",
+        # [복수국적] 두 번째 국적/국기, 그리고 A매치 출전으로 '고정'된 대표팀.
+        #  nationality2='' 이면 단일국적(기존과 동일 동작).
+        #  intl_committed='' 이면 아직 어느 대표팀에도 묶이지 않아 자유 선택 가능.
+        "ALTER TABLE my_player ADD COLUMN nationality2 TEXT DEFAULT ''",
+        "ALTER TABLE my_player ADD COLUMN flag2 TEXT DEFAULT ''",
+        "ALTER TABLE my_player ADD COLUMN intl_committed TEXT DEFAULT ''",
+        # [복수국적] 이 대회에서 내가 '어느 나라로' 뛰는지. ''=미정/해당없음.
+        # my_selected=3 은 '둘 다 진출 → 대표팀 선택 대기' 상태를 뜻한다.
+        "ALTER TABLE intl_tournaments ADD COLUMN my_nat TEXT DEFAULT ''",
     ]:
         try: c.execute(migration)
         except: pass
     conn.commit(); conn.close()
+    remap_all_ovr()   # calc_ovr 정규화에 맞춰 기존 AI OVR 일괄 재계산 (1회성)
+    migrate_money_to_thousand()   # 금액 단위 만원→천원 전환 (1회성)
 
-# ─── 시드 ────────────────────────────────────────────────────
+
+def remap_all_ovr():
+    """calc_ovr 정규화(÷sum) 변경에 맞춰 기존 ai_players OVR을 전부 재계산.
+    meta 플래그로 1회만 실행."""
+    conn = get_conn(); c = conn.cursor()
+    try:
+        row = c.execute("SELECT value FROM meta WHERE key='ovr_remapped_v2'").fetchone()
+    except Exception:
+        row = None
+    if row:
+        conn.close(); return
+    try:
+        rows = c.execute(
+            "SELECT id, position, " + ",".join(ALL_STATS) + " FROM ai_players"
+        ).fetchall()
+        for r in rows:
+            stats = {s: r[s] for s in ALL_STATS}
+            new_ovr = calc_ovr(r["position"], stats)
+            c.execute("UPDATE ai_players SET ovr=? WHERE id=?", (new_ovr, r["id"]))
+        c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('ovr_remapped_v2','1')")
+        conn.commit()
+    except Exception as e:
+        print("remap_all_ovr 실패:", e)
+    finally:
+        conn.close()
+
+
+def migrate_money_to_thousand():
+    """금액 저장 단위를 만원→천원(×10)으로 일괄 전환. meta 플래그로 1회만.
+    기존 세이브의 salary/total_assets/total_earnings 및 커리어 salary를 보정."""
+    conn = get_conn(); c = conn.cursor()
+    try:
+        row = c.execute("SELECT value FROM meta WHERE key='money_unit_thousand'").fetchone()
+    except Exception:
+        row = None
+    if row:
+        conn.close(); return
+    try:
+        # my_player 금액 컬럼
+        c.execute("""UPDATE my_player SET
+                        salary = salary * 10,
+                        total_assets = total_assets * 10,
+                        total_earnings = total_earnings * 10
+                     WHERE id = 1""")
+        # 커리어 기록의 연봉
+        c.execute("UPDATE career_entries SET salary = salary * 10")
+        c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('money_unit_thousand','1')")
+        conn.commit()
+    except Exception as e:
+        print("migrate_money_to_thousand 실패:", e)
+    finally:
+        conn.close()
+
+
 def seed_initial_data():
     conn = get_conn(); c = conn.cursor()
     c.execute("SELECT value FROM meta WHERE key='seeded'")
@@ -201,7 +295,7 @@ def seed_initial_data():
 def reset_game_data():
     init_db()  # 마이그레이션 적용
     conn = get_conn(); c = conn.cursor()
-    for t in ["my_player","career_entries","promotion_log","trophy_log",
+    for t in ["my_player","career_entries","promotion_log","trophy_log","awards",
               "game_log","match_results","season_state",
               "intl_history","intl_tournaments","intl_entries","intl_matches"]:
         c.execute(f"DELETE FROM {t}")
@@ -228,8 +322,8 @@ ALL_STATS = ["stamina","speed","jump","shooting","passing","dribbling",
 
 def calc_ovr(position, stats):
     w = WEIGHTS.get(position, WEIGHTS["CM"])
-    total = sum(stats.get(s,40)*w.get(s,5) for s in w) / 100
-    return min(100, max(1, int(total)))
+    total = sum(stats.get(s,40)*w.get(s,5) for s in w) / sum(w.values())
+    return min(100, max(1, int(round(total))))
 
 
 # ─── 국가 데이터 (등급 자동 산정: fifa_rank 기준) ─────────────

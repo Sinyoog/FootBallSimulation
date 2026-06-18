@@ -168,17 +168,34 @@ class RetireWindow(QDialog):
         conn = get_conn(); c = conn.cursor()
         entries  = [dict(r) for r in c.execute("SELECT * FROM career_entries ORDER BY id").fetchall()]
         trophies = [dict(r) for r in c.execute("SELECT * FROM trophy_log ORDER BY id").fetchall()]
+        try:
+            awards = [dict(r) for r in c.execute(
+                "SELECT * FROM awards WHERE is_mine=1 ORDER BY year").fetchall()]
+        except Exception:
+            awards = []
         from game_engine import get_my_promotions
         promos   = get_my_promotions()
         conn.close()
+
+        # ── 개인 수상 하이라이트 (있을 때만, 최상단 강조) ──
+        if awards:
+            from collections import Counter
+            cnt = Counter(a.get("award_type","") for a in awards)
+            order = ["발롱도르","MVP","득점왕","도움왕","베스트11","골든글러브","영플레이어"]
+            parts = [f"{k} {cnt[k]}회" for k in order if cnt.get(k)]
+            hl = QLabel("🏅 " + "   ·   ".join(parts))
+            hl.setWordWrap(True)
+            hl.setStyleSheet("color:#ffcc00;font-size:15px;font-weight:bold;"
+                             "padding:10px;background:#2a2a1a;border-radius:6px;")
+            lay.addWidget(hl)
 
         # ── 팀 이력 ─────────────────────────────────
         t1 = QLabel("📋 팀 이력"); t1.setObjectName("secTitle")
         lay.addWidget(t1)
         lay.addWidget(self._team_table(entries))
 
-        # ── 수상 경력 ────────────────────────────────
-        t2 = QLabel(f"🏆 수상 경력  ({len(trophies)})")
+        # ── 우승 경력 ────────────────────────────────
+        t2 = QLabel(f"🏆 우승 경력  ({len(trophies)})")
         t2.setObjectName("secTitle")
         lay.addWidget(t2)
         lay.addWidget(self._trophy_table(trophies))
@@ -197,10 +214,21 @@ class RetireWindow(QDialog):
         lay.addWidget(t35)
         lay.addWidget(self._intl_table(intl_ms, p))
 
-        # ── AI 커리어 요약 ───────────────────────────
-        t4 = QLabel("✨ AI 커리어 스토리")
+        # ── 개인 수상 ────────────────────────────────
+        try:
+            awards = [dict(r) for r in c.execute(
+                "SELECT * FROM awards WHERE is_mine=1 ORDER BY year").fetchall()]
+        except Exception:
+            awards = []
+        t4 = QLabel(f"🥇 개인 수상  ({len(awards)})")
         t4.setObjectName("secTitle")
         lay.addWidget(t4)
+        lay.addWidget(self._award_table(awards))
+
+        # ── AI 커리어 요약 ───────────────────────────
+        t5 = QLabel("✨ AI 커리어 스토리")
+        t5.setObjectName("secTitle")
+        lay.addWidget(t5)
 
         self.story_box = QTextEdit()
         self.story_box.setObjectName("story")
@@ -250,7 +278,7 @@ class RetireWindow(QDialog):
             lbl = QLabel("기록 없음"); lbl.setStyleSheet("color:#555;")
             return lbl
 
-        cols = ["기간","포지션","팀명","리그","연봉","출전","골","어시","선방","실점","선방률","CS","평균평점","팀순위","승무패"]
+        cols = ["기간","포지션","국가","리그","팀명","연봉","출전","골","어시","선방","실점","선방률","CS","평균평점","팀순위","승무패","계약","이적"]
         # 이슈3: 단기(1~4주차 이적, 0경기) 항목 제거
         visible = [e for e in entries if not (
             e.get("start_week", 1) <= 4
@@ -260,15 +288,23 @@ class RetireWindow(QDialog):
             and e.get("matches", 0) == 0
         )]
         tbl  = self._make_table(len(visible), cols)
+        
+        prev_team = None
         for i, e in enumerate(visible):
             rc  = e.get("season_rating_cnt", 0)
             rs  = e.get("season_rating_sum", 0) or e.get("avg_rating", 0)
             avg = round(rs/rc, 1) if rc > 0 else (round(float(rs), 1) if rs else "—")
-            wdl = f"{e.get('wins',0)}승{e.get('draws',0)}무{e.get('losses',0)}패"
+            # 출전 0이면 팀 순위·승무패는 본인 성적이 아니므로 — 표시
+            if e.get("matches", 0) > 0:
+                wdl       = f"{e.get('wins',0)}승{e.get('draws',0)}무{e.get('losses',0)}패"
+                rank_disp = f"{e.get('team_rank',0)}위"
+            else:
+                wdl       = "—"
+                rank_disp = "—"
 
             sy = e.get("start_year",""); sw = e.get("start_week", 1)
             ey = e.get("end_year","");   ew = e.get("end_week", 52)
-            period = f"{sy}/{sw}주~{ey}/{ew}주" if sy != ey else f"{sy}  {sw}~{ew}주"
+            period = f"{sy} {sw}~{ew}주" if sy == ey else f"{sy} {sw}~{ey} {ew}주"
 
             pos   = e.get("position","")
             is_gk = pos == "GK"
@@ -287,14 +323,36 @@ class RetireWindow(QDialog):
                 col_asst = str(e.get("assists", 0))
                 col_save, col_conc, col_rate = "—", "—", "—"
             col_cs = str(e.get("clean_sheets", 0)) if pos in CS_POS else "—"
+            
+            # 계약 컬럼: 팀 변경 또는 연장 시에만 년수 표시
+            cur_team = e.get("team_name", "")
+            c_yrs = e.get("contract_years", 0)
+            exit_t = e.get("exit_type", "")
+            in_type = e.get("transfer_type", "입단")
+            t_type = exit_t if exit_t else in_type
+            
+            if i == 0 or cur_team != visible[i-1].get("team_name"):
+                # 팀이 바뀌었거나 첫 행 → 입단 (년수 표시)
+                c_str = f"{c_yrs}년" if c_yrs else "—"
+                prev_team = cur_team
+            elif in_type == "연장" or t_type == "연장":
+                # 같은 팀에서 연장 (연장 년수 표시)
+                c_str = f"{c_yrs}년" if c_yrs else "—"
+            else:
+                # 같은 팀 계속 (대시)
+                c_str = "—"
+            
+            # 이적 컬럼
+            tt_color = "#cc4444" if t_type in ("팔림", "방출", "계약만료") else None
 
             vals = [period, pos,
+                    e.get("league_name", "")[:2] if e.get("league_name","") else "—",  # 국가 약자
+                    e.get("league_name",""),
                     e.get("team_name",""),
-                    f"{e.get('league_name','')} ({e.get('tier','')}부)",
                     fmt_money(e.get("salary",0)),
                     str(e.get("matches",0)),
                     col_goal, col_asst, col_save, col_conc, col_rate, col_cs,
-                    str(avg), f"{e.get('team_rank',0)}위", wdl]
+                    str(avg), rank_disp, wdl, c_str, t_type]
             for j, v in enumerate(vals):
                 self._set_item(tbl, i, j, v)
         tbl.resizeColumnsToContents()
@@ -309,14 +367,101 @@ class RetireWindow(QDialog):
         cols = ["기간","팀/국가","대회","결과"]
         tbl  = self._make_table(len(trophies), cols)
         for i, t in enumerate(trophies):
-            yr = str(t.get("year",""))
-            for j, v in enumerate([yr, t.get("team_name",""),
-                                    t.get("competition",""), t.get("league_name","")]):
-                self._set_item(tbl, i, j, v)
+            yr     = str(t.get("year",""))
+            tier_t = t.get("tier", 0)
+            tname  = t.get("team_name","")
+            lname  = t.get("league_name","")
+
+            if tier_t and tier_t > 0:
+                # 리그 우승: 팀 (국가) / 리그 (N부) / 우승
+                country  = self._country_of_league(lname)
+                team_str = f"{tname} ({country})" if country else tname
+                comp_str = f"{lname} ({tier_t}부)"
+                result   = "우승"
+                color    = "#00cc44"
+            else:
+                # 국제대회: 국가 / 대회 / 결과
+                team_str = tname
+                comp_str = t.get('competition','')
+                result   = lname  # league_name 자리에 결과 저장됨
+                if "우승" in result:   color = "#00cc44"
+                elif "탈락" in result: color = "#cc6666"
+                else:                  color = None
+
+            for j, v in enumerate([yr, team_str, comp_str, result]):
+                self._set_item_colored(tbl, i, j, v, color if j == 3 else None)
         tbl.resizeColumnsToContents()
         tbl.resizeRowsToContents()
-        tbl.setFixedHeight(30 + min(len(trophies), 5) * 28)
+        tbl.setFixedHeight(30 + min(len(trophies), 7) * 28)
         return tbl
+    
+    def _country_of_league(self, league_name):
+        """리그명에서 국가 정보 추출 (캐시됨)"""
+        if not hasattr(self, '_lc_cache'):
+            self._lc_cache = {}
+        if league_name in self._lc_cache:
+            return self._lc_cache[league_name]
+        conn = get_conn()
+        row = conn.execute("""SELECT cn.flag, cn.name as cname
+                             FROM leagues l JOIN countries cn ON l.country_id=cn.id
+                             WHERE l.name=? LIMIT 1""", (league_name,)).fetchone()
+        conn.close()
+        name = f"{row['flag']} {row['cname']}" if row else ""
+        self._lc_cache[league_name] = name
+        return name
+    
+    def _set_item_colored(self, tbl, row, col, val, color=None):
+        """색상이 들어갈 수 있는 _set_item"""
+        item = QTableWidgetItem(str(val))
+        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        if color:
+            item.setForeground(QColor(color))
+        tbl.setItem(row, col, item)
+
+    def _award_table(self, awards):
+        """개인 수상 테이블"""
+        if not awards:
+            lbl = QLabel("개인 수상 기록 없음"); lbl.setStyleSheet("color:#555;")
+            return lbl
+        
+        # 수상 종류별 횟수 요약
+        from collections import Counter
+        cnt = Counter(a.get("award_type","") for a in awards)
+        order = ["발롱도르","MVP","득점왕","도움왕","베스트11","골든글러브","영플레이어","신데렐라","푸스카스상","사모라상"]
+        summary_parts = []
+        for k in order:
+            if cnt.get(k):
+                summary_parts.append(f"{k} {cnt[k]}회")
+        
+        frame = QFrame()
+        fl = QVBoxLayout(frame); fl.setContentsMargins(0,0,0,0)
+        
+        if summary_parts:
+            sl = QLabel("  ·  ".join(summary_parts))
+            sl.setStyleSheet("color:#ffcc00;font-size:14px;font-weight:bold;padding:6px;")
+            fl.addWidget(sl)
+        
+        cols = ["연도","수상","리그","상세"]
+        tbl  = self._make_table(len(awards), cols)
+        icon = {"득점왕":"⚽","도움왕":"🎯","베스트11":"⭐","MVP":"🏅",
+                "발롱도르":"🏆","영플레이어":"🌟","골든글러브":"🧤",
+                "신데렐라":"✨","푸스카스상":"💥","사모라상":"🛡️"}
+        
+        for i, a in enumerate(awards):
+            atype = a.get("award_type","")
+            label = f"{icon.get(atype,'🏅')} {atype}"
+            # 발롱도르/MVP는 황금색, 주요 상은 녹색
+            color = "#ffcc00" if atype in ("발롱도르","MVP") else (
+                    "#00cc44" if atype in ("득점왕","도움왕","베스트11") else None)
+            vals = [str(a.get("year","")), label, a.get("league_name",""), a.get("detail","")]
+            for j, v in enumerate(vals):
+                self._set_item_colored(tbl, i, j, v, color if j == 1 else None)
+        
+        fl.addWidget(tbl)
+        tbl.resizeColumnsToContents()
+        tbl.resizeRowsToContents()
+        tbl.setFixedHeight(30 + min(len(awards), 7) * 28)
+        return frame
 
     def _promo_table(self, promos):
         if not promos:
@@ -390,12 +535,17 @@ class RetireWindow(QDialog):
         conn = get_conn()
         entries  = [dict(r) for r in conn.execute("SELECT * FROM career_entries ORDER BY id").fetchall()]
         trophies = [dict(r) for r in conn.execute("SELECT * FROM trophy_log ORDER BY id").fetchall()]
+        try:
+            awards = [dict(r) for r in conn.execute(
+                "SELECT * FROM awards WHERE is_mine=1 ORDER BY year").fetchall()]
+        except Exception:
+            awards = []
         conn.close()
 
         lines = []
         lines.append(f"【 {p['name']} 선수 커리어 요약 】")
         lines.append(f"국적: {p.get('flag','')} {p['nationality']}  |  포지션: {p['position']} ({p.get('sub_role','')})")
-        lines.append(f"성격: {p.get('personality','')}  |  은퇴 나이: {p['age']}세  |  최종 OVR: {p.get('ovr',0)}")
+        lines.append(f"성격: {p.get('personality','')}  |  특징: {p.get('physical_trait','무난함')}  |  은퇴 나이: {p['age']}세  |  최종 OVR: {p.get('ovr',0)}")
         lines.append("")
 
         # 팀 이력
@@ -413,19 +563,50 @@ class RetireWindow(QDialog):
                 avg = round(ar, 1) if ar else "—"
                 tier = e.get("tier","")
                 lines.append(f"  • {period}  {e.get('team_name','')} ({e.get('league_name','')} / {tier}부)")
-                lines.append(f"    출전 {m}경기  {g}골  {a}어시  평점 {avg}  팀순위 {e.get('team_rank',0)}위")
+                if m > 0:
+                    lines.append(f"    출전 {m}경기  {g}골  {a}어시  평점 {avg}  팀순위 {e.get('team_rank',0)}위")
+                else:
+                    lines.append(f"    출전 0경기 (입단만, 출전 없음)")
+                # [커리어 보강] 역할/감독/구단야망 — 있으면 한 줄 더
+                ctx = []
+                if e.get("contract_role"):  ctx.append(f"역할 {e['contract_role']}")
+                if e.get("manager_type"):   ctx.append(f"감독 {e['manager_type']}")
+                if e.get("club_ambition"):  ctx.append(f"구단목표 {e['club_ambition']}")
+                tt = e.get("transfer_type")
+                if tt and tt not in ("입단",): ctx.append(f"({tt})")
+                if ctx:
+                    lines.append("    └ " + "  ·  ".join(ctx))
         else:
             lines.append("  기록 없음")
         lines.append("")
 
-        # 수상 (리그 우승 등 ─ 국제대회는 아래 국가대표 섹션에서)
+        # 팀 우승 (리그 우승 등 ─ 국제대회는 아래 국가대표 섹션에서)
         league_trophies = [t for t in trophies if t.get('tier', 0) != 0]
-        lines.append(f"▶ 수상 경력  ({len(league_trophies)}건)")
+        lines.append(f"▶ 팀 우승  ({len(league_trophies)}건)")
         if league_trophies:
             for t in league_trophies:
                 comp   = t.get('competition', '')
                 nation = t.get('team_name', '')
                 lines.append(f"  🏆 {t.get('year','')}년  {comp}  ({nation})")
+        else:
+            lines.append("  없음")
+        lines.append("")
+
+        # 개인 영예 (득점왕/베스트11/발롱도르 등)
+        lines.append(f"▶ 개인 영예  ({len(awards)}건)")
+        if awards:
+            from collections import Counter
+            cnt = Counter(a.get("award_type","") for a in awards)
+            order = ["발롱도르","MVP","득점왕","도움왕","베스트11","골든글러브","영플레이어"]
+            summ = [f"{k} {cnt[k]}회" for k in order if cnt.get(k)]
+            if summ:
+                lines.append("  ★ " + "  ·  ".join(summ))
+            icon = {"득점왕":"⚽","도움왕":"🎯","베스트11":"⭐","MVP":"🏅",
+                    "발롱도르":"🏆","영플레이어":"🌟","골든글러브":"🧤"}
+            for a in awards:
+                at = a.get("award_type","")
+                lines.append(f"  {icon.get(at,'🏅')} {a.get('year','')}년  {at}  "
+                             f"({a.get('league_name','')}, {a.get('detail','')})")
         else:
             lines.append("  없음")
         lines.append("")

@@ -158,6 +158,7 @@ class PlayerPanel(QWidget):
             ("리그",   league_name),
             ("포지션", p["position"]),
             ("성격",   p["personality"]),
+            ("특징",   p.get("physical_trait", "무난함")),
             ("신체",   f"{p['height']}cm / {p['weight']}kg"),
             ("명성",   f"{p.get('fame',0)} [{fame_lbl}]"),
             ("인기도", str(p.get("popularity",0))),

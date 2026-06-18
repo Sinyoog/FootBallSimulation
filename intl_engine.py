@@ -53,6 +53,75 @@ def get_tournament(year):
     return dict(row) if row else None
 
 
+def get_pending_choice():
+    """[복수국적] 대표팀 선택이 필요한 대회가 있으면 정보 반환, 없으면 None.
+    (둘 다 본선 진출 + 아직 미고정 + 21세 이하 → my_selected==3)"""
+    from game_engine import get_state, get_player
+    st = get_state(); p = get_player()
+    if not st or not p:
+        return None
+    t = get_tournament(st["current_year"])
+    if not t or t.get("my_selected") != 3:
+        return None
+    
+    # 21세 이후는 국가 선택 불가 (주어진 국적으로 자동 고정)
+    age = st.get("current_year", 0) - p.get("birth_year", 0)
+    if age > 21:
+        return None
+    
+    nat1 = p.get("nationality", "") or ""
+    nat2 = p.get("nationality2", "") or ""
+    conn = get_conn()
+    entry_names = {r["country"] for r in conn.execute(
+        "SELECT country FROM intl_entries WHERE tournament_id=?", (t["id"],)).fetchall()}
+    opts = []
+    for n in (nat1, nat2):
+        if n and n in entry_names:
+            fr = conn.execute("SELECT flag FROM intl_entries WHERE tournament_id=? AND country=?",
+                              (t["id"], n)).fetchone()
+            opts.append({"nat": n, "flag": fr["flag"] if fr else ""})
+    conn.close()
+    if len(opts) < 2:
+        return None
+    return {"tournament_id": t["id"], "name": t["name"],
+            "year": t["year"], "options": opts}
+
+
+def choose_national_team(tournament_id, nat):
+    """[복수국적] 대표팀 선택 확정 → 그 나라로 고정하고 대회 출전국 설정.
+    선발 판정을 다시 수행해 my_selected를 1(선발)/0(미선발)로 갱신."""
+    from game_engine import get_player, update_player
+    p = get_player()
+    if not p:
+        return None
+    conn = get_conn()
+    grow = conn.execute("SELECT grade FROM countries WHERE name=?", (nat,)).fetchone()
+    grade = grow["grade"] if grow else "F"
+    conn.close()
+
+    # 이 선택으로 영구 고정 (이후 모든 대회에서 이 나라로만)
+    update_player(intl_committed=nat)
+
+    p = get_player()
+    selected = _check_selection(p, grade)
+    my_sel = 1 if selected else 0
+    conn = get_conn()
+    conn.execute("UPDATE intl_tournaments SET my_nat=?, my_selected=? WHERE id=?",
+                 (nat, my_sel, tournament_id))
+    conn.commit(); conn.close()
+    return {"nat": nat, "selected": selected}
+
+
+def _my_nat(t, p):
+    """[복수국적] 이 대회에서 내가 뛰는 나라.
+    대회에 저장된 my_nat 우선, 없으면(구 세이브) 주 국적으로 폴백."""
+    if t:
+        mn = t.get("my_nat") if isinstance(t, dict) else t["my_nat"]
+        if mn:
+            return mn
+    return (p.get("nationality", "") if p else "") or ""
+
+
 def _active_tournament():
     from game_engine import get_state
     st = get_state()
@@ -74,7 +143,7 @@ def get_my_match(week):
     t = get_tournament(st["current_year"])
     if not t or t["status"] == "done" or t["my_selected"] != 1:
         return None
-    nat = p.get("nationality", "")
+    nat = _my_nat(t, p)
     conn = get_conn()
     m = conn.execute(
         """SELECT * FROM intl_matches
@@ -131,13 +200,28 @@ def start_intl_tournament(year):
     if get_tournament(year):
         return  # 중복 생성 방지
 
-    nat = p.get("nationality", "")
+    # [복수국적] 내 국적 목록 (1~2개). committed(고정)되어 있으면 그 나라만.
+    nat1 = p.get("nationality", "") or ""
+    nat2 = p.get("nationality2", "") or ""
+    committed = p.get("intl_committed", "") or ""
+    if committed:
+        my_nats = [committed]
+    else:
+        my_nats = [n for n in (nat1, nat2) if n]
+
     conn = get_conn()
+    # 대회 종류(월드컵/대륙컵)는 '주 국적'의 대륙 기준으로 결정 (기존 동작 유지).
     nrow = conn.execute(
-        "SELECT continent, grade, flag FROM countries WHERE name=?", (nat,)).fetchone()
-    conn.close()
+        "SELECT continent, grade, flag FROM countries WHERE name=?", (nat1,)).fetchone()
     my_continent = nrow["continent"] if nrow else "유럽"
-    my_grade = nrow["grade"] if nrow else "F"
+    # 각 국적의 대륙/등급 조회
+    nat_info = {}
+    for n in my_nats:
+        r = conn.execute(
+            "SELECT continent, grade FROM countries WHERE name=?", (n,)).fetchone()
+        if r:
+            nat_info[n] = {"continent": r["continent"], "grade": r["grade"]}
+    conn.close()
 
     if is_wc:
         kind, name = "world", "월드컵"
@@ -149,19 +233,29 @@ def start_intl_tournament(year):
         entries = _qualify_continental(my_continent)
         n_groups = CONT_GROUPS
 
-    qualified = any(e["name"] == nat for e in entries)
+    entry_names = {e["name"] for e in entries}
+    # 이번 대회에 '본선 진출'한 내 국적들 (대륙컵이면 그 대륙 소속만 해당)
+    qualified_nats = [n for n in my_nats if n in entry_names]
 
-    # 내 선발 여부
-    selected = False
-    if qualified:
-        selected = _check_selection(p, my_grade)
-
-    my_sel = 1 if selected else (0 if qualified else 2)
+    # 출전국/선발 결정
+    #  - 진출국 0개 → 출전 없음(my_sel=2)
+    #  - 진출국 1개 → 그 나라로 출전, 선발 판정
+    #  - 진출국 2개(아직 미고정) → 대표팀 선택 대기(my_sel=3)
+    my_nat = ""
+    if len(qualified_nats) == 0:
+        my_sel = 2
+    elif len(qualified_nats) == 1:
+        my_nat = qualified_nats[0]
+        grade = nat_info.get(my_nat, {}).get("grade", "F")
+        my_sel = 1 if _check_selection(p, grade) else 0
+    else:
+        # 둘 다 진출 + 아직 어느 대표팀에도 안 묶임 → 선택 대기
+        my_sel = 3
 
     conn = get_conn()
     c = conn.cursor()
-    c.execute("""INSERT INTO intl_tournaments(year, kind, name, status, my_selected)
-                 VALUES(?,?,?,?,?)""", (year, kind, name, "group", my_sel))
+    c.execute("""INSERT INTO intl_tournaments(year, kind, name, status, my_selected, my_nat)
+                 VALUES(?,?,?,?,?,?)""", (year, kind, name, "group", my_sel, my_nat))
     tid = c.lastrowid
 
     # 포트 추첨: 전력순 4개 포트 → 조마다 포트별 1팀
@@ -186,7 +280,12 @@ def start_intl_tournament(year):
         for g, members in groups.items():
             for hi, ai in pairs:
                 home, away = members[hi], members[ai]
-                is_my = 1 if nat in (home["name"], away["name"]) else 0
+                # 내가 이 대회에서 뛰는 나라(my_nat)가 끼면 내 경기로 표시.
+                # 아직 선택 대기(my_sel=3)면 두 국적 다 내 경기 후보로 표시.
+                if my_nat:
+                    is_my = 1 if my_nat in (home["name"], away["name"]) else 0
+                else:
+                    is_my = 1 if (home["name"] in my_nats or away["name"] in my_nats) else 0
                 c.execute("""INSERT INTO intl_matches
                              (tournament_id, stage, grp, week, home, away,
                               home_score, away_score, is_my, slot)
@@ -198,19 +297,41 @@ def start_intl_tournament(year):
     # ── 로그 ──
     add_log("─" * 44, "sep")
     add_log(f"🌍 {year}년 {name} 개막!  본선 {len(entries)}개국", "event", year, INTL_CALLUP_WEEK)
-    if qualified:
-        my_g = next(g for g, ms in groups.items() if any(m["name"] == nat for m in ms))
-        mates = [f"{m['flag']}{m['name']}" for m in groups[my_g] if m["name"] != nat]
-        add_log(f"   {nrow['flag'] if nrow else ''}{nat} {my_g}조 편성  (vs {', '.join(mates)})",
-                "event", year, INTL_CALLUP_WEEK)
-        if selected:
+
+    if my_sel == 3:
+        # 둘 다 진출 → 대표팀 선택 대기
+        nat_list = " / ".join(qualified_nats)
+        add_log(f"   🌍 복수국적 발탁 가능! {nat_list} 중 대표팀을 선택하세요", "event", year, INTL_CALLUP_WEEK)
+    elif my_nat:
+        # 출전국 확정 (진출국 1개)
+        _flag = ""
+        _grow = _country_flag(my_nat)
+        try:
+            my_g = next(g for g, ms in groups.items() if any(m["name"] == my_nat for m in ms))
+            mates = [f"{m['flag']}{m['name']}" for m in groups[my_g] if m["name"] != my_nat]
+            add_log(f"   {_grow}{my_nat} {my_g}조 편성  (vs {', '.join(mates)})",
+                    "event", year, INTL_CALLUP_WEEK)
+        except StopIteration:
+            pass
+        if my_sel == 1:
             add_log(f"   📣 국가대표 소집! 조별리그 {w0}~{w0+2}주차", "event", year, INTL_CALLUP_WEEK)
         else:
             add_log("   📋 국가대표 미선발... 대표팀 경기를 지켜봅니다", "event", year, INTL_CALLUP_WEEK)
-            _save_trophy(year, nat, name, "국가대표 미선발")
+            _save_trophy(year, my_nat, name, "국가대표 미선발")
     else:
-        add_log(f"   📋 {nat}, 예선 탈락으로 본선 진출 실패", "event", year, INTL_CALLUP_WEEK)
-        _save_trophy(year, nat, name, "예선 탈락")
+        # 진출국 없음
+        none_nat = my_nats[0] if my_nats else ""
+        add_log(f"   📋 {none_nat}, 예선 탈락으로 본선 진출 실패", "event", year, INTL_CALLUP_WEEK)
+        if none_nat:
+            _save_trophy(year, none_nat, name, "예선 탈락")
+
+
+def _country_flag(name):
+    """국가 국기 조회 (없으면 빈 문자열)."""
+    conn = get_conn()
+    r = conn.execute("SELECT flag FROM countries WHERE name=?", (name,)).fetchone()
+    conn.close()
+    return r["flag"] if r else ""
 
 
 def _check_selection(p, my_grade):
@@ -382,7 +503,7 @@ def _sim_ai_match(t, m, my_played=False):
 
     # 내 국가 경기(결장 포함)는 로그 출력
     p = get_player()
-    nat = p.get("nationality", "") if p else ""
+    nat = _my_nat(t, p)
     if m["is_my"] and nat in (m["home"], m["away"]):
         stage_ko = STAGE_KO.get(m["stage"], "")
         pso_txt = f"  (승부차기 {pso_score})" if pso_winner else ""
@@ -416,7 +537,12 @@ def simulate_my_match(week, p):
                           (info["match_id"],)).fetchone())
     conn.close()
 
-    nat = p.get("nationality", "")
+    nat = _my_nat(t, p)
+    # [복수국적] A매치 첫 출전 → 그 나라로 영구 고정(cap-tie).
+    # 이후 대회부터는 이 나라로만 차출된다.
+    if nat and not (p.get("intl_committed", "") or ""):
+        from game_engine import update_player as _upd
+        _upd(intl_committed=nat)
     he = _entry(t["id"], m["home"])
     ae = _entry(t["id"], m["away"])
     is_home = info["is_home"]
@@ -555,7 +681,7 @@ def _finalize_groups(t, next_stage, next_week):
         pairs.append((firsts[g2], seconds[g1]))
 
     p = get_player()
-    nat = p.get("nationality", "") if p else ""
+    nat = _my_nat(t, p)
     for slot, (home, away) in enumerate(pairs):
         is_my = 1 if nat in (home, away) else 0
         c.execute("""INSERT INTO intl_matches
@@ -587,7 +713,7 @@ def _advance_knockout(t, week, next_stage, next_week):
         return
 
     p = get_player()
-    nat = p.get("nationality", "") if p else ""
+    nat = _my_nat(t, p)
     cur_stage_ko = STAGE_KO.get(cur[0]["stage"], "")
 
     winners = []
@@ -647,7 +773,7 @@ def _finish_tournament(t, final_week):
     add_log(f"🏆 {t['name']} 우승: {we['flag']}{winner}!", "event")
 
     p = get_player()
-    nat = p.get("nationality", "") if p else ""
+    nat = _my_nat(t, p)
     if nat == winner:
         _record_my_exit(t, "우승")
     elif nat == loser:
@@ -674,7 +800,7 @@ def _record_my_exit(t, result):
     p = get_player()
     if not p:
         return
-    nat = p.get("nationality", "")
+    nat = _my_nat(t, p)
 
     conn = get_conn()
     conn.execute("UPDATE intl_tournaments SET my_result=? WHERE id=?", (result, t["id"]))
