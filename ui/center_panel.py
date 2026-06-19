@@ -4,9 +4,10 @@ ui/center_panel.py  ─  가운데 메인 패널
 import random
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QComboBox, QFrame, QMessageBox
+    QPushButton, QComboBox, QFrame, QMessageBox,
+    QGraphicsDropShadowEffect
 )
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve
 from PyQt6.QtGui import QColor
 
 from game_engine import (
@@ -156,6 +157,23 @@ class CenterPanel(QWidget):
             hl.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
             fl.addWidget(wl); fl.addWidget(cb); fl.addWidget(ml); fl.addWidget(hl)
+
+            # "진행할 주" 강조용 형광 발광 효과 (평소엔 꺼둠)
+            glow = QGraphicsDropShadowEffect(f)
+            glow.setColor(QColor("#00ff88"))
+            glow.setOffset(0, 0)
+            glow.setBlurRadius(0)
+            f.setGraphicsEffect(glow)
+            glow.setEnabled(False)
+            anim = QPropertyAnimation(glow, b"blurRadius", self)
+            anim.setStartValue(10)
+            anim.setEndValue(30)
+            anim.setDuration(900)
+            anim.setEasingCurve(QEasingCurve.Type.InOutSine)
+            anim.setLoopCount(-1)      # 무한 반복 (숨쉬듯 펄스)
+            f._glow = glow
+            f._glow_anim = anim
+
             self.week_frames.append(f)
             self.week_combos.append(cb)
             self.week_hints.append(hl)
@@ -226,6 +244,30 @@ class CenterPanel(QWidget):
 
     # ── 갱신 ─────────────────────────────────────
 
+    def _set_glow(self, frame, on):
+        """주차 프레임의 형광 발광 효과 on/off + 테두리 강조."""
+        glow = getattr(frame, "_glow", None)
+        anim = getattr(frame, "_glow_anim", None)
+        if glow is None:
+            return
+        if on:
+            if not glow.isEnabled():
+                glow.setEnabled(True)
+                # 형광 테두리로 박스 가장자리 자체도 강조
+                frame.setStyleSheet(
+                    "#weekFrame{background-color:#1f2a1f;"
+                    "border:2px solid #00ff88;border-radius:6px;}")
+                if anim:
+                    anim.start()
+        else:
+            if glow.isEnabled():
+                glow.setEnabled(False)
+                if anim:
+                    anim.stop()
+                glow.setBlurRadius(0)
+            # 기본 스타일 복귀 (전역 스타일시트에 위임)
+            frame.setStyleSheet("")
+
     def refresh(self):
         p  = get_player()
         st = get_state()
@@ -270,14 +312,18 @@ class CenterPanel(QWidget):
                 cb.setEnabled(False)
                 if i < self._step_idx:
                     tag = "✓ 완료"; f.setEnabled(False)
+                    self._set_glow(f, False)
                 elif i == self._step_idx:
                     tag = "▶ 진행할 주"; f.setEnabled(True)
+                    self._set_glow(f, True)      # 진행할 주만 형광 발광
                 else:
                     tag = "대기"; f.setEnabled(False)
+                    self._set_glow(f, False)
                 if labels: labels[0].setText(f"{w}주차 [{ph}]  {tag}")
             else:
                 cb.setEnabled(True)
                 f.setEnabled(True)
+                self._set_glow(f, False)         # 4주 모드: 강조 없음
                 if labels: labels[0].setText(f"{w}주차 [{ph}]")
 
             match_info = (self._get_match(w, p)
@@ -298,6 +344,17 @@ class CenterPanel(QWidget):
                         ml.setText(f"🌍 {match_info['league_name']} {stage}{grp}\nvs {opp}")
                         ml.setStyleSheet("color:#66ccff;font-weight:bold;font-size:12px;"
                                          "background:#1a2a3a;border-radius:4px;padding:4px;")
+                        ml.show()
+                elif match_info.get("cl"):
+                    # 클럽 대륙 챔피언스리그
+                    stage = match_info.get("stage_ko", "")
+                    opp   = f"{match_info.get('opp_flag','')}{match_info.get('opp','')}"
+                    loc   = "홈" if match_info.get("is_home") else "원정"
+                    hl.setText("스트레스 +8")
+                    if ml:
+                        ml.setText(f"🏆 {match_info['league_name']} {stage} ({loc})\nvs {opp}")
+                        ml.setStyleSheet("color:#ffd24d;font-weight:bold;font-size:12px;"
+                                         "background:#3a2f1a;border-radius:4px;padding:4px;")
                         ml.show()
                 else:
                     league_name = match_info.get("league_name", "")
@@ -367,7 +424,10 @@ class CenterPanel(QWidget):
         if row["n"] > 0:
             return True
         import intl_engine
-        return intl_engine.has_my_match_between(week, week+3)
+        if intl_engine.has_my_match_between(week, week+3):
+            return True
+        import champions_engine
+        return champions_engine.has_my_cl_match_between(week, week+3)
 
     def _update_preview(self):
         total_stress = 0
@@ -415,6 +475,14 @@ class CenterPanel(QWidget):
         p  = get_player()
         st = get_state()
         if not p or not st: return
+
+        # [복수국적] 대표팀 선택이 대기 중이면 그것부터 처리 (진행 차단)
+        import intl_engine
+        pend = intl_engine.get_pending_choice()
+        if pend:
+            show_toast(self, "⚠  먼저 대표팀을 선택해야 합니다!", "#cc6600", 1600)
+            self._show_nat_choice(pend)
+            return
 
         week = st["current_week"]
         from constants import MIN_JOIN_AGE
@@ -541,7 +609,12 @@ class CenterPanel(QWidget):
         if not row:
             # 클럽 경기 없음 → 국가대표 경기 확인 (월드컵/대륙컵 윈도우)
             import intl_engine
-            return intl_engine.get_my_match(week)
+            im = intl_engine.get_my_match(week)
+            if im:
+                return im
+            # 그래도 없으면 → 클럽 챔피언스리그 경기 확인 (41~52주)
+            import champions_engine
+            return champions_engine.get_my_cl_match(week)
 
         return {
             "home_id":     row["home_team_id"],
@@ -556,12 +629,13 @@ class CenterPanel(QWidget):
     # ── 액션 ─────────────────────────────────────
 
     def _show_renew_dialog(self, p):
-        """재계약 팝업: 연봉 확인 + 계약 기간 선택 (1~5년). 게임 톤 다크 스타일."""
+        """재계약 팝업: 팀이 정한 연봉·기간(1~3년)을 제시 → 수락/거절만."""
         from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
-                                      QLabel, QSpinBox, QPushButton, QFrame)
+                                      QLabel, QPushButton, QFrame)
         from game_engine import join_team, update_player, get_state
 
         offer_sal = p.get("_contract_renew_offer", 0)
+        offer_yrs = p.get("_contract_renew_years", 0) or 2   # 안전 기본값
         from database import get_conn
         _conn = get_conn()
         _row  = _conn.execute("SELECT name FROM teams WHERE id=?", (p.get("current_team_id",0),)).fetchone()
@@ -581,35 +655,29 @@ class CenterPanel(QWidget):
         card = QFrame(); card.setObjectName("dlgCard")
         cl = QVBoxLayout(card); cl.setContentsMargins(14,12,14,12); cl.setSpacing(6)
         cl.addWidget(QLabel(f"<b style='color:#fff'>{team_name}</b><span style='color:#bbb'>에서 재계약을 제안합니다.</span>"))
+        cl.addWidget(QLabel(f"<span style='color:#bbb'>제시 조건</span>  "
+                            f"<b style='color:#ffcc33'>{offer_yrs}년 계약</b>"))
         cl.addWidget(QLabel(f"<span style='color:#bbb'>제시 연봉</span>  "
                             f"<b style='color:#00cc66'>{fmt_money(offer_sal)} / 년</b>"))
         lay.addWidget(card)
 
-        lay.addWidget(QLabel("<span style='color:#bbb'>계약 기간을 선택하세요</span>"))
-        spin = QSpinBox()
-        spin.setObjectName("dlgSpin")
-        spin.setRange(1, 5); spin.setValue(3); spin.setSuffix(" 년")
-        spin.setButtonSymbols(QSpinBox.ButtonSymbols.UpDownArrows)
-        lay.addWidget(spin)
-
         btn_row = QHBoxLayout(); btn_row.setSpacing(8)
-        btn_accept = QPushButton("✅ 수락"); btn_accept.setObjectName("dlgOk")
+        btn_accept = QPushButton(f"✅ {offer_yrs}년 계약 수락"); btn_accept.setObjectName("dlgOk")
         btn_reject = QPushButton("❌ 거절 (소속 없음)"); btn_reject.setObjectName("dlgNo")
         btn_row.addWidget(btn_accept, 1); btn_row.addWidget(btn_reject, 1)
         lay.addLayout(btn_row)
 
         def _accept():
-            yrs = spin.value()
+            yrs = offer_yrs   # 팀이 정한 기간 (선택 불가)
             st  = get_state()
-            end = st["current_year"] + yrs
+            # 만료 연도 = 입단 로직과 동일 규칙.
+            #  - 재계약 팝업은 만료 다음 해 1~4주에 뜨므로 올해가 1년차 → -1 보정
+            #  - 드물게 시즌 중(5주~) 수락이면 올해 미포함 → 보정 없음
+            cur_y = st["current_year"]; cur_w = st["current_week"]
+            end = (cur_y + yrs - 1) if cur_w <= 4 else (cur_y + yrs)
             from game_engine import update_player as upd
             upd(contract_years=yrs, contract_end_year=end,
-                salary=offer_sal, _contract_renew_offer=0)
-            # 재계약(연장) 흔적을 커리어 이력에 남긴다.
-            #  - 같은 팀에 계속 머무는 경우, 매 시즌 새 줄의 transfer_type이
-            #    과거 입단 경로("오퍼")로 복사돼 연장 표시가 안 됐다.
-            #  - mark_contract_extension이 '현재 시즌'의 열린 항목에 "연장"/연수를
-            #    박고, 잔류 방지용 _pending_transfer_type 처리까지 담당한다.
+                salary=offer_sal, _contract_renew_offer=0, _contract_renew_years=0)
             from game_engine import mark_contract_extension
             mark_contract_extension(yrs)
             from game_engine import add_log, fmt_money
@@ -638,57 +706,98 @@ class CenterPanel(QWidget):
         dlg.exec()
 
     def _show_nat_choice(self, pend):
-        """[복수국적] 두 나라 다 본선 진출 시 대표팀 선택 팝업.
-        선택하면 그 나라로 영구 고정(A매치 출전 = cap-tie)된다."""
+        """[복수국적] 본선 진출국 대표팀 발탁 제안 팝업.
+        - 진출국 1개: 그 나라로 뛸지 예/아니오 확인
+        - 진출국 2~3개: 어느 나라로 뛸지 선택 (+ 이번엔 거절)
+        선택해서 '예/국가'를 누르면 그 나라로 영구 고정(A매치 출전 = cap-tie)된다.
+        거절하면 이번 대회만 출전하지 않고, 다음 대회에서 다시 제안된다."""
+        # 이미 팝업이 떠 있으면 중복 생성 방지 (refresh가 여러 번 불려도 1개만)
+        if getattr(self, "_nat_choice_open", False):
+            return
+        self._nat_choice_open = True
         from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
                                       QLabel, QPushButton, QFrame)
         import intl_engine
 
+        opts = pend.get("options", [])
+        single = (len(opts) == 1)
+
         dlg = QDialog(self)
-        dlg.setWindowTitle("🌍 대표팀 선택")
-        dlg.setMinimumWidth(380)
+        dlg.setWindowTitle("🌍 대표팀 발탁")
+        dlg.setMinimumWidth(400)
         dlg.setStyleSheet(_DIALOG_STYLE)
         lay = QVBoxLayout(dlg)
         lay.setContentsMargins(18,16,18,16); lay.setSpacing(10)
 
-        hdr = QLabel(f"🌍 {pend['name']} 대표팀 선택"); hdr.setObjectName("dlgHeader")
+        hdr = QLabel(f"🌍 {pend['name']} 대표팀 발탁"); hdr.setObjectName("dlgHeader")
         lay.addWidget(hdr)
 
-        info = QLabel(
-            "<span style='color:#bbb'>두 나라 모두 본선에 진출했습니다.<br>"
-            "어느 대표팀으로 뛸지 선택하세요.<br>"
-            "<b style='color:#ffcc66'>한 번 출전하면 그 나라로 영구 고정</b>되어<br>"
-            "다른 나라 대표로는 뛸 수 없습니다.</span>")
+        if single:
+            opt = opts[0]
+            info = QLabel(
+                f"<span style='color:#ddd; font-size:14px'>"
+                f"<b style='color:#ffcc66; font-size:16px'>{opt.get('flag','')} {opt['nat']}</b> "
+                f"대표팀에서 발탁을 제안합니다.<br><br>"
+                f"이 나라로 국가대표 경기를 뛰겠습니까?<br>"
+                f"<b style='color:#ff8866'>한 번 출전하면 그 나라로 영구 고정</b>되어<br>"
+                f"다른 나라 대표로는 뛸 수 없습니다.</span>")
+        else:
+            nat_list = " / ".join(f"{o.get('flag','')}{o['nat']}" for o in opts)
+            info = QLabel(
+                f"<span style='color:#ddd; font-size:14px'>"
+                f"여러 국적이 본선에 진출했습니다.<br>"
+                f"<b style='color:#ffcc66'>{nat_list}</b><br><br>"
+                f"어느 대표팀으로 뛸지 선택하세요.<br>"
+                f"<b style='color:#ff8866'>한 번 출전하면 그 나라로 영구 고정</b>됩니다.</span>")
         info.setWordWrap(True)
         card = QFrame(); card.setObjectName("dlgCard")
         cl = QVBoxLayout(card); cl.setContentsMargins(14,12,14,12)
         cl.addWidget(info)
         lay.addWidget(card)
 
+        def _do_choice(nat):
+            res = intl_engine.choose_national_team(pend["tournament_id"], nat)
+            dlg.accept()
+            if res:
+                if res["selected"]:
+                    show_toast(self, f"🌍 {nat} 대표로 발탁되었습니다!", "#1a4d8f", 1800)
+                else:
+                    show_toast(self, f"🌍 {nat} 대표를 선택했지만 이번엔 미발탁", "#664400", 1800)
+            if self.main_win: self.main_win.refresh_all()
+
+        def _do_decline():
+            intl_engine.decline_national_team(pend["tournament_id"])
+            dlg.accept()
+            show_toast(self, "🌍 이번 대회 대표팀 발탁을 보류했습니다", "#555555", 1800)
+            if self.main_win: self.main_win.refresh_all()
+
         btn_row = QHBoxLayout(); btn_row.setSpacing(8)
+        if single:
+            opt = opts[0]
+            b_yes = QPushButton(f"✅ 예, {opt['nat']}로 뛰겠습니다")
+            b_yes.setObjectName("dlgChoice")
+            b_yes.clicked.connect(lambda _=False, n=opt["nat"]: _do_choice(n))
+            b_no = QPushButton("❌ 아니오 (보류)")
+            b_no.setObjectName("dlgNo")
+            b_no.clicked.connect(lambda _=False: _do_decline())
+            btn_row.addWidget(b_yes, 2); btn_row.addWidget(b_no, 1)
+            lay.addLayout(btn_row)
+        else:
+            for opt in opts:
+                b = QPushButton(f"{opt.get('flag','')} {opt['nat']}")
+                b.setObjectName("dlgChoice")
+                b.clicked.connect(lambda _=False, n=opt["nat"]: _do_choice(n))
+                btn_row.addWidget(b, 1)
+            lay.addLayout(btn_row)
+            b_no = QPushButton("이번엔 어느 나라로도 뛰지 않음")
+            b_no.setObjectName("dlgNo")
+            b_no.clicked.connect(lambda _=False: _do_decline())
+            lay.addWidget(b_no)
 
-        def _make_choice(nat):
-            def _do():
-                res = intl_engine.choose_national_team(pend["tournament_id"], nat)
-                dlg.accept()
-                if res:
-                    if res["selected"]:
-                        show_toast(self, f"🌍 {nat} 대표로 발탁되었습니다!", "#1a4d8f", 1800)
-                    else:
-                        show_toast(self, f"🌍 {nat} 대표를 선택했지만 이번엔 미발탁", "#664400", 1800)
-                if self.main_win: self.main_win.refresh_all()
-            return _do
-
-        for opt in pend["options"]:
-            b = QPushButton(f"{opt.get('flag','')} {opt['nat']}")
-            b.setObjectName("dlgChoice")
-            b.clicked.connect(_make_choice(opt["nat"]))
-            btn_row.addWidget(b, 1)
-        lay.addLayout(btn_row)
-
-        # 선택을 강제 (닫기 비활성)
+        # 선택을 강제 (닫기 버튼 비활성 — 예/아니오/거절 중 하나는 눌러야 함)
         dlg.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
         dlg.exec()
+        self._nat_choice_open = False
 
     def _do_join(self):
         """소속 없음일 때만 수동 팀 입단 (1~4주차)."""
@@ -801,11 +910,49 @@ class CenterPanel(QWidget):
         if not is_off:
             show_toast(self, "⚠  은퇴는 비시즌에만 가능합니다", "#cc6600", 1500)
             return
-        reply = QMessageBox.question(self, "은퇴 확인", "정말 은퇴하시겠습니까?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
+
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame
+        p = get_player() or {}
+        nm  = p.get("name", "선수")
+        age = p.get("age", "")
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("은퇴 확인")
+        dlg.setMinimumWidth(360)
+        dlg.setStyleSheet(_DIALOG_STYLE)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(18,16,18,16); lay.setSpacing(12)
+
+        hdr = QLabel("🏁 은퇴")
+        hdr.setStyleSheet("color:#e0a020; font-size:16px; font-weight:bold;")
+        lay.addWidget(hdr)
+
+        card = QFrame(); card.setObjectName("dlgCard")
+        cl = QVBoxLayout(card); cl.setContentsMargins(14,14,14,14); cl.setSpacing(6)
+        cl.addWidget(QLabel(
+            f"<span style='color:#ddd; font-size:14px'>"
+            f"<b style='color:#fff'>{nm}</b>{(' ('+str(age)+'세)') if age else ''} 선수의<br>"
+            f"선수 생활을 여기서 마칠까요?</span>"))
+        warn = QLabel("⚠ 은퇴하면 되돌릴 수 없으며, 커리어가 마감됩니다.")
+        warn.setStyleSheet("color:#cc7766; font-size:12px;")
+        warn.setWordWrap(True)
+        cl.addWidget(warn)
+        lay.addWidget(card)
+
+        btn_row = QHBoxLayout(); btn_row.setSpacing(8)
+        b_no  = QPushButton("계속 선수 생활")
+        b_no.setObjectName("dlgOk")          # 안전한 선택을 초록(기본)으로
+        b_yes = QPushButton("🏁 은퇴하기")
+        b_yes.setObjectName("dlgNo")          # 되돌릴 수 없는 선택을 빨강으로
+        b_no.clicked.connect(dlg.reject)
+        b_yes.clicked.connect(dlg.accept)
+        btn_row.addWidget(b_no, 1); btn_row.addWidget(b_yes, 1)
+        lay.addLayout(btn_row)
+
+        b_no.setDefault(True)   # 엔터 시 기본은 '계속'
+
+        if dlg.exec() == QDialog.DialogCode.Accepted:
             from ui.retire_window import RetireWindow
-            # parent를 MainWindow로 전달 (go_to_start 호출용)
             main_win = self.window()
             self._retire_win = RetireWindow(get_player().get("language", "ko"), main_win)
             self._retire_win.show()

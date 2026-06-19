@@ -63,6 +63,20 @@ def _game_warning(parent, title: str, message: str):
 
 from database import get_conn
 
+
+# 개인 수상으로 분류할 키워드 (trophy_log에 섞여 들어온 발롱도르·MVP 행 식별)
+_PERSONAL_AWARD_KEYWORDS = (
+    "발롱도르", "MVP", "득점왕", "도움왕", "베스트11",
+    "골든글러브", "영플레이어", "신데렐라", "푸스카스", "사모라",
+)
+
+
+def _is_personal_award(trophy):
+    """trophy_log 한 행이 '개인 수상'인지 판별 (우승 집계에서 제외 용도)."""
+    comp = (trophy.get("competition") or "")
+    return any(k in comp for k in _PERSONAL_AWARD_KEYWORDS)
+
+
 STYLE = """
 QDialog { background:#1e1e1e; color:#ccc; }
 QScrollArea { border:none; background:#1e1e1e; }
@@ -167,7 +181,10 @@ class RetireWindow(QDialog):
         # DB 데이터
         conn = get_conn(); c = conn.cursor()
         entries  = [dict(r) for r in c.execute("SELECT * FROM career_entries ORDER BY id").fetchall()]
-        trophies = [dict(r) for r in c.execute("SELECT * FROM trophy_log ORDER BY id").fetchall()]
+        # trophy_log에는 발롱도르·MVP 같은 개인 수상도 함께 적재되므로
+        # 우승 경력에는 '진짜 우승'만 남기고 개인 수상 행은 제외한다.
+        all_trophies = [dict(r) for r in c.execute("SELECT * FROM trophy_log ORDER BY id").fetchall()]
+        trophies = [t for t in all_trophies if not _is_personal_award(t)]
         try:
             awards = [dict(r) for r in c.execute(
                 "SELECT * FROM awards WHERE is_mine=1 ORDER BY year").fetchall()]
@@ -214,12 +231,18 @@ class RetireWindow(QDialog):
         lay.addWidget(t35)
         lay.addWidget(self._intl_table(intl_ms, p))
 
+        # ── 챔피언스리그 기록 ────────────────────────
+        import champions_engine
+        cl_ms = champions_engine.get_my_cl_matches()
+        t36 = QLabel(f"🏆 챔피언스리그 기록  ({len(cl_ms)})")
+        t36.setObjectName("secTitle")
+        lay.addWidget(t36)
+        lay.addWidget(self._champions_table(cl_ms, p))
+
         # ── 개인 수상 ────────────────────────────────
-        try:
-            awards = [dict(r) for r in c.execute(
-                "SELECT * FROM awards WHERE is_mine=1 ORDER BY year").fetchall()]
-        except Exception:
-            awards = []
+        # (awards는 위에서 conn이 열려 있을 때 이미 로드했다. conn.close() 이후
+        #  c.execute를 다시 호출하면 예외가 나서 0개로 표시되던 버그 수정 →
+        #  앞서 로드한 리스트를 그대로 재사용한다.)
         t4 = QLabel(f"🥇 개인 수상  ({len(awards)})")
         t4.setObjectName("secTitle")
         lay.addWidget(t4)
@@ -372,7 +395,7 @@ class RetireWindow(QDialog):
             tname  = t.get("team_name","")
             lname  = t.get("league_name","")
 
-            if tier_t and tier_t > 0:
+            if tier_t and tier_t > 0 and not _is_personal_award(t):
                 # 리그 우승: 팀 (국가) / 리그 (N부) / 우승
                 country  = self._country_of_league(lname)
                 team_str = f"{tname} ({country})" if country else tname
@@ -505,6 +528,29 @@ class RetireWindow(QDialog):
         tbl.setFixedHeight(30 + min(len(matches), 7) * 28)
         return tbl
 
+    def _champions_table(self, matches, p):
+        """챔피언스리그 경기별 기록 테이블."""
+        if not matches:
+            lbl = QLabel("챔피언스리그 기록 없음"); lbl.setStyleSheet("color:#555;")
+            return lbl
+        cols = ["기간","포지션","소속팀","대회","상대","골/선방","어시/실점","평점","스코어","결과"]
+        tbl  = self._make_table(len(matches), cols)
+        for i, m in enumerate(matches):
+            is_gk = m["position"] == "GK"
+            stat1 = f"{m['saves']}선방"   if is_gk else f"{m['goals']}골"
+            stat2 = f"{m['conceded']}실점" if is_gk else f"{m['assists']}A"
+            vals = [f"{m['year']} {m['week']}주차", m["position"],
+                    f"{m['team_flag']}{m['team']}",
+                    f"{m['comp']} {m['stage']}",
+                    f"{m['opp_flag']}{m['opp']}",
+                    stat1, stat2, str(m["rating"]), m["score"], m["result"]]
+            for j, v in enumerate(vals):
+                self._set_item(tbl, i, j, v)
+        tbl.resizeColumnsToContents()
+        tbl.resizeRowsToContents()
+        tbl.setFixedHeight(30 + min(len(matches), 7) * 28)
+        return tbl
+
     def _make_table(self, rows, cols):
         tbl = QTableWidget(rows, len(cols))
         tbl.setHorizontalHeaderLabels(cols)
@@ -580,14 +626,42 @@ class RetireWindow(QDialog):
             lines.append("  기록 없음")
         lines.append("")
 
-        # 팀 우승 (리그 우승 등 ─ 국제대회는 아래 국가대표 섹션에서)
-        league_trophies = [t for t in trophies if t.get('tier', 0) != 0]
+        # 팀 우승 (리그 우승 ─ tier>0). 챔스(tier=-1)/국가대표(tier=0)는 별도.
+        league_trophies = [t for t in trophies if t.get('tier', 0) > 0]
         lines.append(f"▶ 팀 우승  ({len(league_trophies)}건)")
         if league_trophies:
             for t in league_trophies:
                 comp   = t.get('competition', '')
                 nation = t.get('team_name', '')
                 lines.append(f"  🏆 {t.get('year','')}년  {comp}  ({nation})")
+        else:
+            lines.append("  없음")
+        lines.append("")
+
+        # 챔피언스리그 경력 (클럽 대륙 대회 ─ tier=-1, 대회별 결과 + 활약)
+        cl_trophies = [t for t in trophies if t.get('tier', 0) == -1]
+        lines.append(f"▶ 챔피언스리그 경력  ({len(cl_trophies)}건)")
+        if cl_trophies:
+            conn_c = get_conn()
+            try:
+                clhist = {(r["year"], r["competition"]): dict(r) for r in conn_c.execute(
+                    "SELECT * FROM cl_history").fetchall()}
+            except Exception:
+                clhist = {}
+            conn_c.close()
+            for t in cl_trophies:
+                yr, comp = t.get('year', 0), t.get('competition', '')
+                result   = t.get('league_name', '')   # league_name 자리에 결과 저장됨
+                team     = t.get('team_name', '')
+                line = f"  🏆 {yr}년  {comp}  →  {result}  ({team})"
+                ch = clhist.get((yr, comp))
+                if ch and ch.get("caps", 0) > 0:
+                    if p.get("position") == "GK":
+                        line += f"  | {ch['caps']}경기 출전, 평점 {ch.get('rating', 0)}"
+                    else:
+                        line += (f"  | {ch['caps']}경기 {ch.get('goals',0)}골 "
+                                 f"{ch.get('assists',0)}어시, 평점 {ch.get('rating', 0)}")
+                lines.append(line)
         else:
             lines.append("  없음")
         lines.append("")
@@ -649,6 +723,23 @@ class RetireWindow(QDialog):
                 lines.append(f"  • {im['year']}년 {im['week']}주차  "
                              f"{im['comp']} {im['stage']}  vs {im['opp']}  ─  "
                              f"{stat}  평점 {im['rating']}  ({im['score']} {im['result']})")
+        else:
+            lines.append("  없음")
+        lines.append("")
+
+        # 챔피언스리그 기록 (클럽 대륙 대회 경기 단위 ─ A매치 아님, 클럽 출전)
+        import champions_engine
+        cl_ms2 = champions_engine.get_my_cl_matches()
+        lines.append(f"▶ 챔피언스리그 기록  ({len(cl_ms2)}경기)  ※ 클럽 대항전 (A매치 아님)")
+        if cl_ms2:
+            for cm in cl_ms2:
+                if cm["position"] == "GK":
+                    stat = f"{cm['saves']}선방 {cm['conceded']}실점"
+                else:
+                    stat = f"{cm['goals']}골 {cm['assists']}어시"
+                lines.append(f"  • {cm['year']}년 {cm['week']}주차  "
+                             f"{cm['comp']} {cm['stage']}  ({cm['team']}) vs {cm['opp']}  ─  "
+                             f"{stat}  평점 {cm['rating']}  ({cm['score']} {cm['result']})")
         else:
             lines.append("  없음")
         lines.append("")

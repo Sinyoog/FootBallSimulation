@@ -24,9 +24,17 @@ from constants import (
     CONFEDERATIONS, CONF_CUP_NAME,
     GRADE_TEAM_OVR, GRADE_QUAL_BASE, QUAL_NOISE,
     INTL_SELECTION_OVR, INTL_MAX_TIER, INTL_MIN_MATCHES,
+    INTL_SELECTION_MARGIN,
 )
 
 STAGE_KO = {"group": "조별리그", "R16": "16강", "QF": "8강", "SF": "4강", "F": "결승"}
+
+# ── entry 캐시 ─────────────────────────────────────
+# intl_entries(ovr/flag/grade)는 대회 진행 중 불변 → (tid, country)별 1회 조회.
+_entry_cache = {}
+
+def _clear_entry_cache():
+    _entry_cache.clear()
 
 # 그룹 라벨
 _GROUP_LABELS = ["A", "B", "C", "D", "E", "F", "G", "H"]
@@ -54,8 +62,10 @@ def get_tournament(year):
 
 
 def get_pending_choice():
-    """[복수국적] 대표팀 선택이 필요한 대회가 있으면 정보 반환, 없으면 None.
-    (둘 다 본선 진출 + 아직 미고정 + 21세 이하 → my_selected==3)"""
+    """[복수국적] 대표팀 선택/동의가 필요한 대회가 있으면 정보 반환, 없으면 None.
+    (미고정 + 21세 이하 + 본선 진출국 1개 이상 → my_selected==3)
+    진출국이 1개여도 본인 동의를 받기 위해 팝업을 띄운다.
+    22세 이상은 create_tournament 단계에서 이미 자동 고정되므로 여기 안 걸린다."""
     from game_engine import get_state, get_player
     st = get_state(); p = get_player()
     if not st or not p:
@@ -63,25 +73,27 @@ def get_pending_choice():
     t = get_tournament(st["current_year"])
     if not t or t.get("my_selected") != 3:
         return None
-    
-    # 21세 이후는 국가 선택 불가 (주어진 국적으로 자동 고정)
-    age = st.get("current_year", 0) - p.get("birth_year", 0)
+    # 안전장치: 22세 이상이면 선택 대상 아님 (이미 고정됐어야 함)
+    age = st.get("current_year", 0) - (p.get("birth_year", 0) or 0)
     if age > 21:
         return None
-    
-    nat1 = p.get("nationality", "") or ""
-    nat2 = p.get("nationality2", "") or ""
+
+    nats = [p.get("nationality", "") or "",
+            p.get("nationality2", "") or "",
+            p.get("nationality3", "") or ""]
     conn = get_conn()
     entry_names = {r["country"] for r in conn.execute(
         "SELECT country FROM intl_entries WHERE tournament_id=?", (t["id"],)).fetchall()}
     opts = []
-    for n in (nat1, nat2):
-        if n and n in entry_names:
+    seen = set()
+    for n in nats:
+        if n and n in entry_names and n not in seen:
+            seen.add(n)
             fr = conn.execute("SELECT flag FROM intl_entries WHERE tournament_id=? AND country=?",
                               (t["id"], n)).fetchone()
             opts.append({"nat": n, "flag": fr["flag"] if fr else ""})
     conn.close()
-    if len(opts) < 2:
+    if len(opts) < 1:
         return None
     return {"tournament_id": t["id"], "name": t["name"],
             "year": t["year"], "options": opts}
@@ -108,8 +120,27 @@ def choose_national_team(tournament_id, nat):
     conn = get_conn()
     conn.execute("UPDATE intl_tournaments SET my_nat=?, my_selected=? WHERE id=?",
                  (nat, my_sel, tournament_id))
-    conn.commit(); conn.close()
+    # 미선발이면 대회 자동판정 경로(start_intl_tournament)와 동일하게
+    # '국가대표 미선발'을 trophy_log에 남긴다 (선택대기→동의→미선발 빈틈 보정).
+    if not selected:
+        trow = conn.execute("SELECT year, name FROM intl_tournaments WHERE id=?",
+                            (tournament_id,)).fetchone()
+        conn.commit(); conn.close()
+        if trow:
+            _save_trophy(trow["year"], nat, trow["name"], "국가대표 미선발")
+    else:
+        conn.commit(); conn.close()
     return {"nat": nat, "selected": selected}
+
+
+def decline_national_team(tournament_id):
+    """[복수국적] 이번 대회 대표팀 발탁을 거절(보류). 영구 고정하지 않으며,
+    이번 대회만 출전 없음(my_selected=2) 처리한다. 다음 대회에서 다시 제안된다."""
+    conn = get_conn()
+    conn.execute("UPDATE intl_tournaments SET my_nat='', my_selected=2 WHERE id=?",
+                 (tournament_id,))
+    conn.commit(); conn.close()
+    return True
 
 
 def _my_nat(t, p):
@@ -200,14 +231,17 @@ def start_intl_tournament(year):
     if get_tournament(year):
         return  # 중복 생성 방지
 
-    # [복수국적] 내 국적 목록 (1~2개). committed(고정)되어 있으면 그 나라만.
+    _clear_entry_cache()   # 새 대회 → 이전 캐시 무효화
+
+    # [복수국적] 내 국적 목록 (1~3개). committed(고정)되어 있으면 그 나라만.
     nat1 = p.get("nationality", "") or ""
     nat2 = p.get("nationality2", "") or ""
+    nat3 = p.get("nationality3", "") or ""
     committed = p.get("intl_committed", "") or ""
     if committed:
         my_nats = [committed]
     else:
-        my_nats = [n for n in (nat1, nat2) if n]
+        my_nats = [n for n in (nat1, nat2, nat3) if n]
 
     conn = get_conn()
     # 대회 종류(월드컵/대륙컵)는 '주 국적'의 대륙 기준으로 결정 (기존 동작 유지).
@@ -238,19 +272,44 @@ def start_intl_tournament(year):
     qualified_nats = [n for n in my_nats if n in entry_names]
 
     # 출전국/선발 결정
+    #  - 이미 고정(committed)된 경우: 그 나라가 진출했으면 그 나라로 출전·선발 판정,
+    #    아니면 이번 대회는 출전 없음.
+    #  - 미고정 + 21세 이하: 진출국 1개 이상이면 '선택 대기(my_sel=3)'.
+    #    본인이 팝업에서 골라야만(또는 동의해야만) 영구 고정된다.
+    #  - 미고정 + 22세 이상: 더 이상 선택 불가. 국적 중 '주 국적(nat1)'으로
+    #    자동 고정(cap-tie). 예선 탈락이어도 그 나라 소속으로 간주.
+    #    (현실 규칙: 일정 나이가 지나면 사실상 한 나라에 묶임)
     #  - 진출국 0개 → 출전 없음(my_sel=2)
-    #  - 진출국 1개 → 그 나라로 출전, 선발 판정
-    #  - 진출국 2개(아직 미고정) → 대표팀 선택 대기(my_sel=3)
+    age = year - (p.get("birth_year", year - 17) or (year - 17))
     my_nat = ""
-    if len(qualified_nats) == 0:
-        my_sel = 2
-    elif len(qualified_nats) == 1:
-        my_nat = qualified_nats[0]
-        grade = nat_info.get(my_nat, {}).get("grade", "F")
-        my_sel = 1 if _check_selection(p, grade) else 0
+    if committed:
+        if committed in qualified_nats:
+            my_nat = committed
+            grade = nat_info.get(my_nat, {}).get("grade", "F")
+            my_sel = 1 if _check_selection(p, grade) else 0
+        else:
+            my_sel = 2   # 고정된 나라가 본선 진출 못함 → 이번엔 출전 없음
+    elif age <= 21:
+        # 21세 이하: 본인 선택권 있음
+        if len(qualified_nats) == 0:
+            my_sel = 2
+        else:
+            my_sel = 3   # 선택/동의 대기
     else:
-        # 둘 다 진출 + 아직 어느 대표팀에도 안 묶임 → 선택 대기
-        my_sel = 3
+        # 22세 이상 미고정: 주 국적으로 자동 고정 (선택권 소멸)
+        auto_nat = nat1 or (my_nats[0] if my_nats else "")
+        if auto_nat:
+            from game_engine import update_player as _upd_commit
+            _upd_commit(intl_committed=auto_nat)
+            committed = auto_nat
+            if auto_nat in qualified_nats:
+                my_nat = auto_nat
+                grade = nat_info.get(auto_nat, {}).get("grade", "F")
+                my_sel = 1 if _check_selection(p, grade) else 0
+            else:
+                my_sel = 2   # 고정됐지만 이번 대회는 본선 진출 못함
+        else:
+            my_sel = 2
 
     conn = get_conn()
     c = conn.cursor()
@@ -299,9 +358,12 @@ def start_intl_tournament(year):
     add_log(f"🌍 {year}년 {name} 개막!  본선 {len(entries)}개국", "event", year, INTL_CALLUP_WEEK)
 
     if my_sel == 3:
-        # 둘 다 진출 → 대표팀 선택 대기
+        # 미고정 + 진출국 1개 이상 → 본인 동의(선택) 대기
         nat_list = " / ".join(qualified_nats)
-        add_log(f"   🌍 복수국적 발탁 가능! {nat_list} 중 대표팀을 선택하세요", "event", year, INTL_CALLUP_WEEK)
+        if len(qualified_nats) == 1:
+            add_log(f"   🌍 {nat_list} 대표팀 발탁 제안! 출전 여부를 선택하세요", "event", year, INTL_CALLUP_WEEK)
+        else:
+            add_log(f"   🌍 복수국적 발탁 가능! {nat_list} 중 대표팀을 선택하세요", "event", year, INTL_CALLUP_WEEK)
     elif my_nat:
         # 출전국 확정 (진출국 1개)
         _flag = ""
@@ -334,22 +396,50 @@ def _country_flag(name):
     return r["flag"] if r else ""
 
 
+def _vet_bonus(age):
+    """베테랑 가산점: 노련함 프리미엄. 최대 +5. (절대 하한은 별도 보장)"""
+    if age >= 36:
+        return 5
+    if age >= 33:
+        return 4
+    if age >= 30:
+        return 2
+    return 0
+
+
 def _check_selection(p, my_grade):
-    """국가대표 선발 판정: OVR + 소속 리그 티어 + 통산 5경기."""
-    if p.get("ovr", 0) < INTL_SELECTION_OVR.get(my_grade, 40):
+    """국가대표 선발 판정 — 자국 등급(국대 평균 전력) 대비 상대평가.
+
+    선발 기준을 클럽 선수 풀이 아니라 GRADE_TEAM_OVR(국대 경기 시뮬에 쓰는
+    그 나라 평균 전력)에 정합시킨다. 선발 스케일 = 경기 스케일.
+      임계 = 국대평균 - 마진(톱권)
+      유효OVR = 내 OVR + 베테랑 보너스(최대 +5)
+      → 유효OVR이 임계 이상이면 선발. 단 절대 하한 미달은 보너스로도 구제 불가.
+    """
+    nat_avg = GRADE_TEAM_OVR.get(my_grade, 45)
+    threshold = nat_avg - INTL_SELECTION_MARGIN
+    my_ovr = p.get("ovr", 0)
+    eff_ovr = my_ovr + _vet_bonus(p.get("age", 25))
+
+    # 절대 하한: 베테랑 보너스로도 이 밑이면 탈락 (36세 60 같은 경우 차단)
+    if my_ovr < threshold - INTL_SELECTION_MARGIN:
+        return False
+    if eff_ovr < threshold:
         return False
     if p.get("total_matches", 0) < INTL_MIN_MATCHES:
         return False
     tid = p.get("current_team_id", 0)
     if not tid:
         return False
+    # 티어 보조 가드(완화): 등급 기준 티어보다 한 단계까지는 허용
+    #   → 노쇠해 하위 리그로 내려간 베테랑도 OVR이 충분하면 막지 않는다.
     conn = get_conn()
     row = conn.execute(
         """SELECT l.tier FROM teams t JOIN leagues l ON t.league_id=l.id
            WHERE t.id=?""", (tid,)).fetchone()
     conn.close()
     my_tier = row["tier"] if row else 99
-    return my_tier <= INTL_MAX_TIER.get(my_grade, 3)
+    return my_tier <= INTL_MAX_TIER.get(my_grade, 3) + 1
 
 
 def _qualify_world():
@@ -445,12 +535,18 @@ def process_intl_week(week):
 # ─────────────────────────────────────────────
 
 def _entry(tid, country):
+    key = (tid, country)
+    cached = _entry_cache.get(key)
+    if cached is not None:
+        return cached
     conn = get_conn()
     row = conn.execute(
         "SELECT * FROM intl_entries WHERE tournament_id=? AND country=?",
         (tid, country)).fetchone()
     conn.close()
-    return dict(row) if row else {"ovr": 50, "flag": "", "grade": "F"}
+    val = dict(row) if row else {"ovr": 50, "flag": "", "grade": "F"}
+    _entry_cache[key] = val
+    return val
 
 
 def _match_outcome(h_ovr, a_ovr, knockout):
@@ -501,16 +597,17 @@ def _sim_ai_match(t, m, my_played=False):
     conn.commit()
     conn.close()
 
-    # 내 국가 경기(결장 포함)는 로그 출력
-    p = get_player()
-    nat = _my_nat(t, p)
-    if m["is_my"] and nat in (m["home"], m["away"]):
-        stage_ko = STAGE_KO.get(m["stage"], "")
-        pso_txt = f"  (승부차기 {pso_score})" if pso_winner else ""
-        add_log(f"🌍 {t['name']} {stage_ko}  "
-                f"{he['flag']}{m['home']} {hs}-{as_} {ae['flag']}{m['away']}{pso_txt}", "match")
-        if t["my_selected"] == 1 and not my_played:
-            add_log("   🚑 부상으로 대표팀 경기 결장", "match")
+    # 내 국가 경기(결장 포함)는 로그 출력. AI끼리 경기는 get_player() 불필요.
+    if m["is_my"]:
+        p = get_player()
+        nat = _my_nat(t, p)
+        if nat in (m["home"], m["away"]):
+            stage_ko = STAGE_KO.get(m["stage"], "")
+            pso_txt = f"  (승부차기 {pso_score})" if pso_winner else ""
+            add_log(f"🌍 {t['name']} {stage_ko}  "
+                    f"{he['flag']}{m['home']} {hs}-{as_} {ae['flag']}{m['away']}{pso_txt}", "match")
+            if t["my_selected"] == 1 and not my_played:
+                add_log("   🚑 부상으로 대표팀 경기 결장", "match")
 
 
 def _winner_of(m):
@@ -802,15 +899,24 @@ def _record_my_exit(t, result):
         return
     nat = _my_nat(t, p)
 
+    # 미선발(또는 출전 보류)이면 이 대회 성적은 내 경력이 아니다.
+    #  - my_result는 'XX 미선발'로만 표시(대회 화면 일관성용)
+    #  - trophy_log / intl_history(개인기록) / 보상은 일절 기록하지 않는다.
+    #    (선발 안 됐는데 대표팀이 우승했다고 내 우승 트로피로 박히던 버그 방지)
+    if t["my_selected"] != 1:
+        conn = get_conn()
+        conn.execute("UPDATE intl_tournaments SET my_result=? WHERE id=?",
+                     (f"{result} (미선발)", t["id"]))
+        conn.commit()
+        conn.close()
+        return
+
     conn = get_conn()
     conn.execute("UPDATE intl_tournaments SET my_result=? WHERE id=?", (result, t["id"]))
     conn.commit()
     conn.close()
 
     _save_trophy(t["year"], nat, t["name"], result)
-
-    if t["my_selected"] != 1:
-        return  # 미선발이면 관전만 ─ 보상 없음
 
     fame_g, pop_g, hap_g = _REWARD.get(result, (0, 0, 0))
     if t["kind"] != "world":  # 대륙컵은 60% 스케일

@@ -63,7 +63,7 @@ def _calc_agent_cost(agent_grade: str, country_grade: str) -> int:
     return max(10, round(varied / 50) * 50)
 
 def _gen_agent_offers(cur_grade: str) -> list:
-    """현재 등급 기준 최대 3개 오퍼."""
+    """현재 등급 기준 최대 3개 오퍼. 각 오퍼는 (등급, 변형타입)."""
     cur_idx = AGENT_GRADES.index(cur_grade)
     pool = []
     for g in AGENT_GRADES:
@@ -76,6 +76,27 @@ def _gen_agent_offers(cur_grade: str) -> list:
         pool = [cur_grade]
     count = random.randint(1, 3)
     return [random.choice(pool) for _ in range(count)]
+
+
+# 같은 등급 내 에이전트 '협상 스타일' 변형:
+#  같은 등급이라도 계약금↑수수료↓ vs 계약금↓수수료↑ 의 트레이드오프.
+#  → 장기 재직 계획이면 수수료 낮은(=계약금 높은) 쪽이 이득,
+#    단기/저자산이면 계약금 낮은(=수수료 높은) 쪽이 이득. 무조건 싼 게 정답 아님.
+AGENT_VARIANTS = [
+    # (라벨, 계약금 배수, 수수료 가산)
+    ("실속형",   0.55, +0.04),   # 계약금 싸지만 수수료 비쌈
+    ("표준형",   1.00,  0.00),   # 등급 기본
+    ("거물형",   1.85, -0.04),   # 계약금 비싸지만 수수료 쌈
+]
+
+def _make_variant(grade, country_grade):
+    """등급+국가등급 기준 (계약금, 수수료율, 라벨) 변형 1개 생성."""
+    label, cost_mult, fee_add = random.choice(AGENT_VARIANTS)
+    base_cost = _calc_agent_cost(grade, country_grade)
+    cost = max(0, int(base_cost * cost_mult))
+    base_fee = AGENT_FEE_RATE.get(grade, 0.0)
+    fee = round(max(0.0, base_fee + fee_add), 3)
+    return cost, fee, label
 
 
 class AgentWindow(QDialog):
@@ -91,9 +112,9 @@ class AgentWindow(QDialog):
         self.cur_grade    = p.get("agent_grade","F") if p else "F"
         self.country_grade = _get_country_grade(p)
         self.offers = _gen_agent_offers(self.cur_grade)
-        # 오퍼별 계약금 (같은 등급도 다르게)
-        self.costs = {i: _calc_agent_cost(g, self.country_grade)
-                      for i, g in enumerate(self.offers)}
+        # 오퍼별 변형: (계약금, 수수료율, 라벨) — 같은 등급도 다르게
+        self.variants = {i: _make_variant(g, self.country_grade)
+                         for i, g in enumerate(self.offers)}
         self._build()
 
     def _build(self):
@@ -146,34 +167,41 @@ class AgentWindow(QDialog):
         QTimer.singleShot(duration, self._toast.hide)
 
     def _make_card(self, idx, grade):
+        from constants import AGENT_UPPER_LEAGUE_BONUS
         icon, name, desc = AGENT_INFO[grade]
-        cost = self.costs[idx]
+        cost, fee, label = self.variants[idx]
         card = QFrame(); card.setObjectName("agCard")
         cl = QVBoxLayout(card); cl.setContentsMargins(12,10,12,10)
 
         h1 = QHBoxLayout()
-        nl = QLabel(f"{icon}  [{grade}] {name}")
+        nl = QLabel(f"{icon}  [{grade}] {name}  · {label}")
         nl.setStyleSheet("font-size:13px;font-weight:bold;color:#e0e0e0;")
         h1.addWidget(nl); h1.addStretch()
         cl.addLayout(h1)
         cl.addWidget(QLabel(desc))
-        cost_lbl = QLabel(f"수수료 {int(AGENT_FEE_RATE[grade]*100)}%  |  계약금 {fmt_money(cost)}")
+        # 상위리그 오퍼 보너스 안내 (실제 효과)
+        bonus = AGENT_UPPER_LEAGUE_BONUS.get(grade, 0)
+        if bonus > 0:
+            bl = QLabel(f"📈 실력보다 최대 +{bonus}등급 높은 리그 오퍼 가능")
+            bl.setStyleSheet("color:#66aaff;font-size:11px;")
+            cl.addWidget(bl)
+        cost_lbl = QLabel(f"수수료 {fee*100:.0f}%  |  계약금 {fmt_money(cost)}")
         cost_lbl.setStyleSheet("color:#00cc44;" if grade != self.cur_grade else "color:#888;")
         cl.addWidget(cost_lbl)
 
         h2 = QHBoxLayout()
         if grade == self.cur_grade:
-            btn = QPushButton("현재 에이전트"); btn.setObjectName("currentBtn")
-            btn.setEnabled(False)
+            btn = QPushButton("현재 등급 (재계약)"); btn.setObjectName("selectBtn")
+            btn.clicked.connect(lambda _, g=grade, c=cost, f=fee: self._select(g, c, f))
         else:
             btn = QPushButton("✅ 선택" if self.lang=="ko" else "✅ Select")
             btn.setObjectName("selectBtn")
-            btn.clicked.connect(lambda _, g=grade, c=cost: self._select(g, c))
+            btn.clicked.connect(lambda _, g=grade, c=cost, f=fee: self._select(g, c, f))
         h2.addWidget(btn); h2.addStretch()
         cl.addLayout(h2)
         return card
 
-    def _select(self, grade, cost):
+    def _select(self, grade, cost, fee):
         p = get_player()
         if not p: return
         assets = p.get("total_assets", 0)
@@ -182,6 +210,7 @@ class AgentWindow(QDialog):
                 f"💸 자산 부족  필요 {fmt_money(cost)}  현재 {fmt_money(assets)}", 1500)
             return
         # 확인 없이 바로 계약 (토스트로 충분)
-        update_player(agent_grade=grade, total_assets=assets - cost)
-        add_log(f"👔 에이전트 [{grade}]로 변경  계약금 -{fmt_money(cost)}", "event")
+        update_player(agent_grade=grade, agent_fee_rate=fee,
+                      total_assets=assets - cost)
+        add_log(f"👔 에이전트 [{grade}] 계약  수수료 {fee*100:.0f}%  계약금 -{fmt_money(cost)}", "event")
         self.accept()

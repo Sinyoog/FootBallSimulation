@@ -151,9 +151,27 @@ class PlayerPanel(QWidget):
         salary   = p.get("salary",0)
         monthly  = salary // 12
 
+        # 국적 표시 (복수국적: 본 국적 맨 앞 + ★, 나머지 병기)
+        _nats = []
+        for _nk, _fk in (("nationality","flag"),("nationality2","flag2"),("nationality3","flag3")):
+            _n = p.get(_nk, "") or ""
+            if _n:
+                _nats.append((_n, p.get(_fk, "") or ""))
+        _committed = p.get("intl_committed", "") or ""
+        if _committed and any(n == _committed for n, f in _nats):
+            _nats.sort(key=lambda nf: 0 if nf[0] == _committed else 1)
+        if _nats:
+            _parts = []
+            for _n, _f in _nats:
+                _mark = "★" if (_committed and _n == _committed) else ""
+                _parts.append(f"{_f} {_n}{_mark}")
+            _nat_str = "  /  ".join(_parts)
+        else:
+            _nat_str = f"{p.get('flag','')} {p.get('nationality','')}"
+
         rows = [
             ("나이",   f"{p['age']}세 ({p['current_year']}년)"),
-            ("국적",   f"{p.get('flag','')} {p['nationality']}"),
+            ("국적",   _nat_str),
             ("소속",   team_name),
             ("리그",   league_name),
             ("포지션", p["position"]),

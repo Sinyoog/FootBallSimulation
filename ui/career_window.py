@@ -12,6 +12,25 @@ from PyQt6.QtGui import QColor
 from game_engine import get_player, fmt_money, get_my_promotions
 from database import get_conn
 
+
+# 개인 수상으로 분류할 키워드 (trophy_log에 섞여 들어온 발롱도르·MVP 행 식별)
+_PERSONAL_AWARD_KEYWORDS = (
+    "발롱도르", "MVP", "득점왕", "도움왕", "베스트11",
+    "골든글러브", "영플레이어", "신데렐라", "푸스카스", "사모라",
+)
+
+
+def _is_personal_award(trophy):
+    """trophy_log 한 행이 '개인 수상'인지 판별.
+
+    리그/국제대회 우승은 competition이 '... 우승' / '... 32강 탈락' 형태이고,
+    개인 수상은 'MVP (...)' / '발롱도르 (...)' 형태로 적재된다.
+    competition 문자열에 개인 수상 키워드가 들어 있으면 개인 수상으로 본다.
+    """
+    comp = (trophy.get("competition") or "")
+    return any(k in comp for k in _PERSONAL_AWARD_KEYWORDS)
+
+
 STYLE = """
 QDialog { background:#1e1e1e; color:#ccc; }
 QTabWidget::pane { border:1px solid #333; background:#1e1e1e; }
@@ -65,7 +84,11 @@ class CareerWindow(QDialog):
 
         conn = get_conn(); c = conn.cursor()
         entries  = [dict(r) for r in c.execute("SELECT * FROM career_entries ORDER BY id").fetchall()]
-        trophies = [dict(r) for r in c.execute("SELECT * FROM trophy_log ORDER BY id").fetchall()]
+        # trophy_log에는 리그/국제대회 우승뿐 아니라 발롱도르·MVP 같은 개인 수상도
+        # 함께 적재된다. 우승 탭에는 '진짜 우승'만 보여야 하므로 개인 수상 행은 제외한다.
+        # (개인 수상은 아래 awards 테이블 기반으로 '개인 수상' 탭에서 따로 표시됨)
+        all_trophies = [dict(r) for r in c.execute("SELECT * FROM trophy_log ORDER BY id").fetchall()]
+        trophies = [t for t in all_trophies if not _is_personal_award(t)]
         try:
             awards = [dict(r) for r in c.execute(
                 "SELECT * FROM awards WHERE is_mine=1 ORDER BY year").fetchall()]
@@ -84,6 +107,10 @@ class CareerWindow(QDialog):
         import intl_engine
         intl_ms = intl_engine.get_my_intl_matches()
         tabs.addTab(self._intl_tab(intl_ms, p), f"국제전 ({len(intl_ms)})")
+
+        import champions_engine
+        cl_ms = champions_engine.get_my_cl_matches()
+        tabs.addTab(self._champions_tab(cl_ms, p), f"챔피언스 ({len(cl_ms)})")
         root.addWidget(tabs)
         tabs.currentChanged.connect(lambda: self._fit_width())
 
@@ -266,7 +293,7 @@ class CareerWindow(QDialog):
             tname  = t.get("team_name","")
             lname  = t.get("league_name","")
 
-            if tier_t and tier_t > 0:
+            if tier_t and tier_t > 0 and not _is_personal_award(t):
                 # 리그 우승: 팀 (국가) / 리그 (N부) / 우승
                 country  = self._country_of_league(lname)
                 team_str = f"{tname} ({country})" if country else tname
@@ -376,6 +403,49 @@ class CareerWindow(QDialog):
                      else "#888888" if res == "무" else "#cc4444")
             vals = [f"{m['year']} {m['week']}주차", m["position"],
                     f"{m['nat_flag']}{m['nat']}",
+                    f"{m['comp']} {m['stage']}",
+                    f"{m['opp_flag']}{m['opp']}",
+                    stat1, stat2, str(m["rating"]), m["score"], res]
+            for j, v in enumerate(vals):
+                self._set(tbl, i, j, v, color if j == len(vals) - 1 else None)
+        lay.addWidget(tbl)
+        return w
+
+    def _champions_tab(self, matches, p):
+        """챔피언스리그 경기별 기록: 기간/포지션/팀/대회/상대/스탯/평점/스코어/결과."""
+        w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(0,0,0,0)
+
+        # 대회별 성적(우승/몇강) 요약 (cl_history)
+        conn = get_conn()
+        try:
+            hist = [dict(r) for r in conn.execute(
+                "SELECT * FROM cl_history ORDER BY year").fetchall()]
+        except Exception:
+            hist = []
+        conn.close()
+
+        if hist:
+            parts = [f"{h['year']}년 {h['result']}" for h in hist]
+            hl = QLabel("🏆 " + "   ·   ".join(parts))
+            hl.setStyleSheet("color:#ffd24d;font-size:12px;font-weight:bold;padding:4px;")
+            hl.setWordWrap(True)
+            lay.addWidget(hl)
+
+        if not matches:
+            lay.addWidget(QLabel("챔피언스리그 출전 기록 없음"))
+            return w
+
+        cols = ["기간","포지션","소속팀","대회","상대","골/선방","어시/실점","평점","스코어","결과"]
+        tbl = self._make_table(len(matches), cols)
+        for i, m in enumerate(matches):
+            is_gk = m["position"] == "GK"
+            stat1 = f"{m['saves']}선방"   if is_gk else f"{m['goals']}골"
+            stat2 = f"{m['conceded']}실점" if is_gk else f"{m['assists']}A"
+            res   = m["result"]
+            color = ("#00cc44" if res.startswith("승")
+                     else "#888888" if res == "무" else "#cc4444")
+            vals = [f"{m['year']} {m['week']}주차", m["position"],
+                    f"{m['team_flag']}{m['team']}",
                     f"{m['comp']} {m['stage']}",
                     f"{m['opp_flag']}{m['opp']}",
                     stat1, stat2, str(m["rating"]), m["score"], res]

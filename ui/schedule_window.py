@@ -1,6 +1,10 @@
 """
 ui/schedule_window.py  ─  모달리스, 실시간 갱신
 """
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel,
     QTableWidget, QTableWidgetItem, QHeaderView,
@@ -103,6 +107,11 @@ class ScheduleWindow(QDialog):
         if intl_w:
             self._tab.addTab(intl_w, "🌍 국제대회")
 
+        # 챔피언스리그 탭
+        champs_w = self._make_champions_tab()
+        if champs_w:
+            self._tab.addTab(champs_w, "🏆 챔피언스리그")
+
         if 0 <= cur < self._tab.count():
             self._tab.setCurrentIndex(cur)
 
@@ -201,37 +210,185 @@ class ScheduleWindow(QDialog):
             gt.setFixedHeight(gt.verticalHeader().defaultSectionSize() * len(rows) + 28)
             lay.addWidget(gt)
 
-        # ── 토너먼트 대진 ──
+        # ── 토너먼트 대진 → 브래킷(대진표) ──
         if ko_rows:
+            from ui.bracket_widget import BracketWidget, build_rounds_from_matches
             lbl_k = QLabel("◼ 토너먼트")
             lbl_k.setStyleSheet("color:#00cc44;font-weight:bold;font-size:12px;margin-top:6px;")
             lay.addWidget(lbl_k)
-            stage_seen = None
+
+            # 등장하는 스테이지 순서를 데이터 등장 순으로 잡아 정렬 기준 생성
+            stage_order = {}
             for m in ko_rows:
-                if m["stage"] != stage_seen:
-                    stage_seen = m["stage"]
-                    sl = QLabel(f"  {intl_engine.STAGE_KO.get(m['stage'], m['stage'])}  ({m['week']}주차)")
-                    sl.setStyleSheet("color:#aaaaaa;font-size:11px;font-weight:bold;")
-                    lay.addWidget(sl)
-                hf, af = flags.get(m["home"], ""), flags.get(m["away"], "")
-                if m["home_score"] >= 0:
-                    pso = f"  (PSO {m['pso_score']})" if m["pso_winner"] else ""
-                    winner = m["pso_winner"] or (m["home"] if m["home_score"] > m["away_score"] else m["away"])
-                    txt = f"    {hf}{m['home']}  {m['home_score']} - {m['away_score']}  {af}{m['away']}{pso}   →  {flags.get(winner,'')}{winner} 진출"
+                stg = intl_engine.STAGE_KO.get(m["stage"], m["stage"])
+                if stg not in stage_order:
+                    stage_order[stg] = len(stage_order)
+
+            bracket_matches = []
+            for m in ko_rows:
+                hs, as_ = m["home_score"], m["away_score"]
+                played  = hs is not None and hs >= 0
+                if played:
+                    winner = m["pso_winner"] or (m["home"] if hs > as_ else m["away"])
                 else:
-                    txt = f"    {hf}{m['home']}  vs  {af}{m['away']}   (예정)"
-                ml = QLabel(txt)
-                if nat and nat in (m["home"], m["away"]):
-                    ml.setStyleSheet("color:#66ccff;font-size:12px;")
-                elif m["home_score"] >= 0:
-                    ml.setStyleSheet("color:#cccccc;font-size:12px;")
+                    winner = ""
+                if nat and nat == m["home"]:
+                    my_side = "home"
+                elif nat and nat == m["away"]:
+                    my_side = "away"
                 else:
-                    ml.setStyleSheet("color:#777777;font-size:12px;")
-                lay.addWidget(ml)
+                    my_side = None
+                bracket_matches.append({
+                    "stage": intl_engine.STAGE_KO.get(m["stage"], m["stage"]),
+                    "week": m["week"],
+                    "home": m["home"], "away": m["away"],
+                    "home_flag": flags.get(m["home"], ""),
+                    "away_flag": flags.get(m["away"], ""),
+                    "hs": hs if played else -1, "as_": as_ if played else -1,
+                    "winner": winner,
+                    "pso": m["pso_score"] if m["pso_winner"] else "",
+                    "my_side": my_side,
+                })
+
+            rounds = build_rounds_from_matches(bracket_matches, stage_order)
+            bracket = BracketWidget(rounds)
+            lay.addWidget(bracket)
+            self._fit_to_bracket(bracket)
 
         lay.addStretch()
         outer.setWidget(body)
         return outer
+
+    # ── 챔피언스리그 탭 ──────────────────────────
+
+    def _make_champions_tab(self):
+        try:
+            import champions_engine
+        except ImportError:
+            return None
+        from game_engine import get_state, get_player
+        
+        st = get_state()
+        if not st:
+            return None
+        
+        p = get_player()
+        if not p or not p.get("current_team_id"):
+            return None
+        
+        # 내 팀이 속한 리그와 국가 정보 조회
+        conn = get_conn()
+        team_info = conn.execute("""
+            SELECT t.id, t.name, l.id as league_id, l.name as league_name,
+                   cn.id as country_id, cn.name as country_name, cn.continent
+            FROM teams t
+            JOIN leagues l ON t.league_id = l.id
+            JOIN countries cn ON l.country_id = cn.id
+            WHERE t.id = ?
+        """, (p["current_team_id"],)).fetchone()
+        conn.close()
+        
+        if not team_info:
+            return None
+        
+        my_continent = team_info["continent"]
+        my_team_id = team_info["id"]
+        
+        # 내 팀의 챔피언스리그 경기 조회
+        matches = champions_engine.get_my_champions_matches(st["current_year"])
+        if not matches:
+            return None
+        
+        from PyQt6.QtWidgets import QScrollArea
+        
+        outer = QScrollArea()
+        outer.setWidgetResizable(True)
+        outer.setStyleSheet("QScrollArea{border:none;background:#1e1e1e;}")
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(10)
+        
+        # 챔피언스리그 이름
+        league_names = {
+            "유럽": "유럽 챔피언스리그",
+            "아시아": "아시안 챔피언스리그",
+            "아프리카": "아프리카 챔피언스리그",
+            "남미": "코파 리베르타도레스"
+        }
+        league_name = league_names.get(my_continent, f"{my_continent} 챔피언스리그")
+        
+        # 헤더
+        hdr = QLabel(f"🏆 {st['current_year']}년 {league_name}")
+        hdr.setStyleSheet("color:#ffcc00;font-size:14px;font-weight:bold;")
+        lay.addWidget(hdr)
+        
+        sub = QLabel(f"팀: {team_info['name']} ({team_info['league_name']})")
+        sub.setStyleSheet("color:#888;font-size:11px;")
+        lay.addWidget(sub)
+        
+        # 토너먼트 매치업 → 브래킷(대진표)
+        from ui.bracket_widget import BracketWidget, build_rounds_from_matches
+        stage_order = {"32강": 0, "16강": 1, "8강": 2, "4강": 3, "결승": 4}
+
+        bracket_matches = []
+        for m in matches:
+            hs, as_ = m["home_score"], m["away_score"]
+            played  = hs is not None and hs >= 0
+            if played:
+                winner = m["pso_winner"] or (m["home_name"] if hs > as_ else m["away_name"])
+            else:
+                winner = ""
+            if m["home_id"] == my_team_id:
+                my_side = "home"
+            elif m["away_id"] == my_team_id:
+                my_side = "away"
+            else:
+                my_side = None
+            bracket_matches.append({
+                "stage": m["stage"], "week": m["week"],
+                "home": m["home_name"], "away": m["away_name"],
+                "home_flag": "", "away_flag": "",
+                "hs": hs if played else -1, "as_": as_ if played else -1,
+                "winner": winner, "pso": m["pso_score"] if m["pso_winner"] else "",
+                "my_side": my_side,
+            })
+
+        if bracket_matches:
+            lbl_t = QLabel("◼ 토너먼트")
+            lbl_t.setStyleSheet("color:#00cc44;font-weight:bold;font-size:12px;")
+            lay.addWidget(lbl_t)
+            rounds = build_rounds_from_matches(bracket_matches, stage_order)
+            bracket = BracketWidget(rounds)
+            lay.addWidget(bracket)
+            self._fit_to_bracket(bracket)
+        
+        lay.addStretch()
+        outer.setWidget(body)
+        return outer
+
+    def _fit_to_bracket(self, bracket):
+        """대진표 크기에 맞춰 창을 자동으로 키운다 (가로/세로).
+
+        브래킷은 라운드 수·팀 수에 따라 크기가 달라지므로,
+        스크롤 없이 한눈에 보이도록 가능한 범위에서 창을 넓힌다.
+        화면 밖으로 나가지 않게 사용 가능한 화면 크기로 상한을 둔다.
+        """
+        from PyQt6.QtWidgets import QApplication
+        sh = bracket.sizeHint()
+        # 탭/여백 등 크롬을 감안한 여유
+        want_w = sh.width()  + 80
+        want_h = sh.height() + 200
+
+        scr = QApplication.primaryScreen()
+        avail = scr.availableGeometry() if scr else None
+        max_w = avail.width()  - 40 if avail else 1600
+        max_h = avail.height() - 80 if avail else 1000
+
+        target_w = min(max(self.width(),  want_w), max_w)
+        target_h = min(max(self.height(), want_h), max_h)
+        if target_w > self.width() or target_h > self.height():
+            self.resize(target_w, target_h)
 
     def _make_table(self, data, my_view=True):
         w   = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(0,0,0,0)

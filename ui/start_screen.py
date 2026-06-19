@@ -5,7 +5,7 @@ import random
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QLineEdit, QComboBox, QFrame,
-    QDialog, QMessageBox
+    QDialog, QMessageBox, QScrollArea, QGridLayout
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
@@ -99,6 +99,118 @@ def _game_warning(parent, title: str, message: str):
     ok.clicked.connect(dlg.accept)
     lay.addWidget(ok, alignment=Qt.AlignmentFlag.AlignCenter)
     dlg.exec()
+
+
+class CountryPickerDialog(QDialog):
+    """검색 + 다열 그리드 형태의 국적 선택 다이얼로그.
+
+    국가가 매우 많으므로(180+) 일반 콤보박스 대신 검색창 + 4열 버튼 그리드로
+    제공한다. 선택 결과는 self.selected = (name, flag) 또는 None(랜덤)으로 보관.
+    리그가 있는 '실제' 국가만 노출한다(이름만 있는 국가 제외).
+    """
+    COLS = 4
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("국가 선택")
+        self.setMinimumSize(560, 480)
+        self.setStyleSheet(DARK_STYLE)
+        self.selected = None          # (name, flag) | None(=랜덤)
+        self._all = self._load_countries()
+        self._build()
+
+    def _load_countries(self):
+        """리그가 있는 국가만 (grade 높은 순 → 이름 순)."""
+        conn = get_conn()
+        rows = conn.execute(
+            """SELECT name, flag, grade FROM countries
+               WHERE id IN (SELECT DISTINCT country_id FROM leagues)
+               ORDER BY
+                 CASE grade WHEN 'S' THEN 0 WHEN 'A' THEN 1 WHEN 'B' THEN 2
+                            WHEN 'C' THEN 3 WHEN 'D' THEN 4 WHEN 'E' THEN 5
+                            ELSE 6 END,
+                 name""").fetchall()
+        conn.close()
+        return [(r["name"], r["flag"]) for r in rows]
+
+    def _build(self):
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+        lay.setContentsMargins(16, 16, 16, 16)
+
+        # 헤더
+        t = QLabel("🌍  국가 선택")
+        t.setFont(QFont("Malgun Gothic", 15, QFont.Weight.Bold))
+        t.setStyleSheet("color: #00cc44;")
+        lay.addWidget(t)
+
+        # 검색창
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("국가명 검색…  (예: 대한, 브라, 잉글)")
+        self.search.textChanged.connect(self._refilter)
+        lay.addWidget(self.search)
+
+        # 랜덤 선택 버튼 (맨 위 고정)
+        rand = QPushButton("🎲 랜덤 (자동 선택)")
+        rand.setObjectName("gray")
+        rand.clicked.connect(self._pick_random)
+        lay.addWidget(rand)
+
+        # 스크롤 가능한 그리드 영역
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setStyleSheet("QScrollArea { border: 1px solid #444; border-radius: 4px; }")
+        self.grid_host = QWidget()
+        self.grid = QGridLayout(self.grid_host)
+        self.grid.setSpacing(6)
+        self.grid.setContentsMargins(8, 8, 8, 8)
+        self.scroll.setWidget(self.grid_host)
+        lay.addWidget(self.scroll, 1)
+
+        # 하단 취소
+        cancel = QPushButton("취소")
+        cancel.setObjectName("danger")
+        cancel.setFixedWidth(120)
+        cancel.clicked.connect(self.reject)
+        lay.addWidget(cancel, alignment=Qt.AlignmentFlag.AlignRight)
+
+        self._refilter("")
+
+    def _refilter(self, text):
+        # 기존 버튼 제거
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+        q = text.strip()
+        items = [(n, f) for (n, f) in self._all if q in n] if q else self._all
+
+        if not items:
+            empty = QLabel("검색 결과가 없습니다.")
+            empty.setStyleSheet("color: #888; padding: 20px;")
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.grid.addWidget(empty, 0, 0, 1, self.COLS)
+            return
+
+        for idx, (name, flag) in enumerate(items):
+            r, c = divmod(idx, self.COLS)
+            btn = QPushButton(f"{flag} {name}")
+            btn.setObjectName("gray")
+            btn.setStyleSheet(
+                "QPushButton { text-align: left; padding: 8px 10px; font-size: 12px; }"
+                "QPushButton:hover { background-color: #3a8a3a; }")
+            btn.clicked.connect(lambda _, n=name, f=flag: self._pick(n, f))
+            self.grid.addWidget(btn, r, c)
+
+    def _pick(self, name, flag):
+        self.selected = (name, flag)
+        self.accept()
+
+    def _pick_random(self):
+        self.selected = None
+        self.accept()
 
 
 class StartScreen(QWidget):
@@ -206,6 +318,17 @@ class NewPlayerDialog(QDialog):
         name_row.addWidget(self.name_edit)
         lay.addLayout(name_row)
 
+        # 국적 (포지션 위) — 국가가 많아 검색+그리드 다이얼로그로 선택
+        self._nat = None    # (name, flag) | None(=랜덤)
+        nat_row = QHBoxLayout()
+        nat_row.addWidget(QLabel("국적"))
+        self.nat_btn = QPushButton("🌍 국가 선택  (미선택 시 랜덤)")
+        self.nat_btn.setObjectName("gray")
+        self.nat_btn.setStyleSheet("QPushButton { text-align: left; padding: 6px 10px; }")
+        self.nat_btn.clicked.connect(self._pick_country)
+        nat_row.addWidget(self.nat_btn)
+        lay.addLayout(nat_row)
+
         # 포지션
         pos_row = QHBoxLayout()
         pos_row.addWidget(QLabel("포지션"))
@@ -223,7 +346,7 @@ class NewPlayerDialog(QDialog):
         lay.addLayout(role_row)
         self._update_roles(POSITIONS[0])
 
-        note = QLabel("※ 국적 · 신체 · 성격 · 특징 · 스탯은 자동 랜덤")
+        note = QLabel("※ 신체 · 성격 · 특징 · 스탯은 자동 랜덤")
         note.setStyleSheet("color: #666666; font-size: 11px;")
         lay.addWidget(note)
 
@@ -248,6 +371,16 @@ class NewPlayerDialog(QDialog):
     def _update_roles(self, pos):
         self.role_combo.clear()
         self.role_combo.addItems(SUB_ROLES.get(pos, ["기본"]))
+
+    def _pick_country(self):
+        dlg = CountryPickerDialog(self)
+        if dlg.exec():
+            self._nat = dlg.selected          # (name, flag) | None(=랜덤)
+            if self._nat:
+                name, flag = self._nat
+                self.nat_btn.setText(f"{flag} {name}")
+            else:
+                self.nat_btn.setText("🎲 랜덤 (자동 선택)")
 
     def _random_all(self):
         """랜덤 생성 → 바로 인게임 진입"""
@@ -277,5 +410,9 @@ class NewPlayerDialog(QDialog):
             return
         pos  = self.pos_combo.currentText()
         role = self.role_combo.currentText()
-        create_player(name, pos, role)
+        if self._nat:
+            nat_name, nat_flag = self._nat
+            create_player(name, pos, role, nat_name, nat_flag)
+        else:
+            create_player(name, pos, role)
         self.accept()

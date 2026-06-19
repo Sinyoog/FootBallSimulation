@@ -163,6 +163,37 @@ class MainWindow(QMainWindow):
         self.center_panel.refresh()
         self.log_panel.refresh()
 
+    def _nationality_html(self, p):
+        """국적 표시 HTML. 본 국적(국제경기 출전국=intl_committed, 없으면 1국적)을
+        맨 앞에 크고 밝게, 나머지 국적은 뒤에 작고 흐리게. 최대 3개."""
+        nats = []
+        for nk, fk in (("nationality","flag"),
+                       ("nationality2","flag2"),
+                       ("nationality3","flag3")):
+            n = p.get(nk, "") or ""
+            if n:
+                nats.append((n, p.get(fk, "") or ""))
+        if not nats:
+            return ""
+        committed = (p.get("intl_committed", "") or "")
+        primary = None
+        if committed:
+            for n, f in nats:
+                if n == committed:
+                    primary = (n, f); break
+        if primary is None:
+            primary = nats[0]
+        rest = [(n, f) for (n, f) in nats if (n, f) != primary]
+
+        pn, pf = primary
+        star = "★" if committed else ""
+        html = (f"<span style='font-size:15px; font-weight:bold; color:#ffd24d'>"
+                f"{pf} {pn}{star}</span>")
+        if rest:
+            extra = " · ".join(f"{f}{n}" for (n, f) in rest)
+            html += f"<span style='font-size:11px; color:#9aa3ad'>  ({extra})</span>"
+        return html
+
     def _update_top(self):
         p  = get_player()
         st = get_state()
@@ -176,8 +207,9 @@ class MainWindow(QMainWindow):
 
         if self.lang == "ko":
             txt = f"{year}년  |  {season}시즌 {week}주차  |  [{phase}]"
-            if p.get("nationality"):
-                txt += f"  |  {p.get('flag','')} {p['nationality']}"
+            nat_html = self._nationality_html(p)
+            if nat_html:
+                txt += f"  |  {nat_html}"
             if p.get("current_team_id"):
                 from database import get_conn
                 conn = get_conn()

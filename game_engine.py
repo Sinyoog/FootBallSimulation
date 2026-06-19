@@ -6,6 +6,20 @@ from constants import *  # PHYSICAL_STATS, TECHNICAL_STATS, MENTAL_STATS 포함
 
 _pending_transfer_type: str = "입단"  # join_team → _save_career_entry 전달용
 
+# ── 팀 평균 OVR 캐시 ───────────────────────────────────────────
+# ai_players.ovr 및 team_id는 게임 진행 중 변경되지 않는다
+# (변경 지점은 database.py의 1회성 시드/리맵뿐). 따라서 team_id별 평균 OVR은
+# 세션 내내 상수다. 매 경기 시뮬마다 2.6만 행을 집계하던 _team_avg_ovr를
+# 메모이즈해 동일 결과를 반환하면서 호출당 비용을 0으로 만든다.
+# (값이 바뀌는 리맵 시점에는 _invalidate_team_ovr_cache로 비운다.)
+_team_ovr_cache: dict = {}
+_league_ovr_cache: dict = {}
+
+def _invalidate_team_ovr_cache():
+    """ai_players OVR/소속이 일괄 변경되는 경우(리맵·신규 시드) 호출."""
+    _team_ovr_cache.clear()
+    _league_ovr_cache.clear()
+
 
 # ═══════════════════════════════════════════
 # 유틸
@@ -102,17 +116,17 @@ def recalc_ovr(p: dict) -> int:
 
 def _age_train_eff(age: int, peak_age: int) -> float:
     """나이별 훈련 효율 배수. 성장기→전성기→하락기가 선형으로 연결.
-    성장기(16~peak): 1.30→1.00   전성기(peak~peak+2): 1.00
-    하락기(peak+2~33): 1.00→0.55  말년(34+): 0.45
+    성장기(16~peak): 1.30→1.00   전성기(peak~peak+5): 1.00  (현실적 황금기 연장)
+    하락기(peak+5~35): 1.00→0.55  말년(36+): 0.45
     """
     growth_end = peak_age
     if age <= growth_end:
         t = (age - 16) / max(1, growth_end - 16)
         return round(1.30 - 0.30 * t, 3)
-    elif age <= peak_age + 2:
+    elif age <= peak_age + 5:
         return 1.0
-    elif age <= 33:
-        t = (age - (peak_age + 2)) / max(1, 33 - (peak_age + 2))
+    elif age <= 35:
+        t = (age - (peak_age + 5)) / max(1, 35 - (peak_age + 5))
         return round(1.0 - 0.45 * t, 3)
     else:
         return 0.45
@@ -132,15 +146,23 @@ def create_player(name: str, position: str, sub_role: str,
         row = c.fetchone()
         nationality, flag = row["name"], row["flag"]
 
-    # [복수국적] 일정 확률로 두 번째 국적 부여 (현실의 이민자 가정 등).
-    # 1차 국적과 다른 나라를 하나 더 뽑는다. 없으면 단일국적.
+    # [복수국적] 일정 확률로 추가 국적 부여 (현실의 이민자 가정 등).
+    # 1차 국적과 다른 나라를 최대 2개 더 뽑는다 (총 최대 3개). 없으면 단일국적.
     nationality2, flag2 = "", ""
-    if random.random() < 0.20:   # 20% 확률로 복수국적
+    nationality3, flag3 = "", ""
+    if random.random() < 0.20:   # 20% 확률로 2번째 국적
         r2 = c.execute(
             "SELECT name,flag FROM countries WHERE name<>? ORDER BY RANDOM() LIMIT 1",
             (nationality,)).fetchone()
         if r2:
             nationality2, flag2 = r2["name"], r2["flag"]
+            # 2국적이 있을 때만, 추가로 8% 확률로 3번째 국적
+            if random.random() < 0.08:
+                r3 = c.execute(
+                    "SELECT name,flag FROM countries WHERE name NOT IN (?,?) ORDER BY RANDOM() LIMIT 1",
+                    (nationality, nationality2)).fetchone()
+                if r3:
+                    nationality3, flag3 = r3["name"], r3["flag"]
 
     height = random.randint(165, 196)
     weight = random.randint(60, 92)
@@ -246,9 +268,9 @@ def create_player(name: str, position: str, sub_role: str,
         talent_cap, talent_tier, physical_trait,
     ))
 
-    # [복수국적] 두 번째 국적/국기 저장 (단일국적이면 빈 값)
-    conn.execute("UPDATE my_player SET nationality2=?, flag2=? WHERE id=1",
-                 (nationality2, flag2))
+    # [복수국적] 추가 국적/국기 저장 (단일국적이면 빈 값)
+    conn.execute("UPDATE my_player SET nationality2=?, flag2=?, nationality3=?, flag3=? WHERE id=1",
+                 (nationality2, flag2, nationality3, flag3))
 
     # 시즌 상태 초기화
     conn.execute("""INSERT OR REPLACE INTO season_state(id,current_year,current_week,
@@ -489,8 +511,20 @@ def _ensure_career_entry(p, st):
         conn.close(); return
 
     # 없으면 현재 주차 기준으로 생성
-    c_yrs_e  = p.get("contract_years", 0)
+    #  - transfer_type/contract_years는 '이벤트(입단·연장)가 발생한 그 해'에만
+    #    표시되는 일회성 값이다. join_team이 _pending_transfer_type을 세팅한
+    #    직후 첫 _ensure에서만 소비하고, 그 뒤 시즌 줄은 '재직중'(빈 값)으로 둔다.
+    #    같은 팀에 계속 머무는 시즌까지 '오퍼/연장'과 연수가 잔류하던 버그 수정.
+    global _pending_transfer_type
     tt_e     = _pending_transfer_type
+    if tt_e and tt_e != "입단":
+        # 입단/이적 이벤트 줄 → 연수 표시, 그리고 즉시 소비
+        c_yrs_e = p.get("contract_years", 0)
+        _pending_transfer_type = "입단"
+    else:
+        # 같은 팀 잔류 시즌 → 이벤트 아님 (연수/유형 비움 → UI에서 '—')
+        c_yrs_e = 0
+        tt_e    = ""
     tier_e   = p.get("current_tier") or team_row["tier"]
     role_e   = p.get("contract_role", "")
     mgr_e    = p.get("manager_type", "")
@@ -548,6 +582,7 @@ def advance_4weeks(schedule: list):
             break
 
         import intl_engine
+        import champions_engine
 
         # ── 이번 주차 처리 ──
         if p.get("injured"):
@@ -559,29 +594,39 @@ def advance_4weeks(schedule: list):
         elif stype == "경기":
             if isinstance(detail, dict) and detail.get("intl"):
                 intl_engine.simulate_my_match(week, p)
+            elif isinstance(detail, dict) and detail.get("cl"):
+                champions_engine.simulate_my_cl_match(week, p)
             else:
                 _simulate_match(p, week, detail)
         else:
             im = intl_engine.get_my_match(week)
+            cm = champions_engine.get_my_cl_match(week)
             if im:
                 intl_engine.simulate_my_match(week, p)
+            elif cm:
+                champions_engine.simulate_my_cl_match(week, p)
             else:
                 _process_training(p, week, stype, detail)
                 _sim_my_unscheduled_match(week, p, cur_season)
 
-        # 이 주차의 국제대회 + 다른 리그 AI 경기 처리
+        # 이 주차의 국제대회 + 챔스 + 다른 리그 AI 경기 처리
+        # (intl/cl/ai 경기는 my_player의 year/season/team_id/salary를 바꾸지 않으므로
+        #  루프 상단의 p 를 그대로 재사용한다. 불필요한 get_player() 재조회 제거.)
         intl_engine.process_intl_week(week)
-        p = get_player()
+        champions_engine.process_cl_week(week)
         _sim_all_ai_matches(week, p.get("current_league_id", 0), cur_season)
 
         # ── 월급: 4의 배수 주차(= 한 달의 마지막 주)에서만 ──
-        p = get_player()
+        # salary 지급은 total_assets 를 갱신하므로, 직전 경기/훈련 처리가
+        # assets 를 바꿨을 가능성에 대비해 최신 p 를 읽어 안전하게 더한다.
+        # (4주에 1회뿐이라 재조회 비용은 무시할 수준)
         if week % 4 == 0:
-            _pay_salary(p, week)
+            _pay_salary(get_player(), week)
 
         # ── 정확히 1주 전진 (경계 트리거 매주 검사) ──
-        p = get_player()
-        _advance_week(p, week, 1)
+        # _advance_week 는 season_matches(경기 출전 시 갱신됨) 등을 읽어
+        # 37주 경계 커리어 갱신을 판단하므로 최신 p 를 사용한다. (주차당 1회)
+        _advance_week(get_player(), week, 1)
 
         # 진행 중 커리어 행 실시간 갱신
         p_fin = get_player()
@@ -737,10 +782,15 @@ def _process_training(p, week, ttype, focus_stat=None):
         _tech_pool = [s for s in TECHNICAL_STATS
                       if s in FOCUS_TRAIN_STATS.get(p["position"], TECHNICAL_STATS)]
         _rest_pool = (_phy_pool or PHYSICAL_STATS) + (_tech_pool or TECHNICAL_STATS)
-        stat = random.choice(_rest_pool)
-        cur = p.get(stat, 40)
-        if cur > 20:
-            stat_changes[stat] = -1
+        # max(한계치)에 도달한 스탯은 깎지 않는다.
+        #   다 찬 주무기를 깎으면 훈련으로 복구가 안 돼(이미 max) 순감소가 생긴다.
+        #   → 아직 여유 있는(올릴 수 있는) 스탯에서만 하락시켜 복구 가능하게 한다.
+        _rest_below = [s for s in _rest_pool if p.get(s, 40) < p.get(f"{s}_max", 80)]
+        if _rest_below:
+            stat = random.choice(_rest_below)
+            cur = p.get(stat, 40)
+            if cur > 20:
+                stat_changes[stat] = -1
         happy_chg = random.randint(4, 8)
         log_parts = [f"😴 휴식  {week}주차  스트레스 {stress_chg:+d}  행복 {happy_chg:+d}"]
         if stat_changes:
@@ -850,20 +900,23 @@ def _process_training(p, week, ttype, focus_stat=None):
             targets = phy_pick + tech_pick
 
             # [B] 비focus 기술 스탯도 천천히 성장.
+            #   포커스가 다 차면 남는 성장 여력이 안 찬 비focus(예: ST의 패스)로
+            #   흘러가도록 확률을 높였다. 전성기에 '올릴 게 없어' 정체되는 것을 완화.
             _nonfocus = [s for s in TECHNICAL_STATS
                          if s not in focus and p.get(s,40) < p.get(f"{s}_max",80)]
-            if _nonfocus and ttype in ("고강도","중강도","저강도") and random.random() < 0.15:
+            if _nonfocus and ttype in ("고강도","중강도","저강도") and random.random() < 0.30:
                 _slow_pick = random.choice(_nonfocus)
                 _slow_targets = {_slow_pick}
                 targets = targets + [_slow_pick]
             else:
                 _slow_targets = set()
 
-            # [천장 개선] 고강도 전용: focus 스탯들이 cap에 충분히 근접하면,
-            #   남은 성장 여력을 '가중치 있는 비focus 스탯'에 정상 속도로 투입한다.
-            #   이게 없으면 focus 몇 개만 cap에 닿고 나머지가 낮게 남아 OVR이
-            #   cap보다 10+ 낮게 수렴한다. → gifted=90~100 / mid=85~90 /
-            #   normal=80~85 천장을 실제로 달성하게 만드는 핵심 보정.
+            # [천장 개선] focus 스탯들이 한계에 충분히 근접하면, 남은 성장 여력을
+            #   '가중치 있는 비focus 스탯'에 정상 속도로 투입한다.
+            #   이게 없으면 focus 몇 개만 한계에 닿고 나머지가 낮게 남아 OVR이
+            #   천장보다 10+ 낮게 수렴한다.
+            #   - 고강도: talent_cap 기준 (cap까지 돌파 가능)
+            #   - 중강도: max 기준 (max까지만, 다 찬 뒤 안 찬 비focus 채움)
             if cfg.get("exceed_limit"):
                 _cap2 = p.get("talent_cap", 88)
                 _focus_avg = sum(p.get(s,40) for s in focus) / max(1, len(focus))
@@ -876,6 +929,21 @@ def _process_training(p, week, ttype, focus_stat=None):
                     if _nf_all:
                         _nf_all.sort(key=lambda s: _posw.get(s,0), reverse=True)
                         for s in _nf_all[:2]:
+                            if s not in targets:
+                                targets.append(s)
+                        _slow_targets = set()
+            elif ttype == "중강도":
+                # 중강도: focus가 max에 거의 다 찼으면 가중치 있는 비focus를 채운다.
+                _focus_full = all(p.get(s,40) >= p.get(f"{s}_max",80) - 2 for s in focus)
+                if _focus_full:
+                    from database import WEIGHTS as _W2
+                    _posw2 = _W2.get(p["position"], {})
+                    _nf2 = [s for s in ALL_STATS
+                            if s not in focus and _posw2.get(s,0) > 0
+                            and p.get(s,40) < p.get(f"{s}_max",80)]
+                    if _nf2:
+                        _nf2.sort(key=lambda s: _posw2.get(s,0), reverse=True)
+                        for s in _nf2[:2]:
                             if s not in targets:
                                 targets.append(s)
                         _slow_targets = set()
@@ -1148,9 +1216,58 @@ def _simulate_match(p, week, info: dict):
 
 
 def _team_avg_ovr(c, team_id):
+    # 세션 캐시: 같은 team_id는 항상 같은 평균을 반환하므로 1회만 집계.
+    cached = _team_ovr_cache.get(team_id)
+    if cached is not None:
+        return cached
     c.execute("SELECT AVG(ovr) as v FROM ai_players WHERE team_id=?", (team_id,))
     row = c.fetchone()
-    return row["v"] if row and row["v"] else 45
+    val = row["v"] if row and row["v"] else 45
+    _team_ovr_cache[team_id] = val
+    return val
+
+
+# ── 리그 평균 OVR 캐시 ─────────────────────────────────────────
+# 한 리그 전체 ai_players의 평균 OVR. ai_players는 진행 중 안 바뀌므로 상수.
+# (_league_ovr_cache 선언은 파일 상단 _team_ovr_cache 옆에 있음)
+
+def _league_avg_ovr(c, league_id):
+    if not league_id:
+        return 50.0
+    cached = _league_ovr_cache.get(league_id)
+    if cached is not None:
+        return cached
+    c.execute("""SELECT AVG(ap.ovr) as v FROM ai_players ap
+                 JOIN teams t ON ap.team_id=t.id WHERE t.league_id=?""", (league_id,))
+    row = c.fetchone()
+    val = row["v"] if row and row["v"] else 50.0
+    _league_ovr_cache[league_id] = val
+    return val
+
+
+# ══════════════════════════════════════════════════════════════
+# [경기력] OVR-리그격차 지배력 시스템 (튜닝 상수는 여기 모음)
+#   내 OVR이 리그 평균보다 높을수록 개인 활약(골/어시/무실점)이 폭발하고,
+#   낮으면 위축된다. 14경기 풀리그 기준으로 밸런싱됨.
+#   - 황희찬급(85) @ 약체리그(평균50, 격차+35): ST 약 11~12골 (압도적 득점왕)
+#   - 황희찬급(85) @ 강팀리그(평균82, 격차+3):   ST 약 5~6골 (평범한 주전)
+#   - 언더독(격차 음수): 활약 위축
+# ══════════════════════════════════════════════════════════════
+DOMINANCE_K       = 0.045   # 격차 1당 배수 증가폭 (↑일수록 격차 영향 큼)
+DOMINANCE_MIN     = 0.35    # 최저 배수 (강한 리그에서 위축 하한)
+DOMINANCE_MAX     = 2.80    # 최고 배수 (약체리그 무쌍 상한)
+GOAL_PROB_CAP     = 0.85    # 경기당 골 시도 성공확률 상한 (무쌍 방지)
+ASSIST_PROB_CAP   = 0.45    # 경기당 어시 확률 상한
+
+def _dominance_mult(my_ovr, league_avg):
+    """내 OVR vs 리그 평균 → 활약 배수. 격차 0이면 1.0(리그 평균 수준)."""
+    gap = (my_ovr or 50) - (league_avg or 50)
+    return max(DOMINANCE_MIN, min(DOMINANCE_MAX, 1.0 + gap * DOMINANCE_K))
+
+def _stat_n(p, stat, lo=40, hi=95):
+    """스탯을 0~1로 정규화 (lo=0, hi=1). 플레이스타일 반영용."""
+    v = p.get(stat, 60)
+    return max(0.0, min(1.0, (v - lo) / (hi - lo)))
 
 
 def _my_team_avg_ovr(p):
@@ -1236,6 +1353,20 @@ def _player_perf(p, outcome, is_home, hs, as_):
     my_score  = hs if is_home else as_
     opp_score = as_ if is_home else hs
 
+    # ── 지배력 배수: 내 OVR vs 현재 리그 평균 OVR ──
+    # 격차가 클수록 개인 활약(골/어시/선방/무실점)이 폭발, 작거나 음수면 위축.
+    _my_ovr = p.get("ovr", 50)
+    _lid    = p.get("current_league_id", 0)
+    _lg_avg = 50.0
+    if _lid:
+        try:
+            _c_dom = get_conn()
+            _lg_avg = _league_avg_ovr(_c_dom.cursor(), _lid)
+            _c_dom.close()
+        except Exception:
+            _lg_avg = 50.0
+    dom = _dominance_mult(_my_ovr, _lg_avg)
+
     if pos == "GK":
         # ── 티어+OVR 기반 선방률 산출 ──────────────────────────
         # 현재 리그 티어 조회 (p에 current_league_id 있으면 사용)
@@ -1264,8 +1395,10 @@ def _player_perf(p, outcome, is_home, hs, as_):
         # OVR → 선방률 범위 내 위치 (OVR 40=하위 10%, 99=상위 10%)
         _ovr_t = max(0.0, min(1.0, (_gk_ovr - 40) / 60))
         _sr_center = _sr_min + (_sr_max - _sr_min) * _ovr_t
+        # 지배력 보정: 리그 평균보다 월등하면 선방률 추가 상승 (상한 92%)
+        _sr_center = min(0.92, _sr_center * (0.7 + 0.3 * dom))
         # 경기마다 ±4% 랜덤 변동
-        _sr_target = max(_sr_min, min(_sr_max, _sr_center + random.uniform(-0.04, 0.04)))
+        _sr_target = max(_sr_min, min(0.92, _sr_center + random.uniform(-0.04, 0.04)))
 
         # 유효슈팅 수: 티어 높을수록 슈팅 많음 (1부 5~9, 2부 4~8, 3부 3~7)
         if _tier == 1:
@@ -1287,22 +1420,57 @@ def _player_perf(p, outcome, is_home, hs, as_):
         if opp_score == 0: base += 0.5; events.append("🧱 클린시트!")
         elif opp_score >= 3: base -= 1.0; events.append("😞 다실점...")
     else:
-        # 골 (내 팀 득점 my_score를 초과할 수 없음)
-        gprob = {"ST":0.35,"CF":0.30,"LW":0.25,"RW":0.25,"CAM":0.20,"CM":0.12}.get(pos, 0.05)
+        # ── 골/어시: 지배력 배수 × 포지션 × 개인 스탯(플레이스타일) ──
+        # 슈팅↑=골, 패스↑=어시, 드리블↑=둘 다 약간, 세트피스↑=보너스골.
+        sh = _stat_n(p, "shooting")
+        pa = _stat_n(p, "passing")
+        dr = _stat_n(p, "dribbling")
+        sp = _stat_n(p, "setpiece")
+
+        # 포지션별 기본 골/어시 성향 (계수)
+        if pos in ("ST", "CF"):
+            g_base, g_sh, g_dr = 0.20, 0.18, 0.04
+            a_base, a_pa, a_dr = 0.05, 0.18, 0.08
+        elif pos in ("LW", "RW"):
+            g_base, g_sh, g_dr = 0.15, 0.15, 0.07
+            a_base, a_pa, a_dr = 0.07, 0.18, 0.10
+        elif pos == "CAM":
+            g_base, g_sh, g_dr = 0.06, 0.13, 0.05
+            a_base, a_pa, a_dr = 0.07, 0.22, 0.09
+        elif pos == "CM":
+            g_base, g_sh, g_dr = 0.04, 0.11, 0.04
+            a_base, a_pa, a_dr = 0.06, 0.20, 0.08
+        else:  # 수비/CDM 등: 골·어시 드묾
+            g_base, g_sh, g_dr = 0.02, 0.06, 0.02
+            a_base, a_pa, a_dr = 0.03, 0.10, 0.04
+
+        gprob = min(GOAL_PROB_CAP, (g_base + sh * g_sh + dr * g_dr) * dom)
+        aprob = min(ASSIST_PROB_CAP, (a_base + pa * a_pa + dr * a_dr) * dom)
+
+        # 골 (내 팀 득점 my_score 이내로 클램프)
+        got_goal = False
         if my_score > 0 and random.random() < gprob:
-            goals = random.choices([1,2],[75,25])[0]
-            goals = min(goals, my_score)        # 내 팀 득점 이내로 클램프
+            goals = random.choices([1, 2, 3], [70, 24, 6])[0]
+            goals = min(goals, my_score)
             base += goals * 1.0
-            events.append(f"⚽ {'골!' if goals==1 else '멀티골!'}")
+            events.append(f"⚽ {'골!' if goals == 1 else ('멀티골!' if goals == 2 else '해트트릭!')}")
+            got_goal = True
 
-        # 어시 (내 골을 제외한 팀 잔여 득점이 있을 때만 — 같은 골에 골+어시 동시 불가)
-        if goals == 0 and (my_score - goals) > 0 and random.random() < 0.22:
-            assists = 1; base += 0.5; events.append("🎯 어시스트!")
+        # 세트피스 보너스 골 (세트피스 높은 키커, 약체 상대일수록 ↑)
+        if my_score > goals and sp > 0.55 and random.random() < 0.04 * dom:
+            goals += 1; base += 1.0; events.append("🎯 세트피스 골!")
 
-        # 수비 라인 평점 보정 (무실점 기여 — 공격수와 기대평점 균형)
+        # 어시 (골과 독립 판정. 골 넣은 경기는 어시 확률 절반 — 한 장면 중복 방지)
+        rem = my_score - goals
+        if rem > 0:
+            eff_aprob = aprob * 0.5 if got_goal else aprob
+            if random.random() < eff_aprob:
+                assists = 1; base += 0.5; events.append("🅰 어시스트!")
+
+        # 수비 라인 평점 보정 (무실점 기여 — 지배력 클수록 더 안정적)
         if pos in DEF_POS:
             if opp_score == 0:
-                base += 1.0; events.append("🧱 무실점 기여")
+                base += 1.0 * (0.7 + 0.3 * dom); events.append("🧱 무실점 기여")
             elif opp_score == 1:
                 base += 0.4
             elif opp_score >= 3:
@@ -1682,7 +1850,9 @@ def _pay_salary(p, week):
     salary = p.get("salary",0)
     if salary <= 0: return
     monthly = salary // 12
-    fee = AGENT_FEE_RATE.get(p.get("agent_grade","F"), 0)
+    # 에이전트 수수료: 개별 계약 수수료율(agent_fee_rate)이 있으면 그것,
+    # 없으면(0) 등급 기본값. 같은 등급이라도 계약마다 수수료가 다를 수 있다.
+    fee = p.get("agent_fee_rate", 0) or AGENT_FEE_RATE.get(p.get("agent_grade","F"), 0)
     net = int(monthly * (1-fee))
     assets   = p.get("total_assets",   0) + net
     earnings = p.get("total_earnings", 0) + net  # 이슈10: 누적 수입
@@ -1744,6 +1914,16 @@ def _advance_week(p, base_week, n_weeks=4):
             intl_engine.start_intl_tournament(new_year)
         except Exception as e:
             add_log(f"⚠ 국제대회 생성 오류: {e}", "event")
+
+    # 41주차 진입: 클럽 대륙 챔피언스리그 시작 (매년)
+    #   리그 경기는 35주에 끝나므로 직전 시즌(current_season) 순위로 출전팀 선발.
+    from champions_engine import CL_START_WEEK
+    if new_week == CL_START_WEEK:
+        try:
+            import champions_engine
+            champions_engine.start_champions_league(new_year, new_season)
+        except Exception as e:
+            add_log(f"⚠ 챔피언스리그 생성 오류: {e}", "event")
 
     # 새 시즌 시작(1주차 진입 시 1회) 내 리그 + 인접 리그 일정 생성
     # generate_season_schedule는 멱등하지만, 1주차에만 호출해 불필요한 중복 조회 방지
@@ -1977,6 +2157,7 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
 
         # 사모라 상 (최저 실점 골키퍼 — 경기당 평균 실점 최소)
         # 조건: GK && season_matches >= 20 && 경기당 1.2골 이하
+        season_matches = p.get("season_matches", 0)
         if p.get("position") == "GK" and season_matches >= 20:
             my_ga_rate = season_goals_against / season_matches if season_matches > 0 else 999
             # 대부분의 GK는 경기당 1.3~1.5골 실점, 우수한 GK는 1.0~1.2
@@ -2121,8 +2302,25 @@ def _end_of_season(p, year):
                 if avg_r >= _base + 0.5:   new_sal = int(base_sal * 1.15)
                 elif avg_r >= _base:       new_sal = int(base_sal * 1.05)
                 else:                      new_sal = int(base_sal * 0.95)
-                update_player(_contract_renew_offer=new_sal)
-                add_log(f"📋 계약 만료! 팀에서 재계약을 제안합니다. (제시 연봉: {fmt_money(new_sal)})", "event", year, 52)
+                # 팀이 계약 기간(1~3년)을 결정한다. 나이·활약 기반:
+                #  - 어리고(28세 이하) 잘하면 장기(3년) 제안
+                #  - 전성기 지난(31세+) 선수는 단기(1년) 위주
+                #  - 그 사이는 활약도로 2~3년
+                _age = new_age
+                if _age >= 33:
+                    renew_yrs = 1
+                elif _age >= 31:
+                    renew_yrs = random.choices([1, 2], [65, 35])[0]
+                elif _age >= 29:
+                    renew_yrs = random.choices([1, 2, 3], [25, 50, 25])[0]
+                elif _age <= 28 and avg_r >= _base + 0.5:
+                    renew_yrs = random.choices([2, 3], [30, 70])[0]   # 유망/핵심 → 장기
+                else:
+                    renew_yrs = random.choices([1, 2, 3], [15, 45, 40])[0]
+                update_player(_contract_renew_offer=new_sal,
+                              _contract_renew_years=renew_yrs)
+                add_log(f"📋 계약 만료! 팀에서 {renew_yrs}년 재계약을 제안합니다. "
+                        f"(제시 연봉: {fmt_money(new_sal)})", "event", year, 52)
             else:
                 # 재계약 거절 → 소속 없음
                 # (연말 항목은 이미 닫혔으므로 allow_insert=False로 중복 방지)
@@ -3139,6 +3337,9 @@ def _get_team_rank_info(c, team_id) -> str:
 
 
 def _suitable_grades(ovr, agent):
+    """OVR로 자연스러운 리그 등급대를 정하고, 에이전트 등급에 따라
+    '상위 리그 오퍼 +N'을 실제로 적용한다 (AGENT_UPPER_LEAGUE_BONUS).
+    좋은 에이전트일수록 실력보다 높은 등급 리그의 오퍼까지 끌어온다."""
     order = ["F","E","D","C","B","A","S"]
     if ovr >= 85: base = ["S","A"]
     elif ovr >= 75: base = ["A","B"]
@@ -3147,22 +3348,28 @@ def _suitable_grades(ovr, agent):
     elif ovr >= 45: base = ["D","E"]
     else: base = ["E","F"]
 
-    ai = order.index(agent)
-    if ai >= 5 and "S" not in base: base.append("S")
-    elif ai >= 3:
-        bi = order.index(base[0])
-        if bi > 0 and order[bi-1] not in base:
-            base.append(order[bi-1])
+    # 에이전트 상위리그 보너스: 현재 등급대의 최상위에서 N단계 위까지 추가
+    from constants import AGENT_UPPER_LEAGUE_BONUS
+    bonus = AGENT_UPPER_LEAGUE_BONUS.get(agent, 0)
+    if bonus > 0:
+        top_i = max(order.index(g) for g in base)
+        for step in range(1, bonus + 1):
+            ni = top_i + step
+            if ni < len(order) and order[ni] not in base:
+                base.append(order[ni])
+
+    # F급 에이전트는 하위 리그만 (상위 오퍼 못 따옴)
     if agent == "F":
         base = [g for g in base if g in ["E","F"]] or ["F"]
     return base
 
 
 def _salary_ovr_mult(ovr):
-    """OVR → 연봉 배수. 지수형이라 OVR이 높을수록 가파르게 상승.
-    OVR40=0.25배, 65=1.1배, 80=2.85배, 99=4.6배 → 성장의 금전 보상 강화."""
-    t = max(0.0, (ovr - 40) / 25.0)
-    return 0.25 + (t ** 1.9) * 0.85
+    """OVR → 연봉 배수. 상단으로 갈수록 가파르게 (현실의 슈퍼스타 프리미엄).
+    OVR50=0.25배, 70=1.4배, 85=4.1배, 90=5.4배, 99=8.5배.
+    → OVR99 톱리그(S급1부)면 약 600억(메시·음바페급)에 도달."""
+    t = max(0.0, (ovr - 40) / 59.0)
+    return 0.12 + (t ** 2.8) * 8.4
 
 
 def _calc_salary(grade, tier, ovr, country=None):
@@ -3171,13 +3378,13 @@ def _calc_salary(grade, tier, ovr, country=None):
     # country가 주어지면 '리그 부유도' 오버라이드 적용 (사우디=오일머니 등).
     wealth = LEAGUE_WEALTH_OVERRIDE.get(country, grade) if country else grade
     base_year = {
-        "S":{1:2800000, 2:500000, 3:60000},
-        "A":{1:1200000, 2:240000, 3:30000},
-        "B":{1:500000,  2:100000, 3:15000},
-        "C":{1:200000,  2:45000,  3:6000},
-        "D":{1:80000,   2:18000,  3:2000},
-        "E":{1:30000,   2:7000,   3:600},
-        "F":{1:10000,   2:2000,   3:150},   # F3 base=150천원=15만원, OVR 따라 변동
+        "S":{1:7000000, 2:1300000, 3:160000},
+        "A":{1:3200000, 2:640000,  3:80000},
+        "B":{1:1300000, 2:260000,  3:40000},
+        "C":{1:520000,  2:120000,  3:16000},
+        "D":{1:210000,  2:48000,   3:5500},
+        "E":{1:80000,   2:18000,   3:1600},
+        "F":{1:26000,   2:5200,    3:400},   # F3 base=400천원, OVR 따라 변동
     }
     b = base_year.get(wealth, {}).get(tier, 100)
     sal = int(b * _salary_ovr_mult(ovr))
