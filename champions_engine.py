@@ -259,16 +259,25 @@ def start_champions_league(year, season):
 
 
 def _is_my_team_league_winner(p, my_tid):
-    """내 팀이 그 시즌 '내 1부 리그의 1위'인지 — 챔스 출전 자격 판정."""
+    """내 팀이 그 시즌 '내 1부 리그의 1위'인지 — 챔스 출전 자격 판정.
+    챔스는 1부(tier=1) 리그 1위만 출전 자격이 있다. 2부 이하 1위는 자격 없음
+    (2부 우승은 '승격'이지 챔스 진출이 아니다)."""
     if not my_tid:
         return False
     from game_engine import get_league_standings
     conn = get_conn()
-    row = conn.execute("SELECT league_id FROM teams WHERE id=?", (my_tid,)).fetchone()
-    conn.close()
+    row = conn.execute(
+        "SELECT league_id FROM teams WHERE id=?", (my_tid,)).fetchone()
     if not row:
+        conn.close()
         return False
-    standings = get_league_standings(row["league_id"])
+    lid = row["league_id"]
+    tier_row = conn.execute("SELECT tier FROM leagues WHERE id=?", (lid,)).fetchone()
+    conn.close()
+    # 1부가 아니면 챔스 자격 없음 (2부 1위는 승격 대상일 뿐)
+    if not tier_row or tier_row["tier"] != 1:
+        return False
+    standings = get_league_standings(lid)
     if not standings:
         return False
     return standings[0]["id"] == my_tid

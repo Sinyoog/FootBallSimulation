@@ -2006,6 +2006,17 @@ def generate_season_schedule(league_id, season, year, force=False):
     if len(tids) < 2:
         conn.close(); return
 
+    # [중복 생성 방지] 그 시즌 일정이 이미 충분히 생성돼 있으면(상·하반기 14라운드분)
+    #   다시 만들지 않는다. 승강 등으로 teams 구성이 바뀐 뒤 재호출되면 옛 일정과
+    #   새 대진이 섞여 '어떤 팀 3경기 / 어떤 팀 0경기'가 되는 것을 막는다.
+    if not force:
+        n_existing = c.execute(
+            "SELECT COUNT(*) AS c FROM match_results WHERE league_id=? AND season=?",
+            (league_id, season)).fetchone()["c"]
+        # 8팀 풀리그 = 라운드당 4경기 × 14라운드 = 56경기. 8할 이상 차 있으면 완비로 간주.
+        if n_existing >= 56 * 0.8:
+            conn.close(); return
+
     # 이미 완료된 경기 주차
     c.execute("""SELECT week FROM match_results
                  WHERE league_id=? AND season=? AND home_score >= 0""", (league_id, season))
