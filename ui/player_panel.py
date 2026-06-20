@@ -69,11 +69,11 @@ class PlayerPanel(QWidget):
         self.lay.addWidget(self.lbl_rank)
         self._div()
 
-        # 스트레스 / 행복도
+        # 스트레스 / 행복도 (0~100이 최대이므로 bar_max=100)
         self.lbl_stress = QLabel("스트레스  0")
-        self.bar_stress = StatBar(); self.bar_stress.setFixedHeight(8)
+        self.bar_stress = StatBar(bar_max=100); self.bar_stress.setFixedHeight(8)
         self.lbl_happy  = QLabel("행복도  0")
-        self.bar_happy  = StatBar(); self.bar_happy.setFixedHeight(8)
+        self.bar_happy  = StatBar(bar_max=100); self.bar_happy.setFixedHeight(8)
         for w in [self.lbl_stress, self.bar_stress, self.lbl_happy, self.bar_happy]:
             self.lay.addWidget(w)
         self._div()
@@ -90,7 +90,7 @@ class PlayerPanel(QWidget):
         # 스탯
         self.stat_rows: dict[str, StatRow] = {}
         for section, stats in [
-            ("신체", ["stamina","speed","jump"]),
+            ("신체", ["stamina","speed","jump","strength"]),
             ("기술", ["shooting","passing","dribbling","tackling",
                       "heading","positioning","setpiece"]),
             ("정신", ["mental","confidence","leadership","concentration"]),
@@ -177,6 +177,7 @@ class PlayerPanel(QWidget):
             ("포지션", p["position"]),
             ("성격",   p["personality"]),
             ("특징",   p.get("physical_trait", "무난함")),
+            ("체형",   p.get("body_type", "-")),
             ("신체",   f"{p['height']}cm / {p['weight']}kg"),
             ("명성",   f"{p.get('fame',0)} [{fame_lbl}]"),
             ("인기도", str(p.get("popularity",0))),
@@ -213,22 +214,65 @@ class PlayerPanel(QWidget):
         rc = p.get("season_rating_cnt",0)
         rs = p.get("season_rating_sum",0.0)
         avg_r = round(rs/rc,1) if rc else 0.0
+        # 세부 지표
+        d_sh  = p.get("season_shots",0)
+        d_sho = p.get("season_shots_on",0)
+        d_kp  = p.get("season_key_passes",0)
+        d_drb = p.get("season_dribbles",0)
+        d_blk = p.get("season_blocks",0)
+        _pac_c = p.get("season_pass_acc_cnt",0)
+        d_pac = round(p.get("season_pass_acc_sum",0.0)/_pac_c*100) if _pac_c else 0
+        try:
+            from game_engine import _calc_clean_sheets_for_player
+            _cs = _calc_clean_sheets_for_player(p)
+        except Exception:
+            _cs = 0
 
-        if p["position"] == "GK":
-            total_shots = ss + sga  # 선방 + 실점 = 총 슈팅
+        from constants import position_group
+        pos = p.get("position","")
+        grp = position_group(pos)
+
+        if grp == "GK":
+            total_shots = ss + sga
             save_rate = round(ss / total_shots * 100, 1) if total_shots > 0 else 0.0
-            save_str = f"{ss}회 ({ss}/{total_shots})  {save_rate}%"
             s_rows = [
                 ("출전",     f"{sm}경기"),
-                ("선방",     save_str),
+                ("선방",     f"{ss}회 ({save_rate}%)"),
                 ("실점",     f"{sga}골"),
+                ("무실점",   f"{_cs}경기"),
+                ("패스성공", f"{d_pac}%"),
                 ("평균평점", str(avg_r)),
             ]
-        elif p.get("position") in {"CB","CDM"}:
-            # 수비수: 골 대신 평점 강조, 어시 유지
-            s_rows = [("출전",f"{sm}경기"),("어시",f"{sa}A"),("평균평점",str(avg_r))]
+        elif grp == "DEF":
+            # 수비수: 무실점·차단·패스성공이 핵심. 골/어시는 보조.
+            s_rows = [
+                ("출전",     f"{sm}경기"),
+                ("무실점",   f"{_cs}경기"),
+                ("차단",     f"{d_blk}회"),
+                ("패스성공", f"{d_pac}%"),
+                ("평균평점", str(avg_r)),
+                ("공격P",    f"{sg}골 {sa}A"),
+            ]
+        elif pos in ("CM", "CDM", "CAM"):
+            # 미드필더: 골/어시 + 기회창출·패스·차단
+            s_rows = [
+                ("출전",     f"{sm}경기"),
+                ("골/어시",  f"{sg}골 {sa}A"),
+                ("기회창출", f"{d_kp}회"),
+                ("패스성공", f"{d_pac}%"),
+                ("차단",     f"{d_blk}회"),
+                ("평균평점", str(avg_r)),
+            ]
         else:
-            s_rows = [("출전",f"{sm}경기"),("골",f"{sg}골"),("어시",f"{sa}A"),("평균평점",str(avg_r))]
+            # 공격수/윙어: 골/어시 + 슈팅·유효슈팅·기회창출·드리블
+            s_rows = [
+                ("출전",     f"{sm}경기"),
+                ("골/어시",  f"{sg}골 {sa}A"),
+                ("슈팅",     f"{d_sh} (유효 {d_sho})"),
+                ("기회창출", f"{d_kp}회"),
+                ("드리블",   f"{d_drb}회"),
+                ("평균평점", str(avg_r)),
+            ]
         for k,v in s_rows:
             self.season_lay.addWidget(_info_row(k, v))
 
@@ -288,17 +332,23 @@ class StatRow(QWidget):
 
 
 class StatBar(QWidget):
-    """0~100 기준 바. 노란색=현재스탯, 회색반투명=한계스탯 위치 표시"""
-    def __init__(self):
+    """0~125 기준 바. 노란색=현재스탯, 회색반투명=한계스탯 위치 표시.
+    스페셜리스트의 100 초과 스탯도 막대 길이에 반영되도록 상한을 125로 둔다."""
+    BAR_MAX = 125
+    def __init__(self, bar_max=None):
         super().__init__()
         self._cur = 0
         self._mx  = 80
         self._cur_color = None  # None이면 비율로 자동 결정
+        # 스탯바는 0~125(스페셜리스트 100 초과 반영), 스트레스/행복도 등
+        # 0~100이 최대인 값은 bar_max=100을 줘서 100에서 바가 꽉 차게 한다.
+        if bar_max is not None:
+            self.BAR_MAX = bar_max
         self.setMinimumWidth(60)
 
     def set_values(self, cur, mx):
-        self._cur = max(0, min(100, cur))
-        self._mx  = max(0, min(100, mx))
+        self._cur = max(0, min(self.BAR_MAX, cur))
+        self._mx  = max(0, min(self.BAR_MAX, mx))
         self.update()
 
     def paintEvent(self, event):
@@ -308,19 +358,19 @@ class StatBar(QWidget):
         w, h = self.width(), self.height()
         r = 3  # border-radius
 
-        # 배경 (0~100)
+        # 배경 (0~BAR_MAX)
         p.setBrush(QBrush(QColor("#2a2a2a")))
         p.setPen(Qt.PenStyle.NoPen)
         p.drawRoundedRect(0, 0, w, h, r, r)
 
         # 한계스탯 영역 (반투명 회색)
-        mx_w = int(w * self._mx / 100)
+        mx_w = int(w * self._mx / self.BAR_MAX)
         if mx_w > 0:
             p.setBrush(QBrush(QColor(120, 120, 120, 60)))
             p.drawRoundedRect(0, 0, mx_w, h, r, r)
 
         # 현재 스탯 바 (색상)
-        cur_w = int(w * self._cur / 100)
+        cur_w = int(w * self._cur / self.BAR_MAX)
         if cur_w > 0:
             if self._cur_color:
                 color = self._cur_color
@@ -335,8 +385,10 @@ class StatBar(QWidget):
             p.setBrush(QBrush(color))
             p.drawRoundedRect(0, 0, cur_w, h, r, r)
 
-        # 한계스탯 경계선 (흰색 세로줄)
-        mx_x = int(w * self._mx / 100)
+        # 한계스탯 경계선 (흰색 세로줄) — 반투명 한계바 끝에 정확히 일치시킨다.
+        #   (버그수정) 기존엔 /100 으로 그려 BAR_MAX(125) 기준인 반투명바와
+        #   스케일이 어긋나 선이 오른쪽으로 밀려 있었다.
+        mx_x = int(w * self._mx / self.BAR_MAX)
         if 0 < mx_x < w:
             p.setPen(QPen(QColor(200, 200, 200, 140), 1))
             p.drawLine(mx_x, 0, mx_x, h)

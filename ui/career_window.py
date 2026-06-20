@@ -62,12 +62,32 @@ class CareerWindow(QDialog):
         hdr.setStyleSheet("color:#00cc44;font-size:15px;font-weight:bold;")
         root.addWidget(hdr)
 
+        from intl_engine import fmt_nationalities, fmt_rep_nationality
+        _nats = fmt_nationalities(p) or f"{p.get('flag','')}{p.get('nationality','')}"
+        _rep  = fmt_rep_nationality(p)
+        nat_lbl = QLabel(f"🌍 국적: {_nats}    ⚽ 대표: {_rep}")
+        nat_lbl.setStyleSheet("color:#aaa;font-size:12px;")
+        root.addWidget(nat_lbl)
+
         summary = QHBoxLayout()
-        is_gk = p.get("position","") == "GK"
-        stat2_k = "총 선방" if is_gk else "총 골"
-        stat2_v = f"{p.get('total_saves', p.get('total_goals',0))}선방" if is_gk else f"{p.get('total_goals',0)}골"
-        stat3_k = "총 실점" if is_gk else "총 어시"
-        stat3_v = f"{p.get('total_goals_against', p.get('total_assists',0))}실점" if is_gk else f"{p.get('total_assists',0)}A"
+        from constants import position_group
+        _grp = position_group(p.get("position",""))
+        if _grp == "GK":
+            stat2_k, stat2_v = "총 선방", f"{p.get('total_saves',0)}선방"
+            stat3_k, stat3_v = "총 실점", f"{p.get('total_goals_against',0)}실점"
+        elif _grp == "DEF":
+            # 수비수: 무실점 경기 수를 핵심 지표로 (커리어 항목에서 합산)
+            try:
+                _cs = sum(e.get("clean_sheets",0) for e in
+                          [dict(r) for r in get_conn().execute(
+                              "SELECT clean_sheets FROM career_entries").fetchall()])
+            except Exception:
+                _cs = 0
+            stat2_k, stat2_v = "무실점", f"{_cs}경기"
+            stat3_k, stat3_v = "공격P", f"{p.get('total_goals',0)}골 {p.get('total_assists',0)}A"
+        else:
+            stat2_k, stat2_v = "총 골", f"{p.get('total_goals',0)}골"
+            stat3_k, stat3_v = "총 어시", f"{p.get('total_assists',0)}A"
         for k, v in [("총 출전", f"{p.get('total_matches',0)}경기"),
                      (stat2_k, stat2_v),
                      (stat3_k, stat3_v),
@@ -100,7 +120,7 @@ class CareerWindow(QDialog):
 
         tabs = QTabWidget()
         tabs.addTab(self._team_tab(entries),  "팀 이력")
-        tabs.addTab(self._trophy_tab(trophies), f"우승 ({len(trophies)})")
+        tabs.addTab(self._trophy_tab(trophies), f"성적 ({len(trophies)})")
         tabs.addTab(self._award_tab(awards), f"개인 수상 ({len(awards)})")
         tabs.addTab(self._promo_tab(promos),  f"승강 ({len(promos)})")
 
@@ -168,7 +188,23 @@ class CareerWindow(QDialog):
                 league_country[ln] = f"{row['flag']} {row['cname']}" if row else ""
         conn.close()
 
-        cols = ["기간","포지션","국가","리그","팀명","연봉","출전","골","어시","선방","실점","선방률","CS","평균평점","팀순위","승무패","계약","이적"]
+        # 선수의 현재 포지션 그룹에 맞춰 '지표 칸'을 다르게 구성한다.
+        #   공통: 기간/포지션/국가/리그/팀명/연봉/출전 ... 평균평점/팀순위/승무패/계약/이적
+        #   중간 지표 칸만 그룹별로 교체.
+        from constants import position_group
+        _mypos = get_player().get("position", "")
+        _grp = position_group(_mypos)
+        if _grp == "GK":
+            stat_cols = ["골","어시","선방","실점","선방률","CS"]
+        elif _grp == "DEF":
+            stat_cols = ["골","어시","무실점","차단","패스%","평점기여"]
+        elif _mypos in ("CM","CDM","CAM"):
+            stat_cols = ["골","어시","기회창출","패스%","차단","드리블"]
+        else:  # 공격수/윙어
+            stat_cols = ["골","어시","슈팅","유효","기회창출","드리블"]
+        cols = (["기간","포지션","국가","리그","팀명","연봉","출전"]
+                + stat_cols
+                + ["평균평점","팀순위","승무패","계약","이적"])
 
         # 이슈3: 1~4주차 이적 노이즈만 숨김 (4주 이하 머문 0경기 항목)
         # 여름 이적시장(37주~) 입단처럼 경기 없이 보낸 정상 재직 기간은 표시
@@ -212,23 +248,32 @@ class CareerWindow(QDialog):
                     period = f"{sy}/{sw}주~{ey}/{ew_disp}주"
 
             pos   = e.get("position","")
-            is_gk = pos == "GK"
-            # CS(클린시트)는 GK + 중앙 수비 라인(CB/CDM)만 표시
-            CS_POS = {"GK","CB","CDM"}
             sv  = e.get("saves", 0)
             ga  = e.get("goals_against", 0)
             total_shots = sv + ga
             save_rate = f"{round(sv/total_shots*100,1)}%" if total_shots > 0 else "—"
+            _pac = e.get("pass_acc", 0)
+            pac_str = f"{round(_pac*100)}%" if _pac else "—"
 
-            if is_gk:
-                col_goal, col_asst = "—", "—"
-                col_save, col_conc = str(sv), str(ga)
-                col_rate = save_rate
-            else:
-                col_goal = str(e.get("goals", 0))
-                col_asst = str(e.get("assists", 0))
-                col_save, col_conc, col_rate = "—", "—", "—"
-            col_cs = str(e.get("clean_sheets", 0)) if pos in CS_POS else "—"
+            # 테이블 컬럼 세트(stat_cols)에 맞춰 각 지표 칸 값을 매핑.
+            # 그 행 선수가 안 하는 지표는 "—".
+            _val_map = {
+                "골":      str(e.get("goals", 0)),
+                "어시":    str(e.get("assists", 0)),
+                "선방":    str(sv) if pos == "GK" else "—",
+                "실점":    str(ga) if pos == "GK" else "—",
+                "선방률":  save_rate if pos == "GK" else "—",
+                "CS":      str(e.get("clean_sheets", 0)),
+                "무실점":  str(e.get("clean_sheets", 0)),
+                "차단":    str(e.get("blocks", 0)),
+                "패스%":   pac_str,
+                "평점기여": str(round(e.get("avg_rating", 0), 1)) if e.get("avg_rating") else "—",
+                "기회창출": str(e.get("key_passes", 0)),
+                "드리블":  str(e.get("dribbles", 0)),
+                "슈팅":    str(e.get("shots", 0)),
+                "유효":    str(e.get("shots_on", 0)),
+            }
+            stat_vals = [_val_map.get(sc, "—") for sc in stat_cols]
 
             tn = e.get("team_name","")
             ln = e.get("league_name","")
@@ -254,11 +299,11 @@ class CareerWindow(QDialog):
             else:
                 # 같은 팀 계속 (대시)
                 c_str = "—"
-            vals = [period, pos, country_str, league_str, tn,
-                    fmt_money(e.get("salary",0)),
-                    str(e.get("matches",0)),
-                    col_goal, col_asst, col_save, col_conc, col_rate, col_cs,
-                    str(avg), rank_disp, wdl, c_str, t_type]
+            vals = ([period, pos, country_str, league_str, tn,
+                     fmt_money(e.get("salary",0)),
+                     str(e.get("matches",0))]
+                    + stat_vals
+                    + [str(avg), rank_disp, wdl, c_str, t_type])
             # 팔림/방출/계약만료는 빨간색 강조
             tt_color = "#cc4444" if t_type in ("팔림", "방출", "계약만료") else None
             for j, v in enumerate(vals):
@@ -392,20 +437,39 @@ class CareerWindow(QDialog):
         sl.setStyleSheet("color:#66ccff;font-size:12px;font-weight:bold;padding:4px;")
         lay.addWidget(sl)
 
-        cols = ["기간","포지션","국가","대회","상대","골/선방","어시/실점","평점","스코어","결과"]
+        from constants import position_group
+        _pos = p.get("position", "")
+        _grp = position_group(_pos)
+        if _grp == "GK":
+            extra_cols = ["선방","실점"]
+        elif _grp == "DEF":
+            extra_cols = ["차단","패스%"]
+        elif _pos in ("CM","CDM","CAM"):
+            extra_cols = ["기회창출","패스%","차단"]
+        else:
+            extra_cols = ["슈팅","유효","기회창출","드리블"]
+        cols = (["기간","포지션","국가","대회","상대","골","어시"]
+                + extra_cols + ["평점","스코어","결과"])
         tbl = self._make_table(len(matches), cols)
         for i, m in enumerate(matches):
-            is_gk = m["position"] == "GK"
-            stat1 = f"{m['saves']}선방"   if is_gk else f"{m['goals']}골"
-            stat2 = f"{m['conceded']}실점" if is_gk else f"{m['assists']}A"
             res   = m["result"]
             color = ("#00cc44" if res.startswith("승")
                      else "#888888" if res == "무" else "#cc4444")
-            vals = [f"{m['year']} {m['week']}주차", m["position"],
+            _pac = m.get("pass_acc", 0)
+            pac = f"{round(_pac*100)}%" if _pac else "—"
+            _emap = {
+                "선방": str(m.get("saves",0)), "실점": str(m.get("conceded",0)),
+                "차단": str(m.get("blocks",0)), "패스%": pac,
+                "기회창출": str(m.get("key_passes",0)), "드리블": str(m.get("dribbles",0)),
+                "슈팅": str(m.get("shots",0)), "유효": str(m.get("shots_on",0)),
+            }
+            vals = ([f"{m['year']} {m['week']}주차", m["position"],
                     f"{m['nat_flag']}{m['nat']}",
                     f"{m['comp']} {m['stage']}",
                     f"{m['opp_flag']}{m['opp']}",
-                    stat1, stat2, str(m["rating"]), m["score"], res]
+                    str(m["goals"]), str(m["assists"])]
+                    + [_emap.get(c, "—") for c in extra_cols]
+                    + [str(m["rating"]), m["score"], res])
             for j, v in enumerate(vals):
                 self._set(tbl, i, j, v, color if j == len(vals) - 1 else None)
         lay.addWidget(tbl)
@@ -435,20 +499,39 @@ class CareerWindow(QDialog):
             lay.addWidget(QLabel("챔피언스리그 출전 기록 없음"))
             return w
 
-        cols = ["기간","포지션","소속팀","대회","상대","골/선방","어시/실점","평점","스코어","결과"]
+        from constants import position_group
+        _pos = p.get("position", "")
+        _grp = position_group(_pos)
+        if _grp == "GK":
+            extra_cols = ["선방","실점"]
+        elif _grp == "DEF":
+            extra_cols = ["차단","패스%"]
+        elif _pos in ("CM","CDM","CAM"):
+            extra_cols = ["기회창출","패스%","차단"]
+        else:
+            extra_cols = ["슈팅","유효","기회창출","드리블"]
+        cols = (["기간","포지션","소속팀","대회","상대","골","어시"]
+                + extra_cols + ["평점","스코어","결과"])
         tbl = self._make_table(len(matches), cols)
         for i, m in enumerate(matches):
-            is_gk = m["position"] == "GK"
-            stat1 = f"{m['saves']}선방"   if is_gk else f"{m['goals']}골"
-            stat2 = f"{m['conceded']}실점" if is_gk else f"{m['assists']}A"
             res   = m["result"]
             color = ("#00cc44" if res.startswith("승")
                      else "#888888" if res == "무" else "#cc4444")
-            vals = [f"{m['year']} {m['week']}주차", m["position"],
+            _pac = m.get("pass_acc", 0)
+            pac = f"{round(_pac*100)}%" if _pac else "—"
+            _emap = {
+                "선방": str(m.get("saves",0)), "실점": str(m.get("conceded",0)),
+                "차단": str(m.get("blocks",0)), "패스%": pac,
+                "기회창출": str(m.get("key_passes",0)), "드리블": str(m.get("dribbles",0)),
+                "슈팅": str(m.get("shots",0)), "유효": str(m.get("shots_on",0)),
+            }
+            vals = ([f"{m['year']} {m['week']}주차", m["position"],
                     f"{m['team_flag']}{m['team']}",
                     f"{m['comp']} {m['stage']}",
                     f"{m['opp_flag']}{m['opp']}",
-                    stat1, stat2, str(m["rating"]), m["score"], res]
+                    str(m["goals"]), str(m["assists"])]
+                    + [_emap.get(c, "—") for c in extra_cols]
+                    + [str(m["rating"]), m["score"], res])
             for j, v in enumerate(vals):
                 self._set(tbl, i, j, v, color if j == len(vals) - 1 else None)
         lay.addWidget(tbl)

@@ -77,6 +77,29 @@ def _is_personal_award(trophy):
     return any(k in comp for k in _PERSONAL_AWARD_KEYWORDS)
 
 
+def _match_stat_str(m):
+    """경기 1건(국제전/챔스)의 활약을 포지션별 핵심 지표 문자열로.
+       팀 이력 표와 동일한 기준: GK=선방/실점, DEF=차단/패스%,
+       MF=기회창출/패스%/차단, 공격수=골/어시/슈팅/드리블."""
+    from constants import position_group
+    pos = m.get("position", "")
+    grp = position_group(pos)
+    _pac = m.get("pass_acc", 0)
+    pac  = f"{round(_pac*100)}%" if _pac else "-"
+    if grp == "GK":
+        return f"{m.get('saves',0)}선방 {m.get('conceded',0)}실점"
+    if grp == "DEF":
+        return (f"{m.get('goals',0)}골 {m.get('assists',0)}어시 "
+                f"{m.get('blocks',0)}차단 패스 {pac}")
+    if pos in ("CM", "CDM", "CAM"):
+        return (f"{m.get('goals',0)}골 {m.get('assists',0)}어시 "
+                f"{m.get('key_passes',0)}기회창출 패스 {pac} {m.get('blocks',0)}차단")
+    # 공격수/윙어
+    return (f"{m.get('goals',0)}골 {m.get('assists',0)}어시 "
+            f"슈팅 {m.get('shots',0)}({m.get('shots_on',0)}유효) "
+            f"{m.get('dribbles',0)}드리블")
+
+
 STYLE = """
 QDialog { background:#1e1e1e; color:#ccc; }
 QScrollArea { border:none; background:#1e1e1e; }
@@ -138,7 +161,10 @@ class RetireWindow(QDialog):
         nm.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.addWidget(nm)
 
-        sub = QLabel(f"{p.get('flag','')} {p['nationality']}  |  {p['age']}세 은퇴  |  {p['position']}")
+        from intl_engine import fmt_nationalities, fmt_rep_nationality
+        _nats = fmt_nationalities(p) or f"{p.get('flag','')}{p['nationality']}"
+        _rep  = fmt_rep_nationality(p)
+        sub = QLabel(f"{_nats}  |  ⚽대표: {_rep}  |  {p['age']}세 은퇴  |  {p['position']}")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sub.setStyleSheet("color:#888;font-size:13px;")
         lay.addWidget(sub)
@@ -147,16 +173,25 @@ class RetireWindow(QDialog):
         box = QFrame(); box.setObjectName("statBox")
         bl  = QHBoxLayout(box); bl.setContentsMargins(12,10,12,10); bl.setSpacing(6)
         pos = p.get("position","")
-        if pos == "GK":
+        from constants import position_group
+        _grp = position_group(pos)
+        if _grp == "GK":
             ts = p.get("total_saves", 0)
             tga = p.get("total_goals_against", 0)
             tot_shots = ts + tga
             sr = f"{round(ts/tot_shots*100,1)}%" if tot_shots else "0%"
             stat2 = ("선방", f"{ts}회  {sr}")
             stat3 = ("실점", f"{tga}골")
-        elif pos in {"CB","CDM"}:
-            stat2 = ("골", f"{p.get('total_goals',0)}")
-            stat3 = ("어시", f"{p.get('total_assists',0)}")
+        elif _grp == "DEF":
+            # 수비수: 무실점 경기 수(커리어 합산)를 핵심 지표로
+            try:
+                _cs = sum(e.get("clean_sheets",0) for e in
+                          [dict(r) for r in get_conn().execute(
+                              "SELECT clean_sheets FROM career_entries").fetchall()])
+            except Exception:
+                _cs = 0
+            stat2 = ("무실점", f"{_cs}경기")
+            stat3 = ("공격P", f"{p.get('total_goals',0)}골 {p.get('total_assists',0)}A")
         else:
             stat2 = ("골", f"{p.get('total_goals',0)}")
             stat3 = ("어시", f"{p.get('total_assists',0)}")
@@ -212,7 +247,7 @@ class RetireWindow(QDialog):
         lay.addWidget(self._team_table(entries))
 
         # ── 우승 경력 ────────────────────────────────
-        t2 = QLabel(f"🏆 우승 경력  ({len(trophies)})")
+        t2 = QLabel(f"🏆 성적  ({len(trophies)})")
         t2.setObjectName("secTitle")
         lay.addWidget(t2)
         lay.addWidget(self._trophy_table(trophies))
@@ -301,7 +336,20 @@ class RetireWindow(QDialog):
             lbl = QLabel("기록 없음"); lbl.setStyleSheet("color:#555;")
             return lbl
 
-        cols = ["기간","포지션","국가","리그","팀명","연봉","출전","골","어시","선방","실점","선방률","CS","평균평점","팀순위","승무패","계약","이적"]
+        from constants import position_group
+        _mypos = get_player().get("position", "")
+        _grp = position_group(_mypos)
+        if _grp == "GK":
+            stat_cols = ["골","어시","선방","실점","선방률","CS"]
+        elif _grp == "DEF":
+            stat_cols = ["골","어시","무실점","차단","패스%","평점기여"]
+        elif _mypos in ("CM","CDM","CAM"):
+            stat_cols = ["골","어시","기회창출","패스%","차단","드리블"]
+        else:
+            stat_cols = ["골","어시","슈팅","유효","기회창출","드리블"]
+        cols = (["기간","포지션","국가","리그","팀명","연봉","출전"]
+                + stat_cols
+                + ["평균평점","팀순위","승무패","계약","이적"])
         # 이슈3: 단기(1~4주차 이적, 0경기) 항목 제거
         visible = [e for e in entries if not (
             e.get("start_week", 1) <= 4
@@ -330,22 +378,30 @@ class RetireWindow(QDialog):
             period = f"{sy} {sw}~{ew}주" if sy == ey else f"{sy} {sw}~{ey} {ew}주"
 
             pos   = e.get("position","")
-            is_gk = pos == "GK"
-            CS_POS = {"GK","CB","CDM"}
             sv  = e.get("saves", 0)
             ga  = e.get("goals_against", 0)
             total_shots = sv + ga
             save_rate = f"{round(sv/total_shots*100,1)}%" if total_shots > 0 else "—"
+            _pac = e.get("pass_acc", 0)
+            pac_str = f"{round(_pac*100)}%" if _pac else "—"
 
-            if is_gk:
-                col_goal, col_asst = "—", "—"
-                col_save, col_conc = str(sv), str(ga)
-                col_rate = save_rate
-            else:
-                col_goal = str(e.get("goals", 0))
-                col_asst = str(e.get("assists", 0))
-                col_save, col_conc, col_rate = "—", "—", "—"
-            col_cs = str(e.get("clean_sheets", 0)) if pos in CS_POS else "—"
+            _val_map = {
+                "골":      str(e.get("goals", 0)),
+                "어시":    str(e.get("assists", 0)),
+                "선방":    str(sv) if pos == "GK" else "—",
+                "실점":    str(ga) if pos == "GK" else "—",
+                "선방률":  save_rate if pos == "GK" else "—",
+                "CS":      str(e.get("clean_sheets", 0)),
+                "무실점":  str(e.get("clean_sheets", 0)),
+                "차단":    str(e.get("blocks", 0)),
+                "패스%":   pac_str,
+                "평점기여": str(round(e.get("avg_rating", 0), 1)) if e.get("avg_rating") else "—",
+                "기회창출": str(e.get("key_passes", 0)),
+                "드리블":  str(e.get("dribbles", 0)),
+                "슈팅":    str(e.get("shots", 0)),
+                "유효":    str(e.get("shots_on", 0)),
+            }
+            stat_vals = [_val_map.get(sc, "—") for sc in stat_cols]
             
             # 계약 컬럼: 팀 변경 또는 연장 시에만 년수 표시
             cur_team = e.get("team_name", "")
@@ -368,14 +424,14 @@ class RetireWindow(QDialog):
             # 이적 컬럼
             tt_color = "#cc4444" if t_type in ("팔림", "방출", "계약만료") else None
 
-            vals = [period, pos,
-                    e.get("league_name", "")[:2] if e.get("league_name","") else "—",  # 국가 약자
-                    e.get("league_name",""),
-                    e.get("team_name",""),
-                    fmt_money(e.get("salary",0)),
-                    str(e.get("matches",0)),
-                    col_goal, col_asst, col_save, col_conc, col_rate, col_cs,
-                    str(avg), rank_disp, wdl, c_str, t_type]
+            vals = ([period, pos,
+                     e.get("league_name", "")[:2] if e.get("league_name","") else "—",
+                     e.get("league_name",""),
+                     e.get("team_name",""),
+                     fmt_money(e.get("salary",0)),
+                     str(e.get("matches",0))]
+                    + stat_vals
+                    + [str(avg), rank_disp, wdl, c_str, t_type])
             for j, v in enumerate(vals):
                 self._set_item(tbl, i, j, v)
         tbl.resizeColumnsToContents()
@@ -506,21 +562,40 @@ class RetireWindow(QDialog):
         return tbl
 
     def _intl_table(self, matches, p):
-        """국제전(A매치) 경기별 기록 테이블."""
+        """국제전(A매치) 경기별 기록 테이블 (포지션별 세부 지표)."""
         if not matches:
             lbl = QLabel("국제전 기록 없음"); lbl.setStyleSheet("color:#555;")
             return lbl
-        cols = ["기간","포지션","국가","대회","상대","골/선방","어시/실점","평점","스코어","결과"]
+        from constants import position_group
+        _pos = p.get("position", "")
+        _grp = position_group(_pos)
+        if _grp == "GK":
+            extra_cols = ["선방", "실점"]
+        elif _grp == "DEF":
+            extra_cols = ["차단", "패스%"]
+        elif _pos in ("CM", "CDM", "CAM"):
+            extra_cols = ["기회창출", "패스%", "차단"]
+        else:
+            extra_cols = ["슈팅", "유효", "기회창출", "드리블"]
+        cols = (["기간", "포지션", "국가", "대회", "상대", "골", "어시"]
+                + extra_cols + ["평점", "스코어", "결과"])
         tbl  = self._make_table(len(matches), cols)
         for i, m in enumerate(matches):
-            is_gk = m["position"] == "GK"
-            stat1 = f"{m['saves']}선방"   if is_gk else f"{m['goals']}골"
-            stat2 = f"{m['conceded']}실점" if is_gk else f"{m['assists']}A"
-            vals = [f"{m['year']} {m['week']}주차", m["position"],
-                    f"{m['nat_flag']}{m['nat']}",
-                    f"{m['comp']} {m['stage']}",
-                    f"{m['opp_flag']}{m['opp']}",
-                    stat1, stat2, str(m["rating"]), m["score"], m["result"]]
+            _pac = m.get("pass_acc", 0)
+            pac  = f"{round(_pac*100)}%" if _pac else "—"
+            _emap = {
+                "선방": str(m.get("saves", 0)),       "실점": str(m.get("conceded", 0)),
+                "차단": str(m.get("blocks", 0)),       "패스%": pac,
+                "기회창출": str(m.get("key_passes", 0)), "드리블": str(m.get("dribbles", 0)),
+                "슈팅": str(m.get("shots", 0)),        "유효": str(m.get("shots_on", 0)),
+            }
+            vals = ([f"{m['year']} {m['week']}주차", m["position"],
+                     f"{m['nat_flag']}{m['nat']}",
+                     f"{m['comp']} {m['stage']}",
+                     f"{m['opp_flag']}{m['opp']}",
+                     str(m["goals"]), str(m["assists"])]
+                    + [_emap.get(c, "—") for c in extra_cols]
+                    + [str(m["rating"]), m["score"], m["result"]])
             for j, v in enumerate(vals):
                 self._set_item(tbl, i, j, v)
         tbl.resizeColumnsToContents()
@@ -529,21 +604,40 @@ class RetireWindow(QDialog):
         return tbl
 
     def _champions_table(self, matches, p):
-        """챔피언스리그 경기별 기록 테이블."""
+        """챔피언스리그 경기별 기록 테이블 (포지션별 세부 지표)."""
         if not matches:
             lbl = QLabel("챔피언스리그 기록 없음"); lbl.setStyleSheet("color:#555;")
             return lbl
-        cols = ["기간","포지션","소속팀","대회","상대","골/선방","어시/실점","평점","스코어","결과"]
+        from constants import position_group
+        _pos = p.get("position", "")
+        _grp = position_group(_pos)
+        if _grp == "GK":
+            extra_cols = ["선방", "실점"]
+        elif _grp == "DEF":
+            extra_cols = ["차단", "패스%"]
+        elif _pos in ("CM", "CDM", "CAM"):
+            extra_cols = ["기회창출", "패스%", "차단"]
+        else:
+            extra_cols = ["슈팅", "유효", "기회창출", "드리블"]
+        cols = (["기간", "포지션", "소속팀", "대회", "상대", "골", "어시"]
+                + extra_cols + ["평점", "스코어", "결과"])
         tbl  = self._make_table(len(matches), cols)
         for i, m in enumerate(matches):
-            is_gk = m["position"] == "GK"
-            stat1 = f"{m['saves']}선방"   if is_gk else f"{m['goals']}골"
-            stat2 = f"{m['conceded']}실점" if is_gk else f"{m['assists']}A"
-            vals = [f"{m['year']} {m['week']}주차", m["position"],
-                    f"{m['team_flag']}{m['team']}",
-                    f"{m['comp']} {m['stage']}",
-                    f"{m['opp_flag']}{m['opp']}",
-                    stat1, stat2, str(m["rating"]), m["score"], m["result"]]
+            _pac = m.get("pass_acc", 0)
+            pac  = f"{round(_pac*100)}%" if _pac else "—"
+            _emap = {
+                "선방": str(m.get("saves", 0)),       "실점": str(m.get("conceded", 0)),
+                "차단": str(m.get("blocks", 0)),       "패스%": pac,
+                "기회창출": str(m.get("key_passes", 0)), "드리블": str(m.get("dribbles", 0)),
+                "슈팅": str(m.get("shots", 0)),        "유효": str(m.get("shots_on", 0)),
+            }
+            vals = ([f"{m['year']} {m['week']}주차", m["position"],
+                     f"{m['team_flag']}{m['team']}",
+                     f"{m['comp']} {m['stage']}",
+                     f"{m['opp_flag']}{m['opp']}",
+                     str(m["goals"]), str(m["assists"])]
+                    + [_emap.get(c, "—") for c in extra_cols]
+                    + [str(m["rating"]), m["score"], m["result"]])
             for j, v in enumerate(vals):
                 self._set_item(tbl, i, j, v)
         tbl.resizeColumnsToContents()
@@ -590,36 +684,80 @@ class RetireWindow(QDialog):
 
         lines = []
         lines.append(f"【 {p['name']} 선수 커리어 요약 】")
-        lines.append(f"국적: {p.get('flag','')} {p['nationality']}  |  포지션: {p['position']} ({p.get('sub_role','')})")
+        from intl_engine import fmt_nationalities, fmt_rep_nationality
+        _nats = fmt_nationalities(p) or f"{p.get('flag','')} {p['nationality']}"
+        _rep  = fmt_rep_nationality(p)
+        lines.append(f"국적: {_nats}  |  ⚽대표: {_rep}  |  포지션: {p['position']} ({p.get('sub_role','')})")
         lines.append(f"성격: {p.get('personality','')}  |  특징: {p.get('physical_trait','무난함')}  |  은퇴 나이: {p['age']}세  |  최종 OVR: {p.get('ovr',0)}")
         lines.append("")
 
-        # 팀 이력
+        # 팀 이력 — 화면 테이블의 셀 값을 그대로 나열 (산문체 대신 정형 데이터)
         lines.append("▶ 팀 이력")
         if entries:
-            for e in entries:
+            from constants import position_group
+            for idx, e in enumerate(entries):
                 sy = e.get("start_year",""); sw = e.get("start_week",1)
                 ey = e.get("end_year","");   ew = e.get("end_week",52)
-                if sy == ey:
-                    period = f"{sy}년 {sw}~{ew}주"
+                period = f"{sy}년 {sw}~{ew}주" if sy == ey else f"{sy}년 {sw}주 ~ {ey}년 {ew}주"
+                pos = e.get("position","")
+                grp = position_group(pos)
+                m   = e.get("matches",0)
+                sv  = e.get("saves",0); ga = e.get("goals_against",0)
+                cs  = e.get("clean_sheets",0); blk = e.get("blocks",0)
+                kp  = e.get("key_passes",0); drb = e.get("dribbles",0)
+                sh  = e.get("shots",0); sho = e.get("shots_on",0)
+                g   = e.get("goals",0); a = e.get("assists",0)
+                _pac = e.get("pass_acc",0)
+                pac  = f"{round(_pac*100)}%" if _pac else "—"
+                save_rate = f"{round(sv/(sv+ga)*100,1)}%" if (sv+ga) > 0 else "—"
+                ar  = e.get("avg_rating",0)
+                avg = round(ar,1) if ar else "—"
+                rc  = e.get("season_rating_cnt",0); rs = e.get("season_rating_sum",0) or ar
+                avg2 = round(rs/rc,1) if rc > 0 else avg
+                rank_disp = f"{e.get('team_rank',0)}위" if m > 0 else "—"
+                wdl = f"{e.get('wins',0)}승{e.get('draws',0)}무{e.get('losses',0)}패" if m > 0 else "—"
+                lg  = e.get("league_name","")
+                nation = lg[:2] if lg else "—"
+                salary = fmt_money(e.get("salary",0))
+                # 계약/이적
+                c_yrs = e.get("contract_years",0)
+                exit_t = e.get("exit_type",""); in_type = e.get("transfer_type","입단")
+                t_type = exit_t if exit_t else in_type
+                if idx == 0 or e.get("team_name") != entries[idx-1].get("team_name"):
+                    c_str = f"{c_yrs}년" if c_yrs else "—"
+                elif in_type == "연장" or t_type == "연장":
+                    c_str = f"{c_yrs}년" if c_yrs else "—"
                 else:
-                    period = f"{sy}년 {sw}주 ~ {ey}년 {ew}주"
-                m = e.get("matches",0); g = e.get("goals",0); a = e.get("assists",0)
-                ar = e.get("avg_rating", 0)
-                avg = round(ar, 1) if ar else "—"
-                tier = e.get("tier","")
-                lines.append(f"  • {period}  {e.get('team_name','')} ({e.get('league_name','')} / {tier}부)")
+                    c_str = "—"
+
+                # 포지션별 스탯 컬럼 (테이블과 동일)
+                if grp == "GK":
+                    stat_pairs = [("골",g),("어시",a),("선방",sv),("실점",ga),
+                                  ("선방률",save_rate),("무실점",cs)]
+                elif grp == "DEF":
+                    stat_pairs = [("골",g),("어시",a),("무실점",cs),("차단",blk),
+                                  ("패스%",pac),("평점기여",avg)]
+                elif pos in ("CM","CDM","CAM"):
+                    stat_pairs = [("골",g),("어시",a),("기회창출",kp),("패스%",pac),
+                                  ("차단",blk),("드리블",drb)]
+                else:
+                    stat_pairs = [("골",g),("어시",a),("슈팅",sh),("유효",sho),
+                                  ("기회창출",kp),("드리블",drb)]
+
+                # 한 줄: 기간 | 포지션 | 국가 | 리그 | 팀명 | 연봉 | 출전 | [스탯] | 평점 | 순위 | 승무패 | 계약 | 이적
+                head = (f"  • {period} | {pos} | {nation} | {lg} | "
+                        f"{e.get('team_name','')} | {salary} | 출전 {m}")
+                lines.append(head)
                 if m > 0:
-                    lines.append(f"    출전 {m}경기  {g}골  {a}어시  평점 {avg}  팀순위 {e.get('team_rank',0)}위")
+                    stat_str = "  ".join(f"{k} {v}" for k, v in stat_pairs)
+                    lines.append(f"    {stat_str}  | 평점 {avg2} | {rank_disp} | {wdl} | 계약 {c_str} | {t_type}")
                 else:
-                    lines.append(f"    출전 0경기 (입단만, 출전 없음)")
-                # [커리어 보강] 역할/감독/구단야망 — 있으면 한 줄 더
+                    lines.append(f"    출전 0경기 (입단만, 출전 없음)  | 계약 {c_str} | {t_type}")
+                # 역할/감독/구단야망
                 ctx = []
                 if e.get("contract_role"):  ctx.append(f"역할 {e['contract_role']}")
                 if e.get("manager_type"):   ctx.append(f"감독 {e['manager_type']}")
                 if e.get("club_ambition"):  ctx.append(f"구단목표 {e['club_ambition']}")
-                tt = e.get("transfer_type")
-                if tt and tt not in ("입단",): ctx.append(f"({tt})")
                 if ctx:
                     lines.append("    └ " + "  ·  ".join(ctx))
         else:
@@ -628,7 +766,7 @@ class RetireWindow(QDialog):
 
         # 팀 우승 (리그 우승 ─ tier>0). 챔스(tier=-1)/국가대표(tier=0)는 별도.
         league_trophies = [t for t in trophies if t.get('tier', 0) > 0]
-        lines.append(f"▶ 팀 우승  ({len(league_trophies)}건)")
+        lines.append(f"▶ 성적  ({len(league_trophies)}건)")
         if league_trophies:
             for t in league_trophies:
                 comp   = t.get('competition', '')
@@ -653,7 +791,8 @@ class RetireWindow(QDialog):
                 yr, comp = t.get('year', 0), t.get('competition', '')
                 result   = t.get('league_name', '')   # league_name 자리에 결과 저장됨
                 team     = t.get('team_name', '')
-                line = f"  🏆 {yr}년  {comp}  →  {result}  ({team})"
+                _ic = "🏆" if result == "우승" else ("🥈" if result == "준우승" else "▫")
+                line = f"  {_ic} {yr}년  {comp}  →  {result}  ({team})"
                 ch = clhist.get((yr, comp))
                 if ch and ch.get("caps", 0) > 0:
                     if p.get("position") == "GK":
@@ -716,10 +855,7 @@ class RetireWindow(QDialog):
         lines.append(f"▶ 국제전 기록  ({len(intl_ms)}경기)")
         if intl_ms:
             for im in intl_ms:
-                if im["position"] == "GK":
-                    stat = f"{im['saves']}선방 {im['conceded']}실점"
-                else:
-                    stat = f"{im['goals']}골 {im['assists']}어시"
+                stat = _match_stat_str(im)
                 lines.append(f"  • {im['year']}년 {im['week']}주차  "
                              f"{im['comp']} {im['stage']}  vs {im['opp']}  ─  "
                              f"{stat}  평점 {im['rating']}  ({im['score']} {im['result']})")
@@ -733,10 +869,7 @@ class RetireWindow(QDialog):
         lines.append(f"▶ 챔피언스리그 기록  ({len(cl_ms2)}경기)  ※ 클럽 대항전 (A매치 아님)")
         if cl_ms2:
             for cm in cl_ms2:
-                if cm["position"] == "GK":
-                    stat = f"{cm['saves']}선방 {cm['conceded']}실점"
-                else:
-                    stat = f"{cm['goals']}골 {cm['assists']}어시"
+                stat = _match_stat_str(cm)
                 lines.append(f"  • {cm['year']}년 {cm['week']}주차  "
                              f"{cm['comp']} {cm['stage']}  ({cm['team']}) vs {cm['opp']}  ─  "
                              f"{stat}  평점 {cm['rating']}  ({cm['score']} {cm['result']})")
@@ -766,10 +899,17 @@ class RetireWindow(QDialog):
         total_s = p.get("total_seasons", 0)
         pos_txt = p.get("position","")
         lines.append("▶ 통산 기록")
-        if pos_txt == "GK":
+        from constants import position_group
+        _grp = position_group(pos_txt)
+        # 통산 무실점: my_player에 누적 컬럼이 없으므로 커리어 항목에서 합산
+        _total_cs = sum(e.get("clean_sheets", 0) for e in entries)
+        if _grp == "GK":
             ts2 = p.get("total_saves",0); tga2 = p.get("total_goals_against",0)
             tot2 = ts2+tga2; sr2 = f"{round(ts2/tot2*100,1)}%" if tot2 else "0%"
-            lines.append(f"  {total_s}시즌  {total_m}경기  선방 {ts2}회({sr2})  실점 {tga2}골")
+            lines.append(f"  {total_s}시즌  {total_m}경기  선방 {ts2}회({sr2})  실점 {tga2}골  무실점 {_total_cs}경기")
+        elif _grp == "DEF":
+            # 수비수: 무실점 경기 수를 핵심 지표로, 공격 포인트는 보조
+            lines.append(f"  {total_s}시즌  {total_m}경기  무실점 {_total_cs}경기  (공격P {total_g}골 {total_a}어시)")
         else:
             lines.append(f"  {total_s}시즌  {total_m}경기  {total_g}골  {total_a}어시스트")
         ic = p.get("intl_caps", 0)

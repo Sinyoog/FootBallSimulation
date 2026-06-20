@@ -20,14 +20,15 @@ from constants import (
     CONTINENTAL_START_YEAR, CONTINENTAL_INTERVAL,
     INTL_CALLUP_WEEK, INTL_GROUP_WEEKS, INTL_KO_WEEKS,
     WC_TEAMS, WC_GROUPS, WC_QUOTA,
-    CONT_TEAMS, CONT_GROUPS,
+    WC_EXPAND_YEAR, WC_TEAMS_BIG, WC_GROUPS_BIG, WC_QUOTA_BIG,
+    CONT_TEAMS, CONT_GROUPS, CONT_BEST_THIRDS,
     CONFEDERATIONS, CONF_CUP_NAME,
     GRADE_TEAM_OVR, GRADE_QUAL_BASE, QUAL_NOISE,
     INTL_SELECTION_OVR, INTL_MAX_TIER, INTL_MIN_MATCHES,
     INTL_SELECTION_MARGIN,
 )
 
-STAGE_KO = {"group": "조별리그", "R16": "16강", "QF": "8강", "SF": "4강", "F": "결승"}
+STAGE_KO = {"group": "조별리그", "R32": "32강", "R16": "16강", "QF": "8강", "SF": "4강", "F": "결승"}
 
 # ── entry 캐시 ─────────────────────────────────────
 # intl_entries(ovr/flag/grade)는 대회 진행 중 불변 → (tid, country)별 1회 조회.
@@ -37,7 +38,8 @@ def _clear_entry_cache():
     _entry_cache.clear()
 
 # 그룹 라벨
-_GROUP_LABELS = ["A", "B", "C", "D", "E", "F", "G", "H"]
+_GROUP_LABELS = ["A", "B", "C", "D", "E", "F", "G", "H",
+                 "I", "J", "K", "L", "M", "N", "O", "P"]
 
 # 조별리그 라운드 매칭 (4팀, 인덱스)
 _GROUP_ROUNDS = [
@@ -63,9 +65,10 @@ def get_tournament(year):
 
 def get_pending_choice():
     """[복수국적] 대표팀 선택/동의가 필요한 대회가 있으면 정보 반환, 없으면 None.
-    (미고정 + 21세 이하 + 본선 진출국 1개 이상 → my_selected==3)
+    (미고정 + 본선 진출국 1개 이상 → my_selected==3)
+    나이와 무관하게, 발탁창에서 본인이 골라야(또는 동의해야) 한다.
     진출국이 1개여도 본인 동의를 받기 위해 팝업을 띄운다.
-    22세 이상은 create_tournament 단계에서 이미 자동 고정되므로 여기 안 걸린다."""
+    선택해서 본선에 출전하면 그 나라로 영구 고정(cap-tie)된다."""
     from game_engine import get_state, get_player
     st = get_state(); p = get_player()
     if not st or not p:
@@ -73,10 +76,8 @@ def get_pending_choice():
     t = get_tournament(st["current_year"])
     if not t or t.get("my_selected") != 3:
         return None
-    # 안전장치: 22세 이상이면 선택 대상 아님 (이미 고정됐어야 함)
-    age = st.get("current_year", 0) - (p.get("birth_year", 0) or 0)
-    if age > 21:
-        return None
+    # 22세 이상은 정상적으로는 1~4주차 강제선택(get_forced_commit)으로 이미
+    # 고정되어 있어야 한다. 그 팝업을 건너뛴 미고정 선수는 여기서도 선택 가능.
 
     nats = [p.get("nationality", "") or "",
             p.get("nationality2", "") or "",
@@ -141,6 +142,91 @@ def decline_national_team(tournament_id):
                  (tournament_id,))
     conn.commit(); conn.close()
     return True
+
+
+def get_forced_commit():
+    """[복수국적] 22세 1~4주차(비시즌)에 아직 대표팀을 고정하지 않았다면,
+    강제로 국적을 정하게 하는 정보 반환. 없으면 None.
+
+    - 조건: 미고정(intl_committed=='') + 나이 == 22 + 현재 주차 1~4
+    - 본선 진출 여부와 무관하게 '보유 국적 전부'를 선택지로 제공한다.
+      (대회에 안 나가도 평생 뛸 대표팀을 이 시점에 확정)
+    - 이 선택으로 intl_committed만 설정되며, 보유 국적(nationality/2/3)은
+      그대로 유지된다(국적이 사라지지 않음).
+    """
+    from game_engine import get_state, get_player
+    st = get_state(); p = get_player()
+    if not st or not p:
+        return None
+    if (p.get("intl_committed", "") or ""):
+        return None   # 이미 고정됨
+    week = st.get("current_week", 0)
+    if not (1 <= week <= 4):
+        return None
+    year = st.get("current_year", 0)
+    age  = year - (p.get("birth_year", year - 17) or (year - 17))
+    if age != 22:
+        return None
+
+    # 보유 국적 전부 (본선 진출 무관)
+    pairs = [
+        (p.get("nationality", "")  or "", p.get("flag", "")  or ""),
+        (p.get("nationality2", "") or "", p.get("flag2", "") or ""),
+        (p.get("nationality3", "") or "", p.get("flag3", "") or ""),
+    ]
+    opts = []
+    seen = set()
+    for nat, flag in pairs:
+        if nat and nat not in seen:
+            seen.add(nat)
+            opts.append({"nat": nat, "flag": flag})
+    if not opts:
+        return None
+    return {"forced": True, "year": year, "options": opts}
+
+
+def commit_nationality(nat):
+    """[복수국적] 22세 강제 선택 확정 → intl_committed만 그 나라로 설정.
+    보유 국적(nationality/2/3)은 건드리지 않아 사라지지 않는다."""
+    from game_engine import get_player, update_player
+    p = get_player()
+    if not p:
+        return None
+    update_player(intl_committed=nat)
+    return {"nat": nat}
+
+
+def fmt_nationalities(p):
+    """[복수국적] 보유 국적 전부를 '국기+이름' 문자열로 (예: '🇦🇹오스트리아 / 🇵🇦파나마')."""
+    if not p:
+        return ""
+    pairs = [
+        (p.get("nationality", "")  or "", p.get("flag", "")  or ""),
+        (p.get("nationality2", "") or "", p.get("flag2", "") or ""),
+        (p.get("nationality3", "") or "", p.get("flag3", "") or ""),
+    ]
+    seen = set(); out = []
+    for nat, flag in pairs:
+        if nat and nat not in seen:
+            seen.add(nat)
+            out.append(f"{flag}{nat}")
+    return " / ".join(out)
+
+
+def fmt_rep_nationality(p):
+    """[복수국적] 축구 대표로 뛰는 국적(국기 포함). 미고정이면 '미정'."""
+    if not p:
+        return "미정"
+    rep = p.get("intl_committed", "") or ""
+    if not rep:
+        return "미정"
+    # 국기 찾기
+    for nat_key, flag_key in (("nationality", "flag"),
+                              ("nationality2", "flag2"),
+                              ("nationality3", "flag3")):
+        if (p.get(nat_key, "") or "") == rep:
+            return f"{p.get(flag_key, '') or ''}{rep}"
+    return rep
 
 
 def _my_nat(t, p):
@@ -259,8 +345,8 @@ def start_intl_tournament(year):
 
     if is_wc:
         kind, name = "world", "월드컵"
-        entries = _qualify_world()
-        n_groups = WC_GROUPS
+        entries = _qualify_world(year)
+        n_groups = WC_GROUPS_BIG if year >= WC_EXPAND_YEAR else WC_GROUPS
     else:
         kind = "continent"
         name = CONF_CUP_NAME.get(my_continent, "대륙컵")
@@ -289,27 +375,14 @@ def start_intl_tournament(year):
             my_sel = 1 if _check_selection(p, grade) else 0
         else:
             my_sel = 2   # 고정된 나라가 본선 진출 못함 → 이번엔 출전 없음
-    elif age <= 21:
-        # 21세 이하: 본인 선택권 있음
+    else:
+        # 미고정: 본인 선택권 있음. 진출국 1개 이상이면 선택/동의 대기.
+        #  (정상 흐름에선 22세 1~4주차에 get_forced_commit 팝업으로 이미 고정됨.
+        #   그 팝업을 건너뛴 구 세이브 등 예외 상황의 폴백 경로.)
         if len(qualified_nats) == 0:
             my_sel = 2
         else:
             my_sel = 3   # 선택/동의 대기
-    else:
-        # 22세 이상 미고정: 주 국적으로 자동 고정 (선택권 소멸)
-        auto_nat = nat1 or (my_nats[0] if my_nats else "")
-        if auto_nat:
-            from game_engine import update_player as _upd_commit
-            _upd_commit(intl_committed=auto_nat)
-            committed = auto_nat
-            if auto_nat in qualified_nats:
-                my_nat = auto_nat
-                grade = nat_info.get(auto_nat, {}).get("grade", "F")
-                my_sel = 1 if _check_selection(p, grade) else 0
-            else:
-                my_sel = 2   # 고정됐지만 이번 대회는 본선 진출 못함
-        else:
-            my_sel = 2
 
     conn = get_conn()
     c = conn.cursor()
@@ -442,8 +515,13 @@ def _check_selection(p, my_grade):
     return my_tier <= INTL_MAX_TIER.get(my_grade, 3) + 1
 
 
-def _qualify_world():
-    """대륙별 쿼터 + 확률 예선으로 32개국 선발."""
+def _qualify_world(year=0):
+    """대륙별 쿼터 + 확률 예선으로 본선 진출국 선발.
+    year >= WC_EXPAND_YEAR 이면 64개국, 아니면 32개국."""
+    big = (year >= WC_EXPAND_YEAR)
+    quota_map = WC_QUOTA_BIG if big else WC_QUOTA
+    n_teams = WC_TEAMS_BIG if big else WC_TEAMS
+
     conn = get_conn()
     rows = [dict(r) for r in conn.execute(
         "SELECT name, flag, continent, grade FROM countries").fetchall()]
@@ -462,12 +540,12 @@ def _qualify_world():
     host = random.choices(host_pool, weights=weights)[0]
 
     picked = [host]
-    for cont, quota in WC_QUOTA.items():
+    for cont, quota in quota_map.items():
         q = quota - (1 if host["continent"] == cont else 0)
         pool = [r for r in rows if r["continent"] == cont and r["name"] != host["name"]]
         pool.sort(key=lambda r: r["qual"], reverse=True)
         picked.extend(pool[:q])
-    return picked[:WC_TEAMS]
+    return picked[:n_teams]
 
 
 def _qualify_continental(my_continent):
@@ -512,11 +590,18 @@ def process_intl_week(week):
     # 라운드 진행
     last_group_week = INTL_GROUP_WEEKS[1]
     if t["kind"] == "world":
+        # 64개국(2002~)은 32강부터, 32개국은 16강부터
+        big = (t["year"] >= WC_EXPAND_YEAR)
+        if big:
+            plan = {last_group_week: ("R32", 21), 21: ("R16", 22),
+                    22: ("QF", 23), 23: ("SF", 24), 24: ("F", 25), 25: (None, None)}
+        else:
+            plan = {last_group_week: ("R16", 21), 21: ("QF", 22),
+                    22: ("SF", 23), 23: ("F", 24), 24: (None, None)}
+    else:
+        # 대륙컵 24개국: 조별(6조) → 16강 → 8강 → 4강 → 결승
         plan = {last_group_week: ("R16", 21), 21: ("QF", 22),
                 22: ("SF", 23), 23: ("F", 24), 24: (None, None)}
-    else:
-        plan = {last_group_week: ("QF", 21), 21: ("SF", 22),
-                22: ("F", 23), 23: (None, None)}
 
     if week not in plan:
         return
@@ -657,26 +742,45 @@ def simulate_my_match(week, p):
         pso_winner = m["home"] if win_home else m["away"]
     hs, as_ = _gen_score(outcome)
 
-    goals, assists, saves, rating, events = _player_perf(p, outcome, is_home, hs, as_)
+    goals, assists, saves, rating, events, detail = _player_perf(p, outcome, is_home, hs, as_)
     my_result = _my_result(outcome, is_home)
+    my_conceded = (as_ if is_home else hs)
 
     conn = get_conn()
     conn.execute("""UPDATE intl_matches SET home_score=?, away_score=?,
                     pso_winner=?, pso_score=?,
                     my_played=1, my_nat=?, my_position=?,
-                    my_saves=?, my_goals=?, my_assists=?, my_rating=?
+                    my_saves=?, my_goals=?, my_assists=?, my_rating=?,
+                    my_shots=?, my_shots_on=?, my_key_passes=?,
+                    my_dribbles=?, my_blocks=?, my_pass_acc=?, my_conceded=?
                     WHERE id=?""",
                  (hs, as_, pso_winner, pso_score,
                   nat, p.get("position", ""),
-                  saves, goals, assists, rating, m["id"]))
+                  saves, goals, assists, rating,
+                  detail["shots"], detail["shots_on"], detail["key_passes"],
+                  detail["dribbles"], detail["blocks"], detail["pass_acc"],
+                  my_conceded, m["id"]))
     conn.commit()
     conn.close()
 
     # 국가대표 개인 기록 (클럽 시즌 통계와 분리)
+    #  [cap-tie] 본선 무대(조별리그~결승)를 밟으면 그 나라로 영구 고정된다.
+    #  이 함수는 본선 경기에서만 호출되므로(예선은 별도), 출전 즉시 cap 처리.
     update_player(
         intl_caps=p.get("intl_caps", 0) + 1,
         intl_goals=p.get("intl_goals", 0) + goals,
         intl_assists=p.get("intl_assists", 0) + assists,
+        intl_capped=1,
+        intl_committed=(p.get("intl_committed", "") or nat),
+    )
+    # [세부 지표] 통산(total_*)에도 누적 → 커리어 통합 통계에 A매치 반영
+    p2 = get_player()
+    update_player(
+        total_shots=p2.get("total_shots", 0) + detail["shots"],
+        total_shots_on=p2.get("total_shots_on", 0) + detail["shots_on"],
+        total_key_passes=p2.get("total_key_passes", 0) + detail["key_passes"],
+        total_dribbles=p2.get("total_dribbles", 0) + detail["dribbles"],
+        total_blocks=p2.get("total_blocks", 0) + detail["blocks"],
     )
 
     # 인기/스트레스/행복
@@ -749,18 +853,45 @@ def get_group_standings(tid, grp):
 
 
 def _finalize_groups(t, next_stage, next_week):
-    """조별리그 종료 → 상위 2팀 진출, 다음 라운드 대진 생성."""
+    """조별리그 종료 → 16강 진출국 확정, R16 대진 생성.
+    - 월드컵(8조): 각 조 1·2위 = 16팀
+    - 대륙컵(6조): 각 조 1·2위(12팀) + 성적 좋은 3위 중 상위 4팀 = 16팀
+    """
     from game_engine import add_log, get_player
     tid = t["id"]
-    n_groups = WC_GROUPS if t["kind"] == "world" else CONT_GROUPS
+    is_wc = (t["kind"] == "world")
+    if is_wc:
+        n_groups = WC_GROUPS_BIG if t["year"] >= WC_EXPAND_YEAR else WC_GROUPS
+    else:
+        n_groups = CONT_GROUPS
     labels = _GROUP_LABELS[:n_groups]
 
     firsts, seconds = {}, {}
+    thirds = []          # (조라벨, row) — 대륙컵 best-3rd 후보
     eliminated = []
+    standings = {}
     for g in labels:
         rows = get_group_standings(tid, g)
-        firsts[g], seconds[g] = rows[0]["country"], rows[1]["country"]
-        eliminated.extend(r["country"] for r in rows[2:])
+        standings[g] = rows
+        firsts[g]  = rows[0]["country"]
+        seconds[g] = rows[1]["country"]
+        if is_wc:
+            # 월드컵: 3위 이하 전부 탈락
+            eliminated.extend(r["country"] for r in rows[2:])
+        else:
+            # 대륙컵: 3위는 best-3rd 경쟁, 4위는 탈락
+            if len(rows) >= 3:
+                thirds.append((g, rows[2]))
+            eliminated.extend(r["country"] for r in rows[3:])
+
+    # 대륙컵: 3위 팀들 중 성적 좋은 상위 CONT_BEST_THIRDS만 진출, 나머지 탈락
+    best_thirds = []
+    if not is_wc:
+        thirds.sort(key=lambda gr: (gr[1]["pts"], gr[1]["gf"] - gr[1]["ga"],
+                                     gr[1]["gf"], gr[1]["ovr"]), reverse=True)
+        adv = thirds[:CONT_BEST_THIRDS]
+        best_thirds = [(g, r["country"]) for g, r in adv]
+        eliminated.extend(r["country"] for _, r in thirds[CONT_BEST_THIRDS:])
 
     conn = get_conn()
     c = conn.cursor()
@@ -768,14 +899,37 @@ def _finalize_groups(t, next_stage, next_week):
         c.execute("UPDATE intl_entries SET alive=0 WHERE tournament_id=? AND country=?",
                   (tid, nat_e))
 
-    # 대진: 1A-2B, 1C-2D, ... 후반 슬롯은 1B-2A, 1D-2C, ...
-    pairs = []
-    for i in range(0, n_groups, 2):
-        g1, g2 = labels[i], labels[i + 1]
-        pairs.append((firsts[g1], seconds[g2]))
-    for i in range(0, n_groups, 2):
-        g1, g2 = labels[i], labels[i + 1]
-        pairs.append((firsts[g2], seconds[g1]))
+    # ── R16 대진 생성 ──
+    if is_wc:
+        # 표준 월드컵 대진: 1A-2B, 1C-2D, … / 1B-2A, 1D-2C, …
+        pairs = []
+        for i in range(0, n_groups, 2):
+            g1, g2 = labels[i], labels[i + 1]
+            pairs.append((firsts[g1], seconds[g2]))
+        for i in range(0, n_groups, 2):
+            g1, g2 = labels[i], labels[i + 1]
+            pairs.append((firsts[g2], seconds[g1]))
+    else:
+        # 대륙컵 24개국 표준 대진 (유로 2016 방식):
+        #   16팀 = 1위6 + 2위6 + 3위4.
+        #   1위는 3위/2위와, 2위끼리 일부 맞붙는 고정 브래킷.
+        #   구현 단순화: 1위6 + best3위4 = 10팀을 한 풀, 2위6을 다른 풀로 나눠
+        #   상위 시드(1위)가 하위 시드(2위/3위)와 만나도록 페어링.
+        firsts_list  = [firsts[g]  for g in labels]              # 6
+        seconds_list = [seconds[g] for g in labels]              # 6
+        thirds_list  = [nat for _, nat in best_thirds]           # 4
+        # 시드 풀: 강(1위) 6 + 약(2위6 + 3위4) 10 → 16
+        # 1위 6팀은 2위/3위 중에서 상대를 받고, 남는 2위끼리 맞붙음.
+        strong = list(firsts_list)                # 6 (상위 시드)
+        weak   = thirds_list + seconds_list        # 10 (하위 시드: 3위 먼저 소진)
+        pairs = []
+        for s in strong:
+            opp = weak.pop(0) if weak else None
+            if opp is not None:
+                pairs.append((s, opp))
+        # 남은 weak(2위 4팀)끼리 2경기
+        while len(weak) >= 2:
+            pairs.append((weak.pop(0), weak.pop(0)))
 
     p = get_player()
     nat = _my_nat(t, p)
@@ -831,6 +985,8 @@ def _advance_knockout(t, week, next_stage, next_week):
 
     winners.sort()
     for slot in range(0, len(winners), 2):
+        if slot + 1 >= len(winners):
+            break
         home, away = winners[slot][1], winners[slot + 1][1]
         is_my = 1 if nat in (home, away) else 0
         c.execute("""INSERT INTO intl_matches
@@ -1015,6 +1171,9 @@ def get_my_intl_matches():
             "goals": m["my_goals"], "assists": m["my_assists"],
             "saves": m["my_saves"], "conceded": op_s,
             "rating": m["my_rating"],
+            "shots": m.get("my_shots", 0), "shots_on": m.get("my_shots_on", 0),
+            "key_passes": m.get("my_key_passes", 0), "dribbles": m.get("my_dribbles", 0),
+            "blocks": m.get("my_blocks", 0), "pass_acc": m.get("my_pass_acc", 0),
             "score": f"{my_s}-{op_s}", "result": result,
         })
     return out

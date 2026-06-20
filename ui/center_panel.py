@@ -33,9 +33,9 @@ def show_toast(parent, msg, color="#cc4400", duration=1200):
     lbl.show()
     QTimer.singleShot(duration, lbl.deleteLater)
 
-TRAIN_OPTS_KO = ["고강도","중강도","집중훈련","저강도","휴식"]
+TRAIN_OPTS_KO = ["고강도","중강도","강점훈련","약점훈련","저강도","휴식"]
 TRAIN_MAP_KO  = {"고강도":"고강도","중강도":"중강도",
-                  "집중훈련":"집중훈련","저강도":"저강도","휴식":"휴식"}
+                  "강점훈련":"강점훈련","약점훈련":"약점훈련","저강도":"저강도","휴식":"휴식"}
 # 기본값: 휴식/중강도/중강도/휴식
 TRAIN_DEFAULTS = ["휴식","중강도","중강도","휴식"]
 
@@ -102,6 +102,7 @@ class CenterPanel(QWidget):
         self.main_win = main_win
         self.setStyleSheet(CENTER_STYLE)
         self._join_used        = False   # 이번 달 팀 입단 버튼 사용 여부
+        self._skip_join_lock   = False   # 전부 결렬→1년 훈련 보류 플래그
         self._auto_offer_shown = False   # 이번 구간 자동 오퍼 표시 여부
         # ── 1주씩 보기 상태 ──
         # _step_mode : 1주씩 보기 on/off
@@ -384,7 +385,10 @@ class CenterPanel(QWidget):
         self.btn_join.setEnabled(can_join)
         self.btn_join.setVisible(not has_team)
         self.btn_agent.setEnabled(is_off)
-        self.btn_retire.setEnabled(is_off)  # 비시즌에만 활성화
+        # [은퇴] 리그 경기(35주)가 끝나고 우승·수상이 확정 가능한 37~52주에만 허용.
+        #   12주·26~36주 등 리그 진행 중에는 은퇴 불가(우승 누락 방지).
+        can_retire = 37 <= week <= 52
+        self.btn_retire.setEnabled(can_retire)
         has_team = bool(p.get("current_team_id"))
         self.btn_standing.setEnabled(has_team)
         self.btn_schedule.setEnabled(has_team)
@@ -476,8 +480,15 @@ class CenterPanel(QWidget):
         st = get_state()
         if not p or not st: return
 
-        # [복수국적] 대표팀 선택이 대기 중이면 그것부터 처리 (진행 차단)
+        # [복수국적] ★최우선★ 22세 1~4주차 미고정이면 국적부터 강제 확정.
+        #   이게 가장 먼저 뜨고, 처리해야만 나머지(입단/오퍼/대표팀발탁 등)로 넘어간다.
         import intl_engine
+        forced = intl_engine.get_forced_commit()
+        if forced:
+            self._show_forced_commit(forced)
+            return
+
+        # [복수국적] 대표팀 선택이 대기 중이면 그것부터 처리 (진행 차단)
         pend = intl_engine.get_pending_choice()
         if pend:
             show_toast(self, "⚠  먼저 대표팀을 선택해야 합니다!", "#cc6600", 1600)
@@ -487,8 +498,11 @@ class CenterPanel(QWidget):
         week = st["current_week"]
         from constants import MIN_JOIN_AGE
 
-        # 17살 이상인데 팀이 없고 비시즌(1~4주)이면 입단 강제
-        if p["age"] >= MIN_JOIN_AGE and not p.get("current_team_id") and 1 <= week <= 4:
+        # 17살 이상인데 팀이 없고 비시즌(1~4주)이면 입단 강제.
+        #   단, 올해 모든 오퍼가 결렬돼 '1년 훈련'을 택한 경우(_skip_join_lock)는
+        #   이번 시즌 동안 입단을 강제하지 않고 그대로 진행시킨다.
+        if (p["age"] >= MIN_JOIN_AGE and not p.get("current_team_id")
+                and 1 <= week <= 4 and not getattr(self, "_skip_join_lock", False)):
             show_toast(self, "⚠  먼저 팀에 입단해야 합니다!", "#cc6600", 1500)
             return
 
@@ -507,11 +521,8 @@ class CenterPanel(QWidget):
                 if mi:
                     sched.append((w, "경기", mi))
                 else:
-                    detail = None
-                    if ttype == "집중훈련":
-                        pool = FOCUS_TRAIN_STATS.get(p["position"], ALL_STATS[:3])
-                        detail = pool[0]
-                    sched.append((w, ttype, detail))
+                    # 강점/약점훈련은 엔진이 스탯을 자동 선별하므로 detail 불필요.
+                    sched.append((w, ttype, None))
             return sched
 
         if not self._step_mode:
@@ -565,6 +576,11 @@ class CenterPanel(QWidget):
 
         # 소속 없으면 입단 안내
         if 1 <= new_week <= 4 and p2.get("age",0) >= MIN_JOIN_AGE and not p2.get("current_team_id"):
+            # 새 시즌 1~4주 진입 → 작년 '전부 결렬→1년 훈련' 보류를 해제하고
+            #   올해 다시 입단(오퍼)에 도전하게 한다.
+            self._skip_join_lock = False
+            self._join_used = False
+            self.btn_join.setEnabled(True)
             show_toast(self, f"⭐ {st2['current_year']}년 새 시즌!  팀 입단 기간입니다", "#006622", 2000)
 
         # [복수국적] 두 나라 다 본선 진출 → 대표팀 선택 팝업 (선택 전까지 차출 보류)
@@ -705,6 +721,64 @@ class CenterPanel(QWidget):
         btn_reject.clicked.connect(_reject)
         dlg.exec()
 
+    def _show_forced_commit(self, forced):
+        """[복수국적] 22세 1~4주차 — 평생 뛸 대표팀 국적을 강제로 확정.
+        본선 진출 여부와 무관하게 보유 국적 전부 중에서 선택.
+        선택해도 보유 국적은 사라지지 않고, '대표로 뛰는 국적'만 정해진다.
+        닫기·취소 불가 — 반드시 하나를 골라야 진행된다."""
+        if getattr(self, "_forced_commit_open", False):
+            return
+        self._forced_commit_open = True
+        from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QLabel,
+                                      QPushButton, QFrame)
+        import intl_engine
+
+        opts = forced.get("options", [])
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("🌍 국가대표 국적 확정")
+        dlg.setMinimumWidth(420)
+        dlg.setStyleSheet(_DIALOG_STYLE)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(18, 16, 18, 16); lay.setSpacing(10)
+
+        hdr = QLabel("🌍 국가대표 국적 확정 (만 22세)"); hdr.setObjectName("dlgHeader")
+        lay.addWidget(hdr)
+
+        nat_list = " / ".join(f"{o.get('flag','')}{o['nat']}" for o in opts)
+        info = QLabel(
+            f"<span style='color:#ddd; font-size:14px'>"
+            f"만 22세가 되어 <b style='color:#ffcc66'>평생 뛸 국가대표 국적</b>을 "
+            f"확정할 때입니다.<br><br>"
+            f"보유 국적: <b style='color:#ffcc66'>{nat_list}</b><br><br>"
+            f"이 중 어느 나라 대표로 뛸지 고르세요. "
+            f"(본선 진출과 무관하게 선택 가능)<br>"
+            f"<b style='color:#ff8866'>한 번 정하면 평생 그 나라 대표로만</b> 뛰게 됩니다.<br>"
+            f"<span style='color:#88cc88'>※ 선택해도 보유 국적은 사라지지 않습니다.</span></span>")
+        info.setWordWrap(True)
+        card = QFrame(); card.setObjectName("dlgCard")
+        cl = QVBoxLayout(card); cl.setContentsMargins(14, 12, 14, 12)
+        cl.addWidget(info)
+        lay.addWidget(card)
+
+        def _do_commit(nat):
+            intl_engine.commit_nationality(nat)
+            dlg.accept()
+            show_toast(self, f"🌍 {nat} 대표로 국적을 확정했습니다!", "#1a4d8f", 2000)
+            if self.main_win: self.main_win.refresh_all()
+
+        # 국적 수만큼 버튼을 세로로 쌓아 글자 잘림/창 크기 문제 방지
+        for opt in opts:
+            b = QPushButton(f"✅ {opt.get('flag','')} {opt['nat']} 대표로 뛰겠습니다")
+            b.setObjectName("dlgChoice")
+            b.clicked.connect(lambda _=False, n=opt["nat"]: _do_commit(n))
+            lay.addWidget(b)
+
+        # 닫기·취소 불가 (반드시 선택)
+        dlg.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+        dlg.exec()
+        self._forced_commit_open = False
+
     def _show_nat_choice(self, pend):
         """[복수국적] 본선 진출국 대표팀 발탁 제안 팝업.
         - 진출국 1개: 그 나라로 뛸지 예/아니오 확인
@@ -740,7 +814,8 @@ class CenterPanel(QWidget):
                 f"대표팀에서 발탁을 제안합니다.<br><br>"
                 f"이 나라로 국가대표 경기를 뛰겠습니까?<br>"
                 f"<b style='color:#ff8866'>한 번 출전하면 그 나라로 영구 고정</b>되어<br>"
-                f"다른 나라 대표로는 뛸 수 없습니다.</span>")
+                f"다른 나라 대표로는 뛸 수 없습니다."
+                f"<br><span style='color:#88cc88'>※ 보유 국적 자체는 사라지지 않습니다.</span></span>")
         else:
             nat_list = " / ".join(f"{o.get('flag','')}{o['nat']}" for o in opts)
             info = QLabel(
@@ -748,7 +823,8 @@ class CenterPanel(QWidget):
                 f"여러 국적이 본선에 진출했습니다.<br>"
                 f"<b style='color:#ffcc66'>{nat_list}</b><br><br>"
                 f"어느 대표팀으로 뛸지 선택하세요.<br>"
-                f"<b style='color:#ff8866'>한 번 출전하면 그 나라로 영구 고정</b>됩니다.</span>")
+                f"<b style='color:#ff8866'>한 번 출전하면 그 나라로 영구 고정</b>됩니다."
+                f"<br><span style='color:#88cc88'>※ 보유 국적 자체는 사라지지 않습니다.</span></span>")
         info.setWordWrap(True)
         card = QFrame(); card.setObjectName("dlgCard")
         cl = QVBoxLayout(card); cl.setContentsMargins(14,12,14,12)
@@ -818,8 +894,21 @@ class CenterPanel(QWidget):
         dlg = OfferWindow(offers, p.get("language","ko"), self,
                           title="🏟 팀 입단", force_select=is_first)
         self._offer_dlg = dlg
-        dlg.finished.connect(lambda: self._on_join_done(dlg))
-        dlg.show()
+        # 모달로 띄워 다이얼로그가 열려 있는 동안 진행(next day)을 차단.
+        # 비모달(show)이면 오퍼창을 띄운 채 시간을 더 진행시킨 뒤 수락할 수 있어
+        # join_team이 엉뚱한 주차/시즌 기준으로 실행되는 정합성 버그가 생긴다.
+        dlg.exec()
+        # [전부 결렬 → 1년 훈련] 모든 오퍼가 결렬되어 입단할 곳이 없으면,
+        #   이번 시즌은 입단 강제를 풀고 그대로 훈련하며 보낸다. (다음 해 재도전)
+        if not dlg.chosen and getattr(dlg, "all_failed", False):
+            self._skip_join_lock = True
+            self._join_used = True
+            self.btn_join.setEnabled(False)
+            show_toast(self, "📅 모든 협상 결렬 — 올해는 입단을 보류하고 1년 더 훈련합니다.",
+                       "#cc6600", 2200)
+            if self.main_win: self.main_win.refresh_all()
+            return
+        self._on_join_done(dlg)
 
     def _on_join_done(self, dlg):
         if dlg.chosen:
@@ -845,8 +934,9 @@ class CenterPanel(QWidget):
         from ui.offer_window import OfferWindow
         dlg = OfferWindow(offers, p.get("language","ko"), self, title="✈ 오퍼")
         self._offer_dlg = dlg
-        dlg.finished.connect(lambda: self._on_auto_offer_done(dlg))
-        dlg.show()
+        # 모달(exec)로 띄워 오퍼창이 열려 있는 동안 next day 진행을 차단.
+        dlg.exec()
+        self._on_auto_offer_done(dlg)
 
     def _on_auto_offer_done(self, dlg):
         if dlg.chosen:
@@ -906,9 +996,9 @@ class CenterPanel(QWidget):
     def _do_retire(self):
         st = get_state()
         week = st["current_week"]
-        is_off = not (5 <= week <= 11 or 26 <= week <= 32)
-        if not is_off:
-            show_toast(self, "⚠  은퇴는 비시즌에만 가능합니다", "#cc6600", 1500)
+        # 리그 경기(35주)가 끝나고 우승·수상이 확정 가능한 37~52주에만 은퇴 가능.
+        if not (37 <= week <= 52):
+            show_toast(self, "⚠  은퇴는 리그 종료 후(37주차~)에만 가능합니다", "#cc6600", 1700)
             return
 
         from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame
@@ -952,6 +1042,10 @@ class CenterPanel(QWidget):
         b_no.setDefault(True)   # 엔터 시 기본은 '계속'
 
         if dlg.exec() == QDialog.DialogCode.Accepted:
+            # 리그가 끝난 시즌의 우승·개인수상을 trophy_log/awards에 먼저 확정한 뒤
+            #   은퇴 창을 띄운다. (시즌전환 부작용 없이 성과만 기록)
+            from game_engine import finalize_season_for_retire
+            finalize_season_for_retire()
             from ui.retire_window import RetireWindow
             main_win = self.window()
             self._retire_win = RetireWindow(get_player().get("language", "ko"), main_win)

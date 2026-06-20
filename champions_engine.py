@@ -29,17 +29,18 @@ from database import get_conn
 from constants import GRADE_TEAM_OVR  # 참고용(미사용 가능)
 
 # ── 대회 일정 (주차) ───────────────────────────────
-CL_START_WEEK = 41           # 추첨/출전 확정
+CL_START_WEEK = 41           # 추첨/조 편성
+CL_GROUP_WEEKS = (42, 44)    # 조별리그 3경기 (42,43,44)
 CL_ROUND_WEEKS = {
-    "R32": 42,
-    "R16": 43,
-    "QF":  44,
-    "SF":  45,
-    "F":   46,
+    "R16": 45,
+    "QF":  46,
+    "SF":  47,
+    "F":   48,
 }
-CL_END_WEEK = 46
+CL_END_WEEK = 48
 
-CL_TEAMS = 32                # 각 대륙 본선 32팀
+CL_TEAMS = 32                # 본선 32팀 (8조 × 4팀)
+CL_GROUPS = 8
 
 # ── entry 캐시 ─────────────────────────────────────
 # cl_entries(ovr/flag/team_name/grade)는 대회 진행 중 바뀌지 않으므로
@@ -50,9 +51,16 @@ _entry_cache = {}
 def _clear_entry_cache():
     _entry_cache.clear()
 
-STAGE_KO = {"R32": "32강", "R16": "16강", "QF": "8강", "SF": "4강", "F": "결승"}
-# 라운드 진행 순서
-_STAGE_ORDER = ["R32", "R16", "QF", "SF", "F"]
+STAGE_KO = {"group": "조별리그", "R16": "16강", "QF": "8강", "SF": "4강", "F": "결승"}
+# 토너먼트 라운드 진행 순서 (조별리그 다음부터)
+_STAGE_ORDER = ["R16", "QF", "SF", "F"]
+# 조별리그 라운드 매칭 (4팀, 인덱스 기반) — 3경기
+_GROUP_ROUNDS = [
+    [(0, 3), (1, 2)],
+    [(0, 2), (3, 1)],
+    [(0, 1), (2, 3)],
+]
+_GROUP_LABELS = ["A", "B", "C", "D", "E", "F", "G", "H"]
 
 # 대륙 그룹핑: 게임 내 continent 값 → 챔스 대륙 키
 #   오세아니아 → 아시아 편입, 북미/남미 → 북남미 통합
@@ -166,7 +174,7 @@ def get_my_cl_match(week):
         "league_name": t["name"],         # 대회명 (UI 호환 위해 league_name 키 사용)
         "stage": m["stage"],
         "stage_ko": STAGE_KO.get(m["stage"], m["stage"]),
-        "grp": "",
+        "grp": m["grp"] if "grp" in m.keys() else "",
         "opp": oe["team_name"] if oe else "?",
         "opp_flag": oe["flag"] if oe else "",
         "is_home": is_home,
@@ -211,39 +219,75 @@ def start_champions_league(year, season):
             continue  # 출전팀 부족하면 그 대륙 대회 생략
         _build_tournament(year, cont, entries, my_tid if cont == my_cont else 0)
 
-    # ── 내 대회 안내 로그 ──
+    # ── 내 대회 안내 로그 (출전 자격 = 내 리그 1위일 때만) ──
     if my_cont and my_tid:
         t = get_cl_tournament(year, my_cont)
         if t:
+            # 출전 자격 판정: 내 팀이 '내 1부 리그의 1위'인가?
+            qualified = _is_my_team_league_winner(p, my_tid)
             conn = get_conn()
             mine = conn.execute(
                 "SELECT 1 FROM cl_entries WHERE tournament_id=? AND team_id=?",
                 (t["id"], my_tid)).fetchone()
             conn.close()
+
             if mine:
+                # 본선 진출 (자격도 당연히 있음)
+                conn = get_conn()
+                conn.execute("UPDATE cl_tournaments SET my_qualified=1 WHERE id=?",
+                             (t["id"],))
+                conn.commit(); conn.close()
                 add_log("─" * 44, "sep")
                 add_log(f"🏆 {year}년 {t['name']} 개막!  내 팀 본선 진출!",
                         "event", year, CL_START_WEEK)
-                add_log(f"   32강 {CL_ROUND_WEEKS['R32']}주차부터 토너먼트 시작",
+                add_log(f"   조별리그 {CL_GROUP_WEEKS[0]}주차부터 시작",
                         "event", year, CL_START_WEEK)
+            elif qualified:
+                # 리그 1위(자격)인데 본선엔 못 들어감(32 컷 등) → '본선 진출 실패'
+                conn = get_conn()
+                conn.execute("UPDATE cl_tournaments SET my_qualified=1 WHERE id=?",
+                             (t["id"],))
+                trow = conn.execute("SELECT name FROM teams WHERE id=?",
+                                    (my_tid,)).fetchone()
+                conn.commit(); conn.close()
+                team_name = trow["name"] if trow else ""
+                _save_trophy(year, team_name, t["name"], "본선 진출 실패")
+                add_log("─" * 44, "sep")
+                add_log(f"🏆 {year}년 {t['name']}  리그 우승했지만 본선 진출 실패",
+                        "event", year, CL_START_WEEK)
+            # else: 리그 1위가 아님 → 챔스와 무관, 아무것도 안 뜸 (침묵)
+
+
+def _is_my_team_league_winner(p, my_tid):
+    """내 팀이 그 시즌 '내 1부 리그의 1위'인지 — 챔스 출전 자격 판정."""
+    if not my_tid:
+        return False
+    from game_engine import get_league_standings
+    conn = get_conn()
+    row = conn.execute("SELECT league_id FROM teams WHERE id=?", (my_tid,)).fetchone()
+    conn.close()
+    if not row:
+        return False
+    standings = get_league_standings(row["league_id"])
+    if not standings:
+        return False
+    return standings[0]["id"] == my_tid
 
 
 def _select_entries(continent, season):
-    """대륙 소속 국가들의 직전 시즌 1·2위 팀에서 32팀 선발.
+    """대륙 소속 각 1부 리그의 '1위 팀'만 선발 (최대 32).
 
     규칙:
-      - 각국 1부 리그 1위 → 무조건 후보 (전력 가중치 높음)
-      - 32팀 미달 시 리그 등급 높은 나라의 1부 리그 2위로 채움
+      - 각국 1부 리그 1위만 출전 자격 (2위 이하는 제외)
+      - 1위팀이 32개국을 넘으면 리그 등급 높은 나라 우선으로 32에서 컷
     반환: [{team_id, team_name, flag, ovr, grade, country}, ...] (최대 32)
     """
     from game_engine import get_league_standings
 
-    # 이 대륙(챔스 키)에 매핑되는 game continent 목록
     game_conts = [gc for gc, ck in CONTINENT_MAP.items() if ck == continent]
 
     conn = get_conn()
     placeholders = ",".join("?" * len(game_conts))
-    # 각국 1부(tier=1) 리그 조회
     leagues = conn.execute(
         f"""SELECT l.id AS lid, cn.name AS country, cn.flag AS flag, cn.grade AS grade
             FROM leagues l JOIN countries cn ON l.country_id = cn.id
@@ -252,29 +296,17 @@ def _select_entries(continent, season):
     leagues = [dict(r) for r in leagues]
     conn.close()
 
-    # 등급 우선순위 (S가 가장 높음)
+    # 등급 높은 나라 우선 (32 초과 시 컷 기준)
     grade_rank = {"S": 7, "A": 6, "B": 5, "C": 4, "D": 3, "E": 2, "F": 1}
     leagues.sort(key=lambda r: -grade_rank.get(r["grade"], 0))
 
-    firsts, seconds = [], []
+    picked = []
     for lg in leagues:
         rows = get_league_standings(lg["lid"])
         if not rows:
             continue
-        if len(rows) >= 1:
-            firsts.append((lg, rows[0]))
-        if len(rows) >= 2:
-            seconds.append((lg, rows[1]))
-
-    picked = []
-    # 1단계: 모든 나라 1위
-    for lg, tr in firsts:
-        picked.append(_entry_from(lg, tr))
-        if len(picked) >= CL_TEAMS:
-            return picked[:CL_TEAMS]
-    # 2단계: 등급 높은 나라부터 2위로 채움
-    for lg, tr in seconds:
-        picked.append(_entry_from(lg, tr))
+        # 1위 팀만
+        picked.append(_entry_from(lg, rows[0]))
         if len(picked) >= CL_TEAMS:
             break
     return picked[:CL_TEAMS]
@@ -299,59 +331,63 @@ def _entry_from(lg, standing_row):
 
 
 def _build_tournament(year, continent, entries, my_tid):
-    """대회 row + 출전팀 + 32강 1라운드 대진 생성."""
+    """대회 row + 출전팀 + 조별리그(8조×4팀) 일정 생성."""
     name = CL_CUP_NAME.get(continent, "챔피언스리그")
 
-    # 전력순 시드 → 강팀끼리 1라운드에서 안 만나게 상하 분리 페어링
+    # 32팀으로 정규화 (부족하면 가능한 만큼, 단 조 편성 위해 4의 배수로 컷)
     entries.sort(key=lambda e: e["ovr"], reverse=True)
-    # 출전팀 수를 2의 거듭제곱(≤32)으로 정규화.
-    #   토너먼트는 매 라운드 정확히 절반씩 줄어야 부전승 없이 깔끔히 진행된다.
-    #   _select_entries가 32에서 자르므로 보통 n=32지만, 약소 대륙은 32 미만일 수 있다.
-    #   이때 상위 시드만 2^k(16/8/4)로 남겨 약체 일부를 탈락시킨다.
-    n = _pow2_floor(len(entries))
+    n = (len(entries) // 4) * 4
+    n = min(n, CL_TEAMS)
     entries = entries[:n]
-    # my_in: 내 팀이 이 대회 출전팀인지.  my_reg_tid: 그 경우의 내 팀 ID를 박제.
-    #   → 시즌 중 다른 팀으로 이적해도 이 ID는 안 변하므로, 출전자격 판정의 기준이 된다.
+    n_groups = n // 4
+
+    # 내 팀이 출전팀(=리그 1위)인지. = 출전 자격(my_qualified)과 동일.
     my_in = 1 if (my_tid and any(e["team_id"] == my_tid for e in entries)) else 0
     my_reg_tid = my_tid if my_in else 0
 
     conn = get_conn()
     c = conn.cursor()
-    c.execute("""INSERT INTO cl_tournaments(year, continent, name, status, my_in, my_team_id)
-                 VALUES(?,?,?,?,?,?)""", (year, continent, name, "ko", my_in, my_reg_tid))
+    c.execute("""INSERT INTO cl_tournaments(year, continent, name, status,
+                    my_in, my_team_id, my_qualified)
+                 VALUES(?,?,?,?,?,?,?)""",
+              (year, continent, name, "group", my_in, my_reg_tid, my_in))
     tid = c.lastrowid
 
-    for e in entries:
-        c.execute("""INSERT INTO cl_entries
-                     (tournament_id, team_id, team_name, flag, country, grade, ovr, alive)
-                     VALUES(?,?,?,?,?,?,?,1)""",
-                  (tid, e["team_id"], e["team_name"], e["flag"],
-                   e["country"], e["grade"], e["ovr"]))
+    # ── 포트 추첨: 전력순 4포트 → 조마다 포트별 1팀 ──
+    groups = {g: [] for g in _GROUP_LABELS[:n_groups]}
+    pot_size = n // 4
+    for pot in range(4):
+        pool = entries[pot * pot_size:(pot + 1) * pot_size]
+        random.shuffle(pool)
+        for gi, e in enumerate(pool):
+            g = _GROUP_LABELS[gi]
+            groups[g].append(e)
+            c.execute("""INSERT INTO cl_entries
+                         (tournament_id, team_id, team_name, flag, country,
+                          grade, ovr, grp, alive)
+                         VALUES(?,?,?,?,?,?,?,?,1)""",
+                      (tid, e["team_id"], e["team_name"], e["flag"],
+                       e["country"], e["grade"], e["ovr"], g))
 
-    # 첫 라운드 스테이지 결정 (32팀이면 R32, 그보다 적으면 가장 가까운 단계)
-    first_stage = _first_stage_for(n)
-    week = CL_ROUND_WEEKS[first_stage]
-
-    # 시드 페어링: 1위-마지막, 2위-뒤에서둘째 … (상위 시드 보호)
-    half = n // 2
-    top = entries[:half]
-    bot = entries[half:][::-1]   # 약팀을 뒤집어 매칭
-    slot = 0
-    for hi in range(half):
-        home = top[hi]
-        away = bot[hi] if hi < len(bot) else None
-        if not away:
-            continue
-        is_my = 1 if my_tid in (home["team_id"], away["team_id"]) else 0
-        c.execute("""INSERT INTO cl_matches
-                     (tournament_id, stage, week, home_team_id, away_team_id,
-                      home_score, away_score, is_my, slot)
-                     VALUES(?,?,?,?,?,-1,-1,?,?)""",
-                  (tid, first_stage, week, home["team_id"], away["team_id"], is_my, slot))
-        slot += 1
-
-    c.execute("UPDATE cl_tournaments SET status=?, first_stage=? WHERE id=?",
-              ("ko", first_stage, tid))
+    # ── 조별리그 일정 (42,43,44주 = 3경기) ──
+    w0 = CL_GROUP_WEEKS[0]
+    for rd, pairs in enumerate(_GROUP_ROUNDS):
+        wk = w0 + rd
+        for g, members in groups.items():
+            for hi, ai in pairs:
+                if hi >= len(members) or ai >= len(members):
+                    continue
+                home, away = members[hi], members[ai]
+                is_my = 1 if my_tid in (home["team_id"], away["team_id"]) else 0
+                c.execute("""INSERT INTO cl_matches
+                             (tournament_id, stage, grp, week,
+                              home_team_id, away_team_id,
+                              home_score, away_score, is_my, slot)
+                             VALUES(?,?,?,?,?,?,-1,-1,?,0)""",
+                          (tid, "group", g, wk,
+                           home["team_id"], away["team_id"], is_my))
+    c.execute("UPDATE cl_tournaments SET status='group', first_stage='group' WHERE id=?",
+              (tid,))
     conn.commit()
     conn.close()
 
@@ -399,7 +435,7 @@ def process_cl_week(week):
 
 
 def _process_one(t, week):
-    """단일 대회: 이번 주차 이하 미진행 경기 AI 시뮬 → 라운드 마감."""
+    """단일 대회: 이번 주차 이하 미진행 경기 AI 시뮬 → 라운드/조별 마감."""
     conn = get_conn()
     pending = [dict(r) for r in conn.execute(
         """SELECT * FROM cl_matches
@@ -410,7 +446,18 @@ def _process_one(t, week):
     for m in pending:
         _sim_ai_match(t, m)
 
-    # 이번 주차가 어떤 라운드의 경기 주차였는지 확인 → 다음 라운드 생성
+    # 조별리그 마지막 주차(44) → 16강 진출 확정
+    if week == CL_GROUP_WEEKS[1]:
+        conn = get_conn()
+        remain = conn.execute(
+            "SELECT COUNT(*) AS n FROM cl_matches WHERE tournament_id=? AND stage='group' AND home_score=-1",
+            (t["id"],)).fetchone()["n"]
+        conn.close()
+        if remain == 0:
+            _finalize_groups(t)
+        return
+
+    # 토너먼트 라운드 주차 확인
     cur_stage = None
     for stg, wk in CL_ROUND_WEEKS.items():
         if wk == week:
@@ -482,7 +529,8 @@ def _sim_ai_match(t, m, my_played=False):
 
     outcome = _match_outcome(he["ovr"], ae["ovr"])
     pso_winner, pso_score = 0, ""
-    if outcome == "draw":
+    is_ko = (m["stage"] != "group")
+    if outcome == "draw" and is_ko:
         win_home, pso_score = _resolve_pso(he["ovr"], ae["ovr"])
         pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
     hs, as_ = _gen_score(outcome)
@@ -543,25 +591,41 @@ def simulate_my_cl_match(week, p):
 
     outcome = _match_outcome(h_ovr, a_ovr)
     pso_winner, pso_score = 0, ""
-    if outcome == "draw":
+    is_ko = (m["stage"] != "group")
+    if outcome == "draw" and is_ko:
         win_home, pso_score = _resolve_pso(h_ovr, a_ovr)
         pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
     hs, as_ = _gen_score(outcome)
 
-    goals, assists, saves, rating, events = _player_perf(p, outcome, is_home, hs, as_)
+    goals, assists, saves, rating, events, detail = _player_perf(p, outcome, is_home, hs, as_)
     my_result = _my_result(outcome, is_home)
+    my_conceded = (as_ if is_home else hs)
 
     conn = get_conn()
     conn.execute("""UPDATE cl_matches SET home_score=?, away_score=?,
                     pso_winner=?, pso_score=?,
                     my_played=1, my_position=?,
-                    my_saves=?, my_goals=?, my_assists=?, my_rating=?
+                    my_saves=?, my_goals=?, my_assists=?, my_rating=?,
+                    my_shots=?, my_shots_on=?, my_key_passes=?,
+                    my_dribbles=?, my_blocks=?, my_pass_acc=?, my_conceded=?
                     WHERE id=?""",
                  (hs, as_, pso_winner, pso_score,
                   p.get("position", ""),
-                  saves, goals, assists, rating, m["id"]))
+                  saves, goals, assists, rating,
+                  detail["shots"], detail["shots_on"], detail["key_passes"],
+                  detail["dribbles"], detail["blocks"], detail["pass_acc"],
+                  my_conceded, m["id"]))
     conn.commit()
     conn.close()
+
+    # [세부 지표] 통산(total_*)에도 누적 → 커리어 통합 통계에 챔스 경기 반영
+    update_player(
+        total_shots=p.get("total_shots", 0) + detail["shots"],
+        total_shots_on=p.get("total_shots_on", 0) + detail["shots_on"],
+        total_key_passes=p.get("total_key_passes", 0) + detail["key_passes"],
+        total_dribbles=p.get("total_dribbles", 0) + detail["dribbles"],
+        total_blocks=p.get("total_blocks", 0) + detail["blocks"],
+    )
 
     # 인기/스트레스/행복
     _update_pop(p, goals, assists, rating)
@@ -599,6 +663,95 @@ def simulate_my_cl_match(week, p):
 # 라운드 진행
 # ─────────────────────────────────────────────
 
+def get_cl_group_standings(tid, grp):
+    """챔스 조 순위: 승점 → 득실 → 다득점 → 전력."""
+    conn = get_conn()
+    entries = [dict(r) for r in conn.execute(
+        "SELECT * FROM cl_entries WHERE tournament_id=? AND grp=?",
+        (tid, grp)).fetchall()]
+    matches = [dict(r) for r in conn.execute(
+        """SELECT * FROM cl_matches WHERE tournament_id=? AND grp=?
+           AND stage='group' AND home_score>=0""", (tid, grp)).fetchall()]
+    conn.close()
+
+    tbl = {e["team_id"]: {"team_id": e["team_id"], "team_name": e["team_name"],
+                          "flag": e["flag"], "ovr": e["ovr"],
+                          "p": 0, "w": 0, "d": 0, "l": 0, "gf": 0, "ga": 0, "pts": 0}
+           for e in entries}
+    for m in matches:
+        h, a = tbl.get(m["home_team_id"]), tbl.get(m["away_team_id"])
+        if not h or not a:
+            continue
+        hs, as_ = m["home_score"], m["away_score"]
+        h["p"] += 1; a["p"] += 1
+        h["gf"] += hs; h["ga"] += as_
+        a["gf"] += as_; a["ga"] += hs
+        if hs > as_:
+            h["w"] += 1; h["pts"] += 3; a["l"] += 1
+        elif hs < as_:
+            a["w"] += 1; a["pts"] += 3; h["l"] += 1
+        else:
+            h["d"] += 1; a["d"] += 1; h["pts"] += 1; a["pts"] += 1
+    rows = list(tbl.values())
+    rows.sort(key=lambda r: (r["pts"], r["gf"] - r["ga"], r["gf"], r["ovr"]), reverse=True)
+    return rows
+
+
+def _finalize_groups(t):
+    """챔스 조별리그 종료 → 각 조 1·2위(16팀) → 16강 대진 생성."""
+    from game_engine import add_log, get_player
+    tid = t["id"]
+    conn = get_conn()
+    n_groups = conn.execute(
+        "SELECT COUNT(DISTINCT grp) AS n FROM cl_entries WHERE tournament_id=? AND grp!=''",
+        (tid,)).fetchone()["n"]
+    conn.close()
+    labels = _GROUP_LABELS[:n_groups]
+
+    firsts, seconds, eliminated = {}, {}, []
+    for g in labels:
+        rows = get_cl_group_standings(tid, g)
+        if len(rows) >= 1: firsts[g] = rows[0]["team_id"]
+        if len(rows) >= 2: seconds[g] = rows[1]["team_id"]
+        eliminated.extend(r["team_id"] for r in rows[2:])
+
+    conn = get_conn()
+    c = conn.cursor()
+    for tid_e in eliminated:
+        c.execute("UPDATE cl_entries SET alive=0 WHERE tournament_id=? AND team_id=?",
+                  (tid, tid_e))
+
+    # R16 대진: 1A-2B, 1C-2D, … / 1B-2A, 1D-2C, … (월드컵 방식)
+    pairs = []
+    for i in range(0, n_groups, 2):
+        g1, g2 = labels[i], labels[i + 1]
+        if g1 in firsts and g2 in seconds:
+            pairs.append((firsts[g1], seconds[g2]))
+    for i in range(0, n_groups, 2):
+        g1, g2 = labels[i], labels[i + 1]
+        if g2 in firsts and g1 in seconds:
+            pairs.append((firsts[g2], seconds[g1]))
+
+    p = get_player()
+    my_tid = p.get("current_team_id", 0) if p else 0
+    next_week = CL_ROUND_WEEKS["R16"]
+    for slot, (home, away) in enumerate(pairs):
+        is_my = 1 if my_tid in (home, away) else 0
+        c.execute("""INSERT INTO cl_matches
+                     (tournament_id, stage, grp, week, home_team_id, away_team_id,
+                      home_score, away_score, is_my, slot)
+                     VALUES(?,?,?,?,?,?,-1,-1,?,?)""",
+                  (tid, "R16", "", next_week, home, away, is_my, slot))
+    c.execute("UPDATE cl_tournaments SET status='ko' WHERE id=?", (tid,))
+    conn.commit()
+    conn.close()
+
+    add_log(f"🏆 {t['name']} 조별리그 종료 → 16강 진출팀 확정", "event")
+    # 내 팀이 조별 탈락?
+    if my_tid and my_tid in eliminated:
+        _record_my_exit(t, "조별리그 탈락")
+
+
 def _advance_round(t, cur_stage, next_stage):
     """현재 KO 라운드 종료 → 패자 탈락, 다음 라운드 대진 생성."""
     from game_engine import add_log, get_player
@@ -619,9 +772,9 @@ def _advance_round(t, cur_stage, next_stage):
     winners = []
     conn = get_conn()
     c = conn.cursor()
-    # 탈락 결과 라벨: 첫 라운드(보통 32강)에서 지면 'N강 탈락'으로 표기
+    # 탈락 결과 라벨: 첫 토너먼트 라운드(16강)에서 지면 'N강 탈락'
     exit_label = cur_stage_ko
-    if cur_stage == t["first_stage"]:
+    if cur_stage == "R16":
         exit_label = f"{cur_stage_ko} 탈락"
     for m in cur:
         w = _winner_of(m)
@@ -763,6 +916,50 @@ def _save_trophy(year, team_name, competition, result):
 # 챔스 이력 조회 (커리어창 / 은퇴창 공용)
 # ─────────────────────────────────────────────
 
+def get_my_cl_all_groups(year):
+    """[UI용] 내 대륙 챔스의 '모든 조' 순위표 목록을 반환.
+    반환: {"groups": [{"grp": "A", "standings": [...]}...], "my_team_id": tid} 또는 None"""
+    from game_engine import get_player
+    p = get_player()
+    if not p or not p.get("current_team_id"):
+        return None
+    my_tid = p["current_team_id"]
+    t = _my_cl_tournament(p, year)
+    if not t:
+        return None
+    conn = get_conn()
+    grps = [r["grp"] for r in conn.execute(
+        "SELECT DISTINCT grp FROM cl_entries WHERE tournament_id=? AND grp!='' ORDER BY grp",
+        (t["id"],)).fetchall()]
+    conn.close()
+    if not grps:
+        return None
+    groups = [{"grp": g, "standings": get_cl_group_standings(t["id"], g)} for g in grps]
+    return {"groups": groups, "my_team_id": my_tid}
+
+
+def get_my_cl_group_info(year):
+    """[UI용] 내 팀이 속한 조의 라벨과 순위표를 반환. 없으면 None."""
+    from game_engine import get_player
+    p = get_player()
+    if not p or not p.get("current_team_id"):
+        return None
+    my_tid = p["current_team_id"]
+    t = _my_cl_tournament(p, year)
+    if not t:
+        return None
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT grp FROM cl_entries WHERE tournament_id=? AND team_id=?",
+        (t["id"], my_tid)).fetchone()
+    conn.close()
+    if not row or not row["grp"]:
+        return None
+    grp = row["grp"]
+    rows = get_cl_group_standings(t["id"], grp)
+    return {"grp": grp, "standings": rows, "my_team_id": my_tid}
+
+
 def get_my_champions_matches(year):
     """[일정 탭용] 내 팀이 출전한 그 해 챔스의 전체 대진 목록.
 
@@ -812,6 +1009,7 @@ def get_my_champions_matches(year):
             "home_score": m["home_score"], "away_score": m["away_score"],
             "pso_winner": pso_name, "pso_score": m["pso_score"],
             "stage": STAGE_KO.get(m["stage"], m["stage"]), "week": m["week"],
+            "stage_raw": m["stage"], "grp": m["grp"] if "grp" in m.keys() else "",
         })
     return out
 
@@ -864,6 +1062,9 @@ def get_my_cl_matches():
             "goals": m["my_goals"], "assists": m["my_assists"],
             "saves": m["my_saves"], "conceded": op_s,
             "rating": m["my_rating"],
+            "shots": m.get("my_shots", 0), "shots_on": m.get("my_shots_on", 0),
+            "key_passes": m.get("my_key_passes", 0), "dribbles": m.get("my_dribbles", 0),
+            "blocks": m.get("my_blocks", 0), "pass_acc": m.get("my_pass_acc", 0),
             "score": f"{my_s}-{op_s}", "result": result,
         })
     return out

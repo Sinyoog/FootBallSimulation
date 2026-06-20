@@ -39,10 +39,11 @@ INTL_KO_WEEKS     = (21, 24)    # 16강(21)~결승(24)
 # gain_min/max: 일반훈련(중/저/집중)은 소프트캡과 함께 점진 성장하도록 하향.
 #               고강도(exceed_limit=True)는 max~talent_cap 돌파용이라 강하게 유지.
 TRAINING_CONFIG = {
-    "고강도":   {"stress":+20, "injury_chance":0.20, "gain_min":4,   "gain_max":6,   "exceed_limit":True},
-    "집중훈련": {"stress":+16, "injury_chance":0.00, "gain_min":3.5, "gain_max":5.0, "exceed_limit":False},
-    "중강도":   {"stress":+15, "injury_chance":0.00, "gain_min":1.8, "gain_max":2.8, "exceed_limit":False},
-    "저강도":   {"stress":+ 8, "injury_chance":0.00, "gain_min":1.0, "gain_max":1.8, "exceed_limit":False},
+    "고강도":   {"stress":+20, "injury_chance":0.20, "gain_min":4.0, "gain_max":5.5, "exceed_limit":True},
+    "강점훈련": {"stress":+16, "injury_chance":0.00, "gain_min":3.3, "gain_max":4.6, "exceed_limit":False, "focus_mode":"strong"},
+    "약점훈련": {"stress":+16, "injury_chance":0.00, "gain_min":3.3, "gain_max":4.6, "exceed_limit":False, "focus_mode":"weak"},
+    "중강도":   {"stress":+15, "injury_chance":0.00, "gain_min":2.0, "gain_max":3.0, "exceed_limit":False},
+    "저강도":   {"stress":+ 8, "injury_chance":0.00, "gain_min":1.1, "gain_max":1.8, "exceed_limit":False},
     "휴식":     {"stress":-15, "injury_chance":0.00, "gain_min":-1,  "gain_max":-1,  "exceed_limit":False},
 }
 
@@ -50,13 +51,36 @@ TRAINING_CONFIG = {
 SOFTCAP_DENOM = 40.0
 SOFTCAP_FLOOR = 0.10
 
+# 강점/약점 집중훈련: max 도달 후 talent_cap까지 한계 돌파 확률.
+# 고강도(상시 돌파)와 달리 가끔만 돌파한다. 두 모드 동일 — 차이는 '타겟 스탯'뿐.
+#   - 강점훈련: 한계치(_max)가 높은 스탯을 집중해서 그 한계까지 채움
+#   - 약점훈련: 한계치가 낮은 스탯을 집중해서 그 한계까지 채움
+FOCUS_BREAK_PROB_STRONG = 0.05
+FOCUS_BREAK_PROB_WEAK   = 0.05
+FOCUS_BREAK_PROB        = 0.05
+
+# 고강도 훈련: _max 도달 후 한 번 훈련 시 _max를 +1 끌어올릴 확률.
+#   집중훈련(5%)보다 높게 둬서 고강도가 한계 돌파의 주력 트랙임을 분명히 한다.
+HIGH_BREAK_PROB = 0.20
+
 # 재능 등급별 고강도 돌파 상한 (talent_cap). 일반훈련 max와는 별개의 천장.
 # 부상 없이 고강도를 꾸준히 하면 이 값까지 개별 스탯을 올릴 수 있음.
+#   이 cap은 '개별 스탯이 고강도 돌파로 도달 가능한 평균적 천장'이자
+#   전성기 OVR 의 목표 범위이기도 하다 (강점은 cap+α로 100 초과 가능,
+#   약점은 cap 아래라 평균은 cap 부근에서 균형).
+#   - 월클(worldclass): 전성기 OVR 96~100, 강점 스탯은 고강도로 100+ 가능
+#   - 우수(elite):      전성기 OVR 88~93
+#   - 평범(normal):     전성기 OVR 82~87
+#   - 무재능(limited):  전성기 OVR 73~80 (아무리 갈아도 80 언저리)
 TALENT_TIERS = {
-    "gifted": {"prob": 0.15, "cap_min": 100, "cap_max": 100},
-    "mid":    {"prob": 0.35, "cap_min": 92,  "cap_max": 94},
-    "normal": {"prob": 0.50, "cap_min": 86,  "cap_max": 88},
+    "worldclass": {"prob": 0.08, "cap_min": 96, "cap_max": 100},
+    "elite":      {"prob": 0.22, "cap_min": 88, "cap_max": 93},
+    "normal":     {"prob": 0.45, "cap_min": 82, "cap_max": 87},
+    "limited":    {"prob": 0.25, "cap_min": 73, "cap_max": 80},
 }
+
+# (구버전 호환) 예전 티어명을 새 티어로 매핑
+_LEGACY_TALENT_ALIAS = {"gifted": "worldclass", "mid": "elite"}
 
 MATCH_STRESS = +20
 MATCH_STAT_GAIN_MIN = 1
@@ -119,6 +143,75 @@ PHYSICAL_TRAITS = list(PHYSICAL_TRAIT_EFFECTS.keys())
 # 등장 가중치: 무난함이 흔하고, 천재/몬스터는 희귀
 PHYSICAL_TRAIT_WEIGHTS = [34, 12, 8, 14, 12, 10, 10]
 
+# ──────────────────────────────────────────────────────────────
+# [신체 아키타입] 체형 유형. PHYSICAL_TRAIT(부상/성장 특성)와는 별개의 축.
+#   - 선수의 키/체중을 결정하고, 일부 스탯을 ±로 보정한다(현실적 ±5~8).
+#   - 포지션이 어떤 타입이 나올지 '확률을 기울이되' 고정하진 않는다.
+#     → 윙어인데 포켓로켓(메시형)이 나오거나, 작은데 종결자 체급(트라오레)도
+#       드물게 가능. 현실의 다양성을 재현.
+#
+# 스탯 보정(stat_bias)은 '시작 스탯 + 잠재(max) 양쪽'에 더해진다.
+#   양수 = 그 스탯이 또래보다 높게 시작/성장, 음수 = 낮게.
+#   몸싸움 계열(strength/heading/jump)은 크게, 부차 스탯은 작게 둬서
+#   "키 작으면 몸싸움 밀린다"가 분명히 체감되되 개성은 유지되게 한다.
+# ──────────────────────────────────────────────────────────────
+BODY_TYPES = {
+    "하드웨어 종결자형": {
+        "desc": "압도적 체격으로 육체적으로 제압. 포스트플레이·제공권.",
+        "height": (186, 196),
+        "weight": (84, 100),
+        "stat_bias": {
+            "strength": +8, "heading": +7, "jump": +6,
+            "speed": -5, "dribbling": -5, "stamina": -2,
+        },
+    },
+    "음속 지배자형": {
+        "desc": "폭발적인 속도로 측면을 파괴. 치고 달리기·역습.",
+        "height": (172, 186),
+        "weight": (66, 76),
+        "stat_bias": {
+            "speed": +8, "stamina": +4, "dribbling": +3,
+            "strength": -5, "heading": -4, "jump": -2,
+        },
+    },
+    "포켓 로켓형": {
+        "desc": "작지만 단단하고 민첩. 좁은 공간 탈압박·방향전환.",
+        "height": (165, 175),
+        "weight": (63, 73),
+        "stat_bias": {
+            "dribbling": +8, "speed": +4, "setpiece": +2,
+            "strength": -6, "heading": -7, "jump": -5,
+        },
+    },
+    "인간 발전기형": {
+        "desc": "공수 양면 활동량과 밸런스. 육각형 미드필더.",
+        "height": (175, 185),
+        "weight": (70, 80),
+        "stat_bias": {
+            "stamina": +7, "passing": +3, "tackling": +2,
+            "confidence": +1,   # 큰 약점 없이 골고루(보정폭 작게)
+        },
+    },
+}
+BODY_TYPE_NAMES = list(BODY_TYPES.keys())
+
+# 포지션별 아키타입 등장 확률(가중치). 합이 100이 아니어도 됨(상대 비율).
+#   정석 타입에 무게를 싣되, 다른 타입도 0이 아니게 둬서 이질적 선수를 허용한다.
+#   순서: [종결자, 음속, 포켓로켓, 발전기]
+BODY_TYPE_WEIGHTS_BY_POS = {
+    "GK":  [55, 10,  5, 30],   # 키 큰 편
+    "CB":  [60, 10,  3, 27],   # 종결자 다수
+    "LB":  [10, 55, 20, 15],   # 측면=음속
+    "RB":  [10, 55, 20, 15],
+    "CDM": [30, 10, 10, 50],   # 발전기 다수
+    "CM":  [12, 13, 20, 55],   # 발전기 중심
+    "CAM": [ 6, 14, 50, 30],   # 포켓로켓(창의형) 많음
+    "LW":  [ 8, 52, 30, 10],   # 음속/포켓로켓
+    "RW":  [ 8, 52, 30, 10],
+    "CF":  [40, 18, 17, 25],   # 타깃맨~섀도우 다양
+    "ST":  [48, 22, 12, 18],   # 종결자(타깃맨) 우세하되 발빠른 9번도
+}
+
 # 에이전트
 AGENT_GRADES = ["F","E","D","C","B","A","S"]
 AGENT_FEE_RATE = {"F":0.00,"E":0.03,"D":0.06,"C":0.10,"B":0.15,"A":0.20,"S":0.28}
@@ -126,6 +219,22 @@ AGENT_UPPER_LEAGUE_BONUS = {"F":0,"E":1,"D":1,"C":2,"B":2,"A":3,"S":3}
 
 # 포지션
 POSITIONS = ["GK","CB","LB","RB","CDM","CM","CAM","LW","RW","CF","ST"]
+
+# 포지션 그룹: 커리어/은퇴 지표를 포지션 성격에 맞게 보여주기 위한 분류.
+#   - GK: 선방/실점/선방률/무실점이 핵심 (골·어시 무의미)
+#   - 수비수(DEF): 무실점·실점·평점이 핵심, 골·어시는 보조
+#   - 그 외(미드/공격): 골·어시·평점이 핵심
+GK_POSITIONS  = ["GK"]
+DEF_POSITIONS = ["CB", "LB", "RB", "CDM"]   # 중앙·측면 수비 + 수비형 미드
+ATK_POSITIONS = ["CM", "CAM", "LW", "RW", "CF", "ST"]
+
+def position_group(pos):
+    """포지션 → 'GK' / 'DEF' / 'ATK' 그룹 반환."""
+    if pos in GK_POSITIONS:
+        return "GK"
+    if pos in DEF_POSITIONS:
+        return "DEF"
+    return "ATK"
 
 # 세부역할
 SUB_ROLES = {
@@ -173,25 +282,25 @@ PRIORITY_TECH_STATS = {
 }
 
 ALL_STATS = [
-    "stamina","speed","jump","shooting","passing","dribbling",
+    "stamina","speed","jump","strength","shooting","passing","dribbling",
     "tackling","heading","positioning","setpiece",
     "mental","confidence","leadership","concentration"
 ]
 
 # 훈련으로 오르는 스탯 분류
-PHYSICAL_STATS  = ["stamina","speed","jump"]
+PHYSICAL_STATS  = ["stamina","speed","jump","strength"]
 TECHNICAL_STATS = ["shooting","passing","dribbling","tackling","heading","positioning","setpiece"]
 MENTAL_STATS    = ["mental","confidence","leadership","concentration"]
 
 STAT_KO = {
-    "stamina":"체력","speed":"스피드","jump":"점프력",
+    "stamina":"체력","speed":"스피드","jump":"점프력","strength":"몸싸움",
     "shooting":"슈팅","passing":"패스","dribbling":"드리블",
     "tackling":"태클","heading":"헤딩","positioning":"포지셔닝",
     "setpiece":"세트피스","mental":"멘탈","confidence":"자신감",
     "leadership":"리더십","concentration":"집중력"
 }
 STAT_EN = {
-    "stamina":"Stamina","speed":"Speed","jump":"Jump",
+    "stamina":"Stamina","speed":"Speed","jump":"Jump","strength":"Strength",
     "shooting":"Shooting","passing":"Passing","dribbling":"Dribbling",
     "tackling":"Tackling","heading":"Heading","positioning":"Positioning",
     "setpiece":"Set Piece","mental":"Mental","confidence":"Confidence",
@@ -238,11 +347,20 @@ CONTINENTAL_INTERVAL   = 4
 # ── 국제대회 본선 설정 ──────────────────────────────
 WC_TEAMS   = 32   # 월드컵 본선 32개국 (8조 × 4팀)
 WC_GROUPS  = 8
-CONT_TEAMS = 16   # 대륙컵 본선 16개국 (4조 × 4팀)
-CONT_GROUPS = 4
+CONT_TEAMS = 24   # 대륙컵 본선 24개국 (6조 × 4팀)
+CONT_GROUPS = 6
+# 24개국 포맷: 각 조 1·2위(12팀) + 성적 좋은 3위 중 상위 4팀 = 16강
+CONT_BEST_THIRDS = 4
 
 # 월드컵 대륙별 쿼터 (합 32, 개최국 포함 / 오세아니아는 아시아 편입)
 WC_QUOTA = {"유럽": 13, "남미": 4, "북미": 4, "아프리카": 5, "아시아": 6}
+
+# [2002년 확대] 이 해부터 본선 64개국·16조 → 조별 후 32강 시작.
+WC_EXPAND_YEAR  = 2002
+WC_TEAMS_BIG    = 64
+WC_GROUPS_BIG   = 16
+# 64개국 대륙별 쿼터 (합 64, 개최국 포함)
+WC_QUOTA_BIG = {"유럽": 24, "남미": 8, "북미": 8, "아프리카": 12, "아시아": 12}
 
 # 대륙 연맹 구성 (대륙컵 참가 풀)
 CONFEDERATIONS = {

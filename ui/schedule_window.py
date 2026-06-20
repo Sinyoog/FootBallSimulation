@@ -103,14 +103,20 @@ class ScheduleWindow(QDialog):
         self._tab.addTab(self._make_table(all_data, my_view=False), "전체 일정")
 
         # 국제대회 탭 (해당 연도에 월드컵/대륙컵이 열렸으면 표시)
-        intl_w = self._make_intl_tab()
+        intl_w = self._make_intl_tab("groups")
         if intl_w:
             self._tab.addTab(intl_w, "🌍 국제대회")
+        intl_ko = self._make_intl_tab("ko")
+        if intl_ko:
+            self._tab.addTab(intl_ko, "🌍 국제대회(본선)")
 
         # 챔피언스리그 탭
-        champs_w = self._make_champions_tab()
+        champs_w = self._make_champions_tab("groups")
         if champs_w:
             self._tab.addTab(champs_w, "🏆 챔피언스리그")
+        champs_ko = self._make_champions_tab("ko")
+        if champs_ko:
+            self._tab.addTab(champs_ko, "🏆 챔피언스리그(본선)")
 
         if 0 <= cur < self._tab.count():
             self._tab.setCurrentIndex(cur)
@@ -130,7 +136,8 @@ class ScheduleWindow(QDialog):
 
     # ── 국제대회 탭 ──────────────────────────────
 
-    def _make_intl_tab(self):
+    def _make_intl_tab(self, mode="groups"):
+        """mode='groups': 조별 순위표만 / mode='ko': 토너먼트 브래킷만."""
         import intl_engine
         from game_engine import get_state, get_player
         st = get_state()
@@ -177,41 +184,46 @@ class ScheduleWindow(QDialog):
             (t["id"],)).fetchall()}
         conn.close()
 
-        # ── 조별리그 순위표 ──
-        lbl_g = QLabel("◼ 조별리그")
-        lbl_g.setStyleSheet("color:#00cc44;font-weight:bold;font-size:12px;")
-        lay.addWidget(lbl_g)
-        for g in groups:
-            rows = intl_engine.get_group_standings(t["id"], g)
-            gt = QTableWidget(len(rows), 7)
-            gt.setHorizontalHeaderLabels([f"{g}조", "경기", "승", "무", "패", "득실", "승점"])
-            gt.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-            gt.verticalHeader().setVisible(False)
-            gt.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            gt.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            gt.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-            gt.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-            gt.setStyleSheet(
-                "QTableWidget{background:#1e1e1e;color:#ccc;gridline-color:#2a2a2a;border:1px solid #2a2a2a;}"
-                "QHeaderView::section{background:#252525;color:#888;border:none;padding:3px;}")
-            for i, r in enumerate(rows):
-                gd = r["gf"] - r["ga"]
-                vals = [f"{r['flag']}{r['country']}", str(r["p"]), str(r["w"]),
-                        str(r["d"]), str(r["l"]), f"{'+' if gd>0 else ''}{gd}", str(r["pts"])]
-                # 상위 2팀(진출권) 강조, 내 국가는 청록
-                if r["country"] == nat:       color = QColor("#66ccff")
-                elif i < 2:                    color = QColor("#00cc44")
-                else:                          color = QColor("#888888")
-                for j, v in enumerate(vals):
-                    item = QTableWidgetItem(v)
-                    if j > 0: item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                    item.setForeground(color)
-                    gt.setItem(i, j, item)
-            gt.setFixedHeight(gt.verticalHeader().defaultSectionSize() * len(rows) + 28)
-            lay.addWidget(gt)
+        # 본선(ko) 탭인데 아직 토너먼트 대진이 없으면 탭 자체를 만들지 않음
+        if mode == "ko" and not ko_rows:
+            return None
 
-        # ── 토너먼트 대진 → 브래킷(대진표) ──
-        if ko_rows:
+        # ── 조별리그 순위표 ── (groups 모드에서만)
+        if mode == "groups":
+            lbl_g = QLabel("◼ 조별리그")
+            lbl_g.setStyleSheet("color:#00cc44;font-weight:bold;font-size:12px;")
+            lay.addWidget(lbl_g)
+            for g in groups:
+                rows = intl_engine.get_group_standings(t["id"], g)
+                gt = QTableWidget(len(rows), 7)
+                gt.setHorizontalHeaderLabels([f"{g}조", "경기", "승", "무", "패", "득실", "승점"])
+                gt.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+                gt.verticalHeader().setVisible(False)
+                gt.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+                gt.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+                gt.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+                gt.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+                gt.setStyleSheet(
+                    "QTableWidget{background:#1e1e1e;color:#ccc;gridline-color:#2a2a2a;border:1px solid #2a2a2a;}"
+                    "QHeaderView::section{background:#252525;color:#888;border:none;padding:3px;}")
+                for i, r in enumerate(rows):
+                    gd = r["gf"] - r["ga"]
+                    vals = [f"{r['flag']}{r['country']}", str(r["p"]), str(r["w"]),
+                            str(r["d"]), str(r["l"]), f"{'+' if gd>0 else ''}{gd}", str(r["pts"])]
+                    # 상위 2팀(진출권) 강조, 내 국가는 청록
+                    if r["country"] == nat:       color = QColor("#66ccff")
+                    elif i < 2:                    color = QColor("#00cc44")
+                    else:                          color = QColor("#888888")
+                    for j, v in enumerate(vals):
+                        item = QTableWidgetItem(v)
+                        if j > 0: item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                        item.setForeground(color)
+                        gt.setItem(i, j, item)
+                gt.setFixedHeight(gt.verticalHeader().defaultSectionSize() * len(rows) + 28)
+                lay.addWidget(gt)
+
+        # ── 토너먼트 대진 → 브래킷(대진표) ── (ko 모드에서만)
+        if mode == "ko" and ko_rows:
             from ui.bracket_widget import BracketWidget, build_rounds_from_matches
             lbl_k = QLabel("◼ 토너먼트")
             lbl_k.setStyleSheet("color:#00cc44;font-weight:bold;font-size:12px;margin-top:6px;")
@@ -261,7 +273,8 @@ class ScheduleWindow(QDialog):
 
     # ── 챔피언스리그 탭 ──────────────────────────
 
-    def _make_champions_tab(self):
+    def _make_champions_tab(self, mode="groups"):
+        """mode='groups': 조별 순위표만 / mode='ko': 토너먼트 브래킷만."""
         try:
             import champions_engine
         except ImportError:
@@ -326,13 +339,54 @@ class ScheduleWindow(QDialog):
         sub = QLabel(f"팀: {team_info['name']} ({team_info['league_name']})")
         sub.setStyleSheet("color:#888;font-size:11px;")
         lay.addWidget(sub)
+
+        # ── 조별리그 순위표 (전체 조) ── (groups 모드에서만)
+        all_groups = champions_engine.get_my_cl_all_groups(st["current_year"])
+        if mode == "groups" and all_groups and all_groups.get("groups"):
+            my_tid_g = all_groups["my_team_id"]
+            lbl_g = QLabel("◼ 조별리그")
+            lbl_g.setStyleSheet("color:#00cc44;font-weight:bold;font-size:12px;")
+            lay.addWidget(lbl_g)
+            for grp in all_groups["groups"]:
+                rows = grp["standings"]
+                gt = QTableWidget(len(rows), 7)
+                gt.setHorizontalHeaderLabels([f"{grp['grp']}조", "경기", "승", "무", "패", "득실", "승점"])
+                gt.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+                gt.verticalHeader().setVisible(False)
+                gt.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+                gt.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+                gt.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+                gt.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+                gt.setStyleSheet(
+                    "QTableWidget{background:#1e1e1e;color:#ccc;gridline-color:#2a2a2a;border:1px solid #2a2a2a;}"
+                    "QHeaderView::section{background:#252525;color:#888;border:none;padding:3px;}")
+                for i, r in enumerate(rows):
+                    gd = r["gf"] - r["ga"]
+                    vals = [f"{r.get('flag','')}{r['team_name']}", str(r["p"]), str(r["w"]),
+                            str(r["d"]), str(r["l"]), f"{'+' if gd>0 else ''}{gd}", str(r["pts"])]
+                    if r["team_id"] == my_tid_g:   color = QColor("#66ccff")
+                    elif i < 2:                    color = QColor("#00cc44")
+                    else:                          color = QColor("#888888")
+                    for j, v in enumerate(vals):
+                        item = QTableWidgetItem(v)
+                        if j > 0: item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                        item.setForeground(color)
+                        gt.setItem(i, j, item)
+                gt.setFixedHeight(gt.verticalHeader().defaultSectionSize() * len(rows) + 28)
+                lay.addWidget(gt)
+            hint = QLabel("초록=16강 진출권(상위 2팀), 청록=내 팀")
+            hint.setStyleSheet("color:#666;font-size:10px;")
+            lay.addWidget(hint)
         
-        # 토너먼트 매치업 → 브래킷(대진표)
+        # 토너먼트 매치업 → 브래킷(대진표) (ko 모드에서만)
         from ui.bracket_widget import BracketWidget, build_rounds_from_matches
         stage_order = {"32강": 0, "16강": 1, "8강": 2, "4강": 3, "결승": 4}
 
         bracket_matches = []
         for m in matches:
+            # 조별리그 경기는 브래킷에서 제외 (위 순위표로 따로 표시)
+            if m.get("stage_raw") == "group" or m["stage"] == "조별리그":
+                continue
             hs, as_ = m["home_score"], m["away_score"]
             played  = hs is not None and hs >= 0
             if played:
@@ -354,7 +408,11 @@ class ScheduleWindow(QDialog):
                 "my_side": my_side,
             })
 
-        if bracket_matches:
+        # 본선(ko) 탭인데 아직 토너먼트 대진이 없으면 탭 자체를 만들지 않음
+        if mode == "ko" and not bracket_matches:
+            return None
+
+        if mode == "ko" and bracket_matches:
             lbl_t = QLabel("◼ 토너먼트")
             lbl_t.setStyleSheet("color:#00cc44;font-weight:bold;font-size:12px;")
             lay.addWidget(lbl_t)

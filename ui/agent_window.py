@@ -32,33 +32,36 @@ AGENT_INFO = {
     "S": ("⭐", "슈퍼 에이전트",   "수수료 28%. S급 리그. 상위리그 오퍼+3."),
 }
 
-# 국가 등급별 에이전트 기본 계약금 (천원 단위)
-# 같은 에이전트 등급이라도 국가 수준에 따라 다름
+# 에이전트 기본 계약금 (천원 단위)
+#  [익스플로잇 수정] 예전엔 '국가 등급'에 연동했더니, 약소국 출신은 S급
+#  에이전트를 헐값에 잡은 뒤 강팀으로 이적해 비싼 연봉에 싼 수수료를 평생
+#  적용받는 구멍이 있었다. 이제 '내 OVR(=시장가치)'로 비용을 책정한다.
+#  컬럼: 내 OVR 구간 (T1>=85 / T2 78~84 / T3 70~77 / T4 62~69 / T5 54~61 / T6 <54)
 _BASE_COST = {
-    # agent_grade → {country_grade → 기본 계약금}
-    "E": {"S":8000,  "A":6000,  "B":4000,  "C":2500,  "D":1500,  "E":800,   "F":400},
-    "D": {"S":30000, "A":20000, "B":12000, "C":7000,  "D":3500,  "E":1800,  "F":900},
-    "C": {"S":100000,"A":70000, "B":40000, "C":20000, "D":9000,  "E":4500,  "F":2000},
-    "B": {"S":300000,"A":200000,"B":120000,"C":60000, "D":25000, "E":10000, "F":4000},
-    "A": {"S":800000,"A":500000,"B":300000,"C":150000,"D":60000, "E":25000, "F":10000},
-    "S": {"S":2000000,"A":1200000,"B":700000,"C":350000,"D":150000,"E":60000,"F":25000},
+    # agent_grade → {ovr_tier → 기본 계약금}
+    "E": {"T1":8000,   "T2":6000,   "T3":4000,   "T4":2500,   "T5":1500,   "T6":800},
+    "D": {"T1":30000,  "T2":20000,  "T3":12000,  "T4":7000,   "T5":3500,   "T6":1800},
+    "C": {"T1":100000, "T2":70000,  "T3":40000,  "T4":20000,  "T5":9000,   "T6":4500},
+    "B": {"T1":300000, "T2":200000, "T3":120000, "T4":60000,  "T5":25000,  "T6":10000},
+    "A": {"T1":800000, "T2":500000, "T3":300000, "T4":150000, "T5":60000,  "T6":25000},
+    "S": {"T1":2000000,"T2":1200000,"T3":700000, "T4":350000, "T5":150000, "T6":60000},
 }
 
-def _get_country_grade(p) -> str:
-    """내 선수의 국적 등급 조회."""
-    if not p: return "F"
-    conn = get_conn()
-    row = conn.execute("SELECT grade FROM countries WHERE name=?",
-                       (p.get("nationality",""),)).fetchone()
-    conn.close()
-    return row["grade"] if row else "F"
+def _ovr_tier(ovr: int) -> str:
+    """내 OVR을 계약금 구간(T1~T6)으로 변환. 높을수록 비싸다(시장가치 반영)."""
+    if ovr >= 85: return "T1"
+    if ovr >= 78: return "T2"
+    if ovr >= 70: return "T3"
+    if ovr >= 62: return "T4"
+    if ovr >= 54: return "T5"
+    return "T6"
 
-def _calc_agent_cost(agent_grade: str, country_grade: str) -> int:
-    """에이전트 계약금: 국가 등급 기반 + ±30% 랜덤."""
+def _calc_agent_cost(agent_grade: str, ovr_tier: str) -> int:
+    """에이전트 계약금: 내 OVR(시장가치) 구간 기반 + ±30% 랜덤."""
     if agent_grade == "F":
         return 0
-    base = _BASE_COST.get(agent_grade, {}).get(country_grade, 1000)
-    # ±30% 랜덤 (50천원=5만원 단위 반올림)
+    base = _BASE_COST.get(agent_grade, {}).get(ovr_tier, 1000)
+    # ±30% 랜덤 (50천원 단위 반올림)
     varied = int(base * random.uniform(0.70, 1.30))
     return max(10, round(varied / 50) * 50)
 
@@ -89,10 +92,10 @@ AGENT_VARIANTS = [
     ("거물형",   1.85, -0.04),   # 계약금 비싸지만 수수료 쌈
 ]
 
-def _make_variant(grade, country_grade):
-    """등급+국가등급 기준 (계약금, 수수료율, 라벨) 변형 1개 생성."""
+def _make_variant(grade, ovr_tier):
+    """에이전트 등급 + 내 OVR 구간 기준 (계약금, 수수료율, 라벨) 변형 1개 생성."""
     label, cost_mult, fee_add = random.choice(AGENT_VARIANTS)
-    base_cost = _calc_agent_cost(grade, country_grade)
+    base_cost = _calc_agent_cost(grade, ovr_tier)
     cost = max(0, int(base_cost * cost_mult))
     base_fee = AGENT_FEE_RATE.get(grade, 0.0)
     fee = round(max(0.0, base_fee + fee_add), 3)
@@ -110,10 +113,10 @@ class AgentWindow(QDialog):
         self.lang = lang
         p = get_player()
         self.cur_grade    = p.get("agent_grade","F") if p else "F"
-        self.country_grade = _get_country_grade(p)
+        self.ovr_tier = _ovr_tier(p.get("ovr", 40) if p else 40)
         self.offers = _gen_agent_offers(self.cur_grade)
         # 오퍼별 변형: (계약금, 수수료율, 라벨) — 같은 등급도 다르게
-        self.variants = {i: _make_variant(g, self.country_grade)
+        self.variants = {i: _make_variant(g, self.ovr_tier)
                          for i, g in enumerate(self.offers)}
         self._build()
 

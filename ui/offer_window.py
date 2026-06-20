@@ -48,6 +48,8 @@ class OfferWindow(QDialog):
         self.neg_used: dict[int, int] = {}
         self.offer_salaries: list[int] = [o["salary"] for o in offers]
         self.neg_failed: set[int] = set()
+        self.all_failed = False          # 모든 오퍼 결렬 여부 (1년 훈련 분기용)
+        self._close_btn = None           # 닫기 버튼 참조 (전부 결렬 시 활성화)
 
         for i in range(len(offers)):
             self.neg_used[i] = random.randint(1, 3)
@@ -76,6 +78,7 @@ class OfferWindow(QDialog):
             self._render_cards()
 
         close = QPushButton("닫기" if self.lang=="ko" else "Close")
+        self._close_btn = close
         if self._force:
             close.setEnabled(False)
             close.setToolTip("팀을 선택해야 합니다")
@@ -195,6 +198,18 @@ class OfferWindow(QDialog):
                 show_toast(self, "❌ 협상 결렬  입단 불가", "#cc0000", 1400)
             else:
                 show_toast(self, f"협상 실패  남은 기회: {self.neg_used[idx]}회", "#cc4400", 1200)
+
+        # [전부 결렬 구제] 모든 오퍼가 결렬되면 입단할 곳이 없으므로,
+        #   첫 입단(force_select)이라도 닫기를 풀어 1년 더 훈련하도록 빠져나가게 한다.
+        if self.offers and len(self.neg_failed) >= len(self.offers):
+            self.all_failed = True
+            if self._force and self._close_btn is not None:
+                self._close_btn.setEnabled(True)
+                self._close_btn.setText("1년 더 훈련 (전부 결렬)"
+                                        if self.lang == "ko" else "Train 1 more year")
+                self._close_btn.setToolTip("")
+            show_toast(self, "⚠ 모든 협상이 결렬되었습니다. 1년 더 훈련합니다.",
+                       "#cc6600", 1800)
 
         # 카드 갱신 (연봉 수치 반영)
         QTimer.singleShot(100, self._render_cards)

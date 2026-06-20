@@ -45,7 +45,8 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         team_id INTEGER, name TEXT, position TEXT,
         stamina INTEGER DEFAULT 50, speed INTEGER DEFAULT 50,
-        jump INTEGER DEFAULT 50, shooting INTEGER DEFAULT 50,
+        jump INTEGER DEFAULT 50, strength INTEGER DEFAULT 50,
+        shooting INTEGER DEFAULT 50,
         passing INTEGER DEFAULT 50, dribbling INTEGER DEFAULT 50,
         tackling INTEGER DEFAULT 50, heading INTEGER DEFAULT 50,
         positioning INTEGER DEFAULT 50, setpiece INTEGER DEFAULT 50,
@@ -81,6 +82,7 @@ def init_db():
         stamina INTEGER DEFAULT 40, stamina_max INTEGER DEFAULT 75,
         speed INTEGER DEFAULT 40, speed_max INTEGER DEFAULT 75,
         jump INTEGER DEFAULT 40, jump_max INTEGER DEFAULT 75,
+        strength INTEGER DEFAULT 40, strength_max INTEGER DEFAULT 75,
         shooting INTEGER DEFAULT 40, shooting_max INTEGER DEFAULT 75,
         passing INTEGER DEFAULT 40, passing_max INTEGER DEFAULT 75,
         dribbling INTEGER DEFAULT 40, dribbling_max INTEGER DEFAULT 75,
@@ -203,6 +205,29 @@ def init_db():
         "ALTER TABLE my_player ADD COLUMN total_saves INTEGER DEFAULT 0",
         "ALTER TABLE my_player ADD COLUMN total_goals_against INTEGER DEFAULT 0",
         "ALTER TABLE my_player ADD COLUMN total_earnings INTEGER DEFAULT 0",  # 이슈10
+        # ── [세부 지표] 포지션별 활약을 보여줄 경기 누적 스탯 ──────────
+        #   shots=슈팅, shots_on=유효슈팅, key_passes=기회창출(키패스),
+        #   dribbles=드리블 성공, pass_acc_sum/pass_acc_cnt=패스성공률 누적(평균용),
+        #   blocks=차단(태클+인터셉트). season_=이번 시즌, total_=통산.
+        "ALTER TABLE my_player ADD COLUMN season_shots INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN season_shots_on INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN season_key_passes INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN season_dribbles INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN season_blocks INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN season_pass_acc_sum REAL DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN season_pass_acc_cnt INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN total_shots INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN total_shots_on INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN total_key_passes INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN total_dribbles INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN total_blocks INTEGER DEFAULT 0",
+        # career_entries: 시즌(팀별) 단위 세부 지표 + 패스성공률(저장 시점 평균)
+        "ALTER TABLE career_entries ADD COLUMN shots INTEGER DEFAULT 0",
+        "ALTER TABLE career_entries ADD COLUMN shots_on INTEGER DEFAULT 0",
+        "ALTER TABLE career_entries ADD COLUMN key_passes INTEGER DEFAULT 0",
+        "ALTER TABLE career_entries ADD COLUMN dribbles INTEGER DEFAULT 0",
+        "ALTER TABLE career_entries ADD COLUMN blocks INTEGER DEFAULT 0",
+        "ALTER TABLE career_entries ADD COLUMN pass_acc REAL DEFAULT 0",
         "ALTER TABLE my_player ADD COLUMN contract_years INTEGER DEFAULT 0",
         "ALTER TABLE my_player ADD COLUMN contract_end_year INTEGER DEFAULT 0",
         "ALTER TABLE my_player ADD COLUMN first_half_rating REAL DEFAULT 0",
@@ -256,6 +281,17 @@ def init_db():
         "ALTER TABLE my_player ADD COLUMN nationality3 TEXT DEFAULT ''",
         "ALTER TABLE my_player ADD COLUMN flag3 TEXT DEFAULT ''",
         "ALTER TABLE my_player ADD COLUMN intl_committed TEXT DEFAULT ''",
+        # [귀화] 같은 나라(리그)에서 누적 거주 연수 추적. 3년 채우면 그 나라
+        #  귀화 국적 획득 자격(21세 이전 + 본선 미경험 조건과 함께).
+        #  residency_country: 현재 거주 중인 리그의 소속 국가
+        #  residency_years:   그 나라에서 연속 채운 연수 (나라 바뀌면 리셋)
+        "ALTER TABLE my_player ADD COLUMN residency_country TEXT DEFAULT ''",
+        "ALTER TABLE my_player ADD COLUMN residency_years INTEGER DEFAULT 0",
+        # [귀화] 이미 귀화로 획득한 국적 목록(쉼표구분) — 중복 획득 방지용
+        "ALTER TABLE my_player ADD COLUMN naturalized_nats TEXT DEFAULT ''",
+        # [cap-tie] A대표 '본선' 무대를 밟았는지. 본선 출전 시 1 → 국적 영구고정.
+        #  예선만 뛴 것은 0 유지(예선은 cap-tie 아님, 현실 FIFA 규칙).
+        "ALTER TABLE my_player ADD COLUMN intl_capped INTEGER DEFAULT 0",
         # [복수국적] 이 대회에서 내가 '어느 나라로' 뛰는지. ''=미정/해당없음.
         # my_selected=3 은 '둘 다 진출 → 대표팀 선택 대기' 상태를 뜻한다.
         "ALTER TABLE intl_tournaments ADD COLUMN my_nat TEXT DEFAULT ''",
@@ -263,6 +299,34 @@ def init_db():
         #  시즌 중 다른 팀으로 이적하면 current_team_id와 달라지므로,
         #  이 값과 비교해 '등록 마감 후 합류'는 그 시즌 챔스에 못 뛰게 한다.
         "ALTER TABLE cl_tournaments ADD COLUMN my_team_id INTEGER DEFAULT 0",
+        # [신체 아키타입] 체형 유형 + 몸싸움(strength) 스탯
+        "ALTER TABLE my_player ADD COLUMN body_type TEXT DEFAULT '인간 발전기형'",
+        "ALTER TABLE my_player ADD COLUMN strength INTEGER DEFAULT 50",
+        "ALTER TABLE my_player ADD COLUMN strength_max INTEGER DEFAULT 75",
+        "ALTER TABLE ai_players ADD COLUMN strength INTEGER DEFAULT 50",
+        # [세부 지표] 국제전·챔스 경기에도 클럽과 동일한 활약 수치를 기록.
+        #   shots/shots_on/key_passes/dribbles/blocks/pass_acc
+        "ALTER TABLE intl_matches ADD COLUMN my_shots INTEGER DEFAULT 0",
+        "ALTER TABLE intl_matches ADD COLUMN my_shots_on INTEGER DEFAULT 0",
+        "ALTER TABLE intl_matches ADD COLUMN my_key_passes INTEGER DEFAULT 0",
+        "ALTER TABLE intl_matches ADD COLUMN my_dribbles INTEGER DEFAULT 0",
+        "ALTER TABLE intl_matches ADD COLUMN my_blocks INTEGER DEFAULT 0",
+        "ALTER TABLE intl_matches ADD COLUMN my_pass_acc REAL DEFAULT 0",
+        "ALTER TABLE intl_matches ADD COLUMN my_conceded INTEGER DEFAULT 0",
+        "ALTER TABLE cl_matches ADD COLUMN my_shots INTEGER DEFAULT 0",
+        "ALTER TABLE cl_matches ADD COLUMN my_shots_on INTEGER DEFAULT 0",
+        "ALTER TABLE cl_matches ADD COLUMN my_key_passes INTEGER DEFAULT 0",
+        "ALTER TABLE cl_matches ADD COLUMN my_dribbles INTEGER DEFAULT 0",
+        "ALTER TABLE cl_matches ADD COLUMN my_blocks INTEGER DEFAULT 0",
+        "ALTER TABLE cl_matches ADD COLUMN my_pass_acc REAL DEFAULT 0",
+        "ALTER TABLE cl_matches ADD COLUMN my_conceded INTEGER DEFAULT 0",
+        # [챔스 조별리그] 그룹 라벨(A~H). 토너먼트 경기는 ''.
+        "ALTER TABLE cl_matches ADD COLUMN grp TEXT DEFAULT ''",
+        # [챔스 조별] entries에 조 배정 저장.
+        "ALTER TABLE cl_entries ADD COLUMN grp TEXT DEFAULT ''",
+        # [챔스 진출권] 내가 그 해 리그 1위로 '출전 자격'을 얻었는지(1) 아닌지(0).
+        #  자격이 없으면(2위 이하) 그 대회와 무관 → '본선 진출 실패'도 안 뜬다.
+        "ALTER TABLE cl_tournaments ADD COLUMN my_qualified INTEGER DEFAULT 0",
     ]:
         try: c.execute(migration)
         except: pass
@@ -377,19 +441,19 @@ def reset_game_data():
 
 # ─── OVR 가중치 ───────────────────────────────────────────────
 WEIGHTS = {
-    "GK":  dict(stamina=8,speed=3,jump=10,shooting=1,passing=3,dribbling=1,tackling=2,heading=3,positioning=15,setpiece=2,mental=8,confidence=5,leadership=5,concentration=15),
-    "CB":  dict(stamina=8,speed=5,jump=10,shooting=1,passing=5,dribbling=2,tackling=15,heading=12,positioning=10,setpiece=3,mental=5,confidence=5,leadership=5,concentration=10),
-    "LB":  dict(stamina=8,speed=10,jump=3,shooting=1,passing=8,dribbling=5,tackling=12,heading=5,positioning=8,setpiece=3,mental=5,confidence=5,leadership=5,concentration=8),
-    "RB":  dict(stamina=8,speed=10,jump=3,shooting=1,passing=8,dribbling=5,tackling=12,heading=5,positioning=8,setpiece=3,mental=5,confidence=5,leadership=5,concentration=8),
-    "CDM": dict(stamina=8,speed=3,jump=3,shooting=2,passing=8,dribbling=3,tackling=15,heading=5,positioning=12,setpiece=3,mental=8,confidence=5,leadership=5,concentration=10),
-    "CM":  dict(stamina=8,speed=5,jump=3,shooting=5,passing=12,dribbling=8,tackling=8,heading=3,positioning=10,setpiece=5,mental=5,confidence=5,leadership=5,concentration=8),
-    "CAM": dict(stamina=5,speed=5,jump=3,shooting=10,passing=12,dribbling=10,tackling=3,heading=3,positioning=12,setpiece=8,mental=5,confidence=5,leadership=5,concentration=8),
-    "LW":  dict(stamina=5,speed=12,jump=3,shooting=10,passing=8,dribbling=12,tackling=0,heading=3,positioning=10,setpiece=5,mental=5,confidence=5,leadership=5,concentration=8),
-    "RW":  dict(stamina=5,speed=12,jump=3,shooting=10,passing=8,dribbling=12,tackling=0,heading=3,positioning=10,setpiece=5,mental=5,confidence=5,leadership=5,concentration=8),
-    "CF":  dict(stamina=5,speed=8,jump=8,shooting=12,passing=10,dribbling=10,tackling=0,heading=10,positioning=10,setpiece=5,mental=5,confidence=5,leadership=3,concentration=8),
-    "ST":  dict(stamina=5,speed=10,jump=10,shooting=15,passing=3,dribbling=5,tackling=0,heading=15,positioning=13,setpiece=5,mental=5,confidence=5,leadership=3,concentration=8),
+    "GK":  dict(stamina=8,speed=3,jump=10,strength=4,shooting=1,passing=3,dribbling=1,tackling=2,heading=3,positioning=15,setpiece=2,mental=8,confidence=5,leadership=5,concentration=15),
+    "CB":  dict(stamina=8,speed=5,jump=10,strength=12,shooting=1,passing=5,dribbling=2,tackling=15,heading=12,positioning=10,setpiece=3,mental=5,confidence=5,leadership=5,concentration=10),
+    "LB":  dict(stamina=8,speed=10,jump=3,strength=6,shooting=1,passing=8,dribbling=5,tackling=12,heading=5,positioning=8,setpiece=3,mental=5,confidence=5,leadership=5,concentration=8),
+    "RB":  dict(stamina=8,speed=10,jump=3,strength=6,shooting=1,passing=8,dribbling=5,tackling=12,heading=5,positioning=8,setpiece=3,mental=5,confidence=5,leadership=5,concentration=8),
+    "CDM": dict(stamina=8,speed=3,jump=3,strength=10,shooting=2,passing=8,dribbling=3,tackling=15,heading=5,positioning=12,setpiece=3,mental=8,confidence=5,leadership=5,concentration=10),
+    "CM":  dict(stamina=8,speed=5,jump=3,strength=6,shooting=5,passing=12,dribbling=8,tackling=8,heading=3,positioning=10,setpiece=5,mental=5,confidence=5,leadership=5,concentration=8),
+    "CAM": dict(stamina=5,speed=5,jump=3,strength=4,shooting=10,passing=12,dribbling=10,tackling=3,heading=3,positioning=12,setpiece=8,mental=5,confidence=5,leadership=5,concentration=8),
+    "LW":  dict(stamina=5,speed=12,jump=3,strength=3,shooting=10,passing=8,dribbling=12,tackling=0,heading=3,positioning=10,setpiece=5,mental=5,confidence=5,leadership=5,concentration=8),
+    "RW":  dict(stamina=5,speed=12,jump=3,strength=3,shooting=10,passing=8,dribbling=12,tackling=0,heading=3,positioning=10,setpiece=5,mental=5,confidence=5,leadership=5,concentration=8),
+    "CF":  dict(stamina=5,speed=8,jump=8,strength=8,shooting=12,passing=10,dribbling=10,tackling=0,heading=10,positioning=10,setpiece=5,mental=5,confidence=5,leadership=3,concentration=8),
+    "ST":  dict(stamina=5,speed=10,jump=10,strength=10,shooting=15,passing=3,dribbling=5,tackling=0,heading=15,positioning=13,setpiece=5,mental=5,confidence=5,leadership=3,concentration=8),
 }
-ALL_STATS = ["stamina","speed","jump","shooting","passing","dribbling",
+ALL_STATS = ["stamina","speed","jump","strength","shooting","passing","dribbling",
              "tackling","heading","positioning","setpiece",
              "mental","confidence","leadership","concentration"]
 
@@ -1182,12 +1246,12 @@ def _generate_team_players(c, team, team_strength):
         stats = _gen_ai_stats(pos, target)
         ovr = calc_ovr(pos, stats)
         c.execute("""INSERT INTO ai_players
-            (team_id,name,position,stamina,speed,jump,shooting,passing,
+            (team_id,name,position,stamina,speed,jump,strength,shooting,passing,
              dribbling,tackling,heading,positioning,setpiece,
              mental,confidence,leadership,concentration,ovr)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (team["tid"],name,pos,
-             stats["stamina"],stats["speed"],stats["jump"],
+             stats["stamina"],stats["speed"],stats["jump"],stats["strength"],
              stats["shooting"],stats["passing"],stats["dribbling"],
              stats["tackling"],stats["heading"],stats["positioning"],
              stats["setpiece"],stats["mental"],stats["confidence"],
@@ -1196,14 +1260,25 @@ def _generate_team_players(c, team, team_strength):
 
 def _gen_ai_stats(pos, target):
     """목표 OVR을 받아 그 값에 수렴하도록 스탯을 역산 생성.
-    키스탯은 가중치가 높으므로 목표보다 약간 높게, 비키스탯은 약간 낮게 둔다."""
+    키스탯은 가중치가 높으므로 목표보다 약간 높게, 비키스탯은 약간 낮게 둔다.
+    + 신체 아키타입(체형)에 따른 stat_bias 를 더해 종결자/음속/포켓로켓/발전기
+      유형의 개성을 부여한다(포지션이 확률을 기울이되 고정하지 않음)."""
+    from constants import (BODY_TYPE_NAMES, BODY_TYPE_WEIGHTS_BY_POS,
+                           BODY_TYPES, BODY_TYPE_WEIGHTS_BY_POS as _BW)
     keys = KEY_STATS_BY_POS.get(pos, ALL_STATS[:5])
     adj = target + 1.0   # calc_ovr 하향편향(가중분산) 보정
+
+    # 아키타입 추첨 (포지션 가중치 기반, 예외 허용)
+    _w = _BW.get(pos, [25, 25, 25, 25])
+    body_type = random.choices(BODY_TYPE_NAMES, _w)[0]
+    bias = BODY_TYPES[body_type]["stat_bias"]
+
     stats = {}
     for s in ALL_STATS:
         if s in keys:
-            val = int(round(random.gauss(adj + 2, 3)))
+            val = random.gauss(adj + 2, 3)
         else:
-            val = int(round(random.gauss(adj - 3, 4)))
-        stats[s] = min(99, max(15, val))
+            val = random.gauss(adj - 3, 4)
+        val += bias.get(s, 0)   # 아키타입 보정
+        stats[s] = min(99, max(15, int(round(val))))
     return stats

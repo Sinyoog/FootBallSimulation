@@ -4,7 +4,7 @@ import math
 from database import get_conn, calc_ovr, ALL_STATS
 from constants import *  # PHYSICAL_STATS, TECHNICAL_STATS, MENTAL_STATS 포함
 
-_pending_transfer_type: str = "입단"  # join_team → _save_career_entry 전달용
+_pending_transfer_type: str = ""  # join_team → _save_career_entry 전달용. ''=대기(잔류 시즌)
 
 # ── 팀 평균 OVR 캐시 ───────────────────────────────────────────
 # ai_players.ovr 및 team_id는 게임 진행 중 변경되지 않는다
@@ -115,21 +115,31 @@ def recalc_ovr(p: dict) -> int:
 
 
 def _age_train_eff(age: int, peak_age: int) -> float:
-    """나이별 훈련 효율 배수. 성장기→전성기→하락기가 선형으로 연결.
-    성장기(16~peak): 1.30→1.00   전성기(peak~peak+5): 1.00  (현실적 황금기 연장)
-    하락기(peak+5~35): 1.00→0.55  말년(36+): 0.45
+    """나이별 훈련 효율 배수. 현실적 성장 곡선(종 모양).
+    유소년기(16~18): 0.80→1.05  신체가 아직 미성숙해 성장이 더디다.
+    만개기(19~peak): 1.05→1.30   19세부터 잠재력이 빠르게 터진다(피크 직전 최고).
+    전성기(peak~peak+4): 1.30→1.00  고점 유지하며 완성.
+    하락기(peak+4~35): 1.00→0.55   노화.
+    말년(36+): 0.45
+    이 형태라 16~18세에 폭발(평준화)하지 않고 20대 초중반에 완성된다.
     """
-    growth_end = peak_age
-    if age <= growth_end:
-        t = (age - 16) / max(1, growth_end - 16)
+    if age <= 18:
+        # 16:0.80 → 18:1.05
+        t = (age - 16) / 2.0
+        return round(0.80 + 0.25 * t, 3)
+    if age <= peak_age:
+        # 18(1.05) → peak(1.30)
+        span = max(1, peak_age - 18)
+        t = (age - 18) / span
+        return round(1.05 + 0.25 * t, 3)
+    if age <= peak_age + 4:
+        # peak(1.30) → peak+4(1.00) 완만한 하강(전성기)
+        t = (age - peak_age) / 4.0
         return round(1.30 - 0.30 * t, 3)
-    elif age <= peak_age + 5:
-        return 1.0
-    elif age <= 35:
-        t = (age - (peak_age + 5)) / max(1, 35 - (peak_age + 5))
+    if age <= 35:
+        t = (age - (peak_age + 4)) / max(1, 35 - (peak_age + 4))
         return round(1.0 - 0.45 * t, 3)
-    else:
-        return 0.45
+    return 0.45
 
 
 # ═══════════════════════════════════════════
@@ -164,35 +174,59 @@ def create_player(name: str, position: str, sub_role: str,
                 if r3:
                     nationality3, flag3 = r3["name"], r3["flag"]
 
-    height = random.randint(165, 196)
-    weight = random.randint(60, 92)
     personality = random.choice(PERSONALITIES)
     # [신체 특징] 성격과 별개로 1개 부여 (가중 추첨 — 무난함이 흔함)
-    from constants import PHYSICAL_TRAITS, PHYSICAL_TRAIT_WEIGHTS, PHYSICAL_TRAIT_EFFECTS
+    from constants import (PHYSICAL_TRAITS, PHYSICAL_TRAIT_WEIGHTS, PHYSICAL_TRAIT_EFFECTS,
+                           BODY_TYPES, BODY_TYPE_NAMES, BODY_TYPE_WEIGHTS_BY_POS)
     physical_trait = random.choices(PHYSICAL_TRAITS, PHYSICAL_TRAIT_WEIGHTS)[0]
-    peak_age = 23 if random.random() < 0.20 else random.randint(25, 26)
 
-    # 재능 등급 추첨 (gifted/mid/normal) → 고강도 돌파 상한(talent_cap) 결정
+    # [신체 아키타입] 체형 유형 추첨. 포지션이 확률을 기울이되 고정하진 않는다
+    # (윙어인데 포켓로켓/메시형, 작은데 종결자 체급 등 예외 허용).
+    _bw = BODY_TYPE_WEIGHTS_BY_POS.get(position, [25, 25, 25, 25])
+    body_type = random.choices(BODY_TYPE_NAMES, _bw)[0]
+    _bt = BODY_TYPES[body_type]
+    body_bias = _bt["stat_bias"]
+    # 체형이 정한 범위 안에서 키/체중 결정
+    height = random.randint(*_bt["height"])
+    weight = random.randint(*_bt["weight"])
+
+    # 재능 등급 추첨 (worldclass/elite/normal/limited) → 고강도 돌파 상한 결정
     _r = random.random()
-    if _r < TALENT_TIERS["gifted"]["prob"]:
-        talent_tier = "gifted"
-    elif _r < TALENT_TIERS["gifted"]["prob"] + TALENT_TIERS["mid"]["prob"]:
-        talent_tier = "mid"
-    else:
-        talent_tier = "normal"
+    _acc = 0.0
+    talent_tier = "normal"
+    for _tname in ("worldclass", "elite", "normal", "limited"):
+        _acc += TALENT_TIERS[_tname]["prob"]
+        if _r < _acc:
+            talent_tier = _tname
+            break
     _tt = TALENT_TIERS[talent_tier]
     talent_cap = random.randint(_tt["cap_min"], _tt["cap_max"])
 
-    # 시작 스탯 + 일반훈련 천장(max). max는 talent_cap을 넘지 않음.
-    if talent_tier == "gifted":
-        target = random.randint(46, 52); dev = random.randint(6, 10)
-        mx_add = (38, 50)
-    elif talent_tier == "mid":
-        target = random.randint(42, 47); dev = random.randint(8, 12)
-        mx_add = (34, 44)
-    else:
-        target = random.randint(38, 43); dev = random.randint(10, 15)
-        mx_add = (30, 42)
+    # 피크 나이: 재능이 클수록 잠재력을 다 끌어내는 데 오래 걸려 늦게 정점에
+    #   도달한다(월클 23~24, 무재능 20~21). 성장기(16~peak)가 길수록 천천히 오른다.
+    _peak_by_tier = {
+        "worldclass": (23, 24),
+        "elite":      (22, 24),
+        "normal":     (21, 23),
+        "limited":    (20, 22),
+    }
+    peak_age = random.randint(*_peak_by_tier.get(talent_tier, (22, 24)))
+
+    # 시작 스탯(16세) + 일반훈련 천장(max). max는 talent_cap을 넘지 않음.
+    #   16세 시작은 낮게 잡아 20대 중반까지 천천히 성장하도록 한다.
+    #   (성장 페이스는 _age_train_eff 에이징커브가 함께 결정)
+    if talent_tier == "worldclass":
+        target = random.randint(42, 48); dev = random.randint(7, 11)
+        mx_add = (40, 54)
+    elif talent_tier == "elite":
+        target = random.randint(39, 45); dev = random.randint(8, 12)
+        mx_add = (36, 48)
+    elif talent_tier == "normal":
+        target = random.randint(36, 42); dev = random.randint(10, 14)
+        mx_add = (32, 44)
+    else:  # limited
+        target = random.randint(32, 38); dev = random.randint(11, 16)
+        mx_add = (26, 38)
 
     stat_vals = {}
     # [해결A] 포지션 색깔: OVR 가중치를 재활용해 핵심 스탯은 살짝 높게,
@@ -220,9 +254,34 @@ def create_player(name: str, position: str, sub_role: str,
         if _phys_start and s in PHYSICAL_STATS:
             if _trait_phys_stat is None or _trait_phys_stat == s:
                 tbonus = _phys_start
-        cur = max(20, min(72, target + random.randint(-dev, dev) + bias + tbonus))
-        mx  = min(99, talent_cap, cur + random.randint(*mx_add))
-        mx  = max(mx, cur + 5)   # 최소한의 성장 여지 보장
+        # [신체 아키타입] 체형 보정 (현실적 ±5~8). 시작 스탯과 잠재 양쪽에 반영.
+        bbias = body_bias.get(s, 0)
+
+        cur = max(18, min(74, target + random.randint(-dev, dev) + bias + tbonus + bbias))
+
+        # ── 스탯 상한 차등 ──────────────────────────────────────
+        # 핵심 원칙:
+        #   · 일반훈련 천장(max)은 talent_cap 부근에서 강/약점에 따라 흩어진다.
+        #     (강점은 cap에 근접, 약점은 cap보다 확실히 낮게 → 평준화 방지)
+        #   · 개별 스탯이 100을 넘는 것은 오직 '고강도 돌파(talent_cap+α)'로만
+        #     가능하고, 일반훈련 max 자체는 그 천장(break_cap)을 못 넘는다.
+        #   · OVR(평균)의 천장은 talent_cap 이라, 강점이 100을 넘어도 약점이
+        #     낮아 평균은 cap 부근에서 균형잡힌다.
+        is_strong = (bias + bbias) >= 3     # 포지션·체형이 함께 미는 강점
+        is_weak   = (bias + bbias) <= -3    # 명확한 약점
+        # 고강도 돌파로 도달 가능한 절대 천장 (강점만 100 초과 허용)
+        if is_strong:
+            break_cap = min(125, talent_cap + 12)   # 주특기는 고강도로 100+ 가능
+        elif is_weak:
+            break_cap = min(99,  talent_cap - 6)     # 약점은 천장이 낮음
+        else:
+            break_cap = min(110, talent_cap + 2)     # 평범 스탯
+        # 일반훈련 천장(max)은 break_cap 보다 4~10 낮게 둔다 → 그 위(특히 100+)는
+        # 고강도 훈련으로만 돌파. 재능 있어도 일반훈련만으론 100 못 감.
+        soft_cap = break_cap - random.randint(4, 10)
+        mx = min(soft_cap, cur + random.randint(*mx_add))
+        mx = max(mx, cur + 4)        # 최소한의 성장 여지
+        mx = max(28, min(break_cap, mx))
         stat_vals[s] = cur
         stat_vals[f"{s}_max"] = mx
 
@@ -232,27 +291,28 @@ def create_player(name: str, position: str, sub_role: str,
     INSERT INTO my_player(
         id, name, nationality, flag, age, birth_year,
         position, sub_role, personality, height, weight, peak_age,
-        stamina,stamina_max, speed,speed_max, jump,jump_max,
+        stamina,stamina_max, speed,speed_max, jump,jump_max, strength,strength_max,
         shooting,shooting_max, passing,passing_max, dribbling,dribbling_max,
         tackling,tackling_max, heading,heading_max, positioning,positioning_max,
         setpiece,setpiece_max, mental,mental_max, confidence,confidence_max,
         leadership,leadership_max, concentration,concentration_max,
         ovr, current_year, current_week, current_season,
         stress, happiness, agent_grade, language,
-        talent_cap, talent_tier, physical_trait
+        talent_cap, talent_tier, physical_trait, body_type
     ) VALUES (
         1,?,?,?,?,?,
         ?,?,?,?,?,?,
-        ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+        ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
         ?,?,?,?,
         10,10,'F','ko',
-        ?,?,?
+        ?,?,?,?
     )""", (
         name, nationality, flag, PLAYER_START_AGE, GAME_START_YEAR,
         position, sub_role, personality, height, weight, peak_age,
         stat_vals["stamina"],    stat_vals["stamina_max"],
         stat_vals["speed"],      stat_vals["speed_max"],
         stat_vals["jump"],       stat_vals["jump_max"],
+        stat_vals["strength"],   stat_vals["strength_max"],
         stat_vals["shooting"],   stat_vals["shooting_max"],
         stat_vals["passing"],    stat_vals["passing_max"],
         stat_vals["dribbling"],  stat_vals["dribbling_max"],
@@ -265,7 +325,7 @@ def create_player(name: str, position: str, sub_role: str,
         stat_vals["leadership"], stat_vals["leadership_max"],
         stat_vals["concentration"],stat_vals["concentration_max"],
         ovr, GAME_START_YEAR, 1, 1,
-        talent_cap, talent_tier, physical_trait,
+        talent_cap, talent_tier, physical_trait, body_type,
     ))
 
     # [복수국적] 추가 국적/국기 저장 (단일국적이면 빈 값)
@@ -345,6 +405,11 @@ def _update_career_stats(p, year, week):
     rc  = p.get("season_rating_cnt", 0)
     rs  = p.get("season_rating_sum", 0.0)
     avg_r = round(rs/rc, 2) if rc else 0.0
+    # [세부 지표] 시즌 누적 → 커리어 행
+    d_sh, d_sho = p.get("season_shots",0), p.get("season_shots_on",0)
+    d_kp, d_drb, d_blk = p.get("season_key_passes",0), p.get("season_dribbles",0), p.get("season_blocks",0)
+    _pac_c = p.get("season_pass_acc_cnt",0)
+    d_pac = round(p.get("season_pass_acc_sum",0.0)/_pac_c, 3) if _pac_c else 0.0
 
     season = p.get("current_season", 1)
     lid_row = c.execute("SELECT league_id FROM teams WHERE id=?", (tid,)).fetchone()
@@ -370,9 +435,11 @@ def _update_career_stats(p, year, week):
     c.execute("""UPDATE career_entries SET
         matches=?, goals=?, assists=?, saves=?, goals_against=?,
         avg_rating=?, team_rank=?, wins=?, draws=?, losses=?, clean_sheets=?,
+        shots=?, shots_on=?, key_passes=?, dribbles=?, blocks=?, pass_acc=?,
         team_id=?
         WHERE id=?""",
-        (sm, sg, sa, ss, sga, avg_r, rn, tw, td, tl, cs, tid, existing["id"]))
+        (sm, sg, sa, ss, sga, avg_r, rn, tw, td, tl, cs,
+         d_sh, d_sho, d_kp, d_drb, d_blk, d_pac, tid, existing["id"]))
     conn.commit()
     conn.close()
 
@@ -410,6 +477,11 @@ def _close_career_entry(p, year, week, exit_type=""):
     rc  = p.get("season_rating_cnt", 0)
     rs  = p.get("season_rating_sum", 0.0)
     avg_r = round(rs/rc, 2) if rc else 0.0
+    # [세부 지표]
+    d_sh, d_sho = p.get("season_shots",0), p.get("season_shots_on",0)
+    d_kp, d_drb, d_blk = p.get("season_key_passes",0), p.get("season_dribbles",0), p.get("season_blocks",0)
+    _pac_c2 = p.get("season_pass_acc_cnt",0)
+    d_pac = round(p.get("season_pass_acc_sum",0.0)/_pac_c2, 3) if _pac_c2 else 0.0
 
     # 팀 전적 match_results 기반
     season = p.get("current_season", 1)
@@ -436,9 +508,11 @@ def _close_career_entry(p, year, week, exit_type=""):
     c.execute("""UPDATE career_entries SET
         end_year=?, end_week=?, matches=?, goals=?, assists=?, saves=?, goals_against=?,
         avg_rating=?, team_rank=?, wins=?, draws=?, losses=?, clean_sheets=?,
+        shots=?, shots_on=?, key_passes=?, dribbles=?, blocks=?, pass_acc=?,
         league_name=?, tier=?, salary=?, position=?, team_id=?, exit_type=?
         WHERE id=?""",
         (year, week, sm, sg, sa, ss, sga, avg_r, rn, tw, td, tl, cs,
+         d_sh, d_sho, d_kp, d_drb, d_blk, d_pac,
          team_row["lname"], team_row["tier"], p.get("salary", 0),
          p.get("position", ""), tid, exit_type, existing["id"]))
 
@@ -490,6 +564,50 @@ def _lock_in_championship(team_id, year, matches_at_team, min_week=30):
     add_log(f"🏆 {year}년  {info['name']}  {info['lname']} 우승!", "event")
 
 
+def finalize_season_for_retire():
+    """은퇴 확정 직전 호출. 리그 경기가 끝난(36주+) 현재 시즌의 우승·개인수상을
+    '시즌 종료 처리(_end_of_season)를 거치지 않고' trophy_log/awards에 즉시 확정한다.
+
+    이유: _end_of_season 은 새해 진입(52→1주) 때만 돌기 때문에, 36주 이후 은퇴하면
+    그 시즌 우승/수상이 누락된다. 은퇴 화면에 정상 반영되도록 여기서 미리 박는다.
+    나이 증가·스탯 노화·통계 리셋 같은 시즌전환 부작용은 일으키지 않는다.
+    """
+    p = get_player()
+    if not p:
+        return
+    st = get_state() or {}
+    year = st.get("current_year", p.get("current_year", 0))
+    tid  = p.get("current_team_id", 0)
+
+    # 1) 리그 우승 확정 (그 팀에서 충분히 뛰고 1위면). 36주+이므로 min_week=30 충족.
+    if tid:
+        _lock_in_championship(tid, year, p.get("season_matches", 0), min_week=30)
+
+    # 2) 개인 수상 확정 (시즌 10경기 이상 출전 시). 시즌 통계는 아직 살아있다.
+    #    이미 이 연도에 내 수상이 기록돼 있으면(중복 호출/시즌종료 후) 건너뛴다.
+    if p.get("season_matches", 0) >= 10:
+        _conn = get_conn()
+        _dup = _conn.execute(
+            "SELECT 1 FROM awards WHERE year=? AND is_mine=1 LIMIT 1", (year,)).fetchone()
+        _conn.close()
+        if not _dup:
+            _rc = p.get("season_rating_cnt", 0)
+            _rs = p.get("season_rating_sum", 0.0)
+            season_avg_rating = round(_rs / _rc, 2) if _rc else 6.0
+            _season_cs = _calc_clean_sheets_for_player(p)
+            try:
+                _process_awards(
+                    p, year,
+                    season_goals=p.get("season_goals", 0),
+                    season_assists=p.get("season_assists", 0),
+                    season_rating=season_avg_rating,
+                    season_cs=_season_cs,
+                    season_goals_against=p.get("season_goals_against", 0),
+                )
+            except Exception as e:
+                print("finalize_season_for_retire 수상 오류:", e)
+
+
 def _ensure_career_entry(p, st):
     """팀이 있는데 열린 커리어 항목(end_year=0)이 없으면 지금 생성."""
     tid = p.get("current_team_id", 0)
@@ -511,16 +629,17 @@ def _ensure_career_entry(p, st):
         conn.close(); return
 
     # 없으면 현재 주차 기준으로 생성
-    #  - transfer_type/contract_years는 '이벤트(입단·연장)가 발생한 그 해'에만
+    #  - transfer_type/contract_years는 '이벤트(입단·이적·오퍼)가 발생한 그 해'에만
     #    표시되는 일회성 값이다. join_team이 _pending_transfer_type을 세팅한
-    #    직후 첫 _ensure에서만 소비하고, 그 뒤 시즌 줄은 '재직중'(빈 값)으로 둔다.
-    #    같은 팀에 계속 머무는 시즌까지 '오퍼/연장'과 연수가 잔류하던 버그 수정.
+    #    직후 첫 _ensure에서만 소비하고('' 로 리셋), 그 뒤 같은 팀에 머무는
+    #    잔류 시즌 줄은 '재직중'(빈 값)으로 둔다.
+    #    → 플래그가 '비어있지 않으면' 곧 방금 발생한 입단/이적/오퍼 이벤트.
     global _pending_transfer_type
     tt_e     = _pending_transfer_type
-    if tt_e and tt_e != "입단":
-        # 입단/이적 이벤트 줄 → 연수 표시, 그리고 즉시 소비
+    if tt_e:
+        # 입단/이적/오퍼 이벤트 줄 → 유형·연수 표시, 그리고 즉시 소비
         c_yrs_e = p.get("contract_years", 0)
-        _pending_transfer_type = "입단"
+        _pending_transfer_type = ""
     else:
         # 같은 팀 잔류 시즌 → 이벤트 아님 (연수/유형 비움 → UI에서 '—')
         c_yrs_e = 0
@@ -777,20 +896,24 @@ def _process_training(p, week, ttype, focus_stat=None):
 
     if ttype == "휴식":
         # 신체/기술 스탯 중 랜덤 1개 소폭 하락 (멘탈 스탯은 휴식으로 안 떨어짐)
-        _phy_pool  = [s for s in PHYSICAL_STATS
-                      if s in FOCUS_TRAIN_STATS.get(p["position"], PHYSICAL_STATS)]
-        _tech_pool = [s for s in TECHNICAL_STATS
-                      if s in FOCUS_TRAIN_STATS.get(p["position"], TECHNICAL_STATS)]
-        _rest_pool = (_phy_pool or PHYSICAL_STATS) + (_tech_pool or TECHNICAL_STATS)
-        # max(한계치)에 도달한 스탯은 깎지 않는다.
-        #   다 찬 주무기를 깎으면 훈련으로 복구가 안 돼(이미 max) 순감소가 생긴다.
-        #   → 아직 여유 있는(올릴 수 있는) 스탯에서만 하락시켜 복구 가능하게 한다.
-        _rest_below = [s for s in _rest_pool if p.get(s, 40) < p.get(f"{s}_max", 80)]
-        if _rest_below:
-            stat = random.choice(_rest_below)
-            cur = p.get(stat, 40)
-            if cur > 20:
-                stat_changes[stat] = -1
+        #   단, 아직 성장기(피크 나이 이전)면 휴식으로 스탯이 깎이지 않는다.
+        #   한창 크는 선수가 일주일 쉰다고 퇴보하지 않으며, 성장기에 휴식 감소가
+        #   있으면 스트레스 관리용 휴식이 성장을 상쇄해 버린다(22세 OVR 미달의 원인).
+        #   피크 이후에는 노화로 가끔(35%) 소폭 하락.
+        _age_now = p.get("age", 16)
+        _peak = p.get("peak_age", 25)
+        if _age_now > _peak and random.random() < 0.35:
+            _phy_pool  = [s for s in PHYSICAL_STATS
+                          if s in FOCUS_TRAIN_STATS.get(p["position"], PHYSICAL_STATS)]
+            _tech_pool = [s for s in TECHNICAL_STATS
+                          if s in FOCUS_TRAIN_STATS.get(p["position"], TECHNICAL_STATS)]
+            _rest_pool = (_phy_pool or PHYSICAL_STATS) + (_tech_pool or TECHNICAL_STATS)
+            _rest_below = [s for s in _rest_pool if p.get(s, 40) < p.get(f"{s}_max", 80)]
+            if _rest_below:
+                stat = random.choice(_rest_below)
+                cur = p.get(stat, 40)
+                if cur > 20:
+                    stat_changes[stat] = -1
         happy_chg = random.randint(4, 8)
         log_parts = [f"😴 휴식  {week}주차  스트레스 {stress_chg:+d}  행복 {happy_chg:+d}"]
         if stat_changes:
@@ -830,7 +953,45 @@ def _process_training(p, week, ttype, focus_stat=None):
 
         # ── 훈련 스탯 상승 ──────────────────────────────────
         # 집중훈련: 지정 스탯 1개
-        if ttype == "집중훈련" and focus_stat:
+        focus_mode = cfg.get("focus_mode")
+        if focus_mode in ("strong", "weak"):
+            # [강점/약점 훈련] 스탯을 자동 선별해 상위 2~3개를 함께 키운다.
+            #   판정 기준 = '현재 수치'
+            #     - strong: 현재 높은 순 → 지금 잘하는 능력치를 더 극대화
+            #     - weak:   현재 낮은 순 → 지금 부족한 능력치를 메움
+            #   (한계치가 아니라 현재치 기준이라, '한계는 높은데 아직 안 찬'
+            #    태클 45/78 같은 스탯도 약점으로 제대로 잡힌다.)
+            #   포지션 가중치 0(무관)인 스탯은 대상에서 제외(GK의 슈팅 등).
+            from database import WEIGHTS as _FW
+            _posw = _FW.get(p["position"], {})
+            _cap_f = p.get("talent_cap", 88)
+            _cand = [s for s in ALL_STATS if _posw.get(s, 0) > 0]
+            if not _cand:
+                _cand = list(ALL_STATS)
+
+            def _score(s):
+                # 강점/약점 판정은 '현재 수치' 기준.
+                return p.get(s, 40)
+
+            if focus_mode == "strong":
+                # 강점: 현재 높은 순으로 강점군 확정 → 그 안에서 집중.
+                ranked = sorted(_cand, key=_score, reverse=True)
+            else:
+                # 약점: 현재 낮은 순으로 약점군 확정 → 그 안에서 집중.
+                ranked = sorted(_cand, key=_score)
+            half = ranked[:max(3, len(ranked) // 2)]   # 상위/하위 절반(최소3)이 대상군
+            # 더 올릴 여지 있는(아직 안 찬) 스탯을 우선, 없으면 그대로 둬서
+            # max 돌파 로직이 받게 한다.
+            if focus_mode == "strong":
+                room = [s for s in half if p.get(s, 40) < _cap_f]
+            else:
+                room = [s for s in half if p.get(s, 40) < p.get(f"{s}_max", 80)]
+            ordered = room + [s for s in half if s not in room]
+            cnt = random.choices([2, 3], weights=[55, 45])[0]
+            targets = ordered[:cnt]
+            _slow_targets = set()
+        elif ttype == "집중훈련" and focus_stat:
+            # (구버전 호환) 단일 스탯 집중
             targets = [focus_stat]
             _slow_targets = set()
         else:
@@ -843,15 +1004,10 @@ def _process_training(p, week, ttype, focus_stat=None):
             if not tech_pool: tech_pool = list(TECHNICAL_STATS)
 
             # pool 내 스탯이 모두 한계에 도달했으면 전체 스탯으로 확장
-            # 고강도(exceed_limit)는 talent_cap까지 돌파하므로 cap 기준,
-            # 일반훈련은 max 기준으로 '아직 올릴 수 있는' 스탯을 고른다.
-            _cap = p.get("talent_cap", 88)
-            if cfg.get("exceed_limit"):
-                def _below_max(stats_list):
-                    return [s for s in stats_list if p.get(s,40) < _cap]
-            else:
-                def _below_max(stats_list):
-                    return [s for s in stats_list if p.get(s,40) < p.get(f"{s}_max",80)]
+            # 고강도/일반훈련 모두 '스탯별 _max'를 천장으로 본다. (고강도는 _max가
+            # talent_cap+α로 높게 잡힌 강점을 100+까지 끌어올린다)
+            def _below_max(stats_list):
+                return [s for s in stats_list if p.get(s,40) < p.get(f"{s}_max",80)]
             phy_below  = _below_max(phy_pool)
             tech_below = _below_max(tech_pool)
             # pool 내 남은 스탯 없으면 전체에서 미달 스탯으로 확장
@@ -918,14 +1074,14 @@ def _process_training(p, week, ttype, focus_stat=None):
             #   - 고강도: talent_cap 기준 (cap까지 돌파 가능)
             #   - 중강도: max 기준 (max까지만, 다 찬 뒤 안 찬 비focus 채움)
             if cfg.get("exceed_limit"):
-                _cap2 = p.get("talent_cap", 88)
                 _focus_avg = sum(p.get(s,40) for s in focus) / max(1, len(focus))
-                if _focus_avg >= _cap2 - 6:
+                _focus_cap_avg = sum(p.get(f"{s}_max",80) for s in focus) / max(1, len(focus))
+                if _focus_avg >= _focus_cap_avg - 6:
                     from database import WEIGHTS as _W
                     _posw = _W.get(p["position"], {})
                     _nf_all = [s for s in ALL_STATS
                                if s not in focus and _posw.get(s,0) > 0
-                               and p.get(s,40) < _cap2]
+                               and p.get(s,40) < p.get(f"{s}_max",80)]
                     if _nf_all:
                         _nf_all.sort(key=lambda s: _posw.get(s,0), reverse=True)
                         for s in _nf_all[:2]:
@@ -975,34 +1131,68 @@ def _process_training(p, week, ttype, focus_stat=None):
             mx  = p.get(f"{stat}_max", 80)
 
             if cfg.get("exceed_limit"):
-                # 고강도 트랙: max 무시, talent_cap까지 돌파 (소프트캡 미적용)
-                raw = random.uniform(g_min, g_max) * eff
-                gain = (1 if random.random() < raw else 0) if raw < 1.0 else int(raw)
-                new_val = min(talent_cap, cur + gain)
-            elif ttype == "집중훈련":
-                # [해결B] 집중훈련(중간 강화): 콕 집어 키우는 훈련이므로
-                #  - max 미달: 소프트캡을 완만히만 적용(일반훈련보다 덜 둔화) → 잘 오름
-                #  - max 도달: max를 1 끌어올려 talent_cap까지 점진 돌파
+                # 고강도 트랙: 스탯별 _max(break_cap)까지 돌파. talent_cap 일률이
+                #   아니라 스탯마다 천장이 달라, 강점(_max 높음)은 100+까지 가고
+                #   약점(_max 낮음)은 일찍 멈춰 평준화되지 않는다.
+                #   한계 '마지막 몇 포인트'에서만 살짝 둔화시켜(soft) 천장에 닿는
+                #   순간을 늦춘다. 그 외 구간은 거의 풀스피드(돌파 트랙).
                 if cur < mx:
+                    # _max 미달: 풀스피드로 _max까지 채운다(마지막 12점만 둔화).
                     headroom = max(0, mx - cur)
-                    # 분모를 키워(SOFTCAP_DENOM*2) 둔화를 약하게, 하한도 높게
-                    soft = min(1.0, max(0.45, headroom / (SOFTCAP_DENOM * 2)))
+                    soft = 1.0 if headroom >= 12 else max(0.5, headroom / 12.0)
                     raw = random.uniform(g_min, g_max) * eff * soft
                     gain = (1 if random.random() < raw else 0) if raw < 1.0 else int(raw)
                     new_val = min(mx, cur + gain)
                 else:
-                    # max 도달 → max를 1 끌어올림 (talent_cap 이하), 값도 같이 +1
-                    new_mx = min(99, talent_cap, mx + 1)
-                    if new_mx > mx:
+                    # _max 도달: 한 번 훈련 시 HIGH_BREAK_PROB(20%) 확률로 _max를 +1
+                    #   끌어올려 talent_cap+α(강점 100+ 가능)까지 점진 돌파.
+                    break_cap = min(125, talent_cap + 12)
+                    if random.random() < HIGH_BREAK_PROB and mx < break_cap:
+                        new_mx = mx + 1
                         stat_changes[f"{stat}_max_up"] = (stat, new_mx)
                         new_val = min(new_mx, cur + 1)
                     else:
-                        new_val = cur   # 이미 talent_cap, 더는 못 올림
+                        new_val = cur
+            elif cfg.get("focus_mode") in ("strong", "weak") or ttype == "집중훈련":
+                # [강점/약점 집중훈련]
+                #  - max 미달: 소프트캡을 완만히만 적용(일반훈련보다 덜 둔화) → 잘 오름
+                #  - max 도달: 고강도와 달리 '가끔만'(FOCUS_BREAK_PROB) max를 1 끌어올려
+                #              talent_cap까지 점진 돌파. 풀로 채운 뒤에도 천천히 cap을 향함.
+                if cur < mx:
+                    # [막판 보정] _max까지 10 이하로 남으면 상승폭 ×2 (고강도 제외 공통).
+                    headroom = max(0, mx - cur)
+                    soft = min(1.0, max(0.45, headroom / (SOFTCAP_DENOM * 2)))
+                    final_mult = 2.0 if headroom <= 10 else 1.0
+                    raw = random.uniform(g_min, g_max) * eff * soft * final_mult
+                    gain = (1 if random.random() < raw else 0) if raw < 1.0 else int(raw)
+                    new_val = min(mx, cur + gain)
+                else:
+                    # max 도달 → 낮은 확률로만 한계 돌파 (cap 이하)
+                    #   강점훈련은 돌파를 강하게(특화), 약점훈련은 거의 안 함(안전).
+                    if focus_mode == "strong":
+                        _break_p = FOCUS_BREAK_PROB_STRONG
+                    elif focus_mode == "weak":
+                        _break_p = FOCUS_BREAK_PROB_WEAK
+                    else:
+                        _break_p = FOCUS_BREAK_PROB
+                    if random.random() < _break_p:
+                        new_mx = min(99, talent_cap, mx + 1)
+                        if new_mx > mx:
+                            stat_changes[f"{stat}_max_up"] = (stat, new_mx)
+                            new_val = min(new_mx, cur + 1)
+                        else:
+                            new_val = cur   # 이미 talent_cap
+                    else:
+                        new_val = cur
             else:
-                # 일반훈련 트랙: max까지, 소프트캡으로 둔화
+                # 일반훈련 트랙: max까지, 소프트캡으로 둔화.
+                #   [막판 보정] _max까지 10 이하로 남으면 상승폭을 ×2.
+                #   소프트캡 FLOOR 때문에 마지막 구간이 너무 느려, 고강도 없이는
+                #   초기 한계스탯조차 못 채우던 문제를 보정한다. (고강도는 별도 트랙)
                 headroom = max(0, mx - cur)
                 soft = min(1.0, max(SOFTCAP_FLOOR, headroom / SOFTCAP_DENOM))
-                raw = random.uniform(g_min, g_max) * eff * soft
+                final_mult = 2.0 if headroom <= 10 else 1.0
+                raw = random.uniform(g_min, g_max) * eff * soft * final_mult
                 gain = (1 if random.random() < raw else 0) if raw < 1.0 else int(raw)
                 new_val = min(mx, cur + gain)
             if new_val > cur:
@@ -1136,8 +1326,9 @@ def _simulate_match(p, week, info: dict):
     goals = assists = saves = 0
     rating = 0.0
     events = []
+    detail = {"shots":0,"shots_on":0,"key_passes":0,"dribbles":0,"blocks":0,"pass_acc":0.0}
     if played:
-        goals, assists, saves, rating, events = _player_perf(p, outcome, is_home, hs, as_)
+        goals, assists, saves, rating, events, detail = _player_perf(p, outcome, is_home, hs, as_)
         if p.get("slump"):
             rating = max(3.0, rating + SLUMP_RATING_PENALTY)
 
@@ -1171,6 +1362,19 @@ def _simulate_match(p, week, info: dict):
             season_rating_sum=p.get("season_rating_sum",0)+rating,
             season_rating_cnt=p.get("season_rating_cnt",0)+1,
             season_goals_against=p.get("season_goals_against",0)+_ga,
+            # [세부 지표] 누적 (season_ + total_). 패스성공률은 합·횟수로 평균 산출.
+            season_shots=p.get("season_shots",0)+detail["shots"],
+            season_shots_on=p.get("season_shots_on",0)+detail["shots_on"],
+            season_key_passes=p.get("season_key_passes",0)+detail["key_passes"],
+            season_dribbles=p.get("season_dribbles",0)+detail["dribbles"],
+            season_blocks=p.get("season_blocks",0)+detail["blocks"],
+            season_pass_acc_sum=p.get("season_pass_acc_sum",0)+detail["pass_acc"],
+            season_pass_acc_cnt=p.get("season_pass_acc_cnt",0)+1,
+            total_shots=p.get("total_shots",0)+detail["shots"],
+            total_shots_on=p.get("total_shots_on",0)+detail["shots_on"],
+            total_key_passes=p.get("total_key_passes",0)+detail["key_passes"],
+            total_dribbles=p.get("total_dribbles",0)+detail["dribbles"],
+            total_blocks=p.get("total_blocks",0)+detail["blocks"],
         )
 
     _update_manager_rel(p, rating, my_result, played)
@@ -1349,6 +1553,9 @@ def _player_perf(p, outcome, is_home, hs, as_):
     base    = 6.0
     goals   = assists = saves = 0
     events  = []
+    # [세부 지표] 이 경기에서 발생한 활약 수치 (스탯·포지션·dom 연동)
+    detail  = {"shots": 0, "shots_on": 0, "key_passes": 0,
+               "dribbles": 0, "blocks": 0, "pass_acc": 0.0}
 
     my_score  = hs if is_home else as_
     opp_score = as_ if is_home else hs
@@ -1419,6 +1626,9 @@ def _player_perf(p, outcome, is_home, hs, as_):
         elif rate >= 0.65: base += 0.4
         if opp_score == 0: base += 0.5; events.append("🧱 클린시트!")
         elif opp_score >= 3: base -= 1.0; events.append("😞 다실점...")
+        # GK 세부지표: 패스성공률만 의미 (분배 능력). 슈팅/드리블/차단은 0.
+        _pa_gk = _stat_n(p, "passing")
+        detail["pass_acc"] = round(min(0.97, 0.70 + 0.22 * _pa_gk + random.uniform(-0.03, 0.03)), 3)
     else:
         # ── 골/어시: 지배력 배수 × 포지션 × 개인 스탯(플레이스타일) ──
         # 슈팅↑=골, 패스↑=어시, 드리블↑=둘 다 약간, 세트피스↑=보너스골.
@@ -1467,6 +1677,60 @@ def _player_perf(p, outcome, is_home, hs, as_):
             if random.random() < eff_aprob:
                 assists = 1; base += 0.5; events.append("🅰 어시스트!")
 
+        # ── [세부 지표] 슈팅/유효슈팅/키패스/드리블/차단/패스성공 ──────
+        #   골/어시와 동일 체계: 정규화 스탯 × 포지션 성향 × 지배력(dom).
+        #   dom 은 내 OVR vs 리그평균이라 리그 수준이 자연히 반영된다.
+        ta = _stat_n(p, "tackling")
+        po = _stat_n(p, "positioning")
+        spd = _stat_n(p, "speed")
+
+        # 포지션군별 활동량 계수 (공격가담/수비가담 성향)
+        if pos in ("ST", "CF"):
+            shot_w, key_w, drb_w, blk_w = 3.2, 1.0, 1.4, 0.3
+        elif pos in ("LW", "RW"):
+            shot_w, key_w, drb_w, blk_w = 2.4, 1.6, 2.6, 0.5
+        elif pos == "CAM":
+            shot_w, key_w, drb_w, blk_w = 1.8, 2.6, 1.8, 0.7
+        elif pos == "CM":
+            shot_w, key_w, drb_w, blk_w = 1.2, 2.0, 1.2, 1.6
+        elif pos == "CDM":
+            shot_w, key_w, drb_w, blk_w = 0.6, 1.2, 0.8, 2.8
+        elif pos in ("LB", "RB"):
+            shot_w, key_w, drb_w, blk_w = 0.5, 1.3, 1.2, 2.4
+        else:  # CB
+            shot_w, key_w, drb_w, blk_w = 0.3, 0.5, 0.4, 3.0
+
+        # 슈팅: 슈팅·포지셔닝 스탯 × 공격성향 × dom. 유효슈팅은 그중 일부(결정력=shooting).
+        shots = int(round(shot_w * (0.4 + 0.6 * sh) * dom + random.uniform(0, 1)))
+        shots = max(0, shots)
+        on_ratio = 0.30 + 0.35 * sh                       # shooting 높을수록 유효슈팅 비율↑
+        shots_on = int(round(shots * on_ratio + random.uniform(0, 0.5)))
+        shots_on = max(min(shots, goals), min(shots, shots_on))  # 최소 골 수 이상
+        # 키패스(기회창출): 패스·드리블 × 창의 성향 × dom
+        key_passes = int(round(key_w * (0.35 + 0.4 * pa + 0.25 * dr) * dom + random.uniform(0, 1)))
+        key_passes = max(assists, key_passes)             # 최소 어시 수 이상
+        # 드리블 성공: 드리블·스피드 × 성향 × dom
+        dribbles = int(round(drb_w * (0.4 + 0.45 * dr + 0.15 * spd) * dom + random.uniform(0, 1)))
+        dribbles = max(0, dribbles)
+        # 차단(태클+인터셉트): 태클·포지셔닝 × 수비성향. 약체 상대(dom↑)일수록 상대 공격이
+        #   적어 차단 기회도 줄므로 dom 역방향(2-dom) 가중.
+        # 차단(태클+인터셉트): 태클·포지셔닝 × 수비성향. 약체 상대(dom↑)면 상대 공격이
+        #   적어 차단 기회도 다소 줄지만(완만한 역방향), 수비수의 기본 활동량이 핵심.
+        _blk_dom = 1.25 - 0.25 * min(1.4, dom)   # dom 1.0→1.0, 강팀일수록 소폭↓
+        blocks = int(round(blk_w * (0.7 + 0.6 * ta + 0.3 * po) * _blk_dom
+                           + random.uniform(0, 1.2)))
+        blocks = max(0, blocks)
+        # 패스 성공률: 패스 스탯 기반 (수비/미드일수록 안정적, 공격수는 약간 낮음)
+        _pa_floor = 0.72 if pos in ("CB","LB","RB","CDM","CM") else 0.66
+        pass_acc = min(0.97, _pa_floor + 0.22 * pa + random.uniform(-0.03, 0.03))
+
+        detail["shots"]      = shots
+        detail["shots_on"]   = shots_on
+        detail["key_passes"] = key_passes
+        detail["dribbles"]   = dribbles
+        detail["blocks"]     = blocks
+        detail["pass_acc"]   = round(pass_acc, 3)
+
         # 수비 라인 평점 보정 (무실점 기여 — 지배력 클수록 더 안정적)
         if pos in DEF_POS:
             if opp_score == 0:
@@ -1503,7 +1767,7 @@ def _player_perf(p, outcome, is_home, hs, as_):
             base -= 0.3
 
     base = round(max(3.0, min(10.0, base + random.uniform(-0.4,0.4))), 1)
-    return goals, assists, saves, base, events
+    return goals, assists, saves, base, events, detail
 
 
 def _pos_events(pos, positive):
@@ -1864,6 +2128,129 @@ def _pay_salary(p, week):
 # 주차 전진
 # ─────────────────────────────────────────
 
+def _update_residency_and_naturalization(cur_year):
+    """[귀화] 매 연도 전환 시 호출.
+    - 현재 소속 클럽의 '나라'에서 보낸 누적 연수를 추적한다.
+      같은 나라면 +1, 나라가 바뀌면 1로 리셋. (그 나라 안에서 팀 이동은 유지)
+    - 같은 나라에서 3년을 채우고, 21세 이전이며, A대표 '본선'을 아직 안 밟았고,
+      그 나라가 아직 내 국적/귀화국적이 아니면 → 귀화 국적을 획득(복수국적 추가).
+      이후 국가대표 선택 시 후보에 포함된다. (21세 이후엔 자동 소속고정이라 무의미)
+    """
+    p = get_player()
+    if not p:
+        return
+    tid = p.get("current_team_id")
+    if not tid:
+        return
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT c.name AS cname FROM teams t JOIN countries c ON t.country_id=c.id "
+        "WHERE t.id=?", (tid,)).fetchone()
+    conn.close()
+    if not row:
+        return
+    club_country = row["cname"]
+
+    prev_country = p.get("residency_country", "") or ""
+    prev_years = p.get("residency_years", 0) or 0
+    if club_country == prev_country:
+        new_years = prev_years + 1
+    else:
+        new_years = 1
+    update_player(residency_country=club_country, residency_years=new_years)
+
+    # --- 귀화 자격 판정 ---
+    age = cur_year - (p.get("birth_year", cur_year - 17) or (cur_year - 17))
+    if age > 21:
+        return                      # 21세 넘으면 소속 자동확정, 귀화 불가
+    if p.get("intl_capped", 0):
+        return                      # 이미 본선 출전(cap-tie) → 변경 불가
+    if p.get("intl_committed", ""):
+        return                      # 이미 대표팀 영구고정
+    if new_years < 3:
+        return                      # 거주 3년 미충족
+
+    # 이미 보유한 국적(출생/귀화)이면 스킵
+    owned = {p.get("nationality","") or "", p.get("nationality2","") or "",
+             p.get("nationality3","") or ""}
+    nat_list = [n for n in (p.get("naturalized_nats","") or "").split(",") if n]
+    owned |= set(nat_list)
+    if club_country in owned:
+        return
+    # 빈 국적 슬롯에 귀화 국적 추가 (nationality2 → nationality3)
+    if not (p.get("nationality2","") or ""):
+        update_player(nationality2=club_country)
+    elif not (p.get("nationality3","") or ""):
+        update_player(nationality3=club_country)
+    else:
+        return                      # 국적 슬롯이 꽉 참(이미 3개)
+    nat_list.append(club_country)
+    update_player(naturalized_nats=",".join(nat_list))
+    try:
+        add_log(f"🛂 {club_country} 귀화 자격 획득! ({club_country} 리그 {new_years}년 거주) "
+                f"— 국가대표 선택 시 {club_country}도 고를 수 있습니다.", "event")
+    except Exception:
+        pass
+
+
+def _team_at_week35_for(year):
+    """주어진 연도의 35주차(리그 종료) 시점에 내가 소속이던 팀 id.
+    36주 이후 이적해도 '리그를 끝까지 함께한 팀'을 우승 귀속 대상으로 본다."""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT team_id, start_week, start_year, end_week, end_year
+               FROM career_entries
+               WHERE team_id IS NOT NULL AND team_id<>0
+                 AND start_year<=? AND (end_year=0 OR end_year>=?)
+               ORDER BY start_week""", (year, year)).fetchall()
+        for r in rows:
+            sw = r["start_week"] or 0
+            if (r["end_year"] or 0) == 0 or (r["end_year"] or 0) > year:
+                ew = 52
+            else:
+                ew = r["end_week"] or 52
+            # 시작 연도가 올해면 start_week, 아니면 1주부터로 간주
+            sw_eff = sw if (r["start_year"] or year) == year else 1
+            if sw_eff <= 35 <= ew:
+                conn.close()
+                return r["team_id"]
+    except Exception:
+        pass
+    conn.close()
+    p = get_player() or {}
+    return p.get("current_team_id", 0)
+
+
+def _lock_league_title_at_37(p, year):
+    """37주 진입 시: 리그 경기(35주)가 끝났으므로, 35주 소속 팀이 1위면
+    그 즉시 우승을 trophy_log에 확정한다. (연말까지 안 기다림)
+    36주에 다른 팀으로 이적해도 35주 소속 팀 기준이라 우승이 누락되지 않는다."""
+    champ_tid = _team_at_week35_for(year)
+    if not champ_tid:
+        return
+    # 그 팀에서 그 시즌 5경기 이상 뛰었을 때만(스쳐간 팀 제외).
+    #   현재 팀이면 season_matches, 이미 떠난 팀이면 career_entries의 matches 사용.
+    matches = 0
+    p_now = get_player() or {}
+    if champ_tid == p_now.get("current_team_id"):
+        matches = p_now.get("season_matches", 0)
+    else:
+        conn = get_conn()
+        try:
+            r = conn.execute(
+                """SELECT matches FROM career_entries
+                   WHERE team_id=? AND start_year<=? AND (end_year=0 OR end_year>=?)
+                   ORDER BY start_week DESC LIMIT 1""",
+                (champ_tid, year, year)).fetchone()
+            if r:
+                matches = r["matches"] or 0
+        except Exception:
+            pass
+        conn.close()
+    _lock_in_championship(champ_tid, year, matches, min_week=35)
+
+
 def _advance_week(p, base_week, n_weeks=4):
     new_week = base_week + n_weeks
     new_year = p["current_year"]
@@ -1876,6 +2263,8 @@ def _advance_week(p, base_week, n_weeks=4):
         # 연도 넘어갈 때 현재 팀 커리어 항목 닫기 (연도별 분리)
         if p.get("current_team_id"):
             _close_career_entry(p, new_year - 1, 52)
+        # [귀화] 거주 연수 갱신 + 자격 체크는 _end_of_season 안에서 처리
+        #   (그 시점에 current_team_id가 아직 살아있어 소속국가를 읽을 수 있음)
         _end_of_season(p, new_year-1)
     else:
         # 하반기 종료(33~36주차) → 37~40주차: 커리어 스탯 중간 업데이트만
@@ -1883,6 +2272,9 @@ def _advance_week(p, base_week, n_weeks=4):
         if base_week <= 36 and new_week >= 37:
             if p.get("current_team_id") and p.get("season_matches", 0) > 0:
                 _update_career_stats(p, new_year, new_week)
+            # [우승 확정] 리그 경기는 35주에 끝나므로, 37주 진입 시 35주 소속 팀이
+            #   1위면 그 즉시 우승을 기록한다. (연말까지 안 기다리고 바로 '성적'에 반영)
+            _lock_league_title_at_37(p, new_year)
 
     update_player(current_year=new_year, current_week=new_week,
                   current_season=new_season)
@@ -2194,6 +2586,10 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
 def _end_of_season(p, year):
     # 커리어 기록은 37~40주차 진입 시 이미 저장됨 → 여기선 생략
 
+    # [귀화] 거주 연수 갱신 + 귀화 자격 체크. 이 함수 진입 시점엔 current_team_id가
+    #   아직 살아있다(아래 계약만료 처리 전). next_year 기준으로 판정.
+    _update_residency_and_naturalization(year + 1)
+
     # ── [기능1] 계약 보너스 정산 (출전·공격포인트 기반) ──────────
     if p.get("current_team_id"):
         app_b  = p.get("appearance_bonus_k", 0)
@@ -2264,7 +2660,10 @@ def _end_of_season(p, year):
     # 4. 시즌 통계 초기화
     stat_updates.update(season_matches=0, season_goals=0, season_assists=0,
                         season_saves=0, season_rating_sum=0, season_rating_cnt=0,
-                        season_goals_against=0)
+                        season_goals_against=0,
+                        season_shots=0, season_shots_on=0, season_key_passes=0,
+                        season_dribbles=0, season_blocks=0,
+                        season_pass_acc_sum=0, season_pass_acc_cnt=0)
     update_player(**stat_updates)
 
     # 이슈9: 시즌 종료 시 순위 기반 행복도 변화
@@ -2913,6 +3312,96 @@ def generate_offers(count=5) -> list:
     tried  = 0
 
     if first_join and my_country_id:
+        # ── [자국 보장] 첫 입단은 자국 리그에서 최소 1~2개는 반드시 온다 ──
+        #   현실 반영: 유스 출신은 우선 자국에서 데뷔 제안을 받는다.
+        #
+        #   [핵심 설계] '내 평균 수준으로 어느 티어가 입단 가능한지'를 먼저 판정하고,
+        #   그 가능한 티어들 중에서만 1부10%/2부30%/3부60% 비중으로 뽑는다.
+        #     - 이탈리아처럼 1부가 매우 높은 자국이면, 17세 신인은 1·2부가 수준
+        #       미달이라 애초에 후보에서 빠지고 3부만 가능 → 사실상 100% 3부.
+        #     - 한국처럼 1부가 약하면 1부도 후보에 들어 10% 확률로 1부 데뷔 가능.
+        #   판정 기준은 일반 슬롯과 동일한 _team_fits_me (팀 평균 OVR - 내 OVR ≤ 8).
+        guarantee = random.choice([1, 2])
+
+        def _tier_fittable(tier) -> bool:
+            """자국 해당 티어에 '내 수준에 맞는' 팀이 하나라도 존재하면 True.
+               (가장 약한 팀 기준: 그 리그 최저 팀 평균 OVR이 내 +8 이내면 가능)"""
+            c2 = conn.cursor()
+            c2.execute("""SELECT MIN(ta.avg_ovr) AS min_avg
+                          FROM teams t
+                          JOIN leagues l ON t.league_id=l.id
+                          JOIN (SELECT team_id, AVG(ovr) AS avg_ovr
+                                  FROM ai_players GROUP BY team_id) ta
+                                ON ta.team_id=t.id
+                          WHERE l.country_id=? AND l.tier=?""",
+                       (my_country_id, tier))
+            r = c2.fetchone()
+            if not r or r["min_avg"] is None:
+                # 그 티어 자체가 자국에 없거나 선수 데이터 없음 → 후보 아님
+                return False
+            return (r["min_avg"] - ovr) <= 8
+
+        def _try_domestic(tier, relax=False):
+            """자국 특정 티어에서 '수준 맞는' 팀 1개 탐색.
+               relax=True면 _team_fits_me 무시하고 아무 팀이나(데뷔 보장용)."""
+            if relax:
+                c.execute("""SELECT t.id,t.name,l.id as lid,l.name as lname,l.tier,
+                                    cn.name as country,cn.flag,cn.grade
+                             FROM teams t
+                             JOIN leagues l ON t.league_id=l.id
+                             JOIN countries cn ON l.country_id=cn.id
+                             WHERE cn.id=? AND l.tier=?
+                             ORDER BY RANDOM() LIMIT 1""", (my_country_id, tier))
+                row = c.fetchone()
+                if not row: return False
+            else:
+                # 팀 평균 OVR - 내 OVR <= 8 인 팀들 중에서만 무작위 1팀.
+                #   (_tier_fittable 와 동일 기준으로, 판정-선택 불일치를 없앤다)
+                c.execute("""SELECT t.id,t.name,l.id as lid,l.name as lname,l.tier,
+                                    cn.name as country,cn.flag,cn.grade
+                             FROM teams t
+                             JOIN leagues l ON t.league_id=l.id
+                             JOIN countries cn ON l.country_id=cn.id
+                             JOIN (SELECT team_id, AVG(ovr) AS avg_ovr
+                                     FROM ai_players GROUP BY team_id) ta
+                                   ON ta.team_id=t.id
+                             WHERE cn.id=? AND l.tier=? AND (ta.avg_ovr - ?) <= 8
+                             ORDER BY RANDOM() LIMIT 1""", (my_country_id, tier, ovr))
+                row = c.fetchone()
+                if not row: return False
+            if any(o["team_id"] == row["id"] for o in offers): return False
+            if row["id"] == my_tid: return False
+            grade  = random.choice(grades)
+            salary = int(_calc_salary(row["grade"], tier, ovr, row["country"]) * random.uniform(0.85, 1.15))
+            offers.append(_build_offer(row, grade, tier, salary))
+            return True
+
+        # [1단계] 내 수준으로 가능한 자국 티어 확정.
+        #   force_tier3(저능력 17세)이면 무조건 3부만.
+        if force_tier3:
+            fittable = [3] if _tier_fittable(3) else []
+        else:
+            fittable = [t for t in (1, 2, 3) if _tier_fittable(t)]
+
+        # [2단계] 가능 티어들 중에서 1부10/2부30/3부60 비중으로 뽑아 슬롯 채움.
+        TIER_W = {1: 10, 2: 30, 3: 60}
+        for _ in range(guarantee):
+            placed = False
+            if fittable:
+                # 가능 티어만 남긴 가중치로 뽑기 → 매 시도 새로 뽑아 비중 유지
+                for _ in range(8):
+                    weights = [TIER_W[t] for t in fittable]
+                    pick_tier = random.choices(fittable, weights)[0]
+                    if _try_domestic(pick_tier):
+                        placed = True; break
+            # [예외 보강] 가능 티어가 없거나(자국 1·2·3부 모두 수준 초과) 못 채웠으면
+            #   3부에서 기준 완화해서라도 데뷔 기회 1개는 보장.
+            if not placed:
+                for _ in range(10):
+                    if _try_domestic(3, relax=True):
+                        placed = True; break
+            # 자국에 3부 리그 자체가 없으면 더는 강제하지 않음
+
         # 자국 팀 중 내 수준에 맞는 것만 우선
         # domestic_count: 30% 확률로 4개(+해외 1개), 70% 확률로 5개 모두 자국
         domestic_count = 4 if random.random() < 0.30 else 5
@@ -2996,6 +3485,7 @@ def generate_offers(count=5) -> list:
                 if not row: continue
                 if any(o["team_id"] == row["id"] for o in offers): continue
                 if row["id"] == my_tid: continue
+                if not _team_fits_me(row): continue   # 내 OVR과 너무 차이나는 팀 제외
                 salary = int(_calc_salary(row["grade"], tier, ovr, row["country"]) * random.uniform(0.85, 1.15))
                 offer = _build_offer(row, row["grade"], tier, salary)
                 offer["_home_league"] = True  # 정렬용 플래그
@@ -3018,6 +3508,7 @@ def generate_offers(count=5) -> list:
                 if not row: continue
                 if any(o["team_id"] == row["id"] for o in offers): continue
                 if row["id"] == my_tid: continue
+                if not _team_fits_me(row): continue   # 내 OVR과 너무 차이나는 팀 제외
                 salary = int(_calc_salary(row["grade"], tier, ovr, row["country"]) * random.uniform(0.85, 1.15))
                 offers.append(_build_offer(row, row["grade"], tier, salary))
                 break
@@ -3535,8 +4026,8 @@ def mark_contract_extension(yrs: int):
                      WHERE id=?""", (yrs, existing["id"]))
         conn.commit()
         # 열린 줄에 직접 박았으므로 다음 시즌 줄에 '연장'이 잔류하지 않도록
-        # _pending_transfer_type을 기본값으로 되돌린다. (연장은 발동된 그 해만 표시)
-        _pending_transfer_type = "입단"
+        # _pending_transfer_type을 대기값('')으로 되돌린다. (연장은 발동된 그 해만 표시)
+        _pending_transfer_type = ""
     else:
         # 드물게 열린 줄이 아직 없으면, 다음 _ensure_career_entry가 만들 줄에
         # '연장'이 들어가도록 플래그만 세팅. (그 _ensure가 소비)
@@ -3572,6 +4063,19 @@ def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None
         update_player(season_matches=0, season_goals=0, season_assists=0,
                       season_saves=0, season_rating_sum=0.0, season_rating_cnt=0,
                       season_goals_against=0)
+        # [에이전트 익스플로잇 차단] 이적 시 개별 협상 수수료(agent_fee_rate)를
+        #   리셋한다. 예전엔 약소국·저연봉 시절 헐값에 잡은 낮은 수수료율이
+        #   이적 후 폭등한 연봉에도 평생 고정 적용됐다. 이제 이적하면 그 특혜가
+        #   사라지고, 다음 급여부터는 에이전트 '등급 기본 수수료'로 돌아간다
+        #   (새 계약엔 새 조건). 재계약 원하면 에이전트 창에서 다시 협상.
+        if p.get("agent_fee_rate", 0):
+            update_player(agent_fee_rate=0)
+            try:
+                _ag = p.get("agent_grade", "F")
+                _base_fee = AGENT_FEE_RATE.get(_ag, 0.0)
+                add_log(f"📑 이적으로 에이전트 계약 갱신 — 수수료 {int(_base_fee*100)}%(등급 기본)로 조정", "event")
+            except Exception:
+                pass
 
     age_jt = p.get("age",17) if p else 17
     c_yrs  = _calc_contract_years(age_jt, row["tier"])
