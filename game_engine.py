@@ -933,6 +933,28 @@ def _sim_all_ai_matches(week, my_league_id, season):
 # 훈련
 # ─────────────────────────────────────────
 
+def effective_training_stress(p, ttype):
+    """선수의 성격/신체특징 stress_mult 를 반영한 '실제 적용' 스트레스 변화량.
+
+    TRAINING_CONFIG[ttype]['stress'] 는 기본값이고, 실제로는 냉철함/훈련광(성격),
+    지구력형/강철체질(신체특징) 의 stress_mult 가 곱해진다. 메인 화면 미리보기가
+    이 함수를 사용하면 표시값과 실제 적용값이 항상 일치한다.
+    (계산식은 _process_training 의 stress_chg 산출과 반드시 동일하게 유지할 것.)
+    """
+    cfg = TRAINING_CONFIG.get(ttype)
+    if not cfg:
+        return 0
+    from constants import PHYSICAL_TRAIT_EFFECTS as _PTE
+    pe       = PERSONALITY_EFFECTS.get(p.get("personality", "성실함"), {})
+    trait_fx = _PTE.get(p.get("physical_trait", "무난함"), {})
+    stress_chg = cfg["stress"]
+    if "stress_mult" in pe:
+        stress_chg = int(stress_chg * pe["stress_mult"])
+    if "stress_mult" in trait_fx:
+        stress_chg = int(stress_chg * trait_fx["stress_mult"])
+    return stress_chg
+
+
 def _process_training(p, week, ttype, focus_stat=None):
     cfg  = TRAINING_CONFIG[ttype]
     pers = p.get("personality","성실함")
@@ -953,13 +975,7 @@ def _process_training(p, week, ttype, focus_stat=None):
     if p.get("slump"):
         eff *= SLUMP_TRAIN_PENALTY
 
-    stress_chg = cfg["stress"]
-    # 냉철함 / 훈련광 등 stress_mult 적용 (성격)
-    if "stress_mult" in pe:
-        stress_chg = int(stress_chg * pe["stress_mult"])
-    # 지구력형 / 강철체질 등 stress_mult 적용 (신체 특징)
-    if "stress_mult" in trait_fx:
-        stress_chg = int(stress_chg * trait_fx["stress_mult"])
+    stress_chg = effective_training_stress(p, ttype)
 
     happy_chg = 0
     stat_changes = {}
@@ -2529,7 +2545,14 @@ def _collect_league_candidates(c, league_id, exclude_my_team=None):
 
 
 def _process_awards(p, year, season_goals, season_assists, season_rating, season_cs, season_goals_against=0):
-    """시즌 종료 시 개인 수상 산정. 내 선수 실제 성적 + AI 추정 비교."""
+    """시즌 종료 시 개인 수상 산정. 내 선수 실제 성적 + AI 추정 비교.
+
+    [득점왕/도움왕 최소 기준]
+      단순히 'pool 내 1위'만으로 주면, 약체 리그에서 AI 추정치가 우연히 낮게
+      깔린 시즌엔 2골/2도움으로도 타이틀이 나오는 비현실적 상황이 생긴다.
+      → 1위 조건에 더해 '출전 경기수 기반 최소 산출 기준'을 통과해야 수상.
+         (풀시즌 7라운드*2 = 14경기 기준. 경기당 최소 생산성으로 환산)
+    """
     tid = p.get("current_team_id", 0)
     if not tid:
         return  # 무소속이면 수상 없음
@@ -2555,14 +2578,26 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
 
         my_awards = []  # (award_type, detail)
 
-        # 득점왕 (10경기 이상 출전 가정 — 내 출전 충분할 때만 후보)
+        # ── 득점왕/도움왕 최소 산출 기준 ───────────────────────────
+        # 풀시즌 리그 경기 = 14경기(상/하반기 7R씩). 내가 실제로 뛴 경기수를
+        # 기준으로 최소 기준을 비례 조정한다(중도 합류/이적 시 너무 빡빡하지 않게).
+        #   - 풀시즌 기준 득점왕 최소 8골 / 도움왕 최소 6도움.
+        #   - 절대 하한(아무리 적게 뛰어도): 득점왕 4골 / 도움왕 4도움.
+        # 이렇게 하면 '2도움 도움왕' 같은 표본 부족 타이틀이 사라진다.
+        FULL_SEASON_MATCHES = 14
+        sm = max(1, p.get("season_matches", 0))
+        play_ratio = min(1.0, sm / FULL_SEASON_MATCHES)
+        min_goals_for_title  = max(4, round(8 * play_ratio))
+        min_assists_for_title = max(4, round(6 * play_ratio))
+
+        # 득점왕 (pool 1위 + 최소 골 기준 충족)
         top_scorer = max(pool, key=lambda x: (x["goals"], x["rating"]))
-        if top_scorer["is_mine"] and season_goals > 0:
+        if top_scorer["is_mine"] and season_goals >= min_goals_for_title:
             my_awards.append(("득점왕", f"{season_goals}골"))
 
-        # 도움왕
+        # 도움왕 (pool 1위 + 최소 도움 기준 충족)
         top_assist = max(pool, key=lambda x: (x["assists"], x["rating"]))
-        if top_assist["is_mine"] and season_assists > 0:
+        if top_assist["is_mine"] and season_assists >= min_assists_for_title:
             my_awards.append(("도움왕", f"{season_assists}도움"))
 
         # 베스트11 — 포지션 그룹별 최고 점수 1위 선정 (포메이션: GK1/DF4/MF3/FW3)

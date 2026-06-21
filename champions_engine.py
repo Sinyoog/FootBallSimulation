@@ -781,10 +781,10 @@ def _advance_round(t, cur_stage, next_stage):
     winners = []
     conn = get_conn()
     c = conn.cursor()
-    # 탈락 결과 라벨: 첫 토너먼트 라운드(16강)에서 지면 'N강 탈락'
+    # 탈락 결과 라벨: 토너먼트에서 진 라운드 = '도달한 라운드'로 기록한다.
+    #   16강에서 졌으면 '16강 진출'까지가 성취 → '16강 탈락'(X)이 아니라 '16강'(O).
+    #   (월드컵 intl_engine 과 동일한 관례.)
     exit_label = cur_stage_ko
-    if cur_stage == "R16":
-        exit_label = f"{cur_stage_ko} 탈락"
     for m in cur:
         w = _winner_of(m)
         loser = m["away_team_id"] if w == m["home_team_id"] else m["home_team_id"]

@@ -435,21 +435,34 @@ class CenterPanel(QWidget):
 
     def _update_preview(self):
         total_stress = 0
-        total_happy  = 0
+        # 휴식 행복도는 실제로 random.randint(4,8) → 평균 6으로 추산하되,
+        # 표시는 범위(+4~8)임을 알 수 있게 한다.
+        rest_count = 0
+        # 성격/신체특징 stress_mult 가 반영된 '실제 적용' 스트레스를 표시한다.
+        from game_engine import effective_training_stress, get_player
+        p = get_player() or {}
         for i, cb in enumerate(self.week_combos):
+            # 경기 주차는 콤보가 숨겨지고(week_hints 에 경기 스트레스가 표시됨)
+            # 훈련 대상이 아니므로 미리보기 합산/덮어쓰기에서 제외한다.
+            if not cb.isVisible():
+                continue
             sel   = cb.currentText()
             ttype = TRAIN_MAP_KO.get(sel, "중강도")
-            cfg   = TRAINING_CONFIG.get(ttype, TRAINING_CONFIG["중강도"])
-            s_chg = cfg["stress"]
+            s_chg = effective_training_stress(p, ttype)
             total_stress += s_chg
-            if ttype == "휴식": total_happy += 6
+            if ttype == "휴식":
+                rest_count += 1
             sign = "+" if s_chg >= 0 else ""
             self.week_hints[i].setText(f"스트레스 {sign}{s_chg}")
 
         ss = "+" if total_stress >= 0 else ""
-        hs = "+" if total_happy  >= 0 else ""
         self.lbl_pv_stress.setText(f"예상 스트레스: {ss}{total_stress}")
-        self.lbl_pv_happy.setText(f"예상 행복도: {hs}{total_happy}")
+        if rest_count:
+            # 휴식 1회당 +4~8 → 합산 범위로 표시
+            self.lbl_pv_happy.setText(
+                f"예상 행복도: +{rest_count*4}~{rest_count*8}")
+        else:
+            self.lbl_pv_happy.setText("예상 행복도: +0")
 
     # ── 모드 토글 ────────────────────────────────
 

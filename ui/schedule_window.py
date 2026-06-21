@@ -399,9 +399,26 @@ class ScheduleWindow(QDialog):
                 my_side = "away"
             else:
                 my_side = None
+            # 팀명 옆에 소속 국가 표기 — 어느 나라 클럽인지 한눈에.
+            #   home_league/away_league = cl_entries.country (국가명)
+            home_nm = m["home_name"]
+            away_nm = m["away_name"]
+            h_ctry = m.get("home_league", "")
+            a_ctry = m.get("away_league", "")
+            if h_ctry:
+                home_nm = f"{home_nm} ({h_ctry})"
+            if a_ctry:
+                away_nm = f"{away_nm} ({a_ctry})"
+            # winner 는 위에서 bare name 으로 계산됐으므로, 표기명(국가 포함)에 맞춰
+            # 다시 매핑해야 BracketWidget 의 승자 하이라이트(name==winner)가 동작한다.
+            if played:
+                if winner == m["away_name"]:
+                    winner = away_nm
+                else:
+                    winner = home_nm
             bracket_matches.append({
                 "stage": m["stage"], "week": m["week"],
-                "home": m["home_name"], "away": m["away_name"],
+                "home": home_nm, "away": away_nm,
                 "home_flag": "", "away_flag": "",
                 "hs": hs if played else -1, "as_": as_ if played else -1,
                 "winner": winner, "pso": m["pso_score"] if m["pso_winner"] else "",
