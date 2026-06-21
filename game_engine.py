@@ -1,7 +1,10 @@
 # game_engine.py
 import random
 import math
-from database import get_conn, calc_ovr, ALL_STATS
+import json
+from database import (get_conn, calc_ovr, ALL_STATS,
+                      rescale_team_to_target_ovr, get_league_avg_ovr,
+                      get_league_strong_ovr)
 from constants import *  # PHYSICAL_STATS, TECHNICAL_STATS, MENTAL_STATS 포함
 
 _pending_transfer_type: str = ""  # join_team → _save_career_entry 전달용. ''=대기(잔류 시즌)
@@ -57,6 +60,55 @@ def update_player(**kw):
     c.execute(f"UPDATE my_player SET {sets} WHERE id=1", list(kw.values()))
     conn.commit()
     conn.close()
+
+
+# ═══════════════════════════════════════════
+# [국적 연혁] 출생국적 / 귀화 / 대표선택 이력 기록
+# ═══════════════════════════════════════════
+# nat_history 컬럼(JSON list)에 국적 관련 사건을 시간순으로 누적한다.
+#   type: "birth"(출생 보유) / "naturalize"(귀화 획득) / "commit"(대표 확정)
+#   각 항목: {"type","nat","flag","year","week"}
+# 은퇴 AI요약에서 "라오스 출생 → 1994년 포르투갈 귀화 → 1996년 포르투갈 대표 선택"
+# 같은 연혁을 재구성하는 데 쓴다.
+
+def get_nat_history(p=None):
+    """국적 연혁 리스트 반환 (없으면 빈 리스트)."""
+    if p is None:
+        p = get_player()
+    if not p:
+        return []
+    raw = p.get("nat_history", "") or ""
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def add_nat_history(ev_type, nat, flag="", year=None, week=None, p=None):
+    """국적 연혁에 사건 1건 추가. 같은 (type, nat)이 이미 있으면 중복 추가 안 함.
+    year/week 생략 시 현재 시즌 상태에서 자동으로 채운다."""
+    if not nat:
+        return
+    if p is None:
+        p = get_player()
+    if not p:
+        return
+    if year is None or week is None:
+        st = get_state() or {}
+        if year is None:
+            year = st.get("current_year", GAME_START_YEAR)
+        if week is None:
+            week = st.get("current_week", 1)
+    hist = get_nat_history(p)
+    for h in hist:
+        if h.get("type") == ev_type and h.get("nat") == nat:
+            return   # 중복 방지 (대표선택은 1회뿐이지만 안전하게)
+    hist.append({"type": ev_type, "nat": nat, "flag": flag or "",
+                 "year": year, "week": week})
+    update_player(nat_history=json.dumps(hist, ensure_ascii=False))
 
 
 def get_state():
@@ -304,10 +356,10 @@ def create_player(name: str, position: str, sub_role: str,
         ?,?,?,?,?,?,
         ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
         ?,?,?,?,
-        10,10,'F','ko',
+        15,50,'F','ko',
         ?,?,?,?
     )""", (
-        name, nationality, flag, PLAYER_START_AGE, GAME_START_YEAR,
+        name, nationality, flag, PLAYER_START_AGE, GAME_START_YEAR - PLAYER_START_AGE,
         position, sub_role, personality, height, weight, peak_age,
         stat_vals["stamina"],    stat_vals["stamina_max"],
         stat_vals["speed"],      stat_vals["speed_max"],
@@ -331,6 +383,24 @@ def create_player(name: str, position: str, sub_role: str,
     # [복수국적] 추가 국적/국기 저장 (단일국적이면 빈 값)
     conn.execute("UPDATE my_player SET nationality2=?, flag2=?, nationality3=?, flag3=? WHERE id=1",
                  (nationality2, flag2, nationality3, flag3))
+
+    # [출생국적] 태어난 고향(=1차 국적)을 별도로 영구 보존. 귀화/대표선택과 무관.
+    #   디에고 코스타처럼 '출생국 ≠ 대표국'을 은퇴요약에서 구분하기 위함.
+    conn.execute("UPDATE my_player SET origin_nat=?, origin_flag=? WHERE id=1",
+                 (nationality, flag))
+
+    # [국적 연혁] 출생 시점 보유 국적을 birth 이벤트로 기록(시작국적 + 복수국적).
+    #   첫 항목이 '시작국적'이 되도록 1차 국적을 맨 앞에 둔다.
+    _birth_hist = [{"type": "birth", "nat": nationality, "flag": flag,
+                    "year": GAME_START_YEAR, "week": 1}]
+    if nationality2:
+        _birth_hist.append({"type": "birth", "nat": nationality2, "flag": flag2,
+                            "year": GAME_START_YEAR, "week": 1})
+    if nationality3:
+        _birth_hist.append({"type": "birth", "nat": nationality3, "flag": flag3,
+                            "year": GAME_START_YEAR, "week": 1})
+    conn.execute("UPDATE my_player SET nat_history=? WHERE id=1",
+                 (json.dumps(_birth_hist, ensure_ascii=False),))
 
     # 시즌 상태 초기화
     conn.execute("""INSERT OR REPLACE INTO season_state(id,current_year,current_week,
@@ -1232,8 +1302,22 @@ def _process_training(p, week, ttype, focus_stat=None):
             # 유리멘탈: 발동 임계치를 낮춤
             threshold -= pe.get("slump_threshold_reduce", 0)
 
-            if new_stress >= threshold and ttype != "휴식":
-                chance = SLUMP_CHANCE
+            # [행복도 연동] 행복도가 낮으면(SLUMP_LOW_HAPPY 이하) 슬럼프 임계치를
+            #   40으로 낮춘다. 즉 스트레스가 60에 못 미쳐도 불행하면 슬럼프가 올 수 있다.
+            #   - 스트레스 >= 정규 임계치(60)  : 기존 확률(SLUMP_CHANCE)
+            #   - 행복도 낮고 스트레스 40~59   : 낮은 확률(SLUMP_LOW_HAPPY_CHANCE)
+            low_happy = new_happy <= SLUMP_LOW_HAPPY
+            eff_threshold = threshold
+            if low_happy:
+                eff_threshold = min(threshold, SLUMP_LOW_HAPPY_STRESS)
+
+            if new_stress >= eff_threshold and ttype != "휴식":
+                # 정규 구간(스트레스 60+)인지, 저행복 구간(40~59)인지로 베이스 확률 분기
+                if new_stress >= threshold:
+                    chance = SLUMP_CHANCE
+                else:
+                    # 저행복 때문에 낮은 임계치로 진입한 구간
+                    chance = SLUMP_LOW_HAPPY_CHANCE
                 if "slump_chance_mult" in pe:
                     chance *= pe["slump_chance_mult"]
                 # 유리멘탈: 60 이상 구간에선 확률 추가
@@ -1242,7 +1326,10 @@ def _process_training(p, week, ttype, focus_stat=None):
                 chance = min(1.0, chance)
                 if random.random() < chance:
                     slump = 1
-                    add_log(f"😰 슬럼프 발생!  {week}주차", "slump")
+                    if new_stress >= threshold:
+                        add_log(f"😰 슬럼프 발생!  {week}주차", "slump")
+                    else:
+                        add_log(f"😰 행복도 저하로 슬럼프!  {week}주차", "slump")
             if new_happy <= SLUMP_HAPPY_THRESHOLD:
                 slump = 1
                 add_log(f"😰 행복도 저하로 슬럼프!  {week}주차", "slump")
@@ -1382,7 +1469,8 @@ def _simulate_match(p, week, info: dict):
 
     p2 = get_player()
     # 30대 이후: 경험이 풍부하여 스트레스 감소
-    age = st["current_year"] - p2.get("birth_year", 0)
+    # [버그수정] age 컬럼 사용 (year - birth_year는 실제보다 16 적게 나옴)
+    age = p2.get("age", 0) or 0
     if age >= 30:
         match_stress = 3 if info.get("is_home") else 6  # 원래 5/8 → 3/6
     else:
@@ -1574,6 +1662,16 @@ def _player_perf(p, outcome, is_home, hs, as_):
             _lg_avg = 50.0
     dom = _dominance_mult(_my_ovr, _lg_avg)
 
+    # ── [평점 베이스라인] OVR-리그격차를 평점 시작점에 직접 반영 ──────
+    #   기존엔 누구나 base=6.0에서 출발해 OVR 26 차이가 평점 0.3~0.5밖에
+    #   안 벌어졌다(리그 바닥과 월클이 거의 동일). dom(격차 배수)을 base에
+    #   실어 '잘하는 선수는 높은 데서, 못하는 선수는 낮은 데서' 출발시킨다.
+    #     dom 0.35(압도적 약체) → base≈5.5
+    #     dom 1.00(리그 평균)   → base≈6.3
+    #     dom 1.80(압도적 강자) → base≈7.1
+    #   이후 골/어시/무실점 가산이 얹혀 최종 평점 분포가 5.5~8.x로 펴진다.
+    base = 5.4 + 0.9 * min(1.9, dom)
+
     if pos == "GK":
         # ── 티어+OVR 기반 선방률 산출 ──────────────────────────
         # 현재 리그 티어 조회 (p에 current_league_id 있으면 사용)
@@ -1590,30 +1688,34 @@ def _player_perf(p, outcome, is_home, hs, as_):
                 pass
 
         # 티어별 선방률 범위 (하위권/평균/상위권)
-        # 1부: 58~80%, 2부: 55~75%, 3부: 50~72%
+        # 하한을 낮춰 '못하는 GK'가 실제로 못하게 만든다(기존 50~58% → 38~46%).
+        # 상한은 유지. 범위가 넓어져 OVR에 따른 선방률 차이가 체감된다.
+        # 1부: 46~82%, 2부: 42~78%, 3부: 38~74%
         _gk_ovr = p.get("ovr", 50)
         if _tier == 1:
-            _sr_min, _sr_max = 0.58, 0.80
+            _sr_min, _sr_max = 0.46, 0.82
         elif _tier == 2:
-            _sr_min, _sr_max = 0.55, 0.75
+            _sr_min, _sr_max = 0.42, 0.78
         else:
-            _sr_min, _sr_max = 0.50, 0.72
+            _sr_min, _sr_max = 0.38, 0.74
 
-        # OVR → 선방률 범위 내 위치 (OVR 40=하위 10%, 99=상위 10%)
-        _ovr_t = max(0.0, min(1.0, (_gk_ovr - 40) / 60))
+        # OVR → 선방률 범위 내 위치 (OVR 40=하위, 99=상위). 기울기 강화를 위해
+        # 정규화 기준을 좁혀(40~85) OVR 변화가 선방률에 더 크게 반영되게 한다.
+        _ovr_t = max(0.0, min(1.0, (_gk_ovr - 40) / 45))
         _sr_center = _sr_min + (_sr_max - _sr_min) * _ovr_t
         # 지배력 보정: 리그 평균보다 월등하면 선방률 추가 상승 (상한 92%)
         _sr_center = min(0.92, _sr_center * (0.7 + 0.3 * dom))
         # 경기마다 ±4% 랜덤 변동
         _sr_target = max(_sr_min, min(0.92, _sr_center + random.uniform(-0.04, 0.04)))
 
-        # 유효슈팅 수: 티어 높을수록 슈팅 많음 (1부 5~9, 2부 4~8, 3부 3~7)
+        # 유효슈팅 수: 무실점 과다를 줄이기 위해 상향(상대 공격량↑).
+        # 1부 6~10, 2부 5~9, 3부 4~8 (과도한 실점 누적은 방지)
         if _tier == 1:
-            total_shots = opp_score + random.randint(4, 8)
+            total_shots = opp_score + random.randint(4, 9)
         elif _tier == 2:
-            total_shots = opp_score + random.randint(3, 7)
+            total_shots = opp_score + random.randint(3, 8)
         else:
-            total_shots = opp_score + random.randint(2, 6)
+            total_shots = opp_score + random.randint(2, 7)
         total_shots = max(opp_score + 1, total_shots)  # 최소 실점+1
 
         # 목표 선방률로 선방 수 역산
@@ -1622,10 +1724,14 @@ def _player_perf(p, outcome, is_home, hs, as_):
         saves = max(0, saves)
 
         rate = (saves + opp_score) and saves / total_shots or 0
-        if rate >= 0.75: base += 1.0; events.append("🧤 훌륭한 선방!")
-        elif rate >= 0.65: base += 0.4
-        if opp_score == 0: base += 0.5; events.append("🧱 클린시트!")
-        elif opp_score >= 3: base -= 1.0; events.append("😞 다실점...")
+        # 선방 퍼포먼스를 평점에 더 강하게 반영(잘한 GK와 못한 GK 격차↑).
+        if rate >= 0.80: base += 1.4; events.append("🧤 환상적인 선방쇼!")
+        elif rate >= 0.72: base += 0.9; events.append("🧤 훌륭한 선방!")
+        elif rate >= 0.62: base += 0.3
+        elif rate < 0.45: base -= 0.8; events.append("😞 불안한 선방...")
+        if opp_score == 0: base += 0.6; events.append("🧱 클린시트!")
+        elif opp_score >= 4: base -= 1.4; events.append("😞 대량 실점...")
+        elif opp_score >= 3: base -= 0.8; events.append("😞 다실점...")
         # GK 세부지표: 패스성공률만 의미 (분배 능력). 슈팅/드리블/차단은 0.
         _pa_gk = _stat_n(p, "passing")
         detail["pass_acc"] = round(min(0.97, 0.70 + 0.22 * _pa_gk + random.uniform(-0.03, 0.03)), 3)
@@ -1731,12 +1837,15 @@ def _player_perf(p, outcome, is_home, hs, as_):
         detail["blocks"]     = blocks
         detail["pass_acc"]   = round(pass_acc, 3)
 
-        # 수비 라인 평점 보정 (무실점 기여 — 지배력 클수록 더 안정적)
+        # 수비 라인 평점 보정 (무실점 기여). 단, OVR-격차(dom)에 비례시켜
+        #   '못하는 수비수가 팀 무실점에 묻어가 평점을 거저 받는' 문제를 막는다.
+        #   dom 0.35(약체)→보너스 0.25배, dom 1.0(평균)→0.6배, dom 1.8(강자)→1.0배.
         if pos in DEF_POS:
+            _cs_scale = max(0.25, min(1.0, 0.6 * dom))
             if opp_score == 0:
-                base += 1.0 * (0.7 + 0.3 * dom); events.append("🧱 무실점 기여")
+                base += 1.0 * _cs_scale; events.append("🧱 무실점 기여")
             elif opp_score == 1:
-                base += 0.4
+                base += 0.4 * _cs_scale
             elif opp_score >= 3:
                 base -= 0.6; events.append("😞 수비 불안")
 
@@ -1766,7 +1875,7 @@ def _player_perf(p, outcome, is_home, hs, as_):
         if pers == "소심함" and (my_score + (0 if is_home else 0)) < opp_score:
             base -= 0.3
 
-    base = round(max(3.0, min(10.0, base + random.uniform(-0.4,0.4))), 1)
+    base = round(max(3.0, min(9.5, base + random.uniform(-0.25, 0.25))), 1)
     return goals, assists, saves, base, events, detail
 
 
@@ -2171,7 +2280,9 @@ def _update_residency_and_naturalization(cur_year):
     update_player(residency_country=club_country, residency_years=new_years)
 
     # --- 귀화 자격 판정 ---
-    age = cur_year - (p.get("birth_year", cur_year - 17) or (cur_year - 17))
+    # [버그수정] age 컬럼 사용. 이 함수는 나이 증가 전에 호출되고 cur_year=year+1
+    #   (다음해)이므로, 다음해 기준 나이는 현재 age 컬럼 + 1.
+    age = (p.get("age", 0) or 0) + 1
     if age > 21:
         return                      # 21세 넘으면 소속 자동확정, 귀화 불가
     if p.get("intl_capped", 0):
@@ -2189,14 +2300,21 @@ def _update_residency_and_naturalization(cur_year):
     if club_country in owned:
         return
     # 빈 국적 슬롯에 귀화 국적 추가 (nationality2 → nationality3)
+    # 국기도 함께 저장해 연혁/표시에서 깃발이 비지 않게 한다.
+    conn2 = get_conn()
+    frow = conn2.execute("SELECT flag FROM countries WHERE name=?", (club_country,)).fetchone()
+    conn2.close()
+    club_flag = frow["flag"] if frow else ""
     if not (p.get("nationality2","") or ""):
-        update_player(nationality2=club_country)
+        update_player(nationality2=club_country, flag2=club_flag)
     elif not (p.get("nationality3","") or ""):
-        update_player(nationality3=club_country)
+        update_player(nationality3=club_country, flag3=club_flag)
     else:
         return                      # 국적 슬롯이 꽉 참(이미 3개)
     nat_list.append(club_country)
     update_player(naturalized_nats=",".join(nat_list))
+    # [국적 연혁] 귀화 획득 사건 기록 (현재 연도/주차)
+    add_nat_history("naturalize", club_country, club_flag, cur_year, 1)
     try:
         add_log(f"🛂 {club_country} 귀화 자격 획득! ({club_country} 리그 {new_years}년 거주) "
                 f"— 국가대표 선택 시 {club_country}도 고를 수 있습니다.", "event")
@@ -3054,6 +3172,7 @@ def _process_promotion_relegation(year):
                     pending_logs.append((f"🏆 {year}년  {winner_info['name']}  1부 리그 우승!", "event"))
 
     moved_teams: set = set()  # 이번 시즌 이미 이동한 팀 ID
+    _rescale_jobs: list = []  # (team_id, target_ovr) — 승강팀 OVR 평형 작업
 
     for cid in cids:
         for tier in [1, 2]:
@@ -3128,6 +3247,20 @@ def _process_promotion_relegation(year):
             bu_info = ci.fetchone()
             if not tl_info or not bu_info: continue
 
+            # ── 승강 OVR 평형: 이동 '직전' 양 리그 평균 OVR을 스냅샷 ──────
+            #   승격팀(top_lower)은 상위 리그 평균까지 끌어올리고,
+            #   강등팀(bottom_upper)은 하위 리그 '상위권' 수준으로 조정해
+            #   "2부 전력 그대로 1부에서 학살당하는" 문제와
+            #   "강등 직후 곧바로 2부 최약체가 되는" 문제를 동시에 없앤다.
+            #   실제 명단 변경(rescale)은 캐시/평균 오염을 막기 위해
+            #   country 루프가 끝난 뒤 일괄 적용한다(아래 _rescale_jobs).
+            _upper_avg    = get_league_avg_ovr(upper_lid, conn)       # 1부 평균
+            _lower_strong = get_league_strong_ovr(lower_lid, 0.75, conn)  # 하위 상위권
+            if _upper_avg is not None:
+                _rescale_jobs.append((top_lower["id"], _upper_avg))      # 승격 → 1부 평균
+            if _lower_strong is not None:
+                _rescale_jobs.append((bottom_upper["id"], _lower_strong))  # 강등 → 하위 상위권
+
             # 승격: top_lower → upper
             c.execute("UPDATE teams SET league_id=?,current_tier=? WHERE id=?",
                       (upper_lid, tier, top_lower["id"]))
@@ -3167,8 +3300,26 @@ def _process_promotion_relegation(year):
         c.execute("""UPDATE teams SET wins=0,draws=0,losses=0,goals_for=0,goals_against=0
                      WHERE league_id IN (SELECT id FROM leagues WHERE country_id=?)""", (cid,))
 
+    # ── 승강팀 OVR 평형 일괄 적용 ────────────────────────────────
+    #   teams 이동/전적 초기화가 끝난 뒤, 같은 conn으로 선수 능력치를
+    #   목표 평균까지 평행이동. 한 번에 commit 하므로 트랜잭션 일관.
+    for _tid, _target in _rescale_jobs:
+        try:
+            _d, _b, _a = rescale_team_to_target_ovr(_tid, _target, conn)
+            if _d != 0:
+                _tn = conn.execute("SELECT name FROM teams WHERE id=?", (_tid,)).fetchone()
+                _nm = _tn["name"] if _tn else f"#{_tid}"
+                _dir = "강화" if _d > 0 else "약화"
+                pending_logs.append(
+                    (f"⚙️ {_nm}  선수단 {_dir}  평균 OVR {_b:.0f}→{_a:.0f} (리그 적응)", "normal"))
+        except Exception as _e:
+            add_log(f"[리스케일 오류] team {_tid}: {_e}", "normal", year, 52)
+
     conn.commit()
     conn.close()
+
+    # ai_players OVR이 일괄 변경됐으므로 팀/리그 평균 캐시를 비운다.
+    _invalidate_team_ovr_cache()
 
     if my_new_league:
         p_up = get_player()

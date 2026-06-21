@@ -143,7 +143,7 @@ class ScheduleWindow(QDialog):
         st = get_state()
         if not st:
             return None
-        t = intl_engine.get_tournament(st["current_year"])
+        t = intl_engine.get_my_tournament(st["current_year"])
         if not t:
             return None
 

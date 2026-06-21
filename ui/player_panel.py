@@ -27,6 +27,17 @@ QWidget { background-color: #1e1e1e; color: #cccccc; font-size: 12px; }
 QProgressBar { background-color: #2a2a2a; border-radius: 3px; border: none; }
 QProgressBar#stressBar::chunk { background-color: #cc4400; border-radius:3px; }
 QProgressBar#happyBar::chunk  { background-color: #00aa44; border-radius:3px; }
+
+/* ── 정보 행: 라벨칸 + 값칸을 테두리 박스로 구분 ── */
+#infoRow  { background-color: transparent; }
+#infoKey  { color: #9aa0a6; font-size: 11px; font-weight: bold;
+            background-color: #262626; border: 1px solid #3a3a3a;
+            border-right: none; border-top-left-radius: 4px;
+            border-bottom-left-radius: 4px; padding: 4px 4px; }
+#infoVal  { color: #e0e0e0; font-size: 12px;
+            background-color: #1c1c1c; border: 1px solid #3a3a3a;
+            border-top-right-radius: 4px; border-bottom-right-radius: 4px;
+            padding: 4px 6px; }
 """
 
 
@@ -60,7 +71,7 @@ class PlayerPanel(QWidget):
         # 기본 정보 영역 (동적)
         self.info_frame = QWidget()
         self.info_lay   = QVBoxLayout(self.info_frame)
-        self.info_lay.setSpacing(2); self.info_lay.setContentsMargins(0,0,0,0)
+        self.info_lay.setSpacing(3); self.info_lay.setContentsMargins(0,0,0,0)
         self.lay.addWidget(self.info_frame)
         self._div()
 
@@ -284,11 +295,29 @@ class PlayerPanel(QWidget):
 
 
 def _info_row(key, val):
-    w = QWidget()
-    h = QHBoxLayout(w); h.setContentsMargins(0,0,0,0); h.setSpacing(4)
-    kl = QLabel(key); kl.setFixedWidth(55); kl.setStyleSheet("color:#888888;font-size:11px;")
-    vl = QLabel(val); vl.setStyleSheet("color:#cccccc;font-size:12px;"); vl.setWordWrap(True)
-    h.addWidget(kl); h.addWidget(vl); h.addStretch()
+    """이미지처럼 '라벨칸 + 값칸'을 테두리 박스로 감싼 한 행.
+    - 라벨칸: 고정폭(키 텍스트), 값칸: 남는 공간 전부 차지(글자 길어도 줄바꿈).
+    - 값이 길어 잘릴 일은 WordWrap으로 처리하고, 패널 폭 자체는
+      MainWindow의 스플리터 최소폭으로 확보한다.
+    """
+    w = QFrame()
+    w.setObjectName("infoRow")
+    h = QHBoxLayout(w)
+    h.setContentsMargins(0, 0, 0, 0)
+    h.setSpacing(0)
+
+    kl = QLabel(key)
+    kl.setObjectName("infoKey")
+    kl.setFixedWidth(64)
+    kl.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter)
+
+    vl = QLabel(val)
+    vl.setObjectName("infoVal")
+    vl.setWordWrap(True)
+    vl.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+
+    h.addWidget(kl)
+    h.addWidget(vl, 1)   # 값칸이 남는 폭을 모두 차지
     return w
 
 

@@ -284,7 +284,8 @@ class StartScreen(QWidget):
     def _open_main(self):
         from ui.main_window import MainWindow
         self.main_win = MainWindow()
-        self.main_win.show()
+        # 캐릭터 생성 후 뜨는 커리어 시뮬레이션 창은 기본 전체화면(최대화)으로.
+        self.main_win.showMaximized()
         self.close()
 
 

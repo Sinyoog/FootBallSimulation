@@ -463,9 +463,10 @@ class RetireWindow(QDialog):
                 team_str = tname
                 comp_str = t.get('competition','')
                 result   = lname  # league_name 자리에 결과 저장됨
-                if "우승" in result:   color = "#00cc44"
-                elif "탈락" in result: color = "#cc6666"
-                else:                  color = None
+                if "우승" in result:    color = "#00cc44"
+                elif "거절" in result:  color = "#cc8844"   # 발탁 거절(주황)
+                elif "탈락" in result:  color = "#cc6666"
+                else:                   color = None
 
             for j, v in enumerate([yr, team_str, comp_str, result]):
                 self._set_item_colored(tbl, i, j, v, color if j == 3 else None)
@@ -687,9 +688,45 @@ class RetireWindow(QDialog):
         from intl_engine import fmt_nationalities, fmt_rep_nationality
         _nats = fmt_nationalities(p) or f"{p.get('flag','')} {p['nationality']}"
         _rep  = fmt_rep_nationality(p)
-        lines.append(f"국적: {_nats}  |  ⚽대표: {_rep}  |  포지션: {p['position']} ({p.get('sub_role','')})")
+        # [출생국적] 태어난 고향 — 대표국적과 다르면 별도 표시(디에고 코스타 케이스)
+        _origin_nat  = p.get("origin_nat", "") or p.get("nationality", "")
+        _origin_flag = p.get("origin_flag", "") or p.get("flag", "")
+        lines.append(f"국적: {_nats}  |  🏠출생: {_origin_flag}{_origin_nat}  "
+                     f"|  ⚽대표: {_rep}  |  포지션: {p['position']} ({p.get('sub_role','')})")
         lines.append(f"성격: {p.get('personality','')}  |  특징: {p.get('physical_trait','무난함')}  |  은퇴 나이: {p['age']}세  |  최종 OVR: {p.get('ovr',0)}")
         lines.append("")
+
+        # ── [국적 연혁] 출생 → 귀화 → 대표선택 시간순 이력 ──────────
+        try:
+            from game_engine import get_nat_history
+            _nat_hist = get_nat_history(p)
+        except Exception:
+            _nat_hist = []
+        if _nat_hist:
+            lines.append("▶ 국적 연혁")
+            # birth(출생) 먼저, 그 뒤 시간순(year,week)으로 귀화/대표선택
+            _births = [h for h in _nat_hist if h.get("type") == "birth"]
+            _events = sorted(
+                [h for h in _nat_hist if h.get("type") != "birth"],
+                key=lambda h: (h.get("year", 0), h.get("week", 0)))
+            if _births:
+                _start = _births[0]
+                _born_str = f"{_start.get('flag','')}{_start.get('nat','')}"
+                if len(_births) > 1:
+                    _extra = " / ".join(f"{b.get('flag','')}{b.get('nat','')}"
+                                        for b in _births[1:])
+                    lines.append(f"  🏠 출생 국적: {_born_str}  (복수국적 보유: {_extra})")
+                else:
+                    lines.append(f"  🏠 출생 국적: {_born_str}")
+            for h in _events:
+                _t = h.get("type")
+                _ns = f"{h.get('flag','')}{h.get('nat','')}"
+                _yr = h.get("year", "")
+                if _t == "naturalize":
+                    lines.append(f"  🛂 {_yr}년  {_ns} 귀화 국적 획득")
+                elif _t == "commit":
+                    lines.append(f"  ⚽ {_yr}년  {_ns} 대표팀 선택 (평생 대표국 확정)")
+            lines.append("")
 
         # 팀 이력 — 화면 테이블의 셀 값을 그대로 나열 (산문체 대신 정형 데이터)
         lines.append("▶ 팀 이력")
@@ -836,6 +873,11 @@ class RetireWindow(QDialog):
                 yr, comp = t.get('year', 0), t.get('competition', '')
                 result   = t.get('league_name', '')
                 nation   = t.get('team_name', '')
+                # [거절 기록] '발탁 거절'은 출전 기록이 아니라 거절 이력이므로
+                #   별도 아이콘(🚫)으로 구분해 표시한다.
+                if result == "발탁 거절":
+                    lines.append(f"  🚫 {yr}년  {comp}  →  발탁 거절  ({nation})")
+                    continue
                 line = f"  🌍 {yr}년  {comp}  →  {result}  ({nation})"
                 ih = hist.get((yr, comp))
                 if ih and ih.get("caps", 0) > 0:

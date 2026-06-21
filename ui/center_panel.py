@@ -480,15 +480,14 @@ class CenterPanel(QWidget):
         st = get_state()
         if not p or not st: return
 
-        # [복수국적] ★최우선★ 22세 1~4주차 미고정이면 국적부터 강제 확정.
-        #   이게 가장 먼저 뜨고, 처리해야만 나머지(입단/오퍼/대표팀발탁 등)로 넘어간다.
+        # [복수국적] 대표팀 선택이 대기 중이면 그것부터 처리 (진행 차단)
+        #   ※ 22세 1~4주차 강제확정은 '새해 진입 직후'에 띄운다(아래 advance_4weeks 뒤).
+        #     일정을 짜기 전에 먼저 국적을 정하도록 하기 위함.
         import intl_engine
         forced = intl_engine.get_forced_commit()
         if forced:
             self._show_forced_commit(forced)
             return
-
-        # [복수국적] 대표팀 선택이 대기 중이면 그것부터 처리 (진행 차단)
         pend = intl_engine.get_pending_choice()
         if pend:
             show_toast(self, "⚠  먼저 대표팀을 선택해야 합니다!", "#cc6600", 1600)
@@ -583,17 +582,33 @@ class CenterPanel(QWidget):
             self.btn_join.setEnabled(True)
             show_toast(self, f"⭐ {st2['current_year']}년 새 시즌!  팀 입단 기간입니다", "#006622", 2000)
 
-        # [복수국적] 두 나라 다 본선 진출 → 대표팀 선택 팝업 (선택 전까지 차출 보류)
+        # [복수국적] ★새해 진입 직후★ 22세 1~4주차 미고정이면 '일정 짜기 전에'
+        #   국적부터 강제 확정. 52주에서 진행 버튼을 눌러 1주차로 막 넘어온 이 시점에
+        #   띄워야 사용자가 1~4주 훈련을 선택하기 전에 대표팀을 정한다.
         import intl_engine
+        forced = intl_engine.get_forced_commit()
+        if forced:
+            self._show_forced_commit(forced)
+            if self.main_win:
+                self.main_win.refresh_all()
+            return   # 강제확정 후 이번 진행은 여기서 종료 (다시 진행 버튼을 누르면 일정 진행)
+
+        # [복수국적] 두 나라 다 본선 진출 → 대표팀 선택 팝업 (선택 전까지 차출 보류)
         pend = intl_engine.get_pending_choice()
         if pend:
             self._show_nat_choice(pend)
 
-        # 오퍼·재계약 팝업은 4주 묶음이 완료됐을 때만
+        # 재계약 팝업은 '새 시즌 진입 직후 즉시' 떠야 한다.
+        #   오퍼 플래그(_contract_renew_offer)는 연말(52주) 처리에서 세팅되므로,
+        #   1주차로 막 넘어온 이 시점에 이미 존재한다. bundle_done(4주 묶음 완료)을
+        #   기다리면 '1~4주 진행을 누른 뒤에야' 떠서 타이밍이 어긋난다.
+        #   다이얼로그에서 수락/거절 시 플래그가 0으로 리셋되므로 반복 노출도 없다.
+        if p2.get("_contract_renew_offer", 0) > 0:
+            self._show_renew_dialog(p2)
+
+        # 자동 오퍼 팝업은 4주 묶음이 완료됐을 때만
         # (1주씩 본다고 매주 오퍼가 뜨지 않음)
         if bundle_done:
-            if p2.get("_contract_renew_offer", 0) > 0:
-                self._show_renew_dialog(p2)
             if p2.get("current_team_id") and in_zone:
                 self._show_auto_offer(new_week)
 
@@ -814,16 +829,18 @@ class CenterPanel(QWidget):
                 f"대표팀에서 발탁을 제안합니다.<br><br>"
                 f"이 나라로 국가대표 경기를 뛰겠습니까?<br>"
                 f"<b style='color:#ff8866'>한 번 출전하면 그 나라로 영구 고정</b>되어<br>"
-                f"다른 나라 대표로는 뛸 수 없습니다."
+                f"다른 나라 대표로는 뛸 수 없습니다.<br>"
+                f"<span style='color:#aaa'>선택하면 선발·예선 결과가 공개됩니다.</span>"
                 f"<br><span style='color:#88cc88'>※ 보유 국적 자체는 사라지지 않습니다.</span></span>")
         else:
             nat_list = " / ".join(f"{o.get('flag','')}{o['nat']}" for o in opts)
             info = QLabel(
                 f"<span style='color:#ddd; font-size:14px'>"
-                f"여러 국적이 본선에 진출했습니다.<br>"
+                f"여러 나라가 당신을 대표로 원합니다.<br>"
                 f"<b style='color:#ffcc66'>{nat_list}</b><br><br>"
                 f"어느 대표팀으로 뛸지 선택하세요.<br>"
-                f"<b style='color:#ff8866'>한 번 출전하면 그 나라로 영구 고정</b>됩니다."
+                f"<b style='color:#ff8866'>한 번 출전하면 그 나라로 영구 고정</b>됩니다.<br>"
+                f"<span style='color:#aaa'>선택하면 선발·예선 결과가 공개됩니다.</span>"
                 f"<br><span style='color:#88cc88'>※ 보유 국적 자체는 사라지지 않습니다.</span></span>")
         info.setWordWrap(True)
         card = QFrame(); card.setObjectName("dlgCard")
@@ -831,20 +848,22 @@ class CenterPanel(QWidget):
         cl.addWidget(info)
         lay.addWidget(card)
 
-        def _do_choice(nat):
-            res = intl_engine.choose_national_team(pend["tournament_id"], nat)
+        def _do_choice(opt):
+            # [복수대륙컵] 선택한 옵션의 대회로 출전. 옵션에 tournament_id가
+            #   있으면 그것을(각 대륙컵), 없으면 pend 대표 tid를 사용(구버전 호환).
+            tid = opt.get("tournament_id", pend["tournament_id"])
+            res = intl_engine.choose_national_team(tid, opt["nat"])
             dlg.accept()
             if res:
-                if res["selected"]:
-                    show_toast(self, f"🌍 {nat} 대표로 발탁되었습니다!", "#1a4d8f", 1800)
-                else:
-                    show_toast(self, f"🌍 {nat} 대표를 선택했지만 이번엔 미발탁", "#664400", 1800)
+                self._show_callup_result(opt["nat"], res)
             if self.main_win: self.main_win.refresh_all()
 
         def _do_decline():
             intl_engine.decline_national_team(pend["tournament_id"])
             dlg.accept()
-            show_toast(self, "🌍 이번 대회 대표팀 발탁을 보류했습니다", "#555555", 1800)
+            _nat_str = "/".join(o["nat"] for o in opts)
+            show_toast(self, f"🚫 {_nat_str} 발탁을 거절했습니다 (기록에 남음)",
+                       "#aa6633", 2000)
             if self.main_win: self.main_win.refresh_all()
 
         btn_row = QHBoxLayout(); btn_row.setSpacing(8)
@@ -852,7 +871,7 @@ class CenterPanel(QWidget):
             opt = opts[0]
             b_yes = QPushButton(f"✅ 예, {opt['nat']}로 뛰겠습니다")
             b_yes.setObjectName("dlgChoice")
-            b_yes.clicked.connect(lambda _=False, n=opt["nat"]: _do_choice(n))
+            b_yes.clicked.connect(lambda _=False, o=opt: _do_choice(o))
             b_no = QPushButton("❌ 아니오 (보류)")
             b_no.setObjectName("dlgNo")
             b_no.clicked.connect(lambda _=False: _do_decline())
@@ -860,9 +879,14 @@ class CenterPanel(QWidget):
             lay.addLayout(btn_row)
         else:
             for opt in opts:
-                b = QPushButton(f"{opt.get('flag','')} {opt['nat']}")
+                # 복수 대륙컵이면 '국적 (대회명)'으로 어느 대회인지 명시
+                _comp = opt.get("competition", "")
+                _label = f"{opt.get('flag','')} {opt['nat']}"
+                if _comp:
+                    _label += f"\n({_comp})"
+                b = QPushButton(_label)
                 b.setObjectName("dlgChoice")
-                b.clicked.connect(lambda _=False, n=opt["nat"]: _do_choice(n))
+                b.clicked.connect(lambda _=False, o=opt: _do_choice(o))
                 btn_row.addWidget(b, 1)
             lay.addLayout(btn_row)
             b_no = QPushButton("이번엔 어느 나라로도 뛰지 않음")
@@ -874,6 +898,50 @@ class CenterPanel(QWidget):
         dlg.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
         dlg.exec()
         self._nat_choice_open = False
+
+    def _show_callup_result(self, nat, res):
+        """[복수국적] 대표 선택 직후 결과를 '순서대로' 공개하는 다이얼로그.
+        순서:  ① 발탁(선택 확정)  →  ② 국가대표 선발 여부  →  ③ 예선 통과/본선 진출.
+        선택한 뒤에야 선발·예선 결과가 단계적으로 드러난다."""
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QFrame
+
+        _rs = res.get("result", "")
+        # 각 단계 라인 구성 (결과에 따라 ②③ 색/내용 분기)
+        line1 = f"✅ <b style='color:#ffcc66'>{nat}</b> 대표로 확정했습니다."
+        if _rs == "미선발":
+            line2 = f"📋 <span style='color:#ff8866'>국가대표 미선발</span> — 이번엔 부름을 받지 못했습니다."
+            line3 = ""
+        elif _rs == "예선탈락":
+            line2 = f"📣 <span style='color:#88cc88'>국가대표 선발!</span>"
+            line3 = f"📋 <span style='color:#ff8866'>…하지만 {nat}은(는) 예선 탈락</span> — 이번 대회 출전 없음."
+        elif _rs == "선발":
+            line2 = f"📣 <span style='color:#88cc88'>국가대표 선발!</span>"
+            line3 = f"🌍 <span style='color:#66ccff'>{nat} 본선 진출!</span> — 조별리그에 소집됩니다."
+        else:
+            line2 = ""; line3 = ""
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("🌍 대표팀 발탁 결과")
+        dlg.setMinimumWidth(400)
+        dlg.setStyleSheet(_DIALOG_STYLE)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(18, 16, 18, 16); lay.setSpacing(10)
+
+        hdr = QLabel("🌍 대표팀 발탁 결과"); hdr.setObjectName("dlgHeader")
+        lay.addWidget(hdr)
+
+        body = "<br><br>".join(x for x in (line1, line2, line3) if x)
+        info = QLabel(f"<span style='color:#ddd; font-size:14px'>{body}</span>")
+        info.setWordWrap(True)
+        card = QFrame(); card.setObjectName("dlgCard")
+        cl = QVBoxLayout(card); cl.setContentsMargins(14, 12, 14, 12)
+        cl.addWidget(info)
+        lay.addWidget(card)
+
+        btn = QPushButton("확인"); btn.setObjectName("dlgChoice")
+        btn.clicked.connect(dlg.accept)
+        lay.addWidget(btn)
+        dlg.exec()
 
     def _do_join(self):
         """소속 없음일 때만 수동 팀 입단 (1~4주차)."""

@@ -120,7 +120,9 @@ class MainWindow(QMainWindow):
             s.setMaximumWidth(maxw)
             return s
 
-        splitter.addWidget(scroll(self.player_panel, 220, 290))
+        # 좌측 선수 패널: 박스 레이아웃 + 복수국적/긴 팀명 등 긴 텍스트를 수용하도록
+        #   최소/최대폭을 넉넉히. (글자가 길면 이 범위 안에서 스플리터로 넓힐 수 있음)
+        splitter.addWidget(scroll(self.player_panel, 250, 380))
         splitter.addWidget(scroll(self.center_panel, 400, 9999))
         splitter.addWidget(scroll(self.log_panel,    240, 340))
         splitter.setStretchFactor(0, 2)
@@ -339,6 +341,8 @@ class MainWindow(QMainWindow):
         self.resize(1280, 720)
         self._build()
         self.refresh_all()
+        # 게임 화면은 기본 전체화면(최대화)으로 — 좌측/중앙/우측 패널이 넓게 보이도록.
+        self.showMaximized()
 
     def closeEvent(self, event):
         event.accept()

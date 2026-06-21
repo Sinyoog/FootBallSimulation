@@ -63,41 +63,98 @@ def get_tournament(year):
     return dict(row) if row else None
 
 
+def get_tournaments(year):
+    """[복수대륙컵] 해당 연도의 모든 국제대회 row 리스트 (없으면 빈 리스트).
+    미고정 복수국적이면 한 해에 대륙컵이 2~3개 존재할 수 있다."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM intl_tournaments WHERE year=? ORDER BY id ASC",
+        (year,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_my_tournament(year=None):
+    """[복수대륙컵] '내가 실제로 출전 중/표시 대상'인 대회 1개를 선별 반환.
+
+    우선순위:
+      1) my_selected==1 (본선 출전 확정) 대회 — 내가 뛰는 대회
+      2) my_selected==3 (선택 대기) 대회 — 발탁창 대상 (가장 이른 id)
+      3) 그 외 — 표시용 대표 대회(월드컵 우선, 없으면 첫 대회)
+    한 해에 본선 출전(==1)은 동시에 1개만 존재하도록 choose가 보장한다.
+    """
+    from game_engine import get_state
+    if year is None:
+        st = get_state()
+        if not st:
+            return None
+        year = st["current_year"]
+    ts = get_tournaments(year)
+    if not ts:
+        return None
+    for t in ts:
+        if t.get("my_selected") == 1:
+            return t
+    for t in ts:
+        if t.get("my_selected") == 3:
+            return t
+    for t in ts:
+        if t.get("kind") == "world":
+            return t
+    return ts[0]
+
+
 def get_pending_choice():
-    """[복수국적] 대표팀 선택/동의가 필요한 대회가 있으면 정보 반환, 없으면 None.
-    (미고정 + 본선 진출국 1개 이상 → my_selected==3)
-    나이와 무관하게, 발탁창에서 본인이 골라야(또는 동의해야) 한다.
-    진출국이 1개여도 본인 동의를 받기 위해 팝업을 띄운다.
-    선택해서 본선에 출전하면 그 나라로 영구 고정(cap-tie)된다."""
+    """[복수국적·복수대륙컵] 대표팀 선택/동의가 필요한 대회들을 하나로 묶어 반환.
+
+    그 해 my_selected==3(선택 대기)인 모든 대회의 후보 국적을 평탄화해
+    최대 3개의 선택지로 제시한다. 각 선택지는 (국적, 대회명, tournament_id)를
+    가지므로, 예를 들어 '크로아티아 → 유럽 챔피언십', '대한민국 → 아시안컵'이
+    같은 발탁창에 함께 뜬다. 전부 거절도 가능하다.
+
+    [선택 우선 원칙] 후보는 cand_nats(선발 통과국)에서 가져온다. 선택해서
+    출전(choose_national_team)하면 그제서야 예선 통과/탈락이 드러나고,
+    본선에 출전하면 그 나라로 영구 고정(cap-tie)된다."""
     from game_engine import get_state, get_player
     st = get_state(); p = get_player()
     if not st or not p:
         return None
-    t = get_tournament(st["current_year"])
-    if not t or t.get("my_selected") != 3:
+    ts = [t for t in get_tournaments(st["current_year"])
+          if t.get("my_selected") == 3]
+    if not ts:
         return None
-    # 22세 이상은 정상적으로는 1~4주차 강제선택(get_forced_commit)으로 이미
-    # 고정되어 있어야 한다. 그 팝업을 건너뛴 미고정 선수는 여기서도 선택 가능.
 
-    nats = [p.get("nationality", "") or "",
-            p.get("nationality2", "") or "",
-            p.get("nationality3", "") or ""]
     conn = get_conn()
-    entry_names = {r["country"] for r in conn.execute(
-        "SELECT country FROM intl_entries WHERE tournament_id=?", (t["id"],)).fetchall()}
     opts = []
-    seen = set()
-    for n in nats:
-        if n and n in entry_names and n not in seen:
-            seen.add(n)
-            fr = conn.execute("SELECT flag FROM intl_entries WHERE tournament_id=? AND country=?",
-                              (t["id"], n)).fetchone()
-            opts.append({"nat": n, "flag": fr["flag"] if fr else ""})
+    seen = set()   # (nat, tournament_id) 중복 방지
+    flag_cache = {}
+    for t in ts:
+        cand_raw = (t.get("cand_nats", "") or "")
+        cand = [n for n in cand_raw.split(",") if n]
+        for n in cand:
+            key = (n, t["id"])
+            if not n or key in seen:
+                continue
+            seen.add(key)
+            if n not in flag_cache:
+                fr = conn.execute("SELECT flag FROM countries WHERE name=?", (n,)).fetchone()
+                flag_cache[n] = fr["flag"] if fr else ""
+            opts.append({"nat": n, "flag": flag_cache[n],
+                         "tournament_id": t["id"], "competition": t["name"]})
     conn.close()
     if len(opts) < 1:
         return None
-    return {"tournament_id": t["id"], "name": t["name"],
-            "year": t["year"], "options": opts}
+    opts = opts[:3]   # 최대 3개 선택지
+    # 대표 tournament_id(구버전 UI 호환): 첫 선택지의 대회.
+    # 대회명은 여러 개일 수 있으므로 '/'로 묶어 표기.
+    comp_names = []
+    for o in opts:
+        if o["competition"] not in comp_names:
+            comp_names.append(o["competition"])
+    return {"tournament_id": opts[0]["tournament_id"],
+            "name": " / ".join(comp_names),
+            "year": st["current_year"], "options": opts,
+            "multi": True}
 
 
 def choose_national_team(tournament_id, nat):
@@ -112,36 +169,144 @@ def choose_national_team(tournament_id, nat):
     grade = grow["grade"] if grow else "F"
     conn.close()
 
-    # 이 선택으로 영구 고정 (이후 모든 대회에서 이 나라로만)
-    update_player(intl_committed=nat)
+    # [버그수정] 선택 시점에는 절대 고정하지 않는다.
+    #   cap-tie(국적 영구 고정)는 FIFA 규정대로 '본선 A매치 실제 출전' 시점에만
+    #   일어나야 한다. 본선 출전 처리는 simulate_my_match()가 담당하며,
+    #   여기서는 미선발/예선탈락이어도 고정되지 않아 다음 대회에 다른 나라를
+    #   다시 선택할 수 있다. (기존엔 선택 즉시 update_player(intl_committed=nat)을
+    #   호출해, 본선에 못 가도 영구 고정돼버리는 버그가 있었다.)
+    from game_engine import get_state
+    _st = get_state() or {}
 
+    # ── [선택 우선] 결과 공개 순서: ① 선발 여부 → ② 예선 통과 여부 ──
+    #   cand_nats 후보는 '선발 통과한 나라'만 들어오므로 selected는 사실상 True지만,
+    #   안전하게 다시 판정한다(중간에 OVR/팀 변동 가능성 대비).
+    from game_engine import add_log
     p = get_player()
     selected = _check_selection(p, grade)
-    my_sel = 1 if selected else 0
+
     conn = get_conn()
+    trow = conn.execute("SELECT year, name FROM intl_tournaments WHERE id=?",
+                        (tournament_id,)).fetchone()
+    tyear = trow["year"] if trow else _st.get("current_year")
+    tname = trow["name"] if trow else ""
+    # 선택한 나라가 이번 대회 본선에 진출했는가(예선 통과 여부 — 이제야 공개)
+    qrow = conn.execute(
+        "SELECT 1 FROM intl_entries WHERE tournament_id=? AND country=? LIMIT 1",
+        (tournament_id, nat)).fetchone()
+    qualified = bool(qrow)
+
+    if not selected:
+        # ① 선발 미달 — 예선 결과와 무관하게 이번 대회 출전 없음
+        my_sel = 0
+        conn.execute("UPDATE intl_tournaments SET my_nat=?, my_selected=? WHERE id=?",
+                     (nat, my_sel, tournament_id))
+        conn.commit(); conn.close()
+        _save_trophy(tyear, nat, tname, "국가대표 미선발")
+        return {"nat": nat, "selected": False, "qualified": qualified, "result": "미선발"}
+
+    if not qualified:
+        # ② 선발은 됐지만 그 나라가 예선 탈락 → 본선 출전 불가
+        my_sel = 2
+        conn.execute("UPDATE intl_tournaments SET my_nat=?, my_selected=? WHERE id=?",
+                     (nat, my_sel, tournament_id))
+        conn.commit(); conn.close()
+        _save_trophy(tyear, nat, tname, "예선 탈락")
+        return {"nat": nat, "selected": True, "qualified": False, "result": "예선탈락"}
+
+    # ③ 선발 + 본선 진출 → 정식 출전. 내 경기로 일정 재태깅.
+    #   [고정 시점] 실제 영구 고정은 본선 첫 경기 출전 시 simulate_my_match()가
+    #   처리한다. 여기서는 본선 확정 사실만 연혁에 commit으로 남긴다.
+    my_sel = 1
     conn.execute("UPDATE intl_tournaments SET my_nat=?, my_selected=? WHERE id=?",
                  (nat, my_sel, tournament_id))
-    # 미선발이면 대회 자동판정 경로(start_intl_tournament)와 동일하게
-    # '국가대표 미선발'을 trophy_log에 남긴다 (선택대기→동의→미선발 빈틈 보정).
-    if not selected:
-        trow = conn.execute("SELECT year, name FROM intl_tournaments WHERE id=?",
-                            (tournament_id,)).fetchone()
-        conn.commit(); conn.close()
-        if trow:
-            _save_trophy(trow["year"], nat, trow["name"], "국가대표 미선발")
-    else:
-        conn.commit(); conn.close()
-    return {"nat": nat, "selected": selected}
+    # 이 대회 경기들 중 선택국이 낀 경기를 내 경기로 표시(선택 전에는 후보 전체였음)
+    conn.execute("UPDATE intl_matches SET is_my=0 WHERE tournament_id=?", (tournament_id,))
+    conn.execute("UPDATE intl_matches SET is_my=1 WHERE tournament_id=? AND (home=? OR away=?)",
+                 (tournament_id, nat, nat))
+    # [복수대륙컵] 본선 출전을 확정했으므로, 같은 해 다른 '선택 대기(3)' 대회는
+    #   이번엔 출전하지 않는 것으로 마감(my_selected=2). 한 해에 본선 출전(1)은
+    #   동시에 1개만 존재하도록 보장한다. (명시적 거절 기록은 남기지 않음 —
+    #   다른 나라를 골랐을 뿐이며, 이 나라로 cap-tie되면 다음 해부터 자동 정리됨.)
+    if tyear is not None:
+        conn.execute(
+            "UPDATE intl_tournaments SET my_selected=2 "
+            "WHERE year=? AND id<>? AND my_selected=3",
+            (tyear, tournament_id))
+    conn.commit(); conn.close()
+    # [국적 연혁] 본선 출전 확정 → 대표 국적 commit 기록 (중복은 add_nat_history가 무시)
+    try:
+        from game_engine import add_nat_history
+        _fl = ""
+        for _nk, _fk in (("nationality","flag"),("nationality2","flag2"),("nationality3","flag3")):
+            if (p.get(_nk,"") or "") == nat:
+                _fl = p.get(_fk,"") or ""; break
+        add_nat_history("commit", nat, _fl,
+                        _st.get("current_year"), _st.get("current_week"))
+    except Exception:
+        pass
+    return {"nat": nat, "selected": True, "qualified": True, "result": "선발"}
 
 
 def decline_national_team(tournament_id):
-    """[복수국적] 이번 대회 대표팀 발탁을 거절(보류). 영구 고정하지 않으며,
-    이번 대회만 출전 없음(my_selected=2) 처리한다. 다음 대회에서 다시 제안된다."""
+    """[복수국적·복수대륙컵] 이번 대표팀 발탁을 거절(보류). 영구 고정하지 않는다.
+
+    같은 해에 선택 대기(my_selected==3)인 대회가 여러 개면(여러 대륙컵) 전부
+    거절 처리한다. 즉 발탁창의 '전부 거절'에 해당한다. 다음 대회에서 다시 제안된다.
+
+    [거절 기록] 거절도 커리어에 남긴다 (은퇴창/AI요약 표시용).
+      - year       : 거절한 연도
+      - team_name  : 거절한 후보 국가 전부 (대회 통합, 예: '크로아티아/대한민국')
+      - league_name: '발탁 거절'
+      - competition: 대회명(들)
+    과거 거절은 나중에 같은 나라 대표로 뛰어도 그대로 남는다(역사 보존)."""
     conn = get_conn()
-    conn.execute("UPDATE intl_tournaments SET my_nat='', my_selected=2 WHERE id=?",
-                 (tournament_id,))
+    trow = conn.execute(
+        "SELECT year FROM intl_tournaments WHERE id=?", (tournament_id,)).fetchone()
+    year = trow["year"] if trow else None
+    # 그 해 선택 대기 대회 전부 수집 (후보 국가/대회명 통합 기록용)
+    cand_all = []
+    comp_all = []
+    if year is not None:
+        rows = conn.execute(
+            "SELECT name, cand_nats FROM intl_tournaments WHERE year=? AND my_selected=3",
+            (year,)).fetchall()
+        for r in rows:
+            if r["name"] and r["name"] not in comp_all:
+                comp_all.append(r["name"])
+            for n in (r["cand_nats"] or "").split(","):
+                if n and n not in cand_all:
+                    cand_all.append(n)
+        conn.execute(
+            "UPDATE intl_tournaments SET my_nat='', my_selected=2 "
+            "WHERE year=? AND my_selected=3", (year,))
+    else:
+        conn.execute("UPDATE intl_tournaments SET my_nat='', my_selected=2 WHERE id=?",
+                     (tournament_id,))
     conn.commit(); conn.close()
+
+    if year is not None:
+        nat_str = "/".join(cand_all) if cand_all else "대표팀"
+        comp_str = " / ".join(comp_all) if comp_all else "대륙컵"
+        _save_decline(year, nat_str, comp_str)
     return True
+
+
+def _save_decline(year, nat_str, competition):
+    """[거절 기록] 발탁 거절을 trophy_log(tier=0)에 남긴다.
+    같은 (year, competition)에 거절 기록이 이미 있으면 중복 방지.
+    선발/예선 결과 줄과 별개로 '발탁 거절' 줄을 따로 남길 수 있도록
+    league_name='발탁 거절' 조건까지 함께 본다."""
+    conn = get_conn()
+    existing = conn.execute(
+        "SELECT id FROM trophy_log WHERE year=? AND competition=? AND league_name=?",
+        (year, competition, "발탁 거절")).fetchone()
+    if not existing:
+        conn.execute(
+            """INSERT INTO trophy_log(year, team_name, league_name, tier, competition)
+               VALUES(?,?,?,0,?)""", (year, nat_str, "발탁 거절", competition))
+        conn.commit()
+    conn.close()
 
 
 def get_forced_commit():
@@ -164,7 +329,9 @@ def get_forced_commit():
     if not (1 <= week <= 4):
         return None
     year = st.get("current_year", 0)
-    age  = year - (p.get("birth_year", year - 17) or (year - 17))
+    # [버그수정] 나이는 'age' 컬럼이 정확하다. birth_year는 게임 내내 갱신되지 않아
+    #   (year - birth_year)는 실제 나이보다 16 적게 나온다 → 22세 판정이 영원히 실패했었다.
+    age = p.get("age", 0) or 0
     if age != 22:
         return None
 
@@ -193,6 +360,18 @@ def commit_nationality(nat):
     if not p:
         return None
     update_player(intl_committed=nat)
+    # [국적 연혁] 22세 강제확정 사건 기록
+    try:
+        from game_engine import add_nat_history, get_state
+        _st = get_state() or {}
+        _fl = ""
+        for _nk, _fk in (("nationality","flag"),("nationality2","flag2"),("nationality3","flag3")):
+            if (p.get(_nk,"") or "") == nat:
+                _fl = p.get(_fk,"") or ""; break
+        add_nat_history("commit", nat, _fl,
+                        _st.get("current_year"), _st.get("current_week"))
+    except Exception:
+        pass
     return {"nat": nat}
 
 
@@ -244,7 +423,7 @@ def _active_tournament():
     st = get_state()
     if not st:
         return None
-    t = get_tournament(st["current_year"])
+    t = get_my_tournament(st["current_year"])
     if t and t["status"] != "done":
         return t
     return t  # done이어도 반환 (UI 표시용) ─ 호출부에서 status 체크
@@ -257,7 +436,7 @@ def get_my_match(week):
     st = get_state()
     if not p or not st:
         return None
-    t = get_tournament(st["current_year"])
+    t = get_my_tournament(st["current_year"])
     if not t or t["status"] == "done" or t["my_selected"] != 1:
         return None
     nat = _my_nat(t, p)
@@ -303,8 +482,15 @@ def has_my_match_between(week_from, week_to):
 # ─────────────────────────────────────────────
 
 def start_intl_tournament(year):
-    """17주차 진입 시 호출. 해당 연도에 대회가 있으면 생성."""
-    from game_engine import add_log, get_player
+    """17주차 진입 시 호출. 해당 연도에 대회가 있으면 생성.
+
+    [복수국적·복수대륙컵] 미고정 선수가 서로 다른 대륙 국적을 보유하면,
+    대륙컵 해에는 보유 국적이 속한 '각 대륙'의 대륙컵을 모두 생성한다.
+    (예: 크로아티아(유럽)+대한민국(아시아) → 유럽 챔피언십 + 아시안컵 둘 다)
+    월드컵 해에는 종전과 동일하게 단일 대회만 생성한다.
+    committed(고정)면 그 나라 대륙의 대륙컵 1개만 생성한다.
+    """
+    from game_engine import get_player
     p = get_player()
     if not p:
         return
@@ -314,12 +500,12 @@ def start_intl_tournament(year):
                and (year - CONTINENTAL_START_YEAR) % CONTINENTAL_INTERVAL == 0)
     if not is_wc and not is_cont:
         return
-    if get_tournament(year):
-        return  # 중복 생성 방지
+    if get_tournaments(year):
+        return  # 이미 그 해 대회가 하나라도 생성됨 → 중복 생성 방지
 
     _clear_entry_cache()   # 새 대회 → 이전 캐시 무효화
 
-    # [복수국적] 내 국적 목록 (1~3개). committed(고정)되어 있으면 그 나라만.
+    # 보유 국적 / 고정 여부
     nat1 = p.get("nationality", "") or ""
     nat2 = p.get("nationality2", "") or ""
     nat3 = p.get("nationality3", "") or ""
@@ -329,12 +515,8 @@ def start_intl_tournament(year):
     else:
         my_nats = [n for n in (nat1, nat2, nat3) if n]
 
-    conn = get_conn()
-    # 대회 종류(월드컵/대륙컵)는 '주 국적'의 대륙 기준으로 결정 (기존 동작 유지).
-    nrow = conn.execute(
-        "SELECT continent, grade, flag FROM countries WHERE name=?", (nat1,)).fetchone()
-    my_continent = nrow["continent"] if nrow else "유럽"
     # 각 국적의 대륙/등급 조회
+    conn = get_conn()
     nat_info = {}
     for n in my_nats:
         r = conn.execute(
@@ -344,50 +526,100 @@ def start_intl_tournament(year):
     conn.close()
 
     if is_wc:
+        # 월드컵: 전 세계 단일 대회. (대륙 개념 없음)
+        _create_one_tournament(year, is_wc=True, my_continent=None,
+                               p=p, my_nats=my_nats, nat_info=nat_info,
+                               committed=committed)
+        return
+
+    # ── 대륙컵: 만들 대륙 목록 결정 ──
+    #   committed면 그 나라 대륙 1개. 미고정이면 보유 국적이 속한 대륙 전부.
+    #   (CONFEDERATIONS로 통합 대륙 정규화: 오세아니아→아시아, 북미↔남미 통합)
+    continents = []
+    for n in my_nats:
+        cont = nat_info.get(n, {}).get("continent")
+        if not cont:
+            continue
+        # 대표 대륙키(연맹 대표 대륙명)로 정규화해 같은 연맹을 1개로 합침.
+        rep = _conf_key(cont)
+        if rep not in continents:
+            continents.append(rep)
+
+    if not continents:
+        # 보유 국적이 전혀 없거나 대륙 정보 없음 → 주 국적 대륙(없으면 유럽) 폴백
+        fallback = nat_info.get(nat1, {}).get("continent", "유럽")
+        continents = [_conf_key(fallback)]
+
+    for cont in continents:
+        _create_one_tournament(year, is_wc=False, my_continent=cont,
+                               p=p, my_nats=my_nats, nat_info=nat_info,
+                               committed=committed)
+
+
+def _conf_key(continent):
+    """대륙명을 연맹 대표 대륙키로 정규화.
+    같은 연맹(예: 아시아+오세아니아, 남미+북미)을 하나의 대륙컵으로 합치기 위함.
+    CONFEDERATIONS의 첫 원소를 대표키로 사용한다."""
+    confs = CONFEDERATIONS.get(continent, [continent])
+    return confs[0] if confs else continent
+
+
+def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, committed):
+    """대회 1개를 생성(조 추첨·일정 포함)하고 로그를 남긴다.
+
+    - is_wc=True  : 월드컵(전 세계 단일). my_continent 무시.
+    - is_wc=False : my_continent 대륙컵. cand_nats는 그 대륙 소속 보유국적만.
+    """
+    from game_engine import add_log
+
+    if is_wc:
         kind, name = "world", "월드컵"
         entries = _qualify_world(year)
         n_groups = WC_GROUPS_BIG if year >= WC_EXPAND_YEAR else WC_GROUPS
+        # 월드컵은 대륙 무관 → 내 국적 전부가 후보 대상
+        cont_nats = [n for n in my_nats if n]
     else:
         kind = "continent"
         name = CONF_CUP_NAME.get(my_continent, "대륙컵")
         entries = _qualify_continental(my_continent)
         n_groups = CONT_GROUPS
+        # 이 대륙컵 후보 = 그 대륙(연맹) 소속 보유 국적만
+        confs = set(CONFEDERATIONS.get(my_continent, [my_continent]))
+        cont_nats = [n for n in my_nats
+                     if nat_info.get(n, {}).get("continent") in confs]
 
     entry_names = {e["name"] for e in entries}
-    # 이번 대회에 '본선 진출'한 내 국적들 (대륙컵이면 그 대륙 소속만 해당)
-    qualified_nats = [n for n in my_nats if n in entry_names]
+    # 이 대회 본선 진출한 내 국적
+    qualified_nats = [n for n in cont_nats if n in entry_names]
 
     # 출전국/선발 결정
-    #  - 이미 고정(committed)된 경우: 그 나라가 진출했으면 그 나라로 출전·선발 판정,
-    #    아니면 이번 대회는 출전 없음.
-    #  - 미고정 + 21세 이하: 진출국 1개 이상이면 '선택 대기(my_sel=3)'.
-    #    본인이 팝업에서 골라야만(또는 동의해야만) 영구 고정된다.
-    #  - 미고정 + 22세 이상: 더 이상 선택 불가. 국적 중 '주 국적(nat1)'으로
-    #    자동 고정(cap-tie). 예선 탈락이어도 그 나라 소속으로 간주.
-    #    (현실 규칙: 일정 나이가 지나면 사실상 한 나라에 묶임)
-    #  - 진출국 0개 → 출전 없음(my_sel=2)
-    age = year - (p.get("birth_year", year - 17) or (year - 17))
     my_nat = ""
+    cand_nats = []
     if committed:
-        if committed in qualified_nats:
+        # 고정 선수: 이 대회가 committed의 대륙이 아닐 수도 있다.
+        #   committed가 이 대회 후보군(cont_nats)에 없으면 이 대회는 내 무대가 아님.
+        if committed not in cont_nats:
+            my_sel = 2   # 이 대회는 출전 대상 아님(타 대륙)
+        elif committed in qualified_nats:
             my_nat = committed
             grade = nat_info.get(my_nat, {}).get("grade", "F")
             my_sel = 1 if _check_selection(p, grade) else 0
         else:
             my_sel = 2   # 고정된 나라가 본선 진출 못함 → 이번엔 출전 없음
     else:
-        # 미고정: 본인 선택권 있음. 진출국 1개 이상이면 선택/동의 대기.
-        #  (정상 흐름에선 22세 1~4주차에 get_forced_commit 팝업으로 이미 고정됨.
-        #   그 팝업을 건너뛴 구 세이브 등 예외 상황의 폴백 경로.)
-        if len(qualified_nats) == 0:
-            my_sel = 2
-        else:
+        # 미고정: 이 대회 대륙(연맹)에 속한 보유 국적만 선택 후보로.
+        #   선발/예선 결과는 선택 후 공개(선택창이 먼저).
+        cand_nats = [n for n in cont_nats if n]
+        if cand_nats:
             my_sel = 3   # 선택/동의 대기
+        else:
+            my_sel = 2   # 이 대회에 낄 수 있는 보유 국적 없음
 
     conn = get_conn()
     c = conn.cursor()
-    c.execute("""INSERT INTO intl_tournaments(year, kind, name, status, my_selected, my_nat)
-                 VALUES(?,?,?,?,?,?)""", (year, kind, name, "group", my_sel, my_nat))
+    c.execute("""INSERT INTO intl_tournaments(year, kind, name, status, my_selected, my_nat, cand_nats)
+                 VALUES(?,?,?,?,?,?,?)""",
+              (year, kind, name, "group", my_sel, my_nat, ",".join(cand_nats)))
     tid = c.lastrowid
 
     # 포트 추첨: 전력순 4개 포트 → 조마다 포트별 1팀
@@ -407,17 +639,18 @@ def start_intl_tournament(year):
 
     # 조별리그 일정 (18~20주)
     w0 = INTL_GROUP_WEEKS[0]
+    if my_nat:
+        _my_match_nats = {my_nat}
+    elif my_sel == 3:
+        _my_match_nats = set(cand_nats)
+    else:
+        _my_match_nats = set(cont_nats)
     for rd, pairs in enumerate(_GROUP_ROUNDS):
         wk = w0 + rd
         for g, members in groups.items():
             for hi, ai in pairs:
                 home, away = members[hi], members[ai]
-                # 내가 이 대회에서 뛰는 나라(my_nat)가 끼면 내 경기로 표시.
-                # 아직 선택 대기(my_sel=3)면 두 국적 다 내 경기 후보로 표시.
-                if my_nat:
-                    is_my = 1 if my_nat in (home["name"], away["name"]) else 0
-                else:
-                    is_my = 1 if (home["name"] in my_nats or away["name"] in my_nats) else 0
+                is_my = 1 if (home["name"] in _my_match_nats or away["name"] in _my_match_nats) else 0
                 c.execute("""INSERT INTO intl_matches
                              (tournament_id, stage, grp, week, home, away,
                               home_score, away_score, is_my, slot)
@@ -431,15 +664,14 @@ def start_intl_tournament(year):
     add_log(f"🌍 {year}년 {name} 개막!  본선 {len(entries)}개국", "event", year, INTL_CALLUP_WEEK)
 
     if my_sel == 3:
-        # 미고정 + 진출국 1개 이상 → 본인 동의(선택) 대기
-        nat_list = " / ".join(qualified_nats)
-        if len(qualified_nats) == 1:
-            add_log(f"   🌍 {nat_list} 대표팀 발탁 제안! 출전 여부를 선택하세요", "event", year, INTL_CALLUP_WEEK)
+        nat_list = " / ".join(cand_nats)
+        if len(cand_nats) == 1:
+            add_log(f"   🌍 {nat_list} 대표팀에서 발탁을 제안합니다! 출전 여부를 선택하세요",
+                    "event", year, INTL_CALLUP_WEEK)
         else:
-            add_log(f"   🌍 복수국적 발탁 가능! {nat_list} 중 대표팀을 선택하세요", "event", year, INTL_CALLUP_WEEK)
+            add_log(f"   🌍 여러 나라가 당신을 원합니다! {nat_list} 중 대표팀을 선택하세요",
+                    "event", year, INTL_CALLUP_WEEK)
     elif my_nat:
-        # 출전국 확정 (진출국 1개)
-        _flag = ""
         _grow = _country_flag(my_nat)
         try:
             my_g = next(g for g, ms in groups.items() if any(m["name"] == my_nat for m in ms))
@@ -454,12 +686,12 @@ def start_intl_tournament(year):
             add_log("   📋 국가대표 미선발... 대표팀 경기를 지켜봅니다", "event", year, INTL_CALLUP_WEEK)
             _save_trophy(year, my_nat, name, "국가대표 미선발")
     else:
-        # 진출국 없음
-        none_nat = my_nats[0] if my_nats else ""
-        add_log(f"   📋 {none_nat}, 예선 탈락으로 본선 진출 실패", "event", year, INTL_CALLUP_WEEK)
-        if none_nat:
-            _save_trophy(year, none_nat, name, "예선 탈락")
-
+        # my_sel==2
+        #   committed가 이 대회 대륙이고 예선 탈락한 경우만 기록.
+        #   (committed가 타 대륙이라 이 대회와 무관하면 아무 기록도 남기지 않는다.)
+        if committed and committed in cont_nats:
+            add_log(f"   📋 {committed} 예선 탈락 — 이번 대회 출전 없음", "event", year, INTL_CALLUP_WEEK)
+            _save_trophy(year, committed, name, "예선 탈락")
 
 def _country_flag(name):
     """국가 국기 조회 (없으면 빈 문자열)."""
@@ -568,15 +800,20 @@ def _qualify_continental(my_continent):
 # ─────────────────────────────────────────────
 
 def process_intl_week(week):
-    """이번 주차의 남은 국제대회 경기(AI) 시뮬 + 라운드 진행."""
+    """이번 주차의 남은 국제대회 경기(AI) 시뮬 + 라운드 진행.
+    [복수대륙컵] 그 해 열린 모든 대회를 각각 진행한다."""
     from game_engine import get_state
     st = get_state()
     if not st:
         return
-    t = get_tournament(st["current_year"])
-    if not t or t["status"] == "done":
-        return
+    for t in get_tournaments(st["current_year"]):
+        if t.get("status") == "done":
+            continue
+        _process_one_tournament_week(t, week)
 
+
+def _process_one_tournament_week(t, week):
+    """대회 1개의 이번 주차 경기 시뮬 + 라운드 진행."""
     conn = get_conn()
     pending = [dict(r) for r in conn.execute(
         """SELECT * FROM intl_matches
@@ -725,6 +962,18 @@ def simulate_my_match(week, p):
     if nat and not (p.get("intl_committed", "") or ""):
         from game_engine import update_player as _upd
         _upd(intl_committed=nat)
+        # [국적 연혁] A매치 첫 출전으로 자동 고정된 경우도 commit 기록
+        try:
+            from game_engine import add_nat_history, get_state
+            _st = get_state() or {}
+            _fl = ""
+            for _nk, _fk in (("nationality","flag"),("nationality2","flag2"),("nationality3","flag3")):
+                if (p.get(_nk,"") or "") == nat:
+                    _fl = p.get(_fk,"") or ""; break
+            add_nat_history("commit", nat, _fl,
+                            _st.get("current_year"), _st.get("current_week"))
+        except Exception:
+            pass
     he = _entry(t["id"], m["home"])
     ae = _entry(t["id"], m["away"])
     is_home = info["is_home"]
