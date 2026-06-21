@@ -362,7 +362,11 @@ class ScheduleWindow(QDialog):
                     "QHeaderView::section{background:#252525;color:#888;border:none;padding:3px;}")
                 for i, r in enumerate(rows):
                     gd = r["gf"] - r["ga"]
-                    vals = [f"{r.get('flag','')}{r['team_name']}", str(r["p"]), str(r["w"]),
+                    ctry = r.get("country", "")
+                    nm = f"{r.get('flag','')}{r['team_name']}"
+                    if ctry:
+                        nm = f"{nm} ({ctry})"
+                    vals = [nm, str(r["p"]), str(r["w"]),
                             str(r["d"]), str(r["l"]), f"{'+' if gd>0 else ''}{gd}", str(r["pts"])]
                     if r["team_id"] == my_tid_g:   color = QColor("#66ccff")
                     elif i < 2:                    color = QColor("#00cc44")

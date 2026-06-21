@@ -685,6 +685,7 @@ def get_cl_group_standings(tid, grp):
 
     tbl = {e["team_id"]: {"team_id": e["team_id"], "team_name": e["team_name"],
                           "flag": e["flag"], "ovr": e["ovr"],
+                          "country": e["country"] if "country" in e.keys() else "",
                           "p": 0, "w": 0, "d": 0, "l": 0, "gf": 0, "ga": 0, "pts": 0}
            for e in entries}
     for m in matches:

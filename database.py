@@ -341,6 +341,10 @@ def init_db():
         # [챔스 진출권] 내가 그 해 리그 1위로 '출전 자격'을 얻었는지(1) 아닌지(0).
         #  자격이 없으면(2위 이하) 그 대회와 무관 → '본선 진출 실패'도 안 뜬다.
         "ALTER TABLE cl_tournaments ADD COLUMN my_qualified INTEGER DEFAULT 0",
+        # [노화] 전성기(peak) 시점의 각 스탯 _max 스냅샷 JSON. 노화 하한선(floor)
+        #  계산의 기준값. 노화가 처음 시작될 때 1회 기록되며 이후 불변.
+        #  ''(빈값)이면 아직 스냅샷 전(전성기 이전).
+        "ALTER TABLE my_player ADD COLUMN aging_peak_max TEXT DEFAULT ''",
     ]:
         try: c.execute(migration)
         except: pass

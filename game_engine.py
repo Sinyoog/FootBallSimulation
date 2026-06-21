@@ -2803,7 +2803,7 @@ def _end_of_season(p, year):
             update_player(**{stat: min(mx, cur+bonus)})
             add_log(f"🌱 시즌 자연 성장: {STAT_KO.get(stat,stat)}+{bonus}", "event", year, 52)
 
-    # 3. 나이 증가 + 스탯 노화
+    # 3. 나이 증가 + 스탯 노화 (재능 등급별 차등 + 하한선)
     new_age = p["age"] + 1
     decay   = 0
     for threshold, d in AGING:
@@ -2813,12 +2813,39 @@ def _end_of_season(p, year):
     stat_updates: dict = {"age": new_age, "total_seasons": p.get("total_seasons",0)+1}
 
     if decay > 0:
+        from constants import AGING_TIER_MULT, AGING_FLOOR_RATIO
+        tier = p.get("talent_tier", "normal")
+        # 재능 등급별 노화 속도 배수 (월클은 느리게, 무재능은 빠르게)
+        tier_mult = AGING_TIER_MULT.get(tier, 1.0)
+        floor_ratio = AGING_FLOOR_RATIO.get(tier, 0.74)
+
+        # [하한선 기준] 전성기 _max 스냅샷. 노화가 처음 시작되는 시즌에 1회 기록.
+        #   이미 노화가 진행된 세이브(스냅샷 없음)는 '현재 _max'를 전성기로 간주해
+        #   그 시점부터 floor 를 적용한다(소급 적용 안 함, 안전).
+        peak_snapshot = {}
+        raw = p.get("aging_peak_max", "")
+        if raw:
+            try:
+                peak_snapshot = json.loads(raw)
+            except Exception:
+                peak_snapshot = {}
+        if not peak_snapshot:
+            peak_snapshot = {s: p.get(f"{s}_max", 80) for s in ALL_STATS}
+            stat_updates["aging_peak_max"] = json.dumps(peak_snapshot)
+
         for stat in ALL_STATS:
             mk = f"{stat}_max"
-            old_mx = p.get(mk,80)
-            new_mx = max(20, old_mx - random.randint(0, decay))
+            old_mx = p.get(mk, 80)
+            # 전성기 _max 대비 floor (등급별). 이 밑으론 노화로 안 떨어짐.
+            peak_mx = peak_snapshot.get(stat, old_mx)
+            floor_mx = int(round(peak_mx * floor_ratio))
+            # 이번 시즌 실제 감소량: decay * 등급배수, 0~상한 사이 랜덤.
+            #   tier_mult<1 이면 평균 감소가 줄어 노화가 느려진다.
+            max_drop = max(0, int(round(decay * tier_mult)))
+            drop = random.randint(0, max_drop) if max_drop > 0 else 0
+            new_mx = max(floor_mx, old_mx - drop)
             stat_updates[mk] = new_mx
-            if p.get(stat,40) > new_mx:
+            if p.get(stat, 40) > new_mx:
                 stat_updates[stat] = new_mx
 
     # 4. 시즌 통계 초기화

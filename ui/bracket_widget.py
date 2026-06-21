@@ -47,8 +47,8 @@ _C_STAGE     = QColor("#aaaaaa")   # 라운드 제목
 
 class BracketWidget(QWidget):
     # 레이아웃 상수
-    BOX_W      = 168      # 경기 박스 너비
-    SLOT_H     = 26       # 한 칸(팀 한 줄) 높이
+    BOX_W      = 176      # 경기 박스 너비
+    SLOT_H     = 38       # 한 칸(팀 한 줄) 높이 — 팀명+국가명 2줄 표기용
     MATCH_H    = SLOT_H * 2          # 경기 박스 높이(홈+원정)
     V_GAP_MIN  = 22       # 같은 라운드 경기 사이 최소 세로 간격
     COL_GAP    = 56       # 라운드(컬럼) 사이 가로 간격
@@ -132,6 +132,8 @@ class BracketWidget(QWidget):
         f_team  = QFont(); f_team.setPointSize(9)
         f_stage = QFont(); f_stage.setPointSize(9); f_stage.setBold(True)
         f_score = QFont(); f_score.setPointSize(9); f_score.setBold(True)
+        f_country = QFont(); f_country.setPointSize(10)   # 국가명(아랫줄)용 작은 폰트
+        self._f_country = f_country
 
         # 1) 연결선 먼저 (박스 뒤에 깔리게)
         qp.setPen(QPen(_C_LINE, 1.4))
@@ -210,15 +212,44 @@ class BracketWidget(QWidget):
             else:
                 col = _C_TEXT
 
-            # 팀명 (말줄임)
-            qp.setFont(f_team)
-            qp.setPen(col)
-            label = f"{flag}{name}"
-            fm = QFontMetrics(f_team)
+            # 팀명 + 국가명 2줄 표기.
+            #   name 형식: "팀명 (국가명)" → 윗줄=국기+팀명, 아랫줄=(국가명)
+            #   국가명이 길어 옆으로 잘리던 문제를 줄바꿈으로 해결한다.
+            country = ""
+            team_only = name
+            if name.endswith(")") and " (" in name:
+                base, _, ctry = name.rpartition(" (")
+                team_only = base
+                country = ctry[:-1]   # 끝 ')' 제거
+
             avail = self.BOX_W - name_pad - score_w
-            label = fm.elidedText(label, Qt.TextElideMode.ElideRight, avail)
-            qp.drawText(QRectF(x + name_pad, ry, avail, self.SLOT_H),
-                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, label)
+            fm = QFontMetrics(f_team)
+
+            if country:
+                # 윗줄: 국기+팀명 (위쪽 절반), 아랫줄: 국가명 (작고 흐리게)
+                line1 = fm.elidedText(f"{flag}{team_only}",
+                                      Qt.TextElideMode.ElideRight, avail)
+                qp.setFont(f_team)
+                qp.setPen(col)
+                qp.drawText(QRectF(x + name_pad, ry + 2, avail, self.SLOT_H / 2),
+                            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, line1)
+
+                fm2 = QFontMetrics(self._f_country)
+                line2 = fm2.elidedText(f"({country})",
+                                       Qt.TextElideMode.ElideRight, avail)
+                qp.setFont(self._f_country)
+                qp.setPen(_C_DIM)
+                qp.drawText(QRectF(x + name_pad, ry + self.SLOT_H / 2 - 2,
+                                   avail, self.SLOT_H / 2),
+                            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, line2)
+            else:
+                # 국가명 없으면 기존처럼 한 줄 중앙 정렬
+                qp.setFont(f_team)
+                qp.setPen(col)
+                label = fm.elidedText(f"{flag}{name}",
+                                      Qt.TextElideMode.ElideRight, avail)
+                qp.drawText(QRectF(x + name_pad, ry, avail, self.SLOT_H),
+                            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, label)
 
             # 스코어
             if played:
