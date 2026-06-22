@@ -434,8 +434,14 @@ def _find_open_entry(c, tid, team_name):
         (team_name,)).fetchone()
 
 
-def _calc_clean_sheets(c, tid, season):
-    """해당 시즌 소속 팀의 클린시트(무실점 경기) 수 집계."""
+def _calc_clean_sheets(c, tid, season, matches=None):
+    """해당 시즌 소속 팀의 클린시트(무실점 경기) 수 집계.
+    matches: 그 팀에서 선수가 실제 출전한 경기 수. 주어지면 이를 상한으로 적용한다.
+      (버그수정) 기존엔 출전 0인 신규 이적팀도 그 팀이 시즌 전체에 쌓은
+      무실점 경기 수를 그대로 반환해, 0출전인데 무실점 5가 찍혔다.
+      선수가 안 뛴 경기의 무실점은 그 선수 기록이 아니므로 출전수로 캡한다."""
+    if matches is not None and matches <= 0:
+        return 0
     row = c.execute("SELECT league_id FROM teams WHERE id=?", (tid,)).fetchone()
     if not row:
         return 0
@@ -445,7 +451,10 @@ def _calc_clean_sheets(c, tid, season):
            AND ((home_team_id=? AND away_score=0)
              OR (away_team_id=? AND home_score=0))""",
         (row["league_id"], season, tid, tid)).fetchone()
-    return q["cnt"] if q else 0
+    cs = q["cnt"] if q else 0
+    if matches is not None:
+        cs = min(cs, matches)
+    return cs
 
 
 def _update_career_stats(p, year, week):
@@ -500,7 +509,7 @@ def _update_career_stats(p, year, week):
                 elif as_ == hs: td += 1
                 else: tl += 1
 
-    cs = _calc_clean_sheets(c, tid, season)
+    cs = _calc_clean_sheets(c, tid, season, matches=sm)
 
     c.execute("""UPDATE career_entries SET
         matches=?, goals=?, assists=?, saves=?, goals_against=?,
@@ -573,7 +582,7 @@ def _close_career_entry(p, year, week, exit_type=""):
                 elif as_ == hs: td += 1
                 else: tl += 1
 
-    cs = _calc_clean_sheets(c, tid, season)
+    cs = _calc_clean_sheets(c, tid, season, matches=sm)
 
     c.execute("""UPDATE career_entries SET
         end_year=?, end_week=?, matches=?, goals=?, assists=?, saves=?, goals_against=?,
@@ -1807,20 +1816,23 @@ def _player_perf(p, outcome, is_home, hs, as_):
         spd = _stat_n(p, "speed")
 
         # 포지션군별 활동량 계수 (공격가담/수비가담 성향)
+        #   ※ blk_w(차단 계수)는 현실 범위에 맞춰 하향 조정했다.
+        #     기존엔 평균 CB가 14경기 ~56회로 과다 → 표(EPL CB 평균 18~28,
+        #     월클 29~42회)에 맞게 약 0.55배로 축소. 평균 CB 경기당 ~1.5회.
         if pos in ("ST", "CF"):
-            shot_w, key_w, drb_w, blk_w = 3.2, 1.0, 1.4, 0.3
+            shot_w, key_w, drb_w, blk_w = 3.2, 1.0, 1.4, 0.18
         elif pos in ("LW", "RW"):
-            shot_w, key_w, drb_w, blk_w = 2.4, 1.6, 2.6, 0.5
+            shot_w, key_w, drb_w, blk_w = 2.4, 1.6, 2.6, 0.30
         elif pos == "CAM":
-            shot_w, key_w, drb_w, blk_w = 1.8, 2.6, 1.8, 0.7
+            shot_w, key_w, drb_w, blk_w = 1.8, 2.6, 1.8, 0.42
         elif pos == "CM":
-            shot_w, key_w, drb_w, blk_w = 1.2, 2.0, 1.2, 1.6
+            shot_w, key_w, drb_w, blk_w = 1.2, 2.0, 1.2, 0.95
         elif pos == "CDM":
-            shot_w, key_w, drb_w, blk_w = 0.6, 1.2, 0.8, 2.8
+            shot_w, key_w, drb_w, blk_w = 0.6, 1.2, 0.8, 1.65
         elif pos in ("LB", "RB"):
-            shot_w, key_w, drb_w, blk_w = 0.5, 1.3, 1.2, 2.4
+            shot_w, key_w, drb_w, blk_w = 0.5, 1.3, 1.2, 1.40
         else:  # CB
-            shot_w, key_w, drb_w, blk_w = 0.3, 0.5, 0.4, 3.0
+            shot_w, key_w, drb_w, blk_w = 0.3, 0.5, 0.4, 1.70
 
         # 슈팅: 슈팅·포지셔닝 스탯 × 공격성향 × dom. 유효슈팅은 그중 일부(결정력=shooting).
         shots = int(round(shot_w * (0.4 + 0.6 * sh) * dom + random.uniform(0, 1)))
@@ -1834,17 +1846,25 @@ def _player_perf(p, outcome, is_home, hs, as_):
         # 드리블 성공: 드리블·스피드 × 성향 × dom
         dribbles = int(round(drb_w * (0.4 + 0.45 * dr + 0.15 * spd) * dom + random.uniform(0, 1)))
         dribbles = max(0, dribbles)
-        # 차단(태클+인터셉트): 태클·포지셔닝 × 수비성향. 약체 상대(dom↑)일수록 상대 공격이
-        #   적어 차단 기회도 줄므로 dom 역방향(2-dom) 가중.
         # 차단(태클+인터셉트): 태클·포지셔닝 × 수비성향. 약체 상대(dom↑)면 상대 공격이
         #   적어 차단 기회도 다소 줄지만(완만한 역방향), 수비수의 기본 활동량이 핵심.
+        #   ※ 재조정: 상수항을 줄이고(0~1.2→0~0.5) 스탯 의존도를 키워,
+        #     평균이 현실 범위(CB 14경기 18~28회)로 내려가고 잘함/못함 격차가
+        #     제대로 벌어지도록 했다. 못하는 CB는 ~14회, 월클은 ~38회 수준.
         _blk_dom = 1.25 - 0.25 * min(1.4, dom)   # dom 1.0→1.0, 강팀일수록 소폭↓
-        blocks = int(round(blk_w * (0.7 + 0.6 * ta + 0.3 * po) * _blk_dom
-                           + random.uniform(0, 1.2)))
+        blocks = int(round(blk_w * (0.30 + 0.90 * ta + 0.45 * po) * _blk_dom
+                           + random.uniform(0, 0.5)))
         blocks = max(0, blocks)
-        # 패스 성공률: 패스 스탯 기반 (수비/미드일수록 안정적, 공격수는 약간 낮음)
+        # 패스 성공률: 개인 패스 스탯 + 리그 수준 보정.
+        #   리그 평균 OVR(_lg_avg)이 높을수록(빅리그) 팀 전체 빌드업 안정성↑ →
+        #   같은 패스 스탯이라도 EPL은 높고, 약소국 리그는 낮게 나온다.
+        #   기준점 78(빅리그 1부) → 보정 0. 평균 55(약소국)면 약 -7%p.
+        #   (표: EPL 평균 82~88%, 필리핀 평균 72~78%, K리그 평균 77~84%)
+        _lg_pass_adj = max(-0.09, min(0.02, (_lg_avg - 78.0) * 0.004))
         _pa_floor = 0.72 if pos in ("CB","LB","RB","CDM","CM") else 0.66
-        pass_acc = min(0.97, _pa_floor + 0.22 * pa + random.uniform(-0.03, 0.03))
+        pass_acc = _pa_floor + 0.16 * pa + 0.04 * (dom - 1.0) + _lg_pass_adj \
+                   + random.uniform(-0.025, 0.025)
+        pass_acc = max(0.55, min(0.96, pass_acc))
 
         detail["shots"]      = shots
         detail["shots_on"]   = shots_on
@@ -2479,7 +2499,7 @@ def _calc_clean_sheets_for_player(p):
     conn = get_conn(); c = conn.cursor()
     try:
         season = p.get("current_season", 1)
-        return _calc_clean_sheets(c, tid, season)
+        return _calc_clean_sheets(c, tid, season, matches=p.get("season_matches", 0))
     except Exception:
         return 0
     finally:
@@ -2865,7 +2885,7 @@ def _end_of_season(p, year):
     #    방출/이적을 먼저 처리하면 current_team_id=0이 되어, 리그 1위를 하고도
     #    "내 팀 아님"으로 판정돼 우승·승격 기록이 통째로 누락된다. (순서 버그 수정)
     _sim_all_leagues_for_season_end(p.get("current_season", 1))
-    _process_promotion_relegation(year)
+    _process_promotion_relegation(year, season_avg_rating)
 
     # 6. 강제 방출 체크 (이슈8 강화) — 우승 판정이 끝난 뒤에 처리
     p = get_player() or p   # 승강으로 리그/연봉이 바뀌었을 수 있으니 최신화
@@ -3120,7 +3140,7 @@ def _try_sell_player(p, year, cur_ovr):
     return True
 
 
-def _process_promotion_relegation(year):
+def _process_promotion_relegation(year, season_avg_rating=6.0):
     conn = get_conn()
     c = conn.cursor()
 
@@ -3396,8 +3416,17 @@ def _process_promotion_relegation(year):
             new_tier = new_tier_row["tier"] if new_tier_row else 3
             old_tier = old_tier_row["tier"] if old_tier_row else 3
             if new_tier < old_tier:   # 승격
-                new_sal = int(old_sal * 1.20)
-                add_log(f"💰 승격 연봉 인상! {fmt_money(old_sal)} → {fmt_money(new_sal)} (+20%)", "event", year, 52)
+                # 시즌 평균평점에 따라 1.5~2.0배 인상.
+                #   잘했을수록(평점 높을수록) 더 큰 폭으로 오른다.
+                #   부진해도 승격 자체로 최소 1.5배는 보장(상위 리그 부유도 반영).
+                if   season_avg_rating >= 7.5: mult = 2.00   # 시즌 MVP급
+                elif season_avg_rating >= 7.0: mult = 1.85   # 매우 우수
+                elif season_avg_rating >= 6.5: mult = 1.65   # 준수
+                else:                          mult = 1.50   # 평범~부진 (하한)
+                new_sal = int(old_sal * mult)
+                _pct = int(round((mult - 1) * 100))
+                add_log(f"💰 승격 연봉 인상! {fmt_money(old_sal)} → {fmt_money(new_sal)} "
+                        f"(+{_pct}%, 평균평점 {season_avg_rating:.2f})", "event", year, 52)
             elif new_tier > old_tier:  # 강등
                 new_sal = int(old_sal * 0.80)
                 add_log(f"💸 강등 연봉 삭감. {fmt_money(old_sal)} → {fmt_money(new_sal)} (-20%)", "event", year, 52)
@@ -4168,7 +4197,7 @@ def _save_career_entry(p, year, week, force_new=False, transfer_type=None,
                 elif as_ == hs: td += 1
                 else: tl += 1
     pos = p.get("position", "")
-    cs  = _calc_clean_sheets(c, tid, season)
+    cs  = _calc_clean_sheets(c, tid, season, matches=sm)
 
     # end_year=0인 열린 항목 찾기 (team_id 우선, 구버전 행은 이름 폴백)
     existing = _find_open_entry(c, tid, team_row["name"])
@@ -4284,9 +4313,16 @@ def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None
         exit_t = "계약만료" if (prev_end and prev_end <= cur_year) else "이적"
         _save_career_entry(p, cur_year, cur_week, force_new=True, exit_type=exit_t)
         # 새 팀 스탯 초기화
+        #   (버그수정) 기존엔 기본 스탯만 리셋해 season_blocks/pass_acc/key_passes/
+        #   dribbles/shots 등 '세부 통계'가 이전 팀에서 그대로 이월됐다.
+        #   → 0출전 신규 팀인데 차단 31·패스 83% 가 찍히는 원인. 시즌말 리셋과
+        #     동일한 필드 전체를 함께 0으로 초기화한다.
         update_player(season_matches=0, season_goals=0, season_assists=0,
                       season_saves=0, season_rating_sum=0.0, season_rating_cnt=0,
-                      season_goals_against=0)
+                      season_goals_against=0,
+                      season_shots=0, season_shots_on=0, season_key_passes=0,
+                      season_dribbles=0, season_blocks=0,
+                      season_pass_acc_sum=0, season_pass_acc_cnt=0)
         # [에이전트 익스플로잇 차단] 이적 시 개별 협상 수수료(agent_fee_rate)를
         #   리셋한다. 예전엔 약소국·저연봉 시절 헐값에 잡은 낮은 수수료율이
         #   이적 후 폭등한 연봉에도 평생 고정 적용됐다. 이제 이적하면 그 특혜가

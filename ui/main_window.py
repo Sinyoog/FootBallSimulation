@@ -164,6 +164,27 @@ class MainWindow(QMainWindow):
         self.player_panel.refresh()
         self.center_panel.refresh()
         self.log_panel.refresh()
+        # 진행(NEXT DAY) 직후 열려 있는 보조 창들을 함께 갱신한다.
+        #   - 경기 일정 창 / 순위표 창 둘 다. 1주씩·4주씩 모드 모두 이 메서드를
+        #     거치므로 모드와 무관하게 즉시 최신 상태가 된다.
+        #   - 창이 닫혔거나 파괴됐으면 조용히 건너뛴다(비용 0).
+        self._refresh_aux_window("_schedule_win")
+        self._refresh_aux_window("_standings_win")
+
+    def _refresh_aux_window(self, attr):
+        """center_panel 에 보관된 보조 창(attr) 이 열려 있으면 refresh() 한다.
+        닫힘/파괴된 창이면 핸들을 비워 둔다."""
+        win = getattr(self.center_panel, attr, None)
+        if win is None:
+            return
+        try:
+            if win.isVisible():
+                win.refresh()
+        except RuntimeError:
+            # 닫기/파괴된 QDialog 접근 → 핸들 정리
+            setattr(self.center_panel, attr, None)
+        except Exception:
+            pass
 
     def _nationality_html(self, p):
         """국적 표시 HTML. 본 국적(국제경기 출전국=intl_committed, 없으면 1국적)을

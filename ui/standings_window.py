@@ -57,15 +57,26 @@ class StandingsWindow(QDialog):
         self._lay.addWidget(btn)
 
     def refresh(self):
-        # 내 팀 실제 리그 재조회
+        # 내 팀의 '현재' 소속 리그와 팀 ID를 재조회한다.
+        #   - 이적: current_team_id 가 바뀜 → my_team_id 갱신(하이라이트 정확)
+        #   - 승강: 같은 팀이라도 소속 league_id 가 바뀜 → league_id 갱신
         p = get_player()
         if p and p.get("current_team_id"):
+            tid = p["current_team_id"]
+            self.my_team_id = tid
             conn = get_conn()
             row = conn.execute(
-                "SELECT l.id FROM teams t JOIN leagues l ON t.league_id=l.id WHERE t.id=?",
-                (p["current_team_id"],)).fetchone()
+                "SELECT l.id AS lid, l.name AS lname, l.tier AS tier "
+                "FROM teams t JOIN leagues l ON t.league_id=l.id WHERE t.id=?",
+                (tid,)).fetchone()
             conn.close()
-            if row: self.league_id = row["id"]
+            if row:
+                self.league_id = row["lid"]
+                # 리그가 바뀌었으면 제목도 갱신(예: 2부→1부 승격)
+                new_name = f"{row['lname']} ({row['tier']}부)"
+                if new_name != self._lname:
+                    self._lname = new_name
+                    self._lbl.setText(f"📊 {self._lname}")
         self._fill_table()
 
     def _fill_table(self):

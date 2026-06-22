@@ -149,7 +149,11 @@ class ScheduleWindow(QDialog):
 
         from PyQt6.QtWidgets import QScrollArea, QFrame
         p   = get_player()
-        nat = p.get("nationality", "") if p else ""
+        # [복수국적 버그수정] 조별표 '내 국가' 강조는 출생/주국적(nationality)이 아니라
+        #   '이 대회에서 대표로 뛰는 국적'(tournament.my_nat) 기준이어야 한다.
+        #   예: 출생 몽골 → 필리핀 대표 출전 시 필리핀 행이 파란색으로 떠야 한다.
+        #   엔진의 검증된 헬퍼 사용(my_nat 우선, 빈 옛 세이브는 주국적 폴백).
+        nat = intl_engine._my_nat(t, p)
 
         outer = QScrollArea(); outer.setWidgetResizable(True)
         outer.setStyleSheet("QScrollArea{border:none;background:#1e1e1e;}")

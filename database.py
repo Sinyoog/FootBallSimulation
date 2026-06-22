@@ -345,6 +345,17 @@ def init_db():
         #  계산의 기준값. 노화가 처음 시작될 때 1회 기록되며 이후 불변.
         #  ''(빈값)이면 아직 스냅샷 전(전성기 이전).
         "ALTER TABLE my_player ADD COLUMN aging_peak_max TEXT DEFAULT ''",
+        # [UI 진행 상태 영속화] 메인 화면의 1주/4주 모드, 진행 중인 묶음 위치,
+        #  고정된 4주 일정, 4개 콤보(훈련) 선택값을 세이브에 저장한다.
+        #  → 나갔다 들어와도 화면이 그대로 복원되어 일정/모드가 어긋나지 않음.
+        #  step_mode   : 0=4주씩, 1=1주씩
+        #  step_idx    : 1주씩 모드에서 현재 묶음 진행 위치(0~3)
+        #  locked_sched: 1주씩 진행 중 고정된 4주 일정 JSON (없으면 '')
+        #  week_combos : 4개 주차 콤보의 선택값 JSON 리스트 (없으면 '')
+        "ALTER TABLE season_state ADD COLUMN step_mode INTEGER DEFAULT 0",
+        "ALTER TABLE season_state ADD COLUMN step_idx INTEGER DEFAULT 0",
+        "ALTER TABLE season_state ADD COLUMN locked_sched TEXT DEFAULT ''",
+        "ALTER TABLE season_state ADD COLUMN week_combos TEXT DEFAULT ''",
     ]:
         try: c.execute(migration)
         except: pass

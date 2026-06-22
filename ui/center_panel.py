@@ -2,6 +2,7 @@
 ui/center_panel.py  ─  가운데 메인 패널
 """
 import random
+import json
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QComboBox, QFrame, QMessageBox,
@@ -11,7 +12,7 @@ from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve
 from PyQt6.QtGui import QColor
 
 from game_engine import (
-    get_player, get_state, advance_4weeks,
+    get_player, get_state, set_state, advance_4weeks,
     generate_offers, join_team, get_league_standings,
     get_schedule, fmt_money
 )
@@ -111,7 +112,10 @@ class CenterPanel(QWidget):
         self._step_mode    = False
         self._locked_sched = None
         self._step_idx     = 0
+        self._restoring    = False   # 복원 중 콤보 시그널이 저장을 되부르는 것 방지
         self._build()
+        # 세이브에 저장된 메인 화면 상태(모드/묶음/콤보)를 복원한다.
+        self._restore_ui_state()
 
     # ── 빌드 ─────────────────────────────────────
 
@@ -245,6 +249,100 @@ class CenterPanel(QWidget):
 
     # ── 갱신 ─────────────────────────────────────
 
+    def _save_ui_state(self):
+        """메인 화면의 진행 상태(모드/묶음/콤보 일정)를 세이브에 영속화한다.
+        상태가 바뀌는 모든 지점(모드 토글·콤보 변경·진행)에서 호출한다.
+        복원 도중(_restoring)에는 저장을 건너뛴다(자기 자신을 되부르지 않게)."""
+        if getattr(self, "_restoring", False):
+            return
+        try:
+            combos = [cb.currentText() for cb in self.week_combos]
+        except Exception:
+            combos = []
+        # locked_sched 직렬화: 각 항목은 (week, type, match_info).
+        #   match_info(dict/Row)는 진행 시점에 _get_match 로 다시 조회하면 되므로
+        #   저장하지 않는다(직렬화 깨짐 방지). 주차·훈련타입만 보존한다.
+        locked = ""
+        if self._locked_sched is not None:
+            try:
+                slim = []
+                for item in self._locked_sched:
+                    w, ttype = item[0], item[1]
+                    slim.append([w, ttype])
+                locked = json.dumps(slim, ensure_ascii=False)
+            except Exception:
+                locked = ""
+        try:
+            set_state(
+                step_mode    = 1 if self._step_mode else 0,
+                step_idx     = int(self._step_idx),
+                locked_sched = locked,
+                week_combos  = json.dumps(combos, ensure_ascii=False),
+            )
+        except Exception:
+            # season_state 컬럼이 아직 없는 구버전 등 — 저장 실패해도 게임은 계속.
+            pass
+
+    def _restore_ui_state(self):
+        """세이브에 저장된 진행 상태를 위젯에 복원한다(__init__ 빌드 직후 1회).
+        저장된 값이 없으면(신규/구버전 세이브) 안전한 기본값으로 둔다."""
+        self._restoring = True
+        try:
+            st = get_state() or {}
+
+            # 1) 콤보(훈련 선택) 복원
+            combos_raw = st.get("week_combos") or ""
+            if combos_raw:
+                try:
+                    combos = json.loads(combos_raw)
+                    for i, cb in enumerate(self.week_combos):
+                        if i < len(combos) and combos[i] in TRAIN_OPTS_KO:
+                            cb.setCurrentText(combos[i])
+                except Exception:
+                    pass
+
+            # 2) 모드 복원
+            self._step_mode = bool(st.get("step_mode", 0))
+
+            # 3) 묶음 진행 위치 / 고정 일정 복원
+            locked_raw = st.get("locked_sched") or ""
+            if self._step_mode and locked_raw:
+                try:
+                    slim = json.loads(locked_raw)   # [[week, ttype], ...] 4개
+                    if isinstance(slim, list) and len(slim) == 4:
+                        from game_engine import get_player
+                        p = get_player() or {}
+                        rebuilt = []
+                        for w, ttype in slim:
+                            mi = (self._get_match(w, p)
+                                  if p.get("current_team_id") else None)
+                            if mi:
+                                rebuilt.append((w, "경기", mi))
+                            else:
+                                rebuilt.append((w, ttype, None))
+                        self._locked_sched = rebuilt
+                        idx = int(st.get("step_idx", 0))
+                        self._step_idx = max(0, min(idx, 3))
+                    else:
+                        self._locked_sched = None
+                        self._step_idx     = 0
+                except Exception:
+                    self._locked_sched = None
+                    self._step_idx     = 0
+            else:
+                # 4주 모드이거나 진행 중 묶음이 없음 → 깨끗한 시작 상태
+                self._locked_sched = None
+                self._step_idx     = 0
+
+            # 토글 버튼 라벨/체크 상태를 복원된 모드에 맞춘다.
+            try:
+                self.btn_mode.setChecked(self._step_mode)
+                self.btn_mode.setText("📆 1주씩" if self._step_mode else "📅 4주씩")
+            except Exception:
+                pass
+        finally:
+            self._restoring = False
+
     def _set_glow(self, frame, on):
         """주차 프레임의 형광 발광 효과 on/off + 테두리 강조."""
         glow = getattr(frame, "_glow", None)
@@ -280,10 +378,13 @@ class CenterPanel(QWidget):
         season = st["current_season"]
         lang   = p.get("language","ko")
 
-        # 1주씩 모드인데 묶음 일정이 없으면(로드 직후 등) 현재 주차 기준으로 정렬.
-        # 묶음 시작은 항상 4주 경계(1,5,9…)이므로 idx = (week-1) % 4.
+        # 1주씩 모드인데 고정된 묶음 일정이 없으면 '묶음 시작 전' 상태다.
+        #   (예전엔 (week-1)%4 로 위치를 추측했으나, 국제대회/강제진행 등으로
+        #    4주 경계가 깨지면 엉뚱한 묶음으로 잘못 복원돼 일정이 어긋났다.
+        #    이제 진행 상태는 _save/_restore_ui_state 로 정확히 영속화하므로,
+        #    일정이 없으면 추측하지 말고 깨끗한 시작(idx=0)으로 둔다.)
         if self._step_mode and self._locked_sched is None:
-            self._step_idx = (week - 1) % 4
+            self._step_idx = 0
 
         # 표시 기준 묶음 시작 주차 = 현재주 - 진행한 주수
         bundle_start = week - self._step_idx if self._step_mode else week
@@ -464,6 +565,9 @@ class CenterPanel(QWidget):
         else:
             self.lbl_pv_happy.setText("예상 행복도: +0")
 
+        # 콤보(훈련 선택)가 바뀌었으니 세이브에 반영.
+        self._save_ui_state()
+
     # ── 모드 토글 ────────────────────────────────
 
     def _toggle_mode(self):
@@ -484,6 +588,7 @@ class CenterPanel(QWidget):
             self._locked_sched = None
             self._step_idx     = 0
             show_toast(self, "📅 4주씩 보기  —  한 달씩 진행", "#006622", 1400)
+        self._save_ui_state()   # 모드 전환 결과를 세이브에 반영
         self.refresh()
 
     # ── 진행 ─────────────────────────────────────
@@ -541,11 +646,27 @@ class CenterPanel(QWidget):
             # 4주 한 번에
             schedule = _build_4week_sched()
         else:
-            # 1주씩: 묶음 시작이면 4주 일정 확정·고정
-            if self._step_idx == 0:
-                self._locked_sched = _build_4week_sched()
-            # 고정된 일정에서 이번 주 한 개만 꺼냄
-            schedule = [self._locked_sched[self._step_idx]]
+            # 1주씩: 묶음 시작이면 4주 일정 확정·고정.
+            #   _step_idx 가 0이 아니어도 _locked_sched 가 비어 있으면(예: 화면
+            #   갱신 시 (week-1)%4 로 재계산됐는데 일정은 미생성) 새로 만든다.
+            #   그리고 묶음의 시작 주(week - _step_idx)부터 만들어야 인덱스가 맞음.
+            if self._locked_sched is None:
+                bundle_start = week - self._step_idx
+                sched = []
+                for i in range(4):
+                    cb    = self.week_combos[i]
+                    w     = bundle_start + i
+                    sel   = cb.currentText()
+                    ttype = TRAIN_MAP_KO.get(sel, "중강도")
+                    mi = self._get_match(w, p)
+                    if mi:
+                        sched.append((w, "경기", mi))
+                    else:
+                        sched.append((w, ttype, None))
+                self._locked_sched = sched
+            # 인덱스 안전 클램프 (혹시라도 범위를 벗어나면 마지막 주로)
+            idx = max(0, min(self._step_idx, len(self._locked_sched) - 1))
+            schedule = [self._locked_sched[idx]]
 
         advance_4weeks(schedule)
 
@@ -559,6 +680,10 @@ class CenterPanel(QWidget):
 
         # 묶음(4주)이 완전히 끝났는가? (4주 모드는 항상 True)
         bundle_done = (not self._step_mode) or (self._step_idx == 0)
+
+        # 진행으로 바뀐 묶음 위치/고정 일정을 세이브에 반영.
+        #   (advance_4weeks 가 current_week 등을 이미 갱신한 뒤이므로 충돌 없음)
+        self._save_ui_state()
 
         # 입단 플래그는 묶음 완료 시에만 초기화
         if bundle_done:
@@ -1038,6 +1163,11 @@ class CenterPanel(QWidget):
         from ui.standings_window import StandingsWindow
         self._standings_win = StandingsWindow(lid, p.get("current_team_id", 0),
                                               p.get("language", "ko"), self)
+        # 창이 닫히면 핸들을 비워 둔다(진행 시 refresh_all 이 죽은 위젯을
+        # 건드리지 않도록). 다시 열면 새로 만든다.
+        def _clear_standings(*_a):
+            self._standings_win = None
+        self._standings_win.finished.connect(_clear_standings)
         self._standings_win.show()
 
     def _do_schedule(self):
@@ -1055,6 +1185,11 @@ class CenterPanel(QWidget):
         from ui.schedule_window import ScheduleWindow
         self._schedule_win = ScheduleWindow(lid, p.get("current_team_id", 0),
                                             st["current_season"], p.get("language", "ko"), self)
+        # 창이 닫히면 핸들을 비워 둔다(진행 시 refresh_all 이 죽은 위젯을
+        # 건드리지 않도록). 다시 열면 _do_schedule 이 새로 만든다.
+        def _clear_handle(*_a):
+            self._schedule_win = None
+        self._schedule_win.finished.connect(_clear_handle)
         self._schedule_win.show()
 
     def _do_agent(self):
