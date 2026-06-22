@@ -109,21 +109,26 @@ class CountryPickerDialog(QDialog):
     리그가 있는 '실제' 국가만 노출한다(이름만 있는 국가 제외).
     """
     COLS = 4
+    # 필터에 노출할 대륙 순서 (리그 보유 국가 기준 6개)
+    CONTINENTS = ["유럽", "남미", "아프리카", "아시아", "북미", "오세아니아"]
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("국가 선택")
-        self.setMinimumSize(560, 480)
+        # 4열 국가 버튼(고정폭)이 가로로 안 잘리도록 창 너비를 넉넉히.
+        self.setMinimumSize(740, 540)
         self.setStyleSheet(DARK_STYLE)
         self.selected = None          # (name, flag) | None(=랜덤)
+        self._active_continents = set()   # 활성화된 대륙들(복수 선택). 비어있으면 '전체'
+        self._cont_buttons = {}           # 대륙명 -> QPushButton (형광 토글용)
         self._all = self._load_countries()
         self._build()
 
     def _load_countries(self):
-        """리그가 있는 국가만 (grade 높은 순 → 이름 순)."""
+        """리그가 있는 국가만 (grade 높은 순 → 이름 순). 대륙 정보 포함."""
         conn = get_conn()
         rows = conn.execute(
-            """SELECT name, flag, grade FROM countries
+            """SELECT name, flag, grade, continent FROM countries
                WHERE id IN (SELECT DISTINCT country_id FROM leagues)
                ORDER BY
                  CASE grade WHEN 'S' THEN 0 WHEN 'A' THEN 1 WHEN 'B' THEN 2
@@ -131,7 +136,7 @@ class CountryPickerDialog(QDialog):
                             ELSE 6 END,
                  name""").fetchall()
         conn.close()
-        return [(r["name"], r["flag"]) for r in rows]
+        return [(r["name"], r["flag"], r["continent"] or "") for r in rows]
 
     def _build(self):
         lay = QVBoxLayout(self)
@@ -148,17 +153,48 @@ class CountryPickerDialog(QDialog):
         self.search = QLineEdit()
         self.search.setPlaceholderText("국가명 검색…  (예: 대한, 브라, 잉글)")
         self.search.textChanged.connect(self._refilter)
+        # 엔터: 현재 검색 결과가 정확히 1개면 그 국가를 자동 선택.
+        self.search.returnPressed.connect(self._on_search_enter)
         lay.addWidget(self.search)
 
-        # 랜덤 선택 버튼 (맨 위 고정)
-        rand = QPushButton("🎲 랜덤 (자동 선택)")
+        # ── 상단 필터 버튼 (4열 × 2줄 = 8개: 랜덤 · 전체 · 대륙6) ──
+        filt_host = QWidget()
+        filt = QGridLayout(filt_host)
+        filt.setSpacing(6)
+        filt.setContentsMargins(0, 0, 0, 0)
+
+        # (0,0) 랜덤 — 즉시 랜덤 자동 선택
+        rand = QPushButton("🎲 랜덤")
         rand.setObjectName("gray")
         rand.clicked.connect(self._pick_random)
-        lay.addWidget(rand)
+        filt.addWidget(rand, 0, 0)
+
+        # (0,1) 전체 — 모든 대륙 해제 + 전체 표시. 기본 활성(형광).
+        self.btn_all = QPushButton("🌐 전체")
+        self.btn_all.setObjectName("gray")
+        self.btn_all.setCheckable(True)
+        self.btn_all.setChecked(True)
+        self.btn_all.clicked.connect(self._select_all)
+        filt.addWidget(self.btn_all, 0, 1)
+
+        # 나머지 6칸: 대륙 버튼 (토글, 복수 선택 가능)
+        #   배치 순서: (0,2)(0,3)(1,0)(1,1)(1,2)(1,3)
+        slots = [(0, 2), (0, 3), (1, 0), (1, 1), (1, 2), (1, 3)]
+        for cont, (r, c) in zip(self.CONTINENTS, slots):
+            b = QPushButton(cont)
+            b.setObjectName("gray")
+            b.setCheckable(True)
+            b.clicked.connect(lambda _checked, name=cont: self._toggle_continent(name))
+            self._cont_buttons[cont] = b
+            filt.addWidget(b, r, c)
+
+        lay.addWidget(filt_host)
+        self._sync_filter_styles()
 
         # 스크롤 가능한 그리드 영역
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scroll.setStyleSheet("QScrollArea { border: 1px solid #444; border-radius: 4px; }")
         self.grid_host = QWidget()
         self.grid = QGridLayout(self.grid_host)
@@ -185,7 +221,16 @@ class CountryPickerDialog(QDialog):
                 w.deleteLater()
 
         q = text.strip()
-        items = [(n, f) for (n, f) in self._all if q in n] if q else self._all
+        conts = self._active_continents   # 비어있으면 전체
+        items = []
+        for (n, f, cont) in self._all:
+            if q and q not in n:
+                continue
+            if conts and cont not in conts:
+                continue
+            items.append((n, f))
+        # 현재 화면에 표시 중인 결과 보관 (엔터 자동선택용)
+        self._filtered = items
 
         if not items:
             empty = QLabel("검색 결과가 없습니다.")
@@ -198,11 +243,51 @@ class CountryPickerDialog(QDialog):
             r, c = divmod(idx, self.COLS)
             btn = QPushButton(f"{flag} {name}")
             btn.setObjectName("gray")
+            # 고정폭: 가장 긴 국가명(11자)+플래그가 안 잘리도록. 가로 스크롤 방지.
+            btn.setMinimumWidth(160)
             btn.setStyleSheet(
                 "QPushButton { text-align: left; padding: 8px 10px; font-size: 12px; }"
                 "QPushButton:hover { background-color: #3a8a3a; }")
             btn.clicked.connect(lambda _, n=name, f=flag: self._pick(n, f))
             self.grid.addWidget(btn, r, c)
+
+    def _on_search_enter(self):
+        # 검색 결과가 정확히 1개일 때만 엔터로 자동 선택한다.
+        #   여러 개거나 0개면 아무 동작도 하지 않음(오선택 방지).
+        items = getattr(self, "_filtered", [])
+        if len(items) == 1:
+            name, flag = items[0]
+            self._pick(name, flag)
+
+    def _toggle_continent(self, name):
+        # 대륙 버튼 토글(복수 선택). 하나라도 켜지면 '전체'는 해제된다.
+        if name in self._active_continents:
+            self._active_continents.discard(name)
+        else:
+            self._active_continents.add(name)
+        self._sync_filter_styles()
+        self._refilter(self.search.text())
+
+    def _select_all(self):
+        # '전체': 모든 대륙 선택 해제 → 전체 국가 표시. 전체만 형광.
+        self._active_continents.clear()
+        self._sync_filter_styles()
+        self._refilter(self.search.text())
+
+    def _sync_filter_styles(self):
+        # 활성 대륙은 형광, 비활성은 회색. 대륙이 하나도 없으면 '전체' 형광.
+        on = ("QPushButton { text-align:center; padding:8px 10px; font-size:12px;"
+              " background-color:#00cc44; color:#10210f; font-weight:bold;"
+              " border:1px solid #00ff55; border-radius:4px; }")
+        off = ("QPushButton { text-align:center; padding:8px 10px; font-size:12px; }"
+               "QPushButton:hover { background-color:#3a8a3a; }")
+        none_active = not self._active_continents
+        self.btn_all.setChecked(none_active)
+        self.btn_all.setStyleSheet(on if none_active else off)
+        for cont, btn in self._cont_buttons.items():
+            active = cont in self._active_continents
+            btn.setChecked(active)
+            btn.setStyleSheet(on if active else off)
 
     def _pick(self, name, flag):
         self.selected = (name, flag)

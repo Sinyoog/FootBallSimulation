@@ -68,10 +68,14 @@ class ScheduleWindow(QDialog):
         if p and p.get("current_team_id"):
             conn = get_conn()
             row = conn.execute(
-                "SELECT l.id FROM teams t JOIN leagues l ON t.league_id=l.id WHERE t.id=?",
+                "SELECT l.id, l.name, l.tier FROM teams t JOIN leagues l ON t.league_id=l.id WHERE t.id=?",
                 (p["current_team_id"],)).fetchone()
             conn.close()
-            if row: self.league_id = row["id"]
+            if row:
+                self.league_id = row["id"]
+                # 좌상단 리그 라벨도 갱신 (승강으로 2부→1부 등 바뀌면 즉시 반영)
+                lname = f"{row['name']} ({row['tier']}부)"
+                self._lbl.setText(f"📅 {lname}")
             self.my_team_id = p["current_team_id"]
         if st: self.season = st["current_season"]
         self._fill_tabs()

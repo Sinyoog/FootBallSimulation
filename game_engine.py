@@ -2564,6 +2564,62 @@ def _collect_league_candidates(c, league_id, exclude_my_team=None):
     return cands, league_avg
 
 
+def _zamora_tally(c, p, year, league_id, lname, live_matches, live_ga):
+    """사모라상 산정용: '같은 시즌·같은 리그'에서 뛴 출전수·실점을 합산한다.
+
+    [규칙] 시즌 중 이적해도, 이적 전후 리그가 같으면(예: 토트넘→첼시 모두
+      프리미어리그) 두 팀의 리그 출전·실점을 한 시즌으로 합쳐서 사모라상을
+      심사한다. 다른 리그로 옮기면(예: 토트넘→레알) 합치지 않는다.
+
+      합산 소스는 career_entries(팀별로 matches·goals_against·league_name·
+      start_year 저장). 현재 팀의 라이브 값(live_matches/live_ga)을 베이스로,
+      같은 해(start_year==year)·같은 리그명(lname)인 '다른 팀(닫힌)' 항목을 더한다.
+
+      ※ GA 폴백: 구버전 데이터는 career_entries.goals_against 가 0으로 누락돼
+        있을 수 있다. matches>0 인데 GA==0 인 GK 항목은 match_results 에서
+        그 팀이 그 시즌 리그에서 먹은 골을 재계산해 보정한다(출전수로 캡).
+
+    반환: (총출전경기, 총실점)
+    """
+    total_m  = int(live_matches or 0)
+    total_ga = int(live_ga or 0)
+    cur_tid  = p.get("current_team_id", 0)
+    try:
+        rows = c.execute(
+            """SELECT team_id, matches, goals_against
+               FROM career_entries
+               WHERE start_year=? AND league_name=? AND team_id<>? AND matches>0""",
+            (year, lname, cur_tid)).fetchall()
+    except Exception:
+        rows = []
+    for r in rows:
+        m  = int(r["matches"] or 0)
+        ga = int(r["goals_against"] or 0)
+        # GA 누락 보정: match_results 에서 해당 팀이 그 리그·시즌에 먹은 골 합
+        if ga == 0 and m > 0:
+            try:
+                q = c.execute(
+                    """SELECT COALESCE(SUM(CASE
+                            WHEN home_team_id=? THEN away_score
+                            WHEN away_team_id=? THEN home_score END),0) AS ga,
+                              COUNT(*) AS gp
+                       FROM match_results
+                       WHERE league_id=? AND home_score>=0
+                         AND (home_team_id=? OR away_team_id=?)""",
+                    (r["team_id"], r["team_id"], league_id,
+                     r["team_id"], r["team_id"])).fetchone()
+                team_ga = int(q["ga"] or 0) if q else 0
+                team_gp = int(q["gp"] or 0) if q else 0
+                # 팀 전체 실점을 선수 출전 경기 비율로 귀속(안 뛴 경기 실점 제외).
+                if team_gp > 0:
+                    ga = round(team_ga * min(m, team_gp) / team_gp)
+            except Exception:
+                ga = 0
+        total_m  += m
+        total_ga += ga
+    return total_m, total_ga
+
+
 def _process_awards(p, year, season_goals, season_assists, season_rating, season_cs, season_goals_against=0):
     """시즌 종료 시 개인 수상 산정. 내 선수 실제 성적 + AI 추정 비교.
 
@@ -2732,14 +2788,20 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
                 my_awards.append(("푸스카스상", f"{season_goals}골, 평점 {season_rating:.1f}"))
 
         # 사모라 상 (최저 실점 골키퍼 — 경기당 평균 실점 최소)
-        # 조건: GK && season_matches >= 20 && 경기당 1.2골 이하
-        season_matches = p.get("season_matches", 0)
-        if p.get("position") == "GK" and season_matches >= 20:
-            my_ga_rate = season_goals_against / season_matches if season_matches > 0 else 999
-            # 대부분의 GK는 경기당 1.3~1.5골 실점, 우수한 GK는 1.0~1.2
-            # 임계값 1.2 이하면 수상 가능
-            if my_ga_rate <= 1.2:
-                my_awards.append(("사모라상", f"경기당 {my_ga_rate:.2f}골 실점 ({season_goals_against}/{season_matches}경기)"))
+        #   조건: GK && (같은 리그 합산) 출전 >= ZAMORA_MIN_MATCHES && 경기당 1.2골 이하
+        #   ※ 시즌 중 같은 리그 안에서 이적하면 두 팀 리그 기록을 합산한다
+        #     (다른 리그로 옮기면 합치지 않음). _zamora_tally 참고.
+        if p.get("position") == "GK":
+            z_matches, z_ga = _zamora_tally(
+                c, p, year, league_id, lname,
+                p.get("season_matches", 0), season_goals_against)
+            if z_matches >= ZAMORA_MIN_MATCHES:
+                my_ga_rate = z_ga / z_matches if z_matches > 0 else 999
+                # 대부분의 GK는 경기당 1.3~1.5골 실점, 우수한 GK는 1.0~1.2.
+                # 임계값 1.2 이하면 수상 가능.
+                if my_ga_rate <= 1.2:
+                    my_awards.append(("사모라상",
+                        f"경기당 {my_ga_rate:.2f}골 실점 ({z_ga}/{z_matches}경기)"))
 
         # 저장 (DB 작업은 이 conn으로 모두 처리)
         for atype, detail in my_awards:
@@ -2823,50 +2885,74 @@ def _end_of_season(p, year):
             update_player(**{stat: min(mx, cur+bonus)})
             add_log(f"🌱 시즌 자연 성장: {STAT_KO.get(stat,stat)}+{bonus}", "event", year, 52)
 
-    # 3. 나이 증가 + 스탯 노화 (재능 등급별 차등 + 하한선)
+    # 3. 나이 증가 + 스탯 노화 (재능 티어 × 나이구간 × 계열 차등)
     new_age = p["age"] + 1
-    decay   = 0
-    for threshold, d in AGING:
-        if new_age >= threshold:
-            decay = d
-
     stat_updates: dict = {"age": new_age, "total_seasons": p.get("total_seasons",0)+1}
 
-    if decay > 0:
-        from constants import AGING_TIER_MULT, AGING_FLOOR_RATIO
+    # 29세부터 노화. 28세 이하는 낙폭 0.
+    if new_age >= 29:
+        from constants import (AGING_DECLINE, AGING_DECLINE_WC_TOP, AGING_WC_TOP_OVR,
+                               AGING_GROUP_WEIGHT, AGING_LIMITED_LATE_MENTAL,
+                               AGING_POS_MULT, AGING_STAT_FLOOR,
+                               PHYSICAL_STATS, TECHNICAL_STATS, MENTAL_STATS)
         tier = p.get("talent_tier", "normal")
-        # 재능 등급별 노화 속도 배수 (월클은 느리게, 무재능은 빠르게)
-        tier_mult = AGING_TIER_MULT.get(tier, 1.0)
-        floor_ratio = AGING_FLOOR_RATIO.get(tier, 0.74)
+        pos  = p.get("position", "CM")
 
-        # [하한선 기준] 전성기 _max 스냅샷. 노화가 처음 시작되는 시즌에 1회 기록.
-        #   이미 노화가 진행된 세이브(스냅샷 없음)는 '현재 _max'를 전성기로 간주해
-        #   그 시점부터 floor 를 적용한다(소급 적용 안 함, 안전).
-        peak_snapshot = {}
-        raw = p.get("aging_peak_max", "")
-        if raw:
-            try:
-                peak_snapshot = json.loads(raw)
-            except Exception:
-                peak_snapshot = {}
-        if not peak_snapshot:
-            peak_snapshot = {s: p.get(f"{s}_max", 80) for s in ALL_STATS}
-            stat_updates["aging_peak_max"] = json.dumps(peak_snapshot)
+        # [티어별 나이구간 연간 OVR 낙폭] 선택.
+        #   worldclass 중 전성기 천장(talent_cap) 98+ 는 더 완만한 wc_top 곡선.
+        if tier == "worldclass" and p.get("talent_cap", p.get("ovr", 0)) >= AGING_WC_TOP_OVR:
+            decline_tbl = AGING_DECLINE_WC_TOP
+        else:
+            decline_tbl = AGING_DECLINE.get(tier, AGING_DECLINE["normal"])
 
-        for stat in ALL_STATS:
-            mk = f"{stat}_max"
-            old_mx = p.get(mk, 80)
-            # 전성기 _max 대비 floor (등급별). 이 밑으론 노화로 안 떨어짐.
-            peak_mx = peak_snapshot.get(stat, old_mx)
-            floor_mx = int(round(peak_mx * floor_ratio))
-            # 이번 시즌 실제 감소량: decay * 등급배수, 0~상한 사이 랜덤.
-            #   tier_mult<1 이면 평균 감소가 줄어 노화가 느려진다.
-            max_drop = max(0, int(round(decay * tier_mult)))
-            drop = random.randint(0, max_drop) if max_drop > 0 else 0
-            new_mx = max(floor_mx, old_mx - drop)
-            stat_updates[mk] = new_mx
-            if p.get(stat, 40) > new_mx:
-                stat_updates[stat] = new_mx
+        # 이번 나이의 '연간 OVR 낙폭(D)' 조회.
+        annual_drop = 0.0
+        for a0, a1, d in decline_tbl:
+            if a0 <= new_age <= a1:
+                annual_drop = d
+                break
+
+        if annual_drop > 0:
+            pos_mult = AGING_POS_MULT.get(pos, 1.0)
+
+            # 계열 비중 정규화: 전체 스탯에 평균 1.0이 되도록.
+            #   (그래야 'OVR 낙폭 D'가 스탯 평균 감소량과 일치)
+            def _group_of(s):
+                if s in PHYSICAL_STATS:  return "physical"
+                if s in TECHNICAL_STATS: return "technical"
+                return "mental"
+
+            # 범부(limited) 노년 예외: 41세+면 멘탈도 일부 깎는다.
+            gw = dict(AGING_GROUP_WEIGHT)
+            if tier == "limited" and new_age >= AGING_LIMITED_LATE_MENTAL["age"]:
+                gw["mental"] = AGING_LIMITED_LATE_MENTAL["weight"]
+
+            avg_w = sum(gw[_group_of(s)] for s in ALL_STATS) / len(ALL_STATS)
+            if avg_w <= 0:
+                avg_w = 1.0
+
+            for stat in ALL_STATS:
+                share = gw[_group_of(stat)] / avg_w      # 멘탈=0 → 안 깎임
+                if share <= 0:
+                    continue
+                # 이번 시즌 이 스탯의 감소량 = D × 계열비중 × 포지션배수 × 랜덤(0.85~1.15)
+                drop = annual_drop * share * pos_mult * random.uniform(0.85, 1.15)
+                if drop <= 0:
+                    continue
+
+                # (a) 현재 스탯 직접 감소 — 훈련으로 다 메우지 못하게(핵심).
+                cur = p.get(stat, 40)
+                new_cur = max(AGING_STAT_FLOOR, round(cur - drop))
+                if new_cur < cur:
+                    stat_updates[stat] = new_cur
+
+                # (b) 천장(_max)도 같은 양만큼 끌어내림(현재값이 다시 차오르는 것 방지).
+                #     단 천장은 현재값 밑으론 안 내려가게(논리 일관).
+                mk = f"{stat}_max"
+                old_mx = p.get(mk, 80)
+                new_mx = max(AGING_STAT_FLOOR, new_cur, round(old_mx - drop))
+                if new_mx < old_mx:
+                    stat_updates[mk] = new_mx
 
     # 4. 시즌 통계 초기화
     stat_updates.update(season_matches=0, season_goals=0, season_assists=0,
@@ -3428,8 +3514,17 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
                 add_log(f"💰 승격 연봉 인상! {fmt_money(old_sal)} → {fmt_money(new_sal)} "
                         f"(+{_pct}%, 평균평점 {season_avg_rating:.2f})", "event", year, 52)
             elif new_tier > old_tier:  # 강등
-                new_sal = int(old_sal * 0.80)
-                add_log(f"💸 강등 연봉 삭감. {fmt_money(old_sal)} → {fmt_money(new_sal)} (-20%)", "event", year, 52)
+                # 시즌 평균평점에 따라 30~60% 삭감.
+                #   부진할수록(평점 낮을수록) 더 크게 깎인다.
+                #   잘했는데 팀 사정으로 강등돼도 최소 30%는 삭감(하위 리그 부유도↓).
+                if   season_avg_rating >= 7.0: cut = 0.30   # 강등권에서도 분전
+                elif season_avg_rating >= 6.5: cut = 0.40   # 준수
+                elif season_avg_rating >= 6.0: cut = 0.50   # 평범
+                else:                          cut = 0.60   # 부진 (최대 삭감)
+                new_sal = int(old_sal * (1 - cut))
+                _pct = int(round(cut * 100))
+                add_log(f"💸 강등 연봉 삭감. {fmt_money(old_sal)} → {fmt_money(new_sal)} "
+                        f"(-{_pct}%, 평균평점 {season_avg_rating:.2f})", "event", year, 52)
             else:
                 new_sal = old_sal
             update_player(current_league_id=my_new_league,
@@ -3541,25 +3636,35 @@ def generate_offers(count=5) -> list:
 
     first_join = (not has_team and age <= 18)
 
-    # 자국 country_id 조회
+    # 자국 country_id + 등급 조회
     my_country_id = None
+    my_country_grade = None
     if nationality:
-        row_c = c.execute("SELECT id FROM countries WHERE name=?", (nationality,)).fetchone()
+        row_c = c.execute("SELECT id, grade FROM countries WHERE name=?", (nationality,)).fetchone()
         if row_c:
             my_country_id = row_c["id"]
+            my_country_grade = row_c["grade"]
+    # 자국 등급별 입단 마진(없으면 기본값)
+    my_join_margin = CLUB_JOIN_MARGIN_BY_GRADE.get(my_country_grade, CLUB_JOIN_MARGIN)
 
     # 자국 팀의 리그 평균 OVR이 내 OVR과 얼마나 차이나는지 확인
     # 차이가 너무 크면 자국 팀이 뜨지 않음 (E/F 등급 약체 리그는 괜찮음)
     def _team_fits_me(team_row) -> bool:
-        """해당 팀의 리그 평균 OVR과 내 OVR 차이가 25 이내면 True."""
+        """팀 평균 OVR 대비 내 OVR 차이가 '그 팀 국가 등급별 마진' 이내면 True.
+           상위 등급(S/A) 리그일수록 마진이 작아(빡빡) 검증된 선수만 입단 가능."""
         c2 = conn.cursor()
         c2.execute("SELECT AVG(ovr) as avg FROM ai_players WHERE team_id=?", (team_row["id"],))
         row = c2.fetchone()
         if not row or not row["avg"]:
             return True
         league_avg = row["avg"]
-        # 팀 평균보다 내가 25 이상 낮으면 현실적으로 입단 불가
-        return (league_avg - ovr) <= 8
+        # team_row 에 grade 가 있으면 등급별 마진, 없으면 기본 마진.
+        try:
+            grade = team_row["grade"]
+        except Exception:
+            grade = None
+        margin = CLUB_JOIN_MARGIN_BY_GRADE.get(grade, CLUB_JOIN_MARGIN)
+        return (league_avg - ovr) <= margin
 
     offers = []
     tried  = 0
@@ -3592,7 +3697,7 @@ def generate_offers(count=5) -> list:
             if not r or r["min_avg"] is None:
                 # 그 티어 자체가 자국에 없거나 선수 데이터 없음 → 후보 아님
                 return False
-            return (r["min_avg"] - ovr) <= 8
+            return (r["min_avg"] - ovr) <= my_join_margin
 
         def _try_domestic(tier, relax=False):
             """자국 특정 티어에서 '수준 맞는' 팀 1개 탐색.
@@ -3608,9 +3713,9 @@ def generate_offers(count=5) -> list:
                 row = c.fetchone()
                 if not row: return False
             else:
-                # 팀 평균 OVR - 내 OVR <= 8 인 팀들 중에서만 무작위 1팀.
+                # 팀 평균 OVR - 내 OVR <= CLUB_JOIN_MARGIN 인 팀들 중 무작위 1팀.
                 #   (_tier_fittable 와 동일 기준으로, 판정-선택 불일치를 없앤다)
-                c.execute("""SELECT t.id,t.name,l.id as lid,l.name as lname,l.tier,
+                c.execute(f"""SELECT t.id,t.name,l.id as lid,l.name as lname,l.tier,
                                     cn.name as country,cn.flag,cn.grade
                              FROM teams t
                              JOIN leagues l ON t.league_id=l.id
@@ -3618,7 +3723,7 @@ def generate_offers(count=5) -> list:
                              JOIN (SELECT team_id, AVG(ovr) AS avg_ovr
                                      FROM ai_players GROUP BY team_id) ta
                                    ON ta.team_id=t.id
-                             WHERE cn.id=? AND l.tier=? AND (ta.avg_ovr - ?) <= 8
+                             WHERE cn.id=? AND l.tier=? AND (ta.avg_ovr - ?) <= {int(my_join_margin)}
                              ORDER BY RANDOM() LIMIT 1""", (my_country_id, tier, ovr))
                 row = c.fetchone()
                 if not row: return False

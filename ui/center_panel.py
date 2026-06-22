@@ -486,9 +486,12 @@ class CenterPanel(QWidget):
         self.btn_join.setEnabled(can_join)
         self.btn_join.setVisible(not has_team)
         self.btn_agent.setEnabled(is_off)
-        # [은퇴] 리그 경기(35주)가 끝나고 우승·수상이 확정 가능한 37~52주에만 허용.
-        #   12주·26~36주 등 리그 진행 중에는 은퇴 불가(우승 누락 방지).
-        can_retire = 37 <= week <= 52
+        # [은퇴] 리그 경기(35주)가 끝나고 우승·수상이 확정 가능한 37~52주,
+        #   그리고 새 시즌 시작 직후이자 계약 연장 거절 타이밍인 1~4주차에 허용.
+        #   - 1~4주: 직전 시즌은 이미 시즌전환(_end_of_season)으로 우승·수상이
+        #     확정됐고, 새 시즌은 아직 경기가 없어 누락 위험이 없다.
+        #   - 12주·26~36주 등 리그 진행 중에는 여전히 은퇴 불가(우승 누락 방지).
+        can_retire = (1 <= week <= 4) or (37 <= week <= 52)
         self.btn_retire.setEnabled(can_retire)
         has_team = bool(p.get("current_team_id"))
         self.btn_standing.setEnabled(has_team)
@@ -1212,9 +1215,9 @@ class CenterPanel(QWidget):
     def _do_retire(self):
         st = get_state()
         week = st["current_week"]
-        # 리그 경기(35주)가 끝나고 우승·수상이 확정 가능한 37~52주에만 은퇴 가능.
-        if not (37 <= week <= 52):
-            show_toast(self, "⚠  은퇴는 리그 종료 후(37주차~)에만 가능합니다", "#cc6600", 1700)
+        # 은퇴 가능 구간: 1~4주(새 시즌 직후·연장 거절 타이밍) 또는 37~52주(리그 종료 후).
+        if not ((1 <= week <= 4) or (37 <= week <= 52)):
+            show_toast(self, "⚠  은퇴는 시즌 종료 후(37주차~) 또는 새 시즌 1~4주차에 가능합니다", "#cc6600", 1900)
             return
 
         from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame
