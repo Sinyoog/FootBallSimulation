@@ -17,11 +17,28 @@ _pending_transfer_type: str = ""  # join_team → _save_career_entry 전달용. 
 # (값이 바뀌는 리맵 시점에는 _invalidate_team_ovr_cache로 비운다.)
 _team_ovr_cache: dict = {}
 _league_ovr_cache: dict = {}
+# 리그 tier 캐시: leagues.tier 는 게임 중 변하지 않는 세션 상수.
+# _player_perf(GK 선방률 산출)가 매 경기 새 커넥션으로 조회하던 것을 메모이즈.
+_league_tier_cache: dict = {}
 
 def _invalidate_team_ovr_cache():
     """ai_players OVR/소속이 일괄 변경되는 경우(리맵·신규 시드) 호출."""
     _team_ovr_cache.clear()
     _league_ovr_cache.clear()
+    _league_tier_cache.clear()
+
+
+def _league_tier(c, league_id, default=3):
+    """리그 tier 조회 (세션 캐시). c=열린 커서 재사용."""
+    if not league_id:
+        return default
+    cached = _league_tier_cache.get(league_id)
+    if cached is not None:
+        return cached
+    row = c.execute("SELECT tier FROM leagues WHERE id=?", (league_id,)).fetchone()
+    val = row["tier"] if row else default
+    _league_tier_cache[league_id] = val
+    return val
 
 
 # ═══════════════════════════════════════════
@@ -159,6 +176,25 @@ def get_logs():
     rows = c.fetchall()
     conn.close()
     return [r["entry"] for r in rows]
+
+
+def get_match_detail(detail_id):
+    """match_details 단건 조회 → dict(파싱된 detail_json 포함) 반환. 없으면 None."""
+    try:
+        conn = get_conn()
+        row = conn.execute("SELECT * FROM match_details WHERE id=?",
+                           (int(detail_id),)).fetchone()
+        conn.close()
+    except Exception:
+        return None
+    if not row:
+        return None
+    d = dict(row)
+    try:
+        d["payload"] = json.loads(d.get("detail_json") or "{}")
+    except Exception:
+        d["payload"] = {}
+    return d
 
 
 def recalc_ovr(p: dict) -> int:
@@ -1424,23 +1460,31 @@ def _simulate_match(p, week, info: dict):
 
     home_ovr += 3
     diff = home_ovr - away_ovr
-    hw = max(0.10, min(0.80, 0.45 + diff * 0.01))
-    dw = 0.25
-    aw = max(0.05, 1.0 - hw - dw)
+    # 전력차 → 승/무/패 확률.
+    #   기존: hw 상한 0.80 + 무승부 0.25 고정 → 압도해도 20%는 못 이기는 비논리.
+    #   개선: 상한을 0.92로 올리고, 무승부를 전력차에 반비례시킨다.
+    #         전력차가 크면 비길 일이 거의 없고(압도), 박빙일수록 무승부가 흔하다.
+    hw = max(0.06, min(0.92, 0.45 + diff * 0.012))
+    # 무승부: 박빙(diff≈0)일 때 최대 ~0.28, 전력차 ±30이면 ~0.08로 급감.
+    dw = max(0.06, 0.28 - abs(diff) * 0.006)
+    aw = max(0.02, 1.0 - hw - dw)
+    # 정규화 (합이 1 넘지 않도록)
+    _tot = hw + dw + aw
+    hw, dw, aw = hw/_tot, dw/_tot, aw/_tot
 
     roll = random.random()
     if roll < hw:         outcome = "home"
     elif roll < hw + dw:  outcome = "draw"
     else:                 outcome = "away"
 
-    hs, as_ = _gen_score(outcome)
+    hs, as_ = _gen_score(outcome, diff)
 
     goals = assists = saves = 0
     rating = 0.0
     events = []
     detail = {"shots":0,"shots_on":0,"key_passes":0,"dribbles":0,"blocks":0,"pass_acc":0.0}
     if played:
-        goals, assists, saves, rating, events, detail = _player_perf(p, outcome, is_home, hs, as_)
+        goals, assists, saves, rating, events, detail = _player_perf(p, outcome, is_home, hs, as_, c=c)
         if p.get("slump"):
             rating = max(3.0, rating + SLUMP_RATING_PENALTY)
 
@@ -1529,7 +1573,8 @@ def _simulate_match(p, week, info: dict):
 
     _write_match_log(p, week, info["league_name"], is_home,
                      home_id, away_id, hs, as_,
-                     my_result, goals, assists, saves, rating, events, played, benched)
+                     my_result, goals, assists, saves, rating, events, played, benched,
+                     detail=detail)
 
 
 def _team_avg_ovr(c, team_id):
@@ -1639,19 +1684,44 @@ def _check_bench(p):
     return random.random() < min(0.95, max(0.0, base))
 
 
-def _gen_score(outcome):
+def _gen_score(outcome, diff=0.0):
+    """경기 스코어 생성. diff(홈-원정 전력차)가 클수록 이긴 쪽이 크게 이긴다.
+    diff는 _simulate_match 에서 계산된 home_ovr-away_ovr (홈 보정 포함).
+      - |diff| 0      → 박빙: 이겨도 1~2골차
+      - |diff| 15~25  → 우세: 2~3골차 흔함
+      - |diff| 35+    → 압도: 4골+ 대량득점, 무실점 잦음
+    승자/패자는 outcome 으로 이미 정해졌고, 여기선 '몇 대 몇'만 정한다.
+    """
+    # 전력차 → 이긴 팀의 기대 득점 가중(우세할수록 큰 점수 쪽으로 분포 이동).
+    adv = abs(diff)
+    if outcome == "draw":
+        # 무승부: 전력 비슷할 때 주로 발생하므로 저득점 위주.
+        g = random.choices([0, 1, 2, 3], weights=[22, 38, 28, 12])[0]
+        return g, g
+
+    # 이긴 팀 득점 분포를 전력차로 조정.
+    if adv >= 50:        # 초압도 (브라질 vs 약소국급) — 드물게 7~9골 이변
+        win_goals = random.choices([3, 4, 5, 6, 7, 8, 9],
+                                   [14, 24, 24, 18, 12, 6, 2])[0]
+        lose_goals = random.choices([0, 1],         [85, 15])[0]
+    elif adv >= 35:      # 압도
+        win_goals = random.choices([2, 3, 4, 5, 6], [12, 26, 30, 20, 12])[0]
+        lose_goals = random.choices([0, 1, 2],      [70, 24, 6])[0]
+    elif adv >= 22:      # 강한 우세
+        win_goals = random.choices([1, 2, 3, 4, 5], [10, 30, 30, 20, 10])[0]
+        lose_goals = random.choices([0, 1, 2],      [58, 32, 10])[0]
+    elif adv >= 12:      # 우세
+        win_goals = random.choices([1, 2, 3, 4],    [22, 38, 26, 14])[0]
+        lose_goals = random.choices([0, 1, 2],      [50, 38, 12])[0]
+    else:               # 박빙
+        win_goals = random.choices([1, 2, 3, 4],    [38, 36, 18, 8])[0]
+        lose_goals = random.choices([0, 1, 2],      [44, 40, 16])[0]
+    lose_goals = min(lose_goals, win_goals - 1)  # 이긴 팀이 항상 더 많이
+
     if outcome == "home":
-        h = random.choices([1,2,3,4], weights=[25,35,25,15])[0]
-        a = random.choices([0,1,2],   weights=[45,35,20])[0]
-        a = min(a, h-1)
-    elif outcome == "away":
-        a = random.choices([1,2,3,4], weights=[25,35,25,15])[0]
-        h = random.choices([0,1,2],   weights=[45,35,20])[0]
-        h = min(h, a-1)
-    else:
-        g = random.choices([0,1,2,3], weights=[20,35,30,15])[0]
-        h, a = g, g
-    return max(0,h), max(0,a)
+        return max(1, win_goals), max(0, lose_goals)
+    else:  # away
+        return max(0, lose_goals), max(1, win_goals)
 
 
 def _my_result(outcome, is_home):
@@ -1660,7 +1730,120 @@ def _my_result(outcome, is_home):
     return "win" if (outcome=="home")==is_home else "loss"
 
 
-def _player_perf(p, outcome, is_home, hs, as_):
+def _multigoal_banner(goals):
+    """다득점 시 표시할 강조 배너. 1골 이하는 배너 없음(None)."""
+    return {
+        2: "🔥 멀티골 달성!",
+        3: "🎩🔥 해트트릭 완성!!",
+        4: "🎩🎩 포-골 하울!! (4골)",
+        5: "🎩🎩🎩 파이브-골 하울!!! (5골)",
+        6: "👑🎩 더블 해트트릭!!! (6골)",
+    }.get(goals)
+
+
+def _min_sortkey(m):
+    """이벤트 분 정렬용 실수 키. 전반 추가시간(146~152)은 45.1~45.7로,
+       후반 추가시간(91~98)은 90.1~90.8로 매핑해 실제 경기 시간순 정렬."""
+    if 146 <= m <= 152:
+        return 45 + (m - 145) / 10.0
+    if 91 <= m <= 98:
+        return 90 + (m - 90) / 10.0
+    return float(m)
+
+
+def _fmt_min(m):
+    """정렬용 분(정수)을 표시 문자열로. 추가시간은 45+n / 90+n 형식.
+       전반 추가시간은 146~152(=45+1~45+7)로 인코딩해 후반 정규시간과 겹치지 않게 한다.
+       후반 추가시간은 91~98(=90+1~90+8).
+       Godot 연동 시에도 이 표기 규칙을 그대로 쓸 수 있다."""
+    if 146 <= m <= 152:          # 전반 추가시간 (45+1 ~ 45+7)
+        return f"45+{m-145}"
+    if 91 <= m <= 98:            # 후반 추가시간 (90+1 ~ 90+8)
+        return f"90+{m-90}"
+    return str(m)
+
+
+def _half_of(m):
+    """분(정수)이 전반인지 후반인지. 전반 추가시간(146~152)도 전반으로."""
+    if 146 <= m <= 152:
+        return "first"
+    return "first" if m <= 45 else "second"
+
+
+def _sample_minutes(n, lo, hi):
+    """경기 이벤트 분(分)을 n개 뽑는다. 정렬용 정수 리스트(오름차순) 반환.
+       정규시간(lo~hi) 위주이되, 낮은 확률로 추가시간이 섞인다.
+       - 전반 추가시간: 146~152 (=45+1~45+7), 짧은 쪽이 흔함
+       - 후반 추가시간: 91~98   (=90+1~90+8), 짧은 쪽이 흔함
+       정렬 시 146~152는 큰 값이라 맨 뒤로 가지만, _half_of 로 전반에 재배치된다."""
+    if n <= 0:
+        return []
+    pool = list(range(lo, min(hi, 90) + 1))
+    # 추가시간: 짧을수록 자주(가중치). 전반은 후반보다 덜 나오게.
+    fh_stop = [146,146,146, 147,147, 148,148, 149, 150, 151, 152]   # 45+1~7
+    sh_stop = [91,91,91,91, 92,92,92, 93,93,93, 94,94, 95,95, 96, 97, 98]  # 90+1~8
+    out = set()
+    attempts = 0
+    while len(out) < n and attempts < n * 25:
+        r = random.random()
+        if r < 0.04:                       # 전반 추가시간 (드묾)
+            out.add(random.choice(fh_stop))
+        elif r < 0.16:                     # 후반 추가시간 (좀 더 흔함)
+            out.add(random.choice(sh_stop))
+        else:
+            out.add(random.choice(pool))
+        attempts += 1
+    while len(out) < n and len(out) < len(pool):
+        out.add(random.choice(pool))
+    return sorted(out)
+
+
+def _describe_goal(goal_idx, total_goals, minute, my_final, opp_final, dom, exclude=None):
+    """내 골 하나의 '맥락'을 추정해 골 묘사 문구를 고른다.
+    실제 골 시점의 스코어는 시뮬레이션이 분 단위로 돌지 않아 알 수 없으므로,
+    최종 스코어 + 분(分) + 골 순번으로 그럴듯한 종류를 휴리스틱하게 분류한다.
+      - 75분 이후 + 1골차 박빙 → 극장골/막판골
+      - 1~2골차 승부에서 마지막 골 → 결승골
+      - 박빙 접전에서 뒤지다 따라잡는 그림(후반) → 역전골
+      - 비기는 스코어 → 동점골 / 첫 골 전반 → 선제골
+    exclude: 같은 경기에서 이미 쓴 문구 set (중복 방지).
+    대승(3골차 이상)에선 결승/역전/극장 분류를 끈다(어색함 방지).
+    """
+    exclude = exclude or set()
+    margin = my_final - opp_final
+    is_last = (goal_idx == total_goals)
+    tight = (0 <= margin <= 2)   # 박빙 여부
+    real_min = _min_sortkey(minute)        # 실제 경기 시간(전/후반 추가시간 반영)
+    is_stoppage = (91 <= minute <= 98)     # 후반 추가시간만 해당
+
+    def pick(key):
+        pool = [x for x in GOAL_PHRASES[key] if x not in exclude] or GOAL_PHRASES[key]
+        return random.choice(pool)
+
+    # 후반 추가시간 + 박빙 마지막 골 → 극장골 최우선 (90+분의 박진감)
+    if is_stoppage and is_last and 0 <= margin <= 1 and my_final >= opp_final:
+        return pick("late")
+    # 막판 극장골 (박빙 1골차, 실제 78분 이후 마지막 골)
+    if real_min >= 78 and is_last and 0 <= margin <= 1 and my_final >= opp_final:
+        return pick("late")
+    # 결승골 (1~2골차 승리의 마지막 골) — 대승 제외
+    if is_last and 1 <= margin <= 2 and my_final > opp_final:
+        return pick("winner")
+    # 역전골 (박빙 접전 + 후반 + 상대도 득점) — 대승 제외
+    if is_last and tight and margin >= 1 and real_min >= 55 and opp_final >= 1:
+        return pick("comeback")
+    # 동점골 (최종 무승부)
+    if margin == 0 and opp_final >= 1:
+        return pick("equalizer")
+    # 선제골 (첫 골 + 전반)
+    if goal_idx == 1 and real_min <= 40:
+        return pick("opener")
+    return pick("normal")
+
+
+def _player_perf(p, outcome, is_home, hs, as_, c=None):
+    # c: _simulate_match 가 이미 열어둔 커서. 있으면 재사용해 커넥션 개폐 0회.
+    #    (없으면 하위 헬퍼가 자체적으로 캐시/기본값을 사용 — 호환 유지)
     pos     = p["position"]
     pers    = p.get("personality","성실함")
     base    = 6.0
@@ -1680,9 +1863,12 @@ def _player_perf(p, outcome, is_home, hs, as_):
     _lg_avg = 50.0
     if _lid:
         try:
-            _c_dom = get_conn()
-            _lg_avg = _league_avg_ovr(_c_dom.cursor(), _lid)
-            _c_dom.close()
+            if c is not None:
+                _lg_avg = _league_avg_ovr(c, _lid)   # 커서 재사용 + 캐시
+            else:
+                _c_dom = get_conn()
+                _lg_avg = _league_avg_ovr(_c_dom.cursor(), _lid)
+                _c_dom.close()
         except Exception:
             _lg_avg = 50.0
     dom = _dominance_mult(_my_ovr, _lg_avg)
@@ -1695,22 +1881,33 @@ def _player_perf(p, outcome, is_home, hs, as_):
     #     dom 1.00(리그 평균)   → base≈6.3
     #     dom 1.80(압도적 강자) → base≈7.1
     #   이후 골/어시/무실점 가산이 얹혀 최종 평점 분포가 5.5~8.x로 펴진다.
-    base = 5.4 + 0.9 * min(1.9, dom)
+    base = 5.0 + 0.85 * min(1.9, dom)   # detail 활약 가산을 더하므로 출발점을 약간 낮춤
+
+    # ── [실점 타임라인] 상대 득점(opp_score)만큼 실점 분(分)을 배정 ──────
+    #   누가 넣었는지는 시뮬이 상대 선수를 굴리지 않아 알 수 없으므로
+    #   '몇 분에 실점'만 기록한다. events 에 (분, 텍스트) 튜플로 넣어
+    #   내 골/어시와 함께 시간순으로 정렬돼 경기 흐름이 읽힌다.
+    #   Godot 연동 시에도 이 분 정보를 그대로 실점 연출에 쓸 수 있다.
+    if opp_score > 0:
+        concede_mins = _sample_minutes(opp_score, 2, 90)
+        for cm in concede_mins:
+            events.append((cm, "🥅 실점"))
 
     if pos == "GK":
         # ── 티어+OVR 기반 선방률 산출 ──────────────────────────
         # 현재 리그 티어 조회 (p에 current_league_id 있으면 사용)
-        _tier = 3
         _lid  = p.get("current_league_id", 0)
-        if _lid:
-            try:
-                _conn2 = get_conn()
-                _row2  = _conn2.execute("SELECT tier FROM leagues WHERE id=?", (_lid,)).fetchone()
-                _conn2.close()
-                if _row2:
-                    _tier = _row2["tier"]
-            except Exception:
-                pass
+        if c is not None:
+            _tier = _league_tier(c, _lid, default=3)      # 커서 재사용 + 캐시
+        else:
+            _tier = 3
+            if _lid:
+                try:
+                    _conn2 = get_conn()
+                    _tier  = _league_tier(_conn2, _lid, default=3)
+                    _conn2.close()
+                except Exception:
+                    pass
 
         # 티어별 선방률 범위 (하위권/평균/상위권)
         # 하한을 낮춰 '못하는 GK'가 실제로 못하게 만든다(기존 50~58% → 38~46%).
@@ -1769,44 +1966,87 @@ def _player_perf(p, outcome, is_home, hs, as_):
         sp = _stat_n(p, "setpiece")
 
         # 포지션별 기본 골/어시 성향 (계수)
+        #   g_pos_mult: 골 '개수' 기대치(xg)용 포지션 배수. 전방일수록 멀티골 잦음.
         if pos in ("ST", "CF"):
             g_base, g_sh, g_dr = 0.20, 0.18, 0.04
             a_base, a_pa, a_dr = 0.05, 0.18, 0.08
+            g_pos_mult = 1.55
         elif pos in ("LW", "RW"):
             g_base, g_sh, g_dr = 0.15, 0.15, 0.07
             a_base, a_pa, a_dr = 0.07, 0.18, 0.10
+            g_pos_mult = 1.15
         elif pos == "CAM":
             g_base, g_sh, g_dr = 0.06, 0.13, 0.05
             a_base, a_pa, a_dr = 0.07, 0.22, 0.09
+            g_pos_mult = 0.85
         elif pos == "CM":
             g_base, g_sh, g_dr = 0.04, 0.11, 0.04
             a_base, a_pa, a_dr = 0.06, 0.20, 0.08
+            g_pos_mult = 0.60
         else:  # 수비/CDM 등: 골·어시 드묾
             g_base, g_sh, g_dr = 0.02, 0.06, 0.02
             a_base, a_pa, a_dr = 0.03, 0.10, 0.04
+            g_pos_mult = 0.32
 
         gprob = min(GOAL_PROB_CAP, (g_base + sh * g_sh + dr * g_dr) * dom)
         aprob = min(ASSIST_PROB_CAP, (a_base + pa * a_pa + dr * a_dr) * dom)
 
         # 골 (내 팀 득점 my_score 이내로 클램프)
+        #   각 골마다 분(分)을 배정하고, 그 시점의 점수 흐름으로 골 종류를 분류한다.
+        #   events 에는 (분, 텍스트) 튜플로 넣어 _write_match_log 가 시간순 정렬.
         got_goal = False
         if my_score > 0 and random.random() < gprob:
-            goals = random.choices([1, 2, 3], [70, 24, 6])[0]
+            # ── 골 개수: 고정 분포 대신 '기대골(xg)' 기반 ──────────────
+            #   같은 OVR이라도 슈팅·결정력이 좋고 약체 상대(dom↑)일수록 멀티골이 잦다.
+            #   xg = 포지션 골성향 × 슈팅능력(0.4~1.0) × dom.
+            #   예) 슈팅90 ST가 평균50 리그(dom≈1.5) → xg 높아 2~3골 자주
+            #       슈팅50 CM이 비슷한 리그 → xg 낮아 대부분 1골.
+            #   실제 골 수는 xg를 기대값으로 하는 가중 분포에서 뽑고 my_score로 클램프.
+            xg = g_pos_mult * (0.40 + 0.60 * sh) * dom
+            xg = max(0.5, min(4.2, xg))         # 한 경기 기대골 현실 범위
+            # xg를 평균으로 하는 분포: 낮으면 1골 위주, 높으면 멀티골 확률 상승.
+            #   각 골당 '추가 득점' 확률 = xg 비례(체감형). 최대 6골.
+            goals = 1
+            extra_p = max(0.0, min(0.85, (xg - 0.8) / 4.0))  # 2골+로 갈 확률
+            while goals < 6 and random.random() < extra_p:
+                goals += 1
+                extra_p *= 0.55                  # 골 늘수록 다음 골은 급격히 어려워짐
             goals = min(goals, my_score)
             base += goals * 1.0
-            events.append(f"⚽ {'골!' if goals == 1 else ('멀티골!' if goals == 2 else '해트트릭!')}")
             got_goal = True
+            # 내 골들의 분을 시간순으로 뽑는다 (추가시간 포함)
+            goal_mins = _sample_minutes(goals, 3, 90)
+            _used_goal_txt = set()
+            for gi, gm in enumerate(goal_mins):
+                ev_txt = _describe_goal(gi + 1, goals, gm, my_score, opp_score,
+                                        dom, exclude=_used_goal_txt)
+                _used_goal_txt.add(ev_txt)
+                events.append((gm, ev_txt))
+            # 다득점 강조 배너 (마지막 골 시점에 표시)
+            banner = _multigoal_banner(goals)
+            if banner:
+                events.append((goal_mins[-1], banner))
 
         # 세트피스 보너스 골 (세트피스 높은 키커, 약체 상대일수록 ↑)
         if my_score > goals and sp > 0.55 and random.random() < 0.04 * dom:
-            goals += 1; base += 1.0; events.append("🎯 세트피스 골!")
+            goals += 1; base += 1.0
+            events.append((random.randint(10, 88), "🎯 환상적인 세트피스 골!"))
 
         # 어시 (골과 독립 판정. 골 넣은 경기는 어시 확률 절반 — 한 장면 중복 방지)
         rem = my_score - goals
         if rem > 0:
             eff_aprob = aprob * 0.5 if got_goal else aprob
             if random.random() < eff_aprob:
-                assists = 1; base += 0.5; events.append("🅰 어시스트!")
+                assists = random.choices([1, 2], [82, 18])[0] if rem >= 2 else 1
+                assists = min(assists, rem)
+                base += 0.5 * assists
+                a_mins = _sample_minutes(assists, 5, 88)
+                a_txts = ["🅰 정확한 어시스트!", "🅰 결정적 도움!", "🅰 키패스로 어시스트!",
+                          "🅰 환상적인 패스로 어시!", "🅰 침투 패스 어시스트!"]
+                for am in a_mins:
+                    events.append((am, random.choice(a_txts)))
+                if assists >= 2:
+                    events.append((a_mins[-1], "🅰🔥 멀티 어시스트!"))
 
         # ── [세부 지표] 슈팅/유효슈팅/키패스/드리블/차단/패스성공 ──────
         #   골/어시와 동일 체계: 정규화 스탯 × 포지션 성향 × 지배력(dom).
@@ -1905,6 +2145,46 @@ def _player_perf(p, outcome, is_home, hs, as_):
             p2 = get_player()
             update_player(manager_relation=max(0,p2.get("manager_relation",50)-5))
 
+        # ══ [3층] 경기 내용(detail) → 평점 연동 ══════════════════════
+        #   골/어시 외의 활약(슈팅·키패스·드리블·차단·패스성공률)을 평점에 반영한다.
+        #   "골 0이어도 키패스·드리블·차단이 좋으면 평점이 받쳐주고,
+        #    아무것도 못 하면 평점이 떨어진다." → 평점이 경기 내용의 요약이 됨.
+        #   각 지표를 '포지션 기대치' 대비 초과분으로 평가해 ± 점수화.
+        #   포지션별 가중치: 공격수는 슈팅·드리블, 미드는 키패스, 수비는 차단·패스.
+        if pos in ("ST", "CF"):
+            w_shot, w_key, w_drb, w_blk = 0.10, 0.10, 0.07, 0.04
+            e_shot, e_key, e_drb, e_blk = 2.8, 1.2, 1.6, 1.2
+        elif pos in ("LW", "RW"):
+            w_shot, w_key, w_drb, w_blk = 0.08, 0.10, 0.10, 0.05
+            e_shot, e_key, e_drb, e_blk = 2.2, 1.6, 2.4, 1.4
+        elif pos == "CAM":
+            w_shot, w_key, w_drb, w_blk = 0.07, 0.12, 0.08, 0.06
+            e_shot, e_key, e_drb, e_blk = 1.6, 2.4, 1.6, 1.8
+        elif pos == "CM":
+            w_shot, w_key, w_drb, w_blk = 0.05, 0.11, 0.06, 0.08
+            e_shot, e_key, e_drb, e_blk = 1.0, 1.8, 1.0, 3.0
+        elif pos == "CDM":
+            w_shot, w_key, w_drb, w_blk = 0.03, 0.09, 0.05, 0.11
+            e_shot, e_key, e_drb, e_blk = 0.5, 1.0, 0.7, 5.0
+        elif pos in ("LB", "RB"):
+            w_shot, w_key, w_drb, w_blk = 0.03, 0.09, 0.07, 0.10
+            e_shot, e_key, e_drb, e_blk = 0.4, 1.0, 1.0, 4.0
+        else:  # CB
+            w_shot, w_key, w_drb, w_blk = 0.02, 0.05, 0.04, 0.12
+            e_shot, e_key, e_drb, e_blk = 0.3, 0.4, 0.3, 5.0
+
+        # 초과분(기대치 대비) × 가중치. 잘하면 +, 부진하면 -. 과도 보정 방지로 클램프.
+        perf = 0.0
+        perf += w_shot * (detail["shots_on"] - e_shot)   # 유효슈팅 기준
+        perf += w_key  * (detail["key_passes"] - e_key)
+        perf += w_drb  * (detail["dribbles"] - e_drb)
+        perf += w_blk  * (detail["blocks"] - e_blk)
+        # 패스 성공률: 0.80 기준 ±. 정확하면 소폭 가산.
+        perf += 1.6 * (detail["pass_acc"] - 0.80)
+        perf = max(-1.3, min(2.0, perf))   # 평점 영향 상·하한
+        base += perf
+        detail["perf_bonus"] = round(perf, 2)   # 디버그/상세창 참고용
+
         # 승부욕 보정
         if pers == "승부욕" and _my_result(outcome, is_home) == "loss":
             base += 0.3
@@ -1916,20 +2196,9 @@ def _player_perf(p, outcome, is_home, hs, as_):
 
 
 def _pos_events(pos, positive):
-    POS = {
-        "GK":  (["선방 성공!","공중볼 장악","킥 정확"],["포지셔닝 실수로 실점","막지 못했다"]),
-        "CB":  (["태클 성공!","헤딩 클리어","인터셉트"],["마킹 실수","태클 미스"]),
-        "LB":  (["오버랩 성공","크로스 연결","태클 성공"],["역습 허용","마킹 실수"]),
-        "RB":  (["오버랩 성공","크로스 연결","태클 성공"],["역습 허용","마킹 실수"]),
-        "CDM": (["공 차단!","패스 연결","포지셔닝"],["패스 미스","포지셔닝 실수"]),
-        "CM":  (["키패스 성공","드리블 돌파","공간 침투"],["턴오버","패스 미스"]),
-        "CAM": (["창의적 패스","드리블 돌파 성공!","공간 침투"],["찬스 창출 실패","결정력 부족"]),
-        "LW":  (["드리블 돌파 성공!","크로스 연결","속도 돌파"],["드리블 실패","크로스 미스"]),
-        "RW":  (["드리블 돌파 성공!","크로스 연결","속도 돌파"],["드리블 실패","크로스 미스"]),
-        "CF":  (["공간 침투 성공!","연결 플레이","키패스"],["빅찬스 미스","오프사이드"]),
-        "ST":  (["공간 침투 성공!","포스트 플레이","슈팅 시도"],["빅찬스 미스!","결정력 부족"]),
-    }
-    pair = POS.get(pos,(["좋은 플레이"],["실수"]))
+    # 문구 풀은 constants.MATCH_PHRASES 로 분리(포지션당 8~12개로 확장).
+    # 구버전 호환: 풀이 없으면 최소 기본값.
+    pair = MATCH_PHRASES.get(pos, (["좋은 플레이"], ["실수"]))
     return pair[0] if positive else pair[1]
 
 
@@ -1973,9 +2242,62 @@ def _update_pop(p, goals, assists, rating):
     update_player(popularity=pop)
 
 
+def _save_match_detail(p, week, comp_name, is_home, home_name, away_name,
+                       hs, as_, result, goals, assists, saves, rating,
+                       events, played, benched, detail=None):
+    """경기 상세를 match_details 에 저장하고 detail_id 를 돌려준다.
+       리그/챔스/국대 모두 이 헬퍼를 공유한다(팀명은 호출자가 직접 넘김).
+       events 정규화(분 배정·시간순)도 여기서 처리. 실패 시 None 반환."""
+    timed = []
+    if played:
+        for ev in events:
+            if isinstance(ev, tuple) and len(ev) == 2:
+                timed.append((int(ev[0]), str(ev[1])))
+            else:
+                timed.append((random.randint(1, 90), str(ev)))
+        timed.sort(key=lambda x: _min_sortkey(x[0]))
+
+    verdict = _match_verdict(rating, result, goals, assists) if played else ""
+    detail = detail or {}
+    st = get_state() or {}
+    payload = {
+        "events": [[m, t] for m, t in timed],
+        "verdict": verdict,
+        "played": bool(played),
+        "benched": bool(benched),
+        "position": p.get("position", ""),
+        "detail": {
+            "shots": detail.get("shots", 0),
+            "shots_on": detail.get("shots_on", 0),
+            "key_passes": detail.get("key_passes", 0),
+            "dribbles": detail.get("dribbles", 0),
+            "blocks": detail.get("blocks", 0),
+            "pass_acc": detail.get("pass_acc", 0.0),
+        },
+    }
+    try:
+        conn2 = get_conn()
+        cur = conn2.execute(
+            """INSERT INTO match_details
+               (year,week,season,league_name,is_home,home_name,away_name,
+                home_score,away_score,result,rating,goals,assists,saves,detail_json)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (st.get("current_year"), week, st.get("current_season"),
+             comp_name, 1 if is_home else 0, home_name, away_name,
+             hs, as_, result, rating, goals, assists, saves,
+             json.dumps(payload, ensure_ascii=False)))
+        detail_id = cur.lastrowid
+        conn2.commit()
+        conn2.close()
+        return detail_id
+    except Exception:
+        return None
+
+
 def _write_match_log(p, week, league_name, is_home,
                      hid, aid, hs, as_,
-                     result, goals, assists, saves, rating, events, played, benched):
+                     result, goals, assists, saves, rating, events, played, benched,
+                     detail=None):
     conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT name FROM teams WHERE id=?", (hid,))
@@ -1987,8 +2309,16 @@ def _write_match_log(p, week, league_name, is_home,
     loc = "홈" if is_home else "원정"
     rs  = {"win":"승","draw":"무","loss":"패"}.get(result,"")
 
+    detail_id = _save_match_detail(p, week, league_name, is_home, hn, an,
+                                   hs, as_, result, goals, assists, saves, rating,
+                                   events, played, benched, detail)
+
+    # ── 로그: 헤더 한 줄(클릭 가능) + 결과 + 핵심 요약 + 순위 ──────────
+    #   상세 이벤트(전/후반)는 로그에서 빼고 상세 창으로 옮겨 로그를 간결하게.
+    #   헤더에 [match:{id}] 마커를 박아두면 log_panel 이 클릭 앵커로 변환한다.
+    marker = f" [match:{detail_id}]" if detail_id else ""
     add_log("─"*44, "sep")
-    add_log(f"⚽ 경기  [{league_name}]  {week}주차  ({loc})", "match")
+    add_log(f"⚽ 경기  [{league_name}]  {week}주차  ({loc}){marker}", "match")
     add_log(f"   {hn} {hs}-{as_} {an}  ({rs})", "match")
 
     if not played:
@@ -1998,28 +2328,49 @@ def _write_match_log(p, week, league_name, is_home,
             add_log(f"   평점 {rating}  선방 {saves}", "match")
         else:
             add_log(f"   평점 {rating}  골 {goals}  어시 {assists}", "match")
-
-        mid = len(events)//2
-        fh = events[:mid+1]
-        sh = events[mid+1:]
-
-        add_log("   [전반]", "match")
-        for ev in fh:
-            m = random.randint(1,45)
-            add_log(f"   {m}'  {ev}", "match")
-        add_log("   [후반]", "match")
-        for ev in sh:
-            m = random.randint(46,90)
-            add_log(f"   {m}'  {ev}", "match")
-
-        # 총평
-        labels = [(9,"완벽한 경기"),(8,"훌륭한 경기"),(7,"좋은 경기"),
-                  (6,"준수한 경기"),(5,"평범한 경기"),(4,"부진한 경기"),(0,"최악의 경기")]
-        total = next(l for t,l in labels if rating >= t)
-        add_log(f"   😞 경기 총평: {total}", "match")
+        # 다득점/멀티어시 같은 하이라이트만 로그에 한 줄 노출(나머진 상세 창에서).
+        timed = sorted([(int(e[0]), e[1]) if isinstance(e, tuple) else
+                        (random.randint(1, 90), str(e)) for e in events],
+                       key=lambda x: _min_sortkey(x[0]))
+        hi = _log_highlight(goals, assists, timed)
+        if hi:
+            add_log(f"   {hi}", "match")
 
     rank_str = get_team_rank(p.get("current_team_id",0))
     add_log(f"   📊 리그 순위: {rank_str}", "match")
+
+
+def _log_highlight(goals, assists, timed):
+    """로그에 한 줄로 노출할 경기 하이라이트(있으면). 다득점/멀티어시 우선."""
+    banner = _multigoal_banner(goals)
+    if banner:
+        return banner
+    if assists >= 2:
+        return "🅰🔥 멀티 어시스트!"
+    # 극장골/역전골이 있으면 그걸 끌어올린다.
+    for _m, t in timed:
+        if "극장골" in t or "역전골" in t or "결승골" in t:
+            return t
+    return ""
+
+
+def _match_verdict(rating, result, goals, assists):
+    """평점·결과·공격포인트를 종합해 총평 문구를 고른다(맥락 기반 다양화)."""
+    contrib = goals + assists
+    if rating >= 8.5:
+        key = "great_win" if result == "win" else "great"
+    elif rating >= 7.5:
+        key = "great" if contrib >= 2 else ("good_win" if result == "win" else "good")
+    elif rating >= 6.8:
+        key = "good_win" if result == "win" else "good"
+    elif rating >= 6.0:
+        key = "good" if result == "win" else "average"
+    elif rating >= 5.0:
+        # 패했지만 평점이 받쳐주면 '분투' 톤
+        key = "loss_effort" if result == "loss" and contrib >= 1 else "poor"
+    else:
+        key = "terrible"
+    return random.choice(VERDICT_PHRASES.get(key, VERDICT_PHRASES["average"]))
 
 
 # ─────────────────────────────────────────
@@ -2533,34 +2884,48 @@ def _best11_score_mf(goals, assists, rating, ovr):
 
 
 def _collect_league_candidates(c, league_id, exclude_my_team=None):
-    """리그 내 모든 팀의 AI 공격 포지션 선수들 시즌 성적 추정 → 후보 리스트."""
-    teams = c.execute("SELECT id FROM teams WHERE league_id=?", (league_id,)).fetchall()
-    if not teams:
+    """리그 내 모든 팀의 AI 공격 포지션 선수들 시즌 성적 추정 → 후보 리스트.
+
+    [최적화] 기존엔 팀마다 ai_players를 2번씩(전체 OVR 집계용 + 공격수 목록용)
+      조회해 20팀 리그면 40+ 쿼리(N+1)가 돌았다. teams JOIN으로 팀별 평균 OVR을
+      1쿼리에, 공격수 목록을 1쿼리에 모아 총 2쿼리로 줄였다. 결과·계산은 동일.
+    """
+    # 팀별 평균 OVR + 리그 평균을 단일 JOIN 집계로.
+    team_rows = c.execute(
+        """SELECT t.id AS tid, AVG(ap.ovr) AS avg_ovr, COUNT(ap.id) AS n,
+                  SUM(ap.ovr) AS sum_ovr
+           FROM teams t LEFT JOIN ai_players ap ON ap.team_id=t.id
+           WHERE t.league_id=?
+           GROUP BY t.id""", (league_id,)).fetchall()
+    if not team_rows:
         return [], 50.0
-    team_ids = [t["id"] for t in teams]
-    # 리그 평균 OVR
-    all_ovr = []
+
     team_avg = {}
-    for tid in team_ids:
-        ovrs = [r["ovr"] for r in c.execute("SELECT ovr FROM ai_players WHERE team_id=?", (tid,))]
-        if ovrs:
-            team_avg[tid] = sum(ovrs)/len(ovrs)
-            all_ovr += ovrs
-    league_avg = sum(all_ovr)/len(all_ovr) if all_ovr else 50.0
+    tot_sum = 0
+    tot_n = 0
+    for r in team_rows:
+        if r["n"]:
+            team_avg[r["tid"]] = r["avg_ovr"]
+            tot_sum += r["sum_ovr"] or 0
+            tot_n   += r["n"]
+    league_avg = (tot_sum / tot_n) if tot_n else 50.0
+
+    # 공격수 전체를 단일 쿼리로 (팀별 반복 제거). ATTACK_POS 는 코드 내 고정 튜플.
+    placeholders = ",".join("?" for _ in ATTACK_POS)
+    atk_rows = c.execute(
+        """SELECT ap.team_id AS tid, ap.name, ap.position, ap.ovr
+           FROM ai_players ap JOIN teams t ON ap.team_id=t.id
+           WHERE t.league_id=? AND ap.position IN ({})""".format(placeholders),
+        (league_id, *ATTACK_POS)).fetchall()
 
     cands = []
-    for tid in team_ids:
-        tavg = team_avg.get(tid, league_avg)
-        rows = c.execute(
-            "SELECT name, position, ovr FROM ai_players WHERE team_id=? AND position IN ({})".format(
-                ",".join("'%s'" % p for p in ATTACK_POS)),
-            (tid,)).fetchall()
-        for r in rows:
-            g, a, rt = _estimate_ai_season(r["ovr"], r["position"], tavg, league_avg)
-            cands.append({
-                "name": r["name"], "position": r["position"], "ovr": r["ovr"],
-                "goals": g, "assists": a, "rating": rt, "is_mine": False,
-            })
+    for r in atk_rows:
+        tavg = team_avg.get(r["tid"], league_avg)
+        g, a, rt = _estimate_ai_season(r["ovr"], r["position"], tavg, league_avg)
+        cands.append({
+            "name": r["name"], "position": r["position"], "ovr": r["ovr"],
+            "goals": g, "assists": a, "rating": rt, "is_mine": False,
+        })
     return cands, league_avg
 
 
@@ -2804,9 +3169,13 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
                         f"경기당 {my_ga_rate:.2f}골 실점 ({z_ga}/{z_matches}경기)"))
 
         # 저장 (DB 작업은 이 conn으로 모두 처리)
+        # 개인 수상의 리그명에도 우승/트로피 기록과 동일하게 "(N부)"를 표기.
+        #   awards 테이블엔 tier 컬럼이 없으므로 league_name 문자열에 합쳐 저장한다.
+        #   → 수상 창·은퇴 후 창·AI 요약 등 awards.league_name 을 읽는 모든 곳이 자동 반영.
+        lname_with_tier = f"{lname} ({tier}부)" if tier else lname
         for atype, detail in my_awards:
             c.execute("INSERT INTO awards(year,award_type,league_name,detail,is_mine) VALUES(?,?,?,?,1)",
-                      (year, atype, lname, detail))
+                      (year, atype, lname_with_tier, detail))
             if atype in ("발롱도르","MVP"):
                 c.execute("INSERT INTO trophy_log(year,team_name,league_name,tier,competition) VALUES(?,?,?,?,?)",
                           (year, p.get("name","나"), lname, tier, f"{atype} ({detail})"))
@@ -3597,16 +3966,29 @@ def _sim_all_leagues_for_season_end(season: int):
     league_ids = [r["id"] for r in c.fetchall()]
     conn.close()
 
+    # 일정 생성이 필요한 리그를 먼저 가려낸 뒤(읽기 전용 커넥션 1개로 일괄),
+    # 생성은 자체 커넥션을 쓰는 generate_season_schedule에 맡긴다.
+    conn_chk = get_conn()
+    need_sched = []
     for lid in league_ids:
-        # 일정 없으면 먼저 생성
-        conn2 = get_conn()
-        cnt = conn2.execute(
+        cnt = conn_chk.execute(
             "SELECT COUNT(*) as c FROM match_results WHERE league_id=? AND season=?",
             (lid, season)).fetchone()["c"]
-        conn2.close()
         if cnt == 0:
-            generate_season_schedule(lid, season, year)
-        _sim_league_full(lid, season)
+            need_sched.append(lid)
+    conn_chk.close()
+    for lid in need_sched:
+        generate_season_schedule(lid, season, year)
+
+    # 시뮬은 커넥션 하나로 전 리그 처리 (리그마다 개폐하던 것을 1회로).
+    # st 도 한 번만 조회해 _sim_league_full 에 재주입.
+    st = get_state()
+    conn_sim = get_conn()
+    c_sim = conn_sim.cursor()
+    for lid in league_ids:
+        _sim_league_full(lid, season, c=c_sim, st=st)
+    conn_sim.commit()
+    conn_sim.close()
 
 
 def generate_offers(count=5) -> list:
@@ -4650,19 +5032,26 @@ def _generate_first_half_schedule(league_id, season, year):
     conn.close()
 
 
-def _sim_league_full(league_id, season):
+def _sim_league_full(league_id, season, c=None, st=None):
     """오퍼 창용: 해당 리그의 현재 주차까지 미완료 경기만 AI 시뮬.
     match_results에만 결과 저장, teams 테이블은 건드리지 않음.
     (순위는 _get_team_rank_info에서 match_results 기준으로 계산)
     과거 시즌이면 전체 주차를 시뮬 (1~4주차 '작년 성적' 계산용 ─ 버그 수정)
+
+    c:  외부에서 연 커서를 재사용 (여러 리그를 한 커넥션으로 처리할 때).
+        None이면 자체 커넥션을 열고 닫는다(기존 동작 = 하위 호환).
+    st: get_state() 결과 재주입 (루프에서 매번 조회 방지). None이면 직접 조회.
     """
-    st = get_state()
+    if st is None:
+        st = get_state()
     cur_week   = st["current_week"]   if st else 11
     cur_season = st["current_season"] if st else 1
     week_cap = 99 if season < cur_season else cur_week
 
-    conn = get_conn()
-    c = conn.cursor()
+    _own_conn = c is None
+    if _own_conn:
+        conn = get_conn()
+        c = conn.cursor()
     c.execute("""SELECT id, home_team_id, away_team_id
                  FROM match_results
                  WHERE league_id=? AND season=? AND home_score=-1 AND week<=?""",
@@ -4686,8 +5075,9 @@ def _sim_league_full(league_id, season):
         c.execute("UPDATE match_results SET home_score=?,away_score=? WHERE id=?",
                   (hs, as_, m["id"]))
 
-    conn.commit()
-    conn.close()
+    if _own_conn:
+        conn.commit()
+        conn.close()
 
 
 def _backfill_past_matches(league_id, season, current_week, my_team_id):

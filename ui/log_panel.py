@@ -2,9 +2,9 @@
 ui/log_panel.py  ─  우측 로그 패널 (HTML 컬러 로그)
 """
 import re
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QTextEdit
-from PyQt6.QtCore import Qt
-from game_engine import get_logs
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QTextBrowser
+from PyQt6.QtCore import Qt, QUrl
+from game_engine import get_logs, get_match_detail
 
 # 로그 줄별 색상 규칙
 # (패턴, 색상)
@@ -36,6 +36,13 @@ STAT_DOWN_RE = re.compile(r'(?<![0-9])(-\d+)')
 
 def _colorize(line: str) -> str:
     """줄 하나를 HTML span으로 변환"""
+    # 경기 헤더의 [match:{id}] 마커 → 클릭 앵커로 분리 추출.
+    #   마커는 표시에서 제거하고, 헤더 전체를 <a>로 감싸 클릭 가능하게 만든다.
+    m_match = re.search(r'\[match:(\d+)\]', line)
+    match_id = m_match.group(1) if m_match else None
+    if m_match:
+        line = line.replace(m_match.group(0), "").rstrip()
+
     escaped = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     # 구분선
@@ -53,11 +60,15 @@ def _colorize(line: str) -> str:
     def repl_up(m):   return f'<span style="color:#4499ff;">{m.group(1)}</span>'
     def repl_down(m): return f'<span style="color:#ff4444;">{m.group(1)}</span>'
 
-    # 스탯 줄인지 확인 (들여쓰기 + 스탯명 + 숫자)
     is_stat_line = re.match(r'^\s+\S+.*[+-]\d', line)
     if is_stat_line:
         escaped = STAT_UP_RE.sub(repl_up, escaped)
         escaped = STAT_DOWN_RE.sub(repl_down, escaped)
+
+    # 경기 헤더는 클릭 앵커로 (밑줄 + 손가락 커서 효과는 QTextBrowser가 처리)
+    if match_id:
+        return (f'<a href="match:{match_id}" style="color:{line_color};'
+                f'text-decoration:none;">{escaped}  🔎</a>')
 
     return f'<span style="color:{line_color};">{escaped}</span>'
 
@@ -72,10 +83,13 @@ class LogPanel(QWidget):
         t.setStyleSheet("color:#888;font-size:11px;border-bottom:1px solid #2a2a2a;padding-bottom:2px;")
         lay.addWidget(t)
 
-        self.te = QTextEdit()
+        self.te = QTextBrowser()
         self.te.setReadOnly(True)
+        self.te.setOpenLinks(False)              # 링크 클릭을 직접 처리(외부 브라우저 X)
+        self.te.setOpenExternalLinks(False)
+        self.te.anchorClicked.connect(self._on_anchor)
         self.te.setStyleSheet("""
-            QTextEdit {
+            QTextBrowser {
                 background:#1a1a1a; color:#cccccc;
                 font-size:12px;
                 font-family:'Malgun Gothic','D2Coding',monospace;
@@ -86,6 +100,22 @@ class LogPanel(QWidget):
             QScrollBar::handle:vertical { background:#3a3a3a; border-radius:3px; }
         """)
         lay.addWidget(self.te)
+
+    def _on_anchor(self, url: QUrl):
+        """경기 헤더 클릭 → 상세 다이얼로그."""
+        s = url.toString()
+        if not s.startswith("match:"):
+            return
+        try:
+            mid = int(s.split(":", 1)[1])
+        except (ValueError, IndexError):
+            return
+        data = get_match_detail(mid)
+        if not data:
+            return
+        from ui.match_detail_dialog import MatchDetailDialog
+        dlg = MatchDetailDialog(data, self)
+        dlg.exec()
 
     def refresh(self):
         lines = get_logs()

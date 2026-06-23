@@ -945,7 +945,8 @@ def _winner_of(m):
 def simulate_my_match(week, p):
     """내가 출전하는 국가대표 경기."""
     from game_engine import (add_log, get_player, update_player,
-                             _player_perf, _my_result, _update_pop, _gen_score)
+                             _player_perf, _my_result, _update_pop, _gen_score,
+                             _save_match_detail)
     info = get_my_match(week)
     if not info:
         return
@@ -989,7 +990,7 @@ def simulate_my_match(week, p):
     if knockout and outcome == "draw":
         win_home, pso_score = _resolve_pso(h_ovr, a_ovr)
         pso_winner = m["home"] if win_home else m["away"]
-    hs, as_ = _gen_score(outcome)
+    hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
 
     goals, assists, saves, rating, events, detail = _player_perf(p, outcome, is_home, hs, as_)
     my_result = _my_result(outcome, is_home)
@@ -1052,16 +1053,29 @@ def simulate_my_match(week, p):
     if pso_winner:
         pso_txt = f"  (승부차기 {pso_score} {'승' if pso_winner == nat else '패'})"
         rs = "무"
+    comp_name = f"{t['name']} {stage_ko}{grp_txt}".strip()
+    home_disp = f"{he['flag']}{m['home']}"
+    away_disp = f"{ae['flag']}{m['away']}"
+    detail_id = _save_match_detail(
+        p, week, comp_name, is_home, home_disp, away_disp,
+        hs, as_, my_result, goals, assists, saves, rating,
+        events, True, False, detail)
+    marker = f" [match:{detail_id}]" if detail_id else ""
+
     add_log("─" * 44, "sep")
-    add_log(f"🌍 {t['name']} {stage_ko}{grp_txt}  {week}주차", "match")
-    add_log(f"   {he['flag']}{m['home']} {hs}-{as_} {ae['flag']}{m['away']}  ({rs}){pso_txt}", "match")
+    add_log(f"🌍 {comp_name}  {week}주차{marker}", "match")
+    add_log(f"   {home_disp} {hs}-{as_} {away_disp}  ({rs}){pso_txt}", "match")
     if p.get("position") == "GK":
         add_log(f"   평점 {rating}  선방 {saves}", "match")
     else:
         add_log(f"   평점 {rating}  골 {goals}  어시 {assists}", "match")
-    for ev in events:
-        mm = random.randint(1, 90)
-        add_log(f"   {mm}'  {ev}", "match")
+    from game_engine import _log_highlight, _min_sortkey
+    _timed = sorted([(int(e[0]), e[1]) if isinstance(e, tuple) else
+                     (random.randint(1, 90), str(e)) for e in events],
+                    key=lambda x: _min_sortkey(x[0]))
+    hi = _log_highlight(goals, assists, _timed)
+    if hi:
+        add_log(f"   {hi}", "match")
 
 
 # ─────────────────────────────────────────────

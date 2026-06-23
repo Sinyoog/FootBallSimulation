@@ -5,18 +5,58 @@ import sqlite3, os, random
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "game.db")
 
-def get_conn():
+# ── 커넥션 풀(단일 영속 커넥션 재사용) ────────────────────────────
+# 이 게임은 단일 스레드(UI 메인 스레드)에서만 DB를 쓰고, 커넥션을 함수 밖으로
+# 넘기지 않는다(모두 함수 내부에서 열고 닫음). 따라서 매 get_conn()마다
+# sqlite3.connect + close 하던 것을, 커넥션 하나를 만들어 계속 재사용한다.
+#   - 프로파일 결과 connect/close/commit 오버헤드가 전체 실행시간의 ~90%였다.
+#   - 반환 커넥션의 close()는 no-op으로 감싼다 → 기존 코드의 conn.close()
+#     호출 73곳을 한 줄도 안 고치고 그대로 두면서, 실제로는 닫지 않게 한다.
+#   - commit/execute/cursor 등은 실제 커넥션에 그대로 위임된다.
+_pool_conn = None
+
+class _PooledConn:
+    """sqlite3.Connection 래퍼. close()만 무력화하고 나머진 전부 위임."""
+    __slots__ = ("_real",)
+    def __init__(self, real):
+        object.__setattr__(self, "_real", real)
+    def close(self):
+        # 풀 커넥션은 닫지 않는다(재사용). 트랜잭션 정리는 commit이 담당.
+        pass
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_real"), name)
+    def __setattr__(self, name, value):
+        setattr(object.__getattribute__(self, "_real"), name, value)
+    # with 문 호환(혹시 쓰는 곳 대비): 진입/이탈 시 닫지 않음
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+
+def _new_raw_conn():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
-    # journal_mode=WAL 은 DB 파일에 영구 저장되는 설정이라 매 연결마다
-    # 다시 지정할 필요가 없다(init_db 에서 1회 보장).
-    # synchronous=NORMAL 은 연결별 설정이지만 비용이 거의 없고,
-    # WAL 과 함께 쓰면 매 commit 의 디스크 fsync 를 생략해(체크포인트 때만 동기화)
-    # commit 비용을 100배가량 줄인다. WAL+NORMAL 은 SQLite 공식 권장 조합으로
-    # 전원 차단 시에도 DB 가 손상되지 않는다(최근 몇 트랜잭션만 유실 가능).
+    # synchronous=NORMAL 은 연결별 설정. WAL(영구 설정)과 함께 매 commit fsync를
+    # 생략해 commit 비용을 크게 줄인다. WAL+NORMAL 은 SQLite 공식 권장 조합.
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
+
+def get_conn():
+    global _pool_conn
+    if _pool_conn is None:
+        _pool_conn = _PooledConn(_new_raw_conn())
+    return _pool_conn
+
+def reset_conn_pool():
+    """DB 파일이 교체되는 경우(세이브 로드/삭제 등) 풀 커넥션을 폐기."""
+    global _pool_conn
+    if _pool_conn is not None:
+        try:
+            object.__getattribute__(_pool_conn, "_real").close()
+        except Exception:
+            pass
+        _pool_conn = None
 
 # ─── 스키마 ───────────────────────────────────────────────────
 def init_db():
@@ -131,6 +171,18 @@ def init_db():
         home_team_id INTEGER, away_team_id INTEGER,
         home_score INTEGER DEFAULT -1, away_score INTEGER DEFAULT -1,
         season INTEGER, year INTEGER)""")
+    # 경기 상세(클릭 시 펼쳐보는 데이터)를 JSON으로 보관.
+    #   game_log 의 헤더 줄에 <a href="match:{id}"> 앵커로 연결된다.
+    #   detail_json 안에 전/후반 이벤트·평점·세부지표·총평이 모두 들어간다.
+    c.execute("""CREATE TABLE IF NOT EXISTS match_details(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        year INTEGER, week INTEGER, season INTEGER,
+        league_name TEXT, is_home INTEGER,
+        home_name TEXT, away_name TEXT,
+        home_score INTEGER, away_score INTEGER,
+        result TEXT, rating REAL,
+        goals INTEGER, assists INTEGER, saves INTEGER,
+        detail_json TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS season_state(
         id INTEGER PRIMARY KEY,
         current_year INTEGER DEFAULT 1990,
@@ -381,6 +433,8 @@ def init_db():
     _conn = sqlite3.connect(DB_PATH, timeout=30)
     _conn.execute("PRAGMA journal_mode=WAL")
     _conn.close()
+    # WAL을 켠 뒤 풀 커넥션을 새로 만들게 리셋(이전 풀 커넥션은 WAL 인식 전일 수 있음).
+    reset_conn_pool()
     remap_all_ovr()   # calc_ovr 정규화에 맞춰 기존 AI OVR 일괄 재계산 (1회성)
     migrate_money_to_thousand()   # 금액 단위 만원→천원 전환 (1회성)
 
@@ -461,7 +515,7 @@ def reset_game_data():
     init_db()  # 마이그레이션 적용
     conn = get_conn(); c = conn.cursor()
     for t in ["my_player","career_entries","promotion_log","trophy_log","awards",
-              "game_log","match_results","season_state",
+              "game_log","match_results","match_details","season_state",
               "intl_history","intl_tournaments","intl_entries","intl_matches",
               "cl_tournaments","cl_entries","cl_matches","cl_history"]:
         c.execute(f"DELETE FROM {t}")

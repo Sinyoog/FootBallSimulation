@@ -450,10 +450,12 @@ def _process_one(t, week):
         """SELECT * FROM cl_matches
            WHERE tournament_id=? AND week<=? AND home_score=-1""",
         (t["id"], week)).fetchall()]
-    conn.close()
 
+    # pending 경기를 한 커넥션·한 트랜잭션으로 일괄 시뮬(경기마다 개폐하던 것을 1회로).
     for m in pending:
-        _sim_ai_match(t, m)
+        _sim_ai_match(t, m, conn=conn)
+    conn.commit()
+    conn.close()
 
     # 조별리그 마지막 주차(44) → 16강 진출 확정
     if week == CL_GROUP_WEEKS[1]:
@@ -530,8 +532,12 @@ def _resolve_pso(h_ovr, a_ovr):
     return winner_home, score
 
 
-def _sim_ai_match(t, m, my_played=False):
-    """AI끼리(또는 내가 결장한 내 경기) 시뮬."""
+def _sim_ai_match(t, m, my_played=False, conn=None):
+    """AI끼리(또는 내가 결장한 내 경기) 시뮬.
+
+    conn: 외부에서 연 커넥션을 재사용해 다수 경기를 한 트랜잭션으로 묶는다.
+          None이면 자체 커넥션을 열고 commit/close(기존 동작 = 하위 호환).
+    """
     from game_engine import add_log, get_player, _gen_score
     he = _entry(t["id"], m["home_team_id"])
     ae = _entry(t["id"], m["away_team_id"])
@@ -542,14 +548,17 @@ def _sim_ai_match(t, m, my_played=False):
     if outcome == "draw" and is_ko:
         win_home, pso_score = _resolve_pso(he["ovr"], ae["ovr"])
         pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
-    hs, as_ = _gen_score(outcome)
+    hs, as_ = _gen_score(outcome, he["ovr"] - ae["ovr"])
 
-    conn = get_conn()
+    _own = conn is None
+    if _own:
+        conn = get_conn()
     conn.execute("""UPDATE cl_matches SET home_score=?, away_score=?,
                     pso_winner=?, pso_score=? WHERE id=?""",
                  (hs, as_, pso_winner, pso_score, m["id"]))
-    conn.commit()
-    conn.close()
+    if _own:
+        conn.commit()
+        conn.close()
 
     # 내 팀 경기(결장 포함)면 로그. AI끼리 경기는 get_player() 불필요.
     if m["is_my"]:
@@ -578,7 +587,8 @@ def _winner_of(m):
 def simulate_my_cl_match(week, p):
     """내가 출전하는 챔스 경기."""
     from game_engine import (add_log, get_player, update_player,
-                             _player_perf, _my_result, _update_pop, _gen_score)
+                             _player_perf, _my_result, _update_pop, _gen_score,
+                             _save_match_detail)
     info = get_my_cl_match(week)
     if not info:
         return
@@ -604,7 +614,7 @@ def simulate_my_cl_match(week, p):
     if outcome == "draw" and is_ko:
         win_home, pso_score = _resolve_pso(h_ovr, a_ovr)
         pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
-    hs, as_ = _gen_score(outcome)
+    hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
 
     goals, assists, saves, rating, events, detail = _player_perf(p, outcome, is_home, hs, as_)
     my_result = _my_result(outcome, is_home)
@@ -647,7 +657,7 @@ def simulate_my_cl_match(week, p):
         nh = max(0, nh - 4)
     update_player(stress=ns, happiness=nh)
 
-    # ── 로그 ──
+    # ── 로그 (리그전과 동일하게: 헤더 클릭 → 상세 창) ──
     stage_ko = STAGE_KO.get(m["stage"], "")
     my_tid = p.get("current_team_id", 0)
     rs = {"win": "승", "draw": "무", "loss": "패"}.get(my_result, "")
@@ -655,17 +665,30 @@ def simulate_my_cl_match(week, p):
     if pso_winner:
         pso_txt = f"  (승부차기 {pso_score} {'승' if pso_winner == my_tid else '패'})"
         rs = "무"
+
+    comp_name = f"{t['name']} {stage_ko}".strip()
+    home_disp = f"{he['flag']}{he['team_name']}"
+    away_disp = f"{ae['flag']}{ae['team_name']}"
+    detail_id = _save_match_detail(
+        p, week, comp_name, is_home, home_disp, away_disp,
+        hs, as_, my_result, goals, assists, saves, rating,
+        events, True, False, detail)
+    marker = f" [match:{detail_id}]" if detail_id else ""
+
     add_log("─" * 44, "sep")
-    add_log(f"🏆 {t['name']} {stage_ko}  {week}주차", "match")
-    add_log(f"   {he['flag']}{he['team_name']} {hs}-{as_} {ae['flag']}{ae['team_name']}  ({rs}){pso_txt}",
-            "match")
+    add_log(f"🏆 {comp_name}  {week}주차{marker}", "match")
+    add_log(f"   {home_disp} {hs}-{as_} {away_disp}  ({rs}){pso_txt}", "match")
     if p.get("position") == "GK":
         add_log(f"   평점 {rating}  선방 {saves}", "match")
     else:
         add_log(f"   평점 {rating}  골 {goals}  어시 {assists}", "match")
-    for ev in events:
-        mm = random.randint(1, 90)
-        add_log(f"   {mm}'  {ev}", "match")
+    from game_engine import _log_highlight, _min_sortkey
+    _timed = sorted([(int(e[0]), e[1]) if isinstance(e, tuple) else
+                     (random.randint(1, 90), str(e)) for e in events],
+                    key=lambda x: _min_sortkey(x[0]))
+    hi = _log_highlight(goals, assists, _timed)
+    if hi:
+        add_log(f"   {hi}", "match")
 
 
 # ─────────────────────────────────────────────
