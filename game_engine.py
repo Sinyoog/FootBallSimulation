@@ -50,6 +50,12 @@ def fmt_money(amount_k: int) -> str:
     if amount_k <= 0:
         return "무급"
     won = amount_k * 1000
+    if won >= 1000000000000:    # 1조 이상 (1조 = 10,000억 = 1,000,000,000,000원)
+        jo  = won // 1000000000000
+        eok = (won % 1000000000000) // 100000000
+        if eok:
+            return f"{jo:,}조 {eok:,}억원"
+        return f"{jo:,}조원"
     if won >= 100000000:        # 1억 이상
         return f"{won/100000000:.2f}억원"
     if won >= 10000000:         # 1천만 이상
@@ -1454,7 +1460,14 @@ def _simulate_match(p, week, info: dict):
     played  = not benched and not p.get("injured")
 
     if played:
-        bonus = my_ovr * 0.08
+        # [에이스 영향력] 내가 팀 평균보다 높을수록 팀을 끌어올린다.
+        #   - 11명 중 1명이지만, 에이스는 경기 영향력이 산술평균 이상.
+        #   - gap(내 OVR - 팀평균) 기반으로 강하게 주되, 1명의 한계로 상한을 둔다.
+        #   - 메시급(약팀에서도 캐리)을 재현하되 11명 게임의 한계는 유지.
+        team_avg = home_ovr if is_home else away_ovr
+        gap = my_ovr - team_avg
+        bonus = max(0.0, gap) * 0.32 + my_ovr * 0.05
+        bonus = min(bonus, 14.0)
         if is_home: home_ovr += bonus
         else:       away_ovr += bonus
 
@@ -1486,7 +1499,7 @@ def _simulate_match(p, week, info: dict):
     if played:
         goals, assists, saves, rating, events, detail = _player_perf(p, outcome, is_home, hs, as_, c=c)
         if p.get("slump"):
-            rating = max(3.0, rating + SLUMP_RATING_PENALTY)
+            rating = round(max(3.0, rating + SLUMP_RATING_PENALTY), 1)
 
     my_result = _my_result(outcome, is_home)
 
@@ -1617,7 +1630,13 @@ def _league_avg_ovr(c, league_id):
 # ══════════════════════════════════════════════════════════════
 DOMINANCE_K       = 0.045   # 격차 1당 배수 증가폭 (↑일수록 격차 영향 큼)
 DOMINANCE_MIN     = 0.35    # 최저 배수 (강한 리그에서 위축 하한)
-DOMINANCE_MAX     = 2.80    # 최고 배수 (약체리그 무쌍 상한)
+DOMINANCE_MAX     = 4.50    # 최고 배수. [수정] 기존 2.80(OVR55에서 포화)은 약체리그
+                            #   에서 OVR 55나 100이나 똑같이 무쌍이 되는 문제가 있었다.
+                            #   상한을 풀어(4.5) '리그 평균 대비 격차'가 곧 실력차로 반영되게 한다.
+                            #   OVR은 100이 최대이므로 격차의 자연 상한은 (100-리그평균)으로 정해진다.
+                            #   예) 리그30선 OVR100 격차+70 → dom 4.15(압도적 무쌍, 한경기 다득점),
+                            #       리그80선 OVR100 격차+20 → dom 1.90(적당한 우위).
+                            #   골/평점/세부지표는 아래에서 dom이 높을수록 체감(제곱근)하도록 관리.
 GOAL_PROB_CAP     = 0.85    # 경기당 골 시도 성공확률 상한 (무쌍 방지)
 ASSIST_PROB_CAP   = 0.45    # 경기당 어시 확률 상한
 
@@ -1841,9 +1860,32 @@ def _describe_goal(goal_idx, total_goals, minute, my_final, opp_final, dom, excl
     return pick("normal")
 
 
-def _player_perf(p, outcome, is_home, hs, as_, c=None):
+def _poisson(lam):
+    """경기당 활동 횟수(키패스·드리블·차단 등)를 포아송 분포로 뽑는다.
+    λ(기대값)는 스탯·포지션·지배력으로 산출된 값. 같은 λ라도 경기마다
+    결과가 흔들려(어떤 날 8개, 어떤 날 1개) 시즌 누적에 현실적 분산이 생긴다.
+    Knuth 알고리즘. λ가 크면(>30) 비용 절감 위해 정규근사로 대체."""
+    if lam <= 0:
+        return 0
+    if lam > 30:
+        # 정규근사 (평균 λ, 분산 λ)
+        return max(0, int(round(random.gauss(lam, lam ** 0.5))))
+    L = 2.718281828459045 ** (-lam)
+    k = 0
+    pr = 1.0
+    while True:
+        k += 1
+        pr *= random.random()
+        if pr <= L:
+            return k - 1
+
+
+def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None):
     # c: _simulate_match 가 이미 열어둔 커서. 있으면 재사용해 커넥션 개폐 0회.
     #    (없으면 하위 헬퍼가 자체적으로 캐시/기본값을 사용 — 호환 유지)
+    # opp_ovr: [국제대회용] 상대 '팀' OVR(국가대표 평균 전력). 주어지면 dom 기준을
+    #    클럽 리그 평균이 아니라 이 상대 OVR로 잡는다. → 강팀(브라질) 상대면 dom이
+    #    낮아 개인도 고전, 약체국 상대면 dom이 높아 골·평점 폭발. 클럽 경기는 None.
     pos     = p["position"]
     pers    = p.get("personality","성실함")
     base    = 6.0
@@ -1859,29 +1901,48 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None):
     # ── 지배력 배수: 내 OVR vs 현재 리그 평균 OVR ──
     # 격차가 클수록 개인 활약(골/어시/선방/무실점)이 폭발, 작거나 음수면 위축.
     _my_ovr = p.get("ovr", 50)
-    _lid    = p.get("current_league_id", 0)
-    _lg_avg = 50.0
-    if _lid:
-        try:
-            if c is not None:
-                _lg_avg = _league_avg_ovr(c, _lid)   # 커서 재사용 + 캐시
-            else:
-                _c_dom = get_conn()
-                _lg_avg = _league_avg_ovr(_c_dom.cursor(), _lid)
-                _c_dom.close()
-        except Exception:
-            _lg_avg = 50.0
+    if opp_ovr is not None:
+        # [국제대회] 상대 국가대표 평균 OVR을 dom 기준으로. 클럽 리그 평균 무시.
+        _lg_avg = opp_ovr
+    else:
+        _lid    = p.get("current_league_id", 0)
+        _lg_avg = 50.0
+        if _lid:
+            try:
+                if c is not None:
+                    _lg_avg = _league_avg_ovr(c, _lid)   # 커서 재사용 + 캐시
+                else:
+                    _c_dom = get_conn()
+                    _lg_avg = _league_avg_ovr(_c_dom.cursor(), _lid)
+                    _c_dom.close()
+            except Exception:
+                _lg_avg = 50.0
     dom = _dominance_mult(_my_ovr, _lg_avg)
 
     # ── [평점 베이스라인] OVR-리그격차를 평점 시작점에 직접 반영 ──────
     #   기존엔 누구나 base=6.0에서 출발해 OVR 26 차이가 평점 0.3~0.5밖에
     #   안 벌어졌다(리그 바닥과 월클이 거의 동일). dom(격차 배수)을 base에
     #   실어 '잘하는 선수는 높은 데서, 못하는 선수는 낮은 데서' 출발시킨다.
-    #     dom 0.35(압도적 약체) → base≈5.5
-    #     dom 1.00(리그 평균)   → base≈6.3
-    #     dom 1.80(압도적 강자) → base≈7.1
-    #   이후 골/어시/무실점 가산이 얹혀 최종 평점 분포가 5.5~8.x로 펴진다.
-    base = 5.0 + 0.85 * min(1.9, dom)   # detail 활약 가산을 더하므로 출발점을 약간 낮춤
+    #   [수정5] dom이 높을 때(약체리그 군림) base가 선형으로 8점대까지 치솟아,
+    #   ST가 골·어시 0인데도 평점 7.6이 나오는 문제가 있었다(실제 게임). 약체리그
+    #   군림은 '골을 많이 넣어서' 고평점이어야지, 가만히 있어도 고평점이면 안 된다.
+    #   dom>1.0 구간을 제곱근으로 눌러(체감형) base 상단을 제한한다. 골/어시/활약
+    #   가산이 그 위에 얹혀 '잘한 만큼' 평점이 오르게 한다.
+    #     dom 0.35(강한 리그서 고전) → base≈5.85
+    #     dom 1.00(리그 평균)        → base≈6.55  (+가산 → 최종 ~6.6)
+    #     dom 1.90 → base≈6.95, dom 3.0 → base≈7.25, dom 4.0 → base≈7.45
+    #   [수정6] min(1.9,dom) 캡 제거 + 곡선 완만화. OVR 높을수록 base가 계속 오르되
+    #   기울기를 더 낮춰(0.90→0.62) 압도적 무쌍이어도 시즌평균이 8점 안팎에 머물게.
+    #   (한 경기 폭발은 골 가산으로 9점대 가능, 시즌평균 9점대는 비현실이라 방지)
+    #   [수정7] base 시작점 6.50→6.20, dom 가산 기울기 0.62→0.42, 지수 0.55→0.50.
+    #     기존엔 OVR 67(약체리그 dom 2.4) ST가 골 0인데도 base 7.24 → 평점 7.3이
+    #     나왔다(실제 게임). '가만히 있어도 고평점' 문제. 곡선을 더 눌러서
+    #     군림해도 base는 6점대 중반에 머물고, 골/어시(+1.0/+0.75)가 그 위에
+    #     얹혀야 7점대가 되도록 한다. (OVR67 골0 → base≈6.70 → 평점 6.5~6.9)
+    if dom >= 1.0:
+        base = 6.20 + 0.42 * ((dom - 1.0) ** 0.50)
+    else:
+        base = 6.20 + 1.55 * (dom - 1.0)   # dom<1.0(언더독)은 선형으로 확실히 하락
 
     # ── [실점 타임라인] 상대 득점(opp_score)만큼 실점 분(分)을 배정 ──────
     #   누가 넣었는지는 시뮬이 상대 선수를 굴리지 않아 알 수 없으므로
@@ -1926,18 +1987,32 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None):
         _ovr_t = max(0.0, min(1.0, (_gk_ovr - 40) / 45))
         _sr_center = _sr_min + (_sr_max - _sr_min) * _ovr_t
         # 지배력 보정: 리그 평균보다 월등하면 선방률 추가 상승 (상한 92%)
-        _sr_center = min(0.92, _sr_center * (0.7 + 0.3 * dom))
+        #   [수정] 약체 리그를 군림하는 GK(dom 1.8)는 약한 슈팅을 상대하므로
+        #   선방률이 더 높아야 한다. 기존 (0.7+0.3·dom)은 OVR이 낮으면(46) dom을
+        #   곱해도 0.53에 그쳐, 약체리그 군림 GK가 늘 선방률 페널티를 받았다.
+        #   dom 가산을 키워(0.55+0.45·dom) 약체 상대 시 선방률이 확실히 오르게 한다.
+        _sr_center = min(0.92, _sr_center * (0.55 + 0.45 * dom))
         # 경기마다 ±4% 랜덤 변동
         _sr_target = max(_sr_min, min(0.92, _sr_center + random.uniform(-0.04, 0.04)))
 
-        # 유효슈팅 수: 무실점 과다를 줄이기 위해 상향(상대 공격량↑).
-        # 1부 6~10, 2부 5~9, 3부 4~8 (과도한 실점 누적은 방지)
+        # 유효슈팅 수: [설계] 현실의 역설을 반영한다 —
+        #   "약팀 GK가 선방을 더 많이 한다"(슈팅 폭격 노출), 동시에
+        #   "강팀 GK가 클린시트를 더 많이 한다"(애초에 슈팅을 덜 맞음).
+        #   ※ 경기당 상대 유효슈팅(SoT)은 현실에서 평균 ~3~5개. 38경기 환산 시
+        #     강팀 GK 선방 70~95, 약팀 GK 100~133 수준이 목표.
+        #   dom(팀 강함 근사)으로 피격량을 역가중: 강팀일수록 적게 맞는다.
+        #   실점(opp_score)은 이미 결정돼 있으므로, '실점에 더해 막아낸 유효슈팅'만 더한다.
+        #   기준 피격 SoT(_base_sot)는 작게(평균 3~4), dom 역가중을 곱한다.
         if _tier == 1:
-            total_shots = opp_score + random.randint(4, 9)
+            _base_sot = random.choices([1, 2, 3, 4, 5], [10, 24, 30, 22, 14])[0]
         elif _tier == 2:
-            total_shots = opp_score + random.randint(3, 8)
+            _base_sot = random.choices([1, 2, 3, 4, 5], [8, 22, 30, 24, 16])[0]
         else:
-            total_shots = opp_score + random.randint(2, 7)
+            _base_sot = random.choices([1, 2, 3, 4, 5, 6], [6, 18, 26, 24, 16, 10])[0]
+        # dom 1.0→×1.0, dom 1.8(강팀)→×0.62, dom 0.5(약팀)→×1.45 (피격 노출 역가중)
+        _expose = max(0.55, min(1.7, 1.45 - 0.46 * min(2.2, dom)))
+        extra_sot = max(0, int(round(_base_sot * _expose)))
+        total_shots = opp_score + extra_sot
         total_shots = max(opp_score + 1, total_shots)  # 최소 실점+1
 
         # 목표 선방률로 선방 수 역산
@@ -1946,17 +2021,43 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None):
         saves = max(0, saves)
 
         rate = (saves + opp_score) and saves / total_shots or 0
-        # 선방 퍼포먼스를 평점에 더 강하게 반영(잘한 GK와 못한 GK 격차↑).
-        if rate >= 0.80: base += 1.4; events.append("🧤 환상적인 선방쇼!")
-        elif rate >= 0.72: base += 0.9; events.append("🧤 훌륭한 선방!")
-        elif rate >= 0.62: base += 0.3
-        elif rate < 0.45: base -= 0.8; events.append("😞 불안한 선방...")
-        if opp_score == 0: base += 0.6; events.append("🧱 클린시트!")
-        elif opp_score >= 4: base -= 1.4; events.append("😞 대량 실점...")
-        elif opp_score >= 3: base -= 0.8; events.append("😞 다실점...")
+        _faced = total_shots          # 받은 유효슈팅 수
+        # ── [GK 평점] 핵심은 '선방 퀄리티'(OVR·기량 반영), 무실점은 보조 ──────
+        #   [수정] 선방률 보너스·페널티는 '받은 슈팅이 충분(3개+)'할 때만 적용한다.
+        #   슈팅 1~2개만 받은 경기는 표본이 작아 선방률이 들쭉날쭉(0%/50%/100%)해서,
+        #   '무실점(0:0)인데 불안한 선방 페널티'(-1.1) 같은 모순이 생겼다(실제 버그).
+        #   또한 무실점 경기엔 선방률 페널티를 절대 주지 않는다(한 골도 안 먹었으니).
+        if _faced >= 3:
+            if rate >= 0.85: base += 1.4 + 0.6 * _ovr_t; events.append("🧤 믿을 수 없는 선방쇼!")
+            elif rate >= 0.78: base += 0.9 + 0.4 * _ovr_t; events.append("🧤 환상적인 선방!")
+            elif rate >= 0.70: base += 0.45 + 0.2 * _ovr_t; events.append("🧤 안정적인 선방")
+            elif rate >= 0.60: base += 0.1
+            elif opp_score > 0 and rate < 0.45: base -= 1.0; events.append("😞 불안한 선방...")
+            elif opp_score > 0 and rate < 0.55: base -= 0.4
+        else:
+            # 슈팅을 거의 안 받은 경기: 막은 게 있으면 소폭 가산, 없으면 중립.
+            #   [수정] 고OVR(기량) GK는 적게 막아도 안정감 가산↑ (OVR 변별 유지).
+            if saves >= 2: base += 0.3 + 0.25 * _ovr_t; events.append("🧤 안정적인 선방")
+            elif saves == 1: base += 0.1 + 0.15 * _ovr_t
+            elif opp_score == 0: base += 0.15 * _ovr_t   # 편한 무실점도 고OVR이면 소폭
+        # 피격 부담 보정: 유효슈팅을 많이 받아내며 막았으면 가산(난사를 버틴 날).
+        if _faced - opp_score >= 5 and rate >= 0.70:
+            base += 0.4; events.append("🛡 슈팅 세례를 막아냄")
+        # 무실점: 고정 보너스를 더 축소(0.3→0.15). 편한 무실점에 평점이 과하게
+        #   붙던 문제 방지. 무실점이어도 결국 '얼마나 막았나(rate)'가 평점을 좌우.
+        #   [수정] 대량실점 페널티 완화: GK 대량실점은 수비 붕괴 탓이 큰데 기존
+        #   페널티(-1.5)가 베이스 하락과 겹쳐 평점이 3점대로 과하게 떨어졌다.
+        if opp_score == 0:
+            base += 0.15; events.append("🧱 클린시트!")
+        elif opp_score >= 5: base -= 1.1; events.append("😞 대량 실점...")
+        elif opp_score >= 4: base -= 0.8; events.append("😞 대량 실점...")
+        elif opp_score >= 3: base -= 0.5; events.append("😞 다실점...")
+        elif opp_score >= 2: base -= 0.2
         # GK 세부지표: 패스성공률만 의미 (분배 능력). 슈팅/드리블/차단은 0.
         _pa_gk = _stat_n(p, "passing")
         detail["pass_acc"] = round(min(0.97, 0.70 + 0.22 * _pa_gk + random.uniform(-0.03, 0.03)), 3)
+        # GK 배급(분배) 미세 평점: 패스성공률 0.82 기준 ±(소폭).
+        base += 0.8 * (detail["pass_acc"] - 0.82)
     else:
         # ── 골/어시: 지배력 배수 × 포지션 × 개인 스탯(플레이스타일) ──
         # 슈팅↑=골, 패스↑=어시, 드리블↑=둘 다 약간, 세트피스↑=보너스골.
@@ -1988,29 +2089,64 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None):
             a_base, a_pa, a_dr = 0.03, 0.10, 0.04
             g_pos_mult = 0.32
 
-        gprob = min(GOAL_PROB_CAP, (g_base + sh * g_sh + dr * g_dr) * dom)
-        aprob = min(ASSIST_PROB_CAP, (a_base + pa * a_pa + dr * a_dr) * dom)
+        # [수정] 경기당 득점/어시 확률. dom 을 풀로 곱하면 약체리그(dom 2.5+)에서
+        #   거의 매 경기 득점 → 시즌 골 폭주. dom 영향을 거듭제곱으로 완만화하되,
+        #   [수정2] 지수를 0.55→0.72로 올린다. OVR 낮은 ST(슈팅스탯↓)가 약체리그를
+        #   군림(dom 2.1)해도 골 확률이 0.36에 그쳐 58% 경기가 무득점이었다.
+        #   약체 군림 ST는 절반 이상 득점해야 정상 → dom 영향을 키운다.
+        #   dom 1.0→1.0, dom 2.12→약 1.71 (기존 1.51 대비 강화).
+        #   [수정5] dom 지수를 포지션 골성향에 연동. 공격수(g_pos_mult 1.55)는 0.72로
+        #   골이 dom 따라 크게 늘되, 수비수(0.32)는 지수를 낮춰(0.40) 약체리그라도
+        #   골이 천천히만 는다. 'OVR 100 CB가 14경기 13골' 같은 폭주를 막는다.
+        _gdom_exp = 0.40 + 0.32 * (g_pos_mult / 1.55)   # ST≈0.72, CM≈0.52, CB≈0.47
+        _gdom = dom ** _gdom_exp
+        # [수정3] 약체 상대 가산항: 상대 수비가 약하면 슈팅스탯이 낮아도 골이
+        #   들어간다. 단 dom 1.3 초과분에만 적용(강팀리그 dom 1.2~1.5는 영향 최소화).
+        #   [수정4] 포지션 골성향(g_pos_mult)에 비례시킨다. 기존엔 포지션 무관 일정
+        #   이라 약체리그 CB가 14경기 13골 넣는 폭주가 났다. 공격수(g_pos_mult 1.55)는
+        #   보너스 풀로, 수비수(0.32)는 1/5만 받아 '수비수 골 폭주'를 막는다.
+        _pos_goal_scale = g_pos_mult / 1.55       # ST=1.0, CM=0.39, CB=0.21
+        _weak_bonus = 0.20 * max(0.0, dom - 1.3) * _pos_goal_scale
+        gprob = min(GOAL_PROB_CAP, (g_base + sh * g_sh + dr * g_dr) * _gdom + _weak_bonus)
+        aprob = min(ASSIST_PROB_CAP, (a_base + pa * a_pa + dr * a_dr) * _gdom + 0.5 * _weak_bonus)
 
         # 골 (내 팀 득점 my_score 이내로 클램프)
         #   각 골마다 분(分)을 배정하고, 그 시점의 점수 흐름으로 골 종류를 분류한다.
         #   events 에는 (분, 텍스트) 튜플로 넣어 _write_match_log 가 시간순 정렬.
         got_goal = False
         if my_score > 0 and random.random() < gprob:
-            # ── 골 개수: 고정 분포 대신 '기대골(xg)' 기반 ──────────────
-            #   같은 OVR이라도 슈팅·결정력이 좋고 약체 상대(dom↑)일수록 멀티골이 잦다.
-            #   xg = 포지션 골성향 × 슈팅능력(0.4~1.0) × dom.
-            #   예) 슈팅90 ST가 평균50 리그(dom≈1.5) → xg 높아 2~3골 자주
-            #       슈팅50 CM이 비슷한 리그 → xg 낮아 대부분 1골.
-            #   실제 골 수는 xg를 기대값으로 하는 가중 분포에서 뽑고 my_score로 클램프.
-            xg = g_pos_mult * (0.40 + 0.60 * sh) * dom
-            xg = max(0.5, min(4.2, xg))         # 한 경기 기대골 현실 범위
+            # ── 골 개수: '기대골(xg)' 기반 + 엘리트 상단 꼬리 ──────────────
+            #   설계 원칙: 평균은 현실(평범한 주전 ST ~15골/38경기)을 지키되,
+            #   결정력·OVR이 극단적으로 높은 선수는 '폭발 시즌'(메시 50골급)이
+            #   가능해야 한다. 즉 평균은 누르고 상단 분산은 연다.
+            #
+            #   xg 구성:
+            #     - 베이스: 포지션 골성향 × 슈팅스탯(0.4~1.0) × dom(멀티골 캡)
+            #     - 엘리트 가산: shooting 스탯이 0.8(≈OVR 86+) 넘는 구간부터
+            #       초선형으로 멀티골 천장을 올린다(elite). OVR 99 결정력 괴물은
+            #       한 경기 4~5골도 드물게 가능 → 시즌 폭발의 씨앗.
+            #   dom 캡은 약체리그 평균 폭주를 막되, elite 가산은 dom과 무관하게
+            #   '개인 기량'으로 상단을 열어 강팀리그에서도 역대급 시즌이 나오게 한다.
+            #   [수정] sh_dom 캡(1.55)이 OVR 변별을 죽였다(dom 2든 4든 동일).
+            #   dom을 곡선(제곱근 체감)으로 반영해, OVR이 높을수록 멀티골이 계속
+            #   늘되 폭주하지 않게 한다. + 포지션 연동: 공격수는 멀티골 잘 나되
+            #   수비수는 dom 영향을 약하게(_pos_goal_scale) 줘서 멀티골을 억제한다.
+            sh_dom = 1.0 + 0.85 * ((max(1.0, dom) - 1.0) ** 0.62) * (0.4 + 0.6 * _pos_goal_scale)
+            xg = g_pos_mult * (0.40 + 0.60 * sh) * sh_dom
+            # 엘리트 결정력 가산: sh 0.80→0, 0.90→약 +0.45, 1.0→약 +1.1 (초선형)
+            if sh > 0.80:
+                xg += g_pos_mult * 11.0 * (sh - 0.80) ** 2
+            xg = max(0.5, min(5.5, xg))         # 상한 상향(약체리그 무쌍 멀티골 허용)
             # xg를 평균으로 하는 분포: 낮으면 1골 위주, 높으면 멀티골 확률 상승.
             #   각 골당 '추가 득점' 확률 = xg 비례(체감형). 최대 6골.
+            #   [수정] 체감률(decay)을 결정력에 연동: 평범한 선수는 급감(0.50),
+            #   엘리트는 완만(최대 0.66)해 멀티골이 더 잘 이어진다 → 상단 꼬리 확장.
             goals = 1
-            extra_p = max(0.0, min(0.85, (xg - 0.8) / 4.0))  # 2골+로 갈 확률
+            decay = 0.50 + 0.16 * max(0.0, sh - 0.6) / 0.4   # sh 0.6→0.50, 1.0→0.66
+            extra_p = max(0.0, min(0.88, (xg - 0.8) / 3.6))  # 2골+로 갈 확률
             while goals < 6 and random.random() < extra_p:
                 goals += 1
-                extra_p *= 0.55                  # 골 늘수록 다음 골은 급격히 어려워짐
+                extra_p *= decay                 # 골 늘수록 다음 골은 어려워짐(엘리트는 완만)
             goals = min(goals, my_score)
             base += goals * 1.0
             got_goal = True
@@ -2033,13 +2169,27 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None):
             events.append((random.randint(10, 88), "🎯 환상적인 세트피스 골!"))
 
         # 어시 (골과 독립 판정. 골 넣은 경기는 어시 확률 절반 — 한 장면 중복 방지)
+        #   [설계] 골과 동일 철학: 평균은 현실(엘리트 플레이메이커 ~10~15/시즌),
+        #   상단 꼬리는 '창조력(passing 스탯)'으로 연다. KDB·Fernandes급(passing 만점)
+        #   은 한 경기 2어시가 잦아 시즌 18~21어시(역대 기록권)가 가능해야 한다.
+        #   - 평범한 선수: 1어시 위주
+        #   - 엘리트(pa>0.80): 멀티어시 확률 초선형 상승
         rem = my_score - goals
         if rem > 0:
             eff_aprob = aprob * 0.5 if got_goal else aprob
             if random.random() < eff_aprob:
-                assists = random.choices([1, 2], [82, 18])[0] if rem >= 2 else 1
+                # 멀티어시 확률: 기본 15%에 창조력 엘리트 가산(pa 0.85→+0, 1.0→+0.18).
+                #   역대 단일시즌 최고가 ~20-21어시이므로 가산을 보수적으로 둔다.
+                multi_p = 0.15
+                if pa > 0.85:
+                    multi_p += 1.2 * (pa - 0.85)            # 최대 +0.18
+                multi_p = min(0.34, multi_p)
+                assists = random.choices([1, 2], [1 - multi_p, multi_p])[0] if rem >= 2 else 1
                 assists = min(assists, rem)
-                base += 0.5 * assists
+                # [수정] 어시 가산 0.5→0.75. 어시는 명백한 공격포인트인데 0.5는
+                #   약해서 '어시 1개 했는데 평점 5.9'(실제 게임) 같은 저평가가 났다.
+                #   골(1.0)의 약 0.75배로 올려 공격포인트가 평점에 제대로 반영되게 함.
+                base += 0.75 * assists
                 a_mins = _sample_minutes(assists, 5, 88)
                 a_txts = ["🅰 정확한 어시스트!", "🅰 결정적 도움!", "🅰 키패스로 어시스트!",
                           "🅰 환상적인 패스로 어시!", "🅰 침투 패스 어시스트!"]
@@ -2047,6 +2197,18 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None):
                     events.append((am, random.choice(a_txts)))
                 if assists >= 2:
                     events.append((a_mins[-1], "🅰🔥 멀티 어시스트!"))
+
+        # ── [무득점 공격수 감점] ─────────────────────────────────
+        #   공격 포지션은 골/어시가 평점의 핵심이다. 약체리그 군림(dom↑)으로 base가
+        #   높아도, 골·어시가 0이면 '제 역할을 못한 경기'이므로 감점한다.
+        #   - ST/CF: 가장 강하게(-0.6). 골이 본업.
+        #   - LW/RW/CAM: 중간(-0.4). 골+창조 둘 다 기대.
+        #   - CM: 약하게(-0.2). 미드는 빌드업 기여로 일부 상쇄.
+        #   - 수비/CDM/GK: 감점 없음(골·어시가 본업이 아님).
+        if goals == 0 and assists == 0:
+            _scoreless_pen = {"ST": 0.6, "CF": 0.6, "LW": 0.4, "RW": 0.4,
+                              "CAM": 0.4, "CM": 0.2}.get(pos, 0.0)
+            base -= _scoreless_pen
 
         # ── [세부 지표] 슈팅/유효슈팅/키패스/드리블/차단/패스성공 ──────
         #   골/어시와 동일 체계: 정규화 스탯 × 포지션 성향 × 지배력(dom).
@@ -2075,26 +2237,41 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None):
             shot_w, key_w, drb_w, blk_w = 0.3, 0.5, 0.4, 1.70
 
         # 슈팅: 슈팅·포지셔닝 스탯 × 공격성향 × dom. 유효슈팅은 그중 일부(결정력=shooting).
-        shots = int(round(shot_w * (0.4 + 0.6 * sh) * dom + random.uniform(0, 1)))
-        shots = max(0, shots)
-        on_ratio = 0.30 + 0.35 * sh                       # shooting 높을수록 유효슈팅 비율↑
-        shots_on = int(round(shots * on_ratio + random.uniform(0, 0.5)))
+        #   [수정] 절대량이 과다(ST 38경기 환산 ~157회, 현실 홀란드급 ~120)했다.
+        #   계수를 약 0.72배로 낮추고 dom 영향은 곡선(제곱근)으로 반영(OVR 변별 유지).
+        #   [수정] min(1.6,dom) 캡 제거 — OVR 높을수록 슈팅·드리블·키패스도 계속 늘되
+        #   제곱근으로 완만히. dom 1.0→1.0, 2.0→1.5, 3.0→1.85, 4.0→2.15.
+        _att_dom = 1.0 + 0.72 * ((max(1.0, dom) - 1.0) ** 0.62)
+        shots = int(round(shot_w * 0.72 * (0.4 + 0.6 * sh) * _att_dom + random.uniform(0, 0.7)))
+        shots = max(goals, shots)   # 골 수보다 슈팅이 적을 순 없다(저슈팅 포지션 비율 왜곡 방지)
+        # 유효슈팅 비율: 기존 0.30~0.65 → 현실(EPL 평균 ~33~40%, 최상위도 ~45% 미만).
+        #   결정력(shooting) 높을수록 비율↑ 이되 상한을 낮춰 71% 같은 비현실값을 제거.
+        #   ※ 저슈팅 포지션(CB·CM)은 표본이 작아 경기별 비율 변동이 크지만,
+        #     시즌 누적으로 보면 슈팅·유효 절대량이 작아 왜곡 영향은 미미하다.
+        on_ratio = 0.28 + 0.16 * sh                       # sh 0→28%, sh 1.0→44%
+        shots_on = int(round(shots * on_ratio + random.uniform(0, 0.4)))
         shots_on = max(min(shots, goals), min(shots, shots_on))  # 최소 골 수 이상
         # 키패스(기회창출): 패스·드리블 × 창의 성향 × dom
-        key_passes = int(round(key_w * (0.35 + 0.4 * pa + 0.25 * dr) * dom + random.uniform(0, 1)))
+        #   [수정] 기존엔 경기별 변동(uniform 0~0.8)이 작아 시즌 누적 키패스가
+        #   사실상 고정값(분산≈0)이었다. 경기당 기대 키패스를 λ로 보는 포아송으로
+        #   뽑아 '어떤 날은 8개, 어떤 날은 1개'의 현실적 변동을 만든다.
+        #   → 시즌 키패스에 분산이 생겨 평범한 날과 폭발한 경기가 구분됨.
+        _kp_lambda = key_w * 0.66 * (0.35 + 0.4 * pa + 0.25 * dr) * _att_dom
+        key_passes = _poisson(_kp_lambda)
         key_passes = max(assists, key_passes)             # 최소 어시 수 이상
         # 드리블 성공: 드리블·스피드 × 성향 × dom
-        dribbles = int(round(drb_w * (0.4 + 0.45 * dr + 0.15 * spd) * dom + random.uniform(0, 1)))
-        dribbles = max(0, dribbles)
+        #   [수정] 경기별 포아송 변동으로 '드리블 폭발한 경기'가 생기게 한다.
+        _drb_lambda = drb_w * 0.78 * (0.4 + 0.45 * dr + 0.15 * spd) * _att_dom
+        dribbles = _poisson(_drb_lambda)
         # 차단(태클+인터셉트): 태클·포지셔닝 × 수비성향. 약체 상대(dom↑)면 상대 공격이
         #   적어 차단 기회도 다소 줄지만(완만한 역방향), 수비수의 기본 활동량이 핵심.
         #   ※ 재조정: 상수항을 줄이고(0~1.2→0~0.5) 스탯 의존도를 키워,
         #     평균이 현실 범위(CB 14경기 18~28회)로 내려가고 잘함/못함 격차가
         #     제대로 벌어지도록 했다. 못하는 CB는 ~14회, 월클은 ~38회 수준.
+        #   [수정] 경기별 포아송 변동 도입 → 시즌 차단 누적에 자연스러운 분산.
         _blk_dom = 1.25 - 0.25 * min(1.4, dom)   # dom 1.0→1.0, 강팀일수록 소폭↓
-        blocks = int(round(blk_w * (0.30 + 0.90 * ta + 0.45 * po) * _blk_dom
-                           + random.uniform(0, 0.5)))
-        blocks = max(0, blocks)
+        _blk_lambda = blk_w * (0.30 + 0.90 * ta + 0.45 * po) * _blk_dom
+        blocks = _poisson(_blk_lambda)
         # 패스 성공률: 개인 패스 스탯 + 리그 수준 보정.
         #   리그 평균 OVR(_lg_avg)이 높을수록(빅리그) 팀 전체 빌드업 안정성↑ →
         #   같은 패스 스탯이라도 EPL은 높고, 약소국 리그는 낮게 나온다.
@@ -2115,15 +2292,20 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None):
 
         # 수비 라인 평점 보정 (무실점 기여). 단, OVR-격차(dom)에 비례시켜
         #   '못하는 수비수가 팀 무실점에 묻어가 평점을 거저 받는' 문제를 막는다.
-        #   dom 0.35(약체)→보너스 0.25배, dom 1.0(평균)→0.6배, dom 1.8(강자)→1.0배.
+        #   [수정] 기존엔 무실점/실점 스윙이 너무 커서(무실점 7.65 vs 실점 6.80)
+        #   '개인은 잘했는데 팀이 실점하면 평점 폭락'했다. 결과 종속을 줄이고
+        #   (보너스·페널티 축소) 개인 차단 활약(아래 3층 perf)이 더 좌우하게 한다.
+        #   dom 0.35(약체)→0.25배, dom 1.0→0.6배, dom 1.8→1.0배.
         if pos in DEF_POS:
             _cs_scale = max(0.25, min(1.0, 0.6 * dom))
             if opp_score == 0:
-                base += 1.0 * _cs_scale; events.append("🧱 무실점 기여")
+                base += 0.6 * _cs_scale; events.append("🧱 무실점 기여")
             elif opp_score == 1:
-                base += 0.4 * _cs_scale
+                base += 0.25 * _cs_scale
+            elif opp_score >= 4:
+                base -= 0.7; events.append("😞 수비 붕괴")
             elif opp_score >= 3:
-                base -= 0.6; events.append("😞 수비 불안")
+                base -= 0.35; events.append("😞 수비 불안")
 
         # 긍정 이벤트
         pos_ev = _pos_events(pos, True)
@@ -2149,39 +2331,49 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None):
         #   골/어시 외의 활약(슈팅·키패스·드리블·차단·패스성공률)을 평점에 반영한다.
         #   "골 0이어도 키패스·드리블·차단이 좋으면 평점이 받쳐주고,
         #    아무것도 못 하면 평점이 떨어진다." → 평점이 경기 내용의 요약이 됨.
-        #   각 지표를 '포지션 기대치' 대비 초과분으로 평가해 ± 점수화.
-        #   포지션별 가중치: 공격수는 슈팅·드리블, 미드는 키패스, 수비는 차단·패스.
+        #   [수정] 기대치(e_*)를 실측 경기당 평균에 맞춰 재보정했다(기존엔 차단
+        #   기대치가 실제의 2배여서 평균 수비수가 늘 '기대 미달'로 깎였다).
+        #   가중치(w_*)는 포지션 정체성대로: 공격수=슈팅·드리블, 미드=키패스,
+        #   수비=차단·패스. 수비/미드는 결과 종속을 줄인 만큼 개인활약 비중을 키웠다.
         if pos in ("ST", "CF"):
-            w_shot, w_key, w_drb, w_blk = 0.10, 0.10, 0.07, 0.04
-            e_shot, e_key, e_drb, e_blk = 2.8, 1.2, 1.6, 1.2
+            w_shot, w_key, w_drb, w_blk = 0.30, 0.10, 0.08, 0.04
+            e_shot, e_key, e_drb, e_blk = 1.9, 1.0, 1.5, 0.3
         elif pos in ("LW", "RW"):
-            w_shot, w_key, w_drb, w_blk = 0.08, 0.10, 0.10, 0.05
-            e_shot, e_key, e_drb, e_blk = 2.2, 1.6, 2.4, 1.4
+            w_shot, w_key, w_drb, w_blk = 0.22, 0.12, 0.12, 0.05
+            e_shot, e_key, e_drb, e_blk = 1.4, 1.6, 2.9, 0.4
         elif pos == "CAM":
-            w_shot, w_key, w_drb, w_blk = 0.07, 0.12, 0.08, 0.06
-            e_shot, e_key, e_drb, e_blk = 1.6, 2.4, 1.6, 1.8
+            w_shot, w_key, w_drb, w_blk = 0.16, 0.22, 0.10, 0.06
+            e_shot, e_key, e_drb, e_blk = 1.1, 2.5, 2.0, 0.5
         elif pos == "CM":
-            w_shot, w_key, w_drb, w_blk = 0.05, 0.11, 0.06, 0.08
-            e_shot, e_key, e_drb, e_blk = 1.0, 1.8, 1.0, 3.0
+            w_shot, w_key, w_drb, w_blk = 0.12, 0.22, 0.10, 0.16
+            e_shot, e_key, e_drb, e_blk = 1.0, 1.9, 1.3, 1.2
         elif pos == "CDM":
-            w_shot, w_key, w_drb, w_blk = 0.03, 0.09, 0.05, 0.11
-            e_shot, e_key, e_drb, e_blk = 0.5, 1.0, 0.7, 5.0
+            w_shot, w_key, w_drb, w_blk = 0.08, 0.16, 0.08, 0.28
+            e_shot, e_key, e_drb, e_blk = 0.8, 1.2, 0.9, 2.1
         elif pos in ("LB", "RB"):
-            w_shot, w_key, w_drb, w_blk = 0.03, 0.09, 0.07, 0.10
-            e_shot, e_key, e_drb, e_blk = 0.4, 1.0, 1.0, 4.0
+            w_shot, w_key, w_drb, w_blk = 0.08, 0.16, 0.12, 0.24
+            e_shot, e_key, e_drb, e_blk = 0.8, 1.3, 1.3, 1.8
         else:  # CB
-            w_shot, w_key, w_drb, w_blk = 0.02, 0.05, 0.04, 0.12
-            e_shot, e_key, e_drb, e_blk = 0.3, 0.4, 0.3, 5.0
+            w_shot, w_key, w_drb, w_blk = 0.06, 0.10, 0.08, 0.34
+            e_shot, e_key, e_drb, e_blk = 0.7, 0.6, 0.4, 2.1
 
         # 초과분(기대치 대비) × 가중치. 잘하면 +, 부진하면 -. 과도 보정 방지로 클램프.
+        #   [수정] 기대치(e_*)를 dom에 비례시킨다. 세부지표 자체가 dom으로 스케일되므로
+        #   (약체 선수=세부지표 적음), 기대치도 같은 dom으로 낮춰야 '제 수준만큼 한
+        #   평범한 선수'가 기대미달로 깎이지 않는다. + 음수 바닥을 -0.8로 제한해
+        #   (기존 -1.6) 평범한 경기가 과하게 추락하지 않게 한다(표준 '무난 6.5~7.4').
+        _ed = max(0.4, min(1.3, dom)) * 0.78   # 기대치를 더 낮춰 평균급도 충족(perf 중립≈0)
         perf = 0.0
-        perf += w_shot * (detail["shots_on"] - e_shot)   # 유효슈팅 기준
-        perf += w_key  * (detail["key_passes"] - e_key)
-        perf += w_drb  * (detail["dribbles"] - e_drb)
-        perf += w_blk  * (detail["blocks"] - e_blk)
-        # 패스 성공률: 0.80 기준 ±. 정확하면 소폭 가산.
-        perf += 1.6 * (detail["pass_acc"] - 0.80)
-        perf = max(-1.3, min(2.0, perf))   # 평점 영향 상·하한
+        perf += w_shot * (detail["shots_on"]   - e_shot * _ed)   # 유효슈팅 기준
+        perf += w_key  * (detail["key_passes"] - e_key  * _ed)
+        perf += w_drb  * (detail["dribbles"]   - e_drb  * _ed)
+        perf += w_blk  * (detail["blocks"]     - e_blk  * _ed)
+        # 패스 성공률: 포지션 기준점 대비 ±. 수비/미드는 빌드업 비중이 커서 가중↑.
+        #   기준점도 dom으로 약간 낮춰(약체 선수는 패스성공률도 낮은 게 정상).
+        _pa_ref = (0.82 if pos in ("CB", "LB", "RB", "CDM", "CM") else 0.78) - 0.04 * (1.0 - min(1.0, dom))
+        _pa_w   = 2.4 if pos in ("CB", "LB", "RB", "CDM", "CM") else 1.4
+        perf += _pa_w * (detail["pass_acc"] - _pa_ref)
+        perf = max(-0.8, min(2.4, perf))   # 음수 바닥 완화(-1.6→-0.8): 평범한 경기 보호
         base += perf
         detail["perf_bonus"] = round(perf, 2)   # 디버그/상세창 참고용
 
@@ -2190,6 +2382,30 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None):
             base += 0.3
         if pers == "소심함" and (my_score + (0 if is_home else 0)) < opp_score:
             base -= 0.3
+
+    # ══ [결과-종속 평점 상한] 팀 결과가 개인 평점의 천장을 제한한다 ════════
+    #   현실: 팀이 0:4로 무너지면 개인이 아무리 분전해도 8점대는 잘 안 나온다.
+    #   '팀이 크게 졌는데 우리 수비수/미드가 8.5' 같은 비현실을 막는다.
+    #   단, 명백한 개인 활약(골·어시·GK 선방)은 천장을 완화한다 —
+    #   "팀은 졌지만 이 선수는 혼자 빛났다"는 정당하게 허용.
+    #   margin = 실점 - 득점 (양수 = 팀이 진 점수차).
+    _margin = opp_score - my_score
+    if _margin >= 1:
+        # 패배 점수차에 따른 기본 천장 (1점차=8.6, 2점차=8.0, 3점차=7.5, 4+점차=7.0)
+        if _margin >= 4:   _ceil = 7.0
+        elif _margin == 3: _ceil = 7.5
+        elif _margin == 2: _ceil = 8.0
+        else:              _ceil = 8.6
+        # 개인 활약 예외: 골/어시/선방이 천장을 끌어올린다(팀 패배에도 빛난 경우).
+        _ceil += 0.45 * goals          # 골 1개당 +0.45
+        _ceil += 0.30 * assists        # 어시 1개당 +0.30
+        if pos == "GK":
+            # GK는 대량실점이 본인 탓이 아닐 수 있어, 선방을 많이 했으면 천장 완화.
+            _ceil += 0.06 * max(0, saves - 3)
+        base = min(base, _ceil)
+    # 대승(팀이 크게 이긴 경우)도 평점 바닥을 약간 올린다 — 무난히 묻어간 선수 보호.
+    elif _margin <= -3 and base < 6.2:
+        base = min(6.2, base + 0.3)
 
     base = round(max(3.0, min(9.5, base + random.uniform(-0.25, 0.25))), 1)
     return goals, assists, saves, base, events, detail
@@ -2325,9 +2541,9 @@ def _write_match_log(p, week, league_name, is_home,
         add_log("   🪑 벤치 대기" if benched else "   🚑 부상 결장", "match")
     else:
         if p["position"] == "GK":
-            add_log(f"   평점 {rating}  선방 {saves}", "match")
+            add_log(f"   평점 {rating:.1f}  선방 {saves}", "match")
         else:
-            add_log(f"   평점 {rating}  골 {goals}  어시 {assists}", "match")
+            add_log(f"   평점 {rating:.1f}  골 {goals}  어시 {assists}", "match")
         # 다득점/멀티어시 같은 하이라이트만 로그에 한 줄 노출(나머진 상세 창에서).
         timed = sorted([(int(e[0]), e[1]) if isinstance(e, tuple) else
                         (random.randint(1, 90), str(e)) for e in events],

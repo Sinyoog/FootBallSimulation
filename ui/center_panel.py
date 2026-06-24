@@ -231,11 +231,7 @@ class CenterPanel(QWidget):
         row2.addStretch()
         self.lay.addLayout(row2)
 
-        # 감독 관계
-        self.lbl_mgr = QLabel("감독 관계: 50"); self.lbl_mgr.setObjectName("mgrLabel")
-        self.lay.addWidget(self.lbl_mgr)
-
-        # 팀 포메이션
+        # 팀 포메이션 (감독 관계는 위젯 내부에 표시)
         from ui.formation_widget import FormationWidget
         self.formation = FormationWidget()
         self.lay.addWidget(self.formation)
@@ -510,13 +506,57 @@ class CenterPanel(QWidget):
         self.lbl_no_match.setVisible(not has_match)
 
         # 팀 있을 때만 감독/포메이션 표시
-        self.lbl_mgr.setVisible(has_team)
         self.formation.setVisible(has_team)
         if has_team:
-            self.lbl_mgr.setText(f"감독 관계: {p.get('manager_relation',50)}")
-            self.formation.load_team(p["current_team_id"])
+            # 현재 대회 컨텍스트 감지 → 포메이션 위젯에 전달
+            _ctx = self._get_formation_context(week, p)
+            self.formation.load_team(
+                p["current_team_id"],
+                context=_ctx,
+                manager_rel=p.get("manager_relation", 50))
 
         self._update_preview()
+
+    def _get_formation_context(self, week, p):
+        """현재 주차에 진행 중인 대회 컨텍스트를 반환. 리그면 None."""
+        # 국가대표 대회 확인
+        try:
+            import intl_engine
+            from game_engine import get_state
+            st = get_state()
+            t = intl_engine.get_my_tournament(st["current_year"]) if st else None
+            if t and t.get("my_selected") == 1 and t.get("status") != "done":
+                nat = t.get("my_nat") or p.get("nationality1", "")
+                if not nat:
+                    # _my_nat 헬퍼 없이 직접 추출
+                    nat = p.get("fixed_nat") or p.get("nationality1", "")
+                return {
+                    "intl": True,
+                    "tournament_id": t["id"],
+                    "league_name": t["name"],
+                    "my_nat": nat,
+                    "stage": "group",   # get_my_match로 정확한 스테이지 알 수 있지만 group이 기본
+                    "stage_ko": "",
+                    "week": week,
+                }
+        except Exception:
+            pass
+        # 챔피언스리그 확인 (41~52주)
+        try:
+            import champions_engine
+            cl_m = champions_engine.get_my_cl_match(week)
+            if cl_m:
+                return {
+                    "cl": True,
+                    "tournament_id": cl_m["tournament_id"],
+                    "league_name": cl_m.get("league_name", ""),
+                    "stage": cl_m.get("stage", "group"),
+                    "stage_ko": cl_m.get("stage_ko", ""),
+                    "week": week,
+                }
+        except Exception:
+            pass
+        return None
 
     def _check_match(self, week, p):
         lid = p.get("current_league_id",0)

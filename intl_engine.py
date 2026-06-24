@@ -980,8 +980,11 @@ def simulate_my_match(week, p):
     is_home = info["is_home"]
     knockout = m["stage"] != "group"
 
-    # 내 출전 보너스 (클럽 경기와 동일 계수)
-    bonus = p.get("ovr", 40) * 0.08
+    # 내 출전 보너스 (격차 기반 에이스 영향력)
+    _my_ovr = p.get("ovr", 40)
+    _team_ovr = he["ovr"] if is_home else ae["ovr"]
+    _gap = _my_ovr - _team_ovr
+    bonus = min(max(0.0, _gap) * 0.32 + _my_ovr * 0.05, 14.0)
     h_ovr = he["ovr"] + (bonus if is_home else 0)
     a_ovr = ae["ovr"] + (0 if is_home else bonus)
 
@@ -992,7 +995,12 @@ def simulate_my_match(week, p):
         pso_winner = m["home"] if win_home else m["away"]
     hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
 
-    goals, assists, saves, rating, events, detail = _player_perf(p, outcome, is_home, hs, as_)
+    # [수정] 국제대회 개인 경기력은 '상대 국가대표 평균 OVR'을 dom 기준으로 삼는다.
+    #   내가 홈이면 상대는 ae(원정), 원정이면 he(홈). 강팀 상대면 개인도 고전,
+    #   약체국 상대면 골·평점 폭발 — 클럽 리그 기준이 아니라 상대 국가 강함 반영.
+    _opp_ovr = (ae["ovr"] if is_home else he["ovr"])
+    goals, assists, saves, rating, events, detail = _player_perf(
+        p, outcome, is_home, hs, as_, opp_ovr=_opp_ovr)
     my_result = _my_result(outcome, is_home)
     my_conceded = (as_ if is_home else hs)
 
@@ -1066,9 +1074,9 @@ def simulate_my_match(week, p):
     add_log(f"🌍 {comp_name}  {week}주차{marker}", "match")
     add_log(f"   {home_disp} {hs}-{as_} {away_disp}  ({rs}){pso_txt}", "match")
     if p.get("position") == "GK":
-        add_log(f"   평점 {rating}  선방 {saves}", "match")
+        add_log(f"   평점 {rating:.1f}  선방 {saves}", "match")
     else:
-        add_log(f"   평점 {rating}  골 {goals}  어시 {assists}", "match")
+        add_log(f"   평점 {rating:.1f}  골 {goals}  어시 {assists}", "match")
     from game_engine import _log_highlight, _min_sortkey
     _timed = sorted([(int(e[0]), e[1]) if isinstance(e, tuple) else
                      (random.randint(1, 90), str(e)) for e in events],
