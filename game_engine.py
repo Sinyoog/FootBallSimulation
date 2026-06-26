@@ -869,11 +869,9 @@ def advance_4weeks(schedule: list):
         p_latest = get_player()
 
         # ── 월급: 4의 배수 주차(= 한 달의 마지막 주)에서만 ──
-        # salary 지급은 total_assets 를 갱신하므로, 직전 경기/훈련 처리가
-        # assets 를 바꿨을 가능성에 대비해 최신 p 를 읽어 안전하게 더한다.
-        # (4주에 1회뿐이라 재조회 비용은 무시할 수준)
         if week % 4 == 0:
             _pay_salary(p_latest, week)
+
         _advance_week(p_latest, week, 1)
 
         # [국가대표 발탁 대기] 방금 17주 진입으로 국제대회(예선/본선)가 생성되며
@@ -3269,13 +3267,16 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
     conn = get_conn(); c = conn.cursor()
     try:
         lrow = c.execute("""SELECT l.id as lid, l.name as lname, l.tier,
-                                   cn.grade as grade
+                                   cn.grade as grade, cn.name as cname
                             FROM teams t JOIN leagues l ON t.league_id=l.id
                             JOIN countries cn ON l.country_id=cn.id
                             WHERE t.id=?""", (tid,)).fetchone()
         if not lrow:
             conn.close(); return
-        league_id, lname, tier, grade = lrow["lid"], lrow["lname"], lrow["tier"], lrow["grade"]
+        from constants import get_league_grade
+        league_id, lname, tier = lrow["lid"], lrow["lname"], lrow["tier"]
+        # 발롱도르 등 수상 판정엔 리그 등급 사용 (국대 등급 아님)
+        grade = get_league_grade(lrow["cname"], lrow["grade"])
 
         cands, league_avg = _collect_league_candidates(c, league_id)
         # 내 선수 추가
@@ -3807,7 +3808,8 @@ def _check_forced_release(p, year):
 
 
 def _my_grade_tier(p):
-    """내 소속 팀의 (국가등급, 리그티어, 국가명) 반환. 무소속이면 None."""
+    """내 소속 팀의 (리그등급, 리그티어, 국가명) 반환. 무소속이면 None.
+    [리그등급 분리] 국대 등급 대신 COUNTRY_LEAGUE_GRADE 사용."""
     tid = p.get("current_team_id", 0)
     if not tid:
         return None
@@ -3821,7 +3823,9 @@ def _my_grade_tier(p):
         conn.close()
     if not row:
         return None
-    return (row["grade"], row["tier"], row["country"])
+    from constants import get_league_grade
+    league_grade = get_league_grade(row["country"], row["grade"])
+    return (league_grade, row["tier"], row["country"])
 
 
 def _try_sell_player(p, year, cur_ovr):
@@ -3927,55 +3931,48 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
     except Exception:
         pass
 
+    # [최적화] 모든 국가의 모든 리그 standings를 한 번에 계산해 캐시
+    # 이후 루프에서 재계산 없이 조회만 한다.
+    # standings 계산: match_results에서 직접 집계 (중첩 함수 제거)
+    def _calc_standings_cached(lid):
+        """리그 standings를 conn 재사용으로 계산. 경기 없으면 []."""
+        teams_in = {r["id"]: {"id": r["id"], "name": r["name"],
+                               "pts": 0, "gd": 0, "gf": 0, "gp": 0}
+                    for r in c.execute("SELECT id, name FROM teams WHERE league_id=?",
+                                       (lid,)).fetchall()}
+        if not teams_in:
+            return []
+        for row in c.execute(
+            """SELECT home_team_id, away_team_id, home_score, away_score
+               FROM match_results WHERE league_id=? AND season=? AND home_score>=0""",
+                (lid, season)).fetchall():
+            hid, aid, hs, as_ = (row["home_team_id"], row["away_team_id"],
+                                  row["home_score"], row["away_score"])
+            for tid, gf, ga in [(hid, hs, as_), (aid, as_, hs)]:
+                if tid not in teams_in:
+                    continue
+                teams_in[tid]["gp"] += 1
+                teams_in[tid]["gf"] += gf
+                teams_in[tid]["gd"] += gf - ga
+                if gf > ga:    teams_in[tid]["pts"] += 3
+                elif gf == ga: teams_in[tid]["pts"] += 1
+        rows_out = [t for t in teams_in.values() if t["gp"] > 0]
+        return sorted(rows_out, key=lambda x: (-x["pts"], -x["gd"], -x["gf"]))
+
     c.execute("SELECT DISTINCT country_id FROM leagues WHERE tier=1")
     cids = [r["country_id"] for r in c.fetchall()]
 
-    # [최적화] 리그 ID 수집을 단일 쿼리로 (루프 내 쿼리 × 국가수×5 → 1회)
-    all_league_rows = c.execute(
-        "SELECT id, country_id, tier FROM leagues WHERE tier BETWEEN 1 AND 5"
-    ).fetchall()
-    cid_set = set(cids)
-    all_league_ids = {r["id"] for r in all_league_rows if r["country_id"] in cid_set}
+    # 모든 관련 리그 ID 수집 → standings 선계산
+    all_league_ids = set()
+    for cid in cids:
+        for tier in range(1, 6):
+            row = c.execute("SELECT id FROM leagues WHERE country_id=? AND tier=?",
+                            (cid, tier)).fetchone()
+            if row:
+                all_league_ids.add(row["id"])
 
-    # [최적화] standings 계산을 단일 JOIN 쿼리로 전체 한 번에 처리
-    # 기존: 리그마다 _calc_standings_cached() 호출 (리그수 × 2 쿼리)
-    # 변경: match_results + teams JOIN으로 모든 리그 집계를 1쿼리로
-    if all_league_ids:
-        ph = ",".join("?" for _ in all_league_ids)
-        _all_match_rows = c.execute(
-            f"""SELECT league_id, home_team_id, away_team_id, home_score, away_score
-                FROM match_results
-                WHERE league_id IN ({ph}) AND season=? AND home_score>=0""",
-            (*all_league_ids, season)).fetchall()
-        _all_team_rows = c.execute(
-            f"SELECT id, name, league_id FROM teams WHERE league_id IN ({ph})",
-            tuple(all_league_ids)).fetchall()
-    else:
-        _all_match_rows = []
-        _all_team_rows = []
-
-    # Python에서 standings 집계
-    _raw: dict = {}  # {league_id: {team_id: {pts,gd,gf,gp,id,name}}}
-    for r in _all_team_rows:
-        _raw.setdefault(r["league_id"], {})[r["id"]] = {
-            "id": r["id"], "name": r["name"], "pts": 0, "gd": 0, "gf": 0, "gp": 0}
-    for r in _all_match_rows:
-        lid = r["league_id"]
-        tbl = _raw.get(lid, {})
-        for tid, gf, ga in [(r["home_team_id"], r["home_score"], r["away_score"]),
-                            (r["away_team_id"], r["away_score"], r["home_score"])]:
-            if tid not in tbl:
-                continue
-            tbl[tid]["gp"] += 1
-            tbl[tid]["gf"] += gf
-            tbl[tid]["gd"] += gf - ga
-            if gf > ga:    tbl[tid]["pts"] += 3
-            elif gf == ga: tbl[tid]["pts"] += 1
-
-    _standings_cache = {}
-    for lid in all_league_ids:
-        rows_out = [t for t in _raw.get(lid, {}).values() if t["gp"] > 0]
-        _standings_cache[lid] = sorted(rows_out, key=lambda x: (-x["pts"], -x["gd"], -x["gf"]))
+    # standings 캐시: {league_id: [sorted rows]}
+    _standings_cache = {lid: _calc_standings_cached(lid) for lid in all_league_ids}
 
     pending_logs  = []
     my_new_league = None
@@ -4814,8 +4811,9 @@ def _suitable_grades(ovr, agent):
     """OVR로 자연스러운 리그 등급대를 정하고, 에이전트 등급에 따라
     '상위 리그 오퍼 +N'을 실제로 적용한다 (AGENT_UPPER_LEAGUE_BONUS).
     좋은 에이전트일수록 실력보다 높은 등급 리그의 오퍼까지 끌어온다."""
-    order = ["F","E","D","C","B","A","S"]
-    if ovr >= 85: base = ["S","A"]
+    order = ["F","E","D","C","B","A","S","SS"]
+    if ovr >= 90: base = ["SS","S"]         # EPL/빅리그 정점
+    elif ovr >= 85: base = ["S","A"]
     elif ovr >= 75: base = ["A","B"]
     elif ovr >= 65: base = ["B","C"]
     elif ovr >= 55: base = ["C","D"]
@@ -4847,19 +4845,30 @@ def _salary_ovr_mult(ovr):
 
 
 def _calc_salary(grade, tier, ovr, country=None):
-    # 연봉 base (천원 단위).
-    # country가 주어지면 LEAGUE_WEALTH_OVERRIDE로 나라 전체 부유도 조정.
-    # 4·5부는 나라별 현실 차이가 크므로 LOWER_LEAGUE_SALARY_OVERRIDE로 핀포인트 조정.
-    from constants import LOWER_LEAGUE_SALARY_OVERRIDE
-    wealth = LEAGUE_WEALTH_OVERRIDE.get(country, grade) if country else grade
+    """연봉 계산 (천원 단위).
+    wealth 결정 우선순위:
+      1) SPECIAL_SALARY_COUNTRIES — 특수 연봉 국가 (사우디/카타르/UAE)
+      2) COUNTRY_LEAGUE_GRADE    — 리그 전용 등급 (국대 등급과 분리)
+      3) grade 파라미터           — fallback (countries.grade = 국대 등급)
+    """
+    from constants import LOWER_LEAGUE_SALARY_OVERRIDE, SPECIAL_SALARY_COUNTRIES, get_league_grade
+    if country:
+        if country in SPECIAL_SALARY_COUNTRIES:
+            wealth = SPECIAL_SALARY_COUNTRIES[country]
+        else:
+            wealth = get_league_grade(country, grade)
+    else:
+        wealth = grade
+
     base_year = {
-        "S":{1:7000000, 2:1300000, 3:160000, 4:20000, 5:5000},
-        "A":{1:3200000, 2:640000,  3:80000,  4:6000},
-        "B":{1:1300000, 2:260000,  3:40000,  4:2000},
-        "C":{1:520000,  2:120000,  3:16000,  4:800},
-        "D":{1:210000,  2:48000,   3:5500,   4:300},
-        "E":{1:80000,   2:18000,   3:1600,   4:100},
-        "F":{1:26000,   2:5200,    3:400},
+        "SS":{1:18000000, 2:4000000, 3:600000, 4:80000},  # EPL: 손흥민급 연봉 현실화
+        "S": {1:7000000,  2:1300000, 3:160000, 4:20000, 5:5000},
+        "A": {1:3200000,  2:640000,  3:80000,  4:6000},
+        "B": {1:1300000,  2:260000,  3:40000,  4:2000},
+        "C": {1:520000,   2:120000,  3:16000,  4:800},
+        "D": {1:210000,   2:48000,   3:5500,   4:300},
+        "E": {1:80000,    2:18000,   3:1600,   4:100},
+        "F": {1:26000,    2:5200,    3:400},
     }
     b = base_year.get(wealth, {}).get(tier, 100)
     # 나라×tier 오버라이드: 특정 나라의 특정 부만 핀포인트 조정
@@ -4867,14 +4876,11 @@ def _calc_salary(grade, tier, ovr, country=None):
         _ov = LOWER_LEAGUE_SALARY_OVERRIDE.get(country, {})
         if tier in _ov:
             b = _ov[tier]
-    # 미국 USL 리그 투 등 오버라이드로 0인 경우 무급
     if b == 0:
         return 0
     sal = int(b * _salary_ovr_mult(ovr))
-    # 극소수 진짜 무급: F급 3부 이하에서 OVR이 매우 낮은 무명만
     if wealth == "F" and tier >= 3 and ovr < 38:
         return 0
-    # 4~5부 아마추어 최저선: 최소 50천원. 단 오버라이드로 0인 경우는 제외
     if tier >= 4 and sal < 50 and b > 0:
         sal = 50
     return max(0, sal)

@@ -159,25 +159,58 @@ class _FormationCanvas(QWidget):
         if not ovrs: return 0
         return round(sum(ovrs) / len(ovrs))
 
-    def load_my_team(self, team_id):
-        conn = get_conn()
-        row = conn.execute("SELECT formation FROM teams WHERE id=?", (team_id,)).fetchone()
-        self.formation = row["formation"] if row else "4-4-2"
+    def load_my_team(self, team_id, intl_nat: str = ""):
+        """리그팀 또는 국가대표팀 로드.
+        intl_nat이 있으면 그 국가 intl_entries 기준으로 포메이션을 그린다."""
         from game_engine import get_player
         p = get_player()
-        my_tid = p.get("current_team_id", 0) if p else 0
-        if my_tid == team_id and p:
-            me = {"id": -1, "name": p.get("name", "나"),
-                  "position": p.get("position", "MF"),
-                  "ovr": p.get("ovr", 40), "is_me": True,
-                  **{s: p.get(s, 0) for s in ALL_STATS}}
-            ais = [dict(r) for r in conn.execute(
-                "SELECT * FROM ai_players WHERE team_id=? LIMIT 10", (team_id,)).fetchall()]
-            self.players = [me] + ais
+
+        if intl_nat:
+            # ── 국제전: 내 국가대표팀 선수 구성 ──
+            # 국제전은 ai_players 대신 국가대표 평균 OVR로만 구성되므로
+            # 내 선수(나)를 포함한 가상 11명으로 포메이션 표시
+            self.formation = "4-4-2"  # 국가대표 기본 포메이션
+            players = []
+            if p:
+                me = {"id": -1, "name": p.get("name", "나"),
+                      "position": p.get("position", "MF"),
+                      "ovr": p.get("ovr", 40), "is_me": True,
+                      **{s: p.get(s, 0) for s in ALL_STATS}}
+                players.append(me)
+            # 나머지 10명: intl_entries의 국가 OVR로 가상 선수 생성
+            conn = get_conn()
+            entry = conn.execute(
+                "SELECT ovr FROM intl_entries WHERE country=? LIMIT 1",
+                (intl_nat,)).fetchone()
+            conn.close()
+            avg_ovr = round(entry["ovr"]) if entry and entry["ovr"] else (p.get("ovr", 50) if p else 50)
+            import random
+            pos_list = ["GK", "CB", "CB", "LB", "RB", "CM", "CM", "CAM", "LW", "RW"]
+            for i, pos in enumerate(pos_list[:10 - (len(players))]):
+                ovr_v = max(30, min(99, avg_ovr + random.randint(-5, 5)))
+                players.append({"id": -(i+2), "name": "", "position": pos,
+                                 "ovr": ovr_v, "is_me": False,
+                                 **{s: ovr_v for s in ALL_STATS}})
+            self.players = players
         else:
-            self.players = [dict(r) for r in conn.execute(
-                "SELECT * FROM ai_players WHERE team_id=? LIMIT 11", (team_id,)).fetchall()]
-        conn.close()
+            # ── 리그팀 ──
+            conn = get_conn()
+            row = conn.execute("SELECT formation FROM teams WHERE id=?", (team_id,)).fetchone()
+            self.formation = row["formation"] if row else "4-4-2"
+            my_tid = p.get("current_team_id", 0) if p else 0
+            if my_tid == team_id and p:
+                me = {"id": -1, "name": p.get("name", "나"),
+                      "position": p.get("position", "MF"),
+                      "ovr": p.get("ovr", 40), "is_me": True,
+                      **{s: p.get(s, 0) for s in ALL_STATS}}
+                ais = [dict(r) for r in conn.execute(
+                    "SELECT * FROM ai_players WHERE team_id=? LIMIT 10", (team_id,)).fetchall()]
+                self.players = [me] + ais
+            else:
+                self.players = [dict(r) for r in conn.execute(
+                    "SELECT * FROM ai_players WHERE team_id=? LIMIT 11", (team_id,)).fetchall()]
+            conn.close()
+
         self._player_at = {}; self._positions_xy = []
         self.update()
 
@@ -362,18 +395,32 @@ class FormationWidget(QWidget):
         lay.addLayout(hint_bar)
 
     def load_team(self, team_id, context: dict = None, manager_rel: int = 50):
-        # ── 내 팀 캔버스
-        self._my_canvas.load_my_team(team_id)
+        is_intl = bool(context and context.get("intl"))
+        my_nat  = context.get("my_nat", "") if is_intl else ""
 
-        # 내 팀 이름 + 평균 OVR + 감독 관계
-        conn = get_conn()
-        trow = conn.execute("SELECT name FROM teams WHERE id=?", (team_id,)).fetchone()
-        conn.close()
-        team_name = trow["name"] if trow else ""
+        # ── 내 팀 캔버스 (국제전이면 국가대표 모드)
+        self._my_canvas.load_my_team(team_id, intl_nat=my_nat)
+
+        # ── 좌측 레이블: 국제전 → 국가명+OVR / 리그 → 팀명+OVR
         my_avg = self._my_canvas._calc_avg_ovr()
-        self.lbl_my.setText(f"내 팀: {team_name}  |  평균 OVR {my_avg}")
+        if is_intl:
+            # 국가 flag + 국가명 표시
+            conn = get_conn()
+            crow = conn.execute(
+                "SELECT flag FROM countries WHERE name=?", (my_nat,)).fetchone()
+            conn.close()
+            flag = (crow["flag"] + " ") if crow and crow["flag"] else ""
+            self.lbl_my.setText(f"{flag}{my_nat}  |  평균 OVR {my_avg}")
+            self.lbl_my.setStyleSheet("color:#ffd700;font-weight:bold;")  # 금색으로 강조
+        else:
+            conn = get_conn()
+            trow = conn.execute("SELECT name FROM teams WHERE id=?", (team_id,)).fetchone()
+            conn.close()
+            team_name = trow["name"] if trow else ""
+            self.lbl_my.setText(f"내 팀: {team_name}  |  평균 OVR {my_avg}")
+            self.lbl_my.setStyleSheet("color:#ffd700;font-weight:bold;")
 
-        # ── 컨텍스트 레이블
+        # ── 컨텍스트 레이블 (대회명 표시줄)
         if context:
             kind = "intl" if context.get("intl") else "cl" if context.get("cl") else "league"
         else:
@@ -382,7 +429,6 @@ class FormationWidget(QWidget):
         lname = context.get("league_name", "") if context else ""
         stage = context.get("stage_ko", "") if context else ""
         if not lname:
-            # 리그명 DB 조회
             conn = get_conn()
             row = conn.execute(
                 "SELECT l.name FROM teams t JOIN leagues l ON t.league_id=l.id WHERE t.id=?",

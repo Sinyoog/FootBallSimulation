@@ -761,13 +761,14 @@ def _insert_player_names(c):
 
 # ─── AI 선수 생성 ──────────────────────────────────────────────
 OVR_RANGES = {
-    "S":{1:(90,100),2:(78,88),3:(63,73),4:(48,58),5:(33,47)},
-    "A":{1:(82,90), 2:(68,78),3:(53,63),4:(38,48)},
-    "B":{1:(75,82), 2:(63,70),3:(52,58),4:(35,45)},
-    "C":{1:(65,73), 2:(55,62),3:(45,52),4:(30,40)},
-    "D":{1:(55,63), 2:(45,53),3:(35,43)},
-    "E":{1:(45,53), 2:(35,43),3:(28,35)},
-    "F":{1:(35,43), 2:(27,35),3:(20,27)},
+    "SS":{1:(93,100),2:(83,92),3:(70,80),4:(55,65)},   # EPL 단독 최상위
+    "S": {1:(88,95), 2:(76,86),3:(63,73),4:(48,58),5:(33,47)},
+    "A": {1:(82,90), 2:(68,78),3:(53,63),4:(38,48)},
+    "B": {1:(75,82), 2:(63,70),3:(52,58),4:(35,45)},
+    "C": {1:(65,73), 2:(55,62),3:(45,52),4:(30,40)},
+    "D": {1:(55,63), 2:(45,53),3:(35,43)},
+    "E": {1:(45,53), 2:(35,43),3:(28,35)},
+    "F": {1:(35,43), 2:(27,35),3:(20,27)},
 }
 TEAM_POSITIONS = ["GK","CB","CB","LB","RB","CDM","CM","CAM","LW","RW","ST"]
 KEY_STATS_BY_POS = {
@@ -789,13 +790,14 @@ KEY_STATS_BY_POS = {
 #   spread : 에이스 대비 11번째(벤치) 하락폭. 상위 등급일수록 층이 얇음(다 잘함).
 #   상위 리그는 선수층이 고르고(작은 spread), 하위 리그는 편차가 큼.
 TEAM_ROLE_PROFILE = {
-    "S": {"ace_lo": 0.93, "spread": 0.10},
-    "A": {"ace_lo": 0.90, "spread": 0.13},
-    "B": {"ace_lo": 0.88, "spread": 0.16},
-    "C": {"ace_lo": 0.86, "spread": 0.19},
-    "D": {"ace_lo": 0.84, "spread": 0.22},
-    "E": {"ace_lo": 0.82, "spread": 0.24},
-    "F": {"ace_lo": 0.80, "spread": 0.26},
+    "SS": {"ace_lo": 0.95, "spread": 0.08},   # EPL: 에이스가 리그 절대 정점, 선수층 최고
+    "S":  {"ace_lo": 0.93, "spread": 0.10},
+    "A":  {"ace_lo": 0.90, "spread": 0.13},
+    "B":  {"ace_lo": 0.88, "spread": 0.16},
+    "C":  {"ace_lo": 0.86, "spread": 0.19},
+    "D":  {"ace_lo": 0.84, "spread": 0.22},
+    "E":  {"ace_lo": 0.82, "spread": 0.24},
+    "F":  {"ace_lo": 0.80, "spread": 0.26},
 }
 
 
@@ -820,8 +822,9 @@ def _target_ovr(grade, tier, team_strength, role_idx):
 
 def _generate_all_ai_players(c):
     # 리그 단위로 묶어 8팀에 강→약 강도를 분배해야 팀 간 위계가 생긴다.
+    # [리그등급 분리] cn.grade는 국대 등급 → 리그 OVR/연봉엔 COUNTRY_LEAGUE_GRADE 사용
     c.execute("""SELECT t.id AS tid, t.current_tier AS tier, cn.grade AS grade,
-                        cn.id AS cid, t.league_id AS lid
+                        cn.id AS cid, t.league_id AS lid, cn.name AS cname
                  FROM teams t JOIN leagues l ON t.league_id=l.id
                  JOIN countries cn ON l.country_id=cn.id
                  ORDER BY t.league_id, t.id""")
@@ -834,15 +837,17 @@ def _generate_all_ai_players(c):
 
     for lid, teams in leagues.items():
         n = len(teams)
-        # 리그 내 팀들에 강도 부여 (랜덤 셔플 후 강→약). 시작 강약은 무작위.
         order = list(range(n))
         random.shuffle(order)
-        # 같은 리그의 모든 팀이 이름을 공유하는 used 셋 → 팀 간 이름 중복 방지
         league_used: set = set()
         for rank, team in zip(order, teams):
-            # rank 0 = 최강 후보(강도 1.0) … rank n-1 = 최약(강도 0)
             team_strength = 1.0 - (rank / (n - 1)) if n > 1 else 1.0
-            _generate_team_players(c, team, team_strength, league_used)
+            # [리그등급 분리] 국대 등급(grade) 대신 리그 전용 등급 사용
+            from constants import get_league_grade
+            league_grade = get_league_grade(team.get("cname", ""), team["grade"])
+            team_with_lg = dict(team)
+            team_with_lg["grade"] = league_grade
+            _generate_team_players(c, team_with_lg, team_strength, league_used)
 
 
 def _generate_team_players(c, team, team_strength, league_used: set = None):
