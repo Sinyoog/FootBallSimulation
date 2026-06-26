@@ -128,6 +128,10 @@ class CareerWindow(QDialog):
         intl_ms = intl_engine.get_my_intl_matches()
         tabs.addTab(self._intl_tab(intl_ms, p), f"국제전 ({len(intl_ms)})")
 
+        qual_ms = intl_engine.get_my_qual_matches()
+        if qual_ms:
+            tabs.addTab(self._intl_tab(qual_ms, p), f"국제전(예선) ({len(qual_ms)})")
+
         import champions_engine
         cl_ms = champions_engine.get_my_cl_matches()
         tabs.addTab(self._champions_tab(cl_ms, p), f"챔피언스 ({len(cl_ms)})")

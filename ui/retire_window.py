@@ -266,6 +266,14 @@ class RetireWindow(QDialog):
         lay.addWidget(t35)
         lay.addWidget(self._intl_table(intl_ms, p))
 
+        # ── 국제전(예선) 기록 ─────────────────────────
+        qual_ms = intl_engine.get_my_qual_matches()
+        if qual_ms:
+            t35q = QLabel(f"🌏 국제전(예선) 기록  ({len(qual_ms)})")
+            t35q.setObjectName("secTitle")
+            lay.addWidget(t35q)
+            lay.addWidget(self._intl_table(qual_ms, p))
+
         # ── 챔피언스리그 기록 ────────────────────────
         import champions_engine
         cl_ms = champions_engine.get_my_cl_matches()
@@ -904,6 +912,17 @@ class RetireWindow(QDialog):
         else:
             lines.append("  없음")
         lines.append("")
+
+        # 국제전(예선) 기록
+        qual_ms2 = intl_engine.get_my_qual_matches()
+        if qual_ms2:
+            lines.append(f"▶ 국제전(예선) 기록  ({len(qual_ms2)}경기)")
+            for qm in qual_ms2:
+                stat = _match_stat_str(qm)
+                lines.append(f"  • {qm['year']}년 {qm['week']}주차  "
+                             f"{qm['comp']} {qm['stage']}  vs {qm['opp']}  ─  "
+                             f"{stat}  평점 {qm['rating']}  ({qm['score']} {qm['result']})")
+            lines.append("")
 
         # 챔피언스리그 기록 (클럽 대륙 대회 경기 단위 ─ A매치 아님, 클럽 출전)
         import champions_engine

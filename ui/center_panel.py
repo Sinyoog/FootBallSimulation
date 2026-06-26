@@ -1087,6 +1087,8 @@ class CenterPanel(QWidget):
         from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QFrame
 
         _rs = res.get("result", "")
+        _kind = res.get("kind", "")
+        _is_qual = (_kind == "wc_qual")
         # 각 단계 라인 구성 (결과에 따라 ②③ 색/내용 분기)
         line1 = f"✅ <b style='color:#ffcc66'>{nat}</b> 대표로 확정했습니다."
         if _rs == "미선발":
@@ -1097,7 +1099,10 @@ class CenterPanel(QWidget):
             line3 = f"📋 <span style='color:#ff8866'>…하지만 {nat}은(는) 예선 탈락</span> — 이번 대회 출전 없음."
         elif _rs == "선발":
             line2 = f"📣 <span style='color:#88cc88'>국가대표 선발!</span>"
-            line3 = f"🌍 <span style='color:#66ccff'>{nat} 본선 진출!</span> — 조별리그에 소집됩니다."
+            if _is_qual:
+                line3 = f"🌏 <span style='color:#66ccff'>{nat} 예선 소집!</span> — 예선 조별리그에 출전합니다."
+            else:
+                line3 = f"🌍 <span style='color:#66ccff'>{nat} 본선 진출!</span> — 조별리그에 소집됩니다."
         else:
             line2 = ""; line3 = ""
 
