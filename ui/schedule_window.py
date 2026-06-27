@@ -203,6 +203,11 @@ class ScheduleWindow(QDialog):
         if qual_w:
             self._tab.addTab(qual_w, "🌏 국제대회(예선)")
 
+        # 국제대회(예선 플레이오프) 탭 — PO 경기가 생성된 시점부터 표시
+        qual_po_w = self._make_intl_tab("qual_po", qual=True)
+        if qual_po_w:
+            self._tab.addTab(qual_po_w, "🌏 국제대회(예선 플레이오프)")
+
         # 챔피언스리그 탭
         champs_w = self._make_champions_tab("groups")
         if champs_w:
@@ -239,6 +244,8 @@ class ScheduleWindow(QDialog):
             return None
         if qual and mode == "ko":
             return None
+        if mode == "qual_po" and not qual:
+            return None
         _is_qual = t.get("kind") in ("wc_qual", "cont_qual")
         _grp_stage = "qual_group" if _is_qual else "group"
 
@@ -253,9 +260,13 @@ class ScheduleWindow(QDialog):
 
         # 헤더
         if _is_qual:
-            status_txt = "예선 진행 중"
-            if t["status"] == "done":
-                status_txt = f"예선 종료  |  결과: {t.get('my_result','') or '─'}"
+            if mode == "qual_po":
+                status_txt = "플레이오프 진행 중" if t["status"] == "qual_po" else \
+                             f"플레이오프 종료  |  결과: {t.get('my_result','') or '─'}"
+            else:
+                status_txt = "예선 진행 중"
+                if t["status"] in ("done", "qual_po"):
+                    status_txt = f"예선 종료  |  결과: {t.get('my_result','') or '─'}"
             icon = "🌏"
         else:
             status_txt = {"group": "조별리그 진행 중", "ko": "토너먼트 진행 중"}.get(t["status"], "")
@@ -280,7 +291,11 @@ class ScheduleWindow(QDialog):
         groups = [r["grp"] for r in conn.execute(
             "SELECT DISTINCT grp FROM intl_entries WHERE tournament_id=? ORDER BY grp",
             (t["id"],)).fetchall()]
-        if _is_qual:
+        if _is_qual and mode == "qual_po":
+            ko_rows = [dict(r) for r in conn.execute(
+                """SELECT * FROM intl_matches WHERE tournament_id=? AND stage='qual_po'
+                   ORDER BY week, id""", (t["id"],)).fetchall()]
+        elif _is_qual:
             ko_rows = []
         else:
             ko_rows = [dict(r) for r in conn.execute(
@@ -292,6 +307,8 @@ class ScheduleWindow(QDialog):
         conn.close()
 
         if mode == "ko" and not ko_rows:
+            return None
+        if mode == "qual_po" and not ko_rows:
             return None
 
         # ── 조별리그 순위표 ──
@@ -368,8 +385,8 @@ class ScheduleWindow(QDialog):
             hint.setStyleSheet("color:#666;font-size:10px;margin-top:4px;")
             lay.addWidget(hint)
 
-        # ── 토너먼트 브래킷 ──
-        if mode == "ko" and ko_rows:
+        # ── 토너먼트 브래킷 (본선 KO / 예선 PO 공용) ──
+        if mode in ("ko", "qual_po") and ko_rows:
             from ui.bracket_widget import BracketWidget, build_rounds_from_matches
             lbl_k = QLabel("◼ 토너먼트")
             lbl_k.setStyleSheet("color:#00cc44;font-weight:bold;font-size:12px;margin-top:6px;")

@@ -204,7 +204,8 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS intl_entries(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tournament_id INTEGER, country TEXT, flag TEXT, grade TEXT,
-        ovr REAL, grp TEXT, pot INTEGER, alive INTEGER DEFAULT 1)""")
+        ovr REAL, grp TEXT, pot INTEGER, alive INTEGER DEFAULT 1,
+        is_my INTEGER DEFAULT 0, continent TEXT DEFAULT '')""")
     c.execute("""CREATE TABLE IF NOT EXISTS intl_matches(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tournament_id INTEGER, stage TEXT, grp TEXT DEFAULT '',
@@ -423,6 +424,9 @@ def init_db():
         "ALTER TABLE my_player ADD COLUMN qual_pledged_nat TEXT DEFAULT ''",
         # [예선 대륙] 예선 대회(wc_qual)가 어느 대륙(연맹)의 예선인지 저장.
         "ALTER TABLE intl_tournaments ADD COLUMN continent TEXT DEFAULT ''",
+        # [예선 entries] 내 국적 포함 여부 + 소속 대륙
+        "ALTER TABLE intl_entries ADD COLUMN is_my INTEGER DEFAULT 0",
+        "ALTER TABLE intl_entries ADD COLUMN continent TEXT DEFAULT ''",
     ]:
         try: c.execute(migration)
         except: pass

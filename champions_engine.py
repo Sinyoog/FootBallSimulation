@@ -893,13 +893,15 @@ def _record_my_exit(t, result):
 
     conn = get_conn()
     conn.execute("UPDATE cl_tournaments SET my_result=? WHERE id=?", (result, t["id"]))
-    # 내 팀명
+    # 내 팀명 + 국가명 (예: "Paradou AC (알제리)")
     te = conn.execute(
-        "SELECT team_name FROM cl_entries WHERE tournament_id=? AND team_id=?",
+        "SELECT team_name, country FROM cl_entries WHERE tournament_id=? AND team_id=?",
         (t["id"], my_tid)).fetchone()
     conn.commit()
     conn.close()
-    team_name = te["team_name"] if te else ""
+    _raw_name = te["team_name"] if te else ""
+    _country  = te["country"]   if te else ""
+    team_name = f"{_raw_name} ({_country})" if _raw_name and _country else _raw_name
 
     _save_trophy(t["year"], team_name, t["name"], result)
 

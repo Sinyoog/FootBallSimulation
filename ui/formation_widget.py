@@ -49,12 +49,23 @@ def _fetch_league_opponents(my_team_id, league_id):
         })
     return result
 
-def _fetch_intl_opponents(tournament_id, my_nat):
+def _fetch_intl_opponents(tournament_id, my_nat, grp=None):
+    """국제대회 상대팀 목록.
+    grp 지정 시 내 조(grp) 팀만 반환 (조별리그).
+    grp 없으면 대회 전체 참가국 반환 (예: 대회 로비에서 볼 때 fallback).
+    """
     conn = get_conn()
-    rows = conn.execute(
-        "SELECT country, flag, ovr FROM intl_entries "
-        "WHERE tournament_id=? AND country!=?",
-        (tournament_id, my_nat)).fetchall()
+    if grp:
+        # 내 그룹 팀만 (조별리그: 나 제외 상대 3팀)
+        rows = conn.execute(
+            "SELECT country, flag, ovr FROM intl_entries "
+            "WHERE tournament_id=? AND country!=? AND grp=?",
+            (tournament_id, my_nat, grp)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT country, flag, ovr FROM intl_entries "
+            "WHERE tournament_id=? AND country!=?",
+            (tournament_id, my_nat)).fetchall()
     conn.close()
     return [{
         "team_id":   None,
@@ -65,12 +76,21 @@ def _fetch_intl_opponents(tournament_id, my_nat):
         "players":   [],
     } for r in rows]
 
-def _fetch_cl_opponents(tournament_id, my_team_id):
+def _fetch_cl_opponents(tournament_id, my_team_id, grp=None):
+    """챔피언스리그 상대팀 목록.
+    grp 지정 시 내 조 팀만 반환 (조별리그).
+    """
     conn = get_conn()
-    rows = conn.execute(
-        "SELECT team_id, team_name, flag, ovr FROM cl_entries "
-        "WHERE tournament_id=? AND team_id!=?",
-        (tournament_id, my_team_id)).fetchall()
+    if grp:
+        rows = conn.execute(
+            "SELECT team_id, team_name, flag, ovr FROM cl_entries "
+            "WHERE tournament_id=? AND team_id!=? AND grp=?",
+            (tournament_id, my_team_id, grp)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT team_id, team_name, flag, ovr FROM cl_entries "
+            "WHERE tournament_id=? AND team_id!=?",
+            (tournament_id, my_team_id)).fetchall()
     conn.close()
     result = []
     for r in rows:
@@ -161,9 +181,27 @@ class _FormationCanvas(QWidget):
 
     def load_my_team(self, team_id, intl_nat: str = ""):
         """리그팀 또는 국가대표팀 로드.
-        intl_nat이 있으면 그 국가 intl_entries 기준으로 포메이션을 그린다."""
+        intl_nat이 있으면 그 국가 intl_entries 기준으로 포메이션을 그린다.
+        [최적화] (team_id, intl_nat) 키로 캐시 — refresh()마다 동일 팀 재쿼리 방지.
+        캐시는 FormationWidget 레벨(_my_team_cache)에서 관리.
+        """
         from game_engine import get_player
         p = get_player()
+
+        # 캐시 키: 내 선수 OVR/포지션도 반영 (레벨업 시 캐시 무효화)
+        _p_sig = (p.get("ovr", 0), p.get("position", "")) if p else (0, "")
+        _cache_key = (team_id, intl_nat, _p_sig)
+        # 부모(FormationWidget)의 캐시에 접근
+        _widget = self.parent()
+        while _widget and not hasattr(_widget, "_my_team_cache"):
+            _widget = _widget.parent() if hasattr(_widget, "parent") else None
+        _cache = getattr(_widget, "_my_team_cache", None)
+
+        if _cache is not None and _cache_key in _cache:
+            self.formation, self.players = _cache[_cache_key]
+            self._player_at = {}; self._positions_xy = []
+            self.update()
+            return
 
         if intl_nat:
             # ── 국제전: 내 국가대표팀 선수 구성 ──
@@ -210,6 +248,14 @@ class _FormationCanvas(QWidget):
                 self.players = [dict(r) for r in conn.execute(
                     "SELECT * FROM ai_players WHERE team_id=? LIMIT 11", (team_id,)).fetchall()]
             conn.close()
+
+        # 캐시 저장
+        if _cache is not None:
+            _cache[_cache_key] = (self.formation, list(self.players))
+            # 캐시 크기 제한 (오래된 항목 제거)
+            if len(_cache) > 30:
+                oldest = next(iter(_cache))
+                del _cache[oldest]
 
         self._player_at = {}; self._positions_xy = []
         self.update()
@@ -332,6 +378,10 @@ class FormationWidget(QWidget):
         super().__init__()
         self._last_ctx = None
         self._opp_teams = []
+        # [최적화] load_my_team 캐시: (team_id, intl_nat) → (formation, players)
+        # refresh()마다 동일 팀을 재쿼리하지 않도록 캐시. team_id/intl_nat 변경 시 자동 갱신.
+        self._my_team_cache: dict = {}   # {(team_id, intl_nat): (formation, players)}
+        self._my_team_cache_key = None   # 마지막으로 로드한 캐시 키
 
         self.setStyleSheet("background:transparent;")
         lay = QVBoxLayout(self)
@@ -454,18 +504,24 @@ class FormationWidget(QWidget):
             nat   = context.get("my_nat", "")
             stage = context.get("stage", "group")
             week  = context.get("week", 0)
+            grp   = context.get("grp", "")
             if stage != "group":
+                # 플레이오프/토너먼트: 이번 주 상대 1팀만
                 res = _fetch_intl_ko_opp(tid, nat, week)
                 if res: return res
-            return _fetch_intl_opponents(tid, nat)
+            # 조별리그: 내 그룹(grp)에 있는 팀만
+            return _fetch_intl_opponents(tid, nat, grp=grp or None)
         elif context and context.get("cl"):
             tid   = context["tournament_id"]
             stage = context.get("stage", "group")
             week  = context.get("week", 0)
+            grp   = context.get("grp", "")
             if stage != "group":
+                # 플레이오프/토너먼트: 이번 주 상대 1팀만
                 res = _fetch_cl_ko_opp(tid, team_id, week)
                 if res: return res
-            return _fetch_cl_opponents(tid, team_id)
+            # 조별리그: 내 그룹(grp)에 있는 팀만
+            return _fetch_cl_opponents(tid, team_id, grp=grp or None)
         else:
             conn = get_conn()
             row = conn.execute("SELECT league_id FROM teams WHERE id=?", (team_id,)).fetchone()

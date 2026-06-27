@@ -25,7 +25,8 @@ from constants import (
     WC_TEAMS, WC_GROUPS, WC_QUOTA,
     WC_EXPAND_YEAR, WC_TEAMS_BIG, WC_GROUPS_BIG, WC_QUOTA_BIG, WC_BEST_THIRDS_BIG,
     CONT_TEAMS, CONT_GROUPS, CONT_BEST_THIRDS,
-    CONFEDERATIONS, CONF_CUP_NAME,
+    CONFEDERATIONS, CONTINENT_TO_CONF, CONF_CUP_NAME,
+    WC_QUAL_32, WC_QUAL_48,
     GRADE_TEAM_OVR, GRADE_QUAL_BASE, QUAL_NOISE,
     INTL_SELECTION_OVR, INTL_MAX_TIER, INTL_MIN_MATCHES,
     INTL_SELECTION_MARGIN,
@@ -585,24 +586,14 @@ def start_intl_tournament(year):
                                committed=committed)
         return
 
-    # ── 월드컵 예선: 내가 속한 대륙(연맹)의 예선만 생성 ──
-    #   내 대륙 전체 조를 만들고, 내 조만 직접 뜀.
-    #   통과국은 qual_results에 저장돼 다음 해 본선 entries 구성에 쓰인다.
-    #   [정책] 대륙컵 예선(cont_qual)은 폐지 — 대륙컵은 랜덤 선발로 바로 본선.
+    # ── 월드컵 예선: 4개 대륙 연맹 전부 예선 생성 ──
+    #   각 연맹별로 _create_qual_tournament 호출.
+    #   내 국적이 속한 연맹만 my_sel=1/2/3, 나머지는 my_sel=2(출전 없음).
+    #   통과국은 _finalize_qual이 qual_results에 저장 → 다음 해 본선 entries 구성.
     if is_wc_qual:
-        continents = []
-        for n in my_nats:
-            cont = nat_info.get(n, {}).get("continent")
-            if not cont:
-                continue
-            rep = _conf_key(cont)
-            if rep not in continents:
-                continents.append(rep)
-        if not continents:
-            fallback = nat_info.get(nat1, {}).get("continent", "유럽")
-            continents = [_conf_key(fallback)]
-        for cont in continents:
-            _create_qual_tournament(year, "wc_qual", cont,
+        all_confs = ["유럽", "아메리카", "아시아", "아프리카"]
+        for conf in all_confs:
+            _create_qual_tournament(year, "wc_qual", conf,
                                     p=p, my_nats=my_nats, nat_info=nat_info,
                                     committed=committed)
         return
@@ -654,11 +645,9 @@ def _close_other_pending_when_committed(year):
 
 
 def _conf_key(continent):
-    """대륙명을 연맹 대표 대륙키로 정규화.
-    같은 연맹(예: 아시아+오세아니아, 남미+북미)을 하나의 대륙컵으로 합치기 위함.
-    CONFEDERATIONS의 첫 원소를 대표키로 사용한다."""
-    confs = CONFEDERATIONS.get(continent, [continent])
-    return confs[0] if confs else continent
+    """대륙명 → 4개 통합 연맹 대표키.
+    유럽/아메리카/아시아/아프리카로 정규화."""
+    return CONTINENT_TO_CONF.get(continent, continent)
 
 
 def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, committed):
@@ -735,9 +724,23 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
 
         cand_nats = [n for n in cont_nats if n]
         if is_wc and _had_wc_qual:
-            # 작년 wc_qual 예선이 있었으나 통과 못함 → 본선 출전 없음
-            my_sel = 2
-            cand_nats = []
+            # 작년 예선이 있었음 → 예선 통과국만 본선 출전 가능
+            # qualified_nats: _qualify_world로 확정된 본선 진출국 중 내 국적
+            passed_nats = [n for n in cand_nats if n in entry_names]
+            if passed_nats:
+                # 예선 통과한 내 국적이 있음 → 발탁창 제시 (또는 1개면 자동)
+                if len(passed_nats) == 1:
+                    my_nat = passed_nats[0]
+                    grade = nat_info.get(my_nat, {}).get("grade", "F")
+                    my_sel = 1 if _check_selection(p, grade) else 2
+                    cand_nats = []
+                else:
+                    my_sel = 3
+                    cand_nats = passed_nats
+            else:
+                # 예선 있었지만 내 국적 모두 탈락 → 출전 불가
+                my_sel = 2
+                cand_nats = []
         elif cand_nats:
             my_sel = 3   # 발탁창 제시
         else:
@@ -877,63 +880,78 @@ def _check_selection(p, my_grade):
 
 
 def _qualify_world(year=0):
-    """대륙별 쿼터 + 확률 예선으로 본선 진출국 선발.
-    year >= WC_EXPAND_YEAR 이면 64개국, 아니면 32개국.
-    내 대륙은 작년 예선 결과(qual_results)를 우선 사용, 타 대륙은 랜덤 계산."""
+    """4개 대륙 연맹의 예선 결과(qual_results)를 조합해 본선 진출국 확정.
+
+    - 예선 결과가 있는 연맹: qual_results에서 읽어 그대로 사용
+    - 예선 결과가 없는 연맹(이전 세이브 호환 등): 등급 기반 랜덤 선발
+    - 쿼터 합산이 본선 팀 수(32 or 48)와 맞지 않으면 부족분을 랜덤으로 보충
+    """
     big = (year >= WC_EXPAND_YEAR)
     quota_map = WC_QUOTA_BIG if big else WC_QUOTA
-    n_teams = WC_TEAMS_BIG if big else WC_TEAMS
+    n_teams   = WC_TEAMS_BIG  if big else WC_TEAMS
 
-    # 작년 예선 통과국 (target_year=올해, kind='world')
+    # 예선 통과국 로드
     conn = get_conn()
     qual_rows = [dict(r) for r in conn.execute(
         "SELECT country, flag, grade, ovr, continent FROM qual_results WHERE target_year=? AND kind='world'",
         (year,)).fetchall()]
-    rows = [dict(r) for r in conn.execute(
+    all_countries = [dict(r) for r in conn.execute(
         "SELECT name, flag, continent, grade FROM countries").fetchall()]
     conn.close()
 
-    # 예선 통과한 대륙(연맹) 집합 → 그 대륙은 예선 결과 사용
-    qualified_continents = {_conf_key(q["continent"]) for q in qual_rows if q.get("continent")}
-    qualified_by_name = {q["country"]: q for q in qual_rows}
-
-    # 오세아니아 → 아시아 편입
-    for r in rows:
-        if r["continent"] == "오세아니아":
-            r["continent"] = "아시아"
+    # 오세아니아 → 아시아, 북중미/북미 → 아메리카 정규화
+    for r in all_countries:
+        r["conf"] = _conf_key(r["continent"])
+        r["ovr"]  = GRADE_TEAM_OVR.get(r["grade"], 45) + random.uniform(-3, 3)
         r["qual"] = GRADE_QUAL_BASE.get(r["grade"], 0.2) + random.uniform(-QUAL_NOISE, QUAL_NOISE)
-        r["ovr"] = GRADE_TEAM_OVR.get(r["grade"], 45) + random.uniform(-3, 3)
+
+    # 예선 결과가 있는 연맹 추적
+    qual_by_conf = {}   # conf_key → [국가dict]
+    for q in qual_rows:
+        ck = _conf_key(q.get("continent", ""))
+        if not ck:
+            continue
+        qual_by_conf.setdefault(ck, []).append({
+            "name": q["country"], "flag": q["flag"],
+            "continent": ck, "grade": q["grade"], "ovr": q["ovr"], "qual": 1.0
+        })
 
     picked = []
-    # 1) 예선 통과국 먼저 확정 추가
-    for q in qual_rows:
-        picked.append({"name": q["country"], "flag": q["flag"],
-                       "continent": _conf_key(q.get("continent", "")),
-                       "grade": q["grade"], "ovr": q["ovr"], "qual": 1.0})
-    picked_names = {p["name"] for p in picked}
+    picked_names = set()
 
-    # 2) 예선 결과 없는 대륙만 기존 랜덤 방식으로 채움
-    #    개최국: 예선 없는 대륙 중에서 (예선 대륙은 이미 통과국으로 채워짐)
-    host = None
-    non_qual_pool = [r for r in rows if _conf_key(r["continent"]) not in qualified_continents
-                     and r["grade"] in ("S", "A", "B")]
-    if non_qual_pool:
-        weights = [{"S": 3, "A": 2, "B": 1}[r["grade"]] for r in non_qual_pool]
-        host = random.choices(non_qual_pool, weights=weights)[0]
-        if host["name"] not in picked_names:
-            picked.append(host); picked_names.add(host["name"])
+    # 1) 예선 결과 있는 연맹: 그대로 사용 (쿼터만큼)
+    for conf, quota in quota_map.items():
+        ck = _conf_key(conf)
+        if ck in qual_by_conf:
+            teams = qual_by_conf[ck][:quota]
+            picked.extend(teams)
+            picked_names.update(t["name"] for t in teams)
 
-    for cont, quota in quota_map.items():
-        cont_key = _conf_key(cont)
-        if cont_key in qualified_continents:
-            continue   # 이 대륙은 예선 결과로 이미 채움
-        q = quota - (1 if (host and _conf_key(host["continent"]) == cont_key) else 0)
-        pool = [r for r in rows if _conf_key(r["continent"]) == cont_key
-                and r["name"] not in picked_names]
-        pool.sort(key=lambda r: r["qual"], reverse=True)
-        picked.extend(pool[:q])
-        for x in pool[:q]:
-            picked_names.add(x["name"])
+    # 2) 예선 결과 누락 연맹 → 오류 로그 + 예외 발생
+    # 예선 시스템이 정상 작동한다면 모든 연맹에 qual_results가 있어야 한다.
+    # 랜덤 보충은 "예선이 없던 시대" 호환용이었으나, 현재는 예선 버그를
+    # 숨기는 역할만 하므로 제거하고 명시적 오류를 발생시킨다.
+    missing_confs = []
+    for conf in quota_map:
+        ck = _conf_key(conf)
+        if ck not in qual_by_conf:
+            missing_confs.append(conf)
+    if missing_confs:
+        from game_engine import add_log
+        msg = f"[오류] {year}년 월드컵 본선: 예선 결과 누락 — {missing_confs}"
+        add_log(msg, "event")
+        raise RuntimeError(msg)
+
+    # 각 연맹 쿼터 충족 여부 검증 (초과는 허용, 미달만 오류)
+    for conf, quota in quota_map.items():
+        ck = _conf_key(conf)
+        actual = len(qual_by_conf.get(ck, []))
+        if actual < quota:
+            from game_engine import add_log
+            msg = (f"[오류] {year}년 월드컵 본선: {conf} 예선 통과국 {actual}팀 < 쿼터 {quota}팀"
+                   f" — 예선이 완료되지 않았거나 qual_results가 불완전합니다")
+            add_log(msg, "event")
+            raise RuntimeError(msg)
 
     return picked[:n_teams]
 
@@ -982,32 +1000,60 @@ def _continent_qual_quota(qual_kind, continent, year):
     if qual_kind == "wc_qual":
         big = (year + 1) >= WC_EXPAND_YEAR
         quota_map = WC_QUOTA_BIG if big else WC_QUOTA
-        # 대륙 정규화: _conf_key 기준 통합 대륙명으로 쿼터 합산
-        total = 0
-        for cont_name, q in quota_map.items():
-            if _conf_key(cont_name) == _conf_key(continent):
-                total += q
-        # 못 찾으면 해당 대륙 직접 조회
-        if total == 0:
-            total = quota_map.get(continent, 4)
-        return total
+        ck = _conf_key(continent)
+        return quota_map.get(ck, 4)
     else:
-        # 대륙컵: 그 대륙이 곧 전체 → 본선 24강
         return CONT_TEAMS
 
 
-def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, committed):
-    """예선 대회 1개 생성 (내가 속한 대륙(연맹)).
+def _conf_countries(conf_key):
+    """연맹 대표키 → 해당 연맹 전체 국가 목록 (DB 조회)."""
+    confs = CONFEDERATIONS.get(conf_key, [conf_key])
+    conn = get_conn()
+    placeholders = ",".join("?" * len(confs))
+    rows = [dict(r) for r in conn.execute(
+        f"SELECT name, flag, continent, grade FROM countries WHERE continent IN ({placeholders})",
+        confs).fetchall()]
+    conn.close()
+    return rows
 
-    - qual_kind: 'wc_qual'(월드컵 예선) ― 대륙컵 예선(cont_qual)은 폐지됨
-    - 내 대륙(연맹) 전체 나라를 4팀씩 조 편성, 홈앤어웨이 6경기.
-    - 내 조만 is_my. 통과국은 조별 종료 시 _finalize_qual이 qual_results에 저장.
-    - 발탁 선택(my_sel=3)은 예선에서 처리. cap-tie는 예선에서 일어나지 않음.
+
+def _enrich_countries(rows):
+    """국가 목록에 ovr/qual 점수 추가."""
+    for r in rows:
+        r["ovr"]  = GRADE_TEAM_OVR.get(r["grade"], 45) + random.uniform(-3, 3)
+        r["qual"] = GRADE_QUAL_BASE.get(r["grade"], 0.2) + random.uniform(-QUAL_NOISE, QUAL_NOISE)
+    return rows
+
+
+def _sim_single_match_ai(home, away):
+    """단판 AI vs AI 시뮬. 전력 기반 확률로 승패 결정. 승자 dict 반환."""
+    h_str = home.get("ovr", 50); a_str = away.get("ovr", 50)
+    total = h_str + a_str
+    h_win_p = (h_str / total) * 0.6 + 0.2   # 홈 어드밴티지 포함
+    r = random.random()
+    return home if r < h_win_p else away
+
+
+def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, committed):
+    """월드컵 예선 대회 생성 (4개 대륙 전부).
+
+    단계:
+      18주차 — 1차 예선 (하위국 단판, DB에 qual_r1 스테이지로 저장)
+      19~24주차 — 조별리그 (qual_group, 홈앤어웨이 6경기)
+      25주차 — 플레이오프 (qual_po, 단판 / 32팀 체제만)
+
+    내 국적이 이 연맹에 속하면 is_my=1, 아니면 0.
+    통과국은 _finalize_qual이 qual_results에 저장.
     """
     from game_engine import add_log
 
-    # [예선 사이클 리셋] 새 예선 시작 → 이전 pledge 해제.
-    #   미고정(아직 cap-tie 안 된) 선수만 다시 선택 가능하도록.
+    big = (year + 1) >= WC_EXPAND_YEAR
+    qual_cfg = WC_QUAL_48.get(continent) if big else WC_QUAL_32.get(continent)
+    if not qual_cfg:
+        return
+
+    # 예선 사이클 리셋 (pledge 해제)
     if not committed:
         try:
             from game_engine import update_player as _upd0
@@ -1015,145 +1061,168 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
         except Exception:
             pass
 
-    confs = CONFEDERATIONS.get(continent, [continent])
-    conn = get_conn()
-    rows = [dict(r) for r in conn.execute(
-        f"SELECT name, flag, continent, grade FROM countries WHERE continent IN ({','.join('?'*len(confs))})",
-        confs).fetchall()]
-    conn.close()
-    if len(rows) < 4:
-        return  # 대륙에 나라가 너무 적으면 예선 생략
+    # 연맹 전체 국가 조회
+    all_rows = _enrich_countries(_conf_countries(continent))
+    if len(all_rows) < 4:
+        return
 
-    for r in rows:
-        r["qual"] = GRADE_QUAL_BASE.get(r["grade"], 0.2) + random.uniform(-QUAL_NOISE, QUAL_NOISE)
-        r["ovr"] = GRADE_TEAM_OVR.get(r["grade"], 45) + random.uniform(-3, 3)
+    # FIFA 랭크(ovr) 기준 정렬
+    all_rows.sort(key=lambda r: r["ovr"], reverse=True)
 
-    # 대회명
-    if qual_kind == "wc_qual":
-        name = f"{year + 1} 월드컵 {continent} 예선"
-    else:
-        cup = CONF_CUP_NAME.get(continent, "대륙컵")
-        name = f"{year + 1} {cup} 예선"
+    # ─── 1차 예선 컷오프: 실제 경기 없이 하위국 제외 ───
+    # 하위국은 조별리그 진출 실패로 성적에만 기록 (대륙컵 예선 미참가 방식과 동일)
+    cutoff_n  = qual_cfg["cutoff_bottom"]
+    top_rows  = all_rows[: len(all_rows) - cutoff_n]   # 조별리그 진출
+    cut_rows  = all_rows[len(all_rows) - cutoff_n:]    # 예선 진출 실패
+    cut_names = {r["name"] for r in cut_rows}
 
-    # 내 국적 중 이 대륙(연맹)에 속한 후보
-    cont_set = set(confs)
+    # 내 나라 컷오프 여부는 my_nats/committed 기준으로만 판정 (sel_cand 계산 전)
+    my_cut_nat = ""
+    check_nats = [committed] if committed else [n for n in my_nats if n]
+    for cand in check_nats:
+        if cand in cut_names:
+            my_cut_nat = cand
+            break
+
+    pool = list(top_rows)
+    random.shuffle(pool)
+
+    # ─── 내 국적 처리 ───
+    cont_set = set(CONFEDERATIONS.get(continent, [continent]))
     if committed:
         cand_nats = [committed] if nat_info.get(committed, {}).get("continent") in cont_set else []
     else:
         cand_nats = [n for n in my_nats
                      if n and nat_info.get(n, {}).get("continent") in cont_set]
 
-    # 발탁 선발 심사: 후보 중 선발 기준 통과하는 국적만 실제 후보로
-    sel_cand = []
-    for n in cand_nats:
-        grade = nat_info.get(n, {}).get("grade", "F")
-        if _check_selection(p, grade):
-            sel_cand.append(n)
+    sel_cand = [n for n in cand_nats
+                if _check_selection(p, nat_info.get(n, {}).get("grade", "F"))]
+
+    # 내 나라가 컷오프 탈락 대상이면 "예선 진출 실패" 처리
+    if my_cut_nat:
+        failed_nat = my_cut_nat
+        if failed_nat:
+            _save_trophy(year, failed_nat, f"{year + 1} 월드컵 {continent} 예선", "예선 진출 실패")
+            try:
+                conn_fc = get_conn()
+                conn_fc.execute("""INSERT INTO intl_history(year, competition, team_name, result,
+                                                            goals, assists, caps, rating)
+                                   VALUES(?,?,?,?,?,?,?,?)""",
+                                (year, f"{year + 1} 월드컵 {continent} 예선",
+                                 failed_nat, "예선 진출 실패", 0, 0, 0, 0.0))
+                conn_fc.commit(); conn_fc.close()
+            except Exception:
+                pass
+            from game_engine import add_log
+            add_log(f"❌ {failed_nat} 월드컵 {continent} 예선 진출 실패 (랭킹 하위권)", "event")
+        return  # 이 연맹 예선은 더 이상 생성하지 않음
 
     if committed:
-        my_sel = 1 if (committed in sel_cand) else 2
+        my_sel = 1 if committed in sel_cand else 2
         my_nat = committed if my_sel == 1 else ""
         cand_nats_final = []
     else:
         if sel_cand:
-            my_sel = 3   # 선택 대기
-            my_nat = ""
-            cand_nats_final = sel_cand
+            my_sel = 3; my_nat = ""; cand_nats_final = sel_cand
         else:
-            my_sel = 2   # 선발 기준 미달 → 예선도 못 뜀
-            my_nat = ""
-            cand_nats_final = []
+            my_sel = 2; my_nat = ""; cand_nats_final = []
 
-    conn = get_conn()
-    c = conn.cursor()
+    # ─── 조별리그 편성 ───
+    n_groups   = qual_cfg["n_groups"]
+    group_size = qual_cfg["group_size"]
+
+    pool.sort(key=lambda r: r["ovr"], reverse=True)
+    glabels = _qual_group_labels(n_groups)
+    groups  = {g: [] for g in glabels}
+    for pot in range(group_size):
+        segment = pool[pot * n_groups:(pot + 1) * n_groups]
+        random.shuffle(segment)
+        for gi, e in enumerate(segment):
+            if gi < n_groups:
+                groups[glabels[gi]].append(e)
+
+    # ─── DB 저장 ───
+    name = f"{year + 1} 월드컵 {continent} 예선"
+    conn = get_conn(); c = conn.cursor()
     c.execute("""INSERT INTO intl_tournaments(year, kind, name, status, my_selected, my_nat, cand_nats, continent)
                  VALUES(?,?,?,?,?,?,?,?)""",
-              (year, qual_kind, name, "qual_group", my_sel, my_nat, ",".join(cand_nats_final), continent))
+              (year, qual_kind, name, "qual_group", my_sel, my_nat,
+               ",".join(cand_nats_final), continent))
     tid = c.lastrowid
 
-    # 4팀씩 조 편성 (전력순 시드 → 포트별 분배)
-    rows.sort(key=lambda e: e["ovr"], reverse=True)
-    n_full = len(rows) // 4          # 4팀 완전조 개수
-    n_groups = max(1, n_full)
-    groups = {g: [] for g in _qual_group_labels(n_groups)}
-    glabels = _qual_group_labels(n_groups)
-    # 포트 4개로 나눠 조마다 포트별 1팀
-    for pot in range(4):
-        pool = rows[pot * n_groups:(pot + 1) * n_groups]
-        random.shuffle(pool)
-        for gi, e in enumerate(pool):
-            if gi >= n_groups:
-                break
-            g = glabels[gi]
-            groups[g].append(e)
-
     # entries 저장
+    my_grp = None
     for g, members in groups.items():
-        for pot_i, e in enumerate(members):
+        for e in members:
+            is_my = 0
+            if my_nat and e["name"] == my_nat:
+                is_my = 1; my_grp = g
+            elif my_sel == 3 and any(e["name"] == n for n in cand_nats_final):
+                is_my = 1; my_grp = g
             c.execute("""INSERT INTO intl_entries
-                         (tournament_id, country, flag, grade, ovr, grp, pot, alive)
-                         VALUES(?,?,?,?,?,?,?,1)""",
-                      (tid, e["name"], e["flag"], e["grade"], e["ovr"], g, pot_i + 1))
+                         (tournament_id, country, flag, grade, ovr, grp, is_my, continent)
+                         VALUES(?,?,?,?,?,?,?,?)""",
+                      (tid, e["name"], e.get("flag",""), e.get("grade","F"),
+                       round(e["ovr"], 1), g, is_my, e.get("continent","")))
 
-    # 내 후보 국적이 어느 조에 들어갔는지 → is_my 판정용
-    if my_nat:
-        _my_match_nats = {my_nat}
-    elif my_sel == 3:
-        _my_match_nats = set(cand_nats_final)
-    else:
-        _my_match_nats = set(cand_nats)
+    # 홈앤어웨이 6라운드 일정 생성 (19~24주차)
+    # 라운드로빈 알고리즘: 1팀 고정 + 나머지 회전 → 정방향 3R + 역방향 3R
+    base_week = 18
 
-    # 조별리그 일정 (홈앤어웨이 6R: 18~23주)
-    w0 = INTL_GROUP_WEEKS[0]
-    for rd, pairs in enumerate(_QUAL_ROUNDS):
-        wk = w0 + rd
-        for g, members in groups.items():
-            if len(members) < 4:
-                continue   # 4팀 미만 조는 경기 생성 생략(안전)
-            for hi, ai in pairs:
-                home, away = members[hi], members[ai]
-                is_my = 1 if (home["name"] in _my_match_nats or away["name"] in _my_match_nats) else 0
+    def _round_robin_schedule(names):
+        """n팀 라운드로빈. 각 라운드는 (홈, 원정) 쌍의 리스트."""
+        t = list(names)
+        if len(t) % 2 == 1:
+            t.append(None)  # 홀수 더미
+        nt = len(t)
+        rounds = []
+        for _ in range(nt - 1):
+            pairs = []
+            for i in range(nt // 2):
+                h, a = t[i], t[nt - 1 - i]
+                if h is not None and a is not None:
+                    pairs.append((h, a))
+            rounds.append(pairs)
+            t = [t[0]] + [t[-1]] + t[1:-1]
+        return rounds
+
+    for g, members in groups.items():
+        names = [e["name"] for e in members]
+        fwd_rounds = _round_robin_schedule(names)
+        # 역방향: 홈↔원정 반전
+        rev_rounds = [[(a, h) for h, a in rnd] for rnd in fwd_rounds]
+        all_rounds = fwd_rounds + rev_rounds  # 6라운드
+
+        cand_set = set(cand_nats_final)
+        for rnd_idx, rnd_pairs in enumerate(all_rounds):
+            wk = base_week + rnd_idx   # 18, 19, 20, 21, 22, 23주
+            wk = min(wk, 23)
+            for home_nat, away_nat in rnd_pairs:
+                is_my_match = (
+                    (my_nat and (home_nat == my_nat or away_nat == my_nat)) or
+                    (my_sel == 3 and (home_nat in cand_set or away_nat in cand_set))
+                )
                 c.execute("""INSERT INTO intl_matches
-                             (tournament_id, stage, grp, week, home, away,
-                              home_score, away_score, is_my, slot)
-                             VALUES(?,?,?,?,?,?,-1,-1,?,0)""",
-                          (tid, "qual_group", g, wk, home["name"], away["name"], is_my))
-    conn.commit()
-    conn.close()
+                             (tournament_id, week, stage, grp, home, away, is_my, my_played)
+                             VALUES(?,?,?,?,?,?,?,?)""",
+                          (tid, wk, "qual_group", g, home_nat, away_nat,
+                           1 if is_my_match else 0, 0))
 
-    # ── 로그 ──
-    add_log("─" * 44, "sep")
-    add_log(f"🌏 {name} 개막!  {len(rows)}개국 {n_groups}개조", "event", year, INTL_CALLUP_WEEK)
+    conn.commit(); conn.close()
 
+    # 플레이오프 주차(25주차) 레코드는 _finalize_qual이 조별 완료 시 생성
+    # (qual_cfg["po_teams"] > 0 인 체제에서만)
+
+    # 로그
+    add_log(f"🌐 {name} 예선 조 추첨 완료 ({n_groups}개 조)", "event")
     if my_sel == 3:
-        nat_list = " / ".join(cand_nats_final)
-        if len(cand_nats_final) == 1:
-            add_log(f"   🌏 {nat_list} 대표팀 예선 발탁 제안! 출전 여부를 선택하세요",
-                    "event", year, INTL_CALLUP_WEEK)
-        else:
-            add_log(f"   🌏 여러 나라가 예선 차출을 원합니다! {nat_list} 중 선택하세요",
-                    "event", year, INTL_CALLUP_WEEK)
-    elif my_nat:
-        _grow = _country_flag(my_nat)
-        try:
-            my_g = next(g for g, ms in groups.items() if any(m["name"] == my_nat for m in ms))
-            mates = [f"{m['flag']}{m['name']}" for m in groups[my_g] if m["name"] != my_nat]
-            add_log(f"   {_grow}{my_nat} 예선 {my_g}조  (vs {', '.join(mates)})",
-                    "event", year, INTL_CALLUP_WEEK)
-            add_log(f"   📣 예선 소집! 조별리그 {w0}~{w0+5}주차", "event", year, INTL_CALLUP_WEEK)
-        except StopIteration:
-            pass
-    else:
-        # my_sel == 2: 후보 국적이 있었으나 선발 기준 미달 → 미선발 기록
-        _miss_nat = ""
-        if committed and committed in cand_nats:
-            _miss_nat = committed
-        elif cand_nats:
-            _miss_nat = cand_nats[0]
-        if _miss_nat:
-            add_log(f"   📋 {_miss_nat} 예선 국가대표 미선발", "event", year, INTL_CALLUP_WEEK)
-            _save_trophy(year, _miss_nat, name, "예선 미선발")
-            # intl_tournaments.my_result에도 표시
+        add_log(f"   발탁 후보: {', '.join(cand_nats_final)}", "event")
+    elif my_sel == 1:
+        add_log(f"   {my_nat} 대표로 출전 확정", "event")
+
+    # 미선발 로그
+    if my_sel == 2 and cand_nats:
+        for n2 in cand_nats:
             conn2 = get_conn()
             conn2.execute("UPDATE intl_tournaments SET my_result=? WHERE id=?",
                           ("예선 미선발", tid))
@@ -1200,11 +1269,26 @@ def _process_one_tournament_week(t, week):
     for m in pending:
         _sim_ai_match(t, m)
 
-    # ── 예선: 조별 홈앤어웨이 6R(18~23주) 끝나면 통과국 확정 ──
+    # ── 예선 진행 ──
     if t["kind"] == "wc_qual":
-        qual_last_week = INTL_GROUP_WEEKS[0] + 5   # 18+5 = 23주
-        if week >= qual_last_week and t.get("status") != "done":
-            _finalize_qual(t)
+        # [버그수정] t는 루프 시작 시의 스냅샷이므로 status를 DB에서 재조회한다.
+        # _finalize_qual 내부에서 status='qual_po' or 'done'으로 갱신되기 때문에
+        # 스냅샷 값으로 판정하면 PO 체제에서 다음 주차 호출이 누락될 수 있다.
+        conn2 = get_conn()
+        cur_row = conn2.execute(
+            "SELECT status FROM intl_tournaments WHERE id=?", (t["id"],)).fetchone()
+        conn2.close()
+        status = cur_row["status"] if cur_row else t.get("status", "qual_group")
+
+        # 조별리그: 완료 주차(23주)에 마감
+        if status == "qual_group":
+            qual_last_week = 23
+            if week >= qual_last_week:
+                _finalize_qual(t)   # 직행 확정 or qual_po 생성
+        # 플레이오프: 25주차 완료 시 마감
+        elif status == "qual_po":
+            if week >= 25:
+                _finalize_qual_po(t)  # 플레이오프 승자 → qual_results
         return
 
     # 라운드 진행
@@ -1518,90 +1602,203 @@ def _qual_group_standings(tid, grp):
 
 
 def _finalize_qual(t):
-    """예선 조별 종료 → 통과국 확정 + qual_results 저장 + 내 성적 기록.
+    """예선 조별 종료 → 플레이오프 생성 or 통과국 확정.
 
-    통과 규칙: 각 조 1위 직행, 부족분은 2위 팀들 중 (승점·득실) 성적순으로 채움.
-    내 나라가 통과하면 '예선 통과', 탈락하면 '예선 탈락'으로 기록(cap-tie 없음).
+    [32팀 체제] po_teams>0 이면 25주차 플레이오프 경기를 생성하고 status='qual_po'로 전환.
+                플레이오프 완료 후 _finalize_qual_po()가 최종 진출국 확정.
+    [48팀 체제] 조 1위(+와일드카드) 직행 → 즉시 qual_results 저장.
     """
-    from game_engine import add_log, get_player, update_player
+    from game_engine import add_log, get_player
+    from constants import WC_QUAL_32, WC_QUAL_48
 
     tid = t["id"]
     conn = get_conn()
     grps = [r["grp"] for r in conn.execute(
         "SELECT DISTINCT grp FROM intl_entries WHERE tournament_id=? ORDER BY grp", (tid,)).fetchall()]
+    conn.close()
 
-    # 대륙명: intl_tournaments.continent 에 직접 저장돼 있음.
-    # 없으면(구 세이브 호환) entries 첫 나라로 역추적.
-    continent = (t.get("continent") or "").strip()
-    if not continent:
-        first_country = conn.execute(
-            "SELECT country FROM intl_entries WHERE tournament_id=? LIMIT 1", (tid,)).fetchone()
-        conn.close()
-        if first_country:
-            conn2 = get_conn()
-            cr = conn2.execute("SELECT continent FROM countries WHERE name=?",
-                               (first_country["country"],)).fetchone()
-            conn2.close()
-            if cr:
-                continent = _conf_key(cr["continent"])
-    else:
-        conn.close()
-        continent = _conf_key(continent)
-
-    quota = _continent_qual_quota(t["kind"], continent, t["year"])
+    continent = _conf_key((t.get("continent") or "").strip() or "유럽")
+    big = (t["year"] + 1) >= WC_EXPAND_YEAR
+    qual_cfg = (WC_QUAL_48 if big else WC_QUAL_32).get(continent, {})
 
     # 조별 1위/2위 수집
-    winners = []     # 조 1위 (직행)
-    runners = []     # 조 2위 (성적순 와일드카드)
+    winners = []
+    runners = []
     for g in grps:
         standings = _qual_group_standings(tid, g)
         if not standings:
             continue
-        if len(standings) >= 1:
-            winners.append(standings[0])
-        if len(standings) >= 2:
-            runners.append(standings[1])
+        if len(standings) >= 1: winners.append(standings[0])
+        if len(standings) >= 2: runners.append(standings[1])
 
-    # 통과국 = 조 1위 전부 + (쿼터 남으면) 2위 성적순
-    qualified = list(winners)
-    if len(qualified) < quota:
-        runners.sort(key=lambda r: (r["pts"], r["gf"] - r["ga"], r["gf"], r["ovr"]), reverse=True)
-        need = quota - len(qualified)
-        qualified.extend(runners[:need])
-    qualified = qualified[:quota]
-    qualified_names = {q["country"] for q in qualified}
+    direct_n  = qual_cfg.get("direct", len(winners))
+    po_teams  = qual_cfg.get("po_teams", 0)
+    wildcard  = qual_cfg.get("wildcard", 0)
+    quota     = qual_cfg.get("quota", direct_n)
 
-    # qual_results 저장 (다음 해 본선용)
-    target_year = t["year"] + 1
-    target_kind = "world" if t["kind"] == "wc_qual" else "continent"
+    # ─── 직행 확정 ───
+    direct_teams = winners[:direct_n]
+
+    # 와일드카드 (아메리카 48팀 체제: 조 2위 중 상위 N팀)
+    if wildcard > 0:
+        runners.sort(key=lambda r: (r["pts"], r["gf"]-r["ga"], r["gf"], r["ovr"]), reverse=True)
+        direct_teams = direct_teams + runners[:wildcard]
+
+    # ─── 플레이오프 필요한 체제 ───
+    # 유럽(32팀): 조 1위 12팀 직행 + 조 2위 중 상위 4팀 단판 → 1팀 추가
+    # 아시아(32팀): 조 1위 10팀 전원 단판 → 5팀
+    # 아프리카(32팀): 조 1위 12팀 전원 단판 → 6팀
+    if po_teams > 0 and not big:
+        # [버그수정] 직행팀을 먼저 저장할 때 set_done=False를 전달해
+        # _save_qual_results가 status='done'으로 설정하는 것을 막는다.
+        # status='done'이 되면 process_intl_week가 다음 주차에 이 대회를 스킵해
+        # _finalize_qual_po가 호출되지 않고, PO 종료 로그도 출력되지 않는 버그 원인.
+        if direct_teams:
+            _save_qual_results(t, continent, direct_teams, set_done=False)
+
+        # PO 대상: direct_n==0이면 조 1위 전원, 아니면 조 2위 중 상위 po_teams팀
+        if direct_n == 0:
+            po_pool = winners[:po_teams]
+        else:
+            # 유럽: 조 2위 중 성적 상위 po_teams팀
+            runners.sort(key=lambda r: (r["pts"], r["gf"]-r["ga"], r["gf"], r["ovr"]), reverse=True)
+            po_pool = runners[:po_teams]
+
+        random.shuffle(po_pool)
+        conn = get_conn(); c = conn.cursor()
+        p = get_player()
+        my_nat = _my_nat(t, p) if p else ""
+        for i in range(0, len(po_pool)-1, 2):
+            home = po_pool[i]; away = po_pool[i+1]
+            is_my = 1 if my_nat and (home["country"] == my_nat or away["country"] == my_nat) else 0
+            c.execute("""INSERT INTO intl_matches
+                         (tournament_id, week, stage, home, away, is_my, my_played)
+                         VALUES(?,?,?,?,?,?,?)""",
+                      (tid, 25, "qual_po", home["country"], away["country"], is_my, 0))
+        c.execute("UPDATE intl_tournaments SET status='qual_po' WHERE id=?", (tid,))
+        conn.commit(); conn.close()
+        add_log(f"🏆 {t['name']} 플레이오프 시작! (25주차)", "event")
+        return  # 플레이오프 완료 후 _finalize_qual_po가 처리
+
+    # ─── 즉시 확정 (플레이오프 없는 체제) ───
+    _save_qual_results(t, continent, direct_teams)
+
+
+def _finalize_qual_po(t):
+    """25주차 플레이오프 완료 → 승자를 qual_results에 저장."""
+    from game_engine import add_log, get_player
+    tid = t["id"]
+    continent = _conf_key((t.get("continent") or "").strip() or "유럽")
+
     conn = get_conn()
-    c = conn.cursor()
-    # 같은 target_year+kind+continent 기존 기록 제거(중복 방지)
-    c.execute("DELETE FROM qual_results WHERE target_year=? AND kind=? AND continent=?",
-              (target_year, target_kind, continent))
-    for q in qualified:
-        c.execute("""INSERT INTO qual_results(target_year, kind, continent, country, flag, grade, ovr)
-                     VALUES(?,?,?,?,?,?,?)""",
-                  (target_year, target_kind, continent,
-                   q["country"], q["flag"], q.get("grade", "F"), q["ovr"]))
-    c.execute("UPDATE intl_tournaments SET status='done' WHERE id=?", (tid,))
-    conn.commit()
+    po_matches = [dict(r) for r in conn.execute(
+        "SELECT * FROM intl_matches WHERE tournament_id=? AND stage='qual_po'", (tid,)).fetchall()]
     conn.close()
 
-    # ── 내 나라 예선 성적 기록 ──
+    p = get_player()
+    my_nat = _my_nat(t, p) if p else ""
+    winners = []
+    po_logs = []  # 경기 결과 로그 버퍼 (헤더와 함께 출력)
+    for m in po_matches:
+        home_row = _entry(tid, m["home"])
+        away_row = _entry(tid, m["away"])
+        home = {"country": m["home"], "flag": home_row.get("flag",""),
+                "grade": home_row.get("grade","F"), "ovr": home_row.get("ovr",50)}
+        away = {"country": m["away"], "flag": away_row.get("flag",""),
+                "grade": away_row.get("grade","F"), "ovr": away_row.get("ovr",50)}
+        if m.get("home_score", -1) >= 0:
+            hs, as_ = m["home_score"], m["away_score"]
+            if hs > as_:
+                winner = home
+            elif as_ > hs:
+                winner = away
+            else:
+                winner = home if random.random() > 0.5 else away
+        else:
+            winner = _sim_single_match_ai(home, away)
+        winners.append(winner)
+        loser = away if winner["country"] == home["country"] else home
+        my_marker = ""
+        if my_nat:
+            if winner["country"] == my_nat:
+                my_marker = " ← 우리팀 통과 ✅"
+            elif loser["country"] == my_nat:
+                my_marker = " ← 우리팀 탈락 ❌"
+        po_logs.append(f"   {home['flag']}{m['home']} vs {away['flag']}{m['away']}"
+                       f" → {winner['flag']}{winner['country']} 통과{my_marker}")
+
+    # PO 경기 결과 로그 출력 (경기 시뮬 완료 후)
+    if po_logs:
+        add_log("─" * 44, "sep")
+        add_log(f"🏆 {t['name']} 플레이오프 결과", "event")
+        for _line in po_logs:
+            add_log(_line, "event")
+
+    # [버그수정] PO 승자만 넘기면 _save_qual_results의 DELETE가
+    # 기존 직행팀을 지워버린다. 직행팀을 미리 읽어 PO 승자와 합쳐서
+    # 전체를 한 번에 저장한다.
+    target_year = t["year"] + 1
+    target_kind = "world" if t["kind"] == "wc_qual" else "continent"
+    conn_pre = get_conn()
+    existing_rows = [dict(r) for r in conn_pre.execute(
+        "SELECT country, flag, grade, ovr FROM qual_results"
+        " WHERE target_year=? AND kind=? AND continent=?",
+        (target_year, target_kind, continent)).fetchall()]
+    conn_pre.close()
+    existing_names = {r["country"] for r in existing_rows}
+    # 직행팀 dict를 _save_qual_results 형식에 맞게 변환
+    direct_teams = [{"country": r["country"], "flag": r["flag"],
+                     "grade": r["grade"], "ovr": r["ovr"]} for r in existing_rows]
+    # po_winners 값만큼만 PO 승자 반영 (유럽: 4팀 PO → 승자 2팀이지만 po_winners=1)
+    from constants import WC_QUAL_32, WC_QUAL_48, WC_EXPAND_YEAR
+    big = (t["year"] + 1) >= WC_EXPAND_YEAR
+    qual_cfg = (WC_QUAL_48 if big else WC_QUAL_32).get(continent, {})
+    po_winners_n = qual_cfg.get("po_winners", len(winners))
+    po_new = [w for w in winners if w["country"] not in existing_names][:po_winners_n]
+    all_qualified = direct_teams + po_new
+    _save_qual_results(t, continent, all_qualified)
+
+
+def _save_qual_results(t, continent, qualified_list, set_done=True):
+    """통과국 목록을 qual_results에 저장 + 내 성적 기록.
+
+    set_done=False: status를 'done'으로 갱신하지 않는다.
+    PO 체제(유럽/아시아/아프리카 32팀)에서 직행팀 먼저 저장 시 사용.
+    PO 완료(_finalize_qual_po) 시에는 True(기본값)로 호출해 'done' 처리.
+    """
+    from game_engine import add_log, get_player
+
+    tid = t["id"]
+    target_year = t["year"] + 1
+    target_kind = "world" if t["kind"] == "wc_qual" else "continent"
+    qualified_names = {q["country"] for q in qualified_list}
+
+    conn = get_conn(); c = conn.cursor()
+    if set_done:
+        # 최종 저장(PO 완료 or 직행 전원 확정): 기존 행 전부 지우고 새로 씀
+        c.execute("DELETE FROM qual_results WHERE target_year=? AND kind=? AND continent=?",
+                  (target_year, target_kind, continent))
+    # set_done=True(최종): DELETE 후 qualified_list 전체를 새로 저장.
+    # set_done=False(직행팀 중간 저장): _finalize_qual_po가 나중에
+    #   직행팀+PO승자를 합쳐 set_done=True로 한 번에 덮어씀.
+    for q in qualified_list:
+        c.execute("""INSERT INTO qual_results
+                     (target_year, kind, continent, country, flag, grade, ovr)
+                     VALUES(?,?,?,?,?,?,?)""",
+                  (target_year, target_kind, continent,
+                   q["country"], q.get("flag",""), q.get("grade","F"), q.get("ovr",50)))
+    if set_done:
+        c.execute("UPDATE intl_tournaments SET status='done' WHERE id=?", (tid,))
+    conn.commit(); conn.close()
+
+    # 내 나라 성적 기록
     p = get_player()
     my_nat = _my_nat(t, p) if p else ""
     if my_nat and t["my_selected"] == 1:
         passed = my_nat in qualified_names
         result = "예선 통과" if passed else "예선 탈락"
-        # intl_tournaments.my_result
         conn = get_conn()
         conn.execute("UPDATE intl_tournaments SET my_result=? WHERE id=?", (result, tid))
-        conn.commit()
-        conn.close()
-        # 트로피 로그 + 개인 이력 (cap-tie는 simulate_my_match가 예선에서 안 함)
-        _save_trophy(t["year"], my_nat, t["name"], result)
-        conn = get_conn()
         agg = conn.execute(
             """SELECT COUNT(*) caps, COALESCE(SUM(my_goals),0) g,
                       COALESCE(SUM(my_assists),0) a, COALESCE(AVG(my_rating),0) r
@@ -1611,20 +1808,24 @@ def _finalize_qual(t):
                         VALUES(?,?,?,?,?,?,?,?)""",
                      (t["year"], t["name"], my_nat, result,
                       agg["g"], agg["a"], agg["caps"], round(agg["r"], 2)))
-        conn.commit()
-        conn.close()
+        conn.commit(); conn.close()
+        _save_trophy(t["year"], my_nat, t["name"], result)
         icon = "✅" if passed else "❌"
         add_log("─" * 44, "sep")
         add_log(f"{icon} {t['name']} 결과: {my_nat} {result}", "event")
         if passed:
-            add_log(f"   → {target_year}년 본선 진출!", "event")
+            add_log(f"   → {target_year}년 월드컵 본선 진출!", "event")
     else:
-        # 미선발/타국 — status만 done
         conn = get_conn()
-        conn.execute("UPDATE intl_tournaments SET my_result=? WHERE id=?",
-                     ("예선 미참가", tid))
-        conn.commit()
-        conn.close()
+        conn.execute("UPDATE intl_tournaments SET my_result=? WHERE id=?", ("예선 미참가", tid))
+        conn.commit(); conn.close()
+
+    # 각 대륙 예선 완료 시 무조건 진출국 목록 출력
+    if set_done:
+        add_log("─" * 44, "sep")
+        add_log(f"🌐 {t['name']} 예선 완료 — {len(qualified_list)}개국 본선 진출", "event")
+        for _q in qualified_list:
+            add_log(f"   ✈️  {_q.get('flag','')} {_q['country']}", "event")
 
 
 def get_group_standings(tid, grp):

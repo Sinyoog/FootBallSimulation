@@ -399,6 +399,13 @@ class CenterPanel(QWidget):
             self.adv_btn.setText("▶▶  이번 달 진행 (4주)")
 
         # 주차별 표시 (프레임 4칸은 항상 [묶음 시작 ~ +3])
+        # [최적화] _get_match를 루프 전에 미리 일괄 조회 (기존: 루프마다 DB+intl/cl 조회 4회)
+        _has_team = bool(p.get("current_team_id"))
+        _match_cache = {
+            bundle_start + i: (self._get_match(bundle_start + i, p) if _has_team else None)
+            for i in range(4)
+        }
+
         for i, (f, cb) in enumerate(zip(self.week_frames, self.week_combos)):
             w  = bundle_start + i
             ph = _phase_short(w, lang)
@@ -424,8 +431,7 @@ class CenterPanel(QWidget):
                 self._set_glow(f, False)         # 4주 모드: 강조 없음
                 if labels: labels[0].setText(f"{w}주차 [{ph}]")
 
-            match_info = (self._get_match(w, p)
-                          if p.get("current_team_id") else None)
+            match_info = _match_cache.get(w)
             # matchLabel, stressHint 찾기
             ml = next((l for l in labels if l.objectName()=="matchLabel"), None)
             hl = self.week_hints[i]
@@ -528,15 +534,33 @@ class CenterPanel(QWidget):
             if t and t.get("my_selected") == 1 and t.get("status") != "done":
                 nat = t.get("my_nat") or p.get("nationality1", "")
                 if not nat:
-                    # _my_nat 헬퍼 없이 직접 추출
                     nat = p.get("fixed_nat") or p.get("nationality1", "")
+                # get_my_match로 정확한 stage/grp 파악 (조별리그면 내 그룹만 표시용)
+                _im = intl_engine.get_my_match(week)
+                _stage    = _im["stage"] if _im else (t.get("status") or "group")
+                _stage_ko = _im.get("stage_ko", "") if _im else ""
+                if _im:
+                    _grp = _im["grp"]
+                else:
+                    # 비경기 주차: intl_entries에서 내 조 직접 조회
+                    try:
+                        from database import get_conn as _gc
+                        _c = _gc()
+                        _er = _c.execute(
+                            "SELECT grp FROM intl_entries WHERE tournament_id=? AND country=?",
+                            (t["id"], nat)).fetchone()
+                        _c.close()
+                        _grp = _er["grp"] if _er and _er["grp"] else ""
+                    except Exception:
+                        _grp = ""
                 return {
                     "intl": True,
                     "tournament_id": t["id"],
                     "league_name": t["name"],
                     "my_nat": nat,
-                    "stage": "group",   # get_my_match로 정확한 스테이지 알 수 있지만 group이 기본
-                    "stage_ko": "",
+                    "stage": _stage,
+                    "stage_ko": _stage_ko,
+                    "grp": _grp,
                     "week": week,
                 }
         except Exception:
@@ -544,6 +568,8 @@ class CenterPanel(QWidget):
         # 챔피언스리그 확인 (41~52주)
         try:
             import champions_engine
+            from game_engine import get_state as _gs
+            _st = _gs()
             cl_m = champions_engine.get_my_cl_match(week)
             if cl_m:
                 return {
@@ -552,8 +578,28 @@ class CenterPanel(QWidget):
                     "league_name": cl_m.get("league_name", ""),
                     "stage": cl_m.get("stage", "group"),
                     "stage_ko": cl_m.get("stage_ko", ""),
+                    "grp": cl_m.get("grp", ""),
                     "week": week,
                 }
+            # 경기 없는 주차에도 대회 진행 중이면 조별리그 context 유지
+            # (포메이션 위젯이 내 조 팀 목록을 표시하기 위해)
+            if _st:
+                cl_gi = champions_engine.get_my_cl_group_info(_st["current_year"])
+                if cl_gi:
+                    # _my_cl_tournament로 대회 정보 가져오기
+                    from champions_engine import _my_cl_tournament
+                    _cp = p  # center_panel의 p
+                    _ct = _my_cl_tournament(_cp, _st["current_year"])
+                    if _ct and _ct.get("status") != "done":
+                        return {
+                            "cl": True,
+                            "tournament_id": _ct["id"],
+                            "league_name": _ct["name"],
+                            "stage": "group",
+                            "stage_ko": "",
+                            "grp": cl_gi["grp"],
+                            "week": week,
+                        }
         except Exception:
             pass
         return None
