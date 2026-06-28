@@ -32,7 +32,7 @@ from constants import (
     INTL_SELECTION_MARGIN,
 )
 
-STAGE_KO = {"group": "조별리그", "R32": "32강", "R16": "16강", "QF": "8강", "SF": "4강", "F": "결승",
+STAGE_KO = {"group": "조별리그", "R32": "32강", "R16": "16강", "QF": "8강", "SF": "4강", "F": "결승", "TP": "3/4위전",
             "qual_group": "조별리그", "qual_po": "플레이오프"}
 
 # ── entry 캐시 ─────────────────────────────────────
@@ -203,11 +203,51 @@ def choose_national_team(tournament_id, nat):
     from game_engine import get_state
     _st = get_state() or {}
 
-    # ── [선택 우선] 결과 공개 순서: ① 선발 여부 → ② 예선 통과 여부 ──
-    #   cand_nats 후보는 '선발 통과한 나라'만 들어오므로 selected는 사실상 True지만,
-    #   안전하게 다시 판정한다(중간에 OVR/팀 변동 가능성 대비).
+    # ── [선택 우선] 결과 공개 순서: ① 컷오프 → ② 선발 여부 → ③ 예선 통과 여부 ──
     from game_engine import add_log
     p = get_player()
+
+    # ① 컷오프 체크: 선택한 나라가 예선 풀 자체에 없으면 예선 진출 실패
+    _cut_check = False
+    try:
+        from constants import WC_QUAL_32, WC_QUAL_48, WC_EXPAND_YEAR, CONFEDERATIONS
+        _qc2 = get_conn()
+        _trow2 = _qc2.execute("SELECT year, kind, continent FROM intl_tournaments WHERE id=?",
+                               (tournament_id,)).fetchone()
+        _qc2.close()
+        if _trow2 and _trow2["kind"] == "wc_qual":
+            _tyear2 = _trow2["year"]
+            _tconf2 = (_trow2["continent"] or "").strip()
+            _big2 = (_tyear2 + 1) >= WC_EXPAND_YEAR
+            _qcfg2 = (WC_QUAL_48 if _big2 else WC_QUAL_32).get(_tconf2, {})
+            _all_rows2 = sorted(_enrich_countries(_conf_countries(_tconf2)),
+                                key=lambda r: r["ovr"], reverse=True)
+            _cutoff2 = _qcfg2.get("cutoff_bottom", 0)
+            _cut_names2 = {r["name"] for r in _all_rows2[len(_all_rows2)-_cutoff2:]}
+            _cut_check = nat in _cut_names2
+    except Exception:
+        pass
+
+    if _cut_check:
+        # 컷오프 → 예선 진출 실패
+        conn2 = get_conn()
+        _tr2 = conn2.execute("SELECT year, name FROM intl_tournaments WHERE id=?",
+                              (tournament_id,)).fetchone()
+        _ty2 = _tr2["year"] if _tr2 else _st.get("current_year")
+        _tn2 = _tr2["name"] if _tr2 else ""
+        conn2.execute("UPDATE intl_tournaments SET my_nat=?, my_selected=2 WHERE id=?",
+                      (nat, tournament_id))
+        conn2.commit(); conn2.close()
+        try:
+            from game_engine import update_player as _upd_cut
+            _upd_cut(qual_pledged_nat="")  # 컷오프: pledge 초기화
+        except Exception:
+            pass
+        _save_trophy(_ty2, nat, _tn2, "예선 진출 실패")
+        add_log(f"❌ {nat} 월드컵 예선 진출 실패 (랭킹 하위권)", "event")
+        return {"nat": nat, "selected": False, "qualified": False,
+                "result": "예선진출실패", "kind": "wc_qual"}
+
     selected = _check_selection(p, grade)
 
     conn = get_conn()
@@ -228,6 +268,11 @@ def choose_national_team(tournament_id, nat):
         conn.execute("UPDATE intl_tournaments SET my_nat=?, my_selected=? WHERE id=?",
                      (nat, my_sel, tournament_id))
         conn.commit(); conn.close()
+        try:
+            from game_engine import update_player as _upd_ms
+            _upd_ms(qual_pledged_nat="")  # 미선발: pledge 초기화
+        except Exception:
+            pass
         _save_trophy(tyear, nat, tname, "국가대표 미선발")
         return {"nat": nat, "selected": False, "qualified": qualified, "result": "미선발", "kind": tkind}
 
@@ -237,6 +282,11 @@ def choose_national_team(tournament_id, nat):
         conn.execute("UPDATE intl_tournaments SET my_nat=?, my_selected=? WHERE id=?",
                      (nat, my_sel, tournament_id))
         conn.commit(); conn.close()
+        try:
+            from game_engine import update_player as _upd_et
+            _upd_et(qual_pledged_nat="")  # 예선탈락: pledge 초기화
+        except Exception:
+            pass
         _save_trophy(tyear, nat, tname, "예선 탈락")
         return {"nat": nat, "selected": True, "qualified": False, "result": "예선탈락", "kind": tkind}
 
@@ -724,21 +774,30 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
 
         cand_nats = [n for n in cont_nats if n]
         if is_wc and _had_wc_qual:
-            # 작년 예선이 있었음 → 예선 통과국만 본선 출전 가능
-            # qualified_nats: _qualify_world로 확정된 본선 진출국 중 내 국적
-            passed_nats = [n for n in cand_nats if n in entry_names]
-            if passed_nats:
-                # 예선 통과한 내 국적이 있음 → 발탁창 제시 (또는 1개면 자동)
-                if len(passed_nats) == 1:
-                    my_nat = passed_nats[0]
-                    grade = nat_info.get(my_nat, {}).get("grade", "F")
-                    my_sel = 1 if _check_selection(p, grade) else 2
-                    cand_nats = []
-                else:
-                    my_sel = 3
-                    cand_nats = passed_nats
+            # 작년 예선이 있었음 → 예선에서 내 처리 결과 확인
+            # my_selected=0(미선발)/2(예선탈락·미참가) → 본선 발탁창 없음
+            # my_selected=1(예선출전확정) + pledge → 본선 발탁창 제시
+            _qual_results = []
+            try:
+                _qc = get_conn()
+                _qual_results = [dict(r) for r in _qc.execute(
+                    "SELECT my_selected, my_nat FROM intl_tournaments"
+                    " WHERE year=? AND kind='wc_qual'",
+                    (year - 1,)).fetchall()]
+                _qc.close()
+            except Exception:
+                pass
+            # 예선에서 선발 확정(my_selected=1)된 대회가 하나라도 있고
+            # 그 나라가 본선에도 진출했으면 발탁창 제시
+            _qual_passed_nats = [
+                r["my_nat"] for r in _qual_results
+                if r["my_selected"] == 1 and r["my_nat"] in entry_names
+            ]
+            if _qual_passed_nats:
+                my_sel = 3
+                cand_nats = _qual_passed_nats
             else:
-                # 예선 있었지만 내 국적 모두 탈락 → 출전 불가
+                # 예선 미선발/탈락/미참가 → 본선 발탁창 없음
                 my_sel = 2
                 cand_nats = []
         elif cand_nats:
@@ -1095,13 +1154,18 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
         cand_nats = [n for n in my_nats
                      if n and nat_info.get(n, {}).get("continent") in cont_set]
 
+    # OVR 조건 통과 여부 (choose_national_team에서 미선발 처리에 사용)
     sel_cand = [n for n in cand_nats
                 if _check_selection(p, nat_info.get(n, {}).get("grade", "F"))]
 
-    # 내 나라가 컷오프 탈락 대상이면 "예선 진출 실패" 처리
+    # ─── my_sel 결정 ───
+    # [핵심 설계] 순서: 국적 선택 → 예선 진출 실패 → 예선 탈락 → 조별리그 탈락 → 토너먼트
+    # 컷오프 걸린 국적도 선택창 먼저 띄우고, choose_national_team에서 결과 처리.
     if my_cut_nat:
-        failed_nat = my_cut_nat
-        if failed_nat:
+        # 컷오프 걸린 국적이 있어도 선택창 제시 (committed면 자동처리)
+        if committed:
+            # 이미 고정된 나라가 컷오프 → 바로 예선 진출 실패 기록
+            failed_nat = committed
             _save_trophy(year, failed_nat, f"{year + 1} 월드컵 {continent} 예선", "예선 진출 실패")
             try:
                 conn_fc = get_conn()
@@ -1115,15 +1179,19 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
                 pass
             from game_engine import add_log
             add_log(f"❌ {failed_nat} 월드컵 {continent} 예선 진출 실패 (랭킹 하위권)", "event")
-        return  # 이 연맹 예선은 더 이상 생성하지 않음
-
-    if committed:
+            my_sel = 2; my_nat = ""; cand_nats_final = []
+        else:
+            # 미고정: 컷오프 국적 포함해서 선택창 제시
+            # choose_national_team에서 컷오프 여부 확인 후 "예선 진출 실패" 처리
+            my_sel = 3; my_nat = ""; cand_nats_final = cand_nats
+    elif committed:
         my_sel = 1 if committed in sel_cand else 2
         my_nat = committed if my_sel == 1 else ""
         cand_nats_final = []
     else:
-        if sel_cand:
-            my_sel = 3; my_nat = ""; cand_nats_final = sel_cand
+        # 미고정: 해당 연맹 소속 국적 있으면 선택창 (OVR 무관)
+        if cand_nats:
+            my_sel = 3; my_nat = ""; cand_nats_final = cand_nats
         else:
             my_sel = 2; my_nat = ""; cand_nats_final = []
 
@@ -1314,7 +1382,24 @@ def _process_one_tournament_week(t, week):
     if week == last_group_week:
         _finalize_groups(t, next_stage, next_week)
     elif next_stage is None:
-        _finish_tournament(t, week)
+        # 결승 주차: F와 TP(3/4위전) 둘 다 완료됐을 때 종료 처리
+        conn_chk = get_conn()
+        tp_remain = conn_chk.execute(
+            "SELECT COUNT(*) AS n FROM intl_matches WHERE tournament_id=? AND stage='TP' AND home_score=-1",
+            (t["id"],)).fetchone()["n"]
+        conn_chk.close()
+        if tp_remain == 0:
+            _finish_tournament(t, week)
+        # tp_remain > 0이면 TP 완료 시 다시 호출됨
+    elif week in plan and plan[week][0] == "TP":
+        # TP 완료 확인 후 결승도 끝났으면 종료
+        conn_chk = get_conn()
+        f_remain = conn_chk.execute(
+            "SELECT COUNT(*) AS n FROM intl_matches WHERE tournament_id=? AND stage='F' AND home_score=-1",
+            (t["id"],)).fetchone()["n"]
+        conn_chk.close()
+        if f_remain == 0:
+            _finish_tournament(t, week)
     else:
         _advance_knockout(t, week, next_stage, next_week)
 
@@ -1645,10 +1730,9 @@ def _finalize_qual(t):
         direct_teams = direct_teams + runners[:wildcard]
 
     # ─── 플레이오프 필요한 체제 ───
-    # 유럽(32팀): 조 1위 12팀 직행 + 조 2위 중 상위 4팀 단판 → 1팀 추가
-    # 아시아(32팀): 조 1위 10팀 전원 단판 → 5팀
-    # 아프리카(32팀): 조 1위 12팀 전원 단판 → 6팀
-    if po_teams > 0 and not big:
+    # 32팀: 유럽(직행12+PO2→1), 아시아(PO10→5), 아프리카(PO12→6)
+    # 48팀: 유럽(직행12+PO8→4), 아시아(PO10→10), 아프리카(PO12→9)
+    if po_teams > 0:
         # [버그수정] 직행팀을 먼저 저장할 때 set_done=False를 전달해
         # _save_qual_results가 status='done'으로 설정하는 것을 막는다.
         # status='done'이 되면 process_intl_week가 다음 주차에 이 대회를 스킵해
@@ -2000,20 +2084,33 @@ def _advance_knockout(t, week, next_stage, next_week):
     cur_stage_ko = STAGE_KO.get(cur[0]["stage"], "")
 
     winners = []
+    is_sf = cur and cur[0]["stage"] == "SF"
+
     conn = get_conn()
     c = conn.cursor()
     for m in cur:
         w = _winner_of(m)
         loser = m["away"] if w == m["home"] else m["home"]
         winners.append((m["slot"], w))
-        c.execute("UPDATE intl_entries SET alive=0 WHERE tournament_id=? AND country=?",
-                  (tid, loser))
-        if nat and loser == nat:
+        # SF 패자는 3/4위전을 뛰므로 alive=0으로 즉시 탈락 처리하지 않는다.
+        # (탈락은 _finish_tournament에서 4위 확정 후 처리)
+        if not is_sf:
+            c.execute("UPDATE intl_entries SET alive=0 WHERE tournament_id=? AND country=?",
+                      (tid, loser))
+        if nat and loser == nat and not is_sf:
             conn.commit()
             conn.close()
             _record_my_exit(t, cur_stage_ko)
             conn = get_conn()
             c = conn.cursor()
+
+    # 4강(SF) 종료 시: 패자 2팀으로 3/4위전(TP) 생성 (결승과 같은 주차)
+    losers = []
+    if is_sf:
+        for m in cur:
+            w = _winner_of(m)
+            loser = m["away"] if w == m["home"] else m["home"]
+            losers.append(loser)
 
     winners.sort()
     for slot in range(0, len(winners), 2):
@@ -2026,43 +2123,75 @@ def _advance_knockout(t, week, next_stage, next_week):
                       home_score, away_score, is_my, slot)
                      VALUES(?,?,?,?,?,?,-1,-1,?,?)""",
                   (tid, next_stage, "", next_week, home, away, is_my, slot // 2))
+
+    # 3/4위전: SF 패자 2팀, 결승과 같은 주차
+    if len(losers) == 2:
+        tp_home, tp_away = losers[0], losers[1]
+        is_my_tp = 1 if nat in (tp_home, tp_away) else 0
+        c.execute("""INSERT INTO intl_matches
+                     (tournament_id, stage, grp, week, home, away,
+                      home_score, away_score, is_my, slot)
+                     VALUES(?,?,?,?,?,?,-1,-1,?,?)""",
+                  (tid, "TP", "", next_week, tp_home, tp_away, is_my_tp, 999))
+        add_log(f"🥉 {t['name']} 3/4위전 대진: {tp_home} vs {tp_away} ({next_week}주차)", "event")
+
     conn.commit()
     conn.close()
     add_log(f"🌍 {t['name']} {cur_stage_ko} 종료 → {STAGE_KO[next_stage]} 대진 확정", "event")
 
 
 def _finish_tournament(t, final_week):
-    """결승 종료 → 우승국 확정, 내 결과 기록."""
+    """결승 + 3/4위전 종료 → 우승국·3위 확정, 내 결과 기록."""
     from game_engine import add_log, get_player
     tid = t["id"]
     conn = get_conn()
     fm = conn.execute(
         """SELECT * FROM intl_matches WHERE tournament_id=? AND stage='F'
            AND home_score>=0""", (tid,)).fetchone()
+    tp = conn.execute(
+        """SELECT * FROM intl_matches WHERE tournament_id=? AND stage='TP'
+           AND home_score>=0""", (tid,)).fetchone()
     conn.close()
     if not fm:
         return
     fm = dict(fm)
-    winner = _winner_of(fm)
-    loser = fm["away"] if winner == fm["home"] else fm["home"]
+    winner  = _winner_of(fm)
+    runner  = fm["away"] if winner == fm["home"] else fm["home"]
+
+    # 3/4위전 결과
+    third = fourth = None
+    if tp:
+        tp = dict(tp)
+        third  = _winner_of(tp)
+        fourth = tp["away"] if third == tp["home"] else tp["home"]
 
     conn = get_conn()
     conn.execute("UPDATE intl_tournaments SET status='done', winner=? WHERE id=?",
                  (winner, tid))
     conn.execute("UPDATE intl_entries SET alive=0 WHERE tournament_id=? AND country=?",
-                 (tid, loser))
+                 (tid, runner))
+    if fourth:
+        conn.execute("UPDATE intl_entries SET alive=0 WHERE tournament_id=? AND country=?",
+                     (tid, fourth))
     conn.commit()
     conn.close()
 
     we = _entry(tid, winner)
     add_log(f"🏆 {t['name']} 우승: {we['flag']}{winner}!", "event")
+    if third:
+        te = _entry(tid, third)
+        add_log(f"🥉 {t['name']} 3위: {te['flag']}{third}", "event")
 
     p = get_player()
     nat = _my_nat(t, p)
     if nat == winner:
         _record_my_exit(t, "우승")
-    elif nat == loser:
+    elif nat == runner:
         _record_my_exit(t, "준우승")
+    elif nat == third:
+        _record_my_exit(t, "3위")
+    elif nat == fourth:
+        _record_my_exit(t, "4위")
 
 
 # ─────────────────────────────────────────────
@@ -2072,9 +2201,12 @@ def _finish_tournament(t, final_week):
 _REWARD = {  # 결과: (명성, 인기, 행복도) ─ 월드컵 기준
     "우승":         (25, 15, 20),
     "준우승":       (15,  8, 10),
-    "4강":          (10,  5,  6),
+    "3위":          (12,  6,  8),
+    "4위":          ( 9,  4,  5),
+    "4강":          (10,  5,  6),   # 3/4위전 없는 대회(대륙컵 등) 호환
     "8강":          ( 6,  3,  3),
     "16강":         ( 3,  2,  1),
+    "32강":         ( 2,  1,  0),   # 48팀 체제 전용 (32팀 체제엔 없는 라운드)
     "조별리그 탈락": ( 1,  0, -2),
 }
 

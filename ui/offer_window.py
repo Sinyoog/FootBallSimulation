@@ -13,10 +13,11 @@ from ui.center_panel import show_toast
 STYLE = """
 QDialog { background:#1e1e1e; color:#ccc; }
 #offerCard { background:#252525; border:1px solid #333; border-radius:8px; padding:8px; }
-#grade_S { color:#ff9900; font-weight:bold; }
-#grade_A { color:#ffcc00; font-weight:bold; }
-#grade_B { color:#00ccff; font-weight:bold; }
-#grade_C { color:#00ff66; }
+#grade_SS { color:#ff4488; font-weight:bold; font-size:13px; }
+#grade_S  { color:#ff9900; font-weight:bold; }
+#grade_A  { color:#ffcc00; font-weight:bold; }
+#grade_B  { color:#00ccff; font-weight:bold; }
+#grade_C  { color:#00ff66; }
 #grade_D, #grade_E, #grade_F { color:#aaaaaa; }
 #tier1  { color:#ff6600; }
 #tier2  { color:#888888; }
@@ -132,8 +133,10 @@ class OfferWindow(QDialog):
         age_now = p_now.get("age", 17) if p_now else 17
         c_yrs = _calc_contract_years(age_now, offer.get("tier", 3))
         h3 = QHBoxLayout(); h3.setSpacing(8)
-        sl = QLabel(f"💰 연 {fmt_money(self.offer_salaries[idx])}"
-                    f"  [월 {fmt_money(self.offer_salaries[idx]//12)}]")
+        _sal = self.offer_salaries[idx]
+        _sal_txt = "💰 무급" if _sal == 0 else (
+            f"💰 연 {fmt_money(_sal)}  [월 {fmt_money(max(1, _sal // 12))}]")
+        sl = QLabel(_sal_txt)
         sl.setStyleSheet("color:#00cc44;")
         cl = QLabel(f"📋 {c_yrs}년 계약")
         cl.setStyleSheet("color:#ffcc44; font-size:11px;")

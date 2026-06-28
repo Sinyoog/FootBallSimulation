@@ -354,9 +354,18 @@ class CareerWindow(QDialog):
                 team_str = tname
                 comp_str = t.get('competition','')
                 result   = lname  # league_name 자리에 결과 저장됨
-                if "우승" in result:   color = "#00cc44"
-                elif "탈락" in result: color = "#ff6666"
-                else:                  color = None
+                if "우승" in result:     color = "#00cc44"
+                elif "준우승" in result: color = "#aaddff"
+                elif "3위" in result:   color = "#ffd700"
+                elif "4위" in result:   color = "#cc9944"
+                elif "8강" in result:   color = "#aaaaff"
+                elif "16강" in result:  color = "#8888cc"
+                elif "32강" in result:  color = "#666699"
+                elif "탈락" in result:   color = "#ff6666"
+                elif "미선발" in result:  color = "#ff9944"
+                elif "진출 실패" in result: color = "#cc6600"
+                elif "진출실패" in result:  color = "#cc6600"
+                else:                    color = None
 
             for j, v in enumerate([yr, team_str, comp_str, result]):
                 self._set(tbl, i, j, v, color if j == 3 else None)

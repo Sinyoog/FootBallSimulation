@@ -36,6 +36,7 @@ CL_ROUND_WEEKS = {
     "QF":  46,
     "SF":  47,
     "F":   48,
+    "TP":  48,  # 3/4위전: 결승과 같은 주차
 }
 CL_END_WEEK = 48
 
@@ -51,7 +52,7 @@ _entry_cache = {}
 def _clear_entry_cache():
     _entry_cache.clear()
 
-STAGE_KO = {"group": "조별리그", "R16": "16강", "QF": "8강", "SF": "4강", "F": "결승"}
+STAGE_KO = {"group": "조별리그", "R16": "16강", "QF": "8강", "SF": "4강", "F": "결승", "TP": "3/4위전"}
 # 토너먼트 라운드 진행 순서 (조별리그 다음부터)
 _STAGE_ORDER = ["R16", "QF", "SF", "F"]
 # 조별리그 라운드 매칭 (4팀, 인덱스 기반) — 3경기
@@ -84,7 +85,9 @@ CL_CUP_NAME = {
 _REWARD = {
     "우승":       (18, 12, 16),
     "준우승":     (11,  7,  8),
-    "4강":        ( 7,  4,  5),
+    "3위":        ( 9,  5,  6),
+    "4위":        ( 6,  3,  4),
+    "4강":        ( 7,  4,  5),  # 3/4위전 없는 경우 호환
     "8강":        ( 4,  3,  3),
     "16강":       ( 2,  2,  1),
     "32강":       ( 1,  0, -1),
@@ -487,7 +490,24 @@ def _process_one(t, week):
         return
 
     if cur_stage == "F":
-        _finish_tournament(t)
+        # TP(3/4위전)도 같은 주차 — 둘 다 완료된 후 _finish_tournament 호출
+        conn2 = get_conn()
+        tp_remain = conn2.execute(
+            "SELECT COUNT(*) AS n FROM cl_matches WHERE tournament_id=? AND stage='TP' AND home_score=-1",
+            (t["id"],)).fetchone()["n"]
+        conn2.close()
+        if tp_remain == 0:   # TP도 끝났거나 TP 경기 자체가 없으면 바로 종료
+            _finish_tournament(t)
+        # tp_remain > 0 이면 TP 완료 시 다시 이 함수가 호출됨
+    elif cur_stage == "TP":
+        # 3/4위전 완료 → 결승도 끝났는지 확인 후 같이 종료
+        conn2 = get_conn()
+        f_remain = conn2.execute(
+            "SELECT COUNT(*) AS n FROM cl_matches WHERE tournament_id=? AND stage='F' AND home_score=-1",
+            (t["id"],)).fetchone()["n"]
+        conn2.close()
+        if f_remain == 0:
+            _finish_tournament(t)
     else:
         nxt = _STAGE_ORDER[_STAGE_ORDER.index(cur_stage) + 1]
         _advance_round(t, cur_stage, nxt)
@@ -805,7 +825,10 @@ def _advance_round(t, cur_stage, next_stage):
     cur_stage_ko = STAGE_KO.get(cur_stage, "")
     next_week = CL_ROUND_WEEKS[next_stage]
 
+    is_sf = (cur_stage == "SF")
+
     winners = []
+    losers  = []
     conn = get_conn()
     c = conn.cursor()
     # 탈락 결과 라벨: 토너먼트에서 진 라운드 = '도달한 라운드'로 기록한다.
@@ -816,12 +839,16 @@ def _advance_round(t, cur_stage, next_stage):
         w = _winner_of(m)
         loser = m["away_team_id"] if w == m["home_team_id"] else m["home_team_id"]
         winners.append((m["slot"], w))
-        c.execute("UPDATE cl_entries SET alive=0 WHERE tournament_id=? AND team_id=?",
-                  (tid, loser))
-        if my_tid and loser == my_tid:
-            conn.commit(); conn.close()
-            _record_my_exit(t, exit_label)
-            conn = get_conn(); c = conn.cursor()
+        # SF 패자는 3/4위전을 뛰므로 즉시 alive=0 처리하지 않음
+        if not is_sf:
+            c.execute("UPDATE cl_entries SET alive=0 WHERE tournament_id=? AND team_id=?",
+                      (tid, loser))
+            if my_tid and loser == my_tid:
+                conn.commit(); conn.close()
+                _record_my_exit(t, exit_label)
+                conn = get_conn(); c = conn.cursor()
+        else:
+            losers.append(loser)
 
     winners.sort()
     for slot in range(0, len(winners), 2):
@@ -834,6 +861,20 @@ def _advance_round(t, cur_stage, next_stage):
                       home_score, away_score, is_my, slot)
                      VALUES(?,?,?,?,?,-1,-1,?,?)""",
                   (tid, next_stage, next_week, home, away, is_my, slot // 2))
+
+    # SF 종료 시 패자 2팀으로 3/4위전 생성 (결승과 같은 주차)
+    if is_sf and len(losers) == 2:
+        tp_home, tp_away = losers[0], losers[1]
+        tp_week = CL_ROUND_WEEKS["TP"]
+        is_my_tp = 1 if my_tid in (tp_home, tp_away) else 0
+        c.execute("""INSERT INTO cl_matches
+                     (tournament_id, stage, week, home_team_id, away_team_id,
+                      home_score, away_score, is_my, slot)
+                     VALUES(?,?,?,?,?,-1,-1,?,999)""",
+                  (tid, "TP", tp_week, tp_home, tp_away, is_my_tp))
+        te_h = _entry(tid, tp_home); te_a = _entry(tid, tp_away)
+        add_log(f"🥉 {t['name']} 3/4위전: {te_h['team_name']} vs {te_a['team_name']} ({tp_week}주차)", "event")
+
     conn.commit()
     conn.close()
     # 진행 상황 로그: 내 팀이 참가했고, 아직 탈락 전일 때만
@@ -846,37 +887,56 @@ def _advance_round(t, cur_stage, next_stage):
 
 
 def _finish_tournament(t):
-    """결승 종료 → 우승팀 확정, 내 결과 기록."""
+    """결승 + 3/4위전 종료 → 우승팀·3위 확정, 내 결과 기록."""
     from game_engine import add_log, get_player
     tid = t["id"]
     conn = get_conn()
     fm = conn.execute(
         """SELECT * FROM cl_matches WHERE tournament_id=? AND stage='F'
            AND home_score>=0 ORDER BY id DESC LIMIT 1""", (tid,)).fetchone()
+    tp = conn.execute(
+        """SELECT * FROM cl_matches WHERE tournament_id=? AND stage='TP'
+           AND home_score>=0 ORDER BY id DESC LIMIT 1""", (tid,)).fetchone()
     conn.close()
     if not fm:
         return
     fm = dict(fm)
     winner = _winner_of(fm)
-    loser = fm["away_team_id"] if winner == fm["home_team_id"] else fm["home_team_id"]
+    runner = fm["away_team_id"] if winner == fm["home_team_id"] else fm["home_team_id"]
+
+    third = fourth = None
+    if tp:
+        tp = dict(tp)
+        third  = _winner_of(tp)
+        fourth = tp["away_team_id"] if third == tp["home_team_id"] else tp["home_team_id"]
 
     conn = get_conn()
     conn.execute("UPDATE cl_tournaments SET status='done', winner_team_id=? WHERE id=?",
                  (winner, tid))
     conn.execute("UPDATE cl_entries SET alive=0 WHERE tournament_id=? AND team_id=?",
-                 (tid, loser))
+                 (tid, runner))
+    if fourth:
+        conn.execute("UPDATE cl_entries SET alive=0 WHERE tournament_id=? AND team_id=?",
+                     (tid, fourth))
     conn.commit()
     conn.close()
 
     we = _entry(tid, winner)
     add_log(f"🏆 {t['name']} 우승: {we['flag']}{we['team_name']}!", "event")
+    if third:
+        te = _entry(tid, third)
+        add_log(f"🥉 {t['name']} 3위: {te['flag']}{te['team_name']}", "event")
 
     p = get_player()
     my_tid = p.get("current_team_id", 0) if p else 0
     if my_tid == winner:
         _record_my_exit(t, "우승")
-    elif my_tid == loser:
+    elif my_tid == runner:
         _record_my_exit(t, "준우승")
+    elif my_tid == third:
+        _record_my_exit(t, "3위")
+    elif my_tid == fourth:
+        _record_my_exit(t, "4위")
 
 
 # ─────────────────────────────────────────────

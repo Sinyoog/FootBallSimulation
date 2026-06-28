@@ -49,14 +49,28 @@ def _fetch_league_opponents(my_team_id, league_id):
         })
     return result
 
+def _make_intl_virtual_players(avg_ovr: float) -> list:
+    """국제대회 상대국 가상 선수 11명 생성 (클릭 시 스탯 팝업용).
+    ai_players에 nationality 컬럼이 없으므로 국가 평균 OVR로 생성."""
+    import random
+    pos_list = ["GK", "CB", "CB", "LB", "RB", "CM", "CM", "CAM", "LW", "RW", "ST"]
+    result = []
+    for i, pos in enumerate(pos_list):
+        ovr_v = max(30, min(99, round(avg_ovr) + random.randint(-5, 5)))
+        result.append({"id": -(i+100), "name": "AI", "position": pos,
+                        "ovr": ovr_v, "is_me": False,
+                        **{s: ovr_v for s in ALL_STATS}})
+    return result
+
+
 def _fetch_intl_opponents(tournament_id, my_nat, grp=None):
     """국제대회 상대팀 목록.
     grp 지정 시 내 조(grp) 팀만 반환 (조별리그).
-    grp 없으면 대회 전체 참가국 반환 (예: 대회 로비에서 볼 때 fallback).
+    grp 없으면 대회 전체 참가국 반환 (fallback).
+    players 목록은 OVR 기반 가상 선수로 채워 클릭 시 스탯 팝업 표시 가능.
     """
     conn = get_conn()
     if grp:
-        # 내 그룹 팀만 (조별리그: 나 제외 상대 3팀)
         rows = conn.execute(
             "SELECT country, flag, ovr FROM intl_entries "
             "WHERE tournament_id=? AND country!=? AND grp=?",
@@ -67,14 +81,18 @@ def _fetch_intl_opponents(tournament_id, my_nat, grp=None):
             "WHERE tournament_id=? AND country!=?",
             (tournament_id, my_nat)).fetchall()
     conn.close()
-    return [{
-        "team_id":   None,
-        "name":      r["country"],
-        "flag":      r["flag"] or "",
-        "avg_ovr":   round(r["ovr"]) if r["ovr"] else 0,
-        "formation": "4-4-2",
-        "players":   [],
-    } for r in rows]
+    result = []
+    for r in rows:
+        avg = r["ovr"] or 50
+        result.append({
+            "team_id":   None,
+            "name":      r["country"],
+            "flag":      r["flag"] or "",
+            "avg_ovr":   round(avg),
+            "formation": "4-4-2",
+            "players":   _make_intl_virtual_players(avg),
+        })
+    return result
 
 def _fetch_cl_opponents(tournament_id, my_team_id, grp=None):
     """챔피언스리그 상대팀 목록.
@@ -119,10 +137,12 @@ def _fetch_intl_ko_opp(tournament_id, my_nat, week):
         "SELECT flag, ovr FROM intl_entries WHERE tournament_id=? AND country=?",
         (tournament_id, opp)).fetchone()
     conn.close()
+    avg = fr["ovr"] if fr and fr["ovr"] else 50
     return [{"team_id": None, "name": opp,
              "flag": fr["flag"] if fr else "",
-             "avg_ovr": round(fr["ovr"]) if fr and fr["ovr"] else 0,
-             "formation": "4-4-2", "players": []}]
+             "avg_ovr": round(avg),
+             "formation": "4-4-2",
+             "players": _make_intl_virtual_players(avg)}]
 
 def _fetch_cl_ko_opp(tournament_id, my_team_id, week):
     conn = get_conn()
@@ -205,30 +225,40 @@ class _FormationCanvas(QWidget):
 
         if intl_nat:
             # ── 국제전: 내 국가대표팀 선수 구성 ──
-            # 국제전은 ai_players 대신 국가대표 평균 OVR로만 구성되므로
-            # 내 선수(나)를 포함한 가상 11명으로 포메이션 표시
-            self.formation = "4-4-2"  # 국가대표 기본 포메이션
-            players = []
-            if p:
-                me = {"id": -1, "name": p.get("name", "나"),
-                      "position": p.get("position", "MF"),
-                      "ovr": p.get("ovr", 40), "is_me": True,
-                      **{s: p.get(s, 0) for s in ALL_STATS}}
-                players.append(me)
-            # 나머지 10명: intl_entries의 국가 OVR로 가상 선수 생성
+            # nationality1 기준으로 ai_players를 국가별로 뽑을 수 없으므로
+            # intl_entries OVR로 가상 11명 생성. 나(my_player)는 실제 스탯 사용.
+            self.formation = "4-4-2"
+            import random
+
             conn = get_conn()
             entry = conn.execute(
                 "SELECT ovr FROM intl_entries WHERE country=? LIMIT 1",
                 (intl_nat,)).fetchone()
             conn.close()
             avg_ovr = round(entry["ovr"]) if entry and entry["ovr"] else (p.get("ovr", 50) if p else 50)
-            import random
-            pos_list = ["GK", "CB", "CB", "LB", "RB", "CM", "CM", "CAM", "LW", "RW"]
-            for i, pos in enumerate(pos_list[:10 - (len(players))]):
-                ovr_v = max(30, min(99, avg_ovr + random.randint(-5, 5)))
-                players.append({"id": -(i+2), "name": "", "position": pos,
-                                 "ovr": ovr_v, "is_me": False,
-                                 **{s: ovr_v for s in ALL_STATS}})
+
+            # 포지션 목록: 나를 제외한 10자리 (GK 반드시 포함)
+            my_pos = p.get("position", "CM") if p else "CM"
+            my_cat = _pos_category(my_pos)
+            # GK은 항상 포함, 나머지는 내 포지션 카테고리 제외 후 채움
+            if my_cat == "GK":
+                others = ["CB", "CB", "LB", "RB", "CM", "CM", "CAM", "LW", "RW", "ST"]
+            else:
+                others = ["GK", "CB", "CB", "LB", "RB", "CM", "CM", "CAM", "LW", "RW"]
+
+            players = []
+            if p:
+                me = {"id": -1, "name": p.get("name", "나"),
+                      "position": my_pos,
+                      "ovr": p.get("ovr", 40), "is_me": True,
+                      **{s: p.get(s, 0) for s in ALL_STATS}}
+                players.append(me)
+            for i, pos in enumerate(others):
+                ovr_v = max(30, min(99, avg_ovr + random.randint(-4, 4)))
+                # 모든 스탯을 ovr_v로 채우되 포지션별 편차 부여
+                base = {s: ovr_v for s in ALL_STATS}
+                players.append({"id": -(i+2), "name": "AI", "position": pos,
+                                 "ovr": ovr_v, "is_me": False, **base})
             self.players = players
         else:
             # ── 리그팀 ──

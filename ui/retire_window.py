@@ -472,7 +472,10 @@ class RetireWindow(QDialog):
                 comp_str = t.get('competition','')
                 result   = lname  # league_name 자리에 결과 저장됨
                 if "우승" in result:    color = "#00cc44"
-                elif "거절" in result:  color = "#cc8844"   # 발탁 거절(주황)
+                elif "준우승" in result: color = "#aaddff"
+                elif "3위" in result:   color = "#ffd700"
+                elif "4위" in result:   color = "#cc9944"
+                elif "거절" in result:  color = "#cc8844"
                 elif "탈락" in result:  color = "#cc6666"
                 else:                   color = None
 
@@ -836,7 +839,14 @@ class RetireWindow(QDialog):
                 yr, comp = t.get('year', 0), t.get('competition', '')
                 result   = t.get('league_name', '')   # league_name 자리에 결과 저장됨
                 team     = t.get('team_name', '')
-                _ic = "🏆" if result == "우승" else ("🥈" if result == "준우승" else "▫")
+                _ic = ("🏆" if result == "우승" else
+                       "🥈" if result == "준우승" else
+                       "🥉" if result == "3위" else
+                       "4️⃣" if result == "4위" else
+                       "⚔️" if result == "8강" else
+                       "🔵" if result == "16강" else
+                       "🟣" if result == "32강" else
+                       "❌" if result in ("국가대표 미선발","예선 탈락","예선 진출 실패") else "▫")
                 line = f"  {_ic} {yr}년  {comp}  →  {result}  ({team})"
                 ch = clhist.get((yr, comp))
                 if ch and ch.get("caps", 0) > 0:
@@ -886,7 +896,15 @@ class RetireWindow(QDialog):
                 if result == "발탁 거절":
                     lines.append(f"  🚫 {yr}년  {comp}  →  발탁 거절  ({nation})")
                     continue
-                line = f"  🌍 {yr}년  {comp}  →  {result}  ({nation})"
+                _ic_i = ("🏆" if result == "우승" else
+                         "🥈" if result == "준우승" else
+                         "🥉" if result == "3위" else
+                         "4️⃣" if result == "4위" else
+                         "⚔️" if result == "8강" else
+                         "🔵" if result == "16강" else
+                         "🟣" if result == "32강" else
+                       "❌" if result in ("국가대표 미선발","예선 탈락","예선 진출 실패") else "🌍")
+                line = f"  {_ic_i} {yr}년  {comp}  →  {result}  ({nation})"
                 ih = hist.get((yr, comp))
                 if ih and ih.get("caps", 0) > 0:
                     if p.get("position") == "GK":

@@ -60,11 +60,16 @@ def _league_tier(c, league_id, default=3):
 # ═══════════════════════════════════════════
 
 def fmt_money(amount_k: int) -> str:
-    """천원 단위 정수 → 표시 문자열. (예: 1=1천원, 10000=1천만원, 100000=1억)"""
-    if amount_k <= 0:
-        return "무급"
+    """천원 단위 정수 → 표시 문자열. (예: 1=1천원, 10000=1천만원, 100000=1억)
+    amount_k <= 0 이면 "무급"이 아닌 "0원"을 반환한다.
+    진짜 무급(salary==0)은 호출부에서 별도 처리할 것.
+    """
+    if amount_k < 0:
+        return "0원"
+    if amount_k == 0:
+        return "0원"
     won = amount_k * 1000
-    if won >= 1000000000000:    # 1조 이상 (1조 = 10,000억 = 1,000,000,000,000원)
+    if won >= 1000000000000:    # 1조 이상
         jo  = won // 1000000000000
         eok = (won % 1000000000000) // 100000000
         if eok:
@@ -316,11 +321,11 @@ def create_player(name: str, position: str, sub_role: str,
     height = random.randint(*_bt["height"])
     weight = random.randint(*_bt["weight"])
 
-    # 재능 등급 추첨 (worldclass/elite/normal/limited) → 고강도 돌파 상한 결정
+    # 재능 등급 추첨 (worldclass/elite/pro/semipro/ordinary) → 고강도 돌파 상한 결정
     _r = random.random()
     _acc = 0.0
-    talent_tier = "normal"
-    for _tname in ("worldclass", "elite", "normal", "limited"):
+    talent_tier = "pro"
+    for _tname in ("worldclass", "elite", "pro", "semipro", "ordinary"):
         _acc += TALENT_TIERS[_tname]["prob"]
         if _r < _acc:
             talent_tier = _tname
@@ -329,12 +334,13 @@ def create_player(name: str, position: str, sub_role: str,
     talent_cap = random.randint(_tt["cap_min"], _tt["cap_max"])
 
     # 피크 나이: 재능이 클수록 잠재력을 다 끌어내는 데 오래 걸려 늦게 정점에
-    #   도달한다(월클 23~24, 무재능 20~21). 성장기(16~peak)가 길수록 천천히 오른다.
+    #   도달한다(월클 25~27, 평범 19~21). 성장기(16~peak)가 길수록 천천히 오른다.
     _peak_by_tier = {
-        "worldclass": (23, 24),
-        "elite":      (22, 24),
-        "normal":     (21, 23),
-        "limited":    (20, 22),
+        "worldclass": (25, 27),
+        "elite":      (23, 25),
+        "pro":        (22, 24),
+        "semipro":    (20, 22),
+        "ordinary":   (19, 21),
     }
     peak_age = random.randint(*_peak_by_tier.get(talent_tier, (22, 24)))
 
@@ -342,17 +348,20 @@ def create_player(name: str, position: str, sub_role: str,
     #   16세 시작은 낮게 잡아 20대 중반까지 천천히 성장하도록 한다.
     #   (성장 페이스는 _age_train_eff 에이징커브가 함께 결정)
     if talent_tier == "worldclass":
-        target = random.randint(42, 48); dev = random.randint(7, 11)
-        mx_add = (40, 54)
+        target = random.randint(42, 50); dev = random.randint(7, 11)
+        mx_add = (44, 58)
     elif talent_tier == "elite":
-        target = random.randint(39, 45); dev = random.randint(8, 12)
-        mx_add = (36, 48)
-    elif talent_tier == "normal":
-        target = random.randint(36, 42); dev = random.randint(10, 14)
-        mx_add = (32, 44)
-    else:  # limited
-        target = random.randint(32, 38); dev = random.randint(11, 16)
-        mx_add = (26, 38)
+        target = random.randint(39, 47); dev = random.randint(8, 12)
+        mx_add = (40, 54)
+    elif talent_tier == "pro":
+        target = random.randint(36, 43); dev = random.randint(9, 13)
+        mx_add = (34, 48)
+    elif talent_tier == "semipro":
+        target = random.randint(32, 39); dev = random.randint(10, 14)
+        mx_add = (28, 42)
+    else:  # ordinary
+        target = random.randint(28, 35); dev = random.randint(11, 16)
+        mx_add = (22, 36)
 
     stat_vals = {}
     # [해결A] 포지션 색깔: OVR 가중치를 재활용해 핵심 스탯은 살짝 높게,
@@ -2917,11 +2926,13 @@ def get_schedule(league_id, season):
 def _pay_salary(p, week):
     salary = p.get("salary",0)
     if salary <= 0: return
-    monthly = salary // 12
+    # monthly가 0이 되지 않도록 최솟값 1천원 보장
+    # (F급 tier2~3 등 초저연봉: salary=3~100천원 → salary//12=0 → 무급 표시 버그)
+    monthly = max(1, salary // 12)
     # 에이전트 수수료: 개별 계약 수수료율(agent_fee_rate)이 있으면 그것,
     # 없으면(0) 등급 기본값. 같은 등급이라도 계약마다 수수료가 다를 수 있다.
     fee = p.get("agent_fee_rate", 0) or AGENT_FEE_RATE.get(p.get("agent_grade","F"), 0)
-    net = int(monthly * (1-fee))
+    net = max(1, int(monthly * (1-fee)))  # 수수료 후도 최소 1천원
     assets   = p.get("total_assets",   0) + net
     earnings = p.get("total_earnings", 0) + net  # 이슈10: 누적 수입
     update_player(total_assets=assets, total_earnings=earnings)
@@ -3577,7 +3588,11 @@ def _end_of_season(p, year):
                                AGING_GROUP_WEIGHT, AGING_LIMITED_LATE_MENTAL,
                                AGING_POS_MULT, AGING_STAT_FLOOR,
                                PHYSICAL_STATS, TECHNICAL_STATS, MENTAL_STATS)
-        tier = p.get("talent_tier", "normal")
+        tier = p.get("talent_tier", "pro")
+        # 구버전 호환: 예전 키를 새 키로 변환
+        _tier_compat = {"normal": "pro", "limited": "semipro",
+                        "gifted": "worldclass", "mid": "elite"}
+        tier = _tier_compat.get(tier, tier)
         pos  = p.get("position", "CM")
 
         # [티어별 나이구간 연간 OVR 낙폭] 선택.
@@ -3585,7 +3600,7 @@ def _end_of_season(p, year):
         if tier == "worldclass" and p.get("talent_cap", p.get("ovr", 0)) >= AGING_WC_TOP_OVR:
             decline_tbl = AGING_DECLINE_WC_TOP
         else:
-            decline_tbl = AGING_DECLINE.get(tier, AGING_DECLINE["normal"])
+            decline_tbl = AGING_DECLINE.get(tier, AGING_DECLINE["pro"])
 
         # 이번 나이의 '연간 OVR 낙폭(D)' 조회.
         annual_drop = 0.0
@@ -3598,15 +3613,14 @@ def _end_of_season(p, year):
             pos_mult = AGING_POS_MULT.get(pos, 1.0)
 
             # 계열 비중 정규화: 전체 스탯에 평균 1.0이 되도록.
-            #   (그래야 'OVR 낙폭 D'가 스탯 평균 감소량과 일치)
             def _group_of(s):
                 if s in PHYSICAL_STATS:  return "physical"
                 if s in TECHNICAL_STATS: return "technical"
                 return "mental"
 
-            # 범부(limited) 노년 예외: 41세+면 멘탈도 일부 깎는다.
+            # ordinary/semipro 노년(41세+)은 멘탈도 일부 깎는다.
             gw = dict(AGING_GROUP_WEIGHT)
-            if tier == "limited" and new_age >= AGING_LIMITED_LATE_MENTAL["age"]:
+            if tier in ("ordinary", "semipro") and new_age >= AGING_LIMITED_LATE_MENTAL["age"]:
                 gw["mental"] = AGING_LIMITED_LATE_MENTAL["weight"]
 
             avg_w = sum(gw[_group_of(s)] for s in ALL_STATS) / len(ALL_STATS)
@@ -3676,23 +3690,32 @@ def _end_of_season(p, year):
         end_yr  = p2.get("contract_end_year", 0)
         if end_yr and year >= end_yr:
             # 팀의 재계약 의사 결정
-            # (season_rating_*는 4단계에서 이미 리셋됨 → 리셋 전 스냅샷 사용)
             avg_r = season_avg_rating
             rel   = p2.get("manager_relation", 50)
-            # 포지션군별 기준선 (수비/GK는 낮게)
             _grp  = POS_GROUP.get(p2.get("position","CM"), "미드")
             _base = RENEW_RATING.get(_grp, 6.3)
-            wants_renew = (avg_r >= _base or rel >= 60)
+
+            # [OVR 격차 기반 재계약 거부] 팀 평균OVR(본인 제외) 대비 격차가
+            # 리그등급 기준 이상이면 감독관계/평점 무관하게 재계약 안 함
+            from constants import RELEASE_GAP_BY_GRADE
+            _glow2 = _my_grade_tier(p2)
+            _ovr_gap = 0
+            if _glow2:
+                _g2, _t2, _c2 = _glow2
+                _team_avg2 = _my_team_avg_ovr(p2)
+                _ovr_gap = _team_avg2 - p2.get("ovr", 40)
+                _rel_threshold2 = RELEASE_GAP_BY_GRADE.get(_g2, 5)
+            else:
+                _rel_threshold2 = 5
+            ovr_too_low = (_ovr_gap >= _rel_threshold2)
+
+            wants_renew = (avg_r >= _base or rel >= 60) and not ovr_too_low
             if wants_renew:
                 # 재계약 의사 있음 → UI 팝업용 플래그 저장
                 base_sal = p2.get("salary", 0)
                 if avg_r >= _base + 0.5:   new_sal = int(base_sal * 1.15)
                 elif avg_r >= _base:       new_sal = int(base_sal * 1.05)
                 else:                      new_sal = int(base_sal * 0.95)
-                # 팀이 계약 기간(1~3년)을 결정한다. 나이·활약 기반:
-                #  - 어리고(28세 이하) 잘하면 장기(3년) 제안
-                #  - 전성기 지난(31세+) 선수는 단기(1년) 위주
-                #  - 그 사이는 활약도로 2~3년
                 _age = new_age
                 if _age >= 33:
                     renew_yrs = 1
@@ -3701,7 +3724,7 @@ def _end_of_season(p, year):
                 elif _age >= 29:
                     renew_yrs = random.choices([1, 2, 3], [25, 50, 25])[0]
                 elif _age <= 28 and avg_r >= _base + 0.5:
-                    renew_yrs = random.choices([2, 3], [30, 70])[0]   # 유망/핵심 → 장기
+                    renew_yrs = random.choices([2, 3], [30, 70])[0]
                 else:
                     renew_yrs = random.choices([1, 2, 3], [15, 45, 40])[0]
                 update_player(_contract_renew_offer=new_sal,
@@ -3709,14 +3732,15 @@ def _end_of_season(p, year):
                 add_log(f"📋 계약 만료! 팀에서 {renew_yrs}년 재계약을 제안합니다. "
                         f"(제시 연봉: {fmt_money(new_sal)})", "event", year, 52)
             else:
-                # 재계약 거절 → 소속 없음
-                # (연말 항목은 이미 닫혔으므로 allow_insert=False로 중복 방지)
+                if ovr_too_low:
+                    add_log(f"📋 계약 만료. 팀 수준에 미달해 재계약을 원하지 않습니다. (격차 {_ovr_gap:+.0f})", "event", year, 52)
+                else:
+                    add_log(f"📋 계약 만료. 팀에서 재계약을 원하지 않습니다.", "event", year, 52)
                 _save_career_entry(p2, year, 52, transfer_type="방출",
                                    allow_insert=False, exit_type="계약만료")
                 update_player(current_team_id=0, current_league_id=0,
                               salary=0, contract_years=0, contract_end_year=0,
                               _contract_renew_offer=0)
-                add_log(f"📋 계약 만료. 팀에서 재계약을 원하지 않습니다.", "event", year, 52)
 
     if new_age >= MAX_AGE:
         add_log(f"⭐ {new_age}세. 선수 생활을 마감합니다.", "event", year, 52)
@@ -3754,16 +3778,15 @@ def _apply_rank_happiness(p, year):
 
 
 def _check_forced_release(p, year):
-    """이슈8: 방출 조건 강화 - 감독 관계 악화 OR 성적 부진 + 평점 저조."""
+    """방출 조건: 팀 평균OVR(본인 제외) 대비 격차가 리그등급 기준 이상 AND 감독관계 30 미만.
+    재계약 거부: 격차 기준 초과 시 감독관계 무관 (계약 만료 시 별도 처리).
+    오버페이 + 부진 선수는 방출 전 하위팀 이적(팔림) 우선 시도."""
     rel  = p.get("manager_relation", 50)
     tid  = p.get("current_team_id", 0)
     if not tid:
         return
 
     # ── 막 합류한 선수 보호 ───────────────────────────────
-    # 시즌 후반(예: 25주 이후)에 입단했으면 평가할 표본(출전)이 부족하다.
-    # 이런 선수를 방출/판매하면, 입단하자마자 또 쫓겨나는 비정상이 생긴다.
-    # (스샷: 45주 입단 → 다음 시즌 시작하자마자 또 이적) → 이번 시즌은 평가 보류.
     try:
         conn0 = get_conn()
         open_row = conn0.execute(
@@ -3776,69 +3799,54 @@ def _check_forced_release(p, year):
     except Exception:
         pass
 
-    rank_str = get_team_rank(tid)
-    try:
-        rn = int(rank_str.split("위")[0].replace("공동", "").strip())
-    except Exception:
-        rn = 0
-
     rc = p.get("season_rating_cnt",0); rs = p.get("season_rating_sum",0.0)
     avg_rating = round(rs/rc,2) if rc > 0 else 6.0
 
-    # 리그 수준 적합성: 팀 평균 OVR과의 격차
+    # 팀 평균OVR(본인 제외) 대비 격차
     team_avg = _my_team_avg_ovr(p)
-    gap = team_avg - p.get("ovr", 40)        # +면 내가 팀 수준에 못 미침
-    season_matches = p.get("season_matches", 0)
+    gap = team_avg - p.get("ovr", 40)   # +면 내가 팀 수준에 못 미침
 
-    cond_ext   = (avg_rating < 5.5 and rc >= 5) or (rel < 20)
-    cond_combo = avg_rating < 6.0 and rel < 40 and rc >= 5
-    # 수준 미달: 팀보다 많이 낮고 출전도 거의 못 함(벤치 누적)
-    cond_level = (gap >= RELEASE_GAP_SOFT and season_matches < RELEASE_GAP_SOFT_MATCH)
-    # 심각한 수준 미달: 격차가 너무 크면 평점 무관 방출
-    cond_level_hard = (gap >= RELEASE_GAP_HARD)
+    # 리그 등급 기반 방출 기준 조회
+    from constants import RELEASE_GAP_BY_GRADE, RELEASE_REL_THRESHOLD
+    _glow = _my_grade_tier(p)
+    if _glow:
+        _grade, _tier, _country = _glow
+        release_threshold = RELEASE_GAP_BY_GRADE.get(_grade, 5)
+    else:
+        release_threshold = 5
 
-    # ── [기능2] 감독 성향(release_relax) + [기능1] 구단 야망(press)으로 임계치 조정 ──
-    # relax가 +면 잘 안 자르고(뚝심형), -면 가차없다(성과주의).
-    # 야망 press가 높으면(우승도전) 기대치가 높아 방출각이 빨라진다.
+    # ── [기능2] 감독 성향(release_relax)으로 임계치 조정 ──
     from constants import MANAGER_TYPES, OFFER_AMBITION
     mt = MANAGER_TYPES.get(p.get("manager_type", "베테랑 신뢰"), {})
     relax = mt.get("release_relax", 0.0)
     press = OFFER_AMBITION.get(p.get("club_ambition", "중위권 안정"), {}).get("press", 1.0)
-    # 평점 기준선을 relax/press로 이동 (관대할수록 낮은 평점도 용인)
-    rate_floor_shift = (-relax * 2.0) + ((press - 1.0) * 1.5)
-    if rc >= 5:
-        eff_rating = avg_rating - rate_floor_shift   # 관대하면 평점을 후하게 본 셈
-        cond_ext   = (eff_rating < 5.5) or (rel < 20)
-        cond_combo = eff_rating < 6.0 and rel < 40
+    # 관대한 감독은 기준을 1~2 올려주고, 성과주의 감독은 더 빡빡하게
+    adjusted_threshold = release_threshold + round(relax * 2) - round((press - 1.0) * 1)
 
-    # ── 팔림(강제 이적) 체크: 오버페이 + 부진 → 손절 후 하위팀 이적 ──
-    # 계약이 남았어도 구단이 손해보면 판다. 무소속이 아니라 수준 맞는 팀으로.
+    # ── 오버페이 + 부진 → 팔림(강제 이적) 우선 시도 ──
     cur_salary = p.get("salary", 0)
     cur_ovr    = p.get("ovr", 40)
-    _glow = _my_grade_tier(p)   # (grade, tier, country)
     if _glow and cur_salary > 0:
-        _grade, _tier, _country = _glow
-        fair_salary = _calc_salary(_grade, _tier, cur_ovr, _country)
+        _grade2, _tier2, _country2 = _glow
+        fair_salary = _calc_salary(_grade2, _tier2, cur_ovr, _country2)
         overpay = (cur_salary / fair_salary) if fair_salary > 0 else 99
-        # 오버페이 1.6배+ AND 부진(평점<6.3 또는 수준미달) AND 아직 방출각은 아님
         is_overpaid = overpay >= 1.6
-        is_underperforming = (avg_rating < 6.3 and rc >= 5) or cond_level
+        is_underperforming = (avg_rating < 6.3 and rc >= 5) or (gap >= adjusted_threshold)
         contract_left = p.get("contract_end_year", 0) > year
-        if is_overpaid and is_underperforming and contract_left and not (cond_ext or cond_level_hard):
+        if is_overpaid and is_underperforming and contract_left:
             if _try_sell_player(p, year, cur_ovr):
                 return   # 팔림 처리 완료 → 방출 로직 건너뜀
 
-    if cond_ext or cond_combo or cond_level or cond_level_hard:
+    # ── 핵심 방출 조건: 격차 기준 초과 AND 감독관계 30 미만 ──
+    cond_level = gap >= adjusted_threshold and rel < RELEASE_REL_THRESHOLD
+    # 감독관계 20 미만은 격차 무관 방출 (극단적 불화)
+    cond_hostile = rel < 20 and avg_rating < 5.5 and rc >= 5
+
+    if cond_level or cond_hostile:
         if rel < 20:
-            reason = "감독 관계 악화"
-        elif cond_level_hard or cond_level:
-            reason = "리그 수준 미달"
-        elif avg_rating < 5.5:
-            reason = "저조한 평점"
+            reason = "감독 관계 극도 악화"
         else:
-            reason = "성적 부진"
-        # 연말 항목은 _close_career_entry로 이미 닫힘 → allow_insert=False로 중복 방지
-        # exit_type='방출'을 직전 팀 항목에 덧칠
+            reason = "리그 수준 미달 + 감독 신뢰 상실"
         _save_career_entry(p, year, 52, transfer_type="방출", allow_insert=False,
                            exit_type="방출")
         add_log(f"😡 {reason}으로 방출!  {year}년  (평점 {avg_rating}, 감독관계 {rel}, 수준격차 {gap:+.0f})", "event", year, 52)
@@ -3896,7 +3904,7 @@ def _try_sell_player(p, year, cur_ovr):
         return False
 
     # 새 팀 연봉 (새 OVR 기준, 리그 부유도 반영)
-    new_salary = _calc_salary(row["grade"], row["tier"], cur_ovr, row["country"])
+    new_salary = _calc_salary(get_league_grade(row["country"], row["grade"]), row["tier"], cur_ovr, row["country"])
 
     # (변경) 떠나는 팀에는 우승을 주지 않는다.
     # 우승은 '시즌 종료 시점 소속팀'이 1위일 때만 _process_promotion_relegation에서 인정.
@@ -4070,16 +4078,23 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
             if not tl_info or not bu_info:
                 continue
 
-            _upper_avg    = get_league_avg_ovr(upper_lid, conn)
-            _lower_strong = get_league_strong_ovr(lower_lid, 0.75, conn)
-            if _upper_avg is not None:
-                _rescale_jobs.append((top_lower["id"], _upper_avg))
-            if _lower_strong is not None:
-                _rescale_jobs.append((bottom_upper["id"], _lower_strong))
+            # [버그수정] 리스케일 목표치는 팀 이동 *전* 측정하되
+            # 각 팀 본인을 제외한 순수 기존 팀 평균으로 산정.
+            # - 승격팀(top_lower) 목표: 상위 리그 기존 팀 평균 (승격팀 제외 불필요 — 아직 안 올라옴)
+            # - 강등팀(bottom_upper) 목표: 하위 리그 기존 팀 상위 75% (강등팀 제외 — 아직 안 내려옴)
+            # tier 1→4 순서 루프이므로, 이전 tier에서 이동된 팀이
+            # 현재 리그 평균에 포함될 수 있어 moved_teams 제외 처리.
+            _upper_avg = get_league_avg_ovr(upper_lid, conn)
+            _lower_strong = get_league_strong_ovr(lower_lid, 0.75, conn,
+                                                   exclude_team_id=bottom_upper["id"])
 
             # 승격: top_lower → upper
             c.execute("UPDATE teams SET league_id=?,current_tier=? WHERE id=?",
                       (upper_lid, tier, top_lower["id"]))
+            if _upper_avg is not None:
+                _rescale_jobs.append((top_lower["id"], _upper_avg))
+            if _lower_strong is not None:
+                _rescale_jobs.append((bottom_upper["id"], _lower_strong))
             c.execute("INSERT INTO promotion_log(year,team_name,from_tier,to_tier,league_name) VALUES(?,?,?,?,?)",
                       (year, tl_info["name"], ntier, tier, tl_info["lname"]))
             tl_is_mine = (top_lower["id"] in my_season_teams)
@@ -4220,7 +4235,7 @@ def _sim_all_leagues_for_season_end(season: int):
 
     cid  = lg_row["country_id"]
     ss   = conn.execute("SELECT current_year FROM season_state WHERE id=1").fetchone()
-    year = ss["current_year"] if ss else 1990
+    year = ss["current_year"] if ss else 2000
 
     # 내 국가 전체 리그 (tier 1~5, 실제 존재하는 것만)
     c.execute("SELECT id FROM leagues WHERE country_id=?", (cid,))
@@ -4314,7 +4329,8 @@ def generate_offers(count=5) -> list:
         if team_avg is None:
             return True
         try:
-            grade = team_row["grade"]
+            from constants import get_league_grade as _glg
+            grade = _glg(team_row.get("country", ""), team_row["grade"])
         except Exception:
             grade = None
         margin = CLUB_JOIN_MARGIN_BY_GRADE.get(grade, CLUB_JOIN_MARGIN)
@@ -4385,8 +4401,8 @@ def generate_offers(count=5) -> list:
                 if not row: return False
             if any(o["team_id"] == row["id"] for o in offers): return False
             if row["id"] == my_tid: return False
-            salary = int(_calc_salary(row["grade"], tier, ovr, row["country"]) * random.uniform(0.85, 1.15))
-            offers.append(_build_offer(row, row["grade"], tier, salary))
+            salary = int(_calc_salary(get_league_grade(row["country"], row["grade"]), tier, ovr, row["country"]) * random.uniform(0.85, 1.15))
+            offers.append(_build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary))
             return True
 
         # [1단계] 내 수준으로 가능한 자국 티어 확정.
@@ -4436,8 +4452,8 @@ def generate_offers(count=5) -> list:
             if any(o["team_id"] == row["id"] for o in offers): continue
             if row["id"] == my_tid: continue
             if not _team_fits_me(row): continue
-            salary = int(_calc_salary(row["grade"], tier, ovr, row["country"]) * random.uniform(0.85, 1.15))
-            offers.append(_build_offer(row, row["grade"], tier, salary))
+            salary = int(_calc_salary(get_league_grade(row["country"], row["grade"]), tier, ovr, row["country"]) * random.uniform(0.85, 1.15))
+            offers.append(_build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary))
 
         # 자국에서 못 채웠거나 해외 슬롯이 남은 경우 → 타국으로 채움
         if len(offers) < count:
@@ -4461,8 +4477,8 @@ def generate_offers(count=5) -> list:
                 if any(o["team_id"] == row["id"] for o in offers): continue
                 if row["id"] == my_tid: continue
                 if not _team_fits_me(row): continue
-                salary = int(_calc_salary(row["grade"], tier, ovr, row["country"]) * random.uniform(0.85, 1.15))
-                offers.append(_build_offer(row, row["grade"], tier, salary))
+                salary = int(_calc_salary(get_league_grade(row["country"], row["grade"]), tier, ovr, row["country"]) * random.uniform(0.85, 1.15))
+                offers.append(_build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary))
     else:
         # 일반 이적/입단 오퍼
         # ── 현재 소속 리그의 국가 팀 우선 1~2개 ──────────────────
@@ -4505,8 +4521,8 @@ def generate_offers(count=5) -> list:
                 if any(o["team_id"] == row["id"] for o in offers): continue
                 if row["id"] == my_tid: continue
                 if not _team_fits_me(row): continue   # 내 OVR과 너무 차이나는 팀 제외
-                salary = int(_calc_salary(row["grade"], tier, ovr, row["country"]) * random.uniform(0.85, 1.15))
-                offer = _build_offer(row, row["grade"], tier, salary)
+                salary = int(_calc_salary(get_league_grade(row["country"], row["grade"]), tier, ovr, row["country"]) * random.uniform(0.85, 1.15))
+                offer = _build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary)
                 offer["_home_league"] = True  # 정렬용 플래그
                 offers.append(offer)
 
@@ -4530,8 +4546,8 @@ def generate_offers(count=5) -> list:
                 if any(o["team_id"] == row["id"] for o in offers): continue
                 if row["id"] == my_tid: continue
                 if not _team_fits_me(row): continue   # 내 OVR과 너무 차이나는 팀 제외
-                salary = int(_calc_salary(row["grade"], tier, ovr, row["country"]) * random.uniform(0.85, 1.15))
-                offers.append(_build_offer(row, row["grade"], tier, salary))
+                salary = int(_calc_salary(get_league_grade(row["country"], row["grade"]), tier, ovr, row["country"]) * random.uniform(0.85, 1.15))
+                offers.append(_build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary))
                 break
 
         while len(offers) < count and tried < 120:
@@ -4552,8 +4568,8 @@ def generate_offers(count=5) -> list:
             if any(o["team_id"] == row["id"] for o in offers): continue
             if row["id"] == my_tid: continue
             if not _team_fits_me(row): continue
-            salary = int(_calc_salary(row["grade"], tier, ovr, row["country"]) * random.uniform(0.85, 1.15))
-            offers.append(_build_offer(row, row["grade"], tier, salary))
+            salary = int(_calc_salary(get_league_grade(row["country"], row["grade"]), tier, ovr, row["country"]) * random.uniform(0.85, 1.15))
+            offers.append(_build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary))
 
     # _home_league 플래그 있는 오퍼를 맨 앞으로 정렬
     offers.sort(key=lambda o: 0 if o.get("_home_league") else 1)
@@ -4641,7 +4657,7 @@ def _offer_probability(p, week: int) -> float:
     min_prob = {"F":0.40,"E":0.45,"D":0.50,"C":0.55,"B":0.60,"A":0.65,"S":0.70}
     guaranteed = min_prob.get(p.get("agent_grade","F"), 0.40)
 
-    cur_year = p.get("current_year", 1990)
+    cur_year = p.get("current_year", GAME_START_YEAR)
     end_year = p.get("contract_end_year", 0)
     years_left = max(0, end_year - cur_year) if end_year else 3
     if years_left <= 1:   contract_mult = 1.5
@@ -4884,53 +4900,126 @@ def _suitable_grades(ovr, agent):
     return base
 
 
-def _salary_ovr_mult(ovr):
-    """OVR → 연봉 배수. 상단으로 갈수록 가파르게 (현실의 슈퍼스타 프리미엄).
-    OVR50=0.25배, 70=1.4배, 85=4.1배, 90=5.4배, 99=8.5배.
-    → OVR99 톱리그(S급1부)면 약 600억(메시·음바페급)에 도달."""
-    t = max(0.0, (ovr - 40) / 59.0)
-    return 0.12 + (t ** 2.8) * 8.4
 
+def _salary_ovr_mult(ovr: int) -> float:
+    """OVR → 연봉 배수. 4구간 piecewise.
+
+    구간별 특성:
+      OVR40~79: 완만한 상승 (0.08 → 2.00)
+      OVR80~89: 가파른 가속 (2.00 → 16.00, 에이스 프리미엄)
+      OVR90~92: 완충 (16.00 → 40.00)
+      OVR93~99: 급격 (40.00 → 141.60, 월드클래스)
+
+    SS 1부(base 19,996,093천원) 기준:
+      OVR82 → 45억/년 (평균)
+      OVR87 → 155억/년
+      OVR90 → 320억/년
+      OVR93 → 800억/년
+      OVR99 → 2831억/년 (CAP 3000억)
+    """
+    if ovr < 80:
+        t = max(0.0, (ovr - 40) / 40.0)
+        return 0.08 + t ** 2.2 * 1.92        # 40→79: 0.08 → 2.00
+    elif ovr < 90:
+        t = (ovr - 80) / 10.0
+        return 2.0 + t ** 2.5 * 14.0         # 80→89: 2.00 → 16.00
+    elif ovr < 93:
+        t = (ovr - 90) / 3.0
+        return 16.0 + t ** 1.5 * 24.0        # 90→92: 16.00 → 40.00
+    else:
+        t = (ovr - 93) / 6.0
+        return 40.0 + t ** 1.2 * 101.6       # 93→99: 40.00 → 141.60
+
+
+def _salary_ovr_adj(ovr: int, grade: str, tier: int) -> float:
+    """하위 호환 래퍼 — _salary_ovr_mult 위임."""
+    return _salary_ovr_mult(ovr)
 
 def _calc_salary(grade, tier, ovr, country=None):
     """연봉 계산 (천원 단위).
     wealth 결정 우선순위:
       1) SPECIAL_SALARY_COUNTRIES — 특수 연봉 국가 (사우디/카타르/UAE)
       2) COUNTRY_LEAGUE_GRADE    — 리그 전용 등급 (국대 등급과 분리)
-      3) grade 파라미터           — fallback (countries.grade = 국대 등급)
+      3) grade 파라미터           — fallback
+    나라별 연봉 배율(COUNTRY_SALARY_MULT) 추가 적용:
+      같은 등급 내에서도 나라마다 재정 수준이 달라 연봉 차이 반영.
+      단, SPECIAL_SALARY_COUNTRIES(사우디 등)는 배율 적용 제외.
     """
-    from constants import LOWER_LEAGUE_SALARY_OVERRIDE, SPECIAL_SALARY_COUNTRIES, get_league_grade
+    from constants import (LOWER_LEAGUE_SALARY_OVERRIDE, SPECIAL_SALARY_COUNTRIES,
+                           get_league_grade)
+    is_special = country and country in SPECIAL_SALARY_COUNTRIES
     if country:
-        if country in SPECIAL_SALARY_COUNTRIES:
+        if is_special:
             wealth = SPECIAL_SALARY_COUNTRIES[country]
         else:
             wealth = get_league_grade(country, grade)
     else:
         wealth = grade
 
+
     base_year = {
-        "SS":{1:18000000, 2:4000000, 3:600000, 4:80000},  # EPL: 손흥민급 연봉 현실화
-        "S": {1:7000000,  2:1300000, 3:160000, 4:20000, 5:5000},
-        "A": {1:3200000,  2:640000,  3:80000,  4:6000},
-        "B": {1:1300000,  2:260000,  3:40000,  4:2000},
-        "C": {1:520000,   2:120000,  3:16000,  4:800},
-        "D": {1:210000,   2:48000,   3:5500,   4:300},
-        "E": {1:80000,    2:18000,   3:1600,   4:100},
-        "F": {1:26000,    2:5200,    3:400},
+        # 천원/년. 각 등급/tier의 평균 OVR에서 목표 평균 연봉이 나오도록 역산.
+        # mult 공식: _salary_ovr_mult(avg_ovr) 에서 나오는 배수로 나눈 값.
+        # ── 평균 OVR / 목표 평균 연봉 ──
+        #   SS(avg82/74/67/61/55): 45억/10억/1.8억/9000만/4000만
+        #   S (avg79/72/65/59/53): 22억/ 4억/9000만/3500만/1500만 (스페인 기준)
+        #   A (avg75/68/61/55):  4.5억/9000만/2500만/800만  (네덜/포르 기준)
+        #   B (avg71/64/58/52):  1.2억/3000만/800만/200만  (스코틀랜드/덴마크 기준)
+        #   C (avg67/61/55/49):  5000만/1200만/300만/100만 (폴란드/세르비아 기준)
+        #   D (avg63/57/51):     1000만/250만/60만         (보스니아 기준)
+        #   E (avg58/52/47):      250만/ 60만/15만
+        #   F (avg52/47/42):      120만/ 30만/ 5만
+        "SS":{1:19_996_093, 2:7_028_218, 3:2_025_506, 4:1_650_731, 5:1_324_913},
+        "S": {1:11_603_489, 2:3_186_829, 3:1_180_000, 4:   77_216, 5:   61_990},
+        "A": {1: 2_977_645, 2:  941_397, 3:   45_853, 4:   26_498},
+        "B": {1: 1_020_507, 2:  426_093, 3:   19_445, 4:    9_266},
+        "C": {1:   562_640, 2:  220_097, 3:    9_936, 4:    6_573},
+        "D": {1:    15_425, 2:    6_715, 3:    3_122},
+        "E": {1:     6_076, 2:    2_780, 3:    1_234},
+        "F": {1:     5_560, 2:    2_469, 3:      605},
+    }
+    # 등급별 연봉 상한 (천원/년)
+    _salary_cap = {
+        "SS": 300_000_000,  # 3000억 (OVR99 SS1부 ≈ 2831억)
+        "S":  100_000_000,  # 1000억
+        "A":   10_000_000,  # 100억
+        "B":    2_500_000,  # 25억
+        "C":      800_000,  # 8억
+        "D":      200_000,  # 2억
+        "E":       50_000,  # 5000만
+        "F":       20_000,  # 2000만
     }
     b = base_year.get(wealth, {}).get(tier, 100)
-    # 나라×tier 오버라이드: 특정 나라의 특정 부만 핀포인트 조정
-    if country and tier >= 4:
-        _ov = LOWER_LEAGUE_SALARY_OVERRIDE.get(country, {})
+
+    # 나라×tier 오버라이드 (3부 이하)
+    if country and tier >= 3:
+        _ov = LOWER_LEAGUE_SALARY_OVERRIDE.get(country, {})\
+            if not is_special else {}
         if tier in _ov:
             b = _ov[tier]
+
     if b == 0:
         return 0
-    sal = int(b * _salary_ovr_mult(ovr))
+
+    # 나라별 연봉 배율 적용 (특수 연봉 국가는 제외)
+    # COUNTRY_SALARY_MULT: 나라별 개별 배율 (없으면 1.0 — 등급 기준국 수준)
+    if not is_special and country:
+        from constants import COUNTRY_SALARY_MULT
+        cont_mult = COUNTRY_SALARY_MULT.get(country, 1.0)
+        b = int(b * cont_mult)
+
+    if b == 0:
+        return 0
+
+    sal = int(b * _salary_ovr_adj(ovr, wealth, tier))
     if wealth == "F" and tier >= 3 and ovr < 38:
         return 0
     if tier >= 4 and sal < 50 and b > 0:
         sal = 50
+    # 등급별 연봉 상한 적용
+    cap = _salary_cap.get(wealth, 0)
+    if cap > 0:
+        sal = min(sal, cap)
     return max(0, sal)
 
 
@@ -5236,7 +5325,7 @@ def negotiate_renewal() -> dict:
 
     old_salary = p.get("salary", 0)
     st = get_state()
-    cur_year = st["current_year"] if st else p.get("current_year", 1990)
+    cur_year = st["current_year"] if st else p.get("current_year", GAME_START_YEAR)
 
     if random.random() < prob:
         lo, hi = cfg["raise_success"]

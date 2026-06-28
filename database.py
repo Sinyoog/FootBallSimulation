@@ -63,6 +63,7 @@ def reset_conn_pool():
 
 # ─── 스키마 ───────────────────────────────────────────────────
 def init_db():
+    from constants import GAME_START_YEAR, PLAYER_START_AGE
     conn = get_conn(); c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS countries(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,10 +98,10 @@ def init_db():
         leadership INTEGER DEFAULT 50, concentration INTEGER DEFAULT 50,
         ovr INTEGER DEFAULT 50,
         FOREIGN KEY(team_id) REFERENCES teams(id))""")
-    c.execute("""CREATE TABLE IF NOT EXISTS my_player(
+    c.execute(f"""CREATE TABLE IF NOT EXISTS my_player(
         id INTEGER PRIMARY KEY,
         name TEXT, nationality TEXT, flag TEXT,
-        age INTEGER DEFAULT 16, birth_year INTEGER DEFAULT 1990,
+        age INTEGER DEFAULT 16, birth_year INTEGER DEFAULT {GAME_START_YEAR - PLAYER_START_AGE},
         position TEXT DEFAULT 'CM', sub_role TEXT DEFAULT '박스투박스',
         personality TEXT DEFAULT '성실함', height INTEGER DEFAULT 175,
         weight INTEGER DEFAULT 70, peak_age INTEGER DEFAULT 25,
@@ -113,7 +114,7 @@ def init_db():
         current_team_id INTEGER DEFAULT 0,
         current_league_id INTEGER DEFAULT 0,
         manager_relation INTEGER DEFAULT 50,
-        current_year INTEGER DEFAULT 1990,
+        current_year INTEGER DEFAULT {GAME_START_YEAR},
         current_week INTEGER DEFAULT 1,
         current_season INTEGER DEFAULT 1,
         total_matches INTEGER DEFAULT 0, total_goals INTEGER DEFAULT 0,
@@ -164,10 +165,10 @@ def init_db():
         league_name TEXT,
         detail TEXT,
         is_mine INTEGER DEFAULT 1)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS game_log(
+    c.execute(f"""CREATE TABLE IF NOT EXISTS game_log(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         entry TEXT, log_type TEXT DEFAULT 'normal',
-        year INTEGER DEFAULT 1990, week INTEGER DEFAULT 1)""")
+        year INTEGER DEFAULT {GAME_START_YEAR}, week INTEGER DEFAULT 1)""")
     c.execute("""CREATE TABLE IF NOT EXISTS match_results(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         league_id INTEGER, week INTEGER,
@@ -186,9 +187,9 @@ def init_db():
         result TEXT, rating REAL,
         goals INTEGER, assists INTEGER, saves INTEGER,
         detail_json TEXT)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS season_state(
+    c.execute(f"""CREATE TABLE IF NOT EXISTS season_state(
         id INTEGER PRIMARY KEY,
-        current_year INTEGER DEFAULT 1990,
+        current_year INTEGER DEFAULT {GAME_START_YEAR},
         current_week INTEGER DEFAULT 1,
         current_season INTEGER DEFAULT 1,
         phase TEXT DEFAULT 'preseason')""")
@@ -569,37 +570,51 @@ def calc_ovr(position, stats):
     return min(100, max(1, int(round(total))))
 
 
-def get_league_avg_ovr(league_id, conn=None):
-    """해당 리그 소속 ai_players 전체의 평균 OVR. 경기 데이터 무관, 명단 기준."""
+def get_league_avg_ovr(league_id, conn=None, exclude_team_id=None):
+    """해당 리그 소속 ai_players 전체의 평균 OVR. 경기 데이터 무관, 명단 기준.
+    exclude_team_id: 이 팀은 평균 계산에서 제외 (승강 직후 목표치 산정용)."""
     own = False
     if conn is None:
         conn = get_conn(); own = True
     try:
-        row = conn.execute(
-            """SELECT AVG(ap.ovr) AS v FROM ai_players ap
-               JOIN teams t ON ap.team_id=t.id WHERE t.league_id=?""",
-            (league_id,)).fetchone()
+        if exclude_team_id:
+            row = conn.execute(
+                """SELECT AVG(ap.ovr) AS v FROM ai_players ap
+                   JOIN teams t ON ap.team_id=t.id
+                   WHERE t.league_id=? AND t.id!=?""",
+                (league_id, exclude_team_id)).fetchone()
+        else:
+            row = conn.execute(
+                """SELECT AVG(ap.ovr) AS v FROM ai_players ap
+                   JOIN teams t ON ap.team_id=t.id WHERE t.league_id=?""",
+                (league_id,)).fetchone()
         return float(row["v"]) if row and row["v"] is not None else None
     finally:
         if own:
             conn.close()
 
 
-def get_league_strong_ovr(league_id, pct=0.75, conn=None):
+def get_league_strong_ovr(league_id, pct=0.75, conn=None, exclude_team_id=None):
     """리그 '상위권' 팀 평균 OVR 추정치.
     팀별 평균 OVR을 구해 정렬한 뒤, 상위 분위(pct)에 해당하는 값을 반환한다.
-    강등팀을 '새 리그(하위 리그)의 상위권 전력'으로 맞추는 목표치로 쓴다.
-    (강등 직후 곧바로 최약체가 되는 비현실 방지)
-    """
+    exclude_team_id: 이 팀은 계산에서 제외 (강등팀 본인 제외용)."""
     own = False
     if conn is None:
         conn = get_conn(); own = True
     try:
-        rows = conn.execute(
-            """SELECT t.id AS tid, AVG(ap.ovr) AS v FROM teams t
-               JOIN ai_players ap ON ap.team_id=t.id
-               WHERE t.league_id=? GROUP BY t.id HAVING v IS NOT NULL""",
-            (league_id,)).fetchall()
+        if exclude_team_id:
+            rows = conn.execute(
+                """SELECT t.id AS tid, AVG(ap.ovr) AS v FROM teams t
+                   JOIN ai_players ap ON ap.team_id=t.id
+                   WHERE t.league_id=? AND t.id!=?
+                   GROUP BY t.id HAVING v IS NOT NULL""",
+                (league_id, exclude_team_id)).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT t.id AS tid, AVG(ap.ovr) AS v FROM teams t
+                   JOIN ai_players ap ON ap.team_id=t.id
+                   WHERE t.league_id=? GROUP BY t.id HAVING v IS NOT NULL""",
+                (league_id,)).fetchall()
         vals = sorted(r["v"] for r in rows)
         if not vals:
             return None
@@ -805,19 +820,19 @@ TEAM_ROLE_PROFILE = {
 }
 
 
-def _tier_top_ovr(grade, tier):
+def _tier_top_ovr(grade, tier, continent_bonus=0):
     """그 등급·tier 리그에서 도달 가능한 최고 OVR.
-    기존 OVR_RANGES의 상단값을 재활용해 밸런스 연속성을 유지한다."""
+    continent_bonus: 대륙별 OVR 보정치 (유럽+1, 아시아-3 등)"""
     rng = OVR_RANGES.get(grade, {}).get(tier)
     if rng:
-        return rng[1]
+        return min(100, rng[1] + continent_bonus)
     return 45
 
 
-def _target_ovr(grade, tier, team_strength, role_idx):
+def _target_ovr(grade, tier, team_strength, role_idx, continent_bonus=0):
     """팀 강도(0~1) + 역할 순번(0=에이스 … 10=막내)으로 목표 OVR 산출."""
     prof = TEAM_ROLE_PROFILE.get(grade, TEAM_ROLE_PROFILE["F"])
-    top = _tier_top_ovr(grade, tier)
+    top = _tier_top_ovr(grade, tier, continent_bonus)
     # 팀 에이스 목표: 강팀일수록 리그 top에 근접
     ace = top * (prof["ace_lo"] + (1.0 - prof["ace_lo"]) * team_strength)
     role_mult = 1.0 - prof["spread"] * (role_idx / 10.0)
@@ -828,7 +843,8 @@ def _generate_all_ai_players(c):
     # 리그 단위로 묶어 8팀에 강→약 강도를 분배해야 팀 간 위계가 생긴다.
     # [리그등급 분리] cn.grade는 국대 등급 → 리그 OVR/연봉엔 COUNTRY_LEAGUE_GRADE 사용
     c.execute("""SELECT t.id AS tid, t.current_tier AS tier, cn.grade AS grade,
-                        cn.id AS cid, t.league_id AS lid, cn.name AS cname
+                        cn.id AS cid, t.league_id AS lid, cn.name AS cname,
+                        cn.continent AS continent
                  FROM teams t JOIN leagues l ON t.league_id=l.id
                  JOIN countries cn ON l.country_id=cn.id
                  ORDER BY t.league_id, t.id""")
@@ -856,8 +872,16 @@ def _generate_all_ai_players(c):
 
 def _generate_team_players(c, team, team_strength, league_used: set = None):
     grade = team["grade"]; tier = team["tier"]
+    continent = team.get("continent", "유럽")
     if league_used is None:
         league_used = set()
+
+    # 대륙별 OVR 보정치
+    from constants import CONTINENT_OVR_BONUS
+    continent_bonus = CONTINENT_OVR_BONUS.get(continent, 0)
+    # SS는 이미 상한(100)에 근접 → 보정 축소 (초과 방지)
+    if grade == "SS":
+        continent_bonus = min(continent_bonus, 0)
 
     # 해당 국가 이름풀 전체를 가져온다 (리그 8팀 × 11명 = 최대 88개 필요)
     c.execute("SELECT name FROM player_names WHERE country_id=? ORDER BY RANDOM()",
@@ -870,11 +894,10 @@ def _generate_team_players(c, team, team_strength, league_used: set = None):
         # 리그 전체에서 아직 안 쓴 이름 우선 사용
         available = [n for n in name_pool if n not in league_used]
         if not available:
-            # 이름풀을 모두 소진한 경우 — 전체 풀에서 중복 허용해 폴백
             available = name_pool
         name = random.choice(available)
         league_used.add(name)
-        target = _target_ovr(grade, tier, team_strength, idx)
+        target = _target_ovr(grade, tier, team_strength, idx, continent_bonus)
         stats = _gen_ai_stats(pos, target)
         ovr = calc_ovr(pos, stats)
         # [AI 생애] 초기 나이: 16~34 삼각분포(25 봉우리). 시즌마다 +1 되며 성장/노화.
