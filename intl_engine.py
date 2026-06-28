@@ -619,14 +619,15 @@ def start_intl_tournament(year):
     else:
         my_nats = [n for n in (nat1, nat2, nat3) if n]
 
-    # 각 국적의 대륙/등급 조회
+    # 각 국적의 대륙/등급 조회 ([최적화] IN 쿼리 1회로 합산)
     conn = get_conn()
     nat_info = {}
-    for n in my_nats:
-        r = conn.execute(
-            "SELECT continent, grade FROM countries WHERE name=?", (n,)).fetchone()
-        if r:
-            nat_info[n] = {"continent": r["continent"], "grade": r["grade"]}
+    if my_nats:
+        _ph = ",".join("?" * len(my_nats))
+        for r in conn.execute(
+                f"SELECT name, continent, grade FROM countries WHERE name IN ({_ph})",
+                my_nats).fetchall():
+            nat_info[r["name"]] = {"continent": r["continent"], "grade": r["grade"]}
     conn.close()
 
     if is_wc:

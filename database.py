@@ -443,6 +443,16 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_mr_league_season ON match_results(league_id, season)",
         "CREATE INDEX IF NOT EXISTS idx_teams_league     ON teams(league_id)",
         "CREATE INDEX IF NOT EXISTS idx_leagues_country  ON leagues(country_id)",
+        # intl/cl 경기 조회: tournament_id+week 복합 (매 주차 process_*_week 호출마다 사용)
+        "CREATE INDEX IF NOT EXISTS idx_intl_matches_tid_week ON intl_matches(tournament_id, week)",
+        "CREATE INDEX IF NOT EXISTS idx_intl_entries_tid      ON intl_entries(tournament_id)",
+        "CREATE INDEX IF NOT EXISTS idx_cl_matches_tid_week   ON cl_matches(tournament_id, week)",
+        "CREATE INDEX IF NOT EXISTS idx_cl_entries_tid        ON cl_entries(tournament_id)",
+        # _calc_clean_sheets: season+home_score 로 미완료 경기 필터링
+        "CREATE INDEX IF NOT EXISTS idx_mr_season_score ON match_results(season, home_score)",
+        # match_results: home/away team_id 조회 (클린시트, 팀 경기 조회)
+        "CREATE INDEX IF NOT EXISTS idx_mr_home_team ON match_results(home_team_id, season)",
+        "CREATE INDEX IF NOT EXISTS idx_mr_away_team ON match_results(away_team_id, season)",
     ]:
         try: c.execute(idx)
         except: pass

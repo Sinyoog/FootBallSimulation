@@ -25,11 +25,24 @@ _league_tier_cache: dict = {}
 _team_name_cache: dict = {}
 
 def _invalidate_team_ovr_cache():
-    """ai_players OVR/소속이 일괄 변경되는 경우(리맵·신규 시드) 호출."""
+    """ai_players OVR/소속이 일괄 변경되는 경우(리맵·신규 시드·승강) 호출.
+    포메이션 위젯의 선수 목록 캐시도 함께 비운다.
+    (승강 후 rescale로 AI OVR이 바뀌어도 위젯 캐시가 남아 있으면
+     구 티어 OVR이 그대로 표시되는 버그 방지.)
+    """
     _team_ovr_cache.clear()
     _league_ovr_cache.clear()
     _league_tier_cache.clear()
     # 승강으로 팀이 다른 리그로 이동해도 팀명은 안 바뀌므로 _team_name_cache는 비우지 않음
+
+    # 포메이션 위젯 선수 목록 캐시 무효화
+    # FormationWidget 인스턴스를 직접 참조하지 않고, 모듈 속성으로 플래그 세팅.
+    # formation_widget.py의 load_my_team이 이 플래그를 보고 캐시를 무시한다.
+    try:
+        import ui.formation_widget as _fw
+        _fw._ovr_cache_invalidated = True
+    except Exception:
+        pass
 
 def _team_name(c, team_id, default="팀") -> str:
     """팀 이름 조회 (세션 캐시). c=열린 커서 재사용."""
@@ -843,6 +856,8 @@ def advance_4weeks(schedule: list):
             break
 
         # ── 이번 주차 처리 ──
+        # [최적화] 경기를 실제로 뛰었는지 추적 → career_stats 갱신을 경기 주차에만 실행
+        _had_match = False
         if p.get("injured"):
             _process_injury_week(p, week)
             if stype == "경기" and not (isinstance(detail, dict) and detail.get("intl")):
@@ -850,6 +865,7 @@ def advance_4weeks(schedule: list):
             else:
                 _sim_my_unscheduled_match(week, p, cur_season)
         elif stype == "경기":
+            _had_match = True
             if isinstance(detail, dict) and detail.get("intl"):
                 intl_engine.simulate_my_match(week, p)
             elif isinstance(detail, dict) and detail.get("cl"):
@@ -860,13 +876,14 @@ def advance_4weeks(schedule: list):
             im = intl_engine.get_my_match(week)
             cm = champions_engine.get_my_cl_match(week)
             if im:
+                _had_match = True
                 intl_engine.simulate_my_match(week, p)
             elif cm:
+                _had_match = True
                 champions_engine.simulate_my_cl_match(week, p)
             else:
                 _process_training(p, week, stype, detail)
                 _sim_my_unscheduled_match(week, p, cur_season)
-
         # 이 주차의 국제대회 + 챔스 + 다른 리그 AI 경기 처리
         # (intl/cl/ai 경기는 my_player의 year/season/team_id/salary를 바꾸지 않으므로
         #  루프 상단의 p 를 그대로 재사용한다. 불필요한 get_player() 재조회 제거.)
@@ -897,14 +914,13 @@ def advance_4weeks(schedule: list):
         except Exception:
             pass
 
-        # 진행 중 커리어 행 실시간 갱신
-        # [최적화] _advance_week가 이미 week를 갱신했으므로 p_latest의 current_season을 활용.
-        #   get_state() 재호출 대신 p_latest에서 직접 읽어 DB 왕복 1회 절약.
-        if p_latest and p_latest.get("current_team_id"):
+        # 진행 중 커리어 행 실시간 갱신 (경기가 있었던 주차에만)
+        # [최적화] 훈련 주차(경기 없음)에는 스탯 변화 없으므로 갱신 스킵
+        #   → 52주 중 경기 주차(~18회)에만 실행, 나머지 ~34회 DB 왕복 절약
+        if _had_match and p_latest and p_latest.get("current_team_id"):
             p_fresh = get_player()   # _advance_week가 week/year를 바꿨으므로 1회만 재조회
             st_new  = get_state()
             _update_career_stats(p_fresh, st_new["current_year"], st_new["current_week"])
-
         # [최적화] 이 주차의 버퍼 로그 일괄 flush (개별 commit 수십 회 → 1회)
         flush_log_buffer()
 
@@ -2727,7 +2743,11 @@ def get_team_rank(team_id, conn=None, season=None) -> str:
     for i, r in enumerate(rows):
         if r["id"] == team_id:
             rank = i + 1
-            if i > 0 and rows[i-1]["pts"] == r["pts"] and rows[i-1]["gd"] == r["gd"]:
+            if (i > 0
+                    and rows[i-1]["pts"] == r["pts"]
+                    and rows[i-1]["gd"] == r["gd"]
+                    and rows[i-1].get("goals_for", rows[i-1].get("gf", 0))
+                        == r.get("goals_for", r.get("gf", 0))):
                 rank_str = f"공동 {rank}위"
             else:
                 rank_str = f"{rank}위"
@@ -4022,6 +4042,18 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
     # standings 캐시: {league_id: [sorted rows]}
     _standings_cache = {lid: _calc_standings_cached(lid) for lid in all_league_ids}
 
+    # [최적화] 팀 이름·리그명 전체 선조회 → 루프 내 ci.execute JOIN 제거
+    #   기존: 승강 판정마다 ci = conn.cursor() + JOIN SELECT 2~3회
+    #   변경: 1회 SELECT로 {team_id: (name, lname)} dict 빌드 후 dict 조회
+    _team_info_cache: dict = {
+        r["id"]: (r["name"], r["lname"])
+        for r in c.execute(
+            "SELECT t.id, t.name, l.name as lname "
+            "FROM teams t JOIN leagues l ON t.league_id=l.id"
+        ).fetchall()
+    }
+
+
     pending_logs  = []
     my_new_league = None
 
@@ -4033,9 +4065,9 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
         top1_rows = _standings_cache.get(top_lid, [])
         if top1_rows and top1_rows[0]["pts"] > 0 and top1_rows[0]["id"] == champ_team_id:
             champ_tid = top1_rows[0]["id"]
-            ci = conn.cursor()
-            ci.execute("SELECT t.name, l.name as lname FROM teams t JOIN leagues l ON t.league_id=l.id WHERE t.id=?", (champ_tid,))
-            winner_info = ci.fetchone()
+            _ti = _team_info_cache.get(champ_tid)
+            winner_info = {"name": _ti[0], "lname": _ti[1]} if _ti else None
+            # [최적화] ci 커서 제거 - _team_info_cache 사용
             if winner_info:
                 existing_champ = c.execute(
                     "SELECT id FROM trophy_log WHERE year=? AND team_name=? AND tier=1",
@@ -4070,11 +4102,11 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
             if bottom_upper["id"] in moved_teams or top_lower["id"] in moved_teams:
                 continue
 
-            ci = conn.cursor()
-            ci.execute("SELECT t.name, l.name as lname FROM teams t JOIN leagues l ON t.league_id=l.id WHERE t.id=?", (top_lower["id"],))
-            tl_info = ci.fetchone()
-            ci.execute("SELECT t.name, l.name as lname FROM teams t JOIN leagues l ON t.league_id=l.id WHERE t.id=?", (bottom_upper["id"],))
-            bu_info = ci.fetchone()
+            _tl = _team_info_cache.get(top_lower["id"])
+            _bu = _team_info_cache.get(bottom_upper["id"])
+            tl_info = {"name": _tl[0], "lname": _tl[1]} if _tl else None
+            bu_info = {"name": _bu[0], "lname": _bu[1]} if _bu else None
+            # [최적화] ci 커서 제거 - _team_info_cache 사용
             if not tl_info or not bu_info:
                 continue
 
@@ -4132,8 +4164,8 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
         try:
             _d, _b, _a = rescale_team_to_target_ovr(_tid, _target, conn)
             if _d != 0:
-                _tn = conn.execute("SELECT name FROM teams WHERE id=?", (_tid,)).fetchone()
-                _nm = _tn["name"] if _tn else f"#{_tid}"
+                _ti2 = _team_info_cache.get(_tid)
+                _nm = _ti2[0] if _ti2 else f"#{_tid}"
                 _dir = "강화" if _d > 0 else "약화"
                 pending_logs.append(
                     (f"⚙️ {_nm}  선수단 {_dir}  평균 OVR {_b:.0f}→{_a:.0f} (리그 적응)", "normal"))
@@ -4187,21 +4219,23 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
 def _sim_all_leagues_for_season_end(season: int):
     """시즌 종료 시 내 국가 tier 1~3 리그 일정 생성 + 미완료 경기 시뮬.
     또한 이전 시즌 미완료 경기도 일괄 정리해서 구 시즌 데이터가 남지 않게 함.
+    [최적화] 기존 conn0/conn/conn_chk/conn_sim 4개 분리 → 단일 conn 통합.
+             get_conn() 4회→1회, commit/close 4회→1회.
     """
+    conn = get_conn()
+    c    = conn.cursor()
+
     # 이전 시즌 미완료 경기 전부 AI로 처리 (구 시즌 데이터 오염 방지)
-    # [최적화] executemany로 배치 UPDATE
     if season > 1:
         prev = season - 1
-        conn0 = get_conn()
-        c0 = conn0.cursor()
-        c0.execute("""SELECT id, home_team_id, away_team_id FROM match_results
+        c.execute("""SELECT id, home_team_id, away_team_id FROM match_results
                       WHERE season=? AND home_score=-1""", (prev,))
-        stale = c0.fetchall()
+        stale = c.fetchall()
         if stale:
             batch = []
             for m in stale:
-                ho = _team_avg_ovr(c0, m["home_team_id"]) + 3
-                ao = _team_avg_ovr(c0, m["away_team_id"])
+                ho = _team_avg_ovr(c, m["home_team_id"]) + 3
+                ao = _team_avg_ovr(c, m["away_team_id"])
                 diff = ho - ao
                 hw = max(0.10, min(0.80, 0.45 + diff * 0.01))
                 dw = 0.25
@@ -4211,12 +4245,7 @@ def _sim_all_leagues_for_season_end(season: int):
                 else:              outcome = "away"
                 hs, as_ = _gen_score(outcome)
                 batch.append((hs, as_, m["id"]))
-            c0.executemany("UPDATE match_results SET home_score=?,away_score=? WHERE id=?", batch)
-            conn0.commit()
-        conn0.close()
-
-    conn = get_conn()
-    c = conn.cursor()
+            c.executemany("UPDATE match_results SET home_score=?,away_score=? WHERE id=?", batch)
 
     # 내 팀 국가 파악
     p_row = conn.execute(
@@ -4224,12 +4253,14 @@ def _sim_all_leagues_for_season_end(season: int):
     my_lid = p_row["current_league_id"] if p_row else 0
 
     if not my_lid:
+        conn.commit()
         conn.close()
         return
 
     lg_row = c.execute(
         "SELECT country_id, tier FROM leagues WHERE id=?", (my_lid,)).fetchone()
     if not lg_row:
+        conn.commit()
         conn.close()
         return
 
@@ -4240,33 +4271,35 @@ def _sim_all_leagues_for_season_end(season: int):
     # 내 국가 전체 리그 (tier 1~5, 실제 존재하는 것만)
     c.execute("SELECT id FROM leagues WHERE country_id=?", (cid,))
     league_ids = [r["id"] for r in c.fetchall()]
+
+    if league_ids:
+        # [최적화] 리그별 개별 COUNT → 1회 GROUP BY로 대체
+        ph = ",".join("?" * len(league_ids))
+        sched_counts = {
+            r["league_id"]: r["cnt"]
+            for r in c.execute(
+                f"SELECT league_id, COUNT(*) as cnt FROM match_results "
+                f"WHERE league_id IN ({ph}) AND season=? GROUP BY league_id",
+                (*league_ids, season)
+            ).fetchall()
+        }
+        need_sched = [lid for lid in league_ids if not sched_counts.get(lid)]
+    else:
+        need_sched = []
+
+    # 일정 생성이 필요한 리그가 있으면 먼저 commit (generate_season_schedule 내부 commit 방지)
+    if need_sched:
+        conn.commit()
+        for lid in need_sched:
+            generate_season_schedule(lid, season, year)
+
+    # 시뮬은 단일 커넥션으로 전 리그 처리
+    st = get_state()
+    for lid in league_ids:
+        _sim_league_full(lid, season, c=c, st=st)
+    conn.commit()
     conn.close()
 
-    # [최적화] 리그별 개별 COUNT → 1회 GROUP BY로 대체
-    conn_chk = get_conn()
-    ph = ",".join("?" * len(league_ids))
-    sched_counts = {
-        r["league_id"]: r["cnt"]
-        for r in conn_chk.execute(
-            f"SELECT league_id, COUNT(*) as cnt FROM match_results "
-            f"WHERE league_id IN ({ph}) AND season=? GROUP BY league_id",
-            (*league_ids, season)
-        ).fetchall()
-    } if league_ids else {}
-    need_sched = [lid for lid in league_ids if not sched_counts.get(lid)]
-    conn_chk.close()
-    for lid in need_sched:
-        generate_season_schedule(lid, season, year)
-
-    # 시뮬은 커넥션 하나로 전 리그 처리 (리그마다 개폐하던 것을 1회로).
-    # st 도 한 번만 조회해 _sim_league_full 에 재주입.
-    st = get_state()
-    conn_sim = get_conn()
-    c_sim = conn_sim.cursor()
-    for lid in league_ids:
-        _sim_league_full(lid, season, c=c_sim, st=st)
-    conn_sim.commit()
-    conn_sim.close()
 
 
 def generate_offers(count=5) -> list:

@@ -683,9 +683,18 @@ class CenterPanel(QWidget):
     # ── 진행 ─────────────────────────────────────
 
     def _advance(self):
+        from PyQt6.QtWidgets import QApplication
+        from PyQt6.QtCore import Qt as _Qt
+        # [UX] 진행 중 버튼 비활성화 + 로딩 커서 → 처리 완료 후 즉시 복원
+        self.adv_btn.setEnabled(False)
+        QApplication.setOverrideCursor(_Qt.CursorShape.WaitCursor)
+        QApplication.processEvents()
         p  = get_player()
         st = get_state()
-        if not p or not st: return
+        if not p or not st:
+            QApplication.restoreOverrideCursor()
+            self.adv_btn.setEnabled(True)
+            return
 
         # [복수국적] 대표팀 선택이 대기 중이면 그것부터 처리 (진행 차단)
         #   ※ 22세 1~4주차 강제확정은 '새해 진입 직후'에 띄운다(아래 advance_4weeks 뒤).
@@ -694,11 +703,17 @@ class CenterPanel(QWidget):
         forced = intl_engine.get_forced_commit()
         if forced:
             self._show_forced_commit(forced)
+            from PyQt6.QtWidgets import QApplication
+            QApplication.restoreOverrideCursor()
+            self.adv_btn.setEnabled(True)
             return
         pend = intl_engine.get_pending_choice()
         if pend:
             show_toast(self, "⚠  먼저 대표팀을 선택해야 합니다!", "#cc6600", 1600)
             self._show_nat_choice(pend)
+            from PyQt6.QtWidgets import QApplication
+            QApplication.restoreOverrideCursor()
+            self.adv_btn.setEnabled(True)
             return
 
         week = st["current_week"]
@@ -710,6 +725,9 @@ class CenterPanel(QWidget):
         if (p["age"] >= MIN_JOIN_AGE and not p.get("current_team_id")
                 and 1 <= week <= 4 and not getattr(self, "_skip_join_lock", False)):
             show_toast(self, "⚠  먼저 팀에 입단해야 합니다!", "#cc6600", 1500)
+            from PyQt6.QtWidgets import QApplication
+            QApplication.restoreOverrideCursor()
+            self.adv_btn.setEnabled(True)
             return
 
         # ── 진행할 일정 결정 ──
@@ -758,6 +776,9 @@ class CenterPanel(QWidget):
             schedule = [self._locked_sched[idx]]
 
         advance_4weeks(schedule)
+        QApplication.restoreOverrideCursor()
+        self.adv_btn.setEnabled(True)
+        QApplication.processEvents()  # 결과를 즉시 이벤트 루프에 반영
 
         # ── 묶음 진행 상태 갱신 ──
         if self._step_mode:

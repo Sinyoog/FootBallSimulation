@@ -14,6 +14,9 @@ from PyQt6.QtGui import QColor, QPainter, QBrush, QPen, QFont
 from database import get_conn
 from constants import FORMATION_SLOTS, STAT_KO, ALL_STATS
 
+# 승강/리스케일 후 OVR 캐시 무효화 플래그 (game_engine._invalidate_team_ovr_cache가 세팅)
+_ovr_cache_invalidated: bool = False
+
 
 # ─────────────────────────────────────────────
 # 상대팀 데이터 조회
@@ -216,6 +219,13 @@ class _FormationCanvas(QWidget):
         while _widget and not hasattr(_widget, "_my_team_cache"):
             _widget = _widget.parent() if hasattr(_widget, "parent") else None
         _cache = getattr(_widget, "_my_team_cache", None)
+
+        # [최적화] 승강/리스케일 후 OVR이 바뀌면 캐시 전체 무효화
+        import ui.formation_widget as _self_mod
+        if _self_mod._ovr_cache_invalidated:
+            if _cache is not None:
+                _cache.clear()
+            _self_mod._ovr_cache_invalidated = False
 
         if _cache is not None and _cache_key in _cache:
             self.formation, self.players = _cache[_cache_key]
@@ -522,7 +532,18 @@ class FormationWidget(QWidget):
             f"{style}font-size:11px;font-weight:bold;{_BOX_STYLE}")
 
         # ── 상대팀 목록 (캐시)
-        ctx_key = (team_id, repr(context))
+        # [버그수정] 캐시 키에 league_id 포함: 승강 후 같은 team_id라도
+        #   리그가 바뀌면 상대팀 목록을 새로 조회한다.
+        _cur_league_id = 0
+        if not (context and (context.get("intl") or context.get("cl"))):
+            try:
+                _cl = get_conn()
+                _lr = _cl.execute("SELECT league_id FROM teams WHERE id=?", (team_id,)).fetchone()
+                _cl.close()
+                _cur_league_id = _lr["league_id"] if _lr else 0
+            except Exception:
+                _cur_league_id = 0
+        ctx_key = (team_id, repr(context), _cur_league_id)
         if ctx_key != self._last_ctx:
             self._last_ctx = ctx_key
             self._opp_teams = self._resolve_opponents(team_id, context)

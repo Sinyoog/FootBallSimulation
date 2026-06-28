@@ -56,16 +56,18 @@ class PlayerPanel(QWidget):
         self.lay.setSpacing(4)
         self.lay.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        # 이름 + OVR + 상태 뱃지
-        name_row = QHBoxLayout()
+        # 이름(줄바꿈 허용) + 아래 줄에 OVR·상태 뱃지
         self.lbl_name  = QLabel("—"); self.lbl_name.setObjectName("pName")
+        self.lbl_name.setWordWrap(True)          # 긴 이름 자동 줄바꿈
         self.lbl_ovr   = QLabel("OVR 0"); self.lbl_ovr.setObjectName("ovrBadge")
         self.lbl_state = QLabel(""); self.lbl_state.setObjectName("injBadge")
-        name_row.addWidget(self.lbl_name)
-        name_row.addStretch()
-        name_row.addWidget(self.lbl_ovr)
-        name_row.addWidget(self.lbl_state)
-        self.lay.addLayout(name_row)
+        badge_row = QHBoxLayout()
+        badge_row.setContentsMargins(0, 2, 0, 0)
+        badge_row.addWidget(self.lbl_ovr)
+        badge_row.addWidget(self.lbl_state)
+        badge_row.addStretch()
+        self.lay.addWidget(self.lbl_name)
+        self.lay.addLayout(badge_row)
         self._div()
 
         # 기본 정보 영역 (동적)
