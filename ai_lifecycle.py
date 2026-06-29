@@ -137,19 +137,34 @@ def _age_and_progress(c):
 # ─────────────────────────────────────────────
 def _retire_and_replace(c, year):
     """고령 선수 은퇴 → 같은 팀·같은 포지션에 신인 영입.
-    [최적화] 팀 평균 OVR 선조회 + 이름풀 캐시로 은퇴자마다 DB 왕복 제거."""
+    [버그수정] 신인 목표 OVR을 team_avg 기반 → 리그 등급/tier OVR_RANGES 기반으로 변경.
+    기존: team_avg가 낮으면 낮은 신인이 들어와 리그 전체 OVR이 해마다 하락하는 버그.
+    수정: OVR_RANGES[grade][tier] 범위 하단~중간값을 신인 목표로 사용 → 리그 OVR 유지.
+    [최적화] 팀 info 선조회 + 이름풀 캐시로 은퇴자마다 DB 왕복 제거."""
+    from constants import OVR_RANGES, COUNTRY_LEAGUE_GRADE
     retired = 0
 
-    # 팀 평균 OVR 선조회 (은퇴자마다 SELECT AVG 방지)
-    team_avgs = {r["team_id"]: (r["avg_ovr"] or 50)
-                 for r in c.execute(
-                     "SELECT team_id, AVG(ovr) AS avg_ovr FROM ai_players "
-                     "GROUP BY team_id").fetchall()}
+    # 팀 → 리그등급/tier 선조회 (은퇴자마다 JOIN 방지)
+    team_info = {}  # {team_id: (grade, tier)}
+    for r in c.execute(
+            """SELECT t.id AS tid, t.current_tier AS tier,
+                      cn.name AS cname
+               FROM teams t
+               JOIN leagues l ON t.league_id = l.id
+               JOIN countries cn ON l.country_id = cn.id""").fetchall():
+        grade = COUNTRY_LEAGUE_GRADE.get(r["cname"], "D")
+        team_info[r["tid"]] = (grade, r["tier"] or 1)
 
     # [최적화] 이름풀 전체 1회 로드 (은퇴자마다 ORDER BY RANDOM() 방지)
     name_cache = _build_name_cache(c)
     # 팀→국가 캐시 초기화 (오프시즌 시작 시 리셋)
     _team_country_cache.clear()
+
+    # 팀별 현재 선수 이름 선조회 → 팀 내 중복 방지용
+    # {team_id: set(name, ...)} — 같은 팀 안에서만 중복 방지, 다른 팀/리그는 무관
+    team_used_names: dict = {}
+    for r2 in c.execute("SELECT team_id, name FROM ai_players").fetchall():
+        team_used_names.setdefault(r2["team_id"], set()).add(r2["name"])
 
     rows = c.execute("SELECT id, team_id, position, age FROM ai_players").fetchall()
     replace_updates = []  # executemany용
@@ -161,13 +176,24 @@ def _retire_and_replace(c, year):
         p_retire = min(0.95, 0.25 + (age - _AI_RETIRE_AGE) * 0.15)
         if random.random() >= p_retire:
             continue
-        # 신인 스탯 생성
-        team_avg = int(team_avgs.get(r["team_id"], 50))
-        target = max(30, min(85, team_avg + random.randint(-8, 2)))
+
+        # [버그수정] 신인 목표 OVR: 리그 등급/tier OVR_RANGES 하단~중간 범위
+        grade, tier = team_info.get(r["team_id"], ("D", 1))
+        ovr_rng = OVR_RANGES.get(grade, {}).get(tier)
+        if ovr_rng:
+            lo, hi = ovr_rng
+            # 신인은 리그 하단~중간 수준으로 진입 (하단+0 ~ 중간+5 범위)
+            mid = (lo + hi) // 2
+            target = random.randint(lo, mid + 5)
+        else:
+            target = random.randint(30, 45)
+
         stats = _gen_stats(r["position"], target)
         new_ovr = calc_ovr(r["position"], stats)
         new_age = random.randint(*_AI_NEWBIE_AGE)
-        name = _random_name(c, r["team_id"], name_cache)
+        # 팀 내 중복 방지: used_in_team에 팀 현재 이름 set 전달
+        used = team_used_names.setdefault(r["team_id"], set())
+        name = _random_name(c, r["team_id"], name_cache, used_in_team=used)
         replace_updates.append(
             (name, new_age, *[stats[s] for s in ALL_STATS], new_ovr, r["id"]))
         retired += 1
@@ -333,19 +359,33 @@ def _get_team_country(c, team_id):
     return _team_country_cache[team_id]
 
 
-def _random_name(c, team_id, name_cache=None):
-    """팀 소속국 이름풀에서 랜덤 이름.
-    name_cache({country_id:[name,...]}) 있으면 DB 조회 없이 Python random.choice."""
+def _random_name(c, team_id, name_cache=None, used_in_team=None):
+    """팀 소속국 이름풀에서 랜덤 이름. 같은 팀 내 중복 방지.
+    used_in_team: set — 이번 오프시즌에 이미 이 팀에 배정된 이름들.
+    다른 팀/리그 동명이인은 허용 (현실적으로 전 세계에 동명이인 있음).
+    """
     cid = _get_team_country(c, team_id)
     if cid is not None:
+        pool = None
         if name_cache is not None:
-            names = name_cache.get(cid)
-            if names:
-                return random.choice(names)
+            pool = name_cache.get(cid, [])
         else:
-            nm = c.execute(
-                "SELECT name FROM player_names WHERE country_id=? ORDER BY RANDOM() LIMIT 1",
-                (cid,)).fetchone()
-            if nm:
-                return nm["name"]
+            rows = c.execute(
+                "SELECT name FROM player_names WHERE country_id=?", (cid,)).fetchall()
+            pool = [r["name"] for r in rows]
+
+        if pool:
+            if used_in_team:
+                # 팀 내 중복 회피: 사용 안 된 이름 우선
+                available = [n for n in pool if n not in used_in_team]
+                if available:
+                    chosen = random.choice(available)
+                else:
+                    # 이름풀 소진 시 어쩔 수 없이 중복 허용
+                    chosen = random.choice(pool)
+            else:
+                chosen = random.choice(pool)
+            if used_in_team is not None:
+                used_in_team.add(chosen)
+            return chosen
     return f"신인{random.randint(100, 999)}"

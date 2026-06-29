@@ -12,7 +12,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QPainter, QBrush, QPen, QFont
 
 from database import get_conn
-from constants import FORMATION_SLOTS, STAT_KO, ALL_STATS
+from constants import FORMATION_SLOTS, STAT_KO, ALL_STATS, POSITION_COMPAT
 
 # 승강/리스케일 후 OVR 캐시 무효화 플래그 (game_engine._invalidate_team_ovr_cache가 세팅)
 _ovr_cache_invalidated: bool = False
@@ -326,9 +326,19 @@ class _FormationCanvas(QWidget):
         player_at = {}
         if self.players and self.players[0].get("is_me"):
             me = self.players[0]
-            my_cat = _pos_category(me.get("position", "MF"))
-            my_slot = next((i for i, (_, _, sp) in enumerate(positions_xy)
-                            if _pos_category(sp) == my_cat), 0)
+            primary_pos = me.get("position", "CM")
+            # POSITION_COMPAT 기반으로 가장 자연스러운 슬롯 결정
+            slots_only = [sp for (_, _, sp) in positions_xy]
+            my_slot, field_pos, mismatch_rank = _best_slot_for_player(primary_pos, slots_only)
+            # field_pos를 me에 저장 → 경기 퍼포먼스·커리어 기록에 활용
+            me["field_pos"] = field_pos
+            me["mismatch_rank"] = mismatch_rank
+            # field_pos·mismatch_rank를 DB에 저장 (경기 퍼포먼스·커리어 기록에 활용)
+            try:
+                from game_engine import update_player
+                update_player(field_pos=field_pos, mismatch_rank=mismatch_rank)
+            except Exception:
+                pass
             player_at[my_slot] = me
             ai_idx = 0
             for si in range(len(positions_xy)):
@@ -356,7 +366,9 @@ class _FormationCanvas(QWidget):
                 painter.drawEllipse(px-28, py-28, 56, 56)
             painter.setPen(QPen(QColor("#000" if is_me else "#fff")))
             f = QFont(); f.setPointSize(10); f.setBold(True); painter.setFont(f)
-            painter.drawText(px-24, py-24, 48, 48, Qt.AlignmentFlag.AlignCenter, pos[:2])
+            # 내 선수는 배치 포지션(field_pos) 표시, AI는 슬롯 포지션
+            _disp_pos = pl.get("field_pos", pos) if (pl and is_me) else pos
+            painter.drawText(px-24, py-24, 48, 48, Qt.AlignmentFlag.AlignCenter, _disp_pos[:2])
             if pl:
                 f2 = QFont(); f2.setPointSize(9); f2.setBold(is_me); painter.setFont(f2)
                 painter.setPen(QPen(QColor("#ffff00" if is_me else "#ddd")))
@@ -373,7 +385,9 @@ class _FormationCanvas(QWidget):
         sorted_rows = sorted(row_order, key=lambda x: _row_priority(x))
         total = len(sorted_rows); result = []
         for ri, rk in enumerate(sorted_rows):
-            poss = rows[rk]; cnt = len(poss)
+            # 같은 행 안에서 _pos_x_order 기준 좌→우 정렬
+            poss = sorted(rows[rk], key=_pos_x_order)
+            cnt = len(poss)
             ry = 16 + int((ri + 0.5) * (h - 32) / total)
             for ci, pos in enumerate(poss):
                 result.append((int((ci+1)*w/(cnt+1)), ry, pos))
@@ -604,10 +618,28 @@ class FormationWidget(QWidget):
 # 헬퍼
 # ─────────────────────────────────────────────
 
+# 같은 행 안에서 포지션의 좌→우 정렬 순서 (낮을수록 왼쪽)
+_POS_X_ORDER = {
+    # 공격 라인
+    "LW": 0, "CF": 1, "ST": 2, "SS": 2, "RW": 4,
+    # 공격형 미드
+    "LM": 0, "CAM": 2, "RM": 4,
+    # 중앙 미드
+    "CM": 2, "CDM": 2, "DM": 2,
+    # 수비 라인
+    "LWB": 0, "LB": 1, "CB": 2, "RB": 3, "RWB": 4, "SW": 2,
+    # GK
+    "GK": 2,
+}
+
+def _pos_x_order(pos):
+    return _POS_X_ORDER.get(pos, 2)
+
 def _row_key(pos):
     if pos == "GK": return "GK"
-    if pos in ("CB","LB","RB","LWB","RWB"): return "DEF"
-    if pos in ("CDM","CM","CAM","LM","RM","DM"): return "MID"
+    if pos in ("CB","LB","RB","LWB","RWB","SW"): return "DEF"
+    if pos in ("CDM","CM","DM"): return "MID"
+    if pos in ("CAM","LM","RM"): return "MID2"  # 공격형 미드/윙미드 = 별도 행
     return "ATK"
 
 def _pos_category(pos):
@@ -616,8 +648,34 @@ def _pos_category(pos):
     if pos in ("CDM","CM","CAM","LM","RM","DM","AM"): return "MID"
     return "ATK"
 
+
+def _best_slot_for_player(primary_pos, slots):
+    """주요 포지션에서 포메이션 슬롯 중 가장 자연스러운 슬롯 인덱스 반환.
+    POSITION_COMPAT 우선순위 리스트 기준: 앞에 있는 슬롯일수록 높은 우선순위.
+    반환: (slot_index, field_pos, mismatch_rank)
+      mismatch_rank=0: 완벽 매치 / 1: 2순위 / 2: 3순위 ...
+    """
+    compat = POSITION_COMPAT.get(primary_pos, [primary_pos])
+    # 이미 할당된 슬롯 제외 없이 최적 슬롯만 찾음 (호출 시 이미 할당된 슬롯 제외 처리)
+    best_idx, best_rank = 0, 999
+    for si, slot_pos in enumerate(slots):
+        if slot_pos in compat:
+            rank = compat.index(slot_pos)
+            if rank < best_rank:
+                best_rank = rank
+                best_idx = si
+    if best_rank == 999:
+        # 호환 없으면 카테고리로 fallback
+        my_cat = _pos_category(primary_pos)
+        for si, slot_pos in enumerate(slots):
+            if _pos_category(slot_pos) == my_cat:
+                return si, slot_pos, 4
+        return 0, slots[0] if slots else primary_pos, 4
+    return best_idx, slots[best_idx], best_rank
+
 def _row_priority(k):
-    return {"ATK":0,"MID":1,"DEF":2,"GK":3}.get(k,2)
+    # 위(공격)→아래(GK) 순서: ATK=0, MID2=1, MID=2, DEF=3, GK=4
+    return {"ATK":0,"MID2":1,"MID":2,"DEF":3,"GK":4}.get(k,2)
 
 def _pos_color(pos):
     if pos == "GK": return "#2244aa"

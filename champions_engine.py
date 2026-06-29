@@ -26,6 +26,34 @@ champions_engine.py ─ 클럽 대륙 챔피언스리그 엔진
 import random
 
 from database import get_conn
+
+def _get_field_pos(p):
+    """현재 팀 포메이션 기반 배치 포지션 계산 (순환 import 방지용 로컬 버전)."""
+    if not p:
+        return "CM"
+    primary = p.get("position", "CM")
+    team_id = p.get("current_team_id", 0)
+    if not team_id:
+        return primary
+    try:
+        from constants import POSITION_COMPAT, FORMATION_SLOTS
+        conn = get_conn()
+        row = conn.execute("SELECT formation FROM teams WHERE id=?", (team_id,)).fetchone()
+        conn.close()
+        formation = (row["formation"] if row else None) or "4-4-2"
+        slots = FORMATION_SLOTS.get(formation, FORMATION_SLOTS["4-4-2"])
+        compat = POSITION_COMPAT.get(primary, [primary])
+        best, best_rank = primary, 999
+        for slot in slots:
+            if slot in compat:
+                rank = compat.index(slot)
+                if rank < best_rank:
+                    best_rank = rank
+                    best = slot
+        return best
+    except Exception:
+        return primary
+
 from constants import GRADE_TEAM_OVR  # 참고용(미사용 가능)
 
 # ── 대회 일정 (주차) ───────────────────────────────
@@ -652,7 +680,7 @@ def simulate_my_cl_match(week, p):
                     my_dribbles=?, my_blocks=?, my_pass_acc=?, my_conceded=?
                     WHERE id=?""",
                  (hs, as_, pso_winner, pso_score,
-                  p.get("position", ""),
+                  _get_field_pos(p),
                   saves, goals, assists, rating,
                   detail["shots"], detail["shots_on"], detail["key_passes"],
                   detail["dribbles"], detail["blocks"], detail["pass_acc"],

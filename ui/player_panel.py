@@ -124,6 +124,11 @@ class PlayerPanel(QWidget):
 
     def refresh(self):
         p = get_player()
+        try:
+            from game_engine import get_field_pos as _gfp
+            _cur_field_pos = _gfp(p) if p else "—"
+        except Exception:
+            _cur_field_pos = p.get("position", "—") if p else "—"
         if not p:
             return
         lang = p.get("language","ko")
@@ -187,7 +192,8 @@ class PlayerPanel(QWidget):
             ("국적",   _nat_str),
             ("소속",   team_name),
             ("리그",   league_name),
-            ("포지션", p["position"]),
+            ("주요 포지션", p["position"]),
+            ("현 포지션",   _cur_field_pos),
             ("성격",   p["personality"]),
             ("특징",   p.get("physical_trait", "무난함")),
             ("체형",   p.get("body_type", "-")),

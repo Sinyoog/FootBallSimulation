@@ -117,6 +117,39 @@ def update_player(**kw):
     conn.close()
 
 
+def get_field_pos(p=None):
+    """현재 팀 포메이션 기반으로 배치 포지션 런타임 계산.
+    DB에 저장하지 않고 호출할 때마다 계산 → 포메이션 변경 즉시 반영.
+    """
+    if p is None:
+        p = get_player()
+    if not p:
+        return "CM"
+    primary = p.get("position", "CM")
+    team_id = p.get("current_team_id", 0)
+    if not team_id:
+        return primary
+    try:
+        from constants import POSITION_COMPAT, FORMATION_SLOTS
+        conn = get_conn()
+        row = conn.execute("SELECT formation FROM teams WHERE id=?", (team_id,)).fetchone()
+        conn.close()
+        formation = (row["formation"] if row else None) or "4-4-2"
+        slots = FORMATION_SLOTS.get(formation, FORMATION_SLOTS["4-4-2"])
+        compat = POSITION_COMPAT.get(primary, [primary])
+        best, best_rank = primary, 999
+        for slot in slots:
+            if slot in compat:
+                rank = compat.index(slot)
+                if rank < best_rank:
+                    best_rank = rank
+                    best = slot
+        return best
+    except Exception:
+        return primary
+
+
+
 # ═══════════════════════════════════════════
 # [국적 연혁] 출생국적 / 귀화 / 대표선택 이력 기록
 # ═══════════════════════════════════════════
@@ -807,7 +840,7 @@ def _ensure_career_entry(p, st):
          contract_years, transfer_type, team_id,
          contract_role, manager_type, club_ambition)
         VALUES (?,?,?,?,?,?,?,?,0,0,0,0,0,0,0,0,0,0,?,?,?,?,?,?)""",
-        (p["age"], p.get("position",""), team_row["name"], team_row["lname"],
+        (p["age"], get_field_pos(p), team_row["name"], team_row["lname"],
          tier_e, p.get("salary",0),
          st["current_year"], st["current_week"],
          c_yrs_e, tt_e, tid,
@@ -1679,22 +1712,33 @@ def _league_avg_ovr(c, league_id):
 #   - 황희찬급(85) @ 강팀리그(평균82, 격차+3):   ST 약 5~6골 (평범한 주전)
 #   - 언더독(격차 음수): 활약 위축
 # ══════════════════════════════════════════════════════════════
-DOMINANCE_K       = 0.045   # 격차 1당 배수 증가폭 (↑일수록 격차 영향 큼)
-DOMINANCE_MIN     = 0.35    # 최저 배수 (강한 리그에서 위축 하한)
-DOMINANCE_MAX     = 4.50    # 최고 배수. [수정] 기존 2.80(OVR55에서 포화)은 약체리그
-                            #   에서 OVR 55나 100이나 똑같이 무쌍이 되는 문제가 있었다.
-                            #   상한을 풀어(4.5) '리그 평균 대비 격차'가 곧 실력차로 반영되게 한다.
-                            #   OVR은 100이 최대이므로 격차의 자연 상한은 (100-리그평균)으로 정해진다.
-                            #   예) 리그30선 OVR100 격차+70 → dom 4.15(압도적 무쌍, 한경기 다득점),
-                            #       리그80선 OVR100 격차+20 → dom 1.90(적당한 우위).
-                            #   골/평점/세부지표는 아래에서 dom이 높을수록 체감(제곱근)하도록 관리.
-GOAL_PROB_CAP     = 0.85    # 경기당 골 시도 성공확률 상한 (무쌍 방지)
-ASSIST_PROB_CAP   = 0.45    # 경기당 어시 확률 상한
+DOMINANCE_K       = 0.040   # 기본 선형 증가폭 (하위권 OVR)
+DOMINANCE_MIN     = 0.30    # 최저 배수 (강한 리그에서 크게 위축)
+DOMINANCE_MAX     = 6.00    # 최고 배수 상한 (메시급 월클 폭발 허용)
+GOAL_PROB_CAP     = 0.88    # 경기당 골 시도 성공확률 상한
+ASSIST_PROB_CAP   = 0.60    # 경기당 어시 확률 상한 (어시 특화 포지션 허용)
 
 def _dominance_mult(my_ovr, league_avg):
-    """내 OVR vs 리그 평균 → 활약 배수. 격차 0이면 1.0(리그 평균 수준)."""
-    gap = (my_ovr or 50) - (league_avg or 50)
-    return max(DOMINANCE_MIN, min(DOMINANCE_MAX, 1.0 + gap * DOMINANCE_K))
+    """내 OVR vs 리그 평균 → 활약 배수. 비선형: OVR 90+ 구간에서 가속.
+    설계 근거 (14경기 기준):
+      - OVR=리그평균: dom=1.0 → 평균 ST 7~10골
+      - OVR 5 위: dom≈1.25 → 에이스 ST 10~14골
+      - OVR 10 위: dom≈1.65 → 탑 ST 14~18골
+      - OVR 95~100 (메시급): dom≈2.5~4.0 → 14~20골 폭발
+    선형만으론 OVR 99와 OVR 90의 차이가 너무 작아 월클 폭발이 안 나왔음.
+    90+ 구간에서 비선형 가속 추가.
+    """
+    my_ovr = my_ovr or 50
+    lg_avg = league_avg or 50
+    gap = my_ovr - lg_avg
+    # 기본 선형항
+    base = 1.0 + gap * DOMINANCE_K
+    # 비선형 가속: OVR 자체가 높을수록 추가 배수
+    # - OVR 90 이상에서 시작, 95+ 에서 폭발
+    if my_ovr >= 90:
+        elite = (my_ovr - 90) ** 1.9 * 0.012   # 90→0, 95→0.32, 99→0.78, 100→0.92
+        base += elite
+    return max(DOMINANCE_MIN, min(DOMINANCE_MAX, base))
 
 def _stat_n(p, stat, lo=40, hi=95):
     """스탯을 0~1로 정규화 (lo=0, hi=1). 플레이스타일 반영용."""
@@ -2124,26 +2168,49 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None):
 
         # 포지션별 기본 골/어시 성향 (계수)
         #   g_pos_mult: 골 '개수' 기대치(xg)용 포지션 배수. 전방일수록 멀티골 잦음.
+        # ── 포지션별 골/어시 성향 계수 (14경기 기준 설계) ──────────────────
+        # g_base: 기본 골 확률 / g_sh: 슈팅 스탯 반영 / g_dr: 드리블 반영
+        # a_base: 기본 어시 확률 / a_pa: 패스 반영 / a_dr: 드리블 반영
+        # g_pos_mult: 멀티골 기대치(xg) 포지션 배수
+        # sp_goal: 세트피스 전문 포지션 추가 보정 (LB/RB/CB)
         if pos in ("ST", "CF"):
-            g_base, g_sh, g_dr = 0.20, 0.18, 0.04
-            a_base, a_pa, a_dr = 0.05, 0.18, 0.08
-            g_pos_mult = 1.55
+            # 득점 특화: 14경기 평균 7~10골 / 에이스 10~14골 / 월클 14~20골
+            g_base, g_sh, g_dr = 0.30, 0.24, 0.05
+            a_base, a_pa, a_dr = 0.05, 0.14, 0.06
+            g_pos_mult = 1.55; sp_goal = 0.0
         elif pos in ("LW", "RW"):
-            g_base, g_sh, g_dr = 0.15, 0.15, 0.07
-            a_base, a_pa, a_dr = 0.07, 0.18, 0.10
-            g_pos_mult = 1.15
+            # 골+어시 균형, 드리블 높으면 컷인 득점 / 어시 특화
+            # 14경기: 골 4~7 / 어시 6~9 / 에이스: 골 7~11 / 어시 8~13
+            g_base, g_sh, g_dr = 0.22, 0.16, 0.10
+            a_base, a_pa, a_dr = 0.14, 0.20, 0.14
+            g_pos_mult = 1.10; sp_goal = 0.0
         elif pos == "CAM":
-            g_base, g_sh, g_dr = 0.06, 0.13, 0.05
-            a_base, a_pa, a_dr = 0.07, 0.22, 0.09
-            g_pos_mult = 0.85
+            # 어시 특화: 14경기 골 3~5 / 어시 7~11 / 에이스: 골 5~8 / 어시 10~15
+            g_base, g_sh, g_dr = 0.14, 0.13, 0.06
+            a_base, a_pa, a_dr = 0.20, 0.26, 0.12
+            g_pos_mult = 0.80; sp_goal = 0.0
         elif pos == "CM":
-            g_base, g_sh, g_dr = 0.04, 0.11, 0.04
-            a_base, a_pa, a_dr = 0.06, 0.20, 0.08
-            g_pos_mult = 0.60
-        else:  # 수비/CDM 등: 골·어시 드묾
-            g_base, g_sh, g_dr = 0.02, 0.06, 0.02
-            a_base, a_pa, a_dr = 0.03, 0.10, 0.04
-            g_pos_mult = 0.32
+            # 박스투박스: 14경기 골 2~4 / 어시 4~7
+            g_base, g_sh, g_dr = 0.10, 0.11, 0.05
+            a_base, a_pa, a_dr = 0.12, 0.22, 0.09
+            g_pos_mult = 0.55; sp_goal = 0.0
+        elif pos == "CDM":
+            # 수비형 미드: 골 드묾 / 어시 약간 (전방 연결)
+            # 14경기: 골 0~2 / 어시 2~4
+            g_base, g_sh, g_dr = 0.04, 0.06, 0.02
+            a_base, a_pa, a_dr = 0.07, 0.15, 0.05
+            g_pos_mult = 0.28; sp_goal = 0.0
+        elif pos in ("LB", "RB"):
+            # 오버래핑 풀백: 어시 특화 / 세트피스 골 가끔
+            # 14경기: 골 1~3 / 어시 3~6
+            g_base, g_sh, g_dr = 0.04, 0.04, 0.04
+            a_base, a_pa, a_dr = 0.10, 0.18, 0.10
+            g_pos_mult = 0.30; sp_goal = 0.04  # 세트피스 오버래핑 크로스
+        else:  # CB / 기타 수비
+            # 14경기: 골 0~2 (코너킥 헤더) / 어시 0~2
+            g_base, g_sh, g_dr = 0.02, 0.03, 0.01
+            a_base, a_pa, a_dr = 0.02, 0.08, 0.02
+            g_pos_mult = 0.22; sp_goal = 0.05  # 세트피스 헤더 전문
 
         # [수정] 경기당 득점/어시 확률. dom 을 풀로 곱하면 약체리그(dom 2.5+)에서
         #   거의 매 경기 득점 → 시즌 골 폭주. dom 영향을 거듭제곱으로 완만화하되,
@@ -2154,17 +2221,21 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None):
         #   [수정5] dom 지수를 포지션 골성향에 연동. 공격수(g_pos_mult 1.55)는 0.72로
         #   골이 dom 따라 크게 늘되, 수비수(0.32)는 지수를 낮춰(0.40) 약체리그라도
         #   골이 천천히만 는다. 'OVR 100 CB가 14경기 13골' 같은 폭주를 막는다.
-        _gdom_exp = 0.40 + 0.32 * (g_pos_mult / 1.55)   # ST≈0.72, CM≈0.52, CB≈0.47
+        _gdom_exp = 0.45 + 0.28 * (g_pos_mult / 1.55)   # ST≈0.73, CM≈0.55, CB≈0.49
         _gdom = dom ** _gdom_exp
-        # [수정3] 약체 상대 가산항: 상대 수비가 약하면 슈팅스탯이 낮아도 골이
-        #   들어간다. 단 dom 1.3 초과분에만 적용(강팀리그 dom 1.2~1.5는 영향 최소화).
-        #   [수정4] 포지션 골성향(g_pos_mult)에 비례시킨다. 기존엔 포지션 무관 일정
-        #   이라 약체리그 CB가 14경기 13골 넣는 폭주가 났다. 공격수(g_pos_mult 1.55)는
-        #   보너스 풀로, 수비수(0.32)는 1/5만 받아 '수비수 골 폭주'를 막는다.
-        _pos_goal_scale = g_pos_mult / 1.55       # ST=1.0, CM=0.39, CB=0.21
-        _weak_bonus = 0.20 * max(0.0, dom - 1.3) * _pos_goal_scale
-        gprob = min(GOAL_PROB_CAP, (g_base + sh * g_sh + dr * g_dr) * _gdom + _weak_bonus)
-        aprob = min(ASSIST_PROB_CAP, (a_base + pa * a_pa + dr * a_dr) * _gdom + 0.5 * _weak_bonus)
+        _pos_goal_scale = g_pos_mult / 1.55   # ST=1.0, CM=0.36, CB=0.14
+        # 약체 상대 가산: dom 1.2 초과분 적용, 포지션 비례
+        _weak_bonus = 0.25 * max(0.0, dom - 1.2) * _pos_goal_scale
+        # 어시는 dom 영향을 골보다 약하게 (어시는 팀 득점이 있어야 가능)
+        _adom_exp = 0.35 + 0.20 * (g_pos_mult / 1.55)
+        _adom = dom ** _adom_exp
+        # OVR 95+ 월클은 gprob CAP을 완화 → 경기 출전 자체가 득점 기회
+        _gprob_cap = GOAL_PROB_CAP
+        _my_ovr_val = p.get("ovr", 50) or 50
+        if _my_ovr_val >= 95:
+            _gprob_cap = min(0.95, GOAL_PROB_CAP + 0.04 * (_my_ovr_val - 95))
+        gprob = min(_gprob_cap, (g_base + sh * g_sh + dr * g_dr) * _gdom + _weak_bonus)
+        aprob = min(ASSIST_PROB_CAP, (a_base + pa * a_pa + dr * a_dr) * _adom + 0.4 * _weak_bonus)
 
         # 골 (내 팀 득점 my_score 이내로 클램프)
         #   각 골마다 분(分)을 배정하고, 그 시점의 점수 흐름으로 골 종류를 분류한다.
@@ -2187,22 +2258,22 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None):
             #   dom을 곡선(제곱근 체감)으로 반영해, OVR이 높을수록 멀티골이 계속
             #   늘되 폭주하지 않게 한다. + 포지션 연동: 공격수는 멀티골 잘 나되
             #   수비수는 dom 영향을 약하게(_pos_goal_scale) 줘서 멀티골을 억제한다.
-            sh_dom = 1.0 + 0.85 * ((max(1.0, dom) - 1.0) ** 0.62) * (0.4 + 0.6 * _pos_goal_scale)
-            xg = g_pos_mult * (0.40 + 0.60 * sh) * sh_dom
-            # 엘리트 결정력 가산: sh 0.80→0, 0.90→약 +0.45, 1.0→약 +1.1 (초선형)
-            if sh > 0.80:
-                xg += g_pos_mult * 11.0 * (sh - 0.80) ** 2
-            xg = max(0.5, min(5.5, xg))         # 상한 상향(약체리그 무쌍 멀티골 허용)
-            # xg를 평균으로 하는 분포: 낮으면 1골 위주, 높으면 멀티골 확률 상승.
-            #   각 골당 '추가 득점' 확률 = xg 비례(체감형). 최대 6골.
-            #   [수정] 체감률(decay)을 결정력에 연동: 평범한 선수는 급감(0.50),
-            #   엘리트는 완만(최대 0.66)해 멀티골이 더 잘 이어진다 → 상단 꼬리 확장.
+            # ── xg (기대골) 계산: 14경기 기준으로 재보정 ──────────────────
+            # sh_dom: dom이 높을수록 멀티골 천장 상승 (비선형 가속)
+            sh_dom = 1.0 + 0.90 * ((max(1.0, dom) - 1.0) ** 0.58) * (0.35 + 0.65 * _pos_goal_scale)
+            xg = g_pos_mult * (0.35 + 0.65 * sh) * sh_dom
+            # 엘리트 결정력 가산: OVR 90+(sh≈0.91+)에서 초선형 폭발
+            # sh 0.75→0, 0.85→+0.43, 0.95→+1.82, 1.0→+2.60 (메시급 멀티골)
+            if sh > 0.75:
+                xg += g_pos_mult * 14.0 * (sh - 0.75) ** 2
+            xg = max(0.5, min(7.0, xg))   # 상한 7.0 (메시급 한 경기 최대 5~6골 가능)
+            # 멀티골 분포
             goals = 1
-            decay = 0.50 + 0.16 * max(0.0, sh - 0.6) / 0.4   # sh 0.6→0.50, 1.0→0.66
-            extra_p = max(0.0, min(0.88, (xg - 0.8) / 3.6))  # 2골+로 갈 확률
-            while goals < 6 and random.random() < extra_p:
+            decay = 0.48 + 0.22 * max(0.0, sh - 0.55) / 0.45   # sh 0.55→0.48, 1.0→0.70
+            extra_p = max(0.0, min(0.92, (xg - 0.65) / 3.0))
+            while goals < 7 and random.random() < extra_p:
                 goals += 1
-                extra_p *= decay                 # 골 늘수록 다음 골은 어려워짐(엘리트는 완만)
+                extra_p *= decay
             goals = min(goals, my_score)
             base += goals * 1.0
             got_goal = True
@@ -2219,40 +2290,42 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None):
             if banner:
                 events.append((goal_mins[-1], banner))
 
-        # 세트피스 보너스 골 (세트피스 높은 키커, 약체 상대일수록 ↑)
-        if my_score > goals and sp > 0.55 and random.random() < 0.04 * dom:
+        # 세트피스 보너스 골
+        # LB/RB: 오버래핑 크로스 후 마무리 (sp_goal=0.04)
+        # CB: 코너킥 헤더 (sp_goal=0.05)
+        # 일반: 세트피스 스탯 높은 키커
+        _sp_prob = sp_goal + (0.05 * sp if sp > 0.55 else 0.0)
+        _sp_prob *= min(1.5, dom)  # 약체 상대일수록 ↑, 강팀 상대는 제한
+        if my_score > goals and _sp_prob > 0 and random.random() < _sp_prob:
             goals += 1; base += 1.0
-            events.append((random.randint(10, 88), "🎯 환상적인 세트피스 골!"))
+            ev_sp = "🎯 세트피스 골!" if pos in ("CB", "LB", "RB") else "🎯 환상적인 세트피스 골!"
+            events.append((random.randint(10, 88), ev_sp))
 
-        # 어시 (골과 독립 판정. 골 넣은 경기는 어시 확률 절반 — 한 장면 중복 방지)
-        #   [설계] 골과 동일 철학: 평균은 현실(엘리트 플레이메이커 ~10~15/시즌),
-        #   상단 꼬리는 '창조력(passing 스탯)'으로 연다. KDB·Fernandes급(passing 만점)
-        #   은 한 경기 2어시가 잦아 시즌 18~21어시(역대 기록권)가 가능해야 한다.
-        #   - 평범한 선수: 1어시 위주
-        #   - 엘리트(pa>0.80): 멀티어시 확률 초선형 상승
-        rem = my_score - goals
-        if rem > 0:
-            eff_aprob = aprob * 0.5 if got_goal else aprob
-            if random.random() < eff_aprob:
-                # 멀티어시 확률: 기본 15%에 창조력 엘리트 가산(pa 0.85→+0, 1.0→+0.18).
-                #   역대 단일시즌 최고가 ~20-21어시이므로 가산을 보수적으로 둔다.
-                multi_p = 0.15
-                if pa > 0.85:
-                    multi_p += 1.2 * (pa - 0.85)            # 최대 +0.18
-                multi_p = min(0.34, multi_p)
-                assists = random.choices([1, 2], [1 - multi_p, multi_p])[0] if rem >= 2 else 1
-                assists = min(assists, rem)
-                # [수정] 어시 가산 0.5→0.75. 어시는 명백한 공격포인트인데 0.5는
-                #   약해서 '어시 1개 했는데 평점 5.9'(실제 게임) 같은 저평가가 났다.
-                #   골(1.0)의 약 0.75배로 올려 공격포인트가 평점에 제대로 반영되게 함.
-                base += 0.75 * assists
-                a_mins = _sample_minutes(assists, 5, 88)
-                a_txts = ["🅰 정확한 어시스트!", "🅰 결정적 도움!", "🅰 키패스로 어시스트!",
-                          "🅰 환상적인 패스로 어시!", "🅰 침투 패스 어시스트!"]
-                for am in a_mins:
-                    events.append((am, random.choice(a_txts)))
-                if assists >= 2:
-                    events.append((a_mins[-1], "🅰🔥 멀티 어시스트!"))
+        # ── 어시 판정 (팀 득점과 독립, aprob에 팀 득점 확률 흡수) ────────
+        # [설계] 기존 rem>0 조건은 "내가 골 넣으면 어시 기회가 줄어"라는 가정인데,
+        #   이게 어시 포지션(CAM/LW/RW)의 어시를 지나치게 억제했다.
+        #   → aprob 자체가 이미 "팀 득점 확률 × 내 어시 기여 확률"을 반영하므로
+        #     rem 조건 없이 독립 판정. 대신 내가 골 넣은 경기는 어시 확률 40%로 감소
+        #     (한 장면에서 골+어시 동시 불가).
+        # 어시 특화 포지션(CAM/LW/RW) 목표: 14경기 6~10어시 / 에이스 8~13어시
+        eff_aprob = aprob * 0.40 if got_goal else aprob
+        if random.random() < eff_aprob:
+            _a_base_multi = 0.12 + 0.10 * (a_pa / 0.26)   # CAM=0.22, LW=0.19, ST=0.08
+            multi_p = min(0.22, _a_base_multi)
+            if pa > 0.78:
+                multi_p += 1.8 * (pa - 0.78) ** 1.3       # 엘리트 패서 최대 +0.36
+            multi_p = min(0.52, multi_p)
+            assists = 1
+            if multi_p > 0 and random.random() < multi_p:
+                assists = 2
+            base += 0.75 * assists
+            a_mins = _sample_minutes(assists, 5, 88)
+            a_txts = ["🅰 정확한 어시스트!", "🅰 결정적 도움!", "🅰 키패스로 어시스트!",
+                      "🅰 환상적인 패스로 어시!", "🅰 침투 패스 어시스트!"]
+            for am in a_mins:
+                events.append((am, random.choice(a_txts)))
+            if assists >= 2:
+                events.append((a_mins[-1], "🅰🔥 멀티 어시스트!"))
 
         # ── [무득점 공격수 감점] ─────────────────────────────────
         #   공격 포지션은 골/어시가 평점의 핵심이다. 약체리그 군림(dom↑)으로 base가
@@ -3539,6 +3612,39 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
             pass
 
 
+def _recalc_field_pos_after_offseason(p):
+    """오프시즌 포메이션 셔플 후 내 field_pos 재계산.
+    감독이 포메이션을 바꾸면 내 배치 포지션도 달라질 수 있다.
+    """
+    if not p or not p.get("current_team_id"):
+        return
+    try:
+        from constants import POSITION_COMPAT, FORMATION_SLOTS
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT formation FROM teams WHERE id=?",
+            (p["current_team_id"],)).fetchone()
+        conn.close()
+        if not row:
+            return
+        _formation = row["formation"] or "4-4-2"
+        _slots = FORMATION_SLOTS.get(_formation, FORMATION_SLOTS["4-4-2"])
+        _primary = p.get("position", "CM")
+        _compat = POSITION_COMPAT.get(_primary, [_primary])
+        _best_pos, _best_rank = _primary, 0
+        _best_found = 999
+        for _slot in _slots:
+            if _slot in _compat:
+                _rank = _compat.index(_slot)
+                if _rank < _best_found:
+                    _best_found = _rank
+                    _best_pos = _slot
+                    _best_rank = _rank
+        pass  # field_pos는 런타임 계산 (get_field_pos), DB 저장 불필요
+    except Exception:
+        pass
+
+
 def _end_of_season(p, year):
     # 커리어 기록은 37~40주차 진입 시 이미 저장됨 → 여기선 생략
 
@@ -3700,6 +3806,9 @@ def _end_of_season(p, year):
 
     # 6. 강제 방출 체크 (이슈8 강화) — 우승 판정이 끝난 뒤에 처리
     p = get_player() or p   # 승강으로 리그/연봉이 바뀌었을 수 있으니 최신화
+    # 오프시즌 포메이션 변경 후 field_pos 재계산
+    _recalc_field_pos_after_offseason(p)
+
     _check_forced_release(p, year)
 
     # 7. (구) 연말 국제대회 일괄 시뮬 → 시즌 중 17~24주 실경기 방식으로 대체됨 (intl_engine)
@@ -3732,10 +3841,18 @@ def _end_of_season(p, year):
             wants_renew = (avg_r >= _base or rel >= 60) and not ovr_too_low
             if wants_renew:
                 # 재계약 의사 있음 → UI 팝업용 플래그 저장
-                base_sal = p2.get("salary", 0)
-                if avg_r >= _base + 0.5:   new_sal = int(base_sal * 1.15)
-                elif avg_r >= _base:       new_sal = int(base_sal * 1.05)
-                else:                      new_sal = int(base_sal * 0.95)
+                # [버그수정] 기존: 현재 salary에 배율 적용 → 승강 후에도 이전 tier 연봉 기준
+                # 수정: 현재 소속 리그/tier 기준으로 _calc_salary 재계산
+                _gt = _my_grade_tier(p2)
+                if _gt:
+                    _rg2, _rt2, _rc2 = _gt
+                    _fair_sal = _calc_salary(_rg2, _rt2, p2.get("ovr", 60), _rc2)
+                else:
+                    _fair_sal = p2.get("salary", 0)
+                # 평점에 따라 ±15% 가감
+                if avg_r >= _base + 0.5:   new_sal = int(_fair_sal * 1.15)
+                elif avg_r >= _base:       new_sal = int(_fair_sal * 1.05)
+                else:                      new_sal = int(_fair_sal * 0.95)
                 _age = new_age
                 if _age >= 33:
                     renew_yrs = 1
@@ -4991,52 +5108,50 @@ def _calc_salary(grade, tier, ovr, country=None):
 
 
     base_year = {
-        # 천원/년. 각 등급/tier의 평균 OVR에서 목표 평균 연봉이 나오도록 역산.
-        # mult 공식: _salary_ovr_mult(avg_ovr) 에서 나오는 배수로 나눈 값.
-        # ── 평균 OVR / 목표 평균 연봉 ──
-        #   SS(avg82/74/67/61/55): 45억/10억/1.8억/9000만/4000만
-        #   S (avg79/72/65/59/53): 22억/ 4억/9000만/3500만/1500만 (스페인 기준)
-        #   A (avg75/68/61/55):  4.5억/9000만/2500만/800만  (네덜/포르 기준)
-        #   B (avg71/64/58/52):  1.2억/3000만/800만/200만  (스코틀랜드/덴마크 기준)
-        #   C (avg67/61/55/49):  5000만/1200만/300만/100만 (폴란드/세르비아 기준)
-        #   D (avg63/57/51):     1000만/250만/60만         (보스니아 기준)
-        #   E (avg58/52/47):      250만/ 60만/15만
-        #   F (avg52/47/42):      120만/ 30만/ 5만
-        "SS":{1:19_996_093, 2:7_028_218, 3:2_025_506, 4:1_650_731, 5:1_324_913},
-        "S": {1:11_603_489, 2:3_186_829, 3:1_180_000, 4:   77_216, 5:   61_990},
+        # 천원/년. SS 1부 기준, 각 등급 OVR65 평균 주전 목표 연봉으로 역산된 base.
+        # 나라별 실제 연봉은 COUNTRY_SALARY_MULT로 조정.
+        # tier 비율: 1부=1.0 / 2부≈0.316 / 3부 이하는 LOWER_LEAGUE_OVERRIDE로 관리.
+        "SS":{1:19_996_093, 2:6_318_572, 3:2_025_506, 4:1_650_731, 5:1_324_913},
+        "S": {1:11_603_489, 2:3_666_703, 3:1_180_000, 4:   77_216, 5:   61_990},
         "A": {1: 2_977_645, 2:  941_397, 3:   45_853, 4:   26_498},
-        "B": {1: 1_020_507, 2:  426_093, 3:   19_445, 4:    9_266},
-        "C": {1:   562_640, 2:  220_097, 3:    9_936, 4:    6_573},
-        "D": {1:    15_425, 2:    6_715, 3:    3_122},
-        "E": {1:     6_076, 2:    2_780, 3:    1_234},
-        "F": {1:     5_560, 2:    2_469, 3:      605},
+        "B": {1: 1_020_507, 2:  322_480, 3:   19_445, 4:    9_266},
+        "C": {1:   562_640, 2:  177_794, 3:    9_936, 4:    6_573},
+        "D": {1:    15_425, 2:    4_874, 3:    3_122},
+        "E": {1:     6_076, 2:    1_920, 3:    1_234},
+        "F": {1:     5_560, 2:    1_757, 3:      605},
     }
-    # 등급별 연봉 상한 (천원/년)
+    # 등급별 연봉 상한 (천원/년) — 나라별 COUNTRY_SALARY_CAP이 실제 상한 역할.
+    # 이 값은 COUNTRY_SALARY_CAP 없는 나라의 최종 안전망.
     _salary_cap = {
-        "SS": 300_000_000,  # 3000억 (OVR99 SS1부 ≈ 2831억)
-        "S":  100_000_000,  # 1000억
-        "A":   10_000_000,  # 100억
-        "B":    2_500_000,  # 25억
-        "C":      800_000,  # 8억
-        "D":      200_000,  # 2억
-        "E":       50_000,  # 5000만
-        "F":       20_000,  # 2000만
+        "SS": 50_000_000,   # 500억 안전망
+        "S":  20_000_000,   # 200억
+        "A":   5_000_000,   # 50억
+        "B":   1_000_000,   # 10억
+        "C":     300_000,   # 3억
+        "D":      50_000,   # 5천만
+        "E":      20_000,   # 2천만
+        "F":      10_000,   # 1천만
     }
     b = base_year.get(wealth, {}).get(tier, 100)
 
     # 나라×tier 오버라이드 (3부 이하)
+    # [버그수정] LOWER_LEAGUE_SALARY_OVERRIDE는 이미 나라별 절대 base값이므로
+    #   override 사용 시 cont_mult를 적용하지 않는다.
+    #   (기존: override에도 cont_mult 재적용 → K3 의도 150만이 31만으로 축소되는 버그)
+    _used_override = False
     if country and tier >= 3:
         _ov = LOWER_LEAGUE_SALARY_OVERRIDE.get(country, {})\
             if not is_special else {}
         if tier in _ov:
             b = _ov[tier]
+            _used_override = True
 
     if b == 0:
         return 0
 
-    # 나라별 연봉 배율 적용 (특수 연봉 국가는 제외)
-    # COUNTRY_SALARY_MULT: 나라별 개별 배율 (없으면 1.0 — 등급 기준국 수준)
-    if not is_special and country:
+    # 나라별 연봉 배율: override를 사용하지 않은 경우에만 적용
+    # (override는 이미 나라별 절대값 — cont_mult 중복 적용 방지)
+    if not is_special and country and not _used_override:
         from constants import COUNTRY_SALARY_MULT
         cont_mult = COUNTRY_SALARY_MULT.get(country, 1.0)
         b = int(b * cont_mult)
@@ -5053,6 +5168,13 @@ def _calc_salary(grade, tier, ovr, country=None):
     cap = _salary_cap.get(wealth, 0)
     if cap > 0:
         sal = min(sal, cap)
+    # [버그수정] 나라별 연봉 상한 적용 (COUNTRY_SALARY_CAP)
+    #   constants.py에 정의돼 있었으나 _calc_salary에서 import/적용이 누락됐었음.
+    if country and not is_special:
+        from constants import COUNTRY_SALARY_CAP
+        country_cap = COUNTRY_SALARY_CAP.get(country, 0)
+        if country_cap > 0:
+            sal = min(sal, country_cap)
     return max(0, sal)
 
 
@@ -5114,7 +5236,7 @@ def _save_career_entry(p, year, week, force_new=False, transfer_type=None,
                 if as_ > hs: tw += 1
                 elif as_ == hs: td += 1
                 else: tl += 1
-    pos = p.get("position", "")
+    pos = get_field_pos(p)   # 배치 포지션 (포메이션 슬롯 기반, 없으면 주요 포지션)
     cs  = _calc_clean_sheets(c, tid, season, matches=sm)
 
     # end_year=0인 열린 항목 찾기 (team_id 우선, 구버전 행은 이름 폴백)
@@ -5210,7 +5332,7 @@ def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None
     p = get_player()
     conn = get_conn()
     c = conn.cursor()
-    c.execute("""SELECT t.name,l.id as lid,l.name as lname,l.tier
+    c.execute("""SELECT t.name,t.formation,l.id as lid,l.name as lname,l.tier
                  FROM teams t JOIN leagues l ON t.league_id=l.id
                  WHERE t.id=?""", (team_id,))
     row = c.fetchone()
@@ -5283,6 +5405,28 @@ def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None
     rel_init += OFFER_INTEREST.get(interest, {}).get("rel_bonus", 0)
     rel_init = max(0, min(100, rel_init))
 
+    # 새 팀 포메이션 기반으로 field_pos 즉시 결정 → career_entries에 올바른 포지션 저장
+    try:
+        from constants import POSITION_COMPAT, FORMATION_SLOTS
+        _formation = row.get("formation", "4-4-2") or "4-4-2"
+        _slots = FORMATION_SLOTS.get(_formation, FORMATION_SLOTS["4-4-2"])
+        _primary = p.get("position", "CM") if p else "CM"
+        _compat = POSITION_COMPAT.get(_primary, [_primary])
+        _best_pos, _best_rank = _primary, 0
+        _best_found = 999
+        for _slot in _slots:
+            if _slot in _compat:
+                _rank = _compat.index(_slot)
+                if _rank < _best_found:
+                    _best_found = _rank
+                    _best_pos = _slot
+                    _best_rank = _rank
+        _field_pos = _best_pos
+        _mismatch_rank = _best_rank
+    except Exception:
+        _field_pos = p.get("position", "CM") if p else "CM"
+        _mismatch_rank = 0
+
     update_player(current_team_id=team_id, current_league_id=row["lid"],
                   salary=salary, manager_relation=rel_init,
                   contract_years=c_yrs, contract_end_year=c_end,
@@ -5290,7 +5434,8 @@ def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None
                   contract_role=role, club_ambition=ambition,
                   manager_type=mgr_type,
                   appearance_bonus_k=app_bonus, goal_bonus_k=goal_bonus,
-                  transfer_requested=0)
+                  transfer_requested=0,
+                  field_pos=_field_pos, mismatch_rank=_mismatch_rank)
     icon = {"입단":"⭐","오퍼":"✈","방출":"😡"}.get(transfer_type,"⭐")
     add_log(f"{icon} {row['name']} {transfer_type}!  {row['lname']}({row['tier']}부)"
             f"  |  {c_yrs}년 계약  |  월 {fmt_money(salary//12)}", "event")

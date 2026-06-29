@@ -417,7 +417,7 @@ class NewPlayerDialog(QDialog):
 
         # 포지션
         pos_row = QHBoxLayout()
-        pos_row.addWidget(QLabel("포지션"))
+        pos_row.addWidget(QLabel("주요 포지션"))
         self.pos_combo = QComboBox()
         self.pos_combo.addItems(POSITIONS)
         self.pos_combo.currentTextChanged.connect(self._update_roles)

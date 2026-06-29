@@ -259,6 +259,8 @@ def init_db():
     # 마이그레이션: 컬럼 추가
     for migration in [
         "ALTER TABLE career_entries ADD COLUMN position TEXT DEFAULT ''",
+        "ALTER TABLE my_player ADD COLUMN field_pos TEXT DEFAULT ''",   # 배치 포지션
+        "ALTER TABLE my_player ADD COLUMN mismatch_rank INTEGER DEFAULT 0", # 포지션 불일치 단계
         "ALTER TABLE career_entries ADD COLUMN saves INTEGER DEFAULT 0",
         "ALTER TABLE career_entries ADD COLUMN goals_against INTEGER DEFAULT 0",
         "ALTER TABLE my_player ADD COLUMN season_goals_against INTEGER DEFAULT 0",
@@ -819,14 +821,20 @@ KEY_STATS_BY_POS = {
 #   spread : 에이스 대비 11번째(벤치) 하락폭. 상위 등급일수록 층이 얇음(다 잘함).
 #   상위 리그는 선수층이 고르고(작은 spread), 하위 리그는 편차가 큼.
 TEAM_ROLE_PROFILE = {
-    "SS": {"ace_lo": 0.95, "spread": 0.08},   # EPL: 에이스가 리그 절대 정점, 선수층 최고
-    "S":  {"ace_lo": 0.93, "spread": 0.10},
-    "A":  {"ace_lo": 0.90, "spread": 0.13},
-    "B":  {"ace_lo": 0.88, "spread": 0.16},
-    "C":  {"ace_lo": 0.86, "spread": 0.19},
-    "D":  {"ace_lo": 0.84, "spread": 0.22},
-    "E":  {"ace_lo": 0.82, "spread": 0.24},
-    "F":  {"ace_lo": 0.80, "spread": 0.26},
+    # ace_lo: 최약팀 에이스 = tier_top * ace_lo (강팀은 *1.0까지)
+    # spread: 에이스 대비 11번째 선수(벤치) 하락폭.
+    # ── 6대 리그 기준 목표 ──
+    # SS(EPL):  리그avg 93, 탑팀avg 96.5, 최약팀avg 89.7, 최약벤치 86.5
+    # S(빅4):   리그avg 90, 탑팀avg 93.6, 최약팀avg 87.1, 최약벤치 83.9
+    # A(에레디): 리그avg 85.7, 탑팀avg 88.8, 최약팀avg 82.6, 최약벤치 78.7
+    "SS": {"ace_lo": 0.93, "spread": 0.07},
+    "S":  {"ace_lo": 0.93, "spread": 0.07},
+    "A":  {"ace_lo": 0.93, "spread": 0.09},
+    "B":  {"ace_lo": 0.91, "spread": 0.11},
+    "C":  {"ace_lo": 0.89, "spread": 0.13},
+    "D":  {"ace_lo": 0.87, "spread": 0.16},
+    "E":  {"ace_lo": 0.85, "spread": 0.18},
+    "F":  {"ace_lo": 0.83, "spread": 0.20},
 }
 
 
