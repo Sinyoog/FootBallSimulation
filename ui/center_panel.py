@@ -835,12 +835,12 @@ class CenterPanel(QWidget):
         #   띄워야 사용자가 1~4주 훈련을 선택하기 전에 대표팀을 정한다.
         import intl_engine
         forced = intl_engine.get_forced_commit()
+        forced = intl_engine.get_forced_commit()
         if forced:
-            self._show_forced_commit(forced)
+            # [타이밍] 1주차 화면 먼저 갱신 후 팝업 표시
             if self.main_win:
                 self.main_win.refresh_all()
-            return   # 강제확정 후 이번 진행은 여기서 종료 (다시 진행 버튼을 누르면 일정 진행)
-
+            self._show_forced_commit(forced)
         # [복수국적] 두 나라 다 본선 진출 → 대표팀 선택 팝업 (선택 전까지 차출 보류)
         pend = intl_engine.get_pending_choice()
         if pend:
@@ -1210,10 +1210,13 @@ class CenterPanel(QWidget):
         self._join_used = True
         self.btn_join.setEnabled(False)
         offers = generate_offers()
-        is_first = (p.get("total_matches", 0) == 0)
         from ui.offer_window import OfferWindow
+        # 이 창은 소속 팀이 없을 때만 뜨므로(위에서 이미 체크) 첫 입단이든
+        # 퇴출/계약종료 후 재입단이든 항상 강제 입단 모드로 띄운다.
+        # force_select=False면 닫기로 그냥 빠져나갈 수 있는데, 그러면 입단할
+        # 곳이 없는 채로 진행이 막히거나 강제 은퇴로 이어질 수 있다.
         dlg = OfferWindow(offers, p.get("language","ko"), self,
-                          title="🏟 팀 입단", force_select=is_first)
+                          title="🏟 팀 입단", force_select=True)
         self._offer_dlg = dlg
         # 모달로 띄워 다이얼로그가 열려 있는 동안 진행(next day)을 차단.
         # 비모달(show)이면 오퍼창을 띄운 채 시간을 더 진행시킨 뒤 수락할 수 있어

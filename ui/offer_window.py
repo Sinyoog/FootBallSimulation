@@ -158,14 +158,17 @@ class OfferWindow(QDialog):
         h3 = QHBoxLayout()
         failed   = idx in self.neg_failed
         neg_left = self.neg_used.get(idx, 0)
+        is_safe  = bool(offer.get("safe")) and self._force
 
-        join_btn = QPushButton("✅ 입단" if self.lang=="ko" else "✅ Join")
+        join_btn = QPushButton(("✅ 입단" if self.lang=="ko" else "✅ Join")
+                                + (" (보장)" if is_safe and self.lang=="ko" else
+                                   " (Guaranteed)" if is_safe else ""))
         join_btn.setObjectName("selectBtn")
-        join_btn.setEnabled(not failed)   # 결렬 시 입단도 비활성
+        join_btn.setEnabled(is_safe or not failed)   # 안전망 오퍼는 결렬돼도 입단 가능
         join_btn.clicked.connect(lambda _, i=idx: self._select(i))
 
         if failed:
-            neg_btn = QPushButton("❌ 협상 결렬")
+            neg_btn = QPushButton("❌ 협상 결렬 (연봉 유지)" if is_safe else "❌ 협상 결렬")
             neg_btn.setObjectName("negBtn"); neg_btn.setEnabled(False)
         else:
             neg_btn = QPushButton(f"💬 협상 ({neg_left}회)")

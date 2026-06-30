@@ -138,10 +138,14 @@ class MatchDetailDialog(QDialog):
                 e.setStyleSheet("color:#555;font-size:11px;")
                 iv.addWidget(e)
             for m, t in items:
-                color = "#ffcc00" if ("⚽" in t or "🅰" in t or "🎩" in t or
-                                       "🔥" in t or "🧤" in t or "🧱" in t) else "#cccccc"
-                if "😞" in t or "🟥" in t or "🥅" in t:
+                if any(x in t for x in ("⚽","🅰","🎩","🔥","🧤","🧱","🏆","🎯")):
+                    color = "#ffcc00"
+                elif any(x in t for x in ("🛡","🔑","🌪","↗","💪")):
+                    color = "#44ccff"   # 수비/창조 활약 — 하늘색
+                elif any(x in t for x in ("😞","🟥","🥅","⚠","😤")):
                     color = "#ff6666"
+                else:
+                    color = "#cccccc"
                 row = QLabel(f"  {_fmt_min(m)}'  {t}")
                 row.setStyleSheet(f"color:{color};font-size:12px;")
                 row.setWordWrap(True)
@@ -161,13 +165,68 @@ class MatchDetailDialog(QDialog):
         sv.addWidget(st_hdr)
         pa = detail.get("pass_acc", 0.0)
         pa_str = f"{pa*100:.0f}%" if pa else "-"
+        shots     = detail.get("shots", 0)
+        shots_on  = detail.get("shots_on", 0)
+        key_passes= detail.get("key_passes", 0)
+        dribbles  = detail.get("dribbles", 0)
+        blocks    = detail.get("blocks", 0)
+        saves_det = data.get("saves", 0)
+
+        from constants import position_group
+        pos_grp = position_group(pos)
+
         if pos == "GK":
+            # GK: 선방수 + 선방률 + 패스%
+            tot_shots = saves_det + (data.get("away_score",0) if data.get("is_home") else data.get("home_score",0))
+            sr_str = f"{saves_det}/{tot_shots} ({saves_det*100//tot_shots if tot_shots else 0}%)" if tot_shots else f"{saves_det}"
+            sv.addWidget(_row("선방 (유효슈팅)", sr_str, "#44ccff"))
             sv.addWidget(_row("패스 성공률", pa_str))
-        else:
-            sv.addWidget(_row("슈팅 (유효)", f"{detail.get('shots',0)} ({detail.get('shots_on',0)})"))
-            sv.addWidget(_row("기회 창출(키패스)", detail.get("key_passes", 0)))
-            sv.addWidget(_row("드리블 성공", detail.get("dribbles", 0)))
-            sv.addWidget(_row("차단(태클·인터셉트)", detail.get("blocks", 0)))
+
+        elif pos in ("CB",):
+            # CB: 차단 우선, 헤딩 클리어 개념, 패스%
+            sv.addWidget(_row("차단 (태클·인터셉트)", str(blocks), "#44ff88" if blocks >= 3 else "#fff"))
+            sv.addWidget(_row("패스 성공률", pa_str))
+            sv.addWidget(_row("슈팅", str(shots)))
+
+        elif pos in ("CDM",):
+            # CDM: 차단 + 키패스(전방연결) + 패스%
+            sv.addWidget(_row("차단 (태클·인터셉트)", str(blocks), "#44ff88" if blocks >= 3 else "#fff"))
+            sv.addWidget(_row("기회 창출 (키패스)", str(key_passes)))
+            sv.addWidget(_row("패스 성공률", pa_str))
+
+        elif pos in ("LB", "RB"):
+            # LB/RB: 어시 창출(키패스) + 차단 + 패스%
+            sv.addWidget(_row("기회 창출 (키패스)", str(key_passes), "#44ccff" if key_passes >= 2 else "#fff"))
+            sv.addWidget(_row("차단 (태클·인터셉트)", str(blocks)))
+            sv.addWidget(_row("드리블 성공", str(dribbles)))
+            sv.addWidget(_row("패스 성공률", pa_str))
+
+        elif pos in ("CM",):
+            # CM: 키패스 + 차단 + 드리블 + 패스%
+            sv.addWidget(_row("기회 창출 (키패스)", str(key_passes)))
+            sv.addWidget(_row("차단 (태클·인터셉트)", str(blocks)))
+            sv.addWidget(_row("드리블 성공", str(dribbles)))
+            sv.addWidget(_row("패스 성공률", pa_str))
+
+        elif pos == "CAM":
+            # CAM: 키패스 우선, 드리블, 슈팅, 패스%
+            sv.addWidget(_row("기회 창출 (키패스)", str(key_passes), "#44ccff" if key_passes >= 3 else "#fff"))
+            sv.addWidget(_row("드리블 성공", str(dribbles)))
+            sv.addWidget(_row("슈팅 (유효)", f"{shots} ({shots_on})"))
+            sv.addWidget(_row("패스 성공률", pa_str))
+
+        elif pos in ("LW", "RW"):
+            # LW/RW: 드리블 + 키패스 + 슈팅 + 패스%
+            sv.addWidget(_row("드리블 성공", str(dribbles), "#44ccff" if dribbles >= 4 else "#fff"))
+            sv.addWidget(_row("기회 창출 (키패스)", str(key_passes)))
+            sv.addWidget(_row("슈팅 (유효)", f"{shots} ({shots_on})"))
+            sv.addWidget(_row("패스 성공률", pa_str))
+
+        else:  # ST/CF 및 기타
+            # ST/CF: 슈팅 우선, 키패스, 드리블
+            sv.addWidget(_row("슈팅 (유효)", f"{shots} ({shots_on})", "#ffcc44" if shots >= 4 else "#fff"))
+            sv.addWidget(_row("기회 창출 (키패스)", str(key_passes)))
+            sv.addWidget(_row("드리블 성공", str(dribbles)))
             sv.addWidget(_row("패스 성공률", pa_str))
         root.addWidget(stat_box)
 

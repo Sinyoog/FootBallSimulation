@@ -396,21 +396,23 @@ def _build_tournament(year, continent, entries, my_tid):
     # ── 포트 추첨: 전력순 4포트 → 조마다 포트별 1팀 ──
     groups = {g: [] for g in _GROUP_LABELS[:n_groups]}
     pot_size = n // 4
+    entry_rows = []
     for pot in range(4):
         pool = entries[pot * pot_size:(pot + 1) * pot_size]
         random.shuffle(pool)
         for gi, e in enumerate(pool):
             g = _GROUP_LABELS[gi]
             groups[g].append(e)
-            c.execute("""INSERT INTO cl_entries
+            entry_rows.append((tid, e["team_id"], e["team_name"], e["flag"],
+                       e["country"], e["grade"], e["ovr"], g))
+    c.executemany("""INSERT INTO cl_entries
                          (tournament_id, team_id, team_name, flag, country,
                           grade, ovr, grp, alive)
-                         VALUES(?,?,?,?,?,?,?,?,1)""",
-                      (tid, e["team_id"], e["team_name"], e["flag"],
-                       e["country"], e["grade"], e["ovr"], g))
+                         VALUES(?,?,?,?,?,?,?,?,1)""", entry_rows)
 
     # ── 조별리그 일정 (42,43,44주 = 3경기) ──
     w0 = CL_GROUP_WEEKS[0]
+    match_rows = []
     for rd, pairs in enumerate(_GROUP_ROUNDS):
         wk = w0 + rd
         for g, members in groups.items():
@@ -419,13 +421,13 @@ def _build_tournament(year, continent, entries, my_tid):
                     continue
                 home, away = members[hi], members[ai]
                 is_my = 1 if my_tid in (home["team_id"], away["team_id"]) else 0
-                c.execute("""INSERT INTO cl_matches
+                match_rows.append((tid, "group", g, wk,
+                           home["team_id"], away["team_id"], is_my))
+    c.executemany("""INSERT INTO cl_matches
                              (tournament_id, stage, grp, week,
                               home_team_id, away_team_id,
                               home_score, away_score, is_my, slot)
-                             VALUES(?,?,?,?,?,?,-1,-1,?,0)""",
-                          (tid, "group", g, wk,
-                           home["team_id"], away["team_id"], is_my))
+                             VALUES(?,?,?,?,?,?,-1,-1,?,0)""", match_rows)
     c.execute("UPDATE cl_tournaments SET status='group', first_stage='group' WHERE id=?",
               (tid,))
     conn.commit()

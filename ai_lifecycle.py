@@ -247,11 +247,13 @@ def _transfer_market(c):
             result = _do_one_transfer_cached(tids, team_players, team_avg)
             if result:
                 # team_players 캐시도 즉시 반영 (같은 시즌 내 연속 이적 일관성)
-                for new_tid, pid in result:
+                for new_tid, pid, old_tid in result:
                     transfer_updates.append((new_tid, pid))
-                    # 캐시 업데이트: 이전 팀에서 제거, 새 팀에 추가
-                    for p_entry in list(team_players.get(new_tid ^ new_tid, [])):  # no-op placeholder
-                        pass
+                    # [bugfix] cache update: remove from old team, add to new team
+                    p_entry = next((e for e in team_players.get(old_tid, []) if e["id"] == pid), None)
+                    if p_entry:
+                        team_players[old_tid] = [e for e in team_players[old_tid] if e["id"] != pid]
+                        team_players.setdefault(new_tid, []).append(p_entry)
                 moved += 1
 
     if transfer_updates:
@@ -280,9 +282,10 @@ def _do_one_transfer_cached(tids, team_players, team_avg):
 
     if same_pos:
         swap = random.choice(same_pos)
-        return [(dst, mover["id"]), (src, swap["id"])]
+        # (new_tid, pid, old_tid)
+        return [(dst, mover["id"], src), (src, swap["id"], dst)]
     else:
-        return [(dst, mover["id"])]
+        return [(dst, mover["id"], src)]
 
 
 # _do_one_transfer는 하위호환용 별칭 (외부에서 직접 호출하는 경우 대비)

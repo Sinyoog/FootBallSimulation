@@ -151,10 +151,18 @@ def get_my_tournament(year=None, qual=None):
     for t in ts:
         if t.get("my_selected") == 3:
             return t
+    # [버그수정] my_selected=0(미선발)/2(탈락·미참가)인 대회는 표시용으로만 반환.
+    # 기존: kind='world'/'wc_qual'이면 my_selected 무관하게 반환
+    # → 예선 미선발(my_selected=0)인데도 월드컵 탭이 보이고 선택창이 다시 뜨는 버그.
+    # 수정: my_selected=2(탈락/미참가) 대회만 표시용으로 반환.
+    #       my_selected=0(미선발)은 반환하지 않음 — 출전 자격 자체가 없음.
     for t in ts:
-        if t.get("kind") in ("world", "wc_qual"):
+        if t.get("my_selected") == 2 and t.get("kind") in ("world", "wc_qual"):
             return t
-    return ts[0]
+    for t in ts:
+        if t.get("my_selected") == 2:
+            return t
+    return None
 
 
 def get_pending_choice():
@@ -408,6 +416,15 @@ def decline_national_team(tournament_id):
         conn.execute("UPDATE intl_tournaments SET my_nat='', my_selected=2 WHERE id=?",
                      (tournament_id,))
     conn.commit(); conn.close()
+
+    # [버그수정] 거절 시 qual_pledged_nat 초기화
+    # 예선 발탁 거절했는데 qual_pledged_nat가 남아있으면
+    # 다음 해 월드컵 본선에서 pledged 로직으로 자동 참가하는 버그가 있었음
+    try:
+        from game_engine import update_player as _upd_p
+        _upd_p(qual_pledged_nat="")
+    except Exception:
+        pass
 
     if year is not None:
         nat_str = "/".join(cand_all) if cand_all else "대표팀"
@@ -764,16 +781,35 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
     #        대륙컵은 예선이 없으므로 pledge가 있어도 대륙컵 발탁에 영향 없음.
     pledged = (p.get("qual_pledged_nat", "") or "") if is_wc else ""
     if committed:
-        # 고정 선수: 이 대회가 committed의 대륙이 아닐 수도 있다.
-        #   committed가 이 대회 후보군(cont_nats)에 없으면 이 대회는 내 무대가 아님.
+        # [bugfix] committed path: also check wc_qual result
+        #   If wc_qual existed last year, committed player who was
+        #   not selected (my_selected=0) or eliminated (my_selected=2)
+        #   must NOT participate in the main tournament.
         if committed not in cont_nats:
-            my_sel = 2   # 이 대회는 출전 대상 아님(타 대륙)
+            my_sel = 2
         elif committed in qualified_nats:
-            my_nat = committed
-            grade = nat_info.get(my_nat, {}).get("grade", "F")
-            my_sel = 1 if _check_selection(p, grade) else 0
+            _blocked_by_qual = False
+            if is_wc:
+                try:
+                    _bqc = get_conn()
+                    _bqr = _bqc.execute(
+                        """SELECT my_selected FROM intl_tournaments
+                           WHERE year=? AND kind='wc_qual' AND my_nat=?
+                           LIMIT 1""",
+                        (year - 1, committed)).fetchone()
+                    _bqc.close()
+                    if _bqr is not None:
+                        _blocked_by_qual = (_bqr["my_selected"] != 1)
+                except Exception:
+                    pass
+            if _blocked_by_qual:
+                my_sel = 2
+            else:
+                my_nat = committed
+                grade = nat_info.get(my_nat, {}).get("grade", "F")
+                my_sel = 1 if _check_selection(p, grade) else 0
         else:
-            my_sel = 2   # 고정된 나라가 본선 진출 못함 → 이번엔 출전 없음
+            my_sel = 2
     elif pledged and pledged in cont_nats:
         # [월드컵 예선 연계] 예선에서 pledge한 나라가 이 월드컵 후보군에 있음.
         #   본선 해엔 선택창을 띄우지 않고 그 나라로 자동 출전한다.
@@ -845,16 +881,17 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
     entries.sort(key=lambda e: e["ovr"], reverse=True)
     pot_size = len(entries) // 4
     groups = {g: [] for g in _GROUP_LABELS[:n_groups]}
+    entry_rows = []
     for pot in range(4):
         pool = entries[pot * pot_size:(pot + 1) * pot_size]
         random.shuffle(pool)
         for gi, e in enumerate(pool):
             g = _GROUP_LABELS[gi]
             groups[g].append(e)
-            c.execute("""INSERT INTO intl_entries
+            entry_rows.append((tid, e["name"], e["flag"], e["grade"], e["ovr"], g, pot + 1))
+    c.executemany("""INSERT INTO intl_entries
                          (tournament_id, country, flag, grade, ovr, grp, pot, alive)
-                         VALUES(?,?,?,?,?,?,?,1)""",
-                      (tid, e["name"], e["flag"], e["grade"], e["ovr"], g, pot + 1))
+                         VALUES(?,?,?,?,?,?,?,1)""", entry_rows)
 
     # 조별리그 일정 (18~20주)
     w0 = INTL_GROUP_WEEKS[0]
@@ -865,17 +902,18 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
     else:
         # my_sel==2: 출전 없음 → 내 경기 없음 (기존엔 cont_nats 전체가 들어가던 버그)
         _my_match_nats = set()
+    match_rows = []
     for rd, pairs in enumerate(_GROUP_ROUNDS):
         wk = w0 + rd
         for g, members in groups.items():
             for hi, ai in pairs:
                 home, away = members[hi], members[ai]
                 is_my = 1 if (home["name"] in _my_match_nats or away["name"] in _my_match_nats) else 0
-                c.execute("""INSERT INTO intl_matches
+                match_rows.append((tid, "group", g, wk, home["name"], away["name"], is_my))
+    c.executemany("""INSERT INTO intl_matches
                              (tournament_id, stage, grp, week, home, away,
                               home_score, away_score, is_my, slot)
-                             VALUES(?,?,?,?,?,?,-1,-1,?,0)""",
-                          (tid, "group", g, wk, home["name"], away["name"], is_my))
+                             VALUES(?,?,?,?,?,?,-1,-1,?,0)""", match_rows)
     conn.commit()
     conn.close()
 
@@ -1249,6 +1287,7 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
 
     # entries 저장
     my_grp = None
+    entry_rows = []
     for g, members in groups.items():
         for e in members:
             is_my = 0
@@ -1256,11 +1295,11 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
                 is_my = 1; my_grp = g
             elif my_sel == 3 and any(e["name"] == n for n in cand_nats_final):
                 is_my = 1; my_grp = g
-            c.execute("""INSERT INTO intl_entries
-                         (tournament_id, country, flag, grade, ovr, grp, is_my, continent)
-                         VALUES(?,?,?,?,?,?,?,?)""",
-                      (tid, e["name"], e.get("flag",""), e.get("grade","F"),
+            entry_rows.append((tid, e["name"], e.get("flag",""), e.get("grade","F"),
                        round(e["ovr"], 1), g, is_my, e.get("continent","")))
+    c.executemany("""INSERT INTO intl_entries
+                         (tournament_id, country, flag, grade, ovr, grp, is_my, continent)
+                         VALUES(?,?,?,?,?,?,?,?)""", entry_rows)
 
     # 홈앤어웨이 6라운드 일정 생성 (19~24주차)
     # 라운드로빈 알고리즘: 1팀 고정 + 나머지 회전 → 정방향 3R + 역방향 3R
@@ -1283,6 +1322,7 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
             t = [t[0]] + [t[-1]] + t[1:-1]
         return rounds
 
+    match_rows = []
     for g, members in groups.items():
         names = [e["name"] for e in members]
         fwd_rounds = _round_robin_schedule(names)
@@ -1299,11 +1339,11 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
                     (my_nat and (home_nat == my_nat or away_nat == my_nat)) or
                     (my_sel == 3 and (home_nat in cand_set or away_nat in cand_set))
                 )
-                c.execute("""INSERT INTO intl_matches
-                             (tournament_id, week, stage, grp, home, away, is_my, my_played)
-                             VALUES(?,?,?,?,?,?,?,?)""",
-                          (tid, wk, "qual_group", g, home_nat, away_nat,
+                match_rows.append((tid, wk, "qual_group", g, home_nat, away_nat,
                            1 if is_my_match else 0, 0))
+    c.executemany("""INSERT INTO intl_matches
+                             (tournament_id, week, stage, grp, home, away, is_my, my_played)
+                             VALUES(?,?,?,?,?,?,?,?)""", match_rows)
 
     conn.commit(); conn.close()
 
@@ -1928,6 +1968,15 @@ def _save_qual_results(t, continent, qualified_list, set_done=True):
         add_log(f"{icon} {t['name']} 결과: {my_nat} {result}", "event")
         if passed:
             add_log(f"   → {target_year}년 월드컵 본선 진출!", "event")
+        else:
+            # [버그수정] 예선 탈락 시 pledge 초기화
+            # qual_pledged_nat가 살아있으면 다음 해 본선 _create_one_tournament에서
+            # pledged 경로로 진입해 오동작할 수 있음
+            try:
+                from game_engine import update_player as _upd_pledged
+                _upd_pledged(qual_pledged_nat="")
+            except Exception:
+                pass
     else:
         conn = get_conn()
         conn.execute("UPDATE intl_tournaments SET my_result=? WHERE id=?", ("예선 미참가", tid))

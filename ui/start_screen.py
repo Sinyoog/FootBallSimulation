@@ -323,7 +323,7 @@ class StartScreen(QWidget):
         title.setStyleSheet("color: #00cc44;")
         lay.addWidget(title)
 
-        sub = QLabel("1990년, 16살의 당신. 전설이 되어보세요.")
+        sub = QLabel("2000년, 16살의 당신. 전설이 되어보세요.")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sub.setStyleSheet("color: #888888; font-size: 13px;")
         lay.addWidget(sub)
