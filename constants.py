@@ -565,7 +565,7 @@ WC_QUAL_48 = {
         "wildcard": 0, "quota": 10,
     },
     "아프리카": {
-        "cutoff_bottom": 8,    # 56 - 8 = 48개국 → 12조×4팀 (32팀 체제 50개국 → 48개국)
+        "cutoff_bottom": 6,    # 54 - 6 = 48개국 → 12조×4팀 (32팀 체제 50개국 → 48개국)
         "n_groups": 12, "group_size": 4,
         "direct": 9,           # 조 1위 중 상위 9팀 직행 (12→9, 3팀 탈락)
         "po_teams": 0, "po_winners": 0,

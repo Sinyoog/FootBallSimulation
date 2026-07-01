@@ -430,6 +430,10 @@ def init_db():
         # [예선 entries] 내 국적 포함 여부 + 소속 대륙
         "ALTER TABLE intl_entries ADD COLUMN is_my INTEGER DEFAULT 0",
         "ALTER TABLE intl_entries ADD COLUMN continent TEXT DEFAULT ''",
+        # [오퍼 토글] 재직 중 자동 이적 오퍼 팝업을 끌 수 있는 스위치.
+        #  기본값 1(활성) → 기존 세이브도 지금까지와 동일하게 오퍼가 뜬다.
+        #  0이어도 '팀 입단'(무소속 강제 입단)과 '이적 요청' 중인 경우는 영향 없음.
+        "ALTER TABLE my_player ADD COLUMN offers_enabled INTEGER DEFAULT 1",
     ]:
         try: c.execute(migration)
         except: pass

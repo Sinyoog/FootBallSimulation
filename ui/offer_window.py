@@ -3,7 +3,7 @@ ui/offer_window.py  ─  이적 오퍼 선택 + 협상
 """
 import random
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+    QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QPushButton, QFrame, QScrollArea, QWidget
 )
 from PyQt6.QtCore import Qt, QTimer
@@ -34,12 +34,14 @@ QDialog { background:#1e1e1e; color:#ccc; }
 """
 
 class OfferWindow(QDialog):
-    def __init__(self, offers: list, lang="ko", parent=None, title="📋 이적 오퍼", force_select=False):
+    def __init__(self, offers: list, lang="ko", parent=None, title="📋 이적 오퍼",
+                 force_select=False, grid=False):
         super().__init__(parent)
         from PyQt6.QtCore import Qt
         self.setWindowModality(Qt.WindowModality.NonModal)
         self.setWindowTitle(title)
-        self.setMinimumSize(580, 500)
+        self.grid = grid
+        self.setMinimumSize(980, 600) if grid else self.setMinimumSize(580, 500)
         self.setStyleSheet(STYLE)
         self.lang       = lang
         self.title_text = title
@@ -72,8 +74,15 @@ class OfferWindow(QDialog):
         else:
             scroll = QScrollArea(); scroll.setWidgetResizable(True)
             scroll.setStyleSheet("QScrollArea{border:none;background:#1e1e1e;}")
-            inner  = QWidget(); self.cards_lay = QVBoxLayout(inner)
-            self.cards_lay.setSpacing(8)
+            inner  = QWidget()
+            if self.grid:
+                self.cards_lay = QGridLayout(inner)
+                self.cards_lay.setSpacing(8)
+                self.cards_lay.setColumnStretch(0, 1)
+                self.cards_lay.setColumnStretch(1, 1)
+            else:
+                self.cards_lay = QVBoxLayout(inner)
+                self.cards_lay.setSpacing(8)
             scroll.setWidget(inner)
             root.addWidget(scroll)
             self._render_cards()
@@ -92,9 +101,15 @@ class OfferWindow(QDialog):
         while self.cards_lay.count():
             item = self.cards_lay.takeAt(0)
             if item.widget(): item.widget().deleteLater()
-        for i, offer in enumerate(self.offers):
-            self.cards_lay.addWidget(self._make_card(i, offer))
-        self.cards_lay.addStretch()
+        if self.grid:
+            for i, offer in enumerate(self.offers):
+                row, col = divmod(i, 2)
+                self.cards_lay.addWidget(self._make_card(i, offer), row, col)
+            self.cards_lay.setRowStretch(self.cards_lay.rowCount(), 1)
+        else:
+            for i, offer in enumerate(self.offers):
+                self.cards_lay.addWidget(self._make_card(i, offer))
+            self.cards_lay.addStretch()
 
     def _make_card(self, idx, offer):
         card = QFrame(); card.setObjectName("offerCard")
@@ -106,7 +121,16 @@ class OfferWindow(QDialog):
         tl.setStyleSheet("font-size:14px;font-weight:bold;color:#e0e0e0;")
         gl  = QLabel(f"[{offer['grade']}급]"); gl.setObjectName(f"grade_{offer['grade']}")
         trl = QLabel(f"{offer['tier']}부");    trl.setObjectName(f"tier{offer['tier']}")
-        h1.addWidget(tl); h1.addWidget(gl); h1.addWidget(trl); h1.addStretch()
+        h1.addWidget(tl); h1.addWidget(gl); h1.addWidget(trl)
+        _zone = offer.get("_zone")
+        _zone_txt = {"domestic": "🏠 자국", "prev_league": "🏟 직전리그",
+                     "hometown": "🌍 고향", "foreign": "✈ 해외"}.get(_zone)
+        if _zone_txt:
+            zl = QLabel(_zone_txt)
+            zl.setStyleSheet("color:#888; font-size:10px; background:#2a2a2a;"
+                             "border-radius:3px; padding:1px 5px;")
+            h1.addWidget(zl)
+        h1.addStretch()
         lay.addLayout(h1)
 
         # ── 행2: 국가 | 리그명 (분리) ────────────────────────

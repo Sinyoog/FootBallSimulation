@@ -4358,6 +4358,89 @@ def generate_offers(count=5) -> list:
     offers = []
     tried  = 0
 
+    # [팀입단 확장] 자국/고향/타국 국가풀에서 팀을 채우는 공용 헬퍼.
+    #   exclude_ids: 이미 뽑힌 team_id 집합(중복 방지, 호출부에서 관리).
+    def _fill_country_pool(country_id, want, exclude_ids, max_tier_cap=None):
+        pool = []
+        if not country_id or want <= 0:
+            return pool
+        _max_t = max_tier_cap or _country_max_tier(country_id)
+        _tiers = list(range(1, _max_t + 1))
+        _weights = tier_weights_by_ovr(ovr)[:_max_t]
+        _tr = 0
+        while len(pool) < want and _tr < 60:
+            _tr += 1
+            tier = _max_t if force_max_tier else random.choices(_tiers, _weights)[0]
+            c.execute("""SELECT t.id,t.name,l.id as lid,l.name as lname,l.tier,
+                                cn.name as country,cn.flag,cn.grade
+                         FROM teams t
+                         JOIN leagues l ON t.league_id=l.id
+                         JOIN countries cn ON l.country_id=cn.id
+                         WHERE cn.id=? AND l.tier=?
+                         ORDER BY RANDOM() LIMIT 1""", (country_id, tier))
+            row = c.fetchone()
+            if not row: continue
+            if row["id"] in exclude_ids or row["id"] == my_tid: continue
+            if not _team_fits_me(row): continue
+            salary = int(_calc_salary(get_league_grade(row["country"], row["grade"]), tier, ovr, row["country"]) * random.uniform(0.85, 1.15))
+            pool.append(_build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary))
+            exclude_ids.add(row["id"])
+        return pool
+
+    def _fill_foreign_pool(want, exclude_country_ids, exclude_ids):
+        pool = []
+        if want <= 0:
+            return pool
+        _f_tiers   = [1, 2, 3]
+        _f_weights = tier_weights_by_ovr(ovr)[:3]
+        _tr = 0
+        while len(pool) < want and _tr < 80:
+            _tr += 1
+            _grade_filter = random.choice(grades)
+            tier = 3 if force_max_tier else random.choices(_f_tiers, _f_weights)[0]
+            _excl = [cid for cid in exclude_country_ids if cid]
+            if _excl:
+                placeholders = ",".join("?" * len(_excl))
+                c.execute(f"""SELECT t.id,t.name,l.id as lid,l.name as lname,l.tier,
+                                    cn.name as country,cn.flag,cn.grade
+                             FROM teams t
+                             JOIN leagues l ON t.league_id=l.id
+                             JOIN countries cn ON l.country_id=cn.id
+                             WHERE cn.grade=? AND l.tier=? AND cn.id NOT IN ({placeholders})
+                             ORDER BY RANDOM() LIMIT 1""", tuple([_grade_filter, tier] + _excl))
+            else:
+                c.execute("""SELECT t.id,t.name,l.id as lid,l.name as lname,l.tier,
+                                    cn.name as country,cn.flag,cn.grade
+                             FROM teams t
+                             JOIN leagues l ON t.league_id=l.id
+                             JOIN countries cn ON l.country_id=cn.id
+                             WHERE cn.grade=? AND l.tier=?
+                             ORDER BY RANDOM() LIMIT 1""", (_grade_filter, tier))
+            row = c.fetchone()
+            if not row: continue
+            if row["id"] in exclude_ids or row["id"] == my_tid: continue
+            if not _team_fits_me(row): continue
+            salary = int(_calc_salary(get_league_grade(row["country"], row["grade"]), tier, ovr, row["country"]) * random.uniform(0.85, 1.15))
+            pool.append(_build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary))
+            exclude_ids.add(row["id"])
+        return pool
+
+    def _interleave(*groups):
+        """그룹들을 리스트로 받아 행(row) 우선으로 지그재그 배치.
+           예: _interleave([d1,d2,d3],[h1,h2,h3],[f1,f2,f3,f4])
+               -> [d1,h1,d2,h2,d3,h3,f1,f2,f3,f4]
+           (마지막 그룹은 남는 슬롯 전체를 그대로 뒤에 이어붙임 = 하단 풀행)"""
+        result = []
+        head_groups = groups[:-1]
+        tail_group  = groups[-1] if groups else []
+        max_len = max((len(g) for g in head_groups), default=0)
+        for i in range(max_len):
+            for g in head_groups:
+                if i < len(g):
+                    result.append(g[i])
+        result.extend(tail_group)
+        return result
+
     if first_join and my_country_id:
         # ── [자국 보장] 첫 입단은 자국 리그에서 최소 1~2개는 반드시 온다 ──
         #   현실 반영: 유스 출신은 우선 자국에서 데뷔 제안을 받는다.
@@ -4449,8 +4532,8 @@ def generate_offers(count=5) -> list:
             # 자국에 3부 리그 자체가 없으면 더는 강제하지 않음
 
         # 자국 팀 중 내 수준에 맞는 것만 우선
-        # domestic_count: 30% 확률로 4개(+해외 1개), 70% 확률로 5개 모두 자국
-        domestic_count = 4 if random.random() < 0.30 else 5
+        # [팀입단 확장] count(보통 10)의 절반은 자국, 절반은 타국으로 고정 분할.
+        domestic_count = count // 2
         _dom_tiers = list(range(1, my_max_tier + 1))
         _dom_weights = tier_weights_by_ovr(ovr)[:my_max_tier]
         while len(offers) < domestic_count and tried < 80:
@@ -4496,6 +4579,56 @@ def generate_offers(count=5) -> list:
                 if not _team_fits_me(row): continue
                 salary = int(_calc_salary(get_league_grade(row["country"], row["grade"]), tier, ovr, row["country"]) * random.uniform(0.85, 1.15))
                 offers.append(_build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary))
+
+        # [그리드 배치] 자국(좌열) / 타국(우열)이 매 행마다 번갈아 오도록 재정렬 + 구역 태그
+        _dom_group = offers[:domestic_count]
+        _for_group = offers[domestic_count:]
+        for o in _dom_group: o["_zone"] = "domestic"
+        for o in _for_group: o["_zone"] = "foreign"
+        offers = _interleave(_dom_group, _for_group, [])
+
+    elif not has_team:
+        # ── [팀입단 확장] 17세 이후 계약종료/방출 등으로 소속이 사라져
+        #    '오퍼'가 아닌 '팀 입단'으로 새 팀을 찾는 경우.
+        #    10개 = 좌측(직전 소속 리그 국가) 3 + 우측(고향=출생국적) 3 + 하단(타국) 4.
+        #    ※ 좌측은 대표국적(nationality)이 아니라 '직전까지 뛰던 리그의 국가'다.
+        #      예) 출생 모리타니, 바하마 1부에서 뛰다 계약종료 → 좌측=바하마, 우측=모리타니.
+        prev_country_id = None
+        row_prev = c.execute(
+            """SELECT team_id FROM career_entries
+               WHERE end_year>0 AND team_id>0
+               ORDER BY id DESC LIMIT 1"""
+        ).fetchone()
+        if row_prev and row_prev["team_id"]:
+            row_pc = c.execute(
+                """SELECT l.country_id FROM teams t
+                   JOIN leagues l ON t.league_id=l.id
+                   WHERE t.id=?""", (row_prev["team_id"],)
+            ).fetchone()
+            if row_pc:
+                prev_country_id = row_pc["country_id"]
+        if not prev_country_id:
+            # 직전 소속 팀 기록이 없으면(경력 자체가 없는 예외 케이스) 대표국적으로 대체
+            prev_country_id = my_country_id
+
+        _origin_nat = p.get("origin_nat") or nationality
+        origin_country_id = my_country_id
+        if _origin_nat and _origin_nat != nationality:
+            row_o = c.execute("SELECT id FROM countries WHERE name=?", (_origin_nat,)).fetchone()
+            if row_o:
+                origin_country_id = row_o["id"]
+
+        _seen_ids = {o["team_id"] for o in offers}
+        _dom_group  = _fill_country_pool(prev_country_id, 3, _seen_ids)
+        _home_group = _fill_country_pool(origin_country_id, 3, _seen_ids)
+        _exclude_countries = {cid for cid in (prev_country_id, origin_country_id) if cid}
+        _for_group  = _fill_foreign_pool(count - len(_dom_group) - len(_home_group),
+                                          _exclude_countries, _seen_ids)
+
+        for o in _dom_group:  o["_zone"] = "prev_league"
+        for o in _home_group: o["_zone"] = "hometown"
+        for o in _for_group:  o["_zone"] = "foreign"
+        offers = _interleave(_dom_group, _home_group, _for_group)
     else:
         # 일반 이적/입단 오퍼
         # ── 현재 소속 리그의 국가 팀 우선 1~2개 ──────────────────
@@ -4597,7 +4730,7 @@ def generate_offers(count=5) -> list:
     # [17세 첫 입단 안전망] 협상을 모두 실패해도 입단할 곳이 사라지지 않도록,
     #   생성된 오퍼 중 연봉(=등급·티어와 직결)이 가장 낮은 1곳은 항상 입단 가능하게 표시.
     #   협상 자체는 그대로 가능(성공 시 연봉 인상), 실패해도 '결렬'로 막히지 않을 뿐.
-    if first_join and offers:
+    if not has_team and offers:
         safe_offer = min(offers, key=lambda o: o["salary"])
         safe_offer["safe"] = True
 

@@ -225,8 +225,9 @@ class CenterPanel(QWidget):
         # 액션 버튼 행2
         row2 = QHBoxLayout()
         self.btn_agent  = QPushButton("👔 에이전트");  self.btn_agent.setObjectName("actBtn")
+        self.btn_offer_toggle = QPushButton("🔔 오퍼 ON"); self.btn_offer_toggle.setObjectName("actBtn")
         self.btn_retire = QPushButton("🚪 은퇴");     self.btn_retire.setObjectName("actBtn")
-        for b in [self.btn_agent, self.btn_retire]:
+        for b in [self.btn_agent, self.btn_offer_toggle, self.btn_retire]:
             row2.addWidget(b)
         row2.addStretch()
         self.lay.addLayout(row2)
@@ -241,6 +242,7 @@ class CenterPanel(QWidget):
         self.btn_standing.clicked.connect(self._do_standings)
         self.btn_schedule.clicked.connect(self._do_schedule)
         self.btn_agent.clicked.connect(self._do_agent)
+        self.btn_offer_toggle.clicked.connect(self._do_toggle_offers)
         self.btn_retire.clicked.connect(self._do_retire)
 
     # ── 갱신 ─────────────────────────────────────
@@ -498,6 +500,19 @@ class CenterPanel(QWidget):
         has_team = bool(p.get("current_team_id"))
         self.btn_standing.setEnabled(has_team)
         self.btn_schedule.setEnabled(has_team)
+
+        # [오퍼 토글] 시즌 구간과 무관하게 언제든 켜고 끌 수 있다.
+        #   OFF여도 '이적 요청' 중이면 오퍼는 계속 뜨므로 라벨로 안내한다.
+        offers_on = bool(p.get("offers_enabled", 1))
+        if offers_on:
+            self.btn_offer_toggle.setText("🔔 오퍼 ON")
+            self.btn_offer_toggle.setToolTip("클릭하면 자동 이적 오퍼 알림을 끕니다")
+        elif p.get("transfer_requested"):
+            self.btn_offer_toggle.setText("🔕 오퍼 OFF*")
+            self.btn_offer_toggle.setToolTip("이적 요청 중이라 오퍼는 계속 옵니다. 클릭하면 다시 켭니다")
+        else:
+            self.btn_offer_toggle.setText("🔕 오퍼 OFF")
+            self.btn_offer_toggle.setToolTip("클릭하면 자동 이적 오퍼 알림을 켭니다 (팀 입단에는 영향 없음)")
 
         # 모드 토글 버튼: 묶음 진행 중(_step_idx>0)엔 전환 불가 → 회색 비활성.
         # 전환 가능할 때(묶음 시작 전)는 파란색으로 강조.
@@ -778,7 +793,6 @@ class CenterPanel(QWidget):
         advance_4weeks(schedule)
         QApplication.restoreOverrideCursor()
         self.adv_btn.setEnabled(True)
-        QApplication.processEvents()  # 결과를 즉시 이벤트 루프에 반영
 
         # ── 묶음 진행 상태 갱신 ──
         if self._step_mode:
@@ -840,6 +854,7 @@ class CenterPanel(QWidget):
             # [타이밍] 1주차 화면 먼저 갱신 후 팝업 표시
             if self.main_win:
                 self.main_win.refresh_all()
+            QApplication.processEvents()
             self._show_forced_commit(forced)
         # [복수국적] 두 나라 다 본선 진출 → 대표팀 선택 팝업 (선택 전까지 차출 보류)
         pend = intl_engine.get_pending_choice()
@@ -1196,6 +1211,23 @@ class CenterPanel(QWidget):
         lay.addWidget(btn)
         dlg.exec()
 
+    def _do_toggle_offers(self):
+        """오퍼 알림 ON/OFF 토글. 팀 입단(무소속 강제 입단)에는 영향 없음."""
+        p = get_player()
+        if not p: return
+        from game_engine import update_player
+        cur = bool(p.get("offers_enabled", 1))
+        new_val = 0 if cur else 1
+        update_player(offers_enabled=new_val)
+        if new_val:
+            show_toast(self, "🔔 오퍼 알림을 켰습니다", "#006622", 1500)
+        else:
+            msg = "🔕 오퍼 알림을 껐습니다  (팀 입단은 계속 가능)"
+            if p.get("transfer_requested"):
+                msg = "🔕 오퍼 알림을 껐습니다  (단, 이적 요청 중이라 오퍼는 계속 옵니다)"
+            show_toast(self, msg, "#666666", 2000)
+        if self.main_win: self.main_win.refresh_all()
+
     def _do_join(self):
         """소속 없음일 때만 수동 팀 입단 (1~4주차)."""
         p = get_player()
@@ -1209,14 +1241,14 @@ class CenterPanel(QWidget):
             return
         self._join_used = True
         self.btn_join.setEnabled(False)
-        offers = generate_offers()
+        offers = generate_offers(count=10)
         from ui.offer_window import OfferWindow
         # 이 창은 소속 팀이 없을 때만 뜨므로(위에서 이미 체크) 첫 입단이든
         # 퇴출/계약종료 후 재입단이든 항상 강제 입단 모드로 띄운다.
         # force_select=False면 닫기로 그냥 빠져나갈 수 있는데, 그러면 입단할
         # 곳이 없는 채로 진행이 막히거나 강제 은퇴로 이어질 수 있다.
         dlg = OfferWindow(offers, p.get("language","ko"), self,
-                          title="🏟 팀 입단", force_select=True)
+                          title="🏟 팀 입단", force_select=True, grid=True)
         self._offer_dlg = dlg
         # 모달로 띄워 다이얼로그가 열려 있는 동안 진행(next day)을 차단.
         # 비모달(show)이면 오퍼창을 띄운 채 시간을 더 진행시킨 뒤 수락할 수 있어
@@ -1245,6 +1277,12 @@ class CenterPanel(QWidget):
         p = get_player()
         if not p or not p.get("current_team_id"): return
         if self._auto_offer_shown: return
+
+        # [오퍼 토글] 꺼져 있으면 자동 오퍼 팝업을 건너뛴다.
+        #   단, '이적 요청' 중이면 사용자가 명시적으로 이적을 원한다는 뜻이므로
+        #   토글과 무관하게 오퍼를 계속 보여준다.
+        if not p.get("offers_enabled", 1) and not p.get("transfer_requested"):
+            return
 
         prob = _offer_probability(p, week)
         import random
