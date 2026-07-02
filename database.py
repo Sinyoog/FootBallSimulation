@@ -434,9 +434,21 @@ def init_db():
         #  기본값 1(활성) → 기존 세이브도 지금까지와 동일하게 오퍼가 뜬다.
         #  0이어도 '팀 입단'(무소속 강제 입단)과 '이적 요청' 중인 경우는 영향 없음.
         "ALTER TABLE my_player ADD COLUMN offers_enabled INTEGER DEFAULT 1",
+        # [전성기 OVR] 커리어 통산 최고 OVR. game_engine.update_player()가 ovr을
+        #  갱신할 때마다 자동으로 함께 갱신된다(역대 최고치만 남도록 max 적용).
+        #  은퇴 화면 등에서 '최종 OVR'(노쇠로 하락한 값) 대신 전성기 기록을 보여주기 위함.
+        "ALTER TABLE my_player ADD COLUMN peak_ovr INTEGER DEFAULT 0",
     ]:
         try: c.execute(migration)
         except: pass
+
+    # [전성기 OVR 보정] 기존 세이브는 peak_ovr 컬럼이 방금 0으로 추가됐거나,
+    #  아직 한 번도 update_player(ovr=...)가 안 불려서 현재 ovr보다 낮을 수 있다.
+    #  현재 ovr을 하한으로 보정 (peak_ovr < ovr 인 경우만) — 매 시작마다 실행되지만
+    #  조건에 안 걸리면 UPDATE 0행이라 사실상 무비용.
+    try:
+        c.execute("UPDATE my_player SET peak_ovr = ovr WHERE peak_ovr < ovr")
+    except: pass
 
     # ─── 성능 인덱스 ───────────────────────────────────────────
     # 매 주차 진행 시 AI 경기 시뮬·순위 집계가 ai_players / match_results를
@@ -578,11 +590,39 @@ ALL_STATS = ["stamina","speed","jump","strength","shooting","passing","dribbling
 
 # 포지션별 가중치 합은 상수 → 1회만 계산해 재사용(calc_ovr 핫루프 분모 재계산 제거).
 _WEIGHT_SUMS = {pos: sum(w.values()) for pos, w in WEIGHTS.items()}
+# [최적화] w.items()를 튜플로 1회만 캐싱 → calc_ovr 핫루프(AI 5.9만명 시즌마다 호출)에서
+# 매번 제너레이터+dict.get() 이중 호출을 하던 것을 단순 for문 + 단일 get()으로 대체.
+# (동일 입력에 대해 완전히 동일한 결과를 반환함 — 순수 계산 방식만 최적화, 로직/수치 변경 없음)
+_WEIGHT_ITEMS = {pos: tuple(w.items()) for pos, w in WEIGHTS.items()}
+# ALL_STATS 이름→인덱스 맵 (리스트 기반 고속 경로용)
+STAT_IDX = {s: i for i, s in enumerate(ALL_STATS)}
+# [최적화] w를 (인덱스, 가중치) 튜플로도 캐싱 → calc_ovr_from_list에서 이름 조회 없이 처리.
+_WEIGHT_IDX_ITEMS = {pos: tuple((STAT_IDX[s], wt) for s, wt in w.items())
+                     for pos, w in WEIGHTS.items()}
 
 def calc_ovr(position, stats):
-    w = WEIGHTS.get(position, WEIGHTS["CM"])
+    items = _WEIGHT_ITEMS.get(position, _WEIGHT_ITEMS["CM"])
     wsum = _WEIGHT_SUMS.get(position, _WEIGHT_SUMS["CM"])
-    total = sum(stats.get(s,40)*w.get(s,5) for s in w) / wsum
+    g = stats.get
+    total = 0
+    for s, wt in items:
+        total += g(s, 40) * wt
+    total /= wsum
+    return min(100, max(1, int(round(total))))
+
+
+def calc_ovr_from_list(position, vals):
+    """calc_ovr과 완전히 동일한 공식/결과를, dict 대신 ALL_STATS 순서의
+    리스트(vals)를 직접 받아 계산한다 (dict 생성/조회 비용 제거).
+    vals는 반드시 ALL_STATS와 같은 순서·같은 길이여야 하며 값이 이미 채워져
+    있어야 한다(=원래 calc_ovr의 stats.get(s,40) 기본값이 필요 없는 경우 전용).
+    핫루프(ai_lifecycle의 5.9만 AI 선수 시즌 처리) 전용 내부 함수."""
+    items = _WEIGHT_IDX_ITEMS.get(position, _WEIGHT_IDX_ITEMS["CM"])
+    wsum = _WEIGHT_SUMS.get(position, _WEIGHT_SUMS["CM"])
+    total = 0
+    for idx, wt in items:
+        total += vals[idx] * wt
+    total /= wsum
     return min(100, max(1, int(round(total))))
 
 

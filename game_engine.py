@@ -111,8 +111,15 @@ def update_player(**kw):
         return
     conn = get_conn()
     c = conn.cursor()
-    sets = ",".join(f"{k}=?" for k in kw)
-    c.execute(f"UPDATE my_player SET {sets} WHERE id=1", list(kw.values()))
+    if "ovr" in kw and "peak_ovr" not in kw:
+        # [전성기 OVR] ovr이 바뀔 때마다 역대 최고치를 peak_ovr에 함께 기록.
+        #   read-before-write 없이 SQL의 max()로 원자적 처리(추가 왕복 없음).
+        sets = ",".join(f"{k}=?" for k in kw) + ", peak_ovr=MAX(COALESCE(peak_ovr,0), ?)"
+        vals = list(kw.values()) + [kw["ovr"]]
+    else:
+        sets = ",".join(f"{k}=?" for k in kw)
+        vals = list(kw.values())
+    c.execute(f"UPDATE my_player SET {sets} WHERE id=1", vals)
     conn.commit()
     conn.close()
 
@@ -517,6 +524,9 @@ def create_player(name: str, position: str, sub_role: str,
     #   디에고 코스타처럼 '출생국 ≠ 대표국'을 은퇴요약에서 구분하기 위함.
     conn.execute("UPDATE my_player SET origin_nat=?, origin_flag=? WHERE id=1",
                  (nationality, flag))
+
+    # [전성기 OVR] 시작 OVR로 초기화 (이후 update_player가 자동으로 최고치 갱신).
+    conn.execute("UPDATE my_player SET peak_ovr=? WHERE id=1", (ovr,))
 
     # [국적 연혁] 출생 시점 보유 국적을 birth 이벤트로 기록(시작국적 + 복수국적).
     #   첫 항목이 '시작국적'이 되도록 1차 국적을 맨 앞에 둔다.

@@ -227,7 +227,8 @@ class CenterPanel(QWidget):
         self.btn_agent  = QPushButton("👔 에이전트");  self.btn_agent.setObjectName("actBtn")
         self.btn_offer_toggle = QPushButton("🔔 오퍼 ON"); self.btn_offer_toggle.setObjectName("actBtn")
         self.btn_retire = QPushButton("🚪 은퇴");     self.btn_retire.setObjectName("actBtn")
-        for b in [self.btn_agent, self.btn_offer_toggle, self.btn_retire]:
+        self.btn_world  = QPushButton("🌍 세계 기록실"); self.btn_world.setObjectName("actBtn")
+        for b in [self.btn_agent, self.btn_offer_toggle, self.btn_retire, self.btn_world]:
             row2.addWidget(b)
         row2.addStretch()
         self.lay.addLayout(row2)
@@ -244,6 +245,7 @@ class CenterPanel(QWidget):
         self.btn_agent.clicked.connect(self._do_agent)
         self.btn_offer_toggle.clicked.connect(self._do_toggle_offers)
         self.btn_retire.clicked.connect(self._do_retire)
+        self.btn_world.clicked.connect(self._do_world_browser)
 
     # ── 갱신 ─────────────────────────────────────
 
@@ -1304,6 +1306,15 @@ class CenterPanel(QWidget):
         if dlg.chosen:
             join_team(dlg.chosen["team_id"], dlg.chosen["salary"], transfer_type="오퍼")
             if self.main_win: self.main_win.refresh_all()
+
+    def _do_world_browser(self):
+        from ui.world_browser_window import WorldBrowserWindow
+        self._world_win = WorldBrowserWindow(self)
+
+        def _clear_world(*_a):
+            self._world_win = None
+        self._world_win.finished.connect(_clear_world)
+        self._world_win.show()
 
     def _do_standings(self):
         p = get_player()

@@ -82,7 +82,12 @@ def _ensure_ai_ages(c):
 # ─────────────────────────────────────────────
 def _age_and_progress(c):
     """모든 AI 선수 나이 +1 후, 연령대별로 스탯 성장/노화 → ovr 재계산.
-    [최적화] 개별 UPDATE → executemany 배치 처리로 DB 왕복 횟수 대폭 감소."""
+    [최적화] 개별 UPDATE → executemany 배치 처리로 DB 왕복 횟수 대폭 감소.
+    [최적화] stats를 dict가 아닌 ALL_STATS 순서 리스트로 다뤄 5.9만 선수마다
+             dict 생성 1회 + dict→list 재조립 1회(총 2회)를 리스트 조작 1회로 축소.
+             calc_ovr_from_list로 dict 없이 바로 OVR 계산.
+             (선택되는 스탯·증감치·호출 순서는 원본과 완전히 동일 — 결과 불변, 자료구조만 변경)"""
+    from database import STAT_IDX, calc_ovr_from_list
     grew = aged = 0
     rows = c.execute(
         "SELECT id, position, age, " + _STAT_COLS + " FROM ai_players").fetchall()
@@ -91,10 +96,13 @@ def _age_and_progress(c):
     phys_list = ["stamina", "speed", "jump", "strength"]
 
     for r in rows:
-        pid = r["id"]
-        pos = r["position"]
-        new_age = (r["age"] or 20) + 1
-        stats = {s: (r[s] or 50) for s in ALL_STATS}
+        # [최적화] sqlite3.Row 이름 접근(r["stat"]) → 위치 접근(r[i])으로 교체.
+        #   SELECT 컬럼 순서가 (id, position, age, *ALL_STATS)로 고정돼 있으므로
+        #   r[3:]는 항상 ALL_STATS와 같은 순서의 값.
+        pid = r[0]
+        pos = r[1]
+        new_age = (r[2] or 20) + 1
+        vals = [v or 50 for v in r[3:]]   # ALL_STATS 순서 리스트 (dict 대신)
         keys = KEY_STATS_BY_POS.get(pos, ALL_STATS[:5])
 
         if new_age <= _AI_PEAK_START:
@@ -102,13 +110,15 @@ def _age_and_progress(c):
             n_up = random.randint(1, 3)
             for _ in range(n_up):
                 s = random.choice(keys if random.random() < 0.7 else ALL_STATS)
-                stats[s] = min(99, stats[s] + random.randint(1, 3))
+                i = STAT_IDX[s]
+                vals[i] = min(99, vals[i] + random.randint(1, 3))
             grew += 1
         elif new_age <= _AI_PEAK_END:
             # 피크: 거의 정체, 미세 변동
             if random.random() < 0.3:
                 s = random.choice(ALL_STATS)
-                stats[s] = min(99, max(15, stats[s] + random.choice([-1, 1, 1])))
+                i = STAT_IDX[s]
+                vals[i] = min(99, max(15, vals[i] + random.choice([-1, 1, 1])))
         else:
             # 노화기: 신체 스탯 위주로 하락
             decline_n = 2 + (new_age - _AI_PEAK_END) // 2
@@ -117,11 +127,12 @@ def _age_and_progress(c):
                     s = random.choice(phys_list)
                 else:
                     s = random.choice(ALL_STATS)
-                stats[s] = max(15, stats[s] - random.randint(1, 3))
+                i = STAT_IDX[s]
+                vals[i] = max(15, vals[i] - random.randint(1, 3))
             aged += 1
 
-        new_ovr = calc_ovr(pos, stats)
-        updates.append((new_age, *[stats[s] for s in ALL_STATS], new_ovr, pid))
+        new_ovr = calc_ovr_from_list(pos, vals)
+        updates.append((new_age, *vals, new_ovr, pid))
 
     # [최적화] 전체를 executemany 1회로 처리 (개별 UPDATE 26000회 → 1회 배치)
     set_clause = ", ".join(f"{s}=?" for s in ALL_STATS)
@@ -160,13 +171,14 @@ def _retire_and_replace(c, year):
     # 팀→국가 캐시 초기화 (오프시즌 시작 시 리셋)
     _team_country_cache.clear()
 
-    # 팀별 현재 선수 이름 선조회 → 팀 내 중복 방지용
-    # {team_id: set(name, ...)} — 같은 팀 안에서만 중복 방지, 다른 팀/리그는 무관
+    # [최적화] 이름 중복방지 캐시 + 은퇴 대상 목록을 별도 두 번 풀스캔하던 것을
+    #   컬럼을 합쳐 1회 SELECT로 통합 (5.9만 행 전체스캔 2회 → 1회).
     team_used_names: dict = {}
-    for r2 in c.execute("SELECT team_id, name FROM ai_players").fetchall():
-        team_used_names.setdefault(r2["team_id"], set()).add(r2["name"])
-
-    rows = c.execute("SELECT id, team_id, position, age FROM ai_players").fetchall()
+    rows = []
+    for r in c.execute(
+            "SELECT id, team_id, position, age, name FROM ai_players").fetchall():
+        team_used_names.setdefault(r["team_id"], set()).add(r["name"])
+        rows.append(r)
     replace_updates = []  # executemany용
 
     for r in rows:

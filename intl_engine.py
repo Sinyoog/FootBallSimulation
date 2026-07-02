@@ -694,25 +694,17 @@ def start_intl_tournament(year):
                                     committed=committed)
         return
 
-    # ── 대륙컵: 만들 대륙 목록 결정 ──
-    #   committed면 그 나라 대륙 1개. 미고정이면 보유 국적이 속한 대륙 전부.
-    #   (CONFEDERATIONS로 통합 대륙 정규화: 오세아니아→아시아, 북미↔남미 통합)
-    continents = []
-    for n in my_nats:
-        cont = nat_info.get(n, {}).get("continent")
-        if not cont:
-            continue
-        # 대표 대륙키(연맹 대표 대륙명)로 정규화해 같은 연맹을 1개로 합침.
-        rep = _conf_key(cont)
-        if rep not in continents:
-            continents.append(rep)
-
-    if not continents:
-        # 보유 국적이 전혀 없거나 대륙 정보 없음 → 주 국적 대륙(없으면 유럽) 폴백
-        fallback = nat_info.get(nat1, {}).get("continent", "유럽")
-        continents = [_conf_key(fallback)]
-
-    for cont in continents:
+    # ── 대륙컵: 4개 대륙 연맹 전부 생성 ──
+    #   [변경] 예전엔 '내 국적이 속한 대륙'만 만들었으나, 챔피언스리그처럼
+    #   4개 대륙 전부 항상 생성하도록 확장 — 다른 대륙 대회 결과도 역대기록에서
+    #   조회 가능해짐. _create_one_tournament 내부는 my_nats를 그 대륙 국적과
+    #   교집합해서 참가여부(my_sel)를 판정하므로, 내 국적이 없는 대륙은 그냥
+    #   'AI끼리 진행되는 배경 대회'가 되고 선택창 등 기존 동작에는 영향 없다.
+    #   [성능] _qualify_continental은 countries 테이블 등급 기반 통계 계산이라
+    #   club 리그 시뮬레이션처럼 무거운 의존성이 없음 — 4년에 1번, 대회 4개
+    #   추가되는 정도라 챔스(매년 4대륙 32팀)보다도 가벼움.
+    all_confs = ["유럽", "아메리카", "아시아", "아프리카"]
+    for cont in all_confs:
         _create_one_tournament(year, is_wc=False, my_continent=cont,
                                p=p, my_nats=my_nats, nat_info=nat_info,
                                committed=committed)

@@ -201,7 +201,7 @@ class RetireWindow(QDialog):
             ("시즌", f"{p.get('total_seasons',0)}"),
             ("총자산", fmt_money(p.get('total_assets',0))),
             ("누적수입", fmt_money(p.get('total_earnings',0))),  # 이슈10
-            ("최종OVR", str(p.get('ovr',0))),
+            ("전성기OVR", str(p.get('peak_ovr', p.get('ovr',0)))),
         ]
         for k, v in stats:
             sw = QFrame(); sl = QVBoxLayout(sw); sl.setContentsMargins(4,4,4,4)
@@ -704,7 +704,12 @@ class RetireWindow(QDialog):
         _origin_flag = p.get("origin_flag", "") or p.get("flag", "")
         lines.append(f"국적: {_nats}  |  🏠출생: {_origin_flag}{_origin_nat}  "
                      f"|  ⚽대표: {_rep}  |  포지션: {p['position']} ({p.get('sub_role','')})")
-        lines.append(f"성격: {p.get('personality','')}  |  특징: {p.get('physical_trait','무난함')}  |  은퇴 나이: {p['age']}세  |  최종 OVR: {p.get('ovr',0)}")
+        _peak_ovr = p.get('peak_ovr', p.get('ovr', 0))
+        _final_ovr = p.get('ovr', 0)
+        _ovr_line = f"전성기 OVR: {_peak_ovr}"
+        if _final_ovr and _final_ovr < _peak_ovr:
+            _ovr_line += f" (은퇴 시점 {_final_ovr})"
+        lines.append(f"성격: {p.get('personality','')}  |  특징: {p.get('physical_trait','무난함')}  |  은퇴 나이: {p['age']}세  |  {_ovr_line}")
         lines.append("")
 
         # ── [국적 연혁] 출생 → 귀화 → 대표선택 시간순 이력 ──────────
