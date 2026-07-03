@@ -33,6 +33,7 @@ def _invalidate_team_ovr_cache():
     _team_ovr_cache.clear()
     _league_ovr_cache.clear()
     _league_tier_cache.clear()
+    _team_formation_cache.clear()
     # 승강으로 팀이 다른 리그로 이동해도 팀명은 안 바뀌므로 _team_name_cache는 비우지 않음
 
     # 포메이션 위젯 선수 목록 캐시 무효화
@@ -968,6 +969,56 @@ def advance_4weeks(schedule: list):
         flush_log_buffer()
 
 
+# ── [개선] 홈 어드밴티지 변동폭 + 포메이션 스타일 보정 ──────────
+#   기존: 모든 경기에 예외 없이 고정 +3 → 팀/경기 상관없이 완전히 똑같은 값.
+#   개선: 매 경기 1.5~4.5 사이로 살짝 흔들리게(평균은 기존과 동일한 3.0 부근)
+#         해서 "어떤 날은 홈 응원이 유독 잘 먹힌다" 정도의 자연스러운 변동 부여.
+_team_formation_cache: dict = {}
+
+def _home_advantage():
+    return random.uniform(1.5, 4.5)
+
+
+def _team_formation(c, team_id):
+    """팀의 현재 포메이션 조회 (세션 캐시, PK 조회라 원래도 저렴하지만 캐시로 0비용화).
+    [주의] 내 팀 포메이션은 경기 중 formation_widget에서 바뀔 수 있으므로
+    _invalidate_team_ovr_cache()가 호출될 때 이 캐시도 함께 비운다."""
+    cached = _team_formation_cache.get(team_id)
+    if cached is not None:
+        return cached
+    c.execute("SELECT formation FROM teams WHERE id=?", (team_id,))
+    row = c.fetchone()
+    val = (row["formation"] if row else None) or "4-4-2"
+    _team_formation_cache[team_id] = val
+    return val
+
+
+def _formation_bias(c, team_id):
+    """포메이션 스타일에 따른 소폭 전력 보정치 (FORMATION_STYLE 참조, ±1.5 이내)."""
+    return FORMATION_STYLE.get(_team_formation(c, team_id), 0.0)
+
+
+def _match_win_probs(diff):
+    """[공용] 전력차(diff=home_ovr-away_ovr, 홈보정 포함)로 승/무/패 확률 산출.
+    _simulate_match(내 경기)의 개선판 공식과 통일:
+      - hw 상한 0.92 (구식 배경 AI 경기 공식은 0.80 캡 → 압도해도 못 이기는 비논리)
+      - dw는 전력차에 반비례 (구식 공식은 dw=0.25 고정 → 전력차 무관 항상 25% 무승부)"""
+    hw = max(0.06, min(0.92, 0.45 + diff * 0.012))
+    dw = max(0.06, 0.28 - abs(diff) * 0.006)
+    aw = max(0.02, 1.0 - hw - dw)
+    tot = hw + dw + aw
+    return hw / tot, dw / tot, aw / tot
+
+
+def _roll_outcome(diff):
+    """diff 기반 승/무/패 확률로 outcome 문자열을 뽑는다."""
+    hw, dw, aw = _match_win_probs(diff)
+    roll = random.random()
+    if roll < hw:         return "home"
+    elif roll < hw + dw:  return "draw"
+    else:                 return "away"
+
+
 def _sim_my_team_match_as_ai(week, p, season):
     """부상/결장 시 내 팀 경기를 AI끼리 시뮬레이션해서 팀 전적에 반영."""
     my_tid = p.get("current_team_id", 0)
@@ -983,16 +1034,12 @@ def _sim_my_team_match_as_ai(week, p, season):
     m = c.fetchone()
     if m:
         hid, aid = m["home_team_id"], m["away_team_id"]
-        ho = _team_avg_ovr(c, hid) + 3
-        ao = _team_avg_ovr(c, aid)
+        ho = _team_avg_ovr(c, hid) + _home_advantage() + _formation_bias(c, hid)
+        ao = _team_avg_ovr(c, aid) + _formation_bias(c, aid)
         diff = ho - ao
-        hw = max(0.10, min(0.80, 0.45 + diff * 0.01))
-        dw = 0.25
-        roll = random.random()
-        if roll < hw:        outcome = "home"
-        elif roll < hw+dw:   outcome = "draw"
-        else:                outcome = "away"
-        hs, as_ = _gen_score(outcome)
+        outcome = _roll_outcome(diff)
+        # [버그수정] diff를 _gen_score에 전달 — 이전엔 인자 누락으로 항상 박빙 취급됐음
+        hs, as_ = _gen_score(outcome, diff)
         _td = {}; _accum_team_rec(_td, hid, aid, outcome, hs, as_); _flush_team_rec(c, _td)
         c.execute("UPDATE match_results SET home_score=?,away_score=? WHERE id=?",
                   (hs, as_, m["id"]))
@@ -1014,16 +1061,12 @@ def _sim_my_unscheduled_match(week: int, p, season: int):
         (lid, season, week, tid, tid)).fetchone()
     if row:
         c = conn.cursor()
-        ho = _team_avg_ovr(c, row["home_team_id"]) + 3
-        ao = _team_avg_ovr(c, row["away_team_id"])
+        ho = _team_avg_ovr(c, row["home_team_id"]) + _home_advantage() + _formation_bias(c, row["home_team_id"])
+        ao = _team_avg_ovr(c, row["away_team_id"]) + _formation_bias(c, row["away_team_id"])
         diff = ho - ao
-        hw = max(0.10, min(0.80, 0.45 + diff * 0.01))
-        dw = 0.25
-        roll = random.random()
-        if roll < hw:         outcome = "home"
-        elif roll < hw + dw:  outcome = "draw"
-        else:                 outcome = "away"
-        hs, as_ = _gen_score(outcome)
+        outcome = _roll_outcome(diff)
+        # [버그수정] diff를 _gen_score에 전달
+        hs, as_ = _gen_score(outcome, diff)
         _td = {}; _accum_team_rec(_td, row["home_team_id"], row["away_team_id"], outcome, hs, as_); _flush_team_rec(c, _td)
         conn.execute("UPDATE match_results SET home_score=?,away_score=? WHERE id=?",
                      (hs, as_, row["id"]))
@@ -1055,16 +1098,12 @@ def _sim_all_ai_matches(week, my_league_id, season):
         is_my_match = (m["home_team_id"] == my_tid or m["away_team_id"] == my_tid)
         if is_my_match and not is_offseason:
             continue
-        ho = _team_avg_ovr(c, m["home_team_id"]) + 3
-        ao = _team_avg_ovr(c, m["away_team_id"])
+        ho = _team_avg_ovr(c, m["home_team_id"]) + _home_advantage() + _formation_bias(c, m["home_team_id"])
+        ao = _team_avg_ovr(c, m["away_team_id"]) + _formation_bias(c, m["away_team_id"])
         diff = ho - ao
-        hw = max(0.10, min(0.80, 0.45 + diff * 0.01))
-        dw = 0.25
-        roll = random.random()
-        if roll < hw:          outcome = "home"
-        elif roll < hw + dw:   outcome = "draw"
-        else:                  outcome = "away"
-        hs, as_ = _gen_score(outcome)
+        outcome = _roll_outcome(diff)
+        # [버그수정] diff를 _gen_score에 전달 — 전체 리그 경기의 90%+가 여길 거침
+        hs, as_ = _gen_score(outcome, diff)
         _accum_team_rec(team_deltas, m["home_team_id"], m["away_team_id"], outcome, hs, as_)
         batch_results.append((hs, as_, m["id"]))
 
@@ -1567,24 +1606,11 @@ def _simulate_match(p, week, info: dict):
         if is_home: home_ovr += bonus
         else:       away_ovr += bonus
 
-    home_ovr += 3
+    home_ovr += _home_advantage() + _formation_bias(c, home_id)
+    away_ovr += _formation_bias(c, away_id)
     diff = home_ovr - away_ovr
-    # 전력차 → 승/무/패 확률.
-    #   기존: hw 상한 0.80 + 무승부 0.25 고정 → 압도해도 20%는 못 이기는 비논리.
-    #   개선: 상한을 0.92로 올리고, 무승부를 전력차에 반비례시킨다.
-    #         전력차가 크면 비길 일이 거의 없고(압도), 박빙일수록 무승부가 흔하다.
-    hw = max(0.06, min(0.92, 0.45 + diff * 0.012))
-    # 무승부: 박빙(diff≈0)일 때 최대 ~0.28, 전력차 ±30이면 ~0.08로 급감.
-    dw = max(0.06, 0.28 - abs(diff) * 0.006)
-    aw = max(0.02, 1.0 - hw - dw)
-    # 정규화 (합이 1 넘지 않도록)
-    _tot = hw + dw + aw
-    hw, dw, aw = hw/_tot, dw/_tot, aw/_tot
-
-    roll = random.random()
-    if roll < hw:         outcome = "home"
-    elif roll < hw + dw:  outcome = "draw"
-    else:                 outcome = "away"
+    # 승/무/패 확률 산출은 _match_win_probs()로 통일 (배경 AI 경기와 동일 공식).
+    outcome = _roll_outcome(diff)
 
     hs, as_ = _gen_score(outcome, diff)
 
@@ -1882,30 +1908,31 @@ def _multigoal_banner(goals):
 
 
 def _min_sortkey(m):
-    """이벤트 분 정렬용 실수 키. 전반 추가시간(146~152)은 45.1~45.7로,
-       후반 추가시간(91~98)은 90.1~90.8로 매핑해 실제 경기 시간순 정렬."""
-    if 146 <= m <= 152:
-        return 45 + (m - 145) / 10.0
-    if 91 <= m <= 98:
-        return 90 + (m - 90) / 10.0
+    """이벤트 분 정렬용 실수 키. 전반 추가시간(146~155)은 45.1~45.10으로,
+       후반 추가시간(91~100)은 90.1~90.10으로 매핑해 실제 경기 시간순 정렬."""
+    if 146 <= m <= 155:
+        return 45 + (m - 145) / 100.0
+    if 91 <= m <= 100:
+        return 90 + (m - 90) / 100.0
     return float(m)
 
 
 def _fmt_min(m):
     """정렬용 분(정수)을 표시 문자열로. 추가시간은 45+n / 90+n 형식.
-       전반 추가시간은 146~152(=45+1~45+7)로 인코딩해 후반 정규시간과 겹치지 않게 한다.
-       후반 추가시간은 91~98(=90+1~90+8).
+       전반 추가시간은 146~155(=45+1~45+10)로 인코딩해 후반 정규시간과 겹치지 않게 한다.
+       후반 추가시간은 91~100(=90+1~90+10) — 최근 축구 트렌드(VAR 등)상 후반 추가시간이
+       10분까지도 흔히 나오므로 그만큼 지원한다.
        Godot 연동 시에도 이 표기 규칙을 그대로 쓸 수 있다."""
-    if 146 <= m <= 152:          # 전반 추가시간 (45+1 ~ 45+7)
+    if 146 <= m <= 155:          # 전반 추가시간 (45+1 ~ 45+10)
         return f"45+{m-145}"
-    if 91 <= m <= 98:            # 후반 추가시간 (90+1 ~ 90+8)
+    if 91 <= m <= 100:           # 후반 추가시간 (90+1 ~ 90+10)
         return f"90+{m-90}"
     return str(m)
 
 
 def _half_of(m):
-    """분(정수)이 전반인지 후반인지. 전반 추가시간(146~152)도 전반으로."""
-    if 146 <= m <= 152:
+    """분(정수)이 전반인지 후반인지. 전반 추가시간(146~155)도 전반으로."""
+    if 146 <= m <= 155:
         return "first"
     return "first" if m <= 45 else "second"
 
@@ -1913,15 +1940,16 @@ def _half_of(m):
 def _sample_minutes(n, lo, hi):
     """경기 이벤트 분(分)을 n개 뽑는다. 정렬용 정수 리스트(오름차순) 반환.
        정규시간(lo~hi) 위주이되, 낮은 확률로 추가시간이 섞인다.
-       - 전반 추가시간: 146~152 (=45+1~45+7), 짧은 쪽이 흔함
-       - 후반 추가시간: 91~98   (=90+1~90+8), 짧은 쪽이 흔함
-       정렬 시 146~152는 큰 값이라 맨 뒤로 가지만, _half_of 로 전반에 재배치된다."""
+       - 전반 추가시간: 146~155 (=45+1~45+10), 짧은 쪽이 흔함
+       - 후반 추가시간: 91~100  (=90+1~90+10), 짧은 쪽이 흔하지만 최근 트렌드상
+         9~10분까지도 드물게 나올 수 있게 폭을 넓혔다
+       정렬 시 146~155는 큰 값이라 맨 뒤로 가지만, _half_of 로 전반에 재배치된다."""
     if n <= 0:
         return []
     pool = list(range(lo, min(hi, 90) + 1))
-    # 추가시간: 짧을수록 자주(가중치). 전반은 후반보다 덜 나오게.
-    fh_stop = [146,146,146, 147,147, 148,148, 149, 150, 151, 152]   # 45+1~7
-    sh_stop = [91,91,91,91, 92,92,92, 93,93,93, 94,94, 95,95, 96, 97, 98]  # 90+1~8
+    # 추가시간: 짧을수록 자주(가중치). 전반은 후반보다 덜 나오게. 9~10분은 아주 드물게.
+    fh_stop = [146,146,146, 147,147, 148,148, 149, 150, 151, 152, 153, 154, 155]   # 45+1~10
+    sh_stop = [91,91,91,91, 92,92,92, 93,93,93, 94,94, 95,95, 96, 97, 98, 99, 100]  # 90+1~10
     out = set()
     attempts = 0
     while len(out) < n and attempts < n * 25:
@@ -1954,7 +1982,7 @@ def _describe_goal(goal_idx, total_goals, minute, my_final, opp_final, dom, excl
     is_last = (goal_idx == total_goals)
     tight = (0 <= margin <= 2)   # 박빙 여부
     real_min = _min_sortkey(minute)        # 실제 경기 시간(전/후반 추가시간 반영)
-    is_stoppage = (91 <= minute <= 98)     # 후반 추가시간만 해당
+    is_stoppage = (91 <= minute <= 100)    # 후반 추가시간만 해당
 
     def pick(key):
         pool = [x for x in GOAL_PHRASES[key] if x not in exclude] or GOAL_PHRASES[key]
@@ -2351,6 +2379,23 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None):
         detail["blocks"]     = blocks
         detail["pass_acc"]   = round(pass_acc, 3)
 
+        # ── 득점으로 이어지지 않은 슈팅 장면 ──────────────────
+        #   기존엔 detail["shots"]=8, detail["shots_on"]=3 처럼 스탯만 쌓이고
+        #   실제 미해결 슈팅 시도는 이벤트로 하나도 안 남아, 재생 화면에서는
+        #   골(또는 PK 실축) 말고는 아무 장면도 안 나왔다.
+        #   [수정] "슈팅 11"인데 장면은 1~2개만 나오는 건 스탯-영상 불일치라서
+        #   대표 몇 개만 뽑던 걸 없애고, 득점 안 된 슈팅 시도 수만큼 전부
+        #   장면화한다(shots - goals개).
+        #   (🚫 마커 → ui/match_sim_viewer.py의 _MISS_MARKERS가 인식해
+        #    '내 팀 공격 시도, 득점 실패' 장면으로 재생함)
+        if pos != "GK" and shots > goals:
+            _miss_n = shots - goals
+            for _mm in _sample_minutes(_miss_n, 3, 89):
+                if random.random() < 0.5:
+                    events.append((_mm, "🚫 슈팅이 골대를 살짝 빗나갔다"))
+                else:
+                    events.append((_mm, "🚫 상대 골키퍼 선방에 막혔다"))
+
         # ── 수비 라인 무실점 보너스 ──────────────────────────
         if pos in ("CB","LB","RB","CDM") and opp_score == 0:
             _def_dom = max(0.5, min(1.5, dom))
@@ -2359,7 +2404,7 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None):
         # ── 차단 활약 보너스 (CDM/CB 전용) ──────────────────
         if pos in ("CDM","CB") and blocks >= 3:
             base += 0.15 * min(2.0, blocks / 3.0)
-            if blocks >= 5: events.append("💪 압도적인 수비 활약!")
+            if blocks >= 5: events.append((_sample_minutes(1, 10, 85)[0], "💪 압도적인 수비 활약!"))
 
         # ── 포지션별 주요 활약 타임라인 이벤트 ────────────────
         # 골/어시 외 차단·키패스·드리블·선방 등을 분 타임스탬프와 함께 기록
@@ -2505,12 +2550,73 @@ def _update_pop(p, goals, assists, rating):
     update_player(popularity=_calc_pop(p, goals, assists, rating))
 
 
+def _derive_match_stats(is_home, hs, as_, goals, assists, saves, pos, detail):
+    """[경기 통계] 점유율/슈팅/코너/파울/패스성공률을 "논리적으로" 만든다.
+
+    설계 원칙 — 순서가 중요하다:
+      1. 최종 스코어(hs/as_)와 내 개인 기록(goals/assists/saves/detail)은
+         이미 확정된 값이다(_player_perf가 먼저 계산함).
+      2. 팀 통계는 그 확정된 값들을 "하한선/기준점" 삼아 역산한다. 그래서
+         절대 "내 슈팅 5개인데 팀 슈팅 3개" 같은 모순이 생기지 않는다.
+      3. random.random()을 전혀 쓰지 않는다 — 같은 스코어·같은 내 기록이면
+         항상 같은 통계가 나온다(완전히 결정론적).
+
+    점유율: 스코어 차이에 비례해 50%에서 벌어짐(최대 ±20%p, tanh로 완만하게).
+    슈팅: 골 수와 완만히 비례하는 베이스 + 내 개인 슈팅 기록을 하한선 보장.
+    유효슈팅: 최소한 그 팀이 넣은 골 수만큼은 보장(골은 유효슈팅에서만 나옴).
+    코너/파울: 슈팅·점유율에서 파생.
+    패스 성공률: 내 개인 pass_acc를 우리 팀 값의 기준점으로 삼음(포지션상
+      GK/CB처럼 안정적 패스 포지션이면 팀 평균과 가깝고, 그대로 사용).
+    """
+    my_score = hs if is_home else as_
+    opp_score = as_ if is_home else hs
+
+    diff = my_score - opp_score
+    my_poss = 50 + round(20 * math.tanh(diff / 2.5))
+    my_poss = max(30, min(70, my_poss))
+    opp_poss = 100 - my_poss
+
+    my_shots = max(detail.get("shots", 0), round(my_score * 3.2 + my_poss * 0.08))
+    my_shots_on = max(detail.get("shots_on", 0), my_score, round(my_shots * 0.35))
+    my_shots = max(my_shots, my_shots_on)
+
+    opp_shots = round(opp_score * 3.2 + opp_poss * 0.08)
+    opp_shots_on = max(opp_score, round(opp_shots * 0.35))
+    opp_shots = max(opp_shots, opp_shots_on)
+
+    my_corners = max(0, round(my_shots * 0.45 + my_poss * 0.02))
+    opp_corners = max(0, round(opp_shots * 0.45 + opp_poss * 0.02))
+
+    # 점유율이 낮은 쪽(수비에 더 시달리는 쪽)이 보통 파울이 더 잦다.
+    my_fouls = max(4, round(15 - my_poss * 0.08))
+    opp_fouls = max(4, round(15 - opp_poss * 0.08))
+
+    my_pass_acc = detail.get("pass_acc") or (0.66 + my_poss * 0.0026)
+    opp_pass_acc = 0.66 + opp_poss * 0.0026
+
+    home_stats, away_stats = (
+        {"poss": my_poss, "shots": my_shots, "shots_on": my_shots_on,
+         "corners": my_corners, "fouls": my_fouls, "pass_acc": round(my_pass_acc, 3)},
+        {"poss": opp_poss, "shots": opp_shots, "shots_on": opp_shots_on,
+         "corners": opp_corners, "fouls": opp_fouls, "pass_acc": round(opp_pass_acc, 3)},
+    ) if is_home else (
+        {"poss": opp_poss, "shots": opp_shots, "shots_on": opp_shots_on,
+         "corners": opp_corners, "fouls": opp_fouls, "pass_acc": round(opp_pass_acc, 3)},
+        {"poss": my_poss, "shots": my_shots, "shots_on": my_shots_on,
+         "corners": my_corners, "fouls": my_fouls, "pass_acc": round(my_pass_acc, 3)},
+    )
+    return {"home": home_stats, "away": away_stats}
+
+
 def _save_match_detail(p, week, comp_name, is_home, home_name, away_name,
                        hs, as_, result, goals, assists, saves, rating,
-                       events, played, benched, detail=None):
+                       events, played, benched, detail=None, pso=None):
     """경기 상세를 match_details 에 저장하고 detail_id 를 돌려준다.
        리그/챔스/국대 모두 이 헬퍼를 공유한다(팀명은 호출자가 직접 넘김).
-       events 정규화(분 배정·시간순)도 여기서 처리. 실패 시 None 반환."""
+       events 정규화(분 배정·시간순)도 여기서 처리. 실패 시 None 반환.
+
+       pso: 승부차기로 결정된 녹아웃 경기라면 {"won": bool, "score": "5-4"}
+       형태로 넘긴다. None이면 승부차기 없는 일반 경기."""
     timed = []
     if played:
         for ev in events:
@@ -2523,12 +2629,16 @@ def _save_match_detail(p, week, comp_name, is_home, home_name, away_name,
     verdict = _match_verdict(rating, result, goals, assists) if played else ""
     detail = detail or {}
     st = get_state() or {}
+    team_stats = (_derive_match_stats(is_home, hs, as_, goals, assists, saves,
+                                      p.get("position", ""), detail)
+                 if played else None)
     payload = {
         "events": [[m, t] for m, t in timed],
         "verdict": verdict,
         "played": bool(played),
         "benched": bool(benched),
         "position": p.get("position", ""),
+        "pso": pso,
         "detail": {
             "shots": detail.get("shots", 0),
             "shots_on": detail.get("shots_on", 0),
@@ -2537,6 +2647,7 @@ def _save_match_detail(p, week, comp_name, is_home, home_name, away_name,
             "blocks": detail.get("blocks", 0),
             "pass_acc": detail.get("pass_acc", 0.0),
         },
+        "team_stats": team_stats,
     }
     try:
         conn2 = get_conn()
@@ -2557,6 +2668,53 @@ def _save_match_detail(p, week, comp_name, is_home, home_name, away_name,
         return None
 
 
+def _augment_events_with_names(c, p, is_home, hid, aid, hs, as_,
+                               goals, assists, played, events):
+    """[텍스트-영상 싱크] 이벤트 문구를 다듬는다.
+
+      - 내가 넣은 골/어시(⚽·🎯 세트피스·🎯 페널티킥·🅰)와 그 외 내 개인
+        활약(선방·차단·드리블 등) → 뒤에 "(내 이름)"을 붙인다.
+      - 실점(🥅)은 내가 한 행동이 아니라 상대가 넣은 것이므로 이름을
+        붙이지 않는다.
+      - 우리 팀이 넣었지만 내가 골도 어시도 아닌 나머지 득점은, 로스터에서
+        아무 이름이나 랜덤으로 뽑아 붙이지 않고 "어떤 골인지"만(문구만)
+        타임라인에 추가한다 — 이름 없는 일반 골로 표시.
+
+    [수정 이력] 처음엔 로스터에서 동료/상대 이름을 랜덤으로 뽑아 붙였는데,
+    국가별로 이름이 뒤죽박죽 나와 어색했다. 지금은 이름은 오직 "내 이름"
+    하나만 쓰고, 내가 관여 안 한 골은 이름 없이 사실(득점 존재·시점·종류)만
+    보여준다.
+    """
+    try:
+        if not played:
+            return events
+        my_name = p.get("name") or "나"
+        my_score = hs if is_home else as_
+
+        def tag(text):
+            if "🥅" in text:
+                return text  # 상대 득점 — 내가 한 게 아니므로 이름 없음
+            return f"{text} ({my_name})"  # 내 골/어시/선방/차단 등 개인 행동
+
+        new_events = []
+        for ev in events:
+            if isinstance(ev, tuple) and len(ev) == 2:
+                m, t = ev
+                new_events.append((m, tag(str(t))))
+            else:
+                new_events.append(tag(str(ev)))
+
+        # 내가 골도 어시도 아닌 우리 팀의 나머지 득점 — 이름 없이 문구만.
+        remaining = max(0, my_score - goals - assists)
+        if remaining > 0:
+            for m in _sample_minutes(remaining, 3, 90):
+                new_events.append((m, random.choice(GOAL_PHRASES["normal"])))
+
+        return new_events
+    except Exception:
+        return events
+
+
 def _write_match_log(p, week, league_name, is_home,
                      hid, aid, hs, as_,
                      result, goals, assists, saves, rating, events, played, benched,
@@ -2566,6 +2724,15 @@ def _write_match_log(p, week, league_name, is_home,
     c = conn.cursor()
     hn = _team_name(c, hid, "홈팀")
     an = _team_name(c, aid, "원정팀")
+
+    # [텍스트-영상 싱크 확장] 이벤트 텍스트에 실제 선수 이름을 붙이고, 내가
+    # 직접 관여하지 않은 우리 팀의 나머지 득점도 실제 로스터 선수 이름으로
+    # 채워 넣는다 — "경기 상세"가 내 개인 기록만 보여주던 것에서 실제 팀
+    # 전체 경기처럼 보이게 하기 위함. 로스터 조회가 실패해도(오프라인 팀,
+    # DB 이슈 등) 경기 저장 자체는 절대 막히면 안 되므로 전부 try/except로
+    # 감싸고, 실패 시 이름 태깅 없이 기존 동작으로 조용히 폴백한다.
+    events = _augment_events_with_names(c, p, is_home, hid, aid, hs, as_,
+                                        goals, assists, played, events)
     conn.close()
 
     loc = "홈" if is_home else "원정"
@@ -4228,16 +4395,11 @@ def _sim_all_leagues_for_season_end(season: int):
         if stale:
             batch = []
             for m in stale:
-                ho = _team_avg_ovr(c, m["home_team_id"]) + 3
-                ao = _team_avg_ovr(c, m["away_team_id"])
+                ho = _team_avg_ovr(c, m["home_team_id"]) + _home_advantage() + _formation_bias(c, m["home_team_id"])
+                ao = _team_avg_ovr(c, m["away_team_id"]) + _formation_bias(c, m["away_team_id"])
                 diff = ho - ao
-                hw = max(0.10, min(0.80, 0.45 + diff * 0.01))
-                dw = 0.25
-                roll = random.random()
-                if roll < hw:      outcome = "home"
-                elif roll < hw+dw: outcome = "draw"
-                else:              outcome = "away"
-                hs, as_ = _gen_score(outcome)
+                outcome = _roll_outcome(diff)
+                hs, as_ = _gen_score(outcome, diff)  # [버그수정] diff 전달
                 batch.append((hs, as_, m["id"]))
             c.executemany("UPDATE match_results SET home_score=?,away_score=? WHERE id=?", batch)
 
@@ -5659,16 +5821,11 @@ def _sim_league_full(league_id, season, c=None, st=None):
     for m in matches:
         hid = m["home_team_id"]
         aid = m["away_team_id"]
-        ho = _team_avg_ovr(c, hid) + 3
-        ao = _team_avg_ovr(c, aid)
+        ho = _team_avg_ovr(c, hid) + _home_advantage() + _formation_bias(c, hid)
+        ao = _team_avg_ovr(c, aid) + _formation_bias(c, aid)
         diff = ho - ao
-        hw = max(0.10, min(0.80, 0.45 + diff * 0.01))
-        dw = 0.25
-        roll = random.random()
-        if roll < hw:          outcome = "home"
-        elif roll < hw + dw:   outcome = "draw"
-        else:                  outcome = "away"
-        hs, as_ = _gen_score(outcome)
+        outcome = _roll_outcome(diff)
+        hs, as_ = _gen_score(outcome, diff)  # [버그수정] diff 전달
         # teams 테이블 업데이트 없이 match_results에만 저장 (배치 처리)
         batch_r.append((hs, as_, m["id"]))
 
@@ -5702,19 +5859,11 @@ def _backfill_past_matches(league_id, season, current_week, my_team_id):
         hid = m["home_team_id"]
         aid = m["away_team_id"]
         # 내 팀이 포함된 과거 경기도 랜덤으로 처리 (입단 전이니 AI끼리 뛴 것)
-        ho = _team_avg_ovr(c, hid) + 3
-        ao = _team_avg_ovr(c, aid)
+        ho = _team_avg_ovr(c, hid) + _home_advantage() + _formation_bias(c, hid)
+        ao = _team_avg_ovr(c, aid) + _formation_bias(c, aid)
         diff = ho - ao
-        hw = max(0.10, min(0.80, 0.45 + diff * 0.01))
-        dw = 0.25
-        roll = random.random()
-        if roll < hw:
-            outcome = "home"
-        elif roll < hw + dw:
-            outcome = "draw"
-        else:
-            outcome = "away"
-        hs, as_ = _gen_score(outcome)
+        outcome = _roll_outcome(diff)
+        hs, as_ = _gen_score(outcome, diff)  # [버그수정] diff 전달
         _accum_team_rec(team_deltas, hid, aid, outcome, hs, as_)
         batch_results.append((hs, as_, m["id"]))
 

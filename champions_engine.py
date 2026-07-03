@@ -563,10 +563,14 @@ def _entry(tid, team_id):
 
 
 def _match_outcome(h_ovr, a_ovr):
-    """중립 구장 가정. 'home'/'draw'/'away' (KO 무승부 → 승부차기)."""
+    """중립 구장 가정. 'home'/'draw'/'away' (KO 무승부 → 승부차기).
+    [수정] 무승부 확률을 전력차에 반비례하도록 개선 (기존 dw=0.22 고정)."""
     diff = h_ovr - a_ovr
     hw = max(0.08, min(0.85, 0.46 + diff * 0.014))
-    dw = 0.22
+    dw = max(0.08, 0.24 - abs(diff) * 0.005)
+    aw = max(0.05, 1.0 - hw - dw)
+    tot = hw + dw + aw
+    hw, dw, aw = hw / tot, dw / tot, aw / tot
     roll = random.random()
     if roll < hw:
         return "home"
@@ -722,10 +726,11 @@ def simulate_my_cl_match(week, p):
     comp_name = f"{t['name']} {stage_ko}".strip()
     home_disp = f"{he['flag']}{he['team_name']}"
     away_disp = f"{ae['flag']}{ae['team_name']}"
+    pso = {"won": pso_winner == my_tid, "score": pso_score} if pso_winner else None
     detail_id = _save_match_detail(
         p, week, comp_name, is_home, home_disp, away_disp,
         hs, as_, my_result, goals, assists, saves, rating,
-        events, True, False, detail)
+        events, True, False, detail, pso=pso)
     marker = f" [match:{detail_id}]" if detail_id else ""
 
     add_log("─" * 44, "sep")

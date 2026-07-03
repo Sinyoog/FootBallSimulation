@@ -1479,11 +1479,15 @@ def _entry(tid, country):
 
 
 def _match_outcome(h_ovr, a_ovr, knockout):
-    """중립 구장 가정. 'home'/'draw'/'away' 반환 (KO는 무승부 → 승부차기)."""
+    """중립 구장 가정. 'home'/'draw'/'away' 반환 (KO는 무승부 → 승부차기).
+    [수정] 무승부 확률을 전력차에 반비례하도록 개선 (기존 dw=0.22 고정 →
+    전력차 무관하게 항상 22% 무승부였음. 국내리그 _match_win_probs와 같은 취지)."""
     diff = h_ovr - a_ovr
     hw = max(0.08, min(0.85, 0.46 + diff * 0.014))
-    dw = 0.22
+    dw = max(0.08, 0.24 - abs(diff) * 0.005)
     aw = max(0.05, 1.0 - hw - dw)
+    tot = hw + dw + aw
+    hw, dw, aw = hw / tot, dw / tot, aw / tot
     roll = random.random()
     if roll < hw:
         return "home"
@@ -1681,10 +1685,11 @@ def simulate_my_match(week, p):
     comp_name = f"{t['name']} {stage_ko}{grp_txt}".strip()
     home_disp = f"{he['flag']}{m['home']}"
     away_disp = f"{ae['flag']}{m['away']}"
+    pso = {"won": pso_winner == nat, "score": pso_score} if pso_winner else None
     detail_id = _save_match_detail(
         p, week, comp_name, is_home, home_disp, away_disp,
         hs, as_, my_result, goals, assists, saves, rating,
-        events, True, False, detail)
+        events, True, False, detail, pso=pso)
     marker = f" [match:{detail_id}]" if detail_id else ""
 
     add_log("─" * 44, "sep")
@@ -2009,6 +2014,35 @@ def get_group_standings(tid, grp):
     return rows
 
 
+def _pair_avoiding_same_group(strong, weak):
+    """[버그 수정] strong/weak: [(조라벨, 값), ...] 리스트. 순서대로 그냥
+    짝지으면(예전 방식) 3위 진출팀 배정 순서에 따라 같은 조 1위와 3위가
+    바로 다음 라운드에서 다시 만나는 경우가 실제로 자주 생겼다(강한 조가
+    1·3위를 같이 배출하면 거의 확정적으로 발생 — 실측 확인됨). 실제
+    대회는 이런 조 충돌을 드로우 규칙으로 원천 차단하므로, 여기서도 같은
+    조 라벨끼리는 절대 페어링되지 않도록 순서를 유지하며 건너뛴다."""
+    weak = list(weak)
+    pairs = []
+    for sg, s in strong:
+        idx = next((i for i, (wg, _w) in enumerate(weak) if wg != sg), None)
+        if idx is None:
+            idx = 0 if weak else None  # 정말 다 같은 조뿐이면(극단적 예외) 어쩔 수 없이 배정
+        if idx is not None:
+            _wg, w = weak.pop(idx)
+            pairs.append((s, w))
+    # 남은 weak끼리 페어링할 때도 같은 조 충돌 회피
+    leftover = list(weak)
+    while len(leftover) >= 2:
+        g0, v0 = leftover.pop(0)
+        idx = next((i for i, (g, _v) in enumerate(leftover) if g != g0), None)
+        if idx is None:
+            idx = 0 if leftover else None
+        if idx is not None:
+            _g1, v1 = leftover.pop(idx)
+            pairs.append((v0, v1))
+    return pairs
+
+
 def _finalize_groups(t, next_stage, next_week):
     """조별리그 종료 → 진출국 확정, 다음 라운드 대진 생성.
     - 월드컵 32개국(8조): 각 조 1·2위 = 16팀 → R16
@@ -2079,37 +2113,18 @@ def _finalize_groups(t, next_stage, next_week):
 
     elif is_big:
         # 48개국: 조 1·2위(24팀) + 3위 8팀 = 32팀 → 32강
-        # 시드 배치: 1위(12) > 2위(12) > 3위(8) 순서로 페어링
-        firsts_list  = [firsts[g]  for g in labels if g in firsts]
-        seconds_list = [seconds[g] for g in labels if g in seconds]
-        thirds_list  = [nat for _, nat in best_thirds]
-        # 32팀 시드 배치: 상위 시드가 하위 시드와 만나도록
-        # 1위 12팀 → 2위/3위 중 상대 배정, 나머지 2위끼리
-        strong = list(firsts_list)                      # 12
-        weak   = thirds_list + seconds_list             # 8+12=20 → 상위 12만 사용
-        pairs = []
-        for s in strong:
-            opp = weak.pop(0) if weak else None
-            if opp is not None:
-                pairs.append((s, opp))
-        # 남은 2위끼리 (12-8=4팀 남음 → 2경기)
-        while len(weak) >= 2:
-            pairs.append((weak.pop(0), weak.pop(0)))
+        # [버그 수정] 같은 조 1위·3위(또는 1위·2위)가 32강에서 바로 다시
+        # 만나지 않도록 _pair_avoiding_same_group으로 조 충돌을 회피한다.
+        strong = [(g, firsts[g]) for g in labels if g in firsts]
+        weak = list(best_thirds) + [(g, seconds[g]) for g in labels if g in seconds]
+        pairs = _pair_avoiding_same_group(strong, weak)
 
     else:
         # 대륙컵 24개국: 1위6 + 2위6 + 3위4 = 16팀 → 16강
-        firsts_list  = [firsts[g]  for g in labels if g in firsts]
-        seconds_list = [seconds[g] for g in labels if g in seconds]
-        thirds_list  = [nat for _, nat in best_thirds]
-        strong = list(firsts_list)
-        weak   = thirds_list + seconds_list
-        pairs = []
-        for s in strong:
-            opp = weak.pop(0) if weak else None
-            if opp is not None:
-                pairs.append((s, opp))
-        while len(weak) >= 2:
-            pairs.append((weak.pop(0), weak.pop(0)))
+        # [버그 수정] 위와 동일하게 같은 조 충돌 회피.
+        strong = [(g, firsts[g]) for g in labels if g in firsts]
+        weak = list(best_thirds) + [(g, seconds[g]) for g in labels if g in seconds]
+        pairs = _pair_avoiding_same_group(strong, weak)
 
     p = get_player()
     nat = _my_nat(t, p)

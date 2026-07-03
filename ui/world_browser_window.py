@@ -84,7 +84,7 @@ class WorldBrowserWindow(QDialog):
         self.setStyleSheet(STYLE)
         # 창 크기를 강제로 고정하지 않고, 내용(테이블 컬럼 수 등)에 맞춰
         # 필요하면 커지도록 한다 — 시작 크기만 적당히 잡아둔다.
-        self.resize(820, 600)
+        self.resize(980, 640)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(14, 12, 14, 12)
@@ -109,6 +109,17 @@ class WorldBrowserWindow(QDialog):
         close_btn.setObjectName("closeBtn")
         close_btn.clicked.connect(self.close)
         lay.addWidget(close_btn)
+        self._first_show_done = False
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # 최초 표시 시점엔 스플리터/리스트 실제 폭이 아직 안 잡혀 있어서
+        # 생성자 안에서 계산한 _ensure_list_fits가 부정확할 수 있다.
+        # 실제로 화면에 뜬 뒤 한 번 더 재확인한다(첫 표시 때만).
+        if not self._first_show_done:
+            self._first_show_done = True
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(0, self._ensure_list_fits)
 
     def _grow_to_fit(self, tbl, extra_w=60, extra_h=140, stretch_col=None):
         """테이블 내용(특히 컬럼 수·긴 텍스트)이 지금 창 폭보다 넓으면 그만큼
@@ -181,6 +192,7 @@ class WorldBrowserWindow(QDialog):
 
         # 좌: 리그 목록 / 우: 순위표
         split = QSplitter(Qt.Orientation.Horizontal)
+        self._league_split = split
         self.league_list = QListWidget()
         self.league_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.league_list.itemClicked.connect(self._on_league_selected)
@@ -209,7 +221,7 @@ class WorldBrowserWindow(QDialog):
         self.standing_tbl.verticalHeader().setVisible(False)
         right_lay.addWidget(self.standing_tbl)
         split.addWidget(right)
-        split.setSizes([300, 480])
+        split.setSizes([440, 500])
         lay.addWidget(split, 1)
 
         self._country_cache = []  # [{id,name,flag,grade,continent}, ...] 현재 대륙 필터 기준
@@ -270,6 +282,32 @@ class WorldBrowserWindow(QDialog):
             note.setFlags(Qt.ItemFlag.NoItemFlags)
             note.setForeground(Qt.GlobalColor.darkGray)
             self.league_list.addItem(note)
+        self._ensure_list_fits()
+
+    def _ensure_list_fits(self):
+        """리그 목록 행(국가·리그명+티어/등급/라이브 배지)이 리스트 폭보다 넓으면
+        가로 스크롤로 잘리는 대신 창 자체를 키운다 — 표 쪽 _grow_to_fit과 같은
+        '절대 줄이지 않는다' 원칙."""
+        max_w = 0
+        for i in range(self.league_list.count()):
+            it = self.league_list.item(i)
+            w = self.league_list.itemWidget(it)
+            if w:
+                max_w = max(max_w, w.sizeHint().width())
+        if max_w == 0:
+            return
+        scrollbar_w = self.league_list.verticalScrollBar().sizeHint().width()
+        needed_list_w = max_w + scrollbar_w + 12
+        cur_list_w = self.league_list.width()
+        if needed_list_w > cur_list_w:
+            grow = needed_list_w - cur_list_w
+            new_w = self.width() + grow
+            if new_w > self.width():
+                self.resize(new_w, self.height())
+            sizes = self._league_split.sizes()
+            if len(sizes) == 2:
+                sizes[0] += grow
+                self._league_split.setSizes(sizes)
 
     def _league_row_widget(self, lg):
         """리그 목록 한 줄: 국기+국가+리그명 / 등급배지 / 티어 / 시뮬여부 배지.

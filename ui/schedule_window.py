@@ -375,6 +375,98 @@ class ScheduleWindow(QDialog):
                 gt.setFixedHeight(gt.verticalHeader().defaultSectionSize() * len(rows) + 28)
                 lay.addWidget(gt)
 
+            # ── 3위 팀 순위표 (3위 진출 대회만: 48개국 월드컵/대륙컵) ──
+            # 실제 2026 월드컵 중계처럼, 각 조 3위끼리 성적순으로 줄 세워서
+            # 상위 N팀만 진출/나머지는 탈락인지 한눈에 보여준다.
+            if has_thirds:
+                third_rows = []
+                for g in groups:
+                    if _is_qual:
+                        rows = intl_engine._qual_group_standings(t["id"], g)
+                        for r in rows:
+                            r.setdefault("w", 0); r.setdefault("d", 0); r.setdefault("l", 0)
+                    else:
+                        rows = intl_engine.get_group_standings(t["id"], g)
+                    if len(rows) >= 3:
+                        r3 = dict(rows[2])
+                        r3["grp"] = g
+                        third_rows.append(r3)
+
+                if third_rows:
+                    third_rows.sort(
+                        key=lambda r: (r["pts"], r["gf"] - r["ga"], r["gf"], r.get("ovr", 0)),
+                        reverse=True)
+
+                    if t.get("kind") == "world":
+                        from constants import WC_BEST_THIRDS_BIG
+                        n_adv3 = WC_BEST_THIRDS_BIG
+                    else:
+                        from constants import CONT_BEST_THIRDS
+                        n_adv3 = CONT_BEST_THIRDS
+
+                    lbl_t = QLabel(f"◼ 3위 팀 순위 (상위 {n_adv3}팀 진출)")
+                    lbl_t.setStyleSheet("color:#00cc44;font-weight:bold;font-size:12px;margin-top:6px;")
+                    lay.addWidget(lbl_t)
+
+                    # 컷라인(진출/탈락 경계) 표시용 구분 행을 진출팀 수만큼 뒤에 끼워 넣는다.
+                    cut_at = n_adv3 if 0 < n_adv3 < len(third_rows) else None
+                    total_rows = len(third_rows) + (1 if cut_at is not None else 0)
+
+                    tt = QTableWidget(total_rows, 8)
+                    tt.setHorizontalHeaderLabels(
+                        ["순위", "조", "국가", "경기", "승", "무", "패", "득실/승점"])
+                    tt.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+                    tt.verticalHeader().setVisible(False)
+                    tt.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+                    tt.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+                    tt.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+                    tt.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+                    tt.setStyleSheet(
+                        "QTableWidget{background:#1e1e1e;color:#ccc;gridline-color:#2a2a2a;border:1px solid #2a2a2a;}"
+                        "QHeaderView::section{background:#252525;color:#888;border:none;padding:3px;}")
+
+                    row_i = 0
+                    for rank, r in enumerate(third_rows, start=1):
+                        country = r.get("country", "")
+                        gd = r["gf"] - r["ga"]
+                        vals = [str(rank), f"{r['grp']}조", f"{r['flag']}{country}",
+                                str(r["p"]), str(r["w"]), str(r["d"]), str(r["l"]),
+                                f"{'+' if gd > 0 else ''}{gd} / {r['pts']}점"]
+
+                        if country == nat:
+                            color = COLOR_MY
+                        elif cut_at is not None and rank <= cut_at:
+                            color = COLOR_THIRD_OK if not thirds_in_progress else COLOR_THIRD
+                        elif cut_at is None and thirds_in_progress:
+                            color = COLOR_THIRD
+                        elif cut_at is None:
+                            color = COLOR_THIRD_OK
+                        else:
+                            color = COLOR_ELIM
+
+                        for j, v in enumerate(vals):
+                            item = QTableWidgetItem(v)
+                            if j > 0:
+                                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                            item.setForeground(color)
+                            tt.setItem(row_i, j, item)
+                        row_i += 1
+
+                        # 진출 컷라인 — 진출 확정 인원 바로 뒤에 구분선 행 삽입
+                        if cut_at is not None and rank == cut_at:
+                            tt.setSpan(row_i, 0, 1, 8)
+                            cut_item = QTableWidgetItem(
+                                "▲ 진출 컷라인 (여기까지 진출) ▲" if not thirds_in_progress
+                                else "▲ 현재 컷라인 — 남은 경기에 따라 바뀔 수 있음 ▲")
+                            cut_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                            cut_item.setForeground(QColor("#666666"))
+                            tt.setItem(row_i, 0, cut_item)
+                            tt.setRowHeight(row_i, 18)
+                            row_i += 1
+
+                    tt.setFixedHeight(tt.verticalHeader().defaultSectionSize() * total_rows + 28)
+                    lay.addWidget(tt)
+
             # 범례
             hint_parts = ["🟢진출확정", "🔵내 국가"]
             if has_thirds:
