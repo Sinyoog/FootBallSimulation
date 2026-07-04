@@ -1937,16 +1937,30 @@ def _half_of(m):
     return "first" if m <= 45 else "second"
 
 
-def _sample_minutes(n, lo, hi):
+def _sample_minutes(n, lo, hi, avoid=None, min_gap=3):
     """경기 이벤트 분(分)을 n개 뽑는다. 정렬용 정수 리스트(오름차순) 반환.
        정규시간(lo~hi) 위주이되, 낮은 확률로 추가시간이 섞인다.
        - 전반 추가시간: 146~155 (=45+1~45+10), 짧은 쪽이 흔함
        - 후반 추가시간: 91~100  (=90+1~90+10), 짧은 쪽이 흔하지만 최근 트렌드상
          9~10분까지도 드물게 나올 수 있게 폭을 넓혔다
-       정렬 시 146~155는 큰 값이라 맨 뒤로 가지만, _half_of 로 전반에 재배치된다."""
+       정렬 시 146~155는 큰 값이라 맨 뒤로 가지만, _half_of 로 전반에 재배치된다.
+
+       avoid: [버그 수정] 이미 다른(진짜) 이벤트가 있는 분(分)들의 집합.
+       min_gap분 이내는 피해서 뽑는다 — 안 그러면 "2' 실점"과 "2' 코너킥이
+       걷어내졌다"처럼 서로 무관한 이벤트가 같은/거의 같은 순간에 겹쳐
+       배너·장면이 뒤죽박죽 충돌하는 문제가 있었다(득점 배너 뜨자마자
+       엉뚱한 코너킥 배너가 겹쳐 뜨는 등)."""
     if n <= 0:
         return []
-    pool = list(range(lo, min(hi, 90) + 1))
+    avoid_keys = [_min_sortkey(a) for a in (avoid or ())]
+
+    def _too_close(m):
+        mk = _min_sortkey(m)
+        return any(abs(mk - ak) < min_gap for ak in avoid_keys)
+
+    pool = [x for x in range(lo, min(hi, 90) + 1) if not _too_close(x)]
+    if not pool:
+        pool = list(range(lo, min(hi, 90) + 1))  # 안전망(avoid가 범위를 다 잡아먹은 극단적 경우)
     # 추가시간: 짧을수록 자주(가중치). 전반은 후반보다 덜 나오게. 9~10분은 아주 드물게.
     fh_stop = [146,146,146, 147,147, 148,148, 149, 150, 151, 152, 153, 154, 155]   # 45+1~10
     sh_stop = [91,91,91,91, 92,92,92, 93,93,93, 94,94, 95,95, 96, 97, 98, 99, 100]  # 90+1~10
@@ -1955,14 +1969,18 @@ def _sample_minutes(n, lo, hi):
     while len(out) < n and attempts < n * 25:
         r = random.random()
         if r < 0.04:                       # 전반 추가시간 (드묾)
-            out.add(random.choice(fh_stop))
+            cand = random.choice(fh_stop)
         elif r < 0.16:                     # 후반 추가시간 (좀 더 흔함)
-            out.add(random.choice(sh_stop))
+            cand = random.choice(sh_stop)
         else:
-            out.add(random.choice(pool))
+            cand = random.choice(pool)
+        if not _too_close(cand):
+            out.add(cand)
         attempts += 1
     while len(out) < n and len(out) < len(pool):
-        out.add(random.choice(pool))
+        cand = random.choice(pool)
+        if not _too_close(cand):
+            out.add(cand)
     return sorted(out)
 
 
@@ -2632,6 +2650,59 @@ def _save_match_detail(p, week, comp_name, is_home, home_name, away_name,
     team_stats = (_derive_match_stats(is_home, hs, as_, goals, assists, saves,
                                       p.get("position", ""), detail)
                  if played else None)
+
+    # ── [신규] 코너킥 통계와 재생 화면 동기화 ────────────────────
+    #   team_stats엔 코너킥 개수(예: 6개)가 이미 계산되는데, 그중 실제
+    #   득점으로 이어진 것(🎯 세트피스 골)만 장면으로 남고 나머지는 그냥
+    #   숫자로만 존재해서 "코너킥 6"이라고 통계엔 뜨는데 재생 화면엔 거의
+    #   안 보였다. 득점 안 된 코너킥도 걷어내지는 장면으로 몇 개 살려서
+    #   통계-영상을 맞춘다. (뷰어의 _detect_style은 텍스트에 "세트피스"만
+    #   들어있으면 스타일을 그대로 인식하므로, 실제 코너킥 연출을 그대로
+    #   재사용하면서 miss_for로만 분류되게 한다.)
+    if played and team_stats:
+        # [버그 수정] 실점/득점 같은 "진짜" 이벤트와 앰비언트(코너킥/파울)
+        # 이벤트가 같은/거의 같은 분(分)에 겹쳐 배정되던 문제. "2' 실점"
+        # 이랑 "2' 세트피스 코너킥이 걷어내졌다"가 동시에 겹쳐 뜨는 식으로
+        # 배너·장면이 충돌해 보였다. 이미 쓰인 분들을 계속 추적하면서
+        # (앰비언트끼리도 서로 피하도록 매번 갱신) 최소 3분 간격을 둔다.
+        _occupied = {m for m, _ in timed}
+
+        _my_side_stats = team_stats["home"] if is_home else team_stats["away"]
+        _my_corners = _my_side_stats.get("corners", 0)
+        _existing_setpiece_goals = sum(1 for _, t in timed if "세트피스" in t)
+        _extra_corners = max(0, _my_corners - _existing_setpiece_goals)
+        _extra_corners = min(_extra_corners, 6)  # 타임라인이 너무 안 북적이게 상한
+        if _extra_corners > 0:
+            _new_mins = _sample_minutes(_extra_corners, 2, 89, avoid=_occupied)
+            for _cm in _new_mins:
+                timed.append((_cm, "🚫 세트피스 코너킥, 수비에 걷어내졌다"))
+            _occupied.update(_new_mins)
+
+        # ── [신규] 파울 / 상대 팀 코너킥도 통계-화면 동기화 ──────────
+        #   경기 통계엔 파울·상대 코너킥 개수가 계산되는데, 지금까지는
+        #   둘 다 재생 화면에 전혀 안 나왔다(숫자로만 존재). 완전한
+        #   장면(선수 애니메이션)까진 아니어도, 최소한 "info" 배너로는
+        #   보이게 한다 — 뷰어가 미분류 텍스트를 배너로 잠깐 띄워준다.
+        #   너무 많으면 배너가 도배되니 각각 상한을 둔다.
+        _opp_side_stats = team_stats["away"] if is_home else team_stats["home"]
+        _my_fouls = min(_my_side_stats.get("fouls", 0), 4)
+        _opp_fouls = min(_opp_side_stats.get("fouls", 0), 4)
+        _new_mins = _sample_minutes(_my_fouls, 2, 89, avoid=_occupied)
+        for _fm in _new_mins:
+            timed.append((_fm, "🟨 우리 팀 파울"))
+        _occupied.update(_new_mins)
+        _new_mins = _sample_minutes(_opp_fouls, 2, 89, avoid=_occupied)
+        for _fm in _new_mins:
+            timed.append((_fm, "🟨 상대 팀 파울"))
+        _occupied.update(_new_mins)
+        _opp_corners = min(_opp_side_stats.get("corners", 0), 4)
+        _new_mins = _sample_minutes(_opp_corners, 2, 89, avoid=_occupied)
+        for _cm in _new_mins:
+            timed.append((_cm, "⛳ 상대 팀 코너킥"))
+        _occupied.update(_new_mins)
+
+        timed.sort(key=lambda x: _min_sortkey(x[0]))
+
     payload = {
         "events": [[m, t] for m, t in timed],
         "verdict": verdict,
