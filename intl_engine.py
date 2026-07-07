@@ -772,6 +772,7 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
     # [정책] pledge는 wc_qual → 월드컵 본선 연계에만 사용.
     #        대륙컵은 예선이 없으므로 pledge가 있어도 대륙컵 발탁에 영향 없음.
     pledged = (p.get("qual_pledged_nat", "") or "") if is_wc else ""
+    _age_dropped = False  # [신규] 팀은 본선에 나갔지만 개인 재판정에서 탈락한 경우
     if committed:
         # [bugfix] committed path: also check wc_qual result
         #   If wc_qual existed last year, committed player who was
@@ -783,22 +784,63 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
             _blocked_by_qual = False
             if is_wc:
                 try:
+                    # [버그 수정 — 근본 원인] 예선에서 개인 재판정(_check_selection)에
+                    # 떨어지면 my_nat이 ""(빈 문자열)로 저장된다(위
+                    # _create_qual_tournament의 "my_nat = committed if
+                    # my_sel==1 else ''" 참고). 그런데 여기 조회는
+                    # "my_nat=committed"로 필터링해서, 정작 "미선발"이었던
+                    # 바로 그 케이스(my_nat="")를 못 찾고 _bqr=None이
+                    # 됐다 — None이면 _blocked_by_qual이 초기값 False로
+                    # 남아서, 예선 미선발이었던 선수가 본선에는 오히려
+                    # 자동 선발되는 정반대 결과가 나왔다(신민용 지적:
+                    # "2009년 미선발인데 2010년 갑자기 본선 출전"). my_nat이
+                    # 아니라 continent로 그 시즌 예선 기록 자체를 찾은 뒤,
+                    # my_selected==1이면서 my_nat도 committed와 일치하는지
+                    # 둘 다 확인한다.
+                    _committed_cont = nat_info.get(committed, {}).get("continent", "")
                     _bqc = get_conn()
                     _bqr = _bqc.execute(
-                        """SELECT my_selected FROM intl_tournaments
-                           WHERE year=? AND kind='wc_qual' AND my_nat=?
+                        """SELECT my_selected, my_nat FROM intl_tournaments
+                           WHERE year=? AND kind='wc_qual' AND continent=?
                            LIMIT 1""",
-                        (year - 1, committed)).fetchone()
+                        (year - 1, _committed_cont)).fetchone()
                     _bqc.close()
                     if _bqr is not None:
-                        _blocked_by_qual = (_bqr["my_selected"] != 1)
+                        _blocked_by_qual = not (_bqr["my_selected"] == 1
+                                                 and _bqr["my_nat"] == committed)
                 except Exception:
                     pass
             if _blocked_by_qual:
                 my_sel = 2
+                # [버그 수정] 이 케이스는 "우리나라가 예선에서 떨어졌다"가
+                # 아니라 "나라는 본선에 갔는데 내가 예선 때 개인 재판정에서
+                # 떨어졌다"는 완전히 다른 사실이다. 이 플래그가 없으면
+                # 아래 로그가 무조건 "예선 탈락"(팀 실패)으로 찍혀서,
+                # 실제로는 팀이 본선에 갔는데도 사실과 다른 메시지가
+                # 남았다(스크린샷 사례: 2005년 "미선발" 다음 2006년
+                # "예선 탈락"으로 바뀌어 마치 사유가 달라진 것처럼 보임 —
+                # 신민용 지적).
+                _age_dropped = True
             else:
-                my_nat = committed
-                my_sel = 1  # 예선 통과 = 본선 선발 보장, 재판정 없음
+                # [버그 수정 — 근본 원인] 대륙컵은 예선 자체가 없어서(제도상
+                # 폐지됨), committed(국적 확정) 선수는 지금까지 "그 나라가
+                # 대회 본선에 나가기만 하면" 개인 컨디션(OVR/나이)과 완전히
+                # 무관하게 무조건 발탁(my_sel=1)됐다. 월드컵은 예선 단계
+                # (_create_qual_tournament)에서 _check_selection이 한 번은
+                # 걸러주지만, 대륙컵은 그 관문 자체가 없어서 한 번 국가를
+                # 확정하면 이후로는 나이 먹어 기량이 떨어져도 평생 대표팀에
+                # 뽑히는 것처럼 보였다(신민용 지적). choose_national_team이
+                # 선택 확정 시 쓰는 것과 같은 판정 함수로 그 시점 실제
+                # 기량을 재검증한다 — 월드컵은 예선 통과로 이미 검증됐으니
+                # (재판정하면 오히려 예선 이후 짧은 폼 기복에 흔들릴 수
+                # 있어) 그대로 둔다.
+                if (not is_wc) and not _check_selection(
+                        p, nat_info.get(committed, {}).get("grade", "F")):
+                    my_sel = 2
+                    _age_dropped = True
+                else:
+                    my_nat = committed
+                    my_sel = 1  # 예선 통과(WC) / 대륙컵 재판정 통과
         else:
             my_sel = 2
     elif pledged and pledged in cont_nats:
@@ -935,9 +977,18 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
         # my_sel==2
         #   committed가 이 대회 대륙이고 예선 탈락한 경우만 기록.
         #   (committed가 타 대륙이라 이 대회와 무관하면 아무 기록도 남기지 않는다.)
+        # [버그 수정] 팀은 본선에 나갔는데 개인 재판정(_age_dropped)에서
+        # 떨어진 경우까지 "예선 탈락"으로 뭉뚱그리면 사실과 다른 메시지가
+        # 된다 — 나이/기량 저하로 못 뽑힌 것과 국가가 본선에 못 간 것은
+        # 다른 사실이므로 구분해서 기록한다.
         if committed and committed in cont_nats:
-            add_log(f"   📋 {committed} 예선 탈락 — 이번 대회 출전 없음", "event", year, INTL_CALLUP_WEEK)
-            _save_trophy(year, committed, name, "예선 탈락")
+            if _age_dropped:
+                add_log(f"   📋 {committed} 대표팀 미선발 (기량 저하) — 이번 대회 출전 없음",
+                        "event", year, INTL_CALLUP_WEEK)
+                _save_trophy(year, committed, name, "국가대표 미선발")
+            else:
+                add_log(f"   📋 {committed} 예선 탈락 — 이번 대회 출전 없음", "event", year, INTL_CALLUP_WEEK)
+                _save_trophy(year, committed, name, "예선 탈락")
 
 def _country_flag(name):
     """국가 국기 조회 (없으면 빈 문자열)."""
@@ -1344,12 +1395,14 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
         add_log(f"   {my_nat} 대표로 출전 확정", "event")
 
     # 미선발 로그
+    # [최적화] 예전엔 cand_nats 후보 수만큼 동일한 UPDATE를 반복 실행했다
+    #  (n2를 쿼리에서 쓰지 않아 매번 같은 tid에 같은 값을 덮어씀 → 불필요한
+    #   커밋 반복). 결과는 항상 같으므로 후보 수와 무관하게 1회만 실행한다.
     if my_sel == 2 and cand_nats:
-        for n2 in cand_nats:
-            conn2 = get_conn()
-            conn2.execute("UPDATE intl_tournaments SET my_result=? WHERE id=?",
-                          ("예선 미선발", tid))
-            conn2.commit(); conn2.close()
+        conn2 = get_conn()
+        conn2.execute("UPDATE intl_tournaments SET my_result=? WHERE id=?",
+                      ("예선 미선발", tid))
+        conn2.commit(); conn2.close()
 
 
 def _qual_group_labels(n):

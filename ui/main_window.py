@@ -272,12 +272,13 @@ class MainWindow(QMainWindow):
         """현재 MainWindow 안에 StartScreen UI를 직접 그림."""
         from PyQt6.QtWidgets import (
             QWidget, QVBoxLayout, QLabel, QPushButton, QDialog,
-            QMessageBox
+            QMessageBox, QApplication
         )
         from PyQt6.QtGui import QFont
         from PyQt6.QtCore import Qt
         from database import reset_game_data, get_conn
         from game_engine import get_player
+        from constants import GAME_START_YEAR, PLAYER_START_AGE
 
         DARK_STYLE = """
         QWidget { background-color: #1a1a1a; color: #e0e0e0;
@@ -311,7 +312,7 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("color: #00cc44;")
         lay.addWidget(title)
 
-        sub = QLabel("1990년, 16살의 당신. 전설이 되어보세요.")
+        sub = QLabel(f"{GAME_START_YEAR}년, {PLAYER_START_AGE}살의 당신. 전설이 되어보세요.")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sub.setStyleSheet("color: #888888; font-size: 13px;")
         lay.addWidget(sub)
@@ -337,8 +338,16 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
         if hasattr(self, 'top_bar'):
             self.top_bar.hide()
+        # [버그수정] 게임 화면(showMaximized 상태)에서 넘어올 때 최대화 플래그가
+        #   안 풀려서 창이 좌측 위에 눌려붙고, 드래그하면 최대화 크기로
+        #   복원돼버리는 문제. 최대화 해제 → 크기 조정 → 화면 중앙 배치 순서로 처리.
+        self.showNormal()
         self.setMinimumSize(500, 400)
         self.resize(600, 450)
+        screen = self.screen() if self.screen() else QApplication.primaryScreen()
+        geo = screen.availableGeometry()
+        self.move(geo.center().x() - self.width() // 2,
+                  geo.center().y() - self.height() // 2)
 
         def do_new_game():
             if not _game_confirm(self, "새 게임", "기존 저장 데이터가 삭제됩니다.\n계속하시겠습니까?"):

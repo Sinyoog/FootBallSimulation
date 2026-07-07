@@ -22,8 +22,12 @@ import random
 import math
 import hashlib
 import time
+import json
+import os
+from datetime import datetime
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QWidget, QLabel, QPushButton, QComboBox
+    QDialog, QVBoxLayout, QHBoxLayout, QWidget, QLabel, QPushButton, QComboBox,
+    QMessageBox
 )
 from PyQt6.QtCore import Qt, QTimer, QRectF
 from PyQt6.QtGui import QPainter, QColor, QBrush, QPen, QFont
@@ -50,6 +54,14 @@ _POS_XY = {
 _ATTACK_ROLES = {"ST", "CF", "LW", "RW", "CAM"}
 _SUPPORT_ROLES = {"CM", "LM", "RM"}  # 공격수가 부족한 포메이션에서 보충용
 _DEFENSE_ROLES = {"CB", "LB", "RB", "LWB", "RWB", "CDM"}
+# [신규] 오프사이드 트랩 라인 동조 대상 — CDM은 포함하지 않는다(CDM은
+# 최종 수비 라인이 아니라 그 앞에서 스크린 역할을 하는 포지션이라, 백4와
+# 같은 줄로 묶으면 라인이 한 덩어리로 뭉개져 보인다).
+_BACKLINE_ROLES = {"CB", "LB", "RB", "LWB", "RWB"}
+# [신규] 수비수가 압박이 길어져도 자기 골라인/골키퍼 옆까지 완전히
+# 밀려나지 않도록 하는 최소 깊이(골라인 기준). 실제 축구에서 아무리
+# 로우블록이어도 페널티박스 언저리는 유지한다.
+_MIN_DEFENSIVE_DEPTH = 0.12
 
 # [현실성 보정] 실제 골대 폭은 7.32m로, 68m 폭 피치 기준 약 0.108(피치 폭의
 # 10.8%)에 불과하다. 페널티박스(폭 40.32m, 약 0.59)보다 훨씬 좁다 — 박스
@@ -87,21 +99,41 @@ def _clamp_shot_start_x(x, atk_goal_x, max_dist):
 # 둘 다 해결한다 — 포메이션 지정이 없으면(None) 공통 기본값을 쓴다.
 _TACTICAL_DX = {
     (None, "GK"):  (0.03, 0.02),
-    (None, "CB"):  (0.22, 0.06), (None, "LB"): (0.20, 0.08), (None, "RB"): (0.20, 0.08),
+    (None, "CB"):  (0.26, 0.06), (None, "LB"): (0.20, 0.08), (None, "RB"): (0.20, 0.08),
     (None, "LWB"): (0.24, 0.10), (None, "RWB"): (0.24, 0.10),
-    (None, "CDM"): (0.16, 0.06), (None, "CM"): (0.20, 0.08), (None, "CAM"): (0.22, 0.10),
-    (None, "LM"):  (0.20, 0.08), (None, "RM"): (0.20, 0.08),
+    # [현실성 보정 — 근본 원인] 예전 후퇴폭(CDM 0.06/CM 0.08/LM,RM 0.08)은
+    # 너무 작아서, 수비할 때도 이 포지션들은 거의 자기 기준위치(hx)에
+    # 그대로 머물렀다. 문제는 CDM/CM/LM/RM의 기준위치 자체가 이미 피치
+    # 중앙~공격 쪽(0.44~0.49대)이라, "거의 안 움직인다"는 게 곧 "수비할
+    # 때도 계속 공격 지역 근처에 남아있다"는 뜻이 됐다. 실측 디버그
+    # 캡처에서 백라인은 자기 골문 근처까지 물러났는데 중원은 하프라인
+    # 코앞에 그대로 남아, 그 사이(약 0.25~0.3 폭)가 완전히 텅 비어버리는
+    # 게 그대로 재현됐다("전방은 뚫렸는데 수비 3명만 남았다"는 지적,
+    # 그리고 그 텅 빈 구간 때문에 전진 패스 상대가 없어서 "다 뚫린
+    # 상황에서 뒤로 패스한다"는 지적 둘 다 이 한 가지 원인에서 갈라져
+    # 나온 것). 후퇴폭을 전진폭과 비슷한 수준으로 올려서, 수비할 때
+    # 중원도 백라인 바로 앞까지 확실히 내려오게 한다.
+    (None, "CDM"): (0.16, 0.18), (None, "CM"): (0.20, 0.18), (None, "CAM"): (0.22, 0.12),
+    (None, "LM"):  (0.22, 0.16), (None, "RM"): (0.22, 0.16),
     (None, "LW"):  (0.24, 0.10), (None, "RW"): (0.24, 0.10),
     (None, "CF"):  (0.24, 0.06), (None, "ST"): (0.24, 0.06),
 
-    # 3-5-2: 윙백이 사실상 윙어를 겸함 — 전/후퇴 폭이 매우 크다.
+    # [현실성 보정 — 근본 원인] 예전 값(0.16)은 push=1.0(팀 전체가 완전히
+    # 밀어붙인 상태)이어도 CB가 기준위치+0.16까지밖에 못 가서, 실측 디버그
+    # 캡처에서 ST/CM은 이미 0.6~0.7까지 전진했는데 백3는 0.22 근처에
+    # 그대로 남아있는 게 확인됐다("6명이 뒤에서 구경한다"는 지적의 정확한
+    # 원인 — 수렴 속도가 아니라 전진폭 "상한" 자체가 낮았던 것). 실제
+    # 축구에서 3-5-2/back-3는 팀이 완전히 공격에 쏠리면 CB도 하프라인
+    # 근처까지는 따라 올라간다 — 그 정도까지 갈 수 있도록 상향한다.
     ("3-5-2", "LWB"): (0.34, 0.16), ("3-5-2", "RWB"): (0.34, 0.16),
-    ("3-5-2", "CB"):  (0.16, 0.05),   # 스리백은 라인을 잘 안 깨고 셋이 붙어 다니되, 완전히 안 올라오진 않는다
+    ("3-5-2", "CB"):  (0.30, 0.05),
 
     # 5-3-2: 기본은 백5로 확실히 눌러앉고, 공격 전환 때만 윙백이 튀어나감
-    # → 후퇴폭을 더 크게(수비 의무가 더 무겁다는 뜻) 잡는다.
+    # → 후퇴폭을 더 크게(수비 의무가 더 무겁다는 뜻) 잡는다. 다만 백3와
+    # 마찬가지로 완전 공격 전개 시엔 어느 정도는 같이 따라 올라가야
+    # 한다(3-5-2보다는 보수적으로).
     ("5-3-2", "LWB"): (0.30, 0.20), ("5-3-2", "RWB"): (0.30, 0.20),
-    ("5-3-2", "CB"):  (0.14, 0.04),
+    ("5-3-2", "CB"):  (0.22, 0.04),
 
     # 4-3-3: 윙어는 늘 폭을 넓게 벌리는 게 특징이라 전진폭 자체는 크지
     # 않아도 되고(이미 넓은 자리에서 시작), 대신 풀백이 오버래핑으로
@@ -120,7 +152,9 @@ _TACTICAL_DX = {
 
     # 3-4-3: 스리백 뒤에 공간이 열리는 리스크를 감수하는 대신 전방
     # 압박이 정체성 — 수비 시에도 라인을 크게 안 내린다(후퇴폭 작음).
-    ("3-4-3", "CB"): (0.16, 0.04),
+    # 하이프레스가 정체성인 만큼 공격 전개 시 CB도 다른 포메이션보다
+    # 오히려 더 적극적으로 따라 올라가야 자연스럽다.
+    ("3-4-3", "CB"): (0.24, 0.04),
     ("3-4-3", "ST"): (0.22, 0.02), ("3-4-3", "LW"): (0.22, 0.02), ("3-4-3", "RW"): (0.22, 0.02),
 }
 
@@ -241,24 +275,72 @@ def _corner_slots(atk_goal_x, corner_y, n_atk, n_def):
     return atk_pts, def_pts
 
 
-def _penalty_arc_slots(atk_goal_x, spot_x, n_atk, n_def):
-    """[신규] 페널티킥일 때 키커/GK를 뺀 나머지 20명을 박스·아크 바깥으로
-    빼서 실제 PK 장면처럼 보이게 한다. 예전엔 이 인원 전체가 씬에 아예
-    포함이 안 돼서 평소 오픈플레이 포메이션 그대로 남아 있었다 — "수비수
-    들이 이상한 데(예: 자기 골키퍼 옆)서 안 움직인다"는 지적의 원인.
-    아크 바로 바깥쪽 세로선을 따라 두 팀을 어긋나게 줄 세운다."""
-    arc_x = spot_x + (0.09 if atk_goal_x >= 0.5 else -0.09)
-    ys = [0.14, 0.24, 0.34, 0.44, 0.56, 0.66, 0.76, 0.86, 0.20, 0.80]
+def _penalty_arc_slots(atk_goal_x, spot_x, atk_team, atk_indices, def_team, def_indices):
+    """[재설계 — 실제 PK 역할 배치] 예전엔 키커/GK를 뺀 20명을 그냥 두
+    팀 평행한 세로줄로 늘어세웠다 — 포지션과 무관하게 다 똑같이 취급돼서
+    "논리적으로 축구를 하는" 그림이 아니었다(신민용이 제공한 실제 PK
+    포지셔닝 자료와 비교해서 지적된 그대로). 그 자료 기준으로 역할을
+    나눈다:
+      - 공격(블루): 세컨볼 침투조(ST/CF/LW/RW/CAM — 박스라인/아크 정면에
+        바짝 붙어 키커의 발이 닿는 순간 튀어들 준비) + 역습 대비조
+        (CB/CDM — 하프라인 쪽으로 처져서 레드의 역습에 대비) + 나머지는
+        그 사이 박스 옆 라인.
+      - 수비(레드): 블루 차단조(CB/LB/RB/LWB/RWB/CDM — 박스라인에서
+        블루 세컨볼조보다 반 보 앞선/골대에 더 가까운 위치, 세컨볼을
+        먼저 걷어낼 수 있게) + 카운터 대기조(ST/CF/LW/RW — 아크 정면
+        에서 골키퍼 선방/클리어링 후 바로 치고 나갈 준비) + 나머지는
+        박스 옆 라인.
+    반환은 {선수idx: (x,y)} 딕셔너리(팀별) — 포지션 라벨로 역할을
+    갈랐으니 굳이 순서를 맞출 필요가 없어져서 zip 대신 dict로 바꿨다.
+    """
+    arc_dir = -1 if atk_goal_x >= 0.5 else 1        # 골대 반대쪽(하프라인) 방향
+    box_line_x = spot_x + arc_dir * 0.09            # 아크/박스 라인 바로 바깥
+    # 레드 차단조는 블루 세컨볼조보다 "반 보 앞서"(골대 쪽으로 더 붙게) —
+    # arc_dir 반대 방향으로 살짝 더 당긴다.
+    def_block_x = box_line_x - arc_dir * 0.015
+    halfway_x = 0.5 + arc_dir * 0.06                # 역습 대비조 — 하프라인 안쪽
 
-    def pts(n, x_bias):
-        out = []
-        for i in range(n):
-            y = ys[i % len(ys)] + random.uniform(-0.02, 0.02)
-            x = arc_x + x_bias + random.uniform(-0.02, 0.02)
-            out.append((max(0.02, min(0.98, x)), max(0.05, min(0.95, y))))
-        return out
+    _ATK_CRASH = {"ST", "CF", "LW", "RW", "CAM"}
+    _ATK_COVER = {"CB", "CDM"}
+    _DEF_BLOCK = {"CB", "LB", "RB", "LWB", "RWB", "CDM"}
+    _DEF_COUNTER = {"ST", "CF", "LW", "RW"}
+    _crash_ys = [0.30, 0.70, 0.40, 0.60, 0.50, 0.34, 0.66]
+    _side_ys = [0.14, 0.86, 0.20, 0.80, 0.10, 0.90]
 
-    return pts(n_atk, 0.02), pts(n_def, -0.02)
+    def _jit(v, j=0.02):
+        return v + random.uniform(-j, j)
+
+    atk_pts = {}
+    _crash = [i for i in atk_indices if atk_team[i]["pos"] in _ATK_CRASH]
+    _cover = [i for i in atk_indices if atk_team[i]["pos"] in _ATK_COVER]
+    _rest_a = [i for i in atk_indices if i not in _crash and i not in _cover]
+    random.shuffle(_crash); random.shuffle(_cover); random.shuffle(_rest_a)
+    for k, i in enumerate(_crash):
+        atk_pts[i] = (max(0.02, min(0.98, _jit(box_line_x, 0.015))),
+                      max(0.05, min(0.95, _jit(_crash_ys[k % len(_crash_ys)]))))
+    for k, i in enumerate(_cover):
+        y = 0.5 + (0.10 if k % 2 == 0 else -0.10) * (k // 2 + 1)
+        atk_pts[i] = (max(0.02, min(0.98, _jit(halfway_x))), max(0.05, min(0.95, y)))
+    for k, i in enumerate(_rest_a):
+        atk_pts[i] = (max(0.02, min(0.98, _jit(box_line_x + 0.05))),
+                      max(0.05, min(0.95, _jit(_side_ys[k % len(_side_ys)]))))
+
+    def_pts = {}
+    _block = [i for i in def_indices if def_team[i]["pos"] in _DEF_BLOCK]
+    _counter = [i for i in def_indices if def_team[i]["pos"] in _DEF_COUNTER]
+    _rest_d = [i for i in def_indices if i not in _block and i not in _counter]
+    random.shuffle(_block); random.shuffle(_counter); random.shuffle(_rest_d)
+    for k, i in enumerate(_block):
+        def_pts[i] = (max(0.02, min(0.98, _jit(def_block_x, 0.015))),
+                      max(0.05, min(0.95, _jit(_crash_ys[k % len(_crash_ys)]))))
+    for k, i in enumerate(_counter):
+        y = 0.5 + (0.16 if k % 2 == 0 else -0.16) * (k // 2 + 1)
+        def_pts[i] = (max(0.02, min(0.98, _jit(box_line_x))), max(0.05, min(0.95, y)))
+    for k, i in enumerate(_rest_d):
+        def_pts[i] = (max(0.02, min(0.98, _jit(def_block_x + 0.04))),
+                      max(0.05, min(0.95, _jit(_side_ys[k % len(_side_ys)]))))
+
+    return atk_pts, def_pts
 
 
 def _find_my_slot(team_slots, my_pos):
@@ -315,7 +397,15 @@ def layout_formation(formation, is_home):
                 x = base_x + sign * curve * bulge
             coords[idx] = (x, ys[k])
     if not is_home:
-        coords = [(1 - x, y) for x, y in coords]
+        # [버그 수정 — 근본 원인] X만 뒤집으면 공격 방향은 맞아지지만
+        # 좌/우가 안 바뀐다. _POS_XY의 L/R 라벨(LW/RW, LB/RB, LWB/RWB,
+        # LM/RM)은 전부 y=0.5 기준 대칭으로 설계돼 있어서, "왼쪽으로
+        # 공격하는 팀 기준 왼쪽 측면은 화면 아래쪽"이 되려면 y도 같이
+        # 뒤집어야 한다(피치를 통째로 180도 회전하는 것과 동치) — 실측:
+        # 왼쪽으로 공격하는 원정팀의 LW가 화면 위쪽(y=0.14)에, RW가
+        # 화면 아래쪽(y=0.86)에 서 있어서 완전히 뒤바뀌어 있었다(신민용
+        # 지적). X만이 아니라 Y도 같이 뒤집는다.
+        coords = [(1 - x, 1 - y) for x, y in coords]
     return list(zip(slots, coords))
 
 
@@ -384,6 +474,13 @@ def _detect_style(text):
     if "페널티킥 실축" in text:
         return "penalty_miss"
     if "페널티킥 골" in text:
+        return "penalty"
+    # [신규] 상대의 PK 실점("🥅 실점 (PK)" — game_engine._roll_is_pk_concede가
+    # 확률적으로 붙인 꼬리표). 이게 없으면 이 텍스트는 "🥅 실점"이라는
+    # 정보 없는 문구뿐이라 항상 "normal"(오픈플레이 빌드업+슛)로 떨어져서
+    # PK인데 그냥 드리블해서 슛 넣는 것처럼 보였다 — 이제 이미 만들어져
+    # 있는 penalty 분기(스팟킥 1:1 + 20명 클리어 대형)를 그대로 태운다.
+    if "실점" in text and "(PK)" in text:
         return "penalty"
     if "세트피스" in text:
         return "setpiece"          # CB/LB/RB 코너킥 헤더 등
@@ -631,11 +728,54 @@ class MatchSimViewer(QDialog):
         # [신규] 전술 전진/후퇴 폭(_tactical_dx) 조회에 쓰려고 저장해둔다.
         self.home_formation = home_formation
         self.away_formation = away_formation
+        # [신규] 22명 중 나(my_slot)를 뺀 21명은 지금까지 실제 로스터
+        # 스탯과 완전히 무관하게 움직였다. game_engine.py가 저장해둔
+        # "포메이션 슬롯 순서대로 뽑은 11명의 스탯"을 선수 생성 전에
+        # 먼저 읽어둔다(아래에서 인덱스로 그대로 붙여야 하므로).
+        self.lineup_stats = payload.get("lineup_stats") or {}
 
         self.home_players = [{"pos": lab, "x": x, "y": y, "hx": x, "hy": y, "vx": 0.0, "vy": 0.0}
                              for lab, (x, y) in layout_formation(home_formation, True)]
         self.away_players = [{"pos": lab, "x": x, "y": y, "hx": x, "hy": y, "vx": 0.0, "vy": 0.0}
                              for lab, (x, y) in layout_formation(away_formation, False)]
+
+        # [신규] game_engine.py가 저장해둔 라인업 스탯을 포메이션 슬롯
+        # 순서(인덱스)로 그대로 붙인다 — home_players[i]/away_players[i]가
+        # lineup_stats["home"/"away"][i]와 대응하도록 저장 시점에 맞춰
+        # 뒀다(둘 다 같은 FORMATION_SLOTS[formation] 순서를 씀). 스탯이
+        # 없는 슬롯(구버전 세이브, 로스터 없음 등)은 빈 dict로 둬서, 아래
+        # 소비하는 쪽이 항상 .get(key, 기본값) 형태로 안전하게 폴백한다.
+        _lineup_home = (self.lineup_stats.get("home") or [])
+        _lineup_away = (self.lineup_stats.get("away") or [])
+        for i, pl in enumerate(self.home_players):
+            pl["stats"] = (_lineup_home[i] if i < len(_lineup_home) and _lineup_home[i] else {})
+        for i, pl in enumerate(self.away_players):
+            pl["stats"] = (_lineup_away[i] if i < len(_lineup_away) and _lineup_away[i] else {})
+
+        # [신규 — 고정 타겟맨/세컨드 스트라이커] 지금까진 ST 2명 중 "지금
+        # 이 순간 볼과 가까운 쪽"이 매 홀더 교체마다 새로 체크인/침투런을
+        # 나눠 맡았다 — 그래서 같은 선수가 어떤 공격 땐 타겟맨처럼, 다음
+        # 공격 땐 세컨드 스트라이커처럼 계속 바뀌었다("고정된 역할"이 아님
+        # — 신민용 지적). 진짜 투톱 체제(ST/CF 정확히 2명)에서는 이 정체성을
+        # 경기 시작 시 한 번만 정해서 끝까지 유지한다 — 포지셔닝 스탯이
+        # 높고 드리블이 낮을수록 "버텨주는" 타겟맨 성향으로 판정.
+        def _pick_fixed_striker_roles(team):
+            pool = [i for i, p in enumerate(team) if p["pos"] in ("ST", "CF")]
+            if len(pool) != 2:
+                return None, None
+            a, b = pool
+            score_a = (team[a]["stats"].get("positioning", 50)
+                       - team[a]["stats"].get("dribbling", 50))
+            score_b = (team[b]["stats"].get("positioning", 50)
+                       - team[b]["stats"].get("dribbling", 50))
+            target_man = a if score_a >= score_b else b
+            second_striker = b if target_man == a else a
+            return target_man, second_striker
+
+        _tm_h, _ss_h = _pick_fixed_striker_roles(self.home_players)
+        _tm_a, _ss_a = _pick_fixed_striker_roles(self.away_players)
+        self._fixed_target_man_idx = {"home": _tm_h, "away": _tm_a}
+        self._fixed_second_striker_idx = {"home": _ss_h, "away": _ss_a}
 
         my_team_slots = self.home_players if self.is_home else self.away_players
         self.my_slot = _find_my_slot(my_team_slots, my_pos)
@@ -646,6 +786,12 @@ class MatchSimViewer(QDialog):
         # 흐름(턴오버 확률, 내가 공에 관여하는 빈도)에 실제 반영한다.
         self.detail = payload.get("detail", {}) or {}
         self.team_stats = payload.get("team_stats") or {}  # [신규] 점유율 등 통계 연동용
+        # [신규 — 구조 변경] match_flow.generate_possession_log()가 만든
+        # 포제션 로그. 있으면(신규 경기) 이 로그가 파울/코너킥/필러 슈팅의
+        # "언제·누가·어디서"를 전부 결정하고, 뷰어는 텍스트를 다시 파싱해서
+        # 추측하지 않는다. 없으면(구버전 세이브) 기존 사후-추측 로직으로
+        # 자동 폴백한다 — 하위호환 100% 보장.
+        self.possession_log = payload.get("possession_log") or []
 
         # [승부차기] 애니메이션까지는 안 만들고, 경기 종료 시점에 결과
         # 배너만 보여준다(효율적으로 가자는 요청에 맞춤).
@@ -725,7 +871,16 @@ class MatchSimViewer(QDialog):
         self._scene_crowd_start = {}
         self._scene_ball_start = {"x": 0.5, "y": 0.5}
         self._pre_event = None    # 다가오는 예정 이벤트(빌드업 구간 진입 시 설정)
-        self._info_freeze_until = -1.0  # [신규] 파울/코너킥 등 정지 상황 잠깐 멈춤용
+        # [신규 — 검증용 계측] 헤드리스 검증 스크립트가 배너 텍스트만으로
+        # "의도된 순간이동"을 추측하다가, 스로인처럼 원래 배너가 안 뜨는
+        # 의도된 스냅을 실제 버그로 오탐하는 일이 실측으로 확인됐다(예:
+        # match#3 away#9 RW가 스로인으로 터치라인에 스냅됐는데 배너가
+        # 비어있어서 "순간이동 버그"로 잘못 잡힘). 이제 스로인/골킥/코너
+        # 크라우드/파울 재개/킥오프/하프타임처럼 코드가 실제로 좌표를
+        # 의도적으로 스냅하는 모든 지점에서 이 시각을 직접 기록해두고,
+        # 프레임 스냅샷에 실어서 검증 스크립트가 배너 텍스트 추측 없이
+        # 정확히 판별할 수 있게 한다.
+        self._last_restart_clock = -99.0
         self._info_glide_until = -1.0   # [신규] 대형 정렬을 여러 프레임에 걸쳐 보여주는 구간
         # [신규] "상대 팀 코너킥" 등 info 이벤트로 스냅한 키커/크라우드
         # 인덱스를 기록해둔다 — 글라이드 구간 동안 _update_player_positions가
@@ -792,7 +947,17 @@ class MatchSimViewer(QDialog):
         # 반응속도(smooth_time) 둘 다에 쓰여서, 같은 팀이라도 선수마다
         # 살짝 다른 타이밍으로 반응하는 "따로 노는" 자연스러움을 만든다.
         for _pl in self.home_players + self.away_players:
-            _pl["reaction"] = random.uniform(0.82, 1.22)
+            _base_reaction = random.uniform(0.82, 1.22)
+            # [신규 — 로스터 스탯 반영] positioning 스탯(50이 평균)이 있으면
+            # 순수 랜덤 대신 절반은 스탯 기반으로 결정한다 — 포지셔닝
+            # 좋은 선수는 계속 민첩하게, 나쁜 선수는 계속 굼뜨게(경기마다
+            # 무작위로만 바뀌지 않고 실제 능력치를 반영).
+            _positioning = _pl.get("stats", {}).get("positioning")
+            if _positioning is not None:
+                _stat_reaction = 0.82 + (_positioning / 100.0) * 0.40
+                _pl["reaction"] = _base_reaction * 0.5 + _stat_reaction * 0.5
+            else:
+                _pl["reaction"] = _base_reaction
 
         # [신규 - 전환 순간] 턴오버가 일어난 그 직후 잠깐 동안 양팀 모두
         # 평소보다 빠르게 반응하게 만드는 부스트. 예전엔 공수 전환이
@@ -802,6 +967,25 @@ class MatchSimViewer(QDialog):
         # 채워두면 아래 _update_player_positions가 몇 틱에 걸쳐 서서히
         # 원래 속도로 감쇠시킨다.
         self._transition_timer = 0.0
+        self._last_throwin_clock = -99.0  # [신규] 스로인 연속 발생 방지용 쿨다운 기준 시각
+        self._last_byline_clock = -99.0   # [신규] 골라인 아웃 연속 발생 방지용 쿨다운 기준 시각
+        # [재설계 — 데드볼 상태 머신] 예전엔 파울/코너킥/스로인/골킥/
+        # 골라인아웃/필러슛결과 처리가 서로의 존재를 전혀 모른 채 각자
+        # 독립적으로 공/possession을 스냅했고(경계 충돌 버그의 근본 원인),
+        # 그걸 "정해진 시간 동안 다른 재개 금지"라는 고정 락으로 막아보려
+        # 했더니 이번엔 락 시간이 필러 이벤트 간격(평균 1분 내외)보다 길어서
+        # 경기 전체가 멈춰버렸다(실측 확인 — 80개 넘는 예정 이벤트가 전부
+        # 처리되지 못하고 유실됨). 근본적인 문제는 "시간"으로 흉내낸 것 —
+        # 필요한 건 "지금 오픈플레이인지, 데드볼이면 정확히 어떤 종류의
+        # 몇 번째 단계인지"를 추적하는 진짜 상태 하나다. self._db가 None이면
+        # 오픈플레이(_do_pass_or_turnover가 정상 작동), None이 아니면 그
+        # 안의 kind/phase가 지금 어떤 재개를 처리 중인지 정확히 말해준다.
+        # 각 kind는 "완료 조건"이 실제 애니메이션 완료(_pass_flight가
+        # 끝났다/글라이드 타이머가 끝났다)에 묶여 있어서, 임의의 시간
+        # 추측이 아니라 실제로 그 재개가 끝났을 때만 오픈플레이로
+        # 복귀한다(_enter_dead_ball/_advance_dead_ball 참고).
+        self._db = None
+        self._target_lane_y = 0.5   # [신규] 전술 엔진 로그의 실제 레인 힌트
         self._TRANSITION_DURATION = 1.1   # 이 시간(가상 초) 동안 부스트가 감쇠
         self._TRANSITION_BOOST = 0.55     # 최대 부스트 시 속도 +55%
 
@@ -819,19 +1003,21 @@ class MatchSimViewer(QDialog):
         self._holding_mid_idx = None     # [신규] 홀딩 CM
         self._check_in_idx = None        # [신규] 체크인하는 ST
         self._run_behind_idx = None      # [신규] 침투런하는 ST
+        self._volpiana_idx = None        # [신규] 라 볼피아나 단독 CDM
         self._breakthrough_marks = {}    # [신규] 라인 브레이크 침투 마크
         self._breakthrough_atk_side = None
         self._assign_roles()
 
-        # [신규 — 죽어있던 통계 살리기] team_stats["shots"]는 계산은 되는데
-        # 지금까지 화면엔 전혀 반영이 안 됐다. 실제 타임라인엔 "내가 관여한"
-        # 사건(내 골/도움/PK 실축/내 세이브)만 있어서, 팀 전체 슈팅 수(예:
-        # 13개)와 실제로 재생에 나오는 장면 수(2~3개) 사이에 큰 괴리가
-        # 있었다. 부족한 만큼 "⚡ [팀] 슈팅" 필러 이벤트를 시간대를 겹치지
-        # 않게 골고루 끼워 넣어서, 통계와 영상이 서로 맞아떨어지게 한다.
-        # 스코어/개인 기록에는 전혀 영향을 안 준다 — 순수하게 "이 팀이
-        # 실제로 이만큼 슈팅을 시도했다"를 화면에도 보여주는 연출용 채움.
-        if self.team_stats:
+        # [신규 — 죽어있던 통계 살리기 / 이제는 구버전 전용 폴백] team_stats
+        # ["shots"]는 계산은 되는데 예전엔 화면에 전혀 반영이 안 됐다.
+        # match_flow.generate_possession_log()가 이 역할을 이제 훨씬 정확히
+        # 대체한다(team_stats를 하한선으로 삼아 실제 개인 이벤트와 절대
+        # 어긋나지 않게 채움 + 로그 자체에 필러 슈팅 레코드가 이미 있음).
+        # possession_log가 있으면 이 블록은 완전히 건너뛴다 — 안 그러면
+        # 로그의 필러 슈팅 + 이 블록의 필러 슈팅이 중복으로 끼어들어서
+        # 슈팅 개수가 두 배로 뻥튀기된다. 로그가 없는 구버전 세이브에서만
+        # 살아서 기존처럼 동작한다.
+        if not self.possession_log and self.team_stats:
             _used_minutes = {e["minute"] for e in self.timeline}
             for _side, _side_name in (("home", self.home_name), ("away", self.away_name)):
                 _stat = self.team_stats.get(_side) or {}
@@ -860,6 +1046,12 @@ class MatchSimViewer(QDialog):
                         "_filler_side": _side,
                     })
             self.timeline.sort(key=lambda e: e["minute"])
+
+        # [신규] possession_log 기반 필러 레코드 준비. 텍스트가 있는
+        # 레코드(text is not None)는 이미 self.timeline에 진짜 개인
+        # 이벤트로 존재하므로 여기서는 건드리지 않는다 — 여기 담기는 건
+        # "텍스트 없는" 필러(팀 전체 슈팅/코너/파울/그냥 빌드업)뿐이다.
+        self._plog = [dict(r, done=False) for r in self.possession_log if r.get("text") is None]
 
         # [결정론적 재생의 핵심] 재생 배속이나 실시간 QTimer 성능과 완전히
         # 무관하게, 가상 시계를 처음부터 끝까지 고정 dt(_FRAME_DT)로 단
@@ -901,7 +1093,16 @@ class MatchSimViewer(QDialog):
                # 곧장 거짓이 되어 루프가 그 즉시 멈췄다 — 배너가 뜬 걸
                # 보여줄 시간도 없이 영상이 끝나버리는 문제. 배너가 아직
                # 옅어지는(감쇠) 중이면 그것도 마저 보여준 뒤에 끝낸다.
-               or self.banner_alpha > 0) and _tail_guard < 300:
+               or self.banner_alpha > 0
+               # [버그 수정 — possession_log 필러 유실 방지] 필러 슈팅이
+               # match_end 바로 직전에 트리거되면, 비행이 끝나 골/선방을
+               # 반영하는 시점(self.clock+dur)이 match_end를 살짝 넘길 수
+               # 있다. 이 조건이 없으면 그 골이 스코어에 반영되기 전에
+               # 굽기가 멈춰버려서 "실제 최종 스코어보다 뷰어 스코어가
+               # 하나 모자란" 채로 영상이 끝나는 사고가 난다(실측으로
+               # 재현됨 — 4-3 경기가 4-2로 끝나는 프레임이 나왔었음).
+               or bool(self._db is not None)
+               or any(not r["done"] for r in self._plog)) and _tail_guard < 900:
             self._advance_one_tick(1.0)
             self._frames.append(self._snapshot_frame())
             _tail_guard += 1
@@ -944,6 +1145,7 @@ class MatchSimViewer(QDialog):
             "banner_text": self.banner_text,
             "banner_color": self.banner_color,
             "banner_alpha": self.banner_alpha,
+            "last_restart_clock": self._last_restart_clock,
         }
 
     def _reset_live_state(self):
@@ -968,10 +1170,15 @@ class MatchSimViewer(QDialog):
         self._scene_crowd = {}
         self._scene_crowd_start = {}
         self._pre_event = None
-        self._info_freeze_until = -1.0
+        self._last_restart_clock = -99.0
         self._info_glide_until = -1.0
         self._corner_lock_home = set()
         self._corner_lock_away = set()
+        self._plog = [dict(r, done=False) for r in self.possession_log if r.get("text") is None]
+        self._last_throwin_clock = -99.0
+        self._last_byline_clock = -99.0
+        self._db = None
+        self._target_lane_y = 0.5
         self._pass_flight = None
         self.ball_trail = []
         self._halftime_reset_done = False
@@ -1083,6 +1290,7 @@ class MatchSimViewer(QDialog):
         """[신규] 코너킥 발생 시 박스 주변으로 대부분의 선수를 즉시 스냅
         시킨다. 세트피스 씬(우리 팀 코너킥)은 자체 크라우드 로직이 있지만,
         "상대 팀 코너킥"은 배너만 뜨는 info라 이 함수로 대신 처리한다."""
+        self._last_restart_clock = self.clock
         atk_goal_x = 1.0 if attacking_side == "home" else 0.0
         box_x = 0.88 if atk_goal_x == 1.0 else 0.12
         box_dir = 1 if atk_goal_x == 1.0 else -1
@@ -1169,6 +1377,25 @@ class MatchSimViewer(QDialog):
         self.ball_trail = []
         self._start_pass_flight((corner_x, corner_y), (target_x, target_y))
 
+        # [버그 수정 — 근본 원인] 이 함수는 크로스 궤적만 만들고
+        # self.possession/self.holder는 한 번도 안 바꿨다. 그러면 크로스가
+        # 도착한 뒤 평소 흐름(_update_possession)이 재개될 때, 코너킥 전에
+        # 남아있던 "예전 홀더"가 그대로 이어져서 — 팀도 위치도 이번 코너
+        # 상황과 전혀 무관한 선수한테 공이 붙어버렸다. 그 선수가 하필
+        # 자기 팀 진영 쪽에 있었다면 "코너킥 받은 팀이 갑자기 자기 골대
+        # 쪽으로 달리는" 것처럼 보였다(정확히 지적된 그 버그). 크로스를
+        # 받는 쪽(공격팀 크라우드 중 낙하 지점에 가장 가까운 선수 = 헤더
+        # 경합에서 이겨 첫 터치한 선수 역할)을 명시적으로 새 홀더로 지정
+        # 한다.
+        if crowd_atk:
+            new_holder = min(crowd_atk, key=lambda i: abs(atk_team[i]["x"] - target_x)
+                                                      + abs(atk_team[i]["y"] - target_y))
+        else:
+            new_holder = taker
+        self.possession = attacking_side
+        self.holder = new_holder
+        self._assign_roles()
+
     def _assign_roles(self):
         """[떨림 방지] 홀더가 바뀔 때(패스/턴오버/초기화 시점)만 호출.
         지원런 2명과 압박 수비 1명을 정해서 self._support_idx/_presser_idx에
@@ -1181,14 +1408,16 @@ class MatchSimViewer(QDialog):
         holder = holder_team[self.holder]
         sign_holder = 1 if holder_side == "home" else -1
 
-        # [버그 수정] 예전엔 "홀더보다 앞선 후보 중 가장 가까운 2명"을
-        # 순수 거리순으로만 뽑아서, 어쩌다 둘 다 홀더와 같은 쪽(예: 둘 다
-        # 위쪽 채널)에 있으면 반대쪽엔 패스 받을 사람이 아무도 없이 볼
-        # 옆에 다닥다닥 붙어있는 것처럼 보였다("사이드로 안 벌려서 패스각을
-        # 안 준다"는 지적 그대로). 위/아래 채널에서 각각 한 명씩(가능하면)
-        # 뽑아서, 최소한 좌우 양쪽에 패스 받을 옵션이 하나씩은 생기게 한다.
+        # [버그 수정 — 겹침 방지] LW/RW/LB/RB(_WIDE_ROLES)는 이제 별도의
+        # "오버래핑 와이드런"(터치라인까지 적극적으로 전진) 로직을 갖고
+        # 있다. 이 서포트런 풀에 같이 들어가면, 아래 elif 체인에서 서포트
+        # 분기가 와이드런 분기보다 먼저 평가돼 target_x/y를 통째로
+        # 덮어써버려서 "터치라인으로 안 뛰고 홀더 쪽으로 당겨지는" 충돌이
+        # 났다(실측 확인됨). 측면 자원은 여기서 제외해 자기 고유의 와이드
+        # 런을 그대로 유지하게 한다.
         _support_pool = [i for i, pl in enumerate(holder_team)
-                         if i != self.holder and (pl["x"] - holder["x"]) * sign_holder > -0.06]
+                         if i != self.holder and pl["pos"] not in _WIDE_ROLES
+                         and (pl["x"] - holder["x"]) * sign_holder > -0.06]
         _upper = [i for i in _support_pool if holder_team[i]["y"] < holder["y"] - 0.04]
         _lower = [i for i in _support_pool if holder_team[i]["y"] > holder["y"] + 0.04]
 
@@ -1237,9 +1466,27 @@ class MatchSimViewer(QDialog):
         # 나란히 서 있는 대신, 볼과 가까운 한 명은 "체크인"(볼을 받으러
         # 내려옴), 먼 한 명은 "침투런"(최전방에 남아 뒷공간을 노림)으로
         # 나눈다.
+        # [버그 수정 — 범위 확장, 그리고 겹침 방지] 예전엔 ST/CF가 2명
+        # 있는 포메이션(투톱)에서만 체크인/침투런이 발동해서, ST가 1명뿐인
+        # 흔한 원톱 포메이션(4-2-3-1 등)에서는 단 한 번도 안 나왔다. CAM을
+        # 후보에 추가해 원톱에서도(ST+CAM 조합으로) 나오게 했다. 단, LW/RW
+        # 는 이 풀에서 제외한다 — 이 둘은 이제 별도의 "오버래핑 와이드런"
+        # 로직(터치라인까지 적극적으로 전진)을 갖고 있는데, 이 체크인/
+        # 침투런 분기가 아래 elif 체인에서 그 로직보다 나중에 평가돼서
+        # target_x/y를 통째로 덮어써버리는 충돌이 있었다(실측 확인 —
+        # 와이드런 수식을 넣었는데도 LW/RW가 여전히 중앙 쪽에 머물렀음).
         st_pool = [i for i, pl in enumerate(holder_team)
-                   if pl["pos"] in ("ST", "CF") and i != self.holder]
-        if len(st_pool) >= 2:
+                   if pl["pos"] in (_ATTACK_ROLES - {"LW", "RW"}) and i != self.holder]
+        _fixed_tm = self._fixed_target_man_idx.get(holder_side)
+        _fixed_ss = self._fixed_second_striker_idx.get(holder_side)
+        if (_fixed_tm is not None and _fixed_ss is not None
+                and _fixed_tm != self.holder and _fixed_ss != self.holder):
+            # [신규 — 고정 역할] 진짜 투톱 체제는 매번 다시 계산하지 않고
+            # 경기 시작 때 정한 정체성을 그대로 쓴다 — 세컨드 스트라이커는
+            # 항상 체크인(내려와서 연계), 타겟맨은 항상 침투런(최전방 유지).
+            self._check_in_idx = _fixed_ss
+            self._run_behind_idx = _fixed_tm
+        elif len(st_pool) >= 2:
             st_pool.sort(key=lambda i: abs(holder_team[i]["x"] - holder["x"])
                                        + abs(holder_team[i]["y"] - holder["y"]))
             self._check_in_idx = st_pool[0]
@@ -1248,6 +1495,14 @@ class MatchSimViewer(QDialog):
             self._check_in_idx = None
             self._run_behind_idx = None
 
+        # [신규 — 라 볼피아나] 단독 CDM(더블 피벗이 아닌 원볼란치 체제
+        # — 4-1-4-1/3-5-2/4-3-3 등)만 대상으로 한다. CDM이 2명인
+        # 포메이션(4-2-3-1)은 이미 홀딩/앵커로 역할이 나뉘어 있어
+        # 이 움직임이 필요 없다.
+        cdm_pool = [i for i, pl in enumerate(holder_team)
+                    if pl["pos"] == "CDM" and i != self.holder]
+        self._volpiana_idx = cdm_pool[0] if len(cdm_pool) == 1 else None
+
         # [신규 - 돌파 마크] 지금까지는 "홀더 근처"만 반응했다(프레서 1명+
         # 커버 2명). 그래서 공을 갖고 있지 않은 채 이미 수비 라인 뒤까지
         # 파고든 위험한 침투 선수는 완전히 무방비였다(사용자가 캡처한
@@ -1255,25 +1510,44 @@ class MatchSimViewer(QDialog):
         # 공격측 선수 중 상대의 최종 수비 라인(오프사이드 클램프와 동일한
         # 기준선)보다 더 깊숙이 들어온 선수를 찾아서, 프레서/커버로 이미
         # 반응 중이지 않은 나머지 수비수 중 가장 가까운 사람을 하나씩
-        # 붙인다(맨마킹). 최대 2명까지만 — 전원이 쫓아가면 이번엔 반대로
-        # 뒷공간이 텅 빈다.
+        # 붙인다(맨마킹).
+        #
+        # [버그 수정 — 근본 원인] "최종라인보다 더 뒤"라는 조건 하나만
+        # 쓰다 보니, 백라인이 이미 로우블록으로 내려앉아 있으면(수비진
+        # 자체가 박스 안 깊숙이 있음) 그보다 "더 뒤"까지 파고든 선수만
+        # 마크 대상이 되고, 정작 박스 안(수비 라인 앞이라도)에 서 있는
+        # 위험한 공격수는 라인을 못 넘었다는 이유로 계속 무방비로
+        # 방치됐다(실측: 박스 근접 상황 중 14~23%가 무마크). "라인
+        # 돌파" 조건과 별개로 "상대 진영 박스 안(골라인 기준 0.20 이내)"
+        # 조건을 추가해 두 기준을 합집합으로 마크 후보에 넣는다. 최대
+        # 3명까지만 — 전원이 쫓아가면 이번엔 반대로 뒷공간이 텅 빈다.
         self._breakthrough_marks = {}
         self._breakthrough_atk_side = holder_side
+        _BOX_DEPTH = 0.20
+        own_goal_x_def = 1.0 if sign_holder > 0 else 0.0
+        breakers = set()
         opp_def_xs = [p["x"] for p in opp_team if p["pos"] != "GK"]
         if opp_def_xs:
             if sign_holder > 0:
                 last_line = max(opp_def_xs)
-                breakers = [i for i, p in enumerate(holder_team)
-                            if i != self.holder and p["x"] > last_line + 0.03]
+                breakers |= {i for i, p in enumerate(holder_team)
+                             if i != self.holder and p["x"] > last_line + 0.03}
             else:
                 last_line = min(opp_def_xs)
-                breakers = [i for i, p in enumerate(holder_team)
-                            if i != self.holder and p["x"] < last_line - 0.03]
-            breakers.sort(key=lambda i: abs(holder_team[i]["x"] - last_line))
+                breakers |= {i for i, p in enumerate(holder_team)
+                             if i != self.holder and p["x"] < last_line - 0.03}
+        if sign_holder > 0:
+            breakers |= {i for i, p in enumerate(holder_team)
+                         if i != self.holder and p["x"] > own_goal_x_def - _BOX_DEPTH}
+        else:
+            breakers |= {i for i, p in enumerate(holder_team)
+                         if i != self.holder and p["x"] < own_goal_x_def + _BOX_DEPTH}
+        if breakers:
+            breakers = sorted(breakers, key=lambda i: abs(holder_team[i]["x"] - own_goal_x_def))
             used_defs = {self._presser_idx} | set(self._cover_idx)
             avail_defs = [i for i in range(len(opp_team))
                           if i not in used_defs and opp_team[i]["pos"] != "GK"]
-            for atk_i in breakers[:2]:
+            for atk_i in breakers[:3]:
                 if not avail_defs:
                     break
                 atk_pl = holder_team[atk_i]
@@ -1315,6 +1589,16 @@ class MatchSimViewer(QDialog):
         self.speed_combo.currentTextChanged.connect(self._on_speed_changed)
         ctrl.addWidget(self.speed_combo)
 
+        # [신규] 디버그 캡처 — 재생 중 "이거 이상한데?" 싶은 순간 누르면,
+        # 그 앞뒤 몇 초 구간의 22명+공 좌표/배너를 통째로 JSON 파일로
+        # 저장한다. 말로 "전반 O분쯤 이상했다"고 설명하는 것보다 훨씬
+        # 정확하게, 정확한 프레임 단위로 재현/진단할 수 있다.
+        debug_btn = QPushButton("🐛 디버그 캡처")
+        debug_btn.setToolTip("방금 화면이 이상해 보였다면 눌러주세요 — "
+                              "현재 시점 앞뒤 몇 초 구간을 파일로 저장합니다.")
+        debug_btn.clicked.connect(self._export_debug_capture)
+        ctrl.addWidget(debug_btn)
+
         ctrl.addStretch()
         close_btn = QPushButton("닫기")
         close_btn.clicked.connect(self.close)
@@ -1338,6 +1622,52 @@ class MatchSimViewer(QDialog):
 
     def _on_speed_changed(self, text):
         self.speed = float(text.replace("x", ""))
+
+    def _export_debug_capture(self):
+        """[신규] 재생 화면이 이상해 보이는 순간 이 버튼을 누르면, 현재
+        시점 앞뒤 몇 초 구간의 22명+공 좌표와 배너 텍스트를 통째로 JSON
+        파일로 저장한다. "전반 O분쯤 이상했다" 같은 말보다 훨씬 정확하게
+        정확한 프레임 단위로 재현/진단할 수 있다 — 이 창을 만든 사람(개발
+        자)에게 이 파일만 전달하면, 그 순간 어떤 씬/상황이었는지, 어떤
+        선수가 어디서 어디로 움직였는지를 코드 없이도 그대로 들여다볼 수
+        있다.
+        """
+        try:
+            idx = max(0, min(len(self._frames) - 1, int(self.clock / self._FRAME_DT)))
+            # [주의] self.clock은 "실제 초"가 아니라 가상 경기 시계(분)다.
+            # 앞뒤 1.5분(경기 시계 기준)씩 잘라내면 충분히 상황을 파악할
+            # 수 있으면서도 파일이 너무 커지지 않는다.
+            window_frames = int(1.5 / self._FRAME_DT)
+            lo = max(0, idx - window_frames)
+            hi = min(len(self._frames), idx + window_frames + 1)
+
+            capture = {
+                "captured_at_clock": self.clock,
+                "home_name": self.home_name,
+                "away_name": self.away_name,
+                "score_at_capture": [self.score_home, self.score_away],
+                "home_positions": [pl["pos"] for pl in self.home_players],
+                "away_positions": [pl["pos"] for pl in self.away_players],
+                "frame_dt": self._FRAME_DT,
+                "clicked_frame_index": idx,
+                "window_start_index": lo,
+                "frames": self._frames[lo:hi],
+            }
+
+            out_dir = os.path.join(os.getcwd(), "debug_captures")
+            os.makedirs(out_dir, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            fname = f"debug_capture_{ts}_clock{self.clock:.1f}.json"
+            fpath = os.path.join(out_dir, fname)
+            with open(fpath, "w", encoding="utf-8") as f:
+                json.dump(capture, f, ensure_ascii=False, indent=1)
+
+            QMessageBox.information(
+                self, "디버그 캡처 저장됨",
+                f"저장 완료:\n{fpath}\n\n이 파일을 그대로 보내주시면 정확히 이 순간을 재현해서 확인할게요."
+            )
+        except Exception as ex:
+            QMessageBox.warning(self, "디버그 캡처 실패", f"저장 중 오류가 발생했습니다:\n{ex}")
 
     def closeEvent(self, event):
         self.timer.stop()
@@ -1407,6 +1737,7 @@ class MatchSimViewer(QDialog):
         fh_end = 45 + self.stoppage1
         if not self._halftime_reset_done and self.clock >= fh_end:
             self._halftime_reset_done = True
+            self._last_restart_clock = self.clock
             for team in (self.home_players, self.away_players):
                 for pl in team:
                     pl["x"], pl["y"] = pl["hx"], pl["hy"]
@@ -1463,114 +1794,153 @@ class MatchSimViewer(QDialog):
         # 등)엔 잡히는데 재생 화면엔 하나도 안 보였다.
         for e in self.timeline:
             if not e["done"] and e["kind"] == "info" and self.clock >= e["minute"]:
-                e["done"] = True
-                self.banner_text = e["text"]
-                self.banner_color = "#ffcc55"
-                self.banner_alpha = 255
-                # [버그 수정] 파울/코너킥처럼 실제로 휘슬이 불려 플레이가
-                # 멈추는 상황은, 배너만 띄우고 밑에서는 평소처럼 드리블이
-                # 계속되면 안 된다("파울인데 그대로 드리블하는" 부자연스러운
-                # 장면 그대로). 잠깐 선수 이동 갱신을 멈춰서(SmoothDamp가
-                # 자연히 감속해 멈춤) 세트피스 준비 자세처럼 보이게 한다.
-                if any(k in e["text"] for k in _STOPPAGE_KEYWORDS):
+                is_stoppage = any(k in e["text"] for k in _STOPPAGE_KEYWORDS)
+                is_filler_shot = bool(e.get("_filler_side")) and self._scene_kind is None
+                if is_stoppage:
                     # [버그 수정 — 근본 원인] 예전엔 "누가 반칙을 했는지/누가
                     # 코너킥을 얻었는지"라는 실제 텍스트 정보("우리 팀"/
                     # "상대 팀")를 전혀 안 보고, 그냥 공이 지금 어느 쪽
-                    # 절반에 있는지(x>=0.5?)만으로 재개팀을 추측했다. 이건
-                    # 완전히 별개의 정보라서(예: 우리가 상대 진영 깊숙이서
-                    # 파울을 당해도 공이 x>=0.5에 있으면 엉뚱하게 홈팀이
-                    # 재개하는 것으로 잘못 판정될 수 있었다), "우리 팀
-                    # 파울"인데 레드팀이 자기 골대 쪽으로 움직이는 것처럼
-                    # 보이는 등 방향이 뒤죽박죽되는 원인이었다. 이제 텍스트
-                    # 자체("우리 팀"/"상대 팀")로 실제 재개팀을 직접 판정한다.
+                    # 절반에 있는지(x>=0.5?)만으로 재개팀을 추측했다. 이제
+                    # 텍스트 자체("우리 팀"/"상대 팀")로 실제 재개팀을 직접
+                    # 판정한다.
                     my_side = "home" if self.is_home else "away"
                     opp_side = "away" if self.is_home else "home"
                     if "파울" in e["text"]:
-                        # "우리 팀 파울" = 우리가 반칙 → 상대가 프리킥 재개.
-                        # "상대 팀 파울" = 상대가 반칙 → 우리가 프리킥 재개.
                         restart_side = opp_side if "우리 팀" in e["text"] else my_side
-                    elif "코너킥" in e["text"]:
-                        # "우리 팀 코너킥" = 우리가 코너를 얻어 우리가 참.
-                        # "상대 팀 코너킥" = 상대가 코너를 얻어 상대가 참.
+                        kind = "foul"
+                    else:  # "코너킥"
                         restart_side = my_side if "우리 팀" in e["text"] else opp_side
-                    else:
-                        restart_side = "home" if self.ball["x"] >= 0.5 else "away"
-                    self.possession = restart_side
-                    # [버그 수정 — 근본 원인] self.possession만 바꾸고
-                    # self.holder는 그대로 둬서, 이전 팀에서 쓰던 holder
-                    # 인덱스를 새 팀 배열에 그대로 대입해버리는 사고가 났다
-                    # (예: 예전 holder=5가 새 팀에선 전혀 다른 엉뚱한
-                    # 선수를 가리킴). 그 선수가 실제 공 위치와 무관한
-                    # 자리에 있으면 재개 후 드리블/패스 전개가 산으로 갔다.
-                    # 재개팀에서 지금 공과 가장 가까운 필드 플레이어(GK
-                    # 제외)를 새 holder로 정하고, 역할(서포트/프레서/커버
-                    # 등)도 이 시점 기준으로 다시 배정한다.
-                    restart_team = self.home_players if restart_side == "home" else self.away_players
-                    self.holder = min(
-                        (i for i, pl in enumerate(restart_team) if pl["pos"] != "GK"),
-                        key=lambda i: abs(restart_team[i]["x"] - self.ball["x"])
-                                     + abs(restart_team[i]["y"] - self.ball["y"]))
-                    self._assign_roles()
-                    # [버그 수정] 예전엔 shape_push(공격 전개도)가 소유권을
-                    # 오래 유지해야만 서서히 올라가는 값이라, 우리 팀이
-                    # 방금 상대 진영까지 밀고 올라간 상태에서 파울이 나도
-                    # shape_push가 미처 못 따라와 있으면 수비수들이 여전히
-                    # 자기 진영에 남은 옛 대형으로 스냅됐다("파울 땄는데 왜
-                    # 다 뒤에 있냐"는 지적 그대로). 스냅 직전에 실제 공
-                    # 위치를 기준으로 두 팀의 shape_push를 즉시 맞춰서,
-                    # "지금 이 순간 실제로 어디까지 밀고 올라가 있는지"가
-                    # 바로 반영되게 한다.
-                    _bx = self.ball["x"]
-                    self.shape_push["home"] = max(0.0, min(1.0, _bx))
-                    self.shape_push["away"] = max(0.0, min(1.0, 1.0 - _bx))
-                    # [버그 수정 — 근본 원인] 예전엔 "12번 반복 호출"이
-                    # 전부 이 한 틱 안에서 끝나버려서, 사전계산 프레임에는
-                    # 결과 딱 1장만 찍혔다. 즉 몇 번을 반복 계산하든 화면
-                    # 상으로는 "그 프레임에서 다음 프레임으로 순간이동"으로
-                    # 보일 수밖에 없었다(사용자가 지적한 "부드럽지 않다"의
-                    # 정체). 이제는 즉시 수렴시키지 않고, 앞으로 여러 실제
-                    # 틱(각각 프레임 한 장씩 찍힘)에 걸쳐 정상보다 살짝 빠른
-                    # 속도로 서서히 정렬되도록 "글라이드 구간"만 설정한다.
-                    if "코너킥" in e["text"]:
-                        self._snap_corner_crowd(restart_side)
-                    self._info_glide_until = self.clock + 0.6
-                    self._info_freeze_until = -1.0
-                elif e.get("_filler_side") and self._scene_kind is None:
-                    # [신규 — 죽어있던 통계 살리기] team_stats["shots"]를
-                    # 맞추려고 끼워 넣은 필러 이벤트. 실제 "씬"까지는 안
-                    # 만들고(그러면 골/선방 로직과 얽혀 리스크가 커진다),
-                    # 이미 검증된 패스 비행(_start_pass_flight)만 재사용해서
-                    # 그 팀 선수 하나가 골대 쪽으로 슛을 시도하는 궤적을
-                    # 그린다. 유효슈팅/빗나감 비율은 그 팀의 실제
-                    # shots_on/shots 비율을 그대로 따른다 — 통계와 영상이
-                    # 서로 어긋나지 않게.
+                        kind = "corner"
+                    # [재설계 — 데드볼 상태 머신] 이미 다른 데드볼이 진행
+                    # 중이면 이 이벤트는 한 틱 미룬다(done을 안 찍고 다음
+                    # 틱에 재시도) — 서로 다른 두 재개가 같은 순간에 겹쳐
+                    # 공을 두 번 스냅해버리는 충돌을 상태 하나로 원천 차단.
+                    if not self._enter_dead_ball(kind, side=restart_side):
+                        continue
+                elif is_filler_shot:
+                    # [신규 — 죽어있던 통계 살리기, 구버전 세이브 전용
+                    # 폴백] team_stats["shots"]를 맞추려고 끼워 넣은 필러
+                    # 이벤트(possession_log가 있는 신규 세이브는 아래 plog
+                    # 루프가 대신 처리하므로 이 경로를 안 탐). 유효슈팅/
+                    # 빗나감 비율은 그 팀의 실제 shots_on/shots 비율을
+                    # 따르고, 실제 결과 처리는 "shot" 데드볼 kind가
+                    # 전담한다(골킥/코너로 이어지는 것까지 전부 상태
+                    # 머신이 알아서 한다 — 예전처럼 결과 처리를 깜빡할
+                    # 여지가 없다).
                     _fside = e["_filler_side"]
-                    _fteam = self.home_players if _fside == "home" else self.away_players
-                    _fgoal_x = 1.0 if _fside == "home" else 0.0
-                    _fpool = [i for i, pl in enumerate(_fteam)
-                              if pl["pos"] in (_ATTACK_ROLES | _SUPPORT_ROLES)]
-                    _ftaker = random.choice(_fpool) if _fpool else random.randrange(len(_fteam))
-                    _fsx = _clamp_shot_start_x(_fteam[_ftaker]["x"], _fgoal_x, _SHOT_ZONE_NORMAL)
-                    _fsy = _fteam[_ftaker]["y"]
                     _fstat = (self.team_stats or {}).get(_fside, {})
                     _on_ratio = 0.35
                     if _fstat.get("shots"):
                         _on_ratio = max(0.15, min(0.75,
                             (_fstat.get("shots_on", 0) or 0) / max(1, _fstat["shots"])))
-                    if random.random() < _on_ratio:
-                        _fty = 0.5 + random.uniform(-1, 1) * _GOAL_HALF_HEIGHT * 0.8
-                    else:
-                        _fsign = random.choice([-1, 1])
-                        _fty = 0.5 + _fsign * random.uniform(
-                            _GOAL_HALF_HEIGHT * 1.3, _GOAL_HALF_HEIGHT * 3.0)
-                    _fty = max(0.04, min(0.96, _fty))
-                    self.possession = _fside
-                    self.holder = _ftaker
+                    _foutcome = "save" if random.random() < _on_ratio else "shot_off"
+                    if not self._enter_dead_ball("shot", side=_fside, outcome=_foutcome):
+                        continue
+                e["done"] = True
+                self.banner_text = e["text"]
+                self.banner_color = "#ffcc55"
+                self.banner_alpha = 255
+
+        # [신규 — possession_log 기반, 구조 변경의 핵심] 텍스트 없는 필러
+        # 레코드(팀 전체 슈팅/코너/파울/그냥 빌드업)를 처리한다. 텍스트가
+        # 있는 진짜 개인 이벤트는 이미 위 self.timeline 루프에서 처리되니
+        # 여기서는 안 건드린다 — self._plog는 __init__에서 text가 None인
+        # 레코드만 골라 담아뒀다. 예전 파울/코너킥 처리와 결정적으로 다른
+        # 점: "team" 필드가 이미 정확한 주체를 담고 있어서, 텍스트("우리
+        # 팀"/"상대 팀")를 다시 파싱해서 재개팀을 추측할 필요가 없다 —
+        # 그 추측 로직 자체가 반복된 버그의 원인이었다.
+        for _pr in self._plog:
+            if _pr["done"] or self.clock < _pr["min"]:
+                continue
+            # [버그 수정 -- 근본 원인] 예전엔 여기서 바로 done=True를 찍은
+            # 뒤 "씬 진행 중이면 그냥 continue"했다. 그러면 그 필러는
+            # done 처리만 되고 실제로는 아무 것도 안 한 채 영원히
+            # 사라졌다 -- 특히 outcome=="goal"인 필러가 하필 실제 개인
+            # 이벤트 씬(빌드업~마무리, 몇 초간 지속)과 겹치면 그 골이
+            # 통째로 유실돼서 최종 스코어가 실제보다 낮게 끝났다(실측
+            # 재현됨). done 표시는 "실제로 처리했을 때만" 찍고, 씬이
+            # 끝날 때까지는 매 틱 다시 시도하게 한다.
+            if self._scene_kind is not None:
+                continue
+            _outcome = _pr["outcome"]
+            _team_name = self.home_name if _pr["team"] == "home" else self.away_name
+
+            if _outcome == "buildup":
+                # [신규] 배너/정지 없이 "이 구간엔 이 팀이 이 구역에서
+                # 공을 갖고 있었다"는 부드러운 힌트만 준다 -- 공/possession을
+                # 직접 스냅하는 게 아니라 데드볼과 절대 충돌하지 않으므로
+                # 상태 머신을 거치지 않고 항상 즉시 처리한다.
+                _pr["done"] = True
+                # [버그 방지] possession만 바꾸고 holder를 안 바꾸면,
+                # 이전 팀에서 쓰던 holder 인덱스가 새 팀 배열의 엉뚱한
+                # 선수를 가리키게 된다. 팀이 실제로 바뀔 때만 다시 잡는다.
+                if _pr["team"] != self.possession:
+                    self.possession = _pr["team"]
+                    _bteam = self.home_players if _pr["team"] == "home" else self.away_players
+                    self.holder = min(
+                        (i for i, pl in enumerate(_bteam) if pl["pos"] != "GK"),
+                        key=lambda i: abs(_bteam[i]["x"] - self.ball["x"])
+                                     + abs(_bteam[i]["y"] - self.ball["y"]))
                     self._assign_roles()
-                    self.ball["x"], self.ball["y"] = _fsx, _fsy
-                    self.ball_trail = []
-                    self._start_pass_flight((_fsx, _fsy), (_fgoal_x, _fty))
-                    self.pass_clock = 0.9  # 슛 직후 바로 다음 판정으로 안 끊기게 살짝 여유
+                _zone_push = {"def": 0.2, "mid": 0.5, "att": 0.8}.get(_pr["zone"], 0.5)
+                if _pr["team"] == "home":
+                    self.shape_push["home"] = _zone_push
+                    self.shape_push["away"] = 1.0 - _zone_push
+                else:
+                    self.shape_push["away"] = _zone_push
+                    self.shape_push["home"] = 1.0 - _zone_push
+                # [신규 — 진짜 레인 반영] 전술 엔진이 만든 로그는 "이 분에
+                # 실제로 어느 레인(좌/중/우)에서 우세했는가"까지 담고
+                # 있다. 이 힌트를 다음 패스 타겟 선정(_do_pass_or_turnover)
+                # 이 참고할 목표 y로 저장해둔다 — 포메이션 매치업 계산이
+                # 실제로 화면에서 "그 쪽으로 공이 몰린다"는 그림으로
+                # 이어지게 하는 마지막 연결고리. 없는 로그(구버전 필러)는
+                # lane이 없으므로 그냥 건드리지 않는다(중립 유지).
+                _lane = _pr.get("lane")
+                if _lane:
+                    self._target_lane_y = {"L": 0.18, "C": 0.5, "R": 0.82}.get(_lane, 0.5)
+                continue
+
+            # [버그 수정 -- 근본 원인] 파울은 지금까지 "team_stats에 맞춰
+            # 예약된 시각이 되면 무조건 발동"이었다 -- 실제로 그 시각에
+            # 반칙팀 선수가 홀더 근처에 있는지는 전혀 안 봤다. 그래서
+            # 실측 디버그 캡처에서 반칙팀 최근접 선수가 홀더에서 정규화
+            # 거리 0.08(피치폭 기준 약 57px)이나 떨어진 채로 파울 배너가
+            # 뜨는 게 그대로 재현됐다("아무도 안 닿았는데 파울이 터진다"는
+            # 지적의 정확한 원인). 반칙팀 중 홀더와 충분히 가까운 선수가
+            # 실제로 있을 때만 발동시키고, 아직 아무도 안 붙었으면 몇 틱
+            # 더 기다린다 -- 단, team_stats와의 정합성(파울 개수)이 깨지면
+            # 안 되므로 예정 시각에서 1.2분 넘게 지나도 아무도 안 붙으면
+            # (극단적으로 안 붙는 경우 대비) 그냥 발동시켜 유실을 막는다.
+            if _outcome == "foul":
+                _foul_team = self.home_players if _pr["team"] == "home" else self.away_players
+                _near = min((abs(pl["x"] - self.ball["x"]) + abs(pl["y"] - self.ball["y"])
+                             for pl in _foul_team if pl["pos"] != "GK"), default=99.0)
+                if _near > 0.12 and (self.clock - _pr["min"]) < 1.2:
+                    continue
+
+            # [재설계 -- 데드볼 상태 머신] foul/corner/goal/save/shot_off/
+            # shot_blocked 전부 이 하나의 진입점을 거친다. 이미 다른
+            # 데드볼이 진행 중이면 False가 돌아오고, done을 안 찍은 채
+            # continue해서 다음 틱에 재시도한다 -- 두 재개가 겹쳐서
+            # 공을 두 번 스냅하는 충돌이 상태 하나로 원천 차단된다.
+            if _outcome == "foul":
+                ok = self._enter_dead_ball("foul", side=("away" if _pr["team"] == "home" else "home"))
+            elif _outcome == "corner":
+                ok = self._enter_dead_ball("corner", side=_pr["team"])
+            else:  # goal / save / shot_off / shot_blocked
+                ok = self._enter_dead_ball("shot", side=_pr["team"], outcome=_outcome)
+            if not ok:
+                continue
+            _pr["done"] = True
+            if _outcome == "foul":
+                self.banner_text = f"\U0001f7e8 {_team_name} \ud30c\uc6b8"
+                self.banner_color = "#ffcc55"
+                self.banner_alpha = 255
+            # corner/shot은 배너를 즉시 안 띄운다 -- corner는 코너 근처로
+            # 굴러나가는 전조가 끝나야, shot(goal/save)은 슛 비행이
+            # 끝나야 실제 결과가 나오므로, 그 시점에 상태 머신
+            # (_db_step_corner/_db_step_shot)이 알아서 배너를 띄운다.
 
         # 다가오는 실제 이벤트를 미리 감지 → 그 팀 쪽으로 점유를 유도해서
         # "골 넣기 전에 상대 진영으로 밀고 들어가는" 빌드업 구간을 만든다.
@@ -1602,20 +1972,15 @@ class MatchSimViewer(QDialog):
             # 알아서 건너뛰므로, 매 틱 같이 호출해도 씬 좌표를 안 건드리고
             # 나머지만 계속 자연스럽게 움직인다.
             self._update_player_positions(speed_scale)
-        elif self.clock < self._info_glide_until:
-            # [신규] 대형 정렬 글라이드 — 예전엔 정렬 계산을 한 틱 안에서
-            # 몇 번을 반복하든 사전계산 프레임엔 결과가 딱 1장만 찍혀서
-            # "부드럽지 않고 순간이동한다"는 지적 그대로였다(반복 횟수와
-            # 무관하게 프레임 한 장짜리 컷이었으니 당연히 그랬다). 이제는
-            # 매 실제 틱(=프레임 한 장)마다 이 분기가 한 번씩만 불려서,
-            # 정상 속도보다 살짝 빠른 정도로(순간이동은 아니게) 여러
-            # 프레임에 걸쳐 서서히 대형을 잡아가는 게 눈에 보인다.
-            self._update_player_positions(2.4)
-        elif self.clock < self._info_freeze_until:
-            # [신규] 파울/코너킥 등으로 잠깐 정지된 구간 — 선수 이동 갱신을
-            # 건너뛰어서(SmoothDamp가 자연히 감속해 멈춤) 휘슬 불린 순간
-            # 그대로 자세를 잡고 서 있는 것처럼 보이게 한다.
-            pass
+        elif self._db is not None:
+            # [재설계 핵심] 예전엔 여기가 글라이드/프리즈/코너대기/그 외
+            # 4갈래로 흩어져 있었고("글라이드 중엔 possession 로직 멈춤",
+            # "코너 대기 중엔 또 다르게 멈춤" 등 조각마다 규칙이 달랐다),
+            # 그 경계에서 계속 새 버그가 나왔다. 이제 "데드볼 진행 중이냐
+            # 아니냐" 단 하나의 분기로 통일한다 — 데드볼의 모든 세부 단계
+            # (스로인/골킥/파울/코너의 각 phase)는 _advance_dead_ball
+            # 안에서 하나의 상태 머신으로 처리된다.
+            self._advance_dead_ball(speed_scale)
         else:
             self._update_possession(speed_scale)
 
@@ -1626,7 +1991,15 @@ class MatchSimViewer(QDialog):
             # 배속에 비례해서 같이 빨리 사라지도록 맞췄다.
             # [버그 수정] speed(float)를 곱하면서 banner_alpha가 float이 돼서
             # PyQt6의 setAlpha(int 전용)에서 TypeError가 났었다. int로 고정.
-            self.banner_alpha = int(max(0, self.banner_alpha - 8 * max(1.0, speed_scale)))
+            # [버그 수정] 예전엔 감쇠가 -8/틱이라 완전히 사라지기까지 약
+            # 1.9분(경기 시계 기준, 실제 재생으로는 약 7~8초)이 걸렸다.
+            # 반면 코너킥 크라우드는 0.6분(약 2.4초) 만에 정상 대형으로
+            # 흩어지므로, 그 사이 5초 넘게 "이미 정상 플레이가 재개됐는데
+            # 배너만 화면에 계속 떠 있는" 구간이 생겼다 — 뒤이어 다른
+            # 코너킥이 짧은 간격으로 또 발생하면 배너가 계속 갱신되며
+            # 안 사라지는 것처럼 보이기도 했다. 감쇠를 -18로 올려서
+            # 크라우드가 흩어지는 속도와 비슷하게(약 0.85분≈3.4초) 맞췄다.
+            self.banner_alpha = int(max(0, self.banner_alpha - 18 * max(1.0, speed_scale)))
 
         # 패스 잔상(궤적) 서서히 페이드아웃
         if self.ball_trail:
@@ -1702,10 +2075,35 @@ class MatchSimViewer(QDialog):
         덮어써버린다."""
         dt = 0.12 * max(1.0, speed_scale)
 
-        # 팀 형태 밀기(공격측 1.0, 수비측은 약하게 라인만 유지) — 서서히 전환
+        # [재설계 — 라인 하이트를 공의 절대 위치에 연동] 예전엔 "우리 팀이
+        # 공을 갖고 있냐 아니냐"라는 이진값 하나로만 push를 정했다(공격
+        # 1.0, 수비 0.0 고정). 그래서 수비할 때는 공이 하프라인 부근이든
+        # 우리 골문 코앞이든 상관없이 항상 최대치로 물러나 골키퍼 옆에
+        # 뭉쳤고("무지성으로 키퍼 주위에"), 반대로 상대가 자기 진영 안에서
+        # 공을 돌리고 있을 때도 우리는 그냥 낮게 웅크린 채 구경만 했다
+        # ("상대 진영에 가까우면 멀리서 구경"). 실제 축구는 볼이 내 골문에서
+        # 얼마나 먼가에 따라 수비 라인 높이가 연속적으로 바뀐다 — 공이
+        # 멀리 있으면(상대 진영) 라인을 높이 올려 압박하고, 가까이 오면
+        # (내 진영) 확실히 내려앉아 박스를 지킨다. 공을 갖고 있을 땐 여전히
+        # 최대 전진(1.0)이고, 안 갖고 있을 때만 이 연속값을 쓴다.
         for side in ("home", "away"):
-            target = 1.0 if side == self.possession else 0.0
-            self.shape_push[side] += (target - self.shape_push[side]) * 0.04
+            if side == self.possession:
+                target = 1.0
+            else:
+                own_goal_x = 0.0 if side == "home" else 1.0
+                ball_dist_from_own_goal = abs(self.ball["x"] - own_goal_x)
+                # 0(내 골문 코앞) → 라인 낮게(0.12), 1(상대 골문 코앞)
+                # → 라인 높게(0.68). 완전한 로우블록도, 완전한 하이프레스도
+                # 아닌 중간 지대를 부드럽게 이어준다.
+                target = 0.12 + 0.56 * ball_dist_from_own_goal
+            # [현실성 보정] 예전 계수(0.04)는 지수감쇠 시간상수가 약 25틱
+            # 이라, 소유권이 그보다 짧게(패스 주기 0.5~1.2초마다 갱신)
+            # 바뀌는 실제 경기 흐름에서는 이 목표치 근처에도 못 가보고
+            # 계속 소유팀이 바뀌었다 — 위에서 전진폭 상한을 올려도 정작
+            # 그 상한까지 "도달"할 시간 자체가 없었던 것. 0.09로 올려서
+            # 시간상수를 약 11틱으로 줄이면, 몇 초만 같은 팀이 소유해도
+            # 실제로 그 팀의 전진폭 상한 근처까지 체감상 도달한다.
+            self.shape_push[side] += (target - self.shape_push[side]) * 0.09
 
         # [신규] 반응 지연용 "인식된 공 위치"를 실제 공보다 훨씬 느리게
         # 따라가게 한다(0.03 vs shape_push의 0.04보다도 느림 — 대략 실시간
@@ -1734,10 +2132,19 @@ class MatchSimViewer(QDialog):
         # 공식으로 건드리지 않고 건너뛴다.
         scene_active = bool(self._scene_kind)
         if scene_active:
+            # [버그 수정 — 근본 원인] _scene_crowd가 예전엔 팀 구분 없이
+            # 순수 인덱스(0~10)만 키로 썼다. 그런데 양 팀 다 인덱스가
+            # 0~10 범위라서, 공격측 크라우드를 다 채운 "다음에" 수비측
+            # 크라우드를 채우면 같은 인덱스에서 값이 덮어써져 공격측
+            # 항목 대부분이 통째로 사라졌다(PK에서 키커 빼고 나머지
+            # 공격팀 선수 9명 중 1명만 배치되고 나머지는 그냥 평소
+            # 오픈플레이 로직에 방치된 원인 — "왜 2명 정도만 공 주변에서
+            # 반응하고 나머지는 그냥 직진/후진만 하냐"는 지적이 여기서도
+            # 나온 것). 키를 (side, i) 튜플로 바꿔서 충돌을 없앴다.
             atk_skip = set(self._scene_atk_idx) | {
-                i for i, (s, _, _) in self._scene_crowd.items() if s == "atk"}
+                i for (s, i) in self._scene_crowd.keys() if s == "atk"}
             def_skip = set(self._scene_def_idx) | {
-                i for i, (s, _, _) in self._scene_crowd.items() if s == "def"}
+                i for (s, i) in self._scene_crowd.keys() if s == "def"}
 
         # [버그 수정 — 근본 원인] "상대 팀 코너킥" 같은 info 이벤트로
         # _snap_corner_crowd()가 스냅해둔 키커/크라우드도 위 씬 스킵과
@@ -1752,11 +2159,73 @@ class MatchSimViewer(QDialog):
             self._corner_lock_home = set()
             self._corner_lock_away = set()
 
+        # [신규 — 필러 슛 GK 다이빙] "필러 슛"(_db_start_shot, 이름 없는
+        # 팀 통계용 슈팅 — 실제 경기의 대다수 슈팅이 여기 해당)이 진행
+        # 중일 때, 막는 팀 GK를 이 일반 공식(전/후퇴 스위퍼 라인, y는
+        # 0.05 가중치로만 살짝 따라감)에 맡기면 슛이 골이든 선방이든
+        # 골문 근처에서 사실상 안 움직였다("막든 안막든 모션 자체가
+        # 없다"는 지적 그대로). _db_start_shot이 결과(골/선방/노골)에
+        # 맞춰 미리 계산해둔 다이빙 목표(self._db["gk_target"])로
+        # _db_step_shot이 직접 보간할 동안, 이 GK 한 명만 일반 공식에서
+        # 빼둔다.
+        shot_gk_lock = None
+        if (self._db is not None and self._db.get("kind") == "shot"
+                and self._db.get("phase") == "flight"):
+            shot_gk_lock = (self._db["gk_side"], self._db["gk_idx"])
+
         for side, team in (("home", self.home_players), ("away", self.away_players)):
             push = self.shape_push[side]
             sign = 1 if side == "home" else -1
             is_holder_side = (side == holder_side)
             formation = self.home_formation if side == "home" else self.away_formation
+            # [신규 — 깊이(depth) 컴팩트니스] 예전엔 포지션별 전진/후퇴폭
+            # (_tactical_dx)이 고정 비율표라서, ST는 항상 크게 전진하고
+            # CB는 항상 크게 후퇴하는 식으로 "각자 따로" 움직였다 — 팀이
+            # 수비할 때조차 라인 간 간격(공격진-수비진 사이 거리)이 줄지
+            # 않고 늘어진 채로 유지됐다("폭"은 지난번에 고쳤지만 "깊이"는
+            # 그대로였음). 실제 압박 축구는 수비 시 라인 간 간격 자체를
+            # 좁혀서 한 덩어리 블록처럼 움직인다. 이 팀의 실제 라인업
+            # 기준 평균 전진/후퇴값을 먼저 구해두고, 아래에서 각 선수를
+            # 그 평균 쪽으로 blend한다 — 튀어나온 공격수는 덜 튀어나오고,
+            # 처진 수비수는 덜 처지게 만들어서 라인 간격이 줄어든다.
+            _outfield_advs = [
+                (_tactical_dx(formation, _p["pos"])[0] * push
+                 - _tactical_dx(formation, _p["pos"])[1] * (1 - push)) * sign
+                for _p in team if _p["pos"] != "GK"
+            ]
+            _team_avg_adv = (sum(_outfield_advs) / len(_outfield_advs)) if _outfield_advs else 0.0
+            # [신규 — 22명 역할 확장 1단계: 오프사이드 트랩 라인 동조]
+            # 지금까진 수비 시 "팀 전체" 평균(공격수/미드필더까지 섞임)
+            # 쪽으로 30%만 당겨서, 정작 한 줄로 움직여야 할 백4(CB/LB/RB/
+            # LWB/RWB)끼리도 서로 다른 타이밍에 오르내려 들쭉날쭉해
+            # 보였다. 백4만 따로 모아 "백라인 전용" 평균을 구해두고,
+            # 아래에서 백4에게는 이 값 쪽으로 훨씬 강하게(60%) 당겨서
+            # 실제 오프사이드 트랩처럼 다 같이 한 줄로 오르내리게 한다.
+            _backline_advs = [
+                (_tactical_dx(formation, _p["pos"])[0] * push
+                 - _tactical_dx(formation, _p["pos"])[1] * (1 - push)) * sign
+                for _p in team if _p["pos"] in _BACKLINE_ROLES
+            ]
+            _backline_avg_adv = (sum(_backline_advs) / len(_backline_advs)
+                                  if _backline_advs else _team_avg_adv)
+            # [신규] 이 팀의 GK 인덱스를 루프 진입 전에 한 번만 찾아둔다.
+            # 포메이션상 거의 항상 인덱스 0이지만, 확정적으로 보장되진
+            # 않으므로(예: 커스텀 라인업) 매 프레임 22번 안전하게 탐색
+            # 해두고 아래 최소 간격 클램프에서 재사용한다.
+            _gk_idx_this_side = next((k for k, _p in enumerate(team) if _p["pos"] == "GK"), 0)
+            # [신규 — 서포트런 긴급도] 지금까진 서포트런 2명이 홀더가
+            # 압박을 받든 안 받든 항상 똑같은 정적인 레인 위치를 유지했다.
+            # 실제 축구는 홀더가 압박당해 급하면 동료들이 더 적극적으로
+            # 다가붙어 짧고 안전한 출구를 만들어준다. 이 사이드가 홀더
+            # 쪽이면, 상대 프레서가 홀더한테 얼마나 바짝 붙었는지를 미리
+            # 구해서 0(여유)~1(급박) 긴급도로 환산해둔다.
+            _support_urgency = 0.0
+            if side == holder_side and self._presser_idx is not None:
+                _opp_for_holder = self.away_players if side == "home" else self.home_players
+                if self._presser_idx < len(_opp_for_holder):
+                    _pp = _opp_for_holder[self._presser_idx]
+                    _pdist = abs(_pp["x"] - holder["x"]) + abs(_pp["y"] - holder["y"])
+                    _support_urgency = max(0.0, min(1.0, (0.22 - _pdist) / 0.22))
             if scene_active:
                 is_scene_atk_side = (side == self._scene_side)
                 skip_set = atk_skip if is_scene_atk_side else def_skip
@@ -1767,12 +2236,29 @@ class MatchSimViewer(QDialog):
                     continue
                 if corner_lock and i in corner_lock:
                     continue
+                if shot_gk_lock is not None and shot_gk_lock == (side, i):
+                    continue
                 # [개선] 포메이션별 전진/후퇴 폭 — 공격 시(push→1) hx보다
                 # fwd만큼 더 전진하고, 수비 시(push→0) back만큼 물러난다.
                 # 예전엔 후퇴가 아예 없어서 수비할 때도 항상 중립 위치에만
                 # 머물렀다(로우블록으로 내려앉는 그림이 없었음).
                 fwd, back = _tactical_dx(formation, pl["pos"])
                 adv = (fwd * push - back * (1 - push)) * sign
+                if not is_holder_side and pl["pos"] != "GK":
+                    # [신규 — 깊이 컴팩트니스 + 오프사이드 트랩] 수비 중일
+                    # 때만 당긴다. 백4는 백라인 전용 평균 쪽으로 강하게
+                    # (60%) 당겨 한 줄로 동조시키고, 그 외(CDM/CM 등)는
+                    # 기존처럼 팀 전체 평균 쪽으로 30%만 당긴다(GK는 별도
+                    # 스위퍼 로직이 있으니 여기서는 제외).
+                    if pl["pos"] in _BACKLINE_ROLES:
+                        adv = adv * 0.40 + _backline_avg_adv * 0.60
+                    else:
+                        # [현실성 보정] 후퇴폭 자체를 올린 것과 별개로,
+                        # 팀 평균 쪽으로 당기는 비중도 30%→45%로 올려서
+                        # 중원이 백라인과 따로 노는 정도를 한 번 더
+                        # 줄인다(이중 안전장치 — 포지션별 표 값만으로는
+                        # 포메이션별 편차가 있어 완전히 못 잡는 경우 대비).
+                        adv = adv * 0.55 + _team_avg_adv * 0.45
                 target_x = pl["hx"] + adv
                 # [개선] "인식된 공 위치" — 홀더 근처처럼 플레이에 실제로
                 # 관여한 선수는 실시간 공 좌표를, 멀리 떨어진 선수는 위에서
@@ -1799,14 +2285,89 @@ class MatchSimViewer(QDialog):
                 y_dist = abs(pl["hy"] - perc_by)
                 target_x -= min(0.05, y_dist * 0.12) * sign
                 if is_holder_side and pl["pos"] in _WIDE_ROLES:
-                    # [신규] 측면 자원(윙어/풀백/윙백)은 팀이 공격 중일 때
-                    # 볼 쪽(대개 중앙)으로 쏠리면 안 되고 오히려 터치라인
-                    # 폭을 유지해서 공간을 벌려줘야 한다(스트레치런). 예전엔
-                    # 다른 선수들과 똑같은 공식이라 볼이 중앙에 있으면
-                    # 윙어도 같이 중앙으로 몰려 폭이 사라졌다.
-                    target_y = pl["hy"] + (perc_by - pl["hy"]) * 0.04
+                    # [재설계 — 폭 "유지"만으론 부족했다] 예전엔 target_y만
+                    # hy 쪽으로 살짝 당기는 정도라, "터치라인 폭을 안
+                    # 잃는다" 정도지 실제로 "달려 들어간다"는 느낌이 전혀
+                    # 없었다. 게다가 hy 자체가 이미 진짜 터치라인(0.06/
+                    # 0.94)보다 한참 안쪽(0.14/0.86)이라, 거기 머무는 것만
+                    # 으론 절대 터치라인까지 안 붙는다 — "윙어가 사이드로
+                    # 안 달린다"는 지적의 실제 원인이 X축(전진)도 Y축
+                    # (터치라인 밀착)도 둘 다 없었다는 것.
+                    #
+                    # [버그 수정 — 근본 원인] 그런데 위 수정은 자기 원래
+                    # 진영(hy) 기준으로만 터치라인을 잡아서, 공이 반대쪽
+                    # 플랭크로 넘어가도 전혀 반응하지 않고 그냥 자기 쪽
+                    # 라인에서 push(공격/수비 전환)에 따라서만 오르내렸다
+                    # — "윙이 무지성으로 사이드에서 왔다갔다한다"는 지적의
+                    # 정확한 원인. 실제 축구에서는 공이 자기 플랭크에 있을
+                    # 때만 터치라인까지 벌려 오버래핑하고, 반대쪽(약측)
+                    # 플랭크에 있을 때는 안으로 좁혀 들어와 박스 안 옵션이
+                    # 되거나 스위치 패스를 받을 준비를 한다. 지연된 인식
+                    # 좌표(perc_by)로 볼이 실제 어느 플랭크에 있는지 먼저
+                    # 판정한다.
+                    _own_upper = pl["hy"] < 0.5
+                    _ball_upper = perc_by < 0.5
+                    _ball_side_match = (_own_upper == _ball_upper)
+                    if _ball_side_match:
+                        _touch_y = 0.06 if _own_upper else 0.94
+                        target_y = pl["hy"] + (_touch_y - pl["hy"]) * min(1.0, push * 1.3)
+                        target_x = pl["hx"] + adv * max(push, 0.85) * 1.3
+                    else:
+                        # [신규 — 약측 인버팅/투크인] 반대쪽 플랭크에 볼이
+                        # 있을 때는 터치라인에 붙어있을 이유가 없다 — 중앙
+                        # 쪽으로 좁혀 들어와 박스 침투/스위치 수신 옵션이
+                        # 되게 한다. 전진은 하되 오버래핑만큼 적극적이진
+                        # 않다.
+                        target_y = pl["hy"] + (0.5 - pl["hy"]) * 0.38
+                        target_x = pl["hx"] + adv * max(push, 0.55) * 0.95
+                    # 오프사이드 라인(상대 최종 수비 라인) 클램프도 같이
+                    # 걸어서 터무니없이 튀어나가진 않게 한다.
+                    _opp_team_now = self.away_players if side == "home" else self.home_players
+                    _opp_def_xs = [p["x"] for p in _opp_team_now if p["pos"] != "GK"]
+                    if _opp_def_xs:
+                        if sign > 0:
+                            target_x = min(target_x, max(_opp_def_xs) + 0.05)
+                        else:
+                            target_x = max(target_x, min(_opp_def_xs) - 0.05)
+                elif is_holder_side:
+                    # [버그 수정 — 방향이 거꾸로였음] 예전엔 "push>0.3(=공격
+                    # 중)일 때 강하게(0.16), 수비 중일 때 약하게(0.07)"
+                    # 볼 쪽으로 당겼다. 이건 실제 축구 전술과 정반대다 —
+                    # 공격 팀은 폭을 넓게 유지해서 상대 수비를 벌려놔야
+                    # 하고, 오히려 수비 팀이 볼 쪽으로 블록을 조여야
+                    # (컴팩트니스) 한다. 그래서 정작 압축이 필요한 수비
+                    # 라인이 제일 느슨하게 반응하고 있었다 — "22명 중 몇
+                    # 명만 반응하고 나머지는 얼어있다"는 인상의 핵심 원인
+                    # 중 하나. 공격 중에는 약하게만 당겨서 폭을 유지한다.
+                    _raw_ty = pl["hy"] + (perc_by - pl["hy"]) * 0.08
+                    _prev_ty = pl.get("_committed_ty")
+                    if _prev_ty is None or abs(_raw_ty - _prev_ty) > 0.035:
+                        pl["_committed_ty"] = _raw_ty
+                        _prev_ty = _raw_ty
+                    target_y = _prev_ty
                 else:
-                    target_y = pl["hy"] + (perc_by - pl["hy"]) * (0.16 if push > 0.3 else 0.07)
+                    # [신규 — 블록 컴팩트니스] 수비 중인 나머지 8~9명
+                    # 전원이 이제 볼 쪽으로 뚜렷하게 압축된다. push(=우리
+                    # 팀의 전개도, 수비 중이라 낮음)가 낮을수록(=로우블록,
+                    # 우리 진영 깊이 웅크린 상황)일수록 오히려 더 바짝
+                    # 조여야 실제 "로우블록으로 좁게 밀집"한 그림이 나온다.
+                    #
+                    # [신규 — "흐물흐물" 방지] 예전엔 매 프레임 perc_by가
+                    # 아주 살짝만 바뀌어도 target_y가 그만큼 따라 바뀌어서,
+                    # 실제 축구처럼 "버티다가 결정적으로 움직이는" 게 아니라
+                    # 끝없이 미세하게 잔진동하는 것처럼 보였다("수비수들이
+                    # 흐물흐물 움직인다"는 지적의 실제 원인). 직전에 확정한
+                    # 목표(_committed_ty)에서 일정 폭(0.035) 이상 벗어났을
+                    # 때만 목표를 갱신하고, 그 전까진 같은 목표를 계속
+                    # 유지한다 — 그 결과 "잠깐 버티다 한 번에 자리를
+                    # 잡는" 자연스러운 패턴이 된다.
+                    _compact = 0.22 + (1.0 - push) * 0.10
+                    _raw_ty = pl["hy"] + (perc_by - pl["hy"]) * _compact
+                    _prev_ty = pl.get("_committed_ty")
+                    if _prev_ty is None or abs(_raw_ty - _prev_ty) > 0.035:
+                        pl["_committed_ty"] = _raw_ty
+                        _prev_ty = _raw_ty
+                    target_y = _prev_ty
 
                 if is_holder_side and i == self.holder:
                     # 홀더는 공과 무관하게 대형 전진 목표를 향해 일반 선수처럼
@@ -1824,9 +2385,16 @@ class MatchSimViewer(QDialog):
                     # 자기 레인을 유지하면서 공 쪽으로 살짝만 쏠리는 정도이므로,
                     # 자기 원래 y(hy)를 더 많이 반영해서 블렌딩한다.
                     lane_side = 1 if pl["hy"] < holder["y"] else -1
+                    # [신규 — 서포트런 긴급도 반영] 홀더가 상대 프레서한테
+                    # 바짝 쫓기고 있으면(_support_urgency↑), 서포트도 더
+                    # 적극적으로 다가붙어서(레인 오프셋을 좁히고 홀더 쪽
+                    # 블렌드 비중을 높여서) 짧고 안전한 출구를 만들어준다.
+                    # 여유 있을 때는 예전처럼 자기 레인을 유지한다.
+                    _lean_w = 0.4 + _support_urgency * 0.35
+                    _lane_gap = 0.18 - _support_urgency * 0.07
                     target_x = pl["hx"] + adv * max(push, 0.6) + 0.06 * sign
-                    holder_lean_y = holder["y"] + lane_side * 0.18
-                    target_y = pl["hy"] * 0.6 + holder_lean_y * 0.4
+                    holder_lean_y = holder["y"] + lane_side * _lane_gap
+                    target_y = pl["hy"] * (1 - _lean_w) + holder_lean_y * _lean_w
                 elif (not is_holder_side) and i == presser_idx:
                     target_x = pl["hx"] + (self.ball["x"] - pl["hx"]) * 0.45
                     target_y = pl["hy"] + (self.ball["y"] - pl["hy"]) * 0.45
@@ -1843,8 +2411,19 @@ class MatchSimViewer(QDialog):
                 elif is_holder_side and i == self._advancing_mid_idx:
                     # [신규] 박스투박스 전진 가담 — CM 2명이 똑같이 움직이지
                     # 않도록, 볼과 가까운 쪽은 박스까지 적극적으로 전진한다.
-                    target_x = pl["hx"] + adv * max(push, 0.8) * 1.35
-                    target_y = pl["hy"] + (self.ball["y"] - pl["hy"]) * 0.30
+                    if formation == "4-3-3":
+                        # [신규 — 메찰라 하프스페이스 침투] 4-3-3의 전진 CM
+                        # (메찰라)은 그냥 볼 쪽으로 붙는 게 아니라, 풀백/윙어
+                        # 채널(y≈0.14/0.86)과 중앙 채널(y=0.5) 사이의 특정
+                        # 통로(하프스페이스, y≈0.28/0.72)를 대각선으로 파고
+                        # 든다 — 지금까진 그냥 "볼 쪽으로 30%만 쏠리는"
+                        # 범용 공식이라 이 채널 개념 자체가 없었다.
+                        _half_space_y = 0.28 if pl["hy"] < 0.5 else 0.72
+                        target_x = pl["hx"] + adv * max(push, 0.85) * 1.45
+                        target_y = pl["hy"] + (_half_space_y - pl["hy"]) * 0.55
+                    else:
+                        target_x = pl["hx"] + adv * max(push, 0.8) * 1.35
+                        target_y = pl["hy"] + (self.ball["y"] - pl["hy"]) * 0.30
                 elif is_holder_side and i == self._holding_mid_idx:
                     # [신규] 홀딩 — 반대쪽 CM은 전진을 억제하고 뒤에 남아
                     # 역습 대비/후방 안정판(피벗) 역할을 한다.
@@ -1871,6 +2450,28 @@ class MatchSimViewer(QDialog):
                             target_x = min(target_x, max(opp_def_xs) + 0.03)
                         else:
                             target_x = max(target_x, min(opp_def_xs) - 0.03)
+                elif (is_holder_side and i == self._volpiana_idx and push < 0.35):
+                    # [신규 — 라 볼피아나] 단독 CDM이 우리 진영 깊숙이서
+                    # 빌드업 중(push 낮음 = 자기 진영)일 때, 센터백 사이로
+                    # 내려가 임시 스리백을 만든다. 문서에서 말하는 "양
+                    # 풀백이 올라갔을 때 센터백 사이로 내려가는" 그 움직임 —
+                    # 지금까진 CDM이 포메이션별 전/후퇴폭표 하나로만
+                    # 움직여서 이 특정 빌드업 패턴 자체가 없었다. 어느
+                    # 풀백이 전진했는지(hx 대비 실제 x가 더 나갔는지)를
+                    # 보고, 그 풀백이 비운 반대쪽으로 치우쳐 내려가
+                    # 실제 라볼피아나처럼 좌우 비대칭 형태를 만든다.
+                    _fb_pool = [p for p in holder_team
+                                if p["pos"] in ("LB", "RB", "LWB", "RWB")]
+                    _cb_pool = [p for p in holder_team if p["pos"] == "CB"]
+                    if _fb_pool and _cb_pool:
+                        _adv_fb = max(_fb_pool, key=lambda p: (p["x"] - p["hx"]) * sign)
+                        _lean = -1 if _adv_fb["hy"] < 0.5 else 1
+                        _cb_avg_x = sum(p["x"] for p in _cb_pool) / len(_cb_pool)
+                        target_x = _cb_avg_x - 0.03 * sign
+                        target_y = 0.5 + _lean * 0.14
+                    else:
+                        target_x = pl["hx"] + adv
+                        target_y = pl["hy"]
                 elif (not is_holder_side) and i in self._breakthrough_marks:
                     # [신규] 돌파 마크 — 프레서/커버는 홀더 근처만 신경써서,
                     # 공 없이 라인 뒤까지 파고든 침투 선수는 무방비였다.
@@ -1883,6 +2484,50 @@ class MatchSimViewer(QDialog):
                     _own_goal_x = 0.0 if sign > 0 else 1.0
                     target_x = _mark_pl["x"] + (_own_goal_x - _mark_pl["x"]) * 0.12
                     target_y = _mark_pl["y"]
+                elif pl["pos"] == "GK":
+                    # [신규 — GK 스위퍼 라인] 예전엔 GK 전/후퇴폭이 표에서
+                    # 사실상 0(0.03/0.02)이라, 팀이 하이프레스로 라인을
+                    # 완전히 밀어 올려도 GK는 항상 자기 골문 바로 앞에
+                    # 얼어붙어 있었다("GK가 상황과 무관하게 안 움직인다"는
+                    # 지적 그대로). 실제로는 수비 라인을 높이 올릴수록
+                    # GK도 같이 전진해서 뒷공간(라인 너머로 뚫고 들어오는
+                    # 침투패스)을 커버해야 한다 — push(우리 팀 전개도)에
+                    # 비례해서 전진폭을 준다.
+                    _sweep = 0.04 + push * 0.11   # 로우블록 0.04 ~ 하이프레스 0.15
+                    target_x = pl["hx"] + _sweep * sign
+                    # [주의] 위 일반 공식의 강한 폭 컴팩트니스(0.22~0.32)는
+                    # GK한테 그대로 적용하면 안 된다 — 골문 중앙에서 크게
+                    # 벗어나면 안 되므로 아주 약하게만 볼 쪽으로 따라간다.
+                    target_y = pl["hy"] + (self.ball["y"] - pl["hy"]) * 0.05
+
+                if pl["pos"] != "GK":
+                    # [버그 수정 — 근본 원인] 처음엔 이 클램프를 훨씬 앞
+                    # (일반 수비 공식 직후)에 걸었는데, 그 뒤에 있는 "커버
+                    # 형태로 더 물러나기"(target_x -= ... * sign) 조정이
+                    # 클램프 이후에 다시 최대 0.05만큼 더 깎아버려서 무용지
+                    # 물이 됐었다(실측: CB/LB가 골키퍼 옆 간격 0.00001
+                    # 수준까지 붙는 게 그대로 재현됨). 이 함수 안에서
+                    # target_x에 손대는 모든 갈래(일반 수비/WIDE_ROLES/
+                    # 커버/GK스위퍼 등) 다음, 최종 피치 경계 클램프
+                    # 직전인 여기서 한 번만 걸어야 실제로 안 뚫린다.
+                    _own_goal_x = 0.0 if sign > 0 else 1.0
+                    _min_x = _own_goal_x + _MIN_DEFENSIVE_DEPTH * sign
+                    target_x = max(target_x, _min_x) if sign > 0 else min(target_x, _min_x)
+                    # [버그 수정 — 2차 원인] 골라인 기준 절대 클램프만으론
+                    # 부족했다 — GK 스위퍼 전진폭(_sweep)이 하이프레스일 때
+                    # 0.15까지 커지는데, 그러면 GK 자신이 오히려 이 절대
+                    # 클램프(0.12)보다 얕은 곳까지 나가 있어서 CB가 절대
+                    # 클램프를 지키고 있어도 GK와 겹쳐버렸다(실측: 간격
+                    # -0.0015, 즉 CB가 GK보다도 골대에 가까움). GK는 항상
+                    # 이 루프에서 인덱스 0으로 먼저 처리되므로, 그 실시간
+                    # 위치를 직접 기준 삼아 "GK보다는 항상 앞에 있어야
+                    # 한다"는 걸 추가로 강제한다.
+                    _gk_x = team[_gk_idx_this_side]["x"]
+                    _min_gap_from_gk = 0.06
+                    if sign > 0:
+                        target_x = max(target_x, _gk_x + _min_gap_from_gk)
+                    else:
+                        target_x = min(target_x, _gk_x - _min_gap_from_gk)
 
                 target_x = min(0.97, max(0.03, target_x))
                 target_y = min(0.95, max(0.05, target_y))
@@ -1892,10 +2537,57 @@ class MatchSimViewer(QDialog):
                 # smooth_time도 짧게 줘서(=더 기민하게 붙는다) 속도뿐
                 # 아니라 "반응 타이밍" 자체도 선수마다 달라지게 한다.
                 reaction = pl.get("reaction", 1.0)
-                max_speed = _MAX_SPEED.get(pl["pos"], 0.6) * transition_mult * (
-                    0.9 + 0.1 * reaction)
+                # [신규 — 로스터 스탯 반영] speed 스탯(0~100대, 50이 평균)을
+                # 최고속도에 곱한다 — 지금까진 포지션만 같으면 스피드
+                # 스탯과 무관하게 전원이 완전히 똑같은 속도로 뛰었다.
+                _speed_stat = pl.get("stats", {}).get("speed", 50)
+                _speed_mult = 0.75 + (_speed_stat / 100.0) * 0.5
+                max_speed = (_MAX_SPEED.get(pl["pos"], 0.6) * transition_mult
+                             * (0.9 + 0.1 * reaction) * _speed_mult)
                 smooth_time = _SMOOTH_TIME / reaction
                 _steer_toward(pl, target_x, target_y, dt, max_speed, smooth_time)
+
+        # [신규 — 겹침 방지] 파울 재개처럼 여러 선수(같은 팀 CM 2명, 체크인/
+        # 침투런 ST 2명 등)의 목표 좌표가 한 틱 안에서 거의 똑같이 계산되면,
+        # 완전히 겹쳐서 화면상 점 하나로 보이는 경우가 있었다(헤드리스
+        # 검증에서 파울 재개 구간에 겹침이 몰려있는 게 확인됨). 씬/코너킥
+        # 크라우드처럼 "의도적으로" 밀집해야 하는 선수는 건드리면 안 되므로
+        # 그쪽은 제외하고, 일반 이동 중인 같은 팀 선수끼리만 아주 살짝
+        # 밀어내서 최소 간격을 확보한다. 상대 팀과의 거리는 건드리지 않는다
+        # — 실제 축구에서도 밀착 마크는 정상이라 겹침 판정 대상이 아니다.
+        _MIN_TEAMMATE_DIST = 0.02
+        for side, team in (("home", self.home_players), ("away", self.away_players)):
+            if scene_active:
+                is_scene_side = (side == self._scene_side)
+                sk = (atk_skip if is_scene_side else def_skip)
+            else:
+                sk = set()
+            cl = ((self._corner_lock_home if side == "home" else self._corner_lock_away)
+                  if corner_lock_active else set())
+            free_idx = [i for i, pl in enumerate(team)
+                        if pl["pos"] != "GK" and i not in sk and i not in cl]
+            for a in range(len(free_idx)):
+                ia = free_idx[a]
+                pa = team[ia]
+                for b in range(a + 1, len(free_idx)):
+                    ib = free_idx[b]
+                    pb = team[ib]
+                    dx = pa["x"] - pb["x"]
+                    dy = pa["y"] - pb["y"]
+                    dist = math.hypot(dx, dy)
+                    if 0.0001 < dist < _MIN_TEAMMATE_DIST:
+                        push = (_MIN_TEAMMATE_DIST - dist) * 0.5
+                        nx, ny = dx / dist, dy / dist
+                        pa["x"] = min(0.97, max(0.03, pa["x"] + nx * push))
+                        pa["y"] = min(0.95, max(0.05, pa["y"] + ny * push))
+                        pb["x"] = min(0.97, max(0.03, pb["x"] - nx * push))
+                        pb["y"] = min(0.95, max(0.05, pb["y"] - ny * push))
+                    elif dist <= 0.0001:
+                        # 완전히 같은 좌표(0으로 나누기 방지) — 인덱스 기반
+                        # 고정 방향으로 살짝 떼어놓는다.
+                        push = _MIN_TEAMMATE_DIST * 0.5
+                        pa["x"] = min(0.97, max(0.03, pa["x"] + push))
+                        pb["x"] = min(0.97, max(0.03, pb["x"] - push))
 
         return dt
 
@@ -1959,6 +2651,483 @@ class MatchSimViewer(QDialog):
                 # 해서 끊김 없이 계속 전개되는 느낌을 살렸다.
                 self.pass_clock = random.uniform(0.5, 1.2)
 
+    # ══════════════════════════════════════════════════════════════
+    # [재설계 — 데드볼 상태 머신]
+    # 예전엔 파울/코너킥/스로인/골킥/필러슛(골·선방·오프타깃·블록) 처리가
+    # 7개의 독립된 코드 조각으로 흩어져 있었고, 서로의 존재를 몰랐다.
+    # 그래서 두 재개가 타이밍이 겹치면 공을 두 번 스냅하거나, 하나가
+    # 끝나기도 전에 오픈플레이가 끼어들어 궤적을 덮어쓰는 등, "조각들
+    # 경계"에서 계속 새로운 버그가 튀어나왔다(파울 텍스트+필러 파울 중복
+    # 발동, 코너 전조 중 오픈플레이 틈입, 필러슛 결과 미처리 등 — 전부
+    # 실측 디버그 캡처로 재현됨).
+    #
+    # 이 문제를 시간 기반 락(_dead_ball_until)으로 막아보려 했으나,
+    # 필러 이벤트 평균 간격(약 1분)보다 락 시간이 길어서 경기 전체가
+    # 멈추는 새로운 회귀가 생겼다(실측: 80개 넘는 예정 이벤트가 전부
+    # 유실됨). 근본 문제는 "시간"이 아니라 "지금 정확히 무슨 상태인가"를
+    # 추적하는 단일 상태가 없었다는 것 — 그래서 시간 대신 상태로 다시
+    # 짠다.
+    #
+    # self._db가 None이면 오픈플레이(_update_possession이 정상 작동).
+    # None이 아니면 {"kind": "throw_in"/"goal_kick"/"foul"/"corner"/
+    # "shot", "phase": ..., ...그 kind에 필요한 부가정보}이고, 매 틱
+    # _advance_dead_ball()이 그 kind의 _db_step_<kind>()를 호출해 진행시킨다.
+    # 각 kind의 종료 조건은 전부 "실제로 그 애니메이션이 끝났는가"
+    # (_pass_flight가 None이 됐는가, 글라이드 타이머가 지났는가)에 묶여
+    # 있어서, 임의의 시간 추측이 끼어들 자리가 없다. shot처럼 결과에 따라
+    # 다른 데드볼로 이어져야 하면(save→골킥, 블록→코너) 오픈플레이를 한
+    # 틱도 거치지 않고 kind만 바꿔치기해서 바로 이어간다 — 그 사이에
+    # 오픈플레이가 끼어들 타이밍 자체가 존재하지 않는다.
+    # ══════════════════════════════════════════════════════════════
+
+    def _enter_dead_ball(self, kind, **kw):
+        """데드볼 진입점. 이미 다른 데드볼이 진행 중이면 아무 것도 바꾸지
+        않고 False를 돌려준다 — 호출자는 그 틱엔 스킵하고(done 처리하지
+        않고 continue 등) 다음 틱에 다시 시도해야 한다. 성공하면 True."""
+        if self._db is not None:
+            return False
+        self._db = {"kind": kind, "phase": "start", **kw}
+        self._last_restart_clock = self.clock
+        getattr(self, f"_db_start_{kind}")()
+        return True
+
+    def _advance_dead_ball(self, speed_scale=1.0):
+        """매 틱 호출 — 지금 진행 중인 데드볼 kind의 스텝 함수 하나만
+        실행한다. 오픈플레이(_update_possession)와는 절대 동시에 안
+        불린다(_advance_one_tick의 단일 분기에서 양자택일)."""
+        getattr(self, f"_db_step_{self._db['kind']}")(speed_scale)
+
+    def _db_exit(self):
+        self._db = None
+
+    # ── 스로인 ──────────────────────────────────────────────
+    def _db_start_throw_in(self):
+        d = self._db
+        out_side, x, y = d["out_side"], d["x"], d["y"]
+        throw_side = "away" if out_side == "home" else "home"
+        throw_team = self.home_players if throw_side == "home" else self.away_players
+        line_y = 0.02 if y < 0.5 else 0.98
+        thrower = min(range(len(throw_team)),
+                      key=lambda i: abs(throw_team[i]["x"] - x) + abs(throw_team[i]["y"] - line_y))
+        throw_team[thrower]["x"], throw_team[thrower]["y"] = x, line_y
+        throw_team[thrower]["vx"] = throw_team[thrower]["vy"] = 0.0
+        recv_pool = [i for i, pl in enumerate(throw_team) if i != thrower and pl["pos"] != "GK"]
+        receiver = (min(recv_pool, key=lambda i: abs(throw_team[i]["x"] - x)
+                                                + abs(throw_team[i]["y"] - line_y))
+                    if recv_pool else thrower)
+        self.possession = throw_side
+        self.holder = receiver
+        self._assign_roles()
+        self.ball["x"], self.ball["y"] = x, line_y
+        self.ball_trail = []
+        self._start_pass_flight((x, line_y), (throw_team[receiver]["x"], throw_team[receiver]["y"]))
+        self.pass_clock = 0.7
+        self._last_throwin_clock = self.clock
+
+    def _db_step_throw_in(self, speed_scale):
+        dt = self._update_player_positions(speed_scale)
+        if self._pass_flight:
+            self._advance_pass_flight(dt)
+        else:
+            self._db_exit()
+
+    # ── 골킥 ────────────────────────────────────────────────
+    def _db_start_goal_kick(self):
+        defending_side = self._db["side"]
+        def_team = self.home_players if defending_side == "home" else self.away_players
+        gk_idx = self._gk_index(defending_side)
+        goal_x = 0.03 if defending_side == "home" else 0.97
+        def_team[gk_idx]["x"], def_team[gk_idx]["y"] = goal_x, 0.5
+        def_team[gk_idx]["vx"] = def_team[gk_idx]["vy"] = 0.0
+        recv_pool = [i for i, pl in enumerate(def_team) if pl["pos"] != "GK"]
+        receiver = (min(recv_pool, key=lambda i: abs(def_team[i]["x"] - goal_x))
+                    if recv_pool else gk_idx)
+        self.possession = defending_side
+        self.holder = receiver
+        self._assign_roles()
+        self.ball["x"], self.ball["y"] = goal_x, 0.5
+        self.ball_trail = []
+        self._start_pass_flight((goal_x, 0.5), (def_team[receiver]["x"], def_team[receiver]["y"]))
+        self.pass_clock = 0.8
+
+    def _db_step_goal_kick(self, speed_scale):
+        dt = self._update_player_positions(speed_scale)
+        if self._pass_flight:
+            self._advance_pass_flight(dt)
+        else:
+            self._db_exit()
+
+    # ── 파울(프리킥) ────────────────────────────────────────
+    def _snap_foul_crowd(self, attacking_side, ball_x, ball_y, taker):
+        """[신규 — 위험 지역 파울 크라우드] 상대 진영 슈팅권(_SHOT_ZONE_NORMAL
+        이내)에서 파울이 나면, 지금까진 반칙 지점 최근접자(키커)와 그
+        즉시 패스를 받는 동료 딱 2명만 자리를 잡고, 나머지 20명은 그
+        순간에도 평소 오픈플레이 공식(홀더 근처 지원런/프레서/커버만
+        반응)에 맡겨져 있었다. 그 공식은 "움직이는 공"이 전제라 세트피스
+        상황(다들 정해진 자리에 서야 함)을 전혀 반영 못 해서, 나머지가
+        목적 없이 근처를 배회하는 것처럼 보였다("파울 잡은 애 빼고
+        나머지는 주변 굴러다닌다"는 지적 그대로 — PK 때 겪었던 것과
+        같은 종류의 공백).
+
+        코너킥과 같은 락 메커니즘(_corner_lock_home/away,
+        _info_glide_until)을 재사용한다 — 수비는 반칙 지점과 자기 골
+        사이에 벽을 세우고 나머지는 박스 수비 슬롯으로, 공격은 박스 크로스
+        슬롯(니어포스트/식스야드/파포스트/박스 엣지, _corner_slots 재사용)
+        으로 채운다.
+        """
+        atk_goal_x = 1.0 if attacking_side == "home" else 0.0
+        atk_team = self.home_players if attacking_side == "home" else self.away_players
+        def_team = self.away_players if attacking_side == "home" else self.home_players
+
+        # ── 수비 벽: 반칙 지점과 자기 골문 사이, 직선 각도를 막는 자리 ──
+        wall_dir = -1 if atk_goal_x >= 0.5 else 1
+        wall_x = max(0.03, min(0.97, ball_x + wall_dir * 0.10))
+        n_wall = 3 if abs(ball_x - atk_goal_x) < 0.25 else 2
+        def_pool = [i for i, pl in enumerate(def_team) if pl["pos"] != "GK"]
+        random.shuffle(def_pool)
+        wall_idx = def_pool[:n_wall]
+        rest_def_pool = def_pool[n_wall:]
+        wall_center_y = ball_y + (0.5 - ball_y) * 0.5
+        for k, i in enumerate(wall_idx):
+            _off = (k - (n_wall - 1) / 2) * 0.035
+            def_team[i]["x"] = wall_x
+            def_team[i]["y"] = max(0.06, min(0.94, wall_center_y + _off))
+            def_team[i]["vx"] = def_team[i]["vy"] = 0.0
+
+        # ── 나머지는 박스 크로스 슬롯으로(코너킥과 동일한 슬롯 재사용) ──
+        atk_pool = [i for i, pl in enumerate(atk_team) if pl["pos"] != "GK" and i != taker]
+        random.shuffle(atk_pool)
+        atk_stay = atk_pool[-1:] if len(atk_pool) > 3 else []
+        crowd_atk = [i for i in atk_pool if i not in atk_stay]
+        crowd_def = rest_def_pool[:-1] if len(rest_def_pool) > 3 else rest_def_pool
+        _corner_y_proxy = 0.04 if ball_y < 0.5 else 0.96
+        atk_pts, def_pts = _corner_slots(atk_goal_x, _corner_y_proxy, len(crowd_atk), len(crowd_def))
+        for i, (tx, ty) in zip(crowd_atk, atk_pts):
+            atk_team[i]["x"], atk_team[i]["y"] = tx, ty
+            atk_team[i]["vx"] = atk_team[i]["vy"] = 0.0
+        for i, (tx, ty) in zip(crowd_def, def_pts):
+            def_team[i]["x"], def_team[i]["y"] = tx, ty
+            def_team[i]["vx"] = def_team[i]["vy"] = 0.0
+
+        atk_locked = set(crowd_atk) | {taker}
+        def_locked = set(wall_idx) | set(crowd_def)
+        if attacking_side == "home":
+            self._corner_lock_home, self._corner_lock_away = atk_locked, def_locked
+        else:
+            self._corner_lock_away, self._corner_lock_home = atk_locked, def_locked
+
+    def _snap_foul_general(self, restart_side, exclude_idx):
+        """[신규] 위험 지역이 아닌 파울(중원/수비 지역)도 코너킥처럼
+        즉시 자리를 잡게 한다. 지금까진 위험 지역(_SHOT_ZONE_NORMAL
+        이내) 파울만 크라우드/벽을 세웠고, 그 밖의 모든 파울은 키커+
+        즉시 패스받는 동료 딱 2명만 자리 잡고 나머지 20명은 여전히
+        평소 오픈플레이 공식(움직이는 공을 전제로 한 홀더 추종형 공식)
+        에 맡겨진 채였다 — "코너킥처럼 각자 포지션이 바로 잡혀야
+        하는데 안 된다"는 지적 그대로. 위험 지역처럼 벽/침투조 같은
+        정교한 역할까지는 필요 없지만, 최소한 각 포지션의 포메이션별
+        전/후진표(_tactical_dx)가 가리키는 목표로 즉시 스냅해서 "다들
+        멈춰서 자리를 잡는" 정지 구간을 만든다. 코너킥과 같은 락
+        (_corner_lock_home/away, _info_glide_until)을 재사용해서, 이
+        글라이드 구간 동안은 평소 공식이 다시 끌고 가지 않게 보호한다.
+        """
+        for side, team in (("home", self.home_players), ("away", self.away_players)):
+            formation = self.home_formation if side == "home" else self.away_formation
+            push = self.shape_push[side]
+            sign = 1 if side == "home" else -1
+            locked = set()
+            for i, pl in enumerate(team):
+                if pl["pos"] == "GK":
+                    continue
+                if side == restart_side and i == exclude_idx:
+                    continue
+                fwd, back = _tactical_dx(formation, pl["pos"])
+                adv = (fwd * push - back * (1 - push)) * sign
+                # [버그 수정] hx/hy 그대로 스냅하면 양 팀 같은 포지션
+                # 라벨(예: 양쪽 ST, 양쪽 LW)이 서로 정확히 같은 y에 자석
+                # 처럼 마주 붙어 서서 "로봇 같은 데칼코마니 배치"로 보였다
+                # (신민용 지적). 작은 지터를 줘서 실제로 각자 마크맨을
+                # 찾아 선 것처럼 자연스러운 편차를 만든다.
+                pl["x"] = max(0.03, min(0.97, pl["hx"] + adv + random.uniform(-0.015, 0.015)))
+                pl["y"] = max(0.04, min(0.96, pl["hy"] + random.uniform(-0.03, 0.03)))
+                pl["vx"] = pl["vy"] = 0.0
+                locked.add(i)
+            if side == "home":
+                self._corner_lock_home = locked
+            else:
+                self._corner_lock_away = locked
+
+    def _db_start_foul(self):
+        d = self._db
+        restart_side = d["side"]
+        restart_team = self.home_players if restart_side == "home" else self.away_players
+        self.possession = restart_side
+        self.holder = min(
+            (i for i, pl in enumerate(restart_team) if pl["pos"] != "GK"),
+            key=lambda i: abs(restart_team[i]["x"] - self.ball["x"])
+                         + abs(restart_team[i]["y"] - self.ball["y"]))
+        self._assign_roles()
+        self.ball["x"] = restart_team[self.holder]["x"]
+        self.ball["y"] = restart_team[self.holder]["y"]
+        self.ball_trail = []
+        self._pass_flight = None
+        _bx = self.ball["x"]
+        self.shape_push["home"] = max(0.0, min(1.0, _bx))
+        self.shape_push["away"] = max(0.0, min(1.0, 1.0 - _bx))
+        self._info_glide_until = self.clock + 0.35
+        d["glide_until"] = self._info_glide_until
+        taker = self.holder
+        # [버그 수정 — 근본 원인] 위험 지역(슈팅권 이내) 파울은 지금까지도
+        # 그냥 "가장 가까운 동료에게 짧은 탭 패스"로 처리됐다 — 실제로는
+        # 이 정도 거리면 직접 슈팅이나 박스 안으로의 크로스가 정상인데,
+        # 크라우드 정렬도 없이 짧은 탭 패스만 나가니 나머지 20명은 목적
+        # 없는 오픈플레이 공식에 맡겨진 채였다. 위험 지역이면 크라우드를
+        # 정렬(_snap_foul_crowd)하고 박스 안으로 크로스를 올린다 — 도착
+        # 후에는 방금 만든 "이벤트 당김" 레이어가 있어서, 근처에 예정된
+        # 슛이 있으면 자연스럽게 이어질 수도 있다.
+        _opp_goal_x = 1.0 if restart_side == "home" else 0.0
+        if abs(self.ball["x"] - _opp_goal_x) < _SHOT_ZONE_NORMAL:
+            self._snap_foul_crowd(restart_side, self.ball["x"], self.ball["y"], taker)
+            _box_x = 0.90 if _opp_goal_x >= 0.5 else 0.10
+            _target_y = 0.5 + random.uniform(-0.16, 0.16)
+            start_xy = (self.ball["x"], self.ball["y"])
+            self._start_pass_flight(start_xy, (_box_x, _target_y))
+            self.pass_clock = 0.9
+            _crowd_atk = [i for i in (self._corner_lock_home if restart_side == "home"
+                                       else self._corner_lock_away) if i != taker]
+            if _crowd_atk:
+                new_holder = min(_crowd_atk, key=lambda i: abs(restart_team[i]["x"] - _box_x)
+                                                          + abs(restart_team[i]["y"] - _target_y))
+                self.holder = new_holder
+                self._assign_roles()
+            return
+        # [신규 — 프리킥 즉시 배급] 위험 지역이 아니면(중원/수비 지역
+        # 파울) 지금까지처럼 반칙 지점에서 가장 가까운 동료에게 즉시
+        # 짧은 프리킥 패스를 날려서 "그 자리에서 바로 찼다"는 것을
+        # 보여준다(스로인/골킥과 동일한 패턴). 그 전에 나머지 20명을
+        # 먼저 스냅해서(_snap_foul_general), 즉시 패스받을 동료도
+        # 그 순간 실제로 있어야 할 자리에서 받게 한다.
+        self._snap_foul_general(restart_side, taker)
+        recv_pool = [i for i, pl in enumerate(restart_team) if i != taker and pl["pos"] != "GK"]
+        if recv_pool:
+            receiver = min(recv_pool, key=lambda i: abs(restart_team[i]["x"] - self.ball["x"])
+                                                    + abs(restart_team[i]["y"] - self.ball["y"]))
+            start_xy = (self.ball["x"], self.ball["y"])
+            self.holder = receiver
+            self._assign_roles()
+            self._start_pass_flight(start_xy, (restart_team[receiver]["x"], restart_team[receiver]["y"]))
+            self.pass_clock = 0.8
+
+    def _db_step_foul(self, speed_scale):
+        glide_active = self.clock < self._db["glide_until"]
+        dt = self._update_player_positions(2.4 if glide_active else speed_scale)
+        if self._pass_flight:
+            self._advance_pass_flight(dt)
+        elif glide_active:
+            _team = self.home_players if self.possession == "home" else self.away_players
+            _holder = _team[self.holder]
+            self.ball["x"], self.ball["y"] = _holder["x"], _holder["y"]
+        if not self._pass_flight and not glide_active:
+            self._db_exit()
+
+    # ── 코너킥 ──────────────────────────────────────────────
+    def _db_start_corner(self):
+        d = self._db
+        attacking_side = d["side"]
+        cgoal_x = 1.0 if attacking_side == "home" else 0.0
+        corner_x_lead = 0.98 if cgoal_x >= 0.5 else 0.02
+        corner_y_lead = 0.04 if self.ball["y"] < 0.5 else 0.96
+        self._start_pass_flight((self.ball["x"], self.ball["y"]), (corner_x_lead, corner_y_lead))
+        d["phase"] = "approach"
+
+    def _db_step_corner(self, speed_scale):
+        d = self._db
+        if d["phase"] == "approach":
+            # 공이 라인 쪽으로 굴러나가는 전조 비행 구간.
+            dt = self._update_player_positions(speed_scale)
+            if self._pass_flight:
+                self._advance_pass_flight(dt)
+            else:
+                _team_name = self.home_name if d["side"] == "home" else self.away_name
+                self.banner_text = f"🚩 {_team_name} 코너킥"
+                self.banner_color = "#ffcc55"
+                self.banner_alpha = 255
+                self._snap_corner_crowd(d["side"])
+                self._info_glide_until = self.clock + 0.35
+                d["glide_until"] = self._info_glide_until
+                d["phase"] = "crowd"
+        else:
+            # 크라우드가 박스 대형으로 정렬되는 글라이드 구간.
+            glide_active = self.clock < d["glide_until"]
+            dt = self._update_player_positions(2.4 if glide_active else speed_scale)
+            if self._pass_flight:
+                self._advance_pass_flight(dt)
+            if not glide_active:
+                self._db_exit()
+
+    # ── 필러 슛(골/선방/오프타깃/블록) ──────────────────────
+    def _db_start_shot(self):
+        d = self._db
+        fside, outcome = d["side"], d["outcome"]
+        fteam = self.home_players if fside == "home" else self.away_players
+        fgoal_x = 1.0 if fside == "home" else 0.0
+        fpool = [i for i, pl in enumerate(fteam) if pl["pos"] in (_ATTACK_ROLES | _SUPPORT_ROLES)]
+        ftaker = random.choice(fpool) if fpool else random.randrange(len(fteam))
+        fsx = _clamp_shot_start_x(fteam[ftaker]["x"], fgoal_x, _SHOT_ZONE_NORMAL)
+        fsy = fteam[ftaker]["y"]
+        if outcome in ("goal", "save"):
+            fty = 0.5 + random.uniform(-1, 1) * _GOAL_HALF_HEIGHT * 0.8
+        else:
+            fsign = random.choice([-1, 1])
+            fty = 0.5 + fsign * random.uniform(_GOAL_HALF_HEIGHT * 1.3, _GOAL_HALF_HEIGHT * 3.0)
+        fty = max(0.04, min(0.96, fty))
+        self.possession = fside
+        self.holder = ftaker
+        self._assign_roles()
+        self.ball["x"], self.ball["y"] = fsx, fsy
+        self.ball_trail = []
+        self._start_pass_flight((fsx, fsy), (fgoal_x, fty))
+        self.pass_clock = 0.9
+
+        # [버그 수정 — 근본 원인] shape_push(팀 전체 전진/후퇴 폭을 정하는
+        # 스칼라)는 tactical_engine의 "그 분에 예정된 buildup 존" 힌트나
+        # 느린 연속 수렴으로만 갱신됐지, 슛이 시작되는 이 순간(ftaker가
+        # 실제로 얼마나 전진해 있었는지)은 전혀 반영하지 않았다. 그래서
+        # 슈터 본인은 슛 궤적 계산으로 확실히 상대 박스 근처까지 가
+        # 있는데, 나머지 10명(수비수 제외 CM/윙백 등)은 이 stale한
+        # push값 기준으로만 전/후진 목표를 잡아서 슈터 혼자만 전진해
+        # 있고 나머지는 안 들어와 있는 것처럼 보였다(신민용 지적 —
+        # "수비수는 그렇다치고 왜 나머지는 안 들어와 있냐"의 정확한
+        # 원인). 파울 재개(_db_start_foul)가 이미 하는 것과 같은 방식
+        # (공 x좌표 기준 직접 설정)으로 슈팅 시작 시점에도 즉시 반영한다.
+        self.shape_push[fside] = max(0.0, min(1.0, fsx if fgoal_x >= 0.5 else 1.0 - fsx))
+        self.shape_push["away" if fside == "home" else "home"] = 1.0 - self.shape_push[fside]
+        d["phase"] = "flight"
+
+        # [버그 수정 — 근본 원인] 이 함수(필러 슛 — 실제 경기 슈팅의 대다수가
+        # 여기 해당)는 지금까지 배너를 전혀 안 건드렸다. 그래서 코너킥/파울/
+        # 선방 배너가 뜬 채로 몇 초~몇 분이 지나 완전히 무관한 새 슈팅이
+        # 시작돼도 화면엔 예전 배너가 그대로 남아있었다 — "왜 이런지 이유도
+        # 안 보이는데 공이 갑자기 튕긴다"는 지적(디버그 캡처로 실측: 코너킥
+        # 배너가 뜬 채로 10초 넘게 지나도 안 바뀌고, 그 사이 새 슈팅이 시작
+        # 되면서 공이 무관한 위치로 순간이동)이 정확히 이 공백 때문이었다.
+        # 슈팅이 시작되는 바로 이 순간 배너를 갱신해서, 결과가 나오기 전에도
+        # "지금 새로운 슈팅 상황"이라는 게 화면에 바로 드러나게 한다.
+        _fteam_name = self.home_name if fside == "home" else self.away_name
+        self.banner_text = f"⚡ {_fteam_name} 슈팅!"
+        self.banner_color = "#ffcc55"
+        self.banner_alpha = 255
+
+        # [신규 — GK 다이빙 목표] 막는 팀 GK가 이 슛의 결과(골/선방/노골)에
+        # 맞춰 실제로 반응하는 것처럼 보이도록, 비행이 끝났을 때 도달해
+        # 있을 목표 좌표를 미리 정해둔다. _db_step_shot이 비행 진행률에
+        # 맞춰 이 목표로 부드럽게 보간한다(공과 같은 이징 곡선 재사용).
+        #   - save: 정확히 fty(공이 오는 지점)까지 도달 — 실제로 막아냄.
+        #   - goal: fty 쪽으로 몸은 던지지만 절반~2/3 정도만 좁혀서(못
+        #     미친 느낌) 최종적으로 골이 되는 것과 시각적으로 모순 안 남.
+        #   - shot_off/shot_blocked: 애초에 골문 밖으로 향하는 슛이라
+        #     전력 다이빙까지는 필요 없음 — 몸만 살짝 기울이는 정도.
+        def_side = "away" if fside == "home" else "home"
+        def_team = self.away_players if fside == "home" else self.home_players
+        gk_idx = self._gk_index(def_side)
+        gk = def_team[gk_idx]
+        d["gk_side"] = def_side
+        d["gk_idx"] = gk_idx
+        d["gk_start"] = (gk["x"], gk["y"])
+        _dive_x_off = 0.03 if fgoal_x < 0.5 else -0.03
+        gk_dive_x = fgoal_x + _dive_x_off
+        if outcome == "save":
+            gk_dive_y = fty
+        elif outcome == "goal":
+            gk_dive_y = 0.5 + (fty - 0.5) * random.uniform(0.45, 0.7)
+        else:
+            gk_dive_y = 0.5 + (fty - 0.5) * 0.18
+        d["gk_target"] = (gk_dive_x, max(0.06, min(0.94, gk_dive_y)))
+
+    def _db_step_shot(self, speed_scale):
+        d = self._db
+        dt = self._update_player_positions(speed_scale)
+        if self._pass_flight:
+            pf = self._pass_flight  # advance_pass_flight may null self._pass_flight below
+            self._advance_pass_flight(dt)
+            # [신규 — GK 다이빙] 공 비행과 같은 진행률(t/dur, 같은 smoothstep
+            # 이징)로 GK를 시작 위치에서 다이빙 목표까지 보간한다 — 공이
+            # 골문에 도달하는 순간과 GK가 도달 지점에 닿는 순간이 항상
+            # 정확히 같은 프레임에 맞아떨어진다.
+            _t = min(1.0, pf["t"] / pf["dur"])
+            _ease = _t * _t * (3 - 2 * _t)
+            _gk_team = self.home_players if d["gk_side"] == "home" else self.away_players
+            _gk = _gk_team[d["gk_idx"]]
+            _sx, _sy = d["gk_start"]
+            _tx, _ty = d["gk_target"]
+            _gk["x"] = _sx + (_tx - _sx) * _ease
+            _gk["y"] = _sy + (_ty - _sy) * _ease
+            return
+        # 비행 완료 — 결과를 반영하고, 결과에 따라 다음 데드볼로 그 자리에서
+        # 바로 이어간다(오픈플레이를 한 틱도 거치지 않음 — 끼어들 틈 자체가
+        # 없다).
+        fside, outcome = d["side"], d["outcome"]
+        team_name = self.home_name if fside == "home" else self.away_name
+        if outcome == "goal":
+            if fside == "home":
+                self.score_home += 1
+            else:
+                self.score_away += 1
+            self.banner_text = f"⚽ GOAL! {team_name}"
+            self.banner_color = "#55ff88"
+            self.banner_alpha = 255
+            concede_side = "away" if fside == "home" else "home"
+            self.possession = concede_side
+            self.holder = self._kickoff_holder_index(concede_side)
+            self._assign_roles()
+            self.ball["x"], self.ball["y"] = 0.5, 0.5
+            self.ball_trail = []
+            self._pass_flight = None
+            self.shape_push["home"] = 0.5
+            self.shape_push["away"] = 0.5
+            self.pass_clock = random.uniform(0.5, 1.2)
+            self._db_exit()
+        elif outcome == "save":
+            self.banner_text = f"🧤 {team_name} 슈팅, 선방에 막힘"
+            self.banner_color = "#ffcc55"
+            self.banner_alpha = 255
+            d["kind"] = "goal_kick"
+            d["side"] = "away" if fside == "home" else "home"
+            self._db_start_goal_kick()
+        elif outcome == "shot_off":
+            # [버그 수정] save/goal은 결과 배너가 있는데 shot_off만 없어서,
+            # 골킥으로 조용히 넘어가는 동안 화면엔 예전 배너가 계속 남아
+            # 있었다 — 위 "⚡ {team} 슈팅!" 시작 배너로 상황 자체는 이제
+            # 보이지만, 결과(빗나감)까지 명확히 알려주는 게 일관성 있다.
+            self.banner_text = f"🚫 {team_name} 슈팅, 골대를 벗어남"
+            self.banner_color = "#888888"
+            self.banner_alpha = 255
+            d["kind"] = "goal_kick"
+            d["side"] = "away" if fside == "home" else "home"
+            self._db_start_goal_kick()
+        elif outcome == "shot_blocked":
+            # [효율화] 블록된 슛은 이미 골문 근처까지 날아온 상태라,
+            # 코너킥의 "접근 굴러나가는" 전조 비행을 또 한 번 반복할
+            # 필요가 없다 — 곧장 코너 근처로 스냅하고 크라우드 단계부터
+            # 시작한다(이벤트가 많은 경기에서 데드볼 처리 시간을 아껴,
+            # 90분 안에 모든 예정 이벤트가 실제로 화면에 나올 시간을
+            # 확보한다).
+            d["kind"] = "corner"
+            d["side"] = fside
+            _cgoal_x = 1.0 if fside == "home" else 0.0
+            _corner_x_lead = 0.98 if _cgoal_x >= 0.5 else 0.02
+            _corner_y_lead = 0.04 if self.ball["y"] < 0.5 else 0.96
+            self.ball["x"], self.ball["y"] = _corner_x_lead, _corner_y_lead
+            self.ball_trail = []
+            self._pass_flight = None
+            _team_name2 = self.home_name if fside == "home" else self.away_name
+            self.banner_text = f"🚩 {_team_name2} 코너킥"
+            self.banner_color = "#ffcc55"
+            self.banner_alpha = 255
+            self._snap_corner_crowd(fside)
+            self._info_glide_until = self.clock + 0.35
+            d["glide_until"] = self._info_glide_until
+            d["phase"] = "crowd"
+
     def _start_pass_flight(self, start_xy, end_xy):
         """[패스 궤적] 공이 홀더→홀더로 순간이동하지 않고, 거리 비례 시간
         동안 부드럽게 날아가도록 비행 상태를 만든다. 이동 중 좌표가
@@ -1983,13 +3152,154 @@ class MatchSimViewer(QDialog):
         if t >= 1.0:
             self._pass_flight = None
 
+    def _evaluate_lane_advantage(self, side):
+        """[신규 — 오픈플레이 공간평가] tactical_engine의 사후 힌트
+        (self._target_lane_y — "그 분에 어느 레인이 우세했는가", 1개
+        스칼라값)와 별개로, "지금 이 순간" 실제 22명의 좌표를 갖고
+        전술 엔진과 같은 레인 경계(0.34/0.67)로 상대 진영에서의 수적
+        우위를 계산한다. tactical_engine의 결과(그 분에 슛/코너가
+        터지는지)는 이미 포메이션 매치업을 반영하지만, 그 우위가
+        화면에서 "그 구역으로 공이 몰리고 침투가 일어나는" 그림으로는
+        전혀 이어지지 않았다 — 이 함수가 그 연결 고리다.
+
+        반환: {"L": adv, "C": adv, "R": adv}
+          adv = (그 레인·상대 진영에 있는 우리 팀 수)
+              - (그 레인·자기 진영에 있는 상대 수비 수)
+          즉 순수 카운트 기반의 가벼운 실시간 스냅샷이며,
+          tactical_engine처럼 스탯까지 반영한 정밀 계산은 아니다
+          (매 패스 판정마다 도는 함수라 가벼워야 함).
+        """
+        team = self.home_players if side == "home" else self.away_players
+        opp = self.away_players if side == "home" else self.home_players
+        sign = 1 if side == "home" else -1
+
+        def _lane_of(y):
+            if y < 0.34:
+                return "L"
+            if y > 0.67:
+                return "R"
+            return "C"
+
+        adv = {"L": 0, "C": 0, "R": 0}
+        for p in team:
+            if p["pos"] == "GK":
+                continue
+            if (p["x"] - 0.5) * sign > 0:   # 상대 진영(전진)에 있는 우리 선수만
+                adv[_lane_of(p["y"])] += 1
+        for p in opp:
+            if p["pos"] == "GK":
+                continue
+            if (p["x"] - 0.5) * sign > 0:   # 같은 구역(우리 전진 진영)에 내려와 있는 상대 수비
+                adv[_lane_of(p["y"])] -= 1
+        return adv
+
+    def _try_pull_forward_scheduled_event(self, side, holder_x, holder_y):
+        """[신규 — 이벤트 당김] 오픈플레이가 실제로 상대 박스 근처까지
+        만들어낸 '찬스'를, 그 상황과 무관하게 예정된 시각까지 그냥
+        기다리는 대신 최대한 자연스럽게 이어붙인다.
+
+        절대 새 슛/코너/파울을 만들어내지 않는다 — tactical_engine이
+        이미 확정해둔 이번 경기 전체 슛/골/코너/파울 개수(team_stats)는
+        한 글자도 안 바뀐다. self._plog(뷰어 로컬 사본, DB에 저장된
+        원본 possession_log와 무관)에 이미 있는, 아직 처리 안 된 그
+        팀의 다음 예정 이벤트 하나를 찾아서 "몇 분에 터지는가"라는
+        타이밍만 지금 이 순간으로 당겨올 뿐이다. 룩어헤드 안에 당길
+        게 없으면 아무 것도 만들지 않고 그냥 오픈플레이가 계속된다.
+        """
+        _opp_goal_x = 1.0 if side == "home" else 0.0
+        # [조정] 처음엔 골문 정면 폭(_GOAL_HALF_HEIGHT*2.5)으로 좁게
+        # 잡았더니 실측(합성 5경기, 총 570틱)에서 x조건조차 1%(114번 중
+        # 1번)만 걸렸다 — 사실상 발동 안 하는 셈이라 무의미했다. 필러
+        # 슛 자체가 쓰는 "일반 슈팅 거리" 기준(_SHOT_ZONE_NORMAL)과
+        # 그보다 조금 넓은 각도 기준으로 맞춰서, 실제로 "슈팅할 만한
+        # 위치"에 들어왔을 때 의미 있는 빈도로 작동하게 한다.
+        _in_chance_area = (abs(holder_x - _opp_goal_x) < _SHOT_ZONE_NORMAL
+                            and abs(holder_y - 0.5) < _GOAL_HALF_HEIGHT * 4.0)
+        if not _in_chance_area:
+            return
+        _LOOKAHEAD_MIN = 2.5
+        _best = None
+        for _pr in self._plog:
+            if _pr["done"] or _pr["team"] != side or _pr["outcome"] == "buildup":
+                continue
+            if _pr["min"] <= self.clock:
+                continue  # 이미 처리 대상 -- 일반 plog 루프가 다음 틱에 알아서 처리
+            if _pr["min"] - self.clock > _LOOKAHEAD_MIN:
+                continue
+            if _best is None or _pr["min"] < _best["min"]:
+                _best = _pr
+        if _best is not None:
+            _best["min"] = self.clock
+
     def _do_pass_or_turnover(self):
+        # [재설계 핵심] 다른 재개(파울/코너킥/스로인/골킥/골라인아웃/필러슛
+        # 결과처리)가 진행 중이면 일반 패스/턴오버 판정 자체를 아예
+        # 안 돌린다. 예전엔 이 함수가 그런 상태와 무관하게 항상 돌아서,
+        # 재개 시퀀스 사이 짧은 틈에 오픈플레이가 끼어들어 재개를 밀어내
+        # 버리는 충돌이 반복됐다 — 이제 이 한 줄이 그 충돌 클래스 전체를
+        # 막는다. (실제로는 _advance_one_tick의 분기 자체가 데드볼 중엔
+        # 이 함수를 아예 안 부르므로 이 체크는 이중 안전장치다.)
+        if self._db is not None:
+            return
         side = self.possession
         team = self.home_players if side == "home" else self.away_players
         opp_team = self.away_players if side == "home" else self.home_players
         sign = 1 if side == "home" else -1
         holder_x = team[self.holder]["x"]
+        holder_y = team[self.holder]["y"]
         start_xy = (self.ball["x"], self.ball["y"])
+
+        # [신규 — 이벤트 당김] 여기서 판정만 하고(다음 틱에 실제 처리),
+        # 아래 패스/턴오버 로직은 평소대로 계속 진행한다 — 당겨졌든
+        # 아니든 이번 틱의 오픈플레이 흐름 자체는 끊기지 않아야 자연스럽다.
+        self._try_pull_forward_scheduled_event(side, holder_x, holder_y)
+
+        # [신규 — 스로인] 실제 축구는 공이 터치라인 밖으로 자주 나가서
+        # 스로인으로 재개되는데, 지금까진 y좌표가 항상 0.05~0.95로
+        # 클램프돼서 "밖으로 나간다"는 개념 자체가 없었다. 홀더가 터치라인
+        # 가까이서 드리블하고 있으면 일정 확률로 공이 그대로 라인을 넘어가
+        # 상대팀 스로인이 된다. 요청대로 배너 문구는 안 띄운다 — 공이
+        # 라인 바로 위에 잠깐 멈췄다가 가까운 동료에게 낮고 짧게(코너킥
+        # 크로스의 아치와는 다르게) 날아드는 움직임 자체가 스로인임을
+        # 보여준다.
+        # [주의] 실제 렌더링 좌표계의 터치라인은 y=0.05/0.95다(모든 위치가
+        # 이 범위로 클램프됨). 윙어/풀백의 홈 y도 폭이 넓어야 0.14/0.86
+        # 수준이라, 기준을 0/1 대신 0.05/0.95로 잡아야 실제로 도달 가능한
+        # 값이 된다.
+        _line_dist = min(holder_y - 0.05, 0.95 - holder_y)
+        if (_line_dist < 0.13 and random.random() < 0.22
+                and self.clock - self._last_throwin_clock > 1.5):
+            self._enter_dead_ball("throw_in", out_side=side, x=holder_x, y=holder_y)
+            return
+
+        # [버그 수정 — 근본 원인] 터치라인(y)엔 스로인 체크가 있었지만
+        # 골라인(x)엔 아무 체크도 없었다. 그래서 드리블/패스가 우연히
+        # 골문 폭 바깥으로 골라인 근처까지 흘러가도, 그 사실을 감지해서
+        # 멈추는 로직이 전혀 없어 그냥 클램프된 채로 오픈플레이가 계속
+        # 이어졌다 — 실측 디버그 캡처에서 홀더가 골라인 코앞(x<0.02)까지
+        # 간 뒤에도 아무 판정 없이 진행되다가, 우연히 타이밍이 맞은 다른
+        # 예정 이벤트(코너킥 등)가 뒤늦게 겹쳐서야 정리되는 게 그대로
+        # 재현됐다("좌표를 전혀 못 잡는다"는 지적의 정확한 원인). 골대
+        # 폭 바깥에서 홀더가 골라인에 바짝 붙으면, 어느 쪽 골라인이냐에
+        # 따라 상대 골킥(내가 공격하다 흘림) 또는 상대 코너킥(내가 수비
+        # 하다 자책성으로 흘림)으로 정리한다.
+        _own_goal_x = 0.0 if side == "home" else 1.0
+        _opp_goal_x = 1.0 if side == "home" else 0.0
+        _outside_goal_mouth = abs(holder_y - 0.5) > _GOAL_HALF_HEIGHT * 1.4
+        if (_outside_goal_mouth and self.clock - self._last_byline_clock > 1.5
+                and random.random() < 0.22):
+            _dist_to_opp_byline = abs(_opp_goal_x - holder_x)
+            _dist_to_own_byline = abs(_own_goal_x - holder_x)
+            if _dist_to_opp_byline < 0.07:
+                # 공격 중 골라인 밖으로 흘림(빗나간 크로스/드리블) → 상대 골킥
+                self._last_byline_clock = self.clock
+                self._enter_dead_ball("goal_kick", side=("away" if side == "home" else "home"))
+                return
+            if _dist_to_own_byline < 0.07:
+                # 수비 중 자기 골라인 밖으로 흘림(클리어링 실패) → 상대 코너킥
+                self._last_byline_clock = self.clock
+                self._enter_dead_ball("corner", side=("away" if side == "home" else "home"))
+                return
 
         my_team_side = "home" if self.is_home else "away"
         is_my_team = (side == my_team_side)
@@ -2012,6 +3322,23 @@ class MatchSimViewer(QDialog):
             # 팀 점유율로 보정된 기준값에 추가로 얹는다.
             pass_acc = self.detail.get("pass_acc") or 0.72
             TURNOVER_CHANCE = max(0.06, min(0.5, TURNOVER_CHANCE - (pass_acc - 0.72) * 0.5))
+        else:
+            # [신규 — 로스터 스탯 반영] 나 말고 나머지 홀더 21명도 지금까진
+            # 완전히 똑같은 확률로 공을 지켰다(포지션·개인 능력과 무관).
+            # 홀더의 dribbling 스탯이 높을수록(50이 평균) 덜 뺏기게 한다.
+            _dribbling = team[self.holder].get("stats", {}).get("dribbling", 50)
+            TURNOVER_CHANCE = max(0.06, min(0.5,
+                TURNOVER_CHANCE - (_dribbling - 50) / 100 * 0.3))
+        # [신규 — 로스터 스탯 반영] 압박 중인 수비수(presser)의 tackling
+        # 스탯이 높을수록 실제로 더 잘 뺏어야 한다 — 예전엔 거리만 보고
+        # 확률이 정해져서, 수비력 약한 선수나 강한 선수나 압박 성공률이
+        # 완전히 같았다.
+        if self._presser_idx is not None:
+            _opp_for_press = self.away_players if side == "home" else self.home_players
+            if self._presser_idx < len(_opp_for_press):
+                _tackling = _opp_for_press[self._presser_idx].get("stats", {}).get("tackling", 50)
+                TURNOVER_CHANCE = max(0.05, min(0.55,
+                    TURNOVER_CHANCE + (_tackling - 50) / 100 * 0.25))
 
         if random.random() < TURNOVER_CHANCE:
             # 상대에게 턴오버 — 공 근처(수비 라인 포함) 상대 선수가 인터셉트
@@ -2071,7 +3398,14 @@ class MatchSimViewer(QDialog):
         # 패스가 나왔다(사용자가 캡처한 화면의 긴 대각선이 이 경우). 실제
         # 축구는 대부분 근~중거리 패스이므로, 홀더와 가까운 후보들만 남기고
         # (그런 후보가 아예 없을 때만 예외적으로 전체 허용) 고른다.
-        _MAX_PASS_DIST = 0.42
+        # [현실성 보정] 0.42는 중원과 최전방 격차가 벌어지는 상황(방금
+        # 후퇴폭 조정으로 격차 자체는 줄였지만 여전히 벌어질 수 있음)에서
+        # 실제로 뚫려 있는 전진 패스 상대까지도 걸러버려서, "완전히
+        # 뚫렸는데 전진 패스가 하나도 안 잡혀 뒤로/옆으로만 돈다"는
+        # 지적의 원인이 됐다. 0.55로 늘려서 스루패스 수준의 진짜 전진
+        # 옵션은 잡히게 하면서도, 피치를 통째로 가로지르는 수준의
+        # 비현실적인 패스는 여전히 걸러진다.
+        _MAX_PASS_DIST = 0.55
         near_candidates = [
             i for i in candidates
             if abs(team[i]["x"] - holder_x) + abs(team[i]["y"] - self.ball["y"]) <= _MAX_PASS_DIST]
@@ -2101,6 +3435,58 @@ class MatchSimViewer(QDialog):
             dists = [abs(team[i]["x"] - holder_x) + abs(team[i]["y"] - self.ball["y"])
                      for i in pool]
             weights = [1.0 / (0.10 + d) for d in dists]
+            # [신규 — 진짜 레인 반영] 전술 엔진이 "이 순간 실제로 이
+            # 레인이 우세했다"고 계산해둔 힌트(self._target_lane_y)가
+            # 있으면, 그 레인에 가까운 동료를 살짝 더 선호한다 — 포메이션
+            # 매치업 계산이 화면에서도 "그 쪽으로 공이 몰린다"는 그림으로
+            # 실제로 이어지게 하는 부분. 거리 기반 가중치를 뒤집는 게
+            # 아니라 그 위에 완만하게 얹는 정도(과하면 그냥 레인 안에서
+            # 핑퐁하는 부자연스러움이 생기므로).
+            _lane_w = [1.0 / (0.12 + abs(team[i]["y"] - self._target_lane_y)) for i in pool]
+            weights = [w * (lw ** 1.6) for w, lw in zip(weights, _lane_w)]
+
+            # [신규 — 실시간 공간평가] 위 _target_lane_y는 "그 분에" 어느
+            # 레인이 우세했는지에 대한 사후 힌트 하나뿐이라, 조용한 시간
+            # (그 분에 예정된 이벤트가 없는 틱)엔 아무 방향성이 없었다
+            # ("CM↔ST를 왕복하며 진전이 없다"는 지적의 원인). 지금 이
+            # 순간 실제 좌표 기준 수적 우위가 있는 레인 쪽을 추가로
+            # 선호하게 해서, 조용한 시간에도 "그 쪽이 뚫려서 공이
+            # 몰린다"는 목적성 있는 흐름을 만든다.
+            _lane_adv = self._evaluate_lane_advantage(side)
+            _best_lane = max(_lane_adv, key=_lane_adv.get)
+            if _lane_adv[_best_lane] > 0:
+                _lane_center = {"L": 0.18, "C": 0.5, "R": 0.82}[_best_lane]
+                _space_w = [1.0 / (0.14 + abs(team[i]["y"] - _lane_center)) for i in pool]
+                weights = [w * (sw ** 1.3) for w, sw in zip(weights, _space_w)]
+
+            # [신규 — 침투런 우선순위] _breakthrough_marks(라인을 이미
+            # 돌파해 뒷공간에 있는 동료 → 마크 중인 수비수)는 지금까지
+            # 수비 마킹에만 쓰이고 공격 쪽 패스 판정엔 전혀 재사용되지
+            # 않았다. 뒷공간에 있는 동료가 전진 후보 풀에 있으면 스루
+            # 패스처럼 우선 연결되도록 크게 가중치를 준다.
+            _breakers = set(self._breakthrough_marks.values())
+            if _breakers:
+                weights = [w * (4.0 if i in _breakers else 1.0)
+                           for w, i in zip(weights, pool)]
+
+            # [버그 수정 — 근본 원인] 홀더가 이미 상대 진영 깊숙이
+            # 들어와 있어도(예: 상대 수비 라인 코앞의 ST), 후보 가중치가
+            # 순수 거리 기반이라 근처에 전진 옵션이 없으면 그냥 가장
+            # "가까운" 후보를 골랐다 — 그런데 그 팀 나머지 대다수(CB/
+            # CDM/CM)가 원래 훨씬 뒤에 자리하고 있으므로, "가장 가까운"
+            # 후보조차 홀더 기준으로는 한참 처진 동료인 경우가 흔했다.
+            # 그 결과 애써 만든 전진 위치를 스스로 반납하는 패스가
+            # 나왔다("전진해 있는 ST가 왜 뒤로 패스하냐"는 지적 그대로).
+            # 홀더가 확실히 상대 진영에 들어와 있을 때만, 자기보다 많이
+            # (0.25 이상) 처진 후보에게 페널티를 줘서 완전 포기성
+            # 백패스 빈도를 낮춘다 — 짧은 안전 백패스(템포 조절)는
+            # 페널티 없이 그대로 허용한다.
+            _holder_adv = (holder_x - 0.5) * sign
+            if _holder_adv > 0.15:
+                _back_pen = [0.35 if (team[i]["x"] - holder_x) * sign < -0.25 else 1.0
+                             for i in pool]
+                weights = [w * bp for w, bp in zip(weights, _back_pen)]
+
             new_holder = random.choices(pool, weights=weights, k=1)[0]
         self.holder = new_holder
         self._assign_roles()
@@ -2121,6 +3507,11 @@ class MatchSimViewer(QDialog):
             random.setstate(_rng_state)
 
     def _start_scene_body(self, e):
+        # [검증용 계측] 씬 시작 시 크로서/키커/수비벽을 강제 위치로 스냅
+        # (_scene_force_start, _scene_crowd)하는데, 이 시점 배너는 아직
+        # ""(공백)이라 배너 텍스트로는 이 스냅을 식별할 수 없었다. 헤드리스
+        # 검증이 오탐 없이 정확히 판별하도록 여기서도 기록해둔다.
+        self._last_restart_clock = self.clock
         # 공격측: goal_for/miss_for(=내가 관여한 이벤트라서 항상 내팀 공격),
         # goal_against/save는 상대 공격
         my_side = "home" if self.is_home else "away"
@@ -2164,16 +3555,18 @@ class MatchSimViewer(QDialog):
             # 안 돼서, 평소 오픈플레이 포메이션 공식을 계속 따라가느라
             # 킥 순간에도 다들 엉뚱한 자리(예: 자기 골키퍼 옆)에 흩어져
             # 있었다("현실적이지 않다"는 지적 그대로). 실제 PK처럼 다들
-            # 박스·아크 밖으로 빠져 나가는 대형을 잡는다.
-            _atk_others = [i for i, pl in enumerate(atk_team) if i != self.my_slot]
+            # 박스·아크 밖으로 빠져 나가는 대형을 잡는다 — 포지션별
+            # 역할(세컨볼 침투조/역습 대비조, 블루 차단조/카운터 대기조)
+            # 까지 반영한다.
+            _atk_others = [i for i, pl in enumerate(atk_team)
+                           if i != self.my_slot and pl["pos"] != "GK"]
             _def_others = [i for i, pl in enumerate(def_team) if pl["pos"] != "GK"]
-            random.shuffle(_atk_others)
-            random.shuffle(_def_others)
-            _atk_pts, _def_pts = _penalty_arc_slots(atk_goal_x, spot_x, len(_atk_others), len(_def_others))
-            for i, (jx, jy) in zip(_atk_others, _atk_pts):
-                self._scene_crowd[i] = ("atk", jx, jy)
-            for i, (jx, jy) in zip(_def_others, _def_pts):
-                self._scene_crowd[i] = ("def", jx, jy)
+            _atk_pts, _def_pts = _penalty_arc_slots(
+                atk_goal_x, spot_x, atk_team, _atk_others, def_team, _def_others)
+            for i, (jx, jy) in _atk_pts.items():
+                self._scene_crowd[("atk", i)] = (jx, jy)
+            for i, (jx, jy) in _def_pts.items():
+                self._scene_crowd[("def", i)] = (jx, jy)
 
         elif style in ("penalty", "penalty_miss") and not my_team_is_atk:
             # [버그 수정] 위 분기는 "우리 팀이 얻은 PK"만 다뤄서, "상대 팀
@@ -2189,15 +3582,15 @@ class MatchSimViewer(QDialog):
             def_idx = [i for i, pl in enumerate(def_team) if pl["pos"] == "GK"]
             spot_x = 0.83 if atk_goal_x == 1.0 else 0.17
             self._scene_ball_start = {"x": spot_x, "y": 0.5}
-            _atk_others = [i for i, pl in enumerate(atk_team) if i != taker]
+            _atk_others = [i for i, pl in enumerate(atk_team)
+                           if i != taker and pl["pos"] != "GK"]
             _def_others = [i for i, pl in enumerate(def_team) if pl["pos"] != "GK"]
-            random.shuffle(_atk_others)
-            random.shuffle(_def_others)
-            _atk_pts, _def_pts = _penalty_arc_slots(atk_goal_x, spot_x, len(_atk_others), len(_def_others))
-            for i, (jx, jy) in zip(_atk_others, _atk_pts):
-                self._scene_crowd[i] = ("atk", jx, jy)
-            for i, (jx, jy) in zip(_def_others, _def_pts):
-                self._scene_crowd[i] = ("def", jx, jy)
+            _atk_pts, _def_pts = _penalty_arc_slots(
+                atk_goal_x, spot_x, atk_team, _atk_others, def_team, _def_others)
+            for i, (jx, jy) in _atk_pts.items():
+                self._scene_crowd[("atk", i)] = (jx, jy)
+            for i, (jx, jy) in _def_pts.items():
+                self._scene_crowd[("def", i)] = (jx, jy)
 
         elif style == "setpiece" and my_team_is_atk:
             # [버그 수정] 예전엔 ATTACK_ROLES(ST/CF/WG/CAM)만 씬에 넣어서,
@@ -2282,9 +3675,9 @@ class MatchSimViewer(QDialog):
             _crowd_def = [i for i in _crowd_def if i not in _def_stay]
             _atk_pts, _def_pts = _corner_slots(atk_goal_x, corner_y, len(_crowd_atk), len(_crowd_def))
             for i, (jx, jy) in zip(_crowd_atk, _atk_pts):
-                self._scene_crowd[i] = ("atk", jx, jy)
+                self._scene_crowd[("atk", i)] = (jx, jy)
             for i, (jx, jy) in zip(_crowd_def, _def_pts):
-                self._scene_crowd[i] = ("def", jx, jy)
+                self._scene_crowd[("def", i)] = (jx, jy)
 
         elif style == "setpiece" and not my_team_is_atk:
             # [버그 수정] 위 분기는 "우리 팀이 얻은 코너킥"만 다뤄서, "상대
@@ -2331,9 +3724,9 @@ class MatchSimViewer(QDialog):
             _crowd_def = [i for i in _crowd_def if i not in _def_stay]
             _atk_pts, _def_pts = _corner_slots(atk_goal_x, corner_y, len(_crowd_atk), len(_crowd_def))
             for i, (jx, jy) in zip(_crowd_atk, _atk_pts):
-                self._scene_crowd[i] = ("atk", jx, jy)
+                self._scene_crowd[("atk", i)] = (jx, jy)
             for i, (jx, jy) in zip(_crowd_def, _def_pts):
-                self._scene_crowd[i] = ("def", jx, jy)
+                self._scene_crowd[("def", i)] = (jx, jy)
 
         elif style == "freekick" and my_team_is_atk:
             # [신규] 직접 프리킥. 예전엔 "세트피스"가 전부 코너킥(코너
@@ -2366,7 +3759,7 @@ class MatchSimViewer(QDialog):
             random.shuffle(wall_pool)
             for k, i in enumerate(wall_pool[:wall_n]):
                 wy = max(0.05, min(0.95, fk_y + (k - (wall_n - 1) / 2) * 0.035))
-                self._scene_crowd[i] = ("def", wall_x, wy)
+                self._scene_crowd[("def", i)] = (wall_x, wy)
 
         else:
             # 기존 오픈플레이 로직 — 일반 골/실점/선방/역전골/동점골 등 공통 기본값.
@@ -2492,9 +3885,9 @@ class MatchSimViewer(QDialog):
         # [신규] 코너킥 박스 크라우드 시작 좌표도 기록해둔다(현재 실제
         # 위치에서 자연스럽게 이어지도록).
         self._scene_crowd_start = {}
-        for _ci, (_side, _tx, _ty) in self._scene_crowd.items():
+        for (_side, _ci), (_tx, _ty) in self._scene_crowd.items():
             _cteam = atk_team if _side == "atk" else def_team
-            self._scene_crowd_start[_ci] = (_cteam[_ci]["x"], _cteam[_ci]["y"])
+            self._scene_crowd_start[(_side, _ci)] = (_cteam[_ci]["x"], _cteam[_ci]["y"])
         # [버그 수정] 코너킥/크로스처럼 특수 시작 좌표가 강제된 선수(크로서)는
         # 실제 평소 위치 대신 그 강제 좌표에서 씬을 시작하도록 덮어쓴다.
         for _idx, _pos in self._scene_force_start.items():
@@ -2634,6 +4027,14 @@ class MatchSimViewer(QDialog):
             follow = gk_follow if is_gk else 0.25
             target_x = pl["hx"] + (goal_x - pl["hx"]) * (follow * 0.3)
             target_y = pl["hy"] + (self.ball["y"] - pl["hy"]) * follow
+            if not is_gk:
+                # [버그 수정] 일반 오픈플레이 공식과 같은 문제 — 여기서도
+                # goal_x(자기 골) 쪽으로 당기기만 하고 하한이 없어서, 골/
+                # 세이브 장면이 반복되면 이 공식을 타는 수비수도 골키퍼
+                # 옆까지 밀릴 수 있었다. 같은 최소 깊이를 적용한다.
+                _dir = 1 if goal_x < 0.5 else -1
+                _min_x = goal_x + _MIN_DEFENSIVE_DEPTH * _dir
+                target_x = max(target_x, _min_x) if _dir > 0 else min(target_x, _min_x)
             pl["x"] = sx + (target_x - sx) * ease
             pl["y"] = sy + (target_y - sy) * ease
 
@@ -2642,10 +4043,10 @@ class MatchSimViewer(QDialog):
         # 재사용해서 크로스가 올라가는 동안 서서히 몰려드는 것처럼 보이게
         # 한다(다 몰린 채로 시작하면 순간이동처럼 보이니).
         if self._scene_crowd:
-            for i, (side, tx, ty) in self._scene_crowd.items():
+            for (side, i), (tx, ty) in self._scene_crowd.items():
                 cteam = atk_team if side == "atk" else def_team
                 pl = cteam[i]
-                sx, sy = self._scene_crowd_start.get(i, (pl["x"], pl["y"]))
+                sx, sy = self._scene_crowd_start.get((side, i), (pl["x"], pl["y"]))
                 pl["x"] = sx + (tx - sx) * ease
                 pl["y"] = sy + (ty - sy) * ease
 

@@ -9,13 +9,34 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPainter, QBrush, QColor, QPen
 
 from game_engine import get_player, get_team_rank, fmt_money
-from constants import ALL_STATS, STAT_KO, STAT_EN
+from constants import ALL_STATS, STAT_KO, STAT_EN, _LEGACY_TALENT_ALIAS
+
+# [신규] 재능 등급 뱃지 — OVR 옆에 표시할 한글 라벨 + 등급별 색상.
+# constants.TALENT_TIERS의 5단계(worldclass~ordinary)에 대응. 구버전
+# 세이브의 예전 티어명(gifted/mid/normal/limited)은 constants의
+# _LEGACY_TALENT_ALIAS로 이미 매핑 테이블이 있으니 그대로 재사용한다.
+_TALENT_KO = {
+    "worldclass": "월드클래스", "elite": "엘리트", "pro": "프로",
+    "semipro": "세미프로", "ordinary": "평범",
+}
+_TALENT_EN = {
+    "worldclass": "World Class", "elite": "Elite", "pro": "Pro",
+    "semipro": "Semi-Pro", "ordinary": "Ordinary",
+}
+_TALENT_COLOR = {
+    "worldclass": "#b8860b",  # 골드
+    "elite":      "#7a4fc9",  # 퍼플
+    "pro":        "#2a6a9e",  # 블루
+    "semipro":    "#555555",  # 그레이
+    "ordinary":   "#3a3a3a",  # 다크그레이
+}
 
 PANEL_STYLE = """
 QWidget { background-color: #1e1e1e; color: #cccccc; font-size: 12px; }
 #pName  { color: #00ff66; font-size: 16px; font-weight: bold; }
 #ovrBadge { background-color: #2a6a2a; color: white;
             padding: 2px 8px; border-radius: 4px; font-size: 12px; }
+#talentBadge { color: white; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; }
 #injBadge { background-color: #8b0000; color: white;
             padding: 2px 6px; border-radius: 4px; font-size: 11px; }
 #slumpBadge { background-color: #555500; color: #ffff00;
@@ -60,10 +81,12 @@ class PlayerPanel(QWidget):
         self.lbl_name  = QLabel("—"); self.lbl_name.setObjectName("pName")
         self.lbl_name.setWordWrap(True)          # 긴 이름 자동 줄바꿈
         self.lbl_ovr   = QLabel("OVR 0"); self.lbl_ovr.setObjectName("ovrBadge")
+        self.lbl_talent = QLabel(""); self.lbl_talent.setObjectName("talentBadge")
         self.lbl_state = QLabel(""); self.lbl_state.setObjectName("injBadge")
         badge_row = QHBoxLayout()
         badge_row.setContentsMargins(0, 2, 0, 0)
         badge_row.addWidget(self.lbl_ovr)
+        badge_row.addWidget(self.lbl_talent)
         badge_row.addWidget(self.lbl_state)
         badge_row.addStretch()
         self.lay.addWidget(self.lbl_name)
@@ -136,6 +159,15 @@ class PlayerPanel(QWidget):
 
         self.lbl_name.setText(p["name"])
         self.lbl_ovr.setText(f"OVR {p['ovr']}")
+
+        # [신규] 재능 등급 뱃지. 구버전 세이브의 예전 티어명은
+        # _LEGACY_TALENT_ALIAS로 새 이름으로 변환한 뒤 표시한다.
+        _tier = p.get("talent_tier", "pro") or "pro"
+        _tier = _LEGACY_TALENT_ALIAS.get(_tier, _tier)
+        _tname = _TALENT_KO.get(_tier, _tier) if lang == "ko" else _TALENT_EN.get(_tier, _tier)
+        _tcolor = _TALENT_COLOR.get(_tier, "#555555")
+        self.lbl_talent.setText(f"★ {_tname}")
+        self.lbl_talent.setStyleSheet(f"background-color: {_tcolor};")
 
         if p.get("injured"):
             self.lbl_state.setText(f"🩹 부상({p['injury_weeks']}주)")

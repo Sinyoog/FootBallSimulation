@@ -4,6 +4,8 @@ import math
 import json
 import intl_engine
 import champions_engine
+from match_sim import match_flow
+from match_sim import tactical_engine
 from database import (get_conn, calc_ovr, ALL_STATS,
                       rescale_team_to_target_ovr, get_league_avg_ovr,
                       get_league_strong_ovr)
@@ -291,6 +293,22 @@ def get_match_detail(detail_id):
         d["payload"] = json.loads(d.get("detail_json") or "{}")
     except Exception:
         d["payload"] = {}
+    # [신규] possession_log는 detail_json과 별개의 컬럼으로 저장했지만
+    # (이유: 경기당 통째로 쓰고 읽는 구조화 데이터라 JSON 컬럼이 더
+    # 맞음), 소비하는 쪽(match_sim_viewer.py)은 다른 필드들처럼 그냥
+    # payload 하나만 보면 되게 여기서 합쳐준다. 구버전 경기(컬럼 자체가
+    # 비어있음)는 빈 리스트 — 뷰어가 자동으로 기존 사후-추측 로직으로
+    # 폴백한다.
+    try:
+        d["payload"]["possession_log"] = json.loads(d.get("possession_log") or "[]")
+    except Exception:
+        d["payload"]["possession_log"] = []
+    # [신규] lineup_stats도 possession_log와 같은 방식으로 payload에
+    # 합쳐준다 — match_sim_viewer.py는 payload 하나만 보면 된다.
+    try:
+        d["payload"]["lineup_stats"] = json.loads(d.get("lineup_stats") or "{}")
+    except Exception:
+        d["payload"]["lineup_stats"] = {}
     return d
 
 
@@ -332,7 +350,7 @@ def _age_train_eff(age: int, peak_age: int) -> float:
 # ═══════════════════════════════════════════
 
 def create_player(name: str, position: str, sub_role: str,
-                  nationality: str = None, flag: str = None):
+                  nationality: str = None, flag: str = None, talent_tier: str = None):
     conn = get_conn()
     c = conn.cursor()
 
@@ -375,15 +393,19 @@ def create_player(name: str, position: str, sub_role: str,
     height = random.randint(*_bt["height"])
     weight = random.randint(*_bt["weight"])
 
-    # 재능 등급 추첨 (worldclass/elite/pro/semipro/ordinary) → 고강도 돌파 상한 결정
-    _r = random.random()
-    _acc = 0.0
-    talent_tier = "pro"
-    for _tname in ("worldclass", "elite", "pro", "semipro", "ordinary"):
-        _acc += TALENT_TIERS[_tname]["prob"]
-        if _r < _acc:
-            talent_tier = _tname
-            break
+    # 재능 등급 (worldclass/elite/pro/semipro/ordinary) → 고강도 돌파 상한 결정.
+    # [신규] 새 게임 화면에서 선수가 직접 등급을 고를 수 있게 됐다 — talent_tier가
+    # 유효한 값으로 넘어오면 그걸 그대로 쓰고, 없거나(None) 잘못된 값이면
+    # (구버전 호출부 호환) 예전처럼 확률 추첨으로 정한다.
+    if talent_tier not in TALENT_TIERS:
+        _r = random.random()
+        _acc = 0.0
+        talent_tier = "pro"
+        for _tname in ("worldclass", "elite", "pro", "semipro", "ordinary"):
+            _acc += TALENT_TIERS[_tname]["prob"]
+            if _r < _acc:
+                talent_tier = _tname
+                break
     _tt = TALENT_TIERS[talent_tier]
     talent_cap = random.randint(_tt["cap_min"], _tt["cap_max"])
 
@@ -1416,7 +1438,7 @@ def _process_training(p, week, ttype, focus_stat=None):
                     gain = (1 if random.random() < raw else 0) if raw < 1.0 else int(raw)
                     new_val = min(mx, cur + gain)
                 else:
-                    # _max 도달: 한 번 훈련 시 HIGH_BREAK_PROB(20%) 확률로 _max를 +1
+                    # _max 도달: 한 번 훈련 시 HIGH_BREAK_PROB(30%) 확률로 _max를 +1
                     #   끌어올려 talent_cap+α(강점 100+ 가능)까지 점진 돌파.
                     break_cap = min(125, talent_cap + 12)
                     if random.random() < HIGH_BREAK_PROB and mx < break_cap:
@@ -1594,6 +1616,7 @@ def _simulate_match(p, week, info: dict):
     benched = _check_bench(p)
     played  = not benched and not p.get("injured")
 
+    bonus = 0.0
     if played:
         # [에이스 영향력] 내가 팀 평균보다 높을수록 팀을 끌어올린다.
         #   - 11명 중 1명이지만, 에이스는 경기 영향력이 산술평균 이상.
@@ -1603,16 +1626,43 @@ def _simulate_match(p, week, info: dict):
         gap = my_ovr - team_avg
         bonus = max(0.0, gap) * 0.32 + my_ovr * 0.05
         bonus = min(bonus, 14.0)
-        if is_home: home_ovr += bonus
-        else:       away_ovr += bonus
 
-    home_ovr += _home_advantage() + _formation_bias(c, home_id)
-    away_ovr += _formation_bias(c, away_id)
-    diff = home_ovr - away_ovr
-    # 승/무/패 확률 산출은 _match_win_probs()로 통일 (배경 AI 경기와 동일 공식).
-    outcome = _roll_outcome(diff)
-
-    hs, as_ = _gen_score(outcome, diff)
+    # [재설계 — 포메이션 매치업 시뮬레이션] 예전엔 홈-원정 OVR 차이 하나로
+    # 확률표(_match_win_probs/_gen_score)에서 스코어를 뽑았다 — 포메이션이
+    # 실제로 어느 구역에서 수적/능력치 우위를 만드는지는 결과에 전혀
+    # 개입하지 못했다. 이제 실제 포메이션 매치업(레인별 공격/수비 스탯
+    # 비교)을 분 단위로 시뮬레이션한 결과를 쓴다 — 단, 이건 "내가 직접
+    # 보는 경기"에만 적용한다. 리그 나머지 수십~수백 경기(AI 대 AI)는
+    # 이 무거운 시뮬레이션을 돌릴 필요도 의미도 없어서 그대로
+    # _roll_outcome/_gen_score를 쓴다(이 함수는 안 건드림). 새 엔진에
+    # 예외가 나도 경기 진행 자체가 막히면 안 되므로, 실패 시 예전 방식
+    # (OVR 차이 확률표)으로 조용히 폴백한다.
+    engine_stats = None
+    engine_plog = None
+    try:
+        from match_sim.tactical_engine import simulate_my_match
+        home_formation = _team_formation(c, home_id)
+        away_formation = _team_formation(c, away_id)
+        sim = simulate_my_match(
+            home_id, away_id, home_formation, away_formation,
+            home_boost=(bonus if is_home else 0.0),
+            away_boost=(bonus if not is_home else 0.0),
+            home_adv=_home_advantage())
+        hs, as_ = sim["home_score"], sim["away_score"]
+        engine_stats = {"home": sim["home_stats"], "away": sim["away_stats"]}
+        engine_plog = sim["possession_log"]
+        outcome = "draw" if hs == as_ else ("home" if hs > as_ else "away")
+        diff = (home_ovr + (bonus if is_home else 0.0) + _home_advantage()
+                + _formation_bias(c, home_id)
+                - (away_ovr + (bonus if not is_home else 0.0) + _formation_bias(c, away_id)))
+    except Exception:
+        home_ovr2 = home_ovr + (bonus if is_home else 0.0)
+        away_ovr2 = away_ovr + (bonus if not is_home else 0.0)
+        home_ovr2 += _home_advantage() + _formation_bias(c, home_id)
+        away_ovr2 += _formation_bias(c, away_id)
+        diff = home_ovr2 - away_ovr2
+        outcome = _roll_outcome(diff)
+        hs, as_ = _gen_score(outcome, diff)
 
     goals = assists = saves = 0
     rating = 0.0
@@ -1707,7 +1757,7 @@ def _simulate_match(p, week, info: dict):
     _write_match_log(p, week, info["league_name"], is_home,
                      home_id, away_id, hs, as_,
                      my_result, goals, assists, saves, rating, events, played, benched,
-                     detail=detail)
+                     detail=detail, engine_stats=engine_stats, engine_plog=engine_plog)
 
 
 def _team_avg_ovr(c, team_id):
@@ -2047,6 +2097,31 @@ def _poisson(lam):
             return k - 1
 
 
+# ── 상대 PK 실점 마킹 ─────────────────────────────────────────
+# [신규] "🥅 실점" 텍스트는 지금까지 그 실점이 PK였는지/오픈플레이였는지
+# 아무 정보도 없었다. 그래서 match_sim_viewer._detect_style()이 상대의
+# PK 득점을 절대 구분 못 하고 항상 "normal"(오픈플레이 빌드업+슛) 씬으로
+# 떨어졌다 — "PK인데 그냥 공 잡고 뛰는 것처럼 나온다"는 지적의 원인.
+# 팀 스코어(opp_score)는 절대 안 건드리고, 이미 정해진 실점 개수 중
+# 일부에 "(PK)" 꼬리표만 붙여서 뷰어가 전용 스팟킥 연출(20명 클리어
+# 대형)을 태울 수 있게 한다.
+#
+# [1단계 — 지금] 실제 축구의 골 대비 PK 비율(대략 15~20%)에 맞춘 고정
+# 확률. [2단계 — 추후] 그 경기의 파울/카드 수가 많을수록(=PK가 나올
+# 만한 상황 자체가 많았을수록) 확률이 올라가도록 바꿀 예정 — 그때는
+# 이 함수에 파울/카드 컨텍스트 인자를 추가하고 아래 고정값 대신 그 값
+# 기반 확률을 쓰면 된다. 호출부(_player_perf)는 헬퍼만 호출하므로 이
+# 함수 내부만 바꾸면 됨.
+_OPP_PK_CONCEDE_PROB = 0.17
+
+
+def _roll_is_pk_concede():
+    """상대의 이번 실점 하나가 PK였는지 확률적으로 결정.
+    [2단계 확장 지점] 나중에 그 경기 파울/카드 수를 반영하려면 이 함수에
+    인자를 추가하고 _OPP_PK_CONCEDE_PROB 대신 그 값 기반 확률을 쓰면 됨."""
+    return random.random() < _OPP_PK_CONCEDE_PROB
+
+
 def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None):
     """경기 퍼포먼스 계산 v3.
     포지션별 Base 차등 + 활약 가산 구조.
@@ -2082,7 +2157,8 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None):
     # ── 실점 타임라인 ─────────────────────────────────────────
     if opp_score > 0:
         for cm in _sample_minutes(opp_score, 2, 90):
-            events.append((cm, "🥅 실점"))
+            _concede_text = "🥅 실점 (PK)" if _roll_is_pk_concede() else "🥅 실점"
+            events.append((cm, _concede_text))
 
     # ── 스탯 정규화 ──────────────────────────────────────────
     sh  = _stat_n(p, "shooting")
@@ -2568,49 +2644,75 @@ def _update_pop(p, goals, assists, rating):
     update_player(popularity=_calc_pop(p, goals, assists, rating))
 
 
-def _derive_match_stats(is_home, hs, as_, goals, assists, saves, pos, detail):
-    """[경기 통계] 점유율/슈팅/코너/파울/패스성공률을 "논리적으로" 만든다.
+def _derive_match_stats(is_home, hs, as_, goals, assists, saves, pos, detail, engine_stats=None):
+    """[경기 통계] 점유율/슈팅/코너/파울/패스성공률을 만든다.
+
+    [신규] engine_stats가 주어지면(내 경기를 새 전술 엔진으로 시뮬레이션한
+    경우) — {"home":{...}, "away":{...}} 형태, 각 항목은
+    {"poss","shots","shots_on","corners","fouls"} — 그 실제 시뮬레이션
+    결과를 기준값으로 쓴다. 공식으로 사후에 지어내는 게 아니라 실제로
+    벌어진 슈팅/코너/파울 횟수라는 뜻. 없으면(폴백 상황 등) 예전처럼
+    점유율/스코어 기반 공식으로 만든다.
 
     설계 원칙 — 순서가 중요하다:
       1. 최종 스코어(hs/as_)와 내 개인 기록(goals/assists/saves/detail)은
          이미 확정된 값이다(_player_perf가 먼저 계산함).
-      2. 팀 통계는 그 확정된 값들을 "하한선/기준점" 삼아 역산한다. 그래서
-         절대 "내 슈팅 5개인데 팀 슈팅 3개" 같은 모순이 생기지 않는다.
-      3. random.random()을 전혀 쓰지 않는다 — 같은 스코어·같은 내 기록이면
-         항상 같은 통계가 나온다(완전히 결정론적).
+      2. 팀 통계는 그 확정된 값들을 "하한선/기준점" 삼아 역산한다(또는
+         engine_stats를 기준 삼는다). 그래서 절대 "내 슈팅 5개인데 팀
+         슈팅 3개" 같은 모순이 생기지 않는다.
+      3. engine_stats가 없을 때는 random.random()을 전혀 쓰지 않는다 —
+         같은 스코어·같은 내 기록이면 항상 같은 통계가 나온다.
 
-    점유율: 스코어 차이에 비례해 50%에서 벌어짐(최대 ±20%p, tanh로 완만하게).
-    슈팅: 골 수와 완만히 비례하는 베이스 + 내 개인 슈팅 기록을 하한선 보장.
+    점유율: engine_stats가 있으면 그 값, 없으면 스코어 차이에서 추정.
+    슈팅: engine_stats가 있으면 그 값을 베이스로, 내 개인 슈팅 기록을 하한선 보장.
     유효슈팅: 최소한 그 팀이 넣은 골 수만큼은 보장(골은 유효슈팅에서만 나옴).
-    코너/파울: 슈팅·점유율에서 파생.
-    패스 성공률: 내 개인 pass_acc를 우리 팀 값의 기준점으로 삼음(포지션상
-      GK/CB처럼 안정적 패스 포지션이면 팀 평균과 가깝고, 그대로 사용).
+    코너/파울: engine_stats가 있으면 그 값, 없으면 슈팅·점유율에서 파생.
+    패스 성공률: 내 개인 pass_acc를 우리 팀 값의 기준점으로 삼음.
     """
     my_score = hs if is_home else as_
     opp_score = as_ if is_home else hs
 
-    diff = my_score - opp_score
-    my_poss = 50 + round(20 * math.tanh(diff / 2.5))
-    my_poss = max(30, min(70, my_poss))
-    opp_poss = 100 - my_poss
+    my_eng = (engine_stats or {}).get("home" if is_home else "away")
+    opp_eng = (engine_stats or {}).get("away" if is_home else "home")
 
-    my_shots = max(detail.get("shots", 0), round(my_score * 3.2 + my_poss * 0.08))
-    my_shots_on = max(detail.get("shots_on", 0), my_score, round(my_shots * 0.35))
-    my_shots = max(my_shots, my_shots_on)
+    if my_eng and opp_eng:
+        my_poss = max(30, min(70, my_eng.get("poss", 50)))
+        opp_poss = 100 - my_poss
+        my_shots = max(detail.get("shots", 0), my_eng.get("shots", 0))
+        my_shots_on = max(detail.get("shots_on", 0), my_score, my_eng.get("shots_on", 0))
+        my_shots = max(my_shots, my_shots_on)
+        opp_shots = max(opp_score, opp_eng.get("shots", 0))
+        opp_shots_on = max(opp_score, opp_eng.get("shots_on", 0))
+        opp_shots = max(opp_shots, opp_shots_on)
+        my_corners = my_eng.get("corners", 0)
+        opp_corners = opp_eng.get("corners", 0)
+        my_fouls = max(1, my_eng.get("fouls", 0))
+        opp_fouls = max(1, opp_eng.get("fouls", 0))
+        my_pass_acc = detail.get("pass_acc") or (0.66 + my_poss * 0.0026)
+        opp_pass_acc = 0.66 + opp_poss * 0.0026
+    else:
+        diff = my_score - opp_score
+        my_poss = 50 + round(20 * math.tanh(diff / 2.5))
+        my_poss = max(30, min(70, my_poss))
+        opp_poss = 100 - my_poss
 
-    opp_shots = round(opp_score * 3.2 + opp_poss * 0.08)
-    opp_shots_on = max(opp_score, round(opp_shots * 0.35))
-    opp_shots = max(opp_shots, opp_shots_on)
+        my_shots = max(detail.get("shots", 0), round(my_score * 3.2 + my_poss * 0.08))
+        my_shots_on = max(detail.get("shots_on", 0), my_score, round(my_shots * 0.35))
+        my_shots = max(my_shots, my_shots_on)
 
-    my_corners = max(0, round(my_shots * 0.45 + my_poss * 0.02))
-    opp_corners = max(0, round(opp_shots * 0.45 + opp_poss * 0.02))
+        opp_shots = round(opp_score * 3.2 + opp_poss * 0.08)
+        opp_shots_on = max(opp_score, round(opp_shots * 0.35))
+        opp_shots = max(opp_shots, opp_shots_on)
 
-    # 점유율이 낮은 쪽(수비에 더 시달리는 쪽)이 보통 파울이 더 잦다.
-    my_fouls = max(4, round(15 - my_poss * 0.08))
-    opp_fouls = max(4, round(15 - opp_poss * 0.08))
+        my_corners = max(0, round(my_shots * 0.45 + my_poss * 0.02))
+        opp_corners = max(0, round(opp_shots * 0.45 + opp_poss * 0.02))
 
-    my_pass_acc = detail.get("pass_acc") or (0.66 + my_poss * 0.0026)
-    opp_pass_acc = 0.66 + opp_poss * 0.0026
+        # 점유율이 낮은 쪽(수비에 더 시달리는 쪽)이 보통 파울이 더 잦다.
+        my_fouls = max(4, round(15 - my_poss * 0.08))
+        opp_fouls = max(4, round(15 - opp_poss * 0.08))
+
+        my_pass_acc = detail.get("pass_acc") or (0.66 + my_poss * 0.0026)
+        opp_pass_acc = 0.66 + opp_poss * 0.0026
 
     home_stats, away_stats = (
         {"poss": my_poss, "shots": my_shots, "shots_on": my_shots_on,
@@ -2628,13 +2730,19 @@ def _derive_match_stats(is_home, hs, as_, goals, assists, saves, pos, detail):
 
 def _save_match_detail(p, week, comp_name, is_home, home_name, away_name,
                        hs, as_, result, goals, assists, saves, rating,
-                       events, played, benched, detail=None, pso=None):
+                       events, played, benched, detail=None, pso=None, engine_stats=None,
+                       engine_plog=None):
     """경기 상세를 match_details 에 저장하고 detail_id 를 돌려준다.
        리그/챔스/국대 모두 이 헬퍼를 공유한다(팀명은 호출자가 직접 넘김).
        events 정규화(분 배정·시간순)도 여기서 처리. 실패 시 None 반환.
 
        pso: 승부차기로 결정된 녹아웃 경기라면 {"won": bool, "score": "5-4"}
-       형태로 넘긴다. None이면 승부차기 없는 일반 경기."""
+       형태로 넘긴다. None이면 승부차기 없는 일반 경기.
+       engine_stats: 전술 엔진(match_sim.tactical_engine)이 만든 실제
+       시뮬레이션 통계({"home":{...},"away":{...}}). 있으면 _derive_match_stats가
+       공식 추정 대신 이 실측값을 기준으로 쓴다.
+       engine_plog: 전술 엔진이 만든 진짜 분 단위 possession_log. 있으면
+       match_flow의 사후 필러 생성 대신 이걸 개인 서사와 병합해서 쓴다."""
     timed = []
     if played:
         for ev in events:
@@ -2648,60 +2756,56 @@ def _save_match_detail(p, week, comp_name, is_home, home_name, away_name,
     detail = detail or {}
     st = get_state() or {}
     team_stats = (_derive_match_stats(is_home, hs, as_, goals, assists, saves,
-                                      p.get("position", ""), detail)
+                                      p.get("position", ""), detail, engine_stats=engine_stats)
                  if played else None)
 
-    # ── [신규] 코너킥 통계와 재생 화면 동기화 ────────────────────
-    #   team_stats엔 코너킥 개수(예: 6개)가 이미 계산되는데, 그중 실제
-    #   득점으로 이어진 것(🎯 세트피스 골)만 장면으로 남고 나머지는 그냥
-    #   숫자로만 존재해서 "코너킥 6"이라고 통계엔 뜨는데 재생 화면엔 거의
-    #   안 보였다. 득점 안 된 코너킥도 걷어내지는 장면으로 몇 개 살려서
-    #   통계-영상을 맞춘다. (뷰어의 _detect_style은 텍스트에 "세트피스"만
-    #   들어있으면 스타일을 그대로 인식하므로, 실제 코너킥 연출을 그대로
-    #   재사용하면서 miss_for로만 분류되게 한다.)
+    # [구조 변경] 예전엔 team_stats에 잡힌 파울/코너킥 개수를 맞추려고
+    # "🟨 우리 팀 파울" / "⛳ 상대 팀 코너킥" / "🚫 세트피스 코너킥, 수비에
+    # 걷어내졌다" 같은 가짜 텍스트를 이 시점에 timed(개인 이벤트 목록)에
+    # 직접 끼워 넣었다. 문제는 이게 "사후 땜빵"이라 뷰어 쪽에서 재개팀을
+    # 텍스트("우리 팀"/"상대 팀")로 다시 파싱해야 했고, 그 파싱 자체가
+    # 반복적인 버그의 원인이었다(파울 재개팀 오판 등).
+    #
+    # 이제 match_flow.generate_possession_log()가 이 역할을 통째로
+    # 대체한다 — team_stats(슈팅/온타깃/코너/파울)와 진짜 개인 이벤트만
+    # 가지고, "언제 어느 팀이 어느 구역에서 무슨 상황이었는지"를 구조화된
+    # 레코드로 만든다(team 필드 = 그 통계의 주체라서 뷰어가 텍스트를 다시
+    # 파싱할 필요가 없다). 그래서 가짜 텍스트를 timed에 주입하던 이
+    # 블록은 완전히 불필요해졌다 — 삭제한다. timed는 이제 진짜 개인
+    # 이벤트만 담은 채로 유지되고, 그걸 그대로 possession_log 생성에
+    # 넘긴다.
+    possession_log = []
     if played and team_stats:
-        # [버그 수정] 실점/득점 같은 "진짜" 이벤트와 앰비언트(코너킥/파울)
-        # 이벤트가 같은/거의 같은 분(分)에 겹쳐 배정되던 문제. "2' 실점"
-        # 이랑 "2' 세트피스 코너킥이 걷어내졌다"가 동시에 겹쳐 뜨는 식으로
-        # 배너·장면이 충돌해 보였다. 이미 쓰인 분들을 계속 추적하면서
-        # (앰비언트끼리도 서로 피하도록 매번 갱신) 최소 3분 간격을 둔다.
-        _occupied = {m for m, _ in timed}
+        my_score = hs if is_home else as_
+        opp_score = as_ if is_home else hs
+        # [재설계 — 진짜 분 단위 로그] engine_stats와 짝을 이루는 진짜
+        # 시뮬레이션 possession_log(engine_plog)가 있으면(=내 경기를 새
+        # 전술 엔진으로 돌린 경우) 그걸 그대로 쓴다 — match_flow가 통계
+        # 숫자만 보고 사후에 흩뿌리던 필러 대신, 실제로 "이 분엔 이 팀이
+        # 이 레인/서드에서 우세했다"는 시뮬레이션 산출물 그 자체다. 내
+        # 개인 실제 이벤트(골/도움/선방/파울/코너 텍스트)만 그 위에
+        # 병합한다(발생 시각은 그대로 유지). 없으면(폴백 등) 예전처럼
+        # match_flow의 통계 기반 사후 생성으로 만든다.
+        if engine_plog:
+            possession_log = tactical_engine.merge_personal_events(
+                engine_plog, timed, "home" if is_home else "away")
+        else:
+            possession_log = match_flow.generate_possession_log(
+                is_home, team_stats, timed, my_score, opp_score)
 
-        _my_side_stats = team_stats["home"] if is_home else team_stats["away"]
-        _my_corners = _my_side_stats.get("corners", 0)
-        _existing_setpiece_goals = sum(1 for _, t in timed if "세트피스" in t)
-        _extra_corners = max(0, _my_corners - _existing_setpiece_goals)
-        _extra_corners = min(_extra_corners, 6)  # 타임라인이 너무 안 북적이게 상한
-        if _extra_corners > 0:
-            _new_mins = _sample_minutes(_extra_corners, 2, 89, avoid=_occupied)
-            for _cm in _new_mins:
-                timed.append((_cm, "🚫 세트피스 코너킥, 수비에 걷어내졌다"))
-            _occupied.update(_new_mins)
-
-        # ── [신규] 파울 / 상대 팀 코너킥도 통계-화면 동기화 ──────────
-        #   경기 통계엔 파울·상대 코너킥 개수가 계산되는데, 지금까지는
-        #   둘 다 재생 화면에 전혀 안 나왔다(숫자로만 존재). 완전한
-        #   장면(선수 애니메이션)까진 아니어도, 최소한 "info" 배너로는
-        #   보이게 한다 — 뷰어가 미분류 텍스트를 배너로 잠깐 띄워준다.
-        #   너무 많으면 배너가 도배되니 각각 상한을 둔다.
-        _opp_side_stats = team_stats["away"] if is_home else team_stats["home"]
-        _my_fouls = min(_my_side_stats.get("fouls", 0), 4)
-        _opp_fouls = min(_opp_side_stats.get("fouls", 0), 4)
-        _new_mins = _sample_minutes(_my_fouls, 2, 89, avoid=_occupied)
-        for _fm in _new_mins:
-            timed.append((_fm, "🟨 우리 팀 파울"))
-        _occupied.update(_new_mins)
-        _new_mins = _sample_minutes(_opp_fouls, 2, 89, avoid=_occupied)
-        for _fm in _new_mins:
-            timed.append((_fm, "🟨 상대 팀 파울"))
-        _occupied.update(_new_mins)
-        _opp_corners = min(_opp_side_stats.get("corners", 0), 4)
-        _new_mins = _sample_minutes(_opp_corners, 2, 89, avoid=_occupied)
-        for _cm in _new_mins:
-            timed.append((_cm, "⛳ 상대 팀 코너킥"))
-        _occupied.update(_new_mins)
-
-        timed.sort(key=lambda x: _min_sortkey(x[0]))
+    # [신규] 22명 중 나(my_slot)를 뺀 21명은 지금까지 실제 선수 스탯과
+    # 완전히 무관하게 움직였다(포메이션 슬롯 라벨만 있고 실제 로스터
+    # 연결이 아예 없었음). 그 팀 로스터에서 포메이션 슬롯에 맞는 11명을
+    # 뽑아 최소 스탯(speed/dribbling/tackling/positioning/jump/heading/
+    # stamina)만 같이 저장해둔다 — match_sim_viewer.py가 이 스탯으로
+    # 선수별 최고속도/턴오버 저항/인터셉트 확률/반응성을 실제로 다르게
+    # 만든다.
+    lineup_stats = {}
+    if played:
+        try:
+            lineup_stats = match_flow.generate_lineup_stats(home_name, away_name)
+        except Exception:
+            lineup_stats = {}
 
     payload = {
         "events": [[m, t] for m, t in timed],
@@ -2725,12 +2829,15 @@ def _save_match_detail(p, week, comp_name, is_home, home_name, away_name,
         cur = conn2.execute(
             """INSERT INTO match_details
                (year,week,season,league_name,is_home,home_name,away_name,
-                home_score,away_score,result,rating,goals,assists,saves,detail_json)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                home_score,away_score,result,rating,goals,assists,saves,
+                detail_json,possession_log,lineup_stats)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (st.get("current_year"), week, st.get("current_season"),
              comp_name, 1 if is_home else 0, home_name, away_name,
              hs, as_, result, rating, goals, assists, saves,
-             json.dumps(payload, ensure_ascii=False)))
+             json.dumps(payload, ensure_ascii=False),
+             json.dumps(possession_log, ensure_ascii=False),
+             json.dumps(lineup_stats, ensure_ascii=False)))
         detail_id = cur.lastrowid
         conn2.commit()
         conn2.close()
@@ -2789,7 +2896,7 @@ def _augment_events_with_names(c, p, is_home, hid, aid, hs, as_,
 def _write_match_log(p, week, league_name, is_home,
                      hid, aid, hs, as_,
                      result, goals, assists, saves, rating, events, played, benched,
-                     detail=None):
+                     detail=None, engine_stats=None, engine_plog=None):
     # [최적화] 팀명을 세션 캐시에서 조회 (매 경기 get_conn 제거)
     conn = get_conn()
     c = conn.cursor()
@@ -2811,7 +2918,8 @@ def _write_match_log(p, week, league_name, is_home,
 
     detail_id = _save_match_detail(p, week, league_name, is_home, hn, an,
                                    hs, as_, result, goals, assists, saves, rating,
-                                   events, played, benched, detail)
+                                   events, played, benched, detail, engine_stats=engine_stats,
+                                   engine_plog=engine_plog)
 
     # ── 로그: 헤더 한 줄(클릭 가능) + 결과 + 핵심 요약 + 순위 ──────────
     #   상세 이벤트(전/후반)는 로그에서 빼고 상세 창으로 옮겨 로그를 간결하게.
@@ -3384,10 +3492,15 @@ def _calc_clean_sheets_for_player(p):
 
 
 def _estimate_ai_season(ovr, pos, team_avg, league_avg):
-    """AI 선수의 시즌 성적(골/도움/평점)을 OVR 기반으로 추정."""
-    g_base = AWARD_POS_GOAL.get(pos, 1) + (ovr-70)*0.55 + (team_avg-league_avg)*0.25
+    """AI 선수의 시즌 성적(골/도움/평점)을 추정.
+    [설계 변경] 골/도움은 더 이상 OVR로 스케일링하지 않는다 — 신민용 지적:
+    "OVR 70이든 90이든 99든 같은 조건이어야 한다"(주전 스트라이커는 실력과
+    무관하게 팀 내 슈팅 기회를 비슷하게 가져간다). 포지션별 고정 기준치
+    (AWARD_POS_GOAL/ASSIST)에 소속팀 강도(team_avg-league_avg)만 살짝
+    반영하고, 실력 차이는 rating(평점)에서만 OVR로 반영한다."""
+    g_base = AWARD_POS_GOAL.get(pos, 1) + (team_avg-league_avg)*0.2
     goals = max(0, round(max(0, g_base) * random.uniform(0.8, 1.2)))
-    a_base = AWARD_POS_ASSIST.get(pos, 1) + (ovr-70)*0.35 + (team_avg-league_avg)*0.15
+    a_base = AWARD_POS_ASSIST.get(pos, 1) + (team_avg-league_avg)*0.1
     assists = max(0, round(max(0, a_base) * random.uniform(0.8, 1.2)))
     rating = round(6.0 + (ovr-60)/20.0 + goals*0.02 + assists*0.015, 2)
     rating = max(5.0, min(9.5, rating))
@@ -3580,9 +3693,12 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
             gk_cands = [x for x in pool if x["position"] in GK_POS]
             if gk_cands:
                 # GK는 클린시트로 평가 (내 선수는 cs_for_me, AI는 추정치)
+                # [최적화] is_mine인 후보는 항상 p 자신이라 cs_for_me와 값이
+                #  같다. 매번 _calc_clean_sheets_for_player(p)를 다시 불러
+                #  DB를 재조회하는 대신 위에서 이미 계산한 값을 재사용한다.
                 gk_scores = []
                 for x in gk_cands:
-                    cs_est = _calc_clean_sheets_for_player(p) if x["is_mine"] else max(0, int(p.get("season_cs", 0) * 0.5))
+                    cs_est = cs_for_me if x["is_mine"] else max(0, int(p.get("season_cs", 0) * 0.5))
                     score = _best11_score_gk_df(cs_est, x["rating"], x["ovr"])
                     gk_scores.append((x, score))
                 best_gk = max(gk_scores, key=lambda x: x[1])
@@ -3639,8 +3755,15 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
                 my_awards.append(("영플레이어", f"{lname} 영플레이어"))
 
         # 발롱도르 (S/A급 1부 + 세계 정상급 OVR + 압도적 성적)
-        # 개선: 25골+ 고정 조건 → 골+도움 30+ (포지션별 공평화)
-        # 이제 윙어/미드필더도 도움으로 기여도를 인정받을 수 있음
+        # [버그 수정 — 근본 원인] 이 게임의 "풀시즌"은 14경기(위 득점왕/
+        # 도움왕 기준과 같은 FULL_SEASON_MATCHES)인데, 원래 "골+도움 30+"은
+        # 38경기급 실제 리그 풀시즌(메시/호날두 전성기, 경기당 0.79G+A)을
+        # 그대로 옮겨온 값이라 14경기 안에서는 사실상 도달 불가능했다
+        # (경기당 2.14를 요구하는 셈 — 실측: 11시즌 내내 두 자릿수 골에
+        # 평점 7.8~8.4를 찍고도 이 조건 하나로 단 한 번도 발롱도르를 못
+        # 받음). 득점왕/도움왕과 똑같이 이 게임의 실제 풀시즌(14경기)
+        # 기준으로 다시 잡는다 — 실제 세계 최정상급 비율(38경기 30G/A ≈
+        # 경기당 0.79)을 14경기에 그대로 적용하면 약 11.
         ballon = False
         if grade in BALLON_DOR_GRADES and tier == 1 and p.get("ovr",0) >= 88:
             other = c.execute("""SELECT MAX(a.ovr) as mo FROM ai_players a
@@ -3651,9 +3774,10 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
                 """.format(",".join("'%s'" % pp for pp in ATTACK_POS))).fetchone()
             rival_ovr = other["mo"] if other and other["mo"] else 90
             # 세계 최정상급(라이벌 -2 이내) + 압도적 시즌
-            # (골+도움 30+ 또는 MVP 수상)
+            # (골+도움 최소 기준 충족 또는 MVP 수상)
             world_class = p.get("ovr",0) >= rival_ovr - 2
-            dominant = (season_goals + season_assists >= 30) or mvp["is_mine"]
+            min_ga_for_ballon = max(6, round(11 * play_ratio))
+            dominant = (season_goals + season_assists >= min_ga_for_ballon) or mvp["is_mine"]
             if world_class and dominant:
                 ballon = True
         if ballon:
@@ -3674,18 +3798,41 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
                 my_awards.append(("신데렐라", f"OVR {x['ovr']} → 리그 정상급 활약"))
 
         # 푸스카스상 (올해의 골 — 최고 평점이면서 멀티골 이상)
-        # 조건: season_goals >= 2 && 최고 평점 기록
+        # [버그 수정 — 근본 원인] 실제 푸스카스상은 전세계에서 딱 1명
+        # 뽑히는 상인데, 후보 비교가 내 리그 pool(multi_goal_cands)에만
+        # 갇혀 있었다 — 발롱도르와 달리 "다른 리그와 비교"하는 게이트가
+        # 아예 없어서, 국가·티어 개수만큼 각자 따로 수여될 수 있는
+        # 구조였다(신민용 지적). 발롱도르와 같은 패턴(S/A등급 1부리그
+        # 최고 공격 OVR 조회)으로 세계급 게이트를 추가한다. 다만
+        # "그 해 최고의 선수"까지 요구하는 발롱도르(-2)보다는 마진을
+        # 느슨하게 잡는다 — 한 경기의 멀티골+고평점이면 되는 상이라
+        # 시즌 전체 지배력까지는 필요 없기 때문.
+        _PUSKAS_OVR_MARGIN = 6
         multi_goal_cands = [x for x in pool if x["goals"] >= 2]
         if multi_goal_cands:
             puskas_best = max(multi_goal_cands, key=lambda x: x["rating"])
             if puskas_best["is_mine"]:
-                my_awards.append(("푸스카스상", f"{season_goals}골, 평점 {season_rating:.1f}"))
+                _pk_rival = c.execute("""SELECT MAX(a.ovr) as mo FROM ai_players a
+                    JOIN teams t ON a.team_id=t.id
+                    JOIN leagues l ON t.league_id=l.id
+                    JOIN countries cn ON l.country_id=cn.id
+                    WHERE cn.grade IN ('S','A') AND l.tier=1 AND a.position IN ({})
+                    """.format(",".join("'%s'" % pp for pp in ATTACK_POS))).fetchone()
+                _pk_rival_ovr = _pk_rival["mo"] if _pk_rival and _pk_rival["mo"] else 90
+                if p.get("ovr", 0) >= _pk_rival_ovr - _PUSKAS_OVR_MARGIN:
+                    my_awards.append(("푸스카스상", f"{season_goals}골, 평점 {season_rating:.1f}"))
 
         # 사모라 상 (최저 실점 골키퍼 — 경기당 평균 실점 최소)
-        #   조건: GK && (같은 리그 합산) 출전 >= ZAMORA_MIN_MATCHES && 경기당 1.2골 이하
+        #   조건: GK && 1부리그 && (같은 리그 합산) 출전 >= ZAMORA_MIN_MATCHES
+        #        && 경기당 1.2골 이하
         #   ※ 시즌 중 같은 리그 안에서 이적하면 두 팀 리그 기록을 합산한다
         #     (다른 리그로 옮기면 합치지 않음). _zamora_tally 참고.
-        if p.get("position") == "GK":
+        # [버그 수정 — 근본 원인] 원래 사모라상은 스페인 1부리그(라리가)
+        # 전용 상인데, 여기선 국가·티어 제한이 전혀 없어서 어느 나라
+        # 몇부 리그의 GK든 조건만 맞으면 받을 수 있었다(신민용 지적).
+        # 특정 국가 하나로 좁히는 대신, 발롱도르와 같은 원칙(최상위
+        # 플라이트만 인정)으로 최소한 1부리그로는 제한한다.
+        if p.get("position") == "GK" and tier == 1:
             z_matches, z_ga = _zamora_tally(
                 c, p, year, league_id, lname,
                 p.get("season_matches", 0), season_goals_against)
@@ -5346,7 +5493,19 @@ def _calc_salary(grade, tier, ovr, country=None):
       단, SPECIAL_SALARY_COUNTRIES(사우디 등)는 배율 적용 제외.
     """
     from constants import (LOWER_LEAGUE_SALARY_OVERRIDE, SPECIAL_SALARY_COUNTRIES,
-                           get_league_grade)
+                           get_league_grade, SALARY_CURVE_OVERRIDE, salary_curve_value,
+                           COUNTRY_SALARY_CAP)
+
+    # [양극화 리그 특례] tier1 + 앵커커브 적용국은 base_year/mult 대신
+    # (하위권 OVR→하위권 연봉)~(월드클래스 OVR→최고연봉) 지수보간 곡선을 그대로 사용.
+    # 국대등급(grade)과 무관하게 국가명 자체로 판정하므로 SPECIAL 여부와도 독립적.
+    if tier == 1 and country in SALARY_CURVE_OVERRIDE:
+        sal = salary_curve_value(country, ovr)
+        cap = COUNTRY_SALARY_CAP.get(country, 0)
+        if cap > 0:
+            sal = min(sal, cap)
+        return max(0, sal)
+
     is_special = country and country in SPECIAL_SALARY_COUNTRIES
     if country:
         if is_special:
@@ -5425,6 +5584,15 @@ def _calc_salary(grade, tier, ovr, country=None):
         country_cap = COUNTRY_SALARY_CAP.get(country, 0)
         if country_cap > 0:
             sal = min(sal, country_cap)
+    # [버그수정] 양극화 리그(SALARY_CURVE_OVERRIDE 적용국)는 tier1만 재계산돼서
+    #   COUNTRY_SALARY_CAP이 tier1 기준 안전망(예: 잉글랜드 550억)으로 상향됐다.
+    #   그 캡이 2부 이하에도 그대로 적용되면 "1부보다 2부가 더 비싼" 역전이
+    #   생기므로, tier>=2는 별도의 낮은 캡(LOWER_TIER_SALARY_CAP)으로 다시 누른다.
+    if country and tier >= 2:
+        from constants import LOWER_TIER_SALARY_CAP
+        lt_cap = LOWER_TIER_SALARY_CAP.get(country, 0)
+        if lt_cap > 0:
+            sal = min(sal, lt_cap)
     return max(0, sal)
 
 

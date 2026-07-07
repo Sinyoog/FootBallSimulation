@@ -1166,7 +1166,10 @@ class CenterPanel(QWidget):
 
     def _show_callup_result(self, nat, res):
         """[복수국적] 대표 선택 직후 결과를 '순서대로' 공개하는 다이얼로그.
-        순서:  ① 발탁(선택 확정)  →  ② 국가대표 선발 여부  →  ③ 예선 통과/본선 진출.
+        순서:  ① 국가 선택(어느 나라에 도전할지)  →  ② 국가대표 선발 여부
+        →  ③ 예선 통과/본선 진출.
+        ①은 스쿼드 확정이 아니라 "이번엔 이 나라 쪽으로 도전한다"는
+        선택일 뿐이고, 실제 승선 여부는 ②에서 갈린다(미선발일 수 있음).
         선택한 뒤에야 선발·예선 결과가 단계적으로 드러난다."""
         from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QFrame
 
@@ -1174,7 +1177,14 @@ class CenterPanel(QWidget):
         _kind = res.get("kind", "")
         _is_qual = (_kind == "wc_qual")
         # 각 단계 라인 구성 (결과에 따라 ②③ 색/내용 분기)
-        line1 = f"✅ <b style='color:#ffcc66'>{nat}</b> 대표로 확정했습니다."
+        # [버그 수정] line1이 "확정했습니다"라고 단독으로 뜨는 순간, 아직
+        # 실제 선발 여부(line2)가 공개되기도 전인데 마치 대표팀 승선이
+        # 이미 확정된 것처럼 읽혔다. 실제로는 복수 국적 중 "이번엔 이
+        # 나라 쪽으로 도전해보겠다"를 고른 것뿐이고, 진짜 확정(선발 여부)
+        # 은 바로 다음 줄(line2)에서 갈린다 — "확정이라 뜨면 헷갈린다"는
+        # 지적 그대로. "확정" 대신 "선택"으로 바꿔서 이건 후보 등록일
+        # 뿐임을 분명히 한다.
+        line1 = f"🏳️ <b style='color:#ffcc66'>{nat}</b> 대표팀에 도전합니다."
         if _rs == "미선발":
             line2 = f"📋 <span style='color:#ff8866'>국가대표 미선발</span> — 이번엔 부름을 받지 못했습니다."
             line3 = ""

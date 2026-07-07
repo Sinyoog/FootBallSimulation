@@ -12,7 +12,8 @@ from PyQt6.QtGui import QFont
 
 from database import reset_game_data, get_conn
 from game_engine import create_player, get_player
-from constants import POSITIONS, SUB_ROLES, PERSONALITIES
+from constants import (POSITIONS, SUB_ROLES, PERSONALITIES, GAME_START_YEAR,
+                       PLAYER_START_AGE, TALENT_TIER_KO, TALENT_TIER_ORDER)
 
 DARK_STYLE = """
 QWidget { background-color: #1a1a1a; color: #e0e0e0;
@@ -323,7 +324,7 @@ class StartScreen(QWidget):
         title.setStyleSheet("color: #00cc44;")
         lay.addWidget(title)
 
-        sub = QLabel("2000년, 16살의 당신. 전설이 되어보세요.")
+        sub = QLabel(f"{GAME_START_YEAR}년, {PLAYER_START_AGE}살의 당신. 전설이 되어보세요.")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sub.setStyleSheet("color: #888888; font-size: 13px;")
         lay.addWidget(sub)
@@ -415,22 +416,41 @@ class NewPlayerDialog(QDialog):
         nat_row.addWidget(self.nat_btn)
         lay.addLayout(nat_row)
 
-        # 포지션
+        # 포지션 — 국적 선택과 같은 패턴으로 "🎲 랜덤"을 기본값으로 둔다.
+        # 이름만 짓고 나머진 전부 랜덤에 맡기고 싶을 때, 이 콤보들을 그냥
+        # 안 건드리기만 하면 되게 하기 위함.
         pos_row = QHBoxLayout()
         pos_row.addWidget(QLabel("주요 포지션"))
         self.pos_combo = QComboBox()
-        self.pos_combo.addItems(POSITIONS)
-        self.pos_combo.currentTextChanged.connect(self._update_roles)
+        self.pos_combo.addItem("🎲 랜덤", None)
+        for _pos in POSITIONS:
+            self.pos_combo.addItem(_pos, _pos)
+        self.pos_combo.currentIndexChanged.connect(
+            lambda _i: self._update_roles(self.pos_combo.currentData()))
         pos_row.addWidget(self.pos_combo)
         lay.addLayout(pos_row)
 
-        # 세부역할
+        # 세부역할 — 포지션이 랜덤이면 세부역할도 "🎲 랜덤" 하나만 남는다
+        # (포지션이 정해져야 세부역할 목록 자체가 정해지므로).
         role_row = QHBoxLayout()
         role_row.addWidget(QLabel("세부역할"))
         self.role_combo = QComboBox()
         role_row.addWidget(self.role_combo)
         lay.addLayout(role_row)
-        self._update_roles(POSITIONS[0])
+        self._update_roles(None)
+
+        # [신규] 재능 등급 선택 — 기본값은 월드클래스(가장 앞)지만, 원하면
+        # 다른 콤보들처럼 "🎲 랜덤"(맨 뒤)을 골라 확률 추첨에 맡길 수도
+        # 있다. talent_tier=None을 넘기면 game_engine.create_player가
+        # 알아서 확률 추첨으로 처리한다.
+        talent_row = QHBoxLayout()
+        talent_row.addWidget(QLabel("재능 등급"))
+        self.talent_combo = QComboBox()
+        self.talent_combo.addItem("🎲 랜덤", None)
+        for _tier in TALENT_TIER_ORDER:
+            self.talent_combo.addItem(TALENT_TIER_KO[_tier], _tier)
+        talent_row.addWidget(self.talent_combo)
+        lay.addLayout(talent_row)
 
         note = QLabel("※ 신체 · 성격 · 특징 · 스탯은 자동 랜덤")
         note.setStyleSheet("color: #666666; font-size: 11px;")
@@ -455,8 +475,18 @@ class NewPlayerDialog(QDialog):
         lay.addLayout(btn_row)
 
     def _update_roles(self, pos):
+        """pos가 None(랜덤 포지션)이면 세부역할도 "🎲 랜덤" 하나만 두고
+        고정한다 — 포지션이 정해지기 전엔 세부역할 목록 자체를 알 수
+        없으므로."""
         self.role_combo.clear()
-        self.role_combo.addItems(SUB_ROLES.get(pos, ["기본"]))
+        if pos is None:
+            self.role_combo.addItem("🎲 랜덤", None)
+            self.role_combo.setEnabled(False)
+            return
+        self.role_combo.setEnabled(True)
+        self.role_combo.addItem("🎲 랜덤", None)
+        for _role in SUB_ROLES.get(pos, ["기본"]):
+            self.role_combo.addItem(_role, _role)
 
     def _pick_country(self):
         dlg = CountryPickerDialog(self)
@@ -486,7 +516,7 @@ class NewPlayerDialog(QDialog):
         rpos  = random.choice(POSITIONS)
         rrole = random.choice(SUB_ROLES.get(rpos, ["기본"]))
 
-        create_player(rname, rpos, rrole, cname, cflag)
+        create_player(rname, rpos, rrole, cname, cflag, talent_tier=self.talent_combo.currentData())
         self.accept()
 
     def _create(self):
@@ -494,11 +524,18 @@ class NewPlayerDialog(QDialog):
         if not name:
             _game_warning(self, "입력 오류", "이름을 입력해주세요.")
             return
-        pos  = self.pos_combo.currentText()
-        role = self.role_combo.currentText()
+        # [신규] 포지션/세부역할이 "🎲 랜덤"(콤보 데이터 None)이면 여기서
+        # 실제 값을 뽑는다 — 국적 선택과 같은 패턴: 안 고르면 랜덤.
+        pos = self.pos_combo.currentData()
+        if pos is None:
+            pos = random.choice(POSITIONS)
+        role = self.role_combo.currentData()
+        if role is None:
+            role = random.choice(SUB_ROLES.get(pos, ["기본"]))
+        tier = self.talent_combo.currentData()  # None이면 create_player가 알아서 확률 추첨
         if self._nat:
             nat_name, nat_flag = self._nat
-            create_player(name, pos, role, nat_name, nat_flag)
+            create_player(name, pos, role, nat_name, nat_flag, talent_tier=tier)
         else:
-            create_player(name, pos, role)
+            create_player(name, pos, role, talent_tier=tier)
         self.accept()

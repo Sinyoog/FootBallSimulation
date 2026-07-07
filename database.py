@@ -259,6 +259,20 @@ def init_db():
     # 마이그레이션: 컬럼 추가
     for migration in [
         "ALTER TABLE career_entries ADD COLUMN position TEXT DEFAULT ''",
+        # [신규] 포제션 로그(match_flow.generate_possession_log 결과)를 담을
+        # 컬럼. 경기당 한 번 통째로 쓰고 통째로 읽는 구조화 데이터라서,
+        # detail_json과 같은 성격 — JSON 텍스트 컬럼 하나면 충분하고,
+        # 별도 정규화 테이블보다 이 쪽이 쓰기/읽기 비용이 훨씬 적다.
+        # 은퇴 후 새 게임 시작 시 reset_game_data()가 match_details 테이블을
+        # DELETE FROM으로 통째로 비우므로, 이 컬럼도 별도 처리 없이 자동으로
+        # 같이 삭제된다(새 테이블로 만들었다면 저 리스트에 수동으로 추가하는
+        # 걸 깜빡할 위험이 있었다).
+        "ALTER TABLE match_details ADD COLUMN possession_log TEXT DEFAULT ''",
+        # [신규] 그 경기에 실제로 뛴 것으로 간주할 11명(포메이션 슬롯 순서)의
+        # 최소 스탯 스냅샷. possession_log와 같은 이유로 컬럼 하나면 충분
+        # (경기당 한 번 통째로 쓰고 통째로 읽음). reset_game_data()가
+        # match_details를 통째로 지우므로 이것도 자동으로 같이 삭제된다.
+        "ALTER TABLE match_details ADD COLUMN lineup_stats TEXT DEFAULT ''",
         "ALTER TABLE my_player ADD COLUMN field_pos TEXT DEFAULT ''",   # 배치 포지션
         "ALTER TABLE my_player ADD COLUMN mismatch_rank INTEGER DEFAULT 0", # 포지션 불일치 단계
         "ALTER TABLE career_entries ADD COLUMN saves INTEGER DEFAULT 0",
@@ -501,10 +515,14 @@ def remap_all_ovr():
         rows = c.execute(
             "SELECT id, position, " + ",".join(ALL_STATS) + " FROM ai_players"
         ).fetchall()
-        for r in rows:
-            stats = {s: r[s] for s in ALL_STATS}
-            new_ovr = calc_ovr(r["position"], stats)
-            c.execute("UPDATE ai_players SET ovr=? WHERE id=?", (new_ovr, r["id"]))
+        # [최적화] 행마다 execute()를 개별 호출하던 것을 executemany()로 배치
+        #  처리. 1회성 마이그레이션이지만 ai_players가 2.6만+ 행이라 배치로
+        #  묶으면 첫 실행 시 버벅임을 줄일 수 있다. 계산 결과(new_ovr)는 동일.
+        updates = [
+            (calc_ovr(r["position"], {s: r[s] for s in ALL_STATS}), r["id"])
+            for r in rows
+        ]
+        c.executemany("UPDATE ai_players SET ovr=? WHERE id=?", updates)
         c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('ovr_remapped_v2','1')")
         conn.commit()
         # ai_players OVR이 바뀌었으므로 엔진의 팀 평균 OVR 캐시를 비운다.
