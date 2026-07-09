@@ -808,8 +808,26 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
                     if _bqr is not None:
                         _blocked_by_qual = not (_bqr["my_selected"] == 1
                                                  and _bqr["my_nat"] == committed)
+                    else:
+                        # [버그수정] 예선 기록 자체가 없는 경우(대륙명 표기 불일치,
+                        # 저장 시점 문제 등으로 조회가 안 되는 경우 포함) 여기서
+                        # "기록이 없으니 통과한 걸로 치자"고 넘어가면 정말로
+                        # 예선에 출전조차 안 한 선수가 본선에 자동 발탁되는
+                        # 사고가 난다(신민용 지적: 2028년 대륙컵 국가대표
+                        # 미선발 + 2029년 예선 미참가 상태였는데 2030년
+                        # 월드컵 본선에 OVR 70으로 출전). 증명할 예선 기록이
+                        # 없으면 "통과했다"고 가정하지 말고, 대륙컵과 동일한
+                        # 실력 재검증(_check_selection)을 거쳐야 한다.
+                        _blocked_by_qual = not _check_selection(
+                            p, nat_info.get(committed, {}).get("grade", "F"))
                 except Exception:
-                    pass
+                    # [버그수정] 조회 중 예외가 나도 "통과로 간주"는 금물 —
+                    # 위와 같은 이유로 실력 재검증으로 대체한다.
+                    try:
+                        _blocked_by_qual = not _check_selection(
+                            p, nat_info.get(committed, {}).get("grade", "F"))
+                    except Exception:
+                        _blocked_by_qual = False
             if _blocked_by_qual:
                 my_sel = 2
                 # [버그 수정] 이 케이스는 "우리나라가 예선에서 떨어졌다"가
@@ -1017,6 +1035,12 @@ def _check_selection(p, my_grade):
       임계 = 국대평균 - 마진(톱권)
       유효OVR = 내 OVR + 베테랑 보너스(최대 +5)
       → 유효OVR이 임계 이상이면 선발. 단 절대 하한 미달은 보너스로도 구제 불가.
+
+    [기능 변경] 예전엔 여기에 시즌 출전 경기 수(5경기 미만 탈락), 소속팀
+    유무, 소속 리그 티어(등급별 상한)까지 같이 봤다. 현실적이지 않다는
+    피드백(OVR 83처럼 기량이 확실하면 소속 리그가 낮거나 그 시즌 출전이
+    적어도 대표팀에 뽑히는 게 자연스럽다)에 따라 이제 순수하게
+    OVR(+베테랑 보너스)만으로 판정한다.
     """
     nat_avg = GRADE_TEAM_OVR.get(my_grade, 45)
     threshold = nat_avg - INTL_SELECTION_MARGIN
@@ -1026,22 +1050,7 @@ def _check_selection(p, my_grade):
     # 절대 하한: 베테랑 보너스로도 이 밑이면 탈락 (36세 60 같은 경우 차단)
     if my_ovr < threshold - INTL_SELECTION_MARGIN:
         return False
-    if eff_ovr < threshold:
-        return False
-    if p.get("total_matches", 0) < INTL_MIN_MATCHES:
-        return False
-    tid = p.get("current_team_id", 0)
-    if not tid:
-        return False
-    # 티어 보조 가드(완화): 등급 기준 티어보다 한 단계까지는 허용
-    #   → 노쇠해 하위 리그로 내려간 베테랑도 OVR이 충분하면 막지 않는다.
-    conn = get_conn()
-    row = conn.execute(
-        """SELECT l.tier FROM teams t JOIN leagues l ON t.league_id=l.id
-           WHERE t.id=?""", (tid,)).fetchone()
-    conn.close()
-    my_tier = row["tier"] if row else 99
-    return my_tier <= INTL_MAX_TIER.get(my_grade, 3) + 1
+    return eff_ovr >= threshold
 
 
 def _qualify_world(year=0):
@@ -1071,11 +1080,25 @@ def _qualify_world(year=0):
         r["qual"] = GRADE_QUAL_BASE.get(r["grade"], 0.2) + random.uniform(-QUAL_NOISE, QUAL_NOISE)
 
     # 예선 결과가 있는 연맹 추적
+    # [버그 수정 — 근본 원인] qual_results에 같은 나라가 중복으로 들어있으면
+    # (과거 _save_qual_results의 중복 저장 버그, 지금은 수정됨) 아래
+    # "[:quota]" 자르기에서 중복 항목이 자리를 차지해 실제로 예선을
+    # 통과한 나라가 쿼터 밖으로 밀려나는 문제가 있었다(예: 유럽 13장인데
+    # 어떤 나라가 3번 겹쳐 들어가면 진짜 13번째 통과국이 잘려나감 —
+    # "예선은 통과로 기록됐는데 본선 진출국 명단엔 없다"는 모순의 원인).
+    # _save_qual_results 쪽 중복 저장 자체는 이미 막았지만, 혹시 모를
+    # 잔존 데이터나 재발에도 안전하도록 여기서도 국가명 기준으로 한 번 더
+    # 중복 제거한다.
     qual_by_conf = {}   # conf_key → [국가dict]
+    _seen_by_conf = {}  # conf_key → {country_name, ...}
     for q in qual_rows:
         ck = _conf_key(q.get("continent", ""))
         if not ck:
             continue
+        seen = _seen_by_conf.setdefault(ck, set())
+        if q["country"] in seen:
+            continue
+        seen.add(q["country"])
         qual_by_conf.setdefault(ck, []).append({
             "name": q["country"], "flag": q["flag"],
             "continent": ck, "grade": q["grade"], "ovr": q["ovr"], "qual": 1.0
@@ -1137,9 +1160,16 @@ def _qualify_continental(my_continent):
     conn.close()
 
     if qual_rows:
-        # 예선 통과국 사용
-        result = [{"name": q["country"], "flag": q["flag"], "grade": q["grade"],
-                   "ovr": q["ovr"]} for q in qual_rows]
+        # 예선 통과국 사용. [버그 수정] world 쪽과 동일한 이유로 국가명
+        # 기준 중복 제거 후 자른다(위 _qualify_world 주석 참고).
+        seen = set()
+        result = []
+        for q in qual_rows:
+            if q["country"] in seen:
+                continue
+            seen.add(q["country"])
+            result.append({"name": q["country"], "flag": q["flag"], "grade": q["grade"],
+                            "ovr": q["ovr"]})
         return result[:CONT_TEAMS]
 
     # 폴백: 기존 랜덤 방식
@@ -1962,6 +1992,17 @@ def _save_qual_results(t, continent, qualified_list, set_done=True):
     set_done=False: status를 'done'으로 갱신하지 않는다.
     PO 체제(유럽/아시아/아프리카 32팀)에서 직행팀 먼저 저장 시 사용.
     PO 완료(_finalize_qual_po) 시에는 True(기본값)로 호출해 'done' 처리.
+
+    [버그 수정] set_done=False 경로는 지금까지 그냥 INSERT만 해서, 어떤
+    이유로든 _finalize_qual()이 같은 (target_year, continent)에 대해
+    두 번 이상 불리면(예: 주차 진행 로직이 같은 주차를 다시 처리하는
+    경우) 직행팀이 그대로 중복 저장됐다 — 유럽만 direct>0이면서 동시에
+    po_teams>0인 유일한 대륙이라 이 경로를 타서, 유독 유럽 예선 통과국
+    목록에서만 같은 나라가 2~3개씩 중복으로 보이는 원인이었다(다른
+    대륙은 set_done=True만 쓰거나 이 중간 저장 자체를 안 타서 매번
+    DELETE 후 재삽입되니 중복이 안 생겼음). 이제 set_done 여부와 무관하게
+    country 단위로 먼저 지우고 넣어서, 같은 목록으로 몇 번을 다시
+    호출해도 항상 국가당 한 줄만 남는다(멱등).
     """
     from game_engine import add_log, get_player
 
@@ -1979,6 +2020,12 @@ def _save_qual_results(t, continent, qualified_list, set_done=True):
     # set_done=False(직행팀 중간 저장): _finalize_qual_po가 나중에
     #   직행팀+PO승자를 합쳐 set_done=True로 한 번에 덮어씀.
     for q in qualified_list:
+        # [버그 수정] 이 나라가 이미 저장돼 있으면(재호출로 인한 중복 삽입
+        # 방지) 먼저 지운 뒤 다시 넣는다 — set_done=False라 위에서 전체
+        # DELETE를 안 했어도 국가 단위로는 항상 유일하게 유지된다.
+        c.execute("""DELETE FROM qual_results
+                     WHERE target_year=? AND kind=? AND continent=? AND country=?""",
+                  (target_year, target_kind, continent, q["country"]))
         c.execute("""INSERT INTO qual_results
                      (target_year, kind, continent, country, flag, grade, ovr)
                      VALUES(?,?,?,?,?,?,?)""",

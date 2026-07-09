@@ -52,11 +52,24 @@ _POS_XY = {
 _FALLBACK_SLOTS = ["GK", "CB", "CB", "LB", "RB", "LM", "CM", "CM", "RM", "ST", "ST"]
 
 
-def _third_of(x):
-    """홈 시점(자기 골문=0, 상대 골문=1) 기준 서드."""
-    if x < 0.34:
+def _third_of(bx):
+    """이 팀 자신의 포메이션 상 역할(수비/미드필더/공격수) 분류.
+    [버그 수정] 이 파일의 _POS_XY는 "한 팀이 스스로의 골문(0)을 기준으로
+    갖는 기본 포메이션 형태"만 담고 있어서 x값 범위가 0.05~0.50 정도로
+    좁다(공격수도 하프라인 부근인 0.50이 최댓값 — 원정팀은 이 값이
+    1-bx로 뒤집혀 0.50~0.95가 됨). 그런데 예전 임계값(0.34/0.67)은 피치
+    전체(0~1)를 3등분하는 값이라, 홈팀 공격수는 절대 "ATT"에 못
+    들어가고(bx가 0.67을 못 넘음) 원정팀 수비수는 절대 "DEF"에 못
+    들어갔다(뒤집힌 x가 0.34 밑으로 안 내려감) — 그 결과 _TeamModel의
+    공격/수비 퀄리티가 실제 선수 스탯을 거의 반영하지 못했다.
+    이제 이 함수는 뒤집히지 않은 원래 bx(각 팀 자신의 대형 좌표)만
+    받는다 — "이 선수가 자기 팀 안에서 수비수/미드필더/공격수 중
+    무엇에 가까운가"라는 팀 내부적 역할 분류이지, 피치의 고정된 절대
+    구역이 아니기 때문이다. 임계값도 실제 _POS_XY 값 분포(수비 라인
+    0.05~0.28, 중원 0.34~0.48, 최전방 0.49~0.50)에 맞게 재보정했다."""
+    if bx < 0.30:
         return "DEF"
-    if x < 0.67:
+    if bx < 0.485:
         return "MID"
     return "ATT"
 
@@ -71,7 +84,16 @@ def _sigmoid(x):
 def _assign_zones(lineup, is_home):
     """[{"player":dict, "lane":..., "third":...}, ...]. lineup은
     FORMATION_SLOTS[formation] 순서와 대응하는 선수 dict 리스트(None 허용).
-    원정팀은 x를 뒤집어(1-x) 홈 시점 좌표계로 통일한다."""
+    원정팀은 홈팀과 정반대 방향을 보고 뛰므로, 전후좌표(x)뿐 아니라
+    좌우좌표(by)도 함께 뒤집어야(1-by) 홈팀 시점 고정좌표계에서 물리적으로
+    맞는 위치가 된다.
+    [버그 수정] 예전엔 x만 뒤집고 by는 그대로 둬서, 원정팀 왼쪽 수비수가
+    실제로는 홈팀 시점 오른쪽 측면에 있어야 하는데도 그대로 "L" 레인에
+    잡혔다. 매치업 계산(simulate_tactical_match의 atk.att[lane] vs
+    dfn_opp.dfn[lane])이 두 팀을 같은 레인 라벨끼리 비교하는 구조라서,
+    좌우 능력치가 비대칭인 스쿼드(예: 왼쪽 윙어는 강한데 오른쪽 풀백은
+    약한 팀)를 상대할 때 실제로는 안 맞붙어야 할 반대편 선수와 매치업이
+    계산되는 원인이었다."""
     out = []
     for i, pl in enumerate(lineup):
         if pl is None:
@@ -79,8 +101,13 @@ def _assign_zones(lineup, is_home):
         label = _FALLBACK_SLOTS[i] if i < len(_FALLBACK_SLOTS) else pl.get("position", "CM")
         bx, by = _POS_XY.get(label, (0.44, 0.5))
         x = bx if is_home else (1.0 - bx)
-        lane = "L" if by < 0.34 else ("C" if by < 0.67 else "R")
-        out.append({"player": pl, "pos": label, "lane": lane, "third": _third_of(x)})
+        y = by if is_home else (1.0 - by)
+        lane = "L" if y < 0.34 else ("C" if y < 0.67 else "R")
+        # [버그 수정] third(수비/미드필더/공격수 역할 분류)는 팀 내부적
+        # 역할이라 뒤집힌 x가 아니라 항상 원래 bx로 판정해야 한다(자세한
+        # 이유는 _third_of 문서 참고) — 안 그러면 홈팀 공격수/원정팀
+        # 수비수의 실제 스탯이 att/dfn 계산에 전혀 반영되지 않는다.
+        out.append({"player": pl, "pos": label, "lane": lane, "third": _third_of(bx)})
     return out
 
 
@@ -225,29 +252,54 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
     home_zoned = _assign_zones(home_lineup, True)
     away_zoned = _assign_zones(away_lineup, False)
 
+    # [최적화] home.att/dfn, away.att/dfn(레인별 공격/수비 퀄리티)은 이
+    # 시점 이후로 루프 안에서 전혀 바뀌지 않는다(경기당일 컨디션 보정도
+    # 이미 루프 진입 전에 다 반영돼 있음). 그런데 예전엔 p_home_poss,
+    # 레인 가중치, 레인별 quality, 레인별 슈터 풀을 분마다(최대 96회) 매번
+    # 다시 계산했다 — 매번 같은 입력으로 같은 값을 다시 뽑는 것이라
+    # math.exp 호출(_sigmoid)과 리스트 컴프리헨션만 반복해서 낭비였다.
+    # 여기서 팀당 한 번(레인 3개 기준)만 계산해서 캐시해두고, 루프
+    # 안에서는 조회만 한다. rng.random()/rng.choices() 호출 횟수와 순서는
+    # 그대로라 시드 고정 시 결과는 동일하다(순수 캐싱, 로직 변경 없음).
+    p_home_poss = _sigmoid((home_mid_total - away_mid_total) / 16.0)
+
+    def _prep_side(atk, dfn_opp, zoned_atk):
+        lane_scores = {ln: max(1.0, atk.att[ln] - dfn_opp.dfn[ln] + 50.0) for ln in LANES}
+        lanes, weights = zip(*lane_scores.items())
+        quality_by_lane = {ln: _sigmoid((atk.att[ln] - dfn_opp.dfn[ln]) / 11.0) for ln in LANES}
+        att_pool_all = [z["player"] for z in zoned_atk if z["third"] == "ATT"]
+        pool_by_lane = {}
+        for ln in LANES:
+            pool = [z["player"] for z in zoned_atk if z["lane"] == ln and z["third"] == "ATT"]
+            pool_by_lane[ln] = pool if pool else att_pool_all
+        return lanes, weights, quality_by_lane, pool_by_lane
+
+    home_lanes, home_weights, home_quality_by_lane, home_pool_by_lane = \
+        _prep_side(home, away, home_zoned)
+    away_lanes, away_weights, away_quality_by_lane, away_pool_by_lane = \
+        _prep_side(away, home, away_zoned)
+
     for minute in range(1, total_minutes + 1):
-        p_home_poss = _sigmoid((home_mid_total - away_mid_total) / 16.0)
         poss_home = rng.random() < p_home_poss
         if poss_home:
             home_poss_minutes += 1
-            atk, dfn_opp, side, zoned_atk = home, away, "home", home_zoned
+            side, dfn_opp = "home", away
+            lanes, weights = home_lanes, home_weights
+            quality_by_lane, pool_by_lane = home_quality_by_lane, home_pool_by_lane
         else:
-            atk, dfn_opp, side, zoned_atk = away, home, "away", away_zoned
+            side, dfn_opp = "away", home
+            lanes, weights = away_lanes, away_weights
+            quality_by_lane, pool_by_lane = away_quality_by_lane, away_pool_by_lane
 
-        lane_scores = {ln: max(1.0, atk.att[ln] - dfn_opp.dfn[ln] + 50.0) for ln in LANES}
-        lanes, weights = zip(*lane_scores.items())
         lane = rng.choices(lanes, weights=weights, k=1)[0]
-        advantage = atk.att[lane] - dfn_opp.dfn[lane]
-        quality = _sigmoid(advantage / 11.0)
+        quality = quality_by_lane[lane]
 
         roll = rng.random()
         shot_chance = 0.075 + quality * 0.23             # 대략 7.5~30.5%
         corner_chance = 0.02 + quality * 0.035          # 걷어낸 공이 라인 밖으로
         foul_chance = 0.035 + (1.0 - quality) * 0.03    # 밀릴 때 거칠게 끊는 경우
 
-        shooter_pool = [z["player"] for z in zoned_atk if z["lane"] == lane and z["third"] == "ATT"]
-        if not shooter_pool:
-            shooter_pool = [z["player"] for z in zoned_atk if z["third"] == "ATT"]
+        shooter_pool = pool_by_lane[lane]
 
         if roll < shot_chance:
             scorer_side = _resolve_shot(

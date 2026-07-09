@@ -1,12 +1,11 @@
 """
 ui/world_browser_window.py — 세계 리그 검색 + 역대 챔피언스리그/월드컵/네이션스컵 기록.
 
-[성능 설계]
-  리그 검색 탭에서 목록을 훑어보는 것 자체는 순수 DB 조회라 가볍다.
-  특정 리그를 '선택'해서 순위표를 열 때만 world_browser.get_or_simulate_league_standings가
-  그 리그 하나만 지연 시뮬레이션한다(이미 시뮬된 리그는 재시뮬 없이 즉시 반환).
-  → 675개 리그를 상시로 다 돌리는 방식과 달리, 유저가 실제로 들여다본 리그만
-    그때그때 살아나므로 주간 진행 성능에 영향이 없다.
+[실시간 전환] 이제 모든 리그가 시즌 시작 시 일정을 미리 받고 매주 실시간으로
+결과가 채워진다(game_engine._generate_all_league_schedules + 매주
+_sim_all_ai_matches). 리그 검색 탭에서 순위표를 열 때 그 자리에서 시뮬레이션할
+필요가 없어졌고, 그래서 예전에 있던 '● 라이브 / ○ 미시뮬' 배지와 '미시뮬로
+되돌리기' 버튼도 함께 제거했다.
 
 [스타일] 이 게임 UI 전반(offer_window/career_window/standings_window 등)의
   기존 톤 — 배경 #1e1e1e, 카드 #252525, 포인트 그린 #00cc44, 등급/티어 배지 색상 —
@@ -53,10 +52,6 @@ QPushButton#closeBtn { background:#2a2a2a; color:#ccc; border:1px solid #444;
                         border-radius:4px; padding:7px; font-size:12px; }
 QPushButton#closeBtn:hover { background:#383838; }
 
-QPushButton#resetBtn { background:#2a2a2a; color:#999; border:1px solid #444;
-                        border-radius:4px; padding:4px 8px; font-size:11px; }
-QPushButton#resetBtn:hover { background:#3a2222; color:#ff8888; border:1px solid #7a3030; }
-
 /* 리그 등급/티어 배지 — offer_window와 동일한 색상 언어 */
 #grade_SS { color:#ff4488; font-weight:bold; }
 #grade_S  { color:#ff9900; font-weight:bold; }
@@ -65,10 +60,6 @@ QPushButton#resetBtn:hover { background:#3a2222; color:#ff8888; border:1px solid
 #grade_C  { color:#00ff66; }
 #grade_D, #grade_E, #grade_F { color:#888888; }
 
-#simBadgeOn  { color:#00cc44; background:#1a3a1a; border-radius:3px;
-               padding:1px 6px; font-size:10px; font-weight:bold; }
-#simBadgeOff { color:#777777; background:#2a2a2a; border-radius:3px;
-               padding:1px 6px; font-size:10px; }
 #countryPill { color:#aaddff; background:#1a2a3a; border-radius:3px;
                padding:1px 5px; font-size:10px; }
 """
@@ -150,8 +141,8 @@ class WorldBrowserWindow(QDialog):
         lay.setContentsMargins(0, 8, 0, 0)
 
         info = QLabel(
-            "ℹ️ 리그를 열면 그 자리에서 이번 시즌 경기를 시뮬레이션해 ● 라이브로 표시됩니다. "
-            "다시 열어보면 결과는 그대로 유지되고, 되돌리려면 오른쪽의 '미시뮬로 되돌리기'를 누르세요.")
+            "ℹ️ 모든 리그가 시즌 내내 실시간으로 진행됩니다. 리그를 선택하면 "
+            "현재까지의 순위표를 바로 보여줍니다.")
         info.setStyleSheet("color:#888;font-size:11px;")
         info.setWordWrap(True)
         lay.addWidget(info)
@@ -206,11 +197,11 @@ class WorldBrowserWindow(QDialog):
         self.standing_title = QLabel("← 왼쪽에서 리그를 선택하세요")
         self.standing_title.setStyleSheet("color:#00cc44;font-size:14px;font-weight:bold;")
         title_row.addWidget(self.standing_title, 1)
-        self.reset_btn = QPushButton("⏹ 미시뮬로 되돌리기")
-        self.reset_btn.setObjectName("resetBtn")
-        self.reset_btn.setVisible(False)
-        self.reset_btn.clicked.connect(self._on_reset_clicked)
-        title_row.addWidget(self.reset_btn)
+        self.history_btn = QPushButton("🏆 역대 우승팀")
+        self.history_btn.setCheckable(True)
+        self.history_btn.setVisible(False)
+        self.history_btn.toggled.connect(self._on_history_toggled)
+        title_row.addWidget(self.history_btn)
         right_lay.addLayout(title_row)
 
         self.standing_sub = QLabel("")
@@ -285,7 +276,7 @@ class WorldBrowserWindow(QDialog):
         self._ensure_list_fits()
 
     def _ensure_list_fits(self):
-        """리그 목록 행(국가·리그명+티어/등급/라이브 배지)이 리스트 폭보다 넓으면
+        """리그 목록 행(국가·리그명+티어/등급 배지)이 리스트 폭보다 넓으면
         가로 스크롤로 잘리는 대신 창 자체를 키운다 — 표 쪽 _grow_to_fit과 같은
         '절대 줄이지 않는다' 원칙."""
         max_w = 0
@@ -310,7 +301,7 @@ class WorldBrowserWindow(QDialog):
                 self._league_split.setSizes(sizes)
 
     def _league_row_widget(self, lg):
-        """리그 목록 한 줄: 국기+국가+리그명 / 등급배지 / 티어 / 시뮬여부 배지.
+        """리그 목록 한 줄: 국기+국가+리그명 / 등급배지 / 티어.
         offer_window의 카드-내부-라벨 조합과 같은 톤(작은 pill 배지)으로 통일."""
         row = QWidget()
         h = QHBoxLayout(row)
@@ -331,9 +322,6 @@ class WorldBrowserWindow(QDialog):
         grade_lbl.setStyleSheet("font-size:10px;")
         h.addWidget(grade_lbl)
 
-        sim_lbl = QLabel("● 라이브" if lg["simulated"] else "○ 미시뮬")
-        sim_lbl.setObjectName("simBadgeOn" if lg["simulated"] else "simBadgeOff")
-        h.addWidget(sim_lbl)
         return row
 
     def _on_league_selected(self, item):
@@ -343,31 +331,37 @@ class WorldBrowserWindow(QDialog):
         self._current_league_id = lid
         self.standing_title.setText("⏳ 불러오는 중...")
         self.standing_sub.setText("")
-        self.reset_btn.setVisible(False)
+        self.history_btn.setVisible(False)
         self.standing_title.repaint()
-        standings, newly = wb.get_or_simulate_league_standings(lid)
+        standings = wb.get_league_standings_for_browser(lid)
+        self._current_standings = standings  # [신규] 역대 우승팀 토글 시 되돌아올 캐시
         title_text = item.data(Qt.ItemDataRole.UserRole + 1) or ""
+        self._current_league_title = title_text
         self.standing_title.setText(f"📊 {title_text}")
-        self.standing_sub.setText("방금 첫 시뮬레이션됨 (이후부터는 즉시 표시됩니다)" if newly else "")
+        # [신규] 새 리그를 열 때는 항상 순위표부터 보여준다(토글 초기화).
+        self.history_btn.blockSignals(True)
+        self.history_btn.setChecked(False)
+        self.history_btn.setText("🏆 역대 우승팀")
+        self.history_btn.blockSignals(False)
+        self.history_btn.setVisible(True)
         self._fill_standing_table(standings)
-        # 리셋 버튼: 내 소속 리그는 다른 화면에서도 실시간으로 쓰이는 데이터라
-        # 여기서 지우면 커리어 진행이 꼬일 수 있어 노출하지 않는다.
-        self.reset_btn.setVisible(not wb.is_my_league(lid))
-        if newly:
-            self._refresh_league_list()  # 배지(○→●) 갱신
 
-    def _on_reset_clicked(self):
+    def _on_history_toggled(self, checked):
+        """[신규] 제목 옆 버튼 — 현재 화면에 맞춰 라벨이 서로 바뀌면서 같은
+        표 영역을 이번 시즌 순위표(1~8위 전체) ↔ 시즌별 1~3위 기록으로 전환한다."""
         lid = getattr(self, "_current_league_id", None)
         if lid is None:
             return
-        ok = wb.reset_league_simulation(lid)
-        if not ok:
-            return
-        self.standing_title.setText("← 왼쪽에서 리그를 선택하세요")
-        self.standing_sub.setText("시뮬레이션 결과를 초기화했습니다 (미시뮬 상태로 돌아감)")
-        self.standing_tbl.setRowCount(0)
-        self.reset_btn.setVisible(False)
-        self._refresh_league_list()  # 배지(●→○) 갱신
+        if checked:
+            self.history_btn.setText("📊 팀 순위")
+            rows = wb.get_league_champions(lid)
+            self.standing_sub.setText(
+                "경기가 진행된 시즌만 표시됩니다" if rows else "")
+            self._fill_champions_table(rows)
+        else:
+            self.history_btn.setText("🏆 역대 우승팀")
+            self.standing_sub.setText("")
+            self._fill_standing_table(getattr(self, "_current_standings", []))
 
     def _fill_standing_table(self, rows):
         cols = ["순위", "팀명", "승", "무", "패", "득점", "실점", "득실", "승점"]
@@ -389,6 +383,35 @@ class WorldBrowserWindow(QDialog):
                     cell.setForeground(Qt.GlobalColor.white)
                 tbl.setItem(i, j, cell)
         self._grow_to_fit(tbl, stretch_col=1)
+
+    def _fill_champions_table(self, rows):
+        """[신규] '🏆 역대 우승팀' 토글 시 표시되는 시즌별 1~3위 + 꼴찌(강등권) 목록.
+        최신 시즌이 위로 오도록 이미 wb.get_league_champions()에서
+        season DESC로 정렬돼 온다. 한 시즌의 성적 상세(승/무/패 등)가 필요하면
+        '📊 팀 순위'로 되돌아가 현재 순위표에서 바로 확인할 수 있으므로,
+        여기서는 여러 시즌을 한눈에 훑어보기 좋도록 순위 이름만 보여준다.
+        마지막 칸(꼴찌)의 컬럼 헤더는 그 시즌 실제 참가팀 수에 맞춰 '{n}위'로
+        표시한다(대부분 8위, 리그 규모가 다르면 그에 맞춰 자동 반영)."""
+        last_rank = max((r.get("last_rank") or 0) for r in rows) if rows else 0
+        last_label = f"🔻 {last_rank}위" if last_rank else "🔻 꼴찌"
+        cols = ["연도", "🥇 1위", "🥈 2위", "🥉 3위", last_label]
+        tbl = self.standing_tbl
+        tbl.clear()
+        tbl.setRowCount(len(rows))
+        tbl.setColumnCount(len(cols))
+        tbl.setHorizontalHeaderLabels(cols)
+        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        for i, r in enumerate(rows):
+            vals = [str(r["year"]), r["first"], r["second"], r["third"], r.get("last", "-")]
+            for j, v in enumerate(vals):
+                cell = QTableWidgetItem(v)
+                cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if j >= 1:
+                    cell.setForeground(Qt.GlobalColor.white)
+                if j == 4:
+                    cell.setForeground(Qt.GlobalColor.red)
+                tbl.setItem(i, j, cell)
+        self._grow_to_fit(tbl, stretch_col=None)
 
     # ─────────────────────────────────────────
     # 탭2: 역대 챔피언스리그

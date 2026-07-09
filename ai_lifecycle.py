@@ -86,41 +86,77 @@ def _age_and_progress(c):
     [최적화] stats를 dict가 아닌 ALL_STATS 순서 리스트로 다뤄 5.9만 선수마다
              dict 생성 1회 + dict→list 재조립 1회(총 2회)를 리스트 조작 1회로 축소.
              calc_ovr_from_list로 dict 없이 바로 OVR 계산.
-             (선택되는 스탯·증감치·호출 순서는 원본과 완전히 동일 — 결과 불변, 자료구조만 변경)"""
-    from database import STAT_IDX, calc_ovr_from_list
+             (선택되는 스탯·증감치·호출 순서는 원본과 완전히 동일 — 결과 불변, 자료구조만 변경)
+    [버그수정 — 등급 무관 무제한 성장] 예전엔 성장기(≤24세) 상승 상한이 모든
+    선수에게 똑같이 99였다. 리그 등급(F든 SS든)과 무관하게 똑같은 천장을
+    향해 자라다 보니, 세이브가 오래 진행될수록(은퇴→신인 교체가 반복될수록)
+    낮은 등급 리그일수록 원래 목표(OVR_RANGES)보다 훨씬 더 크게 벌어져서
+    위로 밀려 올라갔다 — 실측 결과 F등급(설계 35~43)이 19시즌 만에 60대까지
+    올라와 D등급(55~63)과 사실상 구분이 안 될 정도였다. 이제 그 선수가 뛰는
+    팀의 리그 등급·tier에서 OVR_RANGES 상단 + 여유분(10) 을 성장 상한으로
+    삼는다 — 각 리그가 자기 수준 근처에서 성장이 자연히 둔화되어, 시즌이
+    아무리 반복돼도 전 세계 리그가 위로 뭉개지지 않는다."""
+    from database import STAT_IDX, calc_ovr_from_list, OVR_RANGES
+    from constants import COUNTRY_LEAGUE_GRADE, CONTINENT_OVR_BONUS, COUNTRY_OVR_ADJ
     grew = aged = 0
+
+    # [신규] team_id → 성장기 스탯 상한 사전 조회 (선수마다 매번 JOIN 방지)
+    # 등급별 OVR_RANGES 상단에 대륙보정 + 나라별 미세조정까지 반영해서,
+    # 초기 생성 때 쓰는 보정치와 항상 같은 기준으로 성장 상한을 잡는다
+    # (그래야 COUNTRY_OVR_ADJ로 낮춰둔 나라가 수십 시즌 뒤에도 다시
+    #  등급 평균으로 슬금슬금 수렴해버리는 걸 막을 수 있다).
+    team_cap: dict = {}
+    for r in c.execute(
+            """SELECT t.id AS tid, t.current_tier AS tier, cn.name AS cname,
+                      cn.continent AS continent
+               FROM teams t JOIN leagues l ON t.league_id = l.id
+               JOIN countries cn ON l.country_id = cn.id""").fetchall():
+        grade = COUNTRY_LEAGUE_GRADE.get(r["cname"], "F")
+        rng = OVR_RANGES.get(grade, {}).get(r["tier"] or 1)
+        top = rng[1] if rng else 43
+        bonus = CONTINENT_OVR_BONUS.get(r["continent"], 0) + COUNTRY_OVR_ADJ.get(r["cname"], 0)
+        if grade == "SS":
+            bonus = min(bonus, 0)
+        # [조정] 여유분을 +10에서 +3으로 축소. 성장기(16~24세) 동안 시즌마다
+        # 스탯이 오를 기회가 많아서(최대 8시즌×2~3개), +10 여유는 "가끔 튀는
+        # 특출난 선수"가 아니라 "대부분의 선수가 결국 도달하는 새 평균"이
+        # 되어버렸다(19시즌 실측: F등급 설계 35~43인데 실제 평균 54.7까지
+        # 상승). +3 정도로 좁혀 상한이 진짜 상한 역할을 하도록 한다.
+        team_cap[r["tid"]] = min(99, top + bonus + 3)
+
     rows = c.execute(
-        "SELECT id, position, age, " + _STAT_COLS + " FROM ai_players").fetchall()
+        "SELECT id, position, age, team_id, " + _STAT_COLS + " FROM ai_players").fetchall()
 
     updates = []  # (age, s1, s2, ..., ovr, id) 튜플 목록
     phys_list = ["stamina", "speed", "jump", "strength"]
 
     for r in rows:
         # [최적화] sqlite3.Row 이름 접근(r["stat"]) → 위치 접근(r[i])으로 교체.
-        #   SELECT 컬럼 순서가 (id, position, age, *ALL_STATS)로 고정돼 있으므로
-        #   r[3:]는 항상 ALL_STATS와 같은 순서의 값.
+        #   SELECT 컬럼 순서가 (id, position, age, team_id, *ALL_STATS)로 고정돼
+        #   있으므로 r[4:]는 항상 ALL_STATS와 같은 순서의 값.
         pid = r[0]
         pos = r[1]
         new_age = (r[2] or 20) + 1
-        vals = [v or 50 for v in r[3:]]   # ALL_STATS 순서 리스트 (dict 대신)
+        _cap = team_cap.get(r[3], 99)
+        vals = [v or 50 for v in r[4:]]   # ALL_STATS 순서 리스트 (dict 대신)
         keys = KEY_STATS_BY_POS.get(pos, ALL_STATS[:5])
 
         if new_age <= _AI_PEAK_START:
-            # 성장기: 키스탯 위주로 +1~3
+            # 성장기: 키스탯 위주로 +1~3 (리그 등급 상한까지만)
             n_up = random.randint(1, 3)
             for _ in range(n_up):
                 s = random.choice(keys if random.random() < 0.7 else ALL_STATS)
                 i = STAT_IDX[s]
-                vals[i] = min(99, vals[i] + random.randint(1, 3))
+                vals[i] = min(_cap, vals[i] + random.randint(1, 3))
             grew += 1
         elif new_age <= _AI_PEAK_END:
-            # 피크: 거의 정체, 미세 변동
+            # 피크: 거의 정체, 미세 변동 (마찬가지로 등급 상한까지만)
             if random.random() < 0.3:
                 s = random.choice(ALL_STATS)
                 i = STAT_IDX[s]
-                vals[i] = min(99, max(15, vals[i] + random.choice([-1, 1, 1])))
+                vals[i] = min(_cap, max(15, vals[i] + random.choice([-1, 1, 1])))
         else:
-            # 노화기: 신체 스탯 위주로 하락
+            # 노화기: 신체 스탯 위주로 하락 (하락에는 등급 상한이 의미 없음 — 그대로)
             decline_n = 2 + (new_age - _AI_PEAK_END) // 2
             for _ in range(decline_n):
                 if random.random() < 0.65:
@@ -152,19 +188,22 @@ def _retire_and_replace(c, year):
     기존: team_avg가 낮으면 낮은 신인이 들어와 리그 전체 OVR이 해마다 하락하는 버그.
     수정: OVR_RANGES[grade][tier] 범위 하단~중간값을 신인 목표로 사용 → 리그 OVR 유지.
     [최적화] 팀 info 선조회 + 이름풀 캐시로 은퇴자마다 DB 왕복 제거."""
-    from constants import OVR_RANGES, COUNTRY_LEAGUE_GRADE
+    from constants import OVR_RANGES, COUNTRY_LEAGUE_GRADE, CONTINENT_OVR_BONUS, COUNTRY_OVR_ADJ
     retired = 0
 
-    # 팀 → 리그등급/tier 선조회 (은퇴자마다 JOIN 방지)
-    team_info = {}  # {team_id: (grade, tier)}
+    # 팀 → 리그등급/tier/보정치 선조회 (은퇴자마다 JOIN 방지)
+    team_info = {}  # {team_id: (grade, tier, bonus)}
     for r in c.execute(
             """SELECT t.id AS tid, t.current_tier AS tier,
-                      cn.name AS cname
+                      cn.name AS cname, cn.continent AS continent
                FROM teams t
                JOIN leagues l ON t.league_id = l.id
                JOIN countries cn ON l.country_id = cn.id""").fetchall():
         grade = COUNTRY_LEAGUE_GRADE.get(r["cname"], "D")
-        team_info[r["tid"]] = (grade, r["tier"] or 1)
+        bonus = CONTINENT_OVR_BONUS.get(r["continent"], 0) + COUNTRY_OVR_ADJ.get(r["cname"], 0)
+        if grade == "SS":
+            bonus = min(bonus, 0)
+        team_info[r["tid"]] = (grade, r["tier"] or 1, bonus)
 
     # [최적화] 이름풀 전체 1회 로드 (은퇴자마다 ORDER BY RANDOM() 방지)
     name_cache = _build_name_cache(c)
@@ -190,13 +229,16 @@ def _retire_and_replace(c, year):
             continue
 
         # [버그수정] 신인 목표 OVR: 리그 등급/tier OVR_RANGES 하단~중간 범위
-        grade, tier = team_info.get(r["team_id"], ("D", 1))
+        #  + 대륙/나라 보정. [조정] 예전엔 중간값+5까지 허용해서 신인이 데뷔부터
+        #  거의 에이스급으로 들어왔다(A등급 기준 82~91). 하단~중간(82~86)으로
+        #  좁혀서, 실제로 몇 시즌 성장해야 에이스 근처에 도달하도록 한다.
+        grade, tier, _bonus = team_info.get(r["team_id"], ("D", 1, 0))
         ovr_rng = OVR_RANGES.get(grade, {}).get(tier)
         if ovr_rng:
             lo, hi = ovr_rng
-            # 신인은 리그 하단~중간 수준으로 진입 (하단+0 ~ 중간+5 범위)
+            lo, hi = lo + _bonus, hi + _bonus
             mid = (lo + hi) // 2
-            target = random.randint(lo, mid + 5)
+            target = random.randint(lo, mid)
         else:
             target = random.randint(30, 45)
 

@@ -1,19 +1,15 @@
 """
 world_browser.py — 세계 리그 검색 + 역대 챔피언스리그/월드컵 기록 조회.
 
-[설계 원칙 - 지연(lazy) 시뮬레이션]
-  이 게임은 671개국(정확히는 211개국) 675개 리그 중 내 국가 리그만 시즌 종료
-  로직에서 강제로 일정생성+시뮬된다. 나머지는 이적 오퍼(generate_offers)에
-  뜬 팀의 리그만 그 자리에서 지연 시뮬된다 — 이미 있는 패턴.
-  이 모듈은 그 지연 패턴을 '검색'에도 그대로 적용한다:
-    - 검색/목록 조회 자체는 DB 읽기만 함 (일정·시뮬 트리거 없음 → 가볍다).
-    - 사용자가 특정 리그를 '선택'해서 순위표를 열 때만, 그 리그에 이번 시즌
-      경기기록이 없으면 그 자리에서 1회 생성+시뮬한다 (해당 리그 팀 수만큼만
-      비용 발생 — 보통 8~20팀, 전체 675리그를 매주 도는 것과는 비교가 안 되게 쌈).
-    - 한번 시뮬된 리그는 이후 검색부터는 이미 있는 순위표를 그대로 보여준다.
-  이렇게 하면 "전체 상시 시뮬레이션"으로 갈 때 생기는 주간 틱 비용 폭증
-  (플레이어 리그 ~4경기/주 → 전세계 ~2500경기/주) 없이, 유저가 실제로 들여다본
-  리그만 그때그때 살아난다.
+[실시간 전환] 예전엔 이 게임이 675개 리그 중 내 국가 리그만 시즌 종료 로직에서
+강제로 일정생성+시뮬됐고, 나머지는 이적 오퍼나 이 검색 화면에서 유저가 직접
+열어봐야만 그 자리에서 지연 시뮬됐다(그래서 리그마다 '● 라이브 / ○ 미시뮬'
+배지가 따로 있었다). 지금은 game_engine._generate_all_league_schedules가 매
+시즌 시작 시 전 세계 모든 리그의 일정을 미리 깔아 두고, 매주 정규 흐름의
+_sim_all_ai_matches가 리그 구분 없이 실시간으로 결과를 채운다. 즉 유저가 한
+번도 안 열어본 리그도 항상 그 시즌 진행 상황을 그대로 갖고 있다 — '라이브'
+여부를 따로 표시하거나 되돌릴 이유가 없어져서 그 배지/리셋 기능은 제거했다.
+이 모듈의 검색/조회 함수들은 이제 순수 DB 읽기만 한다.
 """
 from database import get_conn
 
@@ -59,15 +55,12 @@ def list_grades():
 
 
 def search_leagues(continent=None, country_id=None, name_query=None, grade=None):
-    """조건에 맞는 리그 목록. 각 리그에 이번 시즌 실제 경기기록이 있는지(simulated)
-    여부를 함께 반환한다 — 목록 조회 자체는 시뮬레이션을 트리거하지 않는다.
+    """조건에 맞는 리그 목록. 이제 모든 리그가 시즌 시작 시 일정을 미리 받고
+    매주 실시간으로 결과가 채워지므로, 예전의 '이번 시즌 시뮬 여부(simulated)'
+    배지는 더 이상 의미가 없어 반환하지 않는다.
     """
     conn = get_conn()
     c = conn.cursor()
-
-    st_row = conn.execute(
-        "SELECT current_season FROM season_state WHERE id=1").fetchone()
-    season = st_row["current_season"] if st_row else 1
 
     q = ("SELECT l.id, l.name, l.tier, cn.id as country_id, cn.name as country, "
          "cn.flag as flag, cn.grade as grade, cn.continent as continent "
@@ -86,26 +79,18 @@ def search_leagues(continent=None, country_id=None, name_query=None, grade=None)
     q += " ORDER BY cn.grade, cn.name, l.tier"
 
     rows = [dict(r) for r in c.execute(q, params).fetchall()]
-
-    # [최적화] 리그마다 개별 COUNT 쿼리 대신, 이번 시즌 경기기록 있는 league_id를
-    # 1회 SELECT로 모아 set으로 조회 (검색 결과가 수십~수백 개여도 쿼리 1회).
-    sim_ids = {r["league_id"] for r in c.execute(
-        "SELECT DISTINCT league_id FROM match_results WHERE season=?",
-        (season,)).fetchall()}
     conn.close()
-
-    for r in rows:
-        r["simulated"] = r["id"] in sim_ids
     return rows
 
 
 # ─────────────────────────────────────────
-# 2. 리그 순위표 (지연 시뮬레이션 트리거)
+# 2. 리그 순위표
 # ─────────────────────────────────────────
-def get_or_simulate_league_standings(league_id, season=None, year=None):
-    """이 리그에 이번 시즌 경기기록이 없으면 그 자리에서 일정생성+시뮬 후
-    순위표를 반환한다. 이미 있으면 추가 시뮬레이션 없이 바로 반환
-    (매번 재시뮬하지 않음 — 한 번 살아난 리그는 계속 그 결과를 유지).
+def get_league_standings_for_browser(league_id, season=None, year=None):
+    """이 리그의 이번 시즌 순위표를 반환한다. 모든 리그가 시즌 시작 시 이미
+    일정을 받아 매주 실시간으로 채워지므로 평소엔 그냥 바로 조회하면 된다.
+    아주 드물게(예: 구버전 세이브 마이그레이션 등) 일정이 비어 있는 리그가
+    있으면 안전망으로 그 자리에서 한 번만 생성+시뮬한다.
     """
     from game_engine import (get_state, generate_season_schedule,
                              _sim_league_full, get_league_standings)
@@ -121,50 +106,50 @@ def get_or_simulate_league_standings(league_id, season=None, year=None):
         (league_id, season)).fetchone()["n"]
     conn.close()
 
-    newly_simulated = False
     if cnt == 0:
         generate_season_schedule(league_id, season, year)
         _sim_league_full(league_id, season)
-        newly_simulated = True
 
-    standings = get_league_standings(league_id, season=season)
-    return standings, newly_simulated
+    return get_league_standings(league_id, season=season)
 
 
-def is_my_league(league_id):
-    """지금 내가 뛰고 있는 리그인지 여부 (리셋 버튼 노출 여부 판단용)."""
-    from game_engine import get_player
-    p = get_player()
-    return bool(p and p.get("current_league_id") == league_id)
-
-
-def reset_league_simulation(league_id, season=None):
-    """이 리그의 이번 시즌 경기기록을 전부 지워서 '미시뮬' 상태로 되돌린다
-    (라이브 배지를 다시 끄는 기능). get_league_standings는 항상 match_results
-    에서 그때그때 직접 집계하므로(teams 테이블 누적 컬럼을 안 씀), 이 삭제
-    한 번으로 안전하게 원상복구된다 — 다른 데이터는 건드릴 필요가 없다.
-
-    [안전장치] 내가 지금 뛰고 있는 리그는 리셋 대상에서 제외한다. 그 리그는
-    이 브라우저 밖에서도(스케줄 화면, 승강제, 시즌종료 처리 등) 실시간으로
-    쓰이고 있어서, 지우면 내 커리어 진행 자체가 꼬일 수 있다. 다른 675개
-    '구경만 하는' 리그와는 성격이 다르다.
-    """
-    from game_engine import get_state, get_player
-    st = get_state()
-    if season is None:
-        season = st["current_season"] if st else 1
-
-    p = get_player()
-    if p and p.get("current_league_id") == league_id:
-        return False  # 내 리그는 리셋 불가
-
+def get_league_champions(league_id, limit=30):
+    """[신규] 이 리그의 시즌별 1~3위 + 꼴찌(강등권) 팀명 목록. 실제로 경기가
+    진행된 시즌만 대상이며(한 번도 경기가 없었던 시즌은 제외), 새 테이블 없이
+    match_results를 시즌 단위로 그때그때 집계해서 계산한다(승강전 처리와 동일한 방식).
+    최신 시즌부터 최대 limit개.
+    'last'는 그 시즌 순위표의 실제 마지막 팀(팀 수가 8개면 8위, 그보다 적으면
+    있는 만큼의 마지막 순위)이다 — 항상 '8위'로 고정하지 않고 리그 규모에 맞춘다."""
+    from game_engine import get_league_standings
     conn = get_conn()
-    conn.execute(
-        "DELETE FROM match_results WHERE league_id=? AND season=?",
-        (league_id, season))
-    conn.commit()
+    season_rows = conn.execute(
+        """SELECT DISTINCT season, year FROM match_results
+           WHERE league_id=? AND home_score>=0
+           ORDER BY season DESC LIMIT ?""",
+        (league_id, limit)).fetchall()
+    out = []
+    for sr in season_rows:
+        standings = get_league_standings(league_id, season=sr["season"], conn=conn)
+        if not standings:
+            continue
+        n = len(standings)
+        last_rank = n  # 실제 순위표 마지막 등수 (보통 8, 팀 수가 다르면 그에 맞춰)
+        out.append({
+            "season": sr["season"], "year": sr["year"],
+            "first":  standings[0]["name"] if n > 0 else "-",
+            "second": standings[1]["name"] if n > 1 else "-",
+            "third":  standings[2]["name"] if n > 2 else "-",
+            "last_rank": last_rank,
+            "last":   standings[-1]["name"] if n > 3 else "-",
+        })
     conn.close()
-    return True
+    return out
+
+
+# [실시간 전환] 예전엔 유저가 열어본 리그만 '라이브' 상태였고, 그걸 다시
+# '미시뮬'로 되돌리는 reset_league_simulation() / 되돌리기 대상에서 내 리그를
+# 제외하는 is_my_league()가 있었다. 지금은 모든 리그가 항상 실시간으로 진행
+# 중이라 되돌릴 '시뮬 이전 상태' 자체가 없으므로 두 함수 모두 제거했다.
 
 
 # ─────────────────────────────────────────

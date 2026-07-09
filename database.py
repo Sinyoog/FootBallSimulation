@@ -956,9 +956,10 @@ def _generate_team_players(c, team, team_strength, league_used: set = None):
     if league_used is None:
         league_used = set()
 
-    # 대륙별 OVR 보정치
-    from constants import CONTINENT_OVR_BONUS
+    # 대륙별 OVR 보정치 + [신규] 나라별 미세조정(COUNTRY_OVR_ADJ)
+    from constants import CONTINENT_OVR_BONUS, COUNTRY_OVR_ADJ
     continent_bonus = CONTINENT_OVR_BONUS.get(continent, 0)
+    continent_bonus += COUNTRY_OVR_ADJ.get(team.get("cname", ""), 0)
     # SS는 이미 상한(100)에 근접 → 보정 축소 (초과 방지)
     if grade == "SS":
         continent_bonus = min(continent_bonus, 0)

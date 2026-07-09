@@ -571,6 +571,14 @@ def create_player(name: str, position: str, sub_role: str,
     conn.commit()
     conn.close()
 
+    # [실시간 전환] 이제까지는 시즌 1(=게임 시작 연도)의 전 세계 일정 생성이
+    # 연도 전환 시점(_advance_week)에서만 호출돼서, 정작 첫 시즌(2000년 등)엔
+    # 아무도 안 걸렸다 — 그래서 시즌 1은 오퍼에 뜬 리그(내 리그 등)만 그 해
+    # 기록이 있고, 나머지 전 세계 리그는 시즌 2(다음 해)부터 기록이 시작되는
+    # 불일치가 있었다. 새 커리어 시작 시점에 한 번 호출해 시즌 1도 처음부터
+    # 전 세계 모든 리그가 동일하게 그 해부터 기록을 갖게 한다.
+    _generate_all_league_schedules(1, GAME_START_YEAR)
+
     add_log(f"⭐ {GAME_START_YEAR}년  —  {name} {PLAYER_START_AGE}세", "event")
     add_log("─"*44, "sep")
 
@@ -3069,7 +3077,17 @@ def get_league_standings_by_team(team_id, conn=None, season=None):
 
 def get_league_standings(league_id, season=None, conn=None):
     """순위표: match_results에서 직접 집계해서 항상 정확한 값 반환.
-    [최적화] season/conn 파라미터 추가 — 외부에서 열린 커넥션 재사용 가능."""
+    [최적화] season/conn 파라미터 추가 — 외부에서 열린 커넥션 재사용 가능.
+
+    [버그수정] 예전엔 로스터를 teams.league_id(=현재 소속 리그) 기준으로 잡았다.
+    승강 전 시즌은 문제없지만, 승강이 한 번이라도 일어난 뒤 '그 이전 시즌'을
+    조회하면: (1) 그 시즌엔 실제로 안 뛰었는데 지금 이 리그 소속인 팀이
+    0승0무0패로 끼어들어 순위표 맨 밑에 나타나고, (2) 그 시즌엔 실제로 뛰었지만
+    이후 승강돼서 지금은 다른 리그 소속인 팀은 통째로 순위표에서 빠지는 문제가
+    있었다(예: FC 목포가 시즌1엔 K3에서 뛰었는데 시즌2에 K2로 승격된 뒤
+    '시즌1 K2 순위표'를 보면 목포가 0-0-0-0으로 8위에 등장). 이제 그 시즌의
+    실제 일정(match_results, 완료 여부 무관)에 등장하는 team_id로 로스터를
+    구성해서 승강 이후에도 과거 시즌 순위표가 그때 그대로 나오게 한다."""
     own_conn = conn is None
     if own_conn:
         conn = get_conn()
@@ -3079,16 +3097,26 @@ def get_league_standings(league_id, season=None, conn=None):
         st = get_state()
         season = st["current_season"] if st else 1
 
-    c.execute("SELECT id, name FROM teams WHERE league_id=?", (league_id,))
+    c.execute("""SELECT home_team_id, away_team_id, home_score, away_score
+                 FROM match_results WHERE league_id=? AND season=?""",
+              (league_id, season))
+    all_rows = c.fetchall()
+
+    team_ids = {tid for r in all_rows for tid in (r["home_team_id"], r["away_team_id"])}
+    if team_ids:
+        qmarks = ",".join("?" * len(team_ids))
+        c.execute(f"SELECT id, name FROM teams WHERE id IN ({qmarks})", tuple(team_ids))
+    else:
+        # 그 시즌 일정 자체가 아직 없는 경우(예: 새 시즌 시작 직후)엔
+        # 현재 리그 소속팀을 그대로 로스터로 사용한다.
+        c.execute("SELECT id, name FROM teams WHERE league_id=?", (league_id,))
     teams = {r["id"]: {"id": r["id"], "name": r["name"],
                        "wins":0,"draws":0,"losses":0,
                        "goals_for":0,"goals_against":0} for r in c.fetchall()}
 
-    c.execute("""SELECT home_team_id, away_team_id, home_score, away_score
-                 FROM match_results
-                 WHERE league_id=? AND season=? AND home_score>=0""",
-              (league_id, season))
-    for row in c.fetchall():
+    for row in all_rows:
+        if row["home_score"] < 0:
+            continue
         hid, aid, hs, as_ = (row["home_team_id"], row["away_team_id"],
                               row["home_score"], row["away_score"])
         for tid, gf, ga in [(hid, hs, as_), (aid, as_, hs)]:
@@ -3406,6 +3434,10 @@ def _advance_week(p, base_week, n_weeks=4):
         # [귀화] 거주 연수 갱신 + 자격 체크는 _end_of_season 안에서 처리
         #   (그 시점에 current_team_id가 아직 살아있어 소속국가를 읽을 수 있음)
         _end_of_season(p, new_year-1)
+        # [실시간 전환] 승강제 결과가 반영된 뒤(= teams.league_id 확정 후) 전 세계
+        # 모든 리그의 새 시즌 일정을 미리 깔아 둔다. 이후 매주 _sim_all_ai_matches가
+        # 실시간으로 채우므로 더 이상 연말에 몰아서 처리할 필요가 없다.
+        _generate_all_league_schedules(new_season, new_year)
     else:
         # 하반기 종료(33~36주차) → 37~40주차: 커리어 스탯 중간 업데이트만
         # (항목은 닫지 않음 - 연도 변경 시 _close_career_entry가 닫음)
@@ -4054,7 +4086,10 @@ def _end_of_season(p, year):
     #    우승/승격은 '그 시즌에 그 팀 소속이었다'는 사실에 근거해야 한다.
     #    방출/이적을 먼저 처리하면 current_team_id=0이 되어, 리그 1위를 하고도
     #    "내 팀 아님"으로 판정돼 우승·승격 기록이 통째로 누락된다. (순서 버그 수정)
-    _sim_all_leagues_for_season_end(p.get("current_season", 1))
+    # [실시간 전환] 이제 전 세계 모든 리그가 시즌 시작 시점에 일정이 미리 깔리고
+    #   매주 _sim_all_ai_matches가 실시간으로 채우므로, 여기서 수백 개 리그를
+    #   몰아서 새로 생성+시뮬할 필요가 없다. 혹시 남은 미완료 경기(-1)만 안전망으로 정리.
+    _finish_incomplete_matches_for_season(p.get("current_season", 1))
     _process_promotion_relegation(year, season_avg_rating)
 
     # 5.7 [AI 선수 생애주기] 나이+1·성장/노화·은퇴/세대교체·이적시장·전술변경.
@@ -4378,33 +4413,48 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
     except Exception:
         pass
 
-    # [최적화] 모든 국가의 모든 리그 standings를 한 번에 계산해 캐시
-    # 이후 루프에서 재계산 없이 조회만 한다.
-    # standings 계산: match_results에서 직접 집계 (중첩 함수 제거)
-    def _calc_standings_cached(lid):
-        """리그 standings를 conn 재사용으로 계산. 경기 없으면 []."""
-        teams_in = {r["id"]: {"id": r["id"], "name": r["name"],
-                               "pts": 0, "gd": 0, "gf": 0, "gp": 0}
-                    for r in c.execute("SELECT id, name FROM teams WHERE league_id=?",
-                                       (lid,)).fetchall()}
-        if not teams_in:
-            return []
+    # [최적화 — 근본 원인] 예전엔 이 캐시를 리그마다 SELECT 2회
+    # (팀 목록 + match_results)로 채워서, 전 세계 675개 리그 기준 쿼리
+    # 1,350회가 나갔다(리그당 쿼리 자체는 인덱스 덕에 빠르지만, 커서/파싱
+    # 오버헤드가 675번 누적되면서 이 함수 하나가 시즌 전환 지연의 절반
+    # 이상(실측 약 6초/10초)을 차지했다). 이제 "팀 전체 1회 SELECT" +
+    # "이번 시즌 match_results 전체 1회 SELECT"만 하고, 리그별 집계는
+    # 파이썬 메모리 안에서 한 번의 루프로 끝낸다 — 쿼리 675x2회 → 2회.
+    def _calc_all_standings_cached(league_ids, season):
+        """모든 리그의 standings를 딱 2번의 SELECT로 한꺼번에 계산.
+        반환값·정렬 기준은 기존 _calc_standings_cached(리그별 개별 계산)와
+        동일하다 — 순수 성능 최적화이며 판정 로직은 바뀌지 않는다."""
+        by_league: dict = {lid: {} for lid in league_ids}
+        for r in c.execute("SELECT id, name, league_id FROM teams").fetchall():
+            lid = r["league_id"]
+            if lid in by_league:
+                by_league[lid][r["id"]] = {"id": r["id"], "name": r["name"],
+                                            "pts": 0, "gd": 0, "gf": 0, "gp": 0}
+
         for row in c.execute(
-            """SELECT home_team_id, away_team_id, home_score, away_score
-               FROM match_results WHERE league_id=? AND season=? AND home_score>=0""",
-                (lid, season)).fetchall():
+                """SELECT league_id, home_team_id, away_team_id, home_score, away_score
+                   FROM match_results WHERE season=? AND home_score>=0""",
+                (season,)).fetchall():
+            teams_in = by_league.get(row["league_id"])
+            if not teams_in:
+                continue
             hid, aid, hs, as_ = (row["home_team_id"], row["away_team_id"],
                                   row["home_score"], row["away_score"])
             for tid, gf, ga in [(hid, hs, as_), (aid, as_, hs)]:
-                if tid not in teams_in:
+                t = teams_in.get(tid)
+                if t is None:
                     continue
-                teams_in[tid]["gp"] += 1
-                teams_in[tid]["gf"] += gf
-                teams_in[tid]["gd"] += gf - ga
-                if gf > ga:    teams_in[tid]["pts"] += 3
-                elif gf == ga: teams_in[tid]["pts"] += 1
-        rows_out = [t for t in teams_in.values() if t["gp"] > 0]
-        return sorted(rows_out, key=lambda x: (-x["pts"], -x["gd"], -x["gf"]))
+                t["gp"] += 1
+                t["gf"] += gf
+                t["gd"] += gf - ga
+                if gf > ga:    t["pts"] += 3
+                elif gf == ga: t["pts"] += 1
+
+        out = {}
+        for lid, teams_in in by_league.items():
+            rows_out = [t for t in teams_in.values() if t["gp"] > 0]
+            out[lid] = sorted(rows_out, key=lambda x: (-x["pts"], -x["gd"], -x["gf"]))
+        return out
 
     # [최적화] 전체 리그 맵을 1회 SELECT로 미리 빌드 (기존: cids×tier 개별 SELECT 275회)
     all_leagues_rows = c.execute(
@@ -4419,7 +4469,8 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
     all_league_ids = {lid for lid in _league_map.values()}
 
     # standings 캐시: {league_id: [sorted rows]}
-    _standings_cache = {lid: _calc_standings_cached(lid) for lid in all_league_ids}
+    _standings_cache = _calc_all_standings_cached(all_league_ids, season)
+
 
     # [최적화] 팀 이름·리그명 전체 선조회 → 루프 내 ci.execute JOIN 제거
     #   기존: 승강 판정마다 ci = conn.cursor() + JOIN SELECT 2~3회
@@ -4539,15 +4590,12 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
                      WHERE league_id IN (SELECT id FROM leagues WHERE country_id=?)""", (cid,))
 
     # 승강팀 OVR 평형 일괄 적용
+    # [기능 변경] 이 리스케일 자체(승강팀 OVR을 새 리그 수준에 맞추는 것)는
+    # 유지하되, "⚙️ ... 리그 적응" 로그는 요청에 따라 화면에 더 이상
+    # 남기지 않는다(디버그성 정보라 매 시즌 로그가 지저분해짐).
     for _tid, _target in _rescale_jobs:
         try:
-            _d, _b, _a = rescale_team_to_target_ovr(_tid, _target, conn)
-            if _d != 0:
-                _ti2 = _team_info_cache.get(_tid)
-                _nm = _ti2[0] if _ti2 else f"#{_tid}"
-                _dir = "강화" if _d > 0 else "약화"
-                pending_logs.append(
-                    (f"⚙️ {_nm}  선수단 {_dir}  평균 OVR {_b:.0f}→{_a:.0f} (리그 적응)", "normal"))
+            rescale_team_to_target_ovr(_tid, _target, conn)
         except Exception as _e:
             add_log(f"[리스케일 오류] team {_tid}: {_e}", "normal", year, 52)
 
@@ -4595,85 +4643,151 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
     for text, ltype in pending_logs:
         add_log(text, ltype, year, 52)
 
-def _sim_all_leagues_for_season_end(season: int):
-    """시즌 종료 시 내 국가 tier 1~3 리그 일정 생성 + 미완료 경기 시뮬.
-    또한 이전 시즌 미완료 경기도 일괄 정리해서 구 시즌 데이터가 남지 않게 함.
-    [최적화] 기존 conn0/conn/conn_chk/conn_sim 4개 분리 → 단일 conn 통합.
-             get_conn() 4회→1회, commit/close 4회→1회.
-    """
+def _finish_incomplete_matches_for_season(season: int):
+    """[실시간 전환 - 안전망] 이제 전 세계 모든 리그가 시즌 시작 시점에
+    _generate_all_league_schedules()로 일정을 미리 받고, 매주
+    _sim_all_ai_matches가 실시간으로 결과를 채운다. 따라서 시즌이 끝나는
+    시점엔 어느 리그든 미완료 경기(-1)가 남아 있으면 안 된다 — 정상 흐름이면
+    이 함수는 사실상 아무 것도 안 찾고 끝난다.
+    혹시 리그 재편·저장 편집 등으로 놓친 경기가 있을 때만 대비하는 안전망이며,
+    수백 개 리그를 몰아서 새로 생성+시뮬하던 기존 로직(연 1회 2~3초 프리징의
+    원인)은 더 이상 필요 없어 제거했다.
+
+    [버그수정 - 중요] 반드시 '지금 끝나는 이번 시즌'만 처리한다. 예전엔 방어적으로
+    '혹시 몰라서' season-1(직전 시즌)도 같이 확인했는데, 이게 실제 사고를 냈다 —
+    승강제(_process_promotion_relegation)와 내 커리어 팀순위 기록은 그 시즌이
+    끝나는 '그 순간'의 match_results를 기준으로 이미 확정·저장된다. 그런데 그
+    시즌이 지난 뒤(다음, 다다음 시즌 전환 시점)에 이 함수가 그 시즌을 다시
+    들여다보다가 어쩌다 남아있던 미완료 경기 하나를 그때서야 채우면, 그 결과가
+    이미 확정된 승강/우승 판정 시점보다 한참 뒤의(선수 노쇠/성장이 반영된) 팀
+    전력으로 다시 굴러가면서 순위가 바뀔 수 있다 — 그러면 '내 커리어 기록'엔
+    예전에 확정된 팀순위가 그대로 남아있는데, 세계 리그 화면(역대 우승팀 등)은
+    나중에 새로 계산되며 다른 팀을 우승팀으로 보여주는 불일치가 생긴다.
+    그래서 지금은 '이번 시즌'만 정리하고, 이미 지나간 시즌은 설령 구멍이 있어도
+    그대로 둔다 — 그 구멍은 그 시즌 순위표에 남지만, 이미 확정되고 화면에
+    보여준 과거 기록을 조용히 다시 쓰는 것보다는 안전하다."""
     conn = get_conn()
-    c    = conn.cursor()
+    c = conn.cursor()
 
-    # 이전 시즌 미완료 경기 전부 AI로 처리 (구 시즌 데이터 오염 방지)
-    if season > 1:
-        prev = season - 1
-        c.execute("""SELECT id, home_team_id, away_team_id FROM match_results
-                      WHERE season=? AND home_score=-1""", (prev,))
-        stale = c.fetchall()
-        if stale:
-            batch = []
-            for m in stale:
-                ho = _team_avg_ovr(c, m["home_team_id"]) + _home_advantage() + _formation_bias(c, m["home_team_id"])
-                ao = _team_avg_ovr(c, m["away_team_id"]) + _formation_bias(c, m["away_team_id"])
-                diff = ho - ao
-                outcome = _roll_outcome(diff)
-                hs, as_ = _gen_score(outcome, diff)  # [버그수정] diff 전달
-                batch.append((hs, as_, m["id"]))
-            c.executemany("UPDATE match_results SET home_score=?,away_score=? WHERE id=?", batch)
+    c.execute("""SELECT id, home_team_id, away_team_id FROM match_results
+                  WHERE season=? AND home_score=-1""", (season,))
+    stale = c.fetchall()
+    if stale:
+        batch = []
+        for m in stale:
+            ho = _team_avg_ovr(c, m["home_team_id"]) + _home_advantage() + _formation_bias(c, m["home_team_id"])
+            ao = _team_avg_ovr(c, m["away_team_id"]) + _formation_bias(c, m["away_team_id"])
+            diff = ho - ao
+            outcome = _roll_outcome(diff)
+            hs, as_ = _gen_score(outcome, diff)
+            batch.append((hs, as_, m["id"]))
+        c.executemany("UPDATE match_results SET home_score=?,away_score=? WHERE id=?", batch)
 
-    # 내 팀 국가 파악
-    p_row = conn.execute(
-        "SELECT current_league_id FROM my_player WHERE id=1").fetchone()
-    my_lid = p_row["current_league_id"] if p_row else 0
-
-    if not my_lid:
-        conn.commit()
-        conn.close()
-        return
-
-    lg_row = c.execute(
-        "SELECT country_id, tier FROM leagues WHERE id=?", (my_lid,)).fetchone()
-    if not lg_row:
-        conn.commit()
-        conn.close()
-        return
-
-    cid  = lg_row["country_id"]
-    ss   = conn.execute("SELECT current_year FROM season_state WHERE id=1").fetchone()
-    year = ss["current_year"] if ss else 2000
-
-    # 내 국가 전체 리그 (tier 1~5, 실제 존재하는 것만)
-    c.execute("SELECT id FROM leagues WHERE country_id=?", (cid,))
-    league_ids = [r["id"] for r in c.fetchall()]
-
-    if league_ids:
-        # [최적화] 리그별 개별 COUNT → 1회 GROUP BY로 대체
-        ph = ",".join("?" * len(league_ids))
-        sched_counts = {
-            r["league_id"]: r["cnt"]
-            for r in c.execute(
-                f"SELECT league_id, COUNT(*) as cnt FROM match_results "
-                f"WHERE league_id IN ({ph}) AND season=? GROUP BY league_id",
-                (*league_ids, season)
-            ).fetchall()
-        }
-        need_sched = [lid for lid in league_ids if not sched_counts.get(lid)]
-    else:
-        need_sched = []
-
-    # 일정 생성이 필요한 리그가 있으면 먼저 commit (generate_season_schedule 내부 commit 방지)
-    if need_sched:
-        conn.commit()
-        for lid in need_sched:
-            generate_season_schedule(lid, season, year)
-
-    # 시뮬은 단일 커넥션으로 전 리그 처리
-    st = get_state()
-    for lid in league_ids:
-        _sim_league_full(lid, season, c=c, st=st)
     conn.commit()
     conn.close()
 
+
+# [실시간 전환] 전 세계 모든 리그(211개국 x 최대 5부, 약 675개)의 이번 시즌
+# 일정을 시즌 시작 시점에 한 번에 깔아 둔다. 결과(score)는 절대 여기서 채우지
+# 않는다 — 매주 정규 흐름의 _sim_all_ai_matches(week 필터만 있고 league_id
+# 필터는 없음)가 자연스럽게 그 주차 경기를 실시간으로 채운다.
+# [기존 방식과 차이] 예전엔 유저가 안 본 리그를 방치하다가 시즌 말에
+# "일정 생성 + 즉시 전 경기 시뮬"을 몰아서 했다(그것도 매 시즌 반복 — 시즌
+# 번호가 바뀌면 '라이브' 판정이 초기화되는 버그가 있었다). 이제는 일정만
+# 미리 깔아 두는 가벼운 INSERT 작업만 여기서 하고, 실제 결과 계산(OVR 조회 +
+# 승패 굴림)은 52주에 걸쳐 자연 분산된다.
+# [성능] 단일 커넥션 + 소수의 배치 쿼리(리그별 SELECT/커밋 반복 없음)로 처리.
+def _generate_all_league_schedules(season: int, year: int):
+    """시즌 시작 시 전 세계 모든 리그의 이번 시즌 일정(-1,-1 스코어)을 생성한다.
+    이미 일정이 있는 리그(80% 이상 채워짐)는 건드리지 않는다(멱등)."""
+    conn = get_conn()
+    c = conn.cursor()
+
+    # 1) 리그별 팀 목록(최대 8팀) 한 번에 조회
+    teams_by_league: dict = {}
+    for r in c.execute("SELECT id, league_id FROM teams ORDER BY league_id, id"):
+        lst = teams_by_league.setdefault(r["league_id"], [])
+        if len(lst) < 8:
+            lst.append(r["id"])
+
+    if not teams_by_league:
+        conn.commit()
+        conn.close()
+        return
+
+    # 2) 이번 시즌 리그별 기존 경기 수 — 1회 GROUP BY로 완비 여부 판정
+    sched_counts = {
+        r["league_id"]: r["cnt"]
+        for r in c.execute(
+            "SELECT league_id, COUNT(*) as cnt FROM match_results WHERE season=? GROUP BY league_id",
+            (season,)).fetchall()
+    }
+
+    need_league_ids = [
+        lid for lid, tids in teams_by_league.items()
+        if len(tids) >= 2 and sched_counts.get(lid, 0) < 56 * 0.8
+    ]
+    if not need_league_ids:
+        conn.commit()
+        conn.close()
+        return
+
+    # 3) 대상 리그들의 이번 시즌 기존 경기(예정/완료 불문) 한 번에 조회 → 중복 방지 세트
+    existing_by_league: dict = {}
+    ph = ",".join("?" * len(need_league_ids))
+    for r in c.execute(
+            f"""SELECT league_id, week, home_team_id, away_team_id FROM match_results
+                WHERE season=? AND league_id IN ({ph})""",
+            (season, *need_league_ids)):
+        s = existing_by_league.setdefault(r["league_id"], set())
+        s.add((r["week"], r["home_team_id"], r["away_team_id"]))
+        s.add((r["week"], r["away_team_id"], r["home_team_id"]))
+
+    new_rows = []
+    for lid in need_league_ids:
+        tids = teams_by_league[lid]
+        existing_matches = existing_by_league.get(lid, set())
+
+        for rd, matches in enumerate(ROUND_MATCHES):
+            week = FIRST_HALF_START + rd
+            for hi, ai in matches:
+                if hi >= len(tids) or ai >= len(tids):
+                    continue
+                t1, t2 = (tids[hi], tids[ai]) if random.random() < 0.5 else (tids[ai], tids[hi])
+                key, rkey = (week, t1, t2), (week, t2, t1)
+                if key in existing_matches or rkey in existing_matches:
+                    continue
+                new_rows.append((lid, week, t1, t2, season, year))
+                existing_matches.add(key); existing_matches.add(rkey)
+
+        for rd, matches in enumerate(ROUND_MATCHES):
+            week = SECOND_HALF_START + rd
+            first_half_week = FIRST_HALF_START + rd
+            for hi, ai in matches:
+                if hi >= len(tids) or ai >= len(tids):
+                    continue
+                flip1 = (first_half_week, tids[hi], tids[ai])
+                flip2 = (first_half_week, tids[ai], tids[hi])
+                if flip1 in existing_matches:
+                    t1, t2 = tids[ai], tids[hi]
+                elif flip2 in existing_matches:
+                    t1, t2 = tids[hi], tids[ai]
+                else:
+                    t1, t2 = (tids[ai], tids[hi]) if random.random() < 0.5 else (tids[hi], tids[ai])
+                key, rkey = (week, t1, t2), (week, t2, t1)
+                if key in existing_matches or rkey in existing_matches:
+                    continue
+                new_rows.append((lid, week, t1, t2, season, year))
+                existing_matches.add(key); existing_matches.add(rkey)
+
+    if new_rows:
+        c.executemany("""INSERT INTO match_results
+                         (league_id,week,home_team_id,away_team_id,
+                          home_score,away_score,season,year)
+                         VALUES(?,?,?,?,-1,-1,?,?)""", new_rows)
+
+    conn.commit()
+    conn.close()
 
 
 def generate_offers(count=5) -> list:
@@ -5543,12 +5657,17 @@ def _calc_salary(grade, tier, ovr, country=None):
     }
     b = base_year.get(wealth, {}).get(tier, 100)
 
-    # 나라×tier 오버라이드 (3부 이하)
+    # 나라×tier 오버라이드 (2부 이하)
     # [버그수정] LOWER_LEAGUE_SALARY_OVERRIDE는 이미 나라별 절대 base값이므로
     #   override 사용 시 cont_mult를 적용하지 않는다.
     #   (기존: override에도 cont_mult 재적용 → K3 의도 150만이 31만으로 축소되는 버그)
+    # [버그수정] 원래 tier>=3만 override 대상이라 2부는 항상 base_year×cont_mult
+    #   수식으로만 계산됐다. cont_mult가 아주 작은 나라(이란/세네갈/모로코/
+    #   스웨덴/덴마크 등)는 이 수식값이 override로 지정된 3부 절대값보다도
+    #   낮아져 "2부가 3부보다 싼" 역전이 발생했다. tier==2도 override 대상에
+    #   포함시켜, 해당 국가엔 3부보다 확실히 높은 2부 절대값을 지정해 둔다.
     _used_override = False
-    if country and tier >= 3:
+    if country and tier >= 2:
         _ov = LOWER_LEAGUE_SALARY_OVERRIDE.get(country, {})\
             if not is_special else {}
         if tier in _ov:
@@ -5571,8 +5690,17 @@ def _calc_salary(grade, tier, ovr, country=None):
     sal = int(b * _salary_ovr_adj(ovr, wealth, tier))
     if wealth == "F" and tier >= 3 and ovr < 38:
         return 0
-    if tier >= 4 and sal < 50 and b > 0:
-        sal = 50
+    # [버그수정] 최저임금 바닥값이 예전엔 tier>=4에 고정 50으로만 적용돼,
+    #   3부 계산값이 50 미만인 저평가 국가(말라위/볼리비아 등)에서
+    #   "3부<4부" 역전이 났다. 그렇다고 3부도 그냥 50으로 맞추면 이번엔
+    #   2부 계산값이 그 50보다 낮은 국가(말레이시아/태국/불가리아 등 저배율국)
+    #   에서 "2부<3부(바닥50)" 역전이 새로 생긴다.
+    #   → 바닥값 자체를 티어가 낮을수록(숫자가 작을수록) 커지도록 계단식으로
+    #     주어 바닥값끼리도 항상 2부>3부>4부>5부 순서가 유지되게 한다.
+    _floor_by_tier = {1: 150, 2: 110, 3: 80, 4: 60, 5: 50}
+    _floor = _floor_by_tier.get(tier, 0)
+    if _floor and sal < _floor and b > 0:
+        sal = _floor
     # 등급별 연봉 상한 적용
     cap = _salary_cap.get(wealth, 0)
     if cap > 0:
