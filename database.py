@@ -577,6 +577,43 @@ def seed_initial_data():
     conn.commit(); conn.close()
     print("완료")
 
+def _reset_teams_to_league_data(c):
+    """[버그수정] '새 게임'을 눌러도 teams.league_id/current_tier가
+    이전 플레이의 승강 결과 그대로 남아있던 문제를 고친다.
+    reset_game_data()는 promotion_log 등 시즌 기록은 싹 지우면서도
+    teams 테이블 자체(league_id, current_tier)는 건드리지 않았기 때문에,
+    이전 판에서 승격/강등된 팀이 새 판에서도 엉뚱한 리그에서 시작했다.
+    이 함수는 LEAGUE_DATA(leagues.py) 원본 배치를 기준으로 모든 팀의
+    league_id/current_tier를 되돌린다. 팀 id(및 그에 딸린 선수단 등)는
+    그대로 유지한 채 소속 리그 정보만 바로잡으므로 안전하다."""
+    c.execute("SELECT id, name FROM countries")
+    cid_by_name = {r["name"]: r["id"] for r in c.fetchall()}
+    c.execute("SELECT id, country_id, tier FROM leagues")
+    league_id_by_country_tier = {(r["country_id"], r["tier"]): r["id"] for r in c.fetchall()}
+
+    # (country_id, team_name) -> (league_id, tier)
+    target = {}
+    for country_name, tiers in LEAGUE_DATA.items():
+        cid = cid_by_name.get(country_name)
+        if cid is None:
+            continue
+        for tier_key, (league_name, team_names) in tiers.items():
+            tier = _tier_to_int(tier_key)
+            lid = league_id_by_country_tier.get((cid, tier))
+            if lid is None:
+                continue
+            for team_name in team_names:
+                target[(cid, team_name)] = (lid, tier)
+
+    c.execute("SELECT id, name, country_id FROM teams")
+    updates = []
+    for r in c.fetchall():
+        dest = target.get((r["country_id"], r["name"]))
+        if dest:
+            updates.append((dest[0], dest[1], r["id"]))
+    c.executemany("UPDATE teams SET league_id=?, current_tier=? WHERE id=?", updates)
+
+
 def reset_game_data():
     init_db()  # 마이그레이션 적용
     conn = get_conn(); c = conn.cursor()
@@ -586,6 +623,7 @@ def reset_game_data():
               "cl_tournaments","cl_entries","cl_matches","cl_history"]:
         c.execute(f"DELETE FROM {t}")
     c.execute("UPDATE teams SET wins=0,draws=0,losses=0,goals_for=0,goals_against=0")
+    _reset_teams_to_league_data(c)
     conn.commit(); conn.close()
 
 # ─── OVR 가중치 ───────────────────────────────────────────────
