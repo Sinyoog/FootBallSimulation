@@ -35,6 +35,14 @@ class StandingsWindow(QDialog):
         self._timer.timeout.connect(self.refresh)
         self._timer.start(5000)
 
+    def pause_refresh(self):
+        """[스레드 안전] 백그라운드 워커가 DB에 쓰는 동안 5초 타이머가
+        같은 커넥션에 SELECT를 던지지 않도록 잠시 멈춘다."""
+        self._timer.stop()
+
+    def resume_refresh(self):
+        self._timer.start(5000)
+
     def _build(self):
         self._lay = QVBoxLayout(self)
         conn = get_conn()

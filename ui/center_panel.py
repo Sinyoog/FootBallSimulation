@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QComboBox, QFrame, QMessageBox,
     QGraphicsDropShadowEffect
 )
-from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve
+from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QThread, pyqtSignal
 from PyQt6.QtGui import QColor
 
 from game_engine import (
@@ -95,6 +95,38 @@ QLabel  { color:#cccccc; font-size:13px; }
              border-radius:6px; padding:12px 14px; font-size:14px; font-weight:bold; }
 #dlgChoice:hover { background:#2360ad; }
 """
+
+
+class _AdvanceWorker(QThread):
+    """주차/시즌 진행(advance_4weeks)을 백그라운드 스레드에서 처리.
+
+    52→1주 시즌전환 시 _end_of_season → run_ai_offseason(AI 생애주기,
+    수만 명 규모) 등 무거운 DB 작업이 한꺼번에 일어나는데, 이걸 메인(UI)
+    스레드에서 그대로 부르면 그 시간만큼 화면이 완전히 멈춘다(체감 렉).
+    실제 계산 시간 자체는 줄이지 않지만, 별도 스레드에서 돌려 이벤트 루프가
+    막히지 않게 하면 사용자 입장에서 "멈춤"은 사라진다.
+
+    [스레드 안전] database.py의 풀 커넥션은 check_same_thread=False로 열려
+    있어 이 워커 스레드에서도 그대로 재사용 가능하다. 단, SQLite 커넥션을
+    여러 스레드가 '동시에' 건드리는 건 안전하지 않으므로, 워커가 도는 동안
+    메인 스레드가 DB에 접근하지 않도록 UI 쪽(CenterPanel._advance)에서
+    main_win 전체를 비활성화해 직렬화를 보장한다."""
+    finished_ok = pyqtSignal()
+    failed = pyqtSignal(str)
+
+    def __init__(self, schedule, parent=None):
+        super().__init__(parent)
+        self._schedule = schedule
+
+    def run(self):
+        try:
+            advance_4weeks(self._schedule)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.failed.emit(str(e))
+            return
+        self.finished_ok.emit()
 
 
 class CenterPanel(QWidget):
@@ -792,9 +824,27 @@ class CenterPanel(QWidget):
             idx = max(0, min(self._step_idx, len(self._locked_sched) - 1))
             schedule = [self._locked_sched[idx]]
 
-        advance_4weeks(schedule)
+        # ── 여기까지는 UI/검증 로직이라 가볍다. 무거운 처리(advance_4weeks,
+        #    특히 52→1주 시즌전환의 AI 생애주기 계산)만 백그라운드로 뺀다. ──
+        # [스레드 안전] 워커가 도는 동안 메인 윈도우 전체를 비활성화해서, 다른
+        #   버튼(오퍼/입단/세계기록실 등)이 같은 DB 커넥션을 동시에 건드리는
+        #   걸 막는다. SQLite 커넥션은 여러 스레드가 '동시에' 쓰면 안전하지
+        #   않으므로, 처리 중엔 오직 워커 스레드만 DB에 접근하도록 보장해야 한다.
+        if self.main_win:
+            self.main_win.setEnabled(False)
+
+        self._advance_worker = _AdvanceWorker(schedule, self)
+        self._advance_worker.finished_ok.connect(
+            lambda: self._on_advance_finished())
+        self._advance_worker.failed.connect(self._on_advance_failed)
+        self._advance_worker.start()
+
+    def _on_advance_finished(self):
+        from PyQt6.QtWidgets import QApplication
         QApplication.restoreOverrideCursor()
         self.adv_btn.setEnabled(True)
+        if self.main_win:
+            self.main_win.setEnabled(True)
 
         # ── 묶음 진행 상태 갱신 ──
         if self._step_mode:
@@ -851,7 +901,6 @@ class CenterPanel(QWidget):
         #   띄워야 사용자가 1~4주 훈련을 선택하기 전에 대표팀을 정한다.
         import intl_engine
         forced = intl_engine.get_forced_commit()
-        forced = intl_engine.get_forced_commit()
         if forced:
             # [타이밍] 1주차 화면 먼저 갱신 후 팝업 표시
             if self.main_win:
@@ -879,6 +928,16 @@ class CenterPanel(QWidget):
 
         if self.main_win:
             self.main_win.refresh_all()
+
+    def _on_advance_failed(self, msg):
+        from PyQt6.QtWidgets import QApplication
+        QApplication.restoreOverrideCursor()
+        self.adv_btn.setEnabled(True)
+        if self.main_win:
+            self.main_win.setEnabled(True)
+        QMessageBox.critical(self, "진행 중 오류",
+                              f"시즌/주차 진행 중 오류가 발생했습니다:\n{msg}")
+
 
     def _get_match(self, week, p):
         tid = p.get("current_team_id", 0)

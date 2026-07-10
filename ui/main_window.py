@@ -375,6 +375,14 @@ class MainWindow(QMainWindow):
         self.showMaximized()
 
     def closeEvent(self, event):
+        # [최적화] 인메모리 라이브 DB를 쓰는 경우, 앱 종료 시 마지막으로
+        # 한 번 더 game.db에 백업해서 마지막 자동저장(4주 주기) 이후 진행분이
+        # 유실되지 않게 한다.
+        try:
+            from database import flush_to_disk
+            flush_to_disk()
+        except Exception:
+            pass
         event.accept()
 
 

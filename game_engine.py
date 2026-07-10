@@ -973,6 +973,13 @@ def advance_4weeks(schedule: list):
         # ── 월급: 4의 배수 주차(= 한 달의 마지막 주)에서만 ──
         if week % 4 == 0:
             _pay_salary(p_latest, week)
+            # [최적화] 인메모리 라이브 DB 자동저장. 월급 지급과 같은 주기(한 달에 1회)로
+            # 얹어서, 앱이 비정상 종료돼도 최대 4주치만 손실되게 한다.
+            try:
+                from database import flush_to_disk
+                flush_to_disk()
+            except Exception:
+                pass
 
         _advance_week(p_latest, week, 1)
 
@@ -3147,20 +3154,24 @@ def generate_season_schedule(league_id, season, year, force=False):
     conn = get_conn()
     c = conn.cursor()
 
-    c.execute("SELECT id FROM teams WHERE league_id=? LIMIT 8", (league_id,))
+    c.execute("SELECT id FROM teams WHERE league_id=?", (league_id,))
     tids = [r["id"] for r in c.fetchall()]
     if len(tids) < 2:
         conn.close(); return
 
-    # [중복 생성 방지] 그 시즌 일정이 이미 충분히 생성돼 있으면(상·하반기 14라운드분)
+    # 팀 수에 맞는 라운드로빈 구성 (8팀 고정 → n팀 일반화)
+    rounds = generate_round_robin(len(tids))
+    expected_matches = len(tids) * (len(tids) - 1)  # 더블 라운드로빈 총 경기 수
+
+    # [중복 생성 방지] 그 시즌 일정이 이미 충분히 생성돼 있으면(상·하반기분)
     #   다시 만들지 않는다. 승강 등으로 teams 구성이 바뀐 뒤 재호출되면 옛 일정과
     #   새 대진이 섞여 '어떤 팀 3경기 / 어떤 팀 0경기'가 되는 것을 막는다.
     if not force:
         n_existing = c.execute(
             "SELECT COUNT(*) AS c FROM match_results WHERE league_id=? AND season=?",
             (league_id, season)).fetchone()["c"]
-        # 8팀 풀리그 = 라운드당 4경기 × 14라운드 = 56경기. 8할 이상 차 있으면 완비로 간주.
-        if n_existing >= 56 * 0.8:
+        # 더블 라운드로빈 총 경기 수의 8할 이상 차 있으면 완비로 간주.
+        if n_existing >= expected_matches * 0.8:
             conn.close(); return
 
     # 이미 완료된 경기 주차
@@ -3183,7 +3194,7 @@ def generate_season_schedule(league_id, season, year, force=False):
 
     new_rows = []  # (league_id,week,home_team_id,away_team_id,season,year) - executemany 배치용
 
-    for rd, matches in enumerate(ROUND_MATCHES):
+    for rd, matches in enumerate(rounds):
         week = FIRST_HALF_START + rd
         if week in played_weeks: continue
         for hi, ai in matches:
@@ -3197,7 +3208,7 @@ def generate_season_schedule(league_id, season, year, force=False):
             existing_matches.add(key)
             existing_matches.add(rkey)
 
-    for rd, matches in enumerate(ROUND_MATCHES):
+    for rd, matches in enumerate(rounds):
         week = SECOND_HALF_START + rd
         if week in played_weeks: continue
         for hi, ai in matches:
@@ -4703,12 +4714,11 @@ def _generate_all_league_schedules(season: int, year: int):
     conn = get_conn()
     c = conn.cursor()
 
-    # 1) 리그별 팀 목록(최대 8팀) 한 번에 조회
+    # 1) 리그별 팀 목록(팀 수 상한 없음 — 8팀 고정 캡 제거) 한 번에 조회
     teams_by_league: dict = {}
     for r in c.execute("SELECT id, league_id FROM teams ORDER BY league_id, id"):
         lst = teams_by_league.setdefault(r["league_id"], [])
-        if len(lst) < 8:
-            lst.append(r["id"])
+        lst.append(r["id"])
 
     if not teams_by_league:
         conn.commit()
@@ -4723,9 +4733,11 @@ def _generate_all_league_schedules(season: int, year: int):
             (season,)).fetchall()
     }
 
+    # 리그별 팀 수에 맞는 더블 라운드로빈 총 경기 수(n*(n-1))를 완비 판정 기준으로 사용.
+    # 8팀 고정 56경기 가정을 제거해 팀 수가 리그마다 달라도 정확히 동작한다.
     need_league_ids = [
         lid for lid, tids in teams_by_league.items()
-        if len(tids) >= 2 and sched_counts.get(lid, 0) < 56 * 0.8
+        if len(tids) >= 2 and sched_counts.get(lid, 0) < len(tids) * (len(tids) - 1) * 0.8
     ]
     if not need_league_ids:
         conn.commit()
@@ -4747,8 +4759,9 @@ def _generate_all_league_schedules(season: int, year: int):
     for lid in need_league_ids:
         tids = teams_by_league[lid]
         existing_matches = existing_by_league.get(lid, set())
+        rounds = generate_round_robin(len(tids))  # 리그별 팀 수에 맞는 라운드 구성
 
-        for rd, matches in enumerate(ROUND_MATCHES):
+        for rd, matches in enumerate(rounds):
             week = FIRST_HALF_START + rd
             for hi, ai in matches:
                 if hi >= len(tids) or ai >= len(tids):
@@ -4760,7 +4773,7 @@ def _generate_all_league_schedules(season: int, year: int):
                 new_rows.append((lid, week, t1, t2, season, year))
                 existing_matches.add(key); existing_matches.add(rkey)
 
-        for rd, matches in enumerate(ROUND_MATCHES):
+        for rd, matches in enumerate(rounds):
             week = SECOND_HALF_START + rd
             first_half_week = FIRST_HALF_START + rd
             for hi, ai in matches:
@@ -6122,7 +6135,7 @@ def _generate_first_half_schedule(league_id, season, year):
     conn = get_conn()
     c = conn.cursor()
 
-    c.execute("SELECT id FROM teams WHERE league_id=? LIMIT 8", (league_id,))
+    c.execute("SELECT id FROM teams WHERE league_id=?", (league_id,))
     tids = [r["id"] for r in c.fetchall()]
     if len(tids) < 2:
         conn.close(); return
@@ -6135,8 +6148,9 @@ def _generate_first_half_schedule(league_id, season, year):
         existing.add((w, h, a))
         existing.add((w, a, h))  # 역방향도 등록
 
+    rounds = generate_round_robin(len(tids))  # 팀 수에 맞는 라운드 구성 (8팀 고정 제거)
     new_rows = []
-    for rd, matches in enumerate(ROUND_MATCHES):
+    for rd, matches in enumerate(rounds):
         week = FIRST_HALF_START + rd
         for hi, ai in matches:
             if hi >= len(tids) or ai >= len(tids): continue

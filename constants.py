@@ -27,6 +27,36 @@ ROUND_MATCHES = [
 FIRST_HALF_START  = 5
 SECOND_HALF_START = 29
 
+# ── 팀 수 무관 라운드로빈 대진표 생성기 (원형법 / circle method) ──────────
+# ROUND_MATCHES는 8팀 전용 고정 테이블이었으나, 리그당 팀 수가 8이 아닌
+# 경우(향후 20팀 이상 확장 등)에도 동작하도록 일반화한 버전.
+# n(팀 수)이 짝수면 n-1라운드 × n/2경기, 홀수면 n라운드 × (n-1)/2경기(매 라운드 1팀 부전승).
+# 반환값은 ROUND_MATCHES와 동일한 형식: [[(idx_a, idx_b), ...], ...] (0-based 팀 인덱스)
+#
+# 상/하반기 라운드 수가 팀 수에 따라 달라지므로, FIRST_HALF_START(5)~SECOND_HALF_START(29)
+# 사이 24주 안에 들어가려면 n-1 <= 24, 즉 팀 수 25까지는 현재 52주 캘린더 구조를
+# 그대로 써도 안전하다. 그 이상(진짜 일 단위 캘린더 등)은 별도의 주차/일자 체계 재설계가 필요.
+def generate_round_robin(n: int):
+    """n팀에 대한 더블 라운드로빈의 '상반기(편도)' 라운드 구성을 생성.
+    n < 2 면 빈 리스트 반환."""
+    if n < 2:
+        return []
+    teams = list(range(n))
+    bye = None
+    if n % 2 == 1:
+        teams.append(bye)  # 부전승 자리
+    m = len(teams)
+    rounds = []
+    for _ in range(m - 1):
+        pairs = []
+        for i in range(m // 2):
+            a, b = teams[i], teams[m - 1 - i]
+            if a is not bye and b is not bye:
+                pairs.append((a, b))
+        rounds.append(pairs)
+        teams = [teams[0]] + [teams[-1]] + teams[1:-1]  # 첫 팀 고정, 나머지 회전
+    return rounds
+
 # 오퍼(이적시장) 구간: 겨울(대회 전/후) + 여름(시즌 후)
 OFFER_ZONES = [(1,4),(13,16),(25,28),(37,40),(45,48)]
 

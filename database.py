@@ -8,6 +8,29 @@ from data.names import NAME_DATA
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "game.db")
 
+# ── [최적화] 인메모리 라이브 DB + 디스크 백업 ──────────────────────
+# 실측 결과, 게임 진행 중(주간 tick·시즌종료 등)의 SQLite 비용 대부분이
+# "매 commit마다 디스크에 fsync"하는 데서 나왔다(디스크 대비 인메모리가
+# 주간 tick 2.5~3배, 팀 수를 늘린 시나리오에서는 절감폭이 더 커짐).
+# 그래서 실행 중엔 인메모리 DB(SQLite 공유캐시 :memory:)를 실제 라이브 DB로
+# 쓰고, DB_PATH(game.db)는 "세이브 파일"로만 쓴다.
+#   - 시작 시: game.db가 있으면 그 내용을 인메모리로 복사(load_from_disk)
+#   - 진행 중: 4주(한 달)마다 자동저장으로 인메모리 → game.db 백업(flush_to_disk)
+#   - 종료 시: main_window closeEvent에서 마지막으로 한 번 더 flush_to_disk
+# 문제가 생기면 아래 플래그 하나만 False로 내리면 기존 "디스크 파일 직결" 방식으로
+# 즉시 되돌아간다(그 외 코드/쿼리는 전부 그대로 재사용됨).
+USE_MEMORY_DB = True
+_MEM_URI = "file:footballsim_live_db?mode=memory&cache=shared"
+# 공유캐시 인메모리 DB는 "열려있는 커넥션이 0개가 되는 순간" 통째로 사라진다.
+# 그래서 앱 생명주기 내내 살아있는 앵커 커넥션을 하나 별도로 붙잡아둔다
+# (풀 커넥션이 reset_conn_pool() 등으로 닫혔다 다시 열려도 데이터가 안 날아가게).
+_mem_anchor = None
+
+def _ensure_mem_anchor():
+    global _mem_anchor
+    if USE_MEMORY_DB and _mem_anchor is None:
+        _mem_anchor = sqlite3.connect(_MEM_URI, uri=True, timeout=30)
+
 # ── 커넥션 풀(단일 영속 커넥션 재사용) ────────────────────────────
 # 이 게임은 단일 스레드(UI 메인 스레드)에서만 DB를 쓰고, 커넥션을 함수 밖으로
 # 넘기지 않는다(모두 함수 내부에서 열고 닫음). 따라서 매 get_conn()마다
@@ -37,12 +60,31 @@ class _PooledConn:
         return False
 
 def _new_raw_conn():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    if USE_MEMORY_DB:
+        _ensure_mem_anchor()
+        # [백그라운드 처리 대비] check_same_thread=False: 시즌 전환처럼 무거운
+        # 처리를 UI 메인 스레드가 아닌 QThread 워커에서 돌리기 위해 필요.
+        # SQLite 자체는 (기본 빌드 기준) 스레드 간 커넥션 공유가 안전하지만,
+        # 파이썬 sqlite3 모듈이 기본적으로 이를 막아둔 것뿐이라 이 플래그로 해제한다.
+        # [전제] 이 앱은 '한 번에 한 스레드만 쓴다'(워커가 도는 동안 메인 스레드는
+        # 진행 버튼이 비활성화돼 DB에 접근하지 않음) — 진짜 동시 쓰기는 없음을
+        # UI 쪽에서 보장해야 한다. 여러 스레드가 동시에 write 하면 안전하지 않다.
+        conn = sqlite3.connect(_MEM_URI, uri=True, timeout=30, check_same_thread=False)
+    else:
+        conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     # synchronous=NORMAL 은 연결별 설정. WAL(영구 설정)과 함께 매 commit fsync를
     # 생략해 commit 비용을 크게 줄인다. WAL+NORMAL 은 SQLite 공식 권장 조합.
+    # (인메모리 DB는 애초에 디스크 fsync 자체가 없어 이 설정이 사실상 no-op이지만
+    #  디스크 모드로 되돌렸을 때도 그대로 맞게 유지해둔다.)
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA synchronous=NORMAL")
+    # [스케일 대비] 팀/경기 수가 늘어나도(20팀+ 리그, 일 단위 일정 등) 페이지 캐시를
+    # 넉넉히 잡아 디스크 I/O를 줄인다. 파일 포맷과 무관한 연결별 설정이라 안전하게
+    # 언제든 조절 가능. mmap은 읽기 위주 쿼리(리그 브라우저, 역대 기록 등)에 유리.
+    conn.execute("PRAGMA cache_size=-16000")   # 약 16MB 페이지 캐시 (기본 -2000의 8배)
+    conn.execute("PRAGMA temp_store=MEMORY")   # 정렬/임시 테이블을 메모리에서 처리
+    conn.execute("PRAGMA mmap_size=134217728") # 128MB mmap I/O
     return conn
 
 def get_conn():
@@ -52,7 +94,10 @@ def get_conn():
     return _pool_conn
 
 def reset_conn_pool():
-    """DB 파일이 교체되는 경우(세이브 로드/삭제 등) 풀 커넥션을 폐기."""
+    """DB 파일이 교체되는 경우(세이브 로드/삭제 등) 풀 커넥션을 폐기.
+    [주의] 인메모리 모드에선 이걸 호출해도 _mem_anchor가 살아있는 한
+    데이터는 사라지지 않는다(풀 커넥션만 새로 열릴 뿐, 공유캐시라 같은
+    인메모리 DB를 다시 가리킨다)."""
     global _pool_conn
     if _pool_conn is not None:
         try:
@@ -61,9 +106,50 @@ def reset_conn_pool():
             pass
         _pool_conn = None
 
+def load_from_disk() -> bool:
+    """게임 시작 시 1회: DB_PATH(game.db)에 기존 세이브가 있으면 그 내용을
+    라이브 인메모리 DB로 통째로 복사한다(SQLite backup API 사용).
+    세이브 파일이 없으면(첫 실행) 아무 것도 안 하고 False를 반환 —
+    이 경우 init_db()가 빈 인메모리 DB에 새 스키마를 만든다.
+    디스크 직결 모드(USE_MEMORY_DB=False)에서는 항상 False(불필요)."""
+    if not USE_MEMORY_DB or not os.path.exists(DB_PATH):
+        return False
+    _ensure_mem_anchor()
+    src = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        dst_pooled = get_conn()
+        dst_real = object.__getattribute__(dst_pooled, "_real")
+        src.backup(dst_real)   # game.db → 인메모리로 전체 복사
+        return True
+    finally:
+        src.close()
+
+def flush_to_disk():
+    """라이브 인메모리 DB 내용을 game.db 파일로 백업한다(자동저장·종료 시 호출).
+    임시파일에 먼저 백업한 뒤 os.replace로 원자적 치환 — 백업 도중 앱이
+    죽어도 기존 세이브 파일은 손상되지 않는다.
+    디스크 직결 모드에서는 이미 매 commit이 곧 저장이므로 아무 것도 안 함."""
+    if not USE_MEMORY_DB:
+        return
+    src_pooled = get_conn()
+    src_real = object.__getattribute__(src_pooled, "_real")
+    tmp_path = DB_PATH + ".tmp"
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+    dst = sqlite3.connect(tmp_path, timeout=30)
+    try:
+        src_real.backup(dst)
+    finally:
+        dst.close()
+    os.replace(tmp_path, DB_PATH)
+
 # ─── 스키마 ───────────────────────────────────────────────────
 def init_db():
     from constants import GAME_START_YEAR, PLAYER_START_AGE
+    # [최적화] 인메모리 모드: 기존 세이브(game.db)가 있으면 먼저 인메모리로
+    # 통째로 복사해온다. 그 뒤 CREATE TABLE IF NOT EXISTS들은 전부 멱등이라
+    # 이미 로드된 데이터를 건드리지 않고 안전하게 지나간다.
+    load_from_disk()
     conn = get_conn(); c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS countries(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -456,6 +542,24 @@ def init_db():
         try: c.execute(migration)
         except: pass
 
+    # ── [버그수정] ai_players 스냅샷 테이블 (새 게임 리셋용) ──────────────
+    # reset_game_data()가 teams(리그/tier)는 원본으로 되돌리면서 ai_players는
+    # 안 건드려서, "새 게임"을 눌러도 이전 플레이에서 은퇴/성장으로 변형된
+    # AI선수 5.9만 명이 그대로 남는 문제가 있었다(teams.league_id 리셋 안 되던
+    # 버그와 같은 유형 — 리셋 함수가 "일부만" 리셋). 최초 시딩 직후 상태를
+    # ai_players_seed에 스냅샷해두고, 새 게임 시 거기서 벌크 복원한다
+    # (재생성 대신 순수 테이블 복사라 개별 INSERT/RANDOM() 쿼리 비용이 없음).
+    # ai_players에 나중에 컬럼이 추가되는 마이그레이션이 있을 수 있으므로,
+    # ai_players_seed는 고정 스키마로 안 박고 매번 ai_players 컬럼 구성에
+    # 맞춰 동적으로 동기화한다.
+    c.execute("CREATE TABLE IF NOT EXISTS ai_players_seed(id INTEGER PRIMARY KEY)")
+    ai_cols = [r["name"] for r in c.execute("PRAGMA table_info(ai_players)").fetchall()]
+    seed_cols = {r["name"] for r in c.execute("PRAGMA table_info(ai_players_seed)").fetchall()}
+    for col in ai_cols:
+        if col not in seed_cols:
+            try: c.execute(f"ALTER TABLE ai_players_seed ADD COLUMN {col}")
+            except: pass
+
     # [전성기 OVR 보정] 기존 세이브는 peak_ovr 컬럼이 방금 0으로 추가됐거나,
     #  아직 한 번도 update_player(ovr=...)가 안 불려서 현재 ovr보다 낮을 수 있다.
     #  현재 ovr을 하한으로 보정 (peak_ovr < ovr 인 경우만) — 매 시작마다 실행되지만
@@ -489,14 +593,16 @@ def init_db():
         try: c.execute(idx)
         except: pass
 
-    conn.commit(); conn.close()
-    # WAL 모드는 DB 파일에 영구 저장되는 설정. 여기서 1회만 보장하면
-    # 이후 get_conn() 들은 매번 PRAGMA 를 실행할 필요가 없다.
-    _conn = sqlite3.connect(DB_PATH, timeout=30)
-    _conn.execute("PRAGMA journal_mode=WAL")
-    _conn.close()
-    # WAL을 켠 뒤 풀 커넥션을 새로 만들게 리셋(이전 풀 커넥션은 WAL 인식 전일 수 있음).
-    reset_conn_pool()
+    conn.commit()
+    if not USE_MEMORY_DB:
+        # WAL 모드는 DB 파일에 영구 저장되는 설정(디스크 직결 모드에서만 의미 있음).
+        # 인메모리 DB는 애초에 디스크 파일이 아니라 WAL 저널이 필요 없어 스킵한다.
+        conn.close()
+        _conn = sqlite3.connect(DB_PATH, timeout=30)
+        _conn.execute("PRAGMA journal_mode=WAL")
+        _conn.close()
+        # WAL을 켠 뒤 풀 커넥션을 새로 만들게 리셋(이전 풀 커넥션은 WAL 인식 전일 수 있음).
+        reset_conn_pool()
     remap_all_ovr()   # calc_ovr 정규화에 맞춰 기존 AI OVR 일괄 재계산 (1회성)
     migrate_money_to_thousand()   # 금액 단위 만원→천원 전환 (1회성)
 
@@ -573,6 +679,14 @@ def seed_initial_data():
     _insert_leagues_and_teams(c)
     _insert_player_names(c)
     _generate_all_ai_players(c)
+    # [버그수정] 최초 시딩 직후(변형되기 전) ai_players 상태를 스냅샷으로 보관.
+    # reset_game_data()가 이걸로 벌크 복원한다 — teams가 LEAGUE_DATA 원본으로
+    # 결정론적으로 돌아가는 것과 동일하게, 선수단도 "최초 시딩 상태로 결정론적
+    # 복귀"가 되도록 통일.
+    ai_cols = [r["name"] for r in c.execute("PRAGMA table_info(ai_players)").fetchall()]
+    col_list = ", ".join(ai_cols)
+    c.execute(f"DELETE FROM ai_players_seed")
+    c.execute(f"INSERT INTO ai_players_seed({col_list}) SELECT {col_list} FROM ai_players")
     c.execute("INSERT INTO meta VALUES('seeded','1')")
     conn.commit(); conn.close()
     print("완료")
@@ -614,6 +728,26 @@ def _reset_teams_to_league_data(c):
     c.executemany("UPDATE teams SET league_id=?, current_tier=? WHERE id=?", updates)
 
 
+def _reset_ai_players_from_seed(c):
+    """[버그수정] '새 게임' 시 ai_players를 최초 시딩 상태로 벌크 복원.
+    개별 재생성(_generate_all_ai_players, 5.9만 명 개별 INSERT + 팀당
+    RANDOM() 조회) 대신, 미리 떠둔 스냅샷을 DELETE+INSERT SELECT 두 문장으로
+    복사만 한다 — 랜덤 재계산이 없어 사실상 즉시 끝난다(인메모리 DB라 더더욱).
+    [구버전 세이브 폴백] ai_players_seed가 비어있으면(이 패치 이전에 만든
+    세이브 — 스냅샷을 못 떠둔 상태) 복원할 데이터가 없으므로, 지금의
+    ai_players 상태를 그대로 시드로 확정해둔다. 그 판의 '새 게임'은
+    1회에 한해 기존 동작(리셋 안 됨)과 같지만, 그 다음 '새 게임'부터는
+    정상적으로 이번에 확정된 시드로 복원된다."""
+    seed_cnt = c.execute("SELECT COUNT(*) c FROM ai_players_seed").fetchone()["c"]
+    ai_cols = [r["name"] for r in c.execute("PRAGMA table_info(ai_players)").fetchall()]
+    col_list = ", ".join(ai_cols)
+    if seed_cnt == 0:
+        c.execute(f"INSERT INTO ai_players_seed({col_list}) SELECT {col_list} FROM ai_players")
+        return
+    c.execute("DELETE FROM ai_players")
+    c.execute(f"INSERT INTO ai_players({col_list}) SELECT {col_list} FROM ai_players_seed")
+
+
 def reset_game_data():
     init_db()  # 마이그레이션 적용
     conn = get_conn(); c = conn.cursor()
@@ -624,6 +758,7 @@ def reset_game_data():
         c.execute(f"DELETE FROM {t}")
     c.execute("UPDATE teams SET wins=0,draws=0,losses=0,goals_for=0,goals_against=0")
     _reset_teams_to_league_data(c)
+    _reset_ai_players_from_seed(c)
     conn.commit(); conn.close()
 
 # ─── OVR 가중치 ───────────────────────────────────────────────
