@@ -139,25 +139,60 @@ def _gk_quality(gk):
             + gk.get("jump", 50) * 0.2)
 
 
+# [2026-07 신설] 포지션별 boost(캐리 보너스) 채널 분배. 예전엔 포지션 구분
+# 없이 모든 포지션이 공격 0.6/수비 0.15/중원 0.5/GK 0.1로 똑같이 받아서,
+# 골키퍼가 아무리 OVR이 높아도 보너스의 90%가 공격·중원(본인이 관여 안 함)
+# 으로 새고 정작 세이브 능력(gk_q)엔 10%만 반영되는 문제가 있었다(사용자
+# 실측: OVR92 골키퍼가 팀평균 30후반 리그에서 전혀 안 먹힘). 이제 그
+# 포지션이 실제로 경기에 관여하는 영역에 보너스가 집중되도록 나눈다.
+# 각 값은 서로 다른 채널에 독립적으로 곱해지는 계수라 합이 1일 필요는
+# 없다(기존 방식과 동일한 구조) — 다만 그 포지션의 실제 영향력 분포를
+# 반영해 채널별 비중을 다르게 뒀다.
+POSITION_BOOST_WEIGHTS = {
+    "GK":  {"att": 0.00, "dfn": 0.15, "mid": 0.00, "gk": 0.90},
+    "CB":  {"att": 0.05, "dfn": 0.80, "mid": 0.15, "gk": 0.00},
+    "LB":  {"att": 0.15, "dfn": 0.65, "mid": 0.25, "gk": 0.00},
+    "RB":  {"att": 0.15, "dfn": 0.65, "mid": 0.25, "gk": 0.00},
+    "LWB": {"att": 0.25, "dfn": 0.55, "mid": 0.30, "gk": 0.00},
+    "RWB": {"att": 0.25, "dfn": 0.55, "mid": 0.30, "gk": 0.00},
+    "CDM": {"att": 0.10, "dfn": 0.35, "mid": 0.55, "gk": 0.00},
+    "CM":  {"att": 0.25, "dfn": 0.15, "mid": 0.65, "gk": 0.00},
+    "CAM": {"att": 0.45, "dfn": 0.05, "mid": 0.50, "gk": 0.00},
+    "LM":  {"att": 0.35, "dfn": 0.15, "mid": 0.55, "gk": 0.00},
+    "RM":  {"att": 0.35, "dfn": 0.15, "mid": 0.55, "gk": 0.00},
+    "LW":  {"att": 0.70, "dfn": 0.05, "mid": 0.30, "gk": 0.00},
+    "RW":  {"att": 0.70, "dfn": 0.05, "mid": 0.30, "gk": 0.00},
+    "CF":  {"att": 0.85, "dfn": 0.00, "mid": 0.20, "gk": 0.00},
+    "ST":  {"att": 0.85, "dfn": 0.00, "mid": 0.20, "gk": 0.00},
+}
+# 포지션을 모르거나 표에 없을 때 쓰는 폴백 — 기존(2026-07 이전) 분배값 그대로.
+_DEFAULT_BOOST_WEIGHTS = {"att": 0.6, "dfn": 0.15, "mid": 0.5, "gk": 0.1}
+
+
+def _boost_weights_for(position):
+    return POSITION_BOOST_WEIGHTS.get(position, _DEFAULT_BOOST_WEIGHTS)
+
+
 class _TeamModel:
     """한 팀의 레인별 공격/수비 퀄리티 + 중원 퀄리티 + GK 퀄리티를 미리
     계산해 담아두는 그릇. boost는 '내 에이스가 팀을 끌어올리는 효과'를
     수비/공격/중원 전역에 고르게 얹기 위한 값(game_engine._simulate_match가
     이미 계산해둔 bonus를 그대로 받는다)."""
 
-    def __init__(self, lineup, is_home, boost=0.0):
+    def __init__(self, lineup, is_home, boost=0.0, boost_position=None):
         zoned = _assign_zones(lineup, is_home)
         self.gk = next((z["player"] for z in zoned if z["pos"] == "GK"), None)
+        w = _boost_weights_for(boost_position) if boost else _DEFAULT_BOOST_WEIGHTS
         self.att = {}
         self.dfn = {}
         for ln in LANES:
             att_players = [z["player"] for z in zoned if z["lane"] == ln and z["third"] == "ATT"]
             def_players = [z["player"] for z in zoned if z["lane"] == ln and z["third"] == "DEF"]
-            self.att[ln] = _attack_quality(att_players) + boost * 0.6
-            self.dfn[ln] = _defense_quality(def_players) + boost * 0.15
+            self.att[ln] = _attack_quality(att_players) + boost * w["att"]
+            self.dfn[ln] = _defense_quality(def_players) + boost * w["dfn"]
         mid_players = [z["player"] for z in zoned if z["third"] == "MID"]
-        self.mid = _midfield_quality(mid_players) + boost * 0.5
-        self.gk_q = _gk_quality(self.gk) + boost * 0.1
+        self.mid = _midfield_quality(mid_players) + boost * w["mid"]
+        self.gk_q = _gk_quality(self.gk) + boost * w["gk"]
 
 
 def _resolve_shot(rng, side, lane, minute, shooter_pool, opp_gk_q, home_stats, away_stats, plog):
@@ -192,6 +227,7 @@ def _resolve_shot(rng, side, lane, minute, shooter_pool, opp_gk_q, home_stats, a
 
 
 def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost=0.0,
+                             home_boost_position=None, away_boost_position=None,
                              home_adv=3.0, seed=None):
     """포메이션 매치업을 실제로 계산해서 90분(+추가시간) 경기를 시뮬레이션한다.
 
@@ -200,6 +236,11 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
             (match_sim.match_flow._select_lineup()의 반환값 그대로 넣으면 됨).
             None 슬롯 허용(그 자리는 그냥 빈 것으로 취급).
         home_boost/away_boost: 그 팀에 얹을 전역 보정(내 에이스 효과 등).
+        home_boost_position/away_boost_position: [2026-07 신설] 그 보정을
+            받는 선수(=나)의 포지션. POSITION_BOOST_WEIGHTS로 보정이 실제
+            그 포지션이 영향력을 행사하는 채널(공격/수비/중원/GK)에 집중
+            되도록 분배한다. None이면 기존 방식(포지션 무관 균등 분배)으로
+            폴백.
         home_adv: 홈 이점(중원 퀄리티에 가산).
         seed: 지정하면 결정론적 재현.
 
@@ -214,8 +255,8 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
     """
     rng = random.Random(seed) if seed is not None else random
 
-    home = _TeamModel(home_lineup, True, boost=home_boost)
-    away = _TeamModel(away_lineup, False, boost=away_boost)
+    home = _TeamModel(home_lineup, True, boost=home_boost, boost_position=home_boost_position)
+    away = _TeamModel(away_lineup, False, boost=away_boost, boost_position=away_boost_position)
 
     # [신규 — 경기 당일 컨디션] 매 분마다 실력 평균으로 수렴하는 구조라,
     # 분 단위 시뮬레이션만으로는 실제 축구의 "약팀이 어쩌다 강팀을 잡는"
@@ -405,7 +446,9 @@ def merge_personal_events(plog, personal_events, my_side):
 
 
 def simulate_my_match(home_team_id, away_team_id, home_formation, away_formation,
-                       home_boost=0.0, away_boost=0.0, home_adv=3.0, seed=None):
+                       home_boost=0.0, away_boost=0.0,
+                       home_boost_position=None, away_boost_position=None,
+                       home_adv=3.0, seed=None):
     """team_id 두 개만 받아서 로스터/포메이션 조회부터 시뮬레이션까지 전부
     처리하는 편의 함수. game_engine._simulate_match에서 이걸 하나만 호출하면
     된다."""
@@ -414,4 +457,7 @@ def simulate_my_match(home_team_id, away_team_id, home_formation, away_formation
     home_lineup = _select_lineup(home_team_id, home_formation)
     away_lineup = _select_lineup(away_team_id, away_formation)
     return simulate_tactical_match(home_lineup, away_lineup, home_boost=home_boost,
-                                    away_boost=away_boost, home_adv=home_adv, seed=seed)
+                                    away_boost=away_boost,
+                                    home_boost_position=home_boost_position,
+                                    away_boost_position=away_boost_position,
+                                    home_adv=home_adv, seed=seed)

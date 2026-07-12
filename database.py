@@ -1,12 +1,30 @@
 """
 database.py - 전체 SQLite 기반. JSON 없음.
 """
-import sqlite3, os, random
+import sqlite3, os, sys, random, time, threading
 from data.countries import COUNTRY_DATA
 from data.leagues import LEAGUE_DATA
 from data.names import NAME_DATA
+# [버그수정 2026-07] OVR_RANGES가 database.py와 constants.py에 각각 따로
+# 정의돼 있었고 값도 서로 어긋나 있었다(예: S등급 tier1이 database=88~95,
+# constants=85~96로 서로 다름). 게다가 둘 다 SS/S의 5부·6부가 빠져 있어서,
+# 새로 추가한 부수의 선수 OVR이 엉뚱하게(예: 6부인데 1부와 비슷한 수치로)
+# 생성되는 버그로 이어졌다. constants.py를 유일한 원본으로 삼아 여기서는
+# 그대로 가져다 쓴다 — 더 이상 두 곳을 따로 수정할 필요가 없다.
+from constants import OVR_RANGES
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "game.db")
+# [PyInstaller 대응] __file__ 기준 경로는 패키징 후 문제가 된다:
+#   - onefile: __file__이 실행마다 새로 생기는 임시폴더(sys._MEIPASS)를 가리켜서,
+#     거기 저장한 game.db가 앱 종료 시 임시폴더와 함께 삭제됨 → "저장 안 됨".
+#   - onedir: __file__이 설치 폴더(Program Files 등)를 가리켜서 쓰기 권한이 없을 수 있음.
+# sys.frozen이면 실행 파일(exe) 옆 폴더를 쓴다 — onefile/onedir 모두 exe 위치는
+# 영구적이고 보통 쓰기 가능한 위치(사용자가 압축 푼 폴더 등)이기 때문.
+if getattr(sys, "frozen", False):
+    _APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    _APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DB_PATH = os.path.join(_APP_DIR, "game.db")
 
 # ── [최적화] 인메모리 라이브 DB + 디스크 백업 ──────────────────────
 # 실측 결과, 게임 진행 중(주간 tick·시즌종료 등)의 SQLite 비용 대부분이
@@ -41,14 +59,136 @@ def _ensure_mem_anchor():
 #   - commit/execute/cursor 등은 실제 커넥션에 그대로 위임된다.
 _pool_conn = None
 
+# [2026-07 버그 수정, 3차] "not an error" / "cannot commit - no transaction is
+# active" 크래시가 계속 재발했다. 1차 수정(flush_to_disk 커밋 흡수), 2차
+# 수정(flush_to_disk를 별도 스냅샷 커넥션으로 분리)까지 했는데도 계속
+# 나는 걸 보면, 원인이 backup() 하나가 아니라 더 근본적이다 — 이 게임은
+# 무거운 처리(시즌 전환 등)를 QThread 워커에서 돌리고, UI 쪽에서
+# "워커가 도는 동안 메인 스레드는 DB를 안 건드린다"는 규칙을 지키려고
+# 팝업 타이머 몇 개를 수동으로 멈추는 식으로 방어해왔다 — 근데 그 목록에
+# 없는 타이머/콜백이 하나라도 있으면(혹은 앞으로 새로 추가되면) 그 순간
+# 풀 커넥션에 진짜 동시 접근이 생기고, 파이썬 sqlite3 모듈의 암묵적
+# 트랜잭션 추적이 두 스레드 사이에서 꼬여버린다.
+# 게다가 기존 래퍼는 close()만 감쌌지 cursor()는 진짜 커넥션의 원본
+# Cursor를 그대로 반환했다 — 이 코드베이스 전역에서 흔히 쓰는
+# "c = conn.cursor(); c.execute(...)" 패턴은 그 원본 커서로 바로
+# 들어가서, 커넥션 래퍼에 방어 로직을 아무리 추가해도 다 우회됐다.
+# 그래서 이번엔: (1) 커서도 래핑해서 우회를 막고, (2) execute/executemany/
+# commit 전부 "일시적 스레드 경합"으로 보이는 특정 오류 시그니처만 아주
+# 짧게 쉬었다 재시도하게 했다(진짜 다른 오류는 그대로 위로 올림 — 조용히
+# 삼키지 않음). 근본적으로 스레드 경합 자체를 원천 차단하는 게 아니라
+# '재발했을 때 자동으로 회복'하는 방어망이라, 위 UI 쪽 타이머 정지 로직은
+# 그대로 유지하는 게 맞다(이건 마지막 안전망).
+_TRANSIENT_SQLITE_ERRORS = ("not an error", "no transaction is active",
+                            "cannot start a transaction within a transaction")
+
+# [2026-07 버그 수정, 4차 — 근본 원인 차단] 지금까지의 3차례 수정은 전부
+# "재발했을 때 감지해서 재시도/흡수"하는 사후 대응이었다(위 3차 수정 설명
+# 참고). 그런데 사후 대응만으로는 UI 쪽에서 타이머를 하나라도 빠뜨리면
+# 다시 재발할 수 있는 구조였다 — 실제로 world_browser_window(세계기록실)의
+# 검색 디바운스 타이머가 이 방어 목록(center_panel._toggle_popup_timers)에서
+# 빠져 있었고, 워커 스레드가 advance_days()로 DB를 쓰는 동안 그 창이 열려
+# 있으면 검색창 타이핑 250ms 뒤 디바운스가 같은 풀 커넥션으로 SELECT를 던져
+# 정확히 이 크래시 시그니처("not an error" 등)를 재현할 수 있었다(별도로
+# 수정함). 근본 원인은 "풀 커넥션 하나(_pool_conn)를 두 스레드가 정말로
+# 동시에 건드릴 수 있다"는 사실 자체다 — check_same_thread=False는 파이썬이
+# 그 접근을 막지 않는다는 뜻일 뿐, 여러 스레드의 동시 호출을 자동으로
+# 직렬화해주는 게 아니다. 그래서 이 락(RLock) 하나로 풀 커넥션에 대한 모든
+# 진입점(execute/executemany/executescript/commit/cursor + fetch류)을 실제로
+# 상호배제한다 — "UI 쪽에서 실수로 안 막았다"는 전제에 기대지 않고, DB 계층
+# 자체가 스스로를 보호하게 한다. 두 스레드가 겹쳐도 이제 한쪽이 아주 짧게
+# 대기할 뿐 데이터는 항상 정확하다(경합 자체가 사라지므로, 위 재시도 로직은
+# 진짜 예외적인 상황에서만 쓰이는 마지막 안전망으로 남는다 — 그대로 유지).
+_pool_lock = threading.RLock()
+
+def _retry_sqlite_op(fn, *args, **kwargs):
+    last_err = None
+    for attempt in range(4):
+        try:
+            with _pool_lock:
+                return fn(*args, **kwargs)
+        except sqlite3.OperationalError as e:
+            msg = str(e)
+            if any(sig in msg for sig in _TRANSIENT_SQLITE_ERRORS):
+                last_err = e
+                time.sleep(0.03 * (attempt + 1))
+                continue
+            raise
+    raise last_err
+
+
+class _PooledCursor:
+    """sqlite3.Cursor 래퍼 — execute류에 재시도 방어를 건다.
+    conn.cursor()가 이 래퍼를 반환해야 위 방어가 실제로 적용된다
+    (원본 커서를 그대로 돌려주면 다 우회됨)."""
+    __slots__ = ("_real",)
+    def __init__(self, real):
+        object.__setattr__(self, "_real", real)
+    def execute(self, *a, **kw):
+        _retry_sqlite_op(object.__getattribute__(self, "_real").execute, *a, **kw)
+        return self
+    def executemany(self, *a, **kw):
+        _retry_sqlite_op(object.__getattribute__(self, "_real").executemany, *a, **kw)
+        return self
+    def executescript(self, *a, **kw):
+        _retry_sqlite_op(object.__getattribute__(self, "_real").executescript, *a, **kw)
+        return self
+    # [2026-07 4차 수정] execute()는 락을 걸어도, 그 뒤에 이어지는
+    # fetchone/fetchmany/fetchall(SELECT 결과를 실제로 SQLite에서 끌어오는
+    # 단계)이 락 밖에서 돌면 "execute 끝~fetch 시작" 사이의 틈으로 다른
+    # 스레드가 끼어들 수 있다. fetch류도 같은 락으로 감싸 그 틈을 없앤다.
+    def fetchone(self, *a, **kw):
+        with _pool_lock:
+            return object.__getattribute__(self, "_real").fetchone(*a, **kw)
+    def fetchmany(self, *a, **kw):
+        with _pool_lock:
+            return object.__getattribute__(self, "_real").fetchmany(*a, **kw)
+    def fetchall(self, *a, **kw):
+        with _pool_lock:
+            return object.__getattribute__(self, "_real").fetchall(*a, **kw)
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_real"), name)
+    def __iter__(self):
+        # 반복도 fetch와 같은 이유로 락 안에서 완전히 리스트로 뽑아둔 뒤 반환
+        # (지연 반복으로 락 밖에서 한 행씩 끌어오면 그 사이 다른 스레드가
+        #  같은 커넥션에 끼어들 여지가 생긴다).
+        with _pool_lock:
+            return iter(list(object.__getattribute__(self, "_real")))
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+
+
 class _PooledConn:
-    """sqlite3.Connection 래퍼. close()만 무력화하고 나머진 전부 위임."""
+    """sqlite3.Connection 래퍼. close()는 무력화(재사용), execute/executemany/
+    commit/cursor는 재시도 방어를 씌워서 위임."""
     __slots__ = ("_real",)
     def __init__(self, real):
         object.__setattr__(self, "_real", real)
     def close(self):
         # 풀 커넥션은 닫지 않는다(재사용). 트랜잭션 정리는 commit이 담당.
         pass
+    def cursor(self, *a, **kw):
+        real = object.__getattribute__(self, "_real")
+        real_c = _retry_sqlite_op(real.cursor, *a, **kw)
+        return _PooledCursor(real_c)
+    def execute(self, *a, **kw):
+        real = object.__getattribute__(self, "_real")
+        real_c = _retry_sqlite_op(real.execute, *a, **kw)
+        return _PooledCursor(real_c)
+    def executemany(self, *a, **kw):
+        real = object.__getattribute__(self, "_real")
+        real_c = _retry_sqlite_op(real.executemany, *a, **kw)
+        return _PooledCursor(real_c)
+    def commit(self):
+        real = object.__getattribute__(self, "_real")
+        try:
+            _retry_sqlite_op(real.commit)
+        except sqlite3.OperationalError as e:
+            if "no transaction is active" in str(e):
+                return  # 이미 커밋된 것과 같은 상태 — 조용히 통과(데이터 손실 아님)
+            raise
     def __getattr__(self, name):
         return getattr(object.__getattribute__(self, "_real"), name)
     def __setattr__(self, name, value):
@@ -128,19 +268,40 @@ def flush_to_disk():
     """라이브 인메모리 DB 내용을 game.db 파일로 백업한다(자동저장·종료 시 호출).
     임시파일에 먼저 백업한 뒤 os.replace로 원자적 치환 — 백업 도중 앱이
     죽어도 기존 세이브 파일은 손상되지 않는다.
-    디스크 직결 모드에서는 이미 매 commit이 곧 저장이므로 아무 것도 안 함."""
+    디스크 직결 모드에서는 이미 매 commit이 곧 저장이므로 아무 것도 안 함.
+
+    [2026-07 버그 수정, 2차] "cannot commit - no transaction is active" /
+    "not an error" 크래시가 반복됐다.
+    원인: _pool_conn은 앱 생명주기 내내 재사용되는 단일 실제 커넥션인데,
+    sqlite3.Connection.backup()을 그 커넥션 위에서 직접 호출하면 파이썬의
+    암묵적 트랜잭션 추적(BEGIN을 언제 실행했는지 기억하는 내부 상태)이
+    backup()의 C-레벨 API 경로를 거치면서 틀어졌다. 1차 수정(backup 직후
+    바로 commit해서 착각 상태를 지우는 방식)으로 commit() 크래시는
+    없앴지만, 그 다음 execute() 자체가 "not an error"로 터지는 변종이
+    또 나왔다 — 즉 이 커넥션을 backup()에 한 번이라도 관여시키는 이상
+    상태 오염 가능성 자체가 근본적으로 남아있었다.
+    진짜 수정: 애초에 게임 진행용 풀 커넥션(_pool_conn)을 backup()에
+    아예 관여시키지 않는다. 인메모리 DB가 공유 캐시 모드
+    (cache=shared)라서, 같은 URI로 새 커넥션을 하나 더 열면 그 커넥션도
+    똑같은 라이브 데이터를 그대로 볼 수 있다 — 그 '별도 스냅샷 커넥션'
+    으로만 backup()을 수행하고 끝나면 바로 닫아버리면, 게임 진행용
+    풀 커넥션의 트랜잭션 상태는 이 함수 실행 전후로 단 1비트도 안 바뀐다.
+    """
     if not USE_MEMORY_DB:
         return
-    src_pooled = get_conn()
-    src_real = object.__getattribute__(src_pooled, "_real")
+    _ensure_mem_anchor()
     tmp_path = DB_PATH + ".tmp"
     if os.path.exists(tmp_path):
         os.remove(tmp_path)
+    # 게임 진행용 풀 커넥션(_pool_conn)은 절대 안 건드린다 — 공유 캐시
+    # URI로 새 스냅샷 커넥션을 열어서 그걸로만 backup 하고 바로 닫는다.
+    src_snapshot = sqlite3.connect(_MEM_URI, uri=True, timeout=30)
     dst = sqlite3.connect(tmp_path, timeout=30)
     try:
-        src_real.backup(dst)
+        src_snapshot.backup(dst)
     finally:
         dst.close()
+        src_snapshot.close()
     os.replace(tmp_path, DB_PATH)
 
 # ─── 스키마 ───────────────────────────────────────────────────
@@ -339,6 +500,40 @@ def init_db():
         year INTEGER, competition TEXT, team_name TEXT, result TEXT,
         goals INTEGER DEFAULT 0, assists INTEGER DEFAULT 0,
         caps INTEGER DEFAULT 0, rating REAL DEFAULT 0)""")
+    # [2026-07 신설] 국내 컵대회(FA컵식) — 1~2부 팀 전부 참가하는 단판
+    # 토너먼트(무승부는 즉시 승부차기). 선수 소속 국가 하나에 대해서만
+    # 지연 생성한다(전 세계 100개국 넘는 나라마다 만들면 성능 부담이
+    # 크고 의미도 없음 — 챔스가 '내 대륙', 월드컵이 '내 국가대표'로
+    # 범위를 좁힌 것과 같은 원칙).
+    c.execute("""CREATE TABLE IF NOT EXISTS cup_tournaments(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        year INTEGER, country_id INTEGER, name TEXT,
+        status TEXT DEFAULT 'active',
+        total_rounds INTEGER DEFAULT 0,
+        round_counter INTEGER DEFAULT 0,
+        pending_tiers TEXT DEFAULT '',
+        winner_team_id INTEGER DEFAULT 0,
+        my_in INTEGER DEFAULT 0, my_result TEXT DEFAULT '',
+        my_team_id INTEGER DEFAULT 0)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS cup_entries(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tournament_id INTEGER, team_id INTEGER, team_name TEXT,
+        tier INTEGER, ovr REAL, alive INTEGER DEFAULT 1)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS cup_matches(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tournament_id INTEGER, round_name TEXT, round_idx INTEGER, week INTEGER,
+        home_team_id INTEGER, away_team_id INTEGER,
+        home_score INTEGER DEFAULT -1, away_score INTEGER DEFAULT -1,
+        pso_winner INTEGER DEFAULT 0, pso_score TEXT DEFAULT '',
+        is_my INTEGER DEFAULT 0, slot INTEGER DEFAULT 0,
+        my_played INTEGER DEFAULT 0, my_goals INTEGER DEFAULT 0,
+        my_assists INTEGER DEFAULT 0, my_saves INTEGER DEFAULT 0,
+        my_rating REAL DEFAULT 0)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS cup_history(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        year INTEGER, team_name TEXT, result TEXT,
+        goals INTEGER DEFAULT 0, assists INTEGER DEFAULT 0,
+        caps INTEGER DEFAULT 0, rating REAL DEFAULT 0)""")
     # 오퍼 거절 기록 (기존 코드가 참조하나 생성 누락되어 있던 테이블)
     c.execute("""CREATE TABLE IF NOT EXISTS offer_refused(
         team_id INTEGER, year INTEGER)""")
@@ -443,6 +638,10 @@ def init_db():
         # [복수국적 확장] 세 번째 국적까지 지원 (최대 3개).
         "ALTER TABLE my_player ADD COLUMN nationality3 TEXT DEFAULT ''",
         "ALTER TABLE my_player ADD COLUMN flag3 TEXT DEFAULT ''",
+        # [복수국적 확장 2026-07] 네 번째 국적까지 지원 (최대 4개).
+        # 시작 국적(1개, 무작위 부여 없음) + 귀화로 최대 3개까지 추가 가능.
+        "ALTER TABLE my_player ADD COLUMN nationality4 TEXT DEFAULT ''",
+        "ALTER TABLE my_player ADD COLUMN flag4 TEXT DEFAULT ''",
         "ALTER TABLE my_player ADD COLUMN intl_committed TEXT DEFAULT ''",
         # [귀화] 같은 나라(리그)에서 누적 거주 연수 추적. 3년 채우면 그 나라
         #  귀화 국적 획득 자격(21세 이전 + 본선 미경험 조건과 함께).
@@ -530,6 +729,14 @@ def init_db():
         # [예선 entries] 내 국적 포함 여부 + 소속 대륙
         "ALTER TABLE intl_entries ADD COLUMN is_my INTEGER DEFAULT 0",
         "ALTER TABLE intl_entries ADD COLUMN continent TEXT DEFAULT ''",
+        # [일 단위 캘린더] 팀 수가 리그마다 8~30(짝수)로 달라지면서 라운드 수도
+        # 달라져, 이제 각 라운드가 정확히 무슨 '일자'인지 별도로 저장한다.
+        # week 컬럼은 그대로 두고(day로부터 항상 역산 가능하게 유지 —
+        # constants.day_to_week 참고) 이 컬럼은 순수 추가 정보다. 기존
+        # week 기반 쿼리(예: _sim_all_ai_matches)는 전혀 손대지 않아도
+        # 계속 정상 동작한다. 기존 세이브의 과거 경기는 NULL로 남아도 무방
+        # (day는 표시/간격 계산용이라 이미 끝난 경기엔 의미 없음).
+        "ALTER TABLE match_results ADD COLUMN day INTEGER",
         # [오퍼 토글] 재직 중 자동 이적 오퍼 팝업을 끌 수 있는 스위치.
         #  기본값 1(활성) → 기존 세이브도 지금까지와 동일하게 오퍼가 뜬다.
         #  0이어도 '팀 입단'(무소속 강제 입단)과 '이적 요청' 중인 경우는 영향 없음.
@@ -538,9 +745,61 @@ def init_db():
         #  갱신할 때마다 자동으로 함께 갱신된다(역대 최고치만 남도록 max 적용).
         #  은퇴 화면 등에서 '최종 OVR'(노쇠로 하락한 값) 대신 전성기 기록을 보여주기 위함.
         "ALTER TABLE my_player ADD COLUMN peak_ovr INTEGER DEFAULT 0",
+        # [일 단위 진행] 진행의 실제 기준값. 1~364 (년중 일자, DAYS_PER_WEEK=7 기준).
+        #   current_week/current_year는 계속 이 값에서 파생돼 함께 갱신되므로
+        #   (advance_days 참고), 기존 수백 곳의 'current_week'/'WHERE week=?'
+        #   참조 코드는 전혀 손대지 않아도 계속 정상 동작한다.
+        "ALTER TABLE my_player ADD COLUMN current_day INTEGER DEFAULT 1",
+        "ALTER TABLE season_state ADD COLUMN current_day INTEGER DEFAULT 1",
+        # [2026-07 추가] 부상 세부 명칭 — injury_type(경미/중간/심각 등급)과
+        #  별개로, "왼쪽 햄스트링 부분 파열" 같은 구체적 부상명을 저장한다.
+        #  등급별로 여러 구체 부상이 있고 회복 기간도 그 안에서 갈리므로
+        #  등급 컬럼은 그대로 두고 이름만 추가 — 기존 injury_type을 읽는
+        #  코드가 없어서 안전하게 병행 가능.
+        "ALTER TABLE my_player ADD COLUMN injury_detail TEXT DEFAULT ''",
+        # [2026-07 추가] 국제전/챔스/컵대회 경기의 '실제 진행 날짜'.
+        #   이 세 대회는 원래 week 컬럼만 있고, 커리어/은퇴창 등에 표시할 땐
+        #   그때그때 '내 현재 소속팀 기준으로' 요일을 재계산했다(_week_intl_cl_day) —
+        #   그런데 그건 그 경기가 실제로 열린 시점이 아니라 '지금 시점 기준
+        #   추정'이라, 과거 시즌 기록에 적용하면 시즌/소속팀이 달라져 엉뚱한
+        #   날짜가 나올 수 있었다(신민용 지적: 커리어/은퇴창 기간이 정확한
+        #   날짜로 안 뜸). 이제 경기가 실제로 시뮬레이션되는 순간(그 시점의
+        #   진짜 소속팀·시즌 기준)에 날짜를 한 번 계산해서 이 컬럼에 그대로
+        #   저장한다 — 이후 조회는 재계산 없이 저장된 값을 그대로 쓴다.
+        #   기존 세이브의 과거 경기는 0으로 남으며, 표시할 땐 week 기반
+        #   추정치로 안전하게 폴백한다.
+        "ALTER TABLE intl_matches ADD COLUMN day INTEGER DEFAULT 0",
+        "ALTER TABLE cl_matches ADD COLUMN day INTEGER DEFAULT 0",
+        "ALTER TABLE cup_matches ADD COLUMN day INTEGER DEFAULT 0",
+        # [2026-07 신설] 직접 지원(팀 검색 후 지원하기) 시도 횟수. 무소속
+        # 기간(첫 입단/계약종료·방출 후) 동안 최대 4회 — 팀에 재입단하면
+        # 다음에 다시 무소속이 될 때(계약종료/방출) 0으로 리셋된다.
+        "ALTER TABLE my_player ADD COLUMN apply_attempts_used INTEGER DEFAULT 0",
+        # [2026-07 버그 수정] 3/4위전 유무 불일치 — 그 라운드에 들어온 팀 수가
+        # 딱 4(=이름 "4강")일 때만 3/4위전을 만들었는데, 부전승 등으로 3팀이나
+        # 5팀이 들어와도 결승 진출자 2명을 정하는 라운드인 건 똑같다. 라운드
+        # 이름 대신 이 값(그 라운드에 실제로 들어온 팀 수, 부전승 포함)으로
+        # "결승 직전 라운드인지"를 구조적으로 판별한다.
+        "ALTER TABLE cup_matches ADD COLUMN pool_entering INTEGER DEFAULT 0",
     ]:
+        # [정리] bare except → sqlite3.OperationalError로 좁힘.
+        # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,
+        #  그 외 진짜 버그로 인한 예외는 숨기지 않는다. 동작은 기존과 동일.)
         try: c.execute(migration)
-        except: pass
+        except sqlite3.OperationalError: pass
+
+    # [일 단위 진행 전환] 기존 세이브는 current_day가 이번에 막 1로 추가됐을 뿐
+    #   실제 진행 상황(current_week)과 안 맞을 수 있다 — current_week 그대로인데
+    #   current_day만 1이면 '연초로 되돌아간 것'처럼 보이므로, 한 번만
+    #   current_week 기준으로 역산해 맞춰준다((week-1)*7+1 = 그 주 첫째 날).
+    #   이후로는 advance_days()가 current_day를 진짜 기준으로 계속 갱신하므로
+    #   이 보정은 최초 1회만 의미 있다(멱등: 이미 맞으면 그대로 둠).
+    for _tbl in ("my_player", "season_state"):
+        try:
+            c.execute(f"""UPDATE {_tbl} SET current_day = (current_week - 1) * 7 + 1
+                          WHERE current_day IS NULL OR current_day <= 1""")
+        except Exception:
+            pass
 
     # ── [버그수정] ai_players 스냅샷 테이블 (새 게임 리셋용) ──────────────
     # reset_game_data()가 teams(리그/tier)는 원본으로 되돌리면서 ai_players는
@@ -558,7 +817,7 @@ def init_db():
     for col in ai_cols:
         if col not in seed_cols:
             try: c.execute(f"ALTER TABLE ai_players_seed ADD COLUMN {col}")
-            except: pass
+            except sqlite3.OperationalError: pass
 
     # [전성기 OVR 보정] 기존 세이브는 peak_ovr 컬럼이 방금 0으로 추가됐거나,
     #  아직 한 번도 update_player(ovr=...)가 안 불려서 현재 ovr보다 낮을 수 있다.
@@ -566,7 +825,7 @@ def init_db():
     #  조건에 안 걸리면 UPDATE 0행이라 사실상 무비용.
     try:
         c.execute("UPDATE my_player SET peak_ovr = ovr WHERE peak_ovr < ovr")
-    except: pass
+    except sqlite3.OperationalError: pass
 
     # ─── 성능 인덱스 ───────────────────────────────────────────
     # 매 주차 진행 시 AI 경기 시뮬·순위 집계가 ai_players / match_results를
@@ -577,6 +836,7 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_aiplayers_team   ON ai_players(team_id)",
         "CREATE INDEX IF NOT EXISTS idx_mr_week_season   ON match_results(week, season)",
         "CREATE INDEX IF NOT EXISTS idx_mr_league_season ON match_results(league_id, season)",
+        "CREATE INDEX IF NOT EXISTS idx_mr_day_season    ON match_results(day, season)",
         "CREATE INDEX IF NOT EXISTS idx_teams_league     ON teams(league_id)",
         "CREATE INDEX IF NOT EXISTS idx_leagues_country  ON leagues(country_id)",
         # intl/cl 경기 조회: tournament_id+week 복합 (매 주차 process_*_week 호출마다 사용)
@@ -584,6 +844,8 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_intl_entries_tid      ON intl_entries(tournament_id)",
         "CREATE INDEX IF NOT EXISTS idx_cl_matches_tid_week   ON cl_matches(tournament_id, week)",
         "CREATE INDEX IF NOT EXISTS idx_cl_entries_tid        ON cl_entries(tournament_id)",
+        "CREATE INDEX IF NOT EXISTS idx_cup_matches_tid_week  ON cup_matches(tournament_id, week)",
+        "CREATE INDEX IF NOT EXISTS idx_cup_entries_tid       ON cup_entries(tournament_id)",
         # _calc_clean_sheets: season+home_score 로 미완료 경기 필터링
         "CREATE INDEX IF NOT EXISTS idx_mr_season_score ON match_results(season, home_score)",
         # match_results: home/away team_id 조회 (클린시트, 팀 경기 조회)
@@ -591,7 +853,7 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_mr_away_team ON match_results(away_team_id, season)",
     ]:
         try: c.execute(idx)
-        except: pass
+        except sqlite3.OperationalError: pass
 
     conn.commit()
     if not USE_MEMORY_DB:
@@ -670,15 +932,35 @@ def migrate_money_to_thousand():
         conn.close()
 
 
-def seed_initial_data():
+def seed_initial_data(progress_cb=None):
+    """progress_cb(stage:str, done:int, total:int, detail:str)로 진행 상황을 알려준다.
+    콜백이 없으면(None) 기존과 완전히 동일하게 동작 — 하위호환."""
     conn = get_conn(); c = conn.cursor()
     c.execute("SELECT value FROM meta WHERE key='seeded'")
     if c.fetchone(): conn.close(); return
     print("초기 데이터 삽입 중...")
+
+    def _stage(name, total):
+        if progress_cb: progress_cb(name, 0, total, "")
+
+    _stage("국가 정보 생성", 1)
     _insert_countries(c)
-    _insert_leagues_and_teams(c)
+    if progress_cb: progress_cb("국가 정보 생성", 1, 1, "")
+
+    _stage("리그·팀 생성", len(LEAGUE_DATA))
+    _insert_leagues_and_teams(
+        c, progress_cb=(lambda d, t, name: progress_cb("리그·팀 생성", d, t, name)) if progress_cb else None)
+
+    _stage("선수 이름 데이터 로딩", 1)
     _insert_player_names(c)
-    _generate_all_ai_players(c)
+    if progress_cb: progress_cb("선수 이름 데이터 로딩", 1, 1, "")
+
+    # 팀 수를 미리 세어 진행률 total로 사용 (실제 처리 순서/개수와 100% 동일)
+    _team_total = c.execute("SELECT COUNT(*) FROM teams").fetchone()[0]
+    _stage("전세계 선수단 생성", _team_total)
+    _generate_all_ai_players(
+        c, progress_cb=(lambda d, t, name: progress_cb("전세계 선수단 생성", d, t, name)) if progress_cb else None)
+
     # [버그수정] 최초 시딩 직후(변형되기 전) ai_players 상태를 스냅샷으로 보관.
     # reset_game_data()가 이걸로 벌크 복원한다 — teams가 LEAGUE_DATA 원본으로
     # 결정론적으로 돌아가는 것과 동일하게, 선수단도 "최초 시딩 상태로 결정론적
@@ -754,7 +1036,8 @@ def reset_game_data():
     for t in ["my_player","career_entries","promotion_log","trophy_log","awards",
               "game_log","match_results","match_details","season_state",
               "intl_history","intl_tournaments","intl_entries","intl_matches",
-              "cl_tournaments","cl_entries","cl_matches","cl_history"]:
+              "cl_tournaments","cl_entries","cl_matches","cl_history",
+              "cup_tournaments","cup_entries","cup_matches","cup_history"]:
         c.execute(f"DELETE FROM {t}")
     c.execute("UPDATE teams SET wins=0,draws=0,losses=0,goals_for=0,goals_against=0")
     _reset_teams_to_league_data(c)
@@ -901,32 +1184,116 @@ def rescale_team_to_target_ovr(team_id, target_ovr, conn=None):
         if delta == 0:
             return (0, before_avg, before_avg)
 
-        cur = conn.cursor()
+        # [최적화] 선수마다 개별 execute() 대신 executemany()로 일괄 UPDATE.
+        # 승강 시즌 전환 시 이 함수가 팀 수십~수백 개에 대해 호출되므로
+        # (팀당 25~30명) 개별 쿼리 누적 시 수천 건까지 늘어날 수 있었음.
+        # 계산 로직과 결과값은 기존과 완전히 동일 — 배치 방식만 바뀜.
+        update_rows = []
+        ovr_sum = 0
         for r in rows:
             new_stats = {}
             for s in ALL_STATS:
                 new_stats[s] = min(99, max(1, int(r[s]) + delta))
             new_ovr = calc_ovr(r["position"], new_stats)
-            cur.execute(
+            ovr_sum += new_ovr
+            update_rows.append((
+                new_stats["stamina"], new_stats["speed"], new_stats["jump"],
+                new_stats["strength"], new_stats["shooting"], new_stats["passing"],
+                new_stats["dribbling"], new_stats["tackling"], new_stats["heading"],
+                new_stats["positioning"], new_stats["setpiece"], new_stats["mental"],
+                new_stats["confidence"], new_stats["leadership"],
+                new_stats["concentration"], new_ovr, r["id"]))
+
+        conn.executemany(
+            """UPDATE ai_players SET
+               stamina=?,speed=?,jump=?,strength=?,shooting=?,passing=?,
+               dribbling=?,tackling=?,heading=?,positioning=?,setpiece=?,
+               mental=?,confidence=?,leadership=?,concentration=?,ovr=?
+               WHERE id=?""", update_rows)
+        if own:
+            conn.commit()
+
+        # [최적화] 방금 계산해 저장한 new_ovr 합계로 after_avg를 바로 구해
+        # 추가 SELECT(AVG) 왕복을 없앰. DB에 저장된 값과 동일하므로 결과는 같음.
+        after_avg = ovr_sum / len(update_rows) if update_rows else before_avg
+        return (delta, before_avg, after_avg)
+    finally:
+        if own:
+            conn.close()
+
+
+def rescale_teams_to_target_ovr_batch(jobs, conn=None):
+    """rescale_team_to_target_ovr을 여러 팀에 대해 한 번에 처리하는 배치 버전.
+
+    [최적화 배경] 승강제 시즌 전환 시 이동한 팀 수만큼(리그 수가 많은 세이브에선
+    실측 1,000팀 이상) rescale_team_to_target_ovr이 팀마다 개별
+    "SELECT * FROM ai_players WHERE team_id=?"를 날렸다 — 계산 자체는 가볍지만
+    쿼리 왕복 횟수가 팀 수만큼 쌓여 시즌 전환 지연의 한 축이었다(실측 약 0.4초/
+    1,308팀). 이 함수는 대상 팀 전체를 "team_id IN (...)" 단 1회 SELECT로 읽어
+    파이썬에서 팀별로 묶은 뒤, 계산은 원본과 완전히 동일한 로직으로 수행하고
+    UPDATE도 전체를 단 1회 executemany로 모아 실행한다 — 결과값·판정 로직은
+    rescale_team_to_target_ovr과 100% 동일, 쿼리 횟수만 팀 수 → 1회로 감소.
+
+    jobs: [(team_id, target_ovr), ...]
+    반환: {team_id: (delta, before_avg, after_avg)} — 팀에 선수가 없으면 항목 생략.
+    """
+    if not jobs:
+        return {}
+    own = False
+    if conn is None:
+        conn = get_conn(); own = True
+    try:
+        team_ids = [tid for tid, _ in jobs]
+        placeholders = ",".join("?" * len(team_ids))
+        rows = conn.execute(
+            f"SELECT * FROM ai_players WHERE team_id IN ({placeholders})",
+            team_ids).fetchall()
+
+        by_team: dict = {}
+        for r in rows:
+            by_team.setdefault(r["team_id"], []).append(r)
+
+        results: dict = {}
+        update_rows = []   # 전체 팀 통합 executemany용
+        for team_id, target_ovr in jobs:
+            team_rows = by_team.get(team_id)
+            if not team_rows:
+                continue
+
+            before_avg = sum(r["ovr"] for r in team_rows) / len(team_rows)
+            gap = target_ovr - before_avg
+            delta = int(round(gap))
+            if delta == 0:
+                results[team_id] = (0, before_avg, before_avg)
+                continue
+
+            ovr_sum = 0
+            for r in team_rows:
+                new_stats = {}
+                for s in ALL_STATS:
+                    new_stats[s] = min(99, max(1, int(r[s]) + delta))
+                new_ovr = calc_ovr(r["position"], new_stats)
+                ovr_sum += new_ovr
+                update_rows.append((
+                    new_stats["stamina"], new_stats["speed"], new_stats["jump"],
+                    new_stats["strength"], new_stats["shooting"], new_stats["passing"],
+                    new_stats["dribbling"], new_stats["tackling"], new_stats["heading"],
+                    new_stats["positioning"], new_stats["setpiece"], new_stats["mental"],
+                    new_stats["confidence"], new_stats["leadership"],
+                    new_stats["concentration"], new_ovr, r["id"]))
+            after_avg = ovr_sum / len(team_rows)
+            results[team_id] = (delta, before_avg, after_avg)
+
+        if update_rows:
+            conn.executemany(
                 """UPDATE ai_players SET
                    stamina=?,speed=?,jump=?,strength=?,shooting=?,passing=?,
                    dribbling=?,tackling=?,heading=?,positioning=?,setpiece=?,
                    mental=?,confidence=?,leadership=?,concentration=?,ovr=?
-                   WHERE id=?""",
-                (new_stats["stamina"], new_stats["speed"], new_stats["jump"],
-                 new_stats["strength"], new_stats["shooting"], new_stats["passing"],
-                 new_stats["dribbling"], new_stats["tackling"], new_stats["heading"],
-                 new_stats["positioning"], new_stats["setpiece"], new_stats["mental"],
-                 new_stats["confidence"], new_stats["leadership"],
-                 new_stats["concentration"], new_ovr, r["id"]))
+                   WHERE id=?""", update_rows)
         if own:
             conn.commit()
-
-        after = conn.execute(
-            "SELECT AVG(ovr) AS v FROM ai_players WHERE team_id=?",
-            (team_id,)).fetchone()
-        after_avg = float(after["v"]) if after and after["v"] is not None else before_avg
-        return (delta, before_avg, after_avg)
+        return results
     finally:
         if own:
             conn.close()
@@ -944,10 +1311,13 @@ def _grade_from_rank(rank):
 
 
 def _insert_countries(c):
-    for (name,flag,cont,lang,rank) in COUNTRY_DATA:
-        grade = _grade_from_rank(rank)
-        c.execute("INSERT INTO countries(name,flag,continent,language,fifa_rank,grade) VALUES(?,?,?,?,?,?)",
-                  (name,flag,cont,lang,rank,grade))
+    # [최적화] 국가 수만큼 개별 execute() → executemany() 1회. 신규 게임
+    # 생성(1회성) 시 초기 로딩 시간을 줄여준다. 삽입 데이터·순서는 동일.
+    rows = [(name, flag, cont, lang, rank, _grade_from_rank(rank))
+            for (name, flag, cont, lang, rank) in COUNTRY_DATA]
+    c.executemany(
+        "INSERT INTO countries(name,flag,continent,language,fifa_rank,grade) VALUES(?,?,?,?,?,?)",
+        rows)
 
 
 def sync_countries():
@@ -956,17 +1326,26 @@ def sync_countries():
     - 기존 국가: fifa_rank/grade/flag/continent/language 갱신
     기존 세이브에도 새 국가가 반영되도록 seed 가드 바깥에서 실행."""
     conn = get_conn(); c = conn.cursor()
+    # [최적화] 국가마다 SELECT 1회씩(존재 확인) 날리던 것을 없애고,
+    # 기존 국가명→id를 1회 SELECT로 미리 읽어 메모리에서 분기.
+    # UPDATE/INSERT 묶음은 각각 executemany()로 일괄 처리 — 결과는 기존과 동일.
+    existing = {r["name"]: r["id"] for r in c.execute("SELECT id, name FROM countries").fetchall()}
+    to_update = []
+    to_insert = []
     for (name, flag, cont, lang, rank) in COUNTRY_DATA:
         grade = _grade_from_rank(rank)
-        row = c.execute("SELECT id FROM countries WHERE name=?", (name,)).fetchone()
-        if row:
-            c.execute("""UPDATE countries SET flag=?, continent=?, language=?,
-                         fifa_rank=?, grade=? WHERE id=?""",
-                      (flag, cont, lang, rank, grade, row["id"]))
+        if name in existing:
+            to_update.append((flag, cont, lang, rank, grade, existing[name]))
         else:
-            c.execute("""INSERT INTO countries(name,flag,continent,language,fifa_rank,grade)
-                         VALUES(?,?,?,?,?,?)""",
-                      (name, flag, cont, lang, rank, grade))
+            to_insert.append((name, flag, cont, lang, rank, grade))
+    if to_update:
+        c.executemany(
+            """UPDATE countries SET flag=?, continent=?, language=?,
+               fifa_rank=?, grade=? WHERE id=?""", to_update)
+    if to_insert:
+        c.executemany(
+            """INSERT INTO countries(name,flag,continent,language,fifa_rank,grade)
+               VALUES(?,?,?,?,?,?)""", to_insert)
     conn.commit(); conn.close()
 
 
@@ -989,20 +1368,30 @@ def _tier_to_int(tier):
     return int(digits) if digits else 1
 
 
-def _insert_leagues_and_teams(c):
+def _insert_leagues_and_teams(c, progress_cb=None):
+    # [최적화] 리그 INSERT는 lastrowid가 필요해 개별 execute()를 유지하되,
+    # 그 리그 소속 팀들은 executemany()로 한 번에 넣는다(기존: 팀마다 execute()).
+    # 삽입 순서·데이터·formation 랜덤 선택 순서는 원본과 동일하게 유지.
     c.execute("SELECT id, name FROM countries")
     cmap = {r["name"]: r["id"] for r in c.fetchall()}
-    for country_name, tiers in LEAGUE_DATA.items():
+    _total = len(LEAGUE_DATA)
+    for _i, (country_name, tiers) in enumerate(LEAGUE_DATA.items(), 1):
         cid = cmap.get(country_name)
-        if cid is None: continue
+        if cid is None:
+            if progress_cb: progress_cb(_i, _total, country_name)
+            continue
         for tier_key, (league_name, teams) in tiers.items():
             tier = _tier_to_int(tier_key)
             c.execute("INSERT INTO leagues(country_id,tier,name) VALUES(?,?,?)",
                       (cid, tier, league_name))
             lid = c.lastrowid
-            for team_name in teams:
-                c.execute("INSERT INTO teams(league_id,country_id,name,formation,current_tier) VALUES(?,?,?,?,?)",
-                          (lid, cid, team_name, random.choice(FORMATIONS), tier))
+            team_rows = [(lid, cid, team_name, random.choice(FORMATIONS), tier)
+                         for team_name in teams]
+            if team_rows:
+                c.executemany(
+                    "INSERT INTO teams(league_id,country_id,name,formation,current_tier) VALUES(?,?,?,?,?)",
+                    team_rows)
+        if progress_cb: progress_cb(_i, _total, country_name)
 
 
 # ─── 이름 데이터 ──────────────────────────────────────────────
@@ -1013,29 +1402,24 @@ def _clean(n):
 
 
 def _insert_player_names(c):
+    # [최적화] 이름 수만큼(수만 건) 개별 execute() → executemany() 1회.
+    # 신규 게임 생성 시 초기 로딩 지연의 큰 비중을 차지하던 부분.
     c.execute("SELECT id, name FROM countries")
     cmap = {r["name"]: r["id"] for r in c.fetchall()}
+    rows = []
     for country, names in NAME_DATA.items():
         cid = cmap.get(country)
         if cid is None: continue
         for n in names:
             clean = _clean(n)
             if clean:
-                c.execute("INSERT INTO player_names(country_id,name) VALUES(?,?)",
-                          (cid, clean))
+                rows.append((cid, clean))
+    if rows:
+        c.executemany("INSERT INTO player_names(country_id,name) VALUES(?,?)", rows)
 
 
 # ─── AI 선수 생성 ──────────────────────────────────────────────
-OVR_RANGES = {
-    "SS":{1:(93,100),2:(83,92),3:(70,80),4:(55,65)},   # EPL 단독 최상위
-    "S": {1:(88,95), 2:(76,86),3:(63,73),4:(48,58),5:(33,47)},
-    "A": {1:(82,90), 2:(68,78),3:(53,63),4:(38,48)},
-    "B": {1:(75,82), 2:(63,70),3:(52,58),4:(35,45)},
-    "C": {1:(65,73), 2:(55,62),3:(45,52),4:(30,40)},
-    "D": {1:(55,63), 2:(45,53),3:(35,43)},
-    "E": {1:(45,53), 2:(35,43),3:(28,35)},
-    "F": {1:(35,43), 2:(27,35),3:(20,27)},
-}
+# OVR_RANGES는 이제 파일 상단에서 constants.py로부터 가져온다 (단일 소스).
 TEAM_POSITIONS = ["GK","CB","CB","LB","RB","CDM","CM","CAM","LW","RW","ST"]
 KEY_STATS_BY_POS = {
     "GK":  ["positioning","concentration","mental","jump","stamina"],
@@ -1060,12 +1444,24 @@ KEY_STATS_BY_POS = {
 # 신민용이 "같은 1부인데 팀간 OVR 격차가 너무 크다"고 지적해 전 등급
 # 공통으로 ace_lo를 올리고 spread를 줄여 팀간 편차를 좁혔다.
 # (전 세계 모든 리그가 이 등급 중 하나를 쓰므로 국가 구분 없이 전부 적용됨)
+#
+# [2026-07 재조정 — 팀 "내" 편차 확대] 위 조정이 팀 간(강팀 vs 약팀) 편차는
+# 잘 좁혔지만, 그 여파로 팀 "내" 편차(에이스 vs 막내)까지 SS/S/A에서
+# 5~6%로 지나치게 좁아져 — 실측: EPL 최약팀도 11명 전원이 91~96 OVR로
+# 몰림. 이러면 "이 팀에 월드클래스가 몇 명"이라는 개념 자체가 사라지고
+# 다 고르게 최상급이 되어버린다(신민용 지적: SS/S는 팀에 월클 2~3명 —
+# 강팀은 최대 4명 — 정도가 현실적이고, 나머지는 그보다 확실히 낮아야
+# 한다). SS/S/A만 spread를 큰 폭으로 넓혀 팀 내 상~하위 격차를 되살렸다
+# (B~F는 기존값 유지 — 그쪽은 지적 대상이 아니었음). 팀 간 편차(ace_lo)는
+# 그대로 둬서 앞서 고친 부분은 유지된다 — 스타 몇 명은 여전히 리그
+# 최상위에 근접하되(아래 STAR_COUNT_BY_GRADE로 명시적으로 보장), 나머지
+# 다수는 확실히 그보다 낮은 지점으로 벌어진다.
 TEAM_ROLE_PROFILE = {
     # ace_lo: 최약팀 에이스 = tier_top * ace_lo (강팀은 *1.0까지)
     # spread: 에이스 대비 11번째 선수(벤치) 하락폭.
-    "SS": {"ace_lo": 0.96, "spread": 0.05},
-    "S":  {"ace_lo": 0.96, "spread": 0.05},
-    "A":  {"ace_lo": 0.95, "spread": 0.06},
+    "SS": {"ace_lo": 0.96, "spread": 0.22},
+    "S":  {"ace_lo": 0.96, "spread": 0.25},
+    "A":  {"ace_lo": 0.95, "spread": 0.28},
     "B":  {"ace_lo": 0.94, "spread": 0.07},
     "C":  {"ace_lo": 0.93, "spread": 0.08},
     "D":  {"ace_lo": 0.92, "spread": 0.09},
@@ -1073,13 +1469,120 @@ TEAM_ROLE_PROFILE = {
     "F":  {"ace_lo": 0.90, "spread": 0.11},
 }
 
+# [2026-07 신설, 2차 개편] 등급별 '스타 슬롯' 개수 — 팀마다 실제로 월드클래스/
+# 엘리트 선수가 몇 명인지 명시적으로 정해서 배치한다(스타는 위 spread에 따른
+# 완만한 하락 곡선을 무시하고 리그 최상위권 OVR로 직접 꽂아 넣는다).
+# team_strength(0~1, 1=리그 최강팀)가 높을수록 스타 수가 늘어난다.
+#
+# [2차 개편 — 신민용 지적] "SS/S 1부는 월드클래스+엘리트로만 구성돼야 한다
+# (그냥 그런 선수가 없어야 함)" — 그래서 SS/S는 월드클래스를 뺀 나머지
+# 11자리 전부를 엘리트로 채운다(el_fill_rest=True, el_base/el_bonus 무시).
+# 반면 A등급은 "엘리트가 상위권뿐 아니라 하위권도 있고, 아예 엘리트가 없는
+# 팀도 있다"는 지적대로 엘리트 슬롯 수 자체를 적게 두고 나머지는 기존
+# 완만한 곡선(_target_ovr, 넓은 spread)에 맡긴다 — 그 결과 A는 최상위 몇
+# 자리만 엘리트/월클이고 나머지는 자연스럽게 쭉 낮아지는 분포가 된다.
+#
+# el_offset: 그 등급의 '엘리트'가 리그 상한에서 얼마나 아래(오프셋 범위)에
+# 형성되는지. SS/S는 상한 바로 아래(대부분 90 초중반) — "엘리트 대부분
+# 상위권". A는 오프셋을 더 크게 둬서 상한보다 확실히 아래(하위권 엘리트,
+# 88~91 안팎)로 형성되게 한다 — S와 A가 둘 다 "엘리트"를 갖더라도 실제
+# OVR대가 다르게 나오는 이유.
+STAR_COUNT_BY_GRADE = {
+    "SS": {"wc_base": 2, "wc_bonus": 2, "el_fill_rest": True,  "el_offset": (4, 9)},
+    "S":  {"wc_base": 2, "wc_bonus": 1, "el_fill_rest": True,  "el_offset": (4, 9)},
+    "A":  {"wc_base": 0, "wc_bonus": 1, "el_fill_rest": False, "el_offset": (8, 16),
+           "el_base": 1, "el_bonus": 2},
+}
+_MAX_WORLDCLASS_PER_TEAM = 4
+# SS/S 1부는 "월클+엘리트로만" 구성이므로 엘리트에 상한을 두지 않는다
+# (el_fill_rest=True면 남는 자리 전부). A처럼 el_fill_rest=False인 등급만
+# 아래 상한이 적용된다.
+_MAX_ELITE_PER_TEAM = 5
+# [2026-07] SS/S 1부는 baseline(_target_ovr) 경로로 떨어지는 자리가 없어야
+# 하지만(el_fill_rest=True라 전원 스타 배정), 방어적으로 혹시 남는 자리가
+# 생기면 이 바닥 밑으로는 절대 안 내려가게 한다(TALENT_TIERS elite 하한과
+# 동일한 88).
+ELITE_FLOOR_BY_GRADE = {"SS": 88.0, "S": 88.0}
+
+
+def _star_counts(grade, team_strength, continent_bonus=0, n_slots=11, tier=1):
+    """(월드클래스 슬롯 수, 엘리트 슬롯 수) 반환. SS/S/A 외 등급은 (0,0) —
+    B급 이하는 이번 조정 대상이 아니라 기존 완만한 곡선 그대로 쓴다.
+
+    [버그수정 2026-07] "SS/S는 월클+엘리트로만 구성"이라는 설계는 원래
+    1부만을 의도한 것이었는데(코드 주석에도 '1부'라고 명시돼 있었음), 정작
+    이 함수엔 tier 구분이 전혀 없어서 SS/S 등급 나라의 모든 부수(2~6부까지)
+    팀 전원이 거의 엘리트/월드클래스로 채워지고 있었다 — 그 결과 6부 아마추어
+    팀도 1부 수준(평균 89 이상) OVR이 나오는 심각한 버그로 이어졌다. 이제
+    tier에 따라 스타 슬롯 배정을 계단식으로 줄인다: 1부만 원래 설계(거의
+    전원 스타) 그대로, 2부는 대폭 축소, 3부 이상은 스타 슬롯 자체가 없어
+    전원 _target_ovr(그 tier의 낮은 상한 기준)로만 결정된다."""
+    cfg = STAR_COUNT_BY_GRADE.get(grade)
+    if not cfg:
+        return 0, 0
+    if tier >= 3:
+        return 0, 0   # 3부 이상은 스타 취급 없음 — 전원 일반 곡선(_target_ovr)
+
+    n_world = cfg["wc_base"] + round(cfg["wc_bonus"] * team_strength)
+    if tier == 2:
+        n_world = max(0, n_world - 2)   # 2부는 월드클래스 사실상 배제
+    if grade == "A" and continent_bonus < 0:
+        # [신민용 요청] A등급 "상위" 리그(포르투갈/네덜란드 등 국가보정 양수)만
+        # 월드클래스가 나오고, "중하위" 리그(한국/일본 등 국가보정 음수)는
+        # 월드클래스 자체가 안 나온다 — 같은 A등급이라도 실질 수준이 다름을 반영.
+        n_world = 0
+    n_world = min(n_world, _MAX_WORLDCLASS_PER_TEAM)
+
+    if cfg.get("el_fill_rest"):
+        # SS/S 1부: 월클을 뺀 나머지 전부를 엘리트로 — "월클+엘리트로만 구성".
+        # 2부는 그 설계를 적용하지 않고 소수 엘리트 슬롯만 남긴다.
+        if tier == 1:
+            n_elite = max(0, n_slots - n_world)
+        else:
+            n_elite = min(3, max(0, n_slots - n_world))
+    else:
+        n_elite = cfg.get("el_base", 0) + round(cfg.get("el_bonus", 0) * team_strength)
+        if grade == "A" and continent_bonus < 0:
+            # [신민용 요청] "엘리트 유무도 있고" — 중하위 A리그는 엘리트 자체가
+            # 없는 팀도 나오도록 카운트를 깎는다(완전히 0이 될 수도 있음).
+            n_elite = max(0, n_elite - 2)
+        n_elite = min(n_elite, _MAX_ELITE_PER_TEAM, max(0, n_slots - n_world))
+    return n_world, n_elite
+
+
+def _star_target_ovr(tier_top, kind, el_offset=(6, 14)):
+    """스타 슬롯 하나의 목표 OVR. 리그 상한(tier_top) 바로 아래에서 결정 —
+    월드클래스는 거의 상한 그 자체, 엘리트는 등급별 el_offset만큼 그 아래
+    (SS/S는 좁은 오프셋 = 상위권 엘리트, A는 넓은 오프셋 = 하위권 엘리트)."""
+    if kind == "worldclass":
+        return tier_top - random.uniform(0, 4)
+    lo, hi = el_offset
+    return tier_top - random.uniform(lo, hi)  # elite
+
 
 def _tier_top_ovr(grade, tier, continent_bonus=0):
     """그 등급·tier 리그에서 도달 가능한 최고 OVR.
-    continent_bonus: 대륙별 OVR 보정치 (유럽+1, 아시아-3 등)"""
-    rng = OVR_RANGES.get(grade, {}).get(tier)
+    continent_bonus: 대륙별 OVR 보정치 (유럽+1, 아시아-3 등)
+
+    [버그수정 2026-07] 예전엔 OVR_RANGES에 그 등급의 tier가 정의 안 돼
+    있으면(예: SS 5부, S 6부처럼 나중에 부수가 늘었는데 표를 못 채운 경우)
+    무조건 45로 떨어졌는데, 이게 등급별 실제 최상단 값(SS는 90~100대)과
+    무관한 고정값이라 자칫 "정의 안 된 tier가 tier1과 비슷해지는" 것보다는
+    낫지만, 반대로 "SS/S처럼 원래 높은 등급인데 갑자기 뚝 떨어지는" 부자연스러운
+    단절이 생겼다. 이제는 그 등급 안에서 정의된 가장 깊은 부수를 기준으로,
+    한 부수당 일정폭(STEP)씩 자연스럽게 더 깎아 내려가도록 한다 — 등급표에
+    없는 부수가 나와도(향후 부수를 더 늘려도) 항상 "한 단계 위보다는 낮고,
+    급격한 단절은 없는" 값이 나온다."""
+    grade_ranges = OVR_RANGES.get(grade, {})
+    rng = grade_ranges.get(tier)
     if rng:
         return min(100, rng[1] + continent_bonus)
+    if grade_ranges:
+        deepest_tier = max(grade_ranges)
+        deepest_top = grade_ranges[deepest_tier][1]
+        STEP = 8   # 부수 하나 내려갈 때마다 대략적인 감쇠폭
+        extra_tiers = tier - deepest_tier
+        return min(100, max(15, deepest_top - extra_tiers * STEP) + continent_bonus)
     return 45
 
 
@@ -1093,7 +1596,7 @@ def _target_ovr(grade, tier, team_strength, role_idx, continent_bonus=0):
     return ace * role_mult
 
 
-def _generate_all_ai_players(c):
+def _generate_all_ai_players(c, progress_cb=None):
     # 리그 단위로 묶어 8팀에 강→약 강도를 분배해야 팀 간 위계가 생긴다.
     # [리그등급 분리] cn.grade는 국대 등급 → 리그 OVR/연봉엔 COUNTRY_LEAGUE_GRADE 사용
     c.execute("""SELECT t.id AS tid, t.current_tier AS tier, cn.grade AS grade,
@@ -1109,6 +1612,8 @@ def _generate_all_ai_players(c):
     for r in rows:
         leagues.setdefault(r["lid"], []).append(r)
 
+    _total_teams = len(rows)
+    _done = 0
     for lid, teams in leagues.items():
         n = len(teams)
         order = list(range(n))
@@ -1122,6 +1627,9 @@ def _generate_all_ai_players(c):
             team_with_lg = dict(team)
             team_with_lg["grade"] = league_grade
             _generate_team_players(c, team_with_lg, team_strength, league_used)
+            _done += 1
+            if progress_cb and (_done % 20 == 0 or _done == _total_teams):
+                progress_cb(_done, _total_teams, team.get("cname", ""))
 
 
 def _generate_team_players(c, team, team_strength, league_used: set = None):
@@ -1145,6 +1653,36 @@ def _generate_team_players(c, team, team_strength, league_used: set = None):
     if not name_pool:
         name_pool = [f"선수{i}" for i in range(100)]
 
+    # [2026-07 신설] 역할 순번(role_idx) 랜덤화 — 예전엔 TEAM_POSITIONS 순서를
+    # 그대로 role_idx로 써서 "에이스"가 항상 idx0(GK)로 고정됐다. 실제로는
+    # 어느 팀은 스트라이커가, 어느 팀은 센터백이 에이스일 수 있으므로 팀마다
+    # 0~10을 섞어서 배정한다(포지션 자체의 스탯 계산(_gen_ai_stats)은 그대로
+    # pos 기준이라 "센터백인데 슈팅 위주"처럼 어긋나지 않는다 — target OVR만
+    # 랜덤한 포지션에 높게 배정될 뿐).
+    role_indices = list(range(len(TEAM_POSITIONS)))
+    random.shuffle(role_indices)
+
+    # [2026-07 신설] 스타 슬롯(월드클래스/엘리트) 명시적 배정 — 완만한 곡선
+    # (_target_ovr)만으로는 "이 팀에 월클이 몇 명"이 보장되지 않아서, 소수
+    # 슬롯을 뽑아 리그 상한 근처 OVR로 직접 꽂아 넣는다.
+    tier_top = _tier_top_ovr(grade, tier, continent_bonus)
+    n_world, n_elite = _star_counts(grade, team_strength, continent_bonus, tier=tier)
+    star_slot_idx = list(range(len(TEAM_POSITIONS)))
+    random.shuffle(star_slot_idx)
+    star_kind_by_slot = {}
+    for i in star_slot_idx[:n_world]:
+        star_kind_by_slot[i] = "worldclass"
+    for i in star_slot_idx[n_world:n_world + n_elite]:
+        star_kind_by_slot[i] = "elite"
+
+    _star_cfg = STAR_COUNT_BY_GRADE.get(grade, {})
+    _el_offset = _star_cfg.get("el_offset", (6, 14))
+    # [버그수정 2026-07] 이 88 하한은 "SS/S 1부는 절대 엘리트 미만 없음"이라는
+    # 의도였는데 tier 구분이 없어 하위 부수까지 적용되던 것 — 1부에서만
+    # 걸리도록 한정한다. 2부 이하의 스타 슬롯(있다면)은 tier_top 기준으로
+    # 자연스럽게 낮게 계산된 값을 그대로 쓴다.
+    _elite_floor = ELITE_FLOOR_BY_GRADE.get(grade) if tier == 1 else None
+
     for idx, pos in enumerate(TEAM_POSITIONS):
         # 리그 전체에서 아직 안 쓴 이름 우선 사용
         available = [n for n in name_pool if n not in league_used]
@@ -1152,7 +1690,21 @@ def _generate_team_players(c, team, team_strength, league_used: set = None):
             available = name_pool
         name = random.choice(available)
         league_used.add(name)
-        target = _target_ovr(grade, tier, team_strength, idx, continent_bonus)
+        if idx in star_kind_by_slot:
+            target = _star_target_ovr(tier_top, star_kind_by_slot[idx], _el_offset)
+            if _elite_floor is not None:
+                # [2026-07 버그 수정] 엘리트 오프셋의 랜덤 폭(uniform 상한) 때문에
+                # 국가보정이 낮은 S급 나라(예: 대륙보정 0인 브라질)에서 드물게
+                # 87대까지 내려가 "SS/S는 절대 엘리트 미만 없음" 원칙이 깨질 수
+                # 있었다 — 스타 슬롯에도 동일한 바닥을 걸어 항상 88 이상 보장.
+                target = max(target, _elite_floor)
+        else:
+            target = _target_ovr(grade, tier, team_strength, role_indices[idx], continent_bonus)
+            # [방어적 안전장치] SS/S 1부는 el_fill_rest=True라 이 분기(baseline)를
+            # 정상적으로는 타지 않지만(전원 스타 배정), 혹시라도 남는 자리가
+            # 생기면 "월클+엘리트로만 구성"이 깨지지 않도록 바닥을 걸어둔다.
+            if _elite_floor is not None and tier == 1:
+                target = max(target, _elite_floor)
         stats = _gen_ai_stats(pos, target)
         ovr = calc_ovr(pos, stats)
         # [AI 생애] 초기 나이: 16~34 삼각분포(25 봉우리). 시즌마다 +1 되며 성장/노화.

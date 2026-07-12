@@ -77,19 +77,24 @@ class PlayerPanel(QWidget):
         self.lay.setSpacing(4)
         self.lay.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        # 이름(줄바꿈 허용) + 아래 줄에 OVR·상태 뱃지
+        # 이름 + 재능 뱃지(같은 줄) / 그 아래 줄에 OVR + 부상·슬럼프 상태
         self.lbl_name  = QLabel("—"); self.lbl_name.setObjectName("pName")
         self.lbl_name.setWordWrap(True)          # 긴 이름 자동 줄바꿈
         self.lbl_ovr   = QLabel("OVR 0"); self.lbl_ovr.setObjectName("ovrBadge")
         self.lbl_talent = QLabel(""); self.lbl_talent.setObjectName("talentBadge")
         self.lbl_state = QLabel(""); self.lbl_state.setObjectName("injBadge")
+        self.lbl_state.setWordWrap(True)         # 부상 상세 텍스트가 길어도 잘리지 않고 줄바꿈
+
+        name_row = QHBoxLayout()
+        name_row.setContentsMargins(0, 0, 0, 0)
+        name_row.addWidget(self.lbl_name, 1)     # 이름이 늘어나면 이 쪽이 먼저 넓어짐
+        name_row.addWidget(self.lbl_talent, 0)
+
         badge_row = QHBoxLayout()
         badge_row.setContentsMargins(0, 2, 0, 0)
-        badge_row.addWidget(self.lbl_ovr)
-        badge_row.addWidget(self.lbl_talent)
-        badge_row.addWidget(self.lbl_state)
-        badge_row.addStretch()
-        self.lay.addWidget(self.lbl_name)
+        badge_row.addWidget(self.lbl_ovr, 0)
+        badge_row.addWidget(self.lbl_state, 1)   # 부상 텍스트가 길면 이 라벨이 줄바꿈되며 늘어남
+        self.lay.addLayout(name_row)
         self.lay.addLayout(badge_row)
         self._div()
 
@@ -170,7 +175,8 @@ class PlayerPanel(QWidget):
         self.lbl_talent.setStyleSheet(f"background-color: {_tcolor};")
 
         if p.get("injured"):
-            self.lbl_state.setText(f"🩹 부상({p['injury_weeks']}주)")
+            _idetail = p.get("injury_detail") or "부상"
+            self.lbl_state.setText(f"🩹 {_idetail}({p['injury_weeks']}일)")
             self.lbl_state.setObjectName("injBadge"); self.lbl_state.show()
         elif p.get("slump"):
             self.lbl_state.setText("😰 슬럼프")
@@ -249,7 +255,11 @@ class PlayerPanel(QWidget):
             self.lbl_rank.setText("팀 없음" if lang=="ko" else "No Team")
 
         # 스트레스/행복도
-        self.lbl_stress.setText(f"스트레스  {p['stress']}")
+        if p.get("injured"):
+            _idetail2 = p.get("injury_detail") or "부상"
+            self.lbl_stress.setText(f"스트레스  {p['stress']}   🚑 {_idetail2} {p['injury_weeks']}일 남음")
+        else:
+            self.lbl_stress.setText(f"스트레스  {p['stress']}")
         self.lbl_happy.setText(f"행복도  {p['happiness']}")
         self.bar_stress.set_values(p['stress'], 100)
         self.bar_stress._cur_color = QColor("#cc4400")

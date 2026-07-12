@@ -165,7 +165,7 @@ class MainWindow(QMainWindow):
         self.center_panel.refresh()
         self.log_panel.refresh()
         # 진행(NEXT DAY) 직후 열려 있는 보조 창들을 함께 갱신한다.
-        #   - 경기 일정 창 / 순위표 창 둘 다. 1주씩·4주씩 모드 모두 이 메서드를
+        #   - 경기 일정 창 / 순위표 창 둘 다. 1주씩·하루씩 모드 모두 이 메서드를
         #     거치므로 모드와 무관하게 즉시 최신 상태가 된다.
         #   - 창이 닫혔거나 파괴됐으면 조용히 건너뛴다(비용 0).
         self._refresh_aux_window("_schedule_win")
@@ -389,9 +389,10 @@ class MainWindow(QMainWindow):
 # ── 유틸 ──────────────────────────────────────────────────────
 
 def _phase_label(week, lang):
+    ps, pe = SEASON_PHASES["preseason1"]
     fs, fe = SEASON_PHASES["first_half"]; ss, se = SEASON_PHASES["second_half"]
-    if   1  <= week <= 4:   return "비시즌"  if lang=="ko" else "Pre-Season"
+    if   ps <= week <= pe:  return "비시즌"  if lang=="ko" else "Pre-Season"
     elif fs <= week <= fe:  return "상반기"  if lang=="ko" else "First Half"
     elif week < ss:         return "비시즌"  if lang=="ko" else "Mid-Season"
     elif week <= se:        return "하반기"  if lang=="ko" else "Second Half"
-    else:                   return "비시즌"  if lang=="ko" else "Off-Season"
+    else:                   return "국제대회 시즌"  if lang=="ko" else "International Season"

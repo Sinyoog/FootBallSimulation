@@ -282,6 +282,14 @@ class RetireWindow(QDialog):
         lay.addWidget(t36)
         lay.addWidget(self._champions_table(cl_ms, p))
 
+        # ── 컵대회 기록 ──────────────────────────────
+        import cup_engine
+        cup_ms = cup_engine.get_my_cup_matches()
+        t37 = QLabel(f"🎖️ 컵대회 기록  ({len(cup_ms)})")
+        t37.setObjectName("secTitle")
+        lay.addWidget(t37)
+        lay.addWidget(self._cup_table(cup_ms))
+
         # ── 개인 수상 ────────────────────────────────
         # (awards는 위에서 conn이 열려 있을 때 이미 로드했다. conn.close() 이후
         #  c.execute를 다시 호출하면 예외가 나서 0개로 표시되던 버그 수정 →
@@ -383,7 +391,10 @@ class RetireWindow(QDialog):
 
             sy = e.get("start_year",""); sw = e.get("start_week", 1)
             ey = e.get("end_year","");   ew = e.get("end_week", 52)
-            period = f"{sy} {sw}~{ew}주" if sy == ey else f"{sy} {sw}~{ey} {ew}주"
+            from constants import week_to_iso_date_str
+            start_str = week_to_iso_date_str(sy, sw) if sy else ""
+            end_str = week_to_iso_date_str(ey, ew) if ey else ""
+            period = f"{start_str} ~ {end_str}"
 
             pos   = e.get("position","")
             sv  = e.get("saves", 0)
@@ -432,12 +443,15 @@ class RetireWindow(QDialog):
             # 이적 컬럼
             tt_color = "#cc4444" if t_type in ("팔림", "방출", "계약만료") else None
 
+            from game_engine import league_total_games_by_name
+            _total_g2 = league_total_games_by_name(e.get("league_name", ""))
+            _apps_str2 = f"{e.get('matches',0)}/{_total_g2}" if _total_g2 else str(e.get("matches", 0))
             vals = ([period, pos,
                      e.get("league_name", "")[:2] if e.get("league_name","") else "—",
                      e.get("league_name",""),
                      e.get("team_name",""),
                      fmt_money(e.get("salary",0)),
-                     str(e.get("matches",0))]
+                     _apps_str2]
                     + stat_vals
                     + [str(avg), rank_disp, wdl, c_str, t_type])
             for j, v in enumerate(vals):
@@ -601,7 +615,7 @@ class RetireWindow(QDialog):
                 "기회창출": str(m.get("key_passes", 0)), "드리블": str(m.get("dribbles", 0)),
                 "슈팅": str(m.get("shots", 0)),        "유효": str(m.get("shots_on", 0)),
             }
-            vals = ([f"{m['year']} {m['week']}주차", m["position"],
+            vals = ([m['date'], m["position"],
                      f"{m['nat_flag']}{m['nat']}",
                      f"{m['comp']} {m['stage']}",
                      f"{m['opp_flag']}{m['opp']}",
@@ -643,13 +657,33 @@ class RetireWindow(QDialog):
                 "기회창출": str(m.get("key_passes", 0)), "드리블": str(m.get("dribbles", 0)),
                 "슈팅": str(m.get("shots", 0)),        "유효": str(m.get("shots_on", 0)),
             }
-            vals = ([f"{m['year']} {m['week']}주차", m["position"],
+            vals = ([m['date'], m["position"],
                      f"{m['team_flag']}{m['team']}",
                      f"{m['comp']} {m['stage']}",
                      f"{m['opp_flag']}{m['opp']}",
                      str(m["goals"]), str(m["assists"])]
                     + [_emap.get(c, "—") for c in extra_cols]
                     + [str(m["rating"]), m["score"], m["result"]])
+            for j, v in enumerate(vals):
+                self._set_item(tbl, i, j, v)
+        tbl.resizeColumnsToContents()
+        tbl.resizeRowsToContents()
+        tbl.setFixedHeight(30 + min(len(matches), 7) * 28)
+        return tbl
+
+    def _cup_table(self, matches):
+        """[2026-07 신설] 국내 컵대회 경기별 기록 테이블. cup_matches는
+        슈팅/패스% 등 세부 스탯이 없어 골/어시/선방/평점 중심으로 표시한다."""
+        if not matches:
+            lbl = QLabel("컵대회 기록 없음"); lbl.setStyleSheet("color:#555;")
+            return lbl
+        cols = ["기간", "대회", "상대", "골", "어시", "선방", "실점", "평점", "스코어", "결과"]
+        tbl = self._make_table(len(matches), cols)
+        for i, m in enumerate(matches):
+            opp = m["opp"] + (f" ({m['opp_tier']}부)" if m.get("opp_tier") else "")
+            vals = [m['date'], f"{m['comp']} {m['stage']}", opp,
+                    str(m["goals"]), str(m["assists"]), str(m["saves"]), str(m["conceded"]),
+                    str(m["rating"]), m["score"], m["result"]]
             for j, v in enumerate(vals):
                 self._set_item(tbl, i, j, v)
         tbl.resizeColumnsToContents()
@@ -751,7 +785,10 @@ class RetireWindow(QDialog):
             for idx, e in enumerate(entries):
                 sy = e.get("start_year",""); sw = e.get("start_week",1)
                 ey = e.get("end_year","");   ew = e.get("end_week",52)
-                period = f"{sy}년 {sw}~{ew}주" if sy == ey else f"{sy}년 {sw}주 ~ {ey}년 {ew}주"
+                from constants import week_to_iso_date_str
+                start_str = week_to_iso_date_str(sy, sw) if sy else ""
+                end_str = week_to_iso_date_str(ey, ew) if ey else ""
+                period = f"{start_str} ~ {end_str}"
                 pos = e.get("position","")
                 grp = position_group(pos)
                 m   = e.get("matches",0)
@@ -798,8 +835,12 @@ class RetireWindow(QDialog):
                                   ("기회창출",kp),("드리블",drb)]
 
                 # 한 줄: 기간 | 포지션 | 국가 | 리그 | 팀명 | 연봉 | 출전 | [스탯] | 평점 | 순위 | 승무패 | 계약 | 이적
+                # [2026-07 추가] 리그마다 풀시즌 경기 수가 다르니 분모도 같이 표시.
+                from game_engine import league_total_games_by_name
+                _total_g = league_total_games_by_name(lg)
+                _apps_str = f"{m}/{_total_g}" if _total_g else str(m)
                 head = (f"  • {period} | {pos} | {nation} | {lg} | "
-                        f"{e.get('team_name','')} | {salary} | 출전 {m}")
+                        f"{e.get('team_name','')} | {salary} | 출전 {_apps_str}")
                 lines.append(head)
                 if m > 0:
                     stat_str = "  ".join(f"{k} {v}" for k, v in stat_pairs)
@@ -860,6 +901,35 @@ class RetireWindow(QDialog):
                     else:
                         line += (f"  | {ch['caps']}경기 {ch.get('goals',0)}골 "
                                  f"{ch.get('assists',0)}어시, 평점 {ch.get('rating', 0)}")
+                lines.append(line)
+        else:
+            lines.append("  없음")
+        lines.append("")
+
+        # 컵대회 경력 (국내 컵대회 ─ tier=-2, 대회별 결과 + 활약)
+        cup_trophies = [t for t in trophies if t.get('tier', 0) == -2]
+        lines.append(f"▶ 컵대회 경력  ({len(cup_trophies)}건)")
+        if cup_trophies:
+            conn_u = get_conn()
+            try:
+                cuphist = {(r["year"], r["team_name"]): dict(r) for r in conn_u.execute(
+                    "SELECT * FROM cup_history").fetchall()}
+            except Exception:
+                cuphist = {}
+            conn_u.close()
+            for t in cup_trophies:
+                yr, comp = t.get('year', 0), t.get('competition', '')
+                result   = t.get('league_name', '')   # league_name 자리에 결과 저장됨
+                team     = t.get('team_name', '')
+                _ic = ("🏆" if result == "우승" else
+                       "🥈" if result == "준우승" else
+                       "🥉" if result == "3위" else
+                       "4️⃣" if result == "4위" else "🎖️")
+                line = f"  {_ic} {yr}년  {comp}  →  {result}  ({team})"
+                ch = cuphist.get((yr, team))
+                if ch and ch.get("caps", 0) > 0:
+                    line += (f"  | {ch['caps']}경기 {ch.get('goals',0)}골 "
+                             f"{ch.get('assists',0)}어시, 평점 {ch.get('rating', 0)}")
                 lines.append(line)
         else:
             lines.append("  없음")
@@ -929,7 +999,7 @@ class RetireWindow(QDialog):
         if intl_ms:
             for im in intl_ms:
                 stat = _match_stat_str(im)
-                lines.append(f"  • {im['year']}년 {im['week']}주차  "
+                lines.append(f"  • {im['date']}  "
                              f"{im['comp']} {im['stage']}  vs {im['opp']}  ─  "
                              f"{stat}  평점 {im['rating']}  ({im['score']} {im['result']})")
         else:
@@ -942,7 +1012,7 @@ class RetireWindow(QDialog):
             lines.append(f"▶ 국제전(예선) 기록  ({len(qual_ms2)}경기)")
             for qm in qual_ms2:
                 stat = _match_stat_str(qm)
-                lines.append(f"  • {qm['year']}년 {qm['week']}주차  "
+                lines.append(f"  • {qm['date']}  "
                              f"{qm['comp']} {qm['stage']}  vs {qm['opp']}  ─  "
                              f"{stat}  평점 {qm['rating']}  ({qm['score']} {qm['result']})")
             lines.append("")
@@ -954,9 +1024,24 @@ class RetireWindow(QDialog):
         if cl_ms2:
             for cm in cl_ms2:
                 stat = _match_stat_str(cm)
-                lines.append(f"  • {cm['year']}년 {cm['week']}주차  "
+                lines.append(f"  • {cm['date']}  "
                              f"{cm['comp']} {cm['stage']}  ({cm['team']}) vs {cm['opp']}  ─  "
                              f"{stat}  평점 {cm['rating']}  ({cm['score']} {cm['result']})")
+        else:
+            lines.append("  없음")
+        lines.append("")
+
+        # 컵대회 기록 (경기 단위 ─ A매치 아님, 클럽 출전)
+        import cup_engine
+        cup_ms2 = cup_engine.get_my_cup_matches()
+        lines.append(f"▶ 컵대회 기록  ({len(cup_ms2)}경기)  ※ 국내 컵대회 (A매치 아님)")
+        if cup_ms2:
+            for um in cup_ms2:
+                opp = um["opp"] + (f" ({um['opp_tier']}부)" if um.get("opp_tier") else "")
+                lines.append(f"  • {um['date']}  "
+                             f"{um['comp']} {um['stage']}  vs {opp}  ─  "
+                             f"{um['goals']}골 {um['assists']}어시  평점 {um['rating']}  "
+                             f"({um['score']} {um['result']})")
         else:
             lines.append("  없음")
         lines.append("")

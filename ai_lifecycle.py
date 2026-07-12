@@ -63,9 +63,17 @@ def run_ai_offseason(year, verbose_log=None):
     c = conn.cursor()
 
     _ensure_ai_ages(c)               # 구버전 세이브 age 보정
-    grew, aged = _age_and_progress(c)
-    retired    = _retire_and_replace(c, year)
-    moved      = _transfer_market(c)
+    grew, aged = _age_and_progress(c)   # 자체적으로 전용 컬럼 SELECT (포지션 위치접근 최적화라 별도 유지)
+
+    # [최적화] _retire_and_replace와 _transfer_market이 각자 따로 부르던
+    # "SELECT ... FROM ai_players"(전체 행) 2회를 1회로 통합해 공유한다.
+    # 두 함수가 필요로 하는 컬럼(id,team_id,position,age,name)이 동일 상위집합이라
+    # 안전하게 합칠 수 있다 — 로직/결과는 완전히 동일, 풀스캔 횟수만 3회→2회로 감소.
+    shared_ai_rows = c.execute(
+        "SELECT id, team_id, position, age, name FROM ai_players").fetchall()
+
+    retired    = _retire_and_replace(c, year, shared_ai_rows)
+    moved      = _transfer_market(c, shared_ai_rows)
     formations = _shuffle_formations(c)
 
     conn.commit()
@@ -346,12 +354,17 @@ def _age_and_progress_py(c, rows, team_cap, orphan_fallback):
 # ─────────────────────────────────────────────
 # 3. 은퇴 + 신인 교체
 # ─────────────────────────────────────────────
-def _retire_and_replace(c, year):
+def _retire_and_replace(c, year, ai_rows=None):
     """고령 선수 은퇴 → 같은 팀·같은 포지션에 신인 영입.
     [버그수정] 신인 목표 OVR을 team_avg 기반 → 리그 등급/tier OVR_RANGES 기반으로 변경.
     기존: team_avg가 낮으면 낮은 신인이 들어와 리그 전체 OVR이 해마다 하락하는 버그.
     수정: OVR_RANGES[grade][tier] 범위 하단~중간값을 신인 목표로 사용 → 리그 OVR 유지.
-    [최적화] 팀 info 선조회 + 이름풀 캐시로 은퇴자마다 DB 왕복 제거."""
+    [최적화] 팀 info 선조회 + 이름풀 캐시로 은퇴자마다 DB 왕복 제거.
+    ai_rows: 호출부(run_ai_offseason)가 이미 조회해둔 ai_players 행
+      (id,team_id,position,age,name)을 넘겨받아 재사용 — 이 함수와
+      _transfer_market이 각자 같은 조건의 SELECT를 또 날리던 것을 없애
+      전체 스캔 횟수를 줄인다(로직/결과는 완전히 동일). None이면(단독 호출
+      등 하위호환) 기존처럼 이 함수가 직접 조회한다."""
     from constants import OVR_RANGES, COUNTRY_LEAGUE_GRADE, CONTINENT_OVR_BONUS, COUNTRY_OVR_ADJ
     retired = 0
 
@@ -375,11 +388,14 @@ def _retire_and_replace(c, year):
     _team_country_cache.clear()
 
     # [최적화] 이름 중복방지 캐시 + 은퇴 대상 목록을 별도 두 번 풀스캔하던 것을
-    #   컬럼을 합쳐 1회 SELECT로 통합 (5.9만 행 전체스캔 2회 → 1회).
+    #   컬럼을 합쳐 1회 SELECT로 통합했었고(5.9만 행 전체스캔 2회 → 1회),
+    #   이제 그 SELECT 자체도 호출부에서 넘겨받은 ai_rows로 재사용해
+    #   _transfer_market과의 중복 스캔까지 없앤다(3회 → 2회).
+    _src_rows = ai_rows if ai_rows is not None else c.execute(
+        "SELECT id, team_id, position, age, name FROM ai_players").fetchall()
     team_used_names: dict = {}
     rows = []
-    for r in c.execute(
-            "SELECT id, team_id, position, age, name FROM ai_players").fetchall():
+    for r in _src_rows:
         team_used_names.setdefault(r["team_id"], set()).add(r["name"])
         rows.append(r)
     replace_updates = []  # executemany용
@@ -428,10 +444,14 @@ def _retire_and_replace(c, year):
 # ─────────────────────────────────────────────
 # 4. 이적 시장 (활발하게)
 # ─────────────────────────────────────────────
-def _transfer_market(c):
+def _transfer_market(c, ai_rows=None):
     """선수들이 팀 간 이동. 같은 리그 내 + 일부 리그 간 이적.
     [최적화] ORDER BY RANDOM() 제거 → 팀별 선수 목록 선조회 후 Python shuffle.
-    이적마다 DB 왕복 2회(RANDOM 쿼리) → 0회로 감소."""
+    이적마다 DB 왕복 2회(RANDOM 쿼리) → 0회로 감소.
+    ai_rows: _retire_and_replace와 공유하는 ai_players 선조회 결과
+      (id,team_id,position,age,name) — 이 함수는 id/team_id/position만 쓰므로
+      그대로 재사용 가능(은퇴 처리는 team_id/position/id를 바꾸지 않으므로
+      은퇴 처리 이전에 뜬 스냅샷이어도 유효하다). None이면 기존처럼 직접 조회."""
     moved = 0
 
     teams = [dict(r) for r in c.execute(
@@ -445,9 +465,9 @@ def _transfer_market(c):
     for t in teams:
         by_league.setdefault(t["lid"], []).append(t["tid"])
 
-    # [최적화] 팀별 선수 목록 전체를 단일 쿼리로 선조회 (ORDER BY RANDOM 방지)
-    # _do_one_transfer 내부 루프에서 매번 SELECT 날리던 것 → Python dict 조회로 교체
-    all_players_rows = c.execute(
+    # [최적화] 팀별 선수 목록을 _retire_and_replace와 공유된 스냅샷에서 재사용
+    # (기존엔 여기서 "SELECT id, team_id, position FROM ai_players"를 또 날렸음)
+    all_players_rows = ai_rows if ai_rows is not None else c.execute(
         "SELECT id, team_id, position FROM ai_players").fetchall()
     # {team_id: [{"id":..., "position":...}, ...]}
     team_players: dict = {}

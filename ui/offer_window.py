@@ -35,7 +35,7 @@ QDialog { background:#1e1e1e; color:#ccc; }
 
 class OfferWindow(QDialog):
     def __init__(self, offers: list, lang="ko", parent=None, title="📋 이적 오퍼",
-                 force_select=False, grid=False):
+                 force_select=False, grid=False, apply_slots=0):
         super().__init__(parent)
         from PyQt6.QtCore import Qt
         self.setWindowModality(Qt.WindowModality.NonModal)
@@ -53,6 +53,12 @@ class OfferWindow(QDialog):
         self.neg_failed: set[int] = set()
         self.all_failed = False          # 모든 오퍼 결렬 여부 (1년 훈련 분기용)
         self._close_btn = None           # 닫기 버튼 참조 (전부 결렬 시 활성화)
+        # [2026-07 신설] 직접 지원 슬롯 — 무소속(팀 입단) 창에서만 켜짐.
+        # 패시브 오퍼 카드들 뒤에 빈 슬롯을 두고, 그 안의 "지원하기" 버튼으로
+        # ApplyWindow(팀 검색)를 열어 성공하면 그 오퍼가 일반 오퍼 카드와
+        # 똑같이(협상/입단 가능) self.offers 뒤쪽에 추가된다.
+        self.apply_slots = apply_slots
+        self._applied_count = 0
 
         for i in range(len(offers)):
             self.neg_used[i] = random.randint(1, 3)
@@ -66,7 +72,7 @@ class OfferWindow(QDialog):
         hdr.setStyleSheet("color:#00cc44;font-size:15px;font-weight:bold;")
         root.addWidget(hdr)
 
-        if not self.offers:
+        if not self.offers and not self.apply_slots:
             lbl = QLabel("오퍼가 없습니다." if self.lang=="ko" else "No offers available.")
             lbl.setObjectName("noOffer")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -101,15 +107,61 @@ class OfferWindow(QDialog):
         while self.cards_lay.count():
             item = self.cards_lay.takeAt(0)
             if item.widget(): item.widget().deleteLater()
+        empty_slots = max(0, self.apply_slots - self._applied_count)
         if self.grid:
             for i, offer in enumerate(self.offers):
                 row, col = divmod(i, 2)
                 self.cards_lay.addWidget(self._make_card(i, offer), row, col)
+            base = len(self.offers)
+            for j in range(empty_slots):
+                row, col = divmod(base + j, 2)
+                self.cards_lay.addWidget(self._make_apply_slot_card(), row, col)
             self.cards_lay.setRowStretch(self.cards_lay.rowCount(), 1)
         else:
             for i, offer in enumerate(self.offers):
                 self.cards_lay.addWidget(self._make_card(i, offer))
+            for j in range(empty_slots):
+                self.cards_lay.addWidget(self._make_apply_slot_card())
             self.cards_lay.addStretch()
+
+    def _make_apply_slot_card(self):
+        """[2026-07 신설] 빈 '직접 지원' 슬롯 카드 — 원하는 팀을 검색해서
+        지원하기 버튼. 성공하면 이 카드가 사라지고 그 자리에 일반 오퍼
+        카드(협상/입단 가능)가 self.offers 뒤쪽에 추가되어 나타난다."""
+        from game_engine import get_apply_attempts_left
+        card = QFrame(); card.setObjectName("offerCard")
+        lay = QVBoxLayout(card); lay.setContentsMargins(12, 10, 12, 10); lay.setSpacing(8)
+
+        left = get_apply_attempts_left()
+        title = QLabel("🔎 직접 지원")
+        title.setStyleSheet("font-size:14px;font-weight:bold;color:#888;")
+        lay.addWidget(title)
+
+        hint = QLabel("원하는 팀을 검색해서 직접 지원해보세요.")
+        hint.setStyleSheet("color:#666;font-size:11px;")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+        lay.addStretch()
+
+        btn = QPushButton(f"🔎 팀 검색 · 지원하기 (남은 {left}회)")
+        btn.setObjectName("selectBtn")
+        btn.setEnabled(left > 0)
+        btn.clicked.connect(self._open_apply_search)
+        lay.addWidget(btn)
+        return card
+
+    def _open_apply_search(self):
+        from ui.apply_window import ApplyWindow
+        dlg = ApplyWindow(self.lang, self)
+        dlg.exec()
+        if dlg.chosen:
+            offer = dlg.chosen
+            idx = len(self.offers)
+            self.offers.append(offer)
+            self.offer_salaries.append(offer["salary"])
+            self.neg_used[idx] = random.randint(1, 3)
+            self._applied_count += 1
+        self._render_cards()
 
     def _make_card(self, idx, offer):
         card = QFrame(); card.setObjectName("offerCard")
@@ -124,7 +176,8 @@ class OfferWindow(QDialog):
         h1.addWidget(tl); h1.addWidget(gl); h1.addWidget(trl)
         _zone = offer.get("_zone")
         _zone_txt = {"domestic": "🏠 자국", "prev_league": "🏟 직전리그",
-                     "hometown": "🌍 고향", "foreign": "✈ 해외"}.get(_zone)
+                     "hometown": "🌍 고향", "foreign": "✈ 해외",
+                     "applied": "🔎 직접 지원"}.get(_zone)
         if _zone_txt:
             zl = QLabel(_zone_txt)
             zl.setStyleSheet("color:#888; font-size:10px; background:#2a2a2a;"

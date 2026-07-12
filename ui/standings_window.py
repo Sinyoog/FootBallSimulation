@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor
 
-from game_engine import get_league_standings, get_player
+from game_engine import get_league_standings, get_player, get_state
 from database import get_conn
 
 STYLE = """
@@ -30,9 +30,17 @@ class StandingsWindow(QDialog):
         self.my_team_id  = my_team_id
         self.lang        = lang
         self._build()
-        # 5초마다 자동 갱신
+        # [최적화] main_window.refresh_all()이 부르는 self.refresh()는 항상
+        #   그대로 즉시 다시 그린다(기존 동작 100% 유지 — 이적/승강/국가대표
+        #   선발 등 즉시 반영돼야 하는 명시적 갱신 경로).
+        #   반대로 5초짜리 배경 타이머는 "창을 그냥 열어두고 보고 있는" 동안
+        #   불필요하게 테이블을 통째로 부수고 다시 그리는 게 렉의 원인이었다.
+        #   순위표는 하루가 실제로 진행되기 전까진 절대 안 바뀌므로, 타이머
+        #   폴링에서만 "직전과 조건이 같으면 건너뛰기"를 적용한다 —
+        #   사용자가 보는 결과는 항상 기존과 동일하게 유지된다.
+        self._last_sig = self._compute_sig()
         self._timer = QTimer(self)
-        self._timer.timeout.connect(self.refresh)
+        self._timer.timeout.connect(self._poll_refresh)
         self._timer.start(5000)
 
     def pause_refresh(self):
@@ -64,6 +72,39 @@ class StandingsWindow(QDialog):
                           "border-radius:4px;padding:6px;")
         self._lay.addWidget(btn)
 
+    def _compute_sig(self, league_id=None, my_team_id=None):
+        """순위표가 달라질 수 있는 최소 조건 스냅샷(리그/내팀/진행일자).
+        타이머 폴링 전용 — 이 값이 안 바뀌면 하루가 진행되지 않았다는
+        뜻이라 순위표 내용은 100% 그대로다."""
+        st = get_state()
+        return (self.league_id if league_id is None else league_id,
+                self.my_team_id if my_team_id is None else my_team_id,
+                st.get("current_day") if st else None,
+                st.get("current_season") if st else None)
+
+    def _poll_refresh(self):
+        """5초 배경 타이머 전용 갱신. refresh()와 같은 저비용 조회(내 팀/리그
+        재확인)만 먼저 해보고, 그 결과로 만든 시그니처가 직전과 같으면
+        무거운 테이블 재조회·재렌더링을 건너뛴다(성능 최적화). 조건이
+        하나라도 바뀌었으면 refresh()를 그대로 호출해 완전히 다시 그린다
+        — 즉 사용자가 보는 결과는 항상 기존과 동일하다."""
+        p = get_player()
+        league_id = self.league_id
+        my_team_id = self.my_team_id
+        if p and p.get("current_team_id"):
+            my_team_id = p["current_team_id"]
+            conn = get_conn()
+            row = conn.execute(
+                "SELECT l.id AS lid FROM teams t JOIN leagues l ON t.league_id=l.id WHERE t.id=?",
+                (my_team_id,)).fetchone()
+            conn.close()
+            if row:
+                league_id = row["lid"]
+        sig = self._compute_sig(league_id, my_team_id)
+        if sig == self._last_sig:
+            return
+        self.refresh()
+
     def refresh(self):
         # 내 팀의 '현재' 소속 리그와 팀 ID를 재조회한다.
         #   - 이적: current_team_id 가 바뀜 → my_team_id 갱신(하이라이트 정확)
@@ -86,6 +127,7 @@ class StandingsWindow(QDialog):
                     self._lname = new_name
                     self._lbl.setText(f"📊 {self._lname}")
         self._fill_table()
+        self._last_sig = self._compute_sig()
 
     def _fill_table(self):
         if self._tbl:

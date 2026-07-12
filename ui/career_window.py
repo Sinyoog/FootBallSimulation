@@ -135,6 +135,10 @@ class CareerWindow(QDialog):
         import champions_engine
         cl_ms = champions_engine.get_my_cl_matches()
         tabs.addTab(self._champions_tab(cl_ms, p), f"챔피언스 ({len(cl_ms)})")
+
+        import cup_engine
+        cup_ms = cup_engine.get_my_cup_matches()
+        tabs.addTab(self._cup_tab(cup_ms), f"컵대회 ({len(cup_ms)})")
         root.addWidget(tabs)
         tabs.currentChanged.connect(lambda: self._fit_width())
 
@@ -239,17 +243,17 @@ class CareerWindow(QDialog):
             sy = e.get("start_year", ""); sw = e.get("start_week", 1)
             ey = e.get("end_year", 0);    ew = e.get("end_week", 0)
 
+            from constants import week_to_iso_date_str
+            start_str = week_to_iso_date_str(sy, sw) if sy else ""
             if ey == 0:
-                period = f"{sy}  {sw}주~현재"
+                period = f"{start_str} ~ 현재"
             else:
                 # 실제 종료 주차를 그대로 표시. (예전엔 37주 이상이면 무조건 52로
                 # 뭉개서, 44주에 이적해도 '52주'로 잘못 보였다.) 50주 이상만
                 # 시즌 끝까지 채운 것으로 보고 52로 정리.
                 ew_disp = 52 if ew >= 50 else ew
-                if sy == ey:
-                    period = f"{sy}  {sw}~{ew_disp}주"
-                else:
-                    period = f"{sy}/{sw}주~{ey}/{ew_disp}주"
+                end_str = week_to_iso_date_str(ey, ew_disp)
+                period = f"{start_str} ~ {end_str}"
 
             pos   = e.get("position","")
             sv  = e.get("saves", 0)
@@ -303,9 +307,17 @@ class CareerWindow(QDialog):
             else:
                 # 같은 팀 계속 (대시)
                 c_str = "—"
+            # [2026-07 추가] 리그마다 팀 수·다전제가 달라 풀시즌 경기 수가
+            # 14~58경기로 다 다르다 — "출전 26"만 보면 시즌을 거의 다 뛴
+            # 건지 절반만 뛴 건지 알 수 없어서, 그 리그의 풀시즌 경기 수를
+            # 분모로 같이 보여준다("26/38"). 못 찾으면(리그명 매칭 실패 등)
+            # 그냥 숫자만 표시.
+            from game_engine import league_total_games_by_name
+            _total_g = league_total_games_by_name(ln)
+            _apps_str = f"{e.get('matches',0)}/{_total_g}" if _total_g else str(e.get("matches", 0))
             vals = ([period, pos, country_str, league_str, tn,
                      fmt_money(e.get("salary",0)),
-                     str(e.get("matches",0))]
+                     _apps_str]
                     + stat_vals
                     + [str(avg), rank_disp, wdl, c_str, t_type])
             # 팔림/방출/계약만료는 빨간색 강조
@@ -476,7 +488,7 @@ class CareerWindow(QDialog):
                 "기회창출": str(m.get("key_passes",0)), "드리블": str(m.get("dribbles",0)),
                 "슈팅": str(m.get("shots",0)), "유효": str(m.get("shots_on",0)),
             }
-            vals = ([f"{m['year']} {m['week']}주차", m["position"],
+            vals = ([m['date'], m["position"],
                     f"{m['nat_flag']}{m['nat']}",
                     f"{m['comp']} {m['stage']}",
                     f"{m['opp_flag']}{m['opp']}",
@@ -538,13 +550,53 @@ class CareerWindow(QDialog):
                 "기회창출": str(m.get("key_passes",0)), "드리블": str(m.get("dribbles",0)),
                 "슈팅": str(m.get("shots",0)), "유효": str(m.get("shots_on",0)),
             }
-            vals = ([f"{m['year']} {m['week']}주차", m["position"],
+            vals = ([m['date'], m["position"],
                     f"{m['team_flag']}{m['team']}",
                     f"{m['comp']} {m['stage']}",
                     f"{m['opp_flag']}{m['opp']}",
                     str(m["goals"]), str(m["assists"])]
                     + [_emap.get(c, "—") for c in extra_cols]
                     + [str(m["rating"]), m["score"], res])
+            for j, v in enumerate(vals):
+                self._set(tbl, i, j, v, color if j == len(vals) - 1 else None)
+        lay.addWidget(tbl)
+        return w
+
+    def _cup_tab(self, matches):
+        """[2026-07 신설] 국내 컵대회 경기별 기록: 기간/라운드/상대/스탯/평점/스코어/결과.
+        cup_matches는 챔스처럼 슈팅·패스% 같은 세부 스탯이 없어(모듈 스코프가
+        더 작다), 골/어시/선방/평점 중심으로 국제전·챔스와 같은 톤으로 보여준다."""
+        w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(0, 0, 0, 0)
+
+        conn = get_conn()
+        try:
+            hist = [dict(r) for r in conn.execute(
+                "SELECT * FROM cup_history ORDER BY year").fetchall()]
+        except Exception:
+            hist = []
+        conn.close()
+
+        if hist:
+            parts = [f"{h['year']}년 {h['result']}" for h in hist]
+            hl = QLabel("🎖️ " + "   ·   ".join(parts))
+            hl.setStyleSheet("color:#c48aff;font-size:12px;font-weight:bold;padding:4px;")
+            hl.setWordWrap(True)
+            lay.addWidget(hl)
+
+        if not matches:
+            lay.addWidget(QLabel("컵대회 출전 기록 없음"))
+            return w
+
+        cols = ["기간", "대회", "상대", "골", "어시", "선방", "실점", "평점", "스코어", "결과"]
+        tbl = self._make_table(len(matches), cols)
+        for i, m in enumerate(matches):
+            res = m["result"]
+            color = ("#00cc44" if res.startswith("승")
+                     else "#888888" if res == "무" else "#cc4444")
+            opp = m["opp"] + (f" ({m['opp_tier']}부)" if m.get("opp_tier") else "")
+            vals = [m['date'], f"{m['comp']} {m['stage']}", opp,
+                    str(m["goals"]), str(m["assists"]), str(m["saves"]), str(m["conceded"]),
+                    str(m["rating"]), m["score"], res]
             for j, v in enumerate(vals):
                 self._set(tbl, i, j, v, color if j == len(vals) - 1 else None)
         lay.addWidget(tbl)

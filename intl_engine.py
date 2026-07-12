@@ -467,7 +467,9 @@ def get_forced_commit():
     if (p.get("intl_committed", "") or ""):
         return None   # 이미 고정됨
     week = st.get("current_week", 0)
-    if not (1 <= week <= 4):
+    from constants import SEASON_PHASES
+    _ps_s, _ps_e = SEASON_PHASES["preseason1"]
+    if not (_ps_s <= week <= _ps_e):
         return None
     year = st.get("current_year", 0)
     # [버그수정] 나이는 'age' 컬럼이 정확하다. birth_year는 게임 내내 갱신되지 않아
@@ -1369,9 +1371,9 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
                       (tid, e["name"], e.get("flag",""), e.get("grade","F"),
                        round(e["ovr"], 1), g, is_my, e.get("continent","")))
 
-    # 홈앤어웨이 6라운드 일정 생성 (19~24주차)
+    # 홈앤어웨이 6라운드 일정 생성 (국제대회 오프시즌 조별리그 구간)
     # 라운드로빈 알고리즘: 1팀 고정 + 나머지 회전 → 정방향 3R + 역방향 3R
-    base_week = 18
+    base_week = INTL_GROUP_WEEKS[0]   # 예: 44주차부터
 
     def _round_robin_schedule(names):
         """n팀 라운드로빈. 각 라운드는 (홈, 원정) 쌍의 리스트."""
@@ -1399,8 +1401,8 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
 
         cand_set = set(cand_nats_final)
         for rnd_idx, rnd_pairs in enumerate(all_rounds):
-            wk = base_week + rnd_idx   # 18, 19, 20, 21, 22, 23주
-            wk = min(wk, 23)
+            wk = base_week + rnd_idx   # base_week ~ base_week+5주
+            wk = min(wk, base_week + 5)
             for home_nat, away_nat in rnd_pairs:
                 is_my_match = (
                     (my_nat and (home_nat == my_nat or away_nat == my_nat)) or
@@ -1472,8 +1474,16 @@ def _process_one_tournament_week(t, week):
         (t["id"], week)).fetchall()]
     conn.close()
 
-    for m in pending:
-        _sim_ai_match(t, m)
+    # [최적화] champions_engine/cup_engine과 동일한 패턴: 경기마다 커넥션을
+    # 열고 commit/close 하던 것을, 한 커넥션·한 트랜잭션으로 일괄 처리.
+    # 국제대회 주간에는 대회 여러 개(월드컵+대륙컵+예선 등)가 동시에 진행돼
+    # pending이 수십~백 건 이상일 수 있어 개별 commit 누적 비용이 체감됨.
+    if pending:
+        conn2 = get_conn()
+        for m in pending:
+            _sim_ai_match(t, m, conn=conn2)
+        conn2.commit()
+        conn2.close()
 
     # ── 예선 진행 ──
     if t["kind"] == "wc_qual":
@@ -1486,14 +1496,14 @@ def _process_one_tournament_week(t, week):
         conn2.close()
         status = cur_row["status"] if cur_row else t.get("status", "qual_group")
 
-        # 조별리그: 완료 주차(23주)에 마감
+        # 조별리그: 완료 주차(그룹 구간 마지막 주)에 마감
         if status == "qual_group":
-            qual_last_week = 23
+            qual_last_week = INTL_GROUP_WEEKS[0] + 5
             if week >= qual_last_week:
                 _finalize_qual(t)   # 직행 확정 or qual_po 생성
-        # 플레이오프: 25주차 완료 시 마감
+        # 플레이오프: 완료 시 마감
         elif status == "qual_po":
-            if week >= 25:
+            if week >= INTL_GROUP_WEEKS[0] + 6:
                 _finalize_qual_po(t)  # 플레이오프 승자 → qual_results
         return
 
@@ -1503,15 +1513,25 @@ def _process_one_tournament_week(t, week):
         # 48개국(2002~)은 32강부터, 32개국은 16강부터
         big = (t["year"] >= WC_EXPAND_YEAR)
         if big:
-            plan = {last_group_week: ("R32", 21), 21: ("R16", 22),
-                    22: ("QF", 23), 23: ("SF", 24), 24: ("F", 25), 25: (None, None)}
+            plan = {last_group_week:   ("R32", last_group_week+1),
+                    last_group_week+1: ("R16", last_group_week+2),
+                    last_group_week+2: ("QF",  last_group_week+3),
+                    last_group_week+3: ("SF",  last_group_week+4),
+                    last_group_week+4: ("F",   last_group_week+5),
+                    last_group_week+5: (None, None)}
         else:
-            plan = {last_group_week: ("R16", 21), 21: ("QF", 22),
-                    22: ("SF", 23), 23: ("F", 24), 24: (None, None)}
+            plan = {last_group_week:   ("R16", last_group_week+1),
+                    last_group_week+1: ("QF",  last_group_week+2),
+                    last_group_week+2: ("SF",  last_group_week+3),
+                    last_group_week+3: ("F",   last_group_week+4),
+                    last_group_week+4: (None, None)}
     else:
         # 대륙컵 24개국: 조별(6조) → 16강 → 8강 → 4강 → 결승
-        plan = {last_group_week: ("R16", 21), 21: ("QF", 22),
-                22: ("SF", 23), 23: ("F", 24), 24: (None, None)}
+        plan = {last_group_week:   ("R16", last_group_week+1),
+                last_group_week+1: ("QF",  last_group_week+2),
+                last_group_week+2: ("SF",  last_group_week+3),
+                last_group_week+3: ("F",   last_group_week+4),
+                last_group_week+4: (None, None)}
 
     if week not in plan:
         return
@@ -1592,9 +1612,14 @@ def _resolve_pso(h_ovr, a_ovr):
     return winner_home, score
 
 
-def _sim_ai_match(t, m, my_played=False):
-    """AI끼리(또는 내가 결장한 내 경기) 시뮬."""
-    from game_engine import add_log, get_player
+def _sim_ai_match(t, m, my_played=False, conn=None):
+    """AI끼리(또는 내가 결장한 내 경기) 시뮬.
+
+    conn: 외부에서 연 커넥션을 재사용해 다수 경기를 한 트랜잭션으로 묶는다
+          (champions_engine._sim_ai_match와 동일한 패턴).
+          None이면 자체 커넥션을 열고 commit/close(기존 동작 = 하위 호환).
+    """
+    from game_engine import add_log, get_player, _week_intl_cl_day
     he = _entry(t["id"], m["home"])
     ae = _entry(t["id"], m["away"])
     knockout = m["stage"] not in ("group", "qual_group")  # [버그수정] 예선 조별도 무승부 허용
@@ -1606,12 +1631,23 @@ def _sim_ai_match(t, m, my_played=False):
         pso_winner = m["home"] if win_home else m["away"]
     hs, as_ = _gen_intl_score(outcome)
 
-    conn = get_conn()
+    # [2026-07 신설] 이 경기가 실제로 진행되는 날짜를 지금 시점 기준으로
+    # 한 번 계산해 저장한다 — 나중에 커리어/은퇴창에서 재계산 없이 그대로 쓴다.
+    # [2026-07 성능 수정] cup_engine/champions_engine과 동일한 이유로,
+    # my_played=1(내 경기)로 조회될 때만 의미가 있으므로 AI끼리 경기에서는
+    # 계산을 건너뛴다(월드컵/네이션스컵은 한 라운드에 수십~수백 개국 경기가
+    # 동시에 도는데, 그때마다 get_player() DB 조회를 하던 낭비를 없앤다).
+    day = _week_intl_cl_day(m["week"], get_player() or {}) if m["is_my"] else 0
+
+    _own = conn is None
+    if _own:
+        conn = get_conn()
     conn.execute("""UPDATE intl_matches SET home_score=?, away_score=?,
-                    pso_winner=?, pso_score=? WHERE id=?""",
-                 (hs, as_, pso_winner, pso_score, m["id"]))
-    conn.commit()
-    conn.close()
+                    pso_winner=?, pso_score=?, day=? WHERE id=?""",
+                 (hs, as_, pso_winner, pso_score, day, m["id"]))
+    if _own:
+        conn.commit()
+        conn.close()
 
     # 내 국가 경기(결장 포함)는 로그 출력. AI끼리 경기는 get_player() 불필요.
     if m["is_my"]:
@@ -1700,20 +1736,25 @@ def simulate_my_match(week, p):
     my_result = _my_result(outcome, is_home)
     my_conceded = (as_ if is_home else hs)
 
+    # [2026-07 신설] 실제 진행 날짜 저장 (커리어/은퇴창 표시용).
+    from game_engine import _week_intl_cl_day
+    day = _week_intl_cl_day(week, p)
+
     conn = get_conn()
     conn.execute("""UPDATE intl_matches SET home_score=?, away_score=?,
                     pso_winner=?, pso_score=?,
                     my_played=1, my_nat=?, my_position=?,
                     my_saves=?, my_goals=?, my_assists=?, my_rating=?,
                     my_shots=?, my_shots_on=?, my_key_passes=?,
-                    my_dribbles=?, my_blocks=?, my_pass_acc=?, my_conceded=?
+                    my_dribbles=?, my_blocks=?, my_pass_acc=?, my_conceded=?,
+                    day=?
                     WHERE id=?""",
                  (hs, as_, pso_winner, pso_score,
                   nat, _get_field_pos(p),
                   saves, goals, assists, rating,
                   detail["shots"], detail["shots_on"], detail["key_passes"],
                   detail["dribbles"], detail["blocks"], detail["pass_acc"],
-                  my_conceded, m["id"]))
+                  my_conceded, day, m["id"]))
     conn.commit()
     conn.close()
 
@@ -1895,16 +1936,17 @@ def _finalize_qual(t):
         conn = get_conn(); c = conn.cursor()
         p = get_player()
         my_nat = _my_nat(t, p) if p else ""
+        po_week = INTL_GROUP_WEEKS[0] + 6
         for i in range(0, len(po_pool)-1, 2):
             home = po_pool[i]; away = po_pool[i+1]
             is_my = 1 if my_nat and (home["country"] == my_nat or away["country"] == my_nat) else 0
             c.execute("""INSERT INTO intl_matches
                          (tournament_id, week, stage, home, away, is_my, my_played)
                          VALUES(?,?,?,?,?,?,?)""",
-                      (tid, 25, "qual_po", home["country"], away["country"], is_my, 0))
+                      (tid, po_week, "qual_po", home["country"], away["country"], is_my, 0))
         c.execute("UPDATE intl_tournaments SET status='qual_po' WHERE id=?", (tid,))
         conn.commit(); conn.close()
-        add_log(f"🏆 {t['name']} 플레이오프 시작! (25주차)", "event")
+        add_log(f"🏆 {t['name']} 플레이오프 시작! ({po_week}주차)", "event")
         return  # 플레이오프 완료 후 _finalize_qual_po가 처리
 
     # ─── 즉시 확정 (플레이오프 없는 체제) ───
@@ -2512,8 +2554,15 @@ def get_my_intl_matches(only_qual=False):
         if m["stage"] in ("group", "qual_group") and m["grp"]:
             stage = f"조별 {m['grp']}조"
 
+        # [2026-07 신설] 'N주차' 대신 실제 날짜(YYYY-MM-DD). day가 저장돼
+        # 있으면(신규 경기) 그대로, 없으면(구버전 세이브의 과거 경기) 그
+        # 주의 첫날로 근사한다.
+        from constants import day_to_iso_date_str, week_to_iso_date_str
+        date_str = (day_to_iso_date_str(m["t_year"], m["day"]) if m.get("day")
+                    else week_to_iso_date_str(m["t_year"], m["week"]))
+
         out.append({
-            "year": m["t_year"], "week": m["week"],
+            "year": m["t_year"], "week": m["week"], "date": date_str,
             "position": m["my_position"], "nat": nat,
             "nat_flag": flags.get((m["tournament_id"], nat), ""),
             "comp": m["comp"], "stage": stage,

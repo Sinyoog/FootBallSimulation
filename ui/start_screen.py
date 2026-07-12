@@ -13,7 +13,7 @@ from PyQt6.QtGui import QFont
 from database import reset_game_data, get_conn
 from game_engine import create_player, get_player
 from constants import (POSITIONS, SUB_ROLES, PERSONALITIES, GAME_START_YEAR,
-                       PLAYER_START_AGE, TALENT_TIER_KO, TALENT_TIER_ORDER)
+                       PLAYER_START_AGE, TALENT_TIER_KO, TALENT_TIER_ORDER, PHYSICAL_TRAITS)
 
 DARK_STYLE = """
 QWidget { background-color: #1a1a1a; color: #e0e0e0;
@@ -452,7 +452,29 @@ class NewPlayerDialog(QDialog):
         talent_row.addWidget(self.talent_combo)
         lay.addLayout(talent_row)
 
-        note = QLabel("※ 신체 · 성격 · 특징 · 스탯은 자동 랜덤")
+        # [2026-07 신규] 성격 선택 — 재능 등급과 같은 패턴("🎲 랜덤"이 기본,
+        # 맨 앞에 둬서 안 고르면 알아서 확률 추첨). personality=None을
+        # 넘기면 game_engine.create_player가 알아서 처리한다.
+        personality_row = QHBoxLayout()
+        personality_row.addWidget(QLabel("성격"))
+        self.personality_combo = QComboBox()
+        self.personality_combo.addItem("🎲 랜덤", None)
+        for _p in PERSONALITIES:
+            self.personality_combo.addItem(_p, _p)
+        personality_row.addWidget(self.personality_combo)
+        lay.addLayout(personality_row)
+
+        # [2026-07 신규] 신체 특징 선택 — 위 성격과 동일한 패턴.
+        trait_row = QHBoxLayout()
+        trait_row.addWidget(QLabel("신체 특징"))
+        self.trait_combo = QComboBox()
+        self.trait_combo.addItem("🎲 랜덤", None)
+        for _t in PHYSICAL_TRAITS:
+            self.trait_combo.addItem(_t, _t)
+        trait_row.addWidget(self.trait_combo)
+        lay.addLayout(trait_row)
+
+        note = QLabel("※ 신체(체형·키·몸무게) · 스탯은 자동 랜덤")
         note.setStyleSheet("color: #666666; font-size: 11px;")
         lay.addWidget(note)
 
@@ -499,7 +521,15 @@ class NewPlayerDialog(QDialog):
                 self.nat_btn.setText("🎲 랜덤 (자동 선택)")
 
     def _random_all(self):
-        """랜덤 생성 → 바로 인게임 진입"""
+        """랜덤 생성 → 바로 인게임 진입.
+
+        [2026-07 버그 수정] 이 버튼은 '내가 뭘 골랐든 상관없이 완전
+        랜덤'이어야 하는데, 예전엔 국적/포지션/세부역할만 무작위로 뽑고
+        재능 등급·성격·신체 특징은 콤보에서 골라둔 값을 그대로 반영해서
+        일관성이 없었다(신민용 지적). 이제 이름을 포함한 모든 항목을
+        폼의 현재 선택과 무관하게 매번 새로 굴린다 — 특정 항목만 미리
+        고정하고 싶으면 '✅ 생성' 버튼을 쓰면 된다(그쪽은 선택한 값은
+        그대로, 안 고른 값만 랜덤으로 채운다)."""
         conn = get_conn()
         c = conn.cursor()
         c.execute("""SELECT id, name, flag FROM countries
@@ -516,7 +546,10 @@ class NewPlayerDialog(QDialog):
         rpos  = random.choice(POSITIONS)
         rrole = random.choice(SUB_ROLES.get(rpos, ["기본"]))
 
-        create_player(rname, rpos, rrole, cname, cflag, talent_tier=self.talent_combo.currentData())
+        # talent_tier/personality/physical_trait를 전부 None으로 넘겨서
+        # (콤보 선택과 무관하게) create_player가 알아서 확률 추첨하게 한다.
+        create_player(rname, rpos, rrole, cname, cflag,
+                      talent_tier=None, personality=None, physical_trait=None)
         self.accept()
 
     def _create(self):
@@ -533,9 +566,13 @@ class NewPlayerDialog(QDialog):
         if role is None:
             role = random.choice(SUB_ROLES.get(pos, ["기본"]))
         tier = self.talent_combo.currentData()  # None이면 create_player가 알아서 확률 추첨
+        personality = self.personality_combo.currentData()
+        trait = self.trait_combo.currentData()
         if self._nat:
             nat_name, nat_flag = self._nat
-            create_player(name, pos, role, nat_name, nat_flag, talent_tier=tier)
+            create_player(name, pos, role, nat_name, nat_flag, talent_tier=tier,
+                          personality=personality, physical_trait=trait)
         else:
-            create_player(name, pos, role, talent_tier=tier)
+            create_player(name, pos, role, talent_tier=tier,
+                          personality=personality, physical_trait=trait)
         self.accept()

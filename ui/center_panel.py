@@ -12,7 +12,7 @@ from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QThread, 
 from PyQt6.QtGui import QColor
 
 from game_engine import (
-    get_player, get_state, set_state, advance_4weeks,
+    get_player, get_state, set_state, advance_4weeks, advance_days,
     generate_offers, join_team, get_league_standings,
     get_schedule, fmt_money
 )
@@ -34,17 +34,60 @@ def show_toast(parent, msg, color="#cc4400", duration=1200):
     lbl.show()
     QTimer.singleShot(duration, lbl.deleteLater)
 
+
+class _ProcessingOverlay(QWidget):
+    """[2026-07 추가] 진행 버튼 클릭 시 무거운 처리(advance_days, 특히
+    52→1주 시즌전환)가 도는 동안 화면 전체를 덮는 반투명 오버레이.
+
+    기존엔 main_win.setEnabled(False) + WaitCursor(커서만 모래시계로 바뀜)뿐이라,
+    시즌 전환처럼 몇 초 걸리는 처리 중엔 사용자 눈엔 그냥 '앱이 멈춘 것'과
+    구분이 안 갔다(마우스를 안 움직이면 커서 모양 변화조차 못 봄). 실제 처리
+    시간 자체를 줄이는 것과 별개로, "지금 뭘 하고 있는지"를 화면에 명시해서
+    같은 대기시간이라도 고장으로 오인하지 않게 한다.
+    """
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setStyleSheet("background: rgba(10,10,10,0.72);")
+        lay = QVBoxLayout(self)
+        lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._label = QLabel("⏳ 처리 중...")
+        self._label.setStyleSheet("""
+            color:white; font-size:16px; font-weight:bold;
+            background: rgba(30,30,30,0.9); border:1px solid #555;
+            border-radius:10px; padding:18px 28px;
+        """)
+        self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(self._label)
+        self.hide()
+
+    def show_message(self, text):
+        self._label.setText(text)
+        if self.parent():
+            self.setGeometry(self.parent().rect())
+        self.raise_()
+        self.show()
+        from PyQt6.QtWidgets import QApplication
+        QApplication.processEvents()
+
 TRAIN_OPTS_KO = ["고강도","중강도","강점훈련","약점훈련","저강도","휴식"]
 TRAIN_MAP_KO  = {"고강도":"고강도","중강도":"중강도",
                   "강점훈련":"강점훈련","약점훈련":"약점훈련","저강도":"저강도","휴식":"휴식"}
-# 기본값: 휴식/중강도/중강도/휴식
-TRAIN_DEFAULTS = ["휴식","중강도","중강도","휴식"]
+# [2026-07 변경, 신민용 요청] 기존엔 월~금 중강도 위주 + 토 저강도 + 일 휴식
+#   이었는데, 격일로 고강도 훈련 후 하루 쉬는 패턴(월 고강도-화 휴식-수 고강도-
+#   목 휴식-금 고강도-토 휴식-일 휴식)으로 기본값을 변경. 실전처럼 하루
+#   빡세게 훈련하고 다음날 회복하는 루틴을 기본으로 삼되, 사용자가 각 요일
+#   콤보박스에서 언제든 자유롭게 바꿀 수 있는 건 그대로다(이건 어디까지나
+#   초기 기본값일 뿐).
+TRAIN_DEFAULTS = ["고강도","휴식","고강도","휴식","고강도","휴식","휴식"]
+# [일 단위 전환] 진행 묶음 크기 = 7일(1주). 기존엔 4주(월 단위) 묶음이었다.
+DAY_BUNDLE_SIZE = 7
 
 CENTER_STYLE = """
 QWidget { background-color: #1e1e1e; color: #cccccc; font-size: 12px; }
 #phaseLabel { color: #00cc44; font-size: 14px; font-weight: bold; }
 #noMatch    { color: #666666; font-size: 12px; }
 #weekFrame  { background-color: #252525; border:1px solid #333; border-radius:6px; }
+#weekFrame[weekend="true"] { background-color: #3a1a1a; border:1px solid #7a3030; border-radius:6px; }
 #weekTitle  { color: #aaaaaa; font-size: 11px; }
 QComboBox   { background-color:#2a2a2a; color:#cccccc;
               border:1px solid #444; border-radius:4px; padding:4px; }
@@ -98,7 +141,7 @@ QLabel  { color:#cccccc; font-size:13px; }
 
 
 class _AdvanceWorker(QThread):
-    """주차/시즌 진행(advance_4weeks)을 백그라운드 스레드에서 처리.
+    """일자/시즌 진행(advance_days)을 백그라운드 스레드에서 처리.
 
     52→1주 시즌전환 시 _end_of_season → run_ai_offseason(AI 생애주기,
     수만 명 규모) 등 무거운 DB 작업이 한꺼번에 일어나는데, 이걸 메인(UI)
@@ -120,7 +163,7 @@ class _AdvanceWorker(QThread):
 
     def run(self):
         try:
-            advance_4weeks(self._schedule)
+            advance_days(self._schedule)
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -139,12 +182,17 @@ class CenterPanel(QWidget):
         self._auto_offer_shown = False   # 이번 구간 자동 오퍼 표시 여부
         # ── 1주씩 보기 상태 ──
         # _step_mode : 1주씩 보기 on/off
-        # _locked_sched : 1주씩 진행 시작 시 고정한 4주 일정 (4개)
+        # _locked_sched : 하루씩 진행 시작 시 고정한 1주(7일) 일정 (7개)
         # _step_idx : 현재 묶음에서 진행한 주 수 (0~3). 0이면 묶음 시작 전.
         self._step_mode    = False
         self._locked_sched = None
         self._step_idx     = 0
         self._restoring    = False   # 복원 중 콤보 시그널이 저장을 되부르는 것 방지
+        # [2026-07 추가] 경기 전날 강제휴식이 원래 선택을 덮어쓴 뒤, 그 경기가
+        # 없어졌을 때(일정 재생성 등) 원래 선택으로 되돌리기 위한 저장소.
+        # {day(정수, 연중 일자): 사용자가 마지막으로 '직접' 고른 문자열}
+        self._day_prefs    = {}
+        self._proc_overlay = None   # 진행 중 오버레이(지연 생성)
         self._build()
         # 세이브에 저장된 메인 화면 상태(모드/묶음/콤보)를 복원한다.
         self._restore_ui_state()
@@ -158,30 +206,53 @@ class CenterPanel(QWidget):
         self.lay.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         # 페이즈 라벨
-        self.lbl_phase = QLabel("비시즌  |  1990년 1시즌  1~4주")
+        self.lbl_phase = QLabel("비시즌  |  1990년 1시즌  1일차")
         self.lbl_phase.setObjectName("phaseLabel")
         self.lay.addWidget(self.lbl_phase)
 
-        self.lbl_no_match = QLabel("이번 달 경기 없음")
+        self.lbl_no_match = QLabel("이번 주 경기 없음")
         self.lbl_no_match.setObjectName("noMatch")
         self.lay.addWidget(self.lbl_no_match)
 
-        # 4주 스케줄
-        sched_row = QHBoxLayout(); sched_row.setSpacing(8)
-        self.week_combos : list[QComboBox] = []
+        # [일 단위 전환] 1주(7일) 스케줄 — 하루에 콤보박스 1개(그날의 훈련/휴식,
+        #   경기 있는 날은 자동으로 "⚽ 경기" 표시로 대체).
+        sched_row = QHBoxLayout(); sched_row.setSpacing(6)
+        self.week_combos : list[QComboBox] = []   # 이제 '주'가 아니라 '일' 7개를 담음
         self.week_hints  : list[QLabel]    = []
         self.week_frames : list[QFrame]    = []
 
-        for i in range(4):
+        day_labels_kr = ["월", "화", "수", "목", "금", "토", "일"]
+        for i in range(DAY_BUNDLE_SIZE):
             f = QFrame(); f.setObjectName("weekFrame")
-            fl = QVBoxLayout(f); fl.setContentsMargins(8,8,8,8); fl.setSpacing(4)
+            is_weekend = i >= 5   # 토(5), 일(6)
+            # [2026-07 수정] 예전엔 주말 콤보박스 자체를 빨갛게 칠했는데,
+            # 원하는 모습은 "선택창(콤보박스)은 평일과 똑같은 회색이고, 그
+            # 바깥 박스(프레임) 테두리만 빨간색"이었다. 그래서 색을
+            # 콤보박스가 아니라 f(QFrame)에 dynamic property로 표시하고,
+            # #weekFrame[weekend="true"] 스타일시트 규칙이 그걸 읽어서
+            # 배경/테두리만 빨갛게 바꾼다 — 진행 중인 날(글로우 효과) 표시와
+            # 겹쳐도 _set_glow()가 setStyleSheet("")로 되돌릴 때 이 규칙이
+            # 그대로 다시 적용되므로 서로 안 부딪힌다.
+            f.setProperty("weekend", True if is_weekend else False)
+            fl = QVBoxLayout(f); fl.setContentsMargins(6,8,6,8); fl.setSpacing(4)
 
-            wl = QLabel(f"{i+1}주차"); wl.setObjectName("weekTitle")
+            wl = QLabel(day_labels_kr[i]); wl.setObjectName("weekTitle")
             wl.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
             cb = QComboBox(); cb.addItems(TRAIN_OPTS_KO)
             cb.setCurrentText(TRAIN_DEFAULTS[i])
             cb.currentTextChanged.connect(self._update_preview)
+            # [2026-07 추가] 경기 전날 강제 휴식(_get_match_for_day 로직)이
+            # 콤보를 "휴식"으로 덮어쓰는데, 이걸 currentText로만 관리하면
+            # 나중에 그 경기가 사라졌을 때(일정 재생성 등) 원래 사용자가
+            # 골라뒀던 훈련으로 못 돌아가고 "휴식"에 그대로 눌러앉는 버그가
+            # 있었다. cb.isEnabled()가 False일 때(=강제 잠금 중일 때)는
+            # 이 시그널이 내가 프로그램적으로 setCurrentText한 것이지 실제
+            # 사용자 입력이 아니므로 저장하지 않는다 — 그래서 항상
+            # setEnabled(False)를 setCurrentText보다 먼저 호출해야 한다
+            # (아래 refresh()의 강제 잠금 코드도 그 순서를 지킨다).
+            cb.currentTextChanged.connect(
+                lambda text, idx=i: self._on_day_combo_changed(idx, text))
 
             # 경기 있을 때 대체 표시용 라벨
             ml = QLabel("⚽ 경기"); ml.setObjectName("matchLabel")
@@ -195,7 +266,7 @@ class CenterPanel(QWidget):
 
             fl.addWidget(wl); fl.addWidget(cb); fl.addWidget(ml); fl.addWidget(hl)
 
-            # "진행할 주" 강조용 형광 발광 효과 (평소엔 꺼둠)
+            # "진행할 날" 강조용 형광 발광 효과 (평소엔 꺼둠)
             glow = QGraphicsDropShadowEffect(f)
             glow.setColor(QColor("#00ff88"))
             glow.setOffset(0, 0)
@@ -220,16 +291,16 @@ class CenterPanel(QWidget):
 
         # 진행 버튼 + 모드 토글
         adv_row = QHBoxLayout(); adv_row.setSpacing(8)
-        self.adv_btn = QPushButton("▶▶  이번 달 진행 (4주)")
+        self.adv_btn = QPushButton("▶▶  이번 주 진행")
         self.adv_btn.setObjectName("advBtn")
         self.adv_btn.clicked.connect(self._advance)
         adv_row.addWidget(self.adv_btn, 1)
 
-        # 1주/4주 모드 토글
-        self.btn_mode = QPushButton("📅 4주씩")
+        # 하루씩/1주씩 모드 토글
+        self.btn_mode = QPushButton("📅 1주씩")
         self.btn_mode.setObjectName("modeBtn")
         self.btn_mode.setCheckable(True)
-        self.btn_mode.setToolTip("클릭하면 1주씩 보기 / 4주씩 보기 전환")
+        self.btn_mode.setToolTip("클릭하면 하루씩 보기 / 1주씩 보기 전환")
         self.btn_mode.clicked.connect(self._toggle_mode)
         adv_row.addWidget(self.btn_mode)
         self.lay.addLayout(adv_row)
@@ -237,7 +308,7 @@ class CenterPanel(QWidget):
         # 예상 변화 박스
         pvbox = QFrame(); pvbox.setObjectName("previewBox")
         pvlay = QVBoxLayout(pvbox); pvlay.setContentsMargins(12,8,12,8)
-        pvlay.addWidget(QLabel("이번 달 예상 변화"))
+        pvlay.addWidget(QLabel("이번 주 예상 변화"))
         self.lbl_pv_stress = QLabel("예상 스트레스: 0")
         self.lbl_pv_happy  = QLabel("예상 행복도: +0")
         self.lbl_pv_match  = QLabel("경기 수: 0경기")
@@ -340,21 +411,21 @@ class CenterPanel(QWidget):
             locked_raw = st.get("locked_sched") or ""
             if self._step_mode and locked_raw:
                 try:
-                    slim = json.loads(locked_raw)   # [[week, ttype], ...] 4개
-                    if isinstance(slim, list) and len(slim) == 4:
+                    slim = json.loads(locked_raw)   # [[day, ttype], ...] 7개
+                    if isinstance(slim, list) and len(slim) == DAY_BUNDLE_SIZE:
                         from game_engine import get_player
                         p = get_player() or {}
                         rebuilt = []
-                        for w, ttype in slim:
-                            mi = (self._get_match(w, p)
+                        for d, ttype in slim:
+                            mi = (self._get_match_for_day(d, p)
                                   if p.get("current_team_id") else None)
                             if mi:
-                                rebuilt.append((w, "경기", mi))
+                                rebuilt.append((d, "경기", mi))
                             else:
-                                rebuilt.append((w, ttype, None))
+                                rebuilt.append((d, ttype, None))
                         self._locked_sched = rebuilt
                         idx = int(st.get("step_idx", 0))
-                        self._step_idx = max(0, min(idx, 3))
+                        self._step_idx = max(0, min(idx, DAY_BUNDLE_SIZE - 1))
                     else:
                         self._locked_sched = None
                         self._step_idx     = 0
@@ -362,14 +433,14 @@ class CenterPanel(QWidget):
                     self._locked_sched = None
                     self._step_idx     = 0
             else:
-                # 4주 모드이거나 진행 중 묶음이 없음 → 깨끗한 시작 상태
+                # 1주 모드이거나 진행 중 묶음이 없음 → 깨끗한 시작 상태
                 self._locked_sched = None
                 self._step_idx     = 0
 
             # 토글 버튼 라벨/체크 상태를 복원된 모드에 맞춘다.
             try:
                 self.btn_mode.setChecked(self._step_mode)
-                self.btn_mode.setText("📆 1주씩" if self._step_mode else "📅 4주씩")
+                self.btn_mode.setText("📆 하루씩" if self._step_mode else "📅 1주씩")
             except Exception:
                 pass
         finally:
@@ -405,72 +476,98 @@ class CenterPanel(QWidget):
         if not p or not st:
             return
 
+        from constants import day_to_week, DAYS_PER_WEEK, day_to_date_str, day_to_full_date_str
         year   = st["current_year"]
         week   = st["current_week"]
         season = st["current_season"]
         lang   = p.get("language","ko")
+        day    = st.get("current_day") or ((week - 1) * DAYS_PER_WEEK + 1)
 
-        # 1주씩 모드인데 고정된 묶음 일정이 없으면 '묶음 시작 전' 상태다.
-        #   (예전엔 (week-1)%4 로 위치를 추측했으나, 국제대회/강제진행 등으로
-        #    4주 경계가 깨지면 엉뚱한 묶음으로 잘못 복원돼 일정이 어긋났다.
-        #    이제 진행 상태는 _save/_restore_ui_state 로 정확히 영속화하므로,
-        #    일정이 없으면 추측하지 말고 깨끗한 시작(idx=0)으로 둔다.)
+        # 하루씩 모드인데 고정된 묶음 일정이 없으면 '묶음 시작 전' 상태다.
+        #   진행 상태는 _save/_restore_ui_state 로 정확히 영속화하므로,
+        #   일정이 없으면 추측하지 말고 깨끗한 시작(idx=0)으로 둔다.
         if self._step_mode and self._locked_sched is None:
             self._step_idx = 0
 
-        # 표시 기준 묶음 시작 주차 = 현재주 - 진행한 주수
-        bundle_start = week - self._step_idx if self._step_mode else week
+        # 표시 기준 묶음 시작 일자 = 현재일 - 진행한 일수
+        bundle_start = day - self._step_idx if self._step_mode else day
 
-        phase = _half(bundle_start, lang)
+        phase = _half(day_to_week(bundle_start), lang)
 
         if self._step_mode:
             done = self._step_idx
             self.lbl_phase.setText(
-                f"{phase}  |  {year}년 {season}시즌  "
-                f"{bundle_start}~{bundle_start+3}주  (1주씩 {done}/4)")
-            self.adv_btn.setText(f"▶  1주 진행  ({done+1}/4주차)")
+                f"{phase}  |  {season}시즌  "
+                f"{day_to_full_date_str(year, bundle_start)} ({day_to_week(bundle_start)}주차)  (하루씩 {done}/{DAY_BUNDLE_SIZE})")
+            self.adv_btn.setText(f"▶  하루 진행  ({day_to_full_date_str(year, day)}, {done+1}/{DAY_BUNDLE_SIZE}일차)")
         else:
             self.lbl_phase.setText(
-                f"{phase}  |  {year}년 {season}시즌  {week}~{week+3}주")
-            self.adv_btn.setText("▶▶  이번 달 진행 (4주)")
+                f"{phase}  |  {season}시즌  "
+                f"{day_to_full_date_str(year, day)} ({week}주차)")
+            self.adv_btn.setText("▶▶  이번 주 진행")
 
-        # 주차별 표시 (프레임 4칸은 항상 [묶음 시작 ~ +3])
-        # [최적화] _get_match를 루프 전에 미리 일괄 조회 (기존: 루프마다 DB+intl/cl 조회 4회)
+        # 일자별 표시 (프레임 7칸은 항상 [묶음 시작 ~ +6])
+        # [최적화] _get_match_for_day를 루프 전에 미리 일괄 조회
         _has_team = bool(p.get("current_team_id"))
         _match_cache = {
-            bundle_start + i: (self._get_match(bundle_start + i, p) if _has_team else None)
-            for i in range(4)
+            bundle_start + i: (self._get_match_for_day(bundle_start + i, p) if _has_team else None)
+            for i in range(DAY_BUNDLE_SIZE)
         }
 
+        day_labels_kr = ["월", "화", "수", "목", "금", "토", "일"]
         for i, (f, cb) in enumerate(zip(self.week_frames, self.week_combos)):
-            w  = bundle_start + i
-            ph = _phase_short(w, lang)
+            d  = bundle_start + i
+            w_of_d = day_to_week(d)
+            ph = _phase_short(w_of_d, lang)
+            dow = day_labels_kr[(d - 1) % DAYS_PER_WEEK]
+            date_str = day_to_date_str(d)
             labels = f.findChildren(QLabel)
-            # labels[0]=주차타이틀, labels[1]=matchLabel, labels[2]=stressHint
+            # labels[0]=요일타이틀, labels[1]=matchLabel, labels[2]=stressHint
 
             if self._step_mode:
-                # 1주씩: 콤보 잠금(묶음 일정 고정), 진행 상태 표시
+                # 하루씩: 콤보 잠금(묶음 일정 고정), 진행 상태 표시
                 cb.setEnabled(False)
                 if i < self._step_idx:
                     tag = "✓ 완료"; f.setEnabled(False)
                     self._set_glow(f, False)
                 elif i == self._step_idx:
-                    tag = "▶ 진행할 주"; f.setEnabled(True)
-                    self._set_glow(f, True)      # 진행할 주만 형광 발광
+                    tag = "▶ 진행할 날"; f.setEnabled(True)
+                    self._set_glow(f, True)      # 진행할 날만 형광 발광
                 else:
                     tag = "대기"; f.setEnabled(False)
                     self._set_glow(f, False)
-                if labels: labels[0].setText(f"{w}주차 [{ph}]  {tag}")
+                if labels: labels[0].setText(f"{dow} {date_str}  {tag}")
             else:
                 cb.setEnabled(True)
                 f.setEnabled(True)
-                self._set_glow(f, False)         # 4주 모드: 강조 없음
-                if labels: labels[0].setText(f"{w}주차 [{ph}]")
+                self._set_glow(f, False)         # 1주 모드: 강조 없음
+                if labels: labels[0].setText(f"{dow} {date_str}")
 
-            match_info = _match_cache.get(w)
+            match_info = _match_cache.get(d)
             # matchLabel, stressHint 찾기
             ml = next((l for l in labels if l.objectName()=="matchLabel"), None)
             hl = self.week_hints[i]
+
+            # [2026-07 추가] 부상 중이면 그 부상이 남아있는 날짜만큼은 무슨
+            # 요일이든(경기 예정일이었어도) 훈련 선택 콤보 대신 "🚑 부상"을
+            # 보여준다 — 실제 진행 로직(advance_days)도 부상 중엔 그날
+            # 예정이 뭐였든 무시하고 부상 휴식으로 처리하므로, 화면도 그와
+            # 똑같이 보여줘야 "왜 훈련이 안 먹히지" 하는 혼란이 없다.
+            # injury_weeks는 이제(버그 수정 후) '남은 일수'를 담고 있어서,
+            # 오늘(day)부터 d까지 며칠 지났는지로 그날도 부상 중인지 정확히
+            # 계산할 수 있다.
+            _inj_days_left = p.get("injury_weeks", 0) if p.get("injured") else 0
+            if _inj_days_left > 0 and (d - day) < _inj_days_left:
+                cb.hide()
+                _idetail3 = p.get("injury_detail") or "부상"
+                _days_left_that_day = _inj_days_left - (d - day)
+                hl.setText(f"🚑 {_days_left_that_day}일 남음")
+                if ml:
+                    ml.setText(f"🚑 부상\n{_idetail3}")
+                    ml.setStyleSheet("color:#ff6666;font-weight:bold;font-size:12px;"
+                                     "background:#3a1a1a;border-radius:4px;padding:4px;")
+                    ml.show()
+                continue
 
             if match_info:
                 cb.hide()
@@ -496,6 +593,19 @@ class CenterPanel(QWidget):
                         ml.setStyleSheet("color:#ffd24d;font-weight:bold;font-size:12px;"
                                          "background:#3a2f1a;border-radius:4px;padding:4px;")
                         ml.show()
+                elif match_info.get("cup"):
+                    # [2026-07 신설] 국내 컵대회(FA컵식)
+                    rname = match_info.get("round_name", "")
+                    opp   = match_info.get("opp", "")
+                    _otier = match_info.get("opp_tier")
+                    opp_disp = f"{opp} ({_otier}부)" if _otier else opp
+                    loc   = "홈" if match_info.get("is_home") else "원정"
+                    hl.setText("스트레스 +8")
+                    if ml:
+                        ml.setText(f"🎖️ {match_info['league_name']} {rname} ({loc})\nvs {opp_disp}")
+                        ml.setStyleSheet("color:#c48aff;font-weight:bold;font-size:12px;"
+                                         "background:#2a1a3a;border-radius:4px;padding:4px;")
+                        ml.show()
                 else:
                     league_name = match_info.get("league_name", "")
                     loc = "홈" if match_info.get("is_home") else "원정"
@@ -507,14 +617,43 @@ class CenterPanel(QWidget):
                                          "background:#1a3a1a;border-radius:4px;padding:4px;")
                         ml.show()
             else:
-                if ml: ml.hide()
-                cb.show()
+                # [2026-07 재설계] 예전엔 경기 전날이면 콤보를 비활성화하고
+                # 텍스트 자체를 "휴식"으로 덮어썼다 — 근데 이러면 사용자가
+                # 원래 그날 뭘 골라놨었는지(예: 고강도)가 화면에서 아예
+                # 사라지고, 진짜 사용자가 "휴식"을 고른 것처럼 보였다.
+                # 이제는 경기 매치 라벨(ml)과 똑같은 방식으로 콤보 자체를
+                # 숨기고 "🛌 대회 전 휴식" 전용 라벨을 보여준다 — 콤보의
+                # currentText는 절대 안 건드리므로 사용자의 원래 선택이
+                # 화면 밑에 그대로 보존되고, 그 경기가 없어지면 콤보가
+                # 다시 나타나면서 원래 선택이 그대로 드러난다(별도 복원
+                # 로직이 필요 없어짐). 실제 스트레스/휴식 효과는 이 표시와
+                # 무관하게 _advance의 스케줄 빌더가 "내일 경기 있으면 오늘
+                # 무조건 휴식 처리"로 그대로 적용한다.
+                next_mi = _match_cache.get(d + 1)
+                if next_mi is None and d + 1 not in _match_cache:
+                    next_mi = self._get_match_for_day(d + 1, p) if _has_team else None
+                if next_mi:
+                    cb.hide()
+                    loc_txt = "원정 이동" if next_mi.get("is_home") is False else "경기 하루 전"
+                    hl.setText(f"🚌 {loc_txt} (스트레스 -15)")
+                    if ml:
+                        ml.setText("🛌 대회 전 휴식")
+                        ml.setStyleSheet("color:#99ccff;font-weight:bold;font-size:12px;"
+                                         "background:#1a2a3a;border-radius:4px;padding:4px;")
+                        ml.show()
+                else:
+                    if ml: ml.hide()
+                    cb.setEnabled(True)
+                    hl.setText("")
+                    cb.show()
 
         # 버튼 활성/비활성
-        is_pre  = 1  <= week <= 4
-        is_mid  = 12 <= week <= 25
-        is_post = 33 <= week <= 52
-        is_off  = is_pre or is_mid or is_post
+        from constants import SEASON_PHASES
+        _ps_s, _ps_e = SEASON_PHASES["preseason1"]      # 1~3주
+        _os_s, _os_e = SEASON_PHASES["postseason"]       # 44~52주 (국제대회 전용 비시즌)
+        is_pre  = _ps_s <= week <= _ps_e
+        is_post = _os_s <= week <= _os_e
+        is_off  = is_pre or is_post
 
         from constants import MIN_JOIN_AGE
         age = p.get("age", 16)
@@ -523,13 +662,18 @@ class CenterPanel(QWidget):
 
         self.btn_join.setEnabled(can_join)
         self.btn_join.setVisible(not has_team)
-        self.btn_agent.setEnabled(is_off)
-        # [은퇴] 리그 경기(35주)가 끝나고 우승·수상이 확정 가능한 37~52주,
-        #   그리고 새 시즌 시작 직후이자 계약 연장 거절 타이밍인 1~4주차에 허용.
-        #   - 1~4주: 직전 시즌은 이미 시즌전환(_end_of_season)으로 우승·수상이
+        # [2026-07] 에이전트는 이제 비시즌 제한 없이 언제든 변경 가능하므로
+        # 버튼도 항상 활성화한다(예전엔 is_off일 때만 눌렸음).
+        # [은퇴] 리그 경기(신규 캘린더: 43주)가 끝나고 우승·수상이 확정 가능한
+        #   국제대회 비시즌(44~52주), 그리고 새 시즌 시작 직후이자 계약 연장
+        #   거절 타이밍인 프리시즌(1~3주)에 허용.
+        #   - 프리시즌: 직전 시즌은 이미 시즌전환(_end_of_season)으로 우승·수상이
         #     확정됐고, 새 시즌은 아직 경기가 없어 누락 위험이 없다.
-        #   - 12주·26~36주 등 리그 진행 중에는 여전히 은퇴 불가(우승 누락 방지).
-        can_retire = (1 <= week <= 4) or (37 <= week <= 52)
+        #   - 그 외(4~43주) 리그 진행 중에는 여전히 은퇴 불가(우승 누락 방지).
+        # [2026-07 요청 반영] 예전엔 리그 진행 중(4~43주)엔 은퇴가 막혀 있었다
+        # (우승·수상 확정 전에 은퇴해서 누락되는 걸 막기 위함) — 신민용 요청으로
+        # 항상 활성화한다. 트로피/수상 누락 위험은 여전히 존재할 수 있으니 참고.
+        can_retire = True
         self.btn_retire.setEnabled(can_retire)
         has_team = bool(p.get("current_team_id"))
         self.btn_standing.setEnabled(has_team)
@@ -661,16 +805,37 @@ class CenterPanel(QWidget):
         conn = get_conn()
         row = conn.execute(
             "SELECT COUNT(*) as n FROM match_results WHERE league_id=? "
-            "AND week BETWEEN ? AND ? AND (home_team_id=? OR away_team_id=?)",
-            (lid, week, week+3, tid, tid)).fetchone()
+            "AND week=? AND (home_team_id=? OR away_team_id=?)",
+            (lid, week, tid, tid)).fetchone()
         conn.close()
         if row["n"] > 0:
             return True
         import intl_engine
-        if intl_engine.has_my_match_between(week, week+3):
+        if intl_engine.has_my_match_between(week, week):
             return True
         import champions_engine
-        return champions_engine.has_my_cl_match_between(week, week+3)
+        return champions_engine.has_my_cl_match_between(week, week)
+
+    def _on_day_combo_changed(self, idx, text):
+        """[2026-07 추가] 콤보 idx번(0~6)이 바뀌었을 때, 지금 그게 실제로
+        가리키는 연중 일자(day)를 계산해서 '사용자가 직접 고른 값'으로
+        저장한다. 단, 지금 그 콤보가 비활성 상태(강제 휴식 잠금 중)라면
+        이건 내가 setCurrentText로 프로그램적으로 바꾼 것뿐이라 저장하지
+        않는다 — 그래야 나중에 강제 휴식이 풀렸을 때 사용자의 원래 선택을
+        복원할 수 있다."""
+        if self._restoring:
+            return
+        cb = self.week_combos[idx]
+        if not cb.isEnabled():
+            return
+        st = get_state()
+        if not st:
+            return
+        from constants import DAYS_PER_WEEK
+        week = st["current_week"]
+        day  = st.get("current_day") or ((week - 1) * DAYS_PER_WEEK + 1)
+        bundle_start = day - self._step_idx if self._step_mode else day
+        self._day_prefs[bundle_start + idx] = text
 
     def _update_preview(self):
         total_stress = 0
@@ -709,27 +874,59 @@ class CenterPanel(QWidget):
     # ── 모드 토글 ────────────────────────────────
 
     def _toggle_mode(self):
-        """1주씩 보기 ↔ 4주씩 보기 전환.
-        단, 1주씩 진행 도중(묶음 일부만 진행)에는 전환 불가."""
+        """하루씩 보기 ↔ 1주씩 보기 전환.
+        단, 하루씩 진행 도중(묶음 일부만 진행)에는 전환 불가."""
         if self._step_idx > 0:
             # 묶음 진행 중 → 전환 막고 버튼 상태 원위치
             self.btn_mode.setChecked(self._step_mode)
-            show_toast(self, "⚠  진행 중인 4주를 끝낸 뒤 전환할 수 있습니다", "#cc6600", 1600)
+            show_toast(self, "⚠  진행 중인 1주를 끝낸 뒤 전환할 수 있습니다", "#cc6600", 1600)
             return
 
         self._step_mode = self.btn_mode.isChecked()
         if self._step_mode:
-            self.btn_mode.setText("📆 1주씩")
-            show_toast(self, "🔍 1주씩 보기  —  4주 일정대로 한 주씩 진행", "#664400", 1500)
+            self.btn_mode.setText("📆 하루씩")
+            show_toast(self, "🔍 하루씩 보기  —  1주 일정대로 하루씩 진행", "#664400", 1500)
         else:
-            self.btn_mode.setText("📅 4주씩")
+            self.btn_mode.setText("📅 1주씩")
             self._locked_sched = None
             self._step_idx     = 0
-            show_toast(self, "📅 4주씩 보기  —  한 달씩 진행", "#006622", 1400)
+            show_toast(self, "📅 1주씩 보기  —  한 주씩 진행", "#006622", 1400)
         self._save_ui_state()   # 모드 전환 결과를 세이브에 반영
         self.refresh()
 
     # ── 진행 ─────────────────────────────────────
+
+    def _toggle_popup_timers(self, pause: bool):
+        """[스레드 안전] schedule_window/standings_window의 5초 자동갱신,
+        world_browser_window의 검색 디바운스 등 QTimer는 메인 스레드에서
+        돈다 — main_win.setEnabled(False)로는 안 막힌다(그건 사용자 입력만
+        차단). 워커가 DB에 쓰는 동안 이 타이머들이 같은 커넥션으로 SELECT를
+        던지면 진짜 동시 접근이 되므로, 워커 시작 전에 명시적으로 멈추고
+        끝나면 되돌린다. 창이 이미 닫혀 C++ 객체가 삭제된 경우도 있어
+        RuntimeError는 조용히 무시한다.
+        [2026-07 버그 수정] world_browser_window(세계기록실)가 이 목록에
+        빠져있었다 — 그 창은 비모달 QDialog라 main_win.setEnabled(False)로도
+        안 막히는데, 검색창 디바운스 타이머(250ms)가 워커와 같은 풀 커넥션을
+        건드려서 "not an error"/"no transaction is active" 류 크래시의
+        실제 원인 중 하나였다(다른 타이머는 이미 다 막아뒀는데 이 창만 누락)."""
+        for win in (getattr(self, "_schedule_win", None), getattr(self, "_standings_win", None),
+                    getattr(self, "_world_win", None)):
+            if win is None:
+                continue
+            try:
+                win.pause_refresh() if pause else win.resume_refresh()
+            except RuntimeError:
+                pass  # 창이 이미 닫혀 C++ 객체가 삭제된 경우
+
+    def _show_processing_overlay(self, text):
+        target = self.main_win if self.main_win else self
+        if self._proc_overlay is None or self._proc_overlay.parent() is not target:
+            self._proc_overlay = _ProcessingOverlay(target)
+        self._proc_overlay.show_message(text)
+
+    def _hide_processing_overlay(self):
+        if self._proc_overlay is not None:
+            self._proc_overlay.hide()
 
     def _advance(self):
         from PyQt6.QtWidgets import QApplication
@@ -746,7 +943,7 @@ class CenterPanel(QWidget):
             return
 
         # [복수국적] 대표팀 선택이 대기 중이면 그것부터 처리 (진행 차단)
-        #   ※ 22세 1~4주차 강제확정은 '새해 진입 직후'에 띄운다(아래 advance_4weeks 뒤).
+        #   ※ 22세 1~4주차 강제확정은 '새해 진입 직후'에 띄운다(아래 advance_days 뒤).
         #     일정을 짜기 전에 먼저 국적을 정하도록 하기 위함.
         import intl_engine
         forced = intl_engine.get_forced_commit()
@@ -766,13 +963,16 @@ class CenterPanel(QWidget):
             return
 
         week = st["current_week"]
-        from constants import MIN_JOIN_AGE
+        from constants import DAYS_PER_WEEK
+        day  = st.get("current_day") or ((week - 1) * DAYS_PER_WEEK + 1)
+        from constants import MIN_JOIN_AGE, SEASON_PHASES
+        _ps_s, _ps_e = SEASON_PHASES["preseason1"]
 
-        # 17살 이상인데 팀이 없고 비시즌(1~4주)이면 입단 강제.
+        # 17살 이상인데 팀이 없고 프리시즌(1~3주)이면 입단 강제.
         #   단, 올해 모든 오퍼가 결렬돼 '1년 훈련'을 택한 경우(_skip_join_lock)는
         #   이번 시즌 동안 입단을 강제하지 않고 그대로 진행시킨다.
         if (p["age"] >= MIN_JOIN_AGE and not p.get("current_team_id")
-                and 1 <= week <= 4 and not getattr(self, "_skip_join_lock", False)):
+                and _ps_s <= week <= _ps_e and not getattr(self, "_skip_join_lock", False)):
             show_toast(self, "⚠  먼저 팀에 입단해야 합니다!", "#cc6600", 1500)
             from PyQt6.QtWidgets import QApplication
             QApplication.restoreOverrideCursor()
@@ -780,51 +980,61 @@ class CenterPanel(QWidget):
             return
 
         # ── 진행할 일정 결정 ──
-        # 4주씩 모드: 현재 콤보 4개로 일정 만들어 한 번에 진행.
-        # 1주씩 모드: 묶음 시작 시 4주 일정을 확정·고정하고,
-        #            누를 때마다 그 중 한 주만 진행. 4주 다 지나면 자동 4주 복귀.
-        def _build_4week_sched():
+        # 1주씩 모드: 현재 콤보 7개(하루하루)로 일정 만들어 한 번에 진행.
+        # 하루씩 모드: 묶음 시작 시 7일 일정을 확정·고정하고,
+        #            누를 때마다 그 중 하루만 진행. 7일 다 지나면 자동 1주 복귀.
+        def _build_week_sched():
             sched = []
-            for i in range(4):
+            for i in range(DAY_BUNDLE_SIZE):
                 cb    = self.week_combos[i]
-                w     = week + i
+                d     = day + i
                 sel   = cb.currentText()
                 ttype = TRAIN_MAP_KO.get(sel, "중강도")
-                mi = self._get_match(w, p)
+                mi = self._get_match_for_day(d, p)
                 if mi:
-                    sched.append((w, "경기", mi))
+                    sched.append((d, "경기", mi))
                 else:
+                    # [2026-07 확장] 경기 하루 전엔(홈/원정 무관) 이동/컨디션
+                    # 관리 목적으로 무조건 휴식을 강제한다(실제 프로팀 루틴과
+                    # 동일, 이틀 연속 경기 방지) — 사용자가 그날 다른 훈련을
+                    # 골라놨어도 경기 전날이면 덮어쓴다.
+                    next_mi = self._get_match_for_day(d + 1, p)
+                    if next_mi:
+                        ttype = "휴식"
                     # 강점/약점훈련은 엔진이 스탯을 자동 선별하므로 detail 불필요.
-                    sched.append((w, ttype, None))
+                    sched.append((d, ttype, None))
             return sched
 
         if not self._step_mode:
-            # 4주 한 번에
-            schedule = _build_4week_sched()
+            # 1주(7일) 한 번에
+            schedule = _build_week_sched()
         else:
-            # 1주씩: 묶음 시작이면 4주 일정 확정·고정.
-            #   _step_idx 가 0이 아니어도 _locked_sched 가 비어 있으면(예: 화면
-            #   갱신 시 (week-1)%4 로 재계산됐는데 일정은 미생성) 새로 만든다.
-            #   그리고 묶음의 시작 주(week - _step_idx)부터 만들어야 인덱스가 맞음.
+            # 하루씩: 묶음 시작이면 7일 일정 확정·고정.
+            #   _step_idx 가 0이 아니어도 _locked_sched 가 비어 있으면 새로 만든다.
+            #   그리고 묶음의 시작일(day - _step_idx)부터 만들어야 인덱스가 맞음.
             if self._locked_sched is None:
-                bundle_start = week - self._step_idx
+                bundle_start = day - self._step_idx
                 sched = []
-                for i in range(4):
+                for i in range(DAY_BUNDLE_SIZE):
                     cb    = self.week_combos[i]
-                    w     = bundle_start + i
+                    d     = bundle_start + i
                     sel   = cb.currentText()
                     ttype = TRAIN_MAP_KO.get(sel, "중강도")
-                    mi = self._get_match(w, p)
+                    mi = self._get_match_for_day(d, p)
                     if mi:
-                        sched.append((w, "경기", mi))
+                        sched.append((d, "경기", mi))
                     else:
-                        sched.append((w, ttype, None))
+                        # 경기 전날 휴식 강제(홈/원정 무관) — 위 _build_week_sched 주석 참고.
+                        next_mi = self._get_match_for_day(d + 1, p)
+                        if next_mi:
+                            ttype = "휴식"
+                        sched.append((d, ttype, None))
                 self._locked_sched = sched
-            # 인덱스 안전 클램프 (혹시라도 범위를 벗어나면 마지막 주로)
+            # 인덱스 안전 클램프 (혹시라도 범위를 벗어나면 마지막 날로)
             idx = max(0, min(self._step_idx, len(self._locked_sched) - 1))
             schedule = [self._locked_sched[idx]]
 
-        # ── 여기까지는 UI/검증 로직이라 가볍다. 무거운 처리(advance_4weeks,
+        # ── 여기까지는 UI/검증 로직이라 가볍다. 무거운 처리(advance_days,
         #    특히 52→1주 시즌전환의 AI 생애주기 계산)만 백그라운드로 뺀다. ──
         # [스레드 안전] 워커가 도는 동안 메인 윈도우 전체를 비활성화해서, 다른
         #   버튼(오퍼/입단/세계기록실 등)이 같은 DB 커넥션을 동시에 건드리는
@@ -832,6 +1042,21 @@ class CenterPanel(QWidget):
         #   않으므로, 처리 중엔 오직 워커 스레드만 DB에 접근하도록 보장해야 한다.
         if self.main_win:
             self.main_win.setEnabled(False)
+        self._toggle_popup_timers(pause=True)
+
+        # [UX] 처리 중 화면 전체가 그냥 멈춘 것처럼 보이던 문제 수정 —
+        #   WaitCursor만으론 신호가 약해서(마우스 안 움직이면 못 봄) 오버레이로
+        #   명시적으로 "지금 뭘 처리 중인지" 보여준다. 52주차 마지막 날(시즌
+        #   전환이 걸리는 그 날)이면 별도 문구로 왜 좀 더 걸리는지 알려준다.
+        from constants import DAYS_PER_WEEK, day_to_week
+        _last_day = schedule[-1][0]
+        _is_season_transition = (
+            _last_day % DAYS_PER_WEEK == 0 and day_to_week(_last_day) == 52)
+        if _is_season_transition:
+            self._show_processing_overlay(
+                "⏳ 시즌 전환 처리 중...\n(전세계 이적시장 · 신인 영입 · 승강제 반영)")
+        else:
+            self._show_processing_overlay("⏳ 진행 중...")
 
         self._advance_worker = _AdvanceWorker(schedule, self)
         self._advance_worker.finished_ok.connect(
@@ -842,23 +1067,25 @@ class CenterPanel(QWidget):
     def _on_advance_finished(self):
         from PyQt6.QtWidgets import QApplication
         QApplication.restoreOverrideCursor()
+        self._hide_processing_overlay()
         self.adv_btn.setEnabled(True)
         if self.main_win:
             self.main_win.setEnabled(True)
+        self._toggle_popup_timers(pause=False)
 
         # ── 묶음 진행 상태 갱신 ──
         if self._step_mode:
             self._step_idx += 1
-            if self._step_idx >= 4:
-                # 4주 묶음 완료 → 잠금 해제, 다음 4주 묶음으로
+            if self._step_idx >= DAY_BUNDLE_SIZE:
+                # 1주(7일) 묶음 완료 → 잠금 해제, 다음 1주 묶음으로
                 self._step_idx     = 0
                 self._locked_sched = None
 
-        # 묶음(4주)이 완전히 끝났는가? (4주 모드는 항상 True)
+        # 묶음(7일=1주)이 완전히 끝났는가? (1주 모드는 항상 True)
         bundle_done = (not self._step_mode) or (self._step_idx == 0)
 
         # 진행으로 바뀐 묶음 위치/고정 일정을 세이브에 반영.
-        #   (advance_4weeks 가 current_week 등을 이미 갱신한 뒤이므로 충돌 없음)
+        #   (advance_days 가 current_week 등을 이미 갱신한 뒤이므로 충돌 없음)
         self._save_ui_state()
 
         # 입단 플래그는 묶음 완료 시에만 초기화
@@ -888,17 +1115,19 @@ class CenterPanel(QWidget):
             self._auto_offer_shown = False
 
         # 소속 없으면 입단 안내
-        if 1 <= new_week <= 4 and p2.get("age",0) >= MIN_JOIN_AGE and not p2.get("current_team_id"):
-            # 새 시즌 1~4주 진입 → 작년 '전부 결렬→1년 훈련' 보류를 해제하고
+        from constants import SEASON_PHASES as _SP4
+        _pss, _pse = _SP4["preseason1"]
+        if _pss <= new_week <= _pse and p2.get("age",0) >= MIN_JOIN_AGE and not p2.get("current_team_id"):
+            # 새 시즌 프리시즌 진입 → 작년 '전부 결렬→1년 훈련' 보류를 해제하고
             #   올해 다시 입단(오퍼)에 도전하게 한다.
             self._skip_join_lock = False
             self._join_used = False
             self.btn_join.setEnabled(True)
             show_toast(self, f"⭐ {st2['current_year']}년 새 시즌!  팀 입단 기간입니다", "#006622", 2000)
 
-        # [복수국적] ★새해 진입 직후★ 22세 1~4주차 미고정이면 '일정 짜기 전에'
+        # [복수국적] ★새해 진입 직후★ 22세 프리시즌(1~3주) 미고정이면 '일정 짜기 전에'
         #   국적부터 강제 확정. 52주에서 진행 버튼을 눌러 1주차로 막 넘어온 이 시점에
-        #   띄워야 사용자가 1~4주 훈련을 선택하기 전에 대표팀을 정한다.
+        #   띄워야 사용자가 프리시즌 훈련을 선택하기 전에 대표팀을 정한다.
         import intl_engine
         forced = intl_engine.get_forced_commit()
         if forced:
@@ -914,13 +1143,13 @@ class CenterPanel(QWidget):
 
         # 재계약 팝업은 '새 시즌 진입 직후 즉시' 떠야 한다.
         #   오퍼 플래그(_contract_renew_offer)는 연말(52주) 처리에서 세팅되므로,
-        #   1주차로 막 넘어온 이 시점에 이미 존재한다. bundle_done(4주 묶음 완료)을
-        #   기다리면 '1~4주 진행을 누른 뒤에야' 떠서 타이밍이 어긋난다.
+        #   1주차로 막 넘어온 이 시점에 이미 존재한다. bundle_done(1주 묶음 완료)을
+        #   기다리면 '프리시즌 진행을 누른 뒤에야' 떠서 타이밍이 어긋난다.
         #   다이얼로그에서 수락/거절 시 플래그가 0으로 리셋되므로 반복 노출도 없다.
         if p2.get("_contract_renew_offer", 0) > 0:
             self._show_renew_dialog(p2)
 
-        # 자동 오퍼 팝업은 4주 묶음이 완료됐을 때만
+        # 자동 오퍼 팝업은 1주 묶음이 완료됐을 때만
         # (1주씩 본다고 매주 오퍼가 뜨지 않음)
         if bundle_done:
             if p2.get("current_team_id") and in_zone:
@@ -932,54 +1161,71 @@ class CenterPanel(QWidget):
     def _on_advance_failed(self, msg):
         from PyQt6.QtWidgets import QApplication
         QApplication.restoreOverrideCursor()
+        self._hide_processing_overlay()
         self.adv_btn.setEnabled(True)
         if self.main_win:
             self.main_win.setEnabled(True)
+        self._toggle_popup_timers(pause=False)
         QMessageBox.critical(self, "진행 중 오류",
                               f"시즌/주차 진행 중 오류가 발생했습니다:\n{msg}")
 
 
-    def _get_match(self, week, p):
+    def _get_match_for_day(self, day, p):
+        """그 날짜(day)에 내 경기가 있는지 확인.
+        클럽 리그 경기는 match_results.day로 정확한 날짜가 있어 그대로 대조.
+        국제대회/챔스는 day 컬럼이 없어(주 단위 대회) game_engine의
+        _week_intl_cl_day()가 정한 '그 주의 정확한 날'에 배정된 것으로
+        취급한다 — advance_days의 실제 처리 시점과 반드시 같은 함수를
+        써서 화면 표시와 실제 진행이 어긋나지 않게 한다(예전엔 화면은
+        '주 마지막 날'로 보여주면서 실제 처리는 그 주 아무 날에나
+        조용히 일어나던 불일치가 있었다)."""
+        from constants import day_to_week, DAYS_PER_WEEK
+        week = day_to_week(day)
         tid = p.get("current_team_id", 0)
-        if not tid: return None
+        if tid:
+            from database import get_conn
+            conn = get_conn()
+            # 항상 DB에서 팀의 실제 league_id 재조회 (이적/승강 후 변경 반영)
+            team_row = conn.execute(
+                "SELECT l.id as lid, l.name as lname FROM teams t JOIN leagues l ON t.league_id=l.id WHERE t.id=?",
+                (tid,)).fetchone()
+            if team_row:
+                lid = team_row["lid"]
+                from game_engine import get_state
+                st = get_state()
+                cur_season = st["current_season"] if st else 1
+                row = conn.execute(
+                    "SELECT * FROM match_results WHERE league_id=? AND week=? AND day=? "
+                    "AND (home_team_id=? OR away_team_id=?) AND home_score=-1 AND season=?",
+                    (lid, week, day, tid, tid, cur_season)).fetchone()
+                conn.close()
+                if row:
+                    return {
+                        "home_id":     row["home_team_id"],
+                        "away_id":     row["away_team_id"],
+                        "league_name": team_row["lname"],
+                        "league_id":   lid,
+                        "is_home":     row["home_team_id"] == tid,
+                        "season":      row["season"],
+                        "year":        row["year"],
+                    }
+            else:
+                conn.close()
 
-        from database import get_conn
-        conn = get_conn()
-        # 항상 DB에서 팀의 실제 league_id 재조회 (이적/승강 후 변경 반영)
-        team_row = conn.execute(
-            "SELECT l.id as lid, l.name as lname FROM teams t JOIN leagues l ON t.league_id=l.id WHERE t.id=?",
-            (tid,)).fetchone()
-        if not team_row:
-            conn.close(); return None
-        lid = team_row["lid"]
-
-        from game_engine import get_state
-        st = get_state()
-        cur_season = st["current_season"] if st else 1
-        row = conn.execute(
-            "SELECT * FROM match_results WHERE league_id=? AND week=? "
-            "AND (home_team_id=? OR away_team_id=?) AND home_score=-1 AND season=?",
-            (lid, week, tid, tid, cur_season)).fetchone()
-        conn.close()
-        if not row:
-            # 클럽 경기 없음 → 국가대표 경기 확인 (월드컵/대륙컵 윈도우)
+        # 클럽 경기 없음 → _week_intl_cl_day가 정한 그 날에만 국가대표/챔스/컵대회 확인.
+        from game_engine import _week_intl_cl_day
+        if day == _week_intl_cl_day(week, p):
             import intl_engine
             im = intl_engine.get_my_match(week)
             if im:
                 return im
-            # 그래도 없으면 → 클럽 챔피언스리그 경기 확인 (41~52주)
             import champions_engine
-            return champions_engine.get_my_cl_match(week)
-
-        return {
-            "home_id":     row["home_team_id"],
-            "away_id":     row["away_team_id"],
-            "league_name": team_row["lname"],
-            "league_id":   lid,
-            "is_home":     row["home_team_id"] == tid,
-            "season":      row["season"],
-            "year":        row["year"],
-        }
+            cm = champions_engine.get_my_cl_match(week)
+            if cm:
+                return cm
+            import cup_engine
+            return cup_engine.get_my_cup_match(week)
+        return None
 
     # ── 액션 ─────────────────────────────────────
 
@@ -1026,7 +1272,7 @@ class CenterPanel(QWidget):
             yrs = offer_yrs   # 팀이 정한 기간 (선택 불가)
             st  = get_state()
             # 만료 연도 = 입단 로직과 동일 규칙.
-            #  - 재계약 팝업은 만료 다음 해 1~4주에 뜨므로 올해가 1년차 → -1 보정
+            #  - 재계약 팝업은 만료 다음 해 프리시즌(1~3주)에 뜨므로 올해가 1년차 → -1 보정
             #  - 드물게 시즌 중(5주~) 수락이면 올해 미포함 → 보정 없음
             cur_y = st["current_year"]; cur_w = st["current_week"]
             end = (cur_y + yrs - 1) if cur_w <= 4 else (cur_y + yrs)
@@ -1061,7 +1307,7 @@ class CenterPanel(QWidget):
         dlg.exec()
 
     def _show_forced_commit(self, forced):
-        """[복수국적] 22세 1~4주차 — 평생 뛸 대표팀 국적을 강제로 확정.
+        """[복수국적] 22세 프리시즌(1~3주) — 평생 뛸 대표팀 국적을 강제로 확정.
         본선 진출 여부와 무관하게 보유 국적 전부 중에서 선택.
         선택해도 보유 국적은 사라지지 않고, '대표로 뛰는 국적'만 정해진다.
         닫기·취소 불가 — 반드시 하나를 골라야 진행된다."""
@@ -1300,7 +1546,7 @@ class CenterPanel(QWidget):
         if self.main_win: self.main_win.refresh_all()
 
     def _do_join(self):
-        """소속 없음일 때만 수동 팀 입단 (1~4주차)."""
+        """소속 없음일 때만 수동 팀 입단 (프리시즌 1~3주차)."""
         p = get_player()
         if not p: return
         if p.get("current_team_id"):
@@ -1312,14 +1558,14 @@ class CenterPanel(QWidget):
             return
         self._join_used = True
         self.btn_join.setEnabled(False)
-        offers = generate_offers(count=10)
+        offers = generate_offers()  # [2026-07] 개수는 이제 함수 내부 고정값(자국10+타국6)이 결정
         from ui.offer_window import OfferWindow
         # 이 창은 소속 팀이 없을 때만 뜨므로(위에서 이미 체크) 첫 입단이든
         # 퇴출/계약종료 후 재입단이든 항상 강제 입단 모드로 띄운다.
         # force_select=False면 닫기로 그냥 빠져나갈 수 있는데, 그러면 입단할
         # 곳이 없는 채로 진행이 막히거나 강제 은퇴로 이어질 수 있다.
         dlg = OfferWindow(offers, p.get("language","ko"), self,
-                          title="🏟 팀 입단", force_select=True, grid=True)
+                          title="🏟 팀 입단", force_select=True, grid=True, apply_slots=4)
         self._offer_dlg = dlg
         # 모달로 띄워 다이얼로그가 열려 있는 동안 진행(next day)을 차단.
         # 비모달(show)이면 오퍼창을 띄운 채 시간을 더 진행시킨 뒤 수락할 수 있어
@@ -1343,7 +1589,7 @@ class CenterPanel(QWidget):
             if self.main_win: self.main_win.refresh_all()
 
     def _show_auto_offer(self, week: int):
-        """소속 있을 때 자동 오퍼 팝업 (1~4, 13~16, 17~20, 21~24주차)."""
+        """소속 있을 때 자동 오퍼 팝업 (이적시장: 여름 1~3주, 겨울 28~29주)."""
         from game_engine import _offer_probability
         p = get_player()
         if not p or not p.get("current_team_id"): return
@@ -1365,7 +1611,7 @@ class CenterPanel(QWidget):
         if not offers: return
 
         from ui.offer_window import OfferWindow
-        dlg = OfferWindow(offers, p.get("language","ko"), self, title="✈ 오퍼")
+        dlg = OfferWindow(offers, p.get("language","ko"), self, title="✈ 오퍼", grid=True)
         self._offer_dlg = dlg
         # 모달(exec)로 띄워 오퍼창이 열려 있는 동안 next day 진행을 차단.
         dlg.exec()
@@ -1431,12 +1677,8 @@ class CenterPanel(QWidget):
     def _do_agent(self):
         p = get_player()
         if not p: return
-        st = get_state()
-        week = st["current_week"]
-        is_off = not (5 <= week <= 11 or 26 <= week <= 32)
-        if not is_off:
-            show_toast(self, "⚠  에이전트 변경은 비시즌에만 가능합니다")
-            return
+        # [2026-07 요청 반영] 예전엔 비시즌(5~11주/26~32주)에만 에이전트를
+        # 바꿀 수 있었는데, 그 제한을 없애고 언제든 변경 가능하게 한다.
         from ui.agent_window import AgentWindow
         self._agent_dlg = AgentWindow(p.get("language", "ko"), self)
         self._agent_dlg.finished.connect(lambda: self._on_agent_done(self._agent_dlg))
@@ -1448,9 +1690,13 @@ class CenterPanel(QWidget):
     def _do_retire(self):
         st = get_state()
         week = st["current_week"]
-        # 은퇴 가능 구간: 1~4주(새 시즌 직후·연장 거절 타이밍) 또는 37~52주(리그 종료 후).
-        if not ((1 <= week <= 4) or (37 <= week <= 52)):
-            show_toast(self, "⚠  은퇴는 시즌 종료 후(37주차~) 또는 새 시즌 1~4주차에 가능합니다", "#cc6600", 1900)
+        from constants import SEASON_PHASES as _SP5
+        _pss5, _pse5 = _SP5["preseason1"]
+        _oss5, _ose5 = _SP5["postseason"]
+        # 은퇴 가능 구간: 프리시즌(1~3주, 새 시즌 직후·연장 거절 타이밍) 또는
+        #   국제대회 비시즌(44~52주, 리그 종료 후).
+        if not ((_pss5 <= week <= _pse5) or (_oss5 <= week <= _ose5)):
+            show_toast(self, f"⚠  은퇴는 시즌 종료 후({_oss5}주차~) 또는 새 시즌 {_pss5}~{_pse5}주차에 가능합니다", "#cc6600", 1900)
             return
 
         from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame

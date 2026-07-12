@@ -1,23 +1,42 @@
 """
-champions_engine.py ─ 클럽 대륙 챔피언스리그 엔진
+champions_engine.py - 클럽 대륙 챔피언스리그 엔진
 
 대륙별로 독립된 클럽 토너먼트 4개를 운영한다 (국가대표 대회와 별개).
   유럽 챔피언스리그 / 아시아 챔피언스리그 /
   아프리카 챔피언스리그 / 북남미 챔피언스리그
 
 각 대륙 '안의' 클럽끼리만 붙는다 (아시안컵·아프리카컵의 클럽판).
-출전팀: 그 대륙 소속 국가들의 직전 시즌 1·2위 팀에서 32팀 선발.
+출전팀: 그 대륙 소속 국가들의 직전 시즌 순위표 상위팀에서 대륙별 정원만큼
+선발 (CL_TEAMS_BY_CONTINENT - 유럽/북남미 36팀, 아시아/아프리카 18팀).
   - 각국 1부 리그 1위는 무조건 출전
-  - 32팀이 안 차면 리그 등급(grade) 높은 나라의 2위로 채움
+  - 정원이 안 차면 클럽 리그 등급(COUNTRY_LEAGUE_GRADE) 높은 나라의
+    2위 이하로 채움 (국가대표 grade가 아니라 클럽 리그 grade 기준)
 
-진행 시점: 시즌 41~46주 (리그는 35주 종료, 36~40주 비시즌/이적).
-  41주: 추첨 + 출전팀 확정 + 32강 대진
-  42주: 32강
-  43주: 16강
-  44주: 8강
-  45주: 4강
-  46주: 결승
-  (라운드가 매주 연속 진행 → 쉬는 주 없이 이어서 치름)
+[2026-07 스위스 방식 전면 개편] 기존 '8조×4팀 조별리그(3경기)+토너먼트'를
+실제 2024~ UEFA 챔피언스리그와 같은 '단일 리그 스테이지 + 플레이오프'
+구조로 바꿨다. 대륙마다 참가 규모가 달라(36팀/18팀) 세부 수치는
+CL_LEAGUE_GAMES_BY_CONTINENT / CL_DIRECT_CUT_BY_CONTINENT /
+CL_PLAYOFF_POOL_BY_CONTINENT 세 딕셔너리로 대륙별로 관리한다(유럽/북남미는
+실제 UEFA 수치 그대로, 아시아/아프리카는 참가 규모가 정확히 절반이라
+경기 수·컷도 절반으로 축소해 같은 비율을 유지).
+
+진행 시점 (유럽/북남미 기준 - 아시아/아프리카는 리그 스테이지가 4경기라
+그만큼 주차가 앞당겨진다. 실제 진행 여부는 대회별 참가 규모로 매주 자동 판정):
+  8주: 추첨 + 출전팀 확정
+  9~16주: 리그 스테이지 (팀마다 서로 다른 8팀과 1경기씩, 총 8경기)
+  17주: 플레이오프 (9~24위가 맞붙어 남은 16강 8자리를 놓고 단판 승부)
+  18주: 16강 (1~8위 직행팀 + 플레이오프 승자 8팀)
+  19주: 8강   20주: 4강   21주: 결승 + 3/4위전
+  (아시아/아프리카는 참가 규모가 절반이라 1~4위 직행/5~12위 플레이오프/
+   13~18위 광탈로 축소되고, 그만큼 빨리 끝나 8강부터 시작한다)
+
+[알려진 단순화] 실제 UEFA 스위스 방식은 세부 실력 밴드로 대진을 짜고
+(각 팀이 밴드별로 정해진 수만큼 상대) 플레이오프/16강도 2경기 홈+원정
+합산이지만, 이 엔진은 기존 조별리그 방식과 마찬가지로 단판 승부 구조를
+그대로 따르고 대진은 전력순 시드 배정(강한 팀일수록 약한 상대와 겹치지
+않도록 순환)으로 단순화했다. 두 팀이 리그 스테이지에서 같은 나라 소속일
+경우를 최대한 피하는 시도는 하지만(조별리그 때와 같은 재시도 방식),
+8경기 전부를 국가 중복 없이 배정하는 것까지는 보장하지 않는다.
 
 내 팀이 출전하면 내 팀 경기만 내가 출전(개인기록 반영),
 나머지 대진은 AI끼리 자동 시뮬한다.
@@ -55,21 +74,76 @@ def _get_field_pos(p):
         return primary
 
 from constants import GRADE_TEAM_OVR  # 참고용(미사용 가능)
+from constants import get_league_grade  # 클럽 대항전 슬롯 계산용(국가대표 grade와 분리)
+from constants import generate_round_robin  # 리그 스테이지 대진(원형법) 생성용
 
-# ── 대회 일정 (주차) ───────────────────────────────
-CL_START_WEEK = 41           # 추첨/조 편성
-CL_GROUP_WEEKS = (42, 44)    # 조별리그 3경기 (42,43,44)
+# ── 대회 일정 (주차) - 2026-07 스위스 방식 개편 ─────────────────────
+# 클럽 시즌이 4~43주라 8주(draw)부터 시작해도 여유가 충분하다. 리그
+# 스테이지(최대 8경기)를 9~16주에 깔고, 17주 플레이오프, 18~21주에
+# 16강부터 결승까지 이어붙인다. 국내 컵대회는 이 구간(8~21주)을 피해서
+# 시작하도록 cup_engine.CUP_ROUND_WEEKS_POOL도 함께 뒤로 밀었다.
+CL_START_WEEK = 8            # 추첨 (직전 시즌 최종 순위 기준)
+CL_LEAGUE_WEEKS = (9, 16)    # 리그 스테이지 최대 구간(9~16주, 실제 사용 주차 수는 대륙별로 다름)
+CL_PLAYOFF_WEEK = 17         # 플레이오프 (9~24위, 단판)
 CL_ROUND_WEEKS = {
-    "R16": 45,
-    "QF":  46,
-    "SF":  47,
-    "F":   48,
-    "TP":  48,  # 3/4위전: 결승과 같은 주차
+    "R16": 18,
+    "QF":  19,
+    "SF":  20,
+    "F":   21,
+    "TP":  21,  # 3/4위전: 결승과 같은 주차
 }
-CL_END_WEEK = 48
+CL_END_WEEK = 21
 
-CL_TEAMS = 32                # 본선 32팀 (8조 × 4팀)
-CL_GROUPS = 8
+CL_TEAMS = 36                # 기본(유럽/북남미) 리그 스테이지 참가 규모
+
+# [2026-07 스위스 방식] 대륙별 참가 규모 - 실제 UEFA(36팀)를 기준으로,
+# 아시아/아프리카는 클럽 리그 인프라가 상대적으로 얕다는 기존 설계 원칙을
+# 유지해 정확히 절반 규모(18팀)로 낮췄다. 그 절반 비율을 경기 수·컷
+# 라인에도 그대로 적용해서(8경기→4경기, 8+16+12→4+8+6) 대륙마다 리그
+# 스테이지 순위표에서의 '직행/플레이오프/광탈' 비중이 똑같이 유지된다.
+CL_TEAMS_BY_CONTINENT = {"유럽": 36, "북남미": 36, "아시아": 18, "아프리카": 18}
+
+# 팀마다 리그 스테이지에서 치르는 경기 수(서로 다른 상대와 1경기씩).
+CL_LEAGUE_GAMES_BY_CONTINENT = {"유럽": 8, "북남미": 8, "아시아": 4, "아프리카": 4}
+
+# 리그 스테이지 순위 1~N위: 플레이오프 없이 바로 다음 토너먼트 라운드 직행.
+CL_DIRECT_CUT_BY_CONTINENT = {"유럽": 8, "북남미": 8, "아시아": 4, "아프리카": 4}
+
+# 리그 스테이지 순위 (직행 다음순위)~(직행+이 값)위: 플레이오프 대상.
+# 이 인원의 절반이 플레이오프를 통과해 직행팀과 합류한다.
+#   유럽/북남미: 9~24위(16명) 플레이오프 → 8명 통과 → 직행 8 + 통과 8 = 16강(16팀)
+#   아시아/아프리카: 5~12위(8명) 플레이오프 → 4명 통과 → 직행 4 + 통과 4 = 8강(8팀)
+CL_PLAYOFF_POOL_BY_CONTINENT = {"유럽": 16, "북남미": 16, "아시아": 8, "아프리카": 8}
+
+def _cl_team_cap(continent: str) -> int:
+    return CL_TEAMS_BY_CONTINENT.get(continent, CL_TEAMS)
+
+def _cl_league_games(continent: str) -> int:
+    return CL_LEAGUE_GAMES_BY_CONTINENT.get(continent, 8)
+
+def _cl_direct_cut(continent: str) -> int:
+    return CL_DIRECT_CUT_BY_CONTINENT.get(continent, 8)
+
+def _cl_playoff_pool(continent: str) -> int:
+    return CL_PLAYOFF_POOL_BY_CONTINENT.get(continent, 16)
+
+# [2026-07 개편] 나라별 챔스 출전 슬롯 수 - 실제 UEFA처럼 리그 등급이 높을수록
+# 한 나라에서 여러 팀이 동시에 나간다(1위만 나가던 방식 폐지).
+#   SS등급(EPL 단독): 5장  S등급(빅리그): 4장  A등급: 3장  B등급: 2장  C~F등급: 1장
+# 대륙별로 이 슬롯을 다 더하면 그 대륙 본선 정원(_cl_team_cap)을 훌쩍 넘는데
+# (유럽만 봐도 최대 100장 안팎), 등급 높은 나라부터 순서대로 슬롯을 채워가다
+# 정원에서 끊는다 - 마지막 나라는 남은 자리만큼만 받을 수도 있다.
+#
+# [버그 수정] 예전엔 이 슬롯을 country.grade(국가대표 FIFA 랭킹 기준 등급)로
+# 계산했다 - 그런데 이건 '국가대표 전력'이지 '그 나라 클럽 리그 수준'이 아니다.
+# 예: 모로코는 국가대표 세계 랭킹은 최상위권(FIFA 랭킹 기준 grade=S)이지만,
+# 모로코 자국 리그 자체는 유럽 빅리그에 비할 바가 못 된다(선수 대부분이
+# 해외파). 그 결과 실제로는 클럽 리그 인프라가 약한 아프리카 국가가 유럽
+# 빅리그와 동급(S, 4장)의 챔스 슬롯을 받는 왜곡이 있었다. 클럽 대항전은
+# 클럽 리그 수준(COUNTRY_LEAGUE_GRADE, get_league_grade())으로 슬롯을
+# 정해야 한다 - 그 표에는 아프리카 최고가 B등급(모로코/나이지리아/이집트/
+# 남아공)까지만 있어서 S등급 국가가 없는 대륙이 실제로 존재하게 된다.
+CL_SLOTS_BY_GRADE = {"SS": 5, "S": 4, "A": 3, "B": 2, "C": 1, "D": 1, "E": 1, "F": 1}
 
 # ── entry 캐시 ─────────────────────────────────────
 # cl_entries(ovr/flag/team_name/grade)는 대회 진행 중 바뀌지 않으므로
@@ -80,16 +154,10 @@ _entry_cache = {}
 def _clear_entry_cache():
     _entry_cache.clear()
 
-STAGE_KO = {"group": "조별리그", "R16": "16강", "QF": "8강", "SF": "4강", "F": "결승", "TP": "3/4위전"}
-# 토너먼트 라운드 진행 순서 (조별리그 다음부터)
+STAGE_KO = {"league": "리그 스테이지", "PO": "플레이오프",
+            "R16": "16강", "QF": "8강", "SF": "4강", "F": "결승", "TP": "3/4위전"}
+# 토너먼트 라운드 진행 순서 (플레이오프 다음부터)
 _STAGE_ORDER = ["R16", "QF", "SF", "F"]
-# 조별리그 라운드 매칭 (4팀, 인덱스 기반) — 3경기
-_GROUP_ROUNDS = [
-    [(0, 3), (1, 2)],
-    [(0, 2), (3, 1)],
-    [(0, 1), (2, 3)],
-]
-_GROUP_LABELS = ["A", "B", "C", "D", "E", "F", "G", "H"]
 
 # 대륙 그룹핑: 게임 내 continent 값 → 챔스 대륙 키
 #   오세아니아 → 아시아 편입, 북미/남미 → 북남미 통합
@@ -109,22 +177,21 @@ CL_CUP_NAME = {
     "북남미": "북남미 챔피언스리그",
 }
 
-# 결과별 보상 (명성, 인기, 행복도) ─ 클럽 대회는 국가대표보다 약간 낮게
+# 결과별 보상 (명성, 인기, 행복도) - 클럽 대회는 국가대표보다 약간 낮게
 _REWARD = {
-    "우승":       (18, 12, 16),
-    "준우승":     (11,  7,  8),
-    "3위":        ( 9,  5,  6),
-    "4위":        ( 6,  3,  4),
-    "4강":        ( 7,  4,  5),  # 3/4위전 없는 경우 호환
-    "8강":        ( 4,  3,  3),
-    "16강":       ( 2,  2,  1),
-    "32강":       ( 1,  0, -1),
-    "32강 탈락":  ( 1,  0, -1),
-    "16강 탈락":  ( 2,  2,  1),
-    "8강 탈락":   ( 4,  3,  3),
-    "4강 탈락":   ( 7,  4,  5),
+    "우승":         (18, 12, 16),
+    "준우승":       (11,  7,  8),
+    "3위":          ( 9,  5,  6),
+    "4위":          ( 6,  3,  4),
+    "4강":          ( 7,  4,  5),  # 3/4위전 없는 경우 호환
+    "8강":          ( 4,  3,  3),
+    "16강":         ( 2,  2,  1),
+    "플레이오프":    ( 1,  1,  0),  # 직행 실패, 플레이오프에서 탈락
+    "리그 스테이지": ( 1,  0, -1),  # 리그 스테이지에서 컷(광탈)
+    "16강 탈락":     ( 2,  2,  1),
+    "8강 탈락":      ( 4,  3,  3),
+    "4강 탈락":      ( 7,  4,  5),
 }
-
 
 # ─────────────────────────────────────────────
 # 조회 헬퍼
@@ -226,14 +293,20 @@ def has_my_cl_match_between(week_from, week_to):
 # ─────────────────────────────────────────────
 
 def start_champions_league(year, season):
-    """41주차 진입 시 호출. 4개 대륙 챔스를 모두 생성.
+    """CL_START_WEEK(8주차) 진입 시 호출. 4개 대륙 챔스를 모두 생성.
 
-    season 인자는 직전 시즌 순위 집계에 사용 (리그 경기는 35주에 끝남).
+    [2026-07] season은 '이번 시즌'(막 시작해서 아직 진행 중) 값이 넘어온다.
+    출전팀은 직전 시즌(season-1)의 '이미 확정된 최종 순위'로 뽑아야 하므로
+    (이번 시즌은 이제 막 8주차라 순위표가 완성돼 있지 않음), 실제 조회는
+    prev_season = season-1 기준으로 한다. season-1이 없으면(첫 시즌) 스킵.
     """
     from game_engine import add_log, get_player
     p = get_player()
     if not p:
         return
+    prev_season = season - 1
+    if prev_season < 1:
+        return   # 첫 시즌엔 참고할 직전 시즌 성적이 없음 → 챔스 생략
 
     # 이미 만들어졌으면(어느 대륙이든) 중복 생성 방지
     if get_cl_tournament(year, "유럽"):
@@ -245,17 +318,17 @@ def start_champions_league(year, season):
     my_tid = p.get("current_team_id", 0)
 
     for cont in ("유럽", "아시아", "아프리카", "북남미"):
-        entries = _select_entries(cont, season)
+        entries = _select_entries(cont, prev_season)
         if len(entries) < 4:
             continue  # 출전팀 부족하면 그 대륙 대회 생략
         _build_tournament(year, cont, entries, my_tid if cont == my_cont else 0)
 
-    # ── 내 대회 안내 로그 (출전 자격 = 내 리그 1위일 때만) ──
+    # ── 내 대회 안내 로그 (출전 자격 = 직전 시즌 내 리그 순위가 배정 슬롯 안) ──
     if my_cont and my_tid:
         t = get_cl_tournament(year, my_cont)
         if t:
-            # 출전 자격 판정: 내 팀이 '내 1부 리그의 1위'인가?
-            qualified = _is_my_team_league_winner(p, my_tid)
+            # 출전 자격 판정: 내 팀이 직전 시즌 '내 1부 리그'에서 CL 슬롯 안에 들었는가?
+            qualified = _is_my_team_cl_qualified(p, my_tid, prev_season)
             conn = get_conn()
             mine = conn.execute(
                 "SELECT 1 FROM cl_entries WHERE tournament_id=? AND team_id=?",
@@ -271,10 +344,10 @@ def start_champions_league(year, season):
                 add_log("─" * 44, "sep")
                 add_log(f"🏆 {year}년 {t['name']} 개막!  내 팀 본선 진출!",
                         "event", year, CL_START_WEEK)
-                add_log(f"   조별리그 {CL_GROUP_WEEKS[0]}주차부터 시작",
+                add_log(f"   리그 스테이지 {CL_LEAGUE_WEEKS[0]}주차부터 시작",
                         "event", year, CL_START_WEEK)
             elif qualified:
-                # 리그 1위(자격)인데 본선엔 못 들어감(32 컷 등) → '본선 진출 실패'
+                # 슬롯 안(자격)인데 32팀 컷 등으로 본선엔 못 들어감 → '본선 진출 실패'
                 conn = get_conn()
                 conn.execute("UPDATE cl_tournaments SET my_qualified=1 WHERE id=?",
                              (t["id"],))
@@ -284,15 +357,15 @@ def start_champions_league(year, season):
                 team_name = trow["name"] if trow else ""
                 _save_trophy(year, team_name, t["name"], "본선 진출 실패")
                 add_log("─" * 44, "sep")
-                add_log(f"🏆 {year}년 {t['name']}  리그 우승했지만 본선 진출 실패",
+                add_log(f"🏆 {year}년 {t['name']}  챔스 출전권 확보했지만 본선 진출 실패",
                         "event", year, CL_START_WEEK)
-            # else: 리그 1위가 아님 → 챔스와 무관, 아무것도 안 뜸 (침묵)
+            # else: 슬롯 밖(자격 없음) → 챔스와 무관, 아무것도 안 뜸 (침묵)
 
 
-def _is_my_team_league_winner(p, my_tid):
-    """내 팀이 그 시즌 '내 1부 리그의 1위'인지 — 챔스 출전 자격 판정.
-    챔스는 1부(tier=1) 리그 1위만 출전 자격이 있다. 2부 이하 1위는 자격 없음
-    (2부 우승은 '승격'이지 챔스 진출이 아니다)."""
+def _is_my_team_cl_qualified(p, my_tid, season):
+    """내 팀이 그 시즌 '내 1부 리그'에서 CL 슬롯(CL_SLOTS_BY_GRADE) 안에 드는지
+    — 챔스 출전 자격 판정. 챔스는 1부(tier=1) 리그 소속만 자격이 있고,
+    그 나라 등급에 따라 1~4위까지도 출전할 수 있다(2부 이하는 자격 없음)."""
     if not my_tid:
         return False
     from game_engine import get_league_standings
@@ -303,28 +376,39 @@ def _is_my_team_league_winner(p, my_tid):
         conn.close()
         return False
     lid = row["league_id"]
-    tier_row = conn.execute("SELECT tier FROM leagues WHERE id=?", (lid,)).fetchone()
+    lg_row = conn.execute(
+        """SELECT l.tier AS tier, cn.name AS country FROM leagues l
+           JOIN countries cn ON l.country_id = cn.id WHERE l.id=?""", (lid,)).fetchone()
     conn.close()
     # 1부가 아니면 챔스 자격 없음 (2부 1위는 승격 대상일 뿐)
-    if not tier_row or tier_row["tier"] != 1:
+    if not lg_row or lg_row["tier"] != 1:
         return False
-    standings = get_league_standings(lid)
+    # [버그 수정] 국가대표 grade가 아니라 클럽 리그 grade로 슬롯 수를 정한다.
+    league_grade = get_league_grade(lg_row["country"], "F")
+    slots = CL_SLOTS_BY_GRADE.get(league_grade, 1)
+    standings = get_league_standings(lid, season=season)
     if not standings:
         return False
-    return standings[0]["id"] == my_tid
+    my_rank = next((i for i, r in enumerate(standings, start=1) if r["id"] == my_tid), None)
+    return my_rank is not None and my_rank <= slots
 
 
 def _select_entries(continent, season):
-    """대륙 소속 각 1부 리그의 '1위 팀'만 선발 (최대 32).
+    """대륙 소속 각 1부 리그에서, 나라 등급별 슬롯 수(CL_SLOTS_BY_GRADE)만큼
+    순위표 상위팀을 뽑는다 (최대 32).
 
     규칙:
-      - 각국 1부 리그 1위만 출전 자격 (2위 이하는 제외)
-      - 1위팀이 32개국을 넘으면 리그 등급 높은 나라 우선으로 32에서 컷
-    반환: [{team_id, team_name, flag, ovr, grade, country}, ...] (최대 32)
+      - 나라 등급이 높을수록(S~F) 한 나라에서 나가는 팀 수가 많음 (최대 4장)
+      - 등급 높은 나라부터 순서대로 슬롯을 소진, 32장에서 컷
+        (마지막 나라는 남은 자리만큼만 받을 수 있음 — 부분 배정)
+      - 각 나라 안에서는 '직전 시즌 최종 순위' 상위팀부터 배정된 슬롯 수만큼
+    반환: [{team_id, team_name, flag, ovr, grade, country, cl_rank}, ...] (최대 32)
+    cl_rank: 그 나라 안에서 몇 위로 출전했는지 (1=리그 우승팀, 2=2위 ...)
     """
     from game_engine import get_league_standings
 
     game_conts = [gc for gc, ck in CONTINENT_MAP.items() if ck == continent]
+    cap = _cl_team_cap(continent)
 
     conn = get_conn()
     placeholders = ",".join("?" * len(game_conts))
@@ -336,23 +420,34 @@ def _select_entries(continent, season):
     leagues = [dict(r) for r in leagues]
     conn.close()
 
-    # 등급 높은 나라 우선 (32 초과 시 컷 기준)
-    grade_rank = {"S": 7, "A": 6, "B": 5, "C": 4, "D": 3, "E": 2, "F": 1}
+    # [버그 수정] 슬롯/정렬 기준을 국가대표 grade(cn.grade)가 아니라 클럽 리그
+    # grade(COUNTRY_LEAGUE_GRADE)로 바꾼다. r["grade"]는 아래에서 그대로
+    # league_grade로 덮어써서, _entry_from()이 만드는 entry의 "grade" 필드도
+    # (화면에 노출되는 값도) 클럽 리그 등급을 가리키게 통일한다.
+    for lg in leagues:
+        lg["grade"] = get_league_grade(lg["country"], "F")
+
+    # 등급 높은 나라 우선 (정원 초과 시 컷 기준 + 슬롯 배정 우선순위)
+    grade_rank = {"SS": 8, "S": 7, "A": 6, "B": 5, "C": 4, "D": 3, "E": 2, "F": 1}
     leagues.sort(key=lambda r: -grade_rank.get(r["grade"], 0))
 
     picked = []
     for lg in leagues:
-        rows = get_league_standings(lg["lid"])
+        remaining = cap - len(picked)
+        if remaining <= 0:
+            break
+        slots = min(CL_SLOTS_BY_GRADE.get(lg["grade"], 1), remaining)
+        rows = get_league_standings(lg["lid"], season=season)
         if not rows:
             continue
-        # 1위 팀만
-        picked.append(_entry_from(lg, rows[0]))
-        if len(picked) >= CL_TEAMS:
+        for rank, row in enumerate(rows[:slots], start=1):
+            picked.append(_entry_from(lg, row, cl_rank=rank))
+        if len(picked) >= cap:
             break
-    return picked[:CL_TEAMS]
+    return picked[:cap]
 
 
-def _entry_from(lg, standing_row):
+def _entry_from(lg, standing_row, cl_rank=1):
     """리그 + 순위표 한 행 → entry dict + 팀 전력(OVR) 계산."""
     from game_engine import get_conn as _gc
     tid = standing_row["id"]
@@ -367,21 +462,55 @@ def _entry_from(lg, standing_row):
         "country": lg["country"],
         "grade": lg["grade"],
         "ovr": ovr,
+        "cl_rank": cl_rank,
     }
 
 
+def _league_phase_pairs(entries, games, my_tid):
+    """[2026-07 신설] 리그 스테이지 대진 생성 - generate_round_robin(n)으로
+    n팀 전체 라운드로빈 순서를 만든 뒤 앞의 `games`라운드만 쓴다(각 팀이
+    서로 다른 `games`팀과 정확히 1경기씩). 순서를 몇 번 무작위로 섞어
+    같은 나라 팀끼리의 매치업이 가장 적은 배치를 고른다(완벽 회피는
+    보장하지 않음 - 조별리그 추첨 때와 같은 절충).
+    반환: [(round_idx, home_entry, away_entry), ...]"""
+    n = len(entries)
+    best_order, best_conflicts = None, None
+    for _try in range(6):
+        order = entries[:]
+        random.shuffle(order)
+        rounds = generate_round_robin(n)[:games]
+        conflicts = sum(
+            1 for rd in rounds for a, b in rd
+            if order[a]["country"] == order[b]["country"])
+        if best_conflicts is None or conflicts < best_conflicts:
+            best_order, best_conflicts = order, conflicts
+        if conflicts == 0:
+            break
+
+    rounds = generate_round_robin(n)[:games]
+    pairs = []
+    for rd_idx, rd in enumerate(rounds):
+        for a, b in rd:
+            home, away = (best_order[a], best_order[b]) if rd_idx % 2 == 0 \
+                         else (best_order[b], best_order[a])
+            pairs.append((rd_idx, home, away))
+    return pairs
+
+
 def _build_tournament(year, continent, entries, my_tid):
-    """대회 row + 출전팀 + 조별리그(8조×4팀) 일정 생성."""
+    """대회 row + 출전팀 + 리그 스테이지 일정 생성 (2026-07 스위스 방식)."""
     name = CL_CUP_NAME.get(continent, "챔피언스리그")
+    games = _cl_league_games(continent)
 
-    # 32팀으로 정규화 (부족하면 가능한 만큼, 단 조 편성 위해 4의 배수로 컷)
+    # 대륙 정원만큼 정규화 (부족하면 가능한 만큼, 단 대진 생성을 위해 짝수로 컷)
     entries.sort(key=lambda e: e["ovr"], reverse=True)
-    n = (len(entries) // 4) * 4
-    n = min(n, CL_TEAMS)
+    n = len(entries) - (len(entries) % 2)
+    n = min(n, _cl_team_cap(continent))
     entries = entries[:n]
-    n_groups = n // 4
+    if n < games + 1:
+        return  # 리그 스테이지를 치르기엔 참가팀이 너무 적음
 
-    # 내 팀이 출전팀(=리그 1위)인지. = 출전 자격(my_qualified)과 동일.
+    # 내 팀이 출전팀(=리그 1위 등 슬롯 안)인지. = 출전 자격(my_qualified)과 동일.
     my_in = 1 if (my_tid and any(e["team_id"] == my_tid for e in entries)) else 0
     my_reg_tid = my_tid if my_in else 0
 
@@ -390,64 +519,37 @@ def _build_tournament(year, continent, entries, my_tid):
     c.execute("""INSERT INTO cl_tournaments(year, continent, name, status,
                     my_in, my_team_id, my_qualified)
                  VALUES(?,?,?,?,?,?,?)""",
-              (year, continent, name, "group", my_in, my_reg_tid, my_in))
+              (year, continent, name, "league", my_in, my_reg_tid, my_in))
     tid = c.lastrowid
 
-    # ── 포트 추첨: 전력순 4포트 → 조마다 포트별 1팀 ──
-    groups = {g: [] for g in _GROUP_LABELS[:n_groups]}
-    pot_size = n // 4
-    entry_rows = []
-    for pot in range(4):
-        pool = entries[pot * pot_size:(pot + 1) * pot_size]
-        random.shuffle(pool)
-        for gi, e in enumerate(pool):
-            g = _GROUP_LABELS[gi]
-            groups[g].append(e)
-            entry_rows.append((tid, e["team_id"], e["team_name"], e["flag"],
-                       e["country"], e["grade"], e["ovr"], g))
+    entry_rows = [(tid, e["team_id"], e["team_name"], e["flag"],
+                   e["country"], e["grade"], e["ovr"]) for e in entries]
     c.executemany("""INSERT INTO cl_entries
                          (tournament_id, team_id, team_name, flag, country,
-                          grade, ovr, grp, alive)
-                         VALUES(?,?,?,?,?,?,?,?,1)""", entry_rows)
+                          grade, ovr, alive)
+                         VALUES(?,?,?,?,?,?,?,1)""", entry_rows)
 
-    # ── 조별리그 일정 (42,43,44주 = 3경기) ──
-    w0 = CL_GROUP_WEEKS[0]
+    # ── 리그 스테이지 일정 (팀마다 서로 다른 `games`팀과 1경기씩) ──
+    w0 = CL_LEAGUE_WEEKS[0]
     match_rows = []
-    for rd, pairs in enumerate(_GROUP_ROUNDS):
-        wk = w0 + rd
-        for g, members in groups.items():
-            for hi, ai in pairs:
-                if hi >= len(members) or ai >= len(members):
-                    continue
-                home, away = members[hi], members[ai]
-                is_my = 1 if my_tid in (home["team_id"], away["team_id"]) else 0
-                match_rows.append((tid, "group", g, wk,
-                           home["team_id"], away["team_id"], is_my))
+    for rd_idx, home, away in _league_phase_pairs(entries, games, my_tid):
+        wk = w0 + rd_idx
+        is_my = 1 if my_tid in (home["team_id"], away["team_id"]) else 0
+        match_rows.append((tid, "league", wk,
+                   home["team_id"], away["team_id"], is_my))
     c.executemany("""INSERT INTO cl_matches
-                             (tournament_id, stage, grp, week,
+                             (tournament_id, stage, week,
                               home_team_id, away_team_id,
                               home_score, away_score, is_my, slot)
-                             VALUES(?,?,?,?,?,?,-1,-1,?,0)""", match_rows)
-    c.execute("UPDATE cl_tournaments SET status='group', first_stage='group' WHERE id=?",
+                             VALUES(?,?,?,?,?,-1,-1,?,0)""", match_rows)
+    c.execute("UPDATE cl_tournaments SET status='league', first_stage='league' WHERE id=?",
               (tid,))
     conn.commit()
     conn.close()
 
 
-def _pow2_floor(n):
-    """n 이하의 가장 큰 2의 거듭제곱 (최대 32). n<2면 0."""
-    if n < 2:
-        return 0
-    p = 1
-    while p * 2 <= n and p < CL_TEAMS:
-        p *= 2
-    return p
-
-
 def _first_stage_for(n):
-    """출전팀 수 n에 맞는 첫 라운드 스테이지."""
-    if n >= 32:
-        return "R32"
+    """출전팀 수 n에 맞는 첫 토너먼트 라운드 스테이지 (직행+플레이오프 통과 합계 기준)."""
     if n >= 16:
         return "R16"
     if n >= 8:
@@ -477,7 +579,7 @@ def process_cl_week(week):
 
 
 def _process_one(t, week):
-    """단일 대회: 이번 주차 이하 미진행 경기 AI 시뮬 → 라운드/조별 마감."""
+    """단일 대회: 이번 주차 이하 미진행 경기 AI 시뮬 → 라운드/스테이지 마감."""
     conn = get_conn()
     pending = [dict(r) for r in conn.execute(
         """SELECT * FROM cl_matches
@@ -490,15 +592,30 @@ def _process_one(t, week):
     conn.commit()
     conn.close()
 
-    # 조별리그 마지막 주차(44) → 16강 진출 확정
-    if week == CL_GROUP_WEEKS[1]:
+    # 리그 스테이지 마지막 주차(대륙마다 다름 - games만큼) → 순위 확정
+    league_end_week = CL_LEAGUE_WEEKS[0] + _cl_league_games(t["continent"]) - 1
+    if week == league_end_week:
         conn = get_conn()
         remain = conn.execute(
-            "SELECT COUNT(*) AS n FROM cl_matches WHERE tournament_id=? AND stage='group' AND home_score=-1",
+            "SELECT COUNT(*) AS n FROM cl_matches WHERE tournament_id=? AND stage='league' AND home_score=-1",
             (t["id"],)).fetchone()["n"]
         conn.close()
         if remain == 0:
-            _finalize_groups(t)
+            _finalize_league_phase(t)
+        return
+
+    # 플레이오프 주차 → 16강(또는 8강) 진출팀 확정
+    if week == CL_PLAYOFF_WEEK:
+        conn = get_conn()
+        total = conn.execute(
+            "SELECT COUNT(*) AS n FROM cl_matches WHERE tournament_id=? AND stage='PO'",
+            (t["id"],)).fetchone()["n"]
+        remain = conn.execute(
+            "SELECT COUNT(*) AS n FROM cl_matches WHERE tournament_id=? AND stage='PO' AND home_score=-1",
+            (t["id"],)).fetchone()["n"]
+        conn.close()
+        if total > 0 and remain == 0:
+            _finalize_playoff(t)
         return
 
     # 토너먼트 라운드 주차 확인
@@ -510,8 +627,18 @@ def _process_one(t, week):
     if cur_stage is None:
         return
 
-    # 이 라운드 경기가 전부 끝났는지 확인
+    # [버그 수정] 대륙마다 대회 규모가 달라(16강부터/8강부터 등) 첫 토너먼트
+    # 라운드 이름이 다르다. 이 주차에 해당하는 스테이지(cur_stage) 경기가
+    # 이 대회엔 애초에 없을 수도 있다 — 그 경우 '이미 진행 완료'가 아니라
+    # '이 대회는 이 라운드를 안 치른다'는 뜻이므로, 잘못 다음 라운드로
+    # 진행시키지 않고 그냥 넘어간다.
     conn = get_conn()
+    total = conn.execute(
+        "SELECT COUNT(*) AS n FROM cl_matches WHERE tournament_id=? AND stage=?",
+        (t["id"], cur_stage)).fetchone()["n"]
+    if total == 0:
+        conn.close()
+        return
     remain = conn.execute(
         "SELECT COUNT(*) AS n FROM cl_matches WHERE tournament_id=? AND stage=? AND home_score=-1",
         (t["id"], cur_stage)).fetchone()["n"]
@@ -592,24 +719,31 @@ def _sim_ai_match(t, m, my_played=False, conn=None):
     conn: 외부에서 연 커넥션을 재사용해 다수 경기를 한 트랜잭션으로 묶는다.
           None이면 자체 커넥션을 열고 commit/close(기존 동작 = 하위 호환).
     """
-    from game_engine import add_log, get_player, _gen_score
+    from game_engine import add_log, get_player, _gen_score, _week_intl_cl_day
     he = _entry(t["id"], m["home_team_id"])
     ae = _entry(t["id"], m["away_team_id"])
 
     outcome = _match_outcome(he["ovr"], ae["ovr"])
     pso_winner, pso_score = 0, ""
-    is_ko = (m["stage"] != "group")
+    is_ko = (m["stage"] != "league")  # [2026-07 버그 수정] 조별리그->리그 스테이지 개편 후 남아있던 옛 스테이지명 비교
     if outcome == "draw" and is_ko:
         win_home, pso_score = _resolve_pso(he["ovr"], ae["ovr"])
         pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
     hs, as_ = _gen_score(outcome, he["ovr"] - ae["ovr"])
 
+    # [2026-07 신설] 실제 진행 날짜 저장 (커리어/은퇴창 표시용).
+    # [2026-07 성능 수정] cup_engine._sim_ai_match와 동일한 이유 — 이 값은
+    # my_played=1인 "내 경기" 행만 읽으므로 AI vs AI 경기에서는 계산 자체가
+    # 낭비다(한 라운드당 AI 경기가 수백~수천 건이라 매번 get_player() DB
+    # 조회를 아끼는 효과가 크다).
+    day = _week_intl_cl_day(m["week"], get_player() or {}) if m["is_my"] else 0
+
     _own = conn is None
     if _own:
         conn = get_conn()
     conn.execute("""UPDATE cl_matches SET home_score=?, away_score=?,
-                    pso_winner=?, pso_score=? WHERE id=?""",
-                 (hs, as_, pso_winner, pso_score, m["id"]))
+                    pso_winner=?, pso_score=?, day=? WHERE id=?""",
+                 (hs, as_, pso_winner, pso_score, day, m["id"]))
     if _own:
         conn.commit()
         conn.close()
@@ -667,7 +801,7 @@ def simulate_my_cl_match(week, p):
 
     outcome = _match_outcome(h_ovr, a_ovr)
     pso_winner, pso_score = 0, ""
-    is_ko = (m["stage"] != "group")
+    is_ko = (m["stage"] != "league")  # [2026-07 버그 수정] 조별리그->리그 스테이지 개편 후 남아있던 옛 스테이지명 비교
     if outcome == "draw" and is_ko:
         win_home, pso_score = _resolve_pso(h_ovr, a_ovr)
         pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
@@ -677,20 +811,25 @@ def simulate_my_cl_match(week, p):
     my_result = _my_result(outcome, is_home)
     my_conceded = (as_ if is_home else hs)
 
+    # [2026-07 신설] 실제 진행 날짜 저장 (커리어/은퇴창 표시용).
+    from game_engine import _week_intl_cl_day
+    day = _week_intl_cl_day(m["week"], p)
+
     conn = get_conn()
     conn.execute("""UPDATE cl_matches SET home_score=?, away_score=?,
                     pso_winner=?, pso_score=?,
                     my_played=1, my_position=?,
                     my_saves=?, my_goals=?, my_assists=?, my_rating=?,
                     my_shots=?, my_shots_on=?, my_key_passes=?,
-                    my_dribbles=?, my_blocks=?, my_pass_acc=?, my_conceded=?
+                    my_dribbles=?, my_blocks=?, my_pass_acc=?, my_conceded=?,
+                    day=?
                     WHERE id=?""",
                  (hs, as_, pso_winner, pso_score,
                   _get_field_pos(p),
                   saves, goals, assists, rating,
                   detail["shots"], detail["shots_on"], detail["key_passes"],
                   detail["dribbles"], detail["blocks"], detail["pass_acc"],
-                  my_conceded, m["id"]))
+                  my_conceded, day, m["id"]))
     conn.commit()
     conn.close()
 
@@ -753,15 +892,16 @@ def simulate_my_cl_match(week, p):
 # 라운드 진행
 # ─────────────────────────────────────────────
 
-def get_cl_group_standings(tid, grp):
-    """챔스 조 순위: 승점 → 득실 → 다득점 → 전력."""
+def get_cl_league_standings(tid):
+    """챔스 리그 스테이지 순위: 승점 → 득실 → 다득점 → 전력.
+    (조가 없어졌으므로 대회 전체 팀을 한 표로 정렬 - 실제 UEFA 리그
+    스테이지와 동일한 방식.)"""
     conn = get_conn()
     entries = [dict(r) for r in conn.execute(
-        "SELECT * FROM cl_entries WHERE tournament_id=? AND grp=?",
-        (tid, grp)).fetchall()]
+        "SELECT * FROM cl_entries WHERE tournament_id=?", (tid,)).fetchall()]
     matches = [dict(r) for r in conn.execute(
-        """SELECT * FROM cl_matches WHERE tournament_id=? AND grp=?
-           AND stage='group' AND home_score>=0""", (tid, grp)).fetchall()]
+        """SELECT * FROM cl_matches WHERE tournament_id=?
+           AND stage='league' AND home_score>=0""", (tid,)).fetchall()]
     conn.close()
 
     tbl = {e["team_id"]: {"team_id": e["team_id"], "team_name": e["team_name"],
@@ -788,59 +928,141 @@ def get_cl_group_standings(tid, grp):
     return rows
 
 
-def _finalize_groups(t):
-    """챔스 조별리그 종료 → 각 조 1·2위(16팀) → 16강 대진 생성."""
+def _finalize_league_phase(t):
+    """[2026-07 신설] 챔스 리그 스테이지 종료 → 순위 확정 → 1~직행컷위는
+    바로 다음 토너먼트 라운드 직행, 그다음 플레이오프컷 인원은 플레이오프
+    대상, 나머지는 광탈. 실제 UEFA(1~8위 직행/9~24위 PO/25~36위 광탈)와
+    같은 비율을 대륙별 참가 규모에 맞춰 그대로 적용한다."""
     from game_engine import add_log, get_player
     tid = t["id"]
-    conn = get_conn()
-    n_groups = conn.execute(
-        "SELECT COUNT(DISTINCT grp) AS n FROM cl_entries WHERE tournament_id=? AND grp!=''",
-        (tid,)).fetchone()["n"]
-    conn.close()
-    labels = _GROUP_LABELS[:n_groups]
+    cont = t["continent"]
+    direct_cut = _cl_direct_cut(cont)
+    po_pool = _cl_playoff_pool(cont)
 
-    firsts, seconds, eliminated = {}, {}, []
-    for g in labels:
-        rows = get_cl_group_standings(tid, g)
-        if len(rows) >= 1: firsts[g] = rows[0]["team_id"]
-        if len(rows) >= 2: seconds[g] = rows[1]["team_id"]
-        eliminated.extend(r["team_id"] for r in rows[2:])
-
-    conn = get_conn()
-    c = conn.cursor()
-    for tid_e in eliminated:
-        c.execute("UPDATE cl_entries SET alive=0 WHERE tournament_id=? AND team_id=?",
-                  (tid, tid_e))
-
-    # R16 대진: 1A-2B, 1C-2D, … / 1B-2A, 1D-2C, … (월드컵 방식)
-    pairs = []
-    for i in range(0, n_groups, 2):
-        g1, g2 = labels[i], labels[i + 1]
-        if g1 in firsts and g2 in seconds:
-            pairs.append((firsts[g1], seconds[g2]))
-    for i in range(0, n_groups, 2):
-        g1, g2 = labels[i], labels[i + 1]
-        if g2 in firsts and g1 in seconds:
-            pairs.append((firsts[g2], seconds[g1]))
+    rows = get_cl_league_standings(tid)
+    direct = rows[:direct_cut]
+    playoff_teams = rows[direct_cut:direct_cut + po_pool]
+    eliminated = rows[direct_cut + po_pool:]
 
     p = get_player()
     my_tid = p.get("current_team_id", 0) if p else 0
-    next_week = CL_ROUND_WEEKS["R16"]
+
+    conn = get_conn(); c = conn.cursor()
+    for r in eliminated:
+        c.execute("UPDATE cl_entries SET alive=0 WHERE tournament_id=? AND team_id=?",
+                  (tid, r["team_id"]))
+
+    # ── 플레이오프 대진: 시드(상위 절반)가 넌시드(하위 절반)를 상대로 홈 개최.
+    #   1번 시드가 최약체 넌시드를, 마지막 시드가 최강 넌시드를 만나는
+    #   실제 UEFA 방식(높은 시드일수록 상대적으로 편한 대진)을 그대로 따른다.
+    half = len(playoff_teams) // 2
+    seeded, unseeded = playoff_teams[:half], playoff_teams[half:]
+    po_pairs = list(zip(seeded, reversed(unseeded)))
+
+    if po_pairs:
+        for slot, (home, away) in enumerate(po_pairs):
+            is_my = 1 if my_tid in (home["team_id"], away["team_id"]) else 0
+            c.execute("""INSERT INTO cl_matches
+                         (tournament_id, stage, week, home_team_id, away_team_id,
+                          home_score, away_score, is_my, slot)
+                         VALUES(?,?,?,?,?,-1,-1,?,?)""",
+                      (tid, "PO", CL_PLAYOFF_WEEK,
+                       home["team_id"], away["team_id"], is_my, slot))
+        c.execute("UPDATE cl_tournaments SET status='playoff' WHERE id=?", (tid,))
+        conn.commit()
+        conn.close()
+    else:
+        # [버그 수정] _start_knockout도 같은 풀 커넥션을 열어서 자체적으로
+        # commit/close 한다 — 여기서 트랜잭션을 먼저 끝내지 않고 호출하면
+        # 같은 커넥션 위에 트랜잭션이 중첩돼 다른 화면(주간 진행 등)에서
+        # "cannot start a transaction within a transaction"으로 이어질 수
+        # 있다. 플레이오프 대상이 아예 없을 만큼 참가 규모가 작으면
+        # 직행팀만으로 바로 KO — 먼저 커밋/닫고 나서 호출한다.
+        conn.commit()
+        conn.close()
+        _start_knockout(t, [r["team_id"] for r in direct])
+
+    add_log(f"🏆 {t['name']} 리그 스테이지 종료 → 1~{direct_cut}위 직행, "
+            f"{direct_cut+1}~{direct_cut+po_pool}위 플레이오프", "event")
+    if my_tid and any(r["team_id"] == my_tid for r in eliminated):
+        _record_my_exit(t, "리그 스테이지")
+
+
+def _finalize_playoff(t):
+    """[2026-07 신설] 플레이오프 종료 → 승자 + 리그 스테이지 직행팀을 합쳐
+    첫 토너먼트 라운드(16강 또는 8강) 대진 생성."""
+    from game_engine import add_log, get_player
+    tid = t["id"]
+    conn = get_conn()
+    po_matches = [dict(r) for r in conn.execute(
+        "SELECT * FROM cl_matches WHERE tournament_id=? AND stage='PO' ORDER BY slot",
+        (tid,)).fetchall()]
+    direct_ids = [r["team_id"] for r in conn.execute(
+        "SELECT team_id FROM cl_entries WHERE tournament_id=? AND alive=1", (tid,)).fetchall()]
+    conn.close()
+
+    p = get_player()
+    my_tid = p.get("current_team_id", 0) if p else 0
+
+    winners, losers = [], []
+    conn = get_conn(); c = conn.cursor()
+    for m in po_matches:
+        w = _winner_of(m)
+        l = m["away_team_id"] if w == m["home_team_id"] else m["home_team_id"]
+        winners.append(w)
+        losers.append(l)
+        c.execute("UPDATE cl_entries SET alive=0 WHERE tournament_id=? AND team_id=?", (tid, l))
+        if my_tid and l == my_tid:
+            conn.commit(); conn.close()
+            _record_my_exit(t, "플레이오프")
+            conn = get_conn(); c = conn.cursor()
+    conn.commit(); conn.close()
+
+    # direct_ids에는 PO 참가팀(현재 alive=1인 채로 남아있던 팀 중 winners 아직 안 뺀 것)이
+    # 섞여 있지 않다 - PO 참가팀은 alive=1 상태로 대기했으므로 direct_ids에 winners/losers도
+    # 포함돼 있을 수 있어, 최종 진출팀은 '직행팀(PO 미참가)' + 'PO 승자'로 명시적으로 합친다.
+    po_team_ids = {m["home_team_id"] for m in po_matches} | {m["away_team_id"] for m in po_matches}
+    direct_only = [tid_ for tid_ in direct_ids if tid_ not in po_team_ids]
+    qualifiers = direct_only + winners
+
+    add_log(f"🏆 {t['name']} 플레이오프 종료 → {STAGE_KO.get(_first_stage_for(len(qualifiers)), '')} 진출팀 확정", "event")
+    _start_knockout(t, qualifiers)
+
+
+def _start_knockout(t, qualifier_ids):
+    """[2026-07 신설] 확정된 진출팀 목록으로 첫 토너먼트 라운드 대진을 만든다.
+    전력순으로 정렬해 1번 시드 vs 최약체, 2번 시드 vs 차약체 식으로 짝지어
+    (실제 대회 추첨과 완전히 같진 않지만) 강팀끼리 초반에 만나는 걸 줄인다."""
+    from game_engine import get_player
+    tid = t["id"]
+    conn = get_conn()
+    infos = {r["team_id"]: dict(r) for r in conn.execute(
+        "SELECT * FROM cl_entries WHERE tournament_id=?", (tid,)).fetchall()}
+    conn.close()
+
+    ranked = sorted(qualifier_ids, key=lambda tid_: infos.get(tid_, {}).get("ovr", 0), reverse=True)
+    half = len(ranked) // 2
+    top, bottom = ranked[:half], ranked[half:]
+    pairs = list(zip(top, reversed(bottom)))
+
+    first_stage = _first_stage_for(len(ranked))
+    next_week = CL_ROUND_WEEKS.get(first_stage, CL_ROUND_WEEKS["R16"])
+
+    p = get_player()
+    my_tid = p.get("current_team_id", 0) if p else 0
+
+    conn = get_conn(); c = conn.cursor()
     for slot, (home, away) in enumerate(pairs):
         is_my = 1 if my_tid in (home, away) else 0
         c.execute("""INSERT INTO cl_matches
-                     (tournament_id, stage, grp, week, home_team_id, away_team_id,
+                     (tournament_id, stage, week, home_team_id, away_team_id,
                       home_score, away_score, is_my, slot)
-                     VALUES(?,?,?,?,?,?,-1,-1,?,?)""",
-                  (tid, "R16", "", next_week, home, away, is_my, slot))
-    c.execute("UPDATE cl_tournaments SET status='ko' WHERE id=?", (tid,))
+                     VALUES(?,?,?,?,?,-1,-1,?,?)""",
+                  (tid, first_stage, next_week, home, away, is_my, slot))
+    c.execute("UPDATE cl_tournaments SET status='ko', first_stage=? WHERE id=?",
+              (first_stage, tid))
     conn.commit()
     conn.close()
-
-    add_log(f"🏆 {t['name']} 조별리그 종료 → 16강 진출팀 확정", "event")
-    # 내 팀이 조별 탈락?
-    if my_tid and my_tid in eliminated:
-        _record_my_exit(t, "조별리그 탈락")
 
 
 def _advance_round(t, cur_stage, next_stage):
@@ -1050,29 +1272,26 @@ def _save_trophy(year, team_name, competition, result):
 # ─────────────────────────────────────────────
 
 def get_my_cl_all_groups(year):
-    """[UI용] 내 대륙 챔스의 '모든 조' 순위표 목록을 반환.
-    반환: {"groups": [{"grp": "A", "standings": [...]}...], "my_team_id": tid} 또는 None"""
-    from game_engine import get_player
-    p = get_player()
-    if not p or not p.get("current_team_id"):
-        return None
-    my_tid = p["current_team_id"]
-    t = _my_cl_tournament(p, year)
-    if not t:
-        return None
-    conn = get_conn()
-    grps = [r["grp"] for r in conn.execute(
-        "SELECT DISTINCT grp FROM cl_entries WHERE tournament_id=? AND grp!='' ORDER BY grp",
-        (t["id"],)).fetchall()]
-    conn.close()
-    if not grps:
-        return None
-    groups = [{"grp": g, "standings": get_cl_group_standings(t["id"], g)} for g in grps]
-    return {"groups": groups, "my_team_id": my_tid}
+    """[2026-07 폐기 예정] 스위스 방식 개편으로 '조'가 없어졌다. 예전
+    UI(ui/schedule_window.py의 조별리그 표시)와의 하위 호환을 위해 함수
+    자체는 남겨두되 항상 None을 반환한다 — 호출부는 get_my_cl_league_standings로
+    교체됐다."""
+    return None
 
 
 def get_my_cl_group_info(year):
-    """[UI용] 내 팀이 속한 조의 라벨과 순위표를 반환. 없으면 None."""
+    """[2026-07 폐기 예정] 위와 동일한 이유로 항상 None. ui/center_panel.py의
+    '경기 없는 주차에도 조별리그 context 유지' 분기가 이 함수를 호출하는데,
+    None을 반환하면 그 분기는 조용히 건너뛴다(에러 없음) — 리그 스테이지는
+    매 주차 실제 경기가 있어서 애초에 그 분기가 필요한 상황 자체가 크게
+    줄었다."""
+    return None
+
+
+def get_my_cl_league_standings(year):
+    """[UI용/2026-07 신설] 내 대륙 챔스의 리그 스테이지 전체 순위표.
+    반환: {"standings": [...], "my_team_id": tid, "direct_cut": N, "playoff_cut": N}
+    또는 None (대회가 없거나 아직 리그 스테이지 매치가 없을 때)."""
     from game_engine import get_player
     p = get_player()
     if not p or not p.get("current_team_id"):
@@ -1081,16 +1300,15 @@ def get_my_cl_group_info(year):
     t = _my_cl_tournament(p, year)
     if not t:
         return None
-    conn = get_conn()
-    row = conn.execute(
-        "SELECT grp FROM cl_entries WHERE tournament_id=? AND team_id=?",
-        (t["id"], my_tid)).fetchone()
-    conn.close()
-    if not row or not row["grp"]:
+    rows = get_cl_league_standings(t["id"])
+    if not rows:
         return None
-    grp = row["grp"]
-    rows = get_cl_group_standings(t["id"], grp)
-    return {"grp": grp, "standings": rows, "my_team_id": my_tid}
+    cont = t["continent"]
+    return {
+        "standings": rows, "my_team_id": my_tid,
+        "direct_cut": _cl_direct_cut(cont),
+        "playoff_cut": _cl_direct_cut(cont) + _cl_playoff_pool(cont),
+    }
 
 
 def get_my_champions_matches(year):
@@ -1187,8 +1405,12 @@ def get_my_cl_matches():
         my_name, my_flag = names.get((m["tournament_id"], m["home_team_id"] if is_home else m["away_team_id"]), ("", ""))
         opp_name, opp_flag = names.get((m["tournament_id"], opp_id), ("?", ""))
 
+        from constants import day_to_iso_date_str, week_to_iso_date_str
+        date_str = (day_to_iso_date_str(m["t_year"], m["day"]) if m.get("day")
+                    else week_to_iso_date_str(m["t_year"], m["week"]))
+
         out.append({
-            "year": m["t_year"], "week": m["week"],
+            "year": m["t_year"], "week": m["week"], "date": date_str,
             "position": m["my_position"], "team": my_name, "team_flag": my_flag,
             "comp": m["comp"], "stage": STAGE_KO.get(m["stage"], m["stage"]),
             "opp": opp_name, "opp_flag": opp_flag,

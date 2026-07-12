@@ -17,7 +17,8 @@ from PyQt6.QtWidgets import (
     QHeaderView, QPushButton, QTabWidget, QWidget, QSplitter, QFrame,
     QAbstractItemView, QScrollArea, QGridLayout, QSizePolicy
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QColor
 
 import world_browser as wb
 
@@ -92,6 +93,7 @@ class WorldBrowserWindow(QDialog):
         lay.addWidget(tabs, 1)
 
         tabs.addTab(self._build_league_tab(), "🔍 리그 검색")
+        tabs.addTab(self._build_cup_tab(), "🎖 컵대회 검색")
         tabs.addTab(self._build_cl_tab(), "🏆 역대 챔피언스리그")
         tabs.addTab(self._build_wc_tab(), "🌐 역대 월드컵")
         tabs.addTab(self._build_nc_tab(), "🎖 역대 네이션스컵")
@@ -176,8 +178,17 @@ class WorldBrowserWindow(QDialog):
         filt.addWidget(self.grade_combo)
 
         self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("🔎 리그명 · 국가명 검색")
-        self.search_box.textChanged.connect(self._refresh_league_list)
+        self.search_box.setPlaceholderText("🔎 리그명 · 국가명 · 팀명 검색")
+        # [최적화] 팀명까지 검색 대상에 들어가면서 "FC"처럼 흔한 문자열은
+        # 매치되는 리그 수가 확 늘어난다(리그당 커스텀 위젯을 새로 만들어야
+        # 하는 리스트 재구성이 무거움). 이 무거운 재구성이 글자 하나 칠 때마다
+        # 매번 일어나던 걸, 타이핑이 잠깐(250ms) 멈췄을 때 한 번만 실행되도록
+        # 디바운스한다 — 최종적으로 화면에 보이는 검색 결과는 기존과 동일.
+        self._search_debounce = QTimer(self)
+        self._search_debounce.setSingleShot(True)
+        self._search_debounce.setInterval(250)
+        self._search_debounce.timeout.connect(self._refresh_league_list)
+        self.search_box.textChanged.connect(lambda _text: self._search_debounce.start())
         filt.addWidget(self.search_box, 1)
         lay.addLayout(filt)
 
@@ -197,6 +208,15 @@ class WorldBrowserWindow(QDialog):
         self.standing_title = QLabel("← 왼쪽에서 리그를 선택하세요")
         self.standing_title.setStyleSheet("color:#00cc44;font-size:14px;font-weight:bold;")
         title_row.addWidget(self.standing_title, 1)
+        # [2026-07 신설] '역대 우승팀' 표에서 특정 시즌(연도) 행을 클릭했을 때
+        # 그 시즌 전체 순위표로 들어간 상태(season_detail)에서만 보이는 뒤로가기.
+        # CL/월드컵/컵대회 탭은 더블클릭 시 별도 다이얼로그(TournamentDetailDialog)를
+        # 띄우지만, 리그는 이미 있는 순위표 영역을 그대로 재사용하는 쪽이 다른
+        # 필터(대륙/국가/등급)와의 UI 흐름상 자연스러워 같은 패널 안에서 전환한다.
+        self.season_back_btn = QPushButton("← 역대 기록으로")
+        self.season_back_btn.setVisible(False)
+        self.season_back_btn.clicked.connect(self._on_season_back_clicked)
+        title_row.addWidget(self.season_back_btn)
         self.history_btn = QPushButton("🏆 역대 우승팀")
         self.history_btn.setCheckable(True)
         self.history_btn.setVisible(False)
@@ -210,6 +230,11 @@ class WorldBrowserWindow(QDialog):
         self.standing_tbl = QTableWidget(0, 0)
         self.standing_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.standing_tbl.verticalHeader().setVisible(False)
+        # [2026-07 신설] '역대 우승팀' 모드일 때만 동작 — 연도 행을 클릭하면
+        # 그 시즌의 전체 순위표를 보여준다(월드컵/챔스처럼 그 시기 기록을
+        # 파고들 수 있게). 현재 순위표/시즌 상세 모드일 땐 아무 동작 없음
+        # (_on_standing_row_clicked가 모드를 보고 알아서 무시함).
+        self.standing_tbl.cellClicked.connect(self._on_standing_row_clicked)
         right_lay.addWidget(self.standing_tbl)
         split.addWidget(right)
         split.setSizes([440, 500])
@@ -247,6 +272,23 @@ class WorldBrowserWindow(QDialog):
             if f"{c['flag']} {c['name']}" == txt:
                 return c["id"]
         return None
+
+    def pause_refresh(self):
+        """[스레드 안전] 시즌/일자 진행 워커(QThread)가 도는 동안 검색 디바운스
+        타이머를 멈춰둔다. 이 창은 center_panel._advance()가 여는 비모달
+        QDialog라(main_win.setEnabled(False)로도 막히지 않음), 워커가 DB에
+        쓰는 도중에도 사용자가 검색창에 계속 타이핑할 수 있다 — 그러면 250ms 뒤
+        디바운스가 같은 풀 커넥션으로 SELECT를 던져 메인 스레드와 워커 스레드가
+        동시에 DB에 접근하는 경합이 생긴다(schedule_window/standings_window를
+        먼저 이렇게 방어해둔 것과 동일한 이유 — 이 창만 목록에서 빠져있었다).
+        pause 중 눌린 키 입력 자체는 막지 않고, 그 결과로 예약된 새로고침만
+        보류한다 — resume 후 사용자가 다시 타이핑하면 정상적으로 반영된다."""
+        self._search_debounce.stop()
+
+    def resume_refresh(self):
+        """pause 동안 새로 시작된 타이머는 없으므로(stop만 호출) 되돌릴 상태가
+        없다 — 다음 텍스트 변경 시 디바운스가 다시 정상적으로 예약된다."""
+        pass
 
     def _refresh_league_list(self, *_a):
         cont = None if self.cont_combo.currentText() == _ALL else self.cont_combo.currentText()
@@ -302,13 +344,19 @@ class WorldBrowserWindow(QDialog):
 
     def _league_row_widget(self, lg):
         """리그 목록 한 줄: 국기+국가+리그명 / 등급배지 / 티어.
-        offer_window의 카드-내부-라벨 조합과 같은 톤(작은 pill 배지)으로 통일."""
+        offer_window의 카드-내부-라벨 조합과 같은 톤(작은 pill 배지)으로 통일.
+        [2026-07] 팀명 검색으로 뜬 결과면(lg['matched_team']이 있으면) 그 팀명을
+        작게 함께 보여줘서 "왜 이 리그가 검색됐는지" 바로 알 수 있게 한다."""
         row = QWidget()
         h = QHBoxLayout(row)
         h.setContentsMargins(8, 5, 8, 5)
         h.setSpacing(6)
 
-        name_lbl = QLabel(f"{lg['flag']}  {lg['country']} · {lg['name']}")
+        name_txt = f"{lg['flag']}  {lg['country']} · {lg['name']}"
+        matched_team = lg.get("matched_team")
+        if matched_team:
+            name_txt += f"  (🔎 {matched_team})"
+        name_lbl = QLabel(name_txt)
         name_lbl.setStyleSheet("color:#ddd;font-size:12px;")
         h.addWidget(name_lbl, 1)
 
@@ -332,6 +380,7 @@ class WorldBrowserWindow(QDialog):
         self.standing_title.setText("⏳ 불러오는 중...")
         self.standing_sub.setText("")
         self.history_btn.setVisible(False)
+        self.season_back_btn.setVisible(False)
         self.standing_title.repaint()
         standings = wb.get_league_standings_for_browser(lid)
         self._current_standings = standings  # [신규] 역대 우승팀 토글 시 되돌아올 캐시
@@ -339,6 +388,7 @@ class WorldBrowserWindow(QDialog):
         self._current_league_title = title_text
         self.standing_title.setText(f"📊 {title_text}")
         # [신규] 새 리그를 열 때는 항상 순위표부터 보여준다(토글 초기화).
+        self._standing_view_mode = "current"
         self.history_btn.blockSignals(True)
         self.history_btn.setChecked(False)
         self.history_btn.setText("🏆 역대 우승팀")
@@ -352,18 +402,85 @@ class WorldBrowserWindow(QDialog):
         lid = getattr(self, "_current_league_id", None)
         if lid is None:
             return
+        self.season_back_btn.setVisible(False)
         if checked:
+            self._standing_view_mode = "history"
             self.history_btn.setText("📊 팀 순위")
             rows = wb.get_league_champions(lid)
+            self._current_champions_rows = rows  # [신규] 시즌 상세에서 승격/강등 색상 표시용
             self.standing_sub.setText(
-                "경기가 진행된 시즌만 표시됩니다" if rows else "")
-            self._fill_champions_table(rows)
+                "경기가 진행된 시즌만 표시됩니다 · 연도 행을 클릭하면 그 시즌 전체 순위를 볼 수 있어요"
+                if rows else "")
+            self._fill_champions_table(rows, wb.league_has_lower_tier(lid))
         else:
+            self._standing_view_mode = "current"
             self.history_btn.setText("🏆 역대 우승팀")
             self.standing_sub.setText("")
             self._fill_standing_table(getattr(self, "_current_standings", []))
 
-    def _fill_standing_table(self, rows):
+    def _on_standing_row_clicked(self, row, _col):
+        """[2026-07 신설] '역대 우승팀' 표에서 연도 행을 클릭하면 그 시즌의
+        전체 순위표(전 구단 승/무/패/득실/승점)를 같은 패널에 보여준다.
+        월드컵/챔스/컵대회 탭이 더블클릭으로 그 시기 대진 상세를 보여주는 것과
+        같은 맥락 — 리그는 '경기 목록'보다 '그 시즌 순위표'가 더 자연스러운
+        상세 정보라 순위표를 그대로 재사용한다.
+        [주의] '팀 순위'(현재 시즌) 모드나 이미 시즌 상세를 보는 중엔 이 클릭이
+        아무 의미가 없으므로 무시한다(_standing_view_mode로 판별)."""
+        if getattr(self, "_standing_view_mode", "current") != "history":
+            return
+        item = self.standing_tbl.item(row, 0)
+        if item is None:
+            return
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if not data:
+            return
+        season, year = data
+        lid = getattr(self, "_current_league_id", None)
+        if lid is None:
+            return
+        rows = wb.get_league_standings_for_browser(lid, season=season, year=year)
+        # [2026-07 신설] 강등팀은 빨간색, 승격팀은 파란색으로 표시하기 위해
+        # 같은 시즌의 승격/강등 팀 명단을 찾는다. _on_history_toggled에서
+        # 캐시해둔 champions rows를 재사용해 별도 조회 없이 바로 매칭한다.
+        promoted_names, relegated_names = set(), set()
+        for champ_row in getattr(self, "_current_champions_rows", []):
+            if champ_row.get("season") == season:
+                promoted_names = {item["name"] for item in (champ_row.get("promoted") or [])}
+                relegated_names = {item["name"] for item in (champ_row.get("relegated") or [])}
+                break
+        self._standing_view_mode = "season_detail"
+        self.history_btn.setVisible(False)
+        self.season_back_btn.setVisible(True)
+        title_text = getattr(self, "_current_league_title", "")
+        self.standing_title.setText(f"📊 {year}년 시즌 최종 순위 — {title_text}")
+        self.standing_sub.setText(
+            "🔵 파란색 = 승격  ·  🔴 빨간색 = 강등" if (promoted_names or relegated_names) else "")
+        self._fill_standing_table(rows, promoted_names=promoted_names, relegated_names=relegated_names)
+
+    def _on_season_back_clicked(self):
+        """시즌 상세 순위표에서 '역대 우승팀' 목록으로 되돌아간다."""
+        lid = getattr(self, "_current_league_id", None)
+        if lid is None:
+            return
+        self._standing_view_mode = "history"
+        self.season_back_btn.setVisible(False)
+        self.history_btn.setVisible(True)
+        self.history_btn.blockSignals(True)
+        self.history_btn.setChecked(True)
+        self.history_btn.setText("📊 팀 순위")
+        self.history_btn.blockSignals(False)
+        rows = wb.get_league_champions(lid)
+        self._current_champions_rows = rows
+        title_text = getattr(self, "_current_league_title", "")
+        self.standing_title.setText(f"🏆 {title_text} 역대 기록")
+        self.standing_sub.setText(
+            "경기가 진행된 시즌만 표시됩니다 · 연도 행을 클릭하면 그 시즌 전체 순위를 볼 수 있어요"
+            if rows else "")
+        self._fill_champions_table(rows, wb.league_has_lower_tier(lid))
+
+    def _fill_standing_table(self, rows, promoted_names=None, relegated_names=None):
+        promoted_names = promoted_names or set()
+        relegated_names = relegated_names or set()
         cols = ["순위", "팀명", "승", "무", "패", "득점", "실점", "득실", "승점"]
         tbl = self.standing_tbl
         tbl.clear()
@@ -376,25 +493,53 @@ class WorldBrowserWindow(QDialog):
             vals = [str(i + 1), r["name"], str(r["wins"]), str(r["draws"]), str(r["losses"]),
                     str(r["goals_for"]), str(r["goals_against"]),
                     str(r["goals_for"] - r["goals_against"]), str(r["pts"])]
+            # [2026-07 신설] 그 시즌 실제로 승격/강등된 팀을 색으로 표시
+            # (season_detail 모드에서만 promoted_names/relegated_names가 채워짐).
+            if r["name"] in relegated_names:
+                row_color = QColor("#ff5555")
+            elif r["name"] in promoted_names:
+                row_color = QColor("#4da6ff")
+            elif i < 4:
+                row_color = Qt.GlobalColor.white
+            else:
+                row_color = None
             for j, v in enumerate(vals):
                 cell = QTableWidgetItem(v)
                 cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if i < 4:
-                    cell.setForeground(Qt.GlobalColor.white)
+                if row_color is not None:
+                    cell.setForeground(row_color)
                 tbl.setItem(i, j, cell)
         self._grow_to_fit(tbl, stretch_col=1)
 
-    def _fill_champions_table(self, rows):
-        """[신규] '🏆 역대 우승팀' 토글 시 표시되는 시즌별 1~3위 + 꼴찌(강등권) 목록.
+    def _fill_champions_table(self, rows, has_lower_tier=True):
+        """'🏆 역대 우승팀' 토글 시 표시되는 시즌별 1~4위 + 강등 순위별 컬럼.
         최신 시즌이 위로 오도록 이미 wb.get_league_champions()에서
         season DESC로 정렬돼 온다. 한 시즌의 성적 상세(승/무/패 등)가 필요하면
         '📊 팀 순위'로 되돌아가 현재 순위표에서 바로 확인할 수 있으므로,
         여기서는 여러 시즌을 한눈에 훑어보기 좋도록 순위 이름만 보여준다.
-        마지막 칸(꼴찌)의 컬럼 헤더는 그 시즌 실제 참가팀 수에 맞춰 '{n}위'로
-        표시한다(대부분 8위, 리그 규모가 다르면 그에 맞춰 자동 반영)."""
-        last_rank = max((r.get("last_rank") or 0) for r in rows) if rows else 0
-        last_label = f"🔻 {last_rank}위" if last_rank else "🔻 꼴찌"
-        cols = ["연도", "🥇 1위", "🥈 2위", "🥉 3위", last_label]
+        [2026-07 추가] 예전엔 1~3위까지만 기록했는데, 모든 리그에 대해
+        4위까지 기록하도록 확장(get_league_champions()가 이미 fourth를
+        내려주므로 여기서 컬럼만 하나 늘리면 된다).
+        [2026-07] 승강 인원이 리그 규모별로 달라져서(game_engine.
+        _promo_releg_count) 강등 인원수도 리그마다 다르다. 한 셀에 다
+        몰아넣지 않고 "18위(강등)", "19위(강등)", "20위(강등)"처럼
+        실제 순위별로 컬럼을 나눠서 보여준다.
+        [2026-07 재수정] 승격은 "N위(승격)"처럼 별도 컬럼을 또 만드는 대신,
+        이미 있는 1~4위 컬럼 자체를 그 시즌 실제 승격 인원만큼만 파란색으로
+        칠한다(신민용 요청) — 승격 인원이 리그마다/시즌마다 다르므로(2팀
+        승격이면 1·2위만 파란색, 1팀만 승격이면 1위만 파란색, 나머지는
+        흰색 그대로) 별도 컬럼 없이 그 순위 자체가 승격인지 아닌지를
+        직관적으로 보여준다. 1부 리그는 애초에 상위 티어가 없어
+        get_league_champions()가 promoted를 항상 빈 리스트로 내려주므로,
+        자동으로 1~4위가 전부 흰색으로만 남는다(승격 개념 자체가 없음).
+        """
+        # 강등 순위 집합(같은 리그면 시즌마다 보통 동일하지만, 방어적으로
+        # 전체 행에서 등장한 순위를 다 모아 오름차순으로 컬럼을 만든다).
+        releg_ranks = sorted({item["rank"] for r in rows for item in (r.get("relegated") or [])})
+
+        cols = (["연도", "🥇 1위", "🥈 2위", "🥉 3위", "🏅 4위"]
+                + [f"{rank}위(강등)" for rank in releg_ranks])
+        FIXED_COLS = 5  # 연도 + 1~4위 (강등 컬럼이 시작되는 인덱스 기준)
         tbl = self.standing_tbl
         tbl.clear()
         tbl.setRowCount(len(rows))
@@ -402,19 +547,167 @@ class WorldBrowserWindow(QDialog):
         tbl.setHorizontalHeaderLabels(cols)
         tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         for i, r in enumerate(rows):
-            vals = [str(r["year"]), r["first"], r["second"], r["third"], r.get("last", "-")]
+            # 이 시즌 실제로 승격된 순위 집합 (예: {1,2}면 1·2위칸만 파란색)
+            promoted_ranks_this_season = {item["rank"] for item in (r.get("promoted") or [])}
+            releg_by_rank = {item["rank"]: item["name"] for item in (r.get("relegated") or [])}
+            vals = [str(r["year"]), r["first"], r["second"], r["third"], r.get("fourth", "-")]
+            vals += [releg_by_rank.get(rank, "-") for rank in releg_ranks]
             for j, v in enumerate(vals):
                 cell = QTableWidgetItem(v)
                 cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 if j >= 1:
                     cell.setForeground(Qt.GlobalColor.white)
-                if j == 4:
-                    cell.setForeground(Qt.GlobalColor.red)
+                if 1 <= j <= 4 and j in promoted_ranks_this_season:
+                    cell.setForeground(QColor("#4da6ff"))   # 그 순위가 실제 승격됐으면 파란색
+                if j >= FIXED_COLS and v != "-":
+                    cell.setForeground(Qt.GlobalColor.red)  # 강등 = 빨간색
+                if j == 0:
+                    # [2026-07 신설] 이 행(연도)을 클릭하면 그 시즌 전체 순위표로
+                    # 들어갈 수 있도록 season/year를 셀 데이터에 실어둔다
+                    # (_on_standing_row_clicked가 읽어서 조회).
+                    cell.setData(Qt.ItemDataRole.UserRole, (r["season"], r["year"]))
+                    cell.setToolTip("클릭하면 이 시즌 전체 순위표를 볼 수 있어요")
                 tbl.setItem(i, j, cell)
         self._grow_to_fit(tbl, stretch_col=None)
 
     # ─────────────────────────────────────────
-    # 탭2: 역대 챔피언스리그
+    # 탭2: 컵대회 검색 (2026-07 신설)
+    # ─────────────────────────────────────────
+    def _build_cup_tab(self):
+        """국내 컵대회(FA컵식) 검색 — 나라를 고르면 그 나라 컵대회의 역대
+        우승/준우승/3·4위 기록을 보여준다. 리그 검색과 같은 필터 UX를
+        쓰되, 컵대회는 나라당 하나뿐이라 목록은 '리그'가 아니라 '나라'
+        단위다."""
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 8, 0, 0)
+
+        info = QLabel(
+            "💡 나라를 선택하면 역대 컵대회 우승/준우승/3·4위 기록이 뜹니다. "
+            "대회 행을 더블클릭하면 라운드별 대진 상세를 볼 수 있어요.")
+        info.setStyleSheet("color:#666;font-size:11px;")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+
+        filt = QHBoxLayout()
+        filt.setSpacing(8)
+        lbl1 = QLabel("대륙"); lbl1.setStyleSheet("color:#888;font-size:11px;")
+        self.cup_cont_combo = QComboBox()
+        self.cup_cont_combo.addItem(_ALL)
+        for cont in wb.list_continents():
+            self.cup_cont_combo.addItem(cont)
+        self.cup_cont_combo.currentTextChanged.connect(self._refresh_cup_country_list)
+        filt.addWidget(lbl1)
+        filt.addWidget(self.cup_cont_combo)
+
+        self.cup_search_box = QLineEdit()
+        self.cup_search_box.setPlaceholderText("🔎 나라명 검색 (예: 대한민국)")
+        self.cup_search_box.textChanged.connect(self._refresh_cup_country_list)
+        filt.addWidget(self.cup_search_box, 1)
+        lay.addLayout(filt)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+        self._cup_split = split
+        self.cup_country_list = QListWidget()
+        self.cup_country_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.cup_country_list.itemClicked.connect(self._on_cup_country_selected)
+        split.addWidget(self.cup_country_list)
+
+        right = QWidget()
+        right_lay = QVBoxLayout(right)
+        right_lay.setContentsMargins(10, 0, 0, 0)
+
+        self.cup_title = QLabel("← 왼쪽에서 나라를 선택하세요")
+        self.cup_title.setStyleSheet("color:#c48aff;font-size:14px;font-weight:bold;")
+        right_lay.addWidget(self.cup_title)
+
+        self.cup_sub = QLabel("")
+        self.cup_sub.setStyleSheet("color:#888;font-size:11px;")
+        right_lay.addWidget(self.cup_sub)
+
+        self.cup_tbl = QTableWidget(0, 0)
+        self.cup_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.cup_tbl.verticalHeader().setVisible(False)
+        self.cup_tbl.cellDoubleClicked.connect(self._open_cup_detail)
+        right_lay.addWidget(self.cup_tbl)
+        split.addWidget(right)
+        split.setSizes([320, 620])
+        lay.addWidget(split, 1)
+
+        self._cup_country_cache = []
+        self._refresh_cup_country_list()
+        return w
+
+    def _refresh_cup_country_list(self, *_a):
+        cont = None if self.cup_cont_combo.currentText() == _ALL else self.cup_cont_combo.currentText()
+        q = self.cup_search_box.text().strip().lower()
+        countries = wb.list_countries(cont)
+        if q:
+            countries = [c for c in countries if q in c["name"].lower()]
+        self._cup_country_cache = countries
+
+        self.cup_country_list.clear()
+        for c in countries:
+            has_data = wb.has_cup_data(c["id"])
+            item = QListWidgetItem(f"{c['flag']}  {c['name']}" + ("" if has_data else "  (기록 없음)"))
+            item.setData(Qt.ItemDataRole.UserRole, c["id"])
+            if not has_data:
+                item.setForeground(Qt.GlobalColor.darkGray)
+            self.cup_country_list.addItem(item)
+
+    def _on_cup_country_selected(self, item):
+        cid = item.data(Qt.ItemDataRole.UserRole)
+        if cid is None:
+            return
+        rows = wb.get_cup_history(cid)
+        cname = item.text().split("  (")[0]
+        self.cup_title.setText(f"🎖️ {cname} 역대 컵대회 기록")
+        self.cup_sub.setText(
+            f"{rows[0]['name']}  ·  완료된 대회 {len(rows)}건" if rows
+            else "이 나라에서 완료된 컵대회 기록이 없습니다")
+
+        cols = ["연도", "대회명", "🏆 우승", "🥈 준우승", "🥉 3위", "4위"]
+        tbl = self.cup_tbl
+        tbl.clear()
+        tbl.setRowCount(len(rows))
+        tbl.setColumnCount(len(cols))
+        tbl.setHorizontalHeaderLabels(cols)
+        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for i, r in enumerate(rows):
+            # [2026-07 신설] 우승/준우승/3위/4위 팀 옆에 그 시즌 소속 부수를
+            # "(N부)"로 함께 표시 — 하위 리그 팀이 이변으로 우승한 경우 등을
+            # 한눈에 알아볼 수 있게. tier 정보가 없으면(팀 없음 "-") 그대로 둔다.
+            def _with_tier(name, tier):
+                return f"{name} ({tier}부)" if (name not in ("-", "?") and tier) else name
+            vals = [str(r["year"]), r["name"],
+                    _with_tier(r["winner"], r.get("winner_tier")),
+                    _with_tier(r["runner_up"], r.get("runner_up_tier")),
+                    _with_tier(r["third"], r.get("third_tier")),
+                    _with_tier(r["fourth"], r.get("fourth_tier"))]
+            for j, v in enumerate(vals):
+                cell = QTableWidgetItem(v)
+                cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if j >= 2:
+                    cell.setForeground(Qt.GlobalColor.white)
+                if j == 0:
+                    cell.setData(Qt.ItemDataRole.UserRole, r["id"])
+                tbl.setItem(i, j, cell)
+        self._grow_to_fit(tbl, stretch_col=1)
+
+    def _open_cup_detail(self, row, _col):
+        item = self.cup_tbl.item(row, 0)
+        tid = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if tid is None:
+            return
+        name_item = self.cup_tbl.item(row, 1)
+        title = f"{item.text()}년 {name_item.text() if name_item else ''}"
+        detail = wb.get_cup_tournament_detail(tid)
+        dlg = TournamentDetailDialog(title, detail, team_based=True, parent=self)
+        dlg.exec()
+
+    # ─────────────────────────────────────────
+    # 탭3: 역대 챔피언스리그
     # ─────────────────────────────────────────
     def _build_cl_tab(self):
         w = QWidget()
@@ -650,13 +943,18 @@ class TournamentDetailDialog(QDialog):
             lay.addWidget(self._section_label("⚽ 조별리그"))
             lay.addWidget(self._build_groups_grid(groups, team_based))
 
+        league_standings = detail.get("league_standings") or []
+        if league_standings:
+            lay.addWidget(self._section_label("⚽ 리그 스테이지"))
+            lay.addWidget(self._build_league_standings_table(league_standings))
+
         knockout = detail.get("knockout") or []
         if knockout:
             lay.addWidget(self._section_label("🏆 토너먼트"))
             for stage in knockout:
                 lay.addWidget(self._build_stage_box(stage, team_based))
 
-        if not groups and not knockout:
+        if not groups and not league_standings and not knockout:
             empty = QLabel("표시할 대진 기록이 없습니다.")
             empty.setStyleSheet("color:#888;font-size:12px;")
             lay.addWidget(empty)
@@ -704,6 +1002,38 @@ class TournamentDetailDialog(QDialog):
             names.setWordWrap(True)
             row.addWidget(names, 1)
             lay.addLayout(row)
+        return box
+
+    def _build_league_standings_table(self, standings):
+        """[2026-07 신설] 챔스 스위스 방식 리그 스테이지 전체 순위표(단일 표).
+        조별 카드 대신 순위·팀명·승무패·득실·승점을 한 표로 쭉 보여준다."""
+        box = self._card()
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(0)
+
+        tbl = QTableWidget(len(standings), 7)
+        tbl.setHorizontalHeaderLabels(["순위", "팀", "승", "무", "패", "득실", "승점"])
+        tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        tbl.verticalHeader().setVisible(False)
+        tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        tbl.setStyleSheet(
+            "QTableWidget{background:#1e1e1e;color:#ccc;gridline-color:#2a2a2a;border:none;}"
+            "QHeaderView::section{background:#252525;color:#888;border:none;padding:3px;}")
+
+        for i, r in enumerate(standings):
+            gd = r["gf"] - r["ga"]
+            vals = [str(i + 1), self._team_text(r["name"], r["flag"], r.get("country")),
+                    str(r["wins"]), str(r["draws"]), str(r["losses"]),
+                    f"{gd:+d}", str(r["pts"])]
+            for j, v in enumerate(vals):
+                item = QTableWidgetItem(v)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                tbl.setItem(i, j, item)
+        tbl.setFixedHeight(tbl.verticalHeader().defaultSectionSize() * len(standings) + 32)
+        lay.addWidget(tbl)
         return box
 
     def _build_groups_grid(self, groups, team_based):

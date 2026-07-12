@@ -17,6 +17,78 @@ from database import get_conn
 # ─────────────────────────────────────────
 # 1. 리그 검색 (대륙/국가별 목록)
 # ─────────────────────────────────────────
+def search_teams(name_query=None, continent=None, country_id=None, grade=None, tier=None, limit=40):
+    """[2026-07 신설] 직접 지원(팀 검색) 화면용 — search_leagues와 달리 팀을
+    1건 1행으로 바로 반환한다(리그 단위가 아니라 팀 단위 선택이 필요하므로).
+    name_query는 팀명/리그명/국가명 어디에든 매치된다. 팀 평균 OVR도 같이
+    계산해서 반환 — 지원 화면에서 "이 팀 수준"을 가늠하는 참고용.
+
+    [주의] grade는 국가대표 등급(countries.grade)이 아니라 '클럽 리그 등급'
+    (constants.get_league_grade)이다 — 잉글랜드처럼 둘이 다른 나라가 있어서
+    (국대는 S급이어도 클럽리그는 SS급 단독) SQL의 cn.grade로 바로 필터링할
+    수 없다. 전체 국가(200여 개, 부담 없는 크기)를 먼저 조회해 실제 클럽
+    등급을 계산한 뒤, 그 등급에 해당하는 country_id만 골라 팀 쿼리에 건다.
+
+    [버그수정 2026-07] 예전엔 "ORDER BY l.tier"로 정렬해서, 검색어 없이
+    그냥 훑어볼 땐 1부 팀 수가 워낙 많아 LIMIT(기본 30~40)이 1부만으로
+    다 채워지고 3부·5부 같은 하위 리그는 사실상 볼 수가 없었다(현실에선
+    선수가 하위리그에 직접 지원하는 일이 흔한데 그게 안 보이는 문제).
+    tier 파라미터로 특정 부수를 콕 집어 검색할 수 있게 하고, 기본
+    정렬은 tier 우선순위 대신 랜덤으로 바꿔 여러 부수가 고르게 섞여
+    나오게 한다.
+
+    [검색어 내 부수 파싱 2026-07] "K리그 3부", "대한민국 3부", 그냥 "3부"처럼
+    검색어 안에 "숫자+부" 표현이 섞여 있으면 자동으로 그 숫자를 tier로
+    파싱해서 적용하고, 나머지 텍스트만 팀/리그/국가명 매칭에 쓴다.
+    tier 파라미터를 별도로 넘긴 경우 그것과 함께(AND) 적용된다."""
+    import re
+    from constants import get_league_grade
+    conn = get_conn()
+
+    if name_query:
+        m = re.search(r"(\d+)\s*부", name_query)
+        if m:
+            parsed_tier = int(m.group(1))
+            tier = parsed_tier if tier is None else tier   # 명시적 tier 인자가 우선
+            name_query = (name_query[:m.start()] + name_query[m.end():]).strip() or None
+
+    grade_country_ids = None
+    if grade:
+        all_c = conn.execute("SELECT id, name, grade FROM countries").fetchall()
+        grade_country_ids = [r["id"] for r in all_c if get_league_grade(r["name"], r["grade"]) == grade]
+        if not grade_country_ids:
+            conn.close()
+            return []
+
+    q = ("SELECT t.id, t.name, l.id as league_id, l.name as league_name, l.tier, "
+         "cn.id as country_id, cn.name as country, cn.flag as flag, cn.grade as cgrade, "
+         "cn.continent as continent, "
+         "(SELECT AVG(ovr) FROM ai_players WHERE team_id=t.id) as avg_ovr "
+         "FROM teams t JOIN leagues l ON t.league_id=l.id "
+         "JOIN countries cn ON l.country_id=cn.id WHERE 1=1")
+    params = []
+    if continent:
+        q += " AND cn.continent=?"; params.append(continent)
+    if country_id:
+        q += " AND cn.id=?"; params.append(country_id)
+    if tier:
+        q += " AND l.tier=?"; params.append(tier)
+    if grade_country_ids is not None:
+        q += " AND cn.id IN (%s)" % ",".join("?" * len(grade_country_ids))
+        params += grade_country_ids
+    if name_query:
+        like = f"%{name_query}%"
+        q += " AND (t.name LIKE ? OR l.name LIKE ? OR cn.name LIKE ?)"
+        params += [like, like, like]
+    q += " ORDER BY RANDOM() LIMIT ?"
+    params.append(limit)
+    rows = [dict(r) for r in conn.execute(q, params).fetchall()]
+    conn.close()
+    for r in rows:
+        r["grade"] = get_league_grade(r["country"], r["cgrade"])
+    return rows
+
+
 def list_continents():
     """존재하는 대륙 목록 (countries.continent 기준, 오세아니아 등 포함)."""
     conn = get_conn()
@@ -27,18 +99,29 @@ def list_continents():
 
 
 def list_countries(continent=None, grade=None):
-    """대륙/등급으로 필터링한 국가 목록 (등급순 정렬)."""
+    """대륙/등급으로 필터링한 국가 목록 (등급순 정렬).
+
+    [버그수정 2026-07] grade는 '클럽 리그 등급'(constants.get_league_grade)
+    이어야 하는데, 지금까지는 countries.grade(국가대표 등급, FIFA랭킹 기반)를
+    그대로 표시/필터링했다. 그래서 국대는 강해도 클럽리그는 약한 나라
+    (모로코·나이지리아·이란 등)가 세계기록실에서 실제보다 훨씬 높은 등급으로
+    보였다. search_teams()가 이미 올바르게 처리하던 방식과 동일하게 맞춘다 —
+    전체 국가를 조회한 뒤 파이썬에서 실제 클럽 등급을 계산해 필터/정렬한다."""
+    from constants import get_league_grade
     conn = get_conn()
     q = "SELECT id, name, flag, grade, continent FROM countries WHERE 1=1"
     params = []
     if continent:
         q += " AND continent=?"; params.append(continent)
-    if grade:
-        q += " AND grade=?"; params.append(grade)
-    q += " ORDER BY grade, name"
-    rows = conn.execute(q, params).fetchall()
+    rows = [dict(r) for r in conn.execute(q, params).fetchall()]
     conn.close()
-    return [dict(r) for r in rows]
+    for r in rows:
+        r["grade"] = get_league_grade(r["name"], r["grade"])
+    if grade:
+        rows = [r for r in rows if r["grade"] == grade]
+    _order = {g: i for i, g in enumerate(_GRADE_ORDER)}
+    rows.sort(key=lambda r: (_order.get(r["grade"], 99), r["name"]))
+    return rows
 
 
 # 국가 등급 고정 순서(강함→약함). DB에 실제 존재하는 값만 걸러서 쓴다.
@@ -46,11 +129,15 @@ _GRADE_ORDER = ["SS", "S", "A", "B", "C", "D", "E", "F"]
 
 
 def list_grades():
-    """실제 존재하는 국가 등급 목록을 정해진 순서(S>A>B>...)로 반환."""
+    """실제 존재하는 '클럽 리그' 등급 목록을 정해진 순서(SS>S>A>...)로 반환.
+    [버그수정 2026-07] countries.grade(국대 등급) 원본이 아니라
+    get_league_grade()로 계산한 클럽 리그 등급 기준으로 바꿈 — 화면에
+    실제로 표시/필터링되는 값과 일치시키기 위함."""
+    from constants import get_league_grade
     conn = get_conn()
-    rows = conn.execute("SELECT DISTINCT grade FROM countries").fetchall()
+    rows = conn.execute("SELECT name, grade FROM countries").fetchall()
     conn.close()
-    existing = {r["grade"] for r in rows}
+    existing = {get_league_grade(r["name"], r["grade"]) for r in rows}
     return [g for g in _GRADE_ORDER if g in existing]
 
 
@@ -58,28 +145,78 @@ def search_leagues(continent=None, country_id=None, name_query=None, grade=None)
     """조건에 맞는 리그 목록. 이제 모든 리그가 시즌 시작 시 일정을 미리 받고
     매주 실시간으로 결과가 채워지므로, 예전의 '이번 시즌 시뮬 여부(simulated)'
     배지는 더 이상 의미가 없어 반환하지 않는다.
+
+    name_query는 리그명·국가명뿐 아니라 팀명도 매치한다 — 예를 들어 "리버풀"을
+    검색하면 리버풀이 뛰고 있는 리그(잉글랜드 프리미어리그)가 검색 결과에
+    뜬다. 이때 결과 dict의 "matched_team"에 실제로 일치한 팀명을 담아, 화면에서
+    "왜 이 리그가 나왔는지"(팀명 때문인지) 알 수 있게 한다.
+
+    [버그수정 2026-07] grade 표시/필터를 countries.grade(국가대표 등급)
+    그대로 쓰고 있었는데, 이건 search_teams()의 주석에도 명시돼 있듯 '클럽
+    리그 등급'과 다르다(국대는 강해도 클럽리그는 약한 나라가 있음 — 모로코·
+    나이지리아·이란 등). search_teams()와 동일하게 get_league_grade()로
+    계산한 값을 쓰도록 통일한다.
+
+    [최적화] 팀명 매칭을 리그마다 서브쿼리 2번(매치 팀명 조회 + 존재 여부
+    확인)씩 따로 날리던 첫 버전은, 검색창에 한 글자 칠 때마다(textChanged로
+    매번 재호출됨) 팀 테이블 전체를 리그 수만큼 반복 스캔해 체감 렉으로
+    이어졌다. teams를 LEFT JOIN해서 한 번만 훑고 GROUP BY로 리그당 1행으로
+    모으는 방식으로 바꿔 쿼리 1회로 끝낸다.
     """
+    from constants import get_league_grade
     conn = get_conn()
     c = conn.cursor()
 
-    q = ("SELECT l.id, l.name, l.tier, cn.id as country_id, cn.name as country, "
-         "cn.flag as flag, cn.grade as grade, cn.continent as continent "
-         "FROM leagues l JOIN countries cn ON l.country_id = cn.id WHERE 1=1")
-    params = []
-    if continent:
-        q += " AND cn.continent=?"; params.append(continent)
-    if country_id:
-        q += " AND cn.id=?"; params.append(country_id)
+    # grade 필터는 클럽 리그 등급 기준이라 SQL의 cn.grade로 바로 못 거르고,
+    # search_teams()와 동일하게 전체 국가를 먼저 계산해 country_id로 변환한다.
+    grade_country_ids = None
     if grade:
-        q += " AND cn.grade=?"; params.append(grade)
+        all_c = conn.execute("SELECT id, name, grade FROM countries").fetchall()
+        grade_country_ids = [r["id"] for r in all_c if get_league_grade(r["name"], r["grade"]) == grade]
+        if not grade_country_ids:
+            conn.close()
+            return []
+
     if name_query:
-        q += " AND (l.name LIKE ? OR cn.name LIKE ?)"
         like = f"%{name_query}%"
-        params += [like, like]
-    q += " ORDER BY cn.grade, cn.name, l.tier"
+        q = ("SELECT l.id, l.name, l.tier, cn.id as country_id, cn.name as country, "
+             "cn.flag as flag, cn.grade as cgrade, cn.continent as continent, "
+             "MAX(CASE WHEN t.name LIKE ? THEN t.name END) as matched_team "
+             "FROM leagues l JOIN countries cn ON l.country_id = cn.id "
+             "LEFT JOIN teams t ON t.league_id = l.id WHERE 1=1")
+        params = [like]
+        if continent:
+            q += " AND cn.continent=?"; params.append(continent)
+        if country_id:
+            q += " AND cn.id=?"; params.append(country_id)
+        if grade_country_ids is not None:
+            q += " AND cn.id IN (%s)" % ",".join("?" * len(grade_country_ids))
+            params += grade_country_ids
+        q += " AND (l.name LIKE ? OR cn.name LIKE ? OR t.name LIKE ?)"
+        params += [like, like, like]
+        # cn.grade(국대등급) 기준 정렬은 더 이상 의미가 없어 제거 — 클럽 등급
+        # 기준 정렬은 아래에서 파이썬으로 다시 한다.
+        q += " GROUP BY l.id ORDER BY cn.name, l.tier"
+    else:
+        q = ("SELECT l.id, l.name, l.tier, cn.id as country_id, cn.name as country, "
+             "cn.flag as flag, cn.grade as cgrade, cn.continent as continent "
+             "FROM leagues l JOIN countries cn ON l.country_id = cn.id WHERE 1=1")
+        params = []
+        if continent:
+            q += " AND cn.continent=?"; params.append(continent)
+        if country_id:
+            q += " AND cn.id=?"; params.append(country_id)
+        if grade_country_ids is not None:
+            q += " AND cn.id IN (%s)" % ",".join("?" * len(grade_country_ids))
+            params += grade_country_ids
+        q += " ORDER BY cn.name, l.tier"
 
     rows = [dict(r) for r in c.execute(q, params).fetchall()]
     conn.close()
+    for r in rows:
+        r["grade"] = get_league_grade(r["country"], r["cgrade"])
+    _order = {g: i for i, g in enumerate(_GRADE_ORDER)}
+    rows.sort(key=lambda r: (_order.get(r["grade"], 99), r["country"], r["tier"]))
     return rows
 
 
@@ -113,34 +250,97 @@ def get_league_standings_for_browser(league_id, season=None, year=None):
     return get_league_standings(league_id, season=season)
 
 
-def get_league_champions(league_id, limit=30):
-    """[신규] 이 리그의 시즌별 1~3위 + 꼴찌(강등권) 팀명 목록. 실제로 경기가
-    진행된 시즌만 대상이며(한 번도 경기가 없었던 시즌은 제외), 새 테이블 없이
-    match_results를 시즌 단위로 그때그때 집계해서 계산한다(승강전 처리와 동일한 방식).
-    최신 시즌부터 최대 limit개.
-    'last'는 그 시즌 순위표의 실제 마지막 팀(팀 수가 8개면 8위, 그보다 적으면
-    있는 만큼의 마지막 순위)이다 — 항상 '8위'로 고정하지 않고 리그 규모에 맞춘다."""
-    from game_engine import get_league_standings
+def league_has_lower_tier(league_id):
+    """이 리그보다 한 단계 아래 티어가 그 나라에 존재하는지.
+    최하위 티어 리그는 애초에 내려갈 곳이 없어 강등 자체가 없다.
+    역대 우승팀 표에서 강등팀 목록을 표시할지 판단하는 용도.
+    """
     conn = get_conn()
+    row = conn.execute("SELECT country_id, tier FROM leagues WHERE id=?",
+                        (league_id,)).fetchone()
+    if not row:
+        conn.close()
+        return False
+    lower = conn.execute(
+        "SELECT 1 FROM leagues WHERE country_id=? AND tier=?",
+        (row["country_id"], row["tier"] + 1)).fetchone()
+    conn.close()
+    return bool(lower)
+
+
+def get_league_champions(league_id, limit=30):
+    """이 리그의 시즌별 1~4위 + 실제 승격팀 전체/강등팀 전체 목록.
+    실제로 경기가 진행된 시즌만 대상이며(한 번도 경기가 없었던 시즌은 제외),
+    새 테이블 없이 match_results를 시즌 단위로 그때그때 집계해서 계산한다
+    (승강전 처리와 동일한 방식).최신 시즌부터 최대 limit개.
+
+    [2026-07 개편] 예전엔 승강제가 '인접 티어 사이 1-up-1-down' 고정이라
+    '꼴찌 1팀 = 강등팀'이 항상 성립했지만, 이제 리그 규모별로 승강 인원이
+    다르므로(game_engine._promo_releg_count) '꼴찌'가 아니라 '실제로
+    강등되는 팀 전체'를, 승격도 마찬가지로 '실제로 승격되는 팀 전체'를
+    game_engine._process_promotion_relegation과 동일한 기준으로 계산해
+    반환한다.
+    """
+    from game_engine import get_league_standings, _promo_releg_count
+    conn = get_conn()
+
+    lg_row = conn.execute("SELECT country_id, tier FROM leagues WHERE id=?",
+                          (league_id,)).fetchone()
+    upper_lid = None
+    has_lower = False
+    if lg_row:
+        if lg_row["tier"] > 1:
+            ur = conn.execute(
+                "SELECT id FROM leagues WHERE country_id=? AND tier=?",
+                (lg_row["country_id"], lg_row["tier"] - 1)).fetchone()
+            upper_lid = ur["id"] if ur else None
+        lr = conn.execute(
+            "SELECT 1 FROM leagues WHERE country_id=? AND tier=?",
+            (lg_row["country_id"], lg_row["tier"] + 1)).fetchone()
+        has_lower = lr is not None
+
     season_rows = conn.execute(
         """SELECT DISTINCT season, year FROM match_results
            WHERE league_id=? AND home_score>=0
            ORDER BY season DESC LIMIT ?""",
         (league_id, limit)).fetchall()
+
     out = []
     for sr in season_rows:
         standings = get_league_standings(league_id, season=sr["season"], conn=conn)
         if not standings:
             continue
         n = len(standings)
-        last_rank = n  # 실제 순위표 마지막 등수 (보통 8, 팀 수가 다르면 그에 맞춰)
+
+        # 승격팀 전체: '상위 티어' 크기 기준으로 산정한 인원만큼 이 리그
+        # 상위 순위부터(game_engine과 동일 로직 - 상위 티어 팀 수로 결정).
+        # relegated와 동일하게 rank(실제 이 리그에서의 최종 순위)도 함께 담아
+        # 화면에서 "2위(승격)"처럼 순위별 컬럼으로 보여줄 수 있게 한다.
+        promoted = []
+        if upper_lid:
+            upper_standings = get_league_standings(upper_lid, season=sr["season"], conn=conn)
+            if upper_standings:
+                n_promo = min(_promo_releg_count(len(upper_standings)), n)
+                promoted = [{"rank": i + 1, "name": standings[i]["name"]}
+                            for i in range(n_promo)]
+
+        # 강등팀 전체: '이 리그 자신'의 크기 기준으로 산정한 인원만큼 하위 순위부터.
+        relegated = []
+        if has_lower:
+            n_releg = min(_promo_releg_count(n), n)
+            # 팀명뿐 아니라 실제 최종 순위(예: 18위)도 함께 담아서 화면에서
+            # "18위 팀명" 형태로 보여줄 수 있게 한다.
+            relegated = [{"rank": n - i, "name": standings[n - 1 - i]["name"]}
+                         for i in range(n_releg)]
+
         out.append({
             "season": sr["season"], "year": sr["year"],
             "first":  standings[0]["name"] if n > 0 else "-",
             "second": standings[1]["name"] if n > 1 else "-",
             "third":  standings[2]["name"] if n > 2 else "-",
-            "last_rank": last_rank,
-            "last":   standings[-1]["name"] if n > 3 else "-",
+            "fourth": standings[3]["name"] if n > 3 else "-",  # [2026-07 추가] 3위까지만 기록하던 것을 4위까지 확장
+            "promoted": promoted,
+            "relegated": relegated,
         })
     conn.close()
     return out
@@ -150,6 +350,152 @@ def get_league_champions(league_id, limit=30):
 # '미시뮬'로 되돌리는 reset_league_simulation() / 되돌리기 대상에서 내 리그를
 # 제외하는 is_my_league()가 있었다. 지금은 모든 리그가 항상 실시간으로 진행
 # 중이라 되돌릴 '시뮬 이전 상태' 자체가 없으므로 두 함수 모두 제거했다.
+
+
+# ─────────────────────────────────────────
+# 3.5. 역대 국내 컵대회 기록 (2026-07 신설)
+# ─────────────────────────────────────────
+def _get_cup_placements(tournament_id, conn):
+    """결승(+3·4위전) cup_matches 결과로 1~4위 team_id를 도출.
+    cup_history는 '내 팀'의 결과만 기록하므로, 모든 나라/모든 시즌의
+    우승/준우승을 보여주려면 이렇게 경기 결과에서 직접 뽑아야 한다."""
+    from cup_engine import _winner_of
+    fm = conn.execute(
+        """SELECT * FROM cup_matches WHERE tournament_id=? AND round_name='결승'
+           AND home_score>=0 ORDER BY id DESC LIMIT 1""", (tournament_id,)).fetchone()
+    if not fm:
+        return None
+    fm = dict(fm)
+    winner = _winner_of(fm)
+    runner_up = fm["away_team_id"] if winner == fm["home_team_id"] else fm["home_team_id"]
+
+    third = fourth = None
+    tp = conn.execute(
+        """SELECT * FROM cup_matches WHERE tournament_id=? AND round_name='3·4위전'
+           AND home_score>=0 ORDER BY id DESC LIMIT 1""", (tournament_id,)).fetchone()
+    if tp:
+        tp = dict(tp)
+        third = _winner_of(tp)
+        fourth = tp["away_team_id"] if third == tp["home_team_id"] else tp["home_team_id"]
+
+    return {"winner": winner, "runner_up": runner_up, "third": third, "fourth": fourth}
+
+
+def get_cup_history(country_id, limit=30):
+    """특정 국가의 역대 국내 컵대회(FA컵식) 우승/준우승/3·4위 기록.
+
+    [2026-07 전체 국가 확장] 예전엔 cup_engine이 성능상 '내 팀이 속한 나라'
+    한정으로만 컵대회를 생성해서, 실제로 뛰어본 나라만 기록이 쌓이고 나머지는
+    항상 빈 목록이었다(신민용 리포트: "컵대회 기록이 다 없다고 뜬다"). 이제
+    매 시즌 5주차에 리그가 있는 나라 전부의 컵대회가 생성/진행되므로, 어느
+    나라를 검색해도 완료된 시즌부터 기록이 쌓인다.
+    """
+    conn = get_conn()
+    rows = [dict(r) for r in conn.execute(
+        """SELECT id, year, name FROM cup_tournaments
+           WHERE country_id=? AND status='done'
+           ORDER BY year DESC LIMIT ?""", (country_id, limit)).fetchall()]
+
+    placements_by_row = []
+    all_tids = set()
+    for r in rows:
+        pl = _get_cup_placements(r["id"], conn)
+        placements_by_row.append(pl)
+        if pl:
+            for key in ("winner", "runner_up", "third", "fourth"):
+                if pl.get(key):
+                    all_tids.add(r["id"])
+
+    # [최적화] 팀명을 시즌×순위(최대 30×4=120회)마다 개별 SELECT 하던 것을,
+    # 등장한 대회(tournament_id) 전체의 cup_entries를 1회 IN 쿼리로 미리
+    # 읽어 {(tournament_id, team_id): team_name} 캐시로 대체. 팀명은
+    # cup_entries에 대회별로 저장되므로(원본과 동일하게) 스코프는 그대로 유지.
+    # [2026-07 신설] 같은 캐시에 tier(그 시즌 그 팀의 소속 부수)도 함께 담아
+    # UI에서 "팀명 (N부)"로 표시할 수 있게 한다 — cup_entries.tier는 이미
+    # 대회 생성 시 저장돼 있던 값이라 추가 조회 없이 같은 쿼리로 딸려온다.
+    name_cache = {}
+    tier_cache = {}
+    if all_tids:
+        ph = ",".join("?" * len(all_tids))
+        for e in conn.execute(
+                f"SELECT tournament_id, team_id, team_name, tier FROM cup_entries "
+                f"WHERE tournament_id IN ({ph})", list(all_tids)).fetchall():
+            name_cache[(e["tournament_id"], e["team_id"])] = e["team_name"]
+            tier_cache[(e["tournament_id"], e["team_id"])] = e["tier"]
+
+    def _nm(tid_, team_id_):
+        if not team_id_:
+            return "-"
+        return name_cache.get((tid_, team_id_), "?")
+
+    def _tier(tid_, team_id_):
+        if not team_id_:
+            return None
+        return tier_cache.get((tid_, team_id_))
+
+    out = []
+    for r, pl in zip(rows, placements_by_row):
+        if not pl:
+            continue
+        out.append({
+            "id": r["id"],  # [2026-07 추가] 더블클릭 상세보기용 대회 id
+            "year": r["year"], "name": r["name"],
+            "winner": _nm(r["id"], pl["winner"]), "runner_up": _nm(r["id"], pl["runner_up"]),
+            "third": _nm(r["id"], pl["third"]), "fourth": _nm(r["id"], pl["fourth"]),
+            "winner_tier": _tier(r["id"], pl["winner"]), "runner_up_tier": _tier(r["id"], pl["runner_up"]),
+            "third_tier": _tier(r["id"], pl["third"]), "fourth_tier": _tier(r["id"], pl["fourth"]),
+        })
+    conn.close()
+    return out
+
+
+def get_cup_tournament_detail(tournament_id):
+    """[2026-07 신설] 국내 컵대회 한 대회의 라운드별 대진 상세 — 조별리그가
+    없는 순수 토너먼트라 챔피언스리그의 knockout 부분과 같은 형식으로만
+    반환한다(groups는 항상 빈 dict). world_browser_window.TournamentDetailDialog가
+    이미 이 형식(team_based=True)을 그대로 그려줄 수 있어 UI는 재사용한다."""
+    conn = get_conn(); c = conn.cursor()
+    rows = c.execute(
+        """SELECT round_name, round_idx, slot, home_team_id, away_team_id,
+                  home_score, away_score, pso_winner, pso_score
+           FROM cup_matches WHERE tournament_id=? AND home_score>=0
+           ORDER BY round_idx, slot""", (tournament_id,)).fetchall()
+    entry_rows = c.execute(
+        "SELECT team_id, team_name, tier FROM cup_entries WHERE tournament_id=?",
+        (tournament_id,)).fetchall()
+    conn.close()
+    # [2026-07 신설, 신민용 요청] 팀명 옆에 "(몇부)"를 붙이되, 지금 소속이 아니라
+    # 이 컵대회 당시(cup_entries.tier — 참가 시점에 고정 저장돼 이후 강등/
+    # 승격과 무관) 티어를 보여준다.
+    name_by_id = {r["team_id"]: f"{r['team_name']} ({r['tier']}부)" for r in entry_rows}
+
+    by_round = {}
+    order = []
+    for m in rows:
+        key = (m["round_idx"], m["round_name"])
+        if key not in by_round:
+            by_round[key] = []
+            order.append(key)
+        by_round[key].append({
+            "home_info": {"team_name": name_by_id.get(m["home_team_id"], "?"),
+                          "flag": "", "team_id": m["home_team_id"]},
+            "away_info": {"team_name": name_by_id.get(m["away_team_id"], "?"),
+                          "flag": "", "team_id": m["away_team_id"]},
+            "home_score": m["home_score"], "away_score": m["away_score"],
+            "pso_winner": m["pso_winner"],
+        })
+    knockout = [{"stage": key[1], "stage_ko": key[1], "matches": by_round[key]} for key in order]
+    return {"groups": {}, "knockout": knockout}
+
+
+def has_cup_data(country_id):
+    """이 나라에 생성된 컵대회 기록이 하나라도 있는지(검색 목록 배지용)."""
+    conn = get_conn()
+    n = conn.execute(
+        "SELECT COUNT(*) AS n FROM cup_tournaments WHERE country_id=?",
+        (country_id,)).fetchone()["n"]
+    conn.close()
+    return n > 0
 
 
 # ─────────────────────────────────────────
@@ -420,30 +766,30 @@ def get_wc_qualifier_summary(wc_year):
 # ─────────────────────────────────────────
 # 7. 대회 상세 — 챔피언스리그
 # ─────────────────────────────────────────
-_CL_KO_STAGE_ORDER = ["R32", "R16", "QF", "SF", "TP", "F"]
+_CL_KO_STAGE_ORDER = ["PO", "R16", "QF", "SF", "TP", "F"]
 
 
 def get_cl_tournament_detail(tournament_id):
-    """챔피언스리그 한 대회의 조별리그 순위표 + 토너먼트(녹아웃) 대진."""
+    """챔피언스리그 한 대회의 리그 스테이지 순위표 + 토너먼트(녹아웃) 대진.
+    [2026-07 스위스 방식 개편] 조별리그가 없어져서 groups 대신 단일
+    league_standings 리스트를 반환한다. 기존 groups 키를 참조하던 옛
+    UI가 있다면 빈 dict로라도 동작하도록 groups=[]는 계속 넣어둔다."""
     from champions_engine import STAGE_KO
     conn = get_conn(); c = conn.cursor()
 
     entries = [dict(r) for r in c.execute(
-        "SELECT team_id, team_name, flag, country, grade, grp FROM cl_entries "
-        "WHERE tournament_id=? AND grp != ''", (tournament_id,)).fetchall()]
-    groups = {}
-    for e in entries:
-        groups.setdefault(e["grp"], []).append({
-            "team_id": e["team_id"], "name": e["team_name"], "flag": e["flag"],
-            "country": e["country"], "grade": e["grade"],
-            "wins": 0, "draws": 0, "losses": 0, "gf": 0, "ga": 0})
-    idx = {(g, t["team_id"]): t for g, teams in groups.items() for t in teams}
+        "SELECT team_id, team_name, flag, country, grade FROM cl_entries "
+        "WHERE tournament_id=?", (tournament_id,)).fetchall()]
+    league_tbl = {e["team_id"]: {
+        "team_id": e["team_id"], "name": e["team_name"], "flag": e["flag"],
+        "country": e["country"], "grade": e["grade"],
+        "wins": 0, "draws": 0, "losses": 0, "gf": 0, "ga": 0} for e in entries}
 
     for m in c.execute(
-            "SELECT grp, home_team_id, away_team_id, home_score, away_score "
-            "FROM cl_matches WHERE tournament_id=? AND stage='group' "
+            "SELECT home_team_id, away_team_id, home_score, away_score "
+            "FROM cl_matches WHERE tournament_id=? AND stage='league' "
             "AND home_score>=0", (tournament_id,)).fetchall():
-        h, a = idx.get((m["grp"], m["home_team_id"])), idx.get((m["grp"], m["away_team_id"]))
+        h, a = league_tbl.get(m["home_team_id"]), league_tbl.get(m["away_team_id"])
         if not h or not a:
             continue
         h["gf"] += m["home_score"]; h["ga"] += m["away_score"]
@@ -451,16 +797,16 @@ def get_cl_tournament_detail(tournament_id):
         if m["home_score"] > m["away_score"]:   h["wins"] += 1;  a["losses"] += 1
         elif m["home_score"] < m["away_score"]: a["wins"] += 1;  h["losses"] += 1
         else:                                   h["draws"] += 1; a["draws"] += 1
-    for teams in groups.values():
-        for t in teams:
-            t["pts"] = t["wins"] * 3 + t["draws"]
-            t["gd"] = t["gf"] - t["ga"]
-        teams.sort(key=lambda t: (-t["pts"], -t["gd"], -t["gf"]))
+    league_standings = list(league_tbl.values())
+    for r in league_standings:
+        r["pts"] = r["wins"] * 3 + r["draws"]
+        r["gd"] = r["gf"] - r["ga"]
+    league_standings.sort(key=lambda r: (-r["pts"], -r["gd"], -r["gf"]))
 
     ko_rows = c.execute(
         "SELECT stage, home_team_id, away_team_id, home_score, away_score, "
         "pso_winner, pso_score FROM cl_matches WHERE tournament_id=? AND "
-        "stage != 'group' AND home_score>=0 ORDER BY id",
+        "stage NOT IN ('league') AND home_score>=0 ORDER BY id",
         (tournament_id,)).fetchall()
 
     # 팀명/국기 매핑 (entries가 이 대회의 전체 출전팀을 이미 담고 있으므로
@@ -477,4 +823,4 @@ def get_cl_tournament_detail(tournament_id):
     knockout = [{"stage": s, "stage_ko": STAGE_KO.get(s, s), "matches": ko_by_stage[s]}
                 for s in _CL_KO_STAGE_ORDER if s in ko_by_stage]
 
-    return {"groups": groups, "knockout": knockout}
+    return {"groups": {}, "league_standings": league_standings, "knockout": knockout}

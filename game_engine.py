@@ -2,12 +2,15 @@
 import random
 import math
 import json
+import sqlite3
 import intl_engine
 import champions_engine
+import cup_engine
 from match_sim import match_flow
 from match_sim import tactical_engine
 from database import (get_conn, calc_ovr, ALL_STATS,
-                      rescale_team_to_target_ovr, get_league_avg_ovr,
+                      rescale_team_to_target_ovr, rescale_teams_to_target_ovr_batch,
+                      get_league_avg_ovr,
                       get_league_strong_ovr)
 from constants import *  # PHYSICAL_STATS, TECHNICAL_STATS, MENTAL_STATS 포함
 
@@ -218,6 +221,7 @@ def get_state():
     return dict(row) if row else {
         "current_year": GAME_START_YEAR,
         "current_week": 1,
+        "current_day": 1,
         "current_season": 1,
         "phase": "preseason",
     }
@@ -237,6 +241,75 @@ def set_state(**kw):
                   list(kw.values()))
     conn.commit()
     conn.close()
+
+
+# [2026-07 성능 수정 — "이번 주 진행" 1초 버퍼링의 실제 원인]
+# _week_intl_cl_day(week, p)는 결과가 오직 (week, 내 팀 id, 내 시즌)에만
+# 좌우된다 — 어떤 경기(m)를 시뮬레이션하는지와는 무관하다. 그런데
+# cup_engine/champions_engine/intl_engine의 _sim_ai_match()가 "그 주에
+# 실제로 진행된 날짜"를 저장하겠다고 이 함수를 AI vs AI 경기 하나하나마다
+# (한 라운드에 수백~수천 건) 매번 새로 호출했다 — 매번 DB에 SELECT
+# fetchall을 하나씩 더 날리는 셈이라, 프로파일링 결과 주간 진행 시간의
+# 대부분(6초 중 4.8초)이 여기서 소모되고 있었다. 실제로 이 값이 쓰이는
+# 곳(get_my_cup_matches 등)은 my_played=1인 "내 경기" 행뿐이라, 애초에
+# AI끼리 경기에 대해서는 계산할 필요조차 없었다(그건 각 엔진의 _sim_ai_match
+# 쪽에서 "내 경기일 때만 계산"하도록 함께 손봤다 — 이 함수는 그와 별개로,
+# 혹시 남아있는 다른 호출 경로에서도 안전하게 빠르도록 (week, tid, season)
+# 조합으로 메모이즈한다. 이 조합의 결과값은 시즌이 진행되는 동안 절대
+# 바뀌지 않는다(경기 스케줄의 day는 시즌 시작 시 한 번 확정되고 이후
+# 재조회해도 항상 같은 값 — advance_days가 매일 새로 부르는 함수인데
+# 매번 똑같은 값을 다시 계산하고 있었다는 뜻).
+_week_intl_cl_day_cache: dict = {}
+
+def _week_intl_cl_day(week: int, p: dict) -> int:
+    """[2026-07 버그 수정] 국제대회/챔스는 'week' 단위로만 저장돼(day 컬럼
+    없음), 화면 표시는 '그 주 마지막 날'로 보여주면서 실제 진행
+    (advance_days)은 그 주 국내 경기가 없는 '아무 날짜'에나(사실상 항상
+    그 주 첫날) 조용히 자동 처리해버렸다 — 화면엔 일요일 챔스로 보이는데
+    실제로는 월요일에 이미 AI 처리되는 식으로 표시와 실제가 어긋났다.
+    이제 화면(UI)과 실제 진행(advance_days) 둘 다 이 함수 하나로 통일해서
+    '그 주 안의 정확히 같은 날짜'를 가리키게 한다.
+
+    [2026-07 확장] 원래는 국내 경기와 '정확히 같은 날'만 피했는데, 그러면
+    화(챔스)-수(국내) 같은 바로 이웃한 날짜 배정이 그대로 남아 이틀 연속
+    경기가 생길 수 있었다. 이제 이번 주뿐 아니라 지난주·다음주 국내 경기
+    날짜까지 다 조회해서, 그 어느 쪽과도 '하루 이내(당일 포함)'로는 안
+    붙게 여러 후보 요일을 순서대로 시도한다(화요일 우선 → 금요일 →
+    그 외). 실제 UEFA 챔스도 국내리그(주말)와 안 겹치는 미드위크에
+    편성되는 것과 같은 원리.
+
+    [2026-07 성능 수정] (week, 내 팀, 내 시즌)이 같으면 결과도 항상
+    같으므로 캐시한다 — 위 모듈 docstring 참고."""
+    tid = p.get("current_team_id", 0)
+    st = get_state()
+    cur_season = st["current_season"] if st else 0
+    cache_key = (week, tid, cur_season)
+    cached = _week_intl_cl_day_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    week_start = (week - 1) * DAYS_PER_WEEK + 1
+    dom_days = []  # 이번주/지난주/다음주 국내 경기일 목록(있는 것만)
+    if tid:
+        conn = get_conn()
+        rows = conn.execute(
+            """SELECT day FROM match_results WHERE week IN (?,?,?) AND season=?
+               AND day IS NOT NULL AND (home_team_id=? OR away_team_id=?)""",
+            (week - 1, week, week + 1, cur_season, tid, tid)).fetchall()
+        conn.close()
+        dom_days = [r["day"] for r in rows if r["day"] is not None]
+
+    def _conflicts(cand):
+        return any(abs(cand - dd) <= 1 for dd in dom_days if dd is not None)
+
+    result = week_start + 2   # 극히 드문 경우(모든 요일이 다 걸림) 기본값
+    for offset in (2, 5, 3, 4, 1, 6, 0):   # 화요일 우선 → 금요일 → 나머지
+        cand = week_start + offset
+        if not _conflicts(cand):
+            result = cand
+            break
+    _week_intl_cl_day_cache[cache_key] = result
+    return result
 
 
 # ── 로그 버퍼: add_log 호출을 모아 flush_log_buffer()로 한 번에 INSERT ──
@@ -275,6 +348,19 @@ def get_logs():
     rows = c.fetchall()
     conn.close()
     return [r["entry"] for r in rows]
+
+
+def _day_label(week, day=None):
+    """[2026-07 추가] 로그에 넣을 날짜 라벨. 지금은 하루 단위로 진행되는데
+    (advance_days) 로그엔 계속 '{week}주차'만 찍혀서, 같은 주 안의 7일치
+    로그가 전부 똑같은 '5주차'로만 보여 어느 날 일어난 일인지 구분이
+    안 됐다. day가 주어지면(=advance_days 경로) 실제 날짜(예: '2001년
+    1월 5일')로 보여준다. day가 없으면(더는 안 쓰이는 구버전 주 단위
+    advance_4weeks 경로) 기존처럼 '{week}주차'로 폴백해 하위호환 유지."""
+    if day is not None:
+        st = get_state()
+        return day_to_full_date_str(st["current_year"], day)
+    return f"{week}주차"
 
 
 def get_match_detail(detail_id):
@@ -350,7 +436,8 @@ def _age_train_eff(age: int, peak_age: int) -> float:
 # ═══════════════════════════════════════════
 
 def create_player(name: str, position: str, sub_role: str,
-                  nationality: str = None, flag: str = None, talent_tier: str = None):
+                  nationality: str = None, flag: str = None, talent_tier: str = None,
+                  personality: str = None, physical_trait: str = None):
     conn = get_conn()
     c = conn.cursor()
 
@@ -359,29 +446,24 @@ def create_player(name: str, position: str, sub_role: str,
         row = c.fetchone()
         nationality, flag = row["name"], row["flag"]
 
-    # [복수국적] 일정 확률로 추가 국적 부여 (현실의 이민자 가정 등).
-    # 1차 국적과 다른 나라를 최대 2개 더 뽑는다 (총 최대 3개). 없으면 단일국적.
+    # [2026-07 제거] 예전엔 여기서 20%→8% 확률로 완전 무작위 국가를
+    # 2번째/3번째 국적으로 몰래 끼워넣었다(현실 이민자 가정 컨셉이었으나,
+    # 플레이어가 선택하지도 확인하지도 못한 채 생성 즉시 조용히 부여되는
+    # 방식이라 "왜 갑자기 이 국적이 생겼지" 하는 혼란만 유발했다). 시작
+    # 국적은 이제 플레이어가 고른 1개뿐이고, 추가 국적은 실제 플레이(그
+    # 나라 리그에서 거주 귀화)로만 늘어난다.
     nationality2, flag2 = "", ""
     nationality3, flag3 = "", ""
-    if random.random() < 0.20:   # 20% 확률로 2번째 국적
-        r2 = c.execute(
-            "SELECT name,flag FROM countries WHERE name<>? ORDER BY RANDOM() LIMIT 1",
-            (nationality,)).fetchone()
-        if r2:
-            nationality2, flag2 = r2["name"], r2["flag"]
-            # 2국적이 있을 때만, 추가로 8% 확률로 3번째 국적
-            if random.random() < 0.08:
-                r3 = c.execute(
-                    "SELECT name,flag FROM countries WHERE name NOT IN (?,?) ORDER BY RANDOM() LIMIT 1",
-                    (nationality, nationality2)).fetchone()
-                if r3:
-                    nationality3, flag3 = r3["name"], r3["flag"]
 
-    personality = random.choice(PERSONALITIES)
+    # [2026-07 추가] 새 게임 화면에서 성격/신체특징도 직접 고를 수 있게 됐다
+    # (talent_tier와 같은 패턴) — None이면(안 고르면) 기존처럼 확률 추첨.
+    if not personality:
+        personality = random.choice(PERSONALITIES)
     # [신체 특징] 성격과 별개로 1개 부여 (가중 추첨 — 무난함이 흔함)
     from constants import (PHYSICAL_TRAITS, PHYSICAL_TRAIT_WEIGHTS, PHYSICAL_TRAIT_EFFECTS,
                            BODY_TYPES, BODY_TYPE_NAMES, BODY_TYPE_WEIGHTS_BY_POS)
-    physical_trait = random.choices(PHYSICAL_TRAITS, PHYSICAL_TRAIT_WEIGHTS)[0]
+    if not physical_trait:
+        physical_trait = random.choices(PHYSICAL_TRAITS, PHYSICAL_TRAIT_WEIGHTS)[0]
 
     # [신체 아키타입] 체형 유형 추첨. 포지션이 확률을 기울이되 고정하진 않는다
     # (윙어인데 포켓로켓/메시형, 작은데 종결자 체급 등 예외 허용).
@@ -646,7 +728,7 @@ def _update_career_stats(p, year, week):
     season = p.get("current_season", 1)
     rank_str = get_team_rank(tid, conn=conn, season=season)
     try: rn = int(rank_str.split("위")[0].replace("공동","").strip())
-    except: rn = 0
+    except (ValueError, AttributeError, IndexError): rn = 0
 
     sm  = p.get("season_matches", 0)
     sg  = p.get("season_goals", 0)
@@ -706,7 +788,7 @@ def _close_career_entry(p, year, week, exit_type=""):
     rank_str = get_team_rank(tid, conn=conn, season=season)
     try:
         rn = int(rank_str.split("위")[0].replace("공동","").strip())
-    except:
+    except (ValueError, AttributeError, IndexError):
         rn = 0
 
     sm  = p.get("season_matches", 0)
@@ -809,9 +891,14 @@ def finalize_season_for_retire():
     if tid:
         _lock_in_championship(tid, year, p.get("season_matches", 0), min_week=30)
 
-    # 2) 개인 수상 확정 (시즌 10경기 이상 출전 시). 시즌 통계는 아직 살아있다.
-    #    이미 이 연도에 내 수상이 기록돼 있으면(중복 호출/시즌종료 후) 건너뛴다.
-    if p.get("season_matches", 0) >= 10:
+    # 2) 개인 수상 확정 (리그 실제 풀시즌의 최소 35% 이상 출전 시 — 예전엔
+    #    무조건 '10경기'로 고정돼 있었는데, 지금은 리그마다 풀시즌이
+    #    14~58경기로 다 달라서 대형 리그에선 시즌 20%도 안 뛰고 자격이
+    #    생기고 소형 리그에선 거의 다 뛰어야 하는 불균형이 있었다).
+    #    시즌 통계는 아직 살아있다. 이미 이 연도에 내 수상이 기록돼
+    #    있으면(중복 호출/시즌종료 후) 건너뛴다.
+    _min_matches_for_awards = max(6, round(0.35 * _league_full_season_matches(p)))
+    if p.get("season_matches", 0) >= _min_matches_for_awards:
         _conn = get_conn()
         _dup = _conn.execute(
             "SELECT 1 FROM awards WHERE year=? AND is_mine=1 LIMIT 1", (year,)).fetchone()
@@ -983,14 +1070,15 @@ def advance_4weeks(schedule: list):
 
         _advance_week(p_latest, week, 1)
 
-        # [국가대표 발탁 대기] 방금 17주 진입으로 국제대회(예선/본선)가 생성되며
-        #   대표팀 선택 대기(my_selected=3)가 생겼다면, 발탁을 먼저 받아야 하므로
-        #   더 진행하지 않고 이 주에서 멈춘다. (발탁 안 한 채 예선/본선 경기가
+        # [국가대표 발탁 대기] 방금 INTL_CALLUP_WEEK 진입으로 국제대회(예선/본선)가
+        #   생성되며 대표팀 선택 대기(my_selected=3)가 생겼다면, 발탁을 먼저 받아야
+        #   하므로 더 진행하지 않고 이 주에서 멈춘다. (발탁 안 한 채 예선/본선 경기가
         #   진행돼버리는 것을 방지. center_panel이 다음 클릭 때 발탁창을 띄운다.)
-        # [최적화] get_pending_choice()는 17주 진입 직후에만 의미 있으므로
-        #   새 주차(new_week)가 17일 때만 DB 조회, 그 외엔 스킵.
+        # [최적화] get_pending_choice()는 INTL_CALLUP_WEEK 진입 직후에만 의미 있으므로
+        #   새 주차(new_week)가 그 값일 때만 DB 조회, 그 외엔 스킵.
         try:
-            if week == 16 and intl_engine.get_pending_choice():
+            from constants import INTL_CALLUP_WEEK as _ICW
+            if week == _ICW - 1 and intl_engine.get_pending_choice():
                 break
         except Exception:
             pass
@@ -1003,6 +1091,176 @@ def advance_4weeks(schedule: list):
             st_new  = get_state()
             _update_career_stats(p_fresh, st_new["current_year"], st_new["current_week"])
         # [최적화] 이 주차의 버퍼 로그 일괄 flush (개별 commit 수십 회 → 1회)
+        flush_log_buffer()
+
+
+def advance_days(schedule: list):
+    """[2026-07 일 단위 진행] schedule 길이만큼 '하루씩 원자적으로' 전진시킨다.
+
+    설계 핵심 — 검증된 advance_4weeks(주 단위 엔진)를 그대로 재사용:
+      - schedule 항목은 (day, stype, detail). day는 연중 일자(1~364).
+      - '그 주(week=day_to_week(day))의 마지막 날'(day % DAYS_PER_WEEK == 0)에
+        도달했을 때만 기존 주 단위 훅(_sim_all_ai_matches, intl/CL 주간 처리,
+        월급, _advance_week)을 정확히 1회 호출한다 — 매일 호출하면 이미
+        처리된 주를 또 스캔하는 낭비만 생기고 정합성 이득은 없다
+        (_sim_all_ai_matches는 home_score=-1인 것만 골라 처리하므로 멱등이지만,
+        굳이 하루 7번씩 스캔할 이유가 없다).
+      - 주 중간(경계일이 아닌 날)에는 current_day만 전진하고 current_week/
+        current_year/current_season은 그대로 둔다 — _advance_week가 그 셋의
+        유일한 갱신 지점이라는 불변식을 유지해서, 기존 수백 곳의 'current_week'
+        참조 코드가 항상 일관된 값을 보게 한다.
+      - 매일 정확히 하나의 행동(경기 또는 훈련/휴식)만 일어난다. 경기가 있는
+        날엔 그날 하루는 훈련 선택이 무시되고 경기로 처리된다(실제 축구처럼
+        경기 있는 날엔 훈련 대신 그 경기를 뛴다) — 그 외 요일엔 훈련/휴식만
+        가능하다.
+
+    schedule 1개면 '하루씩 보기', 7개면 '1주씩 보기'.
+    """
+    from constants import DAYS_PER_WEEK, day_to_week
+
+    p = get_player()
+    if not p: return
+
+    st = get_state()
+    if not schedule:
+        return
+
+    if p.get("current_team_id"):
+        _ensure_career_entry(p, st)
+
+    for (day, stype, detail) in schedule:
+        p  = get_player()
+        if not p:
+            # [버그 수정] 최초 진입 시엔 p가 있었어도, 루프 도중(새 게임 리셋 등)
+            # 플레이어가 사라질 수 있다 — 매 반복 재조회한 p를 여기서도 다시
+            # None 체크 안 하고 바로 p.get(...)을 불러 크래시가 났었다
+            # (AttributeError: 'NoneType' object has no attribute 'get').
+            break
+        st = get_state()
+        cur_day = st.get("current_day") or ((st["current_week"] - 1) * DAYS_PER_WEEK + 1)
+        cur_season = st["current_season"]
+        week = day_to_week(day)
+
+        # 안전장치: schedule이 가리키는 날짜와 실제 현재 날짜가 다르면 멈춘다.
+        if day != cur_day:
+            break
+
+        # ── 이번 날짜 처리 ──
+        _had_match = False
+        if p.get("injured"):
+            _process_injury_week(p, week, day=day)
+            if stype == "경기" and not (isinstance(detail, dict) and detail.get("intl")):
+                _sim_my_team_match_as_ai(week, p, cur_season)
+            else:
+                _sim_my_unscheduled_match(week, p, cur_season)
+        elif stype == "경기":
+            _had_match = True
+            if isinstance(detail, dict) and detail.get("intl"):
+                intl_engine.simulate_my_match(week, p)
+            elif isinstance(detail, dict) and detail.get("cl"):
+                champions_engine.simulate_my_cl_match(week, p)
+            elif isinstance(detail, dict) and detail.get("cup"):
+                cup_engine.simulate_my_cup_match(week, p, day=day)
+            else:
+                _simulate_match(p, week, detail, day=day)
+        else:
+            # [2026-07 버그 수정] 예전엔 im/cm을 week 단위로만 조회해서, 그 주
+            # 안의 '국내 경기가 아닌 아무 날'에나(사실상 항상 그 주 첫날)
+            # 자동으로 걸려버렸다 — 화면(_get_match_for_day)이 보여주는
+            # 날짜와 실제 처리되는 날짜가 어긋났었다. 이제 _week_intl_cl_day로
+            # 정한 '그 주의 정확한 그 날'인지 먼저 확인하고, 맞는 날에만
+            # 처리한다(다른 날엔 원래 계획대로 훈련/휴식이 정상 진행됨).
+            # 컵대회는 CUP_ROUND_WEEKS_POOL이 챔스 주차와 거의 안 겹치게
+            # 짜여 있지만, 같은 함수로 국내 경기와의 요일 충돌은 여전히 피한다.
+            _intl_cl_day = _week_intl_cl_day(week, p)
+            im = intl_engine.get_my_match(week) if day == _intl_cl_day else None
+            cm = champions_engine.get_my_cl_match(week) if day == _intl_cl_day else None
+            cu = cup_engine.get_my_cup_match(week) if day == _intl_cl_day else None
+            if im:
+                _had_match = True
+                intl_engine.simulate_my_match(week, p)
+            elif cm:
+                _had_match = True
+                champions_engine.simulate_my_cl_match(week, p)
+            elif cu:
+                _had_match = True
+                cup_engine.simulate_my_cup_match(week, p, day=day)
+            else:
+                _process_training(p, week, stype, detail, day=day)
+                _sim_my_unscheduled_match(week, p, cur_season)
+
+        is_week_last_day = (day % DAYS_PER_WEEK == 0)
+        next_day = day + 1
+        if next_day > 364:
+            next_day = 1
+
+        _do_flush = False
+        if is_week_last_day:
+            # ── 그 주 마무리: 기존 검증된 주 단위 훅 그대로 재사용 ──
+            intl_engine.process_intl_week(week)
+            champions_engine.process_cl_week(week)
+            cup_engine.process_cup_week(week)
+            _sim_all_ai_matches(week, p.get("current_league_id", 0), cur_season)
+
+            p_latest = get_player()
+            if week % 4 == 0:
+                _pay_salary(p_latest, week)
+            # [최적화] 자동저장(flush_to_disk, DB 전체 백업)은 급여 지급과 같은 날
+            # 묶여 있었는데, 52주차가 하필 4의 배수라 '연도 전환(_advance_week의
+            # 최대 병목 지점)'과 '자동저장'이 같은 클릭에 겹쳐 있었다(실측 약 0.55초
+            # 추가 지연). 저장 빈도(4주마다)·급여 지급 시점은 전혀 안 바꾸고,
+            # 저장이 걸리는 주차만 급여 주차와 2주 어긋나게(2,6,10...50주차) 옮겨서
+            # 52주차와 절대 겹치지 않게 한다 — 사용자가 체감하는 저장 주기는 동일.
+            if week % 4 == 2:
+                _do_flush = True
+
+            _advance_week(p_latest, week, 1)   # current_week/year/season 갱신(검증된 로직)
+
+        # current_day 전진 (주/연도 경계와 무관하게 매일 정확히 1회).
+        # _advance_week는 current_week/year/season만 갱신하고 current_day는
+        # 안 건드리므로, 여기서 항상 별도로 다음 날짜를 반영한다.
+        conn_d = get_conn()
+        conn_d.execute("UPDATE my_player SET current_day=? WHERE id=1", (next_day,))
+        conn_d.execute("UPDATE season_state SET current_day=? WHERE id=1", (next_day,))
+        # [버그 수정] database.flush_to_disk()가 근본 원인은 정리했지만(백업
+        # 직후 자체적으로 commit 시도), 혹시 다른 경로로도 같은 상태가 생길
+        # 수 있으니 여기서도 한 번 더 방어한다 — "no transaction is active"는
+        # 이미 저장이 끝났다는 뜻이라 그냥 무시해도 데이터 유실이 아니다.
+        try:
+            conn_d.commit()
+        except sqlite3.OperationalError as _e:
+            if "no transaction is active" not in str(_e):
+                raise
+        conn_d.close()
+
+        # [버그수정] flush_to_disk()는 SQLite backup API(src_real.backup(dst))를
+        #   쓰는데, 이게 커넥션의 트랜잭션 추적 상태를 흐트러뜨려서 그 '직후'
+        #   같은 커넥션에 commit()을 하면 "cannot commit - no transaction is
+        #   active" 오류가 났다. 그래서 flush는 이번 day 반복에서 필요한 모든
+        #   커밋(위 current_day 커밋, _advance_week의 커밋)이 전부 끝난 뒤
+        #   맨 마지막에, 이 반복에서 더 이상 같은 커넥션에 커밋할 게 없는
+        #   시점에만 실행한다.
+        if _do_flush:
+            try:
+                from database import flush_to_disk
+                flush_to_disk()
+            except Exception:
+                pass
+
+        # [국가대표 발탁 대기] INTL_CALLUP_WEEK 진입 직전 주의 마지막 날에 걸렸다면
+        #   (=_advance_week가 방금 그 주로 진입시켰을 수 있음), 발탁 대기가
+        #   생겼는지 확인 후 있으면 멈춘다.
+        try:
+            from constants import INTL_CALLUP_WEEK as _ICW2
+            if is_week_last_day and week == _ICW2 - 1 and intl_engine.get_pending_choice():
+                break
+        except Exception:
+            pass
+
+        if _had_match and p.get("current_team_id"):
+            p_fresh = get_player()
+            st_new  = get_state()
+            _update_career_stats(p_fresh, st_new["current_year"], st_new["current_week"])
         flush_log_buffer()
 
 
@@ -1127,7 +1385,10 @@ def _sim_all_ai_matches(week, my_league_id, season):
               (week, season))
     matches = c.fetchall()
 
-    is_offseason = (1 <= week <= 4) or (12 <= week <= 25)
+    from constants import SEASON_PHASES
+    _ps_s, _ps_e = SEASON_PHASES["preseason1"]
+    _os_s, _os_e = SEASON_PHASES["postseason"]   # = 국제대회 전용 비시즌
+    is_offseason = (_ps_s <= week <= _ps_e) or (_os_s <= week <= _os_e)
 
     batch_results = []   # (hs, as_, mid) — match_results 배치
     team_deltas   = {}   # {team_id: [w,d,l,gf,ga]} — teams 배치
@@ -1178,7 +1439,7 @@ def effective_training_stress(p, ttype):
     return stress_chg
 
 
-def _process_training(p, week, ttype, focus_stat=None):
+def _process_training(p, week, ttype, focus_stat=None, day=None):
     cfg  = TRAINING_CONFIG[ttype]
     pers = p.get("personality","성실함")
     pe   = PERSONALITY_EFFECTS.get(pers, {})
@@ -1224,7 +1485,7 @@ def _process_training(p, week, ttype, focus_stat=None):
                 if cur > 20:
                     stat_changes[stat] = -1
         happy_chg = random.randint(4, 8)
-        log_parts = [f"😴 휴식  {week}주차  스트레스 {stress_chg:+d}  행복 {happy_chg:+d}"]
+        log_parts = [f"😴 휴식  {_day_label(week, day)}  스트레스 {stress_chg:+d}  행복 {happy_chg:+d}"]
         if stat_changes:
             for s, v in stat_changes.items():
                 log_parts.append(f"   {STAT_KO.get(s,s)} {v:+d}")
@@ -1257,7 +1518,7 @@ def _process_training(p, week, ttype, focus_stat=None):
             inj_chance = 1.0
 
         if random.random() < inj_chance:
-            _apply_injury(p, week)
+            _apply_injury(p, week, day=day)
             return
 
         # ── 훈련 스탯 상승 ──────────────────────────────────
@@ -1450,8 +1711,8 @@ def _process_training(p, week, ttype, focus_stat=None):
                     headroom = max(0, mx - cur)
                     soft = 1.0 if headroom >= 12 else max(0.5, headroom / 12.0)
                     raw = random.uniform(g_min, g_max) * eff * soft
-                    gain = (1 if random.random() < raw else 0) if raw < 1.0 else int(raw)
-                    new_val = min(mx, cur + gain)
+                    gain = round(raw, 1)  # [2026-07] 0.1 단위로 매번 눈에 보이게 누적(예전 확률적 1/0 방식 폐지)
+                    new_val = round(min(mx, cur + gain), 1)  # 부동소수 오차 누적 방지
                 else:
                     # _max 도달: 한 번 훈련 시 HIGH_BREAK_PROB(30%) 확률로 _max를 +1
                     #   끌어올려 talent_cap+α(강점 100+ 가능)까지 점진 돌파.
@@ -1473,8 +1734,8 @@ def _process_training(p, week, ttype, focus_stat=None):
                     soft = min(1.0, max(0.45, headroom / (SOFTCAP_DENOM * 2)))
                     final_mult = 2.0 if headroom <= 10 else 1.0
                     raw = random.uniform(g_min, g_max) * eff * soft * final_mult
-                    gain = (1 if random.random() < raw else 0) if raw < 1.0 else int(raw)
-                    new_val = min(mx, cur + gain)
+                    gain = round(raw, 1)  # [2026-07] 0.1 단위로 매번 눈에 보이게 누적(예전 확률적 1/0 방식 폐지)
+                    new_val = round(min(mx, cur + gain), 1)  # 부동소수 오차 누적 방지
                 else:
                     # max 도달 → 낮은 확률로만 한계 돌파 (cap 이하)
                     #   강점훈련은 돌파를 강하게(특화), 약점훈련은 거의 안 함(안전).
@@ -1502,18 +1763,18 @@ def _process_training(p, week, ttype, focus_stat=None):
                 soft = min(1.0, max(SOFTCAP_FLOOR, headroom / SOFTCAP_DENOM))
                 final_mult = 2.0 if headroom <= 10 else 1.0
                 raw = random.uniform(g_min, g_max) * eff * soft * final_mult
-                gain = (1 if random.random() < raw else 0) if raw < 1.0 else int(raw)
-                new_val = min(mx, cur + gain)
+                gain = round(raw, 1)  # [2026-07] 0.1 단위로 매번 눈에 보이게 누적(예전 확률적 1/0 방식 폐지)
+                new_val = round(min(mx, cur + gain), 1)  # 부동소수 오차 누적 방지
             if new_val > cur:
                 stat_changes[stat] = new_val - cur
 
         label = f"[{ttype}]"
-        log_parts = [f"🏃 {label}  {week}주차"]
+        log_parts = [f"🏃 {label}  {_day_label(week, day)}"]
         max_ups      = {k: v for k, v in stat_changes.items() if k.endswith("_max_up")}
         real_changes = {k: v for k, v in stat_changes.items() if not k.endswith("_max_up")}
         if real_changes or max_ups:
             for s, v in real_changes.items():
-                log_parts.append(f"   {STAT_KO.get(s,s)} {v:+d}")
+                log_parts.append(f"   {STAT_KO.get(s,s)} {v:+.1f}")
             for _, (stat, new_mx) in max_ups.items():
                 log_parts.append(f"   {STAT_KO.get(stat,stat)} 잠재력↑ (최대 {new_mx})")
         else:
@@ -1566,16 +1827,16 @@ def _process_training(p, week, ttype, focus_stat=None):
                 if random.random() < chance:
                     slump = 1
                     if new_stress >= threshold:
-                        add_log(f"😰 슬럼프 발생!  {week}주차", "slump")
+                        add_log(f"😰 슬럼프 발생!  {_day_label(week, day)}", "slump")
                     else:
-                        add_log(f"😰 행복도 저하로 슬럼프!  {week}주차", "slump")
+                        add_log(f"😰 행복도 저하로 슬럼프!  {_day_label(week, day)}", "slump")
             if new_happy <= SLUMP_HAPPY_THRESHOLD:
                 slump = 1
-                add_log(f"😰 행복도 저하로 슬럼프!  {week}주차", "slump")
+                add_log(f"😰 행복도 저하로 슬럼프!  {_day_label(week, day)}", "slump")
     else:
         if new_stress <= SLUMP_RECOVER_STRESS:
             slump = 0
-            add_log(f"😊 슬럼프 해소!  {week}주차", "slump")
+            add_log(f"😊 슬럼프 해소!  {_day_label(week, day)}", "slump")
 
     updates["slump"] = slump
     updates["ovr"]   = calc_ovr(p["position"], {s: updates.get(s, p.get(s,40))
@@ -1585,36 +1846,66 @@ def _process_training(p, week, ttype, focus_stat=None):
         add_log(line, "training")
 
 
-def _apply_injury(p, week):
+def _apply_injury(p, week, day=None):
+    # [2026-07 확장] 등급(경미/중간/심각/매우 심각)을 먼저 확률로 고르고,
+    # 그 등급 안의 구체 부상(INJURY_DETAILS)을 하나 더 골라서 그 부상
+    # 고유의 좁은 회복 범위로 주수를 정한다 — "부상!"으로 뭉뚱그리지 않고
+    # "왼쪽 발목 인대 파열" 식으로 실제로 뭐가 다쳤는지 로그/화면에 남는다.
+    #
+    # [2026-07 버그 수정] INJURY_TYPES/INJURY_DETAILS의 범위는 '주' 단위로
+    # 설계했다(예: ACL 파열 24~32주 ≈ 실제 6~8개월 회복 기간). 그런데
+    # _process_injury_week가 (일 단위 진행 체계에서) 하루에 한 번씩 호출돼
+    # injury_weeks를 매번 -1 해왔다 — 즉 '주' 필드인데 실제로는 매일
+    # 깎여서, 8주 부상이 실제로는 8일 만에 나아버리는 버그가 있었다(회복
+    # 기간이 의도한 것의 1/7로 단축). 이제 주수를 실제 일수로 환산해서
+    # 저장한다(예: 8주 → 56일) — injury_weeks 필드명은 마이그레이션을
+    # 피하려고 그대로 두지만, 이제부터는 '남은 일수'를 담는다.
     roll = random.random()
-    if roll < 0.6:
-        itype = "경미"
-    elif roll < 0.9:
-        itype = "중간"
-    else:
-        itype = "심각"
-    wmin, wmax = INJURY_TYPES[itype]
+    cum = 0.0
+    itype = "경미"
+    for tier, chance in INJURY_TIER_CHANCE.items():
+        cum += chance
+        if roll < cum:
+            itype = tier
+            break
+    detail_pool = INJURY_DETAILS.get(itype) or [(itype, INJURY_TYPES[itype])]
+    detail_name, (wmin, wmax) = random.choice(detail_pool)
     weeks = random.randint(wmin, wmax)
-    update_player(injured=1, injury_weeks=weeks, injury_type=itype,
-                  happiness=max(0, p["happiness"] - 20))  # 이슈9: 부상 -20
-    add_log(f"🚑 {itype} 부상!  {week}주차  ({weeks}주 휴식 필요)", "injury")
+    days = weeks * DAYS_PER_WEEK
+    # 등급이 심할수록 행복도 타격도 커지게(기존엔 등급 무관 고정 -20).
+    happy_penalty = {"경미": 10, "중간": 15, "심각": 20, "매우 심각": 30}.get(itype, 20)
+    update_player(injured=1, injury_weeks=days, injury_type=itype, injury_detail=detail_name,
+                  happiness=max(0, p["happiness"] - happy_penalty))
+    add_log(f"🚑 {detail_name} ({itype})!  {_day_label(week, day)}  ({days}일 휴식 필요)", "injury")
 
 
-def _process_injury_week(p, week):
+def _process_injury_week(p, week, day=None):
     left = p["injury_weeks"] - 1
     if left <= 0:
-        update_player(injured=0, injury_weeks=0, injury_type="")
-        add_log(f"✅ 부상 회복!  {week}주차", "injury")
+        update_player(injured=0, injury_weeks=0, injury_type="", injury_detail="")
+        add_log(f"✅ {p.get('injury_detail') or '부상'} 회복!  {_day_label(week, day)}", "injury")
     else:
         update_player(injury_weeks=left)
-        add_log(f"🚑 부상 휴식  {week}주차  ({left}주 남음)", "injury")
+        detail = p.get("injury_detail") or "부상"
+        add_log(f"🚑 {detail} 휴식  {_day_label(week, day)}  ({left}일 남음)", "injury")
 
 
 # ─────────────────────────────────────────
 # 경기 시뮬레이션
 # ─────────────────────────────────────────
 
-def _simulate_match(p, week, info: dict):
+def _soft_cap(x, cap):
+    """[2026-07 신설] 하드 컷 대신 쓰는 소프트캡 — cap을 넘으면 잘라내지 않고
+    점근적으로만 완만하게 계속 늘어나게 한다(완전히 평평해지지 않음).
+    _simulate_match의 캐리 보너스가 상한 근처에서도 OVR 차이를 계속
+    구분해 반영하도록 쓰인다."""
+    if x <= cap:
+        return x
+    over = x - cap
+    return cap + cap * 0.15 * (1 - math.exp(-over / cap))
+
+
+def _simulate_match(p, week, info: dict, day=None):
     conn = get_conn()
     c = conn.cursor()
     st = get_state()  # 현재 게임 상태 (연도 등)
@@ -1633,14 +1924,27 @@ def _simulate_match(p, week, info: dict):
 
     bonus = 0.0
     if played:
-        # [에이스 영향력] 내가 팀 평균보다 높을수록 팀을 끌어올린다.
-        #   - 11명 중 1명이지만, 에이스는 경기 영향력이 산술평균 이상.
-        #   - gap(내 OVR - 팀평균) 기반으로 강하게 주되, 1명의 한계로 상한을 둔다.
-        #   - 메시급(약팀에서도 캐리)을 재현하되 11명 게임의 한계는 유지.
+        # [2026-07 재설계 — 비선형 캐리] 예전엔 gap에 선형 계수(0.32)만 곱해서
+        # OVR 50대든 90대든 "같은 갭이면 같은 배율"로 팀을 끌어올렸다 — 그런데
+        # 현실은 그렇지 않다(신민용 지적): OVR90대~100은 50대~60대와 갭이
+        # 같아도 훨씬 크게 경기를 지배해야 한다("메시급"과 "준수한 선수"의
+        # 차이는 산술적이지 않고 기하급수적). 그래서 my_ovr 자체에 따라
+        # 갭 배율(star)이 볼록하게(convex) 커지는 구조로 바꿨다 — 60 이하는
+        # 거의 기존과 비슷하지만, 70을 넘기면서 급격히 커진다.
+        #
+        # 또한 예전 상한(14.0)은 하드 컷이라 OVR 80만 넘으면 거의 다 캡에
+        # 걸려서 92와 100이 똑같이 취급되는 문제가 있었다(사용자 실측:
+        # OVR92 골키퍼가 팀평균 30후반 리그에서 전혀 안 먹히는 느낌 —
+        # 포지션 채널 문제와 별개로 이 캡도 원인이었다). 하드 컷 대신
+        # 소프트캡(_soft_cap)으로 바꿔서 상한 근처에서도 완만하게 계속
+        # 늘어나게 했다 — 92와 100이 여전히 구분된다.
         team_avg = home_ovr if is_home else away_ovr
-        gap = my_ovr - team_avg
-        bonus = max(0.0, gap) * 0.32 + my_ovr * 0.05
-        bonus = min(bonus, 14.0)
+        gap = max(0.0, my_ovr - team_avg)
+        star = 1.0 + max(0.0, (my_ovr - 60) / 40.0) ** 1.8 * 3.0
+        bonus = gap * 0.30 * star + max(0.0, my_ovr - 50) * 0.08
+        bonus = _soft_cap(bonus, 30.0)
+
+    my_position = p.get("position", "")
 
     # [재설계 — 포메이션 매치업 시뮬레이션] 예전엔 홈-원정 OVR 차이 하나로
     # 확률표(_match_win_probs/_gen_score)에서 스코어를 뽑았다 — 포메이션이
@@ -1662,6 +1966,8 @@ def _simulate_match(p, week, info: dict):
             home_id, away_id, home_formation, away_formation,
             home_boost=(bonus if is_home else 0.0),
             away_boost=(bonus if not is_home else 0.0),
+            home_boost_position=(my_position if is_home else None),
+            away_boost_position=(my_position if not is_home else None),
             home_adv=_home_advantage())
         hs, as_ = sim["home_score"], sim["away_score"]
         engine_stats = {"home": sim["home_stats"], "away": sim["away_stats"]}
@@ -1763,7 +2069,7 @@ def _simulate_match(p, week, info: dict):
         cur = p.get(ms, 40)
         if cur > 20:
             mental_updates[ms] = cur - 1
-        add_log(f"⚠ 경기 불참  {week}주차  {STAT_KO.get(ms,ms)} -1", "training")
+        add_log(f"⚠ 경기 불참  {_day_label(week, day)}  {STAT_KO.get(ms,ms)} -1", "training")
 
     # [최적화] 감독관계·인기도·스트레스·행복·멘탈 모두 1회 update_player로 통합
     update_player(manager_relation=new_rel, popularity=new_pop,
@@ -1772,7 +2078,7 @@ def _simulate_match(p, week, info: dict):
     _write_match_log(p, week, info["league_name"], is_home,
                      home_id, away_id, hs, as_,
                      my_result, goals, assists, saves, rating, events, played, benched,
-                     detail=detail, engine_stats=engine_stats, engine_plog=engine_plog)
+                     detail=detail, engine_stats=engine_stats, engine_plog=engine_plog, day=day)
 
 
 def _team_avg_ovr(c, team_id):
@@ -2911,7 +3217,7 @@ def _augment_events_with_names(c, p, is_home, hid, aid, hs, as_,
 def _write_match_log(p, week, league_name, is_home,
                      hid, aid, hs, as_,
                      result, goals, assists, saves, rating, events, played, benched,
-                     detail=None, engine_stats=None, engine_plog=None):
+                     detail=None, engine_stats=None, engine_plog=None, day=None):
     # [최적화] 팀명을 세션 캐시에서 조회 (매 경기 get_conn 제거)
     conn = get_conn()
     c = conn.cursor()
@@ -2941,7 +3247,7 @@ def _write_match_log(p, week, league_name, is_home,
     #   헤더에 [match:{id}] 마커를 박아두면 log_panel 이 클릭 앵커로 변환한다.
     marker = f" [match:{detail_id}]" if detail_id else ""
     add_log("─"*44, "sep")
-    add_log(f"⚽ 경기  [{league_name}]  {week}주차  ({loc}){marker}", "match")
+    add_log(f"⚽ 경기  [{league_name}]  {_day_label(week, day)}  ({loc}){marker}", "match")
     add_log(f"   {hn} {hs}-{as_} {an}  ({rs})", "match")
 
     if not played:
@@ -3150,6 +3456,80 @@ def get_league_standings(league_id, season=None, conn=None):
 # 경기 일정 생성
 # ─────────────────────────────────────────
 
+def _build_league_schedule_rows(league_id, tids, season, year, existing_matches, first_half_only=False):
+    """리그 하나의 시즌 전체 경기 행을 만들어 반환한다(스코어 -1,-1로 예정).
+
+    [2026-07 추가] 팀 수가 다른 리그끼리 시즌 종료 시점이 3개월 넘게
+    벌어지는 문제 수정 — 라운드 간격을 1주로 캡 씌우다 보니 라운드 자체가
+    적은 소규모 리그(8팀=7라운드)가 시즌 초반에 다 끝나버렸다. 그래서
+    legs_for_team_count()로 팀이 적을수록 서로 더 여러 번(다전제) 붙게
+    하고(K리그1이 12팀·3전인 것과 같은 발상), season_cycle_windows()로
+    시즌 전체 기간을 그 다전제 횟수만큼 사이클로 나눠 각 사이클마다
+    기존 '왕복 2전'(상반기 1다리 + 하반기 반전 1다리) 구조를 그대로
+    재사용한다 — 그래서 라운드 스프레드·리그별 요일 오프셋·마지막 라운드
+    전 구단 동시진행 로직을 손 안 대고 사이클 수만큼 반복 적용할 수 있다.
+
+    existing_matches: {(day,home,away), ...} 중복 방지 집합(직접 갱신됨).
+    first_half_only=True면 첫 사이클의 첫 다리(1라운드~)만 생성하고 끝낸다
+    (오퍼 창 순위 미리보기용 — 예전 _generate_first_half_schedule과 동일 용도).
+    반환: [(league_id,week,home,away,season,year,day), ...] executemany용.
+    """
+    n = len(tids)
+    if n < 2:
+        return []
+
+    rounds = generate_round_robin(n)
+    n_rounds = len(rounds)
+    legs = 2 if first_half_only else legs_for_team_count(n)
+    n_cycles = max(1, legs // 2)
+    windows = season_cycle_windows(n_cycles)
+    _lg_off = league_day_offset(league_id)
+
+    new_rows = []
+    leg_home = {}   # (cyc,rd,hi,ai) -> 그 사이클 1다리에서 실제 홈이었던 team_id
+    for cyc, (h1s, h1e, h2s, h2e) in enumerate(windows):
+        is_last_cycle = (cyc == n_cycles - 1)
+        for leg_idx, (w_start, w_end) in enumerate(((h1s, h1e), (h2s, h2e))):
+            if first_half_only and (cyc, leg_idx) != (0, 0):
+                break  # 미리보기용은 첫 사이클 첫 다리만 필요
+            is_last_leg_of_season = (not first_half_only) and is_last_cycle and leg_idx == 1
+            for rd, matches in enumerate(rounds):
+                valid_pairs = [(hi, ai) for hi, ai in matches if hi < n and ai < n]
+                is_final_round = is_last_leg_of_season and (rd == n_rounds - 1)
+                if is_final_round and n_rounds >= 2:
+                    # 시즌 진짜 마지막 라운드 — 전 구단 동시진행(스프레드 없음).
+                    prev_valid = [(hi, ai) for hi, ai in rounds[rd - 1] if hi < n and ai < n]
+                    day = final_round_day(rd - 1, n_rounds, w_start, w_end,
+                                           len(prev_valid), offset=_lg_off)
+                    match_days = [day] * len(valid_pairs)
+                else:
+                    match_days = round_match_days(rd, n_rounds, w_start, w_end,
+                                                   len(valid_pairs), offset=_lg_off)
+                for (hi, ai), day in zip(valid_pairs, match_days):
+                    week = day_to_week(day)
+                    if leg_idx == 0:
+                        t1, t2 = (tids[hi], tids[ai]) if random.random() < 0.5 else (tids[ai], tids[hi])
+                        leg_home[(cyc, rd, hi, ai)] = t1
+                    else:
+                        # [버그수정] 2다리는 1다리 홈/원정을 반드시 반전(같은
+                        # 팀이 계속 홈이 되는 걸 방지) — generate_season_schedule
+                        # 원래 주석 그대로.
+                        fh_home = leg_home.get((cyc, rd, hi, ai))
+                        if fh_home == tids[hi]:
+                            t1, t2 = tids[ai], tids[hi]
+                        elif fh_home == tids[ai]:
+                            t1, t2 = tids[hi], tids[ai]
+                        else:
+                            t1, t2 = (tids[ai], tids[hi]) if random.random() < 0.5 else (tids[hi], tids[ai])
+                    key, rkey = (day, t1, t2), (day, t2, t1)
+                    if key in existing_matches or rkey in existing_matches:
+                        continue
+                    new_rows.append((league_id, week, t1, t2, season, year, day))
+                    existing_matches.add(key)
+                    existing_matches.add(rkey)
+    return new_rows
+
+
 def generate_season_schedule(league_id, season, year, force=False):
     conn = get_conn()
     c = conn.cursor()
@@ -3159,9 +3539,10 @@ def generate_season_schedule(league_id, season, year, force=False):
     if len(tids) < 2:
         conn.close(); return
 
-    # 팀 수에 맞는 라운드로빈 구성 (8팀 고정 → n팀 일반화)
-    rounds = generate_round_robin(len(tids))
-    expected_matches = len(tids) * (len(tids) - 1)  # 더블 라운드로빈 총 경기 수
+    # [2026-07] 다전제(legs_for_team_count) 반영 — 팀이 적을수록 총 경기 수가
+    # 왕복 2전보다 많아질 수 있어 '완비 판정' 기준도 실제 legs 기준으로 계산.
+    legs = legs_for_team_count(len(tids))
+    expected_matches = len(tids) * (len(tids) - 1) * (legs // 2)
 
     # [중복 생성 방지] 그 시즌 일정이 이미 충분히 생성돼 있으면(상·하반기분)
     #   다시 만들지 않는다. 승강 등으로 teams 구성이 바뀐 뒤 재호출되면 옛 일정과
@@ -3170,72 +3551,30 @@ def generate_season_schedule(league_id, season, year, force=False):
         n_existing = c.execute(
             "SELECT COUNT(*) AS c FROM match_results WHERE league_id=? AND season=?",
             (league_id, season)).fetchone()["c"]
-        # 더블 라운드로빈 총 경기 수의 8할 이상 차 있으면 완비로 간주.
+        # 총 경기 수의 8할 이상 차 있으면 완비로 간주.
         if n_existing >= expected_matches * 0.8:
             conn.close(); return
 
-    # 이미 완료된 경기 주차
-    c.execute("""SELECT week FROM match_results
-                 WHERE league_id=? AND season=? AND home_score >= 0""", (league_id, season))
-    played_weeks = {r["week"] for r in c.fetchall()}
-
-    # 이미 예정된 경기 (홈/원정 양방향 모두 체크해서 중복 삽입 방지)
-    c.execute("""SELECT week, home_team_id, away_team_id FROM match_results
-                 WHERE league_id=? AND season=?""", (league_id, season))
-    existing_matches = set()
+    # 이미 예정된 경기 (day 기준으로 중복 방지 — day는 라운드마다 항상
+    #   유일하므로, 팀 수가 많아 한 주에 라운드가 여러 개 몰리는 리그에서도
+    #   week만으로 구분하다 생기는 오매칭이 없다. day가 없는(이 기능 이전에
+    #   생성된) 과거 행은 이 dedup 대상이 아니며, 전체 완비 여부는 위의
+    #   80% 카운트 체크가 별도로 지켜준다.)
+    c.execute("""SELECT day, week, home_team_id, away_team_id FROM match_results
+                 WHERE league_id=? AND season=? AND day IS NOT NULL""", (league_id, season))
+    existing_matches = set()   # {(day, home, away)}
     for r in c.fetchall():
-        w, h, a = r["week"], r["home_team_id"], r["away_team_id"]
-        existing_matches.add((w, h, a))
-        existing_matches.add((w, a, h))  # 역방향도 등록해서 중복 방지
+        d, h, a = r["day"], r["home_team_id"], r["away_team_id"]
+        existing_matches.add((d, h, a))
+        existing_matches.add((d, a, h))  # 역방향도 등록해서 중복 방지
 
-    # 내 팀이 리그에 있는데 아직 예정된 경기가 없는 주차 확인
-    p_row = conn.execute("SELECT current_team_id FROM my_player WHERE id=1").fetchone()
-    my_tid = p_row["current_team_id"] if p_row else 0
-
-    new_rows = []  # (league_id,week,home_team_id,away_team_id,season,year) - executemany 배치용
-
-    for rd, matches in enumerate(rounds):
-        week = FIRST_HALF_START + rd
-        if week in played_weeks: continue
-        for hi, ai in matches:
-            if hi >= len(tids) or ai >= len(tids): continue
-            # 홈/원정 랜덤 배정
-            t1, t2 = (tids[hi], tids[ai]) if random.random() < 0.5 else (tids[ai], tids[hi])
-            key  = (week, t1, t2)
-            rkey = (week, t2, t1)
-            if key in existing_matches or rkey in existing_matches: continue
-            new_rows.append((league_id, week, t1, t2, season, year))
-            existing_matches.add(key)
-            existing_matches.add(rkey)
-
-    for rd, matches in enumerate(rounds):
-        week = SECOND_HALF_START + rd
-        if week in played_weeks: continue
-        for hi, ai in matches:
-            if hi >= len(tids) or ai >= len(tids): continue
-            # 하반기는 상반기 반대 (홈↔원정) - 하지만 상반기 기록이 없으면 랜덤
-            # 상반기에 t1이 홈이었다면 하반기엔 t2가 홈
-            first_half_week = FIRST_HALF_START + rd
-            flip_key1 = (first_half_week, tids[hi], tids[ai])
-            flip_key2 = (first_half_week, tids[ai], tids[hi])
-            if flip_key1 in existing_matches:
-                t1, t2 = tids[ai], tids[hi]  # 반전
-            elif flip_key2 in existing_matches:
-                t1, t2 = tids[hi], tids[ai]  # 반전
-            else:
-                t1, t2 = (tids[ai], tids[hi]) if random.random() < 0.5 else (tids[hi], tids[ai])
-            key  = (week, t1, t2)
-            rkey = (week, t2, t1)
-            if key in existing_matches or rkey in existing_matches: continue
-            new_rows.append((league_id, week, t1, t2, season, year))
-            existing_matches.add(key)
-            existing_matches.add(rkey)
+    new_rows = _build_league_schedule_rows(league_id, tids, season, year, existing_matches)
 
     if new_rows:
         c.executemany("""INSERT INTO match_results
                          (league_id,week,home_team_id,away_team_id,
-                          home_score,away_score,season,year)
-                         VALUES(?,?,?,?,-1,-1,?,?)""", new_rows)
+                          home_score,away_score,season,year,day)
+                         VALUES(?,?,?,?,-1,-1,?,?,?)""", new_rows)
 
     conn.commit()
     conn.close()
@@ -3268,7 +3607,7 @@ def get_schedule(league_id, season):
                  JOIN teams ht ON mr.home_team_id=ht.id
                  JOIN teams at ON mr.away_team_id=at.id
                  WHERE mr.league_id=? AND mr.season=?
-                 ORDER BY mr.week""", (league_id, season))
+                 ORDER BY mr.day, mr.week""", (league_id, season))
     rows = [dict(r) for r in c.fetchall()]
     conn.close()
     return rows
@@ -3344,12 +3683,12 @@ def _update_residency_and_naturalization(cur_year):
 
     # 이미 보유한 국적(출생/귀화)이면 스킵
     owned = {p.get("nationality","") or "", p.get("nationality2","") or "",
-             p.get("nationality3","") or ""}
+             p.get("nationality3","") or "", p.get("nationality4","") or ""}
     nat_list = [n for n in (p.get("naturalized_nats","") or "").split(",") if n]
     owned |= set(nat_list)
     if club_country in owned:
         return
-    # 빈 국적 슬롯에 귀화 국적 추가 (nationality2 → nationality3)
+    # 빈 국적 슬롯에 귀화 국적 추가 (nationality2 → nationality3 → nationality4)
     # 국기도 함께 저장해 연혁/표시에서 깃발이 비지 않게 한다.
     conn2 = get_conn()
     frow = conn2.execute("SELECT flag FROM countries WHERE name=?", (club_country,)).fetchone()
@@ -3359,8 +3698,10 @@ def _update_residency_and_naturalization(cur_year):
         update_player(nationality2=club_country, flag2=club_flag)
     elif not (p.get("nationality3","") or ""):
         update_player(nationality3=club_country, flag3=club_flag)
+    elif not (p.get("nationality4","") or ""):
+        update_player(nationality4=club_country, flag4=club_flag)
     else:
-        return                      # 국적 슬롯이 꽉 참(이미 3개)
+        return                      # 국적 슬롯이 꽉 참(이미 4개)
     nat_list.append(club_country)
     update_player(naturalized_nats=",".join(nat_list))
     # [국적 연혁] 귀화 획득 사건 기록 (현재 연도/주차)
@@ -3373,8 +3714,10 @@ def _update_residency_and_naturalization(cur_year):
 
 
 def _team_at_week35_for(year):
-    """주어진 연도의 35주차(리그 종료) 시점에 내가 소속이던 팀 id.
-    36주 이후 이적해도 '리그를 끝까지 함께한 팀'을 우승 귀속 대상으로 본다."""
+    """주어진 연도의 클럽 시즌 종료(리그 종료) 시점에 내가 소속이던 팀 id.
+    시즌 종료 후 이적해도 '리그를 끝까지 함께한 팀'을 우승 귀속 대상으로 본다."""
+    from constants import SEASON_PHASES
+    league_end_week = SEASON_PHASES["second_half"][1]   # 신규 캘린더: 43주
     conn = get_conn()
     try:
         rows = conn.execute(
@@ -3391,7 +3734,7 @@ def _team_at_week35_for(year):
                 ew = r["end_week"] or 52
             # 시작 연도가 올해면 start_week, 아니면 1주부터로 간주
             sw_eff = sw if (r["start_year"] or year) == year else 1
-            if sw_eff <= 35 <= ew:
+            if sw_eff <= league_end_week <= ew:
                 conn.close()
                 return r["team_id"]
     except Exception:
@@ -3401,10 +3744,11 @@ def _team_at_week35_for(year):
     return p.get("current_team_id", 0)
 
 
-def _lock_league_title_at_37(p, year):
-    """37주 진입 시: 리그 경기(35주)가 끝났으므로, 35주 소속 팀이 1위면
-    그 즉시 우승을 trophy_log에 확정한다. (연말까지 안 기다림)
-    36주에 다른 팀으로 이적해도 35주 소속 팀 기준이라 우승이 누락되지 않는다."""
+def _lock_league_title_after_season(p, year):
+    """리그 시즌 종료 다음 주 진입 시: 리그 경기(신규 캘린더 기준 43주)가
+    끝났으므로, 그 종료 시점 소속 팀이 1위면 그 즉시 우승을 trophy_log에
+    확정한다. (연말까지 안 기다림) 종료 다음 주에 다른 팀으로 이적해도
+    종료 시점 소속 팀 기준이라 우승이 누락되지 않는다."""
     champ_tid = _team_at_week35_for(year)
     if not champ_tid:
         return
@@ -3450,14 +3794,17 @@ def _advance_week(p, base_week, n_weeks=4):
         # 실시간으로 채우므로 더 이상 연말에 몰아서 처리할 필요가 없다.
         _generate_all_league_schedules(new_season, new_year)
     else:
-        # 하반기 종료(33~36주차) → 37~40주차: 커리어 스탯 중간 업데이트만
-        # (항목은 닫지 않음 - 연도 변경 시 _close_career_entry가 닫음)
-        if base_week <= 36 and new_week >= 37:
+        # 리그 시즌 종료 주(신규 캘린더: 43주) 다음 주 진입 시: 커리어 스탯
+        # 중간 업데이트만 (항목은 닫지 않음 - 연도 변경 시 _close_career_entry가 닫음)
+        from constants import SEASON_PHASES as _SP
+        _league_end_wk = _SP["second_half"][1]   # 43
+        if base_week <= _league_end_wk and new_week >= _league_end_wk + 1:
             if p.get("current_team_id") and p.get("season_matches", 0) > 0:
                 _update_career_stats(p, new_year, new_week)
-            # [우승 확정] 리그 경기는 35주에 끝나므로, 37주 진입 시 35주 소속 팀이
-            #   1위면 그 즉시 우승을 기록한다. (연말까지 안 기다리고 바로 '성적'에 반영)
-            _lock_league_title_at_37(p, new_year)
+            # [우승 확정] 리그 경기는 _league_end_wk주에 끝나므로, 그 다음 주 진입 시
+            #   그 시점 소속 팀이 1위면 그 즉시 우승을 기록한다.
+            #   (연말까지 안 기다리고 바로 '성적'에 반영)
+            _lock_league_title_after_season(p, new_year)
 
     # [최적화] my_player + season_state 갱신을 하나의 커넥션으로 묶어 커밋 2회→1회
     conn_adv = get_conn()
@@ -3485,8 +3832,10 @@ def _advance_week(p, base_week, n_weeks=4):
             conn_cl.commit()
         conn_cl.close()
 
-    # 13주차 진입 시 상반기 평점 스냅샷 저장 (13~24주 오퍼 확률용)
-    if new_week == 13:
+    # 겨울 이적시장 시작 1주 전: 그 시점까지의 평점 스냅샷 저장 (겨울 오퍼 확률용)
+    from constants import OFFER_ZONES
+    _winter_zone_start = OFFER_ZONES[1][0]   # 겨울 이적시장 시작 주차
+    if new_week == _winter_zone_start - 1:
         p_snap = get_player()
         if p_snap:
             rc_s = p_snap.get("season_rating_cnt", 0)
@@ -3501,14 +3850,23 @@ def _advance_week(p, base_week, n_weeks=4):
         except Exception as e:
             add_log(f"⚠ 국제대회 생성 오류: {e}", "event")
 
-    # 41주차 진입: 클럽 대륙 챔피언스리그 시작 (매년)
-    #   리그 경기는 35주에 끝나므로 직전 시즌(current_season) 순위로 출전팀 선발.
+    # CL_START_WEEK(8주차) 진입: 클럽 대륙 챔피언스리그 시작 (매년)
+    #   출전팀 선발은 직전 시즌(이미 끝난 시즌)의 최종 순위 기준
+    #   (start_champions_league 내부에서 season-1로 조회).
     from champions_engine import CL_START_WEEK
     if new_week == CL_START_WEEK:
         try:
             champions_engine.start_champions_league(new_year, new_season)
         except Exception as e:
             add_log(f"⚠ 챔피언스리그 생성 오류: {e}", "event")
+
+    # [2026-07 신설] 5주차 진입: 국내 컵대회(FA컵식) 개막 (챔스 시작보다
+    # 앞서서, 1~2부 팀 전체로 대진을 짠다).
+    if new_week == 5:
+        try:
+            cup_engine.start_domestic_cup(new_year, new_season)
+        except Exception as e:
+            add_log(f"⚠ 컵대회 생성 오류: {e}", "event")
 
     # 새 시즌 시작(1주차 진입 시 1회) 내 리그 + 인접 리그 일정 생성
     # generate_season_schedule는 멱등하지만, 1주차에만 호출해 불필요한 중복 조회 방지
@@ -3667,6 +4025,50 @@ def _zamora_tally(c, p, year, league_id, lname, live_matches, live_ga):
     return total_m, total_ga
 
 
+def _league_full_season_matches(p) -> int:
+    """[2026-07 추가] 이 선수가 뛰는 리그의 실제 '풀시즌 팀당 경기 수'를
+    구한다(팀 수 + legs_for_team_count 다전제 반영, 8~30팀 리그마다
+    14~58경기로 제각각). 개인 수상 최소 출전 기준(아래 '최소 10경기'
+    게이트, 사모라상 등)이 전부 리그 규모와 무관하게 고정값이었던 걸
+    이 헬퍼로 통일해서 스케일한다 — _process_awards 내부에서도 득점왕/
+    도움왕/발롱도르 기준 계산에 동일한 로직을 쓴다(중복 계산이지만
+    가벼운 COUNT 쿼리 하나라 성능에 영향 없음)."""
+    tid = p.get("current_team_id", 0)
+    if not tid:
+        return 38  # 무소속 등 예외 상황의 안전 폴백(20팀 2전제 기준값)
+    conn = get_conn()
+    row = conn.execute(
+        """SELECT COUNT(*) AS n FROM teams
+           WHERE league_id = (SELECT league_id FROM teams WHERE id=?)""", (tid,)).fetchone()
+    conn.close()
+    n_teams = row["n"] if row and row["n"] else 20
+    legs = legs_for_team_count(n_teams)
+    return max(1, (n_teams - 1) * legs)
+
+
+def league_total_games_by_name(league_name: str):
+    """[2026-07 추가] 리그 이름으로 그 리그의 '풀시즌 팀당 경기 수'를 구한다
+    (커리어 이력처럼 예전에 뛰었던 리그 — 지금 내 팀 기준이 아닌 경우용).
+    이제 리그마다 팀 수·다전제가 달라 풀시즌 경기 수가 14~58경기로 다
+    다르므로, '출전 26경기'만 보면 그게 시즌을 거의 다 뛴 건지 절반만
+    뛴 건지 알 수 없다 — 분모(그 리그 풀시즌 경기 수)를 같이 보여주기
+    위한 조회 함수. 못 찾으면 None(호출부에서 분모 없이 표시)."""
+    if not league_name:
+        return None
+    conn = get_conn()
+    row = conn.execute("SELECT id FROM leagues WHERE name=? LIMIT 1", (league_name,)).fetchone()
+    if not row:
+        conn.close()
+        return None
+    n_teams = conn.execute(
+        "SELECT COUNT(*) AS n FROM teams WHERE league_id=?", (row["id"],)).fetchone()["n"]
+    conn.close()
+    if n_teams < 2:
+        return None
+    legs = legs_for_team_count(n_teams)
+    return max(1, (n_teams - 1) * legs)
+
+
 def _process_awards(p, year, season_goals, season_assists, season_rating, season_cs, season_goals_against=0):
     """시즌 종료 시 개인 수상 산정. 내 선수 실제 성적 + AI 추정 비교.
 
@@ -3705,16 +4107,35 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
         my_awards = []  # (award_type, detail)
 
         # ── 득점왕/도움왕 최소 산출 기준 ───────────────────────────
-        # 풀시즌 리그 경기 = 14경기(상/하반기 7R씩). 내가 실제로 뛴 경기수를
-        # 기준으로 최소 기준을 비례 조정한다(중도 합류/이적 시 너무 빡빡하지 않게).
-        #   - 풀시즌 기준 득점왕 최소 8골 / 도움왕 최소 6도움.
-        #   - 절대 하한(아무리 적게 뛰어도): 득점왕 4골 / 도움왕 4도움.
-        # 이렇게 하면 '2도움 도움왕' 같은 표본 부족 타이틀이 사라진다.
-        FULL_SEASON_MATCHES = 14
+        # [2026-07 버그 수정] 예전엔 "풀시즌 = 14경기(7팀 리그가 기본이던
+        # 시절의 상/하반기 7R씩)"로 고정 하드코딩했다 — 근데 이제 리그마다
+        # 팀 수(8~30팀)와 다전제(legs_for_team_count)에 따라 실제 풀시즌
+        # 경기 수가 14~58경기까지 제각각이다. 고정 14를 계속 쓰면, 예를
+        # 들어 30팀 리그(58경기)에서는 8골만 넣어도 득점왕 자격이 생겨
+        # 버리고(실제로는 시즌 초반 8경기 페이스일 뿐), 반대로 8팀
+        # 리그(42경기, 6전제)에서도 동일한 8골 기준이 적용돼 버려서 리그
+        # 규모별 형평성이 깨진다.
+        # 이제 이 선수가 뛰는 리그의 실제 팀 수로 진짜 풀시즌 경기 수를
+        # 구해서 그 경기 수 기준으로 다시 스케일한다 — 골/도움 '경기당
+        # 페이스' 기준(8골·6도움 / 14경기 ≈ 경기당 0.57골·0.43도움)은
+        # 그대로 유지하고, 리그마다 그 페이스를 실제 풀시즌 길이에 맞게
+        # 적용한다. 중도 합류/이적으로 적게 뛴 선수는 기존처럼 비례 조정.
+        FULL_SEASON_MATCHES = _league_full_season_matches(p)
+        # [2026-07 재조정] 실제 프리미어리그 득점왕(골든부트) 평균 23~25골
+        # (38경기 기준, 홀란급 괴물 시즌은 36골까지)을 기준점으로 다시 잡음.
+        # 이전엔 옛날 14경기 체계 값(8골/14경기)을 그대로 스케일해서 20팀
+        # 리그(38경기) 최소 기준이 22골로 다소 낮게 나왔었다 — 24골/38경기
+        # (≈0.632/경기)로 살짝 올려 현실 페이스에 더 가깝게 맞춘다. 이건
+        # '자격 최소선'이라 홀란급 시즌(30+)은 이 기준을 훌쩍 넘겨서 여전히
+        # 문제없이 득점왕이 나온다.
+        GOALS_PER_GAME_FOR_TITLE   = 24 / 38
+        ASSISTS_PER_GAME_FOR_TITLE = 16 / 38   # 어시스트왕도 같은 기준(38경기)으로 재정렬
+        GA_PER_GAME_FOR_BALLON     = 30 / 38   # 발롱도르급 시즌(골+도움 30/38 ≈ 메시·호날두 전성기)
         sm = max(1, p.get("season_matches", 0))
         play_ratio = min(1.0, sm / FULL_SEASON_MATCHES)
-        min_goals_for_title  = max(4, round(8 * play_ratio))
-        min_assists_for_title = max(4, round(6 * play_ratio))
+        _played_equiv = FULL_SEASON_MATCHES * play_ratio  # = min(sm, FULL_SEASON_MATCHES)
+        min_goals_for_title   = max(4, round(GOALS_PER_GAME_FOR_TITLE * _played_equiv))
+        min_assists_for_title = max(4, round(ASSISTS_PER_GAME_FOR_TITLE * _played_equiv))
 
         # 득점왕 (pool 1위 + 최소 골 기준 충족)
         top_scorer = max(pool, key=lambda x: (x["goals"], x["rating"]))
@@ -3797,16 +4218,18 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
             if young_best["is_mine"]:
                 my_awards.append(("영플레이어", f"{lname} 영플레이어"))
 
-        # 발롱도르 (S/A급 1부 + 세계 정상급 OVR + 압도적 성적)
-        # [버그 수정 — 근본 원인] 이 게임의 "풀시즌"은 14경기(위 득점왕/
-        # 도움왕 기준과 같은 FULL_SEASON_MATCHES)인데, 원래 "골+도움 30+"은
-        # 38경기급 실제 리그 풀시즌(메시/호날두 전성기, 경기당 0.79G+A)을
-        # 그대로 옮겨온 값이라 14경기 안에서는 사실상 도달 불가능했다
-        # (경기당 2.14를 요구하는 셈 — 실측: 11시즌 내내 두 자릿수 골에
-        # 평점 7.8~8.4를 찍고도 이 조건 하나로 단 한 번도 발롱도르를 못
-        # 받음). 득점왕/도움왕과 똑같이 이 게임의 실제 풀시즌(14경기)
-        # 기준으로 다시 잡는다 — 실제 세계 최정상급 비율(38경기 30G/A ≈
-        # 경기당 0.79)을 14경기에 그대로 적용하면 약 11.
+        # 발롱도르 (S/A급 1부 + 세계 정상급 OVR + 압도적 성적 + 꾸준한 고평점)
+        # [2026-07] 득점왕/도움왕과 동일하게, 리그별 실제 풀시즌 경기 수
+        # (FULL_SEASON_MATCHES, 위에서 이미 팀 수·다전제 반영해 계산됨)
+        # 기준으로 스케일한다. 골+도움 페이스는 메시/호날두 전성기 시즌
+        # (38경기 기준 30G/A 안팎)을 기준점으로 재조정.
+        # [추가] 실제 발롱도르는 골/도움 숫자만 보는 상이 아니라 시즌 내내
+        # 얼마나 꾸준히 잘했는지(평균 평점)도 핵심 심사 기준이다 — 그래서
+        # 골+도움 요건과 별개로 시즌 평균 평점도 일정 이상이어야 하게 했다.
+        # (MVP로 대체 인정되는 경우도 동일하게 평점 요건은 유지 — MVP도
+        # 결국 평점이 좋아야 받는 상이긴 하지만, 발롱도르 급의 '세계 최고'
+        # 라인은 그보다 살짝 더 높게 잡는다.)
+        BALLON_MIN_RATING = 7.4
         ballon = False
         if grade in BALLON_DOR_GRADES and tier == 1 and p.get("ovr",0) >= 88:
             other = c.execute("""SELECT MAX(a.ovr) as mo FROM ai_players a
@@ -3816,11 +4239,13 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
                 WHERE cn.grade IN ('S','A') AND l.tier=1 AND a.position IN ({})
                 """.format(",".join("'%s'" % pp for pp in ATTACK_POS))).fetchone()
             rival_ovr = other["mo"] if other and other["mo"] else 90
-            # 세계 최정상급(라이벌 -2 이내) + 압도적 시즌
-            # (골+도움 최소 기준 충족 또는 MVP 수상)
+            # 세계 최정상급(라이벌 -2 이내) + 압도적 성적(골+도움 또는 MVP)
+            # + 꾸준한 고평점(둘 다 충족해야 함 — 평점만 좋고 생산력 없거나,
+            #   반대로 생산력만 있고 기복이 심한 시즌은 발롱도르가 아니다).
             world_class = p.get("ovr",0) >= rival_ovr - 2
-            min_ga_for_ballon = max(6, round(11 * play_ratio))
-            dominant = (season_goals + season_assists >= min_ga_for_ballon) or mvp["is_mine"]
+            min_ga_for_ballon = max(6, round(GA_PER_GAME_FOR_BALLON * _played_equiv))
+            high_rating = season_rating >= BALLON_MIN_RATING
+            dominant = high_rating and ((season_goals + season_assists >= min_ga_for_ballon) or mvp["is_mine"])
             if world_class and dominant:
                 ballon = True
         if ballon:
@@ -3866,8 +4291,16 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
                     my_awards.append(("푸스카스상", f"{season_goals}골, 평점 {season_rating:.1f}"))
 
         # 사모라 상 (최저 실점 골키퍼 — 경기당 평균 실점 최소)
-        #   조건: GK && 1부리그 && (같은 리그 합산) 출전 >= ZAMORA_MIN_MATCHES
+        #   조건: GK && 1부리그 && (같은 리그 합산) 출전 >= 최소 출전(리그
+        #        실제 풀시즌의 60% — 실제 사모라상도 라리가 38경기 중
+        #        28경기 이상을 요구해 약 74%지만, 이 게임은 부상 등 변수로
+        #        너무 빡빡하면 거의 못 받으니 60%로 완화)
         #        && 경기당 1.2골 이하
+        #   [2026-07 버그 수정] ZAMORA_MIN_MATCHES=12(고정값)는 예전 14경기
+        #   체계 기준이라, 지금처럼 리그마다 풀시즌이 14~58경기로 다른
+        #   상황에서 그대로 쓰면 대형 리그에선 시즌 20%만 뛰어도 자격이
+        #   생기고 반대로 소형 리그에선 사실상 거의 전 경기를 요구하는
+        #   꼴이 된다. FULL_SEASON_MATCHES 기준 비율로 다시 잡는다.
         #   ※ 시즌 중 같은 리그 안에서 이적하면 두 팀 리그 기록을 합산한다
         #     (다른 리그로 옮기면 합치지 않음). _zamora_tally 참고.
         # [버그 수정 — 근본 원인] 원래 사모라상은 스페인 1부리그(라리가)
@@ -3879,7 +4312,8 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
             z_matches, z_ga = _zamora_tally(
                 c, p, year, league_id, lname,
                 p.get("season_matches", 0), season_goals_against)
-            if z_matches >= ZAMORA_MIN_MATCHES:
+            min_matches_for_zamora = max(6, round(0.6 * FULL_SEASON_MATCHES))
+            if z_matches >= min_matches_for_zamora:
                 my_ga_rate = z_ga / z_matches if z_matches > 0 else 999
                 # 대부분의 GK는 경기당 1.3~1.5골 실점, 우수한 GK는 1.0~1.2.
                 # 임계값 1.2 이하면 수상 가능.
@@ -3981,8 +4415,9 @@ def _end_of_season(p, year):
     _rs0 = p.get("season_rating_sum", 0.0)
     season_avg_rating = round(_rs0/_rc0, 2) if _rc0 else 6.0
 
-    # 1.5 개인 수상 산정 (통계 리셋 이전에 실행)
-    if p.get("season_matches", 0) >= 10:
+    # 1.5 개인 수상 산정 (통계 리셋 이전에 실행). 최소 출전 기준은 위
+    #     finalize_season_for_retire와 동일 원칙(리그 실제 풀시즌의 35%).
+    if p.get("season_matches", 0) >= max(6, round(0.35 * _league_full_season_matches(p))):
         _season_cs = _calc_clean_sheets_for_player(p)
         _process_awards(
             p, year,
@@ -4185,7 +4620,7 @@ def _end_of_season(p, year):
                                    allow_insert=False, exit_type="계약만료")
                 update_player(current_team_id=0, current_league_id=0,
                               salary=0, contract_years=0, contract_end_year=0,
-                              _contract_renew_offer=0)
+                              _contract_renew_offer=0, apply_attempts_used=0)
 
     if new_age >= MAX_AGE:
         add_log(f"⭐ {new_age}세. 선수 생활을 마감합니다.", "event", year, 52)
@@ -4297,7 +4732,7 @@ def _check_forced_release(p, year):
         add_log(f"😡 {reason}으로 방출!  {year}년  (평점 {avg_rating}, 감독관계 {rel}, 수준격차 {gap:+.0f})", "event", year, 52)
         update_player(current_team_id=0, current_league_id=0,
                       salary=0, manager_relation=50,
-                      contract_years=0, contract_end_year=0)
+                      contract_years=0, contract_end_year=0, apply_attempts_used=0)
 
 
 def _my_grade_tier(p):
@@ -4359,7 +4794,7 @@ def _try_sell_player(p, year, cur_ovr):
 
     # 새 팀으로 이적 (계약은 새로 — 나이/티어 기반)
     age_now = p.get("age", 25)
-    c_yrs = _calc_contract_years(age_now, row["tier"])
+    c_yrs = _calc_contract_years(age_now, row["tier"], row["country"])
     c_end = year + c_yrs   # 시즌 종료(52주) 시점이므로 다음 시즌부터 카운트
 
     global _pending_transfer_type
@@ -4371,6 +4806,22 @@ def _try_sell_player(p, year, cur_ovr):
     add_log(f"💸 {row['name']}로 팔림!  {row['lname']}({row['tier']}부)  "
             f"|  연봉 {fmt_money(new_salary)}  (몸값 대비 부진으로 손절)", "event", year, 52)
     return True
+
+
+def _promo_releg_count(team_count: int) -> int:
+    """리그 규모별 승강 팀 수 (2026-07 밸런스 개편 — 신민용 요청).
+    기존엔 리그 크기 무관하게 항상 1팀만 승강했었음(예: EPL도 1팀 강등).
+    실제 축구처럼 리그가 클수록 승강 인원도 늘어나게 조정:
+      16팀 미만: 1팀   16~19팀: 2팀   20~26팀: 3팀   27팀 이상: 4팀
+    (EPL 20팀 → 3팀 강등/승격, 실제 EPL과 동일)"""
+    if team_count < 16:
+        return 1
+    elif team_count < 20:
+        return 2
+    elif team_count <= 26:
+        return 3
+    else:
+        return 4
 
 
 def _process_promotion_relegation(year, season_avg_rating=6.0):
@@ -4386,7 +4837,8 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
     season = ss_row["current_season"] if ss_row else 1
 
     # ── 우승/승격 귀속 팀 판정 ──────────────────────
-    LEAGUE_END_WEEK = 35
+    from constants import SEASON_PHASES
+    LEAGUE_END_WEEK = SEASON_PHASES["second_half"][1]   # 클럽 시즌 종료 주차(신규 캘린더: 43)
 
     def _team_at_week35():
         try:
@@ -4476,6 +4928,16 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
     cids = list({r["country_id"] for r in all_leagues_rows
                  if r["tier"] == 1})
 
+    # [버그수정 2026-07] 승강제 경계 순회가 "for tier in [1,2,3,4]"로 고정돼
+    # 있어서 최대 5부(4↔5 경계)까지만 처리됐다 — 지금은 S급 5부제라 우연히
+    # 안 걸렸지만, 나중에 6부 이상으로 늘리면 5↔6 경계가 조용히 누락돼
+    # 그 밑 부수는 영원히 승강이 안 되는 버그가 생긴다. 나라별 실제 최대
+    # 부수를 여기서 한 번에 구해서, 몇 부가 됐든 모든 경계를 자동으로 돈다.
+    _country_max_tier_map: dict = {}
+    for (cid_, tier_) in _league_map:
+        if tier_ > _country_max_tier_map.get(cid_, 0):
+            _country_max_tier_map[cid_] = tier_
+
     # 모든 관련 리그 ID 수집 (맵 조회, DB 추가 접근 없음)
     all_league_ids = {lid for lid in _league_map.values()}
 
@@ -4493,6 +4955,54 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
             "FROM teams t JOIN leagues l ON t.league_id=l.id"
         ).fetchall()
     }
+
+    # [최적화] get_league_avg_ovr / get_league_strong_ovr 를 승강 경계마다
+    # 개별 SELECT(AVG/JOIN/GROUP BY)로 부르던 것을 제거.
+    # ai_players + teams를 각 1회만 읽어 팀별 ovr 리스트로 캐싱해두고,
+    # 아래 헬퍼가 그 캐시로 원본과 동일한 계산(리그 전체 평균 / 팀별 평균의
+    # 상위 분위)을 파이썬 메모리에서 수행한다. 판정 로직·반환값은 동일.
+    _team_league_of: dict = {
+        r["id"]: r["league_id"]
+        for r in c.execute("SELECT id, league_id FROM teams").fetchall()
+    }
+    _league_teams: dict = {}
+    for tid, lid in _team_league_of.items():
+        _league_teams.setdefault(lid, []).append(tid)
+    _player_ovrs_by_team: dict = {}
+    for r in c.execute("SELECT team_id, ovr FROM ai_players").fetchall():
+        _player_ovrs_by_team.setdefault(r["team_id"], []).append(r["ovr"])
+
+    def _cached_league_avg_ovr(league_id, exclude_team_id=None):
+        vals = []
+        for tid in _league_teams.get(league_id, []):
+            if tid == exclude_team_id:
+                continue
+            vals.extend(_player_ovrs_by_team.get(tid, []))
+        return (sum(vals) / len(vals)) if vals else None
+
+    def _cached_league_strong_ovr(league_id, pct=0.75, exclude_team_id=None):
+        team_avgs = []
+        for tid in _league_teams.get(league_id, []):
+            if tid == exclude_team_id:
+                continue
+            ovrs = _player_ovrs_by_team.get(tid, [])
+            if ovrs:
+                team_avgs.append(sum(ovrs) / len(ovrs))
+        if not team_avgs:
+            return None
+        vals = sorted(team_avgs)
+        idx = min(len(vals) - 1, max(0, int(round((len(vals) - 1) * pct))))
+        return vals[idx]
+
+    def _move_team_cache(team_id, new_league_id):
+        """DB의 teams.league_id UPDATE와 짝을 맞춰 캐시도 옮긴다.
+        이래야 뒤이은 티어 경계 계산(_cached_league_*)이, 매번 DB를 다시
+        조회하던 원본과 동일한 결과(이동한 팀을 반영한 값)를 낸다."""
+        old_lid = _team_league_of.get(team_id)
+        if old_lid is not None and team_id in _league_teams.get(old_lid, []):
+            _league_teams[old_lid].remove(team_id)
+        _league_teams.setdefault(new_league_id, []).append(team_id)
+        _team_league_of[team_id] = new_league_id
 
 
     pending_logs  = []
@@ -4523,7 +5033,8 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
     _rescale_jobs: list = []
 
     for cid in cids:
-        for tier in [1, 2, 3, 4]:
+        _max_tier_here = _country_max_tier_map.get(cid, 1)
+        for tier in range(1, _max_tier_here):   # 1↔2, 2↔3, ... (최대부-1)↔최대부 — 몇 부든 자동 커버
             ntier = tier + 1
             # [최적화] _league_map 조회 (기존: 개별 SELECT 440회 → 0회)
             upper_lid = _league_map.get((cid, tier))
@@ -4537,64 +5048,82 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
             if not upper_rows or not lower_rows:
                 continue
 
-            bottom_upper = upper_rows[-1]
-            top_lower    = lower_rows[0]
+            # [2026-07 밸런스 개편] 리그 크기에 따라 승강 인원(N)을 정한다.
+            # 기존엔 리그 규모 무관 항상 1팀만 승강했음(EPL 20팀도 1팀 강등).
+            n_move = _promo_releg_count(len(upper_rows))
+            # 안전장치: 아주 작은 리그(6~8팀 등)에서 승강 인원이 리그 절반을
+            # 넘어가지 않도록 상한(실제 데이터 범위-6~30팀-에선 발동 안 함).
+            n_move = max(1, min(n_move, len(upper_rows) // 2, len(lower_rows)))
 
-            if bottom_upper["id"] in moved_teams or top_lower["id"] in moved_teams:
+            bottom_upper_cands = [r for r in upper_rows[-n_move:] if r["id"] not in moved_teams]
+            top_lower_cands    = [r for r in lower_rows[:n_move] if r["id"] not in moved_teams]
+            # 승격 인원과 강등 인원이 달라지면 리그별 총 팀 수가 어긋나므로
+            # (moved_teams 필터링으로 한쪽이 줄었을 수 있음) 더 작은 쪽에 맞춘다.
+            n_actual = min(len(bottom_upper_cands), len(top_lower_cands))
+            if n_actual == 0:
                 continue
-
-            _tl = _team_info_cache.get(top_lower["id"])
-            _bu = _team_info_cache.get(bottom_upper["id"])
-            tl_info = {"name": _tl[0], "lname": _tl[1]} if _tl else None
-            bu_info = {"name": _bu[0], "lname": _bu[1]} if _bu else None
-            # [최적화] ci 커서 제거 - _team_info_cache 사용
-            if not tl_info or not bu_info:
-                continue
+            bottom_upper_list = bottom_upper_cands[:n_actual]
+            top_lower_list    = top_lower_cands[:n_actual]
 
             # [버그수정] 리스케일 목표치는 팀 이동 *전* 측정하되
             # 각 팀 본인을 제외한 순수 기존 팀 평균으로 산정.
-            # - 승격팀(top_lower) 목표: 상위 리그 기존 팀 평균 (승격팀 제외 불필요 — 아직 안 올라옴)
-            # - 강등팀(bottom_upper) 목표: 하위 리그 기존 팀 상위 75% (강등팀 제외 — 아직 안 내려옴)
+            # - 승격팀들 목표: 상위 리그 기존 팀 평균 (승격팀 제외 불필요 — 아직 안 올라옴)
+            # - 강등팀들 목표: 하위 리그 기존 팀 상위 75% (강등팀 제외 — 아직 안 내려옴)
             # tier 1→4 순서 루프이므로, 이전 tier에서 이동된 팀이
             # 현재 리그 평균에 포함될 수 있어 moved_teams 제외 처리.
-            _upper_avg = get_league_avg_ovr(upper_lid, conn)
-            _lower_strong = get_league_strong_ovr(lower_lid, 0.75, conn,
-                                                   exclude_team_id=bottom_upper["id"])
+            # 목표치는 승격/강등 인원 전체가 "그 리그에 새로 들어간다"는
+            # 공통 기준이므로 인원수와 무관하게 한 번만 계산해 재사용한다.
+            _upper_avg = _cached_league_avg_ovr(upper_lid)
+            _lower_strong = _cached_league_strong_ovr(lower_lid, 0.75)
 
-            # 승격: top_lower → upper
-            c.execute("UPDATE teams SET league_id=?,current_tier=? WHERE id=?",
-                      (upper_lid, tier, top_lower["id"]))
-            if _upper_avg is not None:
-                _rescale_jobs.append((top_lower["id"], _upper_avg))
-            if _lower_strong is not None:
-                _rescale_jobs.append((bottom_upper["id"], _lower_strong))
-            c.execute("INSERT INTO promotion_log(year,team_name,from_tier,to_tier,league_name) VALUES(?,?,?,?,?)",
-                      (year, tl_info["name"], ntier, tier, tl_info["lname"]))
-            tl_is_mine = (top_lower["id"] in my_season_teams)
-            if tl_is_mine or my_league_id in (upper_lid, lower_lid):
-                pending_logs.append((f"🔼 {year}년  {tl_info['name']}  {ntier}부→{tier}부  (승격)", "event"))
-            if top_lower["id"] == champ_team_id:
-                exist = c.execute(
-                    "SELECT id FROM trophy_log WHERE year=? AND team_name=? AND tier=?",
-                    (year, tl_info["name"], ntier)).fetchone()
-                if not exist:
-                    c.execute("INSERT INTO trophy_log(year,team_name,league_name,tier,competition) VALUES(?,?,?,?,?)",
-                              (year, tl_info["name"], tl_info["lname"], ntier,
-                               f"{tl_info['lname']} 우승 ({ntier}부 1위 → {tier}부 승격)"))
-                if top_lower["id"] == my_team_id:
-                    my_new_league = upper_lid
+            for top_lower in top_lower_list:
+                _tl = _team_info_cache.get(top_lower["id"])
+                if not _tl:
+                    continue
+                tl_info = {"name": _tl[0], "lname": _tl[1]}
 
-            # 강등: bottom_upper → lower
-            c.execute("UPDATE teams SET league_id=?,current_tier=? WHERE id=?",
-                      (lower_lid, ntier, bottom_upper["id"]))
-            c.execute("INSERT INTO promotion_log(year,team_name,from_tier,to_tier,league_name) VALUES(?,?,?,?,?)",
-                      (year, bu_info["name"], tier, ntier, bu_info["lname"]))
-            if bottom_upper["id"] == my_team_id or my_league_id in (upper_lid, lower_lid):
-                pending_logs.append((f"🔽 {year}년  {bu_info['name']}  {tier}부→{ntier}부  (강등)", "event"))
-            if bottom_upper["id"] == my_team_id:
-                my_new_league = lower_lid
-            moved_teams.add(bottom_upper["id"])
-            moved_teams.add(top_lower["id"])
+                # 승격: top_lower → upper
+                c.execute("UPDATE teams SET league_id=?,current_tier=? WHERE id=?",
+                          (upper_lid, tier, top_lower["id"]))
+                _move_team_cache(top_lower["id"], upper_lid)
+                if _upper_avg is not None:
+                    _rescale_jobs.append((top_lower["id"], _upper_avg))
+                c.execute("INSERT INTO promotion_log(year,team_name,from_tier,to_tier,league_name) VALUES(?,?,?,?,?)",
+                          (year, tl_info["name"], ntier, tier, tl_info["lname"]))
+                tl_is_mine = (top_lower["id"] in my_season_teams)
+                if tl_is_mine or my_league_id in (upper_lid, lower_lid):
+                    pending_logs.append((f"🔼 {year}년  {tl_info['name']}  {ntier}부→{tier}부  (승격)", "event"))
+                if top_lower["id"] == champ_team_id:
+                    exist = c.execute(
+                        "SELECT id FROM trophy_log WHERE year=? AND team_name=? AND tier=?",
+                        (year, tl_info["name"], ntier)).fetchone()
+                    if not exist:
+                        c.execute("INSERT INTO trophy_log(year,team_name,league_name,tier,competition) VALUES(?,?,?,?,?)",
+                                  (year, tl_info["name"], tl_info["lname"], ntier,
+                                   f"{tl_info['lname']} 우승 ({ntier}부 1위 → {tier}부 승격)"))
+                    if top_lower["id"] == my_team_id:
+                        my_new_league = upper_lid
+                moved_teams.add(top_lower["id"])
+
+            for bottom_upper in bottom_upper_list:
+                _bu = _team_info_cache.get(bottom_upper["id"])
+                if not _bu:
+                    continue
+                bu_info = {"name": _bu[0], "lname": _bu[1]}
+
+                # 강등: bottom_upper → lower
+                c.execute("UPDATE teams SET league_id=?,current_tier=? WHERE id=?",
+                          (lower_lid, ntier, bottom_upper["id"]))
+                _move_team_cache(bottom_upper["id"], lower_lid)
+                if _lower_strong is not None:
+                    _rescale_jobs.append((bottom_upper["id"], _lower_strong))
+                c.execute("INSERT INTO promotion_log(year,team_name,from_tier,to_tier,league_name) VALUES(?,?,?,?,?)",
+                          (year, bu_info["name"], tier, ntier, bu_info["lname"]))
+                if bottom_upper["id"] == my_team_id or my_league_id in (upper_lid, lower_lid):
+                    pending_logs.append((f"🔽 {year}년  {bu_info['name']}  {tier}부→{ntier}부  (강등)", "event"))
+                if bottom_upper["id"] == my_team_id:
+                    my_new_league = lower_lid
+                moved_teams.add(bottom_upper["id"])
 
         # teams 전적 초기화
         c.execute("""UPDATE teams SET wins=0,draws=0,losses=0,goals_for=0,goals_against=0
@@ -4604,11 +5133,14 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
     # [기능 변경] 이 리스케일 자체(승강팀 OVR을 새 리그 수준에 맞추는 것)는
     # 유지하되, "⚙️ ... 리그 적응" 로그는 요청에 따라 화면에 더 이상
     # 남기지 않는다(디버그성 정보라 매 시즌 로그가 지저분해짐).
-    for _tid, _target in _rescale_jobs:
-        try:
-            rescale_team_to_target_ovr(_tid, _target, conn)
-        except Exception as _e:
-            add_log(f"[리스케일 오류] team {_tid}: {_e}", "normal", year, 52)
+    # [최적화] 팀마다 개별 rescale_team_to_target_ovr() 호출(=팀 수만큼 개별
+    # SELECT) 대신, 배치 버전으로 대상 팀 전체를 한 번에 처리한다.
+    # 리그 수가 많은 세이브(수백~천 단위 이동팀)일수록 절감 효과가 크다.
+    # 계산 로직·결과는 rescale_team_to_target_ovr과 완전히 동일.
+    try:
+        rescale_teams_to_target_ovr_batch(_rescale_jobs, conn)
+    except Exception as _e:
+        add_log(f"[리스케일 오류] {_e}", "normal", year, 52)
 
     conn.commit()
     conn.close()
@@ -4733,11 +5265,12 @@ def _generate_all_league_schedules(season: int, year: int):
             (season,)).fetchall()
     }
 
-    # 리그별 팀 수에 맞는 더블 라운드로빈 총 경기 수(n*(n-1))를 완비 판정 기준으로 사용.
-    # 8팀 고정 56경기 가정을 제거해 팀 수가 리그마다 달라도 정확히 동작한다.
+    # 리그별 팀 수와 다전제(legs_for_team_count) 반영한 총 경기 수를 완비 판정
+    # 기준으로 사용 — 8팀 고정 56경기 가정을 제거해 리그마다 정확히 동작한다.
     need_league_ids = [
         lid for lid, tids in teams_by_league.items()
-        if len(tids) >= 2 and sched_counts.get(lid, 0) < len(tids) * (len(tids) - 1) * 0.8
+        if len(tids) >= 2
+        and sched_counts.get(lid, 0) < len(tids) * (len(tids) - 1) * (legs_for_team_count(len(tids)) // 2) * 0.8
     ]
     if not need_league_ids:
         conn.commit()
@@ -4745,73 +5278,57 @@ def _generate_all_league_schedules(season: int, year: int):
         return
 
     # 3) 대상 리그들의 이번 시즌 기존 경기(예정/완료 불문) 한 번에 조회 → 중복 방지 세트
+    #    day 기준으로 dedup (day가 라운드마다 항상 유일 — 팀 수가 많아 한 주에
+    #    라운드가 여러 개 몰리는 리그도 week만으로 구분하다 생기는 오매칭이 없다.
+    #    day가 없는(이 기능 이전) 과거 행은 집합에 넣지 않으며, 완비 여부는
+    #    위 2)의 카운트 체크가 별도로 지켜준다.)
     existing_by_league: dict = {}
     ph = ",".join("?" * len(need_league_ids))
     for r in c.execute(
-            f"""SELECT league_id, week, home_team_id, away_team_id FROM match_results
-                WHERE season=? AND league_id IN ({ph})""",
+            f"""SELECT league_id, day, home_team_id, away_team_id FROM match_results
+                WHERE season=? AND league_id IN ({ph}) AND day IS NOT NULL""",
             (season, *need_league_ids)):
         s = existing_by_league.setdefault(r["league_id"], set())
-        s.add((r["week"], r["home_team_id"], r["away_team_id"]))
-        s.add((r["week"], r["away_team_id"], r["home_team_id"]))
+        s.add((r["day"], r["home_team_id"], r["away_team_id"]))
+        s.add((r["day"], r["away_team_id"], r["home_team_id"]))
 
     new_rows = []
     for lid in need_league_ids:
         tids = teams_by_league[lid]
         existing_matches = existing_by_league.get(lid, set())
-        rounds = generate_round_robin(len(tids))  # 리그별 팀 수에 맞는 라운드 구성
-
-        for rd, matches in enumerate(rounds):
-            week = FIRST_HALF_START + rd
-            for hi, ai in matches:
-                if hi >= len(tids) or ai >= len(tids):
-                    continue
-                t1, t2 = (tids[hi], tids[ai]) if random.random() < 0.5 else (tids[ai], tids[hi])
-                key, rkey = (week, t1, t2), (week, t2, t1)
-                if key in existing_matches or rkey in existing_matches:
-                    continue
-                new_rows.append((lid, week, t1, t2, season, year))
-                existing_matches.add(key); existing_matches.add(rkey)
-
-        for rd, matches in enumerate(rounds):
-            week = SECOND_HALF_START + rd
-            first_half_week = FIRST_HALF_START + rd
-            for hi, ai in matches:
-                if hi >= len(tids) or ai >= len(tids):
-                    continue
-                flip1 = (first_half_week, tids[hi], tids[ai])
-                flip2 = (first_half_week, tids[ai], tids[hi])
-                if flip1 in existing_matches:
-                    t1, t2 = tids[ai], tids[hi]
-                elif flip2 in existing_matches:
-                    t1, t2 = tids[hi], tids[ai]
-                else:
-                    t1, t2 = (tids[ai], tids[hi]) if random.random() < 0.5 else (tids[hi], tids[ai])
-                key, rkey = (week, t1, t2), (week, t2, t1)
-                if key in existing_matches or rkey in existing_matches:
-                    continue
-                new_rows.append((lid, week, t1, t2, season, year))
-                existing_matches.add(key); existing_matches.add(rkey)
+        new_rows.extend(_build_league_schedule_rows(lid, tids, season, year, existing_matches))
 
     if new_rows:
         c.executemany("""INSERT INTO match_results
                          (league_id,week,home_team_id,away_team_id,
-                          home_score,away_score,season,year)
-                         VALUES(?,?,?,?,-1,-1,?,?)""", new_rows)
+                          home_score,away_score,season,year,day)
+                         VALUES(?,?,?,?,-1,-1,?,?,?)""", new_rows)
 
     conn.commit()
     conn.close()
 
 
 def generate_offers(count=5) -> list:
+    """[2026-07 재설계] count 파라미터는 더 이상 총 개수를 결정하지 않는다
+    (하위호환을 위해 시그니처만 유지) — 실제 개수는 상황별로 아래 상수에
+    고정되어 있다. 자세한 이유는 아래 주석 참고."""
     p = get_player()
     if not p: return []
 
-    # [기능3] 이적 요청 상태면 오퍼 개수 증가
+    # [2026-07 재설계] 오퍼/입단 개수 전면 개편(신민용 요청) — 상황별 고정 총량:
+    #   · 무소속(첫 입단/계약종료·방출 후 재취업 공통): 자국 10 + 타국 6 = 16
+    #     (+ 직접 지원 4는 UI에서 별도로 처리 — generate_offers는 패시브분만 담당)
+    #   · 소속 있음(이적시즌 오퍼): 현재 리그 국가 3 + 고향(대표국적) 3 + 타국 4 = 10
+    # 이적요청 중이면 기존처럼 보너스를 주되, 어느 구역이 늘어야 할지 애매하므로
+    # 전부 '타국' 구역에 더한다(해외로 더 넓게 알아본다는 느낌).
     from constants import TRANSFER_REQUEST_OFFER_BONUS
     transfer_req = bool(p.get("transfer_requested"))
-    if transfer_req:
-        count += TRANSFER_REQUEST_OFFER_BONUS
+    _bonus = TRANSFER_REQUEST_OFFER_BONUS if transfer_req else 0
+    NO_TEAM_DOMESTIC = 10
+    NO_TEAM_FOREIGN  = 6 + _bonus
+    HAS_TEAM_LEAGUE_COUNTRY = 3
+    HAS_TEAM_HOMETOWN       = 3
+    HAS_TEAM_FOREIGN        = 4 + _bonus
 
     conn = get_conn()
     c = conn.cursor()
@@ -5049,8 +5566,8 @@ def generate_offers(count=5) -> list:
             # 자국에 3부 리그 자체가 없으면 더는 강제하지 않음
 
         # 자국 팀 중 내 수준에 맞는 것만 우선
-        # [팀입단 확장] count(보통 10)의 절반은 자국, 절반은 타국으로 고정 분할.
-        domestic_count = count // 2
+        # [2026-07 재설계] 자국 10 + 타국 6 = 16 고정(기존엔 count//2로 가변적이었음).
+        domestic_count = NO_TEAM_DOMESTIC
         _dom_tiers = list(range(1, my_max_tier + 1))
         _dom_weights = tier_weights_by_ovr(ovr)[:my_max_tier]
         while len(offers) < domestic_count and tried < 80:
@@ -5073,9 +5590,10 @@ def generate_offers(count=5) -> list:
             offers.append(_build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary))
 
         # 자국에서 못 채웠거나 해외 슬롯이 남은 경우 → 타국으로 채움
-        if len(offers) < count:
+        _no_team_total = domestic_count + NO_TEAM_FOREIGN
+        if len(offers) < _no_team_total:
             tried2 = 0
-            while len(offers) < count and tried2 < 60:
+            while len(offers) < _no_team_total and tried2 < 60:
                 tried2 += 1
                 _grade_filter = random.choice(grades)   # DB 쿼리 필터용
                 _foreign_max = _country_max_tier(None)
@@ -5105,144 +5623,49 @@ def generate_offers(count=5) -> list:
         offers = _interleave(_dom_group, _for_group, [])
 
     elif not has_team:
-        # ── [팀입단 확장] 17세 이후 계약종료/방출 등으로 소속이 사라져
-        #    '오퍼'가 아닌 '팀 입단'으로 새 팀을 찾는 경우.
-        #    10개 = 좌측(직전 소속 리그 국가) 3 + 우측(고향=출생국적) 3 + 하단(타국) 4.
-        #    ※ 좌측은 대표국적(nationality)이 아니라 '직전까지 뛰던 리그의 국가'다.
-        #      예) 출생 모리타니, 바하마 1부에서 뛰다 계약종료 → 좌측=바하마, 우측=모리타니.
-        prev_country_id = None
-        row_prev = c.execute(
-            """SELECT team_id FROM career_entries
-               WHERE end_year>0 AND team_id>0
-               ORDER BY id DESC LIMIT 1"""
-        ).fetchone()
-        if row_prev and row_prev["team_id"]:
-            row_pc = c.execute(
-                """SELECT l.country_id FROM teams t
-                   JOIN leagues l ON t.league_id=l.id
-                   WHERE t.id=?""", (row_prev["team_id"],)
-            ).fetchone()
-            if row_pc:
-                prev_country_id = row_pc["country_id"]
-        if not prev_country_id:
-            # 직전 소속 팀 기록이 없으면(경력 자체가 없는 예외 케이스) 대표국적으로 대체
-            prev_country_id = my_country_id
-
-        _origin_nat = p.get("origin_nat") or nationality
-        origin_country_id = my_country_id
-        if _origin_nat and _origin_nat != nationality:
-            row_o = c.execute("SELECT id FROM countries WHERE name=?", (_origin_nat,)).fetchone()
-            if row_o:
-                origin_country_id = row_o["id"]
-
+        # ── [2026-07 재설계, 신민용 요청] 17세 이후 계약종료/방출 등으로 소속이
+        #    사라져 '오퍼'가 아닌 '팀 입단'으로 새 팀을 찾는 경우 — 예전엔
+        #    3(직전 리그 국가)+3(고향)+4(타국)=10이었는데, 이제 첫 입단과 완전히
+        #    같은 규칙(대표국적 자국 10 + 타국 6 = 16)으로 통일한다. 직접 지원
+        #    4개는 UI에서 별도(패시브 오퍼와 무관하게 항상 뜨는 채널)로 처리한다.
         _seen_ids = {o["team_id"] for o in offers}
-        _dom_group  = _fill_country_pool(prev_country_id, 3, _seen_ids)
-        _home_group = _fill_country_pool(origin_country_id, 3, _seen_ids)
-        _exclude_countries = {cid for cid in (prev_country_id, origin_country_id) if cid}
-        _for_group  = _fill_foreign_pool(count - len(_dom_group) - len(_home_group),
-                                          _exclude_countries, _seen_ids)
+        _dom_group = _fill_country_pool(my_country_id, NO_TEAM_DOMESTIC, _seen_ids)
+        _for_group = _fill_foreign_pool(NO_TEAM_FOREIGN, {my_country_id} if my_country_id else set(), _seen_ids)
 
-        for o in _dom_group:  o["_zone"] = "prev_league"
-        for o in _home_group: o["_zone"] = "hometown"
-        for o in _for_group:  o["_zone"] = "foreign"
-        offers = _interleave(_dom_group, _home_group, _for_group)
+        for o in _dom_group: o["_zone"] = "domestic"
+        for o in _for_group: o["_zone"] = "foreign"
+        offers = _interleave(_dom_group, _for_group, [])
     else:
-        # 일반 이적/입단 오퍼
-        # ── 현재 소속 리그의 국가 팀 우선 1~2개 ──────────────────
-        # 소속 리그가 있을 때: 해당 리그 국가 팀을 상단 1~2개에 배치
-        # 티어별 확률: 현재 내 티어 기준 (같은 티어 가장 높음)
+        # [2026-07 재설계, 신민용 요청] 일반 이적 오퍼(계약 중, 이적시즌 트리거는
+        # 기존 호출부(_auto_offer_shown/_offer_probability) 그대로 유지) — 예전엔
+        # "현재 리그 국가 1~2개 + (35세 이상이면) 자국 1개 + 나머지 완전 무작위"
+        # 였는데, 이제 첫 입단/무소속 재취업과 같은 3-분류 패턴으로 통일한다:
+        #   현재 뛰는 리그의 국가 3 + 고향(대표국적) 3 + 그 외 타국 4 = 10.
         cur_league_id = p.get("current_league_id", 0)
         league_country_id = None
-        my_current_tier = 3
         if cur_league_id:
             row_lg = c.execute(
-                "SELECT country_id, tier FROM leagues WHERE id=?", (cur_league_id,)
+                "SELECT country_id FROM leagues WHERE id=?", (cur_league_id,)
             ).fetchone()
             if row_lg:
                 league_country_id = row_lg["country_id"]
-                my_current_tier   = row_lg["tier"]
+        if not league_country_id:
+            league_country_id = my_country_id
 
-        if league_country_id:
-            # 현재 소속 리그 국가의 최대 tier
-            _home_max_tier = _country_max_tier(league_country_id)
-            # 티어 가중치: OVR 기반(성장 시 상위 리그로 이동) + 현재 티어를 약간 가산
-            tier_weights = list(tier_weights_by_ovr(ovr))[:_home_max_tier]
-            _cur_idx = min(my_current_tier - 1, len(tier_weights) - 1)
-            tier_weights[_cur_idx] = tier_weights[_cur_idx] + 15
-            _home_tiers = list(range(1, _home_max_tier + 1))
+        _seen_ids = {o["team_id"] for o in offers}
+        _league_group = _fill_country_pool(league_country_id, HAS_TEAM_LEAGUE_COUNTRY, _seen_ids)
+        # 고향(대표국적)이 현재 리그 국가와 같으면(외국인이 아니라 자국 리그에서
+        # 뛰는 경우) 굳이 같은 나라를 두 번 채울 필요 없이 그만큼 타국으로 돌린다.
+        _home_target = HAS_TEAM_HOMETOWN if my_country_id != league_country_id else 0
+        _home_group = _fill_country_pool(my_country_id, _home_target, _seen_ids) if _home_target else []
+        _exclude_countries = {cid for cid in (league_country_id, my_country_id) if cid}
+        _foreign_target = HAS_TEAM_FOREIGN + (HAS_TEAM_HOMETOWN - len(_home_group) if not _home_target else 0)
+        _for_group = _fill_foreign_pool(_foreign_target, _exclude_countries, _seen_ids)
 
-            home_league_count = random.choices([1, 2], weights=[40, 60])[0]  # 1개 or 2개
-            tried_home = 0
-            while len([o for o in offers if o.get("_home_league")]) < home_league_count and tried_home < 50:
-                tried_home += 1
-                tier = random.choices(_home_tiers, tier_weights)[0]
-                c.execute("""SELECT t.id,t.name,l.id as lid,l.name as lname,l.tier,
-                                    cn.name as country,cn.flag,cn.grade
-                             FROM teams t
-                             JOIN leagues l ON t.league_id=l.id
-                             JOIN countries cn ON l.country_id=cn.id
-                             WHERE cn.id=? AND l.tier=?
-                             ORDER BY RANDOM() LIMIT 1""", (league_country_id, tier))
-                row = c.fetchone()
-                if not row: continue
-                if any(o["team_id"] == row["id"] for o in offers): continue
-                if row["id"] == my_tid: continue
-                if not _team_fits_me(row): continue   # 내 OVR과 너무 차이나는 팀 제외
-                salary = int(_calc_salary(get_league_grade(row["country"], row["grade"]), tier, ovr, row["country"]) * random.uniform(0.85, 1.15))
-                offer = _build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary)
-                offer["_home_league"] = True  # 정렬용 플래그
-                offers.append(offer)
-
-        # 35세 이상이면 자국 팀 1개 추가 (소속 리그 국가와 다를 때만)
-        if age >= 35 and my_country_id and my_country_id != league_country_id:
-            _ret_tiers = list(range(1, my_max_tier + 1))
-            _ret_weights = tier_weights_by_ovr(ovr)[:my_max_tier]
-            tried_home = 0
-            while tried_home < 30:
-                tried_home += 1
-                tier = my_max_tier if force_max_tier else random.choices(_ret_tiers, _ret_weights)[0]
-                c.execute("""SELECT t.id,t.name,l.id as lid,l.name as lname,l.tier,
-                                    cn.name as country,cn.flag,cn.grade
-                             FROM teams t
-                             JOIN leagues l ON t.league_id=l.id
-                             JOIN countries cn ON l.country_id=cn.id
-                             WHERE cn.id=? AND l.tier=?
-                             ORDER BY RANDOM() LIMIT 1""", (my_country_id, tier))
-                row = c.fetchone()
-                if not row: continue
-                if any(o["team_id"] == row["id"] for o in offers): continue
-                if row["id"] == my_tid: continue
-                if not _team_fits_me(row): continue   # 내 OVR과 너무 차이나는 팀 제외
-                salary = int(_calc_salary(get_league_grade(row["country"], row["grade"]), tier, ovr, row["country"]) * random.uniform(0.85, 1.15))
-                offers.append(_build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary))
-                break
-
-        while len(offers) < count and tried < 120:
-            tried += 1
-            _grade_filter = random.choice(grades)   # DB 쿼리 필터용
-            _g_max = 3
-            _g_tws = tier_weights_by_ovr(ovr)[:_g_max]
-            tier  = _g_max if force_max_tier else random.choices(list(range(1, _g_max + 1)), _g_tws)[0]
-            c.execute("""SELECT t.id,t.name,l.id as lid,l.name as lname,l.tier,
-                                cn.name as country,cn.flag,cn.grade
-                         FROM teams t
-                         JOIN leagues l ON t.league_id=l.id
-                         JOIN countries cn ON l.country_id=cn.id
-                         WHERE cn.grade=? AND l.tier=?
-                         ORDER BY RANDOM() LIMIT 1""", (_grade_filter, tier))
-            row = c.fetchone()
-            if not row: continue
-            if any(o["team_id"] == row["id"] for o in offers): continue
-            if row["id"] == my_tid: continue
-            if not _team_fits_me(row): continue
-            salary = int(_calc_salary(get_league_grade(row["country"], row["grade"]), tier, ovr, row["country"]) * random.uniform(0.85, 1.15))
-            offers.append(_build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary))
-
-    # _home_league 플래그 있는 오퍼를 맨 앞으로 정렬
-    offers.sort(key=lambda o: 0 if o.get("_home_league") else 1)
-    # 플래그 제거 (UI에 노출 불필요)
-    for o in offers:
-        o.pop("_home_league", None)
+        for o in _league_group: o["_zone"] = "domestic"      # 현재 리그 국가
+        for o in _home_group:   o["_zone"] = "hometown"
+        for o in _for_group:    o["_zone"] = "foreign"
+        offers = _interleave(_league_group, _home_group, _for_group)
 
     # [17세 첫 입단 안전망] 협상을 모두 실패해도 입단할 곳이 사라지지 않도록,
     #   생성된 오퍼 중 연봉(=등급·티어와 직결)이 가장 낮은 1곳은 항상 입단 가능하게 표시.
@@ -5256,16 +5679,19 @@ def generate_offers(count=5) -> list:
     cur_week = st["current_week"] if st else 1
     offer_league_ids = list({o["league_id"] for o in offers})
 
-    if cur_week >= 5:
+    from constants import SEASON_PHASES as _SP2
+    _preseason_end = _SP2["preseason1"][1]     # 3
+    _league_end_wk2 = _SP2["second_half"][1]   # 43
+    if cur_week > _preseason_end:
         for lid in offer_league_ids:
-            if cur_week >= SECOND_HALF_START + 7:
-                # 36주~ 시즌 종료 후: '작년 성적'이 풀 시즌이 되도록 전체 일정 생성
+            if cur_week > _league_end_wk2:
+                # 시즌 종료 후: '작년 성적'이 풀 시즌이 되도록 전체 일정 생성
                 generate_season_schedule(lid, st["current_season"], st["current_year"])
             else:
                 # 시즌 중: 상반기 일정만 (입단 후 경기 일정 영향 방지)
                 _generate_first_half_schedule(lid, st["current_season"], st["current_year"])
             _sim_league_full(lid, st["current_season"])
-    else:  # 이슈5: 1~4주차는 작년 시즌(prev_season) 결과로 rank_info 계산
+    else:  # 이슈5: 프리시즌은 작년 시즌(prev_season) 결과로 rank_info 계산
         prev_season = st["current_season"] - 1 if st["current_season"] > 1 else None
         if prev_season:
             for lid in offer_league_ids:
@@ -5286,34 +5712,234 @@ def generate_offers(count=5) -> list:
     if transfer_req and offers:
         update_player(transfer_requested=0)
 
-    return offers[:count]
+    return offers
+
+
+# ═══════════════════════════════════════════════════════════════
+# [2026-07 신설] 직접 지원 — 내가 팀을 검색해서 골라 지원하는 능동적 채널.
+# 패시브 오퍼(generate_offers)와 별개 — 무소속(첫 입단/계약종료·방출 후)
+# 기간에만 가능하고, 시도 횟수가 제한된다(DIRECT_APPLY_MAX).
+#
+# 판정 공식(신민용과 합의한 설계):
+#   유효격차 = (내 OVR - 팀평균) + 등급별 마진 + 에이전트보정 + 폼보정
+#              + 나이보정 + 재능보정
+#   성공확률 = sigmoid(유효격차 / 8), 3~95%로 clamp
+#   단, 재능(talent_cap)이 그 등급 하한(TALENT_GATE_MIN_BY_GRADE)에 못 미치면
+#   다른 보정과 무관하게 사실상 불가능(0.5%)으로 고정.
+# ═══════════════════════════════════════════════════════════════
+
+DIRECT_APPLY_MAX = 4
+
+# 재능 하한선 — 이 등급에 못 미치는 talent_cap이면 그 리그 등급 지원은
+# 사실상 불가능(다른 보정 무시). SS/S=엘리트 이상(88), A=프로 이상(78),
+# B=세미프로 이상(69), C 이하는 사실상 누구나 도전 가능.
+TALENT_GATE_MIN_BY_GRADE = {"SS": 88, "S": 88, "A": 78, "B": 69, "C": 60, "D": 0, "E": 0, "F": 0}
+
+# 에이전트 등급별 지원 성공 보정치.
+AGENT_APPLY_MOD = {"S": 8, "A": 6, "B": 4, "C": 2, "D": 0, "E": -2, "F": -4}
+
+# 직전 시즌 평균평점 보정.
+_APPLY_FORM_RATING_MOD = [(7.5, 6), (7.0, 4), (6.5, 2)]
+
+# 직전 수상 보정(최고 하나만 적용).
+_APPLY_AWARD_MOD = {"발롱도르": 10, "MVP": 8, "득점왕": 6, "도움왕": 6, "베스트11": 4}
+
+# 일반 나이 보정(재능과 무관 — 너무 어리거나 너무 노쇠하면 리스크로 소폭 페널티).
+def _apply_age_mod(age: int) -> float:
+    if age <= 20: return -2
+    if age <= 29: return 0
+    if age <= 32: return -2
+    if age <= 35: return -5
+    return -9
+
+
+def _apply_recent_form_mod(p) -> float:
+    """직전 완료된 소속(career_entries 최신 1건) 평균평점 + 최근 수상 보정."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT avg_rating FROM career_entries WHERE end_year>0 ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    rating_mod = 0.0
+    if row and row["avg_rating"]:
+        r = row["avg_rating"]
+        for threshold, mod in _APPLY_FORM_RATING_MOD:
+            if r >= threshold:
+                rating_mod = mod
+                break
+        else:
+            if r < 6.0:
+                rating_mod = -3
+    award_row = conn.execute(
+        "SELECT award_type FROM awards WHERE is_mine=1 ORDER BY year DESC, id DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    award_mod = _APPLY_AWARD_MOD.get(award_row["award_type"], 0) if award_row else 0
+    return rating_mod + award_mod
+
+
+def _apply_talent_bonus(p) -> float:
+    """[2026-07 수정] 나이가중치를 고정 구간 대신 이 선수의 peak_age 기준으로
+    계산한다 — peak_age 이상이면(이미 전성기 지나 OVR이 떨어지기 시작하는
+    나이) 잠재력 보너스는 0(현재 OVR이 곧 실력). peak_age 전이면 남은
+    햇수에 비례해서 최대 0.5까지."""
+    talent_cap = p.get("talent_cap", 88)
+    my_ovr = p.get("ovr", 40)
+    age = p.get("age", 20)
+    peak_age = p.get("peak_age", 25)
+    if age >= peak_age:
+        youth_weight = 0.0
+    else:
+        years_left = peak_age - age
+        youth_weight = min(0.5, years_left * 0.05)
+    return max(0.0, talent_cap - my_ovr) * youth_weight
+
+
+def get_apply_attempts_left(p=None) -> int:
+    """직접 지원 남은 횟수. 소속 팀이 있으면(계약 중) 0 — 그 상태에선 직접
+    지원 자체가 불가능하다."""
+    p = p or get_player()
+    if not p or p.get("current_team_id"):
+        return 0
+    return max(0, DIRECT_APPLY_MAX - p.get("apply_attempts_used", 0))
+
+
+def get_apply_player_context(p=None):
+    """[2026-07 신설, 성능] 직접 지원 확률 계산 중 '팀과 무관한' 부분(에이전트/
+    폼/나이/재능)은 검색 결과가 몇 팀이든 플레이어 1명당 값이 동일하므로,
+    검색 결과 목록 전체에 대해 반복 계산하지 않도록 1회만 뽑아 재사용한다
+    (팀 검색 UI가 60건까지 한 화면에 확률을 다 보여주는데, 매 행마다
+    career_entries/awards 쿼리를 새로 날리면 검색할 때마다 체감 렉이 생김).
+    반환: dict(my_ovr, talent_cap, agent_mod, form_mod, age_mod, talent_mod)."""
+    p = p or get_player()
+    if not p:
+        return None
+    return {
+        "my_ovr": p.get("ovr", 40),
+        "talent_cap": p.get("talent_cap", 88),
+        "agent_mod": AGENT_APPLY_MOD.get(p.get("agent_grade", "F"), 0),
+        "form_mod": _apply_recent_form_mod(p),
+        "age_mod": _apply_age_mod(p.get("age", 20)),
+        "talent_mod": _apply_talent_bonus(p),
+    }
+
+
+def calc_apply_prob_with_context(team_id, ctx):
+    """get_apply_player_context()로 미리 뽑은 컨텍스트를 재사용해 팀 하나에
+    대한 확률만 계산 — 검색 결과 목록을 순회할 때 이걸 쓴다."""
+    if ctx is None:
+        return 0.0, True
+    conn = get_conn()
+    row = conn.execute(
+        """SELECT l.tier, cn.name as country, cn.grade as cgrade
+           FROM teams t JOIN leagues l ON t.league_id=l.id
+           JOIN countries cn ON l.country_id=cn.id WHERE t.id=?""", (team_id,)).fetchone()
+    if not row:
+        conn.close()
+        return 0.0, True
+    grade = get_league_grade(row["country"], row["cgrade"])
+    team_avg_row = conn.execute(
+        "SELECT AVG(ovr) as v FROM ai_players WHERE team_id=?", (team_id,)).fetchone()
+    conn.close()
+    team_avg = team_avg_row["v"] if team_avg_row and team_avg_row["v"] else 50
+
+    gate = TALENT_GATE_MIN_BY_GRADE.get(grade, 0)
+    if ctx["talent_cap"] < gate:
+        return 0.005, True   # 재능 미달 — 사실상 불가능
+
+    margin = CLUB_JOIN_MARGIN_BY_GRADE.get(grade, CLUB_JOIN_MARGIN)
+    gap = ctx["my_ovr"] - team_avg
+    eff = gap + margin + ctx["agent_mod"] + ctx["form_mod"] + ctx["age_mod"] + ctx["talent_mod"]
+    prob = 1.0 / (1.0 + math.exp(-eff / 8.0)) if abs(eff) < 700 else (1.0 if eff > 0 else 0.0)
+    prob = max(0.03, min(0.95, prob))
+    return prob, False
+
+
+def calc_apply_success_prob(team_id):
+    """직접 지원 성공 확률 계산 (팀 1개만 볼 때 편의용). 여러 팀을 한꺼번에
+    볼 때(검색 결과 목록)는 get_apply_player_context() + calc_apply_prob_with_context()
+    조합을 써서 플레이어측 계산을 반복하지 않는 편이 낫다.
+    반환: (prob: float, blocked: bool)."""
+    ctx = get_apply_player_context()
+    return calc_apply_prob_with_context(team_id, ctx)
+
+
+def apply_to_team(team_id):
+    """직접 지원 실행 — 시도 1회 소진(성공/실패 무관), 성공하면 그 팀
+    오퍼 dict를, 실패하면 None을 반환. 반환: (success, prob, offer)."""
+    p = get_player()
+    if not p or p.get("current_team_id"):
+        return False, 0.0, None
+    if get_apply_attempts_left(p) <= 0:
+        return False, 0.0, None
+
+    prob, blocked = calc_apply_success_prob(team_id)
+    update_player(apply_attempts_used=p.get("apply_attempts_used", 0) + 1)
+
+    if random.random() >= prob:
+        return False, prob, None
+
+    conn = get_conn()
+    row = conn.execute(
+        """SELECT t.id,t.name,l.id as lid,l.name as lname,l.tier,
+                  cn.name as country,cn.flag,cn.grade
+           FROM teams t JOIN leagues l ON t.league_id=l.id
+           JOIN countries cn ON l.country_id=cn.id WHERE t.id=?""", (team_id,)).fetchone()
+    conn.close()
+    if not row:
+        return False, prob, None
+
+    grade = get_league_grade(row["country"], row["grade"])
+    tier = row["tier"]
+    ovr = p.get("ovr", 40)
+    salary = int(_calc_salary(grade, tier, ovr, row["country"]) * random.uniform(0.95, 1.15))
+    offer = _build_offer(row, grade, tier, salary)
+    offer["_zone"] = "applied"
+    _rank_conn = get_conn()
+    offer["rank_info"] = _get_team_rank_info(_rank_conn.cursor(), team_id)
+    _rank_conn.close()
+    return True, prob, offer
 
 
 
-def _calc_contract_years(age: int, tier: int) -> int:
+def _calc_contract_years(age: int, tier: int, country: str = None) -> int:
+    """[2026-07 밸런스 조정] 계약 기간이 나이/티어에만 좌우되고 나라(리그 재정
+    수준)는 전혀 반영하지 않고 있었다 — EPL이든 최빈국 변방 리그든 유망주
+    계약 길이 분포가 완전히 동일했다(신민용 지적). 재정이 넉넉한 리그일수록
+    유망주를 장기계약으로 붙잡아두려는 유인이 크고, 반대로 재정이 빠듯한
+    나라는 방출/이탈 유연성을 위해 단기계약을 선호하는 경향을 반영한다.
+    country를 안 넘기면(기존 호출부 호환) 완전히 기존과 동일하게 동작한다."""
     if age <= 22:   base = random.choices([3,4,5], weights=[20,40,40])[0]
     elif age <= 29: base = random.choices([3,4],   weights=[40,60])[0]
     elif age <= 32: base = random.choices([1,2],   weights=[40,60])[0]
     else:           base = 1
     if tier == 1 and age >= 28: base = max(1, base - 1)
+
+    if country and tier == 1:
+        from constants import get_country_salary_mult
+        wealth = get_country_salary_mult(country)   # 대략 0.05(최빈국)~1.0(유럽 최상위)
+        if wealth < 0.3 and age <= 29:
+            # 재정 열악한 1부 리그 — 장기계약 리스크를 피해 한 해 짧게
+            base = max(1, base - 1)
+        elif wealth >= 0.9 and age <= 22:
+            # 최상위 부유 리그 — 유망주를 장기계약으로 조기에 묶어두는 경향
+            if random.random() < 0.3:
+                base = min(5, base + 1)
     return base
 
 
 def _offer_probability(p, week: int) -> float:
     agent_base = {"F":0.45,"E":0.55,"D":0.65,"C":0.75,"B":0.85,"A":0.92,"S":0.97}
     base = agent_base.get(p.get("agent_grade","F"), 0.45)
-    if 1 <= week <= 4:
+    if 1 <= week <= 3:
+        # 여름(프리시즌) 이적시장: 작년 풀시즌 평점 사용
         conn2 = get_conn()
         row2  = conn2.execute(
             "SELECT avg_rating FROM career_entries WHERE end_year>0 ORDER BY id DESC LIMIT 1"
         ).fetchone()
         conn2.close()
         rating = row2["avg_rating"] if row2 and row2["avg_rating"] else 6.0
-    elif week >= 36:
-        # 여름 이적시장(포스트시즌): 풀시즌 평점 사용
-        rc = p.get("season_rating_cnt",0); rs = p.get("season_rating_sum",0.0)
-        rating = round(rs/rc,2) if rc else p.get("first_half_rating", 0) or 6.0
     else:
+        # 겨울 이적시장: 겨울 창 진입 직전 스냅샷한 평점 사용
         rating = p.get("first_half_rating", 0)
         if not rating:
             rc = p.get("season_rating_cnt",0); rs = p.get("season_rating_sum",0.0)
@@ -5412,9 +6038,10 @@ def _enrich_offer(o: dict, row) -> dict:
 def _get_team_rank_info(c, team_id, ss=None) -> str:
     """이적 오퍼 카드용 순위/성적 문자열.
 
-    현재 주차에 따라 집계 범위 결정:
-    - 13~25주차 비시즌: 상반기(5~11주차) 결과만 → "상반기 성적"
-    - 37~52주차 / 새 시즌 1~4주차: 시즌 전체(5~32주차) 결과 → "작년 성적"
+    현재 주차에 따라 집계 범위 결정 (2026-07 캘린더 기준):
+    - 프리시즌(1~3주): 작년 시즌 전체 결과 → "작년 성적"
+    - 상반기 진행 중(4~22주): 이번 시즌 상반기까지 → "상반기 성적"
+    - 하반기 이후(23주~): 이번 시즌 지금까지(또는 끝났으면 전체) → "시즌 성적"
     승강전 팀이면 이전 리그도 표시.
     ss: season_state 행을 외부에서 주입 가능 (없으면 자체 조회).
     """
@@ -5432,15 +6059,13 @@ def _get_team_rank_info(c, team_id, ss=None) -> str:
     cur_week   = ss["current_week"]   if ss else 1
     cur_season = ss["current_season"] if ss else 1
 
+    from constants import SEASON_PHASES
+    _ps_s, _ps_e = SEASON_PHASES["preseason1"]
+    league_end_week = SEASON_PHASES["second_half"][1]   # 신규 캘린더: 43
+
     # 집계할 시즌과 주차 범위 결정
-    if 12 <= cur_week < SECOND_HALF_START:
-        # 상반기 비시즌(미드시즌): 이번 시즌 상반기(5~11주)만
-        season   = cur_season
-        week_min = FIRST_HALF_START
-        week_max = FIRST_HALF_START + 6
-        label    = "상반기 성적"
-    elif cur_week <= 4:
-        # 새 시즌 시작 전: 작년 시즌 전체 성적 표시
+    if cur_week <= _ps_e:
+        # 프리시즌: 작년 시즌 전체 성적 표시
         prev_season = cur_season - 1
         if prev_season < 1:
             return "(첫 시즌)"
@@ -5452,15 +6077,20 @@ def _get_team_rank_info(c, team_id, ss=None) -> str:
             return ""
         season   = prev_season
         week_min = FIRST_HALF_START
-        week_max = SECOND_HALF_START + 6
+        week_max = league_end_week
         label    = "작년 성적"
-    else:
-        # 36~52주(시즌 후): 방금 끝난 현재 시즌 전체
-        # (시즌 번호는 52→1주에 넘어가므로 직전 시즌 = cur_season ─ 버그 수정)
+    elif cur_week < SECOND_HALF_START:
+        # 상반기 진행 중: 이번 시즌 상반기까지
         season   = cur_season
         week_min = FIRST_HALF_START
-        week_max = SECOND_HALF_START + 6
-        label    = "작년 성적"
+        week_max = FIRST_HALF_START + 6
+        label    = "상반기 성적"
+    else:
+        # 하반기 이후: 이번 시즌 지금까지(진행 중이면 부분, 다 끝났으면 전체)
+        season   = cur_season
+        week_min = FIRST_HALF_START
+        week_max = min(max(cur_week - 1, FIRST_HALF_START), league_end_week)
+        label    = "시즌 성적"
 
     # 해당 시즌 해당 리그에서 집계 대상 팀 목록
     c.execute("""SELECT DISTINCT home_team_id as id FROM match_results
@@ -5692,9 +6322,14 @@ def _calc_salary(grade, tier, ovr, country=None):
 
     # 나라별 연봉 배율: override를 사용하지 않은 경우에만 적용
     # (override는 이미 나라별 절대값 — cont_mult 중복 적용 방지)
+    # [2026-07 버그 수정] 나라별 개별 배율(COUNTRY_SALARY_MULT)이 없는
+    # 나라는 전부 1.0(=유럽과 동일 재정)으로 처리되고 있었다 — 대륙별
+    # 배율(CONTINENT_SALARY_MULT)이 정의만 되고 실제로는 어디서도 안 쓰였기
+    # 때문. get_country_salary_mult()가 그 폴백을 실제로 적용한다(나라별
+    # 지정 → 없으면 대륙별 배율 → 그것도 없으면 1.0).
     if not is_special and country and not _used_override:
-        from constants import COUNTRY_SALARY_MULT
-        cont_mult = COUNTRY_SALARY_MULT.get(country, 1.0)
+        from constants import get_country_salary_mult
+        cont_mult = get_country_salary_mult(country)
         b = int(b * cont_mult)
 
     if b == 0:
@@ -5764,7 +6399,7 @@ def _save_career_entry(p, year, week, force_new=False, transfer_type=None,
     rank_str = get_team_rank(tid)
     try:
         rn = int(rank_str.split("위")[0].replace("공동","").strip())
-    except:
+    except (ValueError, AttributeError, IndexError):
         rn = 0
 
     sm  = p.get("season_matches", 0)
@@ -5891,8 +6526,10 @@ def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None
     p = get_player()
     conn = get_conn()
     c = conn.cursor()
-    c.execute("""SELECT t.name,t.formation,l.id as lid,l.name as lname,l.tier
+    c.execute("""SELECT t.name,t.formation,l.id as lid,l.name as lname,l.tier,
+                        cn.name as country
                  FROM teams t JOIN leagues l ON t.league_id=l.id
+                 JOIN countries cn ON l.country_id=cn.id
                  WHERE t.id=?""", (team_id,))
     row = c.fetchone()
     conn.close()
@@ -5937,13 +6574,14 @@ def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None
                 pass
 
     age_jt = p.get("age",17) if p else 17
-    c_yrs  = _calc_contract_years(age_jt, row["tier"])
+    c_yrs  = _calc_contract_years(age_jt, row["tier"], row["country"])
     # 계약 만료 연도 (만료는 해당 연도 52주차)
-    #  - 시즌 초(1~4주) 계약: 올해가 1년차 → cur_year + c_yrs - 1
+    #  - 시즌 초(프리시즌 1~3주) 계약: 올해가 1년차 → cur_year + c_yrs - 1
     #    예: 2008년 2주 1년계약 → 2008년 52주 만료
-    #  - 시즌 중(5주~) 계약: 올해는 미포함, 다음 시즌부터 카운트 → cur_year + c_yrs
+    #  - 시즌 중(4주~) 계약: 올해는 미포함, 다음 시즌부터 카운트 → cur_year + c_yrs
     #    예: 2008년 37주 1년계약 → 2009년 52주 만료
-    if cur_week <= 4:
+    from constants import SEASON_PHASES as _SP3
+    if cur_week <= _SP3["preseason1"][1]:
         c_end = cur_year + c_yrs - 1
     else:
         c_end = cur_year + c_yrs
@@ -6140,33 +6778,21 @@ def _generate_first_half_schedule(league_id, season, year):
     if len(tids) < 2:
         conn.close(); return
 
-    c.execute("""SELECT week, home_team_id, away_team_id FROM match_results
-                 WHERE league_id=? AND season=?""", (league_id, season))
+    c.execute("""SELECT day, home_team_id, away_team_id FROM match_results
+                 WHERE league_id=? AND season=? AND day IS NOT NULL""", (league_id, season))
     existing = set()
     for r in c.fetchall():
-        w, h, a = r["week"], r["home_team_id"], r["away_team_id"]
-        existing.add((w, h, a))
-        existing.add((w, a, h))  # 역방향도 등록
+        d, h, a = r["day"], r["home_team_id"], r["away_team_id"]
+        existing.add((d, h, a))
+        existing.add((d, a, h))  # 역방향도 등록
 
-    rounds = generate_round_robin(len(tids))  # 팀 수에 맞는 라운드 구성 (8팀 고정 제거)
-    new_rows = []
-    for rd, matches in enumerate(rounds):
-        week = FIRST_HALF_START + rd
-        for hi, ai in matches:
-            if hi >= len(tids) or ai >= len(tids): continue
-            t1, t2 = (tids[hi], tids[ai]) if random.random() < 0.5 else (tids[ai], tids[hi])
-            key  = (week, t1, t2)
-            rkey = (week, t2, t1)
-            if key in existing or rkey in existing: continue
-            new_rows.append((league_id, week, t1, t2, season, year))
-            existing.add(key)
-            existing.add(rkey)
+    new_rows = _build_league_schedule_rows(league_id, tids, season, year, existing, first_half_only=True)
 
     if new_rows:
         c.executemany("""INSERT INTO match_results
                          (league_id,week,home_team_id,away_team_id,
-                          home_score,away_score,season,year)
-                         VALUES(?,?,?,?,-1,-1,?,?)""", new_rows)
+                          home_score,away_score,season,year,day)
+                         VALUES(?,?,?,?,-1,-1,?,?,?)""", new_rows)
 
     conn.commit()
     conn.close()

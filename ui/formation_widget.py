@@ -27,7 +27,19 @@ def _players_for_team(team_id):
     rows = conn.execute(
         "SELECT * FROM ai_players WHERE team_id=? LIMIT 11", (team_id,)).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    return _mask_ai_names([dict(r) for r in rows])
+
+def _mask_ai_names(rows):
+    """[2026-07] 포메이션 화면에 실제 개인 이름 대신 'AI'만 표시한다 — 이미
+    국제대회(월드컵) 포메이션에서 상대/동료를 가상 선수로 만들 때 쓰던
+    "name":"AI" 표기를 클럽팀 포메이션에도 동일하게 적용한 것. 실제 이름
+    생성(data/names.py → player_names 테이블)은 계속 그대로 두고 다른
+    화면(스쿼드/이적시장/월드브라우저 등)에는 영향 없음 — 여기 포메이션
+    캔버스에 넘기기 직전에만 표시용으로 name을 덮어쓴다.
+    """
+    for r in rows:
+        r["name"] = "AI"
+    return rows
 
 def _avg_ovr(players):
     if not players: return 0
@@ -281,12 +293,12 @@ class _FormationCanvas(QWidget):
                       "position": p.get("position", "MF"),
                       "ovr": p.get("ovr", 40), "is_me": True,
                       **{s: p.get(s, 0) for s in ALL_STATS}}
-                ais = [dict(r) for r in conn.execute(
-                    "SELECT * FROM ai_players WHERE team_id=? LIMIT 10", (team_id,)).fetchall()]
+                ais = _mask_ai_names([dict(r) for r in conn.execute(
+                    "SELECT * FROM ai_players WHERE team_id=? LIMIT 10", (team_id,)).fetchall()])
                 self.players = [me] + ais
             else:
-                self.players = [dict(r) for r in conn.execute(
-                    "SELECT * FROM ai_players WHERE team_id=? LIMIT 11", (team_id,)).fetchall()]
+                self.players = _mask_ai_names([dict(r) for r in conn.execute(
+                    "SELECT * FROM ai_players WHERE team_id=? LIMIT 11", (team_id,)).fetchall()])
             conn.close()
 
         # 캐시 저장
