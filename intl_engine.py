@@ -117,6 +117,20 @@ def get_tournaments(year):
     return [dict(r) for r in rows]
 
 
+def _my_continent_key(p):
+    """플레이어 국적이 속한 연맹(4키: 유럽/아메리카/아시아/아프리카).
+    committed(확정 국적)가 있으면 그걸, 없으면 1국적 기준."""
+    nat = (p.get("intl_committed") or "") or (p.get("nationality") or "")
+    if not nat:
+        return None
+    conn = get_conn()
+    row = conn.execute("SELECT continent FROM countries WHERE name=?", (nat,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return _conf_key(row["continent"])
+
+
 def get_my_tournament(year=None, qual=None):
     """[복수대륙컵] '내가 실제로 출전 중/표시 대상'인 대회 1개를 선별 반환.
 
@@ -129,7 +143,7 @@ def get_my_tournament(year=None, qual=None):
       2) my_selected==3 (선택 대기) 대회
       3) 그 외 — 표시용 대표 대회
     """
-    from game_engine import get_state
+    from game_engine import get_state, get_player
     if year is None:
         st = get_state()
         if not st:
@@ -159,6 +173,16 @@ def get_my_tournament(year=None, qual=None):
     for t in ts:
         if t.get("my_selected") == 2 and t.get("kind") in ("world", "wc_qual"):
             return t
+    # [2026-07 버그수정, 신민용 리포트: "국대로 못 뽑히면 일정에 유럽권이
+    # 무조건 뜬다"] 대륙컵들이 유럽→아메리카→아시아→아프리카 순서로
+    # 생성되다 보니 유럽 대회가 항상 가장 작은 id를 가져서, 아래 표시용
+    # 폴백이 그냥 리스트의 첫 번째(=유럽)를 집어왔다. 내 국적이 속한
+    # 대륙 대회가 있으면 그걸 우선 보여준다.
+    _my_cont = _my_continent_key(get_player() or {})
+    if _my_cont:
+        for t in ts:
+            if t.get("my_selected") == 2 and _conf_key(t.get("continent") or "") == _my_cont:
+                return t
     for t in ts:
         if t.get("my_selected") == 2:
             return t
@@ -341,10 +365,28 @@ def choose_national_team(tournament_id, nat):
     #   동시에 1개만 존재하도록 보장한다. (명시적 거절 기록은 남기지 않음 —
     #   다른 나라를 골랐을 뿐이며, 이 나라로 cap-tie되면 다음 해부터 자동 정리됨.)
     if tyear is not None:
+        # [2026-07 버그수정, 신민용 리포트: "호주/앙골라 복수국적인데 호주를
+        # 선택했는데 커리어에 앙골라 대륙컵 경기도 같이 기록됨"] 대회
+        # 생성 시점엔 아직 선택 전이라 후보국(cand_nats) 경기 전부에
+        # is_my=1이 미리 찍혀 있다(발탁창 뜨기 전엔 어느 나라를 고를지
+        # 모르므로). 그런데 여기서 다른 대회를 my_selected=2로 닫을 때
+        # my_selected만 바꾸고 intl_matches.is_my는 그대로 1로 남겨뒀다 —
+        # 그래서 그 대회가 매주 AI 시뮬레이션될 때(_sim_ai_match)
+        # "m['is_my']==1"만 보고 내 경기로 착각해 커리어 로그에 그대로
+        # 찍혔다(고르지도 않은 나라의 결과가 "부상으로 결장"과 함께 남는
+        # 사고). 이제 다른 대회를 닫을 때 그 대회의 intl_matches.is_my도
+        # 함께 0으로 초기화해 완전히 "내 경기 아님" 처리한다.
+        _closed = [r["id"] for r in conn.execute(
+            "SELECT id FROM intl_tournaments WHERE year=? AND id<>? AND my_selected=3",
+            (tyear, tournament_id)).fetchall()]
         conn.execute(
             "UPDATE intl_tournaments SET my_selected=2 "
             "WHERE year=? AND id<>? AND my_selected=3",
             (tyear, tournament_id))
+        if _closed:
+            _ph = ",".join("?" * len(_closed))
+            conn.execute(f"UPDATE intl_matches SET is_my=0 WHERE tournament_id IN ({_ph})",
+                         _closed)
     conn.commit(); conn.close()
     # [국적 연혁] 본선 출전 확정 → 대표 국적 commit 기록 (중복은 add_nat_history가 무시)
     #   단, 예선(wc_qual)은 영구고정이 아니므로 commit 기록하지 않는다.
@@ -602,6 +644,7 @@ def get_my_match(week):
         "match_id": m["id"],
         "tournament_id": t["id"],
         "league_name": t["name"],
+        "kind": t.get("kind", ""),
         "stage": m["stage"],
         "stage_ko": STAGE_KO.get(m["stage"], m["stage"]),
         "grp": m["grp"],
@@ -726,10 +769,21 @@ def _close_other_pending_when_committed(year):
            WHERE year=? AND my_selected=1
              AND kind IN ('world','continent') LIMIT 1""", (year,)).fetchone()
     if has_committed:
+        # [2026-07 버그수정] choose_national_team의 동일 버그와 같은 이유로,
+        # 여기서 닫히는 대회들의 intl_matches.is_my도 함께 초기화해야
+        # "선택 안 한 나라 경기가 커리어에 같이 기록"되는 사고를 막는다.
+        _closed2 = [r["id"] for r in conn.execute(
+            """SELECT id FROM intl_tournaments
+               WHERE year=? AND my_selected=3 AND kind IN ('world','continent')""",
+            (year,)).fetchall()]
         conn.execute(
             """UPDATE intl_tournaments SET my_selected=2
                WHERE year=? AND my_selected=3 AND kind IN ('world','continent')""",
             (year,))
+        if _closed2:
+            _ph2 = ",".join("?" * len(_closed2))
+            conn.execute(f"UPDATE intl_matches SET is_my=0 WHERE tournament_id IN ({_ph2})",
+                         _closed2)
         conn.commit()
     conn.close()
 
@@ -918,7 +972,17 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
                 my_sel = 2
                 cand_nats = []
         elif cand_nats:
-            my_sel = 3   # 발탁창 제시
+            # [2026-07 신설, 신민용 요청: "16세에 대륙컵 발탁창이 뜨는데
+            # 이건 좀 비현실적이지 않나"] 대회 자체(전 세계 다른 나라들의
+            # 대륙컵 진행)는 그대로 두고, 내가 후보로 뽑힐 수 있는 최소
+            # 나이만 따로 제한한다 — 미달이면 그냥 "이 대회에 낄 수 있는
+            # 후보가 없음(my_sel=2)"과 동일하게 처리해 발탁창 자체가 안 뜬다.
+            from constants import MIN_INTL_CALLUP_AGE
+            if p.get("age", 0) < MIN_INTL_CALLUP_AGE:
+                my_sel = 2
+                cand_nats = []
+            else:
+                my_sel = 3   # 발탁창 제시
         else:
             my_sel = 2   # 이 대회에 낄 수 있는 보유 국적 없음
 
@@ -1034,7 +1098,7 @@ def _check_selection(p, my_grade):
 
     선발 기준을 클럽 선수 풀이 아니라 GRADE_TEAM_OVR(국대 경기 시뮬에 쓰는
     그 나라 평균 전력)에 정합시킨다. 선발 스케일 = 경기 스케일.
-      임계 = 국대평균 - 마진(톱권)
+      임계 = 국대평균 - 마진(톱권) + 부상/감독관계 페널티
       유효OVR = 내 OVR + 베테랑 보너스(최대 +5)
       → 유효OVR이 임계 이상이면 선발. 단 절대 하한 미달은 보너스로도 구제 불가.
 
@@ -1043,11 +1107,36 @@ def _check_selection(p, my_grade):
     피드백(OVR 83처럼 기량이 확실하면 소속 리그가 낮거나 그 시즌 출전이
     적어도 대표팀에 뽑히는 게 자연스럽다)에 따라 이제 순수하게
     OVR(+베테랑 보너스)만으로 판정한다.
+
+    [2026-07 추가, 신민용 요청] 부상 중이거나 소속팀 감독과 관계가 안
+    좋으면 대표팀 발탁이 불리해지도록 반영한다. "부상=무조건 탈락",
+    "관계 나쁨=무조건 탈락"처럼 완전 배제하면 너무 극단적이므로, 대신
+    임계값(threshold)을 조금 올리는 페널티로만 반영한다 — 실력이
+    확실히 앞서는 선수는 그래도 뽑히고, 애매한 선수만 이 페널티로
+    떨어지는 정도의 밸런스로 맞춘다.
     """
     nat_avg = GRADE_TEAM_OVR.get(my_grade, 45)
     threshold = nat_avg - INTL_SELECTION_MARGIN
     my_ovr = p.get("ovr", 0)
     eff_ovr = my_ovr + _vet_bonus(p.get("age", 25))
+
+    # [2026-07 신설] 최소 소집 연령 — 발탁 후보(cand_nats) 판정 단계에서
+    # 이미 걸러지지만, 다른 경로(예선 등)에서도 실수로 새지 않게 여기서도
+    # 한 번 더 막는다(이중 안전장치, 비용 거의 0).
+    from constants import MIN_INTL_CALLUP_AGE
+    if p.get("age", 0) < MIN_INTL_CALLUP_AGE:
+        return False
+
+    # 부상/감독관계 페널티 (완전 배제 아님 — 임계값만 소폭 상향)
+    penalty = 0.0
+    if p.get("injured"):
+        penalty += 4.0
+    rel = p.get("manager_relation", 50)
+    if rel < 30:
+        penalty += 3.0
+    elif rel < 50:
+        penalty += 1.5
+    threshold += penalty
 
     # 절대 하한: 베테랑 보너스로도 이 밑이면 탈락 (36세 60 같은 경우 차단)
     if my_ovr < threshold - INTL_SELECTION_MARGIN:
@@ -1478,10 +1567,19 @@ def _process_one_tournament_week(t, week):
     # 열고 commit/close 하던 것을, 한 커넥션·한 트랜잭션으로 일괄 처리.
     # 국제대회 주간에는 대회 여러 개(월드컵+대륙컵+예선 등)가 동시에 진행돼
     # pending이 수십~백 건 이상일 수 있어 개별 commit 누적 비용이 체감됨.
+    # [2026-07 추가 최적화] 개별 execute()도 batch에 모아 executemany()로
+    # 한 번에 반영 — champions_engine/cup_engine과 동일하게 "1주 진행"
+    # 체감 지연을 더 줄인다.
     if pending:
         conn2 = get_conn()
+        _batch = []
         for m in pending:
-            _sim_ai_match(t, m, conn=conn2)
+            _sim_ai_match(t, m, batch=_batch)
+        if _batch:
+            conn2.executemany(
+                """UPDATE intl_matches SET home_score=?, away_score=?,
+                   pso_winner=?, pso_score=?, day=?, my_absence_reason=? WHERE id=?""",
+                _batch)
         conn2.commit()
         conn2.close()
 
@@ -1612,12 +1710,18 @@ def _resolve_pso(h_ovr, a_ovr):
     return winner_home, score
 
 
-def _sim_ai_match(t, m, my_played=False, conn=None):
+def _sim_ai_match(t, m, my_played=False, conn=None, reason="injury", batch=None):
     """AI끼리(또는 내가 결장한 내 경기) 시뮬.
 
     conn: 외부에서 연 커넥션을 재사용해 다수 경기를 한 트랜잭션으로 묶는다
           (champions_engine._sim_ai_match와 동일한 패턴).
           None이면 자체 커넥션을 열고 commit/close(기존 동작 = 하위 호환).
+    reason: 내 경기인데 결장한 사유 — 'injury'(부상)/'suspension'(출전정지) 등.
+    batch: [2026-07 성능 최적화] 리스트를 넘기면 UPDATE를 즉시 실행하지 않고
+           이 리스트에 튜플만 쌓아둔다 — 호출부(_process_one_tournament_week)가
+           그 주 모든 국제대회 경기를 다 모은 뒤 executemany()로 한 번에
+           반영한다(월드컵/대륙컵은 한 라운드에 수십~수백 개국 경기가 동시에
+           돈다 — "1주 진행" 체감 지연을 줄인다).
     """
     from game_engine import add_log, get_player, _week_intl_cl_day
     he = _entry(t["id"], m["home"])
@@ -1637,20 +1741,33 @@ def _sim_ai_match(t, m, my_played=False, conn=None):
     # my_played=1(내 경기)로 조회될 때만 의미가 있으므로 AI끼리 경기에서는
     # 계산을 건너뛴다(월드컵/네이션스컵은 한 라운드에 수십~수백 개국 경기가
     # 동시에 도는데, 그때마다 get_player() DB 조회를 하던 낭비를 없앤다).
-    day = _week_intl_cl_day(m["week"], get_player() or {}) if m["is_my"] else 0
+    # [2026-07 버그수정] m["is_my"] 하나만 보고 "내 경기"로 취급하면, 복수
+    # 국적으로 후보에 올랐다가 다른 나라가 선택돼 이 대회는 my_selected=2로
+    # 닫혔는데도(선택 시점에 is_my가 항상 정리되도록 위쪽도 고쳤지만, 이미
+    # 오염된 기존 세이브에는 여전히 is_my=1이 남아있을 수 있다) 선택하지
+    # 않은 나라의 경기가 커리어 로그에 같이 찍히는 사고가 난다. 실제로
+    # "내 경기"인지는 is_my 플래그와 함께 그 대회가 현재 my_selected==1
+    # (정식 선택·출전 확정) 상태인지도 같이 봐야 한다.
+    _really_mine = bool(m["is_my"]) and t.get("my_selected") == 1
+    day = _week_intl_cl_day(m["week"], get_player() or {}) if _really_mine else 0
 
-    _own = conn is None
-    if _own:
-        conn = get_conn()
-    conn.execute("""UPDATE intl_matches SET home_score=?, away_score=?,
-                    pso_winner=?, pso_score=?, day=? WHERE id=?""",
-                 (hs, as_, pso_winner, pso_score, day, m["id"]))
-    if _own:
-        conn.commit()
-        conn.close()
+    _absence = reason if _really_mine else None
+    _row = (hs, as_, pso_winner, pso_score, day, _absence, m["id"])
+    if batch is not None:
+        batch.append(_row)
+    else:
+        _own = conn is None
+        if _own:
+            conn = get_conn()
+        conn.execute("""UPDATE intl_matches SET home_score=?, away_score=?,
+                        pso_winner=?, pso_score=?, day=?, my_absence_reason=? WHERE id=?""",
+                     _row)
+        if _own:
+            conn.commit()
+            conn.close()
 
     # 내 국가 경기(결장 포함)는 로그 출력. AI끼리 경기는 get_player() 불필요.
-    if m["is_my"]:
+    if _really_mine:
         p = get_player()
         nat = _my_nat(t, p)
         if nat in (m["home"], m["away"]):
@@ -1659,7 +1776,8 @@ def _sim_ai_match(t, m, my_played=False, conn=None):
             add_log(f"🌍 {t['name']} {stage_ko}  "
                     f"{he['flag']}{m['home']} {hs}-{as_} {ae['flag']}{m['away']}{pso_txt}", "match")
             if t["my_selected"] == 1 and not my_played:
-                add_log("   🚑 부상으로 대표팀 경기 결장", "match")
+                _reason_ko = {"injury": "부상", "suspension": "출전정지", "bench": "벤치"}.get(reason, reason)
+                add_log(f"   🚑 {_reason_ko}(으)로 대표팀 경기 결장", "match")
 
 
 def _winner_of(m):
@@ -1672,11 +1790,30 @@ def _winner_of(m):
 # 내 경기 시뮬
 # ─────────────────────────────────────────────
 
+def sim_my_match_as_ai(week, p, reason="injury"):
+    """[2026-07 신설, 버그수정] 부상 등으로 내가 못 뛸 때 내 국가대표 경기를
+    AI끼리 시뮬레이션 — cup_engine.sim_my_cup_match_as_ai와 동일한 이유로
+    신설(이게 없으면 그 경기가 영원히 미완료로 남아 대회 진행이 멈춘다)."""
+    info = get_my_match(week)
+    if not info:
+        return
+    conn = get_conn()
+    t = dict(conn.execute("SELECT * FROM intl_tournaments WHERE id=?",
+                          (info["tournament_id"],)).fetchone())
+    m = dict(conn.execute("SELECT * FROM intl_matches WHERE id=?",
+                          (info["match_id"],)).fetchone())
+    conn.close()
+    if m["home_score"] != -1:
+        return  # 이미 처리됨(멱등)
+    _sim_ai_match(t, m, my_played=False, reason=reason)
+
+
 def simulate_my_match(week, p):
     """내가 출전하는 국가대표 경기."""
     from game_engine import (add_log, get_player, update_player,
                              _player_perf, _my_result, _update_pop, _gen_score,
-                             _save_match_detail)
+                             _save_match_detail, _soft_cap,
+                             _check_suspended, _roll_red_card, _apply_red_card_dismissal)
     info = get_my_match(week)
     if not info:
         return
@@ -1712,11 +1849,31 @@ def simulate_my_match(week, p):
     is_home = info["is_home"]
     knockout = m["stage"] not in ("group", "qual_group")  # [버그수정] 예선 조별도 무승부 허용
 
+    # [2026-07 신설] 출전정지 체크 — 퇴장 다음 경기는 강제 결장.
+    _suspended, _new_susp = _check_suspended(p)
+    if _suspended:
+        update_player(red_card_suspension=_new_susp)
+        add_log(f"🟥 출전정지로 결장{'  (다음 경기부터 복귀)' if _new_susp == 0 else f'  (남은 정지 {_new_susp}경기)'}",
+                "event")
+
     # 내 출전 보너스 (격차 기반 에이스 영향력)
+    # [2026-07 통일] 리그(game_engine._simulate_match)와 동일한 볼록가속+
+    # 소프트캡 공식으로 교체 — 예전 선형+하드컷(14.0)보다 월드클래스급
+    # 선수의 캐리력이 정확히 반영된다.
     _my_ovr = p.get("ovr", 40)
     _team_ovr = he["ovr"] if is_home else ae["ovr"]
-    _gap = _my_ovr - _team_ovr
-    bonus = min(max(0.0, _gap) * 0.32 + _my_ovr * 0.05, 14.0)
+    _gap = max(0.0, _my_ovr - _team_ovr)
+    _star = 1.0 + max(0.0, (_my_ovr - 60) / 40.0) ** 1.8 * 3.0
+    bonus = _gap * 0.30 * _star + max(0.0, _my_ovr - 50) * 0.08
+    bonus = _soft_cap(bonus, 30.0)
+    # [2026-07 신설] '리더십' 성격의 team_win_bonus 연결 (정의만 돼있고
+    # 실제 경기엔 미연결 상태였음) — 캐리 보너스에 작은 배율만 얹는다.
+    from constants import PERSONALITY_EFFECTS
+    _pe = PERSONALITY_EFFECTS.get(p.get("personality", ""), {})
+    if "team_win_bonus" in _pe:
+        bonus *= (1.0 + _pe["team_win_bonus"])
+    if _suspended:
+        bonus = 0.0
     h_ovr = he["ovr"] + (bonus if is_home else 0)
     a_ovr = ae["ovr"] + (0 if is_home else bonus)
 
@@ -1727,12 +1884,28 @@ def simulate_my_match(week, p):
         pso_winner = m["home"] if win_home else m["away"]
     hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
 
-    # [수정] 국제대회 개인 경기력은 '상대 국가대표 평균 OVR'을 dom 기준으로 삼는다.
-    #   내가 홈이면 상대는 ae(원정), 원정이면 he(홈). 강팀 상대면 개인도 고전,
-    #   약체국 상대면 골·평점 폭발 — 클럽 리그 기준이 아니라 상대 국가 강함 반영.
-    _opp_ovr = (ae["ovr"] if is_home else he["ovr"])
-    goals, assists, saves, rating, events, detail = _player_perf(
-        p, outcome, is_home, hs, as_, opp_ovr=_opp_ovr)
+    if _suspended:
+        goals, assists, saves, rating = 0, 0, 0, 0.0
+        events, detail = [], {"shots": 0, "shots_on": 0, "key_passes": 0,
+                              "dribbles": 0, "blocks": 0, "pass_acc": 0.0}
+        _absence_reason = "suspension"
+    else:
+        # [수정] 국제대회 개인 경기력은 '상대 국가대표 평균 OVR'을 dom 기준으로
+        # 삼는다. 내가 홈이면 상대는 ae(원정), 원정이면 he(홈). 강팀 상대면
+        # 개인도 고전, 약체국 상대면 골·평점 폭발 — 클럽 리그 기준이 아니라
+        # 상대 국가 강함 반영.
+        _opp_ovr = (ae["ovr"] if is_home else he["ovr"])
+        goals, assists, saves, rating, events, detail = _player_perf(
+            p, outcome, is_home, hs, as_, opp_ovr=_opp_ovr)
+        _absence_reason = None
+        # [2026-07 신설] 퇴장 판정 — '폭력적' 성격의 red_card_chance 반영.
+        if _roll_red_card(p):
+            goals, assists, saves, rating, events, detail = _apply_red_card_dismissal(p)
+            _absence_reason = "red_card"
+    # [2026-07 신설] '소심함' 성격의 big_match_rating 연결 — 국가대표 경기는
+    # 전부 빅매치 성격이라(챔스와 동일 기준) 모든 경기에 적용한다.
+    if not _suspended and "big_match_rating" in _pe:
+        rating = max(3.0, min(10.0, round(rating + _pe["big_match_rating"], 1)))
     my_result = _my_result(outcome, is_home)
     my_conceded = (as_ if is_home else hs)
 
@@ -1743,18 +1916,18 @@ def simulate_my_match(week, p):
     conn = get_conn()
     conn.execute("""UPDATE intl_matches SET home_score=?, away_score=?,
                     pso_winner=?, pso_score=?,
-                    my_played=1, my_nat=?, my_position=?,
+                    my_played=?, my_nat=?, my_position=?,
                     my_saves=?, my_goals=?, my_assists=?, my_rating=?,
                     my_shots=?, my_shots_on=?, my_key_passes=?,
                     my_dribbles=?, my_blocks=?, my_pass_acc=?, my_conceded=?,
-                    day=?
+                    day=?, my_absence_reason=?
                     WHERE id=?""",
                  (hs, as_, pso_winner, pso_score,
-                  nat, _get_field_pos(p),
+                  0 if _suspended else 1, nat, _get_field_pos(p),
                   saves, goals, assists, rating,
                   detail["shots"], detail["shots_on"], detail["key_passes"],
                   detail["dribbles"], detail["blocks"], detail["pass_acc"],
-                  my_conceded, day, m["id"]))
+                  my_conceded, day, _absence_reason, m["id"]))
     conn.commit()
     conn.close()
 
@@ -2526,16 +2699,23 @@ def get_my_intl_matches(only_qual=False):
         f"""SELECT m.*, t.year AS t_year, t.name AS comp
            FROM intl_matches m
            JOIN intl_tournaments t ON m.tournament_id = t.id
-           WHERE m.my_played = 1 AND {kind_filter}
+           WHERE (m.my_played = 1 OR m.my_absence_reason IS NOT NULL) AND {kind_filter}
            ORDER BY t.year, m.week""").fetchall()]
     flags = {(r["tournament_id"], r["country"]): r["flag"]
              for r in conn.execute(
                  "SELECT tournament_id, country, flag FROM intl_entries").fetchall()}
     conn.close()
 
+    from game_engine import get_player
+    p = get_player()
+    # [2026-07 수정] 결장(부상/출전정지) 경기는 my_nat이 안 남겨져 있으므로
+    # (실제로 뛴 경기만 my_nat을 기록했음), 현재 확정된 국적(intl_committed)을
+    # 대신 써서 홈/원정을 판별한다 — 대표팀 국적은 첫 A매치 이후 보통 고정.
+    _committed_nat = (p.get("intl_committed") or "") if p else ""
+
     out = []
     for m in rows:
-        nat = m["my_nat"]
+        nat = m["my_nat"] or _committed_nat
         is_home = (m["home"] == nat)
         opp  = m["away"] if is_home else m["home"]
         my_s = m["home_score"] if is_home else m["away_score"]
@@ -2574,6 +2754,7 @@ def get_my_intl_matches(only_qual=False):
             "key_passes": m.get("my_key_passes", 0), "dribbles": m.get("my_dribbles", 0),
             "blocks": m.get("my_blocks", 0), "pass_acc": m.get("my_pass_acc", 0),
             "score": f"{my_s}-{op_s}", "result": result,
+            "absence_reason": m.get("my_absence_reason"),
         })
     return out
 

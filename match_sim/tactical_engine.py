@@ -215,7 +215,17 @@ def _resolve_shot(rng, side, lane, minute, shooter_pool, opp_gk_q, home_stats, a
         return None
 
     stats["shots_on"] += 1
-    save_p = max(0.08, min(0.85, 0.5 + (opp_gk_q - shot_stat) / 120.0))
+    # [버그수정 2026-07, 신민용 지적: "EPL에서 2-9, 7-0 같은 스코어가
+    # 너무 자주 나온다 — 현실에서 10:1은 진짜 실력차 없인 안 나온다"]
+    # 실측: 동일 능력치(78) 두 팀 400경기를 이 함수 그대로 돌려보니 경기당
+    # 평균 총골 3.46(실제 EPL 2.6~2.8 대비 25%+ 높음), 6골 이상 경기가
+    # 14.5%(실제는 3~5% 수준)나 나왔다 — save_p 기준값(0.5)이 너무 낮아서
+    # (유효슈팅의 절반만 막힘) 골 전환율이 실제 축구보다 높게 잡혀 있던
+    # 게 원인. 기준값을 0.63으로 올리니 동일 조건에서 평균 2.67골, 6골+
+    # 비율 6.0%로 실제 축구 근처까지 내려왔다(실력차가 진짜로 큰 대진,
+    # 예: OVR 90 vs 60은 여전히 평균 6.5:0.05로 확실하게 압도함 — 이건
+    # 랜덤 블로아웃이 아니라 진짜 실력차 블로아웃이라 그대로 유지됨).
+    save_p = max(0.08, min(0.90, 0.63 + (opp_gk_q - shot_stat) / 120.0))
     if rng.random() < save_p:
         plog.append({"min": float(minute), "team": side, "zone": "att", "lane": lane,
                      "outcome": "save", "me": False, "text": None})

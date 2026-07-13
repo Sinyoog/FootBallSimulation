@@ -238,9 +238,15 @@ def get_league_standings_for_browser(league_id, season=None, year=None):
         year = st["current_year"] if st else 2000
 
     conn = get_conn()
+    # [2026-07 수정] archive_old_seasons()로 과거 시즌이 match_results_archive로
+    # 옮겨지므로, 여기서 match_results만 세면 이미 완료·보관된 과거 시즌을
+    # "일정이 없다(cnt==0)"고 오판해 그 시즌을 엉뚱하게 재생성/재시뮬레이션
+    # 하게 된다 — 두 테이블을 합쳐서 세야 한다.
     cnt = conn.execute(
-        "SELECT COUNT(*) n FROM match_results WHERE league_id=? AND season=?",
-        (league_id, season)).fetchone()["n"]
+        """SELECT (SELECT COUNT(*) FROM match_results WHERE league_id=? AND season=?)
+                 + (SELECT COUNT(*) FROM match_results_archive WHERE league_id=? AND season=?)
+           AS n""",
+        (league_id, season, league_id, season)).fetchone()["n"]
     conn.close()
 
     if cnt == 0:
@@ -299,11 +305,17 @@ def get_league_champions(league_id, limit=30):
             (lg_row["country_id"], lg_row["tier"] + 1)).fetchone()
         has_lower = lr is not None
 
+    # [2026-07 수정] archive_old_seasons()로 과거 시즌이 match_results_archive로
+    # 옮겨지므로, 여기서도 두 테이블을 합쳐서 시즌 목록을 뽑아야 예전처럼
+    # 모든 완료 시즌이 다 나온다.
     season_rows = conn.execute(
         """SELECT DISTINCT season, year FROM match_results
            WHERE league_id=? AND home_score>=0
+           UNION
+           SELECT DISTINCT season, year FROM match_results_archive
+           WHERE league_id=? AND home_score>=0
            ORDER BY season DESC LIMIT ?""",
-        (league_id, limit)).fetchall()
+        (league_id, league_id, limit)).fetchall()
 
     out = []
     for sr in season_rows:
@@ -358,7 +370,9 @@ def get_league_champions(league_id, limit=30):
 def _get_cup_placements(tournament_id, conn):
     """결승(+3·4위전) cup_matches 결과로 1~4위 team_id를 도출.
     cup_history는 '내 팀'의 결과만 기록하므로, 모든 나라/모든 시즌의
-    우승/준우승을 보여주려면 이렇게 경기 결과에서 직접 뽑아야 한다."""
+    우승/준우승을 보여주려면 이렇게 경기 결과에서 직접 뽑아야 한다.
+    [주의] 대회 하나만 볼 때 쓰는 함수 — 여러 대회를 한꺼번에 나열할 때는
+    _batch_cup_placements()를 써서 대회 수만큼 쿼리가 늘어나지 않게 한다."""
     from cup_engine import _winner_of
     fm = conn.execute(
         """SELECT * FROM cup_matches WHERE tournament_id=? AND round_name='결승'
@@ -381,6 +395,43 @@ def _get_cup_placements(tournament_id, conn):
     return {"winner": winner, "runner_up": runner_up, "third": third, "fourth": fourth}
 
 
+def _batch_cup_placements(tournament_ids, conn):
+    """[2026-07 성능개선] _get_cup_placements를 대회마다 호출하면 대회 하나당
+    SELECT 2번(결승/3·4위전)이 나가 목록 조회(최대 30개)마다 최대 60번 왕복이
+    발생했다. tournament_id IN 배치 쿼리 1번으로 관련 경기를 전부 가져온 뒤
+    파이썬에서 (tournament_id, round_name)별로 묶어 마지막 행(=원래
+    'ORDER BY id DESC LIMIT 1'과 동일)만 취한다 — 판정 로직/반환값은
+    _get_cup_placements와 완전히 동일, 반환 형태만 {tournament_id: dict}."""
+    from cup_engine import _winner_of
+    if not tournament_ids:
+        return {}
+    ph = ",".join("?" * len(tournament_ids))
+    rows = conn.execute(
+        f"""SELECT * FROM cup_matches WHERE tournament_id IN ({ph})
+            AND round_name IN ('결승','3·4위전') AND home_score>=0
+            ORDER BY id""", list(tournament_ids)).fetchall()
+    # (tournament_id, round_name) -> 마지막(최대 id) 행. id ASC로 정렬해서
+    # 순회하며 계속 덮어쓰면 자동으로 "그 그룹의 최대 id 행"만 남는다.
+    latest = {}
+    for r in rows:
+        latest[(r["tournament_id"], r["round_name"])] = dict(r)
+
+    out = {}
+    for tid in tournament_ids:
+        fm = latest.get((tid, "결승"))
+        if not fm:
+            continue
+        winner = _winner_of(fm)
+        runner_up = fm["away_team_id"] if winner == fm["home_team_id"] else fm["home_team_id"]
+        third = fourth = None
+        tp = latest.get((tid, "3·4위전"))
+        if tp:
+            third = _winner_of(tp)
+            fourth = tp["away_team_id"] if third == tp["home_team_id"] else tp["home_team_id"]
+        out[tid] = {"winner": winner, "runner_up": runner_up, "third": third, "fourth": fourth}
+    return out
+
+
 def get_cup_history(country_id, limit=30):
     """특정 국가의 역대 국내 컵대회(FA컵식) 우승/준우승/3·4위 기록.
 
@@ -398,8 +449,10 @@ def get_cup_history(country_id, limit=30):
 
     placements_by_row = []
     all_tids = set()
+    tournament_ids = [r["id"] for r in rows]
+    placements_map = _batch_cup_placements(tournament_ids, conn)
     for r in rows:
-        pl = _get_cup_placements(r["id"], conn)
+        pl = placements_map.get(r["id"])
         placements_by_row.append(pl)
         if pl:
             for key in ("winner", "runner_up", "third", "fourth"):
@@ -503,7 +556,9 @@ def has_cup_data(country_id):
 # ─────────────────────────────────────────
 def _get_cl_placements(tournament_id, conn):
     """결승(F)+3/4위전(TP) cl_matches 결과로 1~4위 team_id를 도출.
-    intl_engine 쪽 _get_placements와 동일한 패턴, team_id(정수) 기준만 다름."""
+    intl_engine 쪽 _get_placements와 동일한 패턴, team_id(정수) 기준만 다름.
+    [주의] 대회 하나만 볼 때 쓰는 함수 — 여러 대회를 한꺼번에 나열할 때는
+    _batch_cl_placements()를 써서 대회 수만큼 쿼리가 늘어나지 않게 한다."""
     from champions_engine import _winner_of
     fm = conn.execute(
         "SELECT * FROM cl_matches WHERE tournament_id=? AND stage='F' "
@@ -526,6 +581,39 @@ def _get_cl_placements(tournament_id, conn):
     return {"winner": winner, "runner_up": runner_up, "third": third, "fourth": fourth}
 
 
+def _batch_cl_placements(tournament_ids, conn):
+    """[2026-07 성능개선] _get_cl_placements의 대회당 SELECT 2번을
+    tournament_id IN 배치 쿼리 1번으로 통합 (get_cl_history의 limit=100
+    기본값 기준 최대 200회 왕복 → 1회). 판정 로직은 완전히 동일하고
+    반환 형태만 {tournament_id: dict}."""
+    from champions_engine import _winner_of
+    if not tournament_ids:
+        return {}
+    ph = ",".join("?" * len(tournament_ids))
+    rows = conn.execute(
+        f"""SELECT * FROM cl_matches WHERE tournament_id IN ({ph})
+            AND stage IN ('F','TP') AND home_score>=0
+            ORDER BY id""", list(tournament_ids)).fetchall()
+    latest = {}
+    for r in rows:
+        latest[(r["tournament_id"], r["stage"])] = dict(r)
+
+    out = {}
+    for tid in tournament_ids:
+        fm = latest.get((tid, "F"))
+        if not fm:
+            continue
+        winner = _winner_of(fm)
+        runner_up = fm["away_team_id"] if winner == fm["home_team_id"] else fm["home_team_id"]
+        third = fourth = None
+        tp = latest.get((tid, "TP"))
+        if tp:
+            third = _winner_of(tp)
+            fourth = tp["away_team_id"] if third == tp["home_team_id"] else tp["home_team_id"]
+        out[tid] = {"winner": winner, "runner_up": runner_up, "third": third, "fourth": fourth}
+    return out
+
+
 def get_cl_history(continent=None, limit=100):
     """완료된 챔피언스리그 대회의 연도별 1~4위(팀명+국가+국기) 목록.
     cl_tournaments.winner_team_id는 대회가 실제로 끝났을 때만 채워지므로
@@ -545,8 +633,10 @@ def get_cl_history(continent=None, limit=100):
     # 대회별 1~4위 team_id 도출
     placements_by_row = []
     all_tids = set()
+    tournament_ids = [r["id"] for r in rows]
+    placements_map = _batch_cl_placements(tournament_ids, conn)
     for r in rows:
-        pl = _get_cl_placements(r["id"], conn) or {}
+        pl = placements_map.get(r["id"]) or {}
         placements_by_row.append(pl)
         for key in ("winner", "runner_up", "third", "fourth"):
             if pl.get(key):
@@ -606,15 +696,54 @@ def _get_placements(tournament_id, conn):
     return {"winner": winner, "runner_up": runner_up, "third": third, "fourth": fourth}
 
 
+def _batch_placements(tournament_ids, conn):
+    """[2026-07 성능개선] _get_placements의 대회당 SELECT 2번을 tournament_id
+    IN 배치 쿼리 1번으로 통합 (get_wc_history/get_continental_cup_history의
+    limit=100 기본값 기준 최대 200회 왕복 → 1회). _get_placements는 ORDER BY
+    없이 fetchone()으로 '첫 매치'를 취했으므로, 여기서도 id 오름차순으로
+    순회하며 그룹당 처음 나온 행만 남겨 동일한 결과를 보장한다."""
+    from intl_engine import _winner_of
+    if not tournament_ids:
+        return {}
+    ph = ",".join("?" * len(tournament_ids))
+    rows = conn.execute(
+        f"""SELECT * FROM intl_matches WHERE tournament_id IN ({ph})
+            AND stage IN ('F','TP') AND home_score>=0
+            ORDER BY id""", list(tournament_ids)).fetchall()
+    first = {}
+    for r in rows:
+        key = (r["tournament_id"], r["stage"])
+        if key not in first:
+            first[key] = dict(r)
+
+    out = {}
+    for tid in tournament_ids:
+        fm = first.get((tid, "F"))
+        if not fm:
+            continue
+        winner = _winner_of(fm)
+        runner_up = fm["away"] if winner == fm["home"] else fm["home"]
+        third = fourth = None
+        tp = first.get((tid, "TP"))
+        if tp:
+            third = _winner_of(tp)
+            fourth = tp["away"] if third == tp["home"] else tp["home"]
+        out[tid] = {"winner": winner, "runner_up": runner_up, "third": third, "fourth": fourth}
+    return out
+
+
 def _attach_placements_and_flags(rows, conn):
     """intl_tournaments 행 목록에 1~4위 국가명 + 국기를 채워 넣는다.
     [최적화] 국기는 대회마다 개별 조회하지 않고, 전체 대회에서 등장한
-    국가명을 모아 1회 IN 쿼리로 일괄 조회한다 (완료 대회 수가 적어 원래도
-    가벼운 조회지만, 여러 대회를 한 화면에 나열할 때 왕복 횟수를 줄인다)."""
+    국가명을 모아 1회 IN 쿼리로 일괄 조회한다. [2026-07] 대회별 결승/3·4위전
+    조회 자체도 _batch_placements()로 배치 처리해 대회 수만큼 왕복이
+    늘어나지 않게 한다."""
     placements_by_row = []
     all_names = set()
+    tournament_ids = [r["id"] for r in rows]
+    placements_map = _batch_placements(tournament_ids, conn)
     for r in rows:
-        pl = _get_placements(r["id"], conn) or {}
+        pl = placements_map.get(r["id"]) or {}
         placements_by_row.append(pl)
         for key in ("winner", "runner_up", "third", "fourth"):
             if pl.get(key):
@@ -766,7 +895,7 @@ def get_wc_qualifier_summary(wc_year):
 # ─────────────────────────────────────────
 # 7. 대회 상세 — 챔피언스리그
 # ─────────────────────────────────────────
-_CL_KO_STAGE_ORDER = ["PO", "R16", "QF", "SF", "TP", "F"]
+_CL_KO_STAGE_ORDER = ["PO", "R32", "R16", "QF", "SF", "TP", "F"]
 
 
 def get_cl_tournament_detail(tournament_id):

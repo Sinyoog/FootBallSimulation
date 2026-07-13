@@ -422,6 +422,20 @@ def init_db():
         home_team_id INTEGER, away_team_id INTEGER,
         home_score INTEGER DEFAULT -1, away_score INTEGER DEFAULT -1,
         season INTEGER, year INTEGER)""")
+    # [2026-07 신설, 성능] 시즌 전환(52→1주) 시마다 match_results가 시즌당
+    # ~17만 행씩 영구히 쌓여서(지우는 로직이 없었음), 시즌이 쌓일수록 다음
+    # 시즌 일정 INSERT 비용이 계속 늘어나는 문제가 있었다(6개 인덱스 갱신
+    # 비용이 테이블 크기에 비례). 완료된 과거 시즌은 이 아카이브 테이블로
+    # 옮기고 match_results는 '진행 중인 이번 시즌'만 유지한다 — world_browser의
+    # 역대 순위/우승팀 조회는 두 테이블을 함께 보도록 수정했으므로(get_league_
+    # standings 등) 화면에 보이는 결과는 완전히 동일하다. 스키마는 match_results
+    # 와 동일(신설 테이블이라 day 컬럼도 처음부터 포함).
+    c.execute("""CREATE TABLE IF NOT EXISTS match_results_archive(
+        id INTEGER PRIMARY KEY,
+        league_id INTEGER, week INTEGER,
+        home_team_id INTEGER, away_team_id INTEGER,
+        home_score INTEGER DEFAULT -1, away_score INTEGER DEFAULT -1,
+        season INTEGER, year INTEGER, day INTEGER)""")
     # 경기 상세(클릭 시 펼쳐보는 데이터)를 JSON으로 보관.
     #   game_log 의 헤더 줄에 <a href="match:{id}"> 앵커로 연결된다.
     #   detail_json 안에 전/후반 이벤트·평점·세부지표·총평이 모두 들어간다.
@@ -721,6 +735,13 @@ def init_db():
         # [AI 선수 생애] 나이 컬럼. 시즌 종료 시 +1 되며 성장/노화/은퇴의 기준.
         #  기존 세이브엔 없으므로 추가 후 NULL인 행은 _ensure_ai_ages()가 랜덤 채움.
         "ALTER TABLE ai_players ADD COLUMN age INTEGER DEFAULT 0",
+        # [세부역할 2026-07] AI 선수도 세부역할(SUB_ROLES)을 갖도록 컬럼 추가.
+        #  기존엔 이 컬럼 자체가 없어서 sub_role은 내 선수(my_player)에만
+        #  있었다 — 세부역할별 매치 가중치(_SUB_ROLE_MATCH_MOD)를 AI 시즌
+        #  추정(_estimate_ai_season)에도 적용하려면 AI도 값이 있어야 한다.
+        #  기존 세이브의 빈 값은 _ensure_ai_sub_roles()가 포지션에 맞는
+        #  값으로 한 번에 채운다.
+        "ALTER TABLE ai_players ADD COLUMN sub_role TEXT DEFAULT ''",
         # [예선] 예선에서 선택해 뛴 나라. 본선 해에 이 나라로 자동 출전(cap-tie 전).
         #  예선 시작 시 리셋되어, 21세 이하면 다음 예선 때 다른 나라 선택 가능.
         "ALTER TABLE my_player ADD COLUMN qual_pledged_nat TEXT DEFAULT ''",
@@ -781,6 +802,17 @@ def init_db():
         # 이름 대신 이 값(그 라운드에 실제로 들어온 팀 수, 부전승 포함)으로
         # "결승 직전 라운드인지"를 구조적으로 판별한다.
         "ALTER TABLE cup_matches ADD COLUMN pool_entering INTEGER DEFAULT 0",
+        # [2026-07 신설] 퇴장(레드카드) → 다음 경기 출전정지 시스템.
+        # 0이면 정상, N(>=1)이면 앞으로 내 경기 N번을 강제로 결장한다
+        # (경기가 진행될 때마다 1씩 차감). '폭력적' 성격의 red_card_chance
+        # 효과를 실제로 반영하기 위해 신설.
+        "ALTER TABLE my_player ADD COLUMN red_card_suspension INTEGER DEFAULT 0",
+        # [2026-07 신설] 컵대회/챔스/국제대회에서 내가 결장한 이유(부상/출전정지
+        # 등)를 기록 — 신민용 요청: 커리어 세부 기록·은퇴창·AI 요약에
+        # "(부상)"/"(출전정지)" 식으로 표시하기 위함. NULL이면 정상 출전.
+        "ALTER TABLE cl_matches ADD COLUMN my_absence_reason TEXT DEFAULT NULL",
+        "ALTER TABLE cup_matches ADD COLUMN my_absence_reason TEXT DEFAULT NULL",
+        "ALTER TABLE intl_matches ADD COLUMN my_absence_reason TEXT DEFAULT NULL",
     ]:
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,
@@ -851,6 +883,9 @@ def init_db():
         # match_results: home/away team_id 조회 (클린시트, 팀 경기 조회)
         "CREATE INDEX IF NOT EXISTS idx_mr_home_team ON match_results(home_team_id, season)",
         "CREATE INDEX IF NOT EXISTS idx_mr_away_team ON match_results(away_team_id, season)",
+        # match_results_archive: 역대 순위/우승팀 조회(league_id+season 등치 검색)
+        # 전용 — 쓰기는 시즌 전환 시 1회 벌크 INSERT뿐이라 인덱스 개수 부담이 없다.
+        "CREATE INDEX IF NOT EXISTS idx_mra_league_season ON match_results_archive(league_id, season)",
     ]:
         try: c.execute(idx)
         except sqlite3.OperationalError: pass
@@ -867,6 +902,165 @@ def init_db():
         reset_conn_pool()
     remap_all_ovr()   # calc_ovr 정규화에 맞춰 기존 AI OVR 일괄 재계산 (1회성)
     migrate_money_to_thousand()   # 금액 단위 만원→천원 전환 (1회성)
+    repair_duplicate_season_schedules()   # 유령 중복 시즌 일정 정리 (1회성, 아래 참고)
+    repair_stray_intl_is_my_flags()   # 복수국적 미선택국 is_my 오염 정리 (1회성, 아래 참고)
+
+
+def archive_old_seasons(current_season):
+    """[2026-07 신설, 성능] 진행 중인 시즌(current_season) 이전의 모든
+    match_results 행을 match_results_archive로 옮긴다.
+
+    새 시즌 일정을 match_results에 INSERT할 때마다 인덱스 6개가 테이블
+    전체 크기에 비례해 느려지는데(실측: 3시즌 누적 52만 행 상태에서 새
+    시즌 17만 행 삽입에 2.6초, 시즌이 쌓일수록 계속 나빠짐), 완료된 과거
+    시즌을 이 아카이브로 옮겨 match_results를 '이번 시즌 것만' 유지하면
+    삽입 비용이 시즌 수와 무관하게 항상 일정해진다.
+
+    world_browser의 역대 순위/우승팀 조회(get_league_standings,
+    get_league_standings_for_browser, get_league_champions)는 이미 이
+    아카이브 테이블도 함께 보도록 수정되어 있으므로, 화면에 보이는 결과는
+    바뀌지 않는다 — 데이터 삭제가 아니라 이동이며, id 값도 그대로 보존한다.
+
+    _process_promotion_relegation이 '방금 끝난 시즌'의 match_results를
+    이미 다 읽어들인 뒤(그 함수가 이 호출보다 항상 먼저 실행됨) 호출되므로
+    안전하다. INSERT OR IGNORE라 중복 호출돼도(예: 재시도) 에러 없이
+    멱등하게 동작한다."""
+    conn = get_conn()
+    c = conn.cursor()
+    cols = "id,league_id,week,home_team_id,away_team_id,home_score,away_score,season,year,day"
+    c.execute(
+        f"""INSERT OR IGNORE INTO match_results_archive({cols})
+            SELECT {cols} FROM match_results WHERE season<?""", (current_season,))
+    c.execute("DELETE FROM match_results WHERE season<?", (current_season,))
+    conn.commit()
+
+
+def repair_duplicate_season_schedules():
+    """[2026-07 버그 수정, 신민용 리포트: "2001년엔 14팀인데 2002년엔
+    17팀으로 뜬다"] _generate_all_league_schedules()가 예전엔 완료돼
+    아카이브로 넘어간 과거 시즌을 '이번 시즌 것만 있다'고 잘못 가정해
+    완비 여부를 판정했다 — 그 버그 때문에 이미 끝난 시즌인데도 다른 팀
+    구성으로 새 일정을 통째로 또 깔아버린 적이 있었다(그 원인 자체는
+    _generate_all_league_schedules에서 이미 고쳐짐 — 아카이브+라이브
+    합산 카운트로 완비 여부를 판정하도록 수정됨). 하지만 그 버그가
+    고쳐지기 전에 이미 생겨버린 '유령 일정'(같은 league_id+season에
+    결과가 하나도 안 채워진(-1,-1) 채로 남아있는, 실제 팀 구성과 다른
+    중복 스케줄 뭉치)은 세이브 파일에 이미 저장돼 있어서, 코드를
+    고쳐도 역대 기록 화면의 팀 수 집계는 계속 부풀어 보인다.
+
+    이 함수는 1회성으로 그런 '유령 뭉치'만 정확히 골라 삭제한다:
+      - 같은 (league_id, season) 안에서 같은 날짜(day)에 같은 팀이
+        두 번 이상 등장하면(정상 라운드로빈이면 불가능) 중복 스케줄이
+        겹쳐 있다는 확실한 신호.
+      - 그중 결과가 전혀 기록되지 않은(all -1,-1) 쪽과, 팀 구성 자체가
+        완료된(결과가 있는) 쪽과 다른 경우에만 유령으로 판정해 삭제한다.
+      - 실제로 경기가 하나라도 진행된 데이터, 혹은 팀 구성이 동일해서
+        그냥 '진행 중인 정상 시즌'인 경우는 절대 건드리지 않는다.
+    """
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        row = c.execute("SELECT value FROM meta WHERE key='dup_season_repair_v1'").fetchone()
+    except Exception:
+        row = None
+    if row:
+        conn.close()
+        return
+    removed_total = 0
+    try:
+        for table in ("match_results", "match_results_archive"):
+            groups = c.execute(
+                f"SELECT DISTINCT league_id, season FROM {table} WHERE day IS NOT NULL"
+            ).fetchall()
+            for g in groups:
+                lid, season = g["league_id"], g["season"]
+                rows = c.execute(
+                    f"SELECT id, day, home_team_id, away_team_id, home_score FROM {table} "
+                    f"WHERE league_id=? AND season=? AND day IS NOT NULL",
+                    (lid, season)).fetchall()
+                if not rows:
+                    continue
+                day_team_count: dict = {}
+                for r in rows:
+                    for tid in (r["home_team_id"], r["away_team_id"]):
+                        key = (r["day"], tid)
+                        day_team_count[key] = day_team_count.get(key, 0) + 1
+                if not any(v > 1 for v in day_team_count.values()):
+                    continue   # 중복 신호 없음 — 정상 데이터, 스킵
+                unplayed_ids = [r["id"] for r in rows if r["home_score"] == -1]
+                played_ids   = [r["id"] for r in rows if r["home_score"] != -1]
+                if not played_ids or not unplayed_ids:
+                    continue   # 한쪽이 아예 없으면 그냥 진행중/미시작 시즌
+                played_teams = {t for r in rows if r["home_score"] != -1
+                                for t in (r["home_team_id"], r["away_team_id"])}
+                unplayed_teams = {t for r in rows if r["home_score"] == -1
+                                  for t in (r["home_team_id"], r["away_team_id"])}
+                if played_teams == unplayed_teams:
+                    continue   # 팀 구성 동일 = 그냥 진행 중인 정상 시즌
+                ph = ",".join("?" * len(unplayed_ids))
+                c.execute(f"DELETE FROM {table} WHERE id IN ({ph})", unplayed_ids)
+                removed_total += len(unplayed_ids)
+        c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('dup_season_repair_v1',?)",
+                  (str(removed_total),))
+        conn.commit()
+        if removed_total:
+            print(f"[repair] 중복 유령 시즌 일정 {removed_total}건 정리 완료")
+    except Exception as e:
+        print("repair_duplicate_season_schedules 실패:", e)
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def repair_stray_intl_is_my_flags():
+    """[2026-07 버그 수정, 신민용 리포트: "호주/앙골라 복수국적인데 호주를
+    선택했는데 커리어에 앙골라 대륙컵 경기도 같이 기록됨"]
+
+    복수국적 대회는 발탁창을 띄우기 전(선택 대기, my_selected=3)에도
+    intl_matches.is_my=1이 후보국 경기에 미리 찍혀 있다. 실제 선택 시
+    다른 후보 대회는 my_selected=2로 닫히는데, 그 대회의 is_my는 예전
+    코드에선 그대로 1로 남았다(원인 자체는 intl_engine.choose_national_team
+    / _close_other_pending_when_committed에서 이미 고쳐짐 — 이제 선택
+    시점에 is_my도 함께 0으로 정리된다). 하지만 그 버그가 고쳐지기
+    전에 이미 선택을 마친 기존 세이브에는 '선택 안 한 나라' 대회의
+    is_my=1이 그대로 남아있어, 계속 커리어 로그에 잘못 기록된다.
+
+    이 함수는 1회성으로 my_selected가 1이 아닌(출전 확정 안 된) 대회에
+    남아있는 is_my=1을 전부 0으로 되돌린다 — 실제 출전 확정(my_selected=1)
+    대회는 절대 건드리지 않는다."""
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        row = c.execute("SELECT value FROM meta WHERE key='intl_ismy_repair_v1'").fetchone()
+    except Exception:
+        row = None
+    if row:
+        conn.close()
+        return
+    removed = 0
+    try:
+        stray_ids = [r["id"] for r in c.execute(
+            """SELECT id FROM intl_tournaments WHERE my_selected != 1"""
+        ).fetchall()]
+        if stray_ids:
+            ph = ",".join("?" * len(stray_ids))
+            cur = c.execute(
+                f"SELECT COUNT(*) as n FROM intl_matches WHERE tournament_id IN ({ph}) AND is_my=1",
+                stray_ids)
+            removed = cur.fetchone()["n"]
+            c.execute(
+                f"UPDATE intl_matches SET is_my=0 WHERE tournament_id IN ({ph}) AND is_my=1",
+                stray_ids)
+        c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('intl_ismy_repair_v1',?)",
+                  (str(removed),))
+        conn.commit()
+        if removed:
+            print(f"[repair] 복수국적 미선택국 is_my 오염 {removed}건 정리 완료")
+    except Exception as e:
+        print("repair_stray_intl_is_my_flags 실패:", e)
+        conn.rollback()
+    finally:
+        conn.close()
 
 
 def remap_all_ovr():
@@ -981,14 +1175,25 @@ def _reset_teams_to_league_data(c):
     이전 판에서 승격/강등된 팀이 새 판에서도 엉뚱한 리그에서 시작했다.
     이 함수는 LEAGUE_DATA(leagues.py) 원본 배치를 기준으로 모든 팀의
     league_id/current_tier를 되돌린다. 팀 id(및 그에 딸린 선수단 등)는
-    그대로 유지한 채 소속 리그 정보만 바로잡으므로 안전하다."""
+    그대로 유지한 채 소속 리그 정보만 바로잡으므로 안전하다.
+
+    [버그수정 2026-07, 신민용 리포트] 팀명이 같은 나라 안에서 중복되면
+    (예: 데이터 오류로 '전북 현대 모터스'가 K리그1과 K3리그 양쪽에 잘못
+    들어간 경우) (country_id, team_name)을 키로 쓰는 딕셔너리에서 나중에
+    처리된 등급의 값이 먼저 값을 덮어써버려, 두 팀(서로 다른 team_id)이
+    전부 같은(나중 값) 리그로 리셋되는 버그가 있었다 — 그 결과 한쪽 등급은
+    팀이 하나 모자라고 다른 쪽은 하나 남는 현상이 생겼다(실측: 1부 11개/
+    3부 15개, 원래는 12개/14개여야 함). 이제 이름이 같은 팀들을 id 오름차순
+    으로 모아서, LEAGUE_DATA에 그 이름이 등장하는 순서와 1:1로 매칭한다 —
+    이름 중복이 있어도 각 team_id가 자기 몫의 등급으로 정확히 돌아간다."""
     c.execute("SELECT id, name FROM countries")
     cid_by_name = {r["name"]: r["id"] for r in c.fetchall()}
     c.execute("SELECT id, country_id, tier FROM leagues")
     league_id_by_country_tier = {(r["country_id"], r["tier"]): r["id"] for r in c.fetchall()}
 
-    # (country_id, team_name) -> (league_id, tier)
-    target = {}
+    # (country_id, team_name) -> [(league_id, tier), ...] — 이름이 중복되면
+    # 리스트에 여러 항목이 쌓인다(등장 순서 그대로).
+    target_lists = {}
     for country_name, tiers in LEAGUE_DATA.items():
         cid = cid_by_name.get(country_name)
         if cid is None:
@@ -999,14 +1204,26 @@ def _reset_teams_to_league_data(c):
             if lid is None:
                 continue
             for team_name in team_names:
-                target[(cid, team_name)] = (lid, tier)
+                target_lists.setdefault((cid, team_name), []).append((lid, tier))
 
-    c.execute("SELECT id, name, country_id FROM teams")
-    updates = []
+    # DB의 팀들을 (country_id, name)별로 id 오름차순 그룹핑 — 최초 시딩 시
+    # INSERT 순서(=LEAGUE_DATA 등장 순서)와 id 오름차순이 일치하므로, 이렇게
+    # 모으면 이름이 중복돼도 각 team_id가 자기 원래 등급과 정확히 짝지어진다.
+    c.execute("SELECT id, name, country_id FROM teams ORDER BY id")
+    grouped = {}
     for r in c.fetchall():
-        dest = target.get((r["country_id"], r["name"]))
-        if dest:
-            updates.append((dest[0], dest[1], r["id"]))
+        grouped.setdefault((r["country_id"], r["name"]), []).append(r["id"])
+
+    updates = []
+    for key, team_ids in grouped.items():
+        dests = target_lists.get(key)
+        if not dests:
+            continue
+        # 팀 추가/삭제로 개수가 어긋나는 예외적인 경우를 대비해 짧은 쪽 기준으로.
+        n = min(len(team_ids), len(dests))
+        for i in range(n):
+            lid, tier = dests[i]
+            updates.append((lid, tier, team_ids[i]))
     c.executemany("UPDATE teams SET league_id=?, current_tier=? WHERE id=?", updates)
 
 
@@ -1653,15 +1870,6 @@ def _generate_team_players(c, team, team_strength, league_used: set = None):
     if not name_pool:
         name_pool = [f"선수{i}" for i in range(100)]
 
-    # [2026-07 신설] 역할 순번(role_idx) 랜덤화 — 예전엔 TEAM_POSITIONS 순서를
-    # 그대로 role_idx로 써서 "에이스"가 항상 idx0(GK)로 고정됐다. 실제로는
-    # 어느 팀은 스트라이커가, 어느 팀은 센터백이 에이스일 수 있으므로 팀마다
-    # 0~10을 섞어서 배정한다(포지션 자체의 스탯 계산(_gen_ai_stats)은 그대로
-    # pos 기준이라 "센터백인데 슈팅 위주"처럼 어긋나지 않는다 — target OVR만
-    # 랜덤한 포지션에 높게 배정될 뿐).
-    role_indices = list(range(len(TEAM_POSITIONS)))
-    random.shuffle(role_indices)
-
     # [2026-07 신설] 스타 슬롯(월드클래스/엘리트) 명시적 배정 — 완만한 곡선
     # (_target_ovr)만으로는 "이 팀에 월클이 몇 명"이 보장되지 않아서, 소수
     # 슬롯을 뽑아 리그 상한 근처 OVR로 직접 꽂아 넣는다.
@@ -1674,6 +1882,25 @@ def _generate_team_players(c, team, team_strength, league_used: set = None):
         star_kind_by_slot[i] = "worldclass"
     for i in star_slot_idx[n_world:n_world + n_elite]:
         star_kind_by_slot[i] = "elite"
+
+    # [2026-07 신설, 버그수정] 역할 순번(role_idx) 랜덤화 — 어느 팀은
+    # 스트라이커가, 어느 팀은 센터백이 에이스일 수 있으므로 팀마다 0~10을
+    # 섞어서 배정한다(포지션 자체의 스탯 계산(_gen_ai_stats)은 그대로 pos
+    # 기준이라 "센터백인데 슈팅 위주"처럼 어긋나지 않는다 — target OVR만
+    # 랜덤한 포지션에 높게 배정될 뿐).
+    # [버그수정] 원래는 스타 슬롯 포함 11자리 전체에 0~10을 셔플해 배정하고
+    # 그 중 스타 슬롯에 떨어진 값은 그냥 버렸다 — 그 결과 스타 슬롯이 하필
+    # 낮은(막내급) 값을 가져가면, 비스타 포지션들이 반대로 에이스급(0~2)
+    # role_idx를 받아버려 "스타 제외 나머지는 확실히 낮은 지점" 설계 의도가
+    # 깨지는 경우가 있었다. 이제 스타 인원수(n_star)만큼의 상위 랭크(0~n_star-1,
+    # 에이스 쪽)는 스타 슬롯 몫으로 아예 비워두고, 비스타 포지션은 그 아래
+    # 구간(n_star~10)의 role_idx만 셔플해서 나눠 갖는다 — _target_ovr의
+    # role_idx 해석(0=에이스…10=막내)과 스케일(role_idx/10.0)은 그대로다.
+    n_star = len(star_kind_by_slot)
+    non_star_positions = [i for i in range(len(TEAM_POSITIONS)) if i not in star_kind_by_slot]
+    remaining_ranks = list(range(n_star, len(TEAM_POSITIONS)))
+    random.shuffle(remaining_ranks)
+    role_indices = dict(zip(non_star_positions, remaining_ranks))
 
     _star_cfg = STAR_COUNT_BY_GRADE.get(grade, {})
     _el_offset = _star_cfg.get("el_offset", (6, 14))
@@ -1709,17 +1936,20 @@ def _generate_team_players(c, team, team_strength, league_used: set = None):
         ovr = calc_ovr(pos, stats)
         # [AI 생애] 초기 나이: 16~34 삼각분포(25 봉우리). 시즌마다 +1 되며 성장/노화.
         age = int(round(random.triangular(16, 34, 25)))
+        # [세부역할 2026-07] 포지션에 맞는 SUB_ROLES 중 하나를 무작위 배정.
+        from constants import SUB_ROLES
+        sub_role = random.choice(SUB_ROLES.get(pos, ["기본"]))
         c.execute("""INSERT INTO ai_players
             (team_id,name,position,stamina,speed,jump,strength,shooting,passing,
              dribbling,tackling,heading,positioning,setpiece,
-             mental,confidence,leadership,concentration,ovr,age)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             mental,confidence,leadership,concentration,ovr,age,sub_role)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (team["tid"],name,pos,
              stats["stamina"],stats["speed"],stats["jump"],stats["strength"],
              stats["shooting"],stats["passing"],stats["dribbling"],
              stats["tackling"],stats["heading"],stats["positioning"],
              stats["setpiece"],stats["mental"],stats["confidence"],
-             stats["leadership"],stats["concentration"],ovr,age))
+             stats["leadership"],stats["concentration"],ovr,age,sub_role))
 
 
 def _gen_ai_stats(pos, target):

@@ -205,10 +205,29 @@ class CenterPanel(QWidget):
         self.lay.setSpacing(8)
         self.lay.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        # 페이즈 라벨
+        # 페이즈 라벨 + [2026-07 신설] 우측에 다음 주 미리보기(작은 박스 7개).
+        #   신민용 요청: "중앙 화면 우측에 다음주 일정이 간단하게 표시되는건
+        #   어떨까? 네모 7개, 대회 종류에 따라 색이 다르게" — 리그=초록,
+        #   컵=보라, 챔스=황금, 국대(월드컵/대륙컵)=주황, 국대(그 외)=빨강,
+        #   경기 없는 날=회색. 4번 색상 규칙과 동일하게 맞춘다.
+        phase_row = QHBoxLayout(); phase_row.setSpacing(8)
         self.lbl_phase = QLabel("비시즌  |  1990년 1시즌  1일차")
         self.lbl_phase.setObjectName("phaseLabel")
-        self.lay.addWidget(self.lbl_phase)
+        phase_row.addWidget(self.lbl_phase, 1)
+
+        self.nwp_boxes: list[QLabel] = []
+        nwp_row = QHBoxLayout(); nwp_row.setSpacing(3)
+        for _ in range(DAY_BUNDLE_SIZE):
+            b = QLabel("")
+            b.setFixedSize(14, 14)
+            b.setStyleSheet("background:#333;border-radius:3px;")
+            self.nwp_boxes.append(b)
+            nwp_row.addWidget(b)
+        nwp_wrap = QWidget(); nwp_wrap.setLayout(nwp_row)
+        nwp_wrap.setToolTip("다음 주 일정 미리보기 (초록=리그, 보라=컵, 황금=챔스, "
+                            "주황=월드컵/대륙컵, 빨강=국대, 회색=경기 없음)")
+        phase_row.addWidget(nwp_wrap, 0)
+        self.lay.addLayout(phase_row)
 
         self.lbl_no_match = QLabel("이번 주 경기 없음")
         self.lbl_no_match.setObjectName("noMatch")
@@ -507,12 +526,38 @@ class CenterPanel(QWidget):
             self.adv_btn.setText("▶▶  이번 주 진행")
 
         # 일자별 표시 (프레임 7칸은 항상 [묶음 시작 ~ +6])
-        # [최적화] _get_match_for_day를 루프 전에 미리 일괄 조회
-        _has_team = bool(p.get("current_team_id"))
-        _match_cache = {
-            bundle_start + i: (self._get_match_for_day(bundle_start + i, p) if _has_team else None)
-            for i in range(DAY_BUNDLE_SIZE)
-        }
+        # [2026-07 버그수정, 신민용 리포트: "16세에 국대 발탁됐는데 일정
+        # 화면엔 안 뜨고 로그에만 결과가 찍힘"] 예전엔 아래 _has_team이
+        # False(소속 클럽 없음 — 어린 나이라 아직 입단 전인 경우 등)이면
+        # _get_match_for_day() 호출 자체를 건너뛰고 무조건 None으로
+        # 취급했다. 그런데 국가대표 경기는 클럽 소속과 무관하게 열릴 수
+        # 있다(_get_match_for_day 내부는 이미 tid=0이어도 국제전/챔스/
+        # 컵대회를 정상적으로 조회한다) — 그래서 실제로는 경기가 잡혀서
+        # 진행까지 됐는데(로그엔 남음) 화면 미리보기에서만 빠져 보였다.
+        # 이제 소속팀 유무와 무관하게 항상 조회한다.
+        if self._step_mode and self._locked_sched is not None and len(self._locked_sched) == DAY_BUNDLE_SIZE:
+            # [2026-07 버그수정] 하루씩 모드에서 미래 요일(아직 진행 안 한 날)의
+            # 경기 정보가 화면에서 사라지던 문제. 원인: 하루씩 모드는 묶음 시작
+            # 시점에 self._locked_sched(그 주 7일 확정 일정)를 이미 만들어두고
+            # 그걸로 실제 진행을 하는데, 화면 표시는 이 확정본을 안 쓰고 매
+            # 새로고침마다 _get_match_for_day()를 다시 호출해 재조회했다. 그런데
+            # 하루씩 진행 중 앞선 날짜가 처리되면서(경기 결과 기록, AI 스캔 등)
+            # DB 상태가 바뀌고, 그 여파로 재조회 결과가 확정 당시와 달라질 수
+            # 있어(예: home_score 갱신 타이밍) 아직 오지 않은 날의 경기 라벨이
+            # 통째로 빠져 보였다. 이제 하루씩 모드에서 묶음이 이미 고정된
+            # 상태라면 그 확정본(self._locked_sched)을 그대로 화면에 반영해
+            # "실제로 진행될 내용 = 화면에 보이는 내용"을 항상 일치시킨다.
+            _match_cache = {
+                item[0]: (item[2] if item[1] == "경기" else None)
+                for item in self._locked_sched
+            }
+        else:
+            _match_cache = {
+                bundle_start + i: self._get_match_for_day(bundle_start + i, p)
+                for i in range(DAY_BUNDLE_SIZE)
+            }
+
+        self._update_next_week_preview(bundle_start, p)
 
         day_labels_kr = ["월", "화", "수", "목", "금", "토", "일"]
         for i, (f, cb) in enumerate(zip(self.week_frames, self.week_combos)):
@@ -572,15 +617,24 @@ class CenterPanel(QWidget):
             if match_info:
                 cb.hide()
                 if match_info.get("intl"):
-                    # 국가대표 경기 (월드컵/대륙컵)
+                    # 국가대표 경기 (월드컵/대륙컵/예선)
+                    # [2026-07 색상 규칙 개편, 신민용 요청] 예전엔 국대 경기
+                    # 전부(월드컵/대륙컵/예선) 파란색 하나로 뭉뚱그려 표시됐다.
+                    # 리그=초록, 컵=보라, 챔스=황금과 같은 급으로 나누되,
+                    # 국대 안에서도 월드컵·대륙컵 본선은 주황, 그 외(예선 등)는
+                    # 빨강으로 구분한다 — schedule_window.py의 국제전 탭
+                    # 헤더 색상 규칙과 동일하게 맞춘다.
                     stage = match_info.get("stage_ko", "")
                     grp   = f" {match_info['grp']}조" if match_info.get("grp") else ""
                     opp   = f"{match_info.get('opp_flag','')}{match_info.get('opp','')}"
                     hl.setText("스트레스 +8")
                     if ml:
+                        _is_main = match_info.get("kind") in ("world", "continent")
+                        _txt_c = "#ffaa33" if _is_main else "#ff6666"
+                        _bg_c  = "#3a2a1a" if _is_main else "#3a1a1a"
                         ml.setText(f"🌍 {match_info['league_name']} {stage}{grp}\nvs {opp}")
-                        ml.setStyleSheet("color:#66ccff;font-weight:bold;font-size:12px;"
-                                         "background:#1a2a3a;border-radius:4px;padding:4px;")
+                        ml.setStyleSheet(f"color:{_txt_c};font-weight:bold;font-size:12px;"
+                                         f"background:{_bg_c};border-radius:4px;padding:4px;")
                         ml.show()
                 elif match_info.get("cl"):
                     # 클럽 대륙 챔피언스리그
@@ -613,7 +667,10 @@ class CenterPanel(QWidget):
                     hl.setText(f"스트레스 +{stress_val}")
                     if ml:
                         ml.setText(f"⚽ {league_name}\n({loc})")
-                        ml.setStyleSheet("color:#ffcc00;font-weight:bold;font-size:12px;"
+                        # [2026-07 색상 규칙, 신민용 요청] 리그=초록. 예전엔
+                        # 배경만 초록이고 글자색은 노란(#ffcc00)이라 다른
+                        # 대회(컵=보라/챔스=황금) 색상 규칙과 안 맞았다.
+                        ml.setStyleSheet("color:#66ff99;font-weight:bold;font-size:12px;"
                                          "background:#1a3a1a;border-radius:4px;padding:4px;")
                         ml.show()
             else:
@@ -631,7 +688,7 @@ class CenterPanel(QWidget):
                 # 무조건 휴식 처리"로 그대로 적용한다.
                 next_mi = _match_cache.get(d + 1)
                 if next_mi is None and d + 1 not in _match_cache:
-                    next_mi = self._get_match_for_day(d + 1, p) if _has_team else None
+                    next_mi = self._get_match_for_day(d + 1, p)
                 if next_mi:
                     cb.hide()
                     loc_txt = "원정 이동" if next_mi.get("is_home") is False else "경기 하루 전"
@@ -1170,6 +1227,31 @@ class CenterPanel(QWidget):
                               f"시즌/주차 진행 중 오류가 발생했습니다:\n{msg}")
 
 
+    def _update_next_week_preview(self, bundle_start, p):
+        """[2026-07 신설] 우측 상단 작은 박스 7개 — 다음 주(현재 표시 중인
+        7일 묶음의 바로 다음 7일) 일정을 대회 종류별 색으로 간단히 미리
+        보여준다. 4번 색상 규칙(리그=초록/컵=보라/챔스=황금/국대=주황·빨강)과
+        동일한 배색을 쓰며, 경기 없는 날(훈련/휴식)은 회색으로 둔다.
+        [2026-07 버그수정] 소속 클럽이 없어도(국대만 있는 어린 선수 등)
+        국제전은 뜰 수 있으므로 has_team 게이트 없이 항상 조회한다."""
+        if not hasattr(self, "nwp_boxes"):
+            return
+        next_start = bundle_start + DAY_BUNDLE_SIZE
+        for i, box in enumerate(self.nwp_boxes):
+            d = next_start + i
+            mi = self._get_match_for_day(d, p)
+            if not mi:
+                color = "#333"
+            elif mi.get("intl"):
+                color = "#ffaa33" if mi.get("kind") in ("world", "continent") else "#ff6666"
+            elif mi.get("cl"):
+                color = "#ffd24d"
+            elif mi.get("cup"):
+                color = "#c48aff"
+            else:
+                color = "#66ff99"
+            box.setStyleSheet(f"background:{color};border-radius:3px;")
+
     def _get_match_for_day(self, day, p):
         """그 날짜(day)에 내 경기가 있는지 확인.
         클럽 리그 경기는 match_results.day로 정확한 날짜가 있어 그대로 대조.
@@ -1296,7 +1378,7 @@ class CenterPanel(QWidget):
                                    transfer_type="방출", allow_insert=False)
             upd(current_team_id=0, current_league_id=0,
                 salary=0, contract_years=0, contract_end_year=0,
-                _contract_renew_offer=0)
+                _contract_renew_offer=0, apply_attempts_used=0)
             from game_engine import add_log
             add_log("📋 재계약 거절. 소속 없음 상태가 됩니다.", "event")
             dlg.reject()

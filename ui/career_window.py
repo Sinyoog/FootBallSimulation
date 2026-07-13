@@ -11,6 +11,7 @@ from PyQt6.QtGui import QColor
 
 from game_engine import get_player, fmt_money, get_my_promotions
 from database import get_conn
+from constants import format_result_with_absence
 
 
 # 개인 수상으로 분류할 키워드 (trophy_log에 섞여 들어온 발롱도르·MVP 행 식별)
@@ -107,7 +108,12 @@ class CareerWindow(QDialog):
         # trophy_log에는 리그/국제대회 우승뿐 아니라 발롱도르·MVP 같은 개인 수상도
         # 함께 적재된다. 우승 탭에는 '진짜 우승'만 보여야 하므로 개인 수상 행은 제외한다.
         # (개인 수상은 아래 awards 테이블 기반으로 '개인 수상' 탭에서 따로 표시됨)
-        all_trophies = [dict(r) for r in c.execute("SELECT * FROM trophy_log ORDER BY id").fetchall()]
+        # [2026-07 버그+성능 수정] trophy_log를 필터 없이 통째로 읽으면 전 세계
+        # 모든 AI 팀의 우승까지 섞여 보이고(기능 버그), 연차가 쌓일수록 창을
+        # 여는 속도도 느려진다(log_panel의 game_log와 같은 유형의 문제).
+        # get_my_trophies()가 내 재직 기간 기준으로 미리 걸러서 반환한다.
+        from game_engine import get_my_trophies
+        all_trophies = get_my_trophies()
         trophies = [t for t in all_trophies if not _is_personal_award(t)]
         try:
             awards = [dict(r) for r in c.execute(
@@ -235,7 +241,11 @@ class CareerWindow(QDialog):
             # 보여주지 않도록)
             if e.get("matches", 0) > 0:
                 wdl       = f"{e.get('wins',0)}승{e.get('draws',0)}무{e.get('losses',0)}패"
-                rank_disp = f"{e.get('team_rank',0)}위"
+                # [2026-07 신설, 신민용 요청] "12위" 대신 "12위/18팀"으로.
+                from game_engine import league_total_teams_by_name
+                _total_teams = league_total_teams_by_name(e.get("league_name", ""))
+                rank_disp = (f"{e.get('team_rank',0)}위/{_total_teams}팀" if _total_teams
+                             else f"{e.get('team_rank',0)}위")
             else:
                 wdl       = "—"
                 rank_disp = "—"
@@ -494,7 +504,7 @@ class CareerWindow(QDialog):
                     f"{m['opp_flag']}{m['opp']}",
                     str(m["goals"]), str(m["assists"])]
                     + [_emap.get(c, "—") for c in extra_cols]
-                    + [str(m["rating"]), m["score"], res])
+                    + [str(m["rating"]), m["score"], format_result_with_absence(m)])
             for j, v in enumerate(vals):
                 self._set(tbl, i, j, v, color if j == len(vals) - 1 else None)
         lay.addWidget(tbl)
@@ -556,7 +566,7 @@ class CareerWindow(QDialog):
                     f"{m['opp_flag']}{m['opp']}",
                     str(m["goals"]), str(m["assists"])]
                     + [_emap.get(c, "—") for c in extra_cols]
-                    + [str(m["rating"]), m["score"], res])
+                    + [str(m["rating"]), m["score"], format_result_with_absence(m)])
             for j, v in enumerate(vals):
                 self._set(tbl, i, j, v, color if j == len(vals) - 1 else None)
         lay.addWidget(tbl)
@@ -596,7 +606,7 @@ class CareerWindow(QDialog):
             opp = m["opp"] + (f" ({m['opp_tier']}부)" if m.get("opp_tier") else "")
             vals = [m['date'], f"{m['comp']} {m['stage']}", opp,
                     str(m["goals"]), str(m["assists"]), str(m["saves"]), str(m["conceded"]),
-                    str(m["rating"]), m["score"], res]
+                    str(m["rating"]), m["score"], format_result_with_absence(m)]
             for j, v in enumerate(vals):
                 self._set(tbl, i, j, v, color if j == len(vals) - 1 else None)
         lay.addWidget(tbl)

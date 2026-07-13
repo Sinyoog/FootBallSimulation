@@ -10,6 +10,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QColor
 
 from game_engine import get_player, fmt_money, add_log, get_state, _save_career_entry
+from constants import format_result_with_absence
 
 def _game_confirm(parent, title: str, message: str) -> bool:
     from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
@@ -218,7 +219,10 @@ class RetireWindow(QDialog):
         entries  = [dict(r) for r in c.execute("SELECT * FROM career_entries ORDER BY id").fetchall()]
         # trophy_log에는 발롱도르·MVP 같은 개인 수상도 함께 적재되므로
         # 우승 경력에는 '진짜 우승'만 남기고 개인 수상 행은 제외한다.
-        all_trophies = [dict(r) for r in c.execute("SELECT * FROM trophy_log ORDER BY id").fetchall()]
+        # [2026-07 버그+성능 수정] career_window.py와 동일한 이유로
+        # get_my_trophies() 사용 (전 세계 AI 팀 우승 혼입 방지 + 연차별 성능 저하 방지).
+        from game_engine import get_my_trophies
+        all_trophies = get_my_trophies()
         trophies = [t for t in all_trophies if not _is_personal_award(t)]
         try:
             awards = [dict(r) for r in c.execute(
@@ -352,6 +356,21 @@ class RetireWindow(QDialog):
             lbl = QLabel("기록 없음"); lbl.setStyleSheet("color:#555;")
             return lbl
 
+        # [버그수정] league_name → 국가 flag 매핑. 예전엔 이 조회 자체가 없어서
+        # "국가" 칸에 리그명 앞 2글자(예: "K4리그" → "K4")를 잘못 채워 넣고
+        # 있었다 — career_window.py의 올바른 로직과 동일하게 맞춘다.
+        conn = get_conn()
+        c = conn.cursor()
+        league_country = {}
+        for e in entries:
+            ln = e.get("league_name", "")
+            if ln and ln not in league_country:
+                row = c.execute("""SELECT cn.flag, cn.name as cname
+                                   FROM leagues l JOIN countries cn ON l.country_id=cn.id
+                                   WHERE l.name=? LIMIT 1""", (ln,)).fetchone()
+                league_country[ln] = f"{row['flag']} {row['cname']}" if row else ""
+        conn.close()
+
         from constants import position_group
         _mypos = get_player().get("position", "")
         _grp = position_group(_mypos)
@@ -443,12 +462,23 @@ class RetireWindow(QDialog):
             # 이적 컬럼
             tt_color = "#cc4444" if t_type in ("팔림", "방출", "계약만료") else None
 
-            from game_engine import league_total_games_by_name
+            from game_engine import league_total_games_by_name, league_total_teams_by_name
             _total_g2 = league_total_games_by_name(e.get("league_name", ""))
             _apps_str2 = f"{e.get('matches',0)}/{_total_g2}" if _total_g2 else str(e.get("matches", 0))
+
+            ln = e.get("league_name", "")
+            country_str = league_country.get(ln, "")
+            league_str = f"{ln} ({e.get('tier','')}부)" if ln else ""
+            # [2026-07 신설, 신민용 요청] "12위" 대신 "12위/18팀"으로 —
+            # rank_disp가 이미 "—"(안 뛴 경우)면 그대로 둔다.
+            if rank_disp != "—":
+                _total_teams = league_total_teams_by_name(ln)
+                if _total_teams:
+                    rank_disp = f"{e.get('team_rank',0)}위/{_total_teams}팀"
+
             vals = ([period, pos,
-                     e.get("league_name", "")[:2] if e.get("league_name","") else "—",
-                     e.get("league_name",""),
+                     country_str,
+                     league_str,
                      e.get("team_name",""),
                      fmt_money(e.get("salary",0)),
                      _apps_str2]
@@ -621,7 +651,7 @@ class RetireWindow(QDialog):
                      f"{m['opp_flag']}{m['opp']}",
                      str(m["goals"]), str(m["assists"])]
                     + [_emap.get(c, "—") for c in extra_cols]
-                    + [str(m["rating"]), m["score"], m["result"]])
+                    + [str(m["rating"]), m["score"], format_result_with_absence(m)])
             for j, v in enumerate(vals):
                 self._set_item(tbl, i, j, v)
         tbl.resizeColumnsToContents()
@@ -663,7 +693,7 @@ class RetireWindow(QDialog):
                      f"{m['opp_flag']}{m['opp']}",
                      str(m["goals"]), str(m["assists"])]
                     + [_emap.get(c, "—") for c in extra_cols]
-                    + [str(m["rating"]), m["score"], m["result"]])
+                    + [str(m["rating"]), m["score"], format_result_with_absence(m)])
             for j, v in enumerate(vals):
                 self._set_item(tbl, i, j, v)
         tbl.resizeColumnsToContents()
@@ -683,7 +713,7 @@ class RetireWindow(QDialog):
             opp = m["opp"] + (f" ({m['opp_tier']}부)" if m.get("opp_tier") else "")
             vals = [m['date'], f"{m['comp']} {m['stage']}", opp,
                     str(m["goals"]), str(m["assists"]), str(m["saves"]), str(m["conceded"]),
-                    str(m["rating"]), m["score"], m["result"]]
+                    str(m["rating"]), m["score"], format_result_with_absence(m)]
             for j, v in enumerate(vals):
                 self._set_item(tbl, i, j, v)
         tbl.resizeColumnsToContents()
@@ -720,7 +750,11 @@ class RetireWindow(QDialog):
         p = get_player()
         conn = get_conn()
         entries  = [dict(r) for r in conn.execute("SELECT * FROM career_entries ORDER BY id").fetchall()]
-        trophies = [dict(r) for r in conn.execute("SELECT * FROM trophy_log ORDER BY id").fetchall()]
+        # [2026-07 버그+성능 수정] 위 _open()과 동일한 이유로 get_my_trophies()
+        # 사용. 개인 수상은 별도의 awards 리스트로 이미 전달되므로 story
+        # 생성 내용엔 영향 없다.
+        from game_engine import get_my_trophies
+        trophies = get_my_trophies()
         try:
             awards = [dict(r) for r in conn.execute(
                 "SELECT * FROM awards WHERE is_mine=1 ORDER BY year").fetchall()]
@@ -807,7 +841,20 @@ class RetireWindow(QDialog):
                 rank_disp = f"{e.get('team_rank',0)}위" if m > 0 else "—"
                 wdl = f"{e.get('wins',0)}승{e.get('draws',0)}무{e.get('losses',0)}패" if m > 0 else "—"
                 lg  = e.get("league_name","")
-                nation = lg[:2] if lg else "—"
+                # [버그수정] 예전엔 리그명 앞 2글자(예: "K4리그"→"K4")를 국가처럼
+                # 잘못 표시했다 — 실제 국가명 조회로 교체하고, 리그명에도
+                # career_window.py와 동일하게 (n부) 접미사를 붙인다.
+                from game_engine import league_total_teams_by_name
+                _country_row = get_conn().execute(
+                    """SELECT cn.flag, cn.name as cname FROM leagues l
+                       JOIN countries cn ON l.country_id=cn.id WHERE l.name=? LIMIT 1""",
+                    (lg,)).fetchone() if lg else None
+                nation = f"{_country_row['flag']} {_country_row['cname']}" if _country_row else "—"
+                lg_disp = f"{lg} ({e.get('tier','')}부)" if lg else "—"
+                if m > 0:
+                    _total_teams = league_total_teams_by_name(lg)
+                    if _total_teams:
+                        rank_disp = f"{e.get('team_rank',0)}위/{_total_teams}팀"
                 salary = fmt_money(e.get("salary",0))
                 # 계약/이적
                 c_yrs = e.get("contract_years",0)
@@ -839,7 +886,7 @@ class RetireWindow(QDialog):
                 from game_engine import league_total_games_by_name
                 _total_g = league_total_games_by_name(lg)
                 _apps_str = f"{m}/{_total_g}" if _total_g else str(m)
-                head = (f"  • {period} | {pos} | {nation} | {lg} | "
+                head = (f"  • {period} | {pos} | {nation} | {lg_disp} | "
                         f"{e.get('team_name','')} | {salary} | 출전 {_apps_str}")
                 lines.append(head)
                 if m > 0:
@@ -1001,7 +1048,7 @@ class RetireWindow(QDialog):
                 stat = _match_stat_str(im)
                 lines.append(f"  • {im['date']}  "
                              f"{im['comp']} {im['stage']}  vs {im['opp']}  ─  "
-                             f"{stat}  평점 {im['rating']}  ({im['score']} {im['result']})")
+                             f"{stat}  평점 {im['rating']}  ({im['score']} {format_result_with_absence(im)})")
         else:
             lines.append("  없음")
         lines.append("")
@@ -1014,7 +1061,7 @@ class RetireWindow(QDialog):
                 stat = _match_stat_str(qm)
                 lines.append(f"  • {qm['date']}  "
                              f"{qm['comp']} {qm['stage']}  vs {qm['opp']}  ─  "
-                             f"{stat}  평점 {qm['rating']}  ({qm['score']} {qm['result']})")
+                             f"{stat}  평점 {qm['rating']}  ({qm['score']} {format_result_with_absence(qm)})")
             lines.append("")
 
         # 챔피언스리그 기록 (클럽 대륙 대회 경기 단위 ─ A매치 아님, 클럽 출전)
@@ -1026,7 +1073,7 @@ class RetireWindow(QDialog):
                 stat = _match_stat_str(cm)
                 lines.append(f"  • {cm['date']}  "
                              f"{cm['comp']} {cm['stage']}  ({cm['team']}) vs {cm['opp']}  ─  "
-                             f"{stat}  평점 {cm['rating']}  ({cm['score']} {cm['result']})")
+                             f"{stat}  평점 {cm['rating']}  ({cm['score']} {format_result_with_absence(cm)})")
         else:
             lines.append("  없음")
         lines.append("")
@@ -1041,7 +1088,7 @@ class RetireWindow(QDialog):
                 lines.append(f"  • {um['date']}  "
                              f"{um['comp']} {um['stage']}  vs {opp}  ─  "
                              f"{um['goals']}골 {um['assists']}어시  평점 {um['rating']}  "
-                             f"({um['score']} {um['result']})")
+                             f"({um['score']} {format_result_with_absence(um)})")
         else:
             lines.append("  없음")
         lines.append("")

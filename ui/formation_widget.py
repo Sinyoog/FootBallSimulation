@@ -429,9 +429,11 @@ class _FormationCanvas(QWidget):
 # ─────────────────────────────────────────────
 
 _CTX_STYLE = {
-    "league": ("color:#aaffaa;", "⚽"),
-    "intl":   ("color:#66ccff;", "🌍"),
-    "cl":     ("color:#ffd24d;", "🏆"),
+    "league":    ("color:#66ff99;", "⚽"),
+    "intl_main": ("color:#ffaa33;", "🌍"),   # 월드컵/대륙컵 본선
+    "intl_qual": ("color:#ff6666;", "🌍"),   # 그 외 국대(예선 등)
+    "cl":        ("color:#ffd24d;", "🏆"),
+    "cup":       ("color:#c48aff;", "🎖️"),
 }
 
 # actBtn과 동일한 다크 박스 스타일
@@ -538,7 +540,17 @@ class FormationWidget(QWidget):
 
         # ── 컨텍스트 레이블 (대회명 표시줄)
         if context:
-            kind = "intl" if context.get("intl") else "cl" if context.get("cl") else "league"
+            if context.get("intl"):
+                # [2026-07 색상 규칙 개편] 국대 경기도 월드컵/대륙컵 본선(주황)과
+                # 그 외(예선 등, 빨강)를 구분한다 — center_panel/schedule_window와
+                # 동일한 규칙.
+                kind = "intl_main" if context.get("kind") in ("world", "continent") else "intl_qual"
+            elif context.get("cl"):
+                kind = "cl"
+            elif context.get("cup"):
+                kind = "cup"
+            else:
+                kind = "league"
         else:
             kind = "league"
         style, icon = _CTX_STYLE.get(kind, _CTX_STYLE["league"])

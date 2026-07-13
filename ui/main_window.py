@@ -389,10 +389,17 @@ class MainWindow(QMainWindow):
 # ── 유틸 ──────────────────────────────────────────────────────
 
 def _phase_label(week, lang):
+    """[2026-07 수정, 신민용 요청: "여름/겨울에 비시즌이 한 번씩 있으니
+    상반기·하반기·비시즌 이렇게 1년에 비시즌이 2번 뜨면 좋겠다"]
+    예전엔 여름(프리시즌, 1~3주)은 '비시즌'으로 뜨는데 겨울(국제대회
+    구간, 44~52주)은 '국제대회 시즌'이라는 다른 문구로 떠서, 사용자
+    입장에선 겨울 비시즌 표시가 아예 안 되는 것처럼 보였다. 이제 두
+    구간 모두 동일하게 '비시즌'으로 표시하고, 국제대회가 실제로 열리는
+    구간이라는 건 괄호로 부기해 정보 손실 없이 통일한다."""
     ps, pe = SEASON_PHASES["preseason1"]
     fs, fe = SEASON_PHASES["first_half"]; ss, se = SEASON_PHASES["second_half"]
-    if   ps <= week <= pe:  return "비시즌"  if lang=="ko" else "Pre-Season"
+    if   ps <= week <= pe:  return "비시즌"  if lang=="ko" else "Off-Season"
     elif fs <= week <= fe:  return "상반기"  if lang=="ko" else "First Half"
     elif week < ss:         return "비시즌"  if lang=="ko" else "Mid-Season"
     elif week <= se:        return "하반기"  if lang=="ko" else "Second Half"
-    else:                   return "국제대회 시즌"  if lang=="ko" else "International Season"
+    else:                   return "비시즌 (국제대회)"  if lang=="ko" else "Off-Season (International)"

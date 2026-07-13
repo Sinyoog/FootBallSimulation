@@ -5,7 +5,7 @@ import sys
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                               QLabel, QProgressBar, QPushButton)
 from PyQt6.QtCore import Qt
-from database import init_db, seed_initial_data, sync_countries, get_conn
+from database import init_db, seed_initial_data, sync_countries, get_conn, flush_to_disk
 from ui.start_screen import StartScreen
 
 
@@ -135,6 +135,14 @@ def main():
         seed_win.close()
         sys.exit(0)
     seed_win.close()
+
+    # [버그수정 2026-07] 인메모리 모드에서는 flush_to_disk()가 게임 진행 중
+    # (advance_days 등)에만 조건부로 호출됐다 — 그래서 최초 실행으로 전
+    # 세계 데이터를 생성한 직후, 새 게임을 시작하지 않고 바로 앱을 종료하면
+    # game.db에 아무것도 저장되지 않았다. 다음 실행 시 meta.seeded 플래그를
+    # 못 찾아 "초기 데이터 삽입 중..."이 처음부터 반복되는 원인이었다.
+    # 세계 생성 직후 여기서 1회 명시적으로 디스크에 백업해 이 문제를 없앤다.
+    flush_to_disk()
 
     sync_countries()   # COUNTRY_DATA 변경분 기존 세이브에 반영
 

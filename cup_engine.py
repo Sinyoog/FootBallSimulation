@@ -8,8 +8,8 @@
 # 바로 결정한다.
 #
 # [설계 이유] 챔스/월드컵 등 국제 일정이 있는 건 1부 팀뿐이다 — 그래서
-# 1부는 최대한 늦게 합류시켜서 챔스 주차(8~21주차 — 2026-07 스위스 방식
-# 개편으로 리그 스테이지+플레이오프까지 포함해 기간이 늘어남)와 안 겹치게
+# 1부는 최대한 늦게 합류시켜서 챔스 주차(8~23주차 — 2026-07 대륙 규모
+# 재조정(북남미 48팀·R32 추가)으로 기간이 한 주 더 늘어남)와 안 겹치게
 # 하고, 2부 이하는 그런 제약이 전혀 없으니 시즌 초반(5주차~)부터 자유롭게
 # 예선을 치르게 한다. 라운드 하나는 일부러 박싱데이 시즌(달력상 12월
 # 하순~1월 초)에 걸리게 배치해서 그 시기 일정이 자연스럽게 촘촘해진다.
@@ -31,7 +31,9 @@ from database import get_conn
 # 합류한 뒤로는 뒤쪽(챔스 이후) 구간을 순서대로 사용한다. round_counter를
 # 그대로 인덱스로 써서 별도 분기 없이 자연스럽게 앞→뒤로 이어지게 한다.
 # [2026-07] 챔스가 8~21주로 늘어나면서(스위스 방식) 뒤쪽 구간 시작을
-# 18→24로 밀었다(챔스 종료 21주 + 여유 3주, 기존과 같은 간격 유지).
+# 18→24로 밀었다. [2026-07 후속] 북남미 48팀·R32 추가로 챔스 종료가
+# 21→23주로 한 주 더 밀렸지만, 24는 그대로 둬도 됨 — 여유가 3주에서
+# 1주로 줄었을 뿐 챔스 결승(23주)과 겹치지 않는다.
 CUP_ROUND_WEEKS_POOL = [5, 6, 7, 24, 27, 30, 33, 36, 39, 42]
 
 
@@ -134,14 +136,18 @@ def _my_cup_tournament(p, year):
 
 def get_my_cup_matches():
     """[2026-07 커리어 기록 추가] 내가 실제 출전한 국내 컵대회 경기 목록(시간순).
-    champions_engine.get_my_cl_matches()와 같은 패턴 — 결장 경기는 제외.
+    champions_engine.get_my_cl_matches()와 같은 패턴.
+    [2026-07 수정, 신민용 요청] 결장(부상/출전정지) 경기도 이제 포함한다 —
+    예전엔 my_played=1인 것만 보여줘서 결장 경기 자체가 커리어에서 통째로
+    사라졌는데, 이제 "(부상)"/"(출전정지)" 식으로 표시하기 위해 결장
+    경기도 함께 조회하고 my_absence_reason을 실어 보낸다.
     컵대회는 국가/시즌 단위라 cup_matches만으로 연도순 정렬하면 충분하다."""
     conn = get_conn()
     rows = [dict(r) for r in conn.execute(
         """SELECT m.*, t.year AS t_year, t.name AS comp
            FROM cup_matches m
            JOIN cup_tournaments t ON m.tournament_id = t.id
-           WHERE m.my_played = 1
+           WHERE m.my_played = 1 OR m.my_absence_reason IS NOT NULL
            ORDER BY t.year, m.week""").fetchall()]
     conn.close()
 
@@ -180,6 +186,7 @@ def get_my_cup_matches():
             "saves": m["my_saves"], "conceded": op_s,
             "rating": m["my_rating"],
             "score": f"{my_s}-{op_s}", "result": result,
+            "absence_reason": m.get("my_absence_reason"),
         })
     return out
 
@@ -367,7 +374,21 @@ def _start_next_round(t):
     # 있었다. 실제 관례대로 '이 라운드에 들어오는 팀 수' 기준으로 고쳤다
     # (16강=16팀 참가, 결승=2팀 참가).
     rname = _round_name(pool_entering, round_counter)
-    week = CUP_ROUND_WEEKS_POOL[min(round_counter, len(CUP_ROUND_WEEKS_POOL) - 1)]
+    # [버그수정 2026-07, 신민용 리포트] CUP_ROUND_WEEKS_POOL은 10칸뿐인데,
+    # 팀 수가 아주 많은 나라(프랑스·이탈리아·스페인·브라질·독일·잉글랜드 등,
+    # 하위 리그까지 다 합치면 팀이 훨씬 많아 라운드가 10개를 넘게 필요함)는
+    # round_counter가 9를 넘어서면 예전 코드(min으로 마지막 칸 고정)가 그 뒤
+    # 모든 라운드를 전부 "42주차"에 몰아넣었다. 그러면 한 주차에 서로 다른
+    # 라운드(예: '10라운드'와 '결승')가 겹치고, 이미 끝난 라운드를 처리하며
+    # "다음 라운드로 진행"이 또 호출돼 결승이 계속 복제되는 무한루프가
+    # 생겼다(실측: round_idx 10~30이 전부 '결승'으로 중복 생성, 대회가
+    # 영원히 안 끝남). 풀을 넘어서면 마지막 주차부터 1주씩 이어 붙여서
+    # 절대 같은 주차에 겹치지 않게 한다(52주 상한은 유지).
+    if round_counter < len(CUP_ROUND_WEEKS_POOL):
+        week = CUP_ROUND_WEEKS_POOL[round_counter]
+    else:
+        extra = round_counter - (len(CUP_ROUND_WEEKS_POOL) - 1)
+        week = min(52, CUP_ROUND_WEEKS_POOL[-1] + extra)
 
     c = conn.cursor()
     for slot in range(0, len(pool), 2):
@@ -420,7 +441,16 @@ def _resolve_pso(h_ovr, a_ovr):
     return winner_home, score
 
 
-def _sim_ai_match(t, m, conn=None):
+def _sim_ai_match(t, m, conn=None, reason="injury", batch=None):
+    """AI끼리(또는 내가 결장한 내 경기) 시뮬.
+    reason: 내 경기(m['is_my'])인데 내가 결장한 사유 — 'injury'(부상) 등.
+    향후 다른 결장 사유가 생기면 호출부에서 이 값만 바꿔 넘기면 된다.
+
+    batch: [2026-07 성능 최적화] 리스트를 넘기면 UPDATE를 즉시 실행하지
+    않고 이 리스트에 튜플만 쌓아둔다 — 호출부(_process_one)가 한 라운드
+    분량을 다 모은 뒤 executemany()로 한 번에 반영한다("1주 진행" 클릭 시
+    컵대회 경기가 많은 라운드일수록 개별 execute() 호출이 누적되던 비용을
+    줄인다 — game_engine._sim_all_ai_matches의 배치 패턴과 동일)."""
     from game_engine import add_log, get_player, _gen_score, _week_intl_cl_day
     he = _entry(t["id"], m["home_team_id"])
     ae = _entry(t["id"], m["away_team_id"])
@@ -439,15 +469,20 @@ def _sim_ai_match(t, m, conn=None):
     # 이제 캐시되지만, 애초에 호출 자체가 불필요했다).
     day = _week_intl_cl_day(m["week"], get_player() or {}) if m["is_my"] else 0
 
-    _own = conn is None
-    if _own:
-        conn = get_conn()
-    conn.execute("""UPDATE cup_matches SET home_score=?, away_score=?,
-                    pso_winner=?, pso_score=?, day=? WHERE id=?""",
-                 (hs, as_, pso_winner, pso_score, day, m["id"]))
-    if _own:
-        conn.commit()
-        conn.close()
+    _absence = reason if m["is_my"] else None
+    _row = (hs, as_, pso_winner, pso_score, day, _absence, m["id"])
+    if batch is not None:
+        batch.append(_row)
+    else:
+        _own = conn is None
+        if _own:
+            conn = get_conn()
+        conn.execute("""UPDATE cup_matches SET home_score=?, away_score=?,
+                        pso_winner=?, pso_score=?, day=?, my_absence_reason=? WHERE id=?""",
+                     _row)
+        if _own:
+            conn.commit()
+            conn.close()
 
     if m["is_my"]:
         p = get_player()
@@ -456,7 +491,8 @@ def _sim_ai_match(t, m, conn=None):
             pso_txt = f"  (승부차기 {pso_score})" if pso_winner else ""
             add_log(f"🏆 {t['name']} {m['round_name']}  "
                     f"{he['team_name']} {hs}-{as_} {ae['team_name']}{pso_txt}", "match")
-            add_log("   🚑 부상으로 컵대회 경기 결장", "match")
+            _reason_ko = {"injury": "부상", "suspension": "출전정지", "bench": "벤치"}.get(reason, reason)
+            add_log(f"   🚑 {_reason_ko}(으)로 컵대회 경기 결장", "match")
 
 
 def _winner_of(m):
@@ -465,11 +501,33 @@ def _winner_of(m):
     return m["home_team_id"] if m["home_score"] > m["away_score"] else m["away_team_id"]
 
 
+def sim_my_cup_match_as_ai(week, p, reason="injury"):
+    """[2026-07 신설, 버그수정] 부상 등으로 내가 못 뛸 때 내 컵대회 경기를
+    AI끼리(내 보너스 없이) 시뮬레이션 — 이게 없으면 그 경기가 영원히
+    home_score=-1(미완료)로 남아 대회 전체 진행이 멈춘다(신민용 리포트:
+    "10월인데 1월 경기가 계속 '예정'으로 남아있다"). simulate_my_cup_match와
+    동일하게 정보를 조회한 뒤 _sim_ai_match로 넘긴다."""
+    info = get_my_cup_match(week)
+    if not info:
+        return
+    conn = get_conn()
+    t = dict(conn.execute("SELECT * FROM cup_tournaments WHERE id=?",
+                          (info["tournament_id"],)).fetchone())
+    m = dict(conn.execute("SELECT * FROM cup_matches WHERE id=?",
+                          (info["match_id"],)).fetchone())
+    conn.close()
+    if m["home_score"] != -1:
+        return  # 이미 처리됨(멱등)
+    _sim_ai_match(t, m, reason=reason)
+
+
 def simulate_my_cup_match(week, p, day=None):
     """내가 출전하는 컵대회 경기."""
     from game_engine import (add_log, get_player, update_player,
                              _player_perf, _my_result, _update_pop, _gen_score,
-                             _save_match_detail)
+                             _save_match_detail, _soft_cap,
+                             _check_suspended, _roll_red_card, _apply_red_card_dismissal)
+    from constants import PERSONALITY_EFFECTS
     info = get_my_cup_match(week)
     if not info:
         return
@@ -484,10 +542,31 @@ def simulate_my_cup_match(week, p, day=None):
     ae = _entry(t["id"], m["away_team_id"])
     is_home = info["is_home"]
 
+    # [2026-07 신설] 출전정지 체크 — 퇴장 다음 경기는 강제 결장(개인 캐리
+    # 보너스·개인 스탯 전부 0), 팀은 나 없이 시뮬레이션된다.
+    _suspended, _new_susp = _check_suspended(p)
+    if _suspended:
+        update_player(red_card_suspension=_new_susp)
+        add_log(f"🟥 출전정지로 결장{'  (다음 경기부터 복귀)' if _new_susp == 0 else f'  (남은 정지 {_new_susp}경기)'}",
+                "event")
+
+    # [2026-07 통일] 리그(game_engine._simulate_match)와 동일한 볼록가속+
+    # 소프트캡 공식으로 교체 — 예전 선형+하드컷(14.0)보다 월드클래스급
+    # 선수의 캐리력이 정확히 반영된다.
     _my_ovr = p.get("ovr", 40)
     _team_ovr = he["ovr"] if is_home else ae["ovr"]
-    _gap = _my_ovr - _team_ovr
-    bonus = min(max(0.0, _gap) * 0.32 + _my_ovr * 0.05, 14.0)
+    _gap = max(0.0, _my_ovr - _team_ovr)
+    _star = 1.0 + max(0.0, (_my_ovr - 60) / 40.0) ** 1.8 * 3.0
+    bonus = _gap * 0.30 * _star + max(0.0, _my_ovr - 50) * 0.08
+    bonus = _soft_cap(bonus, 30.0)
+    # [2026-07 신설] '리더십' 성격의 team_win_bonus — 정의만 돼있고 실제
+    # 경기엔 연결이 안 돼있던 효과. 캐리 보너스에 아주 작은 배율만 얹어서
+    # "주장감 선수가 팀을 살짝 더 끌어올린다" 정도로만 반영한다.
+    _pe = PERSONALITY_EFFECTS.get(p.get("personality", ""), {})
+    if "team_win_bonus" in _pe:
+        bonus *= (1.0 + _pe["team_win_bonus"])
+    if _suspended:
+        bonus = 0.0
     h_ovr = he["ovr"] + (bonus if is_home else 0)
     a_ovr = ae["ovr"] + (0 if is_home else bonus)
 
@@ -498,7 +577,30 @@ def simulate_my_cup_match(week, p, day=None):
         pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
     hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
 
-    goals, assists, saves, rating, events, detail = _player_perf(p, outcome, is_home, hs, as_)
+    if _suspended:
+        goals, assists, saves, rating = 0, 0, 0, 0.0
+        events, detail = [], {"shots": 0, "shots_on": 0, "key_passes": 0,
+                              "dribbles": 0, "blocks": 0, "pass_acc": 0.0}
+        _absence_reason = "suspension"
+    else:
+        # [2026-07 통일] intl_engine(국제대회)과 동일하게 "오늘 상대의 실제 팀
+        # OVR"을 dom 기준으로 넘긴다 — 강팀 상대면 개인도 고전, 약체 상대면
+        # 골·평점이 폭발하도록. he/ae는 보너스 반영 전 원본 팀 OVR이다.
+        _opp_ovr = (ae["ovr"] if is_home else he["ovr"])
+        goals, assists, saves, rating, events, detail = _player_perf(
+            p, outcome, is_home, hs, as_, opp_ovr=_opp_ovr)
+        _absence_reason = None
+        # [2026-07 신설] 퇴장 판정 — '폭력적' 성격의 red_card_chance 반영.
+        if _roll_red_card(p):
+            goals, assists, saves, rating, events, detail = _apply_red_card_dismissal(p)
+            _absence_reason = "red_card"
+    # [2026-07 신설] '겁쟁이' 성격의 cup_rating(컵대회 전반 위축) +
+    # '소심함'의 big_match_rating(결승전 한정 위축) 연결. 둘 다 정의만
+    # 돼있고 실제 경기엔 연결이 안 돼있던 효과였다.
+    if not _suspended and "cup_rating" in _pe:
+        rating = max(3.0, min(10.0, round(rating + _pe["cup_rating"], 1)))
+    if m.get("round_name") == "결승" and not _suspended and "big_match_rating" in _pe:
+        rating = max(3.0, min(10.0, round(rating + _pe["big_match_rating"], 1)))
     my_result = _my_result(outcome, is_home)
 
     # [2026-07 신설] 실제 진행 날짜 저장 (커리어/은퇴창 표시용).
@@ -509,10 +611,12 @@ def simulate_my_cup_match(week, p, day=None):
 
     conn = get_conn()
     conn.execute("""UPDATE cup_matches SET home_score=?, away_score=?,
-                    pso_winner=?, pso_score=?, my_played=1,
-                    my_saves=?, my_goals=?, my_assists=?, my_rating=?, day=?
+                    pso_winner=?, pso_score=?, my_played=?,
+                    my_saves=?, my_goals=?, my_assists=?, my_rating=?, day=?,
+                    my_absence_reason=?
                     WHERE id=?""",
-                 (hs, as_, pso_winner, pso_score, saves, goals, assists, rating, day, m["id"]))
+                 (hs, as_, pso_winner, pso_score, 0 if _suspended else 1,
+                  saves, goals, assists, rating, day, _absence_reason, m["id"]))
     conn.commit()
     conn.close()
 
@@ -577,12 +681,23 @@ def _process_one(t, week):
         return
 
     # 남은 AI끼리 경기를 채운다(내 경기는 이미 그 주 안에 별도로 처리됨).
+    # [2026-07 성능 최적화] 예전엔 경기마다 conn.execute()를 개별 호출했다
+    # ("1주 진행" 시 컵대회 라운드가 큰 주차일수록 체감 지연의 한 원인).
+    # 이제 game_engine._sim_all_ai_matches와 동일하게 batch 리스트에 모아
+    # executemany()로 한 번에 반영한다 — 결과(어느 경기가 몇 대 몇으로
+    # 끝나는지)는 완전히 동일하고, DB 반영 방식만 배치로 바뀐다.
     conn2 = get_conn()
     pending = [dict(r) for r in conn2.execute(
         "SELECT * FROM cup_matches WHERE tournament_id=? AND week=? AND home_score=-1 AND is_my=0",
         (t["id"], week)).fetchall()]
+    _batch = []
     for m in pending:
-        _sim_ai_match(t, m, conn=conn2)
+        _sim_ai_match(t, m, batch=_batch)
+    if _batch:
+        conn2.executemany(
+            """UPDATE cup_matches SET home_score=?, away_score=?,
+               pso_winner=?, pso_score=?, day=?, my_absence_reason=? WHERE id=?""",
+            _batch)
     conn2.commit()
     conn2.close()
 

@@ -77,6 +77,13 @@ class LogPanel(QWidget):
     def __init__(self, main_win=None):
         super().__init__()
         self.main_win = main_win
+        # [2026-07 성능 수정] 아래 refresh() 참고 — 마지막으로 읽은 로그
+        # id를 기억해서 다음부터는 새로 생긴 줄만 가져오기 위한 상태.
+        # 이 위젯은 새 게임/이어하기(_rebuild_main)마다 새로 만들어지므로
+        # (main_window.py에서 매번 LogPanel(self)로 재생성) 0으로 시작해도
+        # 이전 세이브의 로그 id와 섞일 걱정이 없다.
+        self._last_log_id = 0
+        self._initialized = False
         lay = QVBoxLayout(self); lay.setContentsMargins(8,8,8,8); lay.setSpacing(4)
 
         t = QLabel("로그")
@@ -118,9 +125,33 @@ class LogPanel(QWidget):
         dlg.exec()
 
     def refresh(self):
-        lines = get_logs()
-        html_lines = [_colorize(l) for l in lines]
-        html = "<br>".join(html_lines)
-        self.te.setHtml(f'<div style="font-family:\'Malgun Gothic\',monospace;font-size:12px;">{html}</div>')
+        """[2026-07 성능 수정, 신민용 리포트: "20년 쌓였을 때랑 방금
+        시작했을 때랑 next day 속도가 같아야 하는데 다른 것 같다"]
+
+        예전엔 매번 get_logs()로 game_log 테이블 전체(계속 쌓이기만
+        하는 테이블)를 처음부터 다시 읽고, 그 전부를 다시 색칠해서
+        setHtml()로 통째로 다시 그렸다 — 즉 "다음 날" 한 번의 비용이
+        지금까지 쌓인 전체 로그 양에 비례해서 계속 커졌다(플레이 연차가
+        쌓일수록 매일 느려짐).
+
+        이제 마지막으로 읽은 로그 id(self._last_log_id) 이후에 새로
+        생긴 줄만 가져와서 기존 내용 뒤에 append한다 — 하루치 새로
+        생기는 로그 줄 수는 연차와 무관하게 거의 일정하므로, "다음 날"
+        1회당 처리 비용도 항상 일정해진다. 최초 1회(패널이 막 만들어져
+        내용이 하나도 없을 때)만 그때까지의 전체 로그를 한 번에 채운다."""
+        entries, new_last_id = get_logs(self._last_log_id)
+        if not entries:
+            return
+        html_lines = [_colorize(l) for l in entries]
+        chunk_html = "<br>".join(html_lines)
+        if not self._initialized:
+            self.te.setHtml(f'<div style="font-family:\'Malgun Gothic\',monospace;'
+                            f'font-size:12px;">{chunk_html}</div>')
+            self._initialized = True
+        else:
+            # QTextBrowser.append()은 기존 내용을 다시 파싱/렌더링하지 않고
+            # 끝에 새 블록만 덧붙인다 — 여기가 "증분" 갱신의 핵심.
+            self.te.append(chunk_html)
+        self._last_log_id = new_last_id
         sb = self.te.verticalScrollBar()
         sb.setValue(sb.maximum())

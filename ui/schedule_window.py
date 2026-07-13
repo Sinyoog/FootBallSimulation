@@ -341,7 +341,13 @@ class ScheduleWindow(QDialog):
                 status_txt = f"종료  |  🏆 우승: {t['winner']}"
             icon = "🌍"
         hdr = QLabel(f"{icon} {t['name']}  ─  {status_txt}")
-        hdr.setStyleSheet("color:#66ccff;font-size:14px;font-weight:bold;")
+        # [2026-07 색상 규칙 개편, 신민용 요청] 예전엔 국제대회 전부(월드컵/
+        # 대륙컵/예선)가 파란색 하나로 뭉뚱그려 표시됐다. 이제 리그=초록,
+        # 컵=보라, 챔스=황금과 같은 급으로 국제대회도 종류별로 나눈다:
+        #   - 월드컵·대륙컵(본선, kind in world/continent) → 주황
+        #   - 그 외 국가대표 대회(예선 wc_qual 등) → 빨강
+        _hdr_color = "#ff9933" if t.get("kind") in ("world", "continent") else "#ff5555"
+        hdr.setStyleSheet(f"color:{_hdr_color};font-size:14px;font-weight:bold;")
         lay.addWidget(hdr)
         if t["my_selected"] == 1:
             sub = QLabel(f"📣 {nat} 국가대표 소집")
