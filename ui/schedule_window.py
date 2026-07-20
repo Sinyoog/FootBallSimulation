@@ -271,6 +271,14 @@ class ScheduleWindow(QDialog):
         if champs_ko:
             self._tab.addTab(champs_ko, "🏆 챔피언스리그(본선)")
 
+        # [2026-07 신설, 신민용 리포트: "클럽월드컵이 경기 일정에 안 뜬다"]
+        cwc_w = self._make_cwc_tab()
+        if cwc_w:
+            self._tab.addTab(cwc_w, "🌍 클럽 월드컵")
+        cwc_bracket_w = self._make_cwc_bracket_tab()
+        if cwc_bracket_w:
+            self._tab.addTab(cwc_bracket_w, "🌍 클럽 월드컵(본선)")
+
         # [2026-07 신설] 국내 컵대회 탭 — 예전엔 이 탭 자체가 없어서 컵
         # 경기가 로그에만 남고 일정 화면 어디에도 안 보였다.
         cup_w = self._make_cup_tab()
@@ -393,11 +401,11 @@ class ScheduleWindow(QDialog):
             split_row = QHBoxLayout()
             split_row.setSpacing(14)
             left_widget = QWidget()
-            left_widget.setMaximumWidth(420)
             lay_orig = lay          # 아래 기존 코드가 'lay.addWidget(...)'를
             lay = QVBoxLayout(left_widget)   # 그대로 쓰도록 lay를 잠시 왼쪽 컬럼으로 바꿔치기
             lay.setContentsMargins(0, 0, 0, 0)
             lay.setSpacing(10)
+            _max_left_w = 0   # [2026-07 버그수정] 국가명 길이만큼 필요한 폭 추적용
 
             # 진출 기준 계산
             advance_n, has_thirds = _intl_advance_count(t)
@@ -425,7 +433,12 @@ class ScheduleWindow(QDialog):
                 gt.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
                 gt.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
                 gt.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-                gt.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+                # [2026-07 버그수정, 신민용 리포트: "이름이 너무 길어서
+                # 잘리는 경우가 있는데 이름 크기만큼 창이 늘어나서 다
+                # 보이게 하고 싶다"] 0번 컬럼(국가명)이 Stretch라 left_widget
+                # 고정폭(기존 420)에 맞춰 긴 이름이 잘렸다. Stretch를 빼서
+                # 실제 필요한 폭만큼 컬럼이 넓어지게 하고, 그 폭을 아래에서
+                # 창 크기 계산에 반영한다.
                 gt.setStyleSheet(
                     "QTableWidget{background:#1e1e1e;color:#ccc;gridline-color:#2a2a2a;border:1px solid #2a2a2a;}"
                     "QHeaderView::section{background:#252525;color:#888;border:none;padding:3px;}")
@@ -459,6 +472,10 @@ class ScheduleWindow(QDialog):
                         gt.setItem(i, j, item)
 
                 gt.setFixedHeight(gt.verticalHeader().defaultSectionSize() * len(rows) + 28)
+                gt.resizeColumnsToContents()
+                _need_w = sum(gt.columnWidth(j) for j in range(gt.columnCount())) + 24
+                gt.setMinimumWidth(_need_w)
+                _max_left_w = max(_max_left_w, _need_w)
                 lay.addWidget(gt)
 
             # ── 3위 팀 순위표 (3위 진출 대회만: 48개국 월드컵/대륙컵) ──
@@ -506,7 +523,8 @@ class ScheduleWindow(QDialog):
                     tt.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
                     tt.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
                     tt.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-                    tt.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+                    # [2026-07 버그수정] 위 조별 순위표와 동일한 이유로 국가명
+                    # Stretch 제거 — 이름 잘림 방지.
                     tt.setStyleSheet(
                         "QTableWidget{background:#1e1e1e;color:#ccc;gridline-color:#2a2a2a;border:1px solid #2a2a2a;}"
                         "QHeaderView::section{background:#252525;color:#888;border:none;padding:3px;}")
@@ -551,6 +569,10 @@ class ScheduleWindow(QDialog):
                             row_i += 1
 
                     tt.setFixedHeight(tt.verticalHeader().defaultSectionSize() * total_rows + 28)
+                    tt.resizeColumnsToContents()
+                    _need_w_tt = sum(tt.columnWidth(j) for j in range(tt.columnCount())) + 24
+                    tt.setMinimumWidth(_need_w_tt)
+                    _max_left_w = max(_max_left_w, _need_w_tt)
                     lay.addWidget(tt)
 
             # 범례
@@ -578,10 +600,23 @@ class ScheduleWindow(QDialog):
                 group_key="grp", group_label_fmt="{}조 일정"))
             right_lay.addStretch()
 
+            left_widget.setMinimumWidth(_max_left_w)
             split_row.addWidget(left_widget, 0)
             split_row.addWidget(right_widget, 1)
             lay = lay_orig
             lay.addLayout(split_row)
+
+            # [2026-07 버그수정] left_widget 고정폭(기존 420) 캡을 없앤 대신,
+            # 실제 필요한 폭(_max_left_w)을 창 크기 계산에 반영 — CL 탭과
+            # 동일한 이유(_build_grouped_fixture_column의 자체 resize는
+            # 왼쪽 폭을 고정값으로 가정하므로, 이름이 길어 그보다 넓어지면
+            # 여기서 다시 한번 정확히 계산해줘야 한다).
+            _want_total = _max_left_w + getattr(self, "_max_fixture_w_seen", 0) + 60
+            if _want_total > self.width():
+                from PyQt6.QtWidgets import QApplication
+                scr = QApplication.primaryScreen()
+                max_w = (scr.availableGeometry().width() - 40) if scr else 1600
+                self.resize(min(_want_total, max_w), self.height())
 
         # ── 토너먼트 브래킷 (본선 KO / 예선 PO 공용) ──
         if mode in ("ko", "qual_po") and ko_rows:
@@ -704,7 +739,6 @@ class ScheduleWindow(QDialog):
             split_row = QHBoxLayout()
             split_row.setSpacing(14)
             left_widget = QWidget()
-            left_widget.setMaximumWidth(460)
             left_lay = QVBoxLayout(left_widget)
             left_lay.setContentsMargins(0, 0, 0, 0)
             left_lay.setSpacing(10)
@@ -722,8 +756,12 @@ class ScheduleWindow(QDialog):
             gt.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
             gt.verticalHeader().setVisible(False)
             gt.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            # [2026-07 버그수정, 신민용 리포트: "바르셀로나... 처럼 이름이
+            # 잘린다"] 팀명 컬럼(1번)이 Stretch라 left_widget의 고정 최대폭
+            # (기존 460)에 맞춰 긴 이름이 그냥 잘렸다. ResizeToContents로
+            # 바꿔서 테이블이 이름 길이만큼 필요한 폭을 요구하게 하고,
+            # 그 폭에 맞춰 왼쪽 컬럼·창을 늘린다(아래 결과 채운 뒤 처리).
             gt.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-            gt.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
             gt.setStyleSheet(
                 "QTableWidget{background:#1e1e1e;color:#ccc;gridline-color:#2a2a2a;border:1px solid #2a2a2a;}"
                 "QHeaderView::section{background:#252525;color:#888;border:none;padding:3px;}")
@@ -754,6 +792,10 @@ class ScheduleWindow(QDialog):
                     gt.setItem(i, j, item)
 
             gt.setFixedHeight(gt.verticalHeader().defaultSectionSize() * len(rows) + 28)
+            gt.resizeColumnsToContents()
+            _need_w = sum(gt.columnWidth(j) for j in range(gt.columnCount())) + 24
+            gt.setMinimumWidth(_need_w)
+            left_widget.setMinimumWidth(_need_w)
             left_lay.addWidget(gt)
 
             hint = QLabel(f"🟢1~{direct_cut}위 직행  🟡{direct_cut+1}~{playoff_cut}위 플레이오프  "
@@ -791,6 +833,18 @@ class ScheduleWindow(QDialog):
             split_row.addWidget(left_widget, 0)
             split_row.addWidget(right_widget, 1)
             lay.addLayout(split_row)
+
+            # [2026-07 버그수정] left_widget의 고정 maxWidth(460)를 없앤 대신,
+            # 실제로 필요한 폭(_need_w, 팀명 길이 반영)을 창 크기 계산에
+            # 반영한다 — _build_grouped_fixture_column 내부의 자체 resize는
+            # 왼쪽 폭을 고정 360으로 가정해서, 이름이 길어 왼쪽이 그보다
+            # 넓어지면 그 가정이 틀려 창이 다시 좁게 잡힐 수 있다.
+            _want_total = _need_w + getattr(self, "_max_fixture_w_seen", 0) + 60
+            if _want_total > self.width():
+                from PyQt6.QtWidgets import QApplication
+                scr = QApplication.primaryScreen()
+                max_w = (scr.availableGeometry().width() - 40) if scr else 1600
+                self.resize(min(_want_total, max_w), self.height())
 
         # ── 토너먼트 브래킷 (플레이오프 포함) ──
         from ui.bracket_widget import BracketWidget, build_rounds_from_matches
@@ -865,6 +919,250 @@ class ScheduleWindow(QDialog):
         target_h = min(max(self.height(), want_h), max_h)
         if target_w > self.width() or target_h > self.height():
             self.resize(target_w, target_h)
+
+    def _make_cwc_tab(self):
+        """[2026-07 신설, 신민용 리포트: "클럽월드컵이 경기 일정에 안 뜬다"]
+        [2026-07 개편, 신민용 리포트: "클럽월드컵이 컵대회처럼 단순 표로
+        뜨는데, 국제대회 예선처럼 좌측 조별 순위표 / 우측 조별 일정으로
+        나눠서 보고 싶다"] 조별리그 8개조×4팀 구조는 국제대회 조별리그와
+        똑같은 형태이므로, 컵대회식 단순 표 대신 _make_intl_tab의 "groups"
+        모드와 같은 2단 분할 레이아웃(좌: 조별 순위표 / 우: 조별 일정,
+        _build_grouped_fixture_column 재사용)으로 통일한다. 토너먼트 단계는
+        여전히 _make_cwc_bracket_tab에서 따로 그린다."""
+        import club_world_cup_engine as cwe
+        from game_engine import get_state, get_player
+        from PyQt6.QtWidgets import QScrollArea
+
+        st = get_state()
+        p = get_player()
+        if not st or not p or not p.get("current_team_id"):
+            return None
+
+        conn = get_conn()
+        t = conn.execute(
+            "SELECT * FROM cwc_tournaments WHERE year=? AND my_in=1",
+            (st["current_year"],)).fetchone()
+        if not t:
+            conn.close()
+            return None
+        t = dict(t)
+        groups = [r["grp"] for r in conn.execute(
+            "SELECT DISTINCT grp FROM cwc_entries WHERE tournament_id=? ORDER BY grp",
+            (t["id"],)).fetchall()]
+        grp_match_rows = [dict(r) for r in conn.execute(
+            """SELECT * FROM cwc_matches WHERE tournament_id=? AND stage='group'
+               ORDER BY week, grp, id""", (t["id"],)).fetchall()]
+        entries = {e["team_id"]: dict(e) for e in conn.execute(
+            "SELECT team_id, team_name, country FROM cwc_entries WHERE tournament_id=?",
+            (t["id"],)).fetchall()}
+        conn.close()
+        if not groups:
+            return None
+
+        my_tid = p["current_team_id"]
+
+        outer = QScrollArea()
+        outer.setWidgetResizable(True)
+        outer.setStyleSheet("QScrollArea{border:none;background:#1e1e1e;}")
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(10)
+
+        hdr = QLabel(f"🌍 {t['year']}년 클럽 월드컵 (조별리그)" +
+                     (f"  —  현재 성적: {t['my_result']}" if t.get("my_result") else ""))
+        hdr.setStyleSheet("color:#4dd2ff;font-size:14px;font-weight:bold;")
+        lay.addWidget(hdr)
+
+        # ── 좌: 조별 순위표 / 우: 조별 경기 일정 (2026-07 국제대회 탭과 동일한 2단 레이아웃) ──
+        split_row = QHBoxLayout()
+        split_row.setSpacing(14)
+        left_widget = QWidget()
+        left_lay = QVBoxLayout(left_widget)
+        left_lay.setContentsMargins(0, 0, 0, 0)
+        left_lay.setSpacing(10)
+
+        lbl_g = QLabel("◼ 조별리그")
+        lbl_g.setStyleSheet("color:#00cc44;font-weight:bold;font-size:12px;")
+        left_lay.addWidget(lbl_g)
+
+        # [2026-07] 팀명 컬럼은 국가명까지 붙어 길어질 수 있어(예: "레알
+        # 마드리드(스페인)") Stretch 대신 ResizeToContents로 실제 필요한
+        # 폭을 요구하게 하고, 그 폭에 맞춰 왼쪽 컬럼과 창을 넓힌다 —
+        # _build_grouped_fixture_column에서 이미 쓰던 것과 동일한 패턴.
+        _max_left_w = 0
+        for g in groups:
+            rows = cwe.get_cwc_group_standings(t["id"], g)
+            gt = QTableWidget(len(rows), 7)
+            gt.setHorizontalHeaderLabels([f"{g}조", "경기", "승", "무", "패", "득실", "승점"])
+            gt.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+            gt.verticalHeader().setVisible(False)
+            gt.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            gt.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            gt.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+            gt.setStyleSheet(
+                "QTableWidget{background:#1e1e1e;color:#ccc;gridline-color:#2a2a2a;border:1px solid #2a2a2a;}"
+                "QHeaderView::section{background:#252525;color:#888;border:none;padding:3px;}")
+
+            for i, r in enumerate(rows):
+                name = cwe.team_display(r["team_name"], r["country"])
+                gd = r["gf"] - r["ga"]
+                vals = [name, str(r["p"]), str(r["w"]), str(r["d"]), str(r["l"]),
+                        f"{'+' if gd>0 else ''}{gd}", str(r["pts"])]
+                is_my = r["team_id"] == my_tid
+                color = COLOR_MY if is_my else (COLOR_ADVANCE if i < 2 else COLOR_ELIM)
+                for j, v in enumerate(vals):
+                    item = QTableWidgetItem(v)
+                    if j > 0: item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    item.setForeground(color)
+                    gt.setItem(i, j, item)
+
+            gt.setFixedHeight(gt.verticalHeader().defaultSectionSize() * max(len(rows), 1) + 28)
+            gt.resizeColumnsToContents()
+            _need_w = sum(gt.columnWidth(j) for j in range(gt.columnCount())) + 24
+            gt.setMinimumWidth(_need_w)
+            _max_left_w = max(_max_left_w, _need_w)
+            left_lay.addWidget(gt)
+
+        hint = QLabel("🟢조 1~2위(16강 진출)  🔵내 팀  ⬜조 3~4위(탈락)")
+        hint.setStyleSheet("color:#666;font-size:10px;margin-top:4px;")
+        left_lay.addWidget(hint)
+        left_lay.addStretch()
+        left_widget.setMinimumWidth(_max_left_w)
+
+        # 우측: 조별 경기 일정
+        right_widget = QWidget()
+        right_lay = QVBoxLayout(right_widget)
+        right_lay.setContentsMargins(0, 0, 0, 0)
+        right_lay.setSpacing(6)
+        lbl_sched = QLabel("◼ 경기 일정")
+        lbl_sched.setStyleSheet("color:#00cc44;font-weight:bold;font-size:12px;")
+        right_lay.addWidget(lbl_sched)
+
+        fixture_rows = []
+        for m in grp_match_rows:
+            he = entries.get(m["home_team_id"])
+            ae = entries.get(m["away_team_id"])
+            fixture_rows.append({
+                "week": m["week"], "grp": m["grp"],
+                "home": cwe.team_display(he["team_name"], he["country"]) if he else "?",
+                "away": cwe.team_display(ae["team_name"], ae["country"]) if ae else "?",
+                "home_score": m["home_score"], "away_score": m["away_score"],
+                "pso_winner": m["pso_winner"],
+                "is_my": m["home_team_id"] == my_tid or m["away_team_id"] == my_tid,
+            })
+        right_lay.addWidget(self._build_grouped_fixture_column(
+            fixture_rows, {}, None, p, t["year"],
+            group_key="grp", group_label_fmt="{}조 일정"))
+        right_lay.addStretch()
+
+        split_row.addWidget(left_widget, 0)
+        split_row.addWidget(right_widget, 1)
+        lay.addLayout(split_row)
+        lay.addStretch()
+
+        _want_total = _max_left_w + getattr(self, "_max_fixture_w_seen", 0) + 60
+        if _want_total > self.width():
+            from PyQt6.QtWidgets import QApplication
+            scr = QApplication.primaryScreen()
+            max_w = (scr.availableGeometry().width() - 40) if scr else 1600
+            self.resize(min(_want_total, max_w), self.height())
+
+        outer.setWidget(body)
+        return outer
+
+    def _make_cwc_bracket_tab(self):
+        """[2026-07 신설, 신민용 확정: "클럽월드컵도 기본탭/본선으로 나눠야"]
+        16강~결승/3·4위전을 챔스·컵대회와 같은 토너먼트 대진표로 보여준다."""
+        import club_world_cup_engine as cwe
+        from game_engine import get_state, get_player
+
+        st = get_state()
+        p = get_player()
+        if not st or not p or not p.get("current_team_id"):
+            return None
+
+        conn = get_conn()
+        t = conn.execute(
+            "SELECT * FROM cwc_tournaments WHERE year=? AND my_in=1",
+            (st["current_year"],)).fetchone()
+        if not t:
+            conn.close()
+            return None
+        t = dict(t)
+
+        my_tid = p["current_team_id"]
+        rows = [dict(r) for r in conn.execute(
+            """SELECT * FROM cwc_matches WHERE tournament_id=?
+               AND stage IN ('R16','QF','SF','TP','F')
+               ORDER BY CASE stage WHEN 'R16' THEN 0 WHEN 'QF' THEN 1
+                        WHEN 'SF' THEN 2 WHEN 'TP' THEN 3 WHEN 'F' THEN 3 END,
+               id ASC""", (t["id"],)).fetchall()]
+        if not rows:
+            conn.close()
+            return None
+
+        entries = {r["team_id"]: dict(r) for r in conn.execute(
+            "SELECT * FROM cwc_entries WHERE tournament_id=?", (t["id"],)).fetchall()}
+        conn.close()
+
+        def _nm(team_id):
+            e = entries.get(team_id)
+            return cwe.team_display(e["team_name"], e["country"]) if e else "?"
+
+        stage_ko = {"R16": "16강", "QF": "8강", "SF": "4강", "F": "결승", "TP": "3/4위전"}
+        stage_order = {"R16": 0, "QF": 1, "SF": 2, "F": 3, "TP": 3}
+
+        bracket_matches = []
+        for m in rows:
+            hs, as_ = m["home_score"], m["away_score"]
+            played = hs is not None and hs >= 0
+            home_nm, away_nm = _nm(m["home_team_id"]), _nm(m["away_team_id"])
+            if played:
+                winner_id = m["pso_winner"] or (m["home_team_id"] if hs > as_ else m["away_team_id"])
+                winner = home_nm if winner_id == m["home_team_id"] else away_nm
+            else:
+                winner = ""
+            if m["home_team_id"] == my_tid: my_side = "home"
+            elif m["away_team_id"] == my_tid: my_side = "away"
+            else: my_side = None
+            bracket_matches.append({
+                "stage": stage_ko.get(m["stage"], m["stage"]), "week": m["week"],
+                "home": home_nm, "away": away_nm, "home_flag": "", "away_flag": "",
+                "hs": hs if played else -1, "as_": as_ if played else -1,
+                "winner": winner, "pso": m["pso_score"] if m["pso_winner"] else "",
+                "my_side": my_side,
+            })
+
+        from PyQt6.QtWidgets import QScrollArea
+        from ui.bracket_widget import BracketWidget, build_rounds_from_matches
+
+        outer = QScrollArea()
+        outer.setWidgetResizable(True)
+        outer.setStyleSheet("QScrollArea{border:none;background:#1e1e1e;}")
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(10)
+
+        hdr = QLabel(f"🌍 {t['year']}년 클럽 월드컵  (본선: 16강~)" +
+                     (f"  —  현재 성적: {t['my_result']}" if t.get("my_result") else ""))
+        hdr.setStyleSheet("color:#4dd2ff;font-size:14px;font-weight:bold;")
+        lay.addWidget(hdr)
+
+        lbl_t = QLabel("◼ 토너먼트")
+        lbl_t.setStyleSheet("color:#00cc44;font-weight:bold;font-size:12px;")
+        lay.addWidget(lbl_t)
+
+        stage_order_named = {stage_ko.get(k, k): v for k, v in stage_order.items()}
+        rounds = build_rounds_from_matches(bracket_matches, stage_order_named)
+        bracket = BracketWidget(rounds)
+        lay.addWidget(bracket)
+        self._fit_to_bracket(bracket)
+
+        lay.addStretch()
+        outer.setWidget(body)
+        return outer
 
     def _make_cup_tab(self):
         """[2026-07 신설] 국내 컵대회(FA컵식) 일정/결과 탭. 챔스처럼 별도
@@ -1083,8 +1381,10 @@ class ScheduleWindow(QDialog):
             tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             tbl.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-            tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-            tbl.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+            # [2026-07 버그수정, 신민용 리포트] 예전엔 홈/원정 컬럼이 Stretch라
+            # 창 폭에 맞춰 팀명이 그냥 잘렸다("...") — ResizeToContents로 바꿔서
+            # 테이블 자체가 팀명 길이만큼 필요한 폭을 요구하게 하고, 아래에서
+            # 창 크기를 그 폭에 맞춰 늘려준다.
             tbl.setStyleSheet(
                 "QTableWidget{background:#1e1e1e;color:#ccc;gridline-color:#2a2a2a;border:1px solid #2a2a2a;}"
                 "QHeaderView::section{background:#252525;color:#888;border:none;padding:3px;}")
@@ -1111,7 +1411,21 @@ class ScheduleWindow(QDialog):
                         item.setForeground(COLOR_PENDING)
                     tbl.setItem(i, j, item)
             tbl.setFixedHeight(tbl.verticalHeader().defaultSectionSize() * max(len(group_rows), 1) + 28)
+            tbl.resizeColumnsToContents()
+            _need_w = sum(tbl.columnWidth(j) for j in range(tbl.columnCount())) + 40
+            tbl.setMinimumWidth(_need_w)
             col.addWidget(tbl)
+            _max_fixture_w = max(getattr(self, "_max_fixture_w_seen", 0), _need_w)
+            self._max_fixture_w_seen = _max_fixture_w
+
+        # [2026-07 버그수정] 위에서 계산한 '팀명이 안 잘리는 최소 폭'만큼
+        # 창이 좁으면 늘려준다 — 왼쪽 순위표 폭(대략 320)까지 감안.
+        _want_total = getattr(self, "_max_fixture_w_seen", 0) + 360
+        if _want_total > self.width():
+            from PyQt6.QtWidgets import QApplication
+            scr = QApplication.primaryScreen()
+            max_w = (scr.availableGeometry().width() - 40) if scr else 1600
+            self.resize(min(_want_total, max_w), self.height())
 
         return box
 

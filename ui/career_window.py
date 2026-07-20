@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
 
-from game_engine import get_player, fmt_money, get_my_promotions
+from game_engine import get_player, fmt_money, get_my_promotions, get_state
 from database import get_conn
 from constants import format_result_with_absence
 
@@ -126,6 +126,7 @@ class CareerWindow(QDialog):
 
         tabs = QTabWidget()
         tabs.addTab(self._team_tab(entries),  "팀 이력")
+        tabs.addTab(self._club_totals_tab(entries), "전체 이력")
         tabs.addTab(self._trophy_tab(trophies), f"성적 ({len(trophies)})")
         tabs.addTab(self._award_tab(awards), f"개인 수상 ({len(awards)})")
         tabs.addTab(self._promo_tab(promos),  f"승강 ({len(promos)})")
@@ -145,6 +146,11 @@ class CareerWindow(QDialog):
         import cup_engine
         cup_ms = cup_engine.get_my_cup_matches()
         tabs.addTab(self._cup_tab(cup_ms), f"컵대회 ({len(cup_ms)})")
+
+        import club_world_cup_engine
+        cwc_ms = club_world_cup_engine.get_my_cwc_matches()
+        if cwc_ms:
+            tabs.addTab(self._cwc_tab(cwc_ms), f"클럽 월드컵 ({len(cwc_ms)})")
         root.addWidget(tabs)
         tabs.currentChanged.connect(lambda: self._fit_width())
 
@@ -304,11 +310,38 @@ class CareerWindow(QDialog):
             # 이적란: 나간 경로가 있으면 그걸 우선 표시(팔림/방출/이적/계약만료),
             # 없으면(재직 중이거나 정상) 들어온 경로 표시
             t_type = exit_t if exit_t else in_type
+            # [2026-07 재수정, 신민용 지적: "임대(2003)이 아니라 임대(임대기간)로,
+            # 계약엔 임대보낸 팀 계약 기간을 그대로 가져가는 게 맞다"]
+            # 계약 컬럼은 다시 원소속팀 계약년수(c_yrs)를 그대로 보여주고
+            # (임대는 새 계약이 아니라 원소속팀 계약을 유지한 채 팀만 옮기는
+            # 것이므로), 대신 "이적" 컬럼 쪽에 실제 임대 기간(개월/년)을
+            # "임대(N개월)"처럼 표기한다.
+            if t_type in ("임대", "임대 종료"):
+                _label = t_type
+                if ey:
+                    total_weeks = max(1, (ey - sy) * 52 + (ew - sw))
+                    months = max(1, round(total_weeks / 4.33))
+                    if months >= 12:
+                        _yrs, _rem = divmod(months, 12)
+                        dur = f"{_yrs}년" if _rem == 0 else f"{_yrs}년 {_rem}개월"
+                    else:
+                        dur = f"{months}개월"
+                else:
+                    dur = "진행중"
+                t_type = f"{_label}({dur})"
             cur_team = e.get("team_name", "")
-            
+
             # 계약 컬럼: 팀 변경 또는 연장 시에만 년수 표시
-            if i == 0 or cur_team != entries[i-1].get("team_name"):
-                # 팀이 바뀌었거나 첫 행 → 입단 (년수 표시)
+            # [2026-07 신설, 신민용 지적: "커리어 UI에도 임대 처리했나"]
+            # 임대는 원소속팀 계약(연봉·계약년수·contract_end_year)을 그대로
+            # 유지한 채 팀만 임시로 옮기는 것이므로, 계약 컬럼엔 다른 팀
+            # 이적/입단과 동일하게 원소속팀 계약 년수를 그대로 보여준다
+            # (신민용 지적: "계약에는 임대보낸 팀 계약 기간을 그대로 가는
+            # 게 맞다" — 임대처와 새로 계약을 맺은 것처럼 보이지 않도록
+            # 별도 문구로 덮어쓰지 않는다).
+            if in_type == "임대" or i == 0 or cur_team != entries[i-1].get("team_name"):
+                # 임대, 또는 팀이 바뀌었거나 첫 행 → 계약년수 표시
+                # (임대는 원소속팀 계약을 그대로 유지하므로 동일하게 취급)
                 c_str = f"{c_yrs}년" if c_yrs else "—"
                 prev_team = cur_team
             elif in_type == "연장" or t_type == "연장":
@@ -322,8 +355,8 @@ class CareerWindow(QDialog):
             # 건지 절반만 뛴 건지 알 수 없어서, 그 리그의 풀시즌 경기 수를
             # 분모로 같이 보여준다("26/38"). 못 찾으면(리그명 매칭 실패 등)
             # 그냥 숫자만 표시.
-            from game_engine import league_total_games_by_name
-            _total_g = league_total_games_by_name(ln)
+            from game_engine import team_matches_played_in_window
+            _total_g = team_matches_played_in_window(tn, ln, sy, sw, ey, ew)
             _apps_str = f"{e.get('matches',0)}/{_total_g}" if _total_g else str(e.get("matches", 0))
             vals = ([period, pos, country_str, league_str, tn,
                      fmt_money(e.get("salary",0)),
@@ -335,6 +368,144 @@ class CareerWindow(QDialog):
             for j, v in enumerate(vals):
                 self._set(tbl, i, j, v, tt_color if j == len(vals)-1 else None)
         lay.addWidget(tbl)
+        return w
+
+    def _club_totals_tab(self, entries):
+        """[2026-07 신설 → 재수정 → 재작성 → 재확장, 신민용 지적/요청]
+        팀 이력과 동일한 포지션별 상세 컬럼 구조로 리그 외(컵+챔스+
+        클럽월드컵+국가대표) 기록까지 합산해서 보여준다. 처음엔 슈팅/
+        드리블 등 세부 스탯이 컵대회·클럽월드컵엔 저장 안 된다고 판단했지만
+        (챔스/국제전은 이미 저장하고 있었음), cup_matches/cwc_matches에
+        컬럼을 추가하고 cup_engine.py/club_world_cup_engine.py가 이미
+        _player_perf로 계산해두고 버리던 detail을 저장하도록 고쳐서
+        이제 4개 대회 전부 실제 값으로 합산된다."""
+        w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(0, 0, 0, 0)
+        if not entries:
+            lay.addWidget(QLabel("기록 없음")); return w
+
+        def _is_empty_short(e):
+            if e.get("end_year", 0) == 0:  return False
+            if e.get("matches", 0) != 0:   return False
+            sy = e.get("start_year", 0); ey = e.get("end_year", 0)
+            sw = e.get("start_week", 1); ew = e.get("end_week", 0)
+            return sy == ey and (ew - sw) <= 4
+
+        from constants import position_group
+        _mypos = get_player().get("position", "")
+        _grp = position_group(_mypos)
+        if _grp == "GK":
+            stat_cols = ["골", "어시", "선방", "실점", "선방률", "CS"]
+        elif _grp == "DEF":
+            stat_cols = ["골", "어시", "무실점", "차단", "패스%", "평점기여"]
+        elif _mypos in ("CM", "CDM", "CAM"):
+            stat_cols = ["골", "어시", "기회창출", "패스%", "차단", "드리블"]
+        else:
+            stat_cols = ["골", "어시", "슈팅", "유효", "기회창출", "드리블"]
+        cols = ["기간", "팀명", "리그", "출전"] + stat_cols + ["평균평점", "승무패"]
+
+        visible = [e for e in entries if not _is_empty_short(e)]
+        tbl = self._make_table(len(visible), cols)
+
+        from game_engine import get_full_history_extras_for_period, team_matches_played_in_window
+        _nat = get_player().get("nationality", "")
+        for i, e in enumerate(visible):
+            sy = e.get("start_year", ""); sw = e.get("start_week", 1)
+            ey = e.get("end_year", "");   ew = e.get("end_week", 0)
+            from constants import week_to_iso_date_str
+            start_str = week_to_iso_date_str(sy, sw) if sy else ""
+            if ey == 0:
+                period = f"{start_str} ~ 현재"
+            else:
+                ew_disp = 52 if ew >= 50 else ew
+                period = f"{start_str} ~ {week_to_iso_date_str(ey, ew_disp)}"
+
+            # [2026-07 버그수정, 위 평균평점 버그를 추적하다 같이 발견]
+            # ey가 0(진행 중인 현재 스틴트)일 때 "ey or sy or 0"으로 넘기면
+            # end_year가 시작 연도(sy) 그 자체가 되어버려서, 실제로는
+            # "start_year ~ 현재"까지 열린 컵/챔스/클럽WC/국가대표 경기를
+            # "start_year ~ start_year"(그 해 단 1년) 범위로 뭉개버렸다 —
+            # 진행 중인 스틴트일수록 이 창(extras)이 놓치는 기간이 커진다.
+            # team_matches_played_in_window와 동일하게, 진행 중이면 현재
+            # 연도까지로 맞춘다.
+            _extras_end_year = ey if ey else get_state().get("current_year", sy or 0)
+            extras = get_full_history_extras_for_period(
+                e.get("team_id", 0), _nat, sy or 0, _extras_end_year)
+
+            # 출전: 리그 출전/분모 + 그 외 대회 출전/분모 (팀 이력의 '22/24'와 동일 원리)
+            _league_total = team_matches_played_in_window(
+                e.get("team_name", ""), e.get("league_name", ""), sy, sw, ey, ew or 52) or 0
+            grand_played = e.get("matches", 0) + extras["matches_played"]
+            grand_avail = _league_total + extras["matches_available"]
+            apps_str = f"{grand_played}/{grand_avail}" if grand_avail else str(grand_played)
+
+            g = e.get("goals", 0) + extras["goals"]
+            a = e.get("assists", 0) + extras["assists"]
+            sv = e.get("saves", 0) + extras["saves"]
+            ga = e.get("goals_against", 0) + extras["goals_against"]
+            cs = e.get("clean_sheets", 0) + extras["clean_sheets"]
+            save_rate = f"{round(sv/(sv+ga)*100,1)}%" if (sv + ga) > 0 else "—"
+
+            # 평점: 리그 평점 합계·횟수 + 그 외 대회 평점 합계·횟수를 합쳐 가중평균
+            # [2026-07 버그수정, 신민용 리포트: "전체 이력 평균평점이 빈칸(-)으로
+            # 나온다"] career_entries 테이블엔 애초에 season_rating_cnt/
+            # season_rating_sum 컬럼이 없다(avg_rating만 있음) — 그런데 이 줄은
+            # "e.get('season_rating_cnt', 0)"으로 항상 0을 얻어놓고, 그 0을
+            # "_rc"(가중치)로 써서 "avg_rating * _rc"를 계산하니 실제 평점이
+            # 9.9든 뭐든 상관없이 무조건 0 * 어떤값 = 0으로 지워져버렸다(심지어
+            # 삼항식이 _rc==0이면 곱셈 자체를 안 하고 그냥 0을 반환하도록 짜여
+            # 있어서 더 명확한 버그). 리그 실적을 다른 대회(컵/챔스/클럽WC)
+            # 실적과 가중평균으로 합치려면 "이 스틴트에서 몇 경기를 뛰었는가"가
+            # 가중치여야 하는데, 그 값은 career_entries에 실제로 존재하는
+            # "matches" 컬럼을 쓰면 된다.
+            _rc = e.get("matches", 0)
+            _av = e.get("avg_rating", 0)
+            _rs = (_av * _rc) if (_av and _rc) else 0
+            _tot_rs = _rs + extras["rating_sum"]
+            _tot_rc = _rc + extras["rating_cnt"]
+            avg = f"{round(_tot_rs/_tot_rc, 1)}" if _tot_rc else "—"
+
+            # [2026-07 신설, 신민용 요청: "테이블 컬럼에 추가해서 ㄱㄱ"]
+            # cup_matches/cwc_matches에도 my_shots 등 컬럼을 추가하고
+            # cup_engine.py/club_world_cup_engine.py가 이미 계산해뒀던
+            # detail을 저장하도록 고쳐서, 이제 진짜로 합산 가능해졌다.
+            shots = e.get("shots", 0) + extras["shots"]
+            shots_on = e.get("shots_on", 0) + extras["shots_on"]
+            key_passes = e.get("key_passes", 0) + extras["key_passes"]
+            dribbles = e.get("dribbles", 0) + extras["dribbles"]
+            blocks = e.get("blocks", 0) + extras["blocks"]
+            # 패스%: 리그는 스틴트당 평균값 하나만 저장돼 있어 출전 경기수로
+            # 가중치를 줘서(그 경기수만큼의 표본으로 취급) 대회별 평균과 합친다.
+            _lg_pa = e.get("pass_acc", 0); _lg_m = e.get("matches", 0)
+            _pa_sum = (_lg_pa * _lg_m if _lg_pa and _lg_m else 0) + extras["pass_acc_sum"]
+            _pa_cnt = (_lg_m if _lg_pa and _lg_m else 0) + extras["pass_acc_cnt"]
+            pass_acc_str = f"{round(_pa_sum/_pa_cnt*100)}%" if _pa_cnt else "—"
+
+            _val_map = {
+                "골": str(g), "어시": str(a),
+                "선방": str(sv), "실점": str(ga), "선방률": save_rate, "CS": str(cs),
+                "무실점": str(cs),
+                "차단": str(blocks), "패스%": pass_acc_str, "평점기여": avg,
+                "기회창출": str(key_passes), "드리블": str(dribbles),
+                "슈팅": str(shots), "유효": str(shots_on),
+            }
+            stat_vals = [_val_map.get(sc, "—") for sc in stat_cols]
+
+            # [2026-07 신설, 신민용 리포트: "전체 이력에 승패 표시가 사라졌어"]
+            _tw = e.get("wins", 0) + extras["wins"]
+            _td = e.get("draws", 0) + extras["draws"]
+            _tl = e.get("losses", 0) + extras["losses"]
+            wdl_str = f"{_tw}승{_td}무{_tl}패"
+
+            vals = ([period, e.get("team_name", ""),
+                     f"{e.get('league_name','')} ({e.get('tier','')}부)",
+                     apps_str]
+                    + stat_vals + [avg, wdl_str])
+            for j, v in enumerate(vals):
+                self._set(tbl, i, j, v)
+        lay.addWidget(tbl)
+        hint = QLabel("리그 + 컵대회 + 챔피언스리그 + 클럽월드컵 + 국가대표(예선 포함) 합산")
+        hint.setStyleSheet("color:#666;font-size:10px;padding:4px;")
+        lay.addWidget(hint)
         return w
 
     def _country_of_league(self, league_name):
@@ -515,10 +686,13 @@ class CareerWindow(QDialog):
         w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(0,0,0,0)
 
         # 대회별 성적(우승/몇강) 요약 (cl_history)
+        # [2026-07 주의] cl_history는 클럽월드컵 기록도 competition="클럽 월드컵"으로
+        # 같이 저장되므로(재사용), 이 챔스 탭에서는 반드시 제외해야 섞이지 않는다.
         conn = get_conn()
         try:
             hist = [dict(r) for r in conn.execute(
-                "SELECT * FROM cl_history ORDER BY year").fetchall()]
+                "SELECT * FROM cl_history WHERE competition!=? ORDER BY year",
+                ("클럽 월드컵",)).fetchall()]
         except Exception:
             hist = []
         conn.close()
@@ -567,6 +741,46 @@ class CareerWindow(QDialog):
                     str(m["goals"]), str(m["assists"])]
                     + [_emap.get(c, "—") for c in extra_cols]
                     + [str(m["rating"]), m["score"], format_result_with_absence(m)])
+            for j, v in enumerate(vals):
+                self._set(tbl, i, j, v, color if j == len(vals) - 1 else None)
+        lay.addWidget(tbl)
+        return w
+
+    def _cwc_tab(self, matches):
+        """[2026-07 신설] 클럽 월드컵 경기별 기록. cup_tab과 같은 톤(세부 스탯 없이
+        골/어시/선방/평점 중심)으로 보여준다. cl_history를 재사용하므로
+        competition='클럽 월드컵'으로 반드시 필터링해서 챔스 기록과 안 섞이게 한다."""
+        w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(0, 0, 0, 0)
+
+        conn = get_conn()
+        try:
+            hist = [dict(r) for r in conn.execute(
+                "SELECT * FROM cl_history WHERE competition=? ORDER BY year",
+                ("클럽 월드컵",)).fetchall()]
+        except Exception:
+            hist = []
+        conn.close()
+
+        if hist:
+            parts = [f"{h['year']}년 {h['result']}" for h in hist]
+            hl = QLabel("🌍 " + "   ·   ".join(parts))
+            hl.setStyleSheet("color:#4dd2ff;font-size:12px;font-weight:bold;padding:4px;")
+            hl.setWordWrap(True)
+            lay.addWidget(hl)
+
+        if not matches:
+            lay.addWidget(QLabel("클럽 월드컵 출전 기록 없음"))
+            return w
+
+        cols = ["기간", "대회", "상대", "골", "어시", "선방", "실점", "평점", "스코어", "결과"]
+        tbl = self._make_table(len(matches), cols)
+        for i, m in enumerate(matches):
+            res = m["result"]
+            color = ("#00cc44" if res.startswith("승")
+                     else "#888888" if res == "무" else "#cc4444")
+            vals = [m['date'], f"{m['comp']} {m['stage']}", m["opp"],
+                    str(m["goals"]), str(m["assists"]), str(m["saves"]), str(m["conceded"]),
+                    str(m["rating"]), m["score"], format_result_with_absence(m)]
             for j, v in enumerate(vals):
                 self._set(tbl, i, j, v, color if j == len(vals) - 1 else None)
         lay.addWidget(tbl)

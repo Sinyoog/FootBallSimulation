@@ -155,7 +155,116 @@ def _cl_playoff_pool(continent: str) -> int:
 # 클럽 리그 수준(COUNTRY_LEAGUE_GRADE, get_league_grade())으로 슬롯을
 # 정해야 한다 - 그 표에는 아프리카 최고가 B등급(모로코/나이지리아/이집트/
 # 남아공)까지만 있어서 S등급 국가가 없는 대륙이 실제로 존재하게 된다.
+# [2026-07 재조정, 신민용 지적: "챔스가 유럽만 등급 하나로 뭉뚱그려져서
+# 스페인/프랑스가 똑같이 4장 받는 게 이상하다"] 등급(SS/S/A/B...) 단일
+# 기준 대신, 실제 UEFA 계수 기반 접근 슬롯에 가까운 국가별 오버라이드를
+# 우선 적용한다. 지정 안 된 나라는 그대로 등급 기본값(CL_SLOTS_BY_GRADE)
+# 으로 폴백 — COUNTRY_OVR_ADJ/COUNTRY_SALARY_MULT와 같은 패턴.
 CL_SLOTS_BY_GRADE = {"SS": 5, "S": 4, "A": 3, "B": 2, "C": 1, "D": 1, "E": 1, "F": 1}
+CL_SLOTS_OVERRIDE = {
+    # 최상위 (5장) — 잉글랜드는 이미 SS급이라 등급 기본값(5)과 동일하지만
+    # 명시적으로 같이 적어 "최상위 그룹"이라는 의도를 코드에서도 드러낸다.
+    "잉글랜드": 5, "스페인": 5, "이탈리아": 5, "독일": 5,
+    # 상위 (3장)
+    "프랑스": 3,
+    # 중상위 (2장)
+    "네덜란드": 2, "포르투갈": 2, "벨기에": 2,
+    # 중위 (1장, 그래도 본선 직행)
+    "튀르키예": 1, "오스트리아": 1, "스위스": 1, "덴마크": 1, "체코": 1,
+    # 나머지 국가는 CL_SLOTS_BY_GRADE 등급 기본값으로 폴백
+    # (하위권은 예선을 거쳐 1장 정도 배정되는 셈 — 별도 예선 시스템은
+    # 미구현이라 지금은 "직행 1장"으로 동일하게 처리됨)
+}
+
+# ══════════════════════════════════════════════════════════════
+# [2026-07 신설, 신민용 확정] 국가별 챔스 슬롯 동적 배정 — "덴마크=항상
+# 1팀"처럼 영구 고정이 아니라, 그 대륙에서 최근 몇 시즌 챔스 성적이
+# 좋은 나라일수록 슬롯이 자연스럽게 늘어나고 부진하면 줄어드는 구조.
+# 실제 UEFA 계수 제도를 흉내낸 것 — 클럽월드컵(club_world_cup.py)의
+# "4시즌 누적 점수제"와 완전히 같은 채점 함수(_team_stage_points)를
+# 그대로 재사용해서, 대회당 아니라 "국가" 단위로 합산한 게 계수다.
+#
+# 데이터가 부족한 게임 초반(그 대륙에서 실측 챔스 시즌이 몇 번 안 쌓였을
+# 때)엔 위 CL_SLOTS_OVERRIDE(유럽) / 등급 기본값(그 외 대륙)을 "시드값"
+# 으로 그대로 쓰고, 시즌이 쌓이면서 자동으로 실측 계수 기반으로 넘어간다
+# — 별도 전환 스위치 없이, "실측 데이터가 min개 이상 있으면 그걸 우선
+# 사용"이라는 규칙 하나로 자연스럽게 전환됨.
+CL_COEFF_SEASONS = 5      # 계수 산정에 쓰는 롤링 시즌 수 (실제 UEFA와 동일)
+CL_COEFF_MIN_COUNTRIES = 6  # 이만큼 국가가 랭킹에 잡혀야 "데이터 충분"으로 보고 실측 사용
+
+
+def _slots_from_rank(continent: str, rank_idx: int) -> int:
+    """국가 순위(0-based, 계수 1위=0)를 슬롯 수로 변환.
+    [2026-07 재조정, 신민용 확정] 4개 대륙 밴드를 각각 다르게 잡는다 —
+    유럽/아시아/아프리카는 참가 규모(36개국)는 같아도 실제 상위권 쏠림
+    정도가 다르고(유럽이 가장 쏠림), 북남미는 참가 규모 자체가 48개로
+    더 크다(+남미 강호 쏠림도 반영해 한 단계 더 후하게)."""
+    if continent == "북남미":
+        if rank_idx < 1:  return 6   # 1위
+        if rank_idx < 3:  return 4   # 2~3위
+        if rank_idx < 6:  return 3   # 4~6위
+        if rank_idx < 12: return 2   # 7~12위
+        return 1                     # 13위~
+    if continent == "아시아":
+        if rank_idx < 2:  return 4   # 1~2위
+        if rank_idx < 5:  return 3   # 3~5위
+        if rank_idx < 10: return 2   # 6~10위
+        return 1                     # 11위~
+    if continent == "아프리카":
+        if rank_idx < 2:  return 3   # 1~2위
+        if rank_idx < 6:  return 2   # 3~6위
+        return 1                     # 7위~
+    # 유럽 (기본값) — 기존 그대로
+    if rank_idx < 2:  return 5   # 1~2위
+    if rank_idx < 4:  return 4   # 3~4위
+    if rank_idx < 6:  return 3   # 5~6위
+    if rank_idx < 10: return 2   # 7~10위
+    return 1                     # 11위~
+
+
+def _country_coefficients(conn, continent: str, upto_year: int, n_seasons: int = CL_COEFF_SEASONS):
+    """continent(챔스 키: 유럽/아시아/아프리카/북남미)의 최근 n_seasons년치
+    챔스 성적을 국가 단위로 합산한 계수 랭킹. [(country, pts), ...] 내림차순.
+    [2026-07 성능수정] 팀별 개별 쿼리(N+1) 대신 대회당 1회 배치 조회로
+    바꿔서, 매년 8주차마다 도는 이 함수가 리그 수가 많아질수록(실측
+    664개 리그) 느려지던 문제를 없앴다."""
+    from club_world_cup import _batch_team_stage_points
+    years = list(range(upto_year - n_seasons, upto_year))
+    if not years:
+        return []
+    ph = ",".join("?" * len(years))
+    tournaments = conn.execute(
+        f"SELECT id, winner_team_id FROM cl_tournaments WHERE continent=? AND year IN ({ph})",
+        (continent, *years)).fetchall()
+    scores: dict = {}
+    for t in tournaments:
+        entries = conn.execute(
+            "SELECT team_id, country FROM cl_entries WHERE tournament_id=?", (t["id"],)).fetchall()
+        stage_pts = _batch_team_stage_points(conn, t["id"], t["winner_team_id"])
+        for e in entries:
+            pts = stage_pts.get(e["team_id"], 0)
+            scores[e["country"]] = scores.get(e["country"], 0) + pts
+    return sorted(scores.items(), key=lambda kv: -kv[1])
+
+
+def get_cl_slots(country: str, grade: str, continent: str = None, year: int = None) -> int:
+    """나라별 챔스 슬롯 수. continent+year가 주어지면 최근 5시즌 실측
+    계수로 동적 산정을 우선 시도하고, 데이터가 아직 부족하면(게임 초반)
+    시드값(CL_SLOTS_OVERRIDE → 등급 기본값 순)으로 폴백한다.
+    continent/year를 안 넘기면(하위호환) 예전처럼 시드값만 바로 반환."""
+    if continent and year:
+        conn = get_conn()
+        ranking = _country_coefficients(conn, continent, year)
+        conn.close()
+        if len(ranking) >= CL_COEFF_MIN_COUNTRIES:
+            rank_map = {c: i for i, (c, _) in enumerate(ranking)}
+            if country in rank_map:
+                return _slots_from_rank(continent, rank_map[country])
+            # 랭킹엔 없지만(최근 5시즌 챔스에 한 번도 못 나간 나라) 데이터
+            # 자체는 충분한 상황 — 시드값이 있으면 그걸, 없으면 최하위(1장).
+    if country in CL_SLOTS_OVERRIDE:
+        return CL_SLOTS_OVERRIDE[country]
+    return CL_SLOTS_BY_GRADE.get(grade, 1)
 
 # ── entry 캐시 ─────────────────────────────────────
 # cl_entries(ovr/flag/team_name/grade)는 대회 진행 중 바뀌지 않으므로
@@ -315,12 +424,22 @@ def start_champions_league(year, season):
     prev_season = season-1 기준으로 한다. season-1이 없으면(첫 시즌) 스킵.
     """
     from game_engine import add_log, get_player
+    import time
+    _t0 = time.perf_counter()
     p = get_player()
     if not p:
         return
     prev_season = season - 1
-    if prev_season < 1:
-        return   # 첫 시즌엔 참고할 직전 시즌 성적이 없음 → 챔스 생략
+    # [2026-07 재설계, 신민용 확정] 예전엔 "직전 시즌이 없으면(1년차) 챔스
+    # 자체를 생략"했는데, 이러면 게임 초반 몇 년간 챔스/이 게임의 클럽월드컵
+    # 등 국제 클럽대항전 역사가 통째로 비어버린다. 플레이어는 MIN_INTL_CALLUP_AGE
+    # (17세) 나이 제한 때문에 1년차(16세)엔 애초에 국대에 못 뽑히므로 "가짜
+    # 시즌 도중 내가 소집되는" 위험은 이미 구조적으로 차단돼 있다 — 그래서
+    # 1년차도 그냥 정상 진행하고, 없는 "직전 시즌 순위"만 team_strength 기반
+    # 추정 순위로 대체한다(_select_entries 내부의 _pseudo_season_standings
+    # 참고). prev_season이 음수로 내려가는 건 이론상 불가능하지만 방어적으로만 막는다.
+    if prev_season < 0:
+        return
 
     # 이미 만들어졌으면(어느 대륙이든) 중복 생성 방지
     if get_cl_tournament(year, "유럽"):
@@ -332,17 +451,18 @@ def start_champions_league(year, season):
     my_tid = p.get("current_team_id", 0)
 
     for cont in ("유럽", "아시아", "아프리카", "북남미"):
-        entries = _select_entries(cont, prev_season)
+        entries = _select_entries(cont, prev_season, year)
         if len(entries) < 4:
             continue  # 출전팀 부족하면 그 대륙 대회 생략
         _build_tournament(year, cont, entries, my_tid if cont == my_cont else 0)
+    print(f"[PERF] 챔스 4대륙 생성(슬롯 계산 포함) {time.perf_counter()-_t0:.2f}s")
 
     # ── 내 대회 안내 로그 (출전 자격 = 직전 시즌 내 리그 순위가 배정 슬롯 안) ──
     if my_cont and my_tid:
         t = get_cl_tournament(year, my_cont)
         if t:
             # 출전 자격 판정: 내 팀이 직전 시즌 '내 1부 리그'에서 CL 슬롯 안에 들었는가?
-            qualified = _is_my_team_cl_qualified(p, my_tid, prev_season)
+            qualified = _is_my_team_cl_qualified(p, my_tid, prev_season, year)
             conn = get_conn()
             mine = conn.execute(
                 "SELECT 1 FROM cl_entries WHERE tournament_id=? AND team_id=?",
@@ -376,13 +496,43 @@ def start_champions_league(year, season):
             # else: 슬롯 밖(자격 없음) → 챔스와 무관, 아무것도 안 뜸 (침묵)
 
 
-def _is_my_team_cl_qualified(p, my_tid, season):
+def _pseudo_season_standings(league_id):
+    """[2026-07 신설] 1년차(직전 시즌 자체가 없음)에 챔스 출전팀을 뽑아야
+    할 때 쓰는 가상 순위표. get_league_standings(season=0)은 실제 경기가
+    하나도 없어서 그 리그 소속팀을 전부 0승0무0패로 반환하는데, 이러면
+    정렬 기준(pts/gd/득점)이 전부 동률이라 사실상 team_id 순서 같은
+    의미 없는 순서로 챔스 출전팀이 뽑힌다. 대신 팀 평균 OVR(=선수 생성 때
+    이미 확정된 team_strength의 결과물)로 정렬해서, '한 시즌 뛰었다면
+    이런 순서로 끝났을 것'이라는 그럴듯한 가상 순위를 만든다."""
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT t.id AS id, t.name AS name, AVG(a.ovr) AS avg_ovr
+           FROM teams t LEFT JOIN ai_players a ON a.team_id = t.id
+           WHERE t.league_id=? GROUP BY t.id""", (league_id,)).fetchall()
+    conn.close()
+    ranked = sorted(
+        [{"id": r["id"], "name": r["name"], "wins": 0, "draws": 0, "losses": 0,
+          "goals_for": 0, "goals_against": 0, "pts": 0, "gd": 0}
+         for r in rows],
+        key=lambda r: -(next(x["avg_ovr"] for x in rows if x["id"] == r["id"]) or 0))
+    return ranked
+
+
+def _standings_or_pseudo(league_id, season):
+    """season<1(1년차, 참고할 직전 시즌 자체가 없음)이면 가상 순위,
+    아니면 실제 순위표. _select_entries/_is_my_team_cl_qualified 공용."""
+    from game_engine import get_league_standings
+    if season < 1:
+        return _pseudo_season_standings(league_id)
+    return get_league_standings(league_id, season=season)
+
+
+def _is_my_team_cl_qualified(p, my_tid, season, year=None):
     """내 팀이 그 시즌 '내 1부 리그'에서 CL 슬롯(CL_SLOTS_BY_GRADE) 안에 드는지
     — 챔스 출전 자격 판정. 챔스는 1부(tier=1) 리그 소속만 자격이 있고,
     그 나라 등급에 따라 1~4위까지도 출전할 수 있다(2부 이하는 자격 없음)."""
     if not my_tid:
         return False
-    from game_engine import get_league_standings
     conn = get_conn()
     row = conn.execute(
         "SELECT league_id FROM teams WHERE id=?", (my_tid,)).fetchone()
@@ -391,7 +541,7 @@ def _is_my_team_cl_qualified(p, my_tid, season):
         return False
     lid = row["league_id"]
     lg_row = conn.execute(
-        """SELECT l.tier AS tier, cn.name AS country FROM leagues l
+        """SELECT l.tier AS tier, cn.name AS country, cn.continent AS continent FROM leagues l
            JOIN countries cn ON l.country_id = cn.id WHERE l.id=?""", (lid,)).fetchone()
     conn.close()
     # 1부가 아니면 챔스 자격 없음 (2부 1위는 승격 대상일 뿐)
@@ -399,15 +549,16 @@ def _is_my_team_cl_qualified(p, my_tid, season):
         return False
     # [버그 수정] 국가대표 grade가 아니라 클럽 리그 grade로 슬롯 수를 정한다.
     league_grade = get_league_grade(lg_row["country"], "F")
-    slots = CL_SLOTS_BY_GRADE.get(league_grade, 1)
-    standings = get_league_standings(lid, season=season)
+    cl_cont = CONTINENT_MAP.get(lg_row["continent"])
+    slots = get_cl_slots(lg_row["country"], league_grade, cl_cont, year)
+    standings = _standings_or_pseudo(lid, season)
     if not standings:
         return False
     my_rank = next((i for i, r in enumerate(standings, start=1) if r["id"] == my_tid), None)
     return my_rank is not None and my_rank <= slots
 
 
-def _select_entries(continent, season):
+def _select_entries(continent, season, year=None):
     """대륙 소속 각 1부 리그에서, 나라 등급별 슬롯 수(CL_SLOTS_BY_GRADE)만큼
     순위표 상위팀을 뽑는다 (대륙별 정원은 _cl_team_cap — 36 또는 48).
 
@@ -450,8 +601,8 @@ def _select_entries(continent, season):
         remaining = cap - len(picked)
         if remaining <= 0:
             break
-        slots = min(CL_SLOTS_BY_GRADE.get(lg["grade"], 1), remaining)
-        rows = get_league_standings(lg["lid"], season=season)
+        slots = min(get_cl_slots(lg["country"], lg["grade"], continent, year), remaining)
+        rows = _standings_or_pseudo(lg["lid"], season)
         if not rows:
             continue
         for rank, row in enumerate(rows[:slots], start=1):
@@ -716,11 +867,17 @@ def _entry(tid, team_id):
 
 def _match_outcome(h_ovr, a_ovr):
     """중립 구장 가정. 'home'/'draw'/'away' (KO 무승부 → 승부차기).
-    [수정] 무승부 확률을 전력차에 반비례하도록 개선 (기존 dw=0.22 고정)."""
+    [수정] 무승부 확률을 전력차에 반비례하도록 개선 (기존 dw=0.22 고정).
+
+    [2026-07 재조정, 신민용 지적: "챔스 우승팀이 리그에서는 하위권,
+    반대로 챔스 조기탈락팀이 리그 3등인 게 이상하다"] 리그(_match_win_probs)/
+    국제대회/컵대회와 동일한 이유로 기울기를 올렸다 — 챔스도 토너먼트라
+    표본이 적어서, 완만한 확률 공식을 쓰면 진짜 실력과 동떨어진 결과가
+    쉽게 나온다. 나머지 대회들과 같은 기울기로 통일."""
     diff = h_ovr - a_ovr
-    hw = max(0.08, min(0.85, 0.46 + diff * 0.014))
-    dw = max(0.08, 0.24 - abs(diff) * 0.005)
-    aw = max(0.05, 1.0 - hw - dw)
+    hw = max(0.04, min(0.95, 0.46 + diff * 0.022))
+    dw = max(0.05, 0.24 - abs(diff) * 0.009)
+    aw = max(0.02, 1.0 - hw - dw)
     tot = hw + dw + aw
     hw, dw, aw = hw / tot, dw / tot, aw / tot
     roll = random.random()
@@ -846,9 +1003,9 @@ def simulate_my_cl_match(week, p):
     is_home = info["is_home"]
 
     # [2026-07 신설] 출전정지 체크 — 퇴장 다음 경기는 강제 결장.
-    _suspended, _new_susp = _check_suspended(p)
+    _suspended, _new_susp = _check_suspended(p, field="cl_suspension")
     if _suspended:
-        update_player(red_card_suspension=_new_susp)
+        update_player(cl_suspension=_new_susp)
         add_log(f"🟥 출전정지로 결장{'  (다음 경기부터 복귀)' if _new_susp == 0 else f'  (남은 정지 {_new_susp}경기)'}",
                 "event")
 
@@ -899,7 +1056,7 @@ def simulate_my_cl_match(week, p):
         _absence_reason = None
         # [2026-07 신설] 퇴장 판정 — '폭력적' 성격의 red_card_chance 반영.
         if _roll_red_card(p):
-            goals, assists, saves, rating, events, detail = _apply_red_card_dismissal(p)
+            goals, assists, saves, rating, events, detail = _apply_red_card_dismissal(p, field="cl_suspension")
             _absence_reason = "red_card"
     # [2026-07 신설] '소심함' 성격의 big_match_rating 연결 — 챔피언스리그는
     # 대회 자체가 빅매치 성격이라(국내컵과 달리 결승 한정이 아니라) 모든
@@ -943,7 +1100,9 @@ def simulate_my_cl_match(week, p):
     # 인기/스트레스/행복
     _update_pop(p, goals, assists, rating)
     p2 = get_player()
-    ns = min(100, p2["stress"] + 8)
+    # [2026-07 조정, 신민용 지적: "경기 스트레스가 고강도 훈련만큼은 돼야
+    # 하지 않나"] 리그/컵과 동일 원칙으로 상향.
+    ns = min(100, p2["stress"] + 20)
     nh = p2["happiness"]
     if my_result == "win":
         nh = min(100, nh + 4)
@@ -1085,7 +1244,18 @@ def _finalize_league_phase(t):
     add_log(f"🏆 {t['name']} 리그 스테이지 종료 → 1~{direct_cut}위 직행, "
             f"{direct_cut+1}~{direct_cut+po_pool}위 플레이오프", "event")
     if my_tid and any(r["team_id"] == my_tid for r in eliminated):
-        _record_my_exit(t, "리그 스테이지")
+        # [버그수정 2026-07, 신민용 지적: "성적에 챔스 몇등인지 안 뜬다"]
+        # 그냥 "리그 스테이지"라고만 저장하면 순위가 안 남는다 — 국내
+        # 리그(성적 탭)나 오퍼 화면(예: "15위 6승4무11패 22점")처럼 순위·
+        # 전적을 같이 남긴다.
+        my_rank = next((i + 1 for i, r in enumerate(rows) if r["team_id"] == my_tid), 0)
+        my_row = next((r for r in rows if r["team_id"] == my_tid), None)
+        if my_rank and my_row:
+            result_txt = (f"리그 스테이지 {my_rank}위 "
+                          f"({my_row['w']}승{my_row['d']}무{my_row['l']}패, {my_row['pts']}점)")
+        else:
+            result_txt = "리그 스테이지"
+        _record_my_exit(t, result_txt)
 
 
 def _finalize_playoff(t):
@@ -1126,13 +1296,24 @@ def _finalize_playoff(t):
     qualifiers = direct_only + winners
 
     add_log(f"🏆 {t['name']} 플레이오프 종료 → {STAGE_KO.get(_first_stage_for(len(qualifiers)), '')} 진출팀 확정", "event")
-    _start_knockout(t, qualifiers)
+    _start_knockout(t, qualifiers, direct_ids=direct_only, winner_ids=winners)
 
 
-def _start_knockout(t, qualifier_ids):
+def _start_knockout(t, qualifier_ids, direct_ids=None, winner_ids=None):
     """[2026-07 신설] 확정된 진출팀 목록으로 첫 토너먼트 라운드 대진을 만든다.
     전력순으로 정렬해 1번 시드 vs 최약체, 2번 시드 vs 차약체 식으로 짝지어
-    (실제 대회 추첨과 완전히 같진 않지만) 강팀끼리 초반에 만나는 걸 줄인다."""
+    (실제 대회 추첨과 완전히 같진 않지만) 강팀끼리 초반에 만나는 걸 줄인다.
+
+    [버그수정 2026-07, 신민용 지적: "종헨크나 멘유는 리그 스테이지 1~8등
+    직행팀인데 걔네끼리 16강에서 붙는 게 말이 되냐"] direct_ids/winner_ids를
+    같이 넘기면(플레이오프를 거친 라운드) 직행팀·플레이오프 승자를 각각
+    OVR로 정렬해 그룹 간에만 매칭한다 — 실제 UEFA처럼 직행팀은 16강에서
+    서로 만나지 않고 반드시 플레이오프 승자와 붙는다(강한 직행팀일수록
+    약한 승자를 만나도록 매칭). 이전엔 qualifier_ids 전체를 하나의 풀로
+    합쳐 OVR로만 상/하위 절반을 나눴는데, 직행팀들의 OVR이 우연히 중앙값
+    양쪽으로 갈리면 직행팀끼리 붙는 경우가 실제로 생겼다.
+    direct_ids/winner_ids를 안 넘기면(플레이오프 자체가 없어 직행팀만으로
+    바로 KO 직행하는 소규모 대륙) 기존처럼 전체 풀 OVR 시딩을 그대로 쓴다."""
     from game_engine import get_player
     tid = t["id"]
     conn = get_conn()
@@ -1140,12 +1321,17 @@ def _start_knockout(t, qualifier_ids):
         "SELECT * FROM cl_entries WHERE tournament_id=?", (tid,)).fetchall()}
     conn.close()
 
-    ranked = sorted(qualifier_ids, key=lambda tid_: infos.get(tid_, {}).get("ovr", 0), reverse=True)
-    half = len(ranked) // 2
-    top, bottom = ranked[:half], ranked[half:]
-    pairs = list(zip(top, reversed(bottom)))
+    if direct_ids and winner_ids and len(direct_ids) == len(winner_ids):
+        d_sorted = sorted(direct_ids, key=lambda tid_: infos.get(tid_, {}).get("ovr", 0), reverse=True)
+        w_sorted = sorted(winner_ids, key=lambda tid_: infos.get(tid_, {}).get("ovr", 0))
+        pairs = list(zip(d_sorted, w_sorted))
+    else:
+        ranked = sorted(qualifier_ids, key=lambda tid_: infos.get(tid_, {}).get("ovr", 0), reverse=True)
+        half = len(ranked) // 2
+        top, bottom = ranked[:half], ranked[half:]
+        pairs = list(zip(top, reversed(bottom)))
 
-    first_stage = _first_stage_for(len(ranked))
+    first_stage = _first_stage_for(len(qualifier_ids))
     next_week = CL_ROUND_WEEKS.get(first_stage, CL_ROUND_WEEKS["R16"])
 
     p = get_player()
@@ -1243,6 +1429,156 @@ def _advance_round(t, cur_stage, next_stage):
             add_log(f"🏆 {t['name']} {cur_stage_ko} 종료 → {STAGE_KO[next_stage]} 대진 확정", "event")
 
 
+def _cl_team_stage_weights(conn, tid):
+    """[2026-07 신설, 설계문서 v2 6절에서 발견한 공백 메움] 국가대표 대회
+    (`intl_engine._intl_country_stage_weights`)와 클럽월드컵
+    (`club_world_cup_engine._cwc_team_stage_weights`)은 이미 진출 라운드
+    가중치를 개인상에 반영하고 있는데, 정작 챔피언스리그(가장 자주 열리는
+    대회)만 이 가중치가 빠져 있었다 — 조별(리그 스테이지) 탈락 선수와
+    우승 선수가 개인 스탯만 같으면 챔스 시즌MVP를 동률로 다퉜다는 뜻이다.
+    이 함수는 그 공백을 메운다. 챔스 스테이지 구성(리그 스테이지→플레이오프
+    →32강(북남미만)→16강→8강→4강→결승/3·4위전)에 맞춰 조별(리그 스테이지)만
+    =0.70, 플레이오프=0.75, 32강=0.80, 16강=0.85, 8강=0.90, 4강(3/4위전
+    포함)=0.96, 준우승=0.99, 우승=1.00으로 둔다."""
+    t = conn.execute("SELECT winner_team_id FROM cl_tournaments WHERE id=?", (tid,)).fetchone()
+    winner_tid = t["winner_team_id"] if t else 0
+    _ORDER = {"PO": 0, "R32": 1, "R16": 2, "QF": 3, "SF": 4}
+    _TIER_W = {0: 0.75, 1: 0.80, 2: 0.85, 3: 0.90, 4: 0.96}
+    furthest = {}
+    runner_up_tid = None
+    for m in conn.execute(
+            "SELECT stage, home_team_id, away_team_id FROM cl_matches "
+            "WHERE tournament_id=? AND stage!='league' AND home_score>=0", (tid,)).fetchall():
+        stg = m["stage"]
+        if stg == "F":
+            loser = m["away_team_id"] if m["home_team_id"] == winner_tid else m["home_team_id"]
+            runner_up_tid = loser
+            continue
+        if stg == "TP":
+            for side_tid in (m["home_team_id"], m["away_team_id"]):
+                furthest[side_tid] = max(furthest.get(side_tid, -1), _ORDER["SF"])
+            continue
+        if stg not in _ORDER:
+            continue
+        idx = _ORDER[stg]
+        for side_tid in (m["home_team_id"], m["away_team_id"]):
+            furthest[side_tid] = max(furthest.get(side_tid, -1), idx)
+
+    def _weight(team_id):
+        if team_id == winner_tid:
+            return 1.00
+        if team_id == runner_up_tid:
+            return 0.99
+        return _TIER_W.get(furthest.get(team_id, -1), 0.70)
+    return _weight
+
+
+def _award_cl_awards(t, my_tid):
+    """[2026-07 확장, 신민용 확정] 챔스 득점왕/시즌MVP/베스트11/영플레이어/
+    골든글러브. 내 팀이 조기탈락해도(4강까지 못 가도) 대회 전체 기준으로
+    별개 판정한다.
+    [2026-07 추가 확장, 설계문서 v2 반영] 진출 라운드 가중치
+    (_cl_team_stage_weights)를 드디어 적용하고, 결승·준결승 빅게임 보너스
+    (가산, 상한 있음)를 추가하고, 영플레이어 나이컷을 UEFA 실제 기준
+    (23세 이하)으로 올리고, 골든글러브에 세이브율·평균실점 품질 게이트를
+    추가한다."""
+    from game_engine import (get_player, add_log, _estimate_ai_season, _estimate_ai_clean_sheets,
+                             _position_award_score, _evaluate_extra_awards,
+                             _cap_additive_bonus, _gk_quality_ok,
+                             ATTACK_POS, GK_POS, DF_POS, MF_POS)
+    tid = t["id"]
+    conn = get_conn()
+    my_row = conn.execute(
+        """SELECT COUNT(*) n, COALESCE(SUM(my_goals),0) g, COALESCE(SUM(my_assists),0) a,
+                  COALESCE(AVG(my_rating),0) r, COALESCE(SUM(my_saves),0) sv,
+                  COALESCE(SUM(my_conceded),0) gc
+           FROM cl_matches WHERE tournament_id=? AND my_played=1""", (tid,)).fetchone()
+    if not my_row or my_row["n"] == 0:
+        conn.close()
+        return
+    n_games = max(1, my_row["n"])
+    p = get_player()
+    my_pos = p.get("position", "ST") if p else "ST"
+    my_ovr = p.get("ovr", 60) if p else 60
+    my_age = p.get("age", 25) if p else 25
+    my_cs = conn.execute(
+        """SELECT COUNT(*) c FROM cl_matches WHERE tournament_id=? AND my_played=1
+           AND ((home_team_id=? AND away_score=0) OR (away_team_id=? AND home_score=0))""",
+        (tid, my_tid, my_tid)).fetchone()["c"]
+
+    pool = [{"position": my_pos, "goals": my_row["g"], "assists": my_row["a"], "rating": my_row["r"],
+             "ovr": my_ovr, "cs": my_cs, "age": my_age, "is_mine": True, "team_id": my_tid}]
+
+    entries = conn.execute(
+        "SELECT team_id FROM cl_entries WHERE tournament_id=?", (tid,)).fetchall()
+    ALL_POS = GK_POS + DF_POS + MF_POS + ATTACK_POS
+    ph = ",".join("?" * len(ALL_POS))
+    for e in entries:
+        if e["team_id"] == my_tid:
+            continue
+        rows = conn.execute(
+            f"""SELECT ovr, position, sub_role, age FROM ai_players
+                WHERE team_id=? AND position IN ({ph})""",
+            (e["team_id"], *ALL_POS)).fetchall()
+        for r in rows:
+            g, a, rt = _estimate_ai_season(r["ovr"], r["position"], 80, 80, r["sub_role"],
+                                           full_season_matches=n_games)
+            cs = _estimate_ai_clean_sheets(r["position"], r["ovr"], 80, 80, n_games) if r["position"] in GK_POS else 0
+            pool.append({"position": r["position"], "goals": g, "assists": a, "rating": rt,
+                        "ovr": r["ovr"], "cs": cs, "age": r["age"] or 25, "is_mine": False,
+                        "team_id": e["team_id"]})
+
+    _stage_w = _cl_team_stage_weights(conn, tid)
+    my_base_score = _position_award_score(my_pos, my_row["g"], my_row["a"], my_row["r"], my_ovr, my_cs)
+    my_score = my_base_score * _stage_w(my_tid)
+
+    # [2026-07 신설] 빅게임 보너스 — 결승/준결승/3·4위전 경기의 "실제" 기록만
+    # 따로 골라 계산한 값을 가산한다(고정 숫자 아님). 우승하지 못해도 그
+    # 무대에서 결정적으로 잘한 선수는 여전히 후보가 될 수 있게 하되, 상한
+    # (기준 점수의 10%)을 넘지 못하므로 이 보너스 하나로 MVP가 뒤집히진 않는다.
+    # AI 후보는 스테이지별 개인 기록을 추정하지 않으므로(추정치는 대회 전체
+    # 뭉뚱그린 값) 이 보너스는 실제 경기별 기록이 있는 내 선수에게만 계산되고,
+    # AI 쪽엔 계산 자체가 불가능하다는 점을 감안해 상한을 두었다.
+    _bg = conn.execute(
+        """SELECT COUNT(*) n, COALESCE(AVG(my_rating),0) r, COALESCE(SUM(my_goals),0) g,
+                  COALESCE(SUM(my_assists),0) a
+           FROM cl_matches WHERE tournament_id=? AND my_played=1 AND stage IN ('SF','F','TP')""",
+        (tid,)).fetchone()
+    if _bg and _bg["n"] > 0:
+        _raw_bonus = (_bg["r"] - 6.0) * 1.2 + (_bg["g"] + _bg["a"]) * 0.8
+        my_score += _cap_additive_bonus(_raw_bonus, my_base_score, cap_ratio=0.10)
+
+    others = [x for x in pool if not x["is_mine"]]
+    best_ai_scorer_g = max((x["goals"] for x in others), default=-1)
+    best_ai_mvp_score = max((_position_award_score(x["position"], x["goals"], x["assists"],
+                                                    x["rating"], x["ovr"], x["cs"]) * _stage_w(x["team_id"])
+                             for x in others), default=-1)
+    year = t["year"]
+    awards = []
+    if my_row["g"] > 0 and my_row["g"] >= best_ai_scorer_g:
+        awards.append(("챔피언스리그 득점왕", f"{my_row['g']}골"))
+    if my_score >= best_ai_mvp_score:
+        awards.append(("챔피언스리그 시즌MVP", f"{year} {t['name']} MVP"))
+    for label in _evaluate_extra_awards(pool, my_pos, my_age, weight_fn=lambda x: _stage_w(x["team_id"]),
+                                         young_age_cutoff=23):
+        awards.append((f"챔피언스리그 {label}", f"{year} {t['name']} {label}"))
+    if (my_pos in GK_POS and my_cs >= 2
+            and _gk_quality_ok(my_row["sv"], my_row["gc"], n_games, n_games, min_play_ratio=0.0)):
+        gk_group = [x for x in pool if x["position"] in GK_POS]
+        best_gk = max(gk_group, key=lambda x: x["cs"]) if gk_group else None
+        if best_gk and best_gk["is_mine"]:
+            awards.append(("챔피언스리그 골든글러브", f"{my_cs} 클린시트"))
+
+    for atype, detail in awards:
+        add_log(f"🏅 {atype} 수상! ({detail})", "event")
+        conn.execute(
+            "INSERT INTO awards(year,award_type,league_name,detail,is_mine) VALUES(?,?,?,?,1)",
+            (year, atype, t["name"], detail))
+    if awards:
+        conn.commit()
+    conn.close()
+
+
 def _finish_tournament(t):
     """결승 + 3/4위전 종료 → 우승팀·3위 확정, 내 결과 기록."""
     from game_engine import add_log, get_player
@@ -1295,6 +1631,9 @@ def _finish_tournament(t):
     elif my_tid == fourth:
         _record_my_exit(t, "4위")
 
+    # [2026-07 신설] 조기탈락해도 득점왕/시즌MVP는 별개로 판정
+    _award_cl_awards(t, my_tid)
+
 
 # ─────────────────────────────────────────────
 # 내 결과 확정 + 보상
@@ -1310,7 +1649,6 @@ def _record_my_exit(t, result):
 
     conn = get_conn()
     conn.execute("UPDATE cl_tournaments SET my_result=? WHERE id=?", (result, t["id"]))
-    # 내 팀명 + 국가명 (예: "Paradou AC (알제리)")
     te = conn.execute(
         "SELECT team_name, country FROM cl_entries WHERE tournament_id=? AND team_id=?",
         (t["id"], my_tid)).fetchone()
@@ -1318,7 +1656,17 @@ def _record_my_exit(t, result):
     conn.close()
     _raw_name = te["team_name"] if te else ""
     _country  = te["country"]   if te else ""
-    team_name = f"{_raw_name} ({_country})" if _raw_name and _country else _raw_name
+    # [버그수정 2026-07, 신민용 지적: "2002년에 챔스 준우승까지 갔는데
+    # 성적에 안 뜬다"] 여기서 team_name에 국가명을 괄호로 덧붙여
+    # ("맨체스터 유나이티드 (잉글랜드)") trophy_log에 저장하고 있었는데,
+    # career_entries.team_name은 항상 국가명 없이 순수 팀명("맨체스터
+    # 유나이티드")만 저장한다(teams.name 그대로). get_my_trophies()가 이
+    # 둘을 정확히 일치(=)시켜야 내 트로피로 인정하는 구조라, 국가명이
+    # 붙은 채로 저장된 챔스 트로피는 전 시즌 통째로 매칭에 실패해서 tier
+    # 필터를 고친 뒤에도 여전히 하나도 안 보였다. career_entries와 같은
+    # 포맷(순수 팀명)으로 저장하도록 고친다 — 국가 정보가 필요하면 UI가
+    # league_country 등 별도 조회로 붙이면 된다(다른 트로피들도 다 그렇게 함).
+    team_name = _raw_name
 
     _save_trophy(t["year"], team_name, t["name"], result)
 

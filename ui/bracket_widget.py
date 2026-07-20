@@ -86,21 +86,82 @@ class BracketWidget(QWidget):
             r0.append(cy)
         self._centers.append(r0)
 
-        # 이후 라운드: 직전 라운드 경기 2개씩 묶어 중점
+        # 이후 라운드: 직전 라운드 경기와 이름으로 대응시켜 배치
+        # [버그수정 2026-07, 신민용 지적: "16강 칸끼리 겹쳐서 팀명이 안
+        # 보인다" — 1차 수정 후에도 재현됨] 처음엔 "다음 라운드 경기 수 =
+        # 직전 라운드의 절반"이라는 고정 가정이 문제라고 보고 이름 매칭으로
+        # 바꿨는데, 그것만으론 부족했다 — 이 게임의 16강 대진은 직행팀과
+        # 플레이오프 승자를 "1:1로만" 섞는 게 아니라 전체 진출팀을 OVR로
+        # 정렬해 상위/하위 절반을 매칭한다(_start_knockout). 그 결과 "직행팀
+        # 끼리"(예: 맨체스터 유나이티드 vs 종 헨크, 둘 다 플레이오프 전적 없음)
+        # 매치업도 실제로 생길 수 있어서, 직전 라운드에서 이름을 하나도 못
+        # 찾는 매치가 여럿 나온다. 이런 매치들이 전부 독립적으로
+        # "top부터 균등 배치" 폴백을 쓰면 서로 겹칠 수 있다(폴백끼리도
+        # 폴백-아닌-매치와도 좌표 공간을 공유하니까).
+        # 그래서 2단계로 처리한다:
+        #   1) 이름 매칭 가능한 매치는 그 직전 라운드 매치의 y를 그대로/평균.
+        #   2) 매칭 안 되는 매치(둘 다 bye)는 앞뒤로 가장 가까운 매칭된
+        #      매치 사이를 선형보간(둘 다 없으면 unit 간격 외삽)해 채운다.
+        #   3) 마지막으로 위→아래 순서를 훑으며 최소 간격(MATCH_H+V_GAP_MIN)
+        #      을 강제한다 — 1)/2) 결과가 어떻게 나오든 최종적으로 겹치는
+        #      두 매치가 하나도 없다고 보장된다.
         for ri in range(1, n_rounds):
-            prev = self._centers[ri - 1]
-            cur  = []
             n_cur = len(self._rounds[ri]["matches"])
+            raw = []
+            for m in self._rounds[ri]["matches"]:
+                home, away = m.get("home"), m.get("away")
+                ys = []
+                # [버그수정 2026-07, 신민용 리포트: "3/4위전이 결승 옆에
+                # 붙어야 하는데 위에 있어"] 3/4위전(TP)은 '직전 라운드'가
+                # 아니라 '두 라운드 전'(4강)의 참가팀(4강 패자)과 이름이
+                # 겹친다 — 결승(F)이 4강 바로 다음 컬럼을 차지하고 3/4위전은
+                # 그 다음 컬럼에 놓이는 경우, 3/4위전 기준 '직전 라운드'는
+                # 4강이 아니라 결승이라 이름 매칭이 하나도 안 됐다. 매칭
+                # 실패 시 캔버스 맨 위로 배치하는 폴백(아래 141줄)을 타서,
+                # 3/4위전 박스가 결승과 나란히 있어야 할 위치가 아니라
+                # 화면 맨 위쪽에 붙어버렸다. 직전 라운드부터 시작해 매칭될
+                # 때까지 점점 더 이전 라운드를 훑도록 고쳐서, 3/4위전도
+                # 4강(그 경기의 진짜 부모 라운드)과 올바르게 정렬된다.
+                for back in range(1, ri + 1):
+                    prev = self._centers[ri - back]
+                    prev_matches = self._rounds[ri - back]["matches"]
+                    for k, pm in enumerate(prev_matches):
+                        if k >= len(prev):
+                            continue
+                        pteam = (pm.get("home"), pm.get("away"))
+                        if home and home in pteam:
+                            ys.append(prev[k])
+                        if away and away in pteam:
+                            ys.append(prev[k])
+                    if ys:
+                        break
+                raw.append(sum(ys) / len(ys) if ys else None)
+
+            # 2) 매칭 안 된 자리는 앞뒤 매칭값 사이 선형보간(또는 외삽)으로 채운다.
             for j in range(n_cur):
-                a = 2 * j
-                b = 2 * j + 1
-                if b < len(prev):
-                    cur.append((prev[a] + prev[b]) / 2)
-                elif a < len(prev):
-                    cur.append(prev[a])
+                if raw[j] is not None:
+                    continue
+                prev_known = next(((k, raw[k]) for k in range(j - 1, -1, -1)
+                                    if raw[k] is not None), None)
+                next_known = next(((k, raw[k]) for k in range(j + 1, n_cur)
+                                    if raw[k] is not None), None)
+                if prev_known and next_known:
+                    pk, pv = prev_known; nk, nv = next_known
+                    raw[j] = pv + (nv - pv) * (j - pk) / (nk - pk)
+                elif prev_known:
+                    raw[j] = prev_known[1] + (j - prev_known[0]) * unit
+                elif next_known:
+                    raw[j] = next_known[1] - (next_known[0] - j) * unit
                 else:
-                    # 직전 라운드 정보가 부족하면 균등 배치로 폴백
-                    cur.append(top + j * unit + self.MATCH_H / 2)
+                    raw[j] = top + j * unit + self.MATCH_H / 2
+
+            # 3) 최소 간격 강제 — 위에서부터 훑으며 겹치면 아래로 밀어낸다.
+            min_gap = self.MATCH_H + self.V_GAP_MIN
+            for j in range(1, n_cur):
+                if raw[j] < raw[j - 1] + min_gap:
+                    raw[j] = raw[j - 1] + min_gap
+
+            cur = raw
             self._centers.append(cur)
 
         # 전체 크기
@@ -108,7 +169,7 @@ class BracketWidget(QWidget):
         max_cy = top + self.MATCH_H / 2
         for col in self._centers:
             if col:
-                max_cy = max(max_cy, col[-1])
+                max_cy = max(max_cy, max(col))
         self._h = int(max_cy + self.MATCH_H / 2 + self.PAD)
         self._w = int(self._w)
         self._layout_done = True
@@ -136,16 +197,29 @@ class BracketWidget(QWidget):
         self._f_country = f_country
 
         # 1) 연결선 먼저 (박스 뒤에 깔리게)
+        # [버그수정 2026-07] _compute_layout과 동일한 이유로, 여기도
+        # (2j, 2j+1) 고정 페어링 대신 팀 이름으로 직전 라운드 매치를 찾아
+        # 그 매치에서만 선을 긋는다 — bye가 섞인 라운드(챔스 플레이오프→
+        # 16강 등)에서 엉뚱한 매치끼리 잘못 이어지는 걸 방지한다.
         qp.setPen(QPen(_C_LINE, 1.4))
         for ri in range(len(self._rounds) - 1):
             cur_x_right = self._col_x(ri) + self.BOX_W
             nxt_x_left  = self._col_x(ri + 1)
             mid_x = (cur_x_right + nxt_x_left) / 2
             cur_centers = self._centers[ri]
+            cur_matches = self._rounds[ri]["matches"]
             nxt_centers = self._centers[ri + 1]
+            nxt_matches = self._rounds[ri + 1]["matches"]
             for j, ncy in enumerate(nxt_centers):
-                a, b = 2 * j, 2 * j + 1
-                pair = [c for c in (a, b) if c < len(cur_centers)]
+                nm = nxt_matches[j] if j < len(nxt_matches) else {}
+                home, away = nm.get("home"), nm.get("away")
+                pair = []
+                for k, cm in enumerate(cur_matches):
+                    if k >= len(cur_centers):
+                        continue
+                    cteam = (cm.get("home"), cm.get("away"))
+                    if (home and home in cteam) or (away and away in cteam):
+                        pair.append(k)
                 for c in pair:
                     cy = cur_centers[c]
                     # ┐ 모양: 박스 오른쪽 → 중간 수직 → 다음 박스 왼쪽

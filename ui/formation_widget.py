@@ -25,7 +25,8 @@ _ovr_cache_invalidated: bool = False
 def _players_for_team(team_id):
     conn = get_conn()
     rows = conn.execute(
-        "SELECT * FROM ai_players WHERE team_id=? LIMIT 11", (team_id,)).fetchall()
+        "SELECT * FROM ai_players WHERE team_id=? ORDER BY ovr DESC LIMIT 11",
+        (team_id,)).fetchall()
     conn.close()
     return _mask_ai_names([dict(r) for r in rows])
 
@@ -65,16 +66,32 @@ def _fetch_league_opponents(my_team_id, league_id):
     return result
 
 def _make_intl_virtual_players(avg_ovr: float) -> list:
-    """국제대회 상대국 가상 선수 11명 생성 (클릭 시 스탯 팝업용).
-    ai_players에 nationality 컬럼이 없으므로 국가 평균 OVR로 생성."""
+    """[폴백 전용] 실제 국적 선수 풀이 얇을 때만 쓰는 가상 선수 11명."""
     import random
     pos_list = ["GK", "CB", "CB", "LB", "RB", "CM", "CM", "CAM", "LW", "RW", "ST"]
     result = []
     for i, pos in enumerate(pos_list):
         ovr_v = max(30, min(99, round(avg_ovr) + random.randint(-5, 5)))
         result.append({"id": -(i+100), "name": "AI", "position": pos,
-                        "ovr": ovr_v, "is_me": False,
+                        "ovr": ovr_v, "is_me": False, "club": "",
                         **{s: ovr_v for s in ALL_STATS}})
+    return result
+
+
+def _make_intl_real_players(country: str, avg_ovr: float):
+    """[2026-07 재조정, 신민용 지적: "8명 미만 나라는 자국 1부나 남의 나라
+    2부에서도 채울 수 있다"] database.get_country_squad_players()의
+    3단계 폴백(국적태그→자국리그→해외 하위리그 대륙우선)을 그대로
+    쓴다 — 클릭 시 재쿼리하는 구조가 아니라 화면 로드 시 1회만 조회."""
+    from database import get_country_squad_players
+    picked = get_country_squad_players(country, min_count=8)
+    if len(picked) < 8:
+        return None
+    result = []
+    for r in picked:
+        result.append({"id": r["id"], "name": r["name"], "position": r["position"],
+                        "ovr": r["ovr"], "is_me": False, "club": r["club"],
+                        **{s: r["ovr"] for s in ALL_STATS}})
     return result
 
 
@@ -82,7 +99,8 @@ def _fetch_intl_opponents(tournament_id, my_nat, grp=None):
     """국제대회 상대팀 목록.
     grp 지정 시 내 조(grp) 팀만 반환 (조별리그).
     grp 없으면 대회 전체 참가국 반환 (fallback).
-    players 목록은 OVR 기반 가상 선수로 채워 클릭 시 스탯 팝업 표시 가능.
+    [2026-07 수정] players는 이제 실제 국적 선수(_make_intl_real_players)를
+    우선 쓰고, 실제 선수 풀이 얇은 나라만 가상 선수로 폴백한다.
     """
     conn = get_conn()
     if grp:
@@ -99,13 +117,14 @@ def _fetch_intl_opponents(tournament_id, my_nat, grp=None):
     result = []
     for r in rows:
         avg = r["ovr"] or 50
+        players = _make_intl_real_players(r["country"], avg) or _make_intl_virtual_players(avg)
         result.append({
             "team_id":   None,
             "name":      r["country"],
             "flag":      r["flag"] or "",
             "avg_ovr":   round(avg),
             "formation": "4-4-2",
-            "players":   _make_intl_virtual_players(avg),
+            "players":   players,
         })
     return result
 
@@ -199,20 +218,30 @@ class _FormationCanvas(QWidget):
         self.setStyleSheet("background-color:#1a3a1a;border-radius:6px;")
         self.setMouseTracking(True)
 
-    def _calc_avg_ovr(self):
-        """현재 로드된 선수들의 평균 OVR."""
+    def _calc_avg_ovr(self, ndigits=0):
+        """현재 로드된 선수들의 평균 OVR.
+        [2026-07 재수정, 신민용 지적] "나"를 다시 평균에 포함시킨다.
+        이전엔 나를 제외했는데(약한 내가 무조건 라인업에 꽂히던 옛 버그
+        때문에 그렇게 했었음), 이제 load_my_team()이 "내가 그 자리 기존
+        선수보다 나을 때만" 나를 넣도록 바뀌었으므로 — 내가 리스트에
+        있다는 것 자체가 이미 "그 자리 최선의 선택"이라는 뜻이라 평균에
+        넣어도 더 이상 실제 팀 수준을 왜곡하지 않는다(오히려 빼면 내
+        업그레이드 효과가 화면에 전혀 반영되지 않는 문제가 생김).
+        ndigits: 반환 소수 자릿수. 계산 자체는 항상 2자리까지 유지하고,
+        표시용으로 호출하는 쪽에서 반올림 자릿수를 지정한다(기본 0=정수 표시)."""
         if not self.players: return 0
         ovrs = []
         for p in self.players:
             v = p.get("ovr", 0)
             try:
-                v = int(v)
+                v = float(v)
             except (TypeError, ValueError):
                 v = 0
             if 1 <= v <= 100:   # 비정상값 제외
                 ovrs.append(v)
         if not ovrs: return 0
-        return round(sum(ovrs) / len(ovrs))
+        precise = round(sum(ovrs) / len(ovrs), 2)   # 내부 계산은 항상 소수 2자리
+        return round(precise, ndigits) if ndigits else round(precise)
 
     def load_my_team(self, team_id, intl_nat: str = ""):
         """리그팀 또는 국가대표팀 로드.
@@ -289,16 +318,56 @@ class _FormationCanvas(QWidget):
             self.formation = row["formation"] if row else "4-4-2"
             my_tid = p.get("current_team_id", 0) if p else 0
             if my_tid == team_id and p:
+                # [2026-07 수정] "나를 빼고 베스트11을 먼저 짠 뒤, 내 자리에 있던
+                # 선수와 비교해서 내가 더 나을 때만 들어간다"는 원칙으로 재설계.
+                # 기존엔 내 실력과 무관하게 무조건 [나]+AI10명으로 라인업을 짰음.
+                slots_only = FORMATION_SLOTS.get(self.formation, FORMATION_SLOTS["4-4-2"])
+                all_ai = _mask_ai_names([dict(r) for r in conn.execute(
+                    "SELECT * FROM ai_players WHERE team_id=? ORDER BY ovr DESC",
+                    (team_id,)).fetchall()])
+
+                # 1) 나를 제외한 베스트11: 포지션 호환 우선순위로 그리디 배정
+                #    (OVR 높은 순으로 훑으며 자신에게 가장 잘 맞는 빈 슬롯을 차지)
+                slot_filled = [None] * len(slots_only)
+                for ai in all_ai:
+                    open_slots = [sp for i, sp in enumerate(slots_only) if slot_filled[i] is None]
+                    if not open_slots:
+                        break
+                    _, chosen_pos, _ = _best_slot_for_player(ai.get("position", "CM"), open_slots)
+                    for i, sp in enumerate(slots_only):
+                        if slot_filled[i] is None and sp == chosen_pos:
+                            slot_filled[i] = ai
+                            break
+                # 포지션이 안 맞아 못 채운 슬롯은 남은 선수 중 OVR 높은 순으로 채움(방어적 폴백)
+                if any(s is None for s in slot_filled):
+                    used_ids = {pl["id"] for pl in slot_filled if pl}
+                    leftovers = [ai for ai in all_ai if ai["id"] not in used_ids]
+                    li = 0
+                    for i in range(len(slot_filled)):
+                        if slot_filled[i] is None and li < len(leftovers):
+                            slot_filled[i] = leftovers[li]; li += 1
+
+                # 2) 내 포지션에 맞는 슬롯을 찾아, 그 자리의 기존 선수와 OVR 비교
+                my_slot_idx, field_pos, mismatch_rank = _best_slot_for_player(
+                    p.get("position", "MF"), slots_only)
+                rival = slot_filled[my_slot_idx] if my_slot_idx < len(slot_filled) else None
+
                 me = {"id": -1, "name": p.get("name", "나"),
                       "position": p.get("position", "MF"),
                       "ovr": p.get("ovr", 40), "is_me": True,
                       **{s: p.get(s, 0) for s in ALL_STATS}}
-                ais = _mask_ai_names([dict(r) for r in conn.execute(
-                    "SELECT * FROM ai_players WHERE team_id=? LIMIT 10", (team_id,)).fetchall()])
-                self.players = [me] + ais
+
+                if rival is None or me["ovr"] > rival["ovr"]:
+                    # 내가 그 자리 주전보다 낫다 (또는 빈 자리) → 선발 출전
+                    rest = [pl for pl in slot_filled if pl is not None and pl is not rival]
+                    self.players = [me] + rest
+                else:
+                    # 그 자리 주전이 나보다 낫다 → 벤치 (베스트11 그대로 표시, 나는 제외)
+                    self.players = [pl for pl in slot_filled if pl is not None]
             else:
                 self.players = _mask_ai_names([dict(r) for r in conn.execute(
-                    "SELECT * FROM ai_players WHERE team_id=? LIMIT 11", (team_id,)).fetchall()])
+                    "SELECT * FROM ai_players WHERE team_id=? ORDER BY ovr DESC LIMIT 11",
+                    (team_id,)).fetchall()])
             conn.close()
 
         # 캐시 저장
@@ -720,6 +789,21 @@ class PlayerStatPopup(QDialog):
         hdr = QLabel(f"{pl.get('name','')}  [{pl.get('position','')}]  OVR {pl.get('ovr',0)}")
         hdr.setStyleSheet("color:#00cc44;font-size:13px;font-weight:bold;")
         lay.addWidget(hdr)
+
+        # [2026-07 신설, 신민용 요청] 국적 표시
+        nat = pl.get("nationality", "")
+        if nat:
+            nat_lbl = QLabel(f"🌍 {nat}")
+            nat_lbl.setStyleSheet("color:#888;font-size:11px;")
+            lay.addWidget(nat_lbl)
+
+        # [2026-07 신설, 신민용 요청] 소속팀 표시 (국제대회 화면에서 상대국
+        # 선수 클릭 시 — "어느 클럽 소속인지"가 국적보다 새 정보이므로 표시)
+        club = pl.get("club", "")
+        if club:
+            club_lbl = QLabel(f"🏟️ {club}")
+            club_lbl.setStyleSheet("color:#888;font-size:11px;")
+            lay.addWidget(club_lbl)
 
         tbl = QTableWidget(len(ALL_STATS), 2)
         tbl.setHorizontalHeaderLabels(["스탯","수치"])

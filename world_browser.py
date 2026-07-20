@@ -909,6 +909,10 @@ def get_cl_tournament_detail(tournament_id):
     entries = [dict(r) for r in c.execute(
         "SELECT team_id, team_name, flag, country, grade FROM cl_entries "
         "WHERE tournament_id=?", (tournament_id,)).fetchall()]
+    # [2026-07 신설, 신민용 요청] 리그 스테이지 순위표 색칠(직행/플레이오프)에
+    # 대륙별 컷 라인이 필요해서 continent도 같이 조회한다.
+    t_row = c.execute("SELECT continent FROM cl_tournaments WHERE id=?", (tournament_id,)).fetchone()
+    continent = t_row["continent"] if t_row else None
     league_tbl = {e["team_id"]: {
         "team_id": e["team_id"], "name": e["team_name"], "flag": e["flag"],
         "country": e["country"], "grade": e["grade"],
@@ -952,4 +956,151 @@ def get_cl_tournament_detail(tournament_id):
     knockout = [{"stage": s, "stage_ko": STAGE_KO.get(s, s), "matches": ko_by_stage[s]}
                 for s in _CL_KO_STAGE_ORDER if s in ko_by_stage]
 
-    return {"groups": {}, "league_standings": league_standings, "knockout": knockout}
+    return {"groups": {}, "league_standings": league_standings, "knockout": knockout,
+            "continent": continent}
+
+
+# ─────────────────────────────────────────
+# 7. 역대 클럽 월드컵 기록 (2026-07 신설)
+# ─────────────────────────────────────────
+_CWC_KO_STAGE_ORDER = ["R16", "QF", "SF", "TP", "F"]
+
+
+def _batch_cwc_placements(tournament_ids, conn):
+    """get_cl_history의 _batch_cl_placements와 완전히 동일한 패턴 —
+    cwc_matches는 cl_matches와 스키마가 같으므로 champions_engine._winner_of를
+    그대로 재사용한다."""
+    from champions_engine import _winner_of
+    if not tournament_ids:
+        return {}
+    ph = ",".join("?" * len(tournament_ids))
+    rows = conn.execute(
+        f"""SELECT * FROM cwc_matches WHERE tournament_id IN ({ph})
+            AND stage IN ('F','TP') AND home_score>=0
+            ORDER BY id""", list(tournament_ids)).fetchall()
+    latest = {}
+    for r in rows:
+        latest[(r["tournament_id"], r["stage"])] = dict(r)
+
+    out = {}
+    for tid in tournament_ids:
+        fm = latest.get((tid, "F"))
+        if not fm:
+            continue
+        winner = _winner_of(fm)
+        runner_up = fm["away_team_id"] if winner == fm["home_team_id"] else fm["home_team_id"]
+        third = fourth = None
+        tp = latest.get((tid, "TP"))
+        if tp:
+            third = _winner_of(tp)
+            fourth = tp["away_team_id"] if third == tp["home_team_id"] else tp["home_team_id"]
+        out[tid] = {"winner": winner, "runner_up": runner_up, "third": third, "fourth": fourth}
+    return out
+
+
+def get_cwc_history(limit=100):
+    """완료된 클럽 월드컵 대회의 연도별 1~4위(팀명+국가) 목록.
+    get_cl_history와 완전히 동일한 구조 — 4년에 한 번뿐이라 limit 기본값
+    100이면 사실상 게임 전체 기간을 다 담는다."""
+    conn = get_conn(); c = conn.cursor()
+    rows = [dict(r) for r in c.execute(
+        """SELECT t.id, t.year, t.name
+           FROM cwc_tournaments t
+           WHERE t.status='done' AND t.winner_team_id != 0
+           ORDER BY t.year DESC, t.id DESC LIMIT ?""", (limit,)).fetchall()]
+
+    placements_by_row = []
+    all_tids = set()
+    tournament_ids = [r["id"] for r in rows]
+    placements_map = _batch_cwc_placements(tournament_ids, conn)
+    for r in rows:
+        pl = placements_map.get(r["id"]) or {}
+        placements_by_row.append(pl)
+        for key in ("winner", "runner_up", "third", "fourth"):
+            if pl.get(key):
+                all_tids.add(pl[key])
+
+    team_info = {}
+    if all_tids:
+        ph = ",".join("?" * len(all_tids))
+        for tr in c.execute(
+                f"""SELECT tm.id, tm.name, cn.flag, cn.name as country
+                    FROM teams tm
+                    LEFT JOIN leagues l ON tm.league_id = l.id
+                    LEFT JOIN countries cn ON l.country_id = cn.id
+                    WHERE tm.id IN ({ph})""", list(all_tids)).fetchall():
+            team_info[tr["id"]] = {"name": tr["name"], "flag": tr["flag"] or "",
+                                   "country": tr["country"] or ""}
+    conn.close()
+
+    for r, pl in zip(rows, placements_by_row):
+        for key in ("winner", "runner_up", "third", "fourth"):
+            tid = pl.get(key)
+            info = team_info.get(tid) if tid else None
+            r[f"{key}_name"] = info["name"] if info else ""
+            r[f"{key}_flag"] = info["flag"] if info else ""
+            r[f"{key}_country"] = info["country"] if info else ""
+    return rows
+
+
+def get_cwc_tournament_detail(tournament_id):
+    """클럽 월드컵 한 대회의 8개조 조별리그 순위표 + 토너먼트(녹아웃) 대진.
+    get_cl_tournament_detail과 같은 반환 형태를 쓰되, '리그 스테이지'
+    대신 '조별리그'(8조×4팀)이므로 groups 키를 실제로 채워서 반환한다."""
+    conn = get_conn(); c = conn.cursor()
+
+    entries = [dict(r) for r in c.execute(
+        "SELECT team_id, team_name, country, grp, grade FROM cwc_entries "
+        "WHERE tournament_id=?", (tournament_id,)).fetchall()]
+    team_info = {e["team_id"]: e for e in entries}
+
+    groups_tbl = {}
+    for e in entries:
+        g = e["grp"] or "?"
+        groups_tbl.setdefault(g, {})[e["team_id"]] = {
+            "team_id": e["team_id"], "name": e["team_name"], "flag": "",
+            "country": e["country"], "grade": e["grade"],
+            "wins": 0, "draws": 0, "losses": 0, "gf": 0, "ga": 0}
+
+    for m in c.execute(
+            "SELECT home_team_id, away_team_id, home_score, away_score "
+            "FROM cwc_matches WHERE tournament_id=? AND stage='group' "
+            "AND home_score>=0", (tournament_id,)).fetchall():
+        for g, tbl in groups_tbl.items():
+            h, a = tbl.get(m["home_team_id"]), tbl.get(m["away_team_id"])
+            if not h or not a:
+                continue
+            h["gf"] += m["home_score"]; h["ga"] += m["away_score"]
+            a["gf"] += m["away_score"]; a["ga"] += m["home_score"]
+            if m["home_score"] > m["away_score"]:   h["wins"] += 1;  a["losses"] += 1
+            elif m["home_score"] < m["away_score"]: a["wins"] += 1;  h["losses"] += 1
+            else:                                   h["draws"] += 1; a["draws"] += 1
+            break   # 이 매치는 한 조에만 속하므로 찾으면 바로 중단
+
+    groups = {}
+    for g, tbl in sorted(groups_tbl.items()):
+        rows = list(tbl.values())
+        for r in rows:
+            r["pts"] = r["wins"] * 3 + r["draws"]
+            r["gd"] = r["gf"] - r["ga"]
+        rows.sort(key=lambda r: (-r["pts"], -r["gd"], -r["gf"]))
+        groups[g] = rows
+
+    ko_rows = c.execute(
+        "SELECT stage, home_team_id, away_team_id, home_score, away_score, "
+        "pso_winner, pso_score FROM cwc_matches WHERE tournament_id=? AND "
+        "stage!='group' AND home_score>=0 ORDER BY id",
+        (tournament_id,)).fetchall()
+    conn.close()
+
+    _CWC_STAGE_KO = {"R16": "16강", "QF": "8강", "SF": "4강", "F": "결승", "TP": "3/4위전"}
+    ko_by_stage = {}
+    for m in ko_rows:
+        m = dict(m)
+        m["home_info"] = team_info.get(m["home_team_id"], {})
+        m["away_info"] = team_info.get(m["away_team_id"], {})
+        ko_by_stage.setdefault(m["stage"], []).append(m)
+    knockout = [{"stage": s, "stage_ko": _CWC_STAGE_KO.get(s, s), "matches": ko_by_stage[s]}
+                for s in _CWC_KO_STAGE_ORDER if s in ko_by_stage]
+
+    return {"groups": groups, "league_standings": [], "knockout": knockout}

@@ -489,6 +489,19 @@ class CenterPanel(QWidget):
             # 기본 스타일 복귀 (전역 스타일시트에 위임)
             frame.setStyleSheet("")
 
+    def _match_stress_preview(self, p, is_home: bool) -> int:
+        """[2026-07 버그수정, 신민용 리포트] 경기 스트레스 미리보기가
+        game_engine._simulate_match의 실제 공식과 따로 놀아서(하드코딩된
+        옛날 값 +5/+8/+8 을 그대로 표시), 실제 진행 시 적용되는 값(18/22,
+        30세 이상은 13/16)과 화면 표시가 어긋났다. 실제 공식과 동일하게
+        맞춘다 — 리그/챔스/컵/국제전 전부 이 함수 하나로 통일."""
+        age = p.get("age", 0) or 0
+        if age >= 30:
+            return 10 if is_home else 14
+        if age >= 25:
+            return 16 if is_home else 20
+        return 18 if is_home else 22
+
     def refresh(self):
         p  = get_player()
         st = get_state()
@@ -627,7 +640,7 @@ class CenterPanel(QWidget):
                     stage = match_info.get("stage_ko", "")
                     grp   = f" {match_info['grp']}조" if match_info.get("grp") else ""
                     opp   = f"{match_info.get('opp_flag','')}{match_info.get('opp','')}"
-                    hl.setText("스트레스 +8")
+                    hl.setText(f"스트레스 +{self._match_stress_preview(p, match_info.get('is_home', False))}")
                     if ml:
                         _is_main = match_info.get("kind") in ("world", "continent")
                         _txt_c = "#ffaa33" if _is_main else "#ff6666"
@@ -641,7 +654,7 @@ class CenterPanel(QWidget):
                     stage = match_info.get("stage_ko", "")
                     opp   = f"{match_info.get('opp_flag','')}{match_info.get('opp','')}"
                     loc   = "홈" if match_info.get("is_home") else "원정"
-                    hl.setText("스트레스 +8")
+                    hl.setText(f"스트레스 +{self._match_stress_preview(p, match_info.get('is_home', False))}")
                     if ml:
                         ml.setText(f"🏆 {match_info['league_name']} {stage} ({loc})\nvs {opp}")
                         ml.setStyleSheet("color:#ffd24d;font-weight:bold;font-size:12px;"
@@ -654,16 +667,31 @@ class CenterPanel(QWidget):
                     _otier = match_info.get("opp_tier")
                     opp_disp = f"{opp} ({_otier}부)" if _otier else opp
                     loc   = "홈" if match_info.get("is_home") else "원정"
-                    hl.setText("스트레스 +8")
+                    hl.setText(f"스트레스 +{self._match_stress_preview(p, match_info.get('is_home', False))}")
                     if ml:
                         ml.setText(f"🎖️ {match_info['league_name']} {rname} ({loc})\nvs {opp_disp}")
                         ml.setStyleSheet("color:#c48aff;font-weight:bold;font-size:12px;"
                                          "background:#2a1a3a;border-radius:4px;padding:4px;")
                         ml.show()
+                elif match_info.get("cwc"):
+                    # [2026-07 신설, 신민용 리포트: "클럽월드컵이 안 뜬다/색이
+                    # 이상하다"] 분기 자체가 없어서 일반 리그 경기(초록 ⚽)로
+                    # 뭉뚱그려 표시되고 있었다 — 전용 아이콘/색으로 분리.
+                    stage = match_info.get("stage_ko", "")
+                    opp   = match_info.get("opp", "")
+                    opp_country = match_info.get("opp_country", "")
+                    opp_disp = f"{opp}({opp_country})" if opp_country else opp
+                    loc   = "홈" if match_info.get("is_home") else "원정"
+                    hl.setText(f"스트레스 +{self._match_stress_preview(p, match_info.get('is_home', False))}")
+                    if ml:
+                        ml.setText(f"🌍 클럽 월드컵 {stage} ({loc})\nvs {opp_disp}")
+                        ml.setStyleSheet("color:#4dd2ff;font-weight:bold;font-size:12px;"
+                                         "background:#1a2f3a;border-radius:4px;padding:4px;")
+                        ml.show()
                 else:
                     league_name = match_info.get("league_name", "")
                     loc = "홈" if match_info.get("is_home") else "원정"
-                    stress_val = 5 if match_info.get("is_home") else 8
+                    stress_val = self._match_stress_preview(p, match_info.get("is_home", False))
                     hl.setText(f"스트레스 +{stress_val}")
                     if ml:
                         ml.setText(f"⚽ {league_name}\n({loc})")
@@ -852,6 +880,22 @@ class CenterPanel(QWidget):
                         }
         except Exception:
             pass
+        # 클럽 월드컵 확인 (43~52주, 4년에 한 번)
+        try:
+            import club_world_cup_engine
+            cwc_m = club_world_cup_engine.get_my_cwc_match(week)
+            if cwc_m:
+                return {
+                    "cwc": True,
+                    "tournament_id": cwc_m["tournament_id"],
+                    "league_name": cwc_m.get("league_name", "클럽 월드컵"),
+                    "stage": cwc_m.get("stage", "group"),
+                    "stage_ko": cwc_m.get("stage_ko", ""),
+                    "grp": cwc_m.get("grp", ""),
+                    "week": week,
+                }
+        except Exception:
+            pass
         return None
 
     def _check_match(self, week, p):
@@ -871,7 +915,13 @@ class CenterPanel(QWidget):
         if intl_engine.has_my_match_between(week, week):
             return True
         import champions_engine
-        return champions_engine.has_my_cl_match_between(week, week)
+        if champions_engine.has_my_cl_match_between(week, week):
+            return True
+        import cup_engine
+        if cup_engine.has_my_cup_match_between(week, week):
+            return True
+        import club_world_cup_engine
+        return club_world_cup_engine.has_my_cwc_match_between(week, week)
 
     def _on_day_combo_changed(self, idx, text):
         """[2026-07 추가] 콤보 idx번(0~6)이 바뀌었을 때, 지금 그게 실제로
@@ -903,9 +953,18 @@ class CenterPanel(QWidget):
         from game_engine import effective_training_stress, get_player
         p = get_player() or {}
         for i, cb in enumerate(self.week_combos):
-            # 경기 주차는 콤보가 숨겨지고(week_hints 에 경기 스트레스가 표시됨)
-            # 훈련 대상이 아니므로 미리보기 합산/덮어쓰기에서 제외한다.
             if not cb.isVisible():
+                # [2026-07 버그수정, 신민용 리포트: "경기일엔 스트레스 +8이
+                # 뜨는데 주간 합계는 +0으로 나옴"] 경기일은 훈련 콤보가
+                # 아니라서 여기서 다시 계산은 못 하지만(부상/경기 등 종류가
+                # 다양함), week_hints[i]에 이미 표시된 값을 그대로 파싱해서
+                # 합계에 포함시킨다 — 표시값과 합계가 항상 일치하게.
+                import re
+                _hint_txt = self.week_hints[i].text()
+                if "스트레스" in _hint_txt:   # 부상("N일 남음") 등은 제외
+                    m = re.search(r"([+-]?\d+)", _hint_txt)
+                    if m:
+                        total_stress += int(m.group(1))
                 continue
             sel   = cb.currentText()
             ttype = TRAIN_MAP_KO.get(sel, "중강도")
@@ -1119,6 +1178,17 @@ class CenterPanel(QWidget):
         self._advance_worker.finished_ok.connect(
             lambda: self._on_advance_finished())
         self._advance_worker.failed.connect(self._on_advance_failed)
+        # [2026-07 버그수정, 신민용 리포트: "QThread: Destroyed while thread
+        # still running" 콘솔 경고 + 진행 스피너가 안 사라지고 멈춤]
+        # 원인: _on_advance_finished 안에서 시즌전환 직후 국적 강제확정 체크
+        # 시 self.main_win.refresh_all() + QApplication.processEvents()를
+        # 수동 호출하는데, 이 재진입성 이벤트 처리 도중 self._advance_worker
+        # 파이썬 참조가 아직 완전히 안 끝난(Qt 내부적으로 isRunning()이 아직
+        # True인) 스레드 객체를 가리키는 채로 재사용되면서, 파이썬 GC가
+        # 이 객체를 너무 일찍 정리해버릴 수 있었다. Qt의 자체 스레드 수명
+        # 관리(finished 시그널→deleteLater)에 맡기면, 파이썬 쪽 참조 타이밍과
+        # 무관하게 Qt가 안전한 시점에 알아서 정리해준다.
+        self._advance_worker.finished.connect(self._advance_worker.deleteLater)
         self._advance_worker.start()
 
     def _on_advance_finished(self):
@@ -1306,7 +1376,11 @@ class CenterPanel(QWidget):
             if cm:
                 return cm
             import cup_engine
-            return cup_engine.get_my_cup_match(week)
+            cu = cup_engine.get_my_cup_match(week)
+            if cu:
+                return cu
+            import club_world_cup_engine
+            return club_world_cup_engine.get_my_cwc_match(week)
         return None
 
     # ── 액션 ─────────────────────────────────────

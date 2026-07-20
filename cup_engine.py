@@ -144,7 +144,7 @@ def get_my_cup_matches():
     컵대회는 국가/시즌 단위라 cup_matches만으로 연도순 정렬하면 충분하다."""
     conn = get_conn()
     rows = [dict(r) for r in conn.execute(
-        """SELECT m.*, t.year AS t_year, t.name AS comp
+        """SELECT m.*, t.year AS t_year, t.name AS comp, t.my_team_id AS t_my_tid
            FROM cup_matches m
            JOIN cup_tournaments t ON m.tournament_id = t.id
            WHERE m.my_played = 1 OR m.my_absence_reason IS NOT NULL
@@ -152,11 +152,14 @@ def get_my_cup_matches():
     conn.close()
 
     out = []
-    from game_engine import get_player
-    p = get_player()
-    my_tid = p.get("current_team_id", 0) if p else 0
 
     for m in rows:
+        # [2026-07 버그수정, champions_engine.get_my_cl_matches와 동일한
+        # 버그 발견/수정] "현재" 소속팀 대신 cup_tournaments.my_team_id
+        # (그 대회 시작 시점에 고정 저장된 내 팀)를 쓴다 — 안 그러면 그
+        # 이후 이적한 경우 과거 경기의 상대가 그때의 내 팀 이름으로
+        # 뒤바뀌어 표시되고 스코어/승패도 뒤집힌다.
+        my_tid = m["t_my_tid"]
         he = _entry(m["tournament_id"], m["home_team_id"])
         ae = _entry(m["tournament_id"], m["away_team_id"])
         is_home = (m["home_team_id"] == my_tid)
@@ -189,6 +192,20 @@ def get_my_cup_matches():
             "absence_reason": m.get("my_absence_reason"),
         })
     return out
+
+
+def has_my_cup_match_between(week_from, week_to):
+    """주차 범위 내 내 컵대회 경기 존재 여부 (센터패널 표시용).
+    [2026-07 신설, 신민용 리포트: "일정이 안뜰 때가 있다"] intl_engine.
+    has_my_match_between / champions_engine.has_my_cl_match_between과
+    똑같은 용도의 함수가 컵대회 쪽에만 없었다. 그래서 center_panel.py의
+    _check_match()가 리그/국제대회/챔스만 확인하고 컵대회는 아예 확인을
+    안 해서, 그 주에 컵대회 경기만 있고 리그 경기가 없는 경우 실제로는
+    경기가 있는데도 "이번 주 경기 없음" 배너가 잘못 떴다."""
+    for w in range(week_from, week_to + 1):
+        if get_my_cup_match(w):
+            return True
+    return False
 
 
 def get_my_cup_match(week):
@@ -346,9 +363,10 @@ def _start_next_round(t):
     if next_tier is not None:
         new_teams = _tier_teams(t["country_id"], next_tier)
         conn = get_conn(); c = conn.cursor()
-        for team_id, team_name, ovr in new_teams:
-            c.execute("""INSERT INTO cup_entries(tournament_id, team_id, team_name, tier, ovr)
-                         VALUES(?,?,?,?,?)""", (tid, team_id, team_name, next_tier, ovr))
+        if new_teams:
+            c.executemany("""INSERT INTO cup_entries(tournament_id, team_id, team_name, tier, ovr)
+                         VALUES(?,?,?,?,?)""",
+                          [(tid, team_id, team_name, next_tier, ovr) for team_id, team_name, ovr in new_teams])
         conn.commit(); conn.close()
         pool = pool + [(x[0], x[1], x[2]) for x in new_teams]
 
@@ -391,15 +409,17 @@ def _start_next_round(t):
         week = min(52, CUP_ROUND_WEEKS_POOL[-1] + extra)
 
     c = conn.cursor()
+    _match_rows = []
     for slot in range(0, len(pool), 2):
         home, away = pool[slot], pool[slot + 1]
         is_my = 1 if my_tid in (home[0], away[0]) else 0
-        c.execute("""INSERT INTO cup_matches
+        _match_rows.append((tid, rname, round_counter, week, home[0], away[0], is_my, slot // 2,
+                            pool_entering))
+    if _match_rows:
+        c.executemany("""INSERT INTO cup_matches
                      (tournament_id, round_name, round_idx, week,
                       home_team_id, away_team_id, is_my, slot, pool_entering)
-                     VALUES(?,?,?,?,?,?,?,?,?)""",
-                  (tid, rname, round_counter, week, home[0], away[0], is_my, slot // 2,
-                   pool_entering))
+                     VALUES(?,?,?,?,?,?,?,?,?)""", _match_rows)
     if bye:
         if _is_mine:
             add_log(f"🏆 {t['name']} {rname}: {bye[1]} 부전승", "event")
@@ -420,10 +440,19 @@ def _entry(tid, team_id):
 
 
 def _match_outcome(h_ovr, a_ovr):
+    """[2026-07 재조정, 신민용 지적: "컵대회 우승팀이 리그에서는 10등,
+    챔스 우승팀이 리그 하위권인 게 이상하다"] 이 함수가 리그(_match_win_probs)/
+    국제대회(intl_engine._match_outcome)와 똑같은 예전 완만한 공식(계수
+    0.014, 캡 0.85)에 그대로 머물러 있었다 — 리그는 38~58경기라 표본이
+    커서 진짜 실력 순으로 수렴하는데, 컵대회는 토너먼트 몇 경기뿐이라
+    이변 확률이 낮아야 결과가 리그 순위와 크게 어긋나지 않는다. 오히려
+    거꾸로 컵대회 쪽이 리그보다 더 완만한(이변이 잦은) 공식을 쓰고
+    있었으니, 몇 경기 안 되는 토너먼트에서 실제 순위와 동떨어진 결과가
+    누적되기 쉬웠다. 리그/국제대회와 동일한 기울기로 통일한다."""
     diff = h_ovr - a_ovr
-    hw = max(0.08, min(0.85, 0.46 + diff * 0.014))
-    dw = max(0.08, 0.24 - abs(diff) * 0.005)
-    aw = max(0.05, 1.0 - hw - dw)
+    hw = max(0.04, min(0.95, 0.46 + diff * 0.022))
+    dw = max(0.05, 0.24 - abs(diff) * 0.009)
+    aw = max(0.02, 1.0 - hw - dw)
     tot = hw + dw + aw
     hw, dw, aw = hw / tot, dw / tot, aw / tot
     roll = random.random()
@@ -544,9 +573,9 @@ def simulate_my_cup_match(week, p, day=None):
 
     # [2026-07 신설] 출전정지 체크 — 퇴장 다음 경기는 강제 결장(개인 캐리
     # 보너스·개인 스탯 전부 0), 팀은 나 없이 시뮬레이션된다.
-    _suspended, _new_susp = _check_suspended(p)
+    _suspended, _new_susp = _check_suspended(p, field="cup_suspension")
     if _suspended:
-        update_player(red_card_suspension=_new_susp)
+        update_player(cup_suspension=_new_susp)
         add_log(f"🟥 출전정지로 결장{'  (다음 경기부터 복귀)' if _new_susp == 0 else f'  (남은 정지 {_new_susp}경기)'}",
                 "event")
 
@@ -592,7 +621,7 @@ def simulate_my_cup_match(week, p, day=None):
         _absence_reason = None
         # [2026-07 신설] 퇴장 판정 — '폭력적' 성격의 red_card_chance 반영.
         if _roll_red_card(p):
-            goals, assists, saves, rating, events, detail = _apply_red_card_dismissal(p)
+            goals, assists, saves, rating, events, detail = _apply_red_card_dismissal(p, field="cup_suspension")
             _absence_reason = "red_card"
     # [2026-07 신설] '겁쟁이' 성격의 cup_rating(컵대회 전반 위축) +
     # '소심함'의 big_match_rating(결승전 한정 위축) 연결. 둘 다 정의만
@@ -613,16 +642,25 @@ def simulate_my_cup_match(week, p, day=None):
     conn.execute("""UPDATE cup_matches SET home_score=?, away_score=?,
                     pso_winner=?, pso_score=?, my_played=?,
                     my_saves=?, my_goals=?, my_assists=?, my_rating=?, day=?,
+                    my_shots=?, my_shots_on=?, my_key_passes=?,
+                    my_dribbles=?, my_blocks=?, my_pass_acc=?,
                     my_absence_reason=?
                     WHERE id=?""",
                  (hs, as_, pso_winner, pso_score, 0 if _suspended else 1,
-                  saves, goals, assists, rating, day, _absence_reason, m["id"]))
+                  saves, goals, assists, rating, day,
+                  detail["shots"], detail["shots_on"], detail["key_passes"],
+                  detail["dribbles"], detail["blocks"], detail["pass_acc"],
+                  _absence_reason, m["id"]))
     conn.commit()
     conn.close()
 
     _update_pop(p, goals, assists, rating)
     p2 = get_player()
-    ns = min(100, p2["stress"] + 8)
+    # [2026-07 조정, 신민용 지적: "경기 스트레스가 고강도 훈련만큼은 돼야
+    # 하지 않나"] 리그 경기와 동일 원칙 — 고강도 훈련(20)과 최소 동급으로
+    # 올림. 컵대회는 홈/원정·나이 구분 없이 단일 값을 쓰는 기존 구조는
+    # 유지하고 크기만 리그 스케일에 맞췄다.
+    ns = min(100, p2["stress"] + 20)
     nh = p2["happiness"]
     if my_result == "win":
         nh = min(100, nh + 4)
@@ -737,6 +775,7 @@ def _advance_round(t, round_name, week):
 
     conn = get_conn(); c = conn.cursor()
     sf_losers = []
+    _loser_updates = []  # [2026-07 최적화] 패자 UPDATE를 모았다가 executemany로 일괄 반영
     for m in cur:
         w = _winner_of(m)
         loser = m["away_team_id"] if w == m["home_team_id"] else m["home_team_id"]
@@ -745,13 +784,24 @@ def _advance_round(t, round_name, week):
             # 않고 탈락 기록도 미룬다(3/4위전 결과가 진짜 최종 성적이다).
             sf_losers.append(loser)
             continue
-        c.execute("UPDATE cup_entries SET alive=0 WHERE tournament_id=? AND team_id=?",
-                  (tid, loser))
         if my_tid and loser == my_tid and not is_tp:
+            # 내 팀이 탈락하는 희귀 케이스만 기존처럼 그 자리에서 즉시 처리
+            # (커밋 순서가 _record_my_exit 호출 전에 반드시 끝나야 하므로).
+            if _loser_updates:
+                c.executemany("UPDATE cup_entries SET alive=0 WHERE tournament_id=? AND team_id=?",
+                              _loser_updates)
+                _loser_updates = []
+            c.execute("UPDATE cup_entries SET alive=0 WHERE tournament_id=? AND team_id=?",
+                      (tid, loser))
             exit_label = "준우승" if is_final else round_name
             conn.commit(); conn.close()
             _record_my_exit(t, exit_label, _teams_remaining_at(tid))
             conn = get_conn(); c = conn.cursor()
+        else:
+            _loser_updates.append((tid, loser))
+    if _loser_updates:
+        c.executemany("UPDATE cup_entries SET alive=0 WHERE tournament_id=? AND team_id=?",
+                      _loser_updates)
     conn.commit(); conn.close()
 
     if is_sf:

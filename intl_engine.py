@@ -58,7 +58,69 @@ from constants import (
     GRADE_TEAM_OVR, GRADE_QUAL_BASE, QUAL_NOISE,
     INTL_SELECTION_OVR, INTL_MAX_TIER, INTL_MIN_MATCHES,
     INTL_SELECTION_MARGIN,
+    CONTINENT_OVR_BONUS, COUNTRY_OVR_ADJ,
 )
+
+
+_NAT_SQUAD_POSITIONS = ["GK", "CB", "CB", "LB", "RB", "CDM", "CM", "CAM", "LW", "RW", "ST"]
+
+
+def _get_real_squad_ovr(country):
+    """[2026-07 신설, 신민용 확정: "국적 배정했으니 스쿼드도 실제 선수로
+    뽑아야"] database.get_country_squad_players()의 3단계 폴백(국적태그→
+    자국리그→해외 하위리그)으로 실제 선수 풀을 최대한 넓게 확보한다.
+    그래도 8명 미만이면 None을 반환해 호출부가 기존 공식값을 쓰게 한다."""
+    from database import get_country_squad_players
+    picked = get_country_squad_players(country, min_count=8)
+    if len(picked) < 8:
+        return None
+    return sum(p["ovr"] for p in picked) / len(picked)
+
+
+def _nat_team_ovr(grade, name="", continent="", fast=False):
+    """[2026-07 신설, 신민용 지적: "한국 국대 OVR이 너무 높다"] 국가대표
+    OVR을 등급(GRADE_TEAM_OVR)만으로 정하면, 클럽 쪽에서 이미 적용 중인
+    대륙보정(CONTINENT_OVR_BONUS)·나라별 미세조정(COUNTRY_OVR_ADJ)이
+    전혀 반영이 안 된다. 대한민국은 A등급이지만 클럽 생성 시엔 대륙보정
+    -3(아시아) + 나라별 조정 -3("K리그 — A등급 안에서는 중하위")이 항상
+    같이 들어가는데, 국가대표 쪽만 그 두 조정을 건너뛰고 유럽 A등급
+    국가(포르투갈 등)와 똑같은 값을 받고 있었다. 여기서 그 두 보정을
+    국가대표 OVR에도 동일하게 적용한다.
+
+    [2026-07 재조정, 신민용 지적: "최상위 팀도 현실처럼 고점은 높지만
+    가끔 80대까지 떨어질 수 있어야 한다 — 독일이 2014 우승 후 하향곡선을
+    타고 이탈리아가 3년 동안 월드컵 예선을 못 뚫었던 것처럼, 이건 모든
+    강대국에 적용되는 게 맞다"] 균등분포(-2~+2) 대신 삼각분포를 쓴다 —
+    최빈값은 여전히 고점 근처(+1)라 대부분 시즌엔 세계 최정상급이지만,
+    분포 왼쪽 꼬리가 -10까지 길게 뻗어있어 가끔(체감상 4~5년에 한 번
+    꼴) 전력이 크게 빠지는 '침체기'가 자연스럽게 나온다. 오른쪽 꼬리도
+    +4까지 있어 절정기엔 기준 base(93)보다 더 높은 초강세 시즌도 가능.
+
+    [2026-07 재조정, 신민용 확정: "국적 시스템 만들었으니 국대도 실제
+    선수 기반으로"] ai_players.nationality로 실제 스쿼드를 구성할 수
+    있으면(포지션별 8명 이상 확보) 그 실제 평균을 70%, 기존 공식값을
+    30%로 블렌딩한다.
+
+    [2026-07 성능 긴급수정, 신민용 리포트: "41→43주차에서 15~20초씩
+    멈춘다"] 월드컵 예선처럼 전 세계 200여 개국을 한 번에 순회하며 이
+    함수를 부르는 대량 호출 지점에서, 나라마다 실제 스쿼드 조회
+    (_get_real_squad_ovr, 포지션당 최대 3단계 폴백 = 나라당 최대 33개
+    쿼리)까지 다 태우면 200개국 × 33쿼리로 수천 개 쿼리가 한꺼번에
+    몰려서 체감될 만큼 느려진다. fast=True면 이 실제 스쿼드 블렌딩을
+    건너뛰고 공식값만 쓴다 — 예선 통과 여부 같은 대량·근사 계산에는
+    공식값만으로도 충분하고, 실제 매치 시뮬레이션이나 개인상 판정처럼
+    나라 1~2개만 정확히 봐야 하는 곳은 fast=False(기본값)로 그대로
+    정확한 블렌딩을 쓴다."""
+    base = GRADE_TEAM_OVR.get(grade, 45)
+    adj = CONTINENT_OVR_BONUS.get(continent, 0) + COUNTRY_OVR_ADJ.get(name, 0)
+    noise = random.triangular(-10, 4, 1)
+    formula_val = base + adj + noise
+    if fast:
+        return formula_val
+    real_val = _get_real_squad_ovr(name) if name else None
+    if real_val is not None:
+        return round(0.7 * real_val + 0.3 * formula_val, 2)
+    return formula_val
 
 STAGE_KO = {"group": "조별리그", "R32": "32강", "R16": "16강", "QF": "8강", "SF": "4강", "F": "결승", "TP": "3/4위전",
             "qual_group": "조별리그", "qual_po": "플레이오프"}
@@ -250,8 +312,9 @@ def choose_national_team(tournament_id, nat):
     if not p:
         return None
     conn = get_conn()
-    grow = conn.execute("SELECT grade FROM countries WHERE name=?", (nat,)).fetchone()
+    grow = conn.execute("SELECT grade, continent FROM countries WHERE name=?", (nat,)).fetchone()
     grade = grow["grade"] if grow else "F"
+    nat_continent = grow["continent"] if grow else ""
     conn.close()
 
     # [버그수정] 선택 시점에는 절대 고정하지 않는다.
@@ -308,7 +371,7 @@ def choose_national_team(tournament_id, nat):
         return {"nat": nat, "selected": False, "qualified": False,
                 "result": "예선진출실패", "kind": "wc_qual"}
 
-    selected = _check_selection(p, grade)
+    selected = _check_selection(p, grade, country=nat, continent=nat_continent)
 
     conn = get_conn()
     trow = conn.execute("SELECT year, name, kind FROM intl_tournaments WHERE id=?",
@@ -693,6 +756,11 @@ def start_intl_tournament(year):
                   and (nxt - WC_START_YEAR) % WC_INTERVAL == 0)
 
     if not is_wc and not is_cont and not is_wc_qual:
+        # [2026-07 신설] 국가대표 대회가 아무것도 없는 '빈 해'(예: 2003,2007,
+        # 2011...) — 이 해에 클럽 월드컵을 연다. 캘린더 겹침이 전혀 없어서
+        # (챔스는 이미 23주차에 다 끝나있는 상태) 이 해를 고른 것.
+        from club_world_cup_engine import start_club_world_cup
+        start_club_world_cup(year)
         return
     if get_tournaments(year):
         return  # 이미 그 해 대회가 하나라도 생성됨 → 중복 생성 방지
@@ -875,13 +943,17 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
                         # 없으면 "통과했다"고 가정하지 말고, 대륙컵과 동일한
                         # 실력 재검증(_check_selection)을 거쳐야 한다.
                         _blocked_by_qual = not _check_selection(
-                            p, nat_info.get(committed, {}).get("grade", "F"))
+                            p, nat_info.get(committed, {}).get("grade", "F"),
+                            country=committed,
+                            continent=nat_info.get(committed, {}).get("continent", ""))
                 except Exception:
                     # [버그수정] 조회 중 예외가 나도 "통과로 간주"는 금물 —
                     # 위와 같은 이유로 실력 재검증으로 대체한다.
                     try:
                         _blocked_by_qual = not _check_selection(
-                            p, nat_info.get(committed, {}).get("grade", "F"))
+                            p, nat_info.get(committed, {}).get("grade", "F"),
+                            country=committed,
+                            continent=nat_info.get(committed, {}).get("continent", ""))
                     except Exception:
                         _blocked_by_qual = False
             if _blocked_by_qual:
@@ -909,7 +981,9 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
                 # (재판정하면 오히려 예선 이후 짧은 폼 기복에 흔들릴 수
                 # 있어) 그대로 둔다.
                 if (not is_wc) and not _check_selection(
-                        p, nat_info.get(committed, {}).get("grade", "F")):
+                        p, nat_info.get(committed, {}).get("grade", "F"),
+                        country=committed,
+                        continent=nat_info.get(committed, {}).get("continent", "")):
                     my_sel = 2
                     _age_dropped = True
                 else:
@@ -1093,7 +1167,7 @@ def _vet_bonus(age):
     return 0
 
 
-def _check_selection(p, my_grade):
+def _check_selection(p, my_grade, country="", continent=""):
     """국가대표 선발 판정 — 자국 등급(국대 평균 전력) 대비 상대평가.
 
     선발 기준을 클럽 선수 풀이 아니라 GRADE_TEAM_OVR(국대 경기 시뮬에 쓰는
@@ -1114,8 +1188,18 @@ def _check_selection(p, my_grade):
     임계값(threshold)을 조금 올리는 페널티로만 반영한다 — 실력이
     확실히 앞서는 선수는 그래도 뽑히고, 애매한 선수만 이 페널티로
     떨어지는 정도의 밸런스로 맞춘다.
+
+    [2026-07 재수정, 신민용 지적: "한국 국대 OVR이 너무 높다"] 임계값도
+    _nat_team_ovr과 동일한 대륙보정/나라별 조정을 반영해야, 실제 경기
+    시뮬에 쓰이는 그 나라의 진짜 평균 전력과 선발 기준이 어긋나지 않는다
+    (country/continent를 넘기면 반영, 안 넘기면 예전처럼 등급 평균만 사용
+    — 호출부 일부가 아직 이 정보 없이 부르는 경우 대비한 하위호환).
     """
-    nat_avg = GRADE_TEAM_OVR.get(my_grade, 45)
+    if country or continent:
+        nat_avg = GRADE_TEAM_OVR.get(my_grade, 45) + \
+            CONTINENT_OVR_BONUS.get(continent, 0) + COUNTRY_OVR_ADJ.get(country, 0)
+    else:
+        nat_avg = GRADE_TEAM_OVR.get(my_grade, 45)
     threshold = nat_avg - INTL_SELECTION_MARGIN
     my_ovr = p.get("ovr", 0)
     eff_ovr = my_ovr + _vet_bonus(p.get("age", 25))
@@ -1165,12 +1249,13 @@ def _qualify_world(year=0):
     conn.close()
 
     # 오세아니아 → 아시아, 북중미/북미 → 아메리카 정규화
+    import time
+    _t0 = time.perf_counter()
     for r in all_countries:
         r["conf"] = _conf_key(r["continent"])
-        r["ovr"]  = GRADE_TEAM_OVR.get(r["grade"], 45) + random.uniform(-3, 3)
+        r["ovr"]  = _nat_team_ovr(r["grade"], r["name"], r["continent"], fast=True)
         r["qual"] = GRADE_QUAL_BASE.get(r["grade"], 0.2) + random.uniform(-QUAL_NOISE, QUAL_NOISE)
-
-    # 예선 결과가 있는 연맹 추적
+    print(f"[PERF] 월드컵 예선 전세계 {len(all_countries)}개국 OVR계산 {time.perf_counter()-_t0:.2f}s")
     # [버그 수정 — 근본 원인] qual_results에 같은 나라가 중복으로 들어있으면
     # (과거 _save_qual_results의 중복 저장 버그, 지금은 수정됨) 아래
     # "[:quota]" 자르기에서 중복 항목이 자리를 차지해 실제로 예선을
@@ -1272,7 +1357,8 @@ def _qualify_continental(my_continent):
     conn.close()
     for r in rows:
         r["qual"] = GRADE_QUAL_BASE.get(r["grade"], 0.2) + random.uniform(-QUAL_NOISE, QUAL_NOISE)
-        r["ovr"] = GRADE_TEAM_OVR.get(r["grade"], 45) + random.uniform(-3, 3)
+        r["ovr"] = _nat_team_ovr(r["grade"], r["name"], r["continent"], fast=True)
+    print(f"[PERF] 대륙컵 예선 폴백 {len(rows)}개국 OVR계산 완료")
     rows.sort(key=lambda r: r["qual"], reverse=True)
     return rows[:CONT_TEAMS]
 
@@ -1306,9 +1392,13 @@ def _conf_countries(conf_key):
 
 def _enrich_countries(rows):
     """국가 목록에 ovr/qual 점수 추가."""
+    import time
+    _t0 = time.perf_counter()
     for r in rows:
-        r["ovr"]  = GRADE_TEAM_OVR.get(r["grade"], 45) + random.uniform(-3, 3)
+        r["ovr"]  = _nat_team_ovr(r["grade"], r.get("name", ""), r.get("continent", ""), fast=True)
         r["qual"] = GRADE_QUAL_BASE.get(r["grade"], 0.2) + random.uniform(-QUAL_NOISE, QUAL_NOISE)
+    if len(rows) >= 20:   # 소규모 호출까지 매번 찍으면 로그 스팸이라 큰 호출만
+        print(f"[PERF] _enrich_countries {len(rows)}개국 OVR계산 {time.perf_counter()-_t0:.2f}s")
     return rows
 
 
@@ -1383,7 +1473,9 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
 
     # OVR 조건 통과 여부 (choose_national_team에서 미선발 처리에 사용)
     sel_cand = [n for n in cand_nats
-                if _check_selection(p, nat_info.get(n, {}).get("grade", "F"))]
+                if _check_selection(p, nat_info.get(n, {}).get("grade", "F"),
+                                     country=n,
+                                     continent=nat_info.get(n, {}).get("continent", ""))]
 
     # ─── my_sel 결정 ───
     # [핵심 설계] 순서: 국적 선택 → 예선 진출 실패 → 예선 탈락 → 조별리그 탈락 → 토너먼트
@@ -1682,11 +1774,18 @@ def _entry(tid, country):
 def _match_outcome(h_ovr, a_ovr, knockout):
     """중립 구장 가정. 'home'/'draw'/'away' 반환 (KO는 무승부 → 승부차기).
     [수정] 무승부 확률을 전력차에 반비례하도록 개선 (기존 dw=0.22 고정 →
-    전력차 무관하게 항상 22% 무승부였음. 국내리그 _match_win_probs와 같은 취지)."""
+    전력차 무관하게 항상 22% 무승부였음. 국내리그 _match_win_probs와 같은 취지).
+
+    [2026-07 재조정, 신민용 지적: 대한민국(A급, OVR≈84) vs 필리핀(E급,
+    OVR≈51)처럼 33점 차이나는 예선에서도 필리핀 승률이 7%나 나와 이변이
+    너무 잦았다] game_engine._match_win_probs와 동일한 취지로 diff 반영폭을
+    올렸다 — diff=0(균형)은 기존과 동일하게 유지, 격차가 클수록(diff 20~
+    이상) 훨씬 더 확실하게 강팀 쪽으로 쏠리도록 기울기만 가파르게 했다.
+    """
     diff = h_ovr - a_ovr
-    hw = max(0.08, min(0.85, 0.46 + diff * 0.014))
-    dw = max(0.08, 0.24 - abs(diff) * 0.005)
-    aw = max(0.05, 1.0 - hw - dw)
+    hw = max(0.04, min(0.95, 0.46 + diff * 0.022))
+    dw = max(0.05, 0.24 - abs(diff) * 0.009)
+    aw = max(0.02, 1.0 - hw - dw)
     tot = hw + dw + aw
     hw, dw, aw = hw / tot, dw / tot, aw / tot
     roll = random.random()
@@ -1697,9 +1796,9 @@ def _match_outcome(h_ovr, a_ovr, knockout):
     return "away"
 
 
-def _gen_intl_score(outcome):
+def _gen_intl_score(outcome, diff=0.0):
     from game_engine import _gen_score
-    return _gen_score(outcome)
+    return _gen_score(outcome, diff)
 
 
 def _resolve_pso(h_ovr, a_ovr):
@@ -1733,7 +1832,12 @@ def _sim_ai_match(t, m, my_played=False, conn=None, reason="injury", batch=None)
     if knockout and outcome == "draw":
         win_home, pso_score = _resolve_pso(he["ovr"], ae["ovr"])
         pso_winner = m["home"] if win_home else m["away"]
-    hs, as_ = _gen_intl_score(outcome)
+    # [버그수정 2026-07] diff 누락 — 예전엔 항상 diff=0(박빙 취급)이라 강팀이
+    # 약팀을 만나도 승패(outcome)만 전력차를 반영하고 스코어차는 전력차와
+    # 무관하게 항상 근소하게(최대 4골차)만 나왔다. game_engine/champions_engine/
+    # cup_engine은 이미 diff를 넘기고 있었는데 국제대회 조별/예선 AI 매치만
+    # 빠져 있었음.
+    hs, as_ = _gen_intl_score(outcome, he["ovr"] - ae["ovr"])
 
     # [2026-07 신설] 이 경기가 실제로 진행되는 날짜를 지금 시점 기준으로
     # 한 번 계산해 저장한다 — 나중에 커리어/은퇴창에서 재계산 없이 그대로 쓴다.
@@ -1850,9 +1954,9 @@ def simulate_my_match(week, p):
     knockout = m["stage"] not in ("group", "qual_group")  # [버그수정] 예선 조별도 무승부 허용
 
     # [2026-07 신설] 출전정지 체크 — 퇴장 다음 경기는 강제 결장.
-    _suspended, _new_susp = _check_suspended(p)
+    _suspended, _new_susp = _check_suspended(p, field="intl_suspension")
     if _suspended:
-        update_player(red_card_suspension=_new_susp)
+        update_player(intl_suspension=_new_susp)
         add_log(f"🟥 출전정지로 결장{'  (다음 경기부터 복귀)' if _new_susp == 0 else f'  (남은 정지 {_new_susp}경기)'}",
                 "event")
 
@@ -1900,7 +2004,7 @@ def simulate_my_match(week, p):
         _absence_reason = None
         # [2026-07 신설] 퇴장 판정 — '폭력적' 성격의 red_card_chance 반영.
         if _roll_red_card(p):
-            goals, assists, saves, rating, events, detail = _apply_red_card_dismissal(p)
+            goals, assists, saves, rating, events, detail = _apply_red_card_dismissal(p, field="intl_suspension")
             _absence_reason = "red_card"
     # [2026-07 신설] '소심함' 성격의 big_match_rating 연결 — 국가대표 경기는
     # 전부 빅매치 성격이라(챔스와 동일 기준) 모든 경기에 적용한다.
@@ -1963,7 +2067,9 @@ def simulate_my_match(week, p):
     p2 = get_player()
     _update_pop(p2, goals, assists, rating)
     p2 = get_player()
-    ns = min(100, p2["stress"] + 8)
+    # [2026-07 조정, 신민용 지적: "경기 스트레스가 고강도 훈련만큼은 돼야
+    # 하지 않나"] 리그/컵/챔스와 동일 원칙으로 상향.
+    ns = min(100, p2["stress"] + 20)
     nh = p2["happiness"]
     if my_result == "win":
         nh = min(100, nh + 4)
@@ -2154,7 +2260,21 @@ def _finalize_qual_po(t):
                 winner = home
             elif as_ > hs:
                 winner = away
+            elif m.get("pso_winner"):
+                # [버그수정 2026-07, 신민용 지적] 동점(무승부)이면 승부차기로
+                # 이미 승자가 정해져 있는데(sim_my_match_as_ai/_sim_ai_match가
+                # _resolve_pso로 pso_winner를 DB에 저장하고 경기 로그에도
+                # "승부차기 4-3 승/패"로 표시함), 여기선 그 결과를 무시하고
+                # 완전히 새로운 50/50 코인플립으로 승자를 다시 뽑고 있었다.
+                # 그 결과 "승부차기에서 졌다"고 로그에 뜨고서 예선 통과는
+                # 반대로 표시되는(로그와 결과가 서로 다른 RNG를 쓰는) 모순이
+                # 발생했다. cup_engine/champions_engine의 동일 로직
+                # (_winner_of 등)은 이미 pso_winner를 우선 확인하고 있었음 —
+                # 국제대회 PO만 이 체크가 빠져 있었다.
+                winner = home if m["pso_winner"] == home["country"] else away
             else:
+                # 승부차기 기록이 없는 경우에만 방어적으로 코인플립 (이론상
+                # knockout 무승부는 항상 PSO를 거치므로 거의 발생하지 않음).
                 winner = home if random.random() > 0.5 else away
         else:
             winner = _sim_single_match_ai(home, away)
@@ -2235,7 +2355,20 @@ def _save_qual_results(t, continent, qualified_list, set_done=True):
     # set_done=False(직행팀 중간 저장): _finalize_qual_po가 나중에
     #   직행팀+PO승자를 합쳐 set_done=True로 한 번에 덮어씀.
     for q in qualified_list:
-        # [버그 수정] 이 나라가 이미 저장돼 있으면(재호출로 인한 중복 삽입
+        # [2026-07 버그수정, 신민용 리포트: "국제대회 OVR가 너무 낮다 —
+        # 프랑스가 88 정도로 뜬다"] 예선 단계(_qualify_world/_enrich_countries
+        # 등)는 전세계 200여 개국을 한 번에 훑어야 해서 fast=True(공식값만,
+        # 실제 스쿼드 미반영)로 OVR을 계산했다 — 그 값이 그대로 여기
+        # qual_results에 저장돼 이후 조 추첨·순위표 등 화면에 계속
+        # 노출됐다. 문제는 fast=True 공식값의 난수 폭(삼각분포 -10~+4)이
+        # 꽤 넓어서, 프랑스처럼 실제 태그된 선수가 최정상급(직접 계산
+        # 결과 베스트11 평균 97.5)이어도 운 나쁘면 88 같은 값이 그대로
+        # 굳어버릴 수 있었다. 여기서는 예선 통과국(최종 32~48개국 정도로
+        # 이미 추려진 소규모 목록)에 한해 fast=False로 다시 계산해서
+        # 실제 스쿼드 반영값(70%)+공식값(30%) 블렌딩을 정확히 적용한다 —
+        # 대상이 작아서 성능 문제도 없다.
+        _accurate_ovr = _nat_team_ovr(q.get("grade", "F"), q["country"], continent, fast=False)
+        # DELETE로 이미 저장돼 있으면(재호출로 인한 중복 삽입
         # 방지) 먼저 지운 뒤 다시 넣는다 — set_done=False라 위에서 전체
         # DELETE를 안 했어도 국가 단위로는 항상 유일하게 유지된다.
         c.execute("""DELETE FROM qual_results
@@ -2245,7 +2378,7 @@ def _save_qual_results(t, continent, qualified_list, set_done=True):
                      (target_year, kind, continent, country, flag, grade, ovr)
                      VALUES(?,?,?,?,?,?,?)""",
                   (target_year, target_kind, continent,
-                   q["country"], q.get("flag",""), q.get("grade","F"), q.get("ovr",50)))
+                   q["country"], q.get("flag",""), q.get("grade","F"), _accurate_ovr))
     if set_done:
         c.execute("UPDATE intl_tournaments SET status='done' WHERE id=?", (tid,))
     conn.commit(); conn.close()
@@ -2376,11 +2509,54 @@ def _finalize_groups(t, next_stage, next_week):
         n_groups = CONT_GROUPS
     labels = _GROUP_LABELS[:n_groups]
 
+    # [2026-07 최적화, 신민용 리포트: "국제대회 주간(47~51주)에 렉이 심하다"]
+    # 원래 get_group_standings(tid, g)를 조 라벨마다 따로 호출했는데, 그
+    # 함수 자체가 매번 새 커넥션을 열고 entries/matches 쿼리를 2번씩
+    # 날렸다 — 조 6~12개 × 대회 최대 5개(월드컵+대륙컵 4개가 겹치는 해)가
+    # 동시에 이 함수를 타는 주간에는 쿼리가 수십~백 건까지 쌓였다. 이
+    # 대회의 전체 조(entries+group stage matches)를 딱 2번의 쿼리로 한
+    # 번에 가져와서 파이썬에서 조별로 나누는 방식으로 바꾼다.
+    conn0 = get_conn()
+    _all_entries = [dict(r) for r in conn0.execute(
+        "SELECT * FROM intl_entries WHERE tournament_id=?", (tid,)).fetchall()]
+    _all_matches = [dict(r) for r in conn0.execute(
+        """SELECT * FROM intl_matches WHERE tournament_id=?
+           AND stage='group' AND home_score>=0""", (tid,)).fetchall()]
+    conn0.close()
+    _entries_by_grp: dict = {}
+    for e in _all_entries:
+        _entries_by_grp.setdefault(e["grp"], []).append(e)
+    _matches_by_grp: dict = {}
+    for m in _all_matches:
+        _matches_by_grp.setdefault(m["grp"], []).append(m)
+
+    def _standings_for(entries, matches):
+        tbl = {e["country"]: {"country": e["country"], "flag": e["flag"], "ovr": e["ovr"],
+                              "p": 0, "w": 0, "d": 0, "l": 0, "gf": 0, "ga": 0, "pts": 0}
+               for e in entries}
+        for m in matches:
+            h, a = tbl.get(m["home"]), tbl.get(m["away"])
+            if not h or not a:
+                continue
+            hs, as_ = m["home_score"], m["away_score"]
+            h["p"] += 1; a["p"] += 1
+            h["gf"] += hs; h["ga"] += as_
+            a["gf"] += as_; a["ga"] += hs
+            if hs > as_:
+                h["w"] += 1; h["pts"] += 3; a["l"] += 1
+            elif hs < as_:
+                a["w"] += 1; a["pts"] += 3; h["l"] += 1
+            else:
+                h["d"] += 1; a["d"] += 1; h["pts"] += 1; a["pts"] += 1
+        rows = list(tbl.values())
+        rows.sort(key=lambda r: (r["pts"], r["gf"] - r["ga"], r["gf"], r["ovr"]), reverse=True)
+        return rows
+
     firsts, seconds = {}, {}
     thirds = []      # (조라벨, row) — best-3rd 후보
     eliminated = []
     for g in labels:
-        rows = get_group_standings(tid, g)
+        rows = _standings_for(_entries_by_grp.get(g, []), _matches_by_grp.get(g, []))
         if len(rows) < 2:
             continue
         firsts[g]  = rows[0]["country"]
@@ -2406,9 +2582,9 @@ def _finalize_groups(t, next_stage, next_week):
 
     conn = get_conn()
     c = conn.cursor()
-    for nat_e in eliminated:
-        c.execute("UPDATE intl_entries SET alive=0 WHERE tournament_id=? AND country=?",
-                  (tid, nat_e))
+    if eliminated:
+        c.executemany("UPDATE intl_entries SET alive=0 WHERE tournament_id=? AND country=?",
+                      [(tid, nat_e) for nat_e in eliminated])
 
     # ── 다음 라운드 대진 생성 ──
     if is_wc and not is_big:
@@ -2443,13 +2619,15 @@ def _finalize_groups(t, next_stage, next_week):
 
     p = get_player()
     nat = _my_nat(t, p)
+    _insert_rows = []
     for slot, (home, away) in enumerate(pairs):
         is_my = 1 if nat in (home, away) else 0
-        c.execute("""INSERT INTO intl_matches
+        _insert_rows.append((tid, next_stage, "", next_week, home, away, is_my, slot))
+    if _insert_rows:
+        c.executemany("""INSERT INTO intl_matches
                      (tournament_id, stage, grp, week, home, away,
                       home_score, away_score, is_my, slot)
-                     VALUES(?,?,?,?,?,?,-1,-1,?,?)""",
-                  (tid, next_stage, "", next_week, home, away, is_my, slot))
+                     VALUES(?,?,?,?,?,?,-1,-1,?,?)""", _insert_rows)
     c.execute("UPDATE intl_tournaments SET status='ko' WHERE id=?", (tid,))
     conn.commit()
     conn.close()
@@ -2534,6 +2712,172 @@ def _advance_knockout(t, week, next_stage, next_week):
     add_log(f"🌍 {t['name']} {cur_stage_ko} 종료 → {STAGE_KO[next_stage]} 대진 확정", "event")
 
 
+def _intl_country_stage_weights(tid):
+    """월드컵/대륙컵 참가국별 '진출 라운드 가중치' — champions_engine.
+    _cl_team_stage_weights와 동일한 설계(신민용 확정: "대회 MVP/베스트11에
+    팀(국가) 성적을 반영하자"). intl_matches는 팀 ID 대신 국가명(country
+    TEXT)으로 식별한다. 조별리그만=0.70, 32강=0.75, 16강=0.80, 8강=0.90,
+    4강(3/4위전 포함)=0.96, 준우승=0.99, 우승=1.00."""
+    conn = get_conn()
+    t = conn.execute("SELECT winner FROM intl_tournaments WHERE id=?", (tid,)).fetchone()
+    winner_nat = t["winner"] if t else ""
+    _ORDER = {"R32": 0, "R16": 1, "QF": 2, "SF": 3}
+    _TIER_W = {0: 0.75, 1: 0.80, 2: 0.90, 3: 0.96}
+    furthest = {}
+    runner_up_nat = None
+    for m in conn.execute(
+            "SELECT stage, home, away FROM intl_matches "
+            "WHERE tournament_id=? AND stage IN ('R32','R16','QF','SF','F','TP') "
+            "AND home_score>=0", (tid,)).fetchall():
+        stg = m["stage"]
+        if stg == "F":
+            loser = m["away"] if m["home"] == winner_nat else m["home"]
+            runner_up_nat = loser
+            continue
+        if stg == "TP":
+            for nat in (m["home"], m["away"]):
+                furthest[nat] = max(furthest.get(nat, -1), _ORDER["SF"])
+            continue
+        if stg not in _ORDER:
+            continue
+        idx = _ORDER[stg]
+        for nat in (m["home"], m["away"]):
+            furthest[nat] = max(furthest.get(nat, -1), idx)
+    conn.close()
+
+    def _weight(country):
+        if country == winner_nat:
+            return 1.00
+        if country == runner_up_nat:
+            return 0.99
+        return _TIER_W.get(furthest.get(country, -1), 0.70)
+    return _weight
+
+
+def _award_intl_awards(t):
+    """[2026-07 확장, 신민용 확정] 월드컵 골든볼/골든부트/베스트11/영플레이어상,
+    대륙컵 MVP/득점왕/베스트11/영플레이어상 + 골든글러브. 이제 ai_players.
+    nationality로 실제 각국 선수를 조회할 수 있으므로, champions_engine.
+    _award_cl_awards와 동일 패턴으로 실제 선수 기반 AI 경쟁 풀을 구성한다.
+    내가 조기 탈락해도(4강 못 가도) 대회 전체 기준으로 별개 판정.
+    [2026-07 추가 확장, 설계문서 v2 반영] 결승·준결승 빅게임 보너스(가산,
+    상한 있음), 골든글러브 세이브율·평균실점 품질 게이트, 그리고 "월드컵/
+    대륙컵 영플레이어상은 사실상 평생 한 번"을 실제로 강제하는 로직을
+    추가한다(과거에 같은 대회 성격으로 이미 영플레이어상을 받았으면 후보
+    제외 — 나이 조건만으로는 극단적으로 어린 나이에 데뷔한 경우 두 번
+    받는 게 이론적으로 가능했음)."""
+    from game_engine import (get_player, add_log, _estimate_ai_season, _estimate_ai_clean_sheets,
+                             _position_award_score, _evaluate_extra_awards,
+                             _cap_additive_bonus, _gk_quality_ok,
+                             ATTACK_POS, GK_POS, DF_POS, MF_POS)
+    tid = t["id"]
+    is_wc = (t["kind"] == "world")
+    conn = get_conn()
+    my_row = conn.execute(
+        """SELECT COUNT(*) n, COALESCE(SUM(my_goals),0) g, COALESCE(SUM(my_assists),0) a,
+                  COALESCE(AVG(my_rating),0) r, COALESCE(SUM(my_saves),0) sv,
+                  COALESCE(SUM(my_conceded),0) gc
+           FROM intl_matches WHERE tournament_id=? AND my_played=1""", (tid,)).fetchone()
+    if not my_row or my_row["n"] == 0:
+        conn.close()
+        return
+    n_games = max(1, my_row["n"])
+    p = get_player()
+    my_pos = p.get("position", "ST") if p else "ST"
+    my_ovr = p.get("ovr", 60) if p else 60
+    my_age = p.get("age", 25) if p else 25
+    my_nat = _my_nat(t, p)
+    my_cs = conn.execute(
+        """SELECT COUNT(*) c FROM intl_matches WHERE tournament_id=? AND my_played=1
+           AND ((home=? AND away_score=0) OR (away=? AND home_score=0))""",
+        (tid, my_nat, my_nat)).fetchone()["c"]
+
+    pool = [{"position": my_pos, "goals": my_row["g"], "assists": my_row["a"], "rating": my_row["r"],
+             "ovr": my_ovr, "cs": my_cs, "age": my_age, "is_mine": True, "country": my_nat}]
+
+    entries = conn.execute(
+        "SELECT country FROM intl_entries WHERE tournament_id=?", (tid,)).fetchall()
+    ALL_POS = GK_POS + DF_POS + MF_POS + ATTACK_POS
+    ph = ",".join("?" * len(ALL_POS))
+    for e in entries:
+        if e["country"] == my_nat:
+            continue
+        rows = conn.execute(
+            f"""SELECT ovr, position, sub_role, age FROM ai_players
+                WHERE nationality=? AND position IN ({ph})""",
+            (e["country"], *ALL_POS)).fetchall()
+        for r in rows:
+            g, a, rt = _estimate_ai_season(r["ovr"], r["position"], 85, 85, r["sub_role"],
+                                           full_season_matches=n_games)
+            cs = _estimate_ai_clean_sheets(r["position"], r["ovr"], 85, 85, n_games) if r["position"] in GK_POS else 0
+            pool.append({"position": r["position"], "goals": g, "assists": a, "rating": rt,
+                        "ovr": r["ovr"], "cs": cs, "age": r["age"] or 25, "is_mine": False,
+                        "country": e["country"]})
+
+    # [2026-07 신설] 국가 진출 라운드 가중치 — 골든볼(MVP)/베스트11/영플레이어에만 적용
+    _stage_w = _intl_country_stage_weights(tid)
+    my_base_score = _position_award_score(my_pos, my_row["g"], my_row["a"], my_row["r"], my_ovr, my_cs)
+    my_score = my_base_score * _stage_w(my_nat)
+
+    # [2026-07 신설] 빅게임 보너스 — 결승/준결승/3·4위전 경기의 실제 기록만
+    # 따로 계산해 가산(고정 숫자 아님, 상한은 기준 점수의 10%). champions_engine.
+    # _award_cl_awards와 동일한 설계.
+    _bg = conn.execute(
+        """SELECT COUNT(*) n, COALESCE(AVG(my_rating),0) r, COALESCE(SUM(my_goals),0) g,
+                  COALESCE(SUM(my_assists),0) a
+           FROM intl_matches WHERE tournament_id=? AND my_played=1 AND stage IN ('SF','F','TP')""",
+        (tid,)).fetchone()
+    if _bg and _bg["n"] > 0:
+        _raw_bonus = (_bg["r"] - 6.0) * 1.2 + (_bg["g"] + _bg["a"]) * 0.8
+        my_score += _cap_additive_bonus(_raw_bonus, my_base_score, cap_ratio=0.10)
+
+    others = [x for x in pool if not x["is_mine"]]
+    best_ai_scorer_g = max((x["goals"] for x in others), default=-1)
+    best_ai_mvp_score = max((_position_award_score(x["position"], x["goals"], x["assists"],
+                                                    x["rating"], x["ovr"], x["cs"]) * _stage_w(x["country"])
+                              for x in others), default=-1)
+    year = t["year"]
+    mvp_name = "골든볼" if is_wc else f"{t['name']} MVP"
+    boot_name = "골든부트" if is_wc else f"{t['name']} 득점왕"
+    glove_name = "골든글러브" if is_wc else f"{t['name']} 골든글러브"
+    best11_name = "베스트11" if is_wc else f"{t['name']} 베스트11"
+    young_name = "영플레이어상" if is_wc else f"{t['name']} 영플레이어상"
+    awards = []
+    if my_row["g"] > 0 and my_row["g"] >= best_ai_scorer_g:
+        awards.append((boot_name, f"{my_row['g']}골"))
+    if my_score >= best_ai_mvp_score:
+        awards.append((mvp_name, f"{year} {t['name']}"))
+    # [2026-07 신설, 설계문서 v2 반영] 월드컵/대륙컵 영플레이어상은 4년 주기
+    # 대회 특성상 실제로는 사실상 평생 한 번인데, 나이 조건(<=21)만으로는
+    # 아주 어린 나이에 데뷔한 극소수 케이스가 두 번 받는 게 이론상 가능했다.
+    # 과거에 같은 대회 성격(월드컵이면 월드컵끼리, 대륙컵이면 이 대회 이름
+    # 그대로)으로 이미 영플레이어상을 받은 적이 있으면 이번엔 후보에서 제외한다.
+    _already_won_young = conn.execute(
+        "SELECT 1 FROM awards WHERE is_mine=1 AND award_type=? AND year<?",
+        (young_name, year)).fetchone() is not None
+    for label in _evaluate_extra_awards(pool, my_pos, my_age,
+                                         weight_fn=lambda x: _stage_w(x["country"])):
+        if label == "베스트11":
+            awards.append((best11_name, f"{year} {t['name']} {label}"))
+        elif not _already_won_young:
+            awards.append((young_name, f"{year} {t['name']} {label}"))
+    if (my_pos in GK_POS and my_cs >= 2
+            and _gk_quality_ok(my_row["sv"], my_row["gc"], n_games, n_games, min_play_ratio=0.0)):
+        gk_group = [x for x in pool if x["position"] in GK_POS]
+        best_gk = max(gk_group, key=lambda x: x["cs"]) if gk_group else None
+        if best_gk and best_gk["is_mine"]:
+            awards.append((glove_name, f"{my_cs} 클린시트"))
+
+    for atype, detail in awards:
+        add_log(f"🏅 {atype} 수상! ({detail})", "event")
+        conn.execute(
+            "INSERT INTO awards(year,award_type,league_name,detail,is_mine) VALUES(?,?,?,?,1)",
+            (year, atype, t["name"], detail))
+    if awards:
+        conn.commit()
+    conn.close()
+
+
 def _finish_tournament(t, final_week):
     """결승 + 3/4위전 종료 → 우승국·3위 확정, 내 결과 기록."""
     from game_engine import add_log, get_player
@@ -2586,6 +2930,9 @@ def _finish_tournament(t, final_week):
         _record_my_exit(t, "3위")
     elif nat == fourth:
         _record_my_exit(t, "4위")
+
+    # [2026-07 신설] 조기탈락해도 골든볼/골든부트는 별개로 판정
+    _award_intl_awards(t)
 
 
 # ─────────────────────────────────────────────

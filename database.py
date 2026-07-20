@@ -222,9 +222,15 @@ def _new_raw_conn():
     # [스케일 대비] 팀/경기 수가 늘어나도(20팀+ 리그, 일 단위 일정 등) 페이지 캐시를
     # 넉넉히 잡아 디스크 I/O를 줄인다. 파일 포맷과 무관한 연결별 설정이라 안전하게
     # 언제든 조절 가능. mmap은 읽기 위주 쿼리(리그 브라우저, 역대 기록 등)에 유리.
-    conn.execute("PRAGMA cache_size=-16000")   # 약 16MB 페이지 캐시 (기본 -2000의 8배)
+    # [2026-07 재조정, 신민용 리포트: "연도전환이 갈수록 느려진다"] match_results_archive는
+    # 삭제 없이 매년 계속 쌓이기만 하는 테이블이라(수십 시즌 누적 시 DB 파일 자체가
+    # 수백MB~GB 단위로 커짐), 예전 16MB 캐시/128MB mmap으로는 갈수록 캐시에 안 담기는
+    # 비중이 늘어나 디스크 I/O가 계속 증가했다(연도전환 로그의 "아카이브이동"/
+    # "완비판정조회" 단계가 해마다 조금씩 느려지던 원인 중 하나). 캐시/mmap을
+    # 4배로 늘려 더 오래 캐시에 남아있게 한다.
+    conn.execute("PRAGMA cache_size=-65536")   # 약 64MB 페이지 캐시
     conn.execute("PRAGMA temp_store=MEMORY")   # 정렬/임시 테이블을 메모리에서 처리
-    conn.execute("PRAGMA mmap_size=134217728") # 128MB mmap I/O
+    conn.execute("PRAGMA mmap_size=536870912") # 512MB mmap I/O
     return conn
 
 def get_conn():
@@ -343,7 +349,7 @@ def init_db():
         positioning INTEGER DEFAULT 50, setpiece INTEGER DEFAULT 50,
         mental INTEGER DEFAULT 50, confidence INTEGER DEFAULT 50,
         leadership INTEGER DEFAULT 50, concentration INTEGER DEFAULT 50,
-        ovr INTEGER DEFAULT 50,
+        ovr INTEGER DEFAULT 50, nationality TEXT DEFAULT '',
         FOREIGN KEY(team_id) REFERENCES teams(id))""")
     c.execute(f"""CREATE TABLE IF NOT EXISTS my_player(
         id INTEGER PRIMARY KEY,
@@ -360,6 +366,10 @@ def init_db():
         injury_weeks INTEGER DEFAULT 0, injury_type TEXT DEFAULT '',
         current_team_id INTEGER DEFAULT 0,
         current_league_id INTEGER DEFAULT 0,
+        loan_from_team_id INTEGER DEFAULT 0,
+        loan_from_league_id INTEGER DEFAULT 0,
+        loan_from_tier INTEGER DEFAULT 0,
+        loan_end_year INTEGER DEFAULT 0,
         manager_relation INTEGER DEFAULT 50,
         current_year INTEGER DEFAULT {GAME_START_YEAR},
         current_week INTEGER DEFAULT 1,
@@ -514,6 +524,32 @@ def init_db():
         year INTEGER, competition TEXT, team_name TEXT, result TEXT,
         goals INTEGER DEFAULT 0, assists INTEGER DEFAULT 0,
         caps INTEGER DEFAULT 0, rating REAL DEFAULT 0)""")
+    # ── 클럽 월드컵 (club_world_cup_engine, 2026-07 신설) ──
+    # cl_tournaments/cl_entries/cl_matches와 동일한 구조를 그대로 따른다
+    # (다른 화면/함수들이 그 패턴에 익숙하므로 재사용성을 최대화하기 위함).
+    # winner_team_id는 대회 하나(그 해 클럽월드컵 전체, 대륙별 아님)의 우승팀.
+    c.execute("""CREATE TABLE IF NOT EXISTS cwc_tournaments(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        year INTEGER, name TEXT DEFAULT '클럽 월드컵',
+        status TEXT DEFAULT 'group', winner_team_id INTEGER DEFAULT 0,
+        my_in INTEGER DEFAULT 0, my_result TEXT DEFAULT '',
+        my_team_id INTEGER DEFAULT 0)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS cwc_entries(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tournament_id INTEGER, team_id INTEGER, team_name TEXT,
+        flag TEXT, country TEXT, continent TEXT, grp TEXT DEFAULT '',
+        grade TEXT, ovr REAL, alive INTEGER DEFAULT 1)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS cwc_matches(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tournament_id INTEGER, stage TEXT, week INTEGER,
+        home_team_id INTEGER, away_team_id INTEGER,
+        home_score INTEGER DEFAULT -1, away_score INTEGER DEFAULT -1,
+        pso_winner INTEGER DEFAULT 0, pso_score TEXT DEFAULT '',
+        is_my INTEGER DEFAULT 0, slot INTEGER DEFAULT 0,
+        my_played INTEGER DEFAULT 0, my_position TEXT DEFAULT '',
+        my_saves INTEGER DEFAULT 0, my_goals INTEGER DEFAULT 0,
+        my_assists INTEGER DEFAULT 0, my_rating REAL DEFAULT 0,
+        my_absence_reason TEXT DEFAULT NULL)""")
     # [2026-07 신설] 국내 컵대회(FA컵식) — 1~2부 팀 전부 참가하는 단판
     # 토너먼트(무승부는 즉시 승부차기). 선수 소속 국가 하나에 대해서만
     # 지연 생성한다(전 세계 100개국 넘는 나라마다 만들면 성능 부담이
@@ -710,6 +746,32 @@ def init_db():
         "ALTER TABLE cl_matches ADD COLUMN my_blocks INTEGER DEFAULT 0",
         "ALTER TABLE cl_matches ADD COLUMN my_pass_acc REAL DEFAULT 0",
         "ALTER TABLE cl_matches ADD COLUMN my_conceded INTEGER DEFAULT 0",
+        # [2026-07 신설, 신민용 요청: "전체 이력에 슈팅/드리블도 채워달라"]
+        # cl_matches/intl_matches는 이미 세부 지표를 저장하고 있었는데,
+        # cup_matches/cwc_matches는 _player_perf가 detail을 계산까지는
+        # 해놓고 저장을 안 하고 있었다(버려지고 있었음) — 나머지 둘도
+        # 동일하게 컬럼을 맞춰서 cup_engine.py/club_world_cup_engine.py가
+        # 저장할 수 있게 한다.
+        "ALTER TABLE cup_matches ADD COLUMN my_shots INTEGER DEFAULT 0",
+        "ALTER TABLE cup_matches ADD COLUMN my_shots_on INTEGER DEFAULT 0",
+        "ALTER TABLE cup_matches ADD COLUMN my_key_passes INTEGER DEFAULT 0",
+        "ALTER TABLE cup_matches ADD COLUMN my_dribbles INTEGER DEFAULT 0",
+        "ALTER TABLE cup_matches ADD COLUMN my_blocks INTEGER DEFAULT 0",
+        "ALTER TABLE cup_matches ADD COLUMN my_pass_acc REAL DEFAULT 0",
+        "ALTER TABLE cwc_matches ADD COLUMN my_shots INTEGER DEFAULT 0",
+        "ALTER TABLE cwc_matches ADD COLUMN my_shots_on INTEGER DEFAULT 0",
+        "ALTER TABLE cwc_matches ADD COLUMN my_key_passes INTEGER DEFAULT 0",
+        "ALTER TABLE cwc_matches ADD COLUMN my_dribbles INTEGER DEFAULT 0",
+        "ALTER TABLE cwc_matches ADD COLUMN my_blocks INTEGER DEFAULT 0",
+        "ALTER TABLE cwc_matches ADD COLUMN my_pass_acc REAL DEFAULT 0",
+        # [2026-07 버그수정, 신민용 리포트: "클럽월드컵 경기 일정 여니
+        # 'no such column: grp' 에러"] cl_matches엔 grp 컬럼이 있는데
+        # cwc_matches엔 애초에 빠져있었다 — club_world_cup_engine.py의
+        # get_cwc_group_standings/_group_standings, ui/schedule_window.py의
+        # _make_cwc_tab이 이미 cwc_matches.grp를 조회하고 있었는데(다른
+        # 대회처럼 조 배정 정보가 매치 테이블에도 있을 거라 가정하고 작성),
+        # 정작 테이블에 그 컬럼 자체가 없었다.
+        "ALTER TABLE cwc_matches ADD COLUMN grp TEXT DEFAULT ''",
         # [챔스 조별리그] 그룹 라벨(A~H). 토너먼트 경기는 ''.
         "ALTER TABLE cl_matches ADD COLUMN grp TEXT DEFAULT ''",
         # [챔스 조별] entries에 조 배정 저장.
@@ -807,12 +869,39 @@ def init_db():
         # (경기가 진행될 때마다 1씩 차감). '폭력적' 성격의 red_card_chance
         # 효과를 실제로 반영하기 위해 신설.
         "ALTER TABLE my_player ADD COLUMN red_card_suspension INTEGER DEFAULT 0",
+        # [2026-07 신설, 신민용 확정] AI 선수 국적 시스템 — 지금까지
+        # ai_players는 team_id(소속 클럽)만 있고 국적이 없었다. 국가대표
+        # 스쿼드를 실제 선수로 선발하려면(월드컵 골든볼 등) 국적이 필요.
+        "ALTER TABLE ai_players ADD COLUMN nationality TEXT DEFAULT ''",
+        # [2026-07 버그수정, 신민용 리포트: "챔스 출전정지가 다음 리그경기에서
+        # 소진되고, 정작 다음 챔스 경기는 뛸 수 있게 됨"] 예전엔 대회 구분 없이
+        # red_card_suspension 카운터 하나를 리그/챔스/컵/국제전/클럽월드컵이
+        # 전부 같이 썼다 — 그래서 어느 대회에서 받은 퇴장이든 "다음에 열리는
+        # 아무 경기"에서 소진돼버렸다. 월드컵처럼 4년에 한 번 열리는 대회는
+        # 특히 심각(퇴장당해도 사실상 다음 클럽경기 한 번만 쉬면 그만이었음).
+        # 대회별로 카운터를 완전히 분리한다.
+        "ALTER TABLE my_player ADD COLUMN cl_suspension INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN cup_suspension INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN intl_suspension INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN cwc_suspension INTEGER DEFAULT 0",
         # [2026-07 신설] 컵대회/챔스/국제대회에서 내가 결장한 이유(부상/출전정지
         # 등)를 기록 — 신민용 요청: 커리어 세부 기록·은퇴창·AI 요약에
         # "(부상)"/"(출전정지)" 식으로 표시하기 위함. NULL이면 정상 출전.
         "ALTER TABLE cl_matches ADD COLUMN my_absence_reason TEXT DEFAULT NULL",
         "ALTER TABLE cup_matches ADD COLUMN my_absence_reason TEXT DEFAULT NULL",
         "ALTER TABLE intl_matches ADD COLUMN my_absence_reason TEXT DEFAULT NULL",
+        # [2026-07 버그수정] cwc_matches는 CREATE TABLE에 처음부터 이 컬럼을
+        # 넣어놨지만, 이미 그 전 버전으로 한 번이라도 게임을 실행해서
+        # cwc_matches 테이블이 컬럼 없이 먼저 만들어진 세이브(CREATE TABLE
+        # IF NOT EXISTS라 기존 테이블은 안 바뀜)를 위한 마이그레이션.
+        "ALTER TABLE cwc_matches ADD COLUMN my_absence_reason TEXT DEFAULT NULL",
+        # [2026-07 신설, 신민용 요청] 임대(Loan) 시스템 — 원소속팀 계약(연봉/
+        # 계약년수)은 그대로 둔 채 다른 팀에서 뛰는 기간을 추적하기 위한 필드.
+        # loan_from_team_id=0이면 임대 아님(평소 상태).
+        "ALTER TABLE my_player ADD COLUMN loan_from_team_id INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN loan_from_league_id INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN loan_from_tier INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN loan_end_year INTEGER DEFAULT 0",
     ]:
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,
@@ -886,6 +975,35 @@ def init_db():
         # match_results_archive: 역대 순위/우승팀 조회(league_id+season 등치 검색)
         # 전용 — 쓰기는 시즌 전환 시 1회 벌크 INSERT뿐이라 인덱스 개수 부담이 없다.
         "CREATE INDEX IF NOT EXISTS idx_mra_league_season ON match_results_archive(league_id, season)",
+        # [2026-07 추가, 신민용 리포트: "연도전환이 갈수록 느려진다"]
+        # _generate_all_league_schedules()의 "완비판정조회" 단계가
+        # "SELECT league_id, COUNT(*) FROM match_results_archive WHERE
+        # season=? GROUP BY league_id"로 순수 season 단일 조건 조회를 하는데,
+        # 위 idx_mra_league_season은 league_id가 선두 컬럼이라 이 조회엔
+        # 못 쓰이고 매번 아카이브 테이블 전체를 풀스캔했다 — 아카이브가
+        # 매년 커지므로 이 단계가 해마다 계속 느려지는 원인이었다.
+        # season을 선두로 둔 인덱스를 추가해 O(전체 아카이브) → O(log N)로.
+        "CREATE INDEX IF NOT EXISTS idx_mra_season ON match_results_archive(season, league_id)",
+        # [2026-07 추가, 신민용 리포트: "월드컵/대륙컵 등 열릴 때 렉이 심하다"]
+        # cup_tournaments/intl_tournaments/cwc_tournaments엔 인덱스가 아예
+        # 하나도 없었다. cup_engine.get_cup_tournament()의 "SELECT * FROM
+        # cup_tournaments WHERE year=? AND country_id=?"가 매 시즌 나라마다
+        # (최대 209개국) 호출되는데, 인덱스가 없어 매번 테이블 전체를
+        # 풀스캔했다 — cup_tournaments는 시즌마다 국가 수만큼 계속 쌓이는
+        # 테이블(실측 9시즌차에 이미 1,881행)이라, 이 풀스캔 비용이 매
+        # 시즌 계속 커지는 구조였다(신민용 리포트의 "갈수록 렉이 심해진다"
+        # 와 정확히 일치). intl_tournaments/cwc_tournaments도 같은 문제라
+        # 함께 인덱스를 추가한다.
+        "CREATE INDEX IF NOT EXISTS idx_cup_tournaments_year_country ON cup_tournaments(year, country_id)",
+        "CREATE INDEX IF NOT EXISTS idx_cup_tournaments_status ON cup_tournaments(status)",
+        "CREATE INDEX IF NOT EXISTS idx_intl_tournaments_year ON intl_tournaments(year)",
+        "CREATE INDEX IF NOT EXISTS idx_cwc_tournaments_year ON cwc_tournaments(year)",
+        "CREATE INDEX IF NOT EXISTS idx_cwc_matches_tid_week ON cwc_matches(tournament_id, week)",
+        "CREATE INDEX IF NOT EXISTS idx_cwc_entries_tid ON cwc_entries(tournament_id)",
+        # trophy_log: 승강제 처리(_process_promotion_relegation) 안에서
+        # "WHERE year=? AND team_name=? AND tier=?"로 우승 중복 체크를 함 —
+        # 작은 테이블이지만 저비용으로 미리 인덱싱.
+        "CREATE INDEX IF NOT EXISTS idx_trophy_log_year_team ON trophy_log(year, team_name)",
     ]:
         try: c.execute(idx)
         except sqlite3.OperationalError: pass
@@ -904,6 +1022,50 @@ def init_db():
     migrate_money_to_thousand()   # 금액 단위 만원→천원 전환 (1회성)
     repair_duplicate_season_schedules()   # 유령 중복 시즌 일정 정리 (1회성, 아래 참고)
     repair_stray_intl_is_my_flags()   # 복수국적 미선택국 is_my 오염 정리 (1회성, 아래 참고)
+    repair_cwc_match_groups()   # 클럽월드컵 매치 grp 백필 (1회성, 아래 참고)
+
+
+# [2026-07 최적화, 신민용 리포트: "연도전환 최적화 더 해봐"] match_results엔
+# 인덱스가 6개 걸려있는데(아래 리스트), archive_old_seasons()의 벌크 DELETE
+# (직전 시즌 17만 행)와 _generate_all_league_schedules()의 벌크 INSERT(새
+# 시즌 17만 행)가 항상 연달아 일어난다. 인덱스를 유지한 채 이 두 벌크
+# 작업을 하면 매 행마다 6개 인덱스를 갱신해야 해서(SQLite 실측: 두 작업
+# 합쳐 아카이브이동 0.58s + INSERT 0.73~0.81s ≈ 1.3~1.4s), 인덱스 유지비용이
+# 두 번 청구되는 셈이다. 이 두 작업을 감싸는 동안만 인덱스를 통째로 DROP했다가
+# 끝난 뒤 한 번에 CREATE INDEX로 재생성하면, SQLite가 내부적으로 정렬 스캔
+# 1회로 인덱스를 만들어(벌크 빌드가 건별 갱신보다 훨씬 빠름) 같은 결과를
+# 더 싸게 얻는다. 호출부(game_engine._generate_all_league_schedules)가
+# drop→(archive_old_seasons + INSERT)→rebuild 순서로 감싸 쓴다.
+MATCH_RESULTS_INDEXES = [
+    ("idx_mr_week_season",   "match_results(week, season)"),
+    ("idx_mr_league_season", "match_results(league_id, season)"),
+    ("idx_mr_day_season",    "match_results(day, season)"),
+    ("idx_mr_season_score",  "match_results(season, home_score)"),
+    ("idx_mr_home_team",     "match_results(home_team_id, season)"),
+    ("idx_mr_away_team",     "match_results(away_team_id, season)"),
+]
+
+
+def drop_match_results_indexes(c):
+    """연도전환의 벌크 DELETE+INSERT 구간 동안 match_results 인덱스 6개를
+    임시로 제거한다. 반드시 rebuild_match_results_indexes()와 짝으로 써야
+    하며, 그 사이 구간에서 match_results를 쿼리하는 코드는 인덱스 없이
+    돈다는 점을 감안해야 한다(이 구간에 걸리는 SELECT들은 이미 archive로
+    걸러져 테이블이 거의 비어있는 상태라 문제 없음 — 설계 노트 참고)."""
+    for name, _ in MATCH_RESULTS_INDEXES:
+        try:
+            c.execute(f"DROP INDEX IF EXISTS {name}")
+        except sqlite3.OperationalError:
+            pass
+
+
+def rebuild_match_results_indexes(c):
+    """drop_match_results_indexes()로 제거했던 인덱스 6개를 재생성한다."""
+    for name, spec in MATCH_RESULTS_INDEXES:
+        try:
+            c.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {spec}")
+        except sqlite3.OperationalError:
+            pass
 
 
 def archive_old_seasons(current_season):
@@ -1058,6 +1220,57 @@ def repair_stray_intl_is_my_flags():
             print(f"[repair] 복수국적 미선택국 is_my 오염 {removed}건 정리 완료")
     except Exception as e:
         print("repair_stray_intl_is_my_flags 실패:", e)
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def repair_cwc_match_groups():
+    """[2026-07 버그 수정, 신민용 리포트: "클럽월드컵 경기 일정 여니
+    'no such column: grp' 에러"] cwc_matches 테이블에 애초에 grp 컬럼이
+    빠져 있었다(cl_matches엔 있었는데 클럽월드컵만 놓침) — 컬럼은 이번에
+    ALTER TABLE로 추가했고 새로 생성되는 매치부터는 club_world_cup_engine.py
+    가 정상적으로 채운다. 하지만 이 버그가 고쳐지기 전에 이미 생성된
+    클럽월드컵 조별리그 매치는 grp가 빈 문자열로 남아있어 조별 순위표/
+    일정 화면에서 계속 그룹 구분이 안 된다.
+
+    이 함수는 1회성으로, 이미 grp가 채워져 있는 cwc_entries(팀별 조 배정)를
+    기준으로 cwc_matches.grp를 역으로 채운다 — 조별리그 매치는 항상 같은
+    조 안에서만 열리므로 home_team_id가 속한 조를 그대로 매치에 옮겨 적으면
+    된다."""
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        row = c.execute("SELECT value FROM meta WHERE key='cwc_grp_backfill_v1'").fetchone()
+    except Exception:
+        row = None
+    if row:
+        conn.close()
+        return
+    fixed = 0
+    try:
+        blank_tids = [r["tournament_id"] for r in c.execute(
+            """SELECT DISTINCT tournament_id FROM cwc_matches
+               WHERE stage='group' AND (grp IS NULL OR grp='')""").fetchall()]
+        for tid in blank_tids:
+            entry_grp = {r["team_id"]: r["grp"] for r in c.execute(
+                "SELECT team_id, grp FROM cwc_entries WHERE tournament_id=?", (tid,)).fetchall()}
+            rows = c.execute(
+                """SELECT id, home_team_id FROM cwc_matches
+                   WHERE tournament_id=? AND stage='group' AND (grp IS NULL OR grp='')""",
+                (tid,)).fetchall()
+            for r in rows:
+                g = entry_grp.get(r["home_team_id"])
+                if g:
+                    c.execute("UPDATE cwc_matches SET grp=? WHERE id=?", (g, r["id"]))
+                    fixed += 1
+        c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('cwc_grp_backfill_v1',?)",
+                  (str(fixed),))
+        conn.commit()
+        if fixed:
+            print(f"[repair] 클럽월드컵 매치 grp 백필 {fixed}건 완료")
+    except Exception as e:
+        print("repair_cwc_match_groups 실패:", e)
         conn.rollback()
     finally:
         conn.close()
@@ -1254,6 +1467,7 @@ def reset_game_data():
               "game_log","match_results","match_details","season_state",
               "intl_history","intl_tournaments","intl_entries","intl_matches",
               "cl_tournaments","cl_entries","cl_matches","cl_history",
+              "cwc_tournaments","cwc_entries","cwc_matches",
               "cup_tournaments","cup_entries","cup_matches","cup_history"]:
         c.execute(f"DELETE FROM {t}")
     c.execute("UPDATE teams SET wins=0,draws=0,losses=0,goals_for=0,goals_against=0")
@@ -1635,6 +1849,131 @@ def _insert_player_names(c):
         c.executemany("INSERT INTO player_names(country_id,name) VALUES(?,?)", rows)
 
 
+# ─── AI 선수 국적 배정 (2026-07 신설, 신민용 확정) ──────────────────
+# 실제 축구처럼 리그마다 외국인 비율이 다르고(EPL은 외국인 많고 하위
+# 리그일수록 자국 위주), 포지션별로도 다르며(공격수는 해외 스카우팅이
+# 많고 GK는 자국 선호), 일부 아시아 리그는 외국인 등록 인원 자체를
+# 제한한다(K리그 등). 월드컵 골든볼처럼 "실제 선수" 기반 국가대표 상을
+# 만들기 위한 선행 작업.
+DOMESTIC_PROB_BY_GRADE = {
+    "SS": 0.45, "S": 0.55, "A": 0.70, "B": 0.80,
+    "C": 0.88, "D": 0.93, "E": 0.96, "F": 0.98,
+}
+POS_FOREIGN_MULT = {
+    "GK": 0.6, "CB": 0.8, "LB": 0.9, "RB": 0.9,
+    "CDM": 1.0, "CM": 1.0, "CAM": 1.1,
+    "LW": 1.2, "RW": 1.2, "CF": 1.2, "ST": 1.3,
+}
+# 팀당 외국인 등록 상한 (없는 나라는 무제한 — 확률만 적용).
+FOREIGN_QUOTA_CAP = {"대한민국": 4, "일본": 5, "중국": 5, "카타르": 4, "사우디아라비아": 8}
+# 스타 슬롯(월드클래스/엘리트)이 해외 출신일 때 우선적으로 뽑히는
+# "축구 수출 강국" — 실제로 빅클럽 스타 영입은 이 나라들 출신이 압도적.
+FOOTBALL_POWERHOUSES = ["브라질", "아르헨티나", "프랑스", "잉글랜드", "스페인",
+                        "독일", "포르투갈", "네덜란드"]
+
+_COUNTRY_CONTINENT = {}   # 나라명 -> 대륙 (지연 초기화)
+_CONTINENT_COUNTRIES = {}  # 대륙 -> [(나라명, fifa_rank), ...] fifa_rank 오름차순(강한 순)
+
+
+def get_country_squad_players(country, positions=None, min_count=8):
+    """[2026-07 신설, 신민용 지적: "8명 미만인 나라는 자국 1부나 남의 나라
+    2부에서도 채울 수 있지 않나 — 실제 카보베르데 키퍼가 터키 2부"]
+    국적 태그된 선수만으론 소국의 스쿼드가 너무 얇을 수 있어서 3단계로
+    폭을 넓힌다:
+      1) nationality=country인 선수 (포지션별 최고 OVR)
+      2) 그래도 부족하면: country의 자국 리그 소속 팀 선수를 국적 태그와
+         무관하게 채움 (자국 리그 뛰는 선수는 사실상 그 나라 국적일
+         가능성이 높다는 전제 — 애초에 국적 배정 자체가 자국 비율이
+         높게 설계돼 있어서 태그 누락분을 보정하는 성격)
+      3) 그래도 부족하면(자국 리그 자체가 게임에 없는 나라): 다른 나라
+         2부 이하 리그에서 대륙 우선 → 전체 순으로 채움("해외 하위리그
+         진출" 실제 패턴 반영)
+    반환: 포지션 슬롯 순서(positions 인자 순서)대로 채워진 선수 dict 리스트
+    (부족하면 그만큼 짧게 반환 — 호출부가 len()으로 판단)."""
+    positions = positions or ["GK", "CB", "CB", "LB", "RB", "CDM", "CM", "CAM", "LW", "RW", "ST"]
+    conn = get_conn()
+    slots = [None] * len(positions)
+    used_ids: set = set()
+
+    def _fill(where_sql, params, randomize=False):
+        for i, pos in enumerate(positions):
+            if slots[i] is not None:
+                continue
+            ph = ",".join(str(x) for x in used_ids) or "0"
+            order_by = "RANDOM()" if randomize else "ap.ovr DESC"
+            row = conn.execute(
+                f"""SELECT ap.id, ap.name, ap.position, ap.ovr, t.name AS club
+                    FROM ai_players ap JOIN teams t ON ap.team_id=t.id
+                    JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
+                    WHERE {where_sql} AND ap.position=? AND ap.id NOT IN ({ph})
+                    ORDER BY {order_by} LIMIT 1""",
+                (*params, pos)).fetchone()
+            if row:
+                slots[i] = dict(row)
+                used_ids.add(row["id"])
+
+    _fill("ap.nationality=?", (country,))
+    if sum(1 for s in slots if s) < min_count:
+        _fill("cn.name=?", (country,))
+    if sum(1 for s in slots if s) < min_count:
+        _init_nationality_tables()
+        cont = _COUNTRY_CONTINENT.get(country, "")
+        _fill("t.current_tier>=2 AND cn.continent=? AND cn.name!=?", (cont, country), randomize=True)
+    if sum(1 for s in slots if s) < min_count:
+        _fill("t.current_tier>=2 AND cn.name!=?", (country,), randomize=True)
+    conn.close()
+    return [s for s in slots if s]
+
+
+def _init_nationality_tables():
+    if _COUNTRY_CONTINENT:
+        return
+    by_cont = {}
+    for name, _flag, cont, _lang, rank in COUNTRY_DATA:
+        _COUNTRY_CONTINENT[name] = cont
+        by_cont.setdefault(cont, []).append((name, rank))
+    for cont, lst in by_cont.items():
+        lst.sort(key=lambda x: x[1])   # fifa_rank 낮을수록(=강할수록) 앞
+        _CONTINENT_COUNTRIES[cont] = lst
+
+
+def _weighted_country_pick(candidates):
+    """[(나라, fifa_rank), ...] 중 랭크가 좋을수록(숫자가 작을수록) 더 잘
+    뽑히게 가중 추첨. 후보가 비어있으면 None."""
+    if not candidates:
+        return None
+    weights = [1.0 / (rank + 5) for _, rank in candidates]
+    return random.choices([n for n, _ in candidates], weights=weights, k=1)[0]
+
+
+def _pick_nationality(team_country, team_continent, grade, pos, is_star, foreign_count, quota):
+    """이 슬롯의 국적을 정한다. 반환: (nationality, new_foreign_count)."""
+    _init_nationality_tables()
+    if quota is not None and foreign_count >= quota:
+        return team_country, foreign_count   # 쿼터 다 찼으면 강제 자국
+
+    domestic_base = DOMESTIC_PROB_BY_GRADE.get(grade, 0.85)
+    foreign_prob = min(0.95, (1 - domestic_base) * POS_FOREIGN_MULT.get(pos, 1.0))
+    if random.random() >= foreign_prob:
+        return team_country, foreign_count   # 자국 선수
+
+    # 해외 출신 — 스타 슬롯은 축구 강국 우선
+    if is_star and random.random() < 0.6:
+        cand = [c for c in FOOTBALL_POWERHOUSES if c != team_country]
+        nat = random.choice(cand) if cand else team_country
+        return nat, foreign_count + 1
+
+    if random.random() < 0.7:
+        # 같은 대륙 다른 나라 (FIFA랭크 가중)
+        pool = [(n, r) for n, r in _CONTINENT_COUNTRIES.get(team_continent, []) if n != team_country]
+    else:
+        # 다른 대륙 (FIFA랭크 가중, "축구 수출국" 위주로 자연스럽게 쏠림)
+        pool = [(n, r) for cont, lst in _CONTINENT_COUNTRIES.items() if cont != team_continent
+                for n, r in lst]
+    nat = _weighted_country_pick(pool) or team_country
+    return nat, foreign_count + 1
+
+
 # ─── AI 선수 생성 ──────────────────────────────────────────────
 # OVR_RANGES는 이제 파일 상단에서 constants.py로부터 가져온다 (단일 소스).
 TEAM_POSITIONS = ["GK","CB","CB","LB","RB","CDM","CM","CAM","LW","RW","ST"]
@@ -1742,7 +2081,14 @@ def _star_counts(grade, team_strength, continent_bonus=0, n_slots=11, tier=1):
 
     n_world = cfg["wc_base"] + round(cfg["wc_bonus"] * team_strength)
     if tier == 2:
-        n_world = max(0, n_world - 2)   # 2부는 월드클래스 사실상 배제
+        # [2026-07 재조정, 신민용 지적: "잉글랜드 2부가 스페인 2부랑
+        # 비슷하거나 낮다 — 챔피언십은 80후반~90대로 맞춰져야 한다"]
+        # SS는 전 세계에서 잉글랜드 하나뿐이라(get_league_grade 참고),
+        # 여기서 SS만 따로 후하게 줘도 다른 나라에 영향이 없다. 챔피언십은
+        # 강등 팀들의 낙하산 지원금(parachute payment)·이적료 여력 덕에
+        # 실제로도 유럽 5~6위권 리그 평가를 받는 이례적인 2부 리그이므로,
+        # S급(세군다·세리에B 등, 평범한 2부) 대비 스타 슬롯을 훨씬 덜 깎는다.
+        n_world = max(0, n_world - (1 if grade == "SS" else 2))
     if grade == "A" and continent_bonus < 0:
         # [신민용 요청] A등급 "상위" 리그(포르투갈/네덜란드 등 국가보정 양수)만
         # 월드클래스가 나오고, "중하위" 리그(한국/일본 등 국가보정 음수)는
@@ -1753,8 +2099,12 @@ def _star_counts(grade, team_strength, continent_bonus=0, n_slots=11, tier=1):
     if cfg.get("el_fill_rest"):
         # SS/S 1부: 월클을 뺀 나머지 전부를 엘리트로 — "월클+엘리트로만 구성".
         # 2부는 그 설계를 적용하지 않고 소수 엘리트 슬롯만 남긴다.
+        # [2026-07 재조정] SS(잉글랜드 챔피언십)만 예외 — 2부인데도 대부분
+        # 엘리트급으로 채워지게(강등팀 스쿼드 그대로 유지 + 낙하산 지원금).
         if tier == 1:
             n_elite = max(0, n_slots - n_world)
+        elif tier == 2 and grade == "SS":
+            n_elite = min(8, max(0, n_slots - n_world))
         else:
             n_elite = min(3, max(0, n_slots - n_world))
     else:
@@ -1816,9 +2166,11 @@ def _target_ovr(grade, tier, team_strength, role_idx, continent_bonus=0):
 def _generate_all_ai_players(c, progress_cb=None):
     # 리그 단위로 묶어 8팀에 강→약 강도를 분배해야 팀 간 위계가 생긴다.
     # [리그등급 분리] cn.grade는 국대 등급 → 리그 OVR/연봉엔 COUNTRY_LEAGUE_GRADE 사용
-    c.execute("""SELECT t.id AS tid, t.current_tier AS tier, cn.grade AS grade,
-                        cn.id AS cid, t.league_id AS lid, cn.name AS cname,
-                        cn.continent AS continent
+    # [2026-07 신설, 신민용 지적: "네임드 팀들이 너무 쉽게 강등당한다"]
+    # team_strength(팀 강도) 배정에 팀 이름(t.name)이 필요해져서 SELECT에 추가.
+    c.execute("""SELECT t.id AS tid, t.name AS tname, t.current_tier AS tier,
+                        cn.grade AS grade, cn.id AS cid, t.league_id AS lid,
+                        cn.name AS cname, cn.continent AS continent
                  FROM teams t JOIN leagues l ON t.league_id=l.id
                  JOIN countries cn ON l.country_id=cn.id
                  ORDER BY t.league_id, t.id""")
@@ -1831,12 +2183,19 @@ def _generate_all_ai_players(c, progress_cb=None):
 
     _total_teams = len(rows)
     _done = 0
+    from data.prestige_clubs import is_prestige, weighted_team_order
     for lid, teams in leagues.items():
         n = len(teams)
-        order = list(range(n))
-        random.shuffle(order)
+        # [2026-07 신설] 완전 무작위 셔플 대신 명문팀 가중 셔플 — 명문팀
+        # (data/prestige_clubs.py)은 강한 team_strength 슬롯을 뽑을 확률이
+        # 훨씬 높지만(PRESTIGE_WEIGHT), 0은 아니라서 가끔 하위권으로도
+        # 떨어질 수 있다("토트넘도 가끔 강등권까지 간다"를 재현).
+        teams_info = [{"prestige": is_prestige(t.get("cname",""), t.get("tier",1), t.get("tname",""))}
+                      for t in teams]
+        perm = weighted_team_order(teams_info)   # perm[0]=이번 시즌 최강팀 인덱스, ...
         league_used: set = set()
-        for rank, team in zip(order, teams):
+        for rank, team_idx in enumerate(perm):
+            team = teams[team_idx]
             team_strength = 1.0 - (rank / (n - 1)) if n > 1 else 1.0
             # [리그등급 분리] 국대 등급(grade) 대신 리그 전용 등급 사용
             from constants import get_league_grade
@@ -1909,6 +2268,8 @@ def _generate_team_players(c, team, team_strength, league_used: set = None):
     # 걸리도록 한정한다. 2부 이하의 스타 슬롯(있다면)은 tier_top 기준으로
     # 자연스럽게 낮게 계산된 값을 그대로 쓴다.
     _elite_floor = ELITE_FLOOR_BY_GRADE.get(grade) if tier == 1 else None
+    _quota = FOREIGN_QUOTA_CAP.get(team.get("cname", ""))
+    _foreign_count = 0
 
     for idx, pos in enumerate(TEAM_POSITIONS):
         # 리그 전체에서 아직 안 쓴 이름 우선 사용
@@ -1939,17 +2300,20 @@ def _generate_team_players(c, team, team_strength, league_used: set = None):
         # [세부역할 2026-07] 포지션에 맞는 SUB_ROLES 중 하나를 무작위 배정.
         from constants import SUB_ROLES
         sub_role = random.choice(SUB_ROLES.get(pos, ["기본"]))
+        nationality, _foreign_count = _pick_nationality(
+            team.get("cname", ""), continent, grade, pos,
+            idx in star_kind_by_slot, _foreign_count, _quota)
         c.execute("""INSERT INTO ai_players
             (team_id,name,position,stamina,speed,jump,strength,shooting,passing,
              dribbling,tackling,heading,positioning,setpiece,
-             mental,confidence,leadership,concentration,ovr,age,sub_role)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             mental,confidence,leadership,concentration,ovr,age,sub_role,nationality)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (team["tid"],name,pos,
              stats["stamina"],stats["speed"],stats["jump"],stats["strength"],
              stats["shooting"],stats["passing"],stats["dribbling"],
              stats["tackling"],stats["heading"],stats["positioning"],
              stats["setpiece"],stats["mental"],stats["confidence"],
-             stats["leadership"],stats["concentration"],ovr,age,sub_role))
+             stats["leadership"],stats["concentration"],ovr,age,sub_role,nationality))
 
 
 def _gen_ai_stats(pos, target):

@@ -95,6 +95,7 @@ class WorldBrowserWindow(QDialog):
         tabs.addTab(self._build_league_tab(), "🔍 리그 검색")
         tabs.addTab(self._build_cup_tab(), "🎖 컵대회 검색")
         tabs.addTab(self._build_cl_tab(), "🏆 역대 챔피언스리그")
+        tabs.addTab(self._build_cwc_tab(), "🌍 역대 클럽 월드컵")
         tabs.addTab(self._build_wc_tab(), "🌐 역대 월드컵")
         tabs.addTab(self._build_nc_tab(), "🎖 역대 네이션스컵")
 
@@ -784,6 +785,75 @@ class WorldBrowserWindow(QDialog):
         dlg.exec()
 
     # ─────────────────────────────────────────
+    # 탭2.5: 역대 클럽 월드컵 (2026-07 신설)
+    # ─────────────────────────────────────────
+    def _build_cwc_tab(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 8, 0, 0)
+
+        info = QLabel("ℹ️ 국제대회가 없는 해(4년 주기)마다 대륙별 챔스 성적으로 32팀이 선발됩니다.")
+        info.setStyleSheet("color:#888;font-size:11px;")
+        lay.addWidget(info)
+
+        self.cwc_tbl = QTableWidget(0, 0)
+        self.cwc_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.cwc_tbl.verticalHeader().setVisible(False)
+        self.cwc_tbl.cellDoubleClicked.connect(self._open_cwc_detail)
+        lay.addWidget(self.cwc_tbl)
+        hint = QLabel("💡 대회를 더블클릭하면 조별리그·토너먼트 상세를 볼 수 있어요")
+        hint.setStyleSheet("color:#666;font-size:10px;")
+        lay.addWidget(hint)
+
+        self._refresh_cwc_table()
+        return w
+
+    def _refresh_cwc_table(self, *_a):
+        rows = wb.get_cwc_history()
+        cols = ["연도", "대회", "🥇 우승", "🥈 준우승", "🥉 3위", "4위"]
+        self.cwc_tbl.clear()
+        self.cwc_tbl.setRowCount(len(rows))
+        self.cwc_tbl.setColumnCount(len(cols))
+        self.cwc_tbl.setHorizontalHeaderLabels(cols)
+        self.cwc_tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.cwc_tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+
+        def _fmt_team(r, key):
+            name = r.get(f"{key}_name") or ""
+            if not name:
+                return "-"
+            country = r.get(f"{key}_country") or ""
+            return f"{name} ({country})" if country else name
+
+        for i, r in enumerate(rows):
+            vals = [str(r["year"]), r["name"],
+                    _fmt_team(r, "winner"), _fmt_team(r, "runner_up"),
+                    _fmt_team(r, "third"), _fmt_team(r, "fourth")]
+            for j, v in enumerate(vals):
+                cell = QTableWidgetItem(v)
+                cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if j == 2:
+                    cell.setForeground(Qt.GlobalColor.yellow)
+                if j == 0:
+                    cell.setData(Qt.ItemDataRole.UserRole, r["id"])
+                self.cwc_tbl.setItem(i, j, cell)
+        self._show_empty_state(self.cwc_tbl, rows,
+                                "아직 완료된 클럽 월드컵이 없습니다\n(4년 주기 대회라 초반엔 안 보이는 게 정상)",
+                                len(cols))
+        self._grow_to_fit(self.cwc_tbl, stretch_col=1)
+
+    def _open_cwc_detail(self, row, _col):
+        item = self.cwc_tbl.item(row, 0)
+        tid = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if tid is None:
+            return
+        name_item = self.cwc_tbl.item(row, 1)
+        title = f"{item.text()} {name_item.text() if name_item else ''}"
+        detail = wb.get_cwc_tournament_detail(tid)
+        dlg = TournamentDetailDialog(title, detail, team_based=True, parent=self)
+        dlg.exec()
+
+    # ─────────────────────────────────────────
     # 탭3: 역대 월드컵
     # ─────────────────────────────────────────
     def _build_wc_tab(self):
@@ -926,6 +996,27 @@ class TournamentDetailDialog(QDialog):
         hdr.setStyleSheet("color:#00cc44;font-size:15px;font-weight:bold;")
         outer.addWidget(hdr)
 
+        # [2026-07 신설, 신민용 요청] 참가국 요약 — 커리어창 "개인 수상"
+        # 요약줄(종류별 N회)과 같은 톤으로, 이 대회에 어느 나라가 몇 팀
+        # 참가했는지 많은 순으로 보여준다. team_based(팀 대항전)일 때만
+        # 의미가 있고, 월드컵/네이션스컵(국가 자체가 참가자)일 땐 굳이
+        # 안 보여준다 — 이미 그 자체가 "참가국 목록"이므로 중복.
+        # [2026-07 신설, 신민용 요청: "클럽월드컵에 대륙별로 몇 개 올라왔는지
+        # 맨 위에, 그 아래에 나라별로 몇 팀 나갔는지"] 대륙별 요약을 국가별
+        # 요약(_build_country_summary, 기존 기능) 위에 추가로 보여준다.
+        # 대륙 구분이 의미 있으려면 대회 자체가 여러 대륙을 섞어 참가시켜야
+        # 하는데(클럽월드컵이 정확히 이 경우 — 유럽/아시아/아프리카/북남미
+        # 4개 대륙에서 함께 뽑음), 챔피언스리그처럼 애초에 대회 자체가 한
+        # 대륙으로 한정된 경우엔 대륙이 1개뿐이라 자동으로 안 뜬다(country
+        # 요약과 동일한 "값이 2개 이상일 때만" 규칙 재사용).
+        if team_based:
+            continent_summary = self._build_continent_summary(detail)
+            if continent_summary:
+                outer.addWidget(continent_summary)
+            country_summary = self._build_country_summary(detail)
+            if country_summary:
+                outer.addWidget(country_summary)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -946,7 +1037,8 @@ class TournamentDetailDialog(QDialog):
         league_standings = detail.get("league_standings") or []
         if league_standings:
             lay.addWidget(self._section_label("⚽ 리그 스테이지"))
-            lay.addWidget(self._build_league_standings_table(league_standings))
+            lay.addWidget(self._build_league_standings_table(
+                league_standings, detail.get("continent")))
 
         knockout = detail.get("knockout") or []
         if knockout:
@@ -967,6 +1059,82 @@ class TournamentDetailDialog(QDialog):
         close_btn.setObjectName("closeBtn")
         close_btn.clicked.connect(self.close)
         outer.addWidget(close_btn)
+
+    def _build_continent_summary(self, detail):
+        """참가팀들의 대륙을 세어 많은 순으로 요약 라벨 생성 (클럽월드컵처럼
+        여러 대륙이 한 대회에 섞여 참가할 때만 의미가 있음).
+        _build_country_summary와 완전히 같은 구조 — 대륙(continent) 필드만
+        다르게 센다. 대륙이 1개뿐이면(예: 챔피언스리그 — 대회 자체가 이미
+        한 대륙으로 한정) 정보가 없으므로 None 반환."""
+        from collections import Counter
+        continents = []
+        groups = detail.get("groups") or {}
+        if groups:
+            for rows in groups.values():
+                continents.extend(r.get("continent", "") for r in rows if r.get("continent"))
+        else:
+            for r in (detail.get("league_standings") or []):
+                if r.get("continent"):
+                    continents.append(r["continent"])
+        if not continents:
+            return None
+        cnt = Counter(continents)
+        if len(cnt) <= 1:
+            return None
+        ranked = cnt.most_common()
+
+        w = QWidget()
+        lay = QVBoxLayout(w); lay.setContentsMargins(0, 4, 0, 4); lay.setSpacing(2)
+
+        top_n, top_c = ranked[0]
+        head = QLabel(f"🌐 참가 대륙 {len(cnt)}곳  ·  최다 참가: {top_n} ({top_c}팀)")
+        head.setStyleSheet("color:#4dd0e1;font-size:13px;font-weight:bold;")
+        lay.addWidget(head)
+
+        parts = [f"{name} {c}팀" for name, c in ranked]
+        body = QLabel("  ·  ".join(parts))
+        body.setStyleSheet("color:#aaaaaa;font-size:11px;")
+        body.setWordWrap(True)
+        lay.addWidget(body)
+        return w
+
+    def _build_country_summary(self, detail):
+        """참가팀들의 국가를 세어 많은 순으로 요약 라벨 생성.
+        groups(dict of list) 또는 league_standings(list) 아무 쪽이든
+        채워진 쪽에서 country 필드를 모은다. 참가국이 1개뿐이면(예: 국내
+        대회) 굳이 안 보여줄 만큼 정보가 없으므로 None 반환."""
+        from collections import Counter
+        countries = []
+        groups = detail.get("groups") or {}
+        if groups:
+            for rows in groups.values():
+                countries.extend(r.get("country", "") for r in rows if r.get("country"))
+        else:
+            for r in (detail.get("league_standings") or []):
+                if r.get("country"):
+                    countries.append(r["country"])
+        if not countries:
+            return None
+        cnt = Counter(countries)
+        if len(cnt) <= 1:
+            return None
+        ranked = cnt.most_common()
+
+        w = QWidget()
+        lay = QVBoxLayout(w); lay.setContentsMargins(0, 4, 0, 4); lay.setSpacing(2)
+
+        top_n, top_c = ranked[0]
+        head = QLabel(f"🌍 참가국 {len(cnt)}개국  ·  최다 참가: {top_n} ({top_c}팀)")
+        head.setStyleSheet("color:#ffcc00;font-size:13px;font-weight:bold;")
+        lay.addWidget(head)
+
+        # 개인수상 요약줄과 같은 톤(가운뎃점 구분)으로 국가별 참가팀 수 나열
+        parts = [f"{name} {c}팀" for name, c in ranked]
+        body = QLabel("  ·  ".join(parts))
+        body.setStyleSheet("color:#aaaaaa;font-size:11px;")
+        body.setWordWrap(True)
+        lay.addWidget(body)
+        return w
 
     def _section_label(self, text):
         lbl = QLabel(text)
@@ -1004,9 +1172,28 @@ class TournamentDetailDialog(QDialog):
             lay.addLayout(row)
         return box
 
-    def _build_league_standings_table(self, standings):
+    def _build_league_standings_table(self, standings, continent=None):
         """[2026-07 신설] 챔스 스위스 방식 리그 스테이지 전체 순위표(단일 표).
-        조별 카드 대신 순위·팀명·승무패·득실·승점을 한 표로 쭉 보여준다."""
+        조별 카드 대신 순위·팀명·승무패·득실·승점을 한 표로 쭉 보여준다.
+
+        [2026-07 추가, 신민용 요청: "경기 일정 화면처럼 직행/플레이오프
+        색깔 구분이 역대 기록에도 있으면 좋겠다"] schedule_window.py의
+        진행 중 화면과 완전히 같은 색상 체계(초록=직행/주황=플레이오프/
+        회색=탈락권)를 그대로 재사용해서 통일감을 준다."""
+        from PyQt6.QtGui import QColor
+        COLOR_ADVANCE = QColor("#00cc44")
+        COLOR_THIRD   = QColor("#ffaa00")
+        COLOR_ELIM    = QColor("#888888")
+
+        direct_cut = playoff_cut = None
+        if continent:
+            from champions_engine import CL_DIRECT_CUT_BY_CONTINENT, CL_PLAYOFF_POOL_BY_CONTINENT
+            direct_cut = CL_DIRECT_CUT_BY_CONTINENT.get(continent)
+            playoff_pool = CL_PLAYOFF_POOL_BY_CONTINENT.get(continent)
+            # [2026-07 버그수정, 신민용 리포트] playoff_cut은 direct_cut+playoff_pool이어야 하는데
+            # playoff_pool을 그대로 컷 라인으로 쓴 버그(유럽 8+16=24위가 정확한데 16위까지로 잘물었음).
+            playoff_cut = (direct_cut + playoff_pool) if (direct_cut is not None and playoff_pool is not None) else None
+
         box = self._card()
         lay = QVBoxLayout(box)
         lay.setContentsMargins(10, 8, 10, 8)
@@ -1028,12 +1215,28 @@ class TournamentDetailDialog(QDialog):
             vals = [str(i + 1), self._team_text(r["name"], r["flag"], r.get("country")),
                     str(r["wins"]), str(r["draws"]), str(r["losses"]),
                     f"{gd:+d}", str(r["pts"])]
+            color = None
+            if direct_cut is not None:
+                if i < direct_cut:
+                    color = COLOR_ADVANCE
+                elif playoff_cut is not None and i < playoff_cut:
+                    color = COLOR_THIRD
+                else:
+                    color = COLOR_ELIM
             for j, v in enumerate(vals):
                 item = QTableWidgetItem(v)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if color:
+                    item.setForeground(color)
                 tbl.setItem(i, j, item)
         tbl.setFixedHeight(tbl.verticalHeader().defaultSectionSize() * len(standings) + 32)
         lay.addWidget(tbl)
+
+        if direct_cut is not None:
+            hint = QLabel(f"🟢1~{direct_cut}위 직행  🟡{direct_cut+1}~{playoff_cut}위 플레이오프  "
+                          f"⬜{playoff_cut+1}위 이하 광탈")
+            hint.setStyleSheet("color:#888;font-size:10px;padding:4px 2px 0 2px;")
+            lay.addWidget(hint)
         return box
 
     def _build_groups_grid(self, groups, team_based):

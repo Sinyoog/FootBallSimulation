@@ -76,7 +76,7 @@ def run_ai_offseason(year, verbose_log=None):
     # 상위집합이라 안전하게 합칠 수 있다 — 로직/결과는 완전히 동일, 풀스캔
     # 횟수만 3회→2회로 감소. (ovr은 _transfer_market의 실력 기반 이적 가중치용)
     shared_ai_rows = c.execute(
-        "SELECT id, team_id, position, age, name, ovr FROM ai_players").fetchall()
+        "SELECT id, team_id, position, age, name, ovr, nationality FROM ai_players").fetchall()
 
     retired    = _retire_and_replace(c, year, shared_ai_rows)
     _ta2 = _time_perf.perf_counter()
@@ -114,26 +114,49 @@ def run_ai_offseason(year, verbose_log=None):
 # 0. 나이 보정 (구버전 세이브: age=0/NULL → 랜덤 부여)
 # ─────────────────────────────────────────────
 def _ensure_ai_ages(c):
-    rows = c.execute("SELECT id FROM ai_players WHERE age IS NULL OR age=0").fetchall()
-    if not rows:
+    """[2026-07 최적화, 신민용 리포트: "연도전환 최적화 더 해봐"] 이 보정은
+    '구버전 세이브에 남아있던 age=0/NULL'을 고치기 위한 1회성 마이그레이션인데,
+    run_ai_offseason이 매 시즌 호출될 때마다 ai_players 10만+ 행을 무조건
+    풀스캔하고 있었다(정상 세이브라면 매번 0건 매치라 완전히 낭비 — 실측
+    103,323행 스캔에 age 0건/sub_role 0건). age는 이후 _age_and_progress가
+    매 시즌 전원에게 항상 값을 채우므로, 한 번 깨끗하다고 확인되면 그
+    세이브에선 다시는 더러워질 수 없다 — meta 플래그로 "이 세이브는 이미
+    깨끗함"을 기록해두고, 다음 시즌부터는 쿼리 자체를 건너뛴다."""
+    try:
+        row = c.execute("SELECT value FROM meta WHERE key='ai_ages_clean_v1'").fetchone()
+    except Exception:
+        row = None
+    if row:
         return
-    # [최적화] executemany로 한 번에 처리
-    updates = [(int(round(random.triangular(16, 34, 25))), r["id"]) for r in rows]
-    c.executemany("UPDATE ai_players SET age=? WHERE id=?", updates)
+    rows = c.execute("SELECT id FROM ai_players WHERE age IS NULL OR age=0").fetchall()
+    if rows:
+        # [최적화] executemany로 한 번에 처리
+        updates = [(int(round(random.triangular(16, 34, 25))), r["id"]) for r in rows]
+        c.executemany("UPDATE ai_players SET age=? WHERE id=?", updates)
+    c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('ai_ages_clean_v1','1')")
 
 
 def _ensure_ai_sub_roles(c):
     """[세부역할 2026-07] sub_role 컬럼이 새로 생겨서 기존 세이브엔 빈 값('')
     인 AI 선수가 있다 — 포지션에 맞는 SUB_ROLES 중 하나를 무작위로 채운다.
     (신규 시딩 때는 _generate_team_players가 이미 채우므로 여기선 빈 것만
-    골라 보정한다.)"""
+    골라 보정한다.)
+
+    [2026-07 최적화] _ensure_ai_ages와 동일한 이유로 meta 플래그 가드 추가 —
+    한 번 깨끗해지면 다시 더러워질 수 없으므로 매 시즌 풀스캔할 필요가 없다."""
+    try:
+        row = c.execute("SELECT value FROM meta WHERE key='ai_sub_roles_clean_v1'").fetchone()
+    except Exception:
+        row = None
+    if row:
+        return
     from constants import SUB_ROLES
     rows = c.execute(
         "SELECT id, position FROM ai_players WHERE sub_role IS NULL OR sub_role=''").fetchall()
-    if not rows:
-        return
-    updates = [(random.choice(SUB_ROLES.get(r["position"], ["기본"])), r["id"]) for r in rows]
-    c.executemany("UPDATE ai_players SET sub_role=? WHERE id=?", updates)
+    if rows:
+        updates = [(random.choice(SUB_ROLES.get(r["position"], ["기본"])), r["id"]) for r in rows]
+        c.executemany("UPDATE ai_players SET sub_role=? WHERE id=?", updates)
+    c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('ai_sub_roles_clean_v1','1')")
 
 
 # ─────────────────────────────────────────────
@@ -206,16 +229,26 @@ def _age_and_progress_np(c, rows, team_cap, orphan_fallback):
     raw = np.array(_flat, dtype=np.float64).reshape(N, _N_STATS)
     vals_arr = np.where(np.isnan(raw) | (raw == 0), 50.0, raw).astype(np.int64)
 
-    _cap_get = team_cap.get
-    cap_by_row = np.empty(N, dtype=np.int64)
-    _orphan_team_ids = set()
-    for i, tid in enumerate(tids):
-        v = _cap_get(tid)
-        if v is None:
-            cap_by_row[i] = orphan_fallback
-            _orphan_team_ids.add(tid)
-        else:
-            cap_by_row[i] = v
+    # [2026-07 최적화, 신민용 리포트: "일정 진행이 갈수록 오래 걸린다" — 실측
+    # 결과 이 함수가 "벡터화 버전"이라면서 여기 한 곳만 순수 파이썬 for문으로
+    # 10만+ 회를 도는 게 남아있었다(dict.get()을 선수 수만큼 반복). team_cap은
+    # 팀 수(9천여 개)만큼만 있으니, searchsorted로 완전히 벡터화한다 —
+    # dict 방식 O(N) 파이썬 루프 → O(N log M) numpy 연산(M=팀 수)으로 대체.
+    tids_arr = np.array(tids, dtype=np.int64)
+    if team_cap:
+        _cap_keys = np.array(list(team_cap.keys()), dtype=np.int64)
+        _cap_vals = np.array(list(team_cap.values()), dtype=np.int64)
+        _order = np.argsort(_cap_keys)
+        _cap_keys_sorted = _cap_keys[_order]
+        _cap_vals_sorted = _cap_vals[_order]
+        _idx = np.searchsorted(_cap_keys_sorted, tids_arr)
+        _idx = np.clip(_idx, 0, len(_cap_keys_sorted) - 1)
+        _found = _cap_keys_sorted[_idx] == tids_arr
+        cap_by_row = np.where(_found, _cap_vals_sorted[_idx], orphan_fallback).astype(np.int64)
+        _orphan_team_ids = set(tids_arr[~_found].tolist())
+    else:
+        cap_by_row = np.full(N, orphan_fallback, dtype=np.int64)
+        _orphan_team_ids = set(tids_arr.tolist())
 
     new_age = ages + 1
     growth_mask = new_age <= _AI_PEAK_START
@@ -395,12 +428,24 @@ def _retire_and_replace(c, year, ai_rows=None):
       전체 스캔 횟수를 줄인다(로직/결과는 완전히 동일). None이면(단독 호출
       등 하위호환) 기존처럼 이 함수가 직접 조회한다."""
     from constants import OVR_RANGES, COUNTRY_LEAGUE_GRADE, CONTINENT_OVR_BONUS, COUNTRY_OVR_ADJ, SUB_ROLES
+    from database import _pick_nationality, FOREIGN_QUOTA_CAP
     retired = 0
 
     # 팀 → 리그등급/tier/보정치 선조회 (은퇴자마다 JOIN 방지)
-    team_info = {}  # {team_id: (grade, tier, bonus)}
+    # [2026-07 확장] 국적 재배정(_pick_nationality)에 필요한 국가명/대륙도
+    # 같이 캐싱한다 — 신인이 은퇴자의 옛 국적을 그대로 물려받던 버그 수정용.
+    # [2026-07 최적화, 신민용 리포트: "연도전환 최적화 더 해봐"] 아래
+    # 명문팀 가산 로직이 은퇴자마다 "SELECT name FROM teams WHERE id=?"를
+    # 따로 날리고 있었다 — 이 함수 전체가 "은퇴자마다 DB 왕복 제거"를
+    # 원칙으로 세워놨는데 그 원칙을 깨는 N+1 쿼리였다(은퇴자가 많을수록,
+    # 세이브가 오래될수록 이 함수가 계속 느려지던 원인 중 하나 — 실측
+    # 로그에서 "은퇴·세대교체" 단계가 시즌이 지날수록 조금씩 늘어나는
+    # 추세를 보였음). 팀 이름도 이 아래 team_info 캐시 SELECT 한 번에
+    # 같이 담아서, 이후 루프에서는 dict 조회만 하도록 고친다.
+    from data.prestige_clubs import is_prestige
+    team_info = {}  # {team_id: (grade, tier, bonus, cname, continent, tname)}
     for r in c.execute(
-            """SELECT t.id AS tid, t.current_tier AS tier,
+            """SELECT t.id AS tid, t.name AS tname, t.current_tier AS tier,
                       cn.name AS cname, cn.continent AS continent
                FROM teams t
                JOIN leagues l ON t.league_id = l.id
@@ -409,7 +454,7 @@ def _retire_and_replace(c, year, ai_rows=None):
         bonus = CONTINENT_OVR_BONUS.get(r["continent"], 0) + COUNTRY_OVR_ADJ.get(r["cname"], 0)
         if grade == "SS":
             bonus = min(bonus, 0)
-        team_info[r["tid"]] = (grade, r["tier"] or 1, bonus)
+        team_info[r["tid"]] = (grade, r["tier"] or 1, bonus, r["cname"], r["continent"], r["tname"])
 
     # [최적화] 이름풀 전체 1회 로드 (은퇴자마다 ORDER BY RANDOM() 방지)
     name_cache = _build_name_cache(c)
@@ -421,12 +466,18 @@ def _retire_and_replace(c, year, ai_rows=None):
     #   이제 그 SELECT 자체도 호출부에서 넘겨받은 ai_rows로 재사용해
     #   _transfer_market과의 중복 스캔까지 없앤다(3회 → 2회).
     _src_rows = ai_rows if ai_rows is not None else c.execute(
-        "SELECT id, team_id, position, age, name FROM ai_players").fetchall()
+        "SELECT id, team_id, position, age, name, nationality FROM ai_players").fetchall()
     team_used_names: dict = {}
     rows = []
+    # [2026-07 신설] 팀별 현재 외국인 수 카운터 — 신인 국적 재배정 시
+    # 쿼터(FOREIGN_QUOTA_CAP)를 그대로 지키기 위해 필요.
+    foreign_count_by_team: dict = {}
     for r in _src_rows:
         team_used_names.setdefault(r["team_id"], set()).add(r["name"])
         rows.append(r)
+        tinfo = team_info.get(r["team_id"])
+        if tinfo and r["nationality"] and r["nationality"] != tinfo[3]:
+            foreign_count_by_team[r["team_id"]] = foreign_count_by_team.get(r["team_id"], 0) + 1
     replace_updates = []  # executemany용
 
     for r in rows:
@@ -441,7 +492,8 @@ def _retire_and_replace(c, year, ai_rows=None):
         #  + 대륙/나라 보정. [조정] 예전엔 중간값+5까지 허용해서 신인이 데뷔부터
         #  거의 에이스급으로 들어왔다(A등급 기준 82~91). 하단~중간(82~86)으로
         #  좁혀서, 실제로 몇 시즌 성장해야 에이스 근처에 도달하도록 한다.
-        grade, tier, _bonus = team_info.get(r["team_id"], ("D", 1, 0))
+        grade, tier, _bonus, cname, continent, _tname = team_info.get(
+            r["team_id"], ("D", 1, 0, "", "유럽", ""))
         ovr_rng = OVR_RANGES.get(grade, {}).get(tier)
         if ovr_rng:
             lo, hi = ovr_rng
@@ -466,6 +518,22 @@ def _retire_and_replace(c, year, ai_rows=None):
                 target = random.randint(lo, (lo + hi) // 2)
             else:
                 target = random.randint(30, 45)
+                hi = target  # [방어] 이 극단적 폴백 경로엔 hi가 없어 아래 명문팀 가산에서 참조 에러 방지
+
+        # [2026-07 신설, 신민용 확정: "명문팀 가중치가 게임 시작할 때
+        # 한 번뿐이라 몇 시즌 지나면 사라진다"] 은퇴자 교체 때마다 매번
+        # 명문팀(data/prestige_clubs.py)이면 신인 목표 OVR을 소폭
+        # 상향한다 — "신인은 처음부터 에이스급이면 안 된다"는 기존 설계는
+        # 유지하되(범위를 통째로 올리지 않고 소폭 가산), 명문팀은 유스/
+        # 스카우팅 인프라가 좋아서 평균적으로 조금 더 나은 신인을 계속
+        # 채운다는 현실을 반영한다. 확정 버프가 아니라 +2~+5 정도의
+        # 완만한 가산이라 "가끔은 명문팀도 평범한 신인이 들어온다"는
+        # 여지는 그대로 남는다.
+        # [2026-07 최적화] 팀 이름은 위 team_info 캐시에서 바로 꺼낸다
+        # (원래 여기서 은퇴자마다 "SELECT name FROM teams WHERE id=?"를
+        # 따로 날렸던 N+1 쿼리였음 — 함수 상단 주석 참고).
+        if is_prestige(cname, tier, _tname):
+            target = min(hi, target + random.randint(2, 5))
 
         stats = _gen_stats(r["position"], target)
         new_ovr = calc_ovr(r["position"], stats)
@@ -473,17 +541,29 @@ def _retire_and_replace(c, year, ai_rows=None):
         # [세부역할 2026-07] 새 신인은 은퇴자의 예전 세부역할을 물려받지 않고
         # 그 포지션에 맞는 SUB_ROLES 중 하나를 새로 무작위 배정한다.
         new_sub_role = random.choice(SUB_ROLES.get(r["position"], ["기본"]))
+        # [2026-07 신설, 신민용 지적: "은퇴하면 새 선수 들어오는데 국적도
+        # 새로 뽑아야지, 안 그러면 은퇴자 국적을 그대로 물려받는다"] 은퇴자가
+        # 외국인이었으면 먼저 카운터에서 빼고, 새 국적을 다시 뽑는다.
+        tid = r["team_id"]
+        old_nat = r["nationality"] if "nationality" in r.keys() else ""
+        cur_foreign = foreign_count_by_team.get(tid, 0)
+        if old_nat and old_nat != cname:
+            cur_foreign = max(0, cur_foreign - 1)
+        quota = FOREIGN_QUOTA_CAP.get(cname)
+        new_nat, cur_foreign = _pick_nationality(cname, continent, grade, r["position"],
+                                                  False, cur_foreign, quota)
+        foreign_count_by_team[tid] = cur_foreign
         # 팀 내 중복 방지: used_in_team에 팀 현재 이름 set 전달
         used = team_used_names.setdefault(r["team_id"], set())
         name = _random_name(c, r["team_id"], name_cache, used_in_team=used)
         replace_updates.append(
-            (name, new_age, *[stats[s] for s in ALL_STATS], new_ovr, new_sub_role, r["id"]))
+            (name, new_age, *[stats[s] for s in ALL_STATS], new_ovr, new_sub_role, new_nat, r["id"]))
         retired += 1
 
     if replace_updates:
         set_clause = ", ".join(f"{s}=?" for s in ALL_STATS)
         c.executemany(
-            f"UPDATE ai_players SET name=?, age=?, {set_clause}, ovr=?, sub_role=? WHERE id=?",
+            f"UPDATE ai_players SET name=?, age=?, {set_clause}, ovr=?, sub_role=?, nationality=? WHERE id=?",
             replace_updates)
 
     return retired
