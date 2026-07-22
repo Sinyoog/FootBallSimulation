@@ -1300,11 +1300,29 @@ def advance_days(schedule: list):
         _do_flush = False
         if is_week_last_day:
             # ── 그 주 마무리: 기존 검증된 주 단위 훅 그대로 재사용 ──
+            # [2026-07 계측 추가, 신민용 리포트: "40→41, 49→50, 50→51주에
+            # 렉이 심하다"] 어느 단계가 실제로 오래 걸리는지 특정하기 위해
+            # 연도전환 로그와 같은 스타일로 주 단위 처리도 각 단계별 시간을
+            # 콘솔에 찍는다. 0.3초 미만이면 로그를 생략해 평소엔 콘솔이
+            # 조용하고, 실제로 느린 주에만 세부 내역이 보인다.
+            import time as _time_mod
+            _pw_t0 = _time_mod.perf_counter()
             intl_engine.process_intl_week(week)
+            _pw_t1 = _time_mod.perf_counter()
             champions_engine.process_cl_week(week)
+            _pw_t2 = _time_mod.perf_counter()
             club_world_cup_engine.process_cwc_week(week)
+            _pw_t3 = _time_mod.perf_counter()
             cup_engine.process_cup_week(week)
+            _pw_t4 = _time_mod.perf_counter()
             _sim_all_ai_matches(week, p.get("current_league_id", 0), cur_season)
+            _pw_t5 = _time_mod.perf_counter()
+            _pw_total = _pw_t5 - _pw_t0
+            if _pw_total >= 0.3:
+                print(f"[PERF-WEEK] {week}주차 마무리 {_pw_total:.2f}s "
+                      f"(국제대회 {_pw_t1-_pw_t0:.2f}s | 챔스 {_pw_t2-_pw_t1:.2f}s | "
+                      f"클럽WC {_pw_t3-_pw_t2:.2f}s | 국내컵 {_pw_t4-_pw_t3:.2f}s | "
+                      f"리그시뮬 {_pw_t5-_pw_t4:.2f}s)")
 
             p_latest = get_player()
             if week % 4 == 0:
@@ -5158,13 +5176,26 @@ def _get_cl_cup_season_stats(year):
            WHERE t.year=? AND m.my_played=1""", (year,)).fetchone()
     cl_t = conn.execute(
         "SELECT my_result FROM cl_tournaments WHERE year=? AND my_in=1", (year,)).fetchone()
+    # [2026-07 버그수정, 신민용 리포트: "월드컵 기간에는 월드컵 기준까지
+    # 넣고 그래야지"] 함수 docstring/주변 주석은 "챔스+컵+국가대표 대회"를
+    # 전부 반영한다고 되어 있었는데, 실제로는 국가대표 대회(월드컵/대륙컵)
+    # 개인 기록(내가 그 대회에서 넣은 골/도움/평점)이 통째로 빠져 있었다.
+    # trophy_bonus 쪽엔 국가대표 대회 "팀 성적"(우승/8강 등)은 반영되고
+    # 있었지만, 그건 팀 성적일 뿐 "내가 개인적으로 얼마나 생산했는가"와는
+    # 별개다 — 월드컵에서 8골을 넣어도 그 8골이 combined_ga에 안 잡히고
+    # 있었다는 뜻. intl_matches를 추가로 합산한다.
+    intl = conn.execute(
+        """SELECT COALESCE(SUM(m.my_goals),0) g, COALESCE(SUM(m.my_assists),0) a,
+                  COALESCE(SUM(m.my_rating),0) rs, COUNT(*) rc
+           FROM intl_matches m JOIN intl_tournaments t ON m.tournament_id=t.id
+           WHERE t.year=? AND m.my_played=1""", (year,)).fetchone()
     conn.close()
     cl_won = bool(cl_t and cl_t["my_result"] and "우승" in cl_t["my_result"])
     return {
-        "goals": cl["g"] + cup["g"],
-        "assists": cl["a"] + cup["a"],
-        "rating_sum": cl["rs"] + cup["rs"],
-        "rating_cnt": cl["rc"] + cup["rc"],
+        "goals": cl["g"] + cup["g"] + intl["g"],
+        "assists": cl["a"] + cup["a"] + intl["a"],
+        "rating_sum": cl["rs"] + cup["rs"] + intl["rs"],
+        "rating_cnt": cl["rc"] + cup["rc"] + intl["rc"],
         "cl_won": cl_won,
     }
 
@@ -5254,6 +5285,19 @@ def _intl_trophy_points(result: str, kind: str = "world", continent: str = "") -
     elif "8강" in result:
         base = 0.8
     else:
+        # [2026-07 신설, GPT 3차 피드백 부분 채택: "약한 대륙컵은 잘해도
+        # 보너스는 제한적이지만 못하면 손해는 크다(비대칭)"] GPT는 대회
+        # 5개 × 잘했을때/못했을때 총 10개 계수의 표를 제안했지만, 이 함수는
+        # 결과 문자열만 받고 개인 생산력은 안 받으므로("우승했지만 무득점"과
+        # "조별탈락+무득점"을 구분 못함) 그 정교한 매트릭스를 그대로 넣으면
+        # 팀이 약해서 일찍 떨어진 것까지 선수 개인 책임으로 감점하게 된다.
+        # 그래서 핵심만 최소하게 반영한다 — 유럽 외 대륙컵(아시안컵/남북미
+        # 대륙컵/아프리카 네이션스컵) 조별탈락은 0이 아니라 소폭 마이너스로
+        # 취급해 "이 정도 대회에서도 존재감을 못 보였다"는 신호를 준다.
+        # 월드컵·유로는 그대로 0(중립) — 이미 그 자체로 충분히 어려운
+        # 무대라 추가 감점 없이도 개인 생산력 위주 평가가 자연스럽다.
+        if kind == "continent" and continent != "유럽":
+            return -1.5
         return 0.0   # 조별탈락/예선탈락 등
     if kind == "continent" and continent != "유럽":
         base *= 0.2
@@ -5554,6 +5598,17 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
         # A급 선수라고 기준이 느슨해지는 게 아니라 '후보 자격 게이트'만 하나 더
         # 넘도록 바뀐 것이다.
         eligible_grade = grade in BALLON_DOR_GRADES or (tier == 1 and _major_stage_carry(year, tid))
+        # [2026-07 신설] UEFA/AFC 올해의 선수(대륙상)는 발롱도르보다 낮은
+        # OVR 문턱(85)에서도 검사하므로, 아래 발롱도르 전용 블록(ovr>=88
+        # 게이트 안)에서만 정의되는 값들을 미리 안전한 기본값으로
+        # 초기화해둔다 — 88 미만(85~87)에서 대륙상 블록이 이 값들을 참조할
+        # 때 NameError가 나는 걸 막기 위함.
+        trophy_bonus = 0.0
+        high_rating = False
+        _combined_ga = 0.0
+        _other_bonus = 0.0
+        min_ga_for_ballon = 999999
+        _cc = {"goals": 0, "assists": 0, "rating_sum": 0.0, "rating_cnt": 0, "cl_won": False}
         if eligible_grade and tier == 1 and p.get("ovr",0) >= 88:
             # [버그수정 2026-07, 신민용 지적: "K1에서 55골밖에 안 넣은
             # 애가 발롱도르를 받았다"] world_class 판정용 rival_ovr을
@@ -5632,28 +5687,101 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
             # 리그 top3, 챔스 진출, 자국컵 선전, 국가대표 메이저대회 중
             # 하나라도)을 발롱도르의 필수조건으로 바꾼다 — 아무리 골을
             # 많이 넣어도 트로피 실적이 0이면 발롱도르는 아니고 득점왕만.
-            dominant = high_rating and trophy_bonus > 0 and (
+            # [2026-07 재조정 2차, 신민용 리포트: "리그 6등에 챔스 8강인데도
+            # 골 많이 넣었다고 발롱도르 받는다"] trophy_bonus>0 게이트가 너무
+            # 헐거웠다 — 챔스 8강(1.2점)만 나가도, 리그 순위가 0점(4위 밖)
+            # 이어도 통과해버렸다. "무엇이든 최소한의 팀 성적"이 아니라
+            # "진짜 의미 있는 팀 성적"으로 문턱을 올린다 — 챔스/국가대표
+            # 4강 이상, 리그 top2, 혹은 그에 준하는 조합(리그 top3+챔스 8강
+            # 등)은 통과하지만, 챔스 8강 하나로 리그 순위 없이 통과하는 건
+            # 막는다(리그 3위=0.5+챔스8강=1.2=1.7로 여전히 2.0 미달 — 리그
+            # 순위까지 애매하면 발롱도르는 아니라고 봄).
+            MIN_TROPHY_BONUS_FOR_BALLON = 2.0
+            dominant = high_rating and trophy_bonus >= MIN_TROPHY_BONUS_FOR_BALLON and (
                 (_combined_ga + trophy_bonus + _other_bonus) >= min_ga_for_ballon
                 or mvp["is_mine"] or _cc["cl_won"])
             if world_class and dominant:
                 ballon = True
         if ballon:
             my_awards.append(("발롱도르", f"{year} 발롱도르"))
+            # [2026-07 신설, 신민용 확정: "FIFA 올해의 선수는 발롱도르와
+            # 자동 연동"] 이 상을 가르는 실제 기준(기자/감독/주장/팬 투표)을
+            # 재현할 데이터가 없으므로, 별도 판정 로직 없이 발롱도르 수상과
+            # 그대로 묶는다. 현실에서도 같은 시즌에 두 상을 같이 받는 경우가
+            # 압도적으로 많다.
+            my_awards.append(("FIFA 올해의 선수", f"{year} FIFA 올해의 선수"))
 
-        # 신데렐라 스토리 (저OVR 대비 활약도 최고)
-        # MVP 점수 / OVR로 "효율"을 계산 → 저OVR(70 이하)이면서 가장 높은 효율자
-        cinderella_cand = []
-        for x in pool:
-            if x["ovr"] <= 70:
-                score = _position_award_score(
-                    x["position"], x["goals"], x["assists"], x["rating"], x["ovr"], x.get("cs", 0))
-                eff = score / x["ovr"] if x["ovr"] > 0 else 0
-                cinderella_cand.append((x, eff))
-        if cinderella_cand:
-            cinderella_best = max(cinderella_cand, key=lambda x: x[1])
-            if cinderella_best[0]["is_mine"]:
-                x = cinderella_best[0]
-                my_awards.append(("신데렐라", f"OVR {x['ovr']} → 리그 정상급 활약"))
+        # [2026-07 신설, 신민용 확정] UEFA/AFC 올해의 선수 — 발롱도르와 달리
+        # "그 대륙 안에서만" 비교하는 상이라 실제로 발롱도르와 다른 결과가
+        # 나올 수 있다(발롱도르는 놓쳐도 대륙상은 받을 수 있음, 또는 그 반대).
+        # 위에서 발롱도르용으로 이미 계산해둔 high_rating/trophy_bonus/
+        # _combined_ga/_cc/mvp 등을 그대로 재사용한다(중복 계산 없음, GPT
+        # 피드백에서도 강조된 부분) — 새로 만드는 건 "라이벌 OVR을 전세계가
+        # 아니라 내 대륙으로만 좁힌 쿼리" 하나뿐이다. 발롱도르보다 후보군이
+        # 훨씬 작으므로 문턱(OVR/등급)도 그만큼 낮춘다 — SS/S 등급이 아니어도,
+        # 그 대륙 1부리그 소속이면 후보가 될 수 있다.
+        _CONTINENT_POY = {"유럽": "UEFA 올해의 선수", "아시아": "AFC 올해의 선수",
+                          "아메리카": "CONMEBOL 올해의 선수", "아프리카": "CAF 올해의 선수"}
+        _my_cont_row = c.execute("""SELECT cn.continent FROM teams t
+            JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
+            WHERE t.id=?""", (tid,)).fetchone()
+        _my_continent = _my_cont_row["continent"] if _my_cont_row else ""
+        if _my_continent in _CONTINENT_POY and tier == 1 and p.get("ovr", 0) >= 85:
+            _cont_rival = c.execute("""SELECT MAX(a.ovr) as mo FROM ai_players a
+                JOIN teams t2 ON a.team_id=t2.id
+                JOIN leagues l2 ON t2.league_id=l2.id
+                JOIN countries cn2 ON l2.country_id=cn2.id
+                WHERE cn2.continent=? AND l2.tier=1 AND a.position IN ({})
+                """.format(",".join("'%s'" % pp for pp in ATTACK_POS)), (_my_continent,)).fetchone()
+            _cont_rival_ovr = _cont_rival["mo"] if _cont_rival and _cont_rival["mo"] else 80
+            _cont_world_class = p.get("ovr", 0) >= _cont_rival_ovr - 2
+            # 대륙상은 발롱도르보다 후보군이 작으므로 생산력 문턱을 30% 낮춘다.
+            if _cont_world_class and high_rating and (
+                    (_combined_ga + trophy_bonus + _other_bonus) >= min_ga_for_ballon * 0.7
+                    or mvp["is_mine"] or _cc["cl_won"]):
+                _cname = _CONTINENT_POY[_my_continent]
+                my_awards.append((_cname, f"{year} {_cname}"))
+
+        # [2026-07 신설, 신민용 확정] FIFPro 월드11 — "세계 톱리그 포지션별
+        # 베스트 11". GPT 지적대로 새 점수식을 만들지 않고 리그/CL에서 이미
+        # 쓰고 있는 _best11_score/_best11_score_gk_df/_best11_score_mf를
+        # 그대로 재사용한다. SS/S급 리그 전체(+A급이면서 세계무대 캐리를
+        # 증명한 경우) 소속 선수를 포지션별로 모아 포메이션(GK1/DF4/MF3/FW3)
+        # 별 1위를 뽑고, 그중 내가 있으면 수상. 전세계 탑리그 선수를 매년
+        # 한 번(연도전환 시점) 조회하는 작업이라 시즌 중 성능에는 영향이
+        # 없지만, 연도전환 처리 자체는 조금 더 걸릴 수 있다.
+        if eligible_grade and tier == 1:
+            _W11_FULL_SEASON = 38  # 톱리그 표준 시즌 길이 가정(리그마다 달라도 근사치로 통일)
+            _w11_pool = [{"position": p.get("position", "ST"),
+                          "goals": season_goals, "assists": season_assists, "rating": season_rating,
+                          "ovr": p.get("ovr", 60), "cs": season_cs, "is_mine": True}]
+            _w11_ALL_POS = GK_POS + DF_POS + MF_POS + FW_POS
+            _w11_ph = ",".join("'%s'" % pp for pp in _w11_ALL_POS)
+            _w11_rows = c.execute(f"""SELECT a.ovr, a.position, a.sub_role, t2.id as team_id
+                FROM ai_players a JOIN teams t2 ON a.team_id=t2.id
+                JOIN leagues l2 ON t2.league_id=l2.id JOIN countries cn2 ON l2.country_id=cn2.id
+                WHERE cn2.grade IN ('SS','S') AND l2.tier=1 AND a.position IN ({_w11_ph})""").fetchall()
+            for _r in _w11_rows:
+                _g, _a, _rt = _estimate_ai_season(_r["ovr"], _r["position"], 85, 85, _r["sub_role"],
+                                                   full_season_matches=_W11_FULL_SEASON)
+                _cs2 = (_estimate_ai_clean_sheets(_r["position"], _r["ovr"], 85, 85, _W11_FULL_SEASON)
+                        if _r["position"] in GK_POS else 0)
+                _w11_pool.append({"position": _r["position"], "goals": _g, "assists": _a, "rating": _rt,
+                                  "ovr": _r["ovr"], "cs": _cs2, "is_mine": False})
+            _w11_groups = [(GK_POS + DF_POS, _best11_score_gk_df, "cs"),
+                          (MF_POS, _best11_score_mf, "ga"),
+                          (FW_POS, _best11_score, "ga")]
+            for _grp_pos, _scorefn, _mode in _w11_groups:
+                _grp = [x for x in _w11_pool if x["position"] in _grp_pos]
+                if not _grp:
+                    continue
+                if _mode == "cs":
+                    _best = max(_grp, key=lambda x: _scorefn(x["cs"], x["rating"], x["ovr"]))
+                else:
+                    _best = max(_grp, key=lambda x: _scorefn(x["goals"], x["assists"], x["rating"], x["ovr"]))
+                if _best["is_mine"]:
+                    my_awards.append(("FIFPro 월드11", f"{year} FIFPro 월드11"))
+                    break
 
         # 푸스카스상 (올해의 골 — 최고 평점이면서 멀티골 이상)
         # [버그 수정 — 근본 원인] 실제 푸스카스상은 전세계에서 딱 1명
@@ -5762,7 +5890,7 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
         for atype, detail in my_awards:
             icon = {"득점왕":"⚽","도움왕":"🎯","베스트11":"⭐","MVP":"🏅",
                     "발롱도르":"🏆","영플레이어":"🌟","골든글러브":"🧤",
-                    "신데렐라":"✨","푸스카스상":"💥","올해의 골":"💥",
+                    "푸스카스상":"💥","올해의 골":"💥",
                     "사모라상":"🛡️"}.get(atype,"🏅")
             add_log(f"{icon} {atype} 수상! ({detail})  {year}년", "event", year, 52)
         return

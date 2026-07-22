@@ -2163,7 +2163,49 @@ def _finalize_qual(t):
     conn = get_conn()
     grps = [r["grp"] for r in conn.execute(
         "SELECT DISTINCT grp FROM intl_entries WHERE tournament_id=? ORDER BY grp", (tid,)).fetchall()]
+    # [2026-07 최적화, 신민용 리포트: "49~50주에 렉이 심하다" — 실측 [PERF-WEEK]
+    # 로그로 국제대회 처리에서만 6~7초가 나오는 게 확인됨] 원래 조 라벨마다
+    # _qual_group_standings(tid, g)를 따로 호출했는데, 그 함수가 매번 새
+    # 커넥션을 열고 entries/matches 쿼리를 2번씩 날렸다. 월드컵 예선은 유럽12+
+    # 아메리카8+아시아10+아프리카12 = 조 42개나 있어서(대륙컵보다 훨씬 많음)
+    # champions_engine._finalize_groups에서 고쳤던 것과 똑같은 문제가 여기서는
+    # 훨씬 크게 터졌다. 대회 전체 entries/matches를 딱 2번의 쿼리로 한 번에
+    # 가져와서 파이썬에서 조별로 나눈다.
+    _all_entries = [dict(r) for r in conn.execute(
+        "SELECT * FROM intl_entries WHERE tournament_id=?", (tid,)).fetchall()]
+    _all_matches = [dict(r) for r in conn.execute(
+        """SELECT * FROM intl_matches WHERE tournament_id=?
+           AND stage='qual_group' AND home_score>=0""", (tid,)).fetchall()]
     conn.close()
+    _entries_by_grp: dict = {}
+    for e in _all_entries:
+        _entries_by_grp.setdefault(e["grp"], []).append(e)
+    _matches_by_grp: dict = {}
+    for m in _all_matches:
+        _matches_by_grp.setdefault(m["grp"], []).append(m)
+
+    def _qual_standings_for(entries, matches):
+        tbl = {e["country"]: {"country": e["country"], "flag": e["flag"], "ovr": e["ovr"],
+                              "grade": e["grade"], "p": 0, "w": 0, "d": 0, "l": 0,
+                              "gf": 0, "ga": 0, "pts": 0}
+               for e in entries}
+        for m in matches:
+            h, a = tbl.get(m["home"]), tbl.get(m["away"])
+            if not h or not a:
+                continue
+            hs, as_ = m["home_score"], m["away_score"]
+            h["p"] += 1; a["p"] += 1
+            h["gf"] += hs; h["ga"] += as_
+            a["gf"] += as_; a["ga"] += hs
+            if hs > as_:
+                h["pts"] += 3; h["w"] += 1; a["l"] += 1
+            elif hs < as_:
+                a["pts"] += 3; a["w"] += 1; h["l"] += 1
+            else:
+                h["pts"] += 1; a["pts"] += 1; h["d"] += 1; a["d"] += 1
+        rows = list(tbl.values())
+        rows.sort(key=lambda r: (r["pts"], r["gf"] - r["ga"], r["gf"], r["ovr"]), reverse=True)
+        return rows
 
     continent = _conf_key((t.get("continent") or "").strip() or "유럽")
     big = (t["year"] + 1) >= WC_EXPAND_YEAR
@@ -2173,7 +2215,7 @@ def _finalize_qual(t):
     winners = []
     runners = []
     for g in grps:
-        standings = _qual_group_standings(tid, g)
+        standings = _qual_standings_for(_entries_by_grp.get(g, []), _matches_by_grp.get(g, []))
         if not standings:
             continue
         if len(standings) >= 1: winners.append(standings[0])
@@ -2832,21 +2874,54 @@ def _award_intl_awards(t):
         my_score += _cap_additive_bonus(_raw_bonus, my_base_score, cap_ratio=0.10)
 
     others = [x for x in pool if not x["is_mine"]]
-    best_ai_scorer_g = max((x["goals"] for x in others), default=-1)
-    best_ai_mvp_score = max((_position_award_score(x["position"], x["goals"], x["assists"],
+    # [2026-07 확장, 신민용 확정] 골든볼/골든부트를 "내가 1등이냐"만 보던 걸
+    # sorted()로 순위 전체를 매겨서 2위(실버)·3위(브론즈)까지 판정한다.
+    # 비용은 max()→sorted() 수준이라 거의 없다. 실제로도 월드컵은 골든볼/
+    # 실버볼/브론즈볼, 골든부트/실버부트/브론즈부트를 전부 시상한다.
+    _ai_scorer_scores = sorted((x["goals"] for x in others), reverse=True)
+    _ai_mvp_scores = sorted((_position_award_score(x["position"], x["goals"], x["assists"],
                                                     x["rating"], x["ovr"], x["cs"]) * _stage_w(x["country"])
-                              for x in others), default=-1)
+                              for x in others), reverse=True)
+
+    def _my_rank(my_val, ai_sorted_desc):
+        """내 값이 AI 정렬 리스트(내림차순) 안에서 몇 등인지(1부터). 동점은
+        내가 우선(기존 >= 판정 관례 유지)."""
+        rank = 1
+        for v in ai_sorted_desc:
+            if v > my_val:
+                rank += 1
+            else:
+                break
+        return rank
+
     year = t["year"]
     mvp_name = "골든볼" if is_wc else f"{t['name']} MVP"
     boot_name = "골든부트" if is_wc else f"{t['name']} 득점왕"
     glove_name = "골든글러브" if is_wc else f"{t['name']} 골든글러브"
     best11_name = "베스트11" if is_wc else f"{t['name']} 베스트11"
     young_name = "영플레이어상" if is_wc else f"{t['name']} 영플레이어상"
+    # 은/동메달용 이름 — 월드컵만 실제 명칭(실버볼 등)이 있고, 대륙컵은
+    # 실제로 이런 시상이 없어 "MVP 2위/득점 2위" 식으로 이름 붙인다.
+    mvp2_name = "실버볼" if is_wc else f"{t['name']} MVP 2위"
+    mvp3_name = "브론즈볼" if is_wc else f"{t['name']} MVP 3위"
+    boot2_name = "실버부트" if is_wc else f"{t['name']} 득점 2위"
+    boot3_name = "브론즈부트" if is_wc else f"{t['name']} 득점 3위"
     awards = []
-    if my_row["g"] > 0 and my_row["g"] >= best_ai_scorer_g:
-        awards.append((boot_name, f"{my_row['g']}골"))
-    if my_score >= best_ai_mvp_score:
+    if my_row["g"] > 0:
+        _scorer_rank = _my_rank(my_row["g"], _ai_scorer_scores)
+        if _scorer_rank == 1:
+            awards.append((boot_name, f"{my_row['g']}골"))
+        elif _scorer_rank == 2:
+            awards.append((boot2_name, f"{my_row['g']}골"))
+        elif _scorer_rank == 3:
+            awards.append((boot3_name, f"{my_row['g']}골"))
+    _mvp_rank = _my_rank(my_score, _ai_mvp_scores)
+    if _mvp_rank == 1:
         awards.append((mvp_name, f"{year} {t['name']}"))
+    elif _mvp_rank == 2:
+        awards.append((mvp2_name, f"{year} {t['name']}"))
+    elif _mvp_rank == 3:
+        awards.append((mvp3_name, f"{year} {t['name']}"))
     # [2026-07 신설, 설계문서 v2 반영] 월드컵/대륙컵 영플레이어상은 4년 주기
     # 대회 특성상 실제로는 사실상 평생 한 번인데, 나이 조건(<=21)만으로는
     # 아주 어린 나이에 데뷔한 극소수 케이스가 두 번 받는 게 이론상 가능했다.

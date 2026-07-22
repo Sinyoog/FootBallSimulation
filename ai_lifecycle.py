@@ -499,7 +499,33 @@ def _retire_and_replace(c, year, ai_rows=None):
             lo, hi = ovr_rng
             lo, hi = lo + _bonus, hi + _bonus
             mid = (lo + hi) // 2
-            target = random.randint(lo, mid)
+            # [2026-07 버그수정, 신민용 리포트: "명문팀이 계속 강등당한다"]
+            # 예전엔 항상 '하단~중간'에서 뽑고 명문팀이면 그 위에 그냥
+            # +2~5만 더했다 — 그런데 게임 초반 시딩(_generate_all_ai_players
+            # → weighted_team_order)은 "명문팀은 강한 슬롯을 뽑을 확률이
+            # 훨씬 높되(PRESTIGE_WEIGHT=6.0) 100%는 아니다"라는 철학이었다.
+            # 신인 교체가 이 철학을 안 따르고 매번 '하단~중간 + 소폭 보정'만
+            # 하다 보니, 명문팀 선수단이 은퇴로 교체될수록(대략 10~15년 후
+            # 전체 세대교체) 원래 시딩 때 받았던 우위가 사라지고 리그 평균
+            # 수준으로 수렴해버렸다 — 그래서 시간이 지날수록 명문팀이 점점
+            # 강등권에 가까워지는 정확히 그 증상이었다. 이제 명문팀은
+            # weighted_team_order와 같은 확률(PRESTIGE_WEIGHT 기반)로
+            # '중간~상단'에서 뽑을 확률이 훨씬 높게 하되, 완전히 배제하진
+            # 않는다(가끔은 평범한 신인도 나와야 "명문팀도 가끔 훅 간다"가
+            # 재현됨).
+            # [2026-07 확률 보정] 처음엔 random()**(1/PRESTIGE_WEIGHT)>=0.5 조건을
+            # 썼는데, 실측 시뮬레이션해보니 98.4% 확률로 상단이 나와서 원래
+            # 설계 문서(prestige_clubs.py 상단 주석)가 말하는 "대략 10~20%
+            # 안팎만 하위권"이라는 의도보다 훨씬 강했다(거의 100% 고정 강세와
+            # 다를 게 없어짐). 의도한 비율(상단 85%, 하위 15%)을 직접
+            # 상수로 명시한다.
+            _PRESTIGE_UPPER_PROB = 0.85
+            _is_prestige_team = is_prestige(cname, tier, _tname)
+            _use_upper = _is_prestige_team and (random.random() < _PRESTIGE_UPPER_PROB)
+            if _use_upper:
+                target = random.randint(mid, hi)
+            else:
+                target = random.randint(lo, mid)
         else:
             # [버그수정 2026-07] 그 등급에 이 tier가 정의 안 돼 있으면(부수가
             # 늘었는데 표를 못 채운 경우) 고정 30~45가 아니라, 그 등급 안에서
@@ -520,20 +546,12 @@ def _retire_and_replace(c, year, ai_rows=None):
                 target = random.randint(30, 45)
                 hi = target  # [방어] 이 극단적 폴백 경로엔 hi가 없어 아래 명문팀 가산에서 참조 에러 방지
 
-        # [2026-07 신설, 신민용 확정: "명문팀 가중치가 게임 시작할 때
-        # 한 번뿐이라 몇 시즌 지나면 사라진다"] 은퇴자 교체 때마다 매번
-        # 명문팀(data/prestige_clubs.py)이면 신인 목표 OVR을 소폭
-        # 상향한다 — "신인은 처음부터 에이스급이면 안 된다"는 기존 설계는
-        # 유지하되(범위를 통째로 올리지 않고 소폭 가산), 명문팀은 유스/
-        # 스카우팅 인프라가 좋아서 평균적으로 조금 더 나은 신인을 계속
-        # 채운다는 현실을 반영한다. 확정 버프가 아니라 +2~+5 정도의
-        # 완만한 가산이라 "가끔은 명문팀도 평범한 신인이 들어온다"는
-        # 여지는 그대로 남는다.
+        # [2026-07 수정] 명문팀 보정은 이제 위 target 산출 시점(중간~상단 확률
+        # 편향)에서 이미 반영되므로, 여기서 별도로 다시 가산하지 않는다 —
+        # 예전엔 여기서 +2~5를 또 더했는데, 그러면 이중 보정이 된다.
         # [2026-07 최적화] 팀 이름은 위 team_info 캐시에서 바로 꺼낸다
         # (원래 여기서 은퇴자마다 "SELECT name FROM teams WHERE id=?"를
         # 따로 날렸던 N+1 쿼리였음 — 함수 상단 주석 참고).
-        if is_prestige(cname, tier, _tname):
-            target = min(hi, target + random.randint(2, 5))
 
         stats = _gen_stats(r["position"], target)
         new_ovr = calc_ovr(r["position"], stats)

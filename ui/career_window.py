@@ -17,7 +17,7 @@ from constants import format_result_with_absence
 # 개인 수상으로 분류할 키워드 (trophy_log에 섞여 들어온 발롱도르·MVP 행 식별)
 _PERSONAL_AWARD_KEYWORDS = (
     "발롱도르", "MVP", "득점왕", "도움왕", "베스트11",
-    "골든글러브", "영플레이어", "신데렐라", "푸스카스", "사모라",
+    "골든글러브", "영플레이어", "푸스카스", "사모라",
 )
 
 

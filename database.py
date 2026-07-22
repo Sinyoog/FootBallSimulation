@@ -955,6 +955,16 @@ def init_db():
     # 수천 ms가 걸린다. 아래 인덱스로 호출당 비용을 O(N)→O(log N)로 낮춘다.
     for idx in [
         "CREATE INDEX IF NOT EXISTS idx_aiplayers_team   ON ai_players(team_id)",
+        # [2026-07 신설, 신민용 리포트: "49~50주에 렉이 6~7초씩 걸린다"]
+        # get_country_squad_players._fill()이 "WHERE nationality=? AND
+        # position=? ORDER BY ovr DESC LIMIT 1" 쿼리를 국가당 포지션 수(최대
+        # 11개)만큼, 그것도 국적 태그/자국리그/대륙 3단계로 최대 33번까지
+        # 반복한다. 이 조합 인덱스가 없어서 매번 ai_players 전체(10만+ 행)를
+        # 스캔+정렬하고 있었다 — cProfile로 실측한 결과 쿼리 1개당 평균
+        # 24ms, 국제대회 예선 마감 주차(20개국 동시 처리)에 417개 쿼리가
+        # 몰려 10초 이상 걸리는 게 확인됨. 이 인덱스로 조건에 맞는 행만
+        # 바로 찾아 정렬 없이(ovr DESC를 인덱스 순서로 커버) 가져온다.
+        "CREATE INDEX IF NOT EXISTS idx_aiplayers_nat_pos_ovr ON ai_players(nationality, position, ovr DESC)",
         "CREATE INDEX IF NOT EXISTS idx_mr_week_season   ON match_results(week, season)",
         "CREATE INDEX IF NOT EXISTS idx_mr_league_season ON match_results(league_id, season)",
         "CREATE INDEX IF NOT EXISTS idx_mr_day_season    ON match_results(day, season)",
@@ -2153,12 +2163,19 @@ def _tier_top_ovr(grade, tier, continent_bonus=0):
     return 45
 
 
-def _target_ovr(grade, tier, team_strength, role_idx, continent_bonus=0):
-    """팀 강도(0~1) + 역할 순번(0=에이스 … 10=막내)으로 목표 OVR 산출."""
+def _target_ovr(grade, tier, team_strength, role_idx, continent_bonus=0, prestige_bonus=0):
+    """팀 강도(0~1) + 역할 순번(0=에이스 … 10=막내)으로 목표 OVR 산출.
+    [2026-07 신설] prestige_bonus: 명문팀 전용 추가 보너스. continent_bonus처럼
+    _tier_top_ovr()의 top 자체에 더하면 SS등급 클램프("if grade=='SS':
+    continent_bonus=min(continent_bonus,0)")에 걸려 사라져버린다(하필 이
+    보너스가 정작 필요한 EPL 등 SS등급 명문팀에서 무효화되는 것) — 그래서
+    top 계산 이후, ace 산출 단계에서 따로 더한다. role_mult를 곱하기 전에
+    더해서 에이스일수록 보너스를 온전히 받고 벤치로 갈수록 비례해 줄어들게
+    한다(스카우팅/인프라 우위가 에이스급에서 가장 크게 드러난다는 설계)."""
     prof = TEAM_ROLE_PROFILE.get(grade, TEAM_ROLE_PROFILE["F"])
     top = _tier_top_ovr(grade, tier, continent_bonus)
     # 팀 에이스 목표: 강팀일수록 리그 top에 근접
-    ace = top * (prof["ace_lo"] + (1.0 - prof["ace_lo"]) * team_strength)
+    ace = top * (prof["ace_lo"] + (1.0 - prof["ace_lo"]) * team_strength) + prestige_bonus
     role_mult = 1.0 - prof["spread"] * (role_idx / 10.0)
     return ace * role_mult
 
@@ -2184,6 +2201,15 @@ def _generate_all_ai_players(c, progress_cb=None):
     _total_teams = len(rows)
     _done = 0
     from data.prestige_clubs import is_prestige, weighted_team_order
+    # [2026-07 신설, 신민용 확정] 명문팀 전용 team_strength 보너스. ace_lo
+    # (팀 간 OVR 격차의 전체 폭)는 예전 지적("같은 1부인데 팀간 격차가
+    # 너무 크다")대로 좁게 유지한다 — 이걸 다시 넓히면 명문팀 문제는
+    # 고쳐져도 관련 없는 일반 팀들 간의 격차 문제가 되살아난다. 대신
+    # 명문팀에만 "뽑은 순위와 무관하게" 최소한의 안전판을 얹는다 —
+    # weighted_team_order가 하위권 슬롯을 뽑아버리는 그 드문 경우에도
+    # 완전히 바닥까지 떨어지진 않게. 일반 팀의 team_strength 분포와
+    # 곡선 자체는 전혀 안 건드린다.
+    PRESTIGE_STRENGTH_BONUS = 0.25
     for lid, teams in leagues.items():
         n = len(teams)
         # [2026-07 신설] 완전 무작위 셔플 대신 명문팀 가중 셔플 — 명문팀
@@ -2197,6 +2223,8 @@ def _generate_all_ai_players(c, progress_cb=None):
         for rank, team_idx in enumerate(perm):
             team = teams[team_idx]
             team_strength = 1.0 - (rank / (n - 1)) if n > 1 else 1.0
+            if teams_info[team_idx]["prestige"]:
+                team_strength = min(1.0, team_strength + PRESTIGE_STRENGTH_BONUS)
             # [리그등급 분리] 국대 등급(grade) 대신 리그 전용 등급 사용
             from constants import get_league_grade
             league_grade = get_league_grade(team.get("cname", ""), team["grade"])
@@ -2221,6 +2249,13 @@ def _generate_team_players(c, team, team_strength, league_used: set = None):
     # SS는 이미 상한(100)에 근접 → 보정 축소 (초과 방지)
     if grade == "SS":
         continent_bonus = min(continent_bonus, 0)
+
+    # [2026-07 신설] 명문팀 전용 OVR 보너스 — ace_lo(팀간 전반 격차)는 건드리지
+    # 않고, 명문팀에만 별도로 얹는다. continent_bonus와 달리 SS등급 클램프의
+    # 영향을 안 받도록 _target_ovr 안에서 top 계산 이후 단계에 더해진다.
+    from data.prestige_clubs import is_prestige, PRESTIGE_OVR_BONUS
+    prestige_bonus = PRESTIGE_OVR_BONUS if is_prestige(
+        team.get("cname", ""), tier, team.get("tname", "")) else 0
 
     # 해당 국가 이름풀 전체를 가져온다 (리그 8팀 × 11명 = 최대 88개 필요)
     c.execute("SELECT name FROM player_names WHERE country_id=? ORDER BY RANDOM()",
@@ -2287,7 +2322,8 @@ def _generate_team_players(c, team, team_strength, league_used: set = None):
                 # 있었다 — 스타 슬롯에도 동일한 바닥을 걸어 항상 88 이상 보장.
                 target = max(target, _elite_floor)
         else:
-            target = _target_ovr(grade, tier, team_strength, role_indices[idx], continent_bonus)
+            target = _target_ovr(grade, tier, team_strength, role_indices[idx], continent_bonus,
+                                 prestige_bonus)
             # [방어적 안전장치] SS/S 1부는 el_fill_rest=True라 이 분기(baseline)를
             # 정상적으로는 타지 않지만(전원 스타 배정), 혹시라도 남는 자리가
             # 생기면 "월클+엘리트로만 구성"이 깨지지 않도록 바닥을 걸어둔다.

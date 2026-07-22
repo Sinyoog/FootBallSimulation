@@ -68,7 +68,7 @@ from database import get_conn
 # 개인 수상으로 분류할 키워드 (trophy_log에 섞여 들어온 발롱도르·MVP 행 식별)
 _PERSONAL_AWARD_KEYWORDS = (
     "발롱도르", "MVP", "득점왕", "도움왕", "베스트11",
-    "골든글러브", "영플레이어", "신데렐라", "푸스카스", "사모라",
+    "골든글러브", "영플레이어", "푸스카스", "사모라",
 )
 
 
@@ -711,7 +711,7 @@ class RetireWindow(QDialog):
         # 수상 종류별 횟수 요약
         from collections import Counter
         cnt = Counter(a.get("award_type","") for a in awards)
-        order = ["발롱도르","MVP","득점왕","도움왕","베스트11","골든글러브","영플레이어","신데렐라","푸스카스상","올해의 골","사모라상"]
+        order = ["발롱도르","MVP","득점왕","도움왕","베스트11","골든글러브","영플레이어","푸스카스상","올해의 골","사모라상"]
         summary_parts = []
         for k in order:
             if cnt.get(k):
@@ -729,7 +729,7 @@ class RetireWindow(QDialog):
         tbl  = self._make_table(len(awards), cols)
         icon = {"득점왕":"⚽","도움왕":"🎯","베스트11":"⭐","MVP":"🏅",
                 "발롱도르":"🏆","영플레이어":"🌟","골든글러브":"🧤",
-                "신데렐라":"✨","푸스카스상":"💥","올해의 골":"💥","사모라상":"🛡️"}
+                "푸스카스상":"💥","올해의 골":"💥","사모라상":"🛡️"}
         
         for i, a in enumerate(awards):
             atype = a.get("award_type","")
