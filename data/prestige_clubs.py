@@ -116,6 +116,20 @@ PRESTIGE_TEAMS = {
 # (현실의 "명문팀도 가끔 훅 간다"를 재현하는 핵심 장치).
 PRESTIGE_WEIGHT = 6.0
 
+# [2026-07 신설, 신민용 리포트: "PRESTIGE_OVR_BONUS를 찾을 수 없다는
+# ImportError가 난다"] database._generate_team_players()/_target_ovr()가
+# 이 상수를 참조하고 있었는데 정의가 빠져 있었다. 명문팀 전용 OVR 직접
+# 보너스(에이스 목표 OVR에 가산)다. team_strength(순위 뽑기) 확률만으로는
+# 뽑기 운이 나쁘면 명문팀도 완전히 하위권 OVR을 받을 수 있어서, 뽑힌
+# 순위와 무관하게 최소한의 안전판을 더한다. _target_ovr()에서 top(리그
+# 상한) 계산 이후, ace 산출 단계에서 더해진다 — SS등급은 continent_bonus를
+# 0 이하로 클램프하는 별도 로직이 있어서(안 그러면 상한 100을 넘어갈 수
+# 있음), continent_bonus와 같은 자리에 더하면 이 보너스가 정작 필요한 EPL
+# 등 SS등급 명문팀에서 무효화된다 — 그래서 클램프 이후 단계에 별도로
+# 더하도록 설계돼 있다. 팀 간 전반 OVR 격차(ace_lo로 이미 좁혀둔 것)를
+# 과도하게 벌리지 않는 수준으로 3.0을 기본값으로 둔다.
+PRESTIGE_OVR_BONUS = 3.0
+
 
 def is_prestige(country: str, tier: int, team_name: str) -> bool:
     """[2026-07 버그수정, 신민용 리포트: "명문팀이 강등되는 경우가 너무

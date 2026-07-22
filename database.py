@@ -2204,12 +2204,12 @@ def _generate_all_ai_players(c, progress_cb=None):
     # [2026-07 신설, 신민용 확정] 명문팀 전용 team_strength 보너스. ace_lo
     # (팀 간 OVR 격차의 전체 폭)는 예전 지적("같은 1부인데 팀간 격차가
     # 너무 크다")대로 좁게 유지한다 — 이걸 다시 넓히면 명문팀 문제는
-    # 고쳐져도 관련 없는 일반 팀들 간의 격차 문제가 되살아난다. 대신
-    # 명문팀에만 "뽑은 순위와 무관하게" 최소한의 안전판을 얹는다 —
-    # weighted_team_order가 하위권 슬롯을 뽑아버리는 그 드문 경우에도
-    # 완전히 바닥까지 떨어지진 않게. 일반 팀의 team_strength 분포와
-    # 곡선 자체는 전혀 안 건드린다.
-    PRESTIGE_STRENGTH_BONUS = 0.25
+    # 고쳐져도 관련 없는 일반 팀들 간의 격차 문제가 되살아난다.
+    # [2026-07 정리] 명문팀 보정은 _target_ovr의 prestige_bonus 파라미터
+    # (SS등급 클램프를 피해가도록 설계된 쪽)로 일원화한다 — 한때 여기서도
+    # team_strength 자체를 올리는 별도 보너스를 썼는데, 그러면 두 메커니즘이
+    # 동시에 적용돼 이중 보정이 된다. team_strength 분포/곡선 자체는 순위
+    # 뽑기 결과 그대로 두고 건드리지 않는다.
     for lid, teams in leagues.items():
         n = len(teams)
         # [2026-07 신설] 완전 무작위 셔플 대신 명문팀 가중 셔플 — 명문팀
@@ -2223,8 +2223,6 @@ def _generate_all_ai_players(c, progress_cb=None):
         for rank, team_idx in enumerate(perm):
             team = teams[team_idx]
             team_strength = 1.0 - (rank / (n - 1)) if n > 1 else 1.0
-            if teams_info[team_idx]["prestige"]:
-                team_strength = min(1.0, team_strength + PRESTIGE_STRENGTH_BONUS)
             # [리그등급 분리] 국대 등급(grade) 대신 리그 전용 등급 사용
             from constants import get_league_grade
             league_grade = get_league_grade(team.get("cname", ""), team["grade"])
