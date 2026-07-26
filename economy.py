@@ -26,12 +26,16 @@ def _base_market_value_eok(ovr: int) -> float:
     안에서는 지수보간한다. 리그 재정력은 이 값에 ±20~30%만 얹는다
     (아래 _market_value_league_mult).
 
-    앵커(OVR, 억원): 60→0.1, 70→3, 75→8, 80→20, 85→60, 90→350,
-                     93→900, 96→1800, 99→3000 (역대급 월드클래스 상한권)
+    [2026-07 4차 재조정, 신민용 지적: "Elite(81~94)가 너무 넓은데 90부터
+    경제가 폭발하고 있다 — 90~94와 96~100 차이가 부족하다. 81~88 완만,
+    89~94 점진적 상승, 95~96 급격한 벽, 97~100 월드클래스 폭발 형태가
+    맞다"] 90 근처 값을 낮추고, 94→95→96 사이(엘리트 최상단→월드클래스
+    진입)를 훨씬 가파르게 벌렸다.
     """
     anchors = [
         (40, 0.02), (60, 0.1), (70, 3), (75, 8), (80, 20),
-        (85, 45), (88, 85), (90, 130), (93, 400), (96, 1200), (99, 2600),
+        (82, 35), (85, 80), (88, 200), (90, 400), (92, 850),
+        (94, 1500), (95, 2200), (96, 3000), (98, 4500), (100, 6000),
     ]
     if ovr <= anchors[0][0]:
         return anchors[0][1]
@@ -55,13 +59,28 @@ MARKET_VALUE_GRADE_MULT = {
     "C": 0.50, "D": 0.35, "E": 0.25, "F": 0.15,
 }
 MARKET_VALUE_COUNTRY_MULT = {
-    # 오일머니 리그: 연봉으로 스타를 영입하지만(SPECIAL_SALARY_COUNTRIES),
-    # 유럽 빅리그 대비 커리어 정점/이적 유동성이 낮게 평가돼 시장가치는
-    # 오히려 등급 대비 역보정된다.
-    "사우디아라비아": 0.55,
-    "카타르":        0.55,
-    "아랍에미리트":  0.55,
-    "브라질":        0.95,  # 실력은 S급이나 리그 잔류 유인이 약해 소폭 하향
+    # [2026-07 재조정, 신민용 지적: "사우디가 전부 ×0.55면 '기존 스타
+    # 이적'과 '22살 유망주 영입'을 구분 못 한다 — 알힐랄이 젊은 브라질
+    # 유망주를 700억에 사 오는 경우도 있는데, 국적만으로 저평가되는
+    # 셈"] 0.55(전체 역보정) → 0.8로 완화. 나이별 세분화(노장 0.55 /
+    # 유망주 1.0)는 ai_players에 나이 컬럼이 생겨야 가능해 5.2절 과제로
+    # 남긴다 — 지금은 그 중간값으로 절충.
+    "사우디아라비아": 0.8,
+    "카타르":        0.8,
+    "아랍에미리트":  0.8,
+    "브라질":        1.15,   # 유망주 생산·유럽 진출 전 단계 시장이 강함
+}
+
+
+# [2026-07 신설, 신민용 지적: "같은 OVR90이어도 ST가 CB보다 비싼 게
+# 현실"] 포지션별 시장가치 배수. position 인자가 없으면(하위호환) 1.0.
+POSITION_MARKET_MULT = {
+    # [2026-07 재조정, 신민용 지적: "반다이크·그바르디올·루벤 디아스처럼
+    # 최근 시장에서 CB도 공격수 못지않게 비싸다 — GK 0.75는 너무 FM식"]
+    "ST": 1.15, "CF": 1.15, "LW": 1.10, "RW": 1.10,
+    "CAM": 1.10, "CM": 1.00, "CDM": 1.00,
+    "LB": 0.95, "RB": 0.95, "LWB": 0.95, "RWB": 0.95,
+    "CB": 1.05, "GK": 0.85,
 }
 
 
@@ -72,18 +91,110 @@ def _market_value_league_mult(grade: str, country: str = None) -> float:
     return base
 
 
-def estimate_transfer_fee(grade, tier, ovr, country=None, team_name=None) -> int:
-    """선수 시장가치(이적료 추정치, 천원 단위). [2026-07 재설계] 연봉에서
-    파생시키지 않고 OVR(기본가치) × 리그재정력(20~30%만 반영)으로 독립
-    계산한다 — 연봉이 높다고 시장가치까지 비례해서 튀는 문제(사우디 등)를
-    구조적으로 차단한다. tier가 1이 아니면(2부 이하) 추가로 감가한다.
+def _market_value_prestige_mult(country: str = None, team_name: str = None,
+                                 tier: int = 1) -> float:
+    """[2026-07 신설, 신민용 지적: "명문팀 프리미엄은 연봉보다 오히려
+    시장가치(재판매가치·바이아웃) 쪽에 더 크게 붙는 게 현실 — 벤피카
+    유망주가 연봉은 낮아도 나중에 비싸게 팔린다"] 연봉 프리미엄
+    (PRESTIGE_SALARY_MULT)의 20%만 시장가치에도 얹는다(신민용 제안
+    5~15%보다 살짝 높게 잡되, 연봉만큼 크게 흔들지는 않도록 절반 이하로
+    제한 — 포르투갈 2.0배 연봉 프리미엄 → 시장가치는 +20%만 반영).
     """
+    if not (team_name and country):
+        return 1.0
+    from data.prestige_clubs import is_prestige, PRESTIGE_SALARY_MULT, PRESTIGE_SALARY_MULT_DEFAULT
+    if is_prestige(country, tier, team_name):
+        salary_mult = PRESTIGE_SALARY_MULT.get(country, PRESTIGE_SALARY_MULT_DEFAULT)
+        return 1.0 + (salary_mult - 1.0) * 0.2
+    return 1.0
+
+
+CONTRACT_MULT = {0: 0.6, 1: 0.75, 2: 0.9, 3: 1.0, 4: 1.1}
+CONTRACT_MULT_5PLUS = 1.2
+
+
+def _contract_mult(contract_remaining_years) -> float:
+    """[11차 설계] 계약기간 계수 — "선수 실력 보정"이 아니라 "판매
+    협상력 보정"이다. None(모름/AI 선수 등 데이터 없음)이면 1.0(중립).
+    0년(진짜 계약만료/FA)은 estimate_transfer_fee()에서 exit_type으로
+    먼저 걸러지므로 여기까지 오면 "계약 중이지만 얼마 안 남음"으로
+    취급한다."""
+    if contract_remaining_years is None:
+        return 1.0
+    if contract_remaining_years >= 5:
+        return CONTRACT_MULT_5PLUS
+    return CONTRACT_MULT.get(max(0, int(contract_remaining_years)), 1.0)
+
+
+def _age_mult(age) -> float:
+    """나이 계수 — "영향도 캡" 방식(순수 곱연산 폭주 방지). None이면 1.0."""
+    if age is None:
+        return 1.0
+    if age <= 21:
+        raw = 1.75
+    elif age <= 25:
+        raw = 1.35
+    elif age <= 29:
+        raw = 1.0
+    elif age <= 33:
+        raw = 0.8
+    else:
+        raw = 0.5
+    return 1.0 + (raw - 1.0) * 0.5   # 영향력을 절반으로 완화
+
+
+def potential_mult(current_ovr, talent_cap) -> float:
+    """잠재력 계수 — talent_cap(전성기 최대 OVR, 기존 필드 재사용)과
+    현재 OVR의 gap이 클수록(=아직 다 안 큰 유망주일수록) 프리미엄이
+    붙는다. gap에 current_ovr 비례 가중치(quality)를 곱해서, "현재
+    OVR70·gap25"인 선수가 "현재 OVR85·gap10"인 완성형 선수보다
+    비싸지는 역전을 완화한다."""
+    if not talent_cap or talent_cap <= current_ovr:
+        return 1.0
+    gap = talent_cap - current_ovr
+    quality = current_ovr / 100.0
+    return 1.0 + gap * 0.03 * quality
+
+
+def estimate_transfer_fee(grade, tier, ovr, country=None, team_name=None,
+                          position=None, exit_type=None, age=None,
+                          talent_cap=None, contract_remaining_years=None,
+                          debug=False):
+    """선수 시장가치(이적료 추정치, 천원 단위).
+
+    exit_type: [11차 신설] "계약만료"면 진짜 FA — 다른 계수 계산 없이
+      즉시 0을 반환한다(3.11/3.13절). "6개월 남음"과 "진짜 계약 끝남"을
+      contract_remaining_years 숫자만으로 구분하면 위험해서, 이 판정을
+      계산의 가장 첫 단계로 명시적으로 분리했다.
+    age, talent_cap, contract_remaining_years: [11차 신설] 없으면(None,
+      AI 선수 등) 전부 중립(1.0)으로 하위호환. my_player는 이미
+      age/talent_cap/contract_end_year 필드가 다 있어 바로 연결 가능.
+    """
+    if exit_type == "계약만료":
+        return 0
+
     base_eok = _base_market_value_eok(ovr)
-    mult = _market_value_league_mult(grade, country)
-    val_eok = base_eok * mult
+    league_mult = _market_value_league_mult(grade, country)
+    pos_mult = POSITION_MARKET_MULT.get(position, 1.0) if position else 1.0
+    prestige_mult = _market_value_prestige_mult(country, team_name, tier)
+    c_mult = _contract_mult(contract_remaining_years)
+    a_mult = _age_mult(age)
+    p_mult = potential_mult(ovr, talent_cap)
+
+    val_eok = (base_eok * league_mult * pos_mult * prestige_mult
+               * c_mult * a_mult * p_mult)
     if tier and tier >= 2:
         val_eok *= max(0.15, 0.55 ** (tier - 1))  # 2부 0.55x, 3부 0.30x ...
-    return int(val_eok * 100_000)  # 억원 -> 천원 단위로 환산(_calc_salary와 단위 통일)
+    final = int(val_eok * 100_000)  # 억원 -> 천원 단위(_calc_salary와 통일)
+
+    if debug:
+        return {"fee": final, "debug": {
+            "base_eok": base_eok, "league_mult": league_mult,
+            "position_mult": pos_mult, "prestige_mult": prestige_mult,
+            "contract_mult": c_mult, "age_mult": a_mult,
+            "potential_mult": p_mult,
+        }}
+    return final
 
 
 
@@ -144,7 +255,28 @@ def _tier_scaled_country_cap(country_cap, tier):
     return max(1, int(country_cap * ratio))
 
 
-def _clamp_salary_to_cap(sal, wealth, country=None, tier=1, is_special=False):
+def _cap_relief_mult(ovr) -> float:
+    """[2026-07 신설, 신민용 지적: "브라질이 OVR88 이상 전부 30억으로
+    고정 — 네이마르급도 그냥 준수한 선수랑 연봉이 똑같아진다"]
+    COUNTRY_SALARY_CAP은 나라 전체에 적용되는 평평한 고정 상한이라, 실측
+    앵커 곡선이 없는 나라(6개국 제외 전부)는 재능 등급이 아무리 올라가도
+    상한을 넘는 순간부터 연봉이 안 오르는 구조적 결함이 있었다.
+    평범~프로(OVR≤80) 구간은 원래 상한을 안전망으로 그대로 쓰고,
+    엘리트(81~94)·월드클래스(95+) 구간만 상한을 단계적으로 풀어준다.
+    """
+    if ovr is None or ovr <= 80:
+        return 1.0
+    if ovr < 90:
+        t = (ovr - 80) / 10.0
+        return 1.0 + t * 0.8          # 80→90: 1.0배 → 1.8배
+    if ovr < 95:
+        t = (ovr - 90) / 5.0
+        return 1.8 + t * 1.2          # 90→95: 1.8배 → 3.0배
+    t = min(1.0, (ovr - 95) / 5.0)
+    return 3.0 + t * 3.0              # 95→100: 3.0배 → 6.0배
+
+
+def _clamp_salary_to_cap(sal, wealth, country=None, tier=1, is_special=False, ovr=None):
     """[버그수정 2026-07, 신민용 지적] 등급/국가별 연봉 상한 최종 안전망.
 
     _calc_salary는 자기 내부에서만 캡을 체크하는데, 재계약 협상 성공
@@ -166,21 +298,26 @@ def _clamp_salary_to_cap(sal, wealth, country=None, tier=1, is_special=False):
     지키는데, 이 clamp 함수는 그 우선순위를 무시하고 낮은 범용 캡으로 먼저
     눌러버려서 오퍼 화면에 뜨는 실제 금액이 항상 200억으로 뭉개졌다 —
     country_cap이 있으면 그걸 우선(더 낮은 범용 캡을 추가로 덧씌우지 않음),
-    없을 때만 범용 캡을 쓰도록 순서를 맞춘다."""
+    없을 때만 범용 캡을 쓰도록 순서를 맞춘다.
+
+    [버그수정 2026-07 #3, 신민용 지적: "브라질 OVR88+ 전부 30억 고정"]
+    ovr 인자가 주어지면 _cap_relief_mult로 엘리트/월드클래스 구간의 상한을
+    완화한다. 기본값 None → 기존 호출부는 하위호환(완화 없음)."""
     from constants import COUNTRY_SALARY_CAP, LOWER_TIER_SALARY_CAP
+    relief = _cap_relief_mult(ovr)
     country_cap = COUNTRY_SALARY_CAP.get(country, 0) if (country and not is_special) else 0
     if country_cap > 0:
-        sal = min(sal, _tier_scaled_country_cap(country_cap, tier))
+        sal = min(sal, int(_tier_scaled_country_cap(country_cap, tier) * relief))
     else:
         cap = _tier_scaled_country_cap(_salary_cap_table().get(wealth, 0), tier)
         if cap > 0:
-            sal = min(sal, cap)
+            sal = min(sal, int(cap * relief))
     if country and not is_special and tier >= 2:
         _lt = LOWER_TIER_SALARY_CAP.get(country, {})
         if _lt:
             lt_cap = _lt.get(tier, _lt[max(_lt.keys())])
             if lt_cap > 0:
-                sal = min(sal, lt_cap)
+                sal = min(sal, int(lt_cap * relief))
     return max(0, int(sal))
 
 
@@ -308,18 +445,23 @@ def _calc_salary(grade, tier, ovr, country=None, team_name=None):
     # 비율로 tier 스케일을 적용한다.
     cap = _tier_scaled_country_cap(_salary_cap.get(wealth, 0), tier)
     if cap > 0:
-        sal = min(sal, cap)
+        sal = min(sal, int(cap * _cap_relief_mult(ovr)))
     # [버그수정] 나라별 연봉 상한 적용 (COUNTRY_SALARY_CAP)
     #   constants.py에 정의돼 있었으나 _calc_salary에서 import/적용이 누락됐었음.
     # [버그수정 2026-07, 신민용 지적: "K1이랑 K2가 둘 다 30억으로 고정"]
     #   이 캡이 tier를 구분 안 해서, LOWER_TIER_SALARY_CAP이 따로 없는
     #   나라(대한민국 등 대부분)는 1부든 2부든 OVR만 높으면 똑같은 국가
     #   상한에 눌렸다. tier별로 비율을 낮춰 적용한다.
+    # [버그수정 2026-07 #2, 신민용 지적: "브라질이 OVR88 이상 전부 30억으로
+    #   고정 — 네이마르급도 그냥 준수한 선수랑 똑같아진다"] 이 캡도 OVR을
+    #   전혀 구분 안 해서, 실측 앵커 곡선이 없는 나라(6개국 제외 전부)는
+    #   엘리트 이상 구간이 통째로 평평해지고 있었다. _cap_relief_mult로
+    #   엘리트(81~94)·월드클래스(95+) 구간만 상한을 단계적으로 풀어준다.
     if country and not is_special:
         from constants import COUNTRY_SALARY_CAP
         country_cap = COUNTRY_SALARY_CAP.get(country, 0)
         if country_cap > 0:
-            sal = min(sal, _tier_scaled_country_cap(country_cap, tier))
+            sal = min(sal, int(_tier_scaled_country_cap(country_cap, tier) * _cap_relief_mult(ovr)))
     # [버그수정] 양극화 리그(SALARY_CURVE_OVERRIDE 적용국)는 tier1만 재계산돼서
     #   COUNTRY_SALARY_CAP이 tier1 기준 안전망(예: 잉글랜드 550억)으로 상향됐다.
     #   그 캡이 2부 이하에도 그대로 적용되면 "1부보다 2부가 더 비싼" 역전이

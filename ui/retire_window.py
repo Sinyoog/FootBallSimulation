@@ -196,6 +196,15 @@ class RetireWindow(QDialog):
         else:
             stat2 = ("골", f"{p.get('total_goals',0)}")
             stat3 = ("어시", f"{p.get('total_assists',0)}")
+        # [2026-07 신설] 최고 이적료 — career_entries.transfer_fee 중 최댓값.
+        # 이적료가 아예 없었으면(전부 0, FA/유스승격만) 카드 자체를 생략한다.
+        try:
+            _max_fee = max((e.get("transfer_fee", 0) for e in
+                            [dict(r) for r in get_conn().execute(
+                                "SELECT transfer_fee FROM career_entries").fetchall()]),
+                           default=0)
+        except Exception:
+            _max_fee = 0
         stats = [
             ("출전", f"{p.get('total_matches',0)}경기"),
             stat2, stat3,
@@ -204,6 +213,8 @@ class RetireWindow(QDialog):
             ("누적수입", fmt_money(p.get('total_earnings',0))),  # 이슈10
             ("전성기OVR", str(p.get('peak_ovr', p.get('ovr',0)))),
         ]
+        if _max_fee > 0:
+            stats.append(("최고이적료", fmt_money(_max_fee)))
         for k, v in stats:
             sw = QFrame(); sl = QVBoxLayout(sw); sl.setContentsMargins(4,4,4,4)
             kl = QLabel(k); kl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -458,6 +469,9 @@ class RetireWindow(QDialog):
                 "유효":    str(e.get("shots_on", 0)),
             }
             stat_vals = [_val_map.get(sc, "—") for sc in stat_cols]
+            # [2026-07 신설, 신민용 요청] 0경기 항목은 세부 스탯 전부 "—".
+            if e.get("matches", 0) == 0:
+                stat_vals = ["—"] * len(stat_vals)
             
             # 계약 컬럼: 팀 변경 또는 연장 시에만 년수 표시
             cur_team = e.get("team_name", "")
@@ -538,6 +552,18 @@ class RetireWindow(QDialog):
             return lbl
 
         def _is_empty_short(e):
+            # [버그수정 2026-07, 신민용 리포트: "시즌 시작 전에 바로
+            # 이적하면 원래 있던 팀이 커리어에서 아예 안 보인다"] 이
+            # 필터는 원래 '같은 재직의 스퓨리어스 중복 행'(이벤트 없이
+            # 잔류만 하는데 실수로 새 행이 또 생기는 버그, transfer_type=
+            # '')을 숨기려는 목적이었다. 그런데 진짜 이적/입단/오퍼
+            # 이벤트(transfer_type이 채워짐)로 생긴 항목도 우연히 기간이
+            # 짧으면(0경기) 똑같이 걸러져서, "2001-01-01 입단 → 01-15
+            # 오퍼로 즉시 이적" 같은 정상적인 실제 기록까지 함께
+            # 사라졌다. transfer_type이 실제로 채워져 있으면(진짜
+            # 이벤트) 기간과 무관하게 항상 보여준다.
+            if e.get("transfer_type"):
+                return False
             if e.get("end_year", 0) == 0:  return False
             if e.get("matches", 0) != 0:   return False
             sy = e.get("start_year", 0); ey = e.get("end_year", 0)

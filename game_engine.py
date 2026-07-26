@@ -1032,18 +1032,44 @@ def _ensure_career_entry(p, st):
     role_e   = p.get("contract_role", "")
     mgr_e    = p.get("manager_type", "")
     amb_e    = p.get("club_ambition", "")
+
+    # [버그수정 2026-07, 신민용 리포트: "오퍼는 이적료가 뜨는데 커리어엔
+    # 안 뜬다"] 실제 새 커리어 행 INSERT는 _save_career_entry()가 아니라
+    # 이 함수(_ensure_career_entry, 입단/이적 후 첫 4주 진행 시 호출)가
+    # 담당하고 있었다 — _save_career_entry 쪽에만 이적료 계산을 넣어서
+    # 실제로는 한 번도 실행되지 않는 코드였다. 여기서도 동일하게
+    # "이적"/"오퍼"일 때만 계산하고, 그 외(입단/임대/연장)는 0.
+    _transfer_fee_e = 0
+    if tt_e in ("이적", "오퍼"):
+        _country_e = c.execute(
+            "SELECT cn.name FROM leagues l JOIN countries cn ON l.country_id=cn.id WHERE l.id=?",
+            (team_row["lid"],)).fetchone()
+        _country_e = _country_e["name"] if _country_e else None
+        _grade_e = get_league_grade(_country_e, "") if _country_e else None
+        _contract_end_e = p.get("contract_end_year", 0)
+        _cur_year_e = st["current_year"]
+        _remain_e = (max(0, _contract_end_e - _cur_year_e)
+                     if _contract_end_e else None)
+        _transfer_fee_e = estimate_transfer_fee(
+            _grade_e, tier_e, p.get("ovr", 0),
+            country=_country_e, team_name=team_row["name"],
+            position=get_field_pos(p), age=p.get("age"),
+            talent_cap=p.get("talent_cap"),
+            contract_remaining_years=_remain_e,
+        )
+
     c.execute("""INSERT INTO career_entries
         (age, position, team_name, league_name, tier, salary,
          start_year, start_week, end_year, end_week,
          matches, goals, assists, avg_rating, team_rank, wins, draws, losses,
          contract_years, transfer_type, team_id,
-         contract_role, manager_type, club_ambition)
-        VALUES (?,?,?,?,?,?,?,?,0,0,0,0,0,0,0,0,0,0,?,?,?,?,?,?)""",
+         contract_role, manager_type, club_ambition, transfer_fee)
+        VALUES (?,?,?,?,?,?,?,?,0,0,0,0,0,0,0,0,0,0,?,?,?,?,?,?,?)""",
         (p["age"], get_field_pos(p), team_row["name"], team_row["lname"],
          tier_e, p.get("salary",0),
          st["current_year"], st["current_week"],
          c_yrs_e, tt_e, tid,
-         role_e, mgr_e, amb_e))
+         role_e, mgr_e, amb_e, _transfer_fee_e))
     conn.commit()
     conn.close()
 
@@ -8255,6 +8281,23 @@ def _enrich_offer(o: dict, row) -> dict:
 
     # 감독 성향 (입단 전 미리 노출 → 결정에 활용)
     o["manager_type"] = random.choices(MANAGER_TYPE_LIST, MANAGER_TYPE_WEIGHTS)[0]
+
+    # [2026-07 신설] 이적료 — 지금 소속팀이 있으면(=계약 중인데 다른 팀이
+    # 오퍼) 유료 이적으로 보고 계산, 무소속(계약만료/방출 후 apply_window로
+    # 직접 지원)이면 FA라 이적료 0(0.1절 규칙 — "입단"은 항상 0).
+    if p.get("current_team_id", 0):
+        _contract_end = p.get("contract_end_year", 0)
+        _cur_year = p.get("current_year", 0)
+        _remain = (max(0, _contract_end - _cur_year)
+                   if (_contract_end and _cur_year) else None)
+        o["transfer_fee"] = estimate_transfer_fee(
+            o.get("grade"), o["tier"], my_ovr, country=o["country"],
+            team_name=o["team_name"], position=get_field_pos(p),
+            age=my_age, talent_cap=p.get("talent_cap"),
+            contract_remaining_years=_remain,
+        )
+    else:
+        o["transfer_fee"] = 0
     return o
 
 
@@ -8438,7 +8481,7 @@ from economy import (
 
 
 def _save_career_entry(p, year, week, force_new=False, transfer_type=None,
-                       allow_insert=True, exit_type=""):
+                       allow_insert=True, exit_type="", transfer_fee=None):
     """커리어 기록 업데이트.
     force_new=True: 이전 팀 기록 확정 (end_year 채움)
     force_new=False: 시즌 종료 시 현재 팀 기록 업데이트
@@ -8447,6 +8490,13 @@ def _save_career_entry(p, year, week, force_new=False, transfer_type=None,
          유령 중복 행이 생기는 것 방지)
     exit_type: 그 팀에서 떠난 경로('팔림'/'방출'/'이적'/'계약만료'/''=재직중).
         이미 닫힌 항목이어도 exit_type이 있으면 그 행에 덧칠한다.
+    transfer_fee: [2026-07 신설] 이 팀에 들어올 때(새 커리어 행이 INSERT될
+        때만 의미 있음) 지불된 이적료. None이면 transfer_type이 "이적"일
+        때만 economy.estimate_transfer_fee()로 자동 계산하고, 그 외
+        (입단/임대/연장)는 0 — transfer_type/exit_type(어떻게 왔는지)과
+        완전히 별개 축이라 항상 같이 저장하되, "입단"(FA 포함)은 이적료가
+        없는 게 정상이라 자동으로 0이 된다. 명시적으로 값을 넘기면 그
+        값을 그대로 쓴다(기존 행 UPDATE 시 값 보존 등에 사용 가능).
     """
     tid = p.get("current_team_id", 0)
     if not tid: return
@@ -8455,8 +8505,9 @@ def _save_career_entry(p, year, week, force_new=False, transfer_type=None,
     c = conn.cursor()
 
     # 팀/리그 정보 (이적 전 팀이므로 tid 기준)
-    team_row = c.execute("""SELECT t.name, l.name as lname, l.tier
+    team_row = c.execute("""SELECT t.name, l.name as lname, l.tier, cn.name as country
                             FROM teams t JOIN leagues l ON t.league_id=l.id
+                            JOIN countries cn ON t.country_id=cn.id
                             WHERE t.id=?""", (tid,)).fetchone()
     if not team_row:
         conn.close(); return
@@ -8531,20 +8582,45 @@ def _save_career_entry(p, year, week, force_new=False, transfer_type=None,
         c_yrs_save     = p.get("contract_years", 0)
 
         saved_tier = p.get("current_tier") or team_row["tier"]
+
+        # [2026-07 신설] 이적료 자동 계산 — "이적"(계약 중 유료 이적)일 때만
+        # 계산하고, 입단(첫 계약/FA 포함)·임대·연장은 0. 명시적으로 넘겨받은
+        # 값이 있으면 그걸 우선한다(하위호환 + 값 보존용).
+        if transfer_fee is None:
+            # [버그수정 2026-07, 신민용 리포트: "오퍼는 이적료가 뜨는데
+            # 커리어엔 안 뜬다"] join_team()이 실제로 넘기는 유료 이적
+            # transfer_type 값은 "이적"이 아니라 "오퍼"(center_panel.py의
+            # _on_auto_offer_done)였다 — "이적"은 나갈 때(exit_type)만
+            # 쓰이는 값이라 조건이 항상 거짓이었음. 둘 다 받아준다.
+            if pending_tt in ("이적", "오퍼"):
+                _grade = get_league_grade(team_row["country"], "")
+                _contract_end = p.get("contract_end_year", 0)
+                _remain = (max(0, _contract_end - cur_year)
+                           if _contract_end else None)
+                transfer_fee = estimate_transfer_fee(
+                    _grade, saved_tier, p.get("ovr", 0),
+                    country=team_row["country"], team_name=team_row["name"],
+                    position=get_field_pos(p), age=p.get("age"),
+                    talent_cap=p.get("talent_cap"),
+                    contract_remaining_years=_remain,
+                )
+            else:
+                transfer_fee = 0
+
         c.execute("""INSERT INTO career_entries
             (age, position, team_name, league_name, tier, salary,
              start_year, start_week, end_year, end_week,
              matches, goals, assists, saves, goals_against,
              avg_rating, team_rank, wins, draws, losses,
              contract_years, transfer_type, clean_sheets, team_id,
-             contract_role, manager_type, club_ambition, exit_type)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             contract_role, manager_type, club_ambition, exit_type, transfer_fee)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (p["age"], pos, team_row["name"], team_row["lname"], saved_tier,
              p.get("salary", 0), cur_year, cur_week,
              year, week, sm, sg, sa, ss, sga, avg_r, rn, tw, td, tl,
              c_yrs_save, pending_tt, cs, tid,
              p.get("contract_role",""), p.get("manager_type",""), p.get("club_ambition",""),
-             exit_type))
+             exit_type, transfer_fee))
 
     conn.commit()
     conn.close()
@@ -8632,6 +8708,16 @@ def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None
     # 이전 팀 커리어 기록 확정 (end_year=0인 항목 닫기)
     if p and p.get("current_team_id") and p["current_team_id"] != team_id:
         prev_tid = p["current_team_id"]
+        # [버그수정 2026-07, 신민용 리포트: "시즌 시작 전 오퍼로 바로 이적하면
+        # 원래 있던 팀이 커리어에 아예 안 뜬다"] 새 팀 커리어 항목은 첫 4주
+        # 진행 시(_ensure_career_entry)에야 비로소 생성되는데, 그 전에
+        # (즉 이전 팀에서 단 한 번도 _ensure_career_entry가 안 불린 채로)
+        # 바로 다른 팀 오퍼를 수락하면 전역 _pending_transfer_type이 아래서
+        # 새 값으로 덮어써지기 전에, 이전 팀 몫의 항목을 먼저 만들어둬야
+        # 한다 — 안 그러면 "입단"이었다는 기록 자체가 통째로 사라진다.
+        global _pending_transfer_type
+        if _pending_transfer_type:
+            _ensure_career_entry(p, st)
         # (변경) 시즌 중 이적 시 이전 팀에 우승을 주지 않는다.
         # 우승은 시즌 종료 시점 소속팀이 1위일 때만 인정된다.
         # 떠난 경로: 계약이 아직 남았는데 옮기면 '이적', 만료됐으면 '계약만료'
@@ -8688,7 +8774,9 @@ def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None
         c_end = cur_year + c_yrs - 1
     else:
         c_end = cur_year + c_yrs
-    global _pending_transfer_type
+    # (global _pending_transfer_type은 위에서 이미 선언됨 — 같은 함수 내
+    # 중복 global 선언은 "used prior to global declaration" SyntaxError를
+    # 유발하므로 여기서는 대입만 한다)
     _pending_transfer_type = transfer_type
 
     # ── [기능1+2] 오퍼 맥락 반영 ─────────────────────────────

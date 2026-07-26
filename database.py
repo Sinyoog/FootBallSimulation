@@ -411,7 +411,8 @@ def init_db():
         goals_against INTEGER DEFAULT 0,
         avg_rating REAL DEFAULT 0,
         team_rank INTEGER DEFAULT 0,
-        wins INTEGER DEFAULT 0, draws INTEGER DEFAULT 0, losses INTEGER DEFAULT 0)""")
+        wins INTEGER DEFAULT 0, draws INTEGER DEFAULT 0, losses INTEGER DEFAULT 0,
+        transfer_fee INTEGER DEFAULT 0)""")
     c.execute("""CREATE TABLE IF NOT EXISTS promotion_log(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         year INTEGER, team_name TEXT, from_tier INTEGER,
@@ -652,6 +653,11 @@ def init_db():
         "ALTER TABLE my_player ADD COLUMN agent_fee_rate REAL DEFAULT 0",
         "ALTER TABLE career_entries ADD COLUMN contract_years INTEGER DEFAULT 0",
         "ALTER TABLE career_entries ADD COLUMN transfer_type TEXT DEFAULT '입단'",
+        # [2026-07 신설] 이적료(transfer_fee) — transfer_type/exit_type(어떻게
+        # 왔는지)과는 별개 축(얼마에 왔는지). FA(계약만료)면 자연스럽게 0.
+        # 과거 특정 거래 시점의 값을 그대로 고정 저장한다(현재 시장가치처럼
+        # 매번 재계산하지 않음 — 나중에 OVR이 바뀌어도 그때 값 그대로 유지).
+        "ALTER TABLE career_entries ADD COLUMN transfer_fee INTEGER DEFAULT 0",
         "ALTER TABLE career_entries ADD COLUMN clean_sheets INTEGER DEFAULT 0",
         "ALTER TABLE career_entries ADD COLUMN team_id INTEGER DEFAULT 0",
         "ALTER TABLE my_player ADD COLUMN intl_caps INTEGER DEFAULT 0",

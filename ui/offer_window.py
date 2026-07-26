@@ -277,7 +277,7 @@ class OfferWindow(QDialog):
         h2.addStretch()
         lay.addLayout(h2)
 
-        # ── 행3: 연봉 + 계약 기간 ────────────────────────────
+        # ── 행3: 연봉 + 이적료 + 계약 기간 ────────────────────
         from game_engine import _calc_contract_years, get_player
         p_now = get_player()
         age_now = p_now.get("age", 17) if p_now else 17
@@ -288,9 +288,17 @@ class OfferWindow(QDialog):
             f"💰 연 {fmt_money(_sal)}  [월 {fmt_money(max(1, _sal // 12))}]")
         sl = QLabel(_sal_txt)
         sl.setStyleSheet("color:#00cc44;")
+        h3.addWidget(sl)
+        # [2026-07 신설] 이적료 표시 — 무소속(FA) 지원이면 0이라 아예 안
+        # 보여주고, 계약 중인데 오퍼가 왔으면(=유료 이적) 표시한다.
+        _fee = offer.get("transfer_fee", 0)
+        if _fee:
+            fl = QLabel(f"🔄 이적료 {fmt_money(_fee)}")
+            fl.setStyleSheet("color:#66aaff; font-size:11px;")
+            h3.addWidget(fl)
         cl = QLabel(f"📋 {c_yrs}년 계약")
         cl.setStyleSheet("color:#ffcc44; font-size:11px;")
-        h3.addWidget(sl); h3.addStretch(); h3.addWidget(cl)
+        h3.addStretch(); h3.addWidget(cl)
         lay.addLayout(h3)
 
         # ── 행4: 성적 ─────────────────────────────────────────

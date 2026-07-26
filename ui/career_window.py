@@ -229,6 +229,18 @@ class CareerWindow(QDialog):
         # 이슈3: 1~4주차 이적 노이즈만 숨김 (4주 이하 머문 0경기 항목)
         # 여름 이적시장(37주~) 입단처럼 경기 없이 보낸 정상 재직 기간은 표시
         def _is_empty_short(e):
+            # [버그수정 2026-07, 신민용 리포트: "시즌 시작 전에 바로
+            # 이적하면 원래 있던 팀이 커리어에서 아예 안 보인다"] 이
+            # 필터는 원래 '같은 재직의 스퓨리어스 중복 행'(이벤트 없이
+            # 잔류만 하는데 실수로 새 행이 또 생기는 버그, transfer_type=
+            # '')을 숨기려는 목적이었다. 그런데 진짜 이적/입단/오퍼
+            # 이벤트(transfer_type이 채워짐)로 생긴 항목도 우연히 기간이
+            # 짧으면(0경기) 똑같이 걸러져서, "2001-01-01 입단 → 01-15
+            # 오퍼로 즉시 이적" 같은 정상적인 실제 기록까지 함께
+            # 사라졌다. transfer_type이 실제로 채워져 있으면(진짜
+            # 이벤트) 기간과 무관하게 항상 보여준다.
+            if e.get("transfer_type"):
+                return False
             if e.get("end_year", 0) == 0:  return False  # 현재 팀
             if e.get("matches", 0) != 0:   return False
             sy = e.get("start_year", 0); ey = e.get("end_year", 0)
@@ -298,6 +310,13 @@ class CareerWindow(QDialog):
                 "유효":    str(e.get("shots_on", 0)),
             }
             stat_vals = [_val_map.get(sc, "—") for sc in stat_cols]
+            # [2026-07 신설, 신민용 요청: "연봉까지만 뜨고 출전 이런거 다
+            # 빈칸으로"] 출전 0경기(방금 입단/이적해서 아직 안 뛴 경우)면
+            # 세부 스탯을 전부 "—"로 덮어쓴다 — 숫자 0은 "0경기 뛰고
+            # 0골 넣었다"처럼 보이지만, 실제로는 "아직 데이터 없음"이
+            # 맞는 의미라서 구분한다.
+            if e.get("matches", 0) == 0:
+                stat_vals = ["—"] * len(stat_vals)
 
             tn = e.get("team_name","")
             ln = e.get("league_name","")
@@ -329,6 +348,15 @@ class CareerWindow(QDialog):
                 else:
                     dur = "진행중"
                 t_type = f"{_label}({dur})"
+            # [2026-07 신설] 이적료 표시 — transfer_type/exit_type(어떻게
+            # 왔는지)과 별개 축인 transfer_fee(얼마에 왔는지)를 괄호로
+            # 덧붙인다. transfer_fee는 실제 "이적"(유료 이적) 행에만
+            # 0보다 큰 값이 저장돼 있고, 그 외(입단/FA/임대/연장/같은 팀
+            # 재직 중 행)는 자연히 0이라 별도 블랭크 규칙 없이 조건 하나로
+            # 충분하다(계약 컬럼처럼 팀 변경 여부를 따로 볼 필요 없음).
+            _fee = e.get("transfer_fee", 0)
+            if _fee:
+                t_type = f"{t_type} ({fmt_money(_fee)})"
             cur_team = e.get("team_name", "")
 
             # 계약 컬럼: 팀 변경 또는 연장 시에만 년수 표시
@@ -384,6 +412,18 @@ class CareerWindow(QDialog):
             lay.addWidget(QLabel("기록 없음")); return w
 
         def _is_empty_short(e):
+            # [버그수정 2026-07, 신민용 리포트: "시즌 시작 전에 바로
+            # 이적하면 원래 있던 팀이 커리어에서 아예 안 보인다"] 이
+            # 필터는 원래 '같은 재직의 스퓨리어스 중복 행'(이벤트 없이
+            # 잔류만 하는데 실수로 새 행이 또 생기는 버그, transfer_type=
+            # '')을 숨기려는 목적이었다. 그런데 진짜 이적/입단/오퍼
+            # 이벤트(transfer_type이 채워짐)로 생긴 항목도 우연히 기간이
+            # 짧으면(0경기) 똑같이 걸러져서, "2001-01-01 입단 → 01-15
+            # 오퍼로 즉시 이적" 같은 정상적인 실제 기록까지 함께
+            # 사라졌다. transfer_type이 실제로 채워져 있으면(진짜
+            # 이벤트) 기간과 무관하게 항상 보여준다.
+            if e.get("transfer_type"):
+                return False
             if e.get("end_year", 0) == 0:  return False
             if e.get("matches", 0) != 0:   return False
             sy = e.get("start_year", 0); ey = e.get("end_year", 0)
