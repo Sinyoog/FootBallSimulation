@@ -196,6 +196,11 @@ class CenterPanel(QWidget):
         self._build()
         # 세이브에 저장된 메인 화면 상태(모드/묶음/콤보)를 복원한다.
         self._restore_ui_state()
+        # [2026-07 신설, 신민용 요청] 오퍼/입단 창을 결정 내리기 전에 껐다
+        # 켰다면(또는 창이 열린 채로 앱이 종료됐다면), 새로 랜덤 생성하지
+        # 않고 저장된 상태 그대로 창을 다시 띄운다(재접속 오퍼 리롤 방지).
+        # 위젯이 완전히 표시된 뒤 뜨도록 한 틱 지연시킨다.
+        QTimer.singleShot(0, self._restore_pending_offer_window)
 
     # ── 빌드 ─────────────────────────────────────
 
@@ -1714,14 +1719,21 @@ class CenterPanel(QWidget):
             return
         self._join_used = True
         self.btn_join.setEnabled(False)
-        offers = generate_offers()  # [2026-07] 개수는 이제 함수 내부 고정값(자국10+타국6)이 결정
+        # [2026-07 신설, 신민용 요청] 결정 전에 껐다 켰을 때 오퍼가 새로
+        # 랜덤 생성되는(=재접속 리롤) 걸 막기 위해, 저장된 상태가 있으면
+        # 그걸 그대로 복원해서 쓰고 없을 때만 새로 생성한다.
+        from game_engine import load_pending_offer_state
+        restore = load_pending_offer_state(kind="join")
+        offers = restore.get("offers", []) if restore else generate_offers()
+        # [2026-07] 개수는 이제 함수 내부 고정값(자국10+타국6)이 결정
         from ui.offer_window import OfferWindow
         # 이 창은 소속 팀이 없을 때만 뜨므로(위에서 이미 체크) 첫 입단이든
         # 퇴출/계약종료 후 재입단이든 항상 강제 입단 모드로 띄운다.
         # force_select=False면 닫기로 그냥 빠져나갈 수 있는데, 그러면 입단할
         # 곳이 없는 채로 진행이 막히거나 강제 은퇴로 이어질 수 있다.
         dlg = OfferWindow(offers, p.get("language","ko"), self,
-                          title="🏟 팀 입단", force_select=True, grid=True, apply_slots=4)
+                          title="🏟 팀 입단", force_select=True, grid=True, apply_slots=4,
+                          kind="join", restore_state=restore)
         self._offer_dlg = dlg
         # 모달로 띄워 다이얼로그가 열려 있는 동안 진행(next day)을 차단.
         # 비모달(show)이면 오퍼창을 띄운 채 시간을 더 진행시킨 뒤 수락할 수 있어
@@ -1737,6 +1749,13 @@ class CenterPanel(QWidget):
                        "#cc6600", 2200)
             if self.main_win: self.main_win.refresh_all()
             return
+        if not dlg.chosen:
+            # [2026-07 신설, 신민용 지적: "왜 닫기를 잠궈버렸어"] 팀을 안
+            # 고르고 그냥 닫은 경우 — 오퍼 상태는 저장돼 있으니(dlg.reject()
+            # 참고) 버튼을 다시 눌러 열면 완전히 같은 목록이 그대로 뜬다.
+            self._join_used = False
+            self.btn_join.setEnabled(True)
+            return
         self._on_join_done(dlg)
 
     def _on_join_done(self, dlg):
@@ -1746,28 +1765,36 @@ class CenterPanel(QWidget):
 
     def _show_auto_offer(self, week: int):
         """소속 있을 때 자동 오퍼 팝업 (이적시장: 여름 1~3주, 겨울 28~29주)."""
-        from game_engine import _offer_probability
+        from game_engine import _offer_probability, load_pending_offer_state
         p = get_player()
         if not p or not p.get("current_team_id"): return
         if self._auto_offer_shown: return
 
-        # [오퍼 토글] 꺼져 있으면 자동 오퍼 팝업을 건너뛴다.
-        #   단, '이적 요청' 중이면 사용자가 명시적으로 이적을 원한다는 뜻이므로
-        #   토글과 무관하게 오퍼를 계속 보여준다.
-        if not p.get("offers_enabled", 1) and not p.get("transfer_requested"):
-            return
+        # [2026-07 신설, 신민용 요청] 저장된 오퍼 상태가 있으면(결정 전에
+        # 껐다 켠 경우) 확률/토글 체크를 다시 하지 않고 그대로 복원한다 —
+        # 이미 한 번 통과해서 뜬 오퍼이므로 재판정하면 안 된다.
+        restore = load_pending_offer_state(kind="auto_offer")
+        if restore:
+            offers = restore.get("offers", [])
+        else:
+            # [오퍼 토글] 꺼져 있으면 자동 오퍼 팝업을 건너뛴다.
+            #   단, '이적 요청' 중이면 사용자가 명시적으로 이적을 원한다는 뜻이므로
+            #   토글과 무관하게 오퍼를 계속 보여준다.
+            if not p.get("offers_enabled", 1) and not p.get("transfer_requested"):
+                return
 
-        prob = _offer_probability(p, week)
-        import random
-        if random.random() > prob:
-            return  # 이번 구간 오퍼 없음
+            prob = _offer_probability(p, week)
+            import random
+            if random.random() > prob:
+                return  # 이번 구간 오퍼 없음
+
+            offers = generate_offers()
+            if not offers: return
 
         self._auto_offer_shown = True
-        offers = generate_offers()
-        if not offers: return
-
         from ui.offer_window import OfferWindow
-        dlg = OfferWindow(offers, p.get("language","ko"), self, title="✈ 오퍼", grid=True)
+        dlg = OfferWindow(offers, p.get("language","ko"), self, title="✈ 오퍼", grid=True,
+                          kind="auto_offer", restore_state=restore)
         self._offer_dlg = dlg
         # 모달(exec)로 띄워 오퍼창이 열려 있는 동안 next day 진행을 차단.
         dlg.exec()
@@ -1777,6 +1804,66 @@ class CenterPanel(QWidget):
         if dlg.chosen:
             join_team(dlg.chosen["team_id"], dlg.chosen["salary"], transfer_type="오퍼")
             if self.main_win: self.main_win.refresh_all()
+
+    def _restore_pending_offer_window(self):
+        """[2026-07 신설, 신민용 요청] 앱 시작 시 저장된 오퍼 상태가 있으면
+        (결정을 내리기 전에 게임을 껐다 켠 경우) 새로 뽑지 않고 그 상태
+        그대로 오퍼/입단 창을 다시 띄운다 — _do_join/_show_auto_offer와
+        각각 동일한 흐름을 그대로 재현한다."""
+        from game_engine import load_pending_offer_state, clear_pending_offer_state
+        restore = load_pending_offer_state()
+        if not restore:
+            return
+        p = get_player()
+        if not p:
+            return
+        kind = restore.get("kind")
+        from ui.offer_window import OfferWindow
+
+        if kind == "join":
+            if p.get("current_team_id"):
+                # 이미 소속 팀이 생긴 비정상 상태 — 남은 상태만 정리.
+                clear_pending_offer_state()
+                return
+            self._join_used = True
+            self.btn_join.setEnabled(False)
+            dlg = OfferWindow(restore.get("offers", []), p.get("language", "ko"), self,
+                              title=restore.get("title", "🏟 팀 입단"),
+                              force_select=restore.get("force_select", True),
+                              grid=restore.get("grid", True),
+                              apply_slots=restore.get("apply_slots", 4),
+                              kind="join", restore_state=restore)
+            self._offer_dlg = dlg
+            dlg.exec()
+            if not dlg.chosen and getattr(dlg, "all_failed", False):
+                self._skip_join_lock = True
+                self._join_used = True
+                self.btn_join.setEnabled(False)
+                show_toast(self, "📅 모든 협상 결렬 — 올해는 입단을 보류하고 1년 더 훈련합니다.",
+                           "#cc6600", 2200)
+                if self.main_win: self.main_win.refresh_all()
+                return
+            if not dlg.chosen:
+                # 팀을 안 고르고 그냥 닫은 경우 — 상태는 저장돼 있으니 버튼을
+                # 다시 눌러 열면 완전히 같은 목록이 그대로 뜬다.
+                self._join_used = False
+                self.btn_join.setEnabled(True)
+                return
+            self._on_join_done(dlg)
+
+        elif kind == "auto_offer":
+            if not p.get("current_team_id"):
+                # 소속이 없어진(방출 등) 비정상 상태 — 남은 상태만 정리.
+                clear_pending_offer_state()
+                return
+            self._auto_offer_shown = True
+            dlg = OfferWindow(restore.get("offers", []), p.get("language", "ko"), self,
+                              title=restore.get("title", "✈ 오퍼"),
+                              grid=restore.get("grid", True),
+                              kind="auto_offer", restore_state=restore)
+            self._offer_dlg = dlg
+            dlg.exec()
+            self._on_auto_offer_done(dlg)
 
     def _do_world_browser(self):
         from ui.world_browser_window import WorldBrowserWindow

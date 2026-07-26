@@ -80,7 +80,8 @@ _pool_conn = None
 # '재발했을 때 자동으로 회복'하는 방어망이라, 위 UI 쪽 타이머 정지 로직은
 # 그대로 유지하는 게 맞다(이건 마지막 안전망).
 _TRANSIENT_SQLITE_ERRORS = ("not an error", "no transaction is active",
-                            "cannot start a transaction within a transaction")
+                            "cannot start a transaction within a transaction",
+                            "abort due to rollback")
 
 # [2026-07 버그 수정, 4차 — 근본 원인 차단] 지금까지의 3차례 수정은 전부
 # "재발했을 때 감지해서 재시도/흡수"하는 사후 대응이었다(위 3차 수정 설명
@@ -137,15 +138,19 @@ class _PooledCursor:
     # fetchone/fetchmany/fetchall(SELECT 결과를 실제로 SQLite에서 끌어오는
     # 단계)이 락 밖에서 돌면 "execute 끝~fetch 시작" 사이의 틈으로 다른
     # 스레드가 끼어들 수 있다. fetch류도 같은 락으로 감싸 그 틈을 없앤다.
+    # [2026-07 5차 수정, 신민용 리포트: "abort due to ROLLBACK으로
+    # standings_window에서 크래시났다"] fetch류는 지금까지 락만 걸고
+    # _retry_sqlite_op(재시도)는 안 타고 있었다 — execute/executemany/
+    # executescript는 이미 재시도 방어가 있는데, 그 뒤에 이어지는 fetch
+    # 단계만 방어가 없어서, 워커 스레드가 롤백하는 바로 그 타이밍에 UI
+    # 타이머의 fetchall()이 걸리면 재시도 없이 그대로 크래시로 이어졌다.
+    # 이제 fetch류도 execute류와 동일하게 _retry_sqlite_op를 타게 한다.
     def fetchone(self, *a, **kw):
-        with _pool_lock:
-            return object.__getattribute__(self, "_real").fetchone(*a, **kw)
+        return _retry_sqlite_op(object.__getattribute__(self, "_real").fetchone, *a, **kw)
     def fetchmany(self, *a, **kw):
-        with _pool_lock:
-            return object.__getattribute__(self, "_real").fetchmany(*a, **kw)
+        return _retry_sqlite_op(object.__getattribute__(self, "_real").fetchmany, *a, **kw)
     def fetchall(self, *a, **kw):
-        with _pool_lock:
-            return object.__getattribute__(self, "_real").fetchall(*a, **kw)
+        return _retry_sqlite_op(object.__getattribute__(self, "_real").fetchall, *a, **kw)
     def __getattr__(self, name):
         return getattr(object.__getattribute__(self, "_real"), name)
     def __iter__(self):
@@ -902,6 +907,15 @@ def init_db():
         "ALTER TABLE my_player ADD COLUMN loan_from_league_id INTEGER DEFAULT 0",
         "ALTER TABLE my_player ADD COLUMN loan_from_tier INTEGER DEFAULT 0",
         "ALTER TABLE my_player ADD COLUMN loan_end_year INTEGER DEFAULT 0",
+        # [2026-07 신설, 신민용 요청] 오퍼/입단 창 상태 영속화 — 예전엔
+        # generate_offers()가 매번 완전히 새로 랜덤 생성돼서, 결정을 내리기
+        # 전에 게임을 껐다 켜면(또는 창이 열린 채로 종료됐다 재실행하면)
+        # 오퍼 목록이 통째로 새로 뽑혔다(직접 지원으로 확정한 팀도 사라짐).
+        # 이러면 오히려 "맘에 드는 오퍼 나올 때까지 재접속"이 가능해지는
+        # 셈이라, 오퍼가 처음 생성되는 시점에 이 컬럼에 JSON으로 저장해두고
+        # 결정(입단 완료/전부 결렬)이 나기 전까지는 껐다 켜도 항상 같은
+        # 오퍼 목록이 그대로 다시 뜨게 한다. 결정이 나면 빈 문자열로 비운다.
+        "ALTER TABLE my_player ADD COLUMN pending_offer_state TEXT DEFAULT ''",
     ]:
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,
@@ -2115,6 +2129,13 @@ def _star_counts(grade, team_strength, continent_bonus=0, n_slots=11, tier=1):
             n_elite = max(0, n_slots - n_world)
         elif tier == 2 and grade == "SS":
             n_elite = min(8, max(0, n_slots - n_world))
+        elif tier == 2 and grade == "S":
+            # [2026-07 신설, 신민용 지적: "세군다·세리에B·분데스2·리그2는
+            # 현실에서도 상당히 강한 2부 리그인데 엘리트 슬롯이 3개로 확
+            # 깎여서 S급 1→2부 하락폭(9.9)이 A/B급(7.8~7.9)보다도 커지는
+            # 역전이 있었다" — SS(챔피언십)만큼은 아니어도 A/B보다는 완만하게
+            # 떨어지도록 6개까지 허용한다.
+            n_elite = min(9, max(0, n_slots - n_world))
         else:
             n_elite = min(3, max(0, n_slots - n_world))
     else:

@@ -536,7 +536,7 @@ def get_my_cwc_matches():
     호출하도록 연결하면 그대로 표시된다."""
     conn = get_conn()
     rows = [dict(r) for r in conn.execute(
-        """SELECT m.*, t.year AS t_year, t.name AS comp
+        """SELECT m.*, t.year AS t_year, t.name AS comp, t.my_team_id AS t_my_tid
            FROM cwc_matches m
            JOIN cwc_tournaments t ON m.tournament_id = t.id
            WHERE m.my_played = 1 OR m.my_absence_reason IS NOT NULL
@@ -547,14 +547,17 @@ def get_my_cwc_matches():
     conn.close()
 
     out = []
-    from game_engine import get_player
-    p = get_player()
-    my_tid = p.get("current_team_id", 0) if p else 0
 
     stage_ko = {"group": "조별리그", "R16": "16강", "QF": "8강", "SF": "4강",
                 "F": "결승", "TP": "3/4위전"}
 
     for m in rows:
+        # [2026-07 버그수정, champions_engine.get_my_cl_matches와 동일한
+        # 버그 발견/수정] "현재" 소속팀 대신 cwc_tournaments.my_team_id
+        # (그 대회 시작 시점에 고정 저장된 내 팀)를 쓴다 — 안 그러면 그
+        # 이후 이적한 경우 과거 경기의 상대가 그때의 내 팀 이름으로
+        # 뒤바뀌어 표시되고 스코어/승패도 뒤집힌다.
+        my_tid = m["t_my_tid"]
         is_home = (m["home_team_id"] == my_tid)
         opp_id = m["away_team_id"] if is_home else m["home_team_id"]
         my_s = m["home_score"] if is_home else m["away_score"]

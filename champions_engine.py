@@ -1819,7 +1819,7 @@ def get_my_cl_matches():
     "(부상)"/"(출전정지)" 표시를 위해 my_absence_reason을 함께 싣는다."""
     conn = get_conn()
     rows = [dict(r) for r in conn.execute(
-        """SELECT m.*, t.year AS t_year, t.name AS comp
+        """SELECT m.*, t.year AS t_year, t.name AS comp, t.my_team_id AS t_my_tid
            FROM cl_matches m
            JOIN cl_tournaments t ON m.tournament_id = t.id
            WHERE m.my_played = 1 OR m.my_absence_reason IS NOT NULL
@@ -1830,13 +1830,19 @@ def get_my_cl_matches():
     conn.close()
 
     out = []
-    from game_engine import get_player
-    p = get_player()
-    my_tid = p.get("current_team_id", 0) if p else 0
 
     for m in rows:
-        # 내 팀 식별: 그 경기 시점 소속을 알 수 없으므로 양쪽 중
-        # my_played 행 기준으로 현재 팀이 끼어있으면 그쪽을, 아니면 home 기준.
+        # [2026-07 버그수정, 신민용 리포트: "옛날 경기의 상대가 그때 내 팀
+        # 이름으로 뜬다(자기자신과 붙은 것처럼 보임)"] 예전엔 "현재" 소속팀
+        # (p.get("current_team_id"))으로 그 경기 당시 내가 홈/원정 중 어느
+        # 쪽이었는지를 판정했다 — 그 이후 이적을 한 번이라도 하면 현재 팀ID가
+        # 그 경기의 홈/원정 둘 중 어느 쪽과도 안 맞아떨어지게 되고, 그러면
+        # is_home이 무조건 False로 잡혀서 "그 경기 당시 내 팀"이 오히려
+        # 상대팀으로 표시되고(홈이었던 경우), 스코어/승패까지 뒤집혀
+        # 나왔다. cl_tournaments.my_team_id는 그 대회가 시작될 때 이미
+        # "그 시점 내 팀"으로 고정 저장돼 있으므로, 그걸 그대로 쓴다 —
+        # 이적을 몇 번을 하든 과거 기록은 항상 그 당시 팀 기준으로 정확하다.
+        my_tid = m["t_my_tid"]
         is_home = (m["home_team_id"] == my_tid)
         opp_id = m["away_team_id"] if is_home else m["home_team_id"]
         my_s = m["home_score"] if is_home else m["away_score"]

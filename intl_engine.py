@@ -57,8 +57,9 @@ from constants import (
     WC_QUAL_32, WC_QUAL_48,
     GRADE_TEAM_OVR, GRADE_QUAL_BASE, QUAL_NOISE,
     INTL_SELECTION_OVR, INTL_MAX_TIER, INTL_MIN_MATCHES,
-    INTL_SELECTION_MARGIN,
-    CONTINENT_OVR_BONUS, COUNTRY_OVR_ADJ,
+    INTL_SELECTION_MARGIN, INTL_SQUAD_QUOTA,
+    GK_POS, DF_POS, MF_POS, FW_POS,
+    get_country_ovr_bonus, get_league_grade,
 )
 
 
@@ -112,7 +113,19 @@ def _nat_team_ovr(grade, name="", continent="", fast=False):
     나라 1~2개만 정확히 봐야 하는 곳은 fast=False(기본값)로 그대로
     정확한 블렌딩을 쓴다."""
     base = GRADE_TEAM_OVR.get(grade, 45)
-    adj = CONTINENT_OVR_BONUS.get(continent, 0) + COUNTRY_OVR_ADJ.get(name, 0)
+    # [2026-07 재설계, 신민용 지적: "대륙+등급 가감산을 매번 역산할 거면
+    # 애초에 국가별 목표치를 직접 잡으면 되는거 아닌가"] COUNTRY_OVR_ADJ
+    # (대륙보정 위 델타)가 COUNTRY_OVR_TARGET(절대 목표 상한치)으로
+    # 바뀌었다 — 그런데 그 목표치는 "리그 등급" 기준으로 리서치된 값이라,
+    # 여기(국가대표 OVR, grade는 국대 등급이라 리그 등급과 다를 수 있음
+    # — 예: 사우디는 국대 C급/리그 A급)에 그대로 절대치를 갖다 쓰면 안
+    # 맞다. 대신 그 나라의 "리그 등급" 기준으로 델타를 구해서(클럽 쪽과
+    # 동일한 국가별 체감 보정값을 유지), 국가대표 베이스(GRADE_TEAM_OVR,
+    # 국대 등급 기준)에 더한다 — 원래 의도("클럽에 적용 중인 보정을
+    # 국가대표에도 동일 적용")를 그대로 살리면서 등급 불일치 문제를
+    # 피한다.
+    _league_grade = get_league_grade(name, grade)
+    adj = get_country_ovr_bonus(name, _league_grade, continent)
     noise = random.triangular(-10, 4, 1)
     formula_val = base + adj + noise
     if fast:
@@ -1167,65 +1180,128 @@ def _vet_bonus(age):
     return 0
 
 
+def _intl_form_raw(pos, goals, assists, rating, cs=0):
+    """[2026-07 신설] 국가대표 선발 전용 '순수 폼' 점수 — 개인상의
+    _position_award_score와 같은 포지션별 가중치를 쓰되 ovr*0.3 항은 뺀다.
+    최종 선발점수에서 OVR을 이미 45%로 따로 반영하니, 폼 안에 또 섞이면
+    이중 반영이 된다(신민용 지적)."""
+    if pos in GK_POS:
+        return cs * 3.0 + rating * 8.0
+    if pos in DF_POS:
+        return goals * 1.0 + assists * 1.5 + rating * 7.0
+    if pos in MF_POS:
+        return goals * 1.5 + assists * 2.0 + rating * 6.0
+    return goals * 2.0 + assists * 1.0 + rating * 5.0  # FW/기타
+
+
+def _normalize_form(raw_by_id, my_id, my_raw):
+    """그 포지션 그룹 후보 전원의 raw 폼 점수를 상대 정규화(최고=100,
+    최저=40)한다 — 시대·리그 수준이 달라도(1960년대 vs 2020년대) 항상
+    같은 스케일로 비교 가능하게. 후보가 나 하나뿐이면 70(평균) 취급."""
+    all_raw = list(raw_by_id.values()) + [my_raw]
+    mx, mn = max(all_raw), min(all_raw)
+    if mx == mn:
+        return {k: 70.0 for k in raw_by_id}, 70.0
+    def _norm(v):
+        return 40.0 + (v - mn) / (mx - mn) * 60.0
+    return {k: _norm(v) for k, v in raw_by_id.items()}, _norm(my_raw)
+
+
 def _check_selection(p, my_grade, country="", continent=""):
-    """국가대표 선발 판정 — 자국 등급(국대 평균 전력) 대비 상대평가.
+    """국가대표 선발 판정 — [2026-07 전면 재설계, 신민용 확정] "OVR이 그
+    나라 평균과 비슷하면 무조건 뽑힌다"는 절대 문턱 방식에서, 실제
+    국가대표처럼 포지션별 정원(23인 = GK3/DF8/MF8/FW4) 안에서 동포지션
+    후보들과 경쟁하는 방식으로 바꿨다. 같은 포지션에 나보다 잘하는 동포
+    선수가 이미 정원만큼 있으면, 내 OVR이 웬만큼 높아도 밀릴 수 있다
+    (실제로 그렇듯이).
 
-    선발 기준을 클럽 선수 풀이 아니라 GRADE_TEAM_OVR(국대 경기 시뮬에 쓰는
-    그 나라 평균 전력)에 정합시킨다. 선발 스케일 = 경기 스케일.
-      임계 = 국대평균 - 마진(톱권) + 부상/감독관계 페널티
-      유효OVR = 내 OVR + 베테랑 보너스(최대 +5)
-      → 유효OVR이 임계 이상이면 선발. 단 절대 하한 미달은 보너스로도 구제 불가.
-
-    [기능 변경] 예전엔 여기에 시즌 출전 경기 수(5경기 미만 탈락), 소속팀
-    유무, 소속 리그 티어(등급별 상한)까지 같이 봤다. 현실적이지 않다는
-    피드백(OVR 83처럼 기량이 확실하면 소속 리그가 낮거나 그 시즌 출전이
-    적어도 대표팀에 뽑히는 게 자연스럽다)에 따라 이제 순수하게
-    OVR(+베테랑 보너스)만으로 판정한다.
-
-    [2026-07 추가, 신민용 요청] 부상 중이거나 소속팀 감독과 관계가 안
-    좋으면 대표팀 발탁이 불리해지도록 반영한다. "부상=무조건 탈락",
-    "관계 나쁨=무조건 탈락"처럼 완전 배제하면 너무 극단적이므로, 대신
-    임계값(threshold)을 조금 올리는 페널티로만 반영한다 — 실력이
-    확실히 앞서는 선수는 그래도 뽑히고, 애매한 선수만 이 페널티로
-    떨어지는 정도의 밸런스로 맞춘다.
-
-    [2026-07 재수정, 신민용 지적: "한국 국대 OVR이 너무 높다"] 임계값도
-    _nat_team_ovr과 동일한 대륙보정/나라별 조정을 반영해야, 실제 경기
-    시뮬에 쓰이는 그 나라의 진짜 평균 전력과 선발 기준이 어긋나지 않는다
-    (country/continent를 넘기면 반영, 안 넘기면 예전처럼 등급 평균만 사용
-    — 호출부 일부가 아직 이 정보 없이 부르는 경우 대비한 하위호환).
-    """
-    if country or continent:
-        nat_avg = GRADE_TEAM_OVR.get(my_grade, 45) + \
-            CONTINENT_OVR_BONUS.get(continent, 0) + COUNTRY_OVR_ADJ.get(country, 0)
-    else:
-        nat_avg = GRADE_TEAM_OVR.get(my_grade, 45)
-    threshold = nat_avg - INTL_SELECTION_MARGIN
-    my_ovr = p.get("ovr", 0)
-    eff_ovr = my_ovr + _vet_bonus(p.get("age", 25))
-
-    # [2026-07 신설] 최소 소집 연령 — 발탁 후보(cand_nats) 판정 단계에서
-    # 이미 걸러지지만, 다른 경로(예선 등)에서도 실수로 새지 않게 여기서도
-    # 한 번 더 막는다(이중 안전장치, 비용 거의 0).
+    선발점수 = OVR×45% + 정규화폼×55% − 페널티
+      - 폼은 _intl_form_raw()(개인상 포지션 가중치에서 ovr 항만 뺀 것)를
+        그 나라 동포지션 후보군 안에서 상대 정규화(최고100/최저40)한 값.
+        "지금 잘하는 선수"가 커리어 내내 OVR만 높은 선수보다 유리해지는
+        핵심 장치.
+      - 페널티는 예전처럼 임계값을 올리는 게 아니라 선발점수를 직접 깎는다
+        (장기부상 -15, 감독불화 -8, 출장시간부족 -6).
+    포지션 그룹(GK/DF/MF/FW) 안에서 AI 동포 선수 전원(_estimate_ai_season
+    으로 폼 추정) + 나를 한 풀에 놓고 점수 순으로 정렬 → 정원 안에 들면
+    선발. 정원 경계(마지노선, INTL_SELECTION_MARGIN=3점 이내 차이)에서는
+    25% 확률로 순위가 뒤집힐 수 있다 — 격차가 크면(3점 초과) 뒤집히지
+    않는다."""
     from constants import MIN_INTL_CALLUP_AGE
     if p.get("age", 0) < MIN_INTL_CALLUP_AGE:
         return False
 
-    # 부상/감독관계 페널티 (완전 배제 아님 — 임계값만 소폭 상향)
+    my_pos = p.get("position", "ST")
+    if my_pos in GK_POS:
+        pos_group, group_members = "GK", GK_POS
+    elif my_pos in DF_POS:
+        pos_group, group_members = "DF", DF_POS
+    elif my_pos in MF_POS:
+        pos_group, group_members = "MF", MF_POS
+    else:
+        pos_group, group_members = "FW", FW_POS
+    quota = INTL_SQUAD_QUOTA.get(pos_group, 4)
+
+    nat = country or p.get("nationality", "")
+    _league_grade_team = get_league_grade(country, my_grade)
+    team_avg = GRADE_TEAM_OVR.get(my_grade, 45) + \
+        get_country_ovr_bonus(country, _league_grade_team, continent)
+
+    # 그 나라 동포지션 AI 후보 전원 수집 + 폼 추정
+    conn = get_conn()
+    ph = ",".join("'%s'" % pp for pp in group_members)
+    rows = conn.execute(
+        f"SELECT id, ovr, position, sub_role, age FROM ai_players "
+        f"WHERE nationality=? AND position IN ({ph})", (nat,)).fetchall()
+    conn.close()
+    from game_engine import _estimate_ai_season, _estimate_ai_clean_sheets
+    raw_by_id, ovr_by_id = {}, {}
+    for r in rows:
+        g, a, rt = _estimate_ai_season(r["ovr"], r["position"], team_avg, team_avg, r["sub_role"])
+        cs = _estimate_ai_clean_sheets(r["position"], r["ovr"], team_avg, team_avg, 14) if pos_group == "GK" else 0
+        raw_by_id[r["id"]] = _intl_form_raw(r["position"], g, a, rt, cs)
+        ovr_by_id[r["id"]] = r["ovr"]
+
+    # 내 폼(실제 이번 시즌 기록)
+    _rc = p.get("season_rating_cnt", 0)
+    my_avg_rating = (p.get("season_rating_sum", 0) / _rc) if _rc > 0 else 6.0
+    my_cs = _calc_clean_sheets_for_player(p) if pos_group == "GK" else 0
+    my_raw = _intl_form_raw(my_pos, p.get("season_goals", 0), p.get("season_assists", 0),
+                            my_avg_rating, my_cs)
+
+    norm_by_id, my_norm = _normalize_form(raw_by_id, id(p), my_raw)
+
+    # 페널티(선발점수 직접 감점 — 예전처럼 임계값 상향이 아님)
     penalty = 0.0
     if p.get("injured"):
-        penalty += 4.0
+        penalty += 15.0
     rel = p.get("manager_relation", 50)
     if rel < 30:
-        penalty += 3.0
+        penalty += 8.0
     elif rel < 50:
-        penalty += 1.5
-    threshold += penalty
+        penalty += 3.0
+    if p.get("season_matches", 0) < 10:
+        penalty += 6.0
 
-    # 절대 하한: 베테랑 보너스로도 이 밑이면 탈락 (36세 60 같은 경우 차단)
-    if my_ovr < threshold - INTL_SELECTION_MARGIN:
+    my_ovr = p.get("ovr", 0)
+    my_score = my_ovr * 0.45 + my_norm * 0.55 - penalty
+    ai_scores = sorted((ovr_by_id[k] * 0.45 + norm_by_id[k] * 0.55 for k in raw_by_id), reverse=True)
+
+    if len(ai_scores) < quota:
+        return True  # 그 포지션에 나 포함해도 정원이 안 찬 나라 — 자동 선발
+
+    boundary_top = ai_scores[quota - 1] if quota - 1 < len(ai_scores) else -999
+    boundary_bottom = ai_scores[quota] if quota < len(ai_scores) else -999
+    my_rank = 1 + sum(1 for s in ai_scores if s > my_score)
+
+    if my_rank <= quota:
+        if my_rank == quota and (boundary_top - boundary_bottom) <= INTL_SELECTION_MARGIN:
+            return random.random() < 0.75   # 마지노선 접전 — 25% 확률로 밀려남
+        return True
+    else:
+        if my_rank == quota + 1 and (boundary_top - boundary_bottom) <= INTL_SELECTION_MARGIN:
+            return random.random() < 0.25   # 마지노선 접전 — 25% 확률로 발탁
         return False
-    return eff_ovr >= threshold
 
 
 def _qualify_world(year=0):

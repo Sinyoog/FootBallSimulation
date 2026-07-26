@@ -35,35 +35,100 @@ QDialog { background:#1e1e1e; color:#ccc; }
 
 class OfferWindow(QDialog):
     def __init__(self, offers: list, lang="ko", parent=None, title="📋 이적 오퍼",
-                 force_select=False, grid=False, apply_slots=0):
+                 force_select=False, grid=False, apply_slots=0,
+                 kind="", restore_state=None):
         super().__init__(parent)
         from PyQt6.QtCore import Qt
         self.setWindowModality(Qt.WindowModality.NonModal)
+        self.lang       = lang
+        self.chosen     = None
+        self.all_failed = False          # 모든 오퍼 결렬 여부 (1년 훈련 분기용)
+        self._close_btn = None           # 닫기 버튼 참조 (전부 결렬 시 활성화)
+        # [2026-07 신설, 신민용 요청] kind("join"/"auto_offer")가 주어지면
+        # 이 창의 상태(오퍼 목록·협상 진행도·직접지원 결과)를 DB에 저장해서,
+        # 결정을 내리기 전에 게임을 껐다 켜도 새로 랜덤 생성하지 않고 같은
+        # 상태 그대로 다시 뜨게 한다(재접속 오퍼 리롤 방지). restore_state가
+        # 주어지면(재시작 후 복원) 그 값으로 초기 상태를 그대로 복원한다.
+        self._kind = kind
+        if restore_state:
+            title        = restore_state.get("title", title)
+            force_select = restore_state.get("force_select", force_select)
+            grid         = restore_state.get("grid", grid)
+            apply_slots  = restore_state.get("apply_slots", apply_slots)
+            offers       = restore_state.get("offers", offers)
+
         self.setWindowTitle(title)
         self.grid = grid
         self.setMinimumSize(980, 600) if grid else self.setMinimumSize(580, 500)
         self.setStyleSheet(STYLE)
-        self.lang       = lang
         self.title_text = title
-        self.chosen     = None
         self._force     = force_select
         self.offers     = offers
-        self.neg_used: dict[int, int] = {}
-        self.offer_salaries: list[int] = [o["salary"] for o in offers]
-        self.neg_failed: set[int] = set()
-        self.all_failed = False          # 모든 오퍼 결렬 여부 (1년 훈련 분기용)
-        self._close_btn = None           # 닫기 버튼 참조 (전부 결렬 시 활성화)
         # [2026-07 신설] 직접 지원 슬롯 — 무소속(팀 입단) 창에서만 켜짐.
         # 패시브 오퍼 카드들 뒤에 빈 슬롯을 두고, 그 안의 "지원하기" 버튼으로
         # ApplyWindow(팀 검색)를 열어 성공하면 그 오퍼가 일반 오퍼 카드와
         # 똑같이(협상/입단 가능) self.offers 뒤쪽에 추가된다.
         self.apply_slots = apply_slots
-        self._applied_count = 0
 
-        for i in range(len(offers)):
-            self.neg_used[i] = random.randint(1, 3)
+        if restore_state:
+            self.offer_salaries = restore_state.get(
+                "offer_salaries", [o["salary"] for o in self.offers])
+            self.neg_used = {int(k): v for k, v in
+                              restore_state.get("neg_used", {}).items()}
+            self.neg_failed = set(restore_state.get("neg_failed", []))
+            self._applied_count = restore_state.get("applied_count", 0)
+        else:
+            self.offer_salaries: list[int] = [o["salary"] for o in offers]
+            self.neg_used: dict[int, int] = {}
+            for i in range(len(offers)):
+                self.neg_used[i] = random.randint(1, 3)
+            self.neg_failed: set[int] = set()
+            self._applied_count = 0
 
         self._build()
+        # 창이 만들어지는 즉시(사용자가 아무것도 안 눌러도) 저장해둔다 —
+        # 그래야 이 창을 띄운 직후 바로 꺼져도 다음에 같은 상태로 복원된다.
+        self._persist()
+
+    def _persist(self):
+        """현재 오퍼/협상 상태를 DB에 저장(kind가 없으면 아무것도 안 함)."""
+        if not self._kind:
+            return
+        from game_engine import save_pending_offer_state
+        save_pending_offer_state(
+            kind=self._kind, title=self.title_text, force_select=self._force,
+            grid=self.grid, apply_slots=self.apply_slots, offers=self.offers,
+            offer_salaries=self.offer_salaries, neg_used=self.neg_used,
+            neg_failed=self.neg_failed, applied_count=self._applied_count,
+        )
+
+    def _clear_persisted(self):
+        """결정이 끝나면(입단 확정/전부 결렬 등) 저장된 상태를 지운다."""
+        if not self._kind:
+            return
+        from game_engine import clear_pending_offer_state
+        clear_pending_offer_state()
+
+    def accept(self):
+        # 팀을 실제로 골라 입단하는 경우 — 결정이 끝났으니 저장된 상태를 지운다.
+        self._clear_persisted()
+        super().accept()
+
+    def reject(self):
+        # [2026-07 재수정, 신민용 지적: "왜 아예 닫기 버튼을 잠궈버렸어?"]
+        # 이전엔 force_select면 닫기/X 자체를 막아버렸는데, 그럴 필요가
+        # 없었다 — 무소속인데 진행을 계속하면 center_panel의 별도 체크
+        # ("17살 이상인데 팀이 없고 프리시즌이면 입단 강제" 안내)가 이미
+        # 다음 날 진행을 막아주므로, 이 다이얼로그 자체를 못 닫게 잠글
+        # 이유가 없다. 대신: 팀을 안 고르고 그냥 닫은 경우(all_failed도
+        # 아님)엔 저장된 오퍼 상태를 지우지 않는다 — 나중에 다시 열면
+        # (같은 세션에서 버튼을 다시 누르든, 앱을 껐다 켜든) 완전히 같은
+        # 오퍼 목록이 그대로 뜬다(재접속·재오픈으로 오퍼를 리롤하는 것만
+        # 막으면 충분하고, 창을 못 닫게 할 필요는 없었다). all_failed로
+        # 끝난 경우(전부 결렬 → 1년 훈련)는 진짜 결론이 난 것이므로 지운다.
+        if self.all_failed:
+            self._clear_persisted()
+        super().reject()
 
     def _build(self):
         root = QVBoxLayout(self)
@@ -95,11 +160,18 @@ class OfferWindow(QDialog):
 
         close = QPushButton("닫기" if self.lang=="ko" else "Close")
         self._close_btn = close
+        # [2026-07 재수정, 신민용 지적: "왜 아예 닫기 버튼을 잠궈버렸어?"]
+        # force_select여도 닫기 자체는 항상 눌리게 둔다 — 결정 없이 닫아도
+        # 오퍼 상태는 그대로 저장돼 있으니(위 reject() 참고) 나중에 똑같은
+        # 목록으로 다시 열 수 있고, 무소속으로 방치되는 것도 center_panel의
+        # 별도 진행 차단 안내가 막아준다. 안내 툴팁만 남겨 "아직 안 골랐다"는
+        # 걸 알려준다.
         if self._force:
-            close.setEnabled(False)
-            close.setToolTip("팀을 선택해야 합니다")
-        close.setStyleSheet("background:#2a2a2a;color:#ccc;border:1px solid #444;"
-                            "border-radius:4px;padding:6px;")
+            close.setToolTip("아직 팀을 선택하지 않았습니다 — 나중에 다시 열면 같은 목록이 뜹니다")
+        close.setStyleSheet(
+            "QPushButton{background:#2a2a2a;color:#ccc;border:1px solid #444;"
+            "border-radius:4px;padding:6px;}"
+            "QPushButton:disabled{background:#222;color:#555;border:1px solid #333;}")
         close.clicked.connect(self.reject)
         root.addWidget(close)
 
@@ -161,6 +233,7 @@ class OfferWindow(QDialog):
             self.offer_salaries.append(offer["salary"])
             self.neg_used[idx] = random.randint(1, 3)
             self._applied_count += 1
+            self._persist()
         self._render_cards()
 
     def _make_card(self, idx, offer):
@@ -294,5 +367,6 @@ class OfferWindow(QDialog):
             show_toast(self, "⚠ 모든 협상이 결렬되었습니다. 1년 더 훈련합니다.",
                        "#cc6600", 1800)
 
+        self._persist()
         # 카드 갱신 (연봉 수치 반영)
         QTimer.singleShot(100, self._render_cards)
