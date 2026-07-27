@@ -271,7 +271,7 @@ class CareerWindow(QDialog):
             sy = e.get("start_year", ""); sw = e.get("start_week", 1)
             ey = e.get("end_year", 0);    ew = e.get("end_week", 0)
 
-            from constants import week_to_iso_date_str
+            from constants import week_to_iso_date_str, week_to_iso_date_str_end
             start_str = week_to_iso_date_str(sy, sw) if sy else ""
             if ey == 0:
                 period = f"{start_str} ~ 현재"
@@ -280,7 +280,7 @@ class CareerWindow(QDialog):
                 # 뭉개서, 44주에 이적해도 '52주'로 잘못 보였다.) 50주 이상만
                 # 시즌 끝까지 채운 것으로 보고 52로 정리.
                 ew_disp = 52 if ew >= 50 else ew
-                end_str = week_to_iso_date_str(ey, ew_disp)
+                end_str = week_to_iso_date_str_end(ey, ew_disp)
                 period = f"{start_str} ~ {end_str}"
 
             pos   = e.get("position","")
@@ -384,7 +384,7 @@ class CareerWindow(QDialog):
             # 분모로 같이 보여준다("26/38"). 못 찾으면(리그명 매칭 실패 등)
             # 그냥 숫자만 표시.
             from game_engine import team_matches_played_in_window
-            _total_g = team_matches_played_in_window(tn, ln, sy, sw, ey, ew)
+            _total_g = team_matches_played_in_window(e.get("team_id", 0), ln, sy, sw, ey, ew)
             _apps_str = f"{e.get('matches',0)}/{_total_g}" if _total_g else str(e.get("matches", 0))
             vals = ([period, pos, country_str, league_str, tn,
                      fmt_money(e.get("salary",0)),
@@ -451,13 +451,13 @@ class CareerWindow(QDialog):
         for i, e in enumerate(visible):
             sy = e.get("start_year", ""); sw = e.get("start_week", 1)
             ey = e.get("end_year", "");   ew = e.get("end_week", 0)
-            from constants import week_to_iso_date_str
+            from constants import week_to_iso_date_str, week_to_iso_date_str_end
             start_str = week_to_iso_date_str(sy, sw) if sy else ""
             if ey == 0:
                 period = f"{start_str} ~ 현재"
             else:
                 ew_disp = 52 if ew >= 50 else ew
-                period = f"{start_str} ~ {week_to_iso_date_str(ey, ew_disp)}"
+                period = f"{start_str} ~ {week_to_iso_date_str_end(ey, ew_disp)}"
 
             # [2026-07 버그수정, 위 평균평점 버그를 추적하다 같이 발견]
             # ey가 0(진행 중인 현재 스틴트)일 때 "ey or sy or 0"으로 넘기면
@@ -473,7 +473,7 @@ class CareerWindow(QDialog):
 
             # 출전: 리그 출전/분모 + 그 외 대회 출전/분모 (팀 이력의 '22/24'와 동일 원리)
             _league_total = team_matches_played_in_window(
-                e.get("team_name", ""), e.get("league_name", ""), sy, sw, ey, ew or 52) or 0
+                e.get("team_id", 0), e.get("league_name", ""), sy, sw, ey, ew or 52) or 0
             grand_played = e.get("matches", 0) + extras["matches_played"]
             grand_avail = _league_total + extras["matches_available"]
             apps_str = f"{grand_played}/{grand_avail}" if grand_avail else str(grand_played)

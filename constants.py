@@ -20,8 +20,15 @@ MAX_AGE = 50
 #         — 실제 프리미어리그처럼 겨울 이적시장 동안에도 경기는 계속된다.
 #         (분데스리가식으로 완전히 경기를 끊고 싶으면 이 구간만 빼고
 #         라운드를 재분배하면 되는데, 지금은 안 뺀 채로 간다.)
-#   - 국제대회 전용 비시즌:    301~364일 (44~52주, 총 64일) — 이 구간엔
+#   - 국제대회 전용 비시즌:    302~364일 (44~52주, 총 63일) — 이 구간엔
 #     클럽 경기가 전혀 없다. 월드컵/대륙컵 본선·예선이 전부 여기서 열린다.
+#     [2026-07 버그수정, 신민용 리포트: "42주차에 끝나던 일정이 43주차까지
+#     늘어남 / 월드컵·네이션스컵 기록이 없다"] 예전엔 301일로 잡혀 있었는데,
+#     day_to_week()가 (day-1)//7+1 이라 실제로는 301일도 43주차(클럽
+#     시즌의 마지막 주와 동일)로 계산돼 국제대회 주간이 클럽 시즌 마지막
+#     주와 겹쳐버렸다(SEASON_PHASES의 second_half=(23,43)과 postseason=
+#     (43,52)이 43에서 겹치는 것으로 확인됨). 44주차의 진짜 첫째 날은
+#     302일이다.
 CLUB_PRESEASON_START_DAY = 1
 CLUB_PRESEASON_END_DAY   = 21
 
@@ -29,7 +36,7 @@ CLUB_SEASON_START_DAY = 22
 CLUB_SEASON_MID_DAY   = 161   # 상/하반기 분기점(홈/원정 반전 기준)
 CLUB_SEASON_END_DAY   = 300
 
-INTL_OFFSEASON_START_DAY = 301
+INTL_OFFSEASON_START_DAY = 302
 INTL_OFFSEASON_END_DAY   = 364
 
 # 겨울 이적시장 — 클럽 시즌 중간에 겹쳐서 열림(경기는 안 끊김)
@@ -306,6 +313,18 @@ def week_to_iso_date_str(season_year: int, week: int) -> str:
     """day 컬럼이 없는(구버전 세이브 등) 경기 기록을 위한 폴백 —
     그 주의 첫째 날로 근사한 날짜를 반환한다."""
     day = (week - 1) * DAYS_PER_WEEK + 1
+    return day_to_iso_date_str(season_year, day)
+
+def week_to_iso_date_str_end(season_year: int, week: int) -> str:
+    """기간 표시용 '종료일' — 그 주의 마지막 날짜를 반환한다.
+    [2026-07 버그수정, 신민용 리포트: "같은 주에 입단·이적하면
+    2001-01-01~2001-01-01처럼 시작=종료로 찍힌다, 2001-01-01~2001-01-07
+    이어야 한다"] week_to_iso_date_str()는 항상 그 주의 첫째 날을
+    반환하므로, 재직 '기간' 표시에서 종료일에도 그대로 쓰면 같은 주
+    안에서 시작과 종료가 같은 날로 보인다. 종료일은 그 주가 끝나는
+    마지막 날(7일째)로 잡아야 "그 주까지 재직했다"는 의미가 정확히
+    전달된다."""
+    day = week * DAYS_PER_WEEK
     return day_to_iso_date_str(season_year, day)
 
 # ── 기존(주 단위) 코드와의 호환용 파생값 ──────────────────────────
@@ -1010,10 +1029,84 @@ INTL_MIN_MATCHES   = 5
 #     - S/A급(톱 리그): 마진 1 → 거의 그 팀 평균급이어야 입단.
 #       (엘리트 전성기 90 → S급 1부, 평범 85 → A급 1부가 한계, S급은 못 감)
 #     - 하위 등급: 점점 관대(아무나 데뷔 가능한 약체 리그).
-CLUB_JOIN_MARGIN = 3   # (하위호환용 기본값 — 등급 미상 시 사용)
+CLUB_JOIN_MARGIN = 3   # (하위호환용 기본값 — 등급 미상 시 사용. my_join_margin/직접지원 계산 등에서 여전히 사용)
 CLUB_JOIN_MARGIN_BY_GRADE = {
     "S": 1, "A": 1, "B": 3, "C": 4, "D": 5, "E": 6, "F": 7,
 }
+
+# [밸런스 재설계 2026-07, 신민용 설계+GPT 검토+실데이터(game.db 리그당 팀수
+# 6~30팀) 대조 확정] 오퍼/입단/직접지원 세 경로를 하나의 기준으로 통일하기
+# 위한 상수 모음. 숫자만 바꿔서 밸런스 조정이 가능하도록 전부 여기 모은다.
+
+# 1) 자동 오퍼 최소 보장 확률(에이전트 등급별). 실제 확률은 이 값과
+#    퍼포먼스 기반 확률 중 큰 쪽(max)을 쓴다 — 못해도 이 정도는 보장,
+#    잘하면 이보다 훨씬 높은 확률로 뜬다.
+AGENT_MIN_OFFER_PROB = {
+    "F": 0.08, "E": 0.12, "D": 0.16, "C": 0.22, "B": 0.30, "A": 0.38, "S": 0.45,
+}
+
+# 2) 계약 만료 임박 보너스 — "게임 내 남은 주 수" 기준(시즌=52주 고정).
+#    (임계 주 수, 배율) 오름차순. 남은 주가 임계값 이하면 그 배율 적용,
+#    마지막 구간을 넘으면 CONTRACT_URGENCY_FALLBACK 적용.
+CONTRACT_URGENCY_BONUS = [
+    (13,  1.6),   # 3개월 이하
+    (26,  1.4),   # 6개월 이하
+    (52,  1.2),   # 1년 이하
+    (104, 1.0),   # 2년 이하
+]
+CONTRACT_URGENCY_FALLBACK = 0.9   # 2년 초과 — 장기계약, 관심 다소 낮음
+
+# 3) 오퍼 역할 결정에 쓰는 나이 기준.
+ROLE_AGE_THRESHOLD = 30          # 이 나이 이상 + 격차 애매(0~3)면 로테이션으로
+ROLE_YOUNG_PROSPECT_MAX_AGE = 22 # 이 나이 이하 + 격차 큼이면 유망주 영입으로
+
+# 4) 팀 후보 필터링 마진 — 국가 등급 대신 "그 팀이 자기 리그 안에서 상위
+#    몇 %인가"로 결정. (누적 백분위 상한, 마진) — 리그 최강팀에 가까울수록
+#    빡빡(마진1), 최하위권일수록 관대(마진5).
+LEAGUE_RELATIVE_MARGIN_BANDS = [
+    (0.2, 1),   # 상위 20% = 명문
+    (0.4, 2),   # 상위 40% = 상위권
+    (0.6, 3),   # 상위 60% = 중위권
+    (0.8, 4),   # 상위 80% = 하위권
+]
+LEAGUE_RELATIVE_MARGIN_FALLBACK = 5   # 하위 20% = 최하위권 (그 이상 전부 포함)
+
+# 5) 패시브 오퍼(자동 오퍼·무소속 입단) 후보 선별 — 마진 통과 후보를 팀
+#    평균 OVR 높은 순으로 줄 세운 뒤, 등수 구간별 가중치로 추첨한다
+#    (고정 정렬로 뽑으면 매번 같은 상위 1~2팀만 나오는 문제를 피하기 위함).
+#    (순위 상한, 가중치) — 1~3위 가중치 5, 4~6위 가중치 3, 7~10위 가중치 1.
+PASSIVE_OFFER_RANK_WEIGHTS = [
+    (3, 5),
+    (6, 3),
+    (10, 1),
+]
+PASSIVE_OFFER_RANK_WEIGHT_FALLBACK = 0.3   # 11위 이하(넓게 뽑혔을 때의 꼬리)
+
+
+def get_league_relative_margin(pct: float) -> int:
+    """팀의 리그 내 백분위(0에 가까울수록 강팀)로 마진(1~5)을 반환."""
+    for cap, margin in LEAGUE_RELATIVE_MARGIN_BANDS:
+        if pct <= cap:
+            return margin
+    return LEAGUE_RELATIVE_MARGIN_FALLBACK
+
+
+def get_passive_offer_rank_weight(rank: int) -> float:
+    """마진 통과 후보를 팀 평균 OVR 내림차순으로 줄 세웠을 때의 순위(1부터)로
+    추첨 가중치를 반환. 상위권일수록 가중치가 크다."""
+    for cap, weight in PASSIVE_OFFER_RANK_WEIGHTS:
+        if rank <= cap:
+            return weight
+    return PASSIVE_OFFER_RANK_WEIGHT_FALLBACK
+
+
+def get_contract_urgency_mult(weeks_left: int) -> float:
+    """계약 만료까지 남은 주 수로 오퍼 확률 배율을 반환."""
+    for cap, mult in CONTRACT_URGENCY_BONUS:
+        if weeks_left <= cap:
+            return mult
+    return CONTRACT_URGENCY_FALLBACK
+
 
 CONTINENT_NAMES = ["유럽","아시아","아프리카","북미+남미"]
 
@@ -1359,15 +1452,31 @@ def get_country_continent(country: str) -> str:
     return COUNTRY_CONTINENT.get(country, "")
 
 
-def get_country_ovr_bonus(country: str) -> float:
-    """[호환용 복구] 나라 이름 -> 최종 OVR 보정치(대륙 보정 + 국가별
-    미세조정치 합산). intl_engine.py 등에서 참조하는데, 작업 중이던
-    코드 스냅샷에는 이 함수가 누락돼 있었다 — 이 세션 내내 써온 공식
-    (CONTINENT_OVR_BONUS[대륙] + COUNTRY_OVR_ADJ.get(국가, 0))을 그대로
-    함수화했다. 실제 프로젝트에 있던 원래 구현과 미묘하게 다를 수 있으니,
-    intl_engine.py 쪽 사용처와 대조해서 다르면 알려달라."""
-    continent = get_country_continent(country)
-    return CONTINENT_OVR_BONUS.get(continent, 0) + COUNTRY_OVR_ADJ.get(country, 0)
+def get_country_ovr_bonus(country: str, grade: str = None, continent: str = None) -> float:
+    """나라 이름(+ 국대/리그 등급, 대륙) -> 최종 OVR 보정치(대륙 보정 +
+    국가별 미세조정치 합산, SS등급은 초과 방지로 0 이하로 클램프).
+
+    [2026-07 버그수정, 신민용 리포트: "월드컵/네이션스컵 기록이 없다"]
+    intl_engine.py의 실제 호출부(_nat_team_ovr, 국가대표 발탁 판정)는
+    이 함수를 (country, grade, continent) 3개 인자로 부르고 있었는데,
+    바로 아래 docstring에 적혀 있던 "호환용 복구" 버전은 country 인자
+    하나만 받도록 되어 있어서 — 부를 때마다
+    'get_country_ovr_bonus() takes 1 positional argument but 3 were given'
+    로 즉시 TypeError가 났다. 이 예외가 _qualify_world() 안에서 그대로
+    터지면서 월드컵/대륙컵 생성 자체가 중간에 멈춰, 그 대회가 아예
+    생성되지 않아 "역대 기록"에도 나타나지 않았던 것이다.
+    ai_lifecycle.py/database.py에 있는 동일 공식(대륙보정+국가보정,
+    SS등급은 0 이하로 클램프)과 맞춰 세 인자를 받도록 복구하고, 그
+    두 파일에서 이미 한 번 잡았던 버그(COUNTRY_OVR_ADJ의 소수점 값이
+    그대로 새어나가 다른 곳에서 random.randint에 float로 들어가 터짐)를
+    여기서도 반복하지 않도록 round()로 정수화한다. continent를 안 넘기면
+    국가명으로 직접 조회한다(과거 시그니처로 불러도 죽지 않게)."""
+    if continent is None:
+        continent = get_country_continent(country)
+    bonus = round(CONTINENT_OVR_BONUS.get(continent, 0) + COUNTRY_OVR_ADJ.get(country, 0))
+    if grade == "SS":
+        bonus = min(bonus, 0)
+    return bonus
 
 _CONTINENT_MULT_MIN = {}   # 대륙별 "실제 지정된 국가들 중 최솟값" 캐시
 

@@ -190,7 +190,15 @@ def _age_and_progress(c):
         grade = COUNTRY_LEAGUE_GRADE.get(r["cname"], "F")
         rng = OVR_RANGES.get(grade, {}).get(r["tier"] or 1)
         top = rng[1] if rng else 43
-        bonus = CONTINENT_OVR_BONUS.get(r["continent"], 0) + COUNTRY_OVR_ADJ.get(r["cname"], 0)
+        # [버그수정 2026-07, 신민용 리포트: "이적시장 처리 중 오류: 'float'
+        # object cannot be interpreted as an integer"] COUNTRY_OVR_ADJ에
+        # 대한민국(1.5)·세르비아(-1.5)·우루과이/콜롬비아/에콰도르(-0.5)처럼
+        # 소수점 조정치가 섞여 있어서, 이 값이 그대로 bonus에 더해지면
+        # bonus 자체가 float이 되고, 그게 OVR 상한 계산에 계속 실려
+        # 내려가다가 결국 아래(신인 교체 로직)의 random.randint(mid, hi)에
+        # float가 그대로 들어가 터졌다. 정수 등급 보정치라는 원래 의도대로
+        # 여기서 반올림해 int로 확정한다.
+        bonus = round(CONTINENT_OVR_BONUS.get(r["continent"], 0) + COUNTRY_OVR_ADJ.get(r["cname"], 0))
         if grade == "SS":
             bonus = min(bonus, 0)
         team_cap[r["tid"]] = min(99, top + bonus + 3)
@@ -451,7 +459,13 @@ def _retire_and_replace(c, year, ai_rows=None):
                JOIN leagues l ON t.league_id = l.id
                JOIN countries cn ON l.country_id = cn.id""").fetchall():
         grade = COUNTRY_LEAGUE_GRADE.get(r["cname"], "D")
-        bonus = CONTINENT_OVR_BONUS.get(r["continent"], 0) + COUNTRY_OVR_ADJ.get(r["cname"], 0)
+        # [버그수정 2026-07, 신민용 리포트: "이적시장 처리 중 오류: 'float'
+        # object cannot be interpreted as an integer"] COUNTRY_OVR_ADJ의
+        # 소수점 조정치(대한민국 1.5, 세르비아 -1.5, 우루과이/콜롬비아/
+        # 에콰도르 -0.5)가 그대로 더해지면 bonus가 float이 되고, 그게
+        # lo/hi/mid를 전부 float으로 오염시켜 아래 random.randint(mid, hi)
+        # 에서 바로 이 예외가 났다. 정수로 반올림해서 확정한다.
+        bonus = round(CONTINENT_OVR_BONUS.get(r["continent"], 0) + COUNTRY_OVR_ADJ.get(r["cname"], 0))
         if grade == "SS":
             bonus = min(bonus, 0)
         team_info[r["tid"]] = (grade, r["tier"] or 1, bonus, r["cname"], r["continent"], r["tname"])

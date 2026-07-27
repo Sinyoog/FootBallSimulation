@@ -120,6 +120,12 @@ QHeaderView::section { background:#252525; color:#888; border:none; padding:4px;
 #backBtn { background:#2a6a2a; color:white; border:none; border-radius:6px;
            padding:10px 20px; font-size:13px; }
 #backBtn:hover { background:#3a8a3a; }
+#leftPanel  { background:#1e1e1e; }
+#rightPanel { background:#181818; border-left:2px solid #2a2a2a; }
+#storyTitle { color:#00ff88; font-size:18px; font-weight:bold;
+              padding:14px 18px 8px 18px; }
+#storyBig   { background:#181818; color:#e6e6e6; font-size:14px;
+              line-height:1.6; border:none; padding:6px 18px 18px 18px; }
 """
 
 
@@ -129,14 +135,14 @@ class RetireWindow(QDialog):
         from PyQt6.QtCore import Qt
         self.setWindowModality(Qt.WindowModality.NonModal)
         self.setWindowTitle("은퇴")
-        self.setMinimumSize(680, 820)
+        self.setMinimumSize(1100, 820)
         self.setStyleSheet(STYLE)
         self.lang   = lang
         self.parent_win = parent
         self._build()
 
     def _build(self):
-        root = QVBoxLayout(self)
+        root = QHBoxLayout(self)
         root.setSpacing(0)
         root.setContentsMargins(0,0,0,0)
 
@@ -150,12 +156,19 @@ class RetireWindow(QDialog):
             _save_career_entry(p, st["current_year"], st["current_week"])
         add_log(f"🎖 {p['name']} 선수 은퇴. {p['age']}세.", "event")
 
+        # ── 좌측 패널 (이력/성적 + 하단 버튼) ─────────────
+        left_panel = QWidget(); left_panel.setObjectName("leftPanel")
+        self.left_panel = left_panel
+        left_v = QVBoxLayout(left_panel)
+        left_v.setSpacing(0); left_v.setContentsMargins(0,0,0,0)
+        root.addWidget(left_panel, stretch=0)
+
         # ── 스크롤 영역 ───────────────────────────────
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
         inner  = QWidget(); lay = QVBoxLayout(inner)
         lay.setSpacing(14); lay.setContentsMargins(16,16,16,16)
         scroll.setWidget(inner)
-        root.addWidget(scroll, stretch=1)
+        left_v.addWidget(scroll, stretch=1)
 
         # 이름 헤더
         nm = QLabel(f"⭐  {p['name']}  ⭐"); nm.setObjectName("heroName")
@@ -332,51 +345,78 @@ class RetireWindow(QDialog):
         lay.addWidget(t4)
         lay.addWidget(self._award_table(awards))
 
-        # ── AI 커리어 요약 ───────────────────────────
-        t5 = QLabel("✨ AI 커리어 스토리")
-        t5.setObjectName("secTitle")
-        lay.addWidget(t5)
-
-        self.story_box = QTextEdit()
-        self.story_box.setObjectName("story")
-        self.story_box.setReadOnly(True)
-        self.story_box.setMinimumHeight(80)
-        self.story_box.setMaximumHeight(180)
-        self.story_box.setPlaceholderText("아래 버튼을 눌러 AI가 커리어 스토리를 만들어 드립니다...")
-        lay.addWidget(self.story_box)
         lay.addStretch()
 
-        # ── 하단 버튼: root에 고정 (화면 크기와 무관하게 항상 보임) ──
+        # ── 하단 버튼: 좌측 패널 바닥에 고정 (화면 크기와 무관하게 항상 보임) ──
         btn_row = QHBoxLayout()
         btn_row.setContentsMargins(16, 6, 16, 10)
 
-        self.gen_btn = QPushButton("✨ AI 스토리 생성")
+        self.gen_btn = QPushButton("✨ AI 커리어 요약")
         self.gen_btn.setObjectName("genBtn")
         self.gen_btn.clicked.connect(self._gen_story)
+
+        self.book_btn = QPushButton("📖 AI 스토리 생성")
+        self.book_btn.setObjectName("genBtn")
+        self.book_btn.clicked.connect(self._open_story_book)
 
         back_btn = QPushButton("🏠 시작 화면으로")
         back_btn.setObjectName("backBtn")
         back_btn.clicked.connect(self._go_start)
 
         btn_row.addWidget(self.gen_btn)
+        btn_row.addWidget(self.book_btn)
         btn_row.addWidget(back_btn)
-        root.addLayout(btn_row)
+        left_v.addLayout(btn_row)
+
+        # ── 우측 패널: AI 커리어 요약 (전체 화면 사용) ──────
+        right_panel = QWidget(); right_panel.setObjectName("rightPanel")
+        right_v = QVBoxLayout(right_panel)
+        right_v.setSpacing(0); right_v.setContentsMargins(0,0,0,0)
+        root.addWidget(right_panel, stretch=1)
+
+        t5 = QLabel("✨ AI 커리어 요약")
+        t5.setObjectName("storyTitle")
+        right_v.addWidget(t5)
+
+        self.story_box = QTextEdit()
+        self.story_box.setObjectName("storyBig")
+        self.story_box.setReadOnly(True)
+        self.story_box.setPlaceholderText(
+            "좌측 하단의 'AI 커리어 요약' 버튼을 누르면 기록 요약이,\n"
+            "'AI 스토리 생성' 버튼을 누르면 책 형태의 연대기 창이 뜹니다...")
+        right_v.addWidget(self.story_box, stretch=1)
+
 
     def showEvent(self, event):
         super().showEvent(event)
+        self.showMaximized()
+
+        # 은퇴 화면은 좌측(이력) + 우측(AI 스토리)을 한 화면에 모두 보여준다.
+        # 커리어 창(career_window.py)과 똑같이 표가 가로 스크롤 없이 다
+        # 보이는 게 최우선이고, 우측 AI 스토리 패널은 화면이 넉넉할 때만
+        # 그 나머지를 차지한다 (최소 폭만 보장).
         from PyQt6.QtWidgets import QTableWidget
         from PyQt6.QtGui import QGuiApplication
-        max_w = 700
-        for tbl in self.findChildren(QTableWidget):
-            w = sum(tbl.columnWidth(i) for i in range(tbl.columnCount())) + 40
+        min_w = 720
+        right_min = 460  # 우측 AI 스토리 패널에 최소한 남겨줄 폭
+        tables = self.findChildren(QTableWidget)
+        max_w = min_w
+        for tbl in tables:
+            w = sum(tbl.columnWidth(i) for i in range(tbl.columnCount())) + 50
             max_w = max(max_w, w)
-        # 화면 크기 초과 방지
         screen = QGuiApplication.primaryScreen().availableGeometry()
-        max_w = min(max_w, int(screen.width() * 0.95))
-        # 높이도 화면의 90% 이하로 제한 (버튼이 잘리지 않도록)
-        target_h = max(820, self.height())
-        target_h = min(target_h, int(screen.height() * 0.90))
-        self.resize(max_w, target_h)
+        # 화면이 넉넉하면 표 전체가 보이는 폭(max_w) 그대로 사용하고,
+        # 화면이 좁아서 우측 최소 폭을 침범할 때만 그만큼만 줄인다.
+        left_w = max(min_w, min(max_w, screen.width() - right_min))
+        self.left_panel.setFixedWidth(left_w)
+        # 좌측 패널 폭 안에 들어오는 표는 가로 스크롤바를 꺼서 깔끔하게,
+        # 그래도 넘치는(화면이 아주 좁을 때) 표만 스크롤 가능하게 남긴다.
+        for tbl in tables:
+            w = sum(tbl.columnWidth(i) for i in range(tbl.columnCount())) + 50
+            if w <= left_w - 20:
+                tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            else:
+                tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
     # ── 테이블 헬퍼 ──────────────────────────────────
 
@@ -414,14 +454,24 @@ class RetireWindow(QDialog):
         cols = (["기간","포지션","국가","리그","팀명","연봉","출전"]
                 + stat_cols
                 + ["평균평점","팀순위","승무패","계약","이적"])
-        # 이슈3: 단기(1~4주차 이적, 0경기) 항목 제거
-        visible = [e for e in entries if not (
-            e.get("start_week", 1) <= 4
-            and e.get("end_year", 0) != 0
-            and e.get("start_year") == e.get("end_year")
-            and e.get("end_week", 0) <= 4
-            and e.get("matches", 0) == 0
-        )]
+        # 이슈3: '스퓨리어스 중복 행'(이벤트 없이 잔류만 하는데 실수로
+        # 새 행이 또 생기는 버그, transfer_type='')만 숨긴다. 진짜
+        # 이적/입단/오퍼 이벤트(transfer_type이 채워짐)는 기간이 짧고
+        # 0경기여도 실제 기록이므로 항상 보여준다.
+        # [2026-07 버그수정, 신민용 리포트: "베어스 FC 입단 기록이 은퇴창
+        # 팀 이력에 아예 안 보인다"] 예전엔 transfer_type을 확인하지 않고
+        # 무조건 걸러서, career_window.py(_is_empty_short)에는 정상적으로
+        # 뜨는 "2001-01-01 입단 → 곧바로 이적" 같은 실제 기록이 은퇴창
+        # 에서만 사라졌다. career_window.py와 동일한 기준으로 맞춘다.
+        def _is_empty_short(e):
+            if e.get("transfer_type"):
+                return False
+            if e.get("end_year", 0) == 0:  return False
+            if e.get("matches", 0) != 0:   return False
+            sy = e.get("start_year", 0); ey = e.get("end_year", 0)
+            sw = e.get("start_week", 1); ew = e.get("end_week", 0)
+            return sy == ey and (ew - sw) <= 4
+        visible = [e for e in entries if not _is_empty_short(e)]
         tbl  = self._make_table(len(visible), cols)
         
         prev_team = None
@@ -439,9 +489,9 @@ class RetireWindow(QDialog):
 
             sy = e.get("start_year",""); sw = e.get("start_week", 1)
             ey = e.get("end_year","");   ew = e.get("end_week", 52)
-            from constants import week_to_iso_date_str
+            from constants import week_to_iso_date_str, week_to_iso_date_str_end
             start_str = week_to_iso_date_str(sy, sw) if sy else ""
-            end_str = week_to_iso_date_str(ey, ew) if ey else ""
+            end_str = week_to_iso_date_str_end(ey, ew) if ey else ""
             period = f"{start_str} ~ {end_str}"
 
             pos   = e.get("position","")
@@ -509,12 +559,18 @@ class RetireWindow(QDialog):
                 # 같은 팀 계속 (대시)
                 c_str = "—"
             
+            # 이적료 표시 — career_window.py와 동일 로직 (은퇴창에 누락되어
+            # "오퍼로 얼마에 팔렸는지"가 안 보이던 버그 수정).
+            _fee = e.get("transfer_fee", 0)
+            if _fee:
+                t_type = f"{t_type} ({fmt_money(_fee)})"
+
             # 이적 컬럼
             tt_color = "#cc4444" if t_type in ("팔림", "방출", "계약만료") else None
 
             from game_engine import team_matches_played_in_window, league_total_teams_by_name
             _total_g2 = team_matches_played_in_window(
-                e.get("team_name", ""), e.get("league_name", ""), sy, sw, ey, ew)
+                e.get("team_id", 0), e.get("league_name", ""), sy, sw, ey, ew)
             _apps_str2 = f"{e.get('matches',0)}/{_total_g2}" if _total_g2 else str(e.get("matches", 0))
 
             ln = e.get("league_name", "")
@@ -591,9 +647,9 @@ class RetireWindow(QDialog):
         for i, e in enumerate(visible):
             sy = e.get("start_year", ""); sw = e.get("start_week", 1)
             ey = e.get("end_year", "");   ew = e.get("end_week", 52)
-            from constants import week_to_iso_date_str
+            from constants import week_to_iso_date_str, week_to_iso_date_str_end
             start_str = week_to_iso_date_str(sy, sw) if sy else ""
-            end_str = week_to_iso_date_str(ey, ew) if ey else ""
+            end_str = week_to_iso_date_str_end(ey, ew) if ey else ""
             period = f"{start_str} ~ {end_str}"
 
             # [2026-07 버그수정, career_window.py와 동일 버그 발견/수정] ey가 0
@@ -605,7 +661,7 @@ class RetireWindow(QDialog):
                 e.get("team_id", 0), _nat, sy or 0, _extras_end_year)
 
             _league_total = team_matches_played_in_window(
-                e.get("team_name", ""), e.get("league_name", ""), sy, sw, ey, ew) or 0
+                e.get("team_id", 0), e.get("league_name", ""), sy, sw, ey, ew) or 0
             grand_played = e.get("matches", 0) + extras["matches_played"]
             grand_avail = _league_total + extras["matches_available"]
             apps_str = f"{grand_played}/{grand_avail}" if grand_avail else str(grand_played)
@@ -1012,9 +1068,9 @@ class RetireWindow(QDialog):
             for idx, e in enumerate(entries):
                 sy = e.get("start_year",""); sw = e.get("start_week",1)
                 ey = e.get("end_year","");   ew = e.get("end_week",52)
-                from constants import week_to_iso_date_str
+                from constants import week_to_iso_date_str, week_to_iso_date_str_end
                 start_str = week_to_iso_date_str(sy, sw) if sy else ""
-                end_str = week_to_iso_date_str(ey, ew) if ey else ""
+                end_str = week_to_iso_date_str_end(ey, ew) if ey else ""
                 period = f"{start_str} ~ {end_str}"
                 pos = e.get("position","")
                 grp = position_group(pos)
@@ -1098,7 +1154,7 @@ class RetireWindow(QDialog):
                 # 분모에 들어가 출전율이 왜곡된다 — 그 팀 소속 기간 동안
                 # 실제로 열린 경기 수로 바꾼다(team_matches_played_in_window).
                 from game_engine import team_matches_played_in_window
-                _total_g = team_matches_played_in_window(e.get("team_name", ""), lg, sy, sw, ey, ew)
+                _total_g = team_matches_played_in_window(e.get("team_id", 0), lg, sy, sw, ey, ew)
                 _apps_str = f"{m}/{_total_g}" if _total_g else str(m)
                 head = (f"  • {period} | {pos} | {nation} | {lg_disp} | "
                         f"{e.get('team_name','')} | {salary} | 출전 {_apps_str}")
@@ -1117,7 +1173,7 @@ class RetireWindow(QDialog):
                 _extras3 = get_full_history_extras_for_period(
                     e.get("team_id", 0), p.get("nationality", ""), sy or 0, _extras3_end_year)
                 _league_total3 = team_matches_played_in_window(
-                    e.get("team_name", ""), lg, sy, sw, ey, ew) or 0
+                    e.get("team_id", 0), lg, sy, sw, ey, ew) or 0
                 _grand_played = m + _extras3["matches_played"]
                 _grand_avail = _league_total3 + _extras3["matches_available"]
                 _apps_str3 = f"{_grand_played}/{_grand_avail}" if _grand_avail else str(_grand_played)
@@ -1396,8 +1452,58 @@ class RetireWindow(QDialog):
         lines.append(f"  총 자산: {fmt_money(p.get('total_assets',0))}")
 
         self.story_box.setPlainText("\n".join(lines))
-        self.gen_btn.setText("✨ 다시 생성")
+        self.gen_btn.setText("✨ 다시 요약")
         self.gen_btn.setEnabled(True)
+
+    # ── AI 스토리(책) 생성 ─────────────────────────────
+
+    def _open_story_book(self):
+        """story_generator.py(로컬 문장 뱅크 기반, API 비사용)로 장문
+        연대기를 만들어 책 형태의 새 창(StoryBookWindow)으로 띄운다."""
+        self.book_btn.setEnabled(False)
+        self.book_btn.setText("⏳ 생성 중...")
+        try:
+            p = get_player()
+            conn = get_conn(); c = conn.cursor()
+            entries = [dict(r) for r in c.execute(
+                "SELECT * FROM career_entries ORDER BY id").fetchall()]
+
+            from game_engine import get_my_trophies
+            all_trophies = get_my_trophies()
+            trophies = [t for t in all_trophies if not _is_personal_award(t)]
+            try:
+                awards = [dict(r) for r in c.execute(
+                    "SELECT * FROM awards WHERE is_mine=1 ORDER BY year").fetchall()]
+            except Exception:
+                awards = []
+
+            # entries에 실제 국가 정보를 채워준다 — story_generator가 리그명
+            # 문자열 추측이 아니라 이 country 필드로 '해외 진출/귀국'을
+            # 정확히 구분한다 (K리그2 같은 국내 리그명엔 국가 접두어가
+            # 없어서 문자열 추측만으로는 오탐이 났었다).
+            league_country = {}
+            for e in entries:
+                ln = e.get("league_name", "")
+                if ln and ln not in league_country:
+                    row = c.execute("""SELECT cn.name as cname FROM leagues l
+                                        JOIN countries cn ON l.country_id=cn.id
+                                        WHERE l.name=? LIMIT 1""", (ln,)).fetchone()
+                    league_country[ln] = row["cname"] if row else ""
+                e["country"] = league_country.get(ln, "")
+            conn.close()
+
+            intl_trophies = [t for t in trophies if t.get("tier", 0) == 0]
+
+            import story_generator
+            story_text = story_generator.generate_story(
+                p, entries, trophies, awards, intl_trophies=intl_trophies)
+
+            from ui.story_book_window import StoryBookWindow
+            self._book_win = StoryBookWindow(p.get("name", "선수"), story_text, parent=self)
+            self._book_win.show()
+        finally:
+            self.book_btn.setEnabled(True)
+            self.book_btn.setText("📖 AI 스토리 생성")
 
     # ── 시작 화면으로 ─────────────────────────────────
 

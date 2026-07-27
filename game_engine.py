@@ -741,13 +741,43 @@ def _calc_clean_sheets(c, tid, season, matches=None):
     return cs
 
 
+def _team_wdl_from_results(c, tid, league_id, season):
+    """[버그수정 2026-07, 신민용 리포트: "커리어 팀 전적이 세계기록실 순위표랑
+    다르다 — 실제 44경기 시즌인데 69승무패로 나온다"] teams.wins/draws/losses는
+    매 시즌 리셋되긴 하지만, 그 사이 다른 경로(오퍼 창 미리보기 시뮬레이션 등)에서
+    같은 리그+시즌에 중복 일정이 끼어들면 이 카운터가 실제 경기 수보다 부풀 수
+    있다 — 반면 world_browser 순위표(get_league_standings)는 항상 match_results를
+    직접 집계해서 보여주므로 그쪽이 진짜 정확한 값이다. _save_career_entry는
+    이미 이 방식으로 고쳐져 있었는데 _update_career_stats/_close_career_entry는
+    여전히 옛 카운터를 읽고 있었다 — 여기서 셋 다 같은 방식(match_results 직접
+    집계)을 쓰도록 통일한다."""
+    tw = td = tl = 0
+    if not league_id:
+        return tw, td, tl
+    rows = c.execute(
+        """SELECT home_team_id, away_team_id, home_score, away_score
+           FROM match_results WHERE league_id=? AND season=? AND home_score>=0""",
+        (league_id, season)).fetchall()
+    for row in rows:
+        hid, aid, hs, as_ = row["home_team_id"], row["away_team_id"], row["home_score"], row["away_score"]
+        if hid == tid:
+            if hs > as_: tw += 1
+            elif hs == as_: td += 1
+            else: tl += 1
+        elif aid == tid:
+            if as_ > hs: tw += 1
+            elif as_ == hs: td += 1
+            else: tl += 1
+    return tw, td, tl
+
+
 def _update_career_stats(p, year, week):
     """열린 커리어 항목의 스탯만 갱신. end_year는 건드리지 않음."""
     tid = p.get("current_team_id", 0)
     if not tid: return
     conn = get_conn()
     c = conn.cursor()
-    team_row = c.execute("""SELECT t.name, l.name as lname, l.tier
+    team_row = c.execute("""SELECT t.name, l.id as lid, l.name as lname, l.tier
                              FROM teams t JOIN leagues l ON t.league_id=l.id
                              WHERE t.id=?""", (tid,)).fetchone()
     if not team_row:
@@ -776,11 +806,10 @@ def _update_career_stats(p, year, week):
     _pac_c = p.get("season_pass_acc_cnt",0)
     d_pac = round(p.get("season_pass_acc_sum",0.0)/_pac_c, 3) if _pac_c else 0.0
 
-    # [최적화] teams 테이블에서 직접 읽기 (match_results 풀스캔 제거)
-    trec = c.execute("SELECT wins, draws, losses FROM teams WHERE id=?", (tid,)).fetchone()
-    tw = trec["wins"] if trec else 0
-    td = trec["draws"] if trec else 0
-    tl = trec["losses"] if trec else 0
+    # [버그수정 2026-07] teams 테이블의 누적 카운터 대신 match_results에서
+    # 직접 집계 (_save_career_entry와 동일 방식 — world_browser 순위표와
+    # 항상 일치하도록).
+    tw, td, tl = _team_wdl_from_results(c, tid, team_row["lid"], season)
 
     cs = _calc_clean_sheets(c, tid, season, matches=sm)
 
@@ -805,7 +834,7 @@ def _close_career_entry(p, year, week, exit_type=""):
     conn = get_conn()
     c = conn.cursor()
 
-    team_row = c.execute("""SELECT t.name, l.name as lname, l.tier
+    team_row = c.execute("""SELECT t.name, l.id as lid, l.name as lname, l.tier
                              FROM teams t JOIN leagues l ON t.league_id=l.id
                              WHERE t.id=?""", (tid,)).fetchone()
     if not team_row:
@@ -837,11 +866,10 @@ def _close_career_entry(p, year, week, exit_type=""):
     _pac_c2 = p.get("season_pass_acc_cnt",0)
     d_pac = round(p.get("season_pass_acc_sum",0.0)/_pac_c2, 3) if _pac_c2 else 0.0
 
-    # 팀 전적: teams 테이블에서 직접 읽기
-    trec2 = c.execute("SELECT wins, draws, losses FROM teams WHERE id=?", (tid,)).fetchone()
-    tw = trec2["wins"] if trec2 else 0
-    td = trec2["draws"] if trec2 else 0
-    tl = trec2["losses"] if trec2 else 0
+    # [버그수정 2026-07] teams 테이블의 누적 카운터 대신 match_results에서
+    # 직접 집계 (_save_career_entry와 동일 방식 — world_browser 순위표와
+    # 항상 일치하도록).
+    tw, td, tl = _team_wdl_from_results(c, tid, team_row["lid"], season)
 
     cs = _calc_clean_sheets(c, tid, season, matches=sm)
 
@@ -4994,14 +5022,20 @@ def _league_full_season_matches(p) -> int:
     return max(1, (n_teams - 1) * legs)
 
 
-def team_matches_played_in_window(team_name: str, league_name: str,
+def team_matches_played_in_window(team_id: int, league_name: str,
                                    start_year, start_week, end_year, end_week):
-    """[버그수정 2026-07, 신민용 지적] 커리어 "출전 X/Y"의 분모(Y)가 지금까지
-    league_total_games_by_name()로 그 리그의 '풀시즌 전체 경기 수'를 그대로
-    썼는데, 이러면 시즌 중간에 이적한 스탠트는 실제로 그 팀에 있던 기간
-    동안 열린 경기 수보다 분모가 훨씬 커져서("21/34"처럼) 마치 벤치/부상
-    때문에 절반도 못 뛴 것처럼 오해하게 만든다 — 사실은 애초에 그 팀에
-    있지도 않았던 기간의 경기까지 분모에 다 들어가 있던 것.
+    """[버그수정 2026-07, 신민용 리포트: "전체 이력이 33/3처럼 말이 안 되는
+    분모로 나온다 / 팀 이력에서 분모(출전 X/Y의 Y)가 통째로 빠진다"]
+
+    예전 버전은 team_name으로 '지금 이 순간' teams 테이블에서 그 팀을
+    다시 찾았는데, 그 팀이 그 스탠트 이후 승격/강등으로 다른 리그(다른
+    league_id)로 옮겨갔으면 "league_id=(그 스탠트 당시 리그) AND
+    name=팀명" 조건에 걸리는 행이 하나도 없어서 조용히 실패했다(None
+    반환 → 분모가 통째로 사라지거나, 다른 대회 출전만 분모에 남아
+    "33/3"처럼 분자보다 작은 분모가 나옴). team_id는 승격/강등과 무관하게
+    영구히 같은 값이고 career_entries에 이미 저장돼 있으므로, 팀을 다시
+    찾을 필요 없이 이 함수는 그 team_id를 그대로 받아서 쓴다 — league_name은
+    '그 스탠트 당시 어느 리그(=몇 부)에서 뛰었는지' 필터링 용도로만 쓴다.
 
     이 함수는 대신 "내가 그 팀 소속이었던 기간(start~end) 동안 그 팀이
     실제로 치른 리그 경기 수"를 센다 — 내가 직접 뛰었는지와 무관하게
@@ -5012,7 +5046,7 @@ def team_matches_played_in_window(team_name: str, league_name: str,
 
     end_year가 0/미정이면(아직 그 팀 소속 = 현재 진행 중인 스탠트) 지금
     게임 시점까지로 계산한다."""
-    if not team_name or not league_name or not start_year:
+    if not team_id or not league_name or not start_year:
         return None
     conn = get_conn()
     lrow = conn.execute("SELECT id FROM leagues WHERE name=? LIMIT 1", (league_name,)).fetchone()
@@ -5020,12 +5054,7 @@ def team_matches_played_in_window(team_name: str, league_name: str,
         conn.close()
         return None
     lid = lrow["id"]
-    trow = conn.execute(
-        "SELECT id FROM teams WHERE league_id=? AND name=? LIMIT 1", (lid, team_name)).fetchone()
-    if not trow:
-        conn.close()
-        return None
-    tid = trow["id"]
+    tid = team_id
 
     ey, ew = end_year, end_week
     if not ey:
@@ -7381,11 +7410,13 @@ def generate_offers(count=5) -> list:
     #   · 소속 있음(이적시즌 오퍼): 현재 리그 국가 3 + 고향(대표국적) 3 + 타국 4 = 10
     # 이적요청 중이면 기존처럼 보너스를 주되, 어느 구역이 늘어야 할지 애매하므로
     # 전부 '타국' 구역에 더한다(해외로 더 넓게 알아본다는 느낌).
-    from constants import TRANSFER_REQUEST_OFFER_BONUS
+    from constants import TRANSFER_REQUEST_OFFER_BONUS, get_league_relative_margin, get_passive_offer_rank_weight
     transfer_req = bool(p.get("transfer_requested"))
     _bonus = TRANSFER_REQUEST_OFFER_BONUS if transfer_req else 0
-    NO_TEAM_DOMESTIC = 10
-    NO_TEAM_FOREIGN  = 6 + _bonus
+    # [밸런스 조정 2026-07] 무소속 오퍼 총량 16→12 (현실성 검토: "16개는 조금
+    #   과한 편" — 선택지는 남기되 오퍼 하나하나의 가치를 살린다).
+    NO_TEAM_DOMESTIC = 8
+    NO_TEAM_FOREIGN  = 4 + _bonus
     HAS_TEAM_LEAGUE_COUNTRY = 3
     HAS_TEAM_HOMETOWN       = 3
     HAS_TEAM_FOREIGN        = 4 + _bonus
@@ -7433,18 +7464,47 @@ def generate_offers(count=5) -> list:
         if r["avg_ovr"] is not None
     }
 
+    # [밸런스 조정 2026-07, 현실성 검토 반영] 마진 기준을 "그 나라 등급"에서
+    #   "그 팀이 자기 리그 안에서 몇 등급이냐(상대적 위치)"로 변경.
+    #   기존엔 F급 국가면 무조건 마진 7(팀 평균보다 7 낮아도 입단) 처럼
+    #   나라 하나로 퉁쳤는데, 실제로는 같은 나라 안에서도 우승권 팀은
+    #   깐깐하고 강등권 팀은 관대해야 자연스럽다. 그래서 같은 리그 소속팀들
+    #   끼리 평균 OVR 백분위를 매겨 명문(상위 20%, 마진1)~최하위(하위 20%,
+    #   마진5)로 나눈다.
+    _team_league_map: dict = {
+        r["id"]: r["league_id"]
+        for r in c.execute("SELECT id, league_id FROM teams").fetchall()
+    }
+    _league_avgs: dict = {}
+    for _tid, _avg in _team_avg_cache_offers.items():
+        _lid = _team_league_map.get(_tid)
+        if _lid is None:
+            continue
+        _league_avgs.setdefault(_lid, []).append(_avg)
+    for _lid in _league_avgs:
+        _league_avgs[_lid].sort(reverse=True)  # 내림차순: 앞쪽 = 리그 내 강팀
+
+    def _team_relative_margin(team_row) -> int:
+        """팀이 속한 리그 내 평균 OVR 백분위로 마진(1~5) 결정.
+           명문(상위20%)=1 ~ 최하위(하위20%)=5. 리그 정보가 없으면 하위호환
+           기본값(CLUB_JOIN_MARGIN)으로 폴백."""
+        tid = team_row["id"]
+        team_avg = _team_avg_cache_offers.get(tid)
+        peers = _league_avgs.get(_team_league_map.get(tid))
+        if team_avg is None or not peers or len(peers) < 2:
+            return CLUB_JOIN_MARGIN
+        rank = sum(1 for v in peers if v >= team_avg)  # 1=리그 최강팀
+        pct = rank / len(peers)
+        return get_league_relative_margin(pct)
+
     def _team_fits_me(team_row) -> bool:
-        """팀 평균 OVR 대비 내 OVR 차이가 '그 팀 국가 등급별 마진' 이내면 True.
-           상위 등급(S/A) 리그일수록 마진이 작아(빡빡) 검증된 선수만 입단 가능."""
+        """팀 평균 OVR 대비 내 OVR 차이가 '그 팀의 리그 내 상대적 위치별
+           마진' 이내면 True. 명문 팀일수록 마진이 작아(빡빡) 검증된 선수만
+           입단 가능, 하위권/강등권 팀일수록 관대하다."""
         team_avg = _team_avg_cache_offers.get(team_row["id"])
         if team_avg is None:
             return True
-        try:
-            from constants import get_league_grade as _glg
-            grade = _glg(team_row.get("country", ""), team_row["grade"])
-        except Exception:
-            grade = None
-        margin = CLUB_JOIN_MARGIN_BY_GRADE.get(grade, CLUB_JOIN_MARGIN)
+        margin = _team_relative_margin(team_row)
         return (team_avg - ovr) <= margin
 
     first_join = (not has_team and age <= 18)
@@ -7471,11 +7531,21 @@ def generate_offers(count=5) -> list:
                          JOIN leagues l ON t.league_id=l.id
                          JOIN countries cn ON l.country_id=cn.id
                          WHERE cn.id=? AND l.tier=?
-                         ORDER BY RANDOM() LIMIT 1""", (country_id, tier))
-            row = c.fetchone()
-            if not row: continue
-            if row["id"] in exclude_ids or row["id"] == my_tid: continue
-            if not _team_fits_me(row): continue
+                         ORDER BY RANDOM() LIMIT 20""", (country_id, tier))
+            # [상위권 우선 가중치 추첨 2026-07, 신민용 설계+GPT 검토] 후보를
+            #   넉넉히 뽑아 마진 통과한 것들만 남긴 뒤, 팀 평균 OVR이 높은
+            #   순서로 줄 세워 순위별 가중치로 추첨한다. 마진(들어갈 수
+            #   있는지)은 그대로 두고 '그 안에서 어떤 팀을 보여줄지'만
+            #   상위권 쪽에 무게를 실어서, 매번 같은 1~2팀만 고정되지 않게
+            #   한다 — 하위권은 어차피 직접 지원으로도 갈 수 있어 패시브
+            #   오퍼 슬롯을 거기 쓸 이유가 없다.
+            cands = [r for r in c.fetchall()
+                     if r["id"] not in exclude_ids and r["id"] != my_tid and _team_fits_me(r)]
+            if not cands:
+                continue
+            cands.sort(key=lambda r: _team_avg_cache_offers.get(r["id"], 0), reverse=True)
+            _w = [get_passive_offer_rank_weight(i + 1) for i in range(len(cands))]
+            row = random.choices(cands, _w)[0]
             _wealth_g = get_league_grade(row["country"], row["grade"])
             salary = _clamp_salary_to_cap(
                 int(_calc_salary(_wealth_g, tier, ovr, row["country"], row["name"]) * random.uniform(0.85, 1.15)),
@@ -7504,7 +7574,7 @@ def generate_offers(count=5) -> list:
                              JOIN leagues l ON t.league_id=l.id
                              JOIN countries cn ON l.country_id=cn.id
                              WHERE cn.grade=? AND l.tier=? AND cn.id NOT IN ({placeholders})
-                             ORDER BY RANDOM() LIMIT 1""", tuple([_grade_filter, tier] + _excl))
+                             ORDER BY RANDOM() LIMIT 20""", tuple([_grade_filter, tier] + _excl))
             else:
                 c.execute("""SELECT t.id,t.name,l.id as lid,l.name as lname,l.tier,
                                     cn.name as country,cn.flag,cn.grade
@@ -7512,11 +7582,17 @@ def generate_offers(count=5) -> list:
                              JOIN leagues l ON t.league_id=l.id
                              JOIN countries cn ON l.country_id=cn.id
                              WHERE cn.grade=? AND l.tier=?
-                             ORDER BY RANDOM() LIMIT 1""", (_grade_filter, tier))
-            row = c.fetchone()
-            if not row: continue
-            if row["id"] in exclude_ids or row["id"] == my_tid: continue
-            if not _team_fits_me(row): continue
+                             ORDER BY RANDOM() LIMIT 20""", (_grade_filter, tier))
+            # [상위권 우선 가중치 추첨 2026-07] _fill_country_pool과 동일한
+            #   원리 — 넉넉히 뽑아서 마진 통과분만 남기고, 팀 평균 OVR
+            #   내림차순 순위별 가중치로 추첨한다.
+            cands = [r for r in c.fetchall()
+                     if r["id"] not in exclude_ids and r["id"] != my_tid and _team_fits_me(r)]
+            if not cands:
+                continue
+            cands.sort(key=lambda r: _team_avg_cache_offers.get(r["id"], 0), reverse=True)
+            _w = [get_passive_offer_rank_weight(i + 1) for i in range(len(cands))]
+            row = random.choices(cands, _w)[0]
             _wealth_g = get_league_grade(row["country"], row["grade"])
             salary = _clamp_salary_to_cap(
                 int(_calc_salary(_wealth_g, tier, ovr, row["country"], row["name"]) * random.uniform(0.85, 1.15)),
@@ -8007,9 +8083,10 @@ def calc_apply_prob_with_context(team_id, ctx):
     대한 확률만 계산 — 검색 결과 목록을 순회할 때 이걸 쓴다."""
     if ctx is None:
         return 0.0, True
+    from constants import get_league_relative_margin
     conn = get_conn()
     row = conn.execute(
-        """SELECT l.tier, cn.name as country, cn.grade as cgrade, cn.continent as continent
+        """SELECT l.id as lid, l.tier, cn.name as country, cn.grade as cgrade, cn.continent as continent
            FROM teams t JOIN leagues l ON t.league_id=l.id
            JOIN countries cn ON l.country_id=cn.id WHERE t.id=?""", (team_id,)).fetchone()
     if not row:
@@ -8018,8 +8095,24 @@ def calc_apply_prob_with_context(team_id, ctx):
     grade = get_league_grade(row["country"], row["cgrade"])
     team_avg_row = conn.execute(
         "SELECT AVG(ovr) as v FROM ai_players WHERE team_id=?", (team_id,)).fetchone()
-    conn.close()
     team_avg = team_avg_row["v"] if team_avg_row and team_avg_row["v"] else 50
+
+    # [밸런스 재설계 2026-07] 마진도 오퍼/입단과 동일하게 "국가 등급"이 아니라
+    # "그 팀이 자기 리그 안에서 몇 %냐"로 통일 — 같은 기준으로 평가돼야
+    # 직접 지원만 유독 헐렁해지는 불일치가 없어진다.
+    peer_rows = conn.execute(
+        """SELECT t.id as tid, AVG(ai.ovr) as avg_ovr FROM teams t
+           JOIN ai_players ai ON ai.team_id = t.id
+           WHERE t.league_id=? GROUP BY t.id""", (row["lid"],)).fetchall()
+    conn.close()
+    peers = [r["avg_ovr"] for r in peer_rows if r["avg_ovr"] is not None]
+    if len(peers) >= 2 and team_avg is not None:
+        peers.sort(reverse=True)
+        rank = sum(1 for v in peers if v >= team_avg)
+        pct = rank / len(peers)
+        margin = get_league_relative_margin(pct)
+    else:
+        margin = CLUB_JOIN_MARGIN_BY_GRADE.get(grade, CLUB_JOIN_MARGIN)
 
     # [버그수정] 부수(tier)를 반영한 완화된 등급으로 게이트 판정 — 같은
     # 나라라도 하위 리그는 실제 요구 재능이 낮다.
@@ -8044,7 +8137,6 @@ def calc_apply_prob_with_context(team_id, ctx):
     from constants import transfer_region_mod
     region_mod = transfer_region_mod(ctx["my_continent"], row["continent"])
 
-    margin = CLUB_JOIN_MARGIN_BY_GRADE.get(grade, CLUB_JOIN_MARGIN)
     gap = ctx["my_ovr"] - team_avg
     eff = (gap + margin + ctx["agent_mod"] + ctx["form_mod"] + ctx["age_mod"]
            + ctx["talent_mod"] + ctx["pop_mod"] + ctx["fame_mod"]
@@ -8202,17 +8294,23 @@ def _offer_probability(p, week: int) -> float:
     o_s = max(0.0, min(1.0, (ovr-30)/70))
     perf = r_s*0.6 + o_s*0.4
 
-    # 등급별 최소 보장 확률 (OVR 낮아도 F급 팀은 오퍼 올 수 있음)
-    min_prob = {"F":0.40,"E":0.45,"D":0.50,"C":0.55,"B":0.60,"A":0.65,"S":0.70}
-    guaranteed = min_prob.get(p.get("agent_grade","F"), 0.40)
+    # [밸런스 재설계 2026-07, GPT 검토+상수화 확정] 등급별 최소 보장 확률.
+    #   기존 40%~70%는 "경기 못 뛰고 평점 낮아도 이적시장 두 번이면 거의
+    #   반드시 온다"는 체감이었음 — 에이전트 등급에 따라 "일 잘하는 에이전트
+    #   (S) vs 거의 못 구해주는 에이전트(F)" 격차가 드러나도록 낮췄다.
+    #   실제확률 = max(하한선, 퍼포먼스 기반 확률).
+    from constants import AGENT_MIN_OFFER_PROB, get_contract_urgency_mult
+    guaranteed = AGENT_MIN_OFFER_PROB.get(p.get("agent_grade","F"), AGENT_MIN_OFFER_PROB["F"])
 
+    # [밸런스 재설계 2026-07] 계약 만료 임박 보너스를 연 단위 대신 "게임 내
+    #   남은 주 수" 단위로 세분화(보스만 룰 현실 반영: 3개월/6개월/1년
+    #   이하일수록 관심 급증). 시즌=52주 고정 구조 확인 완료.
     cur_year = p.get("current_year", GAME_START_YEAR)
     end_year = p.get("contract_end_year", 0)
-    years_left = max(0, end_year - cur_year) if end_year else 3
-    if years_left <= 1:   contract_mult = 1.5
-    elif years_left == 2: contract_mult = 1.2
-    elif years_left >= 4: contract_mult = 0.7
-    else:                 contract_mult = 1.0
+    cur_week = get_state().get("current_week", 1)
+    weeks_left = ((end_year - cur_year) * 52 + (52 - cur_week)) if end_year else 999
+    weeks_left = max(0, weeks_left)
+    contract_mult = get_contract_urgency_mult(weeks_left)
 
     calculated = base * perf * contract_mult
     return min(0.95, max(guaranteed, calculated))
@@ -8250,13 +8348,18 @@ def _enrich_offer(o: dict, row) -> dict:
     team_avg = r["a"] if r and r["a"] else my_ovr
     gap = team_avg - my_ovr   # +면 내가 팀 수준에 못 미침
 
-    # 역할 결정
+    # 역할 결정 — [밸런스 재설계 2026-07, GPT 검토 반영] 나이 보정은
+    #   '능력이 정말 애매한 경우(격차 0~3, 팀 평균이 나와 비슷하거나 살짝
+    #   높음)'에만 적용한다. 격차가 음수로 큰 경우(내가 팀보다 확실히
+    #   나음)는 나이와 무관하게 주전 경쟁 이상을 유지 — "OVR 84, 팀평균 80,
+    #   31세인데 로테이션"처럼 실력이 나은데도 나이만으로 강등되는 걸 방지.
+    from constants import ROLE_AGE_THRESHOLD, ROLE_YOUNG_PROSPECT_MAX_AGE
     if gap <= -6:
         role = "주전 보장"
     elif gap <= 3:
-        role = "주전 경쟁"
+        role = "로테이션" if (gap >= 0 and my_age >= ROLE_AGE_THRESHOLD) else "주전 경쟁"
     else:
-        role = "유망주 영입" if my_age <= 21 else "로테이션"
+        role = "유망주 영입" if my_age <= ROLE_YOUNG_PROSPECT_MAX_AGE else "로테이션"
     o["role"] = role
 
     # 감독 관심도 (가중 랜덤, 단 주전보장이면 직접지명 확률↑)
@@ -8527,25 +8630,12 @@ def _save_career_entry(p, year, week, force_new=False, transfer_type=None,
     rs  = p.get("season_rating_sum", 0.0)
     avg_r = round(rs/rc, 2) if rc else 0.0
 
-    # 팀 전적: teams 테이블 대신 match_results에서 직접 집계 (sync 오염 방지)
+    # 팀 전적: teams 테이블 대신 match_results에서 직접 집계 (sync 오염 방지,
+    #   _team_wdl_from_results로 통일 — _update_career_stats/_close_career_entry와 동일)
     season = p.get("current_season", 1)
     league_id_row = c.execute("SELECT league_id FROM teams WHERE id=?", (tid,)).fetchone()
-    tw = td = tl = 0
-    if league_id_row:
-        lid = league_id_row["league_id"]
-        c.execute("""SELECT home_team_id, away_team_id, home_score, away_score
-                     FROM match_results WHERE league_id=? AND season=? AND home_score>=0""",
-                  (lid, season))
-        for row in c.fetchall():
-            hid, aid, hs, as_ = row[0], row[1], row[2], row[3]
-            if hid == tid:
-                if hs > as_: tw += 1
-                elif hs == as_: td += 1
-                else: tl += 1
-            elif aid == tid:
-                if as_ > hs: tw += 1
-                elif as_ == hs: td += 1
-                else: tl += 1
+    lid = league_id_row["league_id"] if league_id_row else None
+    tw, td, tl = _team_wdl_from_results(c, tid, lid, season)
     pos = get_field_pos(p)   # 배치 포지션 (포메이션 슬롯 기반, 없으면 주요 포지션)
     cs  = _calc_clean_sheets(c, tid, season, matches=sm)
 

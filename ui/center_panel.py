@@ -1775,6 +1775,13 @@ class CenterPanel(QWidget):
         # 이미 한 번 통과해서 뜬 오퍼이므로 재판정하면 안 된다.
         restore = load_pending_offer_state(kind="auto_offer")
         if restore:
+            # [버그수정 2026-07] 저장된 오퍼가 있어도 그 사이 사용자가 토글을
+            #   껐다면(이적 요청 중이 아닌 한) 무시하고 보여주지 않아야 한다.
+            #   기존엔 이 체크가 없어서 "토글을 꺼도 오퍼가 뜬다"는 문제가 있었다.
+            if not p.get("offers_enabled", 1) and not p.get("transfer_requested"):
+                from game_engine import clear_pending_offer_state
+                clear_pending_offer_state()
+                return
             offers = restore.get("offers", [])
         else:
             # [오퍼 토글] 꺼져 있으면 자동 오퍼 팝업을 건너뛴다.
@@ -1854,6 +1861,12 @@ class CenterPanel(QWidget):
         elif kind == "auto_offer":
             if not p.get("current_team_id"):
                 # 소속이 없어진(방출 등) 비정상 상태 — 남은 상태만 정리.
+                clear_pending_offer_state()
+                return
+            # [버그수정 2026-07] 오퍼 창을 띄운 채(또는 뜨기 직전 상태로) 게임을
+            #   종료했다가, 재시작 전/후 사이에 토글을 껐다면 — 이적 요청 중이
+            #   아닌 한 그대로 복원하지 않고 정리한다. (기존엔 무조건 복원)
+            if not p.get("offers_enabled", 1) and not p.get("transfer_requested"):
                 clear_pending_offer_state()
                 return
             self._auto_offer_shown = True
