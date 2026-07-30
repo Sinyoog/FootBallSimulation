@@ -129,7 +129,7 @@ PRESTIGE_TEAMS = {
 # 결과 명문팀 평균 OVR이 일반팀보다 8~10점이나 높게 나왔다(S급 리그에선
 # 에이스 목표치가 100을 넘어 그냥 캡에 걸리는 낭비도 있었음). 6.0 → 4.0으로
 # 낮춰 "상위권에 꽤 쏠리지만 압도적이진 않은" 수준으로 완화한다.
-PRESTIGE_WEIGHT = 4.0
+PRESTIGE_WEIGHT = 3.0
 
 # [2026-07 신설, 신민용 리포트: "PRESTIGE_OVR_BONUS를 찾을 수 없다는
 # ImportError가 난다"] database._generate_team_players()/_target_ovr()가
@@ -153,7 +153,7 @@ PRESTIGE_WEIGHT = 4.0
 # 만으로도 상위 슬롯 편중 효과는 여전히 크게 남아 있으므로, 이 고정
 # 보너스는 8.0 → 3.0으로 낮춘다 — 두 장치를 합친 실제 격차가 리그 평균
 # 대비 +4점 안팎(수정 전 +8~10)이 되도록 시뮬레이션으로 확인한 값이다.
-PRESTIGE_OVR_BONUS = 3.0
+PRESTIGE_OVR_BONUS = 2.0
 
 
 def is_prestige(country: str, tier: int, team_name: str) -> bool:

@@ -78,61 +78,115 @@ def _get_real_squad_ovr(country):
     return sum(p["ovr"] for p in picked) / len(picked)
 
 
-def _nat_team_ovr(grade, name="", continent="", fast=False):
-    """[2026-07 신설, 신민용 지적: "한국 국대 OVR이 너무 높다"] 국가대표
-    OVR을 등급(GRADE_TEAM_OVR)만으로 정하면, 클럽 쪽에서 이미 적용 중인
-    대륙보정(CONTINENT_OVR_BONUS)·나라별 미세조정(COUNTRY_OVR_ADJ)이
-    전혀 반영이 안 된다. 대한민국은 A등급이지만 클럽 생성 시엔 대륙보정
-    -3(아시아) + 나라별 조정 -3("K리그 — A등급 안에서는 중하위")이 항상
-    같이 들어가는데, 국가대표 쪽만 그 두 조정을 건너뛰고 유럽 A등급
-    국가(포르투갈 등)와 똑같은 값을 받고 있었다. 여기서 그 두 보정을
-    국가대표 OVR에도 동일하게 적용한다.
+_grade_rank_cache = {}   # {grade: [(country_name, fifa_rank), ...] 오름차순} — 등급별 1회만 조회
 
-    [2026-07 재조정, 신민용 지적: "최상위 팀도 현실처럼 고점은 높지만
-    가끔 80대까지 떨어질 수 있어야 한다 — 독일이 2014 우승 후 하향곡선을
-    타고 이탈리아가 3년 동안 월드컵 예선을 못 뚫었던 것처럼, 이건 모든
-    강대국에 적용되는 게 맞다"] 균등분포(-2~+2) 대신 삼각분포를 쓴다 —
-    최빈값은 여전히 고점 근처(+1)라 대부분 시즌엔 세계 최정상급이지만,
-    분포 왼쪽 꼬리가 -10까지 길게 뻗어있어 가끔(체감상 4~5년에 한 번
-    꼴) 전력이 크게 빠지는 '침체기'가 자연스럽게 나온다. 오른쪽 꼬리도
-    +4까지 있어 절정기엔 기준 base(93)보다 더 높은 초강세 시즌도 가능.
 
-    [2026-07 재조정, 신민용 확정: "국적 시스템 만들었으니 국대도 실제
-    선수 기반으로"] ai_players.nationality로 실제 스쿼드를 구성할 수
-    있으면(포지션별 8명 이상 확보) 그 실제 평균을 70%, 기존 공식값을
-    30%로 블렌딩한다.
+def get_nat_ovr_band(name, grade):
+    """[2026-07 신설, 신민용+GPT 검토] 나라 이름 -> (하한, 중간값, 상한) 밴드.
+    NAT_OVR_BAND에 직접 지정된 나라(S/A/B 61개국 + C등급 예외 4개국)는
+    그 값을 그대로 쓰고, 없으면 등급별 범위(NAT_OVR_GRADE_BAND_RANGE)
+    안에서 fifa_rank 오름차순 순위 비율로 선형보간한다."""
+    from constants import NAT_OVR_BAND, NAT_OVR_GRADE_BAND_RANGE
+    if name in NAT_OVR_BAND:
+        return NAT_OVR_BAND[name]
 
-    [2026-07 성능 긴급수정, 신민용 리포트: "41→43주차에서 15~20초씩
-    멈춘다"] 월드컵 예선처럼 전 세계 200여 개국을 한 번에 순회하며 이
-    함수를 부르는 대량 호출 지점에서, 나라마다 실제 스쿼드 조회
-    (_get_real_squad_ovr, 포지션당 최대 3단계 폴백 = 나라당 최대 33개
-    쿼리)까지 다 태우면 200개국 × 33쿼리로 수천 개 쿼리가 한꺼번에
-    몰려서 체감될 만큼 느려진다. fast=True면 이 실제 스쿼드 블렌딩을
-    건너뛰고 공식값만 쓴다 — 예선 통과 여부 같은 대량·근사 계산에는
-    공식값만으로도 충분하고, 실제 매치 시뮬레이션이나 개인상 판정처럼
-    나라 1~2개만 정확히 봐야 하는 곳은 fast=False(기본값)로 그대로
-    정확한 블렌딩을 쓴다."""
-    base = GRADE_TEAM_OVR.get(grade, 45)
-    # [2026-07 재설계, 신민용 지적: "대륙+등급 가감산을 매번 역산할 거면
-    # 애초에 국가별 목표치를 직접 잡으면 되는거 아닌가"] COUNTRY_OVR_ADJ
-    # (대륙보정 위 델타)가 COUNTRY_OVR_TARGET(절대 목표 상한치)으로
-    # 바뀌었다 — 그런데 그 목표치는 "리그 등급" 기준으로 리서치된 값이라,
-    # 여기(국가대표 OVR, grade는 국대 등급이라 리그 등급과 다를 수 있음
-    # — 예: 사우디는 국대 C급/리그 A급)에 그대로 절대치를 갖다 쓰면 안
-    # 맞다. 대신 그 나라의 "리그 등급" 기준으로 델타를 구해서(클럽 쪽과
-    # 동일한 국가별 체감 보정값을 유지), 국가대표 베이스(GRADE_TEAM_OVR,
-    # 국대 등급 기준)에 더한다 — 원래 의도("클럽에 적용 중인 보정을
-    # 국가대표에도 동일 적용")를 그대로 살리면서 등급 불일치 문제를
-    # 피한다.
-    _league_grade = get_league_grade(name, grade)
-    adj = get_country_ovr_bonus(name, _league_grade, continent)
-    noise = random.triangular(-10, 4, 1)
-    formula_val = base + adj + noise
+    lo_r, mid_r, hi_r = NAT_OVR_GRADE_BAND_RANGE.get(grade, ((30, 30), (40, 40), (50, 50)))
+    if grade not in _grade_rank_cache:
+        conn = get_conn()
+        rows = conn.execute(
+            "SELECT name, fifa_rank FROM countries WHERE grade=? ORDER BY fifa_rank",
+            (grade,)).fetchall()
+        conn.close()
+        _grade_rank_cache[grade] = [(r["name"], r["fifa_rank"]) for r in rows]
+    ranked = _grade_rank_cache[grade]
+    total = len(ranked)
+    idx = next((i for i, (n, _) in enumerate(ranked) if n == name), total // 2)
+    t = idx / max(1, total - 1)   # 0(등급 내 1위) ~ 1(등급 내 꼴찌)
+
+    def _interp(rng):
+        lo, hi = rng
+        return round(hi - t * (hi - lo), 1)
+    return (_interp(lo_r), _interp(mid_r), _interp(hi_r))
+
+
+def _get_generation_coef(name, year):
+    """[2026-07 신설, 신민용+GPT 검토: "밴드만 있으면 매년 독립적으로
+    난수를 뽑아서 올해 하한 찍었다가 내년 바로 상한 찍는 롤러코스터가
+    나온다"] 나라별 '세대 계수'(0.97~1.03)를 nat_generation 테이블에
+    저장해두고, 8~12년 주기로만 새 목표치를 뽑은 뒤 그 목표를 향해
+    매년 조금씩(NAT_GENERATION_STEP) 다가간다 — 같은 해에 여러 번
+    불려도 같은 값을 반환하고(연도 단위 일관성), 연도가 바뀌면 딱
+    그만큼만 진행시킨다."""
+    if not name or not year:
+        return 1.0
+    from constants import NAT_GENERATION_STEP, NAT_GENERATION_RANGE, NAT_GENERATION_CYCLE_YEARS
+    conn = get_conn()
+    c = conn.cursor()
+    row = c.execute("SELECT * FROM nat_generation WHERE country=?", (name,)).fetchone()
+    if row is None:
+        # 최초 생성 — 나라마다 랜덤 위상으로 시작해서 모든 나라가 동시에
+        # 세대교체하지 않게 한다.
+        cycle_len = random.randint(*NAT_GENERATION_CYCLE_YEARS)
+        target = round(random.uniform(*NAT_GENERATION_RANGE), 4)
+        coef = round(random.uniform(*NAT_GENERATION_RANGE), 4)
+        c.execute("""INSERT INTO nat_generation(country, coef, target, cycle_start_year, cycle_len, last_year)
+                     VALUES(?,?,?,?,?,?)""", (name, coef, target, year, cycle_len, year))
+        conn.commit()
+        conn.close()
+        return coef
+
+    coef, target = row["coef"], row["target"]
+    cycle_start, cycle_len = row["cycle_start_year"], row["cycle_len"]
+    last_year = row["last_year"]
+    if year <= last_year:
+        conn.close()
+        return coef   # 같은 해(또는 과거) 재조회 — 이미 저장된 값 그대로
+
+    y = last_year
+    while y < year:
+        y += 1
+        if (y - cycle_start) >= cycle_len:
+            target = round(random.uniform(*NAT_GENERATION_RANGE), 4)
+            cycle_start = y
+            cycle_len = random.randint(*NAT_GENERATION_CYCLE_YEARS)
+        coef = round(coef + (target - coef) * NAT_GENERATION_STEP, 4)
+    c.execute("""UPDATE nat_generation SET coef=?, target=?, cycle_start_year=?, cycle_len=?, last_year=?
+                 WHERE country=?""", (coef, target, cycle_start, cycle_len, y, name))
+    conn.commit()
+    conn.close()
+    return coef
+
+
+def _nat_team_ovr(grade, name="", continent="", fast=False, year=None):
+    """[2026-07 전면 재설계, 신민용+GPT 검토: "OVR가 100에 몰린다/등급이
+    역전된다"] 예전 방식(등급 base + 대륙보정 + 국가별 조정치 + 노이즈를
+    따로따로 더하고 빼는 방식)은 최종 합산값이 어디 떨어지는지 검증할
+    수 없어서, 노이즈를 더하기도 전에 이미 상한(100)을 넘는 나라가
+    생기고(포르투갈 47.8%가 그냥 100) 등급 역전(모로코 S인데 A 밑)도
+    나왔다. 이제 나라마다 (하한, 중간값, 상한) 밴드를 직접 지정하고
+    (get_nat_ovr_band), random.triangular(하, 상, 중)으로 뽑는다 — 값
+    자체가 이미 1~100 안에서 확정되므로 클램프에 쏠리는 문제가 구조적
+    으로 없다.
+
+    [세대 계수] 밴드 안에서 매년 완전 독립적으로 뽑으면 "올해 하한,
+    내년 바로 상한" 롤러코스터가 나오므로, 8~12년 주기로 서서히 움직이는
+    나라별 계수(_get_generation_coef)를 곱한다 — "국가 등급은 안 바뀌고
+    세대만 바뀐다"는 설계 원칙을 결과값에도 반영한다. year를 안 넘기면
+    (연도 무관 호출) 계수 없이 밴드 삼각분포만 쓴다.
+
+    [실제 스쿼드 블렌딩] ai_players.nationality로 실제 스쿼드를 구성할
+    수 있으면(포지션별 8명 이상) 그 실제 평균을 70%, 밴드 기반 공식값을
+    30%로 블렌딩한다. fast=True면 이 블렌딩을 건너뛰고 공식값만 쓴다
+    (월드컵 예선처럼 200여 개국을 한 번에 순회하는 대량 호출 지점 전용
+    — 나라마다 실제 스쿼드 조회까지 다 태우면 체감될 만큼 느려진다)."""
+    lo, mid, hi = get_nat_ovr_band(name, grade)
+    gen_coef = _get_generation_coef(name, year) if (name and year) else 1.0
+    formula_val = min(100.0, max(1.0, random.triangular(lo, hi, mid) * gen_coef))
     if fast:
         return formula_val
     real_val = _get_real_squad_ovr(name) if name else None
     if real_val is not None:
-        return round(0.7 * real_val + 0.3 * formula_val, 2)
+        return round(min(100.0, max(1.0, 0.7 * real_val + 0.3 * formula_val)), 2)
     return formula_val
 
 STAGE_KO = {"group": "조별리그", "R32": "32강", "R16": "16강", "QF": "8강", "SF": "4강", "F": "결승", "TP": "3/4위전",
@@ -356,7 +410,7 @@ def choose_national_team(tournament_id, nat):
             _tconf2 = (_trow2["continent"] or "").strip()
             _big2 = (_tyear2 + 1) >= WC_EXPAND_YEAR
             _qcfg2 = (WC_QUAL_48 if _big2 else WC_QUAL_32).get(_tconf2, {})
-            _all_rows2 = sorted(_enrich_countries(_conf_countries(_tconf2)),
+            _all_rows2 = sorted(_enrich_countries(_conf_countries(_tconf2), year=_tyear2),
                                 key=lambda r: r["ovr"], reverse=True)
             _cutoff2 = _qcfg2.get("cutoff_bottom", 0)
             _cut_names2 = {r["name"] for r in _all_rows2[len(_all_rows2)-_cutoff2:]}
@@ -812,12 +866,25 @@ def start_intl_tournament(year):
     #   각 연맹별로 _create_qual_tournament 호출.
     #   내 국적이 속한 연맹만 my_sel=1/2/3, 나머지는 my_sel=2(출전 없음).
     #   통과국은 _finalize_qual이 qual_results에 저장 → 다음 해 본선 entries 구성.
+    # [2026-07 신설, 신민용 리포트: "2002년 월드컵이 통째로 사라졌다"]
+    # 예전엔 이 for문에 try/except가 없어서, 한 대륙(예: 아시아) 생성 중
+    # 예외가 나면 for문 자체가 끊겨 뒤이은 대륙(아프리카 등)까지 함께
+    # 생성이 안 됐다 — 그 결과 다음 해 본선(_qualify_world)이 "예선 결과
+    # 누락"으로 통째로 실패해 월드컵 자체가 그 주기 내내 사라졌다. 대륙별로
+    # 예외를 격리해서, 한 대륙이 실패해도 나머지 대륙은 정상적으로 예선이
+    # 생성되게 한다 — 실패를 숨기는 게 아니라(에러는 그대로 로그에 남는다),
+    # 무관한 대륙까지 함께 망가지는 것만 막는다.
     if is_wc_qual:
         all_confs = ["유럽", "아메리카", "아시아", "아프리카"]
         for conf in all_confs:
-            _create_qual_tournament(year, "wc_qual", conf,
-                                    p=p, my_nats=my_nats, nat_info=nat_info,
-                                    committed=committed)
+            try:
+                _create_qual_tournament(year, "wc_qual", conf,
+                                        p=p, my_nats=my_nats, nat_info=nat_info,
+                                        committed=committed)
+            except Exception as e:
+                from game_engine import add_log
+                add_log(f"⚠ {year}년 월드컵 {conf} 예선 생성 오류: {e}"
+                        f"  (다른 대륙 예선은 정상 진행)", "event")
         return
 
     # ── 대륙컵: 4개 대륙 연맹 전부 생성 ──
@@ -1207,6 +1274,25 @@ def _normalize_form(raw_by_id, my_id, my_raw):
     return {k: _norm(v) for k, v in raw_by_id.items()}, _norm(my_raw)
 
 
+def _intl_tier_penalty(tier):
+    """[2026-07 신설, 신민용 지적: "K2/K3에서만 뛴 선수가 국가대표 주전
+    경쟁을 하는 건 비현실적 — 선발 로직이 지금 뛰는 리그 등급(1부인지
+    하위리그인지)을 아예 안 본다"] OVR·폼만으로 선발을 정하면, 하위리그
+    에서도 OVR/폼 수치만 맞으면 1부 경험이 전무해도 상위 대표팀 경쟁에서
+    이길 수 있다 — 실제로는 "지금 어느 무대에서 검증되고 있는지"가 대표팀
+    선발에 크게 작용한다(스카우트 노출·코칭 수준·경기 강도 차이). 모든
+    나라·포지션에 공통 적용되는 완만한 페널티를 선발점수에 추가한다 —
+    1부는 무페널티, 부수가 내려갈수록 커진다. 절대 문턱(하위리그는 무조건
+    탈락)은 아니라서, 정말 압도적인 폼/OVR을 가진 '깜짝 발탁'은 여전히
+    가능하다(실제 축구에도 드물게 있는 사례) — 다만 그 정도로 확실하게
+    나아야 한다는 문턱만 높였다.
+    """
+    t = tier or 1
+    if t <= 1:
+        return 0.0
+    return {2: -4.0, 3: -9.0, 4: -15.0}.get(t, -18.0)
+
+
 def _check_selection(p, my_grade, country="", continent=""):
     """국가대표 선발 판정 — [2026-07 전면 재설계, 신민용 확정] "OVR이 그
     나라 평균과 비슷하면 무조건 뽑힌다"는 절대 문턱 방식에서, 실제
@@ -1215,13 +1301,15 @@ def _check_selection(p, my_grade, country="", continent=""):
     선수가 이미 정원만큼 있으면, 내 OVR이 웬만큼 높아도 밀릴 수 있다
     (실제로 그렇듯이).
 
-    선발점수 = OVR×45% + 정규화폼×55% − 페널티
+    선발점수 = OVR×45% + 정규화폼×55% − 페널티 − 부수페널티(_intl_tier_penalty)
       - 폼은 _intl_form_raw()(개인상 포지션 가중치에서 ovr 항만 뺀 것)를
         그 나라 동포지션 후보군 안에서 상대 정규화(최고100/최저40)한 값.
         "지금 잘하는 선수"가 커리어 내내 OVR만 높은 선수보다 유리해지는
         핵심 장치.
       - 페널티는 예전처럼 임계값을 올리는 게 아니라 선발점수를 직접 깎는다
-        (장기부상 -15, 감독불화 -8, 출장시간부족 -6).
+        (장기부상 -15, 감독불화 -8, 출장시간부족 -6, 하위리그 소속 -4~-18).
+        하위리그 페널티는 나(내 선수)와 AI 동포 후보 전원에게 동일한
+        기준으로 적용된다(그 나라 CM AI가 하위리그에 있어도 똑같이 깎임).
     포지션 그룹(GK/DF/MF/FW) 안에서 AI 동포 선수 전원(_estimate_ai_season
     으로 폼 추정) + 나를 한 풀에 놓고 점수 순으로 정렬 → 정원 안에 들면
     선발. 정원 경계(마지노선, INTL_SELECTION_MARGIN=3점 이내 차이)에서는
@@ -1247,20 +1335,35 @@ def _check_selection(p, my_grade, country="", continent=""):
     team_avg = GRADE_TEAM_OVR.get(my_grade, 45) + \
         get_country_ovr_bonus(country, _league_grade_team, continent)
 
-    # 그 나라 동포지션 AI 후보 전원 수집 + 폼 추정
+    # 그 나라 동포지션 AI 후보 전원 수집 + 폼 추정 (+ 실제 소속 리그 부수)
     conn = get_conn()
     ph = ",".join("'%s'" % pp for pp in group_members)
     rows = conn.execute(
-        f"SELECT id, ovr, position, sub_role, age FROM ai_players "
-        f"WHERE nationality=? AND position IN ({ph})", (nat,)).fetchall()
+        f"""SELECT ap.id, ap.ovr, ap.position, ap.sub_role, ap.age, l.tier AS tier
+            FROM ai_players ap
+            LEFT JOIN teams t ON ap.team_id = t.id
+            LEFT JOIN leagues l ON t.league_id = l.id
+            WHERE ap.nationality=? AND ap.position IN ({ph})""", (nat,)).fetchall()
     conn.close()
-    from game_engine import _estimate_ai_season, _estimate_ai_clean_sheets
-    raw_by_id, ovr_by_id = {}, {}
+    from game_engine import _estimate_ai_season, _estimate_ai_clean_sheets, _calc_clean_sheets_for_player
+    raw_by_id, ovr_by_id, tier_by_id = {}, {}, {}
     for r in rows:
-        g, a, rt = _estimate_ai_season(r["ovr"], r["position"], team_avg, team_avg, r["sub_role"])
-        cs = _estimate_ai_clean_sheets(r["position"], r["ovr"], team_avg, team_avg, 14) if pos_group == "GK" else 0
+        # [2026-07 버그수정, 신민용 리포트: "K2/K3에서만 뛴 선수가 국가대표
+        # 로 너무 쉽게 뽑힌다"] _estimate_ai_season/_estimate_ai_clean_sheets에
+        # full_season_matches를 안 넘겨서 기본값 14로 계산되고 있었다 —
+        # 반면 내 선수의 폼은 실제 풀시즌(보통 30~38경기) 누적치를 그대로
+        # 쓴다. 즉 AI 동포 후보 전원의 추정 생산량이 실제의 1/3 수준으로
+        # 깎인 채 나(전체 시즌 실측치)와 비교됐다 — 그 결과 내 폼이 OVR
+        # 90대 AI보다도 항상 정규화 최고점(100)을 받아버려서, 부수 페널티
+        # 정도로는 이 격차를 절대 못 뒤집었다. 38경기(리그 대표 기준,
+        # GOALS_PER_GAME_FOR_TITLE 등 다른 곳에서 쓰는 기준과 동일)로
+        # 맞춰서 AI도 나와 동일한 '풀시즌' 기준으로 비교되게 한다.
+        g, a, rt = _estimate_ai_season(r["ovr"], r["position"], team_avg, team_avg, r["sub_role"],
+                                        full_season_matches=38)
+        cs = _estimate_ai_clean_sheets(r["position"], r["ovr"], team_avg, team_avg, 38) if pos_group == "GK" else 0
         raw_by_id[r["id"]] = _intl_form_raw(r["position"], g, a, rt, cs)
         ovr_by_id[r["id"]] = r["ovr"]
+        tier_by_id[r["id"]] = r["tier"] or 1   # 팀 정보 없음(드묾) → 무페널티 폴백
 
     # 내 폼(실제 이번 시즌 기록)
     _rc = p.get("season_rating_cnt", 0)
@@ -1282,10 +1385,12 @@ def _check_selection(p, my_grade, country="", continent=""):
         penalty += 3.0
     if p.get("season_matches", 0) < 10:
         penalty += 6.0
+    penalty -= _intl_tier_penalty(p.get("current_tier", 1))   # 마이너스 페널티를 더하는 형태이므로 부호 반전
 
     my_ovr = p.get("ovr", 0)
     my_score = my_ovr * 0.45 + my_norm * 0.55 - penalty
-    ai_scores = sorted((ovr_by_id[k] * 0.45 + norm_by_id[k] * 0.55 for k in raw_by_id), reverse=True)
+    ai_scores = sorted((ovr_by_id[k] * 0.45 + norm_by_id[k] * 0.55 + _intl_tier_penalty(tier_by_id.get(k, 1))
+                        for k in raw_by_id), reverse=True)
 
     if len(ai_scores) < quota:
         return True  # 그 포지션에 나 포함해도 정원이 안 찬 나라 — 자동 선발
@@ -1329,7 +1434,7 @@ def _qualify_world(year=0):
     _t0 = time.perf_counter()
     for r in all_countries:
         r["conf"] = _conf_key(r["continent"])
-        r["ovr"]  = _nat_team_ovr(r["grade"], r["name"], r["continent"], fast=True)
+        r["ovr"]  = _nat_team_ovr(r["grade"], r["name"], r["continent"], fast=True, year=year)
         r["qual"] = GRADE_QUAL_BASE.get(r["grade"], 0.2) + random.uniform(-QUAL_NOISE, QUAL_NOISE)
     print(f"[PERF] 월드컵 예선 전세계 {len(all_countries)}개국 OVR계산 {time.perf_counter()-_t0:.2f}s")
     # [버그 수정 — 근본 원인] qual_results에 같은 나라가 중복으로 들어있으면
@@ -1433,7 +1538,7 @@ def _qualify_continental(my_continent):
     conn.close()
     for r in rows:
         r["qual"] = GRADE_QUAL_BASE.get(r["grade"], 0.2) + random.uniform(-QUAL_NOISE, QUAL_NOISE)
-        r["ovr"] = _nat_team_ovr(r["grade"], r["name"], r["continent"], fast=True)
+        r["ovr"] = _nat_team_ovr(r["grade"], r["name"], r["continent"], fast=True, year=year)
     print(f"[PERF] 대륙컵 예선 폴백 {len(rows)}개국 OVR계산 완료")
     rows.sort(key=lambda r: r["qual"], reverse=True)
     return rows[:CONT_TEAMS]
@@ -1466,12 +1571,12 @@ def _conf_countries(conf_key):
     return rows
 
 
-def _enrich_countries(rows):
+def _enrich_countries(rows, year=None):
     """국가 목록에 ovr/qual 점수 추가."""
     import time
     _t0 = time.perf_counter()
     for r in rows:
-        r["ovr"]  = _nat_team_ovr(r["grade"], r.get("name", ""), r.get("continent", ""), fast=True)
+        r["ovr"]  = _nat_team_ovr(r["grade"], r.get("name", ""), r.get("continent", ""), fast=True, year=year)
         r["qual"] = GRADE_QUAL_BASE.get(r["grade"], 0.2) + random.uniform(-QUAL_NOISE, QUAL_NOISE)
     if len(rows) >= 20:   # 소규모 호출까지 매번 찍으면 로그 스팸이라 큰 호출만
         print(f"[PERF] _enrich_countries {len(rows)}개국 OVR계산 {time.perf_counter()-_t0:.2f}s")
@@ -1514,7 +1619,7 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
             pass
 
     # 연맹 전체 국가 조회
-    all_rows = _enrich_countries(_conf_countries(continent))
+    all_rows = _enrich_countries(_conf_countries(continent), year=year)
     if len(all_rows) < 4:
         return
 
@@ -2485,7 +2590,7 @@ def _save_qual_results(t, continent, qualified_list, set_done=True):
         # 이미 추려진 소규모 목록)에 한해 fast=False로 다시 계산해서
         # 실제 스쿼드 반영값(70%)+공식값(30%) 블렌딩을 정확히 적용한다 —
         # 대상이 작아서 성능 문제도 없다.
-        _accurate_ovr = _nat_team_ovr(q.get("grade", "F"), q["country"], continent, fast=False)
+        _accurate_ovr = _nat_team_ovr(q.get("grade", "F"), q["country"], continent, fast=False, year=target_year)
         # DELETE로 이미 저장돼 있으면(재호출로 인한 중복 삽입
         # 방지) 먼저 지운 뒤 다시 넣는다 — set_done=False라 위에서 전체
         # DELETE를 안 했어도 국가 단위로는 항상 유일하게 유지된다.
@@ -3193,11 +3298,25 @@ def get_my_intl_matches(only_qual=False):
     else:
         kind_filter = "t.kind IN ('world','continent')"
     conn = get_conn()
+    # [2026-07 재수정, 신민용 지적: "다친 게 아니라 그냥 벤치라 안 뛴
+    # 경기도 있는데 그건 빠진다"] my_played=1이거나 absence_reason이
+    # 있는 것만 걸렀더니, "건강한데 로테이션으로 그냥 안 뛴" 경기
+    # (my_played=0이면서 absence_reason도 NULL)가 통째로 빠졌다 —
+    # 내 대표팀 소속으로 치러진 경기는 전부 보여주고(결과가 난 것만,
+    # is_my=1로 범위 한정), 뛰었는지 안 뛰었는지는 화면에서
+    # my_played/absence_reason으로 구분한다.
+    # [2026-07 재수정, 신민용 리포트: "국가대표 미선발인데 국제전 기록에
+    # 벤치로 뜬다"] is_my=1은 "이 나라가 내 후보국"이라는 뜻일 뿐, "이
+    # 대회에 실제로 선발됐다"는 뜻이 아니다(intl_matches.is_my는 후보국
+    # 매치에도 미리 찍혀 있음 — database.py 주석 참고). 실제 선발 여부는
+    # intl_tournaments.my_selected(1=선발)에 따로 있는데 이걸 빼먹어서,
+    # 미선발 대회의 경기까지 전부 "벤치"로 잘못 나왔다 — t.my_selected=1
+    # 조건을 추가해서 진짜 선발된 대회만 가져온다.
     rows = [dict(r) for r in conn.execute(
         f"""SELECT m.*, t.year AS t_year, t.name AS comp
            FROM intl_matches m
            JOIN intl_tournaments t ON m.tournament_id = t.id
-           WHERE (m.my_played = 1 OR m.my_absence_reason IS NOT NULL) AND {kind_filter}
+           WHERE m.is_my = 1 AND t.my_selected = 1 AND m.home_score >= 0 AND {kind_filter}
            ORDER BY t.year, m.week""").fetchall()]
     flags = {(r["tournament_id"], r["country"]): r["flag"]
              for r in conn.execute(
@@ -3253,6 +3372,7 @@ def get_my_intl_matches(only_qual=False):
             "blocks": m.get("my_blocks", 0), "pass_acc": m.get("my_pass_acc", 0),
             "score": f"{my_s}-{op_s}", "result": result,
             "absence_reason": m.get("my_absence_reason"),
+            "my_played": m.get("my_played", 0),
         })
     return out
 

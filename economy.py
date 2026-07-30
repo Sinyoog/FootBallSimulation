@@ -17,6 +17,49 @@ game_engine.py는 이 모듈에서 필요한 함수를 import해서 그대로 �
 """
 
 
+def economy_index(year: int) -> float:
+    """[2026-07 신설, 신민용+GPT 다회 검토 확정, v4] 시대별 경제 배율.
+    지금까지 연봉·시장가치 앵커는 전부 "2026년 축구 경제" 기준으로 잡혀
+    있었는데, 게임은 2001년부터 시작해서 2040년대까지 진행된다 — 즉
+    2001년에도 2026년 수준의 거액(OVR97=연봉 550억/이적료 6000억 등)이
+    그대로 나오는 시대착오가 있었다. 연도별 배율로 시대감을 반영한다.
+
+    앵커(2001=0.48은 2차 검토에서 0.40→0.48로 상향 확정 — "갈락티코 시대
+    (지단·호나우두·피구·베컴)도 지금보단 적었을 뿐 상당한 금액을 받았다"는
+    근거. OVR97 EPL 기준 550억×0.48≈264억로 "당대 최고 선수" 느낌).
+    2026=1.00(현재 앵커 그대로 나오는 기준점). 구간 사이는 선형 보간 —
+    현실은 점프·정체가 반복되지만(2008 금융위기/2017 네이마르 등),
+    게임에서는 예측 가능한 성장 곡선이 플레이어 경험상 더 낫다는 결론
+    (3차 검토에서도 재확인).
+    """
+    anchors = [
+        (2001, 0.48), (2005, 0.50), (2010, 0.65), (2015, 0.82),
+        (2020, 0.95), (2026, 1.00), (2035, 1.20), (2040, 1.35),
+    ]
+    if year <= anchors[0][0]:
+        return anchors[0][1]
+    if year >= anchors[-1][0]:
+        return anchors[-1][1]   # 2040 이후 정책은 추후 별도 확정
+    for (y1, v1), (y2, v2) in zip(anchors, anchors[1:]):
+        if y1 <= year <= y2:
+            t = (year - y1) / (y2 - y1)
+            return v1 + (v2 - v1) * t
+    return anchors[-1][1]
+
+
+def _apply_soft_cap(multiplier: float, threshold: float = 1.6, damp: float = 0.4) -> float:
+    """[2026-07 신설, v4] 이적료 복합배율(리그×포지션×명문×계약×나이×잠재력)이
+    전부 곱연산이라, 조건이 몰리면(SS급+명문팀+ST+21세 이하+계약5년+큰 잠재력
+    gap) 개별 배율의 의도보다 훨씬 커지는 문제가 있었다 — 앵커에서 2800억으로
+    잡아놔도 최종 5000억대까지 튀는 식. threshold를 넘는 초과분에만 damp
+    비율을 적용해 극단값만 눌러준다(평범한 선수는 threshold 밑이라 전혀 영향
+    없음). 파라미터(1.6/0.4)는 GPT 권고값 — 구현 후 대규모 시뮬레이션으로
+    분포를 보고 재검증 필요(v4 문서 TODO)."""
+    if multiplier <= threshold:
+        return multiplier
+    return threshold + (multiplier - threshold) * damp
+
+
 def _base_market_value_eok(ovr: int) -> float:
     """OVR → 기본 시장가치(억원), 연봉과 완전히 독립된 축.
     [2026-07 재설계, 신민용 지적: "연봉×배수 구조면 사우디처럼 연봉만 높은
@@ -26,16 +69,20 @@ def _base_market_value_eok(ovr: int) -> float:
     안에서는 지수보간한다. 리그 재정력은 이 값에 ±20~30%만 얹는다
     (아래 _market_value_league_mult).
 
-    [2026-07 4차 재조정, 신민용 지적: "Elite(81~94)가 너무 넓은데 90부터
-    경제가 폭발하고 있다 — 90~94와 96~100 차이가 부족하다. 81~88 완만,
-    89~94 점진적 상승, 95~96 급격한 벽, 97~100 월드클래스 폭발 형태가
-    맞다"] 90 근처 값을 낮추고, 94→95→96 사이(엘리트 최상단→월드클래스
-    진입)를 훨씬 가파르게 벌렸다.
+    [2026-07 5차 재조정, v4(GPT 다회 검토 확정)] 96/98/100 앵커(3000/4500/6000억)가
+    현실 역대 최고 이적료(네이마르 약 3000억, 엔조 페르난데스 약 1800억,
+    카이세도 약 2000억, 벨링엄 약 1700~1800억)보다 이미 96부터 웃돌아서,
+    96 이상 선수는 전부 "역사상 최고 이적료 후보"가 되는 문제가 있었다.
+    2026년 기준으로 앵커를 하향하고, 대신 economy_index(year)로 시대별
+    스케일을 조정하는 구조로 분리했다(연도 인플레이션은 이 함수가 아니라
+    호출부에서 별도 처리). 97 앵커를 새로 추가해 96→100 구간을 더 촘촘하게
+    보간한다.
     """
     anchors = [
         (40, 0.02), (60, 0.1), (70, 3), (75, 8), (80, 20),
         (82, 35), (85, 80), (88, 200), (90, 400), (92, 850),
-        (94, 1500), (95, 2200), (96, 3000), (98, 4500), (100, 6000),
+        (94, 1200), (95, 1700), (96, 2300), (97, 2800), (98, 3400),
+        (99, 4100), (100, 5000),
     ]
     if ovr <= anchors[0][0]:
         return anchors[0][1]
@@ -54,8 +101,10 @@ def _base_market_value_eok(ovr: int) -> float:
 # [2026-07 신설] 리그 재정력은 시장가치에 20~30%만 반영(연봉만큼 크게
 # 흔들지 않음). 등급별 기본값 + 나라별 역보정(오일머니 리그처럼 "연봉은
 # 높아도 시장가치는 오히려 낮아야 하는" 예외 케이스).
+# [2026-07 v4 재조정] SS 1.20→1.15로 하향 — 소프트캡 신설과 별개로,
+# 개별 배율 자체도 조금씩 낮춰서 극단값 도달을 더 어렵게 한다는 취지.
 MARKET_VALUE_GRADE_MULT = {
-    "SS": 1.20, "S": 1.05, "A": 0.90, "B": 0.70,
+    "SS": 1.15, "S": 1.05, "A": 0.90, "B": 0.70,
     "C": 0.50, "D": 0.35, "E": 0.25, "F": 0.15,
 }
 MARKET_VALUE_COUNTRY_MULT = {
@@ -78,7 +127,12 @@ POSITION_MARKET_MULT = {
     # [2026-07 재조정, 신민용 지적: "반다이크·그바르디올·루벤 디아스처럼
     # 최근 시장에서 CB도 공격수 못지않게 비싸다 — GK 0.75는 너무 FM식"]
     "ST": 1.15, "CF": 1.15, "LW": 1.10, "RW": 1.10,
-    "CAM": 1.10, "CM": 1.00, "CDM": 1.00,
+    # [2026-07 v4 재조정] 시장가치 앵커 근거로 인용한 실측 사례(엔조
+    # 페르난데스 약 1800억, 카이세도 약 2000억)가 둘 다 CDM인데 정작
+    # 배율은 CM과 같은 1.00(평균)이었다 — 근거 데이터와 배율표가 안 맞는
+    # 모순. 최근 시장에서 CDM이 확실히 비싸졌다는 지적도 반영해 CAM
+    # 근처로 상향.
+    "CAM": 1.10, "CM": 1.00, "CDM": 1.08,
     "LB": 0.95, "RB": 0.95, "LWB": 0.95, "RWB": 0.95,
     "CB": 1.05, "GK": 0.85,
 }
@@ -93,20 +147,60 @@ def _market_value_league_mult(grade: str, country: str = None) -> float:
 
 def _market_value_prestige_mult(country: str = None, team_name: str = None,
                                  tier: int = 1) -> float:
-    """[2026-07 신설, 신민용 지적: "명문팀 프리미엄은 연봉보다 오히려
-    시장가치(재판매가치·바이아웃) 쪽에 더 크게 붙는 게 현실 — 벤피카
-    유망주가 연봉은 낮아도 나중에 비싸게 팔린다"] 연봉 프리미엄
-    (PRESTIGE_SALARY_MULT)의 20%만 시장가치에도 얹는다(신민용 제안
-    5~15%보다 살짝 높게 잡되, 연봉만큼 크게 흔들지는 않도록 절반 이하로
-    제한 — 포르투갈 2.0배 연봉 프리미엄 → 시장가치는 +20%만 반영).
+    """[2026-07 v7 재조정, 신민용+GPT 다회 검토: "같은 등급 안에서도
+    구단 위상 차이(팬 규모·판매 경험·브랜드력)는 나야 한다 — 단 구단
+    재정 시스템처럼 크게 벌리지 말고 가볍게(±10%대)만"] 예전엔 명문팀
+    리스트에 있으면 무조건 1.05 고정이었는데, "전통 명문"과 "세계급
+    명문"이 똑같이 취급되는 게 어색하다는 지적 — 국가별 연봉 프리미엄
+    (PRESTIGE_SALARY_MULT, 이미 나라마다 세분화돼 있음)에 비례해서
+    스케일하되, 연봉만큼 크게 벌어지지 않도록 강하게 압축(10%만 반영)
+    한다. 예: 연봉 프리미엄 2.0배 국가의 명문팀 → 이적료는 1.10배만.
     """
     if not (team_name and country):
         return 1.0
     from data.prestige_clubs import is_prestige, PRESTIGE_SALARY_MULT, PRESTIGE_SALARY_MULT_DEFAULT
     if is_prestige(country, tier, team_name):
         salary_mult = PRESTIGE_SALARY_MULT.get(country, PRESTIGE_SALARY_MULT_DEFAULT)
-        return 1.0 + (salary_mult - 1.0) * 0.2
+        return max(1.0, min(1.20, 1.0 + (salary_mult - 1.0) * 0.10))
     return 1.0
+
+
+def _team_rank_status_mult(team_id, tier: int = 1, season=None) -> float:
+    """[2026-07 신설] "같은 등급이라도 그 리그 안에서 상위권/하위권이면
+    협상력이 다르다"는 지적 — 구단 재정 시스템은 안 만들고, 이미 있는
+    "현재 리그 순위"만 가볍게 반영한다(±5% 이내). 명문팀 리스트 밖의
+    일반 팀들 사이에서도 "리그 상위권팀 vs 하위권팀" 차이를 조금
+    만들어준다. 순위를 못 구하면(팀ID 없음, 시즌 초반 등) 중립(1.0).
+
+    [주의] teams.wins/draws/losses는 예전에 스케줄 재생성 버그로 부풀던
+    캐시 컬럼이라 여기서 직접 안 쓰고, 이미 match_results 기준으로
+    정확하게 재계산해주는 get_league_standings()를 그대로 재사용한다."""
+    if not team_id or tier != 1:
+        return 1.0
+    try:
+        from game_engine import get_league_standings
+        from database import get_conn
+        conn = get_conn()
+        row = conn.execute("SELECT league_id FROM teams WHERE id=?", (team_id,)).fetchone()
+        if not row:
+            conn.close()
+            return 1.0
+        league_id = row["league_id"]
+        conn.close()
+        standings = get_league_standings(league_id, season=season)
+        if not standings or len(standings) < 4:
+            return 1.0
+        rank = next((i for i, t in enumerate(standings) if t.get("id") == team_id), None)
+        if rank is None:
+            return 1.0
+        pct = rank / max(1, len(standings) - 1)   # 0=1위, 1=꼴찌
+        if pct <= 0.20:
+            return 1.05
+        if pct >= 0.80:
+            return 0.97
+        return 1.0
+    except Exception:
+        return 1.0
 
 
 CONTRACT_MULT = {0: 0.6, 1: 0.75, 2: 0.9, 3: 1.0, 4: 1.1}
@@ -148,18 +242,24 @@ def potential_mult(current_ovr, talent_cap) -> float:
     현재 OVR의 gap이 클수록(=아직 다 안 큰 유망주일수록) 프리미엄이
     붙는다. gap에 current_ovr 비례 가중치(quality)를 곱해서, "현재
     OVR70·gap25"인 선수가 "현재 OVR85·gap10"인 완성형 선수보다
-    비싸지는 역전을 완화한다."""
+    비싸지는 역전을 완화한다.
+
+    [2026-07 v4 재조정] 나이 배율과 잠재력 배율이 둘 다 "아직 안 큰
+    유망주"에게 겹쳐 붙어서 중복 반영되는 느낌이 있다는 지적 — 계수를
+    0.03→0.015로 절반 낮춘다(예: OVR90·gap10이면 기존 +27% → 현재 +13%
+    수준으로 완화).
+    """
     if not talent_cap or talent_cap <= current_ovr:
         return 1.0
     gap = talent_cap - current_ovr
     quality = current_ovr / 100.0
-    return 1.0 + gap * 0.03 * quality
+    return 1.0 + gap * 0.015 * quality
 
 
 def estimate_transfer_fee(grade, tier, ovr, country=None, team_name=None,
                           position=None, exit_type=None, age=None,
                           talent_cap=None, contract_remaining_years=None,
-                          debug=False):
+                          year=None, team_id=None, season=None, debug=False):
     """선수 시장가치(이적료 추정치, 천원 단위).
 
     exit_type: [11차 신설] "계약만료"면 진짜 FA — 다른 계수 계산 없이
@@ -169,6 +269,14 @@ def estimate_transfer_fee(grade, tier, ovr, country=None, team_name=None,
     age, talent_cap, contract_remaining_years: [11차 신설] 없으면(None,
       AI 선수 등) 전부 중립(1.0)으로 하위호환. my_player는 이미
       age/talent_cap/contract_end_year 필드가 다 있어 바로 연결 가능.
+    year: [2026-07 v4 신설] 게임 내 현재 연도 — economy_index(year)로
+      시대별 배율을 곱한다. None이면(하위호환) 1.0(2026년 기준, 배율
+      없음)으로 취급 — 호출부가 아직 year를 안 넘기는 경우에도 기존과
+      동일하게 동작.
+    team_id, season: [2026-07 v7 신설, 신민용 지적: "같은 등급 안에서도
+      팀별 위상 차이가 있어야 한다"] 있으면 _team_rank_status_mult로
+      "그 리그 안에서 상위권/하위권인지"를 가볍게(±5%) 반영한다. 없으면
+      (AI 선수 등 기존 호출부) 중립(1.0)으로 하위호환.
     """
     if exit_type == "계약만료":
         return 0
@@ -177,22 +285,56 @@ def estimate_transfer_fee(grade, tier, ovr, country=None, team_name=None,
     league_mult = _market_value_league_mult(grade, country)
     pos_mult = POSITION_MARKET_MULT.get(position, 1.0) if position else 1.0
     prestige_mult = _market_value_prestige_mult(country, team_name, tier)
+    rank_mult = _team_rank_status_mult(team_id, tier, season) if team_id else 1.0
     c_mult = _contract_mult(contract_remaining_years)
     a_mult = _age_mult(age)
     p_mult = potential_mult(ovr, talent_cap)
 
-    val_eok = (base_eok * league_mult * pos_mult * prestige_mult
-               * c_mult * a_mult * p_mult)
+    # [2026-07 v4 신설] 리그×포지션×명문×계약×나이×잠재력이 전부 곱연산이라
+    # 조건이 몰리면(SS급+명문팀+ST+21세 이하+계약5년+큰 잠재력 gap) 개별
+    # 배율의 의도보다 훨씬 커지는 문제가 있었다 — 앵커에서 2800억으로
+    # 잡아놔도 최종 5000억대까지 튀는 식. 결합배율에 소프트캡을 적용해
+    # 평범한 선수는 그대로, 극단적으로 조건이 겹친 경우만 완화한다.
+    combined_mult = league_mult * pos_mult * prestige_mult * rank_mult * c_mult * a_mult * p_mult
+    capped_mult = _apply_soft_cap(combined_mult)
+
+    val_eok = base_eok * capped_mult
     if tier and tier >= 2:
         val_eok *= max(0.15, 0.55 ** (tier - 1))  # 2부 0.55x, 3부 0.30x ...
+
+    # [2026-07 v4 신설] 시대 배율 — 게임은 2001년부터 시작하는데 위 앵커는
+    # 전부 2026년 기준이라, 시대감을 살리기 위해 곱한다. 연봉과 동일하게
+    # 지수 없이 그대로 적용(2차 검토에서 ^0.8 지수를 시도했으나 2003년
+    # 값이 여전히 과하다는 3차 검토를 반영해 1.0으로 통일 — v4 문서 참고).
+    eidx = economy_index(year) if year is not None else 1.0
+    val_eok *= eidx
+
     final = int(val_eok * 100_000)  # 억원 -> 천원 단위(_calc_salary와 통일)
+
+    # [2026-07 v6 재조정, 신민용+GPT 검토: "C급 하위권은 연봉 1.126억인데
+    # 이적료가 0.132억(연봉의 12%)밖에 안 된다 — 계약 3년 남은 27세면
+    # 최소 연봉의 절반 정도는 나오는 게 현실적이다"] 이적료는 원래
+    # OVR·등급·역할·계약기간만으로 계산해 연봉과 완전히 독립적인 축으로
+    # 설계했는데, C/D급 하위권에서는 그 결과가 "등록비" 수준까지 떨어져
+    # 부자연스러웠다. C/D급에 한해 "이적료 최저선 = 연봉의 일정 비율"을
+    # 하한으로만 걸어준다(다른 등급은 원래도 이 정도로 낮게 안 떨어지므로
+    # 영향 없음). 참고용 연봉은 같은 조건으로 _calc_salary를 내부에서
+    # 한 번 더 불러 구한다 — 두 축의 "독립적 계산" 설계 원칙은 그대로
+    # 유지하면서, 결과가 비상식적으로 벌어질 때만 안전망으로 개입한다.
+    _MIN_FEE_RATIO_OF_SALARY = {"C": 0.40, "D": 0.25}
+    if grade in _MIN_FEE_RATIO_OF_SALARY:
+        ref_salary = _calc_salary(grade, tier, ovr, country, team_name, year=year)
+        fee_floor = int(ref_salary * _MIN_FEE_RATIO_OF_SALARY[grade])
+        if final < fee_floor:
+            final = fee_floor
 
     if debug:
         return {"fee": final, "debug": {
             "base_eok": base_eok, "league_mult": league_mult,
             "position_mult": pos_mult, "prestige_mult": prestige_mult,
             "contract_mult": c_mult, "age_mult": a_mult,
-            "potential_mult": p_mult,
+            "potential_mult": p_mult, "rank_mult": rank_mult, "combined_mult": combined_mult,
+            "capped_mult": capped_mult, "economy_index": eidx,
         }}
     return final
 
@@ -321,7 +463,17 @@ def _clamp_salary_to_cap(sal, wealth, country=None, tier=1, is_special=False, ov
     return max(0, int(sal))
 
 
-def _calc_salary(grade, tier, ovr, country=None, team_name=None):
+# [2026-07 v4 신설, 신민용 지적: "하드 플로어를 쓰니 슬로바키아=우간다=
+# 볼리비아가 전부 같은 값이 돼버린다 — 국가 차이가 사라진다"] 처음엔
+# max(b, 고정값) 방식으로 했는데, D/E/F급 국가 대부분의 cont_mult가
+# 워낙 작아서(0.01~0.08대) 거의 다 같은 플로어에 눌려 국가 간 순위가
+# 사라졌다. 고정 바닥 대신 "곱연산 부스트"로 바꿔 순위는 그대로 두고
+# 절대 스케일만 올린다 — 목표(신민용 제시: D급 OVR53~63이 0.08~0.30억
+# 근방)에 맞춰 역산한 배율(34배)을 D/E/F 공통으로 적용.
+_LOW_GRADE_SCALE_BOOST = {"D": 34.0, "E": 34.0, "F": 34.0}
+
+
+def _calc_salary(grade, tier, ovr, country=None, team_name=None, year=None):
     """연봉 계산 (천원 단위).
     wealth 결정 우선순위:
       1) SPECIAL_SALARY_COUNTRIES — 특수 연봉 국가 (사우디/카타르/UAE)
@@ -335,7 +487,10 @@ def _calc_salary(grade, tier, ovr, country=None, team_name=None):
       확인해서 PRESTIGE_SALARY_MULT를 최종적으로 곱한다. OVR 팀간 격차는
       건드리지 않고 "이 팀 소속이면 확실히 더 번다"는 연봉만의 프리미엄.
       기본값 None → 기존 호출부는 전부 하위호환(프리미엄 없음).
+    year: [2026-07 v4 신설] 게임 내 현재 연도 — economy_index(year)로
+      시대별 배율을 곱한다. None이면(하위호환) 1.0으로 취급.
     """
+    eidx = economy_index(year) if year is not None else 1.0
     from constants import (LOWER_LEAGUE_SALARY_OVERRIDE, SPECIAL_SALARY_COUNTRIES,
                            get_league_grade, SALARY_CURVE_OVERRIDE, salary_curve_value,
                            COUNTRY_SALARY_CAP)
@@ -356,7 +511,7 @@ def _calc_salary(grade, tier, ovr, country=None, team_name=None):
         cap = COUNTRY_SALARY_CAP.get(country, 0)
         if cap > 0:
             sal = min(sal, cap)
-        return max(0, _apply_prestige(sal))
+        return max(0, int(_apply_prestige(sal) * eidx))
 
     is_special = country and country in SPECIAL_SALARY_COUNTRIES
     if country:
@@ -422,6 +577,21 @@ def _calc_salary(grade, tier, ovr, country=None, team_name=None):
     if b == 0:
         return 0
 
+    # [2026-07 v4 버그수정, 신민용 지적: "D~F급은 OVR53이든 63이든 경제적
+    # 가치가 거의 같다 — 선수 성장→가치 상승 루프가 끊긴다"] D/E/F급은
+    # base_year 자체가 워낙 작은데(예: D급 15,425천원) 여기에 국가 배율
+    # (많은 나라가 0.01~0.08 수준)까지 곱하면 b가 거의 0에 수렴해서,
+    # `_salary_ovr_mult` 곡선이 아무리 정교해도 최종값이 커질 여지가
+    # 없었다(곱셈이라 base가 작으면 커브 모양은 그대로여도 절대값이
+    # 전부 눌린다). 바닥값을 OVR 비례로 바꾼 것만으론 부족했던 이유가
+    # 이거다 — tier1 한정으로 등급별 "유효 최소 base"를 둬서 국가 배율이
+    # 아무리 작아도 커브가 실제로 펼쳐질 최소한의 여지를 보장한다.
+    # (D=40,000천원 → OVR53~63 연봉 0.10~0.26억, 신민용이 제시한 목표치
+    # 0.08~0.30억과 근접하도록 역산 — E/F는 기존 base_year 비율(D 대비
+    # E≈0.39배, F≈0.36배)을 그대로 유지해 등급 간 순서는 보존한다.)
+    if tier == 1 and wealth in _LOW_GRADE_SCALE_BOOST:
+        b = int(b * _LOW_GRADE_SCALE_BOOST[wealth])
+
     sal = int(b * _salary_ovr_adj(ovr, wealth, tier))
     if wealth == "F" and tier >= 3 and ovr < 38:
         return 0
@@ -432,10 +602,35 @@ def _calc_salary(grade, tier, ovr, country=None, team_name=None):
     #   에서 "2부<3부(바닥50)" 역전이 새로 생긴다.
     #   → 바닥값 자체를 티어가 낮을수록(숫자가 작을수록) 커지도록 계단식으로
     #     주어 바닥값끼리도 항상 2부>3부>4부>5부 순서가 유지되게 한다.
+    # [2026-07 v4 버그수정, 신민용 지적: "E/F급은 OVR33이든 53이든 전부
+    # 15만원으로 똑같이 눌린다 — 이건 가난한 리그를 표현한 게 아니라
+    # 연봉 함수가 계단화된 것"] 고정 바닥값(예: tier1=150천원)에 걸리면
+    # OVR 정보가 통째로 사라졌다 — E/F급은 base_year 자체가 워낙 작아서
+    # 거의 항상 이 바닥에 눌렸다. 바닥값을 고정치가 아니라 OVR에 비례하는
+    # 값으로 바꾼다(기준 OVR=50 — 이 근방에서 기존 고정 바닥값과 거의
+    # 같아지도록 캘리브레이션돼 있어 기존 밸런스와 자연스럽게 이어짐).
+    # 티어 간 순서(2부>3부>4부>5부)는 모든 티어에 같은 비율을 곱하므로
+    # 그대로 유지된다.
     _floor_by_tier = {1: 150, 2: 110, 3: 80, 4: 60, 5: 50}
-    _floor = _floor_by_tier.get(tier, 0)
-    if _floor and sal < _floor and b > 0:
-        sal = _floor
+    _floor_ref_ovr = 50
+    _floor_base = _floor_by_tier.get(tier, 0)
+    if _floor_base and b > 0:
+        _floor = max(1, int(_floor_base * (ovr / _floor_ref_ovr)))
+        if sal < _floor:
+            sal = _floor
+
+    # [2026-07 v5 재설계, 신민용+GPT 여러 차례 검토 후 확정: "Floor를
+    # max(raw, floor)로 하면 F급처럼 raw가 워낙 작은 등급에서 국가/OVR
+    # 차이가 전부 사라진다 — floor를 max가 아니라 가산(+)으로 바꿔야
+    # 최저생계는 보장하면서 차이도 살아남는다"] E/F급 tier1에 한해
+    # "최저생활보장액"을 max가 아니라 덧셈으로 준다. D급은 이미 기존
+    # _LOW_GRADE_SCALE_BOOST만으로 충분히 자연스러운 값이 나오고 있어서
+    # (신민용 확인: "슬로바키아는 이미 괜찮다, 괜히 건드리지 마라")
+    # 건드리지 않는다 — E/F만 대상.
+    _livelihood_addend = {"E": 5_000, "F": 2_000}  # 천원, economy_index 적용 전 기준
+    if tier == 1 and wealth in _livelihood_addend:
+        sal = sal + _livelihood_addend[wealth]
+
     # 등급별 연봉 상한 적용
     # [버그수정 2026-07, 신민용 지적: "프랑스뿐 아니라 다른 나라도 다
     # 문제 있을 것 같다"] 실측으로 전체 97개국 스캔해보니, COUNTRY_SALARY_CAP이
@@ -457,7 +652,13 @@ def _calc_salary(grade, tier, ovr, country=None, team_name=None):
     #   전혀 구분 안 해서, 실측 앵커 곡선이 없는 나라(6개국 제외 전부)는
     #   엘리트 이상 구간이 통째로 평평해지고 있었다. _cap_relief_mult로
     #   엘리트(81~94)·월드클래스(95+) 구간만 상한을 단계적으로 풀어준다.
-    if country and not is_special:
+    # [2026-07 v4 버그수정] D/E/F급은 새로 넣은 _LOW_GRADE_SCALE_BOOST가
+    # 이미 그 등급에 맞는 스케일을 보장하는데, 여기에 옛날에(base가 훨씬
+    # 작았을 때) 잡아둔 국가별 소액 캡(예: 우간다 12,000천원=0.12억)까지
+    # 겹치면 방금 살려낸 OVR 곡선이 다시 그 캡에서 눌려버린다 — D/E/F는
+    # 이 국가별 캡 적용에서 제외한다(등급 캡 자체는 그대로 유지, 스케일
+    # 제어는 최소 base 쪽으로 일원화).
+    if country and not is_special and wealth not in ("D", "E", "F"):
         from constants import COUNTRY_SALARY_CAP
         country_cap = COUNTRY_SALARY_CAP.get(country, 0)
         if country_cap > 0:
@@ -477,4 +678,66 @@ def _calc_salary(grade, tier, ovr, country=None, team_name=None):
             lt_cap = _lt.get(tier, _lt[max(_lt.keys())])
             if lt_cap > 0:
                 sal = min(sal, lt_cap)
-    return max(0, _apply_prestige(sal))
+    return max(0, int(_apply_prestige(sal) * eidx))
+
+
+# ══════════════════════════════════════════════════════════════
+# 이적 협상 시스템 (2026-07 신설, 신민용+GPT 다회 설계 확정)
+# ══════════════════════════════════════════════════════════════
+# 오퍼가 뜨면 무조건 이적 가능했던 예전 구조 대신, 3단계 판단을 거친다:
+#   1) 강제판매 체크 — 제안액이 시장가 대비 압도적이면 구단도 못 막는다.
+#   2) 최소수용금액 체크 — 구단이 팔고 싶어하는 최소 조건(가산식+clamp).
+#   3) 거절 누적 — 반복 거절되면 선수 불만이 쌓여 다음 최소수용금액이
+#      완화된다(3시즌 지나면 자연 감쇠).
+# 오퍼 자체의 제안액도 시장가 그대로가 아니라 프리미엄(매수팀-내팀 등급
+# 격차 기반 랜덤)이 붙는다 — 안 그러면 강제판매가 발동할 상황 자체가
+# 생기지 않는다(제안액이 항상 시장가와 정확히 같았으므로).
+
+LEAGUE_GRADE_RANK = {"F": 1, "E": 2, "D": 3, "C": 4, "B": 5, "A": 6, "S": 7, "SS": 8}
+
+
+def offer_premium_mult(buyer_grade: str, my_grade: str) -> float:
+    """매수팀 등급이 내 팀보다 얼마나 높은지(gap)에 따라 오퍼 제안액에
+    붙는 프리미엄 배율. 같은 급끼리는 정상 협상 범위(0.9~1.1)에 머물고,
+    격차가 3단계 이상 벌어지면(예: D급 선수에게 SS급 팀이 관심) 낮은
+    확률로 훨씬 큰 프리미엄이 튄다 — "하위 리그 원석을 빅클럽이 묻지마
+    영입"하는 드문 케이스를 표현한다."""
+    import random
+    gap = LEAGUE_GRADE_RANK.get(buyer_grade, 4) - LEAGUE_GRADE_RANK.get(my_grade, 4)
+    if gap <= 0:
+        return random.uniform(0.9, 1.1)
+    if gap <= 2:
+        return random.uniform(1.0, 1.5)
+    roll = random.random()
+    if roll < 0.02:
+        return random.uniform(2.0, 5.0)
+    if roll < 0.10:
+        return random.uniform(1.2, 2.0)
+    return random.uniform(1.0, 1.3)
+
+
+# 등급별 강제판매 기본 배수 — "이 정도 배수면 아무리 안 팔고 싶어도
+# 어쩔 수 없다"는 기준. 빅리그일수록 자금 여유가 있어 쉽게 안 팔고
+# (배수가 큼), 하위 리그일수록 구단 규모상 거액을 거절하기 어렵다
+# (배수가 작음).
+FORCED_SALE_BASE_MULT = {
+    "SS": 2.75, "S": 2.5, "A": 2.2, "B": 2.0, "C": 1.8, "D": 1.5, "E": 1.4, "F": 1.4,
+}
+
+
+def forced_sale_threshold_mult(buyer_grade: str, my_grade: str) -> float:
+    """강제판매 기준 배수 — 시장가의 몇 배 이상 제안하면 구단이 거절
+    못 하는지. 기본값은 파는 쪽(my_grade) 리그 등급으로 정하고, 사는
+    쪽(buyer_grade)이 훨씬 강한 리그면(격차 3단계 이상) 기준을 낮춰서
+    (더 쉽게 발동) "명문팀 제안은 그 자체로 거절하기 어렵다"를 반영—
+    반대로 사는 쪽이 같거나 약한 리그면 기준을 높여서(더 어렵게 발동)
+    "동급/하위 리그의 거액 제안은 의심스러워 쉽게 안 넘어간다"를 반영."""
+    base = FORCED_SALE_BASE_MULT.get(my_grade, 2.0)
+    gap = LEAGUE_GRADE_RANK.get(buyer_grade, 4) - LEAGUE_GRADE_RANK.get(my_grade, 4)
+    if gap >= 3:
+        adj = 0.8
+    elif gap <= -1:
+        adj = 1.2
+    else:
+        adj = 1.0
+    return base * adj

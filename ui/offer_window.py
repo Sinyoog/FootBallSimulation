@@ -120,13 +120,20 @@ class OfferWindow(QDialog):
         # 없었다 — 무소속인데 진행을 계속하면 center_panel의 별도 체크
         # ("17살 이상인데 팀이 없고 프리시즌이면 입단 강제" 안내)가 이미
         # 다음 날 진행을 막아주므로, 이 다이얼로그 자체를 못 닫게 잠글
-        # 이유가 없다. 대신: 팀을 안 고르고 그냥 닫은 경우(all_failed도
-        # 아님)엔 저장된 오퍼 상태를 지우지 않는다 — 나중에 다시 열면
-        # (같은 세션에서 버튼을 다시 누르든, 앱을 껐다 켜든) 완전히 같은
-        # 오퍼 목록이 그대로 뜬다(재접속·재오픈으로 오퍼를 리롤하는 것만
-        # 막으면 충분하고, 창을 못 닫게 할 필요는 없었다). all_failed로
-        # 끝난 경우(전부 결렬 → 1년 훈련)는 진짜 결론이 난 것이므로 지운다.
-        if self.all_failed:
+        # 이유가 없다.
+        #
+        # [버그수정 2026-07, 신민용 지적: "오퍼는 취소하면 다음에 뜰 때
+        # 새로 떠야지, 저장된 게 그대로 뜨면 안 된다 — 저장 유지는 입단
+        # 창에서만 쓰는 거다"] '팀을 안 고르고 닫아도 상태를 지우지 않고
+        # 다음에 다시 열면 같은 목록이 뜬다'는 건 입단(kind="join")에만
+        # 맞는 동작이다 — 입단은 어차피 언젠가 팀을 반드시 골라야 해서,
+        # 재접속/재오픈으로 계속 새 오퍼를 리롤하는 걸 막을 필요가 있다.
+        # 반면 오퍼(kind="auto_offer")는 이번 오퍼를 그냥 닫는 것 자체가
+        # '이번 건 거절'이라는 확정된 결정이다 — 다음 이적시장에 새로
+        # 뜨는 오퍼는 이번에 거절한 그 목록이 아니라 새로 뽑힌 목록이어야
+        # 한다. 그래서 오퍼는 all_failed 여부와 무관하게 닫으면 항상
+        # 저장된 상태를 지운다.
+        if self._kind == "auto_offer" or self.all_failed:
             self._clear_persisted()
         super().reject()
 
@@ -250,7 +257,7 @@ class OfferWindow(QDialog):
         _zone = offer.get("_zone")
         _zone_txt = {"domestic": "🏠 자국", "prev_league": "🏟 직전리그",
                      "hometown": "🌍 고향", "foreign": "✈ 해외",
-                     "applied": "🔎 직접 지원"}.get(_zone)
+                     "applied": "🔎 직접 지원", "youth_scout": "🌟 유스 스카우트"}.get(_zone)
         if _zone_txt:
             zl = QLabel(_zone_txt)
             zl.setStyleSheet("color:#888; font-size:10px; background:#2a2a2a;"
@@ -285,7 +292,7 @@ class OfferWindow(QDialog):
         h3 = QHBoxLayout(); h3.setSpacing(8)
         _sal = self.offer_salaries[idx]
         _sal_txt = "💰 무급" if _sal == 0 else (
-            f"💰 연 {fmt_money(_sal)}  [월 {fmt_money(max(1, _sal // 12))}]")
+            f"💰 연 {fmt_money(_sal)}  [주 {fmt_money(max(1, _sal // 52))}]")
         sl = QLabel(_sal_txt)
         sl.setStyleSheet("color:#00cc44;")
         h3.addWidget(sl)

@@ -474,6 +474,19 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         year INTEGER, competition TEXT, team_name TEXT,
         result TEXT, goals INTEGER DEFAULT 0, assists INTEGER DEFAULT 0)""")
+    # [2026-07 신설, 국가대표 OVR 재설계 — 신민용+GPT 검토] 국가별 "세대
+    # 계수"를 저장하는 테이블. 밴드(하/중/상)만으로는 매 호출마다 완전
+    # 독립적으로 난수를 뽑기 때문에, 같은 나라가 올해 하한 근처였다가
+    # 내년에 바로 상한 근처로 튀는 비현실적인 롤러코스터가 나올 수 있다.
+    # 이 계수(0.97~1.03)가 8~12년 주기로 천천히 목표치를 향해 이동하면서
+    # 밴드 값에 곱해져, "국가는 안 바뀌지만 세대는 바뀐다"는 느낌을 만든다.
+    c.execute("""CREATE TABLE IF NOT EXISTS nat_generation(
+        country TEXT PRIMARY KEY,
+        coef REAL DEFAULT 1.0,
+        target REAL DEFAULT 1.0,
+        cycle_start_year INTEGER DEFAULT 0,
+        cycle_len INTEGER DEFAULT 10,
+        last_year INTEGER DEFAULT 0)""")
     c.execute("""CREATE TABLE IF NOT EXISTS intl_tournaments(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         year INTEGER, kind TEXT, name TEXT,
@@ -658,6 +671,13 @@ def init_db():
         # 과거 특정 거래 시점의 값을 그대로 고정 저장한다(현재 시장가치처럼
         # 매번 재계산하지 않음 — 나중에 OVR이 바뀌어도 그때 값 그대로 유지).
         "ALTER TABLE career_entries ADD COLUMN transfer_fee INTEGER DEFAULT 0",
+        # [2026-07 신설, 신민용 지적: "임대(1년)/임대 종료(1년) 표기가
+        # 상대팀을 안 보여줘서 어느 팀으로 임대 갔는지/어디로 복귀했는지
+        # 알 수 없다"] exit_type='임대'인 행(원소속팀에서 떠나는 행)엔
+        # 임대 '보낸 곳' 팀명을, exit_type='임대 종료'인 행(임대처에서
+        # 떠나는 행)엔 '복귀할' 원소속팀명을 저장해 UI가 팀명을 함께
+        # 보여줄 수 있게 한다.
+        "ALTER TABLE career_entries ADD COLUMN loan_partner_team TEXT DEFAULT ''",
         "ALTER TABLE career_entries ADD COLUMN clean_sheets INTEGER DEFAULT 0",
         "ALTER TABLE career_entries ADD COLUMN team_id INTEGER DEFAULT 0",
         "ALTER TABLE my_player ADD COLUMN intl_caps INTEGER DEFAULT 0",
@@ -808,6 +828,15 @@ def init_db():
         # [AI 선수 생애] 나이 컬럼. 시즌 종료 시 +1 되며 성장/노화/은퇴의 기준.
         #  기존 세이브엔 없으므로 추가 후 NULL인 행은 _ensure_ai_ages()가 랜덤 채움.
         "ALTER TABLE ai_players ADD COLUMN age INTEGER DEFAULT 0",
+        # [2026-07 신설, 신민용+GPT 검토: "계약 잔여기간 반영하면 현실성이
+        # 크게 오른다 + 방금 이적한 선수는 최소 1시즌은 다시 안 나가야
+        # 한다"] AI 선수는 지금까지 계약이라는 개념 자체가 없었다 —
+        # 일괄 백필(5.9만 명 대상 대량 UPDATE) 대신, 이적/은퇴대체로 새로
+        # 합류하는 시점에 지연 할당(lazy-init)한다. 기존 선수는 0(미설정)
+        # 으로 남는데, 이건 "중립(대략 2~3년 남은 것처럼 취급)"으로 처리
+        # 한다 — 그래서 대량 백필이 없어도 안전하다.
+        "ALTER TABLE ai_players ADD COLUMN contract_end_year INTEGER DEFAULT 0",
+        "ALTER TABLE ai_players ADD COLUMN last_transfer_year INTEGER DEFAULT 0",
         # [세부역할 2026-07] AI 선수도 세부역할(SUB_ROLES)을 갖도록 컬럼 추가.
         #  기존엔 이 컬럼 자체가 없어서 sub_role은 내 선수(my_player)에만
         #  있었다 — 세부역할별 매치 가중치(_SUB_ROLE_MATCH_MOD)를 AI 시즌
@@ -922,6 +951,12 @@ def init_db():
         # 결정(입단 완료/전부 결렬)이 나기 전까지는 껐다 켜도 항상 같은
         # 오퍼 목록이 그대로 다시 뜨게 한다. 결정이 나면 빈 문자열로 비운다.
         "ALTER TABLE my_player ADD COLUMN pending_offer_state TEXT DEFAULT ''",
+        # [2026-07 신설, 신민용+GPT 다회 설계 확정: 이적 강제판매/최소수용금액
+        # 시스템] 거절 누적 카운터 — 3시즌 이상 지난 거절은 자연 감쇠시켜야
+        # 해서(무한 누적 방지), "마지막 거절 연도"도 같이 저장해 매번 그
+        # 차이를 계산한다.
+        "ALTER TABLE my_player ADD COLUMN transfer_rejection_count INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN transfer_rejection_last_year INTEGER DEFAULT 0",
     ]:
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,
@@ -1495,7 +1530,7 @@ def reset_game_data():
     conn = get_conn(); c = conn.cursor()
     for t in ["my_player","career_entries","promotion_log","trophy_log","awards",
               "game_log","match_results","match_details","season_state",
-              "intl_history","intl_tournaments","intl_entries","intl_matches",
+              "intl_history","intl_tournaments","intl_entries","intl_matches","nat_generation",
               "cl_tournaments","cl_entries","cl_matches","cl_history",
               "cwc_tournaments","cwc_entries","cwc_matches",
               "cup_tournaments","cup_entries","cup_matches","cup_history"]:
@@ -1890,19 +1925,29 @@ DOMESTIC_PROB_BY_GRADE = {
     "C": 0.88, "D": 0.93, "E": 0.96, "F": 0.98,
 }
 POS_FOREIGN_MULT = {
-    "GK": 0.6, "CB": 0.8, "LB": 0.9, "RB": 0.9,
+    # [2026-07 조정, 신민용 지적: "국대 GK 경쟁 풀에 해외파가 있을 수
+    # 있다는 전제로 봐야 한다"] 0.6은 다른 포지션 대비 너무 낮아서
+    # 해외파 골키퍼 자체가 거의 안 나왔다 — 클럽이 골키퍼는 검증된
+    # 자원을 선호한다는 현실은 유지하되(여전히 최저), 극단적으로
+    # 낮추진 않도록 0.75로 완화.
+    "GK": 0.75, "CB": 0.8, "LB": 0.9, "RB": 0.9,
     "CDM": 1.0, "CM": 1.0, "CAM": 1.1,
     "LW": 1.2, "RW": 1.2, "CF": 1.2, "ST": 1.3,
 }
 # 팀당 외국인 등록 상한 (없는 나라는 무제한 — 확률만 적용).
 FOREIGN_QUOTA_CAP = {"대한민국": 4, "일본": 5, "중국": 5, "카타르": 4, "사우디아라비아": 8}
-# 스타 슬롯(월드클래스/엘리트)이 해외 출신일 때 우선적으로 뽑히는
-# "축구 수출 강국" — 실제로 빅클럽 스타 영입은 이 나라들 출신이 압도적.
+# [2026-07 리팩터] 예전엔 스타 슬롯 해외파 국가를 이 고정 목록에서만
+# 뽑았는데, 그러면 목록 밖 나라(한국 등 대부분)는 빅클럽 스타 해외파가
+# 사실상 나올 수 없었다. 이제 _pick_nationality()는 전세계 국가를 피파
+# 랭킹 가중 추첨하는 방식으로 바뀌어 이 목록은 더 이상 직접 쓰이지 않는다
+# (강국이 자연히 랭크 가중치로 우대받음) — 참고용으로 남겨둔다.
 FOOTBALL_POWERHOUSES = ["브라질", "아르헨티나", "프랑스", "잉글랜드", "스페인",
                         "독일", "포르투갈", "네덜란드"]
 
 _COUNTRY_CONTINENT = {}   # 나라명 -> 대륙 (지연 초기화)
 _CONTINENT_COUNTRIES = {}  # 대륙 -> [(나라명, fifa_rank), ...] fifa_rank 오름차순(강한 순)
+_ALL_COUNTRIES_BY_RANK = []  # [2026-07 신설] 대륙 무관 전세계 (나라명, fifa_rank) 목록 —
+                              # 스타 슬롯 해외파 국가를 대륙 상관없이 가중 추첨할 때 사용.
 
 
 def get_country_squad_players(country, positions=None, min_count=8):
@@ -1962,6 +2007,7 @@ def _init_nationality_tables():
     for name, _flag, cont, _lang, rank in COUNTRY_DATA:
         _COUNTRY_CONTINENT[name] = cont
         by_cont.setdefault(cont, []).append((name, rank))
+        _ALL_COUNTRIES_BY_RANK.append((name, rank))
     for cont, lst in by_cont.items():
         lst.sort(key=lambda x: x[1])   # fifa_rank 낮을수록(=강할수록) 앞
         _CONTINENT_COUNTRIES[cont] = lst
@@ -1988,9 +2034,15 @@ def _pick_nationality(team_country, team_continent, grade, pos, is_star, foreign
         return team_country, foreign_count   # 자국 선수
 
     # 해외 출신 — 스타 슬롯은 축구 강국 우선
+    # [2026-07 재설계, 신민용 지적: "국대 GK 선발 풀이 국적 기준으로 전세계를
+    # 보는데, 스타 슬롯 해외파는 8개국 고정 목록에서만 나와서 그 목록 밖
+    # 나라(한국 포함 대다수)는 빅클럽 스타 해외파가 사실상 나올 수 없었다"]
+    # 고정 목록 대신 전세계 국가를 피파랭킹 가중 추첨한다 — 강국(랭크
+    # 1~9위)은 가중치가 압도적으로 높아 여전히 대부분의 스타 해외파를
+    # 차지하지만, 그 외 나라도 실력(랭크)에 비례한 실질적 확률을 갖는다.
     if is_star and random.random() < 0.6:
-        cand = [c for c in FOOTBALL_POWERHOUSES if c != team_country]
-        nat = random.choice(cand) if cand else team_country
+        cand = [(n, r) for n, r in _ALL_COUNTRIES_BY_RANK if n != team_country]
+        nat = _weighted_country_pick(cand) or team_country
         return nat, foreign_count + 1
 
     if random.random() < 0.7:
@@ -2134,7 +2186,15 @@ def _star_counts(grade, team_strength, continent_bonus=0, n_slots=11, tier=1):
         if tier == 1:
             n_elite = max(0, n_slots - n_world)
         elif tier == 2 and grade == "SS":
-            n_elite = min(8, max(0, n_slots - n_world))
+            # [2026-07 재수정, 신민용 리포트: "잉글랜드 2부가 1부랑 OVR
+            # 차이가 아예 안 난다"] 예전엔 8개(11자리 중 최대 8개)까지
+            # 엘리트로 채워서 사실상 팀 전체가 스타였다 — 그래서 OVR_RANGES
+            # 상한을 낮춰도 대부분의 선수가 여전히 스타 슬롯 값(상한 근처)에
+            # 몰려 체감상 1부와 구분이 안 됐다. 5개로 줄여 나머지 절반
+            # 가까이는 일반 곡선(_target_ovr, tier2 상한 기준)을 따르게 해
+            # "에이스급 몇 명은 확실히 강하지만 전체 스쿼드는 확연히 아래"
+            # 라는 현실적인 챔피언십 느낌을 되살린다.
+            n_elite = min(5, max(0, n_slots - n_world))
         elif tier == 2 and grade == "S":
             # [2026-07 신설, 신민용 지적: "세군다·세리에B·분데스2·리그2는
             # 현실에서도 상당히 강한 2부 리그인데 엘리트 슬롯이 3개로 확

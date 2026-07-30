@@ -147,7 +147,15 @@ def get_my_cup_matches():
         """SELECT m.*, t.year AS t_year, t.name AS comp, t.my_team_id AS t_my_tid
            FROM cup_matches m
            JOIN cup_tournaments t ON m.tournament_id = t.id
-           WHERE m.my_played = 1 OR m.my_absence_reason IS NOT NULL
+           -- [2026-07 재수정, 신민용 지적: "다친 게 아니라 그냥
+           -- 벤치라 안 뛴 경기도 있는데 그건 빠진다"] my_played=1
+           -- 이거나 absence_reason이 있는 것만 걸렀더니, "건강한데
+           -- 로테이션으로 그냥 안 뛴" 경기(my_played=0이면서
+           -- absence_reason도 NULL)가 통째로 빠졌다 — 그 팀 소속으로
+           -- 치러진 경기는 전부 보여주고(결과가 난 것만), 뛰었는지
+           -- 안 뛰었는지는 화면에서 my_played/absence_reason으로
+           -- 구분한다.
+           WHERE m.is_my = 1 AND m.home_score >= 0
            ORDER BY t.year, m.week""").fetchall()]
     conn.close()
 
@@ -190,6 +198,7 @@ def get_my_cup_matches():
             "rating": m["my_rating"],
             "score": f"{my_s}-{op_s}", "result": result,
             "absence_reason": m.get("my_absence_reason"),
+            "my_played": m.get("my_played", 0),
         })
     return out
 
@@ -535,7 +544,11 @@ def sim_my_cup_match_as_ai(week, p, reason="injury"):
     AI끼리(내 보너스 없이) 시뮬레이션 — 이게 없으면 그 경기가 영원히
     home_score=-1(미완료)로 남아 대회 전체 진행이 멈춘다(신민용 리포트:
     "10월인데 1월 경기가 계속 '예정'으로 남아있다"). simulate_my_cup_match와
-    동일하게 정보를 조회한 뒤 _sim_ai_match로 넘긴다."""
+    동일하게 정보를 조회한 뒤 _sim_ai_match로 넘긴다.
+
+    [2026-07 버그수정, 신민용 리포트: "부상으로 경기 못 나갔는데 감독관계가
+    그대로다"] game_engine._sim_my_team_match_as_ai와 동일한 이유로,
+    이 컵대회 AI-대체 경로도 결장 페널티(manager_relation -1)를 적용한다."""
     info = get_my_cup_match(week)
     if not info:
         return
@@ -548,6 +561,8 @@ def sim_my_cup_match_as_ai(week, p, reason="injury"):
     if m["home_score"] != -1:
         return  # 이미 처리됨(멱등)
     _sim_ai_match(t, m, reason=reason)
+    from game_engine import update_player, _calc_manager_rel
+    update_player(manager_relation=_calc_manager_rel(p, 0, "", played=False, not_played_penalty=2))
 
 
 def simulate_my_cup_match(week, p, day=None):

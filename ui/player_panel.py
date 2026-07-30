@@ -205,7 +205,10 @@ class PlayerPanel(QWidget):
 
         fame_lbl = _fame(p.get("fame",0), lang)
         salary   = p.get("salary",0)
-        monthly  = max(1, salary // 12) if salary > 0 else 0
+        # [2026-07 수정, 신민용 지적: "축구는 월급이 아니라 주급으로 얘기하지
+        # 않나"] 실제 축구는 유럽 기준 관례상 항상 '주급'으로 얘기한다
+        # (손흥민 주급 X억 식) — 월급 표기를 주급으로 바꾼다.
+        weekly = max(1, salary // 52) if salary > 0 else 0
 
         # 국적 표시 (복수국적: 본 국적 맨 앞 + ★, 나머지 병기)
         _nats = []
@@ -241,7 +244,7 @@ class PlayerPanel(QWidget):
             ("팬수",   f"{p.get('fans',0):,}명"),
             ("에이전트", f"[{p.get('agent_grade','F')}등급]"),
             ("연봉",   "무급" if salary == 0 else
-             f"연 {fmt_money(salary)}  [월 {fmt_money(monthly)}]"),
+             f"연 {fmt_money(salary)}  [주 {fmt_money(weekly)}]"),
             ("총자산", fmt_money(p.get("total_assets",0))),
             ("감독관계", str(p.get("manager_relation",50))),
         ]

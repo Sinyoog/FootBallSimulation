@@ -12,6 +12,7 @@ from PyQt6.QtGui import QFont, QColor
 from game_engine import get_player, fmt_money, add_log, get_state, _save_career_entry
 from constants import format_result_with_absence
 
+
 def _game_confirm(parent, title: str, message: str) -> bool:
     from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
     from PyQt6.QtCore import Qt
@@ -101,6 +102,30 @@ def _match_stat_str(m):
             f"{m.get('dribbles',0)}드리블")
 
 
+_ABSENCE_LABEL = {
+    "injury": "부상", "suspension": "출전정지",
+}
+_FULL_ABSENCE_REASONS = ("injury", "suspension")   # 완전 결장 — 스탯 자체가 없음
+
+
+def _match_line_str(m):
+    """[2026-07 재수정, 신민용 리포트: "red_card가 원문 그대로 노출되고,
+    실제로는 뛴 경기(스탯도 진짜)인데 결장 취급된다"] absence_reason이
+    "injury"/"suspension"이면 진짜 결장(스탯 자체가 없음)이라 사유만
+    보여주지만, "red_card"는 그 경기 안에서 퇴장당하기 전까지는 실제로
+    뛴 경기라 스탯·평점이 진짜다(my_played=1) — 결장 취급하지 않고
+    정상 스탯을 보여주되 "(퇴장)"만 덧붙인다."""
+    reason = m.get("absence_reason")
+    if reason in _FULL_ABSENCE_REASONS:
+        return _ABSENCE_LABEL.get(reason, reason)
+    if not m.get("my_played", 1) and not reason:
+        return "벤치"
+    line = f"{_match_stat_str(m)}  평점 {m.get('rating', 0)}"
+    if reason == "red_card":
+        line += " (퇴장)"
+    return line
+
+
 STYLE = """
 QDialog { background:#1e1e1e; color:#ccc; }
 QScrollArea { border:none; background:#1e1e1e; }
@@ -151,9 +176,15 @@ class RetireWindow(QDialog):
             root.addWidget(QLabel("선수 데이터 없음")); return
 
         # 은퇴 시 현재 주차로 마지막 커리어 항목 종료
+        # [버그수정 2026-07, 신민용 리포트: "은퇴창을 여러 번 열었다 닫았다
+        # 하니 팀 이력에 똑같은 행이 여러 개 생긴다"] allow_insert 기본값이
+        # True라서, 창을 다시 열 때마다 "이미 방금 닫힌 항목"을 또 새로
+        # INSERT하고 있었다(_find_open_entry가 이미 닫힌 항목은 못 찾으니
+        # allow_insert=True 경로가 매번 새 행을 만듦). allow_insert=False로
+        # 넘겨서, 이미 마감된 항목이면 새로 만들지 않고 그대로 둔다.
         st = get_state()
         if st and p.get("current_team_id"):
-            _save_career_entry(p, st["current_year"], st["current_week"])
+            _save_career_entry(p, st["current_year"], st["current_week"], allow_insert=False)
         add_log(f"🎖 {p['name']} 선수 은퇴. {p['age']}세.", "event")
 
         # ── 좌측 패널 (이력/성적 + 하단 버튼) ─────────────
@@ -355,7 +386,7 @@ class RetireWindow(QDialog):
         self.gen_btn.setObjectName("genBtn")
         self.gen_btn.clicked.connect(self._gen_story)
 
-        self.book_btn = QPushButton("📖 AI 스토리 생성")
+        self.book_btn = QPushButton("📖 스토리 생성")
         self.book_btn.setObjectName("genBtn")
         self.book_btn.clicked.connect(self._open_story_book)
 
@@ -425,19 +456,24 @@ class RetireWindow(QDialog):
             lbl = QLabel("기록 없음"); lbl.setStyleSheet("color:#555;")
             return lbl
 
-        # [버그수정] league_name → 국가 flag 매핑. 예전엔 이 조회 자체가 없어서
-        # "국가" 칸에 리그명 앞 2글자(예: "K4리그" → "K4")를 잘못 채워 넣고
-        # 있었다 — career_window.py의 올바른 로직과 동일하게 맞춘다.
+        # [2026-07 재수정, 신민용 리포트: "세리에 A인데 국가가 브라질로
+        # 뜬다"] league_name(문자열)만으로 국가를 조회하면, 이탈리아
+        # 세리에 A와 브라질 세리에 A(브라질레이랑 통칭)처럼 리그명이
+        # 같은 나라가 있을 때 엉뚱한 나라가 캐시에 박혀버린다 — team_id로
+        # teams→leagues→countries를 직접 조회하면 이름 충돌과 무관하게
+        # 항상 정확한 나라가 나온다(팀은 나라를 안 바꾸므로 승강으로
+        # league_id/tier가 바뀌어도 국가 조회는 안전하다).
         conn = get_conn()
         c = conn.cursor()
-        league_country = {}
+        team_country = {}
         for e in entries:
-            ln = e.get("league_name", "")
-            if ln and ln not in league_country:
+            tid = e.get("team_id")
+            if tid and tid not in team_country:
                 row = c.execute("""SELECT cn.flag, cn.name as cname
-                                   FROM leagues l JOIN countries cn ON l.country_id=cn.id
-                                   WHERE l.name=? LIMIT 1""", (ln,)).fetchone()
-                league_country[ln] = f"{row['flag']} {row['cname']}" if row else ""
+                                   FROM teams t JOIN leagues l ON t.league_id=l.id
+                                   JOIN countries cn ON l.country_id=cn.id
+                                   WHERE t.id=? LIMIT 1""", (tid,)).fetchone()
+                team_country[tid] = f"{row['flag']} {row['cname']}" if row else ""
         conn.close()
 
         from constants import position_group
@@ -528,6 +564,11 @@ class RetireWindow(QDialog):
             c_yrs = e.get("contract_years", 0)
             exit_t = e.get("exit_type", "")
             in_type = e.get("transfer_type", "입단")
+            # [2026-07 신설, career_window.py와 동일한 신민용 리포트 반영]
+            # 들어온 경로가 강제이적(팔림)이면 "구매"로 구분 표시 — 나간
+            # 경로 쪽 "팔림" 표기(빨간 강조 포함)는 그대로 둔다.
+            if in_type == "팔림":
+                in_type = "구매"
             t_type = exit_t if exit_t else in_type
 
             # [2026-07 재수정, 신민용 지적: "은퇴창도 career_window.py와 동일하게
@@ -535,18 +576,24 @@ class RetireWindow(QDialog):
             # 새 계약이 아니라 원소속팀 계약 유지), 이적 컬럼에 실제 임대
             # 기간을 "임대(N개월)"처럼 붙인다 — career_window.py와 동일 로직.
             if t_type in ("임대", "임대 종료"):
-                _label = t_type
-                if ey:
-                    total_weeks = max(1, (ey - sy) * 52 + (ew - sw))
-                    months = max(1, round(total_weeks / 4.33))
-                    if months >= 12:
-                        _yrs, _rem = divmod(months, 12)
-                        dur = f"{_yrs}년" if _rem == 0 else f"{_yrs}년 {_rem}개월"
-                    else:
-                        dur = f"{months}개월"
+                # [2026-07 재수정, 신민용 지적: "임대(1년)/임대 종료(1년)만
+                # 뜨면 어느 팀으로 갔는지/어디로 복귀했는지 안 보인다"]
+                # career_window.py와 동일하게 상대팀명을 함께 표시한다.
+                _partner = e.get("loan_partner_team", "") or ""
+                if t_type == "임대 종료":
+                    t_type = f"{_partner} 복귀" if _partner else "복귀"
                 else:
-                    dur = "진행중"
-                t_type = f"{_label}({dur})"
+                    if ey:
+                        total_weeks = max(1, (ey - sy) * 52 + (ew - sw))
+                        months = max(1, round(total_weeks / 4.33))
+                        if months >= 12:
+                            _yrs, _rem = divmod(months, 12)
+                            dur = f"{_yrs}년" if _rem == 0 else f"{_yrs}년 {_rem}개월"
+                        else:
+                            dur = f"{months}개월"
+                    else:
+                        dur = "진행중"
+                    t_type = f"{_partner}에 임대({dur})" if _partner else f"임대({dur})"
 
             if in_type == "임대" or i == 0 or cur_team != visible[i-1].get("team_name"):
                 # 임대, 또는 팀이 바뀌었거나 첫 행 → 계약년수 표시
@@ -559,11 +606,14 @@ class RetireWindow(QDialog):
                 # 같은 팀 계속 (대시)
                 c_str = "—"
             
-            # 이적료 표시 — career_window.py와 동일 로직 (은퇴창에 누락되어
-            # "오퍼로 얼마에 팔렸는지"가 안 보이던 버그 수정).
-            _fee = e.get("transfer_fee", 0)
-            if _fee:
-                t_type = f"{t_type} ({fmt_money(_fee)})"
+            # [2026-07 재수정, 신민용 지적: "파는 쪽(팔림)엔 표시 안 하고
+            # 사는 쪽(구매/오퍼)에만 금액을 붙여야 한다"] exit_t가 채택된
+            # 경우("이 팀을 떠난" 이벤트)는 표시하지 않는다 — 그 이적료는
+            # 다음 팀 행(구매 쪽)에 이미 붙는다.
+            if not exit_t:
+                _fee = e.get("transfer_fee", 0)
+                if _fee:
+                    t_type = f"{t_type} ({fmt_money(_fee)})"
 
             # 이적 컬럼
             tt_color = "#cc4444" if t_type in ("팔림", "방출", "계약만료") else None
@@ -574,7 +624,7 @@ class RetireWindow(QDialog):
             _apps_str2 = f"{e.get('matches',0)}/{_total_g2}" if _total_g2 else str(e.get("matches", 0))
 
             ln = e.get("league_name", "")
-            country_str = league_country.get(ln, "")
+            country_str = team_country.get(e.get("team_id"), "")
             league_str = f"{ln} ({e.get('tier','')}부)" if ln else ""
             # [2026-07 신설, 신민용 요청] "12위" 대신 "12위/18팀"으로 —
             # rank_disp가 이미 "—"(안 뛴 경우)면 그대로 둔다.
@@ -883,6 +933,23 @@ class RetireWindow(QDialog):
                      str(m["goals"]), str(m["assists"])]
                     + [_emap.get(c, "—") for c in extra_cols]
                     + [str(m["rating"]), m["score"], format_result_with_absence(m)])
+            # [2026-07 재수정, 신민용 지적: "부상이랑 벤치는 다른 상황이다"]
+            # absence_reason이 있으면 부상/출전정지, 없는데 my_played=0이면
+            # 벤치 — 스탯 칸들을 전부 "—"로, 평점 칸은 사유로 덮어쓴다.
+            # [2026-07 재수정, 신민용 리포트: "red_card는 실제로 뛴 경기라
+            # 결장 취급하면 안 된다"] injury/suspension만 완전 결장으로
+            # 스탯을 가리고, red_card는 실제 스탯이 있으니 그대로 둔다.
+            _reason_label = None
+            if m.get("absence_reason") in _FULL_ABSENCE_REASONS:
+                _reason_label = _ABSENCE_LABEL.get(m["absence_reason"], m["absence_reason"])
+            elif not m.get("my_played", 1) and not m.get("absence_reason"):
+                _reason_label = "벤치"
+            if _reason_label:
+                vals = list(vals)
+                vals[5] = "—"; vals[6] = "—"                    # 골/어시
+                for _k in range(7, 7 + len(extra_cols)):
+                    vals[_k] = "—"
+                vals[7 + len(extra_cols)] = _reason_label        # 평점 칸
             for j, v in enumerate(vals):
                 self._set_item(tbl, i, j, v)
         tbl.resizeColumnsToContents()
@@ -925,6 +992,21 @@ class RetireWindow(QDialog):
                      str(m["goals"]), str(m["assists"])]
                     + [_emap.get(c, "—") for c in extra_cols]
                     + [str(m["rating"]), m["score"], format_result_with_absence(m)])
+            # [2026-07 신설, 신민용 지적: "부상이랑 벤치는 다른 상황이다"]
+            # [2026-07 재수정, 신민용 리포트: "red_card는 실제로 뛴 경기라
+            # 결장 취급하면 안 된다"] injury/suspension만 완전 결장으로
+            # 스탯을 가리고, red_card는 실제 스탯이 있으니 그대로 둔다.
+            _reason_label = None
+            if m.get("absence_reason") in _FULL_ABSENCE_REASONS:
+                _reason_label = _ABSENCE_LABEL.get(m["absence_reason"], m["absence_reason"])
+            elif not m.get("my_played", 1) and not m.get("absence_reason"):
+                _reason_label = "벤치"
+            if _reason_label:
+                vals = list(vals)
+                vals[5] = "—"; vals[6] = "—"
+                for _k in range(7, 7 + len(extra_cols)):
+                    vals[_k] = "—"
+                vals[7 + len(extra_cols)] = _reason_label
             for j, v in enumerate(vals):
                 self._set_item(tbl, i, j, v)
         tbl.resizeColumnsToContents()
@@ -943,6 +1025,17 @@ class RetireWindow(QDialog):
             vals = [m['date'], f"{m['comp']} {m['stage']}", m["opp"],
                     str(m["goals"]), str(m["assists"]), str(m["saves"]), str(m["conceded"]),
                     str(m["rating"]), m["score"], format_result_with_absence(m)]
+            # [2026-07 재수정, 신민용 리포트: "red_card는 실제로 뛴 경기라
+            # 결장 취급하면 안 된다"] injury/suspension만 완전 결장으로
+            # 스탯을 가리고, red_card는 실제 스탯이 있으니 그대로 둔다.
+            _reason_label = None
+            if m.get("absence_reason") in _FULL_ABSENCE_REASONS:
+                _reason_label = _ABSENCE_LABEL.get(m["absence_reason"], m["absence_reason"])
+            elif not m.get("my_played", 1) and not m.get("absence_reason"):
+                _reason_label = "벤치"
+            if _reason_label:
+                vals[3] = "—"; vals[4] = "—"; vals[5] = "—"; vals[6] = "—"
+                vals[7] = _reason_label
             for j, v in enumerate(vals):
                 self._set_item(tbl, i, j, v)
         tbl.resizeColumnsToContents()
@@ -963,6 +1056,17 @@ class RetireWindow(QDialog):
             vals = [m['date'], f"{m['comp']} {m['stage']}", opp,
                     str(m["goals"]), str(m["assists"]), str(m["saves"]), str(m["conceded"]),
                     str(m["rating"]), m["score"], format_result_with_absence(m)]
+            # [2026-07 재수정, 신민용 리포트: "red_card는 실제로 뛴 경기라
+            # 결장 취급하면 안 된다"] injury/suspension만 완전 결장으로
+            # 스탯을 가리고, red_card는 실제 스탯이 있으니 그대로 둔다.
+            _reason_label = None
+            if m.get("absence_reason") in _FULL_ABSENCE_REASONS:
+                _reason_label = _ABSENCE_LABEL.get(m["absence_reason"], m["absence_reason"])
+            elif not m.get("my_played", 1) and not m.get("absence_reason"):
+                _reason_label = "벤치"
+            if _reason_label:
+                vals[3] = "—"; vals[4] = "—"; vals[5] = "—"; vals[6] = "—"
+                vals[7] = _reason_label
             for j, v in enumerate(vals):
                 self._set_item(tbl, i, j, v)
         tbl.resizeColumnsToContents()
@@ -1094,10 +1198,18 @@ class RetireWindow(QDialog):
                 # 잘못 표시했다 — 실제 국가명 조회로 교체하고, 리그명에도
                 # career_window.py와 동일하게 (n부) 접미사를 붙인다.
                 from game_engine import league_total_teams_by_name
+                # [2026-07 재수정, 신민용 리포트: "세리에 A인데 국가가
+                # 브라질로 뜬다"] 리그명만으로 조회하면 이탈리아 세리에 A와
+                # 브라질 세리에 A(브라질레이랑 통칭)처럼 리그명이 같은
+                # 나라가 있을 때 엉뚱한 나라가 나온다 — team_id로 직접
+                # 조회(팀은 나라를 안 바꾸므로 승강으로 tier가 바뀌어도
+                # 국가 조회는 항상 안전하다).
+                _tid_for_country = e.get("team_id")
                 _country_row = get_conn().execute(
-                    """SELECT cn.flag, cn.name as cname FROM leagues l
-                       JOIN countries cn ON l.country_id=cn.id WHERE l.name=? LIMIT 1""",
-                    (lg,)).fetchone() if lg else None
+                    """SELECT cn.flag, cn.name as cname FROM teams t
+                       JOIN leagues l ON t.league_id=l.id
+                       JOIN countries cn ON l.country_id=cn.id WHERE t.id=? LIMIT 1""",
+                    (_tid_for_country,)).fetchone() if _tid_for_country else None
                 nation = f"{_country_row['flag']} {_country_row['cname']}" if _country_row else "—"
                 lg_disp = f"{lg} ({e.get('tier','')}부)" if lg else "—"
                 if m > 0:
@@ -1108,24 +1220,45 @@ class RetireWindow(QDialog):
                 # 계약/이적
                 c_yrs = e.get("contract_years",0)
                 exit_t = e.get("exit_type",""); in_type = e.get("transfer_type","입단")
+                # [2026-07 신설, career_window.py와 동일한 신민용 리포트 반영]
+                # 들어온 경로가 강제이적(팔림)이면 "구매"로 구분 표시.
+                if in_type == "팔림":
+                    in_type = "구매"
                 t_type = exit_t if exit_t else in_type
                 # [2026-07 재수정, 신민용 지적: "은퇴창이랑 AI요약도 마찬가지로
                 # 떠야지"] career_window.py와 동일하게 계약 컬럼은 원소속팀
                 # 계약년수를 그대로 보여주고, 이적란에 실제 임대 기간을
                 # "임대(N개월)"처럼 붙인다.
                 if t_type in ("임대", "임대 종료"):
-                    _label = t_type
-                    if ey:
-                        total_weeks = max(1, (ey - sy) * 52 + (ew - sw))
-                        months = max(1, round(total_weeks / 4.33))
-                        if months >= 12:
-                            _yrs, _rem = divmod(months, 12)
-                            dur = f"{_yrs}년" if _rem == 0 else f"{_yrs}년 {_rem}개월"
-                        else:
-                            dur = f"{months}개월"
+                    # [2026-07 재수정, 신민용 지적: "임대(1년)/임대 종료(1년)만
+                    # 뜨면 어느 팀으로 갔는지/어디로 복귀했는지 안 보인다"]
+                    _partner = e.get("loan_partner_team", "") or ""
+                    if t_type == "임대 종료":
+                        t_type = f"{_partner} 복귀" if _partner else "복귀"
                     else:
-                        dur = "진행중"
-                    t_type = f"{_label}({dur})"
+                        if ey:
+                            total_weeks = max(1, (ey - sy) * 52 + (ew - sw))
+                            months = max(1, round(total_weeks / 4.33))
+                            if months >= 12:
+                                _yrs, _rem = divmod(months, 12)
+                                dur = f"{_yrs}년" if _rem == 0 else f"{_yrs}년 {_rem}개월"
+                            else:
+                                dur = f"{months}개월"
+                        else:
+                            dur = "진행중"
+                        t_type = f"{_partner}에 임대({dur})" if _partner else f"임대({dur})"
+                # [2026-07 신설, 신민용 지적: "구매/팔림에 금액이 안 보인다 —
+                # 파는 쪽(팔림)엔 표시 안 하고 사는 쪽(구매/오퍼)에만
+                # 금액을 붙여야 한다"] 이 행이 "내가 이 팀에 들어온"
+                # 이벤트를 보여줄 때만(=exit_t가 비어서 in_type이 최종
+                # 채택됐을 때만) 이적료를 붙인다 — exit_t가 채택된 경우
+                # (팔림/방출/계약만료 등, "이 팀을 떠난" 이벤트)는 그
+                # 팀에서의 이적료가 아니라 다음 팀 행에 이미 붙으므로
+                # 여기서는 표시하지 않는다.
+                if not exit_t:
+                    _fee_disp = e.get("transfer_fee", 0)
+                    if _fee_disp:
+                        t_type = f"{t_type} ({fmt_money(_fee_disp)})"
                 if in_type == "임대" or idx == 0 or e.get("team_name") != entries[idx-1].get("team_name"):
                     c_str = f"{c_yrs}년" if c_yrs else "—"
                 elif in_type == "연장" or t_type == "연장":
@@ -1348,10 +1481,9 @@ class RetireWindow(QDialog):
         lines.append(f"▶ 국제전 기록  ({len(intl_ms)}경기)")
         if intl_ms:
             for im in intl_ms:
-                stat = _match_stat_str(im)
                 lines.append(f"  • {im['date']}  "
                              f"{im['comp']} {im['stage']}  vs {im['opp']}  ─  "
-                             f"{stat}  평점 {im['rating']}  ({im['score']} {format_result_with_absence(im)})")
+                             f"{_match_line_str(im)}  ({im['score']} {format_result_with_absence(im)})")
         else:
             lines.append("  없음")
         lines.append("")
@@ -1361,10 +1493,9 @@ class RetireWindow(QDialog):
         if qual_ms2:
             lines.append(f"▶ 국제전(예선) 기록  ({len(qual_ms2)}경기)")
             for qm in qual_ms2:
-                stat = _match_stat_str(qm)
                 lines.append(f"  • {qm['date']}  "
                              f"{qm['comp']} {qm['stage']}  vs {qm['opp']}  ─  "
-                             f"{stat}  평점 {qm['rating']}  ({qm['score']} {format_result_with_absence(qm)})")
+                             f"{_match_line_str(qm)}  ({qm['score']} {format_result_with_absence(qm)})")
             lines.append("")
 
         # 챔피언스리그 기록 (클럽 대륙 대회 경기 단위 ─ A매치 아님, 클럽 출전)
@@ -1373,10 +1504,9 @@ class RetireWindow(QDialog):
         lines.append(f"▶ 챔피언스리그 기록  ({len(cl_ms2)}경기)  ※ 클럽 대항전 (A매치 아님)")
         if cl_ms2:
             for cm in cl_ms2:
-                stat = _match_stat_str(cm)
                 lines.append(f"  • {cm['date']}  "
                              f"{cm['comp']} {cm['stage']}  ({cm['team']}) vs {cm['opp']}  ─  "
-                             f"{stat}  평점 {cm['rating']}  ({cm['score']} {format_result_with_absence(cm)})")
+                             f"{_match_line_str(cm)}  ({cm['score']} {format_result_with_absence(cm)})")
         else:
             lines.append("  없음")
         lines.append("")
@@ -1388,9 +1518,13 @@ class RetireWindow(QDialog):
         if cup_ms2:
             for um in cup_ms2:
                 opp = um["opp"] + (f" ({um['opp_tier']}부)" if um.get("opp_tier") else "")
+                if um.get("absence_reason") or not um.get("my_played", 1):
+                    line_body = _match_line_str(um)
+                else:
+                    line_body = f"{um['goals']}골 {um['assists']}어시  평점 {um['rating']}"
                 lines.append(f"  • {um['date']}  "
                              f"{um['comp']} {um['stage']}  vs {opp}  ─  "
-                             f"{um['goals']}골 {um['assists']}어시  평점 {um['rating']}  "
+                             f"{line_body}  "
                              f"({um['score']} {format_result_with_absence(um)})")
         else:
             lines.append("  없음")
@@ -1402,10 +1536,9 @@ class RetireWindow(QDialog):
         if cwc_ms2:
             lines.append(f"▶ 클럽 월드컵 기록  ({len(cwc_ms2)}경기)  ※ 4년 주기 클럽 대항전 (A매치 아님)")
             for wm in cwc_ms2:
-                stat = _match_stat_str(wm)
                 lines.append(f"  • {wm['date']}  "
                              f"{wm['comp']} {wm['stage']}  vs {wm['opp']}  ─  "
-                             f"{stat}  평점 {wm['rating']}  ({wm['score']} {format_result_with_absence(wm)})")
+                             f"{_match_line_str(wm)}  ({wm['score']} {format_result_with_absence(wm)})")
             lines.append("")
 
         # 승강 경험
@@ -1455,7 +1588,103 @@ class RetireWindow(QDialog):
         self.gen_btn.setText("✨ 다시 요약")
         self.gen_btn.setEnabled(True)
 
-    # ── AI 스토리(책) 생성 ─────────────────────────────
+    # ── 스토리(책) 생성 — 로컬 렌더러 / 실제 AI(제미나이) 공용 ──────
+
+    def _gather_story_inputs(self):
+        """두 버튼(로컬/AI)이 공유하는 데이터 수집 로직. player, entries,
+        trophies, awards, intl_trophies, match_rows를 튜플로 반환한다."""
+        p = get_player()
+        conn = get_conn(); c = conn.cursor()
+        entries = [dict(r) for r in c.execute(
+            "SELECT * FROM career_entries ORDER BY id").fetchall()]
+
+        from game_engine import get_my_trophies
+        all_trophies = get_my_trophies()
+        trophies = [t for t in all_trophies if not _is_personal_award(t)]
+        try:
+            awards = [dict(r) for r in c.execute(
+                "SELECT * FROM awards WHERE is_mine=1 ORDER BY year").fetchall()]
+        except Exception:
+            awards = []
+
+        # entries에 실제 국가 정보를 채워준다 — story_generator가 리그명
+        # 문자열 추측이 아니라 이 country 필드로 '해외 진출/귀국'을
+        # 정확히 구분한다 (K리그2 같은 국내 리그명엔 국가 접두어가
+        # 없어서 문자열 추측만으로는 오탐이 났었다).
+        # [2026-07 버그수정, 신민용 리포트: "10위/12팀처럼 자세히 표시가
+        # 안 된다"] story_generator._fill()이 _total_teams 필드를 참조해
+        # "{rank}위/{total}팀" 형태로 표시하는데, career_entries 테이블
+        # 자체엔 그 리그의 '전체 팀 수'가 저장돼 있지 않다(순위만 저장) —
+        # UI(career_window 등)는 화면에 그릴 때마다 그때그때
+        # league_total_teams_by_name()으로 따로 계산해서 붙였는데,
+        # story_generator로 넘기는 이 경로엔 그 계산이 빠져 있어서 항상
+        # "10위"까지만 나오고 "/12팀"이 안 붙었다. country와 같은 자리에서
+        # 함께 채운다.
+        from game_engine import league_total_teams_by_name
+        league_total = {}
+        team_country = {}
+        for e in entries:
+            ln = e.get("league_name", "")
+            tid = e.get("team_id")
+            if tid and tid not in team_country:
+                row = c.execute("""SELECT cn.name as cname FROM teams t
+                                    JOIN leagues l ON t.league_id=l.id
+                                    JOIN countries cn ON l.country_id=cn.id
+                                    WHERE t.id=? LIMIT 1""", (tid,)).fetchone()
+                team_country[tid] = row["cname"] if row else ""
+            e["country"] = team_country.get(tid, "")
+            if ln and ln not in league_total:
+                league_total[ln] = league_total_teams_by_name(ln) or 0
+            e["_total_teams"] = league_total.get(ln, 0)
+        conn.close()
+
+        intl_trophies = [t for t in trophies if t.get("tier", 0) == 0]
+
+        # [2026-07 신설, 커리어 메모리] 경기 단위 기록도 함께 넘긴다 —
+        # story_generator가 해트트릭/고평점 경기 같은 걸
+        # 참고할 수 있게. 실패해도(구버전 세이브 등) 계속 진행되도록 방어.
+        try:
+            conn3 = get_conn()
+            match_rows = [dict(r) for r in conn3.execute(
+                "SELECT * FROM match_details ORDER BY id").fetchall()]
+            conn3.close()
+        except Exception:
+            match_rows = []
+
+        # [2026-07 신설] 컵/챔스/국대 결장 기록에서 "부상으로 결장한 진짜
+        # 사유"만 뽑아 story_generator에 넘긴다 — 예전엔 story_generator가
+        # '평소보다 적게 뛴 시즌'을 통계로 추측만 했는데, 이 대회들은 이미
+        # absence_reason(injury/suspension/...)을 정확히 매겨서 갖고 있으므로
+        # 그 확정 근거를 그대로 쓴다. 대회별 조회가 실패해도(구버전 세이브
+        # 등) 나머지는 계속 진행되도록 각각 방어한다.
+        absence_events = []
+        try:
+            import cup_engine
+            absence_events += [{"year": m.get("year"), "reason": m.get("absence_reason")}
+                                for m in cup_engine.get_my_cup_matches() if m.get("absence_reason")]
+        except Exception:
+            pass
+        try:
+            import champions_engine
+            absence_events += [{"year": m.get("year"), "reason": m.get("absence_reason")}
+                                for m in champions_engine.get_my_cl_matches() if m.get("absence_reason")]
+        except Exception:
+            pass
+        try:
+            import intl_engine
+            absence_events += [{"year": m.get("year"), "reason": m.get("absence_reason")}
+                                for m in intl_engine.get_my_intl_matches() if m.get("absence_reason")]
+        except Exception:
+            pass
+
+        # [2026-07 버그수정, 신민용 리포트: "2002년 삼성 FC가 실제로는
+        # 강등 안 했는데 스토리엔 강등했다고 나온다"] story_generator가
+        # 강등 여부를 순위 비율만으로 추측하고 있었다 — 실제 승강 기록
+        # (promotion_log)을 넘겨서 정확히 판정하게 한다.
+        from game_engine import get_my_promotions
+        promos = get_my_promotions()
+
+        return p, entries, trophies, awards, intl_trophies, match_rows, absence_events, promos
 
     def _open_story_book(self):
         """story_generator.py(로컬 문장 뱅크 기반, API 비사용)로 장문
@@ -1463,47 +1692,20 @@ class RetireWindow(QDialog):
         self.book_btn.setEnabled(False)
         self.book_btn.setText("⏳ 생성 중...")
         try:
-            p = get_player()
-            conn = get_conn(); c = conn.cursor()
-            entries = [dict(r) for r in c.execute(
-                "SELECT * FROM career_entries ORDER BY id").fetchall()]
-
-            from game_engine import get_my_trophies
-            all_trophies = get_my_trophies()
-            trophies = [t for t in all_trophies if not _is_personal_award(t)]
-            try:
-                awards = [dict(r) for r in c.execute(
-                    "SELECT * FROM awards WHERE is_mine=1 ORDER BY year").fetchall()]
-            except Exception:
-                awards = []
-
-            # entries에 실제 국가 정보를 채워준다 — story_generator가 리그명
-            # 문자열 추측이 아니라 이 country 필드로 '해외 진출/귀국'을
-            # 정확히 구분한다 (K리그2 같은 국내 리그명엔 국가 접두어가
-            # 없어서 문자열 추측만으로는 오탐이 났었다).
-            league_country = {}
-            for e in entries:
-                ln = e.get("league_name", "")
-                if ln and ln not in league_country:
-                    row = c.execute("""SELECT cn.name as cname FROM leagues l
-                                        JOIN countries cn ON l.country_id=cn.id
-                                        WHERE l.name=? LIMIT 1""", (ln,)).fetchone()
-                    league_country[ln] = row["cname"] if row else ""
-                e["country"] = league_country.get(ln, "")
-            conn.close()
-
-            intl_trophies = [t for t in trophies if t.get("tier", 0) == 0]
+            p, entries, trophies, awards, intl_trophies, match_rows, absence_events, promos = \
+                self._gather_story_inputs()
 
             import story_generator
             story_text = story_generator.generate_story(
-                p, entries, trophies, awards, intl_trophies=intl_trophies)
+                p, entries, trophies, awards, promos=promos, intl_trophies=intl_trophies,
+                match_rows=match_rows, absence_events=absence_events)
 
             from ui.story_book_window import StoryBookWindow
             self._book_win = StoryBookWindow(p.get("name", "선수"), story_text, parent=self)
             self._book_win.show()
         finally:
             self.book_btn.setEnabled(True)
-            self.book_btn.setText("📖 AI 스토리 생성")
+            self.book_btn.setText("📖 스토리 생성")
 
     # ── 시작 화면으로 ─────────────────────────────────
 

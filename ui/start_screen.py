@@ -401,7 +401,7 @@ class NewPlayerDialog(QDialog):
         name_row = QHBoxLayout()
         name_row.addWidget(QLabel("이름"))
         self.name_edit = QLineEdit()
-        self.name_edit.setPlaceholderText("선수 이름 입력")
+        self.name_edit.setPlaceholderText("선수 이름 입력  (비워두면 국적에 맞는 이름 랜덤 생성)")
         name_row.addWidget(self.name_edit)
         lay.addLayout(name_row)
 
@@ -554,9 +554,39 @@ class NewPlayerDialog(QDialog):
 
     def _create(self):
         name = self.name_edit.text().strip()
+        # 국적 먼저 확정 — 이름 자동생성(국적에 맞는 이름 뽑기)에 필요하므로,
+        # 국적 선택 안 했으면(랜덤) 여기서 미리 하나 뽑아 이후 create_player
+        # 호출에도 그대로 재사용한다(생성된 이름과 실제 배정 국적이
+        # 어긋나지 않도록 한 번만 뽑아 둘 다에 쓴다).
+        if self._nat:
+            nat_name, nat_flag = self._nat
+        else:
+            conn = get_conn(); c = conn.cursor()
+            c.execute("""SELECT name, flag FROM countries
+                         WHERE id IN (SELECT DISTINCT country_id FROM leagues)
+                         ORDER BY RANDOM() LIMIT 1""")
+            crow = c.fetchone()
+            conn.close()
+            nat_name, nat_flag = (crow["name"], crow["flag"]) if crow else (None, None)
+
         if not name:
-            _game_warning(self, "입력 오류", "이름을 입력해주세요.")
-            return
+            # [2026-07 신설, 신민용 요청: "이름 입력 안 하면 국적에 맞는
+            # 랜덤 이름을 만들 수 있냐"] 예전엔 이름을 비워두면 그냥 에러로
+            # 막았다 — 국적/포지션처럼 이름도 "안 정하면 랜덤"이 되도록,
+            # _random_all()과 동일한 player_names 풀에서 위에서 정한
+            # 국적에 맞는 이름을 하나 뽑아 자동으로 채운다.
+            rname = None
+            if nat_name:
+                conn = get_conn(); c = conn.cursor()
+                cid_row = c.execute("SELECT id FROM countries WHERE name=?", (nat_name,)).fetchone()
+                if cid_row:
+                    nrow = c.execute(
+                        "SELECT name FROM player_names WHERE country_id=? ORDER BY RANDOM() LIMIT 1",
+                        (cid_row["id"],)).fetchone()
+                    if nrow:
+                        rname = nrow["name"]
+                conn.close()
+            name = rname or (f"{nat_name}선수" if nat_name else "무명선수")
         # [신규] 포지션/세부역할이 "🎲 랜덤"(콤보 데이터 None)이면 여기서
         # 실제 값을 뽑는다 — 국적 선택과 같은 패턴: 안 고르면 랜덤.
         pos = self.pos_combo.currentData()
@@ -568,11 +598,6 @@ class NewPlayerDialog(QDialog):
         tier = self.talent_combo.currentData()  # None이면 create_player가 알아서 확률 추첨
         personality = self.personality_combo.currentData()
         trait = self.trait_combo.currentData()
-        if self._nat:
-            nat_name, nat_flag = self._nat
-            create_player(name, pos, role, nat_name, nat_flag, talent_tier=tier,
-                          personality=personality, physical_trait=trait)
-        else:
-            create_player(name, pos, role, talent_tier=tier,
-                          personality=personality, physical_trait=trait)
+        create_player(name, pos, role, nat_name, nat_flag, talent_tier=tier,
+                      personality=personality, physical_trait=trait)
         self.accept()

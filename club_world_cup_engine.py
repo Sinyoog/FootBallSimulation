@@ -283,8 +283,24 @@ def _advance_round(t, cur_stage):
             "INSERT INTO cwc_matches(tournament_id, stage, week, home_team_id, away_team_id) "
             "VALUES(?,?,?,?,?)",
             (t["id"], nxt, week, winners[i], winners[i + 1]))
-    if nxt == "SF":
-        pass   # 4강 결과 나오면 F/TP는 _finish_tournament 진입 직전 별도 생성 필요
+    # [2026-07 버그수정, 신민용 리포트: "결승전은 상대가 미리 보이는데
+    # 3/4위전은 경기 끝나야 나온다"] 예전엔 TP 매치 생성을 _finish_tournament
+    # (F/TP를 곧바로 시뮬하는 함수) 진입 시점까지 미뤄서, TP 행이 DB에
+    # 생기는 순간 이미 결과까지 같이 확정돼버렸다 — 그래서 대진표에
+    # "매치업은 정해졌지만 아직 안 뛴" 상태가 존재할 틈이 없었다.
+    # champions_engine.py(챔스)는 SF가 끝나는 즉시 F와 TP를 둘 다
+    # -1,-1(미완료) 매치로 만들어둬서 그 사이에 대진표가 미리 보인다 —
+    # 여기도 SF→F 전환 시점에 TP를 똑같이 즉시 생성한다(패자끼리, 결승과
+    # 같은 주차, -1,-1 미완료 상태로).
+    if cur_stage == "SF":
+        losers = [m["away_team_id"] if _round_winner(dict(m)) == m["home_team_id"] else m["home_team_id"]
+                  for m in matches]
+        if len(losers) == 2:
+            tp_week = CWC_KO_WEEK["TP"]
+            conn.execute(
+                "INSERT INTO cwc_matches(tournament_id, stage, week, home_team_id, away_team_id) "
+                "VALUES(?,'TP',?,?,?)",
+                (t["id"], tp_week, losers[0], losers[1]))
     conn.commit()
     conn.close()
 
@@ -300,6 +316,9 @@ def _finish_tournament(t):
     TP 생성은 F 존재 여부와 완전히 독립적으로 처리한다."""
     from game_engine import add_log, get_player
     conn = get_conn()
+    # [2026-07 버그수정] TP는 이제 _advance_round(SF→F 전환 시점)에서
+    # 이미 만들어져 있는 게 정상 경로다 — 여기선 방어적으로만(과거 세이브
+    # 호환 등 예외 상황 대비) 없으면 만든다.
     sf = conn.execute("SELECT * FROM cwc_matches WHERE tournament_id=? AND stage='SF' ORDER BY id",
                        (t["id"],)).fetchall()
     if sf and not conn.execute(
@@ -539,7 +558,15 @@ def get_my_cwc_matches():
         """SELECT m.*, t.year AS t_year, t.name AS comp, t.my_team_id AS t_my_tid
            FROM cwc_matches m
            JOIN cwc_tournaments t ON m.tournament_id = t.id
-           WHERE m.my_played = 1 OR m.my_absence_reason IS NOT NULL
+           -- [2026-07 재수정, 신민용 지적: "다친 게 아니라 그냥
+           -- 벤치라 안 뛴 경기도 있는데 그건 빠진다"] my_played=1
+           -- 이거나 absence_reason이 있는 것만 걸렀더니, "건강한데
+           -- 로테이션으로 그냥 안 뛴" 경기(my_played=0이면서
+           -- absence_reason도 NULL)가 통째로 빠졌다 — 그 팀 소속으로
+           -- 치러진 경기는 전부 보여주고(결과가 난 것만), 뛰었는지
+           -- 안 뛰었는지는 화면에서 my_played/absence_reason으로
+           -- 구분한다.
+           WHERE m.is_my = 1 AND m.home_score >= 0
            ORDER BY t.year, m.week""").fetchall()]
     names = {(r["tournament_id"], r["team_id"]): (r["team_name"], r["country"])
              for r in conn.execute(
@@ -593,6 +620,7 @@ def get_my_cwc_matches():
             "blocks": 0, "pass_acc": 0,
             "score": f"{my_s}-{op_s}", "result": result,
             "absence_reason": m.get("my_absence_reason"),
+            "my_played": m.get("my_played", 0),
         })
     return out
 
@@ -716,7 +744,11 @@ def get_my_cwc_match(week: int):
 def sim_my_cwc_match_as_ai(week, p, reason="injury"):
     """부상 등으로 내가 못 뛸 때 내 클럽월드컵 경기를 AI끼리 시뮬 —
     champions_engine.sim_my_cl_match_as_ai와 동일한 이유(안 하면 대회
-    진행이 멈춤)."""
+    진행이 멈춤).
+
+    [2026-07 버그수정, 신민용 리포트: "부상으로 경기 못 나갔는데 감독관계가
+    그대로다"] game_engine._sim_my_team_match_as_ai와 동일한 이유로,
+    이 CWC AI-대체 경로도 결장 페널티(manager_relation -1)를 적용한다."""
     info = get_my_cwc_match(week)
     if not info:
         return
@@ -728,6 +760,8 @@ def sim_my_cwc_match_as_ai(week, p, reason="injury"):
     _sim_one(conn, dict(m))
     conn.commit()
     conn.close()
+    from game_engine import update_player, _calc_manager_rel
+    update_player(manager_relation=_calc_manager_rel(p, 0, "", played=False, not_played_penalty=2))
 
 
 def simulate_my_cwc_match(week, p):

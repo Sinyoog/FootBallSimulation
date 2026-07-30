@@ -13,6 +13,26 @@ from game_engine import get_player, fmt_money, get_my_promotions, get_state
 from database import get_conn
 from constants import format_result_with_absence
 
+# [2026-07 신설, 신민용 리포트: "은퇴창엔 부상/벤치/출전정지로 뜨는데
+# 커리어 창(이 파일)엔 여전히 0.0/원문 영어(red_card)로 뜬다"] retire_window.py
+# 에서 만든 것과 동일한 결장 라벨 체계를 여기서도 그대로 쓴다 — injury/
+# suspension만 완전 결장(스탯 자체가 없음)이고, red_card는 실제로 뛴
+# 경기(my_played=1, 스탯도 진짜)라 결장 취급하면 안 된다.
+_ABSENCE_LABEL = {"injury": "부상", "suspension": "출전정지"}
+_FULL_ABSENCE_REASONS = ("injury", "suspension")
+
+
+def _absence_override(m, ncols, rating_col_idx):
+    """전체 결장(부상/출전정지)이면 스탯 칸들을 "—"로, 평점 칸을 사유로
+    덮어쓸 (col_idx, value) 리스트를 반환한다. red_card·정상 출전·벤치는
+    None(덮어쓸 필요 없음 — red_card와 정상 출전은 진짜 스탯을 그대로
+    보여주고, 벤치는 호출부에서 별도 처리)."""
+    reason = m.get("absence_reason")
+    if reason in _FULL_ABSENCE_REASONS:
+        label = _ABSENCE_LABEL.get(reason, reason)
+        return label
+    return None
+
 
 # 개인 수상으로 분류할 키워드 (trophy_log에 섞여 들어온 발롱도르·MVP 행 식별)
 _PERSONAL_AWARD_KEYWORDS = (
@@ -195,17 +215,21 @@ class CareerWindow(QDialog):
         if not entries:
             lay.addWidget(QLabel("기록 없음")); return w
 
-        # league_name → 국가 flag 매핑 (팀명보다 리그명이 더 안정적)
+        # [2026-07 재수정, 신민용 리포트: "세리에 A인데 국가가 브라질로
+        # 뜬다"] league_name(문자열)만으로 조회하면 이탈리아 세리에 A와
+        # 브라질 세리에 A(브라질레이랑 통칭)처럼 리그명이 같은 나라가
+        # 있을 때 엉뚱한 나라가 캐시에 박힌다 — team_id로 직접 조회.
         conn = get_conn()
         c = conn.cursor()
-        league_country = {}
+        team_country = {}
         for e in entries:
-            ln = e.get("league_name","")
-            if ln and ln not in league_country:
+            tid = e.get("team_id")
+            if tid and tid not in team_country:
                 row = c.execute("""SELECT cn.flag, cn.name as cname
-                                   FROM leagues l JOIN countries cn ON l.country_id=cn.id
-                                   WHERE l.name=? LIMIT 1""", (ln,)).fetchone()
-                league_country[ln] = f"{row['flag']} {row['cname']}" if row else ""
+                                   FROM teams t JOIN leagues l ON t.league_id=l.id
+                                   JOIN countries cn ON l.country_id=cn.id
+                                   WHERE t.id=? LIMIT 1""", (tid,)).fetchone()
+                team_country[tid] = f"{row['flag']} {row['cname']}" if row else ""
         conn.close()
 
         # 선수의 현재 포지션 그룹에 맞춰 '지표 칸'을 다르게 구성한다.
@@ -320,12 +344,21 @@ class CareerWindow(QDialog):
 
             tn = e.get("team_name","")
             ln = e.get("league_name","")
-            country_str = league_country.get(ln, "")
+            country_str = team_country.get(e.get("team_id"), "")
             league_str  = f"{ln} ({e.get('tier','')}부)"
 
             c_yrs  = e.get("contract_years", 0)
             in_type  = e.get("transfer_type", "입단")   # 들어온 경로
             exit_t   = e.get("exit_type", "")            # 나간 경로
+            # [2026-07 신설, 신민용 리포트: "2001년은 입단, 2002년은 팔려서
+            # 왔다는 표시가 맞는듯 아님 구매라고 표시하던가"] "팔림"은 원래
+            # '그 팀에서 방출성으로 팔려 나갔다'는 뜻(나간 쪽 관점)인데,
+            # 들어온 경로에도 똑같이 "팔림"이 찍히면 이 팀에 입단할 때도
+            # "팔렸다"는 것처럼 보여 헷갈린다. 들어온 경로가 강제이적(팔림)
+            # 이면 "구매"로 구분한다 — 나간 경로 쪽 "팔림" 표기(빨간 강조
+            # 포함)는 그대로 둔다.
+            if in_type == "팔림":
+                in_type = "구매"
             # 이적란: 나간 경로가 있으면 그걸 우선 표시(팔림/방출/이적/계약만료),
             # 없으면(재직 중이거나 정상) 들어온 경로 표시
             t_type = exit_t if exit_t else in_type
@@ -336,18 +369,27 @@ class CareerWindow(QDialog):
             # 것이므로), 대신 "이적" 컬럼 쪽에 실제 임대 기간(개월/년)을
             # "임대(N개월)"처럼 표기한다.
             if t_type in ("임대", "임대 종료"):
-                _label = t_type
-                if ey:
-                    total_weeks = max(1, (ey - sy) * 52 + (ew - sw))
-                    months = max(1, round(total_weeks / 4.33))
-                    if months >= 12:
-                        _yrs, _rem = divmod(months, 12)
-                        dur = f"{_yrs}년" if _rem == 0 else f"{_yrs}년 {_rem}개월"
-                    else:
-                        dur = f"{months}개월"
+                # [2026-07 재수정, 신민용 지적: "임대(1년)/임대 종료(1년)만
+                # 뜨면 어느 팀으로 갔는지/어디로 복귀했는지 안 보인다"]
+                # exit_type='임대'(원소속팀에서 떠나는 행)는 도착지 팀명을
+                # 붙여 "OO에 임대(N개월)"로, exit_type='임대 종료'(임대처에서
+                # 떠나는 행)는 기간 표기 없이 "OO 복귀"로 표시한다 — 임대가
+                # '끝났다'는 사실보다 '어디로 돌아갔는지'가 의미 있는 정보다.
+                _partner = e.get("loan_partner_team", "") or ""
+                if t_type == "임대 종료":
+                    t_type = f"{_partner} 복귀" if _partner else "복귀"
                 else:
-                    dur = "진행중"
-                t_type = f"{_label}({dur})"
+                    if ey:
+                        total_weeks = max(1, (ey - sy) * 52 + (ew - sw))
+                        months = max(1, round(total_weeks / 4.33))
+                        if months >= 12:
+                            _yrs, _rem = divmod(months, 12)
+                            dur = f"{_yrs}년" if _rem == 0 else f"{_yrs}년 {_rem}개월"
+                        else:
+                            dur = f"{months}개월"
+                    else:
+                        dur = "진행중"
+                    t_type = f"{_partner}에 임대({dur})" if _partner else f"임대({dur})"
             # [2026-07 신설] 이적료 표시 — transfer_type/exit_type(어떻게
             # 왔는지)과 별개 축인 transfer_fee(얼마에 왔는지)를 괄호로
             # 덧붙인다. transfer_fee는 실제 "이적"(유료 이적) 행에만
@@ -548,19 +590,37 @@ class CareerWindow(QDialog):
         lay.addWidget(hint)
         return w
 
-    def _country_of_league(self, league_name):
-        """리그명 → 국가명. 조회 결과 캐싱."""
+    def _country_of_league(self, league_name, team_name=None):
+        """리그명(+가능하면 팀명) → 국가명. 조회 결과 캐싱.
+
+        [2026-07 재수정, 신민용 리포트: "세리에 A인데 국가가 브라질로
+        뜬다"] 리그명만으로 조회하면 이탈리아 세리에 A와 브라질 세리에 A
+        (브라질레이랑 통칭)처럼 같은 이름을 쓰는 나라가 있을 때 엉뚱한
+        나라가 나온다. trophy_log/promotion_log에는 team_id가 없어서(팀
+        이름만 저장) 여기서는 팀명까지 같이 매치해 리그명 충돌을 피한다
+        — "AC 밀란"은 이탈리아 세리에 A에만 있고 브라질 세리에 A에는
+        없으므로 팀명을 같이 걸면 정확한 쪽으로 좁혀진다."""
         if not hasattr(self, "_lc_cache"):
             self._lc_cache = {}
-        if league_name in self._lc_cache:
-            return self._lc_cache[league_name]
+        cache_key = (league_name, team_name)
+        if cache_key in self._lc_cache:
+            return self._lc_cache[cache_key]
         conn = get_conn()
-        row = conn.execute("""SELECT cn.name as cname
-                              FROM leagues l JOIN countries cn ON l.country_id=cn.id
-                              WHERE l.name=? LIMIT 1""", (league_name,)).fetchone()
+        row = None
+        if team_name:
+            row = conn.execute(
+                """SELECT cn.name as cname FROM teams t
+                   JOIN leagues l ON t.league_id=l.id
+                   JOIN countries cn ON l.country_id=cn.id
+                   WHERE l.name=? AND t.name=? LIMIT 1""",
+                (league_name, team_name)).fetchone()
+        if not row:
+            row = conn.execute("""SELECT cn.name as cname
+                                  FROM leagues l JOIN countries cn ON l.country_id=cn.id
+                                  WHERE l.name=? LIMIT 1""", (league_name,)).fetchone()
         conn.close()
         name = row["cname"] if row else ""
-        self._lc_cache[league_name] = name
+        self._lc_cache[cache_key] = name
         return name
 
     def _trophy_tab(self, trophies):
@@ -577,7 +637,7 @@ class CareerWindow(QDialog):
 
             if tier_t and tier_t > 0 and not _is_personal_award(t):
                 # 리그 우승: 팀 (국가) / 리그 (N부) / 우승
-                country  = self._country_of_league(lname)
+                country  = self._country_of_league(lname, tname)
                 team_str = f"{tname} ({country})" if country else tname
                 comp_str = f"{lname} ({tier_t}부)"
                 result   = "우승"
@@ -652,7 +712,7 @@ class CareerWindow(QDialog):
             result = f"{ft}부 → {tt}부"
             lname  = t.get("league_name","")
             tname  = t.get("team_name","")
-            country  = self._country_of_league(lname)
+            country  = self._country_of_league(lname, tname)
             team_str = f"{tname} ({country})" if country else tname
             comp_str = f"{lname} ({ft}부)" if ft else lname
             vals = [str(t.get("year","")), team_str, comp_str, result]
@@ -716,6 +776,15 @@ class CareerWindow(QDialog):
                     str(m["goals"]), str(m["assists"])]
                     + [_emap.get(c, "—") for c in extra_cols]
                     + [str(m["rating"]), m["score"], format_result_with_absence(m)])
+            _reason_label = _absence_override(m, len(vals), 7 + len(extra_cols))
+            if _reason_label is None and not m.get("my_played", 1) and not m.get("absence_reason"):
+                _reason_label = "벤치"
+            if _reason_label:
+                vals = list(vals)
+                vals[5] = "—"; vals[6] = "—"
+                for _k in range(7, 7 + len(extra_cols)):
+                    vals[_k] = "—"
+                vals[7 + len(extra_cols)] = _reason_label
             for j, v in enumerate(vals):
                 self._set(tbl, i, j, v, color if j == len(vals) - 1 else None)
         lay.addWidget(tbl)
@@ -781,6 +850,15 @@ class CareerWindow(QDialog):
                     str(m["goals"]), str(m["assists"])]
                     + [_emap.get(c, "—") for c in extra_cols]
                     + [str(m["rating"]), m["score"], format_result_with_absence(m)])
+            _reason_label = _absence_override(m, len(vals), 7 + len(extra_cols))
+            if _reason_label is None and not m.get("my_played", 1) and not m.get("absence_reason"):
+                _reason_label = "벤치"
+            if _reason_label:
+                vals = list(vals)
+                vals[5] = "—"; vals[6] = "—"
+                for _k in range(7, 7 + len(extra_cols)):
+                    vals[_k] = "—"
+                vals[7 + len(extra_cols)] = _reason_label
             for j, v in enumerate(vals):
                 self._set(tbl, i, j, v, color if j == len(vals) - 1 else None)
         lay.addWidget(tbl)
@@ -821,6 +899,12 @@ class CareerWindow(QDialog):
             vals = [m['date'], f"{m['comp']} {m['stage']}", m["opp"],
                     str(m["goals"]), str(m["assists"]), str(m["saves"]), str(m["conceded"]),
                     str(m["rating"]), m["score"], format_result_with_absence(m)]
+            _reason_label = _absence_override(m, len(vals), 7)
+            if _reason_label is None and not m.get("my_played", 1) and not m.get("absence_reason"):
+                _reason_label = "벤치"
+            if _reason_label:
+                vals[3] = "—"; vals[4] = "—"; vals[5] = "—"; vals[6] = "—"
+                vals[7] = _reason_label
             for j, v in enumerate(vals):
                 self._set(tbl, i, j, v, color if j == len(vals) - 1 else None)
         lay.addWidget(tbl)
@@ -861,6 +945,12 @@ class CareerWindow(QDialog):
             vals = [m['date'], f"{m['comp']} {m['stage']}", opp,
                     str(m["goals"]), str(m["assists"]), str(m["saves"]), str(m["conceded"]),
                     str(m["rating"]), m["score"], format_result_with_absence(m)]
+            _reason_label = _absence_override(m, len(vals), 7)
+            if _reason_label is None and not m.get("my_played", 1) and not m.get("absence_reason"):
+                _reason_label = "벤치"
+            if _reason_label:
+                vals[3] = "—"; vals[4] = "—"; vals[5] = "—"; vals[6] = "—"
+                vals[7] = _reason_label
             for j, v in enumerate(vals):
                 self._set(tbl, i, j, v, color if j == len(vals) - 1 else None)
         lay.addWidget(tbl)

@@ -15,14 +15,32 @@ QTextDocument가 가진 실제 페이지 레이아웃 기능(setPageSize)을 그
 
 from PyQt6.QtWidgets import (
     QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QFrame, QGraphicsDropShadowEffect
+    QFrame, QGraphicsDropShadowEffect, QApplication
 )
 from PyQt6.QtGui import QTextDocument, QPainter, QColor, QFont, QAbstractTextDocumentLayout
-from PyQt6.QtCore import Qt, QSizeF, QRectF
+from PyQt6.QtCore import Qt, QSizeF, QRectF, QTimer
+import re
 
 PAGE_W = 460
 PAGE_H = 620
 PAGE_MARGIN = 34
+
+
+_YEAR_RE = re.compile(r'(\d{4}년)')
+
+
+def _bold_first_year(line: str) -> str:
+    """[2026-07 신설, 신민용 요청: "연도로 시작하는 부분은 굵게 표시해서
+    알아보기 쉽게"] 문단 안에서 처음 나오는 'YYYY년' 패턴 하나만 굵게
+    표시한다. 문단이 항상 연도로 '시작'하는 건 아니라서(팀명이나 묘사로
+    시작하는 문단도 많음) 위치와 무관하게 그 문단을 대표하는 첫 연도를
+    찾아 감싼다 — 두 번째 이후 언급(예: 챕터 콜백의 "2005년까지")은
+    건드리지 않는다."""
+    m = _YEAR_RE.search(line)
+    if not m:
+        return line
+    start, end = m.span()
+    return line[:start] + f"<b>{m.group(1)}</b>" + line[end:]
 
 
 def story_text_to_html(story_text: str) -> str:
@@ -42,7 +60,7 @@ def story_text_to_html(story_text: str) -> str:
             parts.append(f'<h2 class="chapter">{lines[0]}</h2>')
         else:
             for l in lines:
-                parts.append(f'<p>{l}</p>')
+                parts.append(f'<p>{_bold_first_year(l)}</p>')
     body = "\n".join(parts)
     return f"""
     <html><head><style>
@@ -52,6 +70,7 @@ def story_text_to_html(story_text: str) -> str:
                       margin-bottom: 10px; border-bottom: 1px solid #c9b98f;
                       padding-bottom: 6px; }}
         p {{ margin: 0 0 12px 0; text-indent: 1em; text-align: justify; }}
+        p b {{ color: #6b3f1d; }}
     </style></head><body>{body}</body></html>
     """
 
@@ -110,6 +129,7 @@ class StoryBookWindow(QDialog):
         self.setWindowTitle(f"📖 {player_name}의 연대기")
         self.setStyleSheet("QDialog { background:#141414; }")
         self._spread = 0  # 0 = 1,2페이지 / 2 = 3,4페이지 ...
+        self.story_text = story_text  # [2026-07 신설] 복사 버튼에서 원본 평문을 그대로 쓴다
 
         self.document = QTextDocument()
         content_w = PAGE_W - 2 * PAGE_MARGIN
@@ -171,6 +191,17 @@ class StoryBookWindow(QDialog):
             "QPushButton:hover { background:#552828; }")
         close_btn.clicked.connect(self.close)
 
+        # [2026-07 신설, 신민용 요청] 스토리 전체를 클립보드로 복사하는 버튼.
+        # HTML(챕터 제목 태그 등)이 아니라 generate_story()가 만든 원본
+        # 평문(self.story_text)을 그대로 복사한다 — 다른 곳(메모장, 커뮤니티
+        # 글쓰기창 등)에 붙여넣었을 때 태그가 섞여 나오지 않게.
+        self.copy_btn = QPushButton("📋 복사")
+        self.copy_btn.setStyleSheet(
+            "QPushButton { background:#2a2a2a; color:#e8d9b0; border:none;"
+            " border-radius:6px; padding:8px 18px; font-size:13px; font-weight:bold; }"
+            "QPushButton:hover { background:#3a3a3a; }")
+        self.copy_btn.clicked.connect(self._copy_story)
+
         self.prev_btn.clicked.connect(self._go_prev)
         self.next_btn.clicked.connect(self._go_next)
 
@@ -179,6 +210,7 @@ class StoryBookWindow(QDialog):
         nav.addWidget(self.page_lbl)
         nav.addWidget(self.next_btn)
         nav.addStretch()
+        nav.addWidget(self.copy_btn)
         nav.addWidget(close_btn)
         root.addLayout(nav)
 
@@ -207,6 +239,19 @@ class StoryBookWindow(QDialog):
         if self._spread + 2 < self._total_pages():
             self._spread += 2
             self._refresh()
+
+    def _copy_story(self):
+        """[2026-07 신설] 스토리 전체 텍스트를 클립보드에 복사하고,
+        버튼 텍스트를 잠깐 "복사됨!"으로 바꿔서 피드백을 준다(팝업 없이
+        가볍게 — 책 읽는 흐름을 방해하지 않도록)."""
+        QApplication.clipboard().setText(self.story_text)
+        self.copy_btn.setText("✅ 복사됨!")
+        self.copy_btn.setEnabled(False)
+        QTimer.singleShot(1200, self._reset_copy_btn)
+
+    def _reset_copy_btn(self):
+        self.copy_btn.setText("📋 복사")
+        self.copy_btn.setEnabled(True)
 
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key.Key_Left, Qt.Key.Key_PageUp):

@@ -76,11 +76,12 @@ def run_ai_offseason(year, verbose_log=None):
     # 상위집합이라 안전하게 합칠 수 있다 — 로직/결과는 완전히 동일, 풀스캔
     # 횟수만 3회→2회로 감소. (ovr은 _transfer_market의 실력 기반 이적 가중치용)
     shared_ai_rows = c.execute(
-        "SELECT id, team_id, position, age, name, ovr, nationality FROM ai_players").fetchall()
+        "SELECT id, team_id, position, age, name, ovr, nationality, "
+        "contract_end_year, last_transfer_year FROM ai_players").fetchall()
 
     retired    = _retire_and_replace(c, year, shared_ai_rows)
     _ta2 = _time_perf.perf_counter()
-    moved      = _transfer_market(c, shared_ai_rows)
+    moved      = _transfer_market(c, year, shared_ai_rows)
     _ta3 = _time_perf.perf_counter()
     formations = _shuffle_formations(c)
     _ta4 = _time_perf.perf_counter()
@@ -589,13 +590,15 @@ def _retire_and_replace(c, year, ai_rows=None):
         used = team_used_names.setdefault(r["team_id"], set())
         name = _random_name(c, r["team_id"], name_cache, used_in_team=used)
         replace_updates.append(
-            (name, new_age, *[stats[s] for s in ALL_STATS], new_ovr, new_sub_role, new_nat, r["id"]))
+            (name, new_age, *[stats[s] for s in ALL_STATS], new_ovr, new_sub_role, new_nat,
+             year + random.randint(3, 5), r["id"]))
         retired += 1
 
     if replace_updates:
         set_clause = ", ".join(f"{s}=?" for s in ALL_STATS)
         c.executemany(
-            f"UPDATE ai_players SET name=?, age=?, {set_clause}, ovr=?, sub_role=?, nationality=? WHERE id=?",
+            f"UPDATE ai_players SET name=?, age=?, {set_clause}, ovr=?, sub_role=?, nationality=?, "
+            f"contract_end_year=?, last_transfer_year=0 WHERE id=?",
             replace_updates)
 
     return retired
@@ -604,14 +607,17 @@ def _retire_and_replace(c, year, ai_rows=None):
 # ─────────────────────────────────────────────
 # 4. 이적 시장 (활발하게)
 # ─────────────────────────────────────────────
-def _transfer_market(c, ai_rows=None):
+def _transfer_market(c, year, ai_rows=None):
     """선수들이 팀 간 이동. 같은 리그 내 + 일부 리그 간 이적.
     [최적화] ORDER BY RANDOM() 제거 → 팀별 선수 목록 선조회 후 Python shuffle.
     이적마다 DB 왕복 2회(RANDOM 쿼리) → 0회로 감소.
     ai_rows: _retire_and_replace와 공유하는 ai_players 선조회 결과
-      (id,team_id,position,age,name) — 이 함수는 id/team_id/position만 쓰므로
-      그대로 재사용 가능(은퇴 처리는 team_id/position/id를 바꾸지 않으므로
-      은퇴 처리 이전에 뜬 스냅샷이어도 유효하다). None이면 기존처럼 직접 조회."""
+      (id,team_id,position,age,name,ovr,contract_end_year,last_transfer_year)
+      — None이면 기존처럼 직접 조회.
+
+    [2026-07 v2 신설] year 파라미터 추가 — 계약 잔여기간(길수록 이적
+    확률↓) 반영과 "방금 이적한 선수는 최소 1시즌은 유지"를 위해 필요.
+    """
     moved = 0
 
     teams = [dict(r) for r in c.execute(
@@ -626,44 +632,56 @@ def _transfer_market(c, ai_rows=None):
         by_league.setdefault(t["lid"], []).append(t["tid"])
 
     # [최적화] 팀별 선수 목록을 _retire_and_replace와 공유된 스냅샷에서 재사용
-    # (기존엔 여기서 "SELECT id, team_id, position FROM ai_players"를 또 날렸음)
     all_players_rows = ai_rows if ai_rows is not None else c.execute(
-        "SELECT id, team_id, position, ovr FROM ai_players").fetchall()
-    # {team_id: [{"id":..., "position":..., "ovr":...}, ...]}
+        "SELECT id, team_id, position, ovr, contract_end_year, last_transfer_year "
+        "FROM ai_players").fetchall()
+    # {team_id: [{"id":..., "position":..., "ovr":..., "contract_end_year":...,
+    #             "last_transfer_year":...}, ...]}
     team_players: dict = {}
     for r in all_players_rows:
-        team_players.setdefault(r["team_id"], []).append(
-            {"id": r["id"], "position": r["position"], "ovr": r["ovr"] if r["ovr"] is not None else 50})
+        team_players.setdefault(r["team_id"], []).append({
+            "id": r["id"], "position": r["position"],
+            "ovr": r["ovr"] if r["ovr"] is not None else 50,
+            "contract_end_year": r["contract_end_year"] if "contract_end_year" in r.keys() else 0,
+            "last_transfer_year": r["last_transfer_year"] if "last_transfer_year" in r.keys() else 0,
+        })
 
     # 이적 결과 누적 후 executemany
-    transfer_updates = []  # (new_team_id, player_id)
+    # [2026-07 v2] 이적 시 새 계약(2~4년)과 이적연도를 같이 기록한다 —
+    # (new_team_id, new_contract_end_year, last_transfer_year, player_id)
+    transfer_updates = []
 
     for lid, tids in by_league.items():
         if len(tids) < 2:
             continue
         n_transfers = int(len(tids) * random.uniform(1.0, 2.0))
         for _ in range(n_transfers):
-            result = _do_one_transfer_cached(tids, team_players, team_avg)
+            result = _do_one_transfer_cached(tids, team_players, team_avg, year)
             if result:
-                # team_players 캐시도 즉시 반영 (같은 시즌 내 연속 이적 일관성)
                 for new_tid, pid, old_tid in result:
-                    transfer_updates.append((new_tid, pid))
-                    # [bugfix] cache update: remove from old team, add to new team
+                    new_contract_end = year + random.randint(2, 4)
+                    transfer_updates.append((new_tid, new_contract_end, year, pid))
+                    # team_players 캐시도 즉시 반영 (같은 시즌 내 연속 이적 일관성)
                     p_entry = next((e for e in team_players.get(old_tid, []) if e["id"] == pid), None)
                     if p_entry:
                         team_players[old_tid] = [e for e in team_players[old_tid] if e["id"] != pid]
+                        p_entry["contract_end_year"] = new_contract_end
+                        p_entry["last_transfer_year"] = year
                         team_players.setdefault(new_tid, []).append(p_entry)
                 moved += 1
 
     if transfer_updates:
-        c.executemany("UPDATE ai_players SET team_id=? WHERE id=?", transfer_updates)
+        c.executemany(
+            "UPDATE ai_players SET team_id=?, contract_end_year=?, last_transfer_year=? WHERE id=?",
+            transfer_updates)
 
     return moved
 
 
-def _do_one_transfer_cached(tids, team_players, team_avg):
+def _do_one_transfer_cached(tids, team_players, team_avg, year):
     """[최적화] ORDER BY RANDOM() 없이 Python-side shuffle로 이적 처리.
-    team_players: {team_id: [{"id", "position", "ovr"}, ...]} 선조회 캐시.
+    team_players: {team_id: [{"id","position","ovr","contract_end_year",
+    "last_transfer_year"}, ...]} 선조회 캐시.
 
     [버그수정 2026-07] team_avg를 함수가 받기만 하고 실제로는 전혀 참조하지
     않아, 리그 내 이적이 팀 실력과 무관하게 완전 무작위로 일어나고 있었다
@@ -671,13 +689,49 @@ def _do_one_transfer_cached(tids, team_players, team_avg):
     선수(mover)의 OVR과 각 목적지 팀 평균OVR(team_avg) 차이가 작을수록
     (비슷한 수준 팀끼리, 혹은 살짝 더 좋은 팀으로) 그 팀이 목적지로 뽑힐
     확률이 높아지도록 가우시안 가중치를 준다 — 팀 간 실력차가 40 이상이면
-    사실상 이적 후보에서 배제된다(가중치가 0에 수렴)."""
+    사실상 이적 후보에서 배제된다(가중치가 0에 수렴).
+
+    [2026-07 v2 신설, 신민용+GPT 검토: "레알 에이스나 벤치나 완전히 같은
+    확률로 이적하면 세계가 너무 흔들린다 — 스타 선수는 조금만 보호해도
+    이적시장이 훨씬 현실적으로 보인다"] mover를 뽑는 단계 자체를 완전
+    균등추출(random.choice)에서, "팀 내 OVR 순위가 높을수록 뽑힐 확률을
+    낮추는" 가중 추출로 바꾼다. 팀 재정/감독 관계 같은 내 선수급 디테일은
+    AI에겐 없으니(원칙: AI는 플레이어보다 단순해야 한다), OVR 순위 하나만
+    가지고 가볍게 계산한다.
+
+    [2026-07 v3 신설] 계약 잔여기간 반영 + 최소 잔류기간(1시즌). 둘 다
+    "AI는 단순하게" 원칙에 맞춰 가벼운 규칙만 적용한다:
+      - last_transfer_year가 최근(작년)이면 이적 후보에서 아예 제외.
+      - 계약 미설정(0, 기존 선수)은 중립 취급, 설정돼 있으면 남은 연수가
+        많을수록(0.6^연수) 뽑힐 확률이 줄어든다.
+    """
     src = random.choice(tids)
     src_players = team_players.get(src, [])
     if not src_players:
         return None
-    # random.choice → ORDER BY RANDOM() LIMIT 1과 동일 효과, DB 왕복 없음
-    mover = random.choice(src_players)
+
+    # 최소 잔류기간: 작년(또는 그 이후)에 이미 이적한 선수는 이번엔 후보 제외
+    eligible = [p for p in src_players if (year - p.get("last_transfer_year", 0)) >= 1]
+    if not eligible:
+        return None
+
+    n = len(eligible)
+    if n == 1:
+        mover = eligible[0]
+    else:
+        ranked = sorted(range(n), key=lambda i: -eligible[i].get("ovr", 50))
+        rank_of = {}
+        for pos_rank, idx in enumerate(ranked):
+            rank_of[idx] = pos_rank
+        protect_strength = 0.85
+        weights = []
+        for i in range(n):
+            w = 0.15 + protect_strength * (rank_of[i] / max(1, n - 1))
+            _cend = eligible[i].get("contract_end_year", 0) or 0
+            remain = max(0, _cend - year) if _cend else 2   # 미설정=중립(2년 취급)
+            w *= 0.6 ** remain
+            weights.append(w)
+        mover = random.choices(eligible, weights=weights, k=1)[0]
 
     dst_candidates = [t for t in tids if t != src]
     if not dst_candidates:
@@ -697,7 +751,8 @@ def _do_one_transfer_cached(tids, team_players, team_avg):
         dst = random.choices(dst_candidates, weights=weights, k=1)[0]
 
     dst_players = team_players.get(dst, [])
-    same_pos = [p for p in dst_players if p["position"] == mover["position"]]
+    same_pos = [p for p in dst_players if p["position"] == mover["position"]
+                and (year - p.get("last_transfer_year", 0)) >= 1]
 
     if same_pos:
         swap = random.choice(same_pos)
@@ -708,16 +763,24 @@ def _do_one_transfer_cached(tids, team_players, team_avg):
 
 
 # _do_one_transfer는 하위호환용 별칭 (외부에서 직접 호출하는 경우 대비)
-def _do_one_transfer(c, tids, team_avg):
+def _do_one_transfer(c, tids, team_avg, year=None):
     """하위호환 래퍼. 신규 코드는 _do_one_transfer_cached 사용."""
+    import time as _t
+    if year is None:
+        year = _t.gmtime().tm_year
     players_rows = c.execute(
-        "SELECT id, team_id, position, ovr FROM ai_players WHERE team_id IN ({})".format(
+        "SELECT id, team_id, position, ovr, contract_end_year, last_transfer_year "
+        "FROM ai_players WHERE team_id IN ({})".format(
             ",".join("?" for _ in tids)), tids).fetchall()
     tp: dict = {}
     for r in players_rows:
-        tp.setdefault(r["team_id"], []).append(
-            {"id": r["id"], "position": r["position"], "ovr": r["ovr"] if r["ovr"] is not None else 50})
-    return _do_one_transfer_cached(tids, tp, team_avg)
+        tp.setdefault(r["team_id"], []).append({
+            "id": r["id"], "position": r["position"],
+            "ovr": r["ovr"] if r["ovr"] is not None else 50,
+            "contract_end_year": r["contract_end_year"] or 0,
+            "last_transfer_year": r["last_transfer_year"] or 0,
+        })
+    return _do_one_transfer_cached(tids, tp, team_avg, year)
 
 
 # ─────────────────────────────────────────────

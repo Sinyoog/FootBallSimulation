@@ -281,9 +281,15 @@ class ScheduleWindow(QDialog):
 
         # [2026-07 신설] 국내 컵대회 탭 — 예전엔 이 탭 자체가 없어서 컵
         # 경기가 로그에만 남고 일정 화면 어디에도 안 보였다.
-        cup_w = self._make_cup_tab()
-        if cup_w:
-            self._tab.addTab(cup_w, "🎖️ 컵대회")
+        # [2026-07 수정, 신민용 리포트: "컵대회도 내 경기/전체일정처럼
+        # 나누는 게 시각적으로 더 좋지 않아?"] 리그 일정 탭과 동일하게
+        # '내 경기' 탭을 먼저, '전체 일정' 탭을 뒤에 둔다.
+        cup_my_w = self._make_cup_tab(my_view=True)
+        if cup_my_w:
+            self._tab.addTab(cup_my_w, "🎖️ 컵대회(내 경기)")
+        cup_all_w = self._make_cup_tab(my_view=False)
+        if cup_all_w:
+            self._tab.addTab(cup_all_w, "🎖️ 컵대회(전체 일정)")
         # [2026-07 신설] 챔피언스리그·국제대회처럼 컵대회도 토너먼트
         # 대진표(브래킷)로 보여주는 탭 — 4강 이후 결승/3·4위전이 생기면서
         # 다른 대회들과 같은 방식으로 표시할 수 있게 됐다.
@@ -1164,10 +1170,16 @@ class ScheduleWindow(QDialog):
         outer.setWidget(body)
         return outer
 
-    def _make_cup_tab(self):
+    def _make_cup_tab(self, my_view=False):
         """[2026-07 신설] 국내 컵대회(FA컵식) 일정/결과 탭. 챔스처럼 별도
         브래킷 위젯 대신, 라운드가 유동적(팀 수에 따라 N라운드로 이름이
-        달라짐)이라 간단한 표로 보여준다 — 라운드/홈팀/스코어/원정팀/결과."""
+        달라짐)이라 간단한 표로 보여준다 — 라운드/홈팀/스코어/원정팀/결과.
+
+        [2026-07 수정, 신민용 리포트: "컵대회도 내 경기 전체일정처럼 나누는
+        게 시각적으로 더 좋지 않아?"] 예전엔 탭 하나에 그 대회 전체 경기를
+        (초반 라운드는 팀이 많아 수십 줄) 다 우겨넣고 내 경기만 보라색으로
+        구분했는데, 리그 일정 탭처럼 '내 경기'/'전체 일정'으로 아예 탭을
+        나눈다 — my_view=True면 내가 낀 경기만 필터링해서 보여준다."""
         import cup_engine
         from game_engine import get_state, get_player, day_to_full_date_str
 
@@ -1189,6 +1201,11 @@ class ScheduleWindow(QDialog):
             return None
 
         my_tid = p["current_team_id"]
+        if my_view:
+            rows = [r for r in rows
+                    if r["home_team_id"] == my_tid or r["away_team_id"] == my_tid]
+            if not rows:
+                return None
 
         outer = QWidget()
         lay = QVBoxLayout(outer)
@@ -1196,7 +1213,8 @@ class ScheduleWindow(QDialog):
         lay.setSpacing(6)
 
         hdr = QLabel(f"🎖️ {t['year']}년 {t['name']}" +
-                     (f"  —  현재 성적: {t['my_result']}" if t.get("my_result") else ""))
+                     (f"  —  현재 성적: {t['my_result']}" if t.get("my_result") else "") +
+                     ("  (내 경기)" if my_view else "  (전체 일정)"))
         hdr.setStyleSheet("color:#c48aff;font-size:14px;font-weight:bold;")
         lay.addWidget(hdr)
 
@@ -1237,7 +1255,9 @@ class ScheduleWindow(QDialog):
             from game_engine import _week_intl_cl_day
             _cup_day = _week_intl_cl_day(r["week"], p) if r["week"] is not None else 1
             date_str = day_to_full_date_str(t["year"], _cup_day)
-            vals = [r["round_name"], date_str, hn, score, an, result if is_my else ""]
+            # my_view 탭은 어차피 전부 내 경기라서 결과를 항상 보여주고,
+            # 전체 일정 탭은 예전처럼 내 경기가 아니면 결과란을 비운다.
+            vals = [r["round_name"], date_str, hn, score, an, result if (my_view or is_my) else ""]
             for j, v in enumerate(vals):
                 item = QTableWidgetItem(str(v))
                 if j in (0, 1, 3, 5):

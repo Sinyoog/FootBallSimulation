@@ -1725,6 +1725,9 @@ class CenterPanel(QWidget):
         from game_engine import load_pending_offer_state
         restore = load_pending_offer_state(kind="join")
         offers = restore.get("offers", []) if restore else generate_offers()
+        if restore:
+            from game_engine import refresh_offer_rank_info
+            refresh_offer_rank_info(offers)
         # [2026-07] 개수는 이제 함수 내부 고정값(자국10+타국6)이 결정
         from ui.offer_window import OfferWindow
         # 이 창은 소속 팀이 없을 때만 뜨므로(위에서 이미 체크) 첫 입단이든
@@ -1783,6 +1786,8 @@ class CenterPanel(QWidget):
                 clear_pending_offer_state()
                 return
             offers = restore.get("offers", [])
+            from game_engine import refresh_offer_rank_info
+            refresh_offer_rank_info(offers)
         else:
             # [오퍼 토글] 꺼져 있으면 자동 오퍼 팝업을 건너뛴다.
             #   단, '이적 요청' 중이면 사용자가 명시적으로 이적을 원한다는 뜻이므로
@@ -1809,7 +1814,7 @@ class CenterPanel(QWidget):
 
     def _on_auto_offer_done(self, dlg):
         if dlg.chosen:
-            join_team(dlg.chosen["team_id"], dlg.chosen["salary"], transfer_type="오퍼")
+            join_team(dlg.chosen["team_id"], dlg.chosen["salary"], transfer_type="오퍼", offer=dlg.chosen)
             if self.main_win: self.main_win.refresh_all()
 
     def _restore_pending_offer_window(self):
@@ -1834,7 +1839,10 @@ class CenterPanel(QWidget):
                 return
             self._join_used = True
             self.btn_join.setEnabled(False)
-            dlg = OfferWindow(restore.get("offers", []), p.get("language", "ko"), self,
+            _restored_offers = restore.get("offers", [])
+            from game_engine import refresh_offer_rank_info
+            refresh_offer_rank_info(_restored_offers)
+            dlg = OfferWindow(_restored_offers, p.get("language", "ko"), self,
                               title=restore.get("title", "🏟 팀 입단"),
                               force_select=restore.get("force_select", True),
                               grid=restore.get("grid", True),
@@ -1870,7 +1878,10 @@ class CenterPanel(QWidget):
                 clear_pending_offer_state()
                 return
             self._auto_offer_shown = True
-            dlg = OfferWindow(restore.get("offers", []), p.get("language", "ko"), self,
+            _restored_offers2 = restore.get("offers", [])
+            from game_engine import refresh_offer_rank_info
+            refresh_offer_rank_info(_restored_offers2)
+            dlg = OfferWindow(_restored_offers2, p.get("language", "ko"), self,
                               title=restore.get("title", "✈ 오퍼"),
                               grid=restore.get("grid", True),
                               kind="auto_offer", restore_state=restore)
