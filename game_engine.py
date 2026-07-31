@@ -1105,8 +1105,13 @@ def _ensure_career_entry(p, st):
     # 담당하고 있었다 — _save_career_entry 쪽에만 이적료 계산을 넣어서
     # 실제로는 한 번도 실행되지 않는 코드였다. 여기서도 동일하게
     # "이적"/"오퍼"일 때만 계산하고, 그 외(입단/임대/연장)는 0.
+    # [2026-07 재조정, 신민용+GPT 설계 확정: "팔림도 방출이 아니라 구단이
+    # 판매한 것 — 이적과 같은 이적료 체계를 써야 한다. 방출/계약만료/입단만
+    # 0원이 맞다"] "팔림"은 이적과 동일한 사건을 파는 쪽 관점에서 부르는
+    # 이름일 뿐인데, 이 조건에서 빠져 있어서 팔림 이벤트엔 이적료가 항상
+    # 0으로 저장되고 있었다 — "이적"/"오퍼"와 동일하게 취급한다.
     _transfer_fee_e = 0
-    if tt_e in ("이적", "오퍼"):
+    if tt_e in ("이적", "오퍼", "팔림"):
         _country_e = c.execute(
             "SELECT cn.name FROM leagues l JOIN countries cn ON l.country_id=cn.id WHERE l.id=?",
             (team_row["lid"],)).fetchone()
@@ -4484,9 +4489,53 @@ def generate_season_schedule(league_id, season, year, force=False):
     conn.close()
 
 
+def _repair_current_season_in_archive(league_id, season):
+    """[2026-07 버그수정, 신민용 리포트: "팀은 있는데 일정이 안 뜬다"]
+    archive_old_seasons()는 'season < current_season'인 것만 옮기므로
+    정상적이라면 지금 진행 중인 season의 데이터가 archive에 있을 수 없다.
+    그런데 실측 사례(릴 OSC 세이브)에서 season_state.current_season과 같은
+    season의 경기 306개(완전한 한 시즌 분량, 실제 스코어 있음)가 통째로
+    match_results_archive에 들어가 있고 match_results(라이브)는 텅 비어
+    있었다 — 정확한 트리거는 못 찾았지만(시즌 전환 시점 재호출 등으로
+    current_season 값이 일시적으로 어긋났을 가능성), 데이터 자체는
+    멀쩡한 진짜 결과이므로 버리지 않고 라이브 테이블로 복구한다.
+    generate_season_schedule의 '이미 완비됨' 판정이 archive까지 합산해서
+    보기 때문에, 이 상태에서는 재생성 시도 자체가 조용히 no-op 되어
+    영원히 복구가 안 됐다."""
+    conn = get_conn()
+    c = conn.cursor()
+    n_archived = c.execute(
+        "SELECT COUNT(*) c FROM match_results_archive WHERE league_id=? AND season=?",
+        (league_id, season)).fetchone()["c"]
+    if n_archived == 0:
+        conn.close()
+        return False
+    n_live = c.execute(
+        "SELECT COUNT(*) c FROM match_results WHERE league_id=? AND season=?",
+        (league_id, season)).fetchone()["c"]
+    if n_live > 0:
+        # 라이브에도 이미 있으면(정상 상태) 손대지 않는다 — 그냥 넘어감.
+        conn.close()
+        return False
+    cols = "id,league_id,week,home_team_id,away_team_id,home_score,away_score,season,year,day"
+    c.execute(
+        f"""INSERT OR IGNORE INTO match_results({cols})
+            SELECT {cols} FROM match_results_archive WHERE league_id=? AND season=?""",
+        (league_id, season))
+    c.execute(
+        "DELETE FROM match_results_archive WHERE league_id=? AND season=?",
+        (league_id, season))
+    conn.commit()
+    conn.close()
+    add_log(f"🔧 일정 복구: 리그#{league_id} {season}시즌 경기 {n_archived}건을 "
+            f"보관함에서 되살렸습니다.", "event")
+    return True
+
+
 def _generate_adjacent_schedules(my_lid, season, year):
     """내 리그 + 같은 국가 위아래 1티어 리그 일정을 함께 생성.
     승강 처리 시 인접 리그 순위가 필요하므로 반드시 함께 생성해야 함."""
+    _repair_current_season_in_archive(my_lid, season)
     generate_season_schedule(my_lid, season, year)
     conn = get_conn()
     c = conn.cursor()
@@ -4499,6 +4548,7 @@ def _generate_adjacent_schedules(my_lid, season, year):
                 "SELECT id FROM leagues WHERE country_id=? AND tier=?",
                 (cid, adj_tier)).fetchone()
             if adj:
+                _repair_current_season_in_archive(adj["id"], season)
                 generate_season_schedule(adj["id"], season, year)
     conn.close()
 
@@ -4682,6 +4732,221 @@ def _lock_league_title_after_season(p, year):
     _lock_in_championship(champ_tid, year, matches, min_week=35)
 
 
+# ══════════════════════════════════════════════════════════════
+# 구단 판매 추진 시스템 (2026-07 신설, 신민용+GPT 다회 설계 확정, v5)
+# ══════════════════════════════════════════════════════════════
+
+_SALE_PUSH_AWARD_SCORE = {"MVP": -2, "득점왕": -1, "베스트11": -1}
+
+
+def _my_team_rank_category(p) -> str:
+    """팀 내 OVR 순위로 에이스/핵심/주전/후보 분류(내 선수급 디테일 대신
+    가벼운 OVR 순위만 사용 — AI 팀메이트는 출전비중 등 세부 트래킹이
+    없어서 통일된 기준이 OVR뿐이다)."""
+    tid = p.get("current_team_id", 0)
+    if not tid:
+        return "후보"
+    conn = get_conn()
+    teammates = conn.execute("SELECT ovr FROM ai_players WHERE team_id=?", (tid,)).fetchall()
+    my_ovr = p.get("ovr", 50)
+    ovrs = sorted([r["ovr"] for r in teammates] + [my_ovr], reverse=True)
+    rank = ovrs.index(my_ovr) + 1
+    if rank == 1:
+        return "에이스"
+    if rank <= 3:
+        return "핵심"
+    if rank <= 6:
+        return "주전"
+    return "후보"
+
+
+def _calc_sale_push_score(p, cur_year):
+    """5개 조건(+1씩) + 수상 감산으로 판매추진 점수를 계산한다.
+    반환: (score, reasons) — reasons는 알림 문구 생성용 사유 키 리스트."""
+    score = 0
+    reasons = []
+    tid = p.get("current_team_id", 0)
+    conn = get_conn()
+
+    # 1) 재정 압박 — 이번 시즌 강등 (기존 relegation 체크 로직 재사용)
+    if tid:
+        team_row = conn.execute("SELECT name FROM teams WHERE id=?", (tid,)).fetchone()
+        if team_row:
+            rl = conn.execute(
+                """SELECT from_tier, to_tier FROM promotion_log
+                   WHERE team_name=? AND year=? ORDER BY id DESC LIMIT 1""",
+                (team_row["name"], cur_year)).fetchone()
+            if rl and rl["to_tier"] > rl["from_tier"]:
+                score += 1
+                reasons.append("relegation")
+
+    # 2) 계약 만료 임박 — 잔여 1년 이하를 "6개월 이하"의 근사치로 취급
+    #    (연 단위 계약 데이터라 주 단위 정밀 계산은 못 하지만, "임박"
+    #    판정 목적으로는 충분한 근사치다)
+    contract_end = p.get("contract_end_year", 0)
+    if contract_end and (contract_end - cur_year) <= 0:
+        score += 1
+        reasons.append("contract")
+
+    # 3) 전력 외 — 팀 내 순위 "후보" 구간만 해당
+    if _my_team_rank_category(p) == "후보":
+        score += 1
+        reasons.append("bench")
+
+    # 4) 감독과 불화
+    if p.get("manager_relation", 50) < 20:
+        score += 1
+        reasons.append("hostile")
+
+    # 5) 본인 불만 — 기존 transfer_rejection_count(일반 성향) 재사용,
+    #    2회 이상 누적이면 "불만 중"으로 본다
+    if _effective_rejection_count(p, cur_year) >= 2:
+        score += 1
+        reasons.append("frustration")
+
+    # 수상 감산 (이번 연도 awards, is_mine=1)
+    try:
+        awards = conn.execute(
+            "SELECT award_type FROM awards WHERE year=? AND is_mine=1", (cur_year,)).fetchall()
+        for a in awards:
+            at = a["award_type"] or ""
+            for key, delta in _SALE_PUSH_AWARD_SCORE.items():
+                if key in at:
+                    score += delta
+    except Exception:
+        pass
+
+    return max(0, score), reasons
+
+
+_SALE_PUSH_REASON_TEXT = {
+    "relegation": "구단은 강등으로 재정 압박을 받고 있습니다.",
+    "contract": "계약 만료가 임박했습니다.",
+    "bench": "감독은 당신을 다음 시즌 계획에 포함하지 않았습니다.",
+    "hostile": "감독과의 관계가 좋지 않습니다.",
+    "frustration": "최근 이적 요청이 반복해서 거절되어 불만이 쌓여 있습니다.",
+}
+
+
+def _weekly_sale_push_check(p, cur_year, cur_week):
+    """매주 호출 — 판매추진 점수를 재계산하고 상태 전환을 처리한다.
+    알림은 상태가 실제로 바뀔 때만(평상시→판매추진 전환 시 1회) 띄운다.
+
+    [2026-07 재수정, 신민용 리포트: "판매 추진을 억제한다기보단 구단에서
+    보내는 판매 서류를 다 무시한다는 의미인데, 결과가 같게 적용되는
+    건가?"] 예전 구현은 allow_club_sale_push가 꺼지면 이 함수 자체를
+    건너뛰고 sale_push_active를 즉시 0으로 리셋했다 — 이러면 "구단은
+    계속 판매를 추진 중인데 나만 안 본다"가 아니라 "구단이 애초에 판매
+    추진 자체를 안 한다"가 되어버려서, 4점+ 강제판매(_check_sale_push_
+    forced_sale, 토글 무관하게 발동해야 함)가 sale_push_active=1을
+    전제로 하는데 토글이 꺼지는 순간 그 전제 자체가 사라지는 모순이
+    있었다. 이제 점수 계산과 상태(sale_push_active 등)는 토글과 완전히
+    무관하게 항상 그대로 돌아가고, 토글은 "예고 알림을 보여줄지"에만
+    관여한다 — 구단은 서류를 계속 만들고(상태 갱신), 플레이어만 그
+    서류를 안 보는(알림 억제) 것.
+    """
+    score, reasons = _calc_sale_push_score(p, cur_year)
+    was_active = bool(p.get("sale_push_active", 0))
+    _show_notice = bool(p.get("allow_club_sale_push", 1))
+
+    if score >= 2:
+        if not was_active:
+            # 평상시 → 판매추진 전환: 예고 알림 1회(토글 켜져 있을 때만 표시)
+            update_player(sale_push_active=1, sale_push_start_year=cur_year,
+                          sale_push_start_week=cur_week, sale_push_low_score_weeks=0)
+            if _show_notice:
+                reason_lines = "\n".join(_SALE_PUSH_REASON_TEXT.get(r, "") for r in reasons)
+                add_log(f"📋 구단 동향\n구단은 당신의 이적 가능성을 검토하고 있습니다.\n{reason_lines}",
+                        "event", cur_year, cur_week)
+        else:
+            # 계속 판매추진 상태 — 저점수 연속주차 카운터만 리셋
+            if p.get("sale_push_low_score_weeks", 0):
+                update_player(sale_push_low_score_weeks=0)
+            # [2026-07] 유효기간 — 2시즌(104주) 동안 오퍼 없으면 자동 종료
+            start_y, start_w = p.get("sale_push_start_year", cur_year), p.get("sale_push_start_week", cur_week)
+            weeks_elapsed = (cur_year - start_y) * 52 + (cur_week - start_w)
+            last_offer_y = p.get("sale_push_last_offer_year", 0)
+            if weeks_elapsed >= 104 and not last_offer_y:
+                update_player(sale_push_active=0, sale_push_refused_count=0,
+                              sale_push_low_score_weeks=0)
+    else:
+        if was_active:
+            # [2026-07] 종료 디바운스 — 저점수가 연속 4주 유지돼야 실제 종료
+            weeks_low = p.get("sale_push_low_score_weeks", 0) + 1
+            if weeks_low >= 4:
+                update_player(sale_push_active=0, sale_push_refused_count=0,
+                              sale_push_low_score_weeks=0)
+            else:
+                update_player(sale_push_low_score_weeks=weeks_low)
+
+
+def _check_sale_push_forced_sale(p, cur_year, cur_week):
+    """[2026-07 신설, 구단판매추진 v5 설계 확정] 판매추진 점수 4점+ 이면
+    후보 팀 하나를 직접 굴려 최소수용금액을 넘는지 본다. receive_
+    transfer_offers/allow_club_sale_push 토글과 무관하게 독립적으로
+    후보를 찾는다(설계 확정: 오퍼 토글은 이 흐름을 막지 않는다) — 단
+    allow_club_sale_push 자체가 꺼져 있으면 애초에 sale_push_active가
+    될 수 없으므로 자연히 발동 안 함.
+
+    "이번 판매추진 기간 내 거절 1회는 보장" 원칙을 이 함수 안에서
+    자체적으로 관리한다 — join_team의 일반 오퍼 수락/거절 흐름과는
+    별개(강제판매 후보는 플레이어가 직접 고르는 오퍼 목록에 안 뜨므로).
+    최소수용금액을 넘는 후보를 처음 찾으면 "거절 기록"만 남기고 그냥
+    잔류시키고, 그 다음(2번째) 발견 시에 실제로 강제 진행한다.
+    """
+    if not p.get("sale_push_active"):
+        return
+    score, reasons = _calc_sale_push_score(p, cur_year)
+    if score < 4:
+        return
+
+    conn = get_conn()
+    my_tid = p.get("current_team_id", 0)
+    if not my_tid:
+        return
+    grades = _suitable_grades(p.get("ovr", 40), p.get("agent_grade", "F"))
+    row = conn.execute(
+        f"""SELECT t.id, t.name, l.id as lid, l.name as lname, l.tier,
+                   cn.name as country, cn.flag, cn.grade
+            FROM teams t JOIN leagues l ON t.league_id=l.id
+            JOIN countries cn ON l.country_id=cn.id
+            WHERE t.id != ? AND l.tier = 1 AND cn.grade IN ({",".join("?" * len(grades))})
+            ORDER BY RANDOM() LIMIT 1""",
+        (my_tid, *grades)).fetchone()
+    if not row:
+        return
+
+    salary = _calc_salary(row["grade"], row["tier"], p.get("ovr", 40),
+                          row["country"], row["name"], year=cur_year)
+    o = _build_offer(row, row["grade"], row["tier"], salary)
+    o["my_grade"] = get_league_grade(p.get("nationality", ""), "C")
+    my_team_row = conn.execute(
+        """SELECT cn.name as cname, l.tier as tier, cn.grade as grade
+           FROM teams t JOIN leagues l ON t.league_id=l.id
+           JOIN countries cn ON l.country_id=cn.id WHERE t.id=?""", (my_tid,)).fetchone()
+    if my_team_row and my_team_row["tier"] == 1:
+        o["my_grade"] = get_league_grade(my_team_row["cname"], my_team_row["grade"])
+
+    decision, detail = evaluate_offer_decision(p, o)
+    if decision not in ("accept", "forced_sale"):
+        return   # 최소수용금액도 못 넘으면 이번 주는 그냥 넘어감(다음 주 재시도)
+
+    if p.get("sale_push_refused_count", 0) < 1:
+        # 이번 판매추진 기간 내 첫 적격 후보 — 강제 안 하고 "거절 1회"만 기록
+        update_player(sale_push_refused_count=1)
+        add_log(f"📩 {o['team_name']}이(가) 관심을 보였으나, 당신은 잔류를 선택했습니다.",
+                "event", cur_year, cur_week)
+        return
+
+    reason_lines = "\n".join(f"- {_SALE_PUSH_REASON_TEXT.get(r, '')}" for r in reasons)
+    add_log(
+        f"🔒 구단 최종 결정\n구단은 선수 잔류를 원했으나, 다음 사유로 이적을 "
+        f"최종 결정했습니다.\n{reason_lines}\n\n{o['team_name']} 이적료: {fmt_money(o.get('transfer_fee', 0))}",
+        "event", cur_year, cur_week)
+    join_team(o["team_id"], o["salary"], transfer_type="오퍼", offer=o)
+    update_player(sale_push_active=0, sale_push_refused_count=0, sale_push_low_score_weeks=0)
+
+
 def _advance_week(p, base_week, n_weeks=4):
     new_week = base_week + n_weeks
     new_year = p["current_year"]
@@ -4743,6 +5008,16 @@ def _advance_week(p, base_week, n_weeks=4):
             #   그 시점 소속 팀이 1위면 그 즉시 우승을 기록한다.
             #   (연말까지 안 기다리고 바로 '성적'에 반영)
             _lock_league_title_after_season(p, new_year)
+
+    # [2026-07 신설, 신민용+GPT 다회 설계 확정: "구단 판매 추진" 시스템]
+    # 매주(정확히는 _advance_week가 호출될 때마다) 5개 조건 점수를
+    # 재계산 — 오퍼가 매주 뜨는 기존 구조와 맞추기 위해 연말 1회가 아니라
+    # 주 단위로 판정한다.
+    if p.get("current_team_id"):
+        _weekly_sale_push_check(p, new_year, new_week)
+        _p_after_push = get_player()
+        if _p_after_push and _p_after_push.get("current_team_id"):
+            _check_sale_push_forced_sale(_p_after_push, new_year, new_week)
 
     # [최적화] my_player + season_state 갱신을 하나의 커넥션으로 묶어 커밋 2회→1회
     conn_adv = get_conn()
@@ -7860,6 +8135,15 @@ def generate_offers(count=5) -> list:
     p = get_player()
     if not p: return []
 
+    # [2026-07 수정] 오퍼 ON/OFF는 이미 있던 offers_enabled 필드를 그대로
+    # 쓴다(center_panel.py의 기존 "🔔 오퍼 ON/OFF" 버튼과 동일 필드) —
+    # 처음엔 별도 필드(receive_transfer_offers)를 새로 만들었는데, 이미
+    # 똑같은 기능의 토글이 있었다는 걸 나중에 발견해서 하나로 통합했다.
+    # center_panel.py와 동일하게 "이적 요청 중이면 토글 꺼져 있어도 계속
+    # 옴" 예외를 그대로 유지한다. 강제판매(별도 로직)는 이 토글과 무관.
+    if not p.get("offers_enabled", 1) and not p.get("transfer_requested"):
+        return []
+
     # [2026-07 재설계 v2, 신민용 최종안] 상황별로 의도적으로 차이를 크게
     # 둔다 — 현실에서도 "계약 중 선수는 구단이 이적료를 요구해서 접촉이
     # 조심스럽고, 자유계약 선수는 여러 팀이 부담 없이 찔러본다"는 차이가
@@ -7888,6 +8172,23 @@ def generate_offers(count=5) -> list:
     HAS_TEAM_LEAGUE_COUNTRY = 4
     HAS_TEAM_HOMETOWN       = 3
     HAS_TEAM_FOREIGN        = 5 + _bonus   # 이적요청이면 +2 → 계약중12→이적요청14
+
+    # [2026-07 신설, 구단판매추진 설계 확정] 판매추진 점수에 따라 오퍼
+    # 개수(확률의 대리 지표)를 배율로 늘린다: 2점=x1.2, 3점=x1.5, 4점+=x2.0.
+    # 판매추진 비활성/토글 꺼짐이면 배율 1.0(영향 없음).
+    _sale_push_mult = 1.0
+    if p.get("sale_push_active") and p.get("allow_club_sale_push", 1):
+        _sp_score, _ = _calc_sale_push_score(p, p.get("current_year", 0))
+        if _sp_score >= 4:
+            _sale_push_mult = 2.0
+        elif _sp_score == 3:
+            _sale_push_mult = 1.5
+        elif _sp_score == 2:
+            _sale_push_mult = 1.2
+    if _sale_push_mult != 1.0:
+        HAS_TEAM_LEAGUE_COUNTRY = max(HAS_TEAM_LEAGUE_COUNTRY, round(HAS_TEAM_LEAGUE_COUNTRY * _sale_push_mult))
+        HAS_TEAM_HOMETOWN = max(HAS_TEAM_HOMETOWN, round(HAS_TEAM_HOMETOWN * _sale_push_mult))
+        HAS_TEAM_FOREIGN = max(HAS_TEAM_FOREIGN, round(HAS_TEAM_FOREIGN * _sale_push_mult))
 
     conn = get_conn()
     c = conn.cursor()
@@ -9654,7 +9955,9 @@ def _save_career_entry(p, year, week, force_new=False, transfer_type=None,
             # transfer_type 값은 "이적"이 아니라 "오퍼"(center_panel.py의
             # _on_auto_offer_done)였다 — "이적"은 나갈 때(exit_type)만
             # 쓰이는 값이라 조건이 항상 거짓이었음. 둘 다 받아준다.
-            if pending_tt in ("이적", "오퍼"):
+            # [2026-07 재조정, 신민용+GPT 설계 확정] 팔림도 이적과 동일한
+            # 이적료 체계를 쓴다 — _ensure_career_entry와 동일하게 맞춤.
+            if pending_tt in ("이적", "오퍼", "팔림"):
                 _grade = get_league_grade(team_row["country"], "")
                 _contract_end = p.get("contract_end_year", 0)
                 _remain = (max(0, _contract_end - cur_year)

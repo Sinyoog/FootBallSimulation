@@ -957,6 +957,20 @@ def init_db():
         # 차이를 계산한다.
         "ALTER TABLE my_player ADD COLUMN transfer_rejection_count INTEGER DEFAULT 0",
         "ALTER TABLE my_player ADD COLUMN transfer_rejection_last_year INTEGER DEFAULT 0",
+        # [2026-07 신설, 신민용+GPT 다회 설계 확정: "구단 판매 추진" 시스템]
+        # 오퍼 ON/OFF는 이미 있던 offers_enabled 필드를 그대로 쓴다(처음에
+        # receive_transfer_offers를 새로 만들었다가, 기존 토글이 있다는
+        # 걸 나중에 발견해서 제거하고 통합함). 판매추진 ON/OFF만 새 필드.
+        "ALTER TABLE my_player ADD COLUMN allow_club_sale_push INTEGER DEFAULT 1",
+        # 판매추진 상태 — 시작일/마지막오퍼일/이 기간 전용 거절횟수(일반
+        # transfer_rejection_count와 의미가 달라 분리)/종료판정용 저점수
+        # 연속주차 카운터.
+        "ALTER TABLE my_player ADD COLUMN sale_push_active INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN sale_push_start_year INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN sale_push_start_week INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN sale_push_last_offer_year INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN sale_push_refused_count INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN sale_push_low_score_weeks INTEGER DEFAULT 0",
     ]:
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,
@@ -1528,8 +1542,17 @@ def _reset_ai_players_from_seed(c):
 def reset_game_data():
     init_db()  # 마이그레이션 적용
     conn = get_conn(); c = conn.cursor()
+    # [2026-07 버그수정, 신민용 리포트: "새 게임 하면 이전 데이터가 다 안
+    # 사라지는 거 아니냐"] 팀/리그 ID가 새 게임에서도 그대로 재사용되는데
+    # (팀 row는 새로 안 만들고 UPDATE만 함), match_results_archive/
+    # qual_results/offer_refused 3개가 이 삭제 목록에서 빠져 있었다 —
+    # 그래서 이전 플레이의 과거 시즌 결과·예선 순위·오퍼 거절 이력이 새
+    # 게임에도 그대로 남아, 같은 league_id에 "있어야 할 리 없는" 과거
+    # 시즌 데이터가 섞여 보이는 버그(예: 방금 고친 "일정이 안 뜬다" 건도
+    # 이게 원인의 일부였을 가능성이 높다)로 이어질 수 있었다.
     for t in ["my_player","career_entries","promotion_log","trophy_log","awards",
-              "game_log","match_results","match_details","season_state",
+              "game_log","match_results","match_results_archive","match_details",
+              "season_state","qual_results","offer_refused",
               "intl_history","intl_tournaments","intl_entries","intl_matches","nat_generation",
               "cl_tournaments","cl_entries","cl_matches","cl_history",
               "cwc_tournaments","cwc_entries","cwc_matches",

@@ -353,9 +353,14 @@ class CenterPanel(QWidget):
         row2 = QHBoxLayout()
         self.btn_agent  = QPushButton("👔 에이전트");  self.btn_agent.setObjectName("actBtn")
         self.btn_offer_toggle = QPushButton("🔔 오퍼 ON"); self.btn_offer_toggle.setObjectName("actBtn")
+        # [2026-07 신설, 신민용+GPT 다회 설계 확정: "구단 판매 추진" 시스템]
+        # 기존 "오퍼 ON/OFF" 버튼 바로 옆에 배치 — 오퍼 토글(외부 구단의
+        # 자발적 관심)과 판매추진 토글(내 구단이 나를 시장에 내놓는 것)은
+        # 서로 다른 층위라 별개 버튼으로 둔다.
+        self.btn_sale_push_toggle = QPushButton("🏟 판매추진 ON"); self.btn_sale_push_toggle.setObjectName("actBtn")
         self.btn_retire = QPushButton("🚪 은퇴");     self.btn_retire.setObjectName("actBtn")
         self.btn_world  = QPushButton("🌍 세계 기록실"); self.btn_world.setObjectName("actBtn")
-        for b in [self.btn_agent, self.btn_offer_toggle, self.btn_retire, self.btn_world]:
+        for b in [self.btn_agent, self.btn_offer_toggle, self.btn_sale_push_toggle, self.btn_retire, self.btn_world]:
             row2.addWidget(b)
         row2.addStretch()
         self.lay.addLayout(row2)
@@ -371,6 +376,7 @@ class CenterPanel(QWidget):
         self.btn_schedule.clicked.connect(self._do_schedule)
         self.btn_agent.clicked.connect(self._do_agent)
         self.btn_offer_toggle.clicked.connect(self._do_toggle_offers)
+        self.btn_sale_push_toggle.clicked.connect(self._do_toggle_sale_push)
         self.btn_retire.clicked.connect(self._do_retire)
         self.btn_world.clicked.connect(self._do_world_browser)
 
@@ -781,6 +787,20 @@ class CenterPanel(QWidget):
         else:
             self.btn_offer_toggle.setText("🔕 오퍼 OFF")
             self.btn_offer_toggle.setToolTip("클릭하면 자동 이적 오퍼 알림을 켭니다 (팀 입단에는 영향 없음)")
+
+        # [2026-07 신설] 판매추진 토글 — 꺼도 조건이 매우 심각해지면
+        # 구단이 최종 결정을 내릴 수 있다는 걸 항상 툴팁으로 알려준다.
+        sale_push_on = bool(p.get("allow_club_sale_push", 1))
+        if sale_push_on:
+            self.btn_sale_push_toggle.setText("🏟 판매추진 ON")
+            self.btn_sale_push_toggle.setToolTip(
+                "구단이 이적을 추진할 수 있습니다. 클릭하면 억제합니다.")
+        else:
+            self.btn_sale_push_toggle.setText("🏟 판매추진 OFF")
+            self.btn_sale_push_toggle.setToolTip(
+                "구단의 판매 추진을 억제합니다(리스트 등재·오퍼 증가 없음). "
+                "단, 매우 심각한 상황(강등+계약임박+불화 등 다수 겹침)에서는 "
+                "그래도 구단이 최종 결정을 내릴 수 있습니다.")
 
         # 모드 토글 버튼: 묶음 진행 중(_step_idx>0)엔 전환 불가 → 회색 비활성.
         # 전환 가능할 때(묶음 시작 전)는 파란색으로 강조.
@@ -1704,6 +1724,23 @@ class CenterPanel(QWidget):
             if p.get("transfer_requested"):
                 msg = "🔕 오퍼 알림을 껐습니다  (단, 이적 요청 중이라 오퍼는 계속 옵니다)"
             show_toast(self, msg, "#666666", 2000)
+        if self.main_win: self.main_win.refresh_all()
+
+    def _do_toggle_sale_push(self):
+        """판매추진 ON/OFF 토글. 꺼도 매우 심각한 상황(4개+ 조건 겹침)에서는
+        구단이 최종 결정을 내릴 수 있다 — 설계 확정 사항, 토글로 완전히
+        막을 수 있는 건 아니다."""
+        p = get_player()
+        if not p: return
+        from game_engine import update_player
+        cur = bool(p.get("allow_club_sale_push", 1))
+        new_val = 0 if cur else 1
+        update_player(allow_club_sale_push=new_val)
+        if new_val:
+            show_toast(self, "🏟 구단 판매 추진을 허용합니다", "#006622", 1500)
+        else:
+            show_toast(self, "🏟 구단 판매 추진을 억제합니다  (단, 매우 심각한 상황에선 최종 결정 가능)",
+                      "#666666", 2500)
         if self.main_win: self.main_win.refresh_all()
 
     def _do_join(self):

@@ -81,7 +81,7 @@ def run_ai_offseason(year, verbose_log=None):
 
     retired    = _retire_and_replace(c, year, shared_ai_rows)
     _ta2 = _time_perf.perf_counter()
-    moved      = _transfer_market(c, year, shared_ai_rows)
+    moved      = _transfer_market(c, year, shared_ai_rows, verbose_log=verbose_log)
     _ta3 = _time_perf.perf_counter()
     formations = _shuffle_formations(c)
     _ta4 = _time_perf.perf_counter()
@@ -607,8 +607,8 @@ def _retire_and_replace(c, year, ai_rows=None):
 # ─────────────────────────────────────────────
 # 4. 이적 시장 (활발하게)
 # ─────────────────────────────────────────────
-def _transfer_market(c, year, ai_rows=None):
-    """선수들이 팀 간 이동. 같은 리그 내 + 일부 리그 간 이적.
+def _transfer_market(c, year, ai_rows=None, verbose_log=None):
+    """선수들이 팀 간 이동. 같은 리그 내 + 국내 다른 tier + 국제 이동.
     [최적화] ORDER BY RANDOM() 제거 → 팀별 선수 목록 선조회 후 Python shuffle.
     이적마다 DB 왕복 2회(RANDOM 쿼리) → 0회로 감소.
     ai_rows: _retire_and_replace와 공유하는 ai_players 선조회 결과
@@ -617,30 +617,62 @@ def _transfer_market(c, year, ai_rows=None):
 
     [2026-07 v2 신설] year 파라미터 추가 — 계약 잔여기간(길수록 이적
     확률↓) 반영과 "방금 이적한 선수는 최소 1시즌은 유지"를 위해 필요.
+
+    [2026-07 v3 신설, 신민용+GPT 검토: "K리그는 계속 K리그 안에서만 돈다 —
+    승강 시스템이랑 이적시장이 따로 논다 + 10년 지나도 세계가 닫혀있는
+    느낌"] 이적 종류를 3가지로 분리한다: 87% 같은 리그(기존), 8% 국내
+    다른 tier(승강 인접), 5% 국제 이동(동일 등급 ±1등급, tier1끼리만 —
+    하위 tier의 "등급"은 안 매겨져 있어서 국제 이동은 tier1로 한정한다).
+    스타 선수 보호·계약 반영·최소 잔류기간은 이 확장된 후보군에도 그대로
+    적용된다(mover 선택 로직은 공통이고 destination 후보군만 넓어지는
+    구조라 자연스럽게 유지됨).
+
+    [2026-07 v3 신설] verbose_log — 표시용 이적료(저장 없음). 이번 호출에서
+    일어난 이적 중 (OVR85 이상 또는 이적료 최고액) 조건을 만족하는 1건만
+    골라 로그에 남긴다. 자금 이동은 없음 — 순수 서사/기록용.
     """
     moved = 0
 
+    from constants import COUNTRY_LEAGUE_GRADE
+    from economy import LEAGUE_GRADE_RANK
+
     teams = [dict(r) for r in c.execute(
-        """SELECT t.id AS tid, t.league_id AS lid,
+        """SELECT t.id AS tid, t.league_id AS lid, t.current_tier AS tier,
+                  cn.id AS cid, cn.name AS cname,
                   (SELECT AVG(ovr) FROM ai_players WHERE team_id=t.id) AS avg_ovr
-           FROM teams t""").fetchall()]
+           FROM teams t
+           JOIN leagues l ON t.league_id = l.id
+           JOIN countries cn ON l.country_id = cn.id""").fetchall()]
     team_avg = {t["tid"]: (t["avg_ovr"] or 50) for t in teams}
 
-    # 리그별 팀 그룹
+    # 리그별 팀 그룹 (기존, 87%용)
     by_league: dict = {}
+    # 국내 다른 tier 그룹 (국가+tier 기준, 8%용)
+    by_country_tier: dict = {}
+    # tier1 등급별 그룹 (국제 이동, 5%용) — 등급 없는 나라는 제외
+    tier1_by_grade: dict = {}
+    team_tier = {}
+    team_grade_rank = {}
     for t in teams:
         by_league.setdefault(t["lid"], []).append(t["tid"])
+        by_country_tier.setdefault((t["cid"], t["tier"]), []).append(t["tid"])
+        team_tier[t["tid"]] = t["tier"]
+        if t["tier"] == 1:
+            grade = COUNTRY_LEAGUE_GRADE.get(t["cname"])
+            if grade:
+                rank = LEAGUE_GRADE_RANK.get(grade, 4)
+                team_grade_rank[t["tid"]] = rank
+                tier1_by_grade.setdefault(rank, []).append(t["tid"])
 
     # [최적화] 팀별 선수 목록을 _retire_and_replace와 공유된 스냅샷에서 재사용
     all_players_rows = ai_rows if ai_rows is not None else c.execute(
-        "SELECT id, team_id, position, ovr, contract_end_year, last_transfer_year "
+        "SELECT id, team_id, position, age, ovr, contract_end_year, last_transfer_year "
         "FROM ai_players").fetchall()
-    # {team_id: [{"id":..., "position":..., "ovr":..., "contract_end_year":...,
-    #             "last_transfer_year":...}, ...]}
     team_players: dict = {}
     for r in all_players_rows:
         team_players.setdefault(r["team_id"], []).append({
             "id": r["id"], "position": r["position"],
+            "age": r["age"] if "age" in r.keys() and r["age"] else 25,
             "ovr": r["ovr"] if r["ovr"] is not None else 50,
             "contract_end_year": r["contract_end_year"] if "contract_end_year" in r.keys() else 0,
             "last_transfer_year": r["last_transfer_year"] if "last_transfer_year" in r.keys() else 0,
@@ -650,24 +682,49 @@ def _transfer_market(c, year, ai_rows=None):
     # [2026-07 v2] 이적 시 새 계약(2~4년)과 이적연도를 같이 기록한다 —
     # (new_team_id, new_contract_end_year, last_transfer_year, player_id)
     transfer_updates = []
+    _big_transfer = None   # (fee, name_or_ovr, src_lid_name..) — verbose_log용, 최고액 1건만 추적
 
     for lid, tids in by_league.items():
         if len(tids) < 2:
             continue
         n_transfers = int(len(tids) * random.uniform(1.0, 2.0))
         for _ in range(n_transfers):
-            result = _do_one_transfer_cached(tids, team_players, team_avg, year)
+            src = random.choice(tids)
+            src_tier = team_tier.get(src, 1)
+            # 후보군 결정: 87% 같은 리그 / 8% 국내 다른 tier / 5% 국제(tier1만)
+            roll = random.random()
+            if roll < 0.87 or src_tier != 1:
+                dst_pool_tids = tids
+            elif roll < 0.95:
+                cid = next((t["cid"] for t in teams if t["tid"] == src), None)
+                cand = by_country_tier.get((cid, 2), []) or by_country_tier.get((cid, src_tier + 1), [])
+                dst_pool_tids = cand if len(cand) >= 1 else tids
+            else:
+                rank = team_grade_rank.get(src)
+                if rank is None:
+                    dst_pool_tids = tids
+                else:
+                    cand = []
+                    for r in (rank - 1, rank, rank + 1):
+                        cand.extend(tier1_by_grade.get(r, []))
+                    cand = [t for t in cand if t != src]
+                    dst_pool_tids = cand if len(cand) >= 1 else tids
+
+            result = _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year)
             if result:
                 for new_tid, pid, old_tid in result:
                     new_contract_end = year + random.randint(2, 4)
                     transfer_updates.append((new_tid, new_contract_end, year, pid))
-                    # team_players 캐시도 즉시 반영 (같은 시즌 내 연속 이적 일관성)
                     p_entry = next((e for e in team_players.get(old_tid, []) if e["id"] == pid), None)
                     if p_entry:
                         team_players[old_tid] = [e for e in team_players[old_tid] if e["id"] != pid]
                         p_entry["contract_end_year"] = new_contract_end
                         p_entry["last_transfer_year"] = year
                         team_players.setdefault(new_tid, []).append(p_entry)
+                        if verbose_log is not None:
+                            _fee = _estimate_ai_transfer_fee_display(p_entry, old_tid, new_tid, year, teams)
+                            if _fee and (_big_transfer is None or _fee[0] > _big_transfer[0]):
+                                _big_transfer = _fee
                 moved += 1
 
     if transfer_updates:
@@ -675,13 +732,51 @@ def _transfer_market(c, year, ai_rows=None):
             "UPDATE ai_players SET team_id=?, contract_end_year=?, last_transfer_year=? WHERE id=?",
             transfer_updates)
 
+    if verbose_log is not None and _big_transfer is not None:
+        fee, ovr, src_name, dst_name = _big_transfer
+        verbose_log(f"💰 주요 이적: OVR{ovr} 선수  {src_name} → {dst_name}  "
+                     f"예상 이적료 약 {fee/100000:.0f}억원", "event", year, 52)
+
     return moved
 
 
-def _do_one_transfer_cached(tids, team_players, team_avg, year):
+def _estimate_ai_transfer_fee_display(p_entry, old_tid, new_tid, year, teams):
+    """[2026-07 v3 신설] 표시용 이적료 — 자금 이동 없음, DB 저장도 없음.
+    이적 순간에만 즉석 계산해서 그 시즌 최고액 1건만 로그로 소비하고 버린다.
+    OVR85 이상이거나 이적료 최고액인 경우에만 verbose_log에서 실제로
+    출력되도록, 여기서는 조건 없이 계산만 해서 넘긴다(최종 필터는 호출부)."""
+    if p_entry.get("ovr", 0) < 70:
+        return None   # 너무 낮은 OVR은 계산 자체를 생략(성능/의미 둘 다 낮음)
+    try:
+        from economy import estimate_transfer_fee
+        from constants import COUNTRY_LEAGUE_GRADE
+        dst_row = next((t for t in teams if t["tid"] == new_tid), None)
+        if not dst_row:
+            return None
+        grade = COUNTRY_LEAGUE_GRADE.get(dst_row["cname"], "C")
+        fee = estimate_transfer_fee(grade, dst_row["tier"], p_entry["ovr"],
+                                    position=p_entry.get("position"), year=year)
+        if not fee or (p_entry.get("ovr", 0) < 85 and fee < 5_000_000):  # 50억(천원단위) 미만이면 스킵
+            return None
+        src_row = next((t for t in teams if t["tid"] == old_tid), None)
+        conn = get_conn()
+        src_name = conn.execute("SELECT name FROM teams WHERE id=?", (old_tid,)).fetchone()
+        dst_name = conn.execute("SELECT name FROM teams WHERE id=?", (new_tid,)).fetchone()
+        return (fee, p_entry["ovr"],
+                src_name["name"] if src_name else "?",
+                dst_name["name"] if dst_name else "?")
+    except Exception:
+        return None
+
+
+def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year):
     """[최적화] ORDER BY RANDOM() 없이 Python-side shuffle로 이적 처리.
     team_players: {team_id: [{"id","position","ovr","contract_end_year",
     "last_transfer_year"}, ...]} 선조회 캐시.
+    src: 판매 측 팀ID(호출부에서 이미 결정해서 넘김).
+    dst_pool_tids: 목적지 후보 팀ID 리스트(같은 리그/국내 다른 tier/국제
+      중 호출부가 이미 결정한 풀 — src 자신은 포함 안 돼 있어도/있어도 무방,
+      아래에서 다시 한번 걸러진다).
 
     [버그수정 2026-07] team_avg를 함수가 받기만 하고 실제로는 전혀 참조하지
     않아, 리그 내 이적이 팀 실력과 무관하게 완전 무작위로 일어나고 있었다
@@ -704,8 +799,12 @@ def _do_one_transfer_cached(tids, team_players, team_avg, year):
       - last_transfer_year가 최근(작년)이면 이적 후보에서 아예 제외.
       - 계약 미설정(0, 기존 선수)은 중립 취급, 설정돼 있으면 남은 연수가
         많을수록(0.6^연수) 뽑힐 확률이 줄어든다.
+
+    [2026-07 v3 신설] 국내 다른 tier/국제 이동 풀이 넘어올 경우, 어린
+    선수·고OVR·계약만료 임박 선수일수록 그 풀로 실제로 이동될 확률이
+    붙도록(성향 보정) mover 선정 가중치에 반영한다 — "유망주 해외 진출/
+    베테랑 잔류/스타 이적" 패턴이 자연스럽게 생기게.
     """
-    src = random.choice(tids)
     src_players = team_players.get(src, [])
     if not src_players:
         return None
@@ -730,10 +829,21 @@ def _do_one_transfer_cached(tids, team_players, team_avg, year):
             _cend = eligible[i].get("contract_end_year", 0) or 0
             remain = max(0, _cend - year) if _cend else 2   # 미설정=중립(2년 취급)
             w *= 0.6 ** remain
+            # [2026-07 v3] 어린 선수(22세 이하)·고OVR(80+)·계약만료 임박(1년
+            # 이하)일수록 이 풀(국내 다른 tier/국제 이동)로 실제 이동될
+            # 성향을 살짝 높인다. dst_pool_tids가 src 포함 같은 리그 그대로면
+            # (=87% 케이스) 이 보정은 사실상 의미 없이 상쇄되므로 안전하다.
+            _age = eligible[i].get("age", 25)
+            if _age <= 22:
+                w *= 1.3
+            if eligible[i].get("ovr", 50) >= 80:
+                w *= 1.5
+            if _cend and (_cend - year) <= 1:
+                w *= 1.4
             weights.append(w)
         mover = random.choices(eligible, weights=weights, k=1)[0]
 
-    dst_candidates = [t for t in tids if t != src]
+    dst_candidates = [t for t in dst_pool_tids if t != src]
     if not dst_candidates:
         return None
 
@@ -780,7 +890,7 @@ def _do_one_transfer(c, tids, team_avg, year=None):
             "contract_end_year": r["contract_end_year"] or 0,
             "last_transfer_year": r["last_transfer_year"] or 0,
         })
-    return _do_one_transfer_cached(tids, tp, team_avg, year)
+    return _do_one_transfer_cached(tids[0] if tids else None, tids, tp, team_avg, year)
 
 
 # ─────────────────────────────────────────────
