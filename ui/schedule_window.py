@@ -651,10 +651,20 @@ class ScheduleWindow(QDialog):
                     my_side = "away"
                 else:
                     my_side = None
+                # [2026-07 신설, 신민용 리포트: "8강 칸이 그냥 텅 비어
+                # 보인다"] intl_engine._precreate_ko_shell로 대회 시작
+                # 시점에 미리 만들어둔 placeholder 행은 home/away가 빈
+                # 문자열이다 — BracketWidget에 그대로 넘기면 팀명 칸이
+                # 완전히 공백으로 그려져서(원래 텍스트가 "" 자체) 아무
+                # 정보도 없어 보인다. 아직 안 정해진 자리는 "미정"으로
+                # 명시해서, 최소한 "이 라운드가 존재하고 대진만 안 정해진
+                # 상태"라는 게 눈에 보이게 한다.
+                _home_disp = m["home"] or "미정"
+                _away_disp = m["away"] or "미정"
                 bracket_matches.append({
                     "stage": intl_engine.STAGE_KO.get(m["stage"], m["stage"]),
                     "week": m["week"],
-                    "home": m["home"], "away": m["away"],
+                    "home": _home_disp, "away": _away_disp,
                     "home_flag": flags.get(m["home"], ""),
                     "away_flag": flags.get(m["away"], ""),
                     "hs": hs if played else -1, "as_": as_ if played else -1,
@@ -826,7 +836,7 @@ class ScheduleWindow(QDialog):
                 home_nm = m["home_name"] + (f" ({m['home_league']})" if m.get("home_league") else "")
                 away_nm = m["away_name"] + (f" ({m['away_league']})" if m.get("away_league") else "")
                 fixture_rows.append({
-                    "week": m["week"], "home": home_nm, "away": away_nm,
+                    "week": m["week"], "day": m.get("day"), "home": home_nm, "away": away_nm,
                     "home_score": m["home_score"], "away_score": m["away_score"],
                     "pso_winner": m["pso_winner"],
                     "is_my": m["home_id"] == my_team_id or m["away_id"] == my_team_id,
@@ -854,7 +864,15 @@ class ScheduleWindow(QDialog):
 
         # ── 토너먼트 브래킷 (플레이오프 포함) ──
         from ui.bracket_widget import BracketWidget, build_rounds_from_matches
-        stage_order = {"플레이오프": 0, "16강": 1, "8강": 2, "4강": 3, "결승": 4}
+        # [2026-07 버그수정, 신민용 리포트: "북남미 챔피언스리그 대진표가
+        # 뒤죽박죽이다 — 32강이 8강 뒤에 와있다"] 이 표에 "32강"이 아예
+        # 빠져있었다 — build_rounds_from_matches가 정렬 기준을
+        # stage_order.get(stage, 99)로 찾는데, "32강"이 여기 없어서 항상
+        # 99(맨 뒤)로 밀려나 실제로는 제일 먼저 열리는 라운드인데 화면상
+        # 결승보다도 뒤에(사실상 맨 끝에) 그려졌다. 북남미/남미처럼 참가
+        # 규모가 커서 32강부터 시작하는 대회도 있으므로 여기 추가한다.
+        stage_order = {"플레이오프": 0, "32강": 1, "16강": 2, "8강": 3, "4강": 4,
+                        "결승": 5, "3/4위전": 5}
 
         bracket_matches = []
         for m in matches:
@@ -1050,7 +1068,7 @@ class ScheduleWindow(QDialog):
             he = entries.get(m["home_team_id"])
             ae = entries.get(m["away_team_id"])
             fixture_rows.append({
-                "week": m["week"], "grp": m["grp"],
+                "week": m["week"], "day": m.get("day"), "grp": m["grp"],
                 "home": cwe.team_display(he["team_name"], he["country"]) if he else "?",
                 "away": cwe.team_display(ae["team_name"], ae["country"]) if ae else "?",
                 "home_score": m["home_score"], "away_score": m["away_score"],
@@ -1113,6 +1131,8 @@ class ScheduleWindow(QDialog):
         conn.close()
 
         def _nm(team_id):
+            if not team_id:
+                return "미정"   # _precreate_cwc_ko_shell의 placeholder(0) — 아직 진출팀 미정
             e = entries.get(team_id)
             return cwe.team_display(e["team_name"], e["country"]) if e else "?"
 
@@ -1253,7 +1273,13 @@ class ScheduleWindow(QDialog):
                 w = r["home_team_id"] if r["home_score"] > r["away_score"] else r["away_team_id"]
                 result = "승" if w == my_tid else ("무" if r["home_score"] == r["away_score"] else "패")
             from game_engine import _week_intl_cl_day
-            _cup_day = _week_intl_cl_day(r["week"], p) if r["week"] is not None else 1
+            # [2026-07 버그 수정] 저장된 day가 있으면 그대로 쓰고, 없을
+            # 때만(컵대회는 아직 Phase 2 생성 시점 day 배정 전이라 대부분
+            # 이 경로) 예전 방식으로 근사.
+            # [2026-07 버그 수정] rows가 sqlite3.Row라 .get()이 없음
+            # (AttributeError). "day" in r.keys()로 존재 여부 확인 후 접근.
+            _stored_day = r["day"] if ("day" in r.keys() and r["day"]) else None
+            _cup_day = _stored_day or (_week_intl_cl_day(r["week"], p) if r["week"] is not None else 1)
             date_str = day_to_full_date_str(t["year"], _cup_day)
             # my_view 탭은 어차피 전부 내 경기라서 결과를 항상 보여주고,
             # 전체 일정 탭은 예전처럼 내 경기가 아니면 결과란을 비운다.
@@ -1419,7 +1445,14 @@ class ScheduleWindow(QDialog):
                 if played and m.get("pso_winner"):
                     score += "(PSO)"
                 is_my = m["is_my"] if "is_my" in m else bool(nat and nat in (home, away))
-                day = _week_intl_cl_day(m["week"], p)
+                # [2026-07 버그 수정] 예전엔 m["day"](Phase 2에서 생성 시점에
+                # 미리 계산해둔 실제 날짜)를 무시하고 매번 _week_intl_cl_day로
+                # 새로 계산했다 — 여러 라운드가 같은 week 번호를 공유하는
+                # 경우(예선처럼 라운드 간격이 7일 미만) 서로 다른 라운드가
+                # 같은 날짜로 뭉쳐 보이는 원인이었다. 이제 저장된 day가
+                # 있으면 그대로 쓰고, 없을 때(옛 세이브 등)만 예전 방식으로
+                # 근사한다.
+                day = m.get("day") or _week_intl_cl_day(m["week"], p)
                 date_str = day_to_full_date_str(year, day)
                 vals = [date_str, f"{home_flag}{home}", score, f"{away_flag}{away}"]
                 for j, v in enumerate(vals):

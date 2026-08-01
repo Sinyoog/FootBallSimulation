@@ -60,6 +60,9 @@ from constants import (
     INTL_SELECTION_MARGIN, INTL_SQUAD_QUOTA,
     GK_POS, DF_POS, MF_POS, FW_POS,
     get_country_ovr_bonus, get_league_grade,
+    get_stage_rule, stage_round_start_day, assign_match_days, week_to_day,
+    day_to_week, TOURNAMENT_SCHEDULE_RULES,
+    INTL_QUAL_START_DAY, INTL_QUAL_ROUND_GAP_DAYS, INTL_QUAL_WEEK,
 )
 
 
@@ -288,6 +291,16 @@ def get_my_tournament(year=None, qual=None):
         ts = [t for t in ts if t.get("kind") in ("world", "continent")]
     if not ts:
         return None
+    # [2026-07 버그 수정, 신민용 리포트: "월드컵 일정이 안 떠"] 예선과 본선이
+    # 이제 같은 해에 공존한다(예선은 이미 끝나 status='done', 본선은 진행
+    # 중) — my_selected==1인 대회가 이 둘 다일 수 있는데, 예선이 id가 더
+    # 작아(먼저 생성됨) 항상 먼저 반환되면서 get_my_match의
+    # status=='done' 체크에 걸려 본선 일정이 통째로 안 보였다. 끝나지
+    # 않은(진행 중인) 대회를 먼저 찾고, 그게 없을 때만(둘 다 done이거나
+    # 예선만 있는 경우) done인 대회라도 표시용으로 반환한다.
+    for t in ts:
+        if t.get("my_selected") == 1 and t.get("status") != "done":
+            return t
     for t in ts:
         if t.get("my_selected") == 1:
             return t
@@ -744,11 +757,26 @@ def _active_tournament():
     return t  # done이어도 반환 (UI 표시용) ─ 호출부에서 status 체크
 
 
-def get_my_match(week):
-    """이번 주차에 내가 뛸 국가대표 경기가 있으면 dict, 없으면 None."""
+def get_my_match(week, day=None, p=None, st=None):
+    """이번 주차(또는 특정 day)에 내가 뛸 국가대표 경기가 있으면 dict, 없으면 None.
+
+    [2026-07 수정] 한 주에 예선 라운드가 2개 이상 들어갈 수 있게 되면서
+    (중간 휴식기 4일 간격 배정), week만으로 조회하면 그 주의 여러 경기 중
+    아무거나 하나만 (그것도 SQL이 우연히 먼저 반환하는 순서로) 잡히는
+    문제가 있었다. day를 넘기면 day가 있는 행은 정확히 그 날짜의 경기만
+    골라내고, day가 아직 없는 행(옛 세이브 등)은 그대로 week만으로 찾는다.
+
+    [2026-07 최적화, 신민용 리포트: "일 단위 전환 후 전체적으로 렉"]
+    화면 미리보기(center_panel._get_match_for_day)는 하루 셀 하나마다
+    이 함수를 여러 번 호출하는데, 그때마다 get_player()가 다시 DB
+    왕복을 해서(한 화면 새로고침에 최대 100회 가까이) 누적 지연의
+    절반 이상을 차지했다. 호출부가 이미 조회해둔 p를 넘기면 재조회를
+    생략한다 — 안 넘기면 예전처럼 직접 조회(하위호환)."""
     from game_engine import get_player, get_state
-    p = get_player()
-    st = get_state()
+    if p is None:
+        p = get_player()
+    if st is None:
+        st = get_state()
     if not p or not st:
         return None
     t = get_my_tournament(st["current_year"])
@@ -756,11 +784,18 @@ def get_my_match(week):
         return None
     nat = _my_nat(t, p)
     conn = get_conn()
-    m = conn.execute(
-        """SELECT * FROM intl_matches
-           WHERE tournament_id=? AND week=? AND home_score=-1
-             AND (home=? OR away=?)""",
-        (t["id"], week, nat, nat)).fetchone()
+    if day is not None:
+        m = conn.execute(
+            """SELECT * FROM intl_matches
+               WHERE tournament_id=? AND week=? AND home_score=-1
+                 AND (home=? OR away=?) AND (day=? OR day IS NULL)""",
+            (t["id"], week, nat, nat, day)).fetchone()
+    else:
+        m = conn.execute(
+            """SELECT * FROM intl_matches
+               WHERE tournament_id=? AND week=? AND home_score=-1
+                 AND (home=? OR away=?)""",
+            (t["id"], week, nat, nat)).fetchone()
     if not m:
         conn.close()
         return None
@@ -785,6 +820,73 @@ def get_my_match(week):
     }
 
 
+def get_my_pending_stage(week, day=None, p=None, st=None):
+    """[2026-07 신설, 신민용 요청: "8강 날짜가 되면 이기기 전까지는 미정
+    이렇게 메인 화면에 떠야 한다"] get_my_match는 내 국가가 실제로 배정된
+    (home/away에 내 국가명이 들어간) 행만 찾는다 — 그런데
+    _precreate_ko_shell로 미리 만든 미래 라운드는 그 라운드가 실제로
+    올 때까지 home/away가 빈 문자열이라(아직 대진 미확정) get_my_match가
+    절대 못 찾는다. 그래서 오늘이 어떤 라운드의 예정일인데 아직 대진이
+    안 정해졌으면, 이 함수가 그 사실을 찾아서 "미정" 표시용 정보를
+    돌려준다. 내 국가가 이미 탈락(alive=0)했으면 None(더 이상 내 대회가
+    아니므로 표시 안 함).
+
+    [2026-07 최적화] get_my_match와 동일하게 p를 넘기면 get_player()
+    재조회를 생략한다."""
+    from game_engine import get_player, get_state
+    if p is None:
+        p = get_player()
+    if st is None:
+        st = get_state()
+    if not p or not st or day is None:
+        return None
+    t = get_my_tournament(st["current_year"])
+    if not t or t["status"] not in ("group", "ko") or t["my_selected"] != 1:
+        return None
+    nat = _my_nat(t, p)
+    if not nat:
+        return None
+    conn = get_conn()
+    alive_row = conn.execute(
+        "SELECT alive FROM intl_entries WHERE tournament_id=? AND country=?",
+        (t["id"], nat)).fetchone()
+    if alive_row and alive_row["alive"] == 0:
+        conn.close()
+        return None
+    m = conn.execute(
+        """SELECT * FROM intl_matches WHERE tournament_id=? AND day=?
+           AND stage!='group' AND (home='' OR away='') LIMIT 1""",
+        (t["id"], day)).fetchone()
+    if m and m["stage"] in ("F", "TP"):
+        # [2026-07 신설, 신민용 리포트: "결승 진출이 확정됐으면 3/4위전은
+        # 안 보여도 될 것 같다"] 결승(F)과 3/4위전(TP)은 같은 4강에서
+        # 갈라지는 '서로 배타적인' 두 갈래다(4강 승자→결승, 패자→3/4위전)
+        # — 내 국가가 이미 한쪽에 확정 배치됐으면 반대쪽엔 절대 갈 수
+        # 없으므로, 그 반대쪽 placeholder는 더 이상 "혹시 나일 수도"가
+        # 아니라 무조건 남의 경기다. 표시할 이유가 없다.
+        other_stage = "TP" if m["stage"] == "F" else "F"
+        other_row = conn.execute(
+            "SELECT home, away FROM intl_matches WHERE tournament_id=? AND stage=?",
+            (t["id"], other_stage)).fetchone()
+        if other_row and nat in (other_row["home"], other_row["away"]):
+            conn.close()
+            return None
+    conn.close()
+    if not m:
+        return None
+    return {
+        "intl": True,
+        "pending": True,   # 대진 미확정 placeholder임을 표시
+        "match_id": m["id"],
+        "tournament_id": t["id"],
+        "league_name": t["name"],
+        "kind": t.get("kind", ""),
+        "stage": m["stage"],
+        "stage_ko": STAGE_KO.get(m["stage"], m["stage"]),
+        "week": week,
+    }
+
+
 def has_my_match_between(week_from, week_to):
     """주차 범위 내 내 국가대표 경기 존재 여부 (센터패널 표시용)."""
     for w in range(week_from, week_to + 1):
@@ -797,12 +899,82 @@ def has_my_match_between(week_from, week_to):
 # 대회 생성 (17주차 진입 시)
 # ─────────────────────────────────────────────
 
+def _gather_nat_context(p):
+    """국적/고정여부/대륙정보 조회 — start_intl_tournament와
+    start_qualifying_if_needed가 공유하는 공통 설정."""
+    nat1 = p.get("nationality", "") or ""
+    nat2 = p.get("nationality2", "") or ""
+    nat3 = p.get("nationality3", "") or ""
+    committed = p.get("intl_committed", "") or ""
+    if committed:
+        my_nats = [committed]
+    else:
+        my_nats = [n for n in (nat1, nat2, nat3) if n]
+
+    conn = get_conn()
+    nat_info = {}
+    if my_nats:
+        _ph = ",".join("?" * len(my_nats))
+        for r in conn.execute(
+                f"SELECT name, continent, grade FROM countries WHERE name IN ({_ph})",
+                my_nats).fetchall():
+            nat_info[r["name"]] = {"continent": r["continent"], "grade": r["grade"]}
+    conn.close()
+    return my_nats, nat_info, committed
+
+
+def start_qualifying_if_needed(year):
+    """[2026-07 신설] 중간 휴식기 시작 주(INTL_QUAL_WEEK) 진입 시 호출.
+    올해가 월드컵 해면 지금(비시즌 중간 휴식기, 28~31주) 예선을 생성한다.
+
+    [2026-07 재설계] 예전엔 예선이 본선 '전년도'(예: 2001년 예선 →
+    2002 월드컵)에 연말 오프시즌에서 진행됐다. 이제는 예선과 본선이
+    '같은 해'(2002년) 안에서, 예선은 중간 휴식기에 본선은 연말
+    오프시즌에 나눠 진행된다 — 그래서 예선 생성 시점의 year가 곧
+    본선 연도와 같다(더는 year+1 오프셋 없음)."""
+    from game_engine import get_player
+    p = get_player()
+    if not p:
+        return
+
+    is_wc = year >= WC_START_YEAR and (year - WC_START_YEAR) % WC_INTERVAL == 0
+    if not is_wc:
+        return
+    if [t for t in get_tournaments(year) if t["kind"] == "wc_qual"]:
+        return  # 이미 이 해 예선이 생성됨 → 중복 방지
+
+    _clear_entry_cache()
+    my_nats, nat_info, committed = _gather_nat_context(p)
+
+    # [2026-07 신설, 신민용 리포트: "2002년 월드컵이 통째로 사라졌다"]
+    # 대륙별로 예외를 격리해서, 한 대륙이 실패해도 나머지 대륙은 정상적으로
+    # 예선이 생성되게 한다(에러는 로그에 남기되 다른 대륙까지 함께
+    # 망가지는 것만 막는다).
+    all_confs = ["유럽", "아메리카", "아시아", "아프리카"]
+    for conf in all_confs:
+        try:
+            _create_qual_tournament(year, "wc_qual", conf,
+                                    p=p, my_nats=my_nats, nat_info=nat_info,
+                                    committed=committed)
+        except Exception as e:
+            from game_engine import add_log
+            add_log(f"⚠ {year}년 월드컵 {conf} 예선 생성 오류: {e}"
+                    f"  (다른 대륙 예선은 정상 진행)", "event")
+
+
 def start_intl_tournament(year):
-    """17주차 진입 시 호출. 해당 연도에 대회가 있으면 생성.
+    """44주차(INTL_CALLUP_WEEK) 진입 시 호출. 해당 연도 본선/대륙컵/
+    클럽월드컵을 생성한다(예선은 이제 start_qualifying_if_needed가
+    중간 휴식기에 별도로 처리 — 이 함수에서는 다루지 않음).
+
+    [2026-07 재설계] 4년 주기:
+      WC해     (2002,2006..) : 예선(이미 중간휴식기에 생성됨) + 본선(지금, 44주)
+      WC해+1   (2003,2007..) : 클럽월드컵
+      대륙컵해 (2004,2008..) : 대륙컵
+      WC해+3   (2001,2005..) : 완전히 빈 해 — 아무 국제대회도 없음
 
     [복수국적·복수대륙컵] 미고정 선수가 서로 다른 대륙 국적을 보유하면,
     대륙컵 해에는 보유 국적이 속한 '각 대륙'의 대륙컵을 모두 생성한다.
-    (예: 크로아티아(유럽)+대한민국(아시아) → 유럽 챔피언십 + 아시안컵 둘 다)
     월드컵 해에는 종전과 동일하게 단일 대회만 생성한다.
     committed(고정)면 그 나라 대륙의 대륙컵 1개만 생성한다.
     """
@@ -814,46 +986,23 @@ def start_intl_tournament(year):
     is_wc = year >= WC_START_YEAR and (year - WC_START_YEAR) % WC_INTERVAL == 0
     is_cont = (not is_wc and year >= CONTINENTAL_START_YEAR
                and (year - CONTINENTAL_START_YEAR) % CONTINENTAL_INTERVAL == 0)
+    is_cwc = (not is_wc and not is_cont and year >= WC_START_YEAR + 1
+              and (year - (WC_START_YEAR + 1)) % WC_INTERVAL == 0)
 
-    # ── 예선 판정: 다음 해가 월드컵 해이면 올해는 월드컵 예선 ──
-    # [정책] 대륙컵 예선(cont_qual)은 폐지. 월드컵 예선(wc_qual)만 운영.
-    nxt = year + 1
-    is_wc_qual = (not is_wc and not is_cont
-                  and nxt >= WC_START_YEAR
-                  and (nxt - WC_START_YEAR) % WC_INTERVAL == 0)
-
-    if not is_wc and not is_cont and not is_wc_qual:
-        # [2026-07 신설] 국가대표 대회가 아무것도 없는 '빈 해'(예: 2003,2007,
-        # 2011...) — 이 해에 클럽 월드컵을 연다. 캘린더 겹침이 전혀 없어서
-        # (챔스는 이미 23주차에 다 끝나있는 상태) 이 해를 고른 것.
+    if is_cwc:
+        # 월드컵 다음 해 — 캘린더 겹침이 전혀 없어서(챔스는 이미 23주차에
+        # 다 끝나있는 상태) 이 해에 클럽 월드컵을 연다.
         from club_world_cup_engine import start_club_world_cup
         start_club_world_cup(year)
         return
-    if get_tournaments(year):
-        return  # 이미 그 해 대회가 하나라도 생성됨 → 중복 생성 방지
+    if not is_wc and not is_cont:
+        return  # 완전히 빈 해 — 아무것도 안 함
+
+    if [t for t in get_tournaments(year) if t["kind"] in ("world", "continent")]:
+        return  # 이미 그 해 본선/대륙컵이 생성됨 → 중복 생성 방지
 
     _clear_entry_cache()   # 새 대회 → 이전 캐시 무효화
-
-    # 보유 국적 / 고정 여부
-    nat1 = p.get("nationality", "") or ""
-    nat2 = p.get("nationality2", "") or ""
-    nat3 = p.get("nationality3", "") or ""
-    committed = p.get("intl_committed", "") or ""
-    if committed:
-        my_nats = [committed]
-    else:
-        my_nats = [n for n in (nat1, nat2, nat3) if n]
-
-    # 각 국적의 대륙/등급 조회 ([최적화] IN 쿼리 1회로 합산)
-    conn = get_conn()
-    nat_info = {}
-    if my_nats:
-        _ph = ",".join("?" * len(my_nats))
-        for r in conn.execute(
-                f"SELECT name, continent, grade FROM countries WHERE name IN ({_ph})",
-                my_nats).fetchall():
-            nat_info[r["name"]] = {"continent": r["continent"], "grade": r["grade"]}
-    conn.close()
+    my_nats, nat_info, committed = _gather_nat_context(p)
 
     if is_wc:
         # 월드컵: 전 세계 단일 대회. (대륙 개념 없음)
@@ -862,40 +1011,12 @@ def start_intl_tournament(year):
                                committed=committed)
         return
 
-    # ── 월드컵 예선: 4개 대륙 연맹 전부 예선 생성 ──
-    #   각 연맹별로 _create_qual_tournament 호출.
-    #   내 국적이 속한 연맹만 my_sel=1/2/3, 나머지는 my_sel=2(출전 없음).
-    #   통과국은 _finalize_qual이 qual_results에 저장 → 다음 해 본선 entries 구성.
-    # [2026-07 신설, 신민용 리포트: "2002년 월드컵이 통째로 사라졌다"]
-    # 예전엔 이 for문에 try/except가 없어서, 한 대륙(예: 아시아) 생성 중
-    # 예외가 나면 for문 자체가 끊겨 뒤이은 대륙(아프리카 등)까지 함께
-    # 생성이 안 됐다 — 그 결과 다음 해 본선(_qualify_world)이 "예선 결과
-    # 누락"으로 통째로 실패해 월드컵 자체가 그 주기 내내 사라졌다. 대륙별로
-    # 예외를 격리해서, 한 대륙이 실패해도 나머지 대륙은 정상적으로 예선이
-    # 생성되게 한다 — 실패를 숨기는 게 아니라(에러는 그대로 로그에 남는다),
-    # 무관한 대륙까지 함께 망가지는 것만 막는다.
-    if is_wc_qual:
-        all_confs = ["유럽", "아메리카", "아시아", "아프리카"]
-        for conf in all_confs:
-            try:
-                _create_qual_tournament(year, "wc_qual", conf,
-                                        p=p, my_nats=my_nats, nat_info=nat_info,
-                                        committed=committed)
-            except Exception as e:
-                from game_engine import add_log
-                add_log(f"⚠ {year}년 월드컵 {conf} 예선 생성 오류: {e}"
-                        f"  (다른 대륙 예선은 정상 진행)", "event")
-        return
-
     # ── 대륙컵: 4개 대륙 연맹 전부 생성 ──
-    #   [변경] 예전엔 '내 국적이 속한 대륙'만 만들었으나, 챔피언스리그처럼
+    #   예전엔 '내 국적이 속한 대륙'만 만들었으나, 챔피언스리그처럼
     #   4개 대륙 전부 항상 생성하도록 확장 — 다른 대륙 대회 결과도 역대기록에서
     #   조회 가능해짐. _create_one_tournament 내부는 my_nats를 그 대륙 국적과
     #   교집합해서 참가여부(my_sel)를 판정하므로, 내 국적이 없는 대륙은 그냥
     #   'AI끼리 진행되는 배경 대회'가 되고 선택창 등 기존 동작에는 영향 없다.
-    #   [성능] _qualify_continental은 countries 테이블 등급 기반 통계 계산이라
-    #   club 리그 시뮬레이션처럼 무거운 의존성이 없음 — 4년에 1번, 대회 4개
-    #   추가되는 정도라 챔스(매년 4대륙 32팀)보다도 가벼움.
     all_confs = ["유럽", "아메리카", "아시아", "아프리카"]
     for cont in all_confs:
         _create_one_tournament(year, is_wc=False, my_continent=cont,
@@ -940,6 +1061,73 @@ def _conf_key(continent):
     """대륙명 → 4개 통합 연맹 대표키.
     유럽/아메리카/아시아/아프리카로 정규화."""
     return CONTINENT_TO_CONF.get(continent, continent)
+
+
+def _precreate_ko_shell(conn, c, tid, tournament_type, tournament_start_day):
+    """[2026-07 신설, 신민용 설계 제안: "경기 자체는 미리 존재하고 참가팀만
+    나중에 확정된다"] 조별리그를 만드는 시점에 그 뒤 전체 토너먼트
+    (R32/R16~결승, 3/4위전)의 '빈 대진' 행을 미리 만들어둔다 — home/away를
+    빈 문자열로 둔 placeholder다. 실제 진출국이 정해지면(_finalize_groups/
+    _advance_knockout) 새 행을 INSERT하는 대신 이 placeholder를
+    UPDATE해서 팀 이름만 채워 넣는다.
+
+    이 방식의 핵심 이점:
+      - day/week가 대회 시작 시점에 전부 확정돼, 그 뒤 어떤 진행
+        순서로 진행되든(하루씩/1주씩, 유저가 그 나라 선수든 아니든)
+        일정이 다시 계산되거나 밀리는 일이 구조적으로 없어진다 —
+        "8강전이 실제 날짜도 되기 전에 결장 처리된다"류의 타이밍 버그
+        (지난 세션에 process_intl_week day필터로 막았던 것)의 근본
+        원인 자체가 사라진다.
+      - schedule_window.py 같은 화면에서 "8강 진출 시 경기 예정"을
+        자연스럽게 보여줄 수 있다 — 행이 이미 존재하므로 그냥 home/away
+        가 빈 문자열이면 "상대 미정"으로 표시하면 된다.
+
+    match_count/day는 constants.TOURNAMENT_SCHEDULE_RULES를 그대로
+    쓴다 — _advance_knockout이 다음 라운드 day를 계산할 때 쓰던 것과
+    완전히 동일한 규칙이라 결과가 항상 일치한다. TP(3/4위전)는 기존
+    관례대로 slot=999 하나만 둔다.
+    """
+    rows = []
+    for r in TOURNAMENT_SCHEDULE_RULES.get(tournament_type, []):
+        stage = r["stage"]
+        if stage == "group":
+            continue
+        start_day = stage_round_start_day(tournament_type, stage, r["round"], tournament_start_day)
+        n = r["match_count"]
+        day_list = assign_match_days(start_day, n, r["cap"])
+        for idx in range(n):
+            d = day_list[idx]
+            wk = day_to_week(d)
+            slot = 999 if stage == "TP" else idx
+            rows.append((tid, stage, "", wk, d, "", "", -1, -1, 0, slot))
+    if rows:
+        c.executemany("""INSERT INTO intl_matches
+                     (tournament_id, stage, grp, week, day, home, away,
+                      home_score, away_score, is_my, slot)
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?)""", rows)
+
+
+def _fill_ko_shell(conn, c, tid, stage, home_away_by_slot):
+    """[2026-07 신설] _precreate_ko_shell로 미리 만들어둔 그 stage의
+    placeholder 행에 실제 팀 이름을 채워 넣는다(slot 번호로 매칭).
+    혹시 그 stage의 placeholder가 없는 예외 상황(과거 세이브 호환,
+    TOURNAMENT_SCHEDULE_RULES에 없는 잠정 체제 등)이면 해당 slot만
+    새로 INSERT해서(day=None) 예전 동작으로 안전하게 폴백한다 — 대회가
+    조용히 멈추는 것보다 day 정밀도 없이라도 진행되는 게 낫다.
+    home_away_by_slot: {slot: (home, away, is_my)}
+    """
+    for slot, (home, away, is_my) in home_away_by_slot.items():
+        cur = c.execute(
+            """UPDATE intl_matches SET home=?, away=?, is_my=?
+               WHERE tournament_id=? AND stage=? AND slot=?""",
+            (home, away, is_my, tid, stage, slot))
+        if cur.rowcount == 0:
+            c.execute(
+                """INSERT INTO intl_matches
+                   (tournament_id, stage, grp, week, day, home, away,
+                    home_score, away_score, is_my, slot)
+                   VALUES(?,?,?,?,?,?,?,-1,-1,?,?)""",
+                (tid, stage, "", 1, None, home, away, is_my, slot))
 
 
 def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, committed):
@@ -1001,13 +1189,21 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
                     # 아니라 continent로 그 시즌 예선 기록 자체를 찾은 뒤,
                     # my_selected==1이면서 my_nat도 committed와 일치하는지
                     # 둘 다 확인한다.
+                    # [2026-07 버그수정, 신민용 리포트: "예선 탈락했는데 본선에서
+                    # 또 발탁창이 뜬다"] 예선·본선이 '같은 해'(year)에 진행되도록
+                    # 재설계(start_qualifying_if_needed 참고)됐는데, 이 조회는
+                    # 그 이전(예선이 전년도였던) 구조의 잔재로 여전히 year-1을
+                    # 찾고 있었다 — 실제 wc_qual 레코드는 항상 year에 저장되므로
+                    # year-1 조회는 영원히 빈 결과만 반환해 _bqr이 항상 None이
+                    # 되고, 그 결과 예선 기록 유무와 무관하게 매번 _check_selection
+                    # 재검증(사실상 예선 탈락 여부를 무시)으로 새 버그가 생겼다.
                     _committed_cont = nat_info.get(committed, {}).get("continent", "")
                     _bqc = get_conn()
                     _bqr = _bqc.execute(
                         """SELECT my_selected, my_nat FROM intl_tournaments
                            WHERE year=? AND kind='wc_qual' AND continent=?
                            LIMIT 1""",
-                        (year - 1, _committed_cont)).fetchone()
+                        (year, _committed_cont)).fetchone()
                     _bqc.close()
                     if _bqr is not None:
                         _blocked_by_qual = not (_bqr["my_selected"] == 1
@@ -1081,17 +1277,25 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
             my_sel = 2   # pledge한 나라가 본선 진출 실패(예선 탈락) → 출전 없음
     else:
         # 미고정 + pledge 없음.
-        #   [월드컵] 작년 wc_qual 예선이 있었는데 pledge가 없다
+        #   [월드컵] 같은 해 wc_qual 예선이 있었는데 pledge가 없다
         #            = 예선 미선발/탈락 → 본선 출전 불가.
         #   [대륙컵] 대륙컵은 예선이 없으므로 무조건 발탁창을 띄운다.
         _had_wc_qual = False
         if is_wc:
             try:
                 _cc = get_conn()
+                # [2026-07 버그수정, 신민용 리포트: "예선 탈락했는데 국제대회때
+                # 한번 더 국대 나가실래요가 뜬다"] 예선·본선이 이제 '같은 해'
+                # (year)에 진행되도록 재설계됐는데(start_qualifying_if_needed
+                # 참고), 이 조회는 예선이 전년도였던 옛 구조 그대로 year-1을
+                # 찾고 있었다 — 실제 wc_qual 레코드는 항상 같은 year에 저장돼
+                # year-1 조회는 늘 빈 결과라 _had_wc_qual이 항상 False였다.
+                # 그 결과 "예선이 아예 없었던 해"와 동일하게 취급돼, 예선에서
+                # 떨어진 선수에게도 무조건(자격 재검증 없이) 발탁창이 떴다.
                 _qr = _cc.execute(
                     """SELECT 1 FROM intl_tournaments
                        WHERE year=? AND kind='wc_qual' LIMIT 1""",
-                    (year - 1,)).fetchone()
+                    (year,)).fetchone()
                 _cc.close()
                 _had_wc_qual = bool(_qr)
             except Exception:
@@ -1099,16 +1303,18 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
 
         cand_nats = [n for n in cont_nats if n]
         if is_wc and _had_wc_qual:
-            # 작년 예선이 있었음 → 예선에서 내 처리 결과 확인
+            # 같은 해 예선이 있었음 → 예선에서 내 처리 결과 확인
             # my_selected=0(미선발)/2(예선탈락·미참가) → 본선 발탁창 없음
             # my_selected=1(예선출전확정) + pledge → 본선 발탁창 제시
+            # [2026-07 버그수정] 위 _had_wc_qual과 동일한 이유로 year-1을
+            # year로 수정 — wc_qual 레코드는 항상 같은 year에 있다.
             _qual_results = []
             try:
                 _qc = get_conn()
                 _qual_results = [dict(r) for r in _qc.execute(
                     "SELECT my_selected, my_nat FROM intl_tournaments"
                     " WHERE year=? AND kind='wc_qual'",
-                    (year - 1,)).fetchall()]
+                    (year,)).fetchall()]
                 _qc.close()
             except Exception:
                 pass
@@ -1162,8 +1368,13 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
                          VALUES(?,?,?,?,?,?,?,1)""",
                       (tid, e["name"], e["flag"], e["grade"], e["ovr"], g, pot + 1))
 
-    # 조별리그 일정 (18~20주)
+    # 조별리그 일정 (18~20주 앵커 → 이 시점부터 실제 day도 함께 배정)
     w0 = INTL_GROUP_WEEKS[0]
+    # [Phase 2] 32/48개국 체제 판별은 위에서 n_groups 정할 때 쓴 것과 동일한
+    # 기준(year >= WC_EXPAND_YEAR)을 그대로 재사용.
+    tournament_type = (("world_cup_48" if year >= WC_EXPAND_YEAR else "world_cup_32")
+                        if is_wc else "continental")
+    tournament_start_day = week_to_day(w0)
     if my_nat:
         _my_match_nats = {my_nat}
     elif my_sel == 3:
@@ -1172,16 +1383,43 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
         # my_sel==2: 출전 없음 → 내 경기 없음 (기존엔 cont_nats 전체가 들어가던 버그)
         _my_match_nats = set()
     for rd, pairs in enumerate(_GROUP_ROUNDS):
-        wk = w0 + rd
-        for g, members in groups.items():
-            for hi, ai in pairs:
-                home, away = members[hi], members[ai]
-                is_my = 1 if (home["name"] in _my_match_nats or away["name"] in _my_match_nats) else 0
-                c.execute("""INSERT INTO intl_matches
-                             (tournament_id, stage, grp, week, home, away,
-                              home_score, away_score, is_my, slot)
-                             VALUES(?,?,?,?,?,?,-1,-1,?,0)""",
-                          (tid, "group", g, wk, home["name"], away["name"], is_my))
+        # [2026-07 버그 수정, DB로 실제 확인] wk = w0 + rd(라운드 인덱스로
+        # 대충 계산)는 day_list가 4일 capacity 기준으로 분산 배정되는 것과
+        # 안 맞았다 — 한 라운드(4일)가 실제 캘린더 week 경계(7일 단위)와
+        # 어긋나서, day는 맞는데 week 컬럼이 틀린 행이 생겼다(실제 재현:
+        # day313은 진짜 45주인데 저장은 46주로 찍힘 → get_my_match가
+        # week=45로 조회하면 이 행을 영원히 못 찾음). day가 먼저 정해지면
+        # week는 항상 그 day로부터 역산한다(day_to_week) — 아래서 매치별로
+        # 처리.
+        # [Phase 2, 중요] 이 라운드에 속한 모든 (조, 매치) 쌍을 먼저 한 줄로
+        # 펼친 다음 day 리스트를 1:1로 대응시킨다 — 라운드 하나에 day 값
+        # 하나만 주면 daily_match_capacity가 무시되고 "day라는 이름의
+        # week"밖에 안 나온다(실제로 이 실수를 했다가 지적받고 고침).
+        round_matches = [(g, hi, ai) for g in groups for hi, ai in pairs]
+        rule = get_stage_rule(tournament_type, "group", rd + 1)
+        if rule:
+            round_start_day = stage_round_start_day(
+                tournament_type, "group", rd + 1, tournament_start_day)
+            day_list = assign_match_days(round_start_day, len(round_matches), rule["cap"])
+        else:
+            # tournament_schedule_rules에 없는 체제(잠정치 미확정 등)는
+            # day를 NULL로 남긴다 — week 기반 진행에는 영향 없음.
+            day_list = [None] * len(round_matches)
+        for (g, hi, ai), day_val in zip(round_matches, day_list):
+            members = groups[g]
+            home, away = members[hi], members[ai]
+            is_my = 1 if (home["name"] in _my_match_nats or away["name"] in _my_match_nats) else 0
+            wk = day_to_week(day_val) if day_val is not None else (w0 + rd)
+            c.execute("""INSERT INTO intl_matches
+                         (tournament_id, stage, grp, week, day, home, away,
+                          home_score, away_score, is_my, slot)
+                         VALUES(?,?,?,?,?,?,?,-1,-1,?,0)""",
+                      (tid, "group", g, wk, day_val, home["name"], away["name"], is_my))
+
+    # [2026-07 신설] 그룹리그가 끝나기도 전에, 이후 전체 토너먼트의 '빈
+    # 대진'을 미리 만들어둔다 — 자세한 이유는 _precreate_ko_shell 참고.
+    _precreate_ko_shell(conn, c, tid, tournament_type, tournament_start_day)
+
     conn.commit()
     conn.close()
 
@@ -1366,11 +1604,32 @@ def _check_selection(p, my_grade, country="", continent=""):
         tier_by_id[r["id"]] = r["tier"] or 1   # 팀 정보 없음(드묾) → 무페널티 폴백
 
     # 내 폼(실제 이번 시즌 기록)
+    # [2026-07 버그수정, 신민용 리포트: "발롱도르 5회 FIFA/UEFA 올해의
+    # 선수인 선수가 국가대표에 단 한 번도 못 뽑힌다"] 월드컵 예선은 시즌
+    # 중간(INTL_QUAL_START_DAY, 클럽 시즌의 약 60% 지점)에 열리는데, 이
+    # 시점의 내 season_goals/season_assists는 '그 시즌 지금까지 누적치'
+    # (아직 시즌 안 끝남)인 반면, AI 동포 후보는 _estimate_ai_season이
+    # 처음부터 풀시즌(38경기) 기준으로 추정된다 — 즉 내 폼만 시즌 중간
+    # 스냅샷과 AI의 풀시즌 추정치를 그대로 비교하는 규격 불일치가 있었다.
+    # 아무리 압도적인 시즌을 보내고 있어도 시즌이 덜 끝났다는 이유만으로
+    # 골/어시 누적치가 AI보다 항상 낮게 나와 선발점수가 부당하게 깎였다.
+    # 지금까지 뛴 경기 수 기준으로 38경기(AI와 동일한 풀시즌 기준) 페이스로
+    # 환산해서 비교한다 — 평점(rating)은 총량이 아니라 평균이라 이미
+    # 시즌 길이와 무관하므로 그대로 둔다.
     _rc = p.get("season_rating_cnt", 0)
     my_avg_rating = (p.get("season_rating_sum", 0) / _rc) if _rc > 0 else 6.0
     my_cs = _calc_clean_sheets_for_player(p) if pos_group == "GK" else 0
-    my_raw = _intl_form_raw(my_pos, p.get("season_goals", 0), p.get("season_assists", 0),
-                            my_avg_rating, my_cs)
+    _played_so_far = p.get("season_matches", 0)
+    if 0 < _played_so_far < 38:
+        _pace = 38.0 / _played_so_far
+        _my_g = p.get("season_goals", 0) * _pace
+        _my_a = p.get("season_assists", 0) * _pace
+        if pos_group == "GK":
+            my_cs = my_cs * _pace
+    else:
+        _my_g = p.get("season_goals", 0)
+        _my_a = p.get("season_assists", 0)
+    my_raw = _intl_form_raw(my_pos, _my_g, _my_a, my_avg_rating, my_cs)
 
     norm_by_id, my_norm = _normalize_form(raw_by_id, id(p), my_raw)
 
@@ -1549,9 +1808,9 @@ def _qualify_continental(my_continent):
 # ─────────────────────────────────────────────
 
 def _continent_qual_quota(qual_kind, continent, year):
-    """이 대륙(연맹)이 다음 해 본선에서 차지하는 진출 쿼터(장수)."""
+    """이 대륙(연맹)이 올해(=예선과 같은 해) 본선에서 차지하는 진출 쿼터(장수)."""
     if qual_kind == "wc_qual":
-        big = (year + 1) >= WC_EXPAND_YEAR
+        big = year >= WC_EXPAND_YEAR
         quota_map = WC_QUOTA_BIG if big else WC_QUOTA
         ck = _conf_key(continent)
         return quota_map.get(ck, 4)
@@ -1605,7 +1864,7 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
     """
     from game_engine import add_log
 
-    big = (year + 1) >= WC_EXPAND_YEAR
+    big = year >= WC_EXPAND_YEAR
     qual_cfg = WC_QUAL_48.get(continent) if big else WC_QUAL_32.get(continent)
     if not qual_cfg:
         return
@@ -1666,13 +1925,13 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
         if committed:
             # 이미 고정된 나라가 컷오프 → 바로 예선 진출 실패 기록
             failed_nat = committed
-            _save_trophy(year, failed_nat, f"{year + 1} 월드컵 {continent} 예선", "예선 진출 실패")
+            _save_trophy(year, failed_nat, f"{year} 월드컵 {continent} 예선", "예선 진출 실패")
             try:
                 conn_fc = get_conn()
                 conn_fc.execute("""INSERT INTO intl_history(year, competition, team_name, result,
                                                             goals, assists, caps, rating)
                                    VALUES(?,?,?,?,?,?,?,?)""",
-                                (year, f"{year + 1} 월드컵 {continent} 예선",
+                                (year, f"{year} 월드컵 {continent} 예선",
                                  failed_nat, "예선 진출 실패", 0, 0, 0, 0.0))
                 conn_fc.commit(); conn_fc.close()
             except Exception:
@@ -1710,7 +1969,7 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
                 groups[glabels[gi]].append(e)
 
     # ─── DB 저장 ───
-    name = f"{year + 1} 월드컵 {continent} 예선"
+    name = f"{year} 월드컵 {continent} 예선"
     conn = get_conn(); c = conn.cursor()
     c.execute("""INSERT INTO intl_tournaments(year, kind, name, status, my_selected, my_nat, cand_nats, continent)
                  VALUES(?,?,?,?,?,?,?,?)""",
@@ -1733,9 +1992,9 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
                       (tid, e["name"], e.get("flag",""), e.get("grade","F"),
                        round(e["ovr"], 1), g, is_my, e.get("continent","")))
 
-    # 홈앤어웨이 6라운드 일정 생성 (국제대회 오프시즌 조별리그 구간)
+    # 홈앤어웨이 6라운드 일정 생성 — [2026-07 재설계] 연말 오프시즌이 아니라
+    # 중간 휴식기(비시즌, INTL_QUAL_START_DAY부터) 안에서 4일 간격으로 진행.
     # 라운드로빈 알고리즘: 1팀 고정 + 나머지 회전 → 정방향 3R + 역방향 3R
-    base_week = INTL_GROUP_WEEKS[0]   # 예: 44주차부터
 
     def _round_robin_schedule(names):
         """n팀 라운드로빈. 각 라운드는 (홈, 원정) 쌍의 리스트."""
@@ -1754,26 +2013,31 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
             t = [t[0]] + [t[-1]] + t[1:-1]
         return rounds
 
+    # [2026-07 단순화] 같은 라운드의 다른 조 경기는 서로 다른 나라라서
+    # 같은 날짜에 겹쳐도 실제 충돌이 아니다(실제 FIFA 매치데이도 여러 조가
+    # 동시 진행됨) — 그래서 week 버킷/capacity 분산 없이 라운드=day를
+    # 직접 매핑한다. 라운드 수는 그룹 크기에 따라 달라질 수 있어
+    # len(all_rounds) 기준으로 매번 계산한다(4팀 조면 6라운드).
+    cand_set = set(cand_nats_final)
     for g, members in groups.items():
         names = [e["name"] for e in members]
         fwd_rounds = _round_robin_schedule(names)
         # 역방향: 홈↔원정 반전
         rev_rounds = [[(a, h) for h, a in rnd] for rnd in fwd_rounds]
-        all_rounds = fwd_rounds + rev_rounds  # 6라운드
+        all_rounds = fwd_rounds + rev_rounds  # 4팀 조 기준 6라운드
 
-        cand_set = set(cand_nats_final)
         for rnd_idx, rnd_pairs in enumerate(all_rounds):
-            wk = base_week + rnd_idx   # base_week ~ base_week+5주
-            wk = min(wk, base_week + 5)
+            day = INTL_QUAL_START_DAY + rnd_idx * INTL_QUAL_ROUND_GAP_DAYS
+            wk = day_to_week(day)
             for home_nat, away_nat in rnd_pairs:
                 is_my_match = (
                     (my_nat and (home_nat == my_nat or away_nat == my_nat)) or
                     (my_sel == 3 and (home_nat in cand_set or away_nat in cand_set))
                 )
                 c.execute("""INSERT INTO intl_matches
-                             (tournament_id, week, stage, grp, home, away, is_my, my_played)
-                             VALUES(?,?,?,?,?,?,?,?)""",
-                          (tid, wk, "qual_group", g, home_nat, away_nat,
+                             (tournament_id, week, day, stage, grp, home, away, is_my, my_played)
+                             VALUES(?,?,?,?,?,?,?,?,?)""",
+                          (tid, wk, day, "qual_group", g, home_nat, away_nat,
                            1 if is_my_match else 0, 0))
 
     conn.commit(); conn.close()
@@ -1814,9 +2078,17 @@ def _qual_group_labels(n):
 
 
 
-def process_intl_week(week):
+def process_intl_week(week, day=None):
     """이번 주차의 남은 국제대회 경기(AI) 시뮬 + 라운드 진행.
-    [복수대륙컵] 그 해 열린 모든 대회를 각각 진행한다."""
+    [복수대륙컵] 그 해 열린 모든 대회를 각각 진행한다.
+
+    [2026-07 버그수정, 신민용 리포트: "아시안컵 8강/4강이 메인화면에서
+    사라지고 부상으로 결장 처리된다 — 강철체질이라 부상일 리 없다"]
+    이 함수는 이제(4강/3-4위전이 늦게 뜨는 버그 수정으로) 매일 호출된다.
+    day를 함께 넘기면 _process_one_tournament_week가 '오늘(day)까지'만
+    쓸어담고, day가 아직 안 된 미래 경기(같은 주 안에 있어도)는 그날이
+    와서 정상적으로(get_my_match→simulate_my_match) 처리될 때까지
+    건드리지 않는다."""
     from game_engine import get_state
     st = get_state()
     if not st:
@@ -1824,16 +2096,36 @@ def process_intl_week(week):
     for t in get_tournaments(st["current_year"]):
         if t.get("status") == "done":
             continue
-        _process_one_tournament_week(t, week)
+        _process_one_tournament_week(t, week, day=day)
 
 
-def _process_one_tournament_week(t, week):
-    """대회 1개의 이번 주차 경기 시뮬 + 라운드 진행."""
+def _process_one_tournament_week(t, week, day=None):
+    """대회 1개의 이번 주차 경기 시뮬 + 라운드 진행.
+
+    [2026-07 버그수정, DB로 실제 확인한 버그: "8강/4강 경기가 실제 날짜가
+    되기도 전에 '부상 결장'으로 자동 처리돼버린다"] 국제대회는 Phase 2로
+    한 주 안에도 서로 다른 day를 가진 경기가 여러 개 있을 수 있는데(예:
+    조별리그 2라운드가 같은 주의 다른 날, 또는 다음 라운드가 이번 주 뒷날에
+    이미 생성돼 있는 경우), 이 함수가 매일 호출되면서도 pending을 week
+    기준으로만 걸러 골랐다 — 그러면 아직 그 경기의 실제 날짜(day)가 오지도
+    않았는데 이번 주에 속한다는 이유만으로 오늘 즉시 AI(결장) 시뮬로
+    넘어가버렸다(실제 세이브에서 재현: day329 8강전이 day327에 이미
+    '부상으로 결장' 처리됨). day를 받으면 day<=오늘 인 경기만 쓸어담고,
+    아직 안 된 day는 그대로 두어 실제 그날 advance_days의 정상 경로
+    (get_my_match/simulate_my_match)가 처리하게 한다."""
     conn = get_conn()
-    pending = [dict(r) for r in conn.execute(
-        """SELECT * FROM intl_matches
-           WHERE tournament_id=? AND week<=? AND home_score=-1""",
-        (t["id"], week)).fetchall()]
+    if day is not None:
+        pending = [dict(r) for r in conn.execute(
+            """SELECT * FROM intl_matches
+               WHERE tournament_id=? AND home_score=-1 AND home!='' AND away!=''
+                 AND ((day IS NOT NULL AND day<=?) OR (day IS NULL AND week<=?))""",
+            (t["id"], day, week)).fetchall()]
+    else:
+        pending = [dict(r) for r in conn.execute(
+            """SELECT * FROM intl_matches
+               WHERE tournament_id=? AND week<=? AND home_score=-1
+                 AND home!='' AND away!=''""",
+            (t["id"], week)).fetchall()]
     conn.close()
 
     # [최적화] champions_engine/cup_engine과 동일한 패턴: 경기마다 커넥션을
@@ -1868,69 +2160,109 @@ def _process_one_tournament_week(t, week):
         status = cur_row["status"] if cur_row else t.get("status", "qual_group")
 
         # 조별리그: 완료 주차(그룹 구간 마지막 주)에 마감
+        # [2026-07 수정] 예선이 이제 중간 휴식기(INTL_QUAL_START_DAY)
+        # 기준이라, 완료 판정도 그 앵커로 계산해야 한다 — 옛 오프시즌
+        # 앵커(INTL_GROUP_WEEKS)를 그대로 쓰면 이 조건이 영영 안 걸려서
+        # 예선이 조별리그에서 멈춰버린다(실제로 이 버그로 재현됨).
+        qual_group_last_day = INTL_QUAL_START_DAY + 5 * INTL_QUAL_ROUND_GAP_DAYS
+        qual_po_day = INTL_QUAL_START_DAY + 6 * INTL_QUAL_ROUND_GAP_DAYS
+        # [2026-07 버그수정, 신민용 리포트: "플레이오프가 31주차에 열린다면서
+        # 대진표에 팀만 뜨고 스코어가 영원히 안 나온다"] 이 마감 판정이
+        # week 단위였다 — PO 경기 실제 day(214)가 그 주(31주차=211~217일)
+        # 중간인데, week>=31이 그 주 첫날(211일)부터 이미 참이 돼서 실제
+        # 경기 날짜가 오기도 전에 _finalize_qual_po가 불려버렸다.
+        # _finalize_qual_po는 그 시점에 경기가 아직 미시뮬 상태(-1,-1)면
+        # intl_matches 행은 그대로 둔 채 별도 코인플립(_sim_single_match_ai)
+        # 으로만 승자를 정해버려서, 대회 결과(예선 통과)는 확정되는데 정작
+        # 화면에 보이는 그 경기 박스는 스코어 없이 영원히 빈 채로 남았다.
+        # day가 있으면 day 기준으로, 없으면(구버전 호출 등) week로 폴백한다.
         if status == "qual_group":
-            qual_last_week = INTL_GROUP_WEEKS[0] + 5
-            if week >= qual_last_week:
+            ready = (day >= qual_group_last_day) if day is not None \
+                    else (week >= day_to_week(qual_group_last_day))
+            if ready:
                 _finalize_qual(t)   # 직행 확정 or qual_po 생성
         # 플레이오프: 완료 시 마감
         elif status == "qual_po":
-            if week >= INTL_GROUP_WEEKS[0] + 6:
+            ready = (day >= qual_po_day) if day is not None \
+                    else (week >= day_to_week(qual_po_day))
+            if ready:
                 _finalize_qual_po(t)  # 플레이오프 승자 → qual_results
         return
 
-    # 라운드 진행
-    last_group_week = INTL_GROUP_WEEKS[1]
+    # 라운드 진행 — [2026-07 재설계, DB로 확인한 실제 버그: "예선은 끝났는데
+    # 16강을 안 한다"] 예전엔 "각 단계는 정확히 1주씩 걸린다"고 가정한 week
+    # 기반 plan 딕셔너리(last_group_week에 +1씩)로 다음 단계 트리거 시점을
+    # 판정했다. 그런데 압축된 day 기반 일정(daily_match_capacity) 때문에
+    # 한 단계가 여러 주에 걸치거나(예: 8강이 47~48주 두 주에 걸침), 조별
+    # 리그 종료 주(day로 역산하면 실제로는 46주)가 하드코딩된
+    # INTL_GROUP_WEEKS[1](47)와 안 맞는 경우가 생겼다 — 이러면 트리거
+    # 주차가 아예 안 걸리거나 한 단계씩 밀려서 다음 라운드가 영원히
+    # 안 생긴다. week 대신 stage 이름으로 "지금 어느 단계가 진행 중이고
+    # 끝났는지"를 직접 판정하면 며칠/몇 주에 걸치든 항상 정확하다.
+    big = (t["year"] >= WC_EXPAND_YEAR) if t["kind"] == "world" else False
     if t["kind"] == "world":
-        # 48개국(2002~)은 32강부터, 32개국은 16강부터
-        big = (t["year"] >= WC_EXPAND_YEAR)
-        if big:
-            plan = {last_group_week:   ("R32", last_group_week+1),
-                    last_group_week+1: ("R16", last_group_week+2),
-                    last_group_week+2: ("QF",  last_group_week+3),
-                    last_group_week+3: ("SF",  last_group_week+4),
-                    last_group_week+4: ("F",   last_group_week+5),
-                    last_group_week+5: (None, None)}
-        else:
-            plan = {last_group_week:   ("R16", last_group_week+1),
-                    last_group_week+1: ("QF",  last_group_week+2),
-                    last_group_week+2: ("SF",  last_group_week+3),
-                    last_group_week+3: ("F",   last_group_week+4),
-                    last_group_week+4: (None, None)}
+        _ko_seq = ["R32", "R16", "QF", "SF", "F"] if big else ["R16", "QF", "SF", "F"]
     else:
-        # 대륙컵 24개국: 조별(6조) → 16강 → 8강 → 4강 → 결승
-        plan = {last_group_week:   ("R16", last_group_week+1),
-                last_group_week+1: ("QF",  last_group_week+2),
-                last_group_week+2: ("SF",  last_group_week+3),
-                last_group_week+3: ("F",   last_group_week+4),
-                last_group_week+4: (None, None)}
+        _ko_seq = ["R16", "QF", "SF", "F"]
 
-    if week not in plan:
+    conn_s = get_conn()
+    if t["status"] == "group":
+        group_pending = conn_s.execute(
+            "SELECT COUNT(*) n FROM intl_matches WHERE tournament_id=? AND stage='group' AND home_score=-1",
+            (t["id"],)).fetchone()["n"]
+        conn_s.close()
+        if group_pending == 0:
+            _finalize_groups(t, _ko_seq[0], week)
         return
-    next_stage, next_week = plan[week]
 
-    if week == last_group_week:
-        _finalize_groups(t, next_stage, next_week)
-    elif next_stage is None:
-        # 결승 주차: F와 TP(3/4위전) 둘 다 완료됐을 때 종료 처리
-        conn_chk = get_conn()
-        tp_remain = conn_chk.execute(
-            "SELECT COUNT(*) AS n FROM intl_matches WHERE tournament_id=? AND stage='TP' AND home_score=-1",
-            (t["id"],)).fetchone()["n"]
-        conn_chk.close()
-        if tp_remain == 0:
-            _finish_tournament(t, week)
-        # tp_remain > 0이면 TP 완료 시 다시 호출됨
-    elif week in plan and plan[week][0] == "TP":
-        # TP 완료 확인 후 결승도 끝났으면 종료
-        conn_chk = get_conn()
-        f_remain = conn_chk.execute(
-            "SELECT COUNT(*) AS n FROM intl_matches WHERE tournament_id=? AND stage='F' AND home_score=-1",
-            (t["id"],)).fetchone()["n"]
-        conn_chk.close()
-        if f_remain == 0:
-            _finish_tournament(t, week)
-    else:
-        _advance_knockout(t, week, next_stage, next_week)
+    if t["status"] != "ko":
+        conn_s.close()
+        return
+
+    # [2026-07 재설계, KO 셸 사전생성에 맞춰 재작성] 예전엔 "stage!='group'
+    # 인 미완료 행이 하나라도 있으면 이번 주차엔 할 게 없다"고 판단했는데,
+    # 이제 R16~결승/3-4위전 전 스테이지가 대회 시작 시점에 이미
+    # placeholder(home='', away='')로 전부 존재한다 — 그러면 이 조건이
+    # 대회 내내(마지막 스테이지가 끝나기 전까지) 항상 참이 되어 다음
+    # 라운드가 영원히 대진 확정이 안 되는 회귀가 생긴다. 이제 각 스테이지를
+    # "채워졌는지(home!='')"와 "다 끝났는지(home_score!=-1)"로 직접 걸어서
+    # 확인한다 — _ko_seq 순서대로 훑으며, 채워지고 끝난 스테이지인데 바로
+    # 다음 스테이지가 아직 채워지지 않았으면 그 전환을 진행한다.
+    def _stage_rows(stage):
+        return conn_s.execute(
+            "SELECT home, away, home_score FROM intl_matches WHERE tournament_id=? AND stage=?",
+            (t["id"], stage)).fetchall()
+
+    for i, cur_stage in enumerate(_ko_seq[:-1]):
+        rows = _stage_rows(cur_stage)
+        if not rows:
+            continue
+        if any(r["home"] == "" for r in rows):
+            # 이 스테이지가 아직 채워지지 않았다 = 그 이전 단계가 아직
+            # 안 끝났다는 뜻(정상 — 순서대로면 여기서 멈춰야 함).
+            conn_s.close()
+            return
+        if any(r["home_score"] == -1 for r in rows):
+            # 채워졌지만 아직 진행 중.
+            conn_s.close()
+            return
+        next_stage = _ko_seq[i + 1]
+        next_rows = _stage_rows(next_stage)
+        if next_rows and all(r["home"] == "" for r in next_rows):
+            conn_s.close()
+            _advance_knockout(t, cur_stage, next_stage, week)
+            return
+        # next_stage가 이미 채워졌으면(직전 호출에서 처리됨) 계속 다음으로.
+
+    # 여기 도달 = 마지막 KO 스테이지(F, 그리고 있다면 TP)까지 전부 채워짐.
+    # F/TP 완료 여부를 확인해 대회 종료를 트리거한다.
+    f_rows = _stage_rows("F")
+    tp_rows = _stage_rows("TP")
+    conn_s.close()
+    f_done = bool(f_rows) and all(r["home"] != "" and r["home_score"] != -1 for r in f_rows)
+    tp_done = (not tp_rows) or all(r["home"] != "" and r["home_score"] != -1 for r in tp_rows)
+    if f_done and tp_done:
+        _finish_tournament(t, week)
 
 
 # ─────────────────────────────────────────────
@@ -2034,7 +2366,26 @@ def _sim_ai_match(t, m, my_played=False, conn=None, reason="injury", batch=None)
     # "내 경기"인지는 is_my 플래그와 함께 그 대회가 현재 my_selected==1
     # (정식 선택·출전 확정) 상태인지도 같이 봐야 한다.
     _really_mine = bool(m["is_my"]) and t.get("my_selected") == 1
-    day = _week_intl_cl_day(m["week"], get_player() or {}) if _really_mine else 0
+    # [2026-07 재수정, 국제대회 일 단위 전환 Phase 2 버그 수정] 이전엔
+    # "내 경기가 아니면 day=None"으로 무조건 덮어썼는데, 이제 예선/본선
+    # 생성 시점에 모든 경기(AI 포함)에 이미 정확한 day가 채워져 있다
+    # (Phase 2 참고) — 여기서 무조건 None을 넣으면 그 값을 시뮬레이션
+    # 순간 지워버리는 회귀 버그가 된다(실제로 재현됨: 생성 직후엔 day가
+    # 있는데 process_intl_week가 한 번 돌면 싹 NULL로 바뀜).
+    #
+    # [2026-07 재재수정, DB로 실제 확인한 버그] 바로 위 수정("내 경기만
+    # _week_intl_cl_day로 재계산")이 또 다른 회귀였다 — Phase 2가 생성
+    # 시점에 이미 capacity 기반으로 정확히 배정해둔 day(예: round2라서
+    # 315일)를, "내 경기"라는 이유로 _week_intl_cl_day가 그 주(week) 안의
+    # 아무 날로나(예: 318일, 사실은 round3 구간) 다시 계산해서 덮어썼다.
+    # 그 결과 week(46, round2)와 day(318, 실은 round3 날짜)가 서로 안
+    # 맞는 행이 생겼고, 화면에서 "오늘(day) 경기 있냐"고 물어봐도
+    # 못 찾았다(실제 세이브에서 재현·확인됨: round2가 313~316일에 4개씩
+    # 깔끔하게 나뉘어야 하는데 내 경기 하나만 318일로 튀어서 315일 자리가
+    # 비었었다). _week_intl_cl_day는 day가 아예 없던 옛 구조(챔스/컵/CWC)를
+    # 위한 폴백이지, 이미 정확한 day가 있는 예선/본선엔 애초에 쓸 이유가
+    # 없었다 — "내 경기"든 아니든 이제 항상 저장된 day를 그대로 보존한다.
+    day = m.get("day")
 
     _absence = reason if _really_mine else None
     _row = (hs, as_, pso_winner, pso_score, day, _absence, m["id"])
@@ -2075,11 +2426,11 @@ def _winner_of(m):
 # 내 경기 시뮬
 # ─────────────────────────────────────────────
 
-def sim_my_match_as_ai(week, p, reason="injury"):
+def sim_my_match_as_ai(week, p, reason="injury", day=None):
     """[2026-07 신설, 버그수정] 부상 등으로 내가 못 뛸 때 내 국가대표 경기를
     AI끼리 시뮬레이션 — cup_engine.sim_my_cup_match_as_ai와 동일한 이유로
     신설(이게 없으면 그 경기가 영원히 미완료로 남아 대회 진행이 멈춘다)."""
-    info = get_my_match(week)
+    info = get_my_match(week, day=day)
     if not info:
         return
     conn = get_conn()
@@ -2093,13 +2444,13 @@ def sim_my_match_as_ai(week, p, reason="injury"):
     _sim_ai_match(t, m, my_played=False, reason=reason)
 
 
-def simulate_my_match(week, p):
+def simulate_my_match(week, p, day=None):
     """내가 출전하는 국가대표 경기."""
     from game_engine import (add_log, get_player, update_player,
                              _player_perf, _my_result, _update_pop, _gen_score,
                              _save_match_detail, _soft_cap,
                              _check_suspended, _roll_red_card, _apply_red_card_dismissal)
-    info = get_my_match(week)
+    info = get_my_match(week, day=day)
     if not info:
         return
     conn = get_conn()
@@ -2194,9 +2545,11 @@ def simulate_my_match(week, p):
     my_result = _my_result(outcome, is_home)
     my_conceded = (as_ if is_home else hs)
 
-    # [2026-07 신설] 실제 진행 날짜 저장 (커리어/은퇴창 표시용).
-    from game_engine import _week_intl_cl_day
-    day = _week_intl_cl_day(week, p)
+    # [2026-07 재수정] 실제 진행 날짜는 Phase 2가 생성 시점에 이미
+    # 정확히 배정해뒀다 — _week_intl_cl_day로 다시 계산하면 그 값을
+    # (week는 그대로 둔 채) 엉뚱한 날로 덮어써서 week/day 불일치가
+    # 생긴다(_sim_ai_match에서 실제로 재현·수정된 것과 동일한 버그).
+    day = m.get("day")
 
     conn = get_conn()
     conn.execute("""UPDATE intl_matches SET home_score=?, away_score=?,
@@ -2277,7 +2630,16 @@ def simulate_my_match(week, p):
     marker = f" [match:{detail_id}]" if detail_id else ""
 
     add_log("─" * 44, "sep")
-    add_log(f"🌍 {comp_name}  {week}주차{marker}", "match")
+    # [2026-07 신설, 신민용 요청: "48주차가 아니라 11월 27일처럼 실제
+    # 날짜로 떠야 한다"] 이제 국제대회도 day 기반이라 실제 날짜를 알 수
+    # 있는데 로그엔 계속 '주차'만 찍히고 있었다 — day가 있으면 실제
+    # 날짜로, 없으면(구버전 호출 등) 기존처럼 '주차'로 폴백한다.
+    if day is not None:
+        from constants import day_to_date_str
+        when_txt = day_to_date_str(day)
+    else:
+        when_txt = f"{week}주차"
+    add_log(f"🌍 {comp_name}  {when_txt}{marker}", "match")
     add_log(f"   {home_disp} {hs}-{as_} {away_disp}  ({rs}){pso_txt}", "match")
     if p.get("position") == "GK":
         add_log(f"   평점 {rating:.1f}  선방 {saves}", "match")
@@ -2389,7 +2751,7 @@ def _finalize_qual(t):
         return rows
 
     continent = _conf_key((t.get("continent") or "").strip() or "유럽")
-    big = (t["year"] + 1) >= WC_EXPAND_YEAR
+    big = t["year"] >= WC_EXPAND_YEAR
     qual_cfg = (WC_QUAL_48 if big else WC_QUAL_32).get(continent, {})
 
     # 조별 1위/2위 수집
@@ -2438,14 +2800,17 @@ def _finalize_qual(t):
         conn = get_conn(); c = conn.cursor()
         p = get_player()
         my_nat = _my_nat(t, p) if p else ""
-        po_week = INTL_GROUP_WEEKS[0] + 6
-        for i in range(0, len(po_pool)-1, 2):
-            home = po_pool[i]; away = po_pool[i+1]
+        # [2026-07 재설계] 조별 6라운드 뒤 7번째 라운드 = INTL_QUAL_START_DAY
+        # + 6*GAP. PO끼리도 서로 다른 나라라 같은 날짜 겹쳐도 무방.
+        po_day = INTL_QUAL_START_DAY + 6 * INTL_QUAL_ROUND_GAP_DAYS
+        po_week = day_to_week(po_day)
+        _po_pairs = [(po_pool[i], po_pool[i+1]) for i in range(0, len(po_pool)-1, 2)]
+        for home, away in _po_pairs:
             is_my = 1 if my_nat and (home["country"] == my_nat or away["country"] == my_nat) else 0
             c.execute("""INSERT INTO intl_matches
-                         (tournament_id, week, stage, home, away, is_my, my_played)
-                         VALUES(?,?,?,?,?,?,?)""",
-                      (tid, po_week, "qual_po", home["country"], away["country"], is_my, 0))
+                         (tournament_id, week, day, stage, home, away, is_my, my_played)
+                         VALUES(?,?,?,?,?,?,?,?)""",
+                      (tid, po_week, po_day, "qual_po", home["country"], away["country"], is_my, 0))
         c.execute("UPDATE intl_tournaments SET status='qual_po' WHERE id=?", (tid,))
         conn.commit(); conn.close()
         add_log(f"🏆 {t['name']} 플레이오프 시작! ({po_week}주차)", "event")
@@ -2500,7 +2865,31 @@ def _finalize_qual_po(t):
                 # knockout 무승부는 항상 PSO를 거치므로 거의 발생하지 않음).
                 winner = home if random.random() > 0.5 else away
         else:
-            winner = _sim_single_match_ai(home, away)
+            # [2026-07 버그수정, 신민용 리포트: "플레이오프가 대진표엔
+            # 팀만 뜨고 스코어가 영원히 안 나온다"] 이 분기(경기가 아직
+            # 미시뮬 상태로 마감 시점이 온 경우)는 예전엔 승자만 내부적으로
+            # 정하고 intl_matches 행은 그대로 -1,-1로 남겨뒀다 — 대회
+            # 결과(예선 통과 여부)는 확정되는데 화면에 보이는 그 경기
+            # 박스는 스코어 없이 영원히 빈 채로 남는 불일치가 있었다.
+            # 이제 실제 스코어도 같이 생성해서 DB에 반영한다(위의 day
+            # 타이밍 수정으로 이 분기 자체가 훨씬 드물어지지만, 만에
+            # 하나를 위한 안전장치로 결과 일관성은 항상 보장한다).
+            _outcome = _match_outcome(home["ovr"], away["ovr"], True)
+            _pso_w, _pso_s = "", ""
+            if _outcome == "draw":
+                _win_home, _pso_s = _resolve_pso(home["ovr"], away["ovr"])
+                _hs, _as = 1, 1
+                _pso_w = home["country"] if _win_home else away["country"]
+            else:
+                _hs, _as = _gen_intl_score(_outcome, home["ovr"] - away["ovr"])
+            _conn_fix = get_conn()
+            _conn_fix.execute(
+                """UPDATE intl_matches SET home_score=?, away_score=?,
+                   pso_winner=?, pso_score=? WHERE id=?""",
+                (_hs, _as, _pso_w, _pso_s, m["id"]))
+            _conn_fix.commit()
+            _conn_fix.close()
+            winner = home if (_pso_w == home["country"] if _pso_w else _hs > _as) else away
         winners.append(winner)
         loser = away if winner["country"] == home["country"] else home
         my_marker = ""
@@ -2522,7 +2911,7 @@ def _finalize_qual_po(t):
     # [버그수정] PO 승자만 넘기면 _save_qual_results의 DELETE가
     # 기존 직행팀을 지워버린다. 직행팀을 미리 읽어 PO 승자와 합쳐서
     # 전체를 한 번에 저장한다.
-    target_year = t["year"] + 1
+    target_year = t["year"]
     target_kind = "world" if t["kind"] == "wc_qual" else "continent"
     conn_pre = get_conn()
     existing_rows = [dict(r) for r in conn_pre.execute(
@@ -2536,7 +2925,7 @@ def _finalize_qual_po(t):
                      "grade": r["grade"], "ovr": r["ovr"]} for r in existing_rows]
     # po_winners 값만큼만 PO 승자 반영 (유럽: 4팀 PO → 승자 2팀이지만 po_winners=1)
     from constants import WC_QUAL_32, WC_QUAL_48, WC_EXPAND_YEAR
-    big = (t["year"] + 1) >= WC_EXPAND_YEAR
+    big = t["year"] >= WC_EXPAND_YEAR
     qual_cfg = (WC_QUAL_48 if big else WC_QUAL_32).get(continent, {})
     po_winners_n = qual_cfg.get("po_winners", len(winners))
     po_new = [w for w in winners if w["country"] not in existing_names][:po_winners_n]
@@ -2565,7 +2954,7 @@ def _save_qual_results(t, continent, qualified_list, set_done=True):
     from game_engine import add_log, get_player
 
     tid = t["id"]
-    target_year = t["year"] + 1
+    target_year = t["year"]
     target_kind = "world" if t["kind"] == "wc_qual" else "continent"
     qualified_names = {q["country"] for q in qualified_list}
 
@@ -2842,15 +3231,17 @@ def _finalize_groups(t, next_stage, next_week):
 
     p = get_player()
     nat = _my_nat(t, p)
-    _insert_rows = []
+    # [2026-07 재설계] day는 더 이상 여기서 재계산하지 않는다 — 대회
+    # 생성 시점에 _precreate_ko_shell이 이미 이 스테이지의 모든 슬롯에
+    # 정확한 day/week를 배정해뒀다(그때와 완전히 같은 규칙이라 값도
+    # 항상 일치한다). 여기서는 그 placeholder에 실제 진출국 이름만
+    # slot 번호로 매칭해 채워 넣는다 — "경기 자체는 미리 존재하고
+    # 참가팀만 나중에 확정된다"는 설계(신민용 제안).
+    fills = {}
     for slot, (home, away) in enumerate(pairs):
         is_my = 1 if nat in (home, away) else 0
-        _insert_rows.append((tid, next_stage, "", next_week, home, away, is_my, slot))
-    if _insert_rows:
-        c.executemany("""INSERT INTO intl_matches
-                     (tournament_id, stage, grp, week, home, away,
-                      home_score, away_score, is_my, slot)
-                     VALUES(?,?,?,?,?,?,-1,-1,?,?)""", _insert_rows)
+        fills[slot] = (home, away, is_my)
+    _fill_ko_shell(conn, c, tid, next_stage, fills)
     c.execute("UPDATE intl_tournaments SET status='ko' WHERE id=?", (tid,))
     conn.commit()
     conn.close()
@@ -2862,14 +3253,20 @@ def _finalize_groups(t, next_stage, next_week):
         _record_my_exit(t, "조별리그 탈락")
 
 
-def _advance_knockout(t, week, next_stage, next_week):
-    """현재 KO 라운드 종료 → 패자 탈락, 다음 라운드 생성."""
+def _advance_knockout(t, cur_stage, next_stage, next_week):
+    """현재 KO 라운드(cur_stage) 종료 → 패자 탈락, 다음 라운드 생성.
+
+    [2026-07 재설계] 예전엔 week=?로 현재 라운드 경기를 찾았는데, 압축된
+    day 기반 일정 때문에 한 라운드가 여러 주에 걸칠 수 있어서(예: 8강이
+    47~48주 두 주에 걸침) week 하나만 보면 그 라운드의 절반을 놓친다.
+    stage 이름으로 조회하면 몇 주에 걸치든 항상 그 라운드 전체를 정확히
+    찾는다."""
     from game_engine import add_log, get_player
     tid = t["id"]
     conn = get_conn()
     cur = [dict(r) for r in conn.execute(
-        """SELECT * FROM intl_matches WHERE tournament_id=? AND week=?
-           AND stage!='group' ORDER BY slot""", (tid, week)).fetchall()]
+        """SELECT * FROM intl_matches WHERE tournament_id=? AND stage=?
+           ORDER BY slot""", (tid, cur_stage)).fetchall()]
     conn.close()
     if not cur:
         return
@@ -2907,28 +3304,29 @@ def _advance_knockout(t, week, next_stage, next_week):
             loser = m["away"] if w == m["home"] else m["home"]
             losers.append(loser)
 
+    # [2026-07 재설계] day는 더 이상 여기서 재계산하지 않는다 — 대회
+    # 생성 시점에 _precreate_ko_shell이 next_stage/TP 슬롯의 day/week를
+    # 이미 정확히 배정해뒀다. 여기서는 승자 이름만 slot 번호로 매칭해
+    # placeholder를 채운다("경기는 미리 존재, 참가팀만 나중에 확정").
     winners.sort()
+    _next_pairs = []
     for slot in range(0, len(winners), 2):
         if slot + 1 >= len(winners):
             break
-        home, away = winners[slot][1], winners[slot + 1][1]
-        is_my = 1 if nat in (home, away) else 0
-        c.execute("""INSERT INTO intl_matches
-                     (tournament_id, stage, grp, week, home, away,
-                      home_score, away_score, is_my, slot)
-                     VALUES(?,?,?,?,?,?,-1,-1,?,?)""",
-                  (tid, next_stage, "", next_week, home, away, is_my, slot // 2))
+        _next_pairs.append((winners[slot][1], winners[slot + 1][1]))
 
-    # 3/4위전: SF 패자 2팀, 결승과 같은 주차
+    fills = {}
+    for idx, (home, away) in enumerate(_next_pairs):
+        is_my = 1 if nat in (home, away) else 0
+        fills[idx] = (home, away, is_my)
+    _fill_ko_shell(conn, c, tid, next_stage, fills)
+
+    # 3/4위전: SF 패자 2팀 — TP placeholder(slot=999)를 채운다.
     if len(losers) == 2:
         tp_home, tp_away = losers[0], losers[1]
         is_my_tp = 1 if nat in (tp_home, tp_away) else 0
-        c.execute("""INSERT INTO intl_matches
-                     (tournament_id, stage, grp, week, home, away,
-                      home_score, away_score, is_my, slot)
-                     VALUES(?,?,?,?,?,?,-1,-1,?,?)""",
-                  (tid, "TP", "", next_week, tp_home, tp_away, is_my_tp, 999))
-        add_log(f"🥉 {t['name']} 3/4위전 대진: {tp_home} vs {tp_away} ({next_week}주차)", "event")
+        _fill_ko_shell(conn, c, tid, "TP", {999: (tp_home, tp_away, is_my_tp)})
+        add_log(f"🥉 {t['name']} 3/4위전 대진: {tp_home} vs {tp_away}", "event")
 
     conn.commit()
     conn.close()

@@ -971,12 +971,50 @@ def init_db():
         "ALTER TABLE my_player ADD COLUMN sale_push_last_offer_year INTEGER DEFAULT 0",
         "ALTER TABLE my_player ADD COLUMN sale_push_refused_count INTEGER DEFAULT 0",
         "ALTER TABLE my_player ADD COLUMN sale_push_low_score_weeks INTEGER DEFAULT 0",
+        # [2026-07 신설, 신민용 리포트: "맨체스터 유나이티드가 오퍼를
+        # 3461억 → 3343억으로 오히려 낮춰서 다시 제안한다 — 무슨 논리냐"]
+        # 예전엔 오퍼 금액(offer_premium_mult)이 매번 완전히 새로 랜덤
+        # 굴려져서, 같은 팀이 두 번째로 관심을 보일 때도 이전 제안액과
+        # 전혀 무관하게(심지어 더 낮게) 나올 수 있었다 — 실제 이적 협상은
+        # 거절당하면 보통 같거나 더 올려서 재접촉하지 낮춰 부르지 않는다.
+        # 팀별 마지막 제안액을 기억해뒀다가, 같은 팀이 다시 제안할 때
+        # 그 금액 밑으로는 안 내려가게 한다(game_engine._build_offer 참고).
+        "ALTER TABLE my_player ADD COLUMN offer_history_json TEXT DEFAULT '{}'",
+        # [2026-07 신설, 국제대회 일 단위 전환 Phase 1]
+        # intl_matches/cl_matches/cup_matches는 이미 위쪽(862번 줄 부근)
+        # 마이그레이션에서 day 컬럼이 DEFAULT 0으로 추가돼 있다 — 단,
+        # 그건 "내 경기"의 표시용 날짜만 채우는 용도였고(_really_mine일
+        # 때만 _week_intl_cl_day() 결과 저장, 그 외 AI-vs-AI 경기는 전부
+        # 0으로 남음) 이번 국제대회 일정 시스템 전환 목적과는 다르다.
+        # cwc_matches만 그 마이그레이션 대상에서 빠져 있었으므로 여기서
+        # 추가한다 — 다른 셋과 동일하게 nullable로, 아직 NOT NULL 걸지 않음.
+        # (Phase 1.5에서 기존 intl/cl/cup의 "0=미계산" 센티널을 NULL로
+        # 재해석하고, Phase 2 생성기가 모든 경기에 실제 day를 채우는
+        # 순서를 반드시 지킨다 — day 값 범위가 1~364라 0은 항상 무효값이므로
+        # 0→NULL 재해석은 데이터 손실 없이 안전하다.)
+        "ALTER TABLE cwc_matches ADD COLUMN day INTEGER",
     ]:
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,
         #  그 외 진짜 버그로 인한 예외는 숨기지 않는다. 동작은 기존과 동일.)
         try: c.execute(migration)
         except sqlite3.OperationalError: pass
+
+    # [2026-07 신설, 국제대회 일 단위 전환 Phase 1.5] intl_matches/cl_matches/
+    # cup_matches의 day는 기존에 "내 경기가 아니면 0"으로 채워져 있었다
+    # (AI vs AI 경기가 한 라운드에 수백~수천 건이라 _week_intl_cl_day() 호출
+    # 자체를 스킵하는 성능 최적화였음 — intl_engine.py/champions_engine.py/
+    # cup_engine.py의 _sim_ai_match 계열 함수 참고). 0은 day 범위(1~364)에서
+    # 항상 무효값이라 "0번째 날"과 "미계산"을 구분 못 하는 센티널로 오용되고
+    # 있었던 셈이다. 위 세 함수는 이제 0 대신 None을 쓰도록 고쳐서 앞으로는
+    # 이 문제가 재발하지 않지만, 기존에 이미 저장된 행들은 여전히 0으로
+    # 남아있으므로 여기서 한 번 NULL로 재해석한다. day=0인 행이 이미 없으면
+    # UPDATE 0행이라 사실상 무비용 — 매번 실행해도 안전(멱등).
+    for _tbl in ("intl_matches", "cl_matches", "cup_matches"):
+        try:
+            c.execute(f"UPDATE {_tbl} SET day = NULL WHERE day = 0")
+        except sqlite3.OperationalError:
+            pass
 
     # [일 단위 진행 전환] 기존 세이브는 current_day가 이번에 막 1로 추가됐을 뿐
     #   실제 진행 상황(current_week)과 안 맞을 수 있다 — current_week 그대로인데
@@ -2322,11 +2360,14 @@ def _generate_all_ai_players(c, progress_cb=None):
     # 뽑기 결과 그대로 두고 건드리지 않는다.
     for lid, teams in leagues.items():
         n = len(teams)
-        # [2026-07 신설] 완전 무작위 셔플 대신 명문팀 가중 셔플 — 명문팀
-        # (data/prestige_clubs.py)은 강한 team_strength 슬롯을 뽑을 확률이
-        # 훨씬 높지만(PRESTIGE_WEIGHT), 0은 아니라서 가끔 하위권으로도
-        # 떨어질 수 있다("토트넘도 가끔 강등권까지 간다"를 재현).
-        teams_info = [{"prestige": is_prestige(t.get("cname",""), t.get("tier",1), t.get("tname",""))}
+        # [2026-07 v2 확장, 신민용 제안: "명문도 위상이 다른데 이분법이면
+        # 아쉽다 — 3단계(세계적 초명문/빅클럽/전통 강호) 체계가 활용도가
+        # 높다"] data/prestige_clubs.py의 PRESTIGE_TEAMS를 3단계 등급
+        # 구조로 재편했다 — 등급별 가중치는 prestige_weight()가
+        # PRESTIGE_WEIGHT_BY_LEVEL에서 찾아 반환한다(3급=뮌헨/PSG/레알
+        # 등, 2급=첼시/도르트문트 등, 1급=토트넘/레버쿠젠 등, 비명문=1.0).
+        from data.prestige_clubs import prestige_weight
+        teams_info = [{"weight": prestige_weight(t.get("cname", ""), t.get("tname", ""))}
                       for t in teams]
         perm = weighted_team_order(teams_info)   # perm[0]=이번 시즌 최강팀 인덱스, ...
         league_used: set = set()

@@ -354,11 +354,18 @@ def _my_cl_tournament(p, year):
     return get_cl_tournament(year, cont)
 
 
-def get_my_cl_match(week):
-    """이번 주차에 내가 뛸 챔스 경기가 있으면 dict, 없으면 None."""
+def get_my_cl_match(week, day=None, p=None, st=None):
+    """이번 주차(또는 특정 day)에 내가 뛸 챔스 경기가 있으면 dict, 없으면 None.
+
+    [2026-07 최적화, 신민용 리포트: "일 단위 전환 후 전체적으로 렉"] p를
+    넘기면 get_player() 재조회를 생략한다 — center_panel의 하루 셀
+    새로고침이 하루당 여러 번 이런 조회 함수를 부르는데, 그때마다
+    새로 get_player()를 하는 게 누적 지연의 큰 비중을 차지했다."""
     from game_engine import get_player, get_state
-    p = get_player()
-    st = get_state()
+    if p is None:
+        p = get_player()
+    if st is None:
+        st = get_state()
     if not p or not st:
         return None
     tid = p.get("current_team_id", 0)
@@ -374,11 +381,18 @@ def get_my_cl_match(week):
         return None
 
     conn = get_conn()
-    m = conn.execute(
-        """SELECT * FROM cl_matches
-           WHERE tournament_id=? AND week=? AND home_score=-1
-             AND (home_team_id=? OR away_team_id=?)""",
-        (t["id"], week, tid, tid)).fetchone()
+    if day is not None:
+        m = conn.execute(
+            """SELECT * FROM cl_matches
+               WHERE tournament_id=? AND week=? AND home_score=-1
+                 AND (home_team_id=? OR away_team_id=?) AND (day=? OR day IS NULL OR day=0)""",
+            (t["id"], week, tid, tid, day)).fetchone()
+    else:
+        m = conn.execute(
+            """SELECT * FROM cl_matches
+               WHERE tournament_id=? AND week=? AND home_score=-1
+                 AND (home_team_id=? OR away_team_id=?)""",
+            (t["id"], week, tid, tid)).fetchone()
     if not m:
         conn.close()
         return None
@@ -922,7 +936,11 @@ def _sim_ai_match(t, m, my_played=False, conn=None, reason="injury", batch=None)
     # my_played=1인 "내 경기" 행만 읽으므로 AI vs AI 경기에서는 계산 자체가
     # 낭비다(한 라운드당 AI 경기가 수백~수천 건이라 매번 get_player() DB
     # 조회를 아끼는 효과가 크다).
-    day = _week_intl_cl_day(m["week"], get_player() or {}) if m["is_my"] else 0
+    # [2026-07 재수정] "내 경기 아니면 day=None 강제"는 생성 시점에 이미
+    # day가 채워진 경기(향후 챔스도 Phase 2 확장 시 해당)의 값을 시뮬레이션
+    # 순간 지워버리는 회귀 버그가 된다(intl_engine.py에서 실제로 재현·수정된
+    # 것과 동일한 패턴) — 이제 기존 값을 보존한다.
+    day = _week_intl_cl_day(m["week"], get_player() or {}) if m["is_my"] else m.get("day")
 
     _absence = reason if m["is_my"] else None
     _row = (hs, as_, pso_winner, pso_score, day, _absence, m["id"])
@@ -964,7 +982,7 @@ def _winner_of(m):
 # 내 경기 시뮬
 # ─────────────────────────────────────────────
 
-def sim_my_cl_match_as_ai(week, p, reason="injury"):
+def sim_my_cl_match_as_ai(week, p, reason="injury", day=None):
     """[2026-07 신설, 버그수정] 부상 등으로 내가 못 뛸 때 내 챔스 경기를
     AI끼리 시뮬레이션 — cup_engine.sim_my_cup_match_as_ai와 동일한 이유로
     신설(이게 없으면 그 경기가 영원히 미완료로 남아 대회 진행이 멈춘다).
@@ -972,7 +990,7 @@ def sim_my_cl_match_as_ai(week, p, reason="injury"):
     [2026-07 버그수정, 신민용 리포트: "부상으로 경기 못 나갔는데 감독관계가
     그대로다"] game_engine._sim_my_team_match_as_ai와 동일한 이유로,
     이 챔스 AI-대체 경로도 결장 페널티(manager_relation -1)를 적용한다."""
-    info = get_my_cl_match(week)
+    info = get_my_cl_match(week, day=day)
     if not info:
         return
     conn = get_conn()
@@ -988,13 +1006,13 @@ def sim_my_cl_match_as_ai(week, p, reason="injury"):
     update_player(manager_relation=_calc_manager_rel(p, 0, "", played=False, not_played_penalty=2))
 
 
-def simulate_my_cl_match(week, p):
+def simulate_my_cl_match(week, p, day=None):
     """내가 출전하는 챔스 경기."""
     from game_engine import (add_log, get_player, update_player,
                              _player_perf, _my_result, _update_pop, _gen_score,
                              _save_match_detail, _soft_cap,
                              _check_suspended, _roll_red_card, _apply_red_card_dismissal)
-    info = get_my_cl_match(week)
+    info = get_my_cl_match(week, day=day)
     if not info:
         return
     conn = get_conn()

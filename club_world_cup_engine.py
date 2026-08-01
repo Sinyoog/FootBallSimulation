@@ -9,14 +9,15 @@
 열린다 — intl_engine.start_intl_tournament()가 is_wc/is_cont/is_wc_qual가
 전부 False인 해를 감지하면 이 모듈의 start_club_world_cup()을 대신 호출한다.
 
-주차 배분 (10주 안에 넉넉히 들어감):
+주차 배분 (2026-07 v2, 월드컵(world_cup_32)과 완전히 동일한 규칙 재사용):
     43주: 조 추첨
-    44~46주: 조별리그 (팀당 3경기, 1주 1경기)
+    45~46주: 조별리그 (팀당 3경기, day 기반 4일 간격으로 2주 압축)
     47주: 16강
-    48주: 8강
-    49주: 4강
-    50주: 결승 + 3/4위전 (같은 주)
-    51~52주: 여유(버퍼)
+    47주 후반~48주: 8강
+    48주 후반~49주: 4강
+    49주 후반~50주: 결승 + 3/4위전 (라운드 간격 4일)
+    (정확한 day는 constants.TOURNAMENT_SCHEDULE_RULES["world_cup_32"]가
+    결정 — intl_engine.py의 월드컵 32강 체제와 1:1로 동일하다.)
 
 매치 시뮬레이션은 champions_engine._match_outcome/_resolve_pso(순수함수,
 OVR 차이 기반)와 game_engine._gen_score(스코어 생성)를 그대로 재사용한다 —
@@ -31,13 +32,28 @@ OVR 차이 기반)와 game_engine._gen_score(스코어 생성)를 그대로 재�
 
 import random
 from database import get_conn
-from constants import generate_round_robin
+from constants import (
+    generate_round_robin, week_to_day, day_to_week,
+    INTL_GROUP_WEEKS, TOURNAMENT_SCHEDULE_RULES,
+    stage_round_start_day, assign_match_days,
+)
 from champions_engine import _match_outcome, _resolve_pso
 from club_world_cup import get_club_world_cup_field, CWC_QUOTA
 
 CWC_DRAW_WEEK = 43
-CWC_GROUP_WEEKS = (44, 46)                 # 3주(팀당 3경기)
-CWC_KO_WEEK = {"R16": 47, "QF": 48, "SF": 49, "F": 50, "TP": 50}
+# [2026-07 재설계 v2, 신민용 요청: "클럽 월드컵도 월드컵처럼 45주차부터
+# 그룹전, 47주차부터 바로 본선으로, 하루 단위로"] v1(2026-07)에서는 CWC를
+# 44주차부터 자체 상수(CWC_GROUP_START_DAY/CWC_KO_WEEK)로 독자적으로
+# 운영했는데, 그러다 보니 (a) 월드컵보다 한 주 일찍 시작해 시작 시점이
+# 서로 안 맞았고 (b) 토너먼트가 여전히 '그 주 첫날' 단위(요일만 수요일로
+# 밀어둔 수준)라 진짜 하루 단위 압축 간격(라운드 간 4일)까지는 못 갔다.
+# CWC는 32팀·8조·4팀조·16강~결승/3-4위전 구조가 world_cup_32와 완전히
+# 동일하므로, 그 규칙(constants.TOURNAMENT_SCHEDULE_RULES["world_cup_32"])
+# 을 그대로 재사용한다 — anchor(시작일)만 intl_engine과 똑같이
+# INTL_GROUP_WEEKS[0](45주차)로 맞추면, 조별리그 day/주차부터 16강~결승
+# 간격까지 월드컵과 완전히 동일해진다(그룹 2주 압축 + KO 라운드 4일 간격).
+_CWC_TOURNAMENT_TYPE = "world_cup_32"
+CWC_START_DAY = week_to_day(INTL_GROUP_WEEKS[0])
 _STAGE_ORDER = ["R16", "QF", "SF", "F"]
 _GROUP_LABELS = ["A", "B", "C", "D", "E", "F", "G", "H"]
 
@@ -86,6 +102,57 @@ def _seed_groups(all_teams: list) -> list:
                         conts = [t["continent"] for t in groups[gi]]
                         break
     return groups
+
+
+def _precreate_cwc_ko_shell(conn, tid):
+    """[2026-07 신설, 신민용 설계 제안: "경기 자체는 미리 존재하고 참가팀만
+    나중에 확정된다"] 조별리그를 만드는 시점에 16강~결승/3-4위전의 '빈
+    대진' 행을 미리 만들어둔다 — home_team_id/away_team_id를 0(미정
+    sentinel)으로 둔 placeholder다. 실제 진출팀이 정해지면(_build_knockout/
+    _advance_round) 새 행을 INSERT하는 대신 이 placeholder를 UPDATE해서
+    팀 ID만 채워 넣는다(intl_engine._precreate_ko_shell과 동일한 설계).
+    브래킷 크기(16강 8경기→8강 4→4강 2→3/4위전 1→결승 1)는 조별리그
+    결과와 무관하게 항상 고정이라 대회 시작 시점에 전부 계산 가능하다.
+
+    [2026-07 v2, 신민용 요청: "클럽 월드컵도 월드컵처럼 하루 단위로"]
+    day 계산을 CWC 전용 상수 대신 world_cup_32 규칙(TOURNAMENT_SCHEDULE_
+    RULES)에서 그대로 가져온다 — 월드컵과 대회 형태(32팀/8조/16강~결승)가
+    같아서 규칙을 공유해도 결과가 완전히 동일하다(라운드당 4일 간격)."""
+    rows = []
+    for r in TOURNAMENT_SCHEDULE_RULES.get(_CWC_TOURNAMENT_TYPE, []):
+        stage = r["stage"]
+        if stage == "group":
+            continue
+        start_day = stage_round_start_day(_CWC_TOURNAMENT_TYPE, stage, r["round"], CWC_START_DAY)
+        n = r["match_count"]
+        day_list = assign_match_days(start_day, n, r["cap"])
+        for idx in range(n):
+            d = day_list[idx]
+            wk = day_to_week(d)
+            slot = 999 if stage == "TP" else idx
+            rows.append((tid, stage, wk, d, 0, 0, slot))
+    conn.executemany(
+        """INSERT INTO cwc_matches(tournament_id, stage, week, day,
+                                    home_team_id, away_team_id, slot)
+           VALUES(?,?,?,?,?,?,?)""", rows)
+
+
+def _fill_cwc_ko_shell(conn, tid, stage, fills):
+    """_precreate_cwc_ko_shell로 미리 만들어둔 그 stage의 placeholder 행에
+    실제 팀 ID를 채워 넣는다(slot으로 매칭). placeholder가 없으면(과거
+    세이브 호환 등 예외) 그 slot만 새로 INSERT해서 안전하게 폴백한다.
+    fills: {slot: (home_team_id, away_team_id, is_my)}"""
+    for slot, (home, away, is_my) in fills.items():
+        cur = conn.execute(
+            """UPDATE cwc_matches SET home_team_id=?, away_team_id=?, is_my=?
+               WHERE tournament_id=? AND stage=? AND slot=?""",
+            (home, away, is_my, tid, stage, slot))
+        if cur.rowcount == 0:
+            conn.execute(
+                """INSERT INTO cwc_matches(tournament_id, stage, week, day,
+                                            home_team_id, away_team_id, is_my, slot)
+                   VALUES(?,?,1,NULL,?,?,?,?)""",
+                (tid, stage, home, away, is_my, slot))
 
 
 def start_club_world_cup(year: int):
@@ -137,17 +204,26 @@ def start_club_world_cup(year: int):
                 (tid, t["team_id"], t["team_name"], "", t["country"], t["continent"],
                  label, "", ovr))
         # 조별리그 대진 (4팀 단일 라운드로빈 = 3라운드, 라운드당 2경기)
+        # [2026-07 v2] day 계산을 world_cup_32의 조별리그 규칙에서 그대로
+        # 가져온다 — 월드컵과 정확히 같은 날짜/주차(45~46주, 2주 압축)로
+        # 진행된다(신민용 요청: "클럽 월드컵도 월드컵처럼").
         rounds = generate_round_robin(4)
         for r_idx, pairs in enumerate(rounds):
-            week = CWC_GROUP_WEEKS[0] + r_idx
+            day_val = stage_round_start_day(_CWC_TOURNAMENT_TYPE, "group", r_idx + 1, CWC_START_DAY)
+            week = day_to_week(day_val)
             for a, b in pairs:
                 home, away = g[a]["team_id"], g[b]["team_id"]
                 is_my = 1 if my_tid in (home, away) else 0
                 conn.execute(
-                    """INSERT INTO cwc_matches(tournament_id, stage, week,
+                    """INSERT INTO cwc_matches(tournament_id, stage, week, day,
                                                 home_team_id, away_team_id, is_my, grp)
-                       VALUES(?,?,?,?,?,?,?)""",
-                    (tid, "group", week, home, away, is_my, label))
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (tid, "group", week, day_val, home, away, is_my, label))
+
+    # [2026-07 신설] 조별리그가 끝나기도 전에 16강~결승/3-4위전의 '빈
+    # 대진'을 미리 만들어둔다 — 자세한 이유는 _precreate_cwc_ko_shell 참고.
+    _precreate_cwc_ko_shell(conn, tid)
+
     conn.commit()
     conn.close()
     print(f"[PERF] 클럽월드컵 생성 총 {time.perf_counter()-_t0:.2f}s")
@@ -178,33 +254,99 @@ def _sim_one(conn, m):
                  (hs, as_, m["id"]))
 
 
-def process_cwc_week(week: int):
-    """게임 주간 진행 루프에서 호출. 이번 주에 해당하는 cwc_matches를 전부 시뮬."""
+def process_cwc_week(week: int, day=None):
+    """게임 주간 진행 루프에서 호출. 이번 주(또는 day)까지의 cwc_matches를 시뮬.
+
+    [2026-07 재설계, 신민용 요청: "클럽 월드컵도 1주 단위로, 그룹전은
+    2주 안에 3경기"] 조별리그 3라운드가 이제 day 기반(4일 간격)으로
+    배정돼 44주와 45주에 걸쳐 나뉠 수 있다 — 그래서 예전처럼 "week ==
+    그룹 마지막 주(46)"라는 고정값으로 그룹 종료를 판정하면 더는 맞지
+    않는다. intl_engine._process_one_tournament_week와 동일하게, 남은
+    미완료 경기 유무로 "그 단계가 실제로 끝났는지"를 직접 판정한다 —
+    몇 주에 걸치든 항상 정확하다.
+    day를 넘기면 아직 실제 날짜가 안 된(day가 미래인) 경기는 건드리지
+    않고, 그날이 와서 advance_days의 정상 경로가 처리하게 둔다(intl_engine
+    과 동일한 이유 — process_intl_week 버그수정 주석 참고)."""
     conn = get_conn()
     t = conn.execute(
         "SELECT * FROM cwc_tournaments WHERE status!='done' "
-        "AND id IN (SELECT DISTINCT tournament_id FROM cwc_matches WHERE week=?)",
+        "AND id IN (SELECT DISTINCT tournament_id FROM cwc_matches WHERE week<=?)",
         (week,)).fetchone()
     if not t:
         conn.close()
         return
-    matches = conn.execute(
-        "SELECT * FROM cwc_matches WHERE tournament_id=? AND week=? AND home_score=-1",
-        (t["id"], week)).fetchall()
+    tid = t["id"]
+    # [2026-07 안전장치] home_team_id/away_team_id=0은 아직 참가팀이
+    # 확정 안 된 placeholder(_precreate_cwc_ko_shell) — 팀 없는 경기를
+    # 시뮬하면 크래시하므로 여기서 제외한다. 진출이 확정되면
+    # _fill_cwc_ko_shell이 채워 넣은 뒤에야 이 조회에 걸린다.
+    if day is not None:
+        matches = conn.execute(
+            """SELECT * FROM cwc_matches WHERE tournament_id=? AND home_score=-1
+               AND home_team_id!=0 AND away_team_id!=0
+               AND ((day IS NOT NULL AND day<=?) OR (day IS NULL AND week<=?))""",
+            (tid, day, week)).fetchall()
+    else:
+        matches = conn.execute(
+            """SELECT * FROM cwc_matches WHERE tournament_id=? AND week<=? AND home_score=-1
+               AND home_team_id!=0 AND away_team_id!=0""",
+            (tid, week)).fetchall()
     for m in matches:
         _sim_one(conn, dict(m))
     conn.commit()
 
-    if week == CWC_GROUP_WEEKS[1]:
-        _finalize_group_stage(dict(t))
-    elif week in CWC_KO_WEEK.values():
-        stage = [s for s, w in CWC_KO_WEEK.items() if w == week and s != "F"]
-        # F/TP는 같은 주라 별도 분기(둘 다 이번 주에 이미 매치가 깔려 있음)
-        if week == CWC_KO_WEEK["F"]:
-            _finish_tournament(dict(t))
-        elif stage:
-            _advance_round(dict(t), stage[0])
+    status = t["status"]
+    if status == "group":
+        group_pending = conn.execute(
+            "SELECT COUNT(*) n FROM cwc_matches WHERE tournament_id=? AND stage='group' AND home_score=-1",
+            (tid,)).fetchone()["n"]
+        if group_pending == 0:
+            conn.close()
+            _finalize_group_stage(dict(t))
+            return
+        conn.close()
+        return
+
+    if status != "ko":
+        conn.close()
+        return
+
+    # [2026-07 재설계, KO 셸 사전생성에 맞춰 재작성] 이제 R16~결승/3-4위전
+    # 전 스테이지가 대회 시작 시점에 이미 placeholder(home_team_id=0)로
+    # 존재한다 — 예전처럼 "stage!='group'인 미완료 행이 있으면 할 게
+    # 없다"고 판단하면 대회 내내 이 조건이 항상 참이 돼서 다음 라운드
+    # 대진이 영원히 안 채워진다(intl_engine.py의 동일 버그와 같은 원인).
+    # _STAGE_ORDER를 순서대로 훑으며 "채워졌는지(home_team_id!=0)"와
+    # "다 끝났는지(home_score!=-1)"를 직접 확인한다.
+    def _stage_rows(stage):
+        return conn.execute(
+            "SELECT home_team_id, home_score FROM cwc_matches WHERE tournament_id=? AND stage=?",
+            (tid, stage)).fetchall()
+
+    for i, cur_stage in enumerate(_STAGE_ORDER[:-1]):
+        rows = _stage_rows(cur_stage)
+        if not rows:
+            continue
+        if any(r["home_team_id"] == 0 for r in rows):
+            conn.close()
+            return
+        if any(r["home_score"] == -1 for r in rows):
+            conn.close()
+            return
+        nxt = _STAGE_ORDER[i + 1]
+        next_rows = _stage_rows(nxt)
+        if next_rows and all(r["home_team_id"] == 0 for r in next_rows):
+            conn.close()
+            _advance_round(dict(t), cur_stage)
+            return
+
+    f_rows = _stage_rows("F")
+    tp_rows = _stage_rows("TP")
     conn.close()
+    f_done = bool(f_rows) and all(r["home_team_id"] != 0 and r["home_score"] != -1 for r in f_rows)
+    tp_done = (not tp_rows) or all(r["home_team_id"] != 0 and r["home_score"] != -1 for r in tp_rows)
+    if f_done and tp_done:
+        _finish_tournament(dict(t))
 
 
 def _group_standings(conn, tid, grp):
@@ -252,14 +394,15 @@ def _finalize_group_stage(t):
 
 
 def _build_knockout(conn, tid, qualifier_ids):
-    """16팀을 시드 순서(조 1위끼리/2위끼리 안 붙게 스네이크)로 16강 대진."""
+    """16팀을 시드 순서(조 1위끼리/2위끼리 안 붙게 스네이크)로 16강 대진.
+    [2026-07 재설계] 새 행을 INSERT하는 대신, 대회 생성 시점에
+    _precreate_cwc_ko_shell이 미리 만들어둔 R16 placeholder를 slot
+    번호로 채운다("경기는 미리 존재, 참가팀만 나중에 확정")."""
     random.shuffle(qualifier_ids)   # 조 추첨식 랜덤 매칭(간단화)
-    week = CWC_KO_WEEK["R16"]
-    for i in range(0, 16, 2):
-        conn.execute(
-            "INSERT INTO cwc_matches(tournament_id, stage, week, home_team_id, away_team_id) "
-            "VALUES(?,?,?,?,?)",
-            (tid, "R16", week, qualifier_ids[i], qualifier_ids[i + 1]))
+    fills = {}
+    for slot, i in enumerate(range(0, 16, 2)):
+        fills[slot] = (qualifier_ids[i], qualifier_ids[i + 1], 0)
+    _fill_cwc_ko_shell(conn, tid, "R16", fills)
 
 
 def _round_winner(m):
@@ -273,16 +416,17 @@ def _round_winner(m):
 def _advance_round(t, cur_stage):
     conn = get_conn()
     matches = conn.execute(
-        "SELECT * FROM cwc_matches WHERE tournament_id=? AND stage=? ORDER BY id",
+        "SELECT * FROM cwc_matches WHERE tournament_id=? AND stage=? ORDER BY slot",
         (t["id"], cur_stage)).fetchall()
     winners = [_round_winner(dict(m)) for m in matches]
     nxt = _STAGE_ORDER[_STAGE_ORDER.index(cur_stage) + 1]
-    week = CWC_KO_WEEK[nxt]
-    for i in range(0, len(winners), 2):
-        conn.execute(
-            "INSERT INTO cwc_matches(tournament_id, stage, week, home_team_id, away_team_id) "
-            "VALUES(?,?,?,?,?)",
-            (t["id"], nxt, week, winners[i], winners[i + 1]))
+    # [2026-07 재설계] day/week는 더 이상 여기서 계산하지 않는다 —
+    # _precreate_cwc_ko_shell이 대회 생성 시점에 이미 배정해뒀다. 여기서는
+    # 승자 팀 ID만 slot 번호로 매칭해 placeholder를 채운다.
+    fills = {}
+    for slot, i in enumerate(range(0, len(winners), 2)):
+        fills[slot] = (winners[i], winners[i + 1], 0)
+    _fill_cwc_ko_shell(conn, t["id"], nxt, fills)
     # [2026-07 버그수정, 신민용 리포트: "결승전은 상대가 미리 보이는데
     # 3/4위전은 경기 끝나야 나온다"] 예전엔 TP 매치 생성을 _finish_tournament
     # (F/TP를 곧바로 시뮬하는 함수) 진입 시점까지 미뤄서, TP 행이 DB에
@@ -290,17 +434,12 @@ def _advance_round(t, cur_stage):
     # "매치업은 정해졌지만 아직 안 뛴" 상태가 존재할 틈이 없었다.
     # champions_engine.py(챔스)는 SF가 끝나는 즉시 F와 TP를 둘 다
     # -1,-1(미완료) 매치로 만들어둬서 그 사이에 대진표가 미리 보인다 —
-    # 여기도 SF→F 전환 시점에 TP를 똑같이 즉시 생성한다(패자끼리, 결승과
-    # 같은 주차, -1,-1 미완료 상태로).
+    # 여기도 SF→F 전환 시점에 TP를 똑같이 즉시 채운다(패자끼리).
     if cur_stage == "SF":
         losers = [m["away_team_id"] if _round_winner(dict(m)) == m["home_team_id"] else m["home_team_id"]
                   for m in matches]
         if len(losers) == 2:
-            tp_week = CWC_KO_WEEK["TP"]
-            conn.execute(
-                "INSERT INTO cwc_matches(tournament_id, stage, week, home_team_id, away_team_id) "
-                "VALUES(?,'TP',?,?,?)",
-                (t["id"], tp_week, losers[0], losers[1]))
+            _fill_cwc_ko_shell(conn, t["id"], "TP", {999: (losers[0], losers[1], 0)})
     conn.commit()
     conn.close()
 
@@ -317,22 +456,27 @@ def _finish_tournament(t):
     from game_engine import add_log, get_player
     conn = get_conn()
     # [2026-07 버그수정] TP는 이제 _advance_round(SF→F 전환 시점)에서
-    # 이미 만들어져 있는 게 정상 경로다 — 여기선 방어적으로만(과거 세이브
-    # 호환 등 예외 상황 대비) 없으면 만든다.
-    sf = conn.execute("SELECT * FROM cwc_matches WHERE tournament_id=? AND stage='SF' ORDER BY id",
+    # 이미 채워져 있는 게 정상 경로다 — 여기선 방어적으로만(과거 세이브
+    # 호환 등 예외 상황 대비) 아직 안 채워져 있으면(팀ID가 placeholder인
+    # 0) 채운다. [2026-07 재설계] TP 행 자체는 대회 생성 시점에
+    # _precreate_cwc_ko_shell이 이미 만들어뒀으므로 "행이 없으면"이 아니라
+    # "아직 안 채워졌으면"으로 조건을 바꿨다.
+    sf = conn.execute("SELECT * FROM cwc_matches WHERE tournament_id=? AND stage='SF' ORDER BY slot",
                        (t["id"],)).fetchall()
-    if sf and not conn.execute(
-            "SELECT 1 FROM cwc_matches WHERE tournament_id=? AND stage='TP'", (t["id"],)).fetchone():
+    tp_row = conn.execute(
+        "SELECT * FROM cwc_matches WHERE tournament_id=? AND stage='TP'", (t["id"],)).fetchone()
+    if sf and (not tp_row or tp_row["home_team_id"] == 0):
         losers = [m["away_team_id"] if _round_winner(dict(m)) == m["home_team_id"] else m["home_team_id"]
                   for m in sf]
-        conn.execute("INSERT INTO cwc_matches(tournament_id,stage,week,home_team_id,away_team_id) "
-                     "VALUES(?,'TP',?,?,?)", (t["id"], CWC_KO_WEEK["TP"], losers[0], losers[1]))
+        _fill_cwc_ko_shell(conn, t["id"], "TP", {999: (losers[0], losers[1], 0)})
         conn.commit()
 
     # 결승/3-4위전 중 아직 안 뛴 것만 시뮬 (멱등 — is_my 경기는 이미
     # simulate_my_cwc_match가 앞서 채워놨을 수 있으므로 그건 건드리지 않음)
+    # [2026-07 안전장치] home_team_id=0(아직 안 채워진 placeholder)은
+    # 시뮬 대상에서 제외 — team_id 0으로 cwc_entries를 조회하면 크래시.
     for m in conn.execute("SELECT * FROM cwc_matches WHERE tournament_id=? AND stage IN ('F','TP') "
-                           "AND home_score=-1", (t["id"],)).fetchall():
+                           "AND home_score=-1 AND home_team_id!=0", (t["id"],)).fetchall():
         _sim_one(conn, dict(m))
     conn.commit()
 
@@ -686,13 +830,18 @@ def has_my_cwc_match_between(week_from, week_to):
     return False
 
 
-def get_my_cwc_match(week: int):
-    """이번 주차에 내가 뛸 클럽월드컵 경기가 있으면 dict, 없으면 None.
+def get_my_cwc_match(week: int, day=None, p=None, st=None):
+    """이번 주차(또는 특정 day)에 내가 뛸 클럽월드컵 경기가 있으면 dict, 없으면 None.
     champions_engine.get_my_cl_match와 동일한 반환 형식(키 이름까지)으로
-    맞췄다 — game_engine.py의 im/cm 패턴에 그대로 cw로 끼워넣기 위함."""
+    맞췄다 — game_engine.py의 im/cm 패턴에 그대로 cw로 끼워넣기 위함.
+
+    [2026-07 최적화, 신민용 리포트: "일 단위 전환 후 전체적으로 렉"] p를
+    넘기면 get_player() 재조회를 생략한다."""
     from game_engine import get_player, get_state
-    p = get_player()
-    st = get_state()
+    if p is None:
+        p = get_player()
+    if st is None:
+        st = get_state()
     if not p or not st:
         return None
     tid = p.get("current_team_id", 0)
@@ -709,10 +858,17 @@ def get_my_cwc_match(week: int):
     if not reg_tid or reg_tid != tid:
         conn.close()
         return None
-    m = conn.execute(
-        """SELECT * FROM cwc_matches
-           WHERE tournament_id=? AND week=? AND home_score=-1
-             AND (home_team_id=? OR away_team_id=?)""",
+    if day is not None:
+        m = conn.execute(
+            """SELECT * FROM cwc_matches
+               WHERE tournament_id=? AND week=? AND home_score=-1
+                 AND (home_team_id=? OR away_team_id=?) AND (day=? OR day IS NULL)""",
+            (t["id"], week, tid, tid, day)).fetchone()
+    else:
+        m = conn.execute(
+            """SELECT * FROM cwc_matches
+               WHERE tournament_id=? AND week=? AND home_score=-1
+                 AND (home_team_id=? OR away_team_id=?)""",
         (t["id"], week, tid, tid)).fetchone()
     if not m:
         conn.close()
@@ -741,7 +897,76 @@ def get_my_cwc_match(week: int):
     }
 
 
-def sim_my_cwc_match_as_ai(week, p, reason="injury"):
+def get_my_pending_stage(week, day=None, p=None, st=None):
+    """[2026-07 신설] intl_engine.get_my_pending_stage와 동일한 목적 —
+    클럽월드컵도 이제 대회 시작 시점에 16강~결승/3-4위전 전체가
+    placeholder(home_team_id=0)로 미리 생성돼 있다
+    (_precreate_cwc_ko_shell 참고). get_my_cwc_match는 내 팀이 실제로
+    배정된 행만 찾으므로, 아직 대진이 안 정해진 날엔 이 함수가 "미정"
+    표시용 정보를 대신 돌려준다.
+
+    탈락 판정: cwc_tournaments.my_team_id는 대회 시작 시 한 번 정해지면
+    탈락해도 안 바뀌므로(단순 등록 기록용), intl_entries.alive 같은
+    플래그가 없다 — 대신 내 팀이 참여한 가장 최근 '완료된' KO 경기에서
+    졌는지로 직접 판정한다(졌으면 그 뒤로는 더 이상 내 대회가 아님).
+
+    [2026-07 최적화] p를 넘기면 get_player() 재조회를 생략한다."""
+    from game_engine import get_player, get_state
+    if p is None:
+        p = get_player()
+    if st is None:
+        st = get_state()
+    if not p or not st or day is None:
+        return None
+    tid = p.get("current_team_id", 0)
+    if not tid:
+        return None
+    conn = get_conn()
+    t = conn.execute(
+        "SELECT * FROM cwc_tournaments WHERE year=? AND status!='done'",
+        (st["current_year"],)).fetchone()
+    if not t or t["my_team_id"] != tid:
+        conn.close()
+        return None
+    last_ko = conn.execute(
+        """SELECT * FROM cwc_matches WHERE tournament_id=? AND stage!='group'
+           AND home_score!=-1 AND (home_team_id=? OR away_team_id=?)
+           ORDER BY day DESC LIMIT 1""",
+        (t["id"], tid, tid)).fetchone()
+    if last_ko and _round_winner(dict(last_ko)) != tid:
+        conn.close()
+        return None   # 가장 최근 KO 경기에서 짐 = 탈락, 더 표시 안 함
+    m = conn.execute(
+        """SELECT * FROM cwc_matches WHERE tournament_id=? AND day=?
+           AND stage!='group' AND (home_team_id=0 OR away_team_id=0) LIMIT 1""",
+        (t["id"], day)).fetchone()
+    if m and m["stage"] in ("F", "TP"):
+        # 결승/3-4위전은 서로 배타적 — intl_engine과 동일 이유.
+        other_stage = "TP" if m["stage"] == "F" else "F"
+        other_row = conn.execute(
+            "SELECT home_team_id, away_team_id FROM cwc_matches WHERE tournament_id=? AND stage=?",
+            (t["id"], other_stage)).fetchone()
+        if other_row and tid in (other_row["home_team_id"], other_row["away_team_id"]):
+            conn.close()
+            return None
+    conn.close()
+    if not m:
+        return None
+    stage_ko = {"R16": "16강", "QF": "8강", "SF": "4강",
+                "F": "결승", "TP": "3/4위전"}.get(m["stage"], m["stage"])
+    return {
+        "cwc": True,
+        "pending": True,
+        "match_id": m["id"],
+        "tournament_id": t["id"],
+        "league_name": "클럽 월드컵",
+        "stage": m["stage"],
+        "stage_ko": stage_ko,
+        "week": week,
+    }
+
+
+def sim_my_cwc_match_as_ai(week, p, reason="injury", day=None):
     """부상 등으로 내가 못 뛸 때 내 클럽월드컵 경기를 AI끼리 시뮬 —
     champions_engine.sim_my_cl_match_as_ai와 동일한 이유(안 하면 대회
     진행이 멈춤).
@@ -749,7 +974,7 @@ def sim_my_cwc_match_as_ai(week, p, reason="injury"):
     [2026-07 버그수정, 신민용 리포트: "부상으로 경기 못 나갔는데 감독관계가
     그대로다"] game_engine._sim_my_team_match_as_ai와 동일한 이유로,
     이 CWC AI-대체 경로도 결장 페널티(manager_relation -1)를 적용한다."""
-    info = get_my_cwc_match(week)
+    info = get_my_cwc_match(week, day=day)
     if not info:
         return
     conn = get_conn()
@@ -764,14 +989,14 @@ def sim_my_cwc_match_as_ai(week, p, reason="injury"):
     update_player(manager_relation=_calc_manager_rel(p, 0, "", played=False, not_played_penalty=2))
 
 
-def simulate_my_cwc_match(week, p):
+def simulate_my_cwc_match(week, p, day=None):
     """내가 직접 뛰는 클럽월드컵 경기 — champions_engine.simulate_my_cl_match와
     동일한 패턴(개인 스탯 반영 + 클릭 가능한 매치 로그)을 그대로 따른다."""
     from game_engine import (add_log, get_player, update_player,
                              _player_perf, _my_result, _update_pop, _gen_score,
                              _save_match_detail, _soft_cap,
                              _check_suspended, _roll_red_card, _apply_red_card_dismissal)
-    info = get_my_cwc_match(week)
+    info = get_my_cwc_match(week, day=day)
     if not info:
         return
     conn = get_conn()

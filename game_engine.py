@@ -300,7 +300,7 @@ def set_state(**kw):
 # 매번 똑같은 값을 다시 계산하고 있었다는 뜻).
 _week_intl_cl_day_cache: dict = {}
 
-def _week_intl_cl_day(week: int, p: dict) -> int:
+def _week_intl_cl_day(week: int, p: dict, st: dict = None) -> int:
     """[2026-07 버그 수정] 국제대회/챔스는 'week' 단위로만 저장돼(day 컬럼
     없음), 화면 표시는 '그 주 마지막 날'로 보여주면서 실제 진행
     (advance_days)은 그 주 국내 경기가 없는 '아무 날짜'에나(사실상 항상
@@ -318,9 +318,12 @@ def _week_intl_cl_day(week: int, p: dict) -> int:
     편성되는 것과 같은 원리.
 
     [2026-07 성능 수정] (week, 내 팀, 내 시즌)이 같으면 결과도 항상
-    같으므로 캐시한다 — 위 모듈 docstring 참고."""
+    같으므로 캐시한다 — 위 모듈 docstring 참고.
+
+    [2026-07 추가 최적화] st를 넘기면 get_state() 재조회를 생략한다."""
     tid = p.get("current_team_id", 0)
-    st = get_state()
+    if st is None:
+        st = get_state()
     cur_season = st["current_season"] if st else 0
     cache_key = (week, tid, cur_season)
     cached = _week_intl_cl_day_cache.get(cache_key)
@@ -1329,65 +1332,69 @@ def advance_days(schedule: list):
             # 날 분기)과 동일한 방식으로 오늘이 어떤 대회 경기 날인지 먼저
             # 확인하고, 그 대회에 맞는 AI-대체 시뮬레이션을 호출한다.
             if isinstance(detail, dict) and detail.get("intl"):
-                intl_engine.sim_my_match_as_ai(week, p, reason="injury")
+                intl_engine.sim_my_match_as_ai(week, p, reason="injury", day=day)
             elif isinstance(detail, dict) and detail.get("cl"):
-                champions_engine.sim_my_cl_match_as_ai(week, p, reason="injury")
+                champions_engine.sim_my_cl_match_as_ai(week, p, reason="injury", day=day)
             elif isinstance(detail, dict) and detail.get("cup"):
-                cup_engine.sim_my_cup_match_as_ai(week, p, reason="injury")
+                cup_engine.sim_my_cup_match_as_ai(week, p, reason="injury", day=day)
             elif isinstance(detail, dict) and detail.get("cwc"):
-                club_world_cup_engine.sim_my_cwc_match_as_ai(week, p, reason="injury")
+                club_world_cup_engine.sim_my_cwc_match_as_ai(week, p, reason="injury", day=day)
             elif stype == "경기":
                 _sim_my_team_match_as_ai(week, p, cur_season)
             else:
+                # [2026-07 재수정] intl_matches(예선/본선)와 cwc_matches는
+                # 이제 둘 다 Phase 2로 실제 day가 있어 day로 직접 확인한다.
+                # cl/cup_matches는 아직 day가 전부 0(스키마 기본값)이라
+                # day만으로 걸러지지 않아 여전히 _week_intl_cl_day가 정한
+                # '그 주의 딱 하루'에만 확인한다.
                 _intl_cl_day = _week_intl_cl_day(week, p)
-                if day == _intl_cl_day and intl_engine.get_my_match(week):
-                    intl_engine.sim_my_match_as_ai(week, p, reason="injury")
-                elif day == _intl_cl_day and champions_engine.get_my_cl_match(week):
-                    champions_engine.sim_my_cl_match_as_ai(week, p, reason="injury")
-                elif day == _intl_cl_day and cup_engine.get_my_cup_match(week):
-                    cup_engine.sim_my_cup_match_as_ai(week, p, reason="injury")
-                elif day == _intl_cl_day and club_world_cup_engine.get_my_cwc_match(week):
-                    club_world_cup_engine.sim_my_cwc_match_as_ai(week, p, reason="injury")
+                if intl_engine.get_my_match(week, day=day):
+                    intl_engine.sim_my_match_as_ai(week, p, reason="injury", day=day)
+                elif day == _intl_cl_day and champions_engine.get_my_cl_match(week, day=day):
+                    champions_engine.sim_my_cl_match_as_ai(week, p, reason="injury", day=day)
+                elif day == _intl_cl_day and cup_engine.get_my_cup_match(week, day=day):
+                    cup_engine.sim_my_cup_match_as_ai(week, p, reason="injury", day=day)
+                elif club_world_cup_engine.get_my_cwc_match(week, day=day):
+                    club_world_cup_engine.sim_my_cwc_match_as_ai(week, p, reason="injury", day=day)
                 else:
                     _sim_my_unscheduled_match(week, p, cur_season, day=day)
         elif stype == "경기":
             _had_match = True
             if isinstance(detail, dict) and detail.get("intl"):
-                intl_engine.simulate_my_match(week, p)
+                intl_engine.simulate_my_match(week, p, day=day)
             elif isinstance(detail, dict) and detail.get("cl"):
-                champions_engine.simulate_my_cl_match(week, p)
+                champions_engine.simulate_my_cl_match(week, p, day=day)
             elif isinstance(detail, dict) and detail.get("cup"):
                 cup_engine.simulate_my_cup_match(week, p, day=day)
             elif isinstance(detail, dict) and detail.get("cwc"):
-                club_world_cup_engine.simulate_my_cwc_match(week, p)
+                club_world_cup_engine.simulate_my_cwc_match(week, p, day=day)
             else:
                 _simulate_match(p, week, detail, day=day)
         else:
-            # [2026-07 버그 수정] 예전엔 im/cm을 week 단위로만 조회해서, 그 주
-            # 안의 '국내 경기가 아닌 아무 날'에나(사실상 항상 그 주 첫날)
-            # 자동으로 걸려버렸다 — 화면(_get_match_for_day)이 보여주는
-            # 날짜와 실제 처리되는 날짜가 어긋났었다. 이제 _week_intl_cl_day로
-            # 정한 '그 주의 정확한 그 날'인지 먼저 확인하고, 맞는 날에만
-            # 처리한다(다른 날엔 원래 계획대로 훈련/휴식이 정상 진행됨).
-            # 컵대회는 CUP_ROUND_WEEKS_POOL이 챔스 주차와 거의 안 겹치게
-            # 짜여 있지만, 같은 함수로 국내 경기와의 요일 충돌은 여전히 피한다.
+            # [2026-07 재수정] intl_matches(예선/본선)와 cwc_matches는 이제
+            # 둘 다 Phase 2로 실제 day가 있어 day로 직접 확인한다. cl/cup_
+            # matches는 아직 day가 전부 0(스키마 기본값)이라 day만으로
+            # 걸러지지 않는다(그 주 아무 날에나 걸림 → 메인화면에 같은
+            # 미완료 경기가 여러 날 반복 표시되는 원인이었다). day가 있는
+            # intl/cwc만 day로 직접 확인하고, 아직 없는 챔스/컵은 예전처럼
+            # _week_intl_cl_day가 정한 '그 주의 딱 하루'에만 확인한다.
             _intl_cl_day = _week_intl_cl_day(week, p)
-            im = intl_engine.get_my_match(week) if day == _intl_cl_day else None
-            cm = champions_engine.get_my_cl_match(week) if day == _intl_cl_day else None
-            cu = cup_engine.get_my_cup_match(week) if day == _intl_cl_day else None
-            cw = club_world_cup_engine.get_my_cwc_match(week) if day == _intl_cl_day else None
+            im = intl_engine.get_my_match(week, day=day)
+            cm = champions_engine.get_my_cl_match(week, day=day) if day == _intl_cl_day else None
+            cu = cup_engine.get_my_cup_match(week, day=day) if day == _intl_cl_day else None
+            cw = club_world_cup_engine.get_my_cwc_match(week, day=day)
             if im:
                 _had_match = True
-                intl_engine.simulate_my_match(week, p)
+                intl_engine.simulate_my_match(week, p, day=day)
             elif cm:
                 _had_match = True
-                champions_engine.simulate_my_cl_match(week, p)
+                champions_engine.simulate_my_cl_match(week, p, day=day)
             elif cu:
                 _had_match = True
                 cup_engine.simulate_my_cup_match(week, p, day=day)
             elif cw:
                 _had_match = True
-                club_world_cup_engine.simulate_my_cwc_match(week, p)
+                club_world_cup_engine.simulate_my_cwc_match(week, p, day=day)
             else:
                 _process_training(p, week, stype, detail, day=day)
                 _sim_my_unscheduled_match(week, p, cur_season, day=day)
@@ -1396,6 +1403,32 @@ def advance_days(schedule: list):
         next_day = day + 1
         if next_day > 364:
             next_day = 1
+
+        # [2026-07 신설, 신민용 리포트: "4강이랑 3/4위전이 안 뜬다"] 국제대회는
+        # 이제 Phase 2로 실제 day 기반 일정이 있어서, 어느 요일에든 그
+        # 단계(예: 8강)가 실제로 끝나면 곧바로 다음 단계(4강)가 생성돼야
+        # 한다. 그런데 process_intl_week가 그 주 '마지막 날'에만 불리면,
+        # 8강이 주 첫날(day330)에 끝나도 4강 생성은 그 주 끝(day336)까지
+        # 미뤄진다 — 근데 4강 경기 자체는 그 사이 어느 날(day334)로 이미
+        # 배정돼 있어서, 4강이 실제로 만들어지기도 전에 그 날짜가
+        # 지나가버린다(화면엔 아무것도 안 뜨고, 나중에 뒤늦게 생겨도 이미
+        # 지나간 day를 찾는 조회는 영원히 실패해 AI 처리로 샌다 — 실제
+        # 세이브에서 재현·확인됨). 그래서 국제대회만 따로 떼어내 매일
+        # 호출한다 — 내부적으로 이미 pending만 골라서 처리하는 멱등
+        # 구조라 안 할 일이 있는 날엔 비용이 거의 없다.
+        intl_engine.process_intl_week(week, day=day)
+
+        # [2026-07 버그수정, 신민용 리포트: "하루씩 실행하면 나만 실행하고
+        # 다른 날짜들은 멈춰 있어 다음주 올 때까지"] process_cwc_week는
+        # 이미 process_intl_week와 똑같이 day 기반으로 "그날까지 온
+        # 미완료 경기만" 멱등하게 처리하도록 설계돼 있었다(자기 docstring
+        # 에도 그렇게 써있음) — 그런데 정작 호출부는 여태 week 마지막
+        # 날에만 불렀다. 그래서 내 16강 경기는 그날 바로 처리되는데,
+        # 같은 주 다른 날짜에 걸린 AI끼리의 16강 경기들은 그 주가 끝날
+        # 때까지 전혀 시뮬되지 않고 그대로 멈춰 있었다(8강 대진도 그
+        # 여파로 "미정"인 채 굳어있게 됨). intl_engine과 동일하게 매일
+        # 부른다 — 처리할 게 없는 날엔 비용이 거의 없다.
+        club_world_cup_engine.process_cwc_week(week, day=day)
 
         _do_flush = False
         if is_week_last_day:
@@ -1407,11 +1440,12 @@ def advance_days(schedule: list):
             # 조용하고, 실제로 느린 주에만 세부 내역이 보인다.
             import time as _time_mod
             _pw_t0 = _time_mod.perf_counter()
-            intl_engine.process_intl_week(week)
+            # intl_engine.process_intl_week(week)는 위에서 이미 매일 호출함
             _pw_t1 = _time_mod.perf_counter()
             champions_engine.process_cl_week(week)
             _pw_t2 = _time_mod.perf_counter()
-            club_world_cup_engine.process_cwc_week(week)
+            # club_world_cup_engine.process_cwc_week(week, day=day)는
+            # 위에서 이미 매일 호출함 (2026-07 버그수정, 위 주석 참고)
             _pw_t3 = _time_mod.perf_counter()
             cup_engine.process_cup_week(week)
             _pw_t4 = _time_mod.perf_counter()
@@ -3602,7 +3636,23 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None):
     if my_score < opp_score and "losing_rating" in _pe:
         base += _pe["losing_rating"]
 
-    rating = max(3.0, min(10.0, round(base + random.uniform(-0.15, 0.15), 1)))
+    _raw_rating = base + random.uniform(-0.15, 0.15)
+    # [2026-07 버그수정, 신민용 리포트: "챔스 평점이 9.5/10.0이 너무
+    # 흔하다 — 현실에선 10점은 시즌에 한두 번 나오는 수준"] 실측(OVR100
+    # CM vs 평균OVR88 상대)해보니 10.0이 30%, 9.5가 37%로 찍혔다 — 원인은
+    # 압도적인 선수의 base가 이미 9.3~10을 넘나드는데 노이즈가 ±0.15로
+    # 좁아서, "그냥 좋은 경기"와 "역대급 경기"가 똑같이 하드캡(10.0)에
+    # 뭉개져버렸기 때문. base가 9.3을 넘는 초과분을 압축(soft-cap)해서,
+    # 9.5~10.0을 받으려면 노이즈 없이도 base가 원래 훨씬 더 높아야만
+    # 하게 만든다 — 압도적 활약(해트트릭 등)은 여전히 10.0에 닿을 수
+    # 있지만 "그냥 좋은 챔스 경기"만으로는 더 이상 자동으로 10점이 안 된다.
+    _SOFT_CAP_START = 9.3
+    _SOFT_CAP_COMPRESS = 0.35
+    if _raw_rating > _SOFT_CAP_START:
+        _over = _raw_rating - _SOFT_CAP_START
+        _raw_rating = _SOFT_CAP_START + _over * _SOFT_CAP_COMPRESS
+
+    rating = max(3.0, min(10.0, round(_raw_rating, 1)))
 
     return goals, assists, saves, rating, events, detail
 
@@ -5055,9 +5105,35 @@ def _advance_week(p, base_week, n_weeks=4):
             rs_s = p_snap.get("season_rating_sum", 0.0)
             update_player(first_half_rating=round(rs_s/rc_s, 2) if rc_s else 0.0)
 
-    # 17주차 진입: 국제대회 윈도우 시작 (월드컵/대륙컵 해당 연도면 생성)
+    # [2026-07 재수정, 신민용 리포트: "예선 소집이 28주에 오는데 27주에
+    # 와야 할듯"] 28주(휴식기 첫 주) 시작 시점에 예선을 생성하면, 27주
+    # 일정을 짜는 시점엔 아직 예선 대회가 DB에 없어서 "경기 전날 휴식
+    # 강제"(_get_match_for_day(d+1)로 다음날 경기 있는지 미리 확인하는
+    # 로직)가 27주 마지막 날(189일)에서 다음날(190일, 예선 첫 경기)을
+    # 확인해도 아직 존재하지 않는 대회라 놓친다 — 그 결과 대회 시작
+    # 전날 휴식이 안 뜬다. 트리거를 한 주 앞당겨(27주 진입 시점) 생성하면
+    # 27주 일정을 짜는 시점에 이미 예선 대회가 존재해서 정상적으로
+    # 휴식이 뜬다. 실제 경기 날짜(day190~) 자체는 그대로다 — 데이터가
+    # 미리 만들어질 뿐 매치데이는 안 당겨진다.
+    from constants import INTL_QUAL_WEEK
+    if new_week == INTL_QUAL_WEEK - 1:
+        try:
+            intl_engine.start_qualifying_if_needed(new_year)
+        except Exception as e:
+            add_log(f"⚠ 월드컵 예선 생성 오류: {e}", "event")
+
+    # [2026-07 버그수정, 신민용 리포트: "10월29일 클럽월드컵 첫 경기 바로
+    # 전날(10월28일)이 강제 휴식이 아니라 그냥 훈련으로 뜬다"] 예선과
+    # 완전히 동일한 원인이다(위 INTL_QUAL_WEEK-1 주석 참고) — 대회가
+    # INTL_CALLUP_WEEK '그 주 첫날'에 생성되는데, 그날의 바로 전날(오프
+    # 시즌 진입 전 마지막 날) 일정을 화면에 그릴 때는 아직 대회 자체가
+    # DB에 없어서 "내일 경기 있음" 체크가 못 찾는다. 트리거를 한 주
+    # 앞당기면(INTL_CALLUP_WEEK-1 진입 시점) 그 전날 일정을 그릴 때 이미
+    # 대회가 존재해서 정상적으로 휴식이 뜬다. 실제 경기 날짜 자체는
+    # 그대로다(TOURNAMENT_SCHEDULE_RULES가 day를 결정, 트리거는 그저
+    # 데이터를 미리 만들 뿐).
     from constants import INTL_CALLUP_WEEK
-    if new_week == INTL_CALLUP_WEEK:
+    if new_week == INTL_CALLUP_WEEK - 1:
         try:
             intl_engine.start_intl_tournament(new_year)
         except Exception as e:
@@ -9385,17 +9461,9 @@ def _enrich_offer(o: dict, row) -> dict:
         _cur_year = p.get("current_year", 0)
         _remain = (max(0, _contract_end - _cur_year)
                    if (_contract_end and _cur_year) else None)
-        _base_fee = estimate_transfer_fee(
-            o.get("grade"), o["tier"], my_ovr, country=o["country"],
-            team_name=o["team_name"], position=get_field_pos(p),
-            age=my_age, talent_cap=p.get("talent_cap"),
-            contract_remaining_years=_remain,
-            year=_cur_year, team_id=row["id"], season=p.get("current_season"),
-        )
-        # [2026-07 신설] 오퍼 프리미엄 — 이적 협상 시스템(강제판매 체크
-        # 등)이 실제로 의미를 가지려면 제안액이 시장가와 항상 똑같으면
-        # 안 된다. 내 현재 리그 등급을 구해서 매수팀 등급과의 격차로
-        # 프리미엄을 굴린다.
+        # [2026-07 순서 변경] my_grade(내 현재 리그 등급)를 base_fee 계산
+        # '전에' 먼저 구한다 — seller_origin_dampen_mult가 매수팀 등급과
+        # 내 등급의 격차를 알아야 하기 때문(아래 base_fee 계산에 바로 씀).
         from constants import get_league_grade
         _my_grade = "C"
         _my_tid = p.get("current_team_id", 0)
@@ -9409,9 +9477,48 @@ def _enrich_offer(o: dict, row) -> dict:
             conn_mg.close()
             if _row_mg and _row_mg["tier"] == 1:
                 _my_grade = get_league_grade(_row_mg["cname"], _row_mg["grade"])
+
+        _base_fee = estimate_transfer_fee(
+            o.get("grade"), o["tier"], my_ovr, country=o["country"],
+            team_name=o["team_name"], position=get_field_pos(p),
+            age=my_age, talent_cap=p.get("talent_cap"),
+            contract_remaining_years=_remain,
+            year=_cur_year, team_id=row["id"], season=p.get("current_season"),
+        )
+        # [2026-07 신설, 신민용 리포트: "K리그에서 판매한 이적료가 너무
+        # 크다"] 위 base_fee는 오직 '사는 팀'의 리그 등급만 반영한다 —
+        # 내가 지금 하위 리그(K리그 등)에 있다는 사실 자체는 여태 전혀
+        # 안 깎였다. 매수팀이 내 현재 리그보다 훨씬 강하면(격차가 크면)
+        # "검증이 덜 된 원석" 할인을 기준가에 직접 적용한다.
+        _base_fee = int(_base_fee * seller_origin_dampen_mult(o.get("grade", "C"), _my_grade))
+        # [2026-07 신설] 오퍼 프리미엄 — 이적 협상 시스템(강제판매 체크
+        # 등)이 실제로 의미를 가지려면 제안액이 시장가와 항상 똑같으면
+        # 안 된다. 내 현재 리그 등급을 구해서 매수팀 등급과의 격차로
+        # 프리미엄을 굴린다.
         o["my_grade"] = _my_grade
         o["_base_fee"] = _base_fee
-        o["transfer_fee"] = int(_base_fee * offer_premium_mult(o.get("grade", "C"), _my_grade))
+        _new_fee = int(_base_fee * offer_premium_mult(o.get("grade", "C"), _my_grade))
+        # [2026-07 신설, 신민용 리포트: "맨유가 3461억 불렀다가 다음엔
+        # 3343억으로 오히려 낮춰서 다시 온다 — 무슨 논리냐"] offer_premium_mult
+        # 가 매번 완전히 새로 랜덤이라, 같은 팀이 두 번째로 접촉해도 이전
+        # 제안액과 무관하게(심지어 더 낮게) 나올 수 있었다. 그 팀의 마지막
+        # 제안액을 기억해뒀다가, 같은 팀이 다시 제안할 땐 그 금액 밑으로
+        # 안 내려가게(오히려 소폭 인상) 한다 — 실제 협상은 거절당하면
+        # 보통 같거나 올려서 재접촉하지 낮춰 부르지 않는다.
+        try:
+            _hist = json.loads(p.get("offer_history_json") or "{}")
+        except Exception:
+            _hist = {}
+        _team_key = str(row["id"])
+        _prev_fee = _hist.get(_team_key)
+        if _prev_fee and _new_fee < _prev_fee:
+            _new_fee = int(_prev_fee * random.uniform(1.0, 1.08))
+        _hist[_team_key] = _new_fee
+        try:
+            update_player(offer_history_json=json.dumps(_hist))
+        except Exception:
+            pass
+        o["transfer_fee"] = _new_fee
     else:
         o["transfer_fee"] = 0
     return o
@@ -9619,6 +9726,7 @@ from economy import (
     _salary_ovr_adj, _salary_cap_table, _tier_scaled_country_cap,
     _clamp_salary_to_cap, _calc_salary,
     offer_premium_mult, forced_sale_threshold_mult, LEAGUE_GRADE_RANK,
+    seller_origin_dampen_mult,
 )
 
 
@@ -10066,8 +10174,11 @@ def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None
         cur_year_for_log = p.get("current_year", GAME_START_YEAR)
         if decision == "reject":
             _record_offer_rejection(p, cur_year_for_log)
+            _buyer_name = offer.get("team_name", "")
+            _buyer_grade = offer.get("grade", "?")
             add_log(
-                f"🚫 구단이 이적 제안을 거절했습니다. (제안 {fmt_money(offer.get('transfer_fee',0))} "
+                f"🚫 구단이 이적 제안을 거절했습니다. ({_buyer_name}[{_buyer_grade}급] 제안 "
+                f"{fmt_money(offer.get('transfer_fee',0))} "
                 f"< 최소 요구 {fmt_money(int(detail['base_fee']*detail['min_accept_mult']))})",
                 "event")
             return

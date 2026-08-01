@@ -340,6 +340,20 @@ class CenterPanel(QWidget):
             pvlay.addWidget(w)
         self.lay.addWidget(pvbox)
 
+        # [2026-07 신설, 신민용 요청: "8강(예정)/4강(예정)처럼 참가팀이
+        # 아직 안 정해진 다음 라운드도 메인 화면에 미리 보이면 좋겠다"]
+        # 이번 주 그리드엔 '오늘' 기준 7일치만 보이는데, 국제대회 토너먼트는
+        # 이제 라운드 전체가 대회 시작 시점에 이미 day가 확정돼 있으므로
+        # (intl_engine._precreate_ko_shell), 아직 그 주가 오지 않았어도
+        # "다음 라운드가 언제인지"는 미리 알 수 있다 — 내 국가가 아직
+        # 대회에 살아있다면, 그 다음 라운드의 예정일을 별도 줄로 보여준다.
+        self.lbl_next_intl = QLabel("")
+        self.lbl_next_intl.setObjectName("nextIntlPreview")
+        self.lbl_next_intl.setStyleSheet(
+            "color:#ffaa33;font-weight:bold;font-size:12px;padding:2px 4px;")
+        self.lbl_next_intl.hide()
+        self.lay.addWidget(self.lbl_next_intl)
+
         # 액션 버튼 행1
         row1 = QHBoxLayout()
         self.btn_join     = QPushButton("🏟 팀 입단");      self.btn_join.setObjectName("actBtn")
@@ -449,6 +463,8 @@ class CenterPanel(QWidget):
                         for d, ttype in slim:
                             mi = (self._get_match_for_day(d, p)
                                   if p.get("current_team_id") else None)
+                            if mi and mi.get("pending"):
+                                mi = None
                             if mi:
                                 rebuilt.append((d, "경기", mi))
                             else:
@@ -497,8 +513,16 @@ class CenterPanel(QWidget):
                 if anim:
                     anim.stop()
                 glow.setBlurRadius(0)
-            # 기본 스타일 복귀 (전역 스타일시트에 위임)
-            frame.setStyleSheet("")
+                # 기본 스타일 복귀 (전역 스타일시트에 위임) — [2026-07 성능
+                # 수정, 신민용 리포트: "일 단위 전환 후 전체적으로 렉"] 원래
+                # 이 setStyleSheet("")가 if 블록 밖에 있어서, 이미 꺼져있는
+                # (아무 것도 안 바뀐) 프레임도 새로고침마다 매번 다시
+                # 스타일시트를 재적용했다(Qt CSS 파싱은 결코 공짜가
+                # 아니다 — 하루 셀 7개 x 매 새로고침마다 반복되며 누적).
+                # "꺼짐 → 꺼짐"은 상태 변화가 없으니 그대로 둬도 이미 ""
+                # 상태다 — 실제로 "켜짐 → 꺼짐"으로 전환되는 순간에만
+                # 되돌리면 충분하다.
+                frame.setStyleSheet("")
 
     def _match_stress_preview(self, p, is_home: bool) -> int:
         """[2026-07 버그수정, 신민용 리포트] 경기 스트레스 미리보기가
@@ -571,17 +595,83 @@ class CenterPanel(QWidget):
             # 통째로 빠져 보였다. 이제 하루씩 모드에서 묶음이 이미 고정된
             # 상태라면 그 확정본(self._locked_sched)을 그대로 화면에 반영해
             # "실제로 진행될 내용 = 화면에 보이는 내용"을 항상 일치시킨다.
-            _match_cache = {
-                item[0]: (item[2] if item[1] == "경기" else None)
-                for item in self._locked_sched
-            }
+            #
+            # [2026-07 추가 버그수정, 신민용 리포트: "8강전이 화면엔 안
+            # 뜨는데 로그엔 결과가 있다 — 말이 안 된다"] 위 '고정'이 너무
+            # 완고했다 — 묶음이 월요일에 확정될 때(16강도 아직 안 뛴
+            # 시점)는 8강 대진이 존재조차 안 해서 그 요일이 그냥 "고강도
+            # 훈련"으로 고정돼버렸다. 그런데 game_engine.advance_days는
+            # 실제 진행 시점엔 그날 다시 살아있는 조회(get_my_match)를
+            # 하므로, 16강을 이겨 8강이 확정되면 표시(고정된 "훈련")와
+            # 실제 결과(8강 승부)가 어긋났다 — 정확히 이 어긋남이 신고된
+            # 증상이다. '아직 진행 안 한 날'만 매 새로고침마다 살아있는
+            # 조회로 다시 확인해서, 그사이 새로 확정된 경기/미정 라운드를
+            # 고정본에 반영(패치)한다 — 이미 지난 날은 절대 건드리지 않아
+            # (원래 버그 재발 방지) "화면=실제" 원칙은 그대로 유지된다.
+            for _i, (_d, _ttype, _detail) in enumerate(self._locked_sched):
+                if _d < day:
+                    continue   # 이미 지난 날 — 원래 버그 재발 방지를 위해 손대지 않음
+                if _ttype == "경기":
+                    continue   # 이미 실제 경기로 고정돼 있음 — 그대로 둠
+                _live = self._get_match_for_day(_d, p, st=st)
+                if _live and _live.get("pending"):
+                    # 아직 대진 미확정 — 훈련 스케줄 자체는 건드리지 않고
+                    # 표시만 살아있는 정보로 갱신(아래 _match_cache가 사용).
+                    self._locked_sched[_i] = (_d, _ttype, {"__pending_overlay__": _live})
+                elif _live:
+                    # 그사이 대진이 확정됐다 — 이제 진짜 경기이므로 고정본을
+                    # 승격시킨다(advance_days도 라이브 조회로 어차피 이렇게
+                    # 처리하니, 화면과 실제를 다시 일치시키는 것뿐).
+                    self._locked_sched[_i] = (_d, "경기", _live)
+                elif isinstance(_detail, dict) and "__pending_overlay__" in _detail:
+                    # [2026-07 버그수정, 신민용 리포트: "3/4위전이면 결승전은
+                    # 11월 29일처럼 훈련 선택 창으로 바뀌어야 하는데 계속
+                    # '결승전 (미정)'으로 뜬다"] 위 두 분기는 '지금 라이브로
+                    # 봤을 때 여전히 pending이거나(overlay 갱신) 이미 실제
+                    # 경기로 확정된(승격) 경우만 다뤘다 — '한때는 내 경기가
+                    # 될 수도 있어서 미정으로 표시됐지만, 그 사이 4강 결과가
+                    # 나오면서 반대쪽 대진(결승/3-4위전)으로 확정돼 더 이상
+                    # 내 경기가 아니게 된' 경우는 처리하지 않았다. 이땐
+                    # get_my_pending_stage(intl/cwc 공통)가 이제 None을
+                    # 돌려주므로 _live가 None인데, 예전 새로고침 때 붙여둔
+                    # __pending_overlay__가 지워지지 않고 그대로 남아 "미정"
+                    # 표시가 굳어버렸다. 더 이상 내 경기가 아님이 확인됐으니
+                    # 낡은 오버레이를 지우고 원래 훈련일 상태로 되돌린다.
+                    self._locked_sched[_i] = (_d, _ttype, None)
+
+            # [2026-07 추가 버그수정, 신민용 리포트: "결승 진출이 확정됐는데
+            # 그 전날(3/4위전 날)이 강제 휴식으로 안 바뀌고 그냥 고강도로
+            # 뜬다"] 위 패치는 '오늘 경기가 생겼는지'만 확인했지, '내일
+            # 경기가 새로 확정돼서 오늘이 경기 전날 강제휴식이 돼야 하는지'는
+            # 다시 안 봤다. 대진이 잠금 시점 이후에 결정되는 경우(4강 결과에
+            # 따라 결승/3-4위전 중 하나가 확정)엔 이 관계도 매 새로고침마다
+            # 다시 확인해야 한다 — _build_week_sched가 처음 잠글 때 쓰던
+            # 것과 동일한 규칙("내일이 진짜 경기면 오늘은 무조건 휴식")을
+            # 여기서도 그대로 적용한다.
+            _by_day = {x[0]: x for x in self._locked_sched}
+            for _i, (_d, _ttype, _detail) in enumerate(self._locked_sched):
+                if _d < day or _ttype == "경기":
+                    continue
+                _next_item = _by_day.get(_d + 1)
+                if _next_item and _next_item[1] == "경기" and _ttype != "휴식":
+                    self._locked_sched[_i] = (_d, "휴식", None)
+
+            _match_cache = {}
+            for item in self._locked_sched:
+                if item[1] == "경기":
+                    _match_cache[item[0]] = item[2]
+                elif isinstance(item[2], dict) and "__pending_overlay__" in item[2]:
+                    _match_cache[item[0]] = item[2]["__pending_overlay__"]
+                else:
+                    _match_cache[item[0]] = None
         else:
             _match_cache = {
-                bundle_start + i: self._get_match_for_day(bundle_start + i, p)
+                bundle_start + i: self._get_match_for_day(bundle_start + i, p, st=st)
                 for i in range(DAY_BUNDLE_SIZE)
             }
 
-        self._update_next_week_preview(bundle_start, p)
+        self._update_next_week_preview(bundle_start, p, st=st)
+        self._update_next_intl_preview(bundle_start, p)
 
         day_labels_kr = ["월", "화", "수", "목", "금", "토", "일"]
         for i, (f, cb) in enumerate(zip(self.week_frames, self.week_combos)):
@@ -640,7 +730,20 @@ class CenterPanel(QWidget):
 
             if match_info:
                 cb.hide()
-                if match_info.get("intl"):
+                if match_info.get("pending"):
+                    # [2026-07 신설, 신민용 요청: "8강 날짜가 되면 이기기
+                    # 전까지는 미정으로 떠야 한다"] 아직 대진이 안 정해진
+                    # 미래 라운드(intl_engine.get_my_pending_stage) —
+                    # 상대/스트레스 등 실제 경기 정보가 아직 없으므로
+                    # 전용 문구만 보여준다.
+                    stage = match_info.get("stage_ko", "")
+                    hl.setText("")
+                    if ml:
+                        ml.setText(f"🌍 {match_info['league_name']} {stage}\n(미정)")
+                        ml.setStyleSheet("color:#999999;font-weight:bold;font-size:12px;"
+                                         "background:#2a2a2a;border-radius:4px;padding:4px;")
+                        ml.show()
+                elif match_info.get("intl"):
                     # 국가대표 경기 (월드컵/대륙컵/예선)
                     # [2026-07 색상 규칙 개편, 신민용 요청] 예전엔 국대 경기
                     # 전부(월드컵/대륙컵/예선) 파란색 하나로 뭉뚱그려 표시됐다.
@@ -726,8 +829,30 @@ class CenterPanel(QWidget):
                 # 무관하게 _advance의 스케줄 빌더가 "내일 경기 있으면 오늘
                 # 무조건 휴식 처리"로 그대로 적용한다.
                 next_mi = _match_cache.get(d + 1)
-                if next_mi is None and d + 1 not in _match_cache:
-                    next_mi = self._get_match_for_day(d + 1, p)
+                if not next_mi:
+                    # [2026-07 버그수정, 신민용 리포트: "클럽 월드컵 16강이
+                    # 11월 19일인데 그 전날(18일)에 파란색 '경기 전 휴식'
+                    # 표시가 안 뜬다"] 예전엔 d+1이 캐시에 아예 없을 때만
+                    # (사실상 번들 마지막 날 등 예외 상황) 라이브로 다시
+                    # 확인했다 — 그런데 하루씩 모드에서 캐시는 번들이
+                    # 잠긴 시점 기준이라, R16 같은 조별리그 이후 셸이 그
+                    # 뒤에(같은 주 안에서) 확정돼도 이미 지나간 날짜의
+                    # 패치 루프는 더는 그 앞날(d)까지 되짚어 갱신하지
+                    # 않는다 — 그 결과 d+1에 실제 경기가 생겼는데도 캐시엔
+                    # 여전히 None으로 남아 이 미리보기가 낡은 채로 굳어있을
+                    # 수 있었다. 캐시가 "경기 없음"(None)이라고 할 때는
+                    # 항상 가볍게 한 번 더 살아있는 조회로 재확인한다 —
+                    # 실제 경기가 있으면 캐시보다 라이브가 항상 옳고,
+                    # 없으면 조회 결과도 그대로 None이라 손해가 없다.
+                    next_mi = self._get_match_for_day(d + 1, p, st=st)
+                # [2026-07 안전장치] "미정" placeholder(아직 대진 미확정
+                # 미래 라운드)는 실제 경기가 아니라 advance_days의 강제
+                # 휴식 로직도 이걸 모른다 — 여기서 "내일 경기 있음"으로
+                # 취급해 "대회 전 휴식"을 미리 보여주면, 실제로 진행했을 때
+                # 적용되는 훈련(사용자가 고른 값)과 화면 미리보기가
+                # 어긋난다. pending은 이 미리보기 트리거에서 제외한다.
+                if next_mi and next_mi.get("pending"):
+                    next_mi = None
                 if next_mi:
                     cb.hide()
                     loc_txt = "원정 이동" if next_mi.get("is_home") is False else "경기 하루 전"
@@ -839,7 +964,7 @@ class CenterPanel(QWidget):
                 if not nat:
                     nat = p.get("fixed_nat") or p.get("nationality1", "")
                 # get_my_match로 정확한 stage/grp 파악 (조별리그면 내 그룹만 표시용)
-                _im = intl_engine.get_my_match(week)
+                _im = intl_engine.get_my_match(week, p=p)
                 _stage    = _im["stage"] if _im else (t.get("status") or "group")
                 _stage_ko = _im.get("stage_ko", "") if _im else ""
                 if _im:
@@ -873,7 +998,7 @@ class CenterPanel(QWidget):
             import champions_engine
             from game_engine import get_state as _gs
             _st = _gs()
-            cl_m = champions_engine.get_my_cl_match(week)
+            cl_m = champions_engine.get_my_cl_match(week, p=p)
             if cl_m:
                 return {
                     "cl": True,
@@ -908,7 +1033,7 @@ class CenterPanel(QWidget):
         # 클럽 월드컵 확인 (43~52주, 4년에 한 번)
         try:
             import club_world_cup_engine
-            cwc_m = club_world_cup_engine.get_my_cwc_match(week)
+            cwc_m = club_world_cup_engine.get_my_cwc_match(week, p=p)
             if cwc_m:
                 return {
                     "cwc": True,
@@ -1131,7 +1256,14 @@ class CenterPanel(QWidget):
                 d     = day + i
                 sel   = cb.currentText()
                 ttype = TRAIN_MAP_KO.get(sel, "중강도")
-                mi = self._get_match_for_day(d, p)
+                mi = self._get_match_for_day(d, p, st=st)
+                # [2026-07 안전장치] "미정"(get_my_pending_stage) placeholder는
+                # 화면 표시 전용이다 — 실제 상대/스탯이 없는데 이걸 "경기"로
+                # 스케줄에 넣으면 advance_days의 매치 시뮬 경로가 받는 mi에
+                # opp 등 필수 필드가 없어 오작동/크래시할 수 있다. 진짜 대진이
+                # 잡히기 전까지는 평범한 훈련일로 취급한다.
+                if mi and mi.get("pending"):
+                    mi = None
                 if mi:
                     sched.append((d, "경기", mi))
                 else:
@@ -1139,7 +1271,9 @@ class CenterPanel(QWidget):
                     # 관리 목적으로 무조건 휴식을 강제한다(실제 프로팀 루틴과
                     # 동일, 이틀 연속 경기 방지) — 사용자가 그날 다른 훈련을
                     # 골라놨어도 경기 전날이면 덮어쓴다.
-                    next_mi = self._get_match_for_day(d + 1, p)
+                    next_mi = self._get_match_for_day(d + 1, p, st=st)
+                    if next_mi and next_mi.get("pending"):
+                        next_mi = None
                     if next_mi:
                         ttype = "휴식"
                     # 강점/약점훈련은 엔진이 스탯을 자동 선별하므로 detail 불필요.
@@ -1161,12 +1295,16 @@ class CenterPanel(QWidget):
                     d     = bundle_start + i
                     sel   = cb.currentText()
                     ttype = TRAIN_MAP_KO.get(sel, "중강도")
-                    mi = self._get_match_for_day(d, p)
+                    mi = self._get_match_for_day(d, p, st=st)
+                    if mi and mi.get("pending"):
+                        mi = None
                     if mi:
                         sched.append((d, "경기", mi))
                     else:
                         # 경기 전날 휴식 강제(홈/원정 무관) — 위 _build_week_sched 주석 참고.
-                        next_mi = self._get_match_for_day(d + 1, p)
+                        next_mi = self._get_match_for_day(d + 1, p, st=st)
+                        if next_mi and next_mi.get("pending"):
+                            next_mi = None
                         if next_mi:
                             ttype = "휴식"
                         sched.append((d, ttype, None))
@@ -1322,7 +1460,80 @@ class CenterPanel(QWidget):
                               f"시즌/주차 진행 중 오류가 발생했습니다:\n{msg}")
 
 
-    def _update_next_week_preview(self, bundle_start, p):
+    def _update_next_intl_preview(self, bundle_start, p):
+        """[2026-07 신설, 신민용 요청: "8강(예정)/4강(예정)처럼 아직 상대가
+        안 정해진 다음 라운드도 메인 화면에 미리 보이면 좋겠다"] 국제대회
+        토너먼트(월드컵/대륙컵)는 이제 대회 시작 시점에 라운드 전체의
+        day가 이미 확정돼 있다(intl_engine._precreate_ko_shell 참고) —
+        아직 그 주가 안 왔어도 "다음 라운드가 언제인지"는 미리 알 수
+        있다. 지금 보이는 7일 안에 이미 그 경기가 있으면(오늘 뛰는 중)
+        중복 표시하지 않고, 그보다 뒤에 있는 라운드만 미리 보여준다.
+        내 국가가 이미 탈락했으면(alive=0) 표시하지 않는다."""
+        if not hasattr(self, "lbl_next_intl"):
+            return
+        self.lbl_next_intl.hide()
+        try:
+            import intl_engine
+            from game_engine import get_state
+            from database import get_conn
+            from constants import day_to_date_str
+            st = get_state()
+            if not st:
+                return
+            t = intl_engine.get_my_tournament(st["current_year"])
+            if not t or t.get("kind") not in ("world", "continent") or t.get("my_selected") != 1:
+                return
+            if t.get("status") not in ("group", "ko"):
+                return
+            conn = get_conn()
+            nat = intl_engine._my_nat(t, p)
+            if not nat:
+                conn.close()
+                return
+            alive_row = conn.execute(
+                "SELECT alive FROM intl_entries WHERE tournament_id=? AND country=?",
+                (t["id"], nat)).fetchone()
+            if alive_row and alive_row["alive"] == 0:
+                conn.close()
+                return
+            # 아직 안 지난(지금 보이는 7일 범위보다 뒤인) 가장 가까운 미래
+            # day를 먼저 찾는다. 조별리그는 제외(그건 이미 매주 정상 표시됨).
+            window_end = bundle_start + DAY_BUNDLE_SIZE - 1
+            day_row = conn.execute(
+                """SELECT MIN(day) AS d FROM intl_matches
+                   WHERE tournament_id=? AND stage!='group' AND day IS NOT NULL
+                     AND day > ?""",
+                (t["id"], window_end)).fetchone()
+            if not day_row or day_row["d"] is None:
+                conn.close()
+                return
+            next_day = day_row["d"]
+            # 그 day에 속한 행들 중 내 국가가 이미 배정된 행이 있으면 그걸
+            # 쓰고(상대까지 확정), 없으면(아직 미배정) 아무 행이나 하나
+            # 골라 라운드 이름/날짜만 보여준다(같은 라운드는 전부 같은
+            # day라 어느 행이든 정보는 동일).
+            rows = [dict(r) for r in conn.execute(
+                "SELECT stage, home, away FROM intl_matches WHERE tournament_id=? AND day=?",
+                (t["id"], next_day)).fetchall()]
+            conn.close()
+            if not rows:
+                return
+            mine = next((r for r in rows if r["home"] == nat or r["away"] == nat), None)
+            ref = mine or rows[0]
+            stage_ko = intl_engine.STAGE_KO.get(ref["stage"], ref["stage"])
+            date_str = day_to_date_str(next_day)
+            if mine:
+                opp = mine["away"] if mine["home"] == nat else mine["home"]
+                txt = f"🌍 다음 일정: {t['name']} {stage_ko} ({date_str} 예정) vs {opp}"
+            else:
+                txt = f"🌍 다음 일정: {t['name']} {stage_ko} ({date_str} 예정) · 상대 미정"
+            self.lbl_next_intl.setText(txt)
+            self.lbl_next_intl.show()
+        except Exception:
+            # 미리보기는 부가 정보라 실패해도 메인 화면 동작에 영향 주면 안 됨.
+            self.lbl_next_intl.hide()
+
+    def _update_next_week_preview(self, bundle_start, p, st=None):
         """[2026-07 신설] 우측 상단 작은 박스 7개 — 다음 주(현재 표시 중인
         7일 묶음의 바로 다음 7일) 일정을 대회 종류별 색으로 간단히 미리
         보여준다. 4번 색상 규칙(리그=초록/컵=보라/챔스=황금/국대=주황·빨강)과
@@ -1334,7 +1545,7 @@ class CenterPanel(QWidget):
         next_start = bundle_start + DAY_BUNDLE_SIZE
         for i, box in enumerate(self.nwp_boxes):
             d = next_start + i
-            mi = self._get_match_for_day(d, p)
+            mi = self._get_match_for_day(d, p, st=st)
             if not mi:
                 color = "#333"
             elif mi.get("intl"):
@@ -1347,7 +1558,7 @@ class CenterPanel(QWidget):
                 color = "#66ff99"
             box.setStyleSheet(f"background:{color};border-radius:3px;")
 
-    def _get_match_for_day(self, day, p):
+    def _get_match_for_day(self, day, p, st=None):
         """그 날짜(day)에 내 경기가 있는지 확인.
         클럽 리그 경기는 match_results.day로 정확한 날짜가 있어 그대로 대조.
         국제대회/챔스는 day 컬럼이 없어(주 단위 대회) game_engine의
@@ -1355,7 +1566,13 @@ class CenterPanel(QWidget):
         취급한다 — advance_days의 실제 처리 시점과 반드시 같은 함수를
         써서 화면 표시와 실제 진행이 어긋나지 않게 한다(예전엔 화면은
         '주 마지막 날'로 보여주면서 실제 처리는 그 주 아무 날에나
-        조용히 일어나던 불일치가 있었다)."""
+        조용히 일어나던 불일치가 있었다).
+
+        [2026-07 최적화, 신민용 리포트: "일 단위 전환 후 전체적으로 렉"]
+        p와 마찬가지로 st(게임 상태)도 호출부가 이미 조회해둔 게 있으면
+        넘겨서 get_state() 재조회를 생략한다 — 하루 셀 하나당 이 함수가
+        내부에서 부르는 get_my_match/get_my_cl_match 등이 전부 각자
+        get_state()를 다시 했었다."""
         from constants import day_to_week, DAYS_PER_WEEK
         week = day_to_week(day)
         tid = p.get("current_team_id", 0)
@@ -1368,8 +1585,9 @@ class CenterPanel(QWidget):
                 (tid,)).fetchone()
             if team_row:
                 lid = team_row["lid"]
-                from game_engine import get_state
-                st = get_state()
+                if st is None:
+                    from game_engine import get_state
+                    st = get_state()
                 cur_season = st["current_season"] if st else 1
                 row = conn.execute(
                     "SELECT * FROM match_results WHERE league_id=? AND week=? AND day=? "
@@ -1389,24 +1607,49 @@ class CenterPanel(QWidget):
             else:
                 conn.close()
 
-        # 클럽 경기 없음 → _week_intl_cl_day가 정한 그 날에만 국가대표/챔스/컵대회 확인.
+        # [2026-07 재수정] intl_matches(예선/본선)와 cwc_matches는 이제 둘 다
+        # Phase 2로 실제 day가 채워져 있어서 day로 정확히 조회해도 되는데,
+        # cl/cup_matches는 아직 day가 전부 0(스키마 기본값)이다 — day=0을
+        # "미설정"으로 봐주는 폴백 때문에, 이번 주 어느 요일에 물어봐도
+        # 전부 조건이 참이 되어 같은 미완료 경기가 그 주 내내(실제 처리되기
+        # 전까지) 반복 표시됐다. 그래서 day가 진짜 있는 intl/cwc만 day로
+        # 직접 조회하고, 아직 day가 없는 챔스/컵은 예전 방식대로
+        # _week_intl_cl_day가 정한 '그 주의 딱 하루'에만 확인한다.
+        import intl_engine
+        im = intl_engine.get_my_match(week, day=day, p=p, st=st)
+        if im:
+            return im
+
+        # [2026-07 신설, 신민용 요청: "8강 날짜가 되면 이기기 전까지는
+        # 메인 화면에 미정으로 떠야 한다"] 실제 대진이 아직 안 정해진
+        # 미래 라운드(_precreate_ko_shell placeholder)라도, 오늘이 바로
+        # 그 라운드 예정일이면 "미정" 상태로라도 보여준다.
+        pend = intl_engine.get_my_pending_stage(week, day=day, p=p, st=st)
+        if pend:
+            return pend
+
+        import club_world_cup_engine
+        cw = club_world_cup_engine.get_my_cwc_match(week, day=day, p=p, st=st)
+        if cw:
+            return cw
+
+        # [2026-07 신설] CWC도 intl과 동일한 사전생성 셸 구조라 똑같이
+        # "미정" placeholder 확인이 필요하다 — club_world_cup_engine.
+        # get_my_pending_stage 참고.
+        cw_pend = club_world_cup_engine.get_my_pending_stage(week, day=day, p=p, st=st)
+        if cw_pend:
+            return cw_pend
+
         from game_engine import _week_intl_cl_day
-        if day == _week_intl_cl_day(week, p):
-            import intl_engine
-            im = intl_engine.get_my_match(week)
-            if im:
-                return im
-            import champions_engine
-            cm = champions_engine.get_my_cl_match(week)
-            if cm:
-                return cm
-            import cup_engine
-            cu = cup_engine.get_my_cup_match(week)
-            if cu:
-                return cu
-            import club_world_cup_engine
-            return club_world_cup_engine.get_my_cwc_match(week)
-        return None
+        if day != _week_intl_cl_day(week, p, st=st):
+            return None
+
+        import champions_engine
+        cm = champions_engine.get_my_cl_match(week, day=day, p=p, st=st)
+        if cm:
+            return cm
+        import cup_engine
+        return cup_engine.get_my_cup_match(week, day=day, p=p, st=st)
 
     # ── 액션 ─────────────────────────────────────
 

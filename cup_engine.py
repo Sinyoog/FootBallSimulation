@@ -36,6 +36,19 @@ from database import get_conn
 # 1주로 줄었을 뿐 챔스 결승(23주)과 겹치지 않는다.
 CUP_ROUND_WEEKS_POOL = [5, 6, 7, 24, 27, 30, 33, 36, 39, 42]
 
+# [2026-07 수정, 신민용 리포트: "컵대회는 비시즌에 낄 때 있네"] 중간 휴식기
+# (INTL_QUAL_WEEK~휴식기 끝 주차, 28~31주) 도입으로 위 풀의 30이 그 안에
+# 걸려버렸다 — 클럽 경기가 없는 주간에 컵 라운드가 잡히는 버그. 휴식기에
+# 걸리는 주차는 자동으로 휴식기 끝난 바로 다음 주로 민다(하드코딩 숫자를
+# 또 손으로 맞추는 대신, 상수 기준으로 자동 보정해서 나중에 휴식기 길이가
+# 또 바뀌어도 여기를 다시 안 고쳐도 되게 함).
+from constants import INTL_QUAL_WEEK, WINTER_OFFER_END_DAY, day_to_week as _day_to_week
+_CUP_BREAK_END_WEEK = _day_to_week(WINTER_OFFER_END_DAY)
+CUP_ROUND_WEEKS_POOL = [
+    (_CUP_BREAK_END_WEEK + 1) if (INTL_QUAL_WEEK <= _w <= _CUP_BREAK_END_WEEK) else _w
+    for _w in CUP_ROUND_WEEKS_POOL
+]
+
 
 _CUP_REWARD_BY_TEAMS = [
     (4,   (4, 3, 3)),
@@ -217,11 +230,15 @@ def has_my_cup_match_between(week_from, week_to):
     return False
 
 
-def get_my_cup_match(week):
-    """이번 주차에 내가 뛸 컵대회 경기가 있으면 dict, 없으면 None."""
+def get_my_cup_match(week, day=None, p=None, st=None):
+    """이번 주차(또는 특정 day)에 내가 뛸 컵대회 경기가 있으면 dict, 없으면 None.
+
+    [2026-07 최적화] p를 넘기면 get_player() 재조회를 생략한다."""
     from game_engine import get_player, get_state
-    p = get_player()
-    st = get_state()
+    if p is None:
+        p = get_player()
+    if st is None:
+        st = get_state()
     if not p or not st:
         return None
     tid = p.get("current_team_id", 0)
@@ -235,11 +252,18 @@ def get_my_cup_match(week):
         return None
 
     conn = get_conn()
-    m = conn.execute(
-        """SELECT * FROM cup_matches
-           WHERE tournament_id=? AND week=? AND home_score=-1
-             AND (home_team_id=? OR away_team_id=?)""",
-        (t["id"], week, tid, tid)).fetchone()
+    if day is not None:
+        m = conn.execute(
+            """SELECT * FROM cup_matches
+               WHERE tournament_id=? AND week=? AND home_score=-1
+                 AND (home_team_id=? OR away_team_id=?) AND (day=? OR day IS NULL OR day=0)""",
+            (t["id"], week, tid, tid, day)).fetchone()
+    else:
+        m = conn.execute(
+            """SELECT * FROM cup_matches
+               WHERE tournament_id=? AND week=? AND home_score=-1
+                 AND (home_team_id=? OR away_team_id=?)""",
+            (t["id"], week, tid, tid)).fetchone()
     if not m:
         conn.close()
         return None
@@ -416,6 +440,16 @@ def _start_next_round(t):
     else:
         extra = round_counter - (len(CUP_ROUND_WEEKS_POOL) - 1)
         week = min(52, CUP_ROUND_WEEKS_POOL[-1] + extra)
+        # [2026-07 추가 수정] 오버플로우 구간도 휴식기(28~31주)만큼은
+        # 피한다. 다만 상한은 43(클럽 시즌 끝)이 아니라 52로 유지했다 —
+        # 43으로 낮추면 라운드가 아주 많은 나라(부수가 많아 오버플로우가
+        # 큰 경우)에서 여러 라운드가 전부 43주로 겹쳐, 예전에 고쳤던
+        # "라운드 중복 생성 무한루프" 버그가 재발할 위험이 있다. 44주
+        # 이후(국제 오프시즌, 클럽 경기 없음)로 밀리는 경기가 생기는
+        # 근본 문제는 아직 안 풀렸다 — 팀/부수 수에 맞춰 라운드 간격
+        # 자체를 조정하는 재설계가 필요한 부분이라 이번 수정 범위 밖.
+        if INTL_QUAL_WEEK <= week <= _CUP_BREAK_END_WEEK:
+            week = _CUP_BREAK_END_WEEK + 1
 
     c = conn.cursor()
     _match_rows = []
@@ -505,7 +539,11 @@ def _sim_ai_match(t, m, conn=None, reason="injury", batch=None):
     # 아무도 읽지 않는다 — 한 라운드에 수백~수천 건인 AI 경기마다 매번
     # get_player()(DB 조회)를 호출하던 걸 없앤다(_week_intl_cl_day 자체도
     # 이제 캐시되지만, 애초에 호출 자체가 불필요했다).
-    day = _week_intl_cl_day(m["week"], get_player() or {}) if m["is_my"] else 0
+    # [2026-07 재수정] "내 경기 아니면 day=None 강제"는 생성 시점에 이미
+    # day가 채워진 경기의 값을 시뮬레이션 순간 지워버리는 회귀 버그가
+    # 된다(intl_engine.py 예선/본선에서 실제로 재현·수정된 것과 동일한
+    # 패턴) — 이제 기존 값을 보존한다.
+    day = _week_intl_cl_day(m["week"], get_player() or {}) if m["is_my"] else m.get("day")
 
     _absence = reason if m["is_my"] else None
     _row = (hs, as_, pso_winner, pso_score, day, _absence, m["id"])
@@ -539,7 +577,7 @@ def _winner_of(m):
     return m["home_team_id"] if m["home_score"] > m["away_score"] else m["away_team_id"]
 
 
-def sim_my_cup_match_as_ai(week, p, reason="injury"):
+def sim_my_cup_match_as_ai(week, p, reason="injury", day=None):
     """[2026-07 신설, 버그수정] 부상 등으로 내가 못 뛸 때 내 컵대회 경기를
     AI끼리(내 보너스 없이) 시뮬레이션 — 이게 없으면 그 경기가 영원히
     home_score=-1(미완료)로 남아 대회 전체 진행이 멈춘다(신민용 리포트:
@@ -549,7 +587,7 @@ def sim_my_cup_match_as_ai(week, p, reason="injury"):
     [2026-07 버그수정, 신민용 리포트: "부상으로 경기 못 나갔는데 감독관계가
     그대로다"] game_engine._sim_my_team_match_as_ai와 동일한 이유로,
     이 컵대회 AI-대체 경로도 결장 페널티(manager_relation -1)를 적용한다."""
-    info = get_my_cup_match(week)
+    info = get_my_cup_match(week, day=day)
     if not info:
         return
     conn = get_conn()
@@ -572,7 +610,9 @@ def simulate_my_cup_match(week, p, day=None):
                              _save_match_detail, _soft_cap,
                              _check_suspended, _roll_red_card, _apply_red_card_dismissal)
     from constants import PERSONALITY_EFFECTS
-    info = get_my_cup_match(week)
+    # [2026-07 버그수정] day 파라미터가 시그니처엔 있었지만 실제로
+    # get_my_cup_match에 전달이 안 돼 무시되고 있었다.
+    info = get_my_cup_match(week, day=day)
     if not info:
         return
     conn = get_conn()

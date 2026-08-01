@@ -39,9 +39,12 @@ CLUB_SEASON_END_DAY   = 300
 INTL_OFFSEASON_START_DAY = 302
 INTL_OFFSEASON_END_DAY   = 364
 
-# 겨울 이적시장 — 클럽 시즌 중간에 겹쳐서 열림(경기는 안 끊김)
+# 중간 휴식기(구 겨울 이적시장) — [2026-07 확장] 원래 2주(190~203)였던 걸
+# 클럽 경기가 통째로 쉬는 4주 휴식기로 확장. 이 기간엔 경기가 없다(이전엔
+# "경기는 안 끊김"이었으나 이번 변경으로 뒤집힘). 월드컵 예선이 있는 해엔
+# 이 4주 안에서 예선(7라운드, 4일 간격)이 전부 진행된다.
 WINTER_OFFER_START_DAY = 190
-WINTER_OFFER_END_DAY   = 203
+WINTER_OFFER_END_DAY   = 217
 
 # 상/하반기 라운드 매칭 (8팀, 인덱스 기반) — 8팀 전용 리그에서만 사용,
 # 그 외(대부분)는 아래 generate_round_robin()으로 팀 수에 맞게 생성.
@@ -94,8 +97,12 @@ def generate_round_robin(n: int):
 # 몰리는 리그(팀 30개 등)도 그 주가 시뮬레이션될 때 한꺼번에 처리된다.
 DAYS_PER_WEEK = 7
 FIRST_HALF_START_DAY  = CLUB_SEASON_START_DAY        # 22
-FIRST_HALF_END_DAY    = CLUB_SEASON_MID_DAY - 1      # 160
-SECOND_HALF_START_DAY = CLUB_SEASON_MID_DAY          # 161
+# [2026-07 수정] 중간 휴식기(WINTER_OFFER_START/END_DAY, 190~217일) 도입으로
+# 상/하반기가 더는 붙어있지 않고 그 사이에 간격이 생긴다. 이 간격은
+# _phase_label()의 "week < ss" 폴백이 자동으로 '비시즌'으로 표시한다
+# (새 UI 코드 불필요 — 이 상수만 바뀌면 화면에 그대로 반영됨).
+FIRST_HALF_END_DAY    = WINTER_OFFER_START_DAY - 1   # 189
+SECOND_HALF_START_DAY = WINTER_OFFER_END_DAY + 1     # 218
 SECOND_HALF_END_DAY   = CLUB_SEASON_END_DAY          # 300
 
 def round_to_day(rd: int, rounds_total: int, half_start_day: int, half_end_day: int,
@@ -235,34 +242,59 @@ def legs_for_team_count(n: int, target: int = TARGET_ROUNDS_PER_LEG) -> int:
     return cycles * 2
 
 def season_cycle_windows(n_cycles: int):
-    """CLUB_SEASON_START_DAY~END_DAY 전체를 n_cycles개 구간으로 균등 분할해,
-    구간별 (h1_start, h1_end, h2_start, h2_end) — 그 사이클의 '왕복 2전'용
-    상반기/하반기 day 윈도우 — 리스트를 반환한다. 사이클이 1개면 기존
-    FIRST_HALF_*/SECOND_HALF_* 윈도우와 동일한 값이 나온다(하위호환).
+    """[2026-07 재설계, 중간 휴식기 도입] 예전엔 CLUB_SEASON_START_DAY~
+    END_DAY(22~300) 전체를 통짜로 n_cycles개로 나눴는데, 이러면 중간
+    휴식기(WINTER_OFFER_START_DAY~END_DAY, 190~217)를 관통하는 라운드가
+    생길 수 있다 — 그 구간엔 경기가 없어야 하므로 이건 버그가 된다.
 
-    [2026-07 버그 수정] 예전엔 사이클 i의 끝(c_end)과 사이클 i+1의 시작
-    (c_start)이 같은 날짜였다(경계를 그냥 나눠 쓰기만 함) — 그런데 각
-    사이클의 마지막 라운드는 그 사이클 구간 끝날에 정확히 맞춰지도록
-    설계돼 있어서, 사이클 i의 마지막 라운드와 사이클 i+1의 첫 라운드가
-    똑같이 그 경계일 하루에 몰려 같은 팀이 겹쳐 뛰는 충돌이 났다. 이제
-    첫 사이클을 뺀 나머지는 이전 사이클 끝난 다음날부터 시작해서 경계일이
-    안 겹치게 한다."""
-    total = CLUB_SEASON_END_DAY - CLUB_SEASON_START_DAY
-    span = total / n_cycles
-    breakpoints = [CLUB_SEASON_START_DAY + round(i * span) for i in range(n_cycles + 1)]
-    breakpoints[-1] = CLUB_SEASON_END_DAY  # 마지막 경계는 항상 정확히 시즌 종료일
-    windows = []
-    for i in range(n_cycles):
-        c_start = breakpoints[i] if i == 0 else breakpoints[i] + 1
-        c_end   = breakpoints[i + 1]
-        mid = (c_start + c_end) // 2
-        windows.append((c_start, mid - 1, mid, c_end))
-    return windows
+    그래서 이제 시즌을 휴식기 기준으로 두 풀로 미리 나눠둔다:
+      pre_pool  (22~189)  — 모든 사이클의 1다리(h1)는 여기서만 배정
+      post_pool (218~300) — 모든 사이클의 2다리(h2)는 여기서만 배정
+    각 풀 안에서 사이클 수(n_cycles)만큼 다시 균등 분할한다(사이클이
+    여러 개인 소규모 다전제 리그, 예: 8팀 3사이클 대응). 이러면 어떤
+    다리/라운드도 휴식기 내부를 침범할 수 없다 — 풀 경계 자체가 이미
+    휴식기를 피해서 그어져 있기 때문.
+
+    사이클이 1개(legs=2, 대부분의 팀 수)면 h1=pre_pool 전체,
+    h2=post_pool 전체가 되어 "1다리=전반기, 2다리=후반기, 그 사이에
+    휴식기" 라는 가장 직관적인 형태로 자연스럽게 떨어진다.
+
+    [2026-07 이전 버그 수정, 유지] 사이클 경계가 겹쳐서 같은 팀이 같은
+    날 두 번 배정되던 문제 — 첫 구간을 뺀 나머지는 이전 구간 끝난
+    다음날부터 시작해서 경계일이 안 겹치게 하는 방식은 각 풀 내부에도
+    동일하게 적용한다.
+    """
+    pre_start, pre_end   = CLUB_SEASON_START_DAY, WINTER_OFFER_START_DAY - 1
+    post_start, post_end = WINTER_OFFER_END_DAY + 1, CLUB_SEASON_END_DAY
+
+    def _split_pool(pool_start, pool_end, n):
+        total = pool_end - pool_start
+        span = total / n
+        bps = [pool_start + round(i * span) for i in range(n + 1)]
+        bps[-1] = pool_end  # 마지막 경계는 항상 그 풀의 끝날
+        out = []
+        for i in range(n):
+            s = bps[i] if i == 0 else bps[i] + 1
+            e = bps[i + 1]
+            out.append((s, e))
+        return out
+
+    h1_windows = _split_pool(pre_start, pre_end, n_cycles)
+    h2_windows = _split_pool(post_start, post_end, n_cycles)
+    return [(h1s, h1e, h2s, h2e)
+            for (h1s, h1e), (h2s, h2e) in zip(h1_windows, h2_windows)]
 
 def day_to_week(day: int) -> int:
     """일자를 기존 week 체계로 역산 (1~52로 클램프)."""
     w = (day - 1) // DAYS_PER_WEEK + 1
     return max(1, min(52, w))
+
+
+def week_to_day(week: int) -> int:
+    """week 체계를 day로 정방향 변환 — 그 주의 첫째 날.
+    (day_to_week의 역함수. INTL_GROUP_WEEKS 등 기존 week 상수를
+    tournament_start_day 앵커로 쓸 때 사용)"""
+    return (week - 1) * DAYS_PER_WEEK + 1
 
 # ── 실제 달력(월/일) 표시용 ────────────────────────────────────
 # [2026-07 수정] 1일차 = 8월 1일로 했던 걸 1월 1일로 되돌렸다 — 시즌
@@ -331,8 +363,8 @@ def week_to_iso_date_str_end(season_year: int, week: int) -> str:
 # game_engine.py 등 아직 'week' 정수로 시즌 구간을 비교하는 코드가 많아서,
 # 위 day 상수들로부터 주차를 역산해 그대로 제공한다. 이 값들 자체를
 # 직접 바꾸지 말고 위 *_DAY 상수를 바꾸면 여기로 자동 반영된다.
-FIRST_HALF_START  = day_to_week(CLUB_SEASON_START_DAY)   # 4주
-SECOND_HALF_START = day_to_week(CLUB_SEASON_MID_DAY)     # 23주
+FIRST_HALF_START  = day_to_week(FIRST_HALF_START_DAY)    # 4주
+SECOND_HALF_START = day_to_week(SECOND_HALF_START_DAY)    # 32주 (중간 휴식기 반영)
 
 SEASON_PHASES = {
     "preseason1":  (day_to_week(CLUB_PRESEASON_START_DAY), day_to_week(CLUB_PRESEASON_END_DAY)),
@@ -341,11 +373,13 @@ SEASON_PHASES = {
     "postseason":  (day_to_week(INTL_OFFSEASON_START_DAY), 52),   # = 국제대회 전용 구간
 }
 
-# 오퍼(이적시장) 구간 — 실제 축구처럼 딱 2개(여름/겨울)만. 자동 오퍼 팝업은
-# 이 구간 안(in_zone)일 때만 뜬다 (ui/center_panel.py 참고).
+# 오퍼(이적시장) 구간 — [2026-07 확장] 비시즌 3개 구간(프리시즌/중간
+# 휴식기/국제 오프시즌) 전부에서 오퍼가 온다. 자동 오퍼 팝업은 이 구간
+# 안(in_zone)일 때만 뜬다 (ui/center_panel.py 참고).
 OFFER_ZONES = [
-    (day_to_week(CLUB_PRESEASON_START_DAY), day_to_week(CLUB_PRESEASON_END_DAY)),  # 여름(프리시즌)
-    (day_to_week(WINTER_OFFER_START_DAY),   day_to_week(WINTER_OFFER_END_DAY)),    # 겨울
+    (day_to_week(CLUB_PRESEASON_START_DAY), day_to_week(CLUB_PRESEASON_END_DAY)),      # 프리시즌
+    (day_to_week(WINTER_OFFER_START_DAY),   day_to_week(WINTER_OFFER_END_DAY)),        # 중간 휴식기
+    (day_to_week(INTL_OFFSEASON_START_DAY), 52),                                        # 국제 오프시즌
 ]
 
 # 국제대회 윈도우 — 클럽 시즌과 완전히 안 겹치는 전용 비시즌(301~364일=44~52주)
@@ -355,6 +389,112 @@ INTL_OFFSEASON_WEEK_END   = 52
 INTL_CALLUP_WEEK  = INTL_OFFSEASON_WEEK_START                        # 소집/조 추첨
 INTL_GROUP_WEEKS  = (INTL_OFFSEASON_WEEK_START + 1, INTL_OFFSEASON_WEEK_START + 3)   # 조별리그 3경기
 INTL_KO_WEEKS     = (INTL_OFFSEASON_WEEK_START + 4, INTL_OFFSEASON_WEEK_END)          # 16강~결승
+
+# ── [2026-07 신설, 국제대회 일 단위 전환 Phase 2] stage+round 기반 일정 규칙 ──
+# 설계 원칙(중요): 각 stage/round는 "하루"가 아니라 "며칠짜리 창"이다.
+# 그 창 안에서 daily_match_capacity만큼씩 채워가며 여러 날에 나눠 배정해야
+# 실제로 day가 week의 재탕이 아니게 된다 — 라운드당 day 하나만 쓰면 안 됨
+# (이전에 이 실수를 했다가 지적받고 수정함: 그러면 "day라는 이름의 week"밖에
+# 안 나옴). match_count는 daily_capacity의 배수가 되도록 맞춰뒀다
+# (days == ceil(match_count / daily_capacity)).
+#
+# 필드: (round_number, match_count, days, rest_days_after, daily_match_capacity,
+#        min_team_rest_days)
+# [2026-07 재조정 v2, 신민용 재요청: "월드컵 실제 기간(32강 4주/48강
+# 5~6주)에 맞게 토너먼트를 1일 단위로 압축해서 단축해라"] 한 라운드를
+# 1주 간격으로 뒀던 v1(rest_after=6)은 32강 체제 기준 6주, 48강 체제
+# 기준 7주가 나와 실제 대회 기간(각각 ~4주/~5~6주)보다 훨씬 길었다.
+# R32/R16/QF/SF는 그대로 라운드 전체를 하루(cap=match_count)에 몰아서
+# 열되, 다음 라운드까지의 휴식을 6일 → 3일로 줄여 "라운드 간격 4일"
+# (실제 대회의 라운드 간 텀과 비슷한 폭)이 되도록 압축한다 — 이렇게
+# 해도 하루 사전생성 셸(_precreate_ko_shell) 구조 덕분에 "일정이 안
+# 떠서 오류가 난다"던 예전 버그는 재발하지 않는다(그 버그의 원인은
+# 간격이 아니라 라운드 진출 시점에 새 행을 INSERT하던 구조 자체였음).
+# 실측 결과: 32강 체제 조별리그~결승 총 4주(28일), 48강 체제 총
+# 4.5주(32일)로 목표 기간에 맞게 단축됨. 3/4위전(TP)과 결승(F)은
+# 실제 대회처럼 그대로 바로 다음날 붙여서(둘 다 rest_after=0) 연다.
+TOURNAMENT_SCHEDULE_RULES = {
+    "world_cup_32": [
+        {"stage": "group", "round": 1, "match_count": 16, "days": 4, "rest_after": 0, "cap": 4, "min_rest": 0},
+        {"stage": "group", "round": 2, "match_count": 16, "days": 4, "rest_after": 0, "cap": 4, "min_rest": 2},
+        {"stage": "group", "round": 3, "match_count": 16, "days": 4, "rest_after": 2, "cap": 4, "min_rest": 2},
+        {"stage": "R16",   "round": 1, "match_count": 8,  "days": 1, "rest_after": 3, "cap": 8, "min_rest": 2},
+        {"stage": "QF",    "round": 1, "match_count": 4,  "days": 1, "rest_after": 3, "cap": 4, "min_rest": 3},
+        {"stage": "SF",    "round": 1, "match_count": 2,  "days": 1, "rest_after": 3, "cap": 2, "min_rest": 3},
+        {"stage": "TP",    "round": 1, "match_count": 1,  "days": 1, "rest_after": 0, "cap": 1, "min_rest": 3},
+        {"stage": "F",     "round": 1, "match_count": 1,  "days": 1, "rest_after": 0, "cap": 1, "min_rest": 3},
+    ],
+    "world_cup_48": [
+        {"stage": "group", "round": 1, "match_count": 24, "days": 4, "rest_after": 0, "cap": 6, "min_rest": 0},
+        {"stage": "group", "round": 2, "match_count": 24, "days": 4, "rest_after": 0, "cap": 6, "min_rest": 2},
+        {"stage": "group", "round": 3, "match_count": 24, "days": 4, "rest_after": 2, "cap": 6, "min_rest": 2},
+        {"stage": "R32",   "round": 1, "match_count": 16, "days": 1, "rest_after": 3, "cap": 16, "min_rest": 2},
+        {"stage": "R16",   "round": 1, "match_count": 8,  "days": 1, "rest_after": 3, "cap": 8, "min_rest": 2},
+        {"stage": "QF",    "round": 1, "match_count": 4,  "days": 1, "rest_after": 3, "cap": 4, "min_rest": 3},
+        {"stage": "SF",    "round": 1, "match_count": 2,  "days": 1, "rest_after": 3, "cap": 2, "min_rest": 3},
+        {"stage": "TP",    "round": 1, "match_count": 1,  "days": 1, "rest_after": 0, "cap": 1, "min_rest": 3},
+        {"stage": "F",     "round": 1, "match_count": 1,  "days": 1, "rest_after": 0, "cap": 1, "min_rest": 3},
+    ],
+    # [잠정] 대륙컵(24개국, 6조): 조별리그 매치수만 world_cup_32의 3/4 규모로
+    # 축소하고 나머지 라운드 구조는 동일하게 재사용. 실전 확인 전까지 잠정치.
+    "continental": [
+        {"stage": "group", "round": 1, "match_count": 12, "days": 4, "rest_after": 0, "cap": 3, "min_rest": 0},
+        {"stage": "group", "round": 2, "match_count": 12, "days": 4, "rest_after": 0, "cap": 3, "min_rest": 2},
+        {"stage": "group", "round": 3, "match_count": 12, "days": 4, "rest_after": 2, "cap": 3, "min_rest": 2},
+        {"stage": "R16",   "round": 1, "match_count": 8,  "days": 1, "rest_after": 3, "cap": 8, "min_rest": 2},
+        {"stage": "QF",    "round": 1, "match_count": 4,  "days": 1, "rest_after": 3, "cap": 4, "min_rest": 3},
+        {"stage": "SF",    "round": 1, "match_count": 2,  "days": 1, "rest_after": 3, "cap": 2, "min_rest": 3},
+        {"stage": "TP",    "round": 1, "match_count": 1,  "days": 1, "rest_after": 0, "cap": 1, "min_rest": 3},
+        {"stage": "F",     "round": 1, "match_count": 1,  "days": 1, "rest_after": 0, "cap": 1, "min_rest": 3},
+    ],
+}
+
+
+def get_stage_rule(tournament_type, stage, round_number=1):
+    """해당 stage/round의 규칙 dict를 반환. 없으면 None(예: 32개국 체제엔
+    round32 자체가 없어 자동으로 None → 생성기가 스킵)."""
+    for r in TOURNAMENT_SCHEDULE_RULES.get(tournament_type, []):
+        if r["stage"] == stage and r["round"] == round_number:
+            return r
+    return None
+
+
+def stage_round_start_day(tournament_type, stage, round_number, tournament_start_day):
+    """tournament_start_day부터 시작해 이전 stage/round들의 days+rest_after를
+    누적해서 해당 stage/round가 시작하는 절대 day를 계산한다."""
+    day = tournament_start_day
+    for r in TOURNAMENT_SCHEDULE_RULES.get(tournament_type, []):
+        if r["stage"] == stage and r["round"] == round_number:
+            return day
+        day += r["days"] + r.get("rest_after", 0)
+    raise ValueError(f"unknown stage/round: {tournament_type}/{stage}/{round_number}")
+
+
+def assign_match_days(start_day, match_count, daily_capacity):
+    """start_day부터 match_count개 경기를 daily_capacity개씩 채워가며 날짜를
+    배정한다. 라운드 전체에 day 하나만 주는 게 아니라 실제로 여러 날에
+    나눠 떨어지게 하는 게 핵심(그래야 day가 week 재탕이 안 됨).
+    반환: 매치 순서대로 대응하는 day 리스트."""
+    if not daily_capacity or daily_capacity <= 0:
+        daily_capacity = max(match_count, 1)
+    return [start_day + (i // daily_capacity) for i in range(match_count)]
+
+
+# [2026-07 재설계] 예선을 연말 오프시즌이 아니라 중간 휴식기(비시즌,
+# WINTER_OFFER_START~END_DAY) 안에서 진행한다. 조별리그 6라운드 + PO
+# 1라운드 = 7라운드를 4일 간격으로 압축하면 정확히 4주(28일) 휴식기
+# 안에 들어맞는다(설계 검증 완료: 190,194,198,202,206,210,214일).
+#
+# [capacity 방식 폐기] 예전엔 같은 week에 여러 조 경기가 몰리는 걸
+# INTL_QUAL_DAILY_CAPACITY로 나눠 배정했는데, 다시 보니 불필요한
+# 복잡도였다 — 같은 라운드 안의 다른 조 경기는 서로 다른 나라(팀)라서
+# 같은 날짜에 겹쳐도 실제 시뮬레이션 충돌이 아니다(실제 FIFA 예선도
+# 여러 조가 같은 매치데이에 동시 진행됨). 그래서 라운드 하나 = day
+# 하나로 단순화한다.
+INTL_QUAL_START_DAY      = WINTER_OFFER_START_DAY   # 190 (중간 휴식기 첫날)
+INTL_QUAL_ROUND_GAP_DAYS = 4                          # 라운드 간 간격
+INTL_QUAL_WEEK           = day_to_week(WINTER_OFFER_START_DAY)  # 트리거용 주차(28)
+
 
 
 # 훈련 설정
@@ -1237,7 +1377,15 @@ OVR_RANGES = {
     # 함께, 상한을 92로 낮춰 "챔피언십 에이스급 = 80대 후반~90대 초반"
     # (실측 목표 평균 ≈88, 스페인 세군다 ≈80.7보다는 확실히 위,
     # 잉글랜드 1부(90~100)와는 명확히 갈리도록) 재조정.
-    "SS":{1:(90,100),2:(78,92),3:(68,80),4:(53,65),5:(40,52),6:(28,40)},
+    # [2026-07 버그수정, 신민용 리포트: "잉글랜드 3부 리그가 스페인 3부
+    # 리그보다 낮다"] 확인해보니 3~6부 전 구간에서 SS(잉글랜드)가 S(프랑스/
+    # 스페인/독일/이탈리아/브라질 공용)보다 낮게 잡혀 있었다 — 예:
+    # 3부 SS(68~80) vs S(76~88), 6부 SS(28~40) vs S(44~56). 2부는 앞서
+    # 여러 차례(위 주석 참고) 챔피언십 vs 세군다 문제로 조정된 적이
+    # 있었지만, 그 아래 3~6부는 그 조정에서 함께 안 딸려 올라와서 예전
+    # (더 낮았던) 값 그대로 남아있었다. SS 내부 서열(1부>2부>3부…)은
+    # 그대로 유지하면서, 3~6부를 S의 해당 부수보다 확실히 위로 재조정한다.
+    "SS":{1:(90,100),2:(78,92),3:(78,90),4:(66,78),5:(56,68),6:(46,58)},
     "S": {1:(85,96), 2:(86,94),3:(76,88),4:(62,73),5:(52,64),6:(44,56)},
     "A": {1:(82,94), 2:(73,85),3:(65,75),4:(55,68)},
     "B": {1:(72,82), 2:(66,74),3:(55,63),4:(38,49)},

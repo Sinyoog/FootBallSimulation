@@ -108,7 +108,7 @@ class BracketWidget(QWidget):
         for ri in range(1, n_rounds):
             n_cur = len(self._rounds[ri]["matches"])
             raw = []
-            for m in self._rounds[ri]["matches"]:
+            for j0, m in enumerate(self._rounds[ri]["matches"]):
                 home, away = m.get("home"), m.get("away")
                 ys = []
                 # [버그수정 2026-07, 신민용 리포트: "3/4위전이 결승 옆에
@@ -122,6 +122,19 @@ class BracketWidget(QWidget):
                 # 화면 맨 위쪽에 붙어버렸다. 직전 라운드부터 시작해 매칭될
                 # 때까지 점점 더 이전 라운드를 훑도록 고쳐서, 3/4위전도
                 # 4강(그 경기의 진짜 부모 라운드)과 올바르게 정렬된다.
+                # [2026-07 신설, 신민용 리포트: "결승/3-4위전 칸이 대진표
+                # 위쪽에 툭 튀어나와 있다"] 이름 매칭은 실제 팀명이 있어야만
+                # 되는데, intl_engine._precreate_ko_shell로 미리 만든 아직
+                # 안 정해진 미래 라운드는 home/away가 전부 "미정"(빈
+                # 문자열을 표시용으로 바꿔 넣은 값)이라 이름 매칭이 하나도
+                # 안 걸린다 — 그러면 아래 보간 단계에서도 앞뒤로 매칭된
+                # 값이 하나도 없어 캔버스 맨 위(top)로 폴백해버렸다.
+                # 이름 매칭이 이 back 레벨에서 실패했을 때는, 표준 토너먼트
+                # 대진 구조상 이번 라운드의 j0번째 경기가 그 부모 라운드의
+                # (2*j0, 2*j0+1)번째 경기에서 나온다는 사실 자체는 팀명을
+                # 몰라도 항상 성립하므로, 그 규칙으로 대체한다(3/4위전처럼
+                # 진짜 부모가 바로 직전이 아니라 몇 라운드 전이어도 이
+                # back 루프가 그 라운드까지 계속 훑어주므로 그대로 맞는다).
                 for back in range(1, ri + 1):
                     prev = self._centers[ri - back]
                     prev_matches = self._rounds[ri - back]["matches"]
@@ -134,6 +147,9 @@ class BracketWidget(QWidget):
                         if away and away in pteam:
                             ys.append(prev[k])
                     if ys:
+                        break
+                    if len(prev) == 2 * n_cur and 2 * j0 + 1 < len(prev):
+                        ys = [prev[2 * j0], prev[2 * j0 + 1]]
                         break
                 raw.append(sum(ys) / len(ys) if ys else None)
 

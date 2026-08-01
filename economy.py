@@ -696,6 +696,31 @@ def _calc_salary(grade, tier, ovr, country=None, team_name=None, year=None):
 LEAGUE_GRADE_RANK = {"F": 1, "E": 2, "D": 3, "C": 4, "B": 5, "A": 6, "S": 7, "SS": 8}
 
 
+def seller_origin_dampen_mult(buyer_grade: str, seller_grade: str) -> float:
+    """[2026-07 신설, 신민용 리포트: "K리그에서 판매한 이적료가 너무
+    크다"] 지금까지 오퍼의 기준가(_base_fee, estimate_transfer_fee 결과)는
+    오직 '사는 팀'의 리그 등급만으로 계산됐다 — 정작 지금 선수가 뛰고
+    있는 리그(파는 쪽) 수준은 최종 제안액에 붙는 프리미엄
+    (offer_premium_mult)에서만 간접적으로 쓰이고, 정작 min_accept의
+    기준이 되는 base_fee 자체엔 전혀 반영되지 않았다. 그 결과 K리그(C급)
+    소속 선수라도 SS급 빅클럽이 관심을 보이면 기준가부터 SS급 선수와
+    똑같이 잡혀서(그 위에 오퍼 프리미엄까지 더해짐) 비현실적으로 큰
+    액수가 나왔다.
+
+    현실에서는 하위 리그 출신은 실력이 같아도 '검증이 덜 됐다'는 할인이
+    들어간다 — 매수팀 등급이 지금 뛰는 리그보다 높을수록(격차가 클수록)
+    기준가 자체를 낮춘다. 격차가 없거나 오히려 하향/동급 이적이면 할인
+    없음(1.0) — 이미 검증된 무대라 깎을 이유가 없다. 상한을 60%로 둬서
+    아무리 격차가 커도 '재능 자체'의 가치는 남게 한다(완전히 무시되진
+    않음 — 묻지마 영입 프리미엄이 이 위에 그대로 곱해져 극단적 이적도
+    여전히 가능).
+    """
+    gap = LEAGUE_GRADE_RANK.get(buyer_grade, 4) - LEAGUE_GRADE_RANK.get(seller_grade, 4)
+    if gap <= 0:
+        return 1.0
+    return max(0.60, 1.0 - gap * 0.08)
+
+
 def offer_premium_mult(buyer_grade: str, my_grade: str) -> float:
     """매수팀 등급이 내 팀보다 얼마나 높은지(gap)에 따라 오퍼 제안액에
     붙는 프리미엄 배율. 같은 급끼리는 정상 협상 범위(0.9~1.1)에 머물고,
