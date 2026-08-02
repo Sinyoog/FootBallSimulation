@@ -71,14 +71,17 @@ _NAT_SQUAD_POSITIONS = ["GK", "CB", "CB", "LB", "RB", "CDM", "CM", "CAM", "LW", 
 
 def _get_real_squad_ovr(country):
     """[2026-07 신설, 신민용 확정: "국적 배정했으니 스쿼드도 실제 선수로
-    뽑아야"] database.get_country_squad_players()의 3단계 폴백(국적태그→
+    뽑아야"] database.get_country_avg_squad_ovr()의 3단계 폴백(국적태그→
     자국리그→해외 하위리그)으로 실제 선수 풀을 최대한 넓게 확보한다.
-    그래도 8명 미만이면 None을 반환해 호출부가 기존 공식값을 쓰게 한다."""
-    from database import get_country_squad_players
-    picked = get_country_squad_players(country, min_count=8)
-    if len(picked) < 8:
-        return None
-    return sum(p["ovr"] for p in picked) / len(picked)
+    그래도 8명(포지션) 미만이면 None을 반환해 호출부가 기존 공식값을 쓰게 한다.
+
+    [2026-07 버그수정, 신민용 리포트: "국대 실제값이 밴드 상한을 훨씬
+    넘어선다"] 원래는 get_country_squad_players(포지션당 1등 픽)를 썼는데,
+    단일 이상치(707명 중 우연히 EPL 소속인 1명 때문에 평균이 88.6까지
+    치솟은 실측 사례)에 취약했다 — get_country_avg_squad_ovr(포지션당
+    상위 3명 평균)로 교체해서 안정성을 높였다."""
+    from database import get_country_avg_squad_ovr
+    return get_country_avg_squad_ovr(country, min_count=8)
 
 
 _grade_rank_cache = {}   # {grade: [(country_name, fifa_rank), ...] 오름차순} — 등급별 1회만 조회
@@ -1531,6 +1534,35 @@ def _intl_tier_penalty(tier):
     return {2: -4.0, 3: -9.0, 4: -15.0}.get(t, -18.0)
 
 
+def _intl_ovr_gap_penalty(ovr, real_squad_ovr):
+    """[2026-07 재설계, 신민용 지적: "OVR 컷은 좋은 아이디어지만 하드컷
+    보다는 평균과의 격차에 따라 단계적으로 문턱이 낮아지는 게 현실적이다
+    — 88.4는 절대 못 뽑히는 게 아니니까"] 하드컷(딱 잘라 탈락) 대신
+    평균과의 gap을 5단계로 나눠 선발점수에서 깎는 정도를 조절한다.
+    "후보 자격을 아예 박탈"하는 게 아니라 "경쟁에서 불리하게 만드는"
+    방식이라, 폼이 특출나면(아래 형식 경쟁에서) 여전히 역전 가능하다.
+
+      평균+2 이상   → 0점 감점    (무조건 후보)
+      평균 ~ +2     → 1점 감점    (대부분 후보)
+      평균-2 ~ 0    → 6점 감점    (폼이 좋아야 후보)
+      평균-5 ~ -2   → 14점 감점   (특수한 경우만)
+      평균-5 미만   → 30점 감점   (거의 불가능하지만 절대불가는 아님)
+    """
+    if real_squad_ovr is None:
+        return 0.0
+    gap = ovr - real_squad_ovr
+    if gap >= 2:
+        return 0.0
+    elif gap >= 0:
+        return 1.0
+    elif gap >= -2:
+        return 6.0
+    elif gap >= -5:
+        return 14.0
+    else:
+        return 30.0
+
+
 def _check_selection(p, my_grade, country="", continent=""):
     """국가대표 선발 판정 — [2026-07 전면 재설계, 신민용 확정] "OVR이 그
     나라 평균과 비슷하면 무조건 뽑힌다"는 절대 문턱 방식에서, 실제
@@ -1566,14 +1598,32 @@ def _check_selection(p, my_grade, country="", continent=""):
         pos_group, group_members = "MF", MF_POS
     else:
         pos_group, group_members = "FW", FW_POS
-    quota = INTL_SQUAD_QUOTA.get(pos_group, 4)
 
     nat = country or p.get("nationality", "")
+
+    # [2026-07 재설계, 신민용 지적: "그래도 K3리그에서 뛰는 선수가 국대
+    # 발탁은 아니지" → "OVR는 그 나라 평균은 되어야 뽑히게" → "근데 딱
+    # 잘리는 하드컷보다는 평균과의 격차에 따라 단계적으로 낮아지는 게
+    # 현실적이다"] _get_real_squad_ovr(그 나라 실제 스쿼드 평균 OVR —
+    # get_country_ovr에 이미 70% 가중치로 블렌딩되는 것과 같은 값)를
+    # "후보 자격을 아예 박탈하는 하드컷"이 아니라 "선발점수에서 깎는
+    # 정도를 정하는 기준"으로 쓴다(_intl_ovr_gap_penalty, 5단계 그라데이션)
+    # — 최종 판정은 여전히 아래 포지션 경쟁·폼 반영 점수 비교가 담당한다.
+    # 그 나라 실제 스쿼드 표본이 너무 적어(8명 미만) real_val이 없으면
+    # (신생/희귀 국적 등) 감점 없이(0.0) 기존 폼 경쟁으로만 판정한다.
+    _real_squad_ovr = _get_real_squad_ovr(nat) if nat else None
+
+    quota = INTL_SQUAD_QUOTA.get(pos_group, 4)
+
     _league_grade_team = get_league_grade(country, my_grade)
     team_avg = GRADE_TEAM_OVR.get(my_grade, 45) + \
         get_country_ovr_bonus(country, _league_grade_team, continent)
 
     # 그 나라 동포지션 AI 후보 전원 수집 + 폼 추정 (+ 실제 소속 리그 부수)
+    # [2026-07 재설계] AI 후보 쪽도 SQL로 아예 걸러내지 않는다 — 나만
+    # 경쟁에서 불리해지고 AI는 무조건 후보 자격을 유지하는 비대칭을
+    # 피하기 위해, 아래 ai_scores 계산에서 동일한 그라데이션 감점을
+    # 각 AI 후보의 OVR 기준으로 적용한다(경쟁 자체에서 자연스럽게 밀림).
     conn = get_conn()
     ph = ",".join("'%s'" % pp for pp in group_members)
     rows = conn.execute(
@@ -1645,10 +1695,12 @@ def _check_selection(p, my_grade, country="", continent=""):
     if p.get("season_matches", 0) < 10:
         penalty += 6.0
     penalty -= _intl_tier_penalty(p.get("current_tier", 1))   # 마이너스 페널티를 더하는 형태이므로 부호 반전
+    penalty += _intl_ovr_gap_penalty(p.get("ovr", 0), _real_squad_ovr)
 
     my_ovr = p.get("ovr", 0)
     my_score = my_ovr * 0.45 + my_norm * 0.55 - penalty
     ai_scores = sorted((ovr_by_id[k] * 0.45 + norm_by_id[k] * 0.55 + _intl_tier_penalty(tier_by_id.get(k, 1))
+                        - _intl_ovr_gap_penalty(ovr_by_id[k], _real_squad_ovr)
                         for k in raw_by_id), reverse=True)
 
     if len(ai_scores) < quota:

@@ -373,22 +373,47 @@ SEASON_PHASES = {
     "postseason":  (day_to_week(INTL_OFFSEASON_START_DAY), 52),   # = 국제대회 전용 구간
 }
 
+# 국제대회 윈도우 — 클럽 시즌과 완전히 안 겹치는 전용 비시즌(301~364일=44~52주)
+# 전체를 사용. 월드컵은 조별리그+토너먼트, 대륙컵/예선도 전부 이 안에서 진행.
+#
+# [2026-07 승강 플레이오프 도입, 캘린더 재설계] 원래는 INTL_OFFSEASON_WEEK_START
+# (44주)가 곧 소집 주(INTL_CALLUP_WEEK)였다 — 그 주엔 실제 경기가 없고
+# "국가대표 소집!" 로그만 뜨는 순수 버퍼 주였다. 승강 PO를 넣으면서 이 44주를
+# PO 전용 주로 쓰기로 했고, 원래 있던 "소집 주"는 그대로 없애지 않고 PO
+# 바로 다음 주(45주)로 옮겼다 — 새 이벤트를 만든 게 아니라 기존 소집
+# 이벤트가 원래 하려던 역할(경기 없이 대표팀 합류를 준비하는 한 주)을 PO
+# 때문에 밀려난 자리에서 되찾은 것뿐이다. 이 아래로 파생되는 GROUP_WEEKS/
+# KO_WEEKS는 전부 INTL_CALLUP_WEEK 기준 상대값이라 자동으로 함께 밀린다
+# (club_world_cup_engine.CWC_START_DAY 등도 마찬가지로 자동 반영).
+#
+#   44주 = 승강 플레이오프 (아직 미구현 — 그 전까지는 그냥 빈 주)
+#   45주 = 국가대표 소집 (기존 이벤트, 경기 없음)
+#   46주 = 조별리그 시작
+INTL_OFFSEASON_WEEK_START = day_to_week(INTL_OFFSEASON_START_DAY)   # 44
+INTL_OFFSEASON_WEEK_END   = 52
+PLAYOFF_WEEK      = INTL_OFFSEASON_WEEK_START                        # 44 — 승강 PO 전용 주
+INTL_CALLUP_WEEK  = INTL_OFFSEASON_WEEK_START + 1                    # 45 — 소집/조 추첨
+INTL_GROUP_WEEKS  = (INTL_CALLUP_WEEK + 1, INTL_CALLUP_WEEK + 3)   # 조별리그 3경기 (46~48)
+INTL_KO_WEEKS     = (INTL_CALLUP_WEEK + 4, INTL_OFFSEASON_WEEK_END)   # 16강~결승 (49~52)
+
 # 오퍼(이적시장) 구간 — [2026-07 확장] 비시즌 3개 구간(프리시즌/중간
 # 휴식기/국제 오프시즌) 전부에서 오퍼가 온다. 자동 오퍼 팝업은 이 구간
 # 안(in_zone)일 때만 뜬다 (ui/center_panel.py 참고).
+#
+# [2026-08 버그수정, 신민용 리포트: "오퍼가 44주(PLAYOFF_WEEK)부터 오는데
+# 내 팀이 승강 플레이오프에 걸리면 충돌 안 나?"] 정확한 지적 — 자동 오퍼
+# 팝업은 모달(dlg.exec())이라 뜨는 동안 진행 자체를 막는데, 44주는 바로 그
+# PO 경기가 실제로 열리는 주(위 PLAYOFF_WEEK 설명 참고)라 PO 경기를
+# 진행해야 하는 그 주에 오퍼 모달이 끼어들 수 있었다. 국제 오프시즌 쪽
+# 오퍼 시작을 PO 다음 주인 INTL_CALLUP_WEEK(45주 — 원래도 "경기 없는
+# 순수 버퍼 주"로 설계돼 있던 주)로 한 주 늦춘다 — PO가 없는 팀도 이
+# 버퍼 주엔 어차피 아무 경기가 없으니 손해가 없고, PO가 있는 팀은 더 이상
+# 겹치지 않는다.
 OFFER_ZONES = [
     (day_to_week(CLUB_PRESEASON_START_DAY), day_to_week(CLUB_PRESEASON_END_DAY)),      # 프리시즌
     (day_to_week(WINTER_OFFER_START_DAY),   day_to_week(WINTER_OFFER_END_DAY)),        # 중간 휴식기
-    (day_to_week(INTL_OFFSEASON_START_DAY), 52),                                        # 국제 오프시즌
+    (INTL_CALLUP_WEEK,                       52),                                        # 국제 오프시즌(PO 다음 주부터)
 ]
-
-# 국제대회 윈도우 — 클럽 시즌과 완전히 안 겹치는 전용 비시즌(301~364일=44~52주)
-# 전체를 사용. 월드컵은 조별리그+토너먼트, 대륙컵/예선도 전부 이 안에서 진행.
-INTL_OFFSEASON_WEEK_START = day_to_week(INTL_OFFSEASON_START_DAY)   # 44
-INTL_OFFSEASON_WEEK_END   = 52
-INTL_CALLUP_WEEK  = INTL_OFFSEASON_WEEK_START                        # 소집/조 추첨
-INTL_GROUP_WEEKS  = (INTL_OFFSEASON_WEEK_START + 1, INTL_OFFSEASON_WEEK_START + 3)   # 조별리그 3경기
-INTL_KO_WEEKS     = (INTL_OFFSEASON_WEEK_START + 4, INTL_OFFSEASON_WEEK_END)          # 16강~결승
 
 # ── [2026-07 신설, 국제대회 일 단위 전환 Phase 2] stage+round 기반 일정 규칙 ──
 # 설계 원칙(중요): 각 stage/round는 "하루"가 아니라 "며칠짜리 창"이다.

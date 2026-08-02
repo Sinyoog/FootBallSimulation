@@ -7,6 +7,7 @@ import intl_engine
 import champions_engine
 import cup_engine
 import club_world_cup_engine
+import promotion_playoff_engine
 from match_sim import match_flow
 from match_sim import tactical_engine
 from database import (get_conn, calc_ovr, ALL_STATS,
@@ -858,10 +859,11 @@ def _update_career_stats(p, year, week):
         matches=?, goals=?, assists=?, saves=?, goals_against=?,
         avg_rating=?, team_rank=?, wins=?, draws=?, losses=?, clean_sheets=?,
         shots=?, shots_on=?, key_passes=?, dribbles=?, blocks=?, pass_acc=?,
-        team_id=?
+        team_id=?, league_name=?, tier=?
         WHERE id=?""",
         (sm, sg, sa, ss, sga, avg_r, rn, tw, td, tl, cs,
-         d_sh, d_sho, d_kp, d_drb, d_blk, d_pac, tid, existing["id"]))
+         d_sh, d_sho, d_kp, d_drb, d_blk, d_pac, tid,
+         team_row["lname"], team_row["tier"], existing["id"]))
     conn.commit()
     conn.close()
 
@@ -1339,6 +1341,8 @@ def advance_days(schedule: list):
                 cup_engine.sim_my_cup_match_as_ai(week, p, reason="injury", day=day)
             elif isinstance(detail, dict) and detail.get("cwc"):
                 club_world_cup_engine.sim_my_cwc_match_as_ai(week, p, reason="injury", day=day)
+            elif isinstance(detail, dict) and detail.get("po"):
+                promotion_playoff_engine.sim_my_po_match_as_ai(week, p, reason="injury", day=day)
             elif stype == "경기":
                 _sim_my_team_match_as_ai(week, p, cur_season)
             else:
@@ -1356,6 +1360,8 @@ def advance_days(schedule: list):
                     cup_engine.sim_my_cup_match_as_ai(week, p, reason="injury", day=day)
                 elif club_world_cup_engine.get_my_cwc_match(week, day=day):
                     club_world_cup_engine.sim_my_cwc_match_as_ai(week, p, reason="injury", day=day)
+                elif promotion_playoff_engine.get_my_po_match(week, day=day):
+                    promotion_playoff_engine.sim_my_po_match_as_ai(week, p, reason="injury", day=day)
                 else:
                     _sim_my_unscheduled_match(week, p, cur_season, day=day)
         elif stype == "경기":
@@ -1368,6 +1374,8 @@ def advance_days(schedule: list):
                 cup_engine.simulate_my_cup_match(week, p, day=day)
             elif isinstance(detail, dict) and detail.get("cwc"):
                 club_world_cup_engine.simulate_my_cwc_match(week, p, day=day)
+            elif isinstance(detail, dict) and detail.get("po"):
+                promotion_playoff_engine.simulate_my_po_match(week, p, day=day)
             else:
                 _simulate_match(p, week, detail, day=day)
         else:
@@ -1383,6 +1391,7 @@ def advance_days(schedule: list):
             cm = champions_engine.get_my_cl_match(week, day=day) if day == _intl_cl_day else None
             cu = cup_engine.get_my_cup_match(week, day=day) if day == _intl_cl_day else None
             cw = club_world_cup_engine.get_my_cwc_match(week, day=day)
+            po = promotion_playoff_engine.get_my_po_match(week, day=day)
             if im:
                 _had_match = True
                 intl_engine.simulate_my_match(week, p, day=day)
@@ -1395,6 +1404,9 @@ def advance_days(schedule: list):
             elif cw:
                 _had_match = True
                 club_world_cup_engine.simulate_my_cwc_match(week, p, day=day)
+            elif po:
+                _had_match = True
+                promotion_playoff_engine.simulate_my_po_match(week, p, day=day)
             else:
                 _process_training(p, week, stype, detail, day=day)
                 _sim_my_unscheduled_match(week, p, cur_season, day=day)
@@ -1429,6 +1441,29 @@ def advance_days(schedule: list):
         # 여파로 "미정"인 채 굳어있게 됨). intl_engine과 동일하게 매일
         # 부른다 — 처리할 게 없는 날엔 비용이 거의 없다.
         club_world_cup_engine.process_cwc_week(week, day=day)
+
+        # [2026-07 리팩터, 승강 플레이오프 도입 — 신민용 설계: "_end_of_season이
+        # 역할을 너무 많이 갖고 있다, 시간축 기준으로 책임을 재배치하자"]
+        # 원래 _finish_incomplete_matches_for_season + _process_promotion_
+        # relegation은 _end_of_season() 안에 있어서 52주 종료(새해 진입)
+        # 시점에야 실행됐다 — 그런데 승강 플레이오프는 44주(그 해 안)에
+        # 열려야 하니, 그 결과를 만드는 이 두 함수는 클럽 시즌이 실제로
+        # 끝나는 시점(CLUB_SEASON_END_DAY=300일, 43주)에 확정돼야 한다.
+        # 두 함수를 통째로 그 시점에 맞춰 옮겼다(_finalize_club_season) —
+        # 계산 결과 자체는 안 바뀐다(그 사이 클럽 경기가 없어서 언제
+        # 계산해도 같은 숫자). _end_of_season에 남은 나머지(노화/행복도/
+        # 시즌기록초기화/AI 생애주기/계약 등 "연도 전환" 성격의 일들)는
+        # get_player()로 그때그때 최신 상태를 재조회하는 방식이라, 승강이
+        # 이미 훨씬 전에 끝나있어도 아무 문제 없이 그대로 반영된다.
+        from constants import CLUB_SEASON_END_DAY
+        if day == CLUB_SEASON_END_DAY:
+            _finalize_club_season(p, st["current_year"])
+            promotion_playoff_engine.start_promotion_playoffs(st["current_year"])
+
+        # [2026-07 신설] 승강 PO도 intl/cwc와 동일한 day 기반 멱등
+        # 실행기다 — 44주 동안 매일 불러 그날 온 경기를 처리한다.
+        promotion_playoff_engine.process_po_week(week, day=day)
+
 
         _do_flush = False
         if is_week_last_day:
@@ -2394,8 +2429,16 @@ def _simulate_match(p, week, info: dict, day=None):
         # 개인 스탯만 그걸 못 따라가는 비대칭이었다. 국제대회와 동일하게
         # 오늘 상대 팀의 실제 평균 OVR을 넘긴다.
         _opp_ovr = away_ovr if is_home else home_ovr
+        # [2026-07 구조수정] 전술엔진이 실제로 만든 유효슈팅 수를 GK 평점
+        # 계산에 그대로 넘긴다 — engine_stats가 있고(전술엔진 성공) 내가 GK일
+        # 때만 계산(필드플레이어는 안 쓰는 값이라 굳이 계산 안 함). 전술엔진이
+        # 예외로 폴백했다면(engine_stats=None) _player_perf 내부가 자동으로
+        # 예전 랜덤 테이블 경로로 폴백한다.
+        _opp_sot = None
+        if engine_stats is not None and my_position == "GK":
+            _opp_sot = engine_stats["away"]["shots_on"] if is_home else engine_stats["home"]["shots_on"]
         goals, assists, saves, rating, events, detail = _player_perf(
-            p, outcome, is_home, hs, as_, c=c, opp_ovr=_opp_ovr)
+            p, outcome, is_home, hs, as_, c=c, opp_ovr=_opp_ovr, opp_sot=_opp_sot)
         if p.get("slump"):
             rating = round(max(3.0, rating + SLUMP_RATING_PENALTY), 1)
         # [2026-07 신설] 퇴장 판정 — '폭력적' 성격의 red_card_chance 반영.
@@ -3146,7 +3189,7 @@ _GK_SUB_ROLE_SR_MOD = {
 }
 
 
-def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None):
+def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None, opp_sot=None):
     """경기 퍼포먼스 계산 v3.
     포지션별 Base 차등 + 활약 가산 구조.
     수비수는 실점 관여 확률 트리거 감점.
@@ -3225,19 +3268,52 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None):
         _gk_sr = p.get("sub_role", "") or ""
         _sr_target = max(0.20, min(0.95, _sr_target + _GK_SUB_ROLE_SR_MOD.get(_gk_sr, 0.0)))
 
-        if _tier == 1:   _base_sot = random.choices([1,2,3,4,5], [10,24,30,22,14])[0]
-        elif _tier == 2: _base_sot = random.choices([1,2,3,4,5], [8,22,30,24,16])[0]
-        else:            _base_sot = random.choices([1,2,3,4,5,6],[6,18,26,24,16,10])[0]
-        _expose = max(0.55, min(1.7, 1.45 - 0.46 * min(2.2, dom)))
-        extra_sot   = max(0, int(round(_base_sot * _expose)))
-        total_shots = max(opp_score + 1, opp_score + extra_sot)
-        saves = max(0, min(total_shots - opp_score,
-                           round(total_shots * _sr_target - opp_score*(1-_sr_target))))
-        rate  = saves / total_shots if total_shots else 0
-        _faced = total_shots
+        if opp_sot is not None:
+            # [2026-07 구조수정, 신민용 GK QA: "평점 모델이 상상하는 SOT가
+            # 실제 경기 SOT와 어긋난다(OVR85~90 부근에서 부호 역전, 그 여파로
+            # OVR100 평균saves가 OVR80보다 낮아짐)"] 전술엔진(tactical_engine)이
+            # 이미 실제로 몇 개의 유효슈팅을 만들었는지 알고 있고, 그 결과가
+            # opp_score(실점)까지 확정된 상태로 넘어온다 — "유효슈팅은 반드시
+            # 골 아니면 선방"이라는 엔진의 불변식 덕분에, saves는 더 이상
+            # _sr_target으로 재추정할 필요 없이 total_shots-opp_score로 정확히
+            # 결정된다(추가 확률층을 얹으면 오히려 실제 경기와 다시 어긋나는
+            # 이중구조가 재발함). _sr_target/_base_sot 랜덤 테이블은 이 값이
+            # 없을 때(폴백 경로)만 쓰는 백업으로 아래에 남겨둔다.
+            total_shots = max(opp_score, int(round(opp_sot)))
+            saves = max(0, total_shots - opp_score)
+            rate  = saves / total_shots if total_shots else 0
+            _faced = total_shots
+        else:
+            if _tier == 1:   _base_sot = random.choices([1,2,3,4,5], [10,24,30,22,14])[0]
+            elif _tier == 2: _base_sot = random.choices([1,2,3,4,5], [8,22,30,24,16])[0]
+            else:            _base_sot = random.choices([1,2,3,4,5,6],[6,18,26,24,16,10])[0]
+            # [2026-07 QA 버그수정, 신민용 리포트: "GK 평점이 OVR85에서 정점
+            # 찍고 90~100으로 갈수록 오히려 떨어진다"] 압도적인 팀(dom 高)일
+            # 수록 슈팅을 적게 받는 건 현실적이나, expose 하한이 0.55까지
+            # 떨어지면서 OVR95~100 골키퍼가 슈팅 자체를 너무 적게 받아
+            # `_faced>=3` 보너스 구간(최대 +2.0)에 못 들어가고 "슈팅 적은
+            # 경기" 구간(최대 +0.55)에 갇히는 역전 현상이 있었다. 하한을
+            # 0.55→0.70으로 완화했다.
+            _expose = max(0.70, min(1.7, 1.45 - 0.46 * min(2.2, dom)))
+            extra_sot   = max(0, int(round(_base_sot * _expose)))
+            total_shots = max(opp_score + 1, opp_score + extra_sot)
+            saves = max(0, min(total_shots - opp_score,
+                               round(total_shots * _sr_target - opp_score*(1-_sr_target))))
+            rate  = saves / total_shots if total_shots else 0
+            _faced = total_shots
+            # [구조수정 부수효과] sub_role(_GK_SUB_ROLE_SR_MOD)은 원래
+            # _sr_target을 통해 saves 카운트 자체에 반영됐는데, opp_sot 경로는
+            # saves가 실제 경기로 정확히 결정돼 그 채널이 사라진다. 세이브전문형/
+            # 스위퍼킵퍼 색깔을 완전히 지우지 않기 위해, 작은 폭이었던 원래
+            # 효과(±0.015~0.02)를 평점에 직접 소폭 반영한다.
+            pass
+        if opp_sot is not None:
+            base_sub_role_nudge = _GK_SUB_ROLE_SR_MOD.get(_gk_sr, 0.0) * 2.5
+        else:
+            base_sub_role_nudge = 0.0
 
         # GK 기본 Base 6.20
-        base = 6.20
+        base = 6.20 + base_sub_role_nudge
         # 선방 퀄리티 보정
         if _faced >= 3:
             if   rate >= 0.85: base += 1.4 + 0.6*_ovr_t; events.append("🧤 믿을 수 없는 선방쇼!")
@@ -3247,9 +3323,20 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None):
             elif opp_score > 0 and rate < 0.45: base -= 1.0; events.append("😞 불안한 선방...")
             elif opp_score > 0 and rate < 0.55: base -= 0.4
         else:
-            if saves >= 2: base += 0.3 + 0.25*_ovr_t; events.append("🧤 안정적인 선방")
-            elif saves == 1: base += 0.1 + 0.15*_ovr_t
-            elif opp_score == 0: base += 0.15*_ovr_t
+            # [2026-07 QA 버그수정] 슈팅을 적게 받아도(압도적인 팀 소속)
+            # 다 막았으면 그에 걸맞은 보너스를 받아야 한다 — 예전엔
+            # saves>=2에서 최대 +0.55뿐이라, "슈팅 5개 중 4개 막은 평범한
+            # 경기"(최대 +2.0 구간)보다 "슈팅 2개 중 2개 다 막은 완벽한
+            # 경기"가 더 낮게 평가되는 역전이 있었다.
+            _rate_lowvol = saves / max(1, _faced)
+            if saves >= 2 and _rate_lowvol >= 0.8:
+                base += 0.9 + 0.5*_ovr_t; events.append("🧤 안정적인 선방")
+            elif saves >= 2:
+                base += 0.4 + 0.3*_ovr_t; events.append("🧤 안정적인 선방")
+            elif saves == 1:
+                base += 0.15 + 0.2*_ovr_t
+            elif opp_score == 0:
+                base += 0.25*_ovr_t
         if _faced - opp_score >= 5 and rate >= 0.70:
             base += 0.4; events.append("🛡 슈팅 세례를 막아냄")
         # 무실점/대량실점
@@ -3271,10 +3358,20 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None):
     # ══════════════════════════════════════════════════════════
     else:
         # ── 포지션별 Base + 계수 설정 ───────────────────────
+        # [2026-07 Step2 재보정, 신민용+GPT 실측 기반] "OVR80 선수가 OVR80
+        # 환경(gap=0)에서 뛰면 그 포지션의 평균적인 시즌"이 되도록 전
+        # 포지션 g_base/g_sh/g_dr(골)·a_base/a_pa/a_dr(어시)를 실측
+        # 비율로 축소했다 — 예전엔 ST 19.6골/CM 12.6도움/CB 2.9도움처럼
+        # 전 포지션이 목표(ST 11~13골, CM 5~8도움, CB 0~2도움)보다
+        # 1.5~3배 높게 나왔다. dom(격차) 배수 구조와 상단 폭발력은 그대로
+        # 두고(_dominance_mult 자체는 이미 검증됨) "gap=0일 때의 밑바탕"만
+        # 낮췄다 — 그래서 하위리그 지배(gap 있는 경우)는 여전히 폭발적으로
+        # 나온다. base(포지션 기본 평점)는 골 기여가 줄어든 만큼 살짝
+        # 올려서, gap=0에서도 목표 평점(6.8~7.1)이 나오게 맞췄다.
         if pos in ("ST", "CF"):
-            base = 5.80
-            g_base, g_sh, g_dr = 0.30, 0.24, 0.05
-            a_base, a_pa, a_dr = 0.06, 0.14, 0.06
+            base = 6.40
+            g_base, g_sh, g_dr = 0.18, 0.15, 0.03
+            a_base, a_pa, a_dr = 0.045, 0.10, 0.045
             g_goal, g_asst     = 1.10, 0.70
             g_pos_mult         = 1.55
             sp_goal            = 0.0
@@ -3282,9 +3379,9 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None):
             _stat_bonus = 0.10*sh + 0.06*pos_s + 0.04*hd
 
         elif pos in ("LW", "RW"):
-            base = 5.80
-            g_base, g_sh, g_dr = 0.18, 0.12, 0.10  # 어시 특화라 골 낮춤
-            a_base, a_pa, a_dr = 0.18, 0.26, 0.16
+            base = 6.40
+            g_base, g_sh, g_dr = 0.13, 0.08, 0.07  # 어시 특화라 골 낮춤
+            a_base, a_pa, a_dr = 0.106, 0.153, 0.094
             g_goal, g_asst     = 1.00, 0.80
             g_pos_mult         = 0.85
             sp_goal            = 0.0
@@ -3292,9 +3389,9 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None):
             _stat_bonus = 0.08*dr + 0.06*spd + 0.04*pa
 
         elif pos == "CAM":
-            base = 5.90
-            g_base, g_sh, g_dr = 0.14, 0.13, 0.06
-            a_base, a_pa, a_dr = 0.26, 0.32, 0.14
+            base = 6.45
+            g_base, g_sh, g_dr = 0.083, 0.077, 0.036
+            a_base, a_pa, a_dr = 0.160, 0.198, 0.086
             g_goal, g_asst     = 0.90, 0.90
             g_pos_mult         = 0.80
             sp_goal            = 0.0
@@ -3302,9 +3399,9 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None):
             _stat_bonus = 0.10*pa + 0.06*pos_s + 0.04*dr
 
         elif pos == "CM":
-            base = 6.00
-            g_base, g_sh, g_dr = 0.10, 0.11, 0.05
-            a_base, a_pa, a_dr = 0.16, 0.26, 0.10
+            base = 6.55
+            g_base, g_sh, g_dr = 0.051, 0.056, 0.026
+            a_base, a_pa, a_dr = 0.083, 0.134, 0.052
             g_goal, g_asst     = 0.85, 0.80
             g_pos_mult         = 0.55
             sp_goal            = 0.0
@@ -3312,9 +3409,9 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None):
             _stat_bonus = 0.07*pa + 0.05*ta + 0.04*sta
 
         elif pos == "CDM":
-            base = 6.10
-            g_base, g_sh, g_dr = 0.04, 0.06, 0.02
-            a_base, a_pa, a_dr = 0.09, 0.17, 0.05
+            base = 6.68
+            g_base, g_sh, g_dr = 0.017, 0.026, 0.009
+            a_base, a_pa, a_dr = 0.038, 0.071, 0.021
             g_goal, g_asst     = 0.80, 0.75
             g_pos_mult         = 0.28
             sp_goal            = 0.0
@@ -3322,22 +3419,22 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None):
             _stat_bonus = 0.10*ta + 0.07*pos_s + 0.04*sta
 
         elif pos in ("LB", "RB"):
-            base = 6.00
-            g_base, g_sh, g_dr = 0.04, 0.04, 0.04
-            a_base, a_pa, a_dr = 0.14, 0.22, 0.12
+            base = 6.55
+            g_base, g_sh, g_dr = 0.019, 0.019, 0.019
+            a_base, a_pa, a_dr = 0.072, 0.114, 0.062
             g_goal, g_asst     = 0.80, 0.80
             g_pos_mult         = 0.30
-            sp_goal            = 0.04  # 오버래핑 크로스
+            sp_goal            = 0.018  # 오버래핑 크로스
             # 스피드★★ 태클★★ 패스★★
             _stat_bonus = 0.07*spd + 0.06*ta + 0.05*pa
 
         else:  # CB
-            base = 6.10
-            g_base, g_sh, g_dr = 0.02, 0.03, 0.01
-            a_base, a_pa, a_dr = 0.02, 0.06, 0.02
+            base = 6.65
+            g_base, g_sh, g_dr = 0.003, 0.005, 0.0015
+            a_base, a_pa, a_dr = 0.007, 0.021, 0.007
             g_goal, g_asst     = 0.80, 0.70
             g_pos_mult         = 0.22
-            sp_goal            = 0.05  # 코너킥 헤더
+            sp_goal            = 0.018  # 코너킥 헤더
             # 태클★★★ 포지셔닝★★★ 헤딩★★★ 스피드★★
             _stat_bonus = 0.10*ta + 0.08*pos_s + 0.06*hd + 0.04*spd
 
@@ -3355,12 +3452,23 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None):
             g_pos_mult *= _mod.get("gp_mult", 1.0)
             sp_goal  += _mod.get("sp_add", 0.0)
 
-        # dom 가산 (포지션별 기본 base 위에 올림 — "가만히 있어도 고평점" 방지)
-        # dom 가산 — 약체 리그 압도 시 base↑, 강팀 리그 고전 시 base↓
+        # [2026-07 재설계, 신민용+GPT 리포트: "OVR90 선수가 약체 상대로
+        # 뛰면 평균 9.24점, 강한 상대로 뛰면 7.32점 — 난이도 보정이
+        # 거꾸로다"] 예전엔 dom(내 OVR vs 상대 OVR 격차)이 클수록(=상대가
+        # 약할수록) base에 큰 가산을 줬다 — 이건 "약체를 압도한다"는
+        # 사실 자체를 평점 보상 대상으로 삼은 설계였는데, 현실 축구
+        # 평점은 반대다("난이도가 낮은 승리는 당연한 결과, 난이도가 높은
+        # 활약이 값지다"). 골/어시 자체는 dom이 커지면 이미 자연스럽게
+        # 더 많이 나오므로(gprob/aprob가 dom에 비례) 그 보상은 이미
+        # 충분하다 — 여기 있던 "추가 base 가산"만 방향을 정리한다.
+        # 실측 검증 목표(OVR90 기준): 약체(OVR60) 7.8~8.2, 중간(OVR75)
+        # 7.3~7.7, 강팀(OVR88) 7.0~7.5 — dom>=1.0(약체 상대) 쪽 계수를
+        # 1.70→0.35로 크게 압축했다(강팀 상대 쪽은 이미 실측이 목표
+        # 범위 안이라 그대로 둠). 지수도 0.55→0.45로 낮춰 완만하게.
         if dom >= 1.0:
-            base += 1.70 * ((dom - 1.0) ** 0.55)  # dom2.2→+1.88, dom1.5→+1.16
+            base += 0.35 * ((dom - 1.0) ** 0.45)  # 약체 상대: 최소한의 가산만
         else:
-            base += 1.40 * (dom - 1.0)   # dom<1.0 위축
+            base += 1.40 * (dom - 1.0)   # 강팀 상대 고전: 기존 유지(이미 목표 범위 안)
         # ── gprob / aprob 계산 ───────────────────────────────
         _gdom_exp = 0.45 + 0.28 * (g_pos_mult / 1.55)
         _gdom = dom ** _gdom_exp
@@ -3379,9 +3487,17 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None):
         if my_score > 0 and random.random() < gprob:
             sh_dom = 1.0 + 0.90*((max(1.0,dom)-1.0)**0.58)*(0.35+0.65*_pos_goal_scale)
             xg = g_pos_mult * (0.35 + 0.65*sh) * sh_dom
-            # 엘리트 결정력 가산 (OVR90+ sh 높을수록 폭발)
-            if sh > 0.75:
-                xg += g_pos_mult * 14.0 * (sh - 0.75) ** 2
+            # [2026-07 Step4 재설계, 신민용 리포트: "90→95 구간에서 폭발하고
+            # 95→100은 거의 안 늘어난다"] 예전엔 이 보너스가 sh(정규화
+            # 스탯, _stat_n의 hi=95 상한 때문에 OVR95에서 이미 1.0으로
+            # 포화)에 묶여있어서, 딱 그 지점에서 절벽처럼 터지고 그 위로는
+            # 더 이상 못 늘었다(실측: ST OVR90→95골55.9, 95→100골58.4).
+            # sh 대신 원본 OVR(_my_ovr, 100까지 안 잘림)로 갈아서
+            # 85→100까지 완만하게 램프업되게 했다 — _dominance_mult의
+            # 90+/95+ 단계적 가속과 같은 방향(같은 신호에 반응)으로 통일.
+            _elite_frac = max(0.0, min(1.0, (_my_ovr - 85) / 15.0))
+            if _elite_frac > 0:
+                xg += g_pos_mult * 0.30 * _elite_frac ** 1.6
             xg = max(0.5, min(4.5, xg))   # 한 경기 최대 4~5골 수준
             goals = 1
             decay = 0.48 + 0.22 * max(0.0, sh - 0.55) / 0.45
@@ -3566,13 +3682,20 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None):
                     events.append((_mm, "🚫 상대 골키퍼 선방에 막혔다"))
 
         # ── 수비 라인 무실점 보너스 ──────────────────────────
+        # [2026-07 Step3 재조정, 신민용+GPT: "CB가 골 없이도 OVR90급
+        # 답게 7점대 중후반을 유지해야 한다"] 실측해보니 CB의 gap 기준
+        # 평점 곡선이 65~90 구간은 이미 목표에 거의 정확히 맞았는데(오차
+        # 0.01~0.04), 상단(OVR95/100)만 목표(7.5~7.9/7.6~8.0)보다
+        # 0.10~0.18 부족했다 — 골 기반 엘리트 폭발(Step4)에 대응하는
+        # 비득점 지표 쪽 상한이 약해서다. 계수를 0.20→0.28로 올렸다.
         if pos in ("CB","LB","RB","CDM") and opp_score == 0:
             _def_dom = max(0.5, min(1.5, dom))
-            base += 0.20 * _def_dom
+            base += 0.34 * _def_dom
 
         # ── 차단 활약 보너스 (CDM/CB 전용) ──────────────────
+        # [2026-07 Step3 재조정] 위와 같은 이유로 0.15→0.22.
         if pos in ("CDM","CB") and blocks >= 3:
-            base += 0.15 * min(2.0, blocks / 3.0)
+            base += 0.27 * min(2.0, blocks / 3.0)
             if blocks >= 5: events.append((_sample_minutes(1, 10, 85)[0], "💪 압도적인 수비 활약!"))
 
         # ── 포지션별 주요 활약 타임라인 이벤트 ────────────────
@@ -4786,7 +4909,8 @@ def _lock_league_title_after_season(p, year):
 # 구단 판매 추진 시스템 (2026-07 신설, 신민용+GPT 다회 설계 확정, v5)
 # ══════════════════════════════════════════════════════════════
 
-_SALE_PUSH_AWARD_SCORE = {"MVP": -2, "득점왕": -1, "베스트11": -1}
+_SALE_PUSH_AWARD_SCORE = {"MVP": -2, "득점왕": -1, "베스트11": -1, "올해의 수비수": -1,
+                          "구단 올해의 선수": -1}
 
 
 def _my_team_rank_category(p) -> str:
@@ -5221,7 +5345,18 @@ def _estimate_ai_season(ovr, pos, team_avg, league_avg, sub_role=None, full_seas
         a_base *= mod.get("a_mult", 1.0)
     goals = max(0, round(max(0, g_base) * random.uniform(0.8, 1.2)))
     assists = max(0, round(max(0, a_base) * random.uniform(0.8, 1.2)))
-    rating = round(6.0 + (ovr-60)/20.0 + goals*0.02 + assists*0.015, 2)
+    # [2026-07 재보정, 신민용 수비수 QA 확정: "AI 후보(rating~7.8, OVR95)가
+    # 실제 시뮬레이션 결과(_player_perf 기반, 같은 OVR95 CB 실측 평균
+    # rating~7.2)보다 항상 후하게 나와서 베스트11/MVP/올해의 수비수 후보
+    # 경쟁에서 실제 플레이한 내 선수가 구조적으로 밀린다"] OVR→평점
+    # 기울기(/20.0)가 실제 엔진의 dominance 압축(고OVR끼리 붙으면 평점이
+    # 완만하게만 오르는 구조)을 전혀 반영 못 하고 선형으로 계속 올라가는
+    # 게 원인이었다. 실측 CB OVR99·8시즌 평균(rating 7.20)을 기준점으로
+    # 기울기를 /20.0→/35.0으로 완화했다 — OVR60→6.0(불변), OVR95→~7.0,
+    # OVR99→~7.11(+goals/assists 소폭 가산)로 실측 범위에 맞춘다. 골/도움
+    # 가산(goals*0.02/assists*0.015)은 그대로 유지 — 다득점 시즌(ST 등)이
+    # 여전히 그만큼 더 높게 평가되는 구조는 보존한다.
+    rating = round(6.0 + (ovr-60)/35.0 + goals*0.02 + assists*0.015, 2)
     # [2026-07 버그수정, 신민용 리포트(GPT 분석 인용): "K3/K4처럼 약한
     # 리그에서 평점 5.0~5.8 정도의 평범한 시즌으로도 베스트11을 계속
     # 받는다"] 원인은 이 하한(5.0)이었다 — OVR이 낮은 약체 리그에서는
@@ -5241,7 +5376,13 @@ def _estimate_ai_clean_sheets(pos, ovr, team_avg, league_avg, full_season_matche
     소속팀 전력(team_avg-league_avg)과 GK 본인 OVR을 같이 반영한다.
     실제 골든글러브 판정 기준(season_cs>=10, 38경기 기준)과 같은 축으로
     맞추기 위해, 38경기 기준 클린시트 베이스를 잡고 리그 길이로 스케일."""
-    base_cs_per_38 = 11.0  # 평균적 GK의 38경기 기준 클린시트 베이스
+    # [2026-07 재보정, 신민용 수비수 QA 확정] base_cs_per_38=11.0은
+    # SS등급(전원 엘리트) 환경에서 실측된 실제 CB 클린시트(OVR99·8시즌
+    # 평균 7.75)보다 크게 높았다 — team_factor가 (team_avg-league_avg)
+    # 기준이라 "모든 팀이 엘리트"인 SS리그에서는 사실상 0에 수렴해
+    # 보정이 안 먹히고, ovr_factor만으로 OVR95+ 선수 전원이 CS 13~17에
+    # 몰렸다. 실측 평균(7.75)에 맞춰 7.5로 낮춘다.
+    base_cs_per_38 = 7.5  # 평균적 GK의 38경기 기준 클린시트 베이스
     team_factor = 1.0 + (team_avg - league_avg) * 0.03      # 강팀일수록 클린시트↑
     ovr_factor = 1.0 + max(0, ovr - 70) * 0.01                # GK 본인 실력도 소폭 반영
     scale = full_season_matches / 38.0
@@ -5337,6 +5478,19 @@ def _position_award_score(pos, goals, assists, rating, ovr, cs=0):
     if pos in MF_POS:
         return goals * 1.5 + assists * 2.0 + rating * 6.0 + ovr * 0.3
     return goals * 2.0 + assists * 1.0 + rating * 5.0 + ovr * 0.3  # FW/기타
+
+
+def _club_award_score(pos, goals, assists, rating, ovr, cs=0):
+    """[2026-07 신설, 신민용 확정] 구단 올해의 선수(Club Player of the
+    Year) 전용 점수식. 리그 MVP(_position_award_score)와 포지션별 계수를
+    그대로 쓰면 "리그 최고"와 "구단 내 최고"가 사실상 같은 기준이 되어
+    성격이 겹친다 — 이 상은 "그 팀에서 가장 중요했던 선수"라는 더 넓은
+    개념이라, 포지션 구분 없이 단일 공식으로 골/도움/평점/OVR/클린시트를
+    고르게 반영해서 공격수 쏠림을 줄이고 수비수·GK도 자기 팀에서는
+    핵심으로 평가받을 여지를 준다. 후보 풀 자체가 이미 내 팀 로스터로
+    좁혀져 있으므로(club_pool), 점수식은 MVP보다 단순하게 유지한다.
+    """
+    return rating * 50.0 + goals * 2.0 + assists * 2.0 + ovr * 0.5 + cs * 1.0
 
 
 def _evaluate_extra_awards(pool, my_pos, my_age=25, weight_fn=None, young_age_cutoff=21):
@@ -6201,6 +6355,7 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
 
         my_pos = p.get("position","ST")
         my_best11 = False
+        best_df = None  # [올해의 수비수 신설] DF 분기 밖에서도 안전하게 참조하기 위한 기본값
         cs_for_me = _calc_clean_sheets_for_player(p)
         
         if my_pos in GK_POS:
@@ -6260,6 +6415,20 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
         if my_best11:
             my_awards.append(("베스트11", f"베스트11 ({my_pos})"))
 
+        # [2026-07 신설, 신민용 확정] 올해의 수비수 (Defender of the Year)
+        # — 베스트11(DF)이 이미 계산해둔 "리그 DF_POS 전체 중 최고 1명"
+        # (_best11_score_gk_df 기반 best_df)을 그대로 재사용한다. 별도
+        # 점수식을 새로 만들지 않는다 — 실제 축구에서도 Defender of the
+        # Season과 Team of the Season 수비수가 같은 선수인 경우가 흔해서,
+        # 베스트11(DF)과 같은 조건으로 겹쳐 받는 게 오히려 현실적이다.
+        # 차이는 최소 출전 비율 게이트(MVP와 동일한 65%) 하나 — 베스트11은
+        # 이 게이트가 없어서 "반 시즌만 뛰고 어쩌다 DF 풀 1등"도 통과할 수
+        # 있는데, 개인 단독상인 올해의 수비수는 그 상황까진 막는다.
+        DOTY_MIN_PLAY_RATIO = 0.65
+        if (best_df is not None and best_df[0]["is_mine"]
+                and sm >= DOTY_MIN_PLAY_RATIO * FULL_SEASON_MATCHES):
+            my_awards.append(("올해의 수비수", f"{lname} 올해의 수비수"))
+
         # MVP (전체 베스트11 점수 1위)
         # [2026-07 수정] 포지션 무관 공격수 편향 공식(_best11_score) 대신
         # 포지션별 가중 점수식(_position_award_score) 사용 — 수비수/GK도
@@ -6276,6 +6445,24 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
         if (mvp["is_mine"] and sm >= MVP_MIN_PLAY_RATIO * FULL_SEASON_MATCHES
                 and season_rating >= MVP_MIN_RATING):
             my_awards.append(("MVP", f"{lname} 올해의 선수"))
+
+        # [2026-07 신설, 신민용 확정] 구단 올해의 선수 (Club Player of the
+        # Year) — 리그 전체가 아니라 "내 팀 로스터끼리만" 비교하는 내부
+        # 투표 개념. pool의 각 항목엔 이미 team_id가 들어있어(_collect_
+        # league_candidates가 채워둠) 새 쿼리 없이 필터링만으로 후보 풀을
+        # 좁힐 수 있다. MVP보다 경쟁 풀이 훨씬 작으므로(리그 전체 vs 내
+        # 팀 로스터) 게이트도 그만큼 낮게 잡는다 — 출전 비율은 MVP와
+        # 동일(65%)하게 유지하되, 최소 평점은 7.0 대신 6.2로 낮춘다("팀
+        # 내 확실한 핵심"이지 "리그 최정상급"까지는 아니어도 되는 상).
+        CLUB_POTY_MIN_PLAY_RATIO = 0.65
+        CLUB_POTY_MIN_RATING = 6.2
+        club_pool = [x for x in pool if x.get("team_id") == tid]
+        if club_pool:
+            club_best = max(club_pool, key=lambda x: _club_award_score(
+                x["position"], x["goals"], x["assists"], x["rating"], x["ovr"], x.get("cs", 0)))
+            if (club_best["is_mine"] and sm >= CLUB_POTY_MIN_PLAY_RATIO * FULL_SEASON_MATCHES
+                    and season_rating >= CLUB_POTY_MIN_RATING):
+                my_awards.append(("구단 올해의 선수", f"{lname} 구단 올해의 선수"))
 
         # 골든글러브 (GK 최다 클린시트 — 내가 GK이고 클린시트 많을 때)
         # [2026-07 확장, GPT 피드백: "클린시트 개수만 보면 안 되고 세이브율·
@@ -6318,6 +6505,25 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
         # dominant 인정하는 대체 경로를 추가한다(단, world_class OVR
         # 게이트는 그대로 유지 — 우승했다고 무조건은 아님).
         BALLON_MIN_RATING = 7.4
+        # [2026-07 신설, 신민용 GK 발롱도르 QA: "GK는 OVR95·평균 클린시트
+        # 16개짜리 시즌(200시즌 시뮬)에서도 단 한 번도 7.4를 못 넘는다(최댓값
+        # 7.274) — _def_dominant_stats 경로가 있어도 이 공통 게이트에서 항상
+        # 막혀 사실상 죽은 코드였다"] GK 평점 눈금 자체가 base=6.20 기반이라
+        # 공격수(base 6.40~6.68)보다 절대적으로 낮게 형성된다. 포지션 간
+        # 평점 분포가 다른데 하나의 문턱으로 비교하는 게 근본 원인이므로,
+        # GK만 별도 문턱을 둔다(눈금 재보정은 영향범위가 너무 커서 보류).
+        # [바로 아래 재보정 참고] 최초엔 6.9로 잡았으나, 실제 game.db
+        # 기반 E2E 검증에서 SS등급 환경 특성상 도달 불가능한 값으로
+        # 드러나 6.7로 다시 낮췄다.
+        GK_BALLON_MIN_RATING = 6.7
+        # [2026-07 재보정, 신민용 E2E QA 확정] 6.9는 SS등급 1부(전원
+        # 엘리트+월드클래스 로스터 설계) 환경에서 이론상 최고치(OVR99,
+        # 8시즌 시뮬 최고 6.77)조차 못 넘는 "발생 불가능한" 문턱이었다.
+        # world_class(-2)는 그대로 유지 — 90+ 구간 1점 차이가 실질적으로
+        # 크다는 _dominance_mult 설계 철학과 일치하고, "세계 최고권"이라는
+        # 발롱도르 취지에도 맞다. 문제는 rating/CS 쪽 문턱이 "SS/S는 약팀이
+        # 없다"는 리그 설계와 안 맞았던 것 — 6.7은 "이론상 최고 시즌은
+        # 통과, 평범한 월클 시즌은 탈락" 경계에 맞춘 값.
         ballon = False
         # [2026-07 확장, 신민용 지적: "A급 리그라도 월드컵 같은 국제무대에서
         # 캐리해서 상 싹쓸이하면 발롱도르 받을 수 있게"] SS/S급 리그는
@@ -6349,12 +6555,20 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
             # rival_ovr이 실제보다 낮게 잡히면서 world_class 문턱(-2)이
             # 부당하게 낮아졌고, A등급(K리그) 선수도 화려한 골 스탯만
             # 있으면 세계 최고급으로 오판되는 구조였다.
+            # [2026-07 확장, 신민용 확정: "발롱도르는 포지션별로 다른 문을
+            # 통과해야 한다 — 후보 자격은 포지션마다 다르게, 최종 경쟁은
+            # 동일한 잣대로"] 라이벌 OVR 비교 풀도 항상 공격수 (ATTACK_POS)
+            # 만 보던 걸, 내 포지션 그룹에 맞게 바꾼다 — CB는 세계 최고급
+            # CB랑 비교해야지 세계 최고급 스트라이커랑 비교하면 안 된다.
+            _rival_pos_group = (GK_POS if my_pos in GK_POS
+                                 else (DF_POS + ("CDM",)) if (my_pos in DF_POS or my_pos == "CDM")
+                                 else ATTACK_POS)
             other = c.execute("""SELECT MAX(a.ovr) as mo FROM ai_players a
                 JOIN teams t ON a.team_id=t.id
                 JOIN leagues l ON t.league_id=l.id
                 JOIN countries cn ON l.country_id=cn.id
                 WHERE cn.grade IN ('SS','S') AND l.tier=1 AND a.position IN ({})
-                """.format(",".join("'%s'" % pp for pp in ATTACK_POS))).fetchone()
+                """.format(",".join("'%s'" % pp for pp in _rival_pos_group))).fetchone()
             rival_ovr = other["mo"] if other and other["mo"] else 90
             _cc = _get_cl_cup_season_stats(year)
             _combined_ga = season_goals + season_assists + _cc["goals"] + _cc["assists"]
@@ -6367,7 +6581,8 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
             #   반대로 생산력만 있고 기복이 심한 시즌은 발롱도르가 아니다).
             world_class = p.get("ovr",0) >= rival_ovr - 2
             min_ga_for_ballon = max(6, round(GA_PER_GAME_FOR_BALLON * _played_equiv))
-            high_rating = _combined_rating >= BALLON_MIN_RATING
+            _ballon_rating_gate = GK_BALLON_MIN_RATING if my_pos in GK_POS else BALLON_MIN_RATING
+            high_rating = _combined_rating >= _ballon_rating_gate
             # [2026-07 신설, 신민용 지적] 트로피 보너스(챔스/리그순위/자국컵/
             # 국가대표 메이저대회)를 개인 생산력에 더해서 문턱 통과 여부를
             # 판정한다. 개인 생산력(_combined_ga, 보통 20~45대)이 여전히
@@ -6441,9 +6656,31 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
                         _intl_t_row["kind"] == "continent" and _intl_t_row["continent"] == "유럽"):
                     _intl_won = True
             MIN_TROPHY_BONUS_FOR_BALLON = 2.0
+            # [2026-07 신설, 신민용 확정: "후보 자격 자체가 G+A로 제한되면
+            # 안 된다 — 수비수/GK는 수비 지표로도 후보 등록이 가능해야
+            # 한다"] 공격 포지션은 기존처럼 G+A 문턱으로 경쟁하고, 수비
+            # 포지션(CB/FB/CDM)·GK는 무실점 경기 수 + 고평점 조합으로 별도
+            # 대체 경로를 연다. 이건 "문턱을 낮춰주는" 게 아니라 "다른 문을
+            # 여는" 것 — world_class(포지션별 라이벌 OVR-2 이내)와
+            # trophy_bonus 게이트는 공격수와 완전히 동일하게 그대로 적용되고,
+            # 여기서 대체되는 건 오직 _combined_ga 문턱 하나뿐이다.
+            _def_like_pos = my_pos in GK_POS or my_pos in DF_POS or my_pos == "CDM"
+            # [2026-07 재보정, 신민용 E2E QA 확정] CB/FB/CDM의 0.45(45%)
+            # 문턱은 그대로 두되, GK만 별도 비율을 쓴다 — SS등급 1부(전원
+            # 엘리트+월드클래스 로스터 설계)에서는 상대가 항상 강해 클린시트
+            # 자체가 희귀하다(OVR99·8시즌 실측 최댓값 13/38≈34%). 45% 문턱은
+            # 이 환경에서 이론상 최고 시즌도 못 넘는 값이라 GK만 31.6%
+            # (12/38 기준)로 낮췄다 — CB/FB/CDM은 GK만큼 리그 전체 상대
+            # 공격력에 매 경기 노출되지 않아(팀 전체 수비 조직력이 완충)
+            # 기존 문턱을 그대로 유지한다.
+            if my_pos in GK_POS:
+                _cs_needed = max(10, round(0.316 * _played_equiv))
+            else:
+                _cs_needed = max(15, round(0.45 * _played_equiv))
+            _def_dominant_stats = _def_like_pos and season_cs >= _cs_needed and high_rating
             dominant = high_rating and trophy_bonus >= MIN_TROPHY_BONUS_FOR_BALLON and (
                 (_combined_ga + trophy_bonus + _other_bonus) >= min_ga_for_ballon
-                or mvp["is_mine"] or _cc["cl_won"] or _intl_won)
+                or mvp["is_mine"] or _cc["cl_won"] or _intl_won or _def_dominant_stats)
             if world_class and dominant:
                 ballon = True
         if ballon:
@@ -6718,7 +6955,8 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
             icon = {"득점왕":"⚽","도움왕":"🎯","베스트11":"⭐","MVP":"🏅",
                     "발롱도르":"🏆","영플레이어":"🌟","골든글러브":"🧤",
                     "푸스카스상":"💥","올해의 골":"💥",
-                    "사모라상":"🛡️"}.get(atype,"🏅")
+                    "사모라상":"🛡️",
+                    "올해의 수비수":"🛡️","구단 올해의 선수":"🎖️"}.get(atype,"🏅")
             add_log(f"{icon} {atype} 수상! ({detail})  {year}년", "event", year, 52)
         return
     except Exception as e:
@@ -6917,25 +7155,40 @@ def _end_of_season(p, year):
                         season_pass_acc_sum=0, season_pass_acc_cnt=0)
     update_player(**stat_updates)
 
+    # [2026-07 버그수정, 신민용 리포트: "팀 정보가 사라지고 순위도
+    # 0위/14팀으로 뜨고 커리어에 전적이 다 0으로 남는다"] 팀 승/무/패/
+    # 득실 초기화가 원래 이 함수(_end_of_season, 연도 전환 시점=진짜 새
+    # 시즌 시작)에 있어야 하는데, 승강 플레이오프 도입 때 그 초기화 코드가
+    # _process_promotion_relegation 안에 같이 있는 걸 못 보고 그 함수
+    # 호출 시점만 44주 앞(day300)으로 옮겨버렸다 — 그 결과 아직 같은
+    # 해(2001년)인데, 시즌이 끝나자마자 팀 전적이 통째로 0으로 밀려서
+    # 국제대회 기간(44~52주) 내내 커리어 화면·순위표가 전부 깨져 보였다.
+    # 실제 세이브(game.db)로 재현·확인 후, 초기화 코드를 원래 있어야 할
+    # 이 위치로 옮겼다 — 이제 진짜 연도가 넘어갈 때만(52→1주) 초기화된다.
+    conn = get_conn()
+    conn.execute("UPDATE teams SET wins=0,draws=0,losses=0,goals_for=0,goals_against=0")
+    conn.commit()
+    conn.close()
+
     # 이슈9: 시즌 종료 시 순위 기반 행복도 변화
     _apply_rank_happiness(p, year)
 
-    # 5. 승강제·우승 판정 (강제 방출보다 먼저!)
-    #    우승/승격은 '그 시즌에 그 팀 소속이었다'는 사실에 근거해야 한다.
-    #    방출/이적을 먼저 처리하면 current_team_id=0이 되어, 리그 1위를 하고도
-    #    "내 팀 아님"으로 판정돼 우승·승격 기록이 통째로 누락된다. (순서 버그 수정)
-    # [실시간 전환] 이제 전 세계 모든 리그가 시즌 시작 시점에 일정이 미리 깔리고
-    #   매주 _sim_all_ai_matches가 실시간으로 채우므로, 여기서 수백 개 리그를
-    #   몰아서 새로 생성+시뮬할 필요가 없다. 혹시 남은 미완료 경기(-1)만 안전망으로 정리.
-    _finish_incomplete_matches_for_season(p.get("current_season", 1))
-    import time as _time_perf2
-    _tp0 = _time_perf2.perf_counter()
-    _process_promotion_relegation(year, season_avg_rating)
-    _tp1 = _time_perf2.perf_counter()
+    # [2026-07 리팩터, 승강 플레이오프 도입] 예전엔 여기서 바로
+    # "5. 승강제·우승 판정"(_finish_incomplete_matches_for_season +
+    # _process_promotion_relegation)을 처리했는데, 이제 그 둘은 클럽 시즌이
+    # 실제로 끝나는 시점(CLUB_SEASON_END_DAY, 43주)으로 옮겨졌다
+    # (advance_days의 _finalize_club_season 호출 참고) — 승강 플레이오프가
+    # 44주(그 해 안)에 열려야 해서, 대진을 만드는 재료(순위 확정 결과)가
+    # 그보다 훨씬 늦은 새해 진입 시점에야 나오면 PO를 열 44주 자체가 이미
+    # 지나가버린다. get_player()로 최신 상태를 그때그때 재조회하는 아래
+    # 코드들(강제방출/계약 등)은 승강이 이미 몇 주 전에 끝나있어도 아무
+    # 문제 없이 그 결과를 그대로 반영한다.
 
     # 5.7 [AI 선수 생애주기] 나이+1·성장/노화·은퇴/세대교체·이적시장·전술변경.
     #   → 같은 팀에 오래 있어도 매 시즌 스쿼드/전력/포메가 살아 움직인다.
     #   ai_players.ovr·team_id가 바뀌므로 내부에서 OVR 캐시를 무효화한다.
+    import time as _time_perf2
+    _tp1 = _time_perf2.perf_counter()
     try:
         from ai_lifecycle import run_ai_offseason
         run_ai_offseason(year, verbose_log=add_log)
@@ -6945,8 +7198,8 @@ def _end_of_season(p, year):
         for _tid in _RELEGATION_DEBUG_TRACK:
             _relegation_debug_snapshot(_tid, "개막 직전(이적시장 마감 후)")
     _tp2 = _time_perf2.perf_counter()
-    print(f"[PERF]   _end_of_season 세부: 승강제 {_tp1-_tp0:.2f}s | "
-          f"AI생애주기 {_tp2-_tp1:.2f}s")
+    print(f"[PERF]   _end_of_season 세부: AI생애주기 {_tp2-_tp1:.2f}s "
+          f"(승강제 타이밍은 43주 _finalize_club_season으로 이동 — 여기 안 잡힘)")
 
     # 6. 강제 방출 체크 (이슈8 강화) — 우승 판정이 끝난 뒤에 처리
     p = get_player() or p   # 승강으로 리그/연봉이 바뀌었을 수 있으니 최신화
@@ -7561,20 +7814,68 @@ def _try_sell_player(p, year, cur_ovr):
     return True
 
 
-def _promo_releg_count(team_count: int) -> int:
-    """리그 규모별 승강 팀 수 (2026-07 밸런스 개편 — 신민용 요청).
-    기존엔 리그 크기 무관하게 항상 1팀만 승강했었음(예: EPL도 1팀 강등).
-    실제 축구처럼 리그가 클수록 승강 인원도 늘어나게 조정:
-      16팀 미만: 1팀   16~19팀: 2팀   20~26팀: 3팀   27팀 이상: 4팀
-    (EPL 20팀 → 3팀 강등/승격, 실제 EPL과 동일)"""
-    if team_count < 16:
-        return 1
+def _get_promotion_policy(team_count: int) -> dict:
+    """상위 리그(강등 당하는 쪽) 관점의 승강 정책 — 자동 강등 인원과 PO
+    존재 여부를 정한다 (2026-07 재설계, 신민용 최종안: "PO는 항상 4팀
+    브래킷이 마지막 생존권 1장을 놓고 경쟁, 상위 리그는 항상 1팀만
+    위태로움").
+
+    [자동 이동은 반드시 '한쪽' 기준으로만 대칭 결정해야 하는 이유] 실제
+    게임 데이터를 보면 같은 나라의 1부/2부 팀 수가 다른 경우가 68%
+    (208개국 중 141개국)나 된다 — 그래서 "자동 강등 인원"과 "자동 승격
+    인원"을 각자 자기 리그 크기로 독립 계산하면 두 값이 어긋나 리그
+    전체 팀 수가 서서히 무너진다. 그래서 자동 이동분은 항상 위 리그
+    크기만 기준으로 정하고, 아래 리그에도 그대로(대칭) 적용한다 — 이건
+    기존 설계와 동일.
+
+    [PO는 왜 안전한가] PO는 브래킷에 몇 팀이 들어오든(2팀이든 4팀이든)
+    최종적으로 딱 1팀만 실제로 자리를 바꾼다(브래킷에서 진 나머지는
+    원래 있던 리그에 그냥 남을 뿐 이동이 아니다) — 그래서 아래 리그의
+    PO 브래킷 크기는 자동 이동분과 달리 아래 리그 자기 크기로 독립
+    결정해도 총 이동량 보존이 깨지지 않는다(_get_po_bracket_size 참고).
+
+      team_count < 6:  자동 1, PO 없음
+      6~19팀:          자동 1, PO 1자리(항상 1팀만 위태)
+      20~25팀:         자동 2, PO 1자리
+      26팀 이상:        자동 3, PO 1자리
+    """
+    if team_count < 6:
+        return {"auto": 1, "po": 0}
     elif team_count < 20:
-        return 2
-    elif team_count <= 26:
-        return 3
+        return {"auto": 1, "po": 1}
+    elif team_count <= 25:
+        return {"auto": 2, "po": 1}
     else:
-        return 4
+        return {"auto": 3, "po": 1}
+
+
+def _get_po_bracket_size(lower_team_count: int) -> int:
+    """아래 리그가 PO에 몇 팀을 보내는 미니 토너먼트를 치를지 — 아래 리그
+    자기 크기로 독립 결정한다(위 함수 docstring 참고, 총 이동량 보존과
+    무관해서 안전). 8~10팀처럼 작은 리그는 2팀(단판 예선 1경기 → 결승),
+    12팀 이상은 4팀(준결승 2경기 → 결승 → 최종 승강전, 1v4·2v3 시드)."""
+    return 2 if lower_team_count < 12 else 4
+
+
+def _finalize_club_season(p, year):
+    """[2026-07 리팩터, 승강 플레이오프 도입 — 신민용 설계] 예전엔
+    _end_of_season() 안에 있던 "미완료 경기 정리 + 순위 확정 + 자동승강/
+    PO대기 생성" 부분을 시간축에 맞게 분리했다. 이 부분은 클럽 시즌이
+    실제로 끝나는 시점(CLUB_SEASON_END_DAY=300일, 43주)에 확정돼야
+    한다 — 승강 플레이오프(44주)가 이 결과를 그대로 이어받아야 하는데,
+    원래는 이 계산 자체가 훨씬 늦은 시점(52주 종료→새해 진입)에야
+    실행됐다(_end_of_season의 나머지 부분과 함께).
+
+    계산 결과는 이 시점을 옮겨도 달라지지 않는다 — CLUB_SEASON_END_DAY
+    이후(44~52주)엔 클럽 리그 경기가 전혀 없어서(국제대회 전용 기간)
+    match_results가 그 사이 안 바뀌기 때문에, 43주에 계산하든 52주에
+    계산하든 같은 숫자가 나온다. advance_days에서 day==CLUB_SEASON_END_DAY
+    일 때 1회 호출된다."""
+    rs = p.get("season_rating_sum", 0.0)
+    rc = p.get("season_rating_cnt", 0)
+    season_avg_rating = round(rs / rc, 2) if rc else 6.0
+    _finish_incomplete_matches_for_season(p.get("current_season", 1))
+    _process_promotion_relegation(year, season_avg_rating)
 
 
 def _process_promotion_relegation(year, season_avg_rating=6.0):
@@ -7816,6 +8117,7 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
     # executemany로 처리한다.
     _team_move_updates: list = []      # (league_id, tier, team_id)
     _promotion_log_inserts: list = []  # (year, team_name, from_tier, to_tier, league_name)
+    _po_pending_inserts: list = []     # (year, upper_lid, lower_lid, rule_id, side, offset, team_id, team_name)
 
     for cid in cids:
         _max_tier_here = _country_max_tier_map.get(cid, 1)
@@ -7833,22 +8135,83 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
             if not upper_rows or not lower_rows:
                 continue
 
-            # [2026-07 밸런스 개편] 리그 크기에 따라 승강 인원(N)을 정한다.
-            # 기존엔 리그 규모 무관 항상 1팀만 승강했음(EPL 20팀도 1팀 강등).
-            n_move = _promo_releg_count(len(upper_rows))
-            # 안전장치: 아주 작은 리그(6~8팀 등)에서 승강 인원이 리그 절반을
+            # [2026-07 재설계, 신민용 최종안: "상위 리그는 항상 1팀만
+            # 위태, 아래 리그는 리그 크기에 따라 2~4팀이 마지막 승격
+            # 티켓을 놓고 경쟁"] 자동 이동 인원(auto_count)은 반드시 위
+            # 리그 크기 하나로만 정해서 양쪽에 대칭 적용한다(1부/2부 팀
+            # 수가 다른 나라가 68%나 돼서, 각자 자기 크기로 따로 정하면
+            # 리그 전체 팀 수가 서서히 무너진다 — _get_promotion_policy
+            # docstring 참고). PO 브래킷 크기(2 또는 4)는 반대로 아래
+            # 리그 자기 크기로 독립 결정해도 안전하다 — 브래킷에 몇 팀이
+            # 들어오든 최종적으로 딱 1팀만 실제로 이동하기 때문.
+            import promotion_playoff as _pp
+            _policy = _get_promotion_policy(len(upper_rows))
+            auto_count = _policy["auto"]
+            po_exists = _policy["po"] == 1
+            # 안전장치: 아주 작은 리그에서 자동 이동 인원이 리그 절반을
             # 넘어가지 않도록 상한(실제 데이터 범위-6~30팀-에선 발동 안 함).
-            n_move = max(1, min(n_move, len(upper_rows) // 2, len(lower_rows)))
+            auto_count = max(0, min(auto_count, len(upper_rows) // 2, len(lower_rows)))
 
-            bottom_upper_cands = [r for r in upper_rows[-n_move:] if r["id"] not in moved_teams]
-            top_lower_cands    = [r for r in lower_rows[:n_move] if r["id"] not in moved_teams]
+            auto_upper_cands = [r for r in upper_rows[-auto_count:] if r["id"] not in moved_teams] if auto_count else []
+            auto_lower_cands = [r for r in lower_rows[:auto_count] if r["id"] not in moved_teams] if auto_count else []
             # 승격 인원과 강등 인원이 달라지면 리그별 총 팀 수가 어긋나므로
             # (moved_teams 필터링으로 한쪽이 줄었을 수 있음) 더 작은 쪽에 맞춘다.
-            n_actual = min(len(bottom_upper_cands), len(top_lower_cands))
-            if n_actual == 0:
+            n_actual = min(len(auto_upper_cands), len(auto_lower_cands))
+            bottom_upper_list = auto_upper_cands[:n_actual]
+            top_lower_list    = auto_lower_cands[:n_actual]
+
+            if n_actual == 0 and not po_exists:
                 continue
-            bottom_upper_list = bottom_upper_cands[:n_actual]
-            top_lower_list    = top_lower_cands[:n_actual]
+
+            # [PO 후보 추출] 위 리그: 자동존 바로 위 1팀만(있으면). 아래
+            # 리그: 자동존 바로 아래 bracket_size팀(그 리그 자체 크기로
+            # 결정) — 어느 한쪽이라도 이미 이동 처리된 팀이라 후보가
+            # 안 채워지면 이번 해는 이 경계의 PO를 건너뛴다(다음 해에
+            # 다시 시도됨, 실제 데이터 범위에선 거의 발동 안 함).
+            _rule_id = None
+            if po_exists:
+                _bracket_size = _get_po_bracket_size(len(lower_rows))
+                _upper_po_zone = upper_rows[max(0, len(upper_rows) - auto_count - 1):
+                                             len(upper_rows) - auto_count]
+                _po_pending_upper = [r for r in _upper_po_zone if r["id"] not in moved_teams]
+                _lower_po_zone = lower_rows[auto_count: auto_count + _bracket_size]
+                _po_pending_lower = [r for r in _lower_po_zone if r["id"] not in moved_teams]
+                if len(_po_pending_upper) != 1 or len(_po_pending_lower) != _bracket_size:
+                    po_exists = False   # 후보가 부족 — 이번 해엔 PO 없이 자동 이동만
+                else:
+                    _rule_id = _pp.get_rule_id_for_bracket(_bracket_size)
+
+            if not po_exists:
+                _po_pending_upper, _po_pending_lower = [], []
+
+            if po_exists:
+                for _off, _r in enumerate(_po_pending_upper):
+                    _ti = _team_info_cache.get(_r["id"])
+                    _po_pending_inserts.append(
+                        (year, upper_lid, lower_lid, _rule_id, "upper", _off, _r["id"],
+                         _ti[0] if _ti else _r.get("name", "")))
+                    moved_teams.add(_r["id"])
+                    if _r["id"] == my_team_id:
+                        pending_logs.append(
+                            (f"⚖ {year}년  {(_ti[0] if _ti else '')}  {tier}부 잔류 갈림길 — "
+                             f"승강 플레이오프 진출 (44주)", "event"))
+                # top_lower_list와 달리 _po_pending_lower는 lower_rows에서
+                # 이미 순위 오름차순(강→약) 그대로 슬라이스한 것이라, offset도
+                # 그 순서 그대로 매기면 resolve_standing_rank의 lower
+                # offset=0(자동존에 가장 가까운=가장 강한 후보)과 맞는다 —
+                # 예전 dual_slot처럼 reversed()가 필요 없다(그때는 양쪽을
+                # 같은 폭으로 자르고 뒤에서 잘라내는 방식이라 역순이 필요
+                #했는데, 지금은 처음부터 PO존만 따로 슬라이스해서 안 그럼).
+                for _off, _r in enumerate(_po_pending_lower):
+                    _ti = _team_info_cache.get(_r["id"])
+                    _po_pending_inserts.append(
+                        (year, upper_lid, lower_lid, _rule_id, "lower", _off, _r["id"],
+                         _ti[0] if _ti else _r.get("name", "")))
+                    moved_teams.add(_r["id"])
+                    if _r["id"] == my_team_id:
+                        pending_logs.append(
+                            (f"⚖ {year}년  {(_ti[0] if _ti else '')}  {ntier}부 승격 갈림길 — "
+                             f"승강 플레이오프 진출 (44주)", "event"))
 
             # [버그수정] 리스케일 목표치는 팀 이동 *전* 측정하되
             # 각 팀 본인을 제외한 순수 기존 팀 평균으로 산정.
@@ -7872,7 +8235,8 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
                 _move_team_cache(top_lower["id"], upper_lid)
                 if _upper_avg is not None:
                     _rescale_jobs.append((top_lower["id"], _upper_avg))
-                _promotion_log_inserts.append((year, tl_info["name"], ntier, tier, tl_info["lname"]))
+                _promotion_log_inserts.append((year, tl_info["name"], ntier, tier, tl_info["lname"],
+                                                lower_lid, upper_lid))
                 tl_is_mine = (top_lower["id"] in my_season_teams)
                 if tl_is_mine or my_league_id in (upper_lid, lower_lid):
                     pending_logs.append((f"🔼 {year}년  {tl_info['name']}  {ntier}부→{tier}부  (승격)", "event"))
@@ -7902,22 +8266,19 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
                     if DEBUG_RELEGATION_TRACKING:
                         _RELEGATION_DEBUG_TRACK[bottom_upper["id"]] = {
                             "name": bu_info["name"], "season": season, "checkpoints": {}}
-                _promotion_log_inserts.append((year, bu_info["name"], tier, ntier, bu_info["lname"]))
+                _promotion_log_inserts.append((year, bu_info["name"], tier, ntier, bu_info["lname"],
+                                                upper_lid, lower_lid))
                 if bottom_upper["id"] == my_team_id or my_league_id in (upper_lid, lower_lid):
                     pending_logs.append((f"🔽 {year}년  {bu_info['name']}  {tier}부→{ntier}부  (강등)", "event"))
                 if bottom_upper["id"] == my_team_id:
                     my_new_league = lower_lid
                 moved_teams.add(bottom_upper["id"])
 
-    # [2026-07 최적화] 팀 전적 초기화를 국가별로 209번 따로 실행하던 것을
-    # cids 전체를 한 번의 IN절로 묶어 단일 UPDATE로 처리한다 — 매 시즌
-    # 어차피 전체 국가를 순회하며 다 초기화하므로 결과는 완전히 동일하고,
-    # 쿼리 실행 횟수만 209회 → 1회로 준다.
-    if cids:
-        _cid_ph = ",".join("?" * len(cids))
-        c.execute(f"""UPDATE teams SET wins=0,draws=0,losses=0,goals_for=0,goals_against=0
-                     WHERE league_id IN (SELECT id FROM leagues WHERE country_id IN ({_cid_ph}))""",
-                  cids)
+    # [2026-07 버그수정] 팀 승/무/패/득실 초기화는 _end_of_season(진짜
+    # 연도 전환 시점, 52→1주)으로 옮겼다 — 여기(_process_promotion_relegation)
+    # 는 이제 44주(PLAYOFF_WEEK)보다도 앞선 43주 마지막날(day300)에 호출
+    # 되므로, 초기화가 여기 남아있으면 아직 같은 해인데 팀 전적이 미리
+    # 지워져서 국제대회 기간(44~52주) 내내 커리어·순위 화면이 깨져 보였다.
 
     # [2026-07 최적화] 위 루프에서 모아둔 승격/강등 UPDATE·INSERT를 각각
     # executemany로 한 번씩만 실행 — 팀 수만큼 개별 실행하던 것을 2회로 줄인다.
@@ -7925,8 +8286,14 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
         c.executemany("UPDATE teams SET league_id=?,current_tier=? WHERE id=?", _team_move_updates)
     if _promotion_log_inserts:
         c.executemany(
-            "INSERT INTO promotion_log(year,team_name,from_tier,to_tier,league_name) VALUES(?,?,?,?,?)",
+            """INSERT INTO promotion_log(year,team_name,from_tier,to_tier,league_name,
+                                          from_league_id,to_league_id) VALUES(?,?,?,?,?,?,?)""",
             _promotion_log_inserts)
+    if _po_pending_inserts:
+        c.executemany(
+            """INSERT INTO po_pending_slots(year,upper_league_id,lower_league_id,rule_id,side,
+                                             offset_idx,team_id,team_name) VALUES(?,?,?,?,?,?,?,?)""",
+            _po_pending_inserts)
 
     # 승강팀 OVR 평형 일괄 적용
     # [기능 변경] 이 리스케일 자체(승강팀 OVR을 새 리그 수준에 맞추는 것)는
@@ -7994,6 +8361,16 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
         else:
             update_player(current_league_id=my_new_league)
         add_log(f"📋 소속 리그가 변경되었습니다", "event", year, 52)
+
+        # [2026-07 버그수정, 신민용 리포트: "커리어에 리그가 1부로 그대로
+        # 뜬다"] _update_career_stats(진행 중 커리어 항목 실시간 갱신)는
+        # "그 주에 경기가 있었을 때만" 불렸는데, 승강이 확정되는 시점은
+        # 클럽 시즌이 끝난 뒤(경기가 없는 주)라 다음 시즌 첫 경기 전까지
+        # career_entries.league_name/tier가 옛 리그로 그대로 남아있었다
+        # (사이드바의 실시간 p.current_league_id는 맞게 바뀌는데, 커리어
+        # 팝업만 안 따라옴). 리그가 바뀌는 바로 이 시점에 즉시 한 번
+        # 강제로 동기화한다.
+        _update_career_stats(get_player(), year, 52)
 
     for text, ltype in pending_logs:
         add_log(text, ltype, year, 52)
@@ -8204,10 +8581,19 @@ def _last_played_country_id(p):
         conn.close()
 
 
-def generate_offers(count=5) -> list:
+def generate_offers(count=5, force=False) -> list:
     """[2026-07 재설계] count 파라미터는 더 이상 총 개수를 결정하지 않는다
     (하위호환을 위해 시그니처만 유지) — 실제 개수는 상황별로 아래 상수에
-    고정되어 있다. 자세한 이유는 아래 주석 참고."""
+    고정되어 있다. 자세한 이유는 아래 주석 참고.
+
+    [2026-07 버그수정, 신민용 리포트: "계약만료 이후 팀 입단할 때 왜
+    아무것도 안떠?"] center_panel.py의 "🔔 오퍼 ON/OFF" 버튼 툴팁엔 원래
+    "팀 입단(무소속 강제 입단)에는 영향 없음"이라고 명시돼 있었는데, 정작
+    이 함수는 그 구분 없이 offers_enabled=0이면 무조건 빈 리스트를
+    돌려줬다 — 그래서 평소 오퍼 알림을 꺼둔 사람이 계약만료로 무소속이
+    되면, 강제 입단 창(_do_join)조차 자동 오퍼가 0개로 떠서 "직접 지원"
+    슬롯 4개만 덩그러니 보이는 문제가 있었다. force=True면(강제 입단
+    호출 전용) offers_enabled 뮤트를 무시하고 항상 생성한다."""
     p = get_player()
     if not p: return []
 
@@ -8217,7 +8603,9 @@ def generate_offers(count=5) -> list:
     # 똑같은 기능의 토글이 있었다는 걸 나중에 발견해서 하나로 통합했다.
     # center_panel.py와 동일하게 "이적 요청 중이면 토글 꺼져 있어도 계속
     # 옴" 예외를 그대로 유지한다. 강제판매(별도 로직)는 이 토글과 무관.
-    if not p.get("offers_enabled", 1) and not p.get("transfer_requested"):
+    # force=True(강제 입단)면 이 뮤트 자체를 아예 건너뛴다 — 위 버그수정
+    # 주석 참고.
+    if not force and not p.get("offers_enabled", 1) and not p.get("transfer_requested"):
         return []
 
     # [2026-07 재설계 v2, 신민용 최종안] 상황별로 의도적으로 차이를 크게
@@ -8858,7 +9246,8 @@ AGENT_APPLY_MOD = {"S": 8, "A": 6, "B": 4, "C": 2, "D": 0, "E": -2, "F": -4}
 _APPLY_FORM_RATING_MOD = [(7.5, 6), (7.0, 4), (6.5, 2)]
 
 # 직전 수상 보정(최고 하나만 적용).
-_APPLY_AWARD_MOD = {"발롱도르": 10, "MVP": 8, "득점왕": 6, "도움왕": 6, "베스트11": 4}
+_APPLY_AWARD_MOD = {"발롱도르": 10, "MVP": 8, "득점왕": 6, "도움왕": 6, "베스트11": 4,
+                    "올해의 수비수": 4, "구단 올해의 선수": 2}
 
 # 일반 나이 보정(재능과 무관 — 너무 어리거나 너무 노쇠하면 리스크로 소폭 페널티).
 def _apply_age_mod(age: int) -> float:

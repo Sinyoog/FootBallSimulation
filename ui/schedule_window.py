@@ -279,6 +279,11 @@ class ScheduleWindow(QDialog):
         if cwc_bracket_w:
             self._tab.addTab(cwc_bracket_w, "🌍 클럽 월드컵(본선)")
 
+        # [2026-07 신설, 신민용 리포트: "경기 일정 창에 승강전 탭이 안 뜬다"]
+        po_w = self._make_po_tab()
+        if po_w:
+            self._tab.addTab(po_w, "⚖ 승강 플레이오프")
+
         # [2026-07 신설] 국내 컵대회 탭 — 예전엔 이 탭 자체가 없어서 컵
         # 경기가 로그에만 남고 일정 화면 어디에도 안 보였다.
         # [2026-07 수정, 신민용 리포트: "컵대회도 내 경기/전체일정처럼
@@ -1181,6 +1186,58 @@ class ScheduleWindow(QDialog):
         lay.addWidget(lbl_t)
 
         stage_order_named = {stage_ko.get(k, k): v for k, v in stage_order.items()}
+        rounds = build_rounds_from_matches(bracket_matches, stage_order_named)
+        bracket = BracketWidget(rounds)
+        lay.addWidget(bracket)
+        self._fit_to_bracket(bracket)
+
+        lay.addStretch()
+        outer.setWidget(body)
+        return outer
+
+    def _make_po_tab(self):
+        """[2026-07 신설, 신민용 리포트: "경기 일정 창에 승강전 탭이 안
+        뜬다"] 클럽월드컵 본선 탭과 동일한 패턴 — 44주에 내 팀이 승강
+        플레이오프에 걸렸으면(브래킷 어느 자리든) 대진표로 보여준다."""
+        import promotion_playoff_engine as ppe
+        from game_engine import get_state, get_player
+
+        st = get_state()
+        p = get_player()
+        if not st or not p or not p.get("current_team_id"):
+            return None
+
+        t = ppe.get_my_po_tournament(p["current_team_id"], st["current_year"])
+        if not t:
+            return None
+
+        bracket_matches = ppe.get_po_bracket_matches(t["id"])
+        if not bracket_matches:
+            return None
+
+        from PyQt6.QtWidgets import QScrollArea
+        from ui.bracket_widget import BracketWidget, build_rounds_from_matches
+
+        outer = QScrollArea()
+        outer.setWidgetResizable(True)
+        outer.setStyleSheet("QScrollArea{border:none;background:#1e1e1e;}")
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(10)
+
+        hdr = QLabel(f"⚖ {t['year']}년 승강 플레이오프  (44주)")
+        hdr.setStyleSheet("color:#ffee55;font-size:14px;font-weight:bold;")
+        lay.addWidget(hdr)
+
+        lbl_t = QLabel("◼ 대진표")
+        lbl_t.setStyleSheet("color:#00cc44;font-weight:bold;font-size:12px;")
+        lay.addWidget(lbl_t)
+
+        # bracket_matches의 stage는 이미 한글("예선"/"준결승"/"하위리그
+        # 결승"/"최종 승강전")이라 stage_order도 한글 키로 바로 준다 —
+        # promotion_playoff_engine.get_po_bracket_matches 참고.
+        stage_order_named = {"예선": 0, "준결승": 0, "하위리그 결승": 1, "최종 승강전": 2}
         rounds = build_rounds_from_matches(bracket_matches, stage_order_named)
         bracket = BracketWidget(rounds)
         lay.addWidget(bracket)

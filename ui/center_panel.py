@@ -354,6 +354,17 @@ class CenterPanel(QWidget):
         self.lbl_next_intl.hide()
         self.lay.addWidget(self.lbl_next_intl)
 
+        # [2026-07 신설, 신민용 리포트: "이것도 월드컵처럼 다음 일정
+        # 표시가 있어야 하는거 아냐?"] 승강 플레이오프도 intl과 동일한
+        # 패턴 — 44주 전체에 걸쳐 내 팀 매치가 이미 day까지 확정된
+        # 상태라 미리 보여줄 수 있다.
+        self.lbl_next_po = QLabel("")
+        self.lbl_next_po.setObjectName("nextPoPreview")
+        self.lbl_next_po.setStyleSheet(
+            "color:#ffee55;font-weight:bold;font-size:12px;padding:2px 4px;")
+        self.lbl_next_po.hide()
+        self.lay.addWidget(self.lbl_next_po)
+
         # 액션 버튼 행1
         row1 = QHBoxLayout()
         self.btn_join     = QPushButton("🏟 팀 입단");      self.btn_join.setObjectName("actBtn")
@@ -672,6 +683,7 @@ class CenterPanel(QWidget):
 
         self._update_next_week_preview(bundle_start, p, st=st)
         self._update_next_intl_preview(bundle_start, p)
+        self._update_next_po_preview(bundle_start, p)
 
         day_labels_kr = ["월", "화", "수", "목", "금", "토", "일"]
         for i, (f, cb) in enumerate(zip(self.week_frames, self.week_combos)):
@@ -801,6 +813,21 @@ class CenterPanel(QWidget):
                         ml.setText(f"🌍 클럽 월드컵 {stage} ({loc})\nvs {opp_disp}")
                         ml.setStyleSheet("color:#4dd2ff;font-weight:bold;font-size:12px;"
                                          "background:#1a2f3a;border-radius:4px;padding:4px;")
+                        ml.show()
+                elif match_info.get("po"):
+                    # [2026-07 신설, 승강 플레이오프] 다른 대회들과 동일한
+                    # 패턴 — 색은 "이 경기 결과로 리그가 갈린다"는 긴장감을
+                    # 주려고 경고성 노란색 계열로 골랐다(다른 어떤 대회
+                    # 색과도 안 겹침: 리그=초록/컵=보라/챔스=황금/CWC=하늘/
+                    # 국대=주황·빨강).
+                    stage = match_info.get("stage_ko", "")
+                    opp   = match_info.get("opp", "")
+                    loc   = "홈" if match_info.get("is_home") else "원정"
+                    hl.setText(f"스트레스 +{self._match_stress_preview(p, match_info.get('is_home', False))}")
+                    if ml:
+                        ml.setText(f"⚖ 승강 플레이오프 {stage} ({loc})\nvs {opp}")
+                        ml.setStyleSheet("color:#ffee55;font-weight:bold;font-size:12px;"
+                                         "background:#3a3315;border-radius:4px;padding:4px;")
                         ml.show()
                 else:
                     league_name = match_info.get("league_name", "")
@@ -1533,6 +1560,59 @@ class CenterPanel(QWidget):
             # 미리보기는 부가 정보라 실패해도 메인 화면 동작에 영향 주면 안 됨.
             self.lbl_next_intl.hide()
 
+    def _update_next_po_preview(self, bundle_start, p):
+        """[2026-07 신설, 신민용 리포트: "이것도 월드컵처럼 다음 일정
+        표시가 있어야 하는거 아냐?"] 위 _update_next_intl_preview와
+        완전히 같은 패턴 — 승강 플레이오프도 44주 전체에 걸쳐 매치의
+        day가 이미 확정돼 있으므로, 지금 보이는 7일 범위보다 뒤에 있는
+        내 다음 경기를 미리 보여준다.
+
+        [탈락 처리, 신민용 확인: "떨어지면 미리보기 표시가 사라져야
+        한다"] intl은 alive 플래그로 명시적으로 판정하지만, PO는 그럴
+        필요가 없다 — 브래킷 다음 라운드 매치는 "이전 매치 승자"로만
+        채워지는 구조라(promotion_playoff.py의 winner 참조 방식), 내가
+        졌으면 애초에 나를 참조하는 미래 매치 자체가 안 생긴다. 그래서
+        "내 팀이 낀 미해결 매치가 남아있는가"만 확인하면 탈락 여부가
+        자동으로 반영된다."""
+        if not hasattr(self, "lbl_next_po"):
+            return
+        self.lbl_next_po.hide()
+        try:
+            import promotion_playoff_engine as ppe
+            from game_engine import get_state
+            from database import get_conn
+            from constants import day_to_date_str
+            st = get_state()
+            if not st or not p or not p.get("current_team_id"):
+                return
+            tid = p["current_team_id"]
+            t = ppe.get_my_po_tournament(tid, st["current_year"])
+            if not t or t.get("status") != "pending":
+                return   # PO가 아예 없거나 이미 끝남(승패 무관 더 보여줄 게 없음)
+            window_end = bundle_start + DAY_BUNDLE_SIZE - 1
+            conn = get_conn()
+            row = conn.execute(
+                """SELECT * FROM po_matches WHERE tournament_id=? AND home_score=-1
+                   AND (home_team_id=? OR away_team_id=?) AND day>?
+                   ORDER BY day LIMIT 1""",
+                (t["id"], tid, tid, window_end)).fetchone()
+            if not row:
+                conn.close()
+                return
+            opp_id = row["away_team_id"] if row["home_team_id"] == tid else row["home_team_id"]
+            opp_row = conn.execute("SELECT name FROM teams WHERE id=?", (opp_id,)).fetchone() \
+                if opp_id else None
+            conn.close()
+            date_str = day_to_date_str(row["day"])
+            if opp_row:
+                txt = f"⚖ 다음 일정: 승강 플레이오프 ({date_str} 예정) vs {opp_row['name']}"
+            else:
+                txt = f"⚖ 다음 일정: 승강 플레이오프 ({date_str} 예정) · 상대 미정"
+            self.lbl_next_po.setText(txt)
+            self.lbl_next_po.show()
+        except Exception:
+            self.lbl_next_po.hide()
+
     def _update_next_week_preview(self, bundle_start, p, st=None):
         """[2026-07 신설] 우측 상단 작은 박스 7개 — 다음 주(현재 표시 중인
         7일 묶음의 바로 다음 7일) 일정을 대회 종류별 색으로 간단히 미리
@@ -1554,6 +1634,8 @@ class CenterPanel(QWidget):
                 color = "#ffd24d"
             elif mi.get("cup"):
                 color = "#c48aff"
+            elif mi.get("po"):
+                color = "#ffee55"
             else:
                 color = "#66ff99"
             box.setStyleSheet(f"background:{color};border-radius:3px;")
@@ -1639,6 +1721,19 @@ class CenterPanel(QWidget):
         cw_pend = club_world_cup_engine.get_my_pending_stage(week, day=day, p=p, st=st)
         if cw_pend:
             return cw_pend
+
+        # [2026-07 버그수정, 신민용 리포트: "43주 마지막날에 44주 월요일
+        # PO 경기 전 휴식이 안 뜰 수도 있잖아"] PO도 intl/cwc와 동일하게
+        # po_matches.day가 실제 날짜로 채워져 있는데, 예전엔 이 조회가
+        # 아래의 _week_intl_cl_day 게이트(챔스/컵처럼 아직 day가 없는
+        # 대회 전용 — "그 주 딱 하루"에만 확인) *뒤에* 있어서, 그 게이트
+        # 조건이 안 맞는 날엔 아예 PO 조회 자체가 호출되지도 않았다 —
+        # intl/cwc처럼 이 게이트보다 앞에 둬야 day 기반 조회가 매일
+        # 정상적으로 동작한다.
+        import promotion_playoff_engine
+        po = promotion_playoff_engine.get_my_po_match(week, day=day, p=p, st=st)
+        if po:
+            return po
 
         from game_engine import _week_intl_cl_day
         if day != _week_intl_cl_day(week, p, st=st):
@@ -2004,7 +2099,13 @@ class CenterPanel(QWidget):
         # 그걸 그대로 복원해서 쓰고 없을 때만 새로 생성한다.
         from game_engine import load_pending_offer_state
         restore = load_pending_offer_state(kind="join")
-        offers = restore.get("offers", []) if restore else generate_offers()
+        # [2026-07 버그수정, 신민용 리포트: "계약만료 이후 팀 입단할 때 왜
+        # 아무것도 안떠?"] force=True — 이 창은 "🔔 오퍼 ON/OFF" 토글과
+        # 무관하게 항상 떠야 한다(버튼 자체 툴팁에도 "팀 입단에는 영향
+        # 없음"이라고 이미 써있었다). 토글을 꺼둔 채로 계약이 만료되면
+        # 강제 입단 창인데도 오퍼가 0개로 떠서 "직접 지원" 슬롯만 덩그러니
+        # 남는 문제가 있었다.
+        offers = restore.get("offers", []) if restore else generate_offers(force=True)
         if restore:
             from game_engine import refresh_offer_rank_info
             refresh_offer_rank_info(offers)

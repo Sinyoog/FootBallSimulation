@@ -280,30 +280,26 @@ def get_league_champions(league_id, limit=30):
     새 테이블 없이 match_results를 시즌 단위로 그때그때 집계해서 계산한다
     (승강전 처리와 동일한 방식).최신 시즌부터 최대 limit개.
 
-    [2026-07 개편] 예전엔 승강제가 '인접 티어 사이 1-up-1-down' 고정이라
-    '꼴찌 1팀 = 강등팀'이 항상 성립했지만, 이제 리그 규모별로 승강 인원이
-    다르므로(game_engine._promo_releg_count) '꼴찌'가 아니라 '실제로
-    강등되는 팀 전체'를, 승격도 마찬가지로 '실제로 승격되는 팀 전체'를
-    game_engine._process_promotion_relegation과 동일한 기준으로 계산해
-    반환한다.
+    [2026-07 승강 플레이오프 도입, 재수정] 예전엔 승격/강등 명단을 순위
+    위치만으로 재계산했다("하위 N명 = 강등") — 그런데 이제 그 N명 중
+    일부는 PO로 결정되므로, 순위가 강등권(또는 PO권)이어도 실제로는
+    PO에서 이겨 잔류/승격할 수 있다. 이제는 재계산 대신 promotion_log
+    (실제로 확정된 이동만 기록되는 원장)를 그대로 읽는다 — PO가 있든
+    없든 promotion_log는 항상 '진짜로 일어난 일'만 담고 있으므로 이
+    함수는 PO 존재 여부와 무관하게 항상 정확하다.
+
+    [2026-07 버그수정, 실제 테스트 중 발견] 처음엔 promotion_log.league_name
+    문자열로 필터링했는데, "프리메라 디비시온"처럼 여러 나라가 리그 이름을
+    그대로 공유하는 경우가 실제로 있어서(아르헨티나/안도라/칠레 등) 다른
+    나라의 승강 기록이 섞여 들어오는 걸 실제 세이브로 재현했다. 지금은
+    promotion_log.from_league_id/to_league_id(league_id 그대로 저장)로
+    필터링해서 이름 충돌과 완전히 무관하게 조회한다.
     """
-    from game_engine import get_league_standings, _promo_releg_count
+    from game_engine import get_league_standings
     conn = get_conn()
 
-    lg_row = conn.execute("SELECT country_id, tier FROM leagues WHERE id=?",
-                          (league_id,)).fetchone()
-    upper_lid = None
-    has_lower = False
-    if lg_row:
-        if lg_row["tier"] > 1:
-            ur = conn.execute(
-                "SELECT id FROM leagues WHERE country_id=? AND tier=?",
-                (lg_row["country_id"], lg_row["tier"] - 1)).fetchone()
-            upper_lid = ur["id"] if ur else None
-        lr = conn.execute(
-            "SELECT 1 FROM leagues WHERE country_id=? AND tier=?",
-            (lg_row["country_id"], lg_row["tier"] + 1)).fetchone()
-        has_lower = lr is not None
+    lg_row = conn.execute("SELECT tier FROM leagues WHERE id=?", (league_id,)).fetchone()
+    my_tier = lg_row["tier"] if lg_row else 0
 
     # [2026-07 수정] archive_old_seasons()로 과거 시즌이 match_results_archive로
     # 옮겨지므로, 여기서도 두 테이블을 합쳐서 시즌 목록을 뽑아야 예전처럼
@@ -323,27 +319,28 @@ def get_league_champions(league_id, limit=30):
         if not standings:
             continue
         n = len(standings)
+        rank_of = {s["name"]: i + 1 for i, s in enumerate(standings)}
 
-        # 승격팀 전체: '상위 티어' 크기 기준으로 산정한 인원만큼 이 리그
-        # 상위 순위부터(game_engine과 동일 로직 - 상위 티어 팀 수로 결정).
-        # relegated와 동일하게 rank(실제 이 리그에서의 최종 순위)도 함께 담아
-        # 화면에서 "2위(승격)"처럼 순위별 컬럼으로 보여줄 수 있게 한다.
+        # 두 경우 모두 "이 리그(league_id)에서 원래 뛰다가 떠난 팀"이라
+        # from_league_id=league_id는 공통이고, to_tier만 위/아래로 갈린다.
         promoted = []
-        if upper_lid:
-            upper_standings = get_league_standings(upper_lid, season=sr["season"], conn=conn)
-            if upper_standings:
-                n_promo = min(_promo_releg_count(len(upper_standings)), n)
-                promoted = [{"rank": i + 1, "name": standings[i]["name"]}
-                            for i in range(n_promo)]
+        if my_tier > 1:
+            rows_p = conn.execute(
+                """SELECT team_name FROM promotion_log
+                   WHERE year=? AND from_league_id=? AND to_tier=?""",
+                (sr["year"], league_id, my_tier - 1)).fetchall()
+            promoted = [{"rank": rank_of.get(r["team_name"], 0), "name": r["team_name"]}
+                        for r in rows_p if r["team_name"] in rank_of]
+            promoted.sort(key=lambda x: x["rank"])
 
-        # 강등팀 전체: '이 리그 자신'의 크기 기준으로 산정한 인원만큼 하위 순위부터.
         relegated = []
-        if has_lower:
-            n_releg = min(_promo_releg_count(n), n)
-            # 팀명뿐 아니라 실제 최종 순위(예: 18위)도 함께 담아서 화면에서
-            # "18위 팀명" 형태로 보여줄 수 있게 한다.
-            relegated = [{"rank": n - i, "name": standings[n - 1 - i]["name"]}
-                         for i in range(n_releg)]
+        rows_r = conn.execute(
+            """SELECT team_name FROM promotion_log
+               WHERE year=? AND from_league_id=? AND to_tier=?""",
+            (sr["year"], league_id, my_tier + 1)).fetchall()
+        relegated = [{"rank": rank_of.get(r["team_name"], 0), "name": r["team_name"]}
+                     for r in rows_r if r["team_name"] in rank_of]
+        relegated.sort(key=lambda x: x["rank"])
 
         out.append({
             "season": sr["season"], "year": sr["year"],
@@ -1104,3 +1101,242 @@ def get_cwc_tournament_detail(tournament_id):
                 for s in _CWC_KO_STAGE_ORDER if s in ko_by_stage]
 
     return {"groups": groups, "league_standings": [], "knockout": knockout}
+
+def get_po_results(league_id, year, direction="relegation"):
+    """[2026-07 신설, 확장] 이 리그가 관련된 승강 플레이오프 결과를 그 해
+    기준으로 반환한다. direction으로 어느 쪽 경계를 볼지 고른다:
+      - "relegation": 이 리그가 위(upper)인 경계 — 강등 플레이오프
+        (예: 2부 페이지에서 "2부→3부" 경계)
+      - "promotion":  이 리그가 아래(lower)인 경계 — 승급 플레이오프
+        (예: 2부 페이지에서 "1부→2부" 경계, 즉 2부팀이 1부로 올라가려는 쪽)
+    [2026-07 신민용 확정: "칸을 두 개로 나눠서 좌측엔 승급, 우측엔 강등을
+    같이 보여줘야 한다"] 예전엔 upper만 봐서 맨 위/맨 아래 리그가 아닌
+    중간 리그(2부/3부 등)는 자기 위쪽 경계(승급 PO)가 아예 안 보였다 —
+    같은 화면에 두 방향을 나란히 보여주려면 이 함수를 양방향으로 호출할
+    수 있어야 한다.
+
+    시즌 상세(연도 클릭) 화면 하단에 "승강전 어떻게 진행됐는지"를 보여주기
+    위한 용도 — po_matches/po_tournaments는 promotion_log와 마찬가지로
+    별도 정리 없이 계속 남아있으므로 과거 시즌도 그대로 조회된다.
+
+    홈/원정 각각의 소속 부수(tier)도 함께 반환한다 — 승강 PO는 정의상
+    서로 다른 부수 팀끼리 붙으므로("리서(4부) vs UNA(4부)"처럼 같은
+    부수로 잘못 보이면 혼란스럽다), 화면에서 "팀명(N부)"로 명확히
+    구분해서 보여줄 수 있게 한다."""
+    conn = get_conn()
+    _match_field = "t.upper_league_id" if direction == "relegation" else "t.lower_league_id"
+    rows = conn.execute(
+        f"""SELECT m.match_key, m.home_team_id, m.away_team_id,
+                  m.home_score, m.away_score, m.pso_score, m.pso_winner, m.is_boundary,
+                  t.upper_league_id, t.lower_league_id
+           FROM po_matches m JOIN po_tournaments t ON m.tournament_id=t.id
+           WHERE t.year=? AND {_match_field}=?
+             AND m.home_score!=-1
+           ORDER BY m.id""",
+        (year, league_id)).fetchall()
+    out = []
+    _STAGE_KO = {"Q1": "하위리그 예선", "SF1": "준결승", "SF2": "준결승",
+                 "LF": "하위리그 결승", "F": "최종 승강전"}
+    for r in rows:
+        upper_tier = conn.execute("SELECT tier FROM leagues WHERE id=?",
+                                   (r["upper_league_id"],)).fetchone()
+        lower_tier = conn.execute("SELECT tier FROM leagues WHERE id=?",
+                                   (r["lower_league_id"],)).fetchone()
+        upper_tier = upper_tier["tier"] if upper_tier else 0
+        lower_tier = lower_tier["tier"] if lower_tier else 0
+        ht = conn.execute("SELECT name, league_id FROM teams WHERE id=?",
+                           (r["home_team_id"],)).fetchone()
+        at = conn.execute("SELECT name, league_id FROM teams WHERE id=?",
+                           (r["away_team_id"],)).fetchone()
+        # [주의] teams.league_id는 이미 PO 결과가 반영된 "현재" 소속이라,
+        # PO 시작 시점의 소속(위/아래 어느 쪽 대표였는지)과 다를 수 있다
+        # (이겨서 이미 위 리그로 옮겨간 뒤일 수 있음). 그래서 teams.league_id
+        # 로 tier를 되짚지 않고, 이 매치가 속한 tournament의 upper/lower_tier
+        # 값 자체를 그대로 쓴다 — 다만 예선(Q1/SF/LF)은 양쪽 다 lower 소속
+        # 이므로 그 경우엔 둘 다 lower_tier로 표시한다.
+        _is_boundary = bool(r["is_boundary"])
+        out.append({
+            "stage": _STAGE_KO.get(r["match_key"], r["match_key"]),
+            "home": ht["name"] if ht else "?", "away": at["name"] if at else "?",
+            "home_tier": upper_tier if _is_boundary else lower_tier,
+            "away_tier": lower_tier,
+            "home_score": r["home_score"], "away_score": r["away_score"],
+            "pso_score": r["pso_score"], "is_boundary": _is_boundary,
+            "home_won": (r["pso_winner"] == r["home_team_id"]) if r["pso_winner"]
+                        else (r["home_score"] > r["away_score"]),
+        })
+    conn.close()
+    return out
+
+
+def get_team_history(team_id: int):
+    """[2026-07 신설] "팀 검색" → 팀 클릭 시 보여줄 연도별 기록.
+    리그 성적(순위+승격/강등 여부), 국내컵 도달 라운드, 챔피언스리그
+    도달 스테이지를 연도 내림차순으로 묶어 반환한다.
+
+    감독 이름 등은 아예 추적하는 시스템이 없어서(신민용 확정: 필요 없음)
+    안 넣는다 — 순수 "그 해 성적 기록"만.
+
+    [자료 출처] 리그 성적은 match_results(+archive)에서 직접 집계(항상
+    정확, 앞서 get_league_champions와 동일한 원칙). 승격/강등 여부는
+    promotion_log를 팀 이름+연도로 조회(팀 이름 충돌 가능성은 낮지만
+    있을 수 있어 from_league_id로 한 번 더 좁힌다). 컵대회/챔스는
+    cup_matches/cl_matches가 전 세계 모든 팀의 경기를 매년 계속
+    쌓아두는(삭제 안 함) 원본 데이터라, 그 팀의 마지막 경기 라운드를
+    "도달한 곳"으로 역산한다."""
+    from game_engine import get_league_standings
+    conn = get_conn()
+
+    trow = conn.execute("SELECT name FROM teams WHERE id=?", (team_id,)).fetchone()
+    if not trow:
+        conn.close()
+        return []
+    team_name = trow["name"]
+
+    yr_rows = conn.execute(
+        """SELECT DISTINCT season, year, league_id FROM match_results
+           WHERE (home_team_id=? OR away_team_id=?) AND home_score>=0
+           UNION
+           SELECT DISTINCT season, year, league_id FROM match_results_archive
+           WHERE (home_team_id=? OR away_team_id=?) AND home_score>=0""",
+        (team_id, team_id, team_id, team_id)).fetchall()
+    by_year = {}
+    for r in yr_rows:
+        by_year[(r["year"], r["season"])] = r["league_id"]
+
+    _CL_STAGE_KO = {"league": "리그 스테이지", "PO": "플레이오프",
+                    "R32": "32강", "R16": "16강", "QF": "8강", "SF": "4강",
+                    "F": "결승", "TP": "3/4위전"}
+    _CL_STAGE_ORDER = ["league", "PO", "R32", "R16", "QF", "SF", "F"]
+    # [2026-08 신설, 신민용 리포트: "팀 검색 이후 기록에 클럽 월드컵 기록이
+    # 없는거 같은데?"] 리그/컵/챔스는 있는데 클럽 월드컵만 빠져 있었다 —
+    # club_world_cup_engine.py 실제 stage 값(group/SF/TP/F)에 맞춘 매핑.
+    _CWC_STAGE_KO = {"group": "조별리그", "R16": "16강", "QF": "8강",
+                     "SF": "4강", "TP": "3/4위전", "F": "결승"}
+    _CWC_STAGE_ORDER = ["group", "R16", "QF", "SF", "TP", "F"]
+
+    def _cwc_match_winner(m):
+        """그 경기의 승자 team_id. 무승부면 PSO 승자, PSO도 없으면 None."""
+        if m["home_score"] == m["away_score"]:
+            return m["pso_winner"] or None
+        return m["home_team_id"] if m["home_score"] > m["away_score"] else m["away_team_id"]
+
+    out = []
+    for (year, season), league_id in sorted(by_year.items(), key=lambda x: -x[0][0]):
+        entry = {"year": year, "league": None, "cup": None, "cl": None, "cwc": None}
+
+        # ── 리그 성적 ──────────────────────────────────────
+        lg = conn.execute("SELECT name, tier FROM leagues WHERE id=?", (league_id,)).fetchone()
+        standings = get_league_standings(league_id, season=season, conn=conn)
+        rank = next((i + 1 for i, s in enumerate(standings) if s["id"] == team_id), None)
+        if lg and rank:
+            move = conn.execute(
+                """SELECT pl.to_tier, l2.name as dest_name FROM promotion_log pl
+                   JOIN leagues l2 ON pl.to_league_id=l2.id
+                   WHERE pl.year=? AND pl.team_name=? AND pl.from_league_id=?""",
+                (year, team_name, league_id)).fetchone()
+            if not move:
+                # [2026-07 버그수정, 신민용 리포트로 발견] 새 게임 시작 시
+                # 초기 역사(2000~2006년 등)를 미리 채워 넣는 "시드" 과정이
+                # from_league_id/to_league_id가 생기기 전 코드로 만들어진
+                # 것이라(실측: promotion_log 9688건 전부 0), 정확 매칭이
+                # 안 통한다. 이 경우엔 원산지 리그 이름(league_name, 이
+                # 컬럼의 관례상 "떠난" 리그 이름)과 국가(country_id로
+                # 리그를 좁혀서)로 대체 매칭한다 — 나라별로 흔히 겹치는
+                # 이름("프리메라 디비시온" 등) 문제를 국가로 한 번 더
+                # 걸러서 피한다.
+                _country_row = conn.execute(
+                    "SELECT country_id FROM leagues WHERE id=?", (league_id,)).fetchone()
+                _cid = _country_row["country_id"] if _country_row else None
+                move = conn.execute(
+                    """SELECT pl.to_tier, l2.name as dest_name FROM promotion_log pl
+                       JOIN leagues l2 ON l2.country_id=? AND l2.tier=pl.to_tier
+                       WHERE pl.year=? AND pl.team_name=? AND pl.from_tier=?
+                         AND pl.league_name=?""",
+                    (_cid, year, team_name, lg["tier"], lg["name"])).fetchone()
+            move_txt = ""
+            if move:
+                kind = "승격" if move["to_tier"] < lg["tier"] else "강등"
+                move_txt = f"  [{move['dest_name']}({move['to_tier']}부)로 {kind}]"
+            entry["league"] = f"{lg['name']}({lg['tier']}부) [{rank}등]{move_txt}"
+
+        # ── 국내컵 도달 라운드 ─────────────────────────────
+        cup_t = conn.execute(
+            """SELECT ct.id, ct.name, ct.winner_team_id
+               FROM cup_tournaments ct JOIN cup_entries ce ON ce.tournament_id=ct.id
+               WHERE ct.year=? AND ce.team_id=?""", (year, team_id)).fetchone()
+        if cup_t:
+            last_m = conn.execute(
+                """SELECT round_name FROM cup_matches
+                   WHERE tournament_id=? AND (home_team_id=? OR away_team_id=?)
+                     AND home_score!=-1
+                   ORDER BY round_idx DESC LIMIT 1""",
+                (cup_t["id"], team_id, team_id)).fetchone()
+            if last_m:
+                if cup_t["winner_team_id"] == team_id:
+                    entry["cup"] = f"{cup_t['name']} [우승]"
+                else:
+                    entry["cup"] = f"{cup_t['name']} [{last_m['round_name']}]"
+
+        # ── 챔피언스리그 도달 스테이지 ───────────────────────
+        cl_t = conn.execute(
+            """SELECT clt.id, clt.name, clt.winner_team_id
+               FROM cl_tournaments clt JOIN cl_entries cle ON cle.tournament_id=clt.id
+               WHERE clt.year=? AND cle.team_id=?""", (year, team_id)).fetchone()
+        if cl_t:
+            cl_matches = conn.execute(
+                """SELECT stage FROM cl_matches
+                   WHERE tournament_id=? AND (home_team_id=? OR away_team_id=?)
+                     AND home_score!=-1""",
+                (cl_t["id"], team_id, team_id)).fetchall()
+            if cl_matches:
+                reached = max((m["stage"] for m in cl_matches),
+                              key=lambda s: _CL_STAGE_ORDER.index(s) if s in _CL_STAGE_ORDER else -1)
+                stage_ko = _CL_STAGE_KO.get(reached, reached)
+                if cl_t["winner_team_id"] == team_id:
+                    entry["cl"] = f"{cl_t['name']} [우승]"
+                elif reached == "F":
+                    entry["cl"] = f"{cl_t['name']} [준우승]"
+                else:
+                    entry["cl"] = f"{cl_t['name']} [{stage_ko} 탈락]"
+
+        # ── 클럽 월드컵 도달 스테이지 ─────────────────────────
+        # [2026-08 신설, 신민용 리포트: "팀 검색 이후 기록에 클럽 월드컵
+        # 기록이 없다"] 챔피언스리그 블록과 완전히 같은 패턴(entries로
+        # 그해 출전 여부 확인 → matches로 도달한 가장 깊은 스테이지 역산).
+        # 4년 주기 대회라 대부분의 연도엔 cwc_t 자체가 없어서 entry["cwc"]가
+        # None으로 남는 게 정상 — UI(world_browser_window.py)도 None이면
+        # 그 줄 자체를 안 그린다.
+        cwc_t = conn.execute(
+            """SELECT cwt.id, cwt.name, cwt.winner_team_id
+               FROM cwc_tournaments cwt JOIN cwc_entries cwe ON cwe.tournament_id=cwt.id
+               WHERE cwt.year=? AND cwe.team_id=?""", (year, team_id)).fetchone()
+        if cwc_t:
+            cwc_matches = conn.execute(
+                """SELECT stage, home_team_id, away_team_id, home_score, away_score, pso_winner
+                   FROM cwc_matches
+                   WHERE tournament_id=? AND (home_team_id=? OR away_team_id=?)
+                     AND home_score!=-1""",
+                (cwc_t["id"], team_id, team_id)).fetchall()
+            if cwc_matches:
+                reached = max((m["stage"] for m in cwc_matches),
+                              key=lambda s: _CWC_STAGE_ORDER.index(s) if s in _CWC_STAGE_ORDER else -1)
+                if cwc_t["winner_team_id"] == team_id:
+                    entry["cwc"] = f"{cwc_t['name']} [우승]"
+                elif reached == "F":
+                    entry["cwc"] = f"{cwc_t['name']} [준우승]"
+                elif reached == "TP":
+                    # 3/4위전은 다음 스테이지가 없어서(챔스의 'F'처럼) 승패로
+                    # 3위/4위를 직접 갈라줘야 의미가 있다.
+                    tp = next(m for m in cwc_matches if m["stage"] == "TP")
+                    won_tp = _cwc_match_winner(tp) == team_id
+                    entry["cwc"] = f"{cwc_t['name']} [{'3위' if won_tp else '4위'}]"
+                else:
+                    stage_ko = _CWC_STAGE_KO.get(reached, reached)
+                    entry["cwc"] = f"{cwc_t['name']} [{stage_ko} 탈락]"
+
+        if entry["league"] or entry["cup"] or entry["cl"] or entry["cwc"]:
+            out.append(entry)
+
+    conn.close()
+    return out

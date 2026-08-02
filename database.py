@@ -603,6 +603,44 @@ def init_db():
         year INTEGER, team_name TEXT, result TEXT,
         goals INTEGER DEFAULT 0, assists INTEGER DEFAULT 0,
         caps INTEGER DEFAULT 0, rating REAL DEFAULT 0)""")
+    # ── 승강 플레이오프 (promotion_playoff_engine) ──────────────────
+    # [2026-07 신설] _process_promotion_relegation이 43주에 순위를 확정할 때,
+    # PO 대상(po_count 자리)에 걸린 팀은 즉시 이동시키지 않고 여기에
+    # "보류" 상태로 적어둔다 — 자동 이동분(auto_count)은 기존처럼 그 자리에서
+    # 바로 teams.league_id를 바꾸고 promotion_log에 남긴다. PO 대상 팀은
+    # 44주(PLAYOFF_WEEK) 진입 시 promotion_playoff_engine.start_promotion_
+    # playoffs()가 이 테이블을 읽어 실제 대진을 만들고, PO 결과가 나온 뒤에야
+    # teams.league_id/promotion_log에 반영된다(그때 이 테이블에서 소비돼
+    # 지워짐).
+    c.execute("""CREATE TABLE IF NOT EXISTS po_pending_slots(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        year INTEGER, upper_league_id INTEGER, lower_league_id INTEGER,
+        rule_id TEXT, side TEXT, offset_idx INTEGER,
+        team_id INTEGER, team_name TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS po_tournaments(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        year INTEGER, upper_league_id INTEGER, lower_league_id INTEGER,
+        rule_id TEXT, status TEXT DEFAULT 'pending',
+        my_in INTEGER DEFAULT 0, my_team_id INTEGER DEFAULT 0)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS po_matches(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tournament_id INTEGER, match_key TEXT, day INTEGER,
+        home_team_id INTEGER DEFAULT 0, away_team_id INTEGER DEFAULT 0,
+        home_score INTEGER DEFAULT -1, away_score INTEGER DEFAULT -1,
+        pso_winner INTEGER DEFAULT 0, pso_score TEXT DEFAULT '',
+        is_boundary INTEGER DEFAULT 0, finalized INTEGER DEFAULT 0,
+        is_my INTEGER DEFAULT 0, my_played INTEGER DEFAULT 0,
+        my_position TEXT DEFAULT '', my_saves INTEGER DEFAULT 0,
+        my_goals INTEGER DEFAULT 0, my_assists INTEGER DEFAULT 0,
+        my_rating REAL DEFAULT 0)""")
+    # 커리어/은퇴창에서 "국제전"과 같은 톤으로 개인 PO 경기 기록을 보여주기
+    # 위한 요약 테이블(get_my_intl_matches와 동일한 목적 — po_matches는
+    # 대회 데이터라 지워질 수 있지만 이 표는 커리어 기록으로 영구 보존).
+    c.execute("""CREATE TABLE IF NOT EXISTS po_history(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        year INTEGER, team_name TEXT, opp_name TEXT, result TEXT,
+        goals INTEGER DEFAULT 0, assists INTEGER DEFAULT 0,
+        rating REAL DEFAULT 0)""")
     # 오퍼 거절 기록 (기존 코드가 참조하나 생성 누락되어 있던 테이블)
     c.execute("""CREATE TABLE IF NOT EXISTS offer_refused(
         team_id INTEGER, year INTEGER)""")
@@ -924,6 +962,22 @@ def init_db():
         "ALTER TABLE my_player ADD COLUMN cup_suspension INTEGER DEFAULT 0",
         "ALTER TABLE my_player ADD COLUMN intl_suspension INTEGER DEFAULT 0",
         "ALTER TABLE my_player ADD COLUMN cwc_suspension INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN po_suspension INTEGER DEFAULT 0",
+        # [2026-07 버그수정, 신민용 리포트: "승강 플레이오프 중 부상당했는데
+        # 다른 대회처럼 (부상) 표시로도 기록이 안 남는다"] sim_my_po_match_as_ai
+        # (부상 등으로 AI가 대신 뛸 때)가 po_history에 아예 아무것도 안
+        # 남기고 있었다 — cup_matches.my_absence_reason과 동일한 목적의
+        # 컬럼을 po_history(승강 PO는 커리어 영구 기록용 테이블)에 추가한다.
+        "ALTER TABLE po_history ADD COLUMN absence_reason TEXT DEFAULT NULL",
+        # [2026-07 버그수정, 승강 플레이오프 도입 중 발견 — 신민용 세션]
+        # promotion_log.league_name만으로는 어느 리그인지 특정할 수 없다
+        # ("프리메라 디비시온"처럼 나라마다 이름이 겹치는 리그가 실제로
+        # 여러 개 존재 — 아르헨티나/안도라/칠레 등). world_browser.
+        # get_league_champions()가 이름 문자열로 promotion_log를 조회하면
+        # 다른 나라의 승강 기록이 섞여 들어오는 버그가 있었다. league_id를
+        # 직접 남겨서 이름 충돌과 무관하게 정확히 조회할 수 있게 한다.
+        "ALTER TABLE promotion_log ADD COLUMN from_league_id INTEGER DEFAULT 0",
+        "ALTER TABLE promotion_log ADD COLUMN to_league_id INTEGER DEFAULT 0",
         # [2026-07 신설] 컵대회/챔스/국제대회에서 내가 결장한 이유(부상/출전정지
         # 등)를 기록 — 신민용 요청: 커리어 세부 기록·은퇴창·AI 요약에
         # "(부상)"/"(출전정지)" 식으로 표시하기 위함. NULL이면 정상 출전.
@@ -1594,7 +1648,8 @@ def reset_game_data():
               "intl_history","intl_tournaments","intl_entries","intl_matches","nat_generation",
               "cl_tournaments","cl_entries","cl_matches","cl_history",
               "cwc_tournaments","cwc_entries","cwc_matches",
-              "cup_tournaments","cup_entries","cup_matches","cup_history"]:
+              "cup_tournaments","cup_entries","cup_matches","cup_history",
+              "po_pending_slots","po_tournaments","po_matches","po_history"]:
         c.execute(f"DELETE FROM {t}")
     c.execute("UPDATE teams SET wins=0,draws=0,losses=0,goals_for=0,goals_against=0")
     _reset_teams_to_league_data(c)
@@ -2009,6 +2064,67 @@ _COUNTRY_CONTINENT = {}   # 나라명 -> 대륙 (지연 초기화)
 _CONTINENT_COUNTRIES = {}  # 대륙 -> [(나라명, fifa_rank), ...] fifa_rank 오름차순(강한 순)
 _ALL_COUNTRIES_BY_RANK = []  # [2026-07 신설] 대륙 무관 전세계 (나라명, fifa_rank) 목록 —
                               # 스타 슬롯 해외파 국가를 대륙 상관없이 가중 추첨할 때 사용.
+
+
+def get_country_avg_squad_ovr(country, positions=None, min_count=8, top_n=3):
+    """[2026-07 신설, 신민용 리포트: "국대 실제값이 밴드 상한을 훨씬
+    넘어선다"] get_country_squad_players()(포지션당 '전 세계 태그 선수 중
+    1등'만 픽)를 국가 평균 OVR 계산에 그대로 재사용했더니, 단 한 명의
+    극단적 이상치에 전체 평균이 휘둘리는 문제가 있었다 — 실측: 대한민국
+    국적 태그 CB 707명 중 우연히 잉글랜드 프리미어리그 소속인 1명이
+    OVR97까지 찍혀서, 그 한 명 때문에 '국대 평균'이 88.6까지 치솟았다
+    (반면 707명 전체 평균은 61.7). 선수 개인 OVR은 국적과 무관하게 순수히
+    소속 클럽(리그 등급·팀 명성)으로 정해지므로, 태그된 선수 수가 많은
+    나라일수록 이런 통계적 이상치가 나올 확률 자체가 높아진다.
+
+    get_country_squad_players()는 그대로 둔다(포메이션 화면에서 "실제
+    보유한 최고의 선수로 라인업을 짠다"는 목적엔 이 방식이 맞다 —
+    손흥민이 토트넘 소속이면 당연히 그 선수로 스쿼드를 짜야 한다). 이
+    함수는 "그 나라 수준을 대표하는 평균값" 계산 전용으로, 포지션당
+    1명이 아니라 상위 top_n명을 뽑아 평균 내서 단일 이상치의 영향력을
+    줄인다 — 여전히 '준수한 선수들' 수준을 반영하지만(전체 707명 평균
+    보다는 높게, 그게 국가대표 선발 개념에 맞음), 극단값 하나가 전체를
+    끌어올리지는 않는다. 3단계 폴백은 get_country_squad_players와 동일한
+    구조를 그대로 따른다.
+    """
+    positions = positions or ["GK", "CB", "CB", "LB", "RB", "CDM", "CM", "CAM", "LW", "RW", "ST"]
+    conn = get_conn()
+    slot_groups: list = [[] for _ in positions]
+    used_ids: set = set()
+
+    def _fill(where_sql, params, randomize=False):
+        for i, pos in enumerate(positions):
+            if slot_groups[i]:
+                continue
+            ph = ",".join(str(x) for x in used_ids) or "0"
+            order_by = "RANDOM()" if randomize else "ap.ovr DESC"
+            rows = conn.execute(
+                f"""SELECT ap.id, ap.ovr
+                    FROM ai_players ap JOIN teams t ON ap.team_id=t.id
+                    JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
+                    WHERE {where_sql} AND ap.position=? AND ap.id NOT IN ({ph})
+                    ORDER BY {order_by} LIMIT ?""",
+                (*params, pos, top_n)).fetchall()
+            if rows:
+                slot_groups[i] = [r["ovr"] for r in rows]
+                used_ids.update(r["id"] for r in rows)
+
+    _fill("ap.nationality=?", (country,))
+    if sum(1 for s in slot_groups if s) < min_count:
+        _fill("cn.name=?", (country,))
+    if sum(1 for s in slot_groups if s) < min_count:
+        _init_nationality_tables()
+        cont = _COUNTRY_CONTINENT.get(country, "")
+        _fill("t.current_tier>=2 AND cn.continent=? AND cn.name!=?", (cont, country), randomize=True)
+    if sum(1 for s in slot_groups if s) < min_count:
+        _fill("t.current_tier>=2 AND cn.name!=?", (country,), randomize=True)
+    conn.close()
+
+    filled = [g for g in slot_groups if g]
+    if len(filled) < min_count:
+        return None
+    # 포지션별 상위 top_n 평균 → 그 값들을 다시 포지션 간 평균.
+    return sum(sum(g) / len(g) for g in filled) / len(filled)
 
 
 def get_country_squad_players(country, positions=None, min_count=8):

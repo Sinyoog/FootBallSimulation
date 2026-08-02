@@ -13,6 +13,33 @@ from game_engine import get_player, fmt_money, add_log, get_state, _save_career_
 from constants import format_result_with_absence
 
 
+def _fmt_loan_months(total_weeks):
+    """주 단위 기간을 '1년', '1년 3개월', '3개월'처럼 사람이 읽는 형태로."""
+    months = max(1, round(total_weeks / 4.33))
+    if months >= 12:
+        yrs, rem = divmod(months, 12)
+        return f"{yrs}년" if rem == 0 else f"{yrs}년 {rem}개월"
+    return f"{months}개월"
+
+
+def _loan_out_duration_str(entry_list, idx, partner, fallback_sy, fallback_sw):
+    """[2026-08 버그수정, 신민용 리포트: "임대 기간이 실제(1년)와 다르게
+    2개월로 뜬다"] 원소속팀 행(exit_type='임대')의 시작~종료는 '임대를
+    보내기 전까지 원소속팀에 있었던 기간'일 뿐 실제 임대 기간이 아니다 —
+    실제 임대 기간은 목적지 팀(partner)에서 뛴 기간이므로, 이 행 뒤에
+    나오는 행들 중 팀명이 partner와 일치하는 행을 찾아 그 행의 시작~종료로
+    계산한다. 못 찾거나 아직 안 끝났으면 '진행중'."""
+    for fut in entry_list[idx + 1:]:
+        if fut.get("team_name") == partner:
+            fsy = fut.get("start_year", fallback_sy); fsw = fut.get("start_week", 1)
+            fey = fut.get("end_year"); few = fut.get("end_week", 52)
+            if fey:
+                total_weeks = max(1, (fey - fsy) * 52 + (few - fsw))
+                return _fmt_loan_months(total_weeks)
+            return "진행중"
+    return "진행중"
+
+
 def _game_confirm(parent, title: str, message: str) -> bool:
     from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
     from PyQt6.QtCore import Qt
@@ -70,6 +97,7 @@ from database import get_conn
 _PERSONAL_AWARD_KEYWORDS = (
     "발롱도르", "MVP", "득점왕", "도움왕", "베스트11",
     "골든글러브", "영플레이어", "푸스카스", "사모라",
+    "올해의 수비수", "구단 올해의 선수",
 )
 
 
@@ -292,7 +320,8 @@ class RetireWindow(QDialog):
         if awards:
             from collections import Counter
             cnt = Counter(a.get("award_type","") for a in awards)
-            order = ["발롱도르","MVP","득점왕","도움왕","베스트11","골든글러브","영플레이어"]
+            order = ["발롱도르","MVP","득점왕","도움왕","베스트11","골든글러브","영플레이어",
+                     "올해의 수비수","구단 올해의 선수"]
             parts = [f"{k} {cnt[k]}회" for k in order if cnt.get(k)]
             hl = QLabel("🏅 " + "   ·   ".join(parts))
             hl.setWordWrap(True)
@@ -366,6 +395,16 @@ class RetireWindow(QDialog):
             t37b.setObjectName("secTitle")
             lay.addWidget(t37b)
             lay.addWidget(self._cwc_table(cwc_ms))
+
+        # ── 승강 플레이오프 기록 ──────────────────────
+        # [2026-07 버그수정] 컵대회와 같은 급으로(매년 누구에게나 열릴 수
+        # 있음) 0건이어도 항상 표시 — 클럽월드컵(4년 주기)만 조건부로 둔다.
+        import promotion_playoff_engine
+        po_ms = promotion_playoff_engine.get_my_po_matches()
+        t37c = QLabel(f"⚖ 승강 플레이오프 기록  ({len(po_ms)})")
+        t37c.setObjectName("secTitle")
+        lay.addWidget(t37c)
+        lay.addWidget(self._po_table(po_ms))
 
         # ── 개인 수상 ────────────────────────────────
         # (awards는 위에서 conn이 열려 있을 때 이미 로드했다. conn.close() 이후
@@ -581,19 +620,24 @@ class RetireWindow(QDialog):
                 # career_window.py와 동일하게 상대팀명을 함께 표시한다.
                 _partner = e.get("loan_partner_team", "") or ""
                 if t_type == "임대 종료":
-                    t_type = f"{_partner} 복귀" if _partner else "복귀"
-                else:
+                    # [2026-08 버그수정, 신민용 리포트: "임대 온 것도 표시해야
+                    # 한다"] 이 행 자체가 임대처에서 뛴 기간이라 이 행의
+                    # 시작~종료가 곧 실제 임대 기간이다 — "OO 복귀"만 보여주지
+                    # 말고 어디서 얼마나 임대로 왔었는지도 같이 보여준다.
                     if ey:
-                        total_weeks = max(1, (ey - sy) * 52 + (ew - sw))
-                        months = max(1, round(total_weeks / 4.33))
-                        if months >= 12:
-                            _yrs, _rem = divmod(months, 12)
-                            dur = f"{_yrs}년" if _rem == 0 else f"{_yrs}년 {_rem}개월"
-                        else:
-                            dur = f"{months}개월"
+                        dur = _fmt_loan_months(max(1, (ey - sy) * 52 + (ew - sw)))
+                        t_type = f"{_partner}에서 임대({dur}) 후 복귀" if _partner else f"임대({dur}) 후 복귀"
                     else:
-                        dur = "진행중"
+                        t_type = f"{_partner} 복귀" if _partner else "복귀"
+                else:
+                    # [2026-08 버그수정, 신민용 리포트: "임대 기간이 실제(1년)와
+                    # 다르게 2개월로 뜬다"] 이 행(원소속팀)의 시작~종료는
+                    # 임대 가기 전 원소속팀 재직 기간일 뿐이라 부정확하다 —
+                    # 목적지 팀에서 뛴 실제 기간(다음에 나오는 그 팀 행)으로
+                    # 계산한다.
+                    dur = _loan_out_duration_str(visible, i, _partner, sy, sw)
                     t_type = f"{_partner}에 임대({dur})" if _partner else f"임대({dur})"
+
 
             if in_type == "임대" or i == 0 or cur_team != visible[i-1].get("team_name"):
                 # 임대, 또는 팀이 바뀌었거나 첫 행 → 계약년수 표시
@@ -843,7 +887,8 @@ class RetireWindow(QDialog):
         # 수상 종류별 횟수 요약
         from collections import Counter
         cnt = Counter(a.get("award_type","") for a in awards)
-        order = ["발롱도르","MVP","득점왕","도움왕","베스트11","골든글러브","영플레이어","푸스카스상","올해의 골","사모라상"]
+        order = ["발롱도르","MVP","득점왕","도움왕","베스트11","골든글러브","영플레이어","푸스카스상","올해의 골","사모라상",
+                 "올해의 수비수","구단 올해의 선수"]
         summary_parts = []
         for k in order:
             if cnt.get(k):
@@ -861,7 +906,8 @@ class RetireWindow(QDialog):
         tbl  = self._make_table(len(awards), cols)
         icon = {"득점왕":"⚽","도움왕":"🎯","베스트11":"⭐","MVP":"🏅",
                 "발롱도르":"🏆","영플레이어":"🌟","골든글러브":"🧤",
-                "푸스카스상":"💥","올해의 골":"💥","사모라상":"🛡️"}
+                "푸스카스상":"💥","올해의 골":"💥","사모라상":"🛡️",
+                "올해의 수비수":"🛡️","구단 올해의 선수":"🎖️"}
         
         for i, a in enumerate(awards):
             atype = a.get("award_type","")
@@ -1036,6 +1082,33 @@ class RetireWindow(QDialog):
             if _reason_label:
                 vals[3] = "—"; vals[4] = "—"; vals[5] = "—"; vals[6] = "—"
                 vals[7] = _reason_label
+            for j, v in enumerate(vals):
+                self._set_item(tbl, i, j, v)
+        tbl.resizeColumnsToContents()
+        tbl.resizeRowsToContents()
+        tbl.setFixedHeight(30 + min(len(matches), 7) * 28)
+        return tbl
+
+    def _po_table(self, matches):
+        """[2026-07 신설] 승강 플레이오프 경기별 기록 테이블. po_history는
+        골/어시/평점 정도만 담는 얕은 스키마라(슈팅/실점 등 세부 컬럼 없음)
+        그에 맞춰 간단한 컬럼 구성으로 표시한다.
+
+        [2026-07 버그수정, 신민용 리포트: "부상으로 결장한 승강 PO 경기가
+        기록 자체가 안 남는다"] absence_reason이 있으면(부상/출전정지로
+        AI가 대신 뛴 경우) 컵대회 표와 동일하게 스탯 칸을 "—"로, 결과
+        칸을 사유로 덮어써서 표시한다."""
+        if not matches:
+            lbl = QLabel("승강 플레이오프 기록 없음"); lbl.setStyleSheet("color:#555;")
+            return lbl
+        cols = ["연도", "우리 팀", "상대", "골", "어시", "평점", "결과"]
+        tbl = self._make_table(len(matches), cols)
+        for i, m in enumerate(matches):
+            vals = [str(m["year"]), m["team_name"], m["opp_name"],
+                    str(m["goals"]), str(m["assists"]), str(m["rating"]), m["result"]]
+            if m.get("absence_reason"):
+                _reason_label = _ABSENCE_LABEL.get(m["absence_reason"], m["absence_reason"])
+                vals[3] = "—"; vals[4] = "—"; vals[5] = "—"; vals[6] = _reason_label
             for j, v in enumerate(vals):
                 self._set_item(tbl, i, j, v)
         tbl.resizeColumnsToContents()
@@ -1234,18 +1307,23 @@ class RetireWindow(QDialog):
                     # 뜨면 어느 팀으로 갔는지/어디로 복귀했는지 안 보인다"]
                     _partner = e.get("loan_partner_team", "") or ""
                     if t_type == "임대 종료":
-                        t_type = f"{_partner} 복귀" if _partner else "복귀"
-                    else:
+                        # [2026-08 버그수정, 신민용 리포트: "성남 FC에 임대
+                        # 왔다는 표시를 2002년 행에도 해줘야 한다"] 이 행
+                        # 자체가 임대처에서 뛴 기간이라 이 행의 시작~종료가
+                        # 곧 실제 임대 기간이다 — "OO 복귀"만 보여주지 말고
+                        # 어디서 얼마나 임대로 왔었는지도 같이 보여준다.
                         if ey:
-                            total_weeks = max(1, (ey - sy) * 52 + (ew - sw))
-                            months = max(1, round(total_weeks / 4.33))
-                            if months >= 12:
-                                _yrs, _rem = divmod(months, 12)
-                                dur = f"{_yrs}년" if _rem == 0 else f"{_yrs}년 {_rem}개월"
-                            else:
-                                dur = f"{months}개월"
+                            dur = _fmt_loan_months(max(1, (ey - sy) * 52 + (ew - sw)))
+                            t_type = f"{_partner}에서 임대({dur}) 후 복귀" if _partner else f"임대({dur}) 후 복귀"
                         else:
-                            dur = "진행중"
+                            t_type = f"{_partner} 복귀" if _partner else "복귀"
+                    else:
+                        # [2026-08 버그수정, 신민용 리포트: "임대 기간이
+                        # 실제(1년)와 다르게 2개월로 뜬다"] 이 행(원소속팀)의
+                        # 시작~종료는 임대 가기 전 원소속팀 재직 기간일 뿐이라
+                        # 부정확하다 — 목적지 팀에서 뛴 실제 기간(뒤에 나오는
+                        # 그 팀 행)으로 계산한다.
+                        dur = _loan_out_duration_str(entries, idx, _partner, sy, sw)
                         t_type = f"{_partner}에 임대({dur})" if _partner else f"임대({dur})"
                 # [2026-07 신설, 신민용 지적: "구매/팔림에 금액이 안 보인다 —
                 # 파는 쪽(팔림)엔 표시 안 하고 사는 쪽(구매/오퍼)에만
@@ -1423,12 +1501,14 @@ class RetireWindow(QDialog):
         if awards:
             from collections import Counter
             cnt = Counter(a.get("award_type","") for a in awards)
-            order = ["발롱도르","MVP","득점왕","도움왕","베스트11","골든글러브","영플레이어"]
+            order = ["발롱도르","MVP","득점왕","도움왕","베스트11","골든글러브","영플레이어",
+                     "올해의 수비수","구단 올해의 선수"]
             summ = [f"{k} {cnt[k]}회" for k in order if cnt.get(k)]
             if summ:
                 lines.append("  ★ " + "  ·  ".join(summ))
             icon = {"득점왕":"⚽","도움왕":"🎯","베스트11":"⭐","MVP":"🏅",
-                    "발롱도르":"🏆","영플레이어":"🌟","골든글러브":"🧤"}
+                    "발롱도르":"🏆","영플레이어":"🌟","골든글러브":"🧤",
+                    "올해의 수비수":"🛡️","구단 올해의 선수":"🎖️"}
             for a in awards:
                 at = a.get("award_type","")
                 lines.append(f"  {icon.get(at,'🏅')} {a.get('year','')}년  {at}  "
@@ -1540,6 +1620,22 @@ class RetireWindow(QDialog):
                              f"{wm['comp']} {wm['stage']}  vs {wm['opp']}  ─  "
                              f"{_match_line_str(wm)}  ({wm['score']} {format_result_with_absence(wm)})")
             lines.append("")
+
+        # 승강 플레이오프 기록 (경기 단위)
+        import promotion_playoff_engine
+        po_ms2 = promotion_playoff_engine.get_my_po_matches()
+        lines.append(f"▶ 승강 플레이오프 기록  ({len(po_ms2)}경기)")
+        if po_ms2:
+            for pm in po_ms2:
+                if pm.get("absence_reason"):
+                    _reason = _ABSENCE_LABEL.get(pm["absence_reason"], pm["absence_reason"])
+                    lines.append(f"  • {pm['year']}년  {pm['team_name']} vs {pm['opp_name']}  ─  {_reason}")
+                else:
+                    lines.append(f"  • {pm['year']}년  {pm['team_name']} vs {pm['opp_name']}  ─  "
+                                 f"{pm['result']}  (골 {pm['goals']} 어시 {pm['assists']} 평점 {pm['rating']})")
+        else:
+            lines.append("  없음")
+        lines.append("")
 
         # 승강 경험
         from game_engine import get_my_promotions

@@ -18,9 +18,33 @@ from PyQt6.QtWidgets import (
     QAbstractItemView, QScrollArea, QGridLayout, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication
 
 import world_browser as wb
+
+
+def _clamp_and_resize(widget, w, h):
+    """다이얼로그를 원하는 크기로 키우되, 화면(작업 영역) 밖으로 넘어가지
+    않게 화면 크기 안으로 잘라 적용하고, 필요하면 창을 화면 안으로 다시
+    당겨온다. [2026-08 신설, 신민용 리포트: "바로 열면 저렇게 창이
+    (화면 밖으로) 넘어간다"] 예전엔 내용 기준으로 무조건 키우기만 해서
+    (초기 resize(1600,700)도 포함) 화면이 작거나(예: 다른 창과 절반씩
+    나눠 쓰는 모니터 배치) 목록/표 내용이 많은 리그를 열면 다이얼로그가
+    화면보다 커져 아래·오른쪽이 화면 밖으로 잘려 보였다. 모든 자동 확대
+    지점(_grow_to_fit, _ensure_list_fits, _grow_split_standing_to_fit,
+    초기 크기)이 이 함수를 거치게 해서 항상 화면 안에 들어오게 한다."""
+    screen = widget.screen() or QGuiApplication.primaryScreen()
+    if screen:
+        avail = screen.availableGeometry()
+        w = min(w, avail.width() - 40)
+        h = min(h, avail.height() - 60)
+    widget.resize(w, h)
+    if screen:
+        avail = screen.availableGeometry()
+        geo = widget.frameGeometry()
+        x = min(max(geo.x(), avail.x()), max(avail.x(), avail.x() + avail.width() - geo.width()))
+        y = min(max(geo.y(), avail.y()), max(avail.y(), avail.y() + avail.height() - geo.height()))
+        widget.move(x, y)
 
 STYLE = """
 QDialog { background:#1e1e1e; color:#ccc; }
@@ -74,9 +98,16 @@ class WorldBrowserWindow(QDialog):
         self.setWindowModality(Qt.WindowModality.NonModal)
         self.setWindowTitle("세계 축구 기록실")
         self.setStyleSheet(STYLE)
-        # 창 크기를 강제로 고정하지 않고, 내용(테이블 컬럼 수 등)에 맞춰
-        # 필요하면 커지도록 한다 — 시작 크기만 적당히 잡아둔다.
-        self.resize(980, 640)
+        # [2026-07 재수정, 신민용 리포트: "승급/강등 PO 표에 자체 가로
+        # 스크롤이 생긴다"] 예전엔 resize(980,640)로 좁게 시작한 뒤
+        # 나중에 setMinimumWidth(1200)만 걸었는데, 이미 만들어진 다이얼로그
+        # 크기에 최소너비가 곧바로 반영되지 않아 여전히 좁게 뜬 채로 PO
+        # 표 두 칸이 컬럼 내용에 맞춰 스스로 가로 스크롤을 만들었다.
+        # 시작 크기 자체를 넓게 잡는다 — 승급/강등 두 표(각 4열: 단계/
+        # 홈팀/스코어/원정팀)가 나란히 있어도 스크롤 없이 다 보이는 폭.
+        # [2026-08 수정] 화면(작업 영역)보다 이 크기가 크면 그대로 화면
+        # 밖으로 넘어가 버리므로, 화면 안에 들어오게 잘라서 적용한다.
+        _clamp_and_resize(self, 1600, 700)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(14, 12, 14, 12)
@@ -93,6 +124,7 @@ class WorldBrowserWindow(QDialog):
         lay.addWidget(tabs, 1)
 
         tabs.addTab(self._build_league_tab(), "🔍 리그 검색")
+        tabs.addTab(self._build_team_tab(), "🏟 팀 검색")
         tabs.addTab(self._build_cup_tab(), "🎖 컵대회 검색")
         tabs.addTab(self._build_cl_tab(), "🏆 역대 챔피언스리그")
         tabs.addTab(self._build_cwc_tab(), "🌍 역대 클럽 월드컵")
@@ -113,7 +145,12 @@ class WorldBrowserWindow(QDialog):
         if not self._first_show_done:
             self._first_show_done = True
             from PyQt6.QtCore import QTimer
-            QTimer.singleShot(0, self._ensure_list_fits)
+            QTimer.singleShot(0, self._ensure_all_lists_fit)
+
+    def _ensure_all_lists_fit(self):
+        self._ensure_list_fits(self.league_list, self._league_split)
+        self._ensure_list_fits(self.team_list, self._team_split)
+        self._ensure_list_fits(self.cup_country_list, self._cup_split)
 
     def _grow_to_fit(self, tbl, extra_w=60, extra_h=140, stretch_col=None):
         """테이블 내용(특히 컬럼 수·긴 텍스트)이 지금 창 폭보다 넓으면 그만큼
@@ -133,7 +170,85 @@ class WorldBrowserWindow(QDialog):
         new_w = max(self.width(), needed_w)
         new_h = max(self.height(), needed_h)
         if new_w != self.width() or new_h != self.height():
-            self.resize(new_w, new_h)
+            _clamp_and_resize(self, new_w, new_h)
+
+    def _col_label(self, text, width, color="#ccc", size=12, bold=False,
+                   align=Qt.AlignmentFlag.AlignLeft, tooltip_extra=None):
+        """[2026-08 신설, 신민용 리포트: "등급이 오른쪽 벽에 딱 붙어서 시선이
+        너무 멀리 이동한다", "정보들이 열(그리드)로 안 맞춰져 있어 들쭉날쭉해
+        보인다"] 리그/팀/컵대회 목록 각 줄의 셀 하나. 셀마다 폭을 고정해서
+        —내용 길이와 무관하게— 같은 정보가 항상 같은 x좌표에 오도록 만든다
+        (매 줄이 별개의 QWidget/QHBoxLayout이라도, 각 칸 폭이 똑같으면
+        전체 목록이 표처럼 정렬되어 보인다). 텍스트가 칸보다 길면 끝을
+        "…"으로 줄이고, 잘린 원문은 툴팁으로 확인 가능하게 남긴다."""
+        lbl = QLabel()
+        font = QFont()
+        font.setPixelSize(size)
+        font.setBold(bold)
+        lbl.setFont(font)
+        fm = QFontMetrics(font)
+        elided = fm.elidedText(str(text), Qt.TextElideMode.ElideRight, width - 6)
+        lbl.setText(elided)
+        tip = str(text) if elided != str(text) else None
+        if tooltip_extra:
+            tip = (tip + "\n" + tooltip_extra) if tip else tooltip_extra
+        if tip:
+            lbl.setToolTip(tip)
+        lbl.setFixedWidth(width)
+        lbl.setStyleSheet(f"color:{color};")
+        lbl.setAlignment(align | Qt.AlignmentFlag.AlignVCenter)
+        return lbl
+
+    def _grade_chip(self, grade, width=40):
+        """[2026-08 신설, 신민용 확정: "등급을 팀 이름 바로 옆(국가명 앞쪽)으로
+        옮겨라 — 가장 중요한 지표인데 맨 구석에 처박혀 있다"] 등급 배지를
+        이름 바로 다음(국가/리그보다 먼저) 고정폭 칸에 둬서, 목록을 훑을 때
+        가장 먼저 눈에 들어오게 한다. 색상은 offer_window와 같은 등급별
+        팔레트(#grade_SS 등, STYLE에 정의됨)를 objectName으로 그대로 물려받는다."""
+        lbl = QLabel(f"{grade}급")
+        lbl.setObjectName(f"grade_{grade}")
+        lbl.setFixedWidth(width)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+        lbl.setStyleSheet("font-size:11px;font-weight:bold;")
+        return lbl
+
+    def _list_header_row(self, cols):
+        """[2026-08 신설, 신민용 확정: "리그 검색/팀 검색 맨 위에 고정으로
+        리그명|등급|국가|부수 / 팀명|등급|국가|리그명(부수) 이렇게 표시"]
+        목록 각 줄이 고정폭 그리드(_col_label/_grade_chip)로 정렬은 되지만,
+        그게 무슨 칸인지 알려주는 표 헤더가 없었다. QTableWidget의
+        QHeaderView::section과 같은 톤(배경 #252525, 회색 글자)으로,
+        각 칸 폭을 그 목록의 row 위젯과 정확히 맞춘 헤더 한 줄을 만들어
+        목록 위에 스크롤 없이 고정으로 붙인다.
+        cols: [(라벨, 폭, 가운데정렬여부), ...] 순서 — 실제 row 위젯의
+        칸 순서·폭과 반드시 일치해야 세로 정렬이 맞는다."""
+        row = QWidget()
+        row.setStyleSheet("background:#252525; border-bottom:1px solid #333;")
+        h = QHBoxLayout(row)
+        h.setContentsMargins(10, 5, 16, 5)
+        h.setSpacing(10)
+        for label, width, center in cols:
+            lbl = QLabel(label)
+            lbl.setFixedWidth(width)
+            lbl.setStyleSheet("color:#888;font-size:10px;font-weight:bold;")
+            lbl.setAlignment((Qt.AlignmentFlag.AlignCenter if center else Qt.AlignmentFlag.AlignLeft)
+                              | Qt.AlignmentFlag.AlignVCenter)
+            h.addWidget(lbl)
+        h.addStretch(1)
+        return row
+
+    def _wrap_list_with_header(self, list_widget, header_row):
+        """리스트 위젯 위에 고정 헤더 한 줄을 얹은 컨테이너를 만들어
+        반환한다(스플리터엔 리스트 대신 이 컨테이너를 넣는다). 헤더는
+        QListWidget 밖에 별도 QWidget으로 둬서 리스트를 스크롤해도 헤더
+        줄은 항상 맨 위에 고정으로 보인다."""
+        holder = QWidget()
+        v = QVBoxLayout(holder)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+        v.addWidget(header_row)
+        v.addWidget(list_widget, 1)
+        return holder
 
     # ─────────────────────────────────────────
     # 탭1: 리그 검색
@@ -199,7 +314,14 @@ class WorldBrowserWindow(QDialog):
         self.league_list = QListWidget()
         self.league_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.league_list.itemClicked.connect(self._on_league_selected)
-        split.addWidget(self.league_list)
+        league_header = self._list_header_row([
+            ("리그명", self._NAME_COL_W, False),
+            ("", 16, False),   # 🔎 매칭 표시 칸 자리(라벨 없음, row와 폭만 맞춤)
+            ("등급", self._GRADE_COL_W, True),
+            ("국가", self._COUNTRY_COL_W, False),
+            ("부수", self._TIER_COL_W, True),
+        ])
+        split.addWidget(self._wrap_list_with_header(self.league_list, league_header))
 
         right = QWidget()
         right_lay = QVBoxLayout(right)
@@ -237,8 +359,100 @@ class WorldBrowserWindow(QDialog):
         # (_on_standing_row_clicked가 모드를 보고 알아서 무시함).
         self.standing_tbl.cellClicked.connect(self._on_standing_row_clicked)
         right_lay.addWidget(self.standing_tbl)
+
+        # [2026-08 신설, 신민용 리포트: "시즌 순위표가 한 번에 7팀 정도만
+        # 보이는데 너무 적다"] 팀 수가 많은 리그(예: 24팀)는 세로 스크롤 없이
+        # 한눈에 다 보려면 좌우 두 칸으로 나눠 보여주는 쪽이 스크롤보다 낫다
+        # (신민용 검토 후 확정 — 1~n/2위는 왼쪽, 나머지는 오른쪽, 실제 서비스
+        # 축구 경기 그래픽에서 20팀 넘는 리그표를 보여줄 때 흔히 쓰는 방식).
+        # 팀 수가 적은 리그(예: 8팀)까지 굳이 반으로 쪼개면 오히려 어색하고
+        # 허전해 보이므로, _STANDING_SPLIT_THRESHOLD를 넘는 리그만 이 좌우
+        # 2단 표를 쓰고 그 이하는 기존 단일 표(self.standing_tbl)를 그대로
+        # 쓴다 — 두 표는 서로 배타적으로 하나만 보인다.
+        self.standing_split_holder = QWidget()
+        split_row = QHBoxLayout(self.standing_split_holder)
+        split_row.setContentsMargins(0, 0, 0, 0)
+        split_row.setSpacing(10)
+        self.standing_tbl_l = QTableWidget(0, 0)
+        self.standing_tbl_l.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.standing_tbl_l.verticalHeader().setVisible(False)
+        self.standing_tbl_r = QTableWidget(0, 0)
+        self.standing_tbl_r.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.standing_tbl_r.verticalHeader().setVisible(False)
+        split_row.addWidget(self.standing_tbl_l)
+        split_row.addWidget(self.standing_tbl_r)
+        self.standing_split_holder.setVisible(False)
+        right_lay.addWidget(self.standing_split_holder)
+        # [2026-07 신설, 신민용 리포트: "시즌 상세 순위표 아래에 승강전
+        # 어떻게 진행됐는지 안 뜬다" → 이어서: "그거 글로만 되어있는데
+        # 일정처럼 표(UI)로 보여달라 했잖아"] 처음엔 QLabel에 줄바꿈
+        # 텍스트로만 넣어서 "글로 기록"하는 수준이었다 — 다른 표들(순위표,
+        # 역대 기록표)과 똑같이 QTableWidget으로 다시 만들어서 일정 화면
+        # 느낌으로 통일했다. 시즌 상세(season_detail) 모드에서만, 그 리그가
+        # 위/아래 어느 쪽 경계로든 PO에 걸렸을 때만(자동 이동만으로 안
+        # 끝났을 때) 보인다.
+        # [2026-07 신설, 신민용 확정: "중간 리그는 승급/강등 PO가 둘 다
+        # 있으니 좌측엔 승급, 우측엔 강등을 나란히 보여달라"] 예전엔 이
+        # 리그가 upper인 경계(강등 방향) 하나만 보여줬는데, 1부/최하위
+        # 리그가 아닌 중간 리그(2부/3부 등)는 위쪽 경계(승급 PO)도 따로
+        # 있다 — 2부 페이지에서 좌측="2부→1부"(승급), 우측="2부→3부"(강등)
+        # 이렇게 같은 화면에 두 방향을 동시에 보여준다. 칸이 부족할 걸
+        # 감안해 스플리터 크기도 같이 넓혔다(아래 split.setSizes 참고).
+        po_row = QHBoxLayout()
+        po_row.setSpacing(10)
+
+        po_left = QVBoxLayout()
+        self.po_promo_title = QLabel("⬆ 승급 플레이오프 결과")
+        self.po_promo_title.setStyleSheet("color:#4da6ff;font-size:12px;font-weight:bold;padding-top:6px;")
+        self.po_promo_title.setVisible(False)
+        po_left.addWidget(self.po_promo_title)
+        self.po_promo_tbl = QTableWidget(0, 4)
+        self.po_promo_tbl.setHorizontalHeaderLabels(["단계", "홈팀", "스코어", "원정팀"])
+        self.po_promo_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.po_promo_tbl.verticalHeader().setVisible(False)
+        self.po_promo_tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.po_promo_tbl.setVisible(False)
+        po_left.addWidget(self.po_promo_tbl)
+        po_row.addLayout(po_left)
+
+        po_right = QVBoxLayout()
+        self.po_results_title = QLabel("⬇ 강등 플레이오프 결과")
+        self.po_results_title.setStyleSheet("color:#ffee55;font-size:12px;font-weight:bold;padding-top:6px;")
+        self.po_results_title.setVisible(False)
+        po_right.addWidget(self.po_results_title)
+        self.po_results_tbl = QTableWidget(0, 4)
+        self.po_results_tbl.setHorizontalHeaderLabels(["단계", "홈팀", "스코어", "원정팀"])
+        self.po_results_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.po_results_tbl.verticalHeader().setVisible(False)
+        self.po_results_tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.po_results_tbl.setVisible(False)
+        po_right.addWidget(self.po_results_tbl)
+        po_row.addLayout(po_right)
+
+        right_lay.addLayout(po_row)
         split.addWidget(right)
-        split.setSizes([440, 500])
+        split.setSizes([440, 680])
+        # [2026-08 버그수정, 신민용 리포트: "몇부 배지와 우측 패널 사이 공간이
+        # 너무 넓다"] QSplitter는 기본적으로 전체 폭이 늘어나면(예: 표 내용이
+        # 넓어서 다이얼로그가 자동으로 커질 때) 두 판을 "기존 비율대로"
+        # 같이 늘린다. 리그 목록은 이미 고정폭 칸(그리드) 구성이라 그 이상
+        # 넓어져 봐야 빈 여백만 늘어날 뿐이므로, 늘어나는 폭은 전부 오른쪽
+        # 순위표 쪽으로만 가도록 스트레치 비율을 고정한다(왼쪽=0, 오른쪽=1).
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        # [2026-07 재수정] 표 자체의 가로 스크롤을 원천 차단 — 대신 마지막
+        # 열(원정팀)이 남는 폭을 채우도록 늘어나게 해서, 창이 좁아져도
+        # 표 안에서 스크롤이 생기는 대신 열 폭이 알아서 줄어들게 한다.
+        for _po_tbl in (self.po_promo_tbl, self.po_results_tbl):
+            _po_tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            # [2026-08 버그수정, 신민용 리포트: "강등 플레이오프 표의 '원정팀'
+            # 헤더가 가려져(짤려) 보인다"] Stretch 모드인 4번째 칸(원정팀)이
+            # 패널이 좁을 때 헤더 텍스트 폭보다 더 줄어들면서 "원정팀"이
+            # "정"처럼 잘려 보였다. 최소 칸 폭을 헤더 텍스트가 항상 온전히
+            # 들어갈 크기로 못박아서, 아무리 좁아져도 글자가 잘리지 않게 한다.
+            _po_tbl.horizontalHeader().setMinimumSectionSize(64)
+            _po_tbl.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.setMinimumWidth(1550)
         lay.addWidget(split, 1)
 
         self._country_cache = []  # [{id,name,flag,grade,continent}, ...] 현재 대륙 필터 기준
@@ -318,59 +532,81 @@ class WorldBrowserWindow(QDialog):
             self.league_list.addItem(note)
         self._ensure_list_fits()
 
-    def _ensure_list_fits(self):
-        """리그 목록 행(국가·리그명+티어/등급 배지)이 리스트 폭보다 넓으면
-        가로 스크롤로 잘리는 대신 창 자체를 키운다 — 표 쪽 _grow_to_fit과 같은
-        '절대 줄이지 않는다' 원칙."""
+    def _ensure_list_fits(self, list_widget=None, splitter=None):
+        """목록 행(국가·리그명+티어/등급 배지)이 리스트 폭보다 넓으면 가로
+        스크롤로 잘리는 대신 창 자체를 키운다 — 표 쪽 _grow_to_fit과 같은
+        '절대 줄이지 않는다' 원칙.
+        [2026-08 버그수정, 신민용 리포트: "팀 검색에서 리그명이 가려져
+        있다"] 원래 league_list만 검사해서, 팀 검색 탭(team_list)은 목록
+        칸(그리드)이 실제로 더 넓은데도 이 보정을 전혀 못 받아 리그명/국가명이
+        패널 밖으로 잘려나갔다. 인자로 어떤 목록·스플리터든 받게 일반화해서
+        리그/팀/컵대회 세 탭 모두 같은 보정을 받게 한다."""
+        list_widget = list_widget or self.league_list
+        splitter = splitter or self._league_split
         max_w = 0
-        for i in range(self.league_list.count()):
-            it = self.league_list.item(i)
-            w = self.league_list.itemWidget(it)
+        for i in range(list_widget.count()):
+            it = list_widget.item(i)
+            w = list_widget.itemWidget(it)
             if w:
                 max_w = max(max_w, w.sizeHint().width())
         if max_w == 0:
             return
-        scrollbar_w = self.league_list.verticalScrollBar().sizeHint().width()
+        scrollbar_w = list_widget.verticalScrollBar().sizeHint().width()
         needed_list_w = max_w + scrollbar_w + 12
-        cur_list_w = self.league_list.width()
+        cur_list_w = list_widget.width()
         if needed_list_w > cur_list_w:
             grow = needed_list_w - cur_list_w
             new_w = self.width() + grow
             if new_w > self.width():
-                self.resize(new_w, self.height())
-            sizes = self._league_split.sizes()
+                _clamp_and_resize(self, new_w, self.height())
+            sizes = splitter.sizes()
             if len(sizes) == 2:
                 sizes[0] += grow
-                self._league_split.setSizes(sizes)
+                splitter.setSizes(sizes)
+
+    # 리그/팀 목록 공통 칸 폭 — 모든 줄이 같은 폭을 쓰기 때문에 내용 길이와
+    # 무관하게 세로로 칸이 맞춰진다("그리드처럼 보인다").
+    _NAME_COL_W = 190
+    _GRADE_COL_W = 42
+    _COUNTRY_COL_W = 118
+    _TIER_COL_W = 48
+    _LEAGUE_COL_W = 168
 
     def _league_row_widget(self, lg):
-        """리그 목록 한 줄: 국기+국가+리그명 / 등급배지 / 티어.
-        offer_window의 카드-내부-라벨 조합과 같은 톤(작은 pill 배지)으로 통일.
-        [2026-07] 팀명 검색으로 뜬 결과면(lg['matched_team']이 있으면) 그 팀명을
-        작게 함께 보여줘서 "왜 이 리그가 검색됐는지" 바로 알 수 있게 한다."""
+        """리그 목록 한 줄 — 왼쪽부터 [리그명(고정폭)] [등급] [국가] [부수]
+        순서의 그리드. [2026-08 재정리, 신민용 리포트: "등급이 오른쪽 벽에
+        딱 붙어 시선이 멀리 이동한다", "칸이 안 맞춰져 들쭉날쭉하다"]
+        1) 가장 중요한 지표인 등급을 리그명 바로 옆(국가명보다 앞)으로
+           당겨서 훑어보기 쉽게 하고,
+        2) 칸마다 폭을 고정해 실제 표(그리드)처럼 세로 정렬을 맞추고,
+        3) 마지막 칸 뒤에도 여백을 둬서 리스트 오른쪽 벽/스크롤바에
+           바짝 붙어 보이지 않게 했다.
+        [2026-07] 팀명 검색으로 뜬 결과면(lg['matched_team']이 있으면) 리그명
+        칸 툴팁에 그 팀명을 함께 남겨 "왜 이 리그가 검색됐는지" 알 수 있게 한다."""
         row = QWidget()
         h = QHBoxLayout(row)
-        h.setContentsMargins(8, 5, 8, 5)
-        h.setSpacing(6)
+        h.setContentsMargins(10, 6, 16, 6)
+        h.setSpacing(10)
 
-        name_txt = f"{lg['flag']}  {lg['country']} · {lg['name']}"
         matched_team = lg.get("matched_team")
+        tip_extra = f"🔎 검색된 팀: {matched_team}" if matched_team else None
+        h.addWidget(self._col_label(lg["name"], self._NAME_COL_W, color="#eee",
+                                     bold=True, tooltip_extra=tip_extra))
+        # 칸 폭을 조건부로 바꾸면(팀명 매칭 여부에 따라) 줄마다 뒤 칸들이
+        # 밀려서 그리드 정렬이 깨진다 — 매칭 여부와 무관하게 항상 같은 폭의
+        # 표시 칸을 두고, 매칭 없을 땐 빈 채로 둔다.
+        match_mark = QLabel("🔎" if matched_team else "")
+        match_mark.setFixedWidth(16)
         if matched_team:
-            name_txt += f"  (🔎 {matched_team})"
-        name_lbl = QLabel(name_txt)
-        name_lbl.setStyleSheet("color:#ddd;font-size:12px;")
-        h.addWidget(name_lbl, 1)
+            match_mark.setToolTip(f"검색된 팀: {matched_team}")
+        h.addWidget(match_mark)
 
-        tier_lbl = QLabel(f"{lg['tier']}부")
-        tier_lbl.setStyleSheet("color:#888;font-size:10px;background:#2a2a2a;"
-                               "border-radius:3px;padding:1px 5px;")
-        h.addWidget(tier_lbl)
-
-        grade_lbl = QLabel(f"{lg['grade']}급")
-        grade_lbl.setObjectName(f"grade_{lg['grade']}")
-        grade_lbl.setStyleSheet("font-size:10px;")
-        h.addWidget(grade_lbl)
-
+        h.addWidget(self._grade_chip(lg["grade"], self._GRADE_COL_W))
+        h.addWidget(self._col_label(f"{lg['flag']} {lg['country']}",
+                                     self._COUNTRY_COL_W, color="#aaddff"))
+        h.addWidget(self._col_label(f"{lg['tier']}부", self._TIER_COL_W,
+                                     color="#888", align=Qt.AlignmentFlag.AlignCenter))
+        h.addStretch(1)
         return row
 
     def _on_league_selected(self, item):
@@ -378,6 +614,10 @@ class WorldBrowserWindow(QDialog):
         if lid is None:
             return
         self._current_league_id = lid
+        self.po_promo_title.setVisible(False)
+        self.po_promo_tbl.setVisible(False)
+        self.po_results_title.setVisible(False)
+        self.po_results_tbl.setVisible(False)
         self.standing_title.setText("⏳ 불러오는 중...")
         self.standing_sub.setText("")
         self.history_btn.setVisible(False)
@@ -458,8 +698,67 @@ class WorldBrowserWindow(QDialog):
             "🔵 파란색 = 승격  ·  🔴 빨간색 = 강등" if (promoted_names or relegated_names) else "")
         self._fill_standing_table(rows, promoted_names=promoted_names, relegated_names=relegated_names)
 
+        self._fill_po_panel(self.po_promo_title, self.po_promo_tbl,
+                             wb.get_po_results(lid, year, direction="promotion"))
+        self._fill_po_panel(self.po_results_title, self.po_results_tbl,
+                             wb.get_po_results(lid, year, direction="relegation"))
+
+    def _fill_po_panel(self, title_widget, tbl_widget, po_rows):
+        """[2026-07 신설] 승급/강등 PO 패널 채우기 — 두 방향(promotion/
+        relegation)이 완전히 같은 표 형식이라 하나로 합쳤다."""
+        if po_rows:
+            title_widget.setVisible(True)
+            tbl_widget.setVisible(True)
+            tbl_widget.setColumnCount(4)
+            tbl_widget.setHorizontalHeaderLabels(["단계", "홈팀", "스코어", "원정팀"])
+            tbl_widget.setRowCount(len(po_rows))
+            for i, pr in enumerate(po_rows):
+                home_won = pr["home_won"]
+                score_str = f"{pr['home_score']} - {pr['away_score']}"
+                if pr["pso_score"]:
+                    score_str += f"  (PSO {pr['pso_score']})"
+                stage_item = QTableWidgetItem(pr["stage"])
+                home_item = QTableWidgetItem(f"{pr['home']} ({pr['home_tier']}부)")
+                score_item = QTableWidgetItem(score_str)
+                away_item = QTableWidgetItem(f"{pr['away']} ({pr['away_tier']}부)")
+                score_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                # 승자 쪽 팀명을 파란색으로 강조 — 순위표의 "파란색=승격" 색
+                # 규칙과 통일. 예선(준결승 등)은 그 경기 자체의 승자만
+                # 강조하고(다음 라운드 진출이지 승강 확정은 아님), 최종
+                # 승강전(F)만 실제로 "위 리그로 가는 쪽"이라는 의미가 된다.
+                if home_won:
+                    home_item.setForeground(QColor("#4da6ff"))
+                    away_item.setForeground(Qt.GlobalColor.red)
+                else:
+                    away_item.setForeground(QColor("#4da6ff"))
+                    home_item.setForeground(Qt.GlobalColor.red)
+                tbl_widget.setItem(i, 0, stage_item)
+                tbl_widget.setItem(i, 1, home_item)
+                tbl_widget.setItem(i, 2, score_item)
+                tbl_widget.setItem(i, 3, away_item)
+            tbl_widget.resizeRowsToContents()
+            # [2026-07 재수정, 신민용 리포트: "위아래 스크롤도 없애고 다
+            # 보이게 해달라"] 예전엔 "헤더 30 + 행마다 28"로 높이를
+            # 어림잡았는데, 실제 렌더링된 행 높이(길게 줄바꿈된 팀명 등)가
+            # 이 가정보다 크면 컨테이너 안에 다 안 들어가 표 자체에 세로
+            # 스크롤이 생겼다. resizeRowsToContents() 이후의 실제 측정값
+            # (헤더 높이 + 각 행의 실제 높이 합 + 여유분)으로 정확히
+            # 계산하고, 세로 스크롤바 자체도 꺼서 넘치는 일이 없게 한다.
+            tbl_widget.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            _actual_h = tbl_widget.horizontalHeader().height()
+            for _r in range(tbl_widget.rowCount()):
+                _actual_h += tbl_widget.rowHeight(_r)
+            tbl_widget.setFixedHeight(_actual_h + 6)  # 프레임 여유분
+        else:
+            title_widget.setVisible(False)
+            tbl_widget.setVisible(False)
+
     def _on_season_back_clicked(self):
         """시즌 상세 순위표에서 '역대 우승팀' 목록으로 되돌아간다."""
+        self.po_promo_title.setVisible(False)
+        self.po_promo_tbl.setVisible(False)
+        self.po_results_title.setVisible(False)
+        self.po_results_tbl.setVisible(False)
         lid = getattr(self, "_current_league_id", None)
         if lid is None:
             return
@@ -479,11 +778,43 @@ class WorldBrowserWindow(QDialog):
             if rows else "")
         self._fill_champions_table(rows, wb.league_has_lower_tier(lid))
 
+    _STANDING_SPLIT_THRESHOLD = 12  # 이 팀 수를 넘으면 좌/우 2단 표로 전환
+
     def _fill_standing_table(self, rows, promoted_names=None, relegated_names=None):
         promoted_names = promoted_names or set()
         relegated_names = relegated_names or set()
         cols = ["순위", "팀명", "승", "무", "패", "득점", "실점", "득실", "승점"]
-        tbl = self.standing_tbl
+
+        def _row_color(name, rank0):
+            # [2026-08 버그수정] 승격/강등/상위 4팀에 안 걸리는 나머지도
+            # 반드시 명시적 색을 줘야 한다 — 안 그러면 배경색과 구분 안 되는
+            # 기본(검정) 글자색으로 그려져 "존재하지만 안 보이는" 행이 된다.
+            if name in relegated_names:
+                return QColor("#ff5555")
+            if name in promoted_names:
+                return QColor("#4da6ff")
+            if rank0 < 4:
+                return Qt.GlobalColor.white
+            return QColor("#ccc")
+
+        if len(rows) <= self._STANDING_SPLIT_THRESHOLD:
+            self.standing_split_holder.setVisible(False)
+            self.standing_tbl.setVisible(True)
+            self._fill_one_standing_table(self.standing_tbl, cols, rows, 0, _row_color)
+            self._grow_to_fit(self.standing_tbl, stretch_col=1)
+        else:
+            # [2026-08 신설] 팀이 많은 리그(예: 24팀)는 좌: 1~n/2위,
+            # 우: n/2+1~n위로 나눠서 스크롤 없이 한 화면에 다 보여준다.
+            self.standing_tbl.setVisible(False)
+            self.standing_split_holder.setVisible(True)
+            half = -(-len(rows) // 2)  # 올림 나눗셈 — 홀수면 왼쪽이 한 팀 더 많음
+            self._fill_one_standing_table(self.standing_tbl_l, cols, rows[:half], 0, _row_color)
+            self._fill_one_standing_table(self.standing_tbl_r, cols, rows[half:], half, _row_color)
+            self._grow_split_standing_to_fit()
+
+    def _fill_one_standing_table(self, tbl, cols, rows, rank_offset, row_color_fn):
+        """표 하나에 순위표 행을 채운다. rank_offset은 2단 분할 시 오른쪽
+        표의 순위 번호를 이어서 매기기 위한 시작 오프셋(왼쪽=0)."""
         tbl.clear()
         tbl.setRowCount(len(rows))
         tbl.setColumnCount(len(cols))
@@ -491,26 +822,39 @@ class WorldBrowserWindow(QDialog):
         tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         for i, r in enumerate(rows):
-            vals = [str(i + 1), r["name"], str(r["wins"]), str(r["draws"]), str(r["losses"]),
+            rank0 = rank_offset + i
+            vals = [str(rank0 + 1), r["name"], str(r["wins"]), str(r["draws"]), str(r["losses"]),
                     str(r["goals_for"]), str(r["goals_against"]),
                     str(r["goals_for"] - r["goals_against"]), str(r["pts"])]
-            # [2026-07 신설] 그 시즌 실제로 승격/강등된 팀을 색으로 표시
-            # (season_detail 모드에서만 promoted_names/relegated_names가 채워짐).
-            if r["name"] in relegated_names:
-                row_color = QColor("#ff5555")
-            elif r["name"] in promoted_names:
-                row_color = QColor("#4da6ff")
-            elif i < 4:
-                row_color = Qt.GlobalColor.white
-            else:
-                row_color = None
+            row_color = row_color_fn(r["name"], rank0)
             for j, v in enumerate(vals):
                 cell = QTableWidgetItem(v)
                 cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if row_color is not None:
-                    cell.setForeground(row_color)
+                cell.setForeground(row_color)
                 tbl.setItem(i, j, cell)
-        self._grow_to_fit(tbl, stretch_col=1)
+
+    def _grow_split_standing_to_fit(self):
+        """_grow_to_fit의 2단 표 버전 — 좌우 두 표를 한 줄에 놓고 봐야 하므로
+        폭은 (왼쪽 표 폭 + 오른쪽 표 폭 + 표 사이 여백)의 합으로, 높이는
+        (반으로 쪼갰으니) 더 적은 행 수 기준으로 계산한다. 역시 절대 줄이지
+        않는다(_grow_to_fit과 같은 원칙)."""
+        total_w = 20  # 두 표 사이 spacing
+        max_rows = 0
+        for tbl in (self.standing_tbl_l, self.standing_tbl_r):
+            header = tbl.horizontalHeader()
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+            tbl.resizeColumnsToContents()
+            w = sum(tbl.columnWidth(i) for i in range(tbl.columnCount()))
+            w += tbl.verticalHeader().width()
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            total_w += w
+            max_rows = max(max_rows, tbl.rowCount())
+        total_w += 60  # extra_w, _grow_to_fit과 동일한 여유분
+        needed_h = min(700, max_rows * 28 + 140)
+        new_w = max(self.width(), total_w)
+        new_h = max(self.height(), needed_h)
+        if new_w != self.width() or new_h != self.height():
+            _clamp_and_resize(self, new_w, new_h)
 
     def _fill_champions_table(self, rows, has_lower_tier=True):
         """'🏆 역대 우승팀' 토글 시 표시되는 시즌별 1~4위 + 강등 순위별 컬럼.
@@ -534,6 +878,11 @@ class WorldBrowserWindow(QDialog):
         get_league_champions()가 promoted를 항상 빈 리스트로 내려주므로,
         자동으로 1~4위가 전부 흰색으로만 남는다(승격 개념 자체가 없음).
         """
+        # [2026-08] 직전에 팀 수가 많은 리그의 시즌 상세(2단 분할 표)를 보고
+        # 있었을 수 있다 — 역대 우승팀 목록은 항상 단일 표(standing_tbl)를
+        # 쓰므로 전환 시 분할 표는 숨기고 단일 표를 다시 보여준다.
+        self.standing_split_holder.setVisible(False)
+        self.standing_tbl.setVisible(True)
         # 강등 순위 집합(같은 리그면 시즌마다 보통 동일하지만, 방어적으로
         # 전체 행에서 등장한 순위를 다 모아 오름차순으로 컬럼을 만든다).
         releg_ranks = sorted({item["rank"] for r in rows for item in (r.get("relegated") or [])})
@@ -570,6 +919,236 @@ class WorldBrowserWindow(QDialog):
                     cell.setToolTip("클릭하면 이 시즌 전체 순위표를 볼 수 있어요")
                 tbl.setItem(i, j, cell)
         self._grow_to_fit(tbl, stretch_col=None)
+
+    # ─────────────────────────────────────────
+    # 탭1.5: 팀 검색 (2026-07 신설, 신민용 확정: "팀 하나의 역대 기록을
+    # 보고 싶다 — 우승/리그순위/승격강등을 연도별로")
+    # 리그 검색 탭과 거의 같은 UX(대륙/국가/등급 필터 + 검색창 + 좌측
+    # 리스트)를 그대로 따르되, 부수(tier) 필터가 하나 더 있고, 우측은
+    # 순위표 대신 그 팀의 연도별 기록 목록을 보여준다.
+    # ─────────────────────────────────────────
+    def _build_team_tab(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 8, 0, 0)
+
+        info = QLabel("ℹ️ 팀 하나를 골라 그 팀의 연도별 기록(리그 순위·승격/강등·"
+                      "컵대회·챔피언스리그)을 확인하세요.")
+        info.setStyleSheet("color:#888;font-size:11px;")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+
+        filt = QHBoxLayout()
+        filt.setSpacing(8)
+        lbl1 = QLabel("대륙"); lbl1.setStyleSheet("color:#888;font-size:11px;")
+        self.team_cont_combo = QComboBox()
+        self.team_cont_combo.addItem(_ALL)
+        for cont in wb.list_continents():
+            self.team_cont_combo.addItem(cont)
+        self.team_cont_combo.currentTextChanged.connect(self._on_team_continent_changed)
+        filt.addWidget(lbl1)
+        filt.addWidget(self.team_cont_combo)
+
+        lbl2 = QLabel("국가"); lbl2.setStyleSheet("color:#888;font-size:11px;")
+        self.team_country_combo = QComboBox()
+        self.team_country_combo.addItem(_ALL)
+        self.team_country_combo.currentTextChanged.connect(self._refresh_team_list)
+        filt.addWidget(lbl2)
+        filt.addWidget(self.team_country_combo)
+
+        lbl3 = QLabel("등급"); lbl3.setStyleSheet("color:#888;font-size:11px;")
+        self.team_grade_combo = QComboBox()
+        self.team_grade_combo.addItem(_ALL)
+        for g in wb.list_grades():
+            self.team_grade_combo.addItem(g)
+        self.team_grade_combo.currentTextChanged.connect(self._refresh_team_list)
+        filt.addWidget(lbl3)
+        filt.addWidget(self.team_grade_combo)
+
+        lbl4 = QLabel("부수"); lbl4.setStyleSheet("color:#888;font-size:11px;")
+        self.team_tier_combo = QComboBox()
+        self.team_tier_combo.addItem(_ALL)
+        for t in range(1, 7):
+            self.team_tier_combo.addItem(f"{t}부")
+        self.team_tier_combo.currentTextChanged.connect(self._refresh_team_list)
+        filt.addWidget(lbl4)
+        filt.addWidget(self.team_tier_combo)
+
+        self.team_search_box = QLineEdit()
+        self.team_search_box.setPlaceholderText("🔎 리그명 · 국가명 · 팀명 검색")
+        self._team_search_debounce = QTimer(self)
+        self._team_search_debounce.setSingleShot(True)
+        self._team_search_debounce.setInterval(250)
+        self._team_search_debounce.timeout.connect(self._refresh_team_list)
+        self.team_search_box.textChanged.connect(lambda _text: self._team_search_debounce.start())
+        filt.addWidget(self.team_search_box, 1)
+        lay.addLayout(filt)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+        self._team_split = split
+        self.team_list = QListWidget()
+        self.team_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.team_list.itemClicked.connect(self._on_team_selected)
+        team_header = self._list_header_row([
+            ("팀명", self._NAME_COL_W, False),
+            ("등급", self._GRADE_COL_W, True),
+            ("국가", self._COUNTRY_COL_W, False),
+            ("리그명(부수)", self._LEAGUE_COL_W, False),
+        ])
+        split.addWidget(self._wrap_list_with_header(self.team_list, team_header))
+
+        right = QWidget()
+        right_lay = QVBoxLayout(right)
+        right_lay.setContentsMargins(10, 0, 0, 0)
+        self.team_detail_title = QLabel("← 왼쪽에서 팀을 선택하세요")
+        self.team_detail_title.setStyleSheet("color:#00cc44;font-size:14px;font-weight:bold;")
+        right_lay.addWidget(self.team_detail_title)
+
+        self.team_detail_scroll = QScrollArea()
+        self.team_detail_scroll.setWidgetResizable(True)
+        self.team_detail_scroll.setStyleSheet("QScrollArea{border:none;background:transparent;}")
+        self.team_detail_body = QWidget()
+        self.team_detail_lay = QVBoxLayout(self.team_detail_body)
+        self.team_detail_lay.setContentsMargins(4, 4, 4, 4)
+        self.team_detail_lay.setSpacing(4)
+        self.team_detail_lay.addStretch()
+        self.team_detail_scroll.setWidget(self.team_detail_body)
+        right_lay.addWidget(self.team_detail_scroll, 1)
+
+        split.addWidget(right)
+        split.setSizes([440, 900])
+        # [2026-08] 리그 검색 탭과 같은 이유 — 팀 목록도 고정폭 그리드라
+        # 다이얼로그가 커져도 목록 쪽엔 빈 여백만 늘어난다. 늘어나는 폭은
+        # 오른쪽 상세 패널로만 가게 고정한다.
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        lay.addWidget(split, 1)
+
+        self._refresh_team_list()
+        return w
+
+    def _on_team_continent_changed(self, *_a):
+        self._refresh_team_country_combo()
+        self._refresh_team_list()
+
+    def _refresh_team_country_combo(self):
+        """[2026-07 신설] 대륙 필터가 바뀌면 국가 콤보도 그 대륙 국가만
+        보이도록 다시 채운다 — 리그 검색 탭의 _refresh_country_list와
+        동일한 목적, 다만 팀 탭 전용 위젯(self.team_country_combo)에 적용."""
+        cont = None if self.team_cont_combo.currentText() == _ALL else self.team_cont_combo.currentText()
+        cur = self.team_country_combo.currentText()
+        self.team_country_combo.blockSignals(True)
+        self.team_country_combo.clear()
+        self.team_country_combo.addItem(_ALL)
+        countries = wb.list_countries(continent=cont)
+        for c in countries:
+            self.team_country_combo.addItem(f"{c['flag']} {c['name']}")
+        idx = self.team_country_combo.findText(cur)
+        self.team_country_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.team_country_combo.blockSignals(False)
+        self._team_country_cache = countries
+
+    def _selected_team_country_id(self):
+        txt = self.team_country_combo.currentText()
+        if txt == _ALL:
+            return None
+        for c in getattr(self, "_team_country_cache", []):
+            if f"{c['flag']} {c['name']}" == txt:
+                return c["id"]
+        return None
+
+    def _refresh_team_list(self, *_a):
+        cont = None if self.team_cont_combo.currentText() == _ALL else self.team_cont_combo.currentText()
+        cid = self._selected_team_country_id()
+        grade = None if self.team_grade_combo.currentText() == _ALL else self.team_grade_combo.currentText()
+        tier_txt = self.team_tier_combo.currentText()
+        tier = None if tier_txt == _ALL else int(tier_txt.replace("부", ""))
+        q = self.team_search_box.text().strip() or None
+        teams = wb.search_teams(name_query=q, continent=cont, country_id=cid,
+                                grade=grade, tier=tier, limit=300)
+        teams.sort(key=lambda t: t["name"])
+
+        self.team_list.clear()
+        for tm in teams:
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, tm["id"])
+            item.setData(Qt.ItemDataRole.UserRole + 1, tm["name"])
+            row_widget = self._team_row_widget(tm)
+            item.setSizeHint(row_widget.sizeHint())
+            self.team_list.addItem(item)
+            self.team_list.setItemWidget(item, row_widget)
+        self._ensure_list_fits(self.team_list, self._team_split)
+
+    def _team_row_widget(self, tm):
+        """팀 목록 한 줄 — 왼쪽부터 [팀명(고정폭)] [등급] [국가] [소속리그(부수)]
+        순서의 그리드. 리그 검색 탭(_league_row_widget)과 같은 이유로 같은
+        방식 적용: 등급을 팀명 바로 옆으로 당기고, 칸마다 고정폭을 둬서
+        표처럼 정렬되게 하고, 오른쪽 끝에 여백을 남긴다.
+        [2026-07 신설, 신민용 확정] search_teams()가 teams.league_id를
+        그대로 JOIN해서 조회하므로(별도 캐시 아님), 승격/강등이 일어나면
+        다음에 이 목록을 새로고칠 때 자동으로 최신 소속·부수가 반영된다
+        — 별도 갱신 로직이 필요 없다."""
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(10, 6, 16, 6)
+        h.setSpacing(10)
+
+        h.addWidget(self._col_label(tm["name"], self._NAME_COL_W, color="#eee", bold=True))
+        h.addWidget(self._grade_chip(tm["grade"], self._GRADE_COL_W))
+        h.addWidget(self._col_label(f"{tm['flag']} {tm['country']}",
+                                     self._COUNTRY_COL_W, color="#aaddff"))
+        h.addWidget(self._col_label(f"{tm['league_name']}({tm['tier']}부)",
+                                     self._LEAGUE_COL_W, color="#888"))
+        h.addStretch(1)
+        return row
+
+    def _on_team_selected(self, item):
+        tid = item.data(Qt.ItemDataRole.UserRole)
+        tname = item.data(Qt.ItemDataRole.UserRole + 1)
+        if tid is None:
+            return
+        self.team_detail_title.setText(f"📋 {tname}  역대 기록")
+
+        # 기존 내용 비우기(스트레치 제외)
+        while self.team_detail_lay.count() > 1:
+            child = self.team_detail_lay.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+        hist = wb.get_team_history(tid)
+        if not hist:
+            empty = QLabel("기록 없음")
+            empty.setStyleSheet("color:#666;")
+            self.team_detail_lay.insertWidget(0, empty)
+            return
+
+        for i, entry in enumerate(hist):
+            year_lbl = QLabel(str(entry["year"]))
+            year_lbl.setStyleSheet("color:#ffcc00;font-size:13px;font-weight:bold;padding-top:6px;")
+            self.team_detail_lay.insertWidget(self.team_detail_lay.count() - 1, year_lbl)
+            if entry["league"]:
+                _is_move = "승격" in entry["league"] or "강등" in entry["league"]
+                lg_lbl = QLabel(f"  {entry['league']}")
+                lg_lbl.setStyleSheet(
+                    ("color:#4da6ff;" if "승격" in entry["league"] else
+                     "color:#ff5555;" if "강등" in entry["league"] else "color:#ddd;")
+                    + "font-size:12px;")
+                self.team_detail_lay.insertWidget(self.team_detail_lay.count() - 1, lg_lbl)
+            if entry["cup"]:
+                cup_lbl = QLabel(f"  {entry['cup']}")
+                cup_lbl.setStyleSheet("color:#c48aff;font-size:12px;")
+                self.team_detail_lay.insertWidget(self.team_detail_lay.count() - 1, cup_lbl)
+            if entry["cl"]:
+                cl_lbl = QLabel(f"  {entry['cl']}")
+                cl_lbl.setStyleSheet("color:#ffd700;font-size:12px;")
+                self.team_detail_lay.insertWidget(self.team_detail_lay.count() - 1, cl_lbl)
+            if entry.get("cwc"):
+                # [2026-08 신설, 신민용 리포트: "팀 검색 이후 기록에 클럽
+                # 월드컵 기록이 없다"] 리그/컵/챔스와 같은 자리에 클럽
+                # 월드컵 줄도 추가. 챔스(금색)와 구분되게 하늘색 계열로.
+                cwc_lbl = QLabel(f"  {entry['cwc']}")
+                cwc_lbl.setStyleSheet("color:#4dd0e1;font-size:12px;")
+                self.team_detail_lay.insertWidget(self.team_detail_lay.count() - 1, cwc_lbl)
 
     # ─────────────────────────────────────────
     # 탭2: 컵대회 검색 (2026-07 신설)
@@ -612,7 +1191,11 @@ class WorldBrowserWindow(QDialog):
         self.cup_country_list = QListWidget()
         self.cup_country_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.cup_country_list.itemClicked.connect(self._on_cup_country_selected)
-        split.addWidget(self.cup_country_list)
+        cup_header = self._list_header_row([
+            ("나라명", self._NAME_COL_W, False),
+            ("기록", 70, True),
+        ])
+        split.addWidget(self._wrap_list_with_header(self.cup_country_list, cup_header))
 
         right = QWidget()
         right_lay = QVBoxLayout(right)
@@ -633,6 +1216,10 @@ class WorldBrowserWindow(QDialog):
         right_lay.addWidget(self.cup_tbl)
         split.addWidget(right)
         split.setSizes([320, 620])
+        # [2026-08] 리그/팀 검색 탭과 같은 이유로 나라 목록 칸도 고정폭 그리드라
+        # 다이얼로그가 커져도 늘어나는 폭은 오른쪽 기록 패널로만 가게 한다.
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
         lay.addWidget(split, 1)
 
         self._cup_country_cache = []
@@ -650,18 +1237,46 @@ class WorldBrowserWindow(QDialog):
         self.cup_country_list.clear()
         for c in countries:
             has_data = wb.has_cup_data(c["id"])
-            item = QListWidgetItem(f"{c['flag']}  {c['name']}" + ("" if has_data else "  (기록 없음)"))
+            item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, c["id"])
-            if not has_data:
-                item.setForeground(Qt.GlobalColor.darkGray)
+            item.setData(Qt.ItemDataRole.UserRole + 1, c["name"])
+            row_widget = self._cup_country_row_widget(c, has_data)
+            item.setSizeHint(row_widget.sizeHint())
             self.cup_country_list.addItem(item)
+            self.cup_country_list.setItemWidget(item, row_widget)
+        self._ensure_list_fits(self.cup_country_list, self._cup_split)
+
+    def _cup_country_row_widget(self, c, has_data):
+        """컵대회 검색 탭 나라 목록 한 줄 — 리그/팀 검색 탭과 같은 그리드
+        톤(고정폭 칸, 오른쪽 여백)으로 통일. [2026-08 신설, 신민용 요청:
+        "컵대회 검색 UI도 좀 수정해줘"] 예전엔 그냥 QListWidgetItem 텍스트에
+        "(기록 없음)"을 이어붙였는데, 다른 두 탭을 그리드로 정리한 김에
+        여기도 같은 형태(국가명 고정폭 + 기록 유무 배지)로 맞춘다."""
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(10, 6, 16, 6)
+        h.setSpacing(10)
+
+        h.addWidget(self._col_label(f"{c['flag']} {c['name']}", self._NAME_COL_W,
+                                     color="#eee" if has_data else "#666",
+                                     bold=has_data))
+        badge = QLabel("기록 있음" if has_data else "기록 없음")
+        badge.setFixedWidth(70)
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+        badge.setStyleSheet(
+            "color:#00cc44;font-size:10px;background:#16301c;border-radius:3px;padding:2px 5px;"
+            if has_data else
+            "color:#666;font-size:10px;background:#262626;border-radius:3px;padding:2px 5px;")
+        h.addWidget(badge)
+        h.addStretch(1)
+        return row
 
     def _on_cup_country_selected(self, item):
         cid = item.data(Qt.ItemDataRole.UserRole)
         if cid is None:
             return
         rows = wb.get_cup_history(cid)
-        cname = item.text().split("  (")[0]
+        cname = item.data(Qt.ItemDataRole.UserRole + 1) or ""
         self.cup_title.setText(f"🎖️ {cname} 역대 컵대회 기록")
         self.cup_sub.setText(
             f"{rows[0]['name']}  ·  완료된 대회 {len(rows)}건" if rows
@@ -987,7 +1602,7 @@ class TournamentDetailDialog(QDialog):
         self.setWindowModality(Qt.WindowModality.NonModal)
         self.setWindowTitle(title)
         self.setStyleSheet(STYLE)
-        self.resize(760, 560)
+        _clamp_and_resize(self, 760, 560)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(14, 12, 14, 12)

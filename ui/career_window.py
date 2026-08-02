@@ -13,6 +13,35 @@ from game_engine import get_player, fmt_money, get_my_promotions, get_state
 from database import get_conn
 from constants import format_result_with_absence
 
+
+def _fmt_loan_months(total_weeks):
+    """주 단위 기간을 '1년', '1년 3개월', '3개월'처럼 사람이 읽는 형태로.
+    retire_window.py의 동명 함수와 동일 로직(중복 정의 — import 순환을
+    피하려고 각 파일에 독립적으로 둔다)."""
+    months = max(1, round(total_weeks / 4.33))
+    if months >= 12:
+        yrs, rem = divmod(months, 12)
+        return f"{yrs}년" if rem == 0 else f"{yrs}년 {rem}개월"
+    return f"{months}개월"
+
+
+def _loan_out_duration_str(entry_list, idx, partner, fallback_sy, fallback_sw):
+    """[2026-08 버그수정, 신민용 리포트: "임대 기간이 실제(1년)와 다르게
+    2개월로 뜬다"] 원소속팀 행(exit_type='임대')의 시작~종료는 '임대를
+    보내기 전까지 원소속팀에 있었던 기간'일 뿐 실제 임대 기간이 아니다 —
+    실제 임대 기간은 목적지 팀(partner)에서 뛴 기간이므로, 이 행 뒤에
+    나오는 행들 중 팀명이 partner와 일치하는 행을 찾아 그 행의 시작~종료로
+    계산한다. 못 찾거나 아직 안 끝났으면 '진행중'."""
+    for fut in entry_list[idx + 1:]:
+        if fut.get("team_name") == partner:
+            fsy = fut.get("start_year", fallback_sy); fsw = fut.get("start_week", 1)
+            fey = fut.get("end_year"); few = fut.get("end_week", 52)
+            if fey:
+                total_weeks = max(1, (fey - fsy) * 52 + (few - fsw))
+                return _fmt_loan_months(total_weeks)
+            return "진행중"
+    return "진행중"
+
 # [2026-07 신설, 신민용 리포트: "은퇴창엔 부상/벤치/출전정지로 뜨는데
 # 커리어 창(이 파일)엔 여전히 0.0/원문 영어(red_card)로 뜬다"] retire_window.py
 # 에서 만든 것과 동일한 결장 라벨 체계를 여기서도 그대로 쓴다 — injury/
@@ -38,6 +67,7 @@ def _absence_override(m, ncols, rating_col_idx):
 _PERSONAL_AWARD_KEYWORDS = (
     "발롱도르", "MVP", "득점왕", "도움왕", "베스트11",
     "골든글러브", "영플레이어", "푸스카스", "사모라",
+    "올해의 수비수", "구단 올해의 선수",
 )
 
 
@@ -171,6 +201,16 @@ class CareerWindow(QDialog):
         cwc_ms = club_world_cup_engine.get_my_cwc_matches()
         if cwc_ms:
             tabs.addTab(self._cwc_tab(cwc_ms), f"클럽 월드컵 ({len(cwc_ms)})")
+
+        import promotion_playoff_engine
+        po_ms = promotion_playoff_engine.get_my_po_matches()
+        # [2026-07 버그수정, 신민용 리포트: "컵대회(0)/챔피언스(0)처럼
+        # 승강전(0) 탭이 안 뜬다"] 클럽월드컵(4년에 한 번뿐)처럼 조건부로
+        # 숨기면 안 된다 — 승강 PO는 매년 누구에게나 열릴 수 있는 흔한
+        # 가능성이라 컵대회/챔피언스와 같은 급으로, 0건이어도 항상 탭을
+        # 보여줘야 "이번엔 왜 안 걸렸지"가 아니라 "0건 = 안 걸렸구나"로
+        # 명확히 보인다.
+        tabs.addTab(self._po_tab(po_ms), f"⚖ 승강 플레이오프 ({len(po_ms)})")
         root.addWidget(tabs)
         tabs.currentChanged.connect(lambda: self._fit_width())
 
@@ -377,18 +417,23 @@ class CareerWindow(QDialog):
                 # '끝났다'는 사실보다 '어디로 돌아갔는지'가 의미 있는 정보다.
                 _partner = e.get("loan_partner_team", "") or ""
                 if t_type == "임대 종료":
-                    t_type = f"{_partner} 복귀" if _partner else "복귀"
-                else:
+                    # [2026-08 버그수정, 신민용 리포트: "임대 온 것도 표시해야
+                    # 한다"] 이 행 자체가 임대처에서 뛴 기간이라 이 행의
+                    # 시작~종료가 곧 실제 임대 기간이다 — "OO 복귀"만
+                    # 보여주지 말고 어디서 얼마나 임대로 왔었는지도 같이
+                    # 보여준다.
                     if ey:
-                        total_weeks = max(1, (ey - sy) * 52 + (ew - sw))
-                        months = max(1, round(total_weeks / 4.33))
-                        if months >= 12:
-                            _yrs, _rem = divmod(months, 12)
-                            dur = f"{_yrs}년" if _rem == 0 else f"{_yrs}년 {_rem}개월"
-                        else:
-                            dur = f"{months}개월"
+                        dur = _fmt_loan_months(max(1, (ey - sy) * 52 + (ew - sw)))
+                        t_type = f"{_partner}에서 임대({dur}) 후 복귀" if _partner else f"임대({dur}) 후 복귀"
                     else:
-                        dur = "진행중"
+                        t_type = f"{_partner} 복귀" if _partner else "복귀"
+                else:
+                    # [2026-08 버그수정, 신민용 리포트: "임대 기간이
+                    # 실제(1년)와 다르게 2개월로 뜬다"] 이 행(원소속팀)의
+                    # 시작~종료는 임대 가기 전 원소속팀 재직 기간일 뿐이라
+                    # 부정확하다 — 목적지 팀에서 뛴 실제 기간(뒤에 나오는
+                    # 그 팀 행)으로 계산한다.
+                    dur = _loan_out_duration_str(visible, i, _partner, sy, sw)
                     t_type = f"{_partner}에 임대({dur})" if _partner else f"임대({dur})"
             # [2026-07 신설] 이적료 표시 — transfer_type/exit_type(어떻게
             # 왔는지)과 별개 축인 transfer_fee(얼마에 왔는지)를 괄호로
@@ -673,7 +718,8 @@ class CareerWindow(QDialog):
         # 수상 종류별 횟수 요약
         from collections import Counter
         cnt = Counter(a.get("award_type","") for a in awards)
-        order = ["발롱도르","MVP","득점왕","도움왕","베스트11","골든글러브","영플레이어"]
+        order = ["발롱도르","MVP","득점왕","도움왕","베스트11","골든글러브","영플레이어",
+                 "올해의 수비수","구단 올해의 선수"]
         summary_parts = []
         for k in order:
             if cnt.get(k):
@@ -686,7 +732,8 @@ class CareerWindow(QDialog):
         cols = ["연도","수상","리그","상세"]
         tbl  = self._make_table(len(awards), cols)
         icon = {"득점왕":"⚽","도움왕":"🎯","베스트11":"⭐","MVP":"🏅",
-                "발롱도르":"🏆","영플레이어":"🌟","골든글러브":"🧤"}
+                "발롱도르":"🏆","영플레이어":"🌟","골든글러브":"🧤",
+                "올해의 수비수":"🛡️","구단 올해의 선수":"🎖️"}
         for i, a in enumerate(awards):
             atype = a.get("award_type","")
             label = f"{icon.get(atype,'🏅')} {atype}"
@@ -951,6 +998,36 @@ class CareerWindow(QDialog):
             if _reason_label:
                 vals[3] = "—"; vals[4] = "—"; vals[5] = "—"; vals[6] = "—"
                 vals[7] = _reason_label
+            for j, v in enumerate(vals):
+                self._set(tbl, i, j, v, color if j == len(vals) - 1 else None)
+        lay.addWidget(tbl)
+        return w
+    def _po_tab(self, matches):
+        """[2026-07 신설] 승강 플레이오프 경기별 기록. po_history는 슛/평점
+        정도만 담는 얕은 스키마라(intl_matches/cup_matches보다 단순) 컬럼도
+        그에 맞춰 간단하게 — 어느 대회든 '내가 직접 뛴 경기'는 같은 톤으로
+        보여준다는 원칙만 유지한다.
+
+        [2026-07 버그수정, 신민용 리포트: "부상으로 결장한 승강 PO 경기가
+        기록 자체가 안 남는다"] 결장 사유(_absence_override)가 있으면
+        컵대회/챔스 탭과 동일하게 스탯 칸을 "—"로, 결과 칸을 "부상"/
+        "출전정지"로 덮어써서 표시한다."""
+        w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(0, 0, 0, 0)
+        if not matches:
+            lay.addWidget(QLabel("승강 플레이오프 출전 기록 없음"))
+            return w
+        cols = ["연도", "우리 팀", "상대", "골", "어시", "평점", "결과"]
+        tbl = self._make_table(len(matches), cols)
+        for i, m in enumerate(matches):
+            res = m["result"]
+            color = ("#00cc44" if res == "승" else "#888888" if res == "무" else "#cc4444")
+            vals = [str(m["year"]), m["team_name"], m["opp_name"],
+                    str(m["goals"]), str(m["assists"]), str(m["rating"]), res]
+            _reason_label = _absence_override(m, len(vals), 6)
+            if _reason_label:
+                vals[3] = "—"; vals[4] = "—"; vals[5] = "—"
+                vals[6] = _reason_label
+                color = "#888888"
             for j, v in enumerate(vals):
                 self._set(tbl, i, j, v, color if j == len(vals) - 1 else None)
         lay.addWidget(tbl)
