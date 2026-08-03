@@ -377,6 +377,39 @@ def _tier_teams(country_id, tier):
     return out
 
 
+def _cup_bye_count(n, cap=64):
+    """[2026-08 신설, 신민용 설계 확정] "더 이상 새 부수가 합류하지 않는
+    첫 라운드"부터, 생존자 수를 표준 강수(8/16/32/64 중 하나, 64 상한 —
+    "게임에서 128강보다 64강이 훨씬 익숙하다"는 이유로 상한을 둠)로 깔끔히
+    수렴시키기 위한 부전승 인원을 계산한다.
+
+    P = n 이하의 가장 큰 2의 거듭제곱(64 상한)
+    bye = 2P - n   (n이 이미 P와 같으면, 즉 이미 딱 떨어지면 0)
+
+    이렇게 한 라운드에서만 부전승을 몰아주면, 그 다음부터는 항상 정확히
+    반씩 줄어들어(P → P/2 → ... → 2) 라운드 이름(_round_name)과 3/4위전
+    생성(_advance_round의 is_sf 판정)이 별도 손질 없이도 자동으로 맞아
+    떨어진다 — "코리아컵은 16강, 독일/잉글랜드는 32강 또는 64강" 식으로
+    나라별 팀 수에 맞게 본선 시작 지점이 자연스럽게 갈린다.
+
+    n이 128을 넘어(상한의 2배) 공식이 음수가 나오는 극단적인 경우는 이번
+    라운드엔 부전승을 강제로 몰아주지 않고(홀수면 1명만, 예전 방식)
+    다음 라운드에서 다시 계산한다 — 몇 라운드만 지나면 자연히 128 아래로
+    줄어들어 공식이 정상 작동한다.
+    """
+    if n <= 0:
+        return 0
+    p = 1
+    while p * 2 <= n and p * 2 <= cap:
+        p *= 2
+    if p >= n:
+        return 0
+    bye = 2 * p - n
+    if bye < 0:
+        return 1 if n % 2 == 1 else 0
+    return bye
+
+
 def _start_next_round(t):
     """생존 풀(alive=1) + 다음 합류 티어를 합쳐 한 라운드를 만든다.
     합칠 티어가 더 없으면 생존 풀만으로 진행(순수 토너먼트 단계)."""
@@ -410,9 +443,16 @@ def _start_next_round(t):
 
     pool_entering = len(pool)   # 이 라운드에 '참가하는' 팀 수 (라운드 이름 기준 — 예: 16강=16팀 참가)
     random.shuffle(pool)
-    bye = None
-    if len(pool) % 2 == 1:
-        bye = pool.pop()
+    byes = []
+    if next_tier is None:
+        # [2026-08 신설] 더 이상 합류할 부수가 없는 순수 토너먼트 단계 —
+        # _cup_bye_count로 표준 강수(8/16/32/64)에 맞춰 부전승을 몰아준다.
+        # (예선 단계는 예전처럼 그냥 홀수면 1명만 — 억지로 안 맞춤)
+        n_bye = _cup_bye_count(len(pool))
+        for _ in range(n_bye):
+            byes.append(pool.pop())
+    elif len(pool) % 2 == 1:
+        byes.append(pool.pop())
 
     conn = get_conn()
     p_row = conn.execute("SELECT current_team_id FROM my_player WHERE id=1").fetchone()
@@ -463,15 +503,18 @@ def _start_next_round(t):
                      (tournament_id, round_name, round_idx, week,
                       home_team_id, away_team_id, is_my, slot, pool_entering)
                      VALUES(?,?,?,?,?,?,?,?,?)""", _match_rows)
-    if bye:
+    if byes:
         if _is_mine:
-            add_log(f"🏆 {t['name']} {rname}: {bye[1]} 부전승", "event")
+            if len(byes) == 1:
+                add_log(f"🏆 {t['name']} {rname}: {byes[0][1]} 부전승", "event")
+            else:
+                add_log(f"🏆 {t['name']} {rname}: {len(byes)}팀 부전승", "event")
     conn.execute("UPDATE cup_tournaments SET round_counter=? WHERE id=?",
                  (round_counter + 1, tid))
     conn.commit()
     conn.close()
     if _is_mine:
-        add_log(f"🏆 {t['name']} {rname} 대진 확정 ({len(pool)}팀 + 부전승 {1 if bye else 0}팀)", "event")
+        add_log(f"🏆 {t['name']} {rname} 대진 확정 ({len(pool)}팀 + 부전승 {len(byes)}팀)", "event")
 
 
 def _entry(tid, team_id):

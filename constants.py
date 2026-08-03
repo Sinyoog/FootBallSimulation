@@ -567,39 +567,63 @@ HIGH_BREAK_PROB = 0.40
 #   이 cap은 '개별 스탯이 고강도 돌파로 도달 가능한 평균적 천장'이자
 #   전성기 OVR 의 목표 범위이기도 하다 (강점은 cap+α로 100 초과 가능,
 #   약점은 cap 아래라 평균은 cap 부근에서 균형).
-#   5등급 체계:
-#   - 월드클래스(worldclass): 전성기 OVR 96~100, 강점 스탯 고강도로 100+ 가능
-#   - 엘리트(elite):          전성기 OVR 88~95
-#   - 프로(pro):              전성기 OVR 78~87
-#   - 세미프로(semipro):      전성기 OVR 69~77
-#   - 평범(ordinary):         전성기 OVR 60~68 (아마추어 느낌, 선수는 됐지만 별 볼 일 없음)
+#
+# [2026-08 재설계, 신민용 확정] 5단계 → 9단계로 확장. 리그 등급(SS~F,
+# COUNTRY_LEAGUE_GRADE/OVR_RANGES와 동일 체계)에 그대로 대응시켜서
+# "이 재능이면 대충 어느 리그에서 뛰는 수준인지" 감이 바로 오게 했다:
+#   - 신(god):          OVR 100 고정 — GOAT급, 신 등급만 100을 찍을 수 있다.
+#   - 월드클래스:        SS~S급 리그 핵심 선수 수준 (OVR_RANGES SS/S tier1 상단)
+#   - 슈퍼스타:          S급 리그 주전 + A급 상위권 핵심 (S/A tier1 중상단)
+#   - 엘리트:            A급 리그에서 뛰는 선수 (A tier1 일반 수준)
+#   - 프로:              B급 리그 수준
+#   - 세미프로:          C급 리그 수준
+#   - 아마추어:          D급 리그 수준
+#   - 평범:              E급 리그 수준
+#   - 재능없음(untalented): F급 리그 수준 — 선수는 됐지만 재능은 거의 없음
+#
+# [100 하드 가드] "신이 아니면 절대 100을 못 찍는다"는 요구사항 — 개별
+# 스탯은 강점 브레이크(talent_cap+12)로 cap을 넘어설 수 있어서, OVR(가중
+# 평균)이 통계적으로는 100 근처까지 갈 수도 있었다(과거엔 안전장치 없이
+# "약점이 낮아서 평균은 대충 유지된다"는 기대에만 의존). 이제 신 외
+# 모든 등급은 cap_max를 99 이하로 두고, OVR 계산부(_apply_training_result
+# 등 talent_tier를 아는 지점)에서 "신이 아니면 min(ovr, 99)로 강제
+# 클램프"하는 안전장치를 추가로 건다(아래 _clamp_ovr_by_talent 참고) —
+# 가중평균이 어쩌다 100이 나와도 최종 표시값은 절대 100이 될 수 없다.
+#
+# [확률] 예전엔 상위 등급일수록 새 게임 랜덤 확률이 높았다(월드클래스
+# 15%가 최다) — 신민용 확정으로 9등급 전부 동일 확률(1/9)로 바꿨다.
 TALENT_TIERS = {
-    # [2026-07 재조정] 사용자 판단으로 전체 캡을 한 단계씩 낮춤 — 기존엔
-    # "평범"조차 최대 68까지 갈 수 있어서 현실의 세미프로~아마추어 체감과
-    # 어긋났다. K4리그(한국에서 실제로 "세미프로"급으로 불리는 리그)가
-    # 대략 세미프로 캡(60대 후반) 근처에 오도록 OVR_RANGES도 같이 맞췄다.
-    "worldclass": {"prob": 0.15, "cap_min": 95, "cap_max": 100},
-    "elite":      {"prob": 0.20, "cap_min": 81, "cap_max": 94},
-    "pro":        {"prob": 0.30, "cap_min": 69, "cap_max": 80},
-    "semipro":    {"prob": 0.25, "cap_min": 59, "cap_max": 68},
-    "ordinary":   {"prob": 0.10, "cap_min": 48, "cap_max": 58},
+    "god":         {"prob": 1/9, "cap_min": 100, "cap_max": 100},
+    "worldclass":  {"prob": 1/9, "cap_min": 92,  "cap_max": 99},
+    "superstar":   {"prob": 1/9, "cap_min": 84,  "cap_max": 91},
+    "elite":       {"prob": 1/9, "cap_min": 74,  "cap_max": 83},
+    "pro":         {"prob": 1/9, "cap_min": 64,  "cap_max": 73},
+    "semipro":     {"prob": 1/9, "cap_min": 55,  "cap_max": 63},
+    "amateur":     {"prob": 1/9, "cap_min": 46,  "cap_max": 54},
+    "ordinary":    {"prob": 1/9, "cap_min": 37,  "cap_max": 45},
+    "untalented":  {"prob": 1/9, "cap_min": 28,  "cap_max": 36},
 }
 
 # [신규] 재능 등급 한글/영문 표시명 — 새 게임 화면의 등급 선택 콤보박스와
 # 선수 패널의 뱃지가 이 하나의 표를 공유한다(표시 문구가 여러 곳에서
 # 따로 하드코딩되어 서로 어긋나는 걸 방지).
 TALENT_TIER_KO = {
-    "worldclass": "월드클래스", "elite": "엘리트", "pro": "프로",
-    "semipro": "세미프로", "ordinary": "평범",
+    "god": "신", "worldclass": "월드클래스", "superstar": "슈퍼스타",
+    "elite": "엘리트", "pro": "프로", "semipro": "세미프로",
+    "amateur": "아마추어", "ordinary": "평범", "untalented": "재능없음",
 }
 TALENT_TIER_EN = {
-    "worldclass": "World Class", "elite": "Elite", "pro": "Pro",
-    "semipro": "Semi-Pro", "ordinary": "Ordinary",
+    "god": "God", "worldclass": "World Class", "superstar": "Superstar",
+    "elite": "Elite", "pro": "Professional", "semipro": "Semi-Pro",
+    "amateur": "Amateur", "ordinary": "Ordinary", "untalented": "Untalented",
 }
 # 새 게임 화면 콤보박스에 보여줄 순서(강한 순).
-TALENT_TIER_ORDER = ["worldclass", "elite", "pro", "semipro", "ordinary"]
+TALENT_TIER_ORDER = ["god", "worldclass", "superstar", "elite", "pro",
+                     "semipro", "amateur", "ordinary", "untalented"]
 
-# (구버전 호환) 예전 티어명을 새 티어로 매핑
+# (구버전 호환) 예전 티어명을 새 티어로 매핑 — worldclass/elite/pro/semipro/
+# ordinary는 이름이 그대로 남아있어(캡 수치만 재조정) 기존 세이브의
+# talent_tier 값이 별도 변환 없이도 새 TALENT_TIERS에서 바로 유효하다.
 _LEGACY_TALENT_ALIAS = {
     "gifted": "worldclass", "mid": "elite",
     "normal": "pro", "limited": "semipro",

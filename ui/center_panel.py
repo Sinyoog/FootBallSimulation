@@ -623,6 +623,22 @@ class CenterPanel(QWidget):
                 if _d < day:
                     continue   # 이미 지난 날 — 원래 버그 재발 방지를 위해 손대지 않음
                 if _ttype == "경기":
+                    # [2026-08 버그수정, 신민용 리포트: "경기 일정엔 상대가
+                    # 뜨는데 메인 화면 카드는 계속 '?'"] 승강 플레이오프는
+                    # 대진이 아직 안 풀린 시점(하위 브래킷 결과 대기 중)에도
+                    # get_my_po_match가 "po":True 딕셔너리를 opp="?"로
+                    # 채워 반환한다 — 그래서 이 값이 "?"인 채로 그대로
+                    # (_d, "경기", mi) 형태로 락돼버리면, 바로 위
+                    # "이미 실제 경기로 고정됨" 스킵 때문에 나중에 하위
+                    # 브래킷 결과가 나와 실제 상대가 확정돼도 화면은 영원히
+                    # 락 당시의 "?"만 보여줬다. PO이면서 상대가 아직 "?"인
+                    # 경우만 예외로 라이브 재확인해서 갱신한다 — 다른 모든
+                    # "경기" 타입(국제대회/챔스/컵대회 등)은 원래대로 손대지
+                    # 않는다.
+                    if isinstance(_detail, dict) and _detail.get("po") and _detail.get("opp") == "?":
+                        _live = self._get_match_for_day(_d, p, st=st)
+                        if _live and _live.get("opp") and _live.get("opp") != "?":
+                            self._locked_sched[_i] = (_d, "경기", _live)
                     continue   # 이미 실제 경기로 고정돼 있음 — 그대로 둠
                 _live = self._get_match_for_day(_d, p, st=st)
                 if _live and _live.get("pending"):

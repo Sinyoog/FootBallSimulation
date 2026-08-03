@@ -389,7 +389,24 @@ def get_my_po_match(week: int, day=None, p=None, st=None):
     """이번 주차(또는 특정 day)에 내가 뛸 승강 플레이오프 경기가 있으면 dict,
     없으면 None. club_world_cup_engine.get_my_cwc_match와 동일한 반환 형식
     (키 이름까지) — game_engine.py의 im/cm/cw 패턴에 그대로 po로 끼워넣기
-    위함. p/st를 넘기면 재조회를 생략한다(2026-07 최적화 세션과 동일 이유)."""
+    위함. p/st를 넘기면 재조회를 생략한다(2026-07 최적화 세션과 동일 이유).
+
+    [2026-08 버그수정, 신민용 리포트: "경기 당일에도 UI엔 '?'가 뜨는데
+    뒤에서는(po_history 기록상) 결과가 정상 처리됐다"] 원인: 이 함수는
+    원래 po_tournaments.my_team_id(토너먼트 "생성 시점"에 한 번 캡처해
+    박아둔 캐시값)로 "내 토너먼트"를 걸러냈다. 그런데 start_promotion_
+    playoffs()가 무거운 연도전환 처리와 같은 백그라운드 스레드에서 도는
+    시점이라, 그 순간 get_player()가 아직 최신 상태를 못 읽어서
+    my_team_id가 잘못(0 등) 캐싱될 수 있었다 — 실제 세이브에서
+    my_team_id=0으로 찍힌 완료된 토너먼트를 확인함. 반면 실제 경기
+    시뮬레이션(simulate_my_po_match)은 매번 최신 current_team_id를 새로
+    조회해서 우연히 맞았고, 그래서 "뒤에서는 처리되는데 화면은 계속
+    '?'"인 불일치가 생겼다.
+
+    수정: my_team_id라는 캐시값을 아예 안 믿는다 — 그 해의 아직 안 끝난
+    토너먼트 전부를 대상으로, po_matches에 내 team_id가 실제로
+    home/away로 들어있는지 직접 뒤진다. 캐시가 틀려도 절대 어긋날 수
+    없는 방식이라 근본적으로 해결된다."""
     from database import get_conn
     from game_engine import get_player, get_state
     if p is None:
@@ -402,22 +419,20 @@ def get_my_po_match(week: int, day=None, p=None, st=None):
     if not tid:
         return None
     conn = get_conn()
-    t = conn.execute(
-        "SELECT * FROM po_tournaments WHERE year=? AND status!='done' AND my_team_id=?",
-        (st["current_year"], tid)).fetchone()
-    if not t:
-        conn.close()
-        return None
     if day is not None:
         m = conn.execute(
-            """SELECT * FROM po_matches WHERE tournament_id=? AND home_score=-1
-               AND (home_team_id=? OR away_team_id=?) AND day=?""",
-            (t["id"], tid, tid, day)).fetchone()
+            """SELECT pm.* FROM po_matches pm
+               JOIN po_tournaments pt ON pm.tournament_id = pt.id
+               WHERE pt.year=? AND pt.status!='done' AND pm.home_score=-1
+               AND (pm.home_team_id=? OR pm.away_team_id=?) AND pm.day=?""",
+            (st["current_year"], tid, tid, day)).fetchone()
     else:
         m = conn.execute(
-            """SELECT * FROM po_matches WHERE tournament_id=? AND home_score=-1
-               AND (home_team_id=? OR away_team_id=?)""",
-            (t["id"], tid, tid)).fetchone()
+            """SELECT pm.* FROM po_matches pm
+               JOIN po_tournaments pt ON pm.tournament_id = pt.id
+               WHERE pt.year=? AND pt.status!='done' AND pm.home_score=-1
+               AND (pm.home_team_id=? OR pm.away_team_id=?)""",
+            (st["current_year"], tid, tid)).fetchone()
     if not m:
         conn.close()
         return None
@@ -428,7 +443,7 @@ def get_my_po_match(week: int, day=None, p=None, st=None):
     return {
         "po": True,                       # 승강 플레이오프 경기 표시 플래그
         "match_id": m["id"],
-        "tournament_id": t["id"],
+        "tournament_id": m["tournament_id"],
         "league_name": "승강 플레이오프",
         "stage_ko": "결정전",
         "opp": opp_row["name"] if opp_row else "?",
@@ -600,11 +615,22 @@ def simulate_my_po_match(week, p, day=None):
     # (po_matches/po_tournaments는 매년 새로 생기고 지워질 수 있는 대회
     # 데이터라, 커리어 기록은 별도 영구 테이블에 남긴다 — cl_history와
     # 동일한 이유).
+    # [2026-08 수정] detail(슈팅/유효/기회창출/드리블/차단/패스%)과
+    # saves/conceded(GK용)도 함께 저장 — cl_matches/intl_matches와 같은
+    # 필드셋을 갖춰야 career_window의 승강 PO 탭도 다른 대회 탭처럼
+    # 스탯 컬럼을 보여줄 수 있다.
+    conceded = as_ if is_home else hs
+    my_score = hs if is_home else as_
     conn2 = get_conn()
     conn2.execute(
-        """INSERT INTO po_history(year, team_name, opp_name, result, goals, assists, rating)
-           VALUES(?,?,?,?,?,?,?)""",
-        (st_year_of(week), my_team_name, opp_name, rs, goals, assists, rating))
+        """INSERT INTO po_history(year, team_name, opp_name, result, goals, assists, rating,
+                                   shots, shots_on, key_passes, dribbles, blocks, pass_acc,
+                                   saves, conceded, score)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (st_year_of(week), my_team_name, opp_name, rs, goals, assists, rating,
+         detail.get("shots", 0), detail.get("shots_on", 0), detail.get("key_passes", 0),
+         detail.get("dribbles", 0), detail.get("blocks", 0), detail.get("pass_acc", 0.0),
+         saves, conceded, f"{my_score}-{conceded}"))
     conn2.commit()
     conn2.close()
 
@@ -624,14 +650,27 @@ def get_my_po_tournament(team_id: int, year: int):
     schedule_window.py의 다른 대회 탭들(클럽월드컵 등)과 동일한 패턴 —
     내 팀이 이번 해 승강 플레이오프에 걸렸으면(브래킷 어느 자리든, 위
     리그 대표든 아래 리그 예선 참가팀이든) 그 tournament 행 전체를
-    반환한다. po_tournaments.my_team_id는 start_promotion_playoffs가
-    슬롯 전체(위/아래 모든 offset)를 훑어서 정하므로, 4팀 브래킷의
-    준결승에서 진 팀이어도 정확히 잡힌다."""
+    반환한다.
+
+    [2026-08 버그수정, 신민용 리포트: "경기 당일에도 UI엔 '?'가 뜨는데
+    뒤에서는 결과가 정상 처리됐다"] po_tournaments.my_team_id는
+    start_promotion_playoffs가 생성 시점에 딱 한 번 캡처해 박아두는
+    캐시값인데, 이 함수가 무거운 연도전환과 같은 백그라운드 스레드에서
+    도는 타이밍 때문에 get_player()가 최신 상태를 못 읽어 캐시가 잘못
+    (0 등) 찍힐 수 있었다(get_my_po_match와 동일한 원인, 실제 세이브로
+    확인됨). my_team_id를 믿지 않고 po_matches를 직접 뒤져서 내 팀이
+    home/away 어느 쪽으로든 실제로 들어있는지 확인한다 — 캐시가 틀려도
+    절대 어긋나지 않는다."""
     from database import get_conn
     conn = get_conn()
     t = conn.execute(
-        "SELECT * FROM po_tournaments WHERE year=? AND my_team_id=?",
-        (year, team_id)).fetchone()
+        """SELECT pt.* FROM po_tournaments pt
+           WHERE pt.year=? AND EXISTS (
+               SELECT 1 FROM po_matches pm
+               WHERE pm.tournament_id = pt.id
+               AND (pm.home_team_id=? OR pm.away_team_id=?)
+           )""",
+        (year, team_id, team_id)).fetchone()
     conn.close()
     return dict(t) if t else None
 

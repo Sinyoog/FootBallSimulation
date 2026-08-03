@@ -1016,6 +1016,38 @@ def init_db():
         # 남기고 있었다 — cup_matches.my_absence_reason과 동일한 목적의
         # 컬럼을 po_history(승강 PO는 커리어 영구 기록용 테이블)에 추가한다.
         "ALTER TABLE po_history ADD COLUMN absence_reason TEXT DEFAULT NULL",
+        # [2026-08 추가, 신민용 리포트: "승강 플레이오프는 골/어시/평점/결과만
+        # 뜨고 챔스·국제전처럼 슈팅/유효/기회창출/드리블(GK는 선방/실점)이
+        # 안 뜬다"] po_history가 애초에 그 값을 저장할 컬럼 자체가 없었다
+        # (goals/assists/rating뿐). cl_matches/intl_matches와 동일한 필드셋을
+        # po_history에도 추가하고, simulate_my_po_match에서 _player_perf가
+        # 이미 계산해두고 있던 detail(shots/shots_on/key_passes/dribbles/
+        # blocks/pass_acc)과 saves/conceded를 그대로 채워 넣는다.
+        "ALTER TABLE po_history ADD COLUMN shots INTEGER DEFAULT 0",
+        "ALTER TABLE po_history ADD COLUMN shots_on INTEGER DEFAULT 0",
+        "ALTER TABLE po_history ADD COLUMN key_passes INTEGER DEFAULT 0",
+        "ALTER TABLE po_history ADD COLUMN dribbles INTEGER DEFAULT 0",
+        "ALTER TABLE po_history ADD COLUMN blocks INTEGER DEFAULT 0",
+        "ALTER TABLE po_history ADD COLUMN pass_acc REAL DEFAULT 0",
+        "ALTER TABLE po_history ADD COLUMN saves INTEGER DEFAULT 0",
+        "ALTER TABLE po_history ADD COLUMN conceded INTEGER DEFAULT 0",
+        "ALTER TABLE po_history ADD COLUMN score TEXT DEFAULT ''",
+        # [2026-08 신설, 신민용 리포트: "시즌 중 이적하면 시즌 스탯이 0으로
+        # 리셋돼서 이적 전 활약이 시상 계산에서 통째로 사라진다"] season_*는
+        # join_team()에서 이적할 때마다 0으로 리셋된다(새 팀 "이번 시즌"
+        # UI 표시용으로는 맞는 동작) — 그런데 _process_awards가 그 값을
+        # 그대로 갖다 써서, 시즌 대부분을 뛴 원래 팀의 기록이 사라지고
+        # 이적한 지 얼마 안 된 새 팀 기록(대개 최소 출전 기준도 못 채움)만
+        # 남는 문제가 있었다. award_*는 이적해도 리셋되지 않고 진짜 시즌
+        # 종료(_end_of_season) 시점에만 리셋되는 별도 누적치 — 시상 계산
+        # 전용이다.
+        "ALTER TABLE my_player ADD COLUMN award_matches INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN award_goals INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN award_assists INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN award_saves INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN award_goals_against INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN award_rating_sum REAL DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN award_rating_cnt INTEGER DEFAULT 0",
         # [2026-07 버그수정, 승강 플레이오프 도입 중 발견 — 신민용 세션]
         # promotion_log.league_name만으로는 어느 리그인지 특정할 수 없다
         # ("프리메라 디비시온"처럼 나라마다 이름이 겹치는 리그가 실제로

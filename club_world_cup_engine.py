@@ -385,9 +385,25 @@ def _finalize_group_stage(t):
     for label in _GROUP_LABELS:
         standings = _group_standings(conn, t["id"], label)
         qualifiers.extend(standings[:2])   # 각 조 1·2위
+    qualifier_ids = [q["team_id"] for q in qualifiers]
+    # [2026-07 버그수정, 신민용 리포트: "클럽 월드컵 탈락했는데 다음주에
+    # 16강/8강 일정이 뜬다"] cwc_entries.alive가 생성 시 기본값(1)에서
+    # 한 번도 갱신되지 않아, 조별리그 탈락(3·4위)팀도 계속 "생존"으로
+    # 남아있었다 — get_my_pending_stage가 이 값을 못 믿고 "마지막으로
+    # 뛴 토너먼트 경기에서 졌는가"로 대신 판정했는데, 조별 탈락자는
+    # 애초에 토너먼트(KO) 경기 자체가 없어 그 판정도 통과 못 하고 그냥
+    # 화면에 남아있는 아무 미정 placeholder를 내 경기인 것처럼 보여줬다.
+    # 여기서 진출 실패팀의 alive를 0으로 확실히 내린다.
+    if qualifier_ids:
+        placeholders = ",".join("?" * len(qualifier_ids))
+        conn.execute(
+            f"UPDATE cwc_entries SET alive=0 WHERE tournament_id=? AND team_id NOT IN ({placeholders})",
+            (t["id"], *qualifier_ids))
+    else:
+        conn.execute("UPDATE cwc_entries SET alive=0 WHERE tournament_id=?", (t["id"],))
     conn.execute("UPDATE cwc_tournaments SET status='ko' WHERE id=?", (t["id"],))
     conn.commit()
-    _build_knockout(conn, t["id"], [q["team_id"] for q in qualifiers])
+    _build_knockout(conn, t["id"], qualifier_ids)
     conn.commit()
     conn.close()
     add_log(f"⚽ {t['year']}년 클럽 월드컵 조별리그 종료 — 16강 진출 16팀 확정", "event")
@@ -419,6 +435,17 @@ def _advance_round(t, cur_stage):
         "SELECT * FROM cwc_matches WHERE tournament_id=? AND stage=? ORDER BY slot",
         (t["id"], cur_stage)).fetchall()
     winners = [_round_winner(dict(m)) for m in matches]
+    # [2026-07 버그수정] 조별리그 탈락뿐 아니라 16강/8강/4강에서 져도
+    # 그 즉시 alive=0으로 내려야, 다음 라운드 placeholder가 아직
+    # my_pending_stage에 잘못 걸리는 일이 없다(last_ko 판정에만 기대지
+    # 않고 alive 플래그로 한 번 더 확실히 고정).
+    losers_this_round = [m["away_team_id"] if _round_winner(dict(m)) == m["home_team_id"] else m["home_team_id"]
+                          for m in matches]
+    if losers_this_round:
+        placeholders = ",".join("?" * len(losers_this_round))
+        conn.execute(
+            f"UPDATE cwc_entries SET alive=0 WHERE tournament_id=? AND team_id IN ({placeholders})",
+            (t["id"], *losers_this_round))
     nxt = _STAGE_ORDER[_STAGE_ORDER.index(cur_stage) + 1]
     # [2026-07 재설계] day/week는 더 이상 여기서 계산하지 않는다 —
     # _precreate_cwc_ko_shell이 대회 생성 시점에 이미 배정해뒀다. 여기서는
@@ -905,10 +932,15 @@ def get_my_pending_stage(week, day=None, p=None, st=None):
     배정된 행만 찾으므로, 아직 대진이 안 정해진 날엔 이 함수가 "미정"
     표시용 정보를 대신 돌려준다.
 
-    탈락 판정: cwc_tournaments.my_team_id는 대회 시작 시 한 번 정해지면
-    탈락해도 안 바뀌므로(단순 등록 기록용), intl_entries.alive 같은
-    플래그가 없다 — 대신 내 팀이 참여한 가장 최근 '완료된' KO 경기에서
-    졌는지로 직접 판정한다(졌으면 그 뒤로는 더 이상 내 대회가 아님).
+    탈락 판정: [2026-07 버그수정, 신민용 리포트: "탈락했는데 다음주에
+    16강/8강 일정이 뜬다"] 예전엔 cwc_entries.alive를 아무도 갱신 안 해서
+    (항상 기본값 1) 못 믿는다고 보고 "내 팀이 참여한 가장 최근 완료된
+    KO 경기에서 졌는가"로만 판정했는데, 조별리그에서 탈락(3·4위)한
+    팀은 애초에 KO 경기 자체가 없어(last_ko가 None) 이 판정을 그냥
+    통과해버렸다 — 그 결과 화면엔 나와 무관한 남의 미정 경기가 계속
+    "내 다음 일정"으로 떴다. 지금은 _finalize_group_stage/_advance_round
+    양쪽에서 탈락 즉시 alive=0을 확실히 내려주므로, alive를 1차
+    판정으로 쓰고 last_ko는 방어적 보조 판정으로만 남긴다.
 
     [2026-07 최적화] p를 넘기면 get_player() 재조회를 생략한다."""
     from game_engine import get_player, get_state
@@ -928,6 +960,25 @@ def get_my_pending_stage(week, day=None, p=None, st=None):
     if not t or t["my_team_id"] != tid:
         conn.close()
         return None
+    alive_row = conn.execute(
+        "SELECT alive FROM cwc_entries WHERE tournament_id=? AND team_id=?",
+        (t["id"], tid)).fetchone()
+    if alive_row and alive_row["alive"] == 0:
+        conn.close()
+        return None   # 탈락 확정(조별리그 미진출 포함) — 더 표시 안 함
+    # [2026-07 버그수정, 구버전 세이브 호환] 이 수정 이전에 생성된
+    # 세이브는 alive가 예전 방식대로 계속 1로 남아있을 수 있으므로,
+    # alive만 믿지 않고 한 번 더 직접 확인한다: 조별리그가 이미
+    # 끝났는데(status != 'group') 내 팀이 R16 매치 어디에도(홈/어웨이)
+    # 안 나온다면 애초에 진출을 못 한 것 — 조별 탈락으로 간주한다.
+    if t["status"] != "group":
+        in_r16 = conn.execute(
+            """SELECT 1 FROM cwc_matches WHERE tournament_id=? AND stage='R16'
+               AND (home_team_id=? OR away_team_id=?) LIMIT 1""",
+            (t["id"], tid, tid)).fetchone()
+        if not in_r16:
+            conn.close()
+            return None   # 16강 명단에 없음 = 조별리그 탈락, 더 표시 안 함
     last_ko = conn.execute(
         """SELECT * FROM cwc_matches WHERE tournament_id=? AND stage!='group'
            AND home_score!=-1 AND (home_team_id=? OR away_team_id=?)

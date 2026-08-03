@@ -9,26 +9,28 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPainter, QBrush, QColor, QPen
 
 from game_engine import get_player, get_team_rank, fmt_money
-from constants import ALL_STATS, STAT_KO, STAT_EN, _LEGACY_TALENT_ALIAS
+from constants import (ALL_STATS, STAT_KO, STAT_EN, _LEGACY_TALENT_ALIAS,
+                       TALENT_TIER_KO, TALENT_TIER_EN)
 
-# [신규] 재능 등급 뱃지 — OVR 옆에 표시할 한글 라벨 + 등급별 색상.
-# constants.TALENT_TIERS의 5단계(worldclass~ordinary)에 대응. 구버전
-# 세이브의 예전 티어명(gifted/mid/normal/limited)은 constants의
-# _LEGACY_TALENT_ALIAS로 이미 매핑 테이블이 있으니 그대로 재사용한다.
-_TALENT_KO = {
-    "worldclass": "월드클래스", "elite": "엘리트", "pro": "프로",
-    "semipro": "세미프로", "ordinary": "평범",
-}
-_TALENT_EN = {
-    "worldclass": "World Class", "elite": "Elite", "pro": "Pro",
-    "semipro": "Semi-Pro", "ordinary": "Ordinary",
-}
+# [2026-08 수정, 신민용 확정: 9단계 확장] 예전엔 이 파일이 constants.py와
+# 별개로 자기만의 5단계(worldclass~ordinary) 이름 복사본을 들고 있었다 —
+# constants.py 쪽 주석("표시 문구가 여러 곳에서 따로 하드코딩되어 서로
+# 어긋나는 걸 방지")이 무색하게, 실제로는 여기 하나가 안 맞춰져 있었다.
+# 이름은 이제 TALENT_TIER_KO/EN을 그대로 가져다 쓰고, 색상만 이 파일
+# 고유의 값이라 여기서 9단계 전부 채운다(신규 4개: god/superstar/
+# amateur/untalented).
+_TALENT_KO = TALENT_TIER_KO
+_TALENT_EN = TALENT_TIER_EN
 _TALENT_COLOR = {
-    "worldclass": "#b8860b",  # 골드
-    "elite":      "#7a4fc9",  # 퍼플
-    "pro":        "#2a6a9e",  # 블루
-    "semipro":    "#555555",  # 그레이
-    "ordinary":   "#3a3a3a",  # 다크그레이
+    "god":         "#ff2266",  # 진한 핑크레드 — 최상위 GOAT급, 눈에 확 띄게
+    "worldclass":  "#b8860b",  # 골드
+    "superstar":   "#c9862f",  # 골드보다 살짝 옅은 브론즈골드
+    "elite":       "#7a4fc9",  # 퍼플
+    "pro":         "#2a6a9e",  # 블루
+    "semipro":     "#3d7a5c",  # 그린 계열(세미프로~아마추어 사이 구분용)
+    "amateur":     "#555555",  # 그레이
+    "ordinary":    "#3a3a3a",  # 다크그레이
+    "untalented":  "#2a2a2a",  # 가장 어두운 그레이
 }
 
 PANEL_STYLE = """

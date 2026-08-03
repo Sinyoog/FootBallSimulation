@@ -342,6 +342,57 @@ def get_league_champions(league_id, limit=30):
                      for r in rows_r if r["team_name"] in rank_of]
         relegated.sort(key=lambda x: x["rank"])
 
+        # [2026-08 신설, 신민용 요청: "역대 우승팀 화면에서 이 리그로
+        # 승격해서 온 팀도 팀명이랑 그때(출신 리그) 순위를 같이 보여줘"]
+        # promoted/relegated는 "이 리그에서 나간 팀"만 다뤘는데, 이건
+        # 반대로 "이 리그로 들어온 팀"이다 — to_league_id/to_tier가
+        # 이 리그를 가리키는 promotion_log 행을 찾고, 각 팀의 출신 리그
+        # (from_league_id)에서 그 해 몇 등이었는지를 별도로 계산한다.
+        # season 번호는 리그마다 다를 수 있어(승강 등으로 리그 생성 시점이
+        # 다르면 어긋날 수 있음), 출신 리그·해당 연도 조합으로 실제 season을
+        # match_results/아카이브에서 직접 찾아 매칭한다 — GAME_START_YEAR
+        # 기반 계산식에 의존하지 않아 더 안전하다.
+        #
+        # [2026-08 버그수정, 신민용 리포트: "K2 리그 기록실에 K1에서 바로
+        # 강등당해 내려온 팀이 승격팀으로 표시된다"] to_league_id=이 리그,
+        # to_tier=이 리그 등급 조건만으로는 "이 리그로 들어온 팀 전부"가
+        # 잡히는데, 그 안엔 아래 티어에서 진짜 승격해 온 팀(from_tier가
+        # 더 큰 수 = 더 하위 리그)뿐 아니라 위 티어에서 강등당해 내려온
+        # 팀(from_tier가 더 작은 수 = 더 상위 리그)도 섞여 있었다 — 방향
+        # 구분 없이 전부 "승격팀"에 몰아넣은 게 원인. from_tier로 두 방향을
+        # 갈라서 promoted_in(아래→위, 진짜 승격)과 relegated_in(위→아래,
+        # 강등되어 들어옴)을 분리한다.
+        def _incoming_team_info(team_name, src_lid):
+            src_rank, src_name = 0, ""
+            if src_lid:
+                src_season_row = conn.execute(
+                    """SELECT season FROM (
+                           SELECT season FROM match_results WHERE league_id=? AND year=?
+                           UNION
+                           SELECT season FROM match_results_archive WHERE league_id=? AND year=?
+                       ) LIMIT 1""",
+                    (src_lid, sr["year"], src_lid, sr["year"])).fetchone()
+                if src_season_row:
+                    src_standings = get_league_standings(src_lid, season=src_season_row["season"], conn=conn)
+                    for idx, s in enumerate(src_standings):
+                        if s["name"] == team_name:
+                            src_rank = idx + 1
+                            break
+                src_lg_row = conn.execute("SELECT name FROM leagues WHERE id=?", (src_lid,)).fetchone()
+                src_name = src_lg_row["name"] if src_lg_row else ""
+            return {"name": team_name, "from_rank": src_rank, "from_league": src_name}
+
+        rows_in = conn.execute(
+            """SELECT team_name, from_league_id, from_tier FROM promotion_log
+               WHERE year=? AND to_league_id=? AND to_tier=?""",
+            (sr["year"], league_id, my_tier)).fetchall()
+        promoted_in = [_incoming_team_info(r["team_name"], r["from_league_id"])
+                       for r in rows_in if r["from_tier"] > my_tier]
+        relegated_in = [_incoming_team_info(r["team_name"], r["from_league_id"])
+                        for r in rows_in if r["from_tier"] < my_tier]
+        promoted_in.sort(key=lambda x: (x["from_rank"] == 0, x["from_rank"]))
+        relegated_in.sort(key=lambda x: (x["from_rank"] == 0, x["from_rank"]))
+
         out.append({
             "season": sr["season"], "year": sr["year"],
             "first":  standings[0]["name"] if n > 0 else "-",
@@ -350,6 +401,8 @@ def get_league_champions(league_id, limit=30):
             "fourth": standings[3]["name"] if n > 3 else "-",  # [2026-07 추가] 3위까지만 기록하던 것을 4위까지 확장
             "promoted": promoted,
             "relegated": relegated,
+            "promoted_in": promoted_in,
+            "relegated_in": relegated_in,
         })
     conn.close()
     return out
@@ -1277,22 +1330,37 @@ def get_team_history(team_id: int):
             entry["league"] = f"{lg['name']}({lg['tier']}부) [{rank}등]{move_txt}"
 
         # ── 국내컵 도달 라운드 ─────────────────────────────
+        # [2026-08 버그수정, 신민용 리포트: "팀 커리어에 결승 이렇게 뜨는데
+        # 이거 결승이 아니라 준우승 이런식으로 자세하게 떠야 한다"] 예전엔
+        # 결승에서 졌어도 그냥 라운드 이름("결승")만 그대로 보여줘서 우승과
+        # 구분이 안 갔다 — 챔스/클럽월드컵 블록은 이미 진작에 "[준우승]"/
+        # "[3위]"/"[4위]"로 승패를 구분해서 보여주고 있었는데 컵대회만
+        # 빠져 있었다. 같은 패턴(_cwc_match_winner로 승패 판정)으로 통일한다.
         cup_t = conn.execute(
             """SELECT ct.id, ct.name, ct.winner_team_id
                FROM cup_tournaments ct JOIN cup_entries ce ON ce.tournament_id=ct.id
                WHERE ct.year=? AND ce.team_id=?""", (year, team_id)).fetchone()
         if cup_t:
-            last_m = conn.execute(
-                """SELECT round_name FROM cup_matches
+            cup_matches = conn.execute(
+                """SELECT round_name, round_idx, home_team_id, away_team_id,
+                          home_score, away_score, pso_winner
+                   FROM cup_matches
                    WHERE tournament_id=? AND (home_team_id=? OR away_team_id=?)
                      AND home_score!=-1
-                   ORDER BY round_idx DESC LIMIT 1""",
-                (cup_t["id"], team_id, team_id)).fetchone()
-            if last_m:
+                   ORDER BY round_idx DESC""",
+                (cup_t["id"], team_id, team_id)).fetchall()
+            if cup_matches:
+                last_m = cup_matches[0]
+                last_round = last_m["round_name"]
                 if cup_t["winner_team_id"] == team_id:
                     entry["cup"] = f"{cup_t['name']} [우승]"
+                elif last_round == "결승":
+                    entry["cup"] = f"{cup_t['name']} [준우승]"
+                elif last_round == "3·4위전":
+                    won_tp = _cwc_match_winner(dict(last_m)) == team_id
+                    entry["cup"] = f"{cup_t['name']} [{'3위' if won_tp else '4위'}]"
                 else:
-                    entry["cup"] = f"{cup_t['name']} [{last_m['round_name']}]"
+                    entry["cup"] = f"{cup_t['name']} [{last_round} 탈락]"
 
         # ── 챔피언스리그 도달 스테이지 ───────────────────────
         cl_t = conn.execute(

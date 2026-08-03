@@ -350,13 +350,18 @@ class ScheduleWindow(QDialog):
         _sw_marks.append(("컵대회 브래킷", _time_sw.perf_counter()))
 
         _sw_total = _sw_marks[-1][1] - _sw_t0
-        if _sw_total >= 0.05:
-            _prev = _sw_t0
-            _parts = []
-            for _name, _t in _sw_marks:
-                _parts.append(f"{_name} {_t-_prev:.3f}s")
-                _prev = _t
-            print(f"[PERF-SCHED] _fill_tabs 총 {_sw_total:.3f}s — " + " | ".join(_parts))
+        # [2026-08 정리, 신민용: "원인 파악 끝났으니 이제 안 찍어도 될듯"]
+        # 국제대회 예선/챔스 탭의 위젯 렌더링 고정비용 문제는 이미 진단
+        # 완료(세계기록실과 동일 원인) — 계속 찍으면 매일 진행마다 콘솔이
+        # 시끄러워지기만 해서 로그만 제거. 계측 코드 자체는 남겨둬서
+        # 필요하면 print 한 줄만 되살리면 된다.
+        # if _sw_total >= 0.05:
+        #     _prev = _sw_t0
+        #     _parts = []
+        #     for _name, _t in _sw_marks:
+        #         _parts.append(f"{_name} {_t-_prev:.3f}s")
+        #         _prev = _t
+        #     print(f"[PERF-SCHED] _fill_tabs 총 {_sw_total:.3f}s — " + " | ".join(_parts))
 
         if 0 <= cur < self._tab.count():
             self._tab.setCurrentIndex(cur)
@@ -773,11 +778,12 @@ class ScheduleWindow(QDialog):
         lay.addStretch()
         outer.setWidget(body)
         _it_total = _time_it.perf_counter() - _it_t0
-        if _it_total >= 0.05:
-            print(f"[PERF-INTLTAB] _make_intl_tab(mode={mode}, qual={qual}) 총 "
-                  f"{_it_total:.3f}s — DB조회 {_it_t_dbdone-_it_t0:.3f}s | "
-                  f"그룹순위계산누적({len(groups)}개조×2회) {_it_standings_calc:.3f}s | "
-                  f"나머지(위젯렌더링) {_it_total-(_it_t_dbdone-_it_t0)-_it_standings_calc:.3f}s")
+        # [2026-08 정리] PERF-SCHED와 동일한 이유로 로그 제거(원인 진단 완료).
+        # if _it_total >= 0.05:
+        #     print(f"[PERF-INTLTAB] _make_intl_tab(mode={mode}, qual={qual}) 총 "
+        #           f"{_it_total:.3f}s — DB조회 {_it_t_dbdone-_it_t0:.3f}s | "
+        #           f"그룹순위계산누적({len(groups)}개조×2회) {_it_standings_calc:.3f}s | "
+        #           f"나머지(위젯렌더링) {_it_total-(_it_t_dbdone-_it_t0)-_it_standings_calc:.3f}s")
         return outer
 
     # ── 챔피언스리그 탭 ──────────────────────────

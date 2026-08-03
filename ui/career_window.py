@@ -210,7 +210,7 @@ class CareerWindow(QDialog):
         # 가능성이라 컵대회/챔피언스와 같은 급으로, 0건이어도 항상 탭을
         # 보여줘야 "이번엔 왜 안 걸렸지"가 아니라 "0건 = 안 걸렸구나"로
         # 명확히 보인다.
-        tabs.addTab(self._po_tab(po_ms), f"⚖ 승강 플레이오프 ({len(po_ms)})")
+        tabs.addTab(self._po_tab(po_ms, p), f"⚖ 승강 플레이오프 ({len(po_ms)})")
         root.addWidget(tabs)
         tabs.currentChanged.connect(lambda: self._fit_width())
 
@@ -1010,31 +1010,53 @@ class CareerWindow(QDialog):
                 self._set(tbl, i, j, v, color if j == len(vals) - 1 else None)
         lay.addWidget(tbl)
         return w
-    def _po_tab(self, matches):
-        """[2026-07 신설] 승강 플레이오프 경기별 기록. po_history는 슛/평점
-        정도만 담는 얕은 스키마라(intl_matches/cup_matches보다 단순) 컬럼도
-        그에 맞춰 간단하게 — 어느 대회든 '내가 직접 뛴 경기'는 같은 톤으로
-        보여준다는 원칙만 유지한다.
-
-        [2026-07 버그수정, 신민용 리포트: "부상으로 결장한 승강 PO 경기가
-        기록 자체가 안 남는다"] 결장 사유(_absence_override)가 있으면
-        컵대회/챔스 탭과 동일하게 스탯 칸을 "—"로, 결과 칸을 "부상"/
-        "출전정지"로 덮어써서 표시한다."""
+    def _po_tab(self, matches, p):
+        """[2026-08 수정, 신민용 리포트: "승강 플레이오프는 골/어시/결과만
+        뜨는데 다른 대회처럼 슈팅/유효/기회창출/드리블도 떠야 한다"]
+        po_history에 스탯 컬럼(shots/shots_on/key_passes/dribbles/blocks/
+        pass_acc/saves/conceded/score)이 다 채워지므로, 이제 _champions_tab/
+        _intl_tab과 완전히 같은 포지션별 extra_cols 패턴을 쓴다."""
         w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(0, 0, 0, 0)
         if not matches:
             lay.addWidget(QLabel("승강 플레이오프 출전 기록 없음"))
             return w
-        cols = ["연도", "우리 팀", "상대", "골", "어시", "평점", "결과"]
+
+        from constants import position_group
+        _pos = p.get("position", "")
+        _grp = position_group(_pos)
+        if _grp == "GK":
+            extra_cols = ["선방", "실점"]
+        elif _grp == "DEF":
+            extra_cols = ["차단", "패스%"]
+        elif _pos in ("CM", "CDM", "CAM"):
+            extra_cols = ["기회창출", "패스%", "차단"]
+        else:
+            extra_cols = ["슈팅", "유효", "기회창출", "드리블"]
+        cols = (["연도", "우리 팀", "상대", "골", "어시"]
+                + extra_cols + ["평점", "스코어", "결과"])
         tbl = self._make_table(len(matches), cols)
         for i, m in enumerate(matches):
             res = m["result"]
             color = ("#00cc44" if res == "승" else "#888888" if res == "무" else "#cc4444")
-            vals = [str(m["year"]), m["team_name"], m["opp_name"],
-                    str(m["goals"]), str(m["assists"]), str(m["rating"]), res]
-            _reason_label = _absence_override(m, len(vals), 6)
+            _pac = m.get("pass_acc", 0)
+            pac = f"{round(_pac*100)}%" if _pac else "—"
+            _emap = {
+                "선방": str(m.get("saves", 0)), "실점": str(m.get("conceded", 0)),
+                "차단": str(m.get("blocks", 0)), "패스%": pac,
+                "기회창출": str(m.get("key_passes", 0)), "드리블": str(m.get("dribbles", 0)),
+                "슈팅": str(m.get("shots", 0)), "유효": str(m.get("shots_on", 0)),
+            }
+            vals = ([str(m["year"]), m["team_name"], m["opp_name"],
+                    str(m["goals"]), str(m["assists"])]
+                    + [_emap.get(c, "—") for c in extra_cols]
+                    + [str(m["rating"]), m.get("score", "") or "—", res])
+            _reason_label = _absence_override(m, len(vals), 5 + len(extra_cols))
             if _reason_label:
-                vals[3] = "—"; vals[4] = "—"; vals[5] = "—"
-                vals[6] = _reason_label
+                vals = list(vals)
+                vals[3] = "—"; vals[4] = "—"
+                for _k in range(5, 5 + len(extra_cols)):
+                    vals[_k] = "—"
+                vals[5 + len(extra_cols)] = _reason_label
                 color = "#888888"
             for j, v in enumerate(vals):
                 self._set(tbl, i, j, v, color if j == len(vals) - 1 else None)

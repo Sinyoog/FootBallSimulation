@@ -404,7 +404,7 @@ class RetireWindow(QDialog):
         t37c = QLabel(f"⚖ 승강 플레이오프 기록  ({len(po_ms)})")
         t37c.setObjectName("secTitle")
         lay.addWidget(t37c)
-        lay.addWidget(self._po_table(po_ms))
+        lay.addWidget(self._po_table(po_ms, p))
 
         # ── 개인 수상 ────────────────────────────────
         # (awards는 위에서 conn이 열려 있을 때 이미 로드했다. conn.close() 이후
@@ -1094,26 +1094,47 @@ class RetireWindow(QDialog):
         tbl.setFixedHeight(30 + min(len(matches), 7) * 28)
         return tbl
 
-    def _po_table(self, matches):
-        """[2026-07 신설] 승강 플레이오프 경기별 기록 테이블. po_history는
-        골/어시/평점 정도만 담는 얕은 스키마라(슈팅/실점 등 세부 컬럼 없음)
-        그에 맞춰 간단한 컬럼 구성으로 표시한다.
-
-        [2026-07 버그수정, 신민용 리포트: "부상으로 결장한 승강 PO 경기가
-        기록 자체가 안 남는다"] absence_reason이 있으면(부상/출전정지로
-        AI가 대신 뛴 경우) 컵대회 표와 동일하게 스탯 칸을 "—"로, 결과
-        칸을 사유로 덮어써서 표시한다."""
+    def _po_table(self, matches, p):
+        """[2026-08 수정, 신민용 리포트: "승강 플레이오프도 챔스처럼 슈팅/
+        유효/기회창출/드리블이 떠야 한다"] po_history에 스탯 컬럼이 채워지므로
+        _champions_table과 동일한 포지션별 extra_cols 패턴을 쓴다."""
         if not matches:
             lbl = QLabel("승강 플레이오프 기록 없음"); lbl.setStyleSheet("color:#555;")
             return lbl
-        cols = ["연도", "우리 팀", "상대", "골", "어시", "평점", "결과"]
+        from constants import position_group
+        _pos = p.get("position", "")
+        _grp = position_group(_pos)
+        if _grp == "GK":
+            extra_cols = ["선방", "실점"]
+        elif _grp == "DEF":
+            extra_cols = ["차단", "패스%"]
+        elif _pos in ("CM", "CDM", "CAM"):
+            extra_cols = ["기회창출", "패스%", "차단"]
+        else:
+            extra_cols = ["슈팅", "유효", "기회창출", "드리블"]
+        cols = (["연도", "우리 팀", "상대", "골", "어시"]
+                + extra_cols + ["평점", "스코어", "결과"])
         tbl = self._make_table(len(matches), cols)
         for i, m in enumerate(matches):
-            vals = [str(m["year"]), m["team_name"], m["opp_name"],
-                    str(m["goals"]), str(m["assists"]), str(m["rating"]), m["result"]]
+            _pac = m.get("pass_acc", 0)
+            pac = f"{round(_pac*100)}%" if _pac else "—"
+            _emap = {
+                "선방": str(m.get("saves", 0)), "실점": str(m.get("conceded", 0)),
+                "차단": str(m.get("blocks", 0)), "패스%": pac,
+                "기회창출": str(m.get("key_passes", 0)), "드리블": str(m.get("dribbles", 0)),
+                "슈팅": str(m.get("shots", 0)), "유효": str(m.get("shots_on", 0)),
+            }
+            vals = ([str(m["year"]), m["team_name"], m["opp_name"],
+                    str(m["goals"]), str(m["assists"])]
+                    + [_emap.get(c, "—") for c in extra_cols]
+                    + [str(m["rating"]), m.get("score", "") or "—", m["result"]])
             if m.get("absence_reason"):
                 _reason_label = _ABSENCE_LABEL.get(m["absence_reason"], m["absence_reason"])
-                vals[3] = "—"; vals[4] = "—"; vals[5] = "—"; vals[6] = _reason_label
+                vals = list(vals)
+                vals[3] = "—"; vals[4] = "—"
+                for _k in range(5, 5 + len(extra_cols)):
+                    vals[_k] = "—"
+                vals[5 + len(extra_cols)] = _reason_label
             for j, v in enumerate(vals):
                 self._set_item(tbl, i, j, v)
         tbl.resizeColumnsToContents()

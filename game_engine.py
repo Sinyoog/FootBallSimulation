@@ -546,15 +546,19 @@ def create_player(name: str, position: str, sub_role: str,
     height = random.randint(*_bt["height"])
     weight = random.randint(*_bt["weight"])
 
-    # 재능 등급 (worldclass/elite/pro/semipro/ordinary) → 고강도 돌파 상한 결정.
+    # 재능 등급 (TALENT_TIER_ORDER 9단계) → 고강도 돌파 상한 결정.
     # [신규] 새 게임 화면에서 선수가 직접 등급을 고를 수 있게 됐다 — talent_tier가
     # 유효한 값으로 넘어오면 그걸 그대로 쓰고, 없거나(None) 잘못된 값이면
     # (구버전 호출부 호환) 예전처럼 확률 추첨으로 정한다.
+    # [2026-08 수정, 신민용 확정: 9단계 확장] 예전엔 5개 티어 이름이
+    # 하드코딩돼 있어서 새로 추가된 신/슈퍼스타/아마추어/재능없음이 랜덤
+    # 추첨에 절대 안 걸렸다 — TALENT_TIER_ORDER를 그대로 순회하도록 고쳐서
+    # 새 등급이 추가/변경돼도 이 루프는 항상 최신 목록을 따라간다.
     if talent_tier not in TALENT_TIERS:
         _r = random.random()
         _acc = 0.0
         talent_tier = "pro"
-        for _tname in ("worldclass", "elite", "pro", "semipro", "ordinary"):
+        for _tname in TALENT_TIER_ORDER:
             _acc += TALENT_TIERS[_tname]["prob"]
             if _r < _acc:
                 talent_tier = _tname
@@ -567,32 +571,59 @@ def create_player(name: str, position: str, sub_role: str,
     # [2026-07 재조정, 신민용 확정] 전체 2년씩 앞당김 — "전성기는 보통
     # 24~27세"라는 현실 감각에 맞춰 월드클래스 25~27→23~25세, 나머지
     # 등급도 같은 폭으로 비례 조정(등급 간 간격/순서는 그대로 유지).
+    # [2026-08 확장, 신민용 확정: 9단계] 기존 5개(worldclass~ordinary)는
+    # 값을 그대로 두고, 새로 추가된 4개(god/superstar/amateur/untalented)를
+    # 인접 등급 사이 값으로 채워 넣었다 — 순서(재능 클수록 늦게 피크)만
+    # 유지, 세부 수치는 추후 플레이 감각에 맞춰 조정 가능.
     _peak_by_tier = {
-        "worldclass": (23, 25),
-        "elite":      (21, 23),
-        "pro":        (20, 22),
-        "semipro":    (18, 20),
-        "ordinary":   (17, 19),
+        "god":         (24, 26),
+        "worldclass":  (23, 25),
+        "superstar":   (22, 24),
+        "elite":       (21, 23),
+        "pro":         (19, 21),
+        "semipro":     (18, 20),
+        "amateur":     (17, 19),
+        "ordinary":    (16, 18),
+        "untalented":  (16, 17),
     }
     peak_age = random.randint(*_peak_by_tier.get(talent_tier, (22, 24)))
 
     # 시작 스탯(16세) + 일반훈련 천장(max). max는 talent_cap을 넘지 않음.
     #   16세 시작은 낮게 잡아 20대 중반까지 천천히 성장하도록 한다.
     #   (성장 페이스는 _age_train_eff 에이징커브가 함께 결정)
-    if talent_tier == "worldclass":
-        target = random.randint(42, 50); dev = random.randint(7, 11)
+    # [2026-08 재조정, 신민용 확정] 예전엔 시작(target)이 talent_cap 대비
+    # 몇 %인지가 등급마다 크게 벌어져 있었다 — 신(50%)·월드클래스(48%)는
+    # 20대 중반까지 성장 서사가 있었지만, 평범(77%)·재능없음(84%)은
+    # 16세에 이미 cap 턱밑이라 "성장"이랄 게 거의 없었다. 그래서 상위
+    # 등급은 거의 그대로 두고, 하위 등급일수록 더 크게 낮춰서 어느
+    # 등급이든 cap 대비 시작 비율이 46~55% 선으로 고르게 깔리도록
+    # 재조정했다(dev·mx_add는 그대로 — 변동폭·훈련 성장치 성격은 유지).
+    if talent_tier == "god":
+        target = random.randint(44, 50); dev = random.randint(6, 10)
+        mx_add = (50, 64)
+    elif talent_tier == "worldclass":
+        target = random.randint(40, 48); dev = random.randint(7, 11)
         mx_add = (44, 58)
+    elif talent_tier == "superstar":
+        target = random.randint(37, 45); dev = random.randint(7, 12)
+        mx_add = (42, 56)
     elif talent_tier == "elite":
-        target = random.randint(39, 47); dev = random.randint(8, 12)
+        target = random.randint(35, 42); dev = random.randint(8, 12)
         mx_add = (40, 54)
     elif talent_tier == "pro":
-        target = random.randint(36, 43); dev = random.randint(9, 13)
+        target = random.randint(31, 38); dev = random.randint(9, 13)
         mx_add = (34, 48)
     elif talent_tier == "semipro":
-        target = random.randint(32, 39); dev = random.randint(10, 14)
+        target = random.randint(27, 33); dev = random.randint(10, 14)
         mx_add = (28, 42)
+    elif talent_tier == "amateur":
+        target = random.randint(23, 29); dev = random.randint(10, 15)
+        mx_add = (25, 39)
+    elif talent_tier == "untalented":
+        target = random.randint(16, 21); dev = random.randint(12, 17)
+        mx_add = (18, 30)
     else:  # ordinary
-        target = random.randint(28, 35); dev = random.randint(11, 16)
+        target = random.randint(20, 26); dev = random.randint(11, 16)
         mx_add = (22, 36)
 
     stat_vals = {}
@@ -1064,25 +1095,30 @@ def finalize_season_for_retire():
     #    생기고 소형 리그에선 거의 다 뛰어야 하는 불균형이 있었다).
     #    시즌 통계는 아직 살아있다. 이미 이 연도에 내 수상이 기록돼
     #    있으면(중복 호출/시즌종료 후) 건너뛴다.
-    _min_matches_for_awards = max(6, round(0.35 * _league_full_season_matches(p)))
-    if p.get("season_matches", 0) >= _min_matches_for_awards:
+    _award_tid, _award_tid_matches = _primary_club_this_season(p)
+    _min_matches_for_awards = max(6, round(0.35 * _league_full_season_matches(p, team_id=_award_tid)))
+    _award_matches_total = p.get("award_matches", p.get("season_matches", 0))
+    if _award_matches_total >= _min_matches_for_awards:
         _conn = get_conn()
         _dup = _conn.execute(
             "SELECT 1 FROM awards WHERE year=? AND is_mine=1 LIMIT 1", (year,)).fetchone()
         _conn.close()
         if not _dup:
-            _rc = p.get("season_rating_cnt", 0)
-            _rs = p.get("season_rating_sum", 0.0)
+            _rc = p.get("award_rating_cnt", p.get("season_rating_cnt", 0))
+            _rs = p.get("award_rating_sum", p.get("season_rating_sum", 0.0))
             season_avg_rating = round(_rs / _rc, 2) if _rc else 6.0
-            _season_cs = _calc_clean_sheets_for_player(p)
+            # [2026-08 버그수정] 클린시트도 '주 소속팀'(_primary_club_
+            # this_season) 기준으로 — 시즌 중 이적했으면 지금 팀이 아니라
+            # 실제로 더 많이 뛴 팀의 클린시트를 봐야 한다.
+            _season_cs = _calc_clean_sheets_for_player(p, team_id=_award_tid, matches=_award_tid_matches)
             try:
                 _process_awards(
                     p, year,
-                    season_goals=p.get("season_goals", 0),
-                    season_assists=p.get("season_assists", 0),
+                    season_goals=p.get("award_goals", p.get("season_goals", 0)),
+                    season_assists=p.get("award_assists", p.get("season_assists", 0)),
                     season_rating=season_avg_rating,
                     season_cs=_season_cs,
-                    season_goals_against=p.get("season_goals_against", 0),
+                    season_goals_against=p.get("award_goals_against", p.get("season_goals_against", 0)),
                 )
             except Exception as e:
                 print("finalize_season_for_retire 수상 오류:", e)
@@ -2388,6 +2424,15 @@ def _process_training(p, week, ttype, focus_stat=None, day=None):
     updates["slump"] = slump
     updates["ovr"]   = calc_ovr(p["position"], {s: updates.get(s, p.get(s,40))
                                                   for s in ALL_STATS})
+    # [2026-08 신설, 신민용 확정: "신이 아니면 100을 못 찍게 하고 싶어"]
+    # 강점 스탯은 talent_cap+12까지 브레이크될 수 있어서(위 break_cap 참고),
+    # OVR(가중평균)이 통계적으로 100 근처까지 갈 가능성이 있었다 — "약점이
+    # 낮아서 평균은 대충 유지된다"는 기대에만 의존하던 예전 방식은 수학적
+    # 보장이 아니었다. talent_tier가 "god"이 아니면 여기서 무조건 99로
+    # 클램프해서, 실제로 어떤 스탯 조합이 나오든 신 등급 외엔 100이 절대
+    # 안 나오게 못박는다.
+    if p.get("talent_tier") != "god":
+        updates["ovr"] = min(updates["ovr"], 99)
     update_player(**updates)
     for line in log_parts:
         add_log(line, "training")
@@ -2650,6 +2695,16 @@ def _simulate_match(p, week, info: dict, day=None):
             season_rating_sum=p.get("season_rating_sum",0)+rating,
             season_rating_cnt=p.get("season_rating_cnt",0)+1,
             season_goals_against=p.get("season_goals_against",0)+_ga,
+            # [2026-08 신설] award_* — season_*와 똑같이 쌓지만 이적해도
+            # 리셋 안 되는 시즌 전체 누적(시상 계산 전용, _primary_club_
+            # this_season/_process_awards 참고).
+            award_matches=p.get("award_matches",0)+1,
+            award_goals=p.get("award_goals",0)+goals,
+            award_assists=p.get("award_assists",0)+assists,
+            award_saves=p.get("award_saves",0)+saves,
+            award_goals_against=p.get("award_goals_against",0)+_ga,
+            award_rating_sum=p.get("award_rating_sum",0)+rating,
+            award_rating_cnt=p.get("award_rating_cnt",0)+1,
             # [세부 지표] 누적 (season_ + total_). 패스성공률은 합·횟수로 평균 산출.
             season_shots=p.get("season_shots",0)+detail["shots"],
             season_shots_on=p.get("season_shots_on",0)+detail["shots_on"],
@@ -5474,15 +5529,20 @@ def _advance_week(p, base_week, n_weeks=4):
                 p_fresh["current_league_id"], new_season, new_year)
 
 
-def _calc_clean_sheets_for_player(p):
-    """현재 선수 소속 팀의 이번 시즌 클린시트 수 (수상 산정용)."""
-    tid = p.get("current_team_id", 0)
+def _calc_clean_sheets_for_player(p, team_id=None, matches=None):
+    """소속 팀의 이번 시즌 클린시트 수 (수상 산정용).
+    team_id/matches를 넘기면 그 팀·그 팀에서의 출전수 기준으로 계산한다
+    (기본값은 현재 팀 — 이적 없이 쓰던 기존 호출부는 그대로 동작).
+    [2026-08] 시즌 중 이적 시 시상은 '주 소속팀'(_primary_club_this_season)
+    기준으로 계산해야 하므로 이 오버라이드가 필요해졌다."""
+    tid = team_id if team_id is not None else p.get("current_team_id", 0)
     if not tid:
         return 0
     conn = get_conn(); c = conn.cursor()
     try:
         season = p.get("current_season", 1)
-        return _calc_clean_sheets(c, tid, season, matches=p.get("season_matches", 0))
+        _m = matches if matches is not None else p.get("season_matches", 0)
+        return _calc_clean_sheets(c, tid, season, matches=_m)
     except Exception:
         return 0
     finally:
@@ -5853,15 +5913,18 @@ def _zamora_tally(c, p, year, league_id, lname, live_matches, live_ga):
     return total_m, total_ga
 
 
-def _league_full_season_matches(p) -> int:
+def _league_full_season_matches(p, team_id=None) -> int:
     """[2026-07 추가] 이 선수가 뛰는 리그의 실제 '풀시즌 팀당 경기 수'를
     구한다(팀 수 + legs_for_team_count 다전제 반영, 8~30팀 리그마다
     14~58경기로 제각각). 개인 수상 최소 출전 기준(아래 '최소 10경기'
     게이트, 사모라상 등)이 전부 리그 규모와 무관하게 고정값이었던 걸
     이 헬퍼로 통일해서 스케일한다 — _process_awards 내부에서도 득점왕/
     도움왕/발롱도르 기준 계산에 동일한 로직을 쓴다(중복 계산이지만
-    가벼운 COUNT 쿼리 하나라 성능에 영향 없음)."""
-    tid = p.get("current_team_id", 0)
+    가벼운 COUNT 쿼리 하나라 성능에 영향 없음).
+    [2026-08] team_id를 넘기면 그 팀 기준으로 계산한다(기본값은 현재
+    팀) — 시즌 중 이적한 선수의 시상 게이트는 '주 소속팀' 리그 규모를
+    봐야 하므로 이 오버라이드가 필요하다."""
+    tid = team_id if team_id is not None else p.get("current_team_id", 0)
     if not tid:
         return 38  # 무소속 등 예외 상황의 안전 폴백(20팀 2전제 기준값)
     conn = get_conn()
@@ -6439,6 +6502,40 @@ def _major_stage_carry(year: int, team_id: int) -> bool:
     return False
 
 
+def _primary_club_this_season(p):
+    """[2026-08 신설, 신민용 리포트: "시즌 중 이적하면 구단 올해의 선수가
+    엉뚱한 팀(또는 아예 무자격)으로 처리된다"] 이번 시즌(연도) 동안
+    가장 많은 경기를 뛴 소속팀을 (team_id, matches)로 반환한다.
+
+    - 아직 안 닫힌(진행 중) 스틴트: season_matches를 그대로 쓴다 —
+      이적하면 이 값이 0으로 리셋되므로 "지금 팀에서만 뛴 경기수"가 맞다.
+    - 그 해 안에 이미 떠난(닫힌) 스틴트: career_entries.matches를 쓴다 —
+      _close_career_entry가 그 스틴트 종료 시점의 season_matches를 그대로
+      박아두므로(다음 스틴트에서 다시 0으로 리셋되기 전 값) 정확하다.
+    - 여러 팀 중 매치수가 가장 많은 팀을 "그 시즌의 소속팀"으로 본다.
+      동률이면 시즌 종료 시점 현재 팀을 우선한다(직관적으로 "지금 팀"이
+      맞다고 느껴지는 경계 상황이므로).
+    """
+    cur_tid = p.get("current_team_id", 0)
+    cur_matches = p.get("season_matches", 0)
+    year = p.get("current_year", 0)
+    best_tid, best_matches = cur_tid, cur_matches
+    if not year:
+        return cur_tid, cur_matches
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT team_id, matches FROM career_entries
+               WHERE end_year=? AND team_id!=0 AND team_id!=?""",
+            (year, cur_tid)).fetchall()
+    finally:
+        conn.close()
+    for r in rows:
+        if r["matches"] and r["matches"] > best_matches:
+            best_tid, best_matches = r["team_id"], r["matches"]
+    return best_tid, best_matches
+
+
 def _process_awards(p, year, season_goals, season_assists, season_rating, season_cs, season_goals_against=0):
     """시즌 종료 시 개인 수상 산정. 내 선수 실제 성적 + AI 추정 비교.
 
@@ -6448,7 +6545,13 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
       → 1위 조건에 더해 '출전 경기수 기반 최소 산출 기준'을 통과해야 수상.
          (풀시즌 7라운드*2 = 14경기 기준. 경기당 최소 생산성으로 환산)
     """
-    tid = p.get("current_team_id", 0)
+    # [2026-08 버그수정, 신민용 리포트: "시즌 중 이적하면 season_*가
+    # 0으로 리셋되면서 이적 전 활약이 시상 계산에서 통째로 사라진다"]
+    # 예전엔 p.get("current_team_id")를 그대로 썼다 — 시즌 종료 처리가
+    # 실행되는 그 '순간' 소속팀일 뿐, 실제로 그 시즌 대부분을 뛴 팀이
+    # 아닐 수 있다(예: 11개월 A팀 → 12/1 B팀 이적). _primary_club_
+    # this_season이 이번 시즌 실제로 가장 많이 뛴 팀을 찾아준다.
+    tid, _primary_matches = _primary_club_this_season(p)
     if not tid:
         return  # 무소속이면 수상 없음
     conn = get_conn(); c = conn.cursor()
@@ -6468,14 +6571,14 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
         # [2026-07 버그수정] AI 경쟁 풀 추정치도 실제 풀시즌 길이로 스케일해야
         # 하므로, 아래에서 쓰던 FULL_SEASON_MATCHES 계산을 후보 수집보다
         # 앞으로 끌어왔다(계산 내용 자체는 그대로, 호출 순서만 변경).
-        FULL_SEASON_MATCHES = _league_full_season_matches(p)
+        FULL_SEASON_MATCHES = _league_full_season_matches(p, team_id=tid)
         cands, league_avg = _collect_league_candidates(c, league_id, full_season_matches=FULL_SEASON_MATCHES)
         # 내 선수 추가
         me = {
             "name": p.get("name","나"), "position": p.get("position","ST"),
             "ovr": p.get("ovr",40), "goals": season_goals, "assists": season_assists,
             "rating": season_rating, "is_mine": True, "age": p.get("age", 30),
-            "cs": season_cs, "matches": p.get("season_matches", 0), "team_id": tid,
+            "cs": season_cs, "matches": p.get("award_matches", p.get("season_matches", 0)), "team_id": tid,
         }
         pool = cands + [me]
 
@@ -6505,7 +6608,7 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
         GOALS_PER_GAME_FOR_TITLE   = 24 / 38
         ASSISTS_PER_GAME_FOR_TITLE = 16 / 38   # 어시스트왕도 같은 기준(38경기)으로 재정렬
         GA_PER_GAME_FOR_BALLON     = 30 / 38   # 발롱도르급 시즌(골+도움 30/38 ≈ 메시·호날두 전성기)
-        sm = max(1, p.get("season_matches", 0))
+        sm = max(1, p.get("award_matches", p.get("season_matches", 0)))
         play_ratio = min(1.0, sm / FULL_SEASON_MATCHES)
         _played_equiv = FULL_SEASON_MATCHES * play_ratio  # = min(sm, FULL_SEASON_MATCHES)
         min_goals_for_title   = max(4, round(GOALS_PER_GAME_FOR_TITLE * _played_equiv))
@@ -6540,7 +6643,7 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
         my_pos = p.get("position","ST")
         my_best11 = False
         best_df = None  # [올해의 수비수 신설] DF 분기 밖에서도 안전하게 참조하기 위한 기본값
-        cs_for_me = _calc_clean_sheets_for_player(p)
+        cs_for_me = _calc_clean_sheets_for_player(p, team_id=tid, matches=_primary_matches)
         
         if my_pos in GK_POS:
             # GK 그룹
@@ -6638,6 +6741,13 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
         # 팀 로스터) 게이트도 그만큼 낮게 잡는다 — 출전 비율은 MVP와
         # 동일(65%)하게 유지하되, 최소 평점은 7.0 대신 6.2로 낮춘다("팀
         # 내 확실한 핵심"이지 "리그 최정상급"까지는 아니어도 되는 상).
+        # [2026-08 버그수정, 신민용 리포트: "구단 올해의 선수인데 라벨이
+        # '프리미어리그 구단 올해의 선수'로 리그 이름이 붙어 나온다 —
+        # 이건 리그 상이 아니라 내 팀만의 상이니 팀 이름이 붙어야 한다"]
+        # 비교 자체는 처음부터 club_pool(팀 로스터)로 정확히 좁혀서 하고
+        # 있었지만, 라벨 문자열만 다른 리그 상들과 똑같이 lname(리그 이름)을
+        # 그대로 붙여쓰고 있었다 — _team_name(c, tid)로 실제 소속팀 이름을
+        # 붙이도록 고친다.
         CLUB_POTY_MIN_PLAY_RATIO = 0.65
         CLUB_POTY_MIN_RATING = 6.2
         club_pool = [x for x in pool if x.get("team_id") == tid]
@@ -6646,7 +6756,7 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
                 x["position"], x["goals"], x["assists"], x["rating"], x["ovr"], x.get("cs", 0)))
             if (club_best["is_mine"] and sm >= CLUB_POTY_MIN_PLAY_RATIO * FULL_SEASON_MATCHES
                     and season_rating >= CLUB_POTY_MIN_RATING):
-                my_awards.append(("구단 올해의 선수", f"{lname} 구단 올해의 선수"))
+                my_awards.append(("구단 올해의 선수", f"{_team_name(c, tid)} 구단 올해의 선수"))
 
         # 골든글러브 (GK 최다 클린시트 — 내가 GK이고 클린시트 많을 때)
         # [2026-07 확장, GPT 피드백: "클린시트 개수만 보면 안 되고 세이브율·
@@ -6654,7 +6764,7 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
         # 클린시트 1위 비교는 그대로 두고, 내 선수 자신의 세이브율·평균실점이
         # 최소 품질 기준을 넘는지를 _gk_quality_ok()로 추가 검증한다.
         if (p.get("position") == "GK" and season_cs >= 10
-                and _gk_quality_ok(p.get("season_saves", 0), season_goals_against,
+                and _gk_quality_ok(p.get("award_saves", p.get("season_saves", 0)), season_goals_against,
                                     sm, FULL_SEASON_MATCHES)):
             my_awards.append(("골든글러브", f"{season_cs} 클린시트"))
 
@@ -7231,15 +7341,26 @@ def _end_of_season(p, year):
 
     # 1.5 개인 수상 산정 (통계 리셋 이전에 실행). 최소 출전 기준은 위
     #     finalize_season_for_retire와 동일 원칙(리그 실제 풀시즌의 35%).
-    if p.get("season_matches", 0) >= max(6, round(0.35 * _league_full_season_matches(p))):
-        _season_cs = _calc_clean_sheets_for_player(p)
+    # [2026-08 버그수정, 신민용 리포트: "시즌 중 이적하면 이전 팀 활약이
+    # 시상에서 사라진다"] season_*(이적 시 리셋)가 아니라 award_*(이적해도
+    # 안 리셋되는 시즌 전체 누적)로 게이트·점수를 계산한다. season_avg_rating
+    # 변수 자체는 그대로 두고(바로 아래 8단계 계약 만료 체크가 '현재 팀에서의
+    # 평점'을 봐야 하므로 건드리지 않음), 시상 전용으로 award_rating_*에서
+    # 별도 계산한다.
+    _award_matches_total = p.get("award_matches", p.get("season_matches", 0))
+    _award_tid, _award_tid_matches = _primary_club_this_season(p)
+    if _award_matches_total >= max(6, round(0.35 * _league_full_season_matches(p, team_id=_award_tid))):
+        _award_rc = p.get("award_rating_cnt", 0)
+        _award_rs = p.get("award_rating_sum", 0.0)
+        award_avg_rating = round(_award_rs / _award_rc, 2) if _award_rc else season_avg_rating
+        _season_cs = _calc_clean_sheets_for_player(p, team_id=_award_tid, matches=_award_tid_matches)
         _process_awards(
             p, year,
-            season_goals=p.get("season_goals", 0),
-            season_assists=p.get("season_assists", 0),
-            season_rating=season_avg_rating,
+            season_goals=p.get("award_goals", p.get("season_goals", 0)),
+            season_assists=p.get("award_assists", p.get("season_assists", 0)),
+            season_rating=award_avg_rating,
             season_cs=_season_cs,
-            season_goals_against=p.get("season_goals_against", 0),
+            season_goals_against=p.get("award_goals_against", p.get("season_goals_against", 0)),
         )
 
     # 2. 자연 성장 (10경기 이상, 성장기=peak 이전 + max 여유 있을 때만)
@@ -7331,12 +7452,19 @@ def _end_of_season(p, year):
                     stat_updates[mk] = new_mx
 
     # 4. 시즌 통계 초기화
+    # [2026-08 신설] award_*(시즌 중 이적해도 리셋 안 되는 시상용 누적치)는
+    # season_*와 달리 여기(진짜 시즌 종료 시점, 1.5단계 개인수상 산정이
+    # 이미 끝난 뒤)에서만 초기화한다 — join_team()의 이적 리셋 코드는
+    # 일부러 이 필드들을 건드리지 않는다.
     stat_updates.update(season_matches=0, season_goals=0, season_assists=0,
                         season_saves=0, season_rating_sum=0, season_rating_cnt=0,
                         season_goals_against=0,
                         season_shots=0, season_shots_on=0, season_key_passes=0,
                         season_dribbles=0, season_blocks=0,
-                        season_pass_acc_sum=0, season_pass_acc_cnt=0)
+                        season_pass_acc_sum=0, season_pass_acc_cnt=0,
+                        award_matches=0, award_goals=0, award_assists=0,
+                        award_saves=0, award_goals_against=0,
+                        award_rating_sum=0, award_rating_cnt=0)
     update_player(**stat_updates)
 
     # [2026-07 버그수정, 신민용 리포트: "팀 정보가 사라지고 순위도
@@ -7931,7 +8059,10 @@ def _check_loan_candidate(p, year, cur_ovr, season_matches=None,
     # "출전 기회 부족한 유망주"가 아니라 이미 검증된 선수이므로 임대 대상에서 제외.
     if avg_rating is not None and rating_cnt >= 3 and avg_rating >= 7.5:
         return False
-    if cur_ovr >= 81:   # constants.TALENT_TIERS의 elite 하한(81)과 동일 기준
+    # [2026-08 수정] 하드코딩된 81(구버전 elite 하한) 대신 TALENT_TIERS를
+    # 직접 참조 — 재능 등급 수치가 나중에 또 조정돼도 이 기준이 자동으로
+    # 따라간다.
+    if cur_ovr >= TALENT_TIERS["elite"]["cap_min"]:
         return False
     team_avg = _my_team_avg_ovr(p)
     gap = team_avg - cur_ovr
@@ -9893,7 +10024,10 @@ def _offer_probability(p, week: int) -> float:
 
 
 YOUTH_SCOUT_PROB = 0.35
-YOUTH_SCOUT_TALENT_TIERS = ("elite", "worldclass")
+# [2026-08 수정, 신민용 확정: 9단계 확장] 예전엔 최상위가 worldclass였지만
+# 이제 그 위에 슈퍼스타/신이 새로 생겼다 — 여기 안 넣으면 오히려 가장
+# 뛰어난 유망주가 해외 유스 스카우트 대상에서 빠지는 역전이 생긴다.
+YOUTH_SCOUT_TALENT_TIERS = ("god", "worldclass", "superstar", "elite")
 
 
 def _try_youth_scout_offer(c, p, ovr, existing_offers, team_avg_cache, my_country_id):
