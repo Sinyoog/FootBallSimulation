@@ -783,6 +783,35 @@ def _calc_clean_sheets(c, tid, season, matches=None):
     return cs
 
 
+def _team_league_id_for_season(c, team_id, season):
+    """[버그수정 2026-08, 신민용 리포트: "2004년에 승급했는데 그 해 기록이
+    0승0무0패에 리그명도 승격된 리그로 잘못 나온다"] teams.league_id는
+    "지금" 그 팀이 소속된 리그다 — 그런데 승강 처리(_process_promotion_
+    relegation)는 클럽 시즌이 끝나는 43주에 이미 실행되고, 다음 시즌(다음
+    해)부터 반영된다. 그 사이(44~52주, 국제대회 기간) '이번 시즌' 커리어
+    기록을 갱신하면 teams.league_id가 이미 승격/강등된 새 리그를 가리키고
+    있어서, 그 리그+시즌으로 match_results를 조회하면 (그 팀은 실제로 거기서
+    안 뛰었으니) 0건이 나와 전적이 통째로 0승0무0패/리그명도 잘못 찍혔다.
+
+    같은 시즌 안에서는 팀의 league_id가 항상 하나로 일관되므로(승강은 시즌
+    경계에서만 반영), 그 시즌에 실제로 뛴 경기의 league_id를 match_results/
+    match_results_archive에서 직접 찾아 쓴다 — 이번 시즌 경기를 아직 하나도
+    안 뛰었으면(막 이적/입단 직후라 일정이 비어있는 경우) None을 반환하니
+    호출부가 teams.league_id로 폴백하면 된다(그 경우는 애초에 승강 이슈가
+    생길 수 없으므로 안전)."""
+    row = c.execute(
+        """SELECT league_id FROM match_results
+           WHERE (home_team_id=? OR away_team_id=?) AND season=? LIMIT 1""",
+        (team_id, team_id, season)).fetchone()
+    if row:
+        return row["league_id"]
+    row = c.execute(
+        """SELECT league_id FROM match_results_archive
+           WHERE (home_team_id=? OR away_team_id=?) AND season=? LIMIT 1""",
+        (team_id, team_id, season)).fetchone()
+    return row["league_id"] if row else None
+
+
 def _team_wdl_from_results(c, tid, league_id, season):
     """[버그수정 2026-07, 신민용 리포트: "커리어 팀 전적이 세계기록실 순위표랑
     다르다 — 실제 44경기 시즌인데 69승무패로 나온다"] teams.wins/draws/losses는
@@ -830,6 +859,23 @@ def _update_career_stats(p, year, week):
 
     # [최적화] 이미 열린 conn 재사용하여 get_team_rank 내부 커넥션 중복 방지
     season = p.get("current_season", 1)
+
+    # [버그수정 2026-08, 신민용 리포트: "2004년에 승급했는데 그 해 기록이
+    # 0승0무0패/리그명도 승격된 리그로 잘못 나온다"] team_row(teams.league_id
+    # 조인, 즉 "지금" 소속 리그)를 그대로 쓰면 43주 승강 반영 후(44~52주)엔
+    # '이번 시즌 실제로 뛴 리그'가 아니라 '다음 시즌 리그'가 찍힌다 —
+    # _team_league_id_for_season으로 그 시즌 실제 리그를 우선 쓰고, 이번
+    # 시즌 경기가 아직 없으면(막 이적 직후) team_row로 폴백한다.
+    _season_lid = _team_league_id_for_season(c, tid, season)
+    if _season_lid is not None:
+        _season_league_row = c.execute(
+            "SELECT name, tier FROM leagues WHERE id=?", (_season_lid,)).fetchone()
+    else:
+        _season_league_row = None
+    lname = _season_league_row["name"] if _season_league_row else team_row["lname"]
+    tier  = _season_league_row["tier"] if _season_league_row else team_row["tier"]
+    lid   = _season_lid if _season_lid is not None else team_row["lid"]
+
     rank_str = get_team_rank(tid, conn=conn, season=season)
     try: rn = int(rank_str.split("위")[0].replace("공동","").strip())
     except (ValueError, AttributeError, IndexError): rn = 0
@@ -851,7 +897,7 @@ def _update_career_stats(p, year, week):
     # [버그수정 2026-07] teams 테이블의 누적 카운터 대신 match_results에서
     # 직접 집계 (_save_career_entry와 동일 방식 — world_browser 순위표와
     # 항상 일치하도록).
-    tw, td, tl = _team_wdl_from_results(c, tid, team_row["lid"], season)
+    tw, td, tl = _team_wdl_from_results(c, tid, lid, season)
 
     cs = _calc_clean_sheets(c, tid, season, matches=sm)
 
@@ -863,7 +909,7 @@ def _update_career_stats(p, year, week):
         WHERE id=?""",
         (sm, sg, sa, ss, sga, avg_r, rn, tw, td, tl, cs,
          d_sh, d_sho, d_kp, d_drb, d_blk, d_pac, tid,
-         team_row["lname"], team_row["tier"], existing["id"]))
+         lname, tier, existing["id"]))
     conn.commit()
     conn.close()
 
@@ -889,6 +935,24 @@ def _close_career_entry(p, year, week, exit_type=""):
 
     # [최적화] 이미 열린 conn 재사용
     season = p.get("current_season", 1)
+
+    # [버그수정 2026-08, 신민용 리포트: "2004년에 승급했는데 그 해 기록이
+    # 0승0무0패/리그명도 승격된 리그로 잘못 나온다"] team_row(teams.league_id
+    # 조인, "지금" 소속 리그)를 그대로 쓰면 43주 승강 반영 후(44~52주, 국제
+    # 대회 기간에 시즌을 닫는 경우)엔 '이번 시즌 실제로 뛴 리그'가 아니라
+    # '다음 시즌 리그'가 이 닫히는 행에 찍힌다 — _team_league_id_for_season
+    # 으로 그 시즌 실제 리그를 우선 쓰고, 경기가 아예 없었으면(이론상 발생
+    # 안 하지만 안전하게) team_row로 폴백한다.
+    _season_lid = _team_league_id_for_season(c, tid, season)
+    if _season_lid is not None:
+        _season_league_row = c.execute(
+            "SELECT name, tier FROM leagues WHERE id=?", (_season_lid,)).fetchone()
+    else:
+        _season_league_row = None
+    lname = _season_league_row["name"] if _season_league_row else team_row["lname"]
+    tier  = _season_league_row["tier"] if _season_league_row else team_row["tier"]
+    lid   = _season_lid if _season_lid is not None else team_row["lid"]
+
     rank_str = get_team_rank(tid, conn=conn, season=season)
     try:
         rn = int(rank_str.split("위")[0].replace("공동","").strip())
@@ -912,7 +976,7 @@ def _close_career_entry(p, year, week, exit_type=""):
     # [버그수정 2026-07] teams 테이블의 누적 카운터 대신 match_results에서
     # 직접 집계 (_save_career_entry와 동일 방식 — world_browser 순위표와
     # 항상 일치하도록).
-    tw, td, tl = _team_wdl_from_results(c, tid, team_row["lid"], season)
+    tw, td, tl = _team_wdl_from_results(c, tid, lid, season)
 
     cs = _calc_clean_sheets(c, tid, season, matches=sm)
 
@@ -924,7 +988,7 @@ def _close_career_entry(p, year, week, exit_type=""):
         WHERE id=?""",
         (year, week, sm, sg, sa, ss, sga, avg_r, rn, tw, td, tl, cs,
          d_sh, d_sho, d_kp, d_drb, d_blk, d_pac,
-         team_row["lname"], team_row["tier"], p.get("salary", 0),
+         lname, tier, p.get("salary", 0),
          p.get("position", ""), tid, exit_type, existing["id"]))
 
     conn.commit()
@@ -1322,6 +1386,16 @@ def advance_days(schedule: list):
         if day != cur_day:
             break
 
+        # [2026-08 계측 추가, 신민용 리포트: "진행 버튼 누를 때 멈칫하는 게
+        # 늘었어 — 43~45주/52→1주 말고 중간중간도 봐야 할듯"] [PERF-WEEK]는
+        # "그 주의 마지막 날"에만 찍혀서, 하루씩 진행할 때 매일 실제로 얼마나
+        # 걸리는지는 지금까지 전혀 안 보였다(주 7일 중 6일은 로그 자체가
+        # 없었음). 원인 확정 전이므로 로직은 그대로 두고, 하루 처리 전체를
+        # 감싸는 타이머만 추가한다 — 0.1초 이상 걸린 날만 어떤 종류의 날
+        # (경기/훈련, 부상 여부, 그 주 마지막 날 여부)이었는지와 함께 찍는다.
+        import time as _time_day
+        _day_t0 = _time_day.perf_counter()
+
         # ── 이번 날짜 처리 ──
         _had_match = False
         if p.get("injured"):
@@ -1411,6 +1485,11 @@ def advance_days(schedule: list):
                 _process_training(p, week, stype, detail, day=day)
                 _sim_my_unscheduled_match(week, p, cur_season, day=day)
 
+        _dispatch_total = _time_day.perf_counter() - _day_t0
+        if _dispatch_total >= 0.1:
+            print(f"[PERF-DISPATCH] {week}주차 {day}일차 경기/훈련 처리 {_dispatch_total:.3f}s "
+                  f"(stype={stype!r})")
+
         is_week_last_day = (day % DAYS_PER_WEEK == 0)
         next_day = day + 1
         if next_day > 364:
@@ -1428,7 +1507,16 @@ def advance_days(schedule: list):
         # 세이브에서 재현·확인됨). 그래서 국제대회만 따로 떼어내 매일
         # 호출한다 — 내부적으로 이미 pending만 골라서 처리하는 멱등
         # 구조라 안 할 일이 있는 날엔 비용이 거의 없다.
+        # [2026-08 계측 추가, 신민용 리포트: "43~45/52→1 말고 중간중간도
+        # 잦은 멈칫이 있다" — [PERF-DAY]로 확인해보니 매주 마지막날이
+        # 거의 항상 0.9초 이상, 44주(국제대회기간) 훈련일도 1.3~1.6초씩
+        # 걸리는데 [PERF-WEEK]엔 안 잡혔다] 이 함수는 "매일" 불리는데도
+        # 지금까지 개별 타이머가 없었다 — 원인 확정 전이므로 로직은 그대로
+        # 두고 시간만 찍는다(0.05초 이상일 때만, 평소엔 조용하게).
+        import time as _time_diw
+        _diw_t0 = _time_diw.perf_counter()
         intl_engine.process_intl_week(week, day=day)
+        _diw_t1 = _time_diw.perf_counter()
 
         # [2026-07 버그수정, 신민용 리포트: "하루씩 실행하면 나만 실행하고
         # 다른 날짜들은 멈춰 있어 다음주 올 때까지"] process_cwc_week는
@@ -1441,6 +1529,11 @@ def advance_days(schedule: list):
         # 여파로 "미정"인 채 굳어있게 됨). intl_engine과 동일하게 매일
         # 부른다 — 처리할 게 없는 날엔 비용이 거의 없다.
         club_world_cup_engine.process_cwc_week(week, day=day)
+        _diw_t2 = _time_diw.perf_counter()
+        if _diw_t2 - _diw_t0 >= 0.05:
+            print(f"[PERF-DAILYHOOK] {week}주차 {day}일차: "
+                  f"process_intl_week {_diw_t1-_diw_t0:.3f}s | "
+                  f"process_cwc_week {_diw_t2-_diw_t1:.3f}s")
 
         # [2026-07 리팩터, 승강 플레이오프 도입 — 신민용 설계: "_end_of_season이
         # 역할을 너무 많이 갖고 있다, 시간축 기준으로 책임을 재배치하자"]
@@ -1457,12 +1550,44 @@ def advance_days(schedule: list):
         # 이미 훨씬 전에 끝나있어도 아무 문제 없이 그대로 반영된다.
         from constants import CLUB_SEASON_END_DAY
         if day == CLUB_SEASON_END_DAY:
+            # [2026-07 계측 추가, 신민용 리포트: "43주 44주 렉 걸리는거 같고"]
+            # _finalize_club_season / start_promotion_playoffs는 여태 [PERF-WEEK]
+            # 로그 범위 밖(day==CLUB_SEASON_END_DAY 전용 1회 실행)이라 계측이
+            # 전혀 없었다 — 원인 확정 전이므로 로직은 그대로 두고 타이머만 추가.
+            import time as _time_43
+            _t43_0 = _time_43.perf_counter()
             _finalize_club_season(p, st["current_year"])
+            _t43_1 = _time_43.perf_counter()
             promotion_playoff_engine.start_promotion_playoffs(st["current_year"])
+            _t43_2 = _time_43.perf_counter()
+            # [2026-08 신설, 신민용 리포트: "44→45주, 52→1주 렉이 심한데?"]
+            # [PERF-INTLTAB] 로그에서 그룹순위계산이 연도전환 직후에만 가끔
+            # 0.3~0.8s로 튀는 게 관찰됐다 — 52→1주 전환 끝에는 PRAGMA
+            # optimize를 이미 한 번 부르지만, 국제대회 조편성/일정(intl_matches/
+            # intl_entries)은 그 이후(43~44주 구간)에 새로 생성되므로 그
+            # 시점의 SQLite 쿼리플래너 통계는 여전히 낡아있을 수 있다.
+            # PRAGMA optimize는 부작용 없는(변경 감지 시에만 선별적으로
+            # 갱신) 안전한 호출이라, 여기서도 한 번 더 실행해본다 — 원인
+            # 확정 전 실험이므로 다음 로그로 효과를 확인해야 한다.
+            try:
+                get_conn().execute("PRAGMA optimize")
+            except Exception:
+                pass
+            _t43_3 = _time_43.perf_counter()
+            print(f"[PERF-YEAR] {week}주차(CLUB_SEASON_END_DAY) 세부: "
+                  f"finalize_club_season={_t43_1-_t43_0:.3f}s | "
+                  f"promotion_playoffs={_t43_2-_t43_1:.3f}s | "
+                  f"PRAGMA optimize={_t43_3-_t43_2:.3f}s")
 
         # [2026-07 신설] 승강 PO도 intl/cwc와 동일한 day 기반 멱등
         # 실행기다 — 44주 동안 매일 불러 그날 온 경기를 처리한다.
+        # [2026-08 계측 추가] 위 process_intl_week/process_cwc_week와
+        # 동일한 이유로 개별 타이머 추가.
+        _t_po0 = _time_diw.perf_counter()
         promotion_playoff_engine.process_po_week(week, day=day)
+        _t_po1 = _time_diw.perf_counter()
+        if _t_po1 - _t_po0 >= 0.05:
+            print(f"[PERF-DAILYHOOK] {week}주차 {day}일차: process_po_week {_t_po1-_t_po0:.3f}s")
 
 
         _do_flush = False
@@ -1497,7 +1622,14 @@ def advance_days(schedule: list):
             # [2026-07 수정, 신민용 지적: "축구는 주급으로 준다"] 4주마다
             # salary//12를 주던 걸, 매주 salary//52로 바꿨다. 자동저장은
             # 이미 급여 지급과 별개 조건(week%4==2)이라 그대로 둔다.
+            # [2026-08 계측 추가, 신민용 리포트: "18주,30주(경기 있는 주
+            # 마지막날)가 1.15s씩 튀는데 [PERF-WEEK]도 안 찍혔다"] 이
+            # 블록 안에서 유일하게 개별 타이머가 없던 두 곳 — 마지막
+            # 사각지대라 여기서 확인한다.
+            import time as _time_pw2
+            _pw2_t0 = _time_pw2.perf_counter()
             _pay_salary(p_latest, week)
+            _pw2_t1 = _time_pw2.perf_counter()
             # [최적화] 자동저장(flush_to_disk, DB 전체 백업)은 급여 지급과 같은 날
             # 묶여 있었는데, 52주차가 하필 4의 배수라 '연도 전환(_advance_week의
             # 최대 병목 지점)'과 '자동저장'이 같은 클릭에 겹쳐 있었다(실측 약 0.55초
@@ -1508,6 +1640,10 @@ def advance_days(schedule: list):
                 _do_flush = True
 
             _advance_week(p_latest, week, 1)   # current_week/year/season 갱신(검증된 로직)
+            _pw2_t2 = _time_pw2.perf_counter()
+            if _pw2_t2 - _pw2_t0 >= 0.1:
+                print(f"[PERF-WEEKTAIL] {week}주차: _pay_salary {_pw2_t1-_pw2_t0:.3f}s | "
+                      f"_advance_week {_pw2_t2-_pw2_t1:.3f}s")
 
         # current_day 전진 (주/연도 경계와 무관하게 매일 정확히 1회).
         # _advance_week는 current_week/year/season만 갱신하고 current_day는
@@ -1533,10 +1669,20 @@ def advance_days(schedule: list):
         #   커밋(위 current_day 커밋, _advance_week의 커밋)이 전부 끝난 뒤
         #   맨 마지막에, 이 반복에서 더 이상 같은 커넥션에 커밋할 게 없는
         #   시점에만 실행한다.
+        # [2026-08 최적화, 신민용 리포트: "진행 버튼 누를 때 4주마다 한 번씩
+        #   0.7~1초 멈춘다" — [PERF-DAY] 계측으로 자동저장 주(week%4==2)만
+        #   유독 느린 게 확인됨] flush_to_disk()는 전체 DB를 디스크에
+        #   backup하는 진짜 I/O라 동기로 부르면 그만큼 화면이 멈췄다 —
+        #   이 백업은 게임 진행용 풀 커넥션과 완전히 분리된 별도 스냅샷
+        #   커넥션만 건드리도록 이미 설계돼 있어서(위 주석 참고),
+        #   백그라운드 스레드로 돌려도 안전하다. 저장 자체(내용·주기)는
+        #   완전히 동일하고 "게임 진행을 막지 않고" 뒤에서 저장될 뿐이다.
+        #   앱 종료 시(main_window.closeEvent)엔 여전히 동기 버전 +
+        #   wait_for_pending_flush()로 저장 완료를 보장한다.
         if _do_flush:
             try:
-                from database import flush_to_disk
-                flush_to_disk()
+                from database import flush_to_disk_async
+                flush_to_disk_async()
             except Exception:
                 pass
 
@@ -1555,6 +1701,12 @@ def advance_days(schedule: list):
             st_new  = get_state()
             _update_career_stats(p_fresh, st_new["current_year"], st_new["current_week"])
         flush_log_buffer()
+
+        _day_total = _time_day.perf_counter() - _day_t0
+        if _day_total >= 0.1:
+            print(f"[PERF-DAY] {week}주차 {day}일차 처리 {_day_total:.3f}s "
+                  f"(stype={stype!r} | 그주마지막날={is_week_last_day} | "
+                  f"경기있음={_had_match} | 부상={bool(p.get('injured'))})")
 
 
 # ── [개선] 홈 어드밴티지 변동폭 + 포메이션 스타일 보정 ──────────
@@ -1710,6 +1862,14 @@ def _sim_all_ai_matches(week, my_league_id, season):
     conn = get_conn()
     c = conn.cursor()
 
+    # [2026-08 계측 추가, 신민용 리포트: "39주차 리그시뮬이 1.29s 튀었다"]
+    # _team_avg_ovr/_formation_bias는 이미 세션 캐시가 있는데도 튄 걸 보면
+    # (1) 그 주 처리할 경기 수 자체가 유난히 많았거나 (2) 캐시가 그 시점에
+    # 비어있었을 가능성이 있다 — 원인 확정 전이므로 로직은 그대로 두고
+    # 구간별 시간 + 처리한 경기 수만 찍는다.
+    import time as _time_sim
+    _sim_t0 = _time_sim.perf_counter()
+
     p_row = conn.execute("SELECT current_team_id FROM my_player WHERE id=1").fetchone()
     my_tid = p_row["current_team_id"] if p_row else 0
     _my_p = get_player() if my_tid else None   # 오프시즌 예외 케이스에서만 실제로 씀
@@ -1719,11 +1879,14 @@ def _sim_all_ai_matches(week, my_league_id, season):
                  WHERE mr.week=? AND mr.home_score=-1 AND mr.season=?""",
               (week, season))
     matches = c.fetchall()
+    _sim_t1 = _time_sim.perf_counter()
 
     from constants import SEASON_PHASES
     _ps_s, _ps_e = SEASON_PHASES["preseason1"]
     _os_s, _os_e = SEASON_PHASES["postseason"]   # = 국제대회 전용 비시즌
     is_offseason = (_ps_s <= week <= _ps_e) or (_os_s <= week <= _os_e)
+
+    _sim_ovr_cache_hits_before = len(_team_ovr_cache)
 
     batch_results = []   # (hs, as_, mid) — match_results 배치
     team_deltas   = {}   # {team_id: [w,d,l,gf,ga]} — teams 배치
@@ -1745,13 +1908,23 @@ def _sim_all_ai_matches(week, my_league_id, season):
         hs, as_ = _gen_score(outcome, diff)
         _accum_team_rec(team_deltas, m["home_team_id"], m["away_team_id"], outcome, hs, as_)
         batch_results.append((hs, as_, m["id"]))
+    _sim_t2 = _time_sim.perf_counter()
 
     if batch_results:
         c.executemany("UPDATE match_results SET home_score=?,away_score=? WHERE id=?",
                       batch_results)
+    _sim_t3 = _time_sim.perf_counter()
     _flush_team_rec(c, team_deltas)
     conn.commit()
     conn.close()
+    _sim_t4 = _time_sim.perf_counter()
+    _sim_total = _sim_t4 - _sim_t0
+    if _sim_total >= 0.1:
+        print(f"[PERF-SIM]  _sim_all_ai_matches({week}주차, {len(matches)}경기, "
+              f"OVR캐시 {_sim_ovr_cache_hits_before}→{len(_team_ovr_cache)}) 세부: "
+              f"경기조회 {_sim_t1-_sim_t0:.3f}s | 시뮬루프 {_sim_t2-_sim_t1:.3f}s | "
+              f"executemany({len(batch_results)}건) {_sim_t3-_sim_t2:.3f}s | "
+              f"teams반영+commit {_sim_t4-_sim_t3:.3f}s")
 
 
 # ─────────────────────────────────────────
@@ -4391,18 +4564,29 @@ def get_team_rank(team_id, conn=None, season=None) -> str:
 
 
 def get_league_standings_by_team(team_id, conn=None, season=None):
-    """팀 ID로 해당 리그 순위표 반환. conn/season 주어지면 재사용."""
+    """팀 ID로 해당 리그 순위표 반환. conn/season 주어지면 재사용.
+
+    [버그수정 2026-08, 신민용 리포트: "승급 직후(43주 이후)엔 그 시즌 커리어
+    기록이 0승0무0패로 나온다"] season이 주어졌는데 teams.league_id(현재
+    소속 리그)를 그대로 쓰면, 승강이 이미 반영된 뒤(44~52주)엔 '그 시즌
+    실제로 뛴 리그'가 아니라 '다음 시즌 리그'로 조회하게 된다 — 그 리그+
+    시즌엔 이 팀 경기가 아예 없으니 순위표에서 통째로 빠진다. season이
+    주어지면 _team_league_id_for_season으로 그 시즌에 실제로 뛴 리그를
+    먼저 찾고, 없으면(이번 시즌 아직 한 경기도 안 뛴 경우) teams.league_id로
+    폴백한다 — season=None(그냥 "지금 이 팀 리그")일 때는 기존 그대로."""
     own = conn is None
     if own:
         conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT league_id FROM teams WHERE id=?", (team_id,))
-    row = c.fetchone()
+    lid = _team_league_id_for_season(c, team_id, season) if season is not None else None
+    if lid is None:
+        row = c.execute("SELECT league_id FROM teams WHERE id=?", (team_id,)).fetchone()
+        lid = row["league_id"] if row else None
     if own:
         conn.close()
-    if not row:
+    if not lid:
         return []
-    return get_league_standings(row["league_id"], season=season,
+    return get_league_standings(lid, season=season,
                                 conn=None if own else conn)
 
 
@@ -7874,11 +8058,29 @@ def _finalize_club_season(p, year):
     rs = p.get("season_rating_sum", 0.0)
     rc = p.get("season_rating_cnt", 0)
     season_avg_rating = round(rs / rc, 2) if rc else 6.0
+
+    # [2026-07 계측 추가, 신민용 리포트: "43주 44주 렉"] finalize_club_season
+    # 총량 중 미완료 경기 정리 vs 승강제 판정(667개 리그 순회) 중 어느 쪽이
+    # 실제 병목인지 분리 측정 — 아직 최적화는 하지 않고 숫자만 확보한다.
+    import time as _time_fcs
+    _tfcs0 = _time_fcs.perf_counter()
     _finish_incomplete_matches_for_season(p.get("current_season", 1))
+    _tfcs1 = _time_fcs.perf_counter()
     _process_promotion_relegation(year, season_avg_rating)
+    _tfcs2 = _time_fcs.perf_counter()
+    print(f"[PERF-SEASON] finalize_club_season 세부: "
+          f"finish_incomplete_matches={_tfcs1-_tfcs0:.3f}s | "
+          f"promotion_relegation={_tfcs2-_tfcs1:.3f}s")
 
 
 def _process_promotion_relegation(year, season_avg_rating=6.0):
+    # [2026-08 계측 추가, 신민용 리포트: "43주 44주 45주 렉 언제 고칠거야"]
+    # 지난번엔 이 함수 전체(0.48~0.54s)에 바깥쪽 타이머만 달았지 내부는
+    # 아직 못 쪼갰다 — 원인 확정 전이므로 로직은 그대로 두고 구간별 시간만
+    # 촘촘히 찍는다.
+    import time as _time_pr
+    _pr_t0 = _time_pr.perf_counter()
+
     conn = get_conn()
     c = conn.cursor()
 
@@ -7937,6 +8139,14 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
     # 이상(실측 약 6초/10초)을 차지했다). 이제 "팀 전체 1회 SELECT" +
     # "이번 시즌 match_results 전체 1회 SELECT"만 하고, 리그별 집계는
     # 파이썬 메모리 안에서 한 번의 루프로 끝낸다 — 쿼리 675x2회 → 2회.
+    # [2026-08 시도했다가 되돌림, 신민용 리포트: "43주 렉 심한데?"] 이
+    # 집계를 SQL GROUP BY로 옮겨봤는데, game.db로 직접 벤치마크해보니
+    # (UNION ALL 34만행 → TEMP B-TREE로 GROUP BY 정렬) 오히려 파이썬 루프
+    # (0.218s)보다 SQL 버전(0.297s)이 더 느렸다 — 이 케이스는 그룹 수
+    # (~9천개)가 입력 행(17만+)보다 훨씬 적어서 SQLite가 해시가 아니라
+    # 정렬 기반 GROUP BY를 택했고, 그 정렬 비용이 파이썬 dict 집계보다
+    # 컸다. 결과가 같더라도 항상 SQL이 빠른 건 아니라는 사례 — 원래
+    # 방식으로 되돌린다.
     def _calc_all_standings_cached(team_rows, league_ids, season):
         """모든 리그의 standings를 딱 2번의 SELECT로 한꺼번에 계산.
         반환값·정렬 기준은 기존 _calc_standings_cached(리그별 개별 계산)와
@@ -7944,7 +8154,16 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
         [2026-07 추가 최적화] teams 전체 스캔을 이 함수 안에서 직접 하지
         않고, 호출부가 이미 선조회해둔 team_rows(팀명·리그명 캐시와 공유)를
         재사용한다 — 같은 함수 안에서 teams를 3번 따로 SELECT하던 것을
-        1번으로 줄인다. 결과는 완전히 동일."""
+        1번으로 줄인다. 결과는 완전히 동일.
+        [2026-08 추가 최적화, 신민용 리포트: "43주 렉, 방식을 다르게 하면
+        더 줄일 수 없어?"] SQL GROUP BY로 옮기는 시도는 game.db 실측상
+        오히려 느려서 되돌렸었다(TEMP B-TREE 정렬 비용) — 대신 이 시즌
+        경기 17만+ 건을 fetchall()할 때 sqlite3.Row로 감싸지 않고 순수
+        튜플로 받아 위치 인덱스로 접근하도록 바꿨다(_age_and_progress가
+        5.9만 명 ai_players를 읽을 때 쓰는 것과 동일한 패턴). game.db로
+        직접 벤치마크해 Row객체 접근(0.256s) 대비 튜플 접근(0.219s)이
+        약 15% 빠름을 확인했다 — 계산 로직·결과는 완전히 동일, row를
+        "어떻게 꺼내오느냐"만 바뀐다."""
         by_league: dict = {lid: {} for lid in league_ids}
         for r in team_rows:
             lid = r["league_id"]
@@ -7952,15 +8171,21 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
                 by_league[lid][r["id"]] = {"id": r["id"], "name": r["name"],
                                             "pts": 0, "gd": 0, "gf": 0, "gp": 0}
 
-        for row in c.execute(
+        # [버그수정] conn.cursor()는 _PooledCursor(재시도 방어 래퍼, __slots__로
+        # _real만 허용)를 반환해서 row_factory 속성을 못 붙인다 — _age_and_progress가
+        # 쓰는 것과 동일하게 c.connection으로 진짜 sqlite3.Connection을 얻은 뒤
+        # 거기서 순정 커서를 만들어야 row_factory=None이 먹는다.
+        _raw_cursor = c.connection.cursor()
+        _raw_cursor.row_factory = None  # 위치 접근만 쓰므로 Row 래핑 생략
+        for row in _raw_cursor.execute(
                 """SELECT league_id, home_team_id, away_team_id, home_score, away_score
                    FROM match_results WHERE season=? AND home_score>=0""",
                 (season,)).fetchall():
-            teams_in = by_league.get(row["league_id"])
+            # row = (league_id, home_team_id, away_team_id, home_score, away_score)
+            teams_in = by_league.get(row[0])
             if not teams_in:
                 continue
-            hid, aid, hs, as_ = (row["home_team_id"], row["away_team_id"],
-                                  row["home_score"], row["away_score"])
+            hid, aid, hs, as_ = row[1], row[2], row[3], row[4]
             for tid, gf, ga in [(hid, hs, as_), (aid, as_, hs)]:
                 t = teams_in.get(tid)
                 if t is None:
@@ -8003,12 +8228,16 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
     # (standings 스켈레톤 / 팀명·리그명 캐시 / team→league 캐시)이 각자
     # 따로 SELECT 하던 것을 1회 선조회로 통합 — teams 테이블 전체스캔이
     # 3회 → 1회로 줄어든다(결과는 완전히 동일, 그냥 어디서 읽어오느냐만 바뀜).
+    _pr_t1 = _time_pr.perf_counter()
+
     _all_team_rows = c.execute(
         "SELECT t.id, t.name, t.league_id, l.name as lname "
         "FROM teams t JOIN leagues l ON t.league_id=l.id").fetchall()
+    _pr_t2 = _time_pr.perf_counter()
 
     # standings 캐시: {league_id: [sorted rows]}
     _standings_cache = _calc_all_standings_cached(_all_team_rows, all_league_ids, season)
+    _pr_t3 = _time_pr.perf_counter()
 
     # [2026-07 신설, DEBUG_RELEGATION_TRACKING 전용] 지난 사이클에 등록해둔
     # 강등팀들의 "시즌 종료" 체크포인트 — 이번에 막 계산된 standings로
@@ -8048,6 +8277,7 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
     _player_ovrs_by_team: dict = {}
     for r in c.execute("SELECT team_id, ovr FROM ai_players").fetchall():
         _player_ovrs_by_team.setdefault(r["team_id"], []).append(r["ovr"])
+    _pr_t4 = _time_pr.perf_counter()
 
     def _cached_league_avg_ovr(league_id, exclude_team_id=None):
         vals = []
@@ -8282,6 +8512,7 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
 
     # [2026-07 최적화] 위 루프에서 모아둔 승격/강등 UPDATE·INSERT를 각각
     # executemany로 한 번씩만 실행 — 팀 수만큼 개별 실행하던 것을 2회로 줄인다.
+    _pr_t5 = _time_pr.perf_counter()
     if _team_move_updates:
         c.executemany("UPDATE teams SET league_id=?,current_tier=? WHERE id=?", _team_move_updates)
     if _promotion_log_inserts:
@@ -8294,6 +8525,7 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
             """INSERT INTO po_pending_slots(year,upper_league_id,lower_league_id,rule_id,side,
                                              offset_idx,team_id,team_name) VALUES(?,?,?,?,?,?,?,?)""",
             _po_pending_inserts)
+    _pr_t6 = _time_pr.perf_counter()
 
     # 승강팀 OVR 평형 일괄 적용
     # [기능 변경] 이 리스케일 자체(승강팀 OVR을 새 리그 수준에 맞추는 것)는
@@ -8307,6 +8539,7 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
         rescale_teams_to_target_ovr_batch(_rescale_jobs, conn)
     except Exception as _e:
         add_log(f"[리스케일 오류] {_e}", "normal", year, 52)
+    _pr_t7 = _time_pr.perf_counter()
 
     if DEBUG_RELEGATION_TRACKING:
         for _tid in _RELEGATION_DEBUG_TRACK:
@@ -8314,8 +8547,19 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
 
     conn.commit()
     conn.close()
+    _pr_t8 = _time_pr.perf_counter()
 
     _invalidate_team_ovr_cache()
+    _pr_t9 = _time_pr.perf_counter()
+    print(f"[PERF-PROMO] _process_promotion_relegation 세부: "
+          f"my_player/season조회 {_pr_t1-_pr_t0:.3f}s | "
+          f"teams+leagues조회 {_pr_t2-_pr_t1:.3f}s | "
+          f"standings계산({len(all_league_ids)}개리그) {_pr_t3-_pr_t2:.3f}s | "
+          f"ai_players OVR스캔 {_pr_t4-_pr_t3:.3f}s | "
+          f"승강판정루프({len(cids)}개국) {_pr_t5-_pr_t4:.3f}s | "
+          f"executemany({len(_team_move_updates)}건) {_pr_t6-_pr_t5:.3f}s | "
+          f"리스케일({len(_rescale_jobs)}건) {_pr_t7-_pr_t6:.3f}s | "
+          f"commit/close {_pr_t8-_pr_t7:.3f}s | 캐시무효화 {_pr_t9-_pr_t8:.3f}s")
 
     if my_new_league:
         p_up = get_player()
@@ -10383,7 +10627,29 @@ def _save_career_entry(p, year, week, force_new=False, transfer_type=None,
     if not team_row:
         conn.close(); return
 
-    rank_str = get_team_rank(tid)
+    season = p.get("current_season", 1)
+
+    # [버그수정 2026-08, 신민용 리포트: "2004년에 승급했는데 그 해 기록이
+    # 0승0무0패/리그명도 승격된 리그로 잘못 나온다"] 아래는 "이미 열린
+    # 항목을 시즌 도중 갱신"하는 경우에만 필요한 보정이다 — team_row(현재
+    # 소속 리그)를 그대로 쓰면, 43주에 승강이 반영된 뒤(44~52주 국제대회
+    # 기간)엔 '이번 시즌 실제로 뛴 리그'가 아니라 '다음 시즌 리그'가 찍힌다.
+    # 반대로 아래 INSERT 분기(신규 입단 행)는 이번 시즌 경기가 아직 없는
+    # 새 스틴트라 team_row(현재 소속)가 그대로 정답이므로 건드리지 않는다.
+    _season_lid = _team_league_id_for_season(c, tid, season)
+    if _season_lid is not None:
+        _season_league_row = c.execute(
+            "SELECT name, tier FROM leagues WHERE id=?", (_season_lid,)).fetchone()
+    else:
+        _season_league_row = None
+    season_lname = _season_league_row["name"] if _season_league_row else team_row["lname"]
+    season_tier  = _season_league_row["tier"] if _season_league_row else team_row["tier"]
+    lid = _season_lid
+    if lid is None:
+        _live_lid_row = c.execute("SELECT league_id FROM teams WHERE id=?", (tid,)).fetchone()
+        lid = _live_lid_row["league_id"] if _live_lid_row else None
+
+    rank_str = get_team_rank(tid, conn=conn, season=season)
     try:
         rn = int(rank_str.split("위")[0].replace("공동","").strip())
     except (ValueError, AttributeError, IndexError):
@@ -10400,9 +10666,6 @@ def _save_career_entry(p, year, week, force_new=False, transfer_type=None,
 
     # 팀 전적: teams 테이블 대신 match_results에서 직접 집계 (sync 오염 방지,
     #   _team_wdl_from_results로 통일 — _update_career_stats/_close_career_entry와 동일)
-    season = p.get("current_season", 1)
-    league_id_row = c.execute("SELECT league_id FROM teams WHERE id=?", (tid,)).fetchone()
-    lid = league_id_row["league_id"] if league_id_row else None
     tw, td, tl = _team_wdl_from_results(c, tid, lid, season)
     pos = get_field_pos(p)   # 배치 포지션 (포메이션 슬롯 기반, 없으면 주요 포지션)
     cs  = _calc_clean_sheets(c, tid, season, matches=sm)
@@ -10418,7 +10681,7 @@ def _save_career_entry(p, year, week, force_new=False, transfer_type=None,
             loan_partner_team=COALESCE(?, loan_partner_team)
             WHERE id=?""",
             (year, week, sm, sg, sa, ss, sga, avg_r, rn, tw, td, tl, cs,
-             team_row["lname"], team_row["tier"], p.get("salary", 0), pos, tid,
+             season_lname, season_tier, p.get("salary", 0), pos, tid,
              exit_type, loan_partner_team, existing["id"]))
     elif not allow_insert:
         # 이미 닫힌 항목만 존재 → 중복 행은 안 만들되, 떠난 경로(exit_type)는

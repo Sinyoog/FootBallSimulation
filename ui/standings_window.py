@@ -89,17 +89,33 @@ class StandingsWindow(QDialog):
         하나라도 바뀌었으면 refresh()를 그대로 호출해 완전히 다시 그린다
         — 즉 사용자가 보는 결과는 항상 기존과 동일하다."""
         p = get_player()
+        st = get_state()
         league_id = self.league_id
         my_team_id = self.my_team_id
         if p and p.get("current_team_id"):
             my_team_id = p["current_team_id"]
+            # [버그수정 2026-08, 신민용 리포트: "승강전에서 승급/강등되면
+            # 바로 반영되는거 같은데, 다음 연도 1주차에 반영돼야 하지
+            # 않나 — 경기 일정 다 사라지고 좌측에 정보 없음 뜨더라"]
+            # teams.league_id는 43주 승강 처리 즉시 새 리그로 바뀌지만,
+            # 44~52주 국제대회 기간엔 이번 시즌 실제 경기가 전부 옛
+            # 리그에 남아있다 — _team_league_id_for_season으로 이번
+            # 시즌에 실제로 뛴 리그를 먼저 찾고, 없으면(막 이적 직후 등)
+            # 지금 소속 리그로 폴백한다.
+            from game_engine import _team_league_id_for_season
             conn = get_conn()
-            row = conn.execute(
-                "SELECT l.id AS lid FROM teams t JOIN leagues l ON t.league_id=l.id WHERE t.id=?",
-                (my_team_id,)).fetchone()
+            c = conn.cursor()
+            season = st.get("current_season") if st else None
+            _season_lid = _team_league_id_for_season(c, my_team_id, season) if season else None
+            if _season_lid is not None:
+                league_id = _season_lid
+            else:
+                row = c.execute(
+                    "SELECT l.id AS lid FROM teams t JOIN leagues l ON t.league_id=l.id WHERE t.id=?",
+                    (my_team_id,)).fetchone()
+                if row:
+                    league_id = row["lid"]
             conn.close()
-            if row:
-                league_id = row["lid"]
         sig = self._compute_sig(league_id, my_team_id)
         if sig == self._last_sig:
             return
@@ -109,32 +125,57 @@ class StandingsWindow(QDialog):
         # 내 팀의 '현재' 소속 리그와 팀 ID를 재조회한다.
         #   - 이적: current_team_id 가 바뀜 → my_team_id 갱신(하이라이트 정확)
         #   - 승강: 같은 팀이라도 소속 league_id 가 바뀜 → league_id 갱신
+        # [버그수정 2026-08] _poll_refresh와 동일한 이유로, teams.league_id
+        # (지금 소속, 승강 반영 후)가 아니라 이번 시즌에 실제로 뛴 리그를
+        # 우선 쓴다. 이번 시즌 경기가 아직 없으면(막 이적 직후) 기존처럼
+        # teams.league_id로 폴백한다.
         p = get_player()
+        st = get_state()
         if p and p.get("current_team_id"):
             tid = p["current_team_id"]
             self.my_team_id = tid
+            from game_engine import _team_league_id_for_season
             conn = get_conn()
-            row = conn.execute(
-                "SELECT l.id AS lid, l.name AS lname, l.tier AS tier "
-                "FROM teams t JOIN leagues l ON t.league_id=l.id WHERE t.id=?",
-                (tid,)).fetchone()
+            c = conn.cursor()
+            season = st.get("current_season") if st else None
+            _season_lid = _team_league_id_for_season(c, tid, season) if season else None
+            if _season_lid is not None:
+                row = c.execute(
+                    "SELECT name AS lname, tier FROM leagues WHERE id=?",
+                    (_season_lid,)).fetchone()
+                if row:
+                    self.league_id = _season_lid
+                    new_name = f"{row['lname']} ({row['tier']}부)"
+                    if new_name != self._lname:
+                        self._lname = new_name
+                        self._lbl.setText(f"📊 {self._lname}")
+            else:
+                row = c.execute(
+                    "SELECT l.id AS lid, l.name AS lname, l.tier AS tier "
+                    "FROM teams t JOIN leagues l ON t.league_id=l.id WHERE t.id=?",
+                    (tid,)).fetchone()
+                if row:
+                    self.league_id = row["lid"]
+                    new_name = f"{row['lname']} ({row['tier']}부)"
+                    if new_name != self._lname:
+                        self._lname = new_name
+                        self._lbl.setText(f"📊 {self._lname}")
             conn.close()
-            if row:
-                self.league_id = row["lid"]
-                # 리그가 바뀌었으면 제목도 갱신(예: 2부→1부 승격)
-                new_name = f"{row['lname']} ({row['tier']}부)"
-                if new_name != self._lname:
-                    self._lname = new_name
-                    self._lbl.setText(f"📊 {self._lname}")
         self._fill_table()
         self._last_sig = self._compute_sig()
 
     def _fill_table(self):
+        # [2026-08 계측 추가, 신민용 리포트: "순위표 버튼도 혹시 모르고"]
+        # 구조가 단순해서 크게 안 느릴 걸로 예상되지만 확인 차원에서 추가.
+        import time as _time_st
+        _st_t0 = _time_st.perf_counter()
+
         if self._tbl:
             self._tbl_holder.removeWidget(self._tbl)
             self._tbl.deleteLater()
 
         rows = get_league_standings(self.league_id)
+        _st_t1 = _time_st.perf_counter()
         cols = ["순위","팀명","승","무","패","득점","실점","득실","승점"]
         tbl  = QTableWidget(len(rows), len(cols))
         tbl.setHorizontalHeaderLabels(cols)
@@ -170,3 +211,9 @@ class StandingsWindow(QDialog):
         total_w += tbl.verticalHeader().width() + 40  # 여백
         self.setMinimumWidth(max(620, total_w))
         self.resize(max(self.width(), total_w), self.height())
+        _st_t2 = _time_st.perf_counter()
+        _st_total = _st_t2 - _st_t0
+        if _st_total >= 0.05:
+            print(f"[PERF-STAND] _fill_table 총 {_st_total:.3f}s — "
+                  f"get_league_standings {_st_t1-_st_t0:.3f}s | "
+                  f"테이블렌더링 {_st_t2-_st_t1:.3f}s ({len(rows)}팀)")

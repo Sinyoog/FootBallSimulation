@@ -539,13 +539,29 @@ def get_cup_tournament_detail(tournament_id):
 
 
 def has_cup_data(country_id):
-    """이 나라에 생성된 컵대회 기록이 하나라도 있는지(검색 목록 배지용)."""
+    """이 나라에 생성된 컵대회 기록이 하나라도 있는지(검색 목록 배지용).
+    [주의] 국가 목록 전체를 훑을 땐 이 함수를 나라마다 반복 호출하지 말고
+    has_cup_data_bulk()를 쓸 것 — 아래 참고."""
     conn = get_conn()
     n = conn.execute(
         "SELECT COUNT(*) AS n FROM cup_tournaments WHERE country_id=?",
         (country_id,)).fetchone()["n"]
     conn.close()
     return n > 0
+
+
+def has_cup_data_bulk():
+    """[2026-08 최적화, 신민용 리포트: "세계기록실도 클릭할 때 렉있어"]
+    컵대회 검색 탭이 국가 목록(전 세계 150~200개국)을 그릴 때, 나라마다
+    has_cup_data()를 따로 호출해서 SELECT COUNT(*)를 나라 수만큼(N+1) 날리고
+    있었다 — 컵대회 기록이 있는 country_id 집합을 통째로 1번의 쿼리로
+    가져와서, 호출부는 `cid in result_set`으로 O(1) 판정하면 된다.
+    결과(어느 나라가 '기록 있음'으로 뜨는지)는 기존과 완전히 동일하다."""
+    conn = get_conn()
+    ids = {r["country_id"] for r in conn.execute(
+        "SELECT DISTINCT country_id FROM cup_tournaments").fetchall()}
+    conn.close()
+    return ids
 
 
 # ─────────────────────────────────────────

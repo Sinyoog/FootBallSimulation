@@ -189,16 +189,30 @@ class ScheduleWindow(QDialog):
         p = get_player(); st = get_state()
         league_id = self.league_id
         my_team_id = self.my_team_id
+        season = st["current_season"] if st else self.season
         if p and p.get("current_team_id"):
             my_team_id = p["current_team_id"]
+            # [버그수정 2026-08, 신민용 리포트: "승강전에서 승급/강등되면
+            # 바로 반영되는거 같은데, 다음 연도 1주차에 반영돼야 하지
+            # 않나 — 경기 일정 다 사라지고 정보 없음 뜨더라"] teams.
+            # league_id는 43주 승강 처리 즉시 새 리그로 바뀌지만, 44~52주
+            # 국제대회 기간엔 이번 시즌 실제 경기가 전부 옛 리그에
+            # 남아있다. _team_league_id_for_season으로 이번 시즌에 실제로
+            # 뛴 리그를 먼저 찾고, 없으면(막 이적 직후 등) 지금 소속
+            # 리그로 폴백한다.
+            from game_engine import _team_league_id_for_season
             conn = get_conn()
-            row = conn.execute(
-                "SELECT l.id FROM teams t JOIN leagues l ON t.league_id=l.id WHERE t.id=?",
-                (my_team_id,)).fetchone()
+            c = conn.cursor()
+            _season_lid = _team_league_id_for_season(c, my_team_id, season)
+            if _season_lid is not None:
+                league_id = _season_lid
+            else:
+                row = c.execute(
+                    "SELECT l.id FROM teams t JOIN leagues l ON t.league_id=l.id WHERE t.id=?",
+                    (my_team_id,)).fetchone()
+                if row:
+                    league_id = row["id"]
             conn.close()
-            if row:
-                league_id = row["id"]
-        season = st["current_season"] if st else self.season
         sig = self._compute_sig(league_id, my_team_id, season)
         if sig == self._last_sig:
             return
@@ -207,21 +221,44 @@ class ScheduleWindow(QDialog):
     def refresh(self):
         p = get_player(); st = get_state()
         if p and p.get("current_team_id"):
+            season = st["current_season"] if st else self.season
+            from game_engine import _team_league_id_for_season
             conn = get_conn()
-            row = conn.execute(
-                "SELECT l.id, l.name, l.tier FROM teams t JOIN leagues l ON t.league_id=l.id WHERE t.id=?",
-                (p["current_team_id"],)).fetchone()
+            c = conn.cursor()
+            _season_lid = _team_league_id_for_season(c, p["current_team_id"], season)
+            if _season_lid is not None:
+                row = c.execute("SELECT name, tier FROM leagues WHERE id=?",
+                                (_season_lid,)).fetchone()
+                if row:
+                    self.league_id = _season_lid
+                    lname = f"{row['name']} ({row['tier']}부)"
+                    self._lbl.setText(f"📅 {lname}")
+            else:
+                row = c.execute(
+                    "SELECT l.id, l.name, l.tier FROM teams t JOIN leagues l ON t.league_id=l.id WHERE t.id=?",
+                    (p["current_team_id"],)).fetchone()
+                if row:
+                    self.league_id = row["id"]
+                    lname = f"{row['name']} ({row['tier']}부)"
+                    self._lbl.setText(f"📅 {lname}")
             conn.close()
-            if row:
-                self.league_id = row["id"]
-                lname = f"{row['name']} ({row['tier']}부)"
-                self._lbl.setText(f"📅 {lname}")
             self.my_team_id = p["current_team_id"]
         if st: self.season = st["current_season"]
         self._fill_tabs()
         self._last_sig = self._compute_sig()
 
     def _fill_tabs(self):
+        # [2026-08 계측 추가, 신민용 리포트: "경기 일정 클릭할 때 약간
+        # 렉이 있거든"] 경기일정 버튼 클릭 → ScheduleWindow.__init__ →
+        # _build() → _fill_tabs()가 탭 13개(내경기/전체일정/국제대회
+        # 본선·예선·예선PO/챔스 그룹·본선/CWC 그룹·본선/승강PO/컵대회
+        # 내경기·전체·브래킷)를 전부 동기적으로 그린 뒤에야 창이 보인다 —
+        # 어느 탭이 실제로 무거운지 원인 확정 전이므로 로직은 그대로 두고
+        # 구간별 시간만 찍는다.
+        import time as _time_sw
+        _sw_t0 = _time_sw.perf_counter()
+        _sw_marks = []
+
         cur = self._tab.currentIndex()
 
         from PyQt6.QtWidgets import QAbstractScrollArea
@@ -241,9 +278,11 @@ class ScheduleWindow(QDialog):
         all_data = get_schedule(self.league_id, self.season)
         my_data  = [r for r in all_data
                     if r["home_team_id"]==self.my_team_id or r["away_team_id"]==self.my_team_id]
+        _sw_marks.append(("get_schedule", _time_sw.perf_counter()))
 
         self._tab.addTab(self._make_table(my_data, my_view=True),  "내 경기")
         self._tab.addTab(self._make_table(all_data, my_view=False), "전체 일정")
+        _sw_marks.append(("내경기+전체일정 테이블", _time_sw.perf_counter()))
 
         # 국제대회(본선) 탭
         intl_w = self._make_intl_tab("groups", qual=False)
@@ -252,16 +291,19 @@ class ScheduleWindow(QDialog):
         intl_ko = self._make_intl_tab("ko", qual=False)
         if intl_ko:
             self._tab.addTab(intl_ko, "🌍 국제대회(본선)")
+        _sw_marks.append(("국제대회 본선", _time_sw.perf_counter()))
 
         # 국제대회(예선) 탭
         qual_w = self._make_intl_tab("groups", qual=True)
         if qual_w:
             self._tab.addTab(qual_w, "🌏 국제대회(예선)")
+        _sw_marks.append(("국제대회 예선", _time_sw.perf_counter()))
 
         # 국제대회(예선 플레이오프) 탭 — PO 경기가 생성된 시점부터 표시
         qual_po_w = self._make_intl_tab("qual_po", qual=True)
         if qual_po_w:
             self._tab.addTab(qual_po_w, "🌏 국제대회(예선 플레이오프)")
+        _sw_marks.append(("국제대회 예선PO", _time_sw.perf_counter()))
 
         # 챔피언스리그 탭
         champs_w = self._make_champions_tab("groups")
@@ -270,6 +312,7 @@ class ScheduleWindow(QDialog):
         champs_ko = self._make_champions_tab("ko")
         if champs_ko:
             self._tab.addTab(champs_ko, "🏆 챔피언스리그(본선)")
+        _sw_marks.append(("챔피언스리그", _time_sw.perf_counter()))
 
         # [2026-07 신설, 신민용 리포트: "클럽월드컵이 경기 일정에 안 뜬다"]
         cwc_w = self._make_cwc_tab()
@@ -278,11 +321,13 @@ class ScheduleWindow(QDialog):
         cwc_bracket_w = self._make_cwc_bracket_tab()
         if cwc_bracket_w:
             self._tab.addTab(cwc_bracket_w, "🌍 클럽 월드컵(본선)")
+        _sw_marks.append(("클럽월드컵", _time_sw.perf_counter()))
 
         # [2026-07 신설, 신민용 리포트: "경기 일정 창에 승강전 탭이 안 뜬다"]
         po_w = self._make_po_tab()
         if po_w:
             self._tab.addTab(po_w, "⚖ 승강 플레이오프")
+        _sw_marks.append(("승강PO", _time_sw.perf_counter()))
 
         # [2026-07 신설] 국내 컵대회 탭 — 예전엔 이 탭 자체가 없어서 컵
         # 경기가 로그에만 남고 일정 화면 어디에도 안 보였다.
@@ -295,12 +340,23 @@ class ScheduleWindow(QDialog):
         cup_all_w = self._make_cup_tab(my_view=False)
         if cup_all_w:
             self._tab.addTab(cup_all_w, "🎖️ 컵대회(전체 일정)")
+        _sw_marks.append(("컵대회", _time_sw.perf_counter()))
         # [2026-07 신설] 챔피언스리그·국제대회처럼 컵대회도 토너먼트
         # 대진표(브래킷)로 보여주는 탭 — 4강 이후 결승/3·4위전이 생기면서
         # 다른 대회들과 같은 방식으로 표시할 수 있게 됐다.
         cup_bracket_w = self._make_cup_bracket_tab()
         if cup_bracket_w:
             self._tab.addTab(cup_bracket_w, "🎖️ 컵대회(본선)")
+        _sw_marks.append(("컵대회 브래킷", _time_sw.perf_counter()))
+
+        _sw_total = _sw_marks[-1][1] - _sw_t0
+        if _sw_total >= 0.05:
+            _prev = _sw_t0
+            _parts = []
+            for _name, _t in _sw_marks:
+                _parts.append(f"{_name} {_t-_prev:.3f}s")
+                _prev = _t
+            print(f"[PERF-SCHED] _fill_tabs 총 {_sw_total:.3f}s — " + " | ".join(_parts))
 
         if 0 <= cur < self._tab.count():
             self._tab.setCurrentIndex(cur)
@@ -338,6 +394,17 @@ class ScheduleWindow(QDialog):
         from PyQt6.QtWidgets import QScrollArea, QFrame
         p   = get_player()
         nat = intl_engine._my_nat(t, p)
+
+        # [2026-08 계측 추가, 신민용 리포트: "43→44주, 44→45주도 렉걸리네"]
+        # [PERF-SCHED] 로그에서 국제대회 탭이 0.9초까지 튀는 게 확인돼서
+        # (국제대회 기간=43주 이후와 시점이 겹침), DB조회/그룹순위계산/
+        # 위젯렌더링 중 어느 게 무거운지 원인 확정 전이므로 로직은 그대로
+        # 두고 시간만 찍는다. 아래 그룹 순위 계산(intl_engine 호출)은 코드상
+        # "조별 순위표"용과 "3위 팀 순위표"용 두 곳에서 같은 그룹을 두 번
+        # 계산하고 있어 — 이것도 실제로 무거우면 캐싱 여지가 있다.
+        import time as _time_it
+        _it_t0 = _time_it.perf_counter()
+        _it_standings_calc = 0.0
 
         outer = QScrollArea(); outer.setWidgetResizable(True)
         outer.setStyleSheet("QScrollArea{border:none;background:#1e1e1e;}")
@@ -401,6 +468,7 @@ class ScheduleWindow(QDialog):
             "SELECT country, flag FROM intl_entries WHERE tournament_id=?",
             (t["id"],)).fetchall()}
         conn.close()
+        _it_t_dbdone = _time_it.perf_counter()
 
         if mode == "ko" and not ko_rows:
             return None
@@ -429,13 +497,21 @@ class ScheduleWindow(QDialog):
             lbl_g.setStyleSheet("color:#00cc44;font-weight:bold;font-size:12px;")
             lay.addWidget(lbl_g)
 
+            # [2026-08 최적화, 신민용 리포트: "43→44→45주, 52→1주 렉 없애자"]
+            # 예전엔 이 아래 루프와 "3위 팀 순위표" 루프가 같은 그룹의 순위를
+            # 각각 따로 계산했다(그룹당 2번) — 결과는 똑같은데 계산만 중복.
+            # 여기서 한 번 계산해서 캐싱해두고 아래 3위 팀 루프에서 재사용한다.
+            _group_rows_cache = {}
             for g in groups:
+                _it_gs0 = _time_it.perf_counter()
                 if _is_qual:
                     rows = intl_engine._qual_group_standings(t["id"], g)
                     for r in rows:
                         r.setdefault("w", 0); r.setdefault("d", 0); r.setdefault("l", 0)
                 else:
                     rows = intl_engine.get_group_standings(t["id"], g)
+                _it_standings_calc += _time_it.perf_counter() - _it_gs0
+                _group_rows_cache[g] = rows
 
                 gt = QTableWidget(len(rows), 7)
                 gt.setHorizontalHeaderLabels([f"{g}조", "경기", "승", "무", "패", "득실", "승점"])
@@ -443,7 +519,13 @@ class ScheduleWindow(QDialog):
                 gt.verticalHeader().setVisible(False)
                 gt.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
                 gt.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-                gt.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+                # [2026-08 최적화, 신민용 리포트: "43→44→45주, 52→1주 렉
+                # 없애자"] ResizeToContents 모드를 행 채우기 "전"에 걸어두면
+                # setItem() 호출마다(조당 최대 수십 회) Qt가 전체 컬럼 폭을
+                # 매번 다시 계산한다 — 아래에서 행을 다 채운 뒤 어차피
+                # resizeColumnsToContents()를 명시적으로 한 번 더 부르므로,
+                # 모드 적용을 그 뒤로 옮겨서 이 반복 재계산을 없앤다. 최종
+                # 컬럼 폭·화면은 완전히 동일하다.
                 # [2026-07 버그수정, 신민용 리포트: "이름이 너무 길어서
                 # 잘리는 경우가 있는데 이름 크기만큼 창이 늘어나서 다
                 # 보이게 하고 싶다"] 0번 컬럼(국가명)이 Stretch라 left_widget
@@ -483,6 +565,7 @@ class ScheduleWindow(QDialog):
                         gt.setItem(i, j, item)
 
                 gt.setFixedHeight(gt.verticalHeader().defaultSectionSize() * len(rows) + 28)
+                gt.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
                 gt.resizeColumnsToContents()
                 _need_w = sum(gt.columnWidth(j) for j in range(gt.columnCount())) + 24
                 gt.setMinimumWidth(_need_w)
@@ -495,12 +578,16 @@ class ScheduleWindow(QDialog):
             if has_thirds:
                 third_rows = []
                 for g in groups:
-                    if _is_qual:
-                        rows = intl_engine._qual_group_standings(t["id"], g)
-                        for r in rows:
-                            r.setdefault("w", 0); r.setdefault("d", 0); r.setdefault("l", 0)
-                    else:
-                        rows = intl_engine.get_group_standings(t["id"], g)
+                    rows = _group_rows_cache.get(g)
+                    if rows is None:
+                        _it_gs0b = _time_it.perf_counter()
+                        if _is_qual:
+                            rows = intl_engine._qual_group_standings(t["id"], g)
+                            for r in rows:
+                                r.setdefault("w", 0); r.setdefault("d", 0); r.setdefault("l", 0)
+                        else:
+                            rows = intl_engine.get_group_standings(t["id"], g)
+                        _it_standings_calc += _time_it.perf_counter() - _it_gs0b
                     if len(rows) >= 3:
                         r3 = dict(rows[2])
                         r3["grp"] = g
@@ -685,6 +772,12 @@ class ScheduleWindow(QDialog):
 
         lay.addStretch()
         outer.setWidget(body)
+        _it_total = _time_it.perf_counter() - _it_t0
+        if _it_total >= 0.05:
+            print(f"[PERF-INTLTAB] _make_intl_tab(mode={mode}, qual={qual}) 총 "
+                  f"{_it_total:.3f}s — DB조회 {_it_t_dbdone-_it_t0:.3f}s | "
+                  f"그룹순위계산누적({len(groups)}개조×2회) {_it_standings_calc:.3f}s | "
+                  f"나머지(위젯렌더링) {_it_total-(_it_t_dbdone-_it_t0)-_it_standings_calc:.3f}s")
         return outer
 
     # ── 챔피언스리그 탭 ──────────────────────────
@@ -1546,14 +1639,20 @@ class ScheduleWindow(QDialog):
         tbl.setHorizontalHeaderLabels(cols)
         tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         tbl.verticalHeader().setVisible(False)
-        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        tbl.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         tbl.setStyleSheet("""
             QTableWidget{background:#1e1e1e;color:#ccc;gridline-color:#2a2a2a;border:none;}
             QHeaderView::section{background:#252525;color:#888;border:none;padding:4px;}
         """)
+
+        # [2026-08 최적화, 신민용 리포트: "43→44→45주, 52→1주 렉 없애자"]
+        # 예전엔 이 아래 for문 안에서 매 행마다 `from constants import ...`
+        # (그리고 심지어 get_state는 game_engine에서 또)를 실행하고 있었다 —
+        # "전체 일정" 탭은 리그 시즌 전체 경기(수백 건)를 담으므로 행마다
+        # import 문을 도는 오버헤드가 그대로 쌓였다. get_state는 이미 이
+        # 파일 맨 위에서 import돼 있어 그대로 재사용하면 되고, constants
+        # 쪽 3개만 루프 밖으로 한 번만 꺼내둔다. 결과는 완전히 동일하다.
+        from constants import day_to_full_date_str, day_to_week, DAYS_PER_WEEK
 
         for i, r in enumerate(data):
             hs  = r["home_score"]; as_ = r["away_score"]
@@ -1580,13 +1679,11 @@ class ScheduleWindow(QDialog):
             else:
                 row_color = QColor("#aaaaaa")
 
-            from constants import day_to_full_date_str, day_to_week, DAYS_PER_WEEK
             _day = r["day"] if r["day"] else (r["week"] - 1) * DAYS_PER_WEEK + 1
             if r["year"]:
                 _base_year = r["year"]
             else:
-                from game_engine import get_state as _gs
-                _st = _gs()
+                _st = get_state()
                 _base_year = _st["current_year"] if _st else 2000
             vals = [day_to_full_date_str(_base_year, _day), r.get("home_name",""), score,
                     r.get("away_name",""), col_wdl]
@@ -1600,6 +1697,14 @@ class ScheduleWindow(QDialog):
                     item.setForeground(row_color)
                 tbl.setItem(i, j, item)
 
+        # [2026-08 최적화, 신민용 리포트: "43→44→45주, 52→1주 렉 없애자"]
+        # ResizeToContents 모드를 행 채우기 "전"에 걸어두면 setItem() 호출
+        # (전체 일정이면 시즌 전체 경기 수만큼, 수백 회)마다 Qt가 컬럼 폭을
+        # 매번 다시 계산했다 — 행을 다 채운 뒤 모드를 적용하면 Qt가 그
+        # 시점에 한 번만 계산해서 최종 폭·화면은 완전히 동일하다.
+        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        tbl.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         lay.addWidget(tbl)
 
         tbl.resizeColumnsToContents()

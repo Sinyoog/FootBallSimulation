@@ -254,7 +254,23 @@ def _finalize_boundary_match(conn, t, m, year: int) -> None:
 
 def process_po_week(week: int, day=None) -> None:
     """intl_engine.process_intl_week와 동일한 멱등 패턴 — 매일 호출해도
-    안전하며, 그날까지 온 미완료 경기만 처리한다."""
+    안전하며, 그날까지 온 미완료 경기만 처리한다.
+
+    [2026-08 최적화, 신민용 리포트: "43~44주 매일 1.4~1.7초씩 걸린다" —
+    [PERF-DAILYHOOK]/[PERF-PO]로 확인됨] 활성 po_tournaments가 실측
+    400~450개대(전 세계 승강 경계 수만큼)나 됐다 — 예전엔 토너먼트
+    "하나마다" SELECT를 5번씩(due조회/by_key재구성/boundary조회/카운트
+    2번) 날려서 하루에 2000개 넘는 쿼리가 나갔다. 1차로 commit()만
+    배치했지만(4×N회→1회) 여전히 느렸던 이유가 바로 이 쿼리 개수였다.
+
+    토너먼트끼리는 서로 다른 나라/부수 경계에 묶인 완전히 독립된
+    팀 집합이라(같은 팀이 두 토너먼트에 동시에 걸릴 일이 없음), "토너먼트
+    하나씩 전부 처리 후 다음 토너먼트로" 순서를 "모든 토너먼트의 1단계를
+    먼저 끝내고 → 모든 토너먼트의 2단계 → ..."로 바꿔도 결과가 완전히
+    동일하다 — 그 덕에 각 단계를 tournament_id IN (...) 하나의 쿼리로
+    전체 토너먼트에 대해 한 번에 처리할 수 있다. 쿼리 개수가 활성
+    토너먼트 수(400+)에서 상수(약 5개)로 줄어든다. 판정 로직·처리
+    순서·최종 결과는 원본과 완전히 동일하다."""
     from database import get_conn
     from game_engine import get_state
 
@@ -262,73 +278,108 @@ def process_po_week(week: int, day=None) -> None:
     year = st["current_year"] if st else 0
     conn = get_conn()
 
+    import time as _time_po
+    _po_t0 = _time_po.perf_counter()
+
     tournaments = conn.execute(
         "SELECT * FROM po_tournaments WHERE year=? AND status!='done'", (year,)).fetchall()
-    for t in tournaments:
-        if day is not None:
-            due = conn.execute(
-                """SELECT * FROM po_matches WHERE tournament_id=? AND home_score=-1
-                   AND home_team_id!=0 AND away_team_id!=0 AND day<=?""",
-                (t["id"], day)).fetchall()
-        else:
-            due = conn.execute(
-                """SELECT * FROM po_matches WHERE tournament_id=? AND home_score=-1
-                   AND home_team_id!=0 AND away_team_id!=0""",
-                (t["id"],)).fetchall()
-        for m in due:
-            _sim_one(conn, dict(m))
-        conn.commit()
+    if not tournaments:
+        conn.close()
+        return
 
-        # 방금 끝난 경기들의 승자를, 그걸 참조하는 다음 match의 placeholder(0)에 채운다.
+    t_ids = [t["id"] for t in tournaments]
+    t_by_id = {t["id"]: t for t in tournaments}
+    ph = ",".join("?" * len(t_ids))
+
+    # 1) 오늘까지 도래한 미완료 경기 — 전체 활성 토너먼트를 한 번에 조회
+    if day is not None:
+        due_rows = conn.execute(
+            f"""SELECT * FROM po_matches WHERE tournament_id IN ({ph})
+                AND home_score=-1 AND home_team_id!=0 AND away_team_id!=0 AND day<=?""",
+            (*t_ids, day)).fetchall()
+    else:
+        due_rows = conn.execute(
+            f"""SELECT * FROM po_matches WHERE tournament_id IN ({ph})
+                AND home_score=-1 AND home_team_id!=0 AND away_team_id!=0""",
+            t_ids).fetchall()
+    for m in due_rows:
+        _sim_one(conn, dict(m))
+
+    # 2) 방금 끝난 경기들의 승자를 다음 match의 placeholder(0)에 채운다 —
+    #    전체 토너먼트의 po_matches를 한 번에 조회해서(방금 시뮬 결과까지
+    #    반영됨) 토너먼트별로 묶은 뒤 메모리에서 처리한다.
+    all_matches = conn.execute(
+        f"SELECT * FROM po_matches WHERE tournament_id IN ({ph})", t_ids).fetchall()
+    matches_by_tid: dict = {}
+    for r in all_matches:
+        matches_by_tid.setdefault(r["tournament_id"], []).append(dict(r))
+
+    for tid, rows in matches_by_tid.items():
+        t = t_by_id.get(tid)
+        if not t:
+            continue
         rule = pp.PLAYOFF_RULES.get(t["rule_id"])
-        if rule:
-            by_key = {r["match_key"]: dict(r) for r in
-                      conn.execute("SELECT * FROM po_matches WHERE tournament_id=?", (t["id"],)).fetchall()}
-            for m_def in rule["matches"]:
-                mid = m_def["id"]
-                cur = by_key.get(mid)
-                if not cur:
+        if not rule:
+            continue
+        by_key = {r["match_key"]: r for r in rows}
+        for m_def in rule["matches"]:
+            mid = m_def["id"]
+            cur = by_key.get(mid)
+            if not cur:
+                continue
+            changed = {}
+            for field in ("home", "away"):
+                src = m_def[field]
+                if src["type"] != "winner":
                     continue
-                changed = {}
-                for field in ("home", "away"):
-                    src = m_def[field]
-                    if src["type"] != "winner":
-                        continue
-                    ref = by_key.get(src["match"])
-                    if not ref or ref["home_score"] == -1:
-                        continue   # 참조 대상이 아직 안 끝남
-                    col = "home_team_id" if field == "home" else "away_team_id"
-                    if cur[col] == 0:
-                        changed[col] = _winner_of(ref)
-                if changed:
-                    sets = ",".join(f"{k}=?" for k in changed)
-                    conn.execute(f"UPDATE po_matches SET {sets} WHERE id=?",
-                                 (*changed.values(), cur["id"]))
-            conn.commit()
+                ref = by_key.get(src["match"])
+                if not ref or ref["home_score"] == -1:
+                    continue   # 참조 대상이 아직 안 끝남
+                col = "home_team_id" if field == "home" else "away_team_id"
+                if cur[col] == 0:
+                    changed[col] = _winner_of(ref)
+            if changed:
+                sets = ",".join(f"{k}=?" for k in changed)
+                conn.execute(f"UPDATE po_matches SET {sets} WHERE id=?",
+                             (*changed.values(), cur["id"]))
 
-        # boundary match가 끝났으면 즉시 승강 확정. finalized 컬럼으로
-        # 같은 match를 두 번 확정하지 않게 막는다(체인형 룰이면 boundary
-        # match들이 서로 다른 날 끝날 수 있어서, 다음날 다시 호출됐을 때
-        # 이미 끝난 것까지 재확정하면 리그 이동/로그가 중복된다).
-        boundary_rows = conn.execute(
-            """SELECT * FROM po_matches WHERE tournament_id=? AND is_boundary=1
-               AND home_score!=-1 AND finalized=0""", (t["id"],)).fetchall()
-        for m in boundary_rows:
-            _finalize_boundary_match(conn, t, dict(m), year)
-            conn.execute("UPDATE po_matches SET finalized=1 WHERE id=?", (m["id"],))
-        conn.commit()
+    # 3) boundary(승강 결정) match가 끝났으면 즉시 승강 확정 — placeholder가
+    #    막 채워져 "완료" 상태가 된 경기까지 반영하려면 2단계 이후 새로
+    #    조회해야 한다. finalized 컬럼으로 같은 match를 두 번 확정하지
+    #    않는다(체인형 룰이면 boundary match들이 서로 다른 날 끝날 수
+    #    있어서, 다음날 다시 호출됐을 때 이미 끝난 것까지 재확정하면
+    #    리그 이동/로그가 중복된다).
+    boundary_rows = conn.execute(
+        f"""SELECT * FROM po_matches WHERE tournament_id IN ({ph})
+            AND is_boundary=1 AND home_score!=-1 AND finalized=0""", t_ids).fetchall()
+    for m in boundary_rows:
+        t = t_by_id.get(m["tournament_id"])
+        if not t:
+            continue
+        _finalize_boundary_match(conn, t, dict(m), year)
+        conn.execute("UPDATE po_matches SET finalized=1 WHERE id=?", (m["id"],))
 
-        total_boundary = conn.execute(
-            "SELECT COUNT(*) n FROM po_matches WHERE tournament_id=? AND is_boundary=1",
-            (t["id"],)).fetchone()["n"]
-        done_boundary = conn.execute(
-            "SELECT COUNT(*) n FROM po_matches WHERE tournament_id=? AND is_boundary=1 AND finalized=1",
-            (t["id"],)).fetchone()["n"]
-        if total_boundary > 0 and done_boundary == total_boundary:
-            conn.execute("UPDATE po_tournaments SET status='done' WHERE id=?", (t["id"],))
-        conn.commit()
+    # 4) 토너먼트별 "boundary 전부 확정됐는지" — 그룹집계 쿼리 1번으로
+    #    전체 토너먼트를 한 번에 판정(예전엔 토너먼트마다 COUNT 2번씩).
+    status_rows = conn.execute(
+        f"""SELECT tournament_id,
+                   SUM(CASE WHEN is_boundary=1 THEN 1 ELSE 0 END) AS total,
+                   SUM(CASE WHEN is_boundary=1 AND finalized=1 THEN 1 ELSE 0 END) AS done
+            FROM po_matches WHERE tournament_id IN ({ph})
+            GROUP BY tournament_id""", t_ids).fetchall()
+    done_tids = [r["tournament_id"] for r in status_rows
+                 if r["total"] and r["total"] == r["done"]]
+    if done_tids:
+        conn.executemany(
+            "UPDATE po_tournaments SET status='done' WHERE id=?",
+            [(tid,) for tid in done_tids])
 
+    conn.commit()
     conn.close()
+    _po_total = _time_po.perf_counter() - _po_t0
+    if _po_total >= 0.05:
+        print(f"[PERF-PO]  process_po_week({week}주차, {len(tournaments)}개 활성토너먼트) "
+              f"{_po_total:.3f}s")
 
 
 # ─────────────────────────────────────────────

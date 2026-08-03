@@ -2284,12 +2284,28 @@ class CenterPanel(QWidget):
         if not p or not p.get("current_league_id"):
             show_toast(self, "⚠  소속 팀이 없습니다"); return
         from database import get_conn
+        from game_engine import _team_league_id_for_season
+        st = get_state()
         conn = get_conn()
-        row = conn.execute(
-            "SELECT l.id FROM teams t JOIN leagues l ON t.league_id=l.id WHERE t.id=?",
-            (p["current_team_id"],)).fetchone()
+        c = conn.cursor()
+        # [버그수정 2026-08, 신민용 리포트: "승강전에서 승급/강등되면 바로
+        # 반영되는거 같은데, 다음 연도 1주차에 반영돼야 하지 않나 — 경기
+        # 일정 다 사라지고 좌측에 정보 없음 뜨더라"] teams.league_id는
+        # 43주 승강 처리 즉시 새 리그를 가리키도록 바뀌는데(사이드바에
+        # 승격/강등을 바로 보여주려는 의도적 설계), 44~52주 국제대회
+        # 기간엔 아직 "이번 시즌"이 진행 중이라 실제 경기는 전부 옛
+        # 리그에 남아있다 — 그 상태로 새 리그+이번 시즌을 조회하면 내
+        # 팀이 없는 리그를 보게 돼 순위표가 텅 비거나 "정보 없음"이 뜬다.
+        # career_entries와 동일하게 _team_league_id_for_season으로 이번
+        # 시즌에 실제로 뛴 리그를 먼저 찾고, 없으면(막 이적 직후 등)
+        # 지금 소속 리그로 폴백한다.
+        lid = _team_league_id_for_season(c, p["current_team_id"], st["current_season"])
+        if lid is None:
+            row = c.execute(
+                "SELECT l.id FROM teams t JOIN leagues l ON t.league_id=l.id WHERE t.id=?",
+                (p["current_team_id"],)).fetchone()
+            lid = row["id"] if row else p["current_league_id"]
         conn.close()
-        lid = row["id"] if row else p["current_league_id"]
         from ui.standings_window import StandingsWindow
         self._standings_win = StandingsWindow(lid, p.get("current_team_id", 0),
                                               p.get("language", "ko"), self)
@@ -2306,12 +2322,23 @@ class CenterPanel(QWidget):
         if not p or not p.get("current_league_id"):
             show_toast(self, "⚠  소속 팀이 없습니다"); return
         from database import get_conn
+        from game_engine import _team_league_id_for_season
         conn = get_conn()
-        row = conn.execute(
-            "SELECT l.id FROM teams t JOIN leagues l ON t.league_id=l.id WHERE t.id=?",
-            (p["current_team_id"],)).fetchone()
+        c = conn.cursor()
+        # [버그수정 2026-08, 신민용 리포트: "승강전에서 승급/강등되면 바로
+        # 반영되는거 같은데, 다음 연도 1주차에 반영돼야 하지 않나 — 경기
+        # 일정 다 사라지고 좌측에 정보 없음 뜨더라"] _do_standings와 동일한
+        # 원인 — teams.league_id는 43주 승강 처리 즉시 새 리그를 가리키게
+        # 바뀌지만, 44~52주 국제대회 기간엔 이번 시즌 실제 경기가 전부
+        # 옛 리그에 남아있다. 그 상태로 새 리그+이번 시즌을 조회하면
+        # get_schedule()이 빈 결과를 반환해 일정이 통째로 사라져 보인다.
+        lid = _team_league_id_for_season(c, p["current_team_id"], st["current_season"])
+        if lid is None:
+            row = c.execute(
+                "SELECT l.id FROM teams t JOIN leagues l ON t.league_id=l.id WHERE t.id=?",
+                (p["current_team_id"],)).fetchone()
+            lid = row["id"] if row else p["current_league_id"]
         conn.close()
-        lid = row["id"] if row else p["current_league_id"]
         from ui.schedule_window import ScheduleWindow
         self._schedule_win = ScheduleWindow(lid, p.get("current_team_id", 0),
                                             st["current_season"], p.get("language", "ko"), self)

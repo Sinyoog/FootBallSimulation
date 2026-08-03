@@ -378,8 +378,15 @@ class MainWindow(QMainWindow):
         # [최적화] 인메모리 라이브 DB를 쓰는 경우, 앱 종료 시 마지막으로
         # 한 번 더 game.db에 백업해서 마지막 자동저장(4주 주기) 이후 진행분이
         # 유실되지 않게 한다.
+        # [2026-08 수정, 신민용 리포트: "진행 버튼 누를 때 4주마다 멈춘다"]
+        # 게임 진행 중 자동저장을 백그라운드 스레드(flush_to_disk_async)로
+        # 옮기면서, 앱을 닫는 바로 그 순간 그 백그라운드 백업이 아직 안
+        # 끝났을 수 있다 — 같은 임시파일(game.db.tmp)에 두 저장이 동시에
+        # 접근하는 걸 막기 위해, 먼저 진행 중인 백업을 기다린 뒤 마지막
+        # 동기 저장을 한 번 더 실행해 최신 상태를 확실히 남긴다.
         try:
-            from database import flush_to_disk
+            from database import flush_to_disk, wait_for_pending_flush
+            wait_for_pending_flush()
             flush_to_disk()
         except Exception:
             pass

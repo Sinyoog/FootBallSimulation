@@ -315,6 +315,53 @@ def flush_to_disk():
         src_snapshot.close()
     os.replace(tmp_path, DB_PATH)
 
+
+# [2026-08 신설, 신민용 리포트: "진행 버튼 누를 때 4주마다 한 번씩 0.7~1초
+# 멈춘다"] [PERF-DAY] 계측으로 확인됨 — flush_to_disk()는 전체 DB를
+# 디스크에 backup하는 진짜 I/O라서, 게임 진행 흐름(advance_days) 안에서
+# 동기로 부르면 그 시간만큼 화면이 그대로 멈춘다. 위 docstring에도
+# 적혀있듯 이 백업은 이미 게임 진행용 풀 커넥션(_pool_conn)과 완전히
+# 분리된 별도 스냅샷 커넥션만 건드리도록 설계돼 있다 — 그래서 백그라운드
+# 스레드에서 돌려도 게임 진행 커넥션과 절대 충돌하지 않는다. 저장
+# 자체(내용·주기·안전성)는 완전히 동일하게 유지하고, "어느 스레드에서
+# 도느냐"만 바꾼다.
+_flush_thread: "threading.Thread | None" = None
+_flush_thread_lock = threading.Lock()
+
+
+def flush_to_disk_async():
+    """flush_to_disk()를 백그라운드 스레드에서 실행 — 게임 진행(advance_days)
+    중 주기적 자동저장에 쓴다. 이미 백업이 진행 중이면(정상적으로는 겹칠
+    일이 거의 없지만 안전하게) 이번 호출은 조용히 건너뛴다 — 다음
+    자동저장 주기(몇 주 뒤)에 다시 시도되고, 앱 종료 시 closeEvent가
+    항상 wait_for_pending_flush() + 동기 flush_to_disk()로 최종 저장을
+    보장하므로 데이터 유실은 없다."""
+    global _flush_thread
+    if not USE_MEMORY_DB:
+        return
+    with _flush_thread_lock:
+        if _flush_thread is not None and _flush_thread.is_alive():
+            return  # 이미 진행 중 — 건너뜀
+        def _worker():
+            try:
+                flush_to_disk()
+            except Exception:
+                pass
+        _flush_thread = threading.Thread(target=_worker, daemon=True,
+                                         name="flush_to_disk_async")
+        _flush_thread.start()
+
+
+def wait_for_pending_flush(timeout=10):
+    """[2026-08 신설] 앱 종료 등 '저장이 반드시 끝나야 하는' 시점에 호출 —
+    진행 중인 비동기 백업 스레드가 있으면 끝날 때까지 기다린다. 이후
+    호출부가 마지막으로 동기 flush_to_disk()를 한 번 더 부르면, 그 사이
+    바뀐 최신 상태까지 확실히 저장된다."""
+    global _flush_thread
+    t = _flush_thread
+    if t is not None and t.is_alive():
+        t.join(timeout=timeout)
+
 # ─── 스키마 ───────────────────────────────────────────────────
 def init_db():
     from constants import GAME_START_YEAR, PLAYER_START_AGE

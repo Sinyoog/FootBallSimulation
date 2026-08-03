@@ -15,10 +15,11 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QLineEdit,
     QListWidget, QListWidgetItem, QTableWidget, QTableWidgetItem,
     QHeaderView, QPushButton, QTabWidget, QWidget, QSplitter, QFrame,
-    QAbstractItemView, QScrollArea, QGridLayout, QSizePolicy
+    QAbstractItemView, QScrollArea, QGridLayout, QSizePolicy,
+    QStyledItemDelegate, QStyle
 )
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication
+from PyQt6.QtCore import Qt, QTimer, QRect, QSize
+from PyQt6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter
 
 import world_browser as wb
 
@@ -91,6 +92,118 @@ QPushButton#closeBtn:hover { background:#383838; }
 
 _ALL = "전체"
 
+# [2026-08 신설, 신민용 리포트: "세계기록실 여전히 잠깐 멈추는 느낌"]
+# offer_window.py의 등급 팔레트(#grade_SS 등, 위 STYLE과 동일한 값)를
+# 델리게이트 paint()에서 그대로 쓰기 위해 하드코딩 — QSS 셀렉터 색상과
+# 반드시 일치해야 하므로 값을 바꿀 땐 위 STYLE 블록도 같이 바꿀 것.
+_GRADE_COLORS = {
+    "SS": "#ff4488", "S": "#ff9900", "A": "#ffcc00", "B": "#00ccff",
+    "C": "#00ff66", "D": "#888888", "E": "#888888", "F": "#888888",
+}
+
+
+class _GridRowDelegate(QStyledItemDelegate):
+    """[2026-08 신설, 신민용 리포트: "세계기록실 여전히 잠깐 멈추는 느낌"]
+    리그/팀/컵대회 검색 리스트는 행마다 실제 QWidget(+QHBoxLayout+QLabel
+    여러 개)을 만들어 setItemWidget()으로 꽂는 방식이었다 — 실측 결과
+    이 embed 비용 자체가 위젯 내부 복잡도와 무관하게 행당 ~0.55ms로
+    고정이었다(300줄=0.15~0.2s). 폰트캐싱/N+1제거/setUpdatesEnabled/
+    배치지연을 전부 시도했지만 이 비용 자체는 줄지 않았다 — 유일한
+    실질적 해법은 QWidget을 아예 안 만드는 것.
+
+    실제 자식 위젯을 만드는 대신, 각 QListWidgetItem에 "칸 스펙"(텍스트/
+    폭/색상/굵기/정렬 리스트, _SPEC_ROLE)만 데이터로 저장해두고, 이
+    델리게이트가 paint()에서 QPainter로 직접 그린다 — 진짜 위젯이 하나도
+    안 생기므로 setItemWidget() 비용이 원천적으로 없다.
+
+    [위험 관리] 기존 _league_row_widget/_team_row_widget/
+    _cup_country_row_widget(실제 QWidget 버전)는 지우지 않고 그대로
+    남겨뒀다 — 이 delegate를 리스트에서 setItemDelegate()로 빼기만 하면
+    바로 예전 방식(위젯 기반)으로 되돌릴 수 있다.
+
+    마진(10,6,16,6)·칸 간격(10)·칸 폭·폰트 크기는 기존 _col_label/
+    _grade_chip과 동일한 값을 그대로 써서 시각적으로 똑같이 맞췄다.
+    등급 색상은 이 파일 상단 STYLE(#grade_SS 등)과 정확히 일치하는
+    _GRADE_COLORS를 쓴다."""
+    _SPEC_ROLE = Qt.ItemDataRole.UserRole + 2
+    _LEFT_MARGIN = 10
+    _RIGHT_MARGIN = 16
+    _SPACING = 10
+    _V_MARGIN = 6
+
+    def __init__(self, font_cache_owner, parent=None):
+        super().__init__(parent)
+        self._owner = font_cache_owner  # _col_label과 폰트 캐시 공유
+
+    def _font_metrics(self, size, bold):
+        """_col_label과 완전히 동일한 (size,bold)별 QFont/QFontMetrics 캐시를
+        공유한다 — 위젯 기반 경로와 델리게이트 경로가 같은 폰트를 쓴다."""
+        cache = getattr(self._owner, "_col_label_font_cache", None)
+        if cache is None:
+            cache = self._owner._col_label_font_cache = {}
+        key = (size, bold)
+        cached = cache.get(key)
+        if cached is None:
+            font = QFont()
+            font.setPixelSize(size)
+            font.setBold(bold)
+            fm = QFontMetrics(font)
+            cache[key] = (font, fm)
+            return font, fm
+        return cached
+
+    def paint(self, painter, option, index):
+        spec = index.data(self._SPEC_ROLE)
+        if not spec:
+            super().paint(painter, option, index)
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = option.rect
+        if option.state & QStyle.StateFlag.State_Selected:
+            painter.fillRect(rect, option.palette.highlight())
+        x = rect.left() + self._LEFT_MARGIN
+        for col in spec:
+            text = col.get("text", "")
+            width = col.get("width", 60)
+            color = col.get("color", "#ccc")
+            size = col.get("size", 12)
+            bold = col.get("bold", False)
+            align = col.get("align", Qt.AlignmentFlag.AlignLeft)
+            bg = col.get("bg")
+            font, fm = self._font_metrics(size, bold)
+            if bg:
+                # [배지형 칸] 컵대회 검색의 "기록 있음/없음" 배지 재현 —
+                # 원본은 QLabel 스타일시트로 background+border-radius+
+                # padding을 줬다(color/font-size/background/border-radius:
+                # 3px/padding:2px 5px). QPainter로 같은 모양을 직접 그린다.
+                pad_h = fm.height() + 4
+                badge_rect = QRect(x, rect.top() + (rect.height() - pad_h) // 2,
+                                   width, pad_h)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(bg))
+                painter.drawRoundedRect(badge_rect, 3, 3)
+            painter.setPen(QColor(color))
+            painter.setFont(font)
+            col_rect = QRect(x, rect.top(), width, rect.height())
+            elided = fm.elidedText(str(text), Qt.TextElideMode.ElideRight, width - 6)
+            painter.drawText(col_rect, int(align) | int(Qt.AlignmentFlag.AlignVCenter), elided)
+            x += width + self._SPACING
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        spec = index.data(self._SPEC_ROLE)
+        if not spec:
+            return super().sizeHint(option, index)
+        total_w = self._LEFT_MARGIN + self._RIGHT_MARGIN
+        max_h = 0
+        for col in spec:
+            total_w += col.get("width", 60) + self._SPACING
+            _, fm = self._font_metrics(col.get("size", 12), col.get("bold", False))
+            max_h = max(max_h, fm.height())
+        total_w -= self._SPACING  # 마지막 칸 뒤엔 spacing 없음(addStretch 자리)
+        return QSize(total_w, max_h + self._V_MARGIN * 2)
+
 
 class WorldBrowserWindow(QDialog):
     def __init__(self, parent=None):
@@ -123,13 +236,37 @@ class WorldBrowserWindow(QDialog):
         tabs = QTabWidget()
         lay.addWidget(tabs, 1)
 
+        # [2026-08 계측 추가, 신민용 리포트: "세계기록실도 클릭할 때 렉있어"]
+        # 경기일정 창과 동일한 구조(탭 여러 개를 __init__에서 전부 동기로
+        # 그린 뒤에야 창이 뜸) — 어느 탭이 무거운지 원인 확정 전이므로
+        # 로직은 그대로 두고 구간별 시간만 찍는다.
+        import time as _time_wb
+        _wb_t0 = _time_wb.perf_counter()
+        _wb_marks = []
+
         tabs.addTab(self._build_league_tab(), "🔍 리그 검색")
+        _wb_marks.append(("리그검색", _time_wb.perf_counter()))
         tabs.addTab(self._build_team_tab(), "🏟 팀 검색")
+        _wb_marks.append(("팀검색", _time_wb.perf_counter()))
         tabs.addTab(self._build_cup_tab(), "🎖 컵대회 검색")
+        _wb_marks.append(("컵대회검색", _time_wb.perf_counter()))
         tabs.addTab(self._build_cl_tab(), "🏆 역대 챔피언스리그")
+        _wb_marks.append(("역대챔스", _time_wb.perf_counter()))
         tabs.addTab(self._build_cwc_tab(), "🌍 역대 클럽 월드컵")
+        _wb_marks.append(("역대CWC", _time_wb.perf_counter()))
         tabs.addTab(self._build_wc_tab(), "🌐 역대 월드컵")
+        _wb_marks.append(("역대월드컵", _time_wb.perf_counter()))
         tabs.addTab(self._build_nc_tab(), "🎖 역대 네이션스컵")
+        _wb_marks.append(("역대네이션스컵", _time_wb.perf_counter()))
+
+        _wb_total = _wb_marks[-1][1] - _wb_t0
+        if _wb_total >= 0.05:
+            _prev = _wb_t0
+            _parts = []
+            for _name, _t in _wb_marks:
+                _parts.append(f"{_name} {_t-_prev:.3f}s")
+                _prev = _t
+            print(f"[PERF-WORLD] WorldBrowserWindow 생성 총 {_wb_total:.3f}s — " + " | ".join(_parts))
 
         close_btn = QPushButton("닫기")
         close_btn.setObjectName("closeBtn")
@@ -180,13 +317,29 @@ class WorldBrowserWindow(QDialog):
         —내용 길이와 무관하게— 같은 정보가 항상 같은 x좌표에 오도록 만든다
         (매 줄이 별개의 QWidget/QHBoxLayout이라도, 각 칸 폭이 똑같으면
         전체 목록이 표처럼 정렬되어 보인다). 텍스트가 칸보다 길면 끝을
-        "…"으로 줄이고, 잘린 원문은 툴팁으로 확인 가능하게 남긴다."""
+        "…"으로 줄이고, 잘린 원문은 툴팁으로 확인 가능하게 남긴다.
+
+        [2026-08 최적화, 신민용 리포트: "세계기록실도 클릭할 때 렉있어"]
+        리그/팀 검색은 한 번에 최대 300줄, 줄마다 이 함수가 3~4번씩
+        불려서 열 때마다 900~1200번 호출된다. (size,bold) 조합은 실제로
+        몇 종류뿐인데 그때마다 QFont+QFontMetrics를 새로 만들고 있었다 —
+        인스턴스에 (size,bold)별로 캐싱해서 재사용한다. 표시 결과(폰트,
+        elide, 툴팁)는 완전히 동일하다."""
         lbl = QLabel()
-        font = QFont()
-        font.setPixelSize(size)
-        font.setBold(bold)
+        _cache = getattr(self, "_col_label_font_cache", None)
+        if _cache is None:
+            _cache = self._col_label_font_cache = {}
+        _key = (size, bold)
+        _cached = _cache.get(_key)
+        if _cached is None:
+            font = QFont()
+            font.setPixelSize(size)
+            font.setBold(bold)
+            fm = QFontMetrics(font)
+            _cache[_key] = (font, fm)
+        else:
+            font, fm = _cached
         lbl.setFont(font)
-        fm = QFontMetrics(font)
         elided = fm.elidedText(str(text), Qt.TextElideMode.ElideRight, width - 6)
         lbl.setText(elided)
         tip = str(text) if elided != str(text) else None
@@ -314,6 +467,9 @@ class WorldBrowserWindow(QDialog):
         self.league_list = QListWidget()
         self.league_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.league_list.itemClicked.connect(self._on_league_selected)
+        # [2026-08 신설] QWidget 대신 paint()로 행을 그리는 델리게이트 —
+        # setItemDelegate(None)으로 되돌리면 예전 위젯 기반 방식으로 복귀.
+        self.league_list.setItemDelegate(_GridRowDelegate(self, self.league_list))
         league_header = self._list_header_row([
             ("리그명", self._NAME_COL_W, False),
             ("", 16, False),   # 🔎 매칭 표시 칸 자리(라벨 없음, row와 폭만 맞춤)
@@ -506,31 +662,113 @@ class WorldBrowserWindow(QDialog):
         pass
 
     def _refresh_league_list(self, *_a):
+        # [2026-08 계측 추가, 신민용 리포트: "폰트캐싱/N+1 고쳤는데도
+        # 리그검색이 그대로 0.25s"] 추측성 최적화가 안 먹혔으니 DB조회 vs
+        # 위젯 생성 루프 중 진짜 어느 쪽이 무거운지 직접 나눠서 찍는다.
+        import time as _time_wl
+        _wl_t0 = _time_wl.perf_counter()
         cont = None if self.cont_combo.currentText() == _ALL else self.cont_combo.currentText()
         cid = self._selected_country_id()
         grade = None if self.grade_combo.currentText() == _ALL else self.grade_combo.currentText()
         q = self.search_box.text().strip() or None
         leagues = wb.search_leagues(continent=cont, country_id=cid, name_query=q, grade=grade)
+        _wl_t1 = _time_wl.perf_counter()
 
         self.league_list.clear()
         # 검색 결과가 너무 많으면(대륙 전체 등) UI가 무거워지므로 상한을 둔다.
         #   (DB 조회 자체는 이미 다 끝난 뒤 리스트 위젯에 채우는 단계만 자름)
         MAX_SHOW = 300
+
+        # [2026-08 재작성] _GridRowDelegate 도입으로 위젯 embed 비용이
+        # 사라져서, 배치 지연 없이 다시 단순한 동기 루프로 충분히 빠르다
+        # (실측: 배치분할해도 다른 창 타이머와 경쟁하면 오히려 더 오래
+        # 걸리고 화면이 잠깐 텅 비어 보이는 부작용이 있었음 — 신민용
+        # 확인). 위젯 생성 대신 "칸 스펙"(텍스트/폭/색상)만 item에 데이터로
+        # 저장해두면 델리게이트가 그린다.
         for lg in leagues[:MAX_SHOW]:
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, lg["id"])
             item.setData(Qt.ItemDataRole.UserRole + 1,
                         f"{lg['flag']} {lg['country']} · {lg['name']} ({lg['tier']}부)")
-            row_widget = self._league_row_widget(lg)
-            item.setSizeHint(row_widget.sizeHint())
+            item.setData(_GridRowDelegate._SPEC_ROLE, self._league_row_spec(lg))
+            matched_team = lg.get("matched_team")
+            if matched_team:
+                item.setToolTip(f"🔎 검색된 팀: {matched_team}")
             self.league_list.addItem(item)
-            self.league_list.setItemWidget(item, row_widget)
         if len(leagues) > MAX_SHOW:
             note = QListWidgetItem(f"...외 {len(leagues)-MAX_SHOW}개 더 있음 (검색어로 좁혀보세요)")
             note.setFlags(Qt.ItemFlag.NoItemFlags)
             note.setForeground(Qt.GlobalColor.darkGray)
             self.league_list.addItem(note)
+        _wl_t2 = _time_wl.perf_counter()
         self._ensure_list_fits()
+        _wl_t3 = _time_wl.perf_counter()
+        if _wl_t3 - _wl_t0 >= 0.03:
+            print(f"[PERF-WB-LEAGUE] 총 {_wl_t3-_wl_t0:.3f}s — "
+                  f"DB조회(search_leagues,{len(leagues)}건) {_wl_t1-_wl_t0:.3f}s | "
+                  f"행채우기({min(len(leagues),MAX_SHOW)}줄, delegate) {_wl_t2-_wl_t1:.3f}s | "
+                  f"_ensure_list_fits {_wl_t3-_wl_t2:.3f}s")
+
+    def _league_row_spec(self, lg):
+        """[2026-08 신설] _league_row_widget과 동일한 칸 구성(이름/매칭표시/
+        등급/국가/부수)을 QWidget 없이 _GridRowDelegate가 그릴 수 있는
+        스펙 리스트로 표현한다. 폭·색상·굵기 값은 _league_row_widget과
+        1:1로 동일하게 맞춰서 시각적으로 동일하게 보이게 했다."""
+        matched_team = lg.get("matched_team")
+        return [
+            {"text": lg["name"], "width": self._NAME_COL_W, "color": "#eee", "bold": True},
+            {"text": "🔎" if matched_team else "", "width": 16, "color": "#ccc",
+             "align": Qt.AlignmentFlag.AlignCenter},
+            {"text": f"{lg['grade']}급", "width": self._GRADE_COL_W,
+             "color": _GRADE_COLORS.get(lg["grade"], "#888888"),
+             "size": 11, "bold": True, "align": Qt.AlignmentFlag.AlignCenter},
+            {"text": f"{lg['flag']} {lg['country']}", "width": self._COUNTRY_COL_W, "color": "#aaddff"},
+            {"text": f"{lg['tier']}부", "width": self._TIER_COL_W, "color": "#888",
+             "align": Qt.AlignmentFlag.AlignCenter},
+        ]
+
+    def _fill_list_deferred(self, list_widget, items, build_row, on_done, gen_key, batch_size=100):
+        """[2026-08 신설, 신민용 리포트: "세계기록실 여전히 열 때 1초정도
+        걸려"] setItemWidget()을 최대 300번 한 번에 몰아 부르면 그 시간만큼
+        창이 멈춘 것처럼 보인다 — 폰트캐싱/N+1제거/setUpdatesEnabled를 다
+        해봤지만 이 고정비용(위젯 하나 embed하는 데 걸리는 시간) 자체는
+        줄지 않았다(실측: 위젯 개수와 무관하게 행당 ~0.55ms로 일정, 즉
+        setItemWidget() 자체의 비용). 위젯/스타일은 그대로 두고, 채우는
+        작업을 한 번에 몰아서 하지 않고 여러 배치로 나눠 QTimer.singleShot
+        (0, ...)으로 이어붙인다 — 창은 즉시 뜨고 목록이 몇 프레임에 걸쳐
+        차오른다(먹통처럼 안 보임). 최종 화면 결과(순서·내용·스타일)는
+        100% 동일, "언제" 그려지느냐만 다르다.
+
+        [2026-08 재조정, 신민용 리포트: "여전히 잠깐 멈추는 느낌이야"] 배치
+        크기를 키워도 첫 배치(100줄)는 여전히 창이 뜨기 "전에" 동기로
+        처리되고 있었다 — 리그+팀+컵대회 세 리스트의 첫 배치가 겹치면
+        150~200ms가 쌓여 사람 눈엔 여전히 멈칫함으로 느껴진다(100ms
+        넘으면 인지됨). 첫 배치조차 즉시 실행하지 않고 다음 이벤트루프
+        틱으로 미뤄서, 창을 만드는 동안엔 행 위젯을 단 하나도 만들지
+        않게 한다 — 창이 완전히 뜬 "다음" 프레임부터 채워지기 시작한다.
+
+        gen_key: 이 리스트 전용 세대 카운터 속성 이름 — 채우는 도중
+        검색어/필터가 바뀌어 새로 이 함수가 다시 불리면 세대가 올라가고,
+        이전 배치는 자기 세대가 낡은 걸 확인하고 조용히 중단한다(오래된
+        검색 결과가 새 목록 뒤에 섞여 붙는 것을 방지)."""
+        gen = getattr(self, gen_key, 0) + 1
+        setattr(self, gen_key, gen)
+        list_widget.setUpdatesEnabled(False)
+        queue = list(items)
+
+        def _step():
+            if getattr(self, gen_key, None) != gen:
+                return  # 새 검색/필터로 이미 무효화된 배치 — 조용히 중단
+            chunk, queue[:] = queue[:batch_size], queue[batch_size:]
+            for it in chunk:
+                build_row(it)
+            if queue:
+                QTimer.singleShot(0, _step)
+            else:
+                list_widget.setUpdatesEnabled(True)
+                on_done()
+
+        QTimer.singleShot(0, _step)
 
     def _ensure_list_fits(self, list_widget=None, splitter=None):
         """목록 행(국가·리그명+티어/등급 배지)이 리스트 폭보다 넓으면 가로
@@ -544,11 +782,23 @@ class WorldBrowserWindow(QDialog):
         list_widget = list_widget or self.league_list
         splitter = splitter or self._league_split
         max_w = 0
+        delegate = list_widget.itemDelegate()
         for i in range(list_widget.count()):
             it = list_widget.item(i)
             w = list_widget.itemWidget(it)
             if w:
                 max_w = max(max_w, w.sizeHint().width())
+            elif isinstance(delegate, _GridRowDelegate):
+                # [2026-08 신설] setItemWidget()이 없는 delegate 기반 행은
+                # 스펙(칸 폭 리스트)에서 직접 필요한 폭을 계산한다 —
+                # _GridRowDelegate.sizeHint()와 동일한 계산식.
+                spec = it.data(_GridRowDelegate._SPEC_ROLE)
+                if spec:
+                    row_w = delegate._LEFT_MARGIN + delegate._RIGHT_MARGIN
+                    for col in spec:
+                        row_w += col.get("width", 60) + delegate._SPACING
+                    row_w -= delegate._SPACING
+                    max_w = max(max_w, row_w)
         if max_w == 0:
             return
         scrollbar_w = list_widget.verticalScrollBar().sizeHint().width()
@@ -989,6 +1239,7 @@ class WorldBrowserWindow(QDialog):
         self.team_list = QListWidget()
         self.team_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.team_list.itemClicked.connect(self._on_team_selected)
+        self.team_list.setItemDelegate(_GridRowDelegate(self, self.team_list))
         team_header = self._list_header_row([
             ("팀명", self._NAME_COL_W, False),
             ("등급", self._GRADE_COL_W, True),
@@ -1058,6 +1309,8 @@ class WorldBrowserWindow(QDialog):
         return None
 
     def _refresh_team_list(self, *_a):
+        import time as _time_wt
+        _wt_t0 = _time_wt.perf_counter()
         cont = None if self.team_cont_combo.currentText() == _ALL else self.team_cont_combo.currentText()
         cid = self._selected_team_country_id()
         grade = None if self.team_grade_combo.currentText() == _ALL else self.team_grade_combo.currentText()
@@ -1066,18 +1319,38 @@ class WorldBrowserWindow(QDialog):
         q = self.team_search_box.text().strip() or None
         teams = wb.search_teams(name_query=q, continent=cont, country_id=cid,
                                 grade=grade, tier=tier, limit=300)
+        _wt_t1 = _time_wt.perf_counter()
         teams.sort(key=lambda t: t["name"])
+        _wt_t2 = _time_wt.perf_counter()
 
         self.team_list.clear()
+        # [2026-08 재작성] 리그검색과 동일한 이유로 delegate 기반 동기 루프로.
         for tm in teams:
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, tm["id"])
             item.setData(Qt.ItemDataRole.UserRole + 1, tm["name"])
-            row_widget = self._team_row_widget(tm)
-            item.setSizeHint(row_widget.sizeHint())
+            item.setData(_GridRowDelegate._SPEC_ROLE, self._team_row_spec(tm))
             self.team_list.addItem(item)
-            self.team_list.setItemWidget(item, row_widget)
+        _wt_t3 = _time_wt.perf_counter()
         self._ensure_list_fits(self.team_list, self._team_split)
+        _wt_t4 = _time_wt.perf_counter()
+        if _wt_t4 - _wt_t0 >= 0.03:
+            print(f"[PERF-WB-TEAM] 총 {_wt_t4-_wt_t0:.3f}s — "
+                  f"DB조회(search_teams,{len(teams)}건) {_wt_t1-_wt_t0:.3f}s | "
+                  f"정렬 {_wt_t2-_wt_t1:.3f}s | 행채우기(delegate) {_wt_t3-_wt_t2:.3f}s | "
+                  f"_ensure_list_fits {_wt_t4-_wt_t3:.3f}s")
+
+    def _team_row_spec(self, tm):
+        """[2026-08 신설] _team_row_widget과 동일한 칸 구성(팀명/등급/국가/
+        소속리그)을 QWidget 없이 그릴 수 있는 스펙으로 표현."""
+        return [
+            {"text": tm["name"], "width": self._NAME_COL_W, "color": "#eee", "bold": True},
+            {"text": f"{tm['grade']}급", "width": self._GRADE_COL_W,
+             "color": _GRADE_COLORS.get(tm["grade"], "#888888"),
+             "size": 11, "bold": True, "align": Qt.AlignmentFlag.AlignCenter},
+            {"text": f"{tm['flag']} {tm['country']}", "width": self._COUNTRY_COL_W, "color": "#aaddff"},
+            {"text": f"{tm['league_name']}({tm['tier']}부)", "width": self._LEAGUE_COL_W, "color": "#888"},
+        ]
 
     def _team_row_widget(self, tm):
         """팀 목록 한 줄 — 왼쪽부터 [팀명(고정폭)] [등급] [국가] [소속리그(부수)]
@@ -1191,6 +1464,7 @@ class WorldBrowserWindow(QDialog):
         self.cup_country_list = QListWidget()
         self.cup_country_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.cup_country_list.itemClicked.connect(self._on_cup_country_selected)
+        self.cup_country_list.setItemDelegate(_GridRowDelegate(self, self.cup_country_list))
         cup_header = self._list_header_row([
             ("나라명", self._NAME_COL_W, False),
             ("기록", 70, True),
@@ -1227,24 +1501,51 @@ class WorldBrowserWindow(QDialog):
         return w
 
     def _refresh_cup_country_list(self, *_a):
+        import time as _time_wc
+        _wc_t0 = _time_wc.perf_counter()
         cont = None if self.cup_cont_combo.currentText() == _ALL else self.cup_cont_combo.currentText()
         q = self.cup_search_box.text().strip().lower()
         countries = wb.list_countries(cont)
         if q:
             countries = [c for c in countries if q in c["name"].lower()]
         self._cup_country_cache = countries
+        _wc_t1 = _time_wc.perf_counter()
+
+        # [2026-08 최적화] 나라마다 wb.has_cup_data()를 따로 부르던 N+1
+        # 쿼리를 1회 배치 조회로 교체 — 표시되는 배지 결과는 동일하다.
+        _cup_data_ids = wb.has_cup_data_bulk()
+        _wc_t2 = _time_wc.perf_counter()
 
         self.cup_country_list.clear()
+        # [2026-08 재작성] 리그검색과 동일한 이유로 delegate 기반 동기 루프로.
         for c in countries:
-            has_data = wb.has_cup_data(c["id"])
+            has_data = c["id"] in _cup_data_ids
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, c["id"])
             item.setData(Qt.ItemDataRole.UserRole + 1, c["name"])
-            row_widget = self._cup_country_row_widget(c, has_data)
-            item.setSizeHint(row_widget.sizeHint())
+            item.setData(_GridRowDelegate._SPEC_ROLE, self._cup_row_spec(c, has_data))
             self.cup_country_list.addItem(item)
-            self.cup_country_list.setItemWidget(item, row_widget)
+        _wc_t3 = _time_wc.perf_counter()
         self._ensure_list_fits(self.cup_country_list, self._cup_split)
+        _wc_t4 = _time_wc.perf_counter()
+        if _wc_t4 - _wc_t0 >= 0.03:
+            print(f"[PERF-WB-CUP] 총 {_wc_t4-_wc_t0:.3f}s — "
+                  f"list_countries({len(countries)}건) {_wc_t1-_wc_t0:.3f}s | "
+                  f"has_cup_data_bulk {_wc_t2-_wc_t1:.3f}s | "
+                  f"행채우기(delegate) {_wc_t3-_wc_t2:.3f}s | _ensure_list_fits {_wc_t4-_wc_t3:.3f}s")
+
+    def _cup_row_spec(self, c, has_data):
+        """[2026-08 신설] _cup_country_row_widget과 동일한 칸 구성(국가명/
+        기록유무 배지)을 QWidget 없이 그릴 수 있는 스펙으로 표현. 배지는
+        원본과 동일하게 배경색+둥근모서리(bg 필드)로 재현한다."""
+        return [
+            {"text": f"{c['flag']} {c['name']}", "width": self._NAME_COL_W,
+             "color": "#eee" if has_data else "#666", "bold": has_data},
+            {"text": "기록 있음" if has_data else "기록 없음", "width": 70,
+             "align": Qt.AlignmentFlag.AlignCenter, "size": 10,
+             "color": "#00cc44" if has_data else "#666",
+             "bg": "#16301c" if has_data else "#262626"},
+        ]
 
     def _cup_country_row_widget(self, c, has_data):
         """컵대회 검색 탭 나라 목록 한 줄 — 리그/팀 검색 탭과 같은 그리드

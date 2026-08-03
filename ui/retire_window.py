@@ -608,7 +608,12 @@ class RetireWindow(QDialog):
             # 경로 쪽 "팔림" 표기(빨간 강조 포함)는 그대로 둔다.
             if in_type == "팔림":
                 in_type = "구매"
-            t_type = exit_t if exit_t else in_type
+            # [2026-08 신설, career_window.py와 동일한 신민용 지적 반영: "2001년
+            # 팔림 표시는 안 뜨고 2002년 구매만 뜨는게 맞는듯"] 나가는 쪽 exit_t가
+            # "팔림"이면 표시하지 않고(들어오는 쪽 "구매"만 남김), 그 행 자체의
+            # in_type으로 대체한다. 방출/이적/계약만료는 그대로 우선 표시.
+            _exit_disp = "" if exit_t == "팔림" else exit_t
+            t_type = _exit_disp if _exit_disp else in_type
 
             # [2026-07 재수정, 신민용 지적: "은퇴창도 career_window.py와 동일하게
             # 떠야지"] 계약 컬럼은 원소속팀 계약년수를 그대로 보여주고(임대는
@@ -1297,7 +1302,11 @@ class RetireWindow(QDialog):
                 # 들어온 경로가 강제이적(팔림)이면 "구매"로 구분 표시.
                 if in_type == "팔림":
                     in_type = "구매"
-                t_type = exit_t if exit_t else in_type
+                # [2026-08 신설, career_window.py/팀이력 탭과 동일한 신민용
+                # 지적 반영] AI요약도 팀이력 탭과 똑같이 나가는 쪽 "팔림"
+                # 표시는 없애고 들어오는 쪽 "구매"만 남긴다.
+                _exit_disp = "" if exit_t == "팔림" else exit_t
+                t_type = _exit_disp if _exit_disp else in_type
                 # [2026-07 재수정, 신민용 지적: "은퇴창이랑 AI요약도 마찬가지로
                 # 떠야지"] career_window.py와 동일하게 계약 컬럼은 원소속팀
                 # 계약년수를 그대로 보여주고, 이적란에 실제 임대 기간을

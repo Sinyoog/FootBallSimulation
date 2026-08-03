@@ -64,9 +64,15 @@ def run_ai_offseason(year, verbose_log=None):
     conn = get_conn()
     c = conn.cursor()
 
+    # [2026-07 계측 추가, 신민용 리포트: "AI생애주기 합계 1.93s인데 실제
+    # 2.59s — 0.66s 미계측"] 기존 _ta0~_ta4는 ensure_ai_ages/ensure_ai_sub_roles
+    # 이후에 시작하고 commit/캐시무효화는 범위 밖이라 이 구간들이 안 보였다.
+    # 원인 확정 전이므로 로직은 그대로 두고 타이머만 촘촘히 추가한다.
+    _t_start = _time_perf.perf_counter()
     _ensure_ai_ages(c)               # 구버전 세이브 age 보정
     _ensure_ai_sub_roles(c)          # 구버전 세이브 sub_role 보정
-    _ta0 = _time_perf.perf_counter()
+    _t_ensure = _time_perf.perf_counter()
+    _ta0 = _t_ensure
     grew, aged = _age_and_progress(c)   # 자체적으로 전용 컬럼 SELECT (포지션 위치접근 최적화라 별도 유지)
     _ta1 = _time_perf.perf_counter()
 
@@ -78,6 +84,7 @@ def run_ai_offseason(year, verbose_log=None):
     shared_ai_rows = c.execute(
         "SELECT id, team_id, position, age, name, ovr, nationality, "
         "contract_end_year, last_transfer_year FROM ai_players").fetchall()
+    _t_shared = _time_perf.perf_counter()
 
     retired    = _retire_and_replace(c, year, shared_ai_rows)
     _ta2 = _time_perf.perf_counter()
@@ -88,12 +95,16 @@ def run_ai_offseason(year, verbose_log=None):
     # [2026-07 신설, 진단용] game_engine._advance_week의 [PERF] 로그와 짝을
     # 이루는 세부 단계 측정 — "AI생애주기 N초" 중 실제로 어느 서브단계
     # (성장/은퇴·세대교체/이적시장/전술변경)가 무거운지 콘솔에서 바로 보인다.
-    print(f"[PERF]     ai_offseason 세부: 성장/노화 {_ta1-_ta0:.2f}s | "
-          f"은퇴·세대교체 {_ta2-_ta1:.2f}s | 이적시장 {_ta3-_ta2:.2f}s | "
+    print(f"[PERF]     ai_offseason 세부: ensure(age/subrole) {_t_ensure-_t_start:.2f}s | "
+          f"성장/노화({'numpy' if _HAS_NUMPY else 'PURE-PYTHON!'}) {_ta1-_ta0:.2f}s | "
+          f"shared_ai_rows조회 {_t_shared-_ta1:.2f}s | "
+          f"은퇴·세대교체 {_ta2-_t_shared:.2f}s | 이적시장 {_ta3-_ta2:.2f}s | "
           f"전술변경 {_ta4-_ta3:.2f}s")
 
+    _t_commit0 = _time_perf.perf_counter()
     conn.commit()
     conn.close()
+    _t_commit1 = _time_perf.perf_counter()
 
     # OVR/소속이 일괄 변경됨 → 엔진 캐시 무효화
     try:
@@ -101,6 +112,9 @@ def run_ai_offseason(year, verbose_log=None):
         _invalidate_team_ovr_cache()
     except Exception:
         pass
+    _t_cache1 = _time_perf.perf_counter()
+    print(f"[PERF-AI]  commit={_t_commit1-_t_commit0:.3f}s | "
+          f"cache_invalidate={_t_cache1-_t_commit1:.3f}s")
 
     if verbose_log:
         verbose_log(
@@ -179,6 +193,14 @@ def _age_and_progress(c):
     from database import STAT_IDX, calc_ovr_from_list, OVR_RANGES
     from constants import COUNTRY_LEAGUE_GRADE, CONTINENT_OVR_BONUS, COUNTRY_OVR_ADJ
 
+    # [2026-08 계측 추가, 신민용 리포트: "numpy 쓰는데도 0.71s, 예상보다
+    # 느린데?"] numpy 벡터화 버전이 실제로 도는데도 docstring이 적어둔
+    # 0.15~0.2s 범위가 아니라 순수 파이썬 범위(0.35~1.2s)만큼 걸렸다 —
+    # numpy 연산 자체가 아니라 그 앞뒤(team_cap 조회, 5.9만 행 fetch,
+    # DB 쓰기)가 무거운 건 아닌지 구간을 쪼개서 확인한다.
+    import time as _time_ap
+    _ap_t0 = _time_ap.perf_counter()
+
     # ── team_id → 성장기 스탯 상한 사전 조회 (선수마다 매번 JOIN 방지) ──
     # 등급별 OVR_RANGES 상단에 대륙보정 + 나라별 미세조정까지 반영해서,
     # 초기 생성 때 쓰는 보정치와 항상 같은 기준으로 성장 상한을 잡는다.
@@ -203,6 +225,7 @@ def _age_and_progress(c):
         if grade == "SS":
             bonus = min(bonus, 0)
         team_cap[r["tid"]] = min(99, top + bonus + 3)
+    _ap_t1 = _time_ap.perf_counter()
 
     # JOIN에 안 잡힌 팀(league_id/country_id 연결 누락 등)의 폴백 상한.
     _ORPHAN_CAP_FALLBACK = 46
@@ -211,18 +234,30 @@ def _age_and_progress(c):
     rows.row_factory = None  # 위치 접근만 쓰므로 Row 래핑 생략 (5.9만 행 fetch 오버헤드 절감)
     rows = rows.execute(
         "SELECT id, position, age, team_id, " + _STAT_COLS + " FROM ai_players").fetchall()
+    _ap_t2 = _time_ap.perf_counter()
     if not rows:
         return 0, 0
 
     if _HAS_NUMPY:
-        return _age_and_progress_np(c, rows, team_cap, _ORPHAN_CAP_FALLBACK)
-    return _age_and_progress_py(c, rows, team_cap, _ORPHAN_CAP_FALLBACK)
+        _result = _age_and_progress_np(c, rows, team_cap, _ORPHAN_CAP_FALLBACK)
+    else:
+        _result = _age_and_progress_py(c, rows, team_cap, _ORPHAN_CAP_FALLBACK)
+    _ap_t3 = _time_ap.perf_counter()
+    print(f"[PERF-AGE] _age_and_progress({'numpy' if _HAS_NUMPY else 'python'}) 세부: "
+          f"team_cap조회 {_ap_t1-_ap_t0:.3f}s | ai_players fetch({len(rows)}행) {_ap_t2-_ap_t1:.3f}s | "
+          f"계산+DB쓰기 {_ap_t3-_ap_t2:.3f}s")
+    return _result
 
 
 def _age_and_progress_np(c, rows, team_cap, orphan_fallback):
     """벡터화 버전 — 선수 5.9만 명(+향후 확장분)을 파이썬 for문 없이 numpy로 처리.
     로직(확률/증감폭/키스탯 가중치)은 순수 파이썬 버전과 동일하게 유지했다."""
     from database import _WEIGHT_SUMS
+    # [2026-08 계측 추가, 신민용 리포트: "numpy 쓰는데도 예상보다 느린데?"]
+    # "계산+DB쓰기" 0.49s가 numpy 벡터 연산 자체인지 executemany(현재
+    # 10만+ 행)인지 갈라본다.
+    import time as _time_npf
+    _npf_t0 = _time_npf.perf_counter()
 
     N = len(rows)
     pids = [r[0] for r in rows]
@@ -339,11 +374,15 @@ def _age_and_progress_np(c, rows, team_cap, orphan_fallback):
     # 튜플뿐 아니라 리스트 행도 그대로 받아준다. 5.9만 회 언패킹 루프 제거.
     pids_arr = np.array(pids, dtype=np.int64)
     updates = np.column_stack([new_age, vals_arr, ovr_out, pids_arr]).tolist()
+    _npf_t1 = _time_npf.perf_counter()
 
     set_clause = ", ".join(f"{s}=?" for s in ALL_STATS)
     c.executemany(
         f"UPDATE ai_players SET age=?, {set_clause}, ovr=? WHERE id=?",
         updates)
+    _npf_t2 = _time_npf.perf_counter()
+    print(f"[PERF-AGE-NP]  numpy계산 {_npf_t1-_npf_t0:.3f}s | "
+          f"executemany({len(updates)}건) {_npf_t2-_npf_t1:.3f}s")
 
     if _orphan_team_ids:
         import sys as _sys
@@ -636,14 +675,30 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None):
     from constants import COUNTRY_LEAGUE_GRADE
     from economy import LEAGUE_GRADE_RANK
 
+    # [2026-08 계측 추가, 신민용 리포트: "이적시장 0.92s가 어디서 쓰이는지
+    # 쪼개보자"] 아직 로직은 그대로 두고 구간별 시간만 찍는다 —
+    # (1) teams 조회(상관 서브쿼리 AVG(ovr) 포함, 팀마다 1회 실행되므로
+    #     팀 수가 많을수록 이 구간이 의심됨) (2) 그룹핑 dict 구성
+    # (3) team_players dict 구성 (4) 실제 이적 루프(667개 리그 × 팀당
+    #     1~2건, _do_one_transfer_cached 반복 호출 — 가장 유력한 후보)
+    # (5) executemany UPDATE.
+    import time as _time_tm
+    _tm0 = _time_tm.perf_counter()
+
     teams = [dict(r) for r in c.execute(
         """SELECT t.id AS tid, t.league_id AS lid, t.current_tier AS tier,
-                  cn.id AS cid, cn.name AS cname,
+                  t.name AS tname, cn.id AS cid, cn.name AS cname,
                   (SELECT AVG(ovr) FROM ai_players WHERE team_id=t.id) AS avg_ovr
            FROM teams t
            JOIN leagues l ON t.league_id = l.id
            JOIN countries cn ON l.country_id = cn.id""").fetchall()]
     team_avg = {t["tid"]: (t["avg_ovr"] or 50) for t in teams}
+    # [2026-08 최적화] verbose_log용 _estimate_ai_transfer_fee_display가
+    # 이적마다 teams 리스트를 선형탐색(최대 2회) + 팀명 SQL SELECT 2회를
+    # 추가로 날리고 있었다 — 여기서 tid→row 딕셔너리를 한 번만 만들어
+    # 재사용하면 그 함수 안의 왕복이 전부 O(1) 조회로 바뀐다.
+    team_row_by_tid = {t["tid"]: t for t in teams}
+    _tm1 = _time_tm.perf_counter()
 
     # 리그별 팀 그룹 (기존, 87%용)
     by_league: dict = {}
@@ -653,16 +708,28 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None):
     tier1_by_grade: dict = {}
     team_tier = {}
     team_grade_rank = {}
+    # [2026-08 최적화, 신민용 리포트: "이적루프 0.6~0.9s 원인 찾자"] 아래
+    # 이적 루프 안에서 "국내 다른 tier" 후보군(8%)을 고를 때 src 팀의
+    # cid(국가ID)가 필요한데, 예전엔 이걸 캐싱 안 하고 매번
+    # `next(t["cid"] for t in teams if t["tid"]==src)`로 teams 리스트
+    # 전체(전 세계 모든 리그, 수천 팀)를 선형탐색했다 — team_tier/
+    # team_grade_rank는 이미 딕셔너리로 캐싱해뒀으면서 이것만 빠져있었다.
+    # 이적 시도가 667개 리그에 걸쳐 수천~1만 건 발생하고 그중 8%가 이
+    # 탐색을 타므로, "시도 수천 회 × teams 크기 수천"의 불필요한 반복이
+    # 누적된 것으로 보인다 — 순수 O(1) 캐싱이라 결과는 완전히 동일하다.
+    team_to_cid = {}
     for t in teams:
         by_league.setdefault(t["lid"], []).append(t["tid"])
         by_country_tier.setdefault((t["cid"], t["tier"]), []).append(t["tid"])
         team_tier[t["tid"]] = t["tier"]
+        team_to_cid[t["tid"]] = t["cid"]
         if t["tier"] == 1:
             grade = COUNTRY_LEAGUE_GRADE.get(t["cname"])
             if grade:
                 rank = LEAGUE_GRADE_RANK.get(grade, 4)
                 team_grade_rank[t["tid"]] = rank
                 tier1_by_grade.setdefault(rank, []).append(t["tid"])
+    _tm2 = _time_tm.perf_counter()
 
     # [최적화] 팀별 선수 목록을 _retire_and_replace와 공유된 스냅샷에서 재사용
     all_players_rows = ai_rows if ai_rows is not None else c.execute(
@@ -677,6 +744,7 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None):
             "contract_end_year": r["contract_end_year"] if "contract_end_year" in r.keys() else 0,
             "last_transfer_year": r["last_transfer_year"] if "last_transfer_year" in r.keys() else 0,
         })
+    _tm3 = _time_tm.perf_counter()
 
     # 이적 결과 누적 후 executemany
     # [2026-07 v2] 이적 시 새 계약(2~4년)과 이적연도를 같이 기록한다 —
@@ -696,7 +764,7 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None):
             if roll < 0.87 or src_tier != 1:
                 dst_pool_tids = tids
             elif roll < 0.95:
-                cid = next((t["cid"] for t in teams if t["tid"] == src), None)
+                cid = team_to_cid.get(src)
                 cand = by_country_tier.get((cid, 2), []) or by_country_tier.get((cid, src_tier + 1), [])
                 dst_pool_tids = cand if len(cand) >= 1 else tids
             else:
@@ -722,15 +790,21 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None):
                         p_entry["last_transfer_year"] = year
                         team_players.setdefault(new_tid, []).append(p_entry)
                         if verbose_log is not None:
-                            _fee = _estimate_ai_transfer_fee_display(p_entry, old_tid, new_tid, year, teams)
+                            _fee = _estimate_ai_transfer_fee_display(p_entry, old_tid, new_tid, year, team_row_by_tid)
                             if _fee and (_big_transfer is None or _fee[0] > _big_transfer[0]):
                                 _big_transfer = _fee
                 moved += 1
+    _tm4 = _time_tm.perf_counter()
 
     if transfer_updates:
         c.executemany(
             "UPDATE ai_players SET team_id=?, contract_end_year=?, last_transfer_year=? WHERE id=?",
             transfer_updates)
+    _tm5 = _time_tm.perf_counter()
+    print(f"[PERF-TM]  teams조회(서브쿼리포함) {_tm1-_tm0:.3f}s | "
+          f"그룹핑 {_tm2-_tm1:.3f}s | team_players빌드 {_tm3-_tm2:.3f}s | "
+          f"이적루프({len(by_league)}개리그) {_tm4-_tm3:.3f}s | "
+          f"executemany({len(transfer_updates)}건) {_tm5-_tm4:.3f}s")
 
     if verbose_log is not None and _big_transfer is not None:
         fee, ovr, src_name, dst_name = _big_transfer
@@ -740,17 +814,22 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None):
     return moved
 
 
-def _estimate_ai_transfer_fee_display(p_entry, old_tid, new_tid, year, teams):
+def _estimate_ai_transfer_fee_display(p_entry, old_tid, new_tid, year, team_row_by_tid):
     """[2026-07 v3 신설] 표시용 이적료 — 자금 이동 없음, DB 저장도 없음.
     이적 순간에만 즉석 계산해서 그 시즌 최고액 1건만 로그로 소비하고 버린다.
     OVR85 이상이거나 이적료 최고액인 경우에만 verbose_log에서 실제로
-    출력되도록, 여기서는 조건 없이 계산만 해서 넘긴다(최종 필터는 호출부)."""
+    출력되도록, 여기서는 조건 없이 계산만 해서 넘긴다(최종 필터는 호출부).
+
+    team_row_by_tid: {tid: team_row_dict} — 예전엔 teams 리스트를 매번
+    선형탐색(최대 2회)하고 팀명도 별도 SQL SELECT 2회로 조회했는데
+    (신민용 리포트: "이적루프 렉" 조사 중 발견), 호출부에서 만든 tid→row
+    딕셔너리를 그대로 받아 전부 O(1) 조회로 바꾼다 — 결과는 동일."""
     if p_entry.get("ovr", 0) < 70:
         return None   # 너무 낮은 OVR은 계산 자체를 생략(성능/의미 둘 다 낮음)
     try:
         from economy import estimate_transfer_fee
         from constants import COUNTRY_LEAGUE_GRADE
-        dst_row = next((t for t in teams if t["tid"] == new_tid), None)
+        dst_row = team_row_by_tid.get(new_tid)
         if not dst_row:
             return None
         grade = COUNTRY_LEAGUE_GRADE.get(dst_row["cname"], "C")
@@ -758,13 +837,12 @@ def _estimate_ai_transfer_fee_display(p_entry, old_tid, new_tid, year, teams):
                                     position=p_entry.get("position"), year=year)
         if not fee or (p_entry.get("ovr", 0) < 85 and fee < 5_000_000):  # 50억(천원단위) 미만이면 스킵
             return None
-        src_row = next((t for t in teams if t["tid"] == old_tid), None)
-        conn = get_conn()
-        src_name = conn.execute("SELECT name FROM teams WHERE id=?", (old_tid,)).fetchone()
-        dst_name = conn.execute("SELECT name FROM teams WHERE id=?", (new_tid,)).fetchone()
+        src_row = team_row_by_tid.get(old_tid)
+        src_name = src_row["tname"] if src_row else None
+        dst_name = dst_row.get("tname")
         return (fee, p_entry["ovr"],
-                src_name["name"] if src_name else "?",
-                dst_name["name"] if dst_name else "?")
+                src_name if src_name else "?",
+                dst_name if dst_name else "?")
     except Exception:
         return None
 
