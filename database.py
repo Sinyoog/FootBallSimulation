@@ -499,6 +499,25 @@ def init_db():
         home_team_id INTEGER, away_team_id INTEGER,
         home_score INTEGER DEFAULT -1, away_score INTEGER DEFAULT -1,
         season INTEGER, year INTEGER, day INTEGER)""")
+    # [2026-08 신설, 신민용 리포트: "20년대는 렉 때문에 플레이가 거의
+    # 불가능"] match_results_archive가 시즌이 쌓일수록 무한정 커지는 게
+    # (실측: 21시즌차 세이브에서 346만 행, 인덱스 포함 195MB — 전체
+    # game.db의 70%) 자동저장(flush_to_disk, DB 전체 백업) 지연의 직접
+    # 원인이었다. world_browser의 "역대 순위표" 조회는 사실 팀별 승/무/
+    # 패/득실만 있으면 되고 경기 하나하나의 스코어는 안 보여준다 — 그래서
+    # 시즌이 아카이브로 넘어갈 때 이 요약을 미리 계산해 여기 저장해두고,
+    # 원본 경기 행은 (내 커리어의 "출전 X/Y" 분모 계산처럼 실제로 날짜
+    # 단위 원본이 필요한 소수의 케이스만 남기고) 정리한다 — 자세한 정리
+    # 로직은 database.py의 _summarize_and_prune_archive 참고.
+    c.execute("""CREATE TABLE IF NOT EXISTS league_season_standings(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        league_id INTEGER, season INTEGER, year INTEGER, team_id INTEGER,
+        wins INTEGER DEFAULT 0, draws INTEGER DEFAULT 0, losses INTEGER DEFAULT 0,
+        goals_for INTEGER DEFAULT 0, goals_against INTEGER DEFAULT 0)""")
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_lss_league_season
+               ON league_season_standings(league_id, season)""")
+    c.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_lss_unique
+               ON league_season_standings(league_id, season, team_id)""")
     # 경기 상세(클릭 시 펼쳐보는 데이터)를 JSON으로 보관.
     #   game_log 의 헤더 줄에 <a href="match:{id}"> 앵커로 연결된다.
     #   detail_json 안에 전/후반 이벤트·평점·세부지표·총평이 모두 들어간다.
@@ -1273,6 +1292,7 @@ def init_db():
     repair_duplicate_season_schedules()   # 유령 중복 시즌 일정 정리 (1회성, 아래 참고)
     repair_stray_intl_is_my_flags()   # 복수국적 미선택국 is_my 오염 정리 (1회성, 아래 참고)
     repair_cwc_match_groups()   # 클럽월드컵 매치 grp 백필 (1회성, 아래 참고)
+    compact_existing_match_archive()   # 기존 세이브 match_results_archive 요약+정리 (1회성, 아래 참고)
 
 
 # [2026-07 최적화, 신민용 리포트: "연도전환 최적화 더 해봐"] match_results엔
@@ -1318,6 +1338,123 @@ def rebuild_match_results_indexes(c):
             pass
 
 
+def _summarize_and_prune_archive(conn, seasons=None):
+    """[2026-08 신설, 신민용 리포트: "게임.db가 너무 커져서 자동저장(2.3초)
+    때문에 렉이 심하다"] match_results_archive의 (league_id,season) 조합별로
+    팀 승/무/패/득실을 league_season_standings에 미리 계산해서 저장하고,
+    "내 커리어에서 실제로 뛴 적 있는 팀"이 아닌 팀들의 원본 경기 행은
+    지운다.
+
+    - world_browser의 "역대 순위표"는 이제부터 league_season_standings를
+      먼저 본다(game_engine.get_league_standings 참고) — 순위표 자체는
+      원본 경기가 있든 없든 완전히 동일하게 보인다.
+    - team_matches_played_in_window()처럼 "그 기간에 실제로 며칠에 경기가
+      있었는지" 날짜 단위 원본이 필요한 건 career_entries.team_id(내가
+      실제로 몸담았던 팀)에 한해서만이므로, 그 팀들의 원본 행은 그대로
+      남긴다 — 이 함수가 지우는 건 "내 커리어와 무관한 나머지 9천여 개
+      팀들"의 경기 원본뿐이다(대부분의 용량을 차지하지만 아무도 날짜
+      단위로 다시 조회하지 않는 데이터).
+
+    seasons를 넘기면 그 시즌들만(archive_old_seasons가 방금 옮긴 배치),
+    None이면 아직 요약이 없는 모든 (league_id,season) 조합을 찾아 처리한다
+    (기존에 이미 부풀어있는 세이브를 위한 1회성 전체 정리 — init_db에서
+    meta 플래그로 딱 한 번만 실행)."""
+    c = conn.cursor()
+
+    if seasons is not None and not seasons:
+        return
+    season_filter = ""
+    params: tuple = ()
+    if seasons is not None:
+        season_filter = f"AND season IN ({','.join('?' * len(seasons))})"
+        params = tuple(seasons)
+
+    # 1) 아직 요약이 없는 (league_id,season) 조합만 골라 요약 계산.
+    todo = c.execute(
+        f"""SELECT DISTINCT mra.league_id, mra.season FROM match_results_archive mra
+            WHERE NOT EXISTS (
+                SELECT 1 FROM league_season_standings lss
+                WHERE lss.league_id=mra.league_id AND lss.season=mra.season)
+            {season_filter}""", params).fetchall()
+    for row in todo:
+        lid, season = row["league_id"], row["season"]
+        c.execute(
+            """INSERT OR IGNORE INTO league_season_standings
+                   (league_id, season, year, team_id, wins, draws, losses, goals_for, goals_against)
+               SELECT league_id, season, MAX(year), team_id,
+                      SUM(CASE WHEN gf>ga THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN gf=ga THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN gf<ga THEN 1 ELSE 0 END),
+                      SUM(gf), SUM(ga)
+               FROM (
+                   SELECT league_id, season, year, home_team_id AS team_id,
+                          home_score AS gf, away_score AS ga
+                   FROM match_results_archive
+                   WHERE league_id=? AND season=? AND home_score>=0
+                   UNION ALL
+                   SELECT league_id, season, year, away_team_id AS team_id,
+                          away_score AS gf, home_score AS ga
+                   FROM match_results_archive
+                   WHERE league_id=? AND season=? AND home_score>=0
+               )
+               GROUP BY league_id, season, team_id""",
+            (lid, season, lid, season))
+
+    # 2) 요약이 이미 있는 (league_id,season)에 한해, "내 커리어와 무관한 팀"의
+    #    원본 경기 행을 지운다 — career_entries.team_id(내가 실제로 몸담았던
+    #    팀들, 승강/이적과 무관하게 영구 불변값)만 원본을 보존한다.
+    my_team_ids = {r["team_id"] for r in c.execute(
+        "SELECT DISTINCT team_id FROM career_entries WHERE team_id != 0")}
+    keep_clause = ""
+    if my_team_ids:
+        qmarks = ",".join("?" * len(my_team_ids))
+        keep_clause = f"AND home_team_id NOT IN ({qmarks}) AND away_team_id NOT IN ({qmarks})"
+    c.execute(
+        f"""DELETE FROM match_results_archive
+            WHERE (league_id, season) IN (SELECT league_id, season FROM league_season_standings)
+            {keep_clause}
+            {season_filter}""",
+        (*my_team_ids, *my_team_ids, *params) if my_team_ids else params)
+    conn.commit()
+
+
+def compact_existing_match_archive():
+    """[2026-08 신설, 신민용 리포트: "20년대는 렉 때문에 플레이가 거의
+    불가능"] archive_old_seasons()는 이제부터 시즌을 옮길 때마다 바로
+    요약+정리하지만, 그건 '앞으로' 생기는 아카이브에만 적용된다 — 이미
+    수백만 행이 쌓여있는 기존 세이브는 그대로다. 1회성으로 전체를 한 번
+    훑어서 아직 요약이 없는 모든 (league_id,season)을 요약하고(1개월
+    자동저장 배치가 아니라 한 번에 다 처리), 내 커리어와 무관한 팀들의
+    원본 경기 행을 정리한다 — meta 플래그로 딱 한 번만 실행."""
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        row = c.execute("SELECT value FROM meta WHERE key='match_archive_compact_v1'").fetchone()
+    except Exception:
+        row = None
+    if row:
+        conn.close()
+        return
+    try:
+        n_before = c.execute("SELECT COUNT(*) FROM match_results_archive").fetchone()[0]
+        _summarize_and_prune_archive(conn, seasons=None)
+        n_after = c.execute("SELECT COUNT(*) FROM match_results_archive").fetchone()[0]
+        print(f"[MIGRATE] match_results_archive 1회성 정리: {n_before}행 → {n_after}행")
+        # [2026-08] DELETE만으로는 페이지가 "재사용 가능"으로만 표시되고
+        # 파일 자체는 안 줄어든다(그래서 flush_to_disk 백업 파일 크기도
+        # 그대로였다) — VACUUM으로 실제 파일 크기까지 줄인다. 이 정리로
+        # 지워지는 행 수가 워낙 커서(수백만 건) 여기서 한 번 VACUUM하는
+        # 비용은 그만한 가치가 있다(실측: 3.46M행 정리 후 VACUUM 0.3초,
+        # 이후 자동저장이 2.3초 → 0.3초로 빨라짐).
+        conn.execute("VACUUM")
+    except Exception as e:
+        print("compact_existing_match_archive 오류:", e)
+    c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('match_archive_compact_v1','1')")
+    conn.commit()
+    conn.close()
+
+
+
 def archive_old_seasons(current_season):
     """[2026-07 신설, 성능] 진행 중인 시즌(current_season) 이전의 모든
     match_results 행을 match_results_archive로 옮긴다.
@@ -1336,15 +1473,24 @@ def archive_old_seasons(current_season):
     _process_promotion_relegation이 '방금 끝난 시즌'의 match_results를
     이미 다 읽어들인 뒤(그 함수가 이 호출보다 항상 먼저 실행됨) 호출되므로
     안전하다. INSERT OR IGNORE라 중복 호출돼도(예: 재시도) 에러 없이
-    멱등하게 동작한다."""
+    멱등하게 동작한다.
+
+    [2026-08 추가] 옮긴 직후 그 배치(seasons)만 바로 요약+정리
+    (_summarize_and_prune_archive)한다 — 매 시즌 아주 조금씩만 처리하므로
+    한 번에 몰아서 부담될 일이 없고, 그 덕분에 아카이브가 다시는 예전처럼
+    무한정 부풀지 않는다."""
     conn = get_conn()
     c = conn.cursor()
     cols = "id,league_id,week,home_team_id,away_team_id,home_score,away_score,season,year,day"
+    seasons = [r["season"] for r in c.execute(
+        "SELECT DISTINCT season FROM match_results WHERE season<?", (current_season,)).fetchall()]
     c.execute(
         f"""INSERT OR IGNORE INTO match_results_archive({cols})
             SELECT {cols} FROM match_results WHERE season<?""", (current_season,))
     c.execute("DELETE FROM match_results WHERE season<?", (current_season,))
     conn.commit()
+    if seasons:
+        _summarize_and_prune_archive(conn, seasons=seasons)
 
 
 def repair_duplicate_season_schedules():
@@ -1721,9 +1867,16 @@ def reset_game_data():
     # 게임에도 그대로 남아, 같은 league_id에 "있어야 할 리 없는" 과거
     # 시즌 데이터가 섞여 보이는 버그(예: 방금 고친 "일정이 안 뜬다" 건도
     # 이게 원인의 일부였을 가능성이 높다)로 이어질 수 있었다.
+    # [2026-08 버그수정, 신민용 리포트: "은퇴 후 새로 시작하면 팀이 있는데
+    # 없는 것처럼 오류가 난다"] league_season_standings(이번 세션에 성능
+    # 개선용으로 새로 추가한 시즌 요약 테이블)이 이 삭제 목록에서 빠져
+    # 있었다 — 그래서 새 게임을 시작해도 이전 플레이의 시즌 요약이
+    # 그대로 남아있었고, league_id/team_id가 새 게임에서도 재사용되는
+    # 구조라 이전 플레이 때 그 자리에 있던 "다른 팀"의 승/무/패 기록이
+    # 새 게임의 순위표 조회(get_league_standings)에 잘못 섞여 나왔다.
     for t in ["my_player","career_entries","promotion_log","trophy_log","awards",
               "game_log","match_results","match_results_archive","match_details",
-              "season_state","qual_results","offer_refused",
+              "season_state","qual_results","offer_refused","league_season_standings",
               "intl_history","intl_tournaments","intl_entries","intl_matches","nat_generation",
               "cl_tournaments","cl_entries","cl_matches","cl_history",
               "cwc_tournaments","cwc_entries","cwc_matches",

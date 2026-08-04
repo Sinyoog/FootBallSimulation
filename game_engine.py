@@ -4667,6 +4667,33 @@ def get_league_standings(league_id, season=None, conn=None):
         st = get_state()
         season = st["current_season"] if st else 1
 
+    # [2026-08 추가, 신민용 리포트: "게임.db가 너무 커져서 렉이 심하다"]
+    # 이 시즌이 이미 요약돼 있으면(archive_old_seasons가 시즌을 넘길 때
+    # 미리 계산해둠) 원본 경기 수백만 건을 다시 훑을 필요 없이 요약
+    # 테이블에서 바로 가져온다 — 결과는 완전히 동일하다(같은 공식으로
+    # 미리 계산해둔 것뿐). 요약이 없으면(진행 중인 이번 시즌, 또는 아직
+    # 1회성 마이그레이션 전인 옛 세이브) 예전처럼 원본을 직접 집계한다.
+    summarized = c.execute(
+        """SELECT team_id, wins, draws, losses, goals_for, goals_against
+           FROM league_season_standings WHERE league_id=? AND season=?""",
+        (league_id, season)).fetchall()
+    if summarized:
+        team_ids = {r["team_id"] for r in summarized}
+        qmarks = ",".join("?" * len(team_ids))
+        c.execute(f"SELECT id, name FROM teams WHERE id IN ({qmarks})", tuple(team_ids))
+        names = {r["id"]: r["name"] for r in c.fetchall()}
+        if own_conn:
+            conn.close()
+        rows = [{"id": r["team_id"], "name": names.get(r["team_id"], "?"),
+                 "wins": r["wins"], "draws": r["draws"], "losses": r["losses"],
+                 "goals_for": r["goals_for"], "goals_against": r["goals_against"]}
+                for r in summarized]
+        for r in rows:
+            r["pts"] = r["wins"] * 3 + r["draws"]
+            r["gd"] = r["goals_for"] - r["goals_against"]
+        rows.sort(key=lambda r: (-r["pts"], -r["gd"], -r["goals_for"]))
+        return rows
+
     # [2026-07 수정] match_results_archive 함께 조회 — 시즌 전환 시 과거
     # 시즌 데이터가 archive_old_seasons()로 옮겨지므로, 이 함수가 과거
     # 시즌(world_browser 역대 조회) 요청을 받으면 archive도 봐야 정확하다.
@@ -4874,6 +4901,21 @@ def generate_season_schedule(league_id, season, year, force=False):
                      + (SELECT COUNT(*) FROM match_results_archive WHERE league_id=? AND season=?)
                AS c""",
             (league_id, season, league_id, season)).fetchone()["c"]
+        # [2026-08 버그수정, 신민용 리포트: "역대 우승팀이 2000년부터 다
+        # 안 나온다"] match_results_archive를 압축하면서(리그 순위표는
+        # league_season_standings 요약으로 충분하다는 전제로) 내 커리어와
+        # 무관한 팀들의 원본 경기 행을 지운 게, 여기(완비 여부 판정)에서는
+        # "이미 끝난 과거 시즌인데 원본이 없으니 완비 안 됨"으로 오판하게
+        # 만들었다 — 그러면 이미 끝난 시즌 일정을 통째로 또 생성해버릴
+        # 위험이 있다. league_season_standings에 이 시즌 요약이 있으면
+        # (정상적으로 다 뛰고 아카이브+압축된 시즌이라는 뜻) 원본 행 수와
+        # 무관하게 완비로 간주한다.
+        if n_existing < expected_matches * 0.8:
+            _summarized = c.execute(
+                "SELECT 1 FROM league_season_standings WHERE league_id=? AND season=? LIMIT 1",
+                (league_id, season)).fetchone()
+            if _summarized:
+                conn.close(); return
         # 총 경기 수의 8할 이상 차 있으면 완비로 간주.
         if n_existing >= expected_matches * 0.8:
             conn.close(); return
@@ -5313,51 +5355,72 @@ def _check_sale_push_forced_sale(p, cur_year, cur_week):
     if score < 4:
         return
 
-    conn = get_conn()
-    my_tid = p.get("current_team_id", 0)
-    if not my_tid:
-        return
-    grades = _suitable_grades(p.get("ovr", 40), p.get("agent_grade", "F"))
-    row = conn.execute(
-        f"""SELECT t.id, t.name, l.id as lid, l.name as lname, l.tier,
-                   cn.name as country, cn.flag, cn.grade
-            FROM teams t JOIN leagues l ON t.league_id=l.id
-            JOIN countries cn ON l.country_id=cn.id
-            WHERE t.id != ? AND l.tier = 1 AND cn.grade IN ({",".join("?" * len(grades))})
-            ORDER BY RANDOM() LIMIT 1""",
-        (my_tid, *grades)).fetchone()
-    if not row:
-        return
+    # [2026-08 버그수정, 신민용 리포트: "승강이랑 팔림이 겹쳤을 때 크래시
+    # 났었다"] 이 함수는 대상 팀의 리그/등급 정보를 조회해두고 몇 단계
+    # 뒤에(오퍼 평가 → 로그 출력 → join_team) 그 정보로 실제 이적을
+    # 실행한다 — 그 사이 승강제 처리가 같은 팀의 tier/league_id를 바꿔
+    # 버리면 스냅샷이 어긋난 채로 join_team이 실행될 수 있었다. 함수
+    # 전체를 try/except로 감싸 여기서 무슨 예외가 나든 주간 진행
+    # (_advance_week) 전체가 죽지 않게 방어하고, 실제 이적 실행 직전에
+    # 대상 팀 정보를 한 번 더 신선하게 재조회해서 그 사이 tier가 바뀌었으면
+    # (더 이상 1부가 아니게 됐으면) 이번 주는 조용히 건너뛴다(다음 주 재시도).
+    try:
+        conn = get_conn()
+        my_tid = p.get("current_team_id", 0)
+        if not my_tid:
+            return
+        grades = _suitable_grades(p.get("ovr", 40), p.get("agent_grade", "F"))
+        row = conn.execute(
+            f"""SELECT t.id, t.name, l.id as lid, l.name as lname, l.tier,
+                       cn.name as country, cn.flag, cn.grade
+                FROM teams t JOIN leagues l ON t.league_id=l.id
+                JOIN countries cn ON l.country_id=cn.id
+                WHERE t.id != ? AND l.tier = 1 AND cn.grade IN ({",".join("?" * len(grades))})
+                ORDER BY RANDOM() LIMIT 1""",
+            (my_tid, *grades)).fetchone()
+        if not row:
+            return
 
-    salary = _calc_salary(row["grade"], row["tier"], p.get("ovr", 40),
-                          row["country"], row["name"], year=cur_year)
-    o = _build_offer(row, row["grade"], row["tier"], salary)
-    o["my_grade"] = get_league_grade(p.get("nationality", ""), "C")
-    my_team_row = conn.execute(
-        """SELECT cn.name as cname, l.tier as tier, cn.grade as grade
-           FROM teams t JOIN leagues l ON t.league_id=l.id
-           JOIN countries cn ON l.country_id=cn.id WHERE t.id=?""", (my_tid,)).fetchone()
-    if my_team_row and my_team_row["tier"] == 1:
-        o["my_grade"] = get_league_grade(my_team_row["cname"], my_team_row["grade"])
+        salary = _calc_salary(row["grade"], row["tier"], p.get("ovr", 40),
+                              row["country"], row["name"], year=cur_year)
+        o = _build_offer(row, row["grade"], row["tier"], salary)
+        o["my_grade"] = get_league_grade(p.get("nationality", ""), "C")
+        my_team_row = conn.execute(
+            """SELECT cn.name as cname, l.tier as tier, cn.grade as grade
+               FROM teams t JOIN leagues l ON t.league_id=l.id
+               JOIN countries cn ON l.country_id=cn.id WHERE t.id=?""", (my_tid,)).fetchone()
+        if my_team_row and my_team_row["tier"] == 1:
+            o["my_grade"] = get_league_grade(my_team_row["cname"], my_team_row["grade"])
 
-    decision, detail = evaluate_offer_decision(p, o)
-    if decision not in ("accept", "forced_sale"):
-        return   # 최소수용금액도 못 넘으면 이번 주는 그냥 넘어감(다음 주 재시도)
+        decision, detail = evaluate_offer_decision(p, o)
+        if decision not in ("accept", "forced_sale"):
+            return   # 최소수용금액도 못 넘으면 이번 주는 그냥 넘어감(다음 주 재시도)
 
-    if p.get("sale_push_refused_count", 0) < 1:
-        # 이번 판매추진 기간 내 첫 적격 후보 — 강제 안 하고 "거절 1회"만 기록
-        update_player(sale_push_refused_count=1)
-        add_log(f"📩 {o['team_name']}이(가) 관심을 보였으나, 당신은 잔류를 선택했습니다.",
-                "event", cur_year, cur_week)
-        return
+        if p.get("sale_push_refused_count", 0) < 1:
+            # 이번 판매추진 기간 내 첫 적격 후보 — 강제 안 하고 "거절 1회"만 기록
+            update_player(sale_push_refused_count=1)
+            add_log(f"📩 {o['team_name']}이(가) 관심을 보였으나, 당신은 잔류를 선택했습니다.",
+                    "event", cur_year, cur_week)
+            return
 
-    reason_lines = "\n".join(f"- {_SALE_PUSH_REASON_TEXT.get(r, '')}" for r in reasons)
-    add_log(
-        f"🔒 구단 최종 결정\n구단은 선수 잔류를 원했으나, 다음 사유로 이적을 "
-        f"최종 결정했습니다.\n{reason_lines}\n\n{o['team_name']} 이적료: {fmt_money(o.get('transfer_fee', 0))}",
-        "event", cur_year, cur_week)
-    join_team(o["team_id"], o["salary"], transfer_type="오퍼", offer=o)
-    update_player(sale_push_active=0, sale_push_refused_count=0, sale_push_low_score_weeks=0)
+        # [2026-08 신설] 실제 실행 직전 재확인 — row는 위에서 이미 몇 단계를
+        # 거쳐온 스냅샷이라, 그 사이(오퍼 평가 로직 등에서) 대상 팀이 더 이상
+        # 존재하지 않거나 1부가 아니게 됐으면 이번 주는 조용히 건너뛴다.
+        fresh = conn.execute(
+            """SELECT l.tier FROM teams t JOIN leagues l ON t.league_id=l.id
+               WHERE t.id=?""", (o["team_id"],)).fetchone()
+        if not fresh or fresh["tier"] != 1:
+            return
+
+        reason_lines = "\n".join(f"- {_SALE_PUSH_REASON_TEXT.get(r, '')}" for r in reasons)
+        add_log(
+            f"🔒 구단 최종 결정\n구단은 선수 잔류를 원했으나, 다음 사유로 이적을 "
+            f"최종 결정했습니다.\n{reason_lines}\n\n{o['team_name']} 이적료: {fmt_money(o.get('transfer_fee', 0))}",
+            "event", cur_year, cur_week)
+        join_team(o["team_id"], o["salary"], transfer_type="오퍼", offer=o)
+        update_player(sale_push_active=0, sale_push_refused_count=0, sale_push_low_score_weeks=0)
+    except Exception as e:
+        print("_check_sale_push_forced_sale 오류(건너뜀):", e)
 
 
 def _advance_week(p, base_week, n_weeks=4):
@@ -5427,7 +5490,10 @@ def _advance_week(p, base_week, n_weeks=4):
     # 재계산 — 오퍼가 매주 뜨는 기존 구조와 맞추기 위해 연말 1회가 아니라
     # 주 단위로 판정한다.
     if p.get("current_team_id"):
-        _weekly_sale_push_check(p, new_year, new_week)
+        try:
+            _weekly_sale_push_check(p, new_year, new_week)
+        except Exception as e:
+            print("_weekly_sale_push_check 오류(건너뜀):", e)
         _p_after_push = get_player()
         if _p_after_push and _p_after_push.get("current_team_id"):
             _check_sale_push_forced_sale(_p_after_push, new_year, new_week)

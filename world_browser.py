@@ -247,6 +247,16 @@ def get_league_standings_for_browser(league_id, season=None, year=None):
                  + (SELECT COUNT(*) FROM match_results_archive WHERE league_id=? AND season=?)
            AS n""",
         (league_id, season, league_id, season)).fetchone()["n"]
+    # [2026-08 버그수정, 신민용 리포트: "역대 우승팀이 2000년부터 다 안
+    # 나온다"] match_results_archive 압축으로 내 커리어와 무관한 팀들의
+    # 원본 경기가 지워진 뒤로는, cnt==0이 "정말 일정이 없다"가 아니라
+    # "이미 끝나서 league_season_standings로만 요약돼 있다"는 뜻일 수도
+    # 있다 — 그 경우까지 재생성 대상으로 오판하지 않도록 먼저 확인한다.
+    if cnt == 0:
+        summarized = conn.execute(
+            "SELECT 1 FROM league_season_standings WHERE league_id=? AND season=? LIMIT 1",
+            (league_id, season)).fetchone()
+        cnt = 1 if summarized else 0
     conn.close()
 
     if cnt == 0:
@@ -274,11 +284,18 @@ def league_has_lower_tier(league_id):
     return bool(lower)
 
 
-def get_league_champions(league_id, limit=30):
+def get_league_champions(league_id, limit=999):
     """이 리그의 시즌별 1~4위 + 실제 승격팀 전체/강등팀 전체 목록.
     실제로 경기가 진행된 시즌만 대상이며(한 번도 경기가 없었던 시즌은 제외),
     새 테이블 없이 match_results를 시즌 단위로 그때그때 집계해서 계산한다
     (승강전 처리와 동일한 방식).최신 시즌부터 최대 limit개.
+
+    [2026-08 수정, 신민용 리포트: "역대 우승팀이 2000년부터 다 안 나온다"]
+    limit 기본값을 30 → 999(사실상 전체)로 올렸다. 예전엔 시즌마다 원본
+    경기 수백~수천 건을 매번 다시 훑어 집계했어서 30개로 막아뒀는데,
+    이제 get_league_standings()가 league_season_standings 요약을 먼저
+    보므로 시즌 하나당 비용이 훨씬 가벼워졌다 — 실측: 21시즌 전체 조회에
+    0.17초, 체감 렉 없음.
 
     [2026-07 승강 플레이오프 도입, 재수정] 예전엔 승격/강등 명단을 순위
     위치만으로 재계산했다("하위 N명 = 강등") — 그런데 이제 그 N명 중
@@ -304,14 +321,22 @@ def get_league_champions(league_id, limit=30):
     # [2026-07 수정] archive_old_seasons()로 과거 시즌이 match_results_archive로
     # 옮겨지므로, 여기서도 두 테이블을 합쳐서 시즌 목록을 뽑아야 예전처럼
     # 모든 완료 시즌이 다 나온다.
+    # [2026-08 버그수정, 신민용 리포트: "역대 우승팀이 2000년부터 다 안
+    # 나온다"] match_results_archive 압축(내 커리어와 무관한 팀들의 원본
+    # 경기 삭제) 이후로는 원본만 보면 시즌 자체가 있었는지조차 알 수 없는
+    # 경우가 생겼다 — league_season_standings(압축돼도 절대 안 지워지는
+    # 요약)도 함께 봐야 모든 완료 시즌이 예전처럼 다 나온다.
     season_rows = conn.execute(
         """SELECT DISTINCT season, year FROM match_results
            WHERE league_id=? AND home_score>=0
            UNION
            SELECT DISTINCT season, year FROM match_results_archive
            WHERE league_id=? AND home_score>=0
+           UNION
+           SELECT DISTINCT season, year FROM league_season_standings
+           WHERE league_id=?
            ORDER BY season DESC LIMIT ?""",
-        (league_id, league_id, limit)).fetchall()
+        (league_id, league_id, league_id, limit)).fetchall()
 
     out = []
     for sr in season_rows:
@@ -370,8 +395,10 @@ def get_league_champions(league_id, limit=30):
                            SELECT season FROM match_results WHERE league_id=? AND year=?
                            UNION
                            SELECT season FROM match_results_archive WHERE league_id=? AND year=?
+                           UNION
+                           SELECT season FROM league_season_standings WHERE league_id=? AND year=?
                        ) LIMIT 1""",
-                    (src_lid, sr["year"], src_lid, sr["year"])).fetchone()
+                    (src_lid, sr["year"], src_lid, sr["year"], src_lid, sr["year"])).fetchone()
                 if src_season_row:
                     src_standings = get_league_standings(src_lid, season=src_season_row["season"], conn=conn)
                     for idx, s in enumerate(src_standings):
@@ -1259,7 +1286,7 @@ def get_team_history(team_id: int):
     trow = conn.execute("SELECT name FROM teams WHERE id=?", (team_id,)).fetchone()
     if not trow:
         conn.close()
-        return []
+        return {"awards": {"league": 0, "cup": 0, "cl": 0, "cwc": 0}, "years": []}
     team_name = trow["name"]
 
     yr_rows = conn.execute(
@@ -1267,8 +1294,11 @@ def get_team_history(team_id: int):
            WHERE (home_team_id=? OR away_team_id=?) AND home_score>=0
            UNION
            SELECT DISTINCT season, year, league_id FROM match_results_archive
-           WHERE (home_team_id=? OR away_team_id=?) AND home_score>=0""",
-        (team_id, team_id, team_id, team_id)).fetchall()
+           WHERE (home_team_id=? OR away_team_id=?) AND home_score>=0
+           UNION
+           SELECT DISTINCT season, year, league_id FROM league_season_standings
+           WHERE team_id=?""",
+        (team_id, team_id, team_id, team_id, team_id)).fetchall()
     by_year = {}
     for r in yr_rows:
         by_year[(r["year"], r["season"])] = r["league_id"]
@@ -1423,4 +1453,20 @@ def get_team_history(team_id: int):
             out.append(entry)
 
     conn.close()
-    return out
+
+    # [2026-08 신설, 신민용 요청: "팀 검색 우측 기록 맨 위에 '수상' 칸을
+    # 만들어서 리그/컵/챔스/클럽WC 우승 횟수를 한눈에 보여달라"] 방금
+    # 만든 연도별 entry 리스트를 그대로 훑어서 "[1등]"(리그 우승) /
+    # "[우승]"(컵·챔스·클럽WC 전부 이 표기 통일) 개수만 세면 된다 —
+    # 새 쿼리 없이 문자열만 확인하는 거라 비용이 사실상 0에 가깝다.
+    awards = {"league": 0, "cup": 0, "cl": 0, "cwc": 0}
+    for e in out:
+        if e["league"] and "[1등]" in e["league"]:
+            awards["league"] += 1
+        if e["cup"] and "[우승]" in e["cup"]:
+            awards["cup"] += 1
+        if e["cl"] and "[우승]" in e["cl"]:
+            awards["cl"] += 1
+        if e["cwc"] and "[우승]" in e["cwc"]:
+            awards["cwc"] += 1
+    return {"awards": awards, "years": out}

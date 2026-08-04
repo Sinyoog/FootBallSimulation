@@ -1504,7 +1504,8 @@ class WorldBrowserWindow(QDialog):
         tbl.setRowCount(0)
 
         hist = wb.get_team_history(tid)
-        if not hist:
+        awards, years = hist["awards"], hist["years"]
+        if not years and not any(awards.values()):
             tbl.setRowCount(1)
             empty = QTableWidgetItem("기록 없음")
             empty.setForeground(QColor("#666"))
@@ -1512,8 +1513,25 @@ class WorldBrowserWindow(QDialog):
             tbl.setSpan(0, 0, 1, 5)
             return
 
-        tbl.setRowCount(len(hist))
-        for i, entry in enumerate(hist):
+        # [2026-08 신설, 신민용 요청: "연도별 기록 맨 위에 '수상' 칸을 만들어
+        # 리그/컵/챔스/클럽WC 우승 횟수를 보여달라, 0회면 빈칸으로"]
+        tbl.setRowCount(len(years) + 1)
+        award_labels = [
+            ("수상", None),
+            (str(awards["league"]) if awards["league"] else "", "#4da6ff"),
+            (str(awards["cup"]) if awards["cup"] else "", "#c48aff"),
+            (str(awards["cl"]) if awards["cl"] else "", "#ffd700"),
+            (str(awards["cwc"]) if awards["cwc"] else "", "#4dd0e1"),
+        ]
+        for j, (text, color) in enumerate(award_labels):
+            cell = QTableWidgetItem(text)
+            cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            f = cell.font(); f.setBold(True); cell.setFont(f)
+            cell.setForeground(QColor(color) if color else QColor("#ffcc00"))
+            cell.setBackground(QColor("#2a2a2a"))
+            tbl.setItem(0, j, cell)
+
+        for i, entry in enumerate(years, start=1):
             year_item = QTableWidgetItem(str(entry["year"]))
             year_item.setForeground(QColor("#ffcc00"))
             f = year_item.font(); f.setBold(True); year_item.setFont(f)

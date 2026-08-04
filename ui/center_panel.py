@@ -743,8 +743,15 @@ class CenterPanel(QWidget):
             # injury_weeks는 이제(버그 수정 후) '남은 일수'를 담고 있어서,
             # 오늘(day)부터 d까지 며칠 지났는지로 그날도 부상 중인지 정확히
             # 계산할 수 있다.
+            # [2026-08 버그수정, 신민용 리포트: "11/5~11/11 주에 11/7에
+            # 부상당했는데 11/5부터 부상인 것처럼 뜬다"] 예전 조건은
+            # (d-day) < 남은일수만 봐서 하한이 없었다 — 오늘(day)보다
+            # 과거인 그 주의 앞쪽 날짜(d<day)는 (d-day)가 음수라 항상
+            # 조건을 만족해버려서, 실제로 부상당하기 전 날짜까지 전부
+            # "부상 중"으로 소급 표시됐다. d가 오늘 이후여야 한다는 하한을
+            # 추가한다.
             _inj_days_left = p.get("injury_weeks", 0) if p.get("injured") else 0
-            if _inj_days_left > 0 and (d - day) < _inj_days_left:
+            if _inj_days_left > 0 and day <= d < day + _inj_days_left:
                 cb.hide()
                 _idetail3 = p.get("injury_detail") or "부상"
                 _days_left_that_day = _inj_days_left - (d - day)

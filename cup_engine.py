@@ -94,7 +94,16 @@ def _cup_name_for_country(country_id):
     return CUP_NAME_BY_COUNTRY.get(cname, f"{cname}컵" if cname else "컵대회")
 
 
-def _round_name(n_teams: int, round_counter: int) -> str:
+def _round_name(n_teams: int, round_counter: int, is_pure_ko: bool = True) -> str:
+    """[2026-08 버그수정, 신민용 리포트: "최하위 리그가 딱 16팀이면 1라운드가
+    16강으로 잘못 뜬다"] 예전엔 참가 팀 수만 보고 이름을 붙여서, 아직 하위
+    부수가 계속 합류 중인 예선 단계인데도 우연히 그 라운드 참가 팀이
+    16/32/64 등과 맞아떨어지면 "16강" 같은 본선 이름이 붙었다 — 진짜
+    본선(더 이상 새 부수가 합류하지 않는 단계, is_pure_ko=True)일 때만
+    표준 강수 이름을 쓰고, 그 전(예선 단계)엔 숫자가 뭐든 무조건
+    "N라운드"로 표시한다."""
+    if not is_pure_ko:
+        return f"{round_counter + 1}라운드"
     m = {2: "결승", 4: "4강", 8: "8강", 16: "16강", 32: "32강", 64: "64강"}
     # round_counter는 0부터 시작하는 내부 인덱스라, 사람이 보는 라운드
     # 번호는 +1 해서 "0라운드"가 아니라 "1라운드"부터 보이게 한다.
@@ -464,7 +473,7 @@ def _start_next_round(t):
     # '결승'으로, 진짜 결승(2팀)은 이름 없는 'N라운드'로 밀려나는 오류가
     # 있었다. 실제 관례대로 '이 라운드에 들어오는 팀 수' 기준으로 고쳤다
     # (16강=16팀 참가, 결승=2팀 참가).
-    rname = _round_name(pool_entering, round_counter)
+    rname = _round_name(pool_entering, round_counter, is_pure_ko=(next_tier is None))
     # [버그수정 2026-07, 신민용 리포트] CUP_ROUND_WEEKS_POOL은 10칸뿐인데,
     # 팀 수가 아주 많은 나라(프랑스·이탈리아·스페인·브라질·독일·잉글랜드 등,
     # 하위 리그까지 다 합치면 팀이 훨씬 많아 라운드가 10개를 넘게 필요함)는
