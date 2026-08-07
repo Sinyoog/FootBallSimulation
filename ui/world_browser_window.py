@@ -265,6 +265,8 @@ class WorldBrowserWindow(QDialog):
         _wb_marks.append(("역대월드컵", _time_wb.perf_counter()))
         tabs.addTab(self._build_nc_tab(), "🎖 역대 네이션스컵")
         _wb_marks.append(("역대네이션스컵", _time_wb.perf_counter()))
+        tabs.addTab(self._build_country_tab(), "🌍 국가 검색")
+        _wb_marks.append(("국가검색", _time_wb.perf_counter()))
 
         _wb_total = _wb_marks[-1][1] - _wb_t0
         if _wb_total >= 0.05:
@@ -877,6 +879,7 @@ class WorldBrowserWindow(QDialog):
     _COUNTRY_COL_W = 118
     _TIER_COL_W = 48
     _LEAGUE_COL_W = 168
+    _TROPHY_COL_W = 140
 
     def _league_row_widget(self, lg):
         """리그 목록 한 줄 — 왼쪽부터 [리그명(고정폭)] [등급] [국가] [부수]
@@ -1556,6 +1559,217 @@ class WorldBrowserWindow(QDialog):
             cwc_item.setForeground(QColor("#4dd0e1" if entry.get("cwc") else "#555"))
             tbl.setItem(i, 4, cwc_item)
         tbl.resizeRowsToContents()
+
+    # ─────────────────────────────────────────
+    # 탭1.6: 국가 검색 (2026-08 신설, 신민용 확정: "월드컵/대륙컵 우승
+    # 기록실". 팀 검색 탭(_build_team_tab)과 거의 같은 UX — 대륙/등급
+    # 필터 + 검색창 + 좌측 목록/우측 상세. 트로피 집계는 world_browser의
+    # get_country_trophy_summary/get_country_title_list가 intl_tournaments.
+    # kind로 GROUP BY 하므로, 나중에 국제대회 종류가 늘어나도(새 kind 값)
+    # 이 탭은 코드 수정 없이 자동으로 새 대회 종류를 집계·표시한다 —
+    # 예쁜 한글 라벨만 constants.INTL_TOURNAMENT_KIND_LABELS에 추가하면 됨.
+    # ─────────────────────────────────────────
+    def _build_country_tab(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 8, 0, 0)
+
+        info = QLabel("ℹ️ 국가 하나를 골라 월드컵·대륙컵 등 국제대회 우승 기록을 확인하세요.")
+        info.setStyleSheet("color:#888;font-size:11px;")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+
+        filt = QHBoxLayout()
+        filt.setSpacing(8)
+        lbl1 = QLabel("대륙"); lbl1.setStyleSheet("color:#888;font-size:11px;")
+        self.country_cont_combo = QComboBox()
+        self.country_cont_combo.addItem(_ALL)
+        for cont in wb.list_continents():
+            self.country_cont_combo.addItem(cont)
+        self.country_cont_combo.currentTextChanged.connect(self._refresh_country_search_list)
+        filt.addWidget(lbl1)
+        filt.addWidget(self.country_cont_combo)
+
+        lbl2 = QLabel("등급"); lbl2.setStyleSheet("color:#888;font-size:11px;")
+        self.country_grade_combo = QComboBox()
+        self.country_grade_combo.addItem(_ALL)
+        for g in wb.list_grades():
+            self.country_grade_combo.addItem(g)
+        self.country_grade_combo.currentTextChanged.connect(self._refresh_country_search_list)
+        filt.addWidget(lbl2)
+        filt.addWidget(self.country_grade_combo)
+
+        self.country_search_box = QLineEdit()
+        self.country_search_box.setPlaceholderText("🔎 국가명 검색")
+        self._country_search_debounce = QTimer(self)
+        self._country_search_debounce.setSingleShot(True)
+        self._country_search_debounce.setInterval(250)
+        self._country_search_debounce.timeout.connect(self._refresh_country_search_list)
+        self.country_search_box.textChanged.connect(lambda _text: self._country_search_debounce.start())
+        filt.addWidget(self.country_search_box, 1)
+        lay.addLayout(filt)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+        self._country_split = split
+        self.country_list = QListWidget()
+        self.country_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.country_list.itemClicked.connect(self._on_country_selected)
+        self.country_list.setItemDelegate(_GridRowDelegate(self, self.country_list))
+        country_header = self._list_header_row([
+            ("국가", self._NAME_COL_W, False),
+            ("등급", self._GRADE_COL_W, True),
+            ("대륙", self._COUNTRY_COL_W, False),
+            ("우승 기록", self._TROPHY_COL_W, False),
+        ])
+        split.addWidget(self._wrap_list_with_header(self.country_list, country_header))
+
+        right = QWidget()
+        right_lay = QVBoxLayout(right)
+        right_lay.setContentsMargins(10, 0, 0, 0)
+        self.country_detail_title = QLabel("← 왼쪽에서 국가를 선택하세요")
+        self.country_detail_title.setStyleSheet("color:#00cc44;font-size:14px;font-weight:bold;")
+        right_lay.addWidget(self.country_detail_title)
+
+        # kind별 우승 횟수 요약 칩(예: 🌐 월드컵 2회  🎖 대륙컵 3회) — 대회
+        # 종류가 몇 개든(현재 2종, 앞으로 늘어나도) 가로로 쭉 붙여서 보여준다.
+        self.country_summary_row = QHBoxLayout()
+        self.country_summary_row.setSpacing(14)
+        summary_wrap = QWidget()
+        summary_wrap.setLayout(self.country_summary_row)
+        right_lay.addWidget(summary_wrap)
+
+        self.country_detail_tbl = QTableWidget(0, 4)
+        self.country_detail_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.country_detail_tbl.verticalHeader().setVisible(False)
+        self.country_detail_tbl.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.country_detail_tbl.setHorizontalHeaderLabels(["연도", "대회", "종류", "결과"])
+        self.country_detail_tbl.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents)
+        self.country_detail_tbl.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch)
+        self.country_detail_tbl.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents)
+        self.country_detail_tbl.horizontalHeader().setSectionResizeMode(
+            3, QHeaderView.ResizeMode.ResizeToContents)
+        self.country_detail_tbl.cellDoubleClicked.connect(self._open_country_title_detail)
+        right_lay.addWidget(self.country_detail_tbl, 1)
+        hint = QLabel("💡 우승 기록을 더블클릭하면 그 대회 상세를 볼 수 있어요")
+        hint.setStyleSheet("color:#666;font-size:10px;")
+        right_lay.addWidget(hint)
+
+        split.addWidget(right)
+        split.setSizes([440, 900])
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        lay.addWidget(split, 1)
+
+        self._refresh_country_search_list()
+        return w
+
+    def _refresh_country_search_list(self, *_a):
+        cont = None if self.country_cont_combo.currentText() == _ALL else self.country_cont_combo.currentText()
+        grade = None if self.country_grade_combo.currentText() == _ALL else self.country_grade_combo.currentText()
+        q = self.country_search_box.text().strip() or None
+        countries = wb.search_countries(name_query=q, continent=cont, grade=grade)
+        trophy_counts = wb.get_all_countries_trophy_counts()
+
+        self.country_list.clear()
+        for cn in countries:
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, cn["name"])
+            item.setData(_GridRowDelegate._SPEC_ROLE,
+                         self._country_row_spec(cn, trophy_counts.get(cn["name"], {})))
+            self.country_list.addItem(item)
+        self._ensure_list_fits(self.country_list, self._country_split)
+
+    def _trophy_chip_text(self, counts: dict) -> str:
+        """{kind: 횟수} → \"🌐2 🎖3\" 같은 짧은 요약 문자열. 라벨이 없는(=미래에
+        추가된) kind는 INTL_TOURNAMENT_KIND_FALLBACK_LABEL(🏆)로 표시돼서
+        코드 수정 없이도 안 깨지고 보인다."""
+        from constants import INTL_TOURNAMENT_KIND_GLYPHS, INTL_TOURNAMENT_KIND_FALLBACK_LABEL
+        if not counts:
+            return "-"
+        parts = []
+        for kind, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+            glyph = INTL_TOURNAMENT_KIND_GLYPHS.get(kind, INTL_TOURNAMENT_KIND_FALLBACK_LABEL)
+            parts.append(f"{glyph}{n}")
+        return " ".join(parts)
+
+    def _country_row_spec(self, cn, counts: dict):
+        return [
+            {"text": f"{cn['flag']} {cn['name']}", "width": self._NAME_COL_W,
+             "color": "#eee", "bold": True},
+            {"text": f"{cn['grade']}급", "width": self._GRADE_COL_W,
+             "color": _GRADE_COLORS.get(cn["grade"], "#888888"),
+             "size": 11, "bold": True, "align": Qt.AlignmentFlag.AlignCenter},
+            {"text": cn["continent"], "width": self._COUNTRY_COL_W, "color": "#aaddff"},
+            {"text": self._trophy_chip_text(counts), "width": self._TROPHY_COL_W,
+             "color": "#ffcc00" if counts else "#555"},
+        ]
+
+    def _on_country_selected(self, item):
+        name = item.data(Qt.ItemDataRole.UserRole)
+        if not name:
+            return
+        self.country_detail_title.setText(f"🌍 {name}  국제대회 우승 기록")
+
+        # 요약 칩 갱신
+        while self.country_summary_row.count():
+            child = self.country_summary_row.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+        summary = wb.get_country_trophy_summary(name)
+        if not summary:
+            empty = QLabel("아직 우승한 국제대회가 없습니다")
+            empty.setStyleSheet("color:#666;font-size:12px;")
+            self.country_summary_row.addWidget(empty)
+        else:
+            for s in summary:
+                chip = QLabel(f"{s['label']} {s['titles']}회")
+                chip.setStyleSheet(
+                    "background:#2a2a2a;color:#ffcc00;font-size:12px;font-weight:bold;"
+                    "padding:4px 10px;border-radius:8px;")
+                self.country_summary_row.addWidget(chip)
+        self.country_summary_row.addStretch(1)
+
+        # 연도별 전체 성적(우승~조별탈락) — [2026-08] 우승만 보여주던 것에서
+        # get_country_tournament_results()로 교체, 결과(몇강 탈락) 컬럼 추가.
+        _TIER_COLORS = {5: "#ffd700", 4: "#c0c0c0", 3: "#cd7f32",
+                         2: "#aaddff", 1: "#999999", 0: "#555555"}
+        tbl = self.country_detail_tbl
+        results = wb.get_country_tournament_results(name)
+        tbl.setRowCount(len(results))
+        from constants import INTL_TOURNAMENT_KIND_LABELS
+        for i, t in enumerate(results):
+            year_item = QTableWidgetItem(str(t["year"]))
+            year_item.setForeground(QColor("#ffcc00"))
+            f = year_item.font(); f.setBold(True); year_item.setFont(f)
+            year_item.setData(Qt.ItemDataRole.UserRole, t["id"])
+            year_item.setData(Qt.ItemDataRole.UserRole + 1, t["kind"])
+            tbl.setItem(i, 0, year_item)
+
+            name_item = QTableWidgetItem(t["name"])
+            tbl.setItem(i, 1, name_item)
+
+            kind_item = QTableWidgetItem(INTL_TOURNAMENT_KIND_LABELS.get(t["kind"], t["kind"]))
+            tbl.setItem(i, 2, kind_item)
+
+            result_item = QTableWidgetItem(t["result"])
+            result_item.setForeground(QColor(_TIER_COLORS.get(t["tier"], "#999999")))
+            rf = result_item.font()
+            rf.setBold(t["tier"] >= 3)
+            result_item.setFont(rf)
+            tbl.setItem(i, 3, result_item)
+        self._show_empty_state(tbl, results, "참가 기록 없음", 4)
+        tbl.resizeRowsToContents()
+
+    def _open_country_title_detail(self, row, _col):
+        item = self.country_detail_tbl.item(row, 0)
+        tid = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if tid is None:
+            return
+        wc = item.data(Qt.ItemDataRole.UserRole + 1) == "world"
+        self._open_intl_detail(self.country_detail_tbl, row, wc=wc)
 
     # ─────────────────────────────────────────
     # 탭2: 컵대회 검색 (2026-07 신설)

@@ -462,7 +462,10 @@ def get_match_detail(detail_id):
 
 def recalc_ovr(p: dict) -> int:
     stats = {s: p.get(s, 40) for s in ALL_STATS}
-    return calc_ovr(p.get("position", "CM"), stats)
+    # [2026-08 버그수정] 신 등급이면 talent_cap(100~105 개인별 값)을 상한으로,
+    # 그 외는 기존과 동일하게 100(→ 호출부에 따라 이후 99 클램프가 또 걸림).
+    _cap = p.get("talent_cap", 100) if p.get("talent_tier") == "god" else 100
+    return calc_ovr(p.get("position", "CM"), stats, cap=_cap)
 
 
 def _age_train_eff(age: int, peak_age: int) -> float:
@@ -683,7 +686,11 @@ def create_player(name: str, position: str, sub_role: str,
         stat_vals[s] = cur
         stat_vals[f"{s}_max"] = mx
 
-    ovr = calc_ovr(position, stat_vals)
+    # [2026-08 버그수정] 신 등급이면 talent_cap(100~105)을 그대로 상한으로
+    # 써야 실제로 100을 넘길 수 있다 — calc_ovr 기본 cap(100)만 쓰면
+    # TALENT_TIERS["god"]의 cap_max=105 설정이 여기서 다시 100으로 잘림.
+    _ovr_cap = talent_cap if talent_tier == "god" else 100
+    ovr = calc_ovr(position, stat_vals, cap=_ovr_cap)
 
     conn.execute("""
     INSERT INTO my_player(
@@ -2422,8 +2429,13 @@ def _process_training(p, week, ttype, focus_stat=None, day=None):
             add_log(f"😊 슬럼프 해소!  {_day_label(week, day)}", "slump")
 
     updates["slump"] = slump
+    # [2026-08 버그수정] 여기도 신 등급이면 talent_cap(100~105)을 상한으로
+    # 넘겨야 한다 — 안 그러면 calc_ovr 기본 cap(100)에 걸려 훈련으로
+    # 100을 넘기는 게 원천적으로 불가능해진다(바로 아래 99 클램프 이전에
+    # 이미 100에서 잘려있었음).
+    _cap = p.get("talent_cap", 100) if p.get("talent_tier") == "god" else 100
     updates["ovr"]   = calc_ovr(p["position"], {s: updates.get(s, p.get(s,40))
-                                                  for s in ALL_STATS})
+                                                  for s in ALL_STATS}, cap=_cap)
     # [2026-08 신설, 신민용 확정: "신이 아니면 100을 못 찍게 하고 싶어"]
     # 강점 스탯은 talent_cap+12까지 브레이크될 수 있어서(위 break_cap 참고),
     # OVR(가중평균)이 통계적으로 100 근처까지 갈 가능성이 있었다 — "약점이
@@ -2798,6 +2810,11 @@ def _simulate_match(p, week, info: dict, day=None):
 _team_prestige_cache: dict = {}
 PRESTIGE_MATCH_BONUS = 8.0
 
+# [2026-08 사용 중단] _team_avg_ovr()이 이제 이 고정 보너스 대신
+# teams.club_strength(동적 팀 강도)를 쓴다. 이 함수 자체는 seed_club_
+# strength_from_prestige()가 참조하는 data/prestige_clubs.PRESTIGE_TEAMS와
+# 별개 유틸이라 그대로 남겨두지만, 매치 계산 경로에서는 더 이상 호출되지
+# 않는다.
 def _is_team_prestige_cached(c, team_id):
     """팀의 명문팀 여부를 세션 캐시. is_prestige()는 국가+팀명만 보므로
     강등돼도(tier가 바뀌어도) 결과가 안 바뀐다 — 그래서 세션 내내
@@ -2839,8 +2856,17 @@ def _team_avg_ovr(c, team_id):
     # (같은 방식 시뮬레이션 검증: 강등확률 8.28%→0.02%). 화면에 보이는
     # 선수 개개인 OVR·전체 이력의 "팀간 격차가 좁다"는 느낌은 그대로
     # 유지하면서, 경기 결과에만 명문팀 우대가 반영된다.
-    if _is_team_prestige_cached(c, team_id):
-        val += PRESTIGE_MATCH_BONUS
+    # [2026-08 교체, 신민용 확정: 동적 팀 강도] 정적 명문팀 하드코딩
+    # 보너스(PRESTIGE_MATCH_BONUS)를 매치마다 고정으로 얹던 방식을
+    # 그만두고, 그 세이브 안에서 실제 성적으로 쌓이고 깎이는
+    # teams.club_strength를 대신 더한다. new_game 시 seed_club_strength_
+    # from_prestige()가 명문팀 등급을 "초기값"으로만 심어두고, 이후로는
+    # update_club_strength_after_season()(_process_promotion_relegation에서
+    # 매 시즌 호출)이 실제 순위로 이 값을 계속 갱신한다 — 그래서 몇 시즌
+    # 내내 못하면 명문팀도 서서히 이 보너스를 잃는다.
+    cs_row = c.execute("SELECT club_strength FROM teams WHERE id=?", (team_id,)).fetchone()
+    if cs_row and cs_row["club_strength"]:
+        val += cs_row["club_strength"]
     _team_ovr_cache[team_id] = val
     return val
 
@@ -8436,6 +8462,33 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
     _standings_cache = _calc_all_standings_cached(_all_team_rows, all_league_ids, season)
     _pr_t3 = _time_pr.perf_counter()
 
+    # [2026-08 신설, 신민용 확정: 동적 팀 강도] 방금 계산된 이번 시즌
+    # standings(= 승강으로 league_id가 바뀌기 전, "실제로 그 시즌을 치른"
+    # 리그 소속 기준)를 그대로 재사용해 teams.club_strength를 갱신한다.
+    # 추가 SELECT 없이 이미 메모리에 있는 _standings_cache만 쓰므로
+    # 43주 시즌 전환 성능에 영향이 없다. rescale_teams_to_target_ovr_batch
+    # (아래, league_id 이동 이후 호출)와는 독립적 — 순서 상관없이 안전.
+    try:
+        from constants import (club_strength_delta_for_rank, CLUB_STRENGTH_DECAY,
+                                CLUB_STRENGTH_MIN, CLUB_STRENGTH_MAX)
+        _cs_rows = c.execute("SELECT id, club_strength FROM teams").fetchall()
+        _cs_cur = {r["id"]: (r["club_strength"] or 0.0) for r in _cs_rows}
+        _cs_updates = []
+        for _lid, _ranked in _standings_cache.items():
+            _n = len(_ranked)
+            for _idx, _row in enumerate(_ranked, start=1):
+                _tid = _row["id"]
+                _delta = club_strength_delta_for_rank(_idx, _n)
+                _old = _cs_cur.get(_tid, 0.0)
+                _new = _old * CLUB_STRENGTH_DECAY + _delta
+                _new = max(CLUB_STRENGTH_MIN, min(CLUB_STRENGTH_MAX, _new))
+                _cs_updates.append((_new, _tid))
+        if _cs_updates:
+            c.executemany("UPDATE teams SET club_strength=? WHERE id=?", _cs_updates)
+            _invalidate_team_ovr_cache()
+    except Exception as _e:
+        add_log(f"[club_strength 갱신 오류] {_e}", "normal", year, 52)
+
     # [2026-07 신설, DEBUG_RELEGATION_TRACKING 전용] 지난 사이클에 등록해둔
     # 강등팀들의 "시즌 종료" 체크포인트 — 이번에 막 계산된 standings로
     # 순위까지 같이 남기고, 4시점 기록이 끝났으니 추적에서 제거한다.
@@ -9636,6 +9689,24 @@ def generate_offers(count=5, force=False) -> list:
         offer["rank_info"] = _get_team_rank_info(conn.cursor(), offer["team_id"],
                                                   ss=_ss_for_rank)
 
+    # [2026-08 신설, 신민용 확정: 시장 경쟁 효과] 이번 오퍼 배치에 이적료가
+    # 걸린(유료 이적) 제안이 여러 개 동시에 잡히면 "여러 구단이 동시에
+    # 노린다"는 뜻이다. evaluate_offer_decision()엔 원래 competing_offer_count
+    # 파라미터가 있었지만 join_team()이 항상 기본값(1)만 넘겨서 사실상 죽은
+    # 파라미터였다 — 이제 이번 배치의 실제 유료 이적 제안 수를 세서 각
+    # 오퍼에 채워 넣는다(구단 최소요구 판정에 실제로 반영됨). 동시에 매수팀
+    # 쪽 제안액 자체에도 소폭 프리미엄을 더한다 — 구단만 더 완고해지고
+    # 매수팀 제안은 그대로면, 여러 팀이 몰릴수록 오히려 아무도 문턱을 못
+    # 넘어 이적이 더 안 되는 역설이 생기기 때문.
+    _paid_offers = [o for o in offers if o.get("transfer_fee", 0) > 0]
+    _n_paid = len(_paid_offers)
+    if _n_paid >= 2:
+        _heat_mult = min(1.35, 1.0 + 0.08 * (_n_paid - 1))
+        for _o in _paid_offers:
+            _o["transfer_fee"] = int(_o["transfer_fee"] * _heat_mult)
+    for offer in offers:
+        offer["competing_offer_count"] = _n_paid
+
     conn.close()
 
     # [기능3] 이적 요청 플래그 소비 (오퍼가 생성됐으면 리셋)
@@ -10331,22 +10402,44 @@ def _enrich_offer(o: dict, row) -> dict:
         o["my_grade"] = _my_grade
         o["_base_fee"] = _base_fee
         _new_fee = int(_base_fee * offer_premium_mult(o.get("grade", "C"), _my_grade))
-        # [2026-07 신설, 신민용 리포트: "맨유가 3461억 불렀다가 다음엔
-        # 3343억으로 오히려 낮춰서 다시 온다 — 무슨 논리냐"] offer_premium_mult
-        # 가 매번 완전히 새로 랜덤이라, 같은 팀이 두 번째로 접촉해도 이전
-        # 제안액과 무관하게(심지어 더 낮게) 나올 수 있었다. 그 팀의 마지막
-        # 제안액을 기억해뒀다가, 같은 팀이 다시 제안할 땐 그 금액 밑으로
-        # 안 내려가게(오히려 소폭 인상) 한다 — 실제 협상은 거절당하면
-        # 보통 같거나 올려서 재접촉하지 낮춰 부르지 않는다.
+        # [2026-08 재설계, 신민용 지적: "AI가 시장가 근처 한 번 찔러보고
+        # 거절당하면 그냥 끝난다 — 진짜 협상이면 거절당할수록 올려서
+        # 다시 와야 한다"] 기존엔 "이전 제안액보다 낮게만 안 나오게"
+        # 하는 하한선 정도였다(offer_premium_mult가 매번 새 랜덤이라
+        # 거절당했다는 사실 자체는 다음 제안액에 전혀 반영 안 됐음).
+        # 이제 이 팀이 실제로 몇 번 거절당했는지(rejects, join_team의
+        # reject 분기에서 증가)를 기록해두고, 거절 횟수가 쌓일수록
+        # "직전 제안액 대비" 인상폭을 키운다 — 1회 거절 후 재접촉은
+        # +8~15%, 2회는 +18~28%, 3회 이상은 +30~45%까지. min_accept
+        # (최대 base_fee의 1.60배)에 몇 차례 안에 수렴하거나 넘어서도록
+        # 설계했다 — forced_sale 체크가 위에 이미 있어 무한정 치솟진
+        # 않는다(그 문턱을 넘으면 애초에 강제판매로 처리됨).
         try:
             _hist = json.loads(p.get("offer_history_json") or "{}")
         except Exception:
             _hist = {}
         _team_key = str(row["id"])
-        _prev_fee = _hist.get(_team_key)
-        if _prev_fee and _new_fee < _prev_fee:
-            _new_fee = int(_prev_fee * random.uniform(1.0, 1.08))
-        _hist[_team_key] = _new_fee
+        _prev_entry = _hist.get(_team_key)
+        # 구버전 세이브 호환: 예전엔 {team_id: fee}(순수 숫자) 형식이었다.
+        if isinstance(_prev_entry, dict):
+            _prev_fee = _prev_entry.get("fee")
+            _rejects = _prev_entry.get("rejects", 0)
+        else:
+            _prev_fee = _prev_entry
+            _rejects = 0
+        if _prev_fee:
+            if _rejects <= 0:
+                _escalate_mult = random.uniform(1.0, 1.08)
+            elif _rejects == 1:
+                _escalate_mult = random.uniform(1.08, 1.15)
+            elif _rejects == 2:
+                _escalate_mult = random.uniform(1.18, 1.28)
+            else:
+                _escalate_mult = random.uniform(1.30, 1.45)
+            _escalated_fee = int(_prev_fee * _escalate_mult)
+            if _escalated_fee > _new_fee:
+                _new_fee = _escalated_fee
+        _hist[_team_key] = {"fee": _new_fee, "rejects": _rejects}
         try:
             update_player(offer_history_json=json.dumps(_hist))
         except Exception:
@@ -11022,10 +11115,26 @@ def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None
     # 게이트를 건다 — 입단(FA)·로 등은 애초에 원 소속 구단이 없거나
     # 이적료 개념이 아니라서 대상이 아니다.
     if transfer_type == "오퍼" and offer and p and p.get("current_team_id"):
-        decision, detail = evaluate_offer_decision(p, offer)
+        decision, detail = evaluate_offer_decision(
+            p, offer, competing_offer_count=offer.get("competing_offer_count", 1))
         cur_year_for_log = p.get("current_year", GAME_START_YEAR)
         if decision == "reject":
             _record_offer_rejection(p, cur_year_for_log)
+            # [2026-08 신설] 이 팀 전용 거절 횟수를 올려둔다 — 다음 번
+            # 이 팀이 다시 제안할 때(_enrich_offer) 이 값을 보고 얼마나
+            # 더 올려서 부를지 정한다(재협상 사다리).
+            try:
+                _hist2 = json.loads(p.get("offer_history_json") or "{}")
+                _tk2 = str(offer.get("team_id", ""))
+                _entry2 = _hist2.get(_tk2)
+                if isinstance(_entry2, dict):
+                    _entry2["rejects"] = _entry2.get("rejects", 0) + 1
+                else:
+                    _entry2 = {"fee": offer.get("transfer_fee", 0), "rejects": 1}
+                _hist2[_tk2] = _entry2
+                update_player(offer_history_json=json.dumps(_hist2))
+            except Exception:
+                pass
             _buyer_name = offer.get("team_name", "")
             _buyer_grade = offer.get("grade", "?")
             add_log(

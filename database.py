@@ -1145,6 +1145,16 @@ def init_db():
         # 순서를 반드시 지킨다 — day 값 범위가 1~364라 0은 항상 무효값이므로
         # 0→NULL 재해석은 데이터 손실 없이 안전하다.)
         "ALTER TABLE cwc_matches ADD COLUMN day INTEGER",
+        # [2026-08 신설, 신민용 확정: 동적 팀 강도(club_strength) 시스템]
+        # "명문팀 = 영원히 명문"인 정적 하드코딩(data/prestige_clubs.py)
+        # 대신, 시즌 성적에 따라 오르내리는 값을 팀마다 따로 저장한다.
+        # 경기 계산에서만 쓰이고(_team_avg_ovr) DB에 저장된 개별 선수
+        # OVR·화면 표시는 건드리지 않는다 — PRESTIGE_MATCH_BONUS와 같은
+        # 성격의 '경기 시뮬 전용 보너스'인데, 고정값이 아니라 실제 성과로
+        # 누적/쇠퇴한다는 점만 다르다. 초기값은 new_game 시 프레스티지
+        # 등급으로 시딩(claude_seed_club_strength 참고), 이후 시즌마다
+        # update_club_strength_after_season()이 갱신한다.
+        "ALTER TABLE teams ADD COLUMN club_strength REAL DEFAULT 0",
     ]:
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,
@@ -1772,6 +1782,18 @@ def seed_initial_data(progress_cb=None):
     col_list = ", ".join(ai_cols)
     c.execute(f"DELETE FROM ai_players_seed")
     c.execute(f"INSERT INTO ai_players_seed({col_list}) SELECT {col_list} FROM ai_players")
+
+    # [2026-08 신설, 신민용 확정: 동적 팀 강도] 새 게임 최초 1회, 명문팀
+    # 리스트를 club_strength 초기값으로 심는다. 이후로는 시즌마다
+    # update_club_strength_after_season()이 실제 성적으로 이 값을
+    # 계속 갱신하므로, 이 호출은 게임 시작 시 딱 한 번뿐이어야 한다.
+    _stage("팀 위상 초기화", 1)
+    try:
+        seed_club_strength_from_prestige(conn)
+    except Exception as _e:
+        print(f"[club_strength 초기 시딩 오류] {_e}")
+    if progress_cb: progress_cb("팀 위상 초기화", 1, 1, "")
+
     c.execute("INSERT INTO meta VALUES('seeded','1')")
     conn.commit(); conn.close()
     print("완료")
@@ -1918,7 +1940,15 @@ STAT_IDX = {s: i for i, s in enumerate(ALL_STATS)}
 _WEIGHT_IDX_ITEMS = {pos: tuple((STAT_IDX[s], wt) for s, wt in w.items())
                      for pos, w in WEIGHTS.items()}
 
-def calc_ovr(position, stats):
+def calc_ovr(position, stats, cap=100):
+    """[2026-08 버그수정, 신민용 리포트: "신 등급을 100~105로 늘렸는데
+    화면엔 여전히 100으로 뜬다"] TALENT_TIERS["god"]의 cap_max를 105까지
+    올렸어도, 정작 OVR을 실제로 계산/저장하는 이 함수 자체가 항상
+    min(100, ...)로 고정 클램프하고 있어서 그 위 talent_cap 설정이
+    통째로 무효화되고 있었다. cap 파라미터를 받아 호출부(신 등급이면
+    개인별 talent_cap을, 그 외/AI는 기존과 동일하게 100을 넘김)에서
+    실제 상한을 결정하게 바꾼다 — 기본값 100이라 cap을 안 넘기는
+    기존 모든 호출(AI 5.9만 명 포함)은 완전히 동일하게 동작한다."""
     items = _WEIGHT_ITEMS.get(position, _WEIGHT_ITEMS["CM"])
     wsum = _WEIGHT_SUMS.get(position, _WEIGHT_SUMS["CM"])
     g = stats.get
@@ -1926,22 +1956,23 @@ def calc_ovr(position, stats):
     for s, wt in items:
         total += g(s, 40) * wt
     total /= wsum
-    return min(100, max(1, int(round(total))))
+    return min(cap, max(1, int(round(total))))
 
 
-def calc_ovr_from_list(position, vals):
+def calc_ovr_from_list(position, vals, cap=100):
     """calc_ovr과 완전히 동일한 공식/결과를, dict 대신 ALL_STATS 순서의
     리스트(vals)를 직접 받아 계산한다 (dict 생성/조회 비용 제거).
     vals는 반드시 ALL_STATS와 같은 순서·같은 길이여야 하며 값이 이미 채워져
     있어야 한다(=원래 calc_ovr의 stats.get(s,40) 기본값이 필요 없는 경우 전용).
-    핫루프(ai_lifecycle의 5.9만 AI 선수 시즌 처리) 전용 내부 함수."""
+    핫루프(ai_lifecycle의 5.9만 AI 선수 시즌 처리) 전용 내부 함수.
+    cap: calc_ovr과 동일 — 기본 100, AI 선수는 그대로 두면 됨."""
     items = _WEIGHT_IDX_ITEMS.get(position, _WEIGHT_IDX_ITEMS["CM"])
     wsum = _WEIGHT_SUMS.get(position, _WEIGHT_SUMS["CM"])
     total = 0
     for idx, wt in items:
         total += vals[idx] * wt
     total /= wsum
-    return min(100, max(1, int(round(total))))
+    return min(cap, max(1, int(round(total))))
 
 
 def get_league_avg_ovr(league_id, conn=None, exclude_team_id=None):
@@ -2138,6 +2169,118 @@ def rescale_teams_to_target_ovr_batch(jobs, conn=None):
         if own:
             conn.commit()
         return results
+    finally:
+        if own:
+            conn.close()
+
+
+def update_club_strength_after_season(season: int, year: int, conn=None):
+    """[2026-08 신설, 신민용 확정: 동적 팀 강도] 방금 끝난 시즌의
+    league_season_standings를 리그별로 순위 매겨, 그 결과로 teams.club_strength를
+    갱신한다. 하드코딩 명문팀 리스트(prestige_clubs.py)와 달리 그 세이브
+    안에서 실제로 잘한/못한 팀만 강해지거나 약해진다.
+
+    - 리그마다 승점(승*3+무) → 득실차 순으로 순위를 매기고,
+      club_strength_delta_for_rank(순위, 참가팀수)로 델타를 구한다.
+    - 새 값 = 이전 값 * CLUB_STRENGTH_DECAY + 델타, [MIN,MAX] 클램프.
+    - 리그 수가 많은 세이브(수백 개)를 고려해 SELECT 1회 + UPDATE 1회
+      executemany로 처리한다(rescale_teams_to_target_ovr_batch와 동일 패턴).
+
+    반환: 갱신된 team_id 수.
+    """
+    from constants import (club_strength_delta_for_rank, CLUB_STRENGTH_DECAY,
+                            CLUB_STRENGTH_MIN, CLUB_STRENGTH_MAX)
+    own = False
+    if conn is None:
+        conn = get_conn(); own = True
+    try:
+        rows = conn.execute(
+            """SELECT team_id, league_id, wins, draws, losses,
+                      goals_for, goals_against
+               FROM league_season_standings WHERE season=? AND year=?""",
+            (season, year)).fetchall()
+        if not rows:
+            return 0
+
+        by_league: dict = {}
+        for r in rows:
+            by_league.setdefault(r["league_id"], []).append(r)
+
+        team_ids = [r["team_id"] for r in rows]
+        placeholders = ",".join("?" * len(team_ids))
+        cur_rows = conn.execute(
+            f"SELECT id, club_strength FROM teams WHERE id IN ({placeholders})",
+            team_ids).fetchall()
+        cur_strength = {r["id"]: (r["club_strength"] or 0.0) for r in cur_rows}
+
+        update_rows = []
+        for league_id, teams_in_league in by_league.items():
+            n = len(teams_in_league)
+
+            def _key(r):
+                pts = r["wins"] * 3 + r["draws"]
+                gd = r["goals_for"] - r["goals_against"]
+                return (-pts, -gd)
+
+            ranked = sorted(teams_in_league, key=_key)
+            for idx, r in enumerate(ranked, start=1):
+                delta = club_strength_delta_for_rank(idx, n)
+                old = cur_strength.get(r["team_id"], 0.0)
+                new = old * CLUB_STRENGTH_DECAY + delta
+                new = max(CLUB_STRENGTH_MIN, min(CLUB_STRENGTH_MAX, new))
+                update_rows.append((new, r["team_id"]))
+
+        if update_rows:
+            conn.executemany(
+                "UPDATE teams SET club_strength=? WHERE id=?", update_rows)
+        if own:
+            conn.commit()
+        return len(update_rows)
+    finally:
+        if own:
+            conn.close()
+
+
+def seed_club_strength_from_prestige(conn=None):
+    """[2026-08 신설] new_game 1회성 시딩 전용. 정적 명문팀 리스트
+    (data/prestige_clubs.py)의 등급을 초기 club_strength 값으로 환산해
+    깔아준다 — 이후로는 update_club_strength_after_season()이 실제 성적으로
+    이 값을 계속 갱신하므로, 이 함수는 게임 시작 시 딱 한 번만 불러야 한다.
+    (기존 세이브에 뒤늦게 적용해도 안전 — club_strength가 이미 0이 아닌
+    팀은 실적으로 이미 갱신된 것이므로 덮어쓰지 않고 건너뛴다.)
+    """
+    from constants import CLUB_STRENGTH_SEED_BY_PRESTIGE_LEVEL
+    from data.prestige_clubs import PRESTIGE_TEAMS
+    own = False
+    if conn is None:
+        conn = get_conn(); own = True
+    try:
+        rows = conn.execute(
+            """SELECT t.id AS id, t.name AS tname, t.club_strength AS cs,
+                      cn.name AS cname
+               FROM teams t JOIN leagues l ON t.league_id = l.id
+               JOIN countries cn ON l.country_id = cn.id""").fetchall()
+        update_rows = []
+        for r in rows:
+            if r["cs"]:   # 이미 0이 아니면(실적 반영 시작됨) 건드리지 않음
+                continue
+            country_map = PRESTIGE_TEAMS.get(r["cname"], {})
+            level = None
+            for lvl, names in country_map.items():
+                if r["tname"] in names:
+                    level = lvl
+                    break
+            if level is None:
+                continue
+            seed = CLUB_STRENGTH_SEED_BY_PRESTIGE_LEVEL.get(level)
+            if seed:
+                update_rows.append((seed, r["id"]))
+        if update_rows:
+            conn.executemany(
+                "UPDATE teams SET club_strength=? WHERE id=?", update_rows)
+        if own:
+            conn.commit()
+        return len(update_rows)
     finally:
         if own:
             conn.close()

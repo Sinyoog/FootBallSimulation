@@ -907,6 +907,138 @@ def get_continental_cup_history(name=None, limit=100):
 
 
 # ─────────────────────────────────────────
+# 5.5. 국가 검색 (2026-08 신설, 신민용 확정: "월드컵/대륙컵 우승 기록실")
+# ─────────────────────────────────────────
+# [설계 원칙] intl_tournaments.winner에 우승국이 이미 문자열로 저장돼
+# 있으므로, kind별로 GROUP BY만 하면 국가별 집계가 나온다. 대회 종류가
+# 늘어나도(새 kind 값 추가) 이 쿼리들은 코드 수정 없이 자동으로 포함한다
+# — 화면 라벨만 constants.INTL_TOURNAMENT_KIND_LABELS에 추가하면 됨.
+
+def get_all_countries_trophy_counts():
+    """국가명 → {kind: 우승횟수} 매핑을 한 번에 집계.
+    [성능] 국가 검색 리스트를 채울 때 국가마다 개별 쿼리하면 국가 수(200+)
+    만큼 왕복이 생기므로, GROUP BY 한 번으로 전체를 미리 다 구해둔다."""
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT winner, kind, COUNT(*) as n FROM intl_tournaments
+           WHERE status='done' AND winner != '' GROUP BY winner, kind""").fetchall()
+    conn.close()
+    out = {}
+    for r in rows:
+        out.setdefault(r["winner"], {})[r["kind"]] = r["n"]
+    return out
+
+
+def get_country_trophy_summary(country_name):
+    """한 국가의 kind별 우승 횟수 요약(월드컵 N회 / 대륙컵 N회 / ...).
+    반환: [{"kind":, "titles":, "label":}, ...] 우승 많은 순."""
+    from constants import INTL_TOURNAMENT_KIND_LABELS as _LBL
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT kind, COUNT(*) as titles FROM intl_tournaments
+           WHERE status='done' AND winner=? GROUP BY kind
+           ORDER BY titles DESC""", (country_name,)).fetchall()
+    conn.close()
+    return [{"kind": r["kind"], "titles": r["titles"],
+              "label": _LBL.get(r["kind"], r["kind"])} for r in rows]
+
+
+def get_country_title_list(country_name, limit=200):
+    """한 국가가 우승한 대회를 연도 최신순으로 나열 — 국가 검색 탭
+    상세 패널의 하단 목록용(더블클릭하면 get_intl_tournament_detail로 열림)."""
+    conn = get_conn(); c = conn.cursor()
+    rows = [dict(r) for r in c.execute(
+        """SELECT id, year, kind, name FROM intl_tournaments
+           WHERE status='done' AND winner=?
+           ORDER BY year DESC, id DESC LIMIT ?""",
+        (country_name, limit)).fetchall()]
+    conn.close()
+    return rows
+
+
+# 국제대회 토너먼트 스테이지 순서(낮을수록 이른 탈락). F/TP는 스테이지상
+# SF보다 뒤지만, 거기 도달한 나라는 항상 placements(우승/준우승/3위/4위)로
+# 먼저 잡히므로 이 순서엔 안 넣는다 — F/TP 매치에 이름이 있는데 placements
+# 4자리 중 아무 데도 안 걸리는 경우는 정상적으로 없다.
+_STAGE_ORDER = ["group", "R32", "R16", "QF", "SF"]
+_STAGE_ORDER_IDX = {s: i for i, s in enumerate(_STAGE_ORDER)}
+
+
+def get_country_tournament_results(country_name, limit=200):
+    """한 국가가 '참가'한 모든 완료된 국제대회의 최종 성적을 연도 최신순으로
+    반환 - 우승/준우승/3위/4위는 물론, 그 밑이면 몇강에서 떨어졌는지까지
+    (예: "8강 탈락", "조별리그 탈락")를 계산해서 담는다.
+    [2026-08 신설, 신민용 리포트: "우승 기록만 있고 몇강 갔는지는 안 보인다"]
+    intl_entries(참가 여부) + intl_matches(스테이지) + _batch_placements
+    (준우승 이상 4자리)를 조합 - 새 kind가 생겨도 stage 이름 체계만 같으면
+    그대로 동작한다."""
+    from intl_engine import STAGE_KO
+    conn = get_conn(); c = conn.cursor()
+
+    tids = [r["tournament_id"] for r in c.execute(
+        "SELECT DISTINCT tournament_id FROM intl_entries WHERE country=?",
+        (country_name,)).fetchall()]
+    if not tids:
+        conn.close()
+        return []
+    ph = ",".join("?" * len(tids))
+    tours = [dict(r) for r in c.execute(
+        f"""SELECT id, year, kind, name FROM intl_tournaments
+            WHERE id IN ({ph}) AND status='done'
+            ORDER BY year DESC, id DESC LIMIT ?""", tids + [limit]).fetchall()]
+    if not tours:
+        conn.close()
+        return []
+    t_ids = [t["id"] for t in tours]
+    placements = _batch_placements(t_ids, conn)
+
+    ph2 = ",".join("?" * len(t_ids))
+    match_rows = c.execute(
+        f"""SELECT tournament_id, stage FROM intl_matches
+            WHERE tournament_id IN ({ph2}) AND (home=? OR away=?)""",
+        t_ids + [country_name, country_name]).fetchall()
+    stages_by_tid = {}
+    for r in match_rows:
+        stages_by_tid.setdefault(r["tournament_id"], set()).add(r["stage"])
+    conn.close()
+
+    out = []
+    for t in tours:
+        pl = placements.get(t["id"], {})
+        if pl.get("winner") == country_name:
+            result, tier = "🥇 우승", 5
+        elif pl.get("runner_up") == country_name:
+            result, tier = "🥈 준우승", 4
+        elif pl.get("third") == country_name:
+            result, tier = "🥉 3위", 3
+        elif pl.get("fourth") == country_name:
+            result, tier = "4위", 2
+        else:
+            stages = stages_by_tid.get(t["id"], set())
+            reached = [s for s in stages if s in _STAGE_ORDER_IDX]
+            if reached:
+                best = max(reached, key=lambda s: _STAGE_ORDER_IDX[s])
+                result, tier = f"{STAGE_KO.get(best, best)} 탈락", 1
+            else:
+                result, tier = "기록 없음", 0
+        out.append({"id": t["id"], "year": t["year"], "kind": t["kind"],
+                     "name": t["name"], "result": result, "tier": tier})
+    return out
+
+
+def search_countries(name_query=None, continent=None, grade=None):
+    """list_countries()에 이름 검색만 얹은 래퍼 — 팀 검색 탭의 search_teams()와
+    같은 UX(대륙/등급 필터 + 자유 검색어)를 국가 검색 탭에도 제공하기 위함.
+    기존 list_countries() 시그니처/동작은 그대로 둬서 다른 호출부(리그 검색
+    탭의 국가 콤보 등)에 영향이 없다."""
+    rows = list_countries(continent=continent, grade=grade)
+    if name_query:
+        q = name_query.strip().lower()
+        rows = [r for r in rows if q in r["name"].lower()]
+    return rows
+
+
+# ─────────────────────────────────────────
 # 6. 대회 상세(조별리그 순위 + 토너먼트 대진) — 월드컵/네이션스컵
 # ─────────────────────────────────────────
 # [성능] 아래 함수들은 전부 이미 끝난 대회의 intl_matches/cl_matches를
