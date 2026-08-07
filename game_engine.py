@@ -1239,7 +1239,7 @@ def _ensure_career_entry(p, st):
             position=get_field_pos(p), age=p.get("age"),
             talent_cap=p.get("talent_cap"),
             contract_remaining_years=_remain_e,
-            year=_cur_year_e,
+            year=_cur_year_e, team_id=tid,
         )
 
     c.execute("""INSERT INTO career_entries
@@ -5408,7 +5408,7 @@ def _check_sale_push_forced_sale(p, cur_year, cur_week):
             return
 
         salary = _calc_salary(row["grade"], row["tier"], p.get("ovr", 40),
-                              row["country"], row["name"], year=cur_year)
+                              row["country"], row["name"], year=cur_year, team_id=row["id"])
         o = _build_offer(row, row["grade"], row["tier"], salary)
         o["my_grade"] = get_league_grade(p.get("nationality", ""), "C")
         my_team_row = conn.execute(
@@ -7654,7 +7654,8 @@ def _end_of_season(p, year):
                 _gt = _my_grade_tier(p2)
                 if _gt:
                     _rg2, _rt2, _rc2 = _gt
-                    _fair_sal = _calc_salary(_rg2, _rt2, p2.get("ovr", 60), _rc2, year=year)
+                    _fair_sal = _calc_salary(_rg2, _rt2, p2.get("ovr", 60), _rc2, year=year,
+                                             team_id=p2.get("current_team_id"))
                 else:
                     _fair_sal = p2.get("salary", 0)
                 # 평점에 따라 ±15% 가감
@@ -7890,7 +7891,8 @@ def _check_forced_release(p, year, prior_season_matches=None,
     cur_ovr    = p.get("ovr", 40)
     if _glow and cur_salary > 0:
         _grade2, _tier2, _country2 = _glow
-        fair_salary = _calc_salary(_grade2, _tier2, cur_ovr, _country2, year=year)
+        fair_salary = _calc_salary(_grade2, _tier2, cur_ovr, _country2, year=year,
+                                   team_id=p.get("current_team_id"))
         overpay = (cur_salary / fair_salary) if fair_salary > 0 else 99
         is_overpaid = overpay >= 1.6
         is_underperforming = (avg_rating < 6.3 and rc >= 5) or (gap >= adjusted_threshold)
@@ -8197,7 +8199,7 @@ def _try_sell_player(p, year, cur_ovr):
         return False
 
     # 새 팀 연봉 (새 OVR 기준, 리그 부유도 반영)
-    new_salary = _calc_salary(get_league_grade(row["country"], row["grade"]), row["tier"], cur_ovr, row["country"], row["name"], year=year)
+    new_salary = _calc_salary(get_league_grade(row["country"], row["grade"]), row["tier"], cur_ovr, row["country"], row["name"], year=year, team_id=row["id"])
 
     # (변경) 떠나는 팀에는 우승을 주지 않는다.
     # 우승은 '시즌 종료 시점 소속팀'이 1위일 때만 _process_promotion_relegation에서 인정.
@@ -8470,24 +8472,51 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
     # (아래, league_id 이동 이후 호출)와는 독립적 — 순서 상관없이 안전.
     try:
         from constants import (club_strength_delta_for_rank, CLUB_STRENGTH_DECAY,
-                                CLUB_STRENGTH_MIN, CLUB_STRENGTH_MAX)
-        _cs_rows = c.execute("SELECT id, club_strength FROM teams").fetchall()
+                                CLUB_STRENGTH_MIN, CLUB_STRENGTH_MAX, MOMENTUM_SCHEDULES)
+        _cs_rows = c.execute(
+            "SELECT id, club_strength, momentum_type, momentum_seasons_left FROM teams").fetchall()
         _cs_cur = {r["id"]: (r["club_strength"] or 0.0) for r in _cs_rows}
+        _mom_cur = {r["id"]: (r["momentum_type"] or "", r["momentum_seasons_left"] or 0)
+                    for r in _cs_rows}
         _cs_updates = []
+        _mom_decay_updates = []
+        # [2026-08 신설] 이번 시즌 성적까지 반영해 방금 계산한 club_strength를
+        # team_id -> 값으로도 캐싱 — 아래 강등 최저티어 보장 로직이 재조회
+        # 없이 "지금 이 팀이 얼마나 강한가"를 바로 쓸 수 있게 한다.
+        _team_strength_cache: dict = {}
         for _lid, _ranked in _standings_cache.items():
             _n = len(_ranked)
             for _idx, _row in enumerate(_ranked, start=1):
                 _tid = _row["id"]
                 _delta = club_strength_delta_for_rank(_idx, _n)
                 _old = _cs_cur.get(_tid, 0.0)
-                _new = _old * CLUB_STRENGTH_DECAY + _delta
+                _mtype, _mleft = _mom_cur.get(_tid, ("", 0))
+                # [2026-08 신설, club_momentum] 강등 직후/국제대회 우승 직후처럼
+                # momentum이 남아있는 동안(_mleft>0)은 정상 감쇠(0.85) 대신
+                # 그 이벤트 스케줄(MOMENTUM_SCHEDULES)의 완화된 감쇠계수 +
+                # 임시 보너스를 적용하고, 카운트다운을 1 줄인다. 다 쓰면(0이
+                # 되면) 다음 시즌부터는 원래 방식으로 자동 복귀.
+                _sched = MOMENTUM_SCHEDULES.get(_mtype) if _mleft > 0 else None
+                if _sched:
+                    _decay, _bonus = _sched.get(_mleft, (CLUB_STRENGTH_DECAY, 0.0))
+                    _new = _old * _decay + _delta + _bonus
+                    _mom_decay_updates.append((_mtype, _mleft - 1, _tid))
+                else:
+                    _new = _old * CLUB_STRENGTH_DECAY + _delta
                 _new = max(CLUB_STRENGTH_MIN, min(CLUB_STRENGTH_MAX, _new))
                 _cs_updates.append((_new, _tid))
+                _team_strength_cache[_tid] = _new
         if _cs_updates:
             c.executemany("UPDATE teams SET club_strength=? WHERE id=?", _cs_updates)
             _invalidate_team_ovr_cache()
+        if _mom_decay_updates:
+            c.executemany("UPDATE teams SET momentum_type=?, momentum_seasons_left=? WHERE id=?",
+                          [(t, n, tid) for t, n, tid in _mom_decay_updates])
     except Exception as _e:
         add_log(f"[club_strength 갱신 오류] {_e}", "normal", year, 52)
+        _team_strength_cache = {}
+
+
 
     # [2026-07 신설, DEBUG_RELEGATION_TRACKING 전용] 지난 사이클에 등록해둔
     # 강등팀들의 "시즌 종료" 체크포인트 — 이번에 막 계산된 standings로
@@ -8588,6 +8617,7 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
 
     moved_teams: set = set()
     _rescale_jobs: list = []
+    _momentum_reset_updates: list = []  # [2026-08 신설] (momentum_type, seasons_left, team_id) — 이벤트 발생 시 리셋
     # [2026-07 최적화, 신민용 리포트: "연도전환 최적화 더 해봐"] 승격/강등
     # 팀마다 UPDATE teams + INSERT promotion_log를 개별 실행했는데(실측
     # 209개국 × 평균 2개 경계 × 경계당 승격/강등 팀들 = 수백~수천 건),
@@ -8639,6 +8669,36 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
             n_actual = min(len(auto_upper_cands), len(auto_lower_cands))
             bottom_upper_list = auto_upper_cands[:n_actual]
             top_lower_list    = auto_lower_cands[:n_actual]
+
+            # [2026-08 재설계, 강등 스노우볼 방지 — club_strength 기반]
+            # "prestige_clubs.py 안에 있는 팀만 보호"가 아니라 "지금 이
+            # 세이브에서 실제로 강한 팀"(club_strength 기준)이면 명문
+            # 리스트 소속 여부와 무관하게 보호 대상이 되도록 바꿨다. 이
+            # 경계의 위 리그(tier)가 CLUB_STRENGTH_RELEGATION_FLOOR의
+            # "바닥 티어"와 일치하면, 강등 후보 중 그 밴드 이상 club_strength
+            # 를 가진 팀은 정해진 확률로 강등이 취소되고 대신 자동존 바로
+            # 위 순위 팀이 그 자리를 대신 내려간다 — 리그 인원수는 그대로
+            # 유지, "무조건 생존"이 아니라 확률상 살아남을 뿐이다.
+            if bottom_upper_list:
+                from constants import CLUB_STRENGTH_RELEGATION_FLOOR
+                _replacement_pool = ([r for r in upper_rows[:-auto_count] if r["id"] not in moved_teams]
+                                      if auto_count else [])
+                _repl_idx = len(_replacement_pool) - 1  # 자동존 바로 위 팀부터 순서대로 소비
+                _new_bottom_upper_list = []
+                for _cand in bottom_upper_list:
+                    _strength = _team_strength_cache.get(_cand["id"], 0.0)
+                    _floor = _chance = None
+                    for _min_str, _f, _ch in CLUB_STRENGTH_RELEGATION_FLOOR:
+                        if _strength >= _min_str:
+                            _floor, _chance = _f, _ch
+                            break  # 밴드는 club_strength 내림차순 정렬 — 첫 매치가 그 팀의 밴드
+                    if (_floor is not None and tier == _floor and _repl_idx >= 0
+                            and random.random() < _chance):
+                        _new_bottom_upper_list.append(_replacement_pool[_repl_idx])
+                        _repl_idx -= 1
+                        continue  # _cand(강한 팀)는 강등 취소, 대신 위 팀이 강등
+                    _new_bottom_upper_list.append(_cand)
+                bottom_upper_list = _new_bottom_upper_list
 
             if n_actual == 0 and not po_exists:
                 continue
@@ -8741,6 +8801,12 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
                 # 강등: bottom_upper → lower
                 _team_move_updates.append((lower_lid, ntier, bottom_upper["id"]))
                 _move_team_cache(bottom_upper["id"], lower_lid)
+                # [2026-08 신설, club_momentum] 강등된 팀은 'relegation_recovery'
+                # momentum으로 리셋 — 다음 시즌부터 몇 시즌간 club_strength
+                # 감쇠 완화 + 임시 보너스를 받는다(강등 스노우볼 방지).
+                from constants import MOMENTUM_START_BY_TYPE
+                _momentum_reset_updates.append(
+                    ("relegation_recovery", MOMENTUM_START_BY_TYPE["relegation_recovery"], bottom_upper["id"]))
                 if _lower_strong is not None:
                     _rescale_jobs.append((bottom_upper["id"], _lower_strong))
                     if DEBUG_RELEGATION_TRACKING:
@@ -8765,6 +8831,9 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
     _pr_t5 = _time_pr.perf_counter()
     if _team_move_updates:
         c.executemany("UPDATE teams SET league_id=?,current_tier=? WHERE id=?", _team_move_updates)
+    if _momentum_reset_updates:
+        c.executemany("UPDATE teams SET momentum_type=?, momentum_seasons_left=? WHERE id=?",
+                      _momentum_reset_updates)
     if _promotion_log_inserts:
         c.executemany(
             """INSERT INTO promotion_log(year,team_name,from_tier,to_tier,league_name,
@@ -9307,7 +9376,7 @@ def generate_offers(count=5, force=False) -> list:
             row = random.choices(cands, _w)[0]
             _wealth_g = get_league_grade(row["country"], row["grade"])
             salary = _clamp_salary_to_cap(
-                int(_calc_salary(_wealth_g, tier, ovr, row["country"], row["name"], year=p.get("current_year")) * random.uniform(0.85, 1.15)),
+                int(_calc_salary(_wealth_g, tier, ovr, row["country"], row["name"], year=p.get("current_year"), team_id=row["id"]) * random.uniform(0.85, 1.15)),
                 _wealth_g, row["country"], tier)
             pool.append(_build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary))
             exclude_ids.add(row["id"])
@@ -9371,7 +9440,7 @@ def generate_offers(count=5, force=False) -> list:
             row = random.choices(cands, _w)[0]
             _wealth_g = get_league_grade(row["country"], row["grade"])
             salary = _clamp_salary_to_cap(
-                int(_calc_salary(_wealth_g, tier, ovr, row["country"], row["name"], year=p.get("current_year")) * random.uniform(0.85, 1.15)),
+                int(_calc_salary(_wealth_g, tier, ovr, row["country"], row["name"], year=p.get("current_year"), team_id=row["id"]) * random.uniform(0.85, 1.15)),
                 _wealth_g, row["country"], tier)
             pool.append(_build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary))
             exclude_ids.add(row["id"])
@@ -9456,7 +9525,7 @@ def generate_offers(count=5, force=False) -> list:
             if row["id"] == my_tid: return False
             _wealth_g = get_league_grade(row["country"], row["grade"])
             salary = _clamp_salary_to_cap(
-                int(_calc_salary(_wealth_g, tier, ovr, row["country"], row["name"], year=p.get("current_year")) * random.uniform(0.85, 1.15)),
+                int(_calc_salary(_wealth_g, tier, ovr, row["country"], row["name"], year=p.get("current_year"), team_id=row["id"]) * random.uniform(0.85, 1.15)),
                 _wealth_g, row["country"], tier)
             offers.append(_build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary))
             return True
@@ -9524,7 +9593,7 @@ def generate_offers(count=5, force=False) -> list:
             if not _team_fits_me(row): continue
             _wealth_g = get_league_grade(row["country"], row["grade"])
             salary = _clamp_salary_to_cap(
-                int(_calc_salary(_wealth_g, tier, ovr, row["country"], row["name"], year=p.get("current_year")) * random.uniform(0.85, 1.15)),
+                int(_calc_salary(_wealth_g, tier, ovr, row["country"], row["name"], year=p.get("current_year"), team_id=row["id"]) * random.uniform(0.85, 1.15)),
                 _wealth_g, row["country"], tier)
             offers.append(_build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary))
 
@@ -9558,7 +9627,7 @@ def generate_offers(count=5, force=False) -> list:
                 if not _team_fits_me(row): continue
                 _wealth_g = get_league_grade(row["country"], row["grade"])
                 salary = _clamp_salary_to_cap(
-                    int(_calc_salary(_wealth_g, tier, ovr, row["country"], row["name"], year=p.get("current_year")) * random.uniform(0.85, 1.15)),
+                    int(_calc_salary(_wealth_g, tier, ovr, row["country"], row["name"], year=p.get("current_year"), team_id=row["id"]) * random.uniform(0.85, 1.15)),
                     _wealth_g, row["country"], tier)
                 offers.append(_build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary))
 
@@ -10076,7 +10145,7 @@ def apply_to_team(team_id):
     grade = get_league_grade(row["country"], row["grade"])
     tier = row["tier"]
     ovr = p.get("ovr", 40)
-    salary = int(_calc_salary(grade, tier, ovr, row["country"], row["name"], year=p.get("current_year")) * random.uniform(0.95, 1.15))
+    salary = int(_calc_salary(grade, tier, ovr, row["country"], row["name"], year=p.get("current_year"), team_id=row["id"]) * random.uniform(0.95, 1.15))
     offer = _build_offer(row, grade, tier, salary)
     offer["_zone"] = "applied"
     _rank_conn = get_conn()
@@ -10212,7 +10281,7 @@ def _try_youth_scout_offer(c, p, ovr, existing_offers, team_avg_cache, my_countr
         row = random.choice(fit)
         wealth_g = get_league_grade(row["country"], row["grade"])
         salary = _clamp_salary_to_cap(
-            int(_calc_salary(wealth_g, tier, ovr, row["country"], row["name"], year=p.get("current_year")) * random.uniform(0.7, 0.9)),
+            int(_calc_salary(wealth_g, tier, ovr, row["country"], row["name"], year=p.get("current_year"), team_id=row["id"]) * random.uniform(0.7, 0.9)),
             wealth_g, row["country"], tier)
         offer = _build_offer(row, wealth_g, tier, salary)
         offer["_zone"] = "youth_scout"
@@ -10679,6 +10748,8 @@ def _min_accept_extra_pct(p, offer, my_team_importance_ratio, competing_offer_co
     - 계약 잔여기간(★★★★☆): 길수록 안 팜, 6개월 이하면 오히려 싸게라도 팜.
     - 나이/잠재력(★★★★☆): 어리고 잠재력 갭 크면 절대 안 팜, 30대 이상은 팜.
     - 구단 야망(★★★☆☆): 우승 도전이면 안 팜, 강등권이면 재정압박 흡수해 팜.
+    - 상위 리그 이적 매력도(★★★★☆, 2026-08 신설): 매수팀 리그 등급이
+      확실히 높으면(격차 1~3단계+) 문턱을 낮춘다 — "커리어 도약" 요소.
     - 감독 호감도(★★☆☆☆, 보조): 아주 높을 때만 소폭.
     - 경쟁 오퍼(★★☆☆☆, 보조): 여러 팀이 동시에 관심 보이면 소폭 상승.
     - 거절 누적/불만(할인): 반복 거절될수록 완화(음수로 작용).
@@ -10754,6 +10825,28 @@ def _min_accept_extra_pct(p, offer, my_team_importance_ratio, competing_offer_co
         extra += 0.10
     elif rel >= 80:
         extra += 0.05
+
+    # [2026-08 신설, 신민용+GPT 검토 확정] 상위 리그 이적 매력도 ★★★★☆
+    # 강제판매(forced_sale_threshold_mult)에는 "매수팀이 3단계+ 높으면
+    # 문턱을 낮춘다"는 격차 보정이 있는데, 정작 그 밑의 정상 협상 구간
+    # (min_accept, 여기)에는 매수팀 리그 등급이 전혀 반영되지 않았다 —
+    # 그래서 C급 핵심 선수한테 SS급 팀이 정상적인 수준으로 제안해도
+    # "팀 중요도"만으로 문턱이 이미 1.5~1.6까지 올라가 있으면 그냥
+    # 거절당했다. "상위 리그 기회는 선수·구단 모두에게 매력적"이라는
+    # 요소를 추가한다 — 단, 값은 보수적으로(초기 제안 -0.25/0.15/0.08
+    # 대비 완화) 잡는다: 이 함수가 이미 여러 요소를 가산하는 구조라
+    # 여기에 큰 음수를 더하면 "SS팀이 항상 헐값에 데려간다"는 반대쪽
+    # 부작용이 생길 수 있다는 지적을 반영했다. gap==0(동급 이적)은
+    # 영향 없음 — SS→SS처럼 이미 최상위끼리는 "도약"이라 할 게 없다.
+    my_grade = offer.get("my_grade", "C")
+    buyer_grade = offer.get("grade", "C")
+    _league_gap = LEAGUE_GRADE_RANK.get(buyer_grade, 4) - LEAGUE_GRADE_RANK.get(my_grade, 4)
+    if _league_gap >= 3:
+        extra -= 0.15
+    elif _league_gap == 2:
+        extra -= 0.10
+    elif _league_gap == 1:
+        extra -= 0.05
 
     # 경쟁 오퍼 ★★☆☆☆ (보조)
     if competing_offer_count >= 3:
@@ -11021,7 +11114,7 @@ def _save_career_entry(p, year, week, force_new=False, transfer_type=None,
                     position=get_field_pos(p), age=p.get("age"),
                     talent_cap=p.get("talent_cap"),
                     contract_remaining_years=_remain,
-                    year=cur_year,
+                    year=cur_year, team_id=tid,
                 )
             else:
                 transfer_fee = 0

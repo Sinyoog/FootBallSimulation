@@ -5,15 +5,16 @@ import random
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QLineEdit, QComboBox, QFrame,
-    QDialog, QMessageBox, QScrollArea, QGridLayout
+    QDialog, QMessageBox, QScrollArea, QGridLayout, QTextEdit
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QEvent
 from PyQt6.QtGui import QFont
 
-from database import reset_game_data, get_conn
-from game_engine import create_player, get_player
+from database import reset_game_data, get_conn, KEY_STATS_BY_POS
+from game_engine import create_player, get_player, _SUB_ROLE_MATCH_MOD
 from constants import (POSITIONS, SUB_ROLES, PERSONALITIES, GAME_START_YEAR,
-                       PLAYER_START_AGE, TALENT_TIER_KO, TALENT_TIER_ORDER, PHYSICAL_TRAITS)
+                       PLAYER_START_AGE, TALENT_TIER_KO, TALENT_TIER_ORDER, PHYSICAL_TRAITS,
+                       TALENT_TIERS, PERSONALITY_EFFECTS, PHYSICAL_TRAIT_EFFECTS, STAT_KO)
 
 DARK_STYLE = """
 QWidget { background-color: #1a1a1a; color: #e0e0e0;
@@ -379,12 +380,21 @@ class NewPlayerDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("새 선수 생성")
-        self.setMinimumWidth(400)
+        self.setMinimumWidth(720)
         self.setStyleSheet(DARK_STYLE)
         self._build()
 
     def _build(self):
-        lay = QVBoxLayout(self)
+        # [2026-08 신설, 신민용 요청: "재능/신체특징/포지션/세부역할 클릭하면
+        # 우측에 메모장처럼 설명이 뜨게"] 다이얼로그를 좌(입력폼)/우(설명
+        # 노트) 2열로 나눈다. 기존 코드는 전부 self에 직접 QVBoxLayout을
+        # 붙였는데, 그걸 그대로 왼쪽 폼 위젯(form_w) 안으로 옮기고 바깥은
+        # QHBoxLayout으로 감싼다 — 아래 내용(row 구성)은 하나도 안 바뀜.
+        outer = QHBoxLayout(self)
+        outer.setSpacing(14)
+
+        form_w = QWidget()
+        lay = QVBoxLayout(form_w)
         lay.setSpacing(12)
 
         # 헤더
@@ -495,6 +505,187 @@ class NewPlayerDialog(QDialog):
         btn_row.addWidget(ok_btn)
         btn_row.addWidget(cancel_btn)
         lay.addLayout(btn_row)
+
+        outer.addWidget(form_w, 3)
+
+        # ── 우측: 설명 노트 패널 (2026-08 신설) ────────────────────
+        # 재능 등급/성격/신체 특징/주요 포지션/세부역할 콤보 중 하나를
+        # 클릭(포커스)하면 그 필드의 실제 게임 효과를 여기 보여준다.
+        # 다른 필드를 클릭하면 그 필드 설명으로 바뀐다(패널이 하나뿐이라
+        # 이전 설명은 자연히 사라짐) — 값을 바꾸면(currentIndexChanged)
+        # 지금 포커스된 패널이면 그 즉시 갱신된다.
+        note_w = QWidget()
+        note_lay = QVBoxLayout(note_w)
+        note_lay.setContentsMargins(0, 0, 0, 0)
+        note_title = QLabel("📋 설명")
+        note_title.setStyleSheet("color:#888;font-size:12px;font-weight:bold;")
+        note_lay.addWidget(note_title)
+        self.note_panel = QTextEdit()
+        self.note_panel.setReadOnly(True)
+        self.note_panel.setStyleSheet(
+            "QTextEdit { background-color:#111318; color:#ccc; border:1px solid #333; "
+            "border-radius:6px; padding:10px; font-size:12px; }")
+        self.note_panel.setHtml(self._note_default())
+        note_lay.addWidget(self.note_panel, 1)
+        outer.addWidget(note_w, 2)
+
+        self._note_handlers = {}
+        self._active_note_widget = None
+        for combo, handler in (
+            (self.pos_combo, self._note_for_position),
+            (self.role_combo, self._note_for_role),
+            (self.talent_combo, self._note_for_talent),
+            (self.personality_combo, self._note_for_personality),
+            (self.trait_combo, self._note_for_trait),
+        ):
+            combo.installEventFilter(self)
+            self._note_handlers[combo] = handler
+            combo.currentIndexChanged.connect(
+                lambda _i, cb=combo: self._refresh_note_if_active(cb))
+
+    # ── 설명 노트 콘텐츠 ─────────────────────────────────────────
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.FocusIn and obj in getattr(self, "_note_handlers", {}):
+            self._active_note_widget = obj
+            self.note_panel.setHtml(self._note_handlers[obj]())
+        return super().eventFilter(obj, event)
+
+    def _refresh_note_if_active(self, combo):
+        if self._active_note_widget is combo:
+            self.note_panel.setHtml(self._note_handlers[combo]())
+
+    def _note_default(self):
+        return ("<span style='color:#666;'>재능 등급 / 성격 / 신체 특징 / 주요 포지션 / "
+                "세부역할 중 하나를 클릭하면<br>여기에 실제 게임 효과가 표시됩니다.</span>")
+
+    def _note_html(self, title, lines):
+        body = "<br>".join(lines)
+        return (f"<b style='color:#00cc44;font-size:13px;'>{title}</b><br><br>"
+                f"<span style='line-height:150%;'>{body}</span>")
+
+    def _note_for_talent(self):
+        cur = self.talent_combo.currentData()
+        lines = ["선수 스탯이 훈련으로 도달할 수 있는 '숨겨진 성장 상한'을 정합니다.",
+                 "고강도 훈련을 꾸준히 하면 개별 스탯이 이 범위 안에서 자리잡습니다",
+                 "(강점 스탯은 상한+12까지 추가 돌파 가능, 약점은 상한보다 낮게 형성돼",
+                 "평균 OVR은 대체로 상한 근방에서 균형을 이룹니다).", ""]
+        for t in TALENT_TIER_ORDER:
+            cfg = TALENT_TIERS[t]
+            mark = " ← 현재 선택" if cur == t else ""
+            lines.append(f"· {TALENT_TIER_KO[t]}: {cfg['cap_min']}~{cfg['cap_max']}{mark}")
+        if cur is None:
+            lines.append("<br>🎲 랜덤 선택 시 9개 등급 중 균등 확률(각 1/9)로 추첨됩니다.")
+        return self._note_html("재능 등급 — 숨겨진 스탯 성장 상한", lines)
+
+    def _note_for_position(self):
+        pos = self.pos_combo.currentData()
+        if pos is None:
+            return self._note_html("주요 포지션",
+                ["뛸 위치를 정합니다 — OVR 계산에서 어떤 스탯을 우선하는지가 포지션마다 다릅니다.",
+                 "🎲 랜덤 선택 시 11개 포지션 중 무작위로 배정됩니다."])
+        keys = KEY_STATS_BY_POS.get(pos, [])
+        stat_lines = [f"{i+1}. {STAT_KO.get(s, s)}" for i, s in enumerate(keys)]
+        lines = [f"'{pos}' 포지션에서 OVR 계산에 가장 크게 반영되는 핵심 스탯 순서:", ""]
+        lines += [f"· {s}" for s in stat_lines]
+        lines.append("")
+        lines.append("실제 경기에서도 이 스탯들의 비중이 높게 반영됩니다")
+        lines.append("(예: 공격수는 슈팅/헤딩, 수비수는 태클/헤딩 위주).")
+        return self._note_html(f"주요 포지션 — {pos}", lines)
+
+    _ROLE_EFFECT_LABELS = {
+        "g_mult": "득점 반영 배율", "a_mult": "도움 반영 배율",
+        "gp_mult": "골 결정력(찬스 전환) 배율", "blk_mult": "수비 기여(차단) 배율",
+        "sp_add": "세이브율 가산", "pa_add": "패스 정확도 가산",
+    }
+
+    def _note_for_role(self):
+        pos = self.pos_combo.currentData()
+        role = self.role_combo.currentData()
+        if pos is None:
+            return self._note_html("세부역할",
+                ["세부역할은 주요 포지션이 정해져야 목록이 정해집니다.",
+                 "먼저 '주요 포지션'을 선택해주세요(또는 🎲 랜덤으로 두면 둘 다 자동 배정)."])
+        if role is None:
+            avail = SUB_ROLES.get(pos, [])
+            return self._note_html(f"세부역할 — {pos}",
+                [f"'{pos}'의 세부역할 후보: {', '.join(avail)}",
+                 "", "🎲 랜덤 선택 시 이 중 하나가 무작위로 배정됩니다."])
+        mod = _SUB_ROLE_MATCH_MOD.get((pos, role))
+        lines = [f"'{pos} - {role}'가 실제 경기 결과(골/도움/세이브 등)에 주는 보정:", ""]
+        if not mod:
+            lines.append("· 이 조합은 별도 보정이 없습니다(기본값 그대로 반영).")
+        else:
+            for k, v in mod.items():
+                label = self._ROLE_EFFECT_LABELS.get(k, k)
+                if k.endswith("_mult"):
+                    lines.append(f"· {label}: ×{v}")
+                else:
+                    sign = "+" if v >= 0 else ""
+                    lines.append(f"· {label}: {sign}{v}")
+        lines.append("")
+        lines.append("배율 1.0 초과=강화, 미만=약화입니다. 예를 들어 득점 배율이 높고")
+        lines.append("도움 배율이 낮으면 '해결사형', 반대면 '어시스트형' 역할입니다.")
+        return self._note_html(f"세부역할 — {pos} · {role}", lines)
+
+    _EFFECT_LABELS = {
+        "train_eff": ("훈련 효율", "x"), "stress_mult": ("스트레스 축적 속도", "x"),
+        "happy_gain_mult": ("행복도 상승폭", "x"), "big_match_rating": ("빅매치 평점 보정", "pt"),
+        "losing_rating": ("열세 상황 평점 보정", "pt"), "team_win_bonus": ("팀 승리 기여 보너스", "pt"),
+        "red_card_chance": ("퇴장 확률", "addpct"), "high_train_bonus": ("고강도 훈련 효과", "x"),
+        "low_train_penalty": ("저강도 훈련 효과", "x"), "slump_chance_mult": ("슬럼프 확률", "x"),
+        "cup_rating": ("컵대회 평점 보정", "pt"), "natural_growth_bonus": ("자연 성장 보너스", "addpct"),
+        "mental_growth_mult": ("멘탈 스탯 성장 속도", "x"), "no_slump": ("슬럼프 면역", "flag"),
+        "slump_threshold_reduce": ("슬럼프 발동 임계치 감소", "pt"),
+        "slump_chance_add": ("슬럼프 확률", "addpct"), "injury_add": ("부상 확률", "addpct"),
+        "stamina_train": ("체력 훈련 효과", "x"), "phys_growth_mult": ("신체 스탯 성장 속도", "x"),
+        "phys_stat": ("집중 성장 스탯", "raw"), "phys_start_bonus": ("초기 신체 스탯 보너스", "addpt"),
+    }
+
+    def _fmt_effect(self, key, value):
+        label, unit = self._EFFECT_LABELS.get(key, (key, "raw"))
+        if unit == "x":
+            return f"· {label}: ×{value}"
+        if unit == "pt":
+            sign = "+" if value >= 0 else ""
+            return f"· {label}: {sign}{value}"
+        if unit == "addpt":
+            return f"· {label}: +{value}"
+        if unit == "addpct":
+            pct = value * 100 if abs(value) < 1 else value
+            return f"· {label}: +{pct:.0f}%p"
+        if unit == "flag":
+            return f"· {label}" if value else ""
+        if key == "phys_stat":
+            return f"· {label}: {STAT_KO.get(value, value)}"
+        return f"· {label}: {value}"
+
+    def _note_for_personality(self):
+        p = self.personality_combo.currentData()
+        if p is None:
+            return self._note_html("성격",
+                ["훈련 효율·스트레스·평점 등에 영향을 주는 선수 성향입니다.",
+                 "🎲 랜덤 선택 시 확률 추첨으로 배정됩니다."])
+        effects = PERSONALITY_EFFECTS.get(p, {})
+        lines = [f"'{p}' 성격의 실제 효과:", ""]
+        if not effects:
+            lines.append("· 특별한 효과 없음")
+        else:
+            lines += [self._fmt_effect(k, v) for k, v in effects.items()]
+        return self._note_html(f"성격 — {p}", lines)
+
+    def _note_for_trait(self):
+        t = self.trait_combo.currentData()
+        if t is None:
+            return self._note_html("신체 특징",
+                ["부상 확률·신체 스탯 성장 등에 영향을 주는 타고난 체질입니다.",
+                 "🎲 랜덤 선택 시 확률 추첨으로 배정됩니다(무난함이 가장 흔함)."])
+        effects = PHYSICAL_TRAIT_EFFECTS.get(t, {})
+        lines = [f"'{t}' 신체 특징의 실제 효과:", ""]
+        if not effects:
+            lines.append("· 특별한 효과 없음(평범한 신체)")
+        else:
+            lines += [self._fmt_effect(k, v) for k, v in effects.items()]
+        return self._note_html(f"신체 특징 — {t}", lines)
 
     def _update_roles(self, pos):
         """pos가 None(랜덤 포지션)이면 세부역할도 "🎲 랜덤" 하나만 두고

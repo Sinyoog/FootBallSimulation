@@ -511,6 +511,12 @@ def _finish_tournament(t):
     winner_id = _round_winner(dict(final))
     conn.execute("UPDATE cwc_tournaments SET status='done', winner_team_id=? WHERE id=?",
                  (winner_id, t["id"]))
+    # [2026-08 신설, 신민용 확정: club_momentum 확장] 클럽월드컵(4년 주기,
+    # "세계 최강 클럽" 타이틀) 우승팀에도 momentum을 건다 — 챔스보다도 조금
+    # 더 강한 cwc_champion 스케줄(constants.MOMENTUM_SCHEDULES)을 쓴다.
+    from constants import MOMENTUM_START_BY_TYPE
+    conn.execute("UPDATE teams SET momentum_type=?, momentum_seasons_left=? WHERE id=?",
+                 ("cwc_champion", MOMENTUM_START_BY_TYPE["cwc_champion"], winner_id))
 
     p = get_player()
     my_tid = p.get("current_team_id", 0) if p else 0

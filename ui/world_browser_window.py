@@ -1337,7 +1337,7 @@ class WorldBrowserWindow(QDialog):
         lbl4 = QLabel("부수"); lbl4.setStyleSheet("color:#888;font-size:11px;")
         self.team_tier_combo = QComboBox()
         self.team_tier_combo.addItem(_ALL)
-        for t in range(1, 7):
+        for t in range(1, wb.list_max_tier() + 1):
             self.team_tier_combo.addItem(f"{t}부")
         self.team_tier_combo.currentTextChanged.connect(self._refresh_team_list)
         filt.addWidget(lbl4)
@@ -1496,6 +1496,26 @@ class WorldBrowserWindow(QDialog):
         h.addStretch(1)
         return row
 
+    def _two_line_cell(self, main_text, main_color, record=None, bold=False):
+        """[2026-08 신설, 신민용 요청: "팀 검색에서 리그뿐 아니라 국내컵/
+        챔스/클럽월드컵도 각자 승무패를 아래에 보여달라"] 표 칸 하나에
+        본문(위) + 그 대회의 전적(아래, 작은 회색 글씨)을 세로로 쌓는
+        범용 위젯. record가 없으면(그 대회에 출전 안 한 해 등) 본문만."""
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(6, 4, 6, 4)
+        lay.setSpacing(1)
+        main_lbl = QLabel(main_text)
+        main_lbl.setWordWrap(True)
+        _weight = "bold" if bold else "normal"
+        main_lbl.setStyleSheet(f"color:{main_color};font-weight:{_weight};font-size:12px;")
+        lay.addWidget(main_lbl)
+        if record:
+            rec_lbl = QLabel(record)
+            rec_lbl.setStyleSheet("color:#888;font-size:10px;")
+            lay.addWidget(rec_lbl)
+        return w
+
     def _on_team_selected(self, item):
         tid = item.data(Qt.ItemDataRole.UserRole)
         tname = item.data(Qt.ItemDataRole.UserRole + 1)
@@ -1535,29 +1555,33 @@ class WorldBrowserWindow(QDialog):
             tbl.setItem(0, j, cell)
 
         for i, entry in enumerate(years, start=1):
+            # [2026-08 신설, 신민용 요청: "리그뿐 아니라 국내컵/챔스/클럽
+            # 월드컵도 각자 승무패가 있으니 그것도 각 칸 아래에 보여달라"]
+            # 국가 검색 탭(country_detail_tbl)처럼 "상세기록"을 별도 컬럼
+            # 으로 오른쪽에 두는 대신, 각 대회 칸 안에 그 대회 결과 + 그
+            # 대회 전적을 세로로 쌓는다(대회마다 전적이 다르므로 칸마다
+            # 각자의 record를 넣는다) — _two_line_cell 참고.
             year_item = QTableWidgetItem(str(entry["year"]))
             year_item.setForeground(QColor("#ffcc00"))
             f = year_item.font(); f.setBold(True); year_item.setFont(f)
             tbl.setItem(i, 0, year_item)
 
             lg_txt = entry["league"] or "-"
-            lg_item = QTableWidgetItem(lg_txt)
-            lg_item.setForeground(QColor(
-                "#4da6ff" if "승격" in lg_txt else
-                "#ff5555" if "강등" in lg_txt else "#ddd"))
-            tbl.setItem(i, 1, lg_item)
+            lg_color = ("#4da6ff" if "승격" in lg_txt else
+                        "#ff5555" if "강등" in lg_txt else "#ddd")
+            tbl.setCellWidget(i, 1, self._two_line_cell(lg_txt, lg_color, entry.get("league_record")))
 
-            cup_item = QTableWidgetItem(entry["cup"] or "-")
-            cup_item.setForeground(QColor("#c48aff" if entry["cup"] else "#555"))
-            tbl.setItem(i, 2, cup_item)
+            cup_txt = entry["cup"] or "-"
+            cup_color = "#c48aff" if entry["cup"] else "#555"
+            tbl.setCellWidget(i, 2, self._two_line_cell(cup_txt, cup_color, entry.get("cup_record")))
 
-            cl_item = QTableWidgetItem(entry["cl"] or "-")
-            cl_item.setForeground(QColor("#ffd700" if entry["cl"] else "#555"))
-            tbl.setItem(i, 3, cl_item)
+            cl_txt = entry["cl"] or "-"
+            cl_color = "#ffd700" if entry["cl"] else "#555"
+            tbl.setCellWidget(i, 3, self._two_line_cell(cl_txt, cl_color, entry.get("cl_record")))
 
-            cwc_item = QTableWidgetItem(entry.get("cwc") or "-")
-            cwc_item.setForeground(QColor("#4dd0e1" if entry.get("cwc") else "#555"))
-            tbl.setItem(i, 4, cwc_item)
+            cwc_txt = entry.get("cwc") or "-"
+            cwc_color = "#4dd0e1" if entry.get("cwc") else "#555"
+            tbl.setCellWidget(i, 4, self._two_line_cell(cwc_txt, cwc_color, entry.get("cwc_record")))
         tbl.resizeRowsToContents()
 
     # ─────────────────────────────────────────
@@ -1638,11 +1662,11 @@ class WorldBrowserWindow(QDialog):
         summary_wrap.setLayout(self.country_summary_row)
         right_lay.addWidget(summary_wrap)
 
-        self.country_detail_tbl = QTableWidget(0, 4)
+        self.country_detail_tbl = QTableWidget(0, 5)
         self.country_detail_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.country_detail_tbl.verticalHeader().setVisible(False)
         self.country_detail_tbl.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        self.country_detail_tbl.setHorizontalHeaderLabels(["연도", "대회", "종류", "결과"])
+        self.country_detail_tbl.setHorizontalHeaderLabels(["연도", "대회", "종류", "결과", "상세기록"])
         self.country_detail_tbl.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.ResizeToContents)
         self.country_detail_tbl.horizontalHeader().setSectionResizeMode(
@@ -1651,6 +1675,8 @@ class WorldBrowserWindow(QDialog):
             2, QHeaderView.ResizeMode.ResizeToContents)
         self.country_detail_tbl.horizontalHeader().setSectionResizeMode(
             3, QHeaderView.ResizeMode.ResizeToContents)
+        self.country_detail_tbl.horizontalHeader().setSectionResizeMode(
+            4, QHeaderView.ResizeMode.ResizeToContents)
         self.country_detail_tbl.cellDoubleClicked.connect(self._open_country_title_detail)
         right_lay.addWidget(self.country_detail_tbl, 1)
         hint = QLabel("💡 우승 기록을 더블클릭하면 그 대회 상세를 볼 수 있어요")
@@ -1741,26 +1767,42 @@ class WorldBrowserWindow(QDialog):
         tbl.setRowCount(len(results))
         from constants import INTL_TOURNAMENT_KIND_LABELS
         for i, t in enumerate(results):
-            year_item = QTableWidgetItem(str(t["year"]))
-            year_item.setForeground(QColor("#ffcc00"))
-            f = year_item.font(); f.setBold(True); year_item.setFont(f)
-            year_item.setData(Qt.ItemDataRole.UserRole, t["id"])
-            year_item.setData(Qt.ItemDataRole.UserRole + 1, t["kind"])
-            tbl.setItem(i, 0, year_item)
+            # [2026-08 방어코드, 신민용 리포트: "연도만 뜨고 나머지가 텅 빔"]
+            # PyQt의 QTableWidgetItem(str)은 None이 들어오면 예외를 던지는데,
+            # 이 예외가 슬롯 안에서 조용히 삼켜지면서(콘솔에만 트레이스백)
+            # 그 시점 이후 컬럼이 전부 미설정 상태로 남는 증상이 있었다.
+            # world_browser.get_country_tournament_results()에서 이미
+            # None을 걸러주지만, 혹시 모를 다른 원인(레거시 데이터 등)에도
+            # 안전하도록 한 행씩 try/except로 감싼다 — 한 행이 이상해도
+            # 그 행만 건너뛰고 나머지 행은 정상 표시되게.
+            try:
+                year_item = QTableWidgetItem(str(t["year"]))
+                year_item.setForeground(QColor("#ffcc00"))
+                f = year_item.font(); f.setBold(True); year_item.setFont(f)
+                year_item.setData(Qt.ItemDataRole.UserRole, t["id"])
+                year_item.setData(Qt.ItemDataRole.UserRole + 1, t["kind"])
+                tbl.setItem(i, 0, year_item)
 
-            name_item = QTableWidgetItem(t["name"])
-            tbl.setItem(i, 1, name_item)
+                name_item = QTableWidgetItem(str(t["name"]) if t["name"] else "-")
+                tbl.setItem(i, 1, name_item)
 
-            kind_item = QTableWidgetItem(INTL_TOURNAMENT_KIND_LABELS.get(t["kind"], t["kind"]))
-            tbl.setItem(i, 2, kind_item)
+                kind_label = INTL_TOURNAMENT_KIND_LABELS.get(t["kind"], t["kind"])
+                kind_item = QTableWidgetItem(str(kind_label) if kind_label else "-")
+                tbl.setItem(i, 2, kind_item)
 
-            result_item = QTableWidgetItem(t["result"])
-            result_item.setForeground(QColor(_TIER_COLORS.get(t["tier"], "#999999")))
-            rf = result_item.font()
-            rf.setBold(t["tier"] >= 3)
-            result_item.setFont(rf)
-            tbl.setItem(i, 3, result_item)
-        self._show_empty_state(tbl, results, "참가 기록 없음", 4)
+                result_item = QTableWidgetItem(str(t["result"]) if t["result"] else "-")
+                result_item.setForeground(QColor(_TIER_COLORS.get(t["tier"], "#999999")))
+                rf = result_item.font()
+                rf.setBold(t["tier"] >= 3)
+                result_item.setFont(rf)
+                tbl.setItem(i, 3, result_item)
+
+                record_item = QTableWidgetItem(str(t.get("record") or "-"))
+                record_item.setForeground(QColor("#aaaaaa"))
+                tbl.setItem(i, 4, record_item)
+            except Exception as e:
+                print(f"[국제대회기록] {name} {t.get('year')}년 행 렌더링 오류(건너뜀): {e}")
+        self._show_empty_state(tbl, results, "참가 기록 없음", 5)
         tbl.resizeRowsToContents()
 
     def _open_country_title_detail(self, row, _col):

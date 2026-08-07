@@ -1635,6 +1635,15 @@ def _finish_tournament(t):
     if fourth:
         conn.execute("UPDATE cl_entries SET alive=0 WHERE tournament_id=? AND team_id=?",
                      (tid, fourth))
+    # [2026-08 신설, 신민용 확정: club_momentum] 챔스 우승팀은 다음 시즌에도
+    # 강한 전력이 어느 정도 유지되도록 momentum을 리셋한다. club_strength에
+    # 직접 값을 더하는 방식(영구 버프)이 아니라, 몇 시즌짜리 감쇠 완화
+    # 스케줄만 걸어둔다 — 계속 못하면 결국 원래 감쇠로 돌아가 서서히
+    # 식는다(우승 하나로 장기 왕조가 되는 걸 방지). 리그 강등 momentum
+    # (relegation_recovery)과 같은 틀(constants.MOMENTUM_SCHEDULES)을 쓴다.
+    from constants import MOMENTUM_START_BY_TYPE
+    conn.execute("UPDATE teams SET momentum_type=?, momentum_seasons_left=? WHERE id=?",
+                 ("ucl_champion", MOMENTUM_START_BY_TYPE["ucl_champion"], winner))
     conn.commit()
     conn.close()
 

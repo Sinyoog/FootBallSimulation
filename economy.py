@@ -47,14 +47,20 @@ def economy_index(year: int) -> float:
     return anchors[-1][1]
 
 
-def _apply_soft_cap(multiplier: float, threshold: float = 1.6, damp: float = 0.4) -> float:
-    """[2026-07 신설, v4] 이적료 복합배율(리그×포지션×명문×계약×나이×잠재력)이
-    전부 곱연산이라, 조건이 몰리면(SS급+명문팀+ST+21세 이하+계약5년+큰 잠재력
-    gap) 개별 배율의 의도보다 훨씬 커지는 문제가 있었다 — 앵커에서 2800억으로
-    잡아놔도 최종 5000억대까지 튀는 식. threshold를 넘는 초과분에만 damp
-    비율을 적용해 극단값만 눌러준다(평범한 선수는 threshold 밑이라 전혀 영향
-    없음). 파라미터(1.6/0.4)는 GPT 권고값 — 구현 후 대규모 시뮬레이션으로
-    분포를 보고 재검증 필요(v4 문서 TODO)."""
+def _apply_soft_cap(multiplier: float, threshold: float = 1.5, damp: float = 0.3) -> float:
+    """[2026-07 신설, v4; 2026-08 재조정] 이적료 복합배율(리그×포지션×명문×
+    계약×나이×잠재력)이 전부 곱연산이라, 조건이 몰리면(SS급+명문팀+ST+21세
+    이하+계약5년+큰 잠재력 gap) 개별 배율의 의도보다 훨씬 커지는 문제가
+    있었다 — 앵커에서 2800억으로 잡아놔도 최종 5000억대까지 튀는 식.
+    threshold를 넘는 초과분에만 damp 비율을 적용해 극단값만 눌러준다
+    (평범한 선수는 threshold 밑이라 전혀 영향 없음).
+    [2026-08 재조정, 신민용+GPT 검토 확정] 실측 결과 OVR97/SS급/ST/24세/
+    계약4년처럼 "흔한 우수 매물" 조합만으로도 combined_mult가 1.76~2.20까지
+    나와서, 기존 1.6/0.4로는 여전히 최종값이 4600억~9200억까지 튀었다
+    (네이마르 실제 역대 최고 이적료 3550억을 이미 넘김). threshold를
+    1.6→1.5로, damp를 0.4→0.3(초과분 압축을 더 강하게)로 조정 — "기본값을
+    낮추기보다 초과분 압축률을 높인다"는 방향으로, 평범~우수 선수 구간은
+    그대로 두고 극단적으로 조건이 몰린 경우만 더 세게 눌린다."""
     if multiplier <= threshold:
         return multiplier
     return threshold + (multiplier - threshold) * damp
@@ -69,20 +75,22 @@ def _base_market_value_eok(ovr: int) -> float:
     안에서는 지수보간한다. 리그 재정력은 이 값에 ±20~30%만 얹는다
     (아래 _market_value_league_mult).
 
-    [2026-07 5차 재조정, v4(GPT 다회 검토 확정)] 96/98/100 앵커(3000/4500/6000억)가
-    현실 역대 최고 이적료(네이마르 약 3000억, 엔조 페르난데스 약 1800억,
-    카이세도 약 2000억, 벨링엄 약 1700~1800억)보다 이미 96부터 웃돌아서,
-    96 이상 선수는 전부 "역사상 최고 이적료 후보"가 되는 문제가 있었다.
-    2026년 기준으로 앵커를 하향하고, 대신 economy_index(year)로 시대별
-    스케일을 조정하는 구조로 분리했다(연도 인플레이션은 이 함수가 아니라
-    호출부에서 별도 처리). 97 앵커를 새로 추가해 96→100 구간을 더 촘촘하게
-    보간한다.
+    [2026-08 재조정, 신민용+GPT 검토 확정, v5] 실측 현실 이적료(2017~2023
+    역대 상위권: 네이마르 3550억/음바페 2880억/펠릭스·엔조·라이스·그리즈만·
+    그릴리시·루카쿠·포그바 1680~2320억)를 OVR 대응 기준점으로 다시 잡았다.
+    "역대 최고 이적료급 선수 = OVR100"이라는 원칙 아래, 90~100 구간을
+    OVR90=500억(리그 정상급/빅클럽 주전) ~ OVR100=4500억(게임 내 유일급)
+    으로 재설정 — 소프트캡(threshold=1.5/damp=0.3)과 함께 적용했을 때
+    "평범한 월드클래스는 1000~2500억, 역대급은 3000~4500억, 극단적으로
+    조건이 몰린 역사적 이벤트만 최대 ~5000억"이 되도록 역산했다. 90 미만
+    구간(대중적인 선수층)은 기존 곡선을 그대로 유지 — 이번 재조정은
+    "최상위권이 현실보다 과하게 부풀던" 문제만 겨냥한다.
     """
     anchors = [
         (40, 0.02), (60, 0.1), (70, 3), (75, 8), (80, 20),
-        (82, 35), (85, 80), (88, 200), (90, 400), (92, 850),
-        (94, 1200), (95, 1700), (96, 2300), (97, 2800), (98, 3400),
-        (99, 4100), (100, 5000),
+        (82, 35), (85, 80), (88, 200), (90, 500), (92, 900),
+        (94, 1500), (95, 1860), (96, 2300), (97, 2760), (98, 3300),
+        (99, 3850), (100, 4500),
     ]
     if ovr <= anchors[0][0]:
         return anchors[0][1]
@@ -147,22 +155,62 @@ def _market_value_league_mult(grade: str, country: str = None) -> float:
 
 def _market_value_prestige_mult(country: str = None, team_name: str = None,
                                  tier: int = 1) -> float:
-    """[2026-07 v7 재조정, 신민용+GPT 다회 검토: "같은 등급 안에서도
-    구단 위상 차이(팬 규모·판매 경험·브랜드력)는 나야 한다 — 단 구단
-    재정 시스템처럼 크게 벌리지 말고 가볍게(±10%대)만"] 예전엔 명문팀
-    리스트에 있으면 무조건 1.05 고정이었는데, "전통 명문"과 "세계급
-    명문"이 똑같이 취급되는 게 어색하다는 지적 — 국가별 연봉 프리미엄
-    (PRESTIGE_SALARY_MULT, 이미 나라마다 세분화돼 있음)에 비례해서
-    스케일하되, 연봉만큼 크게 벌어지지 않도록 강하게 압축(10%만 반영)
-    한다. 예: 연봉 프리미엄 2.0배 국가의 명문팀 → 이적료는 1.10배만.
-    """
+    """[2026-08 재설계, 신민용 확정: "prestige_clubs.py 안 팀만 프리미엄
+    받던 구조(48개국 중 9개국만 적용) → 명문 등급(prestige_level) 기반으로
+    전환"] 예전엔 국가별 하드코딩 배수 하나로 이적료·연봉을 똑같이
+    올렸는데, 이제 이적료는 data.prestige_clubs.prestige_fee_mult()가
+    "레벨(1/2/3) × 국가 열기(약하게, 가중치 0.2)"로 계산한다 — 레벨 구분이
+    없던 예전과 달리 세계적 초명문(레벨3)과 전통 강호(레벨1)가 다른
+    프리미엄을 받고, 잉글랜드/스페인/독일/이탈리아/프랑스처럼 예전엔
+    프리미엄이 0이었던 나라의 명문팀도 이제 레벨 기반 기본 프리미엄을
+    받는다."""
     if not (team_name and country):
         return 1.0
-    from data.prestige_clubs import is_prestige, PRESTIGE_SALARY_MULT, PRESTIGE_SALARY_MULT_DEFAULT
-    if is_prestige(country, tier, team_name):
-        salary_mult = PRESTIGE_SALARY_MULT.get(country, PRESTIGE_SALARY_MULT_DEFAULT)
-        return max(1.0, min(1.20, 1.0 + (salary_mult - 1.0) * 0.10))
-    return 1.0
+    from data.prestige_clubs import prestige_fee_mult
+    return prestige_fee_mult(country, team_name)
+
+
+def _get_club_strength(team_id) -> float:
+    """[2026-08 신설, STEP3: club_strength 경제 연결] team_id로 그 팀의
+    현재 club_strength(동적 팀 체급, [-10,12] 범위, game_engine의 강등
+    스노우볼 방지/momentum 시스템과 동일한 값)를 조회한다. economy.py는
+    원래 DB 의존 없는 순수 함수 모음이지만, 바로 아래 _team_rank_status_mult
+    가 이미 team_id로 DB를 조회하는 선례가 있어 같은 패턴(지연 import,
+    실패 시 중립값 반환)을 따른다."""
+    if not team_id:
+        return 0.0
+    try:
+        from database import get_conn
+        conn = get_conn()
+        row = conn.execute("SELECT club_strength FROM teams WHERE id=?", (team_id,)).fetchone()
+        conn.close()
+        return (row["club_strength"] or 0.0) if row else 0.0
+    except Exception:
+        return 0.0
+
+
+def _club_strength_fee_mult(team_id) -> float:
+    """[2026-08 신설] 이적료에 얹는 팀 체급 보정 — "역사는 없지만 지금
+    강한 팀"도 영입 경쟁력이 있어야 한다는 설계 의도(신민용 확정). club_
+    strength[-10,12]를 0~1로 정규화해 0.90(최약)~1.15(최강) 범위로 매핑.
+    경제 스노우볼 우려(강팀→비싼 영입→더 강해짐)에 대한 안전장치: club_
+    strength는 실제 순위 성적으로만 갱신되지 돈을 쓴다고 오르지 않으므로
+    ("돈→영입→성적→club_strength" 한 단계를 항상 거치고, 그 사이 매 시즌
+    0.85배 감쇠가 걸림) 이 배율 자체가 순환을 직접 만들지 않는다. 처음엔
+    좁은 범위로 시작 — 필요시 폭만 조정하면 됨."""
+    cs = _get_club_strength(team_id)
+    norm = max(0.0, min(1.0, (cs + 10) / 22))
+    return 0.90 + norm * 0.25
+
+
+def _club_strength_salary_mult(team_id) -> float:
+    """[2026-08 신설] 연봉에 얹는 팀 체급 보정 — 이적료보다 좁은 범위
+    (0.95~1.10)로, "지금 강팀이라고 연봉을 확 더 주진 않는다"는 설계
+    의도(이적료=지불 의사, 연봉=선수 협상력이라는 역할 분리와 동일한
+    원칙)."""
+    cs = _get_club_strength(team_id)
+    norm = max(0.0, min(1.0, (cs + 10) / 22))
+    return 0.95 + norm * 0.15
 
 
 def _team_rank_status_mult(team_id, tier: int = 1, season=None) -> float:
@@ -286,6 +334,10 @@ def estimate_transfer_fee(grade, tier, ovr, country=None, team_name=None,
     pos_mult = POSITION_MARKET_MULT.get(position, 1.0) if position else 1.0
     prestige_mult = _market_value_prestige_mult(country, team_name, tier)
     rank_mult = _team_rank_status_mult(team_id, tier, season) if team_id else 1.0
+    # [2026-08 신설, STEP3] club_strength(현재 팀 체급) — 명문 리스트와
+    # 무관하게 "지금 강한 팀"이면 영입 경쟁력이 올라간다. 팀 이름 있는
+    # 명문팀 프리미엄(prestige_mult)과는 독립된 축.
+    strength_mult = _club_strength_fee_mult(team_id) if team_id else 1.0
     c_mult = _contract_mult(contract_remaining_years)
     a_mult = _age_mult(age)
     p_mult = potential_mult(ovr, talent_cap)
@@ -295,10 +347,20 @@ def estimate_transfer_fee(grade, tier, ovr, country=None, team_name=None,
     # 배율의 의도보다 훨씬 커지는 문제가 있었다 — 앵커에서 2800억으로
     # 잡아놔도 최종 5000억대까지 튀는 식. 결합배율에 소프트캡을 적용해
     # 평범한 선수는 그대로, 극단적으로 조건이 겹친 경우만 완화한다.
-    combined_mult = league_mult * pos_mult * prestige_mult * rank_mult * c_mult * a_mult * p_mult
+    combined_mult = (league_mult * pos_mult * prestige_mult * rank_mult
+                     * strength_mult * c_mult * a_mult * p_mult)
     capped_mult = _apply_soft_cap(combined_mult)
 
     val_eok = base_eok * capped_mult
+    # [2026-08 신설, 신민용+GPT 검토 확정] 소프트캡을 통과해도 극단적으로
+    # 조건이 몰리면(명문+고club_strength+어린나이+큰잠재력+긴계약이 전부
+    # 겹치는 등) 여전히 크게 튈 수 있어서, "2026년 기준" 절대 상한을 하나
+    # 더 둔다 — 역대급 이적이라도 현실 역대 최고 이적료(네이마르 3550억)를
+    # 과하게 넘지 않는 선(5000억)에서 멈춘다. 이 캡은 시대 배율
+    # (economy_index) 적용 *전* 값에 걸므로, 미래 연도(예: 2040)는 경제
+    # 성장분만큼 실제 표시 상한도 자연히 따라 올라간다.
+    HARD_FEE_CAP_EOK = 5000
+    val_eok = min(val_eok, HARD_FEE_CAP_EOK)
     if tier and tier >= 2:
         val_eok *= max(0.15, 0.55 ** (tier - 1))  # 2부 0.55x, 3부 0.30x ...
 
@@ -333,7 +395,8 @@ def estimate_transfer_fee(grade, tier, ovr, country=None, team_name=None,
             "base_eok": base_eok, "league_mult": league_mult,
             "position_mult": pos_mult, "prestige_mult": prestige_mult,
             "contract_mult": c_mult, "age_mult": a_mult,
-            "potential_mult": p_mult, "rank_mult": rank_mult, "combined_mult": combined_mult,
+            "potential_mult": p_mult, "rank_mult": rank_mult, "strength_mult": strength_mult,
+            "combined_mult": combined_mult,
             "capped_mult": capped_mult, "economy_index": eidx,
         }}
     return final
@@ -473,7 +536,7 @@ def _clamp_salary_to_cap(sal, wealth, country=None, tier=1, is_special=False, ov
 _LOW_GRADE_SCALE_BOOST = {"D": 34.0, "E": 34.0, "F": 34.0}
 
 
-def _calc_salary(grade, tier, ovr, country=None, team_name=None, year=None):
+def _calc_salary(grade, tier, ovr, country=None, team_name=None, year=None, team_id=None):
     """연봉 계산 (천원 단위).
     wealth 결정 우선순위:
       1) SPECIAL_SALARY_COUNTRIES — 특수 연봉 국가 (사우디/카타르/UAE)
@@ -484,23 +547,30 @@ def _calc_salary(grade, tier, ovr, country=None, team_name=None, year=None):
       단, SPECIAL_SALARY_COUNTRIES(사우디 등)는 배율 적용 제외.
 
     team_name: [2026-07 신설] 주어지면 그 팀이 명문팀(prestige_clubs.py)인지
-      확인해서 PRESTIGE_SALARY_MULT를 최종적으로 곱한다. OVR 팀간 격차는
+      확인해서 prestige_salary_mult를 최종적으로 곱한다. OVR 팀간 격차는
       건드리지 않고 "이 팀 소속이면 확실히 더 번다"는 연봉만의 프리미엄.
       기본값 None → 기존 호출부는 전부 하위호환(프리미엄 없음).
     year: [2026-07 v4 신설] 게임 내 현재 연도 — economy_index(year)로
       시대별 배율을 곱한다. None이면(하위호환) 1.0으로 취급.
+    team_id: [2026-08 신설, STEP3] 있으면 club_strength(현재 팀 체급)로
+      좁은 범위(0.95~1.10)의 연봉 보정을 추가로 곱한다. 기본값 None →
+      기존 호출부는 하위호환(보정 없음).
     """
     eidx = economy_index(year) if year is not None else 1.0
     from constants import (LOWER_LEAGUE_SALARY_OVERRIDE, SPECIAL_SALARY_COUNTRIES,
                            get_league_grade, SALARY_CURVE_OVERRIDE, salary_curve_value,
                            COUNTRY_SALARY_CAP)
+    strength_mult = _club_strength_salary_mult(team_id) if team_id else 1.0
 
     def _apply_prestige(sal):
+        # [2026-08 재설계] 국가 하드코딩 배수 → prestige_level 기반
+        # (data.prestige_clubs.prestige_salary_mult) 전환. 연봉은 이적료보다
+        # 레벨 배율 자체가 약하다(레벨3 기준 1.12 vs 1.25) — "명문에서
+        # 뛰는 것 자체가 선수에게 가치"라 연봉 프리미엄은 낮게 유지한다는
+        # 설계 의도.
         if team_name and country:
-            from data.prestige_clubs import is_prestige, PRESTIGE_SALARY_MULT, PRESTIGE_SALARY_MULT_DEFAULT
-            if is_prestige(country, tier, team_name):
-                mult = PRESTIGE_SALARY_MULT.get(country, PRESTIGE_SALARY_MULT_DEFAULT)
-                return int(sal * mult)
+            from data.prestige_clubs import prestige_salary_mult
+            return int(sal * prestige_salary_mult(country, team_name))
         return sal
 
     # [양극화 리그 특례] tier1 + 앵커커브 적용국은 base_year/mult 대신
@@ -511,7 +581,7 @@ def _calc_salary(grade, tier, ovr, country=None, team_name=None, year=None):
         cap = COUNTRY_SALARY_CAP.get(country, 0)
         if cap > 0:
             sal = min(sal, cap)
-        return max(0, int(_apply_prestige(sal) * eidx))
+        return max(0, int(_apply_prestige(sal) * strength_mult * eidx))
 
     is_special = country and country in SPECIAL_SALARY_COUNTRIES
     if country:
@@ -677,8 +747,14 @@ def _calc_salary(grade, tier, ovr, country=None, team_name=None, year=None):
         if _lt:
             lt_cap = _lt.get(tier, _lt[max(_lt.keys())])
             if lt_cap > 0:
-                sal = min(sal, lt_cap)
-    return max(0, int(_apply_prestige(sal) * eidx))
+                # [2026-08 버그수정, 신민용 리포트: "잉글랜드 2부 OVR70~100이
+                # 전부 15억으로 평평하다"] 이 캡만 유일하게 _cap_relief_mult
+                # (엘리트/월드클래스 구간 완화, 위 두 캡엔 이미 적용돼 있음)가
+                # 빠져 있었다 — 과거 "브라질 OVR88+ 전부 30억 고정" 등 같은
+                # 증상을 여러 번 고치면서 이 지점만 누락된 것으로 보인다.
+                # 다른 두 캡과 동일한 패턴으로 맞춘다.
+                sal = min(sal, int(lt_cap * _cap_relief_mult(ovr)))
+    return max(0, int(_apply_prestige(sal) * strength_mult * eidx))
 
 
 # ══════════════════════════════════════════════════════════════

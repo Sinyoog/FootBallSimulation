@@ -1007,6 +1007,12 @@ def _finish_tournament(t, winner_id):
         return
     conn.execute("UPDATE cup_tournaments SET status='done', winner_team_id=? WHERE id=?",
                  (winner_id, tid))
+    # [2026-08 신설, 신민용 확정: club_momentum 확장] 국내컵 우승팀도 챔스와
+    # 같은 틀로 momentum을 받는다 — 다만 국내컵은 챔스보다 위상이 낮으므로
+    # domestic_cup_champion 스케줄(더 약하고 짧음)을 쓴다.
+    from constants import MOMENTUM_START_BY_TYPE
+    conn.execute("UPDATE teams SET momentum_type=?, momentum_seasons_left=? WHERE id=?",
+                 ("domestic_cup_champion", MOMENTUM_START_BY_TYPE["domestic_cup_champion"], winner_id))
     conn.commit()
     conn.close()
 

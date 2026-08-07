@@ -276,11 +276,54 @@ def prestige_weight(country: str, team_name: str) -> float:
     return PRESTIGE_WEIGHT_BY_LEVEL.get(level, 1.0)
 
 
-# [2026-07 재조정, 신민용 지적: "1.6배 고정은 단순화 — 나라마다 명문효과가
-# 다르다(포르투갈은 벤피카·포르투·스포르팅이 리그를 거의 독점하는 반면
-# J리그는 팀간 연봉 격차가 크지 않음)"] 국가별 차등 배수로 전환. 여기 없는
-# 나라는 기본값(DEFAULT)을 쓴다.
-PRESTIGE_SALARY_MULT = {
+def prestige_fee_mult(country: str, team_name: str) -> float:
+    """[2026-08 신설] 이적료 프리미엄 = 레벨 배율 × (1 + (국가열기-1)*가중치).
+    레벨0(비명문)이어도 국가 열기 자체는 반영된다(그 나라 이적시장 전체가
+    뜨거우면 비명문팀도 어느 정도 영향을 받는 게 자연스러움) — 다만
+    가중치가 작아서(0.2) 영향은 제한적."""
+    level = prestige_level(country, team_name)
+    heat = COUNTRY_FOOTBALL_HEAT.get(country, COUNTRY_FOOTBALL_HEAT_DEFAULT)
+    return PRESTIGE_LEVEL_FEE_MULT.get(level, 1.0) * (1 + (heat - 1) * COUNTRY_HEAT_FEE_WEIGHT)
+
+
+def prestige_salary_mult(country: str, team_name: str) -> float:
+    """[2026-08 신설] 연봉 프리미엄 = 레벨 배율 × (1 + (국가열기-1)*가중치).
+    이적료보다 레벨 배율 자체도 약하고(1.12 vs 1.25) 국가열기 가중치도
+    더 크게 반영되지만(0.4 vs 0.2) 절대적으로는 여전히 이적료보다 약한
+    프리미엄이 나온다 — "명문에서 뛰는 것 자체가 보상"이라는 설계 의도."""
+    level = prestige_level(country, team_name)
+    heat = COUNTRY_FOOTBALL_HEAT.get(country, COUNTRY_FOOTBALL_HEAT_DEFAULT)
+    return PRESTIGE_LEVEL_SALARY_MULT.get(level, 1.0) * (1 + (heat - 1) * COUNTRY_HEAT_SALARY_WEIGHT)
+
+
+# [2026-08 재설계, 신민용 확정: "명문팀이면 돈을 더 준다"가 아니라
+# "일부 국가에 등록된 명문팀만 돈을 더 준다"였던 구조를 뜯어고침]
+# 예전엔 국가별 하드코딩 배수(PRESTIGE_SALARY_MULT) 하나로 이적료·연봉을
+# 똑같이 올렸는데, 그러면:
+#   - 잉글랜드/스페인/독일/이탈리아/프랑스처럼 이 표에 없는 나라는 리버풀/
+#     레알 마드리드 같은 세계적 명문도 프리미엄이 0이 되고,
+#   - 등록은 됐지만(is_prestige=True) 레벨(1/2/3) 구분 없이 같은 나라면
+#     전부 같은 배율을 받고,
+#   - 이적료(살수록 적극적으로 더 낸다)와 연봉(명문에서 뛰는 것 자체가
+#     가치라 오히려 덜 줘도 온다)이 같은 성격이 아닌데 하나의 배율로
+#     묶여 있었다.
+# 이제 "명문 등급(prestige_level)"이 1차 축, 예전 국가별 하드코딩은
+# COUNTRY_FOOTBALL_HEAT(국가 전체의 축구 열기 — 그 나라 전체 이적시장이
+# 얼마나 뜨거운지)로 격하해서 부차적으로만 더한다. 이적료/연봉도 서로
+# 다른 배율표를 쓴다 — 이적료 쪽을 더 강하게(사고 싶다는 의지), 연봉
+# 쪽은 더 약하게(명문에서 뛰는 것 자체가 보상의 일부).
+PRESTIGE_LEVEL_FEE_MULT = {3: 1.25, 2: 1.12, 1: 1.05, 0: 1.00}
+PRESTIGE_LEVEL_SALARY_MULT = {3: 1.12, 2: 1.06, 1: 1.02, 0: 1.00}
+# 국가별 프리미엄이 이적료/연봉에 얼마나 "추가로" 반영될지의 가중치.
+# heat=2.0인 나라라도 전체 배율이 2.0배가 되는 게 아니라, 레벨 배율 위에
+# (heat-1)*가중치만큼만 얹힌다 — 이적료가 연봉보다 국가 열기에 더 민감.
+COUNTRY_HEAT_FEE_WEIGHT = 0.2
+COUNTRY_HEAT_SALARY_WEIGHT = 0.4
+
+# 예전 PRESTIGE_SALARY_MULT를 그대로 국가 열기 보조계수로 재사용한다 —
+# 이미 여러 차례 실측 검토를 거친 값들이라(사우디 4강 클럽 오일머니,
+# 포르투갈 3강 독점 구조 등) 새로 만들지 않고 역할만 바꿨다.
+COUNTRY_FOOTBALL_HEAT = {
     "포르투갈":   2.0,
     "튀르키예":   2.0,
     "아르헨티나": 2.0,
@@ -295,8 +338,7 @@ PRESTIGE_SALARY_MULT = {
     # 4강 클럽에만 집중되는 구조라 배수를 가장 높게 잡는다.
     "사우디아라비아": 2.2,
 }
-PRESTIGE_SALARY_MULT_DEFAULT = 1.0   # [2026-07 재조정] 명문효과를 의도적으로
-                                      # 설계한 국가만 차등 적용, 그 외엔 프리미엄 없음
+COUNTRY_FOOTBALL_HEAT_DEFAULT = 1.0   # 표에 없는 나라는 "열기 보정 없음"(순수 레벨 배율만)
 
 
 def weighted_team_order(teams: list) -> list:

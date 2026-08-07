@@ -98,6 +98,21 @@ def list_continents():
     return [r["continent"] for r in rows]
 
 
+def list_max_tier():
+    """[2026-08 신설, 신민용 확정: "10부까지 늘릴 수 있게 설계"] 현재 데이터에
+    실제로 존재하는 최고 부수(가장 깊은 tier)를 반환한다. 부수 필터 드롭다운
+    (apply_window/world_browser_window의 '부수' 콤보)이 예전엔 range(1,7)로
+    1~6부를 하드코딩하고 있었는데, 이러면 나라별 리그 깊이를 나중에
+    7~10부로 늘려도 UI에서 그 이상은 아예 선택할 수 없었다 — 이제 실제
+    leagues 테이블의 MAX(tier)를 그대로 써서, 데이터가 몇 부까지 있든
+    드롭다운이 자동으로 맞춰진다(코드 수정 없이). 데이터가 아예 없으면
+    안전하게 6을 기본값으로 폴백."""
+    conn = get_conn()
+    row = conn.execute("SELECT MAX(tier) AS mt FROM leagues").fetchone()
+    conn.close()
+    return row["mt"] if row and row["mt"] else 6
+
+
 def list_countries(continent=None, grade=None):
     """대륙/등급으로 필터링한 국가 목록 (등급순 정렬).
 
@@ -993,19 +1008,61 @@ def get_country_tournament_results(country_name, limit=200):
     placements = _batch_placements(t_ids, conn)
 
     ph2 = ",".join("?" * len(t_ids))
+    # [2026-08] stage뿐 아니라 스코어까지 같이 받아서 대회별 전적(승무패)도
+    # 여기서 함께 집계한다 — "결과(몇강 탈락)"와 "상세기록(몇승 몇무 몇패)"을
+    # 분리해서 보여달라는 요청 대응.
     match_rows = c.execute(
-        f"""SELECT tournament_id, stage FROM intl_matches
-            WHERE tournament_id IN ({ph2}) AND (home=? OR away=?)""",
+        f"""SELECT tournament_id, stage, home, away, home_score, away_score
+            FROM intl_matches
+            WHERE tournament_id IN ({ph2}) AND (home=? OR away=?)
+              AND home_score>=0""",
         t_ids + [country_name, country_name]).fetchall()
     stages_by_tid = {}
+    record_by_tid = {}
     for r in match_rows:
-        stages_by_tid.setdefault(r["tournament_id"], set()).add(r["stage"])
+        tid = r["tournament_id"]
+        stages_by_tid.setdefault(tid, set()).add(r["stage"])
+        is_home = (r["home"] == country_name)
+        my_score = r["home_score"] if is_home else r["away_score"]
+        opp_score = r["away_score"] if is_home else r["home_score"]
+        rec = record_by_tid.setdefault(tid, {"w": 0, "d": 0, "l": 0})
+        if my_score > opp_score:   rec["w"] += 1
+        elif my_score < opp_score: rec["l"] += 1
+        else:                      rec["d"] += 1
+
+    # [2026-08 신설] 월드컵 예선(wc_qual)은 결승/3·4위전이 없어 _batch_placements로
+    # 못 잡는다 — 본선 진출 여부는 qual_results(최종 통과국 명단)로 따로 확인.
+    qual_tids = [t["id"] for t in tours if t["kind"] == "wc_qual"]
+    qualified_by_tid = {}
+    if qual_tids:
+        for t in tours:
+            if t["kind"] != "wc_qual":
+                continue
+            qr = c.execute(
+                "SELECT 1 FROM qual_results WHERE target_year=? AND kind='world' "
+                "AND country=? LIMIT 1", (t["year"], country_name)).fetchone()
+            qualified_by_tid[t["id"]] = bool(qr)
     conn.close()
 
     out = []
     for t in tours:
         pl = placements.get(t["id"], {})
-        if pl.get("winner") == country_name:
+        rec = record_by_tid.get(t["id"], {"w": 0, "d": 0, "l": 0})
+        record_str = f"{rec['w']}승 {rec['d']}무 {rec['l']}패"
+        if t["kind"] == "wc_qual":
+            # 예선은 우승/준우승 개념이 없다 — "본선 진출" 여부와 탈락 시
+            # 어느 라운드(조별리그/플레이오프)에서 떨어졌는지만 의미가 있다.
+            if qualified_by_tid.get(t["id"]):
+                result, tier = "🎫 본선 진출", 2
+            else:
+                stages = stages_by_tid.get(t["id"], set())
+                if "qual_po" in stages:
+                    result, tier = "플레이오프 탈락", 1
+                elif "qual_group" in stages:
+                    result, tier = "조별리그 탈락", 1
+                else:
+                    result, tier = "기록 없음", 0
+        elif pl.get("winner") == country_name:
             result, tier = "🥇 우승", 5
         elif pl.get("runner_up") == country_name:
             result, tier = "🥈 준우승", 4
@@ -1021,8 +1078,19 @@ def get_country_tournament_results(country_name, limit=200):
                 result, tier = f"{STAGE_KO.get(best, best)} 탈락", 1
             else:
                 result, tier = "기록 없음", 0
-        out.append({"id": t["id"], "year": t["year"], "kind": t["kind"],
-                     "name": t["name"], "result": result, "tier": tier})
+        # [2026-08 버그수정, 신민용 리포트: "태국이 예선 조별리그까지 들어갔는데
+        # 연도만 뜨고 대회/종류/결과가 통째로 비어있다"] intl_tournaments.name/
+        # kind 컬럼엔 NOT NULL 제약이 없어서, 과거 세이브에 섞여 있던 일부
+        # 레거시 행은 name이 NULL인 채로 저장돼 있었다 — QTableWidgetItem(None)에
+        # PyQt가 예외를 던지면서 그 행의 연도 칸만 채워지고 나머지가 통째로
+        # 빈 채로 멈췄다(콘솔에 트레이스백만 조용히 찍히고 앱은 안 죽는 PyQt
+        # 특성상 원인이 안 보였음). 여기서 한 번 걸러서 항상 유효한 문자열을
+        # 보장한다 — 데이터 자체가 비정상인 레거시 행이라도 화면은 안 깨지게.
+        out.append({"id": t["id"], "year": t["year"],
+                     "kind": t["kind"] or "?",
+                     "name": t["name"] or f"{t['year']}년 대회(이름 없음)",
+                     "result": result, "tier": tier,
+                     "record": record_str})
     return out
 
 
@@ -1046,7 +1114,7 @@ def search_countries(name_query=None, continent=None, grade=None):
 # 많아야 수십 개 고정) 리그 검색의 지연시뮬과 달리 트리거할 것 자체가 없다
 # — 순수 조회라 몇 밀리초 수준.
 
-_INTL_KO_STAGE_ORDER = ["R32", "R16", "QF", "SF", "TP", "F"]
+_INTL_KO_STAGE_ORDER = ["qual_po", "R32", "R16", "QF", "SF", "TP", "F"]
 
 
 def get_intl_tournament_detail(tournament_id):
@@ -1066,7 +1134,7 @@ def get_intl_tournament_detail(tournament_id):
 
     for m in c.execute(
             "SELECT grp, home, away, home_score, away_score FROM intl_matches "
-            "WHERE tournament_id=? AND stage='group' AND home_score>=0",
+            "WHERE tournament_id=? AND stage IN ('group','qual_group') AND home_score>=0",
             (tournament_id,)).fetchall():
         h, a = idx.get((m["grp"], m["home"])), idx.get((m["grp"], m["away"]))
         if not h or not a:
@@ -1085,7 +1153,7 @@ def get_intl_tournament_detail(tournament_id):
     ko_rows = c.execute(
         "SELECT stage, home, away, home_score, away_score, pso_winner, pso_score "
         "FROM intl_matches WHERE tournament_id=? AND stage NOT IN "
-        "('group','qual_group','qual_po') AND home_score>=0 ORDER BY id",
+        "('group','qual_group') AND home_score>=0 ORDER BY id",
         (tournament_id,)).fetchall()
     conn.close()
 
@@ -1452,14 +1520,46 @@ def get_team_history(team_id: int):
             return m["pso_winner"] or None
         return m["home_team_id"] if m["home_score"] > m["away_score"] else m["away_team_id"]
 
+    def _wdl_record(matches, team_id):
+        """[2026-08 신설, 신민용 요청: "팀 검색에서 리그뿐 아니라 국내컵/
+        챔스/클럽월드컵도 각자 승무패를 보여달라"] 경기 목록(홈/원정/스코어,
+        토너먼트면 pso_winner도)을 받아 그 팀 기준 "W승 D무 L패" 문자열을
+        만든다. 토너먼트는 무승부면 승부차기로 갈리므로(pso_winner 존재),
+        그 경우는 무승부가 아니라 승/패로 센다 — 리그처럼 pso_winner가 없는
+        진짜 무승부만 "무"로 집계된다.
+        """
+        w = d = l = 0
+        for m in matches:
+            is_home = m["home_team_id"] == team_id
+            my_score = m["home_score"] if is_home else m["away_score"]
+            opp_score = m["away_score"] if is_home else m["home_score"]
+            if my_score > opp_score:
+                w += 1
+            elif my_score < opp_score:
+                l += 1
+            else:
+                pso_winner = m["pso_winner"] if "pso_winner" in m.keys() else None
+                if pso_winner:
+                    if pso_winner == team_id:
+                        w += 1
+                    else:
+                        l += 1
+                else:
+                    d += 1
+        return f"{w}승 {d}무 {l}패"
+
     out = []
     for (year, season), league_id in sorted(by_year.items(), key=lambda x: -x[0][0]):
-        entry = {"year": year, "league": None, "cup": None, "cl": None, "cwc": None}
+        entry = {"year": year, "league": None, "cup": None, "cl": None, "cwc": None,
+                  "league_record": None, "cup_record": None, "cl_record": None, "cwc_record": None}
 
         # ── 리그 성적 ──────────────────────────────────────
         lg = conn.execute("SELECT name, tier FROM leagues WHERE id=?", (league_id,)).fetchone()
         standings = get_league_standings(league_id, season=season, conn=conn)
         rank = next((i + 1 for i, s in enumerate(standings) if s["id"] == team_id), None)
+        my_row = next((s for s in standings if s["id"] == team_id), None)
+        if my_row:
+            entry["league_record"] = f"{my_row['wins']}승 {my_row['draws']}무 {my_row['losses']}패"
         if lg and rank:
             move = conn.execute(
                 """SELECT pl.to_tier, l2.name as dest_name FROM promotion_log pl
@@ -1523,6 +1623,7 @@ def get_team_history(team_id: int):
                     entry["cup"] = f"{cup_t['name']} [{'3위' if won_tp else '4위'}]"
                 else:
                     entry["cup"] = f"{cup_t['name']} [{last_round} 탈락]"
+                entry["cup_record"] = _wdl_record(cup_matches, team_id)
 
         # ── 챔피언스리그 도달 스테이지 ───────────────────────
         cl_t = conn.execute(
@@ -1531,7 +1632,8 @@ def get_team_history(team_id: int):
                WHERE clt.year=? AND cle.team_id=?""", (year, team_id)).fetchone()
         if cl_t:
             cl_matches = conn.execute(
-                """SELECT stage FROM cl_matches
+                """SELECT stage, home_team_id, away_team_id, home_score, away_score, pso_winner
+                   FROM cl_matches
                    WHERE tournament_id=? AND (home_team_id=? OR away_team_id=?)
                      AND home_score!=-1""",
                 (cl_t["id"], team_id, team_id)).fetchall()
@@ -1545,6 +1647,7 @@ def get_team_history(team_id: int):
                     entry["cl"] = f"{cl_t['name']} [준우승]"
                 else:
                     entry["cl"] = f"{cl_t['name']} [{stage_ko} 탈락]"
+                entry["cl_record"] = _wdl_record(cl_matches, team_id)
 
         # ── 클럽 월드컵 도달 스테이지 ─────────────────────────
         # [2026-08 신설, 신민용 리포트: "팀 검색 이후 기록에 클럽 월드컵
@@ -1580,6 +1683,7 @@ def get_team_history(team_id: int):
                 else:
                     stage_ko = _CWC_STAGE_KO.get(reached, reached)
                     entry["cwc"] = f"{cwc_t['name']} [{stage_ko} 탈락]"
+                entry["cwc_record"] = _wdl_record(cwc_matches, team_id)
 
         if entry["league"] or entry["cup"] or entry["cl"] or entry["cwc"]:
             out.append(entry)

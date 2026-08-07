@@ -12,6 +12,16 @@ from data.names import NAME_DATA
 # 생성되는 버그로 이어졌다. constants.py를 유일한 원본으로 삼아 여기서는
 # 그대로 가져다 쓴다 — 더 이상 두 곳을 따로 수정할 필요가 없다.
 from constants import OVR_RANGES
+# [2026-08 최적화] 아래 심볼들은 원래 _generate_team_players / _gen_ai_stats /
+# _generate_all_ai_players 안에서 매 팀·매 선수마다(최대 11만+회) 함수 내부
+# import로 다시 불러오고 있었다. sys.modules 캐시 덕에 모듈 재실행은 없지만,
+# "함수 호출 → import 문 실행 → 속성 바인딩"이 호출 수만큼 반복되는 것 자체가
+# 순수 오버헤드다. 신규 게임 생성(세계 선수단 최초 생성, 약 11.5만 명) 시
+# 실측 결과 이 호출 오버헤드만으로 약 1초가 소요됨을 확인 — 여기로 한 번만
+# 끌어올려서 없앤다. (동작은 완전히 동일, 그냥 매번 다시 안 할 뿐)
+from constants import (BODY_TYPE_NAMES, BODY_TYPE_WEIGHTS_BY_POS, BODY_TYPES,
+                       CONTINENT_OVR_BONUS, COUNTRY_OVR_ADJ, SUB_ROLES, get_league_grade)
+from data.prestige_clubs import is_prestige, PRESTIGE_OVR_BONUS, prestige_weight, weighted_team_order
 
 # [PyInstaller 대응] __file__ 기준 경로는 패키징 후 문제가 된다:
 #   - onefile: __file__이 실행마다 새로 생기는 임시폴더(sys._MEIPASS)를 가리켜서,
@@ -1155,6 +1165,14 @@ def init_db():
         # 등급으로 시딩(claude_seed_club_strength 참고), 이후 시즌마다
         # update_club_strength_after_season()이 갱신한다.
         "ALTER TABLE teams ADD COLUMN club_strength REAL DEFAULT 0",
+        # [2026-08 신설, 신민용 확정: club_momentum 시스템] 강등 직후/국제대회
+        # 우승 직후처럼 "이번 이벤트로 팀 체급이 갑자기 흔들리거나 급등하지
+        # 않게" 완충하는 범용 장치. momentum_type이 어떤 스케줄
+        # (constants.MOMENTUM_SCHEDULES)을 쓸지 정하고, momentum_seasons_left가
+        # 카운트다운(매 시즌 1씩 감소, 0이면 스케줄 종료 → 정상 감쇠로 복귀).
+        # 이벤트가 겹치면 가장 최근 이벤트가 이전 것을 덮어쓴다(단순화).
+        "ALTER TABLE teams ADD COLUMN momentum_type TEXT DEFAULT ''",
+        "ALTER TABLE teams ADD COLUMN momentum_seasons_left INTEGER DEFAULT 0",
     ]:
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,
@@ -1251,9 +1269,7 @@ def init_db():
         # match_results: home/away team_id 조회 (클린시트, 팀 경기 조회)
         "CREATE INDEX IF NOT EXISTS idx_mr_home_team ON match_results(home_team_id, season)",
         "CREATE INDEX IF NOT EXISTS idx_mr_away_team ON match_results(away_team_id, season)",
-        # match_results_archive: 역대 순위/우승팀 조회(league_id+season 등치 검색)
-        # 전용 — 쓰기는 시즌 전환 시 1회 벌크 INSERT뿐이라 인덱스 개수 부담이 없다.
-        "CREATE INDEX IF NOT EXISTS idx_mra_league_season ON match_results_archive(league_id, season)",
+
         # [2026-07 추가, 신민용 리포트: "연도전환이 갈수록 느려진다"]
         # _generate_all_league_schedules()의 "완비판정조회" 단계가
         # "SELECT league_id, COUNT(*) FROM match_results_archive WHERE
@@ -1379,17 +1395,32 @@ def _summarize_and_prune_archive(conn, seasons=None):
         season_filter = f"AND season IN ({','.join('?' * len(seasons))})"
         params = tuple(seasons)
 
-    # 1) 아직 요약이 없는 (league_id,season) 조합만 골라 요약 계산.
+    # 1) 아직 요약이 없는 (league_id,season) 조합의 요약을 계산해 넣는다.
+    # [2026-08 버그수정, 신민용 리포트: "요약INSERT루프만 갑자기 7초"]
+    # 예전엔 이 단계를 리그별로 쪼개서 c.execute()를 (보통) 694번 따로
+    # 호출했다 — 매번 (league_id,season) 두 값만 바뀌는 거의 동일한 쿼리를
+    # 694번 반복 실행한 것. 실측 로그를 보면 같은 규모(리그 694개, 매 시즌
+    # 거의 동일한 데이터량)인데도 어떤 시즌은 0.2~0.3초, 어떤 시즌은 7초대로
+    # 튀는 등 데이터量과 무관하게 들쭉날쭉했다 — 694번의 개별 파라미터 쿼리를
+    # SQLite 쿼리플래너가 그때그때 다르게(인덱스 사용 여부 등) 판단해서
+    # 생기는 불안정성으로 보인다. 694번 호출 자체를 없애고 단일 INSERT...
+    # SELECT...GROUP BY 쿼리 1번으로 합치면, 반복 호출에 의존하던 이 불안정성
+    # 요인 자체가 사라진다(플래너가 한 번만 계획을 세우면 됨).
+    _tp0 = time.perf_counter()
     todo = c.execute(
         f"""SELECT DISTINCT mra.league_id, mra.season FROM match_results_archive mra
             WHERE NOT EXISTS (
                 SELECT 1 FROM league_season_standings lss
                 WHERE lss.league_id=mra.league_id AND lss.season=mra.season)
             {season_filter}""", params).fetchall()
-    for row in todo:
-        lid, season = row["league_id"], row["season"]
+    _tp1 = time.perf_counter()
+    if todo:
+        not_exists_clause = """NOT EXISTS (
+                SELECT 1 FROM league_season_standings lss
+                WHERE lss.league_id=mra.league_id AND lss.season=mra.season)"""
+        _bulk_params = (*params, *params) if params else ()
         c.execute(
-            """INSERT OR IGNORE INTO league_season_standings
+            f"""INSERT OR IGNORE INTO league_season_standings
                    (league_id, season, year, team_id, wins, draws, losses, goals_for, goals_against)
                SELECT league_id, season, MAX(year), team_id,
                       SUM(CASE WHEN gf>ga THEN 1 ELSE 0 END),
@@ -1399,33 +1430,49 @@ def _summarize_and_prune_archive(conn, seasons=None):
                FROM (
                    SELECT league_id, season, year, home_team_id AS team_id,
                           home_score AS gf, away_score AS ga
-                   FROM match_results_archive
-                   WHERE league_id=? AND season=? AND home_score>=0
+                   FROM match_results_archive mra
+                   WHERE home_score>=0 {season_filter} AND {not_exists_clause}
                    UNION ALL
                    SELECT league_id, season, year, away_team_id AS team_id,
                           away_score AS gf, home_score AS ga
-                   FROM match_results_archive
-                   WHERE league_id=? AND season=? AND home_score>=0
+                   FROM match_results_archive mra
+                   WHERE home_score>=0 {season_filter} AND {not_exists_clause}
                )
                GROUP BY league_id, season, team_id""",
-            (lid, season, lid, season))
+            _bulk_params)
+    _tp2 = time.perf_counter()
 
     # 2) 요약이 이미 있는 (league_id,season)에 한해, "내 커리어와 무관한 팀"의
     #    원본 경기 행을 지운다 — career_entries.team_id(내가 실제로 몸담았던
     #    팀들, 승강/이적과 무관하게 영구 불변값)만 원본을 보존한다.
     my_team_ids = {r["team_id"] for r in c.execute(
         "SELECT DISTINCT team_id FROM career_entries WHERE team_id != 0")}
+    _tp3 = time.perf_counter()
     keep_clause = ""
     if my_team_ids:
         qmarks = ",".join("?" * len(my_team_ids))
         keep_clause = f"AND home_team_id NOT IN ({qmarks}) AND away_team_id NOT IN ({qmarks})"
+    # [2026-08 버그수정, 신민용 리포트: "2년째부터 연도전환에 갑자기 7~8초"]
+    # 아래 서브쿼리가 season_filter 없이 "SELECT league_id, season FROM
+    # league_season_standings" 전체를 매번 다시 읽고 있었다 — 이 테이블은
+    # 시즌이 지날 때마다 리그 수(694개)만큼 계속 불어나는데, 정작 이번
+    # DELETE가 지우려는 대상은 방금 처리한 배치(seasons)뿐이다. 서브쿼리에도
+    # 같은 season_filter를 걸어 "이번 배치 몫"만 비교하도록 좁힌다 — 시즌이
+    # 쌓여도 서브쿼리 크기가 늘 일정해서 더 이상 해마다 느려지지 않는다.
+    inner_season_filter = season_filter.replace("AND season", "WHERE season", 1) if season_filter else ""
     c.execute(
         f"""DELETE FROM match_results_archive
-            WHERE (league_id, season) IN (SELECT league_id, season FROM league_season_standings)
+            WHERE (league_id, season) IN (
+                SELECT league_id, season FROM league_season_standings {inner_season_filter})
             {keep_clause}
             {season_filter}""",
-        (*my_team_ids, *my_team_ids, *params) if my_team_ids else params)
+        (*params, *my_team_ids, *my_team_ids, *params) if my_team_ids else (*params, *params))
+    _tp4 = time.perf_counter()
     conn.commit()
+    _tp5 = time.perf_counter()
+    print(f"[PERF]     _summarize_and_prune_archive 세부: todo조회 {_tp1-_tp0:.2f}s"
+          f"({len(todo)}건) | 요약INSERT루프 {_tp2-_tp1:.2f}s | my_team조회 {_tp3-_tp2:.2f}s | "
+          f"원본DELETE {_tp4-_tp3:.2f}s | commit {_tp5-_tp4:.2f}s")
 
 
 def compact_existing_match_archive():
@@ -1492,15 +1539,31 @@ def archive_old_seasons(current_season):
     conn = get_conn()
     c = conn.cursor()
     cols = "id,league_id,week,home_team_id,away_team_id,home_score,away_score,season,year,day"
+    # [2026-08 계측 추가, 신민용 리포트: "연도전환 시 아카이브이동만 갑자기
+    # 7~8초"] 여태 archive_old_seasons() 통짜 시간만 로그에 찍혀서, 그 안의
+    # 어느 세부 단계(과거시즌 조회/이동INSERT/DELETE/요약+정리)가 실제
+    # 병목인지 알 수 없었다. 기존 [PERF] 로그와 같은 스타일로 세부 타이머를
+    # 추가한다 — 다음에 다시 느려지면 이 로그만으로 바로 원인 함수를 특정.
+    _ta0 = time.perf_counter()
     seasons = [r["season"] for r in c.execute(
         "SELECT DISTINCT season FROM match_results WHERE season<?", (current_season,)).fetchall()]
+    _ta1 = time.perf_counter()
     c.execute(
         f"""INSERT OR IGNORE INTO match_results_archive({cols})
             SELECT {cols} FROM match_results WHERE season<?""", (current_season,))
+    _ta2 = time.perf_counter()
     c.execute("DELETE FROM match_results WHERE season<?", (current_season,))
+    _ta3 = time.perf_counter()
     conn.commit()
+    _ta4 = time.perf_counter()
+    _tsp = 0.0
     if seasons:
+        _tsp0 = time.perf_counter()
         _summarize_and_prune_archive(conn, seasons=seasons)
+        _tsp = time.perf_counter() - _tsp0
+    print(f"[PERF]   archive_old_seasons 세부: 과거시즌조회 {_ta1-_ta0:.2f}s | "
+          f"아카이브INSERT {_ta2-_ta1:.2f}s | match_results DELETE {_ta3-_ta2:.2f}s | "
+          f"commit {_ta4-_ta3:.2f}s | 요약+정리 {_tsp:.2f}s | (대상시즌 {seasons})")
 
 
 def repair_duplicate_season_schedules():
@@ -2839,7 +2902,17 @@ def _generate_all_ai_players(c, progress_cb=None):
 
     _total_teams = len(rows)
     _done = 0
-    from data.prestige_clubs import is_prestige, weighted_team_order
+    # [2026-08 최적화] 팀마다 "SELECT name FROM player_names WHERE country_id=?
+    # ORDER BY RANDOM()"을 새로 날렸었다 — 팀 수(10,423)만큼 쿼리가 나가는데,
+    # 정작 국가 수는 210개뿐이라 대부분 같은 나라를 위해 매번 다시 조회하는
+    # 중복 쿼리였다. 실측 결과 이 쿼리 하나가 전체 선수단 생성 시간의 40%
+    # 가까이를 차지 — DB 쓰기(INSERT)보다 훨씬 큰 병목이었다.
+    # ORDER BY RANDOM()의 "정렬"은 아래에서 random.choice()로 매번 무작위
+    # 선택하는 로직상 순서에 아무 영향이 없으므로(균등 추출은 입력 순서와
+    # 무관), 국가별로 딱 한 번만 조회해 캐싱하고 이후 같은 나라의 모든
+    # 팀은 캐시를 재사용한다. 결과물(어떤 이름이 어떤 확률로 배정되는지)은
+    # 기존과 동일 — 그냥 같은 조회를 10,423번이 아니라 210번만 한다.
+    _name_pool_cache: dict = {}
     # [2026-07 신설, 신민용 확정] 명문팀 전용 team_strength 보너스. ace_lo
     # (팀 간 OVR 격차의 전체 폭)는 예전 지적("같은 1부인데 팀간 격차가
     # 너무 크다")대로 좁게 유지한다 — 이걸 다시 넓히면 명문팀 문제는
@@ -2857,7 +2930,6 @@ def _generate_all_ai_players(c, progress_cb=None):
         # 구조로 재편했다 — 등급별 가중치는 prestige_weight()가
         # PRESTIGE_WEIGHT_BY_LEVEL에서 찾아 반환한다(3급=뮌헨/PSG/레알
         # 등, 2급=첼시/도르트문트 등, 1급=토트넘/레버쿠젠 등, 비명문=1.0).
-        from data.prestige_clubs import prestige_weight
         teams_info = [{"weight": prestige_weight(t.get("cname", ""), t.get("tname", ""))}
                       for t in teams]
         perm = weighted_team_order(teams_info)   # perm[0]=이번 시즌 최강팀 인덱스, ...
@@ -2866,24 +2938,23 @@ def _generate_all_ai_players(c, progress_cb=None):
             team = teams[team_idx]
             team_strength = 1.0 - (rank / (n - 1)) if n > 1 else 1.0
             # [리그등급 분리] 국대 등급(grade) 대신 리그 전용 등급 사용
-            from constants import get_league_grade
             league_grade = get_league_grade(team.get("cname", ""), team["grade"])
             team_with_lg = dict(team)
             team_with_lg["grade"] = league_grade
-            _generate_team_players(c, team_with_lg, team_strength, league_used)
+            _generate_team_players(c, team_with_lg, team_strength, league_used,
+                                    name_pool_cache=_name_pool_cache)
             _done += 1
             if progress_cb and (_done % 20 == 0 or _done == _total_teams):
                 progress_cb(_done, _total_teams, team.get("cname", ""))
 
 
-def _generate_team_players(c, team, team_strength, league_used: set = None):
+def _generate_team_players(c, team, team_strength, league_used: set = None, name_pool_cache: dict = None):
     grade = team["grade"]; tier = team["tier"]
     continent = team.get("continent", "유럽")
     if league_used is None:
         league_used = set()
 
     # 대륙별 OVR 보정치 + [신규] 나라별 미세조정(COUNTRY_OVR_ADJ)
-    from constants import CONTINENT_OVR_BONUS, COUNTRY_OVR_ADJ
     continent_bonus = CONTINENT_OVR_BONUS.get(continent, 0)
     continent_bonus += COUNTRY_OVR_ADJ.get(team.get("cname", ""), 0)
     # SS는 이미 상한(100)에 근접 → 보정 축소 (초과 방지)
@@ -2893,16 +2964,21 @@ def _generate_team_players(c, team, team_strength, league_used: set = None):
     # [2026-07 신설] 명문팀 전용 OVR 보너스 — ace_lo(팀간 전반 격차)는 건드리지
     # 않고, 명문팀에만 별도로 얹는다. continent_bonus와 달리 SS등급 클램프의
     # 영향을 안 받도록 _target_ovr 안에서 top 계산 이후 단계에 더해진다.
-    from data.prestige_clubs import is_prestige, PRESTIGE_OVR_BONUS
     prestige_bonus = PRESTIGE_OVR_BONUS if is_prestige(
         team.get("cname", ""), tier, team.get("tname", "")) else 0
 
     # 해당 국가 이름풀 전체를 가져온다 (리그 8팀 × 11명 = 최대 88개 필요)
-    c.execute("SELECT name FROM player_names WHERE country_id=? ORDER BY RANDOM()",
-              (team["cid"],))
-    name_pool = [r["name"] for r in c.fetchall()]
-    if not name_pool:
-        name_pool = [f"선수{i}" for i in range(100)]
+    # [2026-08 최적화] 국가당 한 번만 SELECT, 이후 팀들은 캐시 재사용.
+    _cid = team["cid"]
+    if name_pool_cache is not None and _cid in name_pool_cache:
+        name_pool = name_pool_cache[_cid]
+    else:
+        c.execute("SELECT name FROM player_names WHERE country_id=?", (_cid,))
+        name_pool = [r["name"] for r in c.fetchall()]
+        if not name_pool:
+            name_pool = [f"선수{i}" for i in range(100)]
+        if name_pool_cache is not None:
+            name_pool_cache[_cid] = name_pool
 
     # [2026-07 신설] 스타 슬롯(월드클래스/엘리트) 명시적 배정 — 완만한 곡선
     # (_target_ovr)만으로는 "이 팀에 월클이 몇 명"이 보장되지 않아서, 소수
@@ -2945,6 +3021,11 @@ def _generate_team_players(c, team, team_strength, league_used: set = None):
     _elite_floor = ELITE_FLOOR_BY_GRADE.get(grade) if tier == 1 else None
     _quota = FOREIGN_QUOTA_CAP.get(team.get("cname", ""))
     _foreign_count = 0
+    # [2026-08 최적화] 선수 11명치 INSERT를 한 명씩 execute()하는 대신 모아뒀다가
+    # 팀 끝에서 executemany() 한 번으로 묶는다. 매 execute() 호출마다 발생하는
+    # 파이썬↔SQLite 오가는 고정비용(재시도 래퍼/락 진입 등 포함)을 11번 대신 1번만
+    # 치르게 된다. 삽입되는 데이터·순서·트랜잭션 범위는 기존과 완전히 동일.
+    _rows = []
 
     for idx, pos in enumerate(TEAM_POSITIONS):
         # 리그 전체에서 아직 안 쓴 이름 우선 사용
@@ -2974,22 +3055,22 @@ def _generate_team_players(c, team, team_strength, league_used: set = None):
         # [AI 생애] 초기 나이: 16~34 삼각분포(25 봉우리). 시즌마다 +1 되며 성장/노화.
         age = int(round(random.triangular(16, 34, 25)))
         # [세부역할 2026-07] 포지션에 맞는 SUB_ROLES 중 하나를 무작위 배정.
-        from constants import SUB_ROLES
         sub_role = random.choice(SUB_ROLES.get(pos, ["기본"]))
         nationality, _foreign_count = _pick_nationality(
             team.get("cname", ""), continent, grade, pos,
             idx in star_kind_by_slot, _foreign_count, _quota)
-        c.execute("""INSERT INTO ai_players
-            (team_id,name,position,stamina,speed,jump,strength,shooting,passing,
-             dribbling,tackling,heading,positioning,setpiece,
-             mental,confidence,leadership,concentration,ovr,age,sub_role,nationality)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (team["tid"],name,pos,
+        _rows.append((team["tid"],name,pos,
              stats["stamina"],stats["speed"],stats["jump"],stats["strength"],
              stats["shooting"],stats["passing"],stats["dribbling"],
              stats["tackling"],stats["heading"],stats["positioning"],
              stats["setpiece"],stats["mental"],stats["confidence"],
              stats["leadership"],stats["concentration"],ovr,age,sub_role,nationality))
+
+    c.executemany("""INSERT INTO ai_players
+        (team_id,name,position,stamina,speed,jump,strength,shooting,passing,
+         dribbling,tackling,heading,positioning,setpiece,
+         mental,confidence,leadership,concentration,ovr,age,sub_role,nationality)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", _rows)
 
 
 def _gen_ai_stats(pos, target):
@@ -2997,13 +3078,11 @@ def _gen_ai_stats(pos, target):
     키스탯은 가중치가 높으므로 목표보다 약간 높게, 비키스탯은 약간 낮게 둔다.
     + 신체 아키타입(체형)에 따른 stat_bias 를 더해 종결자/음속/포켓로켓/발전기
       유형의 개성을 부여한다(포지션이 확률을 기울이되 고정하지 않음)."""
-    from constants import (BODY_TYPE_NAMES, BODY_TYPE_WEIGHTS_BY_POS,
-                           BODY_TYPES, BODY_TYPE_WEIGHTS_BY_POS as _BW)
     keys = KEY_STATS_BY_POS.get(pos, ALL_STATS[:5])
     adj = target + 1.0   # calc_ovr 하향편향(가중분산) 보정
 
     # 아키타입 추첨 (포지션 가중치 기반, 예외 허용)
-    _w = _BW.get(pos, [25, 25, 25, 25])
+    _w = BODY_TYPE_WEIGHTS_BY_POS.get(pos, [25, 25, 25, 25])
     body_type = random.choices(BODY_TYPE_NAMES, _w)[0]
     bias = BODY_TYPES[body_type]["stat_bias"]
 

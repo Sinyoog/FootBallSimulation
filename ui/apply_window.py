@@ -115,7 +115,7 @@ class ApplyWindow(QDialog):
         # 흔하니, 원하는 부수를 콕 집어 볼 수 있게 한다.
         self.tier_combo = QComboBox()
         self.tier_combo.addItem("전체 부", None)
-        for t in range(1, 7):
+        for t in range(1, wb.list_max_tier() + 1):
             self.tier_combo.addItem(f"{t}부", t)
         self.tier_combo.currentIndexChanged.connect(self._do_search)
         search_row.addWidget(self.tier_combo, 1)
