@@ -2280,7 +2280,7 @@ class WorldBrowserWindow(QDialog):
         lbl = QLabel("대륙"); lbl.setStyleSheet("color:#888;font-size:11px;")
         self.region_cont_combo = QComboBox()
         self.region_cont_combo.addItem(_ALL)
-        for cont in ["아시아", "아프리카", "북중미", "오세아니아"]:
+        for cont in ["아시아", "아프리카", "북중미", "남미", "오세아니아"]:
             self.region_cont_combo.addItem(cont)
         self.region_cont_combo.currentTextChanged.connect(self._refresh_region_list)
         filt.addWidget(lbl)
@@ -2345,6 +2345,12 @@ class WorldBrowserWindow(QDialog):
             prefix = region[:-len(continent)]
         else:
             prefix = region
+        if not prefix:
+            # [2026-08 신설] 남미(region="남미", continent="남미")처럼
+            # 지역명이 대륙명과 완전히 같으면 접두어가 빈 문자열이 돼서
+            # "()남미"라는 어색한 표시가 나온다 — 이 경우엔 괄호 없이
+            # 대륙명만 보여준다.
+            return continent
         return f"({prefix}){continent}"
 
     def _region_row_spec(self, name, label):
