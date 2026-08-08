@@ -6477,7 +6477,14 @@ def _intl_trophy_points(result: str, kind: str = "world", continent: str = "") -
     참가국 수준이 약해서 큰 영향이 없어야 한다"] 월드컵(kind='world')은
     대륙 구분이 없어 그대로 만점을 주고, 대륙컵(kind='continent')은 유럽만
     만점, 그 외 대륙은 20%로 대폭 깎는다 — 아시안컵 우승(10.0)이 유로 우승과
-    동일하게 발롱도르 트로피 점수를 채워주던 것을 막기 위함."""
+    동일하게 발롱도르 트로피 점수를 채워주던 것을 막기 위함.
+
+    [2026-08 확장, 신민용 확정] 3단계 지역컵(kind='region', EAFF/AFF/SAFF/
+    WAFF/COSAFA/CECAFA/WAFU/UNCAF/카리브)은 대륙컵보다도 한 단계 더 아래
+    급이라 — 대륙컵 중 유럽 외(20%)보다도 훨씬 약하게(5%) 잡는다. 지역컵
+    조별탈락엔 대륙컵 같은 마이너스 페널티도 안 준다 — 애초에 그 정도로
+    비중 있는 대회가 아니라서.
+    """
     if not result:
         return 0.0
     if "우승" in result and "준우승" not in result:
@@ -6503,7 +6510,9 @@ def _intl_trophy_points(result: str, kind: str = "world", continent: str = "") -
         if kind == "continent" and continent != "유럽":
             return -1.5
         return 0.0   # 조별탈락/예선탈락 등
-    if kind == "continent" and continent != "유럽":
+    if kind == "region":
+        base *= 0.05
+    elif kind == "continent" and continent != "유럽":
         base *= 0.2
     return base
 

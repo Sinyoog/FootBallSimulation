@@ -265,6 +265,8 @@ class WorldBrowserWindow(QDialog):
         _wb_marks.append(("역대월드컵", _time_wb.perf_counter()))
         tabs.addTab(self._build_nc_tab(), "🎖 역대 네이션스컵")
         _wb_marks.append(("역대네이션스컵", _time_wb.perf_counter()))
+        tabs.addTab(self._build_region_tab(), "🌏 역대 지역컵")
+        _wb_marks.append(("역대지역컵", _time_wb.perf_counter()))
         tabs.addTab(self._build_country_tab(), "🌍 국가 검색")
         _wb_marks.append(("국가검색", _time_wb.perf_counter()))
 
@@ -1623,6 +1625,17 @@ class WorldBrowserWindow(QDialog):
         filt.addWidget(lbl2)
         filt.addWidget(self.country_grade_combo)
 
+        # [2026-08 신설, 신민용 요청] 트로피 유무 필터 — 등급 필터 바로
+        # 뒤에 위치. "전체 / 상 있는 국가 / 상 없는 국가" 3분류.
+        lbl3 = QLabel("수상"); lbl3.setStyleSheet("color:#888;font-size:11px;")
+        self.country_trophy_combo = QComboBox()
+        self.country_trophy_combo.addItem(_ALL)
+        self.country_trophy_combo.addItem("상 있는 국가")
+        self.country_trophy_combo.addItem("상 없는 국가")
+        self.country_trophy_combo.currentTextChanged.connect(self._refresh_country_search_list)
+        filt.addWidget(lbl3)
+        filt.addWidget(self.country_trophy_combo)
+
         self.country_search_box = QLineEdit()
         self.country_search_box.setPlaceholderText("🔎 국가명 검색")
         self._country_search_debounce = QTimer(self)
@@ -1695,9 +1708,17 @@ class WorldBrowserWindow(QDialog):
     def _refresh_country_search_list(self, *_a):
         cont = None if self.country_cont_combo.currentText() == _ALL else self.country_cont_combo.currentText()
         grade = None if self.country_grade_combo.currentText() == _ALL else self.country_grade_combo.currentText()
+        trophy_filter = self.country_trophy_combo.currentText()
         q = self.country_search_box.text().strip() or None
         countries = wb.search_countries(name_query=q, continent=cont, grade=grade)
         trophy_counts = wb.get_all_countries_trophy_counts()
+
+        # [2026-08 신설] 수상 유무 필터 — trophy_counts에 그 국가 항목
+        # 자체가 없거나 있어도 전부 0회면 "상 없는 국가"로 취급.
+        if trophy_filter != _ALL:
+            has_any = lambda name: any((trophy_counts.get(name) or {}).values())
+            want_has_trophy = (trophy_filter == "상 있는 국가")
+            countries = [cn for cn in countries if has_any(cn["name"]) == want_has_trophy]
 
         self.country_list.clear()
         for cn in countries:
@@ -2240,11 +2261,134 @@ class WorldBrowserWindow(QDialog):
                                     "아직 완료된 대회가 없습니다\n(대회 발생 연도가 되어야 기록이 쌓입니다)")
 
     # ─────────────────────────────────────────
+    # 탭4.5: 역대 지역컵 (2026-08 신설, 신민용 확정: "이건 챔스 탭처럼
+    # 표 하나가 아니라, 리그 검색 탭처럼 좌측에 목록 두고 클릭하면
+    # 우측에 그 대회 연도별 1~4위가 뜨게")
+    # ─────────────────────────────────────────
+    def _build_region_tab(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 8, 0, 0)
+
+        info = QLabel("ℹ️ 월드컵/대륙컵/클럽월드컵 어느 것과도 겹치지 않는 해(4년 주기)에 "
+                       "9개 지역(아시아 4·아프리카 3·북중미 2)에서 자동으로 열립니다.")
+        info.setStyleSheet("color:#888;font-size:11px;")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+
+        filt = QHBoxLayout()
+        lbl = QLabel("대륙"); lbl.setStyleSheet("color:#888;font-size:11px;")
+        self.region_cont_combo = QComboBox()
+        self.region_cont_combo.addItem(_ALL)
+        for cont in ["아시아", "아프리카", "북중미", "오세아니아"]:
+            self.region_cont_combo.addItem(cont)
+        self.region_cont_combo.currentTextChanged.connect(self._refresh_region_list)
+        filt.addWidget(lbl)
+        filt.addWidget(self.region_cont_combo)
+        filt.addStretch()
+        lay.addLayout(filt)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+        self._region_split = split
+        # [2026-08 수정, 신민용 리포트: "역대 지역컵 목록 글자가 다른 탭이랑
+        # 안 맞는다"] 맨처음엔 그냥 QListWidgetItem(문자열)이라 왼쪽 여백도
+        # 없고 다른 리스트(국가/리그/팀 검색)와 폰트·정렬이 안 맞았다 —
+        # 그 탭들이 전부 쓰는 것과 완전히 같은 그리드 델리게이트
+        # (_GridRowDelegate) + 고정 헤더 패턴으로 통일한다.
+        self.region_list = QListWidget()
+        self.region_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.region_list.itemClicked.connect(self._on_region_selected)
+        self.region_list.setItemDelegate(_GridRowDelegate(self, self.region_list))
+        region_header = self._list_header_row([
+            ("대회명", self._NAME_COL_W, False),
+            ("대륙", self._COUNTRY_COL_W, False),
+        ])
+        split.addWidget(self._wrap_list_with_header(self.region_list, region_header))
+
+        right = QWidget()
+        right_lay = QVBoxLayout(right)
+        right_lay.setContentsMargins(10, 0, 0, 0)
+        self.region_title = QLabel("← 왼쪽에서 지역대회를 선택하세요")
+        self.region_title.setStyleSheet("color:#00cc44;font-size:14px;font-weight:bold;")
+        right_lay.addWidget(self.region_title)
+
+        self.region_tbl = QTableWidget(0, 0)
+        self.region_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.region_tbl.verticalHeader().setVisible(False)
+        self.region_tbl.cellDoubleClicked.connect(
+            lambda r, c: self._open_intl_detail(self.region_tbl, r, wc=False))
+        right_lay.addWidget(self.region_tbl)
+        hint = QLabel("💡 연도를 더블클릭하면 조별리그·토너먼트 상세를 볼 수 있어요")
+        hint.setStyleSheet("color:#666;font-size:10px;")
+        right_lay.addWidget(hint)
+
+        split.addWidget(right)
+        split.setSizes([440, 900])
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        lay.addWidget(split, 1)
+
+        self._refresh_region_list()
+        return w
+
+    def _region_display_label(self, region, continent):
+        """[2026-08 신설, 신민용 확정: "대륙 앞에 (동)아시아처럼 하위지역
+        표시해줘, 근데 필터는 그대로 대륙 기준으로 동작해야"] 두 번째
+        컬럼에 "(동)아시아"/"(동중부)아프리카"처럼 하위지역을 괄호로
+        붙여서 보여준다. 지역명이 대륙명으로 끝나면(예: "동아시아".
+        endswith("아시아")) 그 대륙명 부분을 떼고 남은 접두어만
+        괄호에 넣고("동"), 안 끝나면(북중미의 "중앙아메리카"/"카리브"
+        처럼) 지역명 전체를 그대로 괄호에 넣는다. 필터 자체는 이 표시
+        문자열이 아니라 원본 continent 값으로 그대로 동작하므로(아래
+        _refresh_region_list) 이 라벨을 바꿔도 필터링엔 영향 없다."""
+        if continent and region.endswith(continent):
+            prefix = region[:-len(continent)]
+        else:
+            prefix = region
+        return f"({prefix}){continent}"
+
+    def _region_row_spec(self, name, label):
+        return [
+            {"text": name, "width": self._NAME_COL_W, "color": "#eee", "bold": True},
+            {"text": label, "width": self._COUNTRY_COL_W, "color": "#aaddff"},
+        ]
+
+    def _refresh_region_list(self, *_a):
+        from constants import REGION_CUP_NAME, REGION_TO_CONTINENT
+        cont = self.region_cont_combo.currentText()
+        names = wb.list_region_cup_names()
+        # 대회명 -> 지역명/대륙 역매핑(REGION_CUP_NAME: 지역명->대회명, REGION_TO_CONTINENT: 지역명->대륙)
+        cup_to_region = {cupname: region for region, cupname in REGION_CUP_NAME.items()}
+        self.region_list.clear()
+        for name in names:
+            region = cup_to_region.get(name, "")
+            name_cont = REGION_TO_CONTINENT.get(region, "")
+            # 필터는 원본 대륙값으로만 동작 — 괄호 표시 라벨과 무관
+            if cont != _ALL and name_cont != cont:
+                continue
+            label = self._region_display_label(region, name_cont)
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, name)
+            item.setData(_GridRowDelegate._SPEC_ROLE, self._region_row_spec(name, label))
+            self.region_list.addItem(item)
+        self._ensure_list_fits(self.region_list, self._region_split)
+        self.region_title.setText("← 왼쪽에서 지역대회를 선택하세요")
+        self.region_tbl.setRowCount(0)
+        self.region_tbl.setColumnCount(0)
+
+    def _on_region_selected(self, item):
+        name = item.data(Qt.ItemDataRole.UserRole)
+        self.region_title.setText(f"🌏 {name}")
+        rows = wb.get_region_cup_history(name=name)
+        self._fill_placement_table(self.region_tbl, rows,
+                                    "아직 완료된 대회가 없습니다\n(대회 발생 연도가 되어야 기록이 쌓입니다)")
+
+    # ─────────────────────────────────────────
     # 공용 헬퍼
     # ─────────────────────────────────────────
     def _fill_placement_table(self, tbl, rows, empty_msg):
         """연도/대회명 + 1~4위(국기 포함) 공통 테이블 채우기.
-        (역대 월드컵/네이션스컵 탭이 동일한 형식이라 공용 헬퍼로 통합)"""
+        (역대 월드컵/네이션스컵/지역컵 탭이 동일한 형식이라 공용 헬퍼로 통합)"""
         cols = ["연도", "대회", "🥇 우승", "🥈 준우승", "🥉 3위", "4위"]
         tbl.clear()
         tbl.setRowCount(len(rows))
@@ -2256,10 +2400,14 @@ class WorldBrowserWindow(QDialog):
             def _fmt(key):
                 nat = r.get(key) or ""
                 if not nat:
-                    return "-"
-                return f"{r.get(f'{key}_flag','')} {nat}".strip()
-            vals = [str(r["year"]), r["name"],
-                    _fmt("winner"), _fmt("runner_up"), _fmt("third"), _fmt("fourth")]
+                    return "-", None
+                return f"{r.get(f'{key}_flag','')} {nat}".strip(), nat
+            w_disp, w_clean = _fmt("winner")
+            ru_disp, ru_clean = _fmt("runner_up")
+            th_disp, th_clean = _fmt("third")
+            fo_disp, fo_clean = _fmt("fourth")
+            vals = [str(r["year"]), r["name"], w_disp, ru_disp, th_disp, fo_disp]
+            clean_vals = [None, None, w_clean, ru_clean, th_clean, fo_clean]
             for j, v in enumerate(vals):
                 cell = QTableWidgetItem(v)
                 cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2267,9 +2415,17 @@ class WorldBrowserWindow(QDialog):
                     cell.setForeground(Qt.GlobalColor.yellow)
                 if j == 0:
                     cell.setData(Qt.ItemDataRole.UserRole, r["id"])
+                # [2026-08 신설, 신민용 리포트: "복사하면 국기/국가명까지
+                # 같이 복사된다 — 챔스처럼 이름만 복사되게"] 챔스/컵대회
+                # 탭과 같은 패턴(_CLEAN_TEXT_ROLE + _enable_plain_copy)을
+                # 이 공용 헬퍼에도 적용 — 월드컵/네이션스컵/지역컵 탭 전부
+                # 한 번에 해결된다.
+                if clean_vals[j]:
+                    cell.setData(_CLEAN_TEXT_ROLE, clean_vals[j])
                 tbl.setItem(i, j, cell)
         self._show_empty_state(tbl, rows, empty_msg, len(cols))
         self._grow_to_fit(tbl, stretch_col=1)
+        self._enable_plain_copy(tbl)
 
     def _open_intl_detail(self, tbl, row, wc):
         item = tbl.item(row, 0)
@@ -2352,7 +2508,7 @@ class TournamentDetailDialog(QDialog):
         groups = detail.get("groups") or {}
         if groups:
             lay.addWidget(self._section_label("⚽ 조별리그"))
-            lay.addWidget(self._build_groups_grid(groups, team_based))
+            lay.addWidget(self._build_groups_grid(groups, team_based, detail.get("qualified")))
 
         league_standings = detail.get("league_standings") or []
         if league_standings:
@@ -2559,7 +2715,13 @@ class TournamentDetailDialog(QDialog):
             lay.addWidget(hint)
         return box
 
-    def _build_groups_grid(self, groups, team_based):
+    def _build_groups_grid(self, groups, team_based, qualified=None):
+        # [2026-08 버그수정, 신민용 리포트: "3위 와일드카드로 진출한 팀도
+        # 흰색으로 떠야 하는데 회색으로 뜬다"] qualified(실제 다음 라운드
+        # 첫 대진에 등장한 팀 이름 집합, world_browser.get_intl_tournament_
+        # detail이 계산해서 넘겨줌)가 있으면 그걸로 진출 여부를 판정하고,
+        # 없으면(옛 호출부·조별탈락형 등) 예전처럼 순위<2로 폴백한다.
+        qualified = qualified or set()
         box = QWidget()
         grid = QGridLayout(box)
         grid.setSpacing(10)
@@ -2591,7 +2753,13 @@ class TournamentDetailDialog(QDialog):
             for rank, t in enumerate(teams):
                 name = t["name"] if team_based else t["country"]
                 country = t.get("country") if team_based else None
-                advancing = rank < 2  # 보통 조 1·2위가 다음 라운드 진출
+                # [2026-08 버그수정] 예전엔 "순위<2" 하나로만 진출을
+                # 판정했다 — 3위 와일드카드로 실제 진출한 팀(예: 24개국
+                # 대회의 6조 3위 중 성적 상위)도 순위만 보면 3위라 회색
+                # (탈락)으로 잘못 뜨고 있었다. qualified 집합(실제 다음
+                # 라운드 대진에 등장한 이름)에 있으면 순위와 무관하게
+                # 진출로 표시한다.
+                advancing = rank < 2 or name in qualified
                 text_color = "#fff" if advancing else "#777"
                 weight = "bold" if advancing else "normal"
 

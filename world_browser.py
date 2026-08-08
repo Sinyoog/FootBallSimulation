@@ -921,6 +921,39 @@ def get_continental_cup_history(name=None, limit=100):
     return rows
 
 
+# [2026-08 신설] 3단계 지역컵 — 대륙컵 함수들과 완전히 같은 패턴이다.
+# 국가 검색/트로피 집계는 kind로 그룹만 하는 범용 구조라 이미 지역컵도
+# 자동으로 잡히지만(get_country_trophy_summary 등), "세계기록실 → 역대
+# 지역컵" 탭 전용으로 (1) 지역별 대회명 목록 (2) 특정 지역의 연도별
+# 1~4위 이력을 뽑는 함수 두 개만 새로 필요하다.
+def list_region_cup_names():
+    """지금까지 이 세이브에서 실제로 열린 적 있는 지역컵 이름 목록
+    (대회명, 예: 'EAFF E-1 챔피언십') — 왼쪽 목록에 쓴다."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT DISTINCT name FROM intl_tournaments WHERE kind='region' "
+        "ORDER BY name").fetchall()
+    conn.close()
+    return [r["name"] for r in rows]
+
+
+def get_region_cup_history(name=None, limit=100):
+    """완료된 지역컵(kind='region') 대회의 연도별 1~4위 목록.
+    name을 주면 그 대회(예: 'EAFF E-1 챔피언십')만."""
+    conn = get_conn(); c = conn.cursor()
+    q = ("SELECT id, year, name FROM intl_tournaments "
+         "WHERE kind='region' AND status='done' AND winner != ''")
+    params = []
+    if name:
+        q += " AND name=?"; params.append(name)
+    q += " ORDER BY year DESC, id DESC LIMIT ?"
+    params.append(limit)
+    rows = [dict(r) for r in c.execute(q, params).fetchall()]
+    rows = _attach_placements_and_flags(rows, conn)
+    conn.close()
+    return rows
+
+
 # ─────────────────────────────────────────
 # 5.5. 국가 검색 (2026-08 신설, 신민용 확정: "월드컵/대륙컵 우승 기록실")
 # ─────────────────────────────────────────
@@ -998,7 +1031,7 @@ def get_country_tournament_results(country_name, limit=200):
         return []
     ph = ",".join("?" * len(tids))
     tours = [dict(r) for r in c.execute(
-        f"""SELECT id, year, kind, name FROM intl_tournaments
+        f"""SELECT id, year, kind, name, continent FROM intl_tournaments
             WHERE id IN ({ph}) AND status='done'
             ORDER BY year DESC, id DESC LIMIT ?""", tids + [limit]).fetchall()]
     if not tours:
@@ -1042,6 +1075,24 @@ def get_country_tournament_results(country_name, limit=200):
                 "SELECT 1 FROM qual_results WHERE target_year=? AND kind='world' "
                 "AND country=? LIMIT 1", (t["year"], country_name)).fetchone()
             qualified_by_tid[t["id"]] = bool(qr)
+
+    # [2026-08 신설, 신민용 리포트: "유로 예선이 종류=cont_qual 그대로 뜨고
+    # 결과가 '기록 없음'으로만 뜬다"] 유로 예선(cont_qual)도 wc_qual과 완전히
+    # 같은 성격(결승 없이 '본선 진출 여부'만 의미 있음)인데 이 특수 처리가
+    # wc_qual만 잡고 있었다 — qual_results(kind='continent')로 통과 여부를
+    # 확인하는 동일한 로직을 cont_qual에도 적용한다.
+    cont_qual_tids = [t["id"] for t in tours if t["kind"] == "cont_qual"]
+    cont_qualified_by_tid = {}
+    if cont_qual_tids:
+        for t in tours:
+            if t["kind"] != "cont_qual":
+                continue
+            _cont = (t.get("continent") or "").strip() or "유럽"
+            qr = c.execute(
+                "SELECT 1 FROM qual_results WHERE target_year=? AND kind='continent' "
+                "AND continent=? AND country=? LIMIT 1",
+                (t["year"], _cont, country_name)).fetchone()
+            cont_qualified_by_tid[t["id"]] = bool(qr)
     conn.close()
 
     out = []
@@ -1059,6 +1110,17 @@ def get_country_tournament_results(country_name, limit=200):
                 if "qual_po" in stages:
                     result, tier = "플레이오프 탈락", 1
                 elif "qual_group" in stages:
+                    result, tier = "조별리그 탈락", 1
+                else:
+                    result, tier = "기록 없음", 0
+        elif t["kind"] == "cont_qual":
+            # [2026-08 신설] 유로 예선도 wc_qual과 동일한 성격 — 본선
+            # 진출/탈락만 의미 있다.
+            if cont_qualified_by_tid.get(t["id"]):
+                result, tier = "🎫 본선 진출", 2
+            else:
+                stages = stages_by_tid.get(t["id"], set())
+                if "qual_group" in stages:
                     result, tier = "조별리그 탈락", 1
                 else:
                     result, tier = "기록 없음", 0
@@ -1088,10 +1150,25 @@ def get_country_tournament_results(country_name, limit=200):
         # 보장한다 — 데이터 자체가 비정상인 레거시 행이라도 화면은 안 깨지게.
         out.append({"id": t["id"], "year": t["year"],
                      "kind": t["kind"] or "?",
-                     "name": t["name"] or f"{t['year']}년 대회(이름 없음)",
+                     "name": _country_result_name(t),
                      "result": result, "tier": tier,
                      "record": record_str})
     return out
+
+
+def _country_result_name(t):
+    """[2026-08 신설, 신민용 리포트: "국가별 기록에 지역컵 대회명만 뜨는데
+    어느 지역인지도 같이 보여줘"] 지역컵(kind='region')은 대회명만 봐서는
+    무슨 지역인지 바로 안 보인다(예: 'WAFF 챔피언십') — REGION_CUP_NAME을
+    거꾸로 뒤져서 "WAFF 챔피언십(서아시아)"처럼 지역명을 괄호로 붙인다."""
+    name = t["name"] or f"{t['year']}년 대회(이름 없음)"
+    if t["kind"] == "region":
+        from constants import REGION_CUP_NAME
+        cup_to_region = {v: k for k, v in REGION_CUP_NAME.items()}
+        region = cup_to_region.get(name)
+        if region:
+            return f"{name}({region})"
+    return name
 
 
 def search_countries(name_query=None, continent=None, grade=None):
@@ -1163,7 +1240,23 @@ def get_intl_tournament_detail(tournament_id):
     knockout = [{"stage": s, "stage_ko": STAGE_KO.get(s, s), "matches": ko_by_stage[s]}
                 for s in _INTL_KO_STAGE_ORDER if s in ko_by_stage]
 
-    return {"groups": groups, "knockout": knockout}
+    # [2026-08 버그수정, 신민용 리포트: "3위 와일드카드로 진출한 팀도
+    # 조별리그 표에서 흰색(진출 표시)으로 떠야 하는데 회색으로 뜬다"]
+    # 이 상세창의 조별리그 표는 원래 "순위<2면 진출"이라는 단순 가정만
+    # 썼다(실제 대진을 안 보고 순위만 봄) — 3위 와일드카드가 있는 대회
+    # (월드컵 48강, 대륙컵/유로/일부 지역컵)에서는 틀린 판정이었다. 실제
+    # 첫 토너먼트 라운드(가장 이른 스테이지)에 등장하는 팀 이름을 그대로
+    # "진출 확정" 집합으로 써서, 순위 대신 실제 대진 데이터를 근거로 삼는다.
+    qualified = set()
+    if knockout:
+        first_stage_matches = knockout[0]["matches"]
+        for m in first_stage_matches:
+            if m.get("home"):
+                qualified.add(m["home"])
+            if m.get("away"):
+                qualified.add(m["away"])
+
+    return {"groups": groups, "knockout": knockout, "qualified": qualified}
 
 
 def get_wc_qualifier_summary(wc_year):

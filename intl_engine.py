@@ -54,7 +54,7 @@ from constants import (
     WC_EXPAND_YEAR, WC_TEAMS_BIG, WC_GROUPS_BIG, WC_QUOTA_BIG, WC_BEST_THIRDS_BIG,
     CONT_TEAMS, CONT_GROUPS, CONT_BEST_THIRDS,
     CONFEDERATIONS, CONTINENT_TO_CONF, CONF_CUP_NAME,
-    WC_QUAL_32, WC_QUAL_48,
+    WC_QUAL_32, WC_QUAL_48, EURO_QUAL,
     GRADE_TEAM_OVR, GRADE_QUAL_BASE, QUAL_NOISE,
     INTL_SELECTION_OVR, INTL_MAX_TIER, INTL_MIN_MATCHES,
     INTL_SELECTION_MARGIN, INTL_SQUAD_QUOTA,
@@ -216,6 +216,32 @@ _GROUP_ROUNDS = [
     [(0, 3), (1, 2)],
 ]
 
+
+def _round_robin_pairs(n):
+    """[2026-08 신설] N개 팀의 라운드로빈 대진(인덱스 쌍)을 3라운드
+    구조로 반환 — region 모드는 조 인원이 3명일 수도 있어서(4팀 고정인
+    _GROUP_ROUNDS로는 인덱스 3에서 죽는다) 필요해졌다. 4팀은 기존
+    _GROUP_ROUNDS와 완전히 동일(호환). 3팀은 매 라운드 한 경기씩(한
+    팀은 그 라운드 부전승)."""
+    if n == 4:
+        return _GROUP_ROUNDS
+    if n == 3:
+        return [[(0, 1)], [(0, 2)], [(1, 2)]]
+    if n <= 1:
+        return []
+    # 일반화(추후 다른 조 인원수 대비) — 서클 메소드
+    teams = list(range(n))
+    if n % 2:
+        teams.append(None)  # 부전승 자리
+    rounds = []
+    m = len(teams)
+    for _ in range(m - 1):
+        pairs = [(teams[i], teams[m - 1 - i]) for i in range(m // 2)
+                 if teams[i] is not None and teams[m - 1 - i] is not None]
+        rounds.append(pairs)
+        teams = [teams[0]] + [teams[-1]] + teams[1:-1]
+    return rounds
+
 # 예선 조별리그: 4팀 홈앤어웨이 = 6라운드(앞 3R + 홈/원정 뒤집은 3R)
 _QUAL_ROUNDS = [
     [(0, 1), (2, 3)],
@@ -291,7 +317,13 @@ def get_my_tournament(year=None, qual=None):
     if qual is True:
         ts = [t for t in ts if t.get("kind") == "wc_qual"]
     elif qual is False:
-        ts = [t for t in ts if t.get("kind") in ("world", "continent")]
+        # [2026-08 버그수정, 신민용 리포트: "경기 일정 창에 국제대회 탭
+        # 자체가 안 뜬다"] 지역컵(kind='region')이 이 화이트리스트에
+        # 없어서, schedule_window._make_intl_tab(qual=False)가 이
+        # 함수를 거쳐 갈 때마다 매 지역컵 시즌(2001,05,09..)에 활성
+        # 대회가 있어도 get_my_tournament가 None을 반환 — "🌍 국제대회"
+        # 탭 자체가 생성되지 않았다.
+        ts = [t for t in ts if t.get("kind") in ("world", "continent", "region")]
     if not ts:
         return None
     # [2026-07 버그 수정, 신민용 리포트: "월드컵 일정이 안 떠"] 예선과 본선이
@@ -421,11 +453,15 @@ def choose_national_team(tournament_id, nat):
         _trow2 = _qc2.execute("SELECT year, kind, continent FROM intl_tournaments WHERE id=?",
                                (tournament_id,)).fetchone()
         _qc2.close()
-        if _trow2 and _trow2["kind"] == "wc_qual":
+        if _trow2 and _trow2["kind"] in ("wc_qual", "cont_qual"):
             _tyear2 = _trow2["year"]
             _tconf2 = (_trow2["continent"] or "").strip()
             _big2 = (_tyear2 + 1) >= WC_EXPAND_YEAR
-            _qcfg2 = (WC_QUAL_48 if _big2 else WC_QUAL_32).get(_tconf2, {})
+            if _trow2["kind"] == "cont_qual":
+                from constants import EURO_QUAL
+                _qcfg2 = EURO_QUAL.get(_tconf2, {})
+            else:
+                _qcfg2 = (WC_QUAL_48 if _big2 else WC_QUAL_32).get(_tconf2, {})
             _all_rows2 = sorted(_enrich_countries(_conf_countries(_tconf2), year=_tyear2),
                                 key=lambda r: r["ovr"], reverse=True)
             _cutoff2 = _qcfg2.get("cutoff_bottom", 0)
@@ -450,9 +486,9 @@ def choose_national_team(tournament_id, nat):
         except Exception:
             pass
         _save_trophy(_ty2, nat, _tn2, "예선 진출 실패")
-        add_log(f"❌ {nat} 월드컵 예선 진출 실패 (랭킹 하위권)", "event")
+        add_log(f"❌ {nat} {_tn2} 진출 실패 (랭킹 하위권)", "event")
         return {"nat": nat, "selected": False, "qualified": False,
-                "result": "예선진출실패", "kind": "wc_qual"}
+                "result": "예선진출실패", "kind": _trow2["kind"]}
 
     selected = _check_selection(p, grade, country=nat, continent=nat_continent)
 
@@ -543,7 +579,7 @@ def choose_national_team(tournament_id, nat):
         _kr = _cc.execute("SELECT kind FROM intl_tournaments WHERE id=?",
                           (tournament_id,)).fetchone()
         _cc.close()
-        if _kr and _kr["kind"] == "wc_qual":
+        if _kr and _kr["kind"] in ("wc_qual", "cont_qual"):
             _is_qual = True
     except Exception:
         pass
@@ -941,28 +977,61 @@ def start_qualifying_if_needed(year):
         return
 
     is_wc = year >= WC_START_YEAR and (year - WC_START_YEAR) % WC_INTERVAL == 0
-    if not is_wc:
+    is_cont = (not is_wc and year >= CONTINENTAL_START_YEAR
+               and (year - CONTINENTAL_START_YEAR) % CONTINENTAL_INTERVAL == 0)
+    # [2026-08 신설, 신민용 확정: "유로(EURO)는 기존 대륙컵('유럽
+    # 네이션스컵', 2004년 주기)과는 완전히 별개로 지역컵과 같은 해
+    # (2001,05,09..)에 새로 연다"] 지역컵 주기와 동일한 년도 판정을
+    # 그대로 재사용 — REGIONAL_CUP_START_YEAR/INTERVAL이 정확히 2001/4.
+    from constants import REGIONAL_CUP_START_YEAR, REGIONAL_CUP_INTERVAL
+    is_euro_cycle = (not is_wc and not is_cont and year >= REGIONAL_CUP_START_YEAR
+                     and (year - REGIONAL_CUP_START_YEAR) % REGIONAL_CUP_INTERVAL == 0)
+    if not is_wc and not is_cont and not is_euro_cycle:
         return
-    if [t for t in get_tournaments(year) if t["kind"] == "wc_qual"]:
-        return  # 이미 이 해 예선이 생성됨 → 중복 방지
 
+    if is_wc:
+        if [t for t in get_tournaments(year) if t["kind"] == "wc_qual"]:
+            return  # 이미 이 해 예선이 생성됨 → 중복 방지
+
+        _clear_entry_cache()
+        my_nats, nat_info, committed = _gather_nat_context(p)
+
+        # [2026-07 신설, 신민용 리포트: "2002년 월드컵이 통째로 사라졌다"]
+        # 대륙별로 예외를 격리해서, 한 대륙이 실패해도 나머지 대륙은 정상적으로
+        # 예선이 생성되게 한다(에러는 로그에 남기되 다른 대륙까지 함께
+        # 망가지는 것만 막는다).
+        all_confs = ["유럽", "아메리카", "아시아", "아프리카"]
+        for conf in all_confs:
+            try:
+                _create_qual_tournament(year, "wc_qual", conf,
+                                        p=p, my_nats=my_nats, nat_info=nat_info,
+                                        committed=committed)
+            except Exception as e:
+                from game_engine import add_log
+                add_log(f"⚠ {year}년 월드컵 {conf} 예선 생성 오류: {e}"
+                        f"  (다른 대륙 예선은 정상 진행)", "event")
+        return
+
+    # [2026-08 신설, 신민용 확정: "유로(EURO)는 다른 지역컵과 달리 여름
+    # 예선 → 겨울 본선"] 대륙컵 해(2004,08..)의 '유럽 네이션스컵'과 별개로
+    # 지역컵 해(2001,05..)의 '유로(EURO)'도 여기서 같은 방식으로 예선을
+    # 돈다 — 이 함수는 year만 받아서 그 해 기준으로 동작하므로(연도
+    # 자체에 하드코딩된 분기가 없음) is_cont든 is_euro_cycle이든 같은
+    # 코드로 자연히 처리된다. 다른 3개 대륙(아시아/아메리카/아프리카)은
+    # 여전히 기존 랜덤 노이즈 직행 선발 그대로 유지 — 호출부인
+    # start_intl_tournament의 본선 생성 쪽에서 유럽만 이 예선 결과를 읽고
+    # 나머지는 손 안 댐.
+    if [t for t in get_tournaments(year) if t["kind"] == "cont_qual"]:
+        return  # 이미 이 해 유로 예선이 생성됨 → 중복 방지
     _clear_entry_cache()
     my_nats, nat_info, committed = _gather_nat_context(p)
-
-    # [2026-07 신설, 신민용 리포트: "2002년 월드컵이 통째로 사라졌다"]
-    # 대륙별로 예외를 격리해서, 한 대륙이 실패해도 나머지 대륙은 정상적으로
-    # 예선이 생성되게 한다(에러는 로그에 남기되 다른 대륙까지 함께
-    # 망가지는 것만 막는다).
-    all_confs = ["유럽", "아메리카", "아시아", "아프리카"]
-    for conf in all_confs:
-        try:
-            _create_qual_tournament(year, "wc_qual", conf,
-                                    p=p, my_nats=my_nats, nat_info=nat_info,
-                                    committed=committed)
-        except Exception as e:
-            from game_engine import add_log
-            add_log(f"⚠ {year}년 월드컵 {conf} 예선 생성 오류: {e}"
-                    f"  (다른 대륙 예선은 정상 진행)", "event")
+    try:
+        _create_qual_tournament(year, "cont_qual", "유럽",
+                                p=p, my_nats=my_nats, nat_info=nat_info,
+                                committed=committed)
+    except Exception as e:
+        from game_engine import add_log
+        add_log(f"⚠ {year}년 유로 예선 생성 오류: {e}", "event")
 
 
 def start_intl_tournament(year):
@@ -999,7 +1068,38 @@ def start_intl_tournament(year):
         start_club_world_cup(year)
         return
     if not is_wc and not is_cont:
-        return  # 완전히 빈 해 — 아무것도 안 함
+        # [2026-08 신설] 완전히 빈 해였던 자리(2001,05,09..)에 3단계
+        # 지역컵을 채운다 — 월드컵/대륙컵/클럽월드컵 어느 것과도 주기가
+        # 안 겹치는 유일한 해라 스케줄 충돌이 없다.
+        from constants import REGIONAL_CUP_START_YEAR, REGIONAL_CUP_INTERVAL, REGION_LIST
+        is_regional = (year >= REGIONAL_CUP_START_YEAR
+                       and (year - REGIONAL_CUP_START_YEAR) % REGIONAL_CUP_INTERVAL == 0)
+        if not is_regional:
+            return  # 정말 빈 해
+        if [t for t in get_tournaments(year) if t["kind"] == "region"]:
+            return  # 이미 그 해 지역컵이 생성됨 → 중복 생성 방지
+        _clear_entry_cache()
+        my_nats, nat_info, committed = _gather_nat_context(p)
+        for region in REGION_LIST:
+            _create_one_tournament(year, is_wc=False, my_continent=None,
+                                   p=p, my_nats=my_nats, nat_info=nat_info,
+                                   committed=committed, my_region=region)
+        # [2026-08 신설, 신민용 확정] 유로(EURO) — 지역컵과 같은 해에,
+        # 유럽만 별도로 한 번 더 대륙컵 형식(24개국 본선)을 연다. 여름에
+        # start_qualifying_if_needed가 이미 이 해의 예선을 돌려놨을
+        # 것이므로(_qualify_continental이 qual_results를 자동으로
+        # 먼저 확인), 그 통과국 24개국이 그대로 본선에 들어간다.
+        from constants import EURO_NAME
+        if not [t for t in get_tournaments(year) if t["kind"] == "continent" and t["name"] == EURO_NAME]:
+            try:
+                _create_one_tournament(year, is_wc=False, my_continent="유럽",
+                                       p=p, my_nats=my_nats, nat_info=nat_info,
+                                       committed=committed, name_override=EURO_NAME)
+            except Exception as e:
+                from game_engine import add_log
+                add_log(f"⚠ {year}년 유로(EURO) 생성 오류: {e}", "event")
+        _close_other_pending_when_committed(year)
+        return
 
     if [t for t in get_tournaments(year) if t["kind"] in ("world", "continent")]:
         return  # 이미 그 해 본선/대륙컵이 생성됨 → 중복 생성 방지
@@ -1039,18 +1139,18 @@ def _close_other_pending_when_committed(year):
     has_committed = conn.execute(
         """SELECT 1 FROM intl_tournaments
            WHERE year=? AND my_selected=1
-             AND kind IN ('world','continent') LIMIT 1""", (year,)).fetchone()
+             AND kind IN ('world','continent','region') LIMIT 1""", (year,)).fetchone()
     if has_committed:
         # [2026-07 버그수정] choose_national_team의 동일 버그와 같은 이유로,
         # 여기서 닫히는 대회들의 intl_matches.is_my도 함께 초기화해야
         # "선택 안 한 나라 경기가 커리어에 같이 기록"되는 사고를 막는다.
         _closed2 = [r["id"] for r in conn.execute(
             """SELECT id FROM intl_tournaments
-               WHERE year=? AND my_selected=3 AND kind IN ('world','continent')""",
+               WHERE year=? AND my_selected=3 AND kind IN ('world','continent','region')""",
             (year,)).fetchall()]
         conn.execute(
             """UPDATE intl_tournaments SET my_selected=2
-               WHERE year=? AND my_selected=3 AND kind IN ('world','continent')""",
+               WHERE year=? AND my_selected=3 AND kind IN ('world','continent','region')""",
             (year,))
         if _closed2:
             _ph2 = ",".join("?" * len(_closed2))
@@ -1089,13 +1189,62 @@ def _precreate_ko_shell(conn, c, tid, tournament_type, tournament_start_day):
     쓴다 — _advance_knockout이 다음 라운드 day를 계산할 때 쓰던 것과
     완전히 동일한 규칙이라 결과가 항상 일치한다. TP(3/4위전)는 기존
     관례대로 slot=999 하나만 둔다.
+
+    [2026-08 버그수정, 신민용 리포트: "16강 미정인데 8강은 상대가 이미
+    정해져서 뜬다"] 지역컵(kind='region')은 규모가 4/8/16강으로
+    지역마다 달라서, TOURNAMENT_SCHEDULE_RULES["region"]에는 R16~F
+    체인 전체를 등록해뒀다(_ko_seq가 실제로 어디부터 시작할지 골라
+    씀) — 근데 이 함수는 그 표를 그대로 다 읽어서 8강부터 시작하는
+    대회(예: AFF)에도 "절대 안 쓰일 16강" 빈 대진을 만들어버렸다.
+    그 안 쓰이는 R16 자리를 schedule_window.py가 "다음 경기(미정)"로
+    잘못 집어서, 실제로 이미 상대가 정해진 8강보다 먼저 보여준 것 —
+    이 대회가 실제로 안 쓰는 앞단계 스테이지는 애초에 shell 자체를
+    안 만든다.
     """
+    _skip_stages = set()
+    _skip_rounds = set()  # [2026-08 신설] (stage, round) 튜플 — 이 대회가
+    # 실제로 안 쓰는 그룹 라운드(예: 3팀 조뿐인 대회의 group 4·5라운드)
+    if tournament_type == "region":
+        from constants import regional_cup_format
+        _n_entries = c.execute(
+            "SELECT COUNT(*) n FROM intl_entries WHERE tournament_id=?", (tid,)).fetchone()["n"]
+        _fmt = regional_cup_format(_n_entries)
+        _bracket = _fmt["bracket_size"]
+        _full_seq = ["R16", "QF", "SF", "F"]
+        _start_idx = {16: 0, 8: 1, 4: 2, 2: 3}.get(_bracket, 0)
+        _skip_stages = set(_full_seq[:_start_idx])
+        if "SF" in _skip_stages:
+            # [2026-08 버그수정, 신민용 리포트: "CAFA/북아프리카(1개조,
+            # 결승만 있는 대회)가 계속 진행중에서 안 끝난다"] bracket_
+            # size=2(4강 없이 곧장 결승)인 대회는 3/4위전(TP)을 정할
+            # 준결승 패자 자체가 없다 — 근데 TP shell을 그대로 만들면
+            # "F는 끝났는데 TP는 영원히 미배정"이라 완료 판정(tp_done)이
+            # 절대 True가 안 됐다. SF가 없는 대회는 TP도 같이 뺀다.
+            _skip_stages.add("TP")
+        # [2026-08 버그수정, 신민용 리포트: "3팀 조만 있는 대회는 원래
+        # 1주면 끝나는데 다음 스테이지가 2주 넘게 밀린다"] 이 대회의
+        # 실제 최대 조 인원(3~5명)으로 진짜 필요한 라운드 수를 구해서,
+        # 그보다 많은 group round(예: 4·5라운드)는 다음 스테이지 시작일
+        # 계산에서도, shell 생성에서도 완전히 빼버린다.
+        _max_group_size = max(_fmt["group_sizes"]) if _fmt["group_sizes"] else 4
+        _rounds_needed = len(_round_robin_pairs(_max_group_size))
+        for _rd in range(_rounds_needed + 1, 6):
+            _skip_rounds.add(("group", _rd))
+        # [2026-08 버그수정] 위 _skip_stages(건너뛰는 KO 스테이지, 예:
+        # SAFF는 R16·QF 둘 다 건너뛰고 SF부터 시작)는 shell 생성에서만
+        # 빼고 있었지, "다음 스테이지 시작일" 누적 계산(stage_round_
+        # start_day)에서는 안 빼고 있었다 — 그래서 SAFF는 4강 시작일을
+        # 계산할 때도 "안 쓰는 16강+8강 몫"까지 그대로 더해져 불필요한
+        # 공백이 더 컸다. 같은 skip 집합에 합쳐서 한 번에 넘긴다.
+        _skip_rounds |= {(s, 1) for s in _skip_stages}
+
     rows = []
     for r in TOURNAMENT_SCHEDULE_RULES.get(tournament_type, []):
         stage = r["stage"]
-        if stage == "group":
+        if stage == "group" or stage in _skip_stages:
             continue
-        start_day = stage_round_start_day(tournament_type, stage, r["round"], tournament_start_day)
+        start_day = stage_round_start_day(tournament_type, stage, r["round"], tournament_start_day,
+                                           skip=_skip_rounds)
         n = r["match_count"]
         day_list = assign_match_days(start_day, n, r["cap"])
         for idx in range(n):
@@ -1133,23 +1282,45 @@ def _fill_ko_shell(conn, c, tid, stage, home_away_by_slot):
                 (tid, stage, "", 1, None, home, away, is_my, slot))
 
 
-def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, committed):
+def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, committed,
+                            my_region=None, name_override=None):
     """대회 1개를 생성(조 추첨·일정 포함)하고 로그를 남긴다.
 
     - is_wc=True  : 월드컵(전 세계 단일). my_continent 무시.
     - is_wc=False : my_continent 대륙컵. cand_nats는 그 대륙 소속 보유국적만.
+    - my_region 지정(is_wc=False와 함께): [2026-08 신설] 3단계 지역컵.
+      my_continent는 무시되고, COUNTRY_REGION 기준 그 지역 소속 보유국적만
+      후보가 된다. 조 편성은 regional_cup_format()으로 지역 규모에 맞춰
+      자동 결정(4팀 고정 포트 방식이 아니라 3~4명 들쭉날쭉한 조를 스네이크
+      시드로 채움) — 아래 group_sizes 참고.
+    - name_override: [2026-08 신설] "유로(EURO)" — 유럽만 대륙컵 자리
+      (2004년 주기, '유럽 네이션스컵')와 별개로 지역컵과 같은 해(2001년
+      주기)에 한 번 더 열린다. CONF_CUP_NAME 고정 조회 대신 이 값으로
+      대회명을 강제 지정한다 — 그 외 로직(조 편성·선발·기록)은 일반
+      대륙컵과 100% 동일.
     """
     from game_engine import add_log
 
+    group_sizes = None  # [2026-08 신설] region 모드에서만 씀(들쭉날쭉한 조 인원)
     if is_wc:
         kind, name = "world", "월드컵"
         entries = _qualify_world(year)
         n_groups = WC_GROUPS_BIG if year >= WC_EXPAND_YEAR else WC_GROUPS
         # 월드컵은 대륙 무관 → 내 국적 전부가 후보 대상
         cont_nats = [n for n in my_nats if n]
+    elif my_region:
+        from constants import REGION_CUP_NAME, COUNTRY_REGION, regional_cup_format
+        kind = "region"
+        name = REGION_CUP_NAME.get(my_region, f"{my_region} 지역컵")
+        entries = _qualify_region(my_region)
+        _fmt = regional_cup_format(len(entries))
+        n_groups = _fmt["n_groups"]
+        group_sizes = _fmt["group_sizes"]
+        # 이 지역컵 후보 = 그 지역 소속 보유 국적만
+        cont_nats = [n for n in my_nats if COUNTRY_REGION.get(n) == my_region]
     else:
         kind = "continent"
-        name = CONF_CUP_NAME.get(my_continent, "대륙컵")
+        name = name_override or CONF_CUP_NAME.get(my_continent, "대륙컵")
         entries = _qualify_continental(my_continent)
         n_groups = CONT_GROUPS
         # 이 대륙컵 후보 = 그 대륙(연맹) 소속 보유 국적만
@@ -1357,26 +1528,53 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
     tid = c.lastrowid
 
     # 포트 추첨: 전력순 4개 포트 → 조마다 포트별 1팀
+    # [2026-08 신설] region 모드는 조 인원이 3~4명으로 들쭉날쭉해서(예:
+    # CECAFA 5조[4,4,4,3,3]) 4팀 고정 포트 방식이 안 맞는다 — 대신 OVR
+    # 내림차순으로 정렬한 뒤 조를 순환하며 채우는 방식(라운드마다 그룹
+    # 0→1→2...로 한 바퀴, 자리가 찬 조는 건너뜀)으로 강팀이 고르게
+    # 분산되게 한다. group_sizes 합계 == len(entries)라 무조건 다 채워짐.
     entries.sort(key=lambda e: e["ovr"], reverse=True)
-    pot_size = len(entries) // 4
     groups = {g: [] for g in _GROUP_LABELS[:n_groups]}
-    for pot in range(4):
-        pool = entries[pot * pot_size:(pot + 1) * pot_size]
-        random.shuffle(pool)
-        for gi, e in enumerate(pool):
-            g = _GROUP_LABELS[gi]
+    if kind == "region" and group_sizes:
+        labels = _GROUP_LABELS[:n_groups]
+        caps = list(group_sizes)
+        gi = 0
+        for e in entries:
+            while caps[gi % n_groups] <= 0:
+                gi += 1
+            slot = gi % n_groups
+            g = labels[slot]
             groups[g].append(e)
+            caps[slot] -= 1
+            gi += 1
+            pot = len(groups[g])  # 그 조 안에서 몇 번째로 들어왔는지(포트 대용 표시값)
             c.execute("""INSERT INTO intl_entries
                          (tournament_id, country, flag, grade, ovr, grp, pot, alive)
                          VALUES(?,?,?,?,?,?,?,1)""",
-                      (tid, e["name"], e["flag"], e["grade"], e["ovr"], g, pot + 1))
+                      (tid, e["name"], e["flag"], e["grade"], e["ovr"], g, pot))
+    else:
+        pot_size = len(entries) // 4
+        for pot in range(4):
+            pool = entries[pot * pot_size:(pot + 1) * pot_size]
+            random.shuffle(pool)
+            for gi, e in enumerate(pool):
+                g = _GROUP_LABELS[gi]
+                groups[g].append(e)
+                c.execute("""INSERT INTO intl_entries
+                             (tournament_id, country, flag, grade, ovr, grp, pot, alive)
+                             VALUES(?,?,?,?,?,?,?,1)""",
+                          (tid, e["name"], e["flag"], e["grade"], e["ovr"], g, pot + 1))
 
     # 조별리그 일정 (18~20주 앵커 → 이 시점부터 실제 day도 함께 배정)
     w0 = INTL_GROUP_WEEKS[0]
     # [Phase 2] 32/48개국 체제 판별은 위에서 n_groups 정할 때 쓴 것과 동일한
     # 기준(year >= WC_EXPAND_YEAR)을 그대로 재사용.
+    # [2026-08 신설] region은 TOURNAMENT_SCHEDULE_RULES에 등록된 체제가
+    # 아니라 get_stage_rule이 항상 None을 반환 → day는 NULL로 남고 week만
+    # 배정된다(기존에도 "잠정치 미확정 체제"에 이미 있던 안전한 폴백 경로,
+    # 새 코드 아님).
     tournament_type = (("world_cup_48" if year >= WC_EXPAND_YEAR else "world_cup_32")
-                        if is_wc else "continental")
+                        if is_wc else ("region" if kind == "region" else "continental"))
     tournament_start_day = week_to_day(w0)
     if my_nat:
         _my_match_nats = {my_nat}
@@ -1385,7 +1583,16 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
     else:
         # my_sel==2: 출전 없음 → 내 경기 없음 (기존엔 cont_nats 전체가 들어가던 버그)
         _my_match_nats = set()
-    for rd, pairs in enumerate(_GROUP_ROUNDS):
+    # [2026-08 신설] region 모드는 조마다 인원(3~4명)이 달라서 라운드별
+    # 대진(pairs)도 조마다 따로 계산해야 한다 — _GROUP_ROUNDS 하나를
+    # 전체 조가 공유하던 기존 방식 대신, 조별로 _round_robin_pairs(그
+    # 조 인원)를 미리 구해두고 라운드 인덱스로 조회한다. 4팀 조는
+    # _round_robin_pairs(4) == _GROUP_ROUNDS라 기존 대륙컵/월드컵 경로는
+    # 값 그대로 100% 동일하게 동작(회귀 없음).
+    _group_round_pairs = {g: _round_robin_pairs(len(members)) for g, members in groups.items()}
+    _max_rounds = max((len(rp) for rp in _group_round_pairs.values()), default=0) \
+        if kind == "region" else len(_GROUP_ROUNDS)
+    for rd in range(_max_rounds):
         # [2026-07 버그 수정, DB로 실제 확인] wk = w0 + rd(라운드 인덱스로
         # 대충 계산)는 day_list가 4일 capacity 기준으로 분산 배정되는 것과
         # 안 맞았다 — 한 라운드(4일)가 실제 캘린더 week 경계(7일 단위)와
@@ -1398,7 +1605,9 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
         # 펼친 다음 day 리스트를 1:1로 대응시킨다 — 라운드 하나에 day 값
         # 하나만 주면 daily_match_capacity가 무시되고 "day라는 이름의
         # week"밖에 안 나온다(실제로 이 실수를 했다가 지적받고 고침).
-        round_matches = [(g, hi, ai) for g in groups for hi, ai in pairs]
+        round_matches = [(g, hi, ai) for g in groups
+                          for rp in [_group_round_pairs[g]] if rd < len(rp)
+                          for hi, ai in rp[rd]]
         rule = get_stage_rule(tournament_type, "group", rd + 1)
         if rule:
             round_start_day = stage_round_start_day(
@@ -1855,8 +2064,35 @@ def _qualify_continental(my_continent):
     return rows[:CONT_TEAMS]
 
 
-# ─────────────────────────────────────────────
-# 예선 대회 생성
+def _qualify_region(my_region):
+    """[2026-08 재설계 v2] 지역컵 참가국 = 그 지역 소속 국가 풀에서 목표
+    본선 규모(REGION_TARGET_SIZE)만큼, 그 해 국가 OVR 상위 순으로 뽑는다.
+    풀이 목표보다 크면(예: WAFF 12개국 풀 → 12개국 목표는 그대로, CECAFA
+    11개국 풀 → 8개국 목표는 상위 8개국만) 나머지는 그 대회에 못 낀다 —
+    고정 제외가 아니라 매 대회마다 그 시점 실력으로 다시 판정한다(신민용
+    확정: "그 당시 국가 OVR 기준으로 낮은 국가는 참여 안 하는 걸로").
+    풀이 이미 목표 이하면(예: CAFA 5개국 풀=5개국 목표) 전원 참가."""
+    from game_engine import get_state
+    from constants import COUNTRY_REGION, REGION_TARGET_SIZE
+    st = get_state() or {}
+    year = st.get("current_year", 0)
+    names = [c for c, r in COUNTRY_REGION.items() if r == my_region]
+    conn = get_conn()
+    ph = ",".join("?" * len(names))
+    rows = [dict(r) for r in conn.execute(
+        f"SELECT name, flag, continent, grade FROM countries WHERE name IN ({ph})",
+        names).fetchall()]
+    conn.close()
+    for r in rows:
+        r["ovr"] = _nat_team_ovr(r["grade"], r["name"], r["continent"], fast=True, year=year)
+    target = REGION_TARGET_SIZE.get(my_region, len(rows))
+    if len(rows) > target:
+        rows.sort(key=lambda r: r["ovr"], reverse=True)
+        rows = rows[:target]
+    return rows
+
+
+
 # ─────────────────────────────────────────────
 
 def _continent_qual_quota(qual_kind, continent, year):
@@ -1904,7 +2140,7 @@ def _sim_single_match_ai(home, away):
 
 
 def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, committed):
-    """월드컵 예선 대회 생성 (4개 대륙 전부).
+    """월드컵 예선(wc_qual) 및 유로 예선(cont_qual, 유럽 전용) 대회 생성.
 
     단계:
       18주차 — 1차 예선 (하위국 단판, DB에 qual_r1 스테이지로 저장)
@@ -1913,11 +2149,22 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
 
     내 국적이 이 연맹에 속하면 is_my=1, 아니면 0.
     통과국은 _finalize_qual이 qual_results에 저장.
+
+    qual_kind="cont_qual"(2026-08 신설): 유로 전용 — EURO_QUAL 설정을
+    쓴다. 다른 대륙(아시아/아메리카/아프리카)은 아직 이 경로를 안 타서
+    (호출부에서 유럽만 넘김) 기존 "랜덤 노이즈 직행 선발" 그대로다.
     """
     from game_engine import add_log
 
-    big = year >= WC_EXPAND_YEAR
-    qual_cfg = WC_QUAL_48.get(continent) if big else WC_QUAL_32.get(continent)
+    if qual_kind == "cont_qual":
+        qual_cfg = EURO_QUAL.get(continent)
+        _qual_name_prefix = "유로"  # [2026-08 신설] "월드컵 예선"으로 하드코딩돼
+        # 있던 이름이 유로 예선에도 그대로 붙던 걸 분리 — 신민용 확정: 유로는
+        # "월드컵"이 아니라 "유로" 예선이라고 표시돼야 함.
+    else:
+        big = year >= WC_EXPAND_YEAR
+        qual_cfg = WC_QUAL_48.get(continent) if big else WC_QUAL_32.get(continent)
+        _qual_name_prefix = "월드컵"
     if not qual_cfg:
         return
 
@@ -1977,19 +2224,19 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
         if committed:
             # 이미 고정된 나라가 컷오프 → 바로 예선 진출 실패 기록
             failed_nat = committed
-            _save_trophy(year, failed_nat, f"{year} 월드컵 {continent} 예선", "예선 진출 실패")
+            _save_trophy(year, failed_nat, f"{year} {_qual_name_prefix} {continent} 예선", "예선 진출 실패")
             try:
                 conn_fc = get_conn()
                 conn_fc.execute("""INSERT INTO intl_history(year, competition, team_name, result,
                                                             goals, assists, caps, rating)
                                    VALUES(?,?,?,?,?,?,?,?)""",
-                                (year, f"{year} 월드컵 {continent} 예선",
+                                (year, f"{year} {_qual_name_prefix} {continent} 예선",
                                  failed_nat, "예선 진출 실패", 0, 0, 0, 0.0))
                 conn_fc.commit(); conn_fc.close()
             except Exception:
                 pass
             from game_engine import add_log
-            add_log(f"❌ {failed_nat} 월드컵 {continent} 예선 진출 실패 (랭킹 하위권)", "event")
+            add_log(f"❌ {failed_nat} {_qual_name_prefix} {continent} 예선 진출 실패 (랭킹 하위권)", "event")
             my_sel = 2; my_nat = ""; cand_nats_final = []
         else:
             # 미고정: 컷오프 국적 포함해서 선택창 제시
@@ -2021,7 +2268,7 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
                 groups[glabels[gi]].append(e)
 
     # ─── DB 저장 ───
-    name = f"{year} 월드컵 {continent} 예선"
+    name = f"{year} {_qual_name_prefix} {continent} 예선"
     conn = get_conn(); c = conn.cursor()
     c.execute("""INSERT INTO intl_tournaments(year, kind, name, status, my_selected, my_nat, cand_nats, continent)
                  VALUES(?,?,?,?,?,?,?,?)""",
@@ -2201,7 +2448,12 @@ def _process_one_tournament_week(t, week, day=None):
         conn2.close()
 
     # ── 예선 진행 ──
-    if t["kind"] == "wc_qual":
+    # [2026-08 버그수정, 신민용 리포트: "유로 예선이 조별리그에서 영원히
+    # 안 끝난다"] 이 블록이 kind=="wc_qual"만 통과시켜서, 유로 예선
+    # (kind='cont_qual')은 매주 이 처리 자체를 건너뛰고 있었다 — 조별리그
+    # 경기는 생성됐지만 마감 판정(_finalize_qual 호출)이 한 번도 안 불려서
+    # status가 'qual_group'에 영원히 머물렀다.
+    if t["kind"] in ("wc_qual", "cont_qual"):
         # [버그수정] t는 루프 시작 시의 스냅샷이므로 status를 DB에서 재조회한다.
         # _finalize_qual 내부에서 status='qual_po' or 'done'으로 갱신되기 때문에
         # 스냅샷 값으로 판정하면 PO 체제에서 다음 주차 호출이 누락될 수 있다.
@@ -2254,6 +2506,20 @@ def _process_one_tournament_week(t, week, day=None):
     big = (t["year"] >= WC_EXPAND_YEAR) if t["kind"] == "world" else False
     if t["kind"] == "world":
         _ko_seq = ["R32", "R16", "QF", "SF", "F"] if big else ["R16", "QF", "SF", "F"]
+    elif t["kind"] == "region":
+        # [2026-08 신설] 지역컵은 규모(브래킷 4/8/16강)가 지역마다 달라서,
+        # 대회별 실제 참가국 수로 다시 계산해 그 브래킷 크기에 맞는
+        # 지점부터 KO 시퀀스를 시작한다 — 조 편성 때 쓴 것과 같은
+        # regional_cup_format()이라 값이 항상 일치.
+        from constants import regional_cup_format
+        _conn_rc = get_conn()
+        _n_entries = _conn_rc.execute(
+            "SELECT COUNT(*) n FROM intl_entries WHERE tournament_id=?", (t["id"],)).fetchone()["n"]
+        _conn_rc.close()
+        _bracket = regional_cup_format(_n_entries)["bracket_size"]
+        _full_seq = ["R16", "QF", "SF", "F"]
+        _start_idx = {16: 0, 8: 1, 4: 2, 2: 3}.get(_bracket, 1)
+        _ko_seq = _full_seq[_start_idx:]
     else:
         _ko_seq = ["R16", "QF", "SF", "F"]
 
@@ -2514,7 +2780,7 @@ def simulate_my_match(week, p, day=None):
 
     nat = _my_nat(t, p)
     # 예선(wc_qual)은 cap-tie 대상이 아니다 → 국적 고정 안 함.
-    _is_qual = t.get("kind") == "wc_qual"
+    _is_qual = t.get("kind") in ("wc_qual", "cont_qual")
     # [복수국적] A매치 첫 출전 → 그 나라로 영구 고정(cap-tie). (본선만)
     # 이후 대회부터는 이 나라로만 차출된다.
     if (not _is_qual) and nat and not (p.get("intl_committed", "") or ""):
@@ -2803,8 +3069,17 @@ def _finalize_qual(t):
         return rows
 
     continent = _conf_key((t.get("continent") or "").strip() or "유럽")
-    big = t["year"] >= WC_EXPAND_YEAR
-    qual_cfg = (WC_QUAL_48 if big else WC_QUAL_32).get(continent, {})
+    # [2026-08 버그수정, 신민용 리포트: "유로 예선이 qual_group에서 안
+    # 끝난다"] 이 함수가 대회의 kind를 보지 않고 무조건 WC_QUAL_32/48만
+    # 읽고 있었다 — 유로 예선(kind='cont_qual')도 월드컵 유럽 예선 설정
+    # (직행12+플레이오프2)이 그대로 적용돼서, 원래 필요 없는 플레이오프
+    # 단계를 기다리다 멈췄다. 대회 kind로 올바른 설정표를 고른다.
+    if t["kind"] == "cont_qual":
+        from constants import EURO_QUAL
+        qual_cfg = EURO_QUAL.get(continent, {})
+    else:
+        big = t["year"] >= WC_EXPAND_YEAR
+        qual_cfg = (WC_QUAL_48 if big else WC_QUAL_32).get(continent, {})
 
     # 조별 1위/2위 수집
     winners = []
@@ -3165,13 +3440,8 @@ def _finalize_groups(t, next_stage, next_week):
     from constants import WC_BEST_THIRDS_BIG
     tid = t["id"]
     is_wc = (t["kind"] == "world")
+    is_region = (t["kind"] == "region")
     is_big = is_wc and t["year"] >= WC_EXPAND_YEAR   # 48개국 시대
-
-    if is_wc:
-        n_groups = WC_GROUPS_BIG if is_big else WC_GROUPS
-    else:
-        n_groups = CONT_GROUPS
-    labels = _GROUP_LABELS[:n_groups]
 
     # [2026-07 최적화, 신민용 리포트: "국제대회 주간(47~51주)에 렉이 심하다"]
     # 원래 get_group_standings(tid, g)를 조 라벨마다 따로 호출했는데, 그
@@ -3187,6 +3457,24 @@ def _finalize_groups(t, next_stage, next_week):
         """SELECT * FROM intl_matches WHERE tournament_id=?
            AND stage='group' AND home_score>=0""", (tid,)).fetchall()]
     conn0.close()
+
+    # [2026-08 신설] region은 조 개수가 저장돼 있지 않으므로(대회마다
+    # 나라 수가 달라서 규모 자체가 다름) 실제 참가국 수로 그때그때
+    # regional_cup_format()을 다시 돌려 n_groups/best_thirds를 구한다 —
+    # 조 편성 때 쓴 것과 완전히 같은 함수라 값도 항상 일치한다.
+    if is_wc:
+        n_groups = WC_GROUPS_BIG if is_big else WC_GROUPS
+        n_best = WC_BEST_THIRDS_BIG if is_big else 0
+    elif is_region:
+        from constants import regional_cup_format
+        _fmt = regional_cup_format(len(_all_entries))
+        n_groups = _fmt["n_groups"]
+        n_best = _fmt["best_thirds"]
+    else:
+        n_groups = CONT_GROUPS
+        n_best = CONT_BEST_THIRDS
+    labels = _GROUP_LABELS[:n_groups]
+
     _entries_by_grp: dict = {}
     for e in _all_entries:
         _entries_by_grp.setdefault(e["grp"], []).append(e)
@@ -3234,9 +3522,8 @@ def _finalize_groups(t, next_stage, next_week):
                 thirds.append((g, rows[2]))
             eliminated.extend(r["country"] for r in rows[3:])
 
-    # 3위 팀 진출 처리 (48개국 월드컵 & 대륙컵 공통)
+    # 3위 팀 진출 처리 (48개국 월드컵 & 대륙컵 & 지역컵 공통, n_best는 위에서 이미 결정됨)
     best_thirds = []
-    n_best = WC_BEST_THIRDS_BIG if is_big else (CONT_BEST_THIRDS if not is_wc else 0)
     if n_best > 0 and thirds:
         thirds.sort(key=lambda gr: (gr[1]["pts"], gr[1]["gf"] - gr[1]["ga"],
                                     gr[1]["gf"], gr[1]["ovr"]), reverse=True)
@@ -3746,7 +4033,12 @@ def get_my_intl_matches(only_qual=False):
     if only_qual:
         kind_filter = "t.kind = 'wc_qual'"
     else:
-        kind_filter = "t.kind IN ('world','continent')"
+        # [2026-08 신설, 신민용 리포트: "지역컵 경기가 국제전 기록에 하나도
+        # 안 들어간다"] 3단계 지역컵(kind='region')이 이 화이트리스트에
+        # 없어서, 실제로 뛴 지역컵 경기가 커리어/은퇴창 "국제전" 탭에서
+        # 통째로 빠지고 있었다 — 개인 통계는 저장되고 있었는데(스탯 컬럼
+        # 자체는 kind 무관하게 채워짐) 이 조회 하나가 걸러버린 것.
+        kind_filter = "t.kind IN ('world','continent','region')"
     conn = get_conn()
     # [2026-07 재수정, 신민용 지적: "다친 게 아니라 그냥 벤치라 안 뛴
     # 경기도 있는데 그건 빠진다"] my_played=1이거나 absence_reason이

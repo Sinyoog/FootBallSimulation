@@ -55,6 +55,14 @@ def _intl_advance_count(t):
         # 대륙컵 24개국: 6조 → 조 1·2위 직행 + 3위 일부(CONT_BEST_THIRDS)
         return 2, True
 
+    elif kind == "region":
+        # [2026-08 신설] 지역컵도 항상 조 1·2위가 직행하고, 대회에 따라
+        # 와일드카드(3위 일부)가 있을 수도/없을 수도 있다 — regional_
+        # cup_format의 best_thirds가 0이면(예: SAFF/UNCAF) 3위는 전부
+        # 탈락, 있으면(예: EAFF/AFF/카리브) 위 _intl_third_qualified가
+        # 실제로 몇 팀이 뽑혔는지 계산한다.
+        return 2, True
+
     elif kind in ("wc_qual", "cont_qual"):
         # 예선: 조 1위 직행(나머지는 성적순 탈락 또는 와일드카드)
         # UI상 1위만 초록, 나머지는 회색으로 표시
@@ -81,7 +89,7 @@ def _intl_third_qualified(t):
     # 3위 진출이 없는 대회
     if kind == "world" and year < WC_EXPAND_YEAR:
         return set()
-    if kind not in ("world", "continent"):
+    if kind not in ("world", "continent", "region"):
         return set()
 
     # 3위 팀들 수집 후 성적순 정렬 → 상위 N팀
@@ -105,6 +113,16 @@ def _intl_third_qualified(t):
         # 48개국: 12조 × 3위 → 상위 8팀
         from constants import WC_BEST_THIRDS_BIG
         n_adv = WC_BEST_THIRDS_BIG
+    elif kind == "region":
+        # [2026-08 신설] 지역컵은 규모가 대회마다 달라서 CONT_BEST_THIRDS
+        # 고정값이 아니라, 그 대회 실제 참가국 수로 regional_cup_format을
+        # 다시 계산해 정확한 와일드카드 수를 구한다.
+        from constants import regional_cup_format
+        _conn2 = _gc()
+        _n_entries = _conn2.execute(
+            "SELECT COUNT(*) n FROM intl_entries WHERE tournament_id=?", (tid,)).fetchone()["n"]
+        _conn2.close()
+        n_adv = regional_cup_format(_n_entries)["best_thirds"]
     else:
         n_adv = CONT_BEST_THIRDS
 
@@ -437,7 +455,7 @@ class ScheduleWindow(QDialog):
         # 컵=보라, 챔스=황금과 같은 급으로 국제대회도 종류별로 나눈다:
         #   - 월드컵·대륙컵(본선, kind in world/continent) → 주황
         #   - 그 외 국가대표 대회(예선 wc_qual 등) → 빨강
-        _hdr_color = "#ff9933" if t.get("kind") in ("world", "continent") else "#ff5555"
+        _hdr_color = "#ff9933" if t.get("kind") in ("world", "continent", "region") else "#ff5555"
         hdr.setStyleSheet(f"color:{_hdr_color};font-size:14px;font-weight:bold;")
         lay.addWidget(hdr)
         if t["my_selected"] == 1:
