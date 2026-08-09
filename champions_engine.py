@@ -74,7 +74,7 @@ def _get_field_pos(p):
         return primary
 
 from constants import GRADE_TEAM_OVR  # 참고용(미사용 가능)
-from constants import get_league_grade  # 클럽 대항전 슬롯 계산용(국가대표 grade와 분리)
+from constants import get_country_league_grade  # 클럽 대항전 슬롯 계산용(국가대표 grade와 분리, [2026-08] resolver 통일)
 from constants import generate_round_robin  # 리그 스테이지 대진(원형법) 생성용
 
 # ── 대회 일정 (주차) - 2026-07 스위스 방식 개편 ─────────────────────
@@ -562,7 +562,7 @@ def _is_my_team_cl_qualified(p, my_tid, season, year=None):
     if not lg_row or lg_row["tier"] != 1:
         return False
     # [버그 수정] 국가대표 grade가 아니라 클럽 리그 grade로 슬롯 수를 정한다.
-    league_grade = get_league_grade(lg_row["country"], "F")
+    league_grade = get_country_league_grade(lg_row["country"])
     cl_cont = CONTINENT_MAP.get(lg_row["continent"])
     slots = get_cl_slots(lg_row["country"], league_grade, cl_cont, year)
     standings = _standings_or_pseudo(lid, season)
@@ -604,7 +604,7 @@ def _select_entries(continent, season, year=None):
     # league_grade로 덮어써서, _entry_from()이 만드는 entry의 "grade" 필드도
     # (화면에 노출되는 값도) 클럽 리그 등급을 가리키게 통일한다.
     for lg in leagues:
-        lg["grade"] = get_league_grade(lg["country"], "F")
+        lg["grade"] = get_country_league_grade(lg["country"])
 
     # 등급 높은 나라 우선 (정원 초과 시 컷 기준 + 슬롯 배정 우선순위)
     grade_rank = {"SS": 8, "S": 7, "A": 6, "B": 5, "C": 4, "D": 3, "E": 2, "F": 1}
@@ -1865,9 +1865,19 @@ def get_my_cl_matches():
            -- 구분한다.
            WHERE m.is_my = 1 AND m.home_score >= 0
            ORDER BY t.year, m.week""").fetchall()]
-    names = {(r["tournament_id"], r["team_id"]): (r["team_name"], r["flag"], r["country"])
-             for r in conn.execute(
-                 "SELECT tournament_id, team_id, team_name, flag, country FROM cl_entries").fetchall()}
+    # [2026-08 성능 수정, 신민용 리포트: "재능 좋은 선수로 오래 뛰면
+    # 은퇴/커리어창이 심하게 렉걸린다"] 예전엔 cl_entries(세계 전체 챔스
+    # 참가팀 이력) 전체를 매번 통째로 로드했다 — 내 경기가 걸쳐있는
+    # tournament_id만 걸러서 필요한 만큼만 가져온다.
+    _tids = {r["tournament_id"] for r in rows}
+    names = {}
+    if _tids:
+        _ph = ",".join("?" * len(_tids))
+        names = {(r["tournament_id"], r["team_id"]): (r["team_name"], r["flag"], r["country"])
+                 for r in conn.execute(
+                     f"SELECT tournament_id, team_id, team_name, flag, country "
+                     f"FROM cl_entries WHERE tournament_id IN ({_ph})",
+                     tuple(_tids)).fetchall()}
     conn.close()
 
     out = []

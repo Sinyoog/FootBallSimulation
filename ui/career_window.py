@@ -151,6 +151,17 @@ class CareerWindow(QDialog):
             bl.addWidget(kl); bl.addWidget(vl)
             box.setStyleSheet("background:#252525;border-radius:6px;")
             summary.addWidget(box)
+        # [2026-08 신설, 신민용 요청: "커리어에 레드카드 기록 추가"]
+        # 통산 레드카드가 한 번이라도 있으면 요약 박스에 함께 보여준다
+        # (전 대회 합산 — 리그만의 수치는 팀 이력 탭의 "🟥" 컬럼 참고).
+        _trc = p.get("total_red_cards_all", 0)
+        if _trc > 0:
+            box = QFrame(); bl = QVBoxLayout(box); bl.setContentsMargins(12,8,12,8)
+            kl = QLabel("🟥레드카드"); kl.setStyleSheet("color:#888;font-size:11px;")
+            vl = QLabel(f"{_trc}회"); vl.setStyleSheet("color:#00cc44;font-size:15px;font-weight:bold;")
+            bl.addWidget(kl); bl.addWidget(vl)
+            box.setStyleSheet("background:#252525;border-radius:6px;")
+            summary.addWidget(box)
         root.addLayout(summary)
 
         conn = get_conn(); c = conn.cursor()
@@ -288,7 +299,7 @@ class CareerWindow(QDialog):
             stat_cols = ["골","어시","슈팅","유효","기회창출","드리블"]
         cols = (["기간","포지션","국가","리그","팀명","연봉","출전"]
                 + stat_cols
-                + ["평균평점","팀순위","승무패","계약","이적"])
+                + ["평균평점","팀순위","승무패","🟥","계약","이적"])
 
         # 이슈3: 1~4주차 이적 노이즈만 숨김 (4주 이하 머문 0경기 항목)
         # 여름 이적시장(37주~) 입단처럼 경기 없이 보낸 정상 재직 기간은 표시
@@ -495,7 +506,9 @@ class CareerWindow(QDialog):
                      fmt_money(e.get("salary",0)),
                      _apps_str]
                     + stat_vals
-                    + [str(avg), rank_disp, wdl, c_str, t_type])
+                    + [str(avg), rank_disp, wdl,
+                       (str(e.get("red_cards", 0)) if e.get("red_cards", 0) else "—"),
+                       c_str, t_type])
             # 팔림/방출/계약만료는 빨간색 강조
             tt_color = "#cc4444" if t_type in ("팔림", "방출", "계약만료") else None
             for j, v in enumerate(vals):

@@ -745,9 +745,18 @@ def get_my_cwc_matches():
            -- 구분한다.
            WHERE m.is_my = 1 AND m.home_score >= 0
            ORDER BY t.year, m.week""").fetchall()]
-    names = {(r["tournament_id"], r["team_id"]): (r["team_name"], r["country"])
-             for r in conn.execute(
-                 "SELECT tournament_id, team_id, team_name, country FROM cwc_entries").fetchall()}
+    # [2026-08 성능 수정, 신민용 리포트: "재능 좋은 선수로 오래 뛰면
+    # 은퇴/커리어창이 심하게 렉걸린다"] cwc_entries 전체 대신 내 경기가
+    # 걸쳐있는 tournament_id만 걸러서 가져온다.
+    _tids = {r["tournament_id"] for r in rows}
+    names = {}
+    if _tids:
+        _ph = ",".join("?" * len(_tids))
+        names = {(r["tournament_id"], r["team_id"]): (r["team_name"], r["country"])
+                 for r in conn.execute(
+                     f"SELECT tournament_id, team_id, team_name, country "
+                     f"FROM cwc_entries WHERE tournament_id IN ({_ph})",
+                     tuple(_tids)).fetchall()}
     conn.close()
 
     out = []

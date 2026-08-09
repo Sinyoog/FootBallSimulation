@@ -2022,7 +2022,10 @@ class CenterPanel(QWidget):
 
         _rs = res.get("result", "")
         _kind = res.get("kind", "")
-        _is_qual = (_kind == "wc_qual")
+        # [2026-08 버그수정, 신민용 리포트: "유로 예선 관련 국제전 표시가
+        # 이상하다"] 같은 wc_qual-only 필터 버그 — 유로 예선(cont_qual)으로
+        # 선발됐을 때도 "본선 진출!"이 아니라 "예선 소집!"으로 떠야 한다.
+        _is_qual = (_kind in ("wc_qual", "cont_qual"))
         # 각 단계 라인 구성 (결과에 따라 ②③ 색/내용 분기)
         # [버그 수정] line1이 "확정했습니다"라고 단독으로 뜨는 순간, 아직
         # 실제 선발 여부(line2)가 공개되기도 전인데 마치 대표팀 승선이

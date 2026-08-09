@@ -85,6 +85,35 @@ CUP_NAME_BY_COUNTRY = {
     "크로아티아": "크로아티아컵",
 }
 
+# [2026-08 신설, 신민용 요청] 국내컵 참가 범위 — "그 나라에 리그가 몇 부까지
+# 존재하느냐"와 "컵대회에 몇 부까지 참가시키느냐"는 별개 축이다. 예전엔
+# _start_domestic_cup_for_country가 그 나라에 존재하는 티어 전부를 무조건
+# 컵에 합류시켰는데(예: 7부리그까지 생기면 7부도 자동으로 컵에 낌), 실제
+# 축구는 나라마다 컵의 개방성이 다르다 — 잉글랜드 FA컵은 비리그 팀까지
+# 열려있는 반면(사실상 최상위 몇 부는 사실상 무제한), 이탈리아 코파
+# 이탈리아는 3부 정도까지로 좁다. CUP_NAME_BY_COUNTRY와 동일하게 국가명을
+# 키로 쓴다 — 딕셔너리에 없는 나라는 DEFAULT_CUP_MAX_TIER를 적용하고,
+# 그 나라에 실제로 존재하는 티어가 상한보다 적으면(예: 3부까지만 있는데
+# 상한이 4부) 있는 만큼만 자연히 참가한다(별도 처리 불필요).
+DEFAULT_CUP_MAX_TIER = 5
+
+CUP_MAX_TIER_BY_COUNTRY = {
+    "잉글랜드": 10,   # FA컵 — 사실상 전 리그+비리그급까지 열려있는 오픈컵
+    "스페인": 4,      # 코파 델 레이 — 1ª/2ª RFEF(3~4부)까지
+    "독일": 4,        # DFB-포칼 — 3부(리가)+지역컵 선발 4부팀까지, 전체 개방은 아님
+    "이탈리아": 3,    # 코파 이탈리아 — 세리에 A/B/C 일부까지로 제한적
+}
+
+
+def _cup_max_tier_for_country(country_id):
+    """이 나라 컵대회가 참가시키는 최대 하부리그 티어(그 이하 부수는 컵에
+    합류하지 않음). CUP_MAX_TIER_BY_COUNTRY에 없으면 DEFAULT_CUP_MAX_TIER."""
+    conn = get_conn()
+    row = conn.execute("SELECT name FROM countries WHERE id=?", (country_id,)).fetchone()
+    conn.close()
+    cname = row["name"] if row else ""
+    return CUP_MAX_TIER_BY_COUNTRY.get(cname, DEFAULT_CUP_MAX_TIER)
+
 
 def _cup_name_for_country(country_id):
     conn = get_conn()
@@ -179,7 +208,26 @@ def get_my_cup_matches():
            -- 구분한다.
            WHERE m.is_my = 1 AND m.home_score >= 0
            ORDER BY t.year, m.week""").fetchall()]
+
+    # [2026-08 성능 수정, 신민용 리포트: "재능 좋은 선수로 오래 뛰면
+    # 은퇴/커리어창이 심하게 렉걸린다"] 예전엔 경기 하나마다 _entry()를
+    # 홈/원정 각각 따로 호출(N+1 쿼리)했다 — 컵대회를 많이 뛴 커리어일수록
+    # 쿼리가 수백~수천 번씩 발생했다. 이 경기들이 걸쳐있는 tournament_id만
+    # 모아 한 번의 IN 쿼리로 필요한 엔트리만 배치 조회한다(전체
+    # cup_entries를 다 읽지 않는다 — 그건 세계 전체 컵대회 참가팀이라 훨씬
+    # 크다).
+    tids = {m["tournament_id"] for m in rows}
+    entries = {}
+    if tids:
+        ph = ",".join("?" * len(tids))
+        for r in conn.execute(
+                f"SELECT * FROM cup_entries WHERE tournament_id IN ({ph})",
+                tuple(tids)).fetchall():
+            entries[(r["tournament_id"], r["team_id"])] = dict(r)
     conn.close()
+
+    def _entry_lookup(tid, team_id):
+        return entries.get((tid, team_id), {"team_name": "?", "ovr": 60})
 
     out = []
 
@@ -190,8 +238,8 @@ def get_my_cup_matches():
         # 이후 이적한 경우 과거 경기의 상대가 그때의 내 팀 이름으로
         # 뒤바뀌어 표시되고 스코어/승패도 뒤집힌다.
         my_tid = m["t_my_tid"]
-        he = _entry(m["tournament_id"], m["home_team_id"])
-        ae = _entry(m["tournament_id"], m["away_team_id"])
+        he = _entry_lookup(m["tournament_id"], m["home_team_id"])
+        ae = _entry_lookup(m["tournament_id"], m["away_team_id"])
         is_home = (m["home_team_id"] == my_tid)
         opp = ae if is_home else he
         my_s = m["home_score"] if is_home else m["away_score"]
@@ -335,6 +383,14 @@ def _start_domestic_cup_for_country(year, cid, my_cid, add_log):
         "SELECT DISTINCT tier FROM leagues WHERE country_id=? ORDER BY tier DESC",
         (cid,)).fetchall()]
     conn.close()
+    if not tiers:
+        return
+
+    # [2026-08 신설, 신민용 요청] 이 나라 컵대회의 참가 상한 티어를 적용 —
+    # 그 나라에 리그가 7부까지 있어도 컵은 4부까지만 참가하는 식으로,
+    # "존재하는 티어"와 "컵에 참가하는 티어"를 분리한다.
+    _max_tier = _cup_max_tier_for_country(cid)
+    tiers = [t for t in tiers if t <= _max_tier]
     if not tiers:
         return
 

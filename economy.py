@@ -16,6 +16,14 @@ game_engine.py는 이 모듈에서 필요한 함수를 import해서 그대로 �
 (호출부 시그니처는 전혀 안 바뀜).
 """
 
+# [2026-08 신설, 신민용 확정: "재능이 신급인 선수만 국가별 상한을 뚫는
+# 초월적 스타 연봉이 나와야 한다"] _calc_salary(talent_tier="god")에서만
+# 쓰이는 my_player 전용 프리미엄. 이적료 쪽 명성 배율(PRESTIGE_LEVEL_FEE_
+# MULT) 튜닝 때와 같은 이유로 보수적인 값에서 시작 — 국가별 상한(예:
+# 잉글랜드 COUNTRY_SALARY_CAP≈2,050억)을 명확히 뚫고 나가되, 과하게
+# 터지지 않는 선. 필요시 이 값만 조정하면 된다.
+GOD_TIER_SALARY_MULT = 1.6
+
 
 def economy_index(year: int) -> float:
     """[2026-07 신설, 신민용+GPT 다회 검토 확정, v4] 시대별 경제 배율.
@@ -481,7 +489,7 @@ def _cap_relief_mult(ovr) -> float:
     return 3.0 + t * 3.0              # 95→100: 3.0배 → 6.0배
 
 
-def _clamp_salary_to_cap(sal, wealth, country=None, tier=1, is_special=False, ovr=None):
+def _clamp_salary_to_cap(sal, wealth, country=None, tier=1, is_special=False, ovr=None, talent_tier=None):
     """[버그수정 2026-07, 신민용 지적] 등급/국가별 연봉 상한 최종 안전망.
 
     _calc_salary는 자기 내부에서만 캡을 체크하는데, 재계약 협상 성공
@@ -507,7 +515,15 @@ def _clamp_salary_to_cap(sal, wealth, country=None, tier=1, is_special=False, ov
 
     [버그수정 2026-07 #3, 신민용 지적: "브라질 OVR88+ 전부 30억 고정"]
     ovr 인자가 주어지면 _cap_relief_mult로 엘리트/월드클래스 구간의 상한을
-    완화한다. 기본값 None → 기존 호출부는 하위호환(완화 없음)."""
+    완화한다. 기본값 None → 기존 호출부는 하위호환(완화 없음).
+
+    talent_tier: [2026-08 신설] "god"면 이 함수의 상한 로직 자체를
+    건너뛴다 — _calc_salary에서 이미 GOD_TIER_SALARY_MULT로 상한을
+    뚫어놓은 값을, 호출부가 안전망 삼아 이 함수로 다시 클램프하면서
+    도로 눌러버리는 걸 막기 위함(재계약/이적 오퍼 경로 다수가 이렇게
+    두 함수를 순서대로 부른다)."""
+    if talent_tier == "god":
+        return max(0, int(sal))
     from constants import COUNTRY_SALARY_CAP, LOWER_TIER_SALARY_CAP
     relief = _cap_relief_mult(ovr)
     country_cap = COUNTRY_SALARY_CAP.get(country, 0) if (country and not is_special) else 0
@@ -536,7 +552,7 @@ def _clamp_salary_to_cap(sal, wealth, country=None, tier=1, is_special=False, ov
 _LOW_GRADE_SCALE_BOOST = {"D": 34.0, "E": 34.0, "F": 34.0}
 
 
-def _calc_salary(grade, tier, ovr, country=None, team_name=None, year=None, team_id=None):
+def _calc_salary(grade, tier, ovr, country=None, team_name=None, year=None, team_id=None, talent_tier=None):
     """연봉 계산 (천원 단위).
     wealth 결정 우선순위:
       1) SPECIAL_SALARY_COUNTRIES — 특수 연봉 국가 (사우디/카타르/UAE)
@@ -555,6 +571,15 @@ def _calc_salary(grade, tier, ovr, country=None, team_name=None, year=None, team
     team_id: [2026-08 신설, STEP3] 있으면 club_strength(현재 팀 체급)로
       좁은 범위(0.95~1.10)의 연봉 보정을 추가로 곱한다. 기본값 None →
       기존 호출부는 하위호환(보정 없음).
+    talent_tier: [2026-08 신설, 신민용 확정: "신급 재능이면 국가별 상한을
+      뚫는 초월적 스타 연봉이 나와야 한다"] my_player 전용 파라미터 —
+      ai_lifecycle.py는 이 함수를 아예 호출하지 않으므로(AI 선수 급여는
+      별도 경로) 완전히 하위호환이다. "god"(신 등급)일 때만 이 함수
+      내부의 등급별/국가별 모든 상한(_salary_cap_table, COUNTRY_SALARY_CAP,
+      LOWER_TIER_SALARY_CAP)을 통과한 최종값에 GOD_TIER_SALARY_MULT를
+      추가로 곱해 뚫고 나간다. worldclass 이하 등급은 이미 talent_cap으로
+      OVR 자체가 99 이하로 묶여 있어(TALENT_TIERS 참고) 자연히 그 상한
+      근처에서 그치므로, 여기서 별도로 더 누를 필요는 없다.
     """
     eidx = economy_index(year) if year is not None else 1.0
     from constants import (LOWER_LEAGUE_SALARY_OVERRIDE, SPECIAL_SALARY_COUNTRIES,
@@ -581,7 +606,12 @@ def _calc_salary(grade, tier, ovr, country=None, team_name=None, year=None, team
         cap = COUNTRY_SALARY_CAP.get(country, 0)
         if cap > 0:
             sal = min(sal, cap)
-        return max(0, int(_apply_prestige(sal) * strength_mult * eidx))
+        # [2026-08 신설] god 등급 전용 프리미엄 — 아래 일반 분기와 동일한
+        # 로직(_calc_salary docstring의 talent_tier 설명 참고).
+        _final = max(0, int(_apply_prestige(sal) * strength_mult * eidx))
+        if talent_tier == "god":
+            _final = int(_final * GOD_TIER_SALARY_MULT)
+        return _final
 
     is_special = country and country in SPECIAL_SALARY_COUNTRIES
     if country:
@@ -754,7 +784,15 @@ def _calc_salary(grade, tier, ovr, country=None, team_name=None, year=None, team
                 # 증상을 여러 번 고치면서 이 지점만 누락된 것으로 보인다.
                 # 다른 두 캡과 동일한 패턴으로 맞춘다.
                 sal = min(sal, int(lt_cap * _cap_relief_mult(ovr)))
-    return max(0, int(_apply_prestige(sal) * strength_mult * eidx))
+    # [2026-08 신설, 신민용 확정: "재능이 신급인 선수만 국가별 상한을
+    # 뚫는 초월적 스타 연봉이 나와야 한다"] 위 모든 등급별/국가별 상한을
+    # 이미 다 통과한 최종값에, god 등급일 때만 추가 프리미엄을 곱한다.
+    # my_player가 아니면(talent_tier=None, AI 선수 경로는 이 함수 자체를
+    # 안 부름) 전혀 영향 없음 — 완전히 하위호환.
+    _final = max(0, int(_apply_prestige(sal) * strength_mult * eidx))
+    if talent_tier == "god":
+        _final = int(_final * GOD_TIER_SALARY_MULT)
+    return _final
 
 
 # ══════════════════════════════════════════════════════════════

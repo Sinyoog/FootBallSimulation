@@ -48,6 +48,7 @@ def _get_field_pos(p):
 
 from constants import (
     WC_START_YEAR, WC_INTERVAL,
+    CWC_START_YEAR, CWC_INTERVAL,
     CONTINENTAL_START_YEAR, CONTINENTAL_INTERVAL,
     INTL_CALLUP_WEEK, INTL_GROUP_WEEKS, INTL_KO_WEEKS,
     WC_TEAMS, WC_GROUPS, WC_QUOTA,
@@ -314,8 +315,15 @@ def get_my_tournament(year=None, qual=None):
     if not ts:
         return None
     # 본선/예선 필터
+    # [2026-08 버그수정, 신민용 리포트: "2001년부터 하는 유로 예선은 경기
+    # 일정에 안 뜬다"] 유로 예선(kind='cont_qual')이 나중에 추가됐는데,
+    # 이 필터가 여전히 'wc_qual'(월드컵 예선)만 걸러서 유로 예선 대회를
+    # 놓치고 있었다 — schedule_window._make_intl_tab(qual=True)가 이
+    # 함수를 거쳐 "국제대회(예선)" 탭을 만드는데, 유로 예선이 있는
+    # 해(2001, 2005, 2009...)엔 이 필터가 빈 리스트를 반환해서 None이
+    # 되고 탭 자체가 생성되지 않았다.
     if qual is True:
-        ts = [t for t in ts if t.get("kind") == "wc_qual"]
+        ts = [t for t in ts if t.get("kind") in ("wc_qual", "cont_qual")]
     elif qual is False:
         # [2026-08 버그수정, 신민용 리포트: "경기 일정 창에 국제대회 탭
         # 자체가 안 뜬다"] 지역컵(kind='region')이 이 화이트리스트에
@@ -348,7 +356,7 @@ def get_my_tournament(year=None, qual=None):
     # 수정: my_selected=2(탈락/미참가) 대회만 표시용으로 반환.
     #       my_selected=0(미선발)은 반환하지 않음 — 출전 자격 자체가 없음.
     for t in ts:
-        if t.get("my_selected") == 2 and t.get("kind") in ("world", "wc_qual"):
+        if t.get("my_selected") == 2 and t.get("kind") in ("world", "wc_qual", "cont_qual"):
             return t
     # [2026-07 버그수정, 신민용 리포트: "국대로 못 뽑히면 일정에 유럽권이
     # 무조건 뜬다"] 대륙컵들이 유럽→아메리카→아시아→아프리카 순서로
@@ -1058,8 +1066,12 @@ def start_intl_tournament(year):
     is_wc = year >= WC_START_YEAR and (year - WC_START_YEAR) % WC_INTERVAL == 0
     is_cont = (not is_wc and year >= CONTINENTAL_START_YEAR
                and (year - CONTINENTAL_START_YEAR) % CONTINENTAL_INTERVAL == 0)
-    is_cwc = (not is_wc and not is_cont and year >= WC_START_YEAR + 1
-              and (year - (WC_START_YEAR + 1)) % WC_INTERVAL == 0)
+    # [2026-08 버그수정] 예전엔 WC_START_YEAR+1로 즉석 계산했는데, WC와
+    # 위상이 같이 밀리는 값이라 GAME_START_YEAR에 더 가까운 클럽월드컵
+    # 해를 놓칠 수 있었다(constants.py CWC_START_YEAR 참고 — 이제 독립
+    # 계산된 상수를 그대로 쓴다).
+    is_cwc = (not is_wc and not is_cont and year >= CWC_START_YEAR
+              and (year - CWC_START_YEAR) % CWC_INTERVAL == 0)
 
     if is_cwc:
         # 월드컵 다음 해 — 캘린더 겹침이 전혀 없어서(챔스는 이미 23주차에
@@ -4031,7 +4043,13 @@ def get_my_intl_matches(only_qual=False):
                rating, score, result(승/무/패, PSO 표기 포함)
     """
     if only_qual:
-        kind_filter = "t.kind = 'wc_qual'"
+        # [2026-08 버그수정, 신민용 리포트: "은퇴엔 국제전(예선)이 있는데
+        # 커리어에는 이게 사라졌다"] 유로 예선(kind='cont_qual')이 나중에
+        # 추가됐는데 이 필터가 여전히 'wc_qual'만 걸러서, 유로 예선에서
+        # 뛴 경기가 커리어/은퇴창 "국제전(예선)" 탭에서 통째로 빠지고
+        # 있었다 — get_my_tournament()의 동일 버그(스케줄 탭 자체가 안
+        # 뜨는 문제)와 같은 원인.
+        kind_filter = "t.kind IN ('wc_qual', 'cont_qual')"
     else:
         # [2026-08 신설, 신민용 리포트: "지역컵 경기가 국제전 기록에 하나도
         # 안 들어간다"] 3단계 지역컵(kind='region')이 이 화이트리스트에
@@ -4060,9 +4078,18 @@ def get_my_intl_matches(only_qual=False):
            JOIN intl_tournaments t ON m.tournament_id = t.id
            WHERE m.is_my = 1 AND t.my_selected = 1 AND m.home_score >= 0 AND {kind_filter}
            ORDER BY t.year, m.week""").fetchall()]
-    flags = {(r["tournament_id"], r["country"]): r["flag"]
-             for r in conn.execute(
-                 "SELECT tournament_id, country, flag FROM intl_entries").fetchall()}
+    # [2026-08 성능 수정, 신민용 리포트: "재능 좋은 선수로 오래 뛰면
+    # 은퇴/커리어창이 심하게 렉걸린다"] intl_entries 전체 대신 내 경기가
+    # 걸쳐있는 tournament_id만 걸러서 가져온다.
+    _tids = {r["tournament_id"] for r in rows}
+    flags = {}
+    if _tids:
+        _ph = ",".join("?" * len(_tids))
+        flags = {(r["tournament_id"], r["country"]): r["flag"]
+                 for r in conn.execute(
+                     f"SELECT tournament_id, country, flag "
+                     f"FROM intl_entries WHERE tournament_id IN ({_ph})",
+                     tuple(_tids)).fetchall()}
     conn.close()
 
     from game_engine import get_player

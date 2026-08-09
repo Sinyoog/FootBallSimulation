@@ -183,7 +183,30 @@ QHeaderView::section { background:#252525; color:#888; border:none; padding:4px;
 
 
 class RetireWindow(QDialog):
+    def _get_career_matches(self):
+        """[2026-08 성능 수정, 신민용 리포트: "재능 좋은 선수로 오래 뛰면
+        은퇴/커리어창이 심하게 렉걸린다"] intl/cl/cup/cwc/po 기록 조회
+        (get_my_*_matches)는 전 세계 누적 테이블(cup_matches 등)을 스캔하는
+        무거운 호출인데, 이 창 안에서 __init__ / _gen_story() /
+        _gather_story_inputs()가 각각 따로 다시 불러서 최대 3번 중복
+        조회하고 있었다 — 한 번 계산해서 인스턴스에 캐싱해두고 재사용한다.
+        (이 창은 열려있는 동안 커리어 데이터가 바뀌지 않으므로 캐시가
+        stale해질 걱정은 없다.)"""
+        if getattr(self, "_career_match_cache", None) is None:
+            import intl_engine, champions_engine, cup_engine
+            import club_world_cup_engine, promotion_playoff_engine
+            self._career_match_cache = {
+                "intl_ms": intl_engine.get_my_intl_matches(),
+                "qual_ms": intl_engine.get_my_qual_matches(),
+                "cl_ms": champions_engine.get_my_cl_matches(),
+                "cup_ms": cup_engine.get_my_cup_matches(),
+                "cwc_ms": club_world_cup_engine.get_my_cwc_matches(),
+                "po_ms": promotion_playoff_engine.get_my_po_matches(),
+            }
+        return self._career_match_cache
+
     def __init__(self, lang="ko", parent=None):
+        self._career_match_cache = None
         super().__init__(parent)
         from PyQt6.QtCore import Qt
         self.setWindowModality(Qt.WindowModality.NonModal)
@@ -287,6 +310,12 @@ class RetireWindow(QDialog):
         ]
         if _max_fee > 0:
             stats.append(("최고이적료", fmt_money(_max_fee)))
+        # [2026-08 신설, 신민용 요청: "커리어에 레드카드 기록 추가"]
+        # 통산 레드카드가 한 번이라도 있으면 통계 박스에 함께 보여준다
+        # (전 대회 합산 — 리그만의 수치는 아래 팀 이력 표의 "🟥" 컬럼 참고).
+        _trc = p.get("total_red_cards_all", 0)
+        if _trc > 0:
+            stats.append(("🟥레드카드", f"{_trc}회"))
         for k, v in stats:
             sw = QFrame(); sl = QVBoxLayout(sw); sl.setContentsMargins(4,4,4,4)
             kl = QLabel(k); kl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -356,15 +385,17 @@ class RetireWindow(QDialog):
         lay.addWidget(self._promo_table(promos))
 
         # ── 국제전 기록 ──────────────────────────────
-        import intl_engine
-        intl_ms = intl_engine.get_my_intl_matches()
+        # [2026-08 성능 수정] get_my_*_matches() 6개를 한 번씩만 조회해
+        # 인스턴스에 캐싱한 결과를 재사용 (_get_career_matches 참고).
+        _cm = self._get_career_matches()
+        intl_ms = _cm["intl_ms"]
         t35 = QLabel(f"🌍 국제전 기록  ({len(intl_ms)})")
         t35.setObjectName("secTitle")
         lay.addWidget(t35)
         lay.addWidget(self._intl_table(intl_ms, p))
 
         # ── 국제전(예선) 기록 ─────────────────────────
-        qual_ms = intl_engine.get_my_qual_matches()
+        qual_ms = _cm["qual_ms"]
         if qual_ms:
             t35q = QLabel(f"🌏 국제전(예선) 기록  ({len(qual_ms)})")
             t35q.setObjectName("secTitle")
@@ -372,24 +403,21 @@ class RetireWindow(QDialog):
             lay.addWidget(self._intl_table(qual_ms, p))
 
         # ── 챔피언스리그 기록 ────────────────────────
-        import champions_engine
-        cl_ms = champions_engine.get_my_cl_matches()
+        cl_ms = _cm["cl_ms"]
         t36 = QLabel(f"🏆 챔피언스리그 기록  ({len(cl_ms)})")
         t36.setObjectName("secTitle")
         lay.addWidget(t36)
         lay.addWidget(self._champions_table(cl_ms, p))
 
         # ── 컵대회 기록 ──────────────────────────────
-        import cup_engine
-        cup_ms = cup_engine.get_my_cup_matches()
+        cup_ms = _cm["cup_ms"]
         t37 = QLabel(f"🎖️ 컵대회 기록  ({len(cup_ms)})")
         t37.setObjectName("secTitle")
         lay.addWidget(t37)
         lay.addWidget(self._cup_table(cup_ms))
 
         # ── 클럽 월드컵 기록 (있을 때만 — 4년에 한 번뿐이라 없는 게 정상) ──
-        import club_world_cup_engine
-        cwc_ms = club_world_cup_engine.get_my_cwc_matches()
+        cwc_ms = _cm["cwc_ms"]
         if cwc_ms:
             t37b = QLabel(f"🌍 클럽 월드컵 기록  ({len(cwc_ms)})")
             t37b.setObjectName("secTitle")
@@ -399,8 +427,7 @@ class RetireWindow(QDialog):
         # ── 승강 플레이오프 기록 ──────────────────────
         # [2026-07 버그수정] 컵대회와 같은 급으로(매년 누구에게나 열릴 수
         # 있음) 0건이어도 항상 표시 — 클럽월드컵(4년 주기)만 조건부로 둔다.
-        import promotion_playoff_engine
-        po_ms = promotion_playoff_engine.get_my_po_matches()
+        po_ms = _cm["po_ms"]
         t37c = QLabel(f"⚖ 승강 플레이오프 기록  ({len(po_ms)})")
         t37c.setObjectName("secTitle")
         lay.addWidget(t37c)
@@ -528,7 +555,7 @@ class RetireWindow(QDialog):
             stat_cols = ["골","어시","슈팅","유효","기회창출","드리블"]
         cols = (["기간","포지션","국가","리그","팀명","연봉","출전"]
                 + stat_cols
-                + ["평균평점","팀순위","승무패","계약","이적"])
+                + ["평균평점","팀순위","승무패","🟥","계약","이적"])
         # 이슈3: '스퓨리어스 중복 행'(이벤트 없이 잔류만 하는데 실수로
         # 새 행이 또 생기는 버그, transfer_type='')만 숨긴다. 진짜
         # 이적/입단/오퍼 이벤트(transfer_type이 채워짐)는 기간이 짧고
@@ -699,7 +726,9 @@ class RetireWindow(QDialog):
                      fmt_money(e.get("salary",0)),
                      _apps_str2]
                     + stat_vals
-                    + [str(avg), rank_disp, wdl, c_str, t_type])
+                    + [str(avg), rank_disp, wdl,
+                       (str(e.get("red_cards", 0)) if e.get("red_cards", 0) else "—"),
+                       c_str, t_type])
             for j, v in enumerate(vals):
                 self._set_item(tbl, i, j, v)
         tbl.resizeColumnsToContents()
@@ -1609,8 +1638,9 @@ class RetireWindow(QDialog):
         lines.append("")
 
         # 국제전 기록 (A매치 경기 단위 ─ 상대/활약/스코어/결과)
-        import intl_engine
-        intl_ms = intl_engine.get_my_intl_matches()
+        # [2026-08 성능 수정] 캐시된 결과 재사용 (_get_career_matches 참고).
+        _cm2 = self._get_career_matches()
+        intl_ms = _cm2["intl_ms"]
         lines.append(f"▶ 국제전 기록  ({len(intl_ms)}경기)")
         if intl_ms:
             for im in intl_ms:
@@ -1622,7 +1652,7 @@ class RetireWindow(QDialog):
         lines.append("")
 
         # 국제전(예선) 기록
-        qual_ms2 = intl_engine.get_my_qual_matches()
+        qual_ms2 = _cm2["qual_ms"]
         if qual_ms2:
             lines.append(f"▶ 국제전(예선) 기록  ({len(qual_ms2)}경기)")
             for qm in qual_ms2:
@@ -1632,8 +1662,7 @@ class RetireWindow(QDialog):
             lines.append("")
 
         # 챔피언스리그 기록 (클럽 대륙 대회 경기 단위 ─ A매치 아님, 클럽 출전)
-        import champions_engine
-        cl_ms2 = champions_engine.get_my_cl_matches()
+        cl_ms2 = _cm2["cl_ms"]
         lines.append(f"▶ 챔피언스리그 기록  ({len(cl_ms2)}경기)  ※ 클럽 대항전 (A매치 아님)")
         if cl_ms2:
             for cm in cl_ms2:
@@ -1645,8 +1674,7 @@ class RetireWindow(QDialog):
         lines.append("")
 
         # 컵대회 기록 (경기 단위 ─ A매치 아님, 클럽 출전)
-        import cup_engine
-        cup_ms2 = cup_engine.get_my_cup_matches()
+        cup_ms2 = _cm2["cup_ms"]
         lines.append(f"▶ 컵대회 기록  ({len(cup_ms2)}경기)  ※ 국내 컵대회 (A매치 아님)")
         if cup_ms2:
             for um in cup_ms2:
@@ -1664,8 +1692,7 @@ class RetireWindow(QDialog):
         lines.append("")
 
         # 클럽 월드컵 기록 (4년에 한 번뿐인 대회 — 경기 단위, A매치 아님)
-        import club_world_cup_engine
-        cwc_ms2 = club_world_cup_engine.get_my_cwc_matches()
+        cwc_ms2 = _cm2["cwc_ms"]
         if cwc_ms2:
             lines.append(f"▶ 클럽 월드컵 기록  ({len(cwc_ms2)}경기)  ※ 4년 주기 클럽 대항전 (A매치 아님)")
             for wm in cwc_ms2:
@@ -1675,8 +1702,7 @@ class RetireWindow(QDialog):
             lines.append("")
 
         # 승강 플레이오프 기록 (경기 단위)
-        import promotion_playoff_engine
-        po_ms2 = promotion_playoff_engine.get_my_po_matches()
+        po_ms2 = _cm2["po_ms"]
         lines.append(f"▶ 승강 플레이오프 기록  ({len(po_ms2)}경기)")
         if po_ms2:
             for pm in po_ms2:
@@ -1806,23 +1832,16 @@ class RetireWindow(QDialog):
         # absence_reason(injury/suspension/...)을 정확히 매겨서 갖고 있으므로
         # 그 확정 근거를 그대로 쓴다. 대회별 조회가 실패해도(구버전 세이브
         # 등) 나머지는 계속 진행되도록 각각 방어한다.
+        # [2026-08 성능 수정] 캐시된 결과 재사용 (_get_career_matches 참고).
         absence_events = []
         try:
-            import cup_engine
+            _cm3 = self._get_career_matches()
             absence_events += [{"year": m.get("year"), "reason": m.get("absence_reason")}
-                                for m in cup_engine.get_my_cup_matches() if m.get("absence_reason")]
-        except Exception:
-            pass
-        try:
-            import champions_engine
+                                for m in _cm3["cup_ms"] if m.get("absence_reason")]
             absence_events += [{"year": m.get("year"), "reason": m.get("absence_reason")}
-                                for m in champions_engine.get_my_cl_matches() if m.get("absence_reason")]
-        except Exception:
-            pass
-        try:
-            import intl_engine
+                                for m in _cm3["cl_ms"] if m.get("absence_reason")]
             absence_events += [{"year": m.get("year"), "reason": m.get("absence_reason")}
-                                for m in intl_engine.get_my_intl_matches() if m.get("absence_reason")]
+                                for m in _cm3["intl_ms"] if m.get("absence_reason")]
         except Exception:
             pass
 

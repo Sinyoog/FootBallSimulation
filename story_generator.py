@@ -3299,6 +3299,14 @@ def generate_epilogue(player, seasons, has_trophy, awards, intl_trophies, rng):
     lines = [f"{with_josa(name, '은/는')} {age}세, {total_s}시즌 만에 유니폼을 벗었다.",
              f"통산 {total_m}경기 {total_g}골 {total_a}도움."]
 
+    # [2026-08 신설, 신민용 요청: "커리어에 레드카드 기록 추가"] 통산
+    # 레드카드가 한 번이라도 있으면 에필로그에 한 줄 남긴다 — 새로운
+    # 사실을 지어내지 않고 이미 my_player에 누적된 값(total_red_cards_all,
+    # 리그+컵+챔스+클럽월드컵+국가대표+승강PO 전 대회 합산)을 그대로 쓴다.
+    total_rc = player.get("total_red_cards_all", 0)
+    if total_rc > 0:
+        lines.append(f"그라운드 위에서 뜨거웠던 만큼, 레드카드도 통산 {total_rc}회 받았다.")
+
     if awards:
         cnt = Counter(a.get("award_type", "") for a in awards)
         order = ["발롱도르", "MVP", "득점왕", "도움왕", "베스트11", "골든글러브", "영플레이어",

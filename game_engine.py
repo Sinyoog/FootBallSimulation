@@ -938,16 +938,17 @@ def _update_career_stats(p, year, week):
     tw, td, tl = _team_wdl_from_results(c, tid, lid, season)
 
     cs = _calc_clean_sheets(c, tid, season, matches=sm)
+    rc_league = p.get("season_red_cards_league", 0)
 
     c.execute("""UPDATE career_entries SET
         matches=?, goals=?, assists=?, saves=?, goals_against=?,
         avg_rating=?, team_rank=?, wins=?, draws=?, losses=?, clean_sheets=?,
         shots=?, shots_on=?, key_passes=?, dribbles=?, blocks=?, pass_acc=?,
-        team_id=?, league_name=?, tier=?
+        team_id=?, league_name=?, tier=?, red_cards=?
         WHERE id=?""",
         (sm, sg, sa, ss, sga, avg_r, rn, tw, td, tl, cs,
          d_sh, d_sho, d_kp, d_drb, d_blk, d_pac, tid,
-         lname, tier, existing["id"]))
+         lname, tier, rc_league, existing["id"]))
     conn.commit()
     conn.close()
 
@@ -1017,17 +1018,18 @@ def _close_career_entry(p, year, week, exit_type=""):
     tw, td, tl = _team_wdl_from_results(c, tid, lid, season)
 
     cs = _calc_clean_sheets(c, tid, season, matches=sm)
+    rc_league = p.get("season_red_cards_league", 0)
 
     c.execute("""UPDATE career_entries SET
         end_year=?, end_week=?, matches=?, goals=?, assists=?, saves=?, goals_against=?,
         avg_rating=?, team_rank=?, wins=?, draws=?, losses=?, clean_sheets=?,
         shots=?, shots_on=?, key_passes=?, dribbles=?, blocks=?, pass_acc=?,
-        league_name=?, tier=?, salary=?, position=?, team_id=?, exit_type=?
+        league_name=?, tier=?, salary=?, position=?, team_id=?, exit_type=?, red_cards=?
         WHERE id=?""",
         (year, week, sm, sg, sa, ss, sga, avg_r, rn, tw, td, tl, cs,
          d_sh, d_sho, d_kp, d_drb, d_blk, d_pac,
          lname, tier, p.get("salary", 0),
-         p.get("position", ""), tid, exit_type, existing["id"]))
+         p.get("position", ""), tid, exit_type, rc_league, existing["id"]))
 
     conn.commit()
     conn.close()
@@ -3133,11 +3135,25 @@ def _apply_red_card_dismissal(p, field="red_card_suspension"):
     """퇴장 처리: 그 경기 평점을 고정값으로, 골/도움/세이브는 조기 강판
     특성상 0으로 처리하고, 다음 경기(같은 대회 한정) 출전정지 1경기를 건다.
     반환: (goals, assists, saves, rating, events, detail) — _player_perf와
-    동일한 반환 형태라 호출부에서 그대로 대입해 쓸 수 있다."""
+    동일한 반환 형태라 호출부에서 그대로 대입해 쓸 수 있다.
+
+    [2026-08 신설, 신민용 요청: "커리어에 레드카드 기록 추가"] 이 함수가
+    리그/컵/챔스/클럽월드컵/국가대표/승강PO 6개 대회 전부에서 퇴장 처리의
+    공통 진입점이라, 누적 카운터도 여기 한 곳에서만 올리면 6곳 전부 커버된다.
+    total_red_cards_all(커리어 통산, 전 대회 합산)은 어디서 발생하든 항상
+    올리고, field가 기본값(red_card_suspension)일 때만 — 즉 "리그" 경기일
+    때만 — 리그 전용 카운터(season/total_red_cards_league)도 함께 올린다.
+    커리어/은퇴창의 "전체 기록"은 total_red_cards_all을, "리그 기록"은
+    total_red_cards_league/career_entries.red_cards를 보여주기 위함."""
     events = [(_sample_minutes(1, 15, 85)[0], "🟥 퇴장! 조기 강판")]
     detail = {"shots": 0, "shots_on": 0, "key_passes": 0,
               "dribbles": 0, "blocks": 0, "pass_acc": 0.0}
-    update_player(**{field: 1})
+    _is_league_rc = (field == "red_card_suspension")
+    _rc_updates = {field: 1, "total_red_cards_all": p.get("total_red_cards_all", 0) + 1}
+    if _is_league_rc:
+        _rc_updates["total_red_cards_league"] = p.get("total_red_cards_league", 0) + 1
+        _rc_updates["season_red_cards_league"] = p.get("season_red_cards_league", 0) + 1
+    update_player(**_rc_updates)
     return 0, 0, 0, RED_CARD_RATING, events, detail
 
 
@@ -4817,7 +4833,15 @@ def _build_league_schedule_rows(league_id, tids, season, year, existing_matches,
     rounds = generate_round_robin(n)
     n_rounds = len(rounds)
     legs = 2 if first_half_only else legs_for_team_count(n)
-    n_cycles = max(1, legs // 2)
+
+    # [2026-08 신설, 신민용 확정: "팀 수가 아주 많은 리그(25팀 이상)는
+    # 왕복이 아니라 단판(전 팀이 서로 딱 1번씩만)으로"] legs==1은 기존
+    # "같은 대진을 h1/h2에서 두 번(홈/원정 반전) 반복"하는 구조와 근본적으로
+    # 다르다 — 반복 없이 딱 한 번씩만 만나야 하므로, generate_round_robin이
+    # 만든 n_rounds개 라운드를 절반씩 h1/h2 창에 나눠 배정한다(반전 없음,
+    # 매 라운드 독립적으로 홈/원정 추첨). 그 외(legs>=2)는 기존 로직 그대로.
+    is_single_round = (legs == 1)
+    n_cycles = max(1, legs // 2) if not is_single_round else 1
     windows = season_cycle_windows(n_cycles)
     _lg_off = league_day_offset(league_id)
 
@@ -4825,25 +4849,39 @@ def _build_league_schedule_rows(league_id, tids, season, year, existing_matches,
     leg_home = {}   # (cyc,rd,hi,ai) -> 그 사이클 1다리에서 실제 홈이었던 team_id
     for cyc, (h1s, h1e, h2s, h2e) in enumerate(windows):
         is_last_cycle = (cyc == n_cycles - 1)
-        for leg_idx, (w_start, w_end) in enumerate(((h1s, h1e), (h2s, h2e))):
+        if is_single_round:
+            # 라운드를 절반씩 h1/h2 창에 나눠 배정 — 각 라운드는 딱 한 번만 등장.
+            half = (n_rounds + 1) // 2
+            leg_round_slices = [(0, half, (h1s, h1e)), (half, n_rounds, (h2s, h2e))]
+        else:
+            leg_round_slices = [(0, n_rounds, (h1s, h1e)), (0, n_rounds, (h2s, h2e))]
+
+        for leg_idx, (rd_start, rd_end, (w_start, w_end)) in enumerate(leg_round_slices):
             if first_half_only and (cyc, leg_idx) != (0, 0):
                 break  # 미리보기용은 첫 사이클 첫 다리만 필요
-            is_last_leg_of_season = (not first_half_only) and is_last_cycle and leg_idx == 1
-            for rd, matches in enumerate(rounds):
+            is_last_leg_of_season = (not first_half_only) and is_last_cycle and (
+                leg_idx == len(leg_round_slices) - 1)
+            leg_rounds = list(enumerate(rounds))[rd_start:rd_end]
+            n_leg_rounds = len(leg_rounds)
+            for local_idx, (rd, matches) in enumerate(leg_rounds):
                 valid_pairs = [(hi, ai) for hi, ai in matches if hi < n and ai < n]
-                is_final_round = is_last_leg_of_season and (rd == n_rounds - 1)
-                if is_final_round and n_rounds >= 2:
+                is_final_round = is_last_leg_of_season and (local_idx == n_leg_rounds - 1)
+                if is_final_round and n_leg_rounds >= 2:
                     # 시즌 진짜 마지막 라운드 — 전 구단 동시진행(스프레드 없음).
-                    prev_valid = [(hi, ai) for hi, ai in rounds[rd - 1] if hi < n and ai < n]
-                    day = final_round_day(rd - 1, n_rounds, w_start, w_end,
+                    prev_rd, prev_matches = leg_rounds[local_idx - 1]
+                    prev_valid = [(hi, ai) for hi, ai in prev_matches if hi < n and ai < n]
+                    day = final_round_day(local_idx - 1, n_leg_rounds, w_start, w_end,
                                            len(prev_valid), offset=_lg_off)
                     match_days = [day] * len(valid_pairs)
                 else:
-                    match_days = round_match_days(rd, n_rounds, w_start, w_end,
+                    match_days = round_match_days(local_idx, n_leg_rounds, w_start, w_end,
                                                    len(valid_pairs), offset=_lg_off)
                 for (hi, ai), day in zip(valid_pairs, match_days):
                     week = day_to_week(day)
-                    if leg_idx == 0:
+                    if is_single_round:
+                        # 단판 — 반전 개념 없음, 매 라운드 독립 추첨.
+                        t1, t2 = (tids[hi], tids[ai]) if random.random() < 0.5 else (tids[ai], tids[hi])
+                    elif leg_idx == 0:
                         t1, t2 = (tids[hi], tids[ai]) if random.random() < 0.5 else (tids[ai], tids[hi])
                         leg_home[(cyc, rd, hi, ai)] = t1
                     else:
@@ -5408,7 +5446,8 @@ def _check_sale_push_forced_sale(p, cur_year, cur_week):
             return
 
         salary = _calc_salary(row["grade"], row["tier"], p.get("ovr", 40),
-                              row["country"], row["name"], year=cur_year, team_id=row["id"])
+                              row["country"], row["name"], year=cur_year, team_id=row["id"],
+                              talent_tier=p.get("talent_tier"))
         o = _build_offer(row, row["grade"], row["tier"], salary)
         o["my_grade"] = get_league_grade(p.get("nationality", ""), "C")
         my_team_row = conn.execute(
@@ -7563,6 +7602,7 @@ def _end_of_season(p, year):
                         season_shots=0, season_shots_on=0, season_key_passes=0,
                         season_dribbles=0, season_blocks=0,
                         season_pass_acc_sum=0, season_pass_acc_cnt=0,
+                        season_red_cards_league=0,
                         award_matches=0, award_goals=0, award_assists=0,
                         award_saves=0, award_goals_against=0,
                         award_rating_sum=0, award_rating_cnt=0)
@@ -7664,7 +7704,8 @@ def _end_of_season(p, year):
                 if _gt:
                     _rg2, _rt2, _rc2 = _gt
                     _fair_sal = _calc_salary(_rg2, _rt2, p2.get("ovr", 60), _rc2, year=year,
-                                             team_id=p2.get("current_team_id"))
+                                             team_id=p2.get("current_team_id"),
+                                             talent_tier=p2.get("talent_tier"))
                 else:
                     _fair_sal = p2.get("salary", 0)
                 # 평점에 따라 ±15% 가감
@@ -7901,7 +7942,8 @@ def _check_forced_release(p, year, prior_season_matches=None,
     if _glow and cur_salary > 0:
         _grade2, _tier2, _country2 = _glow
         fair_salary = _calc_salary(_grade2, _tier2, cur_ovr, _country2, year=year,
-                                   team_id=p.get("current_team_id"))
+                                   team_id=p.get("current_team_id"),
+                                   talent_tier=p.get("talent_tier"))
         overpay = (cur_salary / fair_salary) if fair_salary > 0 else 99
         is_overpaid = overpay >= 1.6
         is_underperforming = (avg_rating < 6.3 and rc >= 5) or (gap >= adjusted_threshold)
@@ -8208,7 +8250,8 @@ def _try_sell_player(p, year, cur_ovr):
         return False
 
     # 새 팀 연봉 (새 OVR 기준, 리그 부유도 반영)
-    new_salary = _calc_salary(get_league_grade(row["country"], row["grade"]), row["tier"], cur_ovr, row["country"], row["name"], year=year, team_id=row["id"])
+    new_salary = _calc_salary(get_league_grade(row["country"], row["grade"]), row["tier"], cur_ovr, row["country"], row["name"], year=year, team_id=row["id"],
+                              talent_tier=p.get("talent_tier"))
 
     # (변경) 떠나는 팀에는 우승을 주지 않는다.
     # 우승은 '시즌 종료 시점 소속팀'이 1위일 때만 _process_promotion_relegation에서 인정.
@@ -9385,8 +9428,8 @@ def generate_offers(count=5, force=False) -> list:
             row = random.choices(cands, _w)[0]
             _wealth_g = get_league_grade(row["country"], row["grade"])
             salary = _clamp_salary_to_cap(
-                int(_calc_salary(_wealth_g, tier, ovr, row["country"], row["name"], year=p.get("current_year"), team_id=row["id"]) * random.uniform(0.85, 1.15)),
-                _wealth_g, row["country"], tier)
+                int(_calc_salary(_wealth_g, tier, ovr, row["country"], row["name"], year=p.get("current_year"), team_id=row["id"], talent_tier=p.get("talent_tier")) * random.uniform(0.85, 1.15)),
+                _wealth_g, row["country"], tier, talent_tier=p.get("talent_tier"))
             pool.append(_build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary))
             exclude_ids.add(row["id"])
         return pool
@@ -9449,8 +9492,8 @@ def generate_offers(count=5, force=False) -> list:
             row = random.choices(cands, _w)[0]
             _wealth_g = get_league_grade(row["country"], row["grade"])
             salary = _clamp_salary_to_cap(
-                int(_calc_salary(_wealth_g, tier, ovr, row["country"], row["name"], year=p.get("current_year"), team_id=row["id"]) * random.uniform(0.85, 1.15)),
-                _wealth_g, row["country"], tier)
+                int(_calc_salary(_wealth_g, tier, ovr, row["country"], row["name"], year=p.get("current_year"), team_id=row["id"], talent_tier=p.get("talent_tier")) * random.uniform(0.85, 1.15)),
+                _wealth_g, row["country"], tier, talent_tier=p.get("talent_tier"))
             pool.append(_build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary))
             exclude_ids.add(row["id"])
             want -= 1
@@ -9534,8 +9577,8 @@ def generate_offers(count=5, force=False) -> list:
             if row["id"] == my_tid: return False
             _wealth_g = get_league_grade(row["country"], row["grade"])
             salary = _clamp_salary_to_cap(
-                int(_calc_salary(_wealth_g, tier, ovr, row["country"], row["name"], year=p.get("current_year"), team_id=row["id"]) * random.uniform(0.85, 1.15)),
-                _wealth_g, row["country"], tier)
+                int(_calc_salary(_wealth_g, tier, ovr, row["country"], row["name"], year=p.get("current_year"), team_id=row["id"], talent_tier=p.get("talent_tier")) * random.uniform(0.85, 1.15)),
+                _wealth_g, row["country"], tier, talent_tier=p.get("talent_tier"))
             offers.append(_build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary))
             return True
 
@@ -9602,8 +9645,8 @@ def generate_offers(count=5, force=False) -> list:
             if not _team_fits_me(row): continue
             _wealth_g = get_league_grade(row["country"], row["grade"])
             salary = _clamp_salary_to_cap(
-                int(_calc_salary(_wealth_g, tier, ovr, row["country"], row["name"], year=p.get("current_year"), team_id=row["id"]) * random.uniform(0.85, 1.15)),
-                _wealth_g, row["country"], tier)
+                int(_calc_salary(_wealth_g, tier, ovr, row["country"], row["name"], year=p.get("current_year"), team_id=row["id"], talent_tier=p.get("talent_tier")) * random.uniform(0.85, 1.15)),
+                _wealth_g, row["country"], tier, talent_tier=p.get("talent_tier"))
             offers.append(_build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary))
 
         # 자국에서 못 채웠거나 해외 슬롯이 남은 경우 → 타국으로 채움
@@ -9636,8 +9679,8 @@ def generate_offers(count=5, force=False) -> list:
                 if not _team_fits_me(row): continue
                 _wealth_g = get_league_grade(row["country"], row["grade"])
                 salary = _clamp_salary_to_cap(
-                    int(_calc_salary(_wealth_g, tier, ovr, row["country"], row["name"], year=p.get("current_year"), team_id=row["id"]) * random.uniform(0.85, 1.15)),
-                    _wealth_g, row["country"], tier)
+                    int(_calc_salary(_wealth_g, tier, ovr, row["country"], row["name"], year=p.get("current_year"), team_id=row["id"], talent_tier=p.get("talent_tier")) * random.uniform(0.85, 1.15)),
+                    _wealth_g, row["country"], tier, talent_tier=p.get("talent_tier"))
                 offers.append(_build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary))
 
         # [그리드 배치] 자국(좌열) / 타국(우열)이 매 행마다 번갈아 오도록 재정렬 + 구역 태그
@@ -10154,7 +10197,7 @@ def apply_to_team(team_id):
     grade = get_league_grade(row["country"], row["grade"])
     tier = row["tier"]
     ovr = p.get("ovr", 40)
-    salary = int(_calc_salary(grade, tier, ovr, row["country"], row["name"], year=p.get("current_year"), team_id=row["id"]) * random.uniform(0.95, 1.15))
+    salary = int(_calc_salary(grade, tier, ovr, row["country"], row["name"], year=p.get("current_year"), team_id=row["id"], talent_tier=p.get("talent_tier")) * random.uniform(0.95, 1.15))
     offer = _build_offer(row, grade, tier, salary)
     offer["_zone"] = "applied"
     _rank_conn = get_conn()
@@ -10290,8 +10333,8 @@ def _try_youth_scout_offer(c, p, ovr, existing_offers, team_avg_cache, my_countr
         row = random.choice(fit)
         wealth_g = get_league_grade(row["country"], row["grade"])
         salary = _clamp_salary_to_cap(
-            int(_calc_salary(wealth_g, tier, ovr, row["country"], row["name"], year=p.get("current_year"), team_id=row["id"]) * random.uniform(0.7, 0.9)),
-            wealth_g, row["country"], tier)
+            int(_calc_salary(wealth_g, tier, ovr, row["country"], row["name"], year=p.get("current_year"), team_id=row["id"], talent_tier=p.get("talent_tier")) * random.uniform(0.7, 0.9)),
+            wealth_g, row["country"], tier, talent_tier=p.get("talent_tier"))
         offer = _build_offer(row, wealth_g, tier, salary)
         offer["_zone"] = "youth_scout"
         return offer
@@ -11064,6 +11107,7 @@ def _save_career_entry(p, year, week, force_new=False, transfer_type=None,
     tw, td, tl = _team_wdl_from_results(c, tid, lid, season)
     pos = get_field_pos(p)   # 배치 포지션 (포메이션 슬롯 기반, 없으면 주요 포지션)
     cs  = _calc_clean_sheets(c, tid, season, matches=sm)
+    rc_league = p.get("season_red_cards_league", 0)
 
     # end_year=0인 열린 항목 찾기 (team_id 우선, 구버전 행은 이름 폴백)
     existing = _find_open_entry(c, tid, team_row["name"])
@@ -11073,11 +11117,11 @@ def _save_career_entry(p, year, week, force_new=False, transfer_type=None,
             end_year=?, end_week=?, matches=?, goals=?, assists=?, saves=?, goals_against=?,
             avg_rating=?, team_rank=?, wins=?, draws=?, losses=?, clean_sheets=?,
             league_name=?, tier=?, salary=?, position=?, team_id=?, exit_type=?,
-            loan_partner_team=COALESCE(?, loan_partner_team)
+            loan_partner_team=COALESCE(?, loan_partner_team), red_cards=?
             WHERE id=?""",
             (year, week, sm, sg, sa, ss, sga, avg_r, rn, tw, td, tl, cs,
              season_lname, season_tier, p.get("salary", 0), pos, tid,
-             exit_type, loan_partner_team, existing["id"]))
+             exit_type, loan_partner_team, rc_league, existing["id"]))
     elif not allow_insert:
         # 이미 닫힌 항목만 존재 → 중복 행은 안 만들되, 떠난 경로(exit_type)는
         # 가장 최근에 닫힌 그 팀 항목에 덧칠해 준다 (방출/팔림 표시 누락 방지).
@@ -11134,14 +11178,14 @@ def _save_career_entry(p, year, week, force_new=False, transfer_type=None,
              matches, goals, assists, saves, goals_against,
              avg_rating, team_rank, wins, draws, losses,
              contract_years, transfer_type, clean_sheets, team_id,
-             contract_role, manager_type, club_ambition, exit_type, transfer_fee)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             contract_role, manager_type, club_ambition, exit_type, transfer_fee, red_cards)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (p["age"], pos, team_row["name"], team_row["lname"], saved_tier,
              p.get("salary", 0), cur_year, cur_week,
              year, week, sm, sg, sa, ss, sga, avg_r, rn, tw, td, tl,
              c_yrs_save, pending_tt, cs, tid,
              p.get("contract_role",""), p.get("manager_type",""), p.get("club_ambition",""),
-             exit_type, transfer_fee))
+             exit_type, transfer_fee, rc_league))
 
     conn.commit()
     conn.close()
@@ -11310,7 +11354,8 @@ def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None
                       season_goals_against=0,
                       season_shots=0, season_shots_on=0, season_key_passes=0,
                       season_dribbles=0, season_blocks=0,
-                      season_pass_acc_sum=0, season_pass_acc_cnt=0)
+                      season_pass_acc_sum=0, season_pass_acc_cnt=0,
+                      season_red_cards_league=0)
         # [에이전트 익스플로잇 차단] 이적 시 개별 협상 수수료(agent_fee_rate)를
         #   리셋한다. 예전엔 약소국·저연봉 시절 헐값에 잡은 낮은 수수료율이
         #   이적 후 폭등한 연봉에도 평생 고정 적용됐다. 이제 이적하면 그 특혜가

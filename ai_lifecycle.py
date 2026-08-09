@@ -191,7 +191,7 @@ def _age_and_progress(c):
     아니다. 다만 각 확률/분포(성장 확률, 상승폭, 키스탯 가중치 등)는 원본과
     동일하게 유지했으므로 밸런스·통계적 결과는 동등하다."""
     from database import STAT_IDX, calc_ovr_from_list, OVR_RANGES
-    from constants import COUNTRY_LEAGUE_GRADE, CONTINENT_OVR_BONUS, COUNTRY_OVR_ADJ
+    from constants import CONTINENT_OVR_BONUS, COUNTRY_OVR_ADJ, get_country_league_grade, get_ovr_range
 
     # [2026-08 계측 추가, 신민용 리포트: "numpy 쓰는데도 0.71s, 예상보다
     # 느린데?"] numpy 벡터화 버전이 실제로 도는데도 docstring이 적어둔
@@ -210,8 +210,9 @@ def _age_and_progress(c):
                       cn.continent AS continent
                FROM teams t JOIN leagues l ON t.league_id = l.id
                JOIN countries cn ON l.country_id = cn.id""").fetchall():
-        grade = COUNTRY_LEAGUE_GRADE.get(r["cname"], "F")
-        rng = OVR_RANGES.get(grade, {}).get(r["tier"] or 1)
+        grade = get_country_league_grade(r["cname"])
+        # [2026-08] tier1은 COUNTRY_LEAGUE_OVR_OVERRIDE 등록국이면 그 값을 우선.
+        rng = get_ovr_range(grade, r["tier"] or 1, r["cname"])
         top = rng[1] if rng else 43
         # [버그수정 2026-07, 신민용 리포트: "이적시장 처리 중 오류: 'float'
         # object cannot be interpreted as an integer"] COUNTRY_OVR_ADJ에
@@ -475,7 +476,8 @@ def _retire_and_replace(c, year, ai_rows=None):
       _transfer_market이 각자 같은 조건의 SELECT를 또 날리던 것을 없애
       전체 스캔 횟수를 줄인다(로직/결과는 완전히 동일). None이면(단독 호출
       등 하위호환) 기존처럼 이 함수가 직접 조회한다."""
-    from constants import OVR_RANGES, COUNTRY_LEAGUE_GRADE, CONTINENT_OVR_BONUS, COUNTRY_OVR_ADJ, SUB_ROLES
+    from constants import (OVR_RANGES, CONTINENT_OVR_BONUS, COUNTRY_OVR_ADJ, SUB_ROLES,
+                           get_country_league_grade, get_ovr_range, COUNTRY_LEAGUE_OVR_OVERRIDE)
     from database import _pick_nationality, FOREIGN_QUOTA_CAP
     retired = 0
 
@@ -490,7 +492,7 @@ def _retire_and_replace(c, year, ai_rows=None):
     # 로그에서 "은퇴·세대교체" 단계가 시즌이 지날수록 조금씩 늘어나는
     # 추세를 보였음). 팀 이름도 이 아래 team_info 캐시 SELECT 한 번에
     # 같이 담아서, 이후 루프에서는 dict 조회만 하도록 고친다.
-    from data.prestige_clubs import is_prestige
+    from data.prestige_clubs import is_prestige, prestige_level, PRESTIGE_LEVEL_OVR_BONUS
     team_info = {}  # {team_id: (grade, tier, bonus, cname, continent, tname)}
     for r in c.execute(
             """SELECT t.id AS tid, t.name AS tname, t.current_tier AS tier,
@@ -498,7 +500,7 @@ def _retire_and_replace(c, year, ai_rows=None):
                FROM teams t
                JOIN leagues l ON t.league_id = l.id
                JOIN countries cn ON l.country_id = cn.id""").fetchall():
-        grade = COUNTRY_LEAGUE_GRADE.get(r["cname"], "D")
+        grade = get_country_league_grade(r["cname"])
         # [버그수정 2026-07, 신민용 리포트: "이적시장 처리 중 오류: 'float'
         # object cannot be interpreted as an integer"] COUNTRY_OVR_ADJ의
         # 소수점 조정치(대한민국 1.5, 세르비아 -1.5, 우루과이/콜롬비아/
@@ -548,10 +550,15 @@ def _retire_and_replace(c, year, ai_rows=None):
         #  좁혀서, 실제로 몇 시즌 성장해야 에이스 근처에 도달하도록 한다.
         grade, tier, _bonus, cname, continent, _tname = team_info.get(
             r["team_id"], ("D", 1, 0, "", "유럽", ""))
-        ovr_rng = OVR_RANGES.get(grade, {}).get(tier)
+        # [2026-08] tier1이 COUNTRY_LEAGUE_OVR_OVERRIDE 등록국이면 그 값을
+        # 최우선 사용 — 이미 그 나라 실측에 맞춘 값이라 대륙/국가 보정(_bonus)은
+        # 중복 적용하지 않는다(초기 시딩의 _tier_top_ovr(country=...)와 동일 원칙).
+        _is_override = tier == 1 and cname in COUNTRY_LEAGUE_OVR_OVERRIDE
+        ovr_rng = get_ovr_range(grade, tier, cname)
         if ovr_rng:
             lo, hi = ovr_rng
-            lo, hi = lo + _bonus, hi + _bonus
+            if not _is_override:
+                lo, hi = lo + _bonus, hi + _bonus
             mid = (lo + hi) // 2
             # [2026-07 버그수정, 신민용 리포트: "명문팀이 계속 강등당한다"]
             # 예전엔 항상 '하단~중간'에서 뽑고 명문팀이면 그 위에 그냥
@@ -580,6 +587,15 @@ def _retire_and_replace(c, year, ai_rows=None):
                 target = random.randint(mid, hi)
             else:
                 target = random.randint(lo, mid)
+            # [2026-08 신설] prestige_level(3/2/1) 가산 보너스 — 85/15 확률
+            # 편향과 역할을 분리한다: 85/15는 "명문팀이 좋은 세대교체를 할
+            # 가능성"을, 이 가산은 "3급/2급/1급 사이의 지속적인 질적 차이"를
+            # 담당한다(PRESTIGE_LEVEL_OVR_BONUS 정의부 주석 참고). 강등된
+            # 명문팀도 현재 tier 기준 범위(lo~hi) 위에 이 보너스만 얹힐 뿐,
+            # 원래 tier로 강제 복귀되지는 않는다 — 강등의 의미는 유지된다.
+            _plvl = prestige_level(cname, _tname)
+            if _plvl:
+                target += PRESTIGE_LEVEL_OVR_BONUS.get(_plvl, 0)
         else:
             # [버그수정 2026-07] 그 등급에 이 tier가 정의 안 돼 있으면(부수가
             # 늘었는데 표를 못 채운 경우) 고정 30~45가 아니라, 그 등급 안에서
@@ -672,7 +688,7 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None):
     """
     moved = 0
 
-    from constants import COUNTRY_LEAGUE_GRADE
+    from constants import get_country_league_grade
     from economy import LEAGUE_GRADE_RANK
 
     # [2026-08 계측 추가, 신민용 리포트: "이적시장 0.92s가 어디서 쓰이는지
@@ -724,11 +740,16 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None):
         team_tier[t["tid"]] = t["tier"]
         team_to_cid[t["tid"]] = t["cid"]
         if t["tier"] == 1:
-            grade = COUNTRY_LEAGUE_GRADE.get(t["cname"])
-            if grade:
-                rank = LEAGUE_GRADE_RANK.get(grade, 4)
-                team_grade_rank[t["tid"]] = rank
-                tier1_by_grade.setdefault(rank, []).append(t["tid"])
+            # [2026-08 grade resolution 단일화] 예전엔 COUNTRY_LEAGUE_GRADE에
+            # 명시 등록 안 된 나라는 grade=None이라 "등급 없는 나라는 제외"
+            # 방침으로 이 국제이동 풀(tier1_by_grade)에서 조용히 빠졌다.
+            # get_country_league_grade()는 항상 유효한 등급(최소 국대 등급
+            # fallback)을 반환하므로 더 이상 제외되는 나라가 없다 —
+            # 등록 안 된 나라의 tier1 팀도 국제 이동 후보군에 정상 포함된다.
+            grade = get_country_league_grade(t["cname"])
+            rank = LEAGUE_GRADE_RANK.get(grade, 4)
+            team_grade_rank[t["tid"]] = rank
+            tier1_by_grade.setdefault(rank, []).append(t["tid"])
     _tm2 = _time_tm.perf_counter()
 
     # [최적화] 팀별 선수 목록을 _retire_and_replace와 공유된 스냅샷에서 재사용
@@ -783,9 +804,26 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None):
                 for new_tid, pid, old_tid in result:
                     new_contract_end = year + random.randint(2, 4)
                     transfer_updates.append((new_tid, new_contract_end, year, pid))
-                    p_entry = next((e for e in team_players.get(old_tid, []) if e["id"] == pid), None)
+                    # [2026-08 성능 수정, 신민용 리포트: "52주차→1주차 렉"]
+                    # 예전엔 이동한 선수를 원 소속팀 리스트에서 지울 때
+                    # next()로 한 번 찾고(O(n)), 그다음 리스트 컴프리헨션으로
+                    # 그 선수만 뺀 새 리스트를 통째로 다시 만들었다(O(n) 또
+                    # 한 번) — 시즌당 이적 2.7만여 건마다 이 이중 O(n)이
+                    # 반복되며 _transfer_market 자체 시간의 상당 부분을
+                    # 차지하고 있었다(cProfile 실측: tottime 0.48s). 인덱스를
+                    # 한 번만 찾아 pop()으로 바로 제거하면 한 번의 스캔으로
+                    # 끝나고, 새 리스트를 통째로 재할당하지도 않는다 — 결과는
+                    # 동일(같은 선수가 원 소속팀 리스트에서 빠지고 목적지
+                    # 팀 리스트에 추가됨). [2026-08 추가 조사] "같은 팀을
+                    # src로 다시 뽑았을 때 mover 선정 계산을 캐싱"하는 방안도
+                    # 시도해봤으나, 실측 캐시 히트율이 0%였다(이적 시도의
+                    # 성공률이 거의 100%에 가까워 캐시가 쌓이기도 전에 거의
+                    # 매번 무효화됨) — 이득이 없어 되돌리고 이 pop() 수정만
+                    # 남긴다.
+                    _old_list = team_players.get(old_tid, [])
+                    _idx = next((i for i, e in enumerate(_old_list) if e["id"] == pid), None)
+                    p_entry = _old_list.pop(_idx) if _idx is not None else None
                     if p_entry:
-                        team_players[old_tid] = [e for e in team_players[old_tid] if e["id"] != pid]
                         p_entry["contract_end_year"] = new_contract_end
                         p_entry["last_transfer_year"] = year
                         team_players.setdefault(new_tid, []).append(p_entry)
@@ -828,11 +866,11 @@ def _estimate_ai_transfer_fee_display(p_entry, old_tid, new_tid, year, team_row_
         return None   # 너무 낮은 OVR은 계산 자체를 생략(성능/의미 둘 다 낮음)
     try:
         from economy import estimate_transfer_fee
-        from constants import COUNTRY_LEAGUE_GRADE
+        from constants import get_country_league_grade
         dst_row = team_row_by_tid.get(new_tid)
         if not dst_row:
             return None
-        grade = COUNTRY_LEAGUE_GRADE.get(dst_row["cname"], "C")
+        grade = get_country_league_grade(dst_row["cname"])
         fee = estimate_transfer_fee(grade, dst_row["tier"], p_entry["ovr"],
                                     position=p_entry.get("position"), year=year)
         if not fee or (p_entry.get("ovr", 0) < 85 and fee < 5_000_000):  # 50억(천원단위) 미만이면 스킵

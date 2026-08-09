@@ -20,7 +20,8 @@ from constants import OVR_RANGES
 # 실측 결과 이 호출 오버헤드만으로 약 1초가 소요됨을 확인 — 여기로 한 번만
 # 끌어올려서 없앤다. (동작은 완전히 동일, 그냥 매번 다시 안 할 뿐)
 from constants import (BODY_TYPE_NAMES, BODY_TYPE_WEIGHTS_BY_POS, BODY_TYPES,
-                       CONTINENT_OVR_BONUS, COUNTRY_OVR_ADJ, SUB_ROLES, get_league_grade)
+                       CONTINENT_OVR_BONUS, COUNTRY_OVR_ADJ, SUB_ROLES, get_country_league_grade,
+                       COUNTRY_LEAGUE_OVR_OVERRIDE)
 from data.prestige_clubs import is_prestige, PRESTIGE_OVR_BONUS, prestige_weight, weighted_team_order
 
 # [PyInstaller 대응] __file__ 기준 경로는 패키징 후 문제가 된다:
@@ -1173,6 +1174,21 @@ def init_db():
         # 이벤트가 겹치면 가장 최근 이벤트가 이전 것을 덮어쓴다(단순화).
         "ALTER TABLE teams ADD COLUMN momentum_type TEXT DEFAULT ''",
         "ALTER TABLE teams ADD COLUMN momentum_seasons_left INTEGER DEFAULT 0",
+        # [2026-08 신설, 신민용 요청: "레드카드 기록 추가"] 레드카드(퇴장)는
+        # 이미 경기별로 발생은 하지만(_roll_red_card/_apply_red_card_dismissal),
+        # 누적 횟수를 어디에도 세어두지 않았다 — 커리어/은퇴창에 "전체 M회
+        # (그중 리그 N회)"로 보여주기 위해 두 카운터를 추가한다.
+        # total_red_cards_league: 리그 경기에서만 받은 누적 퇴장 횟수
+        #   (career_entries.red_cards로 시즌/재직 단위로도 스냅샷됨 — 아래
+        #   career_entries 마이그레이션 참고).
+        # total_red_cards_all: 리그+컵+챔스+클럽월드컵+국가대표+승강PO를
+        #   전부 합친 커리어 통산 퇴장 횟수 ("전체 기록" 표시용).
+        "ALTER TABLE my_player ADD COLUMN total_red_cards_league INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN total_red_cards_all INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN season_red_cards_league INTEGER DEFAULT 0",
+        # career_entries(팀 재직 기간별 리그 기록)에도 같은 패턴(saves,
+        # clean_sheets 등)으로 그 재직 기간 동안의 리그 레드카드 수를 남긴다.
+        "ALTER TABLE career_entries ADD COLUMN red_cards INTEGER DEFAULT 0",
     ]:
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,
@@ -1260,10 +1276,27 @@ def init_db():
         # intl/cl 경기 조회: tournament_id+week 복합 (매 주차 process_*_week 호출마다 사용)
         "CREATE INDEX IF NOT EXISTS idx_intl_matches_tid_week ON intl_matches(tournament_id, week)",
         "CREATE INDEX IF NOT EXISTS idx_intl_entries_tid      ON intl_entries(tournament_id)",
+        "CREATE INDEX IF NOT EXISTS idx_intl_matches_my ON intl_matches(is_my)",
         "CREATE INDEX IF NOT EXISTS idx_cl_matches_tid_week   ON cl_matches(tournament_id, week)",
         "CREATE INDEX IF NOT EXISTS idx_cl_entries_tid        ON cl_entries(tournament_id)",
+        "CREATE INDEX IF NOT EXISTS idx_cl_matches_my ON cl_matches(is_my)",
         "CREATE INDEX IF NOT EXISTS idx_cup_matches_tid_week  ON cup_matches(tournament_id, week)",
         "CREATE INDEX IF NOT EXISTS idx_cup_entries_tid       ON cup_entries(tournament_id)",
+        # [2026-08 추가, 신민용 리포트: "재능 좋은 선수로 오래 뛰면 은퇴/
+        # 커리어창이 심하게 렉걸린다"] get_my_cl/cup/cwc/intl_matches()가
+        # "WHERE is_my=1"로 각 대회 매치 테이블을 조회하는데 is_my 컬럼에
+        # 인덱스가 없어 매번 테이블 전체(월드 전체 누적, cup_matches만도
+        # 12시즌 만에 12만행+)를 풀스캔했다 — 이 테이블들은 match_results와
+        # 달리 시즌마다 정리되지 않고 세이브 시작부터 계속 쌓이므로, 커리어가
+        # 길어질수록(=재능이 좋아 오래 뛸수록) 이 풀스캔 비용이 계속 커지는
+        # 구조였다. is_my는 선택도가 극히 높은 컬럼(수십만 행 중 내 경기
+        # 수백 건)이라 단일 컬럼 인덱스만으로 SEARCH로 전환됨을 확인.
+        "CREATE INDEX IF NOT EXISTS idx_cup_matches_my  ON cup_matches(is_my)",
+        # get_my_cup_matches()에서 홈/원정 엔트리를 tournament_id+team_id로
+        # 매번 개별 조회하는데(N+1), 기존엔 tournament_id만 인덱스가 있어
+        # team_id 매칭은 그 안에서 선형탐색이었다 — 복합 인덱스로 완전
+        # 인덱스 매칭이 되게 한다.
+        "CREATE INDEX IF NOT EXISTS idx_cup_entries_tid_team  ON cup_entries(tournament_id, team_id)",
         # _calc_clean_sheets: season+home_score 로 미완료 경기 필터링
         "CREATE INDEX IF NOT EXISTS idx_mr_season_score ON match_results(season, home_score)",
         # match_results: home/away team_id 조회 (클린시트, 팀 경기 조회)
@@ -1295,6 +1328,7 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_cwc_tournaments_year ON cwc_tournaments(year)",
         "CREATE INDEX IF NOT EXISTS idx_cwc_matches_tid_week ON cwc_matches(tournament_id, week)",
         "CREATE INDEX IF NOT EXISTS idx_cwc_entries_tid ON cwc_entries(tournament_id)",
+        "CREATE INDEX IF NOT EXISTS idx_cwc_matches_my ON cwc_matches(is_my)",
         # trophy_log: 승강제 처리(_process_promotion_relegation) 안에서
         # "WHERE year=? AND team_name=? AND tier=?"로 우승 중복 체크를 함 —
         # 작은 테이블이지만 저비용으로 미리 인덱싱.
@@ -2839,9 +2873,14 @@ def _star_target_ovr(tier_top, kind, el_offset=(6, 14)):
     return tier_top - random.uniform(lo, hi)  # elite
 
 
-def _tier_top_ovr(grade, tier, continent_bonus=0):
+def _tier_top_ovr(grade, tier, continent_bonus=0, country=None):
     """그 등급·tier 리그에서 도달 가능한 최고 OVR.
     continent_bonus: 대륙별 OVR 보정치 (유럽+1, 아시아-3 등)
+    country: [2026-08 신설] COUNTRY_LEAGUE_OVR_OVERRIDE에 등록된 나라면
+        tier1 상한을 그 오버라이드 값으로 대체한다(등급 문자는 그대로 두고
+        실제 스쿼드 OVR 범위만 별도 조정하는 용도). 오버라이드가 적용되면
+        continent_bonus는 더하지 않는다 — 오버라이드 값 자체가 이미 그
+        나라에 특화된 값이라, 대륙 단위 보정을 얹으면 이중 보정이 된다.
 
     [버그수정 2026-07] 예전엔 OVR_RANGES에 그 등급의 tier가 정의 안 돼
     있으면(예: SS 5부, S 6부처럼 나중에 부수가 늘었는데 표를 못 채운 경우)
@@ -2852,6 +2891,8 @@ def _tier_top_ovr(grade, tier, continent_bonus=0):
     한 부수당 일정폭(STEP)씩 자연스럽게 더 깎아 내려가도록 한다 — 등급표에
     없는 부수가 나와도(향후 부수를 더 늘려도) 항상 "한 단계 위보다는 낮고,
     급격한 단절은 없는" 값이 나온다."""
+    if country and tier == 1 and country in COUNTRY_LEAGUE_OVR_OVERRIDE:
+        return COUNTRY_LEAGUE_OVR_OVERRIDE[country][1]
     grade_ranges = OVR_RANGES.get(grade, {})
     rng = grade_ranges.get(tier)
     if rng:
@@ -2865,7 +2906,7 @@ def _tier_top_ovr(grade, tier, continent_bonus=0):
     return 45
 
 
-def _target_ovr(grade, tier, team_strength, role_idx, continent_bonus=0, prestige_bonus=0):
+def _target_ovr(grade, tier, team_strength, role_idx, continent_bonus=0, prestige_bonus=0, country=None):
     """팀 강도(0~1) + 역할 순번(0=에이스 … 10=막내)으로 목표 OVR 산출.
     [2026-07 신설] prestige_bonus: 명문팀 전용 추가 보너스. continent_bonus처럼
     _tier_top_ovr()의 top 자체에 더하면 SS등급 클램프("if grade=='SS':
@@ -2873,9 +2914,11 @@ def _target_ovr(grade, tier, team_strength, role_idx, continent_bonus=0, prestig
     보너스가 정작 필요한 EPL 등 SS등급 명문팀에서 무효화되는 것) — 그래서
     top 계산 이후, ace 산출 단계에서 따로 더한다. role_mult를 곱하기 전에
     더해서 에이스일수록 보너스를 온전히 받고 벤치로 갈수록 비례해 줄어들게
-    한다(스카우팅/인프라 우위가 에이스급에서 가장 크게 드러난다는 설계)."""
+    한다(스카우팅/인프라 우위가 에이스급에서 가장 크게 드러난다는 설계).
+    [2026-08 신설] country: COUNTRY_LEAGUE_OVR_OVERRIDE 조회용, _tier_top_ovr로
+    그대로 전달."""
     prof = TEAM_ROLE_PROFILE.get(grade, TEAM_ROLE_PROFILE["F"])
-    top = _tier_top_ovr(grade, tier, continent_bonus)
+    top = _tier_top_ovr(grade, tier, continent_bonus, country)
     # 팀 에이스 목표: 강팀일수록 리그 top에 근접
     ace = top * (prof["ace_lo"] + (1.0 - prof["ace_lo"]) * team_strength) + prestige_bonus
     role_mult = 1.0 - prof["spread"] * (role_idx / 10.0)
@@ -2938,7 +2981,7 @@ def _generate_all_ai_players(c, progress_cb=None):
             team = teams[team_idx]
             team_strength = 1.0 - (rank / (n - 1)) if n > 1 else 1.0
             # [리그등급 분리] 국대 등급(grade) 대신 리그 전용 등급 사용
-            league_grade = get_league_grade(team.get("cname", ""), team["grade"])
+            league_grade = get_country_league_grade(team.get("cname", ""), team["grade"])
             team_with_lg = dict(team)
             team_with_lg["grade"] = league_grade
             _generate_team_players(c, team_with_lg, team_strength, league_used,
@@ -2983,7 +3026,7 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
     # [2026-07 신설] 스타 슬롯(월드클래스/엘리트) 명시적 배정 — 완만한 곡선
     # (_target_ovr)만으로는 "이 팀에 월클이 몇 명"이 보장되지 않아서, 소수
     # 슬롯을 뽑아 리그 상한 근처 OVR로 직접 꽂아 넣는다.
-    tier_top = _tier_top_ovr(grade, tier, continent_bonus)
+    tier_top = _tier_top_ovr(grade, tier, continent_bonus, team.get("cname", ""))
     n_world, n_elite = _star_counts(grade, team_strength, continent_bonus, tier=tier)
     star_slot_idx = list(range(len(TEAM_POSITIONS)))
     random.shuffle(star_slot_idx)
@@ -3044,7 +3087,7 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
                 target = max(target, _elite_floor)
         else:
             target = _target_ovr(grade, tier, team_strength, role_indices[idx], continent_bonus,
-                                 prestige_bonus)
+                                 prestige_bonus, team.get("cname", ""))
             # [방어적 안전장치] SS/S 1부는 el_fill_rest=True라 이 분기(baseline)를
             # 정상적으로는 타지 않지만(전원 스타 배정), 혹시라도 남는 자리가
             # 생기면 "월클+엘리트로만 구성"이 깨지지 않도록 바닥을 걸어둔다.
