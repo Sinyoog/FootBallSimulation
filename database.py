@@ -658,6 +658,7 @@ def init_db():
         total_rounds INTEGER DEFAULT 0,
         round_counter INTEGER DEFAULT 0,
         pending_tiers TEXT DEFAULT '',
+        has_qualifying INTEGER DEFAULT 0,
         winner_team_id INTEGER DEFAULT 0,
         my_in INTEGER DEFAULT 0, my_result TEXT DEFAULT '',
         my_team_id INTEGER DEFAULT 0)""")
@@ -1093,6 +1094,12 @@ def init_db():
         "ALTER TABLE cl_matches ADD COLUMN my_absence_reason TEXT DEFAULT NULL",
         "ALTER TABLE cup_matches ADD COLUMN my_absence_reason TEXT DEFAULT NULL",
         "ALTER TABLE intl_matches ADD COLUMN my_absence_reason TEXT DEFAULT NULL",
+        # [2026-08 신설, 신민용 설계 확정: "국내컵 단계적 합류 구조 재설계"]
+        # 5부가 존재하는 나라만 "예선"(5부 단독) 단계를 갖고, 그 아래
+        # "1라운드"부터는 다시 1부터 번호를 매긴다 — has_qualifying=1이면
+        # 화면에 보이는 라운드 번호 계산에서 예선 1개 라운드분을 뺀다
+        # (cup_engine._start_next_round 참고).
+        "ALTER TABLE cup_tournaments ADD COLUMN has_qualifying INTEGER DEFAULT 0",
         # [2026-07 버그수정] cwc_matches는 CREATE TABLE에 처음부터 이 컬럼을
         # 넣어놨지만, 이미 그 전 버전으로 한 번이라도 게임을 실행해서
         # cwc_matches 테이블이 컬럼 없이 먼저 만들어진 세이브(CREATE TABLE
@@ -1333,6 +1340,31 @@ def init_db():
         # "WHERE year=? AND team_name=? AND tier=?"로 우승 중복 체크를 함 —
         # 작은 테이블이지만 저비용으로 미리 인덱싱.
         "CREATE INDEX IF NOT EXISTS idx_trophy_log_year_team ON trophy_log(year, team_name)",
+        # [2026-08 신설, 신민용 리포트: "50살까지 하니(35시즌+) 렉걸린다"]
+        # 실측(EXPLAIN QUERY PLAN)으로 확인된 풀스캔 3건 — 이 세 테이블은
+        # 시즌마다 계속 불어나기만 하고(promotion_log 49,550행/35시즌,
+        # po_matches 64,680행/35시즌, cup_matches 368,865행/35시즌) 인덱스가
+        # 하나도 없어서, 매 조회가 테이블 전체를 훑었다. 시즌이 쌓일수록
+        # 정확히 이 스캔 비용만큼 매년 조금씩 더 느려지는 구조.
+        #   - promotion_log: _infer_ambition_from_last_season 등에서
+        #     "WHERE team_name=? AND year=?"로 팀마다(이적시장 처리 중
+        #     최대 10,000+ 팀) 조회 — 실측 50회 0.176s(인덱스 없음) →
+        #     0.0005s(인덱스 후), 약 360배.
+        "CREATE INDEX IF NOT EXISTS idx_promotion_log_team_year ON promotion_log(team_name, year)",
+        #   - po_matches: process_po_week가 매주 활성 토너먼트마다(로그
+        #     기준 400개 이상) "WHERE tournament_id IN (...)"로 조회 —
+        #     실측 50회 0.123s → 0.0009s, 약 130배.
+        "CREATE INDEX IF NOT EXISTS idx_po_matches_tournament ON po_matches(tournament_id)",
+        #   - cup_matches: career_window/retire_window "전체 이력"
+        #     탭(get_full_history_extras_for_period)이 재직 기간마다
+        #     "WHERE home_team_id=? OR away_team_id=?"로 조회 — OR 조건은
+        #     복합 인덱스 하나보다 컬럼별 단일 인덱스 2개를 따로 둬야
+        #     SQLite가 MULTI-INDEX OR로 최적화한다(복합 인덱스 1개로
+        #     테스트했을 때는 여전히 풀스캔이었음). 실측 50회 1.174s
+        #     (인덱스 없음, 복합인덱스도 동일) → 0.021s(개별 인덱스 2개),
+        #     약 55배.
+        "CREATE INDEX IF NOT EXISTS idx_cup_matches_home ON cup_matches(home_team_id)",
+        "CREATE INDEX IF NOT EXISTS idx_cup_matches_away ON cup_matches(away_team_id)",
     ]:
         try: c.execute(idx)
         except sqlite3.OperationalError: pass

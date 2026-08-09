@@ -4940,8 +4940,15 @@ def generate_season_schedule(league_id, season, year, force=False):
 
     # [2026-07] 다전제(legs_for_team_count) 반영 — 팀이 적을수록 총 경기 수가
     # 왕복 2전보다 많아질 수 있어 '완비 판정' 기준도 실제 legs 기준으로 계산.
+    # [2026-08 버그수정, 신민용 리포트: "메이저 리그 사커(30팀) 경기 기록이
+    # 아예 없다"] "legs // 2" 정수나눗셈은 legs=1(25팀 이상 단판, 오늘 신설)일
+    # 때 0이 돼서 expected_matches가 0이 되고, 그 결과 아래 완비 판정이
+    # 항상 "이미 충분함"으로 오판 — 30팀 리그 전체가 일정 생성 자체를
+    # 건너뛰는 사고로 이어졌다(_generate_all_league_schedules의 동일 버그와
+    # 세트). 실수 나눗셈으로 바꾸면 기존(legs 짝수) 리그는 결과가 완전히
+    # 동일하고, legs=1만 올바르게 0.5로 계산된다.
     legs = legs_for_team_count(len(tids))
-    expected_matches = len(tids) * (len(tids) - 1) * (legs // 2)
+    expected_matches = len(tids) * (len(tids) - 1) * (legs / 2)
 
     # [중복 생성 방지] 그 시즌 일정이 이미 충분히 생성돼 있으면(상·하반기분)
     #   다시 만들지 않는다. 승강 등으로 teams 구성이 바뀐 뒤 재호출되면 옛 일정과
@@ -6206,13 +6213,21 @@ def get_full_history_extras_for_period(team_id, nationality, start_year, end_yea
     rating_sum/rating_cnt(가중평균용), saves/goals_against/clean_sheets,
     shots/shots_on/key_passes/dribbles/blocks, pass_acc_sum/pass_acc_cnt
     (평균 낼 때 나누는 용도 — 0인 경기까지 나누면 왜곡되므로 값 있는
-    경기 수로만 나눈다)."""
+    경기 수로만 나눈다), red_cards(컵+챔스+클럽월드컵+국가대표 합산
+    퇴장 횟수 — my_absence_reason='red_card'인 경기 수를 셈)."""
     conn = get_conn(); c = conn.cursor()
     avail_m = played_m = goals = assists = 0
     rating_sum = rating_cnt = 0.0
     saves = goals_against = clean_sheets = 0
     shots = shots_on = key_passes = dribbles = blocks = 0
     pass_acc_sum = 0.0; pass_acc_cnt = 0
+    # [2026-08 신설, 신민용 리포트: "전체 이력엔 그 해 컵대회/챔스/월드컵
+    # 등 대회 레드카드가 안 잡힌다"] my_absence_reason='red_card'는
+    # 퇴장이 발생한 바로 그 경기 행에 이미 저장돼 있다(cup_engine.py 등
+    # _apply_red_card_dismissal 호출부에서 my_played=1과 함께 기록) —
+    # my_player.total_red_cards_all(커리어 통산 합계)은 이미 정확했지만,
+    # '전체 이력' 표(기간별 합산)는 이 필드를 아예 안 읽고 있었다.
+    red_cards = 0
     # [2026-07 신설, 신민용 리포트: "전체 이력에 승패 표시가 사라졌어"]
     # 팀 이력의 승무패(e.wins/draws/losses)는 '내가 뛴 경기'가 아니라
     # '그 시즌 그 팀의 전적'(match_results 전체)이다 — 여기서도 같은
@@ -6246,7 +6261,7 @@ def get_full_history_extras_for_period(team_id, nationality, start_year, end_yea
             f"""SELECT m.home_team_id, m.home_score, m.away_score, m.my_goals,
                        m.my_assists, m.my_saves, m.my_rating, m.my_shots,
                        m.my_shots_on, m.my_key_passes, m.my_dribbles,
-                       m.my_blocks, m.my_pass_acc
+                       m.my_blocks, m.my_pass_acc, m.my_absence_reason
                 FROM {tbl} m JOIN {tour_tbl} t ON m.tournament_id=t.id
                 WHERE m.my_played=1 AND (m.home_team_id=? OR m.away_team_id=?)
                   AND t.year BETWEEN ? AND ?""",
@@ -6270,6 +6285,8 @@ def get_full_history_extras_for_period(team_id, nationality, start_year, end_yea
             blocks += r["my_blocks"] or 0
             if r["my_pass_acc"]:
                 pass_acc_sum += r["my_pass_acc"]; pass_acc_cnt += 1
+            if r["my_absence_reason"] == "red_card":
+                red_cards += 1
 
     if nationality:
         avail_row = c.execute(
@@ -6295,7 +6312,7 @@ def get_full_history_extras_for_period(team_id, nationality, start_year, end_yea
             """SELECT m.home, m.home_score, m.away_score, m.my_goals,
                       m.my_assists, m.my_saves, m.my_rating, m.my_shots,
                       m.my_shots_on, m.my_key_passes, m.my_dribbles,
-                      m.my_blocks, m.my_pass_acc
+                      m.my_blocks, m.my_pass_acc, m.my_absence_reason
                FROM intl_matches m JOIN intl_tournaments t ON m.tournament_id=t.id
                WHERE m.my_played=1 AND (m.home=? OR m.away=?)
                  AND t.year BETWEEN ? AND ?""",
@@ -6319,6 +6336,8 @@ def get_full_history_extras_for_period(team_id, nationality, start_year, end_yea
             blocks += r["my_blocks"] or 0
             if r["my_pass_acc"]:
                 pass_acc_sum += r["my_pass_acc"]; pass_acc_cnt += 1
+            if r["my_absence_reason"] == "red_card":
+                red_cards += 1
     conn.close()
     return {
         "matches_available": avail_m, "matches_played": played_m,
@@ -6329,6 +6348,7 @@ def get_full_history_extras_for_period(team_id, nationality, start_year, end_yea
         "dribbles": dribbles, "blocks": blocks,
         "pass_acc_sum": pass_acc_sum, "pass_acc_cnt": pass_acc_cnt,
         "wins": team_w, "draws": team_d, "losses": team_l,
+        "red_cards": red_cards,
     }
 
 
@@ -7538,6 +7558,11 @@ def _end_of_season(p, year):
 
         # [티어별 나이구간 연간 OVR 낙폭] 선택.
         #   worldclass 중 전성기 천장(talent_cap) 98+ 는 더 완만한 wc_top 곡선.
+        #   [2026-08 버그수정] 예전엔 god/superstar/amateur/untalented가
+        #   AGING_DECLINE에 키가 없어 매번 "pro"로 조용히 폴백됐다 — 이제
+        #   9단계 전부 키가 있어 이 fallback(AGING_DECLINE["pro"])은
+        #   사실상 발동 안 하지만, 혹시 모를 talent_tier 오타/구버전 세이브
+        #   대비 안전장치로 남겨둔다.
         if tier == "worldclass" and p.get("talent_cap", p.get("ovr", 0)) >= AGING_WC_TOP_OVR:
             decline_tbl = AGING_DECLINE_WC_TOP
         else:
@@ -7549,6 +7574,15 @@ def _end_of_season(p, year):
             if a0 <= new_age <= a1:
                 annual_drop = d
                 break
+        # [2026-08 신설, 신민용 리포트: "46세부터 노화가 완전히 멈춘다"]
+        # 위 테이블을 아무리 늘려놔도 "언젠가 그 나이도 넘는" 케이스가
+        # 또 나올 수 있다(은퇴 강제가 없는 내 선수는 이론상 60세, 70세도
+        # 가능) — 테이블에 정의된 마지막 구간을 넘는 나이는 그 구간 값을
+        # 계속 적용해서, 어떤 나이에서도 annual_drop이 우연히 0이 되는
+        # 경로 자체를 구조적으로 봉쇄한다(테이블을 몇 살까지 정의했든
+        # 자동으로 커버됨 — 나중에 또 상한을 깜빡 잊어도 안전).
+        if annual_drop <= 0 and decline_tbl and new_age > decline_tbl[-1][1]:
+            annual_drop = decline_tbl[-1][2]
 
         if annual_drop > 0:
             pos_mult = AGING_POS_MULT.get(pos, 1.0)
@@ -9112,10 +9146,20 @@ def _generate_all_league_schedules(season: int, year: int):
 
         # 리그별 팀 수와 다전제(legs_for_team_count) 반영한 총 경기 수를 완비 판정
         # 기준으로 사용 — 8팀 고정 56경기 가정을 제거해 리그마다 정확히 동작한다.
+        # [2026-08 버그수정, 신민용 리포트: "메이저 리그 사커(30팀) 경기 기록이
+        # 아예 없다"] legs_for_team_count가 25팀 이상 리그엔 legs=1(단판)을
+        # 반환하도록 오늘 바뀌었는데, 여기서 "legs // 2"로 정수나눗셈을 하면
+        # legs=1일 때 결과가 0이 된다 — 그러면 완비 판정 임계값 자체가
+        # n*(n-1)*0*0.8=0이 되어, sched_counts가 진짜 0건이어도 "0 < 0"은
+        # 거짓이라 이 리그가 need_league_ids에 영원히 안 들어간다(=이미
+        # 완비된 것으로 오판) → 30팀 리그 36개 전부 일정이 통째로 생성 안
+        # 되는 사고로 이어졌다. legs=2 이상(짝수)에서는 "//2"와 "/2"가 결과가
+        # 같으므로(기존 리그는 전혀 영향 없음), 실수 나눗셈으로 바꿔 legs=1도
+        # 올바르게 0.5가 나오게 한다.
         need_league_ids = [
             lid for lid, tids in teams_by_league.items()
             if len(tids) >= 2
-            and sched_counts.get(lid, 0) < len(tids) * (len(tids) - 1) * (legs_for_team_count(len(tids)) // 2) * 0.8
+            and sched_counts.get(lid, 0) < len(tids) * (len(tids) - 1) * (legs_for_team_count(len(tids)) / 2) * 0.8
         ]
         if not need_league_ids:
             conn.commit()

@@ -26,6 +26,21 @@ try:
 except ImportError:
     _HAS_NUMPY = False
 
+# ── [2026-08 신설, 신민용 요청: "명문팀 강등 스노우볼이 실제로
+#    _retire_and_replace 때문인지 시즌별로 확인하고 싶다"] ──────────
+# 평소엔 완전히 꺼진 상태(오버헤드 0)이고, DEBUG_PRESTIGE_TRACKING=True로
+# 켰을 때만 지정된 팀들의 "은퇴/신인 교체가 실제로 어떤 OVR을 만들어내는지"를
+# 시즌마다 한 줄로 콘솔에 남긴다. DB 스키마는 안 건드리고(세션 메모리만
+# 사용), game_engine.DEBUG_RELEGATION_TRACKING(강등 순간 4시점 스냅샷)과는
+# 별개 도구 — 이건 "매 시즌 은퇴자 교체가 스쿼드를 어느 쪽으로 끌고
+# 가는지"를 시계열로 보기 위한 것이라 상호보완적이다.
+DEBUG_PRESTIGE_TRACKING = False
+DEBUG_PRESTIGE_TEAMS = {
+    "토트넘 홋스퍼", "맨체스터 시티", "첼시", "아스널",
+    "AC 밀란", "레알 마드리드", "FC 바이에른 뮌헨",
+}
+
+
 # ── 나이 분포/임계값 ──────────────────────────────────────────
 _AI_MIN_AGE      = 16
 _AI_NEWBIE_AGE   = (16, 21)   # 신인 영입 연령대
@@ -100,6 +115,17 @@ def run_ai_offseason(year, verbose_log=None):
           f"shared_ai_rows조회 {_t_shared-_ta1:.2f}s | "
           f"은퇴·세대교체 {_ta2-_t_shared:.2f}s | 이적시장 {_ta3-_ta2:.2f}s | "
           f"전술변경 {_ta4-_ta3:.2f}s")
+    # [2026-08 신설, 신민용 리포트: "시즌 지날수록 은퇴·세대교체가 느려지는데
+    # 처리 대상(은퇴자 수) 자체가 느는 건지 건당 비용이 느는 건지 구분이
+    # 안 된다"] 위 [PERF] 줄은 이미 "은퇴·세대교체 X.XXs"를 찍고 있었지만
+    # 그 시간 동안 실제로 몇 명을 처리했는지가 같이 안 찍혀서, 로그만
+    # 보고는 "대상 증가에 따른 정상적인 비용 증가"인지 "건당 비용 자체가
+    # 늘어난 버그"인지 구분할 수 없었다. retired/moved는 이미 계산돼 있는
+    # 값이라 여기 한 줄만 추가하면 시즌별로 나란히 비교할 수 있다 —
+    # 로직/결과는 전혀 안 건드리고 로그만 추가.
+    print(f"[PERF-LIFECYCLE] {year}년: 은퇴/세대교체 {retired}명 · 이적 {moved}건 · "
+          f"소요시간 {_ta2-_t_shared:.3f}s"
+          + (f" ({(_ta2-_t_shared)/retired*1000:.2f}ms/명)" if retired else ""))
 
     _t_commit0 = _time_perf.perf_counter()
     conn.commit()
@@ -493,9 +519,12 @@ def _retire_and_replace(c, year, ai_rows=None):
     # 추세를 보였음). 팀 이름도 이 아래 team_info 캐시 SELECT 한 번에
     # 같이 담아서, 이후 루프에서는 dict 조회만 하도록 고친다.
     from data.prestige_clubs import is_prestige, prestige_level, PRESTIGE_LEVEL_OVR_BONUS
-    team_info = {}  # {team_id: (grade, tier, bonus, cname, continent, tname)}
+    from constants import (CLUB_STRENGTH_OVR_BONUS_K, CLUB_STRENGTH_OVR_BONUS_MIN,
+                           CLUB_STRENGTH_OVR_BONUS_MAX, CLUB_STRENGTH_OVR_BONUS_MODE)
+    team_info = {}  # {team_id: (grade, tier, bonus, cname, continent, tname, club_strength)}
     for r in c.execute(
             """SELECT t.id AS tid, t.name AS tname, t.current_tier AS tier,
+                      t.club_strength AS club_strength,
                       cn.name AS cname, cn.continent AS continent
                FROM teams t
                JOIN leagues l ON t.league_id = l.id
@@ -510,12 +539,31 @@ def _retire_and_replace(c, year, ai_rows=None):
         bonus = round(CONTINENT_OVR_BONUS.get(r["continent"], 0) + COUNTRY_OVR_ADJ.get(r["cname"], 0))
         if grade == "SS":
             bonus = min(bonus, 0)
-        team_info[r["tid"]] = (grade, r["tier"] or 1, bonus, r["cname"], r["continent"], r["tname"])
+        team_info[r["tid"]] = (grade, r["tier"] or 1, bonus, r["cname"], r["continent"], r["tname"],
+                                r["club_strength"] or 0.0)
 
     # [최적화] 이름풀 전체 1회 로드 (은퇴자마다 ORDER BY RANDOM() 방지)
     name_cache = _build_name_cache(c)
     # 팀→국가 캐시 초기화 (오프시즌 시작 시 리셋)
     _team_country_cache.clear()
+
+    # [2026-08 신설, 진단용] DEBUG_PRESTIGE_TRACKING이 켜져있으면 추적
+    # 대상 팀들의 "은퇴 전 평균 OVR"을 미리 스냅샷해둔다(비교 기준선).
+    _dbg = {}
+    if DEBUG_PRESTIGE_TRACKING:
+        _dbg_name_to_tid = {info[5]: tid for tid, info in team_info.items()
+                             if info[5] in DEBUG_PRESTIGE_TEAMS}
+        for tname, tid in _dbg_name_to_tid.items():
+            row = c.execute("SELECT AVG(ovr) v, COUNT(*) n FROM ai_players WHERE team_id=?",
+                             (tid,)).fetchone()
+            cs_row = c.execute("SELECT club_strength FROM teams WHERE id=?", (tid,)).fetchone()
+            _dbg[tid] = {
+                "name": tname, "tier": team_info[tid][1],
+                "before_avg": round(row["v"], 1) if row and row["v"] else 0.0,
+                "squad_n": row["n"] if row else 0,
+                "club_strength": round((cs_row["club_strength"] or 0.0) if cs_row else 0.0, 2),
+                "retired": 0, "new_ovrs": [],
+            }
 
     # [최적화] 이름 중복방지 캐시 + 은퇴 대상 목록을 별도 두 번 풀스캔하던 것을
     #   컬럼을 합쳐 1회 SELECT로 통합했었고(5.9만 행 전체스캔 2회 → 1회),
@@ -548,8 +596,8 @@ def _retire_and_replace(c, year, ai_rows=None):
         #  + 대륙/나라 보정. [조정] 예전엔 중간값+5까지 허용해서 신인이 데뷔부터
         #  거의 에이스급으로 들어왔다(A등급 기준 82~91). 하단~중간(82~86)으로
         #  좁혀서, 실제로 몇 시즌 성장해야 에이스 근처에 도달하도록 한다.
-        grade, tier, _bonus, cname, continent, _tname = team_info.get(
-            r["team_id"], ("D", 1, 0, "", "유럽", ""))
+        grade, tier, _bonus, cname, continent, _tname, _club_strength = team_info.get(
+            r["team_id"], ("D", 1, 0, "", "유럽", "", 0.0))
         # [2026-08] tier1이 COUNTRY_LEAGUE_OVR_OVERRIDE 등록국이면 그 값을
         # 최우선 사용 — 이미 그 나라 실측에 맞춘 값이라 대륙/국가 보정(_bonus)은
         # 중복 적용하지 않는다(초기 시딩의 _tier_top_ovr(country=...)와 동일 원칙).
@@ -623,8 +671,30 @@ def _retire_and_replace(c, year, ai_rows=None):
         # (원래 여기서 은퇴자마다 "SELECT name FROM teams WHERE id=?"를
         # 따로 날렸던 N+1 쿼리였음 — 함수 상단 주석 참고).
 
+        # [2026-08 신설, 신민용 확정: "club_strength가 경기력엔 반영되는데
+        # 정작 선수단엔 안 이어진다"] 위 PRESTIGE_LEVEL_OVR_BONUS(정적
+        # 명문 리스트 전용, 강등돼도 안 바뀌는 고정값)와 별개로, "그 세이브
+        # 안에서 실제로 지금 강한/약한 팀인지"를 나타내는 club_strength를
+        # 신인 목표 OVR에도 반영한다. 명문 리스트에 없는 팀도 실적으로
+        # club_strength를 쌓으면 똑같이 이 보정을 받는다(원래 설계 철학
+        # "명문이라서가 아니라 강해서 보호"와 일치). 1차 실험이라 기존
+        # PRESTIGE_LEVEL_OVR_BONUS는 그대로 두고 이 보정을 추가로 얹는다
+        # — 어느 쪽 효과인지 나중에 구분해서 조정할 수 있게.
+        _cs_bonus = max(CLUB_STRENGTH_OVR_BONUS_MIN,
+                         min(CLUB_STRENGTH_OVR_BONUS_MAX, _club_strength * CLUB_STRENGTH_OVR_BONUS_K))
+        if CLUB_STRENGTH_OVR_BONUS_MODE == "positive_only":
+            _cs_bonus = max(0.0, _cs_bonus)
+        elif CLUB_STRENGTH_OVR_BONUS_MODE == "off":
+            _cs_bonus = 0.0
+        target += _cs_bonus
+
         stats = _gen_stats(r["position"], target)
         new_ovr = calc_ovr(r["position"], stats)
+        # [2026-08 신설, 진단용] 추적 대상 팀이면 이번에 생성된 신인 OVR을 기록.
+        if DEBUG_PRESTIGE_TRACKING and r["team_id"] in _dbg:
+            _dbg[r["team_id"]]["retired"] += 1
+            _dbg[r["team_id"]]["new_ovrs"].append(new_ovr)
+            _dbg[r["team_id"]].setdefault("cs_bonuses", []).append(round(_cs_bonus, 2))
         new_age = random.randint(*_AI_NEWBIE_AGE)
         # [세부역할 2026-07] 새 신인은 은퇴자의 예전 세부역할을 물려받지 않고
         # 그 포지션에 맞는 SUB_ROLES 중 하나를 새로 무작위 배정한다.
@@ -655,6 +725,21 @@ def _retire_and_replace(c, year, ai_rows=None):
             f"UPDATE ai_players SET name=?, age=?, {set_clause}, ovr=?, sub_role=?, nationality=?, "
             f"contract_end_year=?, last_transfer_year=0 WHERE id=?",
             replace_updates)
+
+    # [2026-08 신설, 진단용] 추적 대상 팀들의 이번 시즌 은퇴/신인 교체 요약을
+    # 한 줄씩 찍는다 — "강등 → 낮은 OVR 신인 → 추가 강등" 루프가 실제로
+    # 발생하는지 시즌별로 눈으로 확인하기 위함.
+    if DEBUG_PRESTIGE_TRACKING:
+        for tid, d in _dbg.items():
+            n_new = len(d["new_ovrs"])
+            new_avg = round(sum(d["new_ovrs"]) / n_new, 1) if n_new else None
+            cs_bonuses = d.get("cs_bonuses", [])
+            cs_bonus_avg = round(sum(cs_bonuses) / len(cs_bonuses), 2) if cs_bonuses else None
+            print(f"[PRESTIGE-DEBUG] {year}년 {d['name']} (현재 {d['tier']}부): "
+                  f"교체전 스쿼드평균 {d['before_avg']}({d['squad_n']}명) | "
+                  f"은퇴/교체 {d['retired']}명 | 신인평균OVR {new_avg} | "
+                  f"club_strength {d['club_strength']:+.2f} | "
+                  f"신인OVR에 얹힌 cs보정 {cs_bonus_avg}")
 
     return retired
 

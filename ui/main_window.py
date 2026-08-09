@@ -160,16 +160,37 @@ class MainWindow(QMainWindow):
     # ── 갱신 ──────────────────────────────────────
 
     def refresh_all(self):
-        self._update_top()
-        self.player_panel.refresh()
-        self.center_panel.refresh()
-        self.log_panel.refresh()
+        self.refresh_light()
         # 진행(NEXT DAY) 직후 열려 있는 보조 창들을 함께 갱신한다.
         #   - 경기 일정 창 / 순위표 창 둘 다. 1주씩·하루씩 모드 모두 이 메서드를
         #     거치므로 모드와 무관하게 즉시 최신 상태가 된다.
         #   - 창이 닫혔거나 파괴됐으면 조용히 건너뛴다(비용 0).
         self._refresh_aux_window("_schedule_win")
         self._refresh_aux_window("_standings_win")
+
+    def refresh_light(self):
+        """[2026-08 신설, 신민용 리포트: "하루씩 진행이 1주씩보다 더 렉걸린다"]
+        하루씩(스텝) 모드에서 묶음(7일) 도중 매일 부르기 위한 가벼운 갱신.
+
+        원인: refresh_all()이 매번 _schedule_win/_standings_win까지 다시
+        그렸는데, 특히 순위표 창은 열려있으면 get_league_standings()를
+        리그 수만큼 재계산한다([PERF-STAND] 로그 기준 회당 0.1~0.5s+).
+        1주씩 모드는 이걸 1번만 내면 되는데, 하루씩 모드는 같은 1주를
+        진행해도 버튼을 7번 눌러 이 무거운 갱신을 7번 반복하고 있었다
+        (center_panel._on_advance_finished가 매 클릭마다 refresh_all을
+        불렀음).
+
+        그래서 갱신을 "매일 필요한 가벼운 것"과 "묶음 끝에 한 번만 하면
+        되는 무거운 것"으로 분리한다. 날짜/진행률(center_panel의 phase
+        라벨·요일 콤보 표시)·선수 패널·로그는 하루하루 실제로 바뀌므로
+        step_mode 중에도 매일 갱신해야 화면이 밀리지 않는다. 반대로
+        일정 창/순위표 창(보조 창)은 스냅샷 성격이라 묶음(1주)이 끝났을
+        때만 최신화해도 사용자 체감상 전혀 문제없다 — 실제로 1주씩
+        모드는 원래부터 그렇게 딱 1번만 갱신해왔다."""
+        self._update_top()
+        self.player_panel.refresh()
+        self.center_panel.refresh()
+        self.log_panel.refresh()
 
     def _refresh_aux_window(self, attr):
         """center_panel 에 보관된 보조 창(attr) 이 열려 있으면 refresh() 한다.

@@ -775,7 +775,7 @@ class RetireWindow(QDialog):
             stat_cols = ["골", "어시", "기회창출", "패스%", "차단", "드리블"]
         else:
             stat_cols = ["골", "어시", "슈팅", "유효", "기회창출", "드리블"]
-        cols = ["기간", "팀명", "리그", "출전"] + stat_cols + ["평균평점", "승무패"]
+        cols = ["기간", "팀명", "리그", "출전"] + stat_cols + ["평균평점", "승무패", "🟥"]
 
         visible = [e for e in entries if not _is_empty_short(e)]
         tbl = self._make_table(len(visible), cols)
@@ -849,10 +849,16 @@ class RetireWindow(QDialog):
             _tl = e.get("losses", 0) + extras["losses"]
             wdl_str = f"{_tw}승{_td}무{_tl}패"
 
+            # [2026-08 신설, 신민용 리포트: "전체 이력엔 그 해 컵대회/챔스/
+            # 월드컵 등 대회 레드카드가 안 잡힌다"] career_window.py의
+            # _club_totals_tab과 동일 수정 — 리그 전용 누적값(e["red_cards"])
+            # + 컵/챔스/클럽월드컵/국가대표 합산(extras["red_cards"]).
+            red_cards_str = str(e.get("red_cards", 0) + extras["red_cards"])
+
             vals = ([period, e.get("team_name", ""),
                      f"{e.get('league_name','')} ({e.get('tier','')}부)",
                      apps_str]
-                    + stat_vals + [avg, wdl_str])
+                    + stat_vals + [avg, wdl_str, red_cards_str])
             for j, v in enumerate(vals):
                 self._set_item(tbl, i, j, v)
         tbl.resizeColumnsToContents()
@@ -1472,13 +1478,19 @@ class RetireWindow(QDialog):
                 _apps_str3 = f"{_grand_played}/{_grand_avail}" if _grand_avail else str(_grand_played)
                 _grand_g = g + _extras3["goals"]
                 _grand_a = a + _extras3["assists"]
+                # [2026-08 신설, 신민용 리포트: "전체 이력엔 그 해 컵대회/
+                # 챔스/월드컵 등 대회 레드카드가 안 잡힌다"] 이 팀 재직기간의
+                # career_entries.red_cards(리그 전용) + extras3["red_cards"]
+                # (컵+챔스+클럽월드컵+국가대표) 합산.
+                _grand_rc = e.get("red_cards", 0) + _extras3["red_cards"]
                 if grp == "GK":
                     _grand_sv = sv + _extras3["saves"]
                     _grand_ga = ga + _extras3["goals_against"]
                     _grand_cs = cs + _extras3["clean_sheets"]
                     lines.append(f"    └ 전체 이력(리그+컵+챔스+클럽WC+국가대표): "
                                  f"출전 {_apps_str3}  {_grand_g}골 {_grand_a}어시  "
-                                 f"선방 {_grand_sv}  실점 {_grand_ga}  CS {_grand_cs}")
+                                 f"선방 {_grand_sv}  실점 {_grand_ga}  CS {_grand_cs}"
+                                 + (f"  🟥{_grand_rc}" if _grand_rc else ""))
                 else:
                     # [2026-07 신설, 신민용 요청: "테이블 컬럼에 추가해서 ㄱㄱ"]
                     # cup/cwc에도 세부 스탯이 저장되게 고쳐서 이제 실제 값 표시.
@@ -1489,7 +1501,8 @@ class RetireWindow(QDialog):
                     lines.append(f"    └ 전체 이력(리그+컵+챔스+클럽WC+국가대표): "
                                  f"출전 {_apps_str3}  {_grand_g}골 {_grand_a}어시  "
                                  f"슈팅 {_grand_sh}  유효 {_grand_sho}  "
-                                 f"기회창출 {_grand_kp}  드리블 {_grand_drb}")
+                                 f"기회창출 {_grand_kp}  드리블 {_grand_drb}"
+                                 + (f"  🟥{_grand_rc}" if _grand_rc else ""))
                 # 역할/감독/구단야망
                 ctx = []
                 if e.get("contract_role"):  ctx.append(f"역할 {e['contract_role']}")

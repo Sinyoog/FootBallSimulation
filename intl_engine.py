@@ -1344,6 +1344,23 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
     # 이 대회 본선 진출한 내 국적
     qualified_nats = [n for n in cont_nats if n in entry_names]
 
+    # [2026-08 신설, 신민용 리포트: "유로(EURO)는 예선 때 국대로 뽑혀도
+    # 본선에서 탈락되는 경우가 있다 — 다른 국제대회(월드컵)처럼 예선
+    # 통과하면 본선까지 그대로 가게 해달라"] 이 함수 안의 "본선에서 예선
+    # 결과를 신뢰할지, 다시 실력 재검증(_check_selection)할지"는 원래
+    # is_wc(월드컵인가)로만 갈렸다 — 월드컵은 예선(wc_qual)이 있으니 그
+    # 결과를 신뢰하고, 그 외(is_wc=False)는 전부 "예선 자체가 없는 대회"로
+    # 취급해 매번 재검증했다. 그런데 유로(EURO)는 나중에 자체 예선
+    # (cont_qual)이 추가됐는데도 is_wc=False라서 여전히 "예선 없는 대회"
+    # 취급을 받아, 예선을 통과한 선수가 본선 직전에 다시 재검증당해
+    # 탈락할 수 있었다. has_qualifying으로 "이 대회가 예선을 실제로
+    # 거쳤는가"를 is_wc와 분리해서 판단한다 — name_override(EURO_NAME)가
+    # 있는 게 지금은 유로뿐이라 이걸로 구분한다. qual_kind는 그 예선
+    # 기록을 실제로 조회할 때 쓸 intl_tournaments.kind 값이다(월드컵은
+    # 'wc_qual', 유로는 'cont_qual').
+    has_qualifying = is_wc or bool(name_override)
+    qual_kind = "wc_qual" if is_wc else "cont_qual"
+
     # 출전국/선발 결정
     my_nat = ""
     cand_nats = []
@@ -1360,7 +1377,7 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
             my_sel = 2
         elif committed in qualified_nats:
             _blocked_by_qual = False
-            if is_wc:
+            if has_qualifying:
                 try:
                     # [버그 수정 — 근본 원인] 예선에서 개인 재판정(_check_selection)에
                     # 떨어지면 my_nat이 ""(빈 문자열)로 저장된다(위
@@ -1383,13 +1400,19 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
                     # year-1 조회는 영원히 빈 결과만 반환해 _bqr이 항상 None이
                     # 되고, 그 결과 예선 기록 유무와 무관하게 매번 _check_selection
                     # 재검증(사실상 예선 탈락 여부를 무시)으로 새 버그가 생겼다.
+                    # [2026-08 버그수정, 신민용 리포트: "유로는 예선 통과해도
+                    # 본선에서 탈락한다"] 이 조회가 kind='wc_qual'로 고정돼
+                    # 있어서, 유로의 예선 기록(kind='cont_qual')은 찾지 못하고
+                    # 매번 "예선 기록 없음" 폴백(아래 else — 실력 재검증)으로
+                    # 빠졌다 — 사실상 유로는 예선을 봐놓고도 그 결과가 한 번도
+                    # 안 쓰인 것. qual_kind로 월드컵/유로를 구분해 조회한다.
                     _committed_cont = nat_info.get(committed, {}).get("continent", "")
                     _bqc = get_conn()
                     _bqr = _bqc.execute(
                         """SELECT my_selected, my_nat FROM intl_tournaments
-                           WHERE year=? AND kind='wc_qual' AND continent=?
+                           WHERE year=? AND kind=? AND continent=?
                            LIMIT 1""",
-                        (year, _committed_cont)).fetchone()
+                        (year, qual_kind, _committed_cont)).fetchone()
                     _bqc.close()
                     if _bqr is not None:
                         _blocked_by_qual = not (_bqr["my_selected"] == 1
@@ -1439,10 +1462,10 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
                 # 확정하면 이후로는 나이 먹어 기량이 떨어져도 평생 대표팀에
                 # 뽑히는 것처럼 보였다(신민용 지적). choose_national_team이
                 # 선택 확정 시 쓰는 것과 같은 판정 함수로 그 시점 실제
-                # 기량을 재검증한다 — 월드컵은 예선 통과로 이미 검증됐으니
-                # (재판정하면 오히려 예선 이후 짧은 폼 기복에 흔들릴 수
-                # 있어) 그대로 둔다.
-                if (not is_wc) and not _check_selection(
+                # 기량을 재검증한다 — 월드컵/유로는 예선 통과로 이미
+                # 검증됐으니(재판정하면 오히려 예선 이후 짧은 폼 기복에
+                # 흔들릴 수 있어) 그대로 둔다.
+                if (not has_qualifying) and not _check_selection(
                         p, nat_info.get(committed, {}).get("grade", "F"),
                         country=committed,
                         continent=nat_info.get(committed, {}).get("continent", "")):
@@ -1450,7 +1473,7 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
                     _age_dropped = True
                 else:
                     my_nat = committed
-                    my_sel = 1  # 예선 통과(WC) / 대륙컵 재판정 통과
+                    my_sel = 1  # 예선 통과(WC/유로) / 대륙컵 재판정 통과
         else:
             my_sel = 2
     elif pledged and pledged in cont_nats:
@@ -1463,11 +1486,11 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
             my_sel = 2   # pledge한 나라가 본선 진출 실패(예선 탈락) → 출전 없음
     else:
         # 미고정 + pledge 없음.
-        #   [월드컵] 같은 해 wc_qual 예선이 있었는데 pledge가 없다
-        #            = 예선 미선발/탈락 → 본선 출전 불가.
-        #   [대륙컵] 대륙컵은 예선이 없으므로 무조건 발탁창을 띄운다.
-        _had_wc_qual = False
-        if is_wc:
+        #   [월드컵/유로] 같은 해 예선(wc_qual/cont_qual)이 있었는데 그
+        #                 결과가 없다 = 예선 미선발/탈락 → 본선 출전 불가.
+        #   [일반 대륙컵] 예선 자체가 없으므로 무조건 발탁창을 띄운다.
+        _had_qual = False
+        if has_qualifying:
             try:
                 _cc = get_conn()
                 # [2026-07 버그수정, 신민용 리포트: "예선 탈락했는데 국제대회때
@@ -1478,17 +1501,20 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
                 # year-1 조회는 늘 빈 결과라 _had_wc_qual이 항상 False였다.
                 # 그 결과 "예선이 아예 없었던 해"와 동일하게 취급돼, 예선에서
                 # 떨어진 선수에게도 무조건(자격 재검증 없이) 발탁창이 떴다.
+                # [2026-08 버그수정, 신민용 리포트: "유로는 예선 통과해도
+                # 본선에서 탈락한다"] kind='wc_qual' 고정이라 유로의
+                # cont_qual 예선 기록은 못 찾았다 — qual_kind로 구분.
                 _qr = _cc.execute(
                     """SELECT 1 FROM intl_tournaments
-                       WHERE year=? AND kind='wc_qual' LIMIT 1""",
-                    (year,)).fetchone()
+                       WHERE year=? AND kind=? LIMIT 1""",
+                    (year, qual_kind)).fetchone()
                 _cc.close()
-                _had_wc_qual = bool(_qr)
+                _had_qual = bool(_qr)
             except Exception:
                 pass
 
         cand_nats = [n for n in cont_nats if n]
-        if is_wc and _had_wc_qual:
+        if has_qualifying and _had_qual:
             # 같은 해 예선이 있었음 → 예선에서 내 처리 결과 확인
             # my_selected=0(미선발)/2(예선탈락·미참가) → 본선 발탁창 없음
             # my_selected=1(예선출전확정) + pledge → 본선 발탁창 제시
@@ -1499,8 +1525,8 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
                 _qc = get_conn()
                 _qual_results = [dict(r) for r in _qc.execute(
                     "SELECT my_selected, my_nat FROM intl_tournaments"
-                    " WHERE year=? AND kind='wc_qual'",
-                    (year,)).fetchall()]
+                    " WHERE year=? AND kind=?",
+                    (year, qual_kind)).fetchall()]
                 _qc.close()
             except Exception:
                 pass

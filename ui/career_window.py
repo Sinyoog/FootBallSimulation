@@ -559,7 +559,7 @@ class CareerWindow(QDialog):
             stat_cols = ["골", "어시", "기회창출", "패스%", "차단", "드리블"]
         else:
             stat_cols = ["골", "어시", "슈팅", "유효", "기회창출", "드리블"]
-        cols = ["기간", "팀명", "리그", "출전"] + stat_cols + ["평균평점", "승무패"]
+        cols = ["기간", "팀명", "리그", "출전"] + stat_cols + ["평균평점", "승무패", "🟥"]
 
         visible = [e for e in entries if not _is_empty_short(e)]
         tbl = self._make_table(len(visible), cols)
@@ -654,14 +654,23 @@ class CareerWindow(QDialog):
             _tl = e.get("losses", 0) + extras["losses"]
             wdl_str = f"{_tw}승{_td}무{_tl}패"
 
+            # [2026-08 신설, 신민용 리포트: "전체 이력엔 그 해 컵대회/챔스/
+            # 월드컵 등 대회 레드카드가 안 잡힌다"] e["red_cards"]는 그
+            # 재직기간 동안의 리그 전용 누적값(career_entries.red_cards,
+            # season_red_cards_league가 재직 종료/갱신 시점에 스냅샷됨).
+            # extras["red_cards"]는 방금 위에서 추가한 컵+챔스+클럽월드컵+
+            # 국가대표 합산값 — 둘을 더하면 "팀 이력" 탭의 🟥(리그만)과
+            # 달리 이 탭 취지(모든 대회 합산)에 맞는 진짜 전체 합계가 된다.
+            red_cards_str = str(e.get("red_cards", 0) + extras["red_cards"])
+
             vals = ([period, e.get("team_name", ""),
                      f"{e.get('league_name','')} ({e.get('tier','')}부)",
                      apps_str]
-                    + stat_vals + [avg, wdl_str])
+                    + stat_vals + [avg, wdl_str, red_cards_str])
             for j, v in enumerate(vals):
                 self._set(tbl, i, j, v)
         lay.addWidget(tbl)
-        hint = QLabel("리그 + 컵대회 + 챔피언스리그 + 클럽월드컵 + 국가대표(예선 포함) 합산")
+        hint = QLabel("리그 + 컵대회 + 챔피언스리그 + 클럽월드컵 + 국가대표(예선 포함) 합산  ·  🟥은 전 대회 합산 퇴장 횟수")
         hint.setStyleSheet("color:#666;font-size:10px;padding:4px;")
         lay.addWidget(hint)
         return w

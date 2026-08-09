@@ -113,7 +113,7 @@ def list_max_tier():
     return row["mt"] if row and row["mt"] else 6
 
 
-def list_countries(continent=None, grade=None):
+def list_countries(continent=None, grade=None, grade_type="league"):
     """대륙/등급으로 필터링한 국가 목록 (등급순 정렬).
 
     [버그수정 2026-07] grade는 '클럽 리그 등급'(constants.get_league_grade)
@@ -121,7 +121,17 @@ def list_countries(continent=None, grade=None):
     그대로 표시/필터링했다. 그래서 국대는 강해도 클럽리그는 약한 나라
     (모로코·나이지리아·이란 등)가 세계기록실에서 실제보다 훨씬 높은 등급으로
     보였다. search_teams()가 이미 올바르게 처리하던 방식과 동일하게 맞춘다 —
-    전체 국가를 조회한 뒤 파이썬에서 실제 클럽 등급을 계산해 필터/정렬한다."""
+    전체 국가를 조회한 뒤 파이썬에서 실제 클럽 등급을 계산해 필터/정렬한다.
+
+    [2026-08 신설, 신민용 요청: "국가 검색 탭 등급 필터는 국가대표 등급으로
+    해달라, 리그 등급이랑 별개니까"] grade_type="league"(기본, 리그/팀/컵
+    검색 탭이 쓰는 기존 동작 그대로 유지)면 위 2026-07 수정대로 클럽 리그
+    등급을 계산해서 쓰고, grade_type="national"이면 그 계산을 건너뛰고
+    countries.grade(국가대표 등급, FIFA랭킹 기반) 원본을 그대로 쓴다 —
+    "국가 검색" 탭은 국제대회 우승 기록을 보여주는 화면이라 클럽 리그보다
+    국가대표 실력이 더 맞는 기준이다(예: 잉글랜드는 클럽 리그도 S급이라
+    이전에도 눈에 띄는 차이가 안 보였지만, 국대 전력만 강하고 클럽 리그는
+    상대적으로 약한 나라들이 이 필터에서 제자리를 찾게 된다)."""
     from constants import get_league_grade
     conn = get_conn()
     q = "SELECT id, name, flag, grade, continent FROM countries WHERE 1=1"
@@ -130,8 +140,11 @@ def list_countries(continent=None, grade=None):
         q += " AND continent=?"; params.append(continent)
     rows = [dict(r) for r in conn.execute(q, params).fetchall()]
     conn.close()
-    for r in rows:
-        r["grade"] = get_league_grade(r["name"], r["grade"])
+    if grade_type == "league":
+        for r in rows:
+            r["grade"] = get_league_grade(r["name"], r["grade"])
+    # grade_type == "national"이면 SELECT로 이미 가져온 countries.grade
+    # 원본을 그대로 둔다(변환 없음).
     if grade:
         rows = [r for r in rows if r["grade"] == grade]
     _order = {g: i for i, g in enumerate(_GRADE_ORDER)}
@@ -143,20 +156,26 @@ def list_countries(continent=None, grade=None):
 _GRADE_ORDER = ["SS", "S", "A", "B", "C", "D", "E", "F"]
 
 
-def list_grades():
-    """실제 존재하는 '클럽 리그' 등급 목록을 정해진 순서(SS>S>A>...)로 반환.
+def list_grades(grade_type="league"):
+    """실제 존재하는 등급 목록을 정해진 순서(SS>S>A>...)로 반환.
     [버그수정 2026-07] countries.grade(국대 등급) 원본이 아니라
     get_league_grade()로 계산한 클럽 리그 등급 기준으로 바꿈 — 화면에
-    실제로 표시/필터링되는 값과 일치시키기 위함."""
+    실제로 표시/필터링되는 값과 일치시키기 위함.
+    [2026-08 신설] grade_type="national"이면 반대로 countries.grade 원본
+    (국가대표 등급) 기준 — list_countries()의 grade_type과 항상 짝 맞춰
+    쓴다(필터 드롭다운 목록과 실제 필터링 기준이 다르면 안 되므로)."""
     from constants import get_league_grade
     conn = get_conn()
     rows = conn.execute("SELECT name, grade FROM countries").fetchall()
     conn.close()
-    existing = {get_league_grade(r["name"], r["grade"]) for r in rows}
+    if grade_type == "national":
+        existing = {r["grade"] for r in rows if r["grade"]}
+    else:
+        existing = {get_league_grade(r["name"], r["grade"]) for r in rows}
     return [g for g in _GRADE_ORDER if g in existing]
 
 
-def search_leagues(continent=None, country_id=None, name_query=None, grade=None):
+def search_leagues(continent=None, country_id=None, name_query=None, grade=None, tier=None):
     """조건에 맞는 리그 목록. 이제 모든 리그가 시즌 시작 시 일정을 미리 받고
     매주 실시간으로 결과가 채워지므로, 예전의 '이번 시즌 시뮬 여부(simulated)'
     배지는 더 이상 의미가 없어 반환하지 않는다.
@@ -165,6 +184,8 @@ def search_leagues(continent=None, country_id=None, name_query=None, grade=None)
     검색하면 리버풀이 뛰고 있는 리그(잉글랜드 프리미어리그)가 검색 결과에
     뜬다. 이때 결과 dict의 "matched_team"에 실제로 일치한 팀명을 담아, 화면에서
     "왜 이 리그가 나왔는지"(팀명 때문인지) 알 수 있게 한다.
+
+    [2026-08 신설, 신민용 요청] tier — 1부~N부로 좁히는 필터. None이면 전체.
 
     [버그수정 2026-07] grade 표시/필터를 countries.grade(국가대표 등급)
     그대로 쓰고 있었는데, 이건 search_teams()의 주석에도 명시돼 있듯 '클럽
@@ -204,6 +225,8 @@ def search_leagues(continent=None, country_id=None, name_query=None, grade=None)
             q += " AND cn.continent=?"; params.append(continent)
         if country_id:
             q += " AND cn.id=?"; params.append(country_id)
+        if tier:
+            q += " AND l.tier=?"; params.append(tier)
         if grade_country_ids is not None:
             q += " AND cn.id IN (%s)" % ",".join("?" * len(grade_country_ids))
             params += grade_country_ids
@@ -221,6 +244,8 @@ def search_leagues(continent=None, country_id=None, name_query=None, grade=None)
             q += " AND cn.continent=?"; params.append(continent)
         if country_id:
             q += " AND cn.id=?"; params.append(country_id)
+        if tier:
+            q += " AND l.tier=?"; params.append(tier)
         if grade_country_ids is not None:
             q += " AND cn.id IN (%s)" % ",".join("?" * len(grade_country_ids))
             params += grade_country_ids
@@ -233,6 +258,17 @@ def search_leagues(continent=None, country_id=None, name_query=None, grade=None)
     _order = {g: i for i, g in enumerate(_GRADE_ORDER)}
     rows.sort(key=lambda r: (_order.get(r["grade"], 99), r["country"], r["tier"]))
     return rows
+
+
+def list_league_tiers():
+    """실제 DB에 존재하는 리그 티어(부수) 목록을 오름차순으로 반환 —
+    [2026-08 신설, 신민용 요청] 리그 검색 탭에 "1부~N부" 필터를 만들기
+    위함. 나라마다 리그 깊이가 달라(4부까지인 나라, 7부까지인 나라 등)
+    고정된 상수 대신 실제 존재하는 값만 조회해서 필터 목록을 만든다."""
+    conn = get_conn()
+    rows = conn.execute("SELECT DISTINCT tier FROM leagues ORDER BY tier").fetchall()
+    conn.close()
+    return [r["tier"] for r in rows if r["tier"]]
 
 
 # ─────────────────────────────────────────
@@ -612,7 +648,14 @@ def get_cup_tournament_detail(tournament_id):
     # [2026-07 신설, 신민용 요청] 팀명 옆에 "(몇부)"를 붙이되, 지금 소속이 아니라
     # 이 컵대회 당시(cup_entries.tier — 참가 시점에 고정 저장돼 이후 강등/
     # 승격과 무관) 티어를 보여준다.
-    name_by_id = {r["team_id"]: f"{r['team_name']} ({r['tier']}부)" for r in entry_rows}
+    # [2026-08 버그수정, 신민용 리포트: "대진표에서 팀명 복사하면 (3부)까지
+    # 같이 복사된다"] 예전엔 "(N부)"를 team_name 문자열에 미리 구워넣어서
+    # (f"{team_name} ({tier}부)") UI가 복사할 때 순수 팀명만 따로 꺼낼 방법이
+    # 없었다 — team_name은 순수하게 두고 tier를 별도 필드로 분리해서, UI가
+    # 화면 표시는 "팀명 (N부)"로 조합하되 복사는 team_name만 쓸 수 있게 한다
+    # (world_browser_window._build_stage_box가 CL/CWC의 country와 동일한
+    # 방식으로 tier를 접미사 취급).
+    name_by_id = {r["team_id"]: (r["team_name"], r["tier"]) for r in entry_rows}
 
     by_round = {}
     order = []
@@ -621,10 +664,12 @@ def get_cup_tournament_detail(tournament_id):
         if key not in by_round:
             by_round[key] = []
             order.append(key)
+        _hn, _ht = name_by_id.get(m["home_team_id"], ("?", None))
+        _an, _at = name_by_id.get(m["away_team_id"], ("?", None))
         by_round[key].append({
-            "home_info": {"team_name": name_by_id.get(m["home_team_id"], "?"),
+            "home_info": {"team_name": _hn, "tier": _ht,
                           "flag": "", "team_id": m["home_team_id"]},
-            "away_info": {"team_name": name_by_id.get(m["away_team_id"], "?"),
+            "away_info": {"team_name": _an, "tier": _at,
                           "flag": "", "team_id": m["away_team_id"]},
             "home_score": m["home_score"], "away_score": m["away_score"],
             "pso_winner": m["pso_winner"],
@@ -962,33 +1007,105 @@ def get_region_cup_history(name=None, limit=100):
 # 늘어나도(새 kind 값 추가) 이 쿼리들은 코드 수정 없이 자동으로 포함한다
 # — 화면 라벨만 constants.INTL_TOURNAMENT_KIND_LABELS에 추가하면 됨.
 
+def _effective_kind(kind, name):
+    """[2026-08 신설, 신민용 요청: "우승 기록에 유로/대륙컵 필터를 따로
+    만들어달라"] DB상 유로(EURO)는 일반 대륙컵과 똑같이 kind='continent'로
+    저장된다(intl_engine._create_one_tournament — 이름만 EURO_NAME으로
+    다르게 줌, 조편성/선발 로직은 100% 동일하다는 설계 의도). 그래서
+    kind 하나만으로는 "이 우승이 유로인지 일반 대륙컵(네이션스컵)인지"
+    구분이 안 됐다 — 이름까지 같이 봐서 필터/집계용 "유효 종류"를
+    따로 판정한다. world/region은 그대로, continent만 이름으로 갈린다."""
+    from constants import EURO_NAME
+    if kind == "continent" and name == EURO_NAME:
+        return "euro"
+    return kind
+
+
+# [2026-08 신설] 필터 콤보에 쓸 "대회 종류" 선택지 — 표시 라벨과 내부
+# effective_kind 값 매핑. 순서대로 콤보박스에 나열된다.
+COUNTRY_TROPHY_KIND_OPTIONS = [
+    ("월드컵", "world"),
+    ("유로", "euro"),
+    ("대륙컵", "continent"),
+    ("지역컵", "region"),
+]
+
+
+# [2026-08 신설] 순위 필터(우승/준우승/3위/4위)에서 쓰는 표시 라벨.
+COUNTRY_PLACEMENT_RANK_OPTIONS = [
+    ("🥇 우승", 1),
+    ("🥈 준우승", 2),
+    ("🥉 3위", 3),
+    ("4위", 4),
+]
+
+
+def get_all_countries_placement_counts():
+    """국가명 → {순위(1~4): 총 횟수} 매핑을 한 번에 집계.
+    [2026-08 신설, 신민용 요청: "1등만 필터되는데 1~4등까지 나눠서 필터하고
+    싶다"] 기존 get_all_countries_trophy_counts()는 intl_tournaments.winner
+    컬럼만 보므로 우승(1위)만 잡힌다 — 준우승/3위/4위는 결승·3·4위전
+    매치(F/TP stage)를 직접 봐야 하므로 _batch_placements를 재사용해서
+    월드컵/대륙컵/유로/지역컵을 통틀어 전 대회를 한 번에 훑는다.
+    [성능] 나라 수(200+)만큼 개별 조회하지 않고, 완료된 전체 대회 목록을
+    한 번만 가져와 _batch_placements(이미 배치 쿼리 1회로 처리)에 넘긴다."""
+    conn = get_conn()
+    tids = [r["id"] for r in conn.execute(
+        """SELECT id FROM intl_tournaments
+           WHERE status='done' AND winner != ''
+             AND kind IN ('world','continent','region')""").fetchall()]
+    placements = _batch_placements(tids, conn)
+    conn.close()
+    out = {}
+    for pl in placements.values():
+        for rank, key in ((1, "winner"), (2, "runner_up"), (3, "third"), (4, "fourth")):
+            nat = pl.get(key)
+            if not nat:
+                continue
+            out.setdefault(nat, {})[rank] = out.setdefault(nat, {}).get(rank, 0) + 1
+    return out
+
+
 def get_all_countries_trophy_counts():
-    """국가명 → {kind: 우승횟수} 매핑을 한 번에 집계.
+    """국가명 → [{kind, name, n}, ...] 매핑을 한 번에 집계 — (kind, name)
+    조합별로 나눠서, 대회명이 다르면(예: 유로 vs 유럽 네이션스컵) 별도
+    항목으로 잡히게 한다.
     [성능] 국가 검색 리스트를 채울 때 국가마다 개별 쿼리하면 국가 수(200+)
     만큼 왕복이 생기므로, GROUP BY 한 번으로 전체를 미리 다 구해둔다."""
     conn = get_conn()
     rows = conn.execute(
-        """SELECT winner, kind, COUNT(*) as n FROM intl_tournaments
-           WHERE status='done' AND winner != '' GROUP BY winner, kind""").fetchall()
+        """SELECT winner, kind, name, COUNT(*) as n FROM intl_tournaments
+           WHERE status='done' AND winner != '' GROUP BY winner, kind, name""").fetchall()
     conn.close()
     out = {}
     for r in rows:
-        out.setdefault(r["winner"], {})[r["kind"]] = r["n"]
+        out.setdefault(r["winner"], []).append(
+            {"kind": r["kind"], "name": r["name"], "n": r["n"],
+             "effective_kind": _effective_kind(r["kind"], r["name"])})
     return out
 
 
 def get_country_trophy_summary(country_name):
-    """한 국가의 kind별 우승 횟수 요약(월드컵 N회 / 대륙컵 N회 / ...).
-    반환: [{"kind":, "titles":, "label":}, ...] 우승 많은 순."""
-    from constants import INTL_TOURNAMENT_KIND_LABELS as _LBL
+    """한 국가의 (kind,name)별 우승 횟수 요약(대회명 그대로 노출 —
+    예: "남북미 대륙컵 1회", "유로(EURO) 2회"). 대회명이 대륙/대회
+    종류에 따라 고정이라(CONF_CUP_NAME 등) 이름 기준으로 묶어도 항상
+    하나의 실제 대회를 가리킨다.
+    반환: [{"kind":, "name":, "titles":, "label":, "effective_kind":}, ...]
+    우승 많은 순."""
+    from constants import INTL_TOURNAMENT_KIND_GLYPHS, INTL_TOURNAMENT_KIND_FALLBACK_LABEL
     conn = get_conn()
     rows = conn.execute(
-        """SELECT kind, COUNT(*) as titles FROM intl_tournaments
-           WHERE status='done' AND winner=? GROUP BY kind
+        """SELECT kind, name, COUNT(*) as titles FROM intl_tournaments
+           WHERE status='done' AND winner=? GROUP BY kind, name
            ORDER BY titles DESC""", (country_name,)).fetchall()
     conn.close()
-    return [{"kind": r["kind"], "titles": r["titles"],
-              "label": _LBL.get(r["kind"], r["kind"])} for r in rows]
+    out = []
+    for r in rows:
+        ek = _effective_kind(r["kind"], r["name"])
+        glyph = INTL_TOURNAMENT_KIND_GLYPHS.get(ek, INTL_TOURNAMENT_KIND_FALLBACK_LABEL)
+        out.append({"kind": r["kind"], "name": r["name"], "titles": r["titles"],
+                    "label": f"{glyph} {r['name']}", "effective_kind": ek})
+    return out
 
 
 def get_country_title_list(country_name, limit=200):
@@ -1150,6 +1267,7 @@ def get_country_tournament_results(country_name, limit=200):
         # 보장한다 — 데이터 자체가 비정상인 레거시 행이라도 화면은 안 깨지게.
         out.append({"id": t["id"], "year": t["year"],
                      "kind": t["kind"] or "?",
+                     "effective_kind": _effective_kind(t["kind"] or "", t["name"] or ""),
                      "name": _country_result_name(t),
                      "result": result, "tier": tier,
                      "record": record_str})
@@ -1171,12 +1289,17 @@ def _country_result_name(t):
     return name
 
 
-def search_countries(name_query=None, continent=None, grade=None):
+def search_countries(name_query=None, continent=None, grade=None, grade_type="national"):
     """list_countries()에 이름 검색만 얹은 래퍼 — 팀 검색 탭의 search_teams()와
     같은 UX(대륙/등급 필터 + 자유 검색어)를 국가 검색 탭에도 제공하기 위함.
     기존 list_countries() 시그니처/동작은 그대로 둬서 다른 호출부(리그 검색
-    탭의 국가 콤보 등)에 영향이 없다."""
-    rows = list_countries(continent=continent, grade=grade)
+    탭의 국가 콤보 등)에 영향이 없다.
+
+    [2026-08 신설, 신민용 요청] 이 함수만 grade_type 기본값을 "national"로
+    둔다 — search_countries()는 오직 "국가 검색"(국제대회 우승 기록) 탭
+    에서만 쓰이는데, 그 화면은 클럽 리그가 아니라 국가대표 실력이 맞는
+    기준이라 list_countries()의 기본값(league)과 다르게 오버라이드한다."""
+    rows = list_countries(continent=continent, grade=grade, grade_type=grade_type)
     if name_query:
         q = name_query.strip().lower()
         rows = [r for r in rows if q in r["name"].lower()]

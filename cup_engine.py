@@ -95,10 +95,16 @@ CUP_NAME_BY_COUNTRY = {
 # 키로 쓴다 — 딕셔너리에 없는 나라는 DEFAULT_CUP_MAX_TIER를 적용하고,
 # 그 나라에 실제로 존재하는 티어가 상한보다 적으면(예: 3부까지만 있는데
 # 상한이 4부) 있는 만큼만 자연히 참가한다(별도 처리 불필요).
+# [2026-08 재설계, 신민용 확정: "6부는 컵 대회도 나가지 못하는거고 5부부터가
+# 시작"] 이건 나라별 커스터마이징(잉글랜드=넓게, 이탈리아=좁게)과는 별개로
+# 절대 넘을 수 없는 전역 상한이다 — CUP_MAX_TIER_BY_COUNTRY에 5보다 큰 값이
+# 있어도(예전 잉글랜드=10) 5로 잘린다. _cup_max_tier_for_country()에서
+# min(5, ...)로 강제한다.
 DEFAULT_CUP_MAX_TIER = 5
+CUP_ABSOLUTE_MAX_TIER = 5   # 6부 이상은 어느 나라든 컵 자체에 못 나감
 
 CUP_MAX_TIER_BY_COUNTRY = {
-    "잉글랜드": 10,   # FA컵 — 사실상 전 리그+비리그급까지 열려있는 오픈컵
+    "잉글랜드": 10,   # FA컵 — 실제론 훨씬 개방적이지만 CUP_ABSOLUTE_MAX_TIER(5)로 잘림
     "스페인": 4,      # 코파 델 레이 — 1ª/2ª RFEF(3~4부)까지
     "독일": 4,        # DFB-포칼 — 3부(리가)+지역컵 선발 4부팀까지, 전체 개방은 아님
     "이탈리아": 3,    # 코파 이탈리아 — 세리에 A/B/C 일부까지로 제한적
@@ -107,12 +113,14 @@ CUP_MAX_TIER_BY_COUNTRY = {
 
 def _cup_max_tier_for_country(country_id):
     """이 나라 컵대회가 참가시키는 최대 하부리그 티어(그 이하 부수는 컵에
-    합류하지 않음). CUP_MAX_TIER_BY_COUNTRY에 없으면 DEFAULT_CUP_MAX_TIER."""
+    합류하지 않음). CUP_MAX_TIER_BY_COUNTRY에 없으면 DEFAULT_CUP_MAX_TIER,
+    있어도 CUP_ABSOLUTE_MAX_TIER(5)를 절대 못 넘는다."""
     conn = get_conn()
     row = conn.execute("SELECT name FROM countries WHERE id=?", (country_id,)).fetchone()
     conn.close()
     cname = row["name"] if row else ""
-    return CUP_MAX_TIER_BY_COUNTRY.get(cname, DEFAULT_CUP_MAX_TIER)
+    return min(CUP_ABSOLUTE_MAX_TIER,
+               CUP_MAX_TIER_BY_COUNTRY.get(cname, DEFAULT_CUP_MAX_TIER))
 
 
 def _cup_name_for_country(country_id):
@@ -377,7 +385,30 @@ def start_domestic_cup(year, season):
 def _start_domestic_cup_for_country(year, cid, my_cid, add_log):
     """한 나라의 컵대회 1개를 개막한다(대진 첫 라운드까지). start_domestic_cup()의
     국가별 반복 본체 — 예전 start_domestic_cup()의 내용을 그대로 country_id
-    파라미터화한 것."""
+    파라미터화한 것.
+
+    [2026-08 전면 재설계, 신민용 설계 확정: "국내컵 단계적 합류 구조가
+    잘못됐다"] 예전엔 참가 티어 전부(예: 5,4,3,2,1)를 한 칸씩 순서대로
+    pending_tiers에 넣고, 맨 처음 팝되는 티어(5부만 있는 라운드)를 그냥
+    "1라운드"라고 불렀다 — 그러면 "5부부터 시작해서 4부가 1라운드에 합류"
+    하는 게 아니라 "5부 자체가 1라운드"가 되어버려 실제 설계 의도보다
+    한 칸씩 밀려 있었다. 이제:
+      - 그 나라의 최하위 참가 티어가 5부면: 5부 단독 라운드를 "예선"이라는
+        별도 이름으로 분리하고, 그 다음(4부 합류)부터 "1라운드"로 다시
+        번호를 매긴다(cup_tournaments.has_qualifying=1로 표시).
+      - 4부/3부/2부까지만 있는 나라는 예선 없이 그 최하위 티어 자체가
+        "1라운드"다.
+      - 1부는 한 라운드에 전원 합류하지 않는다 — 그 시즌 그 대륙
+        챔피언스리그에 참가하지 않는 일반 1부 팀들이 먼저 합류하고
+        ("1a"), 챔피언스리그 참가팀은 그 다음 라운드에 더 늦게 합류한다
+        ("1b") — 실제 FA컵에서 유럽대항전 참가 빅클럽이 더 늦게 합류하는
+        것과 같은 취지. pending_tiers 문자열에 정수가 아니라 "1a"/"1b"
+        같은 태그를 넣어 표현하고, _pop_next_tier/_tier_teams가 이 태그를
+        해석한다.
+      - 5부~2부는 예전처럼 그 라운드에서 전원(존재하는 팀 전부) 합류하고,
+        숫자가 대진에 안 맞아떨어질 때만(홀수 등) 부전승으로 처리한다 —
+        "일부만 뽑아서 넣는" 별도 선발 규칙은 두지 않는다(신민용 확정).
+    """
     conn = get_conn()
     tiers = [r["tier"] for r in conn.execute(
         "SELECT DISTINCT tier FROM leagues WHERE country_id=? ORDER BY tier DESC",
@@ -386,13 +417,22 @@ def _start_domestic_cup_for_country(year, cid, my_cid, add_log):
     if not tiers:
         return
 
-    # [2026-08 신설, 신민용 요청] 이 나라 컵대회의 참가 상한 티어를 적용 —
-    # 그 나라에 리그가 7부까지 있어도 컵은 4부까지만 참가하는 식으로,
-    # "존재하는 티어"와 "컵에 참가하는 티어"를 분리한다.
+    # [2026-08] 이 나라 컵대회의 참가 상한 티어를 적용 — 그 나라에 리그가
+    # 7부까지 있어도 컵은 4부까지만 참가하는 식으로, "존재하는 티어"와
+    # "컵에 참가하는 티어"를 분리한다. CUP_ABSOLUTE_MAX_TIER(5)를 항상
+    # 절대 상한으로 겸한다(_cup_max_tier_for_country 안에서 처리됨).
     _max_tier = _cup_max_tier_for_country(cid)
     tiers = [t for t in tiers if t <= _max_tier]
     if not tiers:
         return
+
+    # tiers는 여기서 내림차순(예: [5,4,3,2,1]) — 가장 낮은 리그(숫자 큼)가
+    # 맨 앞. 1부는 join_queue에서 빼고 맨 끝에 "1a","1b" 두 물결로 대체한다.
+    has_qualifying = 1 if tiers[0] == 5 else 0   # 최하위 참가 티어가 5부일 때만 예선
+    join_queue = [str(t) for t in tiers if t != 1]
+    if 1 in tiers:
+        join_queue += ["1a", "1b"]
+    pending_tiers = ",".join(join_queue)
 
     from game_engine import get_player
     p = get_player()
@@ -402,41 +442,71 @@ def _start_domestic_cup_for_country(year, cid, my_cid, add_log):
 
     conn = get_conn(); c = conn.cursor()
     c.execute("""INSERT INTO cup_tournaments(year, country_id, name, status,
-                 total_rounds, round_counter, pending_tiers, my_in, my_team_id)
-                 VALUES(?,?,?,?,?,?,?,?,?)""",
-              (year, cid, cup_name, "active", len(tiers), 0,
-               ",".join(str(x) for x in tiers), my_in, my_tid))
+                 total_rounds, round_counter, pending_tiers, has_qualifying,
+                 my_in, my_team_id)
+                 VALUES(?,?,?,?,?,?,?,?,?,?)""",
+              (year, cid, cup_name, "active", len(join_queue), 0,
+               pending_tiers, has_qualifying, my_in, my_tid))
     conn.commit(); conn.close()
 
     if cid == my_cid:
-        add_log(f"🏆 {year}년 {cup_name} 개막 (참가 리그 {len(tiers)}부까지)", "event")
+        add_log(f"🏆 {year}년 {cup_name} 개막 (참가 리그 {tiers[0]}부까지)", "event")
     t = get_cup_tournament(year, cid)
     _start_next_round(t)
 
 
 def _pop_next_tier(t):
-    """pending_tiers에서 다음 합류 티어를 꺼내고 DB에서 제거."""
+    """pending_tiers에서 다음 합류 티어를 꺼내고 DB에서 제거. 값은 "5"처럼
+    순수 티어 숫자거나(5~2부, 그 티어 전원 합류), "1a"/"1b"처럼 1부를
+    두 물결로 나눈 태그일 수 있다(_tier_teams가 해석) — 반환값은 그대로
+    문자열 토큰이다(호출부에서 필요할 때 int로 변환)."""
     pt = t.get("pending_tiers") or ""
     if not pt:
         return None
     parts = [x for x in pt.split(",") if x]
     if not parts:
         return None
-    next_tier = int(parts[0])
+    next_token = parts[0]
     rest = ",".join(parts[1:])
     conn = get_conn()
     conn.execute("UPDATE cup_tournaments SET pending_tiers=? WHERE id=?", (rest, t["id"]))
     conn.commit()
     conn.close()
-    return next_tier
+    return next_token
 
 
-def _tier_teams(country_id, tier):
+def _tier_teams(country_id, tier_token, year=None):
+    """이 나라·이 티어(또는 1부 물결)에서 컵에 합류할 팀 목록을 반환한다.
+    tier_token은 "5"~"2" 같은 순수 티어 숫자거나, "1a"(챔피언스리그
+    비참가 1부)/"1b"(챔피언스리그 참가 1부) 태그다.
+
+    [2026-08 신설, 신민용 설계 확정: "1부는 일부만 먼저 합류하고 빅클럽은
+    더 늦게"] 이 시즌 그 대륙 챔피언스리그 출전권을 이미 받은 팀(cl_entries)
+    은 "1b"로 분류해 한 라운드 더 늦게 합류시킨다 — 컵 초반에 하위리그
+    팀이 챔스 나가는 빅클럽부터 만나는 비현실성을 줄이기 위함. 이 시점
+    (컵 4라운드 전후, 시즌 20주차 이후)엔 챔스 출전팀이 이미 확정돼 있어
+    (챔스 조 편성은 6~7주차) 안전하게 조회할 수 있다."""
     from game_engine import _team_avg_ovr
     conn = get_conn(); c = conn.cursor()
-    rows = c.execute(
-        """SELECT t.id AS tid, t.name AS tname FROM teams t JOIN leagues l ON t.league_id=l.id
-           WHERE l.country_id=? AND l.tier=?""", (country_id, tier)).fetchall()
+
+    if tier_token in ("1a", "1b"):
+        rows = c.execute(
+            """SELECT t.id AS tid, t.name AS tname FROM teams t JOIN leagues l ON t.league_id=l.id
+               WHERE l.country_id=? AND l.tier=1""", (country_id,)).fetchall()
+        cl_team_ids = set()
+        if year is not None:
+            cl_team_ids = {r["team_id"] for r in c.execute(
+                """SELECT DISTINCT ce.team_id FROM cl_entries ce
+                   JOIN cl_tournaments ct ON ce.tournament_id=ct.id
+                   WHERE ct.year=?""", (year,)).fetchall()}
+        want_cl = (tier_token == "1b")
+        rows = [r for r in rows if (r["tid"] in cl_team_ids) == want_cl]
+    else:
+        tier = int(tier_token)
+        rows = c.execute(
+            """SELECT t.id AS tid, t.name AS tname FROM teams t JOIN leagues l ON t.league_id=l.id
+               WHERE l.country_id=? AND l.tier=?""", (country_id, tier)).fetchall()
+
     out = [(r["tid"], r["tname"], _team_avg_ovr(c, r["tid"])) for r in rows]
     conn.close()
     return out
@@ -489,15 +559,19 @@ def _start_next_round(t):
         (tid,)).fetchall()]
     conn.close()
 
-    next_tier = _pop_next_tier(t)
+    next_token = _pop_next_tier(t)
+    # [2026-08 신설] cup_entries.tier는 INTEGER라 "1a"/"1b" 태그를 그대로
+    # 못 넣는다 — 저장용 실제 티어 숫자(둘 다 1부)와, 라운드 로직/이름
+    # 판정에 쓰는 원본 토큰을 분리한다.
+    next_tier_num = None if next_token is None else int(next_token[0])
     pool = [(s["team_id"], s["team_name"], 0.0) for s in survivors]
-    if next_tier is not None:
-        new_teams = _tier_teams(t["country_id"], next_tier)
+    if next_token is not None:
+        new_teams = _tier_teams(t["country_id"], next_token, year=t.get("year"))
         conn = get_conn(); c = conn.cursor()
         if new_teams:
             c.executemany("""INSERT INTO cup_entries(tournament_id, team_id, team_name, tier, ovr)
                          VALUES(?,?,?,?,?)""",
-                          [(tid, team_id, team_name, next_tier, ovr) for team_id, team_name, ovr in new_teams])
+                          [(tid, team_id, team_name, next_tier_num, ovr) for team_id, team_name, ovr in new_teams])
         conn.commit(); conn.close()
         pool = pool + [(x[0], x[1], x[2]) for x in new_teams]
 
@@ -509,7 +583,7 @@ def _start_next_round(t):
     pool_entering = len(pool)   # 이 라운드에 '참가하는' 팀 수 (라운드 이름 기준 — 예: 16강=16팀 참가)
     random.shuffle(pool)
     byes = []
-    if next_tier is None:
+    if next_token is None:
         # [2026-08 신설] 더 이상 합류할 부수가 없는 순수 토너먼트 단계 —
         # _cup_bye_count로 표준 강수(8/16/32/64)에 맞춰 부전승을 몰아준다.
         # (예선 단계는 예전처럼 그냥 홀수면 1명만 — 억지로 안 맞춤)
@@ -524,12 +598,24 @@ def _start_next_round(t):
     my_tid = p_row["current_team_id"] if p_row else 0
 
     round_counter = t["round_counter"]
-    # [버그 수정] '결승'은 2팀이 붙어서 1팀이 남는 라운드인데, 예전엔 이
-    # 라운드가 끝난 뒤 '남는 팀 수'로 이름을 붙여서 4팀이 붙는 라운드가
-    # '결승'으로, 진짜 결승(2팀)은 이름 없는 'N라운드'로 밀려나는 오류가
-    # 있었다. 실제 관례대로 '이 라운드에 들어오는 팀 수' 기준으로 고쳤다
-    # (16강=16팀 참가, 결승=2팀 참가).
-    rname = _round_name(pool_entering, round_counter, is_pure_ko=(next_tier is None))
+    # [2026-08 신설, 신민용 설계 확정: "예선(5부 단독)은 별도 이름, 그
+    # 다음부터 1라운드로 다시 번호 매김"] has_qualifying=1인 대회는
+    # round_counter==0인 딱 한 번(그 대회의 첫 라운드 = pending_tiers
+    # 맨 앞이 "5"였던 그 라운드)만 "예선"으로 고정하고, 그 이후 라운드는
+    # 화면 번호에서 예선 몫(1칸)을 빼서 1라운드부터 다시 세게 한다 —
+    # 안 그러면 "예선"이 라운드 번호 하나를 잡아먹어 4부 합류가
+    # "2라운드"로 밀려버린다(원래 의도는 "1라운드").
+    _has_qual = t.get("has_qualifying", 0) or 0
+    if _has_qual and round_counter == 0:
+        rname = "예선"
+    else:
+        _display_counter = round_counter - _has_qual
+        # [버그 수정] '결승'은 2팀이 붙어서 1팀이 남는 라운드인데, 예전엔 이
+        # 라운드가 끝난 뒤 '남는 팀 수'로 이름을 붙여서 4팀이 붙는 라운드가
+        # '결승'으로, 진짜 결승(2팀)은 이름 없는 'N라운드'로 밀려나는 오류가
+        # 있었다. 실제 관례대로 '이 라운드에 들어오는 팀 수' 기준으로 고쳤다
+        # (16강=16팀 참가, 결승=2팀 참가).
+        rname = _round_name(pool_entering, _display_counter, is_pure_ko=(next_token is None))
     # [버그수정 2026-07, 신민용 리포트] CUP_ROUND_WEEKS_POOL은 10칸뿐인데,
     # 팀 수가 아주 많은 나라(프랑스·이탈리아·스페인·브라질·독일·잉글랜드 등,
     # 하위 리그까지 다 합치면 팀이 훨씬 많아 라운드가 10개를 넘게 필요함)는

@@ -1495,8 +1495,22 @@ class CenterPanel(QWidget):
             if p2.get("current_team_id") and in_zone:
                 self._show_auto_offer(new_week)
 
+        # [2026-08 최적화, 신민용 리포트: "하루씩 진행이 1주씩보다 더 렉걸린다"]
+        #   예전엔 여기서 무조건 refresh_all()을 불렀다 — 1주씩 모드는 버튼
+        #   1클릭=1주 진행이라 딱 1번만 무거운 갱신(일정 창/순위표 창 재계산)이
+        #   발생하는데, 하루씩 모드는 같은 1주를 진행해도 버튼을 7번 나눠 눌러
+        #   그 무거운 갱신을 7번 반복하고 있었다([PERF-STAND] 로그 기준 순위표
+        #   창이 열려있으면 회당 0.1~0.5s+). 실제 시뮬레이션(advance_days)
+        #   비용은 동일한데 이 화면 갱신 오버헤드만 7배로 쌓였던 것.
+        #   묶음(7일=1주) 도중(bundle_done=False)엔 날짜/선수패널/로그만
+        #   갱신하는 refresh_light()로 충분하고, 묶음이 실제로 끝난 날에만
+        #   기존처럼 refresh_all()(일정 창·순위표 창까지 포함)을 부른다 —
+        #   1주씩 모드는 항상 bundle_done=True라 동작이 기존과 완전히 동일.
         if self.main_win:
-            self.main_win.refresh_all()
+            if bundle_done:
+                self.main_win.refresh_all()
+            else:
+                self.main_win.refresh_light()
 
     def _on_advance_failed(self, msg):
         from PyQt6.QtWidgets import QApplication

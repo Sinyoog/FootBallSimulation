@@ -199,6 +199,60 @@ def _fetch_cl_ko_opp(tournament_id, my_team_id, week):
              "formation": "4-4-2", "players": players}]
 
 
+# [2026-08 신설, 신민용 리포트: "우측 상대팀 포메이션 확인 기능이 월드컵
+# 외 국제대회(클럽 월드컵)에서는 안 뜬다"] _resolve_opponents가 intl/cl만
+# 처리하고 cwc는 분기 자체가 없어서 else(리그 상대팀) 폴백으로 빠져
+# 엉뚱한(내 리그) 상대팀 목록이 뜨고 있었다 — cl_entries/cl_matches와
+# 완전히 동일한 패턴으로 cwc_entries/cwc_matches용을 추가한다.
+def _fetch_cwc_opponents(tournament_id, my_team_id, grp=None):
+    """클럽 월드컵 상대팀 목록. grp 지정 시 내 조 팀만 반환(조별리그)."""
+    conn = get_conn()
+    if grp:
+        rows = conn.execute(
+            "SELECT team_id, team_name, flag, ovr FROM cwc_entries "
+            "WHERE tournament_id=? AND team_id!=? AND grp=?",
+            (tournament_id, my_team_id, grp)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT team_id, team_name, flag, ovr FROM cwc_entries "
+            "WHERE tournament_id=? AND team_id!=?",
+            (tournament_id, my_team_id)).fetchall()
+    conn.close()
+    result = []
+    for r in rows:
+        players = _players_for_team(r["team_id"])
+        avg = _avg_ovr(players) or round(r["ovr"] or 0)
+        result.append({
+            "team_id":   r["team_id"],
+            "name":      r["team_name"],
+            "flag":      r["flag"] or "",
+            "avg_ovr":   avg,
+            "formation": "4-4-2",
+            "players":   players,
+        })
+    return result
+
+def _fetch_cwc_ko_opp(tournament_id, my_team_id, week):
+    conn = get_conn()
+    m = conn.execute(
+        "SELECT * FROM cwc_matches WHERE tournament_id=? AND week=? "
+        "AND home_score=-1 AND (home_team_id=? OR away_team_id=?)",
+        (tournament_id, week, my_team_id, my_team_id)).fetchone()
+    if not m:
+        conn.close(); return None
+    opp_id = m["away_team_id"] if m["home_team_id"] == my_team_id else m["home_team_id"]
+    e = conn.execute(
+        "SELECT team_name, flag, ovr FROM cwc_entries WHERE tournament_id=? AND team_id=?",
+        (tournament_id, opp_id)).fetchone()
+    conn.close()
+    if not e: return None
+    players = _players_for_team(opp_id)
+    avg = _avg_ovr(players) or round(e["ovr"] or 0)
+    return [{"team_id": opp_id, "name": e["team_name"],
+             "flag": e["flag"] or "", "avg_ovr": avg,
+             "formation": "4-4-2", "players": players}]
+
+
 # ─────────────────────────────────────────────
 # 포메이션 캔버스 (내 팀 / 상대팀 공용)
 # ─────────────────────────────────────────────
@@ -502,6 +556,7 @@ _CTX_STYLE = {
     "intl_main": ("color:#ffaa33;", "🌍"),   # 월드컵/대륙컵 본선
     "intl_qual": ("color:#ff6666;", "🌍"),   # 그 외 국대(예선 등)
     "cl":        ("color:#ffd24d;", "🏆"),
+    "cwc":       ("color:#66d9ff;", "🌐"),
     "cup":       ("color:#c48aff;", "🎖️"),
 }
 
@@ -616,6 +671,8 @@ class FormationWidget(QWidget):
                 kind = "intl_main" if context.get("kind") in ("world", "continent") else "intl_qual"
             elif context.get("cl"):
                 kind = "cl"
+            elif context.get("cwc"):
+                kind = "cwc"
             elif context.get("cup"):
                 kind = "cup"
             else:
@@ -642,7 +699,7 @@ class FormationWidget(QWidget):
         # [버그수정] 캐시 키에 league_id 포함: 승강 후 같은 team_id라도
         #   리그가 바뀌면 상대팀 목록을 새로 조회한다.
         _cur_league_id = 0
-        if not (context and (context.get("intl") or context.get("cl"))):
+        if not (context and (context.get("intl") or context.get("cl") or context.get("cwc"))):
             try:
                 _cl = get_conn()
                 _lr = _cl.execute("SELECT league_id FROM teams WHERE id=?", (team_id,)).fetchone()
@@ -680,6 +737,15 @@ class FormationWidget(QWidget):
                 if res: return res
             # 조별리그: 내 그룹(grp)에 있는 팀만
             return _fetch_cl_opponents(tid, team_id, grp=grp or None)
+        elif context and context.get("cwc"):
+            tid   = context["tournament_id"]
+            stage = context.get("stage", "group")
+            week  = context.get("week", 0)
+            grp   = context.get("grp", "")
+            if stage != "group":
+                res = _fetch_cwc_ko_opp(tid, team_id, week)
+                if res: return res
+            return _fetch_cwc_opponents(tid, team_id, grp=grp or None)
         else:
             conn = get_conn()
             row = conn.execute("SELECT league_id FROM teams WHERE id=?", (team_id,)).fetchone()

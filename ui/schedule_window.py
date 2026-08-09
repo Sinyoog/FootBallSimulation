@@ -8,13 +8,65 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel,
     QTableWidget, QTableWidgetItem, QHeaderView,
-    QPushButton, QTabWidget, QWidget
+    QPushButton, QTabWidget, QWidget, QMenu
 )
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QGuiApplication, QKeySequence, QShortcut
 
 from game_engine import get_schedule, get_player, get_state
 from database import get_conn
+
+# [2026-08 신설, 신민용 리포트: "경기 일정에서 팀명 복사하면 국기/국가까지
+# 같이 복사된다"] ui/world_browser_window.py의 _CLEAN_TEXT_ROLE +
+# _enable_plain_copy와 완전히 동일한 패턴 — 화면엔 국기/팀명/국가를 같이
+# 보여주되, 복사는 팀명(또는 국가명)만 되게 한다. 두 파일이 서로 import하는
+# 관계가 아니라(순환 참조 방지) 여기 schedule_window.py에도 동일하게
+# 복제해서 둔다.
+_CLEAN_TEXT_ROLE = Qt.ItemDataRole.UserRole + 50
+
+
+def _enable_plain_copy(tbl):
+    """이 테이블 셀을 우클릭(복사) 또는 Ctrl+C 하면, 화면에 보이는
+    장식(국기·국가)이 아니라 _CLEAN_TEXT_ROLE에 저장해둔 순수 이름만
+    클립보드에 복사한다. 그 롤이 없는 셀은 item.text()를 그대로 쓴다."""
+    def _clean_text_of(item):
+        if item is None:
+            return ""
+        v = item.data(_CLEAN_TEXT_ROLE)
+        return v if v else item.text()
+
+    def _copy_selected():
+        items = tbl.selectedItems()
+        if not items:
+            return
+        rows = sorted({it.row() for it in items})
+        cols = sorted({it.column() for it in items})
+        if len(rows) == 1 and len(cols) == 1:
+            QGuiApplication.clipboard().setText(_clean_text_of(items[0]))
+            return
+        lines = []
+        for r in rows:
+            line = [_clean_text_of(tbl.item(r, c)) for c in cols if tbl.item(r, c) in items]
+            lines.append("\t".join(line))
+        QGuiApplication.clipboard().setText("\n".join(lines))
+
+    tbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+
+    def _show_menu(pos):
+        item = tbl.itemAt(pos)
+        if item is None:
+            return
+        if item not in tbl.selectedItems():
+            tbl.setCurrentItem(item)
+        menu = QMenu(tbl)
+        act = menu.addAction("복사")
+        act.triggered.connect(_copy_selected)
+        menu.exec(tbl.viewport().mapToGlobal(pos))
+
+    tbl.customContextMenuRequested.connect(_show_menu)
+    sc = QShortcut(QKeySequence.StandardKey.Copy, tbl)
+    sc.setContext(Qt.ShortcutContext.WidgetShortcut)
+    sc.activated.connect(_copy_selected)
 
 STYLE = """
 QDialog { background:#1e1e1e; color:#ccc; }
@@ -585,6 +637,8 @@ class ScheduleWindow(QDialog):
                         item = QTableWidgetItem(v)
                         if j > 0: item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                         item.setForeground(color)
+                        if j == 0:
+                            item.setData(_CLEAN_TEXT_ROLE, country)
                         gt.setItem(i, j, item)
 
                 gt.setFixedHeight(gt.verticalHeader().defaultSectionSize() * len(rows) + 28)
@@ -593,6 +647,7 @@ class ScheduleWindow(QDialog):
                 _need_w = sum(gt.columnWidth(j) for j in range(gt.columnCount())) + 24
                 gt.setMinimumWidth(_need_w)
                 _max_left_w = max(_max_left_w, _need_w)
+                _enable_plain_copy(gt)
                 lay.addWidget(gt)
 
             # ── 3위 팀 순위표 (3위 진출 대회만: 48개국 월드컵/대륙컵) ──
@@ -674,6 +729,8 @@ class ScheduleWindow(QDialog):
                             if j > 0:
                                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                             item.setForeground(color)
+                            if j == 2:
+                                item.setData(_CLEAN_TEXT_ROLE, country)
                             tt.setItem(row_i, j, item)
                         row_i += 1
 
@@ -694,6 +751,7 @@ class ScheduleWindow(QDialog):
                     _need_w_tt = sum(tt.columnWidth(j) for j in range(tt.columnCount())) + 24
                     tt.setMinimumWidth(_need_w_tt)
                     _max_left_w = max(_max_left_w, _need_w_tt)
+                    _enable_plain_copy(tt)
                     lay.addWidget(tt)
 
             # 범례
@@ -927,6 +985,10 @@ class ScheduleWindow(QDialog):
                     item = QTableWidgetItem(v)
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                     item.setForeground(color)
+                    # [2026-08 신설, 신민용 리포트: "복사하면 국기/국가까지
+                    # 같이 복사된다"] 팀명 칸(1번)만 순수 팀명으로 복사되게.
+                    if j == 1:
+                        item.setData(_CLEAN_TEXT_ROLE, r["team_name"])
                     gt.setItem(i, j, item)
 
             gt.setFixedHeight(gt.verticalHeader().defaultSectionSize() * len(rows) + 28)
@@ -934,6 +996,7 @@ class ScheduleWindow(QDialog):
             _need_w = sum(gt.columnWidth(j) for j in range(gt.columnCount())) + 24
             gt.setMinimumWidth(_need_w)
             left_widget.setMinimumWidth(_need_w)
+            _enable_plain_copy(gt)
             left_lay.addWidget(gt)
 
             hint = QLabel(f"🟢1~{direct_cut}위 직행  🟡{direct_cut+1}~{playoff_cut}위 플레이오프  "
