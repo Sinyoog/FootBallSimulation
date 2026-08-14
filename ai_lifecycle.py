@@ -98,7 +98,7 @@ def run_ai_offseason(year, verbose_log=None):
     # 횟수만 3회→2회로 감소. (ovr은 _transfer_market의 실력 기반 이적 가중치용)
     shared_ai_rows = c.execute(
         "SELECT id, team_id, position, age, name, ovr, nationality, "
-        "contract_end_year, last_transfer_year FROM ai_players").fetchall()
+        "contract_end_year, last_transfer_year FROM ai_players ORDER BY id").fetchall()
     _t_shared = _time_perf.perf_counter()
 
     retired    = _retire_and_replace(c, year, shared_ai_rows)
@@ -786,13 +786,20 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None):
     import time as _time_tm
     _tm0 = _time_tm.perf_counter()
 
+    # [2026-08 버그수정, 재현성 문제 추적 중 발견] ORDER BY 없이 조회하면
+    # by_league/by_country_tier/tier1_by_grade 등 이 함수 전체가 쓰는
+    # 팀 후보 리스트들의 순서가 실행마다 달라질 수 있고, 그 순서가
+    # random.choice() 등이 뽑는 인덱스에 그대로 영향을 줘서 동일 seed로도
+    # 이적 결과가 실행마다 달라지는 원인이 됐다(RNG 소비량 계측으로 확인:
+    # 이 함수 진입 전까지는 완전히 동일했는데 완료 후 소비량이 갈렸음).
     teams = [dict(r) for r in c.execute(
         """SELECT t.id AS tid, t.league_id AS lid, t.current_tier AS tier,
                   t.name AS tname, cn.id AS cid, cn.name AS cname,
                   (SELECT AVG(ovr) FROM ai_players WHERE team_id=t.id) AS avg_ovr
            FROM teams t
            JOIN leagues l ON t.league_id = l.id
-           JOIN countries cn ON l.country_id = cn.id""").fetchall()]
+           JOIN countries cn ON l.country_id = cn.id
+           ORDER BY t.id""").fetchall()]
     team_avg = {t["tid"]: (t["avg_ovr"] or 50) for t in teams}
     # [2026-08 최적화] verbose_log용 _estimate_ai_transfer_fee_display가
     # 이적마다 teams 리스트를 선형탐색(최대 2회) + 팀명 SQL SELECT 2회를

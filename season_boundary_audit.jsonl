@@ -1,0 +1,150 @@
+{"season_label": 1, "team_id": 1352, "name": "용 알크마르", "tier": 2, "parent_name": "AZ 알크마르", "parent_tier": 2, "structural_exception": false}
+{"season_label": 1, "team_id": 4505, "name": "알 와흐다 B", "tier": 2, "parent_name": "알 와흐다", "parent_tier": 2, "structural_exception": false}
+{"season_label": 1, "team_id": 6016, "name": "파네베지스 B", "tier": 2, "parent_name": "FK 파네베지스", "parent_tier": 2, "structural_exception": false}
+{"season_label": 1, "team_id": 7396, "name": "압디시 아타 B", "tier": 2, "parent_name": "압디시 아타", "parent_tier": 2, "structural_exception": false}
+{"season_label": 1, "team_id": 809, "name": "CD 베니카를로 B", "tier": 7, "parent_name": "CD 베니카를로", "parent_tier": 7, "structural_exception": true}
+{"season_label": 1, "team_id": 1462, "name": "카를로바츠 1919 B", "tier": 4, "parent_name": "카를로바츠 1919", "parent_tier": 4, "structural_exception": true}
+{"season_label": 1, "team_id": 2237, "name": "미네르바 펀자브 아카데미", "tier": 4, "parent_name": "미네르바 아카데미", "parent_tier": 4, "structural_exception": true}
+{"season_label": 1, "team_id": 3264, "name": "USM 블리다 B", "tier": 4, "parent_name": "블리다", "parent_tier": 4, "structural_exception": true}
+{"season_label": 1, "team_id": 3471, "name": "SV 아우스트리아 잘츠부르크 B", "tier": 4, "parent_name": "아우스트리아 잘츠부르크", "parent_tier": 4, "structural_exception": true}
+{"season_label": 1, "team_id": 4213, "name": "페르난도 데 라 모라 B", "tier": 3, "parent_name": "페르난도 데 라 모라", "parent_tier": 3, "structural_exception": true}
+{"season_label": 1, "team_id": 4370, "name": "TFC 아카데미", "tier": 3, "parent_name": "토론토 펄스", "parent_tier": 3, "structural_exception": true}
+{"season_label": 1, "team_id": 6145, "name": "도마냐노 B", "tier": 2, "parent_name": "도마냐노", "parent_tier": 2, "structural_exception": true}
+{"season_label": 1, "team_id": 6148, "name": "무라타 B", "tier": 2, "parent_name": "무라타", "parent_tier": 2, "structural_exception": true}
+{"season_label": 1, "team_id": 6677, "name": "샤흐타르 B", "tier": 3, "parent_name": "샤흐타르 카라간디", "parent_tier": 3, "structural_exception": true}
+{"season_label": 1, "team_id": 7122, "name": "피에타 핫스퍼스 B", "tier": 3, "parent_name": "피에타 핫스퍼스", "parent_tier": 3, "structural_exception": true}
+{"season_label": 1, "team_id": 7247, "name": "알 신자르 B", "tier": 4, "parent_name": "신자르 SC", "parent_tier": 4, "structural_exception": true}
+{"season_label": 1, "team_id": 8333, "name": "웨스트 베이 유스 FC", "tier": 3, "parent_name": "웨스트 베이 FC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 1, "team_id": 8381, "name": "인데펜디엔테 아루바 유스 FC", "tier": 3, "parent_name": "인데펜디엔테 아루바 FC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 1, "team_id": 8415, "name": "뉴조지아 B FC", "tier": 3, "parent_name": "뉴조지아 유나이티드 FC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 1, "team_id": 9417, "name": "라 디그 유스", "tier": 3, "parent_name": "라 디그", "parent_tier": 3, "structural_exception": true}
+{"season_label": 1, "team_id": 10676, "name": "MFA HPC U17", "tier": 3, "parent_name": "MFA HPC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 1, "team_id": 10677, "name": "MFA HPC U20", "tier": 3, "parent_name": "MFA HPC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 2, "team_id": 1047, "name": "브라가 B", "tier": 2, "parent_name": "브라가", "parent_tier": 2, "structural_exception": false}
+{"season_label": 2, "team_id": 1947, "name": "알 아라비 B", "tier": 2, "parent_name": "알 아라비", "parent_tier": 2, "structural_exception": false}
+{"season_label": 2, "team_id": 5865, "name": "알라슈케르트 II", "tier": 2, "parent_name": "알라슈케르트", "parent_tier": 2, "structural_exception": false}
+{"season_label": 2, "team_id": 6440, "name": "에르침 II", "tier": 2, "parent_name": "에르침", "parent_tier": 2, "structural_exception": false}
+{"season_label": 2, "team_id": 8329, "name": "보덴 타운 B FC", "tier": 2, "parent_name": "보덴 타운 FC", "parent_tier": 2, "structural_exception": false}
+{"season_label": 2, "team_id": 8406, "name": "코사 B FC", "tier": 2, "parent_name": "코사 FC", "parent_tier": 2, "structural_exception": false}
+{"season_label": 2, "team_id": 809, "name": "CD 베니카를로 B", "tier": 7, "parent_name": "CD 베니카를로", "parent_tier": 7, "structural_exception": true}
+{"season_label": 2, "team_id": 1462, "name": "카를로바츠 1919 B", "tier": 4, "parent_name": "카를로바츠 1919", "parent_tier": 4, "structural_exception": true}
+{"season_label": 2, "team_id": 1464, "name": "마르소니아 B", "tier": 4, "parent_name": "마르소니아", "parent_tier": 4, "structural_exception": true}
+{"season_label": 2, "team_id": 2237, "name": "미네르바 펀자브 아카데미", "tier": 4, "parent_name": "미네르바 아카데미", "parent_tier": 4, "structural_exception": true}
+{"season_label": 2, "team_id": 3188, "name": "OC 메데닌 B", "tier": 4, "parent_name": "CO 메데닌", "parent_tier": 4, "structural_exception": true}
+{"season_label": 2, "team_id": 3264, "name": "USM 블리다 B", "tier": 4, "parent_name": "블리다", "parent_tier": 4, "structural_exception": true}
+{"season_label": 2, "team_id": 3853, "name": "소록사르 B", "tier": 4, "parent_name": "소록사르", "parent_tier": 4, "structural_exception": true}
+{"season_label": 2, "team_id": 4225, "name": "스포르티보 루케뇨 B", "tier": 3, "parent_name": "스포르티보 루케뇨", "parent_tier": 3, "structural_exception": true}
+{"season_label": 2, "team_id": 4226, "name": "3 데 페브레로 B", "tier": 3, "parent_name": "3 데 페브레로", "parent_tier": 3, "structural_exception": true}
+{"season_label": 2, "team_id": 4370, "name": "TFC 아카데미", "tier": 3, "parent_name": "토론토 펄스", "parent_tier": 3, "structural_exception": true}
+{"season_label": 2, "team_id": 6120, "name": "카릴 B", "tier": 2, "parent_name": "CE 카릴", "parent_tier": 2, "structural_exception": true}
+{"season_label": 2, "team_id": 6147, "name": "피오렌티노 B", "tier": 2, "parent_name": "피오렌티노", "parent_tier": 2, "structural_exception": true}
+{"season_label": 2, "team_id": 6148, "name": "무라타 B", "tier": 2, "parent_name": "무라타", "parent_tier": 2, "structural_exception": true}
+{"season_label": 2, "team_id": 6677, "name": "샤흐타르 B", "tier": 3, "parent_name": "샤흐타르 카라간디", "parent_tier": 3, "structural_exception": true}
+{"season_label": 2, "team_id": 6912, "name": "라피 B", "tier": 3, "parent_name": "라피", "parent_tier": 3, "structural_exception": true}
+{"season_label": 2, "team_id": 7122, "name": "피에타 핫스퍼스 B", "tier": 3, "parent_name": "피에타 핫스퍼스", "parent_tier": 3, "structural_exception": true}
+{"season_label": 2, "team_id": 7247, "name": "알 신자르 B", "tier": 4, "parent_name": "신자르 SC", "parent_tier": 4, "structural_exception": true}
+{"season_label": 2, "team_id": 8269, "name": "엠파이어 유스 FC", "tier": 3, "parent_name": "엠파이어 FC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 2, "team_id": 8333, "name": "웨스트 베이 유스 FC", "tier": 3, "parent_name": "웨스트 베이 FC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 2, "team_id": 8381, "name": "인데펜디엔테 아루바 유스 FC", "tier": 3, "parent_name": "인데펜디엔테 아루바 FC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 2, "team_id": 8412, "name": "테모투 B FC", "tier": 3, "parent_name": "테모투 에이스 FC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 2, "team_id": 8500, "name": "AS 테파나 유스", "tier": 3, "parent_name": "AS 테파나", "parent_tier": 3, "structural_exception": true}
+{"season_label": 2, "team_id": 10676, "name": "MFA HPC U17", "tier": 3, "parent_name": "MFA HPC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 2, "team_id": 10677, "name": "MFA HPC U20", "tier": 3, "parent_name": "MFA HPC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 3, "team_id": 1601, "name": "OH 루벤 B", "tier": 3, "parent_name": "OH 루벤", "parent_tier": 3, "structural_exception": false}
+{"season_label": 3, "team_id": 3842, "name": "우이페스트 B", "tier": 3, "parent_name": "우이페스트", "parent_tier": 3, "structural_exception": false}
+{"season_label": 3, "team_id": 4001, "name": "바닉 오스트라바 B", "tier": 3, "parent_name": "오스트라바", "parent_tier": 3, "structural_exception": false}
+{"season_label": 3, "team_id": 5918, "name": "고멜 B", "tier": 2, "parent_name": "고멜", "parent_tier": 2, "structural_exception": false}
+{"season_label": 3, "team_id": 809, "name": "CD 베니카를로 B", "tier": 7, "parent_name": "CD 베니카를로", "parent_tier": 7, "structural_exception": true}
+{"season_label": 3, "team_id": 828, "name": "CD 산 마르셀리노 B", "tier": 7, "parent_name": "CD 산 마르셀리노", "parent_tier": 7, "structural_exception": true}
+{"season_label": 3, "team_id": 1462, "name": "카를로바츠 1919 B", "tier": 4, "parent_name": "카를로바츠 1919", "parent_tier": 4, "structural_exception": true}
+{"season_label": 3, "team_id": 1464, "name": "마르소니아 B", "tier": 4, "parent_name": "마르소니아", "parent_tier": 4, "structural_exception": true}
+{"season_label": 3, "team_id": 1826, "name": "다마시 B", "tier": 4, "parent_name": "다마시 길란", "parent_tier": 4, "structural_exception": true}
+{"season_label": 3, "team_id": 2237, "name": "미네르바 펀자브 아카데미", "tier": 4, "parent_name": "미네르바 아카데미", "parent_tier": 4, "structural_exception": true}
+{"season_label": 3, "team_id": 2564, "name": "야네로스 B", "tier": 4, "parent_name": "야네로스", "parent_tier": 4, "structural_exception": true}
+{"season_label": 3, "team_id": 2749, "name": "FAR 라바트 B", "tier": 4, "parent_name": "AS FAR 라바트", "parent_tier": 4, "structural_exception": true}
+{"season_label": 3, "team_id": 3188, "name": "OC 메데닌 B", "tier": 4, "parent_name": "CO 메데닌", "parent_tier": 4, "structural_exception": true}
+{"season_label": 3, "team_id": 3264, "name": "USM 블리다 B", "tier": 4, "parent_name": "블리다", "parent_tier": 4, "structural_exception": true}
+{"season_label": 3, "team_id": 3317, "name": "블란타이어 B", "tier": 3, "parent_name": "블란타이어 유나이티드", "parent_tier": 3, "structural_exception": true}
+{"season_label": 3, "team_id": 4221, "name": "구아라니 B", "tier": 3, "parent_name": "구아라니", "parent_tier": 3, "structural_exception": true}
+{"season_label": 3, "team_id": 4225, "name": "스포르티보 루케뇨 B", "tier": 3, "parent_name": "스포르티보 루케뇨", "parent_tier": 3, "structural_exception": true}
+{"season_label": 3, "team_id": 4226, "name": "3 데 페브레로 B", "tier": 3, "parent_name": "3 데 페브레로", "parent_tier": 3, "structural_exception": true}
+{"season_label": 3, "team_id": 4370, "name": "TFC 아카데미", "tier": 3, "parent_name": "토론토 펄스", "parent_tier": 3, "structural_exception": true}
+{"season_label": 3, "team_id": 5166, "name": "바르데요브 B", "tier": 3, "parent_name": "파르티잔 바르데요브", "parent_tier": 3, "structural_exception": true}
+{"season_label": 3, "team_id": 5570, "name": "티밧 B", "tier": 3, "parent_name": "아르세날 티밧", "parent_tier": 3, "structural_exception": true}
+{"season_label": 3, "team_id": 6013, "name": "잘기리스 B", "tier": 3, "parent_name": "잘기리스 빌뉴스", "parent_tier": 3, "structural_exception": true}
+{"season_label": 3, "team_id": 6073, "name": "FK 리에파야 II", "tier": 3, "parent_name": "리에파야", "parent_tier": 3, "structural_exception": true}
+{"season_label": 3, "team_id": 6120, "name": "카릴 B", "tier": 2, "parent_name": "CE 카릴", "parent_tier": 2, "structural_exception": true}
+{"season_label": 3, "team_id": 6147, "name": "피오렌티노 B", "tier": 2, "parent_name": "피오렌티노", "parent_tier": 2, "structural_exception": true}
+{"season_label": 3, "team_id": 6149, "name": "코스모스 B", "tier": 2, "parent_name": "코스모스", "parent_tier": 2, "structural_exception": true}
+{"season_label": 3, "team_id": 6223, "name": "킬디야 B", "tier": 3, "parent_name": "알 킬디야", "parent_tier": 3, "structural_exception": true}
+{"season_label": 3, "team_id": 6555, "name": "나부아 B", "tier": 3, "parent_name": "나부아 FC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 3, "team_id": 6676, "name": "아티라우 B", "tier": 3, "parent_name": "아티라우", "parent_tier": 3, "structural_exception": true}
+{"season_label": 3, "team_id": 6912, "name": "라피 B", "tier": 3, "parent_name": "라피", "parent_tier": 3, "structural_exception": true}
+{"season_label": 3, "team_id": 6978, "name": "링컨 B", "tier": 3, "parent_name": "링컨 레드 임프스", "parent_tier": 3, "structural_exception": true}
+{"season_label": 3, "team_id": 7122, "name": "피에타 핫스퍼스 B", "tier": 3, "parent_name": "피에타 핫스퍼스", "parent_tier": 3, "structural_exception": true}
+{"season_label": 3, "team_id": 7130, "name": "FC 파두츠 U21", "tier": 3, "parent_name": "FC 파두츠", "parent_tier": 3, "structural_exception": true}
+{"season_label": 3, "team_id": 7131, "name": "FC 파두츠 B", "tier": 3, "parent_name": "FC 파두츠", "parent_tier": 3, "structural_exception": true}
+{"season_label": 3, "team_id": 7143, "name": "FC 파두츠 C", "tier": 3, "parent_name": "FC 파두츠", "parent_tier": 3, "structural_exception": true}
+{"season_label": 3, "team_id": 8067, "name": "해밀턴 유스 FC", "tier": 3, "parent_name": "해밀턴 패리시 FC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 3, "team_id": 8140, "name": "이글스 B FC", "tier": 3, "parent_name": "이글스 수퍼 스트라이커스 FC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 3, "team_id": 8269, "name": "엠파이어 유스 FC", "tier": 3, "parent_name": "엠파이어 FC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 3, "team_id": 8333, "name": "웨스트 베이 유스 FC", "tier": 3, "parent_name": "웨스트 베이 FC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 3, "team_id": 8409, "name": "과달카날 B FC", "tier": 3, "parent_name": "과달카날 FC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 3, "team_id": 8410, "name": "마키라 B FC", "tier": 3, "parent_name": "마키라 스타즈 FC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 3, "team_id": 8412, "name": "테모투 B FC", "tier": 3, "parent_name": "테모투 에이스 FC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 1606, "name": "세르클러 브뤼허 B", "tier": 3, "parent_name": "세르클러 브뤼허", "parent_tier": 3, "structural_exception": false}
+{"season_label": 4, "team_id": 1950, "name": "알 가라파 B", "tier": 3, "parent_name": "알 가라파", "parent_tier": 3, "structural_exception": false}
+{"season_label": 4, "team_id": 1999, "name": "올림픽 FC B", "tier": 2, "parent_name": "올림픽 타슈켄트", "parent_tier": 2, "structural_exception": false}
+{"season_label": 4, "team_id": 5330, "name": "디나모 바투미 B", "tier": 3, "parent_name": "디나모 바투미", "parent_tier": 3, "structural_exception": false}
+{"season_label": 4, "team_id": 7024, "name": "아폴론 리마솔 B", "tier": 3, "parent_name": "아폴론 리마솔", "parent_tier": 3, "structural_exception": false}
+{"season_label": 4, "team_id": 828, "name": "CD 산 마르셀리노 B", "tier": 7, "parent_name": "CD 산 마르셀리노", "parent_tier": 7, "structural_exception": true}
+{"season_label": 4, "team_id": 1462, "name": "카를로바츠 1919 B", "tier": 4, "parent_name": "카를로바츠 1919", "parent_tier": 4, "structural_exception": true}
+{"season_label": 4, "team_id": 1464, "name": "마르소니아 B", "tier": 4, "parent_name": "마르소니아", "parent_tier": 4, "structural_exception": true}
+{"season_label": 4, "team_id": 1659, "name": "K 베르헴 스포르트 B", "tier": 5, "parent_name": "K 베르헴 스포르트", "parent_tier": 5, "structural_exception": true}
+{"season_label": 4, "team_id": 1826, "name": "다마시 B", "tier": 4, "parent_name": "다마시 길란", "parent_tier": 4, "structural_exception": true}
+{"season_label": 4, "team_id": 2237, "name": "미네르바 펀자브 아카데미", "tier": 4, "parent_name": "미네르바 아카데미", "parent_tier": 4, "structural_exception": true}
+{"season_label": 4, "team_id": 2564, "name": "야네로스 B", "tier": 4, "parent_name": "야네로스", "parent_tier": 4, "structural_exception": true}
+{"season_label": 4, "team_id": 2749, "name": "FAR 라바트 B", "tier": 4, "parent_name": "AS FAR 라바트", "parent_tier": 4, "structural_exception": true}
+{"season_label": 4, "team_id": 3188, "name": "OC 메데닌 B", "tier": 4, "parent_name": "CO 메데닌", "parent_tier": 4, "structural_exception": true}
+{"season_label": 4, "team_id": 3264, "name": "USM 블리다 B", "tier": 4, "parent_name": "블리다", "parent_tier": 4, "structural_exception": true}
+{"season_label": 4, "team_id": 3266, "name": "NRB 아르제우 B", "tier": 4, "parent_name": "아르제우", "parent_tier": 4, "structural_exception": true}
+{"season_label": 4, "team_id": 3317, "name": "블란타이어 B", "tier": 3, "parent_name": "블란타이어 유나이티드", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 3831, "name": "데브레첸 B", "tier": 4, "parent_name": "데브레첸", "parent_tier": 4, "structural_exception": true}
+{"season_label": 4, "team_id": 4186, "name": "산 마르틴 B", "tier": 3, "parent_name": "산 마르틴", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 4213, "name": "페르난도 데 라 모라 B", "tier": 3, "parent_name": "페르난도 데 라 모라", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 4221, "name": "구아라니 B", "tier": 3, "parent_name": "구아라니", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 4225, "name": "스포르티보 루케뇨 B", "tier": 3, "parent_name": "스포르티보 루케뇨", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 4226, "name": "3 데 페브레로 B", "tier": 3, "parent_name": "3 데 페브레로", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 4355, "name": "블루밍 유스", "tier": 3, "parent_name": "블루밍", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 4370, "name": "TFC 아카데미", "tier": 3, "parent_name": "토론토 펄스", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 4663, "name": "송클라 유스", "tier": 4, "parent_name": "송클라 FC", "parent_tier": 4, "structural_exception": true}
+{"season_label": 4, "team_id": 4710, "name": "꽝남 유스", "tier": 4, "parent_name": "꽝남 FC", "parent_tier": 4, "structural_exception": true}
+{"season_label": 4, "team_id": 4738, "name": "꽝남 아카데미", "tier": 4, "parent_name": "꽝남 FC", "parent_tier": 4, "structural_exception": true}
+{"season_label": 4, "team_id": 4849, "name": "부구니 B", "tier": 3, "parent_name": "부구니 AC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 4850, "name": "카이 유스", "tier": 3, "parent_name": "카이 FC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 5166, "name": "바르데요브 B", "tier": 3, "parent_name": "파르티잔 바르데요브", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 5308, "name": "에스포 B", "tier": 4, "parent_name": "에스포", "parent_tier": 4, "structural_exception": true}
+{"season_label": 4, "team_id": 5450, "name": "KF 아폴로니아 B", "tier": 4, "parent_name": "아폴로니아", "parent_tier": 4, "structural_exception": true}
+{"season_label": 4, "team_id": 5570, "name": "티밧 B", "tier": 3, "parent_name": "아르세날 티밧", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 5865, "name": "알라슈케르트 II", "tier": 3, "parent_name": "알라슈케르트", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 5920, "name": "민스크 리저브", "tier": 3, "parent_name": "민스크 FC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 6013, "name": "잘기리스 B", "tier": 3, "parent_name": "잘기리스 빌뉴스", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 6019, "name": "트란스인베스트 B", "tier": 3, "parent_name": "트란스인베스트", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 6073, "name": "FK 리에파야 II", "tier": 3, "parent_name": "리에파야", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 6120, "name": "카릴 B", "tier": 2, "parent_name": "CE 카릴", "parent_tier": 2, "structural_exception": true}
+{"season_label": 4, "team_id": 6149, "name": "코스모스 B", "tier": 2, "parent_name": "코스모스", "parent_tier": 2, "structural_exception": true}
+{"season_label": 4, "team_id": 6223, "name": "킬디야 B", "tier": 3, "parent_name": "알 킬디야", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 6448, "name": "데런 B", "tier": 3, "parent_name": "데런 FC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 6562, "name": "라키라키 B", "tier": 3, "parent_name": "라키라키", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 6603, "name": "무라 B", "tier": 4, "parent_name": "무라", "parent_tier": 4, "structural_exception": true}
+{"season_label": 4, "team_id": 6676, "name": "아티라우 B", "tier": 3, "parent_name": "아티라우", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 6912, "name": "라피 B", "tier": 3, "parent_name": "라피", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 6978, "name": "링컨 B", "tier": 3, "parent_name": "링컨 레드 임프스", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 7122, "name": "피에타 핫스퍼스 B", "tier": 3, "parent_name": "피에타 핫스퍼스", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 8067, "name": "해밀턴 유스 FC", "tier": 3, "parent_name": "해밀턴 패리시 FC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 8080, "name": "데번셔 유스 FC", "tier": 3, "parent_name": "데번셔 쿠거스 FC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 8140, "name": "이글스 B FC", "tier": 3, "parent_name": "이글스 수퍼 스트라이커스 FC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 8269, "name": "엠파이어 유스 FC", "tier": 3, "parent_name": "엠파이어 FC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 8333, "name": "웨스트 베이 유스 FC", "tier": 3, "parent_name": "웨스트 베이 FC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 8374, "name": "오란스타드 유스 FC", "tier": 3, "parent_name": "오란스타드 유나이티드 FC", "parent_tier": 3, "structural_exception": true}
+{"season_label": 4, "team_id": 8409, "name": "과달카날 B FC", "tier": 3, "parent_name": "과달카날 FC", "parent_tier": 3, "structural_exception": true}

@@ -119,6 +119,18 @@ class ApplyWindow(QDialog):
             self.tier_combo.addItem(f"{t}부", t)
         self.tier_combo.currentIndexChanged.connect(self._do_search)
         search_row.addWidget(self.tier_combo, 1)
+
+        # [2026-08 신설, 신민용 리포트: "부수 표시 옆에 평균OVR 오름차순/
+        # 내림차순 필터 만들어줘"] 기본값은 기존 동작 그대로 무작위 셔플
+        # (부수가 고르게 섞여 나옴) — 오름/내림차순을 고르면 world_browser.
+        # search_teams가 그 기준으로 SQL ORDER BY까지 걸어서 실제 상/하위
+        # N팀을 반환한다(무작위 30팀 안에서 다시 정렬하는 게 아님).
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItem("정렬: 무작위", None)
+        self.sort_combo.addItem("평균OVR ▲ 오름차순", "ovr_asc")
+        self.sort_combo.addItem("평균OVR ▼ 내림차순", "ovr_desc")
+        self.sort_combo.currentIndexChanged.connect(self._do_search)
+        search_row.addWidget(self.sort_combo, 1)
         root.addLayout(search_row)
 
         self.table = QTableWidget()
@@ -181,8 +193,9 @@ class ApplyWindow(QDialog):
         grade = self.grade_combo.currentData()
         country_id = self.country_combo.currentData()
         tier = self.tier_combo.currentData()
+        sort = self.sort_combo.currentData()
         self._rows = wb.search_teams(name_query=name_query, grade=grade, country_id=country_id,
-                                      tier=tier, limit=30)
+                                      tier=tier, sort=sort, limit=30)
         self._populate_table()
 
     def _populate_table(self):

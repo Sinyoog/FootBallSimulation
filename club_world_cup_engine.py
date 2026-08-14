@@ -284,12 +284,13 @@ def process_cwc_week(week: int, day=None):
         matches = conn.execute(
             """SELECT * FROM cwc_matches WHERE tournament_id=? AND home_score=-1
                AND home_team_id!=0 AND away_team_id!=0
-               AND ((day IS NOT NULL AND day<=?) OR (day IS NULL AND week<=?))""",
+               AND ((day IS NOT NULL AND day<=?) OR (day IS NULL AND week<=?))
+               ORDER BY id""",
             (tid, day, week)).fetchall()
     else:
         matches = conn.execute(
             """SELECT * FROM cwc_matches WHERE tournament_id=? AND week<=? AND home_score=-1
-               AND home_team_id!=0 AND away_team_id!=0""",
+               AND home_team_id!=0 AND away_team_id!=0 ORDER BY id""",
             (tid, week)).fetchall()
     for m in matches:
         _sim_one(conn, dict(m))

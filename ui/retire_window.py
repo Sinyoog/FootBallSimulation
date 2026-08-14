@@ -195,10 +195,13 @@ class RetireWindow(QDialog):
         if getattr(self, "_career_match_cache", None) is None:
             import intl_engine, champions_engine, cup_engine
             import club_world_cup_engine, promotion_playoff_engine
+            import europa_engine, conference_engine
             self._career_match_cache = {
                 "intl_ms": intl_engine.get_my_intl_matches(),
                 "qual_ms": intl_engine.get_my_qual_matches(),
                 "cl_ms": champions_engine.get_my_cl_matches(),
+                "el_ms": europa_engine.get_my_el_matches(),
+                "ecl_ms": conference_engine.get_my_ecl_matches(),
                 "cup_ms": cup_engine.get_my_cup_matches(),
                 "cwc_ms": club_world_cup_engine.get_my_cwc_matches(),
                 "po_ms": promotion_playoff_engine.get_my_po_matches(),
@@ -408,6 +411,20 @@ class RetireWindow(QDialog):
         t36.setObjectName("secTitle")
         lay.addWidget(t36)
         lay.addWidget(self._champions_table(cl_ms, p))
+
+        # ── 유로파리그 기록 (2026-08 신설) ────────────
+        el_ms = _cm["el_ms"]
+        t36e = QLabel(f"🥈 유로파리그 기록  ({len(el_ms)})")
+        t36e.setObjectName("secTitle")
+        lay.addWidget(t36e)
+        lay.addWidget(self._champions_table(el_ms, p, label="유로파리그"))
+
+        # ── 컨퍼런스리그 기록 (2026-08 신설) ──────────
+        ecl_ms = _cm["ecl_ms"]
+        t36c = QLabel(f"🥉 컨퍼런스리그 기록  ({len(ecl_ms)})")
+        t36c.setObjectName("secTitle")
+        lay.addWidget(t36c)
+        lay.addWidget(self._champions_table(ecl_ms, p, label="컨퍼런스리그"))
 
         # ── 컵대회 기록 ──────────────────────────────
         cup_ms = _cm["cup_ms"]
@@ -1053,10 +1070,13 @@ class RetireWindow(QDialog):
         tbl.setFixedHeight(30 + min(len(matches), 7) * 28)
         return tbl
 
-    def _champions_table(self, matches, p):
-        """챔피언스리그 경기별 기록 테이블 (포지션별 세부 지표)."""
+    def _champions_table(self, matches, p, label="챔피언스리그"):
+        """챔피언스리그 경기별 기록 테이블 (포지션별 세부 지표).
+        [2026-08 확장] label만 매개변수화 — 유로파/컨퍼런스도 이 함수를
+        그대로 재사용한다(matches 자체가 이미 각 엔진의 get_my_*_matches()로
+        만들어진 동일 형식 dict라 나머지 로직은 손댈 필요가 없다)."""
         if not matches:
-            lbl = QLabel("챔피언스리그 기록 없음"); lbl.setStyleSheet("color:#555;")
+            lbl = QLabel(f"{label} 기록 없음"); lbl.setStyleSheet("color:#555;")
             return lbl
         from constants import position_group
         _pos = p.get("position", "")
@@ -1526,16 +1546,18 @@ class RetireWindow(QDialog):
             lines.append("  없음")
         lines.append("")
 
-        # 챔피언스리그 경력 (클럽 대륙 대회 ─ tier=-1, 대회별 결과 + 활약)
+        # 클럽 대항전 경력 (챔스/유로파/컨퍼런스 전부 tier=-1로 저장 ─ 대회별 결과 + 활약)
         cl_trophies = [t for t in trophies if t.get('tier', 0) == -1]
-        lines.append(f"▶ 챔피언스리그 경력  ({len(cl_trophies)}건)")
+        lines.append(f"▶ 클럽 대항전 경력  ({len(cl_trophies)}건)")
         if cl_trophies:
             conn_c = get_conn()
-            try:
-                clhist = {(r["year"], r["competition"]): dict(r) for r in conn_c.execute(
-                    "SELECT * FROM cl_history").fetchall()}
-            except Exception:
-                clhist = {}
+            clhist = {}
+            for _htbl in ("cl_history", "el_history", "ecl_history"):
+                try:
+                    clhist.update({(r["year"], r["competition"]): dict(r) for r in conn_c.execute(
+                        f"SELECT * FROM {_htbl}").fetchall()})
+                except Exception:
+                    pass
             conn_c.close()
             for t in cl_trophies:
                 yr, comp = t.get('year', 0), t.get('competition', '')
@@ -1679,6 +1701,30 @@ class RetireWindow(QDialog):
         lines.append(f"▶ 챔피언스리그 기록  ({len(cl_ms2)}경기)  ※ 클럽 대항전 (A매치 아님)")
         if cl_ms2:
             for cm in cl_ms2:
+                lines.append(f"  • {cm['date']}  "
+                             f"{cm['comp']} {cm['stage']}  ({cm['team']}) vs {cm['opp']}  ─  "
+                             f"{_match_line_str(cm)}  ({cm['score']} {format_result_with_absence(cm)})")
+        else:
+            lines.append("  없음")
+        lines.append("")
+
+        # 유로파리그 기록 (2026-08 신설)
+        el_ms2 = _cm2["el_ms"]
+        lines.append(f"▶ 유로파리그 기록  ({len(el_ms2)}경기)  ※ 클럽 대항전 (A매치 아님)")
+        if el_ms2:
+            for em in el_ms2:
+                lines.append(f"  • {em['date']}  "
+                             f"{em['comp']} {em['stage']}  ({em['team']}) vs {em['opp']}  ─  "
+                             f"{_match_line_str(em)}  ({em['score']} {format_result_with_absence(em)})")
+        else:
+            lines.append("  없음")
+        lines.append("")
+
+        # 컨퍼런스리그 기록 (2026-08 신설)
+        ecl_ms2 = _cm2["ecl_ms"]
+        lines.append(f"▶ 컨퍼런스리그 기록  ({len(ecl_ms2)}경기)  ※ 클럽 대항전 (A매치 아님)")
+        if ecl_ms2:
+            for cm in ecl_ms2:
                 lines.append(f"  • {cm['date']}  "
                              f"{cm['comp']} {cm['stage']}  ({cm['team']}) vs {cm['opp']}  ─  "
                              f"{_match_line_str(cm)}  ({cm['score']} {format_result_with_absence(cm)})")

@@ -2196,13 +2196,17 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
 
     if qual_kind == "cont_qual":
         qual_cfg = EURO_QUAL.get(continent)
-        _qual_name_prefix = "유로"  # [2026-08 신설] "월드컵 예선"으로 하드코딩돼
-        # 있던 이름이 유로 예선에도 그대로 붙던 걸 분리 — 신민용 확정: 유로는
-        # "월드컵"이 아니라 "유로" 예선이라고 표시돼야 함.
+        # [2026-08 버그수정, 신민용 리포트: "2000년에 '유로 유럽 예선'이라고
+        # 뜨는데 이 시기엔 유로가 아니라 유럽 네이션스컵 예선이다"] 대회명이
+        # "{year} 유로 {continent} 예선" 형태였는데, cont_qual은 지금
+        # 유럽 전용이라 continent가 항상 "유럽"이라서 "유로 유럽 예선"처럼
+        # 어색하게 겹쳤다. 정식 명칭인 "유럽 네이션스컵 예선"으로 바꾸고,
+        # 이미 "유럽"을 포함하므로 continent를 또 붙이지 않는다.
+        _qual_full_name = f"{year} 유럽 네이션스컵 예선"
     else:
         big = year >= WC_EXPAND_YEAR
         qual_cfg = WC_QUAL_48.get(continent) if big else WC_QUAL_32.get(continent)
-        _qual_name_prefix = "월드컵"
+        _qual_full_name = f"{year} 월드컵 {continent} 예선"
     if not qual_cfg:
         return
 
@@ -2262,19 +2266,19 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
         if committed:
             # 이미 고정된 나라가 컷오프 → 바로 예선 진출 실패 기록
             failed_nat = committed
-            _save_trophy(year, failed_nat, f"{year} {_qual_name_prefix} {continent} 예선", "예선 진출 실패")
+            _save_trophy(year, failed_nat, _qual_full_name, "예선 진출 실패")
             try:
                 conn_fc = get_conn()
                 conn_fc.execute("""INSERT INTO intl_history(year, competition, team_name, result,
                                                             goals, assists, caps, rating)
                                    VALUES(?,?,?,?,?,?,?,?)""",
-                                (year, f"{year} {_qual_name_prefix} {continent} 예선",
+                                (year, _qual_full_name,
                                  failed_nat, "예선 진출 실패", 0, 0, 0, 0.0))
                 conn_fc.commit(); conn_fc.close()
             except Exception:
                 pass
             from game_engine import add_log
-            add_log(f"❌ {failed_nat} {_qual_name_prefix} {continent} 예선 진출 실패 (랭킹 하위권)", "event")
+            add_log(f"❌ {failed_nat} {_qual_full_name} 진출 실패 (랭킹 하위권)", "event")
             my_sel = 2; my_nat = ""; cand_nats_final = []
         else:
             # 미고정: 컷오프 국적 포함해서 선택창 제시
@@ -2306,7 +2310,7 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
                 groups[glabels[gi]].append(e)
 
     # ─── DB 저장 ───
-    name = f"{year} {_qual_name_prefix} {continent} 예선"
+    name = _qual_full_name
     conn = get_conn(); c = conn.cursor()
     c.execute("""INSERT INTO intl_tournaments(year, kind, name, status, my_selected, my_nat, cand_nats, continent)
                  VALUES(?,?,?,?,?,?,?,?)""",
@@ -2455,13 +2459,14 @@ def _process_one_tournament_week(t, week, day=None):
         pending = [dict(r) for r in conn.execute(
             """SELECT * FROM intl_matches
                WHERE tournament_id=? AND home_score=-1 AND home!='' AND away!=''
-                 AND ((day IS NOT NULL AND day<=?) OR (day IS NULL AND week<=?))""",
+                 AND ((day IS NOT NULL AND day<=?) OR (day IS NULL AND week<=?))
+               ORDER BY id""",
             (t["id"], day, week)).fetchall()]
     else:
         pending = [dict(r) for r in conn.execute(
             """SELECT * FROM intl_matches
                WHERE tournament_id=? AND week<=? AND home_score=-1
-                 AND home!='' AND away!=''""",
+                 AND home!='' AND away!='' ORDER BY id""",
             (t["id"], week)).fetchall()]
     conn.close()
 
@@ -3048,6 +3053,123 @@ def _qual_group_standings(tid, grp):
     return rows
 
 
+def get_qual_advance_status(t):
+    """예선(wc_qual/cont_qual) 각 국가의 본선 진출 상태를 계산해 반환.
+
+    [2026-08 신설, 신민용 리포트: "국제대회(예선) 탭에서 실제로 본선에
+    올라가는 팀들이 초록색으로 안 뜨고 조 1위만 뜬다"] UI(schedule_window)
+    쪽의 기존 색상 결정(_intl_advance_count)은 예선 대회 설정을 전혀 보지
+    않고 무조건 "조 1위만 직행, 나머지는 전부 탈락(회색)"으로 그려왔다.
+    실제로는 대륙/체제에 따라:
+      - 유로 예선: 조 1·2위 전원 직행(2위도 초록이어야 함)
+      - 월드컵 아메리카(48팀): 조 1위 직행 + 조 2위 중 성적 상위 N팀도
+        직행(와일드카드)
+      - 월드컵 유럽/48팀 체제 아프리카: 조 1위 직행 + 조 2위 중 성적
+        상위 N팀은 플레이오프(단판)로 나머지 자리를 놓고 경쟁
+    이 함수가 _finalize_qual과 동일한 설정표(WC_QUAL_32/48, EURO_QUAL)를
+    읽어 실제 진출 로직을 그대로 재현한다. 조별리그가 아직 진행 중이면
+    "지금까지의 성적 기준" 잠정 계산이며(다른 조별리그 UI와 동일한 방식),
+    조별리그가 끝난 뒤에는 실제 확정 결과와 일치한다.
+
+    반환: {country: status}
+      'direct'     — 직행권 확보 (조 1위 직행 + 와일드카드로 직행 확정된 2위)
+      'po_bubble'  — 플레이오프 경쟁 중(아직 결과 미확정, 조별리그 진행
+                     중이면 "현재 기준 진출권" 후보)
+      'po_ok'      — 플레이오프 승리로 진출 확정
+      'eliminated' — 탈락 / 진출 가능성 없음
+    """
+    from constants import WC_QUAL_32, WC_QUAL_48, EURO_QUAL, WC_EXPAND_YEAR
+
+    tid = t["id"]
+    conn = get_conn()
+    grps = [r["grp"] for r in conn.execute(
+        "SELECT DISTINCT grp FROM intl_entries WHERE tournament_id=? ORDER BY grp", (tid,)).fetchall()]
+    all_countries = {r["country"] for r in conn.execute(
+        "SELECT country FROM intl_entries WHERE tournament_id=?", (tid,)).fetchall()}
+    po_matches = [dict(r) for r in conn.execute(
+        "SELECT * FROM intl_matches WHERE tournament_id=? AND stage='qual_po'", (tid,)).fetchall()]
+    conn.close()
+
+    status = {c: "eliminated" for c in all_countries}
+    if not grps:
+        return status
+
+    continent = _conf_key((t.get("continent") or "").strip() or "유럽")
+    if t.get("kind") == "cont_qual":
+        qual_cfg = EURO_QUAL.get(continent, {})
+    else:
+        big = t.get("year", 0) >= WC_EXPAND_YEAR
+        qual_cfg = (WC_QUAL_48 if big else WC_QUAL_32).get(continent, {})
+
+    direct_n = qual_cfg.get("direct", len(grps))
+    po_teams = qual_cfg.get("po_teams", 0)
+    wildcard = qual_cfg.get("wildcard", 0)
+
+    winners, runners = [], []
+    for g in grps:
+        rows = _qual_group_standings(tid, g)
+        if len(rows) >= 1:
+            winners.append(rows[0])
+        if len(rows) >= 2:
+            runners.append(rows[1])
+
+    # 조 라벨 순서가 아니라 성적순으로 상위 direct_n팀만 직행시킨다
+    # (_finalize_qual과 동일한 기준, 위 버그수정 참고).
+    if direct_n < len(winners):
+        winners = sorted(winners, key=lambda r: (r["pts"], r["gf"] - r["ga"], r["gf"], r["ovr"]),
+                          reverse=True)
+    direct_set = {w["country"] for w in winners[:direct_n]}
+
+    runners_sorted = sorted(runners, key=lambda r: (r["pts"], r["gf"] - r["ga"], r["gf"], r["ovr"]),
+                             reverse=True)
+    # [2026-08 버그수정, 신민용 리포트: "아프리카는 1등팀들끼리 플레이오프
+    # 하는 거 아니야?"] direct=0인 체제(32팀 예선의 아시아/아프리카)는
+    # _finalize_qual에서 실제로 "조 1위 전원이 직행 없이 플레이오프로
+    # 간다"(po_pool = winners[:po_teams])로 처리하는데, 여기서는 그 분기를
+    # 빼먹고 항상 조 2위(runners_sorted)를 플레이오프 후보로 잘못
+    # 계산했다 — 그 결과 실제 플레이오프에 진출한 조 1위팀들은 화면에
+    # 회색(탈락)으로, 정작 플레이오프와 무관한 조 2위팀들이 주황(경쟁
+    # 중)으로 뜨는 정반대 표시가 났다. _finalize_qual과 동일하게
+    # direct_n==0이면 조 1위(winners)를 플레이오프 후보로 삼는다.
+    if wildcard > 0:
+        direct_set |= {r["country"] for r in runners_sorted[:wildcard]}
+        po_pool = runners_sorted[wildcard:wildcard + po_teams]
+    elif direct_n == 0 and po_teams > 0:
+        po_pool = winners[:po_teams]
+    else:
+        po_pool = runners_sorted[:po_teams]
+
+    for c in direct_set:
+        if c in status:
+            status[c] = "direct"
+    for r in po_pool:
+        if r["country"] in status:
+            status[r["country"]] = "po_bubble"
+
+    # 플레이오프 경기 결과 반영 (경기가 끝난 만큼만 확정 상태로 갱신)
+    for m in po_matches:
+        h, a = m["home"], m["away"]
+        hs = m.get("home_score", -1)
+        if hs is None or hs < 0:
+            continue
+        as_ = m["away_score"]
+        if hs > as_:
+            winner, loser = h, a
+        elif as_ > hs:
+            winner, loser = a, h
+        elif m.get("pso_winner"):
+            winner = m["pso_winner"]
+            loser = a if winner == h else h
+        else:
+            continue
+        if winner in status:
+            status[winner] = "po_ok"
+        if loser in status:
+            status[loser] = "eliminated"
+
+    return status
+
+
 def _finalize_qual(t):
     """예선 조별 종료 → 플레이오프 생성 or 통과국 확정.
 
@@ -3135,6 +3257,15 @@ def _finalize_qual(t):
     quota     = qual_cfg.get("quota", direct_n)
 
     # ─── 직행 확정 ───
+    # [2026-08 버그수정, 신민용 리포트: "예선에서 실제로 올라가는 팀들이
+    # 초록색으로 안 뜨고 조 1위만 뜬다" 조사 중 발견] direct_n < 조 수
+    # (예: 아프리카 12조 → 상위 9팀만 직행, 3팀 탈락)인 체제에서, winners를
+    # 조 라벨 순서(A,B,C...) 그대로 잘라 항상 앞쪽 조 우승팀만 직행시키고
+    # 있었다 — "1위 중 상위 N팀"이라는 constants.py 주석의 의도와 달리
+    # 성적과 무관하게 조 순서로 당락이 갈리는 버그. 성적순 정렬 후 자른다.
+    if direct_n < len(winners):
+        winners = sorted(winners, key=lambda r: (r["pts"], r["gf"] - r["ga"], r["gf"], r["ovr"]),
+                          reverse=True)
     direct_teams = winners[:direct_n]
 
     # 와일드카드 (아메리카 48팀 체제: 조 2위 중 상위 N팀)

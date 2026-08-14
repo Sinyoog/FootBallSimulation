@@ -11,7 +11,7 @@ from data.names import NAME_DATA
 # 새로 추가한 부수의 선수 OVR이 엉뚱하게(예: 6부인데 1부와 비슷한 수치로)
 # 생성되는 버그로 이어졌다. constants.py를 유일한 원본으로 삼아 여기서는
 # 그대로 가져다 쓴다 — 더 이상 두 곳을 따로 수정할 필요가 없다.
-from constants import OVR_RANGES
+from constants import OVR_RANGES, get_ovr_range
 # [2026-08 최적화] 아래 심볼들은 원래 _generate_team_players / _gen_ai_stats /
 # _generate_all_ai_players 안에서 매 팀·매 선수마다(최대 11만+회) 함수 내부
 # import로 다시 불러오고 있었다. sys.modules 캐시 덕에 모듈 재실행은 없지만,
@@ -120,7 +120,16 @@ def _retry_sqlite_op(fn, *args, **kwargs):
             with _pool_lock:
                 return fn(*args, **kwargs)
         except sqlite3.OperationalError as e:
-            msg = str(e)
+            # [2026-08 버그수정, 신민용 리포트: "abort due to ROLLBACK로 크래시
+            # 났다"] _TRANSIENT_SQLITE_ERRORS의 "abort due to rollback"이 전부
+            # 소문자인데, SQLite가 실제로 던지는 메시지는 "abort due to
+            # ROLLBACK"(SQL 키워드는 대문자로 남음)이다. 아래 `sig in msg`는
+            # 대소문자를 구분하는 부분 문자열 비교라 이 시그니처가 단 한 번도
+            # 안 걸렸고, 그 결과 이 함수가 지키려던 바로 그 케이스가 재시도
+            # 없이 그대로 위로 튀어(raise) 크래시로 이어졌다 — 방어 코드가
+            # 정작 자신이 막으려던 오류를 못 잡은 셈. 양쪽을 소문자로 맞춰
+            # 비교해서 SQLite 버전/빌드별 대소문자 차이에도 안전하게 한다.
+            msg = str(e).lower()
             if any(sig in msg for sig in _TRANSIENT_SQLITE_ERRORS):
                 last_err = e
                 time.sleep(0.03 * (attempt + 1))
@@ -396,7 +405,27 @@ def init_db():
         wins INTEGER DEFAULT 0, draws INTEGER DEFAULT 0,
         losses INTEGER DEFAULT 0, goals_for INTEGER DEFAULT 0,
         goals_against INTEGER DEFAULT 0,
+        classification_status TEXT NOT NULL DEFAULT 'NORMAL',
+        parent_team_id INTEGER,
+        review_reason TEXT,
         FOREIGN KEY(league_id) REFERENCES leagues(id))""")
+    # [2026-08 버그수정, 신민용 리포트: "no such column: parent_team_id"]
+    # CREATE TABLE IF NOT EXISTS는 teams가 이미 있는 기존 세이브(산하팀
+    # 컬럼 추가 이전에 생성된 DB)에서는 아무것도 안 하고 넘어간다 — 그런데
+    # 바로 아래 CREATE INDEX는 무조건 실행돼서, 새 컬럼이 없는 기존 DB에서
+    # "no such column" 에러로 죽었다. 인덱스를 걸기 전에 컬럼 존재 여부를
+    # 직접 확인하고, 없으면 ALTER TABLE로 추가해 새 DB/기존 DB 양쪽 모두
+    # 안전하게 만든다(재실행해도 안전 — 이미 있으면 건너뜀).
+    _existing_team_cols = {row[1] for row in c.execute("PRAGMA table_info(teams)").fetchall()}
+    if "classification_status" not in _existing_team_cols:
+        c.execute("ALTER TABLE teams ADD COLUMN classification_status TEXT NOT NULL DEFAULT 'NORMAL'")
+    if "parent_team_id" not in _existing_team_cols:
+        c.execute("ALTER TABLE teams ADD COLUMN parent_team_id INTEGER")
+    if "review_reason" not in _existing_team_cols:
+        c.execute("ALTER TABLE teams ADD COLUMN review_reason TEXT")
+
+    c.execute("CREATE INDEX IF NOT EXISTS idx_teams_parent_team_id ON teams(parent_team_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_teams_classification_status ON teams(classification_status)")
     c.execute("""CREATE TABLE IF NOT EXISTS player_names(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         country_id INTEGER, name TEXT,
@@ -620,6 +649,45 @@ def init_db():
         year INTEGER, competition TEXT, team_name TEXT, result TEXT,
         goals INTEGER DEFAULT 0, assists INTEGER DEFAULT 0,
         caps INTEGER DEFAULT 0, rating REAL DEFAULT 0)""")
+    # ── 유로파급/컨퍼런스급 대륙대항전 (2026-08 신설) ──
+    # cl_tournaments/cl_entries/cl_matches/cl_history와 완전히 동일한
+    # 최종 스키마(그동안의 ALTER TABLE 이력까지 전부 반영된 형태)를
+    # el_*(유로파급)/ecl_*(컨퍼런스급) 두 세트로 그대로 복제한다 —
+    # competition_common.py가 테이블명만 cfg로 받아 똑같은 쿼리를 쓰므로,
+    # 컬럼 구성이 cl_*와 정확히 같아야 한다.
+    for _prefix in ("el", "ecl"):
+        c.execute(f"""CREATE TABLE IF NOT EXISTS {_prefix}_tournaments(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            year INTEGER, continent TEXT, name TEXT,
+            status TEXT DEFAULT 'ko', first_stage TEXT DEFAULT 'R32',
+            winner_team_id INTEGER DEFAULT 0,
+            my_in INTEGER DEFAULT 0, my_result TEXT DEFAULT '',
+            my_team_id INTEGER DEFAULT 0, my_qualified INTEGER DEFAULT 0)""")
+        c.execute(f"""CREATE TABLE IF NOT EXISTS {_prefix}_entries(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tournament_id INTEGER, team_id INTEGER, team_name TEXT,
+            flag TEXT, country TEXT, grade TEXT, ovr REAL,
+            alive INTEGER DEFAULT 1, grp TEXT DEFAULT '')""")
+        c.execute(f"""CREATE TABLE IF NOT EXISTS {_prefix}_matches(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tournament_id INTEGER, stage TEXT, week INTEGER,
+            home_team_id INTEGER, away_team_id INTEGER,
+            home_score INTEGER DEFAULT -1, away_score INTEGER DEFAULT -1,
+            pso_winner INTEGER DEFAULT 0, pso_score TEXT DEFAULT '',
+            is_my INTEGER DEFAULT 0, slot INTEGER DEFAULT 0,
+            my_played INTEGER DEFAULT 0, my_position TEXT DEFAULT '',
+            my_saves INTEGER DEFAULT 0, my_goals INTEGER DEFAULT 0,
+            my_assists INTEGER DEFAULT 0, my_rating REAL DEFAULT 0,
+            my_shots INTEGER DEFAULT 0, my_shots_on INTEGER DEFAULT 0,
+            my_key_passes INTEGER DEFAULT 0, my_dribbles INTEGER DEFAULT 0,
+            my_blocks INTEGER DEFAULT 0, my_pass_acc REAL DEFAULT 0,
+            my_conceded INTEGER DEFAULT 0, grp TEXT DEFAULT '',
+            day INTEGER DEFAULT 0, my_absence_reason TEXT DEFAULT NULL)""")
+        c.execute(f"""CREATE TABLE IF NOT EXISTS {_prefix}_history(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            year INTEGER, competition TEXT, team_name TEXT, result TEXT,
+            goals INTEGER DEFAULT 0, assists INTEGER DEFAULT 0,
+            caps INTEGER DEFAULT 0, rating REAL DEFAULT 0)""")
     # ── 클럽 월드컵 (club_world_cup_engine, 2026-07 신설) ──
     # cl_tournaments/cl_entries/cl_matches와 동일한 구조를 그대로 따른다
     # (다른 화면/함수들이 그 패턴에 익숙하므로 재사용성을 최대화하기 위함).
@@ -1196,6 +1264,20 @@ def init_db():
         # career_entries(팀 재직 기간별 리그 기록)에도 같은 패턴(saves,
         # clean_sheets 등)으로 그 재직 기간 동안의 리그 레드카드 수를 남긴다.
         "ALTER TABLE career_entries ADD COLUMN red_cards INTEGER DEFAULT 0",
+        # [2026-08 신설, 신민용 설계 확정: "컵대회 본선은 실제 참가 가능
+        # 팀 수 기준으로 통일한다"] 예전엔 "합류할 티어가 다 떨어진 시점에
+        # 마침 몇 팀이 남아있는가"로 표준 강수(8/16/32/64강)가 정해졌다 —
+        # 그런데 그 "마침 남은 인원"은 그 전까지 각 예선 라운드에서 그냥
+        # 절반씩 걸러낸 결과일 뿐이라, 전체 참가 가능 팀 수(모든 참가
+        # 티어 합계)가 충분히 많아도(예: 대한민국 4~5부까지 합쳐 수십 팀)
+        # 마지막에 우연히 16 밑으로 떨어지면 8강부터 시작해버렸다. 이제
+        # 대회 개막 시점에 "이 대회에 총 몇 팀이 참가할 것인가"(모든
+        # 참가 티어의 팀 수 합계)를 미리 계산해 여기 저장하고, 그 값을
+        # 기준으로 표준 강수(_cup_bye_count의 cap)를 한 번 정해서
+        # 예선 라운드 내내 그 강수로 수렴시킨다(cup_engine.py 참고) —
+        # "마지막에 몇 명 남았는지"가 아니라 "원래 몇 팀이 있었는지"로
+        # 강수가 정해지게 한다.
+        "ALTER TABLE cup_tournaments ADD COLUMN standard_bracket_size INTEGER DEFAULT 0",
     ]:
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,
@@ -1892,6 +1974,20 @@ def seed_initial_data(progress_cb=None):
     _stage("리그·팀 생성", len(LEAGUE_DATA))
     _insert_leagues_and_teams(
         c, progress_cb=(lambda d, t, name: progress_cb("리그·팀 생성", d, t, name)) if progress_cb else None)
+
+    # [2026-08 신설] 산하팀(리저브/B팀/유스팀) 분류 적용.
+    # data/affiliate_raw.jsonl(GPT로 사전 분류·검증된 국가별 결과)을 읽어서
+    # 방금 생성된 teams row들에 classification_status/parent_team_id를 채운다.
+    # 이 시점에 해야 하는 이유: team_id가 실제로 배정된 직후라 이름 매칭이
+    # 가장 정확하고, 아직 승강/시즌 진행이 전혀 없어 current_tier가
+    # leagues.py 원본 tier와 100% 일치하는 상태이기 때문.
+    _stage("산하팀 분류 적용", 1)
+    try:
+        from affiliate_classify import apply_classification
+        apply_classification(c)
+    except Exception as _e:
+        print(f"[산하팀 분류 적용 오류] {_e}")
+    if progress_cb: progress_cb("산하팀 분류 적용", 1, 1, "")
 
     _stage("선수 이름 데이터 로딩", 1)
     _insert_player_names(c)
@@ -2948,13 +3044,35 @@ def _target_ovr(grade, tier, team_strength, role_idx, continent_bonus=0, prestig
     더해서 에이스일수록 보너스를 온전히 받고 벤치로 갈수록 비례해 줄어들게
     한다(스카우팅/인프라 우위가 에이스급에서 가장 크게 드러난다는 설계).
     [2026-08 신설] country: COUNTRY_LEAGUE_OVR_OVERRIDE 조회용, _tier_top_ovr로
-    그대로 전달."""
+    그대로 전달.
+    [2026-08 재수정] 위 클램프(하한 고정)를 실측해보니 부작용이 있었다 —
+    약체팀(team_strength=0)과 최강팀(team_strength=1) 둘 다 벤치 포지션
+    다수가 같은 고정 하한(84)에 몰려버려서, 정작 "팀간 실력 격차"가
+    거의 사라졌다(신민용 리포트: "포르투갈 1부가 85~87로만 뜬다" — 실측:
+    최약체 평균 85.0, 최강팀 평균 86.6, 격차 겨우 1.6점). 하한 자체를
+    team_strength에 비례해서 올린다 — 약체팀은 여전히 lo 근처까지 내려갈
+    수 있지만, 강팀은 그보다 확실히 높은 지점을 하한으로 삼는다. 그
+    결과 "선수 개인이 lo 밑으로는 절대 안 내려간다"는 보장은 유지하면서,
+    "약체팀 벤치 << 강팀 벤치"라는 팀간 격차도 되살아난다.
+    """
     prof = TEAM_ROLE_PROFILE.get(grade, TEAM_ROLE_PROFILE["F"])
     top = _tier_top_ovr(grade, tier, continent_bonus, country)
     # 팀 에이스 목표: 강팀일수록 리그 top에 근접
     ace = top * (prof["ace_lo"] + (1.0 - prof["ace_lo"]) * team_strength) + prestige_bonus
     role_mult = 1.0 - prof["spread"] * (role_idx / 10.0)
-    return ace * role_mult
+    result = ace * role_mult
+    ovr_rng = get_ovr_range(grade, tier, country)
+    if ovr_rng:
+        lo, hi = ovr_rng
+        # [2026-08] 하한 자체를 team_strength로 보간 — 0(최약체)이면 lo
+        # 그대로, 1(최강팀)이면 lo와 hi 사이 BENCH_FLOOR_GROWTH만큼 올라간
+        # 지점까지. 이렇게 하면 두 팀 다 "그 팀 나름의 하한" 밑으로는 안
+        # 내려가면서도, 강팀 하한이 약체팀 하한보다 확실히 높아 팀간 격차가
+        # 유지된다.
+        BENCH_FLOOR_GROWTH = 0.5
+        effective_lo = lo + (hi - lo) * BENCH_FLOOR_GROWTH * team_strength
+        result = max(result, effective_lo)
+    return result
 
 
 def _generate_all_ai_players(c, progress_cb=None):
@@ -3127,6 +3245,21 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
                 target = max(target, _elite_floor)
         stats = _gen_ai_stats(pos, target)
         ovr = calc_ovr(pos, stats)
+        # [2026-08 버그수정, 신민용 리포트: "새 게임으로 확인해도 여전히
+        # 84 밑으로 새는 선수가 있다"] _target_ovr가 목표치는 하한 이상으로
+        # 잘 잡아도, _gen_ai_stats가 그 목표 주변에 가우시안 노이즈(표준편차
+        # 3~4)를 섞어 실제 스탯을 생성하다 보니, calc_ovr로 재계산한 최종
+        # OVR이 우연히 목표보다 몇 점 낮게 나올 수 있었다(실측: 목표 84인데
+        # 실제 78까지 하락). 최종 OVR이 그 등급/티어/나라의 절대 하한보다
+        # 낮으면, 부족한 만큼 전체 스탯에 균등하게 더해 다시 맞춘다 — 스탯
+        # 간 상대적 개성(강점/약점 분포)은 그대로 유지하면서 최종 OVR만
+        # 하한 이상으로 끌어올린다(rescale_team_to_target_ovr과 동일 원리).
+        _abs_rng = get_ovr_range(grade, tier, team.get("cname", ""))
+        if _abs_rng and ovr < _abs_rng[0]:
+            _deficit = _abs_rng[0] - ovr
+            for _s in ALL_STATS:
+                stats[_s] = min(99, max(1, int(round(stats[_s] + _deficit))))
+            ovr = calc_ovr(pos, stats)
         # [AI 생애] 초기 나이: 16~34 삼각분포(25 봉우리). 시즌마다 +1 되며 성장/노화.
         age = int(round(random.triangular(16, 34, 25)))
         # [세부역할 2026-07] 포지션에 맞는 SUB_ROLES 중 하나를 무작위 배정.

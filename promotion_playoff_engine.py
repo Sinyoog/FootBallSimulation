@@ -226,8 +226,20 @@ def _finalize_boundary_match(conn, t, m, year: int) -> None:
                  (upper_lid, upper_tier, winner))
     conn.execute("UPDATE teams SET league_id=?, current_tier=? WHERE id=?",
                  (lower_lid, lower_tier, loser))
+    conn.commit()
 
     _invalidate_team_ovr_cache()
+
+    # [2026-08 신설, 신민용 리포트: "산하팀이 모팀이랑 같은 티어로 남아있는게
+    # 보인다"] 이 함수(플레이오프 boundary 확정)는 game_engine._process_
+    # promotion_relegation()의 산하팀-모팀 tier 검증 시점(43주차)보다 항상
+    # 늦게(44~52주) 일어난다 — 그래서 여기서 강등/승격된 팀이 모팀이면, 그
+    # 산하팀과의 tier 충돌이 다음 시즌 검증 때까지 방치됐었다. winner/loser
+    # 둘 다에 대해 그 즉시 재검증한다(둘 중 하나가 누군가의 모팀일 수
+    # 있으므로 — 방향에 상관없이 안전한 방어적 호출, 대부분은 no-op).
+    from game_engine import enforce_affiliate_children_tier
+    enforce_affiliate_children_tier(winner, year)
+    enforce_affiliate_children_tier(loser, year)
 
     # [2026-07 버그수정, 신민용 리포트: "우측 로그에 전 세계 승강전 결과가
     # 다 뜬다"] 예전엔 이 매치가 내 팀과 무관해도(전 세계 수백 개 경계 중
@@ -282,7 +294,7 @@ def process_po_week(week: int, day=None) -> None:
     _po_t0 = _time_po.perf_counter()
 
     tournaments = conn.execute(
-        "SELECT * FROM po_tournaments WHERE year=? AND status!='done'", (year,)).fetchall()
+        "SELECT * FROM po_tournaments WHERE year=? AND status!='done' ORDER BY id", (year,)).fetchall()
     if not tournaments:
         conn.close()
         return
@@ -292,15 +304,22 @@ def process_po_week(week: int, day=None) -> None:
     ph = ",".join("?" * len(t_ids))
 
     # 1) 오늘까지 도래한 미완료 경기 — 전체 활성 토너먼트를 한 번에 조회
+    # [2026-08 버그수정, 재현성 문제 추적 중 발견] ORDER BY 없이 조회한
+    # 순서 그대로 _sim_one()을 돌리면(_sim_one이 내부에서 random을 씀)
+    # SQLite가 이 순서를 보장 안 해줘서 동일 seed로도 실행마다 결과가
+    # 달라지는 원인이 됐다 — id 순으로 고정해서 매 실행 동일한 순서로
+    # random을 소비하게 만든다.
     if day is not None:
         due_rows = conn.execute(
             f"""SELECT * FROM po_matches WHERE tournament_id IN ({ph})
-                AND home_score=-1 AND home_team_id!=0 AND away_team_id!=0 AND day<=?""",
+                AND home_score=-1 AND home_team_id!=0 AND away_team_id!=0 AND day<=?
+                ORDER BY id""",
             (*t_ids, day)).fetchall()
     else:
         due_rows = conn.execute(
             f"""SELECT * FROM po_matches WHERE tournament_id IN ({ph})
-                AND home_score=-1 AND home_team_id!=0 AND away_team_id!=0""",
+                AND home_score=-1 AND home_team_id!=0 AND away_team_id!=0
+                ORDER BY id""",
             t_ids).fetchall()
     for m in due_rows:
         _sim_one(conn, dict(m))
@@ -351,7 +370,7 @@ def process_po_week(week: int, day=None) -> None:
     #    리그 이동/로그가 중복된다).
     boundary_rows = conn.execute(
         f"""SELECT * FROM po_matches WHERE tournament_id IN ({ph})
-            AND is_boundary=1 AND home_score!=-1 AND finalized=0""", t_ids).fetchall()
+            AND is_boundary=1 AND home_score!=-1 AND finalized=0 ORDER BY id""", t_ids).fetchall()
     for m in boundary_rows:
         t = t_by_id.get(m["tournament_id"])
         if not t:
@@ -373,6 +392,12 @@ def process_po_week(week: int, day=None) -> None:
         conn.executemany(
             "UPDATE po_tournaments SET status='done' WHERE id=?",
             [(tid,) for tid in done_tids])
+        # [2026-08 신설] 이번 처리에서 새로 끝난 경계가 있으면, "매치 처리
+        # 순서" 문제로 되돌려진 산하팀-모팀 충돌이 없는지 한 번 더 훑는다
+        # (enforce_affiliate_children_tier 개별 hook 참고 — sweep_all_
+        # affiliate_conflicts 문서 참조).
+        from game_engine import sweep_all_affiliate_conflicts
+        sweep_all_affiliate_conflicts(year)
 
     conn.commit()
     conn.close()

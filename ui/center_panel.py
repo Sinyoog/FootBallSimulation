@@ -1052,6 +1052,7 @@ class CenterPanel(QWidget):
             if cl_m:
                 return {
                     "cl": True,
+                    "cl_kind": "champions",
                     "tournament_id": cl_m["tournament_id"],
                     "league_name": cl_m.get("league_name", ""),
                     "stage": cl_m.get("stage", "group"),
@@ -1071,6 +1072,7 @@ class CenterPanel(QWidget):
                     if _ct and _ct.get("status") != "done":
                         return {
                             "cl": True,
+                            "cl_kind": "champions",
                             "tournament_id": _ct["id"],
                             "league_name": _ct["name"],
                             "stage": "group",
@@ -1078,6 +1080,39 @@ class CenterPanel(QWidget):
                             "grp": cl_gi["grp"],
                             "week": week,
                         }
+        except Exception:
+            pass
+        # 유로파리그급/컨퍼런스리그급 확인 (2026-08 신설, 챔스와 동일 주차)
+        try:
+            import europa_engine
+            el_m = europa_engine.get_my_el_match(week, p=p)
+            if el_m:
+                return {
+                    "cl": True,
+                    "cl_kind": "europa",
+                    "tournament_id": el_m["tournament_id"],
+                    "league_name": el_m.get("league_name", ""),
+                    "stage": el_m.get("stage", "league"),
+                    "stage_ko": el_m.get("stage_ko", ""),
+                    "grp": el_m.get("grp", ""),
+                    "week": week,
+                }
+        except Exception:
+            pass
+        try:
+            import conference_engine
+            ecl_m = conference_engine.get_my_ecl_match(week, p=p)
+            if ecl_m:
+                return {
+                    "cl": True,
+                    "cl_kind": "conference",
+                    "tournament_id": ecl_m["tournament_id"],
+                    "league_name": ecl_m.get("league_name", ""),
+                    "stage": ecl_m.get("stage", "league"),
+                    "stage_ko": ecl_m.get("stage_ko", ""),
+                    "grp": ecl_m.get("grp", ""),
+                    "week": week,
+                }
         except Exception:
             pass
         # 클럽 월드컵 확인 (43~52주, 4년에 한 번)
@@ -1116,6 +1151,12 @@ class CenterPanel(QWidget):
             return True
         import champions_engine
         if champions_engine.has_my_cl_match_between(week, week):
+            return True
+        import europa_engine
+        if europa_engine.has_my_el_match_between(week, week):
+            return True
+        import conference_engine
+        if conference_engine.has_my_ecl_match_between(week, week):
             return True
         import cup_engine
         if cup_engine.has_my_cup_match_between(week, week):
@@ -1779,7 +1820,18 @@ class CenterPanel(QWidget):
         import champions_engine
         cm = champions_engine.get_my_cl_match(week, day=day, p=p, st=st)
         if cm:
+            cm["cl_kind"] = "champions"
             return cm
+        import europa_engine
+        elm = europa_engine.get_my_el_match(week, day=day, p=p, st=st)
+        if elm:
+            elm["cl_kind"] = "europa"
+            return elm
+        import conference_engine
+        eclm = conference_engine.get_my_ecl_match(week, day=day, p=p, st=st)
+        if eclm:
+            eclm["cl_kind"] = "conference"
+            return eclm
         import cup_engine
         return cup_engine.get_my_cup_match(week, day=day, p=p, st=st)
 

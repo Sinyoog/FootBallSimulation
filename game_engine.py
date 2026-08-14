@@ -5,6 +5,9 @@ import json
 import sqlite3
 import intl_engine
 import champions_engine
+import europa_engine
+import conference_engine
+import continental_qualification
 import cup_engine
 import club_world_cup_engine
 import promotion_playoff_engine
@@ -1313,18 +1316,32 @@ def advance_4weeks(schedule: list):
             if isinstance(detail, dict) and detail.get("intl"):
                 intl_engine.simulate_my_match(week, p)
             elif isinstance(detail, dict) and detail.get("cl"):
-                champions_engine.simulate_my_cl_match(week, p)
+                _kind = detail.get("cl_kind", "champions")
+                if _kind == "europa":
+                    europa_engine.simulate_my_el_match(week, p)
+                elif _kind == "conference":
+                    conference_engine.simulate_my_ecl_match(week, p)
+                else:
+                    champions_engine.simulate_my_cl_match(week, p)
             else:
                 _simulate_match(p, week, detail)
         else:
             im = intl_engine.get_my_match(week)
             cm = champions_engine.get_my_cl_match(week)
+            elm = europa_engine.get_my_el_match(week)
+            eclm = conference_engine.get_my_ecl_match(week)
             if im:
                 _had_match = True
                 intl_engine.simulate_my_match(week, p)
             elif cm:
                 _had_match = True
                 champions_engine.simulate_my_cl_match(week, p)
+            elif elm:
+                _had_match = True
+                europa_engine.simulate_my_el_match(week, p)
+            elif eclm:
+                _had_match = True
+                conference_engine.simulate_my_ecl_match(week, p)
             else:
                 _process_training(p, week, stype, detail)
                 _sim_my_unscheduled_match(week, p, cur_season)
@@ -1333,6 +1350,8 @@ def advance_4weeks(schedule: list):
         #  루프 상단의 p 를 그대로 재사용한다. 불필요한 get_player() 재조회 제거.)
         intl_engine.process_intl_week(week)
         champions_engine.process_cl_week(week)
+        europa_engine.process_el_week(week)
+        conference_engine.process_ecl_week(week)
         club_world_cup_engine.process_cwc_week(week)
         _sim_all_ai_matches(week, p.get("current_league_id", 0), cur_season)
 
@@ -1405,10 +1424,16 @@ def advance_days(schedule: list):
     from constants import DAYS_PER_WEEK, day_to_week
 
     p = get_player()
-    if not p: return
+    if not p:
+        print("[ADVANCE] EXIT reason=no_player(진입시점)")
+        return
 
     st = get_state()
+    print(f"[ADVANCE] ENTER schedule_len={len(schedule)} first_day={schedule[0][0] if schedule else None} "
+          f"current_day={st.get('current_day')} current_week={st.get('current_week')} "
+          f"current_season={st.get('current_season')} current_year={st.get('current_year')}")
     if not schedule:
+        print("[ADVANCE] EXIT reason=empty_schedule")
         return
 
     if p.get("current_team_id"):
@@ -1421,6 +1446,7 @@ def advance_days(schedule: list):
             # 플레이어가 사라질 수 있다 — 매 반복 재조회한 p를 여기서도 다시
             # None 체크 안 하고 바로 p.get(...)을 불러 크래시가 났었다
             # (AttributeError: 'NoneType' object has no attribute 'get').
+            print(f"[ADVANCE] EXIT reason=no_player(루프중) requested_day={day}")
             break
         st = get_state()
         cur_day = st.get("current_day") or ((st["current_week"] - 1) * DAYS_PER_WEEK + 1)
@@ -1429,6 +1455,9 @@ def advance_days(schedule: list):
 
         # 안전장치: schedule이 가리키는 날짜와 실제 현재 날짜가 다르면 멈춘다.
         if day != cur_day:
+            print(f"[ADVANCE] EXIT reason=day_mismatch requested_day={day} cur_day={cur_day} "
+                  f"week={week} current_week={st['current_week']} current_season={cur_season} "
+                  f"current_year={st.get('current_year')}")
             break
 
         # [2026-08 계측 추가, 신민용 리포트: "진행 버튼 누를 때 멈칫하는 게
@@ -1455,7 +1484,13 @@ def advance_days(schedule: list):
             if isinstance(detail, dict) and detail.get("intl"):
                 intl_engine.sim_my_match_as_ai(week, p, reason="injury", day=day)
             elif isinstance(detail, dict) and detail.get("cl"):
-                champions_engine.sim_my_cl_match_as_ai(week, p, reason="injury", day=day)
+                _kind = detail.get("cl_kind", "champions")
+                if _kind == "europa":
+                    europa_engine.sim_my_el_match_as_ai(week, p, reason="injury", day=day)
+                elif _kind == "conference":
+                    conference_engine.sim_my_ecl_match_as_ai(week, p, reason="injury", day=day)
+                else:
+                    champions_engine.sim_my_cl_match_as_ai(week, p, reason="injury", day=day)
             elif isinstance(detail, dict) and detail.get("cup"):
                 cup_engine.sim_my_cup_match_as_ai(week, p, reason="injury", day=day)
             elif isinstance(detail, dict) and detail.get("cwc"):
@@ -1475,6 +1510,10 @@ def advance_days(schedule: list):
                     intl_engine.sim_my_match_as_ai(week, p, reason="injury", day=day)
                 elif day == _intl_cl_day and champions_engine.get_my_cl_match(week, day=day):
                     champions_engine.sim_my_cl_match_as_ai(week, p, reason="injury", day=day)
+                elif day == _intl_cl_day and europa_engine.get_my_el_match(week, day=day):
+                    europa_engine.sim_my_el_match_as_ai(week, p, reason="injury", day=day)
+                elif day == _intl_cl_day and conference_engine.get_my_ecl_match(week, day=day):
+                    conference_engine.sim_my_ecl_match_as_ai(week, p, reason="injury", day=day)
                 elif day == _intl_cl_day and cup_engine.get_my_cup_match(week, day=day):
                     cup_engine.sim_my_cup_match_as_ai(week, p, reason="injury", day=day)
                 elif club_world_cup_engine.get_my_cwc_match(week, day=day):
@@ -1488,7 +1527,13 @@ def advance_days(schedule: list):
             if isinstance(detail, dict) and detail.get("intl"):
                 intl_engine.simulate_my_match(week, p, day=day)
             elif isinstance(detail, dict) and detail.get("cl"):
-                champions_engine.simulate_my_cl_match(week, p, day=day)
+                _kind = detail.get("cl_kind", "champions")
+                if _kind == "europa":
+                    europa_engine.simulate_my_el_match(week, p, day=day)
+                elif _kind == "conference":
+                    conference_engine.simulate_my_ecl_match(week, p, day=day)
+                else:
+                    champions_engine.simulate_my_cl_match(week, p, day=day)
             elif isinstance(detail, dict) and detail.get("cup"):
                 cup_engine.simulate_my_cup_match(week, p, day=day)
             elif isinstance(detail, dict) and detail.get("cwc"):
@@ -1503,11 +1548,13 @@ def advance_days(schedule: list):
             # matches는 아직 day가 전부 0(스키마 기본값)이라 day만으로
             # 걸러지지 않는다(그 주 아무 날에나 걸림 → 메인화면에 같은
             # 미완료 경기가 여러 날 반복 표시되는 원인이었다). day가 있는
-            # intl/cwc만 day로 직접 확인하고, 아직 없는 챔스/컵은 예전처럼
-            # _week_intl_cl_day가 정한 '그 주의 딱 하루'에만 확인한다.
+            # intl/cwc만 day로 직접 확인하고, 아직 없는 챔스/유로파/컨퍼런스/
+            # 컵은 예전처럼 _week_intl_cl_day가 정한 '그 주의 딱 하루'에만 확인한다.
             _intl_cl_day = _week_intl_cl_day(week, p)
             im = intl_engine.get_my_match(week, day=day)
             cm = champions_engine.get_my_cl_match(week, day=day) if day == _intl_cl_day else None
+            elm = europa_engine.get_my_el_match(week, day=day) if day == _intl_cl_day else None
+            eclm = conference_engine.get_my_ecl_match(week, day=day) if day == _intl_cl_day else None
             cu = cup_engine.get_my_cup_match(week, day=day) if day == _intl_cl_day else None
             cw = club_world_cup_engine.get_my_cwc_match(week, day=day)
             po = promotion_playoff_engine.get_my_po_match(week, day=day)
@@ -1517,6 +1564,12 @@ def advance_days(schedule: list):
             elif cm:
                 _had_match = True
                 champions_engine.simulate_my_cl_match(week, p, day=day)
+            elif elm:
+                _had_match = True
+                europa_engine.simulate_my_el_match(week, p, day=day)
+            elif eclm:
+                _had_match = True
+                conference_engine.simulate_my_ecl_match(week, p, day=day)
             elif cu:
                 _had_match = True
                 cup_engine.simulate_my_cup_match(week, p, day=day)
@@ -1648,6 +1701,8 @@ def advance_days(schedule: list):
             # intl_engine.process_intl_week(week)는 위에서 이미 매일 호출함
             _pw_t1 = _time_mod.perf_counter()
             champions_engine.process_cl_week(week)
+            europa_engine.process_el_week(week)
+            conference_engine.process_ecl_week(week)
             _pw_t2 = _time_mod.perf_counter()
             # club_world_cup_engine.process_cwc_week(week, day=day)는
             # 위에서 이미 매일 호출함 (2026-07 버그수정, 위 주석 참고)
@@ -1737,6 +1792,8 @@ def advance_days(schedule: list):
         try:
             from constants import INTL_CALLUP_WEEK as _ICW2
             if is_week_last_day and week == _ICW2 - 1 and intl_engine.get_pending_choice():
+                print(f"[ADVANCE] EXIT reason=intl_pending_choice day={day} week={week} "
+                      f"pending={intl_engine.get_pending_choice()}")
                 break
         except Exception:
             pass
@@ -1921,7 +1978,8 @@ def _sim_all_ai_matches(week, my_league_id, season):
 
     c.execute("""SELECT mr.id, mr.home_team_id, mr.away_team_id, mr.league_id
                  FROM match_results mr
-                 WHERE mr.week=? AND mr.home_score=-1 AND mr.season=?""",
+                 WHERE mr.week=? AND mr.home_score=-1 AND mr.season=?
+                 ORDER BY mr.id""",
               (week, season))
     matches = c.fetchall()
     _sim_t1 = _time_sim.perf_counter()
@@ -2866,9 +2924,32 @@ def _team_avg_ovr(c, team_id):
     # update_club_strength_after_season()(_process_promotion_relegation에서
     # 매 시즌 호출)이 실제 순위로 이 값을 계속 갱신한다 — 그래서 몇 시즌
     # 내내 못하면 명문팀도 서서히 이 보너스를 잃는다.
+    # [2026-08 버그수정] club_strength 원래 값(-10~+12)을 그대로 더하면
+    # 순수 스쿼드 OVR 격차(같은 리그 팀 간 보통 4~5점)를 완전히 뒤엎는
+    # 크기라 최근 성적(club_strength)이 스쿼드 실력보다 매치 결과를 더
+    # 좌우하는 문제가 있었다(constants.CLUB_STRENGTH_MATCH_WEIGHT 주석
+    # 참고). 매치 강도 계산에만 가중치를 곱해 축소한다 — club_strength
+    # 원본 값 자체(부전승 방어선, 신인 OVR 보정 등 다른 용도)는 그대로.
+    from constants import CLUB_STRENGTH_MATCH_WEIGHT, PRESTIGE_LEVEL_MATCH_BONUS
     cs_row = c.execute("SELECT club_strength FROM teams WHERE id=?", (team_id,)).fetchone()
     if cs_row and cs_row["club_strength"]:
-        val += cs_row["club_strength"]
+        val += cs_row["club_strength"] * CLUB_STRENGTH_MATCH_WEIGHT
+    # [2026-08 신설, 신민용 설계 확정: "명문팀 우승 비율이 너무 낮다"]
+    # club_strength(변동, 실적 기반)만으로는 명문 등급별 우승 비율 목표에
+    # 크게 못 미쳤다(실측: 독일 10%, 스페인 15% 등 — 목표는 65~85%,
+    # 70~85%). 등급(3/2/1)에 따라 매치 강도에 고정 보너스를 더한다 —
+    # club_strength처럼 성적에 따라 오르내리지 않고, "그 팀이 명문이라는
+    # 사실 자체"에서 나오는 꾸준한 이점(선수단 깊이·인프라 등)을 표현한다.
+    # is_prestige()/prestige_level()과 같은 원칙대로 강등돼도 등급을
+    # 유지한다(원래 명문이었다는 사실 자체는 안 바뀌므로).
+    _pinfo = c.execute("""SELECT t.name AS tname, cn.name AS cname
+                          FROM teams t JOIN countries cn ON t.country_id = cn.id
+                          WHERE t.id=?""", (team_id,)).fetchone()
+    if _pinfo:
+        from data.prestige_clubs import prestige_level
+        _plevel = prestige_level(_pinfo["cname"], _pinfo["tname"])
+        if _plevel:
+            val += PRESTIGE_LEVEL_MATCH_BONUS.get(_plevel, 0.0)
     _team_ovr_cache[team_id] = val
     return val
 
@@ -5640,15 +5721,16 @@ def _advance_week(p, base_week, n_weeks=4):
         except Exception as e:
             add_log(f"⚠ 국제대회 생성 오류: {e}", "event")
 
-    # CL_START_WEEK(8주차) 진입: 클럽 대륙 챔피언스리그 시작 (매년)
-    #   출전팀 선발은 직전 시즌(이미 끝난 시즌)의 최종 순위 기준
-    #   (start_champions_league 내부에서 season-1로 조회).
+    # CL_START_WEEK(8주차) 진입: 클럽 대항전(챔스/유로파/컨퍼런스) 3개
+    # 동시 시작 (매년). 출전팀 선발은 직전 시즌(이미 끝난 시즌)의 최종
+    # 순위 기준 — continental_qualification이 대륙당 국가 순위 계산을
+    # 1번만 하고 세 대회에 나눠준다(2026-08, 예전엔 챔스만 있었음).
     from champions_engine import CL_START_WEEK
     if new_week == CL_START_WEEK:
         try:
-            champions_engine.start_champions_league(new_year, new_season)
+            continental_qualification.start_all_continental_competitions(new_year, new_season)
         except Exception as e:
-            add_log(f"⚠ 챔피언스리그 생성 오류: {e}", "event")
+            add_log(f"⚠ 클럽 대항전 생성 오류: {e}", "event")
 
     # [2026-07 신설] 5주차 진입: 국내 컵대회(FA컵식) 개막 (챔스 시작보다
     # 앞서서, 1~2부 팀 전체로 대진을 짠다).
@@ -6157,6 +6239,8 @@ def get_club_other_competitions_summary(team_id, start_year, end_year):
     rating_sum, rating_cnt = 0.0, 0
     for m_table, t_table in (("cup_matches", "cup_tournaments"),
                              ("cl_matches", "cl_tournaments"),
+                             ("el_matches", "el_tournaments"),
+                             ("ecl_matches", "ecl_tournaments"),
                              ("cwc_matches", "cwc_tournaments")):
         rows = conn.execute(
             f"""SELECT m.my_goals, m.my_assists, m.my_rating FROM {m_table} m
@@ -6237,6 +6321,8 @@ def get_full_history_extras_for_period(team_id, nationality, start_year, end_yea
 
     for tbl, tour_tbl in (("cup_matches", "cup_tournaments"),
                           ("cl_matches", "cl_tournaments"),
+                          ("el_matches", "el_tournaments"),
+                          ("ecl_matches", "ecl_tournaments"),
                           ("cwc_matches", "cwc_tournaments")):
         avail_row = c.execute(
             f"""SELECT COUNT(*) n FROM {tbl} m JOIN {tour_tbl} t ON m.tournament_id=t.id
@@ -6366,6 +6452,8 @@ def get_club_and_total_extras_for_period(team_id, nationality, start_year, end_y
     club_m = club_g = club_a = 0
     for tbl, tour_tbl in (("cup_matches", "cup_tournaments"),
                           ("cl_matches", "cl_tournaments"),
+                          ("el_matches", "el_tournaments"),
+                          ("ecl_matches", "ecl_tournaments"),
                           ("cwc_matches", "cwc_tournaments")):
         row = c.execute(
             f"""SELECT COUNT(*) n, COALESCE(SUM(m.my_goals),0) g, COALESCE(SUM(m.my_assists),0) a
@@ -8384,12 +8472,116 @@ def _finalize_club_season(p, year):
           f"promotion_relegation={_tfcs2-_tfcs1:.3f}s")
 
 
+def sweep_all_affiliate_conflicts(year: int) -> None:
+    """[2026-08 신설] enforce_affiliate_children_tier()는 boundary match 1건이
+    끝날 때마다 그 즉시 호출되는데, 같은 플레이오프 주간(44~52주) 안에서
+    "먼저 끝난 경계"의 교정이 "나중에 끝나는 다른 경계"의 결과로 다시
+    덮어써지는 경우가 실측으로 발견됐다 — 예: 산하팀이 tier2→3으로
+    강제 강등됐는데, 그 팀이 애초에 다른 tier1/2 경계 PO에도 이미
+    참가자로 확정돼 있었다면(day300 시점 대진표는 고정), 그 경기가 나중에
+    끝나면서 승리 시 다시 tier2로 되돌려버린다. 개별 hook만으로는 이런
+    "매치 처리 순서" 문제를 완전히 막을 수 없어서, 그 주(week)의 PO 처리가
+    끝날 때마다 전체 산하팀-모팀 쌍을 한 번 더 훑어 남은 충돌을 정리한다
+    (parent_team_id가 있는 팀 수만큼만 순회 — 팀 전체 스캔보다 훨씬 가벼움).
+    """
+    import constants
+    if not getattr(constants, "AFFILIATE_PROMOTION_RESTRICTION", False):
+        return
+    conn = get_conn()
+    c = conn.cursor()
+    parent_ids = {r["parent_team_id"] for r in c.execute(
+        "SELECT DISTINCT parent_team_id FROM teams WHERE parent_team_id IS NOT NULL").fetchall()}
+    for pid in parent_ids:
+        enforce_affiliate_children_tier(pid, year)
+
+
+def enforce_affiliate_children_tier(parent_team_id: int, year: int) -> None:
+    """[2026-08 신설, 신민용 리포트: "산하팀이 모팀이랑 같은 티어로 남아있는게
+    보인다" — 근본 원인 수정] '산하팀은 항상 모팀보다 낮은 tier'라는 불변식은
+    기존에 _process_promotion_relegation()(연 1회, CLUB_SEASON_END_DAY=43주차)
+    안에서만 검사됐다. 그런데 승강 플레이오프(promotion_playoff_engine, 44~52주)
+    는 그 검사 *이후*에 진행되고, 거기서 결정되는 승격/강등은 이 함수가 다시
+    돌기 전까지(=다음 시즌 43주차, 최대 약 1시즌 가까이) 전혀 재검증되지 않아
+    모팀이 플레이오프로 강등되면 산하팀과 tier가 같아지거나 역전된 상태로
+    한 시즌 내내 방치됐다(실측 확인: 예를 들어 VfL 오스나브뤼크가 PO로
+    강등되면 VfL 오스나브뤼크 II가 그 시즌 내내 모팀과 동일 tier로 남음).
+
+    이 함수는 promotion_playoff_engine._finalize_boundary_match()가 팀 tier를
+    바꿀 때마다(승격/강등 양쪽 다) 그 즉시 호출된다 — 방금 tier가 바뀐 팀을
+    "모팀"으로 놓고, 그 팀을 parent_team_id로 참조하는 산하팀들의 tier를
+    검사해 즉시 보정한다. 산하팀 자신도 다른 팀의 모팀일 수 있으므로(다단계
+    산하 구조 대비) 큐 방식으로 재귀 처리한다.
+
+    _process_promotion_relegation의 '경우 ②'(산하팀은 안 움직였는데 모팀이
+    강등돼 충돌 발생 → 산하팀 1티어 추가 강등)와 판정 로직은 동일하되, 시즌
+    끝을 기다리지 않고 그 순간 즉시 반영한다는 점만 다르다.
+    """
+    import constants
+    if not getattr(constants, "AFFILIATE_PROMOTION_RESTRICTION", False):
+        return
+    conn = get_conn()
+    c = conn.cursor()
+
+    queue = [parent_team_id]
+    seen = set()
+    any_change = False
+    while queue:
+        pid = queue.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        prow = c.execute("SELECT current_tier, country_id FROM teams WHERE id=?", (pid,)).fetchone()
+        if not prow:
+            continue
+        p_tier = prow["current_tier"]
+        country_id = prow["country_id"]
+        max_tier_row = c.execute(
+            "SELECT MAX(tier) FROM leagues WHERE country_id=?", (country_id,)).fetchone()
+        max_tier = max_tier_row[0] if max_tier_row and max_tier_row[0] else p_tier
+
+        children = c.execute(
+            "SELECT id, name, current_tier FROM teams WHERE parent_team_id=?", (pid,)).fetchall()
+        for child in children:
+            child_tier = child["current_tier"]
+            if child_tier > p_tier:
+                continue  # 정상 — 이미 모팀보다 아래
+            if child_tier >= max_tier:
+                # 이미 그 나라 최하위 tier — 더 내려갈 데가 없는 구조적 한계
+                # (기존 정책과 동일하게 예외로 허용).
+                continue
+            new_tier = child_tier + 1
+            cur_lid_row = c.execute(
+                "SELECT id FROM leagues WHERE country_id=? AND tier=?",
+                (country_id, child_tier)).fetchone()
+            new_lid_row = c.execute(
+                "SELECT id FROM leagues WHERE country_id=? AND tier=?",
+                (country_id, new_tier)).fetchone()
+            if not new_lid_row:
+                continue
+            c.execute("UPDATE teams SET league_id=?, current_tier=? WHERE id=?",
+                      (new_lid_row["id"], new_tier, child["id"]))
+            c.execute(
+                """INSERT INTO promotion_log(year,team_name,from_tier,to_tier,league_name,
+                                              from_league_id,to_league_id) VALUES(?,?,?,?,?,?,?)""",
+                (year, child["name"], child_tier, new_tier, "",
+                 cur_lid_row["id"] if cur_lid_row else None, new_lid_row["id"]))
+            print(f"[산하팀 tier 보정-PO] {year}년 {child['name']} 강제 강등 "
+                  f"{child_tier}부→{new_tier}부 (모팀 플레이오프 결과와 tier 충돌 즉시 회피)")
+            any_change = True
+            queue.append(child["id"])  # 이 산하팀 밑에 또 산하팀이 있을 수 있음
+
+    if any_change:
+        conn.commit()
+        _invalidate_team_ovr_cache()
+
+
 def _process_promotion_relegation(year, season_avg_rating=6.0):
     # [2026-08 계측 추가, 신민용 리포트: "43주 44주 45주 렉 언제 고칠거야"]
     # 지난번엔 이 함수 전체(0.48~0.54s)에 바깥쪽 타이머만 달았지 내부는
     # 아직 못 쪼갰다 — 원인 확정 전이므로 로직은 그대로 두고 구간별 시간만
     # 촘촘히 찍는다.
     import time as _time_pr
+    import constants
     _pr_t0 = _time_pr.perf_counter()
 
     conn = get_conn()
@@ -8480,6 +8672,7 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
             lid = r["league_id"]
             if lid in by_league:
                 by_league[lid][r["id"]] = {"id": r["id"], "name": r["name"],
+                                            "classification_status": r["classification_status"],
                                             "pts": 0, "gd": 0, "gf": 0, "gp": 0}
 
         # [버그수정] conn.cursor()는 _PooledCursor(재시도 방어 래퍼, __slots__로
@@ -8515,12 +8708,17 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
 
     # [최적화] 전체 리그 맵을 1회 SELECT로 미리 빌드 (기존: cids×tier 개별 SELECT 275회)
     all_leagues_rows = c.execute(
-        "SELECT id, country_id, tier FROM leagues").fetchall()
+        "SELECT id, country_id, tier FROM leagues ORDER BY id").fetchall()
     # {(country_id, tier): league_id}
     _league_map: dict = {(r["country_id"], r["tier"]): r["id"] for r in all_leagues_rows}
     # {country_id: {tier: league_id}}
-    cids = list({r["country_id"] for r in all_leagues_rows
-                 if r["tier"] == 1})
+    # [2026-08 버그수정, 재현성 문제 추적 중 발견] list(set(...))는 set의
+    # 내부 해시 테이블 레이아웃에 좌우돼 실행마다 순서가 달라질 위험이
+    # 있다(이 순서가 country 처리 순서를 정하고, 그 순서가 club_strength
+    # 강등 방어 로직 등에서 random 소비 순서를 바꿔 재현성을 깬다) —
+    # sorted()로 country_id 값 기준 고정 순서를 강제한다.
+    cids = sorted({r["country_id"] for r in all_leagues_rows
+                   if r["tier"] == 1})
 
     # [버그수정 2026-07] 승강제 경계 순회가 "for tier in [1,2,3,4]"로 고정돼
     # 있어서 최대 5부(4↔5 경계)까지만 처리됐다 — 지금은 S급 5부제라 우연히
@@ -8542,8 +8740,9 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
     _pr_t1 = _time_pr.perf_counter()
 
     _all_team_rows = c.execute(
-        "SELECT t.id, t.name, t.league_id, l.name as lname "
-        "FROM teams t JOIN leagues l ON t.league_id=l.id").fetchall()
+        "SELECT t.id, t.name, t.league_id, t.country_id, t.classification_status, "
+        "t.current_tier, t.parent_team_id, l.name as lname "
+        "FROM teams t JOIN leagues l ON t.league_id=l.id ORDER BY t.id").fetchall()
     _pr_t2 = _time_pr.perf_counter()
 
     # standings 캐시: {league_id: [sorted rows]}
@@ -8701,7 +8900,44 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
                                f"{winner_info['lname']} 우승 (1부 리그 챔피언)"))
                     pending_logs.append((f"🏆 {year}년  {winner_info['name']}  1부 리그 우승!", "event"))
 
+    def _select_promotion_eligible(rows, count, moved_teams, restrict):
+        """rows: 순위 정렬된 standings(1위부터). count: 필요한 인원.
+        restrict=False면 기존과 완전히 동일(순서대로 count명 자르기).
+        restrict=True면 이미 이동 처리된 팀은 건너뛰고, classification_status
+        가 'NORMAL'이 아닌 팀도 건너뛰면서 전체 테이블을 훑어 내려가
+        승격 자격이 있는 팀을 count명 채운다(부족하면 그만큼만 반환 —
+        억지로 REVIEW/AFFILIATE를 채워넣지 않는다)."""
+        out = []
+        for r in rows:
+            if r["id"] in moved_teams:
+                continue
+            if restrict and r.get("classification_status", "NORMAL") != "NORMAL":
+                continue
+            out.append(r)
+            if len(out) >= count:
+                break
+        return out
+
     moved_teams: set = set()
+
+    # [2026-08 신설] 산하팀은 항상 모팀보다 낮은 tier에 있어야 한다는
+    # 불변식을 이번 시즌 승강 처리 끝에 검증하기 위한 상태.
+    # pending_tier: 이번 시즌 각 팀의 "확정된" tier — current_tier를
+    # 중간에 그대로 참조하면 이 함수 실행 도중(경계 처리 순서상 아직
+    # 반영 전인) stale 값을 보게 되므로, 루프 안에서 팀이 이동될 때마다
+    # 여기 직접 갱신한다.
+    _pending_tier: dict = {r["id"]: r["current_tier"] for r in _all_team_rows}
+    _original_tier: dict = dict(_pending_tier)  # 승격 취소 시 되돌릴 원래 tier
+    _original_league: dict = {r["id"]: r["league_id"] for r in _all_team_rows}
+    _promo_log_entry_for_team: dict = {}  # team_id -> _promotion_log_inserts에 넣은 그 튜플(취소 시 제거용)
+    _parent_of: dict = {r["id"]: r["parent_team_id"] for r in _all_team_rows if r["parent_team_id"]}
+    _classification_of: dict = {r["id"]: r["classification_status"] for r in _all_team_rows}
+    _country_of: dict = {r["id"]: r["country_id"] for r in _all_team_rows}
+    # [2026-08 신설] 강등 시 prestige_level(country, name) 판정용 country_id
+    # -> 국가명 캐시. 위 country_id 캐시와 별개 쿼리 1회만 추가(팀 수와
+    # 무관하게 country 테이블 1회 스캔이라 저렴).
+    _country_name_by_id: dict = {r["id"]: r["name"] for r in c.execute(
+        "SELECT id, name FROM countries").fetchall()}
     _rescale_jobs: list = []
     _momentum_reset_updates: list = []  # [2026-08 신설] (momentum_type, seasons_left, team_id) — 이벤트 발생 시 리셋
     # [2026-07 최적화, 신민용 리포트: "연도전환 최적화 더 해봐"] 승격/강등
@@ -8749,7 +8985,12 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
             auto_count = max(0, min(auto_count, len(upper_rows) // 2, len(lower_rows)))
 
             auto_upper_cands = [r for r in upper_rows[-auto_count:] if r["id"] not in moved_teams] if auto_count else []
-            auto_lower_cands = [r for r in lower_rows[:auto_count] if r["id"] not in moved_teams] if auto_count else []
+            auto_lower_cands = (
+                _select_promotion_eligible(
+                    lower_rows, auto_count, moved_teams,
+                    constants.AFFILIATE_PROMOTION_RESTRICTION)
+                if auto_count else []
+            )
             # 승격 인원과 강등 인원이 달라지면 리그별 총 팀 수가 어긋나므로
             # (moved_teams 필터링으로 한쪽이 줄었을 수 있음) 더 작은 쪽에 맞춘다.
             n_actual = min(len(auto_upper_cands), len(auto_lower_cands))
@@ -8773,12 +9014,21 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
                 _new_bottom_upper_list = []
                 for _cand in bottom_upper_list:
                     _strength = _team_strength_cache.get(_cand["id"], 0.0)
+                    # [2026-08 버그수정] 예전엔 "club_strength로 첫 매치되는
+                    # 밴드"를 tier와 무관하게 하나 고른 뒤 tier==_floor를
+                    # 나중에 검사했다 — 그런데 리스트가 min_str 내림차순이
+                    # 아니면(또는 매우 강한 팀이 여러 밴드의 min_str을 동시에
+                    # 만족하면) 정작 지금 tier에 맞는 밴드가 뒤에 있어도 앞의
+                    # 다른 tier용 밴드에 먼저 매치되어 보호가 통째로 씹히는
+                    # 문제가 있었다(1부→2부 보호 밴드 추가 중 발견). 이제
+                    # "현재 tier(_f)와 정확히 일치하는 밴드"만 찾는다 — 밴드
+                    # 등록 순서에 더 이상 의존하지 않는다.
                     _floor = _chance = None
                     for _min_str, _f, _ch in CLUB_STRENGTH_RELEGATION_FLOOR:
-                        if _strength >= _min_str:
+                        if _f == tier and _strength >= _min_str:
                             _floor, _chance = _f, _ch
-                            break  # 밴드는 club_strength 내림차순 정렬 — 첫 매치가 그 팀의 밴드
-                    if (_floor is not None and tier == _floor and _repl_idx >= 0
+                            break
+                    if (_floor is not None and _repl_idx >= 0
                             and random.random() < _chance):
                         _new_bottom_upper_list.append(_replacement_pool[_repl_idx])
                         _repl_idx -= 1
@@ -8800,8 +9050,17 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
                 _upper_po_zone = upper_rows[max(0, len(upper_rows) - auto_count - 1):
                                              len(upper_rows) - auto_count]
                 _po_pending_upper = [r for r in _upper_po_zone if r["id"] not in moved_teams]
-                _lower_po_zone = lower_rows[auto_count: auto_count + _bracket_size]
-                _po_pending_lower = [r for r in _lower_po_zone if r["id"] not in moved_teams]
+                # [산하팀 제한] 자동승격으로 이미 뽑힌 팀은 제외한 나머지
+                # 순위표에서 PO 후보를 뽑는다 — 제한 ON이면 여기서도
+                # classification_status != 'NORMAL'인 팀은 건너뛴다
+                # (자동승격 제한을 걸어놓고 PO로 우회시키면 의미가 없음).
+                _lower_taken_ids = {r["id"] for r in auto_lower_cands}
+                _lower_po_pool = [r for r in lower_rows
+                                  if r["id"] not in moved_teams and r["id"] not in _lower_taken_ids]
+                if constants.AFFILIATE_PROMOTION_RESTRICTION:
+                    _lower_po_pool = [r for r in _lower_po_pool
+                                       if r.get("classification_status", "NORMAL") == "NORMAL"]
+                _po_pending_lower = _lower_po_pool[:_bracket_size]
                 if len(_po_pending_upper) != 1 or len(_po_pending_lower) != _bracket_size:
                     po_exists = False   # 후보가 부족 — 이번 해엔 PO 없이 자동 이동만
                 else:
@@ -8841,14 +9100,42 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
 
             # [버그수정] 리스케일 목표치는 팀 이동 *전* 측정하되
             # 각 팀 본인을 제외한 순수 기존 팀 평균으로 산정.
-            # - 승격팀들 목표: 상위 리그 기존 팀 평균 (승격팀 제외 불필요 — 아직 안 올라옴)
             # - 강등팀들 목표: 하위 리그 기존 팀 상위 75% (강등팀 제외 — 아직 안 내려옴)
             # tier 1→4 순서 루프이므로, 이전 tier에서 이동된 팀이
             # 현재 리그 평균에 포함될 수 있어 moved_teams 제외 처리.
             # 목표치는 승격/강등 인원 전체가 "그 리그에 새로 들어간다"는
             # 공통 기준이므로 인원수와 무관하게 한 번만 계산해 재사용한다.
-            _upper_avg = _cached_league_avg_ovr(upper_lid)
+            #
+            # [2026-08 버그수정, 신민용 리포트: "5~6부에서 승격하면 바로
+            # 상위팀 수준 OVR을 받아서, 한번 승격하면 그대로 1부까지
+            # 쭉 올라온다"] 예전엔 승격팀 목표를 상위 리그 "평균"(_cached_
+            # league_avg_ovr)으로 맞췄다 — 그런데 "평균"은 사실상 "중위권"이
+            # 아니라 그 자체로 이미 안정적인 스쿼드라, 승격 직후부터 다시
+            # 상위권을 노릴 수 있는 전력이 되어버렸다. 실측(16시즌 헤드리스)
+            # 결과 실제로 7부→6부→5부→4부→3부→2부→1부를 6시즌 연속으로
+            # 찍는 팀이 여러 개 나왔다 — "승격 직후엔 그 리그에서 하위권으로
+            # 시작해 자리를 잡아야 한다"는 현실감이 완전히 빠져 있었던 것.
+            # 목표를 상위 리그의 "하위 25%(약체) 팀 수준"으로 낮춘다 — 여전히
+            # 승격 자체로 어느 정도 전력 보강은 되지만(원래 하위 리그
+            # 평균보다는 높음), 곧바로 그 리그 중상위권을 넘볼 정도는 아니게
+            # 되어 "승격팀은 보통 신입답게 고전하다가 몇 시즌에 걸쳐
+            # 자리를 잡는다"는 흐름을 만든다.
+            # [2026-08 최종 조정] 12%ile까지 낮춰서도 재검증했지만, "5시즌
+            # 연속 승격(7부→1부)" 사례 자체는 크게 안 줄었다 — 실측해보니
+            # 전체 승격 경험 팀(16시즌간 6,914개) 대비 이런 극단적 연속
+            # 승격 사례는 애초에 15개 안팎(0.2% 수준)으로 드문 편이라,
+            # 퍼센타일을 더 극단적으로 낮춰도(즉 승격팀을 거의 최하위권으로
+            # 만들어도) 이 희귀 케이스 자체는 매치 시뮬레이션 변동성/선수
+            # 성장 쪽 영향이 더 커서 퍼센타일 조정만으론 다 못 잡는다.
+            # 대신 "평균(50%ile)"이던 원래 목표 자체는 승격 직후부터 바로
+            # 그 리그 중상위권을 노릴 수 있는 명백한 과다 보상이었으므로,
+            # 이 부분은 확실히 고쳐야 한다 — 너무 극단적으로 낮추면(예:
+            # 12%ile) 반대로 승격팀이 지나치게 약해져 곧바로 재강등되는
+            # 정반대 문제가 생길 수 있어, 하위 20%ile(리그 하위권 시작 —
+            # 신입답게 고전은 하지만 완전히 최하위는 아닌 수준)로 확정한다.
+            _upper_avg = _cached_league_strong_ovr(upper_lid, 0.20)
             _lower_strong = _cached_league_strong_ovr(lower_lid, 0.75)
+
 
             for top_lower in top_lower_list:
                 _tl = _team_info_cache.get(top_lower["id"])
@@ -8858,11 +9145,13 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
 
                 # 승격: top_lower → upper
                 _team_move_updates.append((upper_lid, tier, top_lower["id"]))
+                _pending_tier[top_lower["id"]] = tier
                 _move_team_cache(top_lower["id"], upper_lid)
                 if _upper_avg is not None:
                     _rescale_jobs.append((top_lower["id"], _upper_avg))
                 _promotion_log_inserts.append((year, tl_info["name"], ntier, tier, tl_info["lname"],
                                                 lower_lid, upper_lid))
+                _promo_log_entry_for_team[top_lower["id"]] = _promotion_log_inserts[-1]
                 tl_is_mine = (top_lower["id"] in my_season_teams)
                 if tl_is_mine or my_league_id in (upper_lid, lower_lid):
                     pending_logs.append((f"🔼 {year}년  {tl_info['name']}  {ntier}부→{tier}부  (승격)", "event"))
@@ -8886,13 +9175,25 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
 
                 # 강등: bottom_upper → lower
                 _team_move_updates.append((lower_lid, ntier, bottom_upper["id"]))
+                _pending_tier[bottom_upper["id"]] = ntier
                 _move_team_cache(bottom_upper["id"], lower_lid)
                 # [2026-08 신설, club_momentum] 강등된 팀은 'relegation_recovery'
                 # momentum으로 리셋 — 다음 시즌부터 몇 시즌간 club_strength
                 # 감쇠 완화 + 임시 보너스를 받는다(강등 스노우볼 방지).
+                # [2026-08 재조정, 신민용 리포트: "명문팀들이 다 강등당하고
+                # prestige_clubs.py 0.5% 강등권 목표가 계속 터진다"] 일반
+                # 강등 보너스는 전 팀 공통이지만, prestige_clubs.py에 등재된
+                # 팀(레벨 1~3)은 등급별 전용 스케줄(relegation_recovery_p3/
+                # _p2/_p1 — MOMENTUM_SCHEDULES 참고, 등급이 높을수록 강하고
+                # 길게)을 대신 적용해 "몇 시즌 내 복귀" 요구에 맞춘다.
                 from constants import MOMENTUM_START_BY_TYPE
+                from data.prestige_clubs import prestige_level as _pget
+                _bu_country = _country_name_by_id.get(_country_of.get(bottom_upper["id"]), "")
+                _bu_plevel = _pget(_bu_country, bu_info["name"])
+                _mtype = {3: "relegation_recovery_p3", 2: "relegation_recovery_p2",
+                          1: "relegation_recovery_p1"}.get(_bu_plevel, "relegation_recovery")
                 _momentum_reset_updates.append(
-                    ("relegation_recovery", MOMENTUM_START_BY_TYPE["relegation_recovery"], bottom_upper["id"]))
+                    (_mtype, MOMENTUM_START_BY_TYPE[_mtype], bottom_upper["id"]))
                 if _lower_strong is not None:
                     _rescale_jobs.append((bottom_upper["id"], _lower_strong))
                     if DEBUG_RELEGATION_TRACKING:
@@ -8906,6 +9207,201 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
                     my_new_league = lower_lid
                 moved_teams.add(bottom_upper["id"])
 
+    # ═══════════════════════════════════════════
+    # [2026-08 신설] 산하팀 < 모팀 tier 불변식 검증 + 보정
+    # ═══════════════════════════════════════════
+    # 위 루프에서 모든 경계의 승격/강등이 pending_tier에 확정된 뒤,
+    # "산하팀은 항상 모팀보다 낮은 tier(숫자가 더 큼)여야 한다"는 규칙을
+    # 검사한다. current_tier가 아니라 이번 시즌 확정 상태(pending_tier)로
+    # 검사해야 아직 DB에 반영 안 된 stale 값을 안 보게 된다.
+    #
+    # 충돌 해소 정책 (기존 합의):
+    #   ① 산하팀 본인이 이번 시즌 승격해서 충돌이 생겼다면 → 그 승격을
+    #      취소하고, 원래 있던 리그의 다음 NORMAL 후보에게 슬롯을 넘긴다
+    #      (대체 후보가 없으면 슬롯을 빈 채로 둔다 — 억지로 안 채움).
+    #   ② 산하팀은 안 움직였는데 모팀이 강등되어 내려오며 충돌이 생겼다면
+    #      → 산하팀을 한 티어 더 아래로 강제 이동시킨다(내려가는 건
+    #      항상 안전하다는 원칙).
+    # 연쇄 반응(취소/강제이동이 새 충돌을 만드는 경우) 대비해 반복하되,
+    # 변경이 없으면 즉시 종료하고 비정상적으로 길어지면 안전 상한으로
+    # 강제 종료한다.
+    if constants.AFFILIATE_PROMOTION_RESTRICTION and _parent_of:
+        import json as _json_audit
+
+        def _audit(row):
+            row.setdefault("season_year", year)
+            _wb_audit_rows.append(row)
+
+        _wb_audit_rows: list = []
+
+        # 이번 시즌 시작 시점, parent_team_id가 있는 모든 팀을 예외 없이
+        # 1건씩 기록한다 — "아무 기록 없이 사라지는 팀"을 방지.
+        for _tid0, _pid0 in _parent_of.items():
+            if _tid0 not in _pending_tier or _pid0 not in _pending_tier:
+                _audit({
+                    "team_id": _tid0, "parent_id": _pid0,
+                    "classification_status": _classification_of.get(_tid0),
+                    "skip_reason": "TEAM_OR_PARENT_NOT_IN_PENDING_TIER",
+                    "entered_correction": False,
+                })
+                continue
+            _is_violation = _pending_tier[_tid0] <= _pending_tier[_pid0]
+            _audit({
+                "team_id": _tid0, "parent_id": _pid0,
+                "country_id": _country_of.get(_tid0),
+                "classification_status": _classification_of.get(_tid0),
+                "parent_tier_initial": _pending_tier[_pid0],
+                "child_tier_initial": _pending_tier[_tid0],
+                "max_country_tier": _country_max_tier_map.get(_country_of.get(_tid0)),
+                "is_violation_initial": _is_violation,
+                "skip_reason": None if _is_violation else "NOT_VIOLATION",
+                "entered_correction": False,
+            })
+
+        _MAX_RESOLUTION_PASSES = 10
+        for _pass_i in range(_MAX_RESOLUTION_PASSES):
+            _violations = [
+                tid for tid, pid in _parent_of.items()
+                if tid in _pending_tier and pid in _pending_tier
+                and _pending_tier[tid] <= _pending_tier[pid]
+            ]
+            if not _violations:
+                break
+
+            _any_change = False
+            for _tid in _violations:
+                _cid = _country_of.get(_tid)
+                _cur_tier = _pending_tier[_tid]
+                _pid_cur = _parent_of.get(_tid)
+                _audit_base = {
+                    "team_id": _tid, "parent_id": _pid_cur, "pass": _pass_i,
+                    "country_id": _cid,
+                    "classification_status": _classification_of.get(_tid),
+                    "parent_tier": _pending_tier.get(_pid_cur),
+                    "child_tier": _cur_tier,
+                    "max_country_tier": _country_max_tier_map.get(_cid),
+                    "entered_correction": True,
+                }
+
+                if _tid in moved_teams and _cur_tier < _original_tier.get(_tid, _cur_tier):
+                    # ① 본인이 이번 시즌 승격해서 생긴 충돌 → 승격 취소
+                    _upper_lid_conflict = _league_map.get((_cid, _cur_tier))
+                    _orig_tier = _original_tier[_tid]
+                    _orig_lid = _original_league[_tid]
+                    if _upper_lid_conflict is None or _orig_lid is None:
+                        _audit({**_audit_base, "correction_action": "CANCEL_PROMOTION",
+                                "skip_reason": "TARGET_LEAGUE_MISSING", "result_tier": _cur_tier})
+                        continue
+                    _pending_tier[_tid] = _orig_tier
+                    _team_move_updates.append((_orig_lid, _orig_tier, _tid))
+                    _old_entry = _promo_log_entry_for_team.pop(_tid, None)
+                    if _old_entry in _promotion_log_inserts:
+                        _promotion_log_inserts.remove(_old_entry)
+                    _tname = _team_info_cache.get(_tid, ("", ""))[0]
+                    print(f"[산하팀 tier 보정] {year}년 {_tname} 승격 취소 "
+                          f"(모팀과 tier 충돌, {_orig_tier}부 잔류로 되돌림)")
+
+                    # 원래 있던 리그(_orig_lid)의 순위표에서 다음 NORMAL
+                    # 후보를 찾아 대신 승격시킨다 — 이미 이동 처리됐거나
+                    # 본인(취소된 팀)은 제외.
+                    _repl = None
+                    for _cand in _standings_cache.get(_orig_lid, []):
+                        if _cand["id"] in moved_teams or _cand["id"] == _tid:
+                            continue
+                        if _cand.get("classification_status", "NORMAL") != "NORMAL":
+                            continue
+                        _repl = _cand
+                        break
+                    if _repl is not None:
+                        _team_move_updates.append((_upper_lid_conflict, _cur_tier, _repl["id"]))
+                        _pending_tier[_repl["id"]] = _cur_tier
+                        moved_teams.add(_repl["id"])
+                        _rname, _rlname = _team_info_cache.get(_repl["id"], ("", ""))
+                        _new_entry = (year, _rname, _orig_tier, _cur_tier, _rlname, _orig_lid, _upper_lid_conflict)
+                        _promotion_log_inserts.append(_new_entry)
+                        print(f"[산하팀 tier 보정] {year}년 {_rname}이(가) 대신 "
+                              f"{_orig_tier}부→{_cur_tier}부 승격")
+                        _audit({**_audit_base, "correction_action": "CANCEL_PROMOTION",
+                                "skip_reason": "CORRECTED", "result_tier": _orig_tier,
+                                "replacement_team_id": _repl["id"]})
+                    else:
+                        print(f"[산하팀 tier 보정] {year}년 {_orig_lid} 리그, "
+                              f"승격 대체 후보 없음 — 슬롯 공석으로 둠")
+                        _audit({**_audit_base, "correction_action": "CANCEL_PROMOTION",
+                                "skip_reason": "CORRECTED_NO_REPLACEMENT", "result_tier": _orig_tier})
+                    _any_change = True
+
+                else:
+                    # ② 산하팀은 안 움직였는데 모팀이 강등돼 내려오며 충돌
+                    # → 산하팀을 한 티어 더 강등(내려가는 건 항상 안전)
+                    _max_tier_country = _country_max_tier_map.get(_cid, _cur_tier)
+                    if _cur_tier >= _max_tier_country:
+                        _tname = _team_info_cache.get(_tid, ("", ""))[0]
+                        c.execute("SELECT MAX(tier) FROM leagues WHERE country_id=?", (_cid,))
+                        _live_max = c.fetchone()[0]
+                        if _live_max is not None and _live_max > _max_tier_country:
+                            print(f"[WB-ALARM] {year}년 {_tname}(id={_tid}, country={_cid}): "
+                                  f"캐시된 max_tier={_max_tier_country} vs 실제DB max_tier={_live_max} "
+                                  f"— 불일치! cur_tier={_cur_tier}")
+                        # [2026-08 정책 확정] 자식이 이미 그 나라 최하위 tier에
+                        # 있고 부모가 강등을 거듭해 그 tier까지 따라잡은
+                        # 경우다. child_tier <= parent_tier면서 child가 이미
+                        # 최하위이면 parent도 반드시 최하위(그 이상 내려갈
+                        # 데가 없으므로) — 이건 "보정 실패"가 아니라 "더 이상
+                        # 밀어낼 tier 자체가 없는 구조적 한계"로, 정책상
+                        # 허용되는 예외다(리히텐슈타인 1부 예외와 같은 성격,
+                        # 다만 이쪽은 국가 단위 화이트리스트가 아니라 "자식이
+                        # 최하위 tier"라는 조건 자체로 일반화된 예외).
+                        print(f"[산하팀 tier 보정] {year}년 {_tname}: 구조적 tier 예외 "
+                              f"(자식이 이미 최하위 tier이고 부모가 그 tier까지 강등됨 — "
+                              f"정책상 허용)")
+                        _audit({**_audit_base, "correction_action": "FORCE_RELEGATE",
+                                "skip_reason": "STRUCTURAL_TIER_EXCEPTION", "result_tier": _cur_tier,
+                                "live_max_tier_check": _live_max})
+                        continue
+                    _new_tier2 = _cur_tier + 1
+                    _new_lid2 = _league_map.get((_cid, _new_tier2))
+                    _cur_lid2 = _league_map.get((_cid, _cur_tier))
+                    if _new_lid2 is None or _cur_lid2 is None:
+                        _audit({**_audit_base, "correction_action": "FORCE_RELEGATE",
+                                "skip_reason": "TARGET_LEAGUE_MISSING", "result_tier": _cur_tier,
+                                "target_tier": _new_tier2})
+                        continue
+                    _tname, _tlname = _team_info_cache.get(_tid, ("", ""))
+                    _pending_tier[_tid] = _new_tier2
+                    _team_move_updates.append((_new_lid2, _new_tier2, _tid))
+                    moved_teams.add(_tid)
+                    _promotion_log_inserts.append(
+                        (year, _tname, _cur_tier, _new_tier2, _tlname, _cur_lid2, _new_lid2))
+                    print(f"[산하팀 tier 보정] {year}년 {_tname} 강제 강등 "
+                          f"{_cur_tier}부→{_new_tier2}부 (모팀과 tier 충돌 회피)")
+                    _audit({**_audit_base, "correction_action": "FORCE_RELEGATE",
+                            "skip_reason": "CORRECTED", "result_tier": _new_tier2,
+                            "target_tier": _new_tier2, "target_league_found": True})
+                    _any_change = True
+
+            if not _any_change:
+                break
+        else:
+            print(f"[산하팀 tier 보정] {year}년: 안전 상한({_MAX_RESOLUTION_PASSES}회) 도달 — "
+                  f"남은 충돌은 다음 시즌으로 이월됨")
+            for _tid in _violations:
+                _audit({"team_id": _tid, "parent_id": _parent_of.get(_tid),
+                        "correction_action": "NONE",
+                        "skip_reason": "MAX_PASSES_EXCEEDED", "entered_correction": True})
+
+        # [2026-08] 감사 로그 자체(_wb_audit_rows 수집)는 항상 하되, 실제
+        # 디스크 기록은 constants.TIER_AUDIT_LOGGING이 True일 때만 —
+        # 이 계측은 "산하팀 tier 역전" 잔존 버그 추적 전용이라, 정식
+        # 플레이에서는 파일을 만들지 않는다(위 constants.py 주석 참고).
+        if constants.TIER_AUDIT_LOGGING:
+            try:
+                with open("tier_audit.jsonl", "a", encoding="utf-8") as _af:
+                    for _row in _wb_audit_rows:
+                        _af.write(_json_audit.dumps(_row, ensure_ascii=False) + "\n")
+            except Exception as _audit_e:
+                print(f"[tier_audit] 로그 기록 실패: {_audit_e}")
+
     # [2026-07 버그수정] 팀 승/무/패/득실 초기화는 _end_of_season(진짜
     # 연도 전환 시점, 52→1주)으로 옮겼다 — 여기(_process_promotion_relegation)
     # 는 이제 44주(PLAYOFF_WEEK)보다도 앞선 43주 마지막날(day300)에 호출
@@ -8915,6 +9411,14 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
     # [2026-07 최적화] 위 루프에서 모아둔 승격/강등 UPDATE·INSERT를 각각
     # executemany로 한 번씩만 실행 — 팀 수만큼 개별 실행하던 것을 2회로 줄인다.
     _pr_t5 = _time_pr.perf_counter()
+    # [2026-08] 이번 세션 디버깅용 하드코딩 감시 목록 — 다음 세션에서는
+    # "실제 위반 발생 순간 자동 감지" 방식으로 교체 예정. 그때까지는
+    # TIER_AUDIT_LOGGING 플래그로 같이 묶어서 정식 플레이엔 영향 없게 둔다.
+    if constants.TIER_AUDIT_LOGGING:
+        _wb_watch = {3848, 7059, 3462, 6544, 8408, 5868}
+        _watched_moves = [m for m in _team_move_updates if m[2] in _wb_watch]
+        if _watched_moves:
+            print(f"[WATCH] {year}년 _team_move_updates 중 감시 대상 팀 이동 큐 순서: {_watched_moves}")
     if _team_move_updates:
         c.executemany("UPDATE teams SET league_id=?,current_tier=? WHERE id=?", _team_move_updates)
     if _momentum_reset_updates:

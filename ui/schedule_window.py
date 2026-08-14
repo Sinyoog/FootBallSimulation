@@ -108,12 +108,22 @@ def _intl_advance_count(t):
         return 2, True
 
     elif kind == "region":
-        # [2026-08 신설] 지역컵도 항상 조 1·2위가 직행하고, 대회에 따라
-        # 와일드카드(3위 일부)가 있을 수도/없을 수도 있다 — regional_
-        # cup_format의 best_thirds가 0이면(예: SAFF/UNCAF) 3위는 전부
-        # 탈락, 있으면(예: EAFF/AFF/카리브) 위 _intl_third_qualified가
-        # 실제로 몇 팀이 뽑혔는지 계산한다.
-        return 2, True
+        # [2026-08 버그수정, 신민용 리포트: "상위 2팀만 올라가는 지역컵인데
+        # 3위 팀 순위표가 뜬다"] 이전엔 지역컵이면 무조건 has_thirds=True로
+        # 고정해서, regional_cup_format의 best_thirds가 실제로 0인 대회
+        # (예: 8개국 2조처럼 조 1·2위(4팀)만으로 브래킷이 딱 맞아 와일드
+        # 카드 자리가 아예 없는 경우)에서도 "3위 팀 순위표"가 그려지고,
+        # 그 안의 팀들이 실제로는 탈락인데도 색이 진출 확정(연두)으로
+        # 잘못 표시됐다. 이 대회의 실제 참가국 수로 regional_cup_format을
+        # 다시 계산해 best_thirds가 0보다 클 때만 has_thirds=True로 준다.
+        from constants import regional_cup_format
+        from database import get_conn as _gc2
+        _conn3 = _gc2()
+        _n_entries2 = _conn3.execute(
+            "SELECT COUNT(*) n FROM intl_entries WHERE tournament_id=?", (t["id"],)).fetchone()["n"]
+        _conn3.close()
+        _best_thirds = regional_cup_format(_n_entries2)["best_thirds"]
+        return 2, _best_thirds > 0
 
     elif kind in ("wc_qual", "cont_qual"):
         # 예선: 조 1위 직행(나머지는 성적순 탈락 또는 와일드카드)
@@ -384,6 +394,29 @@ class ScheduleWindow(QDialog):
             self._tab.addTab(champs_ko, "🏆 챔피언스리그(본선)")
         _sw_marks.append(("챔피언스리그", _time_sw.perf_counter()))
 
+        # 유로파리그 탭 (2026-08 신설)
+        import europa_engine
+        el_w = self._make_champions_tab("groups", engine=europa_engine,
+                                         comp_title="유로파리그", header_color="#F28C28")
+        if el_w:
+            self._tab.addTab(el_w, "🥈 유로파리그")
+        el_ko = self._make_champions_tab("ko", engine=europa_engine,
+                                          comp_title="유로파리그", header_color="#F28C28")
+        if el_ko:
+            self._tab.addTab(el_ko, "🥈 유로파리그(본선)")
+
+        # 컨퍼런스리그 탭 (2026-08 신설)
+        import conference_engine
+        ecl_w = self._make_champions_tab("groups", engine=conference_engine,
+                                          comp_title="컨퍼런스리그", header_color="#20A464")
+        if ecl_w:
+            self._tab.addTab(ecl_w, "🥉 컨퍼런스리그")
+        ecl_ko = self._make_champions_tab("ko", engine=conference_engine,
+                                           comp_title="컨퍼런스리그", header_color="#20A464")
+        if ecl_ko:
+            self._tab.addTab(ecl_ko, "🥉 컨퍼런스리그(본선)")
+        _sw_marks.append(("클럽대항전(유로파/컨퍼런스)", _time_sw.perf_counter()))
+
         # [2026-07 신설, 신민용 리포트: "클럽월드컵이 경기 일정에 안 뜬다"]
         cwc_w = self._make_cwc_tab()
         if cwc_w:
@@ -568,6 +601,15 @@ class ScheduleWindow(QDialog):
             # 아직 진행 중이면 3위 후보 전체를 주황으로 표시
             thirds_in_progress = (has_thirds and t.get("status") == "group")
 
+            # [2026-08 버그수정, 신민용 리포트: "국제대회(예선) 탭에서
+            # 실제로 본선 올라가는 팀들이 초록색으로 안 뜨고 조 1위만
+            # 뜬다"] 예선(wc_qual/cont_qual)은 위 _intl_advance_count가
+            # 무조건 "조 1위만 직행"으로 뭉뚱그렸다 — 실제로는 유로처럼
+            # 2위도 전원 직행하거나, 2위 중 성적순 와일드카드/플레이오프가
+            # 있는 대회도 있다. intl_engine.get_qual_advance_status가
+            # 실제 대회 설정을 그대로 재현해 국가별 상태를 계산해준다.
+            _qual_status = intl_engine.get_qual_advance_status(t) if _is_qual else {}
+
             lbl_g = QLabel("◼ 조별리그")
             lbl_g.setStyleSheet("color:#00cc44;font-weight:bold;font-size:12px;")
             lay.addWidget(lbl_g)
@@ -620,6 +662,18 @@ class ScheduleWindow(QDialog):
                     # 색상 결정
                     if country == nat:
                         color = COLOR_MY
+                    elif _is_qual:
+                        # 예선: 대회 설정(직행/와일드카드/플레이오프)을
+                        # 실제로 반영한 상태를 그대로 색으로 매핑한다.
+                        qstat = _qual_status.get(country, "eliminated")
+                        if qstat == "direct":
+                            color = COLOR_ADVANCE       # 직행 확정 (초록)
+                        elif qstat == "po_ok":
+                            color = COLOR_THIRD_OK      # 플레이오프 승리로 진출 확정 (연두)
+                        elif qstat == "po_bubble":
+                            color = COLOR_THIRD         # 플레이오프 경쟁 중 (주황)
+                        else:
+                            color = COLOR_ELIM          # 탈락 (회색)
                     elif i < advance_n:
                         color = COLOR_ADVANCE       # 직접 진출 (초록)
                     elif i == advance_n and has_thirds:
@@ -650,6 +704,128 @@ class ScheduleWindow(QDialog):
                 _enable_plain_copy(gt)
                 lay.addWidget(gt)
 
+            # ── PO/와일드카드 경쟁팀 순위표 (예선 전용) ──
+            # [2026-08 신설, 신민용 리포트: "예선 3등이여도 점수 높아서
+            # 토너먼트 가는 경우가 있는데 이것도 표시해줘"] 국제대회
+            # 본선의 "3위 팀 순위표"와 같은 발상을, 조 2위(또는 조
+            # 1위)끼리 성적순으로 경쟁하는 예선 체제(와일드카드/플레이오프)
+            # 에도 적용한다.
+            #
+            # [2026-08 버그수정, 신민용 리포트: "아프리카는 1등팀들끼리
+            # 플레이오프 하는 거 아니야?"] 처음엔 이 표가 무조건 조 2위
+            # (rows[1])만 모았는데, direct=0인 체제(32팀 예선 아시아/
+            # 아프리카)는 실제로 조 1위 전원이 직행 없이 바로 플레이오프로
+            # 가는 방식이라(_finalize_qual 참고) 조 2위가 아니라 조 1위가
+            # 경쟁 대상이다 — 대회 설정을 봐서 어느 순위가 실제 PO/와일드
+            # 카드 후보인지 판단한다.
+            if _is_qual:
+                from constants import WC_QUAL_32, WC_QUAL_48, EURO_QUAL, WC_EXPAND_YEAR
+                _qcontinent = intl_engine._conf_key((t.get("continent") or "").strip() or "유럽")
+                if t.get("kind") == "cont_qual":
+                    _qcfg = EURO_QUAL.get(_qcontinent, {})
+                else:
+                    _qbig = t.get("year", 0) >= WC_EXPAND_YEAR
+                    _qcfg = (WC_QUAL_48 if _qbig else WC_QUAL_32).get(_qcontinent, {})
+                _direct_n_for_race = _qcfg.get("direct", len(groups))
+                _race_rank_idx = 0 if _direct_n_for_race == 0 else 1
+                _race_label = "1위" if _race_rank_idx == 0 else "2위"
+
+                runner_rows = []
+                for g in groups:
+                    rows = _group_rows_cache.get(g)
+                    if rows and len(rows) >= _race_rank_idx + 1:
+                        r2 = dict(rows[_race_rank_idx])
+                        r2["grp"] = g
+                        runner_rows.append(r2)
+
+                # 경쟁이 실제로 존재하는 경우에만 표를 그린다 — 전원이
+                # 그냥 직행(status가 전부 'direct')이면 굳이 안 보여준다.
+                _has_runner_race = any(
+                    _qual_status.get(r["country"], "eliminated") != "direct" for r in runner_rows)
+
+                if runner_rows and _has_runner_race:
+                    runner_rows.sort(
+                        key=lambda r: (r["pts"], r["gf"] - r["ga"], r["gf"], r.get("ovr", 0)),
+                        reverse=True)
+
+                    n_direct_runners = sum(
+                        1 for r in runner_rows if _qual_status.get(r["country"]) == "direct")
+                    n_po = sum(
+                        1 for r in runner_rows
+                        if _qual_status.get(r["country"]) in ("po_bubble", "po_ok"))
+
+                    if n_po > 0:
+                        lbl_r_title = f"◼ {_race_label} 팀 순위 (상위 {n_direct_runners}팀 직행, 이후 {n_po}팀 PO행)"
+                    else:
+                        lbl_r_title = f"◼ {_race_label} 팀 순위 (상위 {n_direct_runners}팀 와일드카드 직행)"
+                    lbl_r = QLabel(lbl_r_title)
+                    lbl_r.setStyleSheet("color:#00cc44;font-weight:bold;font-size:12px;margin-top:6px;")
+                    lay.addWidget(lbl_r)
+
+                    # 컷라인(직행 경계) 표시용 구분 행
+                    cut_at_r = n_direct_runners if 0 < n_direct_runners < len(runner_rows) else None
+                    total_rows_r = len(runner_rows) + (1 if cut_at_r is not None else 0)
+
+                    rt = QTableWidget(total_rows_r, 8)
+                    rt.setHorizontalHeaderLabels(
+                        ["순위", "조", "국가", "경기", "승", "무", "패", "득실/승점"])
+                    rt.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+                    rt.verticalHeader().setVisible(False)
+                    rt.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+                    rt.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+                    rt.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+                    rt.setStyleSheet(
+                        "QTableWidget{background:#1e1e1e;color:#ccc;gridline-color:#2a2a2a;border:1px solid #2a2a2a;}"
+                        "QHeaderView::section{background:#252525;color:#888;border:none;padding:3px;}")
+
+                    row_i_r = 0
+                    for rank, r in enumerate(runner_rows, start=1):
+                        country = r.get("country", "")
+                        gd = r["gf"] - r["ga"]
+                        vals = [str(rank), f"{r['grp']}조", f"{r['flag']}{country}",
+                                str(r["p"]), str(r["w"]), str(r["d"]), str(r["l"]),
+                                f"{'+' if gd > 0 else ''}{gd} / {r['pts']}점"]
+
+                        if country == nat:
+                            color = COLOR_MY
+                        else:
+                            qstat = _qual_status.get(country, "eliminated")
+                            if qstat == "direct":
+                                color = COLOR_ADVANCE
+                            elif qstat == "po_ok":
+                                color = COLOR_THIRD_OK
+                            elif qstat == "po_bubble":
+                                color = COLOR_THIRD
+                            else:
+                                color = COLOR_ELIM
+
+                        for j, v in enumerate(vals):
+                            item = QTableWidgetItem(v)
+                            if j > 0:
+                                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                            item.setForeground(color)
+                            if j == 2:
+                                item.setData(_CLEAN_TEXT_ROLE, country)
+                            rt.setItem(row_i_r, j, item)
+                        row_i_r += 1
+
+                        if cut_at_r is not None and rank == cut_at_r:
+                            rt.setSpan(row_i_r, 0, 1, 8)
+                            cut_item_r = QTableWidgetItem("▲ 직행 컷라인 (이후는 PO/탈락) ▲")
+                            cut_item_r.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                            cut_item_r.setForeground(QColor("#666666"))
+                            rt.setItem(row_i_r, 0, cut_item_r)
+                            rt.setRowHeight(row_i_r, 18)
+                            row_i_r += 1
+
+                    rt.setFixedHeight(rt.verticalHeader().defaultSectionSize() * total_rows_r + 28)
+                    rt.resizeColumnsToContents()
+                    _need_w_rt = sum(rt.columnWidth(j) for j in range(rt.columnCount())) + 24
+                    rt.setMinimumWidth(_need_w_rt)
+                    _max_left_w = max(_max_left_w, _need_w_rt)
+                    _enable_plain_copy(rt)
+                    lay.addWidget(rt)
+
             # ── 3위 팀 순위표 (3위 진출 대회만: 48개국 월드컵/대륙컵) ──
             # 실제 2026 월드컵 중계처럼, 각 조 3위끼리 성적순으로 줄 세워서
             # 상위 N팀만 진출/나머지는 탈락인지 한눈에 보여준다.
@@ -679,86 +855,117 @@ class ScheduleWindow(QDialog):
                     if t.get("kind") == "world":
                         from constants import WC_BEST_THIRDS_BIG
                         n_adv3 = WC_BEST_THIRDS_BIG
+                    elif t.get("kind") == "region":
+                        # [2026-08 버그수정, 신민용 리포트: "상위 2팀만
+                        # 올라가는 지역컵인데 3위 팀 순위표에 '상위 4팀
+                        # 진출'로 뜬다"] 지역컵은 대회마다 참가국 규모가
+                        # 달라 CONT_BEST_THIRDS(대륙컵 24개국 고정값)를
+                        # 그대로 쓰면 틀린다 — _intl_third_qualified와
+                        # 동일하게 이 대회의 실제 참가국 수로
+                        # regional_cup_format을 다시 계산한다.
+                        from constants import regional_cup_format
+                        from database import get_conn as _gc3
+                        _conn4 = _gc3()
+                        _n_entries3 = _conn4.execute(
+                            "SELECT COUNT(*) n FROM intl_entries WHERE tournament_id=?",
+                            (t["id"],)).fetchone()["n"]
+                        _conn4.close()
+                        n_adv3 = regional_cup_format(_n_entries3)["best_thirds"]
                     else:
                         from constants import CONT_BEST_THIRDS
                         n_adv3 = CONT_BEST_THIRDS
 
                     lbl_t = QLabel(f"◼ 3위 팀 순위 (상위 {n_adv3}팀 진출)")
                     lbl_t.setStyleSheet("color:#00cc44;font-weight:bold;font-size:12px;margin-top:6px;")
-                    lay.addWidget(lbl_t)
+
+                    # [2026-08 버그수정] n_adv3<=0(진출 가능한 3위 자리 자체가
+                    # 없는 대회 — 예: 지역컵 8개국 2조처럼 조 1·2위 4팀만
+                    # 으로 브래킷이 딱 맞아 와일드카드 자리가 아예 없는
+                    # 경우)이면 예전엔 그대로 컷라인이 None이 되면서 "컷
+                    # 라인 없음=전원 진출확정"으로 잘못 해석해 아무도 실제
+                    # 진출 못 하는 3위 팀들을 연두(진출확정)로 표시했다.
+                    # n_adv3<=0이면 이 표 자체를 아예 그리지 않는다.
+                    if n_adv3 <= 0:
+                        third_rows = []
+                    else:
+                        lay.addWidget(lbl_t)
 
                     # 컷라인(진출/탈락 경계) 표시용 구분 행을 진출팀 수만큼 뒤에 끼워 넣는다.
-                    cut_at = n_adv3 if 0 < n_adv3 < len(third_rows) else None
-                    total_rows = len(third_rows) + (1 if cut_at is not None else 0)
+                    if third_rows:
+                        cut_at = n_adv3 if 0 < n_adv3 < len(third_rows) else None
+                        total_rows = len(third_rows) + (1 if cut_at is not None else 0)
 
-                    tt = QTableWidget(total_rows, 8)
-                    tt.setHorizontalHeaderLabels(
-                        ["순위", "조", "국가", "경기", "승", "무", "패", "득실/승점"])
-                    tt.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-                    tt.verticalHeader().setVisible(False)
-                    tt.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-                    tt.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-                    tt.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-                    # [2026-07 버그수정] 위 조별 순위표와 동일한 이유로 국가명
-                    # Stretch 제거 — 이름 잘림 방지.
-                    tt.setStyleSheet(
-                        "QTableWidget{background:#1e1e1e;color:#ccc;gridline-color:#2a2a2a;border:1px solid #2a2a2a;}"
-                        "QHeaderView::section{background:#252525;color:#888;border:none;padding:3px;}")
+                        tt = QTableWidget(total_rows, 8)
+                        tt.setHorizontalHeaderLabels(
+                            ["순위", "조", "국가", "경기", "승", "무", "패", "득실/승점"])
+                        tt.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+                        tt.verticalHeader().setVisible(False)
+                        tt.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+                        tt.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+                        tt.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+                        # [2026-07 버그수정] 위 조별 순위표와 동일한 이유로 국가명
+                        # Stretch 제거 — 이름 잘림 방지.
+                        tt.setStyleSheet(
+                            "QTableWidget{background:#1e1e1e;color:#ccc;gridline-color:#2a2a2a;border:1px solid #2a2a2a;}"
+                            "QHeaderView::section{background:#252525;color:#888;border:none;padding:3px;}")
 
-                    row_i = 0
-                    for rank, r in enumerate(third_rows, start=1):
-                        country = r.get("country", "")
-                        gd = r["gf"] - r["ga"]
-                        vals = [str(rank), f"{r['grp']}조", f"{r['flag']}{country}",
-                                str(r["p"]), str(r["w"]), str(r["d"]), str(r["l"]),
-                                f"{'+' if gd > 0 else ''}{gd} / {r['pts']}점"]
+                        row_i = 0
+                        for rank, r in enumerate(third_rows, start=1):
+                            country = r.get("country", "")
+                            gd = r["gf"] - r["ga"]
+                            vals = [str(rank), f"{r['grp']}조", f"{r['flag']}{country}",
+                                    str(r["p"]), str(r["w"]), str(r["d"]), str(r["l"]),
+                                    f"{'+' if gd > 0 else ''}{gd} / {r['pts']}점"]
 
-                        if country == nat:
-                            color = COLOR_MY
-                        elif cut_at is not None and rank <= cut_at:
-                            color = COLOR_THIRD_OK if not thirds_in_progress else COLOR_THIRD
-                        elif cut_at is None and thirds_in_progress:
-                            color = COLOR_THIRD
-                        elif cut_at is None:
-                            color = COLOR_THIRD_OK
-                        else:
-                            color = COLOR_ELIM
+                            if country == nat:
+                                color = COLOR_MY
+                            elif cut_at is not None and rank <= cut_at:
+                                color = COLOR_THIRD_OK if not thirds_in_progress else COLOR_THIRD
+                            elif cut_at is None and thirds_in_progress:
+                                color = COLOR_THIRD
+                            elif cut_at is None:
+                                color = COLOR_THIRD_OK
+                            else:
+                                color = COLOR_ELIM
 
-                        for j, v in enumerate(vals):
-                            item = QTableWidgetItem(v)
-                            if j > 0:
-                                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                            item.setForeground(color)
-                            if j == 2:
-                                item.setData(_CLEAN_TEXT_ROLE, country)
-                            tt.setItem(row_i, j, item)
-                        row_i += 1
-
-                        # 진출 컷라인 — 진출 확정 인원 바로 뒤에 구분선 행 삽입
-                        if cut_at is not None and rank == cut_at:
-                            tt.setSpan(row_i, 0, 1, 8)
-                            cut_item = QTableWidgetItem(
-                                "▲ 진출 컷라인 (여기까지 진출) ▲" if not thirds_in_progress
-                                else "▲ 현재 컷라인 — 남은 경기에 따라 바뀔 수 있음 ▲")
-                            cut_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                            cut_item.setForeground(QColor("#666666"))
-                            tt.setItem(row_i, 0, cut_item)
-                            tt.setRowHeight(row_i, 18)
+                            for j, v in enumerate(vals):
+                                item = QTableWidgetItem(v)
+                                if j > 0:
+                                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                                item.setForeground(color)
+                                if j == 2:
+                                    item.setData(_CLEAN_TEXT_ROLE, country)
+                                tt.setItem(row_i, j, item)
                             row_i += 1
 
-                    tt.setFixedHeight(tt.verticalHeader().defaultSectionSize() * total_rows + 28)
-                    tt.resizeColumnsToContents()
-                    _need_w_tt = sum(tt.columnWidth(j) for j in range(tt.columnCount())) + 24
-                    tt.setMinimumWidth(_need_w_tt)
-                    _max_left_w = max(_max_left_w, _need_w_tt)
-                    _enable_plain_copy(tt)
-                    lay.addWidget(tt)
+                            # 진출 컷라인 — 진출 확정 인원 바로 뒤에 구분선 행 삽입
+                            if cut_at is not None and rank == cut_at:
+                                tt.setSpan(row_i, 0, 1, 8)
+                                cut_item = QTableWidgetItem(
+                                    "▲ 진출 컷라인 (여기까지 진출) ▲" if not thirds_in_progress
+                                    else "▲ 현재 컷라인 — 남은 경기에 따라 바뀔 수 있음 ▲")
+                                cut_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                                cut_item.setForeground(QColor("#666666"))
+                                tt.setItem(row_i, 0, cut_item)
+                                tt.setRowHeight(row_i, 18)
+                                row_i += 1
+
+                        tt.setFixedHeight(tt.verticalHeader().defaultSectionSize() * total_rows + 28)
+                        tt.resizeColumnsToContents()
+                        _need_w_tt = sum(tt.columnWidth(j) for j in range(tt.columnCount())) + 24
+                        tt.setMinimumWidth(_need_w_tt)
+                        _max_left_w = max(_max_left_w, _need_w_tt)
+                        _enable_plain_copy(tt)
+                        lay.addWidget(tt)
 
             # 범례
             hint_parts = ["🟢진출확정", "🔵내 국가"]
             if has_thirds:
                 hint_parts.append("🟡3위진출경쟁")
                 hint_parts.append("🟩3위진출확정")
+            elif _is_qual:
+                hint_parts.append("🟡플레이오프경쟁")
+                hint_parts.append("🟩플레이오프진출확정")
             hint_parts.append("⬜탈락")
             hint = QLabel("  ".join(hint_parts))
             hint.setStyleSheet("color:#666;font-size:10px;margin-top:4px;")
@@ -864,11 +1071,19 @@ class ScheduleWindow(QDialog):
 
     # ── 챔피언스리그 탭 ──────────────────────────
 
-    def _make_champions_tab(self, mode="groups"):
-        try:
-            import champions_engine
-        except ImportError:
-            return None
+    def _make_champions_tab(self, mode="groups", engine=None, comp_title="챔피언스리그",
+                             header_color="#ffcc00", cup_name_fallback=None):
+        """[2026-08 확장, 신민용 요청: 유로파/컨퍼런스도 같은 화면 재사용]
+        engine: champions_engine/europa_engine/conference_engine 모듈을 그대로
+        받는다 — get_my_champions_matches/get_my_cl_league_standings에 해당하는
+        각 엔진의 함수(get_my_europa_matches/get_my_el_league_standings 등)를
+        engine 모듈에서 동적으로 찾아 호출한다. engine=None(기본값)이면 기존
+        챔스 그대로 동작(하위 호환)."""
+        if engine is None:
+            try:
+                import champions_engine as engine
+            except ImportError:
+                return None
         from game_engine import get_state, get_player
 
         st = get_state()
@@ -894,7 +1109,10 @@ class ScheduleWindow(QDialog):
             return None
 
         my_team_id = team_info["id"]
-        matches = champions_engine.get_my_champions_matches(st["current_year"])
+        _get_matches_fn = getattr(engine, "get_my_champions_matches", None) or \
+                           getattr(engine, "get_my_europa_matches", None) or \
+                           getattr(engine, "get_my_conference_matches", None)
+        matches = _get_matches_fn(st["current_year"])
         if not matches:
             return None
 
@@ -908,20 +1126,16 @@ class ScheduleWindow(QDialog):
         lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(10)
 
-        league_names = {
-            "유럽": "유럽 챔피언스리그",
-            "아시아": "아시안 챔피언스리그",
-            "아프리카": "아프리카 챔피언스리그",
-            "남미": "코파 리베르타도레스",
-            "북남미": "북남미 챔피언스리그",
-        }
         cont = team_info["continent"]
         from champions_engine import CONTINENT_MAP
         cl_cont = CONTINENT_MAP.get(cont, cont)
-        league_name = league_names.get(cl_cont, f"{cl_cont} 챔피언스리그")
+        _name_map = getattr(engine, "CL_CUP_NAME", None) or \
+                    getattr(engine, "EL_CUP_NAME", None) or \
+                    getattr(engine, "ECL_CUP_NAME", None) or {}
+        league_name = _name_map.get(cl_cont, f"{cl_cont} {comp_title}")
 
         hdr = QLabel(f"🏆 {st['current_year']}년 {league_name}")
-        hdr.setStyleSheet("color:#ffcc00;font-size:14px;font-weight:bold;")
+        hdr.setStyleSheet(f"color:{header_color};font-size:14px;font-weight:bold;")
         lay.addWidget(hdr)
 
         sub = QLabel(f"팀: {team_info['name']} ({team_info['league_name']})")
@@ -930,7 +1144,10 @@ class ScheduleWindow(QDialog):
 
         # ── 리그 스테이지 순위표 (2026-07 스위스 방식 개편 - 조별리그 폐지) ──
         # [2026-07] 좌: 순위표 / 우: 경기 일정 2단 분할 — 국제대회 탭과 동일한 개편.
-        league_info = champions_engine.get_my_cl_league_standings(st["current_year"])
+        _get_standings_fn = getattr(engine, "get_my_cl_league_standings", None) or \
+                            getattr(engine, "get_my_el_league_standings", None) or \
+                            getattr(engine, "get_my_ecl_league_standings", None)
+        league_info = _get_standings_fn(st["current_year"])
         if mode == "groups" and league_info:
             split_row = QHBoxLayout()
             split_row.setSpacing(14)

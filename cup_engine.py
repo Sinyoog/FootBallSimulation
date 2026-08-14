@@ -434,6 +434,19 @@ def _start_domestic_cup_for_country(year, cid, my_cid, add_log):
         join_queue += ["1a", "1b"]
     pending_tiers = ",".join(join_queue)
 
+    # [2026-08 재조정, 신민용 리포트: "16강부터인거지... 근데 지금 니가
+    # 만든건 64강부터 아니야?"] 예전 게임 설계 메모("코리아컵은 16강,
+    # 독일/잉글랜드는 32강 또는 64강")를 그대로 물려받아 cap=64로 계산
+    # 했었는데, 신민용이 확정한 정책은 그게 아니었다 — 참가 가능 팀
+    # 총합이 몇 팀이든(16팀이든 96팀이든) 표준 강수는 16강이 상한이다:
+    #   16팀 이상 → 16강 / 8~15팀 → 8강 / 4~7팀 → 4강 / 2~3팀 → 결승
+    # 즉 "표준 강수"는 나라 규모에 따라 32강·64강으로 더 커지지 않고,
+    # 16강이 유일한 '큰 쪽' 상한이다 — 총 참가팀이 아무리 많아도 그만큼
+    # 앞단의 예선 라운드("N라운드")가 더 늘어날 뿐, 표준 강수 이름이
+    # 붙는 본선 시작점 자체는 항상 16강(또는 그 밑, 팀이 적으면)이다.
+    _total_entrants = sum(len(_tier_teams(cid, tok, year=year)) for tok in join_queue)
+    _standard_bracket_size = _cup_target_bracket_size(_total_entrants, cap=CUP_STANDARD_BRACKET_CAP)
+
     from game_engine import get_player
     p = get_player()
     my_tid = p.get("current_team_id", 0) if (p and cid == my_cid) else 0
@@ -443,10 +456,10 @@ def _start_domestic_cup_for_country(year, cid, my_cid, add_log):
     conn = get_conn(); c = conn.cursor()
     c.execute("""INSERT INTO cup_tournaments(year, country_id, name, status,
                  total_rounds, round_counter, pending_tiers, has_qualifying,
-                 my_in, my_team_id)
-                 VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                 my_in, my_team_id, standard_bracket_size)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
               (year, cid, cup_name, "active", len(join_queue), 0,
-               pending_tiers, has_qualifying, my_in, my_tid))
+               pending_tiers, has_qualifying, my_in, my_tid, _standard_bracket_size))
     conn.commit(); conn.close()
 
     if cid == my_cid:
@@ -459,20 +472,26 @@ def _pop_next_tier(t):
     """pending_tiers에서 다음 합류 티어를 꺼내고 DB에서 제거. 값은 "5"처럼
     순수 티어 숫자거나(5~2부, 그 티어 전원 합류), "1a"/"1b"처럼 1부를
     두 물결로 나눈 태그일 수 있다(_tier_teams가 해석) — 반환값은 그대로
-    문자열 토큰이다(호출부에서 필요할 때 int로 변환)."""
+    문자열 토큰이다(호출부에서 필요할 때 int로 변환).
+
+    반환: (next_token, is_last) — is_last=True면 이 토큰이 pending_tiers의
+    마지막 항목이었다는 뜻(=이 라운드가 끝나면 더 이상 합류할 티어가 없어
+    다음 라운드부터 순수 토너먼트 단계가 시작된다). [2026-08 신설] 표준
+    강수(16강 등) 수렴을 "마지막 합류 라운드" 시점에 앞당겨 시작하기 위해
+    호출부가 미리 알아야 해서 추가했다."""
     pt = t.get("pending_tiers") or ""
     if not pt:
-        return None
+        return None, False
     parts = [x for x in pt.split(",") if x]
     if not parts:
-        return None
+        return None, False
     next_token = parts[0]
     rest = ",".join(parts[1:])
     conn = get_conn()
     conn.execute("UPDATE cup_tournaments SET pending_tiers=? WHERE id=?", (rest, t["id"]))
     conn.commit()
     conn.close()
-    return next_token
+    return next_token, (rest == "")
 
 
 def _tier_teams(country_id, tier_token, year=None):
@@ -512,31 +531,65 @@ def _tier_teams(country_id, tier_token, year=None):
     return out
 
 
+# [2026-08 신설, 신민용 설계 확정: "표준 강수는 16강이 상한 — 참가팀이
+# 많아도 32강/64강으로 더 커지지 않는다"] cup_tournaments.standard_bracket_size
+# 계산(_start_domestic_cup_for_country)에서 쓰는 상한. _cup_bye_count 자체는
+# 범용 유틸이라 기본 cap=64를 그대로 두되(다른 용도로 재사용될 가능성 대비),
+# 실제 대회 표준 강수를 정할 때는 이 상수를 명시적으로 cap으로 넘긴다.
+CUP_STANDARD_BRACKET_CAP = 16
+
+
+def _cup_target_bracket_size(n, cap=64):
+    """[2026-08 신설] n(참가 가능 팀 수, 또는 지금 이 순간 남은 인원) 이하의
+    가장 큰 2의 거듭제곱을 반환한다(cap 상한). _cup_bye_count의 핵심 계산을
+    분리해서, "대회 시작 시점의 참가 가능 팀 총합"으로 표준 강수를 미리
+    한 번 정할 때도(그 값을 이후 모든 라운드의 부전승 계산 cap으로 계속
+    사용) 재사용할 수 있게 했다."""
+    if n <= 0:
+        return 0
+    p = 1
+    while p * 2 <= n and p * 2 <= cap:
+        p *= 2
+    return p
+
+
 def _cup_bye_count(n, cap=64):
     """[2026-08 신설, 신민용 설계 확정] "더 이상 새 부수가 합류하지 않는
     첫 라운드"부터, 생존자 수를 표준 강수(8/16/32/64 중 하나, 64 상한 —
     "게임에서 128강보다 64강이 훨씬 익숙하다"는 이유로 상한을 둠)로 깔끔히
     수렴시키기 위한 부전승 인원을 계산한다.
 
-    P = n 이하의 가장 큰 2의 거듭제곱(64 상한)
+    P = n 이하의 가장 큰 2의 거듭제곱(cap 상한)
     bye = 2P - n   (n이 이미 P와 같으면, 즉 이미 딱 떨어지면 0)
 
     이렇게 한 라운드에서만 부전승을 몰아주면, 그 다음부터는 항상 정확히
     반씩 줄어들어(P → P/2 → ... → 2) 라운드 이름(_round_name)과 3/4위전
     생성(_advance_round의 is_sf 판정)이 별도 손질 없이도 자동으로 맞아
-    떨어진다 — "코리아컵은 16강, 독일/잉글랜드는 32강 또는 64강" 식으로
-    나라별 팀 수에 맞게 본선 시작 지점이 자연스럽게 갈린다.
+    떨어진다.
 
-    n이 128을 넘어(상한의 2배) 공식이 음수가 나오는 극단적인 경우는 이번
-    라운드엔 부전승을 강제로 몰아주지 않고(홀수면 1명만, 예전 방식)
-    다음 라운드에서 다시 계산한다 — 몇 라운드만 지나면 자연히 128 아래로
-    줄어들어 공식이 정상 작동한다.
+    [2026-08 확장, 신민용 설계 확정: "본선 표준 강수는 참가 가능 팀
+    총합 기준"] 예전엔 이 함수가 "더 이상 합류할 부수가 없는 순수
+    토너먼트 단계"에서만 호출됐다 — 그런데 그 단계에 들어가기 *전*
+    예선 라운드들이 그냥 절반씩 걸러내다가 우연히 표준 강수 밑으로
+    떨어지는 문제가 있었다(예: 대한민국 4~5부까지 합쳐 참가 가능 팀이
+    수십 팀인데도 예선에서 계속 반씩 줄다 보니 마지막엔 9팀 남아 8강부터
+    시작). 이제 호출부(cup_engine._start_next_round)가 대회 시작 시점에
+    미리 정해둔 표준 강수(cup_tournaments.standard_bracket_size)를 cap
+    으로 넘겨서 예선 단계에서도 매 라운드 이 함수를 호출한다 — 매
+    라운드 "지금 남은 인원을 표준 강수까지 최대한 수렴"시키려 시도하므로,
+    티어가 계속 새로 합류해 인원이 다시 불어나도 그때마다 다시 표준
+    강수로 눌러준다. 그 결과 모든 티어가 다 합류하고 나면 이미 표준
+    강수 근처(대개 정확히 그 값)에 도달해 있어, "우연히 몇 명 남았는지"가
+    아니라 "원래 몇 팀이 있었는지"로 본선 시작 지점이 정해진다.
+
+    n이 cap의 2배를 넘어(공식이 음수가 나오는 극단적인 경우) 극단적인
+    경우는 이번 라운드엔 부전승을 강제로 몰아주지 않고(홀수면 1명만,
+    예전 방식) 다음 라운드에서 다시 계산한다 — 몇 라운드만 지나면
+    자연히 공식이 정상 작동하는 범위로 줄어든다.
     """
     if n <= 0:
         return 0
-    p = 1
-    while p * 2 <= n and p * 2 <= cap:
-        p *= 2
+    p = _cup_target_bracket_size(n, cap=cap)
     if p >= n:
         return 0
     bye = 2 * p - n
@@ -559,7 +612,9 @@ def _start_next_round(t):
         (tid,)).fetchall()]
     conn.close()
 
-    next_token = _pop_next_tier(t)
+    _orig_pending = [x for x in (t.get("pending_tiers") or "").split(",") if x]
+    next_token, is_last_tier = _pop_next_tier(t)
+    _rest_tiers = _orig_pending[1:]  # 이번에 합류한 티어(_orig_pending[0])를 뺀 나머지 — 앞으로 합류할 티어들
     # [2026-08 신설] cup_entries.tier는 INTEGER라 "1a"/"1b" 태그를 그대로
     # 못 넣는다 — 저장용 실제 티어 숫자(둘 다 1부)와, 라운드 로직/이름
     # 판정에 쓰는 원본 토큰을 분리한다.
@@ -568,12 +623,33 @@ def _start_next_round(t):
     if next_token is not None:
         new_teams = _tier_teams(t["country_id"], next_token, year=t.get("year"))
         conn = get_conn(); c = conn.cursor()
+        # [2026-08 버그수정, 신민용 리포트: "6라운드 다음이 갑자기 8라운드로
+        # 뜬다 / 결승 직전 라운드가 이상하다"] "1a"(챔스 미참가 1부)와
+        # "1b"(챔스 참가 1부)는 서로 다른 라운드(보통 몇 주 간격)에서 각각
+        # 별도로 _tier_teams()를 호출해 "그 시점의 cl_entries 소속 여부"로
+        # 나눈다. 그런데 실제 세이브에서 확인해보니, cl_entries가 "1a" 라운드
+        # 처리 시점과 "1b" 라운드 처리 시점(최대 5주 간격) 사이에 갱신되면
+        # (챔스 조편성 확정 등으로) 같은 팀이 "1a" 때는 비참가로 판정돼
+        # 들어갔다가, "1b" 때 다시 참가로 판정돼 또 들어가는 식으로 같은
+        # 팀이 cup_entries에 중복으로 쌓였다(실측: 도르트문트가 4라운드에
+        # 이미 들어가 있는데 5라운드에서 또 들어가 그 라운드에 2경기를
+        # 동시에 뛰는 상태가 됨 — 이후 라운드의 pool_entering이 실제 생존
+        # 팀 수와 어긋나면서 "8강" 다음이 "4강"이 아니라 "8라운드"처럼
+        # 표준 강수와 안 맞는 이름으로 밀려나는 원인이 됐다).
+        # 어느 쪽이 "맞는" 분류인지 굳이 따지지 않고, 이 토너먼트에 이미
+        # 들어와 있는 팀(cup_entries에 이미 행이 있는 팀)은 무조건 제외한다
+        # — 한 대회에 같은 팀이 두 번 들어갈 방법 자체를 원천 차단.
+        if new_teams:
+            _already_in = {r["team_id"] for r in c.execute(
+                "SELECT team_id FROM cup_entries WHERE tournament_id=?", (tid,)).fetchall()}
+            new_teams = [nt for nt in new_teams if nt[0] not in _already_in]
         if new_teams:
             c.executemany("""INSERT INTO cup_entries(tournament_id, team_id, team_name, tier, ovr)
                          VALUES(?,?,?,?,?)""",
                           [(tid, team_id, team_name, next_tier_num, ovr) for team_id, team_name, ovr in new_teams])
         conn.commit(); conn.close()
         pool = pool + [(x[0], x[1], x[2]) for x in new_teams]
+
 
     if len(pool) < 2:
         if len(pool) == 1:
@@ -583,15 +659,81 @@ def _start_next_round(t):
     pool_entering = len(pool)   # 이 라운드에 '참가하는' 팀 수 (라운드 이름 기준 — 예: 16강=16팀 참가)
     random.shuffle(pool)
     byes = []
+    # [2026-08 재설계 v2, 신민용 설계 확정: "8강/16강은 원래 참가 가능했던
+    # 팀 총합 기준으로 정해야 한다"] v1(len(pool)>=표준강수일 때만 수렴)은
+    # 틀렸다 — 티어가 순차적으로 합류하는 구조상, 앞선 예선 라운드들이
+    # 이미 절반씩 걸러낸 뒤라 "지금 이 순간의 pool"이 표준 강수(예: 64)에
+    # 도달하는 일 자체가 없었다(예: 대한민국 총 96팀인데 예선 매 라운드
+    # 반씩 걸러지며 pool이 한 번도 64를 못 넘김). 표준 강수는 "앞으로 더
+    # 합류할 티어까지 다 합친 최종 총합"을 기준으로 이미 정해져 있으므로
+    # (standard_bracket_size, 대회 시작 시점에 계산), 매 라운드 "지금
+    # 당장 몇 명을 걸러내도 되는지"를 다음처럼 배분한다:
+    #   future_total = 앞으로 합류할 티어들의 팀 수 합(아직 안 만난 팀)
+    #   max_elim     = max(0, len(pool) + future_total - 표준강수)
+    #     (이번 라운드에서 이만큼까지는 걸러내도, 남은 미래 합류분을 다
+    #      더해도 여전히 표준강수 이상은 유지된다는 안전 마진)
+    #   matches      = min(len(pool)//2, max_elim)  (한 라운드에 최대
+    #      가능한 매치 수와 안전 마진 중 작은 쪽 — 페이스 조절의 핵심)
+    #   나머지는 전부 부전승(byes)으로 이번 라운드를 건너뛴다.
+    # 이렇게 하면 예선 초반엔 여유가 많아 공격적으로 걸러내다가(빈 마진
+    # 소진), 남은 티어가 가까워질수록 자동으로 걸러내는 양이 줄어들어,
+    # 모든 티어가 다 합류한 시점엔 정확히 표준 강수(또는 그 이하로 자연
+    # 스럽게 근접)만 남는다. 더 이상 합류할 티어가 없는 순수 토너먼트
+    # 단계(next_token is None)는 future_total=0이라 이 공식이 기존
+    # _cup_bye_count와 동일하게 동작한다(자연스럽게 통합됨).
+    _std = t.get("standard_bracket_size") or 0
+    if _std <= 0:
+        _std = CUP_STANDARD_BRACKET_CAP   # 이 컬럼이 없는 구버전 세이브(마이그레이션 이전 생성된 대회) 안전 폴백 — 16강 상한
     if next_token is None:
-        # [2026-08 신설] 더 이상 합류할 부수가 없는 순수 토너먼트 단계 —
-        # _cup_bye_count로 표준 강수(8/16/32/64)에 맞춰 부전승을 몰아준다.
-        # (예선 단계는 예전처럼 그냥 홀수면 1명만 — 억지로 안 맞춤)
-        n_bye = _cup_bye_count(len(pool))
+        # 더 이상 합류할 티어가 없는 순수 토너먼트 단계 — 여기서부턴
+        # "안 걸러도 되는 여유"를 계산할 필요 없이, 그냥 표준 강수로
+        # 정상적으로 반씩 줄여나가면 된다(기존 _cup_bye_count 그대로).
+        n_bye = _cup_bye_count(len(pool), cap=_std)
         for _ in range(n_bye):
             byes.append(pool.pop())
-    elif len(pool) % 2 == 1:
-        byes.append(pool.pop())
+    else:
+        _future_total = sum(
+            len(_tier_teams(t["country_id"], tok, year=t.get("year")))
+            for tok in _rest_tiers)
+        # [2026-08 버그수정, 신민용 리포트: "18~26팀 정도인 나라도 16강이
+        # 가능한데 왜 8강부터 시작해?"] 실측(422개 신규 대회) 결과 표준
+        # 강수(_std)>=16으로 계산됐는데도 실제론 16강을 못 만들고 8강으로
+        # 떨어지는 대회가 62개 있었다 — 전부 총 참가팀이 18~30팀 안팎으로
+        # 여유가 빠듯한 소국이었다. 원인: 바로 아래 "매 라운드 최소 1경기
+        # 보장"이 max_elim=0(=이번 라운드는 하나도 안 걸러야 딱 맞는 상황)
+        # 이어도 강제로 1명을 더 걸러낸다 — 남은 합류 라운드 수만큼 이
+        # "불필요한 초과 탈락"이 반복 누적되면, 표준강수 문턱 바로 위에
+        # 있던 소국들이 문턱 밑으로 새 버렸다. 남은 합류 라운드 수
+        # (len(_rest_tiers))만큼 여유(margin)를 미리 더 깎아서 계산해두면,
+        # "이후 모든 라운드가 전부 강제로 1명씩 더 걸러내는 최악의 경우"
+        # 를 가정해도 최종적으로 표준강수 이상이 남도록 보장된다.
+        _raw_margin = len(pool) + _future_total - _std
+        _max_elim = max(0, _raw_margin - len(_rest_tiers))
+        if _raw_margin <= 0:
+            # [2026-08 신설] 여유가 전혀 없는 극단적 소국(총 참가팀이
+            # 표준강수와 거의 같거나 더 적음, 예: 총 16팀에 표준강수도
+            # 정확히 16)은 "최소 1경기 강제"조차 걸면 바로 목표 밑으로
+            # 떨어진다 — 이런 경우 이번 라운드는 아무도 안 걸러내고
+            # (부전승 처리만) 그대로 다음 라운드로 즉시 넘어간다(아래
+            # _match_rows가 비면 그 주차를 소모하지 않고 재귀 진행).
+            _matches_this_round = 0
+        else:
+            # [2026-08 버그수정] max_elim이 0이 나오는 라운드(여유가 충분해서
+            # "이번엔 안 걸러도 표준강수를 채울 수 있다"는 경우)가 실제로
+            # 여러 라운드 연속으로 나올 수 있는데, matches=0이면 이 라운드에
+            # cup_matches가 단 한 건도 안 생긴다 — process_cup_week/_process_one이
+            # "그 주차에 cup_matches가 있는 라운드"로만 진행 여부를 판단하므로
+            # (round_names 조회, 위 참고), 매치가 0건인 라운드는 감지 자체가
+            # 안 돼서 대회가 그 지점에서 영원히 멈춘다(실측으로 확인됨). 매
+            # 라운드 최소 1경기는 반드시 열리도록 강제한다 — 페이스 조절
+            # 공식보다 우선한다(len(pool)>=2는 위에서 이미 보장됨). _raw_margin>0
+            # 임을 이미 확인했으므로, 최소 1경기를 강제해도 표준강수 밑으로
+            # 떨어지지 않는다(안전).
+            _matches_this_round = min(len(pool) // 2, max(1, _max_elim))
+        _n_bye = len(pool) - 2 * _matches_this_round
+        for _ in range(_n_bye):
+            byes.append(pool.pop())
+
 
     conn = get_conn()
     p_row = conn.execute("SELECT current_team_id FROM my_player WHERE id=1").fetchone()
@@ -649,8 +791,21 @@ def _start_next_round(t):
         is_my = 1 if my_tid in (home[0], away[0]) else 0
         _match_rows.append((tid, rname, round_counter, week, home[0], away[0], is_my, slot // 2,
                             pool_entering))
-    if _match_rows:
-        c.executemany("""INSERT INTO cup_matches
+    if not _match_rows:
+        # [2026-08 신설] 이번 라운드가 부전승만으로 이루어져(_matches_this_round=0)
+        # 실제 경기가 하나도 없다 — process_cup_week/_process_one은 그 주차에
+        # cup_matches가 있어야만 라운드를 감지하므로, 빈 라운드를 그대로
+        # 만들면 감지가 안 돼서 대회가 영원히 멈춘다. 아무 팀도 안 걸러냈으니
+        # (전원 부전승) 이번 주차를 소모할 필요 자체가 없다 — round_counter만
+        # 그대로 둔 채(아직 진짜 라운드가 시작 안 했으므로) 곧바로 다음
+        # 라운드 생성을 재귀 호출해서 이어간다. pending_tiers는 이미
+        # _pop_next_tier()에서 갱신됐으므로 t를 다시 조회해서 넘긴다.
+        conn.commit(); conn.close()
+        _t2 = get_cup_tournament(t.get("year"), t["country_id"])
+        if _t2:
+            _start_next_round(_t2)
+        return
+    c.executemany("""INSERT INTO cup_matches
                      (tournament_id, round_name, round_idx, week,
                       home_team_id, away_team_id, is_my, slot, pool_entering)
                      VALUES(?,?,?,?,?,?,?,?,?)""", _match_rows)
@@ -975,7 +1130,7 @@ def _process_one(t, week):
     # 끝나는지)는 완전히 동일하고, DB 반영 방식만 배치로 바뀐다.
     conn2 = get_conn()
     pending = [dict(r) for r in conn2.execute(
-        "SELECT * FROM cup_matches WHERE tournament_id=? AND week=? AND home_score=-1 AND is_my=0",
+        "SELECT * FROM cup_matches WHERE tournament_id=? AND week=? AND home_score=-1 AND is_my=0 ORDER BY id",
         (t["id"], week)).fetchall()]
     _batch = []
     for m in pending:

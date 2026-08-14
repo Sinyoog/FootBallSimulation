@@ -1,4 +1,6161 @@
-{"country_id": 3, "country_name": "스페인", "total_teams": 118, "affiliates": 
-[{"team_name": "비야레알 B", "tier": 3, "parent_team_name": "비야레알 CF"}, {"team_name": "아틀레티코 마드리드 B", "tier": 3, "parent_team_name": "아틀레티코 마드리드"}, {"team_name": "FC 바르셀로나 아틀레틱", "tier": 3, "parent_team_name": "바르셀로나"}, {"team_name": "레알 마드리드 카스티야", "tier": 3, "parent_team_name": "레알 마드리드"}, {"team_name": "엘체 이리시타노", "tier": 5, "parent_team_name": "엘체 CF"}, {"team_name": "레알 마드리드 C", "tier": 5, "parent_team_name": "레알 마드리드"}, {"team_name": "카르타헤나 B", "tier": 5, "parent_team_name": "FC 카르타헤나"}], "review": [{"team_name": "우니온 아다르베 B", "tier": 6, "review_reason": "parent_not_found"}]}
-{"country_id": 2, "country_name": "프랑스", "total_teams": 110, "affiliates": 
-[{"team_name": "랭스 II", "tier": 5, "parent_team_name": "스타드 드 랭스"}, {"team_name": "낭트 II", "tier": 5, "parent_team_name": "낭트"}, {"team_name": "생테티엔 II", "tier": 5, "parent_team_name": "생테티엔"}, {"team_name": "릴 II", "tier": 5, "parent_team_name": "릴 OSC"}, {"team_name": "루앙 II", "tier": 6, "parent_team_name": "FC 루앙"}, {"team_name": "디종 II", "tier": 6, "parent_team_name": "디종 FCO"}, {"team_name": "낭시 II", "tier": 6, "parent_team_name": "AS 낭시"}, {"team_name": "소쇼 II", "tier": 6, "parent_team_name": "FC 소쇼"}, {"team_name": "르망 II", "tier": 6, "parent_team_name": "르망 FC"}, {"team_name": "니스 II", "tier": 6, "parent_team_name": "OGC 니스"}, {"team_name": "모나코 II", "tier": 6, "parent_team_name": "AS 모나코"}, {"team_name": "마르세유 II", "tier": 6, "parent_team_name": "올랭피크 마르세유"}, {"team_name": "리옹 II", "tier": 6, "parent_team_name": "올랭피크 리옹"}, {"team_name": "툴루즈 II", "tier": 6, "parent_team_name": "툴루즈 FC"}, {"team_name": "브레스트 II", "tier": 6, "parent_team_name": "스타드 브레스트 29"}, {"team_name": "앙제 II", "tier": 6, "parent_team_name": "앙제 SCO"}, {"team_name": "오세르 II", "tier": 6, "parent_team_name": "오세르"}, {"team_name": "렌 II", "tier": 6, "parent_team_name": "스타드 렌 FC"}, {"team_name": "스트라스부르 II", "tier": 6, "parent_team_name": "RC 스트라스부르"}, {"team_name": "렌느 아카데미", "tier": 6, "parent_team_name": "스타드 렌 FC"}, {"team_name": "낭트 아카데미", "tier": 6, "parent_team_name": "낭트"}], "review": []}
+{
+  "country_name": "아르헨티나",
+  "total_teams": 104,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "프랑스",
+  "total_teams": 150,
+  "affiliates": [
+    {
+      "team_name": "랭스 II",
+      "tier": 5,
+      "parent_team_name": "스타드 드 랭스"
+    },
+    {
+      "team_name": "낭트 II",
+      "tier": 5,
+      "parent_team_name": "낭트"
+    },
+    {
+      "team_name": "생테티엔 II",
+      "tier": 5,
+      "parent_team_name": "생테티엔"
+    },
+    {
+      "team_name": "릴 II",
+      "tier": 5,
+      "parent_team_name": "릴 OSC"
+    },
+    {
+      "team_name": "루앙 II",
+      "tier": 6,
+      "parent_team_name": "FC 루앙"
+    },
+    {
+      "team_name": "디종 II",
+      "tier": 6,
+      "parent_team_name": "디종 FCO"
+    },
+    {
+      "team_name": "낭시 II",
+      "tier": 6,
+      "parent_team_name": "AS 낭시"
+    },
+    {
+      "team_name": "소쇼 II",
+      "tier": 6,
+      "parent_team_name": "FC 소쇼"
+    },
+    {
+      "team_name": "르망 II",
+      "tier": 6,
+      "parent_team_name": "르망 FC"
+    },
+    {
+      "team_name": "니스 II",
+      "tier": 6,
+      "parent_team_name": "OGC 니스"
+    },
+    {
+      "team_name": "모나코 II",
+      "tier": 6,
+      "parent_team_name": "AS 모나코"
+    },
+    {
+      "team_name": "마르세유 II",
+      "tier": 6,
+      "parent_team_name": "올랭피크 마르세유"
+    },
+    {
+      "team_name": "리옹 II",
+      "tier": 6,
+      "parent_team_name": "올랭피크 리옹"
+    },
+    {
+      "team_name": "툴루즈 II",
+      "tier": 6,
+      "parent_team_name": "툴루즈 FC"
+    },
+    {
+      "team_name": "브레스트 II",
+      "tier": 6,
+      "parent_team_name": "스타드 브레스트 29"
+    },
+    {
+      "team_name": "앙제 II",
+      "tier": 6,
+      "parent_team_name": "앙제 SCO"
+    },
+    {
+      "team_name": "오세르 II",
+      "tier": 6,
+      "parent_team_name": "오세르"
+    },
+    {
+      "team_name": "렌 II",
+      "tier": 6,
+      "parent_team_name": "스타드 렌 FC"
+    },
+    {
+      "team_name": "스트라스부르 II",
+      "tier": 6,
+      "parent_team_name": "RC 스트라스부르"
+    },
+    {
+      "team_name": "렌느 아카데미",
+      "tier": 6,
+      "parent_team_name": "스타드 렌 FC"
+    },
+    {
+      "team_name": "낭트 아카데미",
+      "tier": 6,
+      "parent_team_name": "낭트"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "스페인",
+  "total_teams": 175,
+  "affiliates": [
+    {
+      "team_name": "비야레알 B",
+      "tier": 3,
+      "parent_team_name": "비야레알 CF"
+    },
+    {
+      "team_name": "아틀레티코 마드리드 B",
+      "tier": 3,
+      "parent_team_name": "아틀레티코 마드리드"
+    },
+    {
+      "team_name": "FC 바르셀로나 아틀레틱",
+      "tier": 3,
+      "parent_team_name": "바르셀로나"
+    },
+    {
+      "team_name": "레알 마드리드 카스티야",
+      "tier": 3,
+      "parent_team_name": "레알 마드리드"
+    },
+    {
+      "team_name": "엘체 이리시타노",
+      "tier": 5,
+      "parent_team_name": "엘체 CF"
+    },
+    {
+      "team_name": "레알 마드리드 C",
+      "tier": 5,
+      "parent_team_name": "레알 마드리드"
+    },
+    {
+      "team_name": "카르타헤나 B",
+      "tier": 5,
+      "parent_team_name": "FC 카르타헤나"
+    },
+    {
+      "team_name": "CD 레가네스 B",
+      "tier": 6,
+      "parent_team_name": "레가네스"
+    },
+    {
+      "team_name": "CD 알코르콘 B",
+      "tier": 6,
+      "parent_team_name": "AD 알코르콘"
+    },
+    {
+      "team_name": "우니온 아다르베 B",
+      "tier": 6,
+      "parent_team_name": "AD 우니온 아다르베"
+    },
+    {
+      "team_name": "CD 알마소라 B",
+      "tier": 7,
+      "parent_team_name": "CD 알마소라"
+    },
+    {
+      "team_name": "CD 온다 B",
+      "tier": 7,
+      "parent_team_name": "CD 온다"
+    },
+    {
+      "team_name": "CD 베니카를로 B",
+      "tier": 7,
+      "parent_team_name": "CD 베니카를로"
+    },
+    {
+      "team_name": "CD 하베아 B",
+      "tier": 7,
+      "parent_team_name": "CD 하베아"
+    },
+    {
+      "team_name": "CD 산 마르셀리노 B",
+      "tier": 7,
+      "parent_team_name": "CD 산 마르셀리노"
+    }
+  ],
+  "review": [
+    {
+      "team_name": "CD 라 누시아 B",
+      "tier": 7,
+      "review_reason": "parent_not_found"
+    },
+    {
+      "team_name": "CD 카타로하 B",
+      "tier": 7,
+      "review_reason": "parent_not_found"
+    },
+    {
+      "team_name": "CD 마니세스 B",
+      "tier": 7,
+      "review_reason": "parent_not_found"
+    },
+    {
+      "team_name": "CD 알다이아 B",
+      "tier": 7,
+      "review_reason": "parent_not_found"
+    },
+    {
+      "team_name": "CD 토렌트 B",
+      "tier": 7,
+      "review_reason": "parent_not_found"
+    }
+  ]
+}
+
+{
+  "country_name": "잉글랜드",
+  "total_teams": 186,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "브라질",
+  "total_teams": 116,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "모로코",
+  "total_teams": 56,
+  "affiliates": [
+    {
+      "team_name": "USM 우지다 B",
+      "tier": 4,
+      "parent_team_name": "USM 우지다"
+    },
+    {
+      "team_name": "SCC 모하메디아 B",
+      "tier": 4,
+      "parent_team_name": "샤바브 모하메디아"
+    },
+    {
+      "team_name": "하사니아 아가디르 B",
+      "tier": 4,
+      "parent_team_name": "하사니아 아가디르"
+    },
+    {
+      "team_name": "AS 살레 B",
+      "tier": 4,
+      "parent_team_name": "AS 살레"
+    },
+    {
+      "team_name": "파스 나도르 B",
+      "tier": 4,
+      "parent_team_name": "파스 나도르"
+    },
+    {
+      "team_name": "라자 카사블랑카 B",
+      "tier": 4,
+      "parent_team_name": "라자 카사블랑카"
+    },
+    {
+      "team_name": "FAR 라바트 B",
+      "tier": 4,
+      "parent_team_name": "AS FAR 라바트"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "네덜란드",
+  "total_teams": 108,
+  "affiliates": [
+    {
+      "team_name": "용 아약스",
+      "tier": 2,
+      "parent_team_name": "아약스"
+    },
+    {
+      "team_name": "용 PSV",
+      "tier": 2,
+      "parent_team_name": "PSV 에인트호번"
+    },
+    {
+      "team_name": "용 알크마르",
+      "tier": 2,
+      "parent_team_name": "AZ 알크마르"
+    },
+    {
+      "team_name": "용 위트레흐트",
+      "tier": 2,
+      "parent_team_name": "위트레흐트"
+    },
+    {
+      "team_name": "용 스파르타 로테르담",
+      "tier": 3,
+      "parent_team_name": "스파르타 로테르담"
+    },
+    {
+      "team_name": "용 알메러 시티",
+      "tier": 3,
+      "parent_team_name": "알메러 시티"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "독일",
+  "total_teams": 154,
+  "affiliates": [
+    {
+      "team_name": "도르트문트 II",
+      "tier": 3,
+      "parent_team_name": "보루시아 도르트문트"
+    },
+    {
+      "team_name": "슈투트가르트 II",
+      "tier": 3,
+      "parent_team_name": "슈투트가르트"
+    },
+    {
+      "team_name": "베르더 브레멘 II",
+      "tier": 3,
+      "parent_team_name": "베르더 브레멘"
+    },
+    {
+      "team_name": "볼프스부르크 II",
+      "tier": 3,
+      "parent_team_name": "볼프스부르크"
+    },
+    {
+      "team_name": "포르투나 뒤셀도르프 II",
+      "tier": 4,
+      "parent_team_name": "포르투나 뒤셀도르프"
+    },
+    {
+      "team_name": "묀헨글라트바흐 II",
+      "tier": 4,
+      "parent_team_name": "보루시아 묀헨글라트바흐"
+    },
+    {
+      "team_name": "FC 바이에른 뮌헨 II",
+      "tier": 4,
+      "parent_team_name": "FC 바이에른 뮌헨"
+    },
+    {
+      "team_name": "뉘른베르크 II",
+      "tier": 4,
+      "parent_team_name": "FC 뉘른베르크"
+    },
+    {
+      "team_name": "VfB 뤼베크 II",
+      "tier": 6,
+      "parent_team_name": "VfB 뤼베크"
+    },
+    {
+      "team_name": "알레마니아 아헨 II",
+      "tier": 6,
+      "parent_team_name": "알레마니아 아헨"
+    },
+    {
+      "team_name": "VfL 오스나브뤼크 II",
+      "tier": 6,
+      "parent_team_name": "VfL 오스나브뤼크"
+    },
+    {
+      "team_name": "마그데부르크 II",
+      "tier": 6,
+      "parent_team_name": "마그데부르크"
+    },
+    {
+      "team_name": "드레스덴 II",
+      "tier": 6,
+      "parent_team_name": "SG 디나모 드레스덴"
+    },
+    {
+      "team_name": "로트바이스 에센 II",
+      "tier": 6,
+      "parent_team_name": "로트바이스 에센"
+    },
+    {
+      "team_name": "1. FC 포이닉스 뤼베크 II",
+      "tier": 7,
+      "parent_team_name": "1. FC 포이닉스 뤼베크"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "포르투갈",
+  "total_teams": 110,
+  "affiliates": [
+    {
+      "team_name": "벤피카 B",
+      "tier": 2,
+      "parent_team_name": "벤피카"
+    },
+    {
+      "team_name": "포르투 B",
+      "tier": 2,
+      "parent_team_name": "FC 포르투"
+    },
+    {
+      "team_name": "스포르팅 CP B",
+      "tier": 2,
+      "parent_team_name": "스포르팅 CP"
+    },
+    {
+      "team_name": "브라가 B",
+      "tier": 2,
+      "parent_team_name": "브라가"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "벨기에",
+  "total_teams": 114,
+  "affiliates": [
+    {
+      "team_name": "RSCA 퓨처스",
+      "tier": 2,
+      "parent_team_name": "안데를레흐트"
+    },
+    {
+      "team_name": "종 헨크",
+      "tier": 2,
+      "parent_team_name": "헨크"
+    },
+    {
+      "team_name": "종 KAA 헨트",
+      "tier": 2,
+      "parent_team_name": "헨트"
+    },
+    {
+      "team_name": "클럽 NXT",
+      "tier": 2,
+      "parent_team_name": "클럽 브뤼허"
+    },
+    {
+      "team_name": "OH 루벤 B",
+      "tier": 3,
+      "parent_team_name": "OH 루벤"
+    },
+    {
+      "team_name": "세르클러 브뤼허 B",
+      "tier": 3,
+      "parent_team_name": "세르클러 브뤼허"
+    },
+    {
+      "team_name": "KV 메헬렌 B",
+      "tier": 4,
+      "parent_team_name": "메헬렌"
+    },
+    {
+      "team_name": "SV 쥘터 바레험 B",
+      "tier": 4,
+      "parent_team_name": "SV 쥘터 바레험"
+    },
+    {
+      "team_name": "R 앤트워프 FC B",
+      "tier": 4,
+      "parent_team_name": "앤트워프"
+    },
+    {
+      "team_name": "신트트라위던 VV B",
+      "tier": 4,
+      "parent_team_name": "신트트라위던"
+    },
+    {
+      "team_name": "K 베르헴 스포르트 B",
+      "tier": 5,
+      "parent_team_name": "K 베르헴 스포르트"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "멕시코",
+  "total_teams": 114,
+  "affiliates": [
+    {
+      "team_name": "타파티오",
+      "tier": 2,
+      "parent_team_name": "과달라하라"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "콜롬비아",
+  "total_teams": 68,
+  "affiliates": [
+    {
+      "team_name": "나시오날 B",
+      "tier": 3,
+      "parent_team_name": "아틀레티코 나시오날"
+    },
+    {
+      "team_name": "미요나리오스 B",
+      "tier": 3,
+      "parent_team_name": "미요나리오스"
+    },
+    {
+      "team_name": "후니오르 B",
+      "tier": 3,
+      "parent_team_name": "후니오르"
+    },
+    {
+      "team_name": "칼리 B",
+      "tier": 3,
+      "parent_team_name": "데포르티보 칼리"
+    },
+    {
+      "team_name": "메데인 B",
+      "tier": 3,
+      "parent_team_name": "인데펜디엔테 메데인"
+    },
+    {
+      "team_name": "톨리마 B",
+      "tier": 3,
+      "parent_team_name": "데포르테스 톨리마"
+    },
+    {
+      "team_name": "산타페 B",
+      "tier": 3,
+      "parent_team_name": "산타페"
+    },
+    {
+      "team_name": "아메리카 B",
+      "tier": 3,
+      "parent_team_name": "아메리카 데 칼리"
+    },
+    {
+      "team_name": "부카라망가 B",
+      "tier": 3,
+      "parent_team_name": "부카라망가"
+    },
+    {
+      "team_name": "엔비가도 B",
+      "tier": 3,
+      "parent_team_name": "인데펜디엔테 엔비가도"
+    },
+    {
+      "team_name": "온세 칼다스 B",
+      "tier": 3,
+      "parent_team_name": "온세 칼다스"
+    },
+    {
+      "team_name": "페레이라 B",
+      "tier": 3,
+      "parent_team_name": "데포르티보 페레이라"
+    },
+    {
+      "team_name": "야네로스 B",
+      "tier": 3,
+      "parent_team_name": "야네로스"
+    },
+    {
+      "team_name": "페레이라 유스",
+      "tier": 3,
+      "parent_team_name": "데포르티보 페레이라"
+    },
+    {
+      "team_name": "레알 카르타헤나 B",
+      "tier": 3,
+      "parent_team_name": "레알 카르타헤나"
+    },
+    {
+      "team_name": "쿠쿠타 유스",
+      "tier": 3,
+      "parent_team_name": "쿠쿠타 데포르티보"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "미국",
+  "total_teams": 82,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "이탈리아",
+  "total_teams": 188,
+  "affiliates": [
+    {
+      "team_name": "유벤투스 넥스트 젠",
+      "tier": 3,
+      "parent_team_name": "유벤투스"
+    },
+    {
+      "team_name": "아탈란타 U23",
+      "tier": 3,
+      "parent_team_name": "아탈란타"
+    },
+    {
+      "team_name": "라벤나 2군",
+      "tier": 6,
+      "parent_team_name": "라벤나"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "크로아티아",
+  "total_teams": 54,
+  "affiliates": [
+    {
+      "team_name": "비옐로 바르도 B",
+      "tier": 3,
+      "parent_team_name": "BSK 비옐로 브르도"
+    },
+    {
+      "team_name": "카를로바츠 1919 B",
+      "tier": 4,
+      "parent_team_name": "카를로바츠 1919"
+    },
+    {
+      "team_name": "마르소니아 B",
+      "tier": 4,
+      "parent_team_name": "마르소니아"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "세네갈",
+  "total_teams": 78,
+  "affiliates": [
+    {
+      "team_name": "왈리단 B",
+      "tier": 3,
+      "parent_team_name": "왈리단 FC"
+    },
+    {
+      "team_name": "ASC 자라프 아카데미",
+      "tier": 4,
+      "parent_team_name": "ASC 자라프"
+    },
+    {
+      "team_name": "티에스 아카데미",
+      "tier": 3,
+      "parent_team_name": "티에스 FC"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "일본",
+  "total_teams": 94,
+  "affiliates": [
+    {
+      "team_name": "FC 이마바리(2군)",
+      "tier": 5,
+      "parent_team_name": "FC 이마바리"
+    }
+  ],
+  "review": [
+    {
+      "team_name": "FC 이와키(연계)",
+      "tier": 5,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "요코하마 SCC(위성)",
+      "tier": 5,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "알비렉스 니가타(아마)",
+      "tier": 5,
+      "review_reason": "ambiguous_classification"
+    }
+  ]
+}
+
+{
+  "country_name": "우루과이",
+  "total_teams": 58,
+  "affiliates": [
+    {
+      "team_name": "세로 라르고 B",
+      "tier": 2,
+      "parent_team_name": "세로 라르고"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "스위스",
+  "total_teams": 94,
+  "affiliates": [
+    {
+      "team_name": "바젤 II",
+      "tier": 3,
+      "parent_team_name": "바젤"
+    },
+    {
+      "team_name": "취리히 II",
+      "tier": 3,
+      "parent_team_name": "취리히"
+    },
+    {
+      "team_name": "영 보이스 II",
+      "tier": 3,
+      "parent_team_name": "BSC 영 보이스"
+    },
+    {
+      "team_name": "루체른 II",
+      "tier": 3,
+      "parent_team_name": "루체른"
+    },
+    {
+      "team_name": "장크트 갈렌 II",
+      "tier": 3,
+      "parent_team_name": "장크트 갈렌"
+    },
+    {
+      "team_name": "루가노 II",
+      "tier": 3,
+      "parent_team_name": "루가노"
+    },
+    {
+      "team_name": "로잔-스포르 II",
+      "tier": 4,
+      "parent_team_name": "로잔-스포르"
+    },
+    {
+      "team_name": "FC 시옹 II",
+      "tier": 4,
+      "parent_team_name": "시온"
+    },
+    {
+      "team_name": "세르베트 II",
+      "tier": 4,
+      "parent_team_name": "세르베트"
+    },
+    {
+      "team_name": "툰 II",
+      "tier": 4,
+      "parent_team_name": "툰"
+    },
+    {
+      "team_name": "FC 프라이엔바흐 II",
+      "tier": 5,
+      "parent_team_name": "FC 프라이엔바흐"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "덴마크",
+  "total_teams": 84,
+  "affiliates": [
+    {
+      "team_name": "호브로 IK II",
+      "tier": 5,
+      "parent_team_name": "호브로 IK"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "오스트리아",
+  "total_teams": 60,
+  "affiliates": [
+    {
+      "team_name": "라피드 빈 II",
+      "tier": 2,
+      "parent_team_name": "라피드 빈"
+    },
+    {
+      "team_name": "스투름 그라츠 II",
+      "tier": 2,
+      "parent_team_name": "스투름 그라츠"
+    },
+    {
+      "team_name": "LASK II",
+      "tier": 3,
+      "parent_team_name": "LASK 린츠"
+    },
+    {
+      "team_name": "볼프스베르거 AC B",
+      "tier": 3,
+      "parent_team_name": "볼프스베르거 AC"
+    },
+    {
+      "team_name": "아우스트리아 빈 II",
+      "tier": 3,
+      "parent_team_name": "아우스트리아 빈"
+    },
+    {
+      "team_name": "SV 아우스트리아 잘츠부르크 B",
+      "tier": 4,
+      "parent_team_name": "아우스트리아 잘츠부르크"
+    },
+    {
+      "team_name": "그라처 AK B",
+      "tier": 4,
+      "parent_team_name": "GAK 1902"
+    },
+    {
+      "team_name": "린츠 ASK B",
+      "tier": 4,
+      "parent_team_name": "LASK 린츠"
+    },
+    {
+      "team_name": "아우스트리아 클라겐푸르트 B",
+      "tier": 4,
+      "parent_team_name": "아우스트리아 클라겐푸르트"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "이란",
+  "total_teams": 86,
+  "affiliates": [
+    {
+      "team_name": "페르시폴리스 노비",
+      "tier": 3,
+      "parent_team_name": "페르세폴리스"
+    },
+    {
+      "team_name": "다마시 B",
+      "tier": 4,
+      "parent_team_name": "다마시 길란"
+    },
+    {
+      "team_name": "사이파 B",
+      "tier": 4,
+      "parent_team_name": "사이파 FC"
+    },
+    {
+      "team_name": "메스 라프산잔 B",
+      "tier": 4,
+      "parent_team_name": "메스 라프산잔"
+    },
+    {
+      "team_name": "풀라드 B",
+      "tier": 4,
+      "parent_team_name": "풀라드"
+    },
+    {
+      "team_name": "조브 아한 B",
+      "tier": 4,
+      "parent_team_name": "조브 아한 이스파한"
+    },
+    {
+      "team_name": "골 고하르 B",
+      "tier": 4,
+      "parent_team_name": "골 고하르"
+    },
+    {
+      "team_name": "말라반 B",
+      "tier": 4,
+      "parent_team_name": "말라반"
+    },
+    {
+      "team_name": "알루미늄 아라크 B",
+      "tier": 4,
+      "parent_team_name": "알루미늄 아라크"
+    },
+    {
+      "team_name": "나프트 아바단 B",
+      "tier": 4,
+      "parent_team_name": "사나트 나프트"
+    },
+    {
+      "team_name": "메스 케르만 B",
+      "tier": 4,
+      "parent_team_name": "메스 케르만"
+    }
+  ],
+  "review": [
+    {
+      "team_name": "에스테글랄 노바린",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    }
+  ]
+}
+
+{
+  "country_name": "대한민국",
+  "total_teams": 92,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "나이지리아",
+  "total_teams": 68,
+  "affiliates": [
+    {
+      "team_name": "바옐사 유나이티드 B",
+      "tier": 3,
+      "parent_team_name": "바옐사 유나이티드"
+    },
+    {
+      "team_name": "워리 울브스 B",
+      "tier": 3,
+      "parent_team_name": "워리 울브스"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "호주",
+  "total_teams": 58,
+  "affiliates": [
+    {
+      "team_name": "센트럴코스트 마리너스 2군",
+      "tier": 2,
+      "parent_team_name": "센트럴코스트 마리너스"
+    },
+    {
+      "team_name": "시드니 FC 2군",
+      "tier": 2,
+      "parent_team_name": "시드니 FC"
+    },
+    {
+      "team_name": "웨스턴 시드니 원더러스 2군",
+      "tier": 2,
+      "parent_team_name": "웨스턴 시드니 원더러스"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "노르웨이",
+  "total_teams": 60,
+  "affiliates": [
+    {
+      "team_name": "브란 II",
+      "tier": 3,
+      "parent_team_name": "브란"
+    },
+    {
+      "team_name": "몰데 II",
+      "tier": 3,
+      "parent_team_name": "몰데"
+    },
+    {
+      "team_name": "바이킹 II",
+      "tier": 3,
+      "parent_team_name": "바이킹"
+    },
+    {
+      "team_name": "로센보르그 II",
+      "tier": 3,
+      "parent_team_name": "로센보르그"
+    },
+    {
+      "team_name": "릴레스트룀 II",
+      "tier": 4,
+      "parent_team_name": "릴레스트룀"
+    },
+    {
+      "team_name": "보되 글림트 II",
+      "tier": 4,
+      "parent_team_name": "보되 글림트"
+    },
+    {
+      "team_name": "스타르트 II",
+      "tier": 4,
+      "parent_team_name": "스타르트"
+    },
+    {
+      "team_name": "송달 II",
+      "tier": 4,
+      "parent_team_name": "송달"
+    },
+    {
+      "team_name": "하우게순 II",
+      "tier": 4,
+      "parent_team_name": "하우게순"
+    },
+    {
+      "team_name": "프레드릭스타드 II",
+      "tier": 4,
+      "parent_team_name": "프레드릭스타드"
+    },
+    {
+      "team_name": "스트룀스고드세트 II",
+      "tier": 4,
+      "parent_team_name": "스트룀스고드세트"
+    },
+    {
+      "team_name": "산드네스 울프 II",
+      "tier": 4,
+      "parent_team_name": "산드네스 울프"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "캐나다",
+  "total_teams": 36,
+  "affiliates": [
+    {
+      "team_name": "밴쿠버 화이트캡스 리저브",
+      "tier": 2,
+      "parent_team_name": "밴쿠버 FC"
+    },
+    {
+      "team_name": "TFC 아카데미",
+      "tier": 2,
+      "parent_team_name": "토론토 펄스"
+    },
+    {
+      "team_name": "포지 B",
+      "tier": 3,
+      "parent_team_name": "포지 FC"
+    },
+    {
+      "team_name": "카발리 B",
+      "tier": 3,
+      "parent_team_name": "카발리 FC"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "이집트",
+  "total_teams": 60,
+  "affiliates": [
+    {
+      "team_name": "엘 미니아 B",
+      "tier": 3,
+      "parent_team_name": "엘 미니아"
+    },
+    {
+      "team_name": "아스완 B",
+      "tier": 3,
+      "parent_team_name": "아스완"
+    },
+    {
+      "team_name": "알 아흘리 B",
+      "tier": 4,
+      "parent_team_name": "알 아흘리 SC"
+    },
+    {
+      "team_name": "자말렉 B",
+      "tier": 4,
+      "parent_team_name": "자말렉"
+    },
+    {
+      "team_name": "엔피 B",
+      "tier": 4,
+      "parent_team_name": "엔피"
+    },
+    {
+      "team_name": "스무하 B",
+      "tier": 4,
+      "parent_team_name": "스무하"
+    },
+    {
+      "team_name": "ZED B",
+      "tier": 4,
+      "parent_team_name": "ZED FC"
+    },
+    {
+      "team_name": "가즐 B",
+      "tier": 4,
+      "parent_team_name": "가즐 엘 마할라"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "알제리",
+  "total_teams": 90,
+  "affiliates": [
+    {
+      "team_name": "벨루이즈다드 B",
+      "tier": 3,
+      "parent_team_name": "CR 벨루이즈다드"
+    },
+    {
+      "team_name": "콘스탄틴 B",
+      "tier": 3,
+      "parent_team_name": "CS 콘스탄틴"
+    },
+    {
+      "team_name": "케미스 밀리아나 B",
+      "tier": 3,
+      "parent_team_name": "SKAF 켐스 밀리아나"
+    },
+    {
+      "team_name": "RC 아르바 B",
+      "tier": 4,
+      "parent_team_name": "RC 아르바"
+    },
+    {
+      "team_name": "USM 블리다 B",
+      "tier": 4,
+      "parent_team_name": "블리다"
+    },
+    {
+      "team_name": "NRB 아르제우 B",
+      "tier": 4,
+      "parent_team_name": "아르제우"
+    },
+    {
+      "team_name": "USM 켄첼라 B",
+      "tier": 4,
+      "parent_team_name": "USM 켄첼라"
+    },
+    {
+      "team_name": "NC 마그라 B",
+      "tier": 4,
+      "parent_team_name": "NC 마그라"
+    },
+    {
+      "team_name": "ES 세티프 B",
+      "tier": 4,
+      "parent_team_name": "ES 세티프"
+    },
+    {
+      "team_name": "MC 알제 B",
+      "tier": 4,
+      "parent_team_name": "MC 알제"
+    },
+    {
+      "team_name": "JS 사우라 B",
+      "tier": 4,
+      "parent_team_name": "JS 사우라"
+    },
+    {
+      "team_name": "파라두 AC B",
+      "tier": 4,
+      "parent_team_name": "파라두 AC"
+    },
+    {
+      "team_name": "ASO 슐레프 B",
+      "tier": 4,
+      "parent_team_name": "ASO 슐레프"
+    },
+    {
+      "team_name": "MC 오란 B",
+      "tier": 4,
+      "parent_team_name": "MC 오란"
+    },
+    {
+      "team_name": "NA 후세인 데이 B",
+      "tier": 4,
+      "parent_team_name": "NA 후세인 데이"
+    },
+    {
+      "team_name": "WA 틀렘센 B",
+      "tier": 4,
+      "parent_team_name": "WA 틀렘센"
+    },
+    {
+      "team_name": "MO 베자이아 B",
+      "tier": 4,
+      "parent_team_name": "MO 베자이아"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "에콰도르",
+  "total_teams": 54,
+  "affiliates": [
+    {
+      "team_name": "인디펜디엔테 주니어스",
+      "tier": 2,
+      "parent_team_name": "인디펜디엔테 델 바예"
+    },
+    {
+      "team_name": "임바부라 B",
+      "tier": 3,
+      "parent_team_name": "임바부라 SC"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "코트디부아르",
+  "total_teams": 70,
+  "affiliates": [
+    {
+      "team_name": "가뇨아 리저브",
+      "tier": 3,
+      "parent_team_name": "SC 가뇨아"
+    },
+    {
+      "team_name": "산드로 유스",
+      "tier": 3,
+      "parent_team_name": "산 페드로"
+    },
+    {
+      "team_name": "소아 유스",
+      "tier": 3,
+      "parent_team_name": "소아"
+    },
+    {
+      "team_name": "가뇨아 B",
+      "tier": 3,
+      "parent_team_name": "SC 가뇨아"
+    }
+  ],
+  "review": [
+    {
+      "team_name": "이부아르 아카데미",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "위페르 아카데미",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    }
+  ]
+}
+
+{
+  "country_name": "튀르키예",
+  "total_teams": 90,
+  "affiliates": [
+    {
+      "team_name": "에르진잔스포르 B",
+      "tier": 4,
+      "parent_team_name": "에르주룸스포르"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "우크라이나",
+  "total_teams": 56,
+  "affiliates": [
+    {
+      "team_name": "포돌리아 흐멜니츠키 B",
+      "tier": 3,
+      "parent_team_name": "포딜리아"
+    },
+    {
+      "team_name": "루흐 리비우 II",
+      "tier": 3,
+      "parent_team_name": "루흐 리비우"
+    },
+    {
+      "team_name": "카르파티 리비우 II",
+      "tier": 3,
+      "parent_team_name": "카르파티 리비우"
+    },
+    {
+      "team_name": "폴리샤 B",
+      "tier": 3,
+      "parent_team_name": "폴리샤 지토미르"
+    },
+    {
+      "team_name": "올렉산드리아 B",
+      "tier": 3,
+      "parent_team_name": "올렉산드리아"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "러시아",
+  "total_teams": 56,
+  "affiliates": [
+    {
+      "team_name": "우랄 B",
+      "tier": 2,
+      "parent_team_name": "우랄"
+    },
+    {
+      "team_name": "크라스노다르 2",
+      "tier": 3,
+      "parent_team_name": "크라스노다르"
+    },
+    {
+      "team_name": "로디나 2",
+      "tier": 3,
+      "parent_team_name": "로디나 모스크바"
+    },
+    {
+      "team_name": "제니트 2",
+      "tier": 4,
+      "parent_team_name": "제니트"
+    },
+    {
+      "team_name": "스파르타크 모스크바 2",
+      "tier": 4,
+      "parent_team_name": "스파르타크 모스크바"
+    },
+    {
+      "team_name": "루빈 카잔 2",
+      "tier": 4,
+      "parent_team_name": "루빈 카잔"
+    },
+    {
+      "team_name": "디나모 모스크바 2",
+      "tier": 4,
+      "parent_team_name": "디나모 모스크바"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "폴란드",
+  "total_teams": 68,
+  "affiliates": [
+    {
+      "team_name": "레기아 B",
+      "tier": 3,
+      "parent_team_name": "레기아 바르샤바"
+    },
+    {
+      "team_name": "레흐 B",
+      "tier": 3,
+      "parent_team_name": "레흐 포즈난"
+    },
+    {
+      "team_name": "자그웽비에 루빈 II",
+      "tier": 3,
+      "parent_team_name": "자그웽비에 루빈"
+    },
+    {
+      "team_name": "스탈 미엘레츠 II",
+      "tier": 3,
+      "parent_team_name": "스탈 미엘레츠"
+    },
+    {
+      "team_name": "레기아 III",
+      "tier": 4,
+      "parent_team_name": "레기아 바르샤바"
+    },
+    {
+      "team_name": "야기엘로니아 II",
+      "tier": 4,
+      "parent_team_name": "야기엘로니아 비아위스토크"
+    },
+    {
+      "team_name": "레흐 포즈난 III",
+      "tier": 4,
+      "parent_team_name": "레흐 포즈난"
+    },
+    {
+      "team_name": "구르니크 II 자브제",
+      "tier": 4,
+      "parent_team_name": "구르니크 자브제"
+    },
+    {
+      "team_name": "실롱스크 II 브로츠와프",
+      "tier": 4,
+      "parent_team_name": "실롱스크 브로츠와프"
+    },
+    {
+      "team_name": "비스와 II 크라쿠프",
+      "tier": 4,
+      "parent_team_name": "비스와 크라쿠프"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "스웨덴",
+  "total_teams": 64,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "파라과이",
+  "total_teams": 46,
+  "affiliates": [
+    {
+      "team_name": "페르난도 데 라 모라 B",
+      "tier": 2,
+      "parent_team_name": "페르난도 데 라 모라"
+    },
+    {
+      "team_name": "스포르티보 아멜리아노 B",
+      "tier": 3,
+      "parent_team_name": "아멜리아노"
+    },
+    {
+      "team_name": "타쿠아리 B",
+      "tier": 3,
+      "parent_team_name": "타쿠아리"
+    },
+    {
+      "team_name": "구아라니 B",
+      "tier": 3,
+      "parent_team_name": "구아라니"
+    },
+    {
+      "team_name": "올림피아 B",
+      "tier": 3,
+      "parent_team_name": "올림피아"
+    },
+    {
+      "team_name": "세로 포르테뇨 B",
+      "tier": 3,
+      "parent_team_name": "세로 포르테뇨"
+    },
+    {
+      "team_name": "리베르타드 B",
+      "tier": 3,
+      "parent_team_name": "리베르타드"
+    },
+    {
+      "team_name": "스포르티보 루케뇨 B",
+      "tier": 3,
+      "parent_team_name": "스포르티보 루케뇨"
+    },
+    {
+      "team_name": "3 데 페브레로 B",
+      "tier": 3,
+      "parent_team_name": "3 데 페브레로"
+    },
+    {
+      "team_name": "스포르티보 산 로렌소 B",
+      "tier": 3,
+      "parent_team_name": "산 로렌소"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "웨일스",
+  "total_teams": 40,
+  "affiliates": [
+    {
+      "team_name": "더 뉴 세인츠 B",
+      "tier": 3,
+      "parent_team_name": "더 뉴 세인츠"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "헝가리",
+  "total_teams": 82,
+  "affiliates": [
+    {
+      "team_name": "페렌츠바로시 B",
+      "tier": 3,
+      "parent_team_name": "페렌츠바로시"
+    },
+    {
+      "team_name": "푸스카스 B",
+      "tier": 3,
+      "parent_team_name": "푸스카스 아카데미아"
+    },
+    {
+      "team_name": "부다페스트 혼베드 B",
+      "tier": 3,
+      "parent_team_name": "부다페스트 혼베드"
+    },
+    {
+      "team_name": "데브레첸 B",
+      "tier": 3,
+      "parent_team_name": "데브레첸"
+    },
+    {
+      "team_name": "바사스 B",
+      "tier": 3,
+      "parent_team_name": "바사스 FC"
+    },
+    {
+      "team_name": "우이페스트 B",
+      "tier": 3,
+      "parent_team_name": "우이페스트"
+    },
+    {
+      "team_name": "페헤르바르 B",
+      "tier": 3,
+      "parent_team_name": "페헤르바르"
+    },
+    {
+      "team_name": "디오슈죄르 B",
+      "tier": 3,
+      "parent_team_name": "디오슈죄르"
+    },
+    {
+      "team_name": "팍시 B",
+      "tier": 3,
+      "parent_team_name": "팍시 FC"
+    },
+    {
+      "team_name": "니레지하자 B",
+      "tier": 3,
+      "parent_team_name": "니레지하자"
+    },
+    {
+      "team_name": "MTK 부다페스트 B",
+      "tier": 3,
+      "parent_team_name": "MTK 부다페스트"
+    },
+    {
+      "team_name": "죄르 ETO B",
+      "tier": 3,
+      "parent_team_name": "죄르 ETO"
+    },
+    {
+      "team_name": "세게드-Csanad B",
+      "tier": 3,
+      "parent_team_name": "세게드 2011"
+    },
+    {
+      "team_name": "아즈카 B",
+      "tier": 4,
+      "parent_team_name": "아즈카"
+    },
+    {
+      "team_name": "소록사르 B",
+      "tier": 4,
+      "parent_team_name": "소록사르"
+    },
+    {
+      "team_name": "부다포크 B",
+      "tier": 4,
+      "parent_team_name": "부다포크"
+    },
+    {
+      "team_name": "코자르미슬레니 B",
+      "tier": 4,
+      "parent_team_name": "코자르미슬레니"
+    },
+    {
+      "team_name": "페치 B",
+      "tier": 4,
+      "parent_team_name": "페치 AFC"
+    },
+    {
+      "team_name": "시오포크 B",
+      "tier": 4,
+      "parent_team_name": "시오포크"
+    },
+    {
+      "team_name": "티사케치케 B",
+      "tier": 4,
+      "parent_team_name": "티사케치케"
+    },
+    {
+      "team_name": "카진츠바르치카 B",
+      "tier": 4,
+      "parent_team_name": "카진츠바르치카"
+    },
+    {
+      "team_name": "페렌츠바로시 아카데미",
+      "tier": 4,
+      "parent_team_name": "페렌츠바로시"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "사우디아라비아",
+  "total_teams": 68,
+  "affiliates": [
+    {
+      "team_name": "알 바틴 B",
+      "tier": 4,
+      "parent_team_name": "알 바틴"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "파나마",
+  "total_teams": 56,
+  "affiliates": [
+    {
+      "team_name": "아라베 우니도 B",
+      "tier": 2,
+      "parent_team_name": "아라베 우니도"
+    },
+    {
+      "team_name": "타우로 B",
+      "tier": 2,
+      "parent_team_name": "타우로 FC"
+    },
+    {
+      "team_name": "스포르팅 B",
+      "tier": 2,
+      "parent_team_name": "스포르팅 산 미겔리토"
+    },
+    {
+      "team_name": "플라사 아마도르 B",
+      "tier": 2,
+      "parent_team_name": "CD 플라사 아마도르"
+    },
+    {
+      "team_name": "우니베르시타리오 B",
+      "tier": 2,
+      "parent_team_name": "CD 우니베르시타리오"
+    },
+    {
+      "team_name": "CAI B",
+      "tier": 3,
+      "parent_team_name": "CAI 파나마"
+    },
+    {
+      "team_name": "알리안사 B",
+      "tier": 3,
+      "parent_team_name": "알리안사 파나마"
+    },
+    {
+      "team_name": "아라베 우니도 아카데미",
+      "tier": 3,
+      "parent_team_name": "아라베 우니도"
+    },
+    {
+      "team_name": "산 미겔리토 유스",
+      "tier": 3,
+      "parent_team_name": "스포르팅 산 미겔리토"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "스코틀랜드",
+  "total_teams": 42,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "세르비아",
+  "total_teams": 60,
+  "affiliates": [
+    {
+      "team_name": "츠르베나 즈베즈다 B",
+      "tier": 3,
+      "parent_team_name": "츠르베나 즈베즈다"
+    },
+    {
+      "team_name": "파르티잔 B",
+      "tier": 3,
+      "parent_team_name": "파르티잔"
+    },
+    {
+      "team_name": "그라피차르",
+      "tier": 2,
+      "parent_team_name": "츠르베나 즈베즈다"
+    },
+    {
+      "team_name": "텔레옵티크",
+      "tier": 3,
+      "parent_team_name": "파르티잔"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "콩고 민주 공화국",
+  "total_teams": 52,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "체코",
+  "total_teams": 60,
+  "affiliates": [
+    {
+      "team_name": "바닉 오스트라바 B",
+      "tier": 2,
+      "parent_team_name": "오스트라바"
+    },
+    {
+      "team_name": "시그마 올로모우츠 B",
+      "tier": 2,
+      "parent_team_name": "시그마 올로모우츠"
+    },
+    {
+      "team_name": "스파르타 프라하 B",
+      "tier": 2,
+      "parent_team_name": "스파르타 프라하"
+    },
+    {
+      "team_name": "슬라비아 B",
+      "tier": 3,
+      "parent_team_name": "슬라비아 프라하"
+    },
+    {
+      "team_name": "플젠 B",
+      "tier": 3,
+      "parent_team_name": "빅토리아 플젠"
+    },
+    {
+      "team_name": "보헤미안스 B",
+      "tier": 3,
+      "parent_team_name": "보헤미안스 1905"
+    },
+    {
+      "team_name": "즐린 B",
+      "tier": 3,
+      "parent_team_name": "FC 즐린"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "카메룬",
+  "total_teams": 86,
+  "affiliates": [
+    {
+      "team_name": "코톤 B",
+      "tier": 3,
+      "parent_team_name": "코톤 스포르"
+    },
+    {
+      "team_name": "캐논 B",
+      "tier": 3,
+      "parent_team_name": "캐논 야운데"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "슬로바키아",
+  "total_teams": 40,
+  "affiliates": [
+    {
+      "team_name": "질리나 B",
+      "tier": 2,
+      "parent_team_name": "질리나"
+    },
+    {
+      "team_name": "슬로반 브라티슬라바 B",
+      "tier": 2,
+      "parent_team_name": "슬로반 브라티슬라바"
+    },
+    {
+      "team_name": "루조베록 B",
+      "tier": 3,
+      "parent_team_name": "루조베록"
+    },
+    {
+      "team_name": "바르데요브 B",
+      "tier": 3,
+      "parent_team_name": "파르티잔 바르데요브"
+    },
+    {
+      "team_name": "트르나바 B",
+      "tier": 3,
+      "parent_team_name": "스파르타크 트르나바"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "그리스",
+  "total_teams": 54,
+  "affiliates": [
+    {
+      "team_name": "판세라이코스 B",
+      "tier": 4,
+      "parent_team_name": "판세라이코스"
+    },
+    {
+      "team_name": "PAS 지아니나 B",
+      "tier": 4,
+      "parent_team_name": "PAS 지아니나"
+    },
+    {
+      "team_name": "올림피아코스 B",
+      "tier": 4,
+      "parent_team_name": "올림피아코스"
+    },
+    {
+      "team_name": "PAOK B",
+      "tier": 4,
+      "parent_team_name": "PAOK"
+    },
+    {
+      "team_name": "AEK B",
+      "tier": 4,
+      "parent_team_name": "AEK 아테네"
+    },
+    {
+      "team_name": "파나시나이코스 B",
+      "tier": 4,
+      "parent_team_name": "파나시나이코스"
+    },
+    {
+      "team_name": "하니아 B",
+      "tier": 4,
+      "parent_team_name": "하니아"
+    },
+    {
+      "team_name": "칼라마타 B",
+      "tier": 4,
+      "parent_team_name": "칼라마타"
+    },
+    {
+      "team_name": "라리사 B",
+      "tier": 4,
+      "parent_team_name": "라리사"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "베네수엘라",
+  "total_teams": 80,
+  "affiliates": [
+    {
+      "team_name": "타치라 B",
+      "tier": 3,
+      "parent_team_name": "데포르티보 타치라"
+    },
+    {
+      "team_name": "카라카스 B",
+      "tier": 3,
+      "parent_team_name": "카라카스 FC"
+    },
+    {
+      "team_name": "메트로폴리타노스 B",
+      "tier": 4,
+      "parent_team_name": "메트로폴리타노스"
+    },
+    {
+      "team_name": "카라보보 B",
+      "tier": 4,
+      "parent_team_name": "카라보보"
+    },
+    {
+      "team_name": "모나가스 SC B",
+      "tier": 4,
+      "parent_team_name": "모나가스"
+    },
+    {
+      "team_name": "에스투디안테스 B",
+      "tier": 4,
+      "parent_team_name": "에스투디안테스 데 메리다"
+    },
+    {
+      "team_name": "라 과이라 B",
+      "tier": 4,
+      "parent_team_name": "데포르티보 라 과이라"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "칠레",
+  "total_teams": 78,
+  "affiliates": [
+    {
+      "team_name": "콜로콜로 B",
+      "tier": 3,
+      "parent_team_name": "콜로콜로"
+    },
+    {
+      "team_name": "우니베르시다드 데 칠레 B",
+      "tier": 3,
+      "parent_team_name": "우니베르시다드 데 칠레"
+    },
+    {
+      "team_name": "우니베르시다드 카톨리카 B",
+      "tier": 3,
+      "parent_team_name": "우니베르시다드 카톨리카"
+    },
+    {
+      "team_name": "푸에르토 몬트 B",
+      "tier": 3,
+      "parent_team_name": "데포르테스 푸에르토 몬트"
+    },
+    {
+      "team_name": "라 세레나 B",
+      "tier": 2,
+      "parent_team_name": "라 세레나"
+    },
+    {
+      "team_name": "이키케 B",
+      "tier": 2,
+      "parent_team_name": "이키케"
+    },
+    {
+      "team_name": "산 펠리페 유스",
+      "tier": 4,
+      "parent_team_name": "우니온 산 펠리페"
+    }
+  ],
+  "review": [
+    {
+      "team_name": "마갈라네스 B",
+      "tier": 4,
+      "review_reason": "parent_not_found"
+    },
+    {
+      "team_name": "우니온 라 칼레라 B",
+      "tier": 4,
+      "review_reason": "parent_not_found"
+    }
+  ]
+}
+
+{
+  "country_name": "페루",
+  "total_teams": 66,
+  "affiliates": [
+    {
+      "team_name": "우니베르시타리오 B",
+      "tier": 3,
+      "parent_team_name": "우니베르시타리오"
+    },
+    {
+      "team_name": "알리안사 리마 B",
+      "tier": 3,
+      "parent_team_name": "알리안사 리마"
+    },
+    {
+      "team_name": "스포르팅 크리스탈 B",
+      "tier": 3,
+      "parent_team_name": "스포르팅 크리스탈"
+    },
+    {
+      "team_name": "멜가르 B",
+      "tier": 3,
+      "parent_team_name": "멜가르"
+    },
+    {
+      "team_name": "타루마 B",
+      "tier": 3,
+      "parent_team_name": "ADT 타루마"
+    },
+    {
+      "team_name": "아틀레티코 그라우 B",
+      "tier": 3,
+      "parent_team_name": "아틀레티코 그라우"
+    },
+    {
+      "team_name": "UTC 카하마르카 B",
+      "tier": 3,
+      "parent_team_name": "UTC 카하마르카"
+    },
+    {
+      "team_name": "알리안사 아틀레티코 B",
+      "tier": 3,
+      "parent_team_name": "알리안사 아틀레티코"
+    },
+    {
+      "team_name": "세사르 바예호 B",
+      "tier": 3,
+      "parent_team_name": "세사르 바예호"
+    },
+    {
+      "team_name": "쿠스코 FC B",
+      "tier": 3,
+      "parent_team_name": "쿠스코 FC"
+    },
+    {
+      "team_name": "시엔시아노 B",
+      "tier": 3,
+      "parent_team_name": "시엔시아노"
+    },
+    {
+      "team_name": "산 마르틴 B",
+      "tier": 3,
+      "parent_team_name": "산 마르틴"
+    },
+    {
+      "team_name": "아야쿠초 B",
+      "tier": 3,
+      "parent_team_name": "아야쿠초"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "코스타리카",
+  "total_teams": 82,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "루마니아",
+  "total_teams": 74,
+  "affiliates": [
+    {
+      "team_name": "슬라티나 B",
+      "tier": 2,
+      "parent_team_name": "슬라티나"
+    },
+    {
+      "team_name": "FCSB B",
+      "tier": 3,
+      "parent_team_name": "FCSB"
+    },
+    {
+      "team_name": "라피드 B",
+      "tier": 3,
+      "parent_team_name": "라피드 부쿠레슈티"
+    },
+    {
+      "team_name": "파룰 B",
+      "tier": 3,
+      "parent_team_name": "파룰 콘스탄차"
+    }
+  ],
+  "review": [
+    {
+      "team_name": "클루지 B",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "크라이오바 B",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    }
+  ]
+}
+
+{
+  "country_name": "말리",
+  "total_teams": 40,
+  "affiliates": [
+    {
+      "team_name": "조리바 B",
+      "tier": 3,
+      "parent_team_name": "조리바 AC"
+    },
+    {
+      "team_name": "레알 B",
+      "tier": 3,
+      "parent_team_name": "레알 바마코"
+    },
+    {
+      "team_name": "AS 폴리스 리저브",
+      "tier": 3,
+      "parent_team_name": "AS 폴리스 바마코"
+    },
+    {
+      "team_name": "부구니 B",
+      "tier": 3,
+      "parent_team_name": "부구니 AC"
+    },
+    {
+      "team_name": "카이 유스",
+      "tier": 3,
+      "parent_team_name": "카이 FC"
+    },
+    {
+      "team_name": "스타드 B",
+      "tier": 3,
+      "parent_team_name": "스타드 말리앵"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "튀니지",
+  "total_teams": 94,
+  "affiliates": [
+    {
+      "team_name": "올림픽 베자 B",
+      "tier": 2,
+      "parent_team_name": "올림픽 베자"
+    },
+    {
+      "team_name": "비제르탱 B",
+      "tier": 2,
+      "parent_team_name": "클럽 비제르탱"
+    },
+    {
+      "team_name": "US 타타우인 B",
+      "tier": 2,
+      "parent_team_name": "US 타타우인"
+    },
+    {
+      "team_name": "에스페랑스 B",
+      "tier": 3,
+      "parent_team_name": "에스페랑스 드 튀니스"
+    },
+    {
+      "team_name": "사헬 B",
+      "tier": 3,
+      "parent_team_name": "에투알 뒤 사헬"
+    },
+    {
+      "team_name": "AS 가프사 B",
+      "tier": 4,
+      "parent_team_name": "EGS 가프사"
+    },
+    {
+      "team_name": "JS 카이루안 B",
+      "tier": 4,
+      "parent_team_name": "JS 카이루안"
+    },
+    {
+      "team_name": "AS 제르바 B",
+      "tier": 4,
+      "parent_team_name": "AS 제르바"
+    },
+    {
+      "team_name": "CS 카세린 B",
+      "tier": 4,
+      "parent_team_name": "카세린"
+    },
+    {
+      "team_name": "스타드 가베스 B",
+      "tier": 4,
+      "parent_team_name": "스타드 가베시엔"
+    },
+    {
+      "team_name": "ES 자르지스 B",
+      "tier": 4,
+      "parent_team_name": "ES 자르지스"
+    },
+    {
+      "team_name": "AS 가베스 B",
+      "tier": 4,
+      "parent_team_name": "AS 가베스"
+    },
+    {
+      "team_name": "OC 메데닌 B",
+      "tier": 4,
+      "parent_team_name": "CO 메데닌"
+    },
+    {
+      "team_name": "CS 레지슈 B",
+      "tier": 4,
+      "parent_team_name": "CS 레지슈"
+    },
+    {
+      "team_name": "AS 마르사 B",
+      "tier": 4,
+      "parent_team_name": "AS 마르사"
+    },
+    {
+      "team_name": "FC 함맘리프 B",
+      "tier": 4,
+      "parent_team_name": "CS 함맘-리프"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "우즈베키스탄",
+  "total_teams": 66,
+  "affiliates": [
+    {
+      "team_name": "올림픽 FC B",
+      "tier": 2,
+      "parent_team_name": "올림픽 타슈켄트"
+    },
+    {
+      "team_name": "나브바호르-2",
+      "tier": 2,
+      "parent_team_name": "나브바호르"
+    },
+    {
+      "team_name": "파흐타코르 B",
+      "tier": 3,
+      "parent_team_name": "파흐타코르"
+    },
+    {
+      "team_name": "나사프 B",
+      "tier": 3,
+      "parent_team_name": "나사프"
+    },
+    {
+      "team_name": "안디잔 II",
+      "tier": 3,
+      "parent_team_name": "안디잔"
+    },
+    {
+      "team_name": "나브바호르 B",
+      "tier": 3,
+      "parent_team_name": "나브바호르"
+    },
+    {
+      "team_name": "부뇨드코르 II",
+      "tier": 3,
+      "parent_team_name": "부뇨드코르"
+    },
+    {
+      "team_name": "네프치 B",
+      "tier": 3,
+      "parent_team_name": "네프치 페르가나"
+    },
+    {
+      "team_name": "AGMK II",
+      "tier": 3,
+      "parent_team_name": "AGMK"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "아일랜드",
+  "total_teams": 70,
+  "affiliates": [
+    {
+      "team_name": "샴록 B",
+      "tier": 3,
+      "parent_team_name": "샴록 로버스"
+    },
+    {
+      "team_name": "데리 B",
+      "tier": 3,
+      "parent_team_name": "데리 시티"
+    },
+    {
+      "team_name": "코크 시티 B",
+      "tier": 3,
+      "parent_team_name": "코크 시티"
+    },
+    {
+      "team_name": "애슬론 타운 B",
+      "tier": 3,
+      "parent_team_name": "애슬론 타운"
+    },
+    {
+      "team_name": "브레이 원더러스 B",
+      "tier": 3,
+      "parent_team_name": "브레이 원더러스"
+    },
+    {
+      "team_name": "더블린 유니버시티 B",
+      "tier": 3,
+      "parent_team_name": "UCD"
+    },
+    {
+      "team_name": "셸번 B",
+      "tier": 3,
+      "parent_team_name": "셸번"
+    },
+    {
+      "team_name": "던도크 B",
+      "tier": 3,
+      "parent_team_name": "던도크"
+    },
+    {
+      "team_name": "슬라이고 로버스 B",
+      "tier": 3,
+      "parent_team_name": "슬라이고 로버스"
+    },
+    {
+      "team_name": "골웨이 유나이티드 B",
+      "tier": 3,
+      "parent_team_name": "골웨이 유나이티드"
+    },
+    {
+      "team_name": "워터포드 B",
+      "tier": 3,
+      "parent_team_name": "워터포드"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "슬로베니아",
+  "total_teams": 80,
+  "affiliates": [
+    {
+      "team_name": "마리보르 B",
+      "tier": 3,
+      "parent_team_name": "NK 마리보르"
+    },
+    {
+      "team_name": "올림피야 B",
+      "tier": 3,
+      "parent_team_name": "올림피야 류블랴나"
+    },
+    {
+      "team_name": "크란 B",
+      "tier": 3,
+      "parent_team_name": "트리글라브 크란"
+    },
+    {
+      "team_name": "슬로벤스카 비스트리차 B",
+      "tier": 3,
+      "parent_team_name": "비스트리차"
+    },
+    {
+      "team_name": "루다르 벨레녜 B",
+      "tier": 3,
+      "parent_team_name": "벨레녜"
+    },
+    {
+      "team_name": "돔잘레 B",
+      "tier": 3,
+      "parent_team_name": "돔잘레"
+    },
+    {
+      "team_name": "코페르 B",
+      "tier": 3,
+      "parent_team_name": "코페르"
+    },
+    {
+      "team_name": "무라 B",
+      "tier": 3,
+      "parent_team_name": "무라"
+    },
+    {
+      "team_name": "브라보 B",
+      "tier": 3,
+      "parent_team_name": "브라보"
+    },
+    {
+      "team_name": "나프타 렌다바 B",
+      "tier": 3,
+      "parent_team_name": "나프타 렌다바"
+    },
+    {
+      "team_name": "라도믈리에 B",
+      "tier": 4,
+      "parent_team_name": "라도믈리에"
+    },
+    {
+      "team_name": "자브르치 유스",
+      "tier": 4,
+      "parent_team_name": "자브르치"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "카타르",
+  "total_teams": 54,
+  "affiliates": [
+    {
+      "team_name": "알 와크라 B",
+      "tier": 2,
+      "parent_team_name": "알 와크라"
+    },
+    {
+      "team_name": "알 아라비 B",
+      "tier": 2,
+      "parent_team_name": "알 아라비"
+    },
+    {
+      "team_name": "알 사드 SC B",
+      "tier": 3,
+      "parent_team_name": "알 사드 SC"
+    },
+    {
+      "team_name": "알 두하일 SC B",
+      "tier": 3,
+      "parent_team_name": "알 두하일 SC"
+    },
+    {
+      "team_name": "알 가라파 B",
+      "tier": 3,
+      "parent_team_name": "알 가라파"
+    },
+    {
+      "team_name": "알 라얀 B",
+      "tier": 3,
+      "parent_team_name": "알 라얀"
+    },
+    {
+      "team_name": "알 사드 SC C",
+      "tier": 4,
+      "parent_team_name": "알 사드 SC"
+    },
+    {
+      "team_name": "알 두하일 SC C",
+      "tier": 4,
+      "parent_team_name": "알 두하일 SC"
+    },
+    {
+      "team_name": "알 가라파 C",
+      "tier": 4,
+      "parent_team_name": "알 가라파"
+    },
+    {
+      "team_name": "알 라얀 C",
+      "tier": 4,
+      "parent_team_name": "알 라얀"
+    },
+    {
+      "team_name": "알 와크라 C",
+      "tier": 4,
+      "parent_team_name": "알 와크라"
+    },
+    {
+      "team_name": "알 라이얀 유스",
+      "tier": 4,
+      "parent_team_name": "알 라얀"
+    },
+    {
+      "team_name": "라단 FC B",
+      "tier": 4,
+      "parent_team_name": "라단 FC"
+    }
+  ],
+  "review": [
+    {
+      "team_name": "아스파이어 엘리트",
+      "tier": 4,
+      "review_reason": "ambiguous_classification"
+    }
+  ]
+}
+
+{
+  "country_name": "이라크",
+  "total_teams": 100,
+  "affiliates": [
+    {
+      "team_name": "카르발라 B",
+      "tier": 2,
+      "parent_team_name": "카르발라 SC"
+    },
+    {
+      "team_name": "알 쇼르타 B",
+      "tier": 2,
+      "parent_team_name": "알 쇼르타"
+    },
+    {
+      "team_name": "디얄라 B",
+      "tier": 3,
+      "parent_team_name": "디얄라 FC"
+    },
+    {
+      "team_name": "알 두자일 B",
+      "tier": 4,
+      "parent_team_name": "듀자일"
+    },
+    {
+      "team_name": "알 투즈 B",
+      "tier": 4,
+      "parent_team_name": "알 투즈"
+    },
+    {
+      "team_name": "알 신자르 B",
+      "tier": 4,
+      "parent_team_name": "신자르 SC"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "남아프리카공화국",
+  "total_teams": 56,
+  "affiliates": [
+    {
+      "team_name": "치파 B",
+      "tier": 3,
+      "parent_team_name": "치파 유나이티드"
+    },
+    {
+      "team_name": "아마줄루 B",
+      "tier": 3,
+      "parent_team_name": "아마줄루"
+    },
+    {
+      "team_name": "케이프타운 B",
+      "tier": 3,
+      "parent_team_name": "케이프타운 시티"
+    },
+    {
+      "team_name": "선다운즈 유스",
+      "tier": 4,
+      "parent_team_name": "마멜로디 선다운즈"
+    },
+    {
+      "team_name": "올랜도 파이레이츠 B",
+      "tier": 4,
+      "parent_team_name": "올랜도 파이레이츠"
+    },
+    {
+      "team_name": "치프스 유스",
+      "tier": 4,
+      "parent_team_name": "카이저 치프스"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "부르키나 파소",
+  "total_teams": 48,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "카보베르데",
+  "total_teams": 48,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "보스니아 헤르체고비나",
+  "total_teams": 40,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "가나",
+  "total_teams": 58,
+  "affiliates": [
+    {
+      "team_name": "하트 오브 라이온스 B",
+      "tier": 2,
+      "parent_team_name": "하츠 오브 라이온스"
+    },
+    {
+      "team_name": "베레쿰 B",
+      "tier": 2,
+      "parent_team_name": "베레쿰 첼시"
+    },
+    {
+      "team_name": "드림스 B",
+      "tier": 2,
+      "parent_team_name": "드림스 FC"
+    },
+    {
+      "team_name": "메데아마 B",
+      "tier": 2,
+      "parent_team_name": "메데아마 SC"
+    },
+    {
+      "team_name": "코토코 B",
+      "tier": 3,
+      "parent_team_name": "아산테 코토코"
+    },
+    {
+      "team_name": "하츠 B",
+      "tier": 3,
+      "parent_team_name": "하츠 오브 오크"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "온두라스",
+  "total_teams": 62,
+  "affiliates": [],
+  "review": [
+    {
+      "team_name": "산 페드로 유스",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "테구시 유스",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "코판 유스",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "촐루테카 유스",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "단리 유스",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "인디펜디엔테 유스",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "올란치토 유스",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "산타바르바라 유스",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "코마야과 유스",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    }
+  ]
+}
+
+{
+  "country_name": "알바니아",
+  "total_teams": 76,
+  "affiliates": [
+    {
+      "team_name": "티라나 B",
+      "tier": 3,
+      "parent_team_name": "KF 티라나"
+    },
+    {
+      "team_name": "파르티자니 B",
+      "tier": 3,
+      "parent_team_name": "파르티자니 티라나"
+    },
+    {
+      "team_name": "KF 알바페트롤 B",
+      "tier": 4,
+      "parent_team_name": "알베페트롤"
+    },
+    {
+      "team_name": "KF 코라비 B",
+      "tier": 4,
+      "parent_team_name": "코라비"
+    },
+    {
+      "team_name": "KF 카스트리오티 B",
+      "tier": 4,
+      "parent_team_name": "카스트리오티"
+    },
+    {
+      "team_name": "KF 디나모 B",
+      "tier": 4,
+      "parent_team_name": "디나모 시티"
+    },
+    {
+      "team_name": "KF 벨레치쿠 B",
+      "tier": 4,
+      "parent_team_name": "벨레치쿠"
+    },
+    {
+      "team_name": "KF 라치 B",
+      "tier": 4,
+      "parent_team_name": "라치"
+    },
+    {
+      "team_name": "KF 부트린티 B",
+      "tier": 4,
+      "parent_team_name": "부트린티"
+    },
+    {
+      "team_name": "KF 아폴로니아 B",
+      "tier": 4,
+      "parent_team_name": "아폴로니아"
+    }
+  ],
+  "review": [
+    {
+      "team_name": "KF 아드리아티쿠 B",
+      "tier": 4,
+      "review_reason": "ambiguous_classification"
+    }
+  ]
+}
+
+{
+  "country_name": "요르단",
+  "total_teams": 42,
+  "affiliates": [
+    {
+      "team_name": "알 웨다트 B",
+      "tier": 3,
+      "parent_team_name": "알 웨다트"
+    },
+    {
+      "team_name": "알 파이살리 B",
+      "tier": 3,
+      "parent_team_name": "알 파이살리 암만"
+    },
+    {
+      "team_name": "후세인 B",
+      "tier": 3,
+      "parent_team_name": "알 후세인 이르비드"
+    },
+    {
+      "team_name": "라므사 B",
+      "tier": 3,
+      "parent_team_name": "알 라므사"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "아랍에미리트",
+  "total_teams": 61,
+  "affiliates": [
+    {
+      "team_name": "알 와흐다 B",
+      "tier": 2,
+      "parent_team_name": "알 와흐다"
+    },
+    {
+      "team_name": "알 아인 FC B",
+      "tier": 3,
+      "parent_team_name": "알 아인 FC"
+    },
+    {
+      "team_name": "샤바브 알 아흘리 B",
+      "tier": 3,
+      "parent_team_name": "샤바브 알 아흘리"
+    },
+    {
+      "team_name": "아즈만 B",
+      "tier": 3,
+      "parent_team_name": "아즈만"
+    },
+    {
+      "team_name": "샤르자 B",
+      "tier": 3,
+      "parent_team_name": "샤르자 FC"
+    },
+    {
+      "team_name": "푸자이라 아카데미",
+      "tier": 4,
+      "parent_team_name": "푸자이라 FC"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "북마케도니아",
+  "total_teams": 40,
+  "affiliates": [
+    {
+      "team_name": "바르다르 B",
+      "tier": 3,
+      "parent_team_name": "바르다르 스코페"
+    },
+    {
+      "team_name": "스켄디야 B",
+      "tier": 3,
+      "parent_team_name": "스켄디야"
+    },
+    {
+      "team_name": "고스티바르 B",
+      "tier": 3,
+      "parent_team_name": "고스티바르"
+    },
+    {
+      "team_name": "슈쿠피 B",
+      "tier": 3,
+      "parent_team_name": "슈쿠피"
+    },
+    {
+      "team_name": "실렉스 B",
+      "tier": 3,
+      "parent_team_name": "실렉스"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "북아일랜드",
+  "total_teams": 38,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "자메이카",
+  "total_teams": 38,
+  "affiliates": [
+    {
+      "team_name": "하버 뷰 B",
+      "tier": 3,
+      "parent_team_name": "하버 뷰"
+    },
+    {
+      "team_name": "마운트 B",
+      "tier": 3,
+      "parent_team_name": "마운트 플레전트"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "조지아",
+  "total_teams": 66,
+  "affiliates": [
+    {
+      "team_name": "디나모 트빌리시 B",
+      "tier": 3,
+      "parent_team_name": "디나모 트빌리시"
+    },
+    {
+      "team_name": "디나모 바투미 B",
+      "tier": 3,
+      "parent_team_name": "디나모 바투미"
+    },
+    {
+      "team_name": "삼구랄리 B",
+      "tier": 3,
+      "parent_team_name": "삼구랄리"
+    },
+    {
+      "team_name": "디라 B",
+      "tier": 3,
+      "parent_team_name": "디라 고리"
+    },
+    {
+      "team_name": "콜헤티 포티 II",
+      "tier": 4,
+      "parent_team_name": "콜헤티 포티"
+    },
+    {
+      "team_name": "쿠타이시 아카데미",
+      "tier": 4,
+      "parent_team_name": "토르페도 쿠타이시"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "아이슬란드",
+  "total_teams": 48,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "핀란드",
+  "total_teams": 64,
+  "affiliates": [
+    {
+      "team_name": "클루비 04",
+      "tier": 3,
+      "parent_team_name": "HJK 헬싱키"
+    },
+    {
+      "team_name": "KuPS 아카테미아",
+      "tier": 3,
+      "parent_team_name": "KuPS 쿠오피오"
+    },
+    {
+      "team_name": "일베스 B",
+      "tier": 3,
+      "parent_team_name": "일베스 탐페레"
+    },
+    {
+      "team_name": "그니스탄 B",
+      "tier": 4,
+      "parent_team_name": "그니스탄"
+    },
+    {
+      "team_name": "HJK 아카데미",
+      "tier": 4,
+      "parent_team_name": "HJK 헬싱키"
+    },
+    {
+      "team_name": "혼카 아카데미아",
+      "tier": 4,
+      "parent_team_name": "FC 홍카"
+    },
+    {
+      "team_name": "FC 재즈 아카데미",
+      "tier": 4,
+      "parent_team_name": "재즈 포리"
+    },
+    {
+      "team_name": "라티 아카데미",
+      "tier": 4,
+      "parent_team_name": "FC 라티"
+    },
+    {
+      "team_name": "MP 아카데미아",
+      "tier": 4,
+      "parent_team_name": "MP 미켈리"
+    },
+    {
+      "team_name": "FC 오울루 아카데미",
+      "tier": 4,
+      "parent_team_name": "AC 오울루"
+    },
+    {
+      "team_name": "FC 일베스 B",
+      "tier": 4,
+      "parent_team_name": "일베스 B"
+    },
+    {
+      "team_name": "혼카 B",
+      "tier": 4,
+      "parent_team_name": "FC 홍카"
+    },
+    {
+      "team_name": "에스포 B",
+      "tier": 4,
+      "parent_team_name": "에스포"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "이스라엘",
+  "total_teams": 90,
+  "affiliates": [
+    {
+      "team_name": "마카비 아히 나자렛 B",
+      "tier": 4,
+      "parent_team_name": "마카비 아히 나사렛"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "볼리비아",
+  "total_teams": 44,
+  "affiliates": [
+    {
+      "team_name": "볼리바르 B",
+      "tier": 3,
+      "parent_team_name": "볼리바르"
+    },
+    {
+      "team_name": "더 스트롱게스트 B",
+      "tier": 3,
+      "parent_team_name": "더 스트롱게스트"
+    },
+    {
+      "team_name": "오리엔테 B",
+      "tier": 3,
+      "parent_team_name": "오리엔테 페트롤레로"
+    },
+    {
+      "team_name": "블루밍 유스",
+      "tier": 3,
+      "parent_team_name": "블루밍"
+    },
+    {
+      "team_name": "윌스테르만 B",
+      "tier": 3,
+      "parent_team_name": "호르헤 윌스테르만"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "코소보",
+  "total_teams": 34,
+  "affiliates": [
+    {
+      "team_name": "발카니 B",
+      "tier": 3,
+      "parent_team_name": "발카니"
+    },
+    {
+      "team_name": "드리타 B",
+      "tier": 3,
+      "parent_team_name": "드리타"
+    },
+    {
+      "team_name": "프리슈티나 B",
+      "tier": 3,
+      "parent_team_name": "프리슈티나"
+    },
+    {
+      "team_name": "라피 B",
+      "tier": 3,
+      "parent_team_name": "라피"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "오만",
+  "total_teams": 36,
+  "affiliates": [
+    {
+      "team_name": "알시브 B",
+      "tier": 3,
+      "parent_team_name": "알시브"
+    },
+    {
+      "team_name": "도파르 B",
+      "tier": 3,
+      "parent_team_name": "도파르 클럽"
+    },
+    {
+      "team_name": "소하르 B",
+      "tier": 3,
+      "parent_team_name": "소하르 클럽"
+    },
+    {
+      "team_name": "이브리 B",
+      "tier": 3,
+      "parent_team_name": "이브리 클럽"
+    },
+    {
+      "team_name": "나흐다 B",
+      "tier": 3,
+      "parent_team_name": "알 나흐다"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "몬테네그로",
+  "total_teams": 44,
+  "affiliates": [
+    {
+      "team_name": "부두치노스트 B",
+      "tier": 3,
+      "parent_team_name": "부두치노스트 포드고리차"
+    },
+    {
+      "team_name": "수체스카 B",
+      "tier": 3,
+      "parent_team_name": "수체스카 닉시치"
+    },
+    {
+      "team_name": "바르 B",
+      "tier": 3,
+      "parent_team_name": "모르나르 바르"
+    },
+    {
+      "team_name": "티밧 B",
+      "tier": 3,
+      "parent_team_name": "아르세날 티밧"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "퀴라소",
+  "total_teams": 18,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "기니",
+  "total_teams": 50,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "뉴질랜드",
+  "total_teams": 40,
+  "affiliates": [
+    {
+      "team_name": "오클랜드 B",
+      "tier": 3,
+      "parent_team_name": "오클랜드 시티"
+    },
+    {
+      "team_name": "올림픽 B",
+      "tier": 3,
+      "parent_team_name": "웰링턴 올림픽"
+    },
+    {
+      "team_name": "유나이티드 B",
+      "tier": 3,
+      "parent_team_name": "오클랜드 유나이티드"
+    },
+    {
+      "team_name": "서버브스 유스",
+      "tier": 3,
+      "parent_team_name": "이스턴 서버브스"
+    },
+    {
+      "team_name": "네이피어 B",
+      "tier": 3,
+      "parent_team_name": "네이피어 시티"
+    },
+    {
+      "team_name": "크라이스트처치 B",
+      "tier": 3,
+      "parent_team_name": "크라이스트처치 유나이티드"
+    },
+    {
+      "team_name": "웰링턴 피닉스 리저브",
+      "tier": 2,
+      "parent_team_name": "웰링턴 피닉스"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "시리아",
+  "total_teams": 42,
+  "affiliates": [
+    {
+      "team_name": "알 와트바 B",
+      "tier": 3,
+      "parent_team_name": "알 와트바"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "가봉",
+  "total_teams": 50,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "불가리아",
+  "total_teams": 54,
+  "affiliates": [
+    {
+      "team_name": "CSKA 소피아 B",
+      "tier": 2,
+      "parent_team_name": "CSKA 소피아"
+    },
+    {
+      "team_name": "루도고레츠 B",
+      "tier": 2,
+      "parent_team_name": "루도고레츠 라즈그라드"
+    },
+    {
+      "team_name": "보테프 B",
+      "tier": 2,
+      "parent_team_name": "보테프 플로브디프"
+    },
+    {
+      "team_name": "레프스키 B",
+      "tier": 3,
+      "parent_team_name": "레프스키 소피아"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "아이티",
+  "total_teams": 30,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "앙골라",
+  "total_teams": 36,
+  "affiliates": [
+    {
+      "team_name": "페트루 B",
+      "tier": 3,
+      "parent_team_name": "페트루 아틀레티쿠"
+    },
+    {
+      "team_name": "아고스투 B",
+      "tier": 3,
+      "parent_team_name": "1º 드 아고스토"
+    },
+    {
+      "team_name": "로비토 B",
+      "tier": 3,
+      "parent_team_name": "아카데미카 도 로비토"
+    },
+    {
+      "team_name": "리볼로 B",
+      "tier": 3,
+      "parent_team_name": "레크레아티보 도 리볼로"
+    },
+    {
+      "team_name": "인테르 B",
+      "tier": 3,
+      "parent_team_name": "인테르클루브"
+    },
+    {
+      "team_name": "마키스 B",
+      "tier": 3,
+      "parent_team_name": "브라보스 도 마키스"
+    },
+    {
+      "team_name": "우이헤 유스",
+      "tier": 3,
+      "parent_team_name": "와하 도 우이헤"
+    },
+    {
+      "team_name": "말란헤 B",
+      "tier": 3,
+      "parent_team_name": "유니온 말란헤"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "우간다",
+  "total_teams": 36,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "잠비아",
+  "total_teams": 40,
+  "affiliates": [
+    {
+      "team_name": "ZESCO B",
+      "tier": 3,
+      "parent_team_name": "ZESCO 유나이티드"
+    },
+    {
+      "team_name": "파워 B",
+      "tier": 3,
+      "parent_team_name": "파워 다이너모스"
+    },
+    {
+      "team_name": "엔카나 B",
+      "tier": 3,
+      "parent_team_name": "엔카나 FC"
+    },
+    {
+      "team_name": "레드 애로우즈 B",
+      "tier": 3,
+      "parent_team_name": "레드 애로우즈"
+    },
+    {
+      "team_name": "버팔로스 유스",
+      "tier": 3,
+      "parent_team_name": "그린 버팔로스"
+    },
+    {
+      "team_name": "워리어스 B",
+      "tier": 3,
+      "parent_team_name": "카브웨 워리어스"
+    },
+    {
+      "team_name": "자나코 B",
+      "tier": 3,
+      "parent_team_name": "자나코 FC"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "중국",
+  "total_teams": 68,
+  "affiliates": [
+    {
+      "team_name": "상하이 포트 B",
+      "tier": 3,
+      "parent_team_name": "상하이 포트"
+    },
+    {
+      "team_name": "산둥 타이산 B",
+      "tier": 3,
+      "parent_team_name": "산둥 타이산"
+    },
+    {
+      "team_name": "베이징 궈안 B",
+      "tier": 3,
+      "parent_team_name": "베이징 궈안"
+    },
+    {
+      "team_name": "난퉁 즈윈 B",
+      "tier": 3,
+      "parent_team_name": "난퉁 즈윈"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "바레인",
+  "total_teams": 36,
+  "affiliates": [
+    {
+      "team_name": "무하라크 B",
+      "tier": 3,
+      "parent_team_name": "알 무하라크"
+    },
+    {
+      "team_name": "리파 B",
+      "tier": 3,
+      "parent_team_name": "알 리파"
+    },
+    {
+      "team_name": "킬디야 B",
+      "tier": 3,
+      "parent_team_name": "알 킬디야"
+    },
+    {
+      "team_name": "알 아흘리 B",
+      "tier": 3,
+      "parent_team_name": "알 아흘리 마나마"
+    },
+    {
+      "team_name": "부사이틴 B",
+      "tier": 3,
+      "parent_team_name": "부사이틴"
+    },
+    {
+      "team_name": "하이드 B",
+      "tier": 3,
+      "parent_team_name": "알 하이드"
+    },
+    {
+      "team_name": "이스트 리파 B",
+      "tier": 3,
+      "parent_team_name": "이스트 리파"
+    },
+    {
+      "team_name": "샤바브 B",
+      "tier": 3,
+      "parent_team_name": "알 샤바브 마나마"
+    },
+    {
+      "team_name": "할라 B",
+      "tier": 3,
+      "parent_team_name": "알 할라"
+    },
+    {
+      "team_name": "네즈마 B",
+      "tier": 3,
+      "parent_team_name": "알 네즈마"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "베냉",
+  "total_teams": 56,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "태국",
+  "total_teams": 88,
+  "affiliates": [
+    {
+      "team_name": "부리람 B",
+      "tier": 4,
+      "parent_team_name": "부리람 유나이티드"
+    },
+    {
+      "team_name": "무앙통 유나이티드 B",
+      "tier": 4,
+      "parent_team_name": "무앙통 유나이티드"
+    },
+    {
+      "team_name": "콘캔 유나이티드 B",
+      "tier": 4,
+      "parent_team_name": "콘캔 유나이티드"
+    },
+    {
+      "team_name": "BG 빠툼 리저브",
+      "tier": 4,
+      "parent_team_name": "BG 빠툼 유나이티드"
+    },
+    {
+      "team_name": "방콕 유나이티드 B",
+      "tier": 4,
+      "parent_team_name": "방콕 유나이티드"
+    },
+    {
+      "team_name": "포트 FC B",
+      "tier": 4,
+      "parent_team_name": "포트 FC"
+    },
+    {
+      "team_name": "촌부리 B",
+      "tier": 4,
+      "parent_team_name": "촌부리 FC"
+    },
+    {
+      "team_name": "랏차부리 B",
+      "tier": 4,
+      "parent_team_name": "랏차부리 FC"
+    },
+    {
+      "team_name": "사뭇 프라칸 시티 B",
+      "tier": 4,
+      "parent_team_name": "사뭇 프라칸"
+    },
+    {
+      "team_name": "람빵 유스",
+      "tier": 4,
+      "parent_team_name": "람팡 FC"
+    },
+    {
+      "team_name": "싱하 치앙라이 유스",
+      "tier": 4,
+      "parent_team_name": "치앙라이 유나이티드"
+    },
+    {
+      "team_name": "송클라 유스",
+      "tier": 4,
+      "parent_team_name": "송클라 FC"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "팔레스타인",
+  "total_teams": 40,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "벨라루스",
+  "total_teams": 64,
+  "affiliates": [
+    {
+      "team_name": "BATE 보리소프 B",
+      "tier": 2,
+      "parent_team_name": "BATE 보리소프"
+    },
+    {
+      "team_name": "디나모 민스크 B",
+      "tier": 2,
+      "parent_team_name": "디나모 민스크"
+    },
+    {
+      "team_name": "토르페도 조디노 B",
+      "tier": 2,
+      "parent_team_name": "토르페도 조디노"
+    },
+    {
+      "team_name": "고멜 B",
+      "tier": 2,
+      "parent_team_name": "고멜"
+    },
+    {
+      "team_name": "샤흐타르 B",
+      "tier": 2,
+      "parent_team_name": "샤흐타르 솔리그로스크"
+    },
+    {
+      "team_name": "민스크 리저브",
+      "tier": 2,
+      "parent_team_name": "민스크 FC"
+    },
+    {
+      "team_name": "네만 B",
+      "tier": 3,
+      "parent_team_name": "네만 그로드노"
+    },
+    {
+      "team_name": "슬루츠크 B",
+      "tier": 3,
+      "parent_team_name": "슬루츠크"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "과테말라",
+  "total_teams": 62,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "룩셈부르크",
+  "total_teams": 86,
+  "affiliates": [
+    {
+      "team_name": "뒤들랑주 B",
+      "tier": 3,
+      "parent_team_name": "F91 뒤들랑주"
+    },
+    {
+      "team_name": "스위프트 B",
+      "tier": 3,
+      "parent_team_name": "스위프트 에스페랑주"
+    },
+    {
+      "team_name": "몬도르프 B",
+      "tier": 3,
+      "parent_team_name": "몬도르프-레-뱅"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "베트남",
+  "total_teams": 68,
+  "affiliates": [
+    {
+      "team_name": "하노이 B",
+      "tier": 3,
+      "parent_team_name": "하노이 FC"
+    },
+    {
+      "team_name": "호치민 B",
+      "tier": 3,
+      "parent_team_name": "호치민 시티 FC"
+    },
+    {
+      "team_name": "하이퐁 B",
+      "tier": 3,
+      "parent_team_name": "하이퐁 FC"
+    },
+    {
+      "team_name": "하이퐁 유스",
+      "tier": 3,
+      "parent_team_name": "하이퐁 FC"
+    },
+    {
+      "team_name": "남딘 리저브",
+      "tier": 3,
+      "parent_team_name": "남딘 FC"
+    },
+    {
+      "team_name": "꽝남 유스",
+      "tier": 3,
+      "parent_team_name": "꽝남 FC"
+    },
+    {
+      "team_name": "호치민 시티 유스",
+      "tier": 4,
+      "parent_team_name": "호치민 시티 FC"
+    },
+    {
+      "team_name": "하노이 유스",
+      "tier": 4,
+      "parent_team_name": "하노이 FC"
+    },
+    {
+      "team_name": "다낭 유스",
+      "tier": 4,
+      "parent_team_name": "다낭 FC"
+    },
+    {
+      "team_name": "하이퐁 아카데미",
+      "tier": 4,
+      "parent_team_name": "하이퐁 FC"
+    },
+    {
+      "team_name": "탄호아 아카데미",
+      "tier": 4,
+      "parent_team_name": "탄호아 FC"
+    },
+    {
+      "team_name": "꽝남 아카데미",
+      "tier": 4,
+      "parent_team_name": "꽝남 FC"
+    },
+    {
+      "team_name": "푸토 아카데미",
+      "tier": 4,
+      "parent_team_name": "푸토 FC"
+    },
+    {
+      "team_name": "남딘 아카데미",
+      "tier": 4,
+      "parent_team_name": "남딘 FC"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "엘살바도르",
+  "total_teams": 62,
+  "affiliates": [
+    {
+      "team_name": "CD 루이스 앙헬 B",
+      "tier": 2,
+      "parent_team_name": "CD 루이스 앙헬 피르포"
+    },
+    {
+      "team_name": "CD FAS B",
+      "tier": 2,
+      "parent_team_name": "CD FAS"
+    },
+    {
+      "team_name": "알리안사 B",
+      "tier": 2,
+      "parent_team_name": "알리안사"
+    },
+    {
+      "team_name": "아길라 B",
+      "tier": 2,
+      "parent_team_name": "CD 아길라"
+    },
+    {
+      "team_name": "메타판 B",
+      "tier": 2,
+      "parent_team_name": "AD 이시드로 메타판"
+    }
+  ],
+  "review": [
+    {
+      "team_name": "손소나테 유스",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "산살바도르 유스",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "산타아나 유스",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "산미겔 유스",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "라 우니온 유스",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "모라산 유스",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "쿠스카틀란 유스",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "카바냐스 유스",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "산 비센테 유스",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    }
+  ]
+}
+
+{
+  "country_name": "타지키스탄",
+  "total_teams": 38,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "트리니다드 토바고",
+  "total_teams": 32,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "모잠비크",
+  "total_teams": 44,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "마다가스카르",
+  "total_teams": 52,
+  "affiliates": [],
+  "review": [
+    {
+      "team_name": "아카데미 니 안치카 FC",
+      "tier": 2,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "TGBV 아카데미",
+      "tier": 2,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "TGBV 아카데미",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    }
+  ]
+}
+
+{
+  "country_name": "적도 기니",
+  "total_teams": 36,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "키르기스스탄",
+  "total_teams": 38,
+  "affiliates": [
+    {
+      "team_name": "압디시 아타 B",
+      "tier": 2,
+      "parent_team_name": "압디시 아타"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "아르메니아",
+  "total_teams": 36,
+  "affiliates": [
+    {
+      "team_name": "퓨니크 II",
+      "tier": 2,
+      "parent_team_name": "퓨니크 예레반"
+    },
+    {
+      "team_name": "우라르투 II",
+      "tier": 2,
+      "parent_team_name": "우라르투"
+    },
+    {
+      "team_name": "알라슈케르트 II",
+      "tier": 2,
+      "parent_team_name": "알라슈케르트"
+    },
+    {
+      "team_name": "아라라트 II",
+      "tier": 2,
+      "parent_team_name": "아라라트 예레반"
+    },
+    {
+      "team_name": "노아 II",
+      "tier": 2,
+      "parent_team_name": "노아 FC"
+    },
+    {
+      "team_name": "반 II",
+      "tier": 2,
+      "parent_team_name": "반 FC"
+    },
+    {
+      "team_name": "시라크 II",
+      "tier": 2,
+      "parent_team_name": "시라크"
+    },
+    {
+      "team_name": "아라라트-아르메니아 II",
+      "tier": 2,
+      "parent_team_name": "아라라트-아르메니아"
+    },
+    {
+      "team_name": "퓨니크 유스",
+      "tier": 3,
+      "parent_team_name": "퓨니크 예레반"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "코모로",
+  "total_teams": 30,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "케냐",
+  "total_teams": 68,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "리비아",
+  "total_teams": 48,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "카자흐스탄",
+  "total_teams": 36,
+  "affiliates": [
+    {
+      "team_name": "카이라트 자스",
+      "tier": 2,
+      "parent_team_name": "카이라트 알마티"
+    },
+    {
+      "team_name": "아스타나 II",
+      "tier": 2,
+      "parent_team_name": "아스타나"
+    },
+    {
+      "team_name": "오르다바시 B",
+      "tier": 3,
+      "parent_team_name": "오르다바시"
+    },
+    {
+      "team_name": "악토베 B",
+      "tier": 3,
+      "parent_team_name": "악토베"
+    },
+    {
+      "team_name": "타라즈 B",
+      "tier": 3,
+      "parent_team_name": "타라즈"
+    },
+    {
+      "team_name": "토볼 B",
+      "tier": 3,
+      "parent_team_name": "토볼"
+    },
+    {
+      "team_name": "카이사르 B",
+      "tier": 3,
+      "parent_team_name": "카이사르"
+    },
+    {
+      "team_name": "아티라우 B",
+      "tier": 3,
+      "parent_team_name": "아티라우"
+    },
+    {
+      "team_name": "샤흐타르 B",
+      "tier": 3,
+      "parent_team_name": "샤흐타르 카라간디"
+    },
+    {
+      "team_name": "제티수 B",
+      "tier": 3,
+      "parent_team_name": "제티수"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "탄자니아",
+  "total_teams": 52,
+  "affiliates": [
+    {
+      "team_name": "심바 B",
+      "tier": 3,
+      "parent_team_name": "심바 SC"
+    },
+    {
+      "team_name": "영 아프리칸스 B",
+      "tier": 3,
+      "parent_team_name": "영 아프리칸스 SC"
+    },
+    {
+      "team_name": "아잠 B",
+      "tier": 3,
+      "parent_team_name": "아잠 FC"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "모리타니",
+  "total_teams": 50,
+  "affiliates": [],
+  "review": [
+    {
+      "team_name": "누악쇼트 풋볼 아카데미",
+      "tier": 2,
+      "review_reason": "ambiguous_classification"
+    }
+  ]
+}
+
+{
+  "country_name": "니제르",
+  "total_teams": 46,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "레바논",
+  "total_teams": 40,
+  "affiliates": [
+    {
+      "team_name": "알 안사르 유스",
+      "tier": 3,
+      "parent_team_name": "알 안사르"
+    },
+    {
+      "team_name": "네즈메 B",
+      "tier": 3,
+      "parent_team_name": "네즈메"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "감비아",
+  "total_teams": 50,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "수단",
+  "total_teams": 38,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "인도네시아",
+  "total_teams": 96,
+  "affiliates": [
+    {
+      "team_name": "마카사르 B",
+      "tier": 3,
+      "parent_team_name": "PSM 마카사르"
+    },
+    {
+      "team_name": "페르시푸라 리저브",
+      "tier": 3,
+      "parent_team_name": "페르시푸라 자야푸라"
+    },
+    {
+      "team_name": "페르시크 유스",
+      "tier": 3,
+      "parent_team_name": "페르시크 케디리"
+    },
+    {
+      "team_name": "페르시람 유스",
+      "tier": 3,
+      "parent_team_name": "페르시카보 1973"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "토고",
+  "total_teams": 46,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "북한",
+  "total_teams": 36,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "나미비아",
+  "total_teams": 56,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "시에라리온",
+  "total_teams": 48,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "페로 제도",
+  "total_teams": 38,
+  "affiliates": [
+    {
+      "team_name": "B36 토르스하운 B",
+      "tier": 2,
+      "parent_team_name": "B36 토르스하운"
+    },
+    {
+      "team_name": "HB 토르스하운 B",
+      "tier": 2,
+      "parent_team_name": "HB 토르스하운"
+    },
+    {
+      "team_name": "KI 클락스비크 B",
+      "tier": 2,
+      "parent_team_name": "KI 클락스비크"
+    },
+    {
+      "team_name": "NSI 루나비크 B",
+      "tier": 2,
+      "parent_team_name": "NSI 루나비크"
+    },
+    {
+      "team_name": "Víkingur 괴타 B",
+      "tier": 2,
+      "parent_team_name": "Víkingur 괴타"
+    },
+    {
+      "team_name": "07 베스투르 B",
+      "tier": 3,
+      "parent_team_name": "07 베스투르"
+    },
+    {
+      "team_name": "AB 아르기르 B",
+      "tier": 3,
+      "parent_team_name": "AB 아르기르"
+    },
+    {
+      "team_name": "B68 토프티르 B",
+      "tier": 3,
+      "parent_team_name": "B68 토프티르"
+    },
+    {
+      "team_name": "EB 스트레이무르 B",
+      "tier": 3,
+      "parent_team_name": "EB 스트레이무르"
+    },
+    {
+      "team_name": "FC 수두로이 B",
+      "tier": 3,
+      "parent_team_name": "FC 수두로이"
+    },
+    {
+      "team_name": "IF 푸글라프요르두르 B",
+      "tier": 3,
+      "parent_team_name": "IF 푸글라프요르두르"
+    },
+    {
+      "team_name": "KI 클락스비크 C",
+      "tier": 3,
+      "parent_team_name": "KI 클락스비크"
+    },
+    {
+      "team_name": "스칼라 IF B",
+      "tier": 3,
+      "parent_team_name": "스칼라 IF"
+    },
+    {
+      "team_name": "TB 트뵈로이리 B",
+      "tier": 3,
+      "parent_team_name": "TB 트뵈로이리"
+    },
+    {
+      "team_name": "Víkingur 괴타 C",
+      "tier": 3,
+      "parent_team_name": "Víkingur 괴타"
+    },
+    {
+      "team_name": "B36 토르스하운 C",
+      "tier": 4,
+      "parent_team_name": "B36 토르스하운"
+    },
+    {
+      "team_name": "EB 스트레이무르 C",
+      "tier": 4,
+      "parent_team_name": "EB 스트레이무르"
+    },
+    {
+      "team_name": "FC 호이비크 B",
+      "tier": 4,
+      "parent_team_name": "FC 호이비크"
+    },
+    {
+      "team_name": "HB 토르스하운 C",
+      "tier": 4,
+      "parent_team_name": "HB 토르스하운"
+    },
+    {
+      "team_name": "NSI 루나비크 C",
+      "tier": 4,
+      "parent_team_name": "NSI 루나비크"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "키프로스",
+  "total_teams": 62,
+  "affiliates": [
+    {
+      "team_name": "에노시스 네온 파랄림니 B",
+      "tier": 3,
+      "parent_team_name": "에니시스 네온"
+    },
+    {
+      "team_name": "아폴론 리마솔 B",
+      "tier": 3,
+      "parent_team_name": "아폴론 리마솔"
+    },
+    {
+      "team_name": "오모니아 B",
+      "tier": 3,
+      "parent_team_name": "오모니아"
+    },
+    {
+      "team_name": "APOEL B",
+      "tier": 3,
+      "parent_team_name": "APOEL"
+    },
+    {
+      "team_name": "AEL B",
+      "tier": 3,
+      "parent_team_name": "AEL 리마솔"
+    },
+    {
+      "team_name": "네아 살라미스 B",
+      "tier": 3,
+      "parent_team_name": "네아 살라미스"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "수리남",
+  "total_teams": 42,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "아제르바이잔",
+  "total_teams": 34,
+  "affiliates": [
+    {
+      "team_name": "카라바흐 B",
+      "tier": 2,
+      "parent_team_name": "카라바흐"
+    },
+    {
+      "team_name": "사바흐 B",
+      "tier": 2,
+      "parent_team_name": "사바 바쿠"
+    },
+    {
+      "team_name": "네프트치 B",
+      "tier": 2,
+      "parent_team_name": "네프트치 바쿠"
+    },
+    {
+      "team_name": "지라 B",
+      "tier": 2,
+      "parent_team_name": "지라"
+    },
+    {
+      "team_name": "가발라 유스",
+      "tier": 3,
+      "parent_team_name": "가발라"
+    },
+    {
+      "team_name": "사바일 B",
+      "tier": 3,
+      "parent_team_name": "사바일"
+    },
+    {
+      "team_name": "투란 B",
+      "tier": 3,
+      "parent_team_name": "투란 토부즈"
+    },
+    {
+      "team_name": "샤마키 B",
+      "tier": 3,
+      "parent_team_name": "샤마키"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "에스토니아",
+  "total_teams": 30,
+  "affiliates": [
+    {
+      "team_name": "탈리나 칼레브 II",
+      "tier": 2,
+      "parent_team_name": "칼레브 탈린"
+    },
+    {
+      "team_name": "플로라 II",
+      "tier": 2,
+      "parent_team_name": "플로라 탈린"
+    },
+    {
+      "team_name": "레바디아 U21",
+      "tier": 2,
+      "parent_team_name": "레바디아 탈린"
+    },
+    {
+      "team_name": "파이데 II",
+      "tier": 2,
+      "parent_team_name": "파이데 린나메스콘드"
+    },
+    {
+      "team_name": "쿠레사레 II",
+      "tier": 3,
+      "parent_team_name": "쿠레사레"
+    },
+    {
+      "team_name": "타메카 II",
+      "tier": 3,
+      "parent_team_name": "타메카 타르투"
+    },
+    {
+      "team_name": "나르바 트란스 B",
+      "tier": 3,
+      "parent_team_name": "나르바 트란스"
+    },
+    {
+      "team_name": "레바디아 U19",
+      "tier": 3,
+      "parent_team_name": "레바디아 탈린"
+    },
+    {
+      "team_name": "놈메 칼류 II",
+      "tier": 3,
+      "parent_team_name": "놈메 칼류"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "르완다",
+  "total_teams": 44,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "말라위",
+  "total_teams": 42,
+  "affiliates": [
+    {
+      "team_name": "실버 B",
+      "tier": 2,
+      "parent_team_name": "실버 스트라이커스"
+    },
+    {
+      "team_name": "원더러스 B",
+      "tier": 2,
+      "parent_team_name": "마이티 무탈라 원더러스"
+    },
+    {
+      "team_name": "빅 불리츠 B",
+      "tier": 3,
+      "parent_team_name": "냐사 빅 불리츠 FC"
+    },
+    {
+      "team_name": "블란타이어 B",
+      "tier": 3,
+      "parent_team_name": "블란타이어 유나이티드"
+    },
+    {
+      "team_name": "릴롱궤 B",
+      "tier": 3,
+      "parent_team_name": "릴롱궤 스타스"
+    },
+    {
+      "team_name": "음주주 B",
+      "tier": 3,
+      "parent_team_name": "음주주 시티"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "짐바브웨",
+  "total_teams": 38,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "니카라과",
+  "total_teams": 28,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "기니비사우",
+  "total_teams": 48,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "쿠웨이트",
+  "total_teams": 24,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "콩고 공화국",
+  "total_teams": 38,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "필리핀",
+  "total_teams": 48,
+  "affiliates": [
+    {
+      "team_name": "카야 유스",
+      "tier": 3,
+      "parent_team_name": "카야 FC 일로일로"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "말레이시아",
+  "total_teams": 66,
+  "affiliates": [
+    {
+      "team_name": "조호르 다룰 탁짐 II",
+      "tier": 3,
+      "parent_team_name": "조호르 다룰 탁짐"
+    },
+    {
+      "team_name": "셀랑오르 FC II",
+      "tier": 3,
+      "parent_team_name": "셀랑오르 FC"
+    },
+    {
+      "team_name": "쿠알라룸푸르 시티 B",
+      "tier": 3,
+      "parent_team_name": "쿠알라룸푸르 시티"
+    },
+    {
+      "team_name": "페낭 B",
+      "tier": 3,
+      "parent_team_name": "페낭 FC"
+    },
+    {
+      "team_name": "트렝가누 B",
+      "tier": 3,
+      "parent_team_name": "트렝가누 FC"
+    },
+    {
+      "team_name": "사바 FC 리저브",
+      "tier": 3,
+      "parent_team_name": "사바 FC"
+    },
+    {
+      "team_name": "페락 B",
+      "tier": 3,
+      "parent_team_name": "페락 FC"
+    },
+    {
+      "team_name": "케다 다룰 아만 유스",
+      "tier": 3,
+      "parent_team_name": "케다 다룰 아만"
+    },
+    {
+      "team_name": "말라카 유나이티드 B",
+      "tier": 4,
+      "parent_team_name": "멜라카 FC"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "라트비아",
+  "total_teams": 40,
+  "affiliates": [
+    {
+      "team_name": "리가 FC II",
+      "tier": 2,
+      "parent_team_name": "리가 FC"
+    },
+    {
+      "team_name": "RFS II",
+      "tier": 2,
+      "parent_team_name": "RFS"
+    },
+    {
+      "team_name": "발미에라 II",
+      "tier": 2,
+      "parent_team_name": "발미에라 FC"
+    },
+    {
+      "team_name": "투쿠므스 II",
+      "tier": 2,
+      "parent_team_name": "투쿠므스 2000"
+    },
+    {
+      "team_name": "다우가브필스 II",
+      "tier": 2,
+      "parent_team_name": "다우가브필스"
+    },
+    {
+      "team_name": "메타 II",
+      "tier": 2,
+      "parent_team_name": "메타"
+    },
+    {
+      "team_name": "아우다 II",
+      "tier": 2,
+      "parent_team_name": "아우다"
+    },
+    {
+      "team_name": "옐가바 II",
+      "tier": 3,
+      "parent_team_name": "옐가바"
+    },
+    {
+      "team_name": "알베르츠 II",
+      "tier": 3,
+      "parent_team_name": "JDFS 알베르츠"
+    },
+    {
+      "team_name": "FK 리에파야 II",
+      "tier": 3,
+      "parent_team_name": "리에파야"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "인도",
+  "total_teams": 68,
+  "affiliates": [
+    {
+      "team_name": "오디샤 FC B",
+      "tier": 4,
+      "parent_team_name": "오디샤 FC"
+    },
+    {
+      "team_name": "케랄라 블라스터스 리저브",
+      "tier": 4,
+      "parent_team_name": "케랄라 블래스터스"
+    },
+    {
+      "team_name": "미네르바 펀자브 아카데미",
+      "tier": 4,
+      "parent_team_name": "미네르바 아카데미"
+    }
+  ],
+  "review": [
+    {
+      "team_name": "뭄바이 FC",
+      "tier": 4,
+      "review_reason": "ambiguous_classification"
+    }
+  ]
+}
+
+{
+  "country_name": "중앙아프리카공화국",
+  "total_teams": 38,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "라이베리아",
+  "total_teams": 38,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "투르크메니스탄",
+  "total_teams": 30,
+  "affiliates": [
+    {
+      "team_name": "아르카다그 B",
+      "tier": 3,
+      "parent_team_name": "아르카다그 FC"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "부룬디",
+  "total_teams": 38,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "에티오피아",
+  "total_teams": 38,
+  "affiliates": [
+    {
+      "team_name": "세인트 조지 B",
+      "tier": 3,
+      "parent_team_name": "세인트 조지 SC"
+    }
+  ],
+  "review": [
+    {
+      "team_name": "아다마 시티 유스",
+      "tier": 3,
+      "review_reason": "아다마 시티"
+    }
+  ]
+}
+
+{
+  "country_name": "도미니카 공화국",
+  "total_teams": 28,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "예멘",
+  "total_teams": 38,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "레소토",
+  "total_teams": 38,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "보츠와나",
+  "total_teams": 60,
+  "affiliates": [
+    {
+      "team_name": "오라파 영 스타즈",
+      "tier": 3,
+      "parent_team_name": "오라파 유나이티드"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "싱가포르",
+  "total_teams": 32,
+  "affiliates": [
+    {
+      "team_name": "라이언 시티 B",
+      "tier": 3,
+      "parent_team_name": "라이언 시티 세일러스"
+    },
+    {
+      "team_name": "탐파인스 B",
+      "tier": 3,
+      "parent_team_name": "탐파인스 로버스"
+    },
+    {
+      "team_name": "게일랑 B",
+      "tier": 3,
+      "parent_team_name": "게일랑 인터내셔널"
+    },
+    {
+      "team_name": "후강 B",
+      "tier": 3,
+      "parent_team_name": "후강 유나이티드"
+    },
+    {
+      "team_name": "탄종 파가르 B",
+      "tier": 3,
+      "parent_team_name": "탄종 파가르"
+    },
+    {
+      "team_name": "발레스티어 B",
+      "tier": 3,
+      "parent_team_name": "발레스티어 칼사"
+    },
+    {
+      "team_name": "홈 유나이티드 B",
+      "tier": 2,
+      "parent_team_name": "라이언 시티 세일러스"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "리투아니아",
+  "total_teams": 42,
+  "affiliates": [
+    {
+      "team_name": "잘기리스 B",
+      "tier": 2,
+      "parent_team_name": "잘기리스 빌뉴스"
+    },
+    {
+      "team_name": "시아울리아이 B",
+      "tier": 2,
+      "parent_team_name": "시아울리아이"
+    },
+    {
+      "team_name": "카우노 잘기리스 B",
+      "tier": 2,
+      "parent_team_name": "카우노 잘기리스"
+    },
+    {
+      "team_name": "파네베지스 B",
+      "tier": 2,
+      "parent_team_name": "FK 파네베지스"
+    },
+    {
+      "team_name": "반가 B",
+      "tier": 2,
+      "parent_team_name": "반가 가르주다이"
+    },
+    {
+      "team_name": "리테리아이 B",
+      "tier": 2,
+      "parent_team_name": "FK 리테리아이"
+    },
+    {
+      "team_name": "트란스인베스트 B",
+      "tier": 2,
+      "parent_team_name": "트란스인베스트"
+    },
+    {
+      "team_name": "헤겔만 B",
+      "tier": 2,
+      "parent_team_name": "헤겔만"
+    },
+    {
+      "team_name": "수두바 B",
+      "tier": 3,
+      "parent_team_name": "수두바"
+    },
+    {
+      "team_name": "다이나바 B",
+      "tier": 3,
+      "parent_team_name": "다이나바 알리투스"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "가이아나",
+  "total_teams": 38,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "뉴칼레도니아",
+  "total_teams": 38,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "세인트키츠 네비스",
+  "total_teams": 28,
+  "affiliates": [],
+  "review": [
+    {
+      "team_name": "가든 핫스퍼스 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    }
+  ]
+}
+
+{
+  "country_name": "솔로몬 제도",
+  "total_teams": 42,
+  "affiliates": [
+    {
+      "team_name": "솔로몬 워리어스 B FC",
+      "tier": 2,
+      "parent_team_name": "솔로몬 워리어스 FC"
+    },
+    {
+      "team_name": "호니아라 시티 B FC",
+      "tier": 2,
+      "parent_team_name": "호니아라 시티 FC"
+    },
+    {
+      "team_name": "코사 B FC",
+      "tier": 2,
+      "parent_team_name": "코사 FC"
+    },
+    {
+      "team_name": "라우구 B FC",
+      "tier": 2,
+      "parent_team_name": "라우구 유나이티드 FC"
+    },
+    {
+      "team_name": "말레이타 킹즈 B FC",
+      "tier": 2,
+      "parent_team_name": "말레이타 킹즈 FC"
+    },
+    {
+      "team_name": "과달카날 B FC",
+      "tier": 3,
+      "parent_team_name": "과달카날 FC"
+    },
+    {
+      "team_name": "마키라 B FC",
+      "tier": 3,
+      "parent_team_name": "마키라 스타즈 FC"
+    },
+    {
+      "team_name": "초이셀 B FC",
+      "tier": 3,
+      "parent_team_name": "초이셀 워리어스 FC"
+    },
+    {
+      "team_name": "테모투 B FC",
+      "tier": 3,
+      "parent_team_name": "테모투 에이스 FC"
+    },
+    {
+      "team_name": "렌벨 B FC",
+      "tier": 3,
+      "parent_team_name": "렌벨 유나이티드 FC"
+    },
+    {
+      "team_name": "산타 크루즈 B FC",
+      "tier": 3,
+      "parent_team_name": "산타 크루즈 FC"
+    },
+    {
+      "team_name": "뉴조지아 B FC",
+      "tier": 3,
+      "parent_team_name": "뉴조지아 유나이티드 FC"
+    },
+    {
+      "team_name": "이사벨 유나이티드 B FC",
+      "tier": 3,
+      "parent_team_name": "이사벨 유나이티드 FC"
+    },
+    {
+      "team_name": "센트럴 코스트 B FC",
+      "tier": 3,
+      "parent_team_name": "센트럴 코스트 FC"
+    },
+    {
+      "team_name": "마리스트 B FC",
+      "tier": 3,
+      "parent_team_name": "마리스트 FC"
+    },
+    {
+      "team_name": "레알 카카우 B FC",
+      "tier": 3,
+      "parent_team_name": "레알 카카우 FC"
+    },
+    {
+      "team_name": "웨스턴 유나이티드 B FC",
+      "tier": 3,
+      "parent_team_name": "웨스턴 유나이티드 FC"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "푸에르토리코",
+  "total_teams": 38,
+  "affiliates": [
+    {
+      "team_name": "바야몬 B FC",
+      "tier": 2,
+      "parent_team_name": "바야몬 FC"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "피지",
+  "total_teams": 34,
+  "affiliates": [
+    {
+      "team_name": "수바 리저브",
+      "tier": 2,
+      "parent_team_name": "수바 FC"
+    },
+    {
+      "team_name": "바 B",
+      "tier": 2,
+      "parent_team_name": "바 FC"
+    },
+    {
+      "team_name": "라우토카 B",
+      "tier": 3,
+      "parent_team_name": "라우토카 FC"
+    },
+    {
+      "team_name": "레바 B",
+      "tier": 3,
+      "parent_team_name": "레바 FC"
+    },
+    {
+      "team_name": "수바 B",
+      "tier": 3,
+      "parent_team_name": "수바 FC"
+    },
+    {
+      "team_name": "나부아 B",
+      "tier": 3,
+      "parent_team_name": "나부아 FC"
+    },
+    {
+      "team_name": "나디 B",
+      "tier": 3,
+      "parent_team_name": "나디 FC"
+    },
+    {
+      "team_name": "라바사 B",
+      "tier": 3,
+      "parent_team_name": "라바사 FC"
+    },
+    {
+      "team_name": "나드로가 B",
+      "tier": 3,
+      "parent_team_name": "나드로가"
+    },
+    {
+      "team_name": "나시누 B",
+      "tier": 3,
+      "parent_team_name": "나시누 시티"
+    },
+    {
+      "team_name": "타이레부 B",
+      "tier": 3,
+      "parent_team_name": "타이레부 나이타시리"
+    },
+    {
+      "team_name": "라키라키 B",
+      "tier": 3,
+      "parent_team_name": "라키라키"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "홍콩",
+  "total_teams": 34,
+  "affiliates": [
+    {
+      "team_name": "키치 B",
+      "tier": 2,
+      "parent_team_name": "키치 SC"
+    },
+    {
+      "team_name": "동방 B",
+      "tier": 3,
+      "parent_team_name": "동방 축구단"
+    },
+    {
+      "team_name": "레인저스 B",
+      "tier": 3,
+      "parent_team_name": "홍콩 레인저스"
+    },
+    {
+      "team_name": "남구 B",
+      "tier": 3,
+      "parent_team_name": "남구 축구단"
+    }
+  ],
+  "review": [
+    {
+      "team_name": "구룡성 B",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    }
+  ]
+}
+
+{
+  "country_name": "타히티",
+  "total_teams": 38,
+  "affiliates": [
+    {
+      "team_name": "파페에테 유스 FC",
+      "tier": 3,
+      "parent_team_name": "파페에테 FC"
+    },
+    {
+      "team_name": "AS 베뉘스 유스",
+      "tier": 3,
+      "parent_team_name": "AS 베뉘스"
+    },
+    {
+      "team_name": "AS 피라에 유스",
+      "tier": 3,
+      "parent_team_name": "AS 피라에"
+    },
+    {
+      "team_name": "AS 테파나 유스",
+      "tier": 3,
+      "parent_team_name": "AS 테파나"
+    },
+    {
+      "team_name": "AS 드래곤 유스",
+      "tier": 3,
+      "parent_team_name": "AS 드래곤"
+    },
+    {
+      "team_name": "AS 푸나아우이아 유스",
+      "tier": 3,
+      "parent_team_name": "AS 푸나아우이아"
+    },
+    {
+      "team_name": "마히나 유스 FC",
+      "tier": 3,
+      "parent_team_name": "마히나 FC"
+    },
+    {
+      "team_name": "타하아 유스 FC",
+      "tier": 3,
+      "parent_team_name": "타하아 FC"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "미얀마",
+  "total_teams": 40,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "몰도바",
+  "total_teams": 44,
+  "affiliates": [
+    {
+      "team_name": "셰리프 II",
+      "tier": 2,
+      "parent_team_name": "셰리프 티라스폴"
+    },
+    {
+      "team_name": "밀사미 B",
+      "tier": 3,
+      "parent_team_name": "밀사미 오르헤이"
+    },
+    {
+      "team_name": "지브루 B",
+      "tier": 3,
+      "parent_team_name": "지브루 키시나우"
+    },
+    {
+      "team_name": "발차니 B",
+      "tier": 3,
+      "parent_team_name": "CSF 발차니"
+    },
+    {
+      "team_name": "드로키아 유스",
+      "tier": 3,
+      "parent_team_name": "스페란차 드로키아"
+    },
+    {
+      "team_name": "수클리아 B",
+      "tier": 3,
+      "parent_team_name": "수클리아"
+    },
+    {
+      "team_name": "콤라트 B",
+      "tier": 3,
+      "parent_team_name": "올림프 콤라트"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "바누아투",
+  "total_teams": 38,
+  "affiliates": [
+    {
+      "team_name": "에라코르 유스 FC",
+      "tier": 3,
+      "parent_team_name": "에라코르 골든 스타즈 FC"
+    },
+    {
+      "team_name": "이페라 유스 FC",
+      "tier": 3,
+      "parent_team_name": "이페라 체프 FC"
+    },
+    {
+      "team_name": "타페아 유스 FC",
+      "tier": 3,
+      "parent_team_name": "타페아 FC"
+    },
+    {
+      "team_name": "아미칼레 유스 FC",
+      "tier": 3,
+      "parent_team_name": "아미칼레 FC"
+    },
+    {
+      "team_name": "갤럭시 유스 FC",
+      "tier": 3,
+      "parent_team_name": "갤럭시 FC"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "몰타",
+  "total_teams": 40,
+  "affiliates": [
+    {
+      "team_name": "피에타 핫스퍼스 B",
+      "tier": 3,
+      "parent_team_name": "피에타 핫스퍼스"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "앤티가 바부다",
+  "total_teams": 24,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "그레나다",
+  "total_teams": 42,
+  "affiliates": [
+    {
+      "team_name": "이글스 B FC",
+      "tier": 2,
+      "parent_team_name": "이글스 수퍼 스트라이커스 FC"
+    }
+  ],
+  "review": [
+    {
+      "team_name": "카리아쿠 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "구야브 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "그렌빌 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "스프링스 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "벨레어 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "파이브 스타즈 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "스파이스 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "사보 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "챈트미엘 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "하드 록 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "해피 힐 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "폰이 하운즈 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "카리브 가든스 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "퀸스 파크 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    }
+  ]
+}
+
+{
+  "country_name": "쿠바",
+  "total_teams": 52,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "에스와티니",
+  "total_teams": 38,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "세인트루시아",
+  "total_teams": 38,
+  "affiliates": [
+    {
+      "team_name": "그로스 아일렛 B FC",
+      "tier": 2,
+      "parent_team_name": "그로스 아일렛 FC"
+    },
+    {
+      "team_name": "노던 B FC",
+      "tier": 2,
+      "parent_team_name": "노던 유나이티드 FC"
+    },
+    {
+      "team_name": "플래티넘 B FC",
+      "tier": 2,
+      "parent_team_name": "플래티넘 FC"
+    }
+  ],
+  "review": [
+    {
+      "team_name": "초이셀 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "미쿠드 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "라보리 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "데너리 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "캐스트리스 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    }
+  ]
+}
+
+{
+  "country_name": "버뮤다",
+  "total_teams": 32,
+  "affiliates": [
+    {
+      "team_name": "해밀턴 유스 FC",
+      "tier": 2,
+      "parent_team_name": "해밀턴 패리시 FC"
+    },
+    {
+      "team_name": "PHC 유스 FC",
+      "tier": 2,
+      "parent_team_name": "PHC 제브라스 FC"
+    },
+    {
+      "team_name": "데번셔 유스 FC",
+      "tier": 3,
+      "parent_team_name": "데번셔 쿠거스 FC"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "파푸아뉴기니",
+  "total_teams": 42,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "남수단",
+  "total_teams": 54,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "세인트빈센트 그레나딘",
+  "total_teams": 38,
+  "affiliates": [],
+  "review": [
+    {
+      "team_name": "베키아 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "그레나딘 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "노스 윈드워드 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "캠프던 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "라부카 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "레이턴 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "시스템 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "시온 힐 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "아노스 벨리 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "주에 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "호프 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "조지타운 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "샤프 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "바로우아리에 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "킹스타운 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    },
+    {
+      "team_name": "체스타운 유스 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    }
+  ]
+}
+
+{
+  "country_name": "아프가니스탄",
+  "total_teams": 38,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "안도라",
+  "total_teams": 20,
+  "affiliates": [
+    {
+      "team_name": "UE 산타콜로마 B",
+      "tier": 2,
+      "parent_team_name": "UE 산타콜로마"
+    },
+    {
+      "team_name": "카릴 B",
+      "tier": 2,
+      "parent_team_name": "CE 카릴"
+    },
+    {
+      "team_name": "FC 안도라 B",
+      "tier": 2,
+      "parent_team_name": "FC 안도라"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "몰디브",
+  "total_teams": 34,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "중화 타이베이",
+  "total_teams": 26,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "캄보디아",
+  "total_teams": 26,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "몬트세라트",
+  "total_teams": 24,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "네팔",
+  "total_teams": 42,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "모리셔스",
+  "total_teams": 40,
+  "affiliates": [
+    {
+      "team_name": "CNEF U18",
+      "tier": 3,
+      "parent_team_name": "CNEF"
+    },
+    {
+      "team_name": "MFA HPC U17",
+      "tier": 3,
+      "parent_team_name": "MFA HPC"
+    },
+    {
+      "team_name": "MFA HPC U20",
+      "tier": 3,
+      "parent_team_name": "MFA HPC"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "바베이도스",
+  "total_teams": 36,
+  "affiliates": [
+    {
+      "team_name": "스페이츠타운 유스 FC",
+      "tier": 3,
+      "parent_team_name": "스페이츠타운 FC"
+    },
+    {
+      "team_name": "웨이머스 주니어 FC",
+      "tier": 3,
+      "parent_team_name": "웨이머스 웨일스 FC"
+    },
+    {
+      "team_name": "브리지타운 유스 FC",
+      "tier": 3,
+      "parent_team_name": "브리지타운 로버스 FC"
+    },
+    {
+      "team_name": "파라다이스 주니어 FC",
+      "tier": 3,
+      "parent_team_name": "파라다이스 FC"
+    },
+    {
+      "team_name": "BDF 유스 FC",
+      "tier": 3,
+      "parent_team_name": "BDF FC"
+    },
+    {
+      "team_name": "엠파이어 유스 FC",
+      "tier": 3,
+      "parent_team_name": "엠파이어 FC"
+    },
+    {
+      "team_name": "노트르담 유스 FC",
+      "tier": 3,
+      "parent_team_name": "노트르담 FC"
+    },
+    {
+      "team_name": "블랙버즈 유스 FC",
+      "tier": 3,
+      "parent_team_name": "UWI 블랙버즈 FC"
+    },
+    {
+      "team_name": "실버 산즈 주니어 FC",
+      "tier": 3,
+      "parent_team_name": "실버 산즈 FC"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "벨리즈",
+  "total_teams": 20,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "방글라데시",
+  "total_teams": 26,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "도미니카 연방",
+  "total_teams": 38,
+  "affiliates": [
+    {
+      "team_name": "로조 유스 FC",
+      "tier": 3,
+      "parent_team_name": "로조 밸리 FC"
+    },
+    {
+      "team_name": "그랜드 베이 유스 FC",
+      "tier": 3,
+      "parent_team_name": "그랜드 베이 유나이티드 FC"
+    },
+    {
+      "team_name": "마리고 유스 FC",
+      "tier": 3,
+      "parent_team_name": "마리고 스타즈 FC"
+    },
+    {
+      "team_name": "세인트 조셉 유스 FC",
+      "tier": 3,
+      "parent_team_name": "세인트 조셉 FC"
+    },
+    {
+      "team_name": "케인필드 유스 FC",
+      "tier": 3,
+      "parent_team_name": "케인필드 유나이티드 FC"
+    },
+    {
+      "team_name": "에메랄드 유스 FC",
+      "tier": 3,
+      "parent_team_name": "에메랄드 스타즈 FC"
+    },
+    {
+      "team_name": "칼리나고 유스 FC",
+      "tier": 3,
+      "parent_team_name": "칼리나고 내셔널 FC"
+    },
+    {
+      "team_name": "우드포드 유스 FC",
+      "tier": 3,
+      "parent_team_name": "우드포드 힐 FC"
+    },
+    {
+      "team_name": "바스 유스 FC",
+      "tier": 3,
+      "parent_team_name": "바스 이글스 FC"
+    },
+    {
+      "team_name": "두블랑 유스 FC",
+      "tier": 3,
+      "parent_team_name": "두블랑 FC"
+    },
+    {
+      "team_name": "하부 유스 FC",
+      "tier": 3,
+      "parent_team_name": "하부 유나이티드 FC"
+    },
+    {
+      "team_name": "포츠머스 유스 FC",
+      "tier": 3,
+      "parent_team_name": "포츠머스 보머스 FC"
+    },
+    {
+      "team_name": "사우프리 유스 FC",
+      "tier": 3,
+      "parent_team_name": "사우프리 아틀레티코 FC"
+    },
+    {
+      "team_name": "더블라 유스 FC",
+      "tier": 3,
+      "parent_team_name": "더블라 아틀레틱 FC"
+    },
+    {
+      "team_name": "마하고 유스 FC",
+      "tier": 3,
+      "parent_team_name": "마하고 익스프레스 FC"
+    },
+    {
+      "team_name": "위어 유스 FC",
+      "tier": 3,
+      "parent_team_name": "위어 카발리에스 FC"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "차드",
+  "total_teams": 36,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "에리트레아",
+  "total_teams": 16,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "라오스",
+  "total_teams": 26,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "쿡 제도",
+  "total_teams": 24,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "스리랑카",
+  "total_teams": 26,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "사모아",
+  "total_teams": 38,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "아루바",
+  "total_teams": 38,
+  "affiliates": [
+    {
+      "team_name": "다코타 B FC",
+      "tier": 2,
+      "parent_team_name": "다코타 FC"
+    },
+    {
+      "team_name": "RCA B",
+      "tier": 2,
+      "parent_team_name": "RCA 아루바"
+    },
+    {
+      "team_name": "브리타니아 B FC",
+      "tier": 2,
+      "parent_team_name": "브리타니아 FC"
+    },
+    {
+      "team_name": "라 파마 B FC",
+      "tier": 2,
+      "parent_team_name": "라 파마 FC"
+    },
+    {
+      "team_name": "오란스타드 유스 FC",
+      "tier": 3,
+      "parent_team_name": "오란스타드 유나이티드 FC"
+    },
+    {
+      "team_name": "파라데라 유스 FC",
+      "tier": 3,
+      "parent_team_name": "파라데라 FC"
+    },
+    {
+      "team_name": "브라질 유스 FC",
+      "tier": 3,
+      "parent_team_name": "브라질 아루바 FC"
+    },
+    {
+      "team_name": "카케티오 유스 FC",
+      "tier": 3,
+      "parent_team_name": "카케티오 FC"
+    },
+    {
+      "team_name": "부바리 유스 FC",
+      "tier": 3,
+      "parent_team_name": "부바리 FC"
+    },
+    {
+      "team_name": "스포르팅 아루바 유스 FC",
+      "tier": 3,
+      "parent_team_name": "스포르팅 아루바 FC"
+    },
+    {
+      "team_name": "인데펜디엔테 아루바 유스 FC",
+      "tier": 3,
+      "parent_team_name": "인데펜디엔테 아루바 FC"
+    },
+    {
+      "team_name": "유벤투스 아루바 유스 FC",
+      "tier": 3,
+      "parent_team_name": "유벤투스 아루바 FC"
+    },
+    {
+      "team_name": "에스트레야 유스 FC",
+      "tier": 3,
+      "parent_team_name": "에스트레야 FC"
+    },
+    {
+      "team_name": "리버 플레이트 아루바 유스 FC",
+      "tier": 3,
+      "parent_team_name": "리버 플레이트 아루바 FC"
+    },
+    {
+      "team_name": "나시오날 유스 FC",
+      "tier": 3,
+      "parent_team_name": "데포르티보 나시오날 FC"
+    }
+  ],
+  "review": [
+    {
+      "team_name": "아루바 아카데미 FC",
+      "tier": 3,
+      "review_reason": "ambiguous_classification"
+    }
+  ]
+}
+
+{
+  "country_name": "몽골",
+  "total_teams": 32,
+  "affiliates": [
+    {
+      "team_name": "에르침 II",
+      "tier": 2,
+      "parent_team_name": "에르침"
+    },
+    {
+      "team_name": "울란바토르 B",
+      "tier": 3,
+      "parent_team_name": "FC 울란바토르"
+    },
+    {
+      "team_name": "데런 B",
+      "tier": 3,
+      "parent_team_name": "데런 FC"
+    },
+    {
+      "team_name": "팔콘스 B",
+      "tier": 3,
+      "parent_team_name": "SP 팔콘스"
+    },
+    {
+      "team_name": "한가리드 B",
+      "tier": 3,
+      "parent_team_name": "한가리드"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "미국령 사모아",
+  "total_teams": 24,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "부탄",
+  "total_teams": 26,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "마카오",
+  "total_teams": 28,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "브루나이",
+  "total_teams": 36,
+  "affiliates": [
+    {
+      "team_name": "DPMM FC II",
+      "tier": 2,
+      "parent_team_name": "DPMM FC"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "상투메 프린시페",
+  "total_teams": 34,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "지부티",
+  "total_teams": 30,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "케이맨 제도",
+  "total_teams": 38,
+  "affiliates": [
+    {
+      "team_name": "보덴 타운 B FC",
+      "tier": 2,
+      "parent_team_name": "보덴 타운 FC"
+    },
+    {
+      "team_name": "엘리트 B SC",
+      "tier": 2,
+      "parent_team_name": "엘리트 SC"
+    },
+    {
+      "team_name": "조지 타운 B SC",
+      "tier": 2,
+      "parent_team_name": "조지 타운 SC"
+    },
+    {
+      "team_name": "스콜라스 B FC",
+      "tier": 2,
+      "parent_team_name": "스콜라스 인터내셔널 FC"
+    },
+    {
+      "team_name": "웨스트 베이 유스 FC",
+      "tier": 3,
+      "parent_team_name": "웨스트 베이 FC"
+    },
+    {
+      "team_name": "이스트 엔드 유스 FC",
+      "tier": 3,
+      "parent_team_name": "이스트 엔드 유나이티드 FC"
+    },
+    {
+      "team_name": "노스 사이드 유스 FC",
+      "tier": 3,
+      "parent_team_name": "노스 사이드 FC"
+    },
+    {
+      "team_name": "조지 타운 유스 SC",
+      "tier": 3,
+      "parent_team_name": "조지 타운 SC"
+    },
+    {
+      "team_name": "보덴 타운 유스 FC",
+      "tier": 3,
+      "parent_team_name": "보덴 타운 FC"
+    },
+    {
+      "team_name": "사우스 사운드 유스 FC",
+      "tier": 3,
+      "parent_team_name": "사우스 사운드 FC"
+    },
+    {
+      "team_name": "타이거스 유스 FC",
+      "tier": 3,
+      "parent_team_name": "타이거스 FC"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "파키스탄",
+  "total_teams": 50,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "소말리아",
+  "total_teams": 28,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "통가",
+  "total_teams": 40,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "동티모르",
+  "total_teams": 46,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "지브롤터",
+  "total_teams": 36,
+  "affiliates": [
+    {
+      "team_name": "링컨 B",
+      "tier": 3,
+      "parent_team_name": "링컨 레드 임프스"
+    },
+    {
+      "team_name": "유로파 B",
+      "tier": 3,
+      "parent_team_name": "유로파 FC"
+    },
+    {
+      "team_name": "세인트 조셉스 B",
+      "tier": 3,
+      "parent_team_name": "세인트 조셉스"
+    },
+    {
+      "team_name": "마그파이스 B",
+      "tier": 3,
+      "parent_team_name": "브루노스 마그파이스"
+    },
+    {
+      "team_name": "맨체스터 62 B",
+      "tier": 3,
+      "parent_team_name": "맨체스터 62"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "괌",
+  "total_teams": 16,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "세이셸",
+  "total_teams": 50,
+  "affiliates": [
+    {
+      "team_name": "보 발롱 유스",
+      "tier": 3,
+      "parent_team_name": "보 발롱"
+    },
+    {
+      "team_name": "카스케이드 유스",
+      "tier": 3,
+      "parent_team_name": "카스케이드"
+    },
+    {
+      "team_name": "벨 에어 주니어",
+      "tier": 3,
+      "parent_team_name": "벨 에어"
+    },
+    {
+      "team_name": "안세 루아얄 유스",
+      "tier": 3,
+      "parent_team_name": "안세 루아얄"
+    },
+    {
+      "team_name": "포트 글라시스 유스",
+      "tier": 3,
+      "parent_team_name": "포트 글라시스"
+    },
+    {
+      "team_name": "라 디그 유스",
+      "tier": 3,
+      "parent_team_name": "라 디그"
+    },
+    {
+      "team_name": "포인트 라루 주니어",
+      "tier": 3,
+      "parent_team_name": "포인트 라루"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "터크스 케이커스 제도",
+  "total_teams": 8,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "리히텐슈타인",
+  "total_teams": 32,
+  "affiliates": [
+    {
+      "team_name": "FC 파두츠 U21",
+      "tier": 1,
+      "parent_team_name": "FC 파두츠"
+    },
+    {
+      "team_name": "FC 파두츠 B",
+      "tier": 2,
+      "parent_team_name": "FC 파두츠"
+    },
+    {
+      "team_name": "FC 에셴-마우렌 B",
+      "tier": 2,
+      "parent_team_name": "FC 에셴-마우렌"
+    },
+    {
+      "team_name": "FC 발처스 B",
+      "tier": 2,
+      "parent_team_name": "FC 발처스"
+    },
+    {
+      "team_name": "FC 트리센 B",
+      "tier": 2,
+      "parent_team_name": "FC 트리센"
+    },
+    {
+      "team_name": "FC 샨 B",
+      "tier": 2,
+      "parent_team_name": "FC 샨"
+    },
+    {
+      "team_name": "FC 루겔 B",
+      "tier": 2,
+      "parent_team_name": "FC 루겔"
+    },
+    {
+      "team_name": "FC 트리젠베르크 B",
+      "tier": 2,
+      "parent_team_name": "FC 트리젠베르크"
+    },
+    {
+      "team_name": "FC 파두츠 C",
+      "tier": 3,
+      "parent_team_name": "FC 파두츠"
+    },
+    {
+      "team_name": "FC 에셴-마우렌 C",
+      "tier": 3,
+      "parent_team_name": "FC 에셴-마우렌"
+    },
+    {
+      "team_name": "FC 발처스 유스",
+      "tier": 3,
+      "parent_team_name": "FC 발처스"
+    },
+    {
+      "team_name": "FC 에셴-마우렌 D",
+      "tier": 3,
+      "parent_team_name": "FC 에셴-마우렌"
+    },
+    {
+      "team_name": "FC 샨 C",
+      "tier": 3,
+      "parent_team_name": "FC 샨"
+    },
+    {
+      "team_name": "FC 트리센 C",
+      "tier": 3,
+      "parent_team_name": "FC 트리센"
+    }
+  ],
+  "review": []
+}
+
+{
+  "country_name": "바하마",
+  "total_teams": 26,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "미국령 버진아일랜드",
+  "total_teams": 16,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "영국령 버진아일랜드",
+  "total_teams": 24,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "앵귈라",
+  "total_teams": 16,
+  "affiliates": [],
+  "review": []
+}
+
+{
+  "country_name": "산마리노",
+  "total_teams": 28,
+  "affiliates": [
+    {
+      "team_name": "도마냐노 B",
+      "tier": 2,
+      "parent_team_name": "도마냐노"
+    },
+    {
+      "team_name": "파에타노 B",
+      "tier": 2,
+      "parent_team_name": "파에타노"
+    },
+    {
+      "team_name": "피오렌티노 B",
+      "tier": 2,
+      "parent_team_name": "피오렌티노"
+    },
+    {
+      "team_name": "무라타 B",
+      "tier": 2,
+      "parent_team_name": "무라타"
+    },
+    {
+      "team_name": "코스모스 B",
+      "tier": 2,
+      "parent_team_name": "코스모스"
+    },
+    {
+      "team_name": "리베르타스 B",
+      "tier": 2,
+      "parent_team_name": "리베르타스"
+    },
+    {
+      "team_name": "산 조반니 B",
+      "tier": 2,
+      "parent_team_name": "산 조반니"
+    },
+    {
+      "team_name": "카일룽고 B",
+      "tier": 2,
+      "parent_team_name": "카일룽고"
+    },
+    {
+      "team_name": "페냐로사 B",
+      "tier": 2,
+      "parent_team_name": "페냐로사"
+    },
+    {
+      "team_name": "비르투스 B",
+      "tier": 2,
+      "parent_team_name": "비르투스"
+    }
+  ],
+  "review": []
+}

@@ -204,6 +204,18 @@ class CareerWindow(QDialog):
         cl_ms = champions_engine.get_my_cl_matches()
         tabs.addTab(self._champions_tab(cl_ms, p), f"챔피언스 ({len(cl_ms)})")
 
+        import europa_engine
+        el_ms = europa_engine.get_my_el_matches()
+        tabs.addTab(self._champions_tab(el_ms, p, history_table="el_history",
+                                         label="유로파리그", icon="🥈", color="#F28C28"),
+                    f"유로파 ({len(el_ms)})")
+
+        import conference_engine
+        ecl_ms = conference_engine.get_my_ecl_matches()
+        tabs.addTab(self._champions_tab(ecl_ms, p, history_table="ecl_history",
+                                         label="컨퍼런스리그", icon="🥉", color="#20A464"),
+                    f"컨퍼런스 ({len(ecl_ms)})")
+
         import cup_engine
         cup_ms = cup_engine.get_my_cup_matches()
         tabs.addTab(self._cup_tab(cup_ms), f"컵대회 ({len(cup_ms)})")
@@ -670,7 +682,7 @@ class CareerWindow(QDialog):
             for j, v in enumerate(vals):
                 self._set(tbl, i, j, v)
         lay.addWidget(tbl)
-        hint = QLabel("리그 + 컵대회 + 챔피언스리그 + 클럽월드컵 + 국가대표(예선 포함) 합산  ·  🟥은 전 대회 합산 퇴장 횟수")
+        hint = QLabel("리그 + 컵대회 + 챔피언스리그 + 유로파리그 + 컨퍼런스리그 + 클럽월드컵 + 국가대표(예선 포함) 합산  ·  🟥은 전 대회 합산 퇴장 횟수")
         hint.setStyleSheet("color:#666;font-size:10px;padding:4px;")
         lay.addWidget(hint)
         return w
@@ -877,17 +889,21 @@ class CareerWindow(QDialog):
         lay.addWidget(tbl)
         return w
 
-    def _champions_tab(self, matches, p):
-        """챔피언스리그 경기별 기록: 기간/포지션/팀/대회/상대/스탯/평점/스코어/결과."""
+    def _champions_tab(self, matches, p, history_table="cl_history", label="챔피언스리그",
+                        icon="🏆", color="#ffd24d"):
+        """챔피언스리그 경기별 기록: 기간/포지션/팀/대회/상대/스탯/평점/스코어/결과.
+        [2026-08 확장] history_table/label/icon/color를 매개변수로 빼서
+        유로파리그(el_history)/컨퍼런스리그(ecl_history) 탭도 이 함수를
+        그대로 재사용한다 — 로직은 100% 동일, 표시만 다르다."""
         w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(0,0,0,0)
 
-        # 대회별 성적(우승/몇강) 요약 (cl_history)
+        # 대회별 성적(우승/몇강) 요약
         # [2026-07 주의] cl_history는 클럽월드컵 기록도 competition="클럽 월드컵"으로
         # 같이 저장되므로(재사용), 이 챔스 탭에서는 반드시 제외해야 섞이지 않는다.
         conn = get_conn()
         try:
             hist = [dict(r) for r in conn.execute(
-                "SELECT * FROM cl_history WHERE competition!=? ORDER BY year",
+                f"SELECT * FROM {history_table} WHERE competition!=? ORDER BY year",
                 ("클럽 월드컵",)).fetchall()]
         except Exception:
             hist = []
@@ -895,13 +911,13 @@ class CareerWindow(QDialog):
 
         if hist:
             parts = [f"{h['year']}년 {h['result']}" for h in hist]
-            hl = QLabel("🏆 " + "   ·   ".join(parts))
-            hl.setStyleSheet("color:#ffd24d;font-size:12px;font-weight:bold;padding:4px;")
+            hl = QLabel(f"{icon} " + "   ·   ".join(parts))
+            hl.setStyleSheet(f"color:{color};font-size:12px;font-weight:bold;padding:4px;")
             hl.setWordWrap(True)
             lay.addWidget(hl)
 
         if not matches:
-            lay.addWidget(QLabel("챔피언스리그 출전 기록 없음"))
+            lay.addWidget(QLabel(f"{label} 출전 기록 없음"))
             return w
 
         from constants import position_group

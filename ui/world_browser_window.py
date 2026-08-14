@@ -331,6 +331,8 @@ class WorldBrowserWindow(QDialog):
         tabs.addTab(self._build_cup_tab(), "🎖 컵대회 검색")
         _wb_marks.append(("컵대회검색", _time_wb.perf_counter()))
         tabs.addTab(self._build_cl_tab(), "🏆 역대 챔피언스리그")
+        tabs.addTab(self._build_el_tab(), "🥈 역대 유로파리그")
+        tabs.addTab(self._build_ecl_tab(), "🥉 역대 컨퍼런스리그")
         _wb_marks.append(("역대챔스", _time_wb.perf_counter()))
         tabs.addTab(self._build_cwc_tab(), "🌍 역대 클럽 월드컵")
         _wb_marks.append(("역대CWC", _time_wb.perf_counter()))
@@ -1445,7 +1447,7 @@ class WorldBrowserWindow(QDialog):
         self.team_detail_tbl.verticalHeader().setVisible(False)
         self.team_detail_tbl.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.team_detail_tbl.setHorizontalHeaderLabels(
-            ["연도", "리그", "국내컵", "챔피언스리그", "클럽 월드컵"])
+            ["연도", "리그", "국내컵", "클럽 대항전", "클럽 월드컵"])
         self.team_detail_tbl.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.ResizeToContents)
         for _c in (1, 2, 3, 4):
@@ -1582,6 +1584,27 @@ class WorldBrowserWindow(QDialog):
             lay.addWidget(rec_lbl)
         return w
 
+    def _cl_award_summary_cell(self, n_cl, n_el, n_ecl):
+        """[2026-08 신설, 신민용 확정: "클럽 대항전 수상 합계는 하나로
+        합치지 않고 파랑(챔스)/주황(유로파)/초록(컨퍼런스) 숫자를 한 칸 씩
+        띄워서 따로 보여준다, 0회인 대회는 생략"] '수상' 요약 행의 클럽
+        대항전 칸 전용 — 셀 하나에 색이 다른 숫자를 최대 3개까지 나란히
+        배치한다. 전부 0이면 완전히 빈 칸."""
+        w = QWidget()
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(6, 4, 6, 4)
+        lay.setSpacing(8)
+        lay.addStretch()
+        for n, color in ((n_cl, "#1E4DB7"), (n_el, "#F28C28"), (n_ecl, "#20A464")):
+            if not n:
+                continue   # 0회인 대회는 통째로 생략(칸 자체를 안 만듦)
+            lbl = QLabel(str(n))
+            f = lbl.font(); f.setBold(True); lbl.setFont(f)
+            lbl.setStyleSheet(f"color:{color};font-size:13px;")
+            lay.addWidget(lbl)
+        lay.addStretch()
+        return w
+
     def _on_team_selected(self, item):
         tid = item.data(Qt.ItemDataRole.UserRole)
         tname = item.data(Qt.ItemDataRole.UserRole + 1)
@@ -1618,13 +1641,16 @@ class WorldBrowserWindow(QDialog):
 
         # [2026-08 신설, 신민용 요청: "연도별 기록 맨 위에 '수상' 칸을 만들어
         # 리그/컵/챔스/클럽WC 우승 횟수를 보여달라, 0회면 빈칸으로"]
+        # [2026-08 확장, 신민용 확정: "클럽 대항전 수상은 하나로 합치지
+        # 않고 왼쪽부터 파랑(챔스) 한 칸 띄고 주황(유로파) 한 칸 띄고
+        # 초록(컨퍼런스), 0회인 대회는 그 자체를 생략"] 클럽 대항전 칸
+        # 안에서 여러 색 숫자를 한 셀에 같이 넣어야 해서, 이 칸만
+        # _two_line_cell이 아니라 직접 QLabel들을 가로로 배치한 위젯을 쓴다.
         tbl.setRowCount(len(years) + 1)
         award_labels = [
             ("수상", None),
             (str(awards["league"]) if awards["league"] else "", "#4da6ff"),
             (str(awards["cup"]) if awards["cup"] else "", "#c48aff"),
-            (str(awards["cl"]) if awards["cl"] else "", "#ffd700"),
-            (str(awards["cwc"]) if awards["cwc"] else "", "#4dd0e1"),
         ]
         for j, (text, color) in enumerate(award_labels):
             cell = QTableWidgetItem(text)
@@ -1633,6 +1659,18 @@ class WorldBrowserWindow(QDialog):
             cell.setForeground(QColor(color) if color else QColor("#ffcc00"))
             cell.setBackground(QColor("#2a2a2a"))
             tbl.setItem(0, j, cell)
+
+        # 클럽 대항전 수상 칸(3번 컬럼) — 파랑/주황/초록 숫자를 한 칸에 같이.
+        tbl.setCellWidget(0, 3, self._cl_award_summary_cell(
+            awards.get("cl_champions", 0), awards.get("el_champions", 0),
+            awards.get("ecl_champions", 0)))
+
+        cwc_cell = QTableWidgetItem(str(awards["cwc"]) if awards["cwc"] else "")
+        cwc_cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        f = cwc_cell.font(); f.setBold(True); cwc_cell.setFont(f)
+        cwc_cell.setForeground(QColor("#4dd0e1"))
+        cwc_cell.setBackground(QColor("#2a2a2a"))
+        tbl.setItem(0, 4, cwc_cell)
 
         for i, entry in enumerate(years, start=1):
             # [2026-08 신설, 신민용 요청: "리그뿐 아니라 국내컵/챔스/클럽
@@ -1647,20 +1685,34 @@ class WorldBrowserWindow(QDialog):
             tbl.setItem(i, 0, year_item)
 
             lg_txt = entry["league"] or "-"
-            lg_color = ("#4da6ff" if "승격" in lg_txt else
-                        "#ff5555" if "강등" in lg_txt else "#ddd")
+            # [2026-08 신설, 신민용 확정: "승격색이 우선, 1부 1등만 금색"]
+            # 우선순위: 승격(파랑) > 강등(빨강) > 1부 우승(금색) > 그 외(회백).
+            lg_txt_l = lg_txt
+            if "승격" in lg_txt_l:
+                lg_color = "#4da6ff"
+            elif "강등" in lg_txt_l:
+                lg_color = "#ff5555"
+            elif entry.get("league_champion"):
+                lg_color = "#ffd700"
+            else:
+                lg_color = "#ddd"
             tbl.setCellWidget(i, 1, self._two_line_cell(lg_txt, lg_color, entry.get("league_record")))
 
             cup_txt = entry["cup"] or "-"
-            cup_color = "#c48aff" if entry["cup"] else "#555"
+            cup_color = "#ffd700" if entry.get("cup_champion") else ("#c48aff" if entry["cup"] else "#555")
             tbl.setCellWidget(i, 2, self._two_line_cell(cup_txt, cup_color, entry.get("cup_record")))
 
             cl_txt = entry["cl"] or "-"
-            cl_color = "#ffd700" if entry["cl"] else "#555"
+            # [2026-08 신설, 신민용 확정: "클럽 대항전"으로 통합 — 챔스는
+            # 파랑(#1E4DB7), 유로파는 주황(#F28C28), 컨퍼런스는 초록
+            # (#20A464). 워터폴 구조상 한 해엔 하나만 걸리므로 cl_kind
+            # 하나로 색이 딱 정해진다(참가 자체가 없으면 회색).
+            _CL_KIND_COLOR = {"champions": "#1E4DB7", "europa": "#F28C28", "conference": "#20A464"}
+            cl_color = _CL_KIND_COLOR.get(entry.get("cl_kind"), "#555") if entry["cl"] else "#555"
             tbl.setCellWidget(i, 3, self._two_line_cell(cl_txt, cl_color, entry.get("cl_record")))
 
             cwc_txt = entry.get("cwc") or "-"
-            cwc_color = "#4dd0e1" if entry.get("cwc") else "#555"
+            cwc_color = "#ffd700" if entry.get("cwc_champion") else ("#4dd0e1" if entry.get("cwc") else "#555")
             tbl.setCellWidget(i, 4, self._two_line_cell(cwc_txt, cwc_color, entry.get("cwc_record")))
         tbl.resizeRowsToContents()
 
@@ -2152,7 +2204,7 @@ class WorldBrowserWindow(QDialog):
             f"{rows[0]['name']}  ·  완료된 대회 {len(rows)}건" if rows
             else "이 나라에서 완료된 컵대회 기록이 없습니다")
 
-        cols = ["연도", "대회명", "🏆 우승", "🥈 준우승", "🥉 3위", "4위"]
+        cols = ["연도", "대회명", "참여팀", "🏆 우승", "🥈 준우승", "🥉 3위", "4위"]
         tbl = self.cup_tbl
         tbl.clear()
         tbl.setRowCount(len(rows))
@@ -2168,14 +2220,18 @@ class WorldBrowserWindow(QDialog):
                 return f"{name} ({tier}부)" if (name not in ("-", "?") and tier) else name
             names = [r["winner"], r["runner_up"], r["third"], r["fourth"]]
             tiers = [r.get("winner_tier"), r.get("runner_up_tier"), r.get("third_tier"), r.get("fourth_tier")]
-            vals = [str(r["year"]), r["name"]] + [_with_tier(n, t) for n, t in zip(names, tiers)]
-            clean_vals = [None, None] + [n if n not in ("-", "?") else None for n in names]
+            # [2026-08 신설] "참여팀" 열 — 그 시즌 컵대회에 실제로 등록된
+            # 전체 참가팀 수. 대회 규모를 한눈에 보여줘서, 왜 어떤 대회는
+            # 16강부터 시작하고 어떤 대회는 8강부터 시작하는지 바로 설명된다.
+            n_teams_str = str(r["n_teams"]) if r.get("n_teams") else "-"
+            vals = [str(r["year"]), r["name"], n_teams_str] + [_with_tier(n, t) for n, t in zip(names, tiers)]
+            clean_vals = [None, None, None] + [n if n not in ("-", "?") else None for n in names]
             for j, v in enumerate(vals):
                 cell = QTableWidgetItem(v)
                 cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 if clean_vals[j] and clean_vals[j] != v:
                     cell.setData(_CLEAN_TEXT_ROLE, clean_vals[j])
-                if j >= 2:
+                if j >= 3:
                     cell.setForeground(Qt.GlobalColor.white)
                 if j == 0:
                     cell.setData(Qt.ItemDataRole.UserRole, r["id"])
@@ -2197,44 +2253,77 @@ class WorldBrowserWindow(QDialog):
     # 탭3: 역대 챔피언스리그
     # ─────────────────────────────────────────
     def _build_cl_tab(self):
+        return self._build_cl_style_tab(
+            tbl_attr="cl_tbl", combo_attr="cl_cont_combo",
+            history_fn=wb.get_cl_history, detail_fn=wb.get_cl_tournament_detail,
+            winner_color=Qt.GlobalColor.yellow)
+
+    def _build_el_tab(self):
+        """[2026-08 신설] 역대 유로파리그 — 챔스와 완전히 같은 화면을
+        재사용, 데이터 소스(el_*)와 우승 강조색만 다르다."""
+        from PyQt6.QtGui import QColor
+        return self._build_cl_style_tab(
+            tbl_attr="el_tbl", combo_attr="el_cont_combo",
+            history_fn=wb.get_el_history, detail_fn=wb.get_el_tournament_detail,
+            winner_color=QColor("#F28C28"))
+
+    def _build_ecl_tab(self):
+        """[2026-08 신설] 역대 컨퍼런스리그 — 위와 동일 패턴."""
+        from PyQt6.QtGui import QColor
+        return self._build_cl_style_tab(
+            tbl_attr="ecl_tbl", combo_attr="ecl_cont_combo",
+            history_fn=wb.get_ecl_history, detail_fn=wb.get_ecl_tournament_detail,
+            winner_color=QColor("#20A464"))
+
+    def _build_cl_style_tab(self, tbl_attr, combo_attr, history_fn, detail_fn, winner_color):
+        """[2026-08 신설] _build_cl_tab의 로직을 그대로 일반화 — 테이블/콤보
+        위젯 속성명, 데이터 조회 함수, 우승 강조색만 매개변수로 뺐다.
+        위젯 자체는 self.<tbl_attr>/<combo_attr>로 저장해서(예: self.el_tbl)
+        기존 self.cl_tbl 패턴과 동일하게 다른 메서드에서도 접근 가능하다."""
         w = QWidget()
         lay = QVBoxLayout(w)
         lay.setContentsMargins(0, 8, 0, 0)
 
         filt = QHBoxLayout()
         lbl = QLabel("대륙"); lbl.setStyleSheet("color:#888;font-size:11px;")
-        self.cl_cont_combo = QComboBox()
+        combo = QComboBox()
         for cont in [_ALL, "유럽", "아시아", "아프리카", "북남미"]:
-            self.cl_cont_combo.addItem(cont)
-        self.cl_cont_combo.currentTextChanged.connect(self._refresh_cl_table)
+            combo.addItem(cont)
+        setattr(self, combo_attr, combo)
+        combo.currentTextChanged.connect(
+            lambda *_a: self._refresh_cl_style_table(tbl_attr, combo_attr, history_fn, winner_color))
         filt.addWidget(lbl)
-        filt.addWidget(self.cl_cont_combo)
+        filt.addWidget(combo)
         filt.addStretch()
         lay.addLayout(filt)
 
-        self.cl_tbl = QTableWidget(0, 0)
-        self.cl_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.cl_tbl.verticalHeader().setVisible(False)
-        self.cl_tbl.cellDoubleClicked.connect(self._open_cl_detail)
-        _enable_plain_copy(self.cl_tbl)
-        lay.addWidget(self.cl_tbl)
-        hint = QLabel("💡 대회를 더블클릭하면 조별리그·토너먼트 상세를 볼 수 있어요")
+        tbl = QTableWidget(0, 0)
+        tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        tbl.verticalHeader().setVisible(False)
+        tbl.cellDoubleClicked.connect(
+            lambda row, col: self._open_cl_style_detail(tbl_attr, detail_fn, row, col))
+        _enable_plain_copy(tbl)
+        setattr(self, tbl_attr, tbl)
+        lay.addWidget(tbl)
+        hint = QLabel("💡 대회를 더블클릭하면 리그 스테이지·토너먼트 상세를 볼 수 있어요")
         hint.setStyleSheet("color:#666;font-size:10px;")
         lay.addWidget(hint)
 
-        self._refresh_cl_table()
+        self._refresh_cl_style_table(tbl_attr, combo_attr, history_fn, winner_color)
         return w
 
-    def _refresh_cl_table(self, *_a):
-        cont = None if self.cl_cont_combo.currentText() == _ALL else self.cl_cont_combo.currentText()
-        rows = wb.get_cl_history(continent=cont)
+    def _refresh_cl_style_table(self, tbl_attr, combo_attr, history_fn, winner_color):
+        combo = getattr(self, combo_attr)
+        tbl = getattr(self, tbl_attr)
+        cont = None if combo.currentText() == _ALL else combo.currentText()
+        rows = history_fn(continent=cont)
         cols = ["연도", "대회", "🥇 우승", "🥈 준우승", "🥉 3위", "4위"]
-        self.cl_tbl.clear()
-        self.cl_tbl.setRowCount(len(rows))
-        self.cl_tbl.setColumnCount(len(cols))
-        self.cl_tbl.setHorizontalHeaderLabels(cols)
-        self.cl_tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.cl_tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        tbl.clear()
+        tbl.setRowCount(len(rows))
+        tbl.setColumnCount(len(cols))
+        tbl.setHorizontalHeaderLabels(cols)
+        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
 
         def _fmt_team(r, key):
             name = r.get(f"{key}_name") or ""
@@ -2258,21 +2347,22 @@ class WorldBrowserWindow(QDialog):
                 if clean_vals[j] and clean_vals[j] != v:
                     cell.setData(_CLEAN_TEXT_ROLE, clean_vals[j])
                 if j == 2:
-                    cell.setForeground(Qt.GlobalColor.yellow)
+                    cell.setForeground(winner_color)
                 if j == 0:
                     cell.setData(Qt.ItemDataRole.UserRole, r["id"])
-                self.cl_tbl.setItem(i, j, cell)
-        self._show_empty_state(self.cl_tbl, rows, "아직 완료된 대회가 없습니다", len(cols))
-        self._grow_to_fit(self.cl_tbl, stretch_col=1)
+                tbl.setItem(i, j, cell)
+        self._show_empty_state(tbl, rows, "아직 완료된 대회가 없습니다", len(cols))
+        self._grow_to_fit(tbl, stretch_col=1)
 
-    def _open_cl_detail(self, row, _col):
-        item = self.cl_tbl.item(row, 0)
+    def _open_cl_style_detail(self, tbl_attr, detail_fn, row, _col):
+        tbl = getattr(self, tbl_attr)
+        item = tbl.item(row, 0)
         tid = item.data(Qt.ItemDataRole.UserRole) if item else None
         if tid is None:
             return
-        name_item = self.cl_tbl.item(row, 1)
+        name_item = tbl.item(row, 1)
         title = f"{item.text()} {name_item.text() if name_item else ''}"
-        detail = wb.get_cl_tournament_detail(tid)
+        detail = detail_fn(tid)
         dlg = TournamentDetailDialog(title, detail, team_based=True, parent=self)
         dlg.exec()
 
