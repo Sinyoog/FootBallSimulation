@@ -9,8 +9,8 @@ europa_engine.py와 완전히 같은 구조 — 참가팀만 continental_qualifi
 "uecl_champion") 잡혀 있다.
 """
 from database import get_conn
-import champions_engine as _cl
-from competition_common import CompetitionConfig
+from competition import champions_engine as _cl
+from competition.competition_common import CompetitionConfig
 
 ECL_START_WEEK = _cl.CL_START_WEEK
 ECL_LEAGUE_WEEKS = _cl.CL_LEAGUE_WEEKS
@@ -58,37 +58,37 @@ def _ecl_playoff_pool(continent):
 
 
 def get_ecl_tournament(year, continent):
-    from competition_common import get_tournament
+    from competition.competition_common import get_tournament
     return get_tournament(CONFERENCE_CFG, year, continent)
 
 
 def _my_ecl_tournament(p, year):
-    from competition_common import my_tournament
+    from competition.competition_common import my_tournament
     return my_tournament(CONFERENCE_CFG, p, year)
 
 
 def get_my_ecl_match(week, day=None, p=None, st=None):
-    from competition_common import get_my_match
+    from competition.competition_common import get_my_match
     return get_my_match(CONFERENCE_CFG, week, day=day, p=p, st=st)
 
 
 def has_my_ecl_match_between(week_from, week_to):
-    from competition_common import has_my_match_between
+    from competition.competition_common import has_my_match_between
     return has_my_match_between(CONFERENCE_CFG, week_from, week_to)
 
 
 def sim_my_ecl_match_as_ai(week, p, reason="injury", day=None):
-    from competition_common import sim_my_match_as_ai
+    from competition.competition_common import sim_my_match_as_ai
     sim_my_match_as_ai(CONFERENCE_CFG, week, p, get_my_ecl_match, reason=reason, day=day)
 
 
 def simulate_my_ecl_match(week, p, day=None):
-    from competition_common import simulate_my_match
+    from competition.competition_common import simulate_my_match
     simulate_my_match(CONFERENCE_CFG, week, p, get_my_ecl_match, day=day)
 
 
 def get_my_ecl_league_standings(year):
-    from competition_common import get_my_league_standings
+    from competition.competition_common import get_my_league_standings
     from game_engine import get_player
     p = get_player()
     cont = _cl._my_continent(p) if p else None
@@ -98,52 +98,52 @@ def get_my_ecl_league_standings(year):
 
 
 def get_my_conference_matches(year):
-    from competition_common import get_my_matches_for_schedule
+    from competition.competition_common import get_my_matches_for_schedule
     return get_my_matches_for_schedule(CONFERENCE_CFG, year)
 
 
 def get_my_ecl_matches():
-    from competition_common import get_my_matches
+    from competition.competition_common import get_my_matches
     return get_my_matches(CONFERENCE_CFG)
 
 
 def build_from_qualification(year, continent, entries, my_tid):
-    from competition_common import build_tournament
+    from competition.competition_common import build_tournament
     build_tournament(CONFERENCE_CFG, year, continent, entries, my_tid,
                       team_cap=_ecl_team_cap(continent), games=_ecl_league_games(continent))
 
 
 def _finalize_league_phase(t):
-    from competition_common import finalize_league_phase
+    from competition.competition_common import finalize_league_phase
     cont = t["continent"]
     finalize_league_phase(CONFERENCE_CFG, t, _ecl_direct_cut(cont), _ecl_playoff_pool(cont),
                            ECL_PLAYOFF_WEEK, _start_knockout)
 
 
 def _finalize_playoff(t):
-    from competition_common import finalize_playoff
+    from competition.competition_common import finalize_playoff
     finalize_playoff(CONFERENCE_CFG, t, _start_knockout)
 
 
 def _start_knockout(t, qualifier_ids, direct_ids=None, winner_ids=None):
-    from competition_common import start_knockout
+    from competition.competition_common import start_knockout
     start_knockout(CONFERENCE_CFG, t, qualifier_ids, ECL_ROUND_WEEKS,
                    direct_ids=direct_ids, winner_ids=winner_ids)
 
 
 def _advance_round(t, cur_stage, next_stage):
-    from competition_common import advance_round
+    from competition.competition_common import advance_round
     advance_round(CONFERENCE_CFG, t, cur_stage, next_stage, ECL_ROUND_WEEKS)
 
 
 def _finish_tournament(t):
-    from competition_common import finish_tournament
+    from competition.competition_common import finish_tournament
     finish_tournament(CONFERENCE_CFG, t, award_fn=None)
 
 
 def process_ecl_week(week):
     from game_engine import get_state
-    from competition_common import process_one
+    from competition.competition_common import process_one
     st = get_state()
     if not st:
         return

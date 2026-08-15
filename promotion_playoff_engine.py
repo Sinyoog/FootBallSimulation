@@ -21,7 +21,7 @@
 # 동일한 필드 구성).
 
 import promotion_playoff as pp
-from champions_engine import _match_outcome, _resolve_pso
+from competition.champions_engine import _match_outcome, _resolve_pso
 from constants import PLAYOFF_WEEK, week_to_day, day_to_week
 
 # 요일 고정 패턴: 월/수/금/일 (PLAYOFF_WEEK 첫날 기준 +0/+2/+4/+6일).

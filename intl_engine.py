@@ -1076,7 +1076,7 @@ def start_intl_tournament(year):
     if is_cwc:
         # 월드컵 다음 해 — 캘린더 겹침이 전혀 없어서(챔스는 이미 23주차에
         # 다 끝나있는 상태) 이 해에 클럽 월드컵을 연다.
-        from club_world_cup_engine import start_club_world_cup
+        from competition.club_world_cup_engine import start_club_world_cup
         start_club_world_cup(year)
         return
     if not is_wc and not is_cont:

@@ -998,6 +998,14 @@ def init_db():
         #  계산의 기준값. 노화가 처음 시작될 때 1회 기록되며 이후 불변.
         #  ''(빈값)이면 아직 스냅샷 전(전성기 이전).
         "ALTER TABLE my_player ADD COLUMN aging_peak_max TEXT DEFAULT ''",
+        # [2026-08 신설, 신민용 확정] 훈련 gain 진행률(%) 감속 커브의 기준선.
+        # 스탯별 '커리어 시작값' 스냅샷을 JSON({"stamina":42,...} 형태)으로
+        # 1회 저장하고 이후 절대 변경하지 않는다(aging_peak_max와 같은
+        # 패턴 - 매일 다시 계산/조회하지 않고, 생성 시 한 번 박아두고
+        # 끝까지 그대로 참조). ''(빈 값)이면 이 기능 추가 이전 세이브라
+        # 아직 스냅샷 전 - game_engine._ensure_stat_start가 최초 훈련 시
+        # 현재값으로 1회 채워 넣는다.
+        "ALTER TABLE my_player ADD COLUMN stat_start TEXT DEFAULT ''",
         # [UI 진행 상태 영속화] 메인 화면의 1주/4주 모드, 진행 중인 묶음 위치,
         #  고정된 4주 일정, 4개 콤보(훈련) 선택값을 세이브에 저장한다.
         #  → 나갔다 들어와도 화면이 그대로 복원되어 일정/모드가 어긋나지 않음.

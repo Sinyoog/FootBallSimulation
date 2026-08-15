@@ -200,27 +200,27 @@ class CareerWindow(QDialog):
         if qual_ms:
             tabs.addTab(self._intl_tab(qual_ms, p), f"국제전(예선) ({len(qual_ms)})")
 
-        import champions_engine
+        from competition import champions_engine
         cl_ms = champions_engine.get_my_cl_matches()
         tabs.addTab(self._champions_tab(cl_ms, p), f"챔피언스 ({len(cl_ms)})")
 
-        import europa_engine
+        from competition import europa_engine
         el_ms = europa_engine.get_my_el_matches()
         tabs.addTab(self._champions_tab(el_ms, p, history_table="el_history",
                                          label="유로파리그", icon="🥈", color="#F28C28"),
                     f"유로파 ({len(el_ms)})")
 
-        import conference_engine
+        from competition import conference_engine
         ecl_ms = conference_engine.get_my_ecl_matches()
         tabs.addTab(self._champions_tab(ecl_ms, p, history_table="ecl_history",
                                          label="컨퍼런스리그", icon="🥉", color="#20A464"),
                     f"컨퍼런스 ({len(ecl_ms)})")
 
-        import cup_engine
+        from competition import cup_engine
         cup_ms = cup_engine.get_my_cup_matches()
         tabs.addTab(self._cup_tab(cup_ms), f"컵대회 ({len(cup_ms)})")
 
-        import club_world_cup_engine
+        from competition import club_world_cup_engine
         cwc_ms = club_world_cup_engine.get_my_cwc_matches()
         if cwc_ms:
             tabs.addTab(self._cwc_tab(cwc_ms), f"클럽 월드컵 ({len(cwc_ms)})")

@@ -136,7 +136,7 @@ def _select_continent_field(conn, continent: str, cwc_year: int) -> list[dict]:
 
     # 리그 스테이지 승점/득실도 최근 시즌 기준으로 타이브레이크 보강.
     if tournaments:
-        from champions_engine import get_cl_league_standings
+        from competition.champions_engine import get_cl_league_standings
         latest_standings = {r["team_id"]: r for r in get_cl_league_standings(tournaments[0]["id"])}
     else:
         latest_standings = {}

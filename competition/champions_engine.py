@@ -228,7 +228,7 @@ def _country_coefficients(conn, continent: str, upto_year: int, n_seasons: int =
     [2026-07 성능수정] 팀별 개별 쿼리(N+1) 대신 대회당 1회 배치 조회로
     바꿔서, 매년 8주차마다 도는 이 함수가 리그 수가 많아질수록(실측
     664개 리그) 느려지던 문제를 없앴다."""
-    from club_world_cup import _batch_team_stage_points
+    from competition.club_world_cup import _batch_team_stage_points
     years = list(range(upto_year - n_seasons, upto_year))
     if not years:
         return []
@@ -271,7 +271,7 @@ def get_cl_slots(country: str, grade: str, continent: str = None, year: int = No
 # 그쪽으로 옮겼다 — 키에 match_table이 포함돼 있어 대회별로 안전하게
 # 공유된다). 여기서는 이름 호환을 위해 얇게 위임만 한다.
 def _clear_entry_cache():
-    from competition_common import clear_entry_cache
+    from competition.competition_common import clear_entry_cache
     clear_entry_cache()
 
 STAGE_KO = {"league": "리그 스테이지", "PO": "플레이오프",
@@ -304,7 +304,7 @@ CL_CUP_NAME = {
 # CL_LEAGUE_WEEKS/CL_END_WEEK/_STAGE_ORDER와 완전히 동일한 값을 그대로
 # 참조한다(값 복제가 아니라 같은 객체를 담아서, 나중에 위 상수들이
 # 바뀌면 cfg도 자동으로 같이 바뀜).
-from competition_common import CompetitionConfig
+from competition.competition_common import CompetitionConfig
 CHAMPIONS_CFG = CompetitionConfig(
     match_table="cl_matches",
     entry_table="cl_entries",
@@ -649,21 +649,21 @@ def _select_entries(continent, season, year=None):
 def _entry_from(lg, standing_row, cl_rank=1):
     """[2026-08 리팩터링] competition_common.entry_from으로 이동
     (완전 동일 로직) — 위임만."""
-    from competition_common import entry_from
+    from competition.competition_common import entry_from
     return entry_from(lg, standing_row, cl_rank)
 
 
 def _league_phase_pairs(entries, games, my_tid):
     """[2026-08 리팩터링] competition_common.league_phase_pairs로 이동
     (완전 동일 로직) — 위임만."""
-    from competition_common import league_phase_pairs
+    from competition.competition_common import league_phase_pairs
     return league_phase_pairs(entries, games, my_tid)
 
 
 def _build_tournament(year, continent, entries, my_tid):
     """[2026-08 리팩터링] competition_common.build_tournament으로 이동
     (완전 동일 로직) — team_cap/games만 챔스 전용 C그룹 함수로 계산해 넘긴다."""
-    from competition_common import build_tournament
+    from competition.competition_common import build_tournament
     build_tournament(CHAMPIONS_CFG, year, continent, entries, my_tid,
                       team_cap=_cl_team_cap(continent), games=_cl_league_games(continent))
 
@@ -671,7 +671,7 @@ def _build_tournament(year, continent, entries, my_tid):
 def _first_stage_for(n):
     """[2026-08 리팩터링] competition_common.first_stage_for로 이동
     (완전 동일 로직) — 위임만."""
-    from competition_common import first_stage_for
+    from competition.competition_common import first_stage_for
     return first_stage_for(n)
 
 
@@ -802,35 +802,35 @@ def _process_one(t, week):
 def _entry(tid, team_id):
     """[2026-08 리팩터링] competition_common.entry로 이동
     (완전 동일 로직) — 위임만."""
-    from competition_common import entry
+    from competition.competition_common import entry
     return entry(CHAMPIONS_CFG, tid, team_id)
 
 
 def _match_outcome(h_ovr, a_ovr):
     """[2026-08 리팩터링] competition_common.match_outcome으로 이동
     (완전 동일 로직) — 위임만."""
-    from competition_common import match_outcome
+    from competition.competition_common import match_outcome
     return match_outcome(h_ovr, a_ovr)
 
 
 def _resolve_pso(h_ovr, a_ovr):
     """[2026-08 리팩터링] competition_common.resolve_pso로 이동
     (완전 동일 로직) — 위임만."""
-    from competition_common import resolve_pso
+    from competition.competition_common import resolve_pso
     return resolve_pso(h_ovr, a_ovr)
 
 
 def _sim_ai_match(t, m, my_played=False, conn=None, reason="injury", batch=None):
     """[2026-08 리팩터링] competition_common.sim_ai_match로 이동
     (완전 동일 로직) — 위임만."""
-    from competition_common import sim_ai_match
+    from competition.competition_common import sim_ai_match
     sim_ai_match(CHAMPIONS_CFG, t, m, my_played=my_played, conn=conn, reason=reason, batch=batch)
 
 
 def _winner_of(m):
     """[2026-08 리팩터링] competition_common.winner_of로 이동
     (완전 동일 로직) — 위임만."""
-    from competition_common import winner_of
+    from competition.competition_common import winner_of
     return winner_of(m)
 
 
@@ -1034,7 +1034,7 @@ def simulate_my_cl_match(week, p, day=None):
 def get_cl_league_standings(tid):
     """[2026-08 리팩터링] competition_common.get_league_standings으로 이동
     (완전 동일 로직) — 위임만."""
-    from competition_common import get_league_standings
+    from competition.competition_common import get_league_standings
     return get_league_standings(CHAMPIONS_CFG, tid)
 
 
@@ -1043,7 +1043,7 @@ def _finalize_league_phase(t):
     (완전 동일 로직) — direct_cut/po_pool/playoff_week만 챔스 전용 C그룹
     함수·상수로 계산해 넘긴다. start_knockout_fn은 순환 없이 _start_knockout
     자체를 그대로 넘긴다(모듈 레벨 함수라 문제 없음)."""
-    from competition_common import finalize_league_phase
+    from competition.competition_common import finalize_league_phase
     cont = t["continent"]
     finalize_league_phase(CHAMPIONS_CFG, t, _cl_direct_cut(cont), _cl_playoff_pool(cont),
                            CL_PLAYOFF_WEEK, _start_knockout)
@@ -1052,14 +1052,14 @@ def _finalize_league_phase(t):
 def _finalize_playoff(t):
     """[2026-08 리팩터링] competition_common.finalize_playoff로 이동
     (완전 동일 로직) — 위임만."""
-    from competition_common import finalize_playoff
+    from competition.competition_common import finalize_playoff
     finalize_playoff(CHAMPIONS_CFG, t, _start_knockout)
 
 
 def _start_knockout(t, qualifier_ids, direct_ids=None, winner_ids=None):
     """[2026-08 리팩터링] competition_common.start_knockout으로 이동
     (완전 동일 로직) — 위임만."""
-    from competition_common import start_knockout
+    from competition.competition_common import start_knockout
     start_knockout(CHAMPIONS_CFG, t, qualifier_ids, CL_ROUND_WEEKS,
                    direct_ids=direct_ids, winner_ids=winner_ids)
 
@@ -1067,7 +1067,7 @@ def _start_knockout(t, qualifier_ids, direct_ids=None, winner_ids=None):
 def _advance_round(t, cur_stage, next_stage):
     """[2026-08 리팩터링] competition_common.advance_round로 이동
     (완전 동일 로직) — 위임만."""
-    from competition_common import advance_round
+    from competition.competition_common import advance_round
     advance_round(CHAMPIONS_CFG, t, cur_stage, next_stage, CL_ROUND_WEEKS)
 
 
@@ -1155,14 +1155,37 @@ def _award_cl_awards(t, my_tid):
         "SELECT team_id FROM cl_entries WHERE tournament_id=?", (tid,)).fetchall()
     ALL_POS = GK_POS + DF_POS + MF_POS + ATTACK_POS
     ph = ",".join("?" * len(ALL_POS))
+    # [2026-08 최적화, 신민용 요청] 참가팀 수(최대 36개)만큼 ai_players를
+    # 팀별로 개별 조회하던 N+1 쿼리를 team_id IN (...) 배치 조회 1회로
+    # 합쳤다.
+    # ⚠ 주의: _estimate_ai_season/_estimate_ai_clean_sheets 내부에서
+    # random.uniform()으로 RNG를 소비하므로, 선수 순회 순서가 바뀌면 같은
+    # seed라도 이후 뽑히는 난수값이 달라져 결과가 어긋난다. 그래서 순서를
+    # 원본과 동일하게 유지하는 게 핵심이다:
+    #   - 팀 순회 순서: 아래 for문에서 여전히 entries(원본 리스트) 순서
+    #     그대로 순회 → 배치 쿼리의 결과 정렬과 무관하게 보존됨
+    #   - 팀 내부 선수 순서: id(=rowid, INTEGER PRIMARY KEY AUTOINCREMENT)
+    #     오름차순으로 명시 정렬 → 원래 "WHERE team_id=?" 단건 쿼리가
+    #     ORDER BY 없이도 idx_aiplayers_team 인덱스 스캔상 rowid 오름차순으로
+    #     반환되던 것과 동일한 순서를 보장(구두 스캔 순서에 암묵적으로
+    #     의존하던 것을 명시적 ORDER BY로 바꿔 오히려 더 안전해짐 — 과거
+    #     ORDER BY 누락으로 인한 비결정성 버그 이력과 같은 종류의 리스크를
+    #     사전 차단)
+    other_team_ids = [e["team_id"] for e in entries if e["team_id"] != my_tid]
+    players_by_team = {}
+    if other_team_ids:
+        tph = ",".join("?" * len(other_team_ids))
+        rows = conn.execute(
+            f"""SELECT team_id, ovr, position, sub_role, age FROM ai_players
+                WHERE team_id IN ({tph}) AND position IN ({ph})
+                ORDER BY team_id, id""",
+            (*other_team_ids, *ALL_POS)).fetchall()
+        for r in rows:
+            players_by_team.setdefault(r["team_id"], []).append(r)
     for e in entries:
         if e["team_id"] == my_tid:
             continue
-        rows = conn.execute(
-            f"""SELECT ovr, position, sub_role, age FROM ai_players
-                WHERE team_id=? AND position IN ({ph})""",
-            (e["team_id"], *ALL_POS)).fetchall()
-        for r in rows:
+        for r in players_by_team.get(e["team_id"], []):
             g, a, rt = _estimate_ai_season(r["ovr"], r["position"], 80, 80, r["sub_role"],
                                            full_season_matches=n_games)
             cs = _estimate_ai_clean_sheets(r["position"], r["ovr"], 80, 80, n_games) if r["position"] in GK_POS else 0
@@ -1225,7 +1248,7 @@ def _finish_tournament(t):
     """[2026-08 리팩터링] competition_common.finish_tournament으로 이동
     (완전 동일 로직) — 시상 함수(_award_cl_awards)만 그대로 넘겨서 이전과
     동일하게 결승 종료 시 호출되게 한다."""
-    from competition_common import finish_tournament
+    from competition.competition_common import finish_tournament
     finish_tournament(CHAMPIONS_CFG, t, award_fn=_award_cl_awards)
 
 
@@ -1236,14 +1259,14 @@ def _finish_tournament(t):
 def _record_my_exit(t, result):
     """[2026-08 리팩터링] competition_common.record_my_exit으로 이동
     (완전 동일 로직) — 위임만."""
-    from competition_common import record_my_exit
+    from competition.competition_common import record_my_exit
     record_my_exit(CHAMPIONS_CFG, t, result)
 
 
 def _save_trophy(year, team_name, competition, result):
     """[2026-08 리팩터링] competition_common.save_trophy로 이동
     (완전 동일 로직) — 위임만."""
-    from competition_common import save_trophy
+    from competition.competition_common import save_trophy
     save_trophy(CHAMPIONS_CFG, year, team_name, competition, result)
 
 

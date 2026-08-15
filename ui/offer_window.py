@@ -4,7 +4,7 @@ ui/offer_window.py  ─  이적 오퍼 선택 + 협상
 import random
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
-    QPushButton, QFrame, QScrollArea, QWidget
+    QPushButton, QFrame, QScrollArea, QWidget, QComboBox
 )
 from PyQt6.QtCore import Qt, QTimer
 from game_engine import fmt_money
@@ -77,6 +77,22 @@ class OfferWindow(QDialog):
                               restore_state.get("neg_used", {}).items()}
             self.neg_failed = set(restore_state.get("neg_failed", []))
             self._applied_count = restore_state.get("applied_count", 0)
+            _default_years = self._calc_initial_years()
+            _saved_years = restore_state.get("offer_years", [])
+            self.offer_years = (_saved_years if len(_saved_years) == len(self.offers)
+                                 else _default_years)
+            self.years_used = {int(k): v for k, v in
+                                restore_state.get("years_used", {}).items()}
+            if not self.years_used:
+                self.years_used = self._default_years_used()
+            self.years_failed = set(restore_state.get("years_failed", []))
+            # [2026-08 신설] 플레이어가 직접 고른 희망 계약기간(1~6년,
+            # 콤보박스 선택) — 없으면 지금 오퍼 값으로 기본 채움("아직
+            # 안 바꿨다" 상태).
+            _saved_target = restore_state.get("years_target", {})
+            self.years_target = {int(k): v for k, v in _saved_target.items()}
+            for i in range(len(self.offers)):
+                self.years_target.setdefault(i, self.offer_years[i])
         else:
             self.offer_salaries: list[int] = [o["salary"] for o in offers]
             self.neg_used: dict[int, int] = {}
@@ -84,11 +100,39 @@ class OfferWindow(QDialog):
                 self.neg_used[i] = random.randint(1, 3)
             self.neg_failed: set[int] = set()
             self._applied_count = 0
+            # [2026-08 신설, 신민용 확정] 계약 기간도 연봉처럼 오퍼 생성
+            # 시점에 딱 1번만 굴려서 고정한다. (예전엔 카드를 다시 그릴
+            # 때마다 _calc_contract_years를 매번 새로 호출해서, 연봉
+            # 협상을 한 번 누를 때마다 계약 기간 표시가 조용히 다시
+            # 랜덤으로 바뀌는 버그가 있었다 — 이제 self.offer_years에
+            # 고정해두고 카드 렌더링은 이 값만 읽는다.)
+            self.offer_years: list[int] = self._calc_initial_years()
+            self.years_used: dict[int, int] = self._default_years_used()
+            self.years_failed: set[int] = set()
+            # [2026-08 재설계, 신민용 확정: "내가 기간을 직접 입력(선택)
+            # 하고 협상해야 맞지"] 나이 기반 자동 '희망 연도' 추정을
+            # 없애고, 플레이어가 1~6년 중 콤보박스로 직접 고른 값을
+            # 목표로 협상한다. 기본값은 지금 오퍼와 같게(=아직 안 바꾼
+            # 상태) 시작.
+            self.years_target: dict[int, int] = {i: self.offer_years[i] for i in range(len(offers))}
 
         self._build()
         # 창이 만들어지는 즉시(사용자가 아무것도 안 눌러도) 저장해둔다 —
         # 그래야 이 창을 띄운 직후 바로 꺼져도 다음에 같은 상태로 복원된다.
         self._persist()
+
+    def _calc_initial_years(self) -> list:
+        """오퍼별 구단 측 초기 제시 계약 기간(연봉의 offer_salaries와 같은
+        역할) — 오퍼 생성 시점에 1회만 굴리고 이후 협상으로만 바뀐다."""
+        from game_engine import _calc_contract_years, get_player
+        p_now = get_player()
+        age_now = p_now.get("age", 17) if p_now else 17
+        return [_calc_contract_years(age_now, o.get("tier", 3), o.get("country"))
+                for o in self.offers]
+
+    def _default_years_used(self) -> dict:
+        from constants import CONTRACT_YEARS_NEG_MAX_ATTEMPTS
+        return {i: CONTRACT_YEARS_NEG_MAX_ATTEMPTS for i in range(len(self.offers))}
 
     def _persist(self):
         """현재 오퍼/협상 상태를 DB에 저장(kind가 없으면 아무것도 안 함)."""
@@ -100,6 +144,8 @@ class OfferWindow(QDialog):
             grid=self.grid, apply_slots=self.apply_slots, offers=self.offers,
             offer_salaries=self.offer_salaries, neg_used=self.neg_used,
             neg_failed=self.neg_failed, applied_count=self._applied_count,
+            offer_years=self.offer_years, years_used=self.years_used,
+            years_failed=self.years_failed, years_target=self.years_target,
         )
 
     def _clear_persisted(self):
@@ -239,6 +285,15 @@ class OfferWindow(QDialog):
             self.offers.append(offer)
             self.offer_salaries.append(offer["salary"])
             self.neg_used[idx] = random.randint(1, 3)
+            # [2026-08 신설] 기간 협상 상태도 새 오퍼에 맞춰 같이 확장.
+            from game_engine import _calc_contract_years, get_player
+            from constants import CONTRACT_YEARS_NEG_MAX_ATTEMPTS
+            p_now = get_player()
+            age_now = p_now.get("age", 17) if p_now else 17
+            self.offer_years.append(
+                _calc_contract_years(age_now, offer.get("tier", 3), offer.get("country")))
+            self.years_used[idx] = CONTRACT_YEARS_NEG_MAX_ATTEMPTS
+            self.years_target[idx] = self.offer_years[idx]
             self._applied_count += 1
             self._persist()
         self._render_cards()
@@ -285,10 +340,14 @@ class OfferWindow(QDialog):
         lay.addLayout(h2)
 
         # ── 행3: 연봉 + 이적료 + 계약 기간 ────────────────────
-        from game_engine import _calc_contract_years, get_player
-        p_now = get_player()
-        age_now = p_now.get("age", 17) if p_now else 17
-        c_yrs = _calc_contract_years(age_now, offer.get("tier", 3))
+        # [2026-08 수정, 신민용 확정] 예전엔 카드를 다시 그릴 때마다
+        # _calc_contract_years를 매번 새로 굴려서 협상 버튼을 누를 때마다
+        # 계약 기간 표시가 조용히 랜덤으로 바뀌었다 — 이제 __init__에서
+        # 1회만 굴려 고정한 self.offer_years[idx]만 읽는다(기간 협상으로만
+        # 바뀜). 나이 기반 자동 '희망 연도' 추정도 없앴다 — 목표는 아래
+        # 콤보박스에서 플레이어가 직접 고른다.
+        from constants import CONTRACT_YEARS_MIN, CONTRACT_YEARS_MAX
+        c_yrs = self.offer_years[idx]
         h3 = QHBoxLayout(); h3.setSpacing(8)
         _sal = self.offer_salaries[idx]
         _sal_txt = "💰 무급" if _sal == 0 else (
@@ -303,6 +362,9 @@ class OfferWindow(QDialog):
             fl = QLabel(f"🔄 이적료 {fmt_money(_fee)}")
             fl.setStyleSheet("color:#66aaff; font-size:11px;")
             h3.addWidget(fl)
+        # [2026-08 수정, 신민용 확정: "내가 기간을 직접 입력(선택)하고
+        # 협상해야 맞지"] 나이 기반 자동 '희망 연도' 추정 및 그 표시를
+        # 없앴다 — 목표 연수는 아래 콤보박스에서 플레이어가 직접 고른다.
         cl = QLabel(f"📋 {c_yrs}년 계약")
         cl.setStyleSheet("color:#ffcc44; font-size:11px;")
         h3.addStretch(); h3.addWidget(cl)
@@ -324,30 +386,82 @@ class OfferWindow(QDialog):
         failed   = idx in self.neg_failed
         neg_left = self.neg_used.get(idx, 0)
         is_safe  = bool(offer.get("safe")) and self._force
+        # [2026-08 신설] 기간 협상은 연봉 협상과 완전히 독립된 트랙.
+        # 목표 연수는 플레이어가 콤보박스로 직접 고른 self.years_target.
+        years_failed = idx in self.years_failed
+        years_left   = self.years_used.get(idx, 0)
+        target_yrs   = self.years_target.get(idx, c_yrs)
+        years_agreed = (c_yrs == target_yrs)
 
+        # 최종 계약은 "연봉·기간 둘 다 결렬 없이" 끝나야 성사된다 — 둘 중
+        # 하나라도 마지막 시도에서 실패하면 이 오퍼 전체가 결렬(안전망
+        # 오퍼는 예외적으로 결렬돼도 입단 가능).
         join_btn = QPushButton(("✅ 입단" if self.lang=="ko" else "✅ Join")
                                 + (" (보장)" if is_safe and self.lang=="ko" else
                                    " (Guaranteed)" if is_safe else ""))
         join_btn.setObjectName("selectBtn")
-        join_btn.setEnabled(is_safe or not failed)   # 안전망 오퍼는 결렬돼도 입단 가능
+        join_btn.setEnabled(is_safe or not (failed or years_failed))
         join_btn.clicked.connect(lambda _, i=idx: self._select(i))
 
         if failed:
             neg_btn = QPushButton("❌ 협상 결렬 (연봉 유지)" if is_safe else "❌ 협상 결렬")
             neg_btn.setObjectName("negBtn"); neg_btn.setEnabled(False)
         else:
-            neg_btn = QPushButton(f"💬 협상 ({neg_left}회)")
+            neg_btn = QPushButton(f"💬 연봉 협상 ({neg_left}회)")
             neg_btn.setObjectName("negBtn")
             neg_btn.setEnabled(neg_left > 0)
             neg_btn.clicked.connect(lambda _, i=idx: self._negotiate(i))
 
         h3.addWidget(join_btn); h3.addWidget(neg_btn); h3.addStretch()
         lay.addLayout(h3)
+
+        # ── 행5: 기간 협상 — 목표 연수 선택(콤보박스, 1~6년) + 협상 버튼 ──
+        h4 = QHBoxLayout(); h4.setSpacing(6)
+        target_combo = QComboBox()
+        target_combo.setObjectName("yearsCombo")
+        for y in range(CONTRACT_YEARS_MIN, CONTRACT_YEARS_MAX + 1):
+            target_combo.addItem(f"{y}년", y)
+        target_combo.setCurrentIndex(target_yrs - CONTRACT_YEARS_MIN)
+        # 결렬됐으면 목표를 더 바꿔봐야 소용없으니 잠가둔다.
+        target_combo.setEnabled(not years_failed)
+        target_combo.currentIndexChanged.connect(
+            lambda _, i=idx, cb=target_combo: self._on_years_target_changed(i, cb))
+        h4.addWidget(QLabel("🎯 희망:"))
+        h4.addWidget(target_combo)
+
+        if years_failed:
+            yrs_btn = QPushButton("❌ 기간 협상 결렬 (기간 유지)" if is_safe else "❌ 기간 협상 결렬")
+            yrs_btn.setObjectName("negBtn"); yrs_btn.setEnabled(False)
+        elif years_agreed:
+            yrs_btn = QPushButton("✅ 기간 합의 완료")
+            yrs_btn.setObjectName("negBtn"); yrs_btn.setEnabled(False)
+        else:
+            yrs_btn = QPushButton(f"📋 기간 협상 ({years_left}회)")
+            yrs_btn.setObjectName("negBtn")
+            yrs_btn.setEnabled(years_left > 0)
+            yrs_btn.clicked.connect(lambda _, i=idx: self._negotiate_years(i))
+        h4.addWidget(yrs_btn); h4.addStretch()
+        lay.addLayout(h4)
         return card
+
+    def _on_years_target_changed(self, idx, combo):
+        """[2026-08 신설] 콤보박스로 희망 계약기간을 바꾸면 그 값을 목표로
+        저장하고 카드를 다시 그린다(합의 완료 상태였다면 새 목표와 다시
+        비교해 버튼이 재활성화될 수 있음 — 단, 시도 횟수/결렬 여부는
+        그대로라 이미 결렬된 오퍼는 재협상 불가)."""
+        new_target = combo.currentData()
+        if new_target is None:
+            return
+        self.years_target[idx] = new_target
+        self._persist()
+        QTimer.singleShot(0, self._render_cards)
 
     def _select(self, idx):
         self.chosen = dict(self.offers[idx])
         self.chosen["salary"] = self.offer_salaries[idx]
+        # [2026-08 신설] 기간 협상으로 합의된 값을 최종 계약에 그대로
+        # 넘긴다(join_team이 offer.get("contract_years")를 우선 사용).
+        self.chosen["contract_years"] = self.offer_years[idx]
         self.accept()
 
     def _negotiate(self, idx):
@@ -366,13 +480,69 @@ class OfferWindow(QDialog):
         else:
             if self.neg_used[idx] == 0:
                 self.neg_failed.add(idx)
+                # [2026-08 신설, 신민용 확정] 협상 결렬이 뜨면 그 팀은
+                # 연도 기준 냉각기(거절연도+2년차까지 차단)에 들어간다.
+                # join(입단 강제)/auto_offer(일반 오퍼) 양쪽 다 이 창을
+                # 같이 쓰므로 여기 한 곳만 훅해도 두 경로 모두 커버된다.
+                from game_engine import _record_team_offer_cooldown
+                _record_team_offer_cooldown(self.offers[idx]["team_id"])
                 show_toast(self, "❌ 협상 결렬  입단 불가", "#cc0000", 1400)
             else:
                 show_toast(self, f"협상 실패  남은 기회: {self.neg_used[idx]}회", "#cc4400", 1200)
 
-        # [전부 결렬 구제] 모든 오퍼가 결렬되면 입단할 곳이 없으므로,
-        #   첫 입단(force_select)이라도 닫기를 풀어 1년 더 훈련하도록 빠져나가게 한다.
-        if self.offers and len(self.neg_failed) >= len(self.offers):
+        self._after_negotiate_round()
+
+    def _negotiate_years(self, idx):
+        """[2026-08 재설계, 신민용 확정] 계약 '기간' 협상 — 연봉 협상과
+        완전히 독립된 트랙(독립 시도 횟수, 독립 성공/실패). 나이 기반
+        자동 추정이 아니라, 플레이어가 카드의 콤보박스로 직접 고른
+        self.years_target[idx]를 향해서만 움직인다. 이미 목표와 같으면
+        애초에 버튼이 비활성화된다(_make_card 참고)."""
+        from game_engine import _contract_years_neg_delta, _record_team_offer_cooldown
+        from constants import (CONTRACT_YEARS_NEG_SUCCESS_PROB,
+                               CONTRACT_YEARS_MIN, CONTRACT_YEARS_MAX)
+        if self.years_used[idx] <= 0 or idx in self.years_failed:
+            return
+        self.years_used[idx] -= 1
+
+        target  = self.years_target.get(idx, self.offer_years[idx])
+        old_yrs = self.offer_years[idx]
+        tier    = self.offers[idx].get("tier", 3)
+        delta   = _contract_years_neg_delta(tier)
+        success = random.random() < CONTRACT_YEARS_NEG_SUCCESS_PROB
+
+        if success and old_yrs != target:
+            direction = 1 if target > old_yrs else -1
+            step = min(delta, abs(target - old_yrs))
+            new_yrs = old_yrs + direction * step
+            new_yrs = max(CONTRACT_YEARS_MIN, min(CONTRACT_YEARS_MAX, new_yrs))
+            self.offer_years[idx] = new_yrs
+            show_toast(self, f"✅ 기간 협상 성공  {old_yrs}년 → {new_yrs}년", "#006622", 1400)
+        else:
+            if self.years_used[idx] == 0:
+                self.years_failed.add(idx)
+                _record_team_offer_cooldown(self.offers[idx]["team_id"])
+                show_toast(self, "❌ 기간 협상 결렬  입단 불가", "#cc0000", 1400)
+            else:
+                show_toast(self, f"기간 협상 실패  남은 기회: {self.years_used[idx]}회",
+                           "#cc4400", 1200)
+
+        self._after_negotiate_round()
+
+    def _after_negotiate_round(self):
+        """[2026-08 신설] 연봉/기간 두 협상 메서드가 공유하는 뒷정리 —
+        '전부 결렬' 판정(안전망 오퍼가 아닌데 연봉·기간 둘 중 하나라도
+        결렬된 오퍼는 입단 불가로 친다), 저장, 카드 갱신."""
+        dead = 0
+        for i in range(len(self.offers)):
+            is_safe_i = bool(self.offers[i].get("safe")) and self._force
+            if is_safe_i:
+                continue
+            if i in self.neg_failed or i in self.years_failed:
+                dead += 1
+        # [전부 결렬 구제] 입단 가능한 오퍼가 하나도 안 남으면, 첫 입단
+        #   (force_select)이라도 닫기를 풀어 1년 더 훈련하도록 빠져나가게 한다.
+        if self.offers and dead >= len(self.offers):
             self.all_failed = True
             if self._force and self._close_btn is not None:
                 self._close_btn.setEnabled(True)
@@ -383,5 +553,5 @@ class OfferWindow(QDialog):
                        "#cc6600", 1800)
 
         self._persist()
-        # 카드 갱신 (연봉 수치 반영)
+        # 카드 갱신 (연봉/기간 수치 반영)
         QTimer.singleShot(100, self._render_cards)

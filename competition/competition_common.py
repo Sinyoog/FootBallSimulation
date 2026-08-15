@@ -570,7 +570,7 @@ def finish_tournament(cfg, t, award_fn=None):
 # 그대로 재사용한다(대회 등급이 달라도 "우승/준우승/..." 보상 체계 자체는
 # 공용). champions_engine에 이미 정의돼 있으므로 여기서는 import.
 def _get_reward_table():
-    from champions_engine import _REWARD
+    from competition.champions_engine import _REWARD
     return _REWARD
 
 
@@ -727,7 +727,7 @@ def my_continent(p):
     tid = p.get("current_team_id", 0)
     if not tid:
         return None
-    from champions_engine import CONTINENT_MAP
+    from competition.champions_engine import CONTINENT_MAP
     conn = get_conn()
     row = conn.execute(
         """SELECT cn.continent FROM teams t
@@ -851,7 +851,7 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
                              _save_match_detail, _soft_cap,
                              _check_suspended, _roll_red_card, _apply_red_card_dismissal,
                              _week_intl_cl_day, _log_highlight, _min_sortkey)
-    from champions_engine import _get_field_pos
+    from competition.champions_engine import _get_field_pos
     info = get_my_match_fn(week, day=day)
     if not info:
         return

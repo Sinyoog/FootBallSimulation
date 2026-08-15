@@ -522,7 +522,7 @@ def _get_cup_placements(tournament_id, conn):
     우승/준우승을 보여주려면 이렇게 경기 결과에서 직접 뽑아야 한다.
     [주의] 대회 하나만 볼 때 쓰는 함수 — 여러 대회를 한꺼번에 나열할 때는
     _batch_cup_placements()를 써서 대회 수만큼 쿼리가 늘어나지 않게 한다."""
-    from cup_engine import _winner_of
+    from competition.cup_engine import _winner_of
     fm = conn.execute(
         """SELECT * FROM cup_matches WHERE tournament_id=? AND round_name='결승'
            AND home_score>=0 ORDER BY id DESC LIMIT 1""", (tournament_id,)).fetchone()
@@ -551,7 +551,7 @@ def _batch_cup_placements(tournament_ids, conn):
     파이썬에서 (tournament_id, round_name)별로 묶어 마지막 행(=원래
     'ORDER BY id DESC LIMIT 1'과 동일)만 취한다 — 판정 로직/반환값은
     _get_cup_placements와 완전히 동일, 반환 형태만 {tournament_id: dict}."""
-    from cup_engine import _winner_of
+    from competition.cup_engine import _winner_of
     if not tournament_ids:
         return {}
     ph = ",".join("?" * len(tournament_ids))
@@ -754,7 +754,7 @@ def _get_cl_placements(tournament_id, conn, match_table="cl_matches"):
     intl_engine 쪽 _get_placements와 동일한 패턴, team_id(정수) 기준만 다름.
     [주의] 대회 하나만 볼 때 쓰는 함수 — 여러 대회를 한꺼번에 나열할 때는
     _batch_cl_placements()를 써서 대회 수만큼 쿼리가 늘어나지 않게 한다."""
-    from champions_engine import _winner_of
+    from competition.champions_engine import _winner_of
     fm = conn.execute(
         f"SELECT * FROM {match_table} WHERE tournament_id=? AND stage='F' "
         f"AND home_score>=0 ORDER BY id DESC LIMIT 1", (tournament_id,)).fetchone()
@@ -781,7 +781,7 @@ def _batch_cl_placements(tournament_ids, conn, match_table="cl_matches"):
     tournament_id IN 배치 쿼리 1번으로 통합 (get_cl_history의 limit=100
     기본값 기준 최대 200회 왕복 → 1회). 판정 로직은 완전히 동일하고
     반환 형태만 {tournament_id: dict}."""
-    from champions_engine import _winner_of
+    from competition.champions_engine import _winner_of
     if not tournament_ids:
         return {}
     ph = ",".join("?" * len(tournament_ids))
@@ -1470,7 +1470,7 @@ def get_cl_tournament_detail(tournament_id, entry_table="cl_entries",
     [2026-07 스위스 방식 개편] 조별리그가 없어져서 groups 대신 단일
     league_standings 리스트를 반환한다. 기존 groups 키를 참조하던 옛
     UI가 있다면 빈 dict로라도 동작하도록 groups=[]는 계속 넣어둔다."""
-    from champions_engine import STAGE_KO
+    from competition.champions_engine import STAGE_KO
     conn = get_conn(); c = conn.cursor()
 
     entries = [dict(r) for r in c.execute(
@@ -1549,7 +1549,7 @@ def _batch_cwc_placements(tournament_ids, conn):
     """get_cl_history의 _batch_cl_placements와 완전히 동일한 패턴 —
     cwc_matches는 cl_matches와 스키마가 같으므로 champions_engine._winner_of를
     그대로 재사용한다."""
-    from champions_engine import _winner_of
+    from competition.champions_engine import _winner_of
     if not tournament_ids:
         return {}
     ph = ",".join("?" * len(tournament_ids))

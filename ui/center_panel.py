@@ -1045,7 +1045,7 @@ class CenterPanel(QWidget):
             pass
         # 챔피언스리그 확인 (41~52주)
         try:
-            import champions_engine
+            from competition import champions_engine
             from game_engine import get_state as _gs
             _st = _gs()
             cl_m = champions_engine.get_my_cl_match(week, p=p)
@@ -1066,7 +1066,7 @@ class CenterPanel(QWidget):
                 cl_gi = champions_engine.get_my_cl_group_info(_st["current_year"])
                 if cl_gi:
                     # _my_cl_tournament로 대회 정보 가져오기
-                    from champions_engine import _my_cl_tournament
+                    from competition.champions_engine import _my_cl_tournament
                     _cp = p  # center_panel의 p
                     _ct = _my_cl_tournament(_cp, _st["current_year"])
                     if _ct and _ct.get("status") != "done":
@@ -1084,7 +1084,7 @@ class CenterPanel(QWidget):
             pass
         # 유로파리그급/컨퍼런스리그급 확인 (2026-08 신설, 챔스와 동일 주차)
         try:
-            import europa_engine
+            from competition import europa_engine
             el_m = europa_engine.get_my_el_match(week, p=p)
             if el_m:
                 return {
@@ -1100,7 +1100,7 @@ class CenterPanel(QWidget):
         except Exception:
             pass
         try:
-            import conference_engine
+            from competition import conference_engine
             ecl_m = conference_engine.get_my_ecl_match(week, p=p)
             if ecl_m:
                 return {
@@ -1117,7 +1117,7 @@ class CenterPanel(QWidget):
             pass
         # 클럽 월드컵 확인 (43~52주, 4년에 한 번)
         try:
-            import club_world_cup_engine
+            from competition import club_world_cup_engine
             cwc_m = club_world_cup_engine.get_my_cwc_match(week, p=p)
             if cwc_m:
                 return {
@@ -1149,19 +1149,19 @@ class CenterPanel(QWidget):
         import intl_engine
         if intl_engine.has_my_match_between(week, week):
             return True
-        import champions_engine
+        from competition import champions_engine
         if champions_engine.has_my_cl_match_between(week, week):
             return True
-        import europa_engine
+        from competition import europa_engine
         if europa_engine.has_my_el_match_between(week, week):
             return True
-        import conference_engine
+        from competition import conference_engine
         if conference_engine.has_my_ecl_match_between(week, week):
             return True
-        import cup_engine
+        from competition import cup_engine
         if cup_engine.has_my_cup_match_between(week, week):
             return True
-        import club_world_cup_engine
+        from competition import club_world_cup_engine
         return club_world_cup_engine.has_my_cwc_match_between(week, week)
 
     def _on_day_combo_changed(self, idx, text):
@@ -1788,7 +1788,7 @@ class CenterPanel(QWidget):
         if pend:
             return pend
 
-        import club_world_cup_engine
+        from competition import club_world_cup_engine
         cw = club_world_cup_engine.get_my_cwc_match(week, day=day, p=p, st=st)
         if cw:
             return cw
@@ -1817,43 +1817,66 @@ class CenterPanel(QWidget):
         if day != _week_intl_cl_day(week, p, st=st):
             return None
 
-        import champions_engine
+        from competition import champions_engine
         cm = champions_engine.get_my_cl_match(week, day=day, p=p, st=st)
         if cm:
             cm["cl_kind"] = "champions"
             return cm
-        import europa_engine
+        from competition import europa_engine
         elm = europa_engine.get_my_el_match(week, day=day, p=p, st=st)
         if elm:
             elm["cl_kind"] = "europa"
             return elm
-        import conference_engine
+        from competition import conference_engine
         eclm = conference_engine.get_my_ecl_match(week, day=day, p=p, st=st)
         if eclm:
             eclm["cl_kind"] = "conference"
             return eclm
-        import cup_engine
+        from competition import cup_engine
         return cup_engine.get_my_cup_match(week, day=day, p=p, st=st)
 
     # ── 액션 ─────────────────────────────────────
 
     def _show_renew_dialog(self, p):
-        """재계약 팝업: 팀이 정한 연봉·기간(1~3년)을 제시 → 수락/거절만."""
+        """재계약 팝업.
+        [2026-08 재설계, 신민용 확정] 예전엔 "팀이 정한 연봉·기간을 그대로
+        제시 → 수락/거절만" 이었는데, 오퍼 창(OfferWindow)과 똑같은 방식의
+        연봉 협상 + 기간 협상(1~6년, 콤보박스로 직접 선택) 버튼을 추가했다.
+        연봉·기간 둘 다 결렬 없이 끝나야 재계약이 성사되고, 둘 중 하나라도
+        마지막 시도에서 실패하면 이 재계약 제안 자체가 결렬되어(수락 버튼
+        비활성화) 거절(방출/소속 없음)만 남는다 — OfferWindow와 동일한
+        규칙."""
         from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
-                                      QLabel, QPushButton, QFrame)
-        from game_engine import join_team, update_player, get_state
+                                      QLabel, QPushButton, QFrame, QComboBox)
+        from game_engine import (join_team, update_player, get_state, get_conn,
+                                  _contract_years_neg_delta, _record_team_offer_cooldown)
+        from constants import (CONTRACT_YEARS_NEG_MAX_ATTEMPTS, CONTRACT_YEARS_NEG_SUCCESS_PROB,
+                               CONTRACT_YEARS_MIN, CONTRACT_YEARS_MAX)
+        import random
 
-        offer_sal = p.get("_contract_renew_offer", 0)
-        offer_yrs = p.get("_contract_renew_years", 0) or 2   # 안전 기본값
-        from database import get_conn
         _conn = get_conn()
-        _row  = _conn.execute("SELECT name FROM teams WHERE id=?", (p.get("current_team_id",0),)).fetchone()
+        _row  = _conn.execute(
+            "SELECT t.name, t.id, l.tier FROM teams t JOIN leagues l ON t.league_id=l.id "
+            "WHERE t.id=?", (p.get("current_team_id",0),)).fetchone()
         _conn.close()
         team_name = _row["name"] if _row else "현재 팀"
+        team_id   = _row["id"] if _row else p.get("current_team_id", 0)
+        team_tier = _row["tier"] if _row else 3
+
+        # [2026-08 신설] 협상 상태 — 클로저 안에서 갱신할 수 있게 dict로.
+        state = {
+            "sal": p.get("_contract_renew_offer", 0),
+            "yrs": p.get("_contract_renew_years", 0) or 2,   # 안전 기본값
+            "sal_used": random.randint(1, 3),
+            "yrs_used": CONTRACT_YEARS_NEG_MAX_ATTEMPTS,
+            "sal_failed": False,
+            "yrs_failed": False,
+        }
+        state["target_yrs"] = state["yrs"]   # 콤보박스 기본값 = 초기 제시와 동일
 
         dlg = QDialog(self)
         dlg.setWindowTitle("📋 재계약 제안")
-        dlg.setMinimumWidth(360)
+        dlg.setMinimumWidth(380)
         dlg.setStyleSheet(_DIALOG_STYLE)
         lay = QVBoxLayout(dlg)
         lay.setContentsMargins(18,16,18,16); lay.setSpacing(10)
@@ -1864,20 +1887,108 @@ class CenterPanel(QWidget):
         card = QFrame(); card.setObjectName("dlgCard")
         cl = QVBoxLayout(card); cl.setContentsMargins(14,12,14,12); cl.setSpacing(6)
         cl.addWidget(QLabel(f"<b style='color:#fff'>{team_name}</b><span style='color:#bbb'>에서 재계약을 제안합니다.</span>"))
-        cl.addWidget(QLabel(f"<span style='color:#bbb'>제시 조건</span>  "
-                            f"<b style='color:#ffcc33'>{offer_yrs}년 계약</b>"))
-        cl.addWidget(QLabel(f"<span style='color:#bbb'>제시 연봉</span>  "
-                            f"<b style='color:#00cc66'>{fmt_money(offer_sal)} / 년</b>"))
+        yrs_lbl = QLabel()
+        sal_lbl = QLabel()
+        cl.addWidget(yrs_lbl); cl.addWidget(sal_lbl)
         lay.addWidget(card)
 
+        # ── 연봉 협상 행 ──────────────────────────────
+        sal_row = QHBoxLayout(); sal_row.setSpacing(6)
+        sal_btn = QPushButton()
+        sal_row.addWidget(sal_btn); sal_row.addStretch()
+        lay.addLayout(sal_row)
+
+        # ── 기간 협상 행 (목표 콤보박스 + 버튼) ──────────
+        yrs_row = QHBoxLayout(); yrs_row.setSpacing(6)
+        yrs_combo = QComboBox()
+        for y in range(CONTRACT_YEARS_MIN, CONTRACT_YEARS_MAX + 1):
+            yrs_combo.addItem(f"{y}년", y)
+        yrs_combo.setCurrentIndex(state["target_yrs"] - CONTRACT_YEARS_MIN)
+        yrs_btn = QPushButton()
+        yrs_row.addWidget(QLabel("🎯 희망:")); yrs_row.addWidget(yrs_combo)
+        yrs_row.addWidget(yrs_btn); yrs_row.addStretch()
+        lay.addLayout(yrs_row)
+
         btn_row = QHBoxLayout(); btn_row.setSpacing(8)
-        btn_accept = QPushButton(f"✅ {offer_yrs}년 계약 수락"); btn_accept.setObjectName("dlgOk")
+        btn_accept = QPushButton(); btn_accept.setObjectName("dlgOk")
         btn_reject = QPushButton("❌ 거절 (소속 없음)"); btn_reject.setObjectName("dlgNo")
         btn_row.addWidget(btn_accept, 1); btn_row.addWidget(btn_reject, 1)
         lay.addLayout(btn_row)
 
+        def _refresh():
+            yrs_lbl.setText(f"<span style='color:#bbb'>제시 조건</span>  "
+                             f"<b style='color:#ffcc33'>{state['yrs']}년 계약</b>")
+            sal_lbl.setText(f"<span style='color:#bbb'>제시 연봉</span>  "
+                             f"<b style='color:#00cc66'>{fmt_money(state['sal'])} / 년</b>")
+
+            if state["sal_failed"]:
+                sal_btn.setText("❌ 연봉 협상 결렬"); sal_btn.setEnabled(False)
+            else:
+                sal_btn.setText(f"💬 연봉 협상 ({state['sal_used']}회)")
+                sal_btn.setEnabled(state["sal_used"] > 0)
+
+            yrs_combo.setEnabled(not state["yrs_failed"])
+            if state["yrs_failed"]:
+                yrs_btn.setText("❌ 기간 협상 결렬"); yrs_btn.setEnabled(False)
+            elif state["yrs"] == state["target_yrs"]:
+                yrs_btn.setText("✅ 기간 합의 완료"); yrs_btn.setEnabled(False)
+            else:
+                yrs_btn.setText(f"📋 기간 협상 ({state['yrs_used']}회)")
+                yrs_btn.setEnabled(state["yrs_used"] > 0)
+
+            dead = state["sal_failed"] or state["yrs_failed"]
+            btn_accept.setText(f"✅ {state['yrs']}년 계약 수락")
+            btn_accept.setEnabled(not dead)
+
+        def _on_target_changed(_):
+            state["target_yrs"] = yrs_combo.currentData()
+            _refresh()
+
+        def _negotiate_sal():
+            if state["sal_used"] <= 0 or state["sal_failed"]:
+                return
+            state["sal_used"] -= 1
+            old_sal = state["sal"]
+            delta = random.randint(10, 30)
+            if random.random() < 0.55:
+                state["sal"] = int(old_sal * (1 + delta/100))
+                show_toast(self, f"✅ +{delta}%  {fmt_money(old_sal)} → {fmt_money(state['sal'])}",
+                          "#006622", 1400)
+            else:
+                if state["sal_used"] == 0:
+                    state["sal_failed"] = True
+                    show_toast(self, "❌ 연봉 협상 결렬", "#cc0000", 1400)
+                else:
+                    show_toast(self, f"협상 실패  남은 기회: {state['sal_used']}회", "#cc4400", 1200)
+            _refresh()
+
+        def _negotiate_yrs():
+            if state["yrs_used"] <= 0 or state["yrs_failed"]:
+                return
+            state["yrs_used"] -= 1
+            old_yrs = state["yrs"]
+            target  = state["target_yrs"]
+            delta   = _contract_years_neg_delta(team_tier)
+            success = random.random() < CONTRACT_YEARS_NEG_SUCCESS_PROB
+            if success and old_yrs != target:
+                direction = 1 if target > old_yrs else -1
+                step = min(delta, abs(target - old_yrs))
+                new_yrs = old_yrs + direction * step
+                new_yrs = max(CONTRACT_YEARS_MIN, min(CONTRACT_YEARS_MAX, new_yrs))
+                state["yrs"] = new_yrs
+                show_toast(self, f"✅ 기간 협상 성공  {old_yrs}년 → {new_yrs}년", "#006622", 1400)
+            else:
+                if state["yrs_used"] == 0:
+                    state["yrs_failed"] = True
+                    show_toast(self, "❌ 기간 협상 결렬", "#cc0000", 1400)
+                else:
+                    show_toast(self, f"기간 협상 실패  남은 기회: {state['yrs_used']}회",
+                              "#cc4400", 1200)
+            _refresh()
+
         def _accept():
-            yrs = offer_yrs   # 팀이 정한 기간 (선택 불가)
+            yrs = state["yrs"]
+            offer_sal = state["sal"]
             st  = get_state()
             # 만료 연도 = 입단 로직과 동일 규칙.
             #  - 재계약 팝업은 만료 다음 해 프리시즌(1~3주)에 뜨므로 올해가 1년차 → -1 보정
@@ -1896,6 +2007,9 @@ class CenterPanel(QWidget):
 
         def _reject():
             from game_engine import update_player as upd, _save_career_entry, get_player
+            # [2026-08 신설] 협상 결렬로 거절한 것도 팀 오퍼 냉각기 대상.
+            if state["sal_failed"] or state["yrs_failed"]:
+                _record_team_offer_cooldown(team_id)
             p3 = get_player()
             st  = get_state()
             if p3:
@@ -1910,8 +2024,12 @@ class CenterPanel(QWidget):
             dlg.reject()
             if self.main_win: self.main_win.refresh_all()
 
+        sal_btn.clicked.connect(_negotiate_sal)
+        yrs_btn.clicked.connect(_negotiate_yrs)
+        yrs_combo.currentIndexChanged.connect(_on_target_changed)
         btn_accept.clicked.connect(_accept)
         btn_reject.clicked.connect(_reject)
+        _refresh()
         dlg.exec()
 
     def _show_forced_commit(self, forced):
@@ -2236,7 +2354,12 @@ class CenterPanel(QWidget):
 
     def _on_join_done(self, dlg):
         if dlg.chosen:
-            join_team(dlg.chosen["team_id"], dlg.chosen["salary"], transfer_type="입단")
+            # [2026-08 수정, 신민용 확정] offer=dlg.chosen을 넘겨야
+            # join_team이 기간 협상 결과(contract_years)를 실제 계약에
+            # 반영한다 — transfer_type="입단"이라 이적료 승인 게이트
+            # (transfer_type=="오퍼" 전용)는 여전히 안 걸린다.
+            join_team(dlg.chosen["team_id"], dlg.chosen["salary"],
+                      transfer_type="입단", offer=dlg.chosen)
             if self.main_win: self.main_win.refresh_all()
 
     def _show_auto_offer(self, week: int):

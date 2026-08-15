@@ -395,7 +395,7 @@ class ScheduleWindow(QDialog):
         _sw_marks.append(("챔피언스리그", _time_sw.perf_counter()))
 
         # 유로파리그 탭 (2026-08 신설)
-        import europa_engine
+        from competition import europa_engine
         el_w = self._make_champions_tab("groups", engine=europa_engine,
                                          comp_title="유로파리그", header_color="#F28C28")
         if el_w:
@@ -406,7 +406,7 @@ class ScheduleWindow(QDialog):
             self._tab.addTab(el_ko, "🥈 유로파리그(본선)")
 
         # 컨퍼런스리그 탭 (2026-08 신설)
-        import conference_engine
+        from competition import conference_engine
         ecl_w = self._make_champions_tab("groups", engine=conference_engine,
                                           comp_title="컨퍼런스리그", header_color="#20A464")
         if ecl_w:
@@ -1081,7 +1081,7 @@ class ScheduleWindow(QDialog):
         챔스 그대로 동작(하위 호환)."""
         if engine is None:
             try:
-                import champions_engine as engine
+                from competition import champions_engine as engine
             except ImportError:
                 return None
         from game_engine import get_state, get_player
@@ -1127,7 +1127,7 @@ class ScheduleWindow(QDialog):
         lay.setSpacing(10)
 
         cont = team_info["continent"]
-        from champions_engine import CONTINENT_MAP
+        from competition.champions_engine import CONTINENT_MAP
         cl_cont = CONTINENT_MAP.get(cont, cont)
         _name_map = getattr(engine, "CL_CUP_NAME", None) or \
                     getattr(engine, "EL_CUP_NAME", None) or \
@@ -1355,7 +1355,7 @@ class ScheduleWindow(QDialog):
         모드와 같은 2단 분할 레이아웃(좌: 조별 순위표 / 우: 조별 일정,
         _build_grouped_fixture_column 재사용)으로 통일한다. 토너먼트 단계는
         여전히 _make_cwc_bracket_tab에서 따로 그린다."""
-        import club_world_cup_engine as cwe
+        from competition import club_world_cup_engine as cwe
         from game_engine import get_state, get_player
         from PyQt6.QtWidgets import QScrollArea
 
@@ -1500,7 +1500,7 @@ class ScheduleWindow(QDialog):
     def _make_cwc_bracket_tab(self):
         """[2026-07 신설, 신민용 확정: "클럽월드컵도 기본탭/본선으로 나눠야"]
         16강~결승/3·4위전을 챔스·컵대회와 같은 토너먼트 대진표로 보여준다."""
-        import club_world_cup_engine as cwe
+        from competition import club_world_cup_engine as cwe
         from game_engine import get_state, get_player
 
         st = get_state()
@@ -1654,7 +1654,7 @@ class ScheduleWindow(QDialog):
         (초반 라운드는 팀이 많아 수십 줄) 다 우겨넣고 내 경기만 보라색으로
         구분했는데, 리그 일정 탭처럼 '내 경기'/'전체 일정'으로 아예 탭을
         나눈다 — my_view=True면 내가 낀 경기만 필터링해서 보여준다."""
-        import cup_engine
+        from competition import cup_engine
         from game_engine import get_state, get_player, day_to_full_date_str
 
         st = get_state()
@@ -1705,15 +1705,22 @@ class ScheduleWindow(QDialog):
             "QHeaderView::section{background:#252525;color:#888;border:none;padding:4px;}")
 
         conn = get_conn()
+        # [2026-08 최적화, 신민용 요청] 경기 행마다 cup_entries를 2번씩(홈/원정)
+        # 개별 조회하던 N+1 쿼리를, 대회 참가팀 전체를 1회 조회해 team_id→
+        # (team_name,tier) 딕셔너리로 캐싱하는 방식으로 바꿨다. 순수 UI
+        # 렌더링(화면 표시용 문자열 조립)이라 RNG나 시뮬레이션 결과와는
+        # 전혀 무관해 순서를 신경 쓸 필요가 없다.
+        entry_map = {
+            er["team_id"]: (er["team_name"], er["tier"])
+            for er in conn.execute(
+                "SELECT team_id, team_name, tier FROM cup_entries WHERE tournament_id=?",
+                (t["id"],)).fetchall()
+        }
         for i, r in enumerate(rows):
-            he = conn.execute(
-                "SELECT team_name, tier FROM cup_entries WHERE tournament_id=? AND team_id=?",
-                (t["id"], r["home_team_id"])).fetchone()
-            ae = conn.execute(
-                "SELECT team_name, tier FROM cup_entries WHERE tournament_id=? AND team_id=?",
-                (t["id"], r["away_team_id"])).fetchone()
-            hn = f"{he['team_name']} ({he['tier']}부)" if he else "?"
-            an = f"{ae['team_name']} ({ae['tier']}부)" if ae else "?"
+            he = entry_map.get(r["home_team_id"])
+            ae = entry_map.get(r["away_team_id"])
+            hn = f"{he[0]} ({he[1]}부)" if he else "?"
+            an = f"{ae[0]} ({ae[1]}부)" if ae else "?"
             played = r["home_score"] != -1
             score = f"{r['home_score']}-{r['away_score']}" if played else "예정"
             if played and r["pso_winner"]:
@@ -1758,7 +1765,7 @@ class ScheduleWindow(QDialog):
         전체 라운드를 브래킷 하나에 다 우겨넣으면 화면이 지저분해진다는
         지적을 받아, 이 탭은 대진이 안정된 이후인 '8강부터'만(=본선)
         그린다. 그 이전 라운드는 기존 '🎖️ 컵대회' 표 탭에서 계속 볼 수 있다."""
-        import cup_engine
+        from competition import cup_engine
         from game_engine import get_state, get_player
 
         st = get_state()

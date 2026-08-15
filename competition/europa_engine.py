@@ -13,9 +13,9 @@ champions_engine.py와 구조가 거의 동일하지만, 참가팀 자체가 다
 검증 완료된 공용 엔진).
 """
 from database import get_conn
-import champions_engine as _cl
-from competition_common import CompetitionConfig
-import continental_qualification as _cq
+from competition import champions_engine as _cl
+from competition.competition_common import CompetitionConfig
+from competition import continental_qualification as _cq
 
 EL_START_WEEK = _cl.CL_START_WEEK          # 챔스와 같은 주차에 동시 개막
 EL_LEAGUE_WEEKS = _cl.CL_LEAGUE_WEEKS
@@ -72,39 +72,39 @@ def _el_playoff_pool(continent):
 # ─────────────────────────────────────────────
 
 def get_el_tournament(year, continent):
-    from competition_common import get_tournament
+    from competition.competition_common import get_tournament
     return get_tournament(EUROPA_CFG, year, continent)
 
 
 def _my_el_tournament(p, year):
-    from competition_common import my_tournament
+    from competition.competition_common import my_tournament
     return my_tournament(EUROPA_CFG, p, year)
 
 
 def get_my_el_match(week, day=None, p=None, st=None):
     """[2026-08 리팩터링] competition_common.get_my_match로 이동
     (완전 동일 로직) — 위임만."""
-    from competition_common import get_my_match
+    from competition.competition_common import get_my_match
     return get_my_match(EUROPA_CFG, week, day=day, p=p, st=st)
 
 
 def has_my_el_match_between(week_from, week_to):
-    from competition_common import has_my_match_between
+    from competition.competition_common import has_my_match_between
     return has_my_match_between(EUROPA_CFG, week_from, week_to)
 
 
 def sim_my_el_match_as_ai(week, p, reason="injury", day=None):
-    from competition_common import sim_my_match_as_ai
+    from competition.competition_common import sim_my_match_as_ai
     sim_my_match_as_ai(EUROPA_CFG, week, p, get_my_el_match, reason=reason, day=day)
 
 
 def simulate_my_el_match(week, p, day=None):
-    from competition_common import simulate_my_match
+    from competition.competition_common import simulate_my_match
     simulate_my_match(EUROPA_CFG, week, p, get_my_el_match, day=day)
 
 
 def get_my_el_league_standings(year):
-    from competition_common import get_my_league_standings
+    from competition.competition_common import get_my_league_standings
     from game_engine import get_player
     p = get_player()
     cont = _cl._my_continent(p) if p else None
@@ -114,12 +114,12 @@ def get_my_el_league_standings(year):
 
 
 def get_my_europa_matches(year):
-    from competition_common import get_my_matches_for_schedule
+    from competition.competition_common import get_my_matches_for_schedule
     return get_my_matches_for_schedule(EUROPA_CFG, year)
 
 
 def get_my_el_matches():
-    from competition_common import get_my_matches
+    from competition.competition_common import get_my_matches
     return get_my_matches(EUROPA_CFG)
 
 
@@ -132,7 +132,7 @@ def build_from_qualification(year, continent, entries, my_tid):
     """entries: continental_qualification.allocate_continental_slots()의
     alloc["europa"] 중 이 대륙 몫(이미 team_id/team_name/flag/country/grade/
     ovr 다 갖춘 상태)."""
-    from competition_common import build_tournament
+    from competition.competition_common import build_tournament
     build_tournament(EUROPA_CFG, year, continent, entries, my_tid,
                       team_cap=_el_team_cap(continent), games=_el_league_games(continent))
 
@@ -142,30 +142,30 @@ def build_from_qualification(year, continent, entries, my_tid):
 # ─────────────────────────────────────────────
 
 def _finalize_league_phase(t):
-    from competition_common import finalize_league_phase
+    from competition.competition_common import finalize_league_phase
     cont = t["continent"]
     finalize_league_phase(EUROPA_CFG, t, _el_direct_cut(cont), _el_playoff_pool(cont),
                            EL_PLAYOFF_WEEK, _start_knockout)
 
 
 def _finalize_playoff(t):
-    from competition_common import finalize_playoff
+    from competition.competition_common import finalize_playoff
     finalize_playoff(EUROPA_CFG, t, _start_knockout)
 
 
 def _start_knockout(t, qualifier_ids, direct_ids=None, winner_ids=None):
-    from competition_common import start_knockout
+    from competition.competition_common import start_knockout
     start_knockout(EUROPA_CFG, t, qualifier_ids, EL_ROUND_WEEKS,
                    direct_ids=direct_ids, winner_ids=winner_ids)
 
 
 def _advance_round(t, cur_stage, next_stage):
-    from competition_common import advance_round
+    from competition.competition_common import advance_round
     advance_round(EUROPA_CFG, t, cur_stage, next_stage, EL_ROUND_WEEKS)
 
 
 def _finish_tournament(t):
-    from competition_common import finish_tournament
+    from competition.competition_common import finish_tournament
     # [2026-08 신설] 시상(득점왕 등)은 아직 안 옮겼다(챔스 쪽도 마찬가지로
     # award_fn=None이면 시상 단계만 건너뜀) — 1차는 대진/결과/우승팀부터.
     finish_tournament(EUROPA_CFG, t, award_fn=None)
@@ -174,7 +174,7 @@ def _finish_tournament(t):
 def process_el_week(week):
     """CL_START_WEEK부터 매주 호출 — 4개 대륙 유로파 전부 처리."""
     from game_engine import get_state
-    from competition_common import process_one
+    from competition.competition_common import process_one
     st = get_state()
     if not st:
         return

@@ -1589,8 +1589,14 @@ class WorldBrowserWindow(QDialog):
         합치지 않고 파랑(챔스)/주황(유로파)/초록(컨퍼런스) 숫자를 한 칸 씩
         띄워서 따로 보여준다, 0회인 대회는 생략"] '수상' 요약 행의 클럽
         대항전 칸 전용 — 셀 하나에 색이 다른 숫자를 최대 3개까지 나란히
-        배치한다. 전부 0이면 완전히 빈 칸."""
+        배치한다. 전부 0이면 완전히 빈 칸.
+        [2026-08 버그수정, 신민용 리포트: "클럽 대항전 칸만 비어 보인다"]
+        setCellWidget으로 넣는 QWidget은 옆 칸들(QTableWidgetItem +
+        setBackground("#2a2a2a"))과 달리 배경을 안 넣으면 기본 배경(투명/
+        회색)이 그대로 드러나서, 값이 있든 없든 그 칸만 튀어 보였다.
+        같은 배경색을 명시해서 통일한다."""
         w = QWidget()
+        w.setStyleSheet("background:#2a2a2a;")
         lay = QHBoxLayout(w)
         lay.setContentsMargins(6, 4, 6, 4)
         lay.setSpacing(8)
@@ -2928,7 +2934,7 @@ class TournamentDetailDialog(QDialog):
 
         direct_cut = playoff_cut = None
         if continent:
-            from champions_engine import CL_DIRECT_CUT_BY_CONTINENT, CL_PLAYOFF_POOL_BY_CONTINENT
+            from competition.champions_engine import CL_DIRECT_CUT_BY_CONTINENT, CL_PLAYOFF_POOL_BY_CONTINENT
             direct_cut = CL_DIRECT_CUT_BY_CONTINENT.get(continent)
             playoff_pool = CL_PLAYOFF_POOL_BY_CONTINENT.get(continent)
             # [2026-07 버그수정, 신민용 리포트] playoff_cut은 direct_cut+playoff_pool이어야 하는데

@@ -31,7 +31,7 @@
 from database import get_conn
 from constants import get_country_league_grade
 
-import champions_engine as _cl
+from competition import champions_engine as _cl
 
 
 # ── 유로파/컨퍼런스 슬롯표 ──────────────────────────────────────
@@ -51,7 +51,7 @@ def _europa_slots_from_rank(continent: str, rank_idx: int) -> int:
     # [TENTATIVE] 아시아/아프리카/북남미 — 확정 수치 받기 전까지 유럽과
     # 동일한 비율(상위 1/6은 2장, 다음 1/3은 1장)로 그 대륙 실제 국가 수에
     # 맞춰 스케일링. 확정되면 이 분기를 유럽처럼 명시적 숫자로 교체할 것.
-    from champions_engine import CONTINENT_MAP
+    from competition.champions_engine import CONTINENT_MAP
     n_countries = _n_countries_in_continent(continent)
     two_cut = max(1, round(n_countries * 9 / 54))
     one_cut = max(two_cut + 1, round(n_countries * 27 / 54))
@@ -86,7 +86,7 @@ QUALIFICATION_TEAM_CAP = {"유럽": 36, "북남미": 48, "아시아": 36, "아�
 
 
 def _n_countries_in_continent(continent: str) -> int:
-    from champions_engine import CONTINENT_MAP
+    from competition.champions_engine import CONTINENT_MAP
     game_conts = [gc for gc, ck in CONTINENT_MAP.items() if ck == continent]
     conn = get_conn()
     ph = ",".join("?" * len(game_conts))
@@ -103,7 +103,7 @@ def _ranked_countries(continent: str, year: int):
     클럽 리그 등급)으로 순위를 매겨 반환한다.
     반환: [{"country":..., "grade":..., "lid":..., "flag":...}, ...] (1위부터)
     """
-    from champions_engine import CONTINENT_MAP, CL_COEFF_MIN_COUNTRIES
+    from competition.champions_engine import CONTINENT_MAP, CL_COEFF_MIN_COUNTRIES
     game_conts = [gc for gc, ck in CONTINENT_MAP.items() if ck == continent]
     conn = get_conn()
     ph = ",".join("?" * len(game_conts))
@@ -199,9 +199,9 @@ def start_all_continental_competitions(year, season):
     유로파·컨퍼런스는 참가팀 자체가 챔스보다 훨씬 넓어서(27개국/23개국 vs
     보통 10여개국) 매 시즌 정상적으로 열린다."""
     from game_engine import add_log, get_player
-    import champions_engine as _cl_mod
-    import europa_engine
-    import conference_engine
+    from competition import champions_engine as _cl_mod
+    from competition import europa_engine
+    from competition import conference_engine
     p = get_player()
     if not p:
         return
@@ -212,7 +212,7 @@ def start_all_continental_competitions(year, season):
         return  # 이미 이번 연도 생성됨(챔스 기준으로 중복 방지 판단 — 셋 다 항상 같이 생성되므로)
 
     _cl_mod._clear_entry_cache()
-    from competition_common import clear_entry_cache
+    from competition.competition_common import clear_entry_cache
     clear_entry_cache()
 
     my_cont = _cl_mod._my_continent(p)

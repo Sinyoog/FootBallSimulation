@@ -4,12 +4,12 @@ import math
 import json
 import sqlite3
 import intl_engine
-import champions_engine
-import europa_engine
-import conference_engine
-import continental_qualification
-import cup_engine
-import club_world_cup_engine
+from competition import champions_engine
+from competition import europa_engine
+from competition import conference_engine
+from competition import continental_qualification
+from competition import cup_engine
+from competition import club_world_cup_engine
 import promotion_playoff_engine
 from match_sim import match_flow
 from match_sim import tactical_engine
@@ -747,6 +747,13 @@ def create_player(name: str, position: str, sub_role: str,
 
     # [전성기 OVR] 시작 OVR로 초기화 (이후 update_player가 자동으로 최고치 갱신).
     conn.execute("UPDATE my_player SET peak_ovr=? WHERE id=1", (ovr,))
+
+    # [2026-08 신설, 신민용 확정] 훈련 gain 진행률(%) 감속 커브의 기준선
+    # 스냅샷 — 방금 굴린 시작 스탯값을 그대로 stat_start에 박아두고
+    # 이후 커리어 내내 바뀌지 않는다(_progress_soft가 이 값을 기준으로
+    # "시작→한계 전체 구간 중 몇 % 왔는지"를 계산).
+    conn.execute("UPDATE my_player SET stat_start=? WHERE id=1",
+                 (json.dumps({s: stat_vals[s] for s in ALL_STATS}),))
 
     # [국적 연혁] 출생 시점 보유 국적을 birth 이벤트로 기록(시작국적 + 복수국적).
     #   첫 항목이 '시작국적'이 되도록 1차 국적을 맨 앞에 둔다.
@@ -2056,8 +2063,64 @@ def effective_training_stress(p, ttype):
     return stress_chg
 
 
+def _get_stat_start_map(p):
+    """[2026-08 신설] my_player.stat_start(JSON 문자열)를 dict로 파싱.
+    없거나 깨졌으면(구버전 세이브 등) 빈 dict를 반환 — 호출부가
+    _ensure_stat_start로 채워 넣는다."""
+    raw = p.get("stat_start") or ""
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+
+
+def _ensure_stat_start(p, stat_list):
+    """[2026-08 신설, 신민용 확정] stat_start에 아직 없는 스탯이 있으면
+    (이 기능 추가 이전 세이브 등) 현재값을 그 스탯의 '시작값'으로
+    1회 채워 넣는다 — 한 번 채워지면 그 값은 커리어 내내 절대 안 바뀐다.
+    새로 만든 선수는 create_player에서 이미 전부 채워져 있어 여기선
+    보통 아무 일도 안 한다(구버전 세이브 마이그레이션 안전장치)."""
+    starts = _get_stat_start_map(p)
+    changed = False
+    for s in stat_list:
+        if s not in starts:
+            starts[s] = p.get(s, 40)
+            changed = True
+    if changed:
+        p["stat_start"] = json.dumps(starts)
+        update_player(stat_start=p["stat_start"])
+    return starts
+
+
+def _progress_soft(cur, start, mx):
+    """[2026-08 신설, 신민용 확정] 훈련 gain(및 휴식 감소폭)을 '한계까지
+    남은 절대 포인트'가 아니라 '시작값→한계값 전체 구간 중 진행률(%)'로
+    감속하는 배율(0~1). 진행률이 PROGRESS_SOFTCAP_BREAK_PCT를 넘기 전까진
+    풀스피드(1.0), 그 이후로는 지수 커브로 PROGRESS_SOFTCAP_FLOOR까지
+    떨어진다(막판일수록 급격히 느려짐). FLOOR가 있어 한계 바로 앞에서도
+    진행이 완전히 0이 되진 않는다 — '진짜' 한계 돌파(_max 자체를 올리는
+    것)는 이 함수와 무관하게 HIGH_BREAK_PROB/FOCUS_BREAK_PROB가 cur==mx
+    시점부터 별도로 담당한다.
+    고강도/중강도/저강도/강점훈련/약점훈련의 gain 감속과 휴식의 감소폭
+    감속까지 전부 이 함수 하나로 통일해서 쓴다."""
+    total = mx - start
+    if total <= 0:
+        return 1.0
+    progress = max(0.0, min(1.0, (cur - start) / total))
+    if progress <= PROGRESS_SOFTCAP_BREAK_PCT:
+        return 1.0
+    t = (progress - PROGRESS_SOFTCAP_BREAK_PCT) / (1.0 - PROGRESS_SOFTCAP_BREAK_PCT)
+    return 1.0 - (1.0 - PROGRESS_SOFTCAP_FLOOR) * (t ** PROGRESS_SOFTCAP_POWER)
+
+
 def _process_training(p, week, ttype, focus_stat=None, day=None):
     cfg  = TRAINING_CONFIG[ttype]
+    # [2026-08 신설] 진행률(%) 감속 커브의 기준선 — 이번 훈련에서 건드릴
+    # 스탯뿐 아니라 ALL_STATS 전체를 한 번에 보장해둔다(휴식이 고르는
+    # 스탯은 targets와 무관하므로 미리 다 채워둬야 함).
+    _stat_starts = _ensure_stat_start(p, ALL_STATS)
     pers = p.get("personality","성실함")
     pe   = PERSONALITY_EFFECTS.get(pers, {})
     eff  = pe.get("train_eff", 1.0)
@@ -2115,9 +2178,16 @@ def _process_training(p, week, ttype, focus_stat=None, day=None):
         _REST_PENALTY_MULT = 0.5
         _n_dec = random.choices([1, 2], weights=[60, 40])[0]
         for stat in random.sample(_rest_below, min(_n_dec, len(_rest_below))):
-            dec = round(random.uniform(_lo_cfg["gain_min"], _lo_cfg["gain_max"])
-                        * _REST_PENALTY_MULT, 1)
             cur = p.get(stat, 40)
+            # [2026-08 신설, 신민용 확정] 휴식 감소폭도 훈련 gain과 같은
+            # 진행률(%) 커브로 스케일링한다 — 한계에 가까운(원숙한) 스탯일수록
+            # 휴식으로 덜 깎이고, 아직 한계와 먼(성장기) 스탯은 원래 크기
+            # 그대로 깎인다.
+            _mx = p.get(f"{stat}_max", 80)
+            _start = _stat_starts.get(stat, p.get(stat, 40))
+            _rest_soft = _progress_soft(cur, _start, _mx)
+            dec = round(random.uniform(_lo_cfg["gain_min"], _lo_cfg["gain_max"])
+                        * _REST_PENALTY_MULT * _rest_soft, 1)
             new_val = round(max(20, cur - dec), 1)
             if new_val != cur:
                 stat_changes[stat] = round(new_val - cur, 1)
@@ -2357,9 +2427,11 @@ def _process_training(p, week, ttype, focus_stat=None, day=None):
                 #   한계 '마지막 몇 포인트'에서만 살짝 둔화시켜(soft) 천장에 닿는
                 #   순간을 늦춘다. 그 외 구간은 거의 풀스피드(돌파 트랙).
                 if cur < mx:
-                    # _max 미달: 풀스피드로 _max까지 채운다(마지막 12점만 둔화).
-                    headroom = max(0, mx - cur)
-                    soft = 1.0 if headroom >= 12 else max(0.5, headroom / 12.0)
+                    # [2026-08 재설계, 신민용 확정] '한계까지 남은 절대 포인트'
+                    # 대신 '시작값→한계값 진행률(%)'로 감속 — 스탯 구간 폭이
+                    # 달라도 일관된 커브가 나온다(_progress_soft 참고).
+                    _start = _stat_starts.get(stat, p.get(stat, 40))
+                    soft = _progress_soft(cur, _start, mx)
                     raw = random.uniform(g_min, g_max) * eff * soft
                     gain = round(raw, 1)  # [2026-07] 0.1 단위로 매번 눈에 보이게 누적(예전 확률적 1/0 방식 폐지)
                     new_val = round(min(mx, cur + gain), 1)  # 부동소수 오차 누적 방지
@@ -2379,11 +2451,12 @@ def _process_training(p, week, ttype, focus_stat=None, day=None):
                 #  - max 도달: 고강도와 달리 '가끔만'(FOCUS_BREAK_PROB) max를 1 끌어올려
                 #              talent_cap까지 점진 돌파. 풀로 채운 뒤에도 천천히 cap을 향함.
                 if cur < mx:
-                    # [막판 보정] _max까지 10 이하로 남으면 상승폭 ×2 (고강도 제외 공통).
-                    headroom = max(0, mx - cur)
-                    soft = min(1.0, max(0.45, headroom / (SOFTCAP_DENOM * 2)))
-                    final_mult = 2.0 if headroom <= 10 else 1.0
-                    raw = random.uniform(g_min, g_max) * eff * soft * final_mult
+                    # [2026-08 재설계, 신민용 확정] 고강도와 동일한 진행률(%)
+                    # 커브로 통일 — 더 이상 절대 포인트(SOFTCAP_DENOM)나
+                    # 막판 ×2 보정을 따로 두지 않는다.
+                    _start = _stat_starts.get(stat, p.get(stat, 40))
+                    soft = _progress_soft(cur, _start, mx)
+                    raw = random.uniform(g_min, g_max) * eff * soft
                     gain = round(raw, 1)  # [2026-07] 0.1 단위로 매번 눈에 보이게 누적(예전 확률적 1/0 방식 폐지)
                     new_val = round(min(mx, cur + gain), 1)  # 부동소수 오차 누적 방지
                 else:
@@ -2405,14 +2478,12 @@ def _process_training(p, week, ttype, focus_stat=None, day=None):
                     else:
                         new_val = cur
             else:
-                # 일반훈련 트랙: max까지, 소프트캡으로 둔화.
-                #   [막판 보정] _max까지 10 이하로 남으면 상승폭을 ×2.
-                #   소프트캡 FLOOR 때문에 마지막 구간이 너무 느려, 고강도 없이는
-                #   초기 한계스탯조차 못 채우던 문제를 보정한다. (고강도는 별도 트랙)
-                headroom = max(0, mx - cur)
-                soft = min(1.0, max(SOFTCAP_FLOOR, headroom / SOFTCAP_DENOM))
-                final_mult = 2.0 if headroom <= 10 else 1.0
-                raw = random.uniform(g_min, g_max) * eff * soft * final_mult
+                # [2026-08 재설계, 신민용 확정] 일반훈련(중강도/저강도) 트랙도
+                # 고강도/집중훈련과 동일한 진행률(%) 커브로 통일. max를 못
+                # 넘는 트랙이라 여기선 돌파 분기가 없고 cur이 mx에 점근할 뿐.
+                _start = _stat_starts.get(stat, p.get(stat, 40))
+                soft = _progress_soft(cur, _start, mx)
+                raw = random.uniform(g_min, g_max) * eff * soft
                 gain = round(raw, 1)  # [2026-07] 0.1 단위로 매번 눈에 보이게 누적(예전 확률적 1/0 방식 폐지)
                 new_val = round(min(mx, cur + gain), 1)  # 부동소수 오차 누적 방지
             if new_val > cur:
@@ -5668,12 +5739,17 @@ def _advance_week(p, base_week, n_weeks=4):
     conn_adv.commit()
     conn_adv.close()
 
-    # 1주차: 새 시즌 시작 시 이전 연도 오퍼 거절 기록 삭제
+    # 1주차: 새 시즌 시작 시 완전히 만료된(냉각기 끝난) 오퍼 거절 기록 삭제
+    # [2026-08 수정, 신민용 확정] 예전엔 "year < 현재연도"(1년만 지나면
+    # 바로 삭제)였는데, 이제 냉각기 규칙이 "거절연도+2까지 차단"이라
+    # 그 기준(year+2 <= 현재연도)에 맞춰야 실제로 만료된 것만 지운다.
+    # (아직 냉각기가 안 끝난 기록을 여기서 지워버리면 그 팀이 바로 다음
+    # 해부터 다시 오퍼를 보낼 수 있게 되는 버그가 생긴다.)
     if new_week == 1:
         conn_cl = get_conn()
         st_yr = conn_cl.execute("SELECT current_year FROM season_state WHERE id=1").fetchone()
         if st_yr:
-            conn_cl.execute("DELETE FROM offer_refused WHERE year<?", (st_yr["current_year"],))
+            conn_cl.execute("DELETE FROM offer_refused WHERE year + 2 <= ?", (st_yr["current_year"],))
             conn_cl.commit()
         conn_cl.close()
 
@@ -5725,7 +5801,7 @@ def _advance_week(p, base_week, n_weeks=4):
     # 동시 시작 (매년). 출전팀 선발은 직전 시즌(이미 끝난 시즌)의 최종
     # 순위 기준 — continental_qualification이 대륙당 국가 순위 계산을
     # 1번만 하고 세 대회에 나눠준다(2026-08, 예전엔 챔스만 있었음).
-    from champions_engine import CL_START_WEEK
+    from competition.champions_engine import CL_START_WEEK
     if new_week == CL_START_WEEK:
         try:
             continental_qualification.start_all_continental_competitions(new_year, new_season)
@@ -9744,6 +9820,36 @@ def _last_played_country_id(p):
         conn.close()
 
 
+def _record_team_offer_cooldown(team_id):
+    """[2026-08 신설, 신민용 확정] 협상 결렬(입단/오퍼 공통)이 뜬 팀은
+    '연도' 기준으로 최소 1년~최대 2년 가까이 다시 오퍼를 못 보낸다.
+    몇 주차였는지는 안 따지고 오직 연도만 기록한다 — 그래서 2002년 25주든
+    50주든 상관없이 항상 "2004년 1주차부터 재오퍼 가능"이 된다(아래
+    _is_team_offer_blocked의 year+2 조건과 짝을 이룸).
+    (기존 offer_refused 테이블은 스키마만 있고 실제로 쓰는 코드가 없던
+    미완성 스캐폴드였다 — 이제부터 실제로 채워 넣는다.)"""
+    p = get_player()
+    if not p:
+        return
+    cur_year = p.get("current_year", 0)
+    conn = get_conn()
+    conn.execute("INSERT INTO offer_refused(team_id, year) VALUES(?,?)", (team_id, cur_year))
+    conn.commit()
+    conn.close()
+
+
+def _blocked_offer_team_ids(cur_year) -> set:
+    """[2026-08 신설] 아직 냉각기가 안 끝난(현재연도 < 거절연도+2) 팀 id
+    집합을 한 번에 조회 — generate_offers()가 팀마다 개별 조회하지 않고
+    이 결과를 배치로 필터링에 쓴다."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT DISTINCT team_id FROM offer_refused WHERE year + 2 > ?",
+        (cur_year,)).fetchall()
+    conn.close()
+    return {r["team_id"] for r in rows}
+
+
 def generate_offers(count=5, force=False) -> list:
     """[2026-07 재설계] count 파라미터는 더 이상 총 개수를 결정하지 않는다
     (하위호환을 위해 시그니처만 유지) — 실제 개수는 상황별로 아래 상수에
@@ -10378,6 +10484,15 @@ def generate_offers(count=5, force=False) -> list:
 
     conn.close()
 
+    # [2026-08 신설, 신민용 확정] 협상 결렬 냉각기가 안 끝난 팀은 이번
+    # 배치에서 제외한다. 다른 후보로 자리를 다시 채우진 않는다(그 팀 몫만큼
+    # 이번엔 오퍼가 하나 적게 뜰 수 있음 — 냉각기 있는 팀이 스킵된다는
+    # 자연스러운 결과라 별도 백필은 하지 않는다).
+    if offers:
+        _blocked = _blocked_offer_team_ids(p.get("current_year", 0))
+        if _blocked:
+            offers = [o for o in offers if o["team_id"] not in _blocked]
+
     # [기능3] 이적 요청 플래그 소비 (오퍼가 생성됐으면 리셋)
     if transfer_req and offers:
         update_player(transfer_requested=0)
@@ -10673,18 +10788,27 @@ def calc_apply_success_prob(team_id):
 
 def save_pending_offer_state(kind, title, force_select, grid, apply_slots,
                               offers, offer_salaries, neg_used, neg_failed,
-                              applied_count):
+                              applied_count, offer_years=None, years_used=None,
+                              years_failed=None, years_target=None):
     """[2026-07 신설, 신민용 요청] 오퍼/입단 창(OfferWindow) 상태를 통째로
     JSON으로 저장한다 — 결정을 내리기 전에 껐다 켜도 새로 랜덤 생성하지
     않고 이 값을 그대로 복원해서 같은 오퍼 목록을 다시 보여주기 위함
     (재접속으로 오퍼를 리롤하는 걸 막는 게 목적). kind는 "join"(무소속
-    강제 입단)/"auto_offer"(소속 있을 때 자동 오퍼) 중 하나."""
+    강제 입단)/"auto_offer"(소속 있을 때 자동 오퍼) 중 하나.
+    [2026-08 확장] offer_years/years_used/years_failed/years_target —
+    연봉 협상과 독립된 '기간 협상' 상태(years_target은 플레이어가 콤보
+    박스로 직접 고른 희망 계약기간). None이면(구버전 호출부 호환) 빈
+    값으로 저장한다."""
     state = {
         "kind": kind, "title": title, "force_select": bool(force_select),
         "grid": bool(grid), "apply_slots": apply_slots,
         "offers": offers, "offer_salaries": offer_salaries,
         "neg_used": {str(k): v for k, v in neg_used.items()},
         "neg_failed": list(neg_failed), "applied_count": applied_count,
+        "offer_years": offer_years or [],
+        "years_used": {str(k): v for k, v in (years_used or {}).items()},
+        "years_failed": list(years_failed or []),
+        "years_target": {str(k): v for k, v in (years_target or {}).items()},
     }
     try:
         update_player(pending_offer_state=json.dumps(state, ensure_ascii=False))
@@ -10779,6 +10903,12 @@ def _calc_contract_years(age: int, tier: int, country: str = None) -> int:
             if random.random() < 0.3:
                 base = min(5, base + 1)
     return base
+
+
+def _contract_years_neg_delta(tier: int) -> int:
+    """[2026-08 신설] 기간 협상 1회 성공 시 옮길 수 있는 연수 폭 — 구단
+    티어별로 다르다(CONTRACT_YEARS_NEG_DELTA_BY_TIER 참고)."""
+    return CONTRACT_YEARS_NEG_DELTA_BY_TIER.get(tier, CONTRACT_YEARS_NEG_DELTA_DEFAULT)
 
 
 def _offer_probability(p, week: int) -> float:
@@ -11919,7 +12049,15 @@ def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None
                 pass
 
     age_jt = p.get("age",17) if p else 17
-    c_yrs  = _calc_contract_years(age_jt, row["tier"], row["country"])
+    # [2026-08 수정, 신민용 확정] OfferWindow에서 '기간 협상'으로 이미
+    # 합의된 값이 있으면 그걸 그대로 쓴다 — 예전엔 여기서 무조건 다시
+    # _calc_contract_years를 굴려서, 화면에서 협상한 계약 기간이 실제
+    # 계약 체결 시점에는 통째로 무시되고 새로 랜덤 재추첨되는 버그가
+    # 있었다. offer에 없거나(구버전 호출부·직접지원 등) None이면 기존
+    # 처럼 그 자리에서 새로 굴린다(하위호환).
+    c_yrs = (offer.get("contract_years") if offer else None)
+    if c_yrs is None:
+        c_yrs = _calc_contract_years(age_jt, row["tier"], row["country"])
     # 계약 만료 연도 (만료는 해당 연도 52주차)
     #  - 시즌 초(프리시즌 1~3주) 계약: 올해가 1년차 → cur_year + c_yrs - 1
     #    예: 2008년 2주 1년계약 → 2008년 52주 만료

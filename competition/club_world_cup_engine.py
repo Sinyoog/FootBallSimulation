@@ -37,8 +37,8 @@ from constants import (
     INTL_GROUP_WEEKS, TOURNAMENT_SCHEDULE_RULES,
     stage_round_start_day, assign_match_days,
 )
-from champions_engine import _match_outcome, _resolve_pso
-from club_world_cup import get_club_world_cup_field, CWC_QUOTA
+from competition.champions_engine import _match_outcome, _resolve_pso
+from competition.club_world_cup import get_club_world_cup_field, CWC_QUOTA
 
 CWC_DRAW_WEEK = 43
 # [2026-07 재설계 v2, 신민용 요청: "클럽 월드컵도 월드컵처럼 45주차부터
@@ -620,14 +620,29 @@ def _award_cwc_awards(conn, tid, year, my_tid):
         "SELECT team_id, country FROM cwc_entries WHERE tournament_id=?", (tid,)).fetchall()
     ALL_POS = GK_POS + DF_POS + MF_POS + ATTACK_POS
     ph = ",".join("?" * len(ALL_POS))
+    # [2026-08 최적화, 신민용 요청] champions_engine._award_cl_awards와 동일한
+    # 이유로 팀별 개별 ai_players 조회(N+1)를 team_id IN (...) 배치 조회
+    # 1회로 합쳤다.
+    # ⚠ 주의: _estimate_ai_season/_estimate_ai_clean_sheets가 내부에서
+    # random.uniform()으로 RNG를 소비하므로 선수 순회 순서가 원본과 같아야
+    # 한다. 팀 순회는 여전히 entries 원본 순서를 따르고, 팀 내부 선수 순서는
+    # id(rowid) 오름차순으로 명시 정렬해 기존 "WHERE team_id=?" 단건 쿼리의
+    # 암묵적 rowid 순서와 동일하게 맞췄다.
+    other_team_ids = [e["team_id"] for e in entries if e["team_id"] != my_tid]
+    players_by_team = {}
+    if other_team_ids:
+        tph = ",".join("?" * len(other_team_ids))
+        rows = conn.execute(
+            f"""SELECT team_id, ovr, position, sub_role, age FROM ai_players
+                WHERE team_id IN ({tph}) AND position IN ({ph})
+                ORDER BY team_id, id""",
+            (*other_team_ids, *ALL_POS)).fetchall()
+        for r in rows:
+            players_by_team.setdefault(r["team_id"], []).append(r)
     for e in entries:
         if e["team_id"] == my_tid:
             continue
-        rows = conn.execute(
-            f"""SELECT ovr, position, sub_role, age FROM ai_players
-                WHERE team_id=? AND position IN ({ph})""",
-            (e["team_id"], *ALL_POS)).fetchall()
-        for r in rows:
+        for r in players_by_team.get(e["team_id"], []):
             g, a, rt = _estimate_ai_season(r["ovr"], r["position"], 80, 80, r["sub_role"],
                                            full_season_matches=n_games)
             cs = _estimate_ai_clean_sheets(r["position"], r["ovr"], 80, 80, n_games) if r["position"] in GK_POS else 0

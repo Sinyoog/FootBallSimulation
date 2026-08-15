@@ -193,9 +193,13 @@ class RetireWindow(QDialog):
         (이 창은 열려있는 동안 커리어 데이터가 바뀌지 않으므로 캐시가
         stale해질 걱정은 없다.)"""
         if getattr(self, "_career_match_cache", None) is None:
-            import intl_engine, champions_engine, cup_engine
-            import club_world_cup_engine, promotion_playoff_engine
-            import europa_engine, conference_engine
+            from competition import champions_engine
+            from competition import cup_engine
+            import intl_engine
+            from competition import club_world_cup_engine
+            import promotion_playoff_engine
+            from competition import europa_engine
+            from competition import conference_engine
             self._career_match_cache = {
                 "intl_ms": intl_engine.get_my_intl_matches(),
                 "qual_ms": intl_engine.get_my_qual_matches(),
