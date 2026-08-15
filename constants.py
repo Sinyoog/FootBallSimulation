@@ -464,6 +464,15 @@ INTL_TOURNAMENT_KIND_LABELS = {
     # 표시/필터링에서는 name으로 구분한 "유효 종류"(world_browser._effective_kind)
     # 로 이 라벨을 따로 쓴다 — DB의 실제 kind 값은 아님, 표시 전용.
     "euro":      "⚡ 유로",
+    # [2026-08 신설, 신민용 리포트: "유로(EURO) 예선인데 종류가 대륙컵
+    # 예선으로 뜬다"] cont_qual은 유럽 전용으로만 생성되는 대회라서(다른
+    # 대륙은 아직 이 경로를 안 탐 — intl_engine._create_qual_tournament
+    # 참고) 항상 유로 예선이다. world_browser._effective_kind가 cont_qual을
+    # 이 "euro_qual" 유효 종류로 매핑해서 여기 라벨을 쓰게 한다 — 위의
+    # "cont_qual" 원본 라벨은 그대로 두되(다른 코드가 kind 원문 그대로
+    # 참조할 수 있으므로 하위 호환용으로 유지), 실제 화면은 effective_kind
+    # 우선이라 이 라벨이 보인다.
+    "euro_qual": "🎫 유로 예선",
 }
 INTL_TOURNAMENT_KIND_GLYPHS = {
     "world":     "🌐",
@@ -472,6 +481,7 @@ INTL_TOURNAMENT_KIND_GLYPHS = {
     "region":    "🌏",
     "cont_qual": "🎫",
     "euro":      "⚡",
+    "euro_qual": "🎫",
 }
 INTL_TOURNAMENT_KIND_FALLBACK_LABEL = "🏆"
 

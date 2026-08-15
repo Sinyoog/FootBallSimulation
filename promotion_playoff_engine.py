@@ -204,7 +204,7 @@ def _finalize_boundary_match(conn, t, m, year: int) -> None:
         _wt = winner_prev_tier["tier"] if winner_prev_tier else lower_tier
         _log_inserts.append((year, winner_name, _wt, upper_tier,
                               lower_lname["name"] if lower_lname else "",
-                              winner_prev_lid, upper_lid))
+                              winner_prev_lid, upper_lid, winner))
     if loser_prev_lid != lower_lid:
         # upper 소속이었는데 져서 lower로 강등
         loser_prev_tier = conn.execute(
@@ -212,11 +212,11 @@ def _finalize_boundary_match(conn, t, m, year: int) -> None:
         _lt = loser_prev_tier["tier"] if loser_prev_tier else upper_tier
         _log_inserts.append((year, loser_name, _lt, lower_tier,
                               upper_lname["name"] if upper_lname else "",
-                              loser_prev_lid, lower_lid))
+                              loser_prev_lid, lower_lid, loser))
     if _log_inserts:
         conn.executemany(
             """INSERT INTO promotion_log(year,team_name,from_tier,to_tier,league_name,
-                                          from_league_id,to_league_id) VALUES(?,?,?,?,?,?,?)""",
+                                          from_league_id,to_league_id,team_id) VALUES(?,?,?,?,?,?,?,?)""",
             _log_inserts)
 
     # 로그용 "원래 소속" 비교가 끝난 뒤에야 실제로 옮긴다(순서 중요 —

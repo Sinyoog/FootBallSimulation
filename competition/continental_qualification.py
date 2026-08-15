@@ -49,12 +49,20 @@ def _europa_slots_from_rank(continent: str, rank_idx: int) -> int:
             return 1
         return 0
     # [TENTATIVE] 아시아/아프리카/북남미 — 확정 수치 받기 전까지 유럽과
-    # 동일한 비율(상위 1/6은 2장, 다음 1/3은 1장)로 그 대륙 실제 국가 수에
-    # 맞춰 스케일링. 확정되면 이 분기를 유럽처럼 명시적 숫자로 교체할 것.
+    # 동일한 비율(상위 1/3 국가는 2장, 나머지는 1장 — 유럽 확정 수치가
+    # "27개국 중 1~9위 2장/10~27위 1장"이므로 그 비율은 9/27, 27/27)로
+    # 그 대륙 실제 국가 수에 맞춰 스케일링.
+    # [2026-08 버그수정, 신민용 리포트: "유로파/컨퍼런스 북남미가 30팀
+    # 밖에 안 됨, 36으로 다른 대륙급이랑 맞춰야"] 분모를 27(유럽 확정
+    # 국가 수)이 아니라 54로 잘못 써서 절반 비율로 스케일링되고 있었다
+    # — 북남미(45개국)에서 목표 정원(36)보다 한참 적은 30장만 나온 원인.
+    # 분모를 27로 고치면 슬롯 합계가 정원(36)을 넉넉히 넘게 배분되고,
+    # allocate_continental_slots()가 정원에서 정확히 잘라주므로(캡 로직
+    # 자체는 원래 정상) 결과적으로 정확히 36장이 채워진다.
     from competition.champions_engine import CONTINENT_MAP
     n_countries = _n_countries_in_continent(continent)
-    two_cut = max(1, round(n_countries * 9 / 54))
-    one_cut = max(two_cut + 1, round(n_countries * 27 / 54))
+    two_cut = max(1, round(n_countries * 9 / 27))
+    one_cut = max(two_cut + 1, round(n_countries * 27 / 27))
     if rank_idx < two_cut:
         return 2
     if rank_idx < one_cut:
@@ -70,10 +78,13 @@ def _conference_slots_from_rank(continent: str, rank_idx: int) -> int:
         if rank_idx < 23:
             return 2
         return 0
-    # [TENTATIVE] 아시아/아프리카/북남미 — 위와 동일한 이유로 비율 스케일링.
+    # [TENTATIVE] 아시아/아프리카/북남미 — 위와 동일한 이유로 비율
+    # 스케일링(유럽 확정 수치 "23개국 중 1~10위 1장/11~23위 2장"의
+    # 비율 10/23, 23/23을 그대로 사용).
+    # [2026-08 버그수정] europa와 동일한 원인(분모 54→23) 수정.
     n_countries = _n_countries_in_continent(continent)
-    one_cut = max(1, round(n_countries * 10 / 54))
-    two_cut = max(one_cut + 1, round(n_countries * 23 / 54))
+    one_cut = max(1, round(n_countries * 10 / 23))
+    two_cut = max(one_cut + 1, round(n_countries * 23 / 23))
     if rank_idx < one_cut:
         return 1
     if rank_idx < two_cut:
@@ -81,8 +92,10 @@ def _conference_slots_from_rank(continent: str, rank_idx: int) -> int:
     return 0
 
 
-# 유로파/컨퍼런스도 챔스와 동일하게 대륙별 정원을 쓴다(북남미만 48, 나머지 36).
-QUALIFICATION_TEAM_CAP = {"유럽": 36, "북남미": 48, "아시아": 36, "아프리카": 36}
+# [2026-08 확정, 신민용 요청] 유로파/컨퍼런스는 챔스와 달리 대륙 무관하게
+# 전부 36장 — 북남미 챔스만 48로 확대된 건 챔스 전용 결정이라(위
+# champions_engine.CL_TEAMS_BY_CONTINENT 참고) 여기엔 안 물려받는다.
+QUALIFICATION_TEAM_CAP = {"유럽": 36, "북남미": 36, "아시아": 36, "아프리카": 36}
 
 
 def _n_countries_in_continent(continent: str) -> int:
@@ -142,21 +155,30 @@ def allocate_continental_slots(continent: str, season: int, year: int = None):
     떼어간다 — 한 팀이 동시에 두 대회 후보가 될 수 없다(리스트가 겹치지
     않음, 아래 검증 함수로 매 호출마다 실측 확인 가능).
 
-    각 대회는 대륙 정원(36 또는 48)을 넘지 않는 선에서, 국가 순위가 높은
-    나라부터 채워진다(챔스 _select_entries와 동일한 원칙 — 정원 초과분은
-    그냥 버려짐, 억지로 안 채움).
+    각 대회는 대륙 정원(유로파/컨퍼런스는 36 또는 48, 챔스는 별도로
+    champions_engine.CL_TEAMS_BY_CONTINENT를 따름)을 넘지 않는 선에서,
+    국가 순위가 높은 나라부터 채워진다(챔스 _select_entries와 동일한
+    원칙 — 정원 초과분은 그냥 버려짐, 억지로 안 채움).
 
     반환: {"champions": [entry,...], "europa": [entry,...], "conference": [entry,...]}
     entry = {"team_id","team_name","flag","country","grade","ovr","cl_rank"}
     (cl_rank: 그 나라 리그 순위표 상 몇 위 팀인지, 1=우승팀. champions_engine._entry_from
     재사용이라 이름이 cl_rank지만 대회 종류 무관하게 "국내 순위"라는 뜻이다.)
     """
-    cap = QUALIFICATION_TEAM_CAP.get(continent, 36)
+    # [2026-08 버그수정, 신민용 리포트: "유로파/컨퍼런스 북남미가 36이
+    # 아니라 30~48로 어긋남"] 예전엔 cap 하나를 챔스/유로파/컨퍼런스
+    # 셋 다에 공용으로 썼다 — 북남미 챔스를 48로 키우려던 조정이 유로파/
+    # 컨퍼런스까지 같이 48로 끌고 가버렸다. 챔스는 champions_engine의
+    # 대륙별 정원(북남미만 48)을 그대로 쓰고, 유로파/컨퍼런스는 항상
+    # QUALIFICATION_TEAM_CAP(모든 대륙 36)을 쓰도록 분리한다.
+    cl_cap = _cl.CL_TEAMS_BY_CONTINENT.get(continent, 36)
+    el_cf_cap = QUALIFICATION_TEAM_CAP.get(continent, 36)
+    cap_by_comp = {"champions": cl_cap, "europa": el_cf_cap, "conference": el_cf_cap}
     countries = _ranked_countries(continent, year)
 
     out = {"champions": [], "europa": [], "conference": []}
     for rank_idx, lg in enumerate(countries):
-        if all(len(out[k]) >= cap for k in out):
+        if all(len(out[k]) >= cap_by_comp[k] for k in out):
             break
         ch_slots = _cl.get_cl_slots(lg["country"], lg["grade"], continent, year)
         eu_slots = _europa_slots_from_rank(continent, rank_idx)
@@ -173,7 +195,7 @@ def allocate_continental_slots(continent: str, season: int, year: int = None):
                                   ("conference", cf_slots)):
             if slots <= 0:
                 continue
-            remaining_cap = cap - len(out[comp_name])
+            remaining_cap = cap_by_comp[comp_name] - len(out[comp_name])
             take = min(slots, remaining_cap, len(rows) - cursor)
             if take <= 0:
                 cursor += slots  # 정원 꽉 찼어도 다음 대회를 위해 순위 커서는 그대로 전진

@@ -41,20 +41,24 @@ CONFERENCE_CFG = CompetitionConfig(
 )
 
 
+# [2026-08 버그수정, 신민용 리포트: "유로파/컨퍼런스는 대륙 다 36팀인데
+# 왜 북남미만 진행 방식이 챔스처럼 안 가?"] europa_engine.py와 동일한
+# 이유 — team_cap/direct_cut/playoff_pool을 챔스 전용 대륙별 상수에서
+# 떼어내 대륙 무관 고정값(36팀/8경기/8직행/16풀)으로 통일한다.
 def _ecl_team_cap(continent):
-    return _cl._cl_team_cap(continent)
+    return 36
 
 
 def _ecl_league_games(continent):
-    return _cl._cl_league_games(continent)
+    return 8
 
 
 def _ecl_direct_cut(continent):
-    return _cl._cl_direct_cut(continent)
+    return 8
 
 
 def _ecl_playoff_pool(continent):
-    return _cl._cl_playoff_pool(continent)
+    return 16
 
 
 def get_ecl_tournament(year, continent):

@@ -507,6 +507,45 @@ def get_league_champions(league_id, limit=999):
     return out
 
 
+# [2026-08 신설, 신민용 요청: "리그 역대 우승팀 화면에 1등/2등을 가장 많이
+# 한 팀 순위를 보여주는 창을 만들어달라" → 이후 "챔스/유로파/컨퍼런스/
+# 클럽월드컵/네이션스컵/지역컵/컵대회에도 역대 1~4위를 가장 많이 차지한
+# 팀/국가 순위를 보여달라"] 처음엔 리그 전용으로 first/second만 세는
+# 함수였는데, 같은 요청이 6개 대회 탭에 더 필요해져서 자리(key) 개수·
+# 필드 이름 패턴만 다를 뿐 로직은 완전히 동일한 걸 범용 함수로 뺐다 —
+# 클럽 대항전(팀명+국가 분리 필요, name_key_fmt="{key}_name"+country_key_fmt
+# ="{key}_country")과 리그/국가대표 대회/국내컵(이름 하나로 충분,
+# name_key_fmt="{key}")을 모두 이 함수 하나로 처리한다.
+def _rank_leaders_from_rows(rows, keys, name_key_fmt, country_key_fmt=None):
+    """rows(대회/시즌별 결과 목록)에서 keys에 지정한 자리(예: "first"/
+    "second" 또는 "winner"/"runner_up"/"third"/"fourth")별로 이름을 세어
+    많이 나온 순으로 정렬한다.
+    반환: {key: [{"name":, "country":(있으면), "count":}, ...]}
+    각각 횟수 많은 순(동률이면 이름 가나다순)으로 정렬."""
+    from collections import Counter
+    counters = {k: Counter() for k in keys}
+    for r in rows:
+        for k in keys:
+            name = r.get(name_key_fmt.format(key=k))
+            if not name or name in ("-", "?"):
+                continue
+            country = r.get(country_key_fmt.format(key=k)) if country_key_fmt else None
+            counters[k][(name, country or "")] += 1
+    out = {}
+    for k in keys:
+        out[k] = [{"name": n, "country": (c or None), "count": cnt}
+                  for (n, c), cnt in sorted(counters[k].items(), key=lambda x: (-x[1], x[0]))]
+    return out
+
+
+def get_league_rank_leaders(league_id):
+    """이 리그에서 시즌 1~4위를 가장 많이 한 팀 순위.
+    반환: {"first": [...], "second": [...], "third": [...], "fourth": [...]}"""
+    rows = get_league_champions(league_id)
+    return _rank_leaders_from_rows(rows, ("first", "second", "third", "fourth"), "{key}")
+
+
+
 # [실시간 전환] 예전엔 유저가 열어본 리그만 '라이브' 상태였고, 그걸 다시
 # '미시뮬'로 되돌리는 reset_league_simulation() / 되돌리기 대상에서 내 리그를
 # 제외하는 is_my_league()가 있었다. 지금은 모든 리그가 항상 실시간으로 진행
@@ -666,6 +705,15 @@ def get_cup_history(country_id, limit=30):
         })
     conn.close()
     return out
+
+
+# [2026-08 신설, 신민용 요청: "컵대회에도 역대 1~4위를 가장 많이 차지한
+# 팀 순위를 보여달라"] 국내 컵대회는 한 나라 안에서만 열려서 팀명이
+# 그 나라 안에서는 유일하다 — 국가를 따로 붙일 필요가 없어 name_key_fmt
+# ="{key}"만으로 충분(get_continental_cup_rank_leaders와 같은 이유).
+def get_cup_rank_leaders(country_id):
+    rows = get_cup_history(country_id, limit=999999)
+    return _rank_leaders_from_rows(rows, ("winner", "runner_up", "third", "fourth"), "{key}")
 
 
 def get_cup_tournament_detail(tournament_id):
@@ -876,6 +924,29 @@ def get_ecl_history(continent=None, limit=100):
                            tournament_table="ecl_tournaments", match_table="ecl_matches")
 
 
+# [2026-08 신설, 신민용 요청: "챔스/유로파/컨퍼런스에도 대륙 필터 옆에
+# 역대 1~4위를 가장 많이 차지한 팀 순위를 보여달라"] get_cl_history가
+# 이미 연도별 1~4위를 팀명+국가까지 채워서 주므로, _rank_leaders_from_rows
+# 로 그 결과를 그대로 집계만 하면 된다 — limit은 999999(사실상 전체)로
+# 올려서 필터에 걸리는 그 대회 전체 역사를 다 반영한다(화면 표
+# get_cl_history의 limit=100과 달리, 순위 집계는 최근 100개로 잘릴
+# 이유가 없다).
+def get_cl_style_rank_leaders(continent=None, tournament_table="cl_tournaments",
+                               match_table="cl_matches"):
+    rows = get_cl_history(continent=continent, limit=999999,
+                           tournament_table=tournament_table, match_table=match_table)
+    return _rank_leaders_from_rows(rows, ("winner", "runner_up", "third", "fourth"),
+                                    "{key}_name", "{key}_country")
+
+
+def get_el_rank_leaders(continent=None):
+    return get_cl_style_rank_leaders(continent, "el_tournaments", "el_matches")
+
+
+def get_ecl_rank_leaders(continent=None):
+    return get_cl_style_rank_leaders(continent, "ecl_tournaments", "ecl_matches")
+
+
 # ─────────────────────────────────────────
 # 4. 국가대표 대회(월드컵/대륙컵) 1~4위 조회
 # ─────────────────────────────────────────
@@ -1022,6 +1093,16 @@ def get_continental_cup_history(name=None, limit=100):
     return rows
 
 
+# [2026-08 신설, 신민용 요청: "네이션스컵에도 필터 옆에 역대 1~4위를 가장
+# 많이 차지한 국가 순위를 보여달라"] 국가대표 대회는 참가자 자체가
+# 국가라 팀/국가를 분리할 필요가 없다 — name_key_fmt="{key}"만으로 충분
+# (country_key_fmt 없음, RankLeadersDialog가 country=None이면 괄호를
+# 안 붙인다).
+def get_continental_cup_rank_leaders(name=None):
+    rows = get_continental_cup_history(name=name, limit=999999)
+    return _rank_leaders_from_rows(rows, ("winner", "runner_up", "third", "fourth"), "{key}")
+
+
 # [2026-08 신설] 3단계 지역컵 — 대륙컵 함수들과 완전히 같은 패턴이다.
 # 국가 검색/트로피 집계는 kind로 그룹만 하는 범용 구조라 이미 지역컵도
 # 자동으로 잡히지만(get_country_trophy_summary 등), "세계기록실 → 역대
@@ -1055,6 +1136,14 @@ def get_region_cup_history(name=None, limit=100):
     return rows
 
 
+# [2026-08 신설, 신민용 요청: "지역컵에도 역대 1~4위를 가장 많이 차지한
+# 국가 순위를 보여달라"] get_continental_cup_rank_leaders와 완전히 같은
+# 이유·구조 — 지역컵도 참가자가 국가 자체다.
+def get_region_cup_rank_leaders(name=None):
+    rows = get_region_cup_history(name=name, limit=999999)
+    return _rank_leaders_from_rows(rows, ("winner", "runner_up", "third", "fourth"), "{key}")
+
+
 # ─────────────────────────────────────────
 # 5.5. 국가 검색 (2026-08 신설, 신민용 확정: "월드컵/대륙컵 우승 기록실")
 # ─────────────────────────────────────────
@@ -1063,17 +1152,43 @@ def get_region_cup_history(name=None, limit=100):
 # 늘어나도(새 kind 값 추가) 이 쿼리들은 코드 수정 없이 자동으로 포함한다
 # — 화면 라벨만 constants.INTL_TOURNAMENT_KIND_LABELS에 추가하면 됨.
 
-def _effective_kind(kind, name):
+def _is_euro_cycle_year(year):
+    """[2026-08 신설] cont_qual(대륙컵 예선) 대회 하나가 그 해에 어느
+    본선(유럽 네이션스컵 vs 유로(EURO))으로 이어지는 예선인지 구분하는
+    헬퍼. intl_engine.py의 start_qualifying_if_needed가 cont_qual을
+    만드는 조건이 두 가지 서로 다른 해에 걸쳐 있다 — ① 대륙컵 해
+    (CONTINENTAL_START_YEAR 주기, 2000/04/08..)엔 '유럽 네이션스컵'
+    예선, ② 지역컵/유로 해(REGIONAL_CUP_START_YEAR 주기, 2001/05/09..)엔
+    '유로(EURO)' 예선 — 같은 kind='cont_qual'로 저장되지만 실제로는
+    완전히 다른 두 대회의 예선이다. 판정식은 intl_engine.py의
+    is_euro_cycle 계산과 완전히 동일하게 맞춘다(그쪽이 원본 판정)."""
+    from constants import REGIONAL_CUP_START_YEAR, REGIONAL_CUP_INTERVAL
+    return (year >= REGIONAL_CUP_START_YEAR
+            and (year - REGIONAL_CUP_START_YEAR) % REGIONAL_CUP_INTERVAL == 0)
+
+
+def _effective_kind(kind, name, year=None):
     """[2026-08 신설, 신민용 요청: "우승 기록에 유로/대륙컵 필터를 따로
     만들어달라"] DB상 유로(EURO)는 일반 대륙컵과 똑같이 kind='continent'로
     저장된다(intl_engine._create_one_tournament — 이름만 EURO_NAME으로
     다르게 줌, 조편성/선발 로직은 100% 동일하다는 설계 의도). 그래서
     kind 하나만으로는 "이 우승이 유로인지 일반 대륙컵(네이션스컵)인지"
     구분이 안 됐다 — 이름까지 같이 봐서 필터/집계용 "유효 종류"를
-    따로 판정한다. world/region은 그대로, continent만 이름으로 갈린다."""
+    따로 판정한다. world/region은 그대로, continent만 이름으로 갈린다.
+
+    [2026-08 수정, 신민용 리포트: "2000 유럽 네이션스컵 예선이 2000 유로
+    예선으로 뜬다 — 이땐 유로가 아니라 유럽 네이션스컵인데"] cont_qual을
+    무조건 유로 예선으로 판정했던 게 오판이었다 — _is_euro_cycle_year
+    참고: cont_qual은 대륙컵 해(유럽 네이션스컵 예선)와 유로 해(유로
+    예선) 두 군데서 다 만들어진다. year가 주어지면 그 해가 어느 주기인지
+    실제로 계산해서 판정하고, year를 모르면(우승 집계처럼 GROUP BY로
+    year가 없는 호출부) cont_qual은 애초에 우승 개념이 없어서 그런
+    호출부에는 나타나지 않으므로 안전하게 원래 kind 그대로 둔다."""
     from constants import EURO_NAME
     if kind == "continent" and name == EURO_NAME:
         return "euro"
+    if kind == "cont_qual" and year is not None and _is_euro_cycle_year(year):
+        return "euro_qual"
     return kind
 
 
@@ -1323,7 +1438,7 @@ def get_country_tournament_results(country_name, limit=200):
         # 보장한다 — 데이터 자체가 비정상인 레거시 행이라도 화면은 안 깨지게.
         out.append({"id": t["id"], "year": t["year"],
                      "kind": t["kind"] or "?",
-                     "effective_kind": _effective_kind(t["kind"] or "", t["name"] or ""),
+                     "effective_kind": _effective_kind(t["kind"] or "", t["name"] or "", t.get("year")),
                      "name": _country_result_name(t),
                      "result": result, "tier": tier,
                      "record": record_str})
@@ -1334,7 +1449,21 @@ def _country_result_name(t):
     """[2026-08 신설, 신민용 리포트: "국가별 기록에 지역컵 대회명만 뜨는데
     어느 지역인지도 같이 보여줘"] 지역컵(kind='region')은 대회명만 봐서는
     무슨 지역인지 바로 안 보인다(예: 'WAFF 챔피언십') — REGION_CUP_NAME을
-    거꾸로 뒤져서 "WAFF 챔피언십(서아시아)"처럼 지역명을 괄호로 붙인다."""
+    거꾸로 뒤져서 "WAFF 챔피언십(서아시아)"처럼 지역명을 괄호로 붙인다.
+
+    [2026-08 수정, 신민용 리포트: "유로 예선인데 대회명이 '2013 유럽
+    네이션스컵 예선'으로 뜬다. '유로(EURO) 예선'으로 떠야 한다" → 이후
+    "2000 유럽 네이션스컵 예선이 2000 유로 예선으로 잘못 바뀌었다,
+    이땐 유로가 아니라 유럽 네이션스컵"] cont_qual은 두 가지 서로 다른
+    본선(유럽 네이션스컵/유로(EURO))의 예선을 겸한다 — _is_euro_cycle_year
+    로 그 해가 어느 주기인지 실제로 판정해서, 유로 해면 연도 없이
+    "유로(EURO) 예선"(본선 "유로(EURO)"와 표기 통일, 연도는 이미 별도
+    컬럼에 있음), 대륙컵 해면 원래 저장된 이름("{year} 유럽 네이션스컵
+    예선")을 그대로 쓴다. DB에 이미 저장된 과거 기록도(재시뮬레이션
+    없이) 이 함수 하나로 즉시 올바르게 보인다."""
+    if t["kind"] == "cont_qual" and _is_euro_cycle_year(t["year"]):
+        from constants import EURO_NAME
+        return f"{EURO_NAME} 예선"
     name = t["name"] or f"{t['year']}년 대회(이름 없음)"
     if t["kind"] == "region":
         from constants import REGION_CUP_NAME
@@ -1524,7 +1653,17 @@ def get_cl_tournament_detail(tournament_id, entry_table="cl_entries",
                 for s in _CL_KO_STAGE_ORDER if s in ko_by_stage]
 
     return {"groups": {}, "league_standings": league_standings, "knockout": knockout,
-            "continent": continent}
+            "continent": continent, "comp_kind": _comp_kind_from_entry_table(entry_table)}
+
+
+def _comp_kind_from_entry_table(entry_table: str) -> str:
+    """[2026-08 신설, 신민용 리포트: "역대 기록 상세의 직행/플레이오프
+    범례가 유로파/컨퍼런스도 챔스 컷(북남미 1~16/17~48)을 그대로 쓰고
+    있다"] get_cl_tournament_detail이 챔스/유로파/컨퍼런스 셋 다 처리
+    하는 공용 함수라, entry_table로 실제 어느 대회인지 구분해 UI(world_
+    browser_window._build_league_standings_table)에 넘겨준다."""
+    return {"cl_entries": "champions", "el_entries": "europa",
+            "ecl_entries": "conference"}.get(entry_table, "champions")
 
 
 def get_el_tournament_detail(tournament_id):
@@ -1620,6 +1759,15 @@ def get_cwc_history(limit=100):
             r[f"{key}_flag"] = info["flag"] if info else ""
             r[f"{key}_country"] = info["country"] if info else ""
     return rows
+
+
+# [2026-08 신설, 신민용 요청: "클럽 월드컵에도 역대 1~4위를 가장 많이
+# 차지한 팀 순위를 보여달라"] 대륙 필터가 없는 대회라(원래부터 전
+# 대륙이 섞여 참가) continent 인자 없이 전체 역사를 그대로 집계한다.
+def get_cwc_rank_leaders():
+    rows = get_cwc_history(limit=999999)
+    return _rank_leaders_from_rows(rows, ("winner", "runner_up", "third", "fourth"),
+                                    "{key}_name", "{key}_country")
 
 
 def get_cwc_tournament_detail(tournament_id):

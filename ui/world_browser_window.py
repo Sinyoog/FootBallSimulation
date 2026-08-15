@@ -601,6 +601,15 @@ class WorldBrowserWindow(QDialog):
         self.history_btn.setVisible(False)
         self.history_btn.toggled.connect(self._on_history_toggled)
         title_row.addWidget(self.history_btn)
+        # [2026-08 신설, 신민용 요청: "역대 우승팀/팀 순위 버튼 옆에 이
+        # 리그에서 1등/2등을 가장 많이 한 팀 순위를 보여주는 창을 만들어달라"]
+        # 별도 토글이 아니라 눌렀을 때 팝업(RankLeadersDialog)을 여는
+        # 방식 — 순위표/역대 우승팀과 달리 이 창은 "같은 자리에서 전환"할
+        # 필요 없이 잠깐 띄워서 보고 닫는 참고용 정보이기 때문.
+        self.rank_leaders_btn = QPushButton("🥇🥈 최다 순위")
+        self.rank_leaders_btn.setVisible(False)
+        self.rank_leaders_btn.clicked.connect(self._on_rank_leaders_clicked)
+        title_row.addWidget(self.rank_leaders_btn)
         right_lay.addLayout(title_row)
 
         self.standing_sub = QLabel("")
@@ -975,6 +984,7 @@ class WorldBrowserWindow(QDialog):
         self.standing_title.setText("⏳ 불러오는 중...")
         self.standing_sub.setText("")
         self.history_btn.setVisible(False)
+        self.rank_leaders_btn.setVisible(False)
         self.season_back_btn.setVisible(False)
         self.standing_title.repaint()
         standings = wb.get_league_standings_for_browser(lid)
@@ -989,6 +999,7 @@ class WorldBrowserWindow(QDialog):
         self.history_btn.setText("🏆 역대 우승팀")
         self.history_btn.blockSignals(False)
         self.history_btn.setVisible(True)
+        self.rank_leaders_btn.setVisible(True)
         self._fill_standing_table(standings)
 
     def _on_history_toggled(self, checked):
@@ -1012,6 +1023,21 @@ class WorldBrowserWindow(QDialog):
             self.history_btn.setText("🏆 역대 우승팀")
             self.standing_sub.setText("")
             self._fill_standing_table(getattr(self, "_current_standings", []))
+
+    def _on_rank_leaders_clicked(self):
+        """[2026-08 신설, 신민용 요청] '🥇🥈 최다 순위' 버튼 — 이 리그에서
+        1~4위를 가장 많이 한 팀 순위를 별도 팝업(RankLeadersDialog)
+        으로 띄운다. get_league_rank_leaders()가 이미 계산까지 다 끝낸
+        결과를 주므로 여기선 그대로 다이얼로그에 넘기기만 한다."""
+        lid = getattr(self, "_current_league_id", None)
+        if lid is None:
+            return
+        title = getattr(self, "_current_league_title", "") or ""
+        data = wb.get_league_rank_leaders(lid)
+        dlg = RankLeadersDialog(title, data, keys=("first", "second", "third", "fourth"),
+                                 key_labels=["🥇 1위 팀", "🥈 2위 팀", "🥉 3위 팀", "4위 팀"],
+                                 empty_msg="아직 완료된 시즌 기록이 없습니다", parent=self)
+        dlg.show()
 
     def _on_standing_row_clicked(self, row, _col):
         """[2026-07 신설] '역대 우승팀' 표에서 연도 행을 클릭하면 그 시즌의
@@ -1438,9 +1464,22 @@ class WorldBrowserWindow(QDialog):
         right = QWidget()
         right_lay = QVBoxLayout(right)
         right_lay.setContentsMargins(10, 0, 0, 0)
+
+        # [2026-08 신설, 신민용 요청: "팀 검색 상세에 복사하기 버튼을 만들어서
+        # 누르면 그 팀의 연도별 기록을 GPT/제미나이가 알아들을 수 있는 텍스트로
+        # 뽑아달라"] 표는 화면에서 보기용이고, 이 버튼은 같은 데이터(get_team_history
+        # 결과)를 사람이 표를 다시 옮겨 적을 필요 없이 순수 텍스트로 클립보드에
+        # 복사해준다 — _format_team_history_text 참고.
+        title_row = QHBoxLayout()
         self.team_detail_title = QLabel("← 왼쪽에서 팀을 선택하세요")
         self.team_detail_title.setStyleSheet("color:#00cc44;font-size:14px;font-weight:bold;")
-        right_lay.addWidget(self.team_detail_title)
+        title_row.addWidget(self.team_detail_title, 1)
+        self.team_copy_btn = QPushButton("📋 기록 복사")
+        self.team_copy_btn.setEnabled(False)
+        self.team_copy_btn.setToolTip("이 팀의 연도별 기록을 텍스트로 복사합니다(GPT/제미나이 등에 붙여넣기용)")
+        self.team_copy_btn.clicked.connect(self._on_copy_team_history_clicked)
+        title_row.addWidget(self.team_copy_btn)
+        right_lay.addLayout(title_row)
 
         self.team_detail_tbl = QTableWidget(0, 5)
         self.team_detail_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -1568,15 +1607,50 @@ class WorldBrowserWindow(QDialog):
         """[2026-08 신설, 신민용 요청: "팀 검색에서 리그뿐 아니라 국내컵/
         챔스/클럽월드컵도 각자 승무패를 아래에 보여달라"] 표 칸 하나에
         본문(위) + 그 대회의 전적(아래, 작은 회색 글씨)을 세로로 쌓는
-        범용 위젯. record가 없으면(그 대회에 출전 안 한 해 등) 본문만."""
+        범용 위젯. record가 없으면(그 대회에 출전 안 한 해 등) 본문만.
+        [2026-08 수정, 신민용 리포트: "클럽 대항전/클럽월드컵은 우승해도
+        금색(#ffd700)으로 안 바뀐다. 다만 전체를 금색으로 바꾸면 원래
+        대회색(파랑/주황/초록/하늘색)을 못 알아보니, 텍스트에 붙는
+        '[우승]' 부분만 금색으로 강조하고 나머지는 main_color 그대로"]
+        [2026-08 확장, 신민용 리포트: "리그도 마찬가지 — 하위 부수에서
+        1등해서 승격(파랑)/강등 경계 경기 등으로 색이 이미 정해져 있어도,
+        '[1등]' 부분만 금색으로 강조해달라. 1부는 승격 자체가 없어서
+        이 조건이 안 걸리니(else 분기), 거기는 이미 칸 전체가 금색으로
+        따로 처리된다"] '[우승]'과 '[1등]' 둘 다 본문에 있으면 그 부분만
+        #ffd700으로 감싼 리치 텍스트(HTML)로 렌더링한다 — 대회/리그
+        종류를 나타내는 나머지 색(승격=파랑/강등=빨강/챔스=파랑/유로파=
+        주황/컨퍼런스=초록/클럽월드컵=하늘색)은 그대로 유지된다."""
+        import html as _html
         w = QWidget()
         lay = QVBoxLayout(w)
         lay.setContentsMargins(6, 4, 6, 4)
         lay.setSpacing(1)
-        main_lbl = QLabel(main_text)
+        main_lbl = QLabel()
         main_lbl.setWordWrap(True)
         _weight = "bold" if bold else "normal"
-        main_lbl.setStyleSheet(f"color:{main_color};font-weight:{_weight};font-size:12px;")
+        _GOLD_TOKENS = ("[우승]", "[1등]")
+        if main_text and any(tok in main_text for tok in _GOLD_TOKENS):
+            _parts, _rest_text = [], main_text
+            while _rest_text:
+                _hit_idx, _hit_tok = None, None
+                for tok in _GOLD_TOKENS:
+                    idx = _rest_text.find(tok)
+                    if idx != -1 and (_hit_idx is None or idx < _hit_idx):
+                        _hit_idx, _hit_tok = idx, tok
+                if _hit_idx is None:
+                    _parts.append((_rest_text, main_color))
+                    break
+                if _hit_idx > 0:
+                    _parts.append((_rest_text[:_hit_idx], main_color))
+                _parts.append((_hit_tok, "#ffd700"))
+                _rest_text = _rest_text[_hit_idx + len(_hit_tok):]
+            _rich = "".join(
+                f'<span style="color:{c};">{_html.escape(t)}</span>' for t, c in _parts)
+            main_lbl.setStyleSheet(f"font-weight:{_weight};font-size:12px;")
+            main_lbl.setText(_rich)
+        else:
+            main_lbl.setStyleSheet(f"color:{main_color};font-weight:{_weight};font-size:12px;")
+            main_lbl.setText(main_text)
         lay.addWidget(main_lbl)
         if record:
             rec_lbl = QLabel(record)
@@ -1629,6 +1703,10 @@ class WorldBrowserWindow(QDialog):
 
         tbl = self.team_detail_tbl
         tbl.setRowCount(0)
+        # [2026-08 신설] 복사 버튼이 지금 표에 그릴 데이터를 그대로 재사용할 수
+        # 있도록(별도 재조회 없이) 팀 이름 + get_team_history 결과를 인스턴스에
+        # 저장해둔다 — 아래에서 hist를 구한 뒤(다음 줄들) 최신 값으로 갱신한다.
+        self._team_copy_name = tname
         # [2026-08 버그수정, 신민용 리포트: "표에서 칸 하나가 그 행 전체를
         # 뒤덮는 깨짐 현상"] 이 표도 아래에서 "기록 없음"일 때 setSpan을
         # 쓰는데, 이전 팀 선택 때 그 span이 남아있으면(clear는 span을
@@ -1636,14 +1714,17 @@ class WorldBrowserWindow(QDialog):
         # 때마다 무조건 먼저 지운다(_show_empty_state와 동일한 원인).
         tbl.clearSpans()
         hist = wb.get_team_history(tid)
+        self._team_copy_hist = hist
         awards, years = hist["awards"], hist["years"]
         if not years and not any(awards.values()):
+            self.team_copy_btn.setEnabled(False)
             tbl.setRowCount(1)
             empty = QTableWidgetItem("기록 없음")
             empty.setForeground(QColor("#666"))
             tbl.setItem(0, 0, empty)
             tbl.setSpan(0, 0, 1, 5)
             return
+        self.team_copy_btn.setEnabled(True)
 
         # [2026-08 신설, 신민용 요청: "연도별 기록 맨 위에 '수상' 칸을 만들어
         # 리그/컵/챔스/클럽WC 우승 횟수를 보여달라, 0회면 빈칸으로"]
@@ -1705,7 +1786,12 @@ class WorldBrowserWindow(QDialog):
             tbl.setCellWidget(i, 1, self._two_line_cell(lg_txt, lg_color, entry.get("league_record")))
 
             cup_txt = entry["cup"] or "-"
-            cup_color = "#ffd700" if entry.get("cup_champion") else ("#c48aff" if entry["cup"] else "#555")
+            # [2026-08 수정, 신민용 리포트: "국내컵도 우승해도 전체를
+            # 금색으로 바꾸지 말고 [우승]만 금색, 컵 이름은 원래 보라색
+            # 유지"] CL/CWC와 동일한 패턴 — 본문색은 항상 국내컵 고유색
+            # (보라)/미출전(회색)으로 두고, "[우승]"만 _two_line_cell이
+            # 자동으로 금색 강조한다.
+            cup_color = "#c48aff" if entry["cup"] else "#555"
             tbl.setCellWidget(i, 2, self._two_line_cell(cup_txt, cup_color, entry.get("cup_record")))
 
             cl_txt = entry["cl"] or "-"
@@ -1718,9 +1804,82 @@ class WorldBrowserWindow(QDialog):
             tbl.setCellWidget(i, 3, self._two_line_cell(cl_txt, cl_color, entry.get("cl_record")))
 
             cwc_txt = entry.get("cwc") or "-"
-            cwc_color = "#ffd700" if entry.get("cwc_champion") else ("#4dd0e1" if entry.get("cwc") else "#555")
+            # [2026-08 수정] 우승해도 전체를 금색으로 바꾸지 않는다 —
+            # 본문색은 항상 클럽월드컵 고유색(하늘색)/미출전(회색)으로
+            # 유지하고, "[우승]" 부분만 _two_line_cell이 자동으로 금색
+            # 강조한다.
+            cwc_color = "#4dd0e1" if entry.get("cwc") else "#555"
             tbl.setCellWidget(i, 4, self._two_line_cell(cwc_txt, cwc_color, entry.get("cwc_record")))
         tbl.resizeRowsToContents()
+
+    # [2026-08 신설, 신민용 요청: "팀 검색에 복사하기 버튼을 만들어서
+    # 누르면 이 팀의 연도별 기록을 텍스트로 뽑고 싶다 — 지피티나 제미나이가
+    # 알아들을 수 있는 형태로"] 화면 표(team_detail_tbl)와 같은 데이터
+    # (self._team_copy_hist)를 사람이 다시 옮겨 적을 필요 없이, LLM에
+    # 그대로 붙여넣어도 되는 평문 텍스트로 바꿔 클립보드에 복사한다.
+    def _on_copy_team_history_clicked(self):
+        hist = getattr(self, "_team_copy_hist", None)
+        tname = getattr(self, "_team_copy_name", None)
+        if not hist or not tname:
+            return
+        text = self._format_team_history_text(tname, hist)
+        QGuiApplication.clipboard().setText(text)
+
+        # 눌렀을 때 복사됐다는 걸 눈으로 확인할 수 있게 버튼 라벨을
+        # 잠깐 바꿨다가 되돌린다(1.2초). 다른 팀을 고르는 등으로 버튼이
+        # 다시 그려지면(= 이 위젯이 없어지는 게 아니라 그냥 다음 클릭까지
+        # 남아있으므로) 딱히 꼬일 일은 없다 — QTimer.singleShot이 그
+        # 시점에 라벨만 원래대로 되돌린다.
+        self.team_copy_btn.setText("✅ 복사됨")
+        QTimer.singleShot(1200, lambda: self.team_copy_btn.setText("📋 기록 복사"))
+
+    def _format_team_history_text(self, tname, hist):
+        """hist(get_team_history 반환값)를 사람이 읽어도, LLM에 그대로
+        붙여넣어도 되는 평문으로 직렬화한다. 화면 표와 같은 정보(연도별
+        리그/국내컵/클럽대항전/클럽월드컵 결과 + 각자 전적, 맨 위 통산
+        수상 집계)를 담되, 색상 대신 "[승격]"/"[강등]"/"[우승]" 같은
+        텍스트 표기만으로 뜻이 통하게 한다(이미 entry 문자열 안에 이런
+        표기가 들어있으므로 대부분 그대로 옮기면 된다).
+        """
+        awards, years = hist["awards"], hist["years"]
+        lines = [f"[{tname} 역대 기록]"]
+
+        award_bits = []
+        if awards.get("league"):
+            award_bits.append(f"리그 우승 {awards['league']}회")
+        if awards.get("cup"):
+            award_bits.append(f"국내컵 우승 {awards['cup']}회")
+        if awards.get("cl_champions"):
+            award_bits.append(f"챔피언스리그(급) 우승 {awards['cl_champions']}회")
+        if awards.get("el_champions"):
+            award_bits.append(f"유로파리그(급) 우승 {awards['el_champions']}회")
+        if awards.get("ecl_champions"):
+            award_bits.append(f"컨퍼런스리그(급) 우승 {awards['ecl_champions']}회")
+        if awards.get("cwc"):
+            award_bits.append(f"클럽 월드컵 우승 {awards['cwc']}회")
+        lines.append("통산 수상: " + (" · ".join(award_bits) if award_bits else "없음"))
+        lines.append("")
+
+        if not years:
+            lines.append("(연도별 기록 없음)")
+        else:
+            for entry in years:
+                parts = [f"{entry['year']}년"]
+                if entry.get("league"):
+                    rec = f" ({entry['league_record']})" if entry.get("league_record") else ""
+                    parts.append(f"리그: {entry['league']}{rec}")
+                if entry.get("cup"):
+                    rec = f" ({entry['cup_record']})" if entry.get("cup_record") else ""
+                    parts.append(f"국내컵: {entry['cup']}{rec}")
+                if entry.get("cl"):
+                    rec = f" ({entry['cl_record']})" if entry.get("cl_record") else ""
+                    parts.append(f"클럽대항전: {entry['cl']}{rec}")
+                if entry.get("cwc"):
+                    rec = f" ({entry['cwc_record']})" if entry.get("cwc_record") else ""
+                    parts.append(f"클럽월드컵: {entry['cwc']}{rec}")
+                lines.append(" | ".join(parts))
+
+        return "\n".join(lines)
 
     # ─────────────────────────────────────────
     # 탭1.6: 국가 검색 (2026-08 신설, 신민용 확정: "월드컵/대륙컵 우승
@@ -1832,9 +1991,20 @@ class WorldBrowserWindow(QDialog):
         right = QWidget()
         right_lay = QVBoxLayout(right)
         right_lay.setContentsMargins(10, 0, 0, 0)
+        title_row = QHBoxLayout()
         self.country_detail_title = QLabel("← 왼쪽에서 국가를 선택하세요")
         self.country_detail_title.setStyleSheet("color:#00cc44;font-size:14px;font-weight:bold;")
-        right_lay.addWidget(self.country_detail_title)
+        title_row.addWidget(self.country_detail_title, 1)
+        # [2026-08 신설, 신민용 요청: "팀 검색에 만든 것처럼 국가 검색에도
+        # 모든 국가에 복사 버튼을 만들어달라"] 팀 탭의 team_copy_btn과 완전히
+        # 같은 패턴 — 화면 표(country_detail_tbl)와 같은 데이터를 LLM에
+        # 붙여넣기 좋은 평문으로 클립보드에 복사한다.
+        self.country_copy_btn = QPushButton("📋 기록 복사")
+        self.country_copy_btn.setEnabled(False)
+        self.country_copy_btn.setToolTip("이 국가의 국제대회 우승/참가 기록을 텍스트로 복사합니다(GPT/제미나이 등에 붙여넣기용)")
+        self.country_copy_btn.clicked.connect(self._on_copy_country_history_clicked)
+        title_row.addWidget(self.country_copy_btn)
+        right_lay.addLayout(title_row)
 
         # kind별 우승 횟수 요약 칩(예: 🌐 월드컵 2회  🎖 대륙컵 3회) — 대회
         # 종류가 몇 개든(현재 2종, 앞으로 늘어나도) 가로로 쭉 붙여서 보여준다.
@@ -1957,6 +2127,7 @@ class WorldBrowserWindow(QDialog):
         if not name:
             return
         self.country_detail_title.setText(f"🌍 {name}  국제대회 우승 기록")
+        self._country_copy_name = name
 
         # 요약 칩 갱신
         while self.country_summary_row.count():
@@ -1964,6 +2135,7 @@ class WorldBrowserWindow(QDialog):
             if child.widget():
                 child.widget().deleteLater()
         summary = wb.get_country_trophy_summary(name)
+        self._country_copy_summary = summary
         if not summary:
             empty = QLabel("아직 우승한 국제대회가 없습니다")
             empty.setStyleSheet("color:#666;font-size:12px;")
@@ -1983,6 +2155,8 @@ class WorldBrowserWindow(QDialog):
                          2: "#aaddff", 1: "#999999", 0: "#555555"}
         tbl = self.country_detail_tbl
         results = wb.get_country_tournament_results(name)
+        self._country_copy_results = results
+        self.country_copy_btn.setEnabled(bool(results) or bool(summary))
         tbl.setRowCount(len(results))
         from constants import INTL_TOURNAMENT_KIND_LABELS
         for i, t in enumerate(results):
@@ -2024,6 +2198,54 @@ class WorldBrowserWindow(QDialog):
                 print(f"[국제대회기록] {name} {t.get('year')}년 행 렌더링 오류(건너뜀): {e}")
         self._show_empty_state(tbl, results, "참가 기록 없음", 5)
         tbl.resizeRowsToContents()
+
+    # [2026-08 신설, 신민용 요청: "국가 검색에도 팀 검색처럼 복사 버튼을
+    # 만들어달라"] _on_copy_team_history_clicked/_format_team_history_text와
+    # 완전히 같은 목적·패턴 — 다만 대상이 팀의 시즌별 성적이 아니라 국가의
+    # 국제대회(월드컵/대륙컵/지역컵 등) 우승·참가 기록이라는 점만 다르다.
+    def _on_copy_country_history_clicked(self):
+        name = getattr(self, "_country_copy_name", None)
+        results = getattr(self, "_country_copy_results", None)
+        summary = getattr(self, "_country_copy_summary", None)
+        if not name or (not results and not summary):
+            return
+        text = self._format_country_history_text(name, summary, results)
+        QGuiApplication.clipboard().setText(text)
+
+        self.country_copy_btn.setText("✅ 복사됨")
+        QTimer.singleShot(1200, lambda: self.country_copy_btn.setText("📋 기록 복사"))
+
+    def _format_country_history_text(self, name, summary, results):
+        """국가 상세 화면(요약 칩 + 연도별 결과표)과 같은 데이터를 LLM에
+        그대로 붙여넣어도 되는 평문으로 직렬화한다. 팀 쪽
+        (_format_team_history_text)과 같은 구조 — 맨 위에 대회 종류별
+        우승 횟수 요약, 그 아래 연도 내림차순 목록."""
+        from constants import INTL_TOURNAMENT_KIND_LABELS
+        lines = [f"[{name} 국제대회 우승 기록]"]
+
+        if summary:
+            bits = [f"{s['label']} {s['titles']}회" for s in summary]
+            lines.append("통산 우승: " + " · ".join(bits))
+        else:
+            lines.append("통산 우승: 없음")
+        lines.append("")
+
+        if not results:
+            lines.append("(참가 기록 없음)")
+        else:
+            for t in results:
+                try:
+                    tname_ = t.get("name") or "-"
+                    kind_label = INTL_TOURNAMENT_KIND_LABELS.get(
+                        t.get("effective_kind", t.get("kind")), t.get("kind") or "-")
+                    result = t.get("result") or "-"
+                    rec = t.get("record")
+                    rec_txt = f" ({rec})" if rec else ""
+                    lines.append(f"{t.get('year')}년 | {tname_} [{kind_label}] : {result}{rec_txt}")
+                except Exception:
+                    continue
+
+        return "\n".join(lines)
 
     def _open_country_title_detail(self, row, _col):
         item = self.country_detail_tbl.item(row, 0)
@@ -2097,9 +2319,19 @@ class WorldBrowserWindow(QDialog):
         right_lay = QVBoxLayout(right)
         right_lay.setContentsMargins(10, 0, 0, 0)
 
+        title_row = QHBoxLayout()
         self.cup_title = QLabel("← 왼쪽에서 나라를 선택하세요")
         self.cup_title.setStyleSheet("color:#c48aff;font-size:14px;font-weight:bold;")
-        right_lay.addWidget(self.cup_title)
+        title_row.addWidget(self.cup_title, 1)
+        # [2026-08 신설, 신민용 요청: "컵대회에도 역대 1~4위를 가장 많이
+        # 차지한 팀 순위를 보여달라"] 나라별로 이미 좌측에서 선택하는
+        # 구조라 별도 필터는 필요 없다 — 지금 선택된 나라 기준으로 바로
+        # 집계한다.
+        self.cup_rank_btn = QPushButton("🥇 최다 순위")
+        self.cup_rank_btn.setEnabled(False)
+        self.cup_rank_btn.clicked.connect(self._on_cup_rank_leaders_clicked)
+        title_row.addWidget(self.cup_rank_btn)
+        right_lay.addLayout(title_row)
 
         self.cup_sub = QLabel("")
         self.cup_sub.setStyleSheet("color:#888;font-size:11px;")
@@ -2206,6 +2438,9 @@ class WorldBrowserWindow(QDialog):
         rows = wb.get_cup_history(cid)
         cname = item.data(Qt.ItemDataRole.UserRole + 1) or ""
         self.cup_title.setText(f"🎖️ {cname} 역대 컵대회 기록")
+        self._cup_copy_country_id = cid
+        self._cup_copy_country_name = cname
+        self.cup_rank_btn.setEnabled(bool(rows))
         self.cup_sub.setText(
             f"{rows[0]['name']}  ·  완료된 대회 {len(rows)}건" if rows
             else "이 나라에서 완료된 컵대회 기록이 없습니다")
@@ -2255,6 +2490,18 @@ class WorldBrowserWindow(QDialog):
         dlg = TournamentDetailDialog(title, detail, team_based=True, parent=self)
         dlg.exec()
 
+    def _on_cup_rank_leaders_clicked(self):
+        cid = getattr(self, "_cup_copy_country_id", None)
+        cname = getattr(self, "_cup_copy_country_name", "")
+        if cid is None:
+            return
+        data = wb.get_cup_rank_leaders(cid)
+        dlg = RankLeadersDialog(f"{cname} 컵대회", data,
+                                 keys=("winner", "runner_up", "third", "fourth"),
+                                 key_labels=["🥇 1위 팀", "🥈 2위 팀", "🥉 3위 팀", "4위 팀"],
+                                 empty_msg="아직 완료된 컵대회 기록이 없습니다", parent=self)
+        dlg.show()
+
     # ─────────────────────────────────────────
     # 탭3: 역대 챔피언스리그
     # ─────────────────────────────────────────
@@ -2262,7 +2509,8 @@ class WorldBrowserWindow(QDialog):
         return self._build_cl_style_tab(
             tbl_attr="cl_tbl", combo_attr="cl_cont_combo",
             history_fn=wb.get_cl_history, detail_fn=wb.get_cl_tournament_detail,
-            winner_color=Qt.GlobalColor.yellow)
+            winner_color=Qt.GlobalColor.yellow,
+            rank_fn=wb.get_cl_style_rank_leaders, tab_title="챔피언스리그")
 
     def _build_el_tab(self):
         """[2026-08 신설] 역대 유로파리그 — 챔스와 완전히 같은 화면을
@@ -2271,7 +2519,8 @@ class WorldBrowserWindow(QDialog):
         return self._build_cl_style_tab(
             tbl_attr="el_tbl", combo_attr="el_cont_combo",
             history_fn=wb.get_el_history, detail_fn=wb.get_el_tournament_detail,
-            winner_color=QColor("#F28C28"))
+            winner_color=QColor("#F28C28"),
+            rank_fn=wb.get_el_rank_leaders, tab_title="유로파리그")
 
     def _build_ecl_tab(self):
         """[2026-08 신설] 역대 컨퍼런스리그 — 위와 동일 패턴."""
@@ -2279,13 +2528,22 @@ class WorldBrowserWindow(QDialog):
         return self._build_cl_style_tab(
             tbl_attr="ecl_tbl", combo_attr="ecl_cont_combo",
             history_fn=wb.get_ecl_history, detail_fn=wb.get_ecl_tournament_detail,
-            winner_color=QColor("#20A464"))
+            winner_color=QColor("#20A464"),
+            rank_fn=wb.get_ecl_rank_leaders, tab_title="컨퍼런스리그")
 
-    def _build_cl_style_tab(self, tbl_attr, combo_attr, history_fn, detail_fn, winner_color):
+    def _build_cl_style_tab(self, tbl_attr, combo_attr, history_fn, detail_fn, winner_color,
+                             rank_fn, tab_title):
         """[2026-08 신설] _build_cl_tab의 로직을 그대로 일반화 — 테이블/콤보
         위젯 속성명, 데이터 조회 함수, 우승 강조색만 매개변수로 뺐다.
         위젯 자체는 self.<tbl_attr>/<combo_attr>로 저장해서(예: self.el_tbl)
-        기존 self.cl_tbl 패턴과 동일하게 다른 메서드에서도 접근 가능하다."""
+        기존 self.cl_tbl 패턴과 동일하게 다른 메서드에서도 접근 가능하다.
+
+        [2026-08 확장, 신민용 요청: "대륙 선택 버튼 우측에 역대 1~4등을
+        가장 많이 한 팀이 뜨는 창을 만들고, 기본값은 유럽으로"] rank_fn/
+        tab_title을 추가로 받아 '🥇 최다 순위' 버튼을 필터 옆에 놓는다.
+        대륙 콤보 기본값도 _ALL(전체)이 아니라 '유럽'으로 바꿨다 — addItem
+        직후, currentTextChanged를 연결하기 '전에' 선택해서 초기 로드 시
+        핸들러가 불필요하게 두 번 불리지 않게 한다."""
         w = QWidget()
         lay = QVBoxLayout(w)
         lay.setContentsMargins(0, 8, 0, 0)
@@ -2295,12 +2553,17 @@ class WorldBrowserWindow(QDialog):
         combo = QComboBox()
         for cont in [_ALL, "유럽", "아시아", "아프리카", "북남미"]:
             combo.addItem(cont)
+        combo.setCurrentText("유럽")
         setattr(self, combo_attr, combo)
         combo.currentTextChanged.connect(
             lambda *_a: self._refresh_cl_style_table(tbl_attr, combo_attr, history_fn, winner_color))
         filt.addWidget(lbl)
         filt.addWidget(combo)
         filt.addStretch()
+        rank_btn = QPushButton("🥇 최다 순위")
+        rank_btn.clicked.connect(
+            lambda: self._on_cl_style_rank_leaders_clicked(combo_attr, rank_fn, tab_title))
+        filt.addWidget(rank_btn)
         lay.addLayout(filt)
 
         tbl = QTableWidget(0, 0)
@@ -2317,6 +2580,22 @@ class WorldBrowserWindow(QDialog):
 
         self._refresh_cl_style_table(tbl_attr, combo_attr, history_fn, winner_color)
         return w
+
+    def _on_cl_style_rank_leaders_clicked(self, combo_attr, rank_fn, tab_title):
+        """[2026-08 신설] 챔스/유로파/컨퍼런스 탭 공용 '🥇 최다 순위' 버튼
+        — 지금 선택된 대륙 필터 그대로 rank_fn(continent=...)을 호출해서
+        RankLeadersDialog로 띄운다. 대륙을 바꾸고 다시 누르면 그 대륙
+        기준으로 새로 집계해서 보여준다(별도 캐시 없음 — 순수 집계라
+        매번 다시 계산해도 비용이 작다)."""
+        combo = getattr(self, combo_attr)
+        cont = None if combo.currentText() == _ALL else combo.currentText()
+        data = rank_fn(continent=cont)
+        title = f"{tab_title}" + (f" ({cont})" if cont else " (전체)")
+        dlg = RankLeadersDialog(title, data,
+                                 keys=("winner", "runner_up", "third", "fourth"),
+                                 key_labels=["🥇 1위 팀", "🥈 2위 팀", "🥉 3위 팀", "4위 팀"],
+                                 parent=self)
+        dlg.show()
 
     def _refresh_cl_style_table(self, tbl_attr, combo_attr, history_fn, winner_color):
         combo = getattr(self, combo_attr)
@@ -2384,6 +2663,16 @@ class WorldBrowserWindow(QDialog):
         info.setStyleSheet("color:#888;font-size:11px;")
         lay.addWidget(info)
 
+        # [2026-08 신설, 신민용 요청: "클럽 월드컵에도 역대 1~4위를 가장
+        # 많이 차지한 팀 순위를 보여달라"] 이 대회는 대륙 필터가 없으므로
+        # (원래부터 여러 대륙이 섞여 참가) 필터 없이 버튼만 놓는다.
+        tools = QHBoxLayout()
+        tools.addStretch()
+        cwc_rank_btn = QPushButton("🥇 최다 순위")
+        cwc_rank_btn.clicked.connect(self._on_cwc_rank_leaders_clicked)
+        tools.addWidget(cwc_rank_btn)
+        lay.addLayout(tools)
+
         self.cwc_tbl = QTableWidget(0, 0)
         self.cwc_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.cwc_tbl.verticalHeader().setVisible(False)
@@ -2447,6 +2736,14 @@ class WorldBrowserWindow(QDialog):
         dlg = TournamentDetailDialog(title, detail, team_based=True, parent=self)
         dlg.exec()
 
+    def _on_cwc_rank_leaders_clicked(self):
+        data = wb.get_cwc_rank_leaders()
+        dlg = RankLeadersDialog("클럽 월드컵", data,
+                                 keys=("winner", "runner_up", "third", "fourth"),
+                                 key_labels=["🥇 1위 팀", "🥈 2위 팀", "🥉 3위 팀", "4위 팀"],
+                                 empty_msg="아직 완료된 클럽 월드컵이 없습니다", parent=self)
+        dlg.show()
+
     # ─────────────────────────────────────────
     # 탭3: 역대 월드컵
     # ─────────────────────────────────────────
@@ -2488,10 +2785,18 @@ class WorldBrowserWindow(QDialog):
         self.nc_combo.addItem(_ALL)
         for name in wb.list_continental_cup_names():
             self.nc_combo.addItem(name)
+        # [2026-08 되돌림, 신민용 리포트: "나라끼리 붙는 국제대회(네이션스컵/
+        # 지역컵)는 이 탭 필터 기본값이 전체가 맞다 — 유럽/코파를 기본으로
+        # 하고 싶었던 건 '최다 순위' 팝업 안의 필터 얘기였다"] 탭 자체의
+        # 기본 선택은 원래대로 전체(_ALL)로 되돌린다 — "유럽 기본" 요청은
+        # 아래 _on_nc_rank_leaders_clicked이 여는 팝업 내부 필터로 옮겼다.
         self.nc_combo.currentTextChanged.connect(self._refresh_nc_table)
         filt.addWidget(lbl)
         filt.addWidget(self.nc_combo)
         filt.addStretch()
+        nc_rank_btn = QPushButton("🥇 최다 순위")
+        nc_rank_btn.clicked.connect(self._on_nc_rank_leaders_clicked)
+        filt.addWidget(nc_rank_btn)
         lay.addLayout(filt)
 
         self.nc_tbl = QTableWidget(0, 0)
@@ -2512,6 +2817,26 @@ class WorldBrowserWindow(QDialog):
         rows = wb.get_continental_cup_history(name=name)
         self._fill_placement_table(self.nc_tbl, rows,
                                     "아직 완료된 대회가 없습니다\n(대회 발생 연도가 되어야 기록이 쌓입니다)")
+
+    def _on_nc_rank_leaders_clicked(self):
+        """[2026-08 수정, 신민용 리포트: "나라끼리 붙는 국제대회는 탭
+        필터가 전체가 맞고, 유럽을 기본으로 하고 싶었던 건 이 팝업 안의
+        필터 얘기였다"] 탭의 현재 선택과 무관하게 항상 새로 연다 —
+        팝업 내부에 자체 "대회" 필터를 두고(기본값 유럽 네이션스컵),
+        그 필터를 바꾸면 팝업 안에서 바로 다시 집계해서 보여준다."""
+        from constants import CONF_CUP_NAME
+        options = [(_ALL, None)] + [(name, name) for name in wb.list_continental_cup_names()]
+        default_name = CONF_CUP_NAME.get("유럽")
+        default_value = default_name if any(v == default_name for _l, v in options) else None
+        dlg = RankLeadersDialog("네이션스컵", wb.get_continental_cup_rank_leaders(name=default_value),
+                                 keys=("winner", "runner_up", "third", "fourth"),
+                                 key_labels=["🥇 1위", "🥈 2위", "🥉 3위", "4위"],
+                                 empty_msg="아직 완료된 대회가 없습니다",
+                                 filter_label="대회", filter_options=options,
+                                 filter_default=default_value,
+                                 fetch_fn=lambda name: wb.get_continental_cup_rank_leaders(name=name),
+                                 parent=self)
+        dlg.show()
 
     # ─────────────────────────────────────────
     # 탭4.5: 역대 지역컵 (2026-08 신설, 신민용 확정: "이건 챔스 탭처럼
@@ -2535,10 +2860,21 @@ class WorldBrowserWindow(QDialog):
         self.region_cont_combo.addItem(_ALL)
         for cont in ["아시아", "아프리카", "북중미", "남미", "오세아니아"]:
             self.region_cont_combo.addItem(cont)
+        # [2026-08 되돌림, 신민용 리포트: "나라끼리 붙는 국제대회는 이 탭
+        # 필터 기본값이 전체가 맞다 — 코파를 기본으로 하고 싶었던 건
+        # '최다 순위' 팝업 안의 필터 얘기였다"] 탭 자체 기본 선택은 원래
+        # 대로 전체(_ALL)로 되돌린다.
         self.region_cont_combo.currentTextChanged.connect(self._refresh_region_list)
         filt.addWidget(lbl)
         filt.addWidget(self.region_cont_combo)
         filt.addStretch()
+        # [2026-08 신설] '최다 순위' 버튼을 왼쪽 목록에서 뭘 선택했는지와
+        # 무관한 위치(대륙 필터 옆)로 옮겼다 — 팝업 안에 자체 대회 필터가
+        # 생겨서(기본값 코파 아메리카) 더 이상 좌측 목록 선택에 의존할
+        # 필요가 없다.
+        region_rank_btn = QPushButton("🥇 최다 순위")
+        region_rank_btn.clicked.connect(self._on_region_rank_leaders_clicked)
+        filt.addWidget(region_rank_btn)
         lay.addLayout(filt)
 
         split = QSplitter(Qt.Orientation.Horizontal)
@@ -2642,6 +2978,24 @@ class WorldBrowserWindow(QDialog):
         self._fill_placement_table(self.region_tbl, rows,
                                     "아직 완료된 대회가 없습니다\n(대회 발생 연도가 되어야 기록이 쌓입니다)")
 
+    def _on_region_rank_leaders_clicked(self):
+        """[2026-08 수정, 신민용 리포트: "나라끼리 붙는 국제대회는 탭
+        필터가 전체가 맞고, 코파를 기본으로 하고 싶었던 건 이 팝업 안의
+        필터 얘기였다"] 왼쪽 목록에서 뭘 선택했는지와 무관하게 항상 열 수
+        있다 — 팝업 내부에 자체 "대회" 필터를 두고(기본값 코파 아메리카),
+        그 필터를 바꾸면 팝업 안에서 바로 다시 집계해서 보여준다."""
+        options = [(_ALL, None)] + [(name, name) for name in wb.list_region_cup_names()]
+        default_value = "코파 아메리카" if any(v == "코파 아메리카" for _l, v in options) else None
+        dlg = RankLeadersDialog("지역컵", wb.get_region_cup_rank_leaders(name=default_value),
+                                 keys=("winner", "runner_up", "third", "fourth"),
+                                 key_labels=["🥇 1위", "🥈 2위", "🥉 3위", "4위"],
+                                 empty_msg="아직 완료된 대회가 없습니다",
+                                 filter_label="대회", filter_options=options,
+                                 filter_default=default_value,
+                                 fetch_fn=lambda name: wb.get_region_cup_rank_leaders(name=name),
+                                 parent=self)
+        dlg.show()
+
     # ─────────────────────────────────────────
     # 공용 헬퍼
     # ─────────────────────────────────────────
@@ -2723,6 +3077,156 @@ class WorldBrowserWindow(QDialog):
         tbl.setSpan(0, 0, 1, n_cols)
 
 
+class RankLeadersDialog(QDialog):
+    """[2026-08 신설, 신민용 요청: "역대 우승팀/팀 순위 버튼 옆에 이 리그에서
+    1등/2등을 가장 많이 한 팀 순위를 보여주는 창을 만들어달라" → 이후
+    "챔스/유로파/컨퍼런스/클럽월드컵/네이션스컵/지역컵/컵대회에도 역대
+    1~4위를 가장 많이 차지한 팀/국가 순위를 보여달라"] 처음엔 리그 전용
+    (1등/2등 2칸)이었는데, 자리(key) 개수만 다를 뿐 구조가 완전히 같은
+    요청이 6개 대회 탭에 더 필요해져서 범용 다이얼로그로 만들었다 —
+    keys/key_labels 길이만큼 (팀명+횟수) 열 쌍이 옆으로 늘어난다(리그는
+    2쌍, 챔스류는 4쌍). TournamentDetailDialog와 같은 톤(STYLE, 닫기
+    버튼)을 따르되, 이 창은 표 하나뿐이라 스크롤 영역 없이 끝낸다.
+
+    [팀명 (국가) 표시] data의 각 항목이 country를 갖고 있으면(클럽
+    대항전 — 같은 팀명이 다른 나라에 있을 수 있어 구분 필요) "팀명
+    (국가)"로 보여주되, 복사(Ctrl+C/우클릭)하면 국가 없이 팀명만
+    복사되도록 _CLEAN_TEXT_ROLE에 원본 이름을 따로 저장해둔다
+    (_enable_plain_copy가 이 롤을 우선 읽음). country가 없으면(국가대표
+    대회 — 참가자 자체가 국가라 분리 불필요) 이름 그대로 표시.
+
+    [2026-08 수정, 신민용 리포트: "나라끼리 붙는 국제대회(네이션스컵/
+    지역컵)는 세계기록실 탭 자체 필터가 아니라, 이 팝업 안에 자체
+    필터를 만들고 그 기본값을 유럽/코파로 하고 싶었다"] filter_options/
+    filter_default/fetch_fn을 주면 상단에 자체 콤보가 생기고, 바꿀 때마다
+    fetch_fn(선택값)을 다시 불러 표를 새로 그린다 — 다이얼로그를 새로
+    열지 않고 같은 창 안에서 바로 갱신된다.
+
+    [2026-08 버그수정, 신민용 리포트: "박스 클릭하고 복사하면 팀명만이
+    아니라 표 전체가 복사된다"] 표 SelectionMode를 NoSelection으로 뒀던
+    게 원인 — 선택 자체가 막혀 있어 클릭해도 셀이 선택되지 않고, 그
+    상태에서 Ctrl+C를 누르면 _enable_plain_copy의 selectedItems()가
+    아무것도 못 찾아 엉뚱하게 동작했다. 다른 '역대 기록' 표들과 동일하게
+    셀 단위 선택이 되도록 기본 선택 모드(ExtendedSelection)를 그대로
+    둔다 — 클릭 한 칸만 복사하면 그 칸만, 드래그로 여러 칸을 잡으면
+    그만큼만 탭/줄바꿈으로 묶여 복사된다(다른 표들과 동일한 동작)."""
+    _PLACE_COLORS = ["#ffd700", "#c0c0c0", "#cd7f32", "#aaddff"]
+
+    def __init__(self, title, data, keys, key_labels, empty_msg="아직 완료된 기록이 없습니다",
+                 filter_label=None, filter_options=None, filter_default=None, fetch_fn=None,
+                 parent=None):
+        super().__init__(parent)
+        self.setWindowModality(Qt.WindowModality.NonModal)
+        self.setWindowTitle(f"{title} — 최다 순위")
+        self.setStyleSheet(STYLE)
+        n_pairs = len(keys)
+        _clamp_and_resize(self, min(340 + n_pairs * 230, 1200), 560)
+
+        self._keys = keys
+        self._empty_msg = empty_msg
+        self._fetch_fn = fetch_fn
+        self._n_cols = 1 + n_pairs * 2
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(14, 12, 14, 12)
+
+        hdr = QLabel(f"🏆 {title}  최다 순위")
+        hdr.setStyleSheet("color:#00cc44;font-size:15px;font-weight:bold;")
+        outer.addWidget(hdr)
+
+        sub = QLabel("역대 순위별로 가장 많이 그 자리를 차지한 팀/국가 순위입니다.")
+        sub.setStyleSheet("color:#888;font-size:11px;")
+        outer.addWidget(sub)
+
+        self._filter_combo = None
+        if filter_options:
+            filt = QHBoxLayout()
+            flbl = QLabel(filter_label or "필터")
+            flbl.setStyleSheet("color:#888;font-size:11px;")
+            filt.addWidget(flbl)
+            combo = QComboBox()
+            for opt_label, opt_value in filter_options:
+                combo.addItem(opt_label, opt_value)
+            idx = combo.findData(filter_default)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            combo.currentIndexChanged.connect(self._on_filter_changed)
+            filt.addWidget(combo)
+            filt.addStretch()
+            outer.addLayout(filt)
+            self._filter_combo = combo
+
+        self._tbl = QTableWidget(0, self._n_cols)
+        self._tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._tbl.verticalHeader().setVisible(False)
+        cols = ["순위"]
+        for lbl in key_labels:
+            cols += [lbl, "횟수"]
+        self._tbl.setHorizontalHeaderLabels(cols)
+        self._tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        for ci in range(1, self._n_cols):
+            mode = (QHeaderView.ResizeMode.Stretch if ci % 2 == 1
+                    else QHeaderView.ResizeMode.ResizeToContents)
+            self._tbl.horizontalHeader().setSectionResizeMode(ci, mode)
+        _enable_plain_copy(self._tbl)
+        outer.addWidget(self._tbl, 1)
+
+        close_btn = QPushButton("닫기")
+        close_btn.setObjectName("closeBtn")
+        close_btn.clicked.connect(self.close)
+        outer.addWidget(close_btn)
+
+        self._populate(data)
+
+    def _on_filter_changed(self, _idx):
+        if not self._fetch_fn or not self._filter_combo:
+            return
+        value = self._filter_combo.currentData()
+        self._populate(self._fetch_fn(value))
+
+    def _populate(self, data):
+        keys = self._keys
+        tbl = self._tbl
+        lists = [data.get(k) or [] for k in keys]
+        n_rows = max((len(lst) for lst in lists), default=0)
+
+        tbl.setRowCount(n_rows)
+        tbl.clearSpans()
+
+        for i in range(n_rows):
+            rank_item = QTableWidgetItem(f"{i + 1}위")
+            rank_item.setForeground(QColor("#ffcc00"))
+            f = rank_item.font(); f.setBold(True); rank_item.setFont(f)
+            rank_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            tbl.setItem(i, 0, rank_item)
+
+            for ki, lst in enumerate(lists):
+                col_name = 1 + ki * 2
+                col_cnt = col_name + 1
+                if i < len(lst):
+                    entry = lst[i]
+                    country = entry.get("country")
+                    disp = f"{entry['name']} ({country})" if country else entry["name"]
+                    name_item = QTableWidgetItem(disp)
+                    name_item.setForeground(QColor(self._PLACE_COLORS[ki % len(self._PLACE_COLORS)]))
+                    if disp != entry["name"]:
+                        name_item.setData(_CLEAN_TEXT_ROLE, entry["name"])
+                    cnt_item = QTableWidgetItem(f"{entry['count']}회")
+                    cnt_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    tbl.setItem(i, col_name, name_item)
+                    tbl.setItem(i, col_cnt, cnt_item)
+                else:
+                    tbl.setItem(i, col_name, QTableWidgetItem("-"))
+                    tbl.setItem(i, col_cnt, QTableWidgetItem(""))
+
+        if n_rows == 0:
+            tbl.setRowCount(1)
+            empty = QTableWidgetItem(self._empty_msg)
+            empty.setForeground(QColor("#666"))
+            tbl.setItem(0, 0, empty)
+            tbl.setSpan(0, 0, 1, self._n_cols)
+
+
 class TournamentDetailDialog(QDialog):
     """대회 하나(월드컵/네이션스컵/챔피언스리그)의 조별리그 순위 + 토너먼트
     대진을 보여주는 상세 창. [성능] 이미 끝난 대회의 기존 경기기록을
@@ -2785,7 +3289,7 @@ class TournamentDetailDialog(QDialog):
         if league_standings:
             lay.addWidget(self._section_label("⚽ 리그 스테이지"))
             lay.addWidget(self._build_league_standings_table(
-                league_standings, detail.get("continent")))
+                league_standings, detail.get("continent"), detail.get("comp_kind")))
 
         knockout = detail.get("knockout") or []
         if knockout:
@@ -2919,14 +3423,21 @@ class TournamentDetailDialog(QDialog):
             lay.addLayout(row)
         return box
 
-    def _build_league_standings_table(self, standings, continent=None):
+    def _build_league_standings_table(self, standings, continent=None, comp_kind="champions"):
         """[2026-07 신설] 챔스 스위스 방식 리그 스테이지 전체 순위표(단일 표).
         조별 카드 대신 순위·팀명·승무패·득실·승점을 한 표로 쭉 보여준다.
 
         [2026-07 추가, 신민용 요청: "경기 일정 화면처럼 직행/플레이오프
         색깔 구분이 역대 기록에도 있으면 좋겠다"] schedule_window.py의
         진행 중 화면과 완전히 같은 색상 체계(초록=직행/주황=플레이오프/
-        회색=탈락권)를 그대로 재사용해서 통일감을 준다."""
+        회색=탈락권)를 그대로 재사용해서 통일감을 준다.
+        [2026-08 버그수정, 신민용 리포트: "역대 기록 상세의 직행/플레이오프
+        범례가 유로파/컨퍼런스도 챔스 컷(북남미 1~16/17~48)을 그대로
+        쓰고 있다"] 챔스/유로파/컨퍼런스가 이 표를 공용으로 쓰는데,
+        컷 라인은 항상 챔스 전용 대륙별 상수(CL_DIRECT_CUT_BY_CONTINENT
+        등 — 북남미만 48팀 규모)에서 가져왔었다. 유로파/컨퍼런스는
+        대륙 무관 고정값(8직행/16풀, europa_engine._el_direct_cut 등)을
+        쓰므로, comp_kind로 어느 대회인지 구분해서 올바른 값을 쓴다."""
         from PyQt6.QtGui import QColor
         COLOR_ADVANCE = QColor("#00cc44")
         COLOR_THIRD   = QColor("#ffaa00")
@@ -2934,9 +3445,16 @@ class TournamentDetailDialog(QDialog):
 
         direct_cut = playoff_cut = None
         if continent:
-            from competition.champions_engine import CL_DIRECT_CUT_BY_CONTINENT, CL_PLAYOFF_POOL_BY_CONTINENT
-            direct_cut = CL_DIRECT_CUT_BY_CONTINENT.get(continent)
-            playoff_pool = CL_PLAYOFF_POOL_BY_CONTINENT.get(continent)
+            if comp_kind == "champions":
+                from competition.champions_engine import (
+                    CL_DIRECT_CUT_BY_CONTINENT, CL_PLAYOFF_POOL_BY_CONTINENT)
+                direct_cut = CL_DIRECT_CUT_BY_CONTINENT.get(continent)
+                playoff_pool = CL_PLAYOFF_POOL_BY_CONTINENT.get(continent)
+            else:
+                # 유로파/컨퍼런스는 대륙 무관 고정값(8직행/16풀) — 둘 다
+                # 값이 같아서 comp_kind 구분 없이 바로 써도 된다.
+                direct_cut = 8
+                playoff_pool = 16
             # [2026-07 버그수정, 신민용 리포트] playoff_cut은 direct_cut+playoff_pool이어야 하는데
             # playoff_pool을 그대로 컷 라인으로 쓴 버그(유럽 8+16=24위가 정확한데 16위까지로 잘물었음).
             playoff_cut = (direct_cut + playoff_pool) if (direct_cut is not None and playoff_pool is not None) else None

@@ -162,35 +162,44 @@ class MainWindow(QMainWindow):
     def refresh_all(self):
         self.refresh_light()
         # 진행(NEXT DAY) 직후 열려 있는 보조 창들을 함께 갱신한다.
-        #   - 경기 일정 창 / 순위표 창 둘 다. 1주씩·하루씩 모드 모두 이 메서드를
-        #     거치므로 모드와 무관하게 즉시 최신 상태가 된다.
+        #   - 순위표 창은 이미 refresh_light()에서 매일 갱신되므로 여기선
+        #     일정 창만 추가로 갱신한다(묶음/1주 끝에만 — 13개 탭 동기
+        #     렌더링 비용이 있어 매일 부르면 안 됨).
         #   - 창이 닫혔거나 파괴됐으면 조용히 건너뛴다(비용 0).
         self._refresh_aux_window("_schedule_win")
-        self._refresh_aux_window("_standings_win")
 
     def refresh_light(self):
         """[2026-08 신설, 신민용 리포트: "하루씩 진행이 1주씩보다 더 렉걸린다"]
-        하루씩(스텝) 모드에서 묶음(7일) 도중 매일 부르기 위한 가벼운 갱신.
+        [2026-08 수정, 신민용 리포트: "순위표가 하루씩 모드에서 실시간
+        반영이 안 됨"] 하루씩(스텝) 모드에서 묶음(7일) 도중 매일 부르기
+        위한 갱신 — 순위표 창은 매일, 일정 창은 묶음(1주) 끝에만.
 
-        원인: refresh_all()이 매번 _schedule_win/_standings_win까지 다시
-        그렸는데, 특히 순위표 창은 열려있으면 get_league_standings()를
-        리그 수만큼 재계산한다([PERF-STAND] 로그 기준 회당 0.1~0.5s+).
-        1주씩 모드는 이걸 1번만 내면 되는데, 하루씩 모드는 같은 1주를
-        진행해도 버튼을 7번 눌러 이 무거운 갱신을 7번 반복하고 있었다
-        (center_panel._on_advance_finished가 매 클릭마다 refresh_all을
-        불렀음).
+        원인 재실측 결과: 애초에 순위표 창(get_league_standings())은
+        실제 세이브 50팀 리그 기준 1.5~4.5ms로 원래도 가벼웠다 —
+        "0.1~0.5s+"라던 예전 추정은 부정확했다. 진짜 무거운 쪽은 일정
+        창(_schedule_win) 하나였다 — 13개 탭(내경기/전체일정/국제대회
+        예선·본선/챔스/컵대회 등)을 매번 동기적으로 다 그리는 고정비용이
+        실측 0.05초 이상으로 이미 별도 진단된 바 있다(관련 계측 코드가
+        ui/schedule_window.py._fill_tabs()에 남아있음). 하루씩 모드가
+        1주씩보다 느렸던 진짜 원인은 이 일정 창 갱신을 매일 반복한
+        것이었다 — 순위표는 애초에 범인이 아니었다.
 
-        그래서 갱신을 "매일 필요한 가벼운 것"과 "묶음 끝에 한 번만 하면
-        되는 무거운 것"으로 분리한다. 날짜/진행률(center_panel의 phase
-        라벨·요일 콤보 표시)·선수 패널·로그는 하루하루 실제로 바뀌므로
-        step_mode 중에도 매일 갱신해야 화면이 밀리지 않는다. 반대로
-        일정 창/순위표 창(보조 창)은 스냅샷 성격이라 묶음(1주)이 끝났을
-        때만 최신화해도 사용자 체감상 전혀 문제없다 — 실제로 1주씩
-        모드는 원래부터 그렇게 딱 1번만 갱신해왔다."""
+        그래서 "일정 창/순위표 창을 묶어서 둘 다 주 1회만" 갱신하던
+        기존 방식을 풀어, 순위표만 따로 매일 갱신한다(가벼우니 매일
+        갱신해도 체감 렉이 없다) — 일정 창은 여전히 묶음 끝(refresh_all,
+        bundle_done=True)에만 갱신해 렉 재발을 막는다.
+
+        날짜/진행률(center_panel의 phase 라벨·요일 콤보 표시)·선수
+        패널·로그는 하루하루 실제로 바뀌므로 step_mode 중에도 매일
+        갱신해야 화면이 밀리지 않는다."""
         self._update_top()
         self.player_panel.refresh()
         self.center_panel.refresh()
         self.log_panel.refresh()
+        # [2026-08 신설] 순위표만 매일 갱신 — _refresh_aux_window가 창이
+        # 닫혀있으면 알아서 스킵하므로(비용 0), 열려있을 때만 실제로
+        # get_league_standings()가 매일 다시 도는 구조다(1.5~4.5ms 수준).
+        self._refresh_aux_window("_standings_win")
 
     def _refresh_aux_window(self, attr):
         """center_panel 에 보관된 보조 창(attr) 이 열려 있으면 refresh() 한다.

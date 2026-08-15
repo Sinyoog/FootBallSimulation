@@ -1164,6 +1164,12 @@ def init_db():
         # 직접 남겨서 이름 충돌과 무관하게 정확히 조회할 수 있게 한다.
         "ALTER TABLE promotion_log ADD COLUMN from_league_id INTEGER DEFAULT 0",
         "ALTER TABLE promotion_log ADD COLUMN to_league_id INTEGER DEFAULT 0",
+        # [2026-08 신설, 신민용 리포트: "승격팀 강등팀 겹치는데?" 진단 중
+        # 발견] promotion_log가 team_name만 저장해서, 이름이 같은 서로
+        # 다른 팀(동명이팀 — 이 게임엔 흔함, 실측 230종류)이 같은 해에
+        # 각각 승격/강등하면 "같은 팀이 승격+강등 둘 다"로 오판하게 됐다.
+        # team_id를 추가해 이후로는 이름이 아니라 팀 자체로 정확히 추적한다.
+        "ALTER TABLE promotion_log ADD COLUMN team_id INTEGER DEFAULT 0",
         # [2026-07 신설] 컵대회/챔스/국제대회에서 내가 결장한 이유(부상/출전정지
         # 등)를 기록 — 신민용 요청: 커리어 세부 기록·은퇴창·AI 요약에
         # "(부상)"/"(출전정지)" 식으로 표시하기 위함. NULL이면 정상 출전.

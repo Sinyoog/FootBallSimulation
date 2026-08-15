@@ -47,24 +47,35 @@ EUROPA_CFG = CompetitionConfig(
 
 
 # ─────────────────────────────────────────────
-# 대륙별 규모 (챔스와 동일 비율 재사용 — C그룹, 유로파 전용 값이 필요해지면
-# 이 함수들만 바꾸면 된다)
+# 대륙별 규모
+# [2026-08 버그수정, 신민용 리포트: "유로파/컨퍼런스는 대륙 다 36팀으로
+# 같은데 왜 북남미만 1~16 직행/17~36 플레이오프로 챔스랑 다르게 가?"]
+# continental_qualification.QUALIFICATION_TEAM_CAP을 36으로 통일해서
+# "누가 참가하는지"는 이미 대륙 무관 36팀으로 고쳐놨는데, "대회를 어떻게
+# 진행하는지"(직행/플레이오프 컷)는 이 함수들이 여전히 챔스 전용 상수
+# (CL_TEAMS_BY_CONTINENT 등 — 북남미만 48팀 기준 team_cap=48/direct_cut=16/
+# playoff_pool=32)를 그대로 물려받고 있었다. 실제 참가자는 36명인데 진행
+# 로직은 48명 규모를 가정해서, 나머지(48-16=32명 목표였던) 플레이오프
+# 풀이 실제로는 36-16=20명(17~36위)만 채워지는 불일치가 났던 것 — 이게
+# "북남미만 1~16 직행/17~36 플레이오프"로 보였던 원인.
+# 유로파/컨퍼런스는 대륙 무관하게 항상 유럽과 똑같은 구조(36팀/8경기/
+# 8직행/16풀=9~24위 플레이오프)를 쓴다 — continent 인자는 형식만 유지.
 # ─────────────────────────────────────────────
 
 def _el_team_cap(continent):
-    return _cl._cl_team_cap(continent)
+    return 36
 
 
 def _el_league_games(continent):
-    return _cl._cl_league_games(continent)
+    return 8
 
 
 def _el_direct_cut(continent):
-    return _cl._cl_direct_cut(continent)
+    return 8
 
 
 def _el_playoff_pool(continent):
-    return _cl._cl_playoff_pool(continent)
+    return 16
 
 
 # ─────────────────────────────────────────────

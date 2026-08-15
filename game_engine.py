@@ -471,6 +471,35 @@ def recalc_ovr(p: dict) -> int:
     return calc_ovr(p.get("position", "CM"), stats, cap=_cap)
 
 
+def _position_mismatch_rank(primary_pos: str, field_pos: str) -> int:
+    """[2026-08 신설] primary_pos(등록 주 포지션) 기준으로 field_pos(실제
+    배치 포지션)가 몇 순위인지 반환. POSITION_COMPAT 리스트 안에 있으면
+    그 인덱스(0=주 포지션 자신), 리스트에 없으면(완전히 안 맞는 포지션)
+    POSITION_MISMATCH_PENALTY의 마지막 인덱스(조건부, 가장 큰 페널티)로
+    취급한다."""
+    compat = POSITION_COMPAT.get(primary_pos, [primary_pos])
+    if field_pos in compat:
+        rank = compat.index(field_pos)
+    else:
+        rank = len(POSITION_MISMATCH_PENALTY) - 1
+    return min(rank, len(POSITION_MISMATCH_PENALTY) - 1)
+
+
+def calc_positional_ovr(primary_pos: str, stats: dict, field_pos: str, cap: int = 100) -> float:
+    """[2026-08 신설, 신민용 확정] 특정 포지션(field_pos)에 배치됐을 때의
+    '실질 OVR' — calc_ovr(field_pos, stats)로 그 포지션 가중치 기준 OVR을
+    먼저 구하고(포지션 적합도의 1차 반영, WEIGHTS 차이에서 이미 발생),
+    거기에 POSITION_MISMATCH_PENALTY(주 포지션과 얼마나 먼 자리인지에 따른
+    작은 절대 OVR 보정 — 그 포지션이 '전문 분야가 아니다'라는 추가 감점)를
+    뺀다. 두 페널티의 역할을 겹치지 않게 분리하는 게 핵심이라, 여기 절대
+    차감폭은 -0.5~-5.0으로 작게 유지한다(그 이상은 이중 페널티가 된다).
+    field_pos == primary_pos면 당연히 차감 없음(주 포지션 그대로)."""
+    base = calc_ovr(field_pos, stats, cap=cap)
+    rank = _position_mismatch_rank(primary_pos, field_pos)
+    penalty = POSITION_MISMATCH_PENALTY[rank]
+    return round(base - penalty, 1)
+
+
 def _age_train_eff(age: int, peak_age: int) -> float:
     """나이별 훈련 효율 배수.
     [2026-07 재설계, 신민용 지적: "16~18세 더딤이 현실적인가?"] 예전엔
@@ -3617,7 +3646,16 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None, opp_sot=Non
     수비수는 실점 관여 확률 트리거 감점.
     """
     pos       = get_field_pos(p)
-    _my_ovr   = p.get("ovr", 50)
+    # [2026-08 신설, 신민용 확정: "일단 내 선수만"] 배치 포지션(pos)이 주
+    # 포지션과 다르면 POSITION_MISMATCH_PENALTY만큼 실질 OVR을 깎는다.
+    # calc_ovr(pos, stats)가 이미 그 포지션 가중치 기준 1차 차이를 반영하고,
+    # 여기 절대 차감은 "전문 포지션이 아니다"라는 작은 추가 보정이다.
+    # pos==주 포지션이면 페널티 0이라 기존 p["ovr"]과 값이 동일하다(하위호환).
+    # AI 선수는 아직 대상이 아님(신민용 확정 — 안전 확인 후 확장 예정),
+    # my_player만 이 함수를 거치므로 자동으로 범위가 제한된다.
+    _stats_for_ovr = {s: p.get(s, 40) for s in ALL_STATS}
+    _ovr_cap = p.get("talent_cap", 100) if p.get("talent_tier") == "god" else 100
+    _my_ovr   = calc_positional_ovr(p.get("position", "CM"), _stats_for_ovr, pos, cap=_ovr_cap)
     my_score  = hs if is_home else as_
     opp_score = as_ if is_home else hs
     goals = assists = saves = 0
@@ -8638,9 +8676,9 @@ def enforce_affiliate_children_tier(parent_team_id: int, year: int) -> None:
                       (new_lid_row["id"], new_tier, child["id"]))
             c.execute(
                 """INSERT INTO promotion_log(year,team_name,from_tier,to_tier,league_name,
-                                              from_league_id,to_league_id) VALUES(?,?,?,?,?,?,?)""",
+                                              from_league_id,to_league_id,team_id) VALUES(?,?,?,?,?,?,?,?)""",
                 (year, child["name"], child_tier, new_tier, "",
-                 cur_lid_row["id"] if cur_lid_row else None, new_lid_row["id"]))
+                 cur_lid_row["id"] if cur_lid_row else None, new_lid_row["id"], child["id"]))
             print(f"[산하팀 tier 보정-PO] {year}년 {child['name']} 강제 강등 "
                   f"{child_tier}부→{new_tier}부 (모팀 플레이오프 결과와 tier 충돌 즉시 회피)")
             any_change = True
@@ -9112,6 +9150,21 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
                     _new_bottom_upper_list.append(_cand)
                 bottom_upper_list = _new_bottom_upper_list
 
+            # [2026-08 버그수정, 신민용 리포트: "프리미어리그 21팀으로 늘어남,
+            # 승격팀·강등팀 겹침"] club_strength 보호로 "대신 내려갈 팀"이
+            # 뽑히면, 그 팀이 곧바로 아래(_upper_po_zone) PO 후보 계산에서
+            # moved_teams로 걸러져야 하는데 — 지금까지는 이 등록이 한참 뒤
+            # (실제 이동 처리 루프)에서야 일어나서, 같은 팀이 "강등 확정"과
+            # "1부 잔류 PO 참가자"에 동시에 뽑히는 이중 배정이 가능했다.
+            # PO가 끝난 뒤 "2부에 있는 팀이 이겼다"로 오인해 승격으로 다시
+            # 기록되면서 팀 수가 +1 되는 게 실제 증상(21팀 버그)이었다.
+            # bottom_upper_list/top_lower_list가 확정되는 이 시점에 바로
+            # moved_teams를 갱신해서, 아래 PO 후보 계산이 정확히 걸러내게
+            # 한다(뒤쪽 실제 이동 처리 루프의 moved_teams.add()는 그대로 둬도
+            # 이미 들어있는 id를 다시 추가하는 것뿐이라 안전하다).
+            moved_teams.update(r["id"] for r in bottom_upper_list)
+            moved_teams.update(r["id"] for r in top_lower_list)
+
             if n_actual == 0 and not po_exists:
                 continue
 
@@ -9226,7 +9279,7 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
                 if _upper_avg is not None:
                     _rescale_jobs.append((top_lower["id"], _upper_avg))
                 _promotion_log_inserts.append((year, tl_info["name"], ntier, tier, tl_info["lname"],
-                                                lower_lid, upper_lid))
+                                                lower_lid, upper_lid, top_lower["id"]))
                 _promo_log_entry_for_team[top_lower["id"]] = _promotion_log_inserts[-1]
                 tl_is_mine = (top_lower["id"] in my_season_teams)
                 if tl_is_mine or my_league_id in (upper_lid, lower_lid):
@@ -9276,7 +9329,7 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
                         _RELEGATION_DEBUG_TRACK[bottom_upper["id"]] = {
                             "name": bu_info["name"], "season": season, "checkpoints": {}}
                 _promotion_log_inserts.append((year, bu_info["name"], tier, ntier, bu_info["lname"],
-                                                upper_lid, lower_lid))
+                                                upper_lid, lower_lid, bottom_upper["id"]))
                 if bottom_upper["id"] == my_team_id or my_league_id in (upper_lid, lower_lid):
                     pending_logs.append((f"🔽 {year}년  {bu_info['name']}  {tier}부→{ntier}부  (강등)", "event"))
                 if bottom_upper["id"] == my_team_id:
@@ -9393,7 +9446,8 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
                         _pending_tier[_repl["id"]] = _cur_tier
                         moved_teams.add(_repl["id"])
                         _rname, _rlname = _team_info_cache.get(_repl["id"], ("", ""))
-                        _new_entry = (year, _rname, _orig_tier, _cur_tier, _rlname, _orig_lid, _upper_lid_conflict)
+                        _new_entry = (year, _rname, _orig_tier, _cur_tier, _rlname, _orig_lid,
+                                      _upper_lid_conflict, _repl["id"])
                         _promotion_log_inserts.append(_new_entry)
                         print(f"[산하팀 tier 보정] {year}년 {_rname}이(가) 대신 "
                               f"{_orig_tier}부→{_cur_tier}부 승격")
@@ -9448,7 +9502,7 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
                     _team_move_updates.append((_new_lid2, _new_tier2, _tid))
                     moved_teams.add(_tid)
                     _promotion_log_inserts.append(
-                        (year, _tname, _cur_tier, _new_tier2, _tlname, _cur_lid2, _new_lid2))
+                        (year, _tname, _cur_tier, _new_tier2, _tlname, _cur_lid2, _new_lid2, _tid))
                     print(f"[산하팀 tier 보정] {year}년 {_tname} 강제 강등 "
                           f"{_cur_tier}부→{_new_tier2}부 (모팀과 tier 충돌 회피)")
                     _audit({**_audit_base, "correction_action": "FORCE_RELEGATE",
@@ -9503,7 +9557,7 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
     if _promotion_log_inserts:
         c.executemany(
             """INSERT INTO promotion_log(year,team_name,from_tier,to_tier,league_name,
-                                          from_league_id,to_league_id) VALUES(?,?,?,?,?,?,?)""",
+                                          from_league_id,to_league_id,team_id) VALUES(?,?,?,?,?,?,?,?)""",
             _promotion_log_inserts)
     if _po_pending_inserts:
         c.executemany(
