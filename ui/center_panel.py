@@ -6,10 +6,10 @@ import json
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QComboBox, QFrame, QMessageBox,
-    QGraphicsDropShadowEffect
+    QGraphicsDropShadowEffect, QMenu, QProgressBar
 )
 from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QThread, pyqtSignal
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QAction
 
 from game_engine import (
     get_player, get_state, set_state, advance_4weeks, advance_days,
@@ -44,30 +44,93 @@ class _ProcessingOverlay(QWidget):
     구분이 안 갔다(마우스를 안 움직이면 커서 모양 변화조차 못 봄). 실제 처리
     시간 자체를 줄이는 것과 별개로, "지금 뭘 하고 있는지"를 화면에 명시해서
     같은 대기시간이라도 고장으로 오인하지 않게 한다.
-    """
+
+    [2026-08 확장, 신민용 요청: "1년 넘기기 로딩 UI가 이상하다"] 처음엔
+    1년 넘기기 전용으로 별도 오버레이 클래스(_YearProgressOverlay)를 새로
+    만들었는데, 화면 전체를 덮지 못하고 엉뚱한 위치/크기로 뜨는 문제가
+    있었다 — 원인을 오래 추적하는 대신, 이미 정상 동작이 검증된 이
+    클래스에 진행률 바(옵션)만 추가해서 재사용하는 쪽으로 바꿨다. 같은
+    부모(target)·같은 geometry 계산 경로를 그대로 타므로 위치 문제가
+    구조적으로 재발할 수 없다."""
     def __init__(self, parent):
         super().__init__(parent)
         self.setStyleSheet("background: rgba(10,10,10,0.72);")
         lay = QVBoxLayout(self)
         lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._label = QLabel("⏳ 처리 중...")
-        self._label.setStyleSheet("""
-            color:white; font-size:16px; font-weight:bold;
+
+        box = QFrame()
+        box.setStyleSheet("""
             background: rgba(30,30,30,0.9); border:1px solid #555;
-            border-radius:10px; padding:18px 28px;
+            border-radius:10px;
         """)
+        # [2026-08 버그수정, 신민용 리포트: "로딩창 바가 왼쪽 끝에 붙어있고
+        # 박스도 그거에 맞춰 줄여달라"] 실제 메인윈도우 구조(QSplitter +
+        # QScrollArea 3분할)로 재현해보니, lay.setAlignment(AlignCenter)를
+        # 줬는데도 이 box가 sizeHint(~378px)를 무시하고 overlay 거의 전체
+        # 너비(예: 1400px 창에서 1382px)까지 늘어나는 현상이 실제로
+        # 있었다 — 그 결과 안에 있는 고정폭(320px) 진행률 바가 커진 박스의
+        # 왼쪽에 쏠려 보였다. 최대 너비를 명시적으로 못박아 늘어남 자체를
+        # 막는다(내용물 기준 380px면 여유 있게 들어감).
+        box.setMaximumWidth(380)
+        box_lay = QVBoxLayout(box)
+        box_lay.setContentsMargins(28, 20, 28, 20)
+        box_lay.setSpacing(10)
+
+        self._label = QLabel("⏳ 처리 중...")
+        self._label.setStyleSheet("color:white; font-size:16px; font-weight:bold; background:transparent; border:none;")
         self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lay.addWidget(self._label)
+        box_lay.addWidget(self._label)
+
+        # 진행률 바 + 보조 라벨(예: "3 / 52주") — 기본은 숨김, 1년 넘기기
+        # 처럼 여러 단계를 밟는 작업일 때만 show_progress()로 켠다.
+        self._bar = QProgressBar()
+        self._bar.setMinimum(0)
+        self._bar.setFixedWidth(320)
+        self._bar.setTextVisible(True)
+        self._bar.setStyleSheet("""
+            QProgressBar { background:#222; border:1px solid #555; border-radius:6px;
+                            color:white; font-weight:bold; text-align:center; height:22px; }
+            QProgressBar::chunk { background-color:#006622; border-radius:5px; }
+        """)
+        box_lay.addWidget(self._bar, 0, Qt.AlignmentFlag.AlignHCenter)
+        self._bar.hide()
+
+        self._sub_label = QLabel("")
+        self._sub_label.setStyleSheet("color:#999; font-size:11px; background:transparent; border:none;")
+        self._sub_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        box_lay.addWidget(self._sub_label)
+        self._sub_label.hide()
+
+        lay.addWidget(box, 0, Qt.AlignmentFlag.AlignCenter)
         self.hide()
 
-    def show_message(self, text):
-        self._label.setText(text)
+    def _reposition_and_show(self):
         if self.parent():
             self.setGeometry(self.parent().rect())
         self.raise_()
         self.show()
         from PyQt6.QtWidgets import QApplication
         QApplication.processEvents()
+
+    def show_message(self, text):
+        """단순 텍스트만 보여주는 기존 방식(진행률 바는 숨김)."""
+        self._label.setText(text)
+        self._bar.hide()
+        self._sub_label.hide()
+        self._reposition_and_show()
+
+    def show_progress(self, text, done: int, total: int):
+        """[2026-08 신설] 진행률 바가 있는 버전 — 1년 넘기기처럼 여러 단계로
+        나뉘는 작업에 쓴다. 이미 떠 있는 상태에서 done/total만 바꿔가며
+        반복 호출해도 된다(매번 geometry를 다시 잡으므로 창 크기 변경에도
+        안전)."""
+        self._label.setText(text)
+        self._bar.show()
+        self._sub_label.show()
+        self._bar.setMaximum(max(1, total))
+        self._bar.setValue(done)
+        self._sub_label.setText(f"{done} / {total}주")
+        self._reposition_and_show()
 
 TRAIN_OPTS_KO = ["고강도","중강도","강점훈련","약점훈련","저강도","휴식"]
 TRAIN_MAP_KO  = {"고강도":"고강도","중강도":"중강도",
@@ -198,6 +261,7 @@ class CenterPanel(QWidget):
         self._join_used        = False   # 이번 달 팀 입단 버튼 사용 여부
         self._skip_join_lock   = False   # 전부 결렬→1년 훈련 보류 플래그
         self._auto_offer_shown = False   # 이번 구간 자동 오퍼 표시 여부
+        self._join_reminder_shown_week = None   # 팀 없음 알림 중복 방지(주차별 1회)
         # ── 1주씩 보기 상태 ──
         # _step_mode : 1주씩 보기 on/off
         # _locked_sched : 하루씩 진행 시작 시 고정한 1주(7일) 일정 (7개)
@@ -205,6 +269,17 @@ class CenterPanel(QWidget):
         self._step_mode    = False
         self._locked_sched = None
         self._step_idx     = 0
+        # ── 1년 넘기기 상태 ── [2026-08 신설, 신민용 요청: "팀 없을 때 1년
+        # 넘기기". 팀이 없을 때만 선택 가능한 별도 모드 — 켜져 있으면
+        # _advance()가 1주씩 52번을 자동으로 이어서 진행하며, 매 주마다
+        # 처음 설정해둔 7일 패턴을 그대로 반복한다. day/week 모드와 달리
+        # 세이브에 영속화하지 않는다(한 번 눌러 끝까지 도는 일회성 동작).
+        self._year_mode        = False   # 모드 선택 상태(메뉴에서 "1년" 선택함)
+        self._year_active      = False   # 실제로 52주 루프가 도는 중인지
+        self._year_pattern     = None    # 반복할 7일 패턴(콤보 텍스트 리스트)
+        self._year_weeks_total = 0
+        self._year_weeks_done  = 0
+        self._year_paused      = False   # 중단됐지만 이어서 재개 가능한 상태
         self._restoring    = False   # 복원 중 콤보 시그널이 저장을 되부르는 것 방지
         # [2026-07 추가] 경기 전날 강제휴식이 원래 선택을 덮어쓴 뒤, 그 경기가
         # 없어졌을 때(일정 재생성 등) 원래 선택으로 되돌리기 위한 저장소.
@@ -338,12 +413,11 @@ class CenterPanel(QWidget):
         self.adv_btn.clicked.connect(self._advance)
         adv_row.addWidget(self.adv_btn, 1)
 
-        # 하루씩/1주씩 모드 토글
+        # 하루씩/1주씩/1년 모드 선택
         self.btn_mode = QPushButton("📅 1주씩")
         self.btn_mode.setObjectName("modeBtn")
-        self.btn_mode.setCheckable(True)
-        self.btn_mode.setToolTip("클릭하면 하루씩 보기 / 1주씩 보기 전환")
-        self.btn_mode.clicked.connect(self._toggle_mode)
+        self.btn_mode.setToolTip("클릭하면 하루씩 / 1주씩 / 1년 넘기기 중 선택합니다")
+        self.btn_mode.clicked.connect(self._show_mode_menu)
         adv_row.addWidget(self.btn_mode)
         self.lay.addLayout(adv_row)
 
@@ -512,9 +586,8 @@ class CenterPanel(QWidget):
                 self._locked_sched = None
                 self._step_idx     = 0
 
-            # 토글 버튼 라벨/체크 상태를 복원된 모드에 맞춘다.
+            # 버튼 라벨을 복원된 모드에 맞춘다(더 이상 체크형 토글이 아님).
             try:
-                self.btn_mode.setChecked(self._step_mode)
                 self.btn_mode.setText("📆 하루씩" if self._step_mode else "📅 1주씩")
             except Exception:
                 pass
@@ -596,6 +669,14 @@ class CenterPanel(QWidget):
                 f"{phase}  |  {season}시즌  "
                 f"{day_to_full_date_str(year, bundle_start)} ({day_to_week(bundle_start)}주차)  (하루씩 {done}/{DAY_BUNDLE_SIZE})")
             self.adv_btn.setText(f"▶  하루 진행  ({day_to_full_date_str(year, day)}, {done+1}/{DAY_BUNDLE_SIZE}일차)")
+        elif self._year_mode:
+            # [2026-08 신설] 1년 넘기기 모드에서는 adv_btn 라벨을
+            # _set_mode_year/_pause_year_mode가 이미 "1년 넘기기 (이어하기)"
+            # 형태로 맞춰뒀다 — 여기서 "이번 주 진행"으로 되돌리면 안 된다.
+            # 날짜 표시줄만 갱신하고 버튼 텍스트는 건드리지 않는다.
+            self.lbl_phase.setText(
+                f"{phase}  |  {season}시즌  "
+                f"{day_to_full_date_str(year, day)} ({week}주차)  (🗓 1년 넘기기 모드)")
         else:
             self.lbl_phase.setText(
                 f"{phase}  |  {season}시즌  "
@@ -1248,25 +1329,112 @@ class CenterPanel(QWidget):
 
     # ── 모드 토글 ────────────────────────────────
 
-    def _toggle_mode(self):
-        """하루씩 보기 ↔ 1주씩 보기 전환.
-        단, 하루씩 진행 도중(묶음 일부만 진행)에는 전환 불가."""
-        if self._step_idx > 0:
-            # 묶음 진행 중 → 전환 막고 버튼 상태 원위치
-            self.btn_mode.setChecked(self._step_mode)
+    _MODE_MENU_STYLE = """
+        QMenu {
+            background-color:#2a2a2a; color:#eee;
+            border:1px solid #444; border-radius:6px; padding:4px;
+        }
+        QMenu::item {
+            background-color:transparent; color:#eee;
+            padding:8px 16px; border-radius:4px; margin:1px;
+        }
+        QMenu::item:selected { background-color:#3a6a3a; color:white; }
+        QMenu::item:disabled { color: rgba(238,238,238,70); background-color:transparent; }
+        QMenu::separator { height:1px; background:#444; margin:4px 6px; }
+    """
+
+    def _show_mode_menu(self):
+        """[2026-08 신설] 진행 모드 선택 메뉴 — 하루씩/1주씩/1년 넘기기.
+        기존엔 버튼 클릭이 곧바로 하루씩↔1주씩 토글이었는데, "1년 넘기기"
+        옵션이 추가되면서 세 개 중 하나를 고르는 메뉴 방식으로 바꿨다.
+        "1년 넘기기"는 팀이 없을 때만 활성화된다 — 있으면 기본 회색이 아니라
+        앱 전체 다크 테마에 맞춘 반투명한 글자색으로 흐리게 표시된다."""
+        if self._step_idx > 0 or self._year_active:
             show_toast(self, "⚠  진행 중인 1주를 끝낸 뒤 전환할 수 있습니다", "#cc6600", 1600)
             return
 
-        self._step_mode = self.btn_mode.isChecked()
-        if self._step_mode:
-            self.btn_mode.setText("📆 하루씩")
-            show_toast(self, "🔍 하루씩 보기  —  1주 일정대로 하루씩 진행", "#664400", 1500)
+        p = get_player()
+        has_team = bool(p and p.get("current_team_id"))
+
+        menu = QMenu(self)
+        menu.setStyleSheet(self._MODE_MENU_STYLE)
+        act_day  = QAction("📆 하루씩", self)
+        act_week = QAction("📅 1주씩", self)
+        act_year = QAction("🗓 1년 넘기기 (팀 없을 때만)", self)
+        act_year.setEnabled(not has_team)
+        menu.addAction(act_day)
+        menu.addAction(act_week)
+        menu.addSeparator()
+        menu.addAction(act_year)
+
+        act_day.triggered.connect(self._set_mode_day)
+        act_week.triggered.connect(self._set_mode_week)
+        act_year.triggered.connect(self._set_mode_year)
+
+        # [2026-08] 커서 위치가 아니라 버튼 바로 아래에 뜨도록 — 다른 앱
+        # 메뉴/콤보박스와 동일한 위치 관례를 따른다(임의 커서 위치보다
+        # 예측 가능함).
+        menu.exec(self.btn_mode.mapToGlobal(self.btn_mode.rect().bottomLeft()))
+
+    def _set_mode_day(self):
+        """하루씩 보기로 전환. 대기 중인 1년 넘기기 재개 상태는 버린다."""
+        self._year_mode        = False
+        self._year_paused      = False
+        self._year_pattern     = None
+        self._year_weeks_done  = 0
+        self._year_weeks_total = 0
+        self._step_mode = True
+        self.btn_mode.setText("📆 하루씩")
+        self.adv_btn.setText("▶▶  이번 주 진행")
+        show_toast(self, "🔍 하루씩 보기  —  1주 일정대로 하루씩 진행", "#664400", 1500)
+        self._save_ui_state()
+        self.refresh()
+
+    def _set_mode_week(self):
+        """1주씩 보기로 전환. 대기 중인 1년 넘기기 재개 상태는 버린다."""
+        self._year_mode        = False
+        self._year_paused      = False
+        self._year_pattern     = None
+        self._year_weeks_done  = 0
+        self._year_weeks_total = 0
+        self._step_mode    = False
+        self._locked_sched = None
+        self._step_idx     = 0
+        self.btn_mode.setText("📅 1주씩")
+        self.adv_btn.setText("▶▶  이번 주 진행")
+        show_toast(self, "📅 1주씩 보기  —  한 주씩 진행", "#006622", 1400)
+        self._save_ui_state()
+        self.refresh()
+
+    def _set_mode_year(self):
+        """[2026-08 신설] 1년 넘기기 모드 선택. 지금 화면에 짜여 있는 7일
+        패턴을 그대로 52번(=364일=1년) 반복할 준비만 여기서 하고, 실제
+        진행은 여전히 진행 버튼(adv_btn)을 눌러야 시작된다 — 메뉴에서
+        고르자마자 바로 진행되면 실수로 1년을 통째로 날릴 수 있어서다.
+
+        [2026-08 재개 기능 추가] 국가대표 선택 등으로 중단됐던 진행이
+        있으면(_year_paused) 그 진행 상황(_year_weeks_done/_year_pattern)을
+        그대로 두고 "이어하기" 라벨만 보여준다 — 처음부터 다시 시작하지
+        않는다."""
+        p = get_player()
+        if p and p.get("current_team_id"):
+            show_toast(self, "⚠  팀이 있으면 1년 넘기기를 쓸 수 없습니다", "#cc6600", 1600)
+            return
+        self._year_mode    = True
+        self._step_mode    = False
+        self._locked_sched = None
+        self._step_idx     = 0
+        self.btn_mode.setText("🗓 1년")
+        if self._year_paused and self._year_weeks_total:
+            self.adv_btn.setText(
+                f"▶▶  1년 넘기기 이어하기 ({self._year_weeks_done}/{self._year_weeks_total}주)")
+            show_toast(self, f"🗓 1년 넘기기 이어서 진행합니다 "
+                             f"({self._year_weeks_done}/{self._year_weeks_total}주 완료)",
+                       "#664400", 2200)
         else:
-            self.btn_mode.setText("📅 1주씩")
-            self._locked_sched = None
-            self._step_idx     = 0
-            show_toast(self, "📅 1주씩 보기  —  한 주씩 진행", "#006622", 1400)
-        self._save_ui_state()   # 모드 전환 결과를 세이브에 반영
+            self.adv_btn.setText("▶▶  1년 넘기기 (지금 일정 반복)")
+            show_toast(self, "🗓 1년 넘기기 모드  —  지금 짜둔 일정이 52주 동안 반복됩니다",
+                       "#664400", 2200)
         self.refresh()
 
     # ── 진행 ─────────────────────────────────────
@@ -1304,6 +1472,9 @@ class CenterPanel(QWidget):
             self._proc_overlay.hide()
 
     def _advance(self):
+        if self._year_mode:
+            self._advance_year_start()
+            return
         from PyQt6.QtWidgets import QApplication
         from PyQt6.QtCore import Qt as _Qt
         # [UX] 진행 중 버튼 비활성화 + 로딩 커서 → 처리 완료 후 즉시 복원
@@ -1343,16 +1514,18 @@ class CenterPanel(QWidget):
         from constants import MIN_JOIN_AGE, SEASON_PHASES
         _ps_s, _ps_e = SEASON_PHASES["preseason1"]
 
-        # 17살 이상인데 팀이 없고 프리시즌(1~3주)이면 입단 강제.
-        #   단, 올해 모든 오퍼가 결렬돼 '1년 훈련'을 택한 경우(_skip_join_lock)는
-        #   이번 시즌 동안 입단을 강제하지 않고 그대로 진행시킨다.
+        # [2026-08 변경, 신민용 요청: "팀 없을 때는 진행 못 하는데 이때도
+        # 진행할 수 있게 해줘"] 예전엔 여기서 17살 이상+팀 없음+프리시즌
+        # (1~3주)이면 진행 자체를 강제로 막았다 — "1년 넘기기" 기능을 만들며
+        # 팀 없이도 시간을 보낼 수 있게 하는 방향으로 정책이 바뀌었으므로,
+        # 1주씩/하루씩 모드에서도 똑같이 막을 이유가 없다. 완전히 막는 대신
+        # 입단을 잊지 않도록 알림만 띄우고 그대로 진행시킨다(버튼/오퍼는
+        # 여전히 정상적으로 뜬다).
         if (p["age"] >= MIN_JOIN_AGE and not p.get("current_team_id")
-                and _ps_s <= week <= _ps_e and not getattr(self, "_skip_join_lock", False)):
-            show_toast(self, "⚠  먼저 팀에 입단해야 합니다!", "#cc6600", 1500)
-            from PyQt6.QtWidgets import QApplication
-            QApplication.restoreOverrideCursor()
-            self.adv_btn.setEnabled(True)
-            return
+                and _ps_s <= week <= _ps_e and not getattr(self, "_skip_join_lock", False)
+                and self._join_reminder_shown_week != week):
+            self._join_reminder_shown_week = week
+            show_toast(self, "💡 아직 팀이 없습니다 — 입단하지 않고 계속 진행합니다", "#664400", 1800)
 
         # ── 진행할 일정 결정 ──
         # 1주씩 모드: 현재 콤보 7개(하루하루)로 일정 만들어 한 번에 진행.
@@ -1581,6 +1754,290 @@ class CenterPanel(QWidget):
         self._toggle_popup_timers(pause=False)
         QMessageBox.critical(self, "진행 중 오류",
                               f"시즌/주차 진행 중 오류가 발생했습니다:\n{msg}")
+
+    # ── 1년 넘기기 ─────────────────────────────────
+    # [2026-08 신설, 신민용 요청: "팀 없을 때는 1주씩 진행 못 하는데, 이때
+    # 1주 일정을 정해두고 1년(52주) 자동 반복하는 버튼을 만들어줘"]
+    #
+    # 설계:
+    #   - 팀이 없을 때만 켤 수 있다(_set_mode_year에서 이미 막지만, 실제
+    #     시작 시점에도 한 번 더 확인한다 — 메뉴를 연 뒤 팀이 생겼을 수도
+    #     있으므로).
+    #   - 팀 입단 신청은 원래처럼 "1주차 일정 정하는 창"(=지금 이 화면,
+    #     프리시즌 진입 시점)에서만 가능하고, 그 주가 지나면(=1년 넘기기를
+    #     시작하면) 내년 1주가 될 때까지 입단 강제/자동 오퍼가 뜨지 않는다
+    #     — 기존에 "모든 오퍼 결렬 시 1년 훈련" 케이스에 쓰던 _skip_join_lock
+    #     플래그를 그대로 재사용한다(이 플래그는 이미 다음 시즌 프리시즌
+    #     진입 시 자동으로 풀리도록 구현돼 있다).
+    #   - 52주 전체를 advance_days() 한 번에 통째로 던지면 그동안 화면이
+    #     그냥 멈춘 것처럼 보인다(체감 렉) — 대신 1주(7일)씩 나눠 기존
+    #     _AdvanceWorker를 52번 이어서 돌리고, 매 주가 끝날 때마다
+    #     진행률 바를 갱신한다. DB 접근은 항상 워커 스레드 하나만 하도록
+    #     보장되는 기존 스레드 안전 규칙을 그대로 유지한다(워커가 끝나야
+    #     다음 워커를 시작 — 동시에 두 개를 돌리지 않는다).
+    #   - [2026-08 변경, 신민용 요청] 대표팀 발탁(call-up) 선택은 더 이상
+    #     루프를 멈추지 않는다 — 1년 넘기기 동안은 전부 자동 거절하고
+    #     계속 진행한다(headless_runner.py의 자동 테스트 루프와 동일한
+    #     방식). 단, 복수국적 22세 영구 국적 확정(get_forced_commit)은
+    #     되돌릴 수 없는 정체성 선택이라 자동으로 대신 고를 수 없으므로
+    #     여전히 루프를 멈추고 사용자에게 맡긴다 — 처리 후 진행 버튼을
+    #     다시 누르면 남은 주부터 이어갈 수 있다(처음부터 다시 시작 아님).
+
+    def _auto_decline_all_pending(self, intl_engine):
+        """[2026-08 신설] 대기 중인 대표팀 발탁 선택(get_pending_choice)이
+        있으면 전부 자동 거절한다. headless_runner.py가 무인 테스트를 돌릴
+        때 쓰는 것과 완전히 동일한 방식(intl_engine.decline_national_team)
+        이라, 커리어 기록에도 정상적으로 '발탁 거절'로 남는다(트로피 로그
+        중복 방지 로직까지 그대로 재사용됨 — decline_national_team 참고).
+        같은 해에 선택 대기가 여러 건 겹쳐 있을 수 있어 while로 다 빌 때까지
+        반복한다(한 번에 최대 3개까지만 반환되는 get_pending_choice 특성상)."""
+        for _ in range(10):   # 안전 상한 — 정상적으로는 1~2회면 끝남
+            pend = intl_engine.get_pending_choice()
+            if not pend:
+                break
+            for opt in pend.get("options", []):
+                intl_engine.decline_national_team(opt["tournament_id"])
+
+    def _build_pattern_week_sched(self, day, p, st, pattern):
+        """_build_week_sched와 동일한 규칙(경기 있는 날은 자동으로 "경기",
+        경기 전날은 강제 휴식)으로 7일 일정을 만들되, 콤보박스를 실시간으로
+        읽는 대신 고정된 pattern(7개 문자열)을 반복 소스로 쓴다 — 1년
+        넘기기 동안 매주 똑같은 패턴을 재사용하기 위함."""
+        sched = []
+        for i in range(DAY_BUNDLE_SIZE):
+            d     = day + i
+            sel   = pattern[i % len(pattern)] if pattern else "휴식"
+            ttype = TRAIN_MAP_KO.get(sel, "중강도")
+            mi = self._get_match_for_day(d, p, st=st)
+            if mi and mi.get("pending"):
+                mi = None
+            if mi:
+                sched.append((d, "경기", mi))
+            else:
+                next_mi = self._get_match_for_day(d + 1, p, st=st)
+                if next_mi and next_mi.get("pending"):
+                    next_mi = None
+                if next_mi:
+                    ttype = "휴식"
+                sched.append((d, ttype, None))
+        return sched
+
+    def _advance_year_start(self):
+        from PyQt6.QtWidgets import QApplication
+        p  = get_player()
+        st = get_state()
+        if not p or not st:
+            return
+        if p.get("current_team_id"):
+            # 메뉴를 연 뒤~진행 버튼을 누른 사이 팀이 생긴 경우(입단 등) —
+            # 1년 넘기기를 취소하고 평소 1주씩 모드로 되돌린다.
+            self._finalize_year_mode(refresh=False)
+            self._step_mode    = False
+            self._locked_sched = None
+            self._step_idx     = 0
+            self._save_ui_state()
+            show_toast(self, "⚠  팀이 생겨 1년 넘기기를 취소했습니다", "#cc6600", 1800)
+            return
+
+        # 강제확정(복수국적 22세 영구 선택)은 되돌릴 수 없는 정체성 선택이라
+        # 자동으로 대신 골라줄 수 없다 — 이건 그대로 멈추고 사용자에게 맡긴다.
+        # (재개든 새 시작이든 매번 다시 확인 — 그 사이 새로 떴을 수 있음)
+        import intl_engine
+        forced = intl_engine.get_forced_commit()
+        if forced:
+            self._show_forced_commit(forced)
+            return
+
+        # [2026-08 변경, 신민용 요청: "1년 돌리면 대표팀 발탁도 다 자동으로
+        # 거부"] 예전엔 여기서 대기 중인 발탁 선택(get_pending_choice)이
+        # 있으면 멈추고 선택창을 띄웠다 — 이제는 1년 넘기기 동안엔 국가대표
+        # 발탁 자체를 전부 자동 거절하고 계속 진행한다. headless_runner.py의
+        # 자동 테스트 루프와 동일한 방식(decline_national_team)을 써서,
+        # 커리어 기록에도 정상적으로 "발탁 거절"로 남는다.
+        self._auto_decline_all_pending(intl_engine)
+
+        if self._year_paused and self._year_weeks_total:
+            # ── 재개: 남아있던 패턴/진행률을 그대로 이어서 쓴다 ──
+            self._year_paused = False
+        else:
+            # ── 새 시작: 지금 화면에 짜여 있는 7일 패턴을 반복 소스로 고정 ──
+            try:
+                self._year_pattern = [cb.currentText() for cb in self.week_combos]
+            except Exception:
+                self._year_pattern = list(TRAIN_DEFAULTS)
+            self._year_weeks_total = 52
+            self._year_weeks_done  = 0
+
+        # 올해 남은 기간 동안 입단 강제/자동 오퍼를 막는다 — "모든 오퍼
+        # 결렬 시 1년 훈련"과 동일한 플래그라, 다음 시즌 프리시즌 진입
+        # 시 자동으로 풀린다(_on_year_step_finished 참고).
+        self._skip_join_lock = True
+        self._join_used = True
+        self.btn_join.setEnabled(False)
+
+        self._year_active = True
+
+        self.adv_btn.setEnabled(False)
+        self.btn_mode.setEnabled(False)
+        if self.main_win:
+            self.main_win.setEnabled(False)
+        self._toggle_popup_timers(pause=True)
+
+        target = self.main_win if self.main_win else self
+        if self._proc_overlay is None or self._proc_overlay.parent() is not target:
+            self._proc_overlay = _ProcessingOverlay(target)
+        self._proc_overlay.show_progress("🗓 1년 진행 중...", self._year_weeks_done, self._year_weeks_total)
+
+        self._advance_year_step()
+
+    def _advance_year_step(self):
+        """1년 넘기기 중 한 주(7일)를 진행하는 워커를 시작한다. 이전 워커가
+        끝난 뒤에만 다음 워커를 시작하므로(체이닝) 동시에 두 스레드가
+        DB를 건드릴 일은 없다."""
+        p  = get_player()
+        st = get_state()
+        if not p or not st:
+            self._finalize_year_mode(refresh=True)
+            return
+        from constants import DAYS_PER_WEEK
+        day = st.get("current_day") or ((st["current_week"] - 1) * DAYS_PER_WEEK + 1)
+        schedule = self._build_pattern_week_sched(day, p, st, self._year_pattern)
+
+        self._advance_worker = _AdvanceWorker(schedule, self)
+        self._advance_worker.finished_ok.connect(self._on_year_step_finished)
+        self._advance_worker.failed.connect(self._on_year_step_failed)
+        self._advance_worker.finished.connect(self._advance_worker.deleteLater)
+        self._advance_worker.start()
+
+    def _on_year_step_finished(self):
+        from PyQt6.QtWidgets import QApplication
+        self._year_weeks_done += 1
+        if self._proc_overlay is not None:
+            self._proc_overlay.show_progress("🗓 1년 진행 중...", self._year_weeks_done, self._year_weeks_total)
+
+        # ── 중단 조건 확인 ──
+        p2 = get_player()
+        if not p2:
+            self._finalize_year_mode(refresh=True)
+            return
+        if p2.get("current_team_id"):
+            # 정상적으로는 _skip_join_lock 때문에 일어나지 않지만, 방어적으로.
+            self._finalize_year_mode(refresh=True)
+            show_toast(self, "⚽ 팀에 입단해서 1년 넘기기를 마쳤습니다", "#006622", 2000)
+            return
+
+        # [2026-08 변경] 대표팀 발탁(get_pending_choice)은 더 이상 멈추지
+        # 않고 자동 거절 후 계속 진행한다. 되돌릴 수 없는 정체성 선택인
+        # 강제확정(get_forced_commit)만 여전히 멈추고 사용자에게 맡긴다.
+        import intl_engine
+        self._auto_decline_all_pending(intl_engine)
+        forced = intl_engine.get_forced_commit()
+        if forced:
+            # [2026-08] 진행률(_year_weeks_done/_year_pattern)은 보존하고
+            # "일시정지"만 한다 — 처리 후 진행 버튼을 다시 누르면 남은
+            # 주부터 이어간다(처음부터 다시 시작하지 않는다).
+            self._pause_year_mode(refresh=True)
+            show_toast(self, "⚠  대표팀 국적을 정해야 해서 1년 넘기기를 일시 중단했습니다.\n"
+                             f"({self._year_weeks_done}/{self._year_weeks_total}주 완료 — "
+                             "처리 후 진행 버튼을 다시 누르면 이어집니다)",
+                       "#cc6600", 3000)
+            self._show_forced_commit(forced)
+            return
+
+        # 새 시즌 프리시즌으로 들어왔으면(정상적으로는 52주를 다 돌았을
+        # 때 딱 여기 도달) 입단 잠금을 풀어준다 — 이 리셋을 안 하면 1년
+        # 넘기기 후에도 입단 버튼이 계속 잠긴 채로 남는다
+        # (_on_advance_finished의 동일 로직 참고).
+        from constants import SEASON_PHASES as _SP_Y, MIN_JOIN_AGE as _MJA_Y
+        _pss_y, _pse_y = _SP_Y["preseason1"]
+        st2 = get_state()
+        new_week = st2.get("current_week", 0) if st2 else 0
+        if (_pss_y <= new_week <= _pse_y and p2.get("age", 0) >= _MJA_Y
+                and not p2.get("current_team_id")):
+            self._skip_join_lock = False
+            self._join_used = False
+            self.btn_join.setEnabled(True)
+            show_toast(self, f"⭐ {st2.get('current_year')}년 새 시즌!  팀 입단 기간입니다",
+                       "#006622", 2000)
+
+        if self._year_weeks_done >= self._year_weeks_total:
+            self._finalize_year_mode(refresh=True, revert_mode=False)
+            show_toast(self, "🗓 1년 넘기기 완료!", "#006622", 2000)
+            return
+
+        # 계속 다음 주로.
+        QApplication.processEvents()
+        self._advance_year_step()
+
+    def _on_year_step_failed(self, msg):
+        # [2026-08] 오류가 나도 그때까지의 진행률은 보존한다 — 원인을
+        # 해결한 뒤(세이브 백업 등) 진행 버튼을 다시 누르면 실패했던 그
+        # 주부터 다시 시도할 수 있다(완전히 처음으로 되돌리지 않는다).
+        self._pause_year_mode(refresh=False)
+        QMessageBox.critical(
+            self, "진행 중 오류",
+            f"1년 넘기기 진행 중 오류가 발생했습니다 "
+            f"({self._year_weeks_done}/{self._year_weeks_total}주까지 완료):\n{msg}\n\n"
+            "진행 버튼을 다시 누르면 이어서 시도합니다.")
+
+    def _pause_year_mode(self, refresh: bool):
+        """[2026-08 신설] 완료가 아니라 '일시 중단'만 한다 — _year_mode/
+        _year_weeks_done/_year_pattern은 그대로 유지해서 나중에 진행
+        버튼을 다시 누르면 _advance_year_start가 재개 경로를 타게 한다.
+        UI만 평소대로(버튼 활성화, 오버레이 숨김) 되돌린다."""
+        from PyQt6.QtWidgets import QApplication
+        QApplication.restoreOverrideCursor()
+        if self._proc_overlay is not None:
+            self._hide_processing_overlay()
+        self._year_active = False
+        self._year_paused = True
+        self.adv_btn.setText(
+            f"▶▶  1년 넘기기 이어하기 ({self._year_weeks_done}/{self._year_weeks_total}주)")
+        self.adv_btn.setEnabled(True)
+        self.btn_mode.setEnabled(True)
+        if self.main_win:
+            self.main_win.setEnabled(True)
+        self._toggle_popup_timers(pause=False)
+        if refresh and self.main_win:
+            self.main_win.refresh_all()
+
+    def _finalize_year_mode(self, refresh: bool, revert_mode: bool = True):
+        """[2026-08] 진짜로 끝난 경우(52주 완료) 또는 더 이상 이어갈 이유가
+        없는 경우(팀이 생김 등)에만 호출 — _pause_year_mode와 달리 진행
+        상태(주차 카운트/패턴)는 항상 초기화한다.
+
+        [2026-08 수정, 신민용 지적: "1주일이 기본인 건 처음 켰을 때뿐이고,
+        내가 1일/1년을 고르면 그 후엔 진행해도 다시 1주일로 안 바뀌어야
+        한다"] revert_mode=True(기본값)일 때만 모드 선택 자체를 1주씩으로
+        되돌린다 — 팀이 생겨서 더 이상 1년 넘기기를 쓸 수 없게 된 경우처럼
+        정말 강제로 되돌려야 할 때만 그렇게 하고, 52주를 다 채워 정상
+        완료된 경우(revert_mode=False로 호출)엔 "🗓 1년" 선택 상태 자체는
+        그대로 유지한다 — 진행 버튼을 또 누르면 바로 다음 1년을 새로
+        시작할 수 있다."""
+        from PyQt6.QtWidgets import QApplication
+        QApplication.restoreOverrideCursor()
+        if self._proc_overlay is not None:
+            self._hide_processing_overlay()
+        self._year_active      = False
+        self._year_paused      = False
+        self._year_pattern     = None
+        self._year_weeks_done  = 0
+        self._year_weeks_total = 0
+        if revert_mode:
+            self._year_mode = False
+            self.btn_mode.setText("📅 1주씩")
+            self.adv_btn.setText("▶▶  이번 주 진행")
+        else:
+            # 모드 유지 — "1년 넘기기" 선택 상태 그대로, 바로 다음 1년을
+            # 다시 시작할 수 있는 문구로 되돌린다(진행률 문구만 초기화).
+            self.adv_btn.setText("▶▶  1년 넘기기 (지금 일정 반복)")
+        self.adv_btn.setEnabled(True)
+        self.btn_mode.setEnabled(True)
+        if self.main_win:
+            self.main_win.setEnabled(True)
+        self._toggle_popup_timers(pause=False)
+        if refresh and self.main_win:
+            self.main_win.refresh_all()
 
 
     def _update_next_intl_preview(self, bundle_start, p):
@@ -2608,14 +3065,23 @@ class CenterPanel(QWidget):
         from constants import SEASON_PHASES as _SP5
         _pss5, _pse5 = _SP5["preseason1"]
         _oss5, _ose5 = _SP5["postseason"]
+        p = get_player() or {}
+        has_team = bool(p.get("current_team_id"))
         # 은퇴 가능 구간: 프리시즌(1~3주, 새 시즌 직후·연장 거절 타이밍) 또는
         #   국제대회 비시즌(44~52주, 리그 종료 후).
-        if not ((_pss5 <= week <= _pse5) or (_oss5 <= week <= _ose5)):
+        # [2026-08 신설, 신민용 요청: "팀이 없으면 언제든 은퇴 가능하게"]
+        #   이 주차 제한은 애초에 "리그 진행 중에 은퇴하면 그 시즌 우승·
+        #   개인수상이 확정되기 전이라 누락될 수 있다"는 이유로 있었다 —
+        #   그런데 팀이 없는 선수는애초에 리그 성적·수상 자체가 없으니
+        #   이 위험이 성립하지 않는다. 팀이 없으면 주차와 무관하게 상시
+        #   은퇴를 허용하고, 팀이 있을 때만 기존 제한을 그대로 유지한다.
+        if not has_team:
+            pass  # 팀 없음 — 언제든 은퇴 가능
+        elif not ((_pss5 <= week <= _pse5) or (_oss5 <= week <= _ose5)):
             show_toast(self, f"⚠  은퇴는 시즌 종료 후({_oss5}주차~) 또는 새 시즌 {_pss5}~{_pse5}주차에 가능합니다", "#cc6600", 1900)
             return
 
         from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame
-        p = get_player() or {}
         nm  = p.get("name", "선수")
         age = p.get("age", "")
 

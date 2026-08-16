@@ -1472,16 +1472,30 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
                     my_sel = 2
                     _age_dropped = True
                 else:
-                    my_nat = committed
-                    my_sel = 1  # 예선 통과(WC/유로) / 대륙컵 재판정 통과
+                    # [2026-08 신설, 신민용 요청: "22살 이후 국대 결정한 후엔
+                    # 본선도 자동으로 치뤄지는데, 이것도 발탁 거절 형태로
+                    # 뜨게 해달라"] 예전엔 committed 확정 이후로는 여기서
+                    # 곧바로 my_sel=1로 확정해버려서, 미고정 시절(선택창이
+                    # 뜨던 시절)과 달리 그 뒤로는 매 대회 소집을 거부할
+                    # 기회가 영영 사라졌다. 미고정 케이스(my_sel=3)와 동일한
+                    # 발탁창 경로로 보내되 cand_nats를 내 나라 하나만 담아
+                    # 넘긴다 — choose_national_team/decline_national_team이
+                    # 후보 1개짜리도 그대로 처리하므로(위 "🌍 {나라} 대표팀에서
+                    # 발탁을 제안합니다" 단일 후보 로그 분기 참고) 새 로직 없이
+                    # 기존 발탁/거절 인프라를 그대로 재사용한다.
+                    my_nat = ""
+                    my_sel = 3
+                    cand_nats = [committed]
         else:
             my_sel = 2
     elif pledged and pledged in cont_nats:
         # [월드컵 예선 연계] 예선에서 pledge한 나라가 이 월드컵 후보군에 있음.
-        #   본선 해엔 선택창을 띄우지 않고 그 나라로 자동 출전한다.
         if pledged in qualified_nats:
-            my_nat = pledged
-            my_sel = 1  # 예선 통과 = 본선 선발 보장, 재판정 없음
+            # [2026-08 신설, 신민용 요청: 위와 동일 이유] pledge 확정 자동
+            # 출전도 발탁창(my_sel=3)을 통해 수락/거절을 선택할 수 있게 한다.
+            my_nat = ""
+            my_sel = 3
+            cand_nats = [pledged]
         else:
             my_sel = 2   # pledge한 나라가 본선 진출 실패(예선 탈락) → 출전 없음
     else:
@@ -2285,9 +2299,23 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
             # choose_national_team에서 컷오프 여부 확인 후 "예선 진출 실패" 처리
             my_sel = 3; my_nat = ""; cand_nats_final = cand_nats
     elif committed:
-        my_sel = 1 if committed in sel_cand else 2
-        my_nat = committed if my_sel == 1 else ""
-        cand_nats_final = []
+        if committed in sel_cand:
+            # [2026-08 신설, 신민용 요청: "22살 이후 국대 결정한 후엔 예선도
+            # 자동으로 치뤄지는데, 이것도 발탁 거절 형태로 뜨게 해달라"]
+            # 예전엔 committed(평생 대표국 확정) 이후로는 선발 재검증만 하고
+            # my_sel=1로 바로 확정해버려서, 미고정 시절(선택창이 뜨던 시절)과
+            # 달리 그 뒤로는 매 예선마다 소집을 거부할 기회가 영영 사라졌다
+            # (실제 사례: 무소속 선수가 committed 이후 예선 전 경기를 전부
+            # 부상-AI 대체로 자동 소화, 발탁 거절 로그가 한 줄도 안 남음).
+            # 미고정 케이스(아래 else 분기, my_sel=3)와 동일한 발탁창
+            # 경로로 보내되 cand_nats_final을 내 나라 하나만 담아 넘긴다 —
+            # choose_national_team/decline_national_team이 후보 1개짜리도
+            # 그대로 처리하므로 새 로직 없이 기존 발탁/거절 인프라를 그대로
+            # 재사용한다. 거절 시 _save_decline이 trophy_log에 남기는
+            # '발탁 거절' 기록도 미고정 시절과 동일하게 남는다.
+            my_sel = 3; my_nat = ""; cand_nats_final = [committed]
+        else:
+            my_sel = 2; my_nat = ""; cand_nats_final = []
     else:
         # 미고정: 해당 연맹 소속 국적 있으면 선택창 (OVR 무관)
         if cand_nats:

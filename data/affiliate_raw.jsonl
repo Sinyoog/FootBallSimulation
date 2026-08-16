@@ -1681,9 +1681,9 @@
       "parent_team_name": "츠르베나 즈베즈다"
     },
     {
-      "team_name": "파르티잔 B",
+      "team_name": "FK 파르티잔 B",
       "tier": 3,
-      "parent_team_name": "파르티잔"
+      "parent_team_name": "FK 파르티잔"
     },
     {
       "team_name": "그라피차르",
@@ -1693,7 +1693,7 @@
     {
       "team_name": "텔레옵티크",
       "tier": 3,
-      "parent_team_name": "파르티잔"
+      "parent_team_name": "FK 파르티잔"
     }
   ],
   "review": []

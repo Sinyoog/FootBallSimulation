@@ -14,23 +14,19 @@ import sys
 import database
 import game_engine as ge
 import intl_engine
-from affiliate_integrity import check_parent_tier_violations
+from affiliate_integrity import check_parent_tier_coexistence
 
 
 def snapshot_season_boundary(c, season_label):
-    rows, structural = check_parent_tier_violations(c)
+    # [2026-08 정책 변경] 동일/역전 tier 공존은 이제 콜업으로 처리되는
+    # 정상 상태라 "위반/구조적 예외" 구분이 의미 없어졌다 — 그냥 몇 쌍이
+    # 공존 중인지만 기록한다.
+    rows = check_parent_tier_coexistence(c)
     with open("season_boundary_audit.jsonl", "a", encoding="utf-8") as f:
         for team_id, name, tier, parent_name, parent_tier in rows:
             f.write(json.dumps({
                 "season_label": season_label, "team_id": team_id, "name": name,
                 "tier": tier, "parent_name": parent_name, "parent_tier": parent_tier,
-                "structural_exception": False,
-            }, ensure_ascii=False) + "\n")
-        for team_id, name, tier, parent_name, parent_tier in structural:
-            f.write(json.dumps({
-                "season_label": season_label, "team_id": team_id, "name": name,
-                "tier": tier, "parent_name": parent_name, "parent_tier": parent_tier,
-                "structural_exception": True,
             }, ensure_ascii=False) + "\n")
     return rows
 

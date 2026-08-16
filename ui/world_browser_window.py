@@ -576,6 +576,7 @@ class WorldBrowserWindow(QDialog):
             ("등급", self._GRADE_COL_W, True),
             ("국가", self._COUNTRY_COL_W, False),
             ("부수", self._TIER_COL_W, True),
+            ("팀 수", self._TEAM_COUNT_COL_W, True),
         ])
         split.addWidget(self._wrap_list_with_header(self.league_list, league_header))
 
@@ -823,9 +824,13 @@ class WorldBrowserWindow(QDialog):
 
     def _league_row_spec(self, lg):
         """[2026-08 신설] _league_row_widget과 동일한 칸 구성(이름/매칭표시/
-        등급/국가/부수)을 QWidget 없이 _GridRowDelegate가 그릴 수 있는
+        등급/국가/부수/팀 수)을 QWidget 없이 _GridRowDelegate가 그릴 수 있는
         스펙 리스트로 표현한다. 폭·색상·굵기 값은 _league_row_widget과
-        1:1로 동일하게 맞춰서 시각적으로 동일하게 보이게 했다."""
+        1:1로 동일하게 맞춰서 시각적으로 동일하게 보이게 했다.
+
+        [2026-08 추가, 신민용 요청: "부수 뒤에 참가 팀 수도 보여줘"]
+        team_count는 search_leagues()가 이미 한 번의 쿼리로 같이 내려주므로
+        (N+1 없음) 여기선 그대로 표시만 한다."""
         matched_team = lg.get("matched_team")
         return [
             {"text": lg["name"], "width": self._NAME_COL_W, "color": "#eee", "bold": True},
@@ -836,6 +841,8 @@ class WorldBrowserWindow(QDialog):
              "size": 11, "bold": True, "align": Qt.AlignmentFlag.AlignCenter},
             {"text": f"{lg['flag']} {lg['country']}", "width": self._COUNTRY_COL_W, "color": "#aaddff"},
             {"text": f"{lg['tier']}부", "width": self._TIER_COL_W, "color": "#888",
+             "align": Qt.AlignmentFlag.AlignCenter},
+            {"text": f"{lg.get('team_count', 0)}팀", "width": self._TEAM_COUNT_COL_W, "color": "#888",
              "align": Qt.AlignmentFlag.AlignCenter},
         ]
 
@@ -932,12 +939,16 @@ class WorldBrowserWindow(QDialog):
     _GRADE_COL_W = 42
     _COUNTRY_COL_W = 118
     _TIER_COL_W = 48
+    # [2026-08 신설, 신민용 요청: "부수 뒤에 참가 팀 수도 보여줘"] 팀 수는
+    # 많아야 두 자리 숫자(수십 개)라 넓은 칸이 필요 없다 — _TIER_COL_W와
+    # 비슷한 좁은 폭으로 충분.
+    _TEAM_COUNT_COL_W = 46
     _LEAGUE_COL_W = 168
     _TROPHY_COL_W = 140
 
     def _league_row_widget(self, lg):
         """리그 목록 한 줄 — 왼쪽부터 [리그명(고정폭)] [등급] [국가] [부수]
-        순서의 그리드. [2026-08 재정리, 신민용 리포트: "등급이 오른쪽 벽에
+        [팀 수] 순서의 그리드. [2026-08 재정리, 신민용 리포트: "등급이 오른쪽 벽에
         딱 붙어 시선이 멀리 이동한다", "칸이 안 맞춰져 들쭉날쭉하다"]
         1) 가장 중요한 지표인 등급을 리그명 바로 옆(국가명보다 앞)으로
            당겨서 훑어보기 쉽게 하고,
@@ -945,7 +956,9 @@ class WorldBrowserWindow(QDialog):
         3) 마지막 칸 뒤에도 여백을 둬서 리스트 오른쪽 벽/스크롤바에
            바짝 붙어 보이지 않게 했다.
         [2026-07] 팀명 검색으로 뜬 결과면(lg['matched_team']이 있으면) 리그명
-        칸 툴팁에 그 팀명을 함께 남겨 "왜 이 리그가 검색됐는지" 알 수 있게 한다."""
+        칸 툴팁에 그 팀명을 함께 남겨 "왜 이 리그가 검색됐는지" 알 수 있게 한다.
+        [2026-08 추가, 신민용 요청] 부수 다음 칸에 이 리그에 소속된 팀 수를
+        보여준다(search_leagues()가 team_count로 이미 내려줌)."""
         row = QWidget()
         h = QHBoxLayout(row)
         h.setContentsMargins(10, 6, 16, 6)
@@ -968,6 +981,8 @@ class WorldBrowserWindow(QDialog):
         h.addWidget(self._col_label(f"{lg['flag']} {lg['country']}",
                                      self._COUNTRY_COL_W, color="#aaddff"))
         h.addWidget(self._col_label(f"{lg['tier']}부", self._TIER_COL_W,
+                                     color="#888", align=Qt.AlignmentFlag.AlignCenter))
+        h.addWidget(self._col_label(f"{lg.get('team_count', 0)}팀", self._TEAM_COUNT_COL_W,
                                      color="#888", align=Qt.AlignmentFlag.AlignCenter))
         h.addStretch(1)
         return row
@@ -1028,14 +1043,32 @@ class WorldBrowserWindow(QDialog):
         """[2026-08 신설, 신민용 요청] '🥇🥈 최다 순위' 버튼 — 이 리그에서
         1~4위를 가장 많이 한 팀 순위를 별도 팝업(RankLeadersDialog)
         으로 띄운다. get_league_rank_leaders()가 이미 계산까지 다 끝낸
-        결과를 주므로 여기선 그대로 다이얼로그에 넘기기만 한다."""
+        결과를 주므로 여기선 그대로 다이얼로그에 넘기기만 한다.
+
+        [2026-08 확장, 신민용 요청: "4위 옆에 가장 많이 승격한 팀/가장
+        많이 강등한 팀도 넣어달라"] 4위 다음 열로 최다 승격/최다 강등을
+        추가한다. 단, 1부 리그는 승격 자체가 없고(더 올라갈 리그가 없음)
+        최하위 리그는 강등 자체가 없으므로(더 내려갈 리그가 없음), 해당
+        없는 쪽 열은 아예 안 보여준다 — league_has_upper_tier/
+        league_has_lower_tier로 판단(역대 우승팀 표에서 승격/강등팀
+        목록을 보여줄지 판단하던 것과 동일한 기준)."""
         lid = getattr(self, "_current_league_id", None)
         if lid is None:
             return
         title = getattr(self, "_current_league_title", "") or ""
         data = wb.get_league_rank_leaders(lid)
-        dlg = RankLeadersDialog(title, data, keys=("first", "second", "third", "fourth"),
-                                 key_labels=["🥇 1위 팀", "🥈 2위 팀", "🥉 3위 팀", "4위 팀"],
+
+        keys = ["first", "second", "third", "fourth"]
+        key_labels = ["🥇 1위 팀", "🥈 2위 팀", "🥉 3위 팀", "4위 팀"]
+        if wb.league_has_upper_tier(lid):   # 1부가 아니면 승격이 있을 수 있음
+            keys.append("most_promoted")
+            key_labels.append("⬆ 최다 승격")
+        if wb.league_has_lower_tier(lid):   # 최하위가 아니면 강등이 있을 수 있음
+            keys.append("most_relegated")
+            key_labels.append("⬇ 최다 강등")
+
+        dlg = RankLeadersDialog(title, data, keys=tuple(keys),
+                                 key_labels=key_labels,
                                  empty_msg="아직 완료된 시즌 기록이 없습니다", parent=self)
         dlg.show()
 
@@ -3218,6 +3251,15 @@ class RankLeadersDialog(QDialog):
     둔다 — 클릭 한 칸만 복사하면 그 칸만, 드래그로 여러 칸을 잡으면
     그만큼만 탭/줄바꿈으로 묶여 복사된다(다른 표들과 동일한 동작)."""
     _PLACE_COLORS = ["#ffd700", "#c0c0c0", "#cd7f32", "#aaddff"]
+    # [2026-08 버그수정, 신민용 리포트: "최다 승격/최다 강등 색이 열 순서에
+    # 따라 바뀐다"] 예전엔 색을 열 인덱스(ki)로만 정했다 — _PLACE_COLORS를
+    # ki % 4로 순환시키다 보니, 1부 리그처럼 최다 승격 열 자체가 없어서
+    # most_relegated가 4번째 자리(원래 4위 팀 자리)로 밀려 들어오면 순환
+    # 규칙상 골드(1위색)를 받아버렸다 — "승격 없으면 강등이 노란색으로
+    # 뜬다"는 리포트가 정확히 이 현상. 이제 열의 '자리'가 아니라 그 열의
+    # key 자체로 색을 정한다 — most_promoted는 항상 파란색, most_relegated는
+    # 항상 빨간색, 나머지(1~4위)는 기존 금/은/동/하늘색 순환을 그대로 쓴다.
+    _FIXED_KEY_COLORS = {"most_promoted": "#4da6ff", "most_relegated": "#ff5555"}
 
     def __init__(self, title, data, keys, key_labels, empty_msg="아직 완료된 기록이 없습니다",
                  filter_label=None, filter_options=None, filter_default=None, fetch_fn=None,
@@ -3310,12 +3352,14 @@ class RankLeadersDialog(QDialog):
             for ki, lst in enumerate(lists):
                 col_name = 1 + ki * 2
                 col_cnt = col_name + 1
+                key = keys[ki] if ki < len(keys) else None
+                color = self._FIXED_KEY_COLORS.get(key) or self._PLACE_COLORS[ki % len(self._PLACE_COLORS)]
                 if i < len(lst):
                     entry = lst[i]
                     country = entry.get("country")
                     disp = f"{entry['name']} ({country})" if country else entry["name"]
                     name_item = QTableWidgetItem(disp)
-                    name_item.setForeground(QColor(self._PLACE_COLORS[ki % len(self._PLACE_COLORS)]))
+                    name_item.setForeground(QColor(color))
                     if disp != entry["name"]:
                         name_item.setData(_CLEAN_TEXT_ROLE, entry["name"])
                     cnt_item = QTableWidgetItem(f"{entry['count']}회")

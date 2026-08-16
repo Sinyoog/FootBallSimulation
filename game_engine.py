@@ -400,17 +400,23 @@ def get_logs(since_id=0):
     이 id를 기억해뒀다가 다음 새로고침 때 넘기면, 매번 "그날 새로 생긴
     줄"만 읽고 그리게 되어 하루치 비용이 항상 일정해진다(연차와 무관).
     since_id=0(기본값)이면 예전처럼 전체를 반환 — 최초 1회(게임 로드 직후)
-    로그 패널을 처음 채울 때만 이 경로를 쓴다."""
+    로그 패널을 처음 채울 때만 이 경로를 쓴다.
+
+    [2026-08 확장, 신민용 요청: "로그를 1년 단위로 보이게, 새해 시작하면
+    깨끗해지고 다시 쌓이게"] 각 줄이 어느 연도(year) 소속인지를 호출부가
+    알아야 연도 경계를 찾아 화면을 비울 수 있다 — entry 텍스트만 주던 걸
+    (entry, year) 튜플로 바꿨다(game_log.year 컬럼은 원래부터 있었음,
+    여태 안 내려주고 있었을 뿐)."""
     flush_log_buffer()  # 버퍼에 남은 로그 먼저 기록
     conn = get_conn()
     c = conn.cursor()
     if since_id:
-        c.execute("SELECT id, entry FROM game_log WHERE id>? ORDER BY id ASC", (since_id,))
+        c.execute("SELECT id, entry, year FROM game_log WHERE id>? ORDER BY id ASC", (since_id,))
     else:
-        c.execute("SELECT id, entry FROM game_log ORDER BY id ASC")
+        c.execute("SELECT id, entry, year FROM game_log ORDER BY id ASC")
     rows = c.fetchall()
     conn.close()
-    entries = [r["entry"] for r in rows]
+    entries = [(r["entry"], r["year"]) for r in rows]
     max_id = rows[-1]["id"] if rows else since_id
     return entries, max_id
 

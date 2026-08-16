@@ -208,6 +208,9 @@ def search_leagues(continent=None, country_id=None, name_query=None, grade=None,
 
     [2026-08 신설, 신민용 요청] tier — 1부~N부로 좁히는 필터. None이면 전체.
 
+    [2026-08 신설, 신민용 요청: "리그 목록에 참가 팀 수도 보여줘"] 반환
+    dict마다 "team_count"(그 리그에 소속된 팀 수)를 같이 담아준다.
+
     [버그수정 2026-07] grade 표시/필터를 countries.grade(국가대표 등급)
     그대로 쓰고 있었는데, 이건 search_teams()의 주석에도 명시돼 있듯 '클럽
     리그 등급'과 다르다(국대는 강해도 클럽리그는 약한 나라가 있음 — 모로코·
@@ -238,7 +241,8 @@ def search_leagues(continent=None, country_id=None, name_query=None, grade=None,
         like = f"%{name_query}%"
         q = ("SELECT l.id, l.name, l.tier, cn.id as country_id, cn.name as country, "
              "cn.flag as flag, cn.grade as cgrade, cn.continent as continent, "
-             "MAX(CASE WHEN t.name LIKE ? THEN t.name END) as matched_team "
+             "MAX(CASE WHEN t.name LIKE ? THEN t.name END) as matched_team, "
+             "COUNT(DISTINCT t.id) as team_count "
              "FROM leagues l JOIN countries cn ON l.country_id = cn.id "
              "LEFT JOIN teams t ON t.league_id = l.id WHERE 1=1")
         params = [like]
@@ -257,9 +261,17 @@ def search_leagues(continent=None, country_id=None, name_query=None, grade=None,
         # 기준 정렬은 아래에서 파이썬으로 다시 한다.
         q += " GROUP BY l.id ORDER BY cn.name, l.tier"
     else:
+        # [2026-08 신설, 신민용 요청: "리그 목록에 참가 팀 수도 보여줘"]
+        # 팀 수를 리그마다 따로 조회하면 리그 개수만큼 쿼리가 늘어나므로
+        # (N+1), name_query 분기와 동일하게 teams를 LEFT JOIN해서 한 번에
+        # GROUP BY로 리그당 1행씩 모은다 — 검색어가 없을 때도 매번 이
+        # 함수가 다시 불리므로(필터 바뀔 때마다) 여기도 똑같이 최적화해야
+        # 체감 렉이 안 생긴다.
         q = ("SELECT l.id, l.name, l.tier, cn.id as country_id, cn.name as country, "
-             "cn.flag as flag, cn.grade as cgrade, cn.continent as continent "
-             "FROM leagues l JOIN countries cn ON l.country_id = cn.id WHERE 1=1")
+             "cn.flag as flag, cn.grade as cgrade, cn.continent as continent, "
+             "COUNT(DISTINCT t.id) as team_count "
+             "FROM leagues l JOIN countries cn ON l.country_id = cn.id "
+             "LEFT JOIN teams t ON t.league_id = l.id WHERE 1=1")
         params = []
         if continent:
             q += " AND cn.continent=?"; params.append(continent)
@@ -270,7 +282,7 @@ def search_leagues(continent=None, country_id=None, name_query=None, grade=None,
         if grade_country_ids is not None:
             q += " AND cn.id IN (%s)" % ",".join("?" * len(grade_country_ids))
             params += grade_country_ids
-        q += " ORDER BY cn.name, l.tier"
+        q += " GROUP BY l.id ORDER BY cn.name, l.tier"
 
     rows = [dict(r) for r in c.execute(q, params).fetchall()]
     conn.close()
@@ -354,6 +366,27 @@ def league_has_lower_tier(league_id):
         (row["country_id"], row["tier"] + 1)).fetchone()
     conn.close()
     return bool(lower)
+
+
+def league_has_upper_tier(league_id):
+    """[2026-08 신설] 이 리그보다 한 단계 위 티어가 그 나라에 존재하는지.
+    1부 리그는 애초에 올라갈 곳이 없어 승격 자체가 없다 — league_has_lower_tier
+    와 대칭 관계. '최다 순위' 팝업에서 최다 승격팀 열을 보여줄지 판단하는
+    용도(1부면 숨김)."""
+    conn = get_conn()
+    row = conn.execute("SELECT country_id, tier FROM leagues WHERE id=?",
+                        (league_id,)).fetchone()
+    if not row:
+        conn.close()
+        return False
+    if row["tier"] <= 1:
+        conn.close()
+        return False
+    upper = conn.execute(
+        "SELECT 1 FROM leagues WHERE country_id=? AND tier=?",
+        (row["country_id"], row["tier"] - 1)).fetchone()
+    conn.close()
+    return bool(upper)
 
 
 def get_league_champions(league_id, limit=999):
@@ -538,11 +571,55 @@ def _rank_leaders_from_rows(rows, keys, name_key_fmt, country_key_fmt=None):
     return out
 
 
+def _promo_relegation_leader_counts(rows):
+    """[2026-08 신설, 신민용 요청: "최다 순위에서 4위 옆에 가장 많이
+    승격한 팀/가장 많이 강등한 팀도 넣어달라"] get_league_champions()가
+    시즌별로 담아주는 promoted/relegated(그 시즌에 실제로 이 리그에서
+    나간 팀 '목록')를 전 시즌에 걸쳐 팀명별로 세어 누적 횟수 순으로
+    정렬한다.
+
+    1~4위(_rank_leaders_from_rows)와 다른 점: 그쪽은 시즌당 한 자리에
+    팀 하나만 들어가는 단일 이름 필드(row["first"] 등)를 세지만, 여기는
+    시즌당 승격/강등팀이 여러 명일 수 있는 리스트(row["promoted"] =
+    [{"name":...}, ...])를 세야 해서 별도 함수로 뺐다.
+
+    반환: (most_promoted, most_relegated) — 각각 [{"name":, "count":}, ...]
+    횟수 많은 순(동률이면 이름 가나다순)."""
+    from collections import Counter
+    promo_counter = Counter()
+    releg_counter = Counter()
+    for r in rows:
+        for item in r.get("promoted") or []:
+            name = item.get("name")
+            if name and name not in ("-", "?"):
+                promo_counter[name] += 1
+        for item in r.get("relegated") or []:
+            name = item.get("name")
+            if name and name not in ("-", "?"):
+                releg_counter[name] += 1
+    most_promoted = [{"name": n, "count": cnt}
+                      for n, cnt in sorted(promo_counter.items(), key=lambda x: (-x[1], x[0]))]
+    most_relegated = [{"name": n, "count": cnt}
+                       for n, cnt in sorted(releg_counter.items(), key=lambda x: (-x[1], x[0]))]
+    return most_promoted, most_relegated
+
+
 def get_league_rank_leaders(league_id):
-    """이 리그에서 시즌 1~4위를 가장 많이 한 팀 순위.
-    반환: {"first": [...], "second": [...], "third": [...], "fourth": [...]}"""
+    """이 리그에서 시즌 1~4위를 가장 많이 한 팀 순위, 그리고 가장 많이
+    승격/강등한 팀 순위.
+    반환: {"first": [...], "second": [...], "third": [...], "fourth": [...],
+           "most_promoted": [...], "most_relegated": [...]}
+    최상위 리그는 승격 자체가 없어 most_promoted가 항상 빈 리스트이고,
+    최하위 리그는 강등 자체가 없어 most_relegated가 항상 빈 리스트다
+    (get_league_champions가 애초에 그렇게 채워주므로 여기선 그대로 반영될
+    뿐 — 어느 쪽을 화면에 보여줄지는 호출부에서 league_has_lower_tier /
+    tier==1 여부로 판단한다)."""
     rows = get_league_champions(league_id)
-    return _rank_leaders_from_rows(rows, ("first", "second", "third", "fourth"), "{key}")
+    out = _rank_leaders_from_rows(rows, ("first", "second", "third", "fourth"), "{key}")
+    most_promoted, most_relegated = _promo_relegation_leader_counts(rows)
+    out["most_promoted"] = most_promoted
+    out["most_relegated"] = most_relegated
+    return out
 
 
 

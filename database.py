@@ -1346,6 +1346,16 @@ def init_db():
             try: c.execute(f"ALTER TABLE ai_players_seed ADD COLUMN {col}")
             except sqlite3.OperationalError: pass
 
+    # ── [버그수정] teams.formation 스냅샷 테이블 (새 게임 리셋용) ─────────
+    # _shuffle_formations()(ai_lifecycle.py)가 시즌마다 팀의 ~20%를 랜덤하게
+    # 포메이션 변경하는데, reset_game_data()가 이를 안 건드려서 은퇴 후 새
+    # 게임을 해도 직전 플레이 말미의 포메이션이 그대로 남아있던 문제가 있었다
+    # (ai_players_seed와 같은 유형의 "리셋 함수가 일부만 리셋" 버그).
+    # 최초 시딩 직후(변형되기 전) 상태를 여기 스냅샷해두고, 새 게임 시 여기서
+    # 복원한다.
+    c.execute("""CREATE TABLE IF NOT EXISTS team_formation_seed(
+        team_id INTEGER PRIMARY KEY, formation TEXT)""")
+
     # [전성기 OVR 보정] 기존 세이브는 peak_ovr 컬럼이 방금 0으로 추가됐거나,
     #  아직 한 번도 update_player(ovr=...)가 안 불려서 현재 ovr보다 낮을 수 있다.
     #  현재 ovr을 하한으로 보정 (peak_ovr < ovr 인 경우만) — 매 시작마다 실행되지만
@@ -1451,6 +1461,15 @@ def init_db():
         #     기준 400개 이상) "WHERE tournament_id IN (...)"로 조회 —
         #     실측 50회 0.123s → 0.0009s, 약 130배.
         "CREATE INDEX IF NOT EXISTS idx_po_matches_tournament ON po_matches(tournament_id)",
+        # [2026-08 추가] po_tournaments만 위 cup/intl/cwc_tournaments와 달리
+        # 인덱스가 하나도 없었다. process_po_week가 advance_days의 daily hook
+        # 에서 "44주만"이 아니라 매일(연 364회) "WHERE year=? AND status!='done'"
+        # 으로 조회하는데(promotion_playoff_engine.py process_po_week), po_matches와
+        # 똑같이 시즌마다 계속 쌓이기만 하는 테이블이라(po_matches 64,680행/35시즌과
+        # 동일 스케일) 쌓인 시즌 수에 정확히 비례해 이 매일 호출 비용이 커지는
+        # 구조였다. 실측(35시즌 규모, daily-hook 364회 흉내): 인덱스 없음 0.198s →
+        # 인덱스 후 0.031s, 약 6.3배(테이블이 더 쌓일수록 격차는 계속 벌어짐).
+        "CREATE INDEX IF NOT EXISTS idx_po_tournaments_year_status ON po_tournaments(year, status)",
         #   - cup_matches: career_window/retire_window "전체 이력"
         #     탭(get_full_history_extras_for_period)이 재직 기간마다
         #     "WHERE home_team_id=? OR away_team_id=?"로 조회 — OR 조건은
@@ -1989,6 +2008,13 @@ def seed_initial_data(progress_cb=None):
     _insert_leagues_and_teams(
         c, progress_cb=(lambda d, t, name: progress_cb("리그·팀 생성", d, t, name)) if progress_cb else None)
 
+    # [버그수정] 최초 시딩 직후(랜덤 배정 직후, 변형되기 전) 포메이션을
+    # team_formation_seed에 스냅샷 — reset_game_data()가 이걸로 복원한다.
+    # (원래도 랜덤 값이라 "정답"은 아니지만, ai_players_seed와 동일하게
+    # "이번 세이브의 최초 상태"를 새 게임의 기준점으로 고정하는 목적)
+    c.execute("DELETE FROM team_formation_seed")
+    c.execute("INSERT INTO team_formation_seed(team_id, formation) SELECT id, formation FROM teams")
+
     # [2026-08 신설] 산하팀(리저브/B팀/유스팀) 분류 적용.
     # data/affiliate_raw.jsonl(GPT로 사전 분류·검증된 국가별 결과)을 읽어서
     # 방금 생성된 teams row들에 classification_status/parent_team_id를 채운다.
@@ -2117,6 +2143,42 @@ def _reset_ai_players_from_seed(c):
     c.execute(f"INSERT INTO ai_players({col_list}) SELECT {col_list} FROM ai_players_seed")
 
 
+def _reset_formations_from_seed(c):
+    """[버그수정] '새 게임' 시 teams.formation을 최초 시딩 상태로 복원.
+    _shuffle_formations()가 시즌마다 팀의 ~20%를 랜덤 변경해도 reset_game_data()가
+    이를 되돌리지 않아, 은퇴 후 새 게임을 해도 직전 플레이 말미의 포메이션이
+    그대로 남아있던 문제를 고친다.
+    [구버전 세이브 폴백] team_formation_seed가 비어있으면(이 패치 이전 세이브라
+    스냅샷을 못 떠둔 상태) 복원할 데이터가 없으므로, 지금의 teams.formation 상태를
+    그대로 시드로 확정해둔다 — ai_players_seed 폴백과 동일한 패턴. 그 판의
+    '새 게임'은 1회에 한해 기존 동작(리셋 안 됨)과 같지만, 다음 '새 게임'부터는
+    정상적으로 이번에 확정된 시드로 복원된다.
+    """
+    seed_cnt = c.execute("SELECT COUNT(*) c FROM team_formation_seed").fetchone()["c"]
+    if seed_cnt == 0:
+        c.execute("INSERT INTO team_formation_seed(team_id, formation) SELECT id, formation FROM teams")
+        return
+    c.execute("""UPDATE teams SET formation = (
+                    SELECT formation FROM team_formation_seed
+                    WHERE team_formation_seed.team_id = teams.id)
+                 WHERE id IN (SELECT team_id FROM team_formation_seed)""")
+
+
+def _reset_club_strength(c):
+    """[버그수정] '새 게임' 시 teams.club_strength(동적 팀 강도)를 최초 명문팀
+    시딩 상태로 복원. update_club_strength_after_season()이 매 시즌 실제 성적으로
+    이 값을 계속 갱신하는데, reset_game_data()가 이를 안 건드려서 은퇴 후 새
+    게임을 해도 직전 플레이에서 여러 시즌 누적된 club_strength가 그대로 남아
+    매치 가중치 계산에 영향을 주고 있었다.
+    seed_club_strength_from_prestige()는 "이미 0이 아닌 팀은 건드리지 않는다"는
+    가드가 있어(기존 세이브에 안전하게 재적용하기 위함), 재시딩 전에 전부 0으로
+    비워야 한다 — 그러면 최초 설치 때와 동일하게 명문팀 리스트에 있는 팀만
+    시드 값으로 채워지고, 나머지는 0(=시즌 진행 전 초기 상태)으로 남는다.
+    """
+    c.execute("UPDATE teams SET club_strength = 0")
+    seed_club_strength_from_prestige(c.connection)
+
+
 def reset_game_data():
     init_db()  # 마이그레이션 적용
     conn = get_conn(); c = conn.cursor()
@@ -2147,6 +2209,8 @@ def reset_game_data():
     c.execute("UPDATE teams SET wins=0,draws=0,losses=0,goals_for=0,goals_against=0")
     _reset_teams_to_league_data(c)
     _reset_ai_players_from_seed(c)
+    _reset_formations_from_seed(c)
+    _reset_club_strength(c)
     conn.commit(); conn.close()
 
 # ─── OVR 가중치 ───────────────────────────────────────────────

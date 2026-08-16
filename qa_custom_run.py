@@ -168,12 +168,13 @@ for i in range(N_SEASONS):
     # 무결성 체크 (매 시즌 후)
     result = run_all_checks(c)
     tier1_viol = len(result.get("tier1_violations", []))
-    parent_viol = len(result.get("parent_tier_violations", []))
-    parent_struct = len(result.get("parent_tier_structural_exceptions", []))
+    # [2026-08 정책 변경] 모팀·산하팀 동일/역전 tier는 이제 콜업으로
+    # 처리되는 정상 상태라 더 이상 "위반"이 아니다 — 참고용 카운트로만 추적.
+    parent_coexist = len(result.get("parent_tier_coexisting_pairs", []))
     self_parent = len(result.get("self_parent", []))
 
-    parent_viol_rows = result.get("parent_tier_violations", [])
-    for row in parent_viol_rows:
+    parent_coexist_rows = result.get("parent_tier_coexisting_pairs", [])
+    for row in parent_coexist_rows:
         # row 형태: (team_id, name, tier, parent_name, parent_tier) 로 추정 -> 방어적으로 처리
         try:
             TRACK_TEAM_IDS.add(row[0])
@@ -199,14 +200,13 @@ for i in range(N_SEASONS):
     history.append({
         "season": season_after,
         "tier1_violations": tier1_viol,
-        "parent_tier_violations": parent_viol,
-        "parent_tier_structural_exceptions": parent_struct,
+        "parent_tier_coexisting_pairs": parent_coexist,
         "self_parent": self_parent,
         "prestige_snapshot": ptiers,
         "recent_promotions": recent_promos,
     })
-    print(f"[custom]   integrity: tier1_viol={tier1_viol} parent_viol={parent_viol} "
-          f"struct_exc={parent_struct} self_parent={self_parent}")
+    print(f"[custom]   integrity: tier1_viol={tier1_viol} parent_coexist={parent_coexist} "
+          f"self_parent={self_parent}")
     print(f"[custom]   tracked: {snapshot_tracked()}")
     print(f"[custom]   승격팀 OVR 샘플: {recent_promos[:5]}")
 
