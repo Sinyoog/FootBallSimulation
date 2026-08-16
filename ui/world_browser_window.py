@@ -1810,7 +1810,30 @@ class WorldBrowserWindow(QDialog):
             # 강조한다.
             cwc_color = "#4dd0e1" if entry.get("cwc") else "#555"
             tbl.setCellWidget(i, 4, self._two_line_cell(cwc_txt, cwc_color, entry.get("cwc_record")))
+        self._finalize_team_detail_row_heights(tbl)
+
+    # [2026-08 버그수정, 신민용 리포트: "팀 검색에서 승격/강등 문구처럼
+    # 긴 텍스트가 있는 줄은 아래쪽 글자가 살짝 잘려 보인다 — game.db를
+    # 새로 만들어야 하는 거냐?"] game.db와는 무관한 순수 화면(Qt) 문제다.
+    # 이 표의 1~4번 칸은 Stretch 리사이즈 모드라(_build_team_tab) 실제 칸
+    # 너비가 레이아웃이 끝나야 확정되는데, resizeRowsToContents()는 그
+    # 전에(칸이 아직 좁은 스냅샷 기준) 각 _two_line_cell의 줄바꿈을 재서
+    # 행 높이를 계산해버린다 — QTimer.singleShot(0, …)으로 한 프레임
+    # 뒤에 다시 불러도, 폰트 렌더링 반올림 오차로 1~2px가 여전히 모자란
+    # 경우가 남아있었다(신민용이 스크린샷으로 재확인). 그래서 이제는
+    # "정확히 딱 맞추기"를 포기하고, 재계산 후 모든 행에 여유 높이를
+    # 몇 px 더 얹어서 — 오차가 몇 px든 항상 남는 여백이 그걸 흡수하게
+    # 한다(약간 헐렁해 보일 순 있어도 잘리는 것보단 낫다는 원칙).
+    def _finalize_team_detail_row_heights(self, tbl):
+        _ROW_HEIGHT_PAD = 6
+
+        def _pad():
+            tbl.resizeRowsToContents()
+            for r in range(tbl.rowCount()):
+                tbl.setRowHeight(r, tbl.rowHeight(r) + _ROW_HEIGHT_PAD)
+
         tbl.resizeRowsToContents()
+        QTimer.singleShot(0, _pad)
 
     # [2026-08 신설, 신민용 요청: "팀 검색에 복사하기 버튼을 만들어서
     # 누르면 이 팀의 연도별 기록을 텍스트로 뽑고 싶다 — 지피티나 제미나이가
@@ -2014,6 +2037,29 @@ class WorldBrowserWindow(QDialog):
         summary_wrap.setLayout(self.country_summary_row)
         right_lay.addWidget(summary_wrap)
 
+        # [2026-08 신설, 신민용 요청: "우측 기록에 종류(전체/지역컵/월드컵/
+        # 네이션스컵) 필터를 만들어서, 선택하면 그 종류만 뜨게 해달라 —
+        # 예선은 그 본선이랑 같이 묶이고, 유로는 지역컵으로 묶여야 한다"]
+        # 이미 있는 상단 "대회" 필터(country_trophy_kind_combo)는 좌측
+        # 국가 "목록"을 좁히는 필터라 이거랑 별개다 — 이건 선택된 국가
+        # 한 명의 우측 상세 기록만 좁힌다. 매번 새로 쿼리하지 않고
+        # _on_country_selected가 캐시해둔 self._country_all_results를
+        # 로컬에서 effective_kind로 다시 걸러 표만 새로 그린다.
+        result_filt = QHBoxLayout()
+        result_filt.setSpacing(8)
+        rf_lbl = QLabel("종류"); rf_lbl.setStyleSheet("color:#888;font-size:11px;")
+        self.country_result_kind_combo = QComboBox()
+        self.country_result_kind_combo.addItem(_ALL, None)
+        self.country_result_kind_combo.addItem("지역컵", "region_group")
+        self.country_result_kind_combo.addItem("월드컵", "world_group")
+        self.country_result_kind_combo.addItem("네이션스컵", "continent_group")
+        self.country_result_kind_combo.currentIndexChanged.connect(
+            self._refresh_country_detail_table)
+        result_filt.addWidget(rf_lbl)
+        result_filt.addWidget(self.country_result_kind_combo)
+        result_filt.addStretch()
+        right_lay.addLayout(result_filt)
+
         self.country_detail_tbl = QTableWidget(0, 5)
         self.country_detail_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.country_detail_tbl.verticalHeader().setVisible(False)
@@ -2151,12 +2197,38 @@ class WorldBrowserWindow(QDialog):
 
         # 연도별 전체 성적(우승~조별탈락) — [2026-08] 우승만 보여주던 것에서
         # get_country_tournament_results()로 교체, 결과(몇강 탈락) 컬럼 추가.
+        results = wb.get_country_tournament_results(name)
+        self._country_all_results = results
+        self._country_copy_results = results
+        self.country_copy_btn.setEnabled(bool(results) or bool(summary))
+        self._refresh_country_detail_table()
+
+    # [2026-08 신설, 신민용 요청: "국가 검색 우측 기록에 종류(전체/지역컵/
+    # 월드컵/네이션스컵) 필터를 만들어달라 — 예선은 그 본선이랑 같이
+    # 묶이고, 유로는 지역컵으로 묶여야 한다"] effective_kind(이미
+    # get_country_tournament_results가 예선/유로까지 정확히 구분해서
+    # 계산해둔 값)로 세 그룹을 나눈다:
+    #   지역컵 그룹  = region(지역컵) + euro(유로 본선) + euro_qual(유로 예선)
+    #   월드컵 그룹  = world(월드컵 본선) + wc_qual(월드컵 예선)
+    #   네이션스컵 그룹 = continent(대륙컵/네이션스컵 본선, 유로 제외) + cont_qual(그 예선)
+    # 화면 표기(종류/대회명 칸)는 그대로 두고 — 이 필터는 어떤 행을
+    # "보여줄지"만 결정한다, "어떻게 보일지"는 안 바꾼다.
+    _COUNTRY_RESULT_KIND_GROUPS = {
+        "region_group": {"region", "euro", "euro_qual"},
+        "world_group": {"world", "wc_qual"},
+        "continent_group": {"continent", "cont_qual"},
+    }
+
+    def _refresh_country_detail_table(self, *_a):
+        results = getattr(self, "_country_all_results", None) or []
+        group_key = self.country_result_kind_combo.currentData()
+        if group_key:
+            allowed = self._COUNTRY_RESULT_KIND_GROUPS.get(group_key, set())
+            results = [t for t in results if t.get("effective_kind") in allowed]
+
         _TIER_COLORS = {5: "#ffd700", 4: "#c0c0c0", 3: "#cd7f32",
                          2: "#aaddff", 1: "#999999", 0: "#555555"}
         tbl = self.country_detail_tbl
-        results = wb.get_country_tournament_results(name)
-        self._country_copy_results = results
-        self.country_copy_btn.setEnabled(bool(results) or bool(summary))
         tbl.setRowCount(len(results))
         from constants import INTL_TOURNAMENT_KIND_LABELS
         for i, t in enumerate(results):
@@ -2195,7 +2267,7 @@ class WorldBrowserWindow(QDialog):
                 record_item.setForeground(QColor("#aaaaaa"))
                 tbl.setItem(i, 4, record_item)
             except Exception as e:
-                print(f"[국제대회기록] {name} {t.get('year')}년 행 렌더링 오류(건너뜀): {e}")
+                print(f"[국제대회기록] {t.get('year')}년 행 렌더링 오류(건너뜀): {e}")
         self._show_empty_state(tbl, results, "참가 기록 없음", 5)
         tbl.resizeRowsToContents()
 
@@ -2582,18 +2654,23 @@ class WorldBrowserWindow(QDialog):
         return w
 
     def _on_cl_style_rank_leaders_clicked(self, combo_attr, rank_fn, tab_title):
-        """[2026-08 신설] 챔스/유로파/컨퍼런스 탭 공용 '🥇 최다 순위' 버튼
-        — 지금 선택된 대륙 필터 그대로 rank_fn(continent=...)을 호출해서
-        RankLeadersDialog로 띄운다. 대륙을 바꾸고 다시 누르면 그 대륙
-        기준으로 새로 집계해서 보여준다(별도 캐시 없음 — 순수 집계라
-        매번 다시 계산해도 비용이 작다)."""
-        combo = getattr(self, combo_attr)
-        cont = None if combo.currentText() == _ALL else combo.currentText()
-        data = rank_fn(continent=cont)
-        title = f"{tab_title}" + (f" ({cont})" if cont else " (전체)")
-        dlg = RankLeadersDialog(title, data,
+        """[2026-08 수정, 신민용 리포트: "이거 최다 순위 구별하는 게 들어가기
+        전에 있는 탭 필터로 구분한 후 들어가야 되잖아 — 역대 지역컵처럼
+        별개로, 최다 순위 팝업 안에 필터를 넣어달라"] 예전엔 탭의 대륙
+        콤보(combo_attr) 상태를 그대로 읽어서 그 대륙 기준으로만 열었다
+        — 이제 네이션스컵/지역컵과 똑같이, 팝업 자체에 독립된 대륙
+        필터(유럽/아시아/아프리카/북남미)를 두고 기본값을 탭의 현재
+        선택과 무관하게 "유럽"으로 고정한다. 필터를 바꾸면 팝업 안에서
+        바로 다시 집계해서 보여준다."""
+        options = [(_ALL, None), ("유럽", "유럽"), ("아시아", "아시아"),
+                   ("아프리카", "아프리카"), ("북남미", "북남미")]
+        default_value = "유럽"
+        dlg = RankLeadersDialog(tab_title, rank_fn(continent=default_value),
                                  keys=("winner", "runner_up", "third", "fourth"),
                                  key_labels=["🥇 1위 팀", "🥈 2위 팀", "🥉 3위 팀", "4위 팀"],
+                                 filter_label="대륙", filter_options=options,
+                                 filter_default=default_value,
+                                 fetch_fn=lambda cont: rank_fn(continent=cont),
                                  parent=self)
         dlg.show()
 
@@ -2752,6 +2829,16 @@ class WorldBrowserWindow(QDialog):
         lay = QVBoxLayout(w)
         lay.setContentsMargins(0, 8, 0, 0)
 
+        # [2026-08 신설, 신민용 요청: "월드컵도 네이션스컵처럼 최다 순위가
+        # 뜨게 해줘"] 월드컵은 대회명이 하나뿐이라(네이션스컵/지역컵과
+        # 달리 여러 이름으로 안 갈림) 내부 필터 없이 버튼 하나로 바로 연다.
+        tools = QHBoxLayout()
+        tools.addStretch()
+        wc_rank_btn = QPushButton("🥇 최다 순위")
+        wc_rank_btn.clicked.connect(self._on_wc_rank_leaders_clicked)
+        tools.addWidget(wc_rank_btn)
+        lay.addLayout(tools)
+
         self.wc_tbl = QTableWidget(0, 0)
         self.wc_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.wc_tbl.verticalHeader().setVisible(False)
@@ -2766,6 +2853,14 @@ class WorldBrowserWindow(QDialog):
         self._fill_placement_table(self.wc_tbl, rows,
                                     "아직 완료된 월드컵이 없습니다")
         return w
+
+    def _on_wc_rank_leaders_clicked(self):
+        data = wb.get_wc_rank_leaders()
+        dlg = RankLeadersDialog("월드컵", data,
+                                 keys=("winner", "runner_up", "third", "fourth"),
+                                 key_labels=["🥇 1위", "🥈 2위", "🥉 3위", "4위"],
+                                 empty_msg="아직 완료된 월드컵이 없습니다", parent=self)
+        dlg.show()
 
     # ─────────────────────────────────────────
     # 탭4: 역대 네이션스컵(대륙컵)
@@ -2983,8 +3078,20 @@ class WorldBrowserWindow(QDialog):
         필터가 전체가 맞고, 코파를 기본으로 하고 싶었던 건 이 팝업 안의
         필터 얘기였다"] 왼쪽 목록에서 뭘 선택했는지와 무관하게 항상 열 수
         있다 — 팝업 내부에 자체 "대회" 필터를 두고(기본값 코파 아메리카),
-        그 필터를 바꾸면 팝업 안에서 바로 다시 집계해서 보여준다."""
-        options = [(_ALL, None)] + [(name, name) for name in wb.list_region_cup_names()]
+        그 필터를 바꾸면 팝업 안에서 바로 다시 집계해서 보여준다.
+        [2026-08 신설, 신민용 요청: "필터 목록에 대회명만 있는데 어느
+        지역인지도 같이 보여달라"] REGION_CUP_NAME(지역명→대회명)을
+        거꾸로 뒤져서 "AFF 챔피언십(동남아시아)"처럼 표시 라벨에만
+        지역명을 괄호로 붙인다 — fetch_fn에 넘기는 실제 값(대회명)은
+        그대로라 조회 로직엔 영향 없다."""
+        from constants import REGION_CUP_NAME
+        cup_to_region = {v: k for k, v in REGION_CUP_NAME.items()}
+
+        def _labeled(name):
+            region = cup_to_region.get(name)
+            return f"{name}({region})" if region else name
+
+        options = [(_ALL, None)] + [(_labeled(name), name) for name in wb.list_region_cup_names()]
         default_value = "코파 아메리카" if any(v == "코파 아메리카" for _l, v in options) else None
         dlg = RankLeadersDialog("지역컵", wb.get_region_cup_rank_leaders(name=default_value),
                                  keys=("winner", "runner_up", "third", "fourth"),

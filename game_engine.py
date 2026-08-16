@@ -8644,14 +8644,10 @@ def enforce_affiliate_children_tier(parent_team_id: int, year: int) -> None:
         if pid in seen:
             continue
         seen.add(pid)
-        prow = c.execute("SELECT current_tier, country_id FROM teams WHERE id=?", (pid,)).fetchone()
+        prow = c.execute("SELECT current_tier FROM teams WHERE id=?", (pid,)).fetchone()
         if not prow:
             continue
         p_tier = prow["current_tier"]
-        country_id = prow["country_id"]
-        max_tier_row = c.execute(
-            "SELECT MAX(tier) FROM leagues WHERE country_id=?", (country_id,)).fetchone()
-        max_tier = max_tier_row[0] if max_tier_row and max_tier_row[0] else p_tier
 
         children = c.execute(
             "SELECT id, name, current_tier FROM teams WHERE parent_team_id=?", (pid,)).fetchall()
@@ -8659,34 +8655,96 @@ def enforce_affiliate_children_tier(parent_team_id: int, year: int) -> None:
             child_tier = child["current_tier"]
             if child_tier > p_tier:
                 continue  # 정상 — 이미 모팀보다 아래
-            if child_tier >= max_tier:
-                # 이미 그 나라 최하위 tier — 더 내려갈 데가 없는 구조적 한계
-                # (기존 정책과 동일하게 예외로 허용).
-                continue
-            new_tier = child_tier + 1
-            cur_lid_row = c.execute(
-                "SELECT id FROM leagues WHERE country_id=? AND tier=?",
-                (country_id, child_tier)).fetchone()
-            new_lid_row = c.execute(
-                "SELECT id FROM leagues WHERE country_id=? AND tier=?",
-                (country_id, new_tier)).fetchone()
-            if not new_lid_row:
-                continue
-            c.execute("UPDATE teams SET league_id=?, current_tier=? WHERE id=?",
-                      (new_lid_row["id"], new_tier, child["id"]))
-            c.execute(
-                """INSERT INTO promotion_log(year,team_name,from_tier,to_tier,league_name,
-                                              from_league_id,to_league_id,team_id) VALUES(?,?,?,?,?,?,?,?)""",
-                (year, child["name"], child_tier, new_tier, "",
-                 cur_lid_row["id"] if cur_lid_row else None, new_lid_row["id"], child["id"]))
-            print(f"[산하팀 tier 보정-PO] {year}년 {child['name']} 강제 강등 "
-                  f"{child_tier}부→{new_tier}부 (모팀 플레이오프 결과와 tier 충돌 즉시 회피)")
-            any_change = True
-            queue.append(child["id"])  # 이 산하팀 밑에 또 산하팀이 있을 수 있음
+            # [2026-08 재설계] 예전엔 여기서 산하팀 tier를 강제로 한 단계 더
+            # 내렸다(리그 순위와 무관한 인위적 조작). 이제는 리그/tier를
+            # 전혀 건드리지 않고, 모팀이 산하팀에서 부족 포지션 위주로
+            # 선수를 콜업해 산하팀 전력만 낮춘다 — 산하팀은 같은 리그에
+            # 남아 정상적으로 경쟁한다. tier가 안 바뀌므로 그 밑의 손자팀
+            # 으로 재귀 전파할 것도 없다(기존의 queue.append 제거).
+            picked_ids = _affiliate_callup_from_child(conn, pid, child["id"])
+            if picked_ids:
+                print(f"[산하팀 전력조정-PO] {year}년 {child['name']}에서 "
+                      f"{len(picked_ids)}명 콜업 (모팀 플레이오프 결과와 tier 충돌 → "
+                      f"리그·순위는 유지, 산하팀 전력만 조정)")
+                any_change = True
 
     if any_change:
         conn.commit()
         _invalidate_team_ovr_cache()
+
+
+def _affiliate_callup_from_child(conn, parent_id, child_id,
+                                  max_players=3, min_child_remaining=11,
+                                  max_pct=0.25):
+    """[2026-08 재설계, 신민용 확정: "강등 자체를 막으면 안 된다"] 1군(parent_id)이
+    강등(정규 시즌 종료 또는 승강 플레이오프)으로 산하팀(child_id)과 같은
+    tier가 됐을 때, 예전처럼 산하팀을 강제로 한 티어 더 밀어내리는 대신
+    1군이 산하팀 선수단에서 부족한 포지션 위주로 일부를 콜업해 산하팀
+    전력만 낮춘다 — 산하팀의 리그 소속·tier·순위는 전혀 건드리지 않고
+    그대로 같은 리그에서 정상적으로 시즌을 치르게 한다.
+
+    포지션 선정: 1군 스쿼드에서 포지션별(POSITIONS) 목표 보유 인원
+    (_TARGET_DEPTH)보다 실제 보유가 적은 포지션만 "부족 포지션"으로 보고,
+    부족한 정도가 큰 포지션부터 우선한다. 그냥 OVR 높은 순으로 아무나
+    데려오지 않는다 — 실제로 필요한 자리만 채운다.
+
+    콜업 인원은 다음 세 상한 중 가장 작은 값으로 제한한다(과도한 약화 방지):
+      - max_players(기본 3명)
+      - 산하팀 스쿼드의 max_pct(기본 25%)
+      - 산하팀에 최소 min_child_remaining(기본 11명 — 선발 11명을 채울
+        최소 인원)을 남기고 남는 인원
+
+    [2026-08 수치 조정] 처음엔 실제 축구단 기준(18~20명 이상 유지)으로
+    잡았는데, 이 게임의 실제 팀당 스쿼드 인원은 평균 11명(최소 3~최대
+    19명, 실측)으로 훨씬 작다 — 18명 기준을 그대로 쓰면 사실상 거의
+    모든 팀에서 cap이 0이 되어 콜업이 전혀 발동하지 않는 문제가 있었다
+    (12시즌 실측 시뮬레이션에서 실제로 0건 확인 후 발견). 이 게임의
+    실제 스쿼드 규모에 맞춰 "최소 11명(선발 인원)"으로 낮췄다.
+
+    반환: 실제로 이동한 선수 id 리스트(비어있으면 이동 없음 — 로그용).
+    """
+    from constants import POSITIONS
+    c = conn.cursor()
+    parent_squad = c.execute(
+        "SELECT id, position, ovr FROM ai_players WHERE team_id=?", (parent_id,)).fetchall()
+    child_squad = c.execute(
+        "SELECT id, position, ovr FROM ai_players WHERE team_id=?", (child_id,)).fetchall()
+    if not child_squad:
+        return []
+
+    _count_by_pos = {p: 0 for p in POSITIONS}
+    for r in parent_squad:
+        if r["position"] in _count_by_pos:
+            _count_by_pos[r["position"]] += 1
+
+    # 포지션별 목표 보유 인원(스쿼드 depth 기준치) — 목표치보다 실제
+    # 보유가 적은 포지션만 "부족"으로 보고, 부족한(보유 적은) 순서로 정렬.
+    _TARGET_DEPTH = 3
+    _need_positions = sorted(
+        (p for p in POSITIONS if _count_by_pos.get(p, 0) < _TARGET_DEPTH),
+        key=lambda p: _count_by_pos.get(p, 0))
+    if not _need_positions:
+        return []
+
+    cap = min(max_players,
+              int(len(child_squad) * max_pct),
+              max(0, len(child_squad) - min_child_remaining))
+    if cap <= 0:
+        return []
+
+    _need_rank = {p: i for i, p in enumerate(_need_positions)}
+    candidates = [r for r in child_squad if r["position"] in _need_rank]
+    # 부족도가 큰 포지션 우선, 같은 포지션 안에서는 OVR 높은 선수 우선.
+    candidates.sort(key=lambda r: (_need_rank[r["position"]], -r["ovr"]))
+    picked = candidates[:cap]
+    if not picked:
+        return []
+
+    picked_ids = [r["id"] for r in picked]
+    placeholders = ",".join("?" * len(picked_ids))
+    c.execute(f"UPDATE ai_players SET team_id=? WHERE id IN ({placeholders})",
+              (parent_id, *picked_ids))
+    return picked_ids
 
 
 def _process_promotion_relegation(year, season_avg_rating=6.0):
@@ -9111,44 +9169,19 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
             bottom_upper_list = auto_upper_cands[:n_actual]
             top_lower_list    = auto_lower_cands[:n_actual]
 
-            # [2026-08 재설계, 강등 스노우볼 방지 — club_strength 기반]
-            # "prestige_clubs.py 안에 있는 팀만 보호"가 아니라 "지금 이
-            # 세이브에서 실제로 강한 팀"(club_strength 기준)이면 명문
-            # 리스트 소속 여부와 무관하게 보호 대상이 되도록 바꿨다. 이
-            # 경계의 위 리그(tier)가 CLUB_STRENGTH_RELEGATION_FLOOR의
-            # "바닥 티어"와 일치하면, 강등 후보 중 그 밴드 이상 club_strength
-            # 를 가진 팀은 정해진 확률로 강등이 취소되고 대신 자동존 바로
-            # 위 순위 팀이 그 자리를 대신 내려간다 — 리그 인원수는 그대로
-            # 유지, "무조건 생존"이 아니라 확률상 살아남을 뿐이다.
-            if bottom_upper_list:
-                from constants import CLUB_STRENGTH_RELEGATION_FLOOR
-                _replacement_pool = ([r for r in upper_rows[:-auto_count] if r["id"] not in moved_teams]
-                                      if auto_count else [])
-                _repl_idx = len(_replacement_pool) - 1  # 자동존 바로 위 팀부터 순서대로 소비
-                _new_bottom_upper_list = []
-                for _cand in bottom_upper_list:
-                    _strength = _team_strength_cache.get(_cand["id"], 0.0)
-                    # [2026-08 버그수정] 예전엔 "club_strength로 첫 매치되는
-                    # 밴드"를 tier와 무관하게 하나 고른 뒤 tier==_floor를
-                    # 나중에 검사했다 — 그런데 리스트가 min_str 내림차순이
-                    # 아니면(또는 매우 강한 팀이 여러 밴드의 min_str을 동시에
-                    # 만족하면) 정작 지금 tier에 맞는 밴드가 뒤에 있어도 앞의
-                    # 다른 tier용 밴드에 먼저 매치되어 보호가 통째로 씹히는
-                    # 문제가 있었다(1부→2부 보호 밴드 추가 중 발견). 이제
-                    # "현재 tier(_f)와 정확히 일치하는 밴드"만 찾는다 — 밴드
-                    # 등록 순서에 더 이상 의존하지 않는다.
-                    _floor = _chance = None
-                    for _min_str, _f, _ch in CLUB_STRENGTH_RELEGATION_FLOOR:
-                        if _f == tier and _strength >= _min_str:
-                            _floor, _chance = _f, _ch
-                            break
-                    if (_floor is not None and _repl_idx >= 0
-                            and random.random() < _chance):
-                        _new_bottom_upper_list.append(_replacement_pool[_repl_idx])
-                        _repl_idx -= 1
-                        continue  # _cand(강한 팀)는 강등 취소, 대신 위 팀이 강등
-                    _new_bottom_upper_list.append(_cand)
-                bottom_upper_list = _new_bottom_upper_list
+            # [2026-08 제거, 신민용 확정: "강등 자체를 막으면 안 된다"]
+            # 예전엔 여기서 CLUB_STRENGTH_RELEGATION_FLOOR를 참조해,
+            # 이미 순위표(승점→득실차)로 확정된 bottom_upper_list를
+            # 사후에 다시 바꿔치기했다(강한 팀은 확률적으로 강등 취소,
+            # 대신 순위표상 더 위였던 팀을 억지로 끌어내림) — 그 결과
+            # "19·20위는 안 내려가고 17·18위가 대신 강등"처럼 순위
+            # 결과 자체가 뒤집히는 문제가 있었다.
+            # 강팀이 실제로 잘 안 떨어지게 하고 싶다면 이미 있는
+            # CLUB_STRENGTH_MATCH_WEIGHT(경기 결과 자체에 반영 — 순위가
+            # 확정되기 전에 작동)로 처리하는 게 맞는 경로다. 여기서
+            # 순위 확정 후 결과를 다시 조작하는 건 이중 보정이자 결과
+            # 왜곡이므로 완전히 제거한다. bottom_upper_list는 이제
+            # 순수하게 그 시즌 순위표 그대로 유지된다.
 
             # [2026-08 버그수정, 신민용 리포트: "프리미어리그 21팀으로 늘어남,
             # 승격팀·강등팀 겹침"] club_strength 보호로 "대신 내려갈 팀"이
@@ -9388,11 +9421,23 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
             })
 
         _MAX_RESOLUTION_PASSES = 10
+        # [2026-08 신설] 이번 시즌 콜업으로 이미 처리된 (자식,모팀) 쌍은
+        # 다시 위반 목록에 넣지 않는다 — case②는 이제 tier를 바꾸지 않고
+        # 선수 콜업으로만 해결하므로, 이 셋이 없으면 같은 패스 안에서
+        # 매번 다시 "위반"으로 잡혀 콜업이 무한 반복된다.
+        _callup_resolved: set = set()
         for _pass_i in range(_MAX_RESOLUTION_PASSES):
             _violations = [
                 tid for tid, pid in _parent_of.items()
                 if tid in _pending_tier and pid in _pending_tier
                 and _pending_tier[tid] <= _pending_tier[pid]
+                and tid not in _callup_resolved
+                and (
+                    # case①: 자식이 이번 시즌 승격해서 새로 생긴 충돌
+                    (tid in moved_teams and _pending_tier[tid] < _original_tier.get(tid, _pending_tier[tid]))
+                    # case②: 모팀이 이번 시즌 강등돼 자식 tier로 내려오며 새로 생긴 충돌
+                    or (pid in moved_teams and _pending_tier[pid] > _original_tier.get(pid, _pending_tier[pid]))
+                )
             ]
             if not _violations:
                 break
@@ -9463,51 +9508,34 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
 
                 else:
                     # ② 산하팀은 안 움직였는데 모팀이 강등돼 내려오며 충돌
-                    # → 산하팀을 한 티어 더 강등(내려가는 건 항상 안전)
-                    _max_tier_country = _country_max_tier_map.get(_cid, _cur_tier)
-                    if _cur_tier >= _max_tier_country:
-                        _tname = _team_info_cache.get(_tid, ("", ""))[0]
-                        c.execute("SELECT MAX(tier) FROM leagues WHERE country_id=?", (_cid,))
-                        _live_max = c.fetchone()[0]
-                        if _live_max is not None and _live_max > _max_tier_country:
-                            print(f"[WB-ALARM] {year}년 {_tname}(id={_tid}, country={_cid}): "
-                                  f"캐시된 max_tier={_max_tier_country} vs 실제DB max_tier={_live_max} "
-                                  f"— 불일치! cur_tier={_cur_tier}")
-                        # [2026-08 정책 확정] 자식이 이미 그 나라 최하위 tier에
-                        # 있고 부모가 강등을 거듭해 그 tier까지 따라잡은
-                        # 경우다. child_tier <= parent_tier면서 child가 이미
-                        # 최하위이면 parent도 반드시 최하위(그 이상 내려갈
-                        # 데가 없으므로) — 이건 "보정 실패"가 아니라 "더 이상
-                        # 밀어낼 tier 자체가 없는 구조적 한계"로, 정책상
-                        # 허용되는 예외다(리히텐슈타인 1부 예외와 같은 성격,
-                        # 다만 이쪽은 국가 단위 화이트리스트가 아니라 "자식이
-                        # 최하위 tier"라는 조건 자체로 일반화된 예외).
-                        print(f"[산하팀 tier 보정] {year}년 {_tname}: 구조적 tier 예외 "
-                              f"(자식이 이미 최하위 tier이고 부모가 그 tier까지 강등됨 — "
-                              f"정책상 허용)")
-                        _audit({**_audit_base, "correction_action": "FORCE_RELEGATE",
-                                "skip_reason": "STRUCTURAL_TIER_EXCEPTION", "result_tier": _cur_tier,
-                                "live_max_tier_check": _live_max})
-                        continue
-                    _new_tier2 = _cur_tier + 1
-                    _new_lid2 = _league_map.get((_cid, _new_tier2))
-                    _cur_lid2 = _league_map.get((_cid, _cur_tier))
-                    if _new_lid2 is None or _cur_lid2 is None:
-                        _audit({**_audit_base, "correction_action": "FORCE_RELEGATE",
-                                "skip_reason": "TARGET_LEAGUE_MISSING", "result_tier": _cur_tier,
-                                "target_tier": _new_tier2})
-                        continue
-                    _tname, _tlname = _team_info_cache.get(_tid, ("", ""))
-                    _pending_tier[_tid] = _new_tier2
-                    _team_move_updates.append((_new_lid2, _new_tier2, _tid))
-                    moved_teams.add(_tid)
-                    _promotion_log_inserts.append(
-                        (year, _tname, _cur_tier, _new_tier2, _tlname, _cur_lid2, _new_lid2, _tid))
-                    print(f"[산하팀 tier 보정] {year}년 {_tname} 강제 강등 "
-                          f"{_cur_tier}부→{_new_tier2}부 (모팀과 tier 충돌 회피)")
-                    _audit({**_audit_base, "correction_action": "FORCE_RELEGATE",
-                            "skip_reason": "CORRECTED", "result_tier": _new_tier2,
-                            "target_tier": _new_tier2, "target_league_found": True})
+                    # → [2026-08 재설계, 신민용 확정: "강등 자체를 막으면
+                    #   안 된다"] 예전엔 산하팀을 한 티어 더 강등시켰다(리그
+                    #   순위와 무관한 인위적 조작 — "구조적 tier 예외"까지
+                    #   따로 둬야 했을 만큼 부자연스러웠다). 이제는 산하팀의
+                    #   리그·tier·순위를 전혀 건드리지 않고, 모팀이 산하팀
+                    #   에서 부족 포지션 위주로 선수를 콜업해 산하팀 전력만
+                    #   낮춘다 — 산하팀은 같은 리그에 남아 정상적으로
+                    #   경쟁한다. tier가 안 바뀌므로 "이미 최하위라 더 못
+                    #   내려간다"는 구조적 예외 자체가 더 이상 필요 없다.
+                    _tname = _team_info_cache.get(_tid, ("", ""))[0]
+                    _picked_ids = _affiliate_callup_from_child(conn, _pid_cur, _tid)
+                    if _picked_ids:
+                        print(f"[산하팀 전력조정] {year}년 {_tname}에서 {len(_picked_ids)}명 "
+                              f"콜업 (모팀과 tier 충돌 → 리그·순위는 유지, 산하팀 전력만 조정)")
+                        _audit({**_audit_base, "correction_action": "CALLUP",
+                                "skip_reason": "CORRECTED", "result_tier": _cur_tier,
+                                "callup_player_count": len(_picked_ids)})
+                    else:
+                        # 콜업할 대상이 없어도(산하팀 스쿼드가 이미 얇거나
+                        # 부족 포지션이 없는 경우) tier는 그대로 둔다 —
+                        # 억지로 리그를 조작하지 않는다는 원칙은 유지.
+                        _audit({**_audit_base, "correction_action": "CALLUP",
+                                "skip_reason": "NO_ELIGIBLE_PLAYERS", "result_tier": _cur_tier,
+                                "callup_player_count": 0})
+                    # 이번 시즌엔 이 (자식,모팀) 쌍을 다시 위반으로 잡지
+                    # 않는다 — tier가 그대로라 재판정하면 매 패스마다 또
+                    # 콜업이 반복된다.
+                    _callup_resolved.add(_tid)
                     _any_change = True
 
             if not _any_change:
@@ -10589,7 +10617,16 @@ def _gate_grade_for_tier(country_grade: str, tier: int) -> str:
     idx = min(len(_GATE_GRADE_ORDER) - 1, idx + max(0, tier - 1))
     return _GATE_GRADE_ORDER[idx]
 
-# 에이전트 등급별 지원 성공 보정치.
+# [2026-08 신설, 신민용 리포트: "직접 지원이 팀 입단보다 헐렁하면 안 된다"]
+# agent_mod+form_mod+pop_mod+fame_mod 네 개를 다 더하면 이론상 최대
+# 약 44(에이전트8 + 폼·수상16 + 인기8.1 + 명성12.15)까지 나올 수 있어서,
+# 40세에 OVR가 크게 떨어진 선수도 이 네 개만으로 큰 OVR 격차+나이 페널티를
+# 통째로 뒤집어 1부 팀에 "유력"이 뜨는 사례가 있었다. 패시브 오퍼가 같은
+# 인기도/명성을 반영할 때 합산 상한을 4.0으로 두는 것(_pop_fame_bonus)보단
+# 넉넉하게(에이전트/폼/수상 경력이 진짜 좋으면 그래도 유리해야 하므로),
+# 그러나 무제한은 아니게 이 네 보정치 합계에 상한을 둔다.
+REPUTATION_BONUS_CAP = 14.0
+
 AGENT_APPLY_MOD = {"S": 8, "A": 6, "B": 4, "C": 2, "D": 0, "E": -2, "F": -4}
 
 # 직전 시즌 평균평점 보정.
@@ -10720,6 +10757,29 @@ def _apply_reference_league_grade_tier(p):
 # 이미 TALENT_GATE_MIN_BY_GRADE가 사실상 막아주므로 3단계 이상은 극단값).
 _TIER_JUMP_PENALTY = {0: 0, 1: -3, 2: -8, 3: -15}
 
+# [2026-08 신설, 신민용 리포트: "나이 40에 OVR64인 선수가 팀 입단(패시브
+# 오퍼)에서는 K리그 3~5부만 뜨는데, 직접 지원으로 K리그 1부를 검색하면
+# 오히려 '유력'/'가능성 있음'이 뜬다 — 직접 지원은 무조건 팀 입단보다
+# 엄격해야 하지 않나?"] 실측해보니 원인은 위 jump_penalty가 "직전 소속
+# 리그 등급" 기준이라, 이 선수처럼 원래 1부에서 뛰다가 노쇠해서 방출된
+# 경우엔 ref_grade가 여전히 1부(A급)라 jump=0(페널티 없음)으로 계산됐다
+# — "어느 리그 소속이었냐"만 보고 "지금 실력이 그 리그 수준이냐"는 안
+# 본 것. 반면 패시브 오퍼(_suitable_grades)는 순수하게 "지금 OVR"만
+# 보고 등급대를 정하므로, 이 경우 자연스럽게 하위 등급만 뜬다 — 같은
+# 선수인데 두 시스템이 서로 다른 기준(직전 리그 vs 현재 OVR)을 써서
+# 결과가 크게 어긋난 것.
+# 그래서 "직전 리그 대비 점프"와는 별개로 "지금 OVR 대비 점프"도 똑같은
+# 페널티 표로 계산해서 추가한다 — 둘 중 하나라도 크게 벌어지면(과거엔
+# 좋았지만 지금은 아니거나, 원래도 그 등급이 아니었거나) 확률이 떨어져야
+# "직접 지원이 팀 입단보다 절대 헐렁해지지 않는다"는 원칙이 지켜진다.
+def _ovr_natural_best_grade_idx(my_ovr, agent_grade):
+    """지금 OVR+에이전트만으로 자연스러운 등급대(_suitable_grades — 패시브
+    오퍼가 실제로 쓰는 것과 동일한 기준 함수)의 최상위(가장 좋은) 등급
+    인덱스를 반환한다(_GATE_GRADE_ORDER 기준, SS=0이 가장 좋음)."""
+    grades = _suitable_grades(my_ovr, agent_grade)
+    idxs = [_GATE_GRADE_ORDER.index(g) for g in grades if g in _GATE_GRADE_ORDER]
+    return min(idxs) if idxs else len(_GATE_GRADE_ORDER) - 1
+
 # [2026-07 신설, 신민용 확정: "에이전트는 성공률을 올리는 게 아니라 불이익을
 # 줄여주는 역할"] 에이전트 등급이 위 리그 점프 페널티를 등급별 비율만큼
 # 상쇄한다 — "기록(인기도/명성)이 없어도 좋은 에이전트의 연줄로 눈에는
@@ -10737,7 +10797,7 @@ def get_apply_player_context(p=None):
     보여주는데, 매 행마다 career_entries/awards 쿼리를 새로 날리면 검색할
     때마다 체감 렉이 생김).
     반환: dict(my_ovr, talent_cap, agent_mod, agent_grade, form_mod, age_mod,
-    talent_mod, pop_mod, fame_mod, ref_grade_idx, my_continent)."""
+    talent_mod, pop_mod, fame_mod, ref_grade_idx, ovr_best_grade_idx, my_continent)."""
     p = p or get_player()
     if not p:
         return None
@@ -10756,6 +10816,11 @@ def get_apply_player_context(p=None):
         "pop_mod": _apply_pop_mod(p.get("popularity", 0)),
         "fame_mod": _apply_fame_mod(p.get("fame", 0)),
         "ref_grade_idx": _GATE_GRADE_ORDER.index(ref_gate_grade),
+        # [2026-08 신설] "직전 소속 리그가 몇 부였냐"만으로는 놓치는 경우
+        # (원래 1부에서 뛰다가 노쇠해서 방출된 선수 등)를 잡기 위한 두
+        # 번째 기준 — "지금 OVR로 자연스러운 등급대가 어디까지냐"
+        # (_suitable_grades, 패시브 오퍼와 동일 기준)도 같이 들고 있는다.
+        "ovr_best_grade_idx": _ovr_natural_best_grade_idx(p.get("ovr", 40), agent_grade),
         "my_continent": get_country_continent(p.get("nationality", "")),
     }
 
@@ -10812,6 +10877,20 @@ def calc_apply_prob_with_context(team_id, ctx):
     jump_penalty = _TIER_JUMP_PENALTY.get(max(0, jump), -22 if jump > 0 else 0)
     jump_penalty *= (1.0 - ctx["agent_jump_offset"])
 
+    # [2026-08 신설, 신민용 리포트: "나이 40 OVR64 선수가 팀 입단에선
+    # K리그 3~5부만 뜨는데 직접 지원으로 1부를 찾으면 오히려 유력하게
+    # 뜬다 — 직접 지원이 팀 입단보다 헐렁하면 안 되는 거 아니냐"] 위
+    # jump_penalty는 "직전 소속 리그"만 보는데, 원래 1부에서 뛰다가
+    # 노쇠해서 방출된 선수는 ref_grade가 여전히 1부라 이 페널티가 0으로
+    # 나온다 — "지금 실력이 그 등급에 안 맞아졌다"는 걸 놓친다. 패시브
+    # 오퍼가 쓰는 것과 동일한 "지금 OVR로 자연스러운 등급대"
+    # (ovr_best_grade_idx) 기준으로도 똑같은 페널티 표를 한 번 더 적용해서,
+    # 두 기준 중 하나라도 크게 벌어지면 확률이 떨어지게 한다 — 직접
+    # 지원이 팀 입단보다 절대 더 헐렁해지지 않는다는 원칙을 지키기 위함.
+    ovr_jump = ctx["ovr_best_grade_idx"] - target_idx
+    ovr_jump_penalty = _TIER_JUMP_PENALTY.get(max(0, ovr_jump), -22 if ovr_jump > 0 else 0)
+    ovr_jump_penalty *= (1.0 - ctx["agent_jump_offset"])
+
     # [2026-07 신설, 신민용 설계+확정: "국가 명성이 아니라 국적에 따른
     # 시장 접근성"] 출신 대륙 -> 목적 대륙 이적 난이도. 한국 선수가 K리그
     # 에서 아무리 잘해도 EPL/프랑스로 바로 가는 게 드문 것처럼, 실력과
@@ -10819,10 +10898,26 @@ def calc_apply_prob_with_context(team_id, ctx):
     from constants import transfer_region_mod
     region_mod = transfer_region_mod(ctx["my_continent"], row["continent"])
 
+    # [2026-08 신설, 신민용 리포트 (계속): "직접 지원이 팀 입단보다 헐렁하면
+    # 안 된다"] ovr_jump_penalty를 추가해도, 에이전트 등급이 좋으면
+    # _suitable_grades 자체가 이미 등급대를 넓게 잡아줘서(예: S급 에이전트는
+    # +3단계) 이 페널티가 0으로 나올 수 있다 — 그 경우 진짜 원인은
+    # 여기(agent_mod+form_mod+pop_mod+fame_mod)가 개별로는 각각 크지 않아
+    # 보여도 다 더하면(최대 약 44) 큰 OVR 격차+나이 페널티(-9~-24 정도)를
+    # 통째로 뒤집을 만큼 커진다는 것 — 패시브 오퍼는 같은 인기도/명성을
+    # 반영할 때도 합산 상한을 4.0으로 두는데(_pop_fame_bonus) 반해, 이쪽은
+    # 상한이 아예 없었다. "직접 지원은 팀 입단보다 좀 더 대담한 시도를
+    # 허용하되, 그 폭 자체엔 상한이 있어야 한다"는 원칙으로 네 보정치의
+    # 합에 상한(REPUTATION_BONUS_CAP)을 둔다 — 패시브의 +4보다는 넉넉하게
+    # (에이전트/폼/수상 경력이 진짜 좋은 선수는 그래도 남들보단 유리해야
+    # 하므로) 두되, 무제한으로 큰 격차를 통째로 뒤집을 순 없게 막는다.
+    rep_bonus = ctx["agent_mod"] + ctx["form_mod"] + ctx["pop_mod"] + ctx["fame_mod"]
+    rep_bonus = max(-20.0, min(REPUTATION_BONUS_CAP, rep_bonus))
+
     gap = ctx["my_ovr"] - team_avg
-    eff = (gap + margin + ctx["agent_mod"] + ctx["form_mod"] + ctx["age_mod"]
-           + ctx["talent_mod"] + ctx["pop_mod"] + ctx["fame_mod"]
-           + jump_penalty + region_mod)
+    eff = (gap + margin + rep_bonus + ctx["age_mod"]
+           + ctx["talent_mod"]
+           + jump_penalty + ovr_jump_penalty + region_mod)
     prob = 1.0 / (1.0 + math.exp(-eff / 8.0)) if abs(eff) < 700 else (1.0 if eff > 0 else 0.0)
     prob = max(0.03, min(0.95, prob))
     return prob, False

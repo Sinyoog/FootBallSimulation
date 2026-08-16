@@ -1058,6 +1058,15 @@ def get_wc_history(limit=100):
     return rows
 
 
+# [2026-08 신설, 신민용 요청: "월드컵에도 네이션스컵처럼 역대 1~4위를
+# 가장 많이 차지한 국가 순위를 보여달라"] 월드컵은 대회명이 하나뿐이라
+# (네이션스컵/지역컵과 달리 여러 이름으로 안 갈림) 별도 필터 없이 전체
+# 역사를 그대로 집계한다.
+def get_wc_rank_leaders():
+    rows = get_wc_history(limit=999999)
+    return _rank_leaders_from_rows(rows, ("winner", "runner_up", "third", "fourth"), "{key}")
+
+
 # ─────────────────────────────────────────
 # 5. 역대 대륙컵(네이션스컵) 기록
 # ─────────────────────────────────────────
@@ -1507,6 +1516,10 @@ def get_intl_tournament_detail(tournament_id):
     from intl_engine import STAGE_KO
     conn = get_conn(); c = conn.cursor()
 
+    t_row = c.execute(
+        "SELECT id, year, kind, continent FROM intl_tournaments WHERE id=?",
+        (tournament_id,)).fetchone()
+
     entries = [dict(r) for r in c.execute(
         "SELECT country, flag, grade, grp FROM intl_entries "
         "WHERE tournament_id=? AND grp != ''", (tournament_id,)).fetchall()]
@@ -1548,15 +1561,28 @@ def get_intl_tournament_detail(tournament_id):
     knockout = [{"stage": s, "stage_ko": STAGE_KO.get(s, s), "matches": ko_by_stage[s]}
                 for s in _INTL_KO_STAGE_ORDER if s in ko_by_stage]
 
-    # [2026-08 버그수정, 신민용 리포트: "3위 와일드카드로 진출한 팀도
-    # 조별리그 표에서 흰색(진출 표시)으로 떠야 하는데 회색으로 뜬다"]
-    # 이 상세창의 조별리그 표는 원래 "순위<2면 진출"이라는 단순 가정만
-    # 썼다(실제 대진을 안 보고 순위만 봄) — 3위 와일드카드가 있는 대회
-    # (월드컵 48강, 대륙컵/유로/일부 지역컵)에서는 틀린 판정이었다. 실제
-    # 첫 토너먼트 라운드(가장 이른 스테이지)에 등장하는 팀 이름을 그대로
-    # "진출 확정" 집합으로 써서, 순위 대신 실제 대진 데이터를 근거로 삼는다.
+    # [2026-08 버그수정, 신민용 리포트: "세계 축구 기록실에서 조 2위까지
+    # 다 흰색(진출)으로 칠해지는데, 이건 실제로 2위한테 진출 경로가 아예
+    # 없는 대회(예: 아시아 월드컵 예선 — 조 1위만 직행, 와일드카드/PO
+    # 없음)에서도 똑같이 그런다 — 버그 맞다"] 바로 아래 "대진표 등장
+    # 팀 = 진출"이라는 원래 로직은 예선(wc_qual/cont_qual) 중에서도
+    # 플레이오프 자체가 없는 체제(조 1위 전원 직행, 2위는 기회 0)에서는
+    # knockout이 통째로 비어있어 qualified가 빈 set으로 남고, 그러면
+    # world_browser_window._build_groups_grid가 "qualified가 비어있으면
+    # 순위<2로 잠정 표시"라는 폴백을 타 버려서 — 이미 완전히 끝난
+    # 대회인데도 2위까지 흰색으로 뜬다. 예선은 knockout 등장 여부로
+    # 추측하지 않고, intl_engine.get_qual_advance_status(실제 쿼터/
+    # 와일드카드/PO 설정을 그대로 재현하는 함수, schedule_window가 쓰는
+    # 것과 동일)로 확정된 진출 여부를 직접 계산한다 — 이 함수를 호출하는
+    # 시점엔 항상 status='done'인 완료된 예선만 대상이므로(get_country_
+    # tournament_results 등 호출부가 이미 done만 필터링) 'direct'/'po_ok'
+    # 인 나라만 확정 진출로 본다.
     qualified = set()
-    if knockout:
+    if t_row and t_row["kind"] in ("wc_qual", "cont_qual"):
+        from intl_engine import get_qual_advance_status
+        status_map = get_qual_advance_status(dict(t_row))
+        qualified = {nat for nat, s in status_map.items() if s in ("direct", "po_ok")}
+    elif knockout:
         first_stage_matches = knockout[0]["matches"]
         for m in first_stage_matches:
             if m.get("home"):

@@ -31,6 +31,14 @@ QDialog { background:#1e1e1e; color:#ccc; }
 #negBtn:hover { background:#3a3a8a; }
 #negBtn:disabled { background:#333; color:#555; }
 #noOffer { color:#666666; font-size:13px; }
+QComboBox {
+    background:#2a2a2a; color:#ccc; border:1px solid #444;
+    border-radius:4px; padding:4px 6px; font-size:12px;
+}
+QComboBox:disabled { color:#666; }
+QComboBox QAbstractItemView {
+    background:#2a2a2a; color:#ccc; selection-background-color:#3a6a3a;
+}
 """
 
 class OfferWindow(QDialog):

@@ -131,12 +131,30 @@ QLabel  { color:#cccccc; font-size:13px; }
 #dlgOk   { background:#2a6a2a; color:white; border:none; border-radius:6px;
            padding:9px 14px; font-size:13px; font-weight:bold; }
 #dlgOk:hover { background:#3a8a3a; }
+#dlgOk:disabled { background:#2a2a2a; color:#666; }
 #dlgNo   { background:#7a2222; color:white; border:none; border-radius:6px;
            padding:9px 14px; font-size:13px; font-weight:bold; }
 #dlgNo:hover { background:#9a3030; }
+#dlgNo:disabled { background:#2a2a2a; color:#666; }
 #dlgChoice { background:#1a4d8f; color:white; border:1px solid #3a7fd5;
              border-radius:6px; padding:12px 14px; font-size:14px; font-weight:bold; }
 #dlgChoice:hover { background:#2360ad; }
+#negBtn  { background:#2a2a6a; color:white; border:none; border-radius:4px;
+           padding:6px 14px; font-size:12px; }
+#negBtn:hover { background:#3a3a8a; }
+#negBtn:disabled { background:#2a2a2a; color:#555; }
+QPushButton { background:#333; color:#ccc; border:none; border-radius:6px;
+              padding:9px 14px; font-size:13px; }
+QPushButton:hover { background:#444; }
+QPushButton:disabled { background:#2a2a2a; color:#555; }
+QComboBox {
+    background:#2a2a2a; color:#eee; border:1px solid #444;
+    border-radius:4px; padding:4px 6px; font-size:13px;
+}
+QComboBox:disabled { color:#666; }
+QComboBox QAbstractItemView {
+    background:#2a2a2a; color:#ccc; selection-background-color:#3a6a3a;
+}
 """
 
 
@@ -1894,7 +1912,7 @@ class CenterPanel(QWidget):
 
         # ── 연봉 협상 행 ──────────────────────────────
         sal_row = QHBoxLayout(); sal_row.setSpacing(6)
-        sal_btn = QPushButton()
+        sal_btn = QPushButton(); sal_btn.setObjectName("negBtn")
         sal_row.addWidget(sal_btn); sal_row.addStretch()
         lay.addLayout(sal_row)
 
@@ -1904,7 +1922,7 @@ class CenterPanel(QWidget):
         for y in range(CONTRACT_YEARS_MIN, CONTRACT_YEARS_MAX + 1):
             yrs_combo.addItem(f"{y}년", y)
         yrs_combo.setCurrentIndex(state["target_yrs"] - CONTRACT_YEARS_MIN)
-        yrs_btn = QPushButton()
+        yrs_btn = QPushButton(); yrs_btn.setObjectName("negBtn")
         yrs_row.addWidget(QLabel("🎯 희망:")); yrs_row.addWidget(yrs_combo)
         yrs_row.addWidget(yrs_btn); yrs_row.addStretch()
         lay.addLayout(yrs_row)
@@ -1938,6 +1956,13 @@ class CenterPanel(QWidget):
 
             dead = state["sal_failed"] or state["yrs_failed"]
             btn_accept.setText(f"✅ {state['yrs']}년 계약 수락")
+            # [2026-08 버그수정, 신민용 리포트: "결렬되면 입단할 수 없는데
+            # 수락 버튼이 눌리지는 않지만 표시를 안 해서 헷갈린다"] 비활성
+            # 처리(setEnabled(False)) 자체는 원래도 하고 있었다 — 진짜
+            # 원인은 _DIALOG_STYLE에 "#dlgOk:disabled" 규칙이 없어서,
+            # 비활성 상태에서도 눌리는 것처럼 계속 초록색 그대로 보였던
+            # 것. 스타일시트에 그 규칙을 추가해서(회색으로 바뀜) 이제
+            # 비활성 상태가 눈으로도 명확히 구분된다.
             btn_accept.setEnabled(not dead)
 
         def _on_target_changed(_):
