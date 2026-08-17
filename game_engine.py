@@ -549,7 +549,14 @@ def _age_train_eff(age: int, peak_age: int) -> float:
 
 def create_player(name: str, position: str, sub_role: str,
                   nationality: str = None, flag: str = None, talent_tier: str = None,
-                  personality: str = None, physical_trait: str = None):
+                  personality: str = None, physical_trait: str = None,
+                  start_year: int = None, start_age: int = None):
+    # [2026-08 신설, 신민용 요청: "새 선수 생성 때 시작 연도/나이도 고를 수
+    # 있게"] 입력 없으면(None) 기존과 완전히 동일하게 기본 상수를 쓴다 —
+    # 이 매개변수 자체가 하위호환을 깨지 않도록 옵션으로만 존재.
+    _start_year = start_year if start_year is not None else GAME_START_YEAR
+    _start_age = start_age if start_age is not None else PLAYER_START_AGE
+    _min_join_age = _start_age + 1  # "선택한 나이 다음 해부터 입단 가능"
     conn = get_conn()
     c = conn.cursor()
 
@@ -750,7 +757,7 @@ def create_player(name: str, position: str, sub_role: str,
         15,50,'F','ko',
         ?,?,?,?
     )""", (
-        name, nationality, flag, PLAYER_START_AGE, GAME_START_YEAR - PLAYER_START_AGE,
+        name, nationality, flag, _start_age, _start_year - _start_age,
         position, sub_role, personality, height, weight, peak_age,
         stat_vals["stamina"],    stat_vals["stamina_max"],
         stat_vals["speed"],      stat_vals["speed_max"],
@@ -767,7 +774,7 @@ def create_player(name: str, position: str, sub_role: str,
         stat_vals["confidence"], stat_vals["confidence_max"],
         stat_vals["leadership"], stat_vals["leadership_max"],
         stat_vals["concentration"],stat_vals["concentration_max"],
-        ovr, GAME_START_YEAR, 1, 1,
+        ovr, _start_year, 1, 1,
         talent_cap, talent_tier, physical_trait, body_type,
     ))
 
@@ -779,6 +786,15 @@ def create_player(name: str, position: str, sub_role: str,
     #   디에고 코스타처럼 '출생국 ≠ 대표국'을 은퇴요약에서 구분하기 위함.
     conn.execute("UPDATE my_player SET origin_nat=?, origin_flag=? WHERE id=1",
                  (nationality, flag))
+
+    # [2026-08 신설] 이 선수만의 입단 가능 최소 나이(선택한 시작 나이+1) 저장.
+    conn.execute("UPDATE my_player SET min_join_age=? WHERE id=1", (_min_join_age,))
+
+    # [2026-08 신설] 실제 선택된 시작 연도를 영구 저장 — intl_engine.py가
+    # 이걸 기준으로 월드컵/네이션스컵/클럽월드컵/지역컵 개최년도를 다시
+    # 계산한다(자세한 이유는 database.set_game_start_year 주석 참고).
+    from database import set_game_start_year
+    set_game_start_year(_start_year)
 
     # [전성기 OVR] 시작 OVR로 초기화 (이후 update_player가 자동으로 최고치 갱신).
     conn.execute("UPDATE my_player SET peak_ovr=? WHERE id=1", (ovr,))
@@ -793,20 +809,20 @@ def create_player(name: str, position: str, sub_role: str,
     # [국적 연혁] 출생 시점 보유 국적을 birth 이벤트로 기록(시작국적 + 복수국적).
     #   첫 항목이 '시작국적'이 되도록 1차 국적을 맨 앞에 둔다.
     _birth_hist = [{"type": "birth", "nat": nationality, "flag": flag,
-                    "year": GAME_START_YEAR, "week": 1}]
+                    "year": _start_year, "week": 1}]
     if nationality2:
         _birth_hist.append({"type": "birth", "nat": nationality2, "flag": flag2,
-                            "year": GAME_START_YEAR, "week": 1})
+                            "year": _start_year, "week": 1})
     if nationality3:
         _birth_hist.append({"type": "birth", "nat": nationality3, "flag": flag3,
-                            "year": GAME_START_YEAR, "week": 1})
+                            "year": _start_year, "week": 1})
     conn.execute("UPDATE my_player SET nat_history=? WHERE id=1",
                  (json.dumps(_birth_hist, ensure_ascii=False),))
 
     # 시즌 상태 초기화
     conn.execute("""INSERT OR REPLACE INTO season_state(id,current_year,current_week,
                     current_season,phase) VALUES(1,?,1,1,'preseason')""",
-                 (GAME_START_YEAR,))
+                 (_start_year,))
     conn.commit()
     conn.close()
 
@@ -816,9 +832,9 @@ def create_player(name: str, position: str, sub_role: str,
     # 기록이 있고, 나머지 전 세계 리그는 시즌 2(다음 해)부터 기록이 시작되는
     # 불일치가 있었다. 새 커리어 시작 시점에 한 번 호출해 시즌 1도 처음부터
     # 전 세계 모든 리그가 동일하게 그 해부터 기록을 갖게 한다.
-    _generate_all_league_schedules(1, GAME_START_YEAR)
+    _generate_all_league_schedules(1, _start_year)
 
-    add_log(f"⭐ {GAME_START_YEAR}년  —  {name} {PLAYER_START_AGE}세", "event")
+    add_log(f"⭐ {_start_year}년  —  {name} {_start_age}세", "event")
     add_log("─"*44, "sep")
 
 
@@ -7755,7 +7771,7 @@ def _end_of_season(p, year):
     if new_age >= 29:
         from constants import (AGING_DECLINE, AGING_DECLINE_WC_TOP, AGING_WC_TOP_OVR,
                                AGING_GROUP_WEIGHT, AGING_LIMITED_LATE_MENTAL,
-                               AGING_POS_MULT, AGING_STAT_FLOOR,
+                               AGING_POS_MULT, AGING_STAT_FLOOR, get_physical_age_cap,
                                PHYSICAL_STATS, TECHNICAL_STATS, MENTAL_STATS)
         tier = p.get("talent_tier", "pro")
         # 구버전 호환: 예전 키를 새 키로 변환
@@ -7822,6 +7838,18 @@ def _end_of_season(p, year):
                 # (a) 현재 스탯 직접 감소 — 훈련으로 다 메우지 못하게(핵심).
                 cur = p.get(stat, 40)
                 new_cur = max(AGING_STAT_FLOOR, round(cur - drop))
+
+                # [2026-08 신설] 신체 스탯(stamina/speed/jump/strength)만
+                # 나이별 절대 상한을 추가로 적용 — god/worldclass 등급이
+                # GK처럼 포지션 배수가 낮은 경우, 자연 하락만으로는 40대에도
+                # 신체 스탯이 80 가까이 남는 비현실적 케이스가 있었다(상세
+                # 사유는 constants.AGING_PHYSICAL_AGE_CAP 주석 참고).
+                # 기술/멘탈 스탯은 대상이 아니라 그대로 둔다.
+                if stat in PHYSICAL_STATS:
+                    _phys_cap = get_physical_age_cap(new_age)
+                    if _phys_cap is not None and new_cur > _phys_cap:
+                        new_cur = max(AGING_STAT_FLOOR, _phys_cap)
+
                 if new_cur < cur:
                     stat_updates[stat] = new_cur
 
@@ -7830,6 +7858,10 @@ def _end_of_season(p, year):
                 mk = f"{stat}_max"
                 old_mx = p.get(mk, 80)
                 new_mx = max(AGING_STAT_FLOOR, new_cur, round(old_mx - drop))
+                if stat in PHYSICAL_STATS:
+                    _phys_cap = get_physical_age_cap(new_age)
+                    if _phys_cap is not None and new_mx > _phys_cap:
+                        new_mx = max(AGING_STAT_FLOOR, new_cur, _phys_cap)
                 if new_mx < old_mx:
                     stat_updates[mk] = new_mx
 
@@ -7994,9 +8026,6 @@ def _end_of_season(p, year):
     if _p_final.get("current_team_id") and not _pending_transfer_type:
         _maybe_change_manager(_p_final, year)
         _update_club_ambition(_p_final, year)
-
-    if new_age >= MAX_AGE:
-        add_log(f"⭐ {new_age}세. 선수 생활을 마감합니다.", "event", year, 52)
 
 
 MANAGER_CHANGE_BASE_PROB = 0.12       # 시즌마다 기본 감독 교체 확률

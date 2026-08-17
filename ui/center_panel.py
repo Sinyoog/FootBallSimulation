@@ -1026,9 +1026,10 @@ class CenterPanel(QWidget):
         is_off  = is_pre or is_post
 
         from constants import MIN_JOIN_AGE
+        _min_join_age = p.get("min_join_age") or MIN_JOIN_AGE
         age = p.get("age", 16)
         has_team  = bool(p.get("current_team_id"))
-        can_join  = is_pre and age >= MIN_JOIN_AGE and not has_team and not self._join_used
+        can_join  = is_pre and age >= _min_join_age and not has_team and not self._join_used
 
         self.btn_join.setEnabled(can_join)
         self.btn_join.setVisible(not has_team)
@@ -1512,6 +1513,7 @@ class CenterPanel(QWidget):
         from constants import DAYS_PER_WEEK
         day  = st.get("current_day") or ((week - 1) * DAYS_PER_WEEK + 1)
         from constants import MIN_JOIN_AGE, SEASON_PHASES
+        _min_join_age = p.get("min_join_age") or MIN_JOIN_AGE
         _ps_s, _ps_e = SEASON_PHASES["preseason1"]
 
         # [2026-08 변경, 신민용 요청: "팀 없을 때는 진행 못 하는데 이때도
@@ -1521,7 +1523,7 @@ class CenterPanel(QWidget):
         # 1주씩/하루씩 모드에서도 똑같이 막을 이유가 없다. 완전히 막는 대신
         # 입단을 잊지 않도록 알림만 띄우고 그대로 진행시킨다(버튼/오퍼는
         # 여전히 정상적으로 뜬다).
-        if (p["age"] >= MIN_JOIN_AGE and not p.get("current_team_id")
+        if (p["age"] >= _min_join_age and not p.get("current_team_id")
                 and _ps_s <= week <= _ps_e and not getattr(self, "_skip_join_lock", False)
                 and self._join_reminder_shown_week != week):
             self._join_reminder_shown_week = week
@@ -1689,7 +1691,7 @@ class CenterPanel(QWidget):
         # 소속 없으면 입단 안내
         from constants import SEASON_PHASES as _SP4
         _pss, _pse = _SP4["preseason1"]
-        if _pss <= new_week <= _pse and p2.get("age",0) >= MIN_JOIN_AGE and not p2.get("current_team_id"):
+        if _pss <= new_week <= _pse and p2.get("age",0) >= (p2.get("min_join_age") or MIN_JOIN_AGE) and not p2.get("current_team_id"):
             # 새 시즌 프리시즌 진입 → 작년 '전부 결렬→1년 훈련' 보류를 해제하고
             #   올해 다시 입단(오퍼)에 도전하게 한다.
             self._skip_join_lock = False
@@ -1926,11 +1928,49 @@ class CenterPanel(QWidget):
             show_toast(self, "⚽ 팀에 입단해서 1년 넘기기를 마쳤습니다", "#006622", 2000)
             return
 
-        # [2026-08 변경] 대표팀 발탁(get_pending_choice)은 더 이상 멈추지
-        # 않고 자동 거절 후 계속 진행한다. 되돌릴 수 없는 정체성 선택인
-        # 강제확정(get_forced_commit)만 여전히 멈추고 사용자에게 맡긴다.
+        # [2026-08 버그수정, 신민용 리포트: "22살 1주차에 국적 선택 후 1년
+        # 넘기기를 이어하면 딱 1주만 더 진행되고(2주차) 바로 완료 처리돼버림"]
+        # 원인: 이 시점(52주째 진행이 방금 끝나 새해 1주차로 넘어온 바로 그
+        # 순간)에 "52주 완료"와 "22세 국적 강제확정 필요"가 동시에 걸리면,
+        # 예전엔 아래 forced_commit 분기가 완료 판정보다 먼저 실행돼서
+        # _year_weeks_done=52(이미 총량 도달)인 채로 "일시정지"됐다. 그러면
+        # 사용자가 국적을 고르고 "이어하기"를 눌렀을 때 실제로는 이미 끝난
+        # 해인데 한 주를 더 실행해버리고(그래서 1주차→2주차로만 넘어감),
+        # 그다음에야 53>=52로 완료 판정이 떨어져 즉시 "1년 넘기기 완료!"로
+        # 종료됐다 — 사용자 입장에선 "1주만 진행되고 멈춘 것"처럼 보였다.
+        # 완료 판정(weeks_done>=weeks_total)을 forced_commit 판정보다 먼저
+        # 검사하도록 순서를 바꾼다 — 이번 해는 정상적으로 딱 52주에서 완료
+        # 처리하고, 국적 확정은 그 직후(다음 해 몫으로) 별도로 띄운다.
         import intl_engine
         self._auto_decline_all_pending(intl_engine)
+
+        # 새 시즌 프리시즌으로 들어왔으면(정상적으로는 52주를 다 돌았을
+        # 때 딱 여기 도달) 입단 잠금을 풀어준다 — 이 리셋을 안 하면 1년
+        # 넘기기 후에도 입단 버튼이 계속 잠긴 채로 남는다
+        # (_on_advance_finished의 동일 로직 참고).
+        from constants import SEASON_PHASES as _SP_Y, MIN_JOIN_AGE as _MJA_Y
+        _min_join_age_y = p2.get("min_join_age") or _MJA_Y
+        _pss_y, _pse_y = _SP_Y["preseason1"]
+        st2 = get_state()
+        new_week = st2.get("current_week", 0) if st2 else 0
+        if (_pss_y <= new_week <= _pse_y and p2.get("age", 0) >= _min_join_age_y
+                and not p2.get("current_team_id")):
+            self._skip_join_lock = False
+            self._join_used = False
+            self.btn_join.setEnabled(True)
+            show_toast(self, f"⭐ {st2.get('current_year')}년 새 시즌!  팀 입단 기간입니다",
+                       "#006622", 2000)
+
+        if self._year_weeks_done >= self._year_weeks_total:
+            self._finalize_year_mode(refresh=True, revert_mode=False)
+            show_toast(self, "🗓 1년 넘기기 완료!", "#006622", 2000)
+            # 이번 해는 정상적으로 완료 처리했으니, 새해 국적 강제확정이
+            # 걸려 있으면 (완료 토스트와는 별개로) 바로 이어서 띄운다.
+            forced = intl_engine.get_forced_commit()
+            if forced:
+                self._show_forced_commit(forced)
+            return
+
         forced = intl_engine.get_forced_commit()
         if forced:
             # [2026-08] 진행률(_year_weeks_done/_year_pattern)은 보존하고
@@ -1942,27 +1982,6 @@ class CenterPanel(QWidget):
                              "처리 후 진행 버튼을 다시 누르면 이어집니다)",
                        "#cc6600", 3000)
             self._show_forced_commit(forced)
-            return
-
-        # 새 시즌 프리시즌으로 들어왔으면(정상적으로는 52주를 다 돌았을
-        # 때 딱 여기 도달) 입단 잠금을 풀어준다 — 이 리셋을 안 하면 1년
-        # 넘기기 후에도 입단 버튼이 계속 잠긴 채로 남는다
-        # (_on_advance_finished의 동일 로직 참고).
-        from constants import SEASON_PHASES as _SP_Y, MIN_JOIN_AGE as _MJA_Y
-        _pss_y, _pse_y = _SP_Y["preseason1"]
-        st2 = get_state()
-        new_week = st2.get("current_week", 0) if st2 else 0
-        if (_pss_y <= new_week <= _pse_y and p2.get("age", 0) >= _MJA_Y
-                and not p2.get("current_team_id")):
-            self._skip_join_lock = False
-            self._join_used = False
-            self.btn_join.setEnabled(True)
-            show_toast(self, f"⭐ {st2.get('current_year')}년 새 시즌!  팀 입단 기간입니다",
-                       "#006622", 2000)
-
-        if self._year_weeks_done >= self._year_weeks_total:
-            self._finalize_year_mode(refresh=True, revert_mode=False)
-            show_toast(self, "🗓 1년 넘기기 완료!", "#006622", 2000)
             return
 
         # 계속 다음 주로.
@@ -2781,8 +2800,9 @@ class CenterPanel(QWidget):
             show_toast(self, "⚠  소속 팀이 있을 때는 오퍼를 기다리세요")
             return
         from constants import MIN_JOIN_AGE
-        if p["age"] < MIN_JOIN_AGE:
-            show_toast(self, f"⚠  {MIN_JOIN_AGE}살부터 팀에 입단할 수 있습니다")
+        _min_join_age = p.get("min_join_age") or MIN_JOIN_AGE
+        if p["age"] < _min_join_age:
+            show_toast(self, f"⚠  {_min_join_age}살부터 팀에 입단할 수 있습니다")
             return
         self._join_used = True
         self.btn_join.setEnabled(False)

@@ -1248,9 +1248,13 @@ def _is_euro_cycle_year(year):
     '유로(EURO)' 예선 — 같은 kind='cont_qual'로 저장되지만 실제로는
     완전히 다른 두 대회의 예선이다. 판정식은 intl_engine.py의
     is_euro_cycle 계산과 완전히 동일하게 맞춘다(그쪽이 원본 판정)."""
-    from constants import REGIONAL_CUP_START_YEAR, REGIONAL_CUP_INTERVAL
-    return (year >= REGIONAL_CUP_START_YEAR
-            and (year - REGIONAL_CUP_START_YEAR) % REGIONAL_CUP_INTERVAL == 0)
+    # [2026-08 버그수정] 정적 상수 대신, 실제로 선택된 시작 연도 기준으로
+    # 매번 재계산한다(intl_engine._tournament_start_years와 동일한 이유).
+    from constants import REGIONAL_CUP_INTERVAL
+    from intl_engine import _tournament_start_years
+    _regional_start = _tournament_start_years()["regional"]
+    return (year >= _regional_start
+            and (year - _regional_start) % REGIONAL_CUP_INTERVAL == 0)
 
 
 def _effective_kind(kind, name, year=None):

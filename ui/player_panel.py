@@ -231,7 +231,7 @@ class PlayerPanel(QWidget):
             _nat_str = f"{p.get('flag','')} {p.get('nationality','')}"
 
         rows = [
-            ("나이",   f"{p['age']}세 ({p['current_year']}년)"),
+            ("나이",   f"{p['age']}세 ({p.get('birth_year', p['current_year'] - p['age'])}년생)"),
             ("국적",   _nat_str),
             ("소속",   team_name),
             ("리그",   league_name),

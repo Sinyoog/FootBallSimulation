@@ -76,10 +76,23 @@ def _batch_team_stage_points(conn, tournament_id: int, winner_team_id: int) -> d
 
 
 def _recent_cl_tournaments(conn, continent: str, cwc_year: int, n: int = CWC_SEASONS):
-    """클럽월드컵이 열리는 해 직전 n개 시즌의 그 대륙 챔스 대회 row들
+    """클럽월드컵이 열리는 해를 포함해 최근 n개 시즌의 그 대륙 챔스 대회 row들
     (year 내림차순 = 최근 시즌이 먼저). 게임 초반이라 n개가 다 없으면
-    있는 만큼만 반환 — 별도 예외처리 불필요(호출부가 len()으로 알아서 대응)."""
-    years = [cwc_year - i for i in range(1, n + 1)]
+    있는 만큼만 반환 — 별도 예외처리 불필요(호출부가 len()으로 알아서 대응).
+
+    [2026-08 버그수정, 신민용 리포트: "1987년 시작하면 클럽월드컵이 딱
+    1시즌 챔스로 안 열리고 4년 늦게(1991년) 열린다"] 예전엔 range(1,n+1)로
+    cwc_year 자기 자신을 제외하고 '직전' n시즌만 봤다. 그런데 CWC는 43주차
+    이후에 열리고 그 해의 챔스는 이미 23주차에 다 끝나있는 상태(주석 참고,
+    intl_engine.start_intl_tournament)라 cwc_year 자신의 챔스도 이미 완료된
+    유효한 데이터다. 이걸 제외하다 보니 CWC 캘린더 위상(anchor)이 GAME_
+    START_YEAR와 정확히 일치하는 시작 연도(예: 1987 — CWC_ANCHOR_YEAR=2003과
+    mod 4 위상이 같음)에서는 '직전 시즌'이 하나도 없어(게임이 그 해에 막
+    시작해서 이전 시즌 자체가 없음) 매번 팀 수 부족으로 스킵되고, 다음
+    스케줄 슬롯(대륙컵/지역컵/월드컵에 이미 선점됨)까지 밀려 통째로 한
+    주기(4년)를 건너뛰었다. cwc_year 자신을 포함하도록(range(0,n)) 고쳐서
+    '방금 끝난 그 해 챔스 1개'만으로도 정상적으로 클럽월드컵을 구성한다."""
+    years = [cwc_year - i for i in range(0, n)]
     ph = ",".join("?" * len(years))
     rows = conn.execute(
         f"""SELECT id, year, continent, winner_team_id FROM cl_tournaments

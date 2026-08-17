@@ -8,13 +8,15 @@ from PyQt6.QtWidgets import (
     QDialog, QMessageBox, QScrollArea, QGridLayout, QTextEdit
 )
 from PyQt6.QtCore import Qt, QEvent
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QIntValidator
 
 from database import reset_game_data, get_conn, KEY_STATS_BY_POS
 from game_engine import create_player, get_player, _SUB_ROLE_MATCH_MOD
 from constants import (POSITIONS, SUB_ROLES, PERSONALITIES, GAME_START_YEAR,
                        PLAYER_START_AGE, TALENT_TIER_KO, TALENT_TIER_ORDER, PHYSICAL_TRAITS,
-                       TALENT_TIERS, PERSONALITY_EFFECTS, PHYSICAL_TRAIT_EFFECTS, STAT_KO)
+                       TALENT_TIERS, PERSONALITY_EFFECTS, PHYSICAL_TRAIT_EFFECTS, STAT_KO,
+                       PLAYER_START_YEAR_MIN, PLAYER_START_YEAR_MAX,
+                       PLAYER_START_AGE_MIN, PLAYER_START_AGE_MAX)
 
 DARK_STYLE = """
 QWidget { background-color: #1a1a1a; color: #e0e0e0;
@@ -426,6 +428,26 @@ class NewPlayerDialog(QDialog):
         nat_row.addWidget(self.nat_btn)
         lay.addLayout(nat_row)
 
+        # [2026-08 신설, 신민용 요청] 시작 연도/나이 — 이름칸처럼 비워두면
+        # 기본값(GAME_START_YEAR/PLAYER_START_AGE)을 쓴다. 키보드로 직접
+        # 입력하는 형태(스핀박스 화살표 대신 QLineEdit+숫자검증)로 만들고,
+        # placeholder에 "기본값: N"을 띄워 비워도 뭐가 되는지 바로 보이게 함.
+        year_row = QHBoxLayout()
+        year_row.addWidget(QLabel("시작 연도"))
+        self.year_edit = QLineEdit()
+        self.year_edit.setPlaceholderText(f"기본값: {GAME_START_YEAR}년  (비워두면 기본값)")
+        self.year_edit.setValidator(QIntValidator(PLAYER_START_YEAR_MIN, PLAYER_START_YEAR_MAX))
+        year_row.addWidget(self.year_edit)
+        lay.addLayout(year_row)
+
+        age_row = QHBoxLayout()
+        age_row.addWidget(QLabel("시작 나이"))
+        self.age_edit = QLineEdit()
+        self.age_edit.setPlaceholderText(f"기본값: {PLAYER_START_AGE}세  (비워두면 기본값)")
+        self.age_edit.setValidator(QIntValidator(PLAYER_START_AGE_MIN, PLAYER_START_AGE_MAX))
+        age_row.addWidget(self.age_edit)
+        lay.addLayout(age_row)
+
         # 포지션 — 국적 선택과 같은 패턴으로 "🎲 랜덤"을 기본값으로 둔다.
         # 이름만 짓고 나머진 전부 랜덤에 맡기고 싶을 때, 이 콤보들을 그냥
         # 안 건드리기만 하면 되게 하기 위함.
@@ -496,6 +518,17 @@ class NewPlayerDialog(QDialog):
 
         ok_btn = QPushButton("✅ 생성")
         ok_btn.clicked.connect(self._create)
+        self.ok_btn = ok_btn
+        # [2026-08 버그수정, 신민용 리포트: "시작 연도/나이가 범위를 벗어나도
+        # 생성이 눌린다"] QIntValidator는 입력 도중(Intermediate) 상태를
+        # 완전히 막아주지 못해서(자리수가 이미 다 찼는데도 범위 밖 값이
+        # 통과하는 경우가 있었음), 확정적으로 텍스트가 바뀔 때마다 직접
+        # 범위를 재검사해서 벗어나면 "생성" 버튼 자체를 비활성화한다.
+        # "🎲 랜덤 생성" 버튼은 이 필드들을 아예 무시하고 만드므로 그대로
+        # 항상 활성 상태로 둔다.
+        self.year_edit.textChanged.connect(self._update_ok_enabled)
+        self.age_edit.textChanged.connect(self._update_ok_enabled)
+        self.ok_btn = ok_btn
 
         cancel_btn = QPushButton("취소")
         cancel_btn.setObjectName("danger")
@@ -532,6 +565,8 @@ class NewPlayerDialog(QDialog):
         self._note_handlers = {}
         self._active_note_widget = None
         for combo, handler in (
+            (self.year_edit, self._note_for_year),
+            (self.age_edit, self._note_for_age),
             (self.pos_combo, self._note_for_position),
             (self.role_combo, self._note_for_role),
             (self.talent_combo, self._note_for_talent),
@@ -540,8 +575,12 @@ class NewPlayerDialog(QDialog):
         ):
             combo.installEventFilter(self)
             self._note_handlers[combo] = handler
-            combo.currentIndexChanged.connect(
-                lambda _i, cb=combo: self._refresh_note_if_active(cb))
+            if isinstance(combo, QLineEdit):
+                combo.textChanged.connect(
+                    lambda _t, cb=combo: self._refresh_note_if_active(cb))
+            else:
+                combo.currentIndexChanged.connect(
+                    lambda _i, cb=combo: self._refresh_note_if_active(cb))
 
     # ── 설명 노트 콘텐츠 ─────────────────────────────────────────
     def eventFilter(self, obj, event):
@@ -555,13 +594,38 @@ class NewPlayerDialog(QDialog):
             self.note_panel.setHtml(self._note_handlers[combo]())
 
     def _note_default(self):
-        return ("<span style='color:#666;'>재능 등급 / 성격 / 신체 특징 / 주요 포지션 / "
-                "세부역할 중 하나를 클릭하면<br>여기에 실제 게임 효과가 표시됩니다.</span>")
+        return ("<span style='color:#666;'>시작 연도 / 시작 나이 / 재능 등급 / 성격 / "
+                "신체 특징 / 주요 포지션 / <br>세부역할 중 하나를 클릭하면<br>"
+                "여기에 실제 게임 효과가 표시됩니다.</span>")
 
     def _note_html(self, title, lines):
         body = "<br>".join(lines)
         return (f"<b style='color:#00cc44;font-size:13px;'>{title}</b><br><br>"
                 f"<span style='line-height:150%;'>{body}</span>")
+
+    def _note_for_year(self):
+        lines = [
+            f"게임을 시작하는 연도를 정합니다. {PLAYER_START_YEAR_MIN}년~{PLAYER_START_YEAR_MAX}년",
+            "사이에서 직접 골라 선택할 수 있습니다.",
+            "",
+            f"비워두면 기본값({GAME_START_YEAR}년)으로 시작합니다.",
+            "",
+            "월드컵/네이션스컵/대륙컵/클럽월드컵 등 대회 개최 연도는",
+            "선택한 시작 연도를 기준으로 자동으로 다시 배정됩니다.",
+        ]
+        return self._note_html(f"시작 연도 — {PLAYER_START_YEAR_MIN}~{PLAYER_START_YEAR_MAX}년", lines)
+
+    def _note_for_age(self):
+        lines = [
+            f"게임을 시작하는 내 선수의 나이를 정합니다. {PLAYER_START_AGE_MIN}세~{PLAYER_START_AGE_MAX}세",
+            "사이에서 직접 골라 선택할 수 있습니다.",
+            "",
+            f"비워두면 기본값({PLAYER_START_AGE}세)으로 시작합니다.",
+            "",
+            "팀 입단은 선택한 나이 다음 해(선택한 나이+1세)부터 가능합니다.",
+            "국가대표 발탁은 나이와 무관하게 17세부터 가능합니다.",
+        ]
+        return self._note_html(f"시작 나이 — {PLAYER_START_AGE_MIN}~{PLAYER_START_AGE_MAX}세", lines)
 
     def _note_for_talent(self):
         cur = self.talent_combo.currentData()
@@ -743,7 +807,36 @@ class NewPlayerDialog(QDialog):
                       talent_tier=None, personality=None, physical_trait=None)
         self.accept()
 
+    def _update_ok_enabled(self):
+        """시작 연도/나이가 빈 값(=기본값 사용)이거나 허용 범위 안이면
+        활성, 범위를 벗어나면(잘못 입력했으면) 비활성화한다."""
+        ok = True
+        year_txt = self.year_edit.text().strip()
+        if year_txt:
+            try:
+                y = int(year_txt)
+                if not (PLAYER_START_YEAR_MIN <= y <= PLAYER_START_YEAR_MAX):
+                    ok = False
+            except ValueError:
+                ok = False
+        age_txt = self.age_edit.text().strip()
+        if age_txt:
+            try:
+                a = int(age_txt)
+                if not (PLAYER_START_AGE_MIN <= a <= PLAYER_START_AGE_MAX):
+                    ok = False
+            except ValueError:
+                ok = False
+        self.ok_btn.setEnabled(ok)
+        self.ok_btn.setToolTip("" if ok else
+            f"시작 연도는 {PLAYER_START_YEAR_MIN}~{PLAYER_START_YEAR_MAX}년, "
+            f"시작 나이는 {PLAYER_START_AGE_MIN}~{PLAYER_START_AGE_MAX}세 범위여야 합니다")
+
     def _create(self):
+        # 방어적 안전장치 — 버튼이 비활성화돼있어야 정상이지만, 혹시라도
+        # 우회 경로(엔터키 등)로 호출되면 여기서 한 번 더 막는다.
+        if not self.ok_btn.isEnabled():
+            return
         name = self.name_edit.text().strip()
         # 국적 먼저 확정 — 이름 자동생성(국적에 맞는 이름 뽑기)에 필요하므로,
         # 국적 선택 안 했으면(랜덤) 여기서 미리 하나 뽑아 이후 create_player
@@ -789,6 +882,14 @@ class NewPlayerDialog(QDialog):
         tier = self.talent_combo.currentData()  # None이면 create_player가 알아서 확률 추첨
         personality = self.personality_combo.currentData()
         trait = self.trait_combo.currentData()
+        # [2026-08 신설] 비워두면(빈 문자열) None → create_player가 기본값
+        # (GAME_START_YEAR/PLAYER_START_AGE) 사용. 입력했으면 QIntValidator가
+        # 이미 범위(1986~2020 / 14~28)를 강제해뒀으므로 그대로 정수 변환.
+        year_txt = self.year_edit.text().strip()
+        age_txt = self.age_edit.text().strip()
+        start_year = int(year_txt) if year_txt else None
+        start_age = int(age_txt) if age_txt else None
         create_player(name, pos, role, nat_name, nat_flag, talent_tier=tier,
-                      personality=personality, physical_trait=trait)
+                      personality=personality, physical_trait=trait,
+                      start_year=start_year, start_age=start_age)
         self.accept()

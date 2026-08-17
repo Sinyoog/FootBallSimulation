@@ -22,7 +22,7 @@ from constants import OVR_RANGES, get_ovr_range
 from constants import (BODY_TYPE_NAMES, BODY_TYPE_WEIGHTS_BY_POS, BODY_TYPES,
                        CONTINENT_OVR_BONUS, COUNTRY_OVR_ADJ, SUB_ROLES, get_country_league_grade,
                        COUNTRY_LEAGUE_OVR_OVERRIDE)
-from data.prestige_clubs import is_prestige, PRESTIGE_OVR_BONUS, prestige_weight, weighted_team_order
+from data.prestige_clubs import is_prestige, PRESTIGE_OVR_BONUS, prestige_weight, weighted_team_order, prestige_level
 
 # [PyInstaller 대응] __file__ 기준 경로는 패키징 후 문제가 된다:
 #   - onefile: __file__이 실행마다 새로 생기는 임시폴더(sys._MEIPASS)를 가리켜서,
@@ -257,6 +257,48 @@ def _new_raw_conn():
     conn.execute("PRAGMA temp_store=MEMORY")   # 정렬/임시 테이블을 메모리에서 처리
     conn.execute("PRAGMA mmap_size=536870912") # 512MB mmap I/O
     return conn
+
+# [2026-08 신설, 신민용 리포트: "1986년으로 시작하면 국제대회가 하나도 안
+# 열린다"] GAME_START_YEAR가 새 선수 생성 화면에서 선택 가능해졌는데,
+# intl_engine.py는 WC_START_YEAR 등을 constants.py가 "임포트되는 그 순간"의
+# GAME_START_YEAR(하드코딩된 기본값 2000)로 한 번 계산해서 고정값으로 갖고
+# 있었다 — 실제로 플레이어가 1986년을 선택해도 이 계산엔 전혀 반영이 안 돼,
+# 대회 개최년도 판정이 계속 "2000년 기준"으로만 이뤄졌다. 실제로 선택한
+# 시작연도를 meta 테이블에 저장해두고, intl_engine.py가 매번 이 값을 기준으로
+# 대회 시작년도를 다시 계산하게 한다. 세션당 1번만 DB에서 읽고 이후엔
+# 캐시(_game_start_year_cache)로 재사용 — 메타 조회를 매주 반복하지 않는다.
+_game_start_year_cache = None
+
+
+def get_game_start_year():
+    """실제로 이번 세이브가 선택한 시작 연도(meta.game_start_year). 없으면
+    (예: 이 패치 이전 세이브) constants.GAME_START_YEAR로 폴백한다."""
+    global _game_start_year_cache
+    if _game_start_year_cache is not None:
+        return _game_start_year_cache
+    conn = get_conn()
+    row = conn.execute("SELECT value FROM meta WHERE key='game_start_year'").fetchone()
+    if row and row["value"]:
+        try:
+            _game_start_year_cache = int(row["value"])
+            return _game_start_year_cache
+        except (TypeError, ValueError):
+            pass
+    from constants import GAME_START_YEAR
+    _game_start_year_cache = GAME_START_YEAR
+    return _game_start_year_cache
+
+
+def set_game_start_year(year: int):
+    """새 선수 생성 시(create_player) 실제 선택된 시작 연도를 영구 저장하고
+    캐시를 갱신한다."""
+    global _game_start_year_cache
+    conn = get_conn()
+    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('game_start_year', ?)",
+                 (str(year),))
+    conn.commit()
+    _game_start_year_cache = year
+
 
 def get_conn():
     global _pool_conn
@@ -1275,6 +1317,15 @@ def init_db():
         "ALTER TABLE my_player ADD COLUMN total_red_cards_league INTEGER DEFAULT 0",
         "ALTER TABLE my_player ADD COLUMN total_red_cards_all INTEGER DEFAULT 0",
         "ALTER TABLE my_player ADD COLUMN season_red_cards_league INTEGER DEFAULT 0",
+        # [2026-08 신설, 신민용 요청: "새 선수 생성 때 시작 연도/나이를 고를
+        # 수 있게 — 입단은 무조건 선택한 나이+1부터"] MIN_JOIN_AGE가 그동안
+        # 전역 고정 상수(17)라 모든 선수에게 똑같이 적용됐는데, 시작 나이가
+        # 선택 가능해지면 선수마다 "입단 가능 나이"가 달라져야 한다(14세
+        # 시작이면 15세부터, 28세 시작이면 29세부터). 이 값을 선수별로
+        # 저장해서 ui/center_panel.py가 전역 상수 대신 이걸 쓰게 한다.
+        # 기본값 17은 기존 상수(PLAYER_START_AGE 16 + 1)와 완전히 동일 —
+        # 옛 세이브를 불러와도 동작이 안 바뀐다.
+        "ALTER TABLE my_player ADD COLUMN min_join_age INTEGER DEFAULT 17",
         # career_entries(팀 재직 기간별 리그 기록)에도 같은 패턴(saves,
         # clean_sheets 등)으로 그 재직 기간 동안의 리그 레드카드 수를 남긴다.
         "ALTER TABLE career_entries ADD COLUMN red_cards INTEGER DEFAULT 0",
@@ -1742,9 +1793,51 @@ def archive_old_seasons(current_season):
         _tsp0 = time.perf_counter()
         _summarize_and_prune_archive(conn, seasons=seasons)
         _tsp = time.perf_counter() - _tsp0
+    _tvac = _maybe_periodic_vacuum(conn)
     print(f"[PERF]   archive_old_seasons 세부: 과거시즌조회 {_ta1-_ta0:.2f}s | "
           f"아카이브INSERT {_ta2-_ta1:.2f}s | match_results DELETE {_ta3-_ta2:.2f}s | "
-          f"commit {_ta4-_ta3:.2f}s | 요약+정리 {_tsp:.2f}s | (대상시즌 {seasons})")
+          f"commit {_ta4-_ta3:.2f}s | 요약+정리 {_tsp:.2f}s | 주기VACUUM {_tvac:.2f}s | "
+          f"(대상시즌 {seasons})")
+
+
+# [2026-08 신설, 신민용 리포트: "이거 길게 가면(한 세이브를 오래 플레이하면)
+# 렉이 심해진다"] "새 게임" 반복 사이클(reset_game_data)만이 아니라, 한
+# 세이브를 계속 이어가는 경우도 매 시즌 archive_old_seasons의 대량
+# DELETE+INSERT가 쌓이면서 파일 내부 페이지 단편화가 생긴다 — 실측
+# (10시즌 헤드리스 추적): match_results 단편화가 시즌1 14%→시즌4 43%까지
+# 빠르게 오르고, 이후 시즌10까지는 34~40% 선에서 계속 오르내리며 정체된다
+# (한 세이브 안에서는 "새 게임" 반복 때처럼 끝없이 계속 불어나진 않지만,
+# 30~40%대에서 계속 머물러 있는 것 자체가 이미 상당한 성능 손실이다).
+# 매 시즌 VACUUM을 돌리면 그 비용(이 DB 크기 기준 약 0.8~1초)이 매년
+# 누적되어 배보다 배꼽이 커지므로, meta 테이블에 "마지막 VACUUM 이후
+# 지난 시즌 수"를 세어뒀다가 VACUUM_SEASON_INTERVAL(5)시즌마다 한 번만
+# 돌린다 — 단편화가 정체 구간(30~40%)에 도달하기 전에 주기적으로
+# 털어내면서도, 매 시즌 비용을 추가하지 않는다.
+VACUUM_SEASON_INTERVAL = 5
+
+
+def _maybe_periodic_vacuum(conn) -> float:
+    """archive_old_seasons()가 매 시즌 전환 시 호출. meta.seasons_since_vacuum
+    카운터를 증가시키고, VACUUM_SEASON_INTERVAL에 도달하면 VACUUM을 돌리고
+    카운터를 0으로 리셋한다. 반환값은 이번 호출에서 실제로 VACUUM을 도는 데
+    걸린 시간(초) — 안 돌았으면 0.0(archive_old_seasons의 [PERF] 로그용)."""
+    c = conn.cursor()
+    row = c.execute("SELECT value FROM meta WHERE key='seasons_since_vacuum'").fetchone()
+    try:
+        n = int(row["value"]) + 1 if row and row["value"] else 1
+    except (TypeError, ValueError):
+        n = 1
+    if n < VACUUM_SEASON_INTERVAL:
+        c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('seasons_since_vacuum', ?)",
+                  (str(n),))
+        conn.commit()
+        return 0.0
+    _tv0 = time.perf_counter()
+    conn.execute("VACUUM")
+    _tv1 = time.perf_counter()
+    c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('seasons_since_vacuum', '0')")
+    conn.commit()
+    return _tv1 - _tv0
 
 
 def repair_duplicate_season_schedules():
@@ -2202,6 +2295,15 @@ def reset_game_data():
               "season_state","qual_results","offer_refused","league_season_standings",
               "intl_history","intl_tournaments","intl_entries","intl_matches","nat_generation",
               "cl_tournaments","cl_entries","cl_matches","cl_history",
+              # [2026-08 버그수정, 신민용 리포트: "새 게임 시작하면 챔스는 새로
+              # 시작하는데 세계 축구 기록실의 역대 유로파/컨퍼런스는 안 지워진다"]
+              # el_*(유로파급)/ecl_*(컨퍼런스급)는 cl_*와 완전히 동일한 구조로
+              # 2026-08에 새로 추가됐는데, 이 삭제 목록엔 반영이 안 돼있었다 —
+              # 그래서 챔스는 새 게임 때 정상적으로 비워지는데 유로파/컨퍼런스만
+              # 이전 플레이 기록이 그대로 남아 세계 축구 기록실에 미래 연도까지
+              # 쌓여있는 것처럼 보였다.
+              "el_tournaments","el_entries","el_matches","el_history",
+              "ecl_tournaments","ecl_entries","ecl_matches","ecl_history",
               "cwc_tournaments","cwc_entries","cwc_matches",
               "cup_tournaments","cup_entries","cup_matches","cup_history",
               "po_pending_slots","po_tournaments","po_matches","po_history"]:
@@ -2211,7 +2313,26 @@ def reset_game_data():
     _reset_ai_players_from_seed(c)
     _reset_formations_from_seed(c)
     _reset_club_strength(c)
-    conn.commit(); conn.close()
+    conn.commit()
+
+    # [2026-08 신설, 신민용 리포트: "은퇴 이후 새 게임을 반복할수록 렉이
+    # 쌓이는 것 같다"] 실제 세이브 4개(설치 직후/1트/2트/3트)를 dbstat으로
+    # 비교 검증한 결과, 행 개수·파일 크기는 사이클마다 거의 그대로였지만
+    # (reset 자체는 깔끔하게 잘 지움) match_results/ai_players/
+    # league_season_standings 같은 핵심 테이블의 "페이지 단편화율"이
+    # 사이클을 반복할 때마다 계속 나빠지고 있었다(예: match_results
+    # 35%→62%→72%). 원인: 위의 대량 DELETE + _reset_*_from_seed의 대량
+    # UPDATE/INSERT가 반복되면서, SQLite가 지워진 페이지를 재활용은 하되
+    # 테이블별로 순서 있게 재배치는 안 해준다 — 그 결과 한 테이블의 행들이
+    # 파일 전체에 점점 더 흩어져 저장되고, 이게 인메모리 DB↔game.db
+    # 백업(backup() API, load_from_disk/flush_to_disk)에도 그대로
+    # 복제되어 앱을 껐다 켜도 안 없어지고 계속 누적된다. VACUUM으로
+    # 테이블을 파일 안에서 다시 순서대로 재배치하면 이 단편화가 즉시
+    # 해소된다(실측: match_results 단편화 71.7%→0.1%, 파일도 약간 축소).
+    # 새 게임을 누를 때만 1회 도는 작업이라(인메모리 DB 기준 1초 내외)
+    # 실제 플레이 중 버튼 반응성에는 영향이 없다.
+    conn.execute("VACUUM")
+    conn.close()
 
 # ─── OVR 가중치 ───────────────────────────────────────────────
 WEIGHTS = {
@@ -3069,14 +3190,22 @@ def _star_counts(grade, team_strength, continent_bonus=0, n_slots=11, tier=1):
     return n_world, n_elite
 
 
-def _star_target_ovr(tier_top, kind, el_offset=(6, 14)):
+def _star_target_ovr(tier_top, kind, el_offset=(6, 14), prestige_bonus=0.0):
     """스타 슬롯 하나의 목표 OVR. 리그 상한(tier_top) 바로 아래에서 결정 —
     월드클래스는 거의 상한 그 자체, 엘리트는 등급별 el_offset만큼 그 아래
-    (SS/S는 좁은 오프셋 = 상위권 엘리트, A는 넓은 오프셋 = 하위권 엘리트)."""
+    (SS/S는 좁은 오프셋 = 상위권 엘리트, A는 넓은 오프셋 = 하위권 엘리트).
+    [2026-08 버그수정, 신민용 리포트: "S등급(레알/바르사 등) 명문팀이 SS등급
+    (잉글랜드) 명문팀한테 밀리면 안 된다"] 기존엔 이 함수에 prestige_bonus
+    인자 자체가 없었다. SS/S 1부는 el_fill_rest=True라 스쿼드 전원이 여기
+    (스타 슬롯)로만 채워지는데, PRESTIGE_OVR_BONUS는 _target_ovr(일반
+    곡선)에만 들어가고 있었다 - SS/S 1부 명문팀은 명문팀 보정이 적용될
+    자리가 아예 없었던 것. 실측(맨유 94.1 vs 레알 93.3)에서 SS 명문팀이
+    S 명문팀보다 높게 나온 원인이 정확히 이거였다. 이제 worldclass/elite
+    목표치에도 prestige_bonus를 더한다."""
     if kind == "worldclass":
-        return tier_top - random.uniform(0, 4)
+        return tier_top - random.uniform(0, 4) + prestige_bonus
     lo, hi = el_offset
-    return tier_top - random.uniform(lo, hi)  # elite
+    return tier_top - random.uniform(lo, hi) + prestige_bonus  # elite
 
 
 def _tier_top_ovr(grade, tier, continent_bonus=0, country=None):
@@ -3238,6 +3367,24 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
     prestige_bonus = PRESTIGE_OVR_BONUS if is_prestige(
         team.get("cname", ""), tier, team.get("tname", "")) else 0
 
+    # [2026-08 신설, 신민용 요청: "S등급(레알/바르사 등) 명문팀이 SS등급
+    # (잉글랜드) 명문팀한테 밀리면 안 된다 — 단, 브라질은 예외"] 위
+    # prestige_bonus는 _target_ovr(일반 곡선)용이라 SS/S 1부(el_fill_rest=
+    # True, 스쿼드 전원이 스타 슬롯)에는 적용될 자리가 없었다. 스타 슬롯
+    # 전용 보정을 레벨별로 따로 둔다. 브라질은 이미 CONTINENT_OVR_BONUS
+    # (남미=0 vs 유럽=+1)와 COUNTRY_OVR_ADJ(-1)로 tier_top 자체가 유럽
+    # S등급보다 2점 낮게 잡혀 있어서, 이 보정을 브라질에 따로 빼지 않아도
+    # 실측상 유럽 S등급 명문팀보다 확실히 아래에 남는다(검증 완료).
+    _plevel = prestige_level(team.get("cname", ""), team.get("tname", ""))
+    _star_prestige_bonus = {3: 3.0, 2: 2.0, 1: 1.5}.get(_plevel, 0.0)
+    # [2026-08 추가] 위 보정을 SS/S 명문팀에 동일하게 주면 상대 격차(SS의
+    # 구조적 우위: 월드클래스 슬롯 4개 vs 3개, tier_top 100 vs 96~97)는 그대로
+    # 남는다(실측: 여전히 SS 96.7 vs S(비브라질) 95.0, 약 1.7점 차). "S등급
+    # 최상위(레벨3, 브라질 제외) 명문팀은 SS 명문팀에 밀리면 안 된다"는 요청에
+    # 맞춰, S등급 레벨3에만 그 구조적 격차를 상쇄하는 추가 보정을 더한다.
+    if grade == "S" and _plevel == 3 and team.get("cname", "") != "브라질":
+        _star_prestige_bonus += 2.0
+
     # 해당 국가 이름풀 전체를 가져온다 (리그 8팀 × 11명 = 최대 88개 필요)
     # [2026-08 최적화] 국가당 한 번만 SELECT, 이후 팀들은 캐시 재사용.
     _cid = team["cid"]
@@ -3306,7 +3453,7 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
         name = random.choice(available)
         league_used.add(name)
         if idx in star_kind_by_slot:
-            target = _star_target_ovr(tier_top, star_kind_by_slot[idx], _el_offset)
+            target = _star_target_ovr(tier_top, star_kind_by_slot[idx], _el_offset, _star_prestige_bonus)
             if _elite_floor is not None:
                 # [2026-07 버그 수정] 엘리트 오프셋의 랜덤 폭(uniform 상한) 때문에
                 # 국가보정이 낮은 S급 나라(예: 대륙보정 0인 브라질)에서 드물게

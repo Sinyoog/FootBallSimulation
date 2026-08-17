@@ -69,6 +69,30 @@ from constants import (
 
 _NAT_SQUAD_POSITIONS = ["GK", "CB", "CB", "LB", "RB", "CDM", "CM", "CAM", "LW", "RW", "ST"]
 
+def _tournament_start_years():
+    """[2026-08 버그수정, 신민용 리포트: "1986년으로 시작하면 월드컵/
+    네이션스컵/클럽월드컵/지역컵이 하나도 안 열린다"] 위에서 import한
+    WC_START_YEAR/CWC_START_YEAR/CONTINENTAL_START_YEAR는 intl_engine.py가
+    맨 처음 로드되는 시점의 constants.GAME_START_YEAR(하드코딩된 기본값
+    2000)로 딱 한 번 계산된 값이라, 새 선수 생성 화면에서 실제로 다른
+    시작 연도(예: 1986)를 골라도 전혀 반영이 안 됐다 - 대회 개최년도
+    판정이 계속 "2000년 기준"으로만 이뤄지는 버그였다. 이 함수는
+    database.get_game_start_year()(실제로 선택된 시작 연도, 없으면
+    기존 상수로 폴백)를 기준으로 매번 새로 계산해서 돌려준다."""
+    from database import get_game_start_year
+    from constants import (get_next_tournament_year,
+                            WC_ANCHOR_YEAR, CWC_ANCHOR_YEAR,
+                            CONTINENTAL_ANCHOR_YEAR, REGIONAL_CUP_ANCHOR_YEAR,
+                            REGIONAL_CUP_INTERVAL)
+    gsy = get_game_start_year()
+    return {
+        "wc": get_next_tournament_year(gsy, WC_ANCHOR_YEAR, WC_INTERVAL),
+        "cwc": get_next_tournament_year(gsy, CWC_ANCHOR_YEAR, CWC_INTERVAL),
+        "continental": get_next_tournament_year(gsy, CONTINENTAL_ANCHOR_YEAR, CONTINENTAL_INTERVAL),
+        "regional": get_next_tournament_year(gsy, REGIONAL_CUP_ANCHOR_YEAR, REGIONAL_CUP_INTERVAL),
+    }
+
+
 
 def _get_real_squad_ovr(country):
     """[2026-07 신설, 신민용 확정: "국적 배정했으니 스쿼드도 실제 선수로
@@ -984,16 +1008,19 @@ def start_qualifying_if_needed(year):
     if not p:
         return
 
-    is_wc = year >= WC_START_YEAR and (year - WC_START_YEAR) % WC_INTERVAL == 0
-    is_cont = (not is_wc and year >= CONTINENTAL_START_YEAR
-               and (year - CONTINENTAL_START_YEAR) % CONTINENTAL_INTERVAL == 0)
+    # [2026-08 버그수정] 정적 상수(WC_START_YEAR 등) 대신, 실제로 선택된
+    # 시작 연도 기준으로 매번 다시 계산한다 (_tournament_start_years 참고).
+    _ty = _tournament_start_years()
+    is_wc = year >= _ty["wc"] and (year - _ty["wc"]) % WC_INTERVAL == 0
+    is_cont = (not is_wc and year >= _ty["continental"]
+               and (year - _ty["continental"]) % CONTINENTAL_INTERVAL == 0)
     # [2026-08 신설, 신민용 확정: "유로(EURO)는 기존 대륙컵('유럽
     # 네이션스컵', 2004년 주기)과는 완전히 별개로 지역컵과 같은 해
     # (2001,05,09..)에 새로 연다"] 지역컵 주기와 동일한 년도 판정을
     # 그대로 재사용 — REGIONAL_CUP_START_YEAR/INTERVAL이 정확히 2001/4.
-    from constants import REGIONAL_CUP_START_YEAR, REGIONAL_CUP_INTERVAL
-    is_euro_cycle = (not is_wc and not is_cont and year >= REGIONAL_CUP_START_YEAR
-                     and (year - REGIONAL_CUP_START_YEAR) % REGIONAL_CUP_INTERVAL == 0)
+    from constants import REGIONAL_CUP_INTERVAL
+    is_euro_cycle = (not is_wc and not is_cont and year >= _ty["regional"]
+                     and (year - _ty["regional"]) % REGIONAL_CUP_INTERVAL == 0)
     if not is_wc and not is_cont and not is_euro_cycle:
         return
 
@@ -1063,15 +1090,14 @@ def start_intl_tournament(year):
     if not p:
         return
 
-    is_wc = year >= WC_START_YEAR and (year - WC_START_YEAR) % WC_INTERVAL == 0
-    is_cont = (not is_wc and year >= CONTINENTAL_START_YEAR
-               and (year - CONTINENTAL_START_YEAR) % CONTINENTAL_INTERVAL == 0)
-    # [2026-08 버그수정] 예전엔 WC_START_YEAR+1로 즉석 계산했는데, WC와
-    # 위상이 같이 밀리는 값이라 GAME_START_YEAR에 더 가까운 클럽월드컵
-    # 해를 놓칠 수 있었다(constants.py CWC_START_YEAR 참고 — 이제 독립
-    # 계산된 상수를 그대로 쓴다).
-    is_cwc = (not is_wc and not is_cont and year >= CWC_START_YEAR
-              and (year - CWC_START_YEAR) % CWC_INTERVAL == 0)
+    # [2026-08 버그수정] 정적 상수 대신 매번 실제 시작 연도 기준으로
+    # 재계산 (_tournament_start_years 참고).
+    _ty2 = _tournament_start_years()
+    is_wc = year >= _ty2["wc"] and (year - _ty2["wc"]) % WC_INTERVAL == 0
+    is_cont = (not is_wc and year >= _ty2["continental"]
+               and (year - _ty2["continental"]) % CONTINENTAL_INTERVAL == 0)
+    is_cwc = (not is_wc and not is_cont and year >= _ty2["cwc"]
+              and (year - _ty2["cwc"]) % CWC_INTERVAL == 0)
 
     if is_cwc:
         # 월드컵 다음 해 — 캘린더 겹침이 전혀 없어서(챔스는 이미 23주차에
@@ -1083,9 +1109,9 @@ def start_intl_tournament(year):
         # [2026-08 신설] 완전히 빈 해였던 자리(2001,05,09..)에 3단계
         # 지역컵을 채운다 — 월드컵/대륙컵/클럽월드컵 어느 것과도 주기가
         # 안 겹치는 유일한 해라 스케줄 충돌이 없다.
-        from constants import REGIONAL_CUP_START_YEAR, REGIONAL_CUP_INTERVAL, REGION_LIST
-        is_regional = (year >= REGIONAL_CUP_START_YEAR
-                       and (year - REGIONAL_CUP_START_YEAR) % REGIONAL_CUP_INTERVAL == 0)
+        from constants import REGIONAL_CUP_INTERVAL, REGION_LIST
+        is_regional = (year >= _ty2["regional"]
+                       and (year - _ty2["regional"]) % REGIONAL_CUP_INTERVAL == 0)
         if not is_regional:
             return  # 정말 빈 해
         if [t for t in get_tournaments(year) if t["kind"] == "region"]:

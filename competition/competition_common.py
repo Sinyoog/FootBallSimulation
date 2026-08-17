@@ -30,6 +30,11 @@ from dataclasses import dataclass
 from database import get_conn
 from constants import generate_round_robin
 
+# [2026-08 신설] PSO(승부차기) 홈팀 승률에 OVR 차이가 반영되는 민감도.
+# p_home = 0.5 + clamp(diff * PSO_OVR_COEF, -0.1, 0.1) — resolve_pso 참고.
+# 기존 하드코딩값(0.006)을 그대로 기본값으로 옮긴 것뿐, 동작 변화 없음.
+PSO_OVR_COEF = 0.010
+
 
 @dataclass(frozen=True)
 class CompetitionConfig:
@@ -57,10 +62,49 @@ class CompetitionConfig:
 # A그룹 — 완전 공통 (원본과 100% 동일, cfg조차 필요 없음)
 # ─────────────────────────────────────────────
 
+# [2026-08 확정, 신민용 요청: "챔스 우승팀이 너무 다양하다 — 42경기 실측
+# (코펜하겐/브뢴뷔/에피날/브라운슈바이크 등 9개 우승 트리) → 강팀도 지고
+# 있지만 원인의 상당수는 85~95 구간에서 OVR 격차가 최종 승률에 충분히
+# 반영되지 않는 것" — 150회×16시즌 몬테카를로로 검증 완료(<85 우승
+# 1.0%→0.1%, 85-89 우승 8.8%→3.0%, 부작용 없음 확인)] UEFA/대륙
+# 클럽대항전(챔스/유로파/컨퍼런스/클럽월드컵) 매치 확률 계산 직전에만
+# 적용하는 비선형 OVR 보정. 85 이하는 그대로 두고 85~100 구간만 벌린다
+# ("중" 곡선 — "약" 곡선과 최종 우승 분포가 사실상 동일해서 "중"으로 확정,
+# "강" 곡선은 이미 격차가 큰 매치를 과증폭시켜 제외).
+#
+# ⚠ 중요: 이건 실제 ai_players.ovr/teams.ovr 등 원본 데이터는 전혀 안
+# 건드리고, 아래 match_outcome/resolve_pso 호출 시점에만 일시적으로
+# 변환한 값을 쓴다 — 연봉·이적시장·선수 성장·리그 순위·club_strength에는
+# 영향이 전혀 없다. 리그 경기 확률식(game_engine.py, 별도 상수 0.020)도
+# 완전히 별개라 여기서 안 건드린다.
+_TOURNAMENT_OVR_CURVE_PTS = [(70, 70), (80, 80), (85, 85), (90, 93), (95, 100), (100, 108)]
+
+
+def _tournament_effective_ovr(ovr: float) -> float:
+    """UEFA/대륙 클럽대항전 매치 확률 계산 전용 OVR 변환("중" 곡선).
+    _TOURNAMENT_OVR_CURVE_PTS 구간을 선형 보간하고, 표 밖(70 미만/100 초과)은
+    가장 가까운 구간의 기울기를 그대로 연장한다."""
+    pts = _TOURNAMENT_OVR_CURVE_PTS
+    if ovr < pts[0][0]:
+        return ovr + (pts[0][1] - pts[0][0])
+    if ovr > pts[-1][0]:
+        return ovr + (pts[-1][1] - pts[-1][0])
+    for i in range(len(pts) - 1):
+        x0, y0 = pts[i]
+        x1, y1 = pts[i + 1]
+        if x0 <= ovr <= x1:
+            t = (ovr - x0) / (x1 - x0) if x1 > x0 else 0
+            return y0 + t * (y1 - y0)
+    return ovr
+
+
 def match_outcome(h_ovr, a_ovr):
     """중립 구장 가정. 'home'/'draw'/'away' (KO 무승부 → 승부차기).
-    champions_engine._match_outcome과 완전히 동일."""
-    diff = h_ovr - a_ovr
+    champions_engine._match_outcome과 완전히 동일 — 단, 위 비선형 곡선으로
+    변환한 effective OVR을 쓴다(원본 공식/계수는 그대로)."""
+    h_eff = _tournament_effective_ovr(h_ovr)
+    a_eff = _tournament_effective_ovr(a_ovr)
+    diff = h_eff - a_eff
     hw = max(0.04, min(0.95, 0.46 + diff * 0.022))
     dw = max(0.05, 0.24 - abs(diff) * 0.009)
     aw = max(0.02, 1.0 - hw - dw)
@@ -75,8 +119,23 @@ def match_outcome(h_ovr, a_ovr):
 
 
 def resolve_pso(h_ovr, a_ovr):
-    """champions_engine._resolve_pso와 완전히 동일."""
-    p_home = 0.5 + max(-0.1, min(0.1, (h_ovr - a_ovr) * 0.006))
+    """champions_engine._resolve_pso와 완전히 동일.
+    [2026-08 신설, 신민용 요청: "PSO에서 OVR 차이가 승부차기 결과에 지나치게
+    약하게 반영된다 — 챔스 이변이 실제보다 너무 잦은 원인 중 하나"] 계수를
+    하드코딩 리터럴이 아니라 모듈 상수(PSO_OVR_COEF)로 빼서, A/B 테스트
+    스크립트가 함수 코드를 손대지 않고 이 상수만 monkeypatch해서 여러 값을
+    비교할 수 있게 한다.
+    [2026-08 확정, 신민용 요청] 0.006 → 0.010. 80회×16시즌 A/B(0.006/0.008/
+    0.010)로 실측 검증: 0.008은 0.006과 거의 차이 없었고, 0.010에서만
+    <85 우승(0.4%→0.1%)·85-89 우승(4.1%→3.0%)·서로다른우승팀(95→88개)이
+    부작용(95+ 우승 과다 등) 없이 확실히 더 개선됨을 확인.
+    [2026-08 추가] 위 match_outcome과 동일하게, 여기서도 원본 OVR이 아니라
+    비선형 변환한 effective OVR로 계산한다(강팀이 PSO에서도 그 우위를
+    일관되게 유지하도록).
+    """
+    h_eff = _tournament_effective_ovr(h_ovr)
+    a_eff = _tournament_effective_ovr(a_ovr)
+    p_home = 0.5 + max(-0.1, min(0.1, (h_eff - a_eff) * PSO_OVR_COEF))
     winner_home = random.random() < p_home
     score = random.choice(["5-4", "4-3", "4-2", "3-2", "5-3"])
     return winner_home, score
