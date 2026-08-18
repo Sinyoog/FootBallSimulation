@@ -282,9 +282,16 @@ def build_tournament(cfg, year, continent, entries, my_tid, team_cap, games):
     return tid
 
 
-def sim_ai_match(cfg, t, m, my_played=False, conn=None, reason="injury", batch=None):
-    """champions_engine._sim_ai_match와 동일(테이블명·로그 접두사만 cfg)."""
+def sim_ai_match(cfg, t, m, my_played=False, conn=None, reason="injury", batch=None, p=None):
+    """champions_engine._sim_ai_match와 동일(테이블명·로그 접두사만 cfg).
+
+    [2026-08 최적화] p를 넘기면 get_player() 재조회를 생략한다 —
+    process_one이 미처리 경기 개수만큼 이 함수를 루프 안에서 부르므로,
+    호출부가 이미 조회해둔 p를 그대로 넘기면 그 루프 전체에서 DB 왕복이
+    한 번으로 줄어든다."""
     from game_engine import add_log, get_player, _gen_score, _week_intl_cl_day
+    if p is None:
+        p = get_player()
     he = entry(cfg, t["id"], m["home_team_id"])
     ae = entry(cfg, t["id"], m["away_team_id"])
 
@@ -296,7 +303,7 @@ def sim_ai_match(cfg, t, m, my_played=False, conn=None, reason="injury", batch=N
         pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
     hs, as_ = _gen_score(outcome, he["ovr"] - ae["ovr"])
 
-    day = _week_intl_cl_day(m["week"], get_player() or {}) if m["is_my"] else m.get("day")
+    day = _week_intl_cl_day(m["week"], p or {}) if m["is_my"] else m.get("day")
 
     _absence = reason if m["is_my"] else None
     _row = (hs, as_, pso_winner, pso_score, day, _absence, m["id"])
@@ -314,7 +321,6 @@ def sim_ai_match(cfg, t, m, my_played=False, conn=None, reason="injury", batch=N
             conn.close()
 
     if m["is_my"]:
-        p = get_player()
         my_tid = p.get("current_team_id", 0) if p else 0
         if my_tid in (m["home_team_id"], m["away_team_id"]):
             stage_ko = cfg.stage_ko.get(m["stage"], "")
@@ -696,7 +702,12 @@ def process_one(cfg, t, week, league_end_week, playoff_week, round_weeks, stage_
     자기 C그룹 상수로 계산해 넘긴다.
     finalize_league_phase_fn 등 4개: 각 엔진의 얇은 위임 함수(_finalize_
     league_phase 등)를 그대로 넘긴다 — cfg가 이미 그 함수들 내부에
-    바인딩돼 있으므로 여기서는 t/week만 알면 된다."""
+    바인딩돼 있으므로 여기서는 t/week만 알면 된다.
+
+    [2026-08 최적화] 이 함수 안에서 미처리 경기 개수만큼 sim_ai_match를
+    부르므로, get_player()를 여기서 한 번만 조회해 넘긴다."""
+    from game_engine import get_player
+    p = get_player()
     conn = get_conn()
     pending = [dict(r) for r in conn.execute(
         f"""SELECT * FROM {cfg.match_table}
@@ -705,7 +716,7 @@ def process_one(cfg, t, week, league_end_week, playoff_week, round_weeks, stage_
 
     _batch = []
     for m in pending:
-        sim_ai_match(cfg, t, m, batch=_batch)
+        sim_ai_match(cfg, t, m, batch=_batch, p=p)
     if _batch:
         conn.executemany(
             f"""UPDATE {cfg.match_table} SET home_score=?, away_score=?,

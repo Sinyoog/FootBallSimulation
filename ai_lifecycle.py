@@ -801,6 +801,10 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None):
            JOIN countries cn ON l.country_id = cn.id
            ORDER BY t.id""").fetchall()]
     team_avg = {t["tid"]: (t["avg_ovr"] or 50) for t in teams}
+    # [2026-08 신설, 이적 로그용] 팀마다 prestige_level을 한 번만 계산해
+    # 캐싱 — 이적마다 다시 계산하면 수천 건 반복이라 성능에 영향을 준다.
+    from data.prestige_clubs import prestige_level as _prestige_level_fn
+    team_prestige = {t["tid"]: (_prestige_level_fn(t["cname"], t["tname"]) or 0) for t in teams}
     # [2026-08 최적화] verbose_log용 _estimate_ai_transfer_fee_display가
     # 이적마다 teams 리스트를 선형탐색(최대 2회) + 팀명 SQL SELECT 2회를
     # 추가로 날리고 있었다 — 여기서 tid→row 딕셔너리를 한 번만 만들어
@@ -826,11 +830,13 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None):
     # 탐색을 타므로, "시도 수천 회 × teams 크기 수천"의 불필요한 반복이
     # 누적된 것으로 보인다 — 순수 O(1) 캐싱이라 결과는 완전히 동일하다.
     team_to_cid = {}
+    team_lid = {}
     for t in teams:
         by_league.setdefault(t["lid"], []).append(t["tid"])
         by_country_tier.setdefault((t["cid"], t["tier"]), []).append(t["tid"])
         team_tier[t["tid"]] = t["tier"]
         team_to_cid[t["tid"]] = t["cid"]
+        team_lid[t["tid"]] = t["lid"]
         if t["tier"] == 1:
             # [2026-08 grade resolution 단일화] 예전엔 COUNTRY_LEAGUE_GRADE에
             # 명시 등록 안 된 나라는 grade=None이라 "등급 없는 나라는 제외"
@@ -846,12 +852,13 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None):
 
     # [최적화] 팀별 선수 목록을 _retire_and_replace와 공유된 스냅샷에서 재사용
     all_players_rows = ai_rows if ai_rows is not None else c.execute(
-        "SELECT id, team_id, position, age, ovr, contract_end_year, last_transfer_year "
+        "SELECT id, team_id, position, age, name, ovr, contract_end_year, last_transfer_year "
         "FROM ai_players").fetchall()
     team_players: dict = {}
     for r in all_players_rows:
         team_players.setdefault(r["team_id"], []).append({
             "id": r["id"], "position": r["position"],
+            "name": r["name"] if "name" in r.keys() else "",
             "age": r["age"] if "age" in r.keys() and r["age"] else 25,
             "ovr": r["ovr"] if r["ovr"] is not None else 50,
             "contract_end_year": r["contract_end_year"] if "contract_end_year" in r.keys() else 0,
@@ -864,6 +871,13 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None):
     # (new_team_id, new_contract_end_year, last_transfer_year, player_id)
     transfer_updates = []
     _big_transfer = None   # (fee, name_or_ovr, src_lid_name..) — verbose_log용, 최고액 1건만 추적
+
+    # [2026-08 신설, "명문팀 lifecycle 조사" 요청] AI 이적 로그 배치 —
+    # season은 이 함수 호출당 한 번만 조회(이적 건마다 조회하면 수천 건
+    # 반복이라 성능에 영향).
+    _season_row = c.execute("SELECT current_season FROM season_state WHERE id=1").fetchone()
+    _cur_season = _season_row["current_season"] if _season_row else 0
+    transfer_log_rows = []
 
     for lid, tids in by_league.items():
         if len(tids) < 2:
@@ -916,6 +930,24 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None):
                     _idx = next((i for i, e in enumerate(_old_list) if e["id"] == pid), None)
                     p_entry = _old_list.pop(_idx) if _idx is not None else None
                     if p_entry:
+                        # [2026-08 신설, 이적 로그] p_entry는 아직 이적 전 값(포지션/
+                        # 나이/OVR)이라 이 시점에 기록해야 정확하다 — 아래에서
+                        # contract_end_year/last_transfer_year을 덮어쓰기 직전.
+                        _from_lid = team_lid.get(old_tid)
+                        _to_lid = team_lid.get(new_tid)
+                        if _from_lid == _to_lid:
+                            _actual_ttype = "리그내"
+                        elif team_to_cid.get(old_tid) == team_to_cid.get(new_tid):
+                            _actual_ttype = "국내 타부수"
+                        else:
+                            _actual_ttype = "국제 이동"
+                        transfer_log_rows.append((
+                            _cur_season, year, pid, p_entry.get("name", ""), p_entry.get("position", ""),
+                            p_entry.get("age", 0), p_entry.get("ovr", 0),
+                            old_tid, new_tid,
+                            team_prestige.get(old_tid, 0), team_prestige.get(new_tid, 0),
+                            round(team_avg.get(old_tid, 0), 2), round(team_avg.get(new_tid, 0), 2),
+                            _actual_ttype))
                         p_entry["contract_end_year"] = new_contract_end
                         p_entry["last_transfer_year"] = year
                         team_players.setdefault(new_tid, []).append(p_entry)
@@ -930,6 +962,14 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None):
         c.executemany(
             "UPDATE ai_players SET team_id=?, contract_end_year=?, last_transfer_year=? WHERE id=?",
             transfer_updates)
+    if transfer_log_rows:
+        c.executemany(
+            """INSERT INTO ai_transfer_log(
+                season, year, player_id, player_name, player_position, player_age, player_ovr,
+                from_team_id, to_team_id, from_team_prestige, to_team_prestige,
+                from_team_avg_ovr, to_team_avg_ovr, transfer_type)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            transfer_log_rows)
     _tm5 = _time_tm.perf_counter()
     print(f"[PERF-TM]  teams조회(서브쿼리포함) {_tm1-_tm0:.3f}s | "
           f"그룹핑 {_tm2-_tm1:.3f}s | team_players빌드 {_tm3-_tm2:.3f}s | "

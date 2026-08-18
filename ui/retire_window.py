@@ -355,9 +355,11 @@ class RetireWindow(QDialog):
         # ── 개인 수상 하이라이트 (있을 때만, 최상단 강조) ──
         if awards:
             from collections import Counter
-            cnt = Counter(a.get("award_type","") for a in awards)
+            from constants import normalize_award_bucket
+            cnt = Counter(normalize_award_bucket(a.get("award_type","")) for a in awards)
             order = ["발롱도르","MVP","득점왕","도움왕","베스트11","골든글러브","영플레이어",
-                     "올해의 수비수","구단 올해의 선수"]
+                     "올해의 수비수","구단 올해의 선수",
+                     "FIFA 푸스카스상","대회 최고의 골","리그 올해의 골"]
             parts = [f"{k} {cnt[k]}회" for k in order if cnt.get(k)]
             hl = QLabel("🏅 " + "   ·   ".join(parts))
             hl.setWordWrap(True)
@@ -957,9 +959,11 @@ class RetireWindow(QDialog):
         
         # 수상 종류별 횟수 요약
         from collections import Counter
-        cnt = Counter(a.get("award_type","") for a in awards)
-        order = ["발롱도르","MVP","득점왕","도움왕","베스트11","골든글러브","영플레이어","푸스카스상","올해의 골","사모라상",
-                 "올해의 수비수","구단 올해의 선수"]
+        from constants import normalize_award_bucket, award_icon
+        cnt = Counter(normalize_award_bucket(a.get("award_type","")) for a in awards)
+        order = ["발롱도르","MVP","득점왕","도움왕","베스트11","골든글러브","영플레이어","사모라상",
+                 "올해의 수비수","구단 올해의 선수",
+                 "FIFA 푸스카스상","대회 최고의 골","리그 올해의 골"]
         summary_parts = []
         for k in order:
             if cnt.get(k):
@@ -976,13 +980,12 @@ class RetireWindow(QDialog):
         cols = ["연도","수상","리그","상세"]
         tbl  = self._make_table(len(awards), cols)
         icon = {"득점왕":"⚽","도움왕":"🎯","베스트11":"⭐","MVP":"🏅",
-                "발롱도르":"🏆","영플레이어":"🌟","골든글러브":"🧤",
-                "푸스카스상":"💥","올해의 골":"💥","사모라상":"🛡️",
+                "발롱도르":"🏆","영플레이어":"🌟","골든글러브":"🧤","사모라상":"🛡️",
                 "올해의 수비수":"🛡️","구단 올해의 선수":"🎖️"}
         
         for i, a in enumerate(awards):
             atype = a.get("award_type","")
-            label = f"{icon.get(atype,'🏅')} {atype}"
+            label = f"{award_icon(atype, icon)} {atype}"
             # 발롱도르/MVP는 황금색, 주요 상은 녹색
             color = "#ffcc00" if atype in ("발롱도르","MVP") else (
                     "#00cc44" if atype in ("득점왕","도움왕","베스트11") else None)
@@ -1139,10 +1142,10 @@ class RetireWindow(QDialog):
         if not matches:
             lbl = QLabel("클럽 월드컵 기록 없음"); lbl.setStyleSheet("color:#555;")
             return lbl
-        cols = ["기간", "대회", "상대", "골", "어시", "선방", "실점", "평점", "스코어", "결과"]
+        cols = ["기간", "포지션", "대회", "상대", "골", "어시", "선방", "실점", "평점", "스코어", "결과"]
         tbl = self._make_table(len(matches), cols)
         for i, m in enumerate(matches):
-            vals = [m['date'], f"{m['comp']} {m['stage']}", m["opp"],
+            vals = [m['date'], m.get("position", ""), f"{m['comp']} {m['stage']}", m["opp"],
                     str(m["goals"]), str(m["assists"]), str(m["saves"]), str(m["conceded"]),
                     str(m["rating"]), m["score"], format_result_with_absence(m)]
             # [2026-07 재수정, 신민용 리포트: "red_card는 실제로 뛴 경기라
@@ -1154,8 +1157,8 @@ class RetireWindow(QDialog):
             elif not m.get("my_played", 1) and not m.get("absence_reason"):
                 _reason_label = "벤치"
             if _reason_label:
-                vals[3] = "—"; vals[4] = "—"; vals[5] = "—"; vals[6] = "—"
-                vals[7] = _reason_label
+                vals[4] = "—"; vals[5] = "—"; vals[6] = "—"; vals[7] = "—"
+                vals[8] = _reason_label
             for j, v in enumerate(vals):
                 self._set_item(tbl, i, j, v)
         tbl.resizeColumnsToContents()
@@ -1181,7 +1184,7 @@ class RetireWindow(QDialog):
             extra_cols = ["기회창출", "패스%", "차단"]
         else:
             extra_cols = ["슈팅", "유효", "기회창출", "드리블"]
-        cols = (["연도", "우리 팀", "상대", "골", "어시"]
+        cols = (["연도", "포지션", "우리 팀", "상대", "골", "어시"]
                 + extra_cols + ["평점", "스코어", "결과"])
         tbl = self._make_table(len(matches), cols)
         for i, m in enumerate(matches):
@@ -1193,17 +1196,17 @@ class RetireWindow(QDialog):
                 "기회창출": str(m.get("key_passes", 0)), "드리블": str(m.get("dribbles", 0)),
                 "슈팅": str(m.get("shots", 0)), "유효": str(m.get("shots_on", 0)),
             }
-            vals = ([str(m["year"]), m["team_name"], m["opp_name"],
+            vals = ([str(m["year"]), m.get("position", ""), m["team_name"], m["opp_name"],
                     str(m["goals"]), str(m["assists"])]
                     + [_emap.get(c, "—") for c in extra_cols]
                     + [str(m["rating"]), m.get("score", "") or "—", m["result"]])
             if m.get("absence_reason"):
                 _reason_label = _ABSENCE_LABEL.get(m["absence_reason"], m["absence_reason"])
                 vals = list(vals)
-                vals[3] = "—"; vals[4] = "—"
-                for _k in range(5, 5 + len(extra_cols)):
+                vals[4] = "—"; vals[5] = "—"
+                for _k in range(6, 6 + len(extra_cols)):
                     vals[_k] = "—"
-                vals[5 + len(extra_cols)] = _reason_label
+                vals[6 + len(extra_cols)] = _reason_label
             for j, v in enumerate(vals):
                 self._set_item(tbl, i, j, v)
         tbl.resizeColumnsToContents()
@@ -1621,9 +1624,11 @@ class RetireWindow(QDialog):
         lines.append(f"▶ 개인 영예  ({len(awards)}건)")
         if awards:
             from collections import Counter
-            cnt = Counter(a.get("award_type","") for a in awards)
+            from constants import normalize_award_bucket, award_icon
+            cnt = Counter(normalize_award_bucket(a.get("award_type","")) for a in awards)
             order = ["발롱도르","MVP","득점왕","도움왕","베스트11","골든글러브","영플레이어",
-                     "올해의 수비수","구단 올해의 선수"]
+                     "올해의 수비수","구단 올해의 선수",
+                     "FIFA 푸스카스상","대회 최고의 골","리그 올해의 골"]
             summ = [f"{k} {cnt[k]}회" for k in order if cnt.get(k)]
             if summ:
                 lines.append("  ★ " + "  ·  ".join(summ))
@@ -1632,7 +1637,7 @@ class RetireWindow(QDialog):
                     "올해의 수비수":"🛡️","구단 올해의 선수":"🎖️"}
             for a in awards:
                 at = a.get("award_type","")
-                lines.append(f"  {icon.get(at,'🏅')} {a.get('year','')}년  {at}  "
+                lines.append(f"  {award_icon(at, icon)} {a.get('year','')}년  {at}  "
                              f"({a.get('league_name','')}, {a.get('detail','')})")
         else:
             lines.append("  없음")

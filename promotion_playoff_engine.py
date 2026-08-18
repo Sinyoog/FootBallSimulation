@@ -109,7 +109,13 @@ def start_promotion_playoffs(year: int) -> None:
 
             home_tid = _resolve_side("home")
             away_tid = _resolve_side("away")
-            is_my = 1 if my_tid in (home_tid, away_tid) else 0
+            # [2026-08 버그수정, 신민용 리포트: "유로파/CWC/승강플옵/컨퍼런스
+            # 경기별 기록에 그 경기 당시 포지션이 안 남는다"] my_tid==0(선수가
+            # 아직 생성되기 전 시즌 등 p가 None인 경우)일 때 home_tid/away_tid
+            # 도 아직 안 풀린 "winner" 참조라 똑같이 0이면 "0 in (0, away_tid)"가
+            # 항상 참이 되어, 나랑 전혀 상관없는 매치가 대량으로 is_my=1로
+            # 잘못 찍히는 문제가 있었다 - my_tid가 실제 팀 id일 때만 비교한다.
+            is_my = 1 if my_tid and my_tid in (home_tid, away_tid) else 0
 
             conn.execute(
                 """INSERT INTO po_matches(tournament_id, match_key, day,
@@ -154,13 +160,24 @@ def _winner_of(m) -> int:
     return m["home_team_id"] if m["home_score"] > m["away_score"] else m["away_team_id"]
 
 
-def _finalize_boundary_match(conn, t, m, year: int) -> None:
+def _finalize_boundary_match(conn, t, m, year: int, p=None) -> None:
     """boundary(승강 결정) match 하나가 끝났을 때, 실제 승격/강등을 확정한다.
     승자는 upper_league_id로, 패자는 lower_league_id로 — 이게 승강 PO의
     정의 그 자체라 이 방향은 항상 고정이다(춘계 회의에서 정리된 대로,
     match 자체가 이미 upper 후보 vs lower 후보로만 구성돼 있으므로 별도
-    "어느 쪽이 위인지" 메타데이터가 필요 없다)."""
+    "어느 쪽이 위인지" 메타데이터가 필요 없다).
+
+    [2026-08 최적화] p를 넘기면 아래 "내 팀 여부" 체크에서 get_player()
+    재조회를 생략한다 — 호출부(process_po_week)가 이 함수를 boundary
+    경기 개수(최대 수백 회)만큼 루프 안에서 부르는데, current_team_id는
+    이 루프 도중 안 바뀌므로(팀은 그대로, 소속 리그만 바뀜) 미리 한 번
+    조회한 값을 계속 재사용해도 안전하다. 단, 아래 update_player() 직후
+    _update_career_stats에 넘기는 get_player()는 방금 바뀐 리그를 반영한
+    "최신" 상태가 반드시 필요하므로 그건 그대로 재조회한다(캐시 재사용
+    금지)."""
     from game_engine import get_player, update_player, add_log, _invalidate_team_ovr_cache
+    if p is None:
+        p = get_player()
 
     winner = _winner_of(m)
     loser = m["away_team_id"] if winner == m["home_team_id"] else m["home_team_id"]
@@ -246,7 +263,6 @@ def _finalize_boundary_match(conn, t, m, year: int) -> None:
     # 하나일 뿐이어도) 무조건 add_log를 불렀다 — 다른 대회(국제전/CWC 등)가
     # AI끼리의 경기는 로그를 안 남기는 것과 같은 원칙으로, 내 팀이 이
     # 매치에 직접 걸렸을 때만 로그를 남긴다.
-    p = get_player()
     if p and p.get("current_team_id") in (winner, loser):
         new_lid = upper_lid if p["current_team_id"] == winner else lower_lid
         won = (p["current_team_id"] == winner)
@@ -284,11 +300,14 @@ def process_po_week(week: int, day=None) -> None:
     토너먼트 수(400+)에서 상수(약 5개)로 줄어든다. 판정 로직·처리
     순서·최종 결과는 원본과 완전히 동일하다."""
     from database import get_conn
-    from game_engine import get_state
+    from game_engine import get_state, get_player
 
     st = get_state()
     year = st["current_year"] if st else 0
     conn = get_conn()
+    # [2026-08 최적화] boundary_rows 루프(최대 수백 회)에 넘길 p를 여기서
+    # 한 번만 조회 — _finalize_boundary_match 참고.
+    p = get_player()
 
     import time as _time_po
     _po_t0 = _time_po.perf_counter()
@@ -358,6 +377,17 @@ def process_po_week(week: int, day=None) -> None:
                 if cur[col] == 0:
                     changed[col] = _winner_of(ref)
             if changed:
+                # [2026-08 버그수정, 신민용 리포트: "유로파/CWC/승강플옵/컨퍼런스
+                # 경기별 기록에 그 경기 당시 포지션이 안 남는다"] is_my는 대회
+                # 생성 시점(위 start_promotion_playoffs)에 딱 한 번만 계산됐는데,
+                # 그 시점엔 "winner" 참조 쪽 팀이 아직 0(미정)이라 내 팀이 다음
+                # 라운드에 실제로 진출해도 절대 is_my=1이 될 수 없었다 - 여기서
+                # 방금 winner가 확정된 시점에 is_my도 함께 재계산한다.
+                _new_home = changed.get("home_team_id", cur["home_team_id"])
+                _new_away = changed.get("away_team_id", cur["away_team_id"])
+                _mtid = t["my_team_id"] if "my_team_id" in t.keys() else 0
+                if _mtid and _mtid in (_new_home, _new_away):
+                    changed["is_my"] = 1
                 sets = ",".join(f"{k}=?" for k in changed)
                 conn.execute(f"UPDATE po_matches SET {sets} WHERE id=?",
                              (*changed.values(), cur["id"]))
@@ -375,7 +405,7 @@ def process_po_week(week: int, day=None) -> None:
         t = t_by_id.get(m["tournament_id"])
         if not t:
             continue
-        _finalize_boundary_match(conn, t, dict(m), year)
+        _finalize_boundary_match(conn, t, dict(m), year, p=p)
         conn.execute("UPDATE po_matches SET finalized=1 WHERE id=?", (m["id"],))
 
     # 4) 토너먼트별 "boundary 전부 확정됐는지" — 그룹집계 쿼리 1번으로
@@ -650,12 +680,13 @@ def simulate_my_po_match(week, p, day=None):
     conn2.execute(
         """INSERT INTO po_history(year, team_name, opp_name, result, goals, assists, rating,
                                    shots, shots_on, key_passes, dribbles, blocks, pass_acc,
-                                   saves, conceded, score)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                   saves, conceded, score, position)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (st_year_of(week), my_team_name, opp_name, rs, goals, assists, rating,
          detail.get("shots", 0), detail.get("shots_on", 0), detail.get("key_passes", 0),
          detail.get("dribbles", 0), detail.get("blocks", 0), detail.get("pass_acc", 0.0),
-         saves, conceded, f"{my_score}-{conceded}"))
+         saves, conceded, f"{my_score}-{conceded}",
+         _get_field_pos_safe(p) if not _suspended else ""))
     conn2.commit()
     conn2.close()
 

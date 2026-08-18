@@ -255,22 +255,52 @@ def add_nat_history(ev_type, nat, flag="", year=None, week=None, p=None):
     update_player(nat_history=json.dumps(hist, ensure_ascii=False))
 
 
+# ── season_state 캐시 ──────────────────────────────────────────
+# [2026-08 신설, 신민용 리포트: "1년 넘기기가 갈수록 느려진다" — 50시즌
+# 세이브 실측] get_state()가 season_state(행 1개짜리 단일 상태 테이블)를
+# 매번 새로 SELECT했는데, 이 함수가 게임 전체에서 101곳(모든 대회 엔진 +
+# UI)에서 호출된다 — 실측 1년 진행에서만 3,642회, 순수 오버헤드 18.4초
+# (풀 커넥션 락+재시도 래퍼를 매번 타는 비용). season_state는 하루/주/
+# 시즌이 바뀌는 딱 몇 군데(_advance_week, advance_days의 날짜 갱신,
+# set_state, create_player)에서만 쓰이므로, 그 지점들에서만 캐시를 갱신/
+# 무효화하면 나머지 101곳은 항상 최신값을 캐시에서 그냥 읽어도 된다.
+# get_state()가 반환한 dict을 호출부가 직접 수정하는 경우가 있는지 전체
+# 검색으로 확인했고(없음) — 그래도 방어적으로 매번 얕은 복사본을 반환해
+# 혹시 모를 호출부의 in-place 수정이 캐시를 오염시키지 않게 한다.
+_state_cache: dict = None
+
+
+def _invalidate_state_cache():
+    """season_state가 직접 SQL로 갱신되는 지점(또는 그 값을 알 수 없는
+    경우)에서 호출해 캐시를 비운다 — 다음 get_state() 호출 시 새로 조회."""
+    global _state_cache
+    _state_cache = None
+
+
 def get_state():
+    global _state_cache
+    if _state_cache is not None:
+        return dict(_state_cache)
     conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT * FROM season_state WHERE id=1")
     row = c.fetchone()
     conn.close()
-    return dict(row) if row else {
-        "current_year": GAME_START_YEAR,
-        "current_week": 1,
-        "current_day": 1,
-        "current_season": 1,
-        "phase": "preseason",
-    }
+    if row:
+        _state_cache = dict(row)
+    else:
+        _state_cache = {
+            "current_year": GAME_START_YEAR,
+            "current_week": 1,
+            "current_day": 1,
+            "current_season": 1,
+            "phase": "preseason",
+        }
+    return dict(_state_cache)
 
 
 def set_state(**kw):
+    global _state_cache
     conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT id FROM season_state WHERE id=1")
@@ -284,6 +314,13 @@ def set_state(**kw):
                   list(kw.values()))
     conn.commit()
     conn.close()
+    # [최적화] 방금 쓴 값만 캐시에 그대로 반영 — 다음 get_state()가 다시
+    # DB를 조회하지 않아도 되게 한다(캐시가 아직 없던 상태면 그냥 비워서
+    # 다음 호출이 새로 채우게 한다).
+    if _state_cache is not None:
+        _state_cache.update(kw)
+    else:
+        _invalidate_state_cache()
 
 
 # [2026-07 성능 수정 — "이번 주 진행" 1초 버퍼링의 실제 원인]
@@ -825,6 +862,10 @@ def create_player(name: str, position: str, sub_role: str,
                  (_start_year,))
     conn.commit()
     conn.close()
+    # [2026-08 신설] get_state() 캐시가 이 함수 호출 전에 이미 채워져
+    # 있었을 수도 있으므로(예: 새 게임 시작 전 화면 로딩 등) 새 시즌 상태로
+    # 강제 무효화 — 다음 get_state()가 방금 쓴 값을 새로 읽어온다.
+    _invalidate_state_cache()
 
     # [실시간 전환] 이제까지는 시즌 1(=게임 시작 연도)의 전 세계 일정 생성이
     # 연도 전환 시점(_advance_week)에서만 호출돼서, 정작 첫 시즌(2000년 등)엔
@@ -1564,19 +1605,19 @@ def advance_days(schedule: list):
                 # day만으로 걸러지지 않아 여전히 _week_intl_cl_day가 정한
                 # '그 주의 딱 하루'에만 확인한다.
                 _intl_cl_day = _week_intl_cl_day(week, p)
-                if intl_engine.get_my_match(week, day=day):
+                if intl_engine.get_my_match(week, day=day, p=p):
                     intl_engine.sim_my_match_as_ai(week, p, reason="injury", day=day)
-                elif day == _intl_cl_day and champions_engine.get_my_cl_match(week, day=day):
+                elif day == _intl_cl_day and champions_engine.get_my_cl_match(week, day=day, p=p):
                     champions_engine.sim_my_cl_match_as_ai(week, p, reason="injury", day=day)
-                elif day == _intl_cl_day and europa_engine.get_my_el_match(week, day=day):
+                elif day == _intl_cl_day and europa_engine.get_my_el_match(week, day=day, p=p):
                     europa_engine.sim_my_el_match_as_ai(week, p, reason="injury", day=day)
-                elif day == _intl_cl_day and conference_engine.get_my_ecl_match(week, day=day):
+                elif day == _intl_cl_day and conference_engine.get_my_ecl_match(week, day=day, p=p):
                     conference_engine.sim_my_ecl_match_as_ai(week, p, reason="injury", day=day)
-                elif day == _intl_cl_day and cup_engine.get_my_cup_match(week, day=day):
+                elif day == _intl_cl_day and cup_engine.get_my_cup_match(week, day=day, p=p):
                     cup_engine.sim_my_cup_match_as_ai(week, p, reason="injury", day=day)
-                elif club_world_cup_engine.get_my_cwc_match(week, day=day):
+                elif club_world_cup_engine.get_my_cwc_match(week, day=day, p=p):
                     club_world_cup_engine.sim_my_cwc_match_as_ai(week, p, reason="injury", day=day)
-                elif promotion_playoff_engine.get_my_po_match(week, day=day):
+                elif promotion_playoff_engine.get_my_po_match(week, day=day, p=p):
                     promotion_playoff_engine.sim_my_po_match_as_ai(week, p, reason="injury", day=day)
                 else:
                     _sim_my_unscheduled_match(week, p, cur_season, day=day)
@@ -1609,13 +1650,13 @@ def advance_days(schedule: list):
             # intl/cwc만 day로 직접 확인하고, 아직 없는 챔스/유로파/컨퍼런스/
             # 컵은 예전처럼 _week_intl_cl_day가 정한 '그 주의 딱 하루'에만 확인한다.
             _intl_cl_day = _week_intl_cl_day(week, p)
-            im = intl_engine.get_my_match(week, day=day)
-            cm = champions_engine.get_my_cl_match(week, day=day) if day == _intl_cl_day else None
-            elm = europa_engine.get_my_el_match(week, day=day) if day == _intl_cl_day else None
-            eclm = conference_engine.get_my_ecl_match(week, day=day) if day == _intl_cl_day else None
-            cu = cup_engine.get_my_cup_match(week, day=day) if day == _intl_cl_day else None
-            cw = club_world_cup_engine.get_my_cwc_match(week, day=day)
-            po = promotion_playoff_engine.get_my_po_match(week, day=day)
+            im = intl_engine.get_my_match(week, day=day, p=p)
+            cm = champions_engine.get_my_cl_match(week, day=day, p=p) if day == _intl_cl_day else None
+            elm = europa_engine.get_my_el_match(week, day=day, p=p) if day == _intl_cl_day else None
+            eclm = conference_engine.get_my_ecl_match(week, day=day, p=p) if day == _intl_cl_day else None
+            cu = cup_engine.get_my_cup_match(week, day=day, p=p) if day == _intl_cl_day else None
+            cw = club_world_cup_engine.get_my_cwc_match(week, day=day, p=p)
+            po = promotion_playoff_engine.get_my_po_match(week, day=day, p=p)
             if im:
                 _had_match = True
                 intl_engine.simulate_my_match(week, p, day=day)
@@ -1809,6 +1850,11 @@ def advance_days(schedule: list):
         conn_d = get_conn()
         conn_d.execute("UPDATE my_player SET current_day=? WHERE id=1", (next_day,))
         conn_d.execute("UPDATE season_state SET current_day=? WHERE id=1", (next_day,))
+        # [2026-08 신설] get_state() 캐시에도 같은 값을 바로 반영 — 매일
+        # 도는 경로라 무효화(다음 호출 시 재조회) 대신 직접 patch해서
+        # DB 왕복 자체를 아예 안 만든다.
+        if _state_cache is not None:
+            _state_cache["current_day"] = next_day
         # [버그 수정] database.flush_to_disk()가 근본 원인은 정리했지만(백업
         # 직후 자체적으로 commit 시도), 혹시 다른 경로로도 같은 상태가 생길
         # 수 있으니 여기서도 한 번 더 방어한다 — "no transaction is active"는
@@ -2858,6 +2904,28 @@ def _simulate_match(p, week, info: dict, day=None):
         # 다음 경기 출전정지를 건다.
         if _roll_red_card(p):
             goals, assists, saves, rating, events, detail = _apply_red_card_dismissal(p)
+
+        # [2026-08 신설, 골 시상 시스템 v4] 실제로 골을 넣었으면 즉시
+        # goal_events에 기록(is_mine=1, is_pseudo=0) — "올해의 골" 판정의
+        # 근거 데이터. 리그 경기 훅만 우선 반영(컵/국제대회는 각 엔진에
+        # 별도 훅이 필요해 다음 단계로 미룸 — 설계문서 5절 열린 질문 참고).
+        if played and goals > 0:
+            _lg_id = info.get("league_id", 0)
+            if _lg_id:
+                _lg_row = c.execute(
+                    """SELECT cn.name AS cname, cn.grade AS cgrade, l.name AS lname
+                       FROM leagues l JOIN countries cn ON l.country_id=cn.id
+                       WHERE l.id=?""", (_lg_id,)).fetchone()
+                if _lg_row:
+                    from constants import get_league_grade
+                    _my_grade_now = get_league_grade(_lg_row["cname"], _lg_row["cgrade"])
+                    _opp_id_now = away_id if is_home else home_id
+                    _opp_ovr_now = away_ovr if is_home else home_ovr
+                    for _ in range(goals):
+                        _record_goal_event(
+                            c, p, st["current_year"], week, my_tid, _opp_id_now,
+                            "league", _lg_id, _lg_id, _lg_row["lname"],
+                            _my_grade_now, _opp_ovr_now)
 
     my_result = _my_result(outcome, is_home)
 
@@ -5798,6 +5866,13 @@ def _advance_week(p, base_week, n_weeks=4):
             (new_year, new_week, new_season))
     conn_adv.commit()
     conn_adv.close()
+    # [2026-08 신설] get_state() 캐시에도 같은 값을 바로 반영(무효화 대신
+    # patch) — 주/시즌 경계마다 도는 경로라 다음 get_state() 호출들이
+    # 다시 DB를 조회하지 않아도 되게 한다.
+    if _state_cache is not None:
+        _state_cache["current_year"] = new_year
+        _state_cache["current_week"] = new_week
+        _state_cache["current_season"] = new_season
 
     # 1주차: 새 시즌 시작 시 완전히 만료된(냉각기 끝난) 오퍼 거절 기록 삭제
     # [2026-08 수정, 신민용 확정] 예전엔 "year < 현재연도"(1년만 지나면
@@ -6920,6 +6995,240 @@ def _primary_club_this_season(p):
     return best_tid, best_matches
 
 
+# ═══════════════════════════════════════════════════════════════
+# [2026-08 신설, 골 시상 시스템 v4] 실제 골 이벤트 기록 + 시즌말 시상.
+# 설계문서 + 검토 피드백 반영:
+#   - goal_events: is_mine/is_pseudo로 "실제 골" vs "역산 대표골" 구분.
+#     pseudo 골은 어떤 선수 통계 조회에도 절대 섞이면 안 됨(WHERE is_pseudo=0
+#     강제) — 컬럼 자체는 그대로 두고 "조회 쪽에서 강제"하는 원칙 유지.
+#   - context_score는 항상 0.80~1.10로 clamp(gen_goal 내부에서도 이중 방어) —
+#     "대회 중요도가 골 퀄리티(shot_score)를 압도"하는 걸 구조적으로 차단.
+#   - AI 대표골은 득점왕 1명이 아니라 상위 득점자 후보군(최대 5명)에서
+#     생성해 최고 점수를 채택 — 득점왕이 항상 가장 화려한 골을 넣는 건
+#     아니라는 지적 반영.
+#   - AI 대표골 생성은 (year, player_id, competition_id, scope) 기반
+#     결정론적 시드로 재현 가능하게 만든다(재시뮬레이션해도 같은 대표골).
+#   - "후보 생성"과 "실제 시상"을 함수로 분리(_generate_goal_candidates /
+#     _process_goal_awards)해서 나중에 "올해의 골 후보 TOP10" 같은 기능을
+#     추가하기 쉽게 한다.
+# ═══════════════════════════════════════════════════════════════
+
+SHOT_TYPE_KR = {
+    "NORMAL": "일반 슈팅", "HEADER": "헤더", "TOE_POKE": "토킥", "CHIP": "칩슛",
+    "DIRECT_FREEKICK": "직접 프리킥", "CURLED": "감아차기", "DIRECT_CORNER": "직접 코너킥",
+    "BACKHEEL": "백힐", "DIVING_HEADER": "다이빙 헤더", "HALF_VOLLEY": "하프발리",
+    "VOLLEY": "발리", "PANENKA": "파넨카", "RABONA": "라보나",
+    "OVERHEAD": "오버헤드킥", "SCORPION": "스콜피온킥",
+}
+FEATURE_KR = {
+    "LONG_RANGE": "장거리", "EXTREME_LONG_RANGE": "초장거리", "HALF_LINE": "하프라인",
+    "EXTREME_ANGLE": "극단적 각도", "SOLO_RUN": "솔로 돌파",
+    "MULTIPLE_DEFENDERS": "다수 수수비 제침", "GK_GOAL": "GK 골",
+    "LAST_MINUTE": "극장골", "WINNING_GOAL": "결승골", "COMEBACK_GOAL": "역전골",
+}
+
+
+def _goal_detail_text(c, goal_row) -> str:
+    """goal_events 레코드 → 화면 표시용 상세 텍스트.
+    예: "43주차 | 오버헤드킥, 초장거리 | 첼시 vs 아스날"
+    [2026-08 보강, 신민용 요청: "상세에 언제 있었던 경기에서 어떤 골이었는지
+    표시돼야 한다"] 기존엔 슛종류/피처/상대팀만 있고 '언제'가 없었다 —
+    awards.year(연도)는 career_window/retire_window에서 이미 별도 "연도"
+    컬럼으로 보여주고 있으니, 여기선 그 연도 안에서 몇 주차였는지만 덧붙인다.
+    week=0(AI 대표골처럼 특정 실제 경기가 없는 값)이면 주차를 생략 — 다만
+    실제로 상을 받는 골(my_best)은 항상 is_pseudo=0 실제 경기 골이라
+    week이 항상 채워져 있다(AI 대표골은 비교용으로만 쓰이고 상 자체엔
+    연결되지 않음)."""
+    shot = SHOT_TYPE_KR.get(goal_row["shot_type"], goal_row["shot_type"])
+    try:
+        feats = json.loads(goal_row["goal_features"] or "[]")
+    except Exception:
+        feats = []
+    feat_str = ", ".join(FEATURE_KR.get(f, f) for f in feats)
+    parts = [shot] + ([feat_str] if feat_str else [])
+    my_team = _team_name(c, goal_row["team_id"]) if goal_row["team_id"] else "?"
+    opp_team = _team_name(c, goal_row["opponent_team_id"]) if goal_row["opponent_team_id"] else "?"
+    base = f"{', '.join(parts)} | {my_team} vs {opp_team}"
+    week = goal_row["week"] if "week" in goal_row.keys() else 0
+    return f"{week}주차 | {base}" if week else base
+
+
+def _calc_context_score(grade_weight: float, opp_ovr: float, my_ovr: float,
+                         competition_importance_mult: float = 1.0) -> float:
+    """CONTEXT_SCORE 계산 — 항상 0.80~1.10 범위로 clamp(gen_goal도 이중 방어).
+    리그 등급 + 상대 강도 + 대회 중요도를 합산하되, 골 자체의 기술적 난이도
+    (shot_score)를 절대 압도하지 못하도록 폭을 좁게 잡는다(검토 피드백 2번)."""
+    base = 0.85 + grade_weight * 0.15  # grade_weight 0.05→0.8575, 1.00→1.00
+    opp_bonus = max(0.0, min(0.05, (opp_ovr - my_ovr) * 0.002))
+    comp_bonus = competition_importance_mult - 1.0
+    return max(0.80, min(1.10, base + opp_bonus + comp_bonus))
+
+
+def _make_goal_seed(year, player_id, competition_id, scope: str) -> "random.Random":
+    """[검토 피드백 8번, RNG 결정론] AI 대표골은 같은 세이브+같은 시즌을
+    다시 계산해도 항상 같은 골이 나와야 한다 — year/player_id/competition_id/
+    scope로 결정론적 seed를 만든다."""
+    key = f"{year}:{player_id}:{competition_id}:{scope}"
+    seed = hash(key) & 0xFFFFFFFF
+    return random.Random(seed)
+
+
+def _record_goal_event(c, p, year, week, team_id, opponent_team_id,
+                        competition_type, competition_id, league_id, league_name,
+                        grade, opp_ovr):
+    """[실제 골] 내 선수가 실제 경기에서 골을 넣은 그 순간 즉시 호출 —
+    is_mine=1, is_pseudo=0으로 저장한다. c는 열린 커서(같은 트랜잭션)."""
+    import goal_gen
+    my_ovr = p.get("ovr", 60)
+    grade_weight = goal_gen.LEAGUE_GRADE_WEIGHT.get(grade, 0.30)
+    # 실시간 개별 골이라 시즌 골비율(goal_ratio) 대신 내 현재 OVR을 대리 지표로
+    # 쓴다(설계상 goal_ratio는 "시즌 대표골" 산정에 더 맞는 개념 — AI 대표골
+    # 쪽에서 실제 goal_ratio를 그대로 씀).
+    opportunity = goal_gen.opportunity_for_grade(grade_weight, max(0.2, my_ovr / 100.0))
+    context_score = _calc_context_score(grade_weight, opp_ovr, my_ovr)
+    g = goal_gen.gen_goal(opportunity, context_score)  # 실시간 골 — 시드 고정 불필요
+    c.execute("""INSERT INTO goal_events(
+        year, week, player_id, team_id, opponent_team_id,
+        competition_type, competition_id, league_id, league_name,
+        shot_type, goal_features, shot_score, context_score, final_score,
+        is_wonder_goal, is_mine, is_pseudo)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,0)""",
+        (year, week, None, team_id, opponent_team_id,
+         competition_type, competition_id, league_id, league_name,
+         g["shot_type"], json.dumps(g["features"]), g["shot_score"],
+         g["context_score"], g["final_score"],
+         1 if g["final_score"] >= 55 else 0))
+    return c.lastrowid
+
+
+def _generate_ai_representative_goal(c, year, league_id, league_name, grade,
+                                      candidates, competition_type="league",
+                                      competition_id=None, scope="league"):
+    """[AI 대표골, 검토 피드백 7번] 득점왕 1명이 아니라 상위 득점자 후보군
+    (최대 5명, goals 내림차순)에서 각각 대표골을 만들고 그중 final_score
+    최고를 채택한다. is_mine=0, is_pseudo=1로 저장 — 절대 선수 통계에
+    섞이면 안 됨(호출부에서 WHERE is_pseudo=0 강제).
+    candidates: [{"team_id","player_name"(또는 id 대용),"goals","matches","ovr","opponent_ovr"}] 형태.
+    반환: 채택된 goal_events row id (없으면 None)."""
+    import goal_gen
+    if not candidates:
+        return None
+    top = sorted(candidates, key=lambda x: x.get("goals", 0), reverse=True)[:5]
+    grade_weight = goal_gen.LEAGUE_GRADE_WEIGHT.get(grade, 0.30)
+    best = None
+    comp_id = competition_id if competition_id is not None else league_id
+    for cand in top:
+        goals = max(1, cand.get("goals", 1))
+        matches = max(1, cand.get("matches", 1))
+        goal_ratio = goals / matches
+        opportunity = goal_gen.opportunity_for_grade(grade_weight, goal_ratio)
+        context_score = _calc_context_score(
+            grade_weight, cand.get("opponent_ovr", cand.get("ovr", 60)),
+            cand.get("ovr", 60))
+        # AI 식별자가 없을 수 있어(팀 id 정도만 있는 후보군) player_id 자리에
+        # team_id를 대신 넣어 seed에 쓴다 — "완전한 재현"이 목적이 아니라
+        # "같은 시즌 재계산 시 같은 결과"가 목적이므로 이 정도로 충분.
+        seed_pid = cand.get("player_id", cand.get("team_id", 0))
+        rng = _make_goal_seed(year, seed_pid, comp_id, scope)
+        g = goal_gen.gen_goal(opportunity, context_score, rng=rng)
+        row = {
+            "team_id": cand.get("team_id"), "shot_type": g["shot_type"],
+            "goal_features": json.dumps(g["features"]), "shot_score": g["shot_score"],
+            "context_score": g["context_score"], "final_score": g["final_score"],
+        }
+        if best is None or row["final_score"] > best["final_score"]:
+            best = row
+    if best is None:
+        return None
+    cur = c.execute("""INSERT INTO goal_events(
+        year, week, player_id, team_id, opponent_team_id,
+        competition_type, competition_id, league_id, league_name,
+        shot_type, goal_features, shot_score, context_score, final_score,
+        is_wonder_goal, is_mine, is_pseudo)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,1)""",
+        (year, 0, None, best["team_id"], None,
+         competition_type, comp_id, league_id, league_name,
+         best["shot_type"], best["goal_features"], best["shot_score"],
+         best["context_score"], best["final_score"],
+         1 if best["final_score"] >= 55 else 0))
+    return cur.lastrowid
+
+
+def _process_goal_awards(c, p, year, tid, league_id, lname, grade, tier, cands, my_awards):
+    """[시상 단계] "리그 올해의 골" + "FIFA 푸스카스상"(2009년 이후, 그 전엔
+    "올해의 최고의 골")을 판정해 my_awards에 3-tuple(atype, detail,
+    goal_event_id)로 추가한다. 대회(컵/대륙클럽대회/국가대표전 등)별
+    "대회 최고의 골"은 각 대회 엔진에 아직 이 시스템과 연결된 후보군
+    수집 로직이 없어 이번 단계에서는 제외(추후 단계에서 확장 예정).
+
+    cands: _collect_league_candidates()가 반환하는 AI 후보 풀(이미
+    _process_awards에서 만들어져 있는 것을 그대로 재사용 — 중복 쿼리 방지).
+    tier==1(자국 최상위 리그)이 아니어도 리그별 상은 받을 수 있다(문서
+    설계상 "리그 등급이 후보 자격을 제한하지 않는다"는 원칙 그대로).
+    """
+    if not tid or not league_id:
+        return
+
+    # 1) 내 실제 시즌 골 중 이 리그 골 중 최고 1개(방어: NULL 필터 — 검토
+    #    피드백 3번). player_id는 실시간 기록 시 굳이 안 채워서(내 선수는
+    #    항상 team_id=tid로 유일하게 특정 가능) team_id로 필터한다.
+    my_best = c.execute("""SELECT * FROM goal_events
+                            WHERE year=? AND league_id=? AND team_id=? AND is_mine=1
+                              AND is_pseudo=0 AND final_score IS NOT NULL
+                            ORDER BY final_score DESC LIMIT 1""",
+                         (year, league_id, tid)).fetchone()
+    if not my_best:
+        return
+
+    # 2) AI 대표골 생성(상위 득점자 후보군 최대 5명) — 이미 있는 cands 재사용
+    ai_cand_list = [
+        {"team_id": x.get("team_id"), "player_id": x.get("team_id"),
+         "goals": x.get("goals", 0), "matches": x.get("matches", 1),
+         "ovr": x.get("ovr", 60), "opponent_ovr": x.get("ovr", 60)}
+        for x in cands if not x.get("is_mine") and x.get("goals", 0) > 0
+    ]
+    ai_goal_id = _generate_ai_representative_goal(
+        c, year, league_id, lname, grade, ai_cand_list,
+        competition_type="league", competition_id=league_id, scope="league")
+    ai_best_score = 0.0
+    if ai_goal_id:
+        ai_row = c.execute("SELECT final_score FROM goal_events WHERE id=?",
+                            (ai_goal_id,)).fetchone()
+        ai_best_score = ai_row["final_score"] if ai_row else 0.0
+
+    # 3) 리그 올해의 골 — 내 골이 AI 대표골보다 높으면(또는 AI 후보가 없으면) 수상
+    if my_best["final_score"] >= ai_best_score:
+        my_awards.append((f"{lname} 올해의 골", _goal_detail_text(c, my_best), my_best["id"]))
+
+    # 4) FIFA 푸스카스상 — 세계급 라이벌 비교(기존 발롱도르/구 푸스카스 패턴 재사용).
+    #    SS/S 등급 1부리그 최고 OVR 공격수를 라이벌 프록시로 삼아 그 라이벌의
+    #    대표골을 하나 만들고, final_score로 직접 비교한다.
+    _PUSKAS_GRADES = ("SS", "S")
+    if grade in _PUSKAS_GRADES and tier == 1:
+        rival = c.execute("""SELECT a.id, a.ovr, a.team_id FROM ai_players a
+            JOIN teams t ON a.team_id=t.id
+            JOIN leagues l ON t.league_id=l.id
+            JOIN countries cn ON l.country_id=cn.id
+            WHERE cn.grade IN ('SS','S') AND l.tier=1 AND a.position IN ({})
+            ORDER BY a.ovr DESC LIMIT 1
+            """.format(",".join("'%s'" % pp for pp in ATTACK_POS))).fetchone()
+        if rival:
+            rival_goal_id = _generate_ai_representative_goal(
+                c, year, league_id, lname, grade,
+                [{"team_id": rival["team_id"], "player_id": rival["id"],
+                  "goals": max(12, round(rival["ovr"] / 4)), "matches": 30,
+                  "ovr": rival["ovr"], "opponent_ovr": rival["ovr"]}],
+                competition_type="world_rival", competition_id=0, scope="puskas_rival")
+            rival_score = 0.0
+            if rival_goal_id:
+                rr = c.execute("SELECT final_score FROM goal_events WHERE id=?",
+                                (rival_goal_id,)).fetchone()
+                rival_score = rr["final_score"] if rr else 0.0
+            if my_best["final_score"] >= rival_score:
+                label = "FIFA 푸스카스상" if year >= 2009 else "올해의 최고의 골"
+                my_awards.append((label, _goal_detail_text(c, my_best), my_best["id"]))
+
+
 def _process_awards(p, year, season_goals, season_assists, season_rating, season_cs, season_goals_against=0):
     """시즌 종료 시 개인 수상 산정. 내 선수 실제 성적 + AI 추정 비교.
 
@@ -7525,63 +7834,16 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
                     my_awards.append(("FIFPro 월드11", f"{year} FIFPro 월드11"))
                     break
 
-        # 푸스카스상 (올해의 골 — 최고 평점이면서 멀티골 이상)
-        # [버그 수정 — 근본 원인] 실제 푸스카스상은 전세계에서 딱 1명
-        # 뽑히는 상인데, 후보 비교가 내 리그 pool(multi_goal_cands)에만
-        # 갇혀 있었다 — 발롱도르와 달리 "다른 리그와 비교"하는 게이트가
-        # 아예 없어서, 국가·티어 개수만큼 각자 따로 수여될 수 있는
-        # 구조였다(신민용 지적). 발롱도르와 같은 패턴(S/A등급 1부리그
-        # 최고 공격 OVR 조회)으로 세계급 게이트를 추가한다. 다만
-        # "그 해 최고의 선수"까지 요구하는 발롱도르(-2)보다는 마진을
-        # 느슨하게 잡는다 — 한 경기의 멀티골+고평점이면 되는 상이라
-        # 시즌 전체 지배력까지는 필요 없기 때문.
-        # [2026-07 신민용 요청] 푸스카스상은 S등급 이상(SS/S) 리그 1부에서만
-        # 받을 수 있게 제한한다 — 발롱도르도 이번에 A등급 버그를 고쳐서
-        # 지금은 둘 다 BALLON_DOR_GRADES/(SS,S) 동일 기준(A등급 대상 제외).
-        # [2026-07 재조정, 신민용 지적: "푸스카스상이 너무 막 주는 것
-        # 같다"] 예전 기준(시즌 누적 골 2개 이상)은 사실상 거의 모든
-        # 공격수가 통과하는 문턱이었다 — 실제 푸스카스상은 "올해의 원더골"
-        # 1명뿐인 상인데, 이 게임엔 개별 골 하나하나의 임팩트를 추적하는
-        # 데이터가 없어서 시즌 성적으로 대신 추정한다면 적어도 "그 시즌
-        # 진짜 잘한 공격수"급은 돼야 한다 — 득점왕에 준하는 골 수 요구.
-        _PUSKAS_OVR_MARGIN = 3
-        _PUSKAS_GRADES = ("SS", "S")
-        _puskas_min_goals = max(12, round(min_goals_for_title * 0.7))
-        multi_goal_cands = [x for x in pool if x["goals"] >= _puskas_min_goals]
-        if multi_goal_cands and grade in _PUSKAS_GRADES and tier == 1:
-            puskas_best = max(multi_goal_cands, key=lambda x: x["rating"])
-            if puskas_best["is_mine"]:
-                # [버그수정 2026-07] 발롱도르 라이벌 쿼리와 동일한 SS(EPL)
-                # 누락 버그가 여기도 그대로 복사돼 있었다 — 같이 고친다.
-                _pk_rival = c.execute("""SELECT MAX(a.ovr) as mo FROM ai_players a
-                    JOIN teams t ON a.team_id=t.id
-                    JOIN leagues l ON t.league_id=l.id
-                    JOIN countries cn ON l.country_id=cn.id
-                    WHERE cn.grade IN ('SS','S') AND l.tier=1 AND a.position IN ({})
-                    """.format(",".join("'%s'" % pp for pp in ATTACK_POS))).fetchone()
-                _pk_rival_ovr = _pk_rival["mo"] if _pk_rival and _pk_rival["mo"] else 90
-                # [2026-07 재조정, 신민용 리포트: "받을 확률이 너무 높은거
-                # 같기도 해"] 여기까지의 조건(골 수·평점·OVR)은 전부
-                # 결정적(deterministic)이라, 매 시즌 최고의 공격수라면
-                # 사실상 자동으로 받는 구조였다. 그런데 실제 푸스카스상은
-                # "그 해 전세계 수천 골 중 단 하나의 최고 골"을 뽑는 상이라,
-                # 이 게임처럼 개별 골의 임팩트를 추적 못 하고 시즌 성적으로
-                # 대신 추정하는 한 — 자격을 갖췄다고 매번 받는 게 아니라,
-                # 모델링되지 않은 다른 나라 선수의 원더골에 밀릴 가능성도
-                # 반영해야 한다. 자격 조건 통과 후에도 20%만 실제 수상하는
-                # 확률 게이트를 추가한다(별도 확률 — OVR/골 조건과 무관).
-                _PUSKAS_WIN_CHANCE = 0.20
-                if (p.get("ovr", 0) >= _pk_rival_ovr - _PUSKAS_OVR_MARGIN
-                        and random.random() < _PUSKAS_WIN_CHANCE):
-                    # [2026-07 버그수정, 신민용 리포트: "2001년에 푸스카스상을
-                    # 받는 건 현실성을 해친다"] 실제 푸스카스상은 2009년
-                    # 제정이라 그 이전 시즌엔 이 이름의 상이 존재할 수 없다.
-                    # 판정 조건(문턱)은 그대로 두고, 2009년 이전엔 같은 성격의
-                    # 가상 상("올해의 골")으로 이름만 바꿔서 시대 오류를 막는다.
-                    if year >= 2009:
-                        my_awards.append(("푸스카스상", f"{season_goals}골, 평점 {season_rating:.1f}"))
-                    else:
-                        my_awards.append(("올해의 골", f"{season_goals}골, 평점 {season_rating:.1f}"))
+        # 골 시상 시스템 v4 — 리그 올해의 골 + FIFA 푸스카스상.
+        # [2026-08 재설계, 신민용+검토 확정] 예전엔 "시즌 골수+평점"으로
+        # 추정해서 수상 상세에 "{골수}골, 평점 {평점}"이 그대로 찍혔다 —
+        # 실제로 어떤 골(슛종류/피처/상대팀)인지는 아예 추적하지 않았다.
+        # 이제 goal_events(실제 골 goal_events + AI 대표골 역산)를 근거로
+        # 판정하고, 화면엔 "슛종류, 피처 | 팀 vs 팀" 형식으로 표시한다.
+        # 대회별(컵/대륙클럽대회/국대전 등) "대회 최고의 골"은 각 대회
+        # 엔진에 아직 후보군 수집 로직이 없어 이번 단계에서는 제외 —
+        # 리그 올해의 골 + 푸스카스상만 우선 반영(추후 단계에서 확장).
+        _process_goal_awards(c, p, year, tid, league_id, lname, grade, tier, cands, my_awards)
 
         # 사모라 상 (최저 실점 골키퍼 — 경기당 평균 실점 최소)
         #   조건: GK && 1부리그 && (같은 리그 합산) 출전 >= 최소 출전(리그
@@ -7619,9 +7881,20 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
         #   awards 테이블엔 tier 컬럼이 없으므로 league_name 문자열에 합쳐 저장한다.
         #   → 수상 창·은퇴 후 창·AI 요약 등 awards.league_name 을 읽는 모든 곳이 자동 반영.
         lname_with_tier = f"{lname} ({tier}부)" if tier else lname
-        for atype, detail in my_awards:
-            c.execute("INSERT INTO awards(year,award_type,league_name,detail,is_mine) VALUES(?,?,?,?,1)",
-                      (year, atype, lname_with_tier, detail))
+        # [2026-08 신설, 골 시상 시스템] my_awards는 대부분 (atype, detail)
+        # 2-tuple이지만, _process_goal_awards가 추가하는 골 관련 상은
+        # goal_events와 연결하기 위해 (atype, detail, goal_event_id) 3-tuple로
+        # 온다 — 여기서 통일해서 처리(다른 append 호출부는 안 건드림).
+        _normalized_awards = []
+        for entry in my_awards:
+            if len(entry) == 3:
+                _normalized_awards.append(entry)
+            else:
+                _normalized_awards.append((entry[0], entry[1], None))
+        for atype, detail, goal_event_id in _normalized_awards:
+            c.execute("""INSERT INTO awards(year,award_type,league_name,detail,is_mine,goal_event_id)
+                         VALUES(?,?,?,?,1,?)""",
+                      (year, atype, lname_with_tier, detail, goal_event_id))
             if atype in ("발롱도르","MVP"):
                 c.execute("INSERT INTO trophy_log(year,team_name,league_name,tier,competition) VALUES(?,?,?,?,?)",
                           (year, p.get("name","나"), lname, tier, f"{atype} ({detail})"))
@@ -7629,12 +7902,13 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
         conn.close()
 
         # 로그는 conn 닫은 뒤 (add_log가 별도 conn을 열므로 락 방지)
-        for atype, detail in my_awards:
+        for atype, detail, _gid in _normalized_awards:
             icon = {"득점왕":"⚽","도움왕":"🎯","베스트11":"⭐","MVP":"🏅",
                     "발롱도르":"🏆","영플레이어":"🌟","골든글러브":"🧤",
-                    "푸스카스상":"💥","올해의 골":"💥",
+                    "푸스카스상":"💥","올해의 최고의 골":"💥",
                     "사모라상":"🛡️",
-                    "올해의 수비수":"🛡️","구단 올해의 선수":"🎖️"}.get(atype,"🏅")
+                    "올해의 수비수":"🛡️","구단 올해의 선수":"🎖️"}.get(
+                        atype, "💥" if atype.endswith("올해의 골") else "🏅")
             add_log(f"{icon} {atype} 수상! ({detail})  {year}년", "event", year, 52)
         return
     except Exception as e:
@@ -11351,8 +11625,20 @@ def _enrich_offer(o: dict, row) -> dict:
         # [2026-07 순서 변경] my_grade(내 현재 리그 등급)를 base_fee 계산
         # '전에' 먼저 구한다 — seller_origin_dampen_mult가 매수팀 등급과
         # 내 등급의 격차를 알아야 하기 때문(아래 base_fee 계산에 바로 씀).
+        #
+        # [2026-08 버그수정, 신민용 지적: "6부리그 선수한테 244.8억 최소
+        # 요구액이 나오는 게 말이 안 된다"] 예전엔 tier==1(자국 최상위
+        # 리그)일 때만 실제 국가 등급을 구하고, tier!=1(2부든 6부든 전부)이면
+        # 무조건 "C"로 뭉뚱그렸다 — 그 결과 seller_origin_dampen_mult가
+        # 매수팀과의 격차를 계산할 때 "2부 소속"과 "6부 소속"이 완전히
+        # 똑같이 취급됐다(둘 다 그냥 "C"). 실제 국가 등급은 항상 먼저
+        # 구하고, 그 등급을 부수 깊이만큼 단계적으로 낮추는
+        # _gate_grade_for_tier(직접지원 로직에서 쓰는 것과 동일한 함수)를
+        # 적용한다 — 같은 나라라도 2부보다 6부가 더 낮은 등급으로 취급돼
+        # seller_origin_dampen_mult 할인이 부수에 비례해 커진다.
         from constants import get_league_grade
-        _my_grade = "C"
+        _my_country_grade = "C"
+        _my_tier = 1
         _my_tid = p.get("current_team_id", 0)
         if _my_tid:
             conn_mg = get_conn()
@@ -11362,8 +11648,10 @@ def _enrich_offer(o: dict, row) -> dict:
                    JOIN countries cn ON l.country_id=cn.id WHERE t.id=?""",
                 (_my_tid,)).fetchone()
             conn_mg.close()
-            if _row_mg and _row_mg["tier"] == 1:
-                _my_grade = get_league_grade(_row_mg["cname"], _row_mg["grade"])
+            if _row_mg:
+                _my_country_grade = get_league_grade(_row_mg["cname"], _row_mg["grade"])
+                _my_tier = _row_mg["tier"] or 1
+        _my_grade = _gate_grade_for_tier(_my_country_grade, _my_tier)
 
         _base_fee = estimate_transfer_fee(
             o.get("grade"), o["tier"], my_ovr, country=o["country"],
@@ -11876,6 +12164,25 @@ def evaluate_offer_decision(p, offer, competing_offer_count=1):
     if offer_fee >= min_accept:
         return "accept", {"min_accept_mult": min_accept_mult, "base_fee": base_fee}
 
+    # [2026-08 신설, 신민용 지적: "5.2% 부족이라고 무조건 거절하는 건 너무
+    # 경직됐다 — min_accept을 절대적인 거절선이 아니라 협상 기준점으로 보고,
+    # 살짝 부족한 제안은 '협상 가능' 영역으로 다뤄야 한다"] 기존엔 min_accept
+    # 밑으로는 단 1원만 모자라도 100% 거절이었다 — 절벽형 컷오프. 이제
+    # min_accept의 NEGOTIATION_MARGIN(15%) 이내로 부족한 제안은 그 부족률에
+    # 반비례하는 확률로 수락한다: 문턱 바로 아래(부족률→0)면 최대
+    # NEGOTIATION_MAX_CHANCE(65%)까지, 마진 끝(부족률=15%)이면 0%로 선형
+    # 감소. forced_sale 문턱은 그대로 절대선으로 남는다(그건 "거절 못 할
+    # 파격 제안" 개념이라 협상 여지 없이 무조건 통과가 맞음) — 여기 바뀌는
+    # 건 그 밑의 정상 협상 구간뿐이다.
+    NEGOTIATION_MARGIN = 0.15
+    NEGOTIATION_MAX_CHANCE = 0.65
+    shortfall_pct = (min_accept - offer_fee) / min_accept if min_accept > 0 else 1.0
+    if 0 <= shortfall_pct <= NEGOTIATION_MARGIN:
+        accept_chance = NEGOTIATION_MAX_CHANCE * (1 - shortfall_pct / NEGOTIATION_MARGIN)
+        if random.random() < accept_chance:
+            return "accept", {"min_accept_mult": min_accept_mult, "base_fee": base_fee,
+                               "negotiated": True, "shortfall_pct": shortfall_pct}
+
     return "reject", {"min_accept_mult": min_accept_mult, "base_fee": base_fee}
 
 
@@ -12157,6 +12464,11 @@ def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None
                 f"거절할 수 없어 이적을 승인했습니다.", "event")
             _reset_offer_rejection()
         else:
+            if detail.get("negotiated"):
+                add_log(
+                    f"🤝 구단이 다소 부족한 제안이었지만 협상 끝에 이적을 승인했습니다. "
+                    f"({fmt_money(offer.get('transfer_fee',0))}, 최소 요구 대비 "
+                    f"{detail['shortfall_pct']*100:.1f}% 부족)", "event")
             _reset_offer_rejection()
 
     conn = get_conn()

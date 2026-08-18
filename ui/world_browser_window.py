@@ -1654,6 +1654,7 @@ class WorldBrowserWindow(QDialog):
         종류를 나타내는 나머지 색(승격=파랑/강등=빨강/챔스=파랑/유로파=
         주황/컨퍼런스=초록/클럽월드컵=하늘색)은 그대로 유지된다."""
         import html as _html
+        import re as _re
         w = QWidget()
         lay = QVBoxLayout(w)
         lay.setContentsMargins(6, 4, 6, 4)
@@ -1661,22 +1662,23 @@ class WorldBrowserWindow(QDialog):
         main_lbl = QLabel()
         main_lbl.setWordWrap(True)
         _weight = "bold" if bold else "normal"
-        _GOLD_TOKENS = ("[우승]", "[1등]")
-        if main_text and any(tok in main_text for tok in _GOLD_TOKENS):
-            _parts, _rest_text = [], main_text
-            while _rest_text:
-                _hit_idx, _hit_tok = None, None
-                for tok in _GOLD_TOKENS:
-                    idx = _rest_text.find(tok)
-                    if idx != -1 and (_hit_idx is None or idx < _hit_idx):
-                        _hit_idx, _hit_tok = idx, tok
-                if _hit_idx is None:
-                    _parts.append((_rest_text, main_color))
-                    break
-                if _hit_idx > 0:
-                    _parts.append((_rest_text[:_hit_idx], main_color))
-                _parts.append((_hit_tok, "#ffd700"))
-                _rest_text = _rest_text[_hit_idx + len(_hit_tok):]
+        # [2026-08 수정, 신민용 요청: "[1등] 뒤에 [1등/12팀]처럼 팀 수도
+        # 붙게 해달라"] 예전엔 "[1등]" 고정 문자열을 그대로 찾아 금색으로
+        # 감쌌는데, 팀 수가 붙으면서 길이가 리그마다(팀 수마다) 달라져
+        # 고정 토큰으로는 더 이상 못 찾는다 — "[1등"으로 시작해서 그
+        # 칸의 "]"까지를 통째로(팀 수 붙어있든 없든) 금색으로 감싸도록
+        # 정규식으로 바꾼다. "[우승]"은 팀 수 개념이 없어 그대로 고정.
+        _GOLD_PATTERN = _re.compile(r"\[우승\]|\[1등(?:/\d+팀)?\]")
+        _gold_matches = list(_GOLD_PATTERN.finditer(main_text)) if main_text else []
+        if _gold_matches:
+            _parts, _pos = [], 0
+            for _m in _gold_matches:
+                if _m.start() > _pos:
+                    _parts.append((main_text[_pos:_m.start()], main_color))
+                _parts.append((_m.group(), "#ffd700"))
+                _pos = _m.end()
+            if _pos < len(main_text):
+                _parts.append((main_text[_pos:], main_color))
             _rich = "".join(
                 f'<span style="color:{c};">{_html.escape(t)}</span>' for t, c in _parts)
             main_lbl.setStyleSheet(f"font-weight:{_weight};font-size:12px;")

@@ -689,6 +689,51 @@ def decline_national_team(tournament_id):
     return True
 
 
+def decline_national_team_option(tournament_id, nat):
+    """[2026-08 신설, 신민용 요청: "국적이 2개면 동시에 창이 뜨고, 하나만
+    거절하면 그 나라만 닫히고 나머지는 그대로 떠있어야 한다"]
+    decline_national_team()은 그 해 선택 대기(my_selected==3) 대회를 전부
+    한꺼번에 거절한다 — "잉글랜드는 거절하되 코트디부아르는 계속 고민한다"가
+    안 됐다. 이 함수는 딱 그 (tournament_id, nat) 하나만 후보에서 뺀다.
+
+    그 대회에 남은 후보 국적이 있으면(복수 대륙컵이 같은 대회에 묶인
+    경우는 없지만, cand_nats 하나에 여러 나라가 들어있는 경우 — 예:
+    월드컵 본선처럼 서로 다른 대륙 예선을 통과한 복수국적자) my_selected는
+    3(선택 대기)으로 그대로 두고 cand_nats에서 그 나라만 제거한다.
+    후보가 그 나라 하나뿐이었으면 그 대회 자체를 my_selected=2로 닫는다
+    (한 번 거절해도 다음 대회에서 다시 제안되는 기존 정책과 동일).
+
+    choose_national_team()이 이미 '하나를 수락하면 같은 해 다른 대기
+    대회를 전부 자동으로 닫는' 로직을 갖고 있으므로("네를 선택하면
+    나머지는 사라지게"는 별도 구현 불필요 — 기존 인프라 그대로 재사용),
+    이 함수는 "거절" 쪽 대칭만 채워 넣으면 된다."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT year, name, cand_nats FROM intl_tournaments WHERE id=?",
+        (tournament_id,)).fetchone()
+    if not row:
+        conn.close()
+        return False
+    cand = [n for n in (row["cand_nats"] or "").split(",") if n and n != nat]
+    if cand:
+        # 남은 후보가 있으면 그 나라들만으로 계속 선택 대기 상태 유지
+        conn.execute("UPDATE intl_tournaments SET cand_nats=? WHERE id=?",
+                     (",".join(cand), tournament_id))
+    else:
+        # 이 대회의 후보가 그 나라 하나뿐이었음 → 대회 자체를 닫는다
+        conn.execute("UPDATE intl_tournaments SET my_nat='', my_selected=2, "
+                     "cand_nats=? WHERE id=?", ("", tournament_id))
+    conn.commit()
+    year = row["year"]
+    conn.close()
+
+    # 거절 기록은 그 나라 하나만 남긴다(decline_national_team의 '전부 통합'
+    # 기록과 구분 — 나중에 커리어에서 "잉글랜드 발탁 거절"처럼 개별로 보임).
+    if year is not None:
+        _save_decline(year, nat, row["name"] or "대표팀")
+    return True
+
+
 def _save_decline(year, nat_str, competition):
     """[거절 기록] 발탁 거절을 trophy_log(tier=0)에 남긴다.
     같은 (year, competition)에 거절 기록이 이미 있으면 중복 방지.
@@ -1571,12 +1616,23 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
             except Exception:
                 pass
             # 예선에서 선발 확정(my_selected=1)된 대회가 하나라도 있고
-            # 그 나라가 본선에도 진출했으면 발탁창 제시
+            # 그 나라가 본선에도 진출했으면 발탁창 제시 — 단, 후보가 하나뿐이면
+            # (아직 국적이 안 고정된 선수라도 예선 단계에서 이미 그 나라 하나로만
+            # 뛰어서 실질적으로 고를 게 없다) [2026-08 버그수정, 신민용 리포트:
+            # "2002년 월드컵 예선에서 이미 그 나라로 뛰겠다고 선택해서 뛰었는데,
+            # 같은 2002년 월드컵 본선 시작 직전에 똑같은 걸 또 물어본다"] 실제로
+            # 선택할 게 없는데도(후보 1개) 매번 다시 팝업이 떠서 불필요한 반복
+            # 이었다 — 후보가 2개 이상(진짜 복수국적 갈등)일 때만 재확인 발탁창을
+            # 띄우고, 후보가 1개면 예선 선택을 그대로 이어받아 자동으로 확정한다.
             _qual_passed_nats = [
                 r["my_nat"] for r in _qual_results
                 if r["my_selected"] == 1 and r["my_nat"] in entry_names
             ]
-            if _qual_passed_nats:
+            if len(_qual_passed_nats) == 1:
+                my_sel = 1
+                my_nat = _qual_passed_nats[0]
+                cand_nats = []
+            elif _qual_passed_nats:
                 my_sel = 3
                 cand_nats = _qual_passed_nats
             else:
@@ -2291,6 +2347,20 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
     else:
         cand_nats = [n for n in my_nats
                      if n and nat_info.get(n, {}).get("continent") in cont_set]
+
+    # [2026-08 버그수정, 신민용 리포트: "월드컵은 MIN_INTL_CALLUP_AGE(17세)에
+    # 영향을 안 받는 것 같다"] 대륙컵(예선 없는 대회, 위쪽 cand_nats 분기 —
+    # "16세에 대륙컵 발탁창이 뜨는데 이건 좀 비현실적이지 않나" 코멘트 참고)엔
+    # 최소 나이 필터가 있는데, 월드컵/유로 "예선"을 만드는 이 함수에는 같은
+    # 필터가 빠져 있었다. cand_nats가 대륙 소속 여부만으로 정해지다 보니,
+    # 16세도 예선 발탁창(my_sel=3)이 그대로 떴다 — "수락"을 눌러도 이후
+    # _check_selection(나이 체크 포함)에서 결국 미선발 처리되긴 하지만,
+    # 애초에 나이 미달자에게 발탁창 자체가 뜨면 안 된다는 원칙(대륙컵과 동일)이
+    # 여기만 깨져 있었다. 대륙컵과 동일하게 여기서도 후보 자체를 비워
+    # my_sel이 아예 3(발탁창)이 아니라 2(대상 없음)로 떨어지게 한다.
+    from constants import MIN_INTL_CALLUP_AGE
+    if p.get("age", 0) < MIN_INTL_CALLUP_AGE:
+        cand_nats = []
 
     # OVR 조건 통과 여부 (choose_national_team에서 미선발 처리에 사용)
     sel_cand = [n for n in cand_nats

@@ -794,6 +794,40 @@ TALENT_TIER_EN = {
     "amateur": "Amateur", "ordinary": "Ordinary", "untalented": "Untalented",
 }
 # 새 게임 화면 콤보박스에 보여줄 순서(강한 순).
+# [2026-08 신설, 골 시상 시스템] "OO 올해의 골"(리그마다 이름이 다름, 수백 종류)
+# / "OO 최고의 골"(대회마다 이름이 다름) / "FIFA 푸스카스상"은 award_type 자체가
+# award_type=display_name이라(기존 발롱도르/MVP 등과 같은 저장 방식 유지 —
+# 새 컬럼 없이 그대로 호환), 정확한 문자열 목록으로 하드코딩된 기존 요약/집계
+# 로직(story_generator.py, ui/career_window.py, ui/retire_window.py 3곳 전부)이
+# 이 상들을 인식 못 하는 문제가 있었다. award_type을 "리그 올해의 골"/
+# "대회 최고의 골"/"FIFA 푸스카스상" 3개 버킷으로 정규화하는 공용 헬퍼로 통일한다
+# (한 군데만 고치면 3곳 다 정확해짐 — 리그/대회 이름이 몇 개든 상관없음).
+def normalize_award_bucket(award_type: str) -> str:
+    """개인상 요약 집계(Counter)용 — 리그/대회별로 이름이 다른 골 관련 상을
+    공통 버킷 이름으로 묶는다. 그 외 상(발롱도르/MVP 등)은 원래 이름 그대로."""
+    if award_type == "FIFA 푸스카스상":
+        return award_type
+    if award_type.endswith("올해의 골"):
+        return "리그 올해의 골"
+    if award_type.endswith("최고의 골"):
+        return "대회 최고의 골"
+    return award_type
+
+
+_GOAL_AWARD_ICON = {"FIFA 푸스카스상": "💥", "리그 올해의 골": "⚽", "대회 최고의 골": "🌍"}
+
+
+def award_icon(award_type: str, fallback_map: dict = None) -> str:
+    """개인상 아이콘 조회 — 골 관련 상은 버킷 아이콘, 그 외는 fallback_map(호출부
+    기존 icon 딕셔너리) 우선, 없으면 기본 🏅."""
+    bucket = normalize_award_bucket(award_type)
+    if bucket in _GOAL_AWARD_ICON:
+        return _GOAL_AWARD_ICON[bucket]
+    if fallback_map:
+        return fallback_map.get(award_type, "🏅")
+    return "🏅"
+
+
 TALENT_TIER_ORDER = ["god", "worldclass", "superstar", "elite", "pro",
                      "semipro", "amateur", "ordinary", "untalented"]
 

@@ -465,7 +465,7 @@ def _start_domestic_cup_for_country(year, cid, my_cid, add_log):
     if cid == my_cid:
         add_log(f"🏆 {year}년 {cup_name} 개막 (참가 리그 {tiers[0]}부까지)", "event")
     t = get_cup_tournament(year, cid)
-    _start_next_round(t)
+    _start_next_round(t, p=p)
 
 
 def _pop_next_tier(t):
@@ -598,14 +598,20 @@ def _cup_bye_count(n, cap=64):
     return bye
 
 
-def _start_next_round(t):
+def _start_next_round(t, p=None):
     """생존 풀(alive=1) + 다음 합류 티어를 합쳐 한 라운드를 만든다.
-    합칠 티어가 더 없으면 생존 풀만으로 진행(순수 토너먼트 단계)."""
+    합칠 티어가 더 없으면 생존 풀만으로 진행(순수 토너먼트 단계).
+
+    [2026-08 최적화] p를 넘기면 get_player() 재조회를 생략한다(process_cup_week
+    참고) — 실측 3시즌 헤드리스에서 이 함수 하나가 5,244회 호출됐는데, 넘겨받은
+    p가 없을 때만 자체 조회하므로 기존 호출부(있다면)와도 그대로 호환된다."""
     from game_engine import add_log, get_player
+    if p is None:
+        p = get_player()
     tid = t["id"]
     # [2026-07 전체 국가 확장] 이제 이 함수가 모든 나라 컵대회에서 매주 여러 번
     # 호출되므로, 이벤트 로그는 내 나라(또는 대표국적) 대회일 때만 남긴다.
-    _is_mine = (t["country_id"] == _my_country_id(get_player() or {}))
+    _is_mine = (t["country_id"] == _my_country_id(p or {}))
     conn = get_conn()
     survivors = [dict(r) for r in conn.execute(
         "SELECT team_id, team_name FROM cup_entries WHERE tournament_id=? AND alive=1",
@@ -803,7 +809,7 @@ def _start_next_round(t):
         conn.commit(); conn.close()
         _t2 = get_cup_tournament(t.get("year"), t["country_id"])
         if _t2:
-            _start_next_round(_t2)
+            _start_next_round(_t2, p=p)
         return
     c.executemany("""INSERT INTO cup_matches
                      (tournament_id, round_name, round_idx, week,
@@ -1101,15 +1107,26 @@ def simulate_my_cup_match(week, p, day=None):
 
 def process_cup_week(week):
     """이번 주차에 진행 중인 모든 컵대회를 확인해 라운드 종료/다음 라운드 생성."""
+    # [2026-08 최적화, 신민용 리포트: "1년씩 돌리는데 전보다 느려졌다"]
+    # 예전엔 활성 국내컵 나라 수(최대 200개 이상)만큼 _process_one →
+    # _advance_round → _start_next_round 체인 안에서 get_player()를
+    # 매번 새로 DB 조회했다(실측: 3시즌 헤드리스에서만 get_player() 2만 회,
+    # 순수 오버헤드 2.4초). 컵대회가 리그처럼 나라 전체로 확장되면서
+    # (전에는 몇 개국뿐이었을 이 경로가) 호출 횟수가 그만큼 곱연산으로
+    # 늘어난 게 체감 저하의 큰 부분으로 보인다. get_player()는 이 한 주
+    # 처리 안에서는 값이 바뀌지 않으므로 여기서 딱 한 번만 조회해 아래로
+    # 전달한다 — 결과(각 대회 진행 로직)는 완전히 동일, DB 왕복 횟수만 준다.
+    from game_engine import get_player
+    p = get_player()
     conn = get_conn()
     ts = [dict(r) for r in conn.execute(
         "SELECT * FROM cup_tournaments WHERE status='active'").fetchall()]
     conn.close()
     for t in ts:
-        _process_one(t, week)
+        _process_one(t, week, p=p)
 
 
-def _process_one(t, week):
+def _process_one(t, week, p=None):
     # [2026-07 3/4위전 추가] 결승과 3/4위전이 같은 주차에 동시에 열리므로,
     # 예전처럼 그 주차의 '아무 경기 1건'으로 라운드를 판별하면(LIMIT 1)
     # 둘 중 하나를 놓친다. 이 주차에 존재하는 라운드명을 전부 모아 각각
@@ -1144,14 +1161,20 @@ def _process_one(t, week):
     conn2.close()
 
     for rname in round_names:
-        _advance_round(t, rname, week)
+        _advance_round(t, rname, week, p=p)
 
 
-def _advance_round(t, round_name, week):
+def _advance_round(t, round_name, week, p=None):
     """한 라운드(round_name, week 조합 — 결승/3·4위전처럼 같은 주차에 여러
     라운드명이 동시에 있을 수 있다)가 이번 주차에 전부 끝났는지 확인하고,
-    끝났으면 탈락 처리 + 다음 단계로 진행시킨다."""
+    끝났으면 탈락 처리 + 다음 단계로 진행시킨다.
+
+    [2026-08 최적화] p를 넘기면 get_player() 재조회를 생략한다(process_cup_week
+    참고) — 넘기지 않는 다른 호출부(있다면)를 위해 기존처럼 자체 조회하는
+    경로도 그대로 남겨둔다."""
     from game_engine import add_log, get_player
+    if p is None:
+        p = get_player()
     tid = t["id"]
     conn = get_conn()
     cur = [dict(r) for r in conn.execute(
@@ -1161,7 +1184,6 @@ def _advance_round(t, round_name, week):
     if not cur or any(m["home_score"] == -1 for m in cur):
         return  # 이 라운드는 아직 없거나 미완료
 
-    p = get_player()
     my_tid = p.get("current_team_id", 0) if p else 0
 
     is_final = (round_name == "결승")
@@ -1218,7 +1240,7 @@ def _advance_round(t, round_name, week):
         # 4강 승자로 결승 대진을 먼저 만든다 (기존 흐름 그대로).
         t2 = get_cup_tournament(t["year"], t["country_id"])
         if t2 and t2["status"] == "active":
-            _start_next_round(t2)
+            _start_next_round(t2, p=p)
 
         # 4강 패자 2팀으로 3/4위전 생성 (결승과 같은 주차).
         if len(sf_losers) == 2:
@@ -1243,7 +1265,7 @@ def _advance_round(t, round_name, week):
                 # [2026-07 전체 국가 확장] 이제 컵대회가 모든 나라에서 열리므로,
                 # 이 로그는 '내 나라(또는 내 대표국적)' 대회일 때만 남긴다 —
                 # 안 그러면 관심 없는 나라 소식까지 매주 이벤트 로그에 다 쌓인다.
-                if t["country_id"] == _my_country_id(get_player() or {}):
+                if t["country_id"] == _my_country_id(p or {}):
                     add_log(f"🥉 {t['name']} 3/4위전: {he['team_name']} vs {ae['team_name']}", "event")
         return
 
@@ -1279,7 +1301,7 @@ def _advance_round(t, round_name, week):
     # 일반 라운드: 다음 라운드로 진행.
     t2 = get_cup_tournament(t["year"], t["country_id"])
     if t2 and t2["status"] == "active":
-        _start_next_round(t2)
+        _start_next_round(t2, p=p)
 
 
 def _teams_remaining_at(tournament_id):

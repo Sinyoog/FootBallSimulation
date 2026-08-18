@@ -2135,7 +2135,7 @@ def get_team_history(team_id: int):
             if move:
                 kind = "승격" if move["to_tier"] < lg["tier"] else "강등"
                 move_txt = f"  [{move['dest_name']}({move['to_tier']}부)로 {kind}]"
-            entry["league"] = f"{lg['name']}({lg['tier']}부) [{rank}등]{move_txt}"
+            entry["league"] = f"{lg['name']}({lg['tier']}부) [{rank}등/{len(standings)}팀]{move_txt}"
             # [2026-08 신설] 1부 우승만 "리그 우승"으로 친다 — 하위 부수
             # 1등은 보통 승격이라 이미 승격색(파란색)이 우선 표시되고,
             # 신민용 확정: "1부에서 1등만 금색".
@@ -2270,8 +2270,16 @@ def get_team_history(team_id: int):
     # (cl_champions/el_champions/ecl_champions)를 우선 쓴다.
     awards = {"league": 0, "cup": 0, "cl": 0, "cwc": 0,
               "cl_champions": 0, "el_champions": 0, "ecl_champions": 0}
+    # [2026-08 신설, 신민용 요청: "[1등] 뒤에 팀 수도 붙게 해달라"] 위에서
+    # entry["league"]가 "[1등]" → "[1등/N팀]"으로 바뀌면서, 고정 문자열
+    # 매칭으로는 더 이상 못 찾는다 — 정규식으로 "[1등"으로 시작하는 걸
+    # 잡는다(팀 수 붙어있든 없든 상관없이 매칭). league_champion 필드는
+    # "1부 우승"만(신민용 확정) 별도로 좁혀놓은 값이라 이 집계(모든 부수의
+    # 1등 횟수)와는 의미가 달라 그대로 못 쓴다.
+    import re as _re
+    _rank1_re = _re.compile(r"\[1등(?:/\d+팀)?\]")
     for e in out:
-        if e["league"] and "[1등]" in e["league"]:
+        if e["league"] and _rank1_re.search(e["league"]):
             awards["league"] += 1
         if e["cup"] and "[우승]" in e["cup"]:
             awards["cup"] += 1

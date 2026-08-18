@@ -769,9 +769,11 @@ class CareerWindow(QDialog):
 
         # 수상 종류별 횟수 요약
         from collections import Counter
-        cnt = Counter(a.get("award_type","") for a in awards)
+        from constants import normalize_award_bucket, award_icon
+        cnt = Counter(normalize_award_bucket(a.get("award_type","")) for a in awards)
         order = ["발롱도르","MVP","득점왕","도움왕","베스트11","골든글러브","영플레이어",
-                 "올해의 수비수","구단 올해의 선수"]
+                 "올해의 수비수","구단 올해의 선수",
+                 "FIFA 푸스카스상","대회 최고의 골","리그 올해의 골"]
         summary_parts = []
         for k in order:
             if cnt.get(k):
@@ -788,7 +790,7 @@ class CareerWindow(QDialog):
                 "올해의 수비수":"🛡️","구단 올해의 선수":"🎖️"}
         for i, a in enumerate(awards):
             atype = a.get("award_type","")
-            label = f"{icon.get(atype,'🏅')} {atype}"
+            label = f"{award_icon(atype, icon)} {atype}"
             # 발롱도르/MVP/득점왕은 강조색
             color = "#ffcc00" if atype in ("발롱도르","MVP") else (
                     "#00cc44" if atype in ("득점왕","도움왕") else None)
@@ -993,21 +995,21 @@ class CareerWindow(QDialog):
             lay.addWidget(QLabel("클럽 월드컵 출전 기록 없음"))
             return w
 
-        cols = ["기간", "대회", "상대", "골", "어시", "선방", "실점", "평점", "스코어", "결과"]
+        cols = ["기간", "포지션", "대회", "상대", "골", "어시", "선방", "실점", "평점", "스코어", "결과"]
         tbl = self._make_table(len(matches), cols)
         for i, m in enumerate(matches):
             res = m["result"]
             color = ("#00cc44" if res.startswith("승")
                      else "#888888" if res == "무" else "#cc4444")
-            vals = [m['date'], f"{m['comp']} {m['stage']}", m["opp"],
+            vals = [m['date'], m.get("position", ""), f"{m['comp']} {m['stage']}", m["opp"],
                     str(m["goals"]), str(m["assists"]), str(m["saves"]), str(m["conceded"]),
                     str(m["rating"]), m["score"], format_result_with_absence(m)]
-            _reason_label = _absence_override(m, len(vals), 7)
+            _reason_label = _absence_override(m, len(vals), 8)
             if _reason_label is None and not m.get("my_played", 1) and not m.get("absence_reason"):
                 _reason_label = "벤치"
             if _reason_label:
-                vals[3] = "—"; vals[4] = "—"; vals[5] = "—"; vals[6] = "—"
-                vals[7] = _reason_label
+                vals[4] = "—"; vals[5] = "—"; vals[6] = "—"; vals[7] = "—"
+                vals[8] = _reason_label
             for j, v in enumerate(vals):
                 self._set(tbl, i, j, v, color if j == len(vals) - 1 else None)
         lay.addWidget(tbl)
@@ -1080,7 +1082,7 @@ class CareerWindow(QDialog):
             extra_cols = ["기회창출", "패스%", "차단"]
         else:
             extra_cols = ["슈팅", "유효", "기회창출", "드리블"]
-        cols = (["연도", "우리 팀", "상대", "골", "어시"]
+        cols = (["연도", "포지션", "우리 팀", "상대", "골", "어시"]
                 + extra_cols + ["평점", "스코어", "결과"])
         tbl = self._make_table(len(matches), cols)
         for i, m in enumerate(matches):
@@ -1094,17 +1096,17 @@ class CareerWindow(QDialog):
                 "기회창출": str(m.get("key_passes", 0)), "드리블": str(m.get("dribbles", 0)),
                 "슈팅": str(m.get("shots", 0)), "유효": str(m.get("shots_on", 0)),
             }
-            vals = ([str(m["year"]), m["team_name"], m["opp_name"],
+            vals = ([str(m["year"]), m.get("position", ""), m["team_name"], m["opp_name"],
                     str(m["goals"]), str(m["assists"])]
                     + [_emap.get(c, "—") for c in extra_cols]
                     + [str(m["rating"]), m.get("score", "") or "—", res])
-            _reason_label = _absence_override(m, len(vals), 5 + len(extra_cols))
+            _reason_label = _absence_override(m, len(vals), 6 + len(extra_cols))
             if _reason_label:
                 vals = list(vals)
-                vals[3] = "—"; vals[4] = "—"
-                for _k in range(5, 5 + len(extra_cols)):
+                vals[4] = "—"; vals[5] = "—"
+                for _k in range(6, 6 + len(extra_cols)):
                     vals[_k] = "—"
-                vals[5 + len(extra_cols)] = _reason_label
+                vals[6 + len(extra_cols)] = _reason_label
                 color = "#888888"
             for j, v in enumerate(vals):
                 self._set(tbl, i, j, v, color if j == len(vals) - 1 else None)

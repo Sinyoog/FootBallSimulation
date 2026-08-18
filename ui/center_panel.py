@@ -645,6 +645,29 @@ class CenterPanel(QWidget):
         if not p or not st:
             return
 
+        # [2026-08 버그수정, 신민용 리포트: "1년씩 돌린 후 팀 입단하면 이제
+        # 1년씩 돌리진 못하는데, 우측 버튼엔 여전히 1년으로 남아있다"]
+        # 1년 넘기기는 팀이 없을 때만 쓸 수 있는 모드(_set_mode_year 진입
+        # 가드 참고)인데, 그 가드는 "새로 1년 모드를 선택하려는 시점"만
+        # 막아서 이미 1년 모드였던 상태로 입단해버리면(오퍼/직접지원 성공)
+        # 그 이후로도 버튼 표시가 "🗓 1년"에 그대로 멈춰있었다. refresh()는
+        # 입단 처리 직후를 포함해 거의 모든 액션 뒤에 호출되므로, 여기서
+        # "1년 모드인데 팀이 생겼다"를 감지해 1주씩 모드로 자동 전환한다.
+        if self._year_mode and p.get("current_team_id"):
+            self._year_mode    = False
+            self._step_mode    = False
+            self._locked_sched = None
+            self._step_idx     = 0
+            self._year_paused      = False
+            self._year_pattern     = None
+            self._year_weeks_done  = 0
+            self._year_weeks_total = 0
+            self.btn_mode.setText("📅 1주")
+            self.adv_btn.setText("▶▶  이번 주 진행")
+            show_toast(self, "⚠  입단으로 1년 넘기기가 해제되어 1주씩 모드로 전환합니다",
+                       "#cc6600", 2200)
+            self._save_ui_state()
+
         from constants import day_to_week, DAYS_PER_WEEK, day_to_date_str, day_to_full_date_str
         year   = st["current_year"]
         week   = st["current_week"]
@@ -2656,12 +2679,42 @@ class CenterPanel(QWidget):
             if self.main_win: self.main_win.refresh_all()
 
         def _do_decline():
+            # [단일 후보 전용] 후보가 1개뿐일 때의 "아니오" — 그 대회 전체를 닫는다.
             intl_engine.decline_national_team(pend["tournament_id"])
             dlg.accept()
             _nat_str = "/".join(o["nat"] for o in opts)
             show_toast(self, f"🚫 {_nat_str} 발탁을 거절했습니다 (기록에 남음)",
                        "#aa6633", 2000)
             if self.main_win: self.main_win.refresh_all()
+
+        # [2026-08 재설계, 신민용 요청: "그레나다에서 아니요를 누르면 그
+        # 나라 버튼만 회색으로 비활성화되고, 나머지 나라는 같은 창에 그대로
+        # 남아있어야 한다 — 마지막 하나까지 전부 아니오면 그때 창이
+        # 닫히는 거고, 그 전에 어느 쪽이든 예를 누르면 그 나라가 선택되는
+        # 거다"] 예전엔 "아니오" 한 번마다 dlg.accept()로 창을 통째로 닫고
+        # 남은 후보만으로 새 다이얼로그를 재귀적으로 다시 띄웠다 — 동작은
+        # 맞았지만 화면상 매번 새 창이 뜨는 것처럼 보였다. 이제 버튼 쌍을
+        # opt_buttons에 보관해두고, "아니오"를 누르면 그 나라의 버튼 쌍만
+        # 그 자리에서 비활성화(회색 처리)한다 — 창은 안 닫힌다. 남은 후보가
+        # 하나도 없을 때만(전부 아니오) 실제로 창을 닫는다.
+        opt_buttons = {}
+
+        def _do_decline_option(opt):
+            tid = opt.get("tournament_id", pend["tournament_id"])
+            intl_engine.decline_national_team_option(tid, opt["nat"])
+            show_toast(self, f"🚫 {opt['nat']} 발탁을 거절했습니다 (기록에 남음)",
+                       "#aa6633", 1800)
+            pair = opt_buttons.get(opt["nat"])
+            if pair:
+                for b in pair:
+                    b.setEnabled(False)
+                    b.setStyleSheet("color:#777; background-color:#2a2a2a;")
+            remaining = intl_engine.get_pending_choice()
+            if not remaining:
+                # 마지막 후보까지 전부 거절됐으면 그제서야 창을 닫는다.
+                dlg.accept()
+                if self.main_win:
+                    self.main_win.refresh_all()
 
         btn_row = QHBoxLayout(); btn_row.setSpacing(8)
         if single:
@@ -2675,21 +2728,33 @@ class CenterPanel(QWidget):
             btn_row.addWidget(b_yes, 2); btn_row.addWidget(b_no, 1)
             lay.addLayout(btn_row)
         else:
+            # [2026-08 변경] 나라마다 독립된 "예/아니오" 쌍으로 표시 —
+            # 하나를 "예" 하면 choose_national_team이 같은 해 나머지 대회를
+            # 이미 자동으로 닫아주고(기존 로직), 하나를 "아니오" 하면 그
+            # 나라 버튼 쌍만 이 자리에서 회색으로 비활성화되고 나머지는
+            # 그대로 같은 창에 남는다(위 _do_decline_option).
             for opt in opts:
-                # 복수 대륙컵이면 '국적 (대회명)'으로 어느 대회인지 명시
                 _comp = opt.get("competition", "")
                 _label = f"{opt.get('flag','')} {opt['nat']}"
                 if _comp:
-                    _label += f"\n({_comp})"
-                b = QPushButton(_label)
-                b.setObjectName("dlgChoice")
-                b.clicked.connect(lambda _=False, o=opt: _do_choice(o))
-                btn_row.addWidget(b, 1)
+                    _label += f" ({_comp})"
+                col = QFrame(); col_l = QVBoxLayout(col)
+                col_l.setContentsMargins(0,0,0,0); col_l.setSpacing(4)
+                nat_lbl = QLabel(_label); nat_lbl.setWordWrap(True)
+                nat_lbl.setStyleSheet("color:#ffcc66; font-weight:bold;")
+                col_l.addWidget(nat_lbl)
+                pair = QHBoxLayout(); pair.setSpacing(4)
+                b_yes = QPushButton("✅ 예")
+                b_yes.setObjectName("dlgChoice")
+                b_yes.clicked.connect(lambda _=False, o=opt: _do_choice(o))
+                b_no = QPushButton("❌ 아니오")
+                b_no.setObjectName("dlgNo")
+                b_no.clicked.connect(lambda _=False, o=opt: _do_decline_option(o))
+                pair.addWidget(b_yes); pair.addWidget(b_no)
+                col_l.addLayout(pair)
+                btn_row.addWidget(col, 1)
+                opt_buttons[opt["nat"]] = (b_yes, b_no)
             lay.addLayout(btn_row)
-            b_no = QPushButton("이번엔 어느 나라로도 뛰지 않음")
-            b_no.setObjectName("dlgNo")
-            b_no.clicked.connect(lambda _=False: _do_decline())
-            lay.addWidget(b_no)
 
         # 선택을 강제 (닫기 버튼 비활성 — 예/아니오/거절 중 하나는 눌러야 함)
         dlg.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)

@@ -57,6 +57,24 @@ CWC_START_DAY = week_to_day(INTL_GROUP_WEEKS[0])
 _STAGE_ORDER = ["R16", "QF", "SF", "F"]
 _GROUP_LABELS = ["A", "B", "C", "D", "E", "F", "G", "H"]
 
+# [2026-08 신설, 신민용 리포트: "1년씩 돌리는데 전보다 느려졌다" — 50시즌
+# 세이브 실측] 클럽 월드컵은 "국제대회 빈 해"에만 열리므로(4년 중 1번
+# 안팎 — 실측 50년 세이브에 cwc_tournaments 12개뿐), process_cwc_week가
+# 실제로 처리할 게 있는 날은 1년 중 극소수인데, advance_days의 일일 훅이
+# 매일(연 364회) 이 함수를 호출한다. 함수 자체엔 이미 "활성 대회 없으면
+# 바로 return"하는 조기 탈출이 있지만, 그 판정 자체가 매번 DB 조회 2개
+# (cwc_tournaments + cwc_matches 서브쿼리)를 새로 태워서 여전히 호출당
+# 비용이 남는다(실측 364회/5.6초). status!='done'인 cwc_tournaments가
+# 아예 하나도 없는 "빈 해"에는 그 자체를 프로세스 전역 캐시에 기억해두고,
+# 다음부터는 DB 조회 없이 즉시 return한다 — 새 대회가 생기거나(START)
+# 상태가 바뀌면(KO 전환/종료) 캐시를 무효화해 다시 확인하게 한다.
+_cwc_has_active_cache = None  # None=확인 필요, True=활성 대회 있음, False=없음(캐시된 빠른 경로)
+
+
+def _invalidate_cwc_active_cache():
+    global _cwc_has_active_cache
+    _cwc_has_active_cache = None
+
 _REWARD = {   # 챔스 _REWARD와 동일 체계(명성,인기,행복) — 챔스보다 한 단계 낮게
     "우승": (16, 11, 15), "준우승": (10, 6, 7), "3위": (8, 5, 6), "4위": (5, 3, 4),
     "8강 탈락": (3, 2, 2), "16강 탈락": (2, 1, 1), "조별리그 탈락": (1, 0, -1),
@@ -192,6 +210,7 @@ def start_club_world_cup(year: int):
         "INSERT INTO cwc_tournaments(year, my_in, my_team_id) VALUES(?,?,?)",
         (year, 1 if my_in else 0, my_tid if my_in else 0))
     tid = cur.lastrowid
+    _invalidate_cwc_active_cache()
 
     for gi, g in enumerate(groups):
         label = _GROUP_LABELS[gi]
@@ -266,8 +285,24 @@ def process_cwc_week(week: int, day=None):
     몇 주에 걸치든 항상 정확하다.
     day를 넘기면 아직 실제 날짜가 안 된(day가 미래인) 경기는 건드리지
     않고, 그날이 와서 advance_days의 정상 경로가 처리하게 둔다(intl_engine
-    과 동일한 이유 — process_intl_week 버그수정 주석 참고)."""
+    과 동일한 이유 — process_intl_week 버그수정 주석 참고).
+
+    [2026-08 최적화] status!='done'인 대회가 하나도 없는 "빈 해"에는
+    _cwc_has_active_cache로 그 사실을 기억해 다음 호출부터 DB 조회 없이
+    즉시 return한다 — 이 함수는 매일(연 364회) 불리는데 실제로 열리는
+    해는 4년에 1번 안팎이라 대부분의 호출이 이 빠른 경로를 탄다."""
+    global _cwc_has_active_cache
+    if _cwc_has_active_cache is False:
+        return
     conn = get_conn()
+    if _cwc_has_active_cache is not True:
+        _any_pending = conn.execute(
+            "SELECT 1 FROM cwc_tournaments WHERE status!='done' LIMIT 1").fetchone()
+        if not _any_pending:
+            _cwc_has_active_cache = False
+            conn.close()
+            return
+        _cwc_has_active_cache = True
     t = conn.execute(
         "SELECT * FROM cwc_tournaments WHERE status!='done' "
         "AND id IN (SELECT DISTINCT tournament_id FROM cwc_matches WHERE week<=?)",
@@ -414,11 +449,25 @@ def _build_knockout(conn, tid, qualifier_ids):
     """16팀을 시드 순서(조 1위끼리/2위끼리 안 붙게 스네이크)로 16강 대진.
     [2026-07 재설계] 새 행을 INSERT하는 대신, 대회 생성 시점에
     _precreate_cwc_ko_shell이 미리 만들어둔 R16 placeholder를 slot
-    번호로 채운다("경기는 미리 존재, 참가팀만 나중에 확정")."""
+    번호로 채운다("경기는 미리 존재, 참가팀만 나중에 확정").
+
+    [2026-08 버그수정, 신민용 리포트: "클럽 월드컵 우승했는데 career_window/
+    retire_window엔 조별리그 경기만 나온다"] is_my를 매 슬롯마다 무조건
+    0으로 하드코딩하고 있었다 - 내 팀이 실제로 그 매치업에 있어도 항상
+    0으로 저장돼서, get_my_cwc_matches()(WHERE is_my=1)가 16강부터는
+    내 경기를 하나도 못 찾았다(우승까지 했어도 조별리그 3경기만 화면에
+    보이던 원인). 조별리그 매치 생성부와 동일하게 "이 매치업에 내 팀이
+    있는가"로 계산해서 넣는다.
+    """
+    conn2 = get_conn()
+    _my_row = conn2.execute("SELECT my_team_id FROM cwc_tournaments WHERE id=?", (tid,)).fetchone()
+    conn2.close()
+    my_tid = _my_row["my_team_id"] if _my_row else 0
     random.shuffle(qualifier_ids)   # 조 추첨식 랜덤 매칭(간단화)
     fills = {}
     for slot, i in enumerate(range(0, 16, 2)):
-        fills[slot] = (qualifier_ids[i], qualifier_ids[i + 1], 0)
+        h, a = qualifier_ids[i], qualifier_ids[i + 1]
+        fills[slot] = (h, a, 1 if my_tid in (h, a) else 0)
     _fill_cwc_ko_shell(conn, tid, "R16", fills)
 
 
@@ -451,9 +500,17 @@ def _advance_round(t, cur_stage):
     # [2026-07 재설계] day/week는 더 이상 여기서 계산하지 않는다 —
     # _precreate_cwc_ko_shell이 대회 생성 시점에 이미 배정해뒀다. 여기서는
     # 승자 팀 ID만 slot 번호로 매칭해 placeholder를 채운다.
+    # [2026-08 버그수정, 신민용 리포트: "클럽 월드컵 우승했는데 career_window/
+    # retire_window엔 조별리그 경기만 나온다"] is_my를 매 슬롯마다 무조건
+    # 0으로 하드코딩하고 있었다(_build_knockout의 R16 생성부와 동일한 버그) -
+    # 8강/4강/결승까지도 내 팀 경기가 전부 is_my=0으로 저장돼서
+    # get_my_cwc_matches()가 못 찾았다. 승자 쌍에 내 팀이 있는지로 계산한다.
+    _my_row2 = conn.execute("SELECT my_team_id FROM cwc_tournaments WHERE id=?", (t["id"],)).fetchone()
+    my_tid2 = _my_row2["my_team_id"] if _my_row2 else 0
     fills = {}
     for slot, i in enumerate(range(0, len(winners), 2)):
-        fills[slot] = (winners[i], winners[i + 1], 0)
+        w1, w2 = winners[i], winners[i + 1]
+        fills[slot] = (w1, w2, 1 if my_tid2 in (w1, w2) else 0)
     _fill_cwc_ko_shell(conn, t["id"], nxt, fills)
     # [2026-07 버그수정, 신민용 리포트: "결승전은 상대가 미리 보이는데
     # 3/4위전은 경기 끝나야 나온다"] 예전엔 TP 매치 생성을 _finish_tournament
@@ -467,7 +524,8 @@ def _advance_round(t, cur_stage):
         losers = [m["away_team_id"] if _round_winner(dict(m)) == m["home_team_id"] else m["home_team_id"]
                   for m in matches]
         if len(losers) == 2:
-            _fill_cwc_ko_shell(conn, t["id"], "TP", {999: (losers[0], losers[1], 0)})
+            _tp_is_my = 1 if my_tid2 in (losers[0], losers[1]) else 0
+            _fill_cwc_ko_shell(conn, t["id"], "TP", {999: (losers[0], losers[1], _tp_is_my)})
     conn.commit()
     conn.close()
 
@@ -496,7 +554,12 @@ def _finish_tournament(t):
     if sf and (not tp_row or tp_row["home_team_id"] == 0):
         losers = [m["away_team_id"] if _round_winner(dict(m)) == m["home_team_id"] else m["home_team_id"]
                   for m in sf]
-        _fill_cwc_ko_shell(conn, t["id"], "TP", {999: (losers[0], losers[1], 0)})
+        # [2026-08 버그수정] 여기도 is_my 하드코딩 0 버그(위 _build_knockout/
+        # _advance_round와 동일) - 방어적 폴백 경로라 실행 빈도는 낮지만 그대로 뒀다.
+        _my_row3 = conn.execute("SELECT my_team_id FROM cwc_tournaments WHERE id=?", (t["id"],)).fetchone()
+        my_tid3 = _my_row3["my_team_id"] if _my_row3 else 0
+        _tp_is_my2 = 1 if my_tid3 in (losers[0], losers[1]) else 0
+        _fill_cwc_ko_shell(conn, t["id"], "TP", {999: (losers[0], losers[1], _tp_is_my2)})
         conn.commit()
 
     # 결승/3-4위전 중 아직 안 뛴 것만 시뮬 (멱등 — is_my 경기는 이미
@@ -512,6 +575,9 @@ def _finish_tournament(t):
     winner_id = _round_winner(dict(final))
     conn.execute("UPDATE cwc_tournaments SET status='done', winner_team_id=? WHERE id=?",
                  (winner_id, t["id"]))
+    # [2026-08 최적화] 이 대회가 마지막으로 남은 미완료 대회였을 수 있으니
+    # process_cwc_week의 "빈 해" 캐시를 다시 확인하도록 무효화한다.
+    _invalidate_cwc_active_cache()
     # [2026-08 신설, 신민용 확정: club_momentum 확장] 클럽월드컵(4년 주기,
     # "세계 최강 클럽" 타이틀) 우승팀에도 momentum을 건다 — 챔스보다도 조금
     # 더 강한 cwc_champion 스케줄(constants.MOMENTUM_SCHEDULES)을 쓴다.

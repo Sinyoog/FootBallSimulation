@@ -485,6 +485,26 @@ def init_db():
         leadership INTEGER DEFAULT 50, concentration INTEGER DEFAULT 50,
         ovr INTEGER DEFAULT 50, nationality TEXT DEFAULT '',
         FOREIGN KEY(team_id) REFERENCES teams(id))""")
+    # [2026-08 신설, "명문팀 lifecycle 조사" 요청] AI끼리의 이적을 기록하는
+    # 로그 — 지금까지는 ai_players.last_transfer_year만 남아서 "언제"는
+    # 알아도 "어디서 어디로, 어떤 OVR로, 명문도 몇 등급끼리" 오갔는지는
+    # 전혀 추적이 안 됐다. 레알 마드리드 스쿼드가 1998년 95.64 → 2008년
+    # 86.08로 떨어진 원인이 영입 부족인지 핵심선수 유출인지 구분하려면
+    # 이 로그가 반드시 필요하다(GPT 분석 합의). 이 시점부터 새로 발생하는
+    # 이적만 쌓이며, 과거 이적은 소급 기록되지 않는다.
+    c.execute("""CREATE TABLE IF NOT EXISTS ai_transfer_log(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        season INTEGER, year INTEGER, player_id INTEGER,
+        player_name TEXT DEFAULT '', player_position TEXT DEFAULT '',
+        player_age INTEGER DEFAULT 0, player_ovr INTEGER DEFAULT 0,
+        from_team_id INTEGER, to_team_id INTEGER,
+        from_team_prestige INTEGER DEFAULT 0, to_team_prestige INTEGER DEFAULT 0,
+        from_team_avg_ovr REAL DEFAULT 0, to_team_avg_ovr REAL DEFAULT 0,
+        transfer_type TEXT DEFAULT '')""")
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_ai_transfer_log_year
+        ON ai_transfer_log(year)""")
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_ai_transfer_log_teams
+        ON ai_transfer_log(from_team_id, to_team_id)""")
     c.execute(f"""CREATE TABLE IF NOT EXISTS my_player(
         id INTEGER PRIMARY KEY,
         name TEXT, nationality TEXT, flag TEXT,
@@ -557,6 +577,41 @@ def init_db():
         league_name TEXT,
         detail TEXT,
         is_mine INTEGER DEFAULT 1)""")
+    # [2026-08 신설, 골 시상 시스템] 골 "자체"의 기록(누가/언제/어디서/어떤
+    # 슛/몇 점)과 그 골이 받은 "상"(awards)을 완전히 분리한다 — 같은 골이
+    # 원더골 태그 + 리그 올해의 골 + 대회 최고의 골 + 푸스카스상을 동시에
+    # 가질 수 있는 구조를 자연스럽게 지원하기 위함(설계문서 v4 참고).
+    # is_pseudo: AI가 시즌말에 역산 생성한 "잠재 골"인지(1) 실제 발생한
+    # 골인지(0) 구분 — 절대 섞어서 통계 내면 안 됨(예: "내 원더골 개수"
+    # 조회엔 pseudo가 절대 포함되면 안 되지만, "푸스카스 후보 풀"에는 포함).
+    c.execute("""CREATE TABLE IF NOT EXISTS goal_events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        year INTEGER NOT NULL,
+        week INTEGER DEFAULT 0,
+        round TEXT DEFAULT '',
+        player_id INTEGER,
+        team_id INTEGER,
+        opponent_team_id INTEGER,
+        competition_type TEXT NOT NULL,
+        competition_id INTEGER,
+        league_id INTEGER,
+        league_name TEXT DEFAULT '',
+        shot_type TEXT NOT NULL,
+        goal_features TEXT DEFAULT '[]',
+        shot_score INTEGER NOT NULL,
+        context_score REAL NOT NULL,
+        final_score REAL NOT NULL,
+        is_wonder_goal INTEGER DEFAULT 0,
+        is_mine INTEGER DEFAULT 0,
+        is_pseudo INTEGER DEFAULT 0)""")
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_goal_events_year_score
+        ON goal_events(year, final_score DESC)""")
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_goal_events_player_year
+        ON goal_events(player_id, year)""")
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_goal_events_scope
+        ON goal_events(year, competition_type, competition_id)""")
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_goal_events_mine
+        ON goal_events(is_mine)""")
     c.execute(f"""CREATE TABLE IF NOT EXISTS game_log(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         entry TEXT, log_type TEXT DEFAULT 'normal',
@@ -1181,6 +1236,13 @@ def init_db():
         "ALTER TABLE po_history ADD COLUMN saves INTEGER DEFAULT 0",
         "ALTER TABLE po_history ADD COLUMN conceded INTEGER DEFAULT 0",
         "ALTER TABLE po_history ADD COLUMN score TEXT DEFAULT ''",
+        # [2026-08 버그수정, 신민용 리포트: "유로파/CWC/승강플옵/컨퍼런스 경기별
+        # 기록에 그 경기 당시 포지션이 안 남는다"] cl_matches/el_matches/
+        # ecl_matches/cwc_matches는 애초부터 my_position 컬럼이 있었는데
+        # po_history(승강 PO 커리어 영구 기록용 테이블)만 이 컬럼 자체가
+        # 없었다 — simulate_my_po_match에서 골/어시/평점 등은 다 저장하면서
+        # 그 경기 당시 무슨 포지션으로 뛰었는지는 아예 저장할 곳이 없었다.
+        "ALTER TABLE po_history ADD COLUMN position TEXT DEFAULT ''",
         # [2026-08 신설, 신민용 리포트: "시즌 중 이적하면 시즌 스탯이 0으로
         # 리셋돼서 이적 전 활약이 시상 계산에서 통째로 사라진다"] season_*는
         # join_team()에서 이적할 때마다 0으로 리셋된다(새 팀 "이번 시즌"
@@ -1343,6 +1405,14 @@ def init_db():
         # "마지막에 몇 명 남았는지"가 아니라 "원래 몇 팀이 있었는지"로
         # 강수가 정해지게 한다.
         "ALTER TABLE cup_tournaments ADD COLUMN standard_bracket_size INTEGER DEFAULT 0",
+        # [2026-08 신설, 골 시상 시스템] awards에 골 이벤트 연결 + 표시용
+        # 캐시(week/match_info) — goal_events와 조인 안 하고 상 목록 화면을
+        # 바로 그리기 위한 캐시(league_season_standings와 같은 사전계산
+        # 철학). goal_event_id는 골 관련 상(원더골 계열)에서만 채워지고,
+        # 발롱도르/득점왕 등 기존 상들은 0으로 그대로 남는다.
+        "ALTER TABLE awards ADD COLUMN goal_event_id INTEGER DEFAULT 0",
+        "ALTER TABLE awards ADD COLUMN week INTEGER DEFAULT 0",
+        "ALTER TABLE awards ADD COLUMN match_info TEXT DEFAULT ''",
     ]:
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,
@@ -1378,6 +1448,13 @@ def init_db():
                           WHERE current_day IS NULL OR current_day <= 1""")
         except Exception:
             pass
+    # season_state.current_day가 방금 바뀌었을 수 있으므로 get_state() 캐시를
+    # 비운다(초기화 시점이라 보통 비어있지만, 방어적으로).
+    try:
+        import game_engine
+        game_engine._invalidate_state_cache()
+    except Exception:
+        pass
 
     # ── [버그수정] ai_players 스냅샷 테이블 (새 게임 리셋용) ──────────────
     # reset_game_data()가 teams(리그/tier)는 원본으로 되돌리면서 ai_players는
@@ -1444,6 +1521,20 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_cl_matches_tid_week   ON cl_matches(tournament_id, week)",
         "CREATE INDEX IF NOT EXISTS idx_cl_entries_tid        ON cl_entries(tournament_id)",
         "CREATE INDEX IF NOT EXISTS idx_cl_matches_my ON cl_matches(is_my)",
+        # [2026-08 추가, 신민용 리포트: "1년씩 돌리는데 전보다 느려졌다"]
+        # el_*(유로파급)/ecl_*(컨퍼런스급)는 cl_*와 완전히 동일한 스키마로
+        # 복제됐고 competition_common.py가 cl_*와 똑같은 쿼리 패턴(tournament_id+week
+        # 조회, tournament_id+team_id 조회, is_my=1 조회)을 그대로 쓰는데,
+        # 정작 위 cl_matches/cl_entries 인덱스 3개가 el_/ecl_ 쪽엔 하나도
+        # 안 만들어져 있었다 — 챔스만 있던 시절엔 안 보이던 문제가, 유로파/
+        # 컨퍼런스로 범위가 넓어지면서(같은 코드 경로가 3배로 호출되는데
+        # 그중 2/3는 인덱스가 없는 채로) 누적된 것으로 보인다.
+        "CREATE INDEX IF NOT EXISTS idx_el_matches_tid_week   ON el_matches(tournament_id, week)",
+        "CREATE INDEX IF NOT EXISTS idx_el_entries_tid        ON el_entries(tournament_id)",
+        "CREATE INDEX IF NOT EXISTS idx_el_matches_my ON el_matches(is_my)",
+        "CREATE INDEX IF NOT EXISTS idx_ecl_matches_tid_week  ON ecl_matches(tournament_id, week)",
+        "CREATE INDEX IF NOT EXISTS idx_ecl_entries_tid       ON ecl_entries(tournament_id)",
+        "CREATE INDEX IF NOT EXISTS idx_ecl_matches_my ON ecl_matches(is_my)",
         "CREATE INDEX IF NOT EXISTS idx_cup_matches_tid_week  ON cup_matches(tournament_id, week)",
         "CREATE INDEX IF NOT EXISTS idx_cup_entries_tid       ON cup_entries(tournament_id)",
         # [2026-08 추가, 신민용 리포트: "재능 좋은 선수로 오래 뛰면 은퇴/
@@ -1551,6 +1642,14 @@ def init_db():
     repair_stray_intl_is_my_flags()   # 복수국적 미선택국 is_my 오염 정리 (1회성, 아래 참고)
     repair_cwc_match_groups()   # 클럽월드컵 매치 grp 백필 (1회성, 아래 참고)
     compact_existing_match_archive()   # 기존 세이브 match_results_archive 요약+정리 (1회성, 아래 참고)
+    # [2026-08 신설] init_db()는 QA/AB테스트 스크립트 등이 DB_PATH를 바꿔가며
+    # 같은 프로세스 안에서 여러 번 호출하기도 한다 — 그때마다 get_state()
+    # 캐시가 이전 DB의 season_state를 그대로 들고 있으면 안 되므로 비운다.
+    try:
+        import game_engine
+        game_engine._invalidate_state_cache()
+    except Exception:
+        pass
 
 
 # [2026-07 최적화, 신민용 리포트: "연도전환 최적화 더 해봐"] match_results엔
@@ -1793,11 +1892,38 @@ def archive_old_seasons(current_season):
         _tsp0 = time.perf_counter()
         _summarize_and_prune_archive(conn, seasons=seasons)
         _tsp = time.perf_counter() - _tsp0
+    _tal = _prune_ai_transfer_log(conn, current_season)
     _tvac = _maybe_periodic_vacuum(conn)
     print(f"[PERF]   archive_old_seasons 세부: 과거시즌조회 {_ta1-_ta0:.2f}s | "
           f"아카이브INSERT {_ta2-_ta1:.2f}s | match_results DELETE {_ta3-_ta2:.2f}s | "
-          f"commit {_ta4-_ta3:.2f}s | 요약+정리 {_tsp:.2f}s | 주기VACUUM {_tvac:.2f}s | "
-          f"(대상시즌 {seasons})")
+          f"commit {_ta4-_ta3:.2f}s | 요약+정리 {_tsp:.2f}s | ai_transfer_log정리 {_tal:.2f}s | "
+          f"주기VACUUM {_tvac:.2f}s | (대상시즌 {seasons})")
+
+
+# [2026-08 신설, 신민용 리포트: "50년 세이브 실측 — ai_transfer_log가
+# 152만 행까지 쌓였다"] 이 테이블은 AI 이적 시장 처리(ai_lifecycle.py)가
+# 매 시즌 계속 INSERT만 하는 로그성 테이블인데, 전체 코드베이스를 뒤져봐도
+# 이걸 SELECT하는 곳이 단 한 곳도 없다 — UI/월드 기록실 어디에도 노출되지
+# 않는 순수 기록용(디버그/추후 확장 대비)이라, match_results처럼 "역대
+# 조회"를 위해 영구 보존해야 할 이유가 없다. 그렇다고 완전히 안 남기기엔
+# 나중에 이적 시장 밸런스를 디버깅할 때 최근 몇 시즌 흐름은 참고할 수
+# 있어야 하므로, 완전 삭제 대신 "최근 N시즌만" 유지하는 보존 정책으로
+# 접근한다 — match_results/cup 계열과 달리 화면에 노출되는 값이 전혀
+# 없으므로 요약 테이블 없이 오래된 행을 그냥 지워도 안전하다.
+AI_TRANSFER_LOG_RETENTION_SEASONS = 5
+
+
+def _prune_ai_transfer_log(conn, current_season) -> float:
+    """ai_transfer_log에서 (current_season - 보존시즌수) 이전 행을 삭제.
+    archive_old_seasons와 같은 타이밍(연도전환)에 호출되며, 반환값은
+    소요 시간(초) — [PERF] 로그용."""
+    _t0 = time.perf_counter()
+    c = conn.cursor()
+    _cutoff = current_season - AI_TRANSFER_LOG_RETENTION_SEASONS
+    if _cutoff > 0:
+        c.execute("DELETE FROM ai_transfer_log WHERE season<?", (_cutoff,))
+        conn.commit()
+    return time.perf_counter() - _t0
 
 
 # [2026-08 신설, 신민용 리포트: "이거 길게 가면(한 세이브를 오래 플레이하면)
@@ -2295,6 +2421,7 @@ def reset_game_data():
               "season_state","qual_results","offer_refused","league_season_standings",
               "intl_history","intl_tournaments","intl_entries","intl_matches","nat_generation",
               "cl_tournaments","cl_entries","cl_matches","cl_history",
+              "goal_events",
               # [2026-08 버그수정, 신민용 리포트: "새 게임 시작하면 챔스는 새로
               # 시작하는데 세계 축구 기록실의 역대 유로파/컨퍼런스는 안 지워진다"]
               # el_*(유로파급)/ecl_*(컨퍼런스급)는 cl_*와 완전히 동일한 구조로
@@ -2314,6 +2441,14 @@ def reset_game_data():
     _reset_formations_from_seed(c)
     _reset_club_strength(c)
     conn.commit()
+    # season_state가 방금 통째로 지워졌으므로 get_state() 캐시도 반드시
+    # 비워야 한다 — 안 그러면 새 게임 시작 직후에도 이전 플레이의 연도/
+    # 주차가 캐시에 남아 화면에 계속 보이는 버그가 생긴다.
+    try:
+        import game_engine
+        game_engine._invalidate_state_cache()
+    except Exception:
+        pass
 
     # [2026-08 신설, 신민용 리포트: "은퇴 이후 새 게임을 반복할수록 렉이
     # 쌓이는 것 같다"] 실제 세이브 4개(설치 직후/1트/2트/3트)를 dbstat으로
