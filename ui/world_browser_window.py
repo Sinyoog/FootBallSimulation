@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QTableWidget, QTableWidgetItem,
     QHeaderView, QPushButton, QTabWidget, QWidget, QSplitter, QFrame,
     QAbstractItemView, QScrollArea, QGridLayout, QSizePolicy,
-    QStyledItemDelegate, QStyle, QMenu
+    QStyledItemDelegate, QStyle, QMenu, QMessageBox
 )
 from PyQt6.QtCore import Qt, QTimer, QRect, QSize
 from PyQt6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter, QShortcut, QKeySequence
@@ -170,6 +170,13 @@ QPushButton#closeBtn:hover { background:#383838; }
 """
 
 _ALL = "전체"
+
+# [2026-08 신설, 신민용 요청: "기록실(챔스/유로파/컨퍼런스) 필터 기본값은
+# 전체, 최다 순위 팝업 필터 기본값은 유럽 — 이 둘은 기능적으로 별개의
+# filter state로 분리해야 한다"] 이름 그대로 두 화면의 기본값을 각각의
+# 상수로 명확히 나눈다. 하나를 바꿔도 다른 하나는 절대 영향받지 않는다.
+RECORD_FILTER_DEFAULT = _ALL
+RANKING_FILTER_DEFAULT = "유럽"
 
 # [2026-08 신설, 신민용 리포트: "세계기록실 여전히 잠깐 멈추는 느낌"]
 # offer_window.py의 등급 팔레트(#grade_SS 등, 위 STYLE과 동일한 값)를
@@ -491,6 +498,116 @@ class WorldBrowserWindow(QDialog):
         v.addWidget(list_widget, 1)
         return holder
 
+    # [2026-08 신설, 신민용 요청: "검색창 밑에 최근 검색 버튼들이 쌓이면
+    # 좋겠다"] 리그/팀/국가 검색 탭 3곳이 전부 같은 모양(라벨 + 버튼들
+    # + 우측 끝 초기화)이라 공용 메서드 하나로 만든다. kind는
+    # world_browser.get/add/clear_recent_searches가 쓰는 것과 동일한
+    # 키('league'/'team'/'country') — 3개는 서로 독립적으로 쌓인다.
+    #
+    # 배치: 리그명·국가명·팀명 검색창(각 탭의 filt 행) 바로 아래가 아니라,
+    # 우측 상세 패널의 "← 왼쪽에서 OO을 선택하세요" 타이틀 바로 위에 둔다
+    # (신민용 확인 요청).
+    def _build_recent_search_row(self, kind, search_box, list_widget, name_from_item_fn, select_fn):
+        """search_box: 이 탭의 QLineEdit(검색창). list_widget: 이 탭의
+        QListWidget. name_from_item_fn(item): 리스트 항목에서 "깨끗한"
+        이름(국기/등급 등 장식 없이)을 뽑아내는 함수. select_fn(item):
+        그 항목을 실제로 선택했을 때 쓰는 기존 핸들러(_on_league_selected 등)
+        — 최근 검색 버튼을 클릭하면 이 함수를 그대로 다시 호출해서 "그
+        항목을 클릭해서 들어간 것"과 동일하게 동작하게 한다.
+
+        [2026-08 수정, 신민용 리포트: "내가 입력한 것보다 클릭해서 들어간
+        애들이 뜨는 게 맞다 — '치주'라고 쳐서 '치주물루 유나이티드 FC'를
+        클릭해서 들어가면 최근 검색엔 '치주물루 유나이티드 FC'가 남아야지
+        '치주'가 남으면 안 된다"] 예전엔 검색창에 타이핑을 멈춘 시점(디바운스
+        만료)에 그 입력 문자열 자체를 기록했다 — 이제는 그 시점엔 아무것도
+        기록하지 않고, 실제로 리스트에서 항목을 클릭해 들어갔을 때(각 탭의
+        _on_*_selected 안)만 그 항목의 정식 이름을 기록한다. 리그/팀/국가
+        3곳 다 같은 규칙."""
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 6)
+        h.setSpacing(6)
+
+        lbl = QLabel("최근 검색")
+        lbl.setStyleSheet("color:#888;font-size:11px;")
+        h.addWidget(lbl)
+
+        btn_box = QHBoxLayout()
+        btn_box.setSpacing(4)
+        h.addLayout(btn_box)
+        h.addStretch(1)
+
+        reset_btn = QPushButton("🗑 초기화")
+        # [2026-08 버그수정, 신민용 리포트: "검색창에서 엔터 누르면 쌓인
+        # 최근 검색이 강제로 초기화된다"] QPushButton은 기본적으로
+        # autoDefault=True라, 다이얼로그 안 어딘가(검색창 포함)에서 Enter를
+        # 누르면 Qt가 "기본 버튼"을 자동으로 클릭한다 — 이 초기화 버튼이
+        # 그 기본 버튼으로 잡혀서 검색창 Enter만 눌러도 목록이 지워졌다.
+        # Enter로 트리거되면 안 되는 버튼이라 autoDefault/default를 끈다.
+        reset_btn.setAutoDefault(False)
+        reset_btn.setDefault(False)
+        reset_btn.setStyleSheet(
+            "QPushButton{background:#2a2a2a;color:#888;border:1px solid #3a3a3a;"
+            "border-radius:4px;padding:2px 8px;font-size:11px;}"
+            "QPushButton:hover{color:#cc4444;border-color:#cc4444;}")
+        h.addWidget(reset_btn)
+
+        def _pick(q):
+            # 검색창에 그 이름을 채워 목록을 좁힌 뒤, 정확히 일치하는
+            # 항목을 찾아 실제로 클릭해 들어간 것처럼 select_fn을 호출한다.
+            search_box.setText(q)
+            for i in range(list_widget.count()):
+                it = list_widget.item(i)
+                if name_from_item_fn(it) == q:
+                    list_widget.setCurrentItem(it)
+                    select_fn(it)
+                    break
+
+        def _refresh():
+            while btn_box.count():
+                item = btn_box.takeAt(0)
+                widget = item.widget()
+                if widget:
+                    widget.deleteLater()
+            items = wb.get_recent_searches(kind)
+            if not items:
+                empty_lbl = QLabel("(없음 — 항목을 클릭해보세요)")
+                empty_lbl.setStyleSheet("color:#555;font-size:11px;")
+                btn_box.addWidget(empty_lbl)
+                return
+            for q in items:
+                b = QPushButton(q)
+                b.setToolTip(q)
+                # 같은 이유(Enter → autoDefault 버튼 오발동 방지)로 여기도 끈다.
+                b.setAutoDefault(False)
+                b.setDefault(False)
+                b.setCursor(Qt.CursorShape.PointingHandCursor)
+                b.setStyleSheet(
+                    "QPushButton{background:#232323;color:#aad4ff;border:1px solid #3a3a3a;"
+                    "border-radius:10px;padding:2px 10px;font-size:11px;}"
+                    "QPushButton:hover{border-color:#00cc44;color:#fff;}")
+                b.clicked.connect(lambda _checked=False, qq=q: _pick(qq))
+                btn_box.addWidget(b)
+
+        def _reset():
+            wb.clear_recent_searches(kind)
+            _refresh()
+
+        reset_btn.clicked.connect(_reset)
+        row.refresh = _refresh
+        _refresh()
+        return row
+
+    def _record_recent_selection(self, kind, name, recent_row_attr):
+        """리스트에서 항목을 실제로 클릭해 들어갔을 때 호출 — 그 항목의
+        정식 이름을 kind별 최근 검색 기록 맨 앞에 남긴다."""
+        if not name:
+            return
+        wb.add_recent_search(kind, name)
+        row = getattr(self, recent_row_attr, None)
+        if row is not None:
+            row.refresh()
+
     # ─────────────────────────────────────────
     # 탭1: 리그 검색
     # ─────────────────────────────────────────
@@ -583,6 +700,12 @@ class WorldBrowserWindow(QDialog):
         right = QWidget()
         right_lay = QVBoxLayout(right)
         right_lay.setContentsMargins(10, 0, 0, 0)
+
+        self._league_recent_row = self._build_recent_search_row(
+            "league", self.search_box, self.league_list,
+            lambda it: it.data(_CLEAN_TEXT_ROLE),
+            self._on_league_selected)
+        right_lay.addWidget(self._league_recent_row)
 
         title_row = QHBoxLayout()
         self.standing_title = QLabel("← 왼쪽에서 리그를 선택하세요")
@@ -803,6 +926,15 @@ class WorldBrowserWindow(QDialog):
             item.setData(Qt.ItemDataRole.UserRole, lg["id"])
             item.setData(Qt.ItemDataRole.UserRole + 1,
                         f"{lg['flag']} {lg['country']} · {lg['name']} ({lg['tier']}부)")
+            # [2026-08 버그수정, 신민용 리포트: "'list' object has no attribute
+            # 'strip'"] UserRole+2는 이미 _GridRowDelegate._SPEC_ROLE이 쓰고
+            # 있어서(행 스펙 리스트), 뒤에서 setData(_SPEC_ROLE, ...)가 내가
+            # 여기 넣은 순수 리그명을 그대로 덮어써버렸다 — 그래서 나중에
+            # item.data(UserRole+2)를 읽으면 문자열이 아니라 스펙 리스트가
+            # 나와서 add_recent_search의 .strip()에서 터졌다. 이미 이 파일
+            # 상단에 있는, 정확히 이 용도(장식 없는 순수 이름 보관)의
+            # _CLEAN_TEXT_ROLE(UserRole+50, _SPEC_ROLE과 안 겹침)을 대신 쓴다.
+            item.setData(_CLEAN_TEXT_ROLE, lg["name"])
             item.setData(_GridRowDelegate._SPEC_ROLE, self._league_row_spec(lg))
             matched_team = lg.get("matched_team")
             if matched_team:
@@ -1016,6 +1148,10 @@ class WorldBrowserWindow(QDialog):
         self.history_btn.setVisible(True)
         self.rank_leaders_btn.setVisible(True)
         self._fill_standing_table(standings)
+        # [2026-08 신설] 최근 검색 기록은 "클릭해서 들어간 항목"의 정식
+        # 이름으로 남긴다(검색창에 타이핑한 문자열이 아니라).
+        clean_name = item.data(_CLEAN_TEXT_ROLE) or ""
+        self._record_recent_selection("league", clean_name, "_league_recent_row")
 
     def _on_history_toggled(self, checked):
         """[신규] 제목 옆 버튼 — 현재 화면에 맞춰 라벨이 서로 바뀌면서 같은
@@ -1498,6 +1634,12 @@ class WorldBrowserWindow(QDialog):
         right_lay = QVBoxLayout(right)
         right_lay.setContentsMargins(10, 0, 0, 0)
 
+        self._team_recent_row = self._build_recent_search_row(
+            "team", self.team_search_box, self.team_list,
+            lambda it: it.data(Qt.ItemDataRole.UserRole + 1),
+            self._on_team_selected)
+        right_lay.addWidget(self._team_recent_row)
+
         # [2026-08 신설, 신민용 요청: "팀 검색 상세에 복사하기 버튼을 만들어서
         # 누르면 그 팀의 연도별 기록을 GPT/제미나이가 알아들을 수 있는 텍스트로
         # 뽑아달라"] 표는 화면에서 보기용이고, 이 버튼은 같은 데이터(get_team_history
@@ -1726,6 +1868,9 @@ class WorldBrowserWindow(QDialog):
         if tid is None:
             return
         self._show_team_detail(tid, tname)
+        # [2026-08 신설] 최근 검색 기록 — "팀 검색" 목록에서 실제로 클릭해
+        # 들어간 팀명만 남긴다(검색창에 타이핑한 문자열이 아니라).
+        self._record_recent_selection("team", tname or "", "_team_recent_row")
 
     def _show_team_detail(self, tid, tname):
         """[2026-08 신설, 신민용 리포트: "대회 상세 화면(리그 스테이지/
@@ -2049,6 +2194,11 @@ class WorldBrowserWindow(QDialog):
         right = QWidget()
         right_lay = QVBoxLayout(right)
         right_lay.setContentsMargins(10, 0, 0, 0)
+        self._country_recent_row = self._build_recent_search_row(
+            "country", self.country_search_box, self.country_list,
+            lambda it: it.data(Qt.ItemDataRole.UserRole),
+            self._on_country_selected)
+        right_lay.addWidget(self._country_recent_row)
         title_row = QHBoxLayout()
         self.country_detail_title = QLabel("← 왼쪽에서 국가를 선택하세요")
         self.country_detail_title.setStyleSheet("color:#00cc44;font-size:14px;font-weight:bold;")
@@ -2209,6 +2359,9 @@ class WorldBrowserWindow(QDialog):
             return
         self.country_detail_title.setText(f"🌍 {name}  국제대회 우승 기록")
         self._country_copy_name = name
+        # [2026-08 신설] 최근 검색 기록 — "국가 검색" 목록에서 실제로
+        # 클릭해 들어간 국가명만 남긴다.
+        self._record_recent_selection("country", name, "_country_recent_row")
 
         # 요약 칩 갱신
         while self.country_summary_row.count():
@@ -2648,9 +2801,13 @@ class WorldBrowserWindow(QDialog):
         [2026-08 확장, 신민용 요청: "대륙 선택 버튼 우측에 역대 1~4등을
         가장 많이 한 팀이 뜨는 창을 만들고, 기본값은 유럽으로"] rank_fn/
         tab_title을 추가로 받아 '🥇 최다 순위' 버튼을 필터 옆에 놓는다.
-        대륙 콤보 기본값도 _ALL(전체)이 아니라 '유럽'으로 바꿨다 — addItem
-        직후, currentTextChanged를 연결하기 '전에' 선택해서 초기 로드 시
-        핸들러가 불필요하게 두 번 불리지 않게 한다."""
+
+        [2026-08 수정, 신민용 요청: "일반 기록실 필터 기본값은 전체,
+        최다 순위 팝업 필터 기본값은 유럽 — 별개의 filter state로
+        분리해야 한다"] 이 탭(일반 기록실) 자체의 대륙 콤보 기본값은
+        RECORD_FILTER_DEFAULT(전체)를 쓴다. '최다 순위' 팝업의 기본값
+        (RANKING_FILTER_DEFAULT=유럽)은 _on_cl_style_rank_leaders_clicked
+        쪽에서 완전히 독립적으로 관리 — 이 콤보를 안 읽는다."""
         w = QWidget()
         lay = QVBoxLayout(w)
         lay.setContentsMargins(0, 8, 0, 0)
@@ -2660,7 +2817,7 @@ class WorldBrowserWindow(QDialog):
         combo = QComboBox()
         for cont in [_ALL, "유럽", "아시아", "아프리카", "북남미"]:
             combo.addItem(cont)
-        combo.setCurrentText("유럽")
+        combo.setCurrentText(RECORD_FILTER_DEFAULT)
         setattr(self, combo_attr, combo)
         combo.currentTextChanged.connect(
             lambda *_a: self._refresh_cl_style_table(tbl_attr, combo_attr, history_fn, winner_color))
@@ -2695,19 +2852,56 @@ class WorldBrowserWindow(QDialog):
         콤보(combo_attr) 상태를 그대로 읽어서 그 대륙 기준으로만 열었다
         — 이제 네이션스컵/지역컵과 똑같이, 팝업 자체에 독립된 대륙
         필터(유럽/아시아/아프리카/북남미)를 두고 기본값을 탭의 현재
-        선택과 무관하게 "유럽"으로 고정한다. 필터를 바꾸면 팝업 안에서
-        바로 다시 집계해서 보여준다."""
+        선택과 무관하게 RANKING_FILTER_DEFAULT(유럽)로 고정한다. 필터를
+        바꾸면 팝업 안에서 바로 다시 집계해서 보여준다."""
+        self._open_cl_style_rank_dialog(tab_title, rank_fn, RANKING_FILTER_DEFAULT)
+
+    # [2026-08 신설, 신민용 요청: "최다 순위 화면 상단에 [챔피언스][유로파]
+    # [컨퍼런스][슈퍼컵] 이동 버튼 — 현재 화면은 제외"] 챔스/유로파/
+    # 컨퍼런스/슈퍼컵 4개 대륙대회의 (버튼 라벨, tab_title, rank_fn) 목록.
+    # 슈퍼컵은 아직 competition/super_cup_engine.py가 없어서 rank_fn=None
+    # 으로 자리만 잡아둔다 — 그 파일이 생기면 이 한 줄만 채우면 된다.
+    def _cl_style_rank_specs(self):
+        return [
+            ("챔피언스", "챔피언스리그", wb.get_cl_style_rank_leaders),
+            ("유로파", "유로파리그", wb.get_el_rank_leaders),
+            ("컨퍼런스", "컨퍼런스리그", wb.get_ecl_rank_leaders),
+            ("슈퍼컵", "슈퍼컵", None),
+        ]
+
+    def _open_cl_style_rank_dialog(self, tab_title, rank_fn, continent_value):
+        """대륙대회(챔스/유로파/컨퍼런스) '최다 순위' 팝업을 연다. 상단에
+        같은 성격의 다른 대회로 바로 넘어가는 이동 버튼(현재 화면 제외)을
+        같이 붙인다 — 클릭하면 이 팝업을 닫고 그 대회의 팝업을 새로 연다."""
         options = [(_ALL, None), ("유럽", "유럽"), ("아시아", "아시아"),
                    ("아프리카", "아프리카"), ("북남미", "북남미")]
-        default_value = "유럽"
-        dlg = RankLeadersDialog(tab_title, rank_fn(continent=default_value),
+        nav_buttons = []
+        for label, other_title, other_fn in self._cl_style_rank_specs():
+            if other_title == tab_title:
+                continue   # 현재 보고 있는 화면은 이동 버튼에서 제외
+            if other_fn is None:
+                # 슈퍼컵 — 엔진 구현 전까지는 눌러도 안내만 뜬다.
+                nav_buttons.append((label, self._show_super_cup_not_ready))
+            else:
+                nav_buttons.append((label, lambda t=other_title, f=other_fn:
+                                     self._open_cl_style_rank_dialog(t, f, RANKING_FILTER_DEFAULT)))
+        dlg = RankLeadersDialog(tab_title, rank_fn(continent=continent_value),
                                  keys=("winner", "runner_up", "third", "fourth"),
                                  key_labels=["🥇 1위 팀", "🥈 2위 팀", "🥉 3위 팀", "4위 팀"],
                                  filter_label="대륙", filter_options=options,
-                                 filter_default=default_value,
+                                 filter_default=continent_value,
                                  fetch_fn=lambda cont: rank_fn(continent=cont),
+                                 nav_buttons=nav_buttons,
                                  parent=self)
         dlg.show()
+
+    def _show_super_cup_not_ready(self):
+        """[2026-08 신설] 슈퍼컵은 아직 미구현 — competition/super_cup_engine.py
+        (또는 super_cup.py)가 생기고 get_super_cup_rank_leaders 같은 조회
+        함수가 world_browser.py에 추가되면, 위 _cl_style_rank_specs의
+        마지막 항목 rank_fn만 채워 넣으면 이 자리에 자동으로 연결된다."""
+        QMessageBox.information(self, "슈퍼컵",
+                                 "슈퍼컵은 아직 준비 중입니다.")
 
     def _refresh_cl_style_table(self, tbl_attr, combo_attr, history_fn, winner_color):
         combo = getattr(self, combo_attr)
@@ -2977,6 +3171,9 @@ class WorldBrowserWindow(QDialog):
         w = QWidget()
         lay = QVBoxLayout(w)
         lay.setContentsMargins(0, 8, 0, 0)
+        # [2026-08 신설] 왼쪽에서 실제로 클릭한 지역컵 대회명 — 아직 아무
+        # 것도 안 골랐으면 None("← 왼쪽에서 지역대회를 선택하세요" 상태).
+        self._region_selected_name = None
 
         info = QLabel("ℹ️ 월드컵/대륙컵/클럽월드컵 어느 것과도 겹치지 않는 해(4년 주기)에 "
                        "9개 지역(아시아 4·아프리카 3·북중미 2)에서 자동으로 열립니다.")
@@ -3103,6 +3300,11 @@ class WorldBrowserWindow(QDialog):
 
     def _on_region_selected(self, item):
         name = item.data(Qt.ItemDataRole.UserRole)
+        # [2026-08 신설, 신민용 요청: "AFF 챔피언십을 클릭해서 화면에 떠있는
+        # 상태에서 최다 순위를 누르면 코파가 아니라 AFF 챔피언십의 최다
+        # 순위가 떠야 한다"] 왼쪽에서 실제로 클릭한 대회명을 기억해뒀다가
+        # _on_region_rank_leaders_clicked에서 기본값으로 쓴다.
+        self._region_selected_name = name
         self.region_title.setText(f"🌏 {name}")
         rows = wb.get_region_cup_history(name=name)
         self._fill_placement_table(self.region_tbl, rows,
@@ -3114,6 +3316,14 @@ class WorldBrowserWindow(QDialog):
         필터 얘기였다"] 왼쪽 목록에서 뭘 선택했는지와 무관하게 항상 열 수
         있다 — 팝업 내부에 자체 "대회" 필터를 두고(기본값 코파 아메리카),
         그 필터를 바꾸면 팝업 안에서 바로 다시 집계해서 보여준다.
+
+        [2026-08 수정, 신민용 리포트: "왼쪽에서 아무것도 선택 안 했을 때는
+        코파 아메리카가 기본이 맞지만, AFF 챔피언십처럼 왼쪽에서 실제로
+        클릭해서 화면에 띄워둔 상태라면 최다 순위도 그 대회(AFF 챔피언십)
+        기준으로 떠야 한다"] 왼쪽에서 클릭해 고른 대회(_region_selected_name)가
+        있으면 그걸 최우선으로 쓰고, 아직 아무것도 안 골랐으면(맨 처음
+        "← 왼쪽에서 지역대회를 선택하세요" 상태) 기존처럼 코파 아메리카로
+        폴백한다.
         [2026-08 신설, 신민용 요청: "필터 목록에 대회명만 있는데 어느
         지역인지도 같이 보여달라"] REGION_CUP_NAME(지역명→대회명)을
         거꾸로 뒤져서 "AFF 챔피언십(동남아시아)"처럼 표시 라벨에만
@@ -3127,7 +3337,14 @@ class WorldBrowserWindow(QDialog):
             return f"{name}({region})" if region else name
 
         options = [(_ALL, None)] + [(_labeled(name), name) for name in wb.list_region_cup_names()]
-        default_value = "코파 아메리카" if any(v == "코파 아메리카" for _l, v in options) else None
+        valid_values = {v for _l, v in options}
+        selected = getattr(self, "_region_selected_name", None)
+        if selected and selected in valid_values:
+            default_value = selected
+        elif any(v == "코파 아메리카" for _l, v in options):
+            default_value = "코파 아메리카"
+        else:
+            default_value = None
         dlg = RankLeadersDialog("지역컵", wb.get_region_cup_rank_leaders(name=default_value),
                                  keys=("winner", "runner_up", "third", "fourth"),
                                  key_labels=["🥇 1위", "🥈 2위", "🥉 3위", "4위"],
@@ -3265,7 +3482,7 @@ class RankLeadersDialog(QDialog):
 
     def __init__(self, title, data, keys, key_labels, empty_msg="아직 완료된 기록이 없습니다",
                  filter_label=None, filter_options=None, filter_default=None, fetch_fn=None,
-                 parent=None):
+                 nav_buttons=None, parent=None):
         super().__init__(parent)
         self.setWindowModality(Qt.WindowModality.NonModal)
         self.setWindowTitle(f"{title} — 최다 순위")
@@ -3288,6 +3505,29 @@ class RankLeadersDialog(QDialog):
         sub = QLabel("역대 순위별로 가장 많이 그 자리를 차지한 팀/국가 순위입니다.")
         sub.setStyleSheet("color:#888;font-size:11px;")
         outer.addWidget(sub)
+
+        # [2026-08 신설, 신민용 요청: "최다 순위 화면 상단에 [챔피언스]
+        # [유로파][컨퍼런스][슈퍼컵] 이동 버튼 — 현재 화면은 제외"]
+        # nav_buttons: [(라벨, 클릭시콜백), ...] — 콜백은 인자 없이 호출된다.
+        # 클릭하면 이 팝업을 닫고 콜백이 다음 팝업을 연다(그래서 항상
+        # 팝업이 하나만 떠 있다).
+        if nav_buttons:
+            nav_row = QHBoxLayout()
+            nav_lbl = QLabel("다른 대회 보기")
+            nav_lbl.setStyleSheet("color:#666;font-size:11px;")
+            nav_row.addWidget(nav_lbl)
+            for nav_label, nav_cb in nav_buttons:
+                nav_btn = QPushButton(nav_label)
+                nav_btn.setAutoDefault(False)
+                nav_btn.setDefault(False)
+                nav_btn.setStyleSheet(
+                    "QPushButton{background:#232323;color:#aad4ff;border:1px solid #3a3a3a;"
+                    "border-radius:10px;padding:2px 12px;font-size:11px;}"
+                    "QPushButton:hover{border-color:#00cc44;color:#fff;}")
+                nav_btn.clicked.connect(lambda _checked=False, cb=nav_cb: self._on_nav_clicked(cb))
+                nav_row.addWidget(nav_btn)
+            nav_row.addStretch()
+            outer.addLayout(nav_row)
 
         self._filter_combo = None
         if filter_options:
@@ -3328,6 +3568,12 @@ class RankLeadersDialog(QDialog):
         outer.addWidget(close_btn)
 
         self._populate(data)
+
+    def _on_nav_clicked(self, callback):
+        """이동 버튼 클릭 — 이 팝업을 닫고(비모달이라 여러 개 안 겹치게)
+        콜백에게 다음 팝업을 열도록 맡긴다."""
+        self.close()
+        callback()
 
     def _on_filter_changed(self, _idx):
         if not self._fetch_fn or not self._filter_combo:

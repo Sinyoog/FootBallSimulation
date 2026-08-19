@@ -342,28 +342,35 @@ class _FormationCanvas(QWidget):
             conn.close()
             avg_ovr = round(entry["ovr"]) if entry and entry["ovr"] else (p.get("ovr", 50) if p else 50)
 
-            # 포지션 목록: 나를 제외한 10자리 (GK 반드시 포함)
+            # [2026-08 버그수정, 신민용 리포트: "ST → AI [GK]"처럼 포메이션
+            # 슬롯과 실제 선수 표시가 어긋난다] 예전엔 "GK 항상 포함 + 나머지
+            # 고정 순서(others)" 리스트를 그냥 만들어서 paintEvent가 화면
+            # 순서대로 대충 짝짓게 맡겼다 — 그 리스트가 실제 4-4-2 슬롯
+            # 순서/구성과 일치한다는 보장이 없었다(게다가 paintEvent가 쓰는
+            # 화면 표시 순서와도 다시 어긋남). 이제 실제 FORMATION_SLOTS의
+            # "4-4-2"를 그대로 순회하며, 내 슬롯(_best_slot_for_player로
+            # 결정)만 비우고 나머지 슬롯 각각에 그 슬롯의 실제 포지션을
+            # 가진 AI를 만든다 — 슬롯 인덱스(_slot_idx)를 그대로 태그해서
+            # paintEvent가 순서에 의존하지 않고 원본 슬롯으로 직접 매칭한다.
+            slots_only = FORMATION_SLOTS["4-4-2"]
             my_pos = p.get("position", "CM") if p else "CM"
-            my_cat = _pos_category(my_pos)
-            # GK은 항상 포함, 나머지는 내 포지션 카테고리 제외 후 채움
-            if my_cat == "GK":
-                others = ["CB", "CB", "LB", "RB", "CM", "CM", "CAM", "LW", "RW", "ST"]
-            else:
-                others = ["GK", "CB", "CB", "LB", "RB", "CM", "CM", "CAM", "LW", "RW"]
+            my_slot_idx, _field_pos, _mismatch = _best_slot_for_player(my_pos, slots_only)
 
             players = []
             if p:
                 me = {"id": -1, "name": p.get("name", "나"),
-                      "position": my_pos,
+                      "position": my_pos, "_slot_idx": my_slot_idx,
                       "ovr": p.get("ovr", 40), "is_me": True,
                       **{s: p.get(s, 0) for s in ALL_STATS}}
                 players.append(me)
-            for i, pos in enumerate(others):
+            for i, sp in enumerate(slots_only):
+                if p and i == my_slot_idx:
+                    continue
                 ovr_v = max(30, min(99, avg_ovr + random.randint(-4, 4)))
                 # 모든 스탯을 ovr_v로 채우되 포지션별 편차 부여
                 base = {s: ovr_v for s in ALL_STATS}
-                players.append({"id": -(i+2), "name": "AI", "position": pos,
-                                 "ovr": ovr_v, "is_me": False, **base})
+                players.append({"id": -(i+2), "name": "AI", "position": sp,
+                                 "_slot_idx": i, "ovr": ovr_v, "is_me": False, **base})
             self.players = players
         else:
             # ── 리그팀 ──
@@ -382,24 +389,11 @@ class _FormationCanvas(QWidget):
 
                 # 1) 나를 제외한 베스트11: 포지션 호환 우선순위로 그리디 배정
                 #    (OVR 높은 순으로 훑으며 자신에게 가장 잘 맞는 빈 슬롯을 차지)
-                slot_filled = [None] * len(slots_only)
-                for ai in all_ai:
-                    open_slots = [sp for i, sp in enumerate(slots_only) if slot_filled[i] is None]
-                    if not open_slots:
-                        break
-                    _, chosen_pos, _ = _best_slot_for_player(ai.get("position", "CM"), open_slots)
-                    for i, sp in enumerate(slots_only):
-                        if slot_filled[i] is None and sp == chosen_pos:
-                            slot_filled[i] = ai
-                            break
-                # 포지션이 안 맞아 못 채운 슬롯은 남은 선수 중 OVR 높은 순으로 채움(방어적 폴백)
-                if any(s is None for s in slot_filled):
-                    used_ids = {pl["id"] for pl in slot_filled if pl}
-                    leftovers = [ai for ai in all_ai if ai["id"] not in used_ids]
-                    li = 0
-                    for i in range(len(slot_filled)):
-                        if slot_filled[i] is None and li < len(leftovers):
-                            slot_filled[i] = leftovers[li]; li += 1
+                # [2026-08 버그수정] AI 11명 슬롯 배정은 _greedy_fill_slots가
+                # 담당한다 — 포지션이 몰린 스쿼드(예: GK 2명)에서도 진짜
+                # 맞는 선수가 먼저 자기 자리를 차지하고, 잉여만 마지막에
+                # 남는 자리로 밀리게 한다(자세한 설명은 그 함수 주석 참고).
+                slot_filled = _greedy_fill_slots(all_ai, slots_only)
 
                 # 2) 내 포지션에 맞는 슬롯을 찾아, 그 자리의 기존 선수와 OVR 비교
                 my_slot_idx, field_pos, mismatch_rank = _best_slot_for_player(
@@ -407,7 +401,7 @@ class _FormationCanvas(QWidget):
                 rival = slot_filled[my_slot_idx] if my_slot_idx < len(slot_filled) else None
 
                 me = {"id": -1, "name": p.get("name", "나"),
-                      "position": p.get("position", "MF"),
+                      "position": p.get("position", "MF"), "_slot_idx": my_slot_idx,
                       "ovr": p.get("ovr", 40), "is_me": True,
                       **{s: p.get(s, 0) for s in ALL_STATS}}
 
@@ -436,9 +430,27 @@ class _FormationCanvas(QWidget):
         self.update()
 
     def load_opp_team(self, team: dict):
-        """상대팀 dict ({formation, players}) 로드."""
+        """상대팀 dict ({formation, players}) 로드.
+        [2026-08 버그수정, 신민용 리포트: "다른 곳에도 문제 있는거 아니냐"]
+        확인해보니 있었다 — 상대팀 쪽(_fetch_league_opponents/_fetch_intl_
+        opponents/_fetch_cl_opponents 등)은 애초에 선수를 포메이션 슬롯에
+        맞춰 배정하는 로직 자체가 없었다. _players_for_team은 그냥
+        OVR 내림차순 top11이고, _make_intl_virtual_players의 포지션
+        목록조차 실제 FORMATION_SLOTS["4-4-2"] 구성과 다르다(CAM/LW/RW
+        vs 실제 LM/RM/ST/ST) — 즉 내 팀 쪽 버그를 고치기 전부터도
+        상대팀 포메이션 화면은 슬롯-선수가 맞을 가능성이 낮았다.
+        load_my_team의 그리디 슬롯 배정(_best_slot_for_player 기반)을
+        여기서도 그대로 적용해 각 선수에 _slot_idx를 태깅한다 — 이러면
+        _fetch_* 쪽 함수들을 하나씩 안 고쳐도 이 한 곳에서 상대팀 전체
+        경로가 다 같이 고쳐진다(paintEvent는 _slot_idx가 있으면 그걸로
+        직접 매칭하므로)."""
         self.formation = team.get("formation") or "4-4-2"
-        self.players   = team.get("players") or []
+        raw_players = team.get("players") or []
+        slots_only = FORMATION_SLOTS.get(self.formation, FORMATION_SLOTS["4-4-2"])
+        # [2026-08 버그수정] 배정은 _greedy_fill_slots가 담당 — 자세한 설명은
+        # 그 함수 주석 참고(포지션 몰린 스쿼드에서의 연쇄 오배치 수정).
+        slot_filled = _greedy_fill_slots(raw_players, slots_only)
+        self.players = [pl for pl in slot_filled if pl is not None]
         self._player_at = {}; self._positions_xy = []
         self.update()
 
@@ -458,12 +470,22 @@ class _FormationCanvas(QWidget):
         self._positions_xy = positions_xy
 
         # 슬롯→선수 매핑
+        # [2026-08 버그수정, 신민용 리포트: "ST → AI [GK]"처럼 슬롯과 선수가
+        # 뒤섞여 표시된다] 예전엔 "내 슬롯을 뺀 나머지를 배열 순서대로
+        # positions_xy에 순서대로 채운다"는 방식이었는데, self.players의
+        # 순서(load_my_team이 배정한 원본 FORMATION_SLOTS 순서)와
+        # positions_xy의 순서(화면 표시용으로 행/좌우 재정렬된 순서)가
+        # 서로 다르다 — 그래서 배열 인덱스로 그냥 짝지으면 슬롯과 선수가
+        # 뒤섞인다. load_my_team()이 각 선수에 실제로 배정된 원본 슬롯
+        # 인덱스를 "_slot_idx"로 함께 저장해두므로, 그 값으로 직접
+        # 찾아가면 순서와 무관하게 항상 맞는 슬롯에 배치된다.
         player_at = {}
+        me = None
         if self.players and self.players[0].get("is_me"):
             me = self.players[0]
             primary_pos = me.get("position", "CM")
             # POSITION_COMPAT 기반으로 가장 자연스러운 슬롯 결정
-            slots_only = [sp for (_, _, sp) in positions_xy]
+            slots_only = [sp for (_, _, sp, _) in positions_xy]
             my_slot, field_pos, mismatch_rank = _best_slot_for_player(primary_pos, slots_only)
             # field_pos를 me에 저장 → 경기 퍼포먼스·커리어 기록에 활용
             me["field_pos"] = field_pos
@@ -474,10 +496,26 @@ class _FormationCanvas(QWidget):
                 update_player(field_pos=field_pos, mismatch_rank=mismatch_rank)
             except Exception:
                 pass
-            player_at[my_slot] = me
+            # my_slot은 positions_xy(행 재정렬) 기준 인덱스이므로, 그 슬롯의
+            # 원본 slot_idx로 변환해서 저장한다 — 아래 매칭 기준을 하나로 통일.
+            me["_slot_idx"] = positions_xy[my_slot][3]
+
+        _have_slot_idx = bool(self.players) and all(
+            pl.get("_slot_idx") is not None for pl in self.players)
+        if _have_slot_idx:
+            by_slot = {pl["_slot_idx"]: pl for pl in self.players}
+            for i, (px, py, pos, slot_idx) in enumerate(positions_xy):
+                if slot_idx in by_slot:
+                    player_at[i] = by_slot[slot_idx]
+        elif me is not None:
+            # [폴백] _slot_idx가 없는 예전 경로(캐시된 옛 데이터 등) 전용 —
+            # 슬롯 매칭 없이 순서대로 채운다. 정상 경로에서는 위 분기로 빠진다.
+            my_slot_visual = next(i for i, (_, _, _, sidx) in enumerate(positions_xy)
+                                   if sidx == me["_slot_idx"])
+            player_at[my_slot_visual] = me
             ai_idx = 0
             for si in range(len(positions_xy)):
-                if si == my_slot: continue
+                if si == my_slot_visual: continue
                 if ai_idx + 1 < len(self.players):
                     player_at[si] = self.players[ai_idx + 1]; ai_idx += 1
         else:
@@ -485,7 +523,7 @@ class _FormationCanvas(QWidget):
                 player_at[i] = p
         self._player_at = player_at
 
-        for i, (px, py, pos) in enumerate(positions_xy):
+        for i, (px, py, pos, _slot_idx) in enumerate(positions_xy):
             pl = player_at.get(i)
             is_me = pl.get("is_me", False) if pl else False
             is_hov = (i == self._hovered_slot)
@@ -512,25 +550,37 @@ class _FormationCanvas(QWidget):
         painter.end()
 
     def _calc_positions(self, slots, w, h):
+        """[2026-08 버그수정, 신민용 리포트: "ST → AI [GK]", "GK → AI [LW]"처럼
+        슬롯과 선수가 완전히 뒤섞여 표시된다"] 반환 튜플에 slot_idx(=원본
+        FORMATION_SLOTS 리스트에서의 인덱스)를 추가한다. 이 함수는 화면
+        표시용으로 슬롯을 행(GK/DEF/MID/MID2/ATK)별로 묶고 각 행 안에서
+        좌→우로 재정렬하므로, 반환 순서는 원본 slots 리스트 순서와 다르다
+        (예: 4-4-2 원본은 [GK,CB,CB,LB,RB,LM,CM,CM,RM,ST,ST]인데 여기서는
+        ATK행이 맨 앞으로 옴). load_my_team()이 선수를 배정할 때 쓰는
+        슬롯 인덱스는 원본 순서 기준이라, 두 순서를 슬롯 라벨만 보고
+        같은 것으로 착각해 배열 인덱스로 그냥 zip하면(과거 paintEvent가
+        하던 방식) 완전히 다른 슬롯끼리 짝지어진다 — slot_idx를 함께
+        내려줘서 어느 코드도 순서에 의존하지 않고 원본 인덱스로 직접
+        찾아가게 한다."""
         rows = {}; row_order = []
-        for pos in slots:
+        for idx, pos in enumerate(slots):
             k = _row_key(pos)
             if k not in rows: rows[k] = []; row_order.append(k)
-            rows[k].append(pos)
+            rows[k].append((idx, pos))
         sorted_rows = sorted(row_order, key=lambda x: _row_priority(x))
         total = len(sorted_rows); result = []
         for ri, rk in enumerate(sorted_rows):
-            # 같은 행 안에서 _pos_x_order 기준 좌→우 정렬
-            poss = sorted(rows[rk], key=_pos_x_order)
+            # 같은 행 안에서 _pos_x_order 기준 좌→우 정렬 (원본 인덱스는 유지)
+            poss = sorted(rows[rk], key=lambda t: _pos_x_order(t[1]))
             cnt = len(poss)
             ry = 16 + int((ri + 0.5) * (h - 32) / total)
-            for ci, pos in enumerate(poss):
-                result.append((int((ci+1)*w/(cnt+1)), ry, pos))
+            for ci, (idx, pos) in enumerate(poss):
+                result.append((int((ci+1)*w/(cnt+1)), ry, pos, idx))
         return result
 
     def mouseMoveEvent(self, event):
         mx, my = event.pos().x(), event.pos().y()
-        new = next((i for i, (px, py, _) in enumerate(self._positions_xy)
+        new = next((i for i, (px, py, _, _s) in enumerate(self._positions_xy)
                     if (mx-px)**2+(my-py)**2 < 400), -1)
         if new != self._hovered_slot:
             self._hovered_slot = new
@@ -540,7 +590,7 @@ class _FormationCanvas(QWidget):
 
     def mousePressEvent(self, event):
         mx, my = event.pos().x(), event.pos().y()
-        for i, (px, py, _) in enumerate(self._positions_xy):
+        for i, (px, py, _, _s) in enumerate(self._positions_xy):
             if (mx-px)**2+(my-py)**2 < 400:
                 pl = self._player_at.get(i)
                 if pl: PlayerStatPopup(pl, self).exec()
@@ -813,6 +863,13 @@ def _best_slot_for_player(primary_pos, slots):
     POSITION_COMPAT 우선순위 리스트 기준: 앞에 있는 슬롯일수록 높은 우선순위.
     반환: (slot_index, field_pos, mismatch_rank)
       mismatch_rank=0: 완벽 매치 / 1: 2순위 / 2: 3순위 ...
+    [주의] '나(me)' 한 명의 슬롯을 결정할 때만 쓴다. 여러 후보를 한꺼번에
+    슬롯에 채울 때는(AI 11명 등) 아래 _greedy_fill_slots를 쓴다 — 이
+    함수의 최종 폴백(호환/카테고리 매치가 전혀 없을 때 slots[0]을 그냥
+    반환)은 후보가 하나뿐일 때는 무해하지만, 여러 명을 순서대로 돌리면서
+    쓰면 포지션이 몰린(예: GK 2명) 잉여 후보가 엉뚱한 자리를 가로채고
+    그 여파로 뒤 후보들이 줄줄이 밀리는 문제가 있었다(2026-08 버그수정,
+    신민용 리포트: "RB 의 주포가 GK로 뜨고 ST가 CB으로 간다").
     """
     compat = POSITION_COMPAT.get(primary_pos, [primary_pos])
     # 이미 할당된 슬롯 제외 없이 최적 슬롯만 찾음 (호출 시 이미 할당된 슬롯 제외 처리)
@@ -831,6 +888,72 @@ def _best_slot_for_player(primary_pos, slots):
                 return si, slot_pos, 4
         return 0, slots[0] if slots else primary_pos, 4
     return best_idx, slots[best_idx], best_rank
+
+
+def _greedy_fill_slots(candidates, slots_only):
+    """여러 후보 선수를 포메이션 슬롯(slots_only, 원본 순서)에 배정한다.
+    각 배정된 선수 dict에 원본 슬롯 인덱스를 "_slot_idx"로 태깅하고,
+    slots_only와 같은 길이의 리스트(빈 자리는 None)를 반환한다.
+
+    [2026-08 버그수정, 신민용 리포트: "상대팀 포메이션에서 RB 의 주포가
+    GK로 뜨고 ST가 CB으로 가며 GK는 클릭해도 스탯이 안 떠"] 예전엔 후보
+    전원을 OVR 내림차순으로 한 번에 훑으면서, 각자 차례가 오면 그 자리에서
+    바로 "정확한 포지션 매치 → 카테고리 매치 → 그냥 첫 빈 슬롯" 순으로
+    즉시 확정지었다. 그런데 스쿼드에 같은 포지션이 몰려있으면(예: GK가
+    상위 OVR 11명 안에 2명 다 들어옴) 두 번째 GK는 정확한 매치도 카테고리
+    매치도 없다(GK 슬롯은 하나뿐이고 이미 찼으므로) — 그래서 "그냥 첫
+    빈 슬롯"으로 강제 확정되는데, 하필 그 자리가 아직 자기 차례가 안 온
+    진짜 RB 선수의 자리였다. 그러면 진짜 RB 선수는 이후 순서에서 밀려나
+    엉뚱한 자리(ST 등)로 떠밀리고, 그 자리에 있던 선수도 또 밀리는 식으로
+    연쇄 오배치가 일어난다. 또한 진짜 GK 슬롯 자체가 다른 잉여 선수에게
+    가로채여 아예 안 채워지는 경우도 있었다(클릭해도 스탯 안 뜨는 원인).
+
+    이제 3단계로 나눠서, 포지션이 정확히/카테고리로 맞는 선수가 항상
+    먼저 자기 자리를 차지하게 하고, 그렇게도 안 맞는 잉여 선수만 맨
+    마지막에 진짜 남는 자리로 보낸다:
+      1) 정확한 포지션 호환(POSITION_COMPAT) 매치만 전원 시도
+      2) 1)에서 못 찾은 선수만 카테고리(GK/DEF/MID/ATK) 매치 시도
+      3) 그래도 남은 선수만 마지막 수단으로 아무 빈 슬롯에 순서대로
+    """
+    slot_filled = [None] * len(slots_only)
+    remaining = sorted(candidates, key=lambda x: -(x.get("ovr", 0) or 0))
+
+    def _find_compat_slot(pl):
+        pos = pl.get("position", "CM")
+        compat = POSITION_COMPAT.get(pos, [pos])
+        best_i, best_rank = None, 999
+        for i, sp in enumerate(slots_only):
+            if slot_filled[i] is None and sp in compat:
+                r = compat.index(sp)
+                if r < best_rank:
+                    best_rank = r; best_i = i
+        return best_i
+
+    def _find_category_slot(pl):
+        cat = _pos_category(pl.get("position", "CM"))
+        for i, sp in enumerate(slots_only):
+            if slot_filled[i] is None and _pos_category(sp) == cat:
+                return i
+        return None
+
+    for phase_fn in (_find_compat_slot, _find_category_slot):
+        still_left = []
+        for pl in remaining:
+            i = phase_fn(pl)
+            if i is not None:
+                slot_filled[i] = pl
+                pl["_slot_idx"] = i
+            else:
+                still_left.append(pl)
+        remaining = still_left
+
+    # 3) 진짜 마지막 수단 — 위 두 단계로도 못 채운 선수는 남은 빈 슬롯에 순서대로.
+    open_idx = [i for i in range(len(slot_filled)) if slot_filled[i] is None]
+    for i, pl in zip(open_idx, remaining):
+        slot_filled[i] = pl
+        pl["_slot_idx"] = i
+
+    return slot_filled
 
 def _row_priority(k):
     # 위(공격)→아래(GK) 순서: ATK=0, MID2=1, MID=2, DEF=3, GK=4

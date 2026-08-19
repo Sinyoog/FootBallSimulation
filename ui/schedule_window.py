@@ -338,6 +338,10 @@ class ScheduleWindow(QDialog):
         import time as _time_sw
         _sw_t0 = _time_sw.perf_counter()
         _sw_marks = []
+        # [2026-08 최적화] 이번 _fill_tabs() 호출 1회 동안만 유효한 캐시 —
+        # _make_champions_tab의 groups/ko 중복 호출 제거용. 자세한 설명은
+        # _make_champions_tab 내부 주석 참고.
+        self._champ_fetch_cache = {}
 
         cur = self._tab.currentIndex()
 
@@ -453,18 +457,24 @@ class ScheduleWindow(QDialog):
         _sw_marks.append(("컵대회 브래킷", _time_sw.perf_counter()))
 
         _sw_total = _sw_marks[-1][1] - _sw_t0
-        # [2026-08 정리, 신민용: "원인 파악 끝났으니 이제 안 찍어도 될듯"]
-        # 국제대회 예선/챔스 탭의 위젯 렌더링 고정비용 문제는 이미 진단
-        # 완료(세계기록실과 동일 원인) — 계속 찍으면 매일 진행마다 콘솔이
-        # 시끄러워지기만 해서 로그만 제거. 계측 코드 자체는 남겨둬서
-        # 필요하면 print 한 줄만 되살리면 된다.
-        # if _sw_total >= 0.05:
-        #     _prev = _sw_t0
-        #     _parts = []
-        #     for _name, _t in _sw_marks:
-        #         _parts.append(f"{_name} {_t-_prev:.3f}s")
-        #         _prev = _t
-        #     print(f"[PERF-SCHED] _fill_tabs 총 {_sw_total:.3f}s — " + " | ".join(_parts))
+        # [2026-08 재계측, 신민용 리포트: "경기 일정 창 켜놓고 진행하면
+        # 렉, 팀 많을수록 심해짐"] 이전 계측(위 주석)은 "탭 렌더링 고정비용"
+        # 결론까지만 냈고, 팀 수 증가에 비례해서 어느 탭이 커지는지는 아직
+        # 실측하지 않았다 — 국내 컵대회 '전체 일정' 탭은 대회 참가팀 수(=
+        # 사실상 그 나라 전체 팀 수)만큼 행이 생기는 유일한 탭이라 유력한
+        # 용의자지만, 감으로 고치지 않고 여기서 행 수까지 같이 찍어서
+        # 확인한다. 0.03초 이상일 때만 찍어 평소엔 조용하다.
+        if _sw_total >= 0.03:
+            _prev = _sw_t0
+            _parts = []
+            for _name, _t in _sw_marks:
+                _parts.append(f"{_name} {_t-_prev:.3f}s")
+                _prev = _t
+            _extra = f" | 내경기={len(my_data)}행 전체일정={len(all_data)}행"
+            if getattr(self, "_last_cup_all_rows", None) is not None:
+                _extra += f" 컵대회(전체)={self._last_cup_all_rows}행"
+            print(f"[PERF-SCHED] _fill_tabs 총 {_sw_total:.3f}s — "
+                  + " | ".join(_parts) + _extra)
 
         if 0 <= cur < self._tab.count():
             self._tab.setCurrentIndex(cur)
@@ -1109,10 +1119,25 @@ class ScheduleWindow(QDialog):
             return None
 
         my_team_id = team_info["id"]
-        _get_matches_fn = getattr(engine, "get_my_champions_matches", None) or \
-                           getattr(engine, "get_my_europa_matches", None) or \
-                           getattr(engine, "get_my_conference_matches", None)
-        matches = _get_matches_fn(st["current_year"])
+        # [2026-08 최적화, 신민용 리포트: "경기 일정 창 켜놓고 진행하면 렉"]
+        # 이 탭은 "groups"/"ko" 두 모드로 각각 호출되는데(챔스/유로파/
+        # 컨퍼런스 3개 대회 × 2모드 = 6번), 예전엔 모드가 달라도 매번
+        # get_my_*_matches/get_my_*_standings를 처음부터 다시 계산했다 —
+        # 같은 _fill_tabs() 호출 안에서 같은 대회(engine)·같은 연도의
+        # 결과는 완전히 동일하므로, _fill_tabs 시작 시 초기화하는
+        # self._champ_fetch_cache에 담아 두 번째 호출(ko 모드)에서
+        # 재사용한다. 데이터/화면 결과는 기존과 100% 동일하다.
+        _cache_key = (id(engine), st["current_year"])
+        _cache = getattr(self, "_champ_fetch_cache", None)
+        if _cache is not None and _cache_key in _cache:
+            matches = _cache[_cache_key]
+        else:
+            _get_matches_fn = getattr(engine, "get_my_champions_matches", None) or \
+                               getattr(engine, "get_my_europa_matches", None) or \
+                               getattr(engine, "get_my_conference_matches", None)
+            matches = _get_matches_fn(st["current_year"])
+            if _cache is not None:
+                _cache[_cache_key] = matches
         if not matches:
             return None
 
@@ -1144,10 +1169,16 @@ class ScheduleWindow(QDialog):
 
         # ── 리그 스테이지 순위표 (2026-07 스위스 방식 개편 - 조별리그 폐지) ──
         # [2026-07] 좌: 순위표 / 우: 경기 일정 2단 분할 — 국제대회 탭과 동일한 개편.
-        _get_standings_fn = getattr(engine, "get_my_cl_league_standings", None) or \
-                            getattr(engine, "get_my_el_league_standings", None) or \
-                            getattr(engine, "get_my_ecl_league_standings", None)
-        league_info = _get_standings_fn(st["current_year"])
+        _standings_cache_key = (id(engine), st["current_year"], "standings")
+        if _cache is not None and _standings_cache_key in _cache:
+            league_info = _cache[_standings_cache_key]
+        else:
+            _get_standings_fn = getattr(engine, "get_my_cl_league_standings", None) or \
+                                getattr(engine, "get_my_el_league_standings", None) or \
+                                getattr(engine, "get_my_ecl_league_standings", None)
+            league_info = _get_standings_fn(st["current_year"])
+            if _cache is not None:
+                _cache[_standings_cache_key] = league_info
         if mode == "groups" and league_info:
             split_row = QHBoxLayout()
             split_row.setSpacing(14)
@@ -1673,6 +1704,12 @@ class ScheduleWindow(QDialog):
         conn.close()
         if not rows:
             return None
+
+        # [2026-08 계측 추가] '전체 일정'(my_view=False) 행 수를 _fill_tabs의
+        # [PERF-SCHED] 로그에 같이 찍기 위해 저장해둔다 — 팀 수 증가가 실제로
+        # 이 탭 크기와 비례하는지 실측으로 확인하기 위함(추측 금지).
+        if not my_view:
+            self._last_cup_all_rows = len(rows)
 
         my_tid = p["current_team_id"]
         if my_view:

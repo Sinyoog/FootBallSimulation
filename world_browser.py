@@ -12,6 +12,65 @@ _sim_all_ai_matches가 리그 구분 없이 실시간으로 결과를 채운다.
 이 모듈의 검색/조회 함수들은 이제 순수 DB 읽기만 한다.
 """
 from database import get_conn
+import json
+
+
+# ─────────────────────────────────────────
+# 최근 검색 기록 (world_browser_window.py 리그/팀/국가 검색 탭 공용)
+# ─────────────────────────────────────────
+# [2026-08 신설, 신민용 요청: "검색창 밑에 최근 검색 버튼들이 쌓이면
+# 좋겠다"] 여기서는 DB 구조를 크게 건드리지 않는다 — 이미 있는 범용
+# key-value 테이블 meta(key,value)를 그대로 재사용해서 kind별로 최근
+# 검색어 목록을 JSON 문자열 하나로 저장한다. 새 테이블을 만들지 않으므로
+# 기존 세이브에도 그대로(마이그레이션 없이) 적용된다.
+_RECENT_SEARCH_MAX = 5
+
+
+def get_recent_searches(kind: str) -> list:
+    """kind: 'league' | 'team' | 'country'. 최근 검색어를 최신순으로 반환."""
+    conn = get_conn()
+    row = conn.execute("SELECT value FROM meta WHERE key=?",
+                        (f"recent_search_{kind}",)).fetchone()
+    conn.close()
+    if not row or not row["value"]:
+        return []
+    try:
+        items = json.loads(row["value"])
+        return items if isinstance(items, list) else []
+    except (ValueError, TypeError):
+        return []
+
+
+def add_recent_search(kind: str, query: str):
+    """검색어를 kind별 최근 목록 맨 앞에 추가(이미 있으면 앞으로 이동),
+    최대 _RECENT_SEARCH_MAX개까지만 보관한다.
+    [2026-08 방어코드 추가, 신민용 리포트: "'list' object has no attribute
+    'strip'"] 호출부(item.data(role))가 역할(role) 번호 충돌로 문자열이
+    아닌 값을 넘기면 여기서 바로 죽었었다 — 호출부 버그(_CLEAN_TEXT_ROLE
+    미사용으로 인한 role 충돌)는 따로 고쳤지만, 같은 클래스의 실수가
+    다른 탭에서 또 나도 게임이 죽지 않고 조용히 무시되도록 여기서도
+    문자열이 아니면 걸러낸다."""
+    if not isinstance(query, str):
+        return
+    query = query.strip()
+    if not query:
+        return
+    items = [q for q in get_recent_searches(kind) if q != query]
+    items.insert(0, query)
+    items = items[:_RECENT_SEARCH_MAX]
+    conn = get_conn()
+    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                 (f"recent_search_{kind}", json.dumps(items, ensure_ascii=False)))
+    conn.commit()
+    conn.close()
+
+
+def clear_recent_searches(kind: str):
+    """리그검색/팀검색/국가검색은 서로 독립적으로 쌓이므로, kind 하나만 지운다."""
+    conn = get_conn()
+    conn.execute("DELETE FROM meta WHERE key=?", (f"recent_search_{kind}",))
+    conn.commit()
+    conn.close()
 
 
 # ─────────────────────────────────────────
