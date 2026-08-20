@@ -880,8 +880,10 @@ class CenterPanel(QWidget):
                 hl.setText(f"🚑 {_days_left_that_day}일 남음")
                 if ml:
                     ml.setText(f"🚑 부상\n{_idetail3}")
+                    # [2026-08 색상 확정, 신민용 최종 승인] 국대 메이저(#ff3333)와
+                    # 겹치지 않게 배경을 더 어두운 적갈색으로 분리.
                     ml.setStyleSheet("color:#ff6666;font-weight:bold;font-size:12px;"
-                                     "background:#3a1a1a;border-radius:4px;padding:4px;")
+                                     "background:#3a2525;border-radius:4px;padding:4px;")
                     ml.show()
                 continue
 
@@ -901,35 +903,47 @@ class CenterPanel(QWidget):
                                          "background:#2a2a2a;border-radius:4px;padding:4px;")
                         ml.show()
                 elif match_info.get("intl"):
-                    # 국가대표 경기 (월드컵/대륙컵/예선)
-                    # [2026-07 색상 규칙 개편, 신민용 요청] 예전엔 국대 경기
-                    # 전부(월드컵/대륙컵/예선) 파란색 하나로 뭉뚱그려 표시됐다.
-                    # 리그=초록, 컵=보라, 챔스=황금과 같은 급으로 나누되,
-                    # 국대 안에서도 월드컵·대륙컵 본선은 주황, 그 외(예선 등)는
-                    # 빨강으로 구분한다 — schedule_window.py의 국제전 탭
-                    # 헤더 색상 규칙과 동일하게 맞춘다.
+                    # 국가대표 경기 (월드컵/대륙컵/예선/지역컵/유로)
+                    # [2026-08 색상 확정, 신민용 최종 승인] 월드컵·대륙
+                    # 네이션스컵 본선(kind: world/continent)은 강렬한
+                    # 레드, 그 외(예선/지역컵/유로 등)는 핑크로 분리한다
+                    # — 예전엔 "그 외"가 전부 부상(#ff6666/#3a1a1a)과
+                    # 똑같은 빨강이라 헷갈렸던 문제를 이 색 개편으로 해결.
                     stage = match_info.get("stage_ko", "")
                     grp   = f" {match_info['grp']}조" if match_info.get("grp") else ""
                     opp   = f"{match_info.get('opp_flag','')}{match_info.get('opp','')}"
                     hl.setText(f"스트레스 +{self._match_stress_preview(p, match_info.get('is_home', False))}")
                     if ml:
                         _is_main = match_info.get("kind") in ("world", "continent")
-                        _txt_c = "#ffaa33" if _is_main else "#ff6666"
-                        _bg_c  = "#3a2a1a" if _is_main else "#3a1a1a"
+                        _txt_c = "#ff3333" if _is_main else "#ff66b2"
+                        _bg_c  = "#3a1a1a" if _is_main else "#3a1a2b"
                         ml.setText(f"🌍 {match_info['league_name']} {stage}{grp}\nvs {opp}")
                         ml.setStyleSheet(f"color:{_txt_c};font-weight:bold;font-size:12px;"
                                          f"background:{_bg_c};border-radius:4px;padding:4px;")
                         ml.show()
                 elif match_info.get("cl"):
-                    # 클럽 대륙 챔피언스리그
+                    # [2026-08 색상 개편, 신민용 최종 승인: "챔스/유로파/
+                    # 컨퍼런스/슈퍼컵이 전부 같은 황금색이라 안 구분된다"]
+                    # cl_kind별로 색을 완전히 분리한다 —
+                    #   챔피언스: 블루, 유로파: 오렌지,
+                    #   컨퍼런스: 리그(초록)와 정반대 톤(짙은 그린 글자 +
+                    #   밝은 연두 배경)으로 의도적으로 확 튀게, 슈퍼컵: 골드.
                     stage = match_info.get("stage_ko", "")
                     opp   = f"{match_info.get('opp_flag','')}{match_info.get('opp','')}"
                     loc   = "홈" if match_info.get("is_home") else "원정"
                     hl.setText(f"스트레스 +{self._match_stress_preview(p, match_info.get('is_home', False))}")
                     if ml:
+                        _CL_KIND_STYLE = {
+                            "champions":  ("#4466ff", "#1a2b3a"),
+                            "europa":     ("#ff7700", "#3a1f1a"),
+                            "conference": ("#215131", "#b8e6c1"),
+                            "super_cup":  ("#ffd700", "#3a321a"),
+                        }
+                        _txt_c, _bg_c = _CL_KIND_STYLE.get(
+                            match_info.get("cl_kind"), ("#ffd24d", "#3a2f1a"))
                         ml.setText(f"🏆 {match_info['league_name']} {stage} ({loc})\nvs {opp}")
-                        ml.setStyleSheet("color:#ffd24d;font-weight:bold;font-size:12px;"
-                                         "background:#3a2f1a;border-radius:4px;padding:4px;")
+                        ml.setStyleSheet(f"color:{_txt_c};font-weight:bold;font-size:12px;"
+                                         f"background:{_bg_c};border-radius:4px;padding:4px;")
                         ml.show()
                 elif match_info.get("cup"):
                     # [2026-07 신설] 국내 컵대회(FA컵식)
@@ -956,8 +970,11 @@ class CenterPanel(QWidget):
                     hl.setText(f"스트레스 +{self._match_stress_preview(p, match_info.get('is_home', False))}")
                     if ml:
                         ml.setText(f"🌍 클럽 월드컵 {stage} ({loc})\nvs {opp_disp}")
-                        ml.setStyleSheet("color:#4dd2ff;font-weight:bold;font-size:12px;"
-                                         "background:#1a2f3a;border-radius:4px;padding:4px;")
+                        # [2026-08 색상 확정, 신민용 최종 승인] 챔피언스가
+                        # 블루(#4466ff)로 바뀌면서 헷갈리지 않게 클럽월드컵은
+                        # 더 밝은 하늘색으로 확실히 구분한다.
+                        ml.setStyleSheet("color:#00bfff;font-weight:bold;font-size:12px;"
+                                         "background:#1a2a3a;border-radius:4px;padding:4px;")
                         ml.show()
                 elif match_info.get("po"):
                     # [2026-07 신설, 승강 플레이오프] 다른 대회들과 동일한
@@ -1031,8 +1048,9 @@ class CenterPanel(QWidget):
                     hl.setText(f"🚌 {loc_txt} (스트레스 -15)")
                     if ml:
                         ml.setText("🛌 대회 전 휴식")
-                        ml.setStyleSheet("color:#99ccff;font-weight:bold;font-size:12px;"
-                                         "background:#1a2a3a;border-radius:4px;padding:4px;")
+                        # [2026-08 색상 확정, 신민용 최종 승인]
+                        ml.setStyleSheet("color:#88bbff;font-weight:bold;font-size:12px;"
+                                         "background:#1a243a;border-radius:4px;padding:4px;")
                         ml.show()
                 else:
                     if ml: ml.hide()

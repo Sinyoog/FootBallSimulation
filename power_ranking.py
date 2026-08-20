@@ -1,53 +1,61 @@
 # -*- coding: utf-8 -*-
 """
-파워랭킹 시스템 (팀 파워랭킹 / 국가 파워랭킹).
+파워랭킹 시스템 (팀 파워랭킹 / 국가 파워랭킹) — v2
 
-[설계 v1, 2026-08 신설 — "세계 축구 기록실 > 파워랭킹" 기반 구축]
-신민용과의 설계 논의를 그대로 코드로 옮긴 것. 핵심 아이디어:
+[설계 v2, 2026-08 — 신민용 "파워랭킹 설계도 v2" 문서를 그대로 코드화]
+v1(단순 Elo + 우승보너스)에서 v2로 전면 개편. 핵심 구조:
 
-    레이팅(끊임없이 움직이는 기초 체력)
-        ↓
-    파워랭킹(연도 경계에서 스냅샷을 찍어 발표하는 결과물)
+    PS(Power Score) = MatchRating(레이어A) + AchievementRating(레이어B)
 
-두 층을 분리한 이유: "20위가 1위를 한 번 이겼다고 바로 1위가 되면 안 된다"는
-요구사항 때문. 레이팅은 매 경기 Elo식으로 조금씩만 움직이고, 파워랭킹은 그
-레이팅에 그 해의 우승 보너스를 얹은 뒤, 작년 스냅샷과 섞어(안정화) 급변을
-한 번 더 눌러준다.
+- 레이어 A: 경기마다 움직이는 매치 Elo. 상대 전력 대비 결과를 반영.
+- 레이어 B: 대회가 끝났을 때 1회 지급되는 성적 보너스. 대회의 "격"에
+  따라 같은 우승도 배점이 다르다(설계 원칙 1).
 
-── 연도 표기 규칙 (신민용 확정) ──────────────────────────────
-모든 대회가 1년 안에 예선~본선을 다 끝내는 이 게임의 특성상:
-    evaluation_year = 실제로 경기를 치른 시즌 연도 (예: 2001)
-    ranking_year    = 그 성적이 반영되어 "발표"되는 연도 (예: 2002, = eval+1)
-"2002년 파워랭킹"은 "2002년에 열린 대회 성적"이 아니라 "2001 시즌 성적을
-반영해 2002년 1월에 발표된 랭킹"이라는 뜻. run_year_end_power_ranking_update()
-를 매년 연도 전환 시점(_end_of_season 근처)에 evaluation_year=(방금 끝난 시즌)
-으로 호출하면 ranking_year는 자동으로 +1 되어 계산·저장된다.
+두 값은 DB에 항상 분리 저장한다(team_power_rating.a_rating/b_rating,
+country_power_rating도 동일) — 밸런스 조정 시 "경기력 문제"인지
+"보너스 문제"인지 구분하기 위함(설계 문서 1장). 화면에 보여주는
+PS = a_rating + b_rating, 스무딩 없음(5.3 확정 — "실제 PS = 표시 PS").
 
-── 지금 이 파일이 하는 것 (1단계 기반) ──────────────────────
-- 팀: 국내리그(시즌 최종 순위 집계) + 컵대회/챔피언스/유로파/컨퍼런스/
-  슈퍼컵/클럽월드컵(실제 경기 결과, cl_matches류 테이블)을 모아 Elo 갱신.
-- 국가: 월드컵/대륙컵(대륙별 4개)/유로/지역컵(코파 아메리카 포함 14개
-  지역, constants.REGION_CUP_NAME 그대로 재사용) 실제 경기 결과를 모아
-  Elo 갱신.
-- 연도 스냅샷 저장 + "이전 순위 조회"(순위 클릭 시 연도별 이력 보여주는
-  UI)용 조회 함수.
+**PS에는 강제 상·하한을 두지 않는다.** 등급(SS~F, 2장)은 저장값이 아니라
+grade_for_ps()로 PS를 읽을 때마다 구간 매핑해서 "표시만" 한다. 예전
+v1에 있던 country seed의 1200~2000 clamp(min/max)는 이번 v2에서 완전히
+제거했다 — 실력 분포가 넓어지면 PS도 그만큼 넓게 퍼지는 게 정상이다.
 
-── 아직 확정 안 한 것 (신민용 설계 노트 원문 그대로, 시뮬레이션 돌리며
-   튜닝 예정 — 아래 상수들에 "TUNE LATER" 표시해둠) ──────────
-- 대회별/지역컵별 정확한 가중치
-- 최근 1년/3년/5년 비율(지금은 안정화 계수 하나로 단순화해둠)
-- 우승/준우승/4강 등 스테이지별 정확한 점수 차이(지금은 "우승 보너스"만
-  구현 — 준우승 이하 세분화는 다음 단계)
-- 랭킹 변동 폭 상한
+── 연도 표기 규칙 (변경 없음) ─────────────────────────────────
+evaluation_year = 실제로 경기를 치른 시즌 연도. ranking_year = eval+1,
+그 성적이 "발표"되는 연도. run_year_end_power_ranking_update()는
+game_engine.py의 연도전환 훅(_advance_week)에서 evaluation_year=(방금
+끝난 시즌)으로 호출된다.
 
-이 파일은 game_engine._end_of_season() 근처에서
-    import power_ranking
-    power_ranking.run_year_end_power_ranking_update(get_conn(), evaluation_year=new_year-1)
-형태로 호출하는 걸 전제로 설계했다(아직 실제 훅 연결은 안 함 — 신민용이
-원할 때 한 줄 추가하면 됨).
+── v2에서 새로 생긴 파이프라인 (연도 1회 처리 순서) ────────────
+1. update_team_ratings_for_year / update_country_ratings_for_year
+   ① 레이어 A: 이 해에 열린 모든 경기를 대회가중치×단계가중치×
+      (동일리그면 ×0.9)를 곱한 K로 대칭 Elo 갱신(3.2). 상한 |Δ|≤25
+      (결승 ≤40), 상한도 좌우 대칭.
+   ② 레이어 B: 대회별 최종 도달 스테이지를 판정해 배점표(3.6/4.4)
+      보너스 지급, 국내리그/지역컵 연속우승 감쇠(3.7/4.7), 예선탈락
+      페널티(4.6).
+2. compute_*_power_rankings: 위에서 쌓인 PS(A+B)에 시즌전환
+   리그레션(5.1 클럽/4.8 국가)을 적용해 "다음 시즌 시작 PS"를 만들고,
+   그 값을 A:B 원래 비율로 재분배해 저장(1장 ①~④ 공식) → 이 값이
+   곧 이번 ranking_year의 발표 PS이자 다음 해 매치 갱신의 출발점.
+
+── 아직 단순화/보류한 부분 (TUNE LATER, 실측 후 보강 대상) ────
+- 리그 레이어A는 경기 단위가 아니라 league_season_standings 집계를
+  '리그 평균 상대'로 근사(경기 수가 너무 많아 DB 부하 문제로 v1부터
+  유지해온 절충 — match_results_archive는 시즌이 쌓이면 프루닝되어
+  나중엔 조회도 안 됨).
+- 개최국 홈보너스(+60) 판정은 아직 안 함 — 항상 홈팀 기준 +40만 적용.
+- 리그파워(3.1b)의 국제실적보정(②)은 최근 5년 레이어B 이력을 단순
+  합산해 근사(원 설계의 시즌별 정밀 감쇠 대신 저장된 team_b_history를
+  그대로 5년치 훑어서 계산).
+- 3.5의 "결승(패)2.0 vs 결승(승)2.5" 두 값 중, 설계 원칙 7(제로섬은
+  반드시 지킨다)을 우선해 결승전 단계가중치는 2.5 하나로 통일했다
+  (한 경기의 Δ_home/Δ_away가 부호만 반대인 동일 값이어야 하므로, 같은
+  경기에 서로 다른 두 배수를 곱하면 그 전제가 깨진다).
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 from database import get_conn
@@ -58,116 +66,209 @@ from constants import (
 
 
 # ══════════════════════════════════════════════════════════════
-# 1. 대회 카테고리 / 가중치 상수 (TUNE LATER — 지금은 합리적인 추정치)
+# 1. 등급(SS~F) ↔ PS 매핑 (2장) — 순수 표시용, PS에 영향 없음
 # ══════════════════════════════════════════════════════════════
 
-# [팀 파워랭킹] 대회 카테고리별 가중치. 리그와 국제대회를 1승=1승으로
-# 취급하면 안 된다는 설계 원칙을 여기 숫자로 반영한다.
-TEAM_COMPETITION_WEIGHT = {
-    "league":         1.0,   # 자국 리그 (경기 수가 압도적으로 많아 기준점 역할)
-    "domestic_cup":   0.6,
-    "champions":      1.6,
-    "europa":         1.1,
-    "conference":     0.8,
-    "super_cup":      0.5,
-    "club_world_cup": 1.8,
-}
-
-# 대회 우승 시 레이팅에 얹는 보너스(대회 가중치에 곱해짐). 준우승/4강 등
-# 단계별 세분화는 2단계 작업 — 지금은 "우승했는가"만 본다.
-TEAM_CHAMPION_BONUS = 40.0
-
-# [국가 파워랭킹] Tier 가중치.
-COUNTRY_TIER_WEIGHT = {
-    "world_cup":   3.0,
-    "continental": 1.8,   # 아시안컵 / 아프리카 네이션스컵 / 남북미 대륙컵 / 유럽 네이션스컵
-    "euro":        1.9,   # 유로(EURO) — 유럽만 별도로 한 번 더 치르는 네이션스컵급 대회
-    "region":      1.0,   # 지역컵 기본값 (REGIONAL_CUP_STRENGTH로 지역마다 보정)
-}
-COUNTRY_CHAMPION_BONUS = 50.0
-
-# 지역컵마다 다른 위상. constants.REGION_CUP_NAME의 키(지역명)를 그대로 쓴다.
-# 코파 아메리카(REGION_CUP_NAME["남미"])는 신민용이 명시적으로 "월드컵 다음
-# 급"이라 했으므로 지역컵 중 유일하게 대륙컵급에 가깝게 높였다.
-# 나머지는 일단 균등(1.0)에 가깝게 두고, "OO컵이 랭킹에 너무 큰/적은 영향을
-# 준다" 싶으면 이 숫자만 개별 조정하면 된다 — 신민용이 설계 논의에서 말한
-# "regional_competition_strength" 값이 바로 이것.
-REGIONAL_CUP_STRENGTH = {
-    "남미":         1.7,   # 코파 아메리카 — 지역컵이지만 사실상 대륙컵급 위상
-    "동아시아":     1.1,
-    "서아시아":     1.0,
-    "동남아시아":   0.9,
-    "남아시아":     0.7,
-    "중앙아시아":   0.7,
-    "북아프리카":   0.9,
-    "서아프리카":   1.1,
-    "동아프리카":   0.8,
-    "남부아프리카": 0.9,
-    "중앙아프리카": 0.7,
-    "중앙아메리카": 1.0,
-    "카리브":       0.7,
-    "오세아니아":   0.8,
-}
+GRADE_BANDS = [
+    ("SS", 2600, None),
+    ("S", 2400, 2599),
+    ("A", 2200, 2399),
+    ("B", 2000, 2199),
+    ("C", 1800, 1999),
+    ("D", 1600, 1799),
+    ("E", 1300, 1599),
+    ("F", None, 1299),
+]
 
 
-def regional_cup_strength(region_name: str) -> float:
-    """REGIONAL_CUP_STRENGTH에 없는 지역이 나중에 추가돼도 죽지 않도록
-    기본값(1.0)을 깔아준다."""
-    return REGIONAL_CUP_STRENGTH.get(region_name, 1.0)
+def grade_for_ps(ps: float) -> str:
+    """PS를 SS~F 구간으로 환산해 표시용 등급을 돌려준다. PS 자체엔 상/하한이
+    없으므로(설계 확정), 구간표 바깥(2900 초과·1300 미만)도 자연스럽게
+    SS/F로 흡수한다 — 등급만 "표시"고 PS는 그대로 저장·연산된다."""
+    for name, lo, hi in GRADE_BANDS:
+        if lo is not None and ps < lo:
+            continue
+        if hi is not None and ps > hi:
+            continue
+        return name
+    return "F"
+
+
+def k_for_grade(grade: str) -> float:
+    return {"SS": 8, "S": 12, "A": 16, "B": 20, "C": 24, "D": 28,
+            "E": 32, "F": 32}.get(grade, 24)
 
 
 # ══════════════════════════════════════════════════════════════
-# 2. Elo 엔진 (순수 함수 — DB 의존 없음)
+# 2. Elo 엔진 (3.2) — 대칭(제로섬) 매치 델타
 # ══════════════════════════════════════════════════════════════
 
-ELO_K_BASE = 24.0   # TUNE LATER: 경기당 최대 변동폭의 기준값
-
-# 팀/국가 레이팅이 없을 때(첫 등장) 깔아줄 기본값. 실제 강함과 무관하게
-# "리그 전체 평균 어딘가"에서 시작하고, 이후 경기 결과가 쌓이며 스스로
-# 제자리를 찾아가게 두는 게 Elo의 기본 철학이다.
-DEFAULT_TEAM_RATING = 1500.0
-DEFAULT_COUNTRY_RATING = 1500.0
-
-# 연도 스냅샷 안정화 계수: 이번 시즌 계산 결과에 몇 %를 반영하고, 작년
-# 스냅샷을 몇 %나 그대로 끌고 올지. "3년 동안 꾸준한 팀"과 "한 번 이변을
-# 낸 팀"을 구분하려는 장치 — 낮출수록(=작년 비중↑) 랭킹이 안정적으로 변함.
-SNAPSHOT_NEW_WEIGHT = 0.65   # TUNE LATER
+HOME_BONUS = 40.0          # 홈팀 기대승률 계산에만 반영, 저장값엔 안 남음
+DELTA_CAP = 25.0           # 경기당 변동폭 상한 (5.2)
+DELTA_CAP_FINAL = 40.0     # 결승/우승전 예외 상한
+SAME_LEAGUE_DISCOUNT = 0.9  # 대륙대항전에서 같은 리그 팀끼리 붙으면 단계가중치에 추가 할인
 
 
-def expected_score(rating_a: float, rating_b: float) -> float:
-    """A가 B를 상대로 이길 '기대 승률'(0~1). 표준 Elo 공식."""
-    return 1.0 / (1.0 + 10 ** ((rating_b - rating_a) / 400.0))
+def expected_score(rating_a: float, rating_b: float, home_bonus: float = 0.0) -> float:
+    return 1.0 / (1.0 + 10 ** (((rating_b) - (rating_a + home_bonus)) / 400.0))
 
 
-def elo_delta(rating_a: float, rating_b: float, actual_score: float,
-              k: float = ELO_K_BASE) -> float:
-    """actual_score: 승=1.0, 무=0.5, 패=0.0 (승부차기도 무승부 90분 뒤
-    패자 쪽에 0.0, 승자 쪽에 1.0으로 취급 — PSO는 '한 골 차 신승'에
-    가깝다고 보는 것이 Elo 세계에서는 일반적)."""
-    return k * (actual_score - expected_score(rating_a, rating_b))
+def match_delta(rating_home: float, rating_away: float, grade_home: str, grade_away: str,
+                 actual_home: float, comp_weight: float, stage_weight: float,
+                 is_final: bool = False, home_bonus: float = HOME_BONUS):
+    """3.2 공식. actual_home: 홈팀 관점 실제결과(R값, 아래 match_result_r 참고).
+    돌려주는 (delta_home, delta_away)는 반드시 부호만 반대인 동일 크기 —
+    한쪽이 얻은 점수는 정확히 반대쪽이 잃는다(설계 원칙 7, 3.2 확정).
+    상한을 자른 뒤에도 대칭이 유지되도록, delta_home을 먼저 자르고
+    delta_away는 그 잘린 값의 부호만 반대로 계산한다."""
+    e_home = expected_score(rating_home, rating_away, home_bonus)
+    k_match = (k_for_grade(grade_home) + k_for_grade(grade_away)) / 2.0
+    raw = k_match * comp_weight * stage_weight * (actual_home - e_home)
+    cap = DELTA_CAP_FINAL if is_final else DELTA_CAP
+    delta_home = max(-cap, min(cap, raw))
+    return delta_home, -delta_home
 
 
-def _match_scores(home_score: int, away_score: int, pso_winner=None,
-                   home_id=None):
-    """(home_score, away_score, pso_winner)로부터 (home측 actual_score,
-    away측 actual_score)를 돌려준다. 무승부인데 pso_winner가 있으면
-    승부차기로 갈린 것으로 보고 승/패로 취급."""
+def match_result_r(home_score: int, away_score: int, pso_winner=None, home_id=None,
+                    is_knockout: bool = False):
+    """3.2 R값 표. is_knockout=True(승부차기가 존재할 수 있는 토너먼트)이고
+    정규시간 무승부 뒤 pso_winner가 있으면 0.75/0.25, 그 외 무승부는 0.5."""
     if home_score is None or away_score is None or home_score < 0 or away_score < 0:
-        return None  # 아직 안 치러진 경기
+        return None
     if home_score > away_score:
-        return (1.0, 0.0)
+        return 1.0
     if home_score < away_score:
-        return (0.0, 1.0)
-    # 90분 무승부
-    if pso_winner:
-        if home_id is not None and pso_winner == home_id:
-            return (1.0, 0.0)
-        return (0.0, 1.0)
-    return (0.5, 0.5)
+        return 0.0
+    if is_knockout and pso_winner:
+        return 0.75 if (home_id is not None and pso_winner == home_id) else 0.25
+    return 0.5
 
 
 # ══════════════════════════════════════════════════════════════
-# 3. 데이터 구조
+# 3. 팀 — 대회/단계 가중치 (3.4/3.5)
+# ══════════════════════════════════════════════════════════════
+
+TEAM_COMPETITION_WEIGHT = {
+    "league": 1.0, "domestic_cup": 0.6, "super_cup": 0.5,
+    "europa": 1.1, "conference": 0.8, "club_world_cup": 1.8,
+    # champions는 대륙별로 다름 → TEAM_CHAMPIONS_WEIGHT_BY_CONTINENT
+}
+TEAM_CHAMPIONS_WEIGHT_BY_CONTINENT = {
+    "유럽": 1.6, "북남미": 1.7, "아시아": 1.6, "아프리카": 1.6,
+}
+
+# stage 라벨(실제 DB에 쓰이는 값: group/league/PO/R16/QF/SF/TP/F)을
+# 3.5 단계가중치로 매핑. 'league'(CL 스위스리그 페이즈)와 'group'은 조별
+# 리그 취급, 'PO'(CL 플레이오프)는 16강급으로 취급, 'TP'(3/4위전)는
+# SF와 같은 급으로 취급(둘 다 "4강까지 갔다"는 사실은 동일).
+_STAGE_WEIGHT = {
+    "group": 1.0, "league": 1.0, "PO": 1.1, "R16": 1.1,
+    "QF": 1.3, "SF": 1.6, "TP": 1.6, "F": 2.5,
+}
+_STAGE_RANK = {  # deepest-stage 판정용 서열 (숫자가 클수록 깊은 라운드)
+    "group": 0, "league": 0, "PO": 1, "R16": 1, "QF": 2, "SF": 3, "TP": 3, "F": 4,
+}
+
+
+def stage_weight_for(stage: str) -> float:
+    return _STAGE_WEIGHT.get(stage, 1.0)
+
+
+# ══════════════════════════════════════════════════════════════
+# 4. 팀 — 레이어B 배점표 (3.6, 하향 조정판)
+# ══════════════════════════════════════════════════════════════
+
+PLACEMENT_BASE_SCORE = {
+    "champion": 40, "runner_up": 24, "semifinal": 12,
+    "quarterfinal": 6, "round16": 3, "group_exit": 1,
+}
+# 리그 순위 보너스는 절대순위가 아니라 백분위(최종순위/참가팀수) 기반.
+LEAGUE_PLACEMENT_BANDS = [  # (백분위 상한, 배점) — 순서대로 첫 매치 채택
+    (0.0, 20),   # 1위(champion) 자체는 별도 처리하지만 안전망으로 포함
+    (0.10, 10),
+    (0.20, 6),
+    (0.25, 3),
+]
+
+
+def league_placement_bonus(final_rank: int, n_teams: int) -> float:
+    if n_teams <= 0:
+        return 0.0
+    if final_rank == 1:
+        return 20.0
+    percentile = final_rank / n_teams
+    for cutoff, score in LEAGUE_PLACEMENT_BANDS[1:]:
+        if percentile <= cutoff:
+            return float(score)
+    return 0.0
+
+
+# 국내리그/지역컵 연속우승 감쇠 (3.7/4.7)
+STREAK_DECAY = {1: 1.0, 2: 0.8, 3: 0.65, 4: 0.55}
+STREAK_DECAY_FLOOR = 0.5  # 5회차 이상
+
+
+def streak_decay_rate(streak_count: int) -> float:
+    return STREAK_DECAY.get(streak_count, STREAK_DECAY_FLOOR if streak_count >= 5 else 1.0)
+
+
+# ══════════════════════════════════════════════════════════════
+# 5. 국가 — 대회 Tier 가중치 (4.2/4.3)
+# ══════════════════════════════════════════════════════════════
+
+COUNTRY_TIER_WEIGHT = {
+    "world_cup": 2.6, "americas_cup": 1.4, "euro": 1.3,
+    "asian_cup": 1.1, "afcon": 1.1,
+}
+# 지역컵 5단계 세분화(4.3). REGION_CUP_NAME의 키(지역명) 기준.
+REGIONAL_CUP_TIER_WEIGHT = {
+    "서아시아": 1.2, "서아프리카": 1.2,
+    "중앙아메리카": 1.1, "오세아니아": 1.1,
+    "동아시아": 1.0, "남부아프리카": 1.0,
+    "동남아시아": 0.9, "북아프리카": 0.9, "중앙아프리카": 0.9,
+    "동아프리카": 0.7, "카리브": 0.8,
+    "중앙아시아": 0.6, "남아시아": 0.6,
+}
+QUALIFIER_FAIL_BASE_PENALTY = -8  # 4.6, 대회가중치를 곱해서 적용
+
+# intl_tournaments.kind → COUNTRY_TIER_WEIGHT 키. euro는 kind='continent'를
+# 대륙컵과 공유하고 name으로만 구분(world_browser 관례와 동일).
+_COUNTRY_KIND_MAP_BY_CONTINENT = {
+    "아시아": "asian_cup", "아프리카": "afcon", "아메리카": "americas_cup", "유럽": None,
+}
+
+
+def _country_tournament_weight(kind: str, name: str) -> Optional[tuple]:
+    """(카테고리키, 가중치)를 돌려준다. region이면 카테고리키='region'이고
+    가중치는 지역컵 세부 테이블(regional_cup_tier_weight)에서 별도 조회."""
+    if kind == "world":
+        return ("world_cup", COUNTRY_TIER_WEIGHT["world_cup"])
+    if kind == "region":
+        return ("region", None)  # 가중치는 지역명 확인 후 결정
+    if kind == "continent":
+        if name and EURO_NAME in name:
+            return ("euro", COUNTRY_TIER_WEIGHT["euro"])
+        # continent 값 자체가 tournament 테이블엔 없으므로 이름으로 유추
+        for region, key in (("아시안컵", "asian_cup"), ("아프리카", "afcon"), ("아메리카", "americas_cup")):
+            if name and region in name:
+                return (key, COUNTRY_TIER_WEIGHT[key])
+        return ("continental_unknown", 1.1)
+    return None  # 예선류(wc_qual/cont_qual/euro_qual)는 레이어B 배점 대상 아님(예선탈락 페널티만 별도 처리)
+
+
+def regional_cup_tier_weight(region_name: str) -> float:
+    return REGIONAL_CUP_TIER_WEIGHT.get(region_name, 0.9)
+
+
+def _region_of_cup_name(tournament_name: str) -> Optional[str]:
+    for region, cup_name in REGION_CUP_NAME.items():
+        if cup_name == tournament_name:
+            return region
+    return None
+
+
+# ══════════════════════════════════════════════════════════════
+# 6. 데이터 구조
 # ══════════════════════════════════════════════════════════════
 
 @dataclass
@@ -181,7 +282,7 @@ class TeamPowerEntry:
     prev_rank: Optional[int] = None
     ranking_year: int = 0
     evaluation_year: int = 0
-    tier: Optional[int] = None  # 현재 소속 리그 등급(1부/2부/...) — 화면 표시용, live join
+    tier: Optional[int] = None
 
 
 @dataclass
@@ -196,26 +297,21 @@ class CountryPowerEntry:
 
 
 # ══════════════════════════════════════════════════════════════
-# 4. DB 스키마
+# 7. DB 스키마
 # ══════════════════════════════════════════════════════════════
-# [주의] 지금은 이 모듈이 처음 쓰일 때 스스로 테이블을 만든다(멱등,
-# CREATE TABLE IF NOT EXISTS). 나중에 정식으로 database.py의 init 흐름에
-# 편입시키고 싶으면 ensure_power_ranking_tables 호출 한 줄을 거기로
-# 옮기기만 하면 된다 — 스키마 정의는 이 파일 안에 그대로 둬도 무방.
 
 def ensure_power_ranking_tables(conn):
     c = conn.cursor()
-    # 레이어 1 — 계속 움직이는 기초 레이팅(연도 구분 없이 딱 1행/팀).
+    # 레이어1(계속 움직이는 기초 레이팅) — v2: A/B 분리 저장.
     c.execute("""CREATE TABLE IF NOT EXISTS team_power_rating(
         team_id INTEGER PRIMARY KEY,
-        rating REAL DEFAULT 1500,
+        a_rating REAL DEFAULT 0, b_rating REAL DEFAULT 0,
         last_updated_year INTEGER DEFAULT 0)""")
     c.execute("""CREATE TABLE IF NOT EXISTS country_power_rating(
         country TEXT PRIMARY KEY,
-        rating REAL DEFAULT 1500,
+        a_rating REAL DEFAULT 0, b_rating REAL DEFAULT 0,
         last_updated_year INTEGER DEFAULT 0)""")
-    # 레이어 2 — 연도별 스냅샷(발표된 파워랭킹). "이전 순위 조회" UI가
-    # 여기서 team_id/country로 연도별 이력을 그대로 긁어간다.
+    # 연도별 스냅샷(발표 파워랭킹) — 표시 PS = a_rating+b_rating, 스무딩 없음(5.3).
     c.execute("""CREATE TABLE IF NOT EXISTS team_power_rankings(
         ranking_year INTEGER, evaluation_year INTEGER,
         team_id INTEGER, team_name TEXT, continent TEXT, country TEXT,
@@ -234,368 +330,733 @@ def ensure_power_ranking_tables(conn):
         ON country_power_rankings(ranking_year, rank)""")
     c.execute("""CREATE INDEX IF NOT EXISTS idx_cpr_country
         ON country_power_rankings(country, ranking_year)""")
+    # 연속우승 카운터 (3.7/4.7)
+    c.execute("""CREATE TABLE IF NOT EXISTS team_league_streak(
+        league_id INTEGER PRIMARY KEY, winner_team_id INTEGER, streak INTEGER DEFAULT 0)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS country_regional_streak(
+        region TEXT PRIMARY KEY, winner_country TEXT, streak INTEGER DEFAULT 0)""")
+    # 리그파워(3.1b) 연도별 캐시
+    c.execute("""CREATE TABLE IF NOT EXISTS league_power(
+        league_id INTEGER, year INTEGER, power REAL,
+        PRIMARY KEY(league_id, year))""")
+    # 팀별 레이어B 획득 이력(리그파워 국제실적보정 ②용, 최근 5년 조회)
+    c.execute("""CREATE TABLE IF NOT EXISTS team_b_history(
+        team_id INTEGER, year INTEGER, b_gain REAL,
+        PRIMARY KEY(team_id, year))""")
     conn.commit()
 
 
 # ══════════════════════════════════════════════════════════════
-# 5. 레이팅 읽기/쓰기 헬퍼
+# 8. 레이팅 읽기/쓰기 헬퍼 (A/B 분리)
 # ══════════════════════════════════════════════════════════════
 
-def _get_team_rating(conn, team_id: int) -> float:
+def _get_team_ab(conn, team_id: int):
     row = conn.execute(
-        "SELECT rating FROM team_power_rating WHERE team_id=?", (team_id,)
+        "SELECT a_rating, b_rating FROM team_power_rating WHERE team_id=?", (team_id,)
     ).fetchone()
-    if row is None:
-        return DEFAULT_TEAM_RATING
-    return row[0]
+    return (row[0], row[1]) if row else (0.0, 0.0)
 
 
-def _set_team_rating(conn, team_id: int, rating: float, year: int):
-    conn.execute("""INSERT INTO team_power_rating(team_id, rating, last_updated_year)
-                     VALUES(?,?,?)
+def _get_team_rating(conn, team_id: int) -> float:
+    a, b = _get_team_ab(conn, team_id)
+    return a + b
+
+
+def _get_team_grade(conn, team_id: int) -> str:
+    return grade_for_ps(_get_team_rating(conn, team_id))
+
+
+def _add_team_a(conn, team_id: int, delta: float, year: int):
+    a, b = _get_team_ab(conn, team_id)
+    conn.execute("""INSERT INTO team_power_rating(team_id, a_rating, b_rating, last_updated_year)
+                     VALUES(?,?,?,?)
                      ON CONFLICT(team_id) DO UPDATE SET
-                        rating=excluded.rating,
-                        last_updated_year=excluded.last_updated_year""",
-                 (team_id, rating, year))
+                        a_rating=excluded.a_rating, last_updated_year=excluded.last_updated_year""",
+                 (team_id, a + delta, b, year))
+
+
+def _add_team_b(conn, team_id: int, delta: float, year: int):
+    a, b = _get_team_ab(conn, team_id)
+    conn.execute("""INSERT INTO team_power_rating(team_id, a_rating, b_rating, last_updated_year)
+                     VALUES(?,?,?,?)
+                     ON CONFLICT(team_id) DO UPDATE SET
+                        b_rating=excluded.b_rating, last_updated_year=excluded.last_updated_year""",
+                 (team_id, a, b + delta, year))
+    conn.execute("""INSERT INTO team_b_history(team_id, year, b_gain) VALUES(?,?,?)
+                     ON CONFLICT(team_id, year) DO UPDATE SET b_gain=b_gain+excluded.b_gain""",
+                 (team_id, year, delta))
+
+
+def _get_country_ab(conn, country: str):
+    row = conn.execute(
+        "SELECT a_rating, b_rating FROM country_power_rating WHERE country=?", (country,)
+    ).fetchone()
+    if row:
+        return (row[0], row[1])
+    return _seed_country_ab(conn, country)
 
 
 def _get_country_rating(conn, country: str) -> float:
-    row = conn.execute(
-        "SELECT rating FROM country_power_rating WHERE country=?", (country,)
-    ).fetchone()
-    if row is None:
-        return _seed_country_rating(conn, country)
-    return row[0]
+    a, b = _get_country_ab(conn, country)
+    return a + b
 
 
-def _fifa_rank_to_seed_rating(fifa_rank: Optional[int]) -> float:
-    """countries.py의 다섯 번째 값(예: ("아르헨티나","🇦🇷","남미","스페인어",1)의
-    1)을 초기 레이팅으로 환산하는 순수 함수. _seed_country_rating(DB에 쓰는
-    버전)과 get_country_power_ranking_seed(DB에 안 쓰고 조회만 하는 버전)가
-    같은 계산식을 공유하도록 분리해뒀다.
-    TUNE LATER: 211개국 스프레드를 1200~2000 사이로 펼치는 계수는 감으로
-    잡은 값 — 실측 후 조정 필요."""
-    fifa_rank = fifa_rank if fifa_rank else 100
-    rating = 2000.0 - (fifa_rank - 1) * 3.5
-    return max(1200.0, min(2000.0, rating))
+def _get_country_grade(conn, country: str) -> str:
+    return grade_for_ps(_get_country_rating(conn, country))
 
 
-def _seed_country_rating(conn, country: str) -> float:
-    """이 나라가 처음 레이팅을 받는 경우, data/countries.py의 fifa_rank를
-    기반으로 초기값을 깔아준다(신민용 설계: "국가 초기 순위는 countries.py를
-    seed로 사용"). fifa_rank가 낮을수록(=강할수록) 레이팅이 높다."""
-    row = conn.execute(
-        "SELECT fifa_rank FROM countries WHERE name=?", (country,)
-    ).fetchone()
-    fifa_rank = row[0] if row and row[0] else 100
-    rating = _fifa_rank_to_seed_rating(fifa_rank)
-    conn.execute("""INSERT INTO country_power_rating(country, rating, last_updated_year)
-                     VALUES(?,?,0)
-                     ON CONFLICT(country) DO NOTHING""", (country, rating))
-    return rating
-
-
-def _set_country_rating(conn, country: str, rating: float, year: int):
-    conn.execute("""INSERT INTO country_power_rating(country, rating, last_updated_year)
-                     VALUES(?,?,?)
+def _add_country_a(conn, country: str, delta: float, year: int):
+    a, b = _get_country_ab(conn, country)
+    conn.execute("""INSERT INTO country_power_rating(country, a_rating, b_rating, last_updated_year)
+                     VALUES(?,?,?,?)
                      ON CONFLICT(country) DO UPDATE SET
-                        rating=excluded.rating,
-                        last_updated_year=excluded.last_updated_year""",
-                 (country, rating, year))
+                        a_rating=excluded.a_rating, last_updated_year=excluded.last_updated_year""",
+                 (country, a + delta, b, year))
+
+
+def _add_country_b(conn, country: str, delta: float, year: int):
+    a, b = _get_country_ab(conn, country)
+    conn.execute("""INSERT INTO country_power_rating(country, a_rating, b_rating, last_updated_year)
+                     VALUES(?,?,?,?)
+                     ON CONFLICT(country) DO UPDATE SET
+                        b_rating=excluded.b_rating, last_updated_year=excluded.last_updated_year""",
+                 (country, a, b + delta, year))
 
 
 # ══════════════════════════════════════════════════════════════
-# 6. 팀 레이어 1 — 이번 시즌 경기 결과로 레이팅 갱신
+# 9. 초기 시드 (3.1/3.1b/4.1) — 상/하한 없음
 # ══════════════════════════════════════════════════════════════
 
-# cl/el/ecl/cwc/sc는 스키마가 전부 동일(tournament_id, stage, home_team_id,
-# away_team_id, home_score, away_score, pso_winner) — 테이블명만 갈아끼워
-# 하나의 함수로 처리한다. cup_engine(국내컵)만 round_name/round_idx를 쓰지만
-# 필요한 컬럼(팀/스코어/승부차기)은 동일해서 그대로 재사용 가능.
-_CLUB_COMP_TABLES = {
-    "champions":      ("cl_tournaments", "cl_matches"),
-    "europa":         ("el_tournaments", "el_matches"),
-    "conference":     ("ecl_tournaments", "ecl_matches"),
-    "club_world_cup": ("cwc_tournaments", "cwc_matches"),
-    "super_cup":      ("sc_tournaments", "sc_matches"),
-    "domestic_cup":   ("cup_tournaments", "cup_matches"),
+SEED_BASE = 1400.0
+SEED_OVR_COEF = 30.0
+LEAGUE_POWER_ALPHA = 15.0
+LEAGUE_POWER_INTL_SHARE = 0.15  # ②의 비중(85:15)
+LEAGUE_POWER_INTL_CAP = 80.0
+COUNTRY_CONTINENT_BONUS = {
+    "유럽": 60, "남미": 60, "아프리카": 20, "북미": 20,
+    "아시아": 0, "오세아니아": 0,
 }
 
 
-def _update_team_elo_from_matches(conn, matches_table: str, tournament_id: int,
-                                   year: int, weight: float):
-    """matches_table 하나(한 대회)의 실제 경기 전부를 순서대로 훑으며
-    Elo를 갱신한다. 실제 맞대결 상대 레이팅을 그대로 쓰므로 리그 집계
-    방식(6-b)보다 정확도가 높다 — 컵/대륙대항전은 경기 수가 적어(많아야
-    수십 경기) 이 방식이 성능 부담 없이 가능하다."""
+def _team_avg_ovr_seed(conn, team_id: int) -> float:
+    row = conn.execute(
+        "SELECT AVG(ovr) FROM ai_players WHERE team_id=?", (team_id,)).fetchone()
+    return row[0] if row and row[0] else 45.0
+
+
+def compute_league_power(conn, year: int) -> dict:
+    """3.1b. 리그별 OVR지표(①, 85%) + 국제실적보정(②, 15%)을 합쳐
+    league_id → 리그등급보정 값을 돌려주고 league_power에 캐시한다.
+    "같은 부(tier)끼리만" 기준평균을 비교한다(1부는 1부끼리)."""
+    leagues = conn.execute("SELECT id, tier FROM leagues").fetchall()
+    if not leagues:
+        return {}
+    # ① 리그별 OVR지표
+    ovr_index = {}
+    for league_id, tier in leagues:
+        teams = conn.execute("SELECT id FROM teams WHERE league_id=?", (league_id,)).fetchall()
+        team_ids = [t[0] for t in teams]
+        if not team_ids:
+            ovr_index[league_id] = None
+            continue
+        ovrs = sorted((_team_avg_ovr_seed(conn, tid) for tid in team_ids), reverse=True)
+        n = len(ovrs)
+        top_n = max(1, round(n * 0.25))
+        avg_all = sum(ovrs) / n
+        avg_top = sum(ovrs[:top_n]) / top_n
+        avg_bottom = sum(ovrs[-top_n:]) / top_n
+        ovr_index[league_id] = avg_all * 0.5 + avg_top * 0.3 + avg_bottom * 0.2
+
+    # 같은 tier끼리 기준 평균
+    tier_of = {lid: tier for lid, tier in leagues}
+    tier_baseline = {}
+    for lid, idx in ovr_index.items():
+        if idx is None:
+            continue
+        t = tier_of[lid]
+        tier_baseline.setdefault(t, []).append(idx)
+    tier_baseline = {t: sum(v) / len(v) for t, v in tier_baseline.items()}
+
+    # ② 국제실적보정 — 최근 5년 team_b_history 감쇠합, 리그로 분배
+    decay_by_age = {1: 1.0, 2: 0.75, 3: 0.5, 4: 0.3, 5: 0.15}
+    result = {}
+    for lid, idx in ovr_index.items():
+        base = 0.0
+        if idx is not None and tier_of[lid] in tier_baseline:
+            base = (idx - tier_baseline[tier_of[lid]]) * LEAGUE_POWER_ALPHA
+        teams = conn.execute("SELECT id FROM teams WHERE league_id=?", (lid,)).fetchall()
+        team_ids = [t[0] for t in teams]
+        intl = 0.0
+        if team_ids:
+            placeholders = ",".join("?" * len(team_ids))
+            rows = conn.execute(
+                f"""SELECT year, SUM(b_gain) FROM team_b_history
+                    WHERE team_id IN ({placeholders}) AND year <= ? AND year > ?
+                    GROUP BY year""",
+                (*team_ids, year, year - 5)).fetchall()
+            total = 0.0
+            for y, gain in rows:
+                age = year - y + 1
+                total += (gain or 0.0) * decay_by_age.get(age, 0.0)
+            intl = (total * 0.10) / len(team_ids)
+        intl = max(-LEAGUE_POWER_INTL_CAP, min(LEAGUE_POWER_INTL_CAP, intl))
+        final = base * (1 - LEAGUE_POWER_INTL_SHARE) + intl * LEAGUE_POWER_INTL_SHARE
+        result[lid] = final
+        conn.execute("""INSERT INTO league_power(league_id, year, power) VALUES(?,?,?)
+                         ON CONFLICT(league_id, year) DO UPDATE SET power=excluded.power""",
+                     (lid, year, final))
+    conn.commit()
+    return result
+
+
+def _team_seed_ab(conn, team_id: int, league_power_cache: dict) -> tuple:
+    """3.1: PS_초기 = 1400 + (OVR-60)×30 + 리그등급보정. 상/하한 없음.
+    시드 전량은 레이어A(경기력)로 잡는다 — 아직 아무 대회 성적도 없는
+    시점이므로 레이어B는 0에서 출발."""
+    row = conn.execute("SELECT league_id FROM teams WHERE id=?", (team_id,)).fetchone()
+    league_id = row[0] if row else None
+    ovr = _team_avg_ovr_seed(conn, team_id)
+    league_adj = league_power_cache.get(league_id, 0.0) if league_id else 0.0
+    ps = SEED_BASE + (ovr - 60.0) * SEED_OVR_COEF + league_adj
+    return (ps, 0.0)
+
+
+def _seed_country_ab(conn, country: str) -> tuple:
+    """[2026-08 수정, 신민용 명시적 확정 — 국가 초기 시드는 반드시
+    countries.py의 다섯 번째 값(fifa_rank)을 그대로 순위로 써야 한다]
+    4.1 문서 원안은 "대표팀 평균 OVR" 기반이었지만, 게임 시작 시점엔
+    ai_players.nationality로 그 나라 대표팀 선수를 안정적으로 특정할 수
+    없어(스쿼드가 아직 안 갖춰진 나라가 많음) 엉뚱한 순서(예: 체코 1위,
+    스코틀랜드 2위)가 나왔다 — fifa_rank는 항상 존재하고 신뢰할 수 있는
+    값이므로 이것을 그대로 초기 강함의 척도로 쓴다. 대륙보정은 유지."""
+    row = conn.execute(
+        "SELECT continent, fifa_rank FROM countries WHERE name=?", (country,)).fetchone()
+    continent = row[0] if row else ""
+    fifa_rank = row[1] if row and row[1] else 100
+    bonus = COUNTRY_CONTINENT_BONUS.get(continent, 0)
+    ps = SEED_BASE + (211 - fifa_rank) * (SEED_OVR_COEF * 39.0 / 210.0) + bonus
+    # (211-fifa_rank)가 0(최하위)~210(1위)로 움직이도록 뒤집고, OVR 스케일
+    # (60~99, 39점 폭)과 비슷한 체감 폭이 나오게 계수를 맞췄다. TUNE LATER.
+    conn.execute("""INSERT INTO country_power_rating(country, a_rating, b_rating, last_updated_year)
+                     VALUES(?,?,0,0) ON CONFLICT(country) DO NOTHING""", (country, ps))
+    return (ps, 0.0)
+
+
+# ══════════════════════════════════════════════════════════════
+# 10. 팀 레이어 A — 매치 결과 반영
+# ══════════════════════════════════════════════════════════════
+
+_CLUB_COMP_TABLES = {
+    "champions": ("cl_tournaments", "cl_matches"),
+    "europa": ("el_tournaments", "el_matches"),
+    "conference": ("ecl_tournaments", "ecl_matches"),
+    "club_world_cup": ("cwc_tournaments", "cwc_matches"),
+    "super_cup": ("sc_tournaments", "sc_matches"),
+    "domestic_cup": ("cup_tournaments", "cup_matches"),
+}
+
+
+def _team_league_of(conn, team_id: int):
+    row = conn.execute("SELECT league_id FROM teams WHERE id=?", (team_id,)).fetchone()
+    return row[0] if row else None
+
+
+def _team_continent_for_champions(conn, team_id: int) -> Optional[str]:
+    row = conn.execute(
+        """SELECT cn.continent FROM teams t JOIN countries cn ON t.country_id=cn.id
+           WHERE t.id=?""", (team_id,)).fetchone()
+    if not row:
+        return None
+    continent = row[0]
+    if continent in ("아시아", "오세아니아"):
+        return "아시아"
+    if continent in ("북미", "남미"):
+        return "북남미"
+    return continent
+
+
+def _update_team_a_from_matches(conn, matches_table: str, tournament_id: int, year: int,
+                                 comp_weight: float, use_stage_col: bool = True,
+                                 discount_same_league: bool = False):
+    stage_col = "stage" if use_stage_col else "round_idx"
     rows = conn.execute(
-        f"""SELECT home_team_id, away_team_id, home_score, away_score, pso_winner
-            FROM {matches_table} WHERE tournament_id=?
-            ORDER BY id ASC""", (tournament_id,)).fetchall()
-    for r in rows:
-        home_id, away_id, hs, as_, pso = r[0], r[1], r[2], r[3], r[4]
+        f"""SELECT home_team_id, away_team_id, home_score, away_score, pso_winner, {stage_col}
+            FROM {matches_table} WHERE tournament_id=? ORDER BY id ASC""",
+        (tournament_id,)).fetchall()
+    for home_id, away_id, hs, as_, pso, stage in rows:
         if not home_id or not away_id:
             continue
-        outcome = _match_scores(hs, as_, pso, home_id)
-        if outcome is None:
+        r = match_result_r(hs, as_, pso, home_id, is_knockout=True)
+        if r is None:
             continue
-        home_actual, away_actual = outcome
-        rh = _get_team_rating(conn, home_id)
-        ra = _get_team_rating(conn, away_id)
-        dh = elo_delta(rh, ra, home_actual, k=ELO_K_BASE * weight)
-        da = elo_delta(ra, rh, away_actual, k=ELO_K_BASE * weight)
-        _set_team_rating(conn, home_id, rh + dh, year)
-        _set_team_rating(conn, away_id, ra + da, year)
+        if use_stage_col:
+            sw = stage_weight_for(stage)
+            is_final = (stage == "F")
+        else:
+            sw = 1.2  # 국내컵은 round_idx만 있어 세부 단계가중치 대신 완만한 고정값 사용
+            is_final = False
+        if discount_same_league and _team_league_of(conn, home_id) == _team_league_of(conn, away_id):
+            sw *= SAME_LEAGUE_DISCOUNT
+        rh, ra = _get_team_rating(conn, home_id), _get_team_rating(conn, away_id)
+        gh, ga = grade_for_ps(rh), grade_for_ps(ra)
+        d_home, d_away = match_delta(rh, ra, gh, ga, r, comp_weight, sw, is_final=is_final)
+        _add_team_a(conn, home_id, d_home, year)
+        _add_team_a(conn, away_id, d_away, year)
 
 
-def _update_team_elo_from_league(conn, evaluation_year: int):
-    """리그는 한 시즌에 수백~수천 경기가 나올 수 있어 경기 단위로 도는 대신
-    league_season_standings(팀별 승/무/패 집계)를 '가상 라운드로빈'처럼
-    풀어서 Elo를 갱신한다 — 실제 상대는 리그 평균 레이팅으로 근사한다.
-    TUNE LATER: 원한다면 나중에 match_results_archive를 직접 순회하는
-    정밀 버전으로 교체 가능(다만 리그 수가 많아 연산량이 커짐에 유의)."""
+def _update_team_a_from_league(conn, evaluation_year: int):
+    """리그는 경기 단위 대신 league_season_standings 집계를 '리그 평균
+    상대'로 근사(TUNE LATER, 상단 docstring 참고). 단계가중치는 1.0 고정."""
     rows = conn.execute(
         """SELECT team_id, wins, draws, losses
-           FROM league_season_standings WHERE year=?""", (evaluation_year,)
-    ).fetchall()
+           FROM league_season_standings WHERE year=?""", (evaluation_year,)).fetchall()
     if not rows:
         return
-    league_avg = sum(_get_team_rating(conn, r[0]) for r in rows) / len(rows)
+    ratings = {tid: _get_team_rating(conn, tid) for tid, *_ in rows}
+    league_avg = sum(ratings.values()) / len(ratings)
     w = TEAM_COMPETITION_WEIGHT["league"]
     for team_id, wins, draws, losses in rows:
-        rating = _get_team_rating(conn, team_id)
-        # 승/무/패를 각각 "리그 평균 상대와 한 경기씩 치른 것"으로 근사.
+        rating = ratings[team_id]
+        grade = grade_for_ps(rating)
+        avg_grade = grade_for_ps(league_avg)
         n_games = (wins or 0) + (draws or 0) + (losses or 0)
         if n_games == 0:
             continue
         actual_points = (wins or 0) * 1.0 + (draws or 0) * 0.5
-        expected_points = expected_score(rating, league_avg) * n_games
-        delta = (ELO_K_BASE * w) * (actual_points - expected_points) / max(1, n_games) \
-                * min(n_games, 10) / 10  # 경기 수가 적어도 한 번에 과도하게 안 튀도록 완충
-        _set_team_rating(conn, team_id, rating + delta, evaluation_year)
-
-
-def _team_champion_bonus_events(conn, evaluation_year: int):
-    """이번 시즌 각 대회 winner_team_id를 모아 (team_id, category) 목록으로.
-    trophy_log이 아니라 각 *_tournaments.winner_team_id를 직접 읽는다 —
-    trophy_log은 team_name(문자열)만 있어 동명 팀 충돌 위험이 있는 반면,
-    winner_team_id는 teams.id를 그대로 참조해 더 안전하다."""
-    events = []
-    for category, (tournaments_table, _matches_table) in _CLUB_COMP_TABLES.items():
-        rows = conn.execute(
-            f"""SELECT id, winner_team_id FROM {tournaments_table}
-                WHERE year=? AND winner_team_id IS NOT NULL AND winner_team_id != 0""",
-            (evaluation_year,)).fetchall()
-        for tid, winner_team_id in rows:
-            events.append((winner_team_id, category, tid))
-    return events
+        e = expected_score(rating, league_avg)
+        expected_points = e * n_games
+        k_match = (k_for_grade(grade) + k_for_grade(avg_grade)) / 2.0
+        raw = k_match * w * (actual_points - expected_points) / max(1, n_games) \
+              * min(n_games, 10) / 10
+        delta = max(-DELTA_CAP, min(DELTA_CAP, raw))
+        _add_team_a(conn, team_id, delta, evaluation_year)
 
 
 def update_team_ratings_for_year(conn, evaluation_year: int):
-    """레이어 1 갱신 진입점: evaluation_year 한 해 동안 열린 모든 팀 대회의
-    실제 결과를 반영해 team_power_rating을 움직인다."""
     ensure_power_ranking_tables(conn)
-
-    # 1) 리그 (집계 기반)
-    _update_team_elo_from_league(conn, evaluation_year)
-
-    # 2) 컵/챔피언스/유로파/컨퍼런스/슈퍼컵/클럽월드컵 (경기 기반)
+    _update_team_a_from_league(conn, evaluation_year)
     for category, (tournaments_table, matches_table) in _CLUB_COMP_TABLES.items():
-        weight = TEAM_COMPETITION_WEIGHT[category]
-        tids = conn.execute(
-            f"SELECT id FROM {tournaments_table} WHERE year=?", (evaluation_year,)
-        ).fetchall()
-        for (tid,) in tids:
-            _update_team_elo_from_matches(conn, matches_table, tid, evaluation_year, weight)
-
-    # 3) 우승 보너스 (준우승 이하 세분화는 다음 단계 — 설계 노트 참고)
-    for team_id, category, _tid in _team_champion_bonus_events(conn, evaluation_year):
-        rating = _get_team_rating(conn, team_id)
-        bonus = TEAM_CHAMPION_BONUS * TEAM_COMPETITION_WEIGHT[category]
-        _set_team_rating(conn, team_id, rating + bonus, evaluation_year)
-
+        tids_rows = conn.execute(
+            f"SELECT id, continent FROM {tournaments_table} WHERE year=?"
+            if category == "champions" else
+            f"SELECT id, NULL FROM {tournaments_table} WHERE year=?",
+            (evaluation_year,)).fetchall()
+        for tid, continent in tids_rows:
+            if category == "champions":
+                weight = TEAM_CHAMPIONS_WEIGHT_BY_CONTINENT.get(continent, 1.6)
+            else:
+                weight = TEAM_COMPETITION_WEIGHT[category]
+            _update_team_a_from_matches(
+                conn, matches_table, tid, evaluation_year, weight,
+                use_stage_col=(category != "domestic_cup"),
+                discount_same_league=(category in ("champions", "europa", "conference")))
     conn.commit()
 
 
 # ══════════════════════════════════════════════════════════════
-# 7. 국가 레이어 1 — 이번 시즌 A매치 결과로 레이팅 갱신
+# 11. 팀 레이어 B — 대회 성적 보너스 (3.6/3.7)
 # ══════════════════════════════════════════════════════════════
 
-def _intl_tournament_category(kind: str, name: str) -> Optional[str]:
-    """intl_tournaments.kind(+name)를 국가 파워랭킹용 카테고리로 매핑.
-    예선(wc_qual/cont_qual/euro_qual)은 아직 반영하지 않는다(TUNE LATER —
-    예선 탈락도 성적에 넣고 싶으면 여기서 별도 약한 가중치로 추가 가능)."""
-    if kind == "world":
-        return "world_cup"
-    if kind == "region":
-        return "region"
-    if kind == "continent":
-        # euro는 kind='continent'를 대륙컵과 공유하고 name으로만 구분된다
-        # (constants.py의 world_browser._effective_kind와 동일한 판별 방식).
-        if name and EURO_NAME in name:
-            return "euro"
-        return "continental"
-    return None  # wc_qual / cont_qual / euro_qual 등 예선류는 지금은 skip
-
-
-def _country_region_of(tournament_name: str) -> Optional[str]:
-    """지역컵 대회명(REGION_CUP_NAME의 값, 예: '코파 아메리카')으로부터
-    REGIONAL_CUP_STRENGTH 조회용 지역명(키, 예: '남미')을 역으로 찾는다."""
-    for region, cup_name in REGION_CUP_NAME.items():
-        if cup_name == tournament_name:
-            return region
-    return None
-
-
-def _update_country_elo_from_matches(conn, tournament_id: int, year: int, weight: float):
+def _deepest_stage_participants(conn, matches_table: str, tournament_id: int, use_stage_col=True):
+    """토너먼트의 실제 경기를 훑어 참가자별 '도달한 최고 단계'를 판정한다.
+    반환: {team_id: tier_label}, tier_label ∈
+    champion/runner_up/semifinal/quarterfinal/round16/group_exit"""
+    stage_col = "stage" if use_stage_col else "round_idx"
     rows = conn.execute(
-        """SELECT home, away, home_score, away_score, pso_winner
+        f"""SELECT home_team_id, away_team_id, home_score, away_score, pso_winner, {stage_col}
+            FROM {matches_table} WHERE tournament_id=?""", (tournament_id,)).fetchall()
+    if not rows:
+        return {}
+    if use_stage_col:
+        best_rank = {}
+        final_match = None
+        for home_id, away_id, hs, as_, pso, stage in rows:
+            if hs is None or as_ is None or hs < 0 or as_ < 0:
+                continue
+            rank = _STAGE_RANK.get(stage, 0)
+            for tid in (home_id, away_id):
+                if tid:
+                    best_rank[tid] = max(best_rank.get(tid, -1), rank)
+            if stage == "F":
+                final_match = (home_id, away_id, hs, as_, pso)
+        result = {}
+        for tid, rank in best_rank.items():
+            if rank == 4:
+                if final_match and tid in final_match[:2]:
+                    home_id, away_id, hs, as_, pso = final_match
+                    winner_is_home = (hs > as_) or (hs == as_ and pso == home_id)
+                    won = (tid == home_id) == winner_is_home
+                    result[tid] = "champion" if won else "runner_up"
+            elif rank == 3:
+                result[tid] = "semifinal"
+            elif rank == 2:
+                result[tid] = "quarterfinal"
+            elif rank == 1:
+                result[tid] = "round16"
+            else:
+                result[tid] = "group_exit"
+        return result
+    else:
+        # 국내컵: round_idx 상대 서열(가장 큰 값=결승)로 근사
+        idxs = sorted({r[5] for r in rows if r[5] is not None}, reverse=True)
+        rank_of_idx = {idx: min(i, 4) for i, idx in enumerate(idxs)}  # 0=F,1=SF,2=QF,3=R16,4+=조별
+        best_rank = {}
+        final_match = None
+        for home_id, away_id, hs, as_, pso, idx in rows:
+            if hs is None or as_ is None or hs < 0 or as_ < 0 or idx is None:
+                continue
+            rank = 4 - rank_of_idx.get(idx, 4)  # 뒤집어서 크게=깊은 라운드로 통일
+            for tid in (home_id, away_id):
+                if tid:
+                    best_rank[tid] = max(best_rank.get(tid, -1), rank)
+            if rank_of_idx.get(idx) == 0:
+                final_match = (home_id, away_id, hs, as_, pso)
+        result = {}
+        for tid, rank in best_rank.items():
+            if rank == 4 and final_match and tid in final_match[:2]:
+                home_id, away_id, hs, as_, pso = final_match
+                winner_is_home = (hs > as_) or (hs == as_ and pso == home_id)
+                won = (tid == home_id) == winner_is_home
+                result[tid] = "champion" if won else "runner_up"
+            elif rank == 3:
+                result[tid] = "semifinal"
+            elif rank == 2:
+                result[tid] = "quarterfinal"
+            elif rank == 1:
+                result[tid] = "round16"
+            else:
+                result[tid] = "group_exit"
+        return result
+
+
+def _apply_team_league_streak(conn, league_id: int, champion_team_id: int) -> float:
+    """3.7 — 리그 우승 연속 감쇠율을 돌려주고 카운터를 갱신한다."""
+    row = conn.execute(
+        "SELECT winner_team_id, streak FROM team_league_streak WHERE league_id=?",
+        (league_id,)).fetchone()
+    if row and row[0] == champion_team_id:
+        streak = row[1] + 1
+    else:
+        streak = 1
+    conn.execute("""INSERT INTO team_league_streak(league_id, winner_team_id, streak)
+                     VALUES(?,?,?)
+                     ON CONFLICT(league_id) DO UPDATE SET
+                        winner_team_id=excluded.winner_team_id, streak=excluded.streak""",
+                 (league_id, champion_team_id, streak))
+    return streak_decay_rate(streak)
+
+
+def update_team_b_for_year(conn, evaluation_year: int):
+    # 1) 국내리그 순위 보너스(백분위 기반) + 연속우승 감쇠
+    rows = conn.execute(
+        """SELECT l.id, s.team_id, s.wins, s.draws, s.losses
+           FROM league_season_standings s JOIN leagues l ON s.league_id = l.id
+           WHERE s.year=?""", (evaluation_year,)).fetchall()
+    by_league = {}
+    for league_id, team_id, wins, draws, losses in rows:
+        pts = (wins or 0) * 3 + (draws or 0)
+        by_league.setdefault(league_id, []).append((team_id, pts))
+    for league_id, standings in by_league.items():
+        standings.sort(key=lambda x: x[1], reverse=True)
+        n = len(standings)
+        champion_id = standings[0][0] if standings else None
+        decay = _apply_team_league_streak(conn, league_id, champion_id) if champion_id else 1.0
+        for rank, (team_id, _pts) in enumerate(standings, start=1):
+            bonus = league_placement_bonus(rank, n)
+            if bonus <= 0:
+                continue
+            if rank == 1:
+                bonus *= decay
+            _add_team_b(conn, team_id, bonus * TEAM_COMPETITION_WEIGHT["league"], evaluation_year)
+
+    # 2) 국제/국내컵 계열 대회 성적 보너스 (deepest-stage 판정)
+    for category, (tournaments_table, matches_table) in _CLUB_COMP_TABLES.items():
+        rows = conn.execute(
+            f"SELECT id, {'continent' if category == 'champions' else 'NULL'} "
+            f"FROM {tournaments_table} WHERE year=?", (evaluation_year,)).fetchall()
+        for tid, continent in rows:
+            weight = (TEAM_CHAMPIONS_WEIGHT_BY_CONTINENT.get(continent, 1.6)
+                      if category == "champions" else TEAM_COMPETITION_WEIGHT[category])
+            placements = _deepest_stage_participants(
+                conn, matches_table, tid, use_stage_col=(category != "domestic_cup"))
+            for team_id, tier in placements.items():
+                base = PLACEMENT_BASE_SCORE[tier]
+                _add_team_b(conn, team_id, base * weight, evaluation_year)
+
+
+# ══════════════════════════════════════════════════════════════
+# 12. 국가 레이어 A/B
+# ══════════════════════════════════════════════════════════════
+
+def _intl_tournament_weight_key(kind: str, name: str):
+    return _country_tournament_weight(kind, name)
+
+
+def _update_country_a_from_matches(conn, tournament_id: int, year: int, weight: float,
+                                    stage_weight_override: Optional[float] = None):
+    rows = conn.execute(
+        """SELECT home, away, home_score, away_score, pso_winner, stage
            FROM intl_matches WHERE tournament_id=? ORDER BY id ASC""",
         (tournament_id,)).fetchall()
-    for home, away, hs, as_, pso in rows:
+    for home, away, hs, as_, pso, stage in rows:
         if not home or not away:
             continue
-        outcome = _match_scores(hs, as_, pso, home)  # pso_winner는 국가명(TEXT) 그대로 비교
-        if outcome is None:
+        r = match_result_r(hs, as_, pso, home, is_knockout=True)
+        if r is None:
             continue
-        home_actual, away_actual = outcome
-        rh = _get_country_rating(conn, home)
-        ra = _get_country_rating(conn, away)
-        dh = elo_delta(rh, ra, home_actual, k=ELO_K_BASE * weight)
-        da = elo_delta(ra, rh, away_actual, k=ELO_K_BASE * weight)
-        _set_country_rating(conn, home, rh + dh, year)
-        _set_country_rating(conn, away, ra + da, year)
-
-
-def _country_champion_bonus_events(conn, evaluation_year: int):
-    rows = conn.execute(
-        """SELECT kind, name, winner FROM intl_tournaments
-           WHERE year=? AND winner IS NOT NULL AND winner != ''""",
-        (evaluation_year,)).fetchall()
-    events = []
-    for kind, name, winner in rows:
-        category = _intl_tournament_category(kind, name)
-        if category is None:
-            continue
-        if category == "region":
-            region = _country_region_of(name)
-            strength = regional_cup_strength(region) if region else 1.0
-        else:
-            strength = 1.0
-        events.append((winner, category, strength))
-    return events
+        sw = stage_weight_override if stage_weight_override is not None else stage_weight_for(stage)
+        is_final = (stage == "F")
+        rh, ra = _get_country_rating(conn, home), _get_country_rating(conn, away)
+        gh, ga = grade_for_ps(rh), grade_for_ps(ra)
+        d_home, d_away = match_delta(rh, ra, gh, ga, r, weight, sw, is_final=is_final)
+        _add_country_a(conn, home, d_home, year)
+        _add_country_a(conn, away, d_away, year)
 
 
 def update_country_ratings_for_year(conn, evaluation_year: int):
     ensure_power_ranking_tables(conn)
-
     rows = conn.execute(
         "SELECT id, kind, name FROM intl_tournaments WHERE year=?", (evaluation_year,)
     ).fetchall()
     for tid, kind, name in rows:
-        category = _intl_tournament_category(kind, name)
-        if category is None:
+        wk = _intl_tournament_weight_key(kind, name)
+        if wk is None:
+            # 예선류 — 개별 경기는 그래도 레이어A로 실시간 반영(4.6)
+            if kind and kind.endswith("_qual"):
+                base_kind = kind[:-5]
+                base_weight = {"wc": 2.6, "cont": 1.1, "euro": 1.3}.get(base_kind, 1.0)
+                is_playoff_final = False  # 세부 판별은 TUNE LATER, 기본 1.0으로 처리
+                _update_country_a_from_matches(
+                    conn, tid, evaluation_year, base_weight,
+                    stage_weight_override=1.2 if is_playoff_final else 1.0)
             continue
+        category, weight = wk
         if category == "region":
-            region = _country_region_of(name)
-            weight = COUNTRY_TIER_WEIGHT["region"] * regional_cup_strength(region if region else "")
-        else:
-            weight = COUNTRY_TIER_WEIGHT[category]
-        _update_country_elo_from_matches(conn, tid, evaluation_year, weight)
+            region = _region_of_cup_name(name)
+            weight = regional_cup_tier_weight(region) if region else 0.9
+        _update_country_a_from_matches(conn, tid, evaluation_year, weight)
+    conn.commit()
 
-    for winner, category, strength in _country_champion_bonus_events(conn, evaluation_year):
-        rating = _get_country_rating(conn, winner)
+
+def _apply_country_regional_streak(conn, region: str, champion_country: str) -> float:
+    row = conn.execute(
+        "SELECT winner_country, streak FROM country_regional_streak WHERE region=?",
+        (region,)).fetchone()
+    streak = row[1] + 1 if (row and row[0] == champion_country) else 1
+    conn.execute("""INSERT INTO country_regional_streak(region, winner_country, streak)
+                     VALUES(?,?,?)
+                     ON CONFLICT(region) DO UPDATE SET
+                        winner_country=excluded.winner_country, streak=excluded.streak""",
+                 (region, champion_country, streak))
+    return streak_decay_rate(streak)
+
+
+def update_country_b_for_year(conn, evaluation_year: int):
+    rows = conn.execute(
+        "SELECT id, kind, name FROM intl_tournaments WHERE year=?", (evaluation_year,)
+    ).fetchall()
+    # 이 해에 열린 예선 목록(4.6 페널티 판정용) — kind가 *_qual인 것들
+    qual_rows = [(tid, kind, name) for tid, kind, name in rows if kind and kind.endswith("_qual")]
+    main_rows = [(tid, kind, name) for tid, kind, name in rows if not (kind and kind.endswith("_qual"))]
+
+    for tid, kind, name in main_rows:
+        wk = _intl_tournament_weight_key(kind, name)
+        if wk is None:
+            continue
+        category, weight = wk
+        region = None
         if category == "region":
-            bonus = COUNTRY_CHAMPION_BONUS * COUNTRY_TIER_WEIGHT["region"] * strength
-        else:
-            bonus = COUNTRY_CHAMPION_BONUS * COUNTRY_TIER_WEIGHT[category]
-        _set_country_rating(conn, winner, rating + bonus, evaluation_year)
+            region = _region_of_cup_name(name)
+            weight = regional_cup_tier_weight(region) if region else 0.9
+        placements = _deepest_stage_participants(conn, "intl_matches", tid, use_stage_col=True) \
+            if False else _country_deepest_stage(conn, tid)
+        champion = None
+        for country, tier in placements.items():
+            base = PLACEMENT_BASE_SCORE[tier]
+            decay = 1.0
+            if tier == "champion":
+                champion = country
+                if category == "region" and region:
+                    decay = _apply_country_regional_streak(conn, region, country)
+            _add_country_b(conn, country, base * weight * decay, evaluation_year)
 
+    # 예선 탈락 페널티(4.6): 예선에 참가했지만 같은 해 본선 entries에 없는 국가
+    for qtid, qkind, qname in qual_rows:
+        base_kind = qkind[:-5]
+        main_key, base_weight = {"wc": ("world_cup", 2.6), "cont": (None, 1.1),
+                                  "euro": ("euro", 1.3)}.get(base_kind, (None, 1.0))
+        qual_countries = {r[0] for r in conn.execute(
+            "SELECT DISTINCT country FROM intl_entries WHERE tournament_id=?", (qtid,)).fetchall()}
+        # 같은 해, 같은 계열의 본선 entries
+        main_countries = set()
+        for tid, kind, name in main_rows:
+            if (base_kind == "wc" and kind == "world") or \
+               (base_kind in ("cont", "euro") and kind == "continent"):
+                main_countries |= {r[0] for r in conn.execute(
+                    "SELECT DISTINCT country FROM intl_entries WHERE tournament_id=?",
+                    (tid,)).fetchall()}
+        failed = qual_countries - main_countries
+        for country in failed:
+            _add_country_b(conn, country, QUALIFIER_FAIL_BASE_PENALTY * base_weight, evaluation_year)
+    conn.commit()
+
+
+def _country_deepest_stage(conn, tournament_id: int) -> dict:
+    rows = conn.execute(
+        """SELECT home, away, home_score, away_score, pso_winner, stage
+           FROM intl_matches WHERE tournament_id=?""", (tournament_id,)).fetchall()
+    if not rows:
+        return {}
+    best_rank = {}
+    final_match = None
+    for home, away, hs, as_, pso, stage in rows:
+        if hs is None or as_ is None or hs < 0 or as_ < 0:
+            continue
+        rank = _STAGE_RANK.get(stage, 0)
+        for c in (home, away):
+            if c:
+                best_rank[c] = max(best_rank.get(c, -1), rank)
+        if stage == "F":
+            final_match = (home, away, hs, as_, pso)
+    result = {}
+    for country, rank in best_rank.items():
+        if rank == 4:
+            if final_match and country in final_match[:2]:
+                home, away, hs, as_, pso = final_match
+                winner_is_home = (hs > as_) or (hs == as_ and pso == home)
+                won = (country == home) == winner_is_home
+                result[country] = "champion" if won else "runner_up"
+        elif rank == 3:
+            result[country] = "semifinal"
+        elif rank == 2:
+            result[country] = "quarterfinal"
+        elif rank == 1:
+            result[country] = "round16"
+        else:
+            result[country] = "group_exit"
+    return result
+
+
+# ══════════════════════════════════════════════════════════════
+# 13. 시즌 전환 리그레션 (5.1 클럽 / 4.8 국가) — PS 전체에 적용 후 A:B 재분배
+# ══════════════════════════════════════════════════════════════
+
+REGRESSION_BASE = 0.85          # 클럽 기본 (1-수렴비율)
+SOFT_RESET_TRIGGER_1 = 0.08     # 로스터 OVR 변화율 8%↑ → 수렴비율 0.25
+SOFT_RESET_TRIGGER_2 = 0.15     # 15%↑ → 0.35
+
+
+def _team_ovr_change_rate(conn, team_id: int, prev_year_ovr: Optional[float]) -> float:
+    if not prev_year_ovr:
+        return 0.0
+    cur = _team_avg_ovr_seed(conn, team_id)
+    if prev_year_ovr == 0:
+        return 0.0
+    return abs(cur - prev_year_ovr) / prev_year_ovr
+
+
+def _regress_and_split(ps: float, seed_ps: float, a: float, b: float, convergence: float):
+    """1장 ①~④ 공식: PS 전체에 회귀 적용 후 원래 A:B 비율로 재분배."""
+    new_ps = ps * (1 - convergence) + seed_ps * convergence
+    if ps == 0:
+        return new_ps, 0.0
+    ratio_a = a / ps
+    return new_ps * ratio_a, new_ps * (1 - ratio_a)
+
+
+def apply_team_season_regression(conn, evaluation_year: int, league_power_cache: dict):
+    teams = conn.execute("SELECT id FROM teams").fetchall()
+    for (team_id,) in teams:
+        a, b = _get_team_ab(conn, team_id)
+        ps = a + b
+        seed_ps, _ = _team_seed_ab(conn, team_id, league_power_cache)
+        convergence = 1 - REGRESSION_BASE
+        # 소프트 리셋: 직전 연도 OVR 기록이 team_b_history에는 없으므로,
+        # 간단화: 이번 연도 시드 OVR과 seed_ps 계산에 쓰인 OVR을 직접 비교하는
+        # 대신, 현재 OVR 자체를 다시 조회해 큰 변화가 있었는지는 시드값과
+        # 현재 PS의 괴리 크기로 근사 판단한다(TUNE LATER — 정밀 전년 OVR
+        # 스냅샷 테이블은 다음 단계에서 추가 가능).
+        if seed_ps and ps:
+            drift = abs(ps - seed_ps) / max(abs(seed_ps), 1.0)
+            if drift >= SOFT_RESET_TRIGGER_2:
+                convergence = 0.35
+            elif drift >= SOFT_RESET_TRIGGER_1:
+                convergence = 0.25
+        new_a, new_b = _regress_and_split(ps, seed_ps, a, b, convergence)
+        conn.execute("""UPDATE team_power_rating SET a_rating=?, b_rating=?, last_updated_year=?
+                         WHERE team_id=?""", (new_a, new_b, evaluation_year, team_id))
+    conn.commit()
+
+
+def _country_last_intl_year(conn, country: str, upto_year: int) -> Optional[int]:
+    row = conn.execute(
+        """SELECT MAX(t.year) FROM intl_entries e JOIN intl_tournaments t ON e.tournament_id=t.id
+           WHERE e.country=? AND t.year<=?""", (country, upto_year)).fetchone()
+    return row[0] if row and row[0] else None
+
+
+def apply_country_season_regression(conn, evaluation_year: int):
+    countries = conn.execute("SELECT name FROM countries").fetchall()
+    for (country,) in countries:
+        a, b = _get_country_ab(conn, country)
+        ps = a + b
+        seed_ps, _ = _seed_country_ab(conn, country)
+        last_year = _country_last_intl_year(conn, country, evaluation_year)
+        if last_year is None:
+            convergence = 0.45
+        else:
+            gap = evaluation_year - last_year
+            convergence = {0: 0.15, 1: 0.25, 2: 0.35}.get(gap, 0.45 if gap >= 3 else 0.15)
+        new_a, new_b = _regress_and_split(ps, seed_ps, a, b, convergence)
+        conn.execute("""UPDATE country_power_rating SET a_rating=?, b_rating=?, last_updated_year=?
+                         WHERE country=?""", (new_a, new_b, evaluation_year, country))
     conn.commit()
 
 
 # ══════════════════════════════════════════════════════════════
-# 8. 레이어 2 — 연도 스냅샷 계산 + 저장 (+ 안정화)
+# 14. 스냅샷 계산/저장 (5.3 — 스무딩 없음, 리그레션 후 값 그대로 표시)
 # ══════════════════════════════════════════════════════════════
-
-def _prev_snapshot_rating_team(conn, team_id: int, ranking_year: int) -> Optional[float]:
-    row = conn.execute(
-        """SELECT rating FROM team_power_rankings
-           WHERE team_id=? AND ranking_year=?""", (team_id, ranking_year - 1)
-    ).fetchone()
-    return row[0] if row else None
-
-
-def _prev_snapshot_rating_country(conn, country: str, ranking_year: int) -> Optional[float]:
-    row = conn.execute(
-        """SELECT rating FROM country_power_rankings
-           WHERE country=? AND ranking_year=?""", (country, ranking_year - 1)
-    ).fetchone()
-    return row[0] if row else None
-
 
 def _prev_rank_team(conn, team_id: int, ranking_year: int) -> Optional[int]:
     row = conn.execute(
-        """SELECT rank FROM team_power_rankings
-           WHERE team_id=? AND ranking_year=?""", (team_id, ranking_year - 1)
-    ).fetchone()
+        "SELECT rank FROM team_power_rankings WHERE team_id=? AND ranking_year=?",
+        (team_id, ranking_year - 1)).fetchone()
     return row[0] if row else None
 
 
 def _prev_rank_country(conn, country: str, ranking_year: int) -> Optional[int]:
     row = conn.execute(
-        """SELECT rank FROM country_power_rankings
-           WHERE country=? AND ranking_year=?""", (country, ranking_year - 1)
-    ).fetchone()
+        "SELECT rank FROM country_power_rankings WHERE country=? AND ranking_year=?",
+        (country, ranking_year - 1)).fetchone()
     return row[0] if row else None
 
 
-def _stabilize(raw: float, prev: Optional[float]) -> float:
-    """작년 스냅샷이 있으면 SNAPSHOT_NEW_WEIGHT만큼만 새 값을 반영해
-    급변을 누른다(신민용 요구사항: "강팀을 한 번 잡은 약팀"이 바로
-    최상위로 튀지 않게). 첫 등장이면 그대로 raw를 쓴다."""
-    if prev is None:
-        return raw
-    return SNAPSHOT_NEW_WEIGHT * raw + (1 - SNAPSHOT_NEW_WEIGHT) * prev
-
-
 def compute_team_power_rankings(conn, evaluation_year: int) -> list:
-    """레이어 1 갱신이 끝난 뒤 호출. team_power_rankings에
-    ranking_year = evaluation_year + 1 로 스냅샷을 저장하고, 저장된
-    TeamPowerEntry 리스트(전체, 대륙 무관 정렬)를 돌려준다."""
     ranking_year = evaluation_year + 1
     ensure_power_ranking_tables(conn)
-
     teams = conn.execute(
         """SELECT t.id, t.name, c.continent, c.name
-           FROM teams t
-           JOIN countries c ON t.country_id = c.id""").fetchall()
-
+           FROM teams t JOIN countries c ON t.country_id = c.id""").fetchall()
     entries = []
     for team_id, team_name, continent, country in teams:
-        raw = _get_team_rating(conn, team_id)
-        prev_rating = _prev_snapshot_rating_team(conn, team_id, ranking_year)
-        final_rating = _stabilize(raw, prev_rating)
+        rating = _get_team_rating(conn, team_id)
         entries.append(TeamPowerEntry(
             team_id=team_id, team_name=team_name, continent=continent,
-            country=country, rating=final_rating,
+            country=country, rating=rating,
             ranking_year=ranking_year, evaluation_year=evaluation_year))
-
     entries.sort(key=lambda e: e.rating, reverse=True)
     for i, e in enumerate(entries, start=1):
         e.rank = i
         e.prev_rank = _prev_rank_team(conn, e.team_id, ranking_year)
-
     for e in entries:
         conn.execute("""INSERT INTO team_power_rankings
             (ranking_year, evaluation_year, team_id, team_name, continent, country,
              rating, rank, prev_rank)
             VALUES(?,?,?,?,?,?,?,?,?)
             ON CONFLICT(ranking_year, team_id) DO UPDATE SET
-                evaluation_year=excluded.evaluation_year,
-                team_name=excluded.team_name, continent=excluded.continent,
-                country=excluded.country, rating=excluded.rating,
-                rank=excluded.rank, prev_rank=excluded.prev_rank""",
+                evaluation_year=excluded.evaluation_year, team_name=excluded.team_name,
+                continent=excluded.continent, country=excluded.country,
+                rating=excluded.rating, rank=excluded.rank, prev_rank=excluded.prev_rank""",
             (e.ranking_year, e.evaluation_year, e.team_id, e.team_name,
              e.continent, e.country, e.rating, e.rank, e.prev_rank))
     conn.commit()
@@ -605,31 +1066,24 @@ def compute_team_power_rankings(conn, evaluation_year: int) -> list:
 def compute_country_power_rankings(conn, evaluation_year: int) -> list:
     ranking_year = evaluation_year + 1
     ensure_power_ranking_tables(conn)
-
     countries = conn.execute("SELECT name, continent FROM countries").fetchall()
-
     entries = []
     for country, continent in countries:
-        raw = _get_country_rating(conn, country)
-        prev_rating = _prev_snapshot_rating_country(conn, country, ranking_year)
-        final_rating = _stabilize(raw, prev_rating)
+        rating = _get_country_rating(conn, country)
         entries.append(CountryPowerEntry(
-            country=country, continent=continent, rating=final_rating,
+            country=country, continent=continent, rating=rating,
             ranking_year=ranking_year, evaluation_year=evaluation_year))
-
     entries.sort(key=lambda e: e.rating, reverse=True)
     for i, e in enumerate(entries, start=1):
         e.rank = i
         e.prev_rank = _prev_rank_country(conn, e.country, ranking_year)
-
     for e in entries:
         conn.execute("""INSERT INTO country_power_rankings
             (ranking_year, evaluation_year, country, continent, rating, rank, prev_rank)
             VALUES(?,?,?,?,?,?,?)
             ON CONFLICT(ranking_year, country) DO UPDATE SET
-                evaluation_year=excluded.evaluation_year,
-                continent=excluded.continent, rating=excluded.rating,
-                rank=excluded.rank, prev_rank=excluded.prev_rank""",
+                evaluation_year=excluded.evaluation_year, continent=excluded.continent,
+                rating=excluded.rating, rank=excluded.rank, prev_rank=excluded.prev_rank""",
             (e.ranking_year, e.evaluation_year, e.country, e.continent,
              e.rating, e.rank, e.prev_rank))
     conn.commit()
@@ -637,37 +1091,119 @@ def compute_country_power_rankings(conn, evaluation_year: int) -> list:
 
 
 # ══════════════════════════════════════════════════════════════
-# 9. 오케스트레이터 — 연도 전환 시 호출할 단일 진입점
+# 15. 오케스트레이터
 # ══════════════════════════════════════════════════════════════
 
 def run_year_end_power_ranking_update(conn, evaluation_year: int):
-    """game_engine._advance_week()의 연도 전환 분기(_end_of_season 호출
-    근처)에서 이 한 줄만 추가하면 됨:
+    """game_engine.py 연도전환 훅에서 호출하는 단일 진입점. 순서:
+    레이어A(경기결과) → 레이어B(대회성적) → 시즌전환 리그레션(A:B 재분배)
+    → 스냅샷 저장. evaluation_year=방금 끝난 시즌, ranking_year=eval+1."""
+    ensure_power_ranking_tables(conn)
+    ensure_initial_team_power_ranking(conn)
+    ensure_initial_country_power_ranking(conn)
 
-        power_ranking.run_year_end_power_ranking_update(get_conn(), new_year - 1)
-
-    evaluation_year는 "방금 끝난 시즌"의 연도(= new_year - 1)를 넘긴다.
-    내부적으로 레이어1(레이팅) 갱신 → 레이어2(스냅샷) 계산·저장 순서로
-    진행하고, 최종 ranking_year(=evaluation_year+1) 값을 돌려준다."""
     update_team_ratings_for_year(conn, evaluation_year)
+    update_team_b_for_year(conn, evaluation_year)
     update_country_ratings_for_year(conn, evaluation_year)
+    update_country_b_for_year(conn, evaluation_year)
+
+    league_power_cache = compute_league_power(conn, evaluation_year)
+    apply_team_season_regression(conn, evaluation_year, league_power_cache)
+    apply_country_season_regression(conn, evaluation_year)
+
     compute_team_power_rankings(conn, evaluation_year)
     compute_country_power_rankings(conn, evaluation_year)
     return evaluation_year + 1
 
 
 # ══════════════════════════════════════════════════════════════
-# 10. UI 조회 헬퍼
+# 16. 초기(게임 시작연도) 시드 저장 — countries.py/OVR 기반, DB에 실제 저장
+# ══════════════════════════════════════════════════════════════
+
+def _country_seed_entries(conn) -> list:
+    countries = conn.execute("SELECT name, continent FROM countries").fetchall()
+    entries = []
+    for name, continent in countries:
+        ps, _ = _seed_country_ab(conn, name)
+        entries.append(CountryPowerEntry(
+            country=name, continent=continent or "", rating=ps, rank=0, prev_rank=None,
+            ranking_year=GAME_START_YEAR, evaluation_year=GAME_START_YEAR - 1))
+    entries.sort(key=lambda e: e.rating, reverse=True)
+    for i, e in enumerate(entries, start=1):
+        e.rank = i
+    return entries
+
+
+def ensure_initial_country_power_ranking(conn):
+    ensure_power_ranking_tables(conn)
+    exists = conn.execute(
+        "SELECT 1 FROM country_power_rankings WHERE ranking_year=? LIMIT 1",
+        (GAME_START_YEAR,)).fetchone()
+    if exists:
+        return
+    for e in _country_seed_entries(conn):
+        conn.execute("""INSERT INTO country_power_rankings
+            (ranking_year, evaluation_year, country, continent, rating, rank, prev_rank)
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(ranking_year, country) DO NOTHING""",
+            (e.ranking_year, e.evaluation_year, e.country, e.continent,
+             e.rating, e.rank, e.prev_rank))
+        conn.execute("""INSERT INTO country_power_rating(country, a_rating, b_rating, last_updated_year)
+                         VALUES(?,?,0,0) ON CONFLICT(country) DO NOTHING""",
+                     (e.country, e.rating))
+    conn.commit()
+
+
+def get_country_power_ranking_seed(conn) -> list:
+    return _country_seed_entries(conn)
+
+
+def _team_seed_entries(conn) -> list:
+    league_power_cache = compute_league_power(conn, GAME_START_YEAR - 1)
+    rows = conn.execute(
+        """SELECT t.id, t.name, cn.continent, cn.name, t.current_tier
+           FROM teams t JOIN countries cn ON t.country_id = cn.id""").fetchall()
+    entries = []
+    for team_id, name, continent, country, tier in rows:
+        ps, _ = _team_seed_ab(conn, team_id, league_power_cache)
+        entries.append(TeamPowerEntry(
+            team_id=team_id, team_name=name, continent=continent or "",
+            country=country or "", rating=ps, rank=0, prev_rank=None,
+            ranking_year=GAME_START_YEAR, evaluation_year=GAME_START_YEAR - 1, tier=tier))
+    # OVR로 이미 산출된 PS 기준 정렬 + tier 타이브레이크(1부가 2부보다 위)
+    entries.sort(key=lambda e: (-e.rating, e.tier if e.tier else 99, e.team_id))
+    for i, e in enumerate(entries, start=1):
+        e.rank = i
+    return entries
+
+
+def ensure_initial_team_power_ranking(conn):
+    ensure_power_ranking_tables(conn)
+    exists = conn.execute(
+        "SELECT 1 FROM team_power_rankings WHERE ranking_year=? LIMIT 1",
+        (GAME_START_YEAR,)).fetchone()
+    if exists:
+        return
+    for e in _team_seed_entries(conn):
+        conn.execute("""INSERT INTO team_power_rankings
+            (ranking_year, evaluation_year, team_id, team_name, continent, country,
+             rating, rank, prev_rank)
+            VALUES(?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(ranking_year, team_id) DO NOTHING""",
+            (e.ranking_year, e.evaluation_year, e.team_id, e.team_name,
+             e.continent, e.country, e.rating, e.rank, e.prev_rank))
+        conn.execute("""INSERT INTO team_power_rating(team_id, a_rating, b_rating, last_updated_year)
+                         VALUES(?,?,0,0) ON CONFLICT(team_id) DO NOTHING""",
+                     (e.team_id, e.rating))
+    conn.commit()
+
+
+# ══════════════════════════════════════════════════════════════
+# 17. UI 조회 헬퍼 (기존 시그니처 유지)
 # ══════════════════════════════════════════════════════════════
 
 def get_team_power_ranking(conn, ranking_year: int, continent: Optional[str] = None,
                             limit: int = 100) -> list:
-    """파워랭킹 화면의 '전체/아시아/유럽/...' 탭용. continent=None이면 전체.
-    오세아니아를 아시아에 합쳐 보여주고 싶으면 호출부에서
-    continent='아시아' 조회 후 데이터에 continent='오세아니아'인 것도 별도
-    쿼리해 합치거나, 이 함수에 continents 리스트를 받는 변형을 추가하면 됨
-    (지금은 신민용이 말한 '내부 데이터엔 오세아니아 별도 보관' 원칙을
-    지키기 위해 단일 대륙만 받는 형태로 둔다)."""
     ensure_power_ranking_tables(conn)
     ensure_initial_team_power_ranking(conn)
     if continent:
@@ -689,31 +1225,30 @@ def get_team_power_ranking(conn, ranking_year: int, continent: Optional[str] = N
                             ranking_year=r[0], evaluation_year=r[1], tier=r[9]) for r in rows]
 
 
-# 화면에 보여줄 대륙 탭 ↔ 실제 continent 컬럼값(들) 매핑. 신민용 확정:
-# "오세아니아는 아시아에 통합, 북미+남미는 아메리카로 통합해서 표시하되
-# 내부 데이터(countries.continent)는 그대로 나눠서 보관". UI는 이 함수
-# 하나만 쓰면 되고, 실제 DB의 continent 값(아시아/유럽/아프리카/북미/
-# 남미/오세아니아)은 그대로 둔다.
-TEAM_POWER_RANKING_TABS = ["전체", "아시아", "유럽", "아프리카", "아메리카"]
+TEAM_POWER_RANKING_TABS = ["전체", "아시아", "유럽", "아프리카", "오세아니아", "북미", "남미"]
 _TAB_TO_CONTINENTS = {
-    "아시아":   ["아시아", "오세아니아"],
-    "유럽":     ["유럽"],
+    # [2026-08 수정, 신민용 요청: "전체/아시아/유럽/아프리카/아메리카"
+    # 5개 탭을 "전체/아시아/유럽/아프리카/오세아니아/북미/남미" 6개
+    # 원시 대륙 탭으로 확장 — 더 이상 오세아니아를 아시아에, 북미·남미를
+    # 아메리카로 합치지 않는다. countries.continent에 실제 저장된 값과
+    # 탭이 1:1로 대응한다.
+    "아시아": ["아시아"],
+    "유럽": ["유럽"],
     "아프리카": ["아프리카"],
-    "아메리카": ["남미", "북미", "북중미"],
+    "오세아니아": ["오세아니아"],
+    "북미": ["북미", "북중미"],  # DB에 두 표기가 혼재할 수 있어 둘 다 받는다
+    "남미": ["남미"],
 }
 
 
 def get_team_power_ranking_grouped(conn, ranking_year: int, tab: str = "전체",
                                     limit: int = 100) -> list:
-    """파워랭킹 화면의 대륙 탭(전체/아시아/유럽/아프리카/아메리카) 전용
-    조회 함수. get_team_power_ranking()은 DB에 실제 저장된 continent
-    값 하나만 받으므로, 오세아니아→아시아·북미+남미→아메리카로 합쳐
-    보여줘야 하는 화면 쪽 요구는 여기서 처리한다.
-    [주의] 국가 필터(신민용 요청, 검색창 우측)는 여기서 SQL로 거르지
-    않는다 — 걸러서 다시 LIMIT을 적용하면 "그 대륙 범위 안에서의 실제
-    순위"가 아니라 "그 나라 팀들 중에서의 순위"로 뜻이 바뀌어 버린다.
-    화면 쪽(_apply_pr_team_search)에서 이 함수가 돌려준 '대륙 범위
-    전체' 캐시를 그대로 두고 국가 조건은 필터링만 하는 방식을 쓴다."""
+    """[2026-08 버그수정, 신민용 리포트: "아시아 탭에서 대륙순위 1등인데
+    전년 대비가 전체순위 243등이랑 비교해서 계산된다"] 예전엔 이 함수가
+    team_power_rankings.prev_rank(글로벌 순위 기준)를 그대로 돌려주면서
+    화면에선 rank만 대륙 범위 순번으로 바꿔치기해서 rank/prev_rank의
+    기준이 서로 어긋났다 — 이제 prev_rank도 '같은 대륙 범위 안에서'의
+    작년 순번으로 다시 계산해서 돌려준다(기준을 rank와 통일)."""
     ensure_power_ranking_tables(conn)
     ensure_initial_team_power_ranking(conn)
     if tab not in _TAB_TO_CONTINENTS:
@@ -722,22 +1257,25 @@ def get_team_power_ranking_grouped(conn, ranking_year: int, tab: str = "전체",
     placeholders = ",".join("?" * len(continents))
     rows = conn.execute(
         f"""SELECT p.ranking_year, p.evaluation_year, p.team_id, p.team_name, p.continent,
-                   p.country, p.rating, p.rank, p.prev_rank, t.current_tier
+                   p.country, p.rating, p.rank, t.current_tier
             FROM team_power_rankings p LEFT JOIN teams t ON t.id = p.team_id
             WHERE p.ranking_year=? AND p.continent IN ({placeholders})
             ORDER BY p.rating DESC LIMIT ?""",
         (ranking_year, *continents, limit)).fetchall()
+    # 작년(ranking_year-1) 같은 대륙 범위 순번 맵 — 전체 팀(limit 제한 없이)을
+    # 대상으로 만들어야 100위 밖에서 올라온 팀도 정확히 잡힌다.
+    prev_rows = conn.execute(
+        f"""SELECT team_id FROM team_power_rankings
+            WHERE ranking_year=? AND continent IN ({placeholders})
+            ORDER BY rating DESC""",
+        (ranking_year - 1, *continents)).fetchall()
+    prev_local_rank = {tid: i + 1 for i, (tid,) in enumerate(prev_rows)}
     return [TeamPowerEntry(team_id=r[2], team_name=r[3], continent=r[4], country=r[5],
-                            rating=r[6], rank=r[7], prev_rank=r[8],
-                            ranking_year=r[0], evaluation_year=r[1], tier=r[9]) for r in rows]
+                            rating=r[6], rank=r[7], prev_rank=prev_local_rank.get(r[2]),
+                            ranking_year=r[0], evaluation_year=r[1], tier=r[8]) for r in rows]
 
 
 def get_countries_in_tab_group(conn, tab: str) -> list:
-    """[2026-08 신설, 신민용 요청] 검색창 우측 '국가 필터' 콤보의 선택지용
-    — 지금 선택된 대륙 탭(전체/아시아/유럽/아프리카/아메리카)에 속한
-    나라 이름만 정렬해서 돌려준다. "아시아를 선택하면 아시아 국가들만
-    필터에 뜨고" — TEAM_POWER_RANKING_TABS와 동일한 오세아니아→아시아,
-    북미+남미→아메리카 통합 규칙(_TAB_TO_CONTINENTS)을 그대로 쓴다."""
     if tab not in _TAB_TO_CONTINENTS:
         rows = conn.execute("SELECT name FROM countries ORDER BY name ASC").fetchall()
     else:
@@ -750,10 +1288,6 @@ def get_countries_in_tab_group(conn, tab: str) -> list:
 
 
 def get_latest_ranking_year(conn) -> Optional[int]:
-    """세계기록실 파워랭킹 탭이 처음 열릴 때 기본으로 보여줄 연도.
-    아직 한 번도 계산된 적이 없어도 ensure_initial_country_power_ranking()/
-    ensure_initial_team_power_ranking() 덕분에 최소 GAME_START_YEAR는
-    항상 존재한다."""
     ensure_power_ranking_tables(conn)
     ensure_initial_country_power_ranking(conn)
     ensure_initial_team_power_ranking(conn)
@@ -767,12 +1301,6 @@ def get_latest_ranking_year(conn) -> Optional[int]:
 
 
 def get_available_ranking_years(conn) -> list:
-    """[2026-08 수정, 신민용 요청: "연도 필터도 게임 시작년도부터"] 국가
-    파워랭킹은 ensure_initial_country_power_ranking()이 GAME_START_YEAR
-    스냅샷을 항상 보장하므로, 팀 연도만 모으던 이전 방식 대신 팀·국가
-    양쪽 ranking_year를 합쳐서(중복 제거) 돌려준다 — 그래야 아직 시즌이
-    한 번도 안 끝나 팀 데이터가 없는 새 게임에서도 GAME_START_YEAR가
-    선택 가능한 연도로 뜬다."""
     ensure_power_ranking_tables(conn)
     ensure_initial_country_power_ranking(conn)
     ensure_initial_team_power_ranking(conn)
@@ -786,9 +1314,6 @@ def get_available_ranking_years(conn) -> list:
 
 
 def get_country_power_ranking(conn, ranking_year: int, limit: int = 250) -> list:
-    """limit 기본값을 250으로 둔 이유: 신민용 확정 — 국가 파워랭킹은
-    상위 N등이 아니라 countries.py에 등록된 211개국 전체를 항상 보여준다.
-    250이면 211개국 전체가 잘리지 않고 다 들어간다."""
     ensure_power_ranking_tables(conn)
     ensure_initial_country_power_ranking(conn)
     rows = conn.execute(
@@ -800,133 +1325,7 @@ def get_country_power_ranking(conn, ranking_year: int, limit: int = 250) -> list
             for r in rows]
 
 
-def _country_seed_entries(conn) -> list:
-    """countries.py의 다섯 번째 값(fifa_rank)만으로 만든 순수 시드 목록.
-    DB에는 아무것도 안 쓴다 — ensure_initial_country_power_ranking()이
-    이 목록을 실제 country_power_rankings 테이블에 저장하는 쪽."""
-    rows = conn.execute(
-        """SELECT name, continent, fifa_rank FROM countries
-           ORDER BY fifa_rank ASC, name ASC""").fetchall()
-    entries = []
-    for i, (name, continent, fifa_rank) in enumerate(rows, start=1):
-        entries.append(CountryPowerEntry(
-            country=name, continent=continent or "",
-            rating=_fifa_rank_to_seed_rating(fifa_rank),
-            rank=i, prev_rank=None,
-            ranking_year=GAME_START_YEAR, evaluation_year=GAME_START_YEAR - 1))
-    return entries
-
-
-def ensure_initial_country_power_ranking(conn):
-    """[2026-08 신설, 신민용 리포트: "game.db 새로 돌렸는데 전년이 안 뜬다
-    — 시작할 때 순위가 있으니 전년이 표시될 수 있잖아"] 첫 시즌이 끝나
-    ranking_year=GAME_START_YEAR+1 스냅샷이 계산될 때 비교할 'GAME_START_YEAR
-    시점 순위'가 DB에 아예 없으면 항상 "신규"로만 뜬다 — 그래서 게임이
-    시작되는 순간(=이 함수가 처음 호출되는 순간) countries.py 시드값을
-    ranking_year=GAME_START_YEAR 스냅샷으로 실제 저장해둔다. 이후
-    compute_country_power_rankings(evaluation_year=GAME_START_YEAR)가
-    ranking_year=GAME_START_YEAR+1을 계산할 때 _prev_rank_country가 바로
-    이 행을 찾아 전년 대비 화살표를 정상적으로 그려준다. 이미 저장돼
-    있으면(재호출돼도) 아무 것도 하지 않는 멱등 함수."""
-    ensure_power_ranking_tables(conn)
-    exists = conn.execute(
-        "SELECT 1 FROM country_power_rankings WHERE ranking_year=? LIMIT 1",
-        (GAME_START_YEAR,)).fetchone()
-    if exists:
-        return
-    for e in _country_seed_entries(conn):
-        conn.execute("""INSERT INTO country_power_rankings
-            (ranking_year, evaluation_year, country, continent, rating, rank, prev_rank)
-            VALUES(?,?,?,?,?,?,?)
-            ON CONFLICT(ranking_year, country) DO NOTHING""",
-            (e.ranking_year, e.evaluation_year, e.country, e.continent,
-             e.rating, e.rank, e.prev_rank))
-        # 레이어1(계속 움직이는 기초 레이팅)도 같은 시드로 미리 깔아둔다 —
-        # 안 그러면 첫 실제 경기 갱신 때 DEFAULT_COUNTRY_RATING(1500)에서
-        # 다시 시작해 이 스냅샷 값과 어긋난다.
-        conn.execute("""INSERT INTO country_power_rating(country, rating, last_updated_year)
-                         VALUES(?,?,0) ON CONFLICT(country) DO NOTHING""",
-                     (e.country, e.rating))
-    conn.commit()
-
-
-def _ovr_to_seed_rating(avg_ovr: float) -> float:
-    """[2026-08 신설, 신민용 요청: "팀 순위 OVR을 기준으로 해줄 수 있어?"]
-    스쿼드 평균 OVR을 팀 파워랭킹 초기 레이팅으로 환산하는 순수 함수.
-    country 쪽 _fifa_rank_to_seed_rating과 같은 역할 — OVR 40~99 정도의
-    실제 분포를 DEFAULT_TEAM_RATING(1500) 근방 스케일로 펼친다.
-    TUNE LATER: 계수는 감으로 잡은 값 — 실측 후 조정 필요."""
-    return 1000.0 + avg_ovr * 10.0
-
-
-def _team_seed_entries(conn) -> list:
-    """[2026-08 신설, 신민용 요청] 아직 시즌이 한 번도 안 끝나
-    team_power_rankings가 텅 빈 새 게임에서 쓰는 팀 초기 시드 목록 —
-    ai_players 스쿼드 평균 OVR을 기준으로 정렬하고, OVR이 완전히 같으면
-    리그 등급(현재 소속 부, 낮은 tier 숫자가 더 높은 등급 = 1부가 2부보다
-    위)로, 그것도 같으면 team_id 순으로 그냥 아무렇게나 둔다(신민용:
-    "이정도 차이면 바로 달라질테니 대충 위치하게 해도 됨"). ai_players에
-    한 명도 없는 팀(스쿼드가 아직 안 채워진 신생 팀 등)은 45로 취급."""
-    rows = conn.execute(
-        """SELECT t.id, t.name, cn.continent, cn.name, t.current_tier,
-                  COALESCE((SELECT AVG(ap.ovr) FROM ai_players ap WHERE ap.team_id = t.id), 45)
-           FROM teams t JOIN countries cn ON t.country_id = cn.id
-           ORDER BY 6 DESC, COALESCE(t.current_tier, 99) ASC, t.id ASC"""
-    ).fetchall()
-    entries = []
-    for i, (team_id, name, continent, country, tier, avg_ovr) in enumerate(rows, start=1):
-        entries.append(TeamPowerEntry(
-            team_id=team_id, team_name=name, continent=continent or "",
-            country=country or "", rating=_ovr_to_seed_rating(avg_ovr),
-            rank=i, prev_rank=None,
-            ranking_year=GAME_START_YEAR, evaluation_year=GAME_START_YEAR - 1,
-            tier=tier))
-    return entries
-
-
-def ensure_initial_team_power_ranking(conn):
-    """[2026-08 신설, 신민용 요청: "팀 순위도 시작년도부터 순위를 만들 수
-    있지" — OVR 기준] ensure_initial_country_power_ranking()의 팀 버전.
-    GAME_START_YEAR 스냅샷이 없으면 _team_seed_entries()로 만들어 저장한다
-    (멱등 — 이미 있으면 아무 것도 안 함). 이후 첫 시즌이 끝나면 실제
-    경기 결과 기반 계산값이 자연스럽게 이어받는다(country 쪽과 동일한
-    설계: 레이어1 레이팅도 같은 시드로 미리 깔아둬 첫 갱신이 1500에서
-    다시 시작하지 않게 한다)."""
-    ensure_power_ranking_tables(conn)
-    exists = conn.execute(
-        "SELECT 1 FROM team_power_rankings WHERE ranking_year=? LIMIT 1",
-        (GAME_START_YEAR,)).fetchone()
-    if exists:
-        return
-    for e in _team_seed_entries(conn):
-        conn.execute("""INSERT INTO team_power_rankings
-            (ranking_year, evaluation_year, team_id, team_name, continent, country,
-             rating, rank, prev_rank)
-            VALUES(?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(ranking_year, team_id) DO NOTHING""",
-            (e.ranking_year, e.evaluation_year, e.team_id, e.team_name,
-             e.continent, e.country, e.rating, e.rank, e.prev_rank))
-        conn.execute("""INSERT INTO team_power_rating(team_id, rating, last_updated_year)
-                         VALUES(?,?,0) ON CONFLICT(team_id) DO NOTHING""",
-                     (e.team_id, e.rating))
-    conn.commit()
-
-
-def get_country_power_ranking_seed(conn) -> list:
-    """[하위호환용] DB에 아무것도 안 쓰는 순수 조회 버전 — 지금 UI는
-    ensure_initial_country_power_ranking()으로 실제 저장된 GAME_START_YEAR
-    스냅샷을 get_country_power_ranking()으로 그냥 읽어오는 쪽을 쓰지만,
-    저장이 불가능한(읽기 전용 conn 등) 상황을 위해 순수 버전도 남겨둔다."""
-    return _country_seed_entries(conn)
-
-
 def _continent_group_for(continent: str) -> list:
-    """이 팀의 원본 continent 값이 UI 대륙 탭(전체/아시아/유럽/아프리카/
-    아메리카, get_team_power_ranking_grouped와 동일한 오세아니아→아시아,
-    북미+남미→아메리카 통합 규칙)에서 어느 그룹에 속하는지 찾아 그 그룹의
-    continent 목록을 돌려준다. "대륙 순위"가 화면의 대륙 탭 순위와
-    일치해야 하므로(원본 continent 하나만으로 세면 오세아니아/북미가
-    아시아/아메리카 탭과 다른 숫자가 되어 버림)."""
     for continents in _TAB_TO_CONTINENTS.values():
         if continent in continents:
             return continents
@@ -934,15 +1333,6 @@ def _continent_group_for(continent: str) -> list:
 
 
 def get_team_power_history(conn, team_id: int) -> list:
-    """[2026-08 수정, 신민용 요청: "연도, 전체 순위, 대륙 순위 이렇게
-    3개로 뜨게"] 순위 클릭 시 뜨는 '이전 순위' 창용 —
-    [(ranking_year, rank, continent_rank), ...]를 최신 연도부터
-    내림차순으로 돌려준다. rank는 전체 기준 글로벌 순위, continent_rank는
-    화면의 대륙 탭(오세아니아→아시아, 북미+남미→아메리카로 통합된 5개
-    그룹)과 같은 기준으로 계산한 그 안에서의 순위 — team_power_rankings.rank가
-    이미 rating 내림차순 전체 순서이므로, 같은 대륙그룹·같은 ranking_year에서
-    rank가 이 팀보다 작거나 같은 행 개수를 세면 곧 대륙 내 순위가 된다
-    (전역 순서를 부분집합으로 필터링해도 상대 순서는 그대로 유지되므로)."""
     ensure_power_ranking_tables(conn)
     rows = conn.execute(
         """SELECT ranking_year, rank, continent FROM team_power_rankings
