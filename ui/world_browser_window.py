@@ -16,12 +16,15 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QTableWidget, QTableWidgetItem,
     QHeaderView, QPushButton, QTabWidget, QWidget, QSplitter, QFrame,
     QAbstractItemView, QScrollArea, QGridLayout, QSizePolicy,
-    QStyledItemDelegate, QStyle, QMenu, QMessageBox
+    QStyledItemDelegate, QStyle, QMenu, QMessageBox, QSpinBox
 )
 from PyQt6.QtCore import Qt, QTimer, QRect, QSize
 from PyQt6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter, QShortcut, QKeySequence
 
 import world_browser as wb
+from database import get_conn
+import power_ranking as pr
+from constants import GAME_START_YEAR
 
 # [2026-08 신설, 신민용 리포트: "복사하면 국기/국가/부수까지 같이 복사된다,
 # 팀명만 복사되게 해달라"] 셀 화면 텍스트("🇺🇸 토론토 FC (미국)", "보루시아
@@ -358,6 +361,8 @@ class WorldBrowserWindow(QDialog):
         _wb_marks.append(("역대지역컵", _time_wb.perf_counter()))
         tabs.addTab(self._build_country_tab(), "🌍 국가 검색")
         _wb_marks.append(("국가검색", _time_wb.perf_counter()))
+        tabs.addTab(self._build_power_ranking_tab(), "📊 파워랭킹")
+        _wb_marks.append(("파워랭킹", _time_wb.perf_counter()))
 
         _wb_total = _wb_marks[-1][1] - _wb_t0
         if _wb_total >= 0.05:
@@ -388,8 +393,33 @@ class WorldBrowserWindow(QDialog):
         self._ensure_list_fits(self.league_list, self._league_split)
         self._ensure_list_fits(self.team_list, self._team_split)
         self._ensure_list_fits(self.cup_country_list, self._cup_split)
+        self._ensure_tab_bar_fits()
 
-    
+    def _ensure_tab_bar_fits(self):
+        """[2026-08 신설, 신민용 리포트 3번째: "국가 검색 탭 옆에 스크롤
+        화살표(◀▶)가 왜 있어야 하냐 — 모니터가 넓으면 창을 그만큼 키워서
+        탭이 다 보이게 해야지, 저 화살표는 창 작은 컴퓨터를 위해 남겨두는
+        용도지 화면 넓은데도 뜰 이유가 없잖아"] QTabWidget은 탭 라벨을
+        전부 늘어놓은 폭(tabBar().sizeHint())이 지금 탭 영역 폭보다 넓으면
+        자동으로 스크롤 화살표를 띄운다 — 파워랭킹 탭 안 내용(스플리터)
+        폭만 맞추던 기존 _pr_ensure_window_width와는 별개로, '탭 제목들
+        전체가 한 줄에 다 들어가는 폭'도 창 크기에 반영해야 화살표가
+        안 뜬다. 화면(작업 영역)보다 커지면 그 지점부터는 화살표가
+        남아있는 게 맞다(신민용이 명시적으로 "작은 컴퓨터를 위해 남겨야
+        한다"고 확인) — _clamp_and_resize와 동일하게 화면 안으로 잘라
+        적용한다."""
+        bar = self.tabs.tabBar()
+        bar_needed = bar.sizeHint().width()
+        bar_have = self.tabs.width()
+        if bar_needed <= bar_have:
+            return  # 이미 화살표 없이 다 보임
+        extra = bar_needed - bar_have
+        needed_w = self.width() + extra + 20
+        screen = QGuiApplication.primaryScreen()
+        max_w = screen.availableGeometry().width() - 40 if screen else needed_w
+        new_w = min(needed_w, max_w)
+        if new_w > self.width():
+            self.resize(new_w, self.height())
 
     def _grow_to_fit(self, tbl, extra_w=60, extra_h=140, stretch_col=None):
         """테이블 내용(특히 컬럼 수·긴 텍스트)이 지금 창 폭보다 넓으면 그만큼
@@ -3627,6 +3657,443 @@ class WorldBrowserWindow(QDialog):
         note.setForeground(Qt.GlobalColor.darkGray)
         tbl.setItem(0, 0, note)
         tbl.setSpan(0, 0, 1, n_cols)
+
+    # ── [2026-08 신설] 파워랭킹 탭 ──────────────────────────────────
+    # power_ranking.py(팀/국가 Elo 레이팅 + 연도별 스냅샷)를 그대로 읽어
+    # 보여주기만 하는 화면 — 계산 자체는 연도 전환 시(game_engine._advance_week)
+    # 이미 끝나 있으므로 여기선 SELECT만 한다. 좌: 팀 파워랭킹(대륙 탭),
+    # 우: 국가 파워랭킹. 신민용 설계 mockup(전체/아시아/유럽/아프리카/
+    # 아메리카 탭 + 순위 클릭 시 이전 순위 이력)을 그대로 따른다.
+    def _build_power_ranking_tab(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 8, 0, 0)
+
+        top = QHBoxLayout()
+        self.pr_year_label = QLabel("파워랭킹")
+        self.pr_year_label.setStyleSheet("color:#00cc44;font-size:14px;font-weight:bold;")
+        top.addWidget(self.pr_year_label)
+        top.addStretch(1)
+        # [2026-08 수정, 신민용 리포트: "연도 필터를 콤보박스 목록으로 두면
+        # 나중에 50년 넘게 쌓였을 때 목록이 너무 길어진다"] 스크롤해야 하는
+        # 드롭다운 대신, 숫자를 직접 입력하거나 화살표로 1년씩 넘기는
+        # QSpinBox로 바꾼다. 최소값은 GAME_START_YEAR — 게임 시작 연도의
+        # 국가 파워랭킹(초기 시드)부터 조회 가능해야 하므로.
+        lbl_year = QLabel("연도"); lbl_year.setStyleSheet("color:#888;font-size:11px;")
+        self.pr_year_spin = QSpinBox()
+        self.pr_year_spin.setRange(GAME_START_YEAR, GAME_START_YEAR + 300)
+        self.pr_year_spin.setValue(GAME_START_YEAR)
+        self.pr_year_spin.valueChanged.connect(self._refresh_power_ranking_tables)
+        top.addWidget(lbl_year)
+        top.addWidget(self.pr_year_spin)
+        self.pr_year_latest_btn = QPushButton("최신")
+        self.pr_year_latest_btn.setToolTip("가장 최근에 계산된 파워랭킹 연도로 이동")
+        self.pr_year_latest_btn.clicked.connect(self._on_pr_jump_to_latest_year)
+        top.addWidget(self.pr_year_latest_btn)
+        lay.addLayout(top)
+
+        info = QLabel("ℹ️ 순위를 더블클릭하면 그 팀/국가의 연도별 순위 이력을 볼 수 있습니다.")
+        info.setStyleSheet("color:#888;font-size:11px;")
+        lay.addWidget(info)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+
+        # ── 왼쪽: 팀 파워랭킹 ──
+        left = QWidget()
+        left_lay = QVBoxLayout(left)
+        left_lay.setContentsMargins(0, 0, 0, 0)
+        left_title = QLabel("🏟 팀 파워랭킹")
+        left_title.setStyleSheet("color:#eee;font-size:13px;font-weight:bold;")
+        left_lay.addWidget(left_title)
+
+        tab_row = QHBoxLayout()
+        self.pr_team_tab_group = []
+        for tab_name in pr.TEAM_POWER_RANKING_TABS:
+            btn = QPushButton(tab_name)
+            btn.setCheckable(True)
+            btn.setChecked(tab_name == "전체")
+            # [2026-08 버그수정, 신민용 리포트: "버튼이 추가된 만큼 창이
+            # 안 넓어져서 좁아 보인다"] 대륙 탭 버튼 5개가 QHBoxLayout
+            # 기본 크기로는 서로 눌려서 텍스트가 잘릴 수 있다 — 버튼마다
+            # 최소 폭을 보장해 항상 읽히게 하고, 창 쪽도 아래에서
+            # _pr_ensure_window_width()로 이 최소 폭 합계가 들어갈
+            # 공간을 스스로 확보한다.
+            btn.setMinimumWidth(76)
+            btn.clicked.connect(lambda _checked, t=tab_name: self._on_pr_team_tab_clicked(t))
+            tab_row.addWidget(btn)
+            self.pr_team_tab_group.append(btn)
+        left_lay.addLayout(tab_row)
+        self._pr_current_team_tab = "전체"
+
+        # [2026-08 신설, 신민용 요청] 국가 쪽과 동일한 검색바 — 이름이
+        # 겹치면(예: "FC") 순위 높은 순(=순위 숫자가 작은 순, 이미
+        # team_entries가 그 순서로 정렬돼 있어 필터링만 하면 자동으로
+        # 유지됨)으로 나열. "전체" 탭이면 전체 팀 중에서, "아프리카" 탭이
+        # 선택된 상태면 아프리카 팀 중에서만 검색되고, 이때 순위 칸은
+        # 검색 결과 안에서 다시 매긴 번호가 아니라 '지금 선택된 범위(전체
+        # 또는 그 대륙) 안에서 이 팀의 실제 순위'를 그대로 보여준다 —
+        # 국가 검색과 완전히 같은 원칙(_apply_pr_country_search 참고).
+        # 검색창 우측엔 국가 필터를 하나 더 둔다(신민용 요청) — 이 콤보의
+        # 선택지 자체가 지금 선택된 대륙 탭에 종속된다: "아시아" 탭이면
+        # 아시아(+오세아니아) 국가만, "유럽" 탭이면 유럽 국가만 뜬다.
+        # 탭이 바뀔 때마다 _pr_refresh_team_country_filter_options()가
+        # 다시 채운다.
+        team_search_row = QHBoxLayout()
+        self.pr_team_search_box = QLineEdit()
+        self.pr_team_search_box.setPlaceholderText("🔎 팀명 검색")
+        self.pr_team_search_box.textChanged.connect(self._on_pr_team_search_changed)
+        team_search_row.addWidget(self.pr_team_search_box, 1)
+        self.pr_team_country_combo = QComboBox()
+        self.pr_team_country_combo.addItem("전체 국가")
+        self.pr_team_country_combo.currentTextChanged.connect(self._on_pr_team_search_changed)
+        team_search_row.addWidget(self.pr_team_country_combo)
+        left_lay.addLayout(team_search_row)
+
+        # [2026-08 신설] 팀 명과 대륙 사이에 '부'(현재 소속 리그 등급)를
+        # 넣어 분류를 한 단계 더 세분화(신민용 요청) —
+        # 순위/전년/팀/부/대륙/국가/점수 7열.
+        self.pr_team_tbl = QTableWidget(0, 7)
+        self.pr_team_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.pr_team_tbl.verticalHeader().setVisible(False)
+        self.pr_team_tbl.setHorizontalHeaderLabels(["순위", "전년", "팀", "부", "대륙", "국가", "점수"])
+        self.pr_team_tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.pr_team_tbl.cellDoubleClicked.connect(self._on_pr_team_row_double_clicked)
+        _enable_plain_copy(self.pr_team_tbl)
+        left_lay.addWidget(self.pr_team_tbl, 1)
+        split.addWidget(left)
+
+        # ── 오른쪽: 국가 파워랭킹 (211개국 전체) ──
+        right = QWidget()
+        right_lay = QVBoxLayout(right)
+        right_lay.setContentsMargins(0, 0, 0, 0)
+        right_title = QLabel("🌍 국가 파워랭킹 (211개국)")
+        right_title.setStyleSheet("color:#eee;font-size:13px;font-weight:bold;")
+        right_lay.addWidget(right_title)
+
+        # [2026-08 신설, 신민용 요청] "국가 파워랭킹" 글자 바로 아래 검색바 —
+        # 나라 이름을 치면 그 나라(들)만 남기고, 순위 칸은 필터링된 목록
+        # 안에서의 순번이 아니라 '전체 211개국 기준 실제 순위'를 그대로
+        # 보여준다(예: "중" 검색 시 중국·중화 타이베이·중앙아프리카공화국이
+        # 각각 자기 실제 순위(예: 91위)를 달고 나옴 — 검색 결과 안에서
+        # 1,2,3위로 다시 매기지 않는다). 검색창 좌측엔 대륙 필터를 하나 더
+        # 둔다(신민용 요청) — 이 콤보는 팀 쪽 5탭(오세아니아→아시아,
+        # 북미+남미→아메리카로 합침)과 달리 countries.continent 실제 값을
+        # 그대로 쓴다(국가 쪽은 합쳐 보여달라는 요청이 없었음).
+        search_row = QHBoxLayout()
+        self.pr_country_continent_combo = QComboBox()
+        self.pr_country_continent_combo.addItem("전체 대륙")
+        for cont in ["아시아", "유럽", "아프리카", "북미", "남미", "오세아니아"]:
+            self.pr_country_continent_combo.addItem(cont)
+        self.pr_country_continent_combo.currentTextChanged.connect(self._on_pr_country_search_changed)
+        search_row.addWidget(self.pr_country_continent_combo)
+        self.pr_country_search_box = QLineEdit()
+        self.pr_country_search_box.setPlaceholderText("🔎 국가명 검색")
+        self.pr_country_search_box.textChanged.connect(self._on_pr_country_search_changed)
+        search_row.addWidget(self.pr_country_search_box, 1)
+        right_lay.addLayout(search_row)
+
+        self.pr_country_tbl = QTableWidget(0, 5)
+        self.pr_country_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.pr_country_tbl.verticalHeader().setVisible(False)
+        self.pr_country_tbl.setHorizontalHeaderLabels(["순위", "전년", "국가", "대륙", "점수"])
+        self.pr_country_tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.pr_country_tbl.cellDoubleClicked.connect(self._on_pr_country_row_double_clicked)
+        _enable_plain_copy(self.pr_country_tbl)
+        right_lay.addWidget(self.pr_country_tbl, 1)
+        split.addWidget(right)
+        # 팀 쪽이 대륙 탭 버튼 5개 + 6열 표라 국가 쪽(검색바 + 5열)보다
+        # 가로 공간이 더 필요 — 5.5 : 4.5 비율로 시작 폭을 나눠준다.
+        split.setSizes([620, 520])
+
+        lay.addWidget(split, 1)
+
+        self._pr_team_entries_cache = []    # 검색 필터링용 — 순위는 여기 원본(범위 내) 값을 그대로 씀
+        self._pr_country_entries_cache = []  # 검색 필터링용 — 순위는 여기 원본 값을 그대로 씀
+        self._pr_tab_widget = w
+        # [2026-08 버그수정, 신민용 리포트: "처음 들어가면 순위 10위부터
+        # '...'으로 깨져 뜨고, 아무 버튼이나 한 번 누르면 그제서야 제대로
+        # 뜬다"] 다이얼로그가 실제로 화면에 show()되어 스타일시트 폰트가
+        # 최종 확정(polish)되기 전에 resizeColumnsToContents()로 열 폭을
+        # 재는 게 원인이었다 — "1"~"9"(한 자리 숫자)는 그 시점의(아직 최종
+        # 폰트로 안 굳은) 좁은 폭에도 어쩌다 들어맞지만, "10" 이상(두 자리)
+        # 이나 "신규"(두 글자) 같은 조금 더 넓은 텍스트는 그 폭에 안 맞아
+        # 말줄임(…)으로 잘렸다. 사용자가 버튼을 누르면 그 시점엔 이미
+        # 창이 화면에 떠서 폰트가 확정된 뒤라 다시 재면 정확히 나왔던 것.
+        # 해결: 최초 채우기를 이 생성자 호출 스택이 끝나고 이벤트 루프가
+        # 한 바퀴 돈 뒤(=창이 실제로 show()된 뒤)로 미룬다.
+        QTimer.singleShot(0, lambda: self._pr_load_years(initial=True))
+        return w
+
+    def _pr_ensure_window_width(self, tab_widget):
+        """[2026-08 신설, 신민용 리포트: "버튼 추가되면 창도 그에 맞춰
+        늘려달라"] 파워랭킹 탭(대륙 버튼 5개 + 검색바 + 대륙 필터)이
+        요구하는 최소 폭을 계산해서, 지금 창이 그보다 좁으면 넓혀준다.
+        화면보다 커지면 안 되므로 기존 _clamp_and_resize와 동일하게
+        화면 안으로 잘라 적용한다. _pr_load_years(initial=True)가 실제
+        데이터를 다 채운 뒤 호출해야 sizeHint가 정확하므로, 그 뒤에서
+        불린다(생성자 시점엔 아직 표가 비어 있어 폭이 작게 잡힘)."""
+        needed = tab_widget.sizeHint().width() + 80
+        cur = self.width()
+        if needed > cur:
+            screen = QGuiApplication.primaryScreen()
+            max_w = screen.availableGeometry().width() - 40 if screen else needed
+            self.resize(min(needed, max_w), self.height())
+
+    def _on_pr_jump_to_latest_year(self):
+        latest = pr.get_latest_ranking_year(get_conn())
+        if latest is not None:
+            self.pr_year_spin.setValue(latest)  # setValue 자체가 valueChanged를 쏴서 갱신됨
+
+    def _pr_load_years(self, initial=False):
+        """[2026-08 수정, 신민용 요청: "연도 필터도 게임 시작년도부터",
+        "50년 넘게 쌓이면 콤보 목록이 너무 길다 — 직접 입력하는 방식도"]
+        예전엔 계산된 연도만 콤보에 채워 넣는 방식이었는데, 이제 연도는
+        QSpinBox 직접 입력이라 목록을 채울 필요가 없다 — 대신 스핀박스
+        기본값을 '최신 계산 연도'로 맞춰주기만 하면 된다. 국가는
+        ensure_initial_country_power_ranking() 덕분에 최소 GAME_START_YEAR
+        스냅샷이 항상 있으므로 get_latest_ranking_year()는 절대 None이
+        아니다."""
+        conn = get_conn()
+        latest = pr.get_latest_ranking_year(conn)
+        if initial:
+            self.pr_year_spin.blockSignals(True)
+            self.pr_year_spin.setValue(latest if latest is not None else GAME_START_YEAR)
+            self.pr_year_spin.blockSignals(False)
+            self._pr_refresh_team_country_filter_options()
+        self._refresh_power_ranking_tables()
+        if initial:
+            self._pr_ensure_window_width(self._pr_tab_widget)
+
+    def _on_pr_team_tab_clicked(self, tab_name):
+        for btn in self.pr_team_tab_group:
+            btn.setChecked(btn.text() == tab_name)
+        self._pr_current_team_tab = tab_name
+        self._pr_refresh_team_country_filter_options()
+        self._refresh_power_ranking_tables()
+
+    def _refresh_power_ranking_tables(self, *_a):
+        ranking_year = self.pr_year_spin.value()
+        conn = get_conn()
+        self.pr_year_label.setText(f"📊 {ranking_year}년 파워랭킹 (평가 시즌: {ranking_year - 1}년)")
+
+        # [2026-08 수정, 신민용 리포트: "100위 안에 없는 팀은 검색해도
+        # 안 뜬다 — 물루 치면 100위 밖이라도 FC 물루즈 같은 팀들이
+        # 순위 그대로 떠야 한다"] 캐시 자체는 이 범위(전체/그 대륙)의
+        # 전체 팀을 다 담아두고(limit을 사실상 무제한으로), 화면에
+        # '기본으로' 보여줄 때만(검색어가 비어 있을 때만) 상위 100위로
+        # 자른다 — _apply_pr_team_search()에서 처리.
+        team_entries = pr.get_team_power_ranking_grouped(
+            conn, ranking_year, tab=self._pr_current_team_tab, limit=100000)
+        # [2026-08 신설, 신민용 요청] 검색창을 넣기 전엔 "전체 목록에서
+        # 몇 번째 줄인가"(local_rank=True → i+1)로 순위를 매겼는데, 검색으로
+        # 목록이 걸러지면 그 i+1이 검색 결과 안에서의 번호로 바뀌어 버려
+        # "지금 이 팀의 실제 순위"가 아니게 된다(국가 검색 때와 같은 문제).
+        # 그래서 지금(=검색 필터 적용 전, 선택된 대륙 범위 전체) 시점에
+        # e.rank를 '이 범위 안에서의 실제 순위'로 한 번 확정해서 캐시해두고,
+        # 이후 검색은 이 캐시를 필터링만 할 뿐 순위를 다시 매기지 않는다.
+        for i, e in enumerate(team_entries):
+            e.rank = i + 1
+        self._pr_team_entries_cache = team_entries
+        self._apply_pr_team_search()
+
+        # 211개국 전체 — get_country_power_ranking의 limit 기본값(250)이
+        # 이미 다 커버하므로 별도 조정 불필요.
+        self._pr_country_entries_cache = pr.get_country_power_ranking(conn, ranking_year)
+        self._apply_pr_country_search()
+
+    def _on_pr_team_search_changed(self, _text):
+        self._apply_pr_team_search()
+
+    def _apply_pr_team_search(self):
+        """[2026-08 신설, 신민용 요청] "이름이 겹치면 나열을 순위가 높은
+        순으로" — _pr_team_entries_cache가 이미 순위(=rating) 내림차순으로
+        정렬돼 있으므로 부분일치로 필터링만 하면 자동으로 그 순서가
+        유지된다. 순위 칸은 검색 결과 안에서 다시 매긴 번호가 아니라
+        '지금 선택된 대륙 범위 안에서 이 팀의 실제 순위'(_refresh_power_
+        ranking_tables에서 미리 확정해둔 e.rank)를 그대로 보여준다.
+
+        [2026-08 수정, 신민용 리포트: "100위 밖 팀도 검색하면 순위
+        그대로 떠야 한다"] 검색어/국가 필터가 둘 다 기본값(빈 검색어 +
+        '전체 국가')일 때만 기본 노출 상위 100위로 자른다 — 둘 중 하나라도
+        활성화되면 캐시(이 범위 전체 팀)에서 필터링하므로 1만위짜리
+        팀이어도, 또는 특정 국가를 골랐을 때 그 나라 팀 전부가 실제
+        순위를 달고 나온다."""
+        query = self.pr_team_search_box.text().strip()
+        country = self.pr_team_country_combo.currentText()
+        country_active = bool(country) and country != "전체 국가"
+        if not query and not country_active:
+            entries = self._pr_team_entries_cache[:100]
+        else:
+            entries = self._pr_team_entries_cache
+            if country_active:
+                entries = [e for e in entries if e.country == country]
+            if query:
+                entries = [e for e in entries if query in e.team_name]
+        self._render_team_power_table(entries)
+
+    def _pr_refresh_team_country_filter_options(self):
+        """[2026-08 신설, 신민용 요청] "아시아를 선택하면 아시아 국가들만
+        필터에 뜨고 유럽은 유럽 국가들만" — 지금 선택된 대륙 탭에 맞춰
+        국가 필터 콤보의 선택지 자체를 다시 채운다. 탭 전환 시(_on_pr_team_
+        tab_clicked)와 최초 로드 시 호출된다."""
+        combo = self.pr_team_country_combo
+        prev_selected = combo.currentText()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("전체 국가")
+        for name in pr.get_countries_in_tab_group(get_conn(), self._pr_current_team_tab):
+            combo.addItem(name)
+        # 대륙 탭이 바뀌어도 이전에 골랐던 국가가 새 목록에 여전히 있으면
+        # 선택을 유지한다(예: "아시아"에서 "한국" 고른 채로 "전체"로
+        # 돌아가도 "한국"이 그대로 남아 있어야 자연스러움).
+        idx = combo.findText(prev_selected)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _render_team_power_table(self, entries):
+        # local_rank=False → 이미 확정해둔(범위 내 실제) e.rank를 그대로 쓴다.
+        self._fill_power_ranking_table(
+            self.pr_team_tbl, entries,
+            name_fn=lambda e: e.team_name, group_fn=lambda e: e.country,
+            continent_fn=lambda e: e.continent, tier_fn=lambda e: e.tier,
+            id_role_fn=lambda e: e.team_id, local_rank=False)
+
+    def _on_pr_country_search_changed(self, _text):
+        self._apply_pr_country_search()
+
+    def _apply_pr_country_search(self):
+        """[2026-08 신설, 신민용 요청] 검색어로 필터링해도 순위 숫자는
+        '211개국 전체 기준 실제 순위'를 그대로 보여준다 — 필터링된 목록
+        안에서 1위부터 다시 매기지 않는다("중" 검색 시 중국이 91위면
+        그대로 91위로 표시). 대륙 필터(신민용 요청, 검색바 좌측)와
+        국가명 검색은 AND로 같이 적용된다."""
+        query = self.pr_country_search_box.text().strip()
+        continent = self.pr_country_continent_combo.currentText()
+        entries = self._pr_country_entries_cache
+        if continent and continent != "전체 대륙":
+            entries = [e for e in entries if e.continent == continent]
+        if query:
+            entries = [e for e in entries if query in e.country]
+        self._render_country_power_table(entries)
+
+    def _render_country_power_table(self, entries):
+        # local_rank=False → 저장된(또는 seed) e.rank를 그대로 쓴다.
+        self._fill_power_ranking_table(
+            self.pr_country_tbl, entries,
+            name_fn=lambda e: e.country, group_fn=lambda e: e.continent,
+            id_role_fn=lambda e: e.country, local_rank=False)
+
+    def _fill_power_ranking_table(self, tbl, entries, name_fn, group_fn, id_role_fn,
+                                   local_rank, continent_fn=None, tier_fn=None):
+        # continent_fn이 있으면(팀 표) 팀명과 국가 사이에 대륙 칸을 하나 더
+        # 넣는다(신민용 요청: "국가와 팀명 사이에 대륙명도 넣어서 분류를
+        # 좀 더 세부적으로"). 국가 표는 이미 group_fn 자체가 대륙이라
+        # continent_fn 없이 기존 5열 그대로 쓴다. tier_fn이 있으면(팀 표만)
+        # 팀명과 대륙 사이에 '부'(현재 소속 리그 등급) 칸을 하나 더
+        # 넣는다(신민용 요청: "팀이랑 대륙 사이에 부란 단어 넣고").
+        n_cols = 5 + (1 if continent_fn else 0) + (1 if tier_fn else 0)
+        tbl.setRowCount(len(entries))
+        for i, e in enumerate(entries):
+            # local_rank=True인 팀 탭은 대륙별로 걸러진 목록이라, 저장된
+            # e.rank(전체 기준 글로벌 순위)가 아니라 이 목록 안에서의 순번을
+            # "순위" 칸에 보여준다 — "아시아 1~100위" 같은 표기와 맞추기 위함.
+            # 국가 표는 항상 e.rank(211개국 전체 기준 실제 순위)를 그대로 쓴다.
+            display_rank = (i + 1) if local_rank else e.rank
+            prev_arrow = ""
+            if e.prev_rank is not None:
+                diff = e.prev_rank - e.rank
+                if diff > 0:
+                    prev_arrow = f"▲{diff}"
+                elif diff < 0:
+                    prev_arrow = f"▼{-diff}"
+                else:
+                    prev_arrow = "—"
+            else:
+                prev_arrow = "신규"
+            vals = [str(display_rank), prev_arrow, name_fn(e)]
+            if tier_fn:
+                tier = tier_fn(e)
+                vals.append(f"{tier}부" if tier else "-")
+            if continent_fn:
+                vals.append(continent_fn(e))
+            vals.append(group_fn(e))
+            vals.append(f"{e.rating:.1f}")
+            for j, v in enumerate(vals):
+                cell = QTableWidgetItem(v)
+                cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if j == 1:
+                    # [2026-08 버그수정, 신민용 리포트: "순위가 내려갔는데
+                    # 빨간색이고 올라갔는데 파란색이다 — 색 반대로 해야돼"]
+                    # 국내 증시/스포츠 순위 표기 관례(상승=빨강, 하락=파랑)에
+                    # 맞춰 반전한다 — 서구 UI 관례(상승=파랑/초록, 하락=빨강)와
+                    # 반대라는 점에 주의.
+                    if prev_arrow.startswith("▲"):
+                        cell.setForeground(QColor("#ff5555"))
+                    elif prev_arrow.startswith("▼"):
+                        cell.setForeground(QColor("#4da6ff"))
+                    else:
+                        cell.setForeground(QColor("#888"))
+                else:
+                    cell.setForeground(Qt.GlobalColor.white if i < 3 else QColor("#ccc"))
+                if j == 0:
+                    cell.setData(Qt.ItemDataRole.UserRole, id_role_fn(e))
+                tbl.setItem(i, j, cell)
+        self._show_empty_state(tbl, entries, "아직 계산된 파워랭킹이 없습니다", n_cols)
+        self._grow_to_fit(tbl, stretch_col=2)
+
+    def _on_pr_team_row_double_clicked(self, row, _col):
+        item = self.pr_team_tbl.item(row, 0)
+        team_id = item.data(Qt.ItemDataRole.UserRole) if item else None
+        name_item = self.pr_team_tbl.item(row, 2)
+        if team_id is None:
+            return
+        history = pr.get_team_power_history(get_conn(), team_id)
+        self._show_power_history_dialog(name_item.text() if name_item else "팀", history,
+                                         columns=["연도", "전체 순위", "대륙 순위"])
+
+    def _on_pr_country_row_double_clicked(self, row, _col):
+        item = self.pr_country_tbl.item(row, 0)
+        country = item.data(Qt.ItemDataRole.UserRole) if item else None
+        name_item = self.pr_country_tbl.item(row, 2)
+        if country is None:
+            return
+        history = pr.get_country_power_history(get_conn(), country)
+        self._show_power_history_dialog(name_item.text() if name_item else "국가", history,
+                                         columns=["연도", "순위"])
+
+    def _show_power_history_dialog(self, title, history, columns):
+        """이전 순위 조회 창 — 신민용 mockup 그대로 "2002 | 5등\n2001 | 9등..."
+        형태를 표로 보여준다(최신 연도부터). [2026-08 확장, 신민용 요청:
+        "연도, 전체 순위, 대륙 순위 이렇게 3개로 뜨게"] columns가 3개면
+        팀용(연도/전체순위/대륙순위), 2개면 국가용(연도/순위) — history의
+        각 행 튜플 길이도 그에 맞춰 (연도,전체,대륙) 또는 (연도,순위)로
+        들어온다."""
+        n_cols = len(columns)
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"{title} — 이전 순위")
+        dlg.resize(360 if n_cols == 3 else 280, 360)
+        v = QVBoxLayout(dlg)
+        tbl = QTableWidget(0, n_cols)
+        tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        tbl.verticalHeader().setVisible(False)
+        tbl.setHorizontalHeaderLabels(columns)
+        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        tbl.setRowCount(len(history))
+        for i, row_vals in enumerate(history):
+            year = row_vals[0]
+            ranks = row_vals[1:]
+            cells = [str(year)] + [f"{r}등" for r in ranks]
+            for j, text in enumerate(cells):
+                it = QTableWidgetItem(text)
+                it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                it.setForeground(Qt.GlobalColor.white if i == 0 else QColor("#ccc"))
+                tbl.setItem(i, j, it)
+        self._show_empty_state(tbl, history, "이력이 없습니다", n_cols)
+        v.addWidget(tbl)
+        close_btn = QPushButton("닫기")
+        close_btn.clicked.connect(dlg.accept)
+        v.addWidget(close_btn)
+        dlg.exec()
 
 
 class RankLeadersDialog(QDialog):

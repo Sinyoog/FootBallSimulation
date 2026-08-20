@@ -5898,6 +5898,20 @@ def _advance_week(p, base_week, n_weeks=4):
         # 실시간으로 채우므로 더 이상 연말에 몰아서 처리할 필요가 없다.
         _generate_all_league_schedules(new_season, new_year)
         _t3 = _time_perf.perf_counter()
+        # [2026-08 신설, 파워랭킹 기반] _generate_all_league_schedules() 안에서
+        # archive_old_seasons()가 이미 실행돼 league_season_standings에
+        # 방금 끝난 시즌(new_year-1) 순위가 확정돼 있고, 그 해 열린 대륙컵/
+        # 지역컵/챔피언스~클럽월드컵 대회들도(43~52주 구간에서 이미 끝남)
+        # 전부 winner가 채워진 상태다 — 파워랭킹 계산에 필요한 데이터가
+        # 전부 갖춰지는 시점이 바로 여기라 여기서 실행한다. 실패해도(예:
+        # 아직 한 시즌도 못 채운 극초반 세이브) 연도 전환 자체를 막으면
+        # 안 되므로 다른 [PERF] 블록들과 같은 방어적 try/except로 감싼다.
+        try:
+            import power_ranking
+            power_ranking.run_year_end_power_ranking_update(get_conn(), new_year - 1)
+        except Exception as e:
+            print("파워랭킹 갱신 오류(건너뜀):", e)
+        _t3c = _time_perf.perf_counter()
         # [2026-07 추가, 신민용 리포트: "연도전환이 갈수록 느려진다"] SQLite는
         # ANALYZE로 모은 테이블 통계를 바탕으로 실행계획(어느 인덱스를 쓸지)을
         # 정하는데, 이 게임은 한 번도 ANALYZE를 돌린 적이 없어서 테이블이
@@ -5913,9 +5927,10 @@ def _advance_week(p, base_week, n_weeks=4):
         except Exception:
             pass
         _t3b = _time_perf.perf_counter()
-        print(f"[PERF] 연도전환 총 {_t3-_t0:.2f}s "
+        print(f"[PERF] 연도전환 총 {_t3b-_t0:.2f}s "
               f"(커리어정리 {_t1-_t0:.2f}s | _end_of_season {_t2-_t1:.2f}s | "
-              f"일정생성 {_t3-_t2:.2f}s | PRAGMA optimize {_t3b-_t3:.2f}s)")
+              f"일정생성 {_t3-_t2:.2f}s | 파워랭킹 {_t3c-_t3:.2f}s | "
+              f"PRAGMA optimize {_t3b-_t3c:.2f}s)")
     else:
         # 리그 시즌 종료 주(신규 캘린더: 43주) 다음 주 진입 시: 커리어 스탯
         # 중간 업데이트만 (항목은 닫지 않음 - 연도 변경 시 _close_career_entry가 닫음)
