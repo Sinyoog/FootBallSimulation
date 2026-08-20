@@ -200,12 +200,14 @@ class RetireWindow(QDialog):
             import promotion_playoff_engine
             from competition import europa_engine
             from competition import conference_engine
+            from competition import super_cup_engine
             self._career_match_cache = {
                 "intl_ms": intl_engine.get_my_intl_matches(),
                 "qual_ms": intl_engine.get_my_qual_matches(),
                 "cl_ms": champions_engine.get_my_cl_matches(),
                 "el_ms": europa_engine.get_my_el_matches(),
                 "ecl_ms": conference_engine.get_my_ecl_matches(),
+                "sc_ms": super_cup_engine.get_my_sc_matches(),
                 "cup_ms": cup_engine.get_my_cup_matches(),
                 "cwc_ms": club_world_cup_engine.get_my_cwc_matches(),
                 "po_ms": promotion_playoff_engine.get_my_po_matches(),
@@ -313,7 +315,6 @@ class RetireWindow(QDialog):
             ("시즌", f"{p.get('total_seasons',0)}"),
             ("총자산", fmt_money(p.get('total_assets',0))),
             ("누적수입", fmt_money(p.get('total_earnings',0))),  # 이슈10
-            ("전성기OVR", str(p.get('peak_ovr', p.get('ovr',0)))),
         ]
         if _max_fee > 0:
             stats.append(("최고이적료", fmt_money(_max_fee)))
@@ -431,6 +432,13 @@ class RetireWindow(QDialog):
         t36c.setObjectName("secTitle")
         lay.addWidget(t36c)
         lay.addWidget(self._champions_table(ecl_ms, p, label="컨퍼런스리그"))
+
+        # ── 슈퍼컵 기록 (2026-08 신설, 14순위) ────────
+        sc_ms = _cm["sc_ms"]
+        t36s = QLabel(f"🏵 슈퍼컵 기록  ({len(sc_ms)})")
+        t36s.setObjectName("secTitle")
+        lay.addWidget(t36s)
+        lay.addWidget(self._champions_table(sc_ms, p, label="슈퍼컵"))
 
         # ── 컵대회 기록 ──────────────────────────────
         cup_ms = _cm["cup_ms"]
@@ -576,7 +584,7 @@ class RetireWindow(QDialog):
             stat_cols = ["골","어시","기회창출","패스%","차단","드리블"]
         else:
             stat_cols = ["골","어시","슈팅","유효","기회창출","드리블"]
-        cols = (["기간","포지션","국가","리그","팀명","연봉","출전"]
+        cols = (["기간","나이","포지션","국가","리그","팀명","연봉","출전"]
                 + stat_cols
                 + ["평균평점","팀순위","승무패","🟥","계약","이적"])
         # 이슈3: '스퓨리어스 중복 행'(이벤트 없이 잔류만 하는데 실수로
@@ -598,7 +606,13 @@ class RetireWindow(QDialog):
             return sy == ey and (ew - sw) <= 4
         visible = [e for e in entries if not _is_empty_short(e)]
         tbl  = self._make_table(len(visible), cols)
-        
+        # [2026-08 신설, 15순위 연장 — 신민용 리포트: "career_window.py엔
+        # 나이가 적혀있는데 retire_window.py엔 안 적혀있다"] career_window
+        # 의 _team_tab과 완전히 같은 계산(birth_year 기준) — 은퇴한 선수라
+        # p["age"]가 은퇴 시점 나이로 고정돼 있어도, birth_year는 그대로
+        # 남아있어 과거 각 재직 연도의 나이를 그대로 역산할 수 있다.
+        _birth_year = get_player().get("birth_year")
+
         prev_team = None
         for i, e in enumerate(visible):
             rc  = e.get("season_rating_cnt", 0)
@@ -618,6 +632,20 @@ class RetireWindow(QDialog):
             start_str = week_to_iso_date_str(sy, sw) if sy else ""
             end_str = week_to_iso_date_str_end(ey, ew) if ey else ""
             period = f"{start_str} ~ {end_str}"
+
+            # [2026-08 신설, 15순위 연장, 신민용 리포트: "career_window.py엔
+            # 나이가 적혀있는데 retire_window.py엔 안 적혀있다"] career_window
+            # 의 _team_tab과 완전히 같은 계산(birth_year 기준) — 은퇴한
+            # 선수라 대부분 재직 기간이 이미 닫혀있지만(ey 있음), 혹시 안
+            # 닫힌 마지막 스틴트가 있으면 은퇴 시점 나이(p["age"])까지로
+            # 계산한다.
+            if _birth_year and sy:
+                _age_end_year = ey if ey else (sy + (get_player().get("age", 0) - (sy - _birth_year)))
+                age_start = sy - _birth_year
+                age_end = _age_end_year - _birth_year
+                age_str = f"{age_start}세" if age_start == age_end else f"{age_start}~{age_end}세"
+            else:
+                age_str = "—"
 
             pos   = e.get("position","")
             sv  = e.get("saves", 0)
@@ -742,7 +770,7 @@ class RetireWindow(QDialog):
                 if _total_teams:
                     rank_disp = f"{e.get('team_rank',0)}위/{_total_teams}팀"
 
-            vals = ([period, pos,
+            vals = ([period, age_str, pos,
                      country_str,
                      league_str,
                      e.get("team_name",""),
@@ -798,13 +826,15 @@ class RetireWindow(QDialog):
             stat_cols = ["골", "어시", "기회창출", "패스%", "차단", "드리블"]
         else:
             stat_cols = ["골", "어시", "슈팅", "유효", "기회창출", "드리블"]
-        cols = ["기간", "팀명", "리그", "출전"] + stat_cols + ["평균평점", "승무패", "🟥"]
+        cols = ["기간", "나이", "팀명", "리그", "출전"] + stat_cols + ["평균평점", "승무패", "🟥"]
 
         visible = [e for e in entries if not _is_empty_short(e)]
         tbl = self._make_table(len(visible), cols)
 
         from game_engine import get_full_history_extras_for_period, team_matches_played_in_window
         _nat = get_player().get("nationality", "")
+        # [2026-08 신설, 15순위 연장] career_window.py의 _club_totals_tab과 동일.
+        _birth_year = get_player().get("birth_year")
         for i, e in enumerate(visible):
             sy = e.get("start_year", ""); sw = e.get("start_week", 1)
             ey = e.get("end_year", "");   ew = e.get("end_week", 52)
@@ -812,6 +842,14 @@ class RetireWindow(QDialog):
             start_str = week_to_iso_date_str(sy, sw) if sy else ""
             end_str = week_to_iso_date_str_end(ey, ew) if ey else ""
             period = f"{start_str} ~ {end_str}"
+
+            if _birth_year and sy:
+                _age_end_year = ey if ey else (sy + (get_player().get("age", 0) - (sy - _birth_year)))
+                age_start = sy - _birth_year
+                age_end = _age_end_year - _birth_year
+                age_str = f"{age_start}세" if age_start == age_end else f"{age_start}~{age_end}세"
+            else:
+                age_str = "—"
 
             # [2026-07 버그수정, career_window.py와 동일 버그 발견/수정] ey가 0
             # (진행 중)일 때 "ey or sy or 0"은 end_year를 start_year 그 해
@@ -878,7 +916,7 @@ class RetireWindow(QDialog):
             # + 컵/챔스/클럽월드컵/국가대표 합산(extras["red_cards"]).
             red_cards_str = str(e.get("red_cards", 0) + extras["red_cards"])
 
-            vals = ([period, e.get("team_name", ""),
+            vals = ([period, age_str, e.get("team_name", ""),
                      f"{e.get('league_name','')} ({e.get('tier','')}부)",
                      apps_str]
                     + stat_vals + [avg, wdl_str, red_cards_str])
@@ -1296,12 +1334,8 @@ class RetireWindow(QDialog):
         _origin_flag = p.get("origin_flag", "") or p.get("flag", "")
         lines.append(f"국적: {_nats}  |  🏠출생: {_origin_flag}{_origin_nat}  "
                      f"|  ⚽대표: {_rep}  |  포지션: {p['position']} ({p.get('sub_role','')})")
-        _peak_ovr = p.get('peak_ovr', p.get('ovr', 0))
         _final_ovr = p.get('ovr', 0)
-        _ovr_line = f"전성기 OVR: {_peak_ovr}"
-        if _final_ovr and _final_ovr < _peak_ovr:
-            _ovr_line += f" (은퇴 시점 {_final_ovr})"
-        lines.append(f"성격: {p.get('personality','')}  |  특징: {p.get('physical_trait','무난함')}  |  은퇴 나이: {p['age']}세  |  {_ovr_line}")
+        lines.append(f"성격: {p.get('personality','')}  |  특징: {p.get('physical_trait','무난함')}  |  은퇴 나이: {p['age']}세  |  최종 OVR: {_final_ovr}")
         lines.append("")
 
         # ── [국적 연혁] 출생 → 귀화 → 대표선택 시간순 이력 ──────────
@@ -1737,6 +1771,18 @@ class RetireWindow(QDialog):
                 lines.append(f"  • {cm['date']}  "
                              f"{cm['comp']} {cm['stage']}  ({cm['team']}) vs {cm['opp']}  ─  "
                              f"{_match_line_str(cm)}  ({cm['score']} {format_result_with_absence(cm)})")
+        else:
+            lines.append("  없음")
+        lines.append("")
+
+        # 슈퍼컵 기록 (2026-08 신설, 14순위)
+        sc_ms2 = _cm2["sc_ms"]
+        lines.append(f"▶ 슈퍼컵 기록  ({len(sc_ms2)}경기)  ※ 클럽 대항전 (A매치 아님)")
+        if sc_ms2:
+            for sm in sc_ms2:
+                lines.append(f"  • {sm['date']}  "
+                             f"{sm['comp']} {sm['stage']}  ({sm['team']}) vs {sm['opp']}  ─  "
+                             f"{_match_line_str(sm)}  ({sm['score']} {format_result_with_absence(sm)})")
         else:
             lines.append("  없음")
         lines.append("")

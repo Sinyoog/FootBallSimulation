@@ -10,6 +10,7 @@ from competition import conference_engine
 from competition import continental_qualification
 from competition import cup_engine
 from competition import club_world_cup_engine
+from competition import super_cup_engine
 import promotion_playoff_engine
 from match_sim import match_flow
 from match_sim import tactical_engine
@@ -1420,6 +1421,8 @@ def advance_4weeks(schedule: list):
                     europa_engine.simulate_my_el_match(week, p)
                 elif _kind == "conference":
                     conference_engine.simulate_my_ecl_match(week, p)
+                elif _kind == "super_cup":
+                    super_cup_engine.simulate_my_super_cup_match(week, p)
                 else:
                     champions_engine.simulate_my_cl_match(week, p)
             else:
@@ -1429,6 +1432,7 @@ def advance_4weeks(schedule: list):
             cm = champions_engine.get_my_cl_match(week)
             elm = europa_engine.get_my_el_match(week)
             eclm = conference_engine.get_my_ecl_match(week)
+            scm = super_cup_engine.get_my_super_cup_match(week)
             if im:
                 _had_match = True
                 intl_engine.simulate_my_match(week, p)
@@ -1441,6 +1445,9 @@ def advance_4weeks(schedule: list):
             elif eclm:
                 _had_match = True
                 conference_engine.simulate_my_ecl_match(week, p)
+            elif scm:
+                _had_match = True
+                super_cup_engine.simulate_my_super_cup_match(week, p)
             else:
                 _process_training(p, week, stype, detail)
                 _sim_my_unscheduled_match(week, p, cur_season)
@@ -1452,6 +1459,7 @@ def advance_4weeks(schedule: list):
         europa_engine.process_el_week(week)
         conference_engine.process_ecl_week(week)
         club_world_cup_engine.process_cwc_week(week)
+        super_cup_engine.process_super_cup_week(week)
         _sim_all_ai_matches(week, p.get("current_league_id", 0), cur_season)
 
         # ── 정확히 1주 전진 (경계 트리거 매주 검사) ──
@@ -1588,6 +1596,8 @@ def advance_days(schedule: list):
                     europa_engine.sim_my_el_match_as_ai(week, p, reason="injury", day=day)
                 elif _kind == "conference":
                     conference_engine.sim_my_ecl_match_as_ai(week, p, reason="injury", day=day)
+                elif _kind == "super_cup":
+                    super_cup_engine.sim_my_super_cup_match_as_ai(week, p, reason="injury", day=day)
                 else:
                     champions_engine.sim_my_cl_match_as_ai(week, p, reason="injury", day=day)
             elif isinstance(detail, dict) and detail.get("cup"):
@@ -1613,6 +1623,8 @@ def advance_days(schedule: list):
                     europa_engine.sim_my_el_match_as_ai(week, p, reason="injury", day=day)
                 elif day == _intl_cl_day and conference_engine.get_my_ecl_match(week, day=day, p=p):
                     conference_engine.sim_my_ecl_match_as_ai(week, p, reason="injury", day=day)
+                elif super_cup_engine.get_my_super_cup_match(week, day=day, p=p):
+                    super_cup_engine.sim_my_super_cup_match_as_ai(week, p, reason="injury", day=day)
                 elif day == _intl_cl_day and cup_engine.get_my_cup_match(week, day=day, p=p):
                     cup_engine.sim_my_cup_match_as_ai(week, p, reason="injury", day=day)
                 elif club_world_cup_engine.get_my_cwc_match(week, day=day, p=p):
@@ -1631,6 +1643,8 @@ def advance_days(schedule: list):
                     europa_engine.simulate_my_el_match(week, p, day=day)
                 elif _kind == "conference":
                     conference_engine.simulate_my_ecl_match(week, p, day=day)
+                elif _kind == "super_cup":
+                    super_cup_engine.simulate_my_super_cup_match(week, p, day=day)
                 else:
                     champions_engine.simulate_my_cl_match(week, p, day=day)
             elif isinstance(detail, dict) and detail.get("cup"):
@@ -1654,6 +1668,7 @@ def advance_days(schedule: list):
             cm = champions_engine.get_my_cl_match(week, day=day, p=p) if day == _intl_cl_day else None
             elm = europa_engine.get_my_el_match(week, day=day, p=p) if day == _intl_cl_day else None
             eclm = conference_engine.get_my_ecl_match(week, day=day, p=p) if day == _intl_cl_day else None
+            scm = super_cup_engine.get_my_super_cup_match(week, day=day, p=p)
             cu = cup_engine.get_my_cup_match(week, day=day, p=p) if day == _intl_cl_day else None
             cw = club_world_cup_engine.get_my_cwc_match(week, day=day, p=p)
             po = promotion_playoff_engine.get_my_po_match(week, day=day, p=p)
@@ -1669,6 +1684,9 @@ def advance_days(schedule: list):
             elif eclm:
                 _had_match = True
                 conference_engine.simulate_my_ecl_match(week, p, day=day)
+            elif scm:
+                _had_match = True
+                super_cup_engine.simulate_my_super_cup_match(week, p, day=day)
             elif cu:
                 _had_match = True
                 cup_engine.simulate_my_cup_match(week, p, day=day)
@@ -1727,6 +1745,12 @@ def advance_days(schedule: list):
         # 부른다 — 처리할 게 없는 날엔 비용이 거의 없다.
         club_world_cup_engine.process_cwc_week(week, day=day)
         _diw_t2 = _time_diw.perf_counter()
+        # [2026-08 신설, 10순위] 슈퍼컵도 클럽월드컵과 동일한 이유로 매일
+        # 호출한다 — 준결승/결승이 한 주(day1/3/6) 안에서 요일 단위로
+        # 갈리므로, 주 마지막 날에만 부르면 중간 요일에 이미 지난 경기가
+        # 뒤늦게 처리되는 문제가 그대로 재현된다(process_cwc_week 위
+        # 버그수정 주석과 동일한 이유).
+        super_cup_engine.process_super_cup_week(week, day=day)
         if _diw_t2 - _diw_t0 >= 0.05:
             print(f"[PERF-DAILYHOOK] {week}주차 {day}일차: "
                   f"process_intl_week {_diw_t1-_diw_t0:.3f}s | "
@@ -4919,12 +4943,17 @@ def get_my_trophies():
 
 
 def get_team_rank(team_id, conn=None, season=None) -> str:
-    """팀 순위 문자열 반환. conn/season 주어지면 재사용."""
+    """팀 순위 문자열 반환. conn/season 주어지면 재사용.
+    [2026-08 확장, 신민용 요청: "15위 (2승 0무 7패 / 승점)처럼 뜨는데
+    15위/그 리그 총 몇팀 이렇게 총 팀 수도 같이 떠야 한다"] rank_str
+    파싱하는 다른 호출부(예: rank_str.split("위")[0])는 "위" 바로 뒤에
+    "/총 N팀"이 붙어도 그 앞부분(숫자)만 잘라내므로 영향이 없다."""
     if not team_id:
         return "정보 없음"
     rows = get_league_standings_by_team(team_id, conn=conn, season=season)
     if not rows:
         return "정보 없음"
+    total = len(rows)
     for i, r in enumerate(rows):
         if r["id"] == team_id:
             rank = i + 1
@@ -4936,8 +4965,71 @@ def get_team_rank(team_id, conn=None, season=None) -> str:
                 rank_str = f"공동 {rank}위"
             else:
                 rank_str = f"{rank}위"
-            return f"{rank_str}  ({r['wins']}승 {r['draws']}무 {r['losses']}패 / 승점 {r['pts']}점)"
+            return f"{rank_str}/{total}팀  ({r['wins']}승 {r['draws']}무 {r['losses']}패 / 승점 {r['pts']}점)"
     return "정보 없음"
+
+
+# [2026-08 신설] player_panel.py 순위 라벨 색상 상수 — 표준 초록/빨강/파랑.
+RANK_COLOR_NEUTRAL = "#00cc44"
+RANK_COLOR_RELEGATED = "#ff5555"
+RANK_COLOR_PROMOTED = "#4da6ff"
+
+
+def get_team_rank_with_zone_color(team_id) -> tuple:
+    """[2026-08 신설, 신민용 요청: "player_panel.py 순위 표시 — 확정
+    강등권이면 빨간색, 확정 승격권이면 파란색. 확정은 승강 플레이오프
+    안 뛰고 바로 올라가거나 내려가는 걸 말한다. 강등당하면 지금은
+    정보없음이라 뜨는데, 다음 1주차가 오기 전까지는 그 결과가 그대로
+    보여야 한다 — 자동 강등이든 PO에서 져서 강등이든 빨간색, PO에서
+    이겨서 잔류했으면 원래 초록색, 승격도 마찬가지로 파란색"]
+    (rank_str, color_hex) 튜플 반환.
+
+    ["확정"의 실제 판정 기준] 승격/강등 여부는 auto(직행)/PO(플레이오프)
+    경로를 따로 구분할 필요가 없다 — 어느 경로든 실제로 팀이 이동하면
+    promotion_playoff_engine.py가 promotion_log에 그대로 기록하므로,
+    "이 시즌(year)에 이 팀의 promotion_log 기록이 있는가"만 보면 결과
+    (승격/강등/잔류)를 이미 다 알 수 있다. PO가 아직 안 끝나서 최종
+    결과가 없는 동안은 그냥 초록(중립)으로 둔다 — 아직 확정된 게 없으므로.
+
+    ["다음 1주차가 오기 전까지" 유지되는 이유] get_league_standings_by_team
+    (season=이번 시즌)은 이미 _team_league_id_for_season으로 "그 시즌에
+    실제로 뛴 리그"를 찾는다 — 그래서 44~52주(승강이 teams.league_id엔
+    이미 반영됐지만 아직 같은 시즌 번호인 기간) 동안에도 옛 리그의 최종
+    순위가 그대로 나온다. 새 시즌(current_season 증가)이 되고 아직 그
+    시즌 경기가 하나도 없으면, teams.league_id(승강 반영된 새 리그)로
+    폴백해서 0-0-0인 새 시즌 순위표가 나온다 — 정확히 "다음 1주차가
+    오면 교체"되는 지점이다."""
+    if not team_id:
+        return "정보 없음", RANK_COLOR_NEUTRAL
+    st = get_state()
+    if not st:
+        return get_team_rank(team_id), RANK_COLOR_NEUTRAL
+
+    season_now = st.get("current_season", 1)
+    year_now = st.get("current_year")
+
+    conn = get_conn()
+    rank_str = get_team_rank(team_id, conn=conn, season=season_now)
+    season_used, year_used = season_now, year_now
+    if rank_str == "정보 없음" and season_now > 1:
+        # 이번 시즌엔 아직 실제 경기가 없다(막 새 시즌 진입) — 직전
+        # 시즌의 최종 순위를 대신 보여준다("다음 1주차가 오기 전까지").
+        rank_str = get_team_rank(team_id, conn=conn, season=season_now - 1)
+        season_used, year_used = season_now - 1, (year_now - 1 if year_now else None)
+
+    color = RANK_COLOR_NEUTRAL
+    if rank_str != "정보 없음" and year_used is not None:
+        mv = conn.execute(
+            """SELECT from_tier, to_tier FROM promotion_log
+               WHERE year=? AND team_id=? ORDER BY id DESC LIMIT 1""",
+            (year_used, team_id)).fetchone()
+        if mv:
+            if mv["to_tier"] < mv["from_tier"]:
+                color = RANK_COLOR_PROMOTED   # tier 숫자가 작아짐 = 상위 리그로 승격
+            elif mv["to_tier"] > mv["from_tier"]:
+                color = RANK_COLOR_RELEGATED  # tier 숫자가 커짐 = 하위 리그로 강등
+    conn.close()
+    return rank_str, color
 
 
 def get_league_standings_by_team(team_id, conn=None, season=None):
@@ -6452,6 +6544,7 @@ def get_club_other_competitions_summary(team_id, start_year, end_year):
                              ("cl_matches", "cl_tournaments"),
                              ("el_matches", "el_tournaments"),
                              ("ecl_matches", "ecl_tournaments"),
+                             ("sc_matches", "sc_tournaments"),
                              ("cwc_matches", "cwc_tournaments")):
         rows = conn.execute(
             f"""SELECT m.my_goals, m.my_assists, m.my_rating FROM {m_table} m
@@ -6534,6 +6627,7 @@ def get_full_history_extras_for_period(team_id, nationality, start_year, end_yea
                           ("cl_matches", "cl_tournaments"),
                           ("el_matches", "el_tournaments"),
                           ("ecl_matches", "ecl_tournaments"),
+                          ("sc_matches", "sc_tournaments"),
                           ("cwc_matches", "cwc_tournaments")):
         avail_row = c.execute(
             f"""SELECT COUNT(*) n FROM {tbl} m JOIN {tour_tbl} t ON m.tournament_id=t.id
@@ -6665,6 +6759,7 @@ def get_club_and_total_extras_for_period(team_id, nationality, start_year, end_y
                           ("cl_matches", "cl_tournaments"),
                           ("el_matches", "el_tournaments"),
                           ("ecl_matches", "ecl_tournaments"),
+                          ("sc_matches", "sc_tournaments"),
                           ("cwc_matches", "cwc_tournaments")):
         row = c.execute(
             f"""SELECT COUNT(*) n, COALESCE(SUM(m.my_goals),0) g, COALESCE(SUM(m.my_assists),0) a
@@ -6736,8 +6831,19 @@ def _get_cl_cup_season_stats(year):
                   COALESCE(SUM(m.my_rating),0) rs, COUNT(*) rc
            FROM cup_matches m JOIN cup_tournaments t ON m.tournament_id=t.id
            WHERE t.year=? AND m.my_played=1""", (year,)).fetchone()
+    # [2026-08 신설, 10순위 슈퍼컵 시스템 구축 이후, 신민용 요청: "상 받는
+    # 것도 슈퍼컵 용으로 추가해야 한다"] 챔스/컵/국가대표와 동일하게,
+    # 슈퍼컵에서 낸 개인 기록(골/도움/평점)도 이 합산에 포함시킨다 —
+    # 이전엔 슈퍼컵이 없어서 반영할 대상 자체가 없었다.
+    sc = conn.execute(
+        """SELECT COALESCE(SUM(m.my_goals),0) g, COALESCE(SUM(m.my_assists),0) a,
+                  COALESCE(SUM(m.my_rating),0) rs, COUNT(*) rc
+           FROM sc_matches m JOIN sc_tournaments t ON m.tournament_id=t.id
+           WHERE t.year=? AND m.my_played=1""", (year,)).fetchone()
     cl_t = conn.execute(
         "SELECT my_result FROM cl_tournaments WHERE year=? AND my_in=1", (year,)).fetchone()
+    sc_t = conn.execute(
+        "SELECT my_result FROM sc_tournaments WHERE year=? AND my_in=1", (year,)).fetchone()
     # [2026-07 버그수정, 신민용 리포트: "월드컵 기간에는 월드컵 기준까지
     # 넣고 그래야지"] 함수 docstring/주변 주석은 "챔스+컵+국가대표 대회"를
     # 전부 반영한다고 되어 있었는데, 실제로는 국가대표 대회(월드컵/대륙컵)
@@ -6753,12 +6859,20 @@ def _get_cl_cup_season_stats(year):
            WHERE t.year=? AND m.my_played=1""", (year,)).fetchone()
     conn.close()
     cl_won = bool(cl_t and cl_t["my_result"] and "우승" in cl_t["my_result"])
+    # [2026-08 신설] 슈퍼컵 우승 게이트 — cl_won과 같은 방식으로, FIFA
+    # 올해의 선수/UEFA·AFC 올해의 선수 등 "우승 시 자동 통과" 조건에
+    # cl_won과 나란히 OR로 추가한다(챔스보다는 약한 대회이므로 발롱도르
+    # 트로피 점수 자체는 0.2배로 낮게 잡지만, "세계 무대에서 우승해봤다"는
+    # 게이트 통과 조건으로는 챔스와 동등하게 인정 — 게이트는 이분법적
+    # 자격 검증이라 가중치 개념이 없다).
+    sc_won = bool(sc_t and sc_t["my_result"] and "우승" in sc_t["my_result"])
     return {
-        "goals": cl["g"] + cup["g"] + intl["g"],
-        "assists": cl["a"] + cup["a"] + intl["a"],
-        "rating_sum": cl["rs"] + cup["rs"] + intl["rs"],
-        "rating_cnt": cl["rc"] + cup["rc"] + intl["rc"],
+        "goals": cl["g"] + cup["g"] + intl["g"] + sc["g"],
+        "assists": cl["a"] + cup["a"] + intl["a"] + sc["a"],
+        "rating_sum": cl["rs"] + cup["rs"] + intl["rs"] + sc["rs"],
+        "rating_cnt": cl["rc"] + cup["rc"] + intl["rc"] + sc["rc"],
         "cl_won": cl_won,
+        "sc_won": sc_won,
     }
 
 
@@ -6787,8 +6901,11 @@ def _get_cl_cup_season_stats(year):
 # "AI 라이벌의 트로피 점수"를 1:1로 비교하는 건 불가능하고, 대신 내
 # 개인 성적+트로피 합산 점수가 발롱도르급 최소 문턱(BALLON_SCORE_MIN)을
 # 넘는지로 판정한다(기존에도 AI는 스탯만으로 추정됐으므로 같은 한계선상).
-# 슈퍼컵/클럽 월드컵은 이 게임에 아예 구현돼 있지 않은 대회라 가중치를
-# 매길 대상 자체가 없다 — 추가하려면 그 대회 시스템부터 새로 만들어야 한다.
+# [2026-08 갱신] 슈퍼컵은 super_cup_engine.py로 실제 구현됐다 — 아래
+# _sc_trophy_points가 _cl_trophy_points의 0.2배 가중치로 반영한다(신민용
+# 확정: "챔스가 발롱에 1의 영향을 주면 슈퍼컵은 0.2의 영향"). 클럽
+# 월드컵은 여전히 이 심사 로직에 포함되지 않는다 — 발롱도르 가중치를
+# 매기려면 별도 확정이 필요하다.
 def _cl_trophy_points(result: str) -> float:
     # [2026-07 재조정, 신민용 지적: "트로피 보너스 배점이 조금 약할 가능성 —
     # 차등을 크게 두면 훨씬 현실적"] 우승/준우승 쪽을 더 높이고 8강/16강
@@ -6819,6 +6936,18 @@ def _cup_trophy_points(result: str) -> float:
     if "준우승" in result:
         return 0.3
     return 0.0
+
+
+def _sc_trophy_points(result: str) -> float:
+    """[2026-08 신설, 10순위 슈퍼컵 시스템 구축 이후, 신민용 확정: "챔스가
+    발롱에 1의 영향을 주면 슈퍼컵은 0.2의 영향을 주는 것"] 슈퍼컵은 이제
+    실제로 구현됐으므로(super_cup_engine.py), 위 주석에서 "가중치를 매길
+    대상 자체가 없다"고 적어뒀던 한계가 해소됐다 — _cl_trophy_points와
+    완전히 같은 결과 판정 기준(우승/준우승/4강급)에 0.2를 곱해, 챔스
+    대비 정확히 1/5 무게로 반영한다. 슈퍼컵은 연 1회·4팀뿐인 단기
+    대회라 챔스만큼 심사에 크게 반영되면 안 된다는 원래 설계 의도
+    (위 별점 표: "슈퍼컵/클럽월드컵 ⭐☆☆☆☆~⭐⭐☆☆☆")를 그대로 따른다."""
+    return _cl_trophy_points(result) * 0.2
 
 
 def _intl_trophy_points(result: str, kind: str = "world", continent: str = "") -> float:
@@ -6904,6 +7033,8 @@ def _get_ballon_trophy_bonus(year: int, team_id: int) -> float:
         "SELECT my_result FROM cl_tournaments WHERE year=? AND my_in=1", (year,)).fetchone()
     cup_t = conn.execute(
         "SELECT my_result FROM cup_tournaments WHERE year=? AND my_in=1", (year,)).fetchone()
+    sc_t = conn.execute(
+        "SELECT my_result FROM sc_tournaments WHERE year=? AND my_in=1", (year,)).fetchone()
     intl_t = conn.execute(
         "SELECT kind, continent, my_result FROM intl_tournaments WHERE year=? AND my_selected=1",
         (year,)).fetchone()
@@ -6911,6 +7042,7 @@ def _get_ballon_trophy_bonus(year: int, team_id: int) -> float:
     bonus = 0.0
     bonus += _cl_trophy_points(cl_t["my_result"] if cl_t else None)
     bonus += _cup_trophy_points(cup_t["my_result"] if cup_t else None)
+    bonus += _sc_trophy_points(sc_t["my_result"] if sc_t else None)
     bonus += _intl_trophy_points(
         intl_t["my_result"] if intl_t else None,
         intl_t["kind"] if intl_t else "world",
@@ -7154,6 +7286,25 @@ def _generate_ai_representative_goal(c, year, league_id, league_name, grade,
     return cur.lastrowid
 
 
+# [2026-08 신설, 17순위 올해의 골 재설계] 튜닝 상수 — 전부 이 근처에
+# 모아둬서, 나중에 "여전히 너무 자주/너무 안 나온다"는 피드백이 오면
+# 여기 숫자만 조정하면 되게 한다.
+#   _GOAL_POOL_SIZE: 리그 올해의 골 경쟁 풀에 넣을 AI 상위 득점자 수.
+#   _GOAL_TOP_FRACTION: 그 풀에서 상위 몇 %까지 "후보" 자격을 주는지.
+#   _GOAL_WIN_PROB_BY_RANK: 후보가 됐을 때 순위별 실제 당첨 확률(1등도
+#     100%가 아니다 — 실제 시상식 표심처럼 편차를 준다).
+#   _GOAL_WIN_PROB_TAIL: 위 딕셔너리에 없는(더 낮은) 순위의 기본 확률.
+#   _PUSKAS_RIVAL_COUNT / _PUSKAS_TOP_CANDIDATES / _PUSKAS_WIN_PROB_BY_RANK:
+#     푸스카스는 리그상보다 훨씬 좁은 문이라 별도로 더 엄격하게 잡는다.
+_GOAL_POOL_SIZE = 10
+_GOAL_TOP_FRACTION = 0.3
+_GOAL_WIN_PROB_BY_RANK = {1: 0.55, 2: 0.30, 3: 0.15}
+_GOAL_WIN_PROB_TAIL = 0.05
+_PUSKAS_RIVAL_COUNT = 8
+_PUSKAS_TOP_CANDIDATES = 3
+_PUSKAS_WIN_PROB_BY_RANK = {1: 0.35, 2: 0.15, 3: 0.06}
+
+
 def _process_goal_awards(c, p, year, tid, league_id, lname, grade, tier, cands, my_awards):
     """[시상 단계] "리그 올해의 골" + "FIFA 푸스카스상"(2009년 이후, 그 전엔
     "올해의 최고의 골")을 판정해 my_awards에 3-tuple(atype, detail,
@@ -7161,10 +7312,25 @@ def _process_goal_awards(c, p, year, tid, league_id, lname, grade, tier, cands, 
     "대회 최고의 골"은 각 대회 엔진에 아직 이 시스템과 연결된 후보군
     수집 로직이 없어 이번 단계에서는 제외(추후 단계에서 확장 예정).
 
-    cands: _collect_league_candidates()가 반환하는 AI 후보 풀(이미
-    _process_awards에서 만들어져 있는 것을 그대로 재사용 — 중복 쿼리 방지).
-    tier==1(자국 최상위 리그)이 아니어도 리그별 상은 받을 수 있다(문서
-    설계상 "리그 등급이 후보 자격을 제한하지 않는다"는 원칙 그대로).
+    [2026-08 재설계, 17순위, 신민용 지적: "올해의 골이 너무 자주 나온다 —
+    수비수가 1994년 1골로 올해의 골, 1997년 2골로 또 올해의 골 받는 건
+    확률적으로 너무 높다. 선수 능력 기반이 아니라 골의 희귀성/경쟁
+    기반으로 가야 한다 — 후보 점수 계산 → 상위 후보 추출 → 확률적 선정"]
+    예전엔 "내 골 1개 vs AI 대표골 1개"를 만들어서 그냥 내가 이기면
+    100% 받는 구조였다(사실상 동전던지기) — 이제는:
+      1) 리그 상위 득점자 여러 명(_GOAL_POOL_SIZE) 각각의 대표골을 만들어
+         "진짜 경쟁 풀"을 구성하고,
+      2) 내 골이 그 풀 안에서 상위 몇 %(_GOAL_TOP_FRACTION) 안에 들어야
+         (=충분히 희귀/뛰어나야) 아예 "후보" 자격이 생기고,
+      3) 후보가 됐어도 순위별 확률(_GOAL_WIN_PROB_BY_RANK)로 당첨 여부를
+         뽑는다 — 1등이어도 100%가 아니다(실제 시상식 표심처럼).
+    "동일 골이 여러 상을 받을 수 있는가" 문제도 여기서 같이 정리한다 —
+    FIFA 푸스카스상은 별개의 "세계 단위 올해의 골" 계층이 아니라(그런
+    3단계 구조는 사실 필요 없다 — 현실의 푸스카스상 자체가 이미 "세계
+    올해의 골"이므로), "이 시즌 리그 올해의 골을 받은 골만" 세계상 후보가
+    되는 구조로 명확히 위계를 세운다. 그래서 같은 골이 리그상+세계상을
+    "동시에" 받는 건 버그가 아니라 위계상 당연한 결과(리그를 이겨야
+    세계 무대에 나갈 자격이 생기는 것과 같은 원리)로 정의한다.
     """
     if not tid or not league_id:
         return
@@ -7180,51 +7346,79 @@ def _process_goal_awards(c, p, year, tid, league_id, lname, grade, tier, cands, 
     if not my_best:
         return
 
-    # 2) AI 대표골 생성(상위 득점자 후보군 최대 5명) — 이미 있는 cands 재사용
-    ai_cand_list = [
-        {"team_id": x.get("team_id"), "player_id": x.get("team_id"),
-         "goals": x.get("goals", 0), "matches": x.get("matches", 1),
-         "ovr": x.get("ovr", 60), "opponent_ovr": x.get("ovr", 60)}
-        for x in cands if not x.get("is_mine") and x.get("goals", 0) > 0
-    ]
-    ai_goal_id = _generate_ai_representative_goal(
-        c, year, league_id, lname, grade, ai_cand_list,
-        competition_type="league", competition_id=league_id, scope="league")
-    ai_best_score = 0.0
-    if ai_goal_id:
-        ai_row = c.execute("SELECT final_score FROM goal_events WHERE id=?",
-                            (ai_goal_id,)).fetchone()
-        ai_best_score = ai_row["final_score"] if ai_row else 0.0
+    # 2) 리그 경쟁 풀 — 상위 득점자 "각자"의 대표골을 만든다(예전엔 상위
+    #    5명 중 최고 1개만 남겨서 사실상 후보가 1명짜리였다).
+    ai_scorers = sorted(
+        [x for x in cands if not x.get("is_mine") and x.get("goals", 0) > 0],
+        key=lambda x: x.get("goals", 0), reverse=True)[:_GOAL_POOL_SIZE]
+    pool_scores = []
+    for i, cand in enumerate(ai_scorers):
+        gid = _generate_ai_representative_goal(
+            c, year, league_id, lname, grade,
+            [{"team_id": cand.get("team_id"), "player_id": cand.get("team_id"),
+              "goals": cand.get("goals", 0), "matches": cand.get("matches", 1),
+              "ovr": cand.get("ovr", 60), "opponent_ovr": cand.get("ovr", 60)}],
+            competition_type="league", competition_id=league_id,
+            scope=f"league_pool{i}")
+        if gid:
+            row = c.execute("SELECT final_score FROM goal_events WHERE id=?", (gid,)).fetchone()
+            if row and row["final_score"] is not None:
+                pool_scores.append(row["final_score"])
 
-    # 3) 리그 올해의 골 — 내 골이 AI 대표골보다 높으면(또는 AI 후보가 없으면) 수상
-    if my_best["final_score"] >= ai_best_score:
-        my_awards.append((f"{lname} 올해의 골", _goal_detail_text(c, my_best), my_best["id"]))
+    # 3) 내 골을 풀에 넣고 순위를 매긴다 — 동점이면 내 골을 더 높은
+    #    순위로 쳐준다(경쟁자 명단에 내 골까지 포함해 "몇 명 중 몇 등"을
+    #    구하는 것뿐이라, 동점 처리 방향이 결과를 크게 바꾸지 않는다).
+    pool_scores.append(my_best["final_score"])
+    pool_scores.sort(reverse=True)
+    my_rank = next(i for i, s in enumerate(pool_scores, start=1) if s <= my_best["final_score"])
 
-    # 4) FIFA 푸스카스상 — 세계급 라이벌 비교(기존 발롱도르/구 푸스카스 패턴 재사용).
-    #    SS/S 등급 1부리그 최고 OVR 공격수를 라이벌 프록시로 삼아 그 라이벌의
-    #    대표골을 하나 만들고, final_score로 직접 비교한다.
+    won_league_goal = False
+    _eligible = my_rank <= max(1, round(len(pool_scores) * _GOAL_TOP_FRACTION))
+    if _eligible:
+        rng = _make_goal_seed(year, tid, league_id, "league_goal_pick")
+        _win_prob = _GOAL_WIN_PROB_BY_RANK.get(my_rank, _GOAL_WIN_PROB_TAIL)
+        if rng.random() < _win_prob:
+            my_awards.append((f"{lname} 올해의 골", _goal_detail_text(c, my_best), my_best["id"]))
+            won_league_goal = True
+
+    # 4) FIFA 푸스카스상 — 리그 올해의 골을 이미 받은 골만 후보가 된다
+    #    (위 docstring 참고 — "세계 무대"는 "리그를 먼저 이긴 골" 중에서만
+    #    나온다는 위계). 세계급 라이벌을 여러 명(_PUSKAS_RIVAL_COUNT) 뽑아
+    #    경쟁 풀을 만들고, 위와 동일하게 상위 후보 + 확률적 선정을 적용한다.
     _PUSKAS_GRADES = ("SS", "S")
-    if grade in _PUSKAS_GRADES and tier == 1:
-        rival = c.execute("""SELECT a.id, a.ovr, a.team_id FROM ai_players a
+    if won_league_goal and grade in _PUSKAS_GRADES and tier == 1:
+        rivals = c.execute("""SELECT a.id, a.ovr, a.team_id FROM ai_players a
             JOIN teams t ON a.team_id=t.id
             JOIN leagues l ON t.league_id=l.id
             JOIN countries cn ON l.country_id=cn.id
             WHERE cn.grade IN ('SS','S') AND l.tier=1 AND a.position IN ({})
-            ORDER BY a.ovr DESC LIMIT 1
-            """.format(",".join("'%s'" % pp for pp in ATTACK_POS))).fetchone()
-        if rival:
+            ORDER BY a.ovr DESC LIMIT ?
+            """.format(",".join("'%s'" % pp for pp in ATTACK_POS)),
+            (_PUSKAS_RIVAL_COUNT,)).fetchall()
+        rival_scores = []
+        for i, rival in enumerate(rivals):
             rival_goal_id = _generate_ai_representative_goal(
                 c, year, league_id, lname, grade,
                 [{"team_id": rival["team_id"], "player_id": rival["id"],
                   "goals": max(12, round(rival["ovr"] / 4)), "matches": 30,
                   "ovr": rival["ovr"], "opponent_ovr": rival["ovr"]}],
-                competition_type="world_rival", competition_id=0, scope="puskas_rival")
-            rival_score = 0.0
+                competition_type="world_rival", competition_id=0,
+                scope=f"puskas_rival{i}")
             if rival_goal_id:
                 rr = c.execute("SELECT final_score FROM goal_events WHERE id=?",
                                 (rival_goal_id,)).fetchone()
-                rival_score = rr["final_score"] if rr else 0.0
-            if my_best["final_score"] >= rival_score:
+                if rr and rr["final_score"] is not None:
+                    rival_scores.append(rr["final_score"])
+
+        rival_scores.append(my_best["final_score"])
+        rival_scores.sort(reverse=True)
+        my_world_rank = next(i for i, s in enumerate(rival_scores, start=1)
+                              if s <= my_best["final_score"])
+        # 세계상은 리그상보다 훨씬 좁은 문 — 상위 극소수만 후보.
+        if my_world_rank <= _PUSKAS_TOP_CANDIDATES:
+            rng2 = _make_goal_seed(year, tid, league_id, "puskas_pick")
+            _win_prob2 = _PUSKAS_WIN_PROB_BY_RANK.get(my_world_rank, 0.02)
+            if rng2.random() < _win_prob2:
                 label = "FIFA 푸스카스상" if year >= 2009 else "올해의 최고의 골"
                 my_awards.append((label, _goal_detail_text(c, my_best), my_best["id"]))
 

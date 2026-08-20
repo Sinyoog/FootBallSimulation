@@ -23,7 +23,7 @@ import json
 # key-value 테이블 meta(key,value)를 그대로 재사용해서 kind별로 최근
 # 검색어 목록을 JSON 문자열 하나로 저장한다. 새 테이블을 만들지 않으므로
 # 기존 세이브에도 그대로(마이그레이션 없이) 적용된다.
-_RECENT_SEARCH_MAX = 5
+_RECENT_SEARCH_MAX = 8
 
 
 def get_recent_searches(kind: str) -> list:
@@ -1060,6 +1060,15 @@ def get_ecl_history(continent=None, limit=100):
                            tournament_table="ecl_tournaments", match_table="ecl_matches")
 
 
+def get_super_cup_history(continent=None, limit=100):
+    """[2026-08 신설, 10순위] 역대 슈퍼컵 기록 — get_cl_history를 sc_* 테이블로.
+    슈퍼컵은 3/4위전이 없어서(총 3경기: 준결승2+결승) third/fourth는 항상
+    빈 값으로 나온다 — _batch_cl_placements가 stage='TP' 매치가 없으면
+    자동으로 None을 주므로 별도 처리가 필요 없다."""
+    return get_cl_history(continent=continent, limit=limit,
+                           tournament_table="sc_tournaments", match_table="sc_matches")
+
+
 # [2026-08 신설, 신민용 요청: "챔스/유로파/컨퍼런스에도 대륙 필터 옆에
 # 역대 1~4위를 가장 많이 차지한 팀 순위를 보여달라"] get_cl_history가
 # 이미 연도별 1~4위를 팀명+국가까지 채워서 주므로, _rank_leaders_from_rows
@@ -1073,6 +1082,16 @@ def get_cl_style_rank_leaders(continent=None, tournament_table="cl_tournaments",
                            tournament_table=tournament_table, match_table=match_table)
     return _rank_leaders_from_rows(rows, ("winner", "runner_up", "third", "fourth"),
                                     "{key}_name", "{key}_country")
+
+
+def get_super_cup_rank_leaders(continent=None):
+    """[2026-08 수정, 10순위 → 신민용 리포트: "3/4위전 생겼으니 최다 순위도
+    1~4위까지 다 떠야 한다"] 3/4위전(TP)이 생겨서 이제 CL/EL/ECL과 완전히
+    동일하게 1~4위 전부 의미가 있다 — get_cl_style_rank_leaders와 동일하게
+    4자리(winner/runner_up/third/fourth)를 그대로 넘긴다."""
+    return get_cl_style_rank_leaders(continent=continent,
+                                      tournament_table="sc_tournaments",
+                                      match_table="sc_matches")
 
 
 def get_el_rank_leaders(continent=None):
@@ -1410,7 +1429,10 @@ def get_country_trophy_summary(country_name):
     예: "남북미 대륙컵 1회", "유로(EURO) 2회"). 대회명이 대륙/대회
     종류에 따라 고정이라(CONF_CUP_NAME 등) 이름 기준으로 묶어도 항상
     하나의 실제 대회를 가리킨다.
-    반환: [{"kind":, "name":, "titles":, "label":, "effective_kind":}, ...]
+    [2026-08 확장, 신민용 요청: "아시안컵 5회 [1956, 1960, ...]처럼
+    우승 연도 목록도 같이 보여달라"] 각 항목에 "years"(우승 연도
+    오름차순 리스트)를 추가한다.
+    반환: [{"kind":, "name":, "titles":, "label":, "effective_kind":, "years":[...]}, ...]
     우승 많은 순."""
     from constants import INTL_TOURNAMENT_KIND_GLYPHS, INTL_TOURNAMENT_KIND_FALLBACK_LABEL
     conn = get_conn()
@@ -1419,12 +1441,80 @@ def get_country_trophy_summary(country_name):
            WHERE status='done' AND winner=? GROUP BY kind, name
            ORDER BY titles DESC""", (country_name,)).fetchall()
     conn.close()
+    # 연도 목록은 get_country_title_list(이미 kind/name/year를 그대로 주는
+    # 함수)를 한 번만 불러서 (kind,name)별로 묶어 재사용한다 — 쿼리 중복 방지.
+    titles = get_country_title_list(country_name, limit=1000)
+    years_by_key = {}
+    for t in titles:
+        years_by_key.setdefault((t["kind"], t["name"]), []).append(t["year"])
+
     out = []
     for r in rows:
         ek = _effective_kind(r["kind"], r["name"])
         glyph = INTL_TOURNAMENT_KIND_GLYPHS.get(ek, INTL_TOURNAMENT_KIND_FALLBACK_LABEL)
+        years = sorted(years_by_key.get((r["kind"], r["name"]), []))
         out.append({"kind": r["kind"], "name": r["name"], "titles": r["titles"],
-                    "label": f"{glyph} {r['name']}", "effective_kind": ek})
+                    "label": f"{glyph} {r['name']}", "effective_kind": ek,
+                    "years": years})
+    return out
+
+
+def get_country_best_non_winning_results(country_name):
+    """[2026-08 신설, 신민용 요청: "우승 못한 대회 중 최고 성적 하나를
+    골라야 한다 — '가장 최근 기록'이 아니라 대회별 최고 성적을 비교해서
+    최고 등급 하나를 선정하는 규칙이 필요"] 이 국가가 "한 번도 우승한
+    적 없는" 대회(name 기준 — 우승 경험이 있는 대회는 get_country_
+    trophy_summary 쪽에 이미 나오므로 여기서 제외)만 대상으로, 본선
+    (예선 wc_qual/cont_qual은 별개 트랙이라 제외) 전체 출전 기록 중
+    가장 좋았던 성적을 rank(0~100, get_country_tournament_results 참고)
+    기준으로 하나 고른다. "가장 최근"이 아니라 "그 대회에서 낸 역대
+    최고 성적"이 기준이므로, 예를 들어 2002년 4강·2018년 16강 탈락이면
+    항상 4강(더 높은 rank)이 선택된다 — 그 최고 rank를 실제로 몇 번
+    달성했는지(count)와 그 연도들(years)을 같이 담는다.
+    반환: [{"kind":, "name":, "effective_kind":, "label":, "result":,
+            "count":, "years":[...]}] — rank 높은 순으로 정렬."""
+    from constants import INTL_TOURNAMENT_KIND_GLYPHS, INTL_TOURNAMENT_KIND_FALLBACK_LABEL
+
+    # [2026-08 버그수정] get_country_trophy_summary의 "name"은 DB 원본
+    # 컬럼값 그대로인데, get_country_tournament_results의 "name"은
+    # _country_result_name()을 거쳐 지역컵이면 "(지역명)"이 붙는다
+    # (예: "AFF 챔피언십" vs "AFF 챔피언십(동남아시아)") — 이 둘을 그대로
+    # (kind,name)으로 비교하면 지역컵은 항상 안 겹쳐서, 우승 경험이 있는
+    # 지역컵도 "우승 못한 대회"로 잘못 다시 나온다. 같은 변환을 거쳐서
+    # 키를 맞춘다(cont_qual 전용 분기는 trophy_summary에 애초에 kind=
+    # 'cont_qual' 행이 없으므로 — 예선엔 winner 개념이 없다 — year는
+    # 아무 값이나 넣어도 안전하다).
+    won_names = {
+        (w["kind"], _country_result_name({"kind": w["kind"], "name": w["name"], "year": None}))
+        for w in get_country_trophy_summary(country_name)
+    }
+    results = get_country_tournament_results(country_name, limit=1000)
+
+    groups = {}
+    for r in results:
+        if r["kind"] in ("wc_qual", "cont_qual"):
+            continue   # 예선은 별개 트랙 — "본선 최고 성적" 비교 대상 아님
+        if r.get("rank", 0) <= 0:
+            continue   # "기록 없음" 등 비교 불가능한 성적은 제외
+        key = (r["kind"], r["name"])
+        if key in won_names:
+            continue   # 우승 경험이 있는 대회는 trophy_summary 쪽에서 이미 보여줌
+        groups.setdefault(key, []).append(r)
+
+    out = []
+    for (kind, name), rows in groups.items():
+        best_rank = max(r["rank"] for r in rows)
+        best_rows = [r for r in rows if r["rank"] == best_rank]
+        years = sorted({r["year"] for r in best_rows})
+        sample = best_rows[0]
+        ek = sample["effective_kind"]
+        glyph = INTL_TOURNAMENT_KIND_GLYPHS.get(ek, INTL_TOURNAMENT_KIND_FALLBACK_LABEL)
+        out.append({"kind": kind, "name": name, "effective_kind": ek,
+                    "label": f"{glyph} {name}", "result": sample["result"],
+                    "count": len(best_rows), "years": years, "_rank": best_rank})
+    out.sort(key=lambda x: (-x["_rank"], x["name"]))
+    for o in out:
+        del o["_rank"]
     return out
 
 
@@ -1447,6 +1537,16 @@ def get_country_title_list(country_name, limit=200):
 # 4자리 중 아무 데도 안 걸리는 경우는 정상적으로 없다.
 _STAGE_ORDER = ["group", "R32", "R16", "QF", "SF"]
 _STAGE_ORDER_IDX = {s: i for i, s in enumerate(_STAGE_ORDER)}
+
+# [2026-08 신설, 신민용 요청: "우승 못한 대회 중 최고 성적 하나를 골라야
+# 한다 — '가장 최근'이 아니라 대회별 최고 성적을 비교하는 규칙이 필요"]
+# get_country_tournament_results가 주는 tier(0~5)는 "탈락(스테이지 무관)"을
+# 전부 1로 뭉뚱그려서, "8강 탈락"과 "16강 탈락" 중 뭐가 더 나은 성적인지
+# 구분이 안 된다 — 그 둘을 구분할 수 있는 촘촘한 rank(0~100) 스케일을
+# 따로 둔다. 우승(100)만 없을 뿐 나머지는 전부 유일한 값을 가져서,
+# "이 대회에서 낸 최고 성적"을 max(rank)로 항상 명확히 고를 수 있다.
+_PLACEMENT_RANK = {5: 100, 4: 90, 3: 80, 2: 70}
+_STAGE_RANK = {"SF": 60, "QF": 50, "R16": 40, "R32": 30, "group": 20}
 
 
 def get_country_tournament_results(country_name, limit=200):
@@ -1537,6 +1637,8 @@ def get_country_tournament_results(country_name, limit=200):
         pl = placements.get(t["id"], {})
         rec = record_by_tid.get(t["id"], {"w": 0, "d": 0, "l": 0})
         record_str = f"{rec['w']}승 {rec['d']}무 {rec['l']}패"
+        rank = 0   # [2026-08 신설] 기본값 — 예선류(wc_qual/cont_qual)는
+                   # "본선 최고 성적" 비교 대상이 아니라 항상 0으로 둔다.
         if t["kind"] == "wc_qual":
             # 예선은 우승/준우승 개념이 없다 — "본선 진출" 여부와 탈락 시
             # 어느 라운드(조별리그/플레이오프)에서 떨어졌는지만 의미가 있다.
@@ -1562,19 +1664,20 @@ def get_country_tournament_results(country_name, limit=200):
                 else:
                     result, tier = "기록 없음", 0
         elif pl.get("winner") == country_name:
-            result, tier = "🥇 우승", 5
+            result, tier, rank = "🥇 우승", 5, _PLACEMENT_RANK[5]
         elif pl.get("runner_up") == country_name:
-            result, tier = "🥈 준우승", 4
+            result, tier, rank = "🥈 준우승", 4, _PLACEMENT_RANK[4]
         elif pl.get("third") == country_name:
-            result, tier = "🥉 3위", 3
+            result, tier, rank = "🥉 3위", 3, _PLACEMENT_RANK[3]
         elif pl.get("fourth") == country_name:
-            result, tier = "4위", 2
+            result, tier, rank = "4위", 2, _PLACEMENT_RANK[2]
         else:
             stages = stages_by_tid.get(t["id"], set())
             reached = [s for s in stages if s in _STAGE_ORDER_IDX]
             if reached:
                 best = max(reached, key=lambda s: _STAGE_ORDER_IDX[s])
                 result, tier = f"{STAGE_KO.get(best, best)} 탈락", 1
+                rank = _STAGE_RANK.get(best, 10)
             else:
                 result, tier = "기록 없음", 0
         # [2026-08 버그수정, 신민용 리포트: "태국이 예선 조별리그까지 들어갔는데
@@ -1589,7 +1692,7 @@ def get_country_tournament_results(country_name, limit=200):
                      "kind": t["kind"] or "?",
                      "effective_kind": _effective_kind(t["kind"] or "", t["name"] or "", t.get("year")),
                      "name": _country_result_name(t),
-                     "result": result, "tier": tier,
+                     "result": result, "tier": tier, "rank": rank,
                      "record": record_str})
     return out
 
@@ -1844,6 +1947,15 @@ def get_ecl_tournament_detail(tournament_id):
                                      match_table="ecl_matches", tournament_table="ecl_tournaments")
 
 
+def get_super_cup_tournament_detail(tournament_id):
+    """[2026-08 신설, 10순위] 슈퍼컵 대회 상세 — get_cl_tournament_detail을
+    sc_* 테이블로. 슈퍼컵은 리그 스테이지가 없어서(4팀 다이렉트 토너먼트)
+    league_standings는 참가 4팀이 전적 0-0-0인 채로만 나온다 — 화면에서는
+    knockout(준결승/3·4위전/결승) 대진표 부분만 의미가 있다."""
+    return get_cl_tournament_detail(tournament_id, entry_table="sc_entries",
+                                     match_table="sc_matches", tournament_table="sc_tournaments")
+
+
 # ─────────────────────────────────────────
 # 7. 역대 클럽 월드컵 기록 (2026-07 신설)
 # ─────────────────────────────────────────
@@ -2086,7 +2198,9 @@ def get_team_history(team_id: int):
     trow = conn.execute("SELECT name FROM teams WHERE id=?", (team_id,)).fetchone()
     if not trow:
         conn.close()
-        return {"awards": {"league": 0, "cup": 0, "cl": 0, "cwc": 0}, "years": []}
+        return {"awards": {"league": 0, "cup": 0, "cl": 0, "cwc": 0,
+                            "cl_champions": 0, "el_champions": 0, "ecl_champions": 0,
+                            "sc_champions": 0}, "years": []}
     team_name = trow["name"]
 
     yr_rows = conn.execute(
@@ -2150,13 +2264,14 @@ def get_team_history(team_id: int):
 
     out = []
     for (year, season), league_id in sorted(by_year.items(), key=lambda x: -x[0][0]):
-        entry = {"year": year, "league": None, "cup": None, "cl": None, "cwc": None,
+        entry = {"year": year, "league": None, "cup": None, "cl": None, "cwc": None, "sc": None,
                   "league_record": None, "cup_record": None, "cl_record": None, "cwc_record": None,
+                  "sc_record": None,
                   # [2026-08 신설, 신민용 요청: "우승했으면 원래 챔스 표시색(금색)으로
                   # 하이라이트"] UI가 텍스트("[1등]"/"[우승]")를 다시 파싱하지
                   # 않도록, 여기서 판정한 결과를 명시적 bool로 같이 내려준다.
                   "league_champion": False, "cup_champion": False, "cwc_champion": False,
-                  "cl_champion": False, "cl_kind": None}
+                  "cl_champion": False, "cl_kind": None, "sc_champion": False}
 
         # ── 리그 성적 ──────────────────────────────────────
         lg = conn.execute("SELECT name, tier FROM leagues WHERE id=?", (league_id,)).fetchone()
@@ -2274,6 +2389,41 @@ def get_team_history(team_id: int):
             entry["cl_kind"] = _kind   # "champions"/"europa"/"conference" — UI가 색 정할 때 씀
             break
 
+        # ── 슈퍼컵 도달 스테이지 (2026-08 신설, 13순위) ──────────
+        # [신민용 요청: "팀 검색에 리그/국내컵/클럽대항전/슈퍼컵/클럽월드컵
+        # 순서로 슈퍼컵 컬럼을 추가해달라"] CL/EL/ECL 블록과 별개(entry["cl"]
+        # 슬롯을 공유하지 않는다 — 같은 해에 챔스 준우승 + 슈퍼컵 참가가
+        # 동시에 있을 수 있어서 한 칸에 몰아넣으면 하나가 사라진다).
+        # 3/4위전이 있는 대회라 클럽월드컵 블록과 완전히 같은 패턴(TP는
+        # 승패로 3위/4위를 직접 가른다).
+        sc_t = conn.execute(
+            """SELECT sct.id, sct.name, sct.winner_team_id
+               FROM sc_tournaments sct JOIN sc_entries sce ON sce.tournament_id=sct.id
+               WHERE sct.year=? AND sce.team_id=?""", (year, team_id)).fetchone()
+        if sc_t:
+            sc_matches = conn.execute(
+                """SELECT stage, home_team_id, away_team_id, home_score, away_score, pso_winner
+                   FROM sc_matches
+                   WHERE tournament_id=? AND (home_team_id=? OR away_team_id=?)
+                     AND home_score!=-1""",
+                (sc_t["id"], team_id, team_id)).fetchall()
+            if sc_matches:
+                _SC_STAGE_ORDER = ["SF", "TP", "F"]
+                reached = max((m["stage"] for m in sc_matches),
+                              key=lambda s: _SC_STAGE_ORDER.index(s) if s in _SC_STAGE_ORDER else -1)
+                if sc_t["winner_team_id"] == team_id:
+                    entry["sc"] = f"{sc_t['name']} [우승]"
+                    entry["sc_champion"] = True
+                elif reached == "F":
+                    entry["sc"] = f"{sc_t['name']} [준우승]"
+                elif reached == "TP":
+                    tp = next(m for m in sc_matches if m["stage"] == "TP")
+                    won_tp = _cwc_match_winner(tp) == team_id
+                    entry["sc"] = f"{sc_t['name']} [{'3위' if won_tp else '4위'}]"
+                else:
+                    entry["sc"] = f"{sc_t['name']} [4강 탈락]"
+                entry["sc_record"] = _wdl_record(sc_matches, team_id)
+
         # ── 클럽 월드컵 도달 스테이지 ─────────────────────────
         # [2026-08 신설, 신민용 리포트: "팀 검색 이후 기록에 클럽 월드컵
         # 기록이 없다"] 챔피언스리그 블록과 완전히 같은 패턴(entries로
@@ -2311,7 +2461,7 @@ def get_team_history(team_id: int):
                     entry["cwc"] = f"{cwc_t['name']} [{stage_ko} 탈락]"
                 entry["cwc_record"] = _wdl_record(cwc_matches, team_id)
 
-        if entry["league"] or entry["cup"] or entry["cl"] or entry["cwc"]:
+        if entry["league"] or entry["cup"] or entry["cl"] or entry["cwc"] or entry["sc"]:
             out.append(entry)
 
     conn.close()
@@ -2328,7 +2478,7 @@ def get_team_history(team_id: int):
     # 그대로 계산은 해두되(옛 UI가 참조할 수 있으므로), UI는 새 필드
     # (cl_champions/el_champions/ecl_champions)를 우선 쓴다.
     awards = {"league": 0, "cup": 0, "cl": 0, "cwc": 0,
-              "cl_champions": 0, "el_champions": 0, "ecl_champions": 0}
+              "cl_champions": 0, "el_champions": 0, "ecl_champions": 0, "sc_champions": 0}
     # [2026-08 신설, 신민용 요청: "[1등] 뒤에 팀 수도 붙게 해달라"] 위에서
     # entry["league"]가 "[1등]" → "[1등/N팀]"으로 바뀌면서, 고정 문자열
     # 매칭으로는 더 이상 못 찾는다 — 정규식으로 "[1등"으로 시작하는 걸
@@ -2352,4 +2502,6 @@ def get_team_history(team_id: int):
                 awards["ecl_champions"] += 1
         if e["cwc"] and "[우승]" in e["cwc"]:
             awards["cwc"] += 1
+        if e["sc"] and "[우승]" in e["sc"]:
+            awards["sc_champions"] += 1
     return {"awards": awards, "years": out}

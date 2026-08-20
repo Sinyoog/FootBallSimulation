@@ -811,7 +811,49 @@ def init_db():
         my_saves INTEGER DEFAULT 0, my_goals INTEGER DEFAULT 0,
         my_assists INTEGER DEFAULT 0, my_rating REAL DEFAULT 0,
         my_absence_reason TEXT DEFAULT NULL)""")
-    # [2026-07 신설] 국내 컵대회(FA컵식) — 1~2부 팀 전부 참가하는 단판
+    # ── 슈퍼컵 (super_cup_engine, 2026-08 신설) ──
+    # [10순위] 대륙별 연 1회, 참가 4팀(챔스 우승/준우승 + 유로파급 우승 +
+    # 컨퍼런스급 우승) → 준결승 2경기 + 결승 1경기(3/4위전 없음, 총 3경기).
+    # el_matches/ecl_matches와 동일한 최종 컬럼 구성(day/my_absence_reason
+    # 등 그동안의 ALTER TABLE 이력까지 이미 반영된 형태)을 새 테이블에
+    # 처음부터 넣는다 — sim_ai_match 등 competition_common.py의 공용
+    # 함수들이 이 컬럼들을 그대로 기대하므로, 나중에 마이그레이션으로
+    # 따라잡을 필요 없이 애초에 맞춰서 만든다.
+    # entries에만 있는 seed_role(cl_champion/cl_runner_up/el_champion/
+    # ecl_champion)은 "이 팀이 왜 여기 있는지"를 기록해 상세 화면·복사
+    # 기능에서 참가 자격을 보여줄 때 쓴다.
+    c.execute("""CREATE TABLE IF NOT EXISTS sc_tournaments(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        year INTEGER, continent TEXT, name TEXT,
+        status TEXT DEFAULT 'sf', first_stage TEXT DEFAULT 'SF',
+        winner_team_id INTEGER DEFAULT 0,
+        my_in INTEGER DEFAULT 0, my_result TEXT DEFAULT '',
+        my_team_id INTEGER DEFAULT 0, my_qualified INTEGER DEFAULT 0)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS sc_entries(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tournament_id INTEGER, team_id INTEGER, team_name TEXT,
+        flag TEXT, country TEXT, grade TEXT, ovr REAL,
+        alive INTEGER DEFAULT 1, seed_role TEXT DEFAULT '')""")
+    c.execute("""CREATE TABLE IF NOT EXISTS sc_matches(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tournament_id INTEGER, stage TEXT, week INTEGER,
+        home_team_id INTEGER, away_team_id INTEGER,
+        home_score INTEGER DEFAULT -1, away_score INTEGER DEFAULT -1,
+        pso_winner INTEGER DEFAULT 0, pso_score TEXT DEFAULT '',
+        is_my INTEGER DEFAULT 0, slot INTEGER DEFAULT 0,
+        my_played INTEGER DEFAULT 0, my_position TEXT DEFAULT '',
+        my_saves INTEGER DEFAULT 0, my_goals INTEGER DEFAULT 0,
+        my_assists INTEGER DEFAULT 0, my_rating REAL DEFAULT 0,
+        my_shots INTEGER DEFAULT 0, my_shots_on INTEGER DEFAULT 0,
+        my_key_passes INTEGER DEFAULT 0, my_dribbles INTEGER DEFAULT 0,
+        my_blocks INTEGER DEFAULT 0, my_pass_acc REAL DEFAULT 0,
+        my_conceded INTEGER DEFAULT 0, grp TEXT DEFAULT '',
+        day INTEGER DEFAULT 0, my_absence_reason TEXT DEFAULT NULL)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS sc_history(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        year INTEGER, competition TEXT, team_name TEXT, result TEXT,
+        goals INTEGER DEFAULT 0, assists INTEGER DEFAULT 0,
+        caps INTEGER DEFAULT 0, rating REAL DEFAULT 0)""")
     # 토너먼트(무승부는 즉시 승부차기). 선수 소속 국가 하나에 대해서만
     # 지연 생성한다(전 세계 100개국 넘는 나라마다 만들면 성능 부담이
     # 크고 의미도 없음 — 챔스가 '내 대륙', 월드컵이 '내 국가대표'로
@@ -1535,6 +1577,11 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_ecl_matches_tid_week  ON ecl_matches(tournament_id, week)",
         "CREATE INDEX IF NOT EXISTS idx_ecl_entries_tid       ON ecl_entries(tournament_id)",
         "CREATE INDEX IF NOT EXISTS idx_ecl_matches_my ON ecl_matches(is_my)",
+        # [2026-08 신설, 10순위 슈퍼컵 — 위 el_/ecl_ 인덱스 누락 버그를
+        # 처음부터 반복하지 않으려고 sc_*도 처음부터 같이 만든다.
+        "CREATE INDEX IF NOT EXISTS idx_sc_matches_tid_week   ON sc_matches(tournament_id, week)",
+        "CREATE INDEX IF NOT EXISTS idx_sc_entries_tid        ON sc_entries(tournament_id)",
+        "CREATE INDEX IF NOT EXISTS idx_sc_matches_my ON sc_matches(is_my)",
         "CREATE INDEX IF NOT EXISTS idx_cup_matches_tid_week  ON cup_matches(tournament_id, week)",
         "CREATE INDEX IF NOT EXISTS idx_cup_entries_tid       ON cup_entries(tournament_id)",
         # [2026-08 추가, 신민용 리포트: "재능 좋은 선수로 오래 뛰면 은퇴/
@@ -2431,6 +2478,10 @@ def reset_game_data():
               # 쌓여있는 것처럼 보였다.
               "el_tournaments","el_entries","el_matches","el_history",
               "ecl_tournaments","ecl_entries","ecl_matches","ecl_history",
+              # [2026-08 신설, 10순위 슈퍼컵 시스템 구축 — el_*/ecl_*가 겪었던
+              # 것과 완전히 같은 버그를 처음부터 막는다] sc_*도 el_*/ecl_*와
+              # 동일한 구조라 새 게임 시작 시 반드시 같이 비워야 한다.
+              "sc_tournaments","sc_entries","sc_matches","sc_history",
               "cwc_tournaments","cwc_entries","cwc_matches",
               "cup_tournaments","cup_entries","cup_matches","cup_history",
               "po_pending_slots","po_tournaments","po_matches","po_history"]:

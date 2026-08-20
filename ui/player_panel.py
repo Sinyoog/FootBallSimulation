@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPainter, QBrush, QColor, QPen
 
-from game_engine import get_player, get_team_rank, fmt_money
+from game_engine import get_player, get_team_rank, get_team_rank_with_zone_color, fmt_money
 from constants import (ALL_STATS, STAT_KO, STAT_EN, _LEGACY_TALENT_ALIAS,
                        TALENT_TIER_KO, TALENT_TIER_EN)
 
@@ -254,10 +254,17 @@ class PlayerPanel(QWidget):
             self.info_lay.addWidget(_info_row(k, v))
 
         # 순위
+        # [2026-08 수정, 신민용 요청: "확정 강등권이면 빨간색, 확정
+        # 승격권이면 파란색으로"] 정적 QSS(#rankLabel 항상 초록)로는
+        # 상태별 색을 못 바꾸므로, 매번 인라인 스타일시트로 덮어쓴다.
         if p.get("current_team_id"):
-            self.lbl_rank.setText(get_team_rank(p["current_team_id"]))
+            _rank_text, _rank_color = get_team_rank_with_zone_color(p["current_team_id"])
+            self.lbl_rank.setText(_rank_text)
+            self.lbl_rank.setStyleSheet(
+                f"color:{_rank_color}; font-size:13px; font-weight:bold;")
         else:
             self.lbl_rank.setText("팀 없음" if lang=="ko" else "No Team")
+            self.lbl_rank.setStyleSheet("")
 
         # 스트레스/행복도
         if p.get("injured"):

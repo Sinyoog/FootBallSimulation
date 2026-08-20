@@ -1942,6 +1942,11 @@ MOMENTUM_SCHEDULES = {
     # momentum 세기로도 반영한다. 스케줄만 추가하면 되는 구조라 확장이 쉽다.
     "cwc_champion":          {3: (1.00, 1.8), 2: (0.90, 1.2), 1: (0.85, 0.6)},
     "domestic_cup_champion": {2: (1.00, 0.8), 1: (0.90, 0.4)},
+    # [2026-08 신설, 10순위] 슈퍼컵 — 참가 자체가 "챔스 우승/준우승 +
+    # 유로파급·컨퍼런스급 우승팀"으로 이미 걸러진 4팀뿐이라 격 자체는
+    # 낮지 않지만, 경기 수(3경기)가 적어 momentum 세기는 국내컵과
+    # 비슷한 수준으로 잡는다.
+    "super_cup_champion":    {1: (0.90, 0.5)},
 }
 # 이벤트 발생 시 momentum_seasons_left를 이 값으로 리셋한다(=스케줄 길이).
 MOMENTUM_START_BY_TYPE = {k: max(v.keys()) for k, v in MOMENTUM_SCHEDULES.items()}

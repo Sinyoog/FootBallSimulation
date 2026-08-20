@@ -1238,6 +1238,25 @@ class CenterPanel(QWidget):
                 }
         except Exception:
             pass
+        # [2026-08 신설, 11순위] 슈퍼컵 확인 — 챔스/유로파/컨퍼런스와 같은
+        # 방식(공용 get_my_match)이지만, 연 1회·4팀뿐이라 사실상 결승까지
+        # 오른 팀만 이 분기를 탄다.
+        try:
+            from competition import super_cup_engine
+            sc_m = super_cup_engine.get_my_super_cup_match(week, p=p)
+            if sc_m:
+                return {
+                    "cl": True,
+                    "cl_kind": "super_cup",
+                    "tournament_id": sc_m["tournament_id"],
+                    "league_name": sc_m.get("league_name", ""),
+                    "stage": sc_m.get("stage", "SF"),
+                    "stage_ko": sc_m.get("stage_ko", ""),
+                    "grp": sc_m.get("grp", ""),
+                    "week": week,
+                }
+        except Exception:
+            pass
         # 클럽 월드컵 확인 (43~52주, 4년에 한 번)
         try:
             from competition import club_world_cup_engine
@@ -1280,6 +1299,9 @@ class CenterPanel(QWidget):
             return True
         from competition import conference_engine
         if conference_engine.has_my_ecl_match_between(week, week):
+            return True
+        from competition import super_cup_engine
+        if super_cup_engine.has_my_super_cup_match_between(week, week):
             return True
         from competition import cup_engine
         if cup_engine.has_my_cup_match_between(week, week):

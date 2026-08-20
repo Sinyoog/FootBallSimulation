@@ -421,6 +421,21 @@ class ScheduleWindow(QDialog):
             self._tab.addTab(ecl_ko, "🥉 컨퍼런스리그(본선)")
         _sw_marks.append(("클럽대항전(유로파/컨퍼런스)", _time_sw.perf_counter()))
 
+        # 슈퍼컵 탭 (2026-08 신설, 11순위) — [2026-08, 신민용 요청: "경기
+        # 일정에 슈퍼컵이 버건디 색상으로 표시되어야 한다"] world_browser_
+        # window.py의 BURGUNDY 상수와 같은 색(#800020) — 두 파일이 서로
+        # import하지 않는 기존 원칙(_CLEAN_TEXT_ROLE과 동일한 이유, 순환
+        # 참조 방지)에 따라 여기도 같은 값을 그대로 복제해서 쓴다. 슈퍼컵은
+        # 리그 스테이지가 아예 없는 4팀 다이렉트 토너먼트라 "groups" 탭은
+        # 만들지 않고(_make_champions_tab이 league_info=None이면 자동으로
+        # 순위표 섹션을 건너뛰므로) "ko"(대진표) 탭 하나만 둔다.
+        from competition import super_cup_engine
+        sc_ko = self._make_champions_tab("ko", engine=super_cup_engine,
+                                          comp_title="슈퍼컵", header_color="#800020")
+        if sc_ko:
+            self._tab.addTab(sc_ko, "🏵 슈퍼컵")
+        _sw_marks.append(("슈퍼컵", _time_sw.perf_counter()))
+
         # [2026-07 신설, 신민용 리포트: "클럽월드컵이 경기 일정에 안 뜬다"]
         cwc_w = self._make_cwc_tab()
         if cwc_w:
@@ -1134,7 +1149,8 @@ class ScheduleWindow(QDialog):
         else:
             _get_matches_fn = getattr(engine, "get_my_champions_matches", None) or \
                                getattr(engine, "get_my_europa_matches", None) or \
-                               getattr(engine, "get_my_conference_matches", None)
+                               getattr(engine, "get_my_conference_matches", None) or \
+                               getattr(engine, "get_my_super_cup_matches", None)
             matches = _get_matches_fn(st["current_year"])
             if _cache is not None:
                 _cache[_cache_key] = matches
@@ -1156,7 +1172,8 @@ class ScheduleWindow(QDialog):
         cl_cont = CONTINENT_MAP.get(cont, cont)
         _name_map = getattr(engine, "CL_CUP_NAME", None) or \
                     getattr(engine, "EL_CUP_NAME", None) or \
-                    getattr(engine, "ECL_CUP_NAME", None) or {}
+                    getattr(engine, "ECL_CUP_NAME", None) or \
+                    getattr(engine, "SUPER_CUP_NAME", None) or {}
         league_name = _name_map.get(cl_cont, f"{cl_cont} {comp_title}")
 
         hdr = QLabel(f"🏆 {st['current_year']}년 {league_name}")
@@ -1176,7 +1193,13 @@ class ScheduleWindow(QDialog):
             _get_standings_fn = getattr(engine, "get_my_cl_league_standings", None) or \
                                 getattr(engine, "get_my_el_league_standings", None) or \
                                 getattr(engine, "get_my_ecl_league_standings", None)
-            league_info = _get_standings_fn(st["current_year"])
+            # [2026-08 신설, 11순위] 슈퍼컵은 리그 스테이지가 아예 없어서
+            # (4팀 다이렉트 토너먼트) get_my_*_league_standings에 해당하는
+            # 함수가 애초에 없다 — 없으면 그냥 league_info=None으로 두면,
+            # 아래 "if mode=='groups' and league_info:" 조건이 자연히
+            # False가 돼서 순위표 섹션을 건너뛰고 바로 대진표(브래킷)만
+            # 그린다(그게 슈퍼컵 화면에 맞는 그림이다).
+            league_info = _get_standings_fn(st["current_year"]) if _get_standings_fn else None
             if _cache is not None:
                 _cache[_standings_cache_key] = league_info
         if mode == "groups" and league_info:

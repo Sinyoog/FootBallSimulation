@@ -13,6 +13,11 @@ from game_engine import get_player, fmt_money, get_my_promotions, get_state
 from database import get_conn
 from constants import format_result_with_absence
 
+# [2026-08 신설, 14순위] world_browser_window.py의 BURGUNDY 상수와 같은 값
+# (#800020) — 두 파일이 서로 import하지 않는 기존 원칙(_fmt_loan_months
+# 주석과 동일한 이유, 순환 참조 방지)에 따라 여기도 값만 그대로 복제한다.
+BURGUNDY = "#800020"
+
 
 def _fmt_loan_months(total_weeks):
     """주 단위 기간을 '1년', '1년 3개월', '3개월'처럼 사람이 읽는 형태로.
@@ -216,6 +221,15 @@ class CareerWindow(QDialog):
                                          label="컨퍼런스리그", icon="🥉", color="#20A464"),
                     f"컨퍼런스 ({len(ecl_ms)})")
 
+        # [2026-08 신설, 14순위] 슈퍼컵 — 위와 완전히 같은 패턴(_champions_tab
+        # 재사용). 연 1회·4팀뿐이라 대부분의 커리어에선 0경기로 나오는 게
+        # 정상이다.
+        from competition import super_cup_engine
+        sc_ms = super_cup_engine.get_my_sc_matches()
+        tabs.addTab(self._champions_tab(sc_ms, p, history_table="sc_history",
+                                         label="슈퍼컵", icon="🏵", color=BURGUNDY),
+                    f"슈퍼컵 ({len(sc_ms)})")
+
         from competition import cup_engine
         cup_ms = cup_engine.get_my_cup_matches()
         tabs.addTab(self._cup_tab(cup_ms), f"컵대회 ({len(cup_ms)})")
@@ -235,6 +249,17 @@ class CareerWindow(QDialog):
         # 명확히 보인다.
         tabs.addTab(self._po_tab(po_ms, p), f"⚖ 승강 플레이오프 ({len(po_ms)})")
         root.addWidget(tabs)
+
+        # [2026-08 신설, 신민용 요청: "커리어 기록이 없으면 창이 제일
+        # 작게 뜨는데, 창 기본 크기를 위에 탭 버튼들 크기에 맞춰달라"]
+        # 커리어 데이터가 거의 없는 캐릭터(막 시작한 선수 등)는 각 탭
+        # 내용이 "기록 없음" 한 줄뿐이라 Qt가 다이얼로그를 아주 작게
+        # 잡는데, 그러면 탭 버튼 12개(팀 이력~승강 플레이오프)가 한 줄에
+        # 안 들어가서 두 줄로 줄바꿈되며 뭉개져 보인다. 탭 바가 실제로
+        # 필요로 하는 폭(sizeHint)을 그대로 다이얼로그 최소 폭으로 잡아서,
+        # 데이터가 얼마나 있든 탭 버튼 한 줄은 항상 안 깨지게 한다.
+        _tabbar_w = tabs.tabBar().sizeHint().width()
+        self.setMinimumWidth(max(900, _tabbar_w + 40))
         tabs.currentChanged.connect(lambda: self._fit_width())
 
         btn = QPushButton("닫기")
@@ -309,7 +334,7 @@ class CareerWindow(QDialog):
             stat_cols = ["골","어시","기회창출","패스%","차단","드리블"]
         else:  # 공격수/윙어
             stat_cols = ["골","어시","슈팅","유효","기회창출","드리블"]
-        cols = (["기간","포지션","국가","리그","팀명","연봉","출전"]
+        cols = (["기간", "나이", "포지션", "국가", "리그", "팀명", "연봉", "출전"]
                 + stat_cols
                 + ["평균평점","팀순위","승무패","🟥","계약","이적"])
 
@@ -336,6 +361,12 @@ class CareerWindow(QDialog):
 
         visible = [e for e in entries if not _is_empty_short(e)]
         tbl = self._make_table(len(visible), cols)
+        # [2026-08 신설, 15순위, 신민용 요청: "팀 이력/전체 이력에 나이도
+        # 표시 — 2028~2031 | FC 서울 | 21~24세처럼"] birth_year가 이미
+        # my_player에 저장돼 있으므로(create_player 시점에 시작연도-
+        # 시작나이로 계산해 저장) 그 해의 나이는 year-birth_year로 바로
+        # 계산 가능하다 — 별도 나이 이력 테이블이 필요 없다.
+        _birth_year = get_player().get("birth_year")
         prev_team = None
         for i, e in enumerate(visible):
             rc  = e.get("season_rating_cnt", 0)
@@ -369,6 +400,17 @@ class CareerWindow(QDialog):
                 ew_disp = 52 if ew >= 50 else ew
                 end_str = week_to_iso_date_str_end(ey, ew_disp)
                 period = f"{start_str} ~ {end_str}"
+
+            # [2026-08 신설, 15순위] 나이 — 시작 연도/(진행중이면 현재
+            # 연도 또는 종료 연도) 각각의 나이를 birth_year로 계산해서,
+            # 같으면 "21세" 하나만, 다르면 "21~24세" 범위로 보여준다.
+            if _birth_year and sy:
+                _age_end_year = ey if ey else get_state().get("current_year", sy)
+                age_start = sy - _birth_year
+                age_end = _age_end_year - _birth_year
+                age_str = f"{age_start}세" if age_start == age_end else f"{age_start}~{age_end}세"
+            else:
+                age_str = "—"
 
             pos   = e.get("position","")
             sv  = e.get("saves", 0)
@@ -514,7 +556,7 @@ class CareerWindow(QDialog):
             from game_engine import team_matches_played_in_window
             _total_g = team_matches_played_in_window(e.get("team_id", 0), ln, sy, sw, ey, ew)
             _apps_str = f"{e.get('matches',0)}/{_total_g}" if _total_g else str(e.get("matches", 0))
-            vals = ([period, pos, country_str, league_str, tn,
+            vals = ([period, age_str, pos, country_str, league_str, tn,
                      fmt_money(e.get("salary",0)),
                      _apps_str]
                     + stat_vals
@@ -571,13 +613,15 @@ class CareerWindow(QDialog):
             stat_cols = ["골", "어시", "기회창출", "패스%", "차단", "드리블"]
         else:
             stat_cols = ["골", "어시", "슈팅", "유효", "기회창출", "드리블"]
-        cols = ["기간", "팀명", "리그", "출전"] + stat_cols + ["평균평점", "승무패", "🟥"]
+        cols = ["기간", "나이", "팀명", "리그", "출전"] + stat_cols + ["평균평점", "승무패", "🟥"]
 
         visible = [e for e in entries if not _is_empty_short(e)]
         tbl = self._make_table(len(visible), cols)
 
         from game_engine import get_full_history_extras_for_period, team_matches_played_in_window
         _nat = get_player().get("nationality", "")
+        # [2026-08 신설, 15순위] 팀 이력 탭과 동일한 방식(birth_year 기준).
+        _birth_year = get_player().get("birth_year")
         for i, e in enumerate(visible):
             sy = e.get("start_year", ""); sw = e.get("start_week", 1)
             ey = e.get("end_year", "");   ew = e.get("end_week", 0)
@@ -588,6 +632,14 @@ class CareerWindow(QDialog):
             else:
                 ew_disp = 52 if ew >= 50 else ew
                 period = f"{start_str} ~ {week_to_iso_date_str_end(ey, ew_disp)}"
+
+            if _birth_year and sy:
+                _age_end_year = ey if ey else get_state().get("current_year", sy)
+                age_start = sy - _birth_year
+                age_end = _age_end_year - _birth_year
+                age_str = f"{age_start}세" if age_start == age_end else f"{age_start}~{age_end}세"
+            else:
+                age_str = "—"
 
             # [2026-07 버그수정, 위 평균평점 버그를 추적하다 같이 발견]
             # ey가 0(진행 중인 현재 스틴트)일 때 "ey or sy or 0"으로 넘기면
@@ -675,7 +727,7 @@ class CareerWindow(QDialog):
             # 달리 이 탭 취지(모든 대회 합산)에 맞는 진짜 전체 합계가 된다.
             red_cards_str = str(e.get("red_cards", 0) + extras["red_cards"])
 
-            vals = ([period, e.get("team_name", ""),
+            vals = ([period, age_str, e.get("team_name", ""),
                      f"{e.get('league_name','')} ({e.get('tier','')}부)",
                      apps_str]
                     + stat_vals + [avg, wdl_str, red_cards_str])
