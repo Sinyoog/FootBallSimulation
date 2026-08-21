@@ -105,7 +105,7 @@ class OfferWindow(QDialog):
             self.offer_salaries: list[int] = [o["salary"] for o in offers]
             self.neg_used: dict[int, int] = {}
             for i in range(len(offers)):
-                self.neg_used[i] = random.randint(1, 3)
+                self.neg_used[i] = self._roll_attempts(i)
             self.neg_failed: set[int] = set()
             self._applied_count = 0
             # [2026-08 신설, 신민용 확정] 계약 기간도 연봉처럼 오퍼 생성
@@ -138,9 +138,33 @@ class OfferWindow(QDialog):
         return [_calc_contract_years(age_now, o.get("tier", 3), o.get("country"))
                 for o in self.offers]
 
+    def _offer_join_prob(self, idx) -> float:
+        """[2026-08 재설계] 오퍼 idx의 실제 입단 성공확률(join_prob) —
+        offer_window.apply_window의 "성공 가능성"(유력/가능성있음/쉽지않음/
+        거의불가능)과 정확히 같은 값. 연봉/기간 협상 둘 다 이 값으로 시도
+        횟수·성공확률을 정한다(game_engine.roll_negotiation_attempts/
+        negotiation_success_prob). 예전 저장분 등 값이 없으면 즉석에서
+        다시 계산해 채워둔다."""
+        offer = self.offers[idx]
+        prob = offer.get("join_prob")
+        if prob is None:
+            from game_engine import calc_apply_success_prob
+            try:
+                prob, _blocked = calc_apply_success_prob(offer.get("team_id"))
+            except Exception:
+                prob = 0.5
+            offer["join_prob"] = prob
+        return prob
+
+    def _roll_attempts(self, idx) -> int:
+        """[2026-08 신설] 오퍼 idx에 대해 협상(연봉·기간 공통) 시도 횟수를
+        실제 입단 성공확률 기반으로 굴린다. 연봉/기간은 각각 독립적으로
+        호출해서 별개의 시도 횟수를 갖는다."""
+        from game_engine import roll_negotiation_attempts
+        return roll_negotiation_attempts(self._offer_join_prob(idx))
+
     def _default_years_used(self) -> dict:
-        from constants import CONTRACT_YEARS_NEG_MAX_ATTEMPTS
-        return {i: CONTRACT_YEARS_NEG_MAX_ATTEMPTS for i in range(len(self.offers))}
+        return {i: self._roll_attempts(i) for i in range(len(self.offers))}
 
     def _persist(self):
         """현재 오퍼/협상 상태를 DB에 저장(kind가 없으면 아무것도 안 함)."""
@@ -292,15 +316,14 @@ class OfferWindow(QDialog):
             idx = len(self.offers)
             self.offers.append(offer)
             self.offer_salaries.append(offer["salary"])
-            self.neg_used[idx] = random.randint(1, 3)
+            self.neg_used[idx] = self._roll_attempts(idx)
             # [2026-08 신설] 기간 협상 상태도 새 오퍼에 맞춰 같이 확장.
             from game_engine import _calc_contract_years, get_player
-            from constants import CONTRACT_YEARS_NEG_MAX_ATTEMPTS
             p_now = get_player()
             age_now = p_now.get("age", 17) if p_now else 17
             self.offer_years.append(
                 _calc_contract_years(age_now, offer.get("tier", 3), offer.get("country")))
-            self.years_used[idx] = CONTRACT_YEARS_NEG_MAX_ATTEMPTS
+            self.years_used[idx] = self._roll_attempts(idx)
             self.years_target[idx] = self.offer_years[idx]
             self._applied_count += 1
             self._persist()
@@ -478,7 +501,10 @@ class OfferWindow(QDialog):
         self.neg_used[idx] -= 1
         old_sal = self.offer_salaries[idx]
         delta   = random.randint(10, 30)
-        success = random.random() < 0.55
+        # [2026-08 재설계] 성공확률도 고정값이 아니라 실제 입단 성공확률
+        # (join_prob) 기반 — 직접 지원 화면의 "성공 가능성"과 같은 기준.
+        from game_engine import negotiation_success_prob
+        success = random.random() < negotiation_success_prob(self._offer_join_prob(idx))
 
         if success:
             new_sal = int(old_sal * (1 + delta/100))
@@ -506,9 +532,9 @@ class OfferWindow(QDialog):
         자동 추정이 아니라, 플레이어가 카드의 콤보박스로 직접 고른
         self.years_target[idx]를 향해서만 움직인다. 이미 목표와 같으면
         애초에 버튼이 비활성화된다(_make_card 참고)."""
-        from game_engine import _contract_years_neg_delta, _record_team_offer_cooldown
-        from constants import (CONTRACT_YEARS_NEG_SUCCESS_PROB,
-                               CONTRACT_YEARS_MIN, CONTRACT_YEARS_MAX)
+        from game_engine import (_contract_years_neg_delta, _record_team_offer_cooldown,
+                                  negotiation_success_prob)
+        from constants import CONTRACT_YEARS_MIN, CONTRACT_YEARS_MAX
         if self.years_used[idx] <= 0 or idx in self.years_failed:
             return
         self.years_used[idx] -= 1
@@ -517,7 +543,8 @@ class OfferWindow(QDialog):
         old_yrs = self.offer_years[idx]
         tier    = self.offers[idx].get("tier", 3)
         delta   = _contract_years_neg_delta(tier)
-        success = random.random() < CONTRACT_YEARS_NEG_SUCCESS_PROB
+        # [2026-08 재설계] 연봉 협상과 동일하게 실제 입단 성공확률 기반.
+        success = random.random() < negotiation_success_prob(self._offer_join_prob(idx))
 
         if success and old_yrs != target:
             direction = 1 if target > old_yrs else -1

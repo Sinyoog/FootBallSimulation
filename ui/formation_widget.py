@@ -13,6 +13,7 @@ from PyQt6.QtGui import QColor, QPainter, QBrush, QPen, QFont
 
 from database import get_conn
 from constants import FORMATION_SLOTS, STAT_KO, ALL_STATS, POSITION_COMPAT
+from game_engine import is_hard_mode
 
 # 승강/리스케일 후 OVR 캐시 무효화 플래그 (game_engine._invalidate_team_ovr_cache가 세팅)
 _ovr_cache_invalidated: bool = False
@@ -589,6 +590,11 @@ class _FormationCanvas(QWidget):
             self.update()
 
     def mousePressEvent(self, event):
+        # [2026-08 신설, 난이도 시스템] 어려움 난이도는 선수를 클릭해도
+        # 스탯 팝업이 뜨지 않는다(신민용 확정: "그냥 포메이션만 표시" —
+        # 내 선수/상대 선수 구분 없이 예외 없음).
+        if is_hard_mode():
+            return
         mx, my = event.pos().x(), event.pos().y()
         for i, (px, py, _, _s) in enumerate(self._positions_xy):
             if (mx-px)**2+(my-py)**2 < 400:
@@ -679,9 +685,14 @@ class FormationWidget(QWidget):
         split.addWidget(self._opp_canvas, 5)
 
         # 힌트 바
+        # [2026-08 신설, 난이도 시스템] 어려움 난이도에선 클릭해도 스탯이
+        # 안 뜨므로("그냥 포메이션만 표시") 안내 문구도 그에 맞게 바꾼다
+        # — 안 그러면 "클릭 → 스탯"이라고 해놓고 아무 반응이 없어 버그처럼
+        # 보일 수 있다.
+        _hint_text = "포메이션만 표시" if is_hard_mode() else "클릭 → 스탯"
         hint_bar = QHBoxLayout()
-        lh = QLabel("클릭 → 스탯"); lh.setStyleSheet(_HINT_STYLE)
-        rh = QLabel("클릭 → 스탯"); rh.setStyleSheet(_HINT_STYLE)
+        lh = QLabel(_hint_text); lh.setStyleSheet(_HINT_STYLE)
+        rh = QLabel(_hint_text); rh.setStyleSheet(_HINT_STYLE)
         rh.setAlignment(Qt.AlignmentFlag.AlignRight)
         hint_bar.addWidget(lh); hint_bar.addStretch(); hint_bar.addWidget(rh)
         lay.addLayout(hint_bar)
@@ -694,7 +705,10 @@ class FormationWidget(QWidget):
         self._my_canvas.load_my_team(team_id, intl_nat=my_nat)
 
         # ── 좌측 레이블: 국제전 → 국가명+OVR / 리그 → 팀명+OVR
+        # [2026-08 신설, 난이도 시스템] 어려움 난이도는 "평균 OVR 76" 같은
+        # 수치를 아예 안 붙인다(신민용 확정).
         my_avg = self._my_canvas._calc_avg_ovr()
+        _ovr_suffix = "" if is_hard_mode() else f"  |  평균 OVR {my_avg}"
         if is_intl:
             # 국가 flag + 국가명 표시
             conn = get_conn()
@@ -702,14 +716,14 @@ class FormationWidget(QWidget):
                 "SELECT flag FROM countries WHERE name=?", (my_nat,)).fetchone()
             conn.close()
             flag = (crow["flag"] + " ") if crow and crow["flag"] else ""
-            self.lbl_my.setText(f"{flag}{my_nat}  |  평균 OVR {my_avg}")
+            self.lbl_my.setText(f"{flag}{my_nat}{_ovr_suffix}")
             self.lbl_my.setStyleSheet("color:#ffd700;font-weight:bold;")  # 금색으로 강조
         else:
             conn = get_conn()
             trow = conn.execute("SELECT name FROM teams WHERE id=?", (team_id,)).fetchone()
             conn.close()
             team_name = trow["name"] if trow else ""
-            self.lbl_my.setText(f"내 팀: {team_name}  |  평균 OVR {my_avg}")
+            self.lbl_my.setText(f"내 팀: {team_name}{_ovr_suffix}")
             self.lbl_my.setStyleSheet("color:#ffd700;font-weight:bold;")
 
         # ── 컨텍스트 레이블 (대회명 표시줄)
@@ -806,9 +820,14 @@ class FormationWidget(QWidget):
     def _fill_combo(self):
         self.combo.blockSignals(True)
         self.combo.clear()
+        # [2026-08 신설, 난이도 시스템] 상대팀 선택 목록도 "OVR 77" 같은
+        # 수치를 어려움 난이도에서는 빼서, 상대팀 콤보만 보고 강팀을
+        # 골라내는 걸 막는다.
+        _hard = is_hard_mode()
         for t in self._opp_teams:
             flag = t["flag"] + " " if t["flag"] else ""
-            self.combo.addItem(f"{flag}{t['name']}  OVR {t['avg_ovr']}")
+            suffix = "" if _hard else f"  OVR {t['avg_ovr']}"
+            self.combo.addItem(f"{flag}{t['name']}{suffix}")
         self.combo.blockSignals(False)
         self.combo.setCurrentIndex(0)
         self._render_opp(0)

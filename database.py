@@ -512,6 +512,7 @@ def init_db():
         position TEXT DEFAULT 'CM', sub_role TEXT DEFAULT '박스투박스',
         personality TEXT DEFAULT '성실함', height INTEGER DEFAULT 175,
         weight INTEGER DEFAULT 70, peak_age INTEGER DEFAULT 25,
+        difficulty TEXT DEFAULT 'easy',
         fame INTEGER DEFAULT 0, popularity INTEGER DEFAULT 0,
         fans INTEGER DEFAULT 0, agent_grade TEXT DEFAULT 'F',
         salary INTEGER DEFAULT 0, total_assets INTEGER DEFAULT 0,
@@ -987,6 +988,11 @@ def init_db():
         # [에이전트] 실제 계약한 에이전트의 수수료율 (같은 등급도 개별 차등).
         #  0이면 미설정 → AGENT_FEE_RATE[grade] 기본값 사용 (구버전 호환).
         "ALTER TABLE my_player ADD COLUMN agent_fee_rate REAL DEFAULT 0",
+        # [2026-08 신설, 난이도 시스템] 캐릭터 생성 시 한 번만 정해지고
+        # 이후 변경 불가. 'easy'/'normal'/'hard' 3단계 — 기본값은 반드시
+        # 'easy'로 둬서(신민용 확정) 이 컬럼이 없던 구버전 세이브가 마이그레이션
+        # 되어도 자동으로 하위호환(기존과 동일하게 전부 공개)된다.
+        "ALTER TABLE my_player ADD COLUMN difficulty TEXT DEFAULT 'easy'",
         "ALTER TABLE career_entries ADD COLUMN contract_years INTEGER DEFAULT 0",
         "ALTER TABLE career_entries ADD COLUMN transfer_type TEXT DEFAULT '입단'",
         # [2026-07 신설] 이적료(transfer_fee) — transfer_type/exit_type(어떻게
@@ -2448,6 +2454,19 @@ def _reset_club_strength(c):
 def reset_game_data():
     init_db()  # 마이그레이션 적용
     conn = get_conn(); c = conn.cursor()
+    # [2026-08 버그수정, 신민용 리포트: "no such table: team_power_rating"
+    # (완전히 새 설치본 등 파워랭킹 화면을 한 번도 연 적 없는 DB에서 새
+    # 게임 시작 시 크래시)] power_ranking.py의 8개 테이블은 init_db()가
+    # 아니라 power_ranking.ensure_power_ranking_tables()가 처음 쓰일 때
+    # (파워랭킹 화면 조회, 시즌 종료 집계 등) 지연 생성한다 — 그래서 그
+    # 시점이 한 번도 없었던 DB에는 테이블 자체가 없는 채로 아래 DELETE
+    # 목록에 걸려 그대로 크래시났다. 지우기 전에 먼저 만들어서(없으면
+    # CREATE, 있으면 그대로) DELETE가 항상 안전하게 돌도록 한다.
+    try:
+        from power_ranking import ensure_power_ranking_tables
+        ensure_power_ranking_tables(conn)
+    except Exception:
+        pass
     # [2026-07 버그수정, 신민용 리포트: "새 게임 하면 이전 데이터가 다 안
     # 사라지는 거 아니냐"] 팀/리그 ID가 새 게임에서도 그대로 재사용되는데
     # (팀 row는 새로 안 만들고 UPDATE만 함), match_results_archive/
@@ -2484,7 +2503,19 @@ def reset_game_data():
               "sc_tournaments","sc_entries","sc_matches","sc_history",
               "cwc_tournaments","cwc_entries","cwc_matches",
               "cup_tournaments","cup_entries","cup_matches","cup_history",
-              "po_pending_slots","po_tournaments","po_matches","po_history"]:
+              "po_pending_slots","po_tournaments","po_matches","po_history",
+              # [2026-08 버그수정, 신민용 리포트: "새 게임(2000년) 시작했는데
+              # 2001년 파워랭킹이 남아있다"] power_ranking.py의 8개 테이블
+              # (레이팅 원본 2개 + 연도별 스냅샷 2개 + 연속우승 카운터 2개 +
+              # 리그파워 캐시 + 팀별 레이어B 이력)이 이 삭제 목록에서 통째로
+              # 빠져 있었다 — team_id/league_id가 새 게임에서도 재사용되는
+              # 구조라, 이전 플레이 때 쌓인 파워랭킹 데이터가 새 게임에도
+              # 그대로 남아 아직 오지도 않은 미래 연도 순위까지 보이는
+              # 버그로 이어졌다.
+              "team_power_rating","country_power_rating",
+              "team_power_rankings","country_power_rankings",
+              "team_league_streak","country_regional_streak",
+              "league_power","team_b_history"]:
         c.execute(f"DELETE FROM {t}")
     c.execute("UPDATE teams SET wins=0,draws=0,losses=0,goals_for=0,goals_against=0")
     _reset_teams_to_league_data(c)

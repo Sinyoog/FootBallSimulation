@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPainter, QBrush, QColor, QPen
 
-from game_engine import get_player, get_team_rank, get_team_rank_with_zone_color, fmt_money
+from game_engine import get_player, get_team_rank, get_team_rank_with_zone_color, fmt_money, is_hard_mode
 from constants import (ALL_STATS, STAT_KO, STAT_EN, _LEGACY_TALENT_ALIAS,
                        TALENT_TIER_KO, TALENT_TIER_EN)
 
@@ -132,6 +132,7 @@ class PlayerPanel(QWidget):
 
         # 스탯
         self.stat_rows: dict[str, StatRow] = {}
+        self.stat_section_labels = []
         for section, stats in [
             ("신체", ["stamina","speed","jump","strength"]),
             ("기술", ["shooting","passing","dribbling","tackling",
@@ -140,6 +141,7 @@ class PlayerPanel(QWidget):
         ]:
             sl = QLabel(section); sl.setObjectName("secTitle")
             self.lay.addWidget(sl)
+            self.stat_section_labels.append(sl)
             for s in stats:
                 row = StatRow(s)
                 self.stat_rows[s] = row
@@ -165,16 +167,27 @@ class PlayerPanel(QWidget):
         sn   = STAT_KO if lang=="ko" else STAT_EN
 
         self.lbl_name.setText(p["name"])
-        self.lbl_ovr.setText(f"OVR {p['ovr']}")
 
-        # [신규] 재능 등급 뱃지. 구버전 세이브의 예전 티어명은
-        # _LEGACY_TALENT_ALIAS로 새 이름으로 변환한 뒤 표시한다.
-        _tier = p.get("talent_tier", "pro") or "pro"
-        _tier = _LEGACY_TALENT_ALIAS.get(_tier, _tier)
-        _tname = _TALENT_KO.get(_tier, _tier) if lang == "ko" else _TALENT_EN.get(_tier, _tier)
-        _tcolor = _TALENT_COLOR.get(_tier, "#555555")
-        self.lbl_talent.setText(f"★ {_tname}")
-        self.lbl_talent.setStyleSheet(f"background-color: {_tcolor};")
+        # [2026-08 신설, 난이도 시스템] 어려움 난이도는 내 선수 포함 전원의
+        # OVR·재능등급을 숨긴다(신민용 확정: "선수를 클릭해도 스탯이
+        # 뜨지 않아야 하며" — 예외 없이 좌측 패널도 동일 원칙 적용).
+        _hard = is_hard_mode(p)
+        if _hard:
+            self.lbl_ovr.hide()
+            self.lbl_talent.hide()
+        else:
+            self.lbl_ovr.show()
+            self.lbl_talent.show()
+            self.lbl_ovr.setText(f"OVR {p['ovr']}")
+
+            # [신규] 재능 등급 뱃지. 구버전 세이브의 예전 티어명은
+            # _LEGACY_TALENT_ALIAS로 새 이름으로 변환한 뒤 표시한다.
+            _tier = p.get("talent_tier", "pro") or "pro"
+            _tier = _LEGACY_TALENT_ALIAS.get(_tier, _tier)
+            _tname = _TALENT_KO.get(_tier, _tier) if lang == "ko" else _TALENT_EN.get(_tier, _tier)
+            _tcolor = _TALENT_COLOR.get(_tier, "#555555")
+            self.lbl_talent.setText(f"★ {_tname}")
+            self.lbl_talent.setStyleSheet(f"background-color: {_tcolor};")
 
         if p.get("injured"):
             _idetail = p.get("injury_detail") or "부상"
@@ -237,19 +250,25 @@ class PlayerPanel(QWidget):
             ("리그",   league_name),
             ("주요 포지션", p["position"]),
             ("현 포지션",   _cur_field_pos),
-            ("성격",   p["personality"]),
-            ("특징",   p.get("physical_trait", "무난함")),
-            ("체형",   p.get("body_type", "-")),
-            ("신체",   f"{p['height']}cm / {p['weight']}kg"),
-            ("명성",   f"{p.get('fame',0)} [{fame_lbl}]"),
-            ("인기도", str(p.get("popularity",0))),
-            ("팬수",   f"{p.get('fans',0):,}명"),
-            ("에이전트", f"[{p.get('agent_grade','F')}등급]"),
-            ("연봉",   "무급" if salary == 0 else
-             f"연 {fmt_money(salary)}  [주 {fmt_money(weekly)}]"),
-            ("총자산", fmt_money(p.get("total_assets",0))),
-            ("감독관계", str(p.get("manager_relation",50))),
         ]
+        # [2026-08 신설, 난이도 시스템] 성격/신체특징(부상·성장 관련 숨겨진
+        # 특성)/감독관계는 어려움 난이도에서 비표시 — 키/몸무게/체형처럼
+        # 겉으로 관찰 가능한 정보가 아니라 원래 내부 수치이기 때문에
+        # OVR·재능등급과 같은 취급을 한다.
+        if not _hard:
+            rows.append(("성격",   p["personality"]))
+            rows.append(("특징",   p.get("physical_trait", "무난함")))
+        rows.append(("체형",   p.get("body_type", "-")))
+        rows.append(("신체",   f"{p['height']}cm / {p['weight']}kg"))
+        rows.append(("명성",   f"{p.get('fame',0)} [{fame_lbl}]"))
+        rows.append(("인기도", str(p.get("popularity",0))))
+        rows.append(("팬수",   f"{p.get('fans',0):,}명"))
+        rows.append(("에이전트", f"[{p.get('agent_grade','F')}등급]"))
+        rows.append(("연봉",   "무급" if salary == 0 else
+                     f"연 {fmt_money(salary)}  [주 {fmt_money(weekly)}]"))
+        rows.append(("총자산", fmt_money(p.get("total_assets",0))))
+        if not _hard:
+            rows.append(("감독관계", str(p.get("manager_relation",50))))
         for k, v in rows:
             self.info_lay.addWidget(_info_row(k, v))
 
@@ -351,10 +370,17 @@ class PlayerPanel(QWidget):
             self.season_lay.addWidget(_info_row(k, v))
 
         # 스탯 바
+        # [2026-08 신설, 난이도 시스템] 어려움 난이도는 이 신체/기술/정신
+        # 스탯바 섹션 전체를 숨긴다(신민용 확정: "좌측 player_panel 아래에
+        # 신체 스탯도 안떠야 해") — 상대 선수든 내 선수든 예외 없음.
+        for sl in self.stat_section_labels:
+            sl.setVisible(not _hard)
         for s, row in self.stat_rows.items():
-            cur = p.get(s,40)
-            mx  = p.get(f"{s}_max",80)
-            row.update(sn.get(s,s), cur, mx)
+            row.setVisible(not _hard)
+            if not _hard:
+                cur = p.get(s,40)
+                mx  = p.get(f"{s}_max",80)
+                row.update(sn.get(s,s), cur, mx)
 
 
 def _info_row(key, val):

@@ -156,6 +156,24 @@ def get_player():
     return dict(row) if row else None
 
 
+# [2026-08 신설, 난이도 시스템] p가 이미 손에 있으면 그걸 쓰고(추가 쿼리
+# 없이), 없으면 여기서 직접 조회한다 — player_panel.py/formation_widget.py/
+# 팀검색 화면 등에서 한 줄로 게이트 조건을 걸 수 있게 하기 위한 헬퍼.
+# 값이 없거나(마이그레이션 직후 등) 알 수 없는 문자열이면 항상 안전한
+# 쪽(easy=전부 공개)으로 취급한다.
+def get_difficulty(p=None) -> str:
+    if p is None:
+        p = get_player()
+    d = (p or {}).get("difficulty") or "easy"
+    return d if d in ("easy", "normal", "hard") else "easy"
+
+
+def is_hard_mode(p=None) -> bool:
+    """어려움 난이도 — 재능등급/현재OVR/성격/감독관계/타선수(내 선수 포함)
+    스탯·신체스탯 전부 비표시, 포메이션 OVR 수치 비표시가 걸리는 기준."""
+    return get_difficulty(p) == "hard"
+
+
 def update_player(**kw):
     if not kw:
         return
@@ -588,7 +606,8 @@ def _age_train_eff(age: int, peak_age: int) -> float:
 def create_player(name: str, position: str, sub_role: str,
                   nationality: str = None, flag: str = None, talent_tier: str = None,
                   personality: str = None, physical_trait: str = None,
-                  start_year: int = None, start_age: int = None):
+                  start_year: int = None, start_age: int = None,
+                  difficulty: str = "easy"):
     # [2026-08 신설, 신민용 요청: "새 선수 생성 때 시작 연도/나이도 고를 수
     # 있게"] 입력 없으면(None) 기존과 완전히 동일하게 기본 상수를 쓴다 —
     # 이 매개변수 자체가 하위호환을 깨지 않도록 옵션으로만 존재.
@@ -827,6 +846,16 @@ def create_player(name: str, position: str, sub_role: str,
 
     # [2026-08 신설] 이 선수만의 입단 가능 최소 나이(선택한 시작 나이+1) 저장.
     conn.execute("UPDATE my_player SET min_join_age=? WHERE id=1", (_min_join_age,))
+
+    # [2026-08 신설, 난이도 시스템] 생성 시 한 번만 확정되고 이후 변경
+    # 불가 — 캐릭터 생성 화면에서 넘어온 값을 그대로 저장. 값 검증(잘못된
+    # 문자열이 넘어오면 안전하게 easy로)까지 여기서 한 번 더 한다 —
+    # 정보 제한이 걸리는 화면(player_panel/포메이션/팀검색)들이 전부 이
+    # 컬럼 하나만 보고 판단하므로, 여기서 걸러두면 그쪽에서 매번 방어
+    # 코드를 반복할 필요가 없다.
+    if difficulty not in ("easy", "normal", "hard"):
+        difficulty = "easy"
+    conn.execute("UPDATE my_player SET difficulty=? WHERE id=1", (difficulty,))
 
     # [2026-08 신설] 실제 선택된 시작 연도를 영구 저장 — intl_engine.py가
     # 이걸 기준으로 월드컵/네이션스컵/클럽월드컵/지역컵 개최년도를 다시
@@ -11537,7 +11566,7 @@ def apply_to_team(team_id):
     tier = row["tier"]
     ovr = p.get("ovr", 40)
     salary = int(_calc_salary(grade, tier, ovr, row["country"], row["name"], year=p.get("current_year"), team_id=row["id"], talent_tier=p.get("talent_tier")) * random.uniform(0.95, 1.15))
-    offer = _build_offer(row, grade, tier, salary)
+    offer = _build_offer(row, grade, tier, salary, join_prob=prob)
     offer["_zone"] = "applied"
     _rank_conn = get_conn()
     offer["rank_info"] = _get_team_rank_info(_rank_conn.cursor(), team_id)
@@ -11576,6 +11605,49 @@ def _contract_years_neg_delta(tier: int) -> int:
     """[2026-08 신설] 기간 협상 1회 성공 시 옮길 수 있는 연수 폭 — 구단
     티어별로 다르다(CONTRACT_YEARS_NEG_DELTA_BY_TIER 참고)."""
     return CONTRACT_YEARS_NEG_DELTA_BY_TIER.get(tier, CONTRACT_YEARS_NEG_DELTA_DEFAULT)
+
+
+def _negotiation_attempts_weights(prob: float):
+    """[2026-08 재설계, 신민용 확정: "직접 지원 화면의 성공 가능성(유력/
+    가능성있음/쉽지않음/거의불가능)과 협상 결렬 위험이 같은 기준을 써야
+    한다"] prob(그 오퍼의 실제 입단 성공확률, calc_apply_success_prob과
+    동일 공식/값)이 높을수록(유력) 협상 기회가 넉넉하고, 낮을수록(거의
+    불가능) 기회 자체가 사실상 1회로 줄어든다. 기준선은 apply_window.py의
+    _PROB_BANDS(0.70/0.40/0.15)와 동일하게 맞췄다."""
+    from constants import NEG_ATTEMPTS_MIN, NEG_ATTEMPTS_MAX
+    counts = list(range(NEG_ATTEMPTS_MIN, NEG_ATTEMPTS_MAX + 1))   # [1,2,3,4,5]
+    if prob >= 0.70:        # 🟢 유력
+        weights = [3, 7, 15, 30, 45]
+    elif prob >= 0.40:      # 🟡 가능성 있음
+        weights = [10, 20, 30, 25, 15]
+    elif prob >= 0.15:      # 🟠 쉽지 않음
+        weights = [40, 30, 18, 8, 4]
+    else:                   # 🔴 거의 불가능 — 1회짜리가 압도적
+        weights = [70, 18, 8, 3, 1]
+    return counts, weights
+
+
+def roll_negotiation_attempts(prob: float) -> int:
+    """[2026-08 신설] 오퍼 하나당 협상(연봉·기간 공통) 시도 횟수를 그
+    오퍼의 실제 입단 성공확률(join_prob) 기반으로 굴린다. 연봉/기간은
+    각각 독립적으로 호출해서 별개의 시도 횟수를 갖는다."""
+    counts, weights = _negotiation_attempts_weights(prob)
+    return random.choices(counts, weights=weights)[0]
+
+
+def negotiation_success_prob(prob: float) -> float:
+    """[2026-08 재설계] 협상 1회 시도당 성공확률 — 그 오퍼의 실제 입단
+    성공확률(prob, 0.03~0.95)을 회당 성공확률(NEG_SUCCESS_PROB_MIN~MAX)
+    구간으로 선형 매핑한다. 유력(높은 prob)일수록 협상도 거의 항상
+    성공하고, 거의불가능(낮은 prob)일수록 회당 성공확률도 바닥까지
+    떨어진다. 연봉/기간 협상이 공유한다."""
+    from constants import (NEG_SUCCESS_PROB_MIN, NEG_SUCCESS_PROB_MAX,
+                            APPLY_PROB_FLOOR, APPLY_PROB_CEIL)
+    span = APPLY_PROB_CEIL - APPLY_PROB_FLOOR
+    ratio = (prob - APPLY_PROB_FLOOR) / span if span else 0.0
+    ratio = max(0.0, min(1.0, ratio))
+    scaled = NEG_SUCCESS_PROB_MIN + ratio * (NEG_SUCCESS_PROB_MAX - NEG_SUCCESS_PROB_MIN)
+    return max(NEG_SUCCESS_PROB_MIN, min(NEG_SUCCESS_PROB_MAX, scaled))
 
 
 def _offer_probability(p, week: int) -> float:
@@ -11741,18 +11813,18 @@ def _infer_team_ambition(c, team_id, team_name, season, year):
         return "중위권 안정"
 
 
-def _build_offer(row, grade, tier, salary) -> dict:
+def _build_offer(row, grade, tier, salary, join_prob=None) -> dict:
     o = dict(
         team_id=row["id"], team_name=row["name"],
         league_id=row["lid"], league_name=row["lname"],
         tier=row["tier"], country=row["country"],
         flag=row["flag"], grade=grade, salary=salary,
     )
-    _enrich_offer(o, row)
+    _enrich_offer(o, row, join_prob=join_prob)
     return o
 
 
-def _enrich_offer(o: dict, row) -> dict:
+def _enrich_offer(o: dict, row, join_prob=None) -> dict:
     """[기능1] 오퍼에 역할/감독관심도/구단야망/계약보너스/감독성향 부여.
 
     역할은 '팀 평균 OVR - 내 OVR' 격차로 결정한다:
@@ -11772,6 +11844,22 @@ def _enrich_offer(o: dict, row) -> dict:
     conn.close()
     team_avg = r["a"] if r and r["a"] else my_ovr
     gap = team_avg - my_ovr   # +면 내가 팀 수준에 못 미침
+    # [2026-08 신설] 연봉/기간 협상 시도 횟수·성공확률 계산에 그대로 쓰기
+    # 위해 팀 평균 OVR을 오퍼에 같이 저장해둔다(참고용, 아래 join_prob이 실제 협상 기준).
+    o["team_avg_ovr"] = team_avg
+    # [2026-08 재설계, 신민용 확정: "직접 지원 화면에 뜨는 성공 가능성(유력/
+    # 가능성있음/쉽지않음/거의불가능)과 협상 결렬 위험이 같은 기준이어야
+    # 한다 — 평균OVR이 나보다 낮아도 등급 점프·게이트 때문에 거의불가능일
+    # 수 있는데, 협상은 그 실제 확률을 봐야지 단순 OVR 격차만 보면 안 된다"]
+    # 직접 지원과 완전히 같은 공식(calc_apply_success_prob)으로 이 오퍼의
+    # 실제 입단 성공확률을 구해 저장한다. 이미 direct-apply 경로(apply_to_team)
+    # 에서 계산해둔 값이 있으면 그걸 그대로 받아써서 중복 계산하지 않는다.
+    if join_prob is None:
+        try:
+            join_prob, _blocked = calc_apply_success_prob(row["id"])
+        except Exception:
+            join_prob = None
+    o["join_prob"] = join_prob
 
     # 역할 결정 — [밸런스 재설계 2026-07, GPT 검토 반영] 나이 보정은
     #   '능력이 정말 애매한 경우(격차 0~3, 팀 평균이 나와 비슷하거나 살짝

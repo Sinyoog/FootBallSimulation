@@ -2406,9 +2406,10 @@ class CenterPanel(QWidget):
         from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
                                       QLabel, QPushButton, QFrame, QComboBox)
         from game_engine import (join_team, update_player, get_state, get_conn,
-                                  _contract_years_neg_delta, _record_team_offer_cooldown)
-        from constants import (CONTRACT_YEARS_NEG_MAX_ATTEMPTS, CONTRACT_YEARS_NEG_SUCCESS_PROB,
-                               CONTRACT_YEARS_MIN, CONTRACT_YEARS_MAX)
+                                  _contract_years_neg_delta, _record_team_offer_cooldown,
+                                  roll_negotiation_attempts, negotiation_success_prob,
+                                  calc_apply_success_prob)
+        from constants import CONTRACT_YEARS_MIN, CONTRACT_YEARS_MAX
         import random
 
         _conn = get_conn()
@@ -2419,13 +2420,22 @@ class CenterPanel(QWidget):
         team_name = _row["name"] if _row else "현재 팀"
         team_id   = _row["id"] if _row else p.get("current_team_id", 0)
         team_tier = _row["tier"] if _row else 3
+        # [2026-08 재설계] 오퍼 협상(OfferWindow)과 동일하게, 재계약 협상도
+        # "지금 팀에 실제로 입단할 수 있는 확률"(직접 지원 화면의 성공
+        # 가능성과 같은 공식) 기반으로 시도 횟수·성공확률이 정해진다 —
+        # 그 팀이 나한테 벅찬 수준이면(거의불가능) 한 번 튕기는 것만으로도
+        # 재계약이 결렬될 수 있다.
+        try:
+            _prob, _ = calc_apply_success_prob(team_id)
+        except Exception:
+            _prob = 0.5
 
         # [2026-08 신설] 협상 상태 — 클로저 안에서 갱신할 수 있게 dict로.
         state = {
             "sal": p.get("_contract_renew_offer", 0),
             "yrs": p.get("_contract_renew_years", 0) or 2,   # 안전 기본값
-            "sal_used": random.randint(1, 3),
-            "yrs_used": CONTRACT_YEARS_NEG_MAX_ATTEMPTS,
+            "sal_used": roll_negotiation_attempts(_prob),
+            "yrs_used": roll_negotiation_attempts(_prob),
             "sal_failed": False,
             "yrs_failed": False,
         }
@@ -2514,7 +2524,7 @@ class CenterPanel(QWidget):
             state["sal_used"] -= 1
             old_sal = state["sal"]
             delta = random.randint(10, 30)
-            if random.random() < 0.55:
+            if random.random() < negotiation_success_prob(_prob):
                 state["sal"] = int(old_sal * (1 + delta/100))
                 show_toast(self, f"✅ +{delta}%  {fmt_money(old_sal)} → {fmt_money(state['sal'])}",
                           "#006622", 1400)
@@ -2533,7 +2543,7 @@ class CenterPanel(QWidget):
             old_yrs = state["yrs"]
             target  = state["target_yrs"]
             delta   = _contract_years_neg_delta(team_tier)
-            success = random.random() < CONTRACT_YEARS_NEG_SUCCESS_PROB
+            success = random.random() < negotiation_success_prob(_prob)
             if success and old_yrs != target:
                 direction = 1 if target > old_yrs else -1
                 step = min(delta, abs(target - old_yrs))

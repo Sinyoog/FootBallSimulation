@@ -107,6 +107,12 @@ HOME_BONUS = 40.0          # 홈팀 기대승률 계산에만 반영, 저장값�
 DELTA_CAP = 25.0           # 경기당 변동폭 상한 (5.2)
 DELTA_CAP_FINAL = 40.0     # 결승/우승전 예외 상한
 SAME_LEAGUE_DISCOUNT = 0.9  # 대륙대항전에서 같은 리그 팀끼리 붙으면 단계가중치에 추가 할인
+# [2026-08 신설] 리그는 경기 단위가 아니라 시즌 전체를 한 번에 집계하는
+# 근사식(_update_team_a_from_league)을 쓰므로, '경기 1건' 상한(DELTA_CAP)을
+# 그대로 씌우면 시즌 전체 성과가 사실상 경기 1건 취급을 받아 지나치게
+# 눌린다. 시즌 전체용 상한은 그보다 훨씬 크게(대략 딥런 대륙대항전 한 번
+# 우승과 맞먹는 수준) 잡는다. TUNE LATER — 실측 후 조정 대상.
+LEAGUE_SEASON_DELTA_CAP = 100.0
 
 
 def expected_score(rating_a: float, rating_b: float, home_bonus: float = 0.0) -> float:
@@ -189,6 +195,29 @@ LEAGUE_PLACEMENT_BANDS = [  # (백분위 상한, 배점) — 순서대로 첫 �
     (0.20, 6),
     (0.25, 3),
 ]
+
+# [2026-08 신설, 신민용 버그 리포트: "2부리그 1등한 게 1부리그 1등급으로
+# 오는 거 같다"] league_placement_bonus/리그 A레이어 가중치가 리그의
+# 부(tier)를 전혀 안 보고 있었다 — 같은 백분위(예: 1위)면 1부든 6부든
+# 배점이 완전히 동일했다. 부가 낮을수록(하위 리그) 배점·A레이어 가중치를
+# 깎는다. 1부=100%, 2부=65%, 3부=45%, 4부=30%, 5부 이하=20% 바닥.
+LEAGUE_TIER_WEIGHT = {1: 1.0, 2: 0.65, 3: 0.45, 4: 0.30}
+LEAGUE_TIER_WEIGHT_FLOOR = 0.20
+
+
+def league_tier_weight(tier: Optional[int]) -> float:
+    if not tier or tier <= 0:
+        return 1.0
+    return LEAGUE_TIER_WEIGHT.get(tier, LEAGUE_TIER_WEIGHT_FLOOR)
+
+
+# [2026-08 신설, 신민용 버그 리포트: "챔스 우승했는데 강등당해도 파워랭킹이
+# 별로 안 떨어진다 — 승리(우승)에 대한 보정만 있고 패배(강등)에 대한 보정이
+# 없는 게 설계 미숙이다"] 강등 자체에 레이어B 페널티가 전혀 없었다(리그
+# 순위 보너스는 잘해야 0점이지, 못하면 마이너스가 되는 구조가 아니었음).
+# 강등 1단계당, 그리고 강등 직전 소속 리그의 등급(league_tier_weight)이
+# 높을수록(명문 리그일수록 강등이 더 뼈아픔) 더 크게 깎는다.
+RELEGATION_BASE_PENALTY = -14.0  # 강등 1단계당 기본 페널티(리그가중치 곱하기 전)
 
 
 def league_placement_bonus(final_rank: int, n_teams: int) -> float:
@@ -606,29 +635,50 @@ def _update_team_a_from_matches(conn, matches_table: str, tournament_id: int, ye
 
 def _update_team_a_from_league(conn, evaluation_year: int):
     """리그는 경기 단위 대신 league_season_standings 집계를 '리그 평균
-    상대'로 근사(TUNE LATER, 상단 docstring 참고). 단계가중치는 1.0 고정."""
+    상대'로 근사(TUNE LATER, 상단 docstring 참고). 단계가중치는 1.0 고정.
+
+    [2026-08 재설계, 신민용 버그 리포트: "우승(대회 성적)에 대한 보정만
+    잘 되고, 패배·부진(특히 강등급 성적)에 대한 보정이 너무 약하다"]
+    예전 공식은 raw = k*w*(actual-expected)/n_games * min(n_games,10)/10
+    이었는데, 이건 "한 시즌 전체 성과"를 사실상 "경기 1개 분량"으로
+    압축해버리는 구조였다 — 게다가 그 결과에 경기당 상한(DELTA_CAP=25,
+    원래 '개별 경기 1건'의 변동폭 상한이지 시즌 전체 상한이 아님)을 그대로
+    씌워서, 시즌 내내 최하위(강등권)를 했든 우승을 했든 리그에서 받을 수
+    있는 A레이어 변동폭이 최대 ±25로 묶여 있었다. 반면 대륙대항전 한 번
+    우승하면 레이어A만으로도 여러 경기(조별~결승)가 각각 최대 ±25~40씩
+    누적되고 레이어B 우승 보너스(40×대회가중치, 최대 70+)까지 더해져서
+    수백 점이 오른다 — 그래서 "우승은 잘 반영되는데 강등은 안 반영된다"는
+    비대칭이 생겼다(챔스 우승하고 같은 해 강등해도 PS가 거의 안 떨어지는
+    버그의 근본 원인). 시즌을 실제 매치 단위로 순차 반영하면 정확하겠지만
+    DB 부하 문제로 이 근사식을 유지해야 하므로, 대신 (a) n_games로 나눴다가
+    다시 곱하는 이중 압축을 없애 시즌 전체 승점 격차(actual-expected)가
+    그대로 델타에 실리게 하고, (b) 상한을 '경기 1건' 상한이 아니라 시즌
+    전체용으로 별도로 크게(LEAGUE_SEASON_DELTA_CAP) 잡는다. (c) 리그
+    부(tier)가 낮을수록(하위 리그) league_tier_weight로 가중치를 깎는다."""
     rows = conn.execute(
-        """SELECT team_id, wins, draws, losses
-           FROM league_season_standings WHERE year=?""", (evaluation_year,)).fetchall()
+        """SELECT s.team_id, s.wins, s.draws, s.losses, l.tier
+           FROM league_season_standings s JOIN leagues l ON s.league_id = l.id
+           WHERE s.year=?""", (evaluation_year,)).fetchall()
     if not rows:
         return
-    ratings = {tid: _get_team_rating(conn, tid) for tid, *_ in rows}
+    team_ids = [r[0] for r in rows]
+    ratings = {tid: _get_team_rating(conn, tid) for tid in team_ids}
     league_avg = sum(ratings.values()) / len(ratings)
-    w = TEAM_COMPETITION_WEIGHT["league"]
-    for team_id, wins, draws, losses in rows:
+    base_w = TEAM_COMPETITION_WEIGHT["league"]
+    for team_id, wins, draws, losses, tier in rows:
         rating = ratings[team_id]
         grade = grade_for_ps(rating)
         avg_grade = grade_for_ps(league_avg)
         n_games = (wins or 0) + (draws or 0) + (losses or 0)
         if n_games == 0:
             continue
+        w = base_w * league_tier_weight(tier)
         actual_points = (wins or 0) * 1.0 + (draws or 0) * 0.5
         e = expected_score(rating, league_avg)
         expected_points = e * n_games
         k_match = (k_for_grade(grade) + k_for_grade(avg_grade)) / 2.0
-        raw = k_match * w * (actual_points - expected_points) / max(1, n_games) \
-              * min(n_games, 10) / 10
-        delta = max(-DELTA_CAP, min(DELTA_CAP, raw))
+        raw = k_match * w * (actual_points - expected_points)
+        delta = max(-LEAGUE_SEASON_DELTA_CAP, min(LEAGUE_SEASON_DELTA_CAP, raw))
         _add_team_a(conn, team_id, delta, evaluation_year)
 
 
@@ -747,27 +797,46 @@ def _apply_team_league_streak(conn, league_id: int, champion_team_id: int) -> fl
 
 
 def update_team_b_for_year(conn, evaluation_year: int):
-    # 1) 국내리그 순위 보너스(백분위 기반) + 연속우승 감쇠
+    # 1) 국내리그 순위 보너스(백분위 기반, 리그 부(tier)로 가중치 조정) + 연속우승 감쇠
     rows = conn.execute(
-        """SELECT l.id, s.team_id, s.wins, s.draws, s.losses
+        """SELECT l.id, l.tier, s.team_id, s.wins, s.draws, s.losses
            FROM league_season_standings s JOIN leagues l ON s.league_id = l.id
            WHERE s.year=?""", (evaluation_year,)).fetchall()
     by_league = {}
-    for league_id, team_id, wins, draws, losses in rows:
+    tier_of_league = {}
+    for league_id, tier, team_id, wins, draws, losses in rows:
         pts = (wins or 0) * 3 + (draws or 0)
         by_league.setdefault(league_id, []).append((team_id, pts))
+        tier_of_league[league_id] = tier
     for league_id, standings in by_league.items():
         standings.sort(key=lambda x: x[1], reverse=True)
         n = len(standings)
         champion_id = standings[0][0] if standings else None
         decay = _apply_team_league_streak(conn, league_id, champion_id) if champion_id else 1.0
+        tier_w = league_tier_weight(tier_of_league.get(league_id))
         for rank, (team_id, _pts) in enumerate(standings, start=1):
             bonus = league_placement_bonus(rank, n)
             if bonus <= 0:
                 continue
             if rank == 1:
                 bonus *= decay
-            _add_team_b(conn, team_id, bonus * TEAM_COMPETITION_WEIGHT["league"], evaluation_year)
+            _add_team_b(conn, team_id, bonus * TEAM_COMPETITION_WEIGHT["league"] * tier_w,
+                        evaluation_year)
+
+    # 1b) [2026-08 신설, 신민용 버그 리포트: "우승 보정만 있고 강등(패배)
+    # 보정이 없다"] 강등은 그 자체로 레이어B 페널티 — 강등 단계 수 ×
+    # 강등 직전 리그의 tier_weight(명문 리그일수록 더 아프게)만큼 깎는다.
+    # 이게 있어야 "챔스 우승 + 강등"처럼 성적이 완전히 엇갈린 시즌에도
+    # PS가 실제로 크게 떨어질 수 있다(우승 보너스가 강등 페널티를 압도할
+    # 수는 있지만, 최소한 반대 방향 힘 자체는 존재해야 한다).
+    relegations = conn.execute(
+        """SELECT team_id, from_tier, to_tier FROM promotion_log
+           WHERE year=? AND to_tier > from_tier AND team_id > 0""",
+        (evaluation_year,)).fetchall()
+    for team_id, from_tier, to_tier in relegations:
+        levels = max(1, (to_tier or 0) - (from_tier or 0))
+        penalty = RELEGATION_BASE_PENALTY * levels * league_tier_weight(from_tier)
+        _add_team_b(conn, team_id, penalty, evaluation_year)
 
     # 2) 국제/국내컵 계열 대회 성적 보너스 (deepest-stage 판정)
     for category, (tournaments_table, matches_table) in _CLUB_COMP_TABLES.items():

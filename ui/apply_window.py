@@ -19,7 +19,7 @@ from PyQt6.QtGui import QColor
 import world_browser as wb
 from game_engine import (
     get_apply_attempts_left, get_apply_player_context, calc_apply_prob_with_context,
-    apply_to_team, DIRECT_APPLY_MAX,
+    apply_to_team, DIRECT_APPLY_MAX, is_hard_mode,
 )
 from ui.center_panel import show_toast
 
@@ -67,6 +67,12 @@ class ApplyWindow(QDialog):
         self.chosen = None
         self._rows = []          # 현재 검색 결과 (search_teams 반환값)
         self._selected_team_id = None
+        # [2026-08 신설, 난이도 시스템] 어려움 난이도는 "누가 강팀인지" 알
+        # 수 없어야 하므로(신민용 확정) 평균OVR 컬럼과 OVR 정렬 필터를
+        # 뺀다 — 부(1부/2부)·국가등급(S/A/B..)·이름검색은 그대로 유지
+        # (이건 강함의 정확한 수치가 아니라 리그 소속·국가 수준일 뿐이라
+        # 문제없다고 확정됨).
+        self._hard = is_hard_mode()
         self._build()
         self._do_search()
 
@@ -125,18 +131,31 @@ class ApplyWindow(QDialog):
         # (부수가 고르게 섞여 나옴) — 오름/내림차순을 고르면 world_browser.
         # search_teams가 그 기준으로 SQL ORDER BY까지 걸어서 실제 상/하위
         # N팀을 반환한다(무작위 30팀 안에서 다시 정렬하는 게 아님).
+        # [2026-08 수정, 난이도 시스템] 어려움 난이도에서는 이 콤보 자체를
+        # 만들지 않는다 — OVR 정렬이 있으면 그 자체로 "누가 강팀인지"가
+        # 드러나 버리기 때문(신민용 확정).
         self.sort_combo = QComboBox()
         self.sort_combo.addItem("정렬: 무작위", None)
         self.sort_combo.addItem("평균OVR ▲ 오름차순", "ovr_asc")
         self.sort_combo.addItem("평균OVR ▼ 내림차순", "ovr_desc")
         self.sort_combo.currentIndexChanged.connect(self._do_search)
-        search_row.addWidget(self.sort_combo, 1)
+        if not self._hard:
+            search_row.addWidget(self.sort_combo, 1)
         root.addLayout(search_row)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(6)
-        self.table.setHorizontalHeaderLabels(
-            ["국가", "팀", "부", "등급", "평균OVR", "성공 가능성"])
+        # [2026-08 수정, 난이도 시스템] 어려움 난이도는 "평균OVR" 컬럼에
+        # 이어 "성공 가능성"도 뺀다(신민용 재확인: "지원 가능성도 결국
+        # OVR 격차로 계산된 값이라 안 뜨는 게 맞다") — ⛔ 지원 불가
+        # 표시조차 "이 팀이 나보다 훨씬 강하다"는 정보가 되므로 예외 없이
+        # 뺀다. 6열→4열(국가/팀/부/등급만).
+        if self._hard:
+            self.table.setColumnCount(4)
+            self.table.setHorizontalHeaderLabels(["국가", "팀", "부", "등급"])
+        else:
+            self.table.setColumnCount(6)
+            self.table.setHorizontalHeaderLabels(
+                ["국가", "팀", "부", "등급", "평균OVR", "성공 가능성"])
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -202,18 +221,26 @@ class ApplyWindow(QDialog):
         self.table.setRowCount(len(self._rows))
         ctx = get_apply_player_context()
         for i, r in enumerate(self._rows):
-            avg_ovr = r.get("avg_ovr") or 0
-            prob, blocked = calc_apply_prob_with_context(r["id"], ctx)
-            label, color = _prob_label(prob, blocked)
-            vals = [
-                f"{r.get('flag','')} {r['country']}", r["name"],
-                f"{r['tier']}부", r["grade"],
-                f"{avg_ovr:.1f}", label,
-            ]
+            if self._hard:
+                vals = [
+                    f"{r.get('flag','')} {r['country']}", r["name"],
+                    f"{r['tier']}부", r["grade"],
+                ]
+                prob_col = None
+            else:
+                avg_ovr = r.get("avg_ovr") or 0
+                prob, blocked = calc_apply_prob_with_context(r["id"], ctx)
+                label, color = _prob_label(prob, blocked)
+                vals = [
+                    f"{r.get('flag','')} {r['country']}", r["name"],
+                    f"{r['tier']}부", r["grade"],
+                    f"{avg_ovr:.1f}", label,
+                ]
+                prob_col = 5
             for j, v in enumerate(vals):
                 item = QTableWidgetItem(v)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if j == 5:
+                if prob_col is not None and j == prob_col:
                     item.setForeground(QColor(color))
                 item.setData(Qt.ItemDataRole.UserRole, r["id"])
                 self.table.setItem(i, j, item)
@@ -231,11 +258,17 @@ class ApplyWindow(QDialog):
         idx = rows[0].row()
         r = self._rows[idx]
         self._selected_team_id = r["id"]
-        ctx = get_apply_player_context()
-        prob, blocked = calc_apply_prob_with_context(r["id"], ctx)
-        label, _ = _prob_label(prob, blocked)
-        self.detail_lbl.setText(f"{r['name']} ({r['country']}, {r['grade']}급 {r['tier']}부) "
-                                 f"— 예상 성공 가능성: {label} (약 {prob*100:.0f}%)")
+        # [2026-08 수정, 난이도 시스템] 어려움 난이도는 성공 가능성을
+        # 아예 계산해서 보여주지 않는다 — 현실처럼 "일단 지원해봐야 아는"
+        # 상태로 둔다(신민용 확정).
+        if self._hard:
+            self.detail_lbl.setText(f"{r['name']} ({r['country']}, {r['tier']}부)")
+        else:
+            ctx = get_apply_player_context()
+            prob, blocked = calc_apply_prob_with_context(r["id"], ctx)
+            label, _ = _prob_label(prob, blocked)
+            self.detail_lbl.setText(f"{r['name']} ({r['country']}, {r['grade']}급 {r['tier']}부) "
+                                     f"— 예상 성공 가능성: {label} (약 {prob*100:.0f}%)")
         self.apply_btn.setEnabled(get_apply_attempts_left() > 0)
 
     def _do_apply(self):
@@ -259,8 +292,13 @@ class ApplyWindow(QDialog):
                        "#cc4400", 500)
             QTimer.singleShot(500, self.reject)
         else:
-            show_toast(self, f"😢 {team_name} 지원 결렬 (성공확률 {prob*100:.0f}%였습니다)",
-                       "#e04040", 2200)
+            # [2026-08 수정, 난이도 시스템] 어려움 난이도는 결과 통보에도
+            # 정확한 확률(%)을 남기지 않는다 — 실패했다는 사실만 안다.
+            if self._hard:
+                show_toast(self, f"😢 {team_name} 지원 결렬", "#e04040", 2200)
+            else:
+                show_toast(self, f"😢 {team_name} 지원 결렬 (성공확률 {prob*100:.0f}%였습니다)",
+                           "#e04040", 2200)
             # 같은 팀 재지원은 의미 없으니(결과 이미 소비) 다시 선택하도록 유도.
             self.table.clearSelection()
             self._selected_team_id = None

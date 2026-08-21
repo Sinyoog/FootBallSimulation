@@ -417,6 +417,49 @@ class NewPlayerDialog(QDialog):
         name_row.addWidget(self.name_edit)
         lay.addLayout(name_row)
 
+        # [2026-08 신설, 난이도 시스템] 이름 칸 바로 아래에 난이도 선택.
+        # 생성 이후엔 절대 변경 불가능하므로(신민용 확정) 여기서만 고른다.
+        # 쉬움(기본값)=지금과 동일 / 보통=재능등급·성격·신체특징 랜덤
+        # 배정(선택창 자체를 숨김) / 어려움=보통 조건 + 게임 내내 내 선수
+        # 포함 전원의 스탯·재능등급·성격·감독관계·포메이션 OVR 수치가
+        # 전부 비공개로 진행.
+        diff_row = QHBoxLayout()
+        diff_row.addWidget(QLabel("난이도"))
+        self.diff_easy_btn = QPushButton("쉬움")
+        self.diff_normal_btn = QPushButton("보통")
+        self.diff_hard_btn = QPushButton("어려움")
+        # [2026-08 재수정, 신민용 리포트: "우측에 설명 안만들었는데 우측에
+        # 설명칸 있다고 했잖아 — 쉬움/보통/어려움이 뭔지 설명을 저기다
+        # 해달라 했잖아"] 처음엔 버튼 툴팁(마우스 올리면 뜨는 창)으로
+        # 처리했는데, 이 다이얼로그는 이미 우측에 전용 "설명 노트 패널"
+        # (self.note_panel, 아래 601번째 줄 부근)이 있고 재능등급/성격/
+        # 신체특징 등 다른 필드들은 전부 그 패널로 설명을 띄운다 — 난이도만
+        # 툴팁으로 따로 놀면 안 되고 같은 패널을 써야 한다. 그래서 버튼
+        # 클릭 시(_on_difficulty_clicked) note_panel을 직접 갱신하도록
+        # 바꿨다(아래 _note_for_difficulty 참고). 선택되지 않은 버튼은
+        # objectName+:checked QSS로 회색 비활성 느낌, 선택된 버튼만
+        # 눈에 띄게 강조.
+        _DIFF_BTN_QSS = """
+            QPushButton#diffBtn {
+                background-color:#2a2a2a; color:#888888; border:1px solid #444444;
+                padding:6px 16px; border-radius:4px;
+            }
+            QPushButton#diffBtn:hover { border:1px solid #777777; color:#bbbbbb; }
+            QPushButton#diffBtn:checked {
+                background-color:#2d5a2d; color:#ffffff; border:1px solid #4caf50;
+                font-weight:bold;
+            }
+        """
+        for btn in (self.diff_easy_btn, self.diff_normal_btn, self.diff_hard_btn):
+            btn.setCheckable(True)
+            btn.setObjectName("diffBtn")
+            btn.setStyleSheet(_DIFF_BTN_QSS)
+            btn.clicked.connect(self._on_difficulty_clicked)
+            diff_row.addWidget(btn)
+        self.diff_easy_btn.setChecked(True)
+        self._difficulty = "easy"
+        lay.addLayout(diff_row)
+
         # 국적 (포지션 위) — 국가가 많아 검색+그리드 다이얼로그로 선택
         self._nat = None    # (name, flag) | None(=랜덤)
         nat_row = QHBoxLayout()
@@ -475,36 +518,46 @@ class NewPlayerDialog(QDialog):
         # 다른 콤보들처럼 "🎲 랜덤"(맨 뒤)을 골라 확률 추첨에 맡길 수도
         # 있다. talent_tier=None을 넘기면 game_engine.create_player가
         # 알아서 확률 추첨으로 처리한다.
-        talent_row = QHBoxLayout()
+        # [2026-08 신설, 난이도 시스템] 보통/어려움에서는 이 행 자체를
+        # 숨긴다(신민용 확정: "재능 등급 성격 신체 특성은 선택할 수 없고
+        # ... 나머지는 아예 선택창에 안뜨며") — QWidget으로 감싸서
+        # setVisible() 하나로 통째로 껐다 켤 수 있게 한다.
+        self.talent_row_w = QWidget()
+        talent_row = QHBoxLayout(self.talent_row_w)
+        talent_row.setContentsMargins(0, 0, 0, 0)
         talent_row.addWidget(QLabel("재능 등급"))
         self.talent_combo = QComboBox()
         self.talent_combo.addItem("🎲 랜덤", None)
         for _tier in TALENT_TIER_ORDER:
             self.talent_combo.addItem(TALENT_TIER_KO[_tier], _tier)
         talent_row.addWidget(self.talent_combo)
-        lay.addLayout(talent_row)
+        lay.addWidget(self.talent_row_w)
 
         # [2026-07 신규] 성격 선택 — 재능 등급과 같은 패턴("🎲 랜덤"이 기본,
         # 맨 앞에 둬서 안 고르면 알아서 확률 추첨). personality=None을
         # 넘기면 game_engine.create_player가 알아서 처리한다.
-        personality_row = QHBoxLayout()
+        self.personality_row_w = QWidget()
+        personality_row = QHBoxLayout(self.personality_row_w)
+        personality_row.setContentsMargins(0, 0, 0, 0)
         personality_row.addWidget(QLabel("성격"))
         self.personality_combo = QComboBox()
         self.personality_combo.addItem("🎲 랜덤", None)
         for _p in PERSONALITIES:
             self.personality_combo.addItem(_p, _p)
         personality_row.addWidget(self.personality_combo)
-        lay.addLayout(personality_row)
+        lay.addWidget(self.personality_row_w)
 
         # [2026-07 신규] 신체 특징 선택 — 위 성격과 동일한 패턴.
-        trait_row = QHBoxLayout()
+        self.trait_row_w = QWidget()
+        trait_row = QHBoxLayout(self.trait_row_w)
+        trait_row.setContentsMargins(0, 0, 0, 0)
         trait_row.addWidget(QLabel("신체 특징"))
         self.trait_combo = QComboBox()
         self.trait_combo.addItem("🎲 랜덤", None)
         for _t in PHYSICAL_TRAITS:
             self.trait_combo.addItem(_t, _t)
         trait_row.addWidget(self.trait_combo)
-        lay.addLayout(trait_row)
+        lay.addWidget(self.trait_row_w)
 
         note = QLabel("※ 신체(체형·키·몸무게) · 스탯은 자동 랜덤")
         note.setStyleSheet("color: #666666; font-size: 11px;")
@@ -582,6 +635,30 @@ class NewPlayerDialog(QDialog):
                 combo.currentIndexChanged.connect(
                     lambda _i, cb=combo: self._refresh_note_if_active(cb))
 
+    # ── 난이도 선택 (2026-08 신설) ──────────────────────────────
+    def _on_difficulty_clicked(self):
+        sender = self.sender()
+        for btn, key in ((self.diff_easy_btn, "easy"),
+                          (self.diff_normal_btn, "normal"),
+                          (self.diff_hard_btn, "hard")):
+            btn.setChecked(btn is sender)
+            if btn is sender:
+                self._difficulty = key
+        # 보통/어려움이면 재능·성격·신체특징 선택창을 아예 숨기고, 안에
+        # 남아있을 수 있는 선택값도 "🎲 랜덤"으로 되돌려 create_player가
+        # 항상 알아서 추첨하게 한다(숨겨진 콤보에 값이 남아있어도 UI에
+        # 안 보이니 상관없지만, 명시적으로 리셋해두는 편이 안전하다).
+        show_choice = (self._difficulty == "easy")
+        for row_w, combo in ((self.talent_row_w, self.talent_combo),
+                              (self.personality_row_w, self.personality_combo),
+                              (self.trait_row_w, self.trait_combo)):
+            row_w.setVisible(show_choice)
+            if not show_choice:
+                combo.setCurrentIndex(0)
+        # [2026-08 신설] 다른 필드들과 동일하게 우측 설명 노트 패널에 표시.
+        self._active_note_widget = None
+        self.note_panel.setHtml(self._note_for_difficulty())
+
     # ── 설명 노트 콘텐츠 ─────────────────────────────────────────
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.FocusIn and obj in getattr(self, "_note_handlers", {}):
@@ -594,7 +671,7 @@ class NewPlayerDialog(QDialog):
             self.note_panel.setHtml(self._note_handlers[combo]())
 
     def _note_default(self):
-        return ("<span style='color:#666;'>시작 연도 / 시작 나이 / 재능 등급 / 성격 / "
+        return ("<span style='color:#666;'>난이도 / 시작 연도 / 시작 나이 / 재능 등급 / 성격 / "
                 "신체 특징 / 주요 포지션 / <br>세부역할 중 하나를 클릭하면<br>"
                 "여기에 실제 게임 효과가 표시됩니다.</span>")
 
@@ -602,6 +679,33 @@ class NewPlayerDialog(QDialog):
         body = "<br>".join(lines)
         return (f"<b style='color:#00cc44;font-size:13px;'>{title}</b><br><br>"
                 f"<span style='line-height:150%;'>{body}</span>")
+
+    # [2026-08 신설] 난이도 버튼 클릭 시 우측 설명 노트 패널에 표시할 내용.
+    def _note_for_difficulty(self):
+        content = {
+            "easy": ("쉬움", [
+                "지금과 동일하게 모든 정보가 공개됩니다.",
+                "",
+                "내 선수를 포함한 모든 선수의 재능 등급·현재 OVR·성격·",
+                "감독 관계·상세 스탯을 언제든 확인할 수 있습니다.",
+            ]),
+            "normal": ("보통", [
+                "재능 등급·성격·신체 특징을 직접 고를 수 없고",
+                "무작위로 배정됩니다(위 선택창 자체가 숨겨집니다).",
+                "",
+                "정보 공개 범위는 쉬움과 동일합니다.",
+            ]),
+            "hard": ("어려움", [
+                "보통 조건(재능 등급·성격·신체 특징 무작위 배정)에 더해,",
+                "게임 내내 내 선수를 포함한 모든 선수의 재능 등급·현재 OVR·",
+                "성격·감독 관계·상세 스탯이 표시되지 않습니다",
+                "(현실적인 정보 제한).",
+                "",
+                "<b style='color:#ff6666;'>⚠ 생성 후에는 난이도를 바꿀 수 없습니다.</b>",
+            ]),
+        }
+        title, lines = content.get(self._difficulty, content["easy"])
+        return self._note_html(f"난이도 — {title}", lines)
 
     def _note_for_year(self):
         lines = [
@@ -803,8 +907,15 @@ class NewPlayerDialog(QDialog):
 
         # talent_tier/personality/physical_trait를 전부 None으로 넘겨서
         # (콤보 선택과 무관하게) create_player가 알아서 확률 추첨하게 한다.
+        # [2026-08 수정, 신민용 확정] "완전 랜덤 생성"은 난이도까지 포함해서
+        # 전부 무작위여야 한다 — 화면에서 고른 난이도를 그대로 쓰지 않고
+        # 매번 쉬움/보통/어려움 중 하나를 새로 뽑는다. ("✅ 생성" 버튼은
+        # 화면에서 고른 난이도를 그대로 쓰는 쪽 — 그쪽만 "선택 안 하면
+        # 쉬움 기본값" 규칙이 적용된다.)
+        rand_difficulty = random.choice(["easy", "normal", "hard"])
         create_player(rname, rpos, rrole, cname, cflag,
-                      talent_tier=None, personality=None, physical_trait=None)
+                      talent_tier=None, personality=None, physical_trait=None,
+                      difficulty=rand_difficulty)
         self.accept()
 
     def _update_ok_enabled(self):
@@ -882,6 +993,13 @@ class NewPlayerDialog(QDialog):
         tier = self.talent_combo.currentData()  # None이면 create_player가 알아서 확률 추첨
         personality = self.personality_combo.currentData()
         trait = self.trait_combo.currentData()
+        # [2026-08 신설, 방어적 안전장치] 보통/어려움은 이 콤보들이 화면에서
+        # 숨겨져 있어야 정상이지만(_on_difficulty_clicked), 혹시라도 숨김
+        # 처리 전에 값이 남아있을 가능성에 대비해 여기서 한 번 더
+        # 강제로 None 처리한다 — "보통/어려움에서는 절대 직접 선택 불가"
+        # 원칙을 확실히 지키기 위함.
+        if self._difficulty != "easy":
+            tier = personality = trait = None
         # [2026-08 신설] 비워두면(빈 문자열) None → create_player가 기본값
         # (GAME_START_YEAR/PLAYER_START_AGE) 사용. 입력했으면 QIntValidator가
         # 이미 범위(1986~2020 / 14~28)를 강제해뒀으므로 그대로 정수 변환.
@@ -891,5 +1009,6 @@ class NewPlayerDialog(QDialog):
         start_age = int(age_txt) if age_txt else None
         create_player(name, pos, role, nat_name, nat_flag, talent_tier=tier,
                       personality=personality, physical_trait=trait,
-                      start_year=start_year, start_age=start_age)
+                      start_year=start_year, start_age=start_age,
+                      difficulty=self._difficulty)
         self.accept()

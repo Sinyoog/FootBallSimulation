@@ -718,8 +718,26 @@ PROGRESS_SOFTCAP_POWER     = 3.0
 # 완전히 독립된 별도 트랙(독립 시도 횟수, 독립 성공/실패). 최종 계약은
 # 연봉·기간 둘 다 "결렬 없이" 끝나야 성사되고, 둘 중 하나라도 마지막
 # 시도에서 실패하면 계약 전체가 결렬된다(ui/offer_window.py 참고).
-CONTRACT_YEARS_NEG_MAX_ATTEMPTS = 2     # 기간 협상 시도 횟수(연봉과 별개)
-CONTRACT_YEARS_NEG_SUCCESS_PROB = 0.50  # 시도 1회당 성공 확률
+# [2026-08 재설계 v2, 신민용 확정: "직접 지원 화면에 뜨는 성공 가능성
+# (유력/가능성있음/쉽지않음/거의불가능)과 협상 결렬 위험이 같은 기준을
+# 써야 한다 — 단순 OVR 격차가 아니라 실제 입단 성공확률(등급 게이트·
+# 점프 페널티까지 반영된 값)을 봐야 한다"] 연봉/기간 협상 공통으로,
+# 오퍼의 실제 입단 성공확률(join_prob, calc_apply_success_prob과 동일
+# 공식)에 따라 시도 횟수(1~5회) 분포와 회당 성공확률이 둘 다 달라진다 —
+# game_engine.roll_negotiation_attempts()/negotiation_success_prob() 참고.
+NEG_ATTEMPTS_MIN = 1
+NEG_ATTEMPTS_MAX = 5
+NEG_SUCCESS_PROB_MIN = 0.08
+NEG_SUCCESS_PROB_MAX = 0.85
+# calc_apply_prob_with_context()가 실제로 반환하는 확률 범위(0.03~0.95) —
+# join_prob을 회당 협상 성공확률로 선형 매핑할 때 양끝 기준으로 쓴다.
+APPLY_PROB_FLOOR = 0.03
+APPLY_PROB_CEIL  = 0.95
+
+# [구버전, 하위호환 폴백용] 팀 평균 OVR을 못 구하는 예외적인 경우에만 쓰는
+# 값 — 정상 흐름은 위 NEG_* 값 기반 함수를 쓴다.
+CONTRACT_YEARS_NEG_MAX_ATTEMPTS = 2     # 기간 협상 시도 횟수(연봉과 별개) [폴백]
+CONTRACT_YEARS_NEG_SUCCESS_PROB = 0.50  # 시도 1회당 성공 확률 [폴백]
 # 시도 성공 시 한 번에 옮길 수 있는 연수 폭 — 구단 티어가 낮을수록(하위
 # 리그·소규모 구단) 선수를 잡으려 유연하게 맞춰주고, 1부 등 상위 티어는
 # 계약 정책이 완고해 폭이 좁다.
