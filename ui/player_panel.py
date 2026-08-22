@@ -263,7 +263,7 @@ class PlayerPanel(QWidget):
         rows.append(("명성",   f"{p.get('fame',0)} [{fame_lbl}]"))
         rows.append(("인기도", str(p.get("popularity",0))))
         rows.append(("팬수",   f"{p.get('fans',0):,}명"))
-        rows.append(("에이전트", f"[{p.get('agent_grade','F')}등급]"))
+        rows.append(("에이전트", f"[{p.get('agent_grade','없음')}등급]"))
         rows.append(("연봉",   "무급" if salary == 0 else
                      f"연 {fmt_money(salary)}  [주 {fmt_money(weekly)}]"))
         rows.append(("총자산", fmt_money(p.get("total_assets",0))))

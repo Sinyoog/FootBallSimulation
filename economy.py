@@ -39,13 +39,23 @@ def economy_index(year: int) -> float:
     현실은 점프·정체가 반복되지만(2008 금융위기/2017 네이마르 등),
     게임에서는 예측 가능한 성장 곡선이 플레이어 경험상 더 낫다는 결론
     (3차 검토에서도 재확인).
-    """
+
+    [2026-08 확장, 신민용+GPT 검토 확정] PLAYER_START_YEAR_MIN=1986까지
+    커스텀 시작 연도를 허용하는데, 이전엔 가장 이른 앵커가 2001이라
+    `year<=2001`이 전부 2001과 똑같은 0.48로 뭉개졌다(1986년에 시작해도
+    "지단 시대" 이적료가 그대로 나오는 시대착오). 그 시절 실제 세계기록급
+    이적료를 2001년 지단(£45.6M)과 같은 방식으로 비율화해서 역산 —
+    1990 바조(£8M)→0.09, 1996 시어러(£15M)→0.16, 2000 피구(£37M)→0.39,
+    1986(마라도나 시대 직후, 아직 완만)→0.07. 2000→2001 구간이 유독
+    가파른 건 실제로도 그 시기(피구·지단 연속 이적, 보스만 판결 이후
+    자금 유입)에 이적시장이 실제로 급팽창했던 시대상을 반영한다."""
     anchors = [
+        (1986, 0.07), (1990, 0.09), (1996, 0.16), (2000, 0.39),
         (2001, 0.48), (2005, 0.50), (2010, 0.65), (2015, 0.82),
         (2020, 0.95), (2026, 1.00), (2035, 1.20), (2040, 1.35),
     ]
     if year <= anchors[0][0]:
-        return anchors[0][1]
+        return anchors[0][1]   # 1986 이전 정책은 추후 별도 확정(현재 게임 허용범위 밖)
     if year >= anchors[-1][0]:
         return anchors[-1][1]   # 2040 이후 정책은 추후 별도 확정
     for (y1, v1), (y2, v2) in zip(anchors, anchors[1:]):
@@ -312,10 +322,131 @@ def potential_mult(current_ovr, talent_cap) -> float:
     return 1.0 + gap * 0.015 * quality
 
 
+def _form_fee_mult(form_score) -> float:
+    """[2026-08 신설, 15-2-G → 2026-08 15-5 폐기 예정] calc_season_form_
+    score()의 form_score(0~1)를 이적료 배율(0.85~1.10)로 직접 변환하던
+    구 방식. 실제 호출부(game_engine.py) 어디에서도 form_score를 넘기지
+    않아 사실상 미사용 상태였다 — 15-5에서 effective_ovr 기반 비율
+    방식(_fee_form_mult)으로 대체한다. 하위 호환을 위해 함수 자체는
+    남겨두되 estimate_transfer_fee 내부에서는 더 이상 호출하지 않는다.
+    """
+    if form_score is None:
+        return 1.0
+    form_score = max(0.0, min(1.0, form_score))
+    anchors = [(0.00, 0.85), (0.40, 0.94), (0.50, 1.00), (0.65, 1.05), (0.80, 1.10)]
+    if form_score <= anchors[0][0]:
+        return anchors[0][1]
+    if form_score >= anchors[-1][0]:
+        return anchors[-1][1]
+    for (x1, y1), (x2, y2) in zip(anchors, anchors[1:]):
+        if x1 <= form_score <= x2:
+            frac = (form_score - x1) / (x2 - x1)
+            return y1 + (y2 - y1) * frac
+    return 1.0
+
+
+def _fee_form_mult(ovr, effective_ovr) -> float:
+    """[2026-08 신설, 15-5] 이적료의 폼/시장가치 보정 — 연봉(_calc_offer_
+    salary)과 같은 원칙(effective_ovr로 원본 OVR을 직접 대체하지 않고,
+    기존 이적료 곡선에서 두 값의 비율만 뽑아 보정계수로 재사용)을
+    따르되, 감쇠폭은 독립적으로 정한다(신민용+GPT 확정 — 연봉의
+    sqrt+0.70을 그대로 복붙하지 않음).
+
+    실측 결과 이적료 곡선(_base_market_value_eok)은 OVR80~89 구간에서
+    연봉 곡선보다 훨씬 가파르다(10 OVR 차이로 20억→500억, 25배) — 이
+    구간에서 raw ratio를 그대로 쓰면 심한 부진 한 시즌만으로 이적료가
+    -73%까지 빠지는 등 비현실적으로 요동친다. sqrt로는 충분히 완충되지
+    않아(같은 구간 -47~-49%) 세제곱근(ratio**(1/3))을 쓴다 — 가장 가파른
+    구간(OVR80~89)에서 최대 감쇠(form=0.0, effective_ovr -5)를 줘도
+    -38.7%로 수렴해 하한(0.60, 최대 -40%)에 거의 안 걸린다. 반대로
+    OVR100 근접 구간은 곡선이 상단에서 평평해져(100 이상 전부 4500억
+    고정) ratio 자체가 1에 가까워, 별도 상단 케어 없이도 "메시급 선수가
+    한 시즌 부진했다고 헐값에 풀리는" 문제가 재현되지 않는다(104 OVR,
+    최대 감쇠 기준 실측 -2.6%).
+
+    effective_ovr가 ovr보다 크거나 같으면(폼 보정 없음, 예: FA/첫 입단)
+    1.0을 반환한다."""
+    if effective_ovr is None or effective_ovr >= ovr:
+        return 1.0
+    base = _base_market_value_eok(ovr)
+    if base <= 0:
+        return 1.0
+    adj = _base_market_value_eok(effective_ovr)
+    ratio = adj / base
+    return max(0.60, min(1.0, ratio ** (1 / 3)))
+
+
+# [2026-08 신설, 15-3-B] tier별 "이적료 = 구단 최고연봉 지불여력 × N배" 배수.
+# 처음부터 확정값이 아니라 10~30배 후보군 중 시뮬레이션으로 고른 값 —
+# 아래 calibration 참고. tier가 낮을수록(하위리그) 배수도 낮게 — 하위
+# 리그는 애초에 "거액 이적" 개념 자체가 약하다는 설계 의도.
+FEE_TO_SALARY_MULT = {1: 5, 2: 4, 3: 3, 4: 2}
+
+
+def _fee_affordability_cap(country, tier, team_name, team_id, year) -> float:
+    """[2026-08 신설, 15-3-B] "이 구단이 일반적으로 감당할 수 있는 이적료의
+    상한"(억원) — "이 가격에 반드시 살 수 있다"가 아니라 지불여력의 대략적
+    상한선. 이미 검증된 연봉 캡 인프라(_calc_salary의 COUNTRY_SALARY_CAP/
+    SALARY_CURVE_OVERRIDE/LOWER_TIER_SALARY_CAP)에서 "이 구단이 최상급
+    선수(OVR99)에게 낼 수 있는 최고 연봉"을 구해, 그 금액의 N배(tier별
+    FEE_TO_SALARY_MULT)를 이적료 상한으로 삼는다 — 새로운 200개국 이적료
+    테이블을 또 만들지 않고 기존에 검증된 국가별 경제력 서열을 그대로
+    재사용한다.
+
+    [중요] team_name은 일부러 안 넘긴다 — _calc_salary가 team_name을 받으면
+    명문팀 프리미엄(prestige_salary_mult)까지 곱해버리는데, estimate_
+    transfer_fee의 raw_fee 쪽에서 이미 prestige_mult(1.664 등)를 곱하고
+    있어서 여기서 또 곱하면 이중 반영된다(GPT 지적 사항). 국가×tier
+    경제력만 반영하고, club_strength만 별도로 좁게(0.9~1.15) 얹는다.
+    """
+    from constants import get_league_grade
+    wealth = get_league_grade(country, "F") if country else "F"
+    top_salary_thousand = _calc_salary(wealth, tier, 99, country=country,
+                                        team_name=None, year=year, team_id=None)
+    top_salary_eok = top_salary_thousand / 100_000
+    mult = FEE_TO_SALARY_MULT.get(tier, FEE_TO_SALARY_MULT.get(4, 8))
+    cap = top_salary_eok * mult
+    # club_strength만 좁게 반영(prestige 중복 방지, 위 docstring 참고)
+    cap *= _club_strength_fee_mult(team_id) if team_id else 1.0
+    return cap
+
+
+def _apply_fee_affordability(raw_fee_eok, affordability_cap_eok,
+                              hard_cap_mult=1.6, damp=0.35, tail_damp=0.03) -> float:
+    """[2026-08 신설, 15-3-B] raw_fee(억원)가 구단 지불여력(affordability_
+    cap)을 넘으면 초과분만 압축한다(2단계: soft compression + tail damp).
+    affordability 이내면 그대로, 초과분은 damp(35%)만 반영.
+
+    [2026-08 재조정, 신민용 리포트: "K4/K2 하위 구단은 OVR70이든 90이든
+    이적료가 완전히 똑같다"] 원래는 hard_cap_mult(1.6)에서 min()으로 완전히
+    잘라냈는데, 이러면 K4처럼 affordability_cap 자체가 작은 구단은 어느
+    OVR을 넣어도 그 상한에 눌려붙어 OVR 구분이 통째로 사라졌다 — 예전에
+    salary 쪽 `_cap_relief_mult`에서 겪었던 것과 완전히 같은 계열의
+    평탄화 버그. 같은 해법 적용: hard_cap_mult 지점에서 완전히 멈추지
+    않고, 그 이후로도 아주 완만하게(tail_damp=3%) 계속 증가시켜서 OVR
+    정보가 특정 구간부터 사라지는 일이 없게 한다(비싸지긴 하지만 절대
+    평평해지지 않음).
+    """
+    if affordability_cap_eok <= 0:
+        return raw_fee_eok
+    ratio = raw_fee_eok / affordability_cap_eok
+    if ratio <= 1.0:
+        return raw_fee_eok
+    # damp 구간(1.0~hard_cap_mult)이 끝나는 지점의 raw ratio를 역산 —
+    # 그 지점까진 기존과 동일한 공식, 그 이후는 tail_damp로 이어붙인다.
+    ratio_at_hardcap = 1.0 + (hard_cap_mult - 1.0) / damp
+    if ratio <= ratio_at_hardcap:
+        compressed_ratio = 1.0 + (ratio - 1.0) * damp
+    else:
+        compressed_ratio = hard_cap_mult + (ratio - ratio_at_hardcap) * tail_damp
+    return affordability_cap_eok * compressed_ratio
+
+
 def estimate_transfer_fee(grade, tier, ovr, country=None, team_name=None,
                           position=None, exit_type=None, age=None,
                           talent_cap=None, contract_remaining_years=None,
-                          year=None, team_id=None, season=None, debug=False):
+                          year=None, team_id=None, season=None, debug=False,
+                          form_score=None, effective_ovr=None):
     """선수 시장가치(이적료 추정치, 천원 단위).
 
     exit_type: [11차 신설] "계약만료"면 진짜 FA — 다른 계수 계산 없이
@@ -333,6 +464,12 @@ def estimate_transfer_fee(grade, tier, ovr, country=None, team_name=None,
       팀별 위상 차이가 있어야 한다"] 있으면 _team_rank_status_mult로
       "그 리그 안에서 상위권/하위권인지"를 가볍게(±5%) 반영한다. 없으면
       (AI 선수 등 기존 호출부) 중립(1.0)으로 하위호환.
+    effective_ovr: [2026-08 신설, 15-5] game_engine.calc_effective_ovr()
+      로 구한 "시장 평가용 OVR". 있으면 _fee_form_mult()로 이적료를
+      보정한다 — 폼/부상으로 낮아진 시장가치를 반영. None이면(하위호환)
+      보정 없음. form_score는 15-5 이전 방식의 잔재 파라미터로, 현재는
+      넘겨도 무시된다(effective_ovr로 대체됨 — _form_fee_mult는 더 이상
+      호출하지 않음).
     """
     if exit_type == "계약만료":
         return 0
@@ -360,6 +497,22 @@ def estimate_transfer_fee(grade, tier, ovr, country=None, team_name=None,
     capped_mult = _apply_soft_cap(combined_mult)
 
     val_eok = base_eok * capped_mult
+    # [2026-08 재설계, 15-5] 이번 시즌 활약 보정 — form_score 직접매핑
+    # 방식(_form_fee_mult, 하위호환용으로 남겨두되 더 이상 호출 안 함)
+    # 대신 effective_ovr 기반 비율 방식(_fee_form_mult)으로 전환. 하드캡/
+    # tier 감쇠보다 먼저(원래 가치를 기준으로 보정) 적용한다.
+    val_eok *= _fee_form_mult(ovr, effective_ovr)
+    # [2026-08 신설, 15-3-B] 구단 지불여력 압축 — raw_fee가 그 구단이 감당
+    # 가능한 상한(_fee_affordability_cap)을 넘으면 초과분만 압축한다.
+    # OVR90 선수의 글로벌 시장가(500억)가 K1 중하위팀에도 그대로
+    # 노출되던 문제(15-3-A 감사로 확인)를 여기서 막는다. HARD_FEE_CAP_EOK
+    # (전세계 공통 절대상한 5000억)보다 먼저 적용 — 구단별 상한이 country
+    # 무관 절대상한보다 훨씬 좁은 게 정상이라 순서는 결과에 큰 영향 없지만,
+    # "구단 사정으로 먼저 걸러지고, 그래도 남은 극단치만 절대상한이 받는다"
+    # 는 의미상 순서를 이렇게 둔다.
+    if country and tier:
+        _afford_cap = _fee_affordability_cap(country, tier, team_name, team_id, year)
+        val_eok = _apply_fee_affordability(val_eok, _afford_cap)
     # [2026-08 신설, 신민용+GPT 검토 확정] 소프트캡을 통과해도 극단적으로
     # 조건이 몰리면(명문+고club_strength+어린나이+큰잠재력+긴계약이 전부
     # 겹치는 등) 여전히 크게 튈 수 있어서, "2026년 기준" 절대 상한을 하나
@@ -405,6 +558,8 @@ def estimate_transfer_fee(grade, tier, ovr, country=None, team_name=None,
             "contract_mult": c_mult, "age_mult": a_mult,
             "potential_mult": p_mult, "rank_mult": rank_mult, "strength_mult": strength_mult,
             "combined_mult": combined_mult,
+            "effective_ovr": effective_ovr, "form_mult": _fee_form_mult(ovr, effective_ovr),
+            "affordability_cap": _fee_affordability_cap(country, tier, team_name, team_id, year) if country and tier else None,
             "capped_mult": capped_mult, "economy_index": eidx,
         }}
     return final
@@ -481,19 +636,26 @@ def _cap_relief_mult(ovr) -> float:
     COUNTRY_SALARY_CAP은 나라 전체에 적용되는 평평한 고정 상한이라, 실측
     앵커 곡선이 없는 나라(6개국 제외 전부)는 재능 등급이 아무리 올라가도
     상한을 넘는 순간부터 연봉이 안 오르는 구조적 결함이 있었다.
-    평범~프로(OVR≤80) 구간은 원래 상한을 안전망으로 그대로 쓰고,
-    엘리트(81~94)·월드클래스(95+) 구간만 상한을 단계적으로 풀어준다.
+
+    [2026-08 재설계, 신민용 리포트: "K1/K2/K3 OVR65~80대가 전부 같은
+    연봉으로 평평하다"] 원래는 OVR<=80을 relief=1.0(캡을 안 풀어줌)으로
+    고정한 하드 문턱이었다 — raw salary가 그 구간 안에서 캡을 넘는
+    순간부터(캡이 낮은 국가/tier일수록 더 낮은 OVR에서 넘음) OVR80까지
+    쭉 평평해지는 게 이 하드 문턱 자체의 구조적 결함이었다(K1은 캡이
+    높아서 안 보였을 뿐, K2/K3처럼 캡이 낮은 곳에서는 OVR65~80 전체가
+    평평해짐). 문턱을 없애고 OVR 전 구간에서 완만하게 계속 증가하는
+    연속함수로 바꾼다 — cap×relief(ovr)가 항상 ovr에 대해 강한 증가함수가
+    되므로, raw가 어느 지점에서 캡을 넘어가든 그 이후로도 캡 자체가
+    계속 올라가서 평평한 구간이 원천적으로 생기지 않는다.
+    평범~프로 구간(OVR40대~70대)은 완만하게, 엘리트(80~94)·월드클래스
+    (95+)로 갈수록 더 가파르게 풀어주는 볼록(convex) 곡선은 기존 설계
+    의도를 그대로 유지한다(그냥 계단이 아니라 매끄럽게 이어질 뿐).
     """
-    if ovr is None or ovr <= 80:
+    if ovr is None:
         return 1.0
-    if ovr < 90:
-        t = (ovr - 80) / 10.0
-        return 1.0 + t * 0.8          # 80→90: 1.0배 → 1.8배
-    if ovr < 95:
-        t = (ovr - 90) / 5.0
-        return 1.8 + t * 1.2          # 90→95: 1.8배 → 3.0배
-    t = min(1.0, (ovr - 95) / 5.0)
-    return 3.0 + t * 3.0              # 95→100: 3.0배 → 6.0배
+    ovr = max(40, min(105, ovr))
+    t = (ovr - 40) / (105 - 40)   # 0.0(OVR40) ~ 1.0(OVR105+)
+    return 1.0 + (t ** 3) * 5.0    # OVR40: 1.0배 ~ OVR105: 6.0배, 항상 매끄럽게 증가
 
 
 def _clamp_salary_to_cap(sal, wealth, country=None, tier=1, is_special=False, ovr=None, talent_tier=None):
@@ -745,31 +907,50 @@ def _calc_salary(grade, tier, ovr, country=None, team_name=None, year=None, team
     # (68개 국가×OVR 조합 확인) 1부·2부가 OVR95~100에서 완전히 같은 값으로
     # 뭉개지고 있었다 — 이 캡도 tier를 구분 안 했기 때문. 국가별 캡과 동일한
     # 비율로 tier 스케일을 적용한다.
-    cap = _tier_scaled_country_cap(_salary_cap.get(wealth, 0), tier)
-    if cap > 0:
-        sal = min(sal, int(cap * _cap_relief_mult(ovr)))
-    # [버그수정] 나라별 연봉 상한 적용 (COUNTRY_SALARY_CAP)
-    #   constants.py에 정의돼 있었으나 _calc_salary에서 import/적용이 누락됐었음.
-    # [버그수정 2026-07, 신민용 지적: "K1이랑 K2가 둘 다 30억으로 고정"]
-    #   이 캡이 tier를 구분 안 해서, LOWER_TIER_SALARY_CAP이 따로 없는
-    #   나라(대한민국 등 대부분)는 1부든 2부든 OVR만 높으면 똑같은 국가
-    #   상한에 눌렸다. tier별로 비율을 낮춰 적용한다.
-    # [버그수정 2026-07 #2, 신민용 지적: "브라질이 OVR88 이상 전부 30억으로
-    #   고정 — 네이마르급도 그냥 준수한 선수랑 똑같아진다"] 이 캡도 OVR을
-    #   전혀 구분 안 해서, 실측 앵커 곡선이 없는 나라(6개국 제외 전부)는
-    #   엘리트 이상 구간이 통째로 평평해지고 있었다. _cap_relief_mult로
-    #   엘리트(81~94)·월드클래스(95+) 구간만 상한을 단계적으로 풀어준다.
+    #
+    # [2026-08 버그수정, 신민용 리포트: "K1 OVR70~80이 전부 10.7~12.6억으로
+    # 평평하다"] 범용 등급 캡과 국가별 캡(COUNTRY_SALARY_CAP)을 순서대로
+    # min()에 넣고 있었는데, 이러면 둘 중 더 낮은 쪽이 항상 이긴다. 대한민국은
+    # wealth="B"라 범용 캡이 10억(tier1)인데, COUNTRY_SALARY_CAP은 20억으로
+    # 더 높게 잡혀 있다 — 즉 범용 캡이 국가별 캡보다 먼저/무조건 적용되면서
+    # 국가별로 더 관대하게 설정해둔 값이 무의미해지고, OVR 60~80대(범용 캡
+    # 10억을 넘는 구간)가 전부 같은 값으로 뭉개졌다. 이건 _clamp_salary_to_cap()
+    # 에서 이미 한 번 고친 것과 완전히 같은 클래스의 버그다(위 #2 버그수정
+    # 주석 "국가별 캡과 동일한 비율" 참고) — 거기선 "country_cap이 있으면
+    # 그걸 우선(범용 캡을 추가로 덧씌우지 않음)"으로 고쳤는데, 정작 원본인
+    # 이 함수(_calc_salary)에는 그 우선순위가 반영되지 않았다. 동일한
+    # 우선순위 규칙을 여기도 적용한다: 국가별 캡이 있으면 그것만 쓰고,
+    # 없을 때만(또는 D/E/F처럼 국가별 캡 적용 대상이 아닐 때만) 범용 등급
+    # 캡으로 폴백한다.
     # [2026-07 v4 버그수정] D/E/F급은 새로 넣은 _LOW_GRADE_SCALE_BOOST가
     # 이미 그 등급에 맞는 스케일을 보장하는데, 여기에 옛날에(base가 훨씬
     # 작았을 때) 잡아둔 국가별 소액 캡(예: 우간다 12,000천원=0.12억)까지
     # 겹치면 방금 살려낸 OVR 곡선이 다시 그 캡에서 눌려버린다 — D/E/F는
     # 이 국가별 캡 적용에서 제외한다(등급 캡 자체는 그대로 유지, 스케일
     # 제어는 최소 base 쪽으로 일원화).
-    if country and not is_special and wealth not in ("D", "E", "F"):
+    _country_cap_applicable = bool(country) and not is_special and wealth not in ("D", "E", "F")
+    _country_cap_val = 0
+    if _country_cap_applicable:
         from constants import COUNTRY_SALARY_CAP
-        country_cap = COUNTRY_SALARY_CAP.get(country, 0)
-        if country_cap > 0:
-            sal = min(sal, int(_tier_scaled_country_cap(country_cap, tier) * _cap_relief_mult(ovr)))
+        _country_cap_val = COUNTRY_SALARY_CAP.get(country, 0)
+
+    if _country_cap_val > 0:
+        # 국가별 캡이 있으면 그것만 적용 — 더 낮은 범용 등급 캡을 추가로
+        # 덧씌우지 않는다(_clamp_salary_to_cap과 동일한 우선순위).
+        sal = min(sal, int(_tier_scaled_country_cap(_country_cap_val, tier) * _cap_relief_mult(ovr)))
+    else:
+        # [버그수정 2026-07, 신민용 지적: "K1이랑 K2가 둘 다 30억으로 고정"]
+        #   이 캡이 tier를 구분 안 해서, LOWER_TIER_SALARY_CAP이 따로 없는
+        #   나라(대한민국 등 대부분)는 1부든 2부든 OVR만 높으면 똑같은 국가
+        #   상한에 눌렸다. tier별로 비율을 낮춰 적용한다.
+        # [버그수정 2026-07 #2, 신민용 지적: "브라질이 OVR88 이상 전부 30억으로
+        #   고정 — 네이마르급도 그냥 준수한 선수랑 똑같아진다"] 이 캡도 OVR을
+        #   전혀 구분 안 해서, 실측 앵커 곡선이 없는 나라(6개국 제외 전부)는
+        #   엘리트 이상 구간이 통째로 평평해지고 있었다. _cap_relief_mult로
+        #   엘리트(81~94)·월드클래스(95+) 구간만 상한을 단계적으로 풀어준다.
+        cap = _tier_scaled_country_cap(_salary_cap.get(wealth, 0), tier)
+        if cap > 0:
+            sal = min(sal, int(cap * _cap_relief_mult(ovr)))
     # [버그수정] 양극화 리그(SALARY_CURVE_OVERRIDE 적용국)는 tier1만 재계산돼서
     #   COUNTRY_SALARY_CAP이 tier1 기준 안전망(예: 잉글랜드 550억)으로 상향됐다.
     #   그 캡이 2부 이하에도 그대로 적용되면 "1부보다 2부가 더 비싼" 역전이

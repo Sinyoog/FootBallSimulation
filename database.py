@@ -514,7 +514,7 @@ def init_db():
         weight INTEGER DEFAULT 70, peak_age INTEGER DEFAULT 25,
         difficulty TEXT DEFAULT 'easy',
         fame INTEGER DEFAULT 0, popularity INTEGER DEFAULT 0,
-        fans INTEGER DEFAULT 0, agent_grade TEXT DEFAULT 'F',
+        fans INTEGER DEFAULT 0, agent_grade TEXT DEFAULT '없음',
         salary INTEGER DEFAULT 0, total_assets INTEGER DEFAULT 0,
         stress INTEGER DEFAULT 10, happiness INTEGER DEFAULT 10,
         slump INTEGER DEFAULT 0, injured INTEGER DEFAULT 0,
@@ -534,6 +534,9 @@ def init_db():
         season_matches INTEGER DEFAULT 0, season_goals INTEGER DEFAULT 0,
         season_assists INTEGER DEFAULT 0, season_saves INTEGER DEFAULT 0,
         season_rating_sum REAL DEFAULT 0, season_rating_cnt INTEGER DEFAULT 0,
+        season_injury_matches_missed INTEGER DEFAULT 0,
+        season_suspension_matches_missed INTEGER DEFAULT 0,
+        season_bench_matches_missed INTEGER DEFAULT 0,
         language TEXT DEFAULT 'ko',
         stamina INTEGER DEFAULT 40, stamina_max INTEGER DEFAULT 75,
         speed INTEGER DEFAULT 40, speed_max INTEGER DEFAULT 75,
@@ -1415,6 +1418,17 @@ def init_db():
         # 이벤트가 겹치면 가장 최근 이벤트가 이전 것을 덮어쓴다(단순화).
         "ALTER TABLE teams ADD COLUMN momentum_type TEXT DEFAULT ''",
         "ALTER TABLE teams ADD COLUMN momentum_seasons_left INTEGER DEFAULT 0",
+        # [2026-08 v3.3 신설, 신민용+검토 확정: "연속 강등 가속 방지"]
+        # 직전 시즌에도 강등당했는지를 추적해서, 연속으로 떨어지는 팀에게
+        # 더 강한 회복 모멘텀을 준다(_process_promotion_relegation 참고).
+        # 강등되면 +1, 강등을 면하면(잔류/승격) 0으로 리셋.
+        "ALTER TABLE teams ADD COLUMN relegation_streak INTEGER DEFAULT 0",
+        # [2026-08 v3.3 신설, 신민용 지적: "재계약 여부가 이번 시즌 OVR
+        # 스냅샷 하나로만 기계적으로 결정된다 — 근속·과거 기여도도 봐야
+        # 한다"] 이 클럽에서 연속으로 뛴 시즌 수. join_team()에서 새 팀
+        # 합류 시 1로 리셋되고, _end_of_season에서 계약이 끊기지 않고
+        # 그대로 남아있으면 +1(game_engine.py 참고).
+        "ALTER TABLE my_player ADD COLUMN club_tenure_seasons INTEGER DEFAULT 1",
         # [2026-08 신설, 신민용 요청: "레드카드 기록 추가"] 레드카드(퇴장)는
         # 이미 경기별로 발생은 하지만(_roll_red_card/_apply_red_card_dismissal),
         # 누적 횟수를 어디에도 세어두지 않았다 — 커리어/은퇴창에 "전체 M회
@@ -1461,6 +1475,47 @@ def init_db():
         "ALTER TABLE awards ADD COLUMN goal_event_id INTEGER DEFAULT 0",
         "ALTER TABLE awards ADD COLUMN week INTEGER DEFAULT 0",
         "ALTER TABLE awards ADD COLUMN match_info TEXT DEFAULT ''",
+        # [2026-08 신설, 시즌 성적 기반 이적시장 평가 15-2-A] 결장 사유별
+        # 시즌 누적 카운터 3개 — 부상/징계/벤치를 하나로 뭉쳐 세던 것을
+        # 분리한다. 각각 의미가 다르다(부상=가용성 리스크, 징계=규율
+        # 리스크, 벤치=전력외 판정용). _simulate_match()에서 매 경기
+        # 결장 사유 판정 시(이미 _suspended/benched/injured 세 플래그로
+        # 구분돼 있음) 누적하고, 시즌 시작 시 0으로 초기화한다.
+        "ALTER TABLE my_player ADD COLUMN season_injury_matches_missed INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN season_suspension_matches_missed INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN season_bench_matches_missed INTEGER DEFAULT 0",
+        # [2026-08 신설, 신민용 리포트: "에이전트 창을 열 때마다 후보가
+        # 바뀌는 게 비현실적이다 — 비시즌 갱신 전까지는 같은 후보가
+        # 유지돼야 한다"] 에이전트 오퍼 풀을 JSON으로 저장해두고, 갱신
+        # 시즌(agent_offer_season)이 현재 시즌과 같으면 저장된 풀을 그대로
+        # 재사용한다. 입단을 나갔다 다시 들어와도(계약만료→FA→재입단) 같은
+        # 시즌 안이면 동일한 풀이 유지되고, 비시즌(오프시즌) 전환 시점에만
+        # 새로 생성한다.
+        "ALTER TABLE my_player ADD COLUMN agent_offer_pool_json TEXT DEFAULT ''",
+        "ALTER TABLE my_player ADD COLUMN agent_offer_season INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN agent_offer_year INTEGER DEFAULT 0",
+        # [2026-08 신설] 선택한 에이전트의 전문 대륙 — 그 대륙 소속 팀
+        # 오퍼/입단 판정에 소폭 보너스를 준다(agent_window._select에서
+        # 함께 저장).
+        "ALTER TABLE my_player ADD COLUMN agent_continent TEXT DEFAULT ''",
+        # [2026-08 신설, 2단계: 판매 압박 지표 분리, 신민용+GPT 검토 확정]
+        # sale_push_refused_count는 "이번 판매추진 사이클 내" 카운터라
+        # 사이클이 끝나면 0으로 리셋된다 — 반면 club_sale_pressure는
+        # 사이클을 넘나들며 누적되는 "구단이 이 선수를 계속 거부당한
+        # 것에 대해 얼마나 인내심을 잃었는가" 장기 지표. 둘을 하나의
+        # 변수에 욱여넣으면 사이클 종료 시 리셋할 때 장기 압박까지 같이
+        # 날아가버리는 문제가 생기므로 분리한다.
+        "ALTER TABLE my_player ADD COLUMN club_sale_pressure INTEGER DEFAULT 0",
+        # [2026-08 신설, 3단계: 판매추진 전용 UI + 예약이적, 신민용+GPT
+        # 검토 확정] 판매추진은 이제 "구단이 판매안을 만들어 플레이어에게
+        # 승인 요청하는" 완전히 별도 거래 형태 — 기존 pending_offer_state
+        # (OfferWindow 전용 스키마)를 재활용하지 않고 독립 필드로 관리.
+        "ALTER TABLE my_player ADD COLUMN sale_push_proposal_json TEXT DEFAULT ''",
+        "ALTER TABLE my_player ADD COLUMN sale_push_next_proposal_year INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN sale_push_next_proposal_week INTEGER DEFAULT 0",
+        # 수락 시 즉시 이적하지 않고 "예약" 상태로 저장 — 다음 비시즌
+        # 전환 시점(_end_of_season)에 실제 이적을 실행한다.
+        "ALTER TABLE my_player ADD COLUMN pending_sale_transfer_json TEXT DEFAULT ''",
     ]:
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,
@@ -2415,6 +2470,75 @@ def _reset_ai_players_from_seed(c):
     c.execute(f"INSERT INTO ai_players({col_list}) SELECT {col_list} FROM ai_players_seed")
 
 
+def _regenerate_ai_players(c, progress_cb=None, skip_generation=False):
+    """[버그수정 2026-08, 신민용 리포트: "새 게임을 눌러도 같은 game.db에서는
+    초기 파워랭킹(팀 순위·PS 수치)이 매번 완전히 똑같다"]
+
+    원인: _reset_ai_players_from_seed()가 '재생성'이 아니라 '복사'였다 —
+    ai_players_seed는 그 game.db가 최초 설치되던 딱 한 번의 순간에 뽑힌
+    난수 결과(weighted_team_order의 팀 강도 순번, _gen_ai_stats의 가우시안
+    노이즈, age 삼각분포 등)를 그대로 얼려둔 스냅샷이다. '새 게임'을 누를
+    때마다 이 스냅샷을 그대로 복사만 해왔기 때문에, 선수단 OVR이 항상
+    설치 시점과 완전히 동일했고 — power_ranking.py의 초기 PS 공식
+    (PS = 1400 + (OVR-60)×30 + 리그등급보정)이 순수하게 이 OVR에서만
+    나오므로, 파생되는 파워랭킹 1~20위 클럽·수치까지 소수점 단위로
+    똑같이 반복됐다(신민용 실측 리포트와 일치).
+
+    이 스냅샷 복사 방식 자체는 원래 다른 버그를 고치려고 도입됐다
+    (아래 _reset_ai_players_from_seed 주석 참고 — '새 게임'을 눌러도
+    이전 플레이에서 은퇴·성장으로 변형된 선수가 안 지워지던 문제).
+    그 목적(선수단을 깨끗한 상태로 되돌리기)은 '복사' 대신 '재생성'으로도
+    똑같이 달성되고, 매번 새 random 시퀀스가 뽑히므로 이번 리포트까지
+    같이 해결된다 — 그래서 새 게임 리셋 경로를 이 함수로 교체한다.
+
+    성능: _generate_all_ai_players는 이미 국가별 이름풀 캐싱(팀당 개별
+    쿼리 10,423회 → 210회) + 팀당 executemany 배치(11번 INSERT → 1번)로
+    최적화돼 있지만, 실측 결과 전세계 선수단(약 12만 명) 재생성 자체에
+    약 4~5초가 걸린다(스냅샷 복사 방식은 거의 즉시였던 것과 대비됨) —
+    "새 게임 버튼 반응성에 큰 영향 없다"던 최초 판단은 실측으로 정정한다.
+    그래서 progress_cb를 그대로 _generate_all_ai_players에 전달해 UI가
+    진행 상황을 보여줄 수 있게 한다(ui/start_screen.py의
+    NewPlayerDialog._regenerate_world_with_progress 참고 — reset_game_data()
+    호출 시점 자체도 '새 게임' 클릭이 아니라 '생성'/'랜덤 생성' 클릭으로
+    옮겨서, 진행률 창이 실제로 오래 걸리는 지점에서만 뜨게 했다).
+    ai_players_seed 스냅샷/구버전 세이브 폴백 로직(_reset_ai_players_from_seed)은
+    혹시 모를 다른 용도를 위해 그대로 남겨두되, '새 게임' 경로에서는 더
+    이상 쓰지 않는다.
+
+    skip_generation: [2026-08 추가, 그런데 최초 구현에 버그 있었음 — 신민용
+    리포트: "새 게임 하면 정상인데 나갔다 들어오니 모든 팀이 950.0으로
+    뜬다"] MainWindow.go_to_start()(은퇴 화면의 "시작 화면으로" 버튼)처럼
+    '지금 당장 화면을 시작 메뉴로 바꾸는 것'이 목적이고 실제 새 선수단은
+    필요 없는 호출 지점을 위한 옵션이다.
+
+    [버그 원인] 최초 구현은 skip_generation=True일 때도 "c.execute(DELETE
+    FROM ai_players)"는 그대로 실행하고 재생성만 건너뛰어서, 시작 메뉴로
+    돌아간 뒤 다음 "새 게임"→"생성"을 누르기 전까지 ai_players가 완전히
+    빈 테이블로 남는 구간이 생겼다. 그런데 그 사이에 세계 파워랭킹 화면이
+    열려 있거나(별도 창이라 시작메뉴로 안 닫힘) 다시 열리면
+    ensure_initial_team_power_ranking()이 그 빈 테이블 기준으로 순위를
+    계산해버린다 — _team_avg_ovr_seed()가 선수가 0명인 팀엔 폴백값 45.0을
+    돌려주고, PS = 1400 + (45-60)×30 + 리그등급보정 = 950 + 리그등급보정
+    인데 리그등급보정도 전 리그가 동일(45.0)해서 0이 되니 정확히 전 세계
+    모든 팀이 950.0으로 동률 처리된다(신민용이 실측으로 보고한 수치와
+    정확히 일치). 게다가 이 값이 team_power_rankings에 그대로 INSERT돼
+    캐시되므로, 그 사이에 화면을 열어본 것만으로 오염된 값이 저장된다.
+
+    [수정] "지금 당장 필요 없다"는 것과 "완전히 비워도 안전하다"는 것은
+    다른 얘기였다 — 재생성(_generate_all_ai_players, ~5초)만 건너뛰고,
+    DELETE도 하지 않는다. 대신 직전 플레이의 선수단이 그대로 남아있게
+    되는데, 이건 화면이 시작 메뉴로 바뀐 뒤 실제로 "새 게임"→"생성"/
+    "랜덤 생성"을 누르는 순간 어차피 (skip 없는) reset_game_data()가 다시
+    호출되어 완전히 새로 재생성되므로 최종 결과에는 전혀 영향이 없다.
+    그 사이 짧은 구간에 어쩌다 파워랭킹 화면이 열려도, 이제는 "완전히
+    빈 테이블의 폴백값"이 아니라 "직전 플레이의 실제 OVR"을 기준으로
+    계산되므로 최소한 950.0 균등 오염 같은 명백히 깨진 값은 나오지
+    않는다."""
+    if not skip_generation:
+        c.execute("DELETE FROM ai_players")
+        _generate_all_ai_players(c, progress_cb=progress_cb)
+
+
 def _reset_formations_from_seed(c):
     """[버그수정] '새 게임' 시 teams.formation을 최초 시딩 상태로 복원.
     _shuffle_formations()가 시즌마다 팀의 ~20%를 랜덤 변경해도 reset_game_data()가
@@ -2451,7 +2575,23 @@ def _reset_club_strength(c):
     seed_club_strength_from_prestige(c.connection)
 
 
-def reset_game_data():
+def reset_game_data(progress_cb=None, skip_ai_regen=False):
+    """progress_cb(done:int, total:int, detail:str) — 선수단 재생성
+    (_regenerate_ai_players, 전체 소요시간의 대부분을 차지) 단계에서만
+    호출된다. 콜백이 없으면(None) 기존과 동일하게 동작한다.
+
+    skip_ai_regen: [2026-08 추가, 신민용 리포트: "은퇴 후 '시작 화면으로'를
+    누르면 진행률 창도 없이 5초 정도 멈춘다"] MainWindow.go_to_start()는
+    NewPlayerDialog를 거치지 않고 곧바로 reset_game_data()를 불렀는데,
+    _regenerate_ai_players 도입 이후 이 호출도 ~5초짜리 전세계 선수단
+    재생성을 포함하게 돼버렸다 — "새 게임" 버튼과 똑같은 문제가 여기서도
+    재발한 것. 이 지점의 진짜 목적은 my_player/career_entries 등 현재
+    세이브를 지워서 '이어하기'를 비활성화하고 시작 메뉴로 돌아가는 것뿐,
+    새 선수단이 그 순간 당장 필요한 게 아니다 — 그래서 True를 넘기면
+    ai_players 재생성만 건너뛴다(그 외 teams/my_player/career_entries 등
+    삭제는 그대로 다 수행). 실제 선수단 재생성은 그 다음 사용자가
+    "새 게임"→"생성"/"랜덤 생성"을 눌러 reset_game_data()가 (skip 없이)
+    다시 호출되는 시점에 진행률 창과 함께 정식으로 일어난다."""
     init_db()  # 마이그레이션 적용
     conn = get_conn(); c = conn.cursor()
     # [2026-08 버그수정, 신민용 리포트: "no such table: team_power_rating"
@@ -2515,11 +2655,15 @@ def reset_game_data():
               "team_power_rating","country_power_rating",
               "team_power_rankings","country_power_rankings",
               "team_league_streak","country_regional_streak",
-              "league_power","team_b_history"]:
+              "league_power","team_b_history",
+              # [2026-08 v3.2 신설] 리그 상대강도 임시 테이블도 새 게임
+              # 시작 시 당연히 비워야 한다(어차피 시즌 종료마다 자체
+              # 정리되지만, 게임 중간에 리셋할 수도 있으므로 안전하게 포함).
+              "team_season_opp_strength"]:
         c.execute(f"DELETE FROM {t}")
     c.execute("UPDATE teams SET wins=0,draws=0,losses=0,goals_for=0,goals_against=0")
     _reset_teams_to_league_data(c)
-    _reset_ai_players_from_seed(c)
+    _regenerate_ai_players(c, progress_cb=progress_cb, skip_generation=skip_ai_regen)
     _reset_formations_from_seed(c)
     _reset_club_strength(c)
     conn.commit()
@@ -3324,6 +3468,34 @@ STAR_COUNT_BY_GRADE = {
     "A":  {"wc_base": 0, "wc_bonus": 1, "el_fill_rest": False, "el_offset": (8, 16),
            "el_base": 1, "el_bonus": 2},
 }
+# [2026-08 신설, 신민용+GPT 교차검토 합의] B/C 등급 국가라도 그 나라의
+# 진짜 간판 클럽(prestige_level 높은 팀)만 예외적으로 소규모 스타 슬롯을
+# 받게 하는 화이트리스트. min_level 미만인(또는 등록 안 된) 팀은 전혀
+# 영향 없음 — 그 나라의 일반 팀들은 기존 등급 그대로다. 남아공은 격차가
+# 가장 커서(실측 68.56 → 목표 82) el_base/el_bonus를 가장 크게 뒀다.
+GLOBAL_PRESTIGE_STAR_CFG = {
+    # [2026-08 1차 실측 후 재조정] el_base=2/el_bonus=3(최대 5개 엘리트)로는
+    # 11자리 중 나머지 6자리가 여전히 B급 완만한 곡선(ace_lo 0.94)에 깔려
+    # 평균이 목표(86)에 크게 못 미쳤다(실측 80.44/81.14) — S등급의
+    # el_fill_rest에 가깝게 슬롯 수를 대폭 늘린다.
+    # [2026-08 2차 실측 후 재조정] slot 수만으로는 2차 실측(84.11/83.92)이
+    # 여전히 목표(86)에 2점 가까이 못 미쳤다 — el_offset을 기본(6,14)보다
+    # 좁혀서(4,9) 엘리트 슬롯 자체의 목표 OVR도 같이 끌어올린다.
+    "이집트":       {"wc_base": 1, "wc_bonus": 1, "el_base": 7, "el_bonus": 3, "min_level": 2, "el_offset": (4, 9)},
+    "모로코":       {"wc_base": 1, "wc_bonus": 1, "el_base": 7, "el_bonus": 3, "min_level": 2, "el_offset": (4, 9)},
+    # [2026-08 2차 실측 후 재조정] 격차가 가장 커서(2차 실측 78.98, 목표
+    # 81~82) 이집트/모로코보다도 더 크게 밀어올린다.
+    "남아프리카공화국": {"wc_base": 1, "wc_bonus": 1, "el_base": 8, "el_bonus": 3, "min_level": 2, "el_offset": (3, 8)},
+    # [2026-08 신설, 신민용 요청: "튀니지도 등급 B로, 1부 OVR 83대로"]
+    # 에스페랑스 드 튀니스/클럽 아프리캥(레벨3) — 이집트·모로코와 동일 패턴,
+    # 목표가 그보다 약간 낮아(83 vs 86) el_base/offset을 살짝 보수적으로.
+    "튀니지":       {"wc_base": 0, "wc_bonus": 1, "el_base": 5, "el_bonus": 3, "min_level": 2, "el_offset": (5, 10)},
+    # [2026-08 신설, 신민용 요청: "캐나다도 평균 OVR 82쯤으로, 등급도 B로"]
+    # 포지 FC(레벨3)만 명문 등록돼 있어 min_level=2로 둬도 사실상 레벨3만
+    # 해당 — 목표가 이집트/모로코/튀니지보다 낮아(82) 슬롯을 더 보수적으로.
+    "캐나다":       {"wc_base": 0, "wc_bonus": 1, "el_base": 4, "el_bonus": 2, "min_level": 2, "el_offset": (5, 10)},
+}
+
 _MAX_WORLDCLASS_PER_TEAM = 4
 # SS/S 1부는 "월클+엘리트로만" 구성이므로 엘리트에 상한을 두지 않는다
 # (el_fill_rest=True면 남는 자리 전부). A처럼 el_fill_rest=False인 등급만
@@ -3336,9 +3508,10 @@ _MAX_ELITE_PER_TEAM = 5
 ELITE_FLOOR_BY_GRADE = {"SS": 88.0, "S": 88.0}
 
 
-def _star_counts(grade, team_strength, continent_bonus=0, n_slots=11, tier=1):
-    """(월드클래스 슬롯 수, 엘리트 슬롯 수) 반환. SS/S/A 외 등급은 (0,0) —
-    B급 이하는 이번 조정 대상이 아니라 기존 완만한 곡선 그대로 쓴다.
+def _star_counts(grade, team_strength, continent_bonus=0, n_slots=11, tier=1,
+                  country=None, prestige_level=0):
+    """(월드클래스 슬롯 수, 엘리트 슬롯 수) 반환. SS/S/A 외 등급은 기본
+    (0,0) — B급 이하는 이번 조정 대상이 아니라 기존 완만한 곡선 그대로 쓴다.
 
     [버그수정 2026-07] "SS/S는 월클+엘리트로만 구성"이라는 설계는 원래
     1부만을 의도한 것이었는데(코드 주석에도 '1부'라고 명시돼 있었음), 정작
@@ -3347,9 +3520,26 @@ def _star_counts(grade, team_strength, continent_bonus=0, n_slots=11, tier=1):
     팀도 1부 수준(평균 89 이상) OVR이 나오는 심각한 버그로 이어졌다. 이제
     tier에 따라 스타 슬롯 배정을 계단식으로 줄인다: 1부만 원래 설계(거의
     전원 스타) 그대로, 2부는 대폭 축소, 3부 이상은 스타 슬롯 자체가 없어
-    전원 _target_ovr(그 tier의 낮은 상한 기준)로만 결정된다."""
+    전원 _target_ovr(그 tier의 낮은 상한 기준)로만 결정된다.
+
+    [2026-08 신설, 신민용+GPT 교차검토 합의 — "국가 리그 등급(연봉·뎁스
+    등)은 그대로 두고, 그 나라의 진짜 간판 클럽(prestige_level 높은 팀)만
+    별도로 강화한다"] B/C 등급은 위 STAR_COUNT_BY_GRADE에 항목이 아예
+    없어서 스타 슬롯 자체가 안 생겼다 — 그 결과 알 아흘리(이집트)·마멜로디
+    선다운즈(남아공)처럼 prestige_level=3(세계적 초명문) 태그가 붙어 있어도
+    등급이 B/C면 그 태그가 사실상 무효화되고 있었다(실측: 세계 순위 900~
+    2100위권). GLOBAL_PRESTIGE_STAR_CFG에 등록된 나라는, 그 나라의
+    prestige_level이 등록된 min_level 이상인 팀에 한해서만(일반 팀은 전혀
+    영향 없음) B/C 등급이어도 소규모 스타 슬롯을 받는다."""
     cfg = STAR_COUNT_BY_GRADE.get(grade)
     if not cfg:
+        gp = GLOBAL_PRESTIGE_STAR_CFG.get(country) if country else None
+        if gp and tier == 1 and prestige_level >= gp.get("min_level", 2):
+            n_world = min(gp.get("wc_base", 0) + round(gp.get("wc_bonus", 0) * team_strength),
+                          _MAX_WORLDCLASS_PER_TEAM)
+            n_elite = min(gp.get("el_base", 0) + round(gp.get("el_bonus", 0) * team_strength),
+                          _MAX_ELITE_PER_TEAM, max(0, n_slots - n_world))
+            return n_world, n_elite
         return 0, 0
     if tier >= 3:
         return 0, 0   # 3부 이상은 스타 취급 없음 — 전원 일반 곡선(_target_ovr)
@@ -3407,7 +3597,7 @@ def _star_counts(grade, team_strength, continent_bonus=0, n_slots=11, tier=1):
     return n_world, n_elite
 
 
-def _star_target_ovr(tier_top, kind, el_offset=(6, 14), prestige_bonus=0.0):
+def _star_target_ovr(tier_top, kind, el_offset=(6, 14), prestige_bonus=0.0, team_strength=1.0):
     """스타 슬롯 하나의 목표 OVR. 리그 상한(tier_top) 바로 아래에서 결정 —
     월드클래스는 거의 상한 그 자체, 엘리트는 등급별 el_offset만큼 그 아래
     (SS/S는 좁은 오프셋 = 상위권 엘리트, A는 넓은 오프셋 = 하위권 엘리트).
@@ -3418,11 +3608,35 @@ def _star_target_ovr(tier_top, kind, el_offset=(6, 14), prestige_bonus=0.0):
     곡선)에만 들어가고 있었다 - SS/S 1부 명문팀은 명문팀 보정이 적용될
     자리가 아예 없었던 것. 실측(맨유 94.1 vs 레알 93.3)에서 SS 명문팀이
     S 명문팀보다 높게 나온 원인이 정확히 이거였다. 이제 worldclass/elite
-    목표치에도 prestige_bonus를 더한다."""
+    목표치에도 prestige_bonus를 더한다.
+    [2026-08 재수정, 신민용 확정 — 국가별 OVR 분포 실측 결과 반영: "SS/S
+    1부가 el_fill_rest=True라 team_strength(순위)가 스타 슬롯 OVR에 전혀
+    반영이 안 되고 있었다"] ace_lo/spread(_target_ovr 쪽 곡선)를 아무리
+    조정해도 SS/S 1부는 스쿼드 전원이 이 함수(스타 슬롯)로만 채워져서
+    그 조정이 무의미했다(실측으로 확인). 최소 변경으로 team_strength를
+    연결한다 — team_strength가 낮을수록(하위권 팀일수록)
+    STAR_STRENGTH_PENALTY_MAX에 비례한 추가 감쇠를 뺀다. 1위급(team_strength≈1)은
+    감쇠가 거의 0, 최하위(team_strength≈0)는 감쇠가 STAR_STRENGTH_PENALTY_MAX
+    그대로 적용된다. wc_base/wc_bonus/el_fill_rest/el_offset 등 스타 슬롯
+    '개수' 구조는 이번엔 건드리지 않고, 가장 작은 변경(OVR 값 자체에만
+    team_strength 연동)으로 먼저 실측한다."""
+    strength_penalty = (1.0 - team_strength) * STAR_STRENGTH_PENALTY_MAX
     if kind == "worldclass":
-        return tier_top - random.uniform(0, 4) + prestige_bonus
+        return tier_top - random.uniform(0, 4) - strength_penalty + prestige_bonus
     lo, hi = el_offset
-    return tier_top - random.uniform(lo, hi) + prestige_bonus  # elite
+    return tier_top - random.uniform(lo, hi) - strength_penalty + prestige_bonus  # elite
+
+
+# [2026-08 신설, 신민용 확정 — 국가별 OVR 분포 재조정 2차 실험] 스타 슬롯
+# (worldclass/elite) OVR에 team_strength 기반으로 추가로 빼는 감쇠의 상한
+# (최하위팀 기준). 0이면 기존과 완전히 동일(하위호환 기본값). 실측으로
+# 4/7/10 세 후보를 13개국×15회 비교한 결과, 4(후보 A)가 프랑스/스페인
+# 목표 밴드(1~3위 95~98, 4~6위 93~95, 7~10위 91~93, 11+ 88~91)에 가장
+# 정확히 들어맞았고, 7/10은 과도하게 깎여 목표 밴드를 이탈했다. 독일은
+# 4로도 11+가 목표(87~90)보다 0.3 높게 나왔지만, 이건 감쇠를 나라마다
+# 다르게 주는 대신 독일 override 하한을 미세조정하는 쪽으로 흡수하기로
+# 확정(감쇠는 전 국가 공통값 유지가 원칙) — COUNTRY_LEAGUE_OVR_OVERRIDE 참고.
+STAR_STRENGTH_PENALTY_MAX = 4.0
 
 
 def _tier_top_ovr(grade, tier, continent_bonus=0, country=None):
@@ -3584,6 +3798,11 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
     prestige_bonus = PRESTIGE_OVR_BONUS if is_prestige(
         team.get("cname", ""), tier, team.get("tname", "")) else 0
 
+    # [2026-08 순서 변경] GLOBAL_PRESTIGE_STAR_CFG(아래 _star_counts 호출)가
+    # prestige_level을 알아야 해서, 원래 _star_prestige_bonus 계산 때 하던
+    # prestige_level() 조회를 여기로 앞당긴다 — 계산 자체는 기존과 동일.
+    _plevel = prestige_level(team.get("cname", ""), team.get("tname", ""))
+
     # [2026-08 신설, 신민용 요청: "S등급(레알/바르사 등) 명문팀이 SS등급
     # (잉글랜드) 명문팀한테 밀리면 안 된다 — 단, 브라질은 예외"] 위
     # prestige_bonus는 _target_ovr(일반 곡선)용이라 SS/S 1부(el_fill_rest=
@@ -3592,15 +3811,25 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
     # (남미=0 vs 유럽=+1)와 COUNTRY_OVR_ADJ(-1)로 tier_top 자체가 유럽
     # S등급보다 2점 낮게 잡혀 있어서, 이 보정을 브라질에 따로 빼지 않아도
     # 실측상 유럽 S등급 명문팀보다 확실히 아래에 남는다(검증 완료).
-    _plevel = prestige_level(team.get("cname", ""), team.get("tname", ""))
     _star_prestige_bonus = {3: 3.0, 2: 2.0, 1: 1.5}.get(_plevel, 0.0)
-    # [2026-08 추가] 위 보정을 SS/S 명문팀에 동일하게 주면 상대 격차(SS의
-    # 구조적 우위: 월드클래스 슬롯 4개 vs 3개, tier_top 100 vs 96~97)는 그대로
-    # 남는다(실측: 여전히 SS 96.7 vs S(비브라질) 95.0, 약 1.7점 차). "S등급
-    # 최상위(레벨3, 브라질 제외) 명문팀은 SS 명문팀에 밀리면 안 된다"는 요청에
-    # 맞춰, S등급 레벨3에만 그 구조적 격차를 상쇄하는 추가 보정을 더한다.
-    if grade == "S" and _plevel == 3 and team.get("cname", "") != "브라질":
-        _star_prestige_bonus += 2.0
+    # [2026-08 추가 → 2026-08 재수정, 신민용 리포트: "잉글랜드 명문팀들이
+    # 파워랭킹 안에 들어갈 수 있는데 안 들어간다 — 다른 나라 최상위권보다
+    # OVR가 낮은 듯하다"] 위 +2.0 보정은 "SS의 구조적 우위: tier_top 100
+    # vs S 96~97"를 상쇄하려고 도입됐는데, 그 근거였던 tier_top 계산식
+    # 자체가 이후(COUNTRY_LEAGUE_OVR_OVERRIDE 도입)에 바뀌었다 —
+    # _tier_top_ovr()는 tier==1이고 그 나라가 오버라이드 표에 있으면 이제
+    # OVR_RANGES 공식이 아니라 오버라이드 상한을 그대로 쓴다. 그 표를 보면
+    # 잉글랜드(88~98)·스페인(89~98)·프랑스(88~98)의 tier_top은 이미
+    # 전부 98로 동률이고, 독일·이탈리아(87~97)만 97로 한 단계 아래다 —
+    # 즉 "SS가 100이라 압도적으로 유리하다"는 이 보정의 전제 자체가 더
+    # 이상 사실이 아닌데, 보정만 그대로 남아서 이제는 반대로 S등급
+    # (레알/바르사/PSG 등)이 잉글랜드보다 더 세게 나오는 원인이 됐다
+    # (실측 5회 평균: 잉글랜드 레벨3 95.53 vs S(비브라질) 레벨3 96.10,
+    # 잉글랜드가 오히려 0.56점 낮음 — 신민용 리포트와 일치). tier_top이
+    # 이미 오버라이드로 동률(98=98) 맞춰져 있으므로, 이 보정은 더 이상
+    # 필요 없어 제거한다 — 제거 후엔 잉글랜드/스페인/프랑스가 동일한
+    # tier_top(98) + 동일한 레벨3 기본 보너스(3.0)로 사실상 동급이 되고,
+    # 독일/이탈리아(tier_top 97)는 자연스럽게 한 단계 아래로 남는다.
 
     # 해당 국가 이름풀 전체를 가져온다 (리그 8팀 × 11명 = 최대 88개 필요)
     # [2026-08 최적화] 국가당 한 번만 SELECT, 이후 팀들은 캐시 재사용.
@@ -3619,7 +3848,8 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
     # (_target_ovr)만으로는 "이 팀에 월클이 몇 명"이 보장되지 않아서, 소수
     # 슬롯을 뽑아 리그 상한 근처 OVR로 직접 꽂아 넣는다.
     tier_top = _tier_top_ovr(grade, tier, continent_bonus, team.get("cname", ""))
-    n_world, n_elite = _star_counts(grade, team_strength, continent_bonus, tier=tier)
+    n_world, n_elite = _star_counts(grade, team_strength, continent_bonus, tier=tier,
+                                     country=team.get("cname", ""), prestige_level=_plevel)
     star_slot_idx = list(range(len(TEAM_POSITIONS)))
     random.shuffle(star_slot_idx)
     star_kind_by_slot = {}
@@ -3648,12 +3878,27 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
     role_indices = dict(zip(non_star_positions, remaining_ranks))
 
     _star_cfg = STAR_COUNT_BY_GRADE.get(grade, {})
-    _el_offset = _star_cfg.get("el_offset", (6, 14))
+    # [2026-08 신설] GLOBAL_PRESTIGE_STAR_CFG로 스타 슬롯을 받는 B/C 등급
+    # 간판팀은 STAR_COUNT_BY_GRADE에 없어 el_offset이 기본값(6,14)으로
+    # 넓게 깎였다 — 이 나라들이 등록한 el_offset이 있으면 그걸 우선한다.
+    _gp_cfg = GLOBAL_PRESTIGE_STAR_CFG.get(team.get("cname", ""), {})
+    _el_offset = _star_cfg.get("el_offset") or _gp_cfg.get("el_offset", (6, 14))
     # [버그수정 2026-07] 이 88 하한은 "SS/S 1부는 절대 엘리트 미만 없음"이라는
     # 의도였는데 tier 구분이 없어 하위 부수까지 적용되던 것 — 1부에서만
     # 걸리도록 한정한다. 2부 이하의 스타 슬롯(있다면)은 tier_top 기준으로
     # 자연스럽게 낮게 계산된 값을 그대로 쓴다.
-    _elite_floor = ELITE_FLOOR_BY_GRADE.get(grade) if tier == 1 else None
+    # [2026-08 재수정, 신민용 확정 — 국가별 OVR 분포 실측: "브라질 override
+    # 하한(84)을 줘도 이 88 하드플로어에 막혀 84~87대가 아예 안 나온다"]
+    # 이 등급 공용 88 하한은 그대로 안전장치로 남기되, 그 나라에
+    # COUNTRY_LEAGUE_OVR_OVERRIDE가 명시돼 있으면 그 나라의 override 하한을
+    # 우선 쓴다 — override가 없는 S/SS 나라는 기존 88 그대로, override로
+    # 국가별 하위권 수준을 세분화한 나라는 그 세분화된 하한이 실제로
+    # 의미를 갖도록(그렇지 않으면 override 하한을 아무리 낮춰도 무용지물).
+    _country_override = COUNTRY_LEAGUE_OVR_OVERRIDE.get(team.get("cname", ""))
+    if tier == 1 and _country_override:
+        _elite_floor = _country_override[0]
+    else:
+        _elite_floor = ELITE_FLOOR_BY_GRADE.get(grade) if tier == 1 else None
     _quota = FOREIGN_QUOTA_CAP.get(team.get("cname", ""))
     _foreign_count = 0
     # [2026-08 최적화] 선수 11명치 INSERT를 한 명씩 execute()하는 대신 모아뒀다가
@@ -3670,7 +3915,7 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
         name = random.choice(available)
         league_used.add(name)
         if idx in star_kind_by_slot:
-            target = _star_target_ovr(tier_top, star_kind_by_slot[idx], _el_offset, _star_prestige_bonus)
+            target = _star_target_ovr(tier_top, star_kind_by_slot[idx], _el_offset, _star_prestige_bonus, team_strength)
             if _elite_floor is not None:
                 # [2026-07 버그 수정] 엘리트 오프셋의 랜덤 폭(uniform 상한) 때문에
                 # 국가보정이 낮은 S급 나라(예: 대륙보정 0인 브라질)에서 드물게

@@ -27,6 +27,34 @@
 import random
 from database import get_conn
 
+# ── 티어별 팀 목록 캐시 ─────────────────────────────────────────
+# [2026-08 신설, 성능] _tier_teams()는 "이 나라·이 티어에 지금 어떤 팀들이
+# 있는지"를 매번 SELECT + _team_avg_ovr 조회로 새로 구성한다. 그런데 팀의
+# tier 소속(teams.current_tier/league_id)은 시즌 중엔 절대 안 바뀐다(승강으로
+# 바뀌는 시점은 시즌 전환뿐 — game_engine._process_promotion_relegation
+# 참고). 그런데도 _advance_round의 "남은 합류 티어 총 인원" 계산(자기 자신
+# 포함 매 라운드마다 재계산)이 국내컵 라운드가 진행될 때마다 이 함수를
+# 다시 불러 같은 SELECT를 반복했다 — 실측(10시즌 헤드리스 프로파일링,
+# game_engine._team_avg_ovr과 같은 방식으로 확인): 국내컵 처리 시간의
+# 20% 안팎이 이 반복 조회였다. team_id별 OVR 캐시(game_engine._team_ovr_
+# cache)와 같은 원리로, (country_id, tier_token, year) 조합 관점에서
+# 세션 캐시한다. 무효화는 game_engine._invalidate_team_ovr_cache()가
+# _team_ovr_cache와 같은 타이밍(시즌 전환)에 함께 처리한다 — game_engine이
+# 이미 이 모듈을 모듈 최상단에서 import하고 있어(순환 임포트 없음) 직접
+# 호출 가능.
+_tier_teams_cache: dict = {}
+# [2026-08 신설] cup_entries 세션 캐시 — _entry() 참고. _tier_teams_cache와
+# 같은 타이밍(시즌 전환)에 함께 비운다.
+_entry_cache: dict = {}
+
+
+def _invalidate_cup_engine_caches():
+    """_tier_teams_cache + _entry_cache 둘 다 비운다(둘 다 시즌 전환에만
+    무효화되면 되는 동일한 수명주기 — game_engine._invalidate_team_ovr_cache
+    참고)."""
+    _tier_teams_cache.clear()
+    _entry_cache.clear()
+
 # 라운드별 주차 후보 — 1부가 아직 합류 전이면 앞쪽(챔스 시작 전) 구간을,
 # 합류한 뒤로는 뒤쪽(챔스 이후) 구간을 순서대로 사용한다. round_counter를
 # 그대로 인덱스로 써서 별도 분기 없이 자연스럽게 앞→뒤로 이어지게 한다.
@@ -34,7 +62,16 @@ from database import get_conn
 # 18→24로 밀었다. [2026-07 후속] 북남미 48팀·R32 추가로 챔스 종료가
 # 21→23주로 한 주 더 밀렸지만, 24는 그대로 둬도 됨 — 여유가 3주에서
 # 1주로 줄었을 뿐 챔스 결승(23주)과 겹치지 않는다.
-CUP_ROUND_WEEKS_POOL = [5, 6, 7, 24, 27, 30, 33, 36, 39, 42]
+# [2026-08 v3.5 재수정, 신민용 리포트: "슈퍼컵을 진짜 하반기(중간
+# 비시즌 지난 후)로 옮기고 국내컵 결승이 밀리는지도 확인해야 한다"]
+# 슈퍼컵을 29주차(국제예선~휴식기 끝난 직후 — super_cup_engine.
+# SC_START_WEEK 참고)로 옮기면서, 이 풀의 1부 합류 라운드를 30주차로
+# 재조정했다. 뒤 라운드는 원래 간격(3주→변경없음, 30,32,34,...는 실제로
+# 2주 간격인데 이는 원래 24,27,30...의 뒤쪽 절반과 동일한 상대 구조를
+# 유지) 그대로 둬도 마지막 라운드가 원래(수정 전) 위치인 42주차에
+# 그대로 맞아떨어져서 국내컵 결승이 전혀 안 밀린다(실측 확인: [5,6,7,
+# 30,32,34,36,38,40,42], 국제예선~휴식기(25~28주)와도 안 겹침).
+CUP_ROUND_WEEKS_POOL = [5, 6, 7, 30, 32, 34, 36, 38, 40, 42]
 
 # [2026-07 수정, 신민용 리포트: "컵대회는 비시즌에 낄 때 있네"] 중간 휴식기
 # (INTL_QUAL_WEEK~휴식기 끝 주차, 28~31주) 도입으로 위 풀의 30이 그 안에
@@ -504,7 +541,13 @@ def _tier_teams(country_id, tier_token, year=None):
     은 "1b"로 분류해 한 라운드 더 늦게 합류시킨다 — 컵 초반에 하위리그
     팀이 챔스 나가는 빅클럽부터 만나는 비현실성을 줄이기 위함. 이 시점
     (컵 4라운드 전후, 시즌 20주차 이후)엔 챔스 출전팀이 이미 확정돼 있어
-    (챔스 조 편성은 6~7주차) 안전하게 조회할 수 있다."""
+    (챔스 조 편성은 6~7주차) 안전하게 조회할 수 있다.
+    [2026-08 신설] 세션 캐시 적용 — 위 모듈 상단 _tier_teams_cache 설명 참고."""
+    _key = (country_id, tier_token, year)
+    _cached = _tier_teams_cache.get(_key)
+    if _cached is not None:
+        return _cached
+
     from game_engine import _team_avg_ovr
     conn = get_conn(); c = conn.cursor()
 
@@ -528,6 +571,7 @@ def _tier_teams(country_id, tier_token, year=None):
 
     out = [(r["tid"], r["tname"], _team_avg_ovr(c, r["tid"])) for r in rows]
     conn.close()
+    _tier_teams_cache[_key] = out
     return out
 
 
@@ -830,11 +874,27 @@ def _start_next_round(t, p=None):
 
 
 def _entry(tid, team_id):
+    # [2026-08 신설, 성능] cup_entries는 팀이 대회에 합류하는 시점 딱 한 번
+    # INSERT되고(team_name/tier/ovr 스냅샷), 이후 바뀌는 건 alive(탈락
+    # 표시)뿐이다 — 그런데 _entry()를 읽는 곳 중 alive를 쓰는 곳이 없어서
+    # (get_my_cup_matches가 이미 같은 이유로 IN 쿼리 배치 조회로 바꿔둔 것과
+    # 동일한 근거), (tournament_id, team_id) 조합으로 세션 캐시해도 안전
+    # 하다. 실측(10시즌 헤드리스 프로파일링): 이 함수가 국내컵 처리 시간의
+    # 10% 안팎을 차지했다(주당 호출 3천~4천 회, 매치마다 홈/원정 각각
+    # 개별 SELECT). _tier_teams_cache와 같은 타이밍(시즌 전환)에 함께
+    # 무효화한다.
+    _key = (tid, team_id)
+    _cached = _entry_cache.get(_key)
+    if _cached is not None:
+        return _cached
     conn = get_conn()
     r = conn.execute("SELECT * FROM cup_entries WHERE tournament_id=? AND team_id=?",
                      (tid, team_id)).fetchone()
     conn.close()
-    return dict(r) if r else {"team_name": "?", "ovr": 60}
+    result = dict(r) if r else {"team_name": "?", "ovr": 60}
+    if r:
+        _entry_cache[_key] = result
+    return result
 
 
 def _match_outcome(h_ovr, a_ovr):
@@ -1116,49 +1176,89 @@ def process_cup_week(week):
     # 늘어난 게 체감 저하의 큰 부분으로 보인다. get_player()는 이 한 주
     # 처리 안에서는 값이 바뀌지 않으므로 여기서 딱 한 번만 조회해 아래로
     # 전달한다 — 결과(각 대회 진행 로직)는 완전히 동일, DB 왕복 횟수만 준다.
+    #
+    # [2026-08 추가 최적화, 실측 프로파일링(10시즌 헤드리스, cProfile)] 위
+    # get_player() 건과 같은 종류의 문제가 한 겹 더 있었다 — _process_one이
+    # 나라(활성 대회)마다 "이 주차 라운드명 뭐임"(SELECT DISTINCT round_name)
+    # 과 "이 주차 아직 안 끝난 AI 매치 뭐임"(SELECT ... home_score=-1)을 각각
+    # 개별 SELECT로 조회하고, 매치 결과 반영도 나라마다 따로 executemany+
+    # commit했다. 활성 대회가 200개 안팎이라 이 패턴만으로 한 주에 400회
+    # 넘는 개별 DB 왕복 + 200번 넘는 commit이 발생했다(실측: cProfile에서
+    # _retry_sqlite_op 누적 시간이 국내컵 처리 주차 전체 시간의 절반 가까이).
+    # 아래처럼 "이번 주차 전체"를 딱 2번의 SELECT로 한 번에 읽어 tournament_id
+    # 별로 나누고, AI 매치 결과도 전체를 한 배치에 모아 한 번만 executemany+
+    # commit하도록 바꾼다 — 어느 매치가 몇 대 몇으로 끝나는지, 어느 라운드가
+    # 언제 끝나 다음 라운드가 언제 열리는지는 완전히 동일(라운드 진행 자체는
+    # 대회별로 순서대로 그대로 처리), DB 왕복·commit 횟수만 나라 수(≈200회)에서
+    # 상수(2~3회)로 줄어든다.
     from game_engine import get_player
     p = get_player()
     conn = get_conn()
     ts = [dict(r) for r in conn.execute(
         "SELECT * FROM cup_tournaments WHERE status='active'").fetchall()]
-    conn.close()
+    if not ts:
+        return
+
+    round_names_by_tid: dict = {}
+    for r in conn.execute(
+            "SELECT DISTINCT tournament_id, round_name FROM cup_matches WHERE week=?",
+            (week,)):
+        round_names_by_tid.setdefault(r["tournament_id"], []).append(r["round_name"])
+
+    pending_by_tid: dict = {}
+    for r in conn.execute(
+            """SELECT * FROM cup_matches WHERE week=? AND home_score=-1 AND is_my=0
+               ORDER BY tournament_id, id""", (week,)):
+        pending_by_tid.setdefault(r["tournament_id"], []).append(dict(r))
+
+    _batch = []
     for t in ts:
-        _process_one(t, week, p=p)
+        for m in pending_by_tid.get(t["id"], ()):
+            _sim_ai_match(t, m, batch=_batch)
+    if _batch:
+        conn.executemany(
+            """UPDATE cup_matches SET home_score=?, away_score=?,
+               pso_winner=?, pso_score=?, day=?, my_absence_reason=? WHERE id=?""",
+            _batch)
+    conn.commit()
+
+    for t in ts:
+        round_names = round_names_by_tid.get(t["id"])
+        if not round_names:
+            continue
+        for rname in round_names:
+            _advance_round(t, rname, week, p=p)
 
 
-def _process_one(t, week, p=None):
-    # [2026-07 3/4위전 추가] 결승과 3/4위전이 같은 주차에 동시에 열리므로,
-    # 예전처럼 그 주차의 '아무 경기 1건'으로 라운드를 판별하면(LIMIT 1)
-    # 둘 중 하나를 놓친다. 이 주차에 존재하는 라운드명을 전부 모아 각각
-    # 별도로 완료 여부를 확인·처리한다.
-    conn = get_conn()
-    round_names = [r["round_name"] for r in conn.execute(
-        "SELECT DISTINCT round_name FROM cup_matches WHERE tournament_id=? AND week=?",
-        (t["id"], week)).fetchall()]
-    conn.close()
+def _process_one(t, week, p=None, round_names=None, pending=None):
+    """대회 하나(t)의 이번 주차 처리. process_cup_week가 이제 이 주차 전체를
+    미리 벌크 조회해 round_names/pending을 넘겨주므로 정상 경로에선 추가
+    SELECT가 없다 — round_names/pending을 안 넘기고 이 함수를 단독 호출하는
+    경우(현재 이 파일 밖에는 없지만 안전망으로 유지)를 위해, 안 넘어오면
+    예전처럼 이 함수가 직접 조회한다."""
+    if round_names is None:
+        conn = get_conn()
+        round_names = [r["round_name"] for r in conn.execute(
+            "SELECT DISTINCT round_name FROM cup_matches WHERE tournament_id=? AND week=?",
+            (t["id"], week)).fetchall()]
     if not round_names:
         return
 
-    # 남은 AI끼리 경기를 채운다(내 경기는 이미 그 주 안에 별도로 처리됨).
-    # [2026-07 성능 최적화] 예전엔 경기마다 conn.execute()를 개별 호출했다
-    # ("1주 진행" 시 컵대회 라운드가 큰 주차일수록 체감 지연의 한 원인).
-    # 이제 game_engine._sim_all_ai_matches와 동일하게 batch 리스트에 모아
-    # executemany()로 한 번에 반영한다 — 결과(어느 경기가 몇 대 몇으로
-    # 끝나는지)는 완전히 동일하고, DB 반영 방식만 배치로 바뀐다.
-    conn2 = get_conn()
-    pending = [dict(r) for r in conn2.execute(
-        "SELECT * FROM cup_matches WHERE tournament_id=? AND week=? AND home_score=-1 AND is_my=0 ORDER BY id",
-        (t["id"], week)).fetchall()]
+    if pending is None:
+        conn2 = get_conn()
+        pending = [dict(r) for r in conn2.execute(
+            "SELECT * FROM cup_matches WHERE tournament_id=? AND week=? AND home_score=-1 AND is_my=0 ORDER BY id",
+            (t["id"], week)).fetchall()]
     _batch = []
     for m in pending:
         _sim_ai_match(t, m, batch=_batch)
     if _batch:
-        conn2.executemany(
+        conn3 = get_conn()
+        conn3.executemany(
             """UPDATE cup_matches SET home_score=?, away_score=?,
                pso_winner=?, pso_score=?, day=?, my_absence_reason=? WHERE id=?""",
             _batch)
-    conn2.commit()
-    conn2.close()
+        conn3.commit()
 
     for rname in round_names:
         _advance_round(t, rname, week, p=p)

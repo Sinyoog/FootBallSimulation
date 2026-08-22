@@ -54,9 +54,12 @@ class StandingsWindow(QDialog):
     def _build(self):
         self._lay = QVBoxLayout(self)
         conn = get_conn()
-        row  = conn.execute("SELECT name, tier FROM leagues WHERE id=?", (self.league_id,)).fetchone()
+        row  = conn.execute("SELECT name, tier, country_id FROM leagues WHERE id=?",
+                             (self.league_id,)).fetchone()
         conn.close()
         self._lname = f"{row['name']} ({row['tier']}부)" if row else "리그"
+        self._tier = row["tier"] if row else None
+        self._country_id = row["country_id"] if row else None
 
         self._lbl = QLabel(f"📊 {self._lname}")
         self._lbl.setStyleSheet("color:#00cc44;font-size:15px;font-weight:bold;")
@@ -141,21 +144,25 @@ class StandingsWindow(QDialog):
             _season_lid = _team_league_id_for_season(c, tid, season) if season else None
             if _season_lid is not None:
                 row = c.execute(
-                    "SELECT name AS lname, tier FROM leagues WHERE id=?",
+                    "SELECT name AS lname, tier, country_id FROM leagues WHERE id=?",
                     (_season_lid,)).fetchone()
                 if row:
                     self.league_id = _season_lid
+                    self._tier = row["tier"]
+                    self._country_id = row["country_id"]
                     new_name = f"{row['lname']} ({row['tier']}부)"
                     if new_name != self._lname:
                         self._lname = new_name
                         self._lbl.setText(f"📊 {self._lname}")
             else:
                 row = c.execute(
-                    "SELECT l.id AS lid, l.name AS lname, l.tier AS tier "
+                    "SELECT l.id AS lid, l.name AS lname, l.tier AS tier, l.country_id AS country_id "
                     "FROM teams t JOIN leagues l ON t.league_id=l.id WHERE t.id=?",
                     (tid,)).fetchone()
                 if row:
                     self.league_id = row["lid"]
+                    self._tier = row["tier"]
+                    self._country_id = row["country_id"]
                     new_name = f"{row['lname']} ({row['tier']}부)"
                     if new_name != self._lname:
                         self._lname = new_name
@@ -163,6 +170,117 @@ class StandingsWindow(QDialog):
             conn.close()
         self._fill_table()
         self._last_sig = self._compute_sig()
+
+    def _compute_zone_colors(self, rows) -> dict:
+        """[2026-08 v3.5 신설, 신민용 요청] 리그 순위표 각 팀의 글자색을
+        승격/강등/대륙대항전 진출 구간에 맞춰 정한다 — 상자(배경) 색이
+        아니라 글자색만 바꾼다.
+
+        규칙:
+          - 1부 리그: 챔스(블루)/유로파(오렌지)/컨퍼런스(연두) 진출 구간
+            — center_panel 주간 일정 카드와 같은 색. 국내 순위표에서
+            "지금 이대로 시즌이 끝나면 어디 나가는지" 실시간 미리보기다
+            (continental_qualification.allocate_continental_slots를 그대로
+            재사용 — 실제 대회 배정과 완전히 같은 워터폴 로직).
+          - 승격 가능 리그(자기보다 위 부가 있는 리그): 자동 승격(블루) +
+            승강 플레이오프권(옐로).
+          - 강등 가능 리그(자기보다 아래 부가 있는 리그): 자동 강등(레드) +
+            승강 플레이오프권(옐로) — game_engine._get_promotion_policy/
+            _get_po_bracket_size를 그대로 재사용해서 실제 승강 로직과
+            정확히 같은 인원수를 쓴다.
+          - 겹치는 경우(작은 나라라 대륙대항전 슬롯이 강등권까지 파고드는
+            드문 케이스): 대륙대항전 색이 항상 우선(더 특수한 상태라서) —
+            그 팀의 대륙대항전 진출이 실제로 끝나면(시즌 종료 시점에
+            워터폴 배정이 최종 확정되면) 자연히 다음 시즌부턴 강등 표시로
+            넘어간다.
+        """
+        colors: dict = {}
+        if not self._tier or not self._country_id:
+            return colors
+        conn = get_conn()
+        c = conn.cursor()
+
+        # 1) 대륙대항전 진출 구간 (1부 리그만)
+        # [2026-08 v3.5 재수정, 신민용 확정: "원래대로 다음 년도 챔스 등이
+        # 나갈 것을 표시하게" — 즉 실제 프리미어리그 순위표처럼 "지금
+        # 이대로 시즌이 끝나면 다음 시즌 챔스/유로파/컨퍼런스에 나갈
+        # 팀"을 라이브로 보여주는 게 맞다.] 직전 시즌 최종 순위로
+        # 실제 대회 참가팀이 확정된다는 사실 자체는 맞지만(그건 이미
+        # 배정되어 지금 뛰고 있는 대회 얘기), 이 순위표가 보여줘야 하는
+        # 건 "그 사실"이 아니라 "지금 순위가 이대로 굳으면 다음 시즌엔
+        # 누가 나가는가"라는 실시간 예측이다 — 실제 축구 중계에서
+        # 순위표에 챔스권을 색칠하는 것과 같은 개념. continental_
+        # qualification.allocate_continental_slots를 현재 시즌 순위로
+        # 그대로 재사용(실제 대회 배정과 완전히 같은 워터폴 로직 — 나라별
+        # 슬롯 수도 champions_engine.get_cl_slots/유로파·컨퍼런스 순위
+        # 기반 배정을 그대로 따르므로, 잉글랜드처럼 슬롯이 많은 나라와
+        # 튀르키예처럼 적은 나라 차이도 자동으로 반영된다).
+        if self._tier == 1:
+            try:
+                crow = c.execute("SELECT continent FROM countries WHERE id=?",
+                                  (self._country_id,)).fetchone()
+                if crow and crow["continent"]:
+                    from competition.champions_engine import CONTINENT_MAP
+                    cont_bucket = CONTINENT_MAP.get(crow["continent"])
+                    if cont_bucket:
+                        st = get_state()
+                        season = st.get("current_season") if st else None
+                        year = st.get("current_year") if st else None
+                        if season and year:
+                            from competition.continental_qualification import (
+                                allocate_continental_slots)
+                            alloc = allocate_continental_slots(cont_bucket, season, year)
+                            _CONT_COLOR = {"champions": "#4466ff", "europa": "#ff7700",
+                                           "conference": "#215131"}
+                            for comp_name, color in _CONT_COLOR.items():
+                                for entry in alloc.get(comp_name, []):
+                                    colors[entry["team_id"]] = color
+            except Exception:
+                pass
+
+        from game_engine import _get_promotion_policy, _get_po_bracket_size
+        team_count = len(rows)
+
+        # 2) 승격 구간(위 부가 존재할 때만)
+        upper = c.execute("SELECT id FROM leagues WHERE country_id=? AND tier=?",
+                           (self._country_id, self._tier - 1)).fetchone() if self._tier else None
+        if upper:
+            upper_count = c.execute("SELECT COUNT(*) FROM teams WHERE league_id=?",
+                                     (upper["id"],)).fetchone()[0]
+            policy = _get_promotion_policy(upper_count)
+            auto_n = policy["auto"]
+            po_n = _get_po_bracket_size(team_count) if policy["po"] else 0
+            for i, r in enumerate(rows, start=1):
+                if i <= auto_n:
+                    colors.setdefault(r["id"], "#4466ff")   # 승격 확정 — 블루
+                elif i <= auto_n + po_n:
+                    colors.setdefault(r["id"], "#ffee55")   # 승강 PO권 — 옐로
+
+        # 3) 강등 구간(아래 부가 존재할 때만)
+        lower = c.execute("SELECT id FROM leagues WHERE country_id=? AND tier=?",
+                           (self._country_id, self._tier + 1)).fetchone()
+        if lower:
+            policy = _get_promotion_policy(team_count)   # 이 리그가 "위 리그" 기준
+            auto_n = policy["auto"]
+            # [2026-08 v3.5 버그수정, 신민용 리포트: "강등은 확정강등 위에
+            # 한 팀만 PO에 참여하는데 왜 4팀이 노란색이야?"] 정확한
+            # 지적 — _get_promotion_policy 설계 자체가 "PO는 항상 4팀
+            # 브래킷이 마지막 생존권 1장을 놓고 경쟁하지만, 상위 리그는
+            # 항상 1팀만 위태로움"이다. 4팀 브래킷은 전부 "아래" 리그
+            # 쪽 몫(_get_po_bracket_size)이고, 이 리그(위 리그 역할)는
+            # policy["po"] 그대로(0 또는 1)가 PO권 인원이다 — 승격 쪽
+            # (아래 리그 자기 자신을 보는 코드, 위 2번 블록)과 혼동해서
+            # 여기도 _get_po_bracket_size를 잘못 썼던 게 원인.
+            po_n = policy["po"]
+            n = team_count
+            for i, r in enumerate(rows, start=1):
+                if i > n - auto_n:
+                    colors.setdefault(r["id"], "#ff3333")   # 강등 확정 — 레드
+                elif i > n - auto_n - po_n:
+                    colors.setdefault(r["id"], "#ffee55")   # 승강 PO권 — 옐로
+
+        conn.close()
+        return colors
 
     def _fill_table(self):
         # [2026-08 계측 추가, 신민용 리포트: "순위표 버튼도 혹시 모르고"]
@@ -176,6 +294,7 @@ class StandingsWindow(QDialog):
 
         rows = get_league_standings(self.league_id)
         _st_t1 = _time_st.perf_counter()
+        zone_colors = self._compute_zone_colors(rows)
         cols = ["순위","팀명","승","무","패","득점","실점","득실","승점"]
         tbl  = QTableWidget(len(rows), len(cols))
         tbl.setHorizontalHeaderLabels(cols)
@@ -194,12 +313,15 @@ class StandingsWindow(QDialog):
             vals = [str(i+1), r["name"], str(r["wins"]), str(r["draws"]), str(r["losses"]),
                     str(r["goals_for"]), str(r["goals_against"]),
                     str(r["goals_for"]-r["goals_against"]), str(r["pts"])]
+            _zone_color = zone_colors.get(r["id"])
             for j, v in enumerate(vals):
                 item = QTableWidgetItem(v)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 if r["id"] == self.my_team_id:
                     item.setBackground(QColor("#1a3a1a"))
                     item.setForeground(QColor("#00ff66"))
+                elif _zone_color:
+                    item.setForeground(QColor(_zone_color))
                 tbl.setItem(i, j, item)
 
         self._tbl = tbl

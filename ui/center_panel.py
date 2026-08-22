@@ -280,6 +280,10 @@ class CenterPanel(QWidget):
         self._year_weeks_total = 0
         self._year_weeks_done  = 0
         self._year_paused      = False   # 중단됐지만 이어서 재개 가능한 상태
+        # [2026-08 신설, 신민용 요청: "1년 말고 내가 원하는 연도를 입력하는
+        # 창도 추가해달라"] 몇 년을 반복할지 — 메뉴의 "1년 넘기기"는 1,
+        # "원하는 연도 입력"으로 고르면 그 값(예: 10)이 들어간다.
+        self._year_target_years = 1
         self._restoring    = False   # 복원 중 콤보 시그널이 저장을 되부르는 것 방지
         # [2026-07 추가] 경기 전날 강제휴식이 원래 선택을 덮어쓴 뒤, 그 경기가
         # 없어졌을 때(일정 재생성 등) 원래 선택으로 되돌리기 위한 저장소.
@@ -294,6 +298,15 @@ class CenterPanel(QWidget):
         # 않고 저장된 상태 그대로 창을 다시 띄운다(재접속 오퍼 리롤 방지).
         # 위젯이 완전히 표시된 뒤 뜨도록 한 틱 지연시킨다.
         QTimer.singleShot(0, self._restore_pending_offer_window)
+        # [2026-08 신설, 3단계] 판매추진 제안 창도 결정 전에 앱을 껐다 켰으면
+        # 그대로 다시 띄운다 — 저장된 proposal JSON을 새로 생성하지 않고
+        # 그대로 재사용.
+        QTimer.singleShot(0, self._restore_pending_sale_push)
+
+    def _restore_pending_sale_push(self):
+        p = get_player()
+        if p and p.get("sale_push_proposal_json"):
+            self._show_sale_push_proposal(p)
 
     # ── 빌드 ─────────────────────────────────────
 
@@ -662,6 +675,7 @@ class CenterPanel(QWidget):
             self._year_pattern     = None
             self._year_weeks_done  = 0
             self._year_weeks_total = 0
+            self._year_target_years = 1
             self.btn_mode.setText("📅 1주")
             self.adv_btn.setText("▶▶  이번 주 진행")
             show_toast(self, "⚠  입단으로 1년 넘기기가 해제되어 1주씩 모드로 전환합니다",
@@ -694,12 +708,13 @@ class CenterPanel(QWidget):
             self.adv_btn.setText(f"▶  하루 진행  ({day_to_full_date_str(year, day)}, {done+1}/{DAY_BUNDLE_SIZE}일차)")
         elif self._year_mode:
             # [2026-08 신설] 1년 넘기기 모드에서는 adv_btn 라벨을
-            # _set_mode_year/_pause_year_mode가 이미 "1년 넘기기 (이어하기)"
+            # _set_mode_year/_pause_year_mode가 이미 "N년 넘기기 (이어하기)"
             # 형태로 맞춰뒀다 — 여기서 "이번 주 진행"으로 되돌리면 안 된다.
             # 날짜 표시줄만 갱신하고 버튼 텍스트는 건드리지 않는다.
+            _yrs = getattr(self, "_year_target_years", 1)
             self.lbl_phase.setText(
                 f"{phase}  |  {season}시즌  "
-                f"{day_to_full_date_str(year, day)} ({week}주차)  (🗓 1년 넘기기 모드)")
+                f"{day_to_full_date_str(year, day)} ({week}주차)  (🗓 {_yrs}년 넘기기 모드)")
         else:
             self.lbl_phase.setText(
                 f"{phase}  |  {season}시즌  "
@@ -1134,16 +1149,41 @@ class CenterPanel(QWidget):
         self.formation.setVisible(has_team)
         if has_team:
             # 현재 대회 컨텍스트 감지 → 포메이션 위젯에 전달
-            _ctx = self._get_formation_context(week, p)
+            # [2026-08 v3.3 신설, 신민용 요청: "리그랑 챔스가 겹치는 주엔
+            # 리그를 보고 싶을 때도 있는데, 1주씩 돌리면 챔스 처리하는
+            # 동안 리그를 확인할 방법이 없다"] 이제 이번 주 내가 걸쳐
+            # 있는 대회 전부를 options로 넘겨서, 포메이션 위젯이 필터
+            # 버튼을 보여줄 수 있게 한다(대회가 하나뿐이면 필터 자체가
+            # 안 뜨므로 화면은 예전과 동일).
+            _options, _ctx = self._get_formation_context_options(week, p)
             self.formation.load_team(
                 p["current_team_id"],
                 context=_ctx,
+                options=_options,
                 manager_rel=p.get("manager_relation", 50))
 
         self._update_preview()
 
-    def _get_formation_context(self, week, p):
-        """현재 주차에 진행 중인 대회 컨텍스트를 반환. 리그면 None."""
+    def _get_formation_context_options(self, week, p):
+        """이번 주 내가 걸쳐 있는 모든 대회를 [(label, context), ...]로
+        모아서 돌려주고, 그 중 "자동으로 고를 기본값" context도 함께
+        돌려준다(예전 _get_formation_context()와 동일한 우선순위:
+        국가대표→챔피언스→유로파→컨퍼런스→슈퍼컵→클럽월드컵→국내컵 순으로
+        가장 먼저 발견된 것이 기본값). "리그"는 팀이 있으면 항상 후보에
+        넣는다 — 그래야 대회 경기가 진행 중인 주에도 필터로 언제든 리그
+        화면으로 돌아갈 수 있다. 겹치는 대회가 없으면(옵션 1개) 포메이션
+        위젯 쪽에서 필터 버튼 자체를 숨긴다."""
+        options = []
+        default_ctx = None
+        default_set = False
+
+        def _consider(label, ctx):
+            nonlocal default_ctx, default_set
+            options.append((label, ctx))
+            if not default_set:
+                default_ctx = ctx
+                default_set = True
+
         # 국가대표 대회 확인
         try:
             import intl_engine
@@ -1172,7 +1212,7 @@ class CenterPanel(QWidget):
                         _grp = _er["grp"] if _er and _er["grp"] else ""
                     except Exception:
                         _grp = ""
-                return {
+                _consider("국가대표", {
                     "intl": True,
                     "tournament_id": t["id"],
                     "league_name": t["name"],
@@ -1181,7 +1221,7 @@ class CenterPanel(QWidget):
                     "stage_ko": _stage_ko,
                     "grp": _grp,
                     "week": week,
-                }
+                })
         except Exception:
             pass
         # 챔피언스리그 확인 (41~52주)
@@ -1191,7 +1231,7 @@ class CenterPanel(QWidget):
             _st = _gs()
             cl_m = champions_engine.get_my_cl_match(week, p=p)
             if cl_m:
-                return {
+                _consider("챔피언스", {
                     "cl": True,
                     "cl_kind": "champions",
                     "tournament_id": cl_m["tournament_id"],
@@ -1200,27 +1240,28 @@ class CenterPanel(QWidget):
                     "stage_ko": cl_m.get("stage_ko", ""),
                     "grp": cl_m.get("grp", ""),
                     "week": week,
-                }
-            # 경기 없는 주차에도 대회 진행 중이면 조별리그 context 유지
-            # (포메이션 위젯이 내 조 팀 목록을 표시하기 위해)
-            if _st:
-                cl_gi = champions_engine.get_my_cl_group_info(_st["current_year"])
-                if cl_gi:
-                    # _my_cl_tournament로 대회 정보 가져오기
-                    from competition.champions_engine import _my_cl_tournament
-                    _cp = p  # center_panel의 p
-                    _ct = _my_cl_tournament(_cp, _st["current_year"])
-                    if _ct and _ct.get("status") != "done":
-                        return {
-                            "cl": True,
-                            "cl_kind": "champions",
-                            "tournament_id": _ct["id"],
-                            "league_name": _ct["name"],
-                            "stage": "group",
-                            "stage_ko": "",
-                            "grp": cl_gi["grp"],
-                            "week": week,
-                        }
+                })
+            else:
+                # 경기 없는 주차에도 대회 진행 중이면 조별리그 context 유지
+                # (포메이션 위젯이 내 조 팀 목록을 표시하기 위해)
+                if _st:
+                    cl_gi = champions_engine.get_my_cl_group_info(_st["current_year"])
+                    if cl_gi:
+                        # _my_cl_tournament로 대회 정보 가져오기
+                        from competition.champions_engine import _my_cl_tournament
+                        _cp = p  # center_panel의 p
+                        _ct = _my_cl_tournament(_cp, _st["current_year"])
+                        if _ct and _ct.get("status") != "done":
+                            _consider("챔피언스", {
+                                "cl": True,
+                                "cl_kind": "champions",
+                                "tournament_id": _ct["id"],
+                                "league_name": _ct["name"],
+                                "stage": "group",
+                                "stage_ko": "",
+                                "grp": cl_gi["grp"],
+                                "week": week,
+                            })
         except Exception:
             pass
         # 유로파리그급/컨퍼런스리그급 확인 (2026-08 신설, 챔스와 동일 주차)
@@ -1228,7 +1269,7 @@ class CenterPanel(QWidget):
             from competition import europa_engine
             el_m = europa_engine.get_my_el_match(week, p=p)
             if el_m:
-                return {
+                _consider("유로파", {
                     "cl": True,
                     "cl_kind": "europa",
                     "tournament_id": el_m["tournament_id"],
@@ -1237,14 +1278,14 @@ class CenterPanel(QWidget):
                     "stage_ko": el_m.get("stage_ko", ""),
                     "grp": el_m.get("grp", ""),
                     "week": week,
-                }
+                })
         except Exception:
             pass
         try:
             from competition import conference_engine
             ecl_m = conference_engine.get_my_ecl_match(week, p=p)
             if ecl_m:
-                return {
+                _consider("컨퍼런스", {
                     "cl": True,
                     "cl_kind": "conference",
                     "tournament_id": ecl_m["tournament_id"],
@@ -1253,7 +1294,7 @@ class CenterPanel(QWidget):
                     "stage_ko": ecl_m.get("stage_ko", ""),
                     "grp": ecl_m.get("grp", ""),
                     "week": week,
-                }
+                })
         except Exception:
             pass
         # [2026-08 신설, 11순위] 슈퍼컵 확인 — 챔스/유로파/컨퍼런스와 같은
@@ -1263,7 +1304,7 @@ class CenterPanel(QWidget):
             from competition import super_cup_engine
             sc_m = super_cup_engine.get_my_super_cup_match(week, p=p)
             if sc_m:
-                return {
+                _consider("슈퍼컵", {
                     "cl": True,
                     "cl_kind": "super_cup",
                     "tournament_id": sc_m["tournament_id"],
@@ -1272,7 +1313,7 @@ class CenterPanel(QWidget):
                     "stage_ko": sc_m.get("stage_ko", ""),
                     "grp": sc_m.get("grp", ""),
                     "week": week,
-                }
+                })
         except Exception:
             pass
         # 클럽 월드컵 확인 (43~52주, 4년에 한 번)
@@ -1280,7 +1321,7 @@ class CenterPanel(QWidget):
             from competition import club_world_cup_engine
             cwc_m = club_world_cup_engine.get_my_cwc_match(week, p=p)
             if cwc_m:
-                return {
+                _consider("클럽월드컵", {
                     "cwc": True,
                     "tournament_id": cwc_m["tournament_id"],
                     "league_name": cwc_m.get("league_name", "클럽 월드컵"),
@@ -1288,10 +1329,30 @@ class CenterPanel(QWidget):
                     "stage_ko": cwc_m.get("stage_ko", ""),
                     "grp": cwc_m.get("grp", ""),
                     "week": week,
-                }
+                })
         except Exception:
             pass
-        return None
+        # [2026-08 v3.3 신설] 국내컵 — 예전엔 이 판정 자체가 없어서
+        # 포메이션 위젯이 국내컵 상대를 절대 보여줄 수 없었다.
+        try:
+            from competition import cup_engine
+            cup_m = cup_engine.get_my_cup_match(week, p=p)
+            if cup_m:
+                _consider("국내컵", {
+                    "cup": True,
+                    "tournament_id": cup_m["tournament_id"],
+                    "league_name": cup_m.get("league_name", "국내컵"),
+                    "week": week,
+                })
+        except Exception:
+            pass
+
+        # 리그는 팀이 있으면 항상 후보(필터로 언제든 돌아갈 수 있게).
+        options.append(("리그", None))
+        if not default_set:
+            default_ctx = None
+
+        return options, default_ctx
 
     def _check_match(self, week, p):
         lid = p.get("current_league_id",0)
@@ -1426,14 +1487,32 @@ class CenterPanel(QWidget):
         act_week = QAction("📅 1주씩", self)
         act_year = QAction("🗓 1년 넘기기 (팀 없을 때만)", self)
         act_year.setEnabled(not has_team)
+        # [2026-08 신설, 신민용 요청: "1년 말고 내가 원하는 연도를 입력하는
+        # 창도 추가해달라, 이것도 팀 입단하면 1년처럼 선택 불가능하게"]
+        # 1년 넘기기와 완전히 같은 가드(팀 있으면 비활성화)를 그대로 쓴다.
+        act_custom = QAction("🗓 원하는 연도 입력... (팀 없을 때만)", self)
+        act_custom.setEnabled(not has_team)
         menu.addAction(act_day)
         menu.addAction(act_week)
         menu.addSeparator()
         menu.addAction(act_year)
+        menu.addAction(act_custom)
 
         act_day.triggered.connect(self._set_mode_day)
         act_week.triggered.connect(self._set_mode_week)
-        act_year.triggered.connect(self._set_mode_year)
+        # [2026-08 버그수정, 신민용 리포트: "1년 넘기기를 고르면 버튼에
+        # '1년'이 아니라 'False'라고 뜬다"] 원인: QAction.triggered
+        # 시그널은 항상 bool(checked) 인자를 하나 넘기는데, 이걸
+        # self._set_mode_year(첫 인자가 years)에 그대로 연결해버려서
+        # PyQt가 그 bool을 위치인자로 years 자리에 꽂아넣고 있었다 —
+        # 그래서 "1년 넘기기"를 고르면 실제로는 _set_mode_year(False)가
+        # 호출돼 self._year_target_years=False가 됐고, f"🗓 {years}년"이
+        # "🗓 False년"으로 찍혔던 것("원하는 연도 입력"쪽은 _prompt_
+        # custom_years를 거쳐 self._set_mode_year(years=spin.value())를
+        # 키워드 인자로 명시해서 호출하므로 이 문제가 없었다). 람다로
+        # 그 bool을 버리고 years=1을 명시적으로 넘기도록 수정.
+        act_year.triggered.connect(lambda _checked=False: self._set_mode_year(years=1))
+        act_custom.triggered.connect(self._prompt_custom_years)
 
         # [2026-08] 커서 위치가 아니라 버튼 바로 아래에 뜨도록 — 다른 앱
         # 메뉴/콤보박스와 동일한 위치 관례를 따른다(임의 커서 위치보다
@@ -1447,6 +1526,7 @@ class CenterPanel(QWidget):
         self._year_pattern     = None
         self._year_weeks_done  = 0
         self._year_weeks_total = 0
+        self._year_target_years = 1
         self._step_mode = True
         self.btn_mode.setText("📆 하루씩")
         self.adv_btn.setText("▶▶  이번 주 진행")
@@ -1461,6 +1541,7 @@ class CenterPanel(QWidget):
         self._year_pattern     = None
         self._year_weeks_done  = 0
         self._year_weeks_total = 0
+        self._year_target_years = 1
         self._step_mode    = False
         self._locked_sched = None
         self._step_idx     = 0
@@ -1470,11 +1551,61 @@ class CenterPanel(QWidget):
         self._save_ui_state()
         self.refresh()
 
-    def _set_mode_year(self):
-        """[2026-08 신설] 1년 넘기기 모드 선택. 지금 화면에 짜여 있는 7일
-        패턴을 그대로 52번(=364일=1년) 반복할 준비만 여기서 하고, 실제
-        진행은 여전히 진행 버튼(adv_btn)을 눌러야 시작된다 — 메뉴에서
-        고르자마자 바로 진행되면 실수로 1년을 통째로 날릴 수 있어서다.
+    def _prompt_custom_years(self):
+        """[2026-08 신설, 신민용 요청: "1년 말고 내가 원하는 연도를 입력하는
+        창을 추가해달라"] 몇 년을 진행할지 물어보는 작은 입력창 — 앱
+        다크 테마(_DIALOG_STYLE의 #dlgSpin/#dlgOk)를 그대로 따른다. 값을
+        고르면 _set_mode_year(years=N)을 그대로 재사용해서, 이후 로직은
+        기존 "1년 넘기기"와 완전히 동일한 경로(52주×N번 반복)를 탄다."""
+        p = get_player()
+        if p and p.get("current_team_id"):
+            show_toast(self, "⚠  팀이 있으면 원하는 연도 넘기기를 쓸 수 없습니다", "#cc6600", 1600)
+            return
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSpinBox
+        dlg = QDialog(self)
+        dlg.setWindowTitle("🗓 원하는 연도 입력")
+        dlg.setMinimumWidth(320)
+        dlg.setStyleSheet(_DIALOG_STYLE)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(18, 16, 18, 16); lay.setSpacing(12)
+
+        hdr = QLabel("🗓 몇 년을 진행할까요?"); hdr.setObjectName("dlgHeader")
+        lay.addWidget(hdr)
+
+        spin = QSpinBox(); spin.setObjectName("dlgSpin")
+        spin.setRange(1, 50)
+        spin.setValue(getattr(self, "_year_target_years", 1) or 1)
+        spin.setSuffix("년")
+        lay.addWidget(spin)
+
+        btn_row = QHBoxLayout()
+        btn_cancel = QPushButton("취소")
+        btn_ok = QPushButton("확인"); btn_ok.setObjectName("dlgOk")
+        # [2026-08 신설, 신민용 요청: "연도 입력 후 엔터를 누르면 확인을
+        # 누른 효과를 줘"] 기본 버튼(default button)으로 지정해두면, 이
+        # 다이얼로그 안 어디서 Enter를 눌러도(스핀박스에 포커스가 있을
+        # 때 포함) Qt가 자동으로 이 버튼의 클릭을 트리거해준다 — 별도로
+        # 키 입력을 가로챌 필요가 없다. 취소 버튼은 autoDefault를 꺼서
+        # Enter가 실수로 취소 쪽에 걸리지 않게 한다.
+        btn_ok.setDefault(True)
+        btn_ok.setAutoDefault(True)
+        btn_cancel.setAutoDefault(False)
+        btn_row.addWidget(btn_cancel); btn_row.addWidget(btn_ok)
+        lay.addLayout(btn_row)
+
+        btn_cancel.clicked.connect(dlg.reject)
+        btn_ok.clicked.connect(dlg.accept)
+        spin.setFocus()
+
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._set_mode_year(years=spin.value())
+
+    def _set_mode_year(self, years=1):
+        """[2026-08 신설] 1년(또는 원하는 연도) 넘기기 모드 선택. 지금
+        화면에 짜여 있는 7일 패턴을 그대로 52×years주 반복할 준비만 여기서
+        하고, 실제 진행은 여전히 진행 버튼(adv_btn)을 눌러야 시작된다 —
+        메뉴에서 고르자마자 바로 진행되면 실수로 여러 해를 통째로 날릴
+        수 있어서다.
 
         [2026-08 재개 기능 추가] 국가대표 선택 등으로 중단됐던 진행이
         있으면(_year_paused) 그 진행 상황(_year_weeks_done/_year_pattern)을
@@ -1488,16 +1619,18 @@ class CenterPanel(QWidget):
         self._step_mode    = False
         self._locked_sched = None
         self._step_idx     = 0
-        self.btn_mode.setText("🗓 1년")
+        self._year_target_years = years
+        label = f"🗓 {years}년"
+        self.btn_mode.setText(label)
         if self._year_paused and self._year_weeks_total:
             self.adv_btn.setText(
-                f"▶▶  1년 넘기기 이어하기 ({self._year_weeks_done}/{self._year_weeks_total}주)")
-            show_toast(self, f"🗓 1년 넘기기 이어서 진행합니다 "
+                f"▶▶  {years}년 넘기기 이어하기 ({self._year_weeks_done}/{self._year_weeks_total}주)")
+            show_toast(self, f"🗓 {years}년 넘기기 이어서 진행합니다 "
                              f"({self._year_weeks_done}/{self._year_weeks_total}주 완료)",
                        "#664400", 2200)
         else:
-            self.adv_btn.setText("▶▶  1년 넘기기 (지금 일정 반복)")
-            show_toast(self, "🗓 1년 넘기기 모드  —  지금 짜둔 일정이 52주 동안 반복됩니다",
+            self.adv_btn.setText(f"▶▶  {years}년 넘기기 (지금 일정 반복)")
+            show_toast(self, f"🗓 {years}년 넘기기 모드  —  지금 짜둔 일정이 {years}년 동안 반복됩니다",
                        "#664400", 2200)
         self.refresh()
 
@@ -1786,6 +1919,12 @@ class CenterPanel(QWidget):
         if p2.get("_contract_renew_offer", 0) > 0:
             self._show_renew_dialog(p2)
 
+        # [2026-08 신설, 3단계] 판매추진 제안 팝업 — 재계약 팝업과 마찬가지로
+        # 새 주차 진입 직후 뜬다(오퍼 팝업과 달리 bundle_done을 기다리지
+        # 않음 — 재계약과 동일한 우선순위).
+        if p2.get("sale_push_proposal_json"):
+            self._show_sale_push_proposal(p2)
+
         # 자동 오퍼 팝업은 1주 묶음이 완료됐을 때만
         # (1주씩 본다고 매주 오퍼가 뜨지 않음)
         if bundle_done:
@@ -1863,6 +2002,26 @@ class CenterPanel(QWidget):
             for opt in pend.get("options", []):
                 intl_engine.decline_national_team(opt["tournament_id"])
 
+    def _auto_commit_forced_nationality(self, intl_engine):
+        """[2026-08 신설, 신민용 요청: "10년처럼 길게 돌릴 때 국적 확정
+        창 때문에 멈추면 안 된다 — 오면 자동으로 뛰겠습니다 하고 넘어가야
+        한다"] 22세 복수국적 영구 확정(get_forced_commit)이 뜨면, 예전
+        처럼 팝업을 띄우고 루프를 멈추는 대신 첫 번째 보유 국적(원 국적,
+        p['nationality'])으로 자동 확정하고 계속 진행한다 — 대표팀 발탁을
+        자동 거절하는 _auto_decline_all_pending과 같은 원칙(1년/N년
+        넘기기는 '사람이 지켜보지 않아도 끝까지 굴러가는' 모드여야 한다).
+        되돌릴 수 없는 선택이라는 점은 그대로지만, 인터랙티브 팝업으로
+        긴 자동진행을 막는 것보다는 원 국적으로 자동 확정하는 쪽이 이
+        모드의 취지에 맞다고 판단해 변경. forced가 있었으면 True를
+        반환(호출부에서 토스트 등 후속 처리에 쓸 수 있도록)."""
+        forced = intl_engine.get_forced_commit()
+        if not forced:
+            return False
+        opts = forced.get("options") or []
+        if opts:
+            intl_engine.commit_nationality(opts[0]["nat"])
+        return True
+
     def _build_pattern_week_sched(self, day, p, st, pattern):
         """_build_week_sched와 동일한 규칙(경기 있는 날은 자동으로 "경기",
         경기 전날은 강제 휴식)으로 7일 일정을 만들되, 콤보박스를 실시간으로
@@ -1904,14 +2063,13 @@ class CenterPanel(QWidget):
             show_toast(self, "⚠  팀이 생겨 1년 넘기기를 취소했습니다", "#cc6600", 1800)
             return
 
-        # 강제확정(복수국적 22세 영구 선택)은 되돌릴 수 없는 정체성 선택이라
-        # 자동으로 대신 골라줄 수 없다 — 이건 그대로 멈추고 사용자에게 맡긴다.
-        # (재개든 새 시작이든 매번 다시 확인 — 그 사이 새로 떴을 수 있음)
+        # [2026-08 변경, 신민용 요청: "10년처럼 길게 돌릴 때 국적 확정
+        # 창 때문에 멈추면 안 된다"] 예전엔 여기서 멈추고 팝업을 띄웠다 —
+        # 이제는 _auto_commit_forced_nationality가 원 국적으로 자동
+        # 확정하고 계속 진행한다(재개든 새 시작이든 매번 다시 확인 —
+        # 그 사이 새로 떴을 수 있음).
         import intl_engine
-        forced = intl_engine.get_forced_commit()
-        if forced:
-            self._show_forced_commit(forced)
-            return
+        self._auto_commit_forced_nationality(intl_engine)
 
         # [2026-08 변경, 신민용 요청: "1년 돌리면 대표팀 발탁도 다 자동으로
         # 거부"] 예전엔 여기서 대기 중인 발탁 선택(get_pending_choice)이
@@ -1930,7 +2088,10 @@ class CenterPanel(QWidget):
                 self._year_pattern = [cb.currentText() for cb in self.week_combos]
             except Exception:
                 self._year_pattern = list(TRAIN_DEFAULTS)
-            self._year_weeks_total = 52
+            # [2026-08 신설] 1년 고정 대신 사용자가 고른 연도 수(N)만큼
+            # 52주씩 반복 — 메뉴에서 "1년 넘기기"를 골랐으면 N=1(기존과
+            # 동일 동작), "원하는 연도 입력"을 골랐으면 그 값.
+            self._year_weeks_total = 52 * max(1, getattr(self, "_year_target_years", 1) or 1)
             self._year_weeks_done  = 0
 
         # 올해 남은 기간 동안 입단 강제/자동 오퍼를 막는다 — "모든 오퍼
@@ -1951,7 +2112,7 @@ class CenterPanel(QWidget):
         target = self.main_win if self.main_win else self
         if self._proc_overlay is None or self._proc_overlay.parent() is not target:
             self._proc_overlay = _ProcessingOverlay(target)
-        self._proc_overlay.show_progress("🗓 1년 진행 중...", self._year_weeks_done, self._year_weeks_total)
+        self._proc_overlay.show_progress(f"🗓 {getattr(self, '_year_target_years', 1) or 1}년 진행 중...", self._year_weeks_done, self._year_weeks_total)
 
         self._advance_year_step()
 
@@ -1978,7 +2139,7 @@ class CenterPanel(QWidget):
         from PyQt6.QtWidgets import QApplication
         self._year_weeks_done += 1
         if self._proc_overlay is not None:
-            self._proc_overlay.show_progress("🗓 1년 진행 중...", self._year_weeks_done, self._year_weeks_total)
+            self._proc_overlay.show_progress(f"🗓 {getattr(self, '_year_target_years', 1) or 1}년 진행 중...", self._year_weeks_done, self._year_weeks_total)
 
         # ── 중단 조건 확인 ──
         p2 = get_player()
@@ -1991,19 +2152,12 @@ class CenterPanel(QWidget):
             show_toast(self, "⚽ 팀에 입단해서 1년 넘기기를 마쳤습니다", "#006622", 2000)
             return
 
-        # [2026-08 버그수정, 신민용 리포트: "22살 1주차에 국적 선택 후 1년
-        # 넘기기를 이어하면 딱 1주만 더 진행되고(2주차) 바로 완료 처리돼버림"]
-        # 원인: 이 시점(52주째 진행이 방금 끝나 새해 1주차로 넘어온 바로 그
-        # 순간)에 "52주 완료"와 "22세 국적 강제확정 필요"가 동시에 걸리면,
-        # 예전엔 아래 forced_commit 분기가 완료 판정보다 먼저 실행돼서
-        # _year_weeks_done=52(이미 총량 도달)인 채로 "일시정지"됐다. 그러면
-        # 사용자가 국적을 고르고 "이어하기"를 눌렀을 때 실제로는 이미 끝난
-        # 해인데 한 주를 더 실행해버리고(그래서 1주차→2주차로만 넘어감),
-        # 그다음에야 53>=52로 완료 판정이 떨어져 즉시 "1년 넘기기 완료!"로
-        # 종료됐다 — 사용자 입장에선 "1주만 진행되고 멈춘 것"처럼 보였다.
-        # 완료 판정(weeks_done>=weeks_total)을 forced_commit 판정보다 먼저
-        # 검사하도록 순서를 바꾼다 — 이번 해는 정상적으로 딱 52주에서 완료
-        # 처리하고, 국적 확정은 그 직후(다음 해 몫으로) 별도로 띄운다.
+        # [2026-08 옛 버그수정 배경, 지금은 아래 두 분기 모두 자동확정으로
+        # 바뀌어 직접적인 영향은 없어졌지만 순서는 그대로 유지] 52주 완료와
+        # 22세 국적 강제확정이 같은 시점에 겹치는 경우가 있어(새해 1주차
+        # 진입 직후), 완료 판정(weeks_done>=weeks_total)을 forced_commit
+        # 처리보다 먼저 검사한다 — 이번 해는 정상적으로 딱 52×N주에서 완료
+        # 처리하고, 국적 자동확정은 그 직후(완료 분기 안)에서 처리한다.
         import intl_engine
         self._auto_decline_all_pending(intl_engine)
 
@@ -2026,26 +2180,18 @@ class CenterPanel(QWidget):
 
         if self._year_weeks_done >= self._year_weeks_total:
             self._finalize_year_mode(refresh=True, revert_mode=False)
-            show_toast(self, "🗓 1년 넘기기 완료!", "#006622", 2000)
-            # 이번 해는 정상적으로 완료 처리했으니, 새해 국적 강제확정이
-            # 걸려 있으면 (완료 토스트와는 별개로) 바로 이어서 띄운다.
-            forced = intl_engine.get_forced_commit()
-            if forced:
-                self._show_forced_commit(forced)
+            show_toast(self, "🗓 연도 넘기기 완료!", "#006622", 2000)
+            # [2026-08 변경] 새해 국적 강제확정이 걸려 있어도 팝업으로
+            # 멈추지 않고 원 국적으로 자동 확정한다(_auto_commit_forced_
+            # nationality 참고) — 이미 완료 처리된 뒤라 별도 진행 흐름에
+            # 영향은 없지만, 다음에 이 화면을 다시 열었을 때 팝업이 뜨는
+            # 것 자체를 방지한다.
+            self._auto_commit_forced_nationality(intl_engine)
             return
 
-        forced = intl_engine.get_forced_commit()
-        if forced:
-            # [2026-08] 진행률(_year_weeks_done/_year_pattern)은 보존하고
-            # "일시정지"만 한다 — 처리 후 진행 버튼을 다시 누르면 남은
-            # 주부터 이어간다(처음부터 다시 시작하지 않는다).
-            self._pause_year_mode(refresh=True)
-            show_toast(self, "⚠  대표팀 국적을 정해야 해서 1년 넘기기를 일시 중단했습니다.\n"
-                             f"({self._year_weeks_done}/{self._year_weeks_total}주 완료 — "
-                             "처리 후 진행 버튼을 다시 누르면 이어집니다)",
-                       "#cc6600", 3000)
-            self._show_forced_commit(forced)
-            return
+        if self._auto_commit_forced_nationality(intl_engine):
+            show_toast(self, "🌍 만 22세 국적을 원 국적으로 자동 확정하고 계속 진행합니다",
+                       "#1a4d8f", 2000)
 
         # 계속 다음 주로.
         QApplication.processEvents()
@@ -2073,8 +2219,9 @@ class CenterPanel(QWidget):
             self._hide_processing_overlay()
         self._year_active = False
         self._year_paused = True
+        _yrs = getattr(self, "_year_target_years", 1) or 1
         self.adv_btn.setText(
-            f"▶▶  1년 넘기기 이어하기 ({self._year_weeks_done}/{self._year_weeks_total}주)")
+            f"▶▶  {_yrs}년 넘기기 이어하기 ({self._year_weeks_done}/{self._year_weeks_total}주)")
         self.adv_btn.setEnabled(True)
         self.btn_mode.setEnabled(True)
         if self.main_win:
@@ -2107,6 +2254,7 @@ class CenterPanel(QWidget):
         self._year_weeks_total = 0
         if revert_mode:
             self._year_mode = False
+            self._year_target_years = 1
             self.btn_mode.setText("📅 1주씩")
             self.adv_btn.setText("▶▶  이번 주 진행")
         else:
@@ -2389,6 +2537,19 @@ class CenterPanel(QWidget):
         if eclm:
             eclm["cl_kind"] = "conference"
             return eclm
+        # [2026-08 버그수정, 신민용 리포트: "슈퍼컵이 center_panel에 안
+        # 뜬다"] 챔스/유로파/컨퍼런스는 여기서 확인하면서 슈퍼컵만 빠져
+        # 있었다 — game_engine.advance_days 쪽은 super_cup_engine을 제대로
+        # 호출해 실제 경기 처리는 정상 진행됐지만(1454~1782행), 화면
+        # 표시 함수인 이 함수는 아예 조회를 안 해서 슈퍼컵 당일에도
+        # "훈련" 카드만 보이는 상태였다. 챔스/유로파/컨퍼런스와 동일하게
+        # cl_kind="super_cup"을 붙여 반환한다(색상 스타일은 _CL_KIND_STYLE에
+        # 이미 있음 — 926행 참고).
+        from competition import super_cup_engine
+        scm = super_cup_engine.get_my_super_cup_match(week, day=day, p=p, st=st)
+        if scm:
+            scm["cl_kind"] = "super_cup"
+            return scm
         from competition import cup_engine
         return cup_engine.get_my_cup_match(week, day=day, p=p, st=st)
 
@@ -2604,6 +2765,104 @@ class CenterPanel(QWidget):
         btn_accept.clicked.connect(_accept)
         btn_reject.clicked.connect(_reject)
         _refresh()
+        dlg.exec()
+
+    def _show_sale_push_proposal(self, p):
+        """[2026-08 신설, 3단계: 판매추진 전용 UI, 신민용+GPT 검토 확정]
+        구단이 만든 판매 제안을 보여준다 — 일반 오퍼(OfferWindow)와
+        완전히 다른 개념: "상대 구단이 나에게 이적을 제안"이 아니라
+        "우리 구단이 이미 판매를 결정하고 완성된 조건을 승인받으려는
+        것"이라서, 연봉/이적료를 협상하는 버튼이 없다 — 수락/거절만
+        가능하다. 우측엔 "관심 구단" 목록(실제 오퍼가 아니라 구매
+        의향이 있는 팀들)을 장식적으로 보여준다."""
+        raw = p.get("sale_push_proposal_json") or ""
+        if not raw:
+            return
+        import json as _json
+        try:
+            proposal = _json.loads(raw)
+        except Exception:
+            return
+
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame
+        from game_engine import accept_sale_push_proposal, reject_sale_push_proposal
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("🏟 판매추진 제안")
+        dlg.setMinimumWidth(440)
+        dlg.setStyleSheet(_DIALOG_STYLE)
+        root = QVBoxLayout(dlg)
+        root.setContentsMargins(18, 16, 18, 16); root.setSpacing(10)
+
+        hdr = QLabel("🏟 구단이 판매를 원합니다")
+        hdr.setObjectName("dlgHeader")
+        root.addWidget(hdr)
+
+        body = QHBoxLayout(); body.setSpacing(12)
+
+        card = QFrame(); card.setObjectName("dlgCard")
+        cl = QVBoxLayout(card); cl.setContentsMargins(14, 12, 14, 12); cl.setSpacing(5)
+        _flag = proposal.get("flag", "")
+        cl.addWidget(QLabel(
+            f"<b style='color:#fff;font-size:14px'>{_flag} {proposal['team_name']}</b>"))
+        cl.addWidget(QLabel(
+            f"<span style='color:#bbb'>{proposal['league_name']} ({proposal['country']}, "
+            f"{proposal['tier']}부)</span>"))
+        cl.addWidget(QLabel(""))
+        cl.addWidget(QLabel(
+            f"<span style='color:#bbb'>제시 연봉</span>  "
+            f"<b style='color:#00cc66'>{fmt_money(proposal['salary'])} / 년</b>"))
+        cl.addWidget(QLabel(
+            f"<span style='color:#bbb'>판매 금액</span>  "
+            f"<b style='color:#ffcc33'>{fmt_money(proposal['transfer_fee'])}</b>  "
+            f"<span style='color:#888;font-size:11px'>"
+            f"(시장가 {fmt_money(proposal['market_fee'])} 대비 "
+            f"{int(proposal['discount_pct']*100)}% 할인)</span>"))
+        cl.addWidget(QLabel(
+            f"<span style='color:#bbb'>계약 기간</span>  "
+            f"<b style='color:#fff'>{proposal['contract_years']}년</b>"))
+        body.addWidget(card, 3)
+
+        interest = proposal.get("interest_teams") or []
+        if interest:
+            ibox = QFrame(); ibox.setObjectName("dlgCard")
+            il = QVBoxLayout(ibox); il.setContentsMargins(10, 10, 10, 10); il.setSpacing(3)
+            il.addWidget(QLabel("<span style='color:#888;font-size:11px'>관심 구단</span>"))
+            for name in interest:
+                nl = QLabel(f"· {name}")
+                nl.setStyleSheet("color:#999;font-size:11px;")
+                il.addWidget(nl)
+            il.addStretch()
+            body.addWidget(ibox, 1)
+
+        root.addLayout(body)
+
+        note = QLabel("※ 수락하면 시즌이 끝난 뒤 실제로 이적합니다. "
+                       "조건 협상은 할 수 없습니다.")
+        note.setStyleSheet("color:#666;font-size:11px;")
+        note.setWordWrap(True)
+        root.addWidget(note)
+
+        btn_row = QHBoxLayout(); btn_row.setSpacing(8)
+        btn_accept = QPushButton("✅ 수락"); btn_accept.setObjectName("dlgOk")
+        btn_reject = QPushButton("❌ 거절"); btn_reject.setObjectName("dlgNo")
+        btn_row.addWidget(btn_accept, 1); btn_row.addWidget(btn_reject, 1)
+        root.addLayout(btn_row)
+
+        def _accept():
+            accept_sale_push_proposal()
+            dlg.accept()
+            if self.main_win:
+                self.main_win.refresh_all()
+
+        def _reject():
+            reject_sale_push_proposal()
+            dlg.accept()
+            if self.main_win:
+                self.main_win.refresh_all()
+
+        btn_accept.clicked.connect(_accept)
+        btn_reject.clicked.connect(_reject)
         dlg.exec()
 
     def _show_forced_commit(self, forced):
@@ -3103,6 +3362,11 @@ class CenterPanel(QWidget):
             self._on_auto_offer_done(dlg)
 
     def _do_world_browser(self):
+        # [2026-08 신설, 신민용 요청: "같은 종류의 창은 하나만 뜨게"] 이미
+        # 열려 있으면 새로 안 만들고 기존 창을 앞으로 가져온다.
+        if getattr(self, "_world_win", None) is not None:
+            self._world_win.raise_(); self._world_win.activateWindow()
+            return
         from ui.world_browser_window import WorldBrowserWindow
         self._world_win = WorldBrowserWindow(self)
 
@@ -3112,6 +3376,11 @@ class CenterPanel(QWidget):
         self._world_win.show()
 
     def _do_standings(self):
+        # [2026-08 신설, 신민용 요청: "같은 종류의 창은 하나만"] 이미 열려
+        # 있으면 새로 만들지 않고 기존 창을 앞으로 가져온다.
+        if getattr(self, "_standings_win", None) is not None:
+            self._standings_win.raise_(); self._standings_win.activateWindow()
+            return
         p = get_player()
         if not p or not p.get("current_league_id"):
             show_toast(self, "⚠  소속 팀이 없습니다"); return
@@ -3149,6 +3418,11 @@ class CenterPanel(QWidget):
         self._standings_win.show()
 
     def _do_schedule(self):
+        # [2026-08 신설, 신민용 요청: "같은 종류의 창은 하나만"] 이미 열려
+        # 있으면 새로 만들지 않고 기존 창을 앞으로 가져온다.
+        if getattr(self, "_schedule_win", None) is not None:
+            self._schedule_win.raise_(); self._schedule_win.activateWindow()
+            return
         p  = get_player()
         st = get_state()
         if not p or not p.get("current_league_id"):
@@ -3182,13 +3456,23 @@ class CenterPanel(QWidget):
         self._schedule_win.show()
 
     def _do_agent(self):
+        # [2026-08 신설, 신민용 요청: "같은 종류의 창은 하나만"] 이미 열려
+        # 있으면 새로 만들지 않고 기존 창을 앞으로 가져온다.
+        if getattr(self, "_agent_dlg", None) is not None:
+            self._agent_dlg.raise_(); self._agent_dlg.activateWindow()
+            return
         p = get_player()
         if not p: return
         # [2026-07 요청 반영] 예전엔 비시즌(5~11주/26~32주)에만 에이전트를
         # 바꿀 수 있었는데, 그 제한을 없애고 언제든 변경 가능하게 한다.
         from ui.agent_window import AgentWindow
         self._agent_dlg = AgentWindow(p.get("language", "ko"), self)
-        self._agent_dlg.finished.connect(lambda: self._on_agent_done(self._agent_dlg))
+
+        def _clear_agent(*_a):
+            self._agent_dlg = None
+        _dlg_ref = self._agent_dlg
+        self._agent_dlg.finished.connect(_clear_agent)
+        self._agent_dlg.finished.connect(lambda: self._on_agent_done(_dlg_ref))
         self._agent_dlg.show()
 
     def _on_agent_done(self, dlg):
@@ -3256,6 +3540,10 @@ class CenterPanel(QWidget):
         b_no.setDefault(True)   # 엔터 시 기본은 '계속'
 
         if dlg.exec() == QDialog.DialogCode.Accepted:
+            # [2026-08 신설, 신민용 요청: "같은 종류의 창은 하나만"]
+            if getattr(self, "_retire_win", None) is not None:
+                self._retire_win.raise_(); self._retire_win.activateWindow()
+                return
             # 리그가 끝난 시즌의 우승·개인수상을 trophy_log/awards에 먼저 확정한 뒤
             #   은퇴 창을 띄운다. (시즌전환 부작용 없이 성과만 기록)
             from game_engine import finalize_season_for_retire
@@ -3263,6 +3551,10 @@ class CenterPanel(QWidget):
             from ui.retire_window import RetireWindow
             main_win = self.window()
             self._retire_win = RetireWindow(get_player().get("language", "ko"), main_win)
+
+            def _clear_retire(*_a):
+                self._retire_win = None
+            self._retire_win.finished.connect(_clear_retire)
             self._retire_win.show()
 
 

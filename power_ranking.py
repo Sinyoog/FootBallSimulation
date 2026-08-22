@@ -58,10 +58,10 @@ game_engine.py의 연도전환 훅(_advance_week)에서 evaluation_year=(방금
 from dataclasses import dataclass
 from typing import Optional
 
-from database import get_conn
+from database import get_conn, get_game_start_year
 from constants import (
     REGION_CUP_NAME, REGION_TO_CONTINENT, CONFEDERATIONS,
-    CONTINENT_TO_CONF, CONF_CUP_NAME, EURO_NAME, GAME_START_YEAR,
+    CONTINENT_TO_CONF, CONF_CUP_NAME, EURO_NAME,
 )
 
 
@@ -188,13 +188,33 @@ PLACEMENT_BASE_SCORE = {
     "champion": 40, "runner_up": 24, "semifinal": 12,
     "quarterfinal": 6, "round16": 3, "group_exit": 1,
 }
+# [2026-08 신설, 신민용 확정: "국가 파워랭킹이 대회 성적 하나로 너무
+# 쉽게 뒤집힌다"] 예전엔 국가도 위 PLACEMENT_BASE_SCORE(클럽과 공용, 우승
+# 40)를 그대로 쓰고 COUNTRY_TIER_WEIGHT(월드컵 2.6)만 곱했다 — 그 결과
+# 월드컵 준우승 한 번(24×2.6=62.4)이 실측 상위10개국 PS 스프레드(96점)의
+# 65%를 즉시 잡아먹어, 통산 우승 0회인 나라도 대회 하나로 즉시 세계
+# 4위권까지 튀어오르는 문제가 실측으로 확인됐다. 클럽 쪽(PLACEMENT_BASE_
+# SCORE)은 이미 여러 세션에 걸쳐 이 값 기준으로 명문팀 우승비율 등이
+# 촘촘히 튜닝돼 있어(prestige_clubs.py 등) 건드리지 않고, 국가 전용
+# 배점표를 따로 분리한다 — "B는 A(경기 기반 Elo)를 뒤집는 게 아니라
+# 살짝 보정하는 역할"이라는 설계 원칙(신민용 확정)에 맞춰 월드컵 기준
+# 최종 B 기여량을 우승25/준우승18/4강13/8강9/16강5/조별탈락0으로 하향
+# — COUNTRY_TIER_WEIGHT(월드컵 2.6)를 곱해서 역산한 배점이다. 같은
+# 배점표에 다른 대회(아메리카컵/유로/아시안컵/AFCON/지역컵)의 기존
+# 가중치를 그대로 곱하면 자동으로 비례 축소된다(예: 유로 우승 12.5,
+# 지역컵 최상위 우승도 40→9.6 수준으로 함께 낮아짐) — 대회별로 따로
+# 손볼 필요 없이 기존 가중치 서열(월드컵>아메리카컵>유로/아시안컵/AFCON
+# >지역컵)이 그대로 유지된다.
+COUNTRY_PLACEMENT_BASE_SCORE = {
+    "champion": 9.6, "runner_up": 6.9, "semifinal": 5.0,
+    "quarterfinal": 3.5, "round16": 1.9, "group_exit": 0.0,
+}
+
 # 리그 순위 보너스는 절대순위가 아니라 백분위(최종순위/참가팀수) 기반.
-LEAGUE_PLACEMENT_BANDS = [  # (백분위 상한, 배점) — 순서대로 첫 매치 채택
-    (0.0, 20),   # 1위(champion) 자체는 별도 처리하지만 안전망으로 포함
-    (0.10, 10),
-    (0.20, 6),
-    (0.25, 3),
-]
+# [2026-08 v3.2] 실제 밴드 값은 아래 league_placement_bonus() 함수 안에
+# if/elif로 직접 명시(mutually exclusive 보장) — 이 상수 테이블은 더 이상
+# 쓰지 않는다(하위권 마이너스 밴드까지 추가되며 함수 안에 직접 넣는 쪽이
+# 더 명확해짐).
 
 # [2026-08 신설, 신민용 버그 리포트: "2부리그 1등한 게 1부리그 1등급으로
 # 오는 거 같다"] league_placement_bonus/리그 A레이어 가중치가 리그의
@@ -220,16 +240,31 @@ def league_tier_weight(tier: Optional[int]) -> float:
 RELEGATION_BASE_PENALTY = -14.0  # 강등 1단계당 기본 페널티(리그가중치 곱하기 전)
 
 
+# [2026-08 v3.2 재설계, GPT 피드백 반영: "1위는 상위10% 밴드와도 겹치니
+# if/elif로 반드시 배타 처리해야 한다" + "하위권도 이제 마이너스가 있어야
+# 한다"] 리그 순위 보너스 — 백분위 기반, 우승 하나만 챙기던 예전과 달리
+# 이제 중~하위권도 세분화된다. 백분위 비교는 <= 부등호라 자동으로 ceil()과
+# 동일한 효과를 낸다(예: 18팀 리그 상위10% 컷오프는 1.8 → 2위까지 포함).
 def league_placement_bonus(final_rank: int, n_teams: int) -> float:
     if n_teams <= 0:
         return 0.0
     if final_rank == 1:
-        return 20.0
+        return 20.0   # mutually exclusive — 아래 상위10% 밴드와 안 겹침
     percentile = final_rank / n_teams
-    for cutoff, score in LEAGUE_PLACEMENT_BANDS[1:]:
-        if percentile <= cutoff:
-            return float(score)
-    return 0.0
+    if percentile <= 0.10:
+        return 10.0
+    if percentile <= 0.20:
+        return 6.0
+    if percentile <= 0.25:
+        return 3.0
+    if percentile <= 0.50:
+        return 0.0
+    if percentile <= 0.75:
+        return -2.0
+    if percentile <= 0.90:
+        return -5.0
+    return -8.0   # 91~100% — 강등팀도 이 밴드에 자연히 포함(별도 행 없음,
+                  # 실제 강등 이벤트 페널티는 RELEGATION_BASE_PENALTY로 별개 처리)
 
 
 # 국내리그/지역컵 연속우승 감쇠 (3.7/4.7)
@@ -372,6 +407,19 @@ def ensure_power_ranking_tables(conn):
     c.execute("""CREATE TABLE IF NOT EXISTS team_b_history(
         team_id INTEGER, year INTEGER, b_gain REAL,
         PRIMARY KEY(team_id, year))""")
+    # [2026-08 v3.2 신설, 리그 상대강도] 그 시즌에 실제로 만난 상대들의
+    # PS를 승/무/패별로 누적 — "5승 5패"가 강팀 상대인지 약팀 상대인지
+    # 구분하기 위함(_update_team_a_from_league 참고). match_results_archive가
+    # 예전에 무한정 쌓여서(21시즌차 346만행/195MB) 저장 지연을 일으켰던
+    # 사고를 반복하지 않기 위해, 이 테이블은 "그 시즌 계산용 임시 데이터"로
+    # 취급한다 — run_year_end_power_ranking_update가 그 시즌 계산을 끝내면
+    # 바로 해당 season 행을 삭제한다(영구 이력 아님).
+    c.execute("""CREATE TABLE IF NOT EXISTS team_season_opp_strength(
+        team_id INTEGER, season INTEGER,
+        win_opp_ps_sum REAL DEFAULT 0, win_n INTEGER DEFAULT 0,
+        draw_opp_ps_sum REAL DEFAULT 0, draw_n INTEGER DEFAULT 0,
+        loss_opp_ps_sum REAL DEFAULT 0, loss_n INTEGER DEFAULT 0,
+        PRIMARY KEY(team_id, season))""")
     conn.commit()
 
 
@@ -379,11 +427,33 @@ def ensure_power_ranking_tables(conn):
 # 8. 레이팅 읽기/쓰기 헬퍼 (A/B 분리)
 # ══════════════════════════════════════════════════════════════
 
+# [2026-08 신설, 성능] run_year_end_power_ranking_update 한 번(연 1회
+# 배치)이 진행되는 동안 같은 team_id의 a_rating/b_rating을 경기 결과·대회
+# 성적·리그레션 단계에서 반복해서 읽고 쓴다(실측: 10시즌 헤드리스
+# cProfile — _get_team_ab만 이 배치 한 번에 117,524회 호출, team 수
+# 11,329개 대비 팀당 평균 10회 이상 중복 조회). get_team_ps_map()이
+# "시즌 내내 유효한 캐시"(위 주석 참고)로 이미 이 패턴을 쓰고 있는데,
+# 정작 그 값을 실제로 갱신하는 이 배치 자체에는 캐시가 없었다.
+# 이 배치는 단일 스레드로 순서대로만 실행되고(동시에 두 시즌이 같이
+# 도는 경우 없음), 아래 쓰기 함수들(_add_team_a/_add_team_b/
+# apply_team_season_regression의 직접 UPDATE)이 전부 DB에 그대로 쓰면서
+# 캐시도 같이 갱신하므로(write-through) DB는 항상 즉시 최신 상태 —
+# 캐시는 순전히 "방금 그 배치 안에서 이미 읽었거나 쓴 값을 또 SELECT
+# 하지 않기 위함"이다. run_year_end_power_ranking_update 시작 시 매번
+# 비워서(다음 시즌엔 무조건 새로 읽음) 시즌 간 데이터가 섞일 일이 없다.
+_team_ab_cache: dict = {}
+
+
 def _get_team_ab(conn, team_id: int):
+    cached = _team_ab_cache.get(team_id)
+    if cached is not None:
+        return cached
     row = conn.execute(
         "SELECT a_rating, b_rating FROM team_power_rating WHERE team_id=?", (team_id,)
     ).fetchone()
-    return (row[0], row[1]) if row else (0.0, 0.0)
+    result = (row[0], row[1]) if row else (0.0, 0.0)
+    _team_ab_cache[team_id] = result
+    return result
 
 
 def _get_team_rating(conn, team_id: int) -> float:
@@ -402,6 +472,7 @@ def _add_team_a(conn, team_id: int, delta: float, year: int):
                      ON CONFLICT(team_id) DO UPDATE SET
                         a_rating=excluded.a_rating, last_updated_year=excluded.last_updated_year""",
                  (team_id, a + delta, b, year))
+    _team_ab_cache[team_id] = (a + delta, b)
 
 
 def _add_team_b(conn, team_id: int, delta: float, year: int):
@@ -411,6 +482,7 @@ def _add_team_b(conn, team_id: int, delta: float, year: int):
                      ON CONFLICT(team_id) DO UPDATE SET
                         b_rating=excluded.b_rating, last_updated_year=excluded.last_updated_year""",
                  (team_id, a, b + delta, year))
+    _team_ab_cache[team_id] = (a, b + delta)
     conn.execute("""INSERT INTO team_b_history(team_id, year, b_gain) VALUES(?,?,?)
                      ON CONFLICT(team_id, year) DO UPDATE SET b_gain=b_gain+excluded.b_gain""",
                  (team_id, year, delta))
@@ -444,12 +516,19 @@ def _add_country_a(conn, country: str, delta: float, year: int):
 
 
 def _add_country_b(conn, country: str, delta: float, year: int):
+    """[2026-08 수정, 신민용 확정: "월드컵+대륙컵을 연달아 우승해도 B가
+    무한히 안 쌓이게"] 상한(COUNTRY_B_MAX)만 건다 — 하한은 그대로 열어둔다
+    (예선탈락 페널티(QUALIFIER_FAIL_BASE_PENALTY)가 그 해 b_rating을
+    일시적으로 마이너스로 만들 수는 있게 두고, 0 바닥은 다음 해
+    apply_country_season_regression의 _decay_b가 처리)."""
+    from constants import COUNTRY_B_MAX
     a, b = _get_country_ab(conn, country)
+    new_b = min(COUNTRY_B_MAX, b + delta)
     conn.execute("""INSERT INTO country_power_rating(country, a_rating, b_rating, last_updated_year)
                      VALUES(?,?,?,?)
                      ON CONFLICT(country) DO UPDATE SET
                         b_rating=excluded.b_rating, last_updated_year=excluded.last_updated_year""",
-                 (country, a, b + delta, year))
+                 (country, a, new_b, year))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -633,6 +712,74 @@ def _update_team_a_from_matches(conn, matches_table: str, tournament_id: int, ye
         _add_team_a(conn, away_id, d_away, year)
 
 
+def get_team_ps_map(conn, team_ids) -> dict:
+    """[2026-08 v3.2 신설] 상대강도 누적용 — 여러 팀 PS를 한 번에 조회해
+    dict로 돌려준다(game_engine.py의 주간 매치 시뮬 루프가 매치마다 개별
+    SELECT 하지 않고 이 dict를 세션 캐시로 재사용하기 위함 — 기존
+    _team_ovr_cache와 동일한 패턴). 팀 PS는 연 1회 연도전환 배치에서만
+    갱신되므로(리그 경기는 시즌 내내 이 값에 영향을 못 줌), 같은 시즌
+    동안은 이 캐시가 계속 유효하다."""
+    if not team_ids:
+        return {}
+    placeholders = ",".join("?" * len(team_ids))
+    rows = conn.execute(
+        f"SELECT team_id, a_rating, b_rating FROM team_power_rating "
+        f"WHERE team_id IN ({placeholders})", list(team_ids)).fetchall()
+    found = {r[0]: (r[1] or 0.0) + (r[2] or 0.0) for r in rows}
+    # 시드가 아직 한 번도 안 된 팀(이론상 거의 없음, 게임 시작 시 전 팀
+    # 시드됨)은 team_power_rating 행 자체가 없을 수 있어 폴백 seed 계산.
+    missing = [tid for tid in team_ids if tid not in found]
+    for tid in missing:
+        ps, _ = _team_seed_ab(conn, tid, {})
+        found[tid] = ps
+    return found
+
+
+def flush_opp_strength(conn, season: int, acc: dict):
+    """[2026-08 v3.2 신설] game_engine.py의 주간 리그 매치 루프가
+    acc: {team_id: [win_sum,win_n,draw_sum,draw_n,loss_sum,loss_n]}
+    형태로 파이썬 dict에 모아둔 걸 한 번의 executemany UPSERT로 반영한다
+    (경기당 개별 쓰기 없음 — _flush_team_rec과 동일한 배치 관례)."""
+    if not acc:
+        return
+    conn.executemany(
+        """INSERT INTO team_season_opp_strength
+               (team_id, season, win_opp_ps_sum, win_n, draw_opp_ps_sum, draw_n,
+                loss_opp_ps_sum, loss_n)
+           VALUES(?,?,?,?,?,?,?,?)
+           ON CONFLICT(team_id, season) DO UPDATE SET
+               win_opp_ps_sum=win_opp_ps_sum+excluded.win_opp_ps_sum,
+               win_n=win_n+excluded.win_n,
+               draw_opp_ps_sum=draw_opp_ps_sum+excluded.draw_opp_ps_sum,
+               draw_n=draw_n+excluded.draw_n,
+               loss_opp_ps_sum=loss_opp_ps_sum+excluded.loss_opp_ps_sum,
+               loss_n=loss_n+excluded.loss_n""",
+        [(tid, season, v[0], v[1], v[2], v[3], v[4], v[5]) for tid, v in acc.items()])
+    conn.commit()
+
+
+def record_league_opp_strength(acc: dict, home_id, away_id, home_ps, away_ps, outcome):
+    """[2026-08 v3.2 신설] game_engine.py 쪽에서 _accum_team_rec과 나란히
+    호출 — 결과 하나를 양 팀 관점에서 acc(파이썬 dict, DB접근 없음)에
+    누적한다. outcome은 game_engine._roll_outcome()이 돌려주는 값과 동일
+    (\"home\"/\"away\"/그 외=무승부)."""
+    def _get(tid):
+        if tid not in acc:
+            acc[tid] = [0.0, 0, 0.0, 0, 0.0, 0]  # win_sum,win_n,draw_sum,draw_n,loss_sum,loss_n
+        return acc[tid]
+
+    h = _get(home_id); a = _get(away_id)
+    if outcome == "home":
+        h[0] += away_ps; h[1] += 1
+        a[4] += home_ps; a[5] += 1
+    elif outcome == "away":
+        h[4] += away_ps; h[5] += 1
+        a[0] += home_ps; a[1] += 1
+    else:
+        h[2] += away_ps; h[3] += 1
+        a[2] += home_ps; a[3] += 1
+
+
 def _update_team_a_from_league(conn, evaluation_year: int):
     """리그는 경기 단위 대신 league_season_standings 집계를 '리그 평균
     상대'로 근사(TUNE LATER, 상단 docstring 참고). 단계가중치는 1.0 고정.
@@ -654,27 +801,53 @@ def _update_team_a_from_league(conn, evaluation_year: int):
     다시 곱하는 이중 압축을 없애 시즌 전체 승점 격차(actual-expected)가
     그대로 델타에 실리게 하고, (b) 상한을 '경기 1건' 상한이 아니라 시즌
     전체용으로 별도로 크게(LEAGUE_SEASON_DELTA_CAP) 잡는다. (c) 리그
-    부(tier)가 낮을수록(하위 리그) league_tier_weight로 가중치를 깎는다."""
+    부(tier)가 낮을수록(하위 리그) league_tier_weight로 가중치를 깎는다.
+
+    [2026-08 v3.2 재설계, 상대강도 반영] "기대승점"의 기준을 리그 전체
+    평균(league_avg)에서 그 팀이 그 시즌 실제로 만난 상대들의 평균 PS
+    (avg_opponent_ps)로 바꾼다 — 5승5패라도 "강팀 5승/약팀 5패"와
+    "약팀 5승/강팀 5패"는 전혀 다른 시즌인데 리그 평균 하나로는 이
+    차이가 사라졌다(신민용+GPT 합의). team_season_opp_strength가 그
+    시즌 매주 실시간으로 쌓아둔 값을 쓰고, 정상적으로는 나오면 안 되는
+    예외(0경기)만 조용히 league_avg로 폴백하지 않고 경고 로그를 남긴다."""
     rows = conn.execute(
-        """SELECT s.team_id, s.wins, s.draws, s.losses, l.tier
+        """SELECT s.team_id, s.wins, s.draws, s.losses, l.tier, s.season
            FROM league_season_standings s JOIN leagues l ON s.league_id = l.id
            WHERE s.year=?""", (evaluation_year,)).fetchall()
     if not rows:
         return
     team_ids = [r[0] for r in rows]
+    season = rows[0][5]
     ratings = {tid: _get_team_rating(conn, tid) for tid in team_ids}
     league_avg = sum(ratings.values()) / len(ratings)
+    opp_rows = conn.execute(
+        """SELECT team_id, win_opp_ps_sum, win_n, draw_opp_ps_sum, draw_n,
+                  loss_opp_ps_sum, loss_n
+           FROM team_season_opp_strength WHERE season=?""", (season,)).fetchall()
+    opp_by_team = {r[0]: r[1:] for r in opp_rows}
     base_w = TEAM_COMPETITION_WEIGHT["league"]
-    for team_id, wins, draws, losses, tier in rows:
+    for team_id, wins, draws, losses, tier, _season in rows:
         rating = ratings[team_id]
         grade = grade_for_ps(rating)
-        avg_grade = grade_for_ps(league_avg)
         n_games = (wins or 0) + (draws or 0) + (losses or 0)
         if n_games == 0:
             continue
+        os_row = opp_by_team.get(team_id)
+        opp_n = (os_row[1] + os_row[3] + os_row[5]) if os_row else 0
+        if os_row and opp_n > 0:
+            opp_sum = os_row[0] + os_row[2] + os_row[4]
+            avg_opponent_ps = opp_sum / opp_n
+        else:
+            print(f"[WARN][power_ranking] team_id={team_id} season={season}: "
+                  f"리그 상대강도 데이터 0건 — league_avg_ps로 폴백")
+            avg_opponent_ps = league_avg
+        avg_grade = grade_for_ps(avg_opponent_ps)
         w = base_w * league_tier_weight(tier)
         actual_points = (wins or 0) * 1.0 + (draws or 0) * 0.5
-        e = expected_score(rating, league_avg)
+        e = expected_score(rating, avg_opponent_ps)   # [2026-08 v3.2] 두 번째 인자만
+                                                        # league_avg → avg_opponent_ps로
+                                                        # 교체, expected_score() 함수
+                                                        # 자체는 손대지 않음(GPT 합의사항)
         expected_points = e * n_games
         k_match = (k_for_grade(grade) + k_for_grade(avg_grade)) / 2.0
         raw = k_match * w * (actual_points - expected_points)
@@ -816,7 +989,11 @@ def update_team_b_for_year(conn, evaluation_year: int):
         tier_w = league_tier_weight(tier_of_league.get(league_id))
         for rank, (team_id, _pts) in enumerate(standings, start=1):
             bonus = league_placement_bonus(rank, n)
-            if bonus <= 0:
+            # [2026-08 v3.2] 하위권 밴드가 마이너스를 돌려주므로 더 이상
+            # "bonus<=0이면 스킵"하면 안 된다 — 정확히 0(중위권, 26~50%)일
+            # 때만 스킵(어차피 더할 게 없음), 마이너스는 그대로 적용해야
+            # "우승만 보정되고 부진은 반영 안 되는" 예전 비대칭이 안 생긴다.
+            if bonus == 0:
                 continue
             if rank == 1:
                 bonus *= decay
@@ -941,7 +1118,7 @@ def update_country_b_for_year(conn, evaluation_year: int):
             if False else _country_deepest_stage(conn, tid)
         champion = None
         for country, tier in placements.items():
-            base = PLACEMENT_BASE_SCORE[tier]
+            base = COUNTRY_PLACEMENT_BASE_SCORE[tier]
             decay = 1.0
             if tier == "champion":
                 champion = country
@@ -1024,16 +1201,27 @@ def _team_ovr_change_rate(conn, team_id: int, prev_year_ovr: Optional[float]) ->
     return abs(cur - prev_year_ovr) / prev_year_ovr
 
 
-def _regress_and_split(ps: float, seed_ps: float, a: float, b: float, convergence: float):
-    """1장 ①~④ 공식: PS 전체에 회귀 적용 후 원래 A:B 비율로 재분배."""
-    new_ps = ps * (1 - convergence) + seed_ps * convergence
-    if ps == 0:
-        return new_ps, 0.0
-    ratio_a = a / ps
-    return new_ps * ratio_a, new_ps * (1 - ratio_a)
+def _regress_a(a: float, seed_ps: float, convergence: float) -> float:
+    """[2026-08 v3.2 재설계, GPT 피드백: "ratio_a는 시드를 다시 나누는
+    구식 잔재라 빼는 게 맞다"] A(현재 실력)만 스쿼드 수준(seed_ps, 시드는
+    전량 A로 잡히므로 그대로 기준점으로 쓸 수 있음) 쪽으로 회귀시킨다.
+    B는 여기서 손대지 않고 _decay_b()가 완전히 별도로 처리한다."""
+    return a * (1 - convergence) + seed_ps * convergence
+
+
+def _decay_b(b: float, decay_rate: float) -> float:
+    """[2026-08 v3.2 재설계] B(과거 업적)는 seed와 무관하게 그냥 이
+    비율만큼 매년 옅어진다. 0 미만으로는 안 내려간다(GPT 지적: "누적
+    업적 자산"이 개념적으로 음수가 되면 안 됨 — 팀이 정말 약하다는 사실은
+    A쪽에서 계속 반영되므로 B에서 중복 표현할 필요가 없다). 시즌 중
+    하위권/강등 페널티가 이번 해 b_rating을 일시적으로 마이너스로 만들 수는
+    있지만(그건 "이번 시즌 성적 변동"이라 정상), 다음 해 이 감쇠 계산에서
+    는 항상 0으로 바닥을 친다."""
+    return max(0.0, b * (1 - decay_rate))
 
 
 def apply_team_season_regression(conn, evaluation_year: int, league_power_cache: dict):
+    from constants import CLUB_B_DECAY_RATE
     teams = conn.execute("SELECT id FROM teams").fetchall()
     for (team_id,) in teams:
         a, b = _get_team_ab(conn, team_id)
@@ -1051,9 +1239,16 @@ def apply_team_season_regression(conn, evaluation_year: int, league_power_cache:
                 convergence = 0.35
             elif drift >= SOFT_RESET_TRIGGER_1:
                 convergence = 0.25
-        new_a, new_b = _regress_and_split(ps, seed_ps, a, b, convergence)
+        new_a = _regress_a(a, seed_ps, convergence)
+        new_b = _decay_b(b, CLUB_B_DECAY_RATE)
         conn.execute("""UPDATE team_power_rating SET a_rating=?, b_rating=?, last_updated_year=?
                          WHERE team_id=?""", (new_a, new_b, evaluation_year, team_id))
+        # [2026-08 신설] 이 UPDATE는 _add_team_a/_add_team_b를 거치지 않는
+        # 직접 쓰기라, 위 _team_ab_cache write-through 대상에서 빠진다 —
+        # 여기서 직접 갱신 안 하면 이 함수 뒤에 오는 compute_team_power_
+        # rankings()가 _get_team_rating()으로 이 팀을 다시 읽을 때 방금
+        # 리그레션 적용 전(stale) 값을 캐시에서 돌려주게 된다.
+        _team_ab_cache[team_id] = (new_a, new_b)
     conn.commit()
 
 
@@ -1065,10 +1260,10 @@ def _country_last_intl_year(conn, country: str, upto_year: int) -> Optional[int]
 
 
 def apply_country_season_regression(conn, evaluation_year: int):
+    from constants import COUNTRY_B_DECAY_RATE
     countries = conn.execute("SELECT name FROM countries").fetchall()
     for (country,) in countries:
         a, b = _get_country_ab(conn, country)
-        ps = a + b
         seed_ps, _ = _seed_country_ab(conn, country)
         last_year = _country_last_intl_year(conn, country, evaluation_year)
         if last_year is None:
@@ -1076,7 +1271,8 @@ def apply_country_season_regression(conn, evaluation_year: int):
         else:
             gap = evaluation_year - last_year
             convergence = {0: 0.15, 1: 0.25, 2: 0.35}.get(gap, 0.45 if gap >= 3 else 0.15)
-        new_a, new_b = _regress_and_split(ps, seed_ps, a, b, convergence)
+        new_a = _regress_a(a, seed_ps, convergence)
+        new_b = _decay_b(b, COUNTRY_B_DECAY_RATE)
         conn.execute("""UPDATE country_power_rating SET a_rating=?, b_rating=?, last_updated_year=?
                          WHERE country=?""", (new_a, new_b, evaluation_year, country))
     conn.commit()
@@ -1167,6 +1363,10 @@ def run_year_end_power_ranking_update(conn, evaluation_year: int):
     """game_engine.py 연도전환 훅에서 호출하는 단일 진입점. 순서:
     레이어A(경기결과) → 레이어B(대회성적) → 시즌전환 리그레션(A:B 재분배)
     → 스냅샷 저장. evaluation_year=방금 끝난 시즌, ranking_year=eval+1."""
+    # [2026-08 신설, 성능] 이번 배치(연 1회) 동안만 유효한 _team_ab_cache를
+    # 매번 새로 비운다 — 위 _team_ab_cache 선언부 설명 참고.
+    _team_ab_cache.clear()
+
     ensure_power_ranking_tables(conn)
     ensure_initial_team_power_ranking(conn)
     ensure_initial_country_power_ranking(conn)
@@ -1182,6 +1382,21 @@ def run_year_end_power_ranking_update(conn, evaluation_year: int):
 
     compute_team_power_rankings(conn, evaluation_year)
     compute_country_power_rankings(conn, evaluation_year)
+
+    # [2026-08 v3.2 신설] team_season_opp_strength는 이번 시즌 계산 전용
+    # 임시 데이터 — 위 계산(특히 update_team_ratings_for_year의 리그
+    # 상대강도 조회)이 전부 성공적으로 끝나고 스냅샷까지 저장된 뒤에만
+    # 지운다(GPT 지적: 계산 실패 시 임시데이터만 사라지는 상태 불일치를
+    # 피하기 위해 "계산 성공 → 삭제" 순서를 지킴). match_results_archive가
+    # 예전에 무한정 쌓였던 사고를 이 테이블에서 반복하지 않기 위한 필수
+    # 조치 — 절대 생략하지 말 것.
+    season_row = conn.execute(
+        "SELECT DISTINCT season FROM league_season_standings WHERE year=?",
+        (evaluation_year,)).fetchone()
+    if season_row:
+        conn.execute("DELETE FROM team_season_opp_strength WHERE season=?", (season_row[0],))
+        conn.commit()
+
     return evaluation_year + 1
 
 
@@ -1190,13 +1405,14 @@ def run_year_end_power_ranking_update(conn, evaluation_year: int):
 # ══════════════════════════════════════════════════════════════
 
 def _country_seed_entries(conn) -> list:
+    _gsy = get_game_start_year()
     countries = conn.execute("SELECT name, continent FROM countries").fetchall()
     entries = []
     for name, continent in countries:
         ps, _ = _seed_country_ab(conn, name)
         entries.append(CountryPowerEntry(
             country=name, continent=continent or "", rating=ps, rank=0, prev_rank=None,
-            ranking_year=GAME_START_YEAR, evaluation_year=GAME_START_YEAR - 1))
+            ranking_year=_gsy, evaluation_year=_gsy - 1))
     entries.sort(key=lambda e: e.rating, reverse=True)
     for i, e in enumerate(entries, start=1):
         e.rank = i
@@ -1205,9 +1421,19 @@ def _country_seed_entries(conn) -> list:
 
 def ensure_initial_country_power_ranking(conn):
     ensure_power_ranking_tables(conn)
+    # [2026-08 v3.3 버그수정, 신민용 리포트: "파워랭킹 첫 연도가 2000
+    # 고정이라 1999년으로 시작하면 그해엔 세계 랭킹 자체가 없다"] 이
+    # 시드는 "게임이 실제로 시작한 연도"에 맞춰야 하는데, 여기서 계속
+    # GAME_START_YEAR(constants.py의 고정 상수, 항상 2000)를 썼다 —
+    # 커스텀 시작 연도(예: 1999)를 골라도 시드는 여전히 2000년으로
+    # 저장돼서, 실제 게임이 도는 1999년엔 world_power_rankings에 그
+    # 해당 연도 행 자체가 없었다. database.get_game_start_year()(플레이어가
+    # 실제로 고른 시작 연도, meta 테이블에 저장됨 — 안 골랐으면 기존처럼
+    # GAME_START_YEAR로 폴백)로 교체한다.
+    _gsy = get_game_start_year()
     exists = conn.execute(
         "SELECT 1 FROM country_power_rankings WHERE ranking_year=? LIMIT 1",
-        (GAME_START_YEAR,)).fetchone()
+        (_gsy,)).fetchone()
     if exists:
         return
     for e in _country_seed_entries(conn):
@@ -1228,7 +1454,8 @@ def get_country_power_ranking_seed(conn) -> list:
 
 
 def _team_seed_entries(conn) -> list:
-    league_power_cache = compute_league_power(conn, GAME_START_YEAR - 1)
+    _gsy = get_game_start_year()
+    league_power_cache = compute_league_power(conn, _gsy - 1)
     rows = conn.execute(
         """SELECT t.id, t.name, cn.continent, cn.name, t.current_tier
            FROM teams t JOIN countries cn ON t.country_id = cn.id""").fetchall()
@@ -1238,7 +1465,7 @@ def _team_seed_entries(conn) -> list:
         entries.append(TeamPowerEntry(
             team_id=team_id, team_name=name, continent=continent or "",
             country=country or "", rating=ps, rank=0, prev_rank=None,
-            ranking_year=GAME_START_YEAR, evaluation_year=GAME_START_YEAR - 1, tier=tier))
+            ranking_year=_gsy, evaluation_year=_gsy - 1, tier=tier))
     # OVR로 이미 산출된 PS 기준 정렬 + tier 타이브레이크(1부가 2부보다 위)
     entries.sort(key=lambda e: (-e.rating, e.tier if e.tier else 99, e.team_id))
     for i, e in enumerate(entries, start=1):
@@ -1248,9 +1475,10 @@ def _team_seed_entries(conn) -> list:
 
 def ensure_initial_team_power_ranking(conn):
     ensure_power_ranking_tables(conn)
+    _gsy = get_game_start_year()
     exists = conn.execute(
         "SELECT 1 FROM team_power_rankings WHERE ranking_year=? LIMIT 1",
-        (GAME_START_YEAR,)).fetchone()
+        (_gsy,)).fetchone()
     if exists:
         return
     for e in _team_seed_entries(conn):
@@ -1366,7 +1594,7 @@ def get_latest_ranking_year(conn) -> Optional[int]:
                UNION
                SELECT ranking_year AS y FROM country_power_rankings)"""
     ).fetchone()
-    return row[0] if row and row[0] else GAME_START_YEAR
+    return row[0] if row and row[0] else get_game_start_year()
 
 
 def get_available_ranking_years(conn) -> list:

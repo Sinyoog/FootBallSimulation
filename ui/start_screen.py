@@ -5,7 +5,8 @@ import random
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QLineEdit, QComboBox, QFrame,
-    QDialog, QMessageBox, QScrollArea, QGridLayout, QTextEdit
+    QDialog, QMessageBox, QScrollArea, QGridLayout, QTextEdit,
+    QProgressBar, QApplication
 )
 from PyQt6.QtCore import Qt, QEvent
 from PyQt6.QtGui import QFont, QIntValidator
@@ -359,10 +360,17 @@ class StartScreen(QWidget):
         self.cont_btn.setEnabled(p is not None)
 
     def _new_game(self):
+        # [2026-08 수정, 신민용 요청: "진행률 창은 새 게임 버튼이 아니라
+        # '생성'/'랜덤 생성'을 누른 후에 떠야 하고, 새 게임 누르는 시점엔
+        # 바가 안 보여야 한다"] reset_game_data()(선수단 재생성, database.py
+        # _regenerate_ai_players 참고 — 약 5초 소요)를 여기서 더 이상 부르지
+        # 않는다. 예전엔 "새 게임"을 누르자마자(캐릭터 생성 창이 뜨기도
+        # 전에) 이게 실행돼서 아무 피드백 없이 몇 초간 멈춘 것처럼 보였다.
+        # 이제 NewPlayerDialog의 "생성"/"랜덤 생성" 버튼을 눌렀을 때
+        # (_regenerate_world_with_progress) 진행률 창과 함께 실행된다.
         if not _game_confirm(self, "새 게임", "기존 저장 데이터가 삭제됩니다.\n계속하시겠습니까?"):
             return
 
-        reset_game_data()
         dlg = NewPlayerDialog(self)
         if dlg.exec():
             self._open_main()
@@ -378,6 +386,83 @@ class StartScreen(QWidget):
         self.close()
 
 
+class _WorldRegenProgressWindow(QDialog):
+    """[2026-08 신설, 신민용 요청: "진행률 창은 새 게임 이후 '생성'과
+    '랜덤 생성'을 누른 후에 뜨게 해야지, 새 게임 누르는 시점엔 바가 안
+    뜨게 해야지"] NewPlayerDialog의 "✅ 생성"/"🎲 랜덤 생성" 버튼을 누른
+    직후에만 뜨는 진행률 창. reset_game_data()가 실제로 전세계 선수단을
+    재생성하는 약 5초 동안(database.py _regenerate_ai_players 참고)
+    화면이 멈춘 것처럼 보이지 않도록 진행 상황만 보여준다.
+
+    [2026-08 재수정, 신민용 요청: "game.db 삭제 후 최초 실행할 때 뜨는
+    바처럼 보이게 해달라"] main.py의 _SeedProgressWindow(최초 설치 전용)와
+    똑같은 크기(440×160)·스타일(_SEED_STYLE_MIRROR, 다크 배경+초록 진행바)
+    ·레이아웃(제목/단계 라벨/진행바/디테일 라벨)을 그대로 맞췄다 — 색상
+    수치가 어긋나면 눈에 바로 띄므로 main.py의 원본 값과 1:1로 동일하게
+    유지한다.
+
+    다만 취소 버튼만은 의도적으로 넣지 않았다 — 여기서는 이미 캐릭터
+    생성 버튼까지 누른 뒤라, 중간에 취소하면 "선수단만 절반 재생성된"
+    애매한 상태가 남을 수 있다(_SeedProgressWindow는 seed_initial_data
+    자체가 맨 끝에만 commit()해서 취소 시 rollback 한 번으로 깨끗이
+    되돌아가지만, 여기서는 reset_game_data()가 이미 팀 리셋 등 여러
+    커밋 단위를 거친 뒤라 안전하게 되돌릴 방법이 없다) — 그래서 여기는
+    끝까지 돌게 두고(닫기 버튼도 숨김), 시각적 스타일만 통일한다."""
+
+    # main.py._SEED_STYLE과 동일 — 별도 모듈로 빼면 main.py -> ui.start_screen
+    # 임포트 순서(main.py가 이미 start_screen을 임포트) 때문에 역참조가
+    # 생겨 순환 임포트가 되므로, 작은 문자열이라 그대로 복제해서 쓴다.
+    _SEED_STYLE_MIRROR = """
+QWidget { background-color: #1a1a1a; color: #e0e0e0;
+          font-family: 'Malgun Gothic', 'Apple SD Gothic Neo', sans-serif; }
+QLabel  { color: #e0e0e0; }
+QProgressBar {
+    background-color: #2a2a2a; border: 1px solid #444; border-radius: 6px;
+    height: 18px; text-align: center; color: #e0e0e0; font-size: 11px;
+}
+QProgressBar::chunk { background-color: #2a8a2a; border-radius: 5px; }
+"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("새 게임 준비 중...")
+        self.setFixedSize(440, 160)
+        self.setStyleSheet(self._SEED_STYLE_MIRROR)
+        self.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self.setWindowFlags(
+            (self.windowFlags() | Qt.WindowType.CustomizeWindowHint)
+            & ~Qt.WindowType.WindowCloseButtonHint
+            & ~Qt.WindowType.WindowContextHelpButtonHint)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 20, 24, 20)
+        lay.setSpacing(10)
+
+        title = QLabel("⚽ 새로운 세계를 만들고 있습니다")
+        title.setStyleSheet("font-size:15px; font-weight:bold;")
+        lay.addWidget(title)
+
+        self._stage_lbl = QLabel("전세계 선수단 생성 중...")
+        self._stage_lbl.setStyleSheet("font-size:13px;")
+        lay.addWidget(self._stage_lbl)
+
+        self._bar = QProgressBar()
+        self._bar.setRange(0, 100)
+        lay.addWidget(self._bar)
+
+        self._detail_lbl = QLabel("")
+        self._detail_lbl.setStyleSheet("font-size:11px; color:#888;")
+        lay.addWidget(self._detail_lbl)
+
+        lay.addStretch()
+
+    def report(self, done, total, detail):
+        self._stage_lbl.setText(f"전세계 선수단 생성 중... ({done}/{total})")
+        self._bar.setValue(int(done / total * 100) if total else 0)
+        self._detail_lbl.setText(detail or "")
+        QApplication.processEvents()
+
+
 class NewPlayerDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -385,6 +470,19 @@ class NewPlayerDialog(QDialog):
         self.setMinimumWidth(720)
         self.setStyleSheet(DARK_STYLE)
         self._build()
+
+    def _regenerate_world_with_progress(self):
+        """[2026-08 신설] "생성"/"랜덤 생성" 버튼을 누른 시점에 실제로
+        reset_game_data()(팀 전력·전세계 선수단 재생성)를 실행한다 — 예전엔
+        StartScreen._new_game()/MainWindow.do_new_game()이 이 창을 띄우기도
+        전에 미리 실행해서, 사용자 입장에선 "새 게임" 버튼을 누르자마자
+        아무 피드백 없이 몇 초간 멈춘 것처럼 보였다. 진행률 창은 이 함수가
+        도는 동안에만 뜬다."""
+        win = _WorldRegenProgressWindow(self)
+        win.show()
+        QApplication.processEvents()
+        reset_game_data(progress_cb=win.report)
+        win.close()
 
     def _build(self):
         # [2026-08 신설, 신민용 요청: "재능/신체특징/포지션/세부역할 클릭하면
@@ -889,6 +987,7 @@ class NewPlayerDialog(QDialog):
         폼의 현재 선택과 무관하게 매번 새로 굴린다 — 특정 항목만 미리
         고정하고 싶으면 '✅ 생성' 버튼을 쓰면 된다(그쪽은 선택한 값은
         그대로, 안 고른 값만 랜덤으로 채운다)."""
+        self._regenerate_world_with_progress()
         conn = get_conn()
         c = conn.cursor()
         c.execute("""SELECT id, name, flag FROM countries
@@ -948,6 +1047,7 @@ class NewPlayerDialog(QDialog):
         # 우회 경로(엔터키 등)로 호출되면 여기서 한 번 더 막는다.
         if not self.ok_btn.isEnabled():
             return
+        self._regenerate_world_with_progress()
         name = self.name_edit.text().strip()
         # 국적 먼저 확정 — 이름 자동생성(국적에 맞는 이름 뽑기)에 필요하므로,
         # 국적 선택 안 했으면(랜덤) 여기서 미리 하나 뽑아 이후 create_player

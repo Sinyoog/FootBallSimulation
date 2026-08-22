@@ -129,36 +129,6 @@ def _fetch_intl_opponents(tournament_id, my_nat, grp=None):
         })
     return result
 
-def _fetch_cl_opponents(tournament_id, my_team_id, grp=None):
-    """챔피언스리그 상대팀 목록.
-    grp 지정 시 내 조 팀만 반환 (조별리그).
-    """
-    conn = get_conn()
-    if grp:
-        rows = conn.execute(
-            "SELECT team_id, team_name, flag, ovr FROM cl_entries "
-            "WHERE tournament_id=? AND team_id!=? AND grp=?",
-            (tournament_id, my_team_id, grp)).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT team_id, team_name, flag, ovr FROM cl_entries "
-            "WHERE tournament_id=? AND team_id!=?",
-            (tournament_id, my_team_id)).fetchall()
-    conn.close()
-    result = []
-    for r in rows:
-        players = _players_for_team(r["team_id"])
-        avg = _avg_ovr(players) or round(r["ovr"] or 0)
-        result.append({
-            "team_id":   r["team_id"],
-            "name":      r["team_name"],
-            "flag":      r["flag"] or "",
-            "avg_ovr":   avg,
-            "formation": "4-4-2",
-            "players":   players,
-        })
-    return result
-
 def _fetch_intl_ko_opp(tournament_id, my_nat, week):
     conn = get_conn()
     m = conn.execute(
@@ -179,17 +149,66 @@ def _fetch_intl_ko_opp(tournament_id, my_nat, week):
              "formation": "4-4-2",
              "players": _make_intl_virtual_players(avg)}]
 
-def _fetch_cl_ko_opp(tournament_id, my_team_id, week):
+# [2026-08 신설, 신민용 리포트: "우측 상대팀 포메이션 확인 기능이 월드컵
+# 외 국제대회(클럽 월드컵)에서는 안 뜬다"] _resolve_opponents가 intl/cl만
+# 처리하고 cwc는 분기 자체가 없어서 else(리그 상대팀) 폴백으로 빠져
+# 엉뚱한(내 리그) 상대팀 목록이 뜨고 있었다 — cl_entries/cl_matches와
+# 완전히 동일한 패턴으로 cwc_entries/cwc_matches용을 추가한다.
+# [2026-08 v3.3 신설, 신민용 리포트: "챔스랑 리그가 겹치면 우측 포메이션이
+# 바뀌는 것처럼, 유로파/컨퍼런스/슈퍼컵/국내컵도 똑같이 대회 일정에 맞춰
+# 상대팀 선택지가 나와야 한다"] cl/el/ecl/cwc 4개 대회는 entries 테이블
+# 스키마가 완전히 동일(team_id, team_name, flag, ovr, grp)해서 조별리그
+# 상대 목록도 테이블 접두사만 바꾸는 공용 함수로 처리할 수 있다. 슈퍼컵은
+# sc_entries에 grp 컬럼이 아예 없어(4팀·준결승부터 시작이라 조별리그
+# 자체가 없음) 이 그룹 목록 함수는 안 쓰고 KO 조회만 쓴다.
+_CLUB_COMP_PREFIX = {"champions": "cl", "europa": "el", "conference": "ecl", "super_cup": "sc"}
+
+
+def _fetch_club_group_opponents(prefix, tournament_id, my_team_id, grp=None):
+    """cl/el/ecl/cwc 공용 — 조별(리그페이즈) 상대 목록. grp 지정 시 내 조만."""
     conn = get_conn()
+    table = f"{prefix}_entries"
+    if grp:
+        rows = conn.execute(
+            f"SELECT team_id, team_name, flag, ovr FROM {table} "
+            f"WHERE tournament_id=? AND team_id!=? AND grp=?",
+            (tournament_id, my_team_id, grp)).fetchall()
+    else:
+        rows = conn.execute(
+            f"SELECT team_id, team_name, flag, ovr FROM {table} "
+            f"WHERE tournament_id=? AND team_id!=?",
+            (tournament_id, my_team_id)).fetchall()
+    conn.close()
+    result = []
+    for r in rows:
+        players = _players_for_team(r["team_id"])
+        avg = _avg_ovr(players) or round(r["ovr"] or 0)
+        result.append({
+            "team_id":   r["team_id"],
+            "name":      r["team_name"],
+            "flag":      r["flag"] or "",
+            "avg_ovr":   avg,
+            "formation": "4-4-2",
+            "players":   players,
+        })
+    return result
+
+
+def _fetch_club_ko_opp(prefix, tournament_id, my_team_id, week):
+    """cl/el/ecl/cwc/sc 공용 — 이번 주(토너먼트/스위스리그 페이즈 등)
+    상대 1팀만. 스키마가 전부 동일(team_id/team_name/flag/ovr)해서
+    슈퍼컵(sc)도 그대로 쓸 수 있다."""
+    conn = get_conn()
+    mtable, etable = f"{prefix}_matches", f"{prefix}_entries"
     m = conn.execute(
-        "SELECT * FROM cl_matches WHERE tournament_id=? AND week=? "
-        "AND home_score=-1 AND (home_team_id=? OR away_team_id=?)",
+        f"SELECT * FROM {mtable} WHERE tournament_id=? AND week=? "
+        f"AND home_score=-1 AND (home_team_id=? OR away_team_id=?)",
         (tournament_id, week, my_team_id, my_team_id)).fetchone()
     if not m:
         conn.close(); return None
     opp_id = m["away_team_id"] if m["home_team_id"] == my_team_id else m["home_team_id"]
     e = conn.execute(
-        "SELECT team_name, flag, ovr FROM cl_entries WHERE tournament_id=? AND team_id=?",
+        f"SELECT team_name, flag, ovr FROM {etable} WHERE tournament_id=? AND team_id=?",
         (tournament_id, opp_id)).fetchone()
     conn.close()
     if not e: return None
@@ -200,11 +219,30 @@ def _fetch_cl_ko_opp(tournament_id, my_team_id, week):
              "formation": "4-4-2", "players": players}]
 
 
-# [2026-08 신설, 신민용 리포트: "우측 상대팀 포메이션 확인 기능이 월드컵
-# 외 국제대회(클럽 월드컵)에서는 안 뜬다"] _resolve_opponents가 intl/cl만
-# 처리하고 cwc는 분기 자체가 없어서 else(리그 상대팀) 폴백으로 빠져
-# 엉뚱한(내 리그) 상대팀 목록이 뜨고 있었다 — cl_entries/cl_matches와
-# 완전히 동일한 패턴으로 cwc_entries/cwc_matches용을 추가한다.
+def _fetch_cup_ko_opp(tournament_id, my_team_id, week):
+    """[2026-08 v3.3 신설] 국내컵 — 조별리그 자체가 없는 순수 토너먼트라
+    항상 이번 주 상대 1팀만. cup_entries엔 flag 컬럼이 없다(국내컵이라
+    전부 같은 나라라 애초에 불필요)."""
+    conn = get_conn()
+    m = conn.execute(
+        "SELECT * FROM cup_matches WHERE tournament_id=? AND week=? "
+        "AND home_score=-1 AND (home_team_id=? OR away_team_id=?)",
+        (tournament_id, week, my_team_id, my_team_id)).fetchone()
+    if not m:
+        conn.close(); return None
+    opp_id = m["away_team_id"] if m["home_team_id"] == my_team_id else m["home_team_id"]
+    e = conn.execute(
+        "SELECT team_name, ovr FROM cup_entries WHERE tournament_id=? AND team_id=?",
+        (tournament_id, opp_id)).fetchone()
+    conn.close()
+    if not e: return None
+    players = _players_for_team(opp_id)
+    avg = _avg_ovr(players) or round(e["ovr"] or 0)
+    return [{"team_id": opp_id, "name": e["team_name"],
+             "flag": "", "avg_ovr": avg,
+             "formation": "4-4-2", "players": players}]
+
+
 def _fetch_cwc_opponents(tournament_id, my_team_id, grp=None):
     """클럽 월드컵 상대팀 목록. grp 지정 시 내 조 팀만 반환(조별리그)."""
     conn = get_conn()
@@ -611,7 +649,14 @@ _CTX_STYLE = {
     "league":    ("color:#66ff99;", "⚽"),
     "intl_main": ("color:#ffaa33;", "🌍"),   # 월드컵/대륙컵 본선
     "intl_qual": ("color:#ff6666;", "🌍"),   # 그 외 국대(예선 등)
-    "cl":        ("color:#ffd24d;", "🏆"),
+    # [2026-08 v3.3 수정, 신민용 리포트: "챔스/유로파/컨퍼런스/슈퍼컵이
+    # 다 'cl'로 뭉뚱그려져서 챔스 색만 나온다"] center_panel.py 주간
+    # 일정 카드에 이미 적용된 cl_kind별 배색(챔피언스=블루/유로파=오렌지/
+    # 컨퍼런스=진초록+연두/슈퍼컵=골드)과 동일하게 맞춘다.
+    "champions": ("color:#4466ff;", "🏆"),
+    "europa":    ("color:#ff7700;", "🥈"),
+    "conference":("color:#215131;", "🥉"),
+    "super_cup": ("color:#ffd700;", "⭐"),
     "cwc":       ("color:#66d9ff;", "🌐"),
     "cup":       ("color:#c48aff;", "🎖️"),
 }
@@ -635,6 +680,28 @@ class FormationWidget(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 2, 0, 0)
         lay.setSpacing(4)
+
+        # ── 0행: 대회 필터 버튼(2026-08 v3.3 신설, 신민용 요청: "리그랑
+        # 챔스가 겹치는 주엔 리그를 보고 싶을 때도 있는데, 1주 단위로
+        # 돌리면 챔스 처리하는 동안 리그를 확인할 방법이 없다 — 우측에
+        # 필터를 만들어서 필터에 따라 다른 게 뜨게 해달라") 이번 주 내가
+        # 동시에 걸쳐 있는 대회가 여러 개면(예: 리그+챔스) 이 줄에 버튼이
+        # 여러 개 뜨고, 하나뿐이면(겹치는 대회가 없으면) 아예 숨겨서 예전과
+        # 화면이 동일하게 유지된다. center_panel.py가 넘겨주는 options
+        # (label, context) 목록 그대로 버튼화 — 실제 대회 판정/그날 상대가
+        # 누구인지는 여전히 center_panel이 계산해서 넘겨주고, 여긴 그 중
+        # "지금 화면에 보여줄 것"만 고르는 순수 표시 필터다(경기 진행 자체엔
+        # 영향 없음 — 어떤 대회 경기를 실제로 뛰는지는 일정이 그대로 정함).
+        self._filter_row_w = QWidget()
+        self._filter_row = QHBoxLayout(self._filter_row_w)
+        self._filter_row.setContentsMargins(0, 0, 0, 0)
+        self._filter_row.setSpacing(4)
+        self._filter_row.addStretch()   # 버튼들을 우측으로 몰아서 배치
+        self._filter_row_w.setVisible(False)
+        lay.addWidget(self._filter_row_w)
+        self._filter_btns = []   # [(QPushButton, context_dict), ...]
+        self._filter_team_id = None
+        self._filter_manager_rel = 50
 
         # ── 1행: 대회명 구분선 (에이전트/은퇴 버튼과 캔버스 사이)
         self.lbl_ctx = QLabel()
@@ -697,7 +764,52 @@ class FormationWidget(QWidget):
         hint_bar.addWidget(lh); hint_bar.addStretch(); hint_bar.addWidget(rh)
         lay.addLayout(hint_bar)
 
-    def load_team(self, team_id, context: dict = None, manager_rel: int = 50):
+    def load_team(self, team_id, context: dict = None, options: list = None, manager_rel: int = 50):
+        """options: [(label, context_dict_or_None), ...] — center_panel.py가
+        "이번 주 내가 걸쳐 있는 모든 대회"를 순서대로 넘겨준다(예: 리그+챔스가
+        겹치는 주엔 [("리그", None), ("챔피언스", {...})]). 2개 이상이면
+        필터 버튼을 보여주고, context는 그 중 "지금 자동으로 골라진 기본
+        선택"(예전 동작과 동일하게 우선순위상 가장 중요한 대회)이다."""
+        self._filter_team_id = team_id
+        self._filter_manager_rel = manager_rel
+        self._build_filter_row(options or [], context)
+        self._apply_context(team_id, context, manager_rel)
+
+    def _build_filter_row(self, options: list, active_context: dict):
+        # 기존 버튼 정리
+        for btn, _ctx in self._filter_btns:
+            btn.setParent(None)
+        self._filter_btns = []
+        if len(options) < 2:
+            self._filter_row_w.setVisible(False)
+            return
+        self._filter_row_w.setVisible(True)
+        for label, ctx in options:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setObjectName("fmFilterBtn")
+            btn.setStyleSheet("""
+                QPushButton#fmFilterBtn {
+                    background-color:#2a2a2a; color:#888888; border:1px solid #444444;
+                    padding:3px 10px; border-radius:4px; font-size:11px;
+                }
+                QPushButton#fmFilterBtn:hover { border:1px solid #777777; color:#bbbbbb; }
+                QPushButton#fmFilterBtn:checked {
+                    background-color:#2d5a2d; color:#ffffff; border:1px solid #4caf50;
+                    font-weight:bold;
+                }
+            """)
+            btn.setChecked(repr(ctx) == repr(active_context))
+            btn.clicked.connect(lambda _checked, c=ctx: self._on_filter_clicked(c))
+            self._filter_row.addWidget(btn)
+            self._filter_btns.append((btn, ctx))
+
+    def _on_filter_clicked(self, context):
+        for btn, ctx in self._filter_btns:
+            btn.setChecked(ctx is context or repr(ctx) == repr(context))
+        self._apply_context(self._filter_team_id, context, self._filter_manager_rel)
+
+    def _apply_context(self, team_id, context: dict = None, manager_rel: int = 50):
         is_intl = bool(context and context.get("intl"))
         my_nat  = context.get("my_nat", "") if is_intl else ""
 
@@ -734,7 +846,10 @@ class FormationWidget(QWidget):
                 # 동일한 규칙.
                 kind = "intl_main" if context.get("kind") in ("world", "continent") else "intl_qual"
             elif context.get("cl"):
-                kind = "cl"
+                # [2026-08 v3.3 수정] cl_kind(champions/europa/conference/
+                # super_cup)별로 색을 분리 — center_panel 주간 일정 카드와
+                # 동일한 배색 기준.
+                kind = context.get("cl_kind", "champions")
             elif context.get("cwc"):
                 kind = "cwc"
             elif context.get("cup"):
@@ -791,16 +906,27 @@ class FormationWidget(QWidget):
             # 조별리그: 내 그룹(grp)에 있는 팀만
             return _fetch_intl_opponents(tid, nat, grp=grp or None)
         elif context and context.get("cl"):
+            # [2026-08 v3.3 버그수정, 신민용 리포트: "챔스랑 리그가 겹치면
+            # 우측 포메이션이 바뀌는데, 유로파/컨퍼런스/슈퍼컵도 마찬가지로
+            # 일정에 맞게 상대가 떠야 한다"] 예전엔 cl_kind와 무관하게
+            # 무조건 챔피언스리그 테이블(cl_entries/cl_matches)만 조회해서,
+            # 실제로는 유로파/컨퍼런스/슈퍼컵 경기인데도 챔스 데이터를
+            # 잘못 보여주거나(우연히 tournament_id가 겹치면) 빈 목록이
+            # 떴다. cl_kind로 올바른 테이블 접두사를 골라서 조회한다.
+            cl_kind = context.get("cl_kind", "champions")
+            prefix  = _CLUB_COMP_PREFIX.get(cl_kind, "cl")
             tid   = context["tournament_id"]
             stage = context.get("stage", "group")
             week  = context.get("week", 0)
             grp   = context.get("grp", "")
-            if stage != "group":
-                # 플레이오프/토너먼트: 이번 주 상대 1팀만
-                res = _fetch_cl_ko_opp(tid, team_id, week)
+            if stage != "group" or prefix == "sc":
+                # 토너먼트/스위스리그 페이즈(유로파·컨퍼런스는 애초에
+                # "group"이 아니라 "league"로 넘어옴)나 슈퍼컵(조별리그
+                # 자체가 없음): 이번 주 상대 1팀만.
+                res = _fetch_club_ko_opp(prefix, tid, team_id, week)
                 if res: return res
-            # 조별리그: 내 그룹(grp)에 있는 팀만
-            return _fetch_cl_opponents(tid, team_id, grp=grp or None)
+            # 챔피언스리그의 실제 조별리그 단계: 내 조에 있는 팀만.
+            return _fetch_club_group_opponents(prefix, tid, team_id, grp=grp or None)
         elif context and context.get("cwc"):
             tid   = context["tournament_id"]
             stage = context.get("stage", "group")
@@ -810,6 +936,14 @@ class FormationWidget(QWidget):
                 res = _fetch_cwc_ko_opp(tid, team_id, week)
                 if res: return res
             return _fetch_cwc_opponents(tid, team_id, grp=grp or None)
+        elif context and context.get("cup"):
+            # [2026-08 v3.3 신설] 예전엔 국내컵 context 분기 자체가 없어서
+            # else(리그 상대팀) 폴백으로 빠져 엉뚱한(내 리그) 상대팀 목록이
+            # 떴다 — 국내컵은 조별리그가 없는 순수 토너먼트라 항상 이번 주
+            # 상대 1팀만 보여준다.
+            tid  = context["tournament_id"]
+            week = context.get("week", 0)
+            return _fetch_cup_ko_opp(tid, team_id, week) or []
         else:
             conn = get_conn()
             row = conn.execute("SELECT league_id FROM teams WHERE id=?", (team_id,)).fetchone()

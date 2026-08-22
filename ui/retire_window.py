@@ -1971,6 +1971,12 @@ class RetireWindow(QDialog):
     def _open_story_book(self):
         """story_generator.py(로컬 문장 뱅크 기반, API 비사용)로 장문
         연대기를 만들어 책 형태의 새 창(StoryBookWindow)으로 띄운다."""
+        # [2026-08 신설, 신민용 요청: "같은 종류의 창은 하나만"] 이미 열려
+        # 있으면 새로 생성하지 않고(비용이 드는 문장 생성도 건너뛰고)
+        # 기존 창을 앞으로 가져온다.
+        if getattr(self, "_book_win", None) is not None:
+            self._book_win.raise_(); self._book_win.activateWindow()
+            return
         self.book_btn.setEnabled(False)
         self.book_btn.setText("⏳ 생성 중...")
         try:
@@ -1984,6 +1990,10 @@ class RetireWindow(QDialog):
 
             from ui.story_book_window import StoryBookWindow
             self._book_win = StoryBookWindow(p.get("name", "선수"), story_text, parent=self)
+
+            def _clear_book(*_a):
+                self._book_win = None
+            self._book_win.finished.connect(_clear_book)
             self._book_win.show()
         finally:
             self.book_btn.setEnabled(True)

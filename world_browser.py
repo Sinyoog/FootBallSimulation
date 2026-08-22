@@ -1836,6 +1836,100 @@ def get_intl_tournament_detail(tournament_id):
     return {"groups": groups, "knockout": knockout, "qualified": qualified}
 
 
+def get_country_intl_match_log(tournament_id, country_name):
+    """[2026-08 신설, 신민용 요청: "국가 검색에서 연도를 클릭하면 그 대회의
+    실제 경기 기록(조별리그 몇 대 몇, 16강 상대는 누구였는지 등)이 바로
+    아래에 펼쳐지게 해달라"] get_country_tournament_results()가 이미
+    계산해두는 "N승 N무 N패" 합계(record)를, 이 국가 관점에서 라운드별
+    개별 경기(상대·스코어·승/무/패)로 풀어서 반환한다. 같이 group_standings
+    (이 국가가 속한 조의 순위표, get_intl_tournament_detail의 groups 계산과
+    동일한 로직을 그 조 하나에만 적용)도 함께 담아 화면이 예시로 보여준
+    "조 순위표 + 라운드별 상대전적" 두 부분을 그대로 구성할 수 있게 한다."""
+    from intl_engine import STAGE_KO
+    conn = get_conn(); c = conn.cursor()
+
+    grp_row = c.execute(
+        "SELECT grp FROM intl_entries WHERE tournament_id=? AND country=?",
+        (tournament_id, country_name)).fetchone()
+    my_group = grp_row["grp"] if grp_row and grp_row["grp"] else None
+
+    group_standings = None
+    if my_group:
+        entries = [dict(r) for r in c.execute(
+            "SELECT country, flag, grade FROM intl_entries "
+            "WHERE tournament_id=? AND grp=?", (tournament_id, my_group)).fetchall()]
+        table = {e["country"]: {**e, "wins": 0, "draws": 0, "losses": 0, "gf": 0, "ga": 0}
+                 for e in entries}
+        for m in c.execute(
+                "SELECT home, away, home_score, away_score FROM intl_matches "
+                "WHERE tournament_id=? AND grp=? AND stage IN ('group','qual_group') "
+                "AND home_score>=0", (tournament_id, my_group)).fetchall():
+            h, a = table.get(m["home"]), table.get(m["away"])
+            if not h or not a:
+                continue
+            h["gf"] += m["home_score"]; h["ga"] += m["away_score"]
+            a["gf"] += m["away_score"]; a["ga"] += m["home_score"]
+            if m["home_score"] > m["away_score"]:   h["wins"] += 1;  a["losses"] += 1
+            elif m["home_score"] < m["away_score"]: a["wins"] += 1;  h["losses"] += 1
+            else:                                   h["draws"] += 1; a["draws"] += 1
+        rows = list(table.values())
+        for t in rows:
+            t["pts"] = t["wins"] * 3 + t["draws"]
+            t["gd"] = t["gf"] - t["ga"]
+        rows.sort(key=lambda t: (-t["pts"], -t["gd"], -t["gf"]))
+        group_standings = {"group": my_group, "rows": rows}
+
+    conn.close()
+
+    # [2026-08 신설, 신민용 요청: "국가 검색으로 들어온 인라인 조 순위표에도
+    # (기존 대회 전체 팝업처럼) 진출/탈락 표시가 있어야 한다"] 조 하나만
+    # 놓고 진출 여부를 새로 판정하지 않고, 이미 검증된
+    # get_intl_tournament_detail()의 qualified 계산(예선 특수룰까지 처리된)을
+    # 그대로 재사용한다 — 전체 대회 기준으로 한 번 계산해서 그중 내 조에
+    # 해당하는 이름만 걸러 쓰면 되므로, 로직 중복 없이 항상 일관된다.
+    if group_standings is not None:
+        full_detail = get_intl_tournament_detail(tournament_id)
+        group_standings["qualified"] = full_detail.get("qualified") or set()
+
+    conn = get_conn(); c = conn.cursor()
+    match_rows = [dict(r) for r in c.execute(
+        "SELECT stage, home, away, home_score, away_score, pso_winner, pso_score "
+        "FROM intl_matches WHERE tournament_id=? AND (home=? OR away=?) "
+        "AND home_score>=0 ORDER BY id",
+        (tournament_id, country_name, country_name)).fetchall()]
+    conn.close()
+
+    stage_order = {"group": -2, "qual_group": -2}
+    for i, s in enumerate(_INTL_KO_STAGE_ORDER):
+        stage_order[s] = i
+    by_stage = {}
+    for m in match_rows:
+        by_stage.setdefault(m["stage"], []).append(m)
+
+    stages = []
+    for stage in sorted(by_stage.keys(), key=lambda s: stage_order.get(s, 99)):
+        matches = []
+        for m in by_stage[stage]:
+            is_home = (m["home"] == country_name)
+            opp = m["away"] if is_home else m["home"]
+            my_score = m["home_score"] if is_home else m["away_score"]
+            opp_score = m["away_score"] if is_home else m["home_score"]
+            pso = m.get("pso_winner")
+            if my_score > opp_score or (my_score == opp_score and pso == country_name):
+                result = "승"
+            elif my_score < opp_score or (my_score == opp_score and pso and pso != country_name):
+                result = "패"
+            else:
+                result = "무"
+            matches.append({"opponent": opp, "my_score": my_score,
+                             "opp_score": opp_score, "result": result,
+                             "pso": bool(pso), "pso_score": m.get("pso_score") or ""})
+        stages.append({"stage": stage, "stage_ko": STAGE_KO.get(stage, stage),
+                        "matches": matches})
+
+    return {"group_standings": group_standings, "stages": stages}
+
+
 def get_wc_qualifier_summary(wc_year):
     """이 월드컵(연도)의 대륙별 예선 통과국 목록 (qual_results 기반 요약).
     [주의] 조별리그 단위 상세가 아니라 '최종 통과국 명단'까지만 제공한다.

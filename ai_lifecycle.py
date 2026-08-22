@@ -993,7 +993,19 @@ def _estimate_ai_transfer_fee_display(p_entry, old_tid, new_tid, year, team_row_
     team_row_by_tid: {tid: team_row_dict} — 예전엔 teams 리스트를 매번
     선형탐색(최대 2회)하고 팀명도 별도 SQL SELECT 2회로 조회했는데
     (신민용 리포트: "이적루프 렉" 조사 중 발견), 호출부에서 만든 tid→row
-    딕셔너리를 그대로 받아 전부 O(1) 조회로 바꾼다 — 결과는 동일."""
+    딕셔너리를 그대로 받아 전부 O(1) 조회로 바꾼다 — 결과는 동일.
+
+    [2026-08 버그수정, 신민용+GPT 리포트: "OVR99 선수가 아틀레티코 마드리드
+    → 알코벤다스 CF인데 6276억이면 이상하다"] estimate_transfer_fee()에
+    country/team_id를 안 넘기고 있었다 — economy.py 쪽 로직 자체는 멀쩡한데
+    (country and tier)가 False가 되어 구단 지불여력 상한(affordability
+    cap)이 아예 통째로 건너뛰어지고 있었다(디버그로 직접 확인:
+    affordability_cap=None). 명문/체급 보정도 team_id가 없어서 전부 중립
+    (1.0) 처리됐다 — 방금 승격한 약체 구단이어도 "표시용 이적료"에서는
+    부자 구단과 똑같이 취급됐다는 뜻. dst_row에 이미 cname(국가명)과
+    tid(팀ID)가 있으므로 그대로 넘기기만 하면 된다 — 실제 이적(어느
+    팀으로 가는지, 스탯이 어떻게 바뀌는지)에는 영향 없음, 오직 이
+    로그 한 줄의 "예상 이적료" 표시값만 정확해진다."""
     if p_entry.get("ovr", 0) < 70:
         return None   # 너무 낮은 OVR은 계산 자체를 생략(성능/의미 둘 다 낮음)
     try:
@@ -1004,6 +1016,7 @@ def _estimate_ai_transfer_fee_display(p_entry, old_tid, new_tid, year, team_row_
             return None
         grade = get_country_league_grade(dst_row["cname"])
         fee = estimate_transfer_fee(grade, dst_row["tier"], p_entry["ovr"],
+                                    country=dst_row["cname"], team_id=new_tid,
                                     position=p_entry.get("position"), year=year)
         if not fee or (p_entry.get("ovr", 0) < 85 and fee < 5_000_000):  # 50억(천원단위) 미만이면 스킵
             return None

@@ -270,11 +270,10 @@ class MainWindow(QMainWindow):
                                    (p["current_team_id"],)).fetchone()
                 conn.close()
                 if row: txt += f"  |  {row['name']}"
-            txt += f"  |  {p['name']} {p['age']}세  |  OVR {p['ovr']}"
-            txt += f"  |  에이전트[{p.get('agent_grade','F')}]"
+            txt += f"  |  {p['name']} {p['age']}세"
         else:
             txt = f"{year}  |  S{season} W{week}  |  [{phase}]"
-            txt += f"  |  {p['name']} {p['age']}  |  OVR {p['ovr']}"
+            txt += f"  |  {p['name']} {p['age']}"
 
         self.top_label.setText(txt)
 
@@ -288,14 +287,30 @@ class MainWindow(QMainWindow):
         self.refresh_all()
 
     def _show_career(self):
+        # [2026-08 신설, 신민용 요청: "같은 종류의 창은 하나만"]
+        if getattr(self, "_career_win", None) is not None:
+            self._career_win.raise_(); self._career_win.activateWindow()
+            return
         from ui.career_window import CareerWindow
         self._career_win = CareerWindow(self.lang, self)
+
+        def _clear_career(*_a):
+            self._career_win = None
+        self._career_win.finished.connect(_clear_career)
         self._career_win.show()
 
     def go_to_start(self):
-        """데이터 초기화 후 현재 창을 시작 화면 UI로 완전 교체."""
+        """데이터 초기화 후 현재 창을 시작 화면 UI로 완전 교체.
+        [2026-08 버그수정, 신민용 리포트: "은퇴 후 '시작 화면으로'를 누르면
+        진행률 창도 없이 5초 정도 멈춘다"] reset_game_data()가
+        _regenerate_ai_players(전세계 선수단 재생성, ~5초)를 포함하게 된
+        뒤로 이 호출도 같이 느려졌는데, 여기선 아직 새 선수단이 필요
+        없다(그냥 시작 메뉴로 돌아갈 뿐) — skip_ai_regen=True로 그 부분만
+        건너뛴다. 실제 재생성은 사용자가 "새 게임"→"생성"/"랜덤 생성"을
+        누르는 시점에 NewPlayerDialog._regenerate_world_with_progress가
+        진행률 창과 함께 정식으로 수행한다."""
         from database import reset_game_data
-        reset_game_data()
+        reset_game_data(skip_ai_regen=True)
         self._show_start_ui()
 
     def _show_start_ui(self):
@@ -380,9 +395,15 @@ class MainWindow(QMainWindow):
                   geo.center().y() - self.height() // 2)
 
         def do_new_game():
+            # [2026-08 수정, 신민용 요청: "진행률 창은 새 게임 버튼이 아니라
+            # '생성'/'랜덤 생성'을 누른 후에 떠야 하고, 새 게임 누르는
+            # 시점엔 바가 안 보여야 한다"] reset_game_data()를 여기서
+            # 더 이상 부르지 않는다 — NewPlayerDialog의 "생성"/"랜덤 생성"
+            # 버튼을 눌렀을 때(_regenerate_world_with_progress) 진행률
+            # 창과 함께 실행된다. start_screen.py의 StartScreen._new_game()과
+            # 완전히 동일한 패턴.
             if not _game_confirm(self, "새 게임", "기존 저장 데이터가 삭제됩니다.\n계속하시겠습니까?"):
                 return
-            reset_game_data()
             from ui.start_screen import NewPlayerDialog
             dlg = NewPlayerDialog(self)
             if dlg.exec():

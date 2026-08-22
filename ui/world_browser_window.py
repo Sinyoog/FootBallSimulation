@@ -22,9 +22,8 @@ from PyQt6.QtCore import Qt, QTimer, QRect, QSize
 from PyQt6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter, QShortcut, QKeySequence
 
 import world_browser as wb
-from database import get_conn
+from database import get_conn, get_game_start_year
 import power_ranking as pr
-from constants import GAME_START_YEAR
 
 # [2026-08 신설, 신민용 리포트: "복사하면 국기/국가/부수까지 같이 복사된다,
 # 팀명만 복사되게 해달라"] 셀 화면 텍스트("🇺🇸 토론토 FC (미국)", "보루시아
@@ -332,10 +331,17 @@ class WorldBrowserWindow(QDialog):
         self.tabs = tabs
         lay.addWidget(tabs, 1)
 
-        # [2026-08 계측 추가, 신민용 리포트: "세계기록실도 클릭할 때 렉있어"]
-        # 경기일정 창과 동일한 구조(탭 여러 개를 __init__에서 전부 동기로
-        # 그린 뒤에야 창이 뜸) — 어느 탭이 무거운지 원인 확정 전이므로
-        # 로직은 그대로 두고 구간별 시간만 찍는다.
+        # [2026-08 v3.5 재수정, 신민용 리포트: "세계기록실 열 때 끊기면서
+        # 열린다"] 원인이 계측(위 주석의 [PERF-WORLD] 로그)으로 이미
+        # 잡혀 있었다 — 탭 13개를 전부 __init__ 안에서 동기로 그린 뒤에야
+        # 창이 화면에 뜨는 구조라, 그 시간만큼 앱 전체가 얼어붙어 보인다.
+        # 리그검색/팀검색/컵대회검색 3개는 showEvent 직후 _ensure_all_
+        # lists_fit()이 self.league_list/team_list/cup_country_list를
+        # 바로 참조하므로 그대로 즉시(eager) 빌드하고, 나머지 10개
+        # (역대 대회 기록·국가검색·파워랭킹 — 처음 열 때 바로 안 봐도
+        # 되는 탭들)는 플레이스홀더만 넣어뒀다가 사용자가 그 탭을 실제로
+        # 클릭하는 순간에만 빌드한다(_lazy_show_wb_tab). 창이 뜨는 데
+        # 걸리는 시간이 "탭 13개 빌드"에서 "탭 3개 빌드"로 줄어든다.
         import time as _time_wb
         _wb_t0 = _time_wb.perf_counter()
         _wb_marks = []
@@ -346,23 +352,26 @@ class WorldBrowserWindow(QDialog):
         _wb_marks.append(("팀검색", _time_wb.perf_counter()))
         tabs.addTab(self._build_cup_tab(), "🎖 컵대회 검색")
         _wb_marks.append(("컵대회검색", _time_wb.perf_counter()))
-        tabs.addTab(self._build_cl_tab(), "🏆 역대 챔피언스리그")
-        tabs.addTab(self._build_el_tab(), "🥈 역대 유로파리그")
-        tabs.addTab(self._build_ecl_tab(), "🥉 역대 컨퍼런스리그")
-        tabs.addTab(self._build_sc_tab(), "🏵 역대 슈퍼컵")
-        _wb_marks.append(("역대챔스", _time_wb.perf_counter()))
-        tabs.addTab(self._build_cwc_tab(), "🌍 역대 클럽 월드컵")
-        _wb_marks.append(("역대CWC", _time_wb.perf_counter()))
-        tabs.addTab(self._build_wc_tab(), "🌐 역대 월드컵")
-        _wb_marks.append(("역대월드컵", _time_wb.perf_counter()))
-        tabs.addTab(self._build_nc_tab(), "🎖 역대 네이션스컵")
-        _wb_marks.append(("역대네이션스컵", _time_wb.perf_counter()))
-        tabs.addTab(self._build_region_tab(), "🌏 역대 지역컵")
-        _wb_marks.append(("역대지역컵", _time_wb.perf_counter()))
-        tabs.addTab(self._build_country_tab(), "🌍 국가 검색")
-        _wb_marks.append(("국가검색", _time_wb.perf_counter()))
-        tabs.addTab(self._build_power_ranking_tab(), "📊 파워랭킹")
-        _wb_marks.append(("파워랭킹", _time_wb.perf_counter()))
+
+        self._wb_lazy_builders = {}   # {tab_index: (builder_fn, label)}
+        _lazy_tabs = [
+            (self._build_cl_tab,           "🏆 역대 챔피언스리그"),
+            (self._build_el_tab,           "🥈 역대 유로파리그"),
+            (self._build_ecl_tab,          "🥉 역대 컨퍼런스리그"),
+            (self._build_sc_tab,           "🏵 역대 슈퍼컵"),
+            (self._build_cwc_tab,          "🌍 역대 클럽 월드컵"),
+            (self._build_wc_tab,           "🌐 역대 월드컵"),
+            (self._build_nc_tab,           "🎖 역대 네이션스컵"),
+            (self._build_region_tab,       "🌏 역대 지역컵"),
+            (self._build_country_tab,      "🌍 국가 검색"),
+            (self._build_power_ranking_tab,"📊 파워랭킹"),
+        ]
+        for builder, label in _lazy_tabs:
+            placeholder = QWidget()
+            idx = tabs.addTab(placeholder, label)
+            self._wb_lazy_builders[idx] = (builder, label)
+        tabs.currentChanged.connect(self._lazy_show_wb_tab)
+        _wb_marks.append(("(나머지 10개 지연 배치)", _time_wb.perf_counter()))
 
         _wb_total = _wb_marks[-1][1] - _wb_t0
         if _wb_total >= 0.05:
@@ -378,6 +387,29 @@ class WorldBrowserWindow(QDialog):
         close_btn.clicked.connect(self.close)
         lay.addWidget(close_btn)
         self._first_show_done = False
+
+    def _lazy_show_wb_tab(self, idx):
+        """[2026-08 v3.5 신설] 지연 배치해둔 탭을 처음 클릭하는 순간에만
+        실제로 빌드해서 그 자리(같은 인덱스)에 끼워 넣는다 — 이미 빌드된
+        탭이면 아무 것도 안 한다."""
+        pending = self._wb_lazy_builders.get(idx)
+        if not pending:
+            return
+        builder, label = pending
+        del self._wb_lazy_builders[idx]
+        import time as _time_wb
+        _t0 = _time_wb.perf_counter()
+        real_widget = builder()
+        _elapsed = _time_wb.perf_counter() - _t0
+        if _elapsed >= 0.05:
+            print(f"[PERF-WORLD] 지연 탭 '{label}' 빌드 {_elapsed:.3f}s")
+        old_widget = self.tabs.widget(idx)
+        self.tabs.blockSignals(True)
+        self.tabs.removeTab(idx)
+        self.tabs.insertTab(idx, real_widget, label)
+        self.tabs.setCurrentIndex(idx)
+        self.tabs.blockSignals(False)
+        old_widget.deleteLater()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -544,13 +576,16 @@ class WorldBrowserWindow(QDialog):
     # 배치: 리그명·국가명·팀명 검색창(각 탭의 filt 행) 바로 아래가 아니라,
     # 우측 상세 패널의 "← 왼쪽에서 OO을 선택하세요" 타이틀 바로 위에 둔다
     # (신민용 확인 요청).
-    def _build_recent_search_row(self, kind, search_box, list_widget, name_from_item_fn, select_fn):
+    def _build_recent_search_row(self, kind, search_box, list_widget, name_from_item_fn, select_fn,
+                                  refresh_fn=None, debounce_timer=None):
         """search_box: 이 탭의 QLineEdit(검색창). list_widget: 이 탭의
         QListWidget. name_from_item_fn(item): 리스트 항목에서 "깨끗한"
         이름(국기/등급 등 장식 없이)을 뽑아내는 함수. select_fn(item):
         그 항목을 실제로 선택했을 때 쓰는 기존 핸들러(_on_league_selected 등)
         — 최근 검색 버튼을 클릭하면 이 함수를 그대로 다시 호출해서 "그
         항목을 클릭해서 들어간 것"과 동일하게 동작하게 한다.
+        refresh_fn/debounce_timer: 이 탭의 검색창 디바운스 타이머와, 타이머가
+        만료됐을 때 호출하는 리스트 재구성 함수(예: _refresh_country_search_list).
 
         [2026-08 수정, 신민용 리포트: "내가 입력한 것보다 클릭해서 들어간
         애들이 뜨는 게 맞다 — '치주'라고 쳐서 '치주물루 유나이티드 FC'를
@@ -559,7 +594,21 @@ class WorldBrowserWindow(QDialog):
         만료)에 그 입력 문자열 자체를 기록했다 — 이제는 그 시점엔 아무것도
         기록하지 않고, 실제로 리스트에서 항목을 클릭해 들어갔을 때(각 탭의
         _on_*_selected 안)만 그 항목의 정식 이름을 기록한다. 리그/팀/국가
-        3곳 다 같은 규칙."""
+        3곳 다 같은 규칙.
+
+        [2026-08 재수정, 신민용 리포트: "최근 검색을 한 번 누르면 검색창엔
+        이름이 채워지고 왼쪽 목록도 그 이름만 남는데, 오른쪽 상세 화면은
+        그대로다 — 한 번 더 눌러야 오른쪽이 바뀐다"] 원인: search_box.setText(q)는
+        textChanged를 거쳐 250ms 디바운스 타이머만 재시작할 뿐, list_widget은
+        그 타이머가 만료돼야 실제로 다시 채워진다 — 그런데 바로 다음 줄의
+        "이름이 일치하는 항목 찾기" 루프는 그 250ms를 기다리지 않고 곧바로
+        (아직 안 걸러진, 즉 이전 필터 상태 그대로인) list_widget을 뒤지다 보니
+        찾는 이름이 그 안에 없어 select_fn이 아예 호출되지 않는 경우가
+        흔했다(그래서 오른쪽이 안 바뀜) — 그 뒤 250ms가 지나 디바운스가
+        list_widget을 갱신해서 왼쪽엔 정상적으로 그 이름만 남았던 것.
+        이제 refresh_fn이 주어지면 대기 중인 디바운스를 멈추고 그 자리에서
+        즉시 동기적으로 리스트를 다시 채운 뒤에 이름을 찾으므로, 첫 클릭
+        만으로 왼쪽 목록도 오른쪽 상세도 한 번에 정확히 갱신된다."""
         row = QWidget()
         h = QHBoxLayout(row)
         h.setContentsMargins(0, 0, 0, 6)
@@ -590,9 +639,15 @@ class WorldBrowserWindow(QDialog):
         h.addWidget(reset_btn)
 
         def _pick(q):
-            # 검색창에 그 이름을 채워 목록을 좁힌 뒤, 정확히 일치하는
-            # 항목을 찾아 실제로 클릭해 들어간 것처럼 select_fn을 호출한다.
+            # 검색창에 그 이름을 채우고, 대기 중이던 디바운스를 멈춘 뒤
+            # 목록을 그 자리에서 즉시 다시 채운다(비동기 250ms를 기다리지
+            # 않음) — 그래야 바로 아래에서 정확히 일치하는 항목을 찾아
+            # 실제로 클릭해 들어간 것처럼 select_fn을 호출할 수 있다.
             search_box.setText(q)
+            if debounce_timer is not None:
+                debounce_timer.stop()
+            if refresh_fn is not None:
+                refresh_fn()
             for i in range(list_widget.count()):
                 it = list_widget.item(i)
                 if name_from_item_fn(it) == q:
@@ -741,7 +796,8 @@ class WorldBrowserWindow(QDialog):
         self._league_recent_row = self._build_recent_search_row(
             "league", self.search_box, self.league_list,
             lambda it: it.data(_CLEAN_TEXT_ROLE),
-            self._on_league_selected)
+            self._on_league_selected,
+            refresh_fn=self._refresh_league_list, debounce_timer=self._search_debounce)
         right_lay.addWidget(self._league_recent_row)
 
         title_row = QHBoxLayout()
@@ -1674,7 +1730,8 @@ class WorldBrowserWindow(QDialog):
         self._team_recent_row = self._build_recent_search_row(
             "team", self.team_search_box, self.team_list,
             lambda it: it.data(Qt.ItemDataRole.UserRole + 1),
-            self._on_team_selected)
+            self._on_team_selected,
+            refresh_fn=self._refresh_team_list, debounce_timer=self._team_search_debounce)
         right_lay.addWidget(self._team_recent_row)
 
         # [2026-08 신설, 신민용 요청: "팀 검색 상세에 복사하기 버튼을 만들어서
@@ -2385,7 +2442,8 @@ class WorldBrowserWindow(QDialog):
         self._country_recent_row = self._build_recent_search_row(
             "country", self.country_search_box, self.country_list,
             lambda it: it.data(Qt.ItemDataRole.UserRole),
-            self._on_country_selected)
+            self._on_country_selected,
+            refresh_fn=self._refresh_country_search_list, debounce_timer=self._country_search_debounce)
         right_lay.addWidget(self._country_recent_row)
         title_row = QHBoxLayout()
         self.country_detail_title = QLabel("← 왼쪽에서 국가를 선택하세요")
@@ -2467,9 +2525,15 @@ class WorldBrowserWindow(QDialog):
             4, QHeaderView.ResizeMode.ResizeToContents)
         self.country_detail_tbl.horizontalHeader().setSectionResizeMode(
             5, QHeaderView.ResizeMode.ResizeToContents)
-        self.country_detail_tbl.cellDoubleClicked.connect(self._open_country_title_detail)
+        # [2026-08 신설, 신민용 요청: "연도를 클릭하면 그 대회의 실제 경기
+        # 기록(조 순위표+라운드별 상대·스코어)이 바로 아래에 펼쳐지게
+        # 해달라"] 기존엔 더블클릭으로 별도 팝업(TournamentDetailDialog,
+        # 전체 참가국 기준)을 열었는데, 이 표는 특정 국가 하나를 보는
+        # 화면이라 그 국가 관점의 경기 로그를 표 안에서 바로 펼쳐 보여주는
+        # 쪽이 요청에 맞다 — 팝업 대신 인라인 확장으로 교체.
+        self.country_detail_tbl.cellClicked.connect(self._on_country_detail_cell_clicked)
         right_lay.addWidget(self.country_detail_tbl, 1)
-        hint = QLabel("💡 우승 기록을 더블클릭하면 그 대회 상세를 볼 수 있어요")
+        hint = QLabel("💡 연도를 클릭하면 이 국가의 경기 기록이 펼쳐지고, 대회명을 클릭하면 대회 전체 일정을 볼 수 있어요")
         hint.setStyleSheet("color:#666;font-size:10px;")
         right_lay.addWidget(hint)
 
@@ -2658,6 +2722,11 @@ class WorldBrowserWindow(QDialog):
     }
 
     def _refresh_country_detail_table(self, *_a):
+        # [2026-08 신설] 필터가 바뀌거나 다른 국가를 선택하면 표를 통째로
+        # 다시 채우므로, 펼쳐져 있던 경기 기록 행이 있으면 먼저 접어서
+        # (span/cellWidget이 낡은 행 인덱스를 참조한 채 남아있지 않도록)
+        # 상태를 깨끗하게 정리한 뒤 다시 그린다.
+        self._collapse_country_detail_row()
         results = getattr(self, "_country_all_results", None) or []
         group_key = self.country_result_kind_combo.currentData()
         if group_key:
@@ -2770,6 +2839,12 @@ class WorldBrowserWindow(QDialog):
         if not results:
             lines.append("(참가 기록 없음)")
         else:
+            # [2026-08 신설, 신민용 요청: "기록복사를 하면 (연도를 펼쳐보지
+            # 않았어도) 조 순위표·라운드별 상대·스코어까지 포함되게 해달라"]
+            # 화면에서 펼쳐야 보이는 _build_country_year_detail_widget과
+            # 같은 데이터(get_country_intl_match_log)를 모든 기록에 대해
+            # 무조건 조회해서, 복사 텍스트에는 펼침 여부와 무관하게 항상
+            # 전부 들어가게 한다.
             for t in results:
                 try:
                     tname_ = t.get("name") or "-"
@@ -2781,6 +2856,29 @@ class WorldBrowserWindow(QDialog):
                     rank = year_rank.get(t.get("year"))
                     rank_txt = f" | 순위: {rank}위" if rank else ""
                     lines.append(f"{t.get('year')}년{rank_txt} | {tname_} [{kind_label}] : {result}{rec_txt}")
+
+                    tid = t.get("id")
+                    if tid is None:
+                        continue
+                    log = wb.get_country_intl_match_log(tid, name)
+                    gs = log.get("group_standings")
+                    if gs and gs.get("rows"):
+                        lines.append(f"  ㄴ {gs['group']}조 순위표:")
+                        for rank_i, gr in enumerate(gs["rows"]):
+                            mark = " ★" if gr["country"] == name else ""
+                            lines.append(
+                                f"     {rank_i+1}. {gr['country']} "
+                                f"{gr['wins']}승{gr['draws']}무{gr['losses']}패 "
+                                f"(득실 {gr['gd']:+d}, 승점 {gr['pts']}){mark}")
+                    for stage in (log.get("stages") or []):
+                        for m in stage["matches"]:
+                            score_txt = f"{m['my_score']}:{m['opp_score']}"
+                            if m.get("pso"):
+                                pso_score = m.get("pso_score") or ""
+                                score_txt += f"(승부차기 {pso_score})" if pso_score else "(승부차기)"
+                            lines.append(
+                                f"  ㄴ {stage['stage_ko']} vs {m['opponent']} "
+                                f"{m['result']} {score_txt}")
                 except Exception:
                     continue
 
@@ -2792,7 +2890,198 @@ class WorldBrowserWindow(QDialog):
         if tid is None:
             return
         wc = item.data(Qt.ItemDataRole.UserRole + 1) == "world"
-        self._open_intl_detail(self.country_detail_tbl, row, wc=wc)
+        # [2026-08 신설, 신민용 요청: "국가 검색으로 들어와서 대회명을
+        # 클릭해 전체 팝업을 열면, 그 안에서도 지금 보고 있는 국가 이름이
+        # 금색으로 표시돼야 한다"] 지금 국가 검색에서 선택된 국가
+        # (_country_copy_name)를 넘겨서 팝업의 조 순위표에도 하이라이트를
+        # 적용한다 — 월드컵/네이션스컵 탭 등 다른 진입 경로에서는 이
+        # 파라미터를 안 넘기므로(highlight_country=None) 기존처럼 아무
+        # 하이라이트 없이 그대로 뜬다.
+        country = getattr(self, "_country_copy_name", None)
+        self._open_intl_detail(self.country_detail_tbl, row, wc=wc,
+                                highlight_country=country)
+
+    # [2026-08 신설, 신민용 요청] 국가 검색 "연도" 칸 클릭 → 그 대회의
+    # 실제 경기 기록(조 순위표 + 라운드별 상대·스코어)을 표 안에 바로 아래
+    # 행으로 펼쳐 보여준다. 이미 펼쳐진 연도를 다시 클릭하면 접힌다.
+    def _collapse_country_detail_row(self):
+        exp = getattr(self, "_country_expanded", None)
+        if not exp:
+            return
+        tbl = self.country_detail_tbl
+        detail_row = exp.get("detail_row")
+        if detail_row is not None and 0 <= detail_row < tbl.rowCount():
+            tbl.removeRow(detail_row)
+        self._country_expanded = None
+
+    def _on_country_detail_cell_clicked(self, row, col):
+        # [2026-08 신설, 신민용 요청: "대회명을 클릭하면 그 대회 전체 일정
+        # (예전에 보여주던 팝업)이 떠야 한다"] 연도(0번)는 이 국가 관점의
+        # 인라인 경기기록 토글, 대회명(2번)은 원래대로 대회 전체(전 참가국
+        # 조편성+토너먼트 대진) 팝업을 그대로 연다 — 서로 다른 목적이라
+        # 컬럼으로 분리한다.
+        if col == 2:
+            self._open_country_title_detail(row, col)
+            return
+        if col != 0:
+            return
+        tbl = self.country_detail_tbl
+        item = tbl.item(row, 0)
+        if not item:
+            return
+        tid = item.data(Qt.ItemDataRole.UserRole)
+        if tid is None:
+            return
+        exp = getattr(self, "_country_expanded", None)
+        same_year = bool(exp) and exp.get("tid") == tid
+        # 이미 다른 연도가 펼쳐져 있으면 먼저 접는다(한 번에 하나만 펼침) —
+        # 접으면 그 아래 행들이 위로 당겨져 인덱스가 바뀔 수 있으므로,
+        # 이후 목표 행은 tid로 다시 찾아낸다(아래 참고).
+        self._collapse_country_detail_row()
+        if same_year:
+            return
+
+        target_row = None
+        for r in range(tbl.rowCount()):
+            it = tbl.item(r, 0)
+            if it and it.data(Qt.ItemDataRole.UserRole) == tid:
+                target_row = r
+                break
+        if target_row is None:
+            return
+
+        country = getattr(self, "_country_copy_name", None)
+        if not country:
+            return
+        name_item = tbl.item(target_row, 2)
+        kind_item = tbl.item(target_row, 3)
+        year_txt = item.text()
+        header = (f"{year_txt} {name_item.text() if name_item else ''} "
+                  f"({kind_item.text() if kind_item else ''})").strip()
+        widget = self._build_country_year_detail_widget(tid, country, header)
+
+        detail_row = target_row + 1
+        tbl.insertRow(detail_row)
+        tbl.setSpan(detail_row, 0, 1, 6)
+        tbl.setCellWidget(detail_row, 0, widget)
+        tbl.resizeRowToContents(detail_row)
+        # [방어코드] resizeRowToContents가 cellWidget의 실제 sizeHint를
+        # 못 따라가는 경우가 있어(특히 위젯 안에 표가 여러 개일 때) 한 번
+        # 더 위젯 자체 sizeHint로 보정한다.
+        h = widget.sizeHint().height()
+        if h > tbl.rowHeight(detail_row):
+            tbl.setRowHeight(detail_row, h + 8)
+        self._country_expanded = {"tid": tid, "orig_row": target_row, "detail_row": detail_row}
+        tbl.scrollToItem(item)
+
+    def _build_country_year_detail_widget(self, tid, country, header_title):
+        """국가 검색 표에서 연도를 펼쳤을 때 보여줄 내용 — 이 국가가 속한
+        조의 순위표(있으면) + 라운드별(조별리그 포함) 상대·스코어·승패.
+        world_browser.get_country_intl_match_log()가 계산해준 데이터를
+        그대로 그린다. [2026-08 신설]
+        [2026-08 재수정, 신민용 리포트: "전체적으로 UI가 잘 안 보인다" +
+        "조 순위표에서 진출/탈락 표시(반투명)가 안 보인다, 이 국가 이름
+        칸만 금색으로 하고 나머지 칸은 원래대로(진출=흰색굵게/탈락=회색
+        반투명) 둬야 겹치지 않는다"] 조 순위표를 _build_groups_grid와 같은
+        진출/탈락 배색(흰색 굵게 vs 회색)으로 되돌리고, "이 국가"만 이름
+        칸에 한정해서 금색으로 덧칠한다(다른 칸은 그대로 진출/탈락 색을
+        따름) — 숫자 칸까지 전부 금색으로 칠하면 탈락 표시(회색)가 묻혀서
+        구분이 안 됐던 문제. 카드 자체도 좌측 초록 강조선+더 밝은 배경으로
+        표 사이에서 잘 눈에 띄게, 경기 한 줄 한 줄도 옅은 배경 스트라이프를
+        줘서 읽기 쉽게 했다."""
+        log = wb.get_country_intl_match_log(tid, country)
+        box = QFrame()
+        box.setStyleSheet(
+            "background:#262626;border:1px solid #3a3a3a;border-left:3px solid #00cc44;"
+            "border-radius:6px;")
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(16, 12, 16, 14)
+        lay.setSpacing(10)
+
+        title = QLabel(f"📋 {header_title}")
+        title.setStyleSheet("color:#00cc44;font-size:13px;font-weight:bold;")
+        lay.addWidget(title)
+
+        gs = log.get("group_standings")
+        if gs and gs.get("rows"):
+            glabel = QLabel(f"⚽ {gs['group']}조 순위표")
+            glabel.setStyleSheet("color:#ffcc00;font-size:12px;font-weight:bold;")
+            lay.addWidget(glabel)
+            rows = gs["rows"]
+            qualified = gs.get("qualified") or set()
+            gtbl = QTableWidget(len(rows), 7)
+            gtbl.setHorizontalHeaderLabels(["순위", "국가", "승", "무", "패", "득실", "승점"])
+            gtbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+            gtbl.verticalHeader().setVisible(False)
+            gtbl.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+            gtbl.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            gtbl.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            gtbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+            gtbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            gtbl.setStyleSheet(
+                "QTableWidget{background:#1a1a1a;color:#ccc;gridline-color:#2f2f2f;border:none;font-size:11px;}"
+                "QHeaderView::section{background:#232323;color:#888;border:none;padding:3px;font-size:9px;}")
+            for rank, t in enumerate(rows):
+                is_me = (t["country"] == country)
+                # _build_groups_grid와 동일한 진출/탈락 판정(qualified가
+                # 있으면 그걸로, 없으면 순위<2 폴백) — 진출=흰색 굵게,
+                # 탈락=회색.
+                advancing = (rank == 0) or ((t["country"] in qualified) if qualified else (rank < 2))
+                base_color = QColor("#ffffff" if advancing else "#777777")
+                vals = [str(rank + 1), f"{t.get('flag', '')} {t['country']}".strip(),
+                        str(t["wins"]), str(t["draws"]), str(t["losses"]),
+                        f"{t['gd']:+d}", str(t["pts"])]
+                for j, v in enumerate(vals):
+                    it = QTableWidgetItem(v)
+                    it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    # 이름 칸(1번)만 "이 국가"면 금색으로 덧칠, 나머지 칸은
+                    # 진출/탈락 색을 그대로 유지 — 숫자칸까지 금색으로
+                    # 덮으면 탈락(회색) 표시가 안 보이게 되는 문제 방지.
+                    if j == 1 and is_me:
+                        it.setForeground(QColor("#ffcc00"))
+                        f = it.font(); f.setBold(True); it.setFont(f)
+                    else:
+                        it.setForeground(base_color)
+                        f = it.font(); f.setBold(advancing); it.setFont(f)
+                    gtbl.setItem(rank, j, it)
+            gtbl.setFixedHeight(gtbl.verticalHeader().defaultSectionSize() * len(rows) + 32)
+            _enable_plain_copy(gtbl)
+            lay.addWidget(gtbl)
+
+        stages = log.get("stages") or []
+        _RESULT_COLOR = {"승": "#4caf50", "무": "#ffcc00", "패": "#ff5555"}
+        if not stages:
+            empty = QLabel("경기 기록이 없습니다.")
+            empty.setStyleSheet("color:#666;font-size:11px;")
+            lay.addWidget(empty)
+        for stage in stages:
+            slabel = QLabel(f"🏆 {stage['stage_ko']}")
+            slabel.setStyleSheet("color:#aaddff;font-size:12px;font-weight:bold;"
+                                  "padding-top:4px;")
+            lay.addWidget(slabel)
+            for m in stage["matches"]:
+                row_w = QWidget()
+                row_w.setStyleSheet("background:#1c1c1c;border-radius:5px;")
+                row_lay = QHBoxLayout(row_w)
+                row_lay.setContentsMargins(10, 5, 10, 5)
+                row_lay.setSpacing(10)
+                opp_lbl = QLabel(f"vs {m['opponent']}")
+                opp_lbl.setStyleSheet("color:#eee;font-size:12px;")
+                row_lay.addWidget(opp_lbl, 1)
+                res_lbl = QLabel(m["result"])
+                res_lbl.setStyleSheet(
+                    f"color:{_RESULT_COLOR.get(m['result'], '#ccc')};font-size:11px;"
+                    "font-weight:bold;padding:2px 10px;background:#101010;border-radius:6px;")
+                row_lay.addWidget(res_lbl)
+                score_txt = f"{m['my_score']} : {m['opp_score']}"
+                if m.get("pso"):
+                    pso_score = m.get("pso_score") or ""
+                    score_txt += f" (승부차기 {pso_score})" if pso_score else " (승부차기)"
+                score_lbl = QLabel(score_txt)
+                score_lbl.setStyleSheet("color:#aaa;font-size:12px;font-weight:bold;min-width:80px;")
+                row_lay.addWidget(score_lbl)
+                lay.addWidget(row_w)
+        return box
 
     # ─────────────────────────────────────────
     # 탭2: 컵대회 검색 (2026-07 신설)
@@ -3691,7 +3980,7 @@ class WorldBrowserWindow(QDialog):
         self._grow_to_fit(tbl, stretch_col=1)
         _enable_plain_copy(tbl)
 
-    def _open_intl_detail(self, tbl, row, wc):
+    def _open_intl_detail(self, tbl, row, wc, highlight_country=None):
         item = tbl.item(row, 0)
         tid = item.data(Qt.ItemDataRole.UserRole) if item else None
         if tid is None:
@@ -3702,7 +3991,8 @@ class WorldBrowserWindow(QDialog):
         detail = wb.get_intl_tournament_detail(tid)
         qualifiers = wb.get_wc_qualifier_summary(year) if wc else None
         dlg = TournamentDetailDialog(title, detail, team_based=False,
-                                     qualifiers=qualifiers, parent=self)
+                                     qualifiers=qualifiers, parent=self,
+                                     highlight_country=highlight_country)
         dlg.exec()
 
     def _show_empty_state(self, tbl, rows, msg, n_cols):
@@ -3750,8 +4040,16 @@ class WorldBrowserWindow(QDialog):
         # 국가 파워랭킹(초기 시드)부터 조회 가능해야 하므로.
         lbl_year = QLabel("연도"); lbl_year.setStyleSheet("color:#888;font-size:11px;")
         self.pr_year_spin = QSpinBox()
-        self.pr_year_spin.setRange(GAME_START_YEAR, GAME_START_YEAR + 300)
-        self.pr_year_spin.setValue(GAME_START_YEAR)
+        # [2026-08 v3.3 버그수정, 신민용 리포트: "1998년으로 시작했는데
+        # 파워랭킹 창은 2000년 고정으로 뜨고 데이터가 없다"] GAME_START_YEAR는
+        # constants.py의 고정 상수(항상 2000)라 커스텀 시작 연도를 반영 못
+        # 한다 — database.get_game_start_year()(플레이어가 실제로 고른
+        # 시작 연도)로 교체. power_ranking.py의 시드 생성 함수들도 이미
+        # 같은 이유로 이걸 쓰도록 고쳐뒀다(둘이 일치해야 시드가 실제로
+        # 이 스핀박스 범위 안에서 조회됨).
+        _gsy = get_game_start_year()
+        self.pr_year_spin.setRange(_gsy, _gsy + 300)
+        self.pr_year_spin.setValue(_gsy)
         self.pr_year_spin.valueChanged.connect(self._refresh_power_ranking_tables)
         top.addWidget(lbl_year)
         top.addWidget(self.pr_year_spin)
@@ -3926,7 +4224,7 @@ class WorldBrowserWindow(QDialog):
         latest = pr.get_latest_ranking_year(conn)
         if initial:
             self.pr_year_spin.blockSignals(True)
-            self.pr_year_spin.setValue(latest if latest is not None else GAME_START_YEAR)
+            self.pr_year_spin.setValue(latest if latest is not None else get_game_start_year())
             self.pr_year_spin.blockSignals(False)
             self._pr_refresh_team_country_filter_options()
         self._refresh_power_ranking_tables()
@@ -4218,6 +4516,16 @@ class RankLeadersDialog(QDialog):
         self.setStyleSheet(STYLE)
         n_pairs = len(keys)
         _clamp_and_resize(self, min(340 + n_pairs * 230, 1200), 560)
+        # [2026-08 신설, 신민용 요청: "최다 순위 창은 모니터 한가운데에
+        # 뜨게"] _clamp_and_resize는 화면 밖으로 나가지만 않게 보정할 뿐
+        # 딱히 중앙에 두진 않는다 — 이 창만 크기를 잡은 직후 화면(작업
+        # 영역) 정중앙으로 옮긴다.
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen:
+            avail = screen.availableGeometry()
+            geo = self.frameGeometry()
+            self.move(avail.center().x() - geo.width() // 2,
+                      avail.center().y() - geo.height() // 2)
 
         self._keys = keys
         self._empty_msg = empty_msg
@@ -4361,12 +4669,19 @@ class TournamentDetailDialog(QDialog):
     읽기만 하므로(재시뮬레이션 없음) 여는 데 드는 비용은 무시할 수 있는
     수준이다 — 대회당 매치 수가 많아야 수십 개로 고정돼 있다.
     """
-    def __init__(self, title, detail, team_based, qualifiers=None, parent=None):
+    def __init__(self, title, detail, team_based, qualifiers=None, parent=None,
+                 highlight_country=None):
         super().__init__(parent)
         self.setWindowModality(Qt.WindowModality.NonModal)
         self.setWindowTitle(title)
         self.setStyleSheet(STYLE)
         _clamp_and_resize(self, 760, 560)
+        # [2026-08 신설, 신민용 요청: "국가 검색으로 들어와서 대회 전체
+        # 팝업을 열면 지금 보고 있는 국가 이름이 금색으로 표시돼야 한다"]
+        # 국가 검색(country_detail_tbl)에서 열었을 때만 채워지고, 월드컵/
+        # 네이션스컵 탭 등 다른 진입 경로에서는 None으로 넘어와 아무
+        # 효과가 없다.
+        self._highlight_country = highlight_country
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(14, 12, 14, 12)
@@ -4411,7 +4726,8 @@ class TournamentDetailDialog(QDialog):
         groups = detail.get("groups") or {}
         if groups:
             lay.addWidget(self._section_label("⚽ 조별리그"))
-            lay.addWidget(self._build_groups_grid(groups, team_based, detail.get("qualified")))
+            lay.addWidget(self._build_groups_grid(groups, team_based, detail.get("qualified"),
+                                                    highlight_country=self._highlight_country))
 
         league_standings = detail.get("league_standings") or []
         if league_standings:
@@ -4641,7 +4957,7 @@ class TournamentDetailDialog(QDialog):
             lay.addWidget(hint)
         return box
 
-    def _build_groups_grid(self, groups, team_based, qualified=None):
+    def _build_groups_grid(self, groups, team_based, qualified=None, highlight_country=None):
         # [2026-08 버그수정, 신민용 리포트: "3위 와일드카드로 진출한 팀도
         # 흰색으로 떠야 하는데 회색으로 뜬다"] qualified(실제 다음 라운드
         # 첫 대진에 등장한 팀 이름 집합, world_browser.get_intl_tournament_
@@ -4731,6 +5047,17 @@ class TournamentDetailDialog(QDialog):
                         f = item.font(); f.setBold(True); item.setFont(f)
                     if j == 1:
                         item.setData(_CLEAN_TEXT_ROLE, name)
+                        # [2026-08 신설, 신민용 요청: "국가 검색으로 들어와서
+                        # 대회 전체 팝업을 열면 지금 보고 있는 국가 이름이
+                        # 금색으로 떠야 한다"] 이름 칸(1번)만 하이라이트
+                        # 대상 국가일 때 금색으로 덧칠 — 진출/탈락 배색을
+                        # 그대로 보여줘야 하는 나머지 칸(승/무/패/득실/승점)
+                        # 은 건드리지 않는다. team_based(팀 대항전)에서는
+                        # highlight_country가 팀명이 아니라 국가명이라
+                        # 매칭 대상이 다르므로 적용하지 않는다.
+                        if not team_based and highlight_country and name == highlight_country:
+                            item.setForeground(QColor("#ffcc00"))
+                            f = item.font(); f.setBold(True); item.setFont(f)
                     tbl.setItem(rank, j, item)
             tbl.setFixedHeight(tbl.verticalHeader().defaultSectionSize() * len(teams) + 30)
             _enable_plain_copy(tbl)
@@ -4814,8 +5141,19 @@ class TournamentDetailDialog(QDialog):
             grid.addWidget(al, ri, 2)
 
             if pso:
-                pso_lbl = QLabel("⚽ 승부차기")
-                pso_lbl.setStyleSheet("color:#666;font-size:9px;")
+                # [2026-08 버그수정, 신민용 리포트: "승부차기 몇 대 몇으로
+                # 이겼는지가 안 보인다 — 경기 일정 화면엔 뜨는데?"] 실제
+                # 승부차기 스코어(m["pso_score"], DB엔 이미 저장돼 있고
+                # get_intl_tournament_detail 등 백엔드도 이미 이 컬럼을
+                # 조회해서 넘겨주고 있었는데, 이 화면만 그 값을 안 쓰고
+                # "⚽ 승부차기"라는 고정 문구만 띄우고 있었다 — 실제로
+                # 데이터가 없던 게 아니라 여기서 안 읽고 있던 것. 경기
+                # 일정 화면(schedule_window.py)과 동일하게 "5-4" 형식
+                # 그대로 붙여서 보여준다.
+                pso_score = m.get("pso_score") or ""
+                pso_txt = f"⚽ 승부차기 {pso_score}" if pso_score else "⚽ 승부차기"
+                pso_lbl = QLabel(pso_txt)
+                pso_lbl.setStyleSheet("color:#999;font-size:9px;")
                 pso_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 grid.addWidget(pso_lbl, ri, 3)
 
