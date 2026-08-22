@@ -1143,7 +1143,8 @@ def simulate_my_cwc_match(week, p, day=None):
     from game_engine import (add_log, get_player, update_player,
                              _player_perf, _my_result, _update_pop, _gen_score,
                              _save_match_detail, _soft_cap,
-                             _check_suspended, _roll_red_card, _apply_red_card_dismissal)
+                             _check_suspended, _roll_red_card, _apply_red_card_dismissal,
+                             _roll_card_events)
     info = get_my_cwc_match(week, day=day)
     if not info:
         return
@@ -1191,14 +1192,19 @@ def simulate_my_cwc_match(week, p, day=None):
         events, detail = [], {"shots": 0, "shots_on": 0, "key_passes": 0,
                               "dribbles": 0, "blocks": 0, "pass_acc": 0.0}
         _absence_reason = "suspension"
+        _yellow_cnt = 0
     else:
         _opp_ovr = (ae["ovr"] if is_home else he["ovr"])
         goals, assists, saves, rating, events, detail = _player_perf(
             p, outcome, is_home, hs, as_, opp_ovr=_opp_ovr)
         _absence_reason = None
-        if _roll_red_card(p):
-            goals, assists, saves, rating, events, detail = _apply_red_card_dismissal(p, field="cwc_suspension")
-            _absence_reason = "red_card"
+        _dismissed, _card_reason, _yellow_ev, _yellow_cnt = _roll_card_events(p, "cwc_suspension")
+        if _dismissed:
+            goals, assists, saves, rating, events, detail = _apply_red_card_dismissal(
+                p, field="cwc_suspension", reason=_card_reason)
+            _absence_reason = _card_reason
+        elif _yellow_ev:
+            events = list(events) + _yellow_ev
     if not _suspended and "big_match_rating" in _pe:
         rating = max(3.0, min(10.0, round(rating + _pe["big_match_rating"], 1)))
     my_result = _my_result(outcome, is_home)
@@ -1211,14 +1217,14 @@ def simulate_my_cwc_match(week, p, day=None):
                     my_saves=?, my_goals=?, my_assists=?, my_rating=?,
                     my_shots=?, my_shots_on=?, my_key_passes=?,
                     my_dribbles=?, my_blocks=?, my_pass_acc=?,
-                    my_absence_reason=?
+                    my_absence_reason=?, my_yellow_cards=?
                     WHERE id=?""",
                  (hs, as_, pso_winner, pso_score,
                   0 if _suspended else 1, _get_field_pos_safe(p),
                   saves, goals, assists, rating,
                   detail["shots"], detail["shots_on"], detail["key_passes"],
                   detail["dribbles"], detail["blocks"], detail["pass_acc"],
-                  _absence_reason, m["id"]))
+                  _absence_reason, _yellow_cnt, m["id"]))
     conn.commit()
     conn.close()
 

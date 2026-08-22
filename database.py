@@ -1453,6 +1453,30 @@ def init_db():
         # career_entries(팀 재직 기간별 리그 기록)에도 같은 패턴(saves,
         # clean_sheets 등)으로 그 재직 기간 동안의 리그 레드카드 수를 남긴다.
         "ALTER TABLE career_entries ADD COLUMN red_cards INTEGER DEFAULT 0",
+        # [2026-08 신설, 옐로카드 시스템] red_cards와 동일 패턴 — 재직
+        # 기간 동안의 리그 전용 옐로카드 누적(season_yellow_league)을
+        # 재직 종료/갱신 시점에 스냅샷.
+        "ALTER TABLE career_entries ADD COLUMN yellow_cards INTEGER DEFAULT 0",
+        # 대회별 개인 경기 기록에 "이 경기에서 옐로카드를 몇 장 받았는지"
+        # (0/1/2) 저장 — my_absence_reason만으로는 "그냥 옐로 1장 받고
+        # 계속 뛴 경기"를 구분할 수 없어서(퇴장이 아니라 결장 사유 자체가
+        # 없음) 별도 컬럼 신설. '전체 이력' 탭(get_full_history_extras_
+        # for_period)의 기간별 옐로 합산에 쓰인다.
+        "ALTER TABLE cl_matches ADD COLUMN my_yellow_cards INTEGER DEFAULT 0",
+        "ALTER TABLE el_matches ADD COLUMN my_yellow_cards INTEGER DEFAULT 0",
+        "ALTER TABLE ecl_matches ADD COLUMN my_yellow_cards INTEGER DEFAULT 0",
+        "ALTER TABLE cup_matches ADD COLUMN my_yellow_cards INTEGER DEFAULT 0",
+        "ALTER TABLE sc_matches ADD COLUMN my_yellow_cards INTEGER DEFAULT 0",
+        "ALTER TABLE cwc_matches ADD COLUMN my_yellow_cards INTEGER DEFAULT 0",
+        "ALTER TABLE intl_matches ADD COLUMN my_yellow_cards INTEGER DEFAULT 0",
+        # [2026-08 신설, 신민용 요청: "승강PO도 팀 이력에는 아니더라도
+        # 전체 이력에는 포함되어야지"] po_matches는 슛/드리블 등 세부
+        # 스탯 컬럼 자체가 원래 없는 얕은 테이블이라(위 설계 코멘트 참고)
+        # 다른 6개 대회 테이블과 동일한 컬럼 세트를 맞출 순 없지만, 카드
+        # 기록만은 동일 패턴으로 추가해 get_full_history_extras_for_period가
+        # PO도 집계할 수 있게 한다.
+        "ALTER TABLE po_matches ADD COLUMN my_absence_reason TEXT DEFAULT NULL",
+        "ALTER TABLE po_matches ADD COLUMN my_yellow_cards INTEGER DEFAULT 0",
         # [2026-08 신설, 신민용 설계 확정: "컵대회 본선은 실제 참가 가능
         # 팀 수 기준으로 통일한다"] 예전엔 "합류할 티어가 다 떨어진 시점에
         # 마침 몇 팀이 남아있는가"로 표준 강수(8/16/32/64강)가 정해졌다 —
@@ -1516,6 +1540,32 @@ def init_db():
         # 수락 시 즉시 이적하지 않고 "예약" 상태로 저장 — 다음 비시즌
         # 전환 시점(_end_of_season)에 실제 이적을 실행한다.
         "ALTER TABLE my_player ADD COLUMN pending_sale_transfer_json TEXT DEFAULT ''",
+        # [2026-08 신설, 옐로카드 시스템] 레드카드와 동일한 "대회별 결장
+        # 카운터" 패턴을 슈퍼컵/월드컵예선에도 추가 — 지금까지 슈퍼컵은
+        # cl_suspension을 챔스/유로파/컨퍼런스와 그대로 같이 썼고(참가팀이
+        # 안 겹친다는 가정이 슈퍼컵엔 안 맞음), 월드컵예선은 intl_suspension을
+        # 본선과 같이 써서 "예선 마지막 경기 퇴장이 본선 첫 경기 결장으로
+        # 이어지는" 버그가 있었다 — 둘 다 분리.
+        "ALTER TABLE my_player ADD COLUMN super_cup_suspension INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN wc_qual_suspension INTEGER DEFAULT 0",
+        # 대회 그룹별 "시즌(또는 대회 사이클) 누적 경고" — 5장 도달 시
+        # 위 결장 카운터 필드를 1로 세팅하고 0으로 리셋한다. 클럽 계열
+        # (league/cup/europe/super_cup/cwc/po)은 매 시즌 리셋, 국가대표
+        # 계열(wc_qual/intl)은 "대회 사이클 종료" 시점에 리셋한다(연도
+        # 기준 리셋이 아님 — intl_engine.py의 예선→본선 전환 지점 참고).
+        "ALTER TABLE my_player ADD COLUMN season_yellow_league INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN season_yellow_cup INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN season_yellow_europe INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN season_yellow_super_cup INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN season_yellow_cwc INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN season_yellow_wc_qual INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN season_yellow_intl INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN season_yellow_po INTEGER DEFAULT 0",
+        # 통산(커리어) 누적 — total_red_cards_all/total_red_cards_league와
+        # 동일 패턴. 2차 옐로(경고누적 퇴장)도 여기엔 정상적으로 +1씩
+        # 반영된다(시즌 누적 징계 카운터에만 안 얹을 뿐).
+        "ALTER TABLE my_player ADD COLUMN total_yellow_all INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN total_yellow_league INTEGER DEFAULT 0",
     ]:
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,

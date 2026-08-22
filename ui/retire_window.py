@@ -142,7 +142,11 @@ def _match_line_str(m):
     "injury"/"suspension"이면 진짜 결장(스탯 자체가 없음)이라 사유만
     보여주지만, "red_card"는 그 경기 안에서 퇴장당하기 전까지는 실제로
     뛴 경기라 스탯·평점이 진짜다(my_played=1) — 결장 취급하지 않고
-    정상 스탯을 보여주되 "(퇴장)"만 덧붙인다."""
+    정상 스탯을 보여주되 "(퇴장)"만 덧붙인다.
+
+    [2026-08 확장, 옐로카드 시스템] "second_yellow"(경고누적 퇴장)도
+    같은 성격 — 두 번째 경고를 받기 전까지는 정상적으로 뛴 경기라
+    "(퇴장)"만 다르게 표시한다("(경고누적 퇴장)")."""
     reason = m.get("absence_reason")
     if reason in _FULL_ABSENCE_REASONS:
         return _ABSENCE_LABEL.get(reason, reason)
@@ -151,6 +155,8 @@ def _match_line_str(m):
     line = f"{_match_stat_str(m)}  평점 {m.get('rating', 0)}"
     if reason == "red_card":
         line += " (퇴장)"
+    elif reason == "second_yellow":
+        line += " (경고누적 퇴장)"
     return line
 
 
@@ -318,6 +324,12 @@ class RetireWindow(QDialog):
         ]
         if _max_fee > 0:
             stats.append(("최고이적료", fmt_money(_max_fee)))
+        # [2026-08 신설, 옐로카드 시스템] 통산 옐로카드가 있으면 레드카드
+        # 박스 앞에 함께 보여준다(전 대회 합산 — 리그만의 수치는 아래
+        # 팀 이력 표의 "🟨" 컬럼 참고).
+        _tyc = p.get("total_yellow_all", 0)
+        if _tyc > 0:
+            stats.append(("🟨경고", f"{_tyc}회"))
         # [2026-08 신설, 신민용 요청: "커리어에 레드카드 기록 추가"]
         # 통산 레드카드가 한 번이라도 있으면 통계 박스에 함께 보여준다
         # (전 대회 합산 — 리그만의 수치는 아래 팀 이력 표의 "🟥" 컬럼 참고).
@@ -586,7 +598,7 @@ class RetireWindow(QDialog):
             stat_cols = ["골","어시","슈팅","유효","기회창출","드리블"]
         cols = (["기간","나이","포지션","국가","리그","팀명","연봉","출전"]
                 + stat_cols
-                + ["평균평점","팀순위","승무패","🟥","계약","이적"])
+                + ["평균평점","팀순위","승무패","🟨","🟥","계약","이적"])
         # 이슈3: '스퓨리어스 중복 행'(이벤트 없이 잔류만 하는데 실수로
         # 새 행이 또 생기는 버그, transfer_type='')만 숨긴다. 진짜
         # 이적/입단/오퍼 이벤트(transfer_type이 채워짐)는 기간이 짧고
@@ -778,6 +790,7 @@ class RetireWindow(QDialog):
                      _apps_str2]
                     + stat_vals
                     + [str(avg), rank_disp, wdl,
+                       (str(e.get("yellow_cards", 0)) if e.get("yellow_cards", 0) else "—"),
                        (str(e.get("red_cards", 0)) if e.get("red_cards", 0) else "—"),
                        c_str, t_type])
             for j, v in enumerate(vals):
@@ -826,7 +839,7 @@ class RetireWindow(QDialog):
             stat_cols = ["골", "어시", "기회창출", "패스%", "차단", "드리블"]
         else:
             stat_cols = ["골", "어시", "슈팅", "유효", "기회창출", "드리블"]
-        cols = ["기간", "나이", "팀명", "리그", "출전"] + stat_cols + ["평균평점", "승무패", "🟥"]
+        cols = ["기간", "나이", "팀명", "리그", "출전"] + stat_cols + ["평균평점", "승무패", "🟨", "🟥"]
 
         visible = [e for e in entries if not _is_empty_short(e)]
         tbl = self._make_table(len(visible), cols)
@@ -915,11 +928,12 @@ class RetireWindow(QDialog):
             # _club_totals_tab과 동일 수정 — 리그 전용 누적값(e["red_cards"])
             # + 컵/챔스/클럽월드컵/국가대표 합산(extras["red_cards"]).
             red_cards_str = str(e.get("red_cards", 0) + extras["red_cards"])
+            yellow_cards_str = str(e.get("yellow_cards", 0) + extras["yellow_cards"])
 
             vals = ([period, age_str, e.get("team_name", ""),
                      f"{e.get('league_name','')} ({e.get('tier','')}부)",
                      apps_str]
-                    + stat_vals + [avg, wdl_str, red_cards_str])
+                    + stat_vals + [avg, wdl_str, yellow_cards_str, red_cards_str])
             for j, v in enumerate(vals):
                 self._set_item(tbl, i, j, v)
         tbl.resizeColumnsToContents()
@@ -1544,13 +1558,16 @@ class RetireWindow(QDialog):
                 # career_entries.red_cards(리그 전용) + extras3["red_cards"]
                 # (컵+챔스+클럽월드컵+국가대표) 합산.
                 _grand_rc = e.get("red_cards", 0) + _extras3["red_cards"]
+                # [2026-08 신설, 옐로카드 시스템] _grand_rc와 동일 원리.
+                _grand_yc = e.get("yellow_cards", 0) + _extras3["yellow_cards"]
                 if grp == "GK":
                     _grand_sv = sv + _extras3["saves"]
                     _grand_ga = ga + _extras3["goals_against"]
                     _grand_cs = cs + _extras3["clean_sheets"]
-                    lines.append(f"    └ 전체 이력(리그+컵+챔스+클럽WC+국가대표): "
+                    lines.append(f"    └ 전체 이력(리그+컵+챔스+클럽WC+승강PO+국가대표): "
                                  f"출전 {_apps_str3}  {_grand_g}골 {_grand_a}어시  "
                                  f"선방 {_grand_sv}  실점 {_grand_ga}  CS {_grand_cs}"
+                                 + (f"  🟨{_grand_yc}" if _grand_yc else "")
                                  + (f"  🟥{_grand_rc}" if _grand_rc else ""))
                 else:
                     # [2026-07 신설, 신민용 요청: "테이블 컬럼에 추가해서 ㄱㄱ"]
@@ -1559,10 +1576,11 @@ class RetireWindow(QDialog):
                     _grand_sho = sho + _extras3["shots_on"]
                     _grand_kp = kp + _extras3["key_passes"]
                     _grand_drb = drb + _extras3["dribbles"]
-                    lines.append(f"    └ 전체 이력(리그+컵+챔스+클럽WC+국가대표): "
+                    lines.append(f"    └ 전체 이력(리그+컵+챔스+클럽WC+승강PO+국가대표): "
                                  f"출전 {_apps_str3}  {_grand_g}골 {_grand_a}어시  "
                                  f"슈팅 {_grand_sh}  유효 {_grand_sho}  "
                                  f"기회창출 {_grand_kp}  드리블 {_grand_drb}"
+                                 + (f"  🟨{_grand_yc}" if _grand_yc else "")
                                  + (f"  🟥{_grand_rc}" if _grand_rc else ""))
                 # 역할/감독/구단야망
                 ctx = []

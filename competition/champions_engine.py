@@ -867,7 +867,8 @@ def simulate_my_cl_match(week, p, day=None):
     from game_engine import (add_log, get_player, update_player,
                              _player_perf, _my_result, _update_pop, _gen_score,
                              _save_match_detail, _soft_cap,
-                             _check_suspended, _roll_red_card, _apply_red_card_dismissal)
+                             _check_suspended, _roll_red_card, _apply_red_card_dismissal,
+                             _roll_card_events)
     info = get_my_cl_match(week, day=day)
     if not info:
         return
@@ -925,19 +926,21 @@ def simulate_my_cl_match(week, p, day=None):
         events, detail = [], {"shots": 0, "shots_on": 0, "key_passes": 0,
                               "dribbles": 0, "blocks": 0, "pass_acc": 0.0}
         _absence_reason = "suspension"
+        _yellow_cnt = 0
     else:
-        # [2026-07 통일] intl_engine(국제대회)과 동일하게 "오늘 상대의 실제 팀
-        # OVR"을 dom 기준으로 넘긴다 — 강팀 상대면 개인도 고전, 약체 상대면
-        # 골·평점이 폭발하도록. he/ae는 보너스 반영 전 원본 팀 OVR이라
-        # game_engine._simulate_match의 home_ovr/away_ovr과 동일한 성격이다.
         _opp_ovr = (ae["ovr"] if is_home else he["ovr"])
         goals, assists, saves, rating, events, detail = _player_perf(
             p, outcome, is_home, hs, as_, opp_ovr=_opp_ovr)
         _absence_reason = None
-        # [2026-07 신설] 퇴장 판정 — '폭력적' 성격의 red_card_chance 반영.
-        if _roll_red_card(p):
-            goals, assists, saves, rating, events, detail = _apply_red_card_dismissal(p, field="cl_suspension")
-            _absence_reason = "red_card"
+        _yellow_cnt = 0
+        # [2026-07 신설 → 2026-08 확장(옐로카드)] 카드 판정.
+        _dismissed, _card_reason, _yellow_ev, _yellow_cnt = _roll_card_events(p, "cl_suspension")
+        if _dismissed:
+            goals, assists, saves, rating, events, detail = _apply_red_card_dismissal(
+                p, field="cl_suspension", reason=_card_reason)
+            _absence_reason = _card_reason
+        elif _yellow_ev:
+            events = list(events) + _yellow_ev
     # [2026-07 신설] '소심함' 성격의 big_match_rating 연결 — 챔피언스리그는
     # 대회 자체가 빅매치 성격이라(국내컵과 달리 결승 한정이 아니라) 모든
     # 경기에 적용한다.
@@ -957,14 +960,14 @@ def simulate_my_cl_match(week, p, day=None):
                     my_saves=?, my_goals=?, my_assists=?, my_rating=?,
                     my_shots=?, my_shots_on=?, my_key_passes=?,
                     my_dribbles=?, my_blocks=?, my_pass_acc=?, my_conceded=?,
-                    day=?, my_absence_reason=?
+                    day=?, my_absence_reason=?, my_yellow_cards=?
                     WHERE id=?""",
                  (hs, as_, pso_winner, pso_score,
                   0 if _suspended else 1, _get_field_pos(p),
                   saves, goals, assists, rating,
                   detail["shots"], detail["shots_on"], detail["key_passes"],
                   detail["dribbles"], detail["blocks"], detail["pass_acc"],
-                  my_conceded, day, _absence_reason, m["id"]))
+                  my_conceded, day, _absence_reason, _yellow_cnt, m["id"]))
     conn.commit()
     conn.close()
 

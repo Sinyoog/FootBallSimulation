@@ -156,6 +156,17 @@ class CareerWindow(QDialog):
             bl.addWidget(kl); bl.addWidget(vl)
             box.setStyleSheet("background:#252525;border-radius:6px;")
             summary.addWidget(box)
+        # [2026-08 신설, 옐로카드 시스템] 통산 옐로카드가 한 번이라도
+        # 있으면 레드카드 박스 앞에 함께 보여준다(전 대회 합산 —
+        # 리그만의 수치는 팀 이력 탭의 "🟨" 컬럼 참고).
+        _tyc = p.get("total_yellow_all", 0)
+        if _tyc > 0:
+            box = QFrame(); bl = QVBoxLayout(box); bl.setContentsMargins(12,8,12,8)
+            kl = QLabel("🟨경고"); kl.setStyleSheet("color:#888;font-size:11px;")
+            vl = QLabel(f"{_tyc}회"); vl.setStyleSheet("color:#00cc44;font-size:15px;font-weight:bold;")
+            bl.addWidget(kl); bl.addWidget(vl)
+            box.setStyleSheet("background:#252525;border-radius:6px;")
+            summary.addWidget(box)
         # [2026-08 신설, 신민용 요청: "커리어에 레드카드 기록 추가"]
         # 통산 레드카드가 한 번이라도 있으면 요약 박스에 함께 보여준다
         # (전 대회 합산 — 리그만의 수치는 팀 이력 탭의 "🟥" 컬럼 참고).
@@ -336,7 +347,7 @@ class CareerWindow(QDialog):
             stat_cols = ["골","어시","슈팅","유효","기회창출","드리블"]
         cols = (["기간", "나이", "포지션", "국가", "리그", "팀명", "연봉", "출전"]
                 + stat_cols
-                + ["평균평점","팀순위","승무패","🟥","계약","이적"])
+                + ["평균평점","팀순위","승무패","🟨","🟥","계약","이적"])
 
         # 이슈3: 1~4주차 이적 노이즈만 숨김 (4주 이하 머문 0경기 항목)
         # 여름 이적시장(37주~) 입단처럼 경기 없이 보낸 정상 재직 기간은 표시
@@ -561,6 +572,7 @@ class CareerWindow(QDialog):
                      _apps_str]
                     + stat_vals
                     + [str(avg), rank_disp, wdl,
+                       (str(e.get("yellow_cards", 0)) if e.get("yellow_cards", 0) else "—"),
                        (str(e.get("red_cards", 0)) if e.get("red_cards", 0) else "—"),
                        c_str, t_type])
             # 팔림/방출/계약만료는 빨간색 강조
@@ -613,7 +625,7 @@ class CareerWindow(QDialog):
             stat_cols = ["골", "어시", "기회창출", "패스%", "차단", "드리블"]
         else:
             stat_cols = ["골", "어시", "슈팅", "유효", "기회창출", "드리블"]
-        cols = ["기간", "나이", "팀명", "리그", "출전"] + stat_cols + ["평균평점", "승무패", "🟥"]
+        cols = ["기간", "나이", "팀명", "리그", "출전"] + stat_cols + ["평균평점", "승무패", "🟨", "🟥"]
 
         visible = [e for e in entries if not _is_empty_short(e)]
         tbl = self._make_table(len(visible), cols)
@@ -726,15 +738,19 @@ class CareerWindow(QDialog):
             # 국가대표 합산값 — 둘을 더하면 "팀 이력" 탭의 🟥(리그만)과
             # 달리 이 탭 취지(모든 대회 합산)에 맞는 진짜 전체 합계가 된다.
             red_cards_str = str(e.get("red_cards", 0) + extras["red_cards"])
+            # [2026-08 신설, 옐로카드 시스템] red_cards_str과 동일 원리 —
+            # career_entries.yellow_cards(리그 전용 스냅샷) + extras["yellow_cards"]
+            # (컵+챔스+클럽월드컵+국가대표 합산)를 더해 전 대회 합계.
+            yellow_cards_str = str(e.get("yellow_cards", 0) + extras["yellow_cards"])
 
             vals = ([period, age_str, e.get("team_name", ""),
                      f"{e.get('league_name','')} ({e.get('tier','')}부)",
                      apps_str]
-                    + stat_vals + [avg, wdl_str, red_cards_str])
+                    + stat_vals + [avg, wdl_str, yellow_cards_str, red_cards_str])
             for j, v in enumerate(vals):
                 self._set(tbl, i, j, v)
         lay.addWidget(tbl)
-        hint = QLabel("리그 + 컵대회 + 챔피언스리그 + 유로파리그 + 컨퍼런스리그 + 클럽월드컵 + 국가대표(예선 포함) 합산  ·  🟥은 전 대회 합산 퇴장 횟수")
+        hint = QLabel("리그 + 컵대회 + 챔피언스리그 + 유로파리그 + 컨퍼런스리그 + 클럽월드컵 + 승강PO + 국가대표(예선 포함) 합산  ·  🟨/🟥은 전 대회 합산 경고/퇴장 횟수")
         hint.setStyleSheet("color:#666;font-size:10px;padding:4px;")
         lay.addWidget(hint)
         return w

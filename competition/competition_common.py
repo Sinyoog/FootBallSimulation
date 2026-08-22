@@ -56,6 +56,10 @@ class CompetitionConfig:
     league_weeks: tuple                   # (시작주, 끝주) — CL_LEAGUE_WEEKS와 동일 형태
     end_week: int
     stage_order: list                     # ["R32","R16","QF","SF","F"]
+    # [2026-08 신설, 옐로카드 시스템] 이 대회의 출전정지 카운터 필드명.
+    # 기본값은 기존 그대로 "cl_suspension"(챔스/유로파/컨퍼런스 공유) —
+    # 슈퍼컵만 별도 그룹(super_cup_suspension)이라 SC_CFG가 오버라이드한다.
+    suspension_field: str = "cl_suspension"
 
 
 # ─────────────────────────────────────────────
@@ -920,6 +924,7 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
                              _player_perf, _my_result, _update_pop, _gen_score,
                              _save_match_detail, _soft_cap,
                              _check_suspended, _roll_red_card, _apply_red_card_dismissal,
+                             _roll_card_events,
                              _week_intl_cl_day, _log_highlight, _min_sortkey)
     from competition.champions_engine import _get_field_pos
     info = get_my_match_fn(week, day=day)
@@ -936,9 +941,10 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
     ae = entry(cfg, t["id"], m["away_team_id"])
     is_home = info["is_home"]
 
-    _suspended, _new_susp = _check_suspended(p, field="cl_suspension")
+    _susp_field = cfg.suspension_field
+    _suspended, _new_susp = _check_suspended(p, field=_susp_field)
     if _suspended:
-        update_player(cl_suspension=_new_susp)
+        update_player(**{_susp_field: _new_susp})
         add_log(f"🟥 출전정지로 결장{'  (다음 경기부터 복귀)' if _new_susp == 0 else f'  (남은 정지 {_new_susp}경기)'}",
                 "event")
 
@@ -970,14 +976,19 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
         events, detail = [], {"shots": 0, "shots_on": 0, "key_passes": 0,
                               "dribbles": 0, "blocks": 0, "pass_acc": 0.0}
         _absence_reason = "suspension"
+        _yellow_cnt = 0
     else:
         _opp_ovr = (ae["ovr"] if is_home else he["ovr"])
         goals, assists, saves, rating, events, detail = _player_perf(
             p, outcome, is_home, hs, as_, opp_ovr=_opp_ovr)
         _absence_reason = None
-        if _roll_red_card(p):
-            goals, assists, saves, rating, events, detail = _apply_red_card_dismissal(p, field="cl_suspension")
-            _absence_reason = "red_card"
+        _dismissed, _card_reason, _yellow_ev, _yellow_cnt = _roll_card_events(p, _susp_field)
+        if _dismissed:
+            goals, assists, saves, rating, events, detail = _apply_red_card_dismissal(
+                p, field=_susp_field, reason=_card_reason)
+            _absence_reason = _card_reason
+        elif _yellow_ev:
+            events = list(events) + _yellow_ev
     if not _suspended and "big_match_rating" in _pe:
         rating = max(3.0, min(10.0, round(rating + _pe["big_match_rating"], 1)))
     my_result = _my_result(outcome, is_home)
@@ -992,14 +1003,14 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
                     my_saves=?, my_goals=?, my_assists=?, my_rating=?,
                     my_shots=?, my_shots_on=?, my_key_passes=?,
                     my_dribbles=?, my_blocks=?, my_pass_acc=?, my_conceded=?,
-                    day=?, my_absence_reason=?
+                    day=?, my_absence_reason=?, my_yellow_cards=?
                     WHERE id=?""",
                  (hs, as_, pso_winner, pso_score,
                   0 if _suspended else 1, _get_field_pos(p),
                   saves, goals, assists, rating,
                   detail["shots"], detail["shots_on"], detail["key_passes"],
                   detail["dribbles"], detail["blocks"], detail["pass_acc"],
-                  my_conceded, day_val, _absence_reason, m["id"]))
+                  my_conceded, day_val, _absence_reason, _yellow_cnt, m["id"]))
     conn.commit()
     conn.close()
 

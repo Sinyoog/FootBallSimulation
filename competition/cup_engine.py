@@ -1023,7 +1023,8 @@ def simulate_my_cup_match(week, p, day=None):
     from game_engine import (add_log, get_player, update_player,
                              _player_perf, _my_result, _update_pop, _gen_score,
                              _save_match_detail, _soft_cap,
-                             _check_suspended, _roll_red_card, _apply_red_card_dismissal)
+                             _check_suspended, _roll_red_card, _apply_red_card_dismissal,
+                             _roll_card_events)
     from constants import PERSONALITY_EFFECTS
     # [2026-07 버그수정] day 파라미터가 시그니처엔 있었지만 실제로
     # get_my_cup_match에 전달이 안 돼 무시되고 있었다.
@@ -1081,6 +1082,7 @@ def simulate_my_cup_match(week, p, day=None):
         events, detail = [], {"shots": 0, "shots_on": 0, "key_passes": 0,
                               "dribbles": 0, "blocks": 0, "pass_acc": 0.0}
         _absence_reason = "suspension"
+        _yellow_cnt = 0
     else:
         # [2026-07 통일] intl_engine(국제대회)과 동일하게 "오늘 상대의 실제 팀
         # OVR"을 dom 기준으로 넘긴다 — 강팀 상대면 개인도 고전, 약체 상대면
@@ -1089,10 +1091,14 @@ def simulate_my_cup_match(week, p, day=None):
         goals, assists, saves, rating, events, detail = _player_perf(
             p, outcome, is_home, hs, as_, opp_ovr=_opp_ovr)
         _absence_reason = None
-        # [2026-07 신설] 퇴장 판정 — '폭력적' 성격의 red_card_chance 반영.
-        if _roll_red_card(p):
-            goals, assists, saves, rating, events, detail = _apply_red_card_dismissal(p, field="cup_suspension")
-            _absence_reason = "red_card"
+        _yellow_cnt = 0
+        _dismissed, _card_reason, _yellow_ev, _yellow_cnt = _roll_card_events(p, "cup_suspension")
+        if _dismissed:
+            goals, assists, saves, rating, events, detail = _apply_red_card_dismissal(
+                p, field="cup_suspension", reason=_card_reason)
+            _absence_reason = _card_reason
+        elif _yellow_ev:
+            events = list(events) + _yellow_ev
     # [2026-07 신설] '겁쟁이' 성격의 cup_rating(컵대회 전반 위축) +
     # '소심함'의 big_match_rating(결승전 한정 위축) 연결. 둘 다 정의만
     # 돼있고 실제 경기엔 연결이 안 돼있던 효과였다.
@@ -1114,13 +1120,13 @@ def simulate_my_cup_match(week, p, day=None):
                     my_saves=?, my_goals=?, my_assists=?, my_rating=?, day=?,
                     my_shots=?, my_shots_on=?, my_key_passes=?,
                     my_dribbles=?, my_blocks=?, my_pass_acc=?,
-                    my_absence_reason=?
+                    my_absence_reason=?, my_yellow_cards=?
                     WHERE id=?""",
                  (hs, as_, pso_winner, pso_score, 0 if _suspended else 1,
                   saves, goals, assists, rating, day,
                   detail["shots"], detail["shots_on"], detail["key_passes"],
                   detail["dribbles"], detail["blocks"], detail["pass_acc"],
-                  _absence_reason, m["id"]))
+                  _absence_reason, _yellow_cnt, m["id"]))
     conn.commit()
     conn.close()
 

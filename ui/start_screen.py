@@ -862,6 +862,11 @@ class NewPlayerDialog(QDialog):
         "g_mult": "득점 반영 배율", "a_mult": "도움 반영 배율",
         "gp_mult": "골 결정력(찬스 전환) 배율", "blk_mult": "수비 기여(차단) 배율",
         "sp_add": "세이브율 가산", "pa_add": "패스 정확도 가산",
+        # [2026-08 신설] shot/keypass/dribble mult 추가에 맞춰 라벨도 등록 —
+        # 안 넣어도 값 자체는 뜨지만(아래 루프가 mod.items() 전체를 도니까)
+        # 라벨 없이 영문 키 이름이 그대로 노출된다.
+        "shot_mult": "슈팅 시도 배율", "keypass_mult": "키패스 시도 배율",
+        "dribble_mult": "드리블 시도 배율",
     }
 
     def _note_for_role(self):

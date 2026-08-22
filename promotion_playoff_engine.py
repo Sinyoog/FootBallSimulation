@@ -561,7 +561,8 @@ def simulate_my_po_match(week, p, day=None):
     from game_engine import (add_log, get_player, update_player,
                              _player_perf, _my_result, _update_pop, _gen_score,
                              _save_match_detail, _soft_cap,
-                             _check_suspended, _roll_red_card, _apply_red_card_dismissal)
+                             _check_suspended, _roll_red_card, _apply_red_card_dismissal,
+                             _roll_card_events)
     from database import get_conn
     info = get_my_po_match(week, day=day, p=p)
     if not info:
@@ -610,12 +611,20 @@ def simulate_my_po_match(week, p, day=None):
         goals, assists, saves, rating = 0, 0, 0, 0.0
         events, detail = [], {"shots": 0, "shots_on": 0, "key_passes": 0,
                               "dribbles": 0, "blocks": 0, "pass_acc": 0.0}
+        _absence_reason = "suspension"
+        _yellow_cnt = 0
     else:
         _opp_ovr = a_ovr if is_home else h_ovr
         goals, assists, saves, rating, events, detail = _player_perf(
             p, outcome, is_home, hs, as_, opp_ovr=_opp_ovr)
-        if _roll_red_card(p):
-            goals, assists, saves, rating, events, detail = _apply_red_card_dismissal(p, field="po_suspension")
+        _absence_reason = None
+        _dismissed, _card_reason, _yellow_ev, _yellow_cnt = _roll_card_events(p, "po_suspension")
+        if _dismissed:
+            goals, assists, saves, rating, events, detail = _apply_red_card_dismissal(
+                p, field="po_suspension", reason=_card_reason)
+            _absence_reason = _card_reason
+        elif _yellow_ev:
+            events = list(events) + _yellow_ev
     if not _suspended and "big_match_rating" in _pe:
         rating = max(3.0, min(10.0, round(rating + _pe["big_match_rating"], 1)))
     my_result = _my_result(outcome, is_home)
@@ -623,11 +632,12 @@ def simulate_my_po_match(week, p, day=None):
     conn = get_conn()
     conn.execute(
         """UPDATE po_matches SET home_score=?, away_score=?, pso_winner=?, pso_score=?,
-           is_my=1, my_played=?, my_position=?, my_saves=?, my_goals=?, my_assists=?, my_rating=?
+           is_my=1, my_played=?, my_position=?, my_saves=?, my_goals=?, my_assists=?, my_rating=?,
+           my_absence_reason=?, my_yellow_cards=?
            WHERE id=?""",
         (hs, as_, pso_winner, pso_score,
          0 if _suspended else 1, _get_field_pos_safe(p),
-         saves, goals, assists, rating, m["id"]))
+         saves, goals, assists, rating, _absence_reason, _yellow_cnt, m["id"]))
     conn.commit()
 
     _update_pop(p, goals, assists, rating)

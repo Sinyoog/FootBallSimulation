@@ -18,6 +18,18 @@ QHeaderView::section { background:#252525; color:#888; border:none; padding:4px;
 QTableWidget::item:selected { background:#2a6a2a; }
 """
 
+# [2026-08 신설] 순위 칸을 구역 색으로 채울 때(_fill_table 참고) 그 배경
+# 위에서 숫자가 확실히 튀어 보이도록 배경색별 대비 글자색을 지정한다 —
+# 밝은 배경(옐로)은 검정, 어둡거나 채도 높은 배경(블루/오렌지/그린/레드)은
+# 흰색이 가장 잘 읽힌다(실측 대비 확인).
+_ZONE_TEXT_COLOR = {
+    "#4466ff": "#ffffff",   # 챔스권 — 블루 배경 + 흰 글자
+    "#ff7700": "#000000",   # 유로파권 — 오렌지 배경 + 검정 글자
+    "#215131": "#ffffff",   # 컨퍼런스권 — 어두운 그린 배경 + 흰 글자
+    "#ffee55": "#000000",   # 승강 PO권 — 옐로 배경 + 검정 글자
+    "#ff3333": "#ffffff",   # 강등 확정 — 레드 배경 + 흰 글자
+}
+
 class StandingsWindow(QDialog):
     def __init__(self, league_id, my_team_id, lang="ko", parent=None):
         super().__init__(parent)
@@ -314,14 +326,27 @@ class StandingsWindow(QDialog):
                     str(r["goals_for"]), str(r["goals_against"]),
                     str(r["goals_for"]-r["goals_against"]), str(r["pts"])]
             _zone_color = zone_colors.get(r["id"])
+            # [2026-08 신설, 신민용 요청: "챔스/강등 등 구역 표시가 팀명까지
+            # 통째로 물들여서 가독성이 떨어진다 — 순위 칸만 색 상자로
+            # 채우고, 내 팀 형광 표시는 그 순위 칸에는 적용하지 말아 달라"]
+            # 예전엔 이 구역 색을 행 전체(모든 칸)의 글자색으로 칠했고, 내 팀
+            # 강조(연두 형광)도 행 전체(배경+글자색)에 걸었다 — 그래서 내 팀이
+            # 승격/강등권에 걸리면 두 표시가 뒤섞여 어느 쪽인지 알아보기
+            # 힘들었다. 이제 역할을 분리한다: 순위(0번 칸)는 구역 색이 있으면
+            # "배경을 그 색으로 채우고 글자는 그 배경 위에서 튀는 색"으로
+            # 표시하는 전용 배지가 되고(내 팀이어도 이 칸은 형광 대신 항상
+            # 구역 색 배지를 우선한다), 나머지 칸(팀명 포함)은 구역 색을
+            # 더 이상 입히지 않고 내 팀 형광(연두 글자+어두운 연두 배경)만
+            # 그대로 적용한다.
             for j, v in enumerate(vals):
                 item = QTableWidgetItem(v)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if r["id"] == self.my_team_id:
+                if j == 0 and _zone_color:
+                    item.setBackground(QColor(_zone_color))
+                    item.setForeground(QColor(_ZONE_TEXT_COLOR.get(_zone_color, "#ffffff")))
+                elif j != 0 and r["id"] == self.my_team_id:
                     item.setBackground(QColor("#1a3a1a"))
                     item.setForeground(QColor("#00ff66"))
-                elif _zone_color:
-                    item.setForeground(QColor(_zone_color))
                 tbl.setItem(i, j, item)
 
         self._tbl = tbl

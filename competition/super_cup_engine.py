@@ -125,6 +125,11 @@ SC_CFG = CompetitionConfig(
     league_weeks=(SC_START_WEEK, SC_START_WEEK),
     end_week=SC_START_WEEK,
     stage_order=["SF", "F"],
+    # [2026-08 신설, 옐로카드 시스템] 슈퍼컵은 카드 누적 그룹상 유럽대항전
+    # (챔스/유로파/컨퍼런스)과 별개다 — 지금까지는 competition_common.
+    # simulate_my_match의 기본값(cl_suspension)을 그대로 물려받아 셋과
+    # 같은 카운터를 썼는데(버그), 이제 전용 필드로 분리한다.
+    suspension_field="super_cup_suspension",
 )
 
 _CONTINENTS = ("유럽", "아시아", "아프리카", "북남미")

@@ -1073,6 +1073,16 @@ def start_qualifying_if_needed(year):
         if [t for t in get_tournaments(year) if t["kind"] == "wc_qual"]:
             return  # 이미 이 해 예선이 생성됨 → 중복 방지
 
+        # [2026-08 신설, 옐로카드 시스템] 새 월드컵 예선 사이클이 시작되는
+        # 시점에 wc_qual 그룹의 결장카운터/시즌누적경고를 리셋한다 — 국가
+        # 대표는 클럽처럼 매년 리셋할 수 없어서(소집 자체가 가끔이라) "그
+        # 대회 사이클이 새로 열릴 때"를 리셋 시점으로 삼는다. 지난 예선
+        # 사이클에서 미처 소진되지 않고 남아있던 결장/누적이 다음 예선까지
+        # 이어지는 걸 막는다(월드컵 본선/기타 국제대회 그룹인 intl_suspension/
+        # season_yellow_intl은 여기서 건드리지 않음 — 별도 그룹이라 그대로 유지).
+        from game_engine import update_player as _reset_wcq
+        _reset_wcq(wc_qual_suspension=0, season_yellow_wc_qual=0)
+
         _clear_entry_cache()
         my_nats, nat_info, committed = _gather_nat_context(p)
 
@@ -2934,7 +2944,8 @@ def simulate_my_match(week, p, day=None):
     from game_engine import (add_log, get_player, update_player,
                              _player_perf, _my_result, _update_pop, _gen_score,
                              _save_match_detail, _soft_cap,
-                             _check_suspended, _roll_red_card, _apply_red_card_dismissal)
+                             _check_suspended, _roll_red_card, _apply_red_card_dismissal,
+                             _roll_card_events)
     info = get_my_match(week, day=day)
     if not info:
         return
@@ -2970,10 +2981,18 @@ def simulate_my_match(week, p, day=None):
     is_home = info["is_home"]
     knockout = m["stage"] not in ("group", "qual_group")  # [버그수정] 예선 조별도 무승부 허용
 
+    # [2026-08 신설, 옐로카드 시스템] 월드컵 예선(wc_qual)은 본선과 카드
+    # 누적 그룹을 분리한다 — 예선 마지막 경기에서 받은 퇴장/정지가 본선
+    # 개막전 결장으로 이어지던 버그 수정. 그 외(cont_qual/본선/유로/AFCON/
+    # 아시안컵/지역컵 등)는 지금 단계에서 전부 intl_suspension 하나로
+    # 유지(신민용+GPT 협의 확정 — 국가대표 대회가 클럽만큼 빈번하지 않아
+    # 더 세분화할 실익이 작음).
+    _susp_field = "wc_qual_suspension" if t.get("kind") == "wc_qual" else "intl_suspension"
+
     # [2026-07 신설] 출전정지 체크 — 퇴장 다음 경기는 강제 결장.
-    _suspended, _new_susp = _check_suspended(p, field="intl_suspension")
+    _suspended, _new_susp = _check_suspended(p, field=_susp_field)
     if _suspended:
-        update_player(intl_suspension=_new_susp)
+        update_player(**{_susp_field: _new_susp})
         add_log(f"🟥 출전정지로 결장{'  (다음 경기부터 복귀)' if _new_susp == 0 else f'  (남은 정지 {_new_susp}경기)'}",
                 "event")
 
@@ -3010,6 +3029,7 @@ def simulate_my_match(week, p, day=None):
         events, detail = [], {"shots": 0, "shots_on": 0, "key_passes": 0,
                               "dribbles": 0, "blocks": 0, "pass_acc": 0.0}
         _absence_reason = "suspension"
+        _yellow_cnt = 0
     else:
         # [수정] 국제대회 개인 경기력은 '상대 국가대표 평균 OVR'을 dom 기준으로
         # 삼는다. 내가 홈이면 상대는 ae(원정), 원정이면 he(홈). 강팀 상대면
@@ -3019,10 +3039,15 @@ def simulate_my_match(week, p, day=None):
         goals, assists, saves, rating, events, detail = _player_perf(
             p, outcome, is_home, hs, as_, opp_ovr=_opp_ovr)
         _absence_reason = None
-        # [2026-07 신설] 퇴장 판정 — '폭력적' 성격의 red_card_chance 반영.
-        if _roll_red_card(p):
-            goals, assists, saves, rating, events, detail = _apply_red_card_dismissal(p, field="intl_suspension")
-            _absence_reason = "red_card"
+        _yellow_cnt = 0
+        # [2026-07 신설 → 2026-08 확장(옐로카드)] 카드 판정.
+        _dismissed, _card_reason, _yellow_ev, _yellow_cnt = _roll_card_events(p, _susp_field)
+        if _dismissed:
+            goals, assists, saves, rating, events, detail = _apply_red_card_dismissal(
+                p, field=_susp_field, reason=_card_reason)
+            _absence_reason = _card_reason
+        elif _yellow_ev:
+            events = list(events) + _yellow_ev
     # [2026-07 신설] '소심함' 성격의 big_match_rating 연결 — 국가대표 경기는
     # 전부 빅매치 성격이라(챔스와 동일 기준) 모든 경기에 적용한다.
     if not _suspended and "big_match_rating" in _pe:
@@ -3043,14 +3068,14 @@ def simulate_my_match(week, p, day=None):
                     my_saves=?, my_goals=?, my_assists=?, my_rating=?,
                     my_shots=?, my_shots_on=?, my_key_passes=?,
                     my_dribbles=?, my_blocks=?, my_pass_acc=?, my_conceded=?,
-                    day=?, my_absence_reason=?
+                    day=?, my_absence_reason=?, my_yellow_cards=?
                     WHERE id=?""",
                  (hs, as_, pso_winner, pso_score,
                   0 if _suspended else 1, nat, _get_field_pos(p),
                   saves, goals, assists, rating,
                   detail["shots"], detail["shots_on"], detail["key_passes"],
                   detail["dribbles"], detail["blocks"], detail["pass_acc"],
-                  my_conceded, day, _absence_reason, m["id"]))
+                  my_conceded, day, _absence_reason, _yellow_cnt, m["id"]))
     conn.commit()
     conn.close()
 

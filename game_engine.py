@@ -85,11 +85,11 @@ def _invalidate_team_ovr_cache():
     _team_formation_cache.clear()
     # 승강으로 팀이 다른 리그로 이동해도 팀명은 안 바뀌므로 _team_name_cache는 비우지 않음
 
-    # [2026-08 신설, 성능] 국내컵 엔진의 "나라·티어별 팀 목록" 캐시
-    # (cup_engine._tier_teams_cache)도 같은 타이밍(시즌 전환)에 함께
-    # 비운다 — 이 모듈이 파일 최상단에서 이미 cup_engine을 import하고
-    # 있어 순환 임포트 걱정 없이 바로 호출 가능(cup_engine 쪽은 반대
-    # 방향이라 함수 내부에서 game_engine을 지연 임포트하는 것과 대칭).
+    # [2026-08 신설, 성능] 국내컵 엔진의 "나라·티어별 팀 목록"/cup_entries
+    # 캐시(cup_engine._tier_teams_cache, _entry_cache)도 같은 타이밍(시즌
+    # 전환)에 함께 비운다 — 이 모듈이 파일 최상단에서 이미 cup_engine을
+    # import하고 있어 순환 임포트 걱정 없이 바로 호출 가능(cup_engine 쪽은
+    # 반대 방향이라 함수 내부에서 game_engine을 지연 임포트하는 것과 대칭).
     cup_engine._invalidate_cup_engine_caches()
 
     # 포메이션 위젯 선수 목록 캐시 무효화
@@ -1078,16 +1078,17 @@ def _update_career_stats(p, year, week):
 
     cs = _calc_clean_sheets(c, tid, season, matches=sm)
     rc_league = p.get("season_red_cards_league", 0)
+    yc_league = p.get("season_yellow_league", 0)
 
     c.execute("""UPDATE career_entries SET
         matches=?, goals=?, assists=?, saves=?, goals_against=?,
         avg_rating=?, team_rank=?, wins=?, draws=?, losses=?, clean_sheets=?,
         shots=?, shots_on=?, key_passes=?, dribbles=?, blocks=?, pass_acc=?,
-        team_id=?, league_name=?, tier=?, red_cards=?
+        team_id=?, league_name=?, tier=?, red_cards=?, yellow_cards=?
         WHERE id=?""",
         (sm, sg, sa, ss, sga, avg_r, rn, tw, td, tl, cs,
          d_sh, d_sho, d_kp, d_drb, d_blk, d_pac, tid,
-         lname, tier, rc_league, existing["id"]))
+         lname, tier, rc_league, yc_league, existing["id"]))
     conn.commit()
     conn.close()
 
@@ -1158,17 +1159,18 @@ def _close_career_entry(p, year, week, exit_type=""):
 
     cs = _calc_clean_sheets(c, tid, season, matches=sm)
     rc_league = p.get("season_red_cards_league", 0)
+    yc_league = p.get("season_yellow_league", 0)
 
     c.execute("""UPDATE career_entries SET
         end_year=?, end_week=?, matches=?, goals=?, assists=?, saves=?, goals_against=?,
         avg_rating=?, team_rank=?, wins=?, draws=?, losses=?, clean_sheets=?,
         shots=?, shots_on=?, key_passes=?, dribbles=?, blocks=?, pass_acc=?,
-        league_name=?, tier=?, salary=?, position=?, team_id=?, exit_type=?, red_cards=?
+        league_name=?, tier=?, salary=?, position=?, team_id=?, exit_type=?, red_cards=?, yellow_cards=?
         WHERE id=?""",
         (year, week, sm, sg, sa, ss, sga, avg_r, rn, tw, td, tl, cs,
          d_sh, d_sho, d_kp, d_drb, d_blk, d_pac,
          lname, tier, p.get("salary", 0),
-         p.get("position", ""), tid, exit_type, rc_league, existing["id"]))
+         p.get("position", ""), tid, exit_type, rc_league, yc_league, existing["id"]))
 
     conn.commit()
     conn.close()
@@ -3002,11 +3004,16 @@ def _simulate_match(p, week, info: dict, day=None):
             p, outcome, is_home, hs, as_, c=c, opp_ovr=_opp_ovr, opp_sot=_opp_sot)
         if p.get("slump"):
             rating = round(max(3.0, rating + SLUMP_RATING_PENALTY), 1)
-        # [2026-07 신설] 퇴장 판정 — '폭력적' 성격의 red_card_chance 반영.
-        # 발동하면 그 경기 활약(골/도움/평점)을 조기 강판 처리로 덮어쓰고
-        # 다음 경기 출전정지를 건다.
-        if _roll_red_card(p):
-            goals, assists, saves, rating, events, detail = _apply_red_card_dismissal(p)
+        # [2026-07 신설 → 2026-08 확장(옐로카드)] 카드 판정 — 스트레이트
+        # 레드/경고누적 2차 옐로면 그 경기 활약(골/도움/평점)을 조기 강판
+        # 처리로 덮어쓰고 다음 경기 출전정지를 건다. 단독 옐로 1장이면
+        # 경기는 정상 진행되고 로그에 "🟨 경고"만 한 줄 추가된다.
+        _dismissed, _card_reason, _yellow_ev, _yc = _roll_card_events(p, "red_card_suspension")
+        if _dismissed:
+            goals, assists, saves, rating, events, detail = _apply_red_card_dismissal(
+                p, reason=_card_reason)
+        elif _yellow_ev:
+            events = list(events) + _yellow_ev
 
         # [2026-08 신설, 골 시상 시스템 v4] 실제로 골을 넣었으면 즉시
         # goal_events에 기록(is_mine=1, is_pseudo=0) — "올해의 골" 판정의
@@ -3556,7 +3563,7 @@ def _check_suspended(p, field="red_card_suspension"):
     return False, 0
 
 
-def _apply_red_card_dismissal(p, field="red_card_suspension"):
+def _apply_red_card_dismissal(p, field="red_card_suspension", reason="red_card"):
     """퇴장 처리: 그 경기 평점을 고정값으로, 골/도움/세이브는 조기 강판
     특성상 0으로 처리하고, 다음 경기(같은 대회 한정) 출전정지 1경기를 건다.
     반환: (goals, assists, saves, rating, events, detail) — _player_perf와
@@ -3569,8 +3576,14 @@ def _apply_red_card_dismissal(p, field="red_card_suspension"):
     올리고, field가 기본값(red_card_suspension)일 때만 — 즉 "리그" 경기일
     때만 — 리그 전용 카운터(season/total_red_cards_league)도 함께 올린다.
     커리어/은퇴창의 "전체 기록"은 total_red_cards_all을, "리그 기록"은
-    total_red_cards_league/career_entries.red_cards를 보여주기 위함."""
-    events = [(_sample_minutes(1, 15, 85)[0], "🟥 퇴장! 조기 강판")]
+    total_red_cards_league/career_entries.red_cards를 보여주기 위함.
+
+    [2026-08 확장, 옐로카드 시스템] reason="second_yellow"면 경고누적
+    퇴장(같은 경기 두 번째 옐로)이라 이벤트 문구만 다르게 표시한다 —
+    통계상으로는 스트레이트 레드와 동일하게 "레드카드 1회"로 집계된다
+    (실제 축구에서도 2차 경고 퇴장은 레드카드로 기록되는 것과 동일)."""
+    _text = "🟥 퇴장! 경고 누적(2차 경고)" if reason == "second_yellow" else "🟥 퇴장! 조기 강판"
+    events = [(_sample_minutes(1, 15, 85)[0], _text)]
     detail = {"shots": 0, "shots_on": 0, "key_passes": 0,
               "dribbles": 0, "blocks": 0, "pass_acc": 0.0}
     _is_league_rc = (field == "red_card_suspension")
@@ -3580,6 +3593,100 @@ def _apply_red_card_dismissal(p, field="red_card_suspension"):
         _rc_updates["season_red_cards_league"] = p.get("season_red_cards_league", 0) + 1
     update_player(**_rc_updates)
     return 0, 0, 0, RED_CARD_RATING, events, detail
+
+
+# ══════════════════════════════════════════════════════════════
+# [2026-08 신설, 옐로카드 시스템] 레드카드와 마찬가지로 리그/컵/챔스류/
+# 슈퍼컵/클럽월드컵/국가대표(예선·본선)/승강PO 전 대회 공통으로 쓰는
+# 진입점. 레드카드는 트랙 하나(즉시 퇴장)뿐이었지만 옐로카드는 두 트랙이
+# 있다 — (A) 시즌(또는 대회 사이클) 누적 5장 → 다음 경기 결장,
+# (B) 한 경기 안에서 옐로 2장 → 그 경기 퇴장(기존 _apply_red_card_dismissal
+# 재사용). 신민용+GPT 협의로 확정된 규칙: 2차 옐로는 통산 카운터엔
+# 정상 반영하되, "시즌 누적 징계 카운터"에는 반영하지 않는다 — 첫 옐로
+# 하나만 그 카운터에 얹혀서, 5장 문턱과 2차옐로 퇴장이 같은 경기에 겹쳐
+# 징계가 두 번 나가는 사고를 원천 차단한다.
+# ══════════════════════════════════════════════════════════════
+BASE_YELLOW_CARD_CHANCE = 0.09   # 평균적인 선수의 경기당 기본 경고 확률
+SECOND_YELLOW_CHANCE = 0.03      # 이미 그 경기에서 옐로를 받은 선수가 한 번 더 받을 확률
+YELLOW_SUSPENSION_THRESHOLD = 5  # 그룹별 시즌(대회 사이클) 누적 경고 몇 장부터 정지인지
+
+# 대회별 결장 카운터 필드 → 그 그룹의 "시즌/대회사이클 누적 경고" 필드.
+# 결장 카운터 자체(=다음 경기 결장 여부)는 레드카드와 완전히 동일한 필드를
+# 공유한다 — 원인(스트레이트 레드/2차 옐로/5장 누적)과 무관하게 "다음 경기
+# 결장 1경기"라는 결과는 같으므로 새 필드는 슈퍼컵/월드컵예선 2개만 신설.
+YELLOW_GROUP_FIELD = {
+    "red_card_suspension":  "season_yellow_league",
+    "cup_suspension":       "season_yellow_cup",
+    "cl_suspension":        "season_yellow_europe",
+    "super_cup_suspension": "season_yellow_super_cup",
+    "cwc_suspension":       "season_yellow_cwc",
+    "wc_qual_suspension":   "season_yellow_wc_qual",
+    "intl_suspension":      "season_yellow_intl",
+    "po_suspension":        "season_yellow_po",
+}
+
+
+def _roll_yellow_card(p):
+    """이번 경기 '첫 번째' 옐로카드 판정. '폭력적' 성격이면 PERSONALITY_
+    EFFECTS의 yellow_card_chance만큼 가산된다."""
+    pe = PERSONALITY_EFFECTS.get(p.get("personality", ""), {})
+    chance = BASE_YELLOW_CARD_CHANCE + pe.get("yellow_card_chance", 0.0)
+    return random.random() < chance
+
+
+def _roll_card_events(p, field):
+    """한 경기의 카드 판정을 스트레이트 레드 → 첫 옐로 → 2차 옐로 순으로
+    굴리고, 옐로 관련 DB 카운터(통산/시즌누적)까지 이 함수 안에서 전부
+    반영한다 — 호출부(리그/컵/챔스류/슈퍼컵/클럽월드컵/국가대표/승강PO)가
+    각자 반복 구현할 필요 없이 여기 한 곳만 쓰면 된다.
+
+    field: 그 경기가 속한 대회의 결장카운터 필드명(red_card_suspension 등).
+
+    반환: (dismissed, reason, events, yellow_count)
+      dismissed=True면 호출부는 기존처럼
+      _apply_red_card_dismissal(p, field=field, reason=reason)을 호출해
+      스탯/평점 처리를 그대로 재사용하면 된다. reason은
+      "red_card" | "second_yellow" | None.
+      dismissed=False인데 yellow_count==1이면 정상적으로 경기가 계속
+      진행된 경우 — 호출부는 events(🟨 경고 로그 한 줄)를 정상 활약
+      이벤트 목록에 합쳐서 저장하면 된다. yellow_count는 그 경기에서
+      받은 옐로 장수(0/1/2) — my_yellow_cards 컬럼 저장용."""
+    if _roll_red_card(p):
+        return True, "red_card", [], 0
+
+    if not _roll_yellow_card(p):
+        return False, None, [], 0
+
+    # 첫 옐로 — 통산 + 시즌(대회사이클) 누적 카운터 반영.
+    season_field = YELLOW_GROUP_FIELD.get(field)
+    p2 = get_player() or p
+    _updates = {"total_yellow_all": p2.get("total_yellow_all", 0) + 1}
+    _is_league = (field == "red_card_suspension")
+    if _is_league:
+        _updates["total_yellow_league"] = p2.get("total_yellow_league", 0) + 1
+    _season_cnt = p2.get(season_field, 0) + 1 if season_field else 0
+    if season_field:
+        _updates[season_field] = _season_cnt
+    minute = _sample_minutes(1, 15, 85)[0]
+    events = [(minute, "🟨 경고")]
+
+    if random.random() < SECOND_YELLOW_CHANCE:
+        # 2차 옐로(경고누적 퇴장) — 통산에는 +1 더 반영하되, 시즌 누적
+        # "징계" 카운터는 첫 옐로 값 그대로 둔다(5장 문턱과 겹치지 않게).
+        _updates["total_yellow_all"] += 1
+        if _is_league:
+            _updates["total_yellow_league"] += 1
+        update_player(**_updates)
+        return True, "second_yellow", events, 2
+
+    # 첫 옐로만으로 끝난 경우 — 시즌 누적이 문턱(5장)에 도달했으면 다음
+    # 경기 결장 처리 + 카운터 리셋(2차 옐로로 이어졌다면 위에서 이미
+    # return 됐으므로 여기 오지 않아 징계 중복 걱정이 없다).
+    if season_field and _season_cnt >= YELLOW_SUSPENSION_THRESHOLD:
+        _updates[field] = 1
+        _updates[season_field] = 0
+    update_player(**_updates)
+    return False, None, events, 1
 
 
 def _gen_score(outcome, diff=0.0):
@@ -3842,37 +3949,77 @@ def _roll_is_pk_concede():
 # 모듈 레벨에 둬서 _player_perf(내 선수 개별경기)와 _estimate_ai_season
 # (AI 시즌추정) 양쪽이 같은 기준표를 공유한다.
 _SUB_ROLE_MATCH_MOD = {
-    ("ST", "포처"):        {"g_mult": 1.15, "gp_mult": 1.10, "a_mult": 0.75},
-    ("ST", "타깃형"):      {"g_mult": 0.90, "a_mult": 1.30, "sp_add": 0.05},
-    ("ST", "올라운더"):    {"g_mult": 1.05, "a_mult": 1.05},  # [세분화 2026-07] 극단 없이 균형형
-    ("CF", "딥라잉"):      {"g_mult": 0.85, "a_mult": 1.30},
-    ("CF", "타깃형"):      {"g_mult": 0.95, "a_mult": 1.15, "sp_add": 0.04},
-    ("CF", "폴스나인"):    {"g_mult": 0.70, "a_mult": 1.45},  # [세분화 2026-07] 처지는 9번, 연계 극대화
-    ("LW", "인버티드"):    {"g_mult": 1.30, "gp_mult": 1.15, "a_mult": 0.75},
-    ("LW", "클래식윙어"):  {"g_mult": 0.75, "a_mult": 1.30, "sp_add": 0.03},
-    ("LW", "폴스윙어"):    {"g_mult": 0.80, "a_mult": 1.35},  # [세분화 2026-07] 중앙으로 처지는 윙어
-    ("RW", "인버티드"):    {"g_mult": 1.30, "gp_mult": 1.15, "a_mult": 0.75},
-    ("RW", "클래식윙어"):  {"g_mult": 0.75, "a_mult": 1.30, "sp_add": 0.03},
-    ("RW", "폴스윙어"):    {"g_mult": 0.80, "a_mult": 1.35},
-    ("CAM", "섀도우"):     {"g_mult": 1.25, "a_mult": 0.85},
-    ("CAM", "클래식"):     {"g_mult": 0.85, "a_mult": 1.20},
-    ("CAM", "세컨드스트라이커"): {"g_mult": 1.35, "a_mult": 0.70},  # [세분화 2026-07] 사실상 반쪽 스트라이커
-    ("CM", "박스투박스"):  {"g_mult": 1.20, "a_mult": 1.15},
-    ("CM", "플레이메이커"): {"g_mult": 0.80, "a_mult": 1.35, "pa_add": 0.03},
-    ("CM", "워크호스"):    {"g_mult": 0.95, "a_mult": 1.10},  # [세분화 2026-07] 활동량형, 도움 쪽으로 살짝
-    ("CDM", "홀딩"):       {"g_mult": 0.65, "a_mult": 0.70, "blk_mult": 1.20},
-    ("CDM", "박스투박스"): {"g_mult": 1.30, "a_mult": 1.30},
-    ("CDM", "딥라잉플레이메이커"): {"g_mult": 0.60, "a_mult": 1.50, "pa_add": 0.05},  # [세분화 2026-07] 레지스타형, 패스로 도움 극대화
-    ("LB", "공격형"):      {"a_mult": 1.30, "sp_add": 0.02, "blk_mult": 0.90},
-    ("LB", "수비형"):      {"a_mult": 0.70, "sp_add": 0.02, "blk_mult": 1.15},
-    ("LB", "윙백"):        {"a_mult": 1.55, "sp_add": 0.02, "blk_mult": 0.85},  # [세분화 2026-07] 공격형보다 더 적극적인 오버래핑
-    ("RB", "공격형"):      {"a_mult": 1.30, "sp_add": 0.02, "blk_mult": 0.90},
-    ("RB", "수비형"):      {"a_mult": 0.70, "sp_add": 0.02, "blk_mult": 1.15},
-    ("RB", "윙백"):        {"a_mult": 1.55, "sp_add": 0.02, "blk_mult": 0.85},
-    ("CB", "볼플레잉"):    {"a_mult": 1.40, "pa_add": 0.04, "blk_mult": 0.90},
-    ("CB", "수비형"):      {"sp_add": 0.02, "pa_add": -0.02, "blk_mult": 1.20},
-    ("CB", "리베로"):      {"a_mult": 1.20, "sp_add": 0.01, "pa_add": 0.02, "blk_mult": 1.05},  # [세분화 2026-07] 볼플레잉과 수비형 중간, 커버형
+    # [2026-08 확장, 신민용+GPT 설계 검토 확정] 기존 g_mult/a_mult/gp_mult/
+    # sp_add/pa_add/blk_mult 6종에 shot_mult/keypass_mult/dribble_mult 3종을
+    # 추가한다 — shots/key_passes/dribbles는 이미 포지션별 가중치(shot_w/
+    # key_w/drb_w, _player_perf 참고)로 Poisson 생성되고 있었는데 세부역할이
+    # 이 셋을 전혀 건드리지 않고 있었다(골/어시/블록/패스성공률만 반영).
+    # "역할 보정이 포지션 기본값을 뒤집을 수 있다"는 우려는 실측으로 반박됨
+    # (가장 공격적인 조합인 CDM 박스투박스 1.30배도 CM 무보정 기본값의
+    # 43%(골)/60%(어시)에 그침 — 포지션 자체의 base 격차가 훨씬 큼), 그래서
+    # 기존 g_mult/a_mult와 같은 스케일(0.70~1.35)로 안전하게 적용한다.
+    ("ST", "포처"):        {"g_mult": 1.15, "gp_mult": 1.10, "a_mult": 0.75,
+                             "shot_mult": 1.20, "keypass_mult": 0.80, "dribble_mult": 0.85},
+    ("ST", "타깃형"):      {"g_mult": 0.90, "a_mult": 1.30, "sp_add": 0.05,
+                             "shot_mult": 0.85, "keypass_mult": 1.15, "dribble_mult": 0.80},
+    ("ST", "올라운더"):    {"g_mult": 1.05, "a_mult": 1.05,  # [세분화 2026-07] 극단 없이 균형형
+                             "shot_mult": 1.00, "keypass_mult": 1.00, "dribble_mult": 1.00},
+    ("CF", "딥라잉"):      {"g_mult": 0.85, "a_mult": 1.30,
+                             "shot_mult": 0.85, "keypass_mult": 1.20, "dribble_mult": 1.10},
+    ("CF", "타깃형"):      {"g_mult": 0.95, "a_mult": 1.15, "sp_add": 0.04,
+                             "shot_mult": 0.90, "keypass_mult": 1.10, "dribble_mult": 0.80},
+    ("CF", "폴스나인"):    {"g_mult": 0.70, "a_mult": 1.45,  # [세분화 2026-07] 처지는 9번, 연계 극대화
+                             "shot_mult": 0.75, "keypass_mult": 1.30, "dribble_mult": 1.20},
+    ("LW", "인버티드"):    {"g_mult": 1.30, "gp_mult": 1.15, "a_mult": 0.75,
+                             "shot_mult": 1.20, "keypass_mult": 0.80, "dribble_mult": 1.05},
+    ("LW", "클래식윙어"):  {"g_mult": 0.75, "a_mult": 1.30, "sp_add": 0.03,
+                             "shot_mult": 0.80, "keypass_mult": 1.25, "dribble_mult": 1.20},
+    ("LW", "폴스윙어"):    {"g_mult": 0.80, "a_mult": 1.35,  # [세분화 2026-07] 중앙으로 처지는 윙어
+                             "shot_mult": 0.80, "keypass_mult": 1.25, "dribble_mult": 1.10},
+    ("RW", "인버티드"):    {"g_mult": 1.30, "gp_mult": 1.15, "a_mult": 0.75,
+                             "shot_mult": 1.20, "keypass_mult": 0.80, "dribble_mult": 1.05},
+    ("RW", "클래식윙어"):  {"g_mult": 0.75, "a_mult": 1.30, "sp_add": 0.03,
+                             "shot_mult": 0.80, "keypass_mult": 1.25, "dribble_mult": 1.20},
+    ("RW", "폴스윙어"):    {"g_mult": 0.80, "a_mult": 1.35,
+                             "shot_mult": 0.80, "keypass_mult": 1.25, "dribble_mult": 1.10},
+    ("CAM", "섀도우"):     {"g_mult": 1.25, "a_mult": 0.85,
+                             "shot_mult": 1.20, "keypass_mult": 0.85, "dribble_mult": 0.95},
+    ("CAM", "클래식"):     {"g_mult": 0.85, "a_mult": 1.20,
+                             "shot_mult": 0.90, "keypass_mult": 1.20, "dribble_mult": 1.05},
+    ("CAM", "세컨드스트라이커"): {"g_mult": 1.35, "a_mult": 0.70,  # [세분화 2026-07] 사실상 반쪽 스트라이커
+                             "shot_mult": 1.25, "keypass_mult": 0.75, "dribble_mult": 0.90},
+    ("CM", "박스투박스"):  {"g_mult": 1.20, "a_mult": 1.15,
+                             "shot_mult": 1.20, "keypass_mult": 1.05, "dribble_mult": 1.05},
+    ("CM", "플레이메이커"): {"g_mult": 0.80, "a_mult": 1.35, "pa_add": 0.03,
+                             "shot_mult": 0.80, "keypass_mult": 1.30, "dribble_mult": 1.00},
+    ("CM", "워크호스"):    {"g_mult": 0.95, "a_mult": 1.10,  # [세분화 2026-07] 활동량형, 도움 쪽으로 살짝
+                             "shot_mult": 0.90, "keypass_mult": 1.05, "dribble_mult": 0.90},
+    ("CDM", "홀딩"):       {"g_mult": 0.65, "a_mult": 0.70, "blk_mult": 1.20,
+                             "shot_mult": 0.70, "keypass_mult": 0.80, "dribble_mult": 0.75},
+    ("CDM", "박스투박스"): {"g_mult": 1.30, "a_mult": 1.30,
+                             "shot_mult": 1.15, "keypass_mult": 1.05, "dribble_mult": 1.00},
+    ("CDM", "딥라잉플레이메이커"): {"g_mult": 0.60, "a_mult": 1.50, "pa_add": 0.05,  # [세분화 2026-07] 레지스타형, 패스로 도움 극대화
+                             "shot_mult": 0.70, "keypass_mult": 1.35, "dribble_mult": 0.85},
+    ("LB", "공격형"):      {"a_mult": 1.30, "sp_add": 0.02, "blk_mult": 0.90,
+                             "shot_mult": 1.10, "keypass_mult": 1.15, "dribble_mult": 1.05},
+    ("LB", "수비형"):      {"a_mult": 0.70, "sp_add": 0.02, "blk_mult": 1.15,
+                             "shot_mult": 0.80, "keypass_mult": 0.85, "dribble_mult": 0.85},
+    ("LB", "윙백"):        {"a_mult": 1.55, "sp_add": 0.02, "blk_mult": 0.85,  # [세분화 2026-07] 공격형보다 더 적극적인 오버래핑
+                             "shot_mult": 1.10, "keypass_mult": 1.20, "dribble_mult": 1.20},
+    ("RB", "공격형"):      {"a_mult": 1.30, "sp_add": 0.02, "blk_mult": 0.90,
+                             "shot_mult": 1.10, "keypass_mult": 1.15, "dribble_mult": 1.05},
+    ("RB", "수비형"):      {"a_mult": 0.70, "sp_add": 0.02, "blk_mult": 1.15,
+                             "shot_mult": 0.80, "keypass_mult": 0.85, "dribble_mult": 0.85},
+    ("RB", "윙백"):        {"a_mult": 1.55, "sp_add": 0.02, "blk_mult": 0.85,
+                             "shot_mult": 1.10, "keypass_mult": 1.20, "dribble_mult": 1.20},
+    ("CB", "볼플레잉"):    {"a_mult": 1.40, "pa_add": 0.04, "blk_mult": 0.90,
+                             "shot_mult": 0.90, "keypass_mult": 1.25, "dribble_mult": 0.95},
+    ("CB", "수비형"):      {"sp_add": 0.02, "pa_add": -0.02, "blk_mult": 1.20,
+                             "shot_mult": 0.80, "keypass_mult": 0.75, "dribble_mult": 0.75},
+    ("CB", "리베로"):      {"a_mult": 1.20, "sp_add": 0.01, "pa_add": 0.02, "blk_mult": 1.05,  # [세분화 2026-07] 볼플레잉과 수비형 중간, 커버형
+                             "shot_mult": 0.95, "keypass_mult": 1.05, "dribble_mult": 1.10},
 }
+
 
 # [세분화 2026-07] GK 세부역할별 선방률(_sr_target) 미세 가산.
 # 스위퍼킵퍼는 배급/스위핑에 무게가 쏠려 순수 선방은 살짝 낮고,
@@ -4114,7 +4261,19 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None, opp_sot=Non
 
         elif pos == "CDM":
             base = 6.68
-            g_base, g_sh, g_dr = 0.017, 0.026, 0.009
+            # [2026-08 신설, 신민용+GPT 검토 확정: "CDM 공격포인트가 실측
+            # 결과 다른 포지션 대비 지나치게 낮다"] 38경기 몬테카를로 실측
+            # (60회 반복)에서 CDM 최상급이 2.3골/3.8어시로, GPT가 제시한
+            # 1차 목표(평범 1~2/1~3 ~ 최상급 4~6/4~7)에 크게 못 미쳤다.
+            # 처음부터 그 목표치까지 한 번에 맞추면 평점/시상/성장 등
+            # 연쇄 영향이 클 수 있어(g_base/g_sh/g_dr은 개인상 판정에도
+            # 직접 쓰임 — _position_award_score 등), 1차로 g_base만
+            # 25% 상향(0.017→0.021)하고 재실측 후 필요하면 2차 조정한다.
+            # g_sh/g_dr(스탯 가중 골 확률)과 a_base/a_pa/a_dr(어시스트
+            # 축)은 이번엔 건드리지 않음 — 골만 우선 조정하고 어시스트는
+            # 이 변경이 실제로 안 건드리므로(gprob/aprob 완전히 독립된
+            # 계산) 재측정에서 그대로 유지될 것으로 예상됨.
+            g_base, g_sh, g_dr = 0.021, 0.026, 0.009
             a_base, a_pa, a_dr = 0.038, 0.071, 0.021
             g_goal, g_asst     = 0.80, 0.75
             g_pos_mult         = 0.28
@@ -4334,15 +4493,18 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None, opp_sot=Non
             shot_w, key_w, drb_w, blk_w = 0.5, 1.3, 1.2, 1.00
         else:  # CB
             shot_w, key_w, drb_w, blk_w = 0.3, 0.5, 0.4, 1.22
-        shots = int(round(shot_w * 0.72 * (0.4+0.6*sh) * _att_dom + random.uniform(0,0.7)))
+        shots = int(round(shot_w * 0.72 * (0.4+0.6*sh) * _att_dom
+                           * (_mod.get("shot_mult", 1.0) if _mod else 1.0) + random.uniform(0,0.7)))
         shots = max(goals, shots)
         on_ratio = 0.28 + 0.16*sh
         shots_on = int(round(shots * on_ratio + random.uniform(0,0.4)))
         shots_on = max(min(shots,goals), min(shots,shots_on))
         _kp_lambda = key_w * 0.66 * (0.35+0.4*pa+0.25*dr) * _att_dom
+        _kp_lambda *= _mod.get("keypass_mult", 1.0) if _mod else 1.0
         key_passes = _poisson(_kp_lambda)
         key_passes = max(assists, key_passes)
         _drb_lambda = drb_w * 0.78 * (0.4+0.45*dr+0.15*spd) * _att_dom
+        _drb_lambda *= _mod.get("dribble_mult", 1.0) if _mod else 1.0
         dribbles = _poisson(_drb_lambda)
         # 차단은 강팀 상대(dom 낮음)일수록 더 많이 발생 (상대 공격이 빈번)
         # 약체(dom 높음)는 오히려 차단 기회 줄어듦
@@ -4534,6 +4696,48 @@ def _flush_team_rec(c, deltas: dict):
     )
 
 
+def _salary_press(p) -> float:
+    """[2026-08 신설, 신민용+GPT 설계 확정] 실제 연봉 / 그 OVR·등급·리그·
+    소속팀 기준 '적정 연봉'의 비율을 감독 기대치 배율로 변환. economy.
+    _calc_salary가 이미 (grade, tier, ovr, country, team_name, year) →
+    적정 연봉을 계산하는 함수라 그대로 재사용한다(명문팀 프리미엄까지
+    포함된 값이라야 "같은 팀에서 이 정도 실력이면 보통 얼마 받는지"와
+    공정하게 비교됨 — team_name을 안 넘기면 명문팀 소속 선수가 전부
+    "고평가"로 잘못 잡힌다).
+    [주의] _calc_manager_rel과 마찬가지로 순수 계산 함수가 아니라 DB
+    조회가 하나 들어간다(팀/리그/국가) — 매치마다 한 번씩 호출되므로
+    쿼리 하나로 묶는다(팀명/등급/티어/국가를 한 SELECT에)."""
+    tid = p.get("current_team_id", 0)
+    if not tid:
+        return 1.0
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            """SELECT t.name as tname, cn.grade as grade, l.tier as tier,
+                      cn.name as country
+               FROM teams t JOIN leagues l ON t.league_id=l.id
+               JOIN countries cn ON l.country_id=cn.id
+               WHERE t.id=?""", (tid,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return 1.0
+    from constants import get_league_grade
+    grade = get_league_grade(row["country"], row["grade"])
+    from economy import _calc_salary
+    expected = _calc_salary(grade, row["tier"], p.get("ovr", 60), row["country"],
+                             row["tname"], year=p.get("current_year"))
+    actual = p.get("salary", 0)
+    if not expected or not actual:
+        return 1.0
+    ratio = actual / expected
+    # [2026-08 신설, 신민용+GPT 검토 확정] 과도한 왜곡 방지 — 0.6배(많이
+    # 저평가)~1.8배(많이 고평가) 범위로 clamp한 뒤 완만한 선형 매핑.
+    # ratio=1.0(적정가)→1.0(중립), ratio=1.8→약 1.25, ratio=0.6→약 0.88.
+    ratio = max(0.6, min(1.8, ratio))
+    return 1.0 + (ratio - 1.0) * 0.31
+
+
 def _calc_manager_rel(p, rating, result, played, not_played_penalty=1) -> int:
     """[최적화] 감독 관계 신규값 계산만 (update_player 제거 → 호출자가 통합).
 
@@ -4552,11 +4756,31 @@ def _calc_manager_rel(p, rating, result, played, not_played_penalty=1) -> int:
     not_played_penalty로 대회별 가중치를 받는다 — 국내리그는 기존대로
     1(기본값), 챔스/컵/클럽월드컵은 호출부에서 2를 넘긴다. 국가대표
     대회는 애초에 이 함수를 호출하지 않는다(intl_engine.py의 부상 AI
-    대체 경로는 의도적으로 manager_relation을 안 건드림)."""
-    from constants import MANAGER_TYPES
+    대체 경로는 의도적으로 manager_relation을 안 건드림).
+
+    [2026-08 신설, 신민용+GPT 설계 확정] "감독 기대치" 축 추가 — 지금까지
+    평점 7.0을 찍으면 로테이션이든 핵심선수든 저연봉이든 고연봉이든
+    똑같이 +3이었다. 이제 계약 역할(OFFER_ROLES.press — 예전부터 값은
+    있었는데 아무 데서도 안 읽고 있었음)과 연봉 대비 가치(_salary_press,
+    신설)를 곱한 exp_mult를 감독 성향(gain_m/loss_m)과 같은 방식으로
+    적용한다. 보너스는 exp_mult로 나누고(기대치가 높을수록 잘해도 덜
+    감동) 페널티는 곱한다(기대치가 높을수록 못하면 더 실망) — "비싼
+    핵심 선수는 잘해도 본전, 못하면 크게 실망 / 싼 로테이션 자원은
+    조금만 해도 기대 이상"이라는 의도를 그대로 수식화. exp_mult 자체가
+    선수 활약(rating)을 지배해버리지 않도록 0.75~1.35로 clamp한다(role_
+    press 최대 1.20 × salary_press 최대 약 1.25가 그대로 곱해지면 최대
+    1.50까지 벌어져 계약조건이 활약보다 과하게 우세해짐 — GPT 지적
+    반영). 승/패(±1)는 그대로 둔다 — 이건 선수 개인이 아니라 팀 전체
+    결과라 기대치 배율을 곱하면 "비싼 선수가 있는 팀이 이겨도 감독이
+    덜 기뻐한다"는 이상한 결과가 나온다."""
+    from constants import MANAGER_TYPES, OFFER_ROLES
     mt = MANAGER_TYPES.get(p.get("manager_type", "베테랑 신뢰"), {})
     gain_m = mt.get("rel_gain_mult", 1.0)
     loss_m = mt.get("rel_loss_mult", 1.0)
+
+    role = p.get("contract_role", "주전 경쟁")
+    role_press = OFFER_ROLES.get(role, {}).get("press", 1.0)
+    exp_mult = max(0.75, min(1.35, role_press * _salary_press(p)))
 
     rel = p.get("manager_relation", 50)
     if not played:
@@ -4564,14 +4788,15 @@ def _calc_manager_rel(p, rating, result, played, not_played_penalty=1) -> int:
         # 반올림 규칙(0.5는 짝수로 반올림) 때문에 round(0.5)=0이 돼서
         # 결장 페널티가 통째로 사라졌다 — max(1, ...)로 최소 1은
         # 항상 깎이게 보장한다.
-        rel = max(0, rel - max(1, round(not_played_penalty * loss_m)))
+        rel = max(0, rel - max(1, round(not_played_penalty * loss_m * exp_mult)))
     else:
-        if rating >= 7.0:   rel = min(100, rel + round(3 * gain_m))
-        elif rating >= 6.0: rel = min(100, rel + round(1 * gain_m))
-        elif rating < 5.0:  rel = max(0, rel - round(3 * loss_m))
+        if rating >= 7.0:   rel = min(100, rel + round(3 * gain_m / exp_mult))
+        elif rating >= 6.0: rel = min(100, rel + round(1 * gain_m / exp_mult))
+        elif rating < 5.0:  rel = max(0, rel - round(3 * loss_m * exp_mult))
         if result == "win":    rel = min(100, rel + 1)
         elif result == "loss": rel = max(0, rel - round(1 * loss_m))
     return rel
+
 
 def _update_manager_rel(p, rating, result, played):
     """하위호환 래퍼 (인트엔진·챔스엔진에서 직접 호출하는 경우 대비)."""
@@ -7013,8 +7238,9 @@ def league_total_games_by_name(league_name: str):
 
 
 def get_full_history_extras_for_period(team_id, nationality, start_year, end_year):
-    """[2026-07 신설 → 재작성 → 재확장, 신민용 요청: "테이블 컬럼에 추가해서
-    ㄱㄱ"] '전체 이력' 탭/표용 리그 외(컵+챔스+클럽월드컵+국가대표) 합산.
+    """[2026-07 신설 → 재작성 → 재확장 → 2026-08 승강PO 추가, 신민용 요청:
+    "테이블 컬럼에 추가해서 ㄱㄱ"] '전체 이력' 탭/표용 리그 외(컵+챔스+
+    유로파+컨퍼런스+슈퍼컵+클럽월드컵+승강PO+국가대표) 합산.
     처음엔 컵대회/클럽월드컵에 슈팅·유효슈팅·기회창출·드리블·차단·패스%가
     저장 안 된다고 판단했었는데 다시 보니 챔스/국제전은 이미 저장하고
     있었고(cl_matches/intl_matches에 my_shots 등 컬럼 존재), _player_perf가
@@ -7027,7 +7253,9 @@ def get_full_history_extras_for_period(team_id, nationality, start_year, end_yea
     shots/shots_on/key_passes/dribbles/blocks, pass_acc_sum/pass_acc_cnt
     (평균 낼 때 나누는 용도 — 0인 경기까지 나누면 왜곡되므로 값 있는
     경기 수로만 나눈다), red_cards(컵+챔스+클럽월드컵+국가대표 합산
-    퇴장 횟수 — my_absence_reason='red_card'인 경기 수를 셈)."""
+    퇴장 횟수 — my_absence_reason이 'red_card' 또는 'second_yellow'(경고
+    누적 퇴장)인 경기 수를 셈), yellow_cards(같은 범위 옐로카드 합산 —
+    my_yellow_cards 컬럼을 그대로 합산)."""
     conn = get_conn(); c = conn.cursor()
     avail_m = played_m = goals = assists = 0
     rating_sum = rating_cnt = 0.0
@@ -7041,6 +7269,8 @@ def get_full_history_extras_for_period(team_id, nationality, start_year, end_yea
     # my_player.total_red_cards_all(커리어 통산 합계)은 이미 정확했지만,
     # '전체 이력' 표(기간별 합산)는 이 필드를 아예 안 읽고 있었다.
     red_cards = 0
+    yellow_cards = 0
+    _RED_REASONS = ("red_card", "second_yellow")
     # [2026-07 신설, 신민용 리포트: "전체 이력에 승패 표시가 사라졌어"]
     # 팀 이력의 승무패(e.wins/draws/losses)는 '내가 뛴 경기'가 아니라
     # '그 시즌 그 팀의 전적'(match_results 전체)이다 — 여기서도 같은
@@ -7077,7 +7307,7 @@ def get_full_history_extras_for_period(team_id, nationality, start_year, end_yea
             f"""SELECT m.home_team_id, m.home_score, m.away_score, m.my_goals,
                        m.my_assists, m.my_saves, m.my_rating, m.my_shots,
                        m.my_shots_on, m.my_key_passes, m.my_dribbles,
-                       m.my_blocks, m.my_pass_acc, m.my_absence_reason
+                       m.my_blocks, m.my_pass_acc, m.my_absence_reason, m.my_yellow_cards
                 FROM {tbl} m JOIN {tour_tbl} t ON m.tournament_id=t.id
                 WHERE m.my_played=1 AND (m.home_team_id=? OR m.away_team_id=?)
                   AND t.year BETWEEN ? AND ?""",
@@ -7101,8 +7331,58 @@ def get_full_history_extras_for_period(team_id, nationality, start_year, end_yea
             blocks += r["my_blocks"] or 0
             if r["my_pass_acc"]:
                 pass_acc_sum += r["my_pass_acc"]; pass_acc_cnt += 1
-            if r["my_absence_reason"] == "red_card":
+            if r["my_absence_reason"] in _RED_REASONS:
                 red_cards += 1
+            yellow_cards += r["my_yellow_cards"] or 0
+
+    # [2026-08 신설, 신민용 요청: "승강PO도 팀 이력에는 아니더라도
+    # 전체 이력에는 포함되어야지"] po_matches는 슛/드리블 등 세부 스탯
+    # 컬럼이 원래 없는 얕은 테이블이라(intl_matches 수준) 위 6개 테이블과
+    # 같은 SELECT를 그대로 못 쓴다 — 있는 컬럼만 따로 집계한다(슈팅류
+    # 누적치는 그대로 0으로 둠, 다른 대회 값에 영향 없음). "팀 이력" 표
+    # (career_entries 재직기간별)는 여전히 PO를 포함하지 않는다 — 그건
+    # career_entries.red_cards처럼 "리그 전용" 스냅샷 성격이라 별개.
+    avail_row = c.execute(
+        """SELECT COUNT(*) n FROM po_matches m JOIN po_tournaments t ON m.tournament_id=t.id
+            WHERE (m.home_team_id=? OR m.away_team_id=?) AND t.year BETWEEN ? AND ?""",
+        (team_id, team_id, start_year, end_year)).fetchone()
+    avail_m += avail_row["n"] or 0
+
+    wdl_rows = c.execute(
+        """SELECT m.home_team_id, m.home_score, m.away_score
+            FROM po_matches m JOIN po_tournaments t ON m.tournament_id=t.id
+            WHERE m.home_score>=0 AND (m.home_team_id=? OR m.away_team_id=?)
+              AND t.year BETWEEN ? AND ?""",
+        (team_id, team_id, start_year, end_year)).fetchall()
+    for wr in wdl_rows:
+        my_score = wr["home_score"] if wr["home_team_id"] == team_id else wr["away_score"]
+        opp_score = wr["away_score"] if wr["home_team_id"] == team_id else wr["home_score"]
+        if my_score > opp_score: team_w += 1
+        elif my_score == opp_score: team_d += 1
+        else: team_l += 1
+
+    rows = c.execute(
+        """SELECT m.home_team_id, m.home_score, m.away_score, m.my_goals,
+                   m.my_assists, m.my_saves, m.my_rating, m.my_absence_reason, m.my_yellow_cards
+            FROM po_matches m JOIN po_tournaments t ON m.tournament_id=t.id
+            WHERE m.my_played=1 AND (m.home_team_id=? OR m.away_team_id=?)
+              AND t.year BETWEEN ? AND ?""",
+        (team_id, team_id, start_year, end_year)).fetchall()
+    for r in rows:
+        played_m += 1
+        goals += r["my_goals"] or 0
+        assists += r["my_assists"] or 0
+        if r["my_rating"]:
+            rating_sum += r["my_rating"]; rating_cnt += 1
+        saves += r["my_saves"] or 0
+        conceded = r["away_score"] if r["home_team_id"] == team_id else r["home_score"]
+        conceded = max(0, conceded or 0)
+        goals_against += conceded
+        if conceded == 0:
+            clean_sheets += 1
+        if r["my_absence_reason"] in _RED_REASONS:
+            red_cards += 1
+        yellow_cards += r["my_yellow_cards"] or 0
 
     if nationality:
         avail_row = c.execute(
@@ -7128,7 +7408,7 @@ def get_full_history_extras_for_period(team_id, nationality, start_year, end_yea
             """SELECT m.home, m.home_score, m.away_score, m.my_goals,
                       m.my_assists, m.my_saves, m.my_rating, m.my_shots,
                       m.my_shots_on, m.my_key_passes, m.my_dribbles,
-                      m.my_blocks, m.my_pass_acc, m.my_absence_reason
+                      m.my_blocks, m.my_pass_acc, m.my_absence_reason, m.my_yellow_cards
                FROM intl_matches m JOIN intl_tournaments t ON m.tournament_id=t.id
                WHERE m.my_played=1 AND (m.home=? OR m.away=?)
                  AND t.year BETWEEN ? AND ?""",
@@ -7152,8 +7432,9 @@ def get_full_history_extras_for_period(team_id, nationality, start_year, end_yea
             blocks += r["my_blocks"] or 0
             if r["my_pass_acc"]:
                 pass_acc_sum += r["my_pass_acc"]; pass_acc_cnt += 1
-            if r["my_absence_reason"] == "red_card":
+            if r["my_absence_reason"] in _RED_REASONS:
                 red_cards += 1
+            yellow_cards += r["my_yellow_cards"] or 0
     conn.close()
     return {
         "matches_available": avail_m, "matches_played": played_m,
@@ -7164,7 +7445,7 @@ def get_full_history_extras_for_period(team_id, nationality, start_year, end_yea
         "dribbles": dribbles, "blocks": blocks,
         "pass_acc_sum": pass_acc_sum, "pass_acc_cnt": pass_acc_cnt,
         "wins": team_w, "draws": team_d, "losses": team_l,
-        "red_cards": red_cards,
+        "red_cards": red_cards, "yellow_cards": yellow_cards,
     }
 
 
@@ -8064,9 +8345,22 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
         # 차이는 최소 출전 비율 게이트(MVP와 동일한 65%) 하나 — 베스트11은
         # 이 게이트가 없어서 "반 시즌만 뛰고 어쩌다 DF 풀 1등"도 통과할 수
         # 있는데, 개인 단독상인 올해의 수비수는 그 상황까진 막는다.
+        # [2026-08 버그수정, 신민용+GPT 검토 확정: "홍명보 평점 6.4/6.7
+        # 시즌이 올해의 수비수를 받는 건 과하다"] 다른 모든 단독 개인상
+        # (MVP 7.0, 구단 올해의 선수 6.2, 골든글러브 클린시트+품질검증)은
+        # 전부 절대 최소선이 있는데, 이 상만 베스트11(DF)과 완전히 동일한
+        # 순수 상대평가라 평점 최소선이 없었다 — "그 시즌 DF 풀에서
+        # 1등"이기만 하면 그 1등의 평점 자체가 낮아도(약한 시즌) 받아버림.
+        # DOTY_MIN_RATING(6.9)을 추가 — MVP(7.0)보다 살짝 낮고 구단
+        # 올해의 선수(6.2)보다는 높은 위계. 베스트11은 최소선을 넣지
+        # 않는다(의도적 유지) — "그 시즌 그 자리에서 가장 잘한 선수"는
+        # 상대평가만으로 충분하고, "올해의 수비수"라 부를 만한 절대
+        # 수준까지 요구하는 건 이 상만이다.
         DOTY_MIN_PLAY_RATIO = 0.65
+        DOTY_MIN_RATING = 6.9
         if (best_df is not None and best_df[0]["is_mine"]
-                and sm >= DOTY_MIN_PLAY_RATIO * FULL_SEASON_MATCHES):
+                and sm >= DOTY_MIN_PLAY_RATIO * FULL_SEASON_MATCHES
+                and season_rating >= DOTY_MIN_RATING):
             my_awards.append(("올해의 수비수", f"{lname} 올해의 수비수"))
 
         # MVP (전체 베스트11 점수 1위)
@@ -8819,6 +9113,14 @@ def _end_of_season(p, year):
                         season_dribbles=0, season_blocks=0,
                         season_pass_acc_sum=0, season_pass_acc_cnt=0,
                         season_red_cards_league=0,
+                        # [2026-08 신설, 옐로카드 시스템] 클럽 계열 카드
+                        # 누적 그룹(리그/국내컵/유럽대항전/슈퍼컵/클럽월드컵/
+                        # 승강PO)은 매 시즌 리셋 — red_cards와 동일 시점.
+                        # 국가대표 계열(wc_qual/intl)은 여기서 건드리지
+                        # 않는다(대회 사이클 기준 리셋이라 별도 훅 사용).
+                        season_yellow_league=0, season_yellow_cup=0,
+                        season_yellow_europe=0, season_yellow_super_cup=0,
+                        season_yellow_cwc=0, season_yellow_po=0,
                         season_injury_matches_missed=0,
                         season_suspension_matches_missed=0,
                         season_bench_matches_missed=0,
@@ -13468,6 +13770,7 @@ def _save_career_entry(p, year, week, force_new=False, transfer_type=None,
     pos = get_field_pos(p)   # 배치 포지션 (포메이션 슬롯 기반, 없으면 주요 포지션)
     cs  = _calc_clean_sheets(c, tid, season, matches=sm)
     rc_league = p.get("season_red_cards_league", 0)
+    yc_league = p.get("season_yellow_league", 0)
 
     # end_year=0인 열린 항목 찾기 (team_id 우선, 구버전 행은 이름 폴백)
     existing = _find_open_entry(c, tid, team_row["name"])
@@ -13477,11 +13780,11 @@ def _save_career_entry(p, year, week, force_new=False, transfer_type=None,
             end_year=?, end_week=?, matches=?, goals=?, assists=?, saves=?, goals_against=?,
             avg_rating=?, team_rank=?, wins=?, draws=?, losses=?, clean_sheets=?,
             league_name=?, tier=?, salary=?, position=?, team_id=?, exit_type=?,
-            loan_partner_team=COALESCE(?, loan_partner_team), red_cards=?
+            loan_partner_team=COALESCE(?, loan_partner_team), red_cards=?, yellow_cards=?
             WHERE id=?""",
             (year, week, sm, sg, sa, ss, sga, avg_r, rn, tw, td, tl, cs,
              season_lname, season_tier, p.get("salary", 0), pos, tid,
-             exit_type, loan_partner_team, rc_league, existing["id"]))
+             exit_type, loan_partner_team, rc_league, yc_league, existing["id"]))
     elif not allow_insert:
         # 이미 닫힌 항목만 존재 → 중복 행은 안 만들되, 떠난 경로(exit_type)는
         # 가장 최근에 닫힌 그 팀 항목에 덧칠해 준다 (방출/팔림 표시 누락 방지).
@@ -13540,14 +13843,14 @@ def _save_career_entry(p, year, week, force_new=False, transfer_type=None,
              matches, goals, assists, saves, goals_against,
              avg_rating, team_rank, wins, draws, losses,
              contract_years, transfer_type, clean_sheets, team_id,
-             contract_role, manager_type, club_ambition, exit_type, transfer_fee, red_cards)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             contract_role, manager_type, club_ambition, exit_type, transfer_fee, red_cards, yellow_cards)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (p["age"], pos, team_row["name"], team_row["lname"], saved_tier,
              p.get("salary", 0), cur_year, cur_week,
              year, week, sm, sg, sa, ss, sga, avg_r, rn, tw, td, tl,
              c_yrs_save, pending_tt, cs, tid,
              p.get("contract_role",""), p.get("manager_type",""), p.get("club_ambition",""),
-             exit_type, transfer_fee, rc_league))
+             exit_type, transfer_fee, rc_league, yc_league))
 
     conn.commit()
     conn.close()
@@ -13733,6 +14036,7 @@ def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None
                       season_dribbles=0, season_blocks=0,
                       season_pass_acc_sum=0, season_pass_acc_cnt=0,
                       season_red_cards_league=0,
+                      season_yellow_league=0,
                       season_injury_matches_missed=0,
                       season_suspension_matches_missed=0,
                       season_bench_matches_missed=0)
