@@ -345,6 +345,201 @@ def build_match_events(match_rows):
     return events
 
 
+def analyze_starting_trajectory(match_rows, min_sample=8, phase_size=15):
+    """[2026-08 신설, PHASE 1 — 신민용+GPT 협업 설계] 데뷔 초반 "벤치를
+    전전하다 어느 순간 주전으로 자리 잡았는가"라는 서사 하나만 우선
+    구현한다(GPT 권고: 처음부터 RAPID_ASCENT 등 태그를 여러 개 만들지
+    말고 이 패턴 하나만 작게 시작).
+
+    핵심 설계:
+    - "첫 N경기"를 날짜가 아니라 선수의 실제 "스쿼드 경기 순서"로 센다
+      (그 팀이 뛴 경기 중 이 선수가 선발이거나 최소한 벤치에는 있었던
+      경기만 — 부상/징계로 아예 결장한 경기는 "선택"과 무관하니 순서에서
+      제외한다). played=True/benched=True 둘 다 스쿼드 포함, 팀 로직상
+      이 둘은 상호배타적이다(_simulate_match: benched면 played는 항상
+      False).
+    - 표본이 min_sample(기본 8) 미만이면 아예 판정하지 않는다 — 한두
+      경기만으로 "벤치를 전전했다" 같은 서사가 나오는 걸 막기 위함.
+    - 초기 구간(phase_size=15경기)의 선발 비율이 높으면(65%+) 처음부터
+      주전이었다는 뜻이라 EARLY_STARTER, 낮으면 EARLY_BENCH.
+    - EARLY_BENCH인 경우, 그 이후 구간을 phase_size 단위로 훑어서 처음
+      선발 비율이 70% 이상을 찍는 구간을 "정착 시점"으로 잡는다(마지막
+      자투리 구간이 window의 절반도 안 되면 표본 부족으로 판정하지
+      않는다).
+    반환: dict({sample, early_start_ratio, tag, [subtag], [established_at]})
+    또는 표본 부족 시 None. 이 함수는 순수 계산만 하고 문장은 만들지
+    않는다(패턴 감지와 템플릿 선택을 분리하라는 설계 원칙 — analyzer가
+    사실을 확정하면, 문장 쪽은 그 태그만 보고 고른다)."""
+    squad = []
+    for m in (match_rows or []):
+        raw = m.get("detail_json")
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw) if isinstance(raw, str) else raw
+        except (ValueError, TypeError):
+            continue
+        played = bool(payload.get("played"))
+        benched = bool(payload.get("benched"))
+        if not played and not benched:
+            continue  # 부상/징계 등 완전 결장 — 선택 여부와 무관, 시퀀스 제외
+        squad.append((m.get("year", 0), m.get("week", 0), m.get("id", 0), played))
+    squad.sort(key=lambda t: (t[0], t[1], t[2]))
+    if len(squad) < min_sample:
+        return None
+
+    early = squad[:phase_size]
+    early_start_ratio = sum(1 for row in early if row[3]) / len(early)
+    result = {"sample": len(squad), "early_start_ratio": round(early_start_ratio, 2)}
+
+    if early_start_ratio >= 0.65:
+        result["tag"] = "EARLY_STARTER"
+        return result
+
+    result["tag"] = "EARLY_BENCH"
+    rest = squad[phase_size:]
+    window = phase_size
+    for i in range(0, len(rest), window):
+        chunk = rest[i:i + window]
+        if len(chunk) < max(5, window // 2):
+            break
+        start_ratio = sum(1 for row in chunk if row[3]) / len(chunk)
+        if start_ratio >= 0.7:
+            result["subtag"] = "STARTER_ESTABLISHED"
+            result["established_at"] = phase_size + i + 1  # 1-based 스쿼드 경기 순번
+            break
+    return result
+
+
+STARTING_TRAJECTORY_TEMPLATES = {
+    "EARLY_BENCH_ESTABLISHED": [
+        "프로 생활의 시작은 순탄하지 않았다. 초반에는 좀처럼 출전 기회를 잡지 못하고 벤치를 지키는 날이 많았지만, 어느 순간을 기점으로 주전 자리를 굳혀 나갔다.",
+        "데뷔 초반에는 선발보다 벤치에서 경기를 지켜보는 시간이 길었다. 그러나 기회를 잡은 뒤로는 그 자리를 놓치지 않고 주전으로 자리매김했다.",
+        "출전 기회는 쉽게 찾아오지 않았다. 초반의 그 답답한 시기를 지나, 그는 결국 스스로의 자리를 만들어냈다.",
+    ],
+    "EARLY_BENCH_ONGOING": [
+        "프로 생활의 시작은 순탄하지 않았다. 초반에는 벤치를 지키는 날이 많았다.",
+        "데뷔 초반에는 선발보다 벤치에서 경기를 지켜보는 시간이 더 길었다.",
+    ],
+    "EARLY_STARTER": [
+        "데뷔 초기부터 꾸준히 선발 자리를 지키며 커리어를 시작했다.",
+        "프로 무대에 발을 들인 순간부터 주전 경쟁에서 밀리지 않았다.",
+        "이른 시기부터 선발 명단에 이름을 올리며 커리어의 첫 발을 뗐다.",
+    ],
+}
+
+
+def build_starting_trajectory_sentence(rng, trajectory):
+    """analyze_starting_trajectory() 결과(dict 또는 None)를 문장 하나로
+    바꾼다. None이면(표본 부족 등) 빈 문자열."""
+    if not trajectory:
+        return ""
+    tag = trajectory.get("tag")
+    if tag == "EARLY_STARTER":
+        bank = STARTING_TRAJECTORY_TEMPLATES["EARLY_STARTER"]
+    elif tag == "EARLY_BENCH" and trajectory.get("subtag") == "STARTER_ESTABLISHED":
+        bank = STARTING_TRAJECTORY_TEMPLATES["EARLY_BENCH_ESTABLISHED"]
+    elif tag == "EARLY_BENCH":
+        bank = STARTING_TRAJECTORY_TEMPLATES["EARLY_BENCH_ONGOING"]
+    else:
+        return ""
+    return rng.choice(bank)
+
+
+def _find_runs(items, key_fn, min_len):
+    """items를 순서대로 훑어 key_fn(item)이 연속으로 같은 값(None 제외)을
+    내는 구간을 찾는다. min_len 이상인 구간만 (category, start_idx,
+    end_idx)로 반환. PHASE 5(경기 묶음 서술) 공용 헬퍼 — 승/패 연속과
+    벤치/결장 연속 둘 다 이걸로 찾는다."""
+    runs = []
+    cur_cat, cur_start = None, None
+    for i, it in enumerate(items):
+        cat = key_fn(it)
+        if cat != cur_cat:
+            if cur_cat is not None and i - cur_start >= min_len:
+                runs.append((cur_cat, cur_start, i - 1))
+            cur_cat, cur_start = cat, i
+    if cur_cat is not None and len(items) - cur_start >= min_len:
+        runs.append((cur_cat, cur_start, len(items) - 1))
+    return runs
+
+
+def build_match_streaks(matches, max_sentences=3):
+    """[2026-08 신설, PHASE 5: 경기 묶음 서술, 신민용 요청 — "경기를 덜
+    뛰는 게 부상 때문인지 로테이션 때문인지 알 수 있잖아, 그것도 자세히
+    쓰고 싶다"] 한 시즌(팀 재직 하나)의 리그 경기 목록(시간순, 각 항목에
+    date/opp_name/score/result/my_played/benched)에서:
+    - 3연승 이상 / 3연패 이상(둘 다 my_played=1인 경기만) → 승/패 연속
+    - 4경기 이상 연속 벤치(my_played=0, benched=1) → 로테이션(스쿼드엔
+      있었지만 선발에서 밀림)
+    - 3경기 이상 연속 완전 결장(my_played=0, benched=0) → 부상/징계 등
+      스쿼드 자체에서 빠진 결장(로테이션과 명확히 다른 사유)
+    을 찾아 실제 상대팀·날짜·스코어를 인용한 문장으로 만든다. 데이터에
+    없는 "왜"는 절대 지어내지 않는다 — 로테이션과 결장을 구분하는 것도
+    추측이 아니라 played/benched 두 불리언이 이미 알려주는 사실이다.
+    최대 max_sentences개까지만(시즌 하나가 끝없이 길어지지 않도록),
+    가장 긴 구간부터 우선."""
+    if not matches:
+        return []
+
+    def _result_cat(m):
+        if not m.get("my_played"):
+            return None
+        r = (m.get("result") or "")[:1]
+        return r if r in ("승", "패") else None
+
+    def _avail_cat(m):
+        if m.get("my_played"):
+            return None
+        return "bench" if m.get("benched") else "absent"
+
+    runs = []
+    runs += [("결과", c, s, e) for c, s, e in _find_runs(matches, _result_cat, 3)]
+    runs += [("가용성", c, s, e) for c, s, e in _find_runs(matches, _avail_cat, 3)
+             if c == "bench" and (e - s + 1) >= 4 or c == "absent" and (e - s + 1) >= 3]
+    if not runs:
+        return []
+    runs.sort(key=lambda r: r[3] - r[2], reverse=True)
+
+    out = []
+    for kind, cat, s, e in runs[:max_sentences]:
+        n = e - s + 1
+        first, last = matches[s], matches[e]
+        if kind == "결과" and cat == "승":
+            out.append(f"{first['date']} {first['opp_name']}전 승리를 시작으로 "
+                       f"{last['date']} {last['opp_name']}전({last['score']})까지 {n}연승을 이어갔다.")
+        elif kind == "결과" and cat == "패":
+            out.append(f"{first['date']} {first['opp_name']}전부터 "
+                       f"{last['date']} {last['opp_name']}전({last['score']})까지 {n}연패에 빠졌다.")
+        elif cat == "bench":
+            out.append(f"{first['date']}부터 {last['date']}까지 {n}경기 연속 벤치에 머물렀다 — "
+                       f"스쿼드에는 있었지만 선발 기회를 얻지 못한 시기였다.")
+        elif cat == "absent":
+            out.append(f"{first['date']}부터 {last['date']}까지 {n}경기 연속 명단에서조차 빠졌다 — "
+                       f"부상이나 징계 등으로 스쿼드 자체에 들지 못한 기간이었다.")
+    return out
+
+
+def build_season_match_narratives(league_matches):
+    """get_my_league_matches() 결과(팀 구분 없이 시간순 전체)를 받아
+    (팀명, 연도)별로 묶은 뒤 build_match_streaks()를 적용한다.
+    반환: {(team_name, year): [sentence, ...]}. 이 딕셔너리를 memory에
+    실어두면 render_chapter가 시즌 문단 바로 뒤에 이어붙인다."""
+    if not league_matches:
+        return {}
+    buckets = {}
+    for m in league_matches:
+        key = (m.get("team_name", ""), m.get("year", 0))
+        buckets.setdefault(key, []).append(m)
+    out = {}
+    for key, ms in buckets.items():
+        ms_sorted = sorted(ms, key=lambda m: (m.get("year", 0), m.get("week", 0)))
+        sentences = build_match_streaks(ms_sorted)
+        if sentences:
+            out[key] = sentences
+    return out
+
+
 def build_analysis(seasons):
     """순수 계산값만 담는다 — 해석 기준(예: '전성기 평점 몇 이상')이 나중에
     바뀌어도 이 값들은 다시 계산할 필요가 없다."""
@@ -537,8 +732,8 @@ QUESTION_OPEN_SENTENCES = {
     ],
     "INJURY_COMEBACK": [
         "부상에서 완전히 돌아올 수 있을지가 다음 시즌의 관심사가 됐다.",
-        "이 부상을 딛고 온전히 돌아올 수 있을지, 그건 다음 시즌이 답해줄 문제였다.",
-        "몸 상태를 되찾는 게 당장의 과제로 남았다.",
+        "이 부상을 딛고 얼마나 회복할 수 있을지, 그건 다음 시즌이 답해줄 문제였다.",
+        "부상 이후 경기력을 어디까지 되찾을지가 당장의 과제로 남았다.",
     ],
     "ADAPTATION": [
         "새로운 환경에 얼마나 빨리 적응할 수 있을지가 그 앞에 놓인 과제였다.",
@@ -563,7 +758,10 @@ QUESTION_PROGRESS_SENTENCES = {
         "다시 한번 정상에 서고 싶다는 마음은 이 시즌에도 여전했다.",
     ],
     "INJURY_COMEBACK": [
-        "몸 상태를 완전히 되찾기까지는 조금 더 시간이 필요해 보였다.",
+        # [2026-08 수정, 신민용+GPT 지적: "완전히 회복했다"는 의학적
+        # 판단은 데이터에 없다] 부상 결장 이후 다시 뛴다는 사실만 확인
+        # 가능하므로, "완전히" 회복했다는 단정은 빼고 사실 위주로 서술.
+        "부상 이후 경기력을 완전히 되찾기까지는 조금 더 시간이 필요해 보였다.",
         "회복은 더디게, 그러나 착실히 이어졌다.",
         "예전의 움직임을 조금씩 되찾아가는 중이었다.",
     ],
@@ -579,16 +777,19 @@ QUESTION_PROGRESS_SENTENCES = {
 QUESTION_PROGRESS_STAGED = {
     "NATIONAL_TEAM_CHASE": {
         "STAGE1": [   # 1~2번째 미선발 — 아직 여유
-            "아직 나이가 있으니, 다음을 기약할 수 있다고 믿었다.",
-            "실망스러웠지만, 아직은 시간이 있다고 생각했다.",
+            "아직 나이가 있어, 다음을 기약할 수 있는 시점이었다.",
+            "아쉬운 결과였지만, 시간은 아직 그의 편이었다.",
         ],
         "STAGE2": [   # 3~4번째 미선발 — 반복되는 좌절
             "꾸준한 활약에도 좀처럼 대표팀의 문턱을 넘지 못했다.",
             "리그에서의 활약과는 별개로, 대표팀 명단은 여전히 먼 이야기였다.",
         ],
-        "STAGE3": [   # 5번째 이상 — 체념에 가까운 톤
-            "이제 대표팀은 점점 현실적인 목표에서 멀어지고 있었다.",
-            "나이가 들수록, 그 꿈은 조금씩 희미해져 갔다.",
+        "STAGE3": [   # 5번째 이상 — 거듭된 미선발
+            # [2026-08 수정, 신민용+GPT 지적] "그 꿈은 희미해져 갔다"는
+            # 선수의 내면을 단정하는 문장이라 미선발 횟수라는 사실만
+            # 남기는 쪽으로 바꾼다.
+            "대표팀 명단은 이번에도 그의 이름을 비켜갔다.",
+            "나이가 들수록 대표팀 발탁 가능성은 점점 낮아지고 있었다.",
         ],
     },
 }
@@ -607,9 +808,12 @@ QUESTION_RESOLVED_SENTENCES = {
         "두 번째 우승과 함께, 그는 다시 한번 정상에 섰다.",
     ],
     "INJURY_COMEBACK": [
-        "부상의 그림자를 완전히 떨쳐내고 그라운드로 돌아왔다.",
+        # [2026-08 수정, 신민용+GPT 지적] "완전히 떨쳐냈다"/"완전한 몸
+        # 상태"는 의학적 판단이라 데이터로 확인 불가 — 결장 이후 다시
+        # 출전했다는 사실만 남긴다.
+        "부상 결장 이후 다시 그라운드에 모습을 드러냈다.",
         "다행히 그 부상은 긴 그림자를 남기지 않았다.",
-        "완전한 몸 상태로 돌아왔다.",
+        "부상에서 돌아와 다시 꾸준히 경기에 나섰다.",
     ],
     "ADAPTATION": [
         "적응기는 그렇게 지나갔고, 그는 새 환경에 자리를 잡았다.",
@@ -1276,8 +1480,11 @@ TEMPLATES = {
     ],
 
     CAT_LOAN: [
-        "{year}년 {team_ro} 임대를 떠났다. 원소속팀에서 밀려난 임대라기보다, 새로운 경험을 쌓기 위한 시간이었다. "
-        "{apps}경기 {stat_phrase}을 기록하며 임대 기간을 알차게 보냈다.",
+        # [2026-08 수정, 신민용 지적: "임대도 보통 팀이 얘를 임대보낸 것"]
+        # "밀려난 임대라기보다, 새로운 경험을 쌓기 위한 시간이었다"는 선수
+        # 쪽 의지를 단정하는 문장이라 삭제 — 어느 쪽이 주도했는지 데이터로
+        # 알 수 없으니 사실(임대를 떠났다/그 기간 기록)만 남긴다.
+        "{year}년 {team_ro} 임대를 떠났다. {apps}경기 {stat_phrase}을 기록하며 임대 기간을 보냈다.",
 
         "임대 신분으로 맞은 {year}년, {team}의 유니폼을 입었다. {apps}경기 {stat_phrase} — "
         "잠시 거쳐 가는 곳이었지만 그 안에서도 자신의 몫을 다했다.",
@@ -1921,7 +2128,12 @@ MANAGER_TYPE_CLAUSE = {
 # "이적"이 빠져 있어서 시즌 중 이적한 케이스에서 절이 비어 있었다.
 EXIT_TYPE_TONE = {
     "방출": "아쉬움을 남긴 채",
-    "팔림": "새로운 기회를 찾아",
+    # [2026-08 수정, 신민용 지적: "팔리는 건 대부분 구단이 팔고 싶어서
+    # 판 것"] "새로운 기회를 찾아"는 선수가 능동적으로 원해서 떠난 것처럼
+    # 읽혀 데이터가 뒷받침 못 하는 동기를 서술하게 된다 — 실제로는 구단의
+    # 결정(이적료를 받고 내보냄)인 경우가 대부분이므로, 어느 쪽이 원했는지
+    # 단정하지 않는 중립적 문구로 바꾼다.
+    "팔림": "구단의 결정으로",
     "계약만료": "계약이 끝나며",
     "임대": "임대 신분으로",
     "임대 종료": "임대를 마치고",
@@ -3192,6 +3404,13 @@ def render_chapter(rng, chapter_seasons, all_seasons, awards_by_year, trophy_yea
                                         player=player, is_chapter_start=(i == 0),
                                         memory=memory, chapter_character=chapter_character,
                                         categories=categories, turning_indices=turning_indices))
+            # [2026-08 신설, PHASE 5] 이 시즌의 연승/연패/로테이션/결장
+            # 구간 문장이 있으면 시즌 문단 바로 뒤에 이어붙인다.
+            if memory:
+                _mn_key = (s.get("team_name", ""), s.get("start_year", 0))
+                _mn = memory.get("match_narratives", {}).get(_mn_key)
+                if _mn:
+                    parts.append(" ".join(_mn))
 
     chapter_facts = build_chapter_facts(chapter_seasons, chap_categories, memory)
     expansion = build_chapter_expansion(rng, tracker, chapter_facts, chapter_character)
@@ -3215,7 +3434,7 @@ def render_chapter(rng, chapter_seasons, all_seasons, awards_by_year, trophy_yea
     return "\n\n".join(parts)
 
 
-def generate_prologue(player, seasons, has_trophy, awards, rng):
+def generate_prologue(player, seasons, has_trophy, awards, rng, trajectory=None):
     name = player.get("name", "선수")
     # [버그수정, 신민용 리포트: "프롤로그는 3시즌, 에필로그는 2시즌으로
     # 서로 다르게 나온다"] len(seasons)는 병합된 (연도,팀) 레코드 개수라
@@ -3239,6 +3458,12 @@ def generate_prologue(player, seasons, has_trophy, awards, rng):
         f"{'개인상까지 챙긴' if has_award else '자신의 자리를 지켜낸'} 선수였다. "
         f"전성기 OVR {peak_ovr}. 이제 그 커리어를 처음부터 다시 돌아본다."
     )
+    # [2026-08 신설, PHASE 1] 데뷔 초반 벤치→주전 정착 서사가 있으면
+    # body 앞에 한 문장 붙인다 — "이제 그 커리어를 처음부터 돌아본다"는
+    # 마무리 문장 바로 앞이 "그 시작이 어땠는지"를 붙이기 자연스러운 자리.
+    traj_sentence = build_starting_trajectory_sentence(rng, trajectory)
+    if traj_sentence:
+        body = traj_sentence + " " + body
     return rng.choice(openers) + "\n\n" + body
 
 
@@ -3374,11 +3599,17 @@ def _compute_rival_team(seasons, match_rows, min_matches=3):
 
 
 def generate_legacy_section(player, seasons, chapters, has_trophy, awards, home_country, rng,
-                             match_rows=None):
+                             match_rows=None, intl_matches=None):
     """[2026-07 신설, 리뷰 피드백: "선수 서사 키워드/그는 어떤 선수였는가
     섹션이 있으면 좋겠다"] 지어낸 사건 없이, 이미 계산해둔 데이터(최고
     평점 시즌, 거쳐간 국가 수, 트로피/개인상 유무, 라이벌 팀)만으로
-    커리어 전체를 한 문단으로 요약한다."""
+    커리어 전체를 한 문단으로 요약한다.
+
+    intl_matches: [2026-08 신설, PHASE 2: 상대 재평가] get_my_intl_matches()
+    +get_my_qual_matches() 결과를 합쳐서 넘기면, opponent_context.py가
+    "당시엔 그냥 한 경기였지만 그 상대가 나중에 그 대회에서 우승/준우승/
+    4강까지 갔다" 같은 문장을 최대 2개까지 덧붙인다. None이면(구버전
+    호출 등) 이 부분은 그냥 생략된다."""
     name = player.get("name", "선수")
 
     countries = {s.get("country", "") for s in seasons if s.get("country")}
@@ -3418,6 +3649,10 @@ def generate_legacy_section(player, seasons, chapters, has_trophy, awards, home_
         rname, rn = rival
         lines.append(f"특히 {with_josa(rname, '을/를')} 상대로 유독 자주 맞부딪히며(통산 {rn}경기) "
                       "남다른 인연을 쌓았다.")
+
+    if intl_matches:
+        from opponent_context import build_opponent_context_sentences
+        lines.extend(build_opponent_context_sentences(rng, intl_matches, limit=2))
 
     return "\n".join(lines)
 
@@ -3522,7 +3757,7 @@ def editorial_pass(text):
 
 
 def generate_story(player, entries, trophies, awards, promos=None, intl_trophies=None, seed=None,
-                    match_rows=None, absence_events=None):
+                    match_rows=None, absence_events=None, intl_matches=None, league_matches=None):
     """메인 진입점. retire_window.py에서 이 함수 하나만 호출하면 된다.
       player        : get_player() 결과 dict
       entries       : career_entries 전체 리스트 (id순). 각 행에 'country'
@@ -3544,6 +3779,21 @@ def generate_story(player, entries, trophies, awards, promos=None, intl_trophies
                       {"year": int, "reason": "injury"|"suspension"|...}
                       리스트. 부상(injury)만 확정 근거로 반영한다 — 없으면
                       (None) 예전처럼 통계적 추정으로만 부상을 다룬다.
+      intl_matches  : [2026-08 신설, PHASE 2: opponent_context_engine]
+                      intl_engine.get_my_intl_matches()+get_my_qual_matches()
+                      를 합친 리스트(tournament_id 포함). 있으면 "그는 어떤
+                      선수였는가" 섹션에 "당시엔 그냥 한 경기였는데 그
+                      상대가 나중에 그 대회에서 우승/준우승/4강까지
+                      갔다"는 문장이 최대 2개까지 붙는다. 없으면(None)
+                      이 부분은 생략된다(하위호환).
+      league_matches: [2026-08 신설, PHASE 5: 경기 묶음 서술]
+                      game_engine.get_my_league_matches() 결과. 있으면
+                      시즌 문단마다 실제 연승/연패/로테이션(벤치 연속)/
+                      결장(부상·징계로 스쿼드 자체에서 빠짐) 구간을 실제
+                      상대·날짜·스코어로 인용해 덧붙인다 — "경기를 덜
+                      뛰는 게 부상 때문인지 로테이션 때문인지"가 실제
+                      데이터(played/benched)로 구분되어 나온다. 없으면
+                      (None) 이 부분은 생략된다(하위호환).
     """
     intl_trophies = intl_trophies or []
     rng = random.Random(seed if seed is not None else player.get("name", "seed"))
@@ -3611,6 +3861,10 @@ def generate_story(player, entries, trophies, awards, promos=None, intl_trophies
     memory = build_career_memory(seasons, awards_by_year, trophy_years, intl_by_year,
                                   awards, intl_trophies, home_country, match_rows=match_rows,
                                   absence_events=absence_events, categories=all_categories)
+    # [2026-08 신설, PHASE 5] (팀명,연도)별 연승/연패/로테이션/결장 구간
+    # 문장을 미리 계산해 memory에 실어둔다 — render_chapter가 시즌 문단
+    # 뒤에 바로 이어붙인다.
+    memory["match_narratives"] = build_season_match_narratives(league_matches)
     chapters = build_story_arcs(seasons, all_categories, awards_by_year, trophy_years, intl_by_year)
 
     # [2026-07 신설, 분량 확장] 전환점 인덱스를 한 번만 계산해서 시즌
@@ -3619,7 +3873,8 @@ def generate_story(player, entries, trophies, awards, promos=None, intl_trophies
     turning_indices = set(detect_turning_points(
         seasons, all_categories, awards_by_year, trophy_years, intl_by_year))
 
-    out = [generate_prologue(player, seasons, has_trophy, awards, rng), ""]
+    out = [generate_prologue(player, seasons, has_trophy, awards, rng,
+                              trajectory=analyze_starting_trajectory(match_rows)), ""]
 
     for i, chap in enumerate(chapters):
         chap_categories = [all_categories[idx_offset_map[id(s)]] for s in chap]
@@ -3643,7 +3898,7 @@ def generate_story(player, entries, trophies, awards, promos=None, intl_trophies
     out.append("그는 어떤 선수였는가")
     out.append("")
     out.append(generate_legacy_section(player, seasons, chapters, has_trophy, awards, home_country, rng,
-                                        match_rows=match_rows))
+                                        match_rows=match_rows, intl_matches=intl_matches))
     out.append("")
 
     out.append("에필로그")

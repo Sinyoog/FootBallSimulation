@@ -907,7 +907,9 @@ class NewPlayerDialog(QDialog):
         "cup_rating": ("컵대회 평점 보정", "pt"), "natural_growth_bonus": ("자연 성장 보너스", "addpct"),
         "mental_growth_mult": ("멘탈 스탯 성장 속도", "x"), "no_slump": ("슬럼프 면역", "flag"),
         "slump_threshold_reduce": ("슬럼프 발동 임계치 감소", "pt"),
-        "slump_chance_add": ("슬럼프 확률", "addpct"), "injury_add": ("부상 확률", "addpct"),
+        "slump_chance_add": ("슬럼프 확률", "addpct"),
+        "injury_load_mult": ("신체 부담 누적 속도", "x"),
+        "injury_immune": ("부상 면역", "flag"),
         "stamina_train": ("체력 훈련 효과", "x"), "phys_growth_mult": ("신체 스탯 성장 속도", "x"),
         "phys_stat": ("집중 성장 스탯", "raw"), "phys_start_bonus": ("초기 신체 스탯 보너스", "addpt"),
     }

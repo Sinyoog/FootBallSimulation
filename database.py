@@ -517,6 +517,7 @@ def init_db():
         fans INTEGER DEFAULT 0, agent_grade TEXT DEFAULT '없음',
         salary INTEGER DEFAULT 0, total_assets INTEGER DEFAULT 0,
         stress INTEGER DEFAULT 10, happiness INTEGER DEFAULT 10,
+        injury_load INTEGER DEFAULT 0,
         slump INTEGER DEFAULT 0, injured INTEGER DEFAULT 0,
         injury_weeks INTEGER DEFAULT 0, injury_type TEXT DEFAULT '',
         current_team_id INTEGER DEFAULT 0,
@@ -1597,6 +1598,11 @@ def init_db():
         # 별개 축. 값은 신체 실루엣 zone 키(예: 'l_knee', 'neck', 'r_hand')
         # 그대로 저장해 ui/player_panel.py가 그대로 갖다 쓸 수 있게 한다.
         "ALTER TABLE my_player ADD COLUMN injury_body_part TEXT DEFAULT ''",
+        # [2026-08 신설, 부상 시스템 확장 2단계] 신체 부담(injury_load) —
+        # 스트레스와 같은 원리(0~100)로 훈련/경기로 쌓이고 휴식으로
+        # 줄어들지만, 스트레스보다 천천히 빠지는 별개의 장기 누적 축.
+        # game_engine._process_training/_simulate_match 참고.
+        "ALTER TABLE my_player ADD COLUMN injury_load INTEGER DEFAULT 0",
     ]:
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,

@@ -2252,6 +2252,38 @@ def effective_training_stress(p, ttype):
     return stress_chg
 
 
+# [2026-08 신설, 부상 시스템 확장 2단계] 휴식이 신체 부담(injury_load)을
+# 스트레스만큼 화끈하게 못 풀게 하는 배율. stress≠injury_load 설계 의도
+# (stress=단기 피로/휴식으로 바로 회복, injury_load=장기 누적 부담/한 번
+# 쉰다고 확 안 풀림)를 살리는 최소한의 장치 — 정확한 값은 잠정치이며
+# 장기 시뮬레이션 결과를 보고 조정할 예정(신민용 방향: 숫자는 나중에).
+INJURY_LOAD_REST_DECAY_MULT = 0.5
+
+
+def effective_training_injury_load(p, ttype):
+    """선수의 신체특징(부상체질 등)을 반영한 '실제 적용' 신체 부담 변화량.
+
+    [2026-08 신설] "이 수치도 스트레스랑 같은 원리로"(신민용 확정) —
+    기본 증가폭은 TRAINING_CONFIG[ttype]['stress']를 그대로 재사용한다
+    (훈련 강도가 셀수록 스트레스도, 신체 부담도 함께 오른다는 같은 신호).
+    다른 점은 두 가지뿐: ①부상체질은 증가분에 injury_load_mult(1.5배)가
+    곱해진다(예전엔 "훈련마다 확률적으로 바로 부상"이었던 걸 "부담이 더
+    빨리 쌓여 100에 더 빨리 도달"하는 방식으로 대체). ②휴식일 때 감소폭은
+    INJURY_LOAD_REST_DECAY_MULT만큼만 적용(스트레스보다 천천히 빠짐).
+    """
+    cfg = TRAINING_CONFIG.get(ttype)
+    if not cfg:
+        return 0
+    from constants import PHYSICAL_TRAIT_EFFECTS as _PTE
+    trait_fx = _PTE.get(p.get("physical_trait", "무난함"), {})
+    load_chg = cfg["stress"]
+    if ttype == "휴식":
+        load_chg = int(load_chg * INJURY_LOAD_REST_DECAY_MULT)
+    elif "injury_load_mult" in trait_fx:
+        load_chg = int(load_chg * trait_fx["injury_load_mult"])
+    return load_chg
+
+
 def _get_stat_start_map(p):
     """[2026-08 신설] my_player.stat_start(JSON 문자열)를 dict로 파싱.
     없거나 깨졌으면(구버전 세이브 등) 빈 dict를 반환 — 호출부가
@@ -2329,6 +2361,7 @@ def _process_training(p, week, ttype, focus_stat=None, day=None):
         eff *= SLUMP_TRAIN_PENALTY
 
     stress_chg = effective_training_stress(p, ttype)
+    injury_load_chg = effective_training_injury_load(p, ttype)
 
     happy_chg = 0
     stat_changes = {}
@@ -2385,39 +2418,25 @@ def _process_training(p, week, ttype, focus_stat=None, day=None):
         # 실제 행복도 계산엔 미연결 상태였음) — 상승분에만 배율 적용.
         if "happy_gain_mult" in pe:
             happy_chg = round(happy_chg * pe["happy_gain_mult"])
-        log_parts = [f"😴 휴식  {_day_label(week, day)}  스트레스 {stress_chg:+d}  행복 {happy_chg:+d}"]
+        log_parts = [f"😴 휴식  {_day_label(week, day)}  스트레스 {stress_chg:+d}  행복 {happy_chg:+d}  신체부담 {injury_load_chg:+d}"]
         if stat_changes:
             for s, v in stat_changes.items():
                 log_parts.append(f"   {STAT_KO.get(s,s)} {v:+.1f}")
 
     else:
-        # 부상 체크
-        inj_chance = cfg["injury_chance"]
-        # [신체 특징] 부상 관련 보정은 성격이 아니라 신체 특징에서 읽는다.
+        # [2026-08 재설계, 신민용 확정: "훈련에서 확률적으로 부상을 입히는
+        # 기능은 없애야" — 부상 시스템 확장 2단계] 예전엔 훈련 종류별
+        # injury_chance로 매 세션 랜덤 룰렛을 돌려 부상을 줬다. 이제 그
+        # 룰렛은 완전히 없앤다 — 대신 이번 세션 시작 시점에 이미 stress나
+        # injury_load(신체 부담)가 과부하(100)였는지만 본다. 이는 기존에
+        # 있던 "stress>=100 → 부상 확정" 안전장치와 완전히 같은 원리를
+        # injury_load에도 그대로 얹은 것뿐이다(신민용 확정: "이 수치도
+        # 스트레스랑 같은 원리로"). 강철체질(injury_immune)은 이 조건을
+        # 만족해도 부상을 입지 않는다 — 신체 부담이 100을 찍어도 예외.
         from constants import PHYSICAL_TRAIT_EFFECTS
-        trait = p.get("physical_trait", "무난함")
-        trait_fx = PHYSICAL_TRAIT_EFFECTS.get(trait, {})
-        inj_add = trait_fx.get("injury_add", 0)
-        immune = inj_add <= -1.0   # 강철체질: 완전 면역
-
-        if immune:
-            inj_chance = 0.0
-        elif inj_chance > 0:
-            # 원래 부상 위험이 있는 훈련(고강도): 특징 보정 그대로 가산
-            inj_chance = max(0, inj_chance + inj_add)
-        elif inj_add > 0:
-            # [부상체질] 평소 안전한 훈련(중강도/집중훈련)에서도 '저 확률'로 부상.
-            #   휴식·저강도는 제외. injury_add(예 0.10)의 1/3만 적용(약 3%).
-            if ttype in ("중강도", "집중훈련"):
-                inj_chance = inj_add / 3.0
-            else:
-                inj_chance = 0.0
-
-        # 과부하(스트레스 100)면 부상 확률 급증. 단 '부상 완전 면역'(강철체질)은 예외.
-        if p.get("stress", 0) >= 100 and not immune:
-            inj_chance = 1.0
-
-        if random.random() < inj_chance:
+        trait_fx = PHYSICAL_TRAIT_EFFECTS.get(p.get("physical_trait", "무난함"), {})
+        immune = bool(trait_fx.get("injury_immune"))
+        if not immune and (p.get("stress", 0) >= 100 or p.get("injury_load", 0) >= 100):
             _apply_injury(p, week, day=day)
             return
 
@@ -2693,7 +2712,8 @@ def _process_training(p, week, ttype, focus_stat=None, day=None):
     # 업데이트
     new_stress  = max(0, min(100, p["stress"] + stress_chg))
     new_happy   = max(0, min(100, p["happiness"] + happy_chg))
-    updates = dict(stress=new_stress, happiness=new_happy)
+    new_load    = max(0, min(100, p.get("injury_load", 0) + injury_load_chg))
+    updates = dict(stress=new_stress, happiness=new_happy, injury_load=new_load)
     max_ups   = {k: v for k, v in stat_changes.items() if k.endswith("_max_up")}
     real_changes = {k: v for k, v in stat_changes.items() if not k.endswith("_max_up")}
     for s, delta in real_changes.items():
@@ -3151,6 +3171,22 @@ def _simulate_match(p, week, info: dict, day=None):
     else:
         match_stress = 18 if info.get("is_home") else 22
     ns = min(100, p["stress"] + match_stress)
+    # [2026-08 신설, 부상 시스템 확장 2단계, 신민용 확정: "경기 출전도
+    # 신체 부담을 늘림"] 실제로 뛴 경기만 부담을 쌓는다(벤치/결장은
+    # 제외 — played가 이미 그 조건을 담고 있음). 스트레스와 같은 원리로
+    # match_stress를 그대로 재사용하고, 부상체질만 1.5배로 더 쌓인다.
+    # 이 시점에 신체 부담 100 과부하로 인한 강제 부상 판정은 하지 않는다
+    # (그 트리거는 지금은 훈련 세션에서만 확인 — _process_training 참고,
+    # 매치 쪽까지 트리거를 얹는 건 다음 단계에서 검토).
+    if played:
+        from constants import PHYSICAL_TRAIT_EFFECTS as _PTE_match
+        _trait_fx_match = _PTE_match.get(p.get("physical_trait", "무난함"), {})
+        _load_chg = match_stress
+        if "injury_load_mult" in _trait_fx_match:
+            _load_chg = int(_load_chg * _trait_fx_match["injury_load_mult"])
+        new_load = max(0, min(100, p.get("injury_load", 0) + _load_chg))
+    else:
+        new_load = p.get("injury_load", 0)
     nh = p["happiness"]
     # [2026-07 신설] '긍정적' 성격의 happy_gain_mult — 승리 시 행복도 상승분에만 적용.
     _pe_happy = PERSONALITY_EFFECTS.get(p.get("personality", ""), {})
@@ -3177,9 +3213,9 @@ def _simulate_match(p, week, info: dict, day=None):
             mental_updates[ms] = cur - 1
         add_log(f"⚠ 경기 불참  {_day_label(week, day)}  {STAT_KO.get(ms,ms)} -1", "training")
 
-    # [최적화] 감독관계·인기도·스트레스·행복·멘탈 모두 1회 update_player로 통합
+    # [최적화] 감독관계·인기도·스트레스·행복·멘탈·신체부담 모두 1회 update_player로 통합
     update_player(manager_relation=new_rel, popularity=new_pop,
-                  stress=ns, happiness=nh, **mental_updates)
+                  stress=ns, happiness=nh, injury_load=new_load, **mental_updates)
 
     _write_match_log(p, week, info["league_name"], is_home,
                      home_id, away_id, hs, as_,
@@ -5195,6 +5231,78 @@ def _match_verdict(rating, result, goals, assists):
 # 순위
 # ─────────────────────────────────────────
 
+def get_my_league_matches():
+    """[2026-08 신설, 신민용 요청: "리그 경기도 챔스처럼 경기 하나하나
+    대회명/상대/스탯이 저장된 기록으로 보고 싶다 — 출전을 안 해도
+    안 한 대로 저장돼야 한다"] match_details는 사실 예전부터 리그 경기를
+    포함한 내 팀의 모든 경기를 매 경기 저장해왔다(_write_match_log →
+    _save_match_detail이 played/benched 여부와 무관하게 항상 호출됨,
+    league_name 컬럼에 "K리그1"처럼 실제 대회명이 그대로 들어감) — 그래서
+    이 기능은 새로 저장을 시작하는 게 아니라, 이미 쌓이고 있던 데이터에서
+    "리그 경기만" 걸러 보여주는 읽기 전용 조회 하나를 추가하는 것뿐이다.
+    즉 이 함수를 추가해도 매 경기 저장 비용은 전혀 늘지 않는다(이미
+    나가고 있던 비용) — 늘어나는 건 커리어 창을 열 때 이 조회 1번뿐이고,
+    그마저도 단일 쿼리(추가 라운드트립 없음)라 무거운 리그가 아니다.
+
+    league_name이 실제 "리그"인지(컵대회/챔피언스리그 등이 아닌지)는
+    leagues.name 목록과 대조해서 가려낸다 — 국내컵/챔스/유로파 등은
+    league_name에 "OO컵 4강", "아시아 챔피언스리그 리그 스테이지"처럼
+    리그명과 겹치지 않는 문자열이 들어가므로 이 방식으로 정확히 갈린다.
+    반환: [{year,week,date,position,team_name,opp_name,comp,goals,assists,
+    saves,conceded,rating,shots,shots_on,key_passes,dribbles,blocks,
+    pass_acc,score,result,my_played}, ...] (시간순)."""
+    conn = get_conn()
+    try:
+        league_names = {r["name"] for r in conn.execute(
+            "SELECT DISTINCT name FROM leagues").fetchall()}
+        if not league_names:
+            return []
+        _ph = ",".join("?" * len(league_names))
+        rows = [dict(r) for r in conn.execute(
+            f"""SELECT * FROM match_details WHERE league_name IN ({_ph})
+                ORDER BY year, week""", tuple(league_names)).fetchall()]
+    finally:
+        conn.close()
+
+    from constants import week_to_iso_date_str
+    out = []
+    for m in rows:
+        try:
+            payload = json.loads(m.get("detail_json") or "{}")
+        except Exception:
+            payload = {}
+        is_home = bool(m.get("is_home"))
+        my_name  = m["home_name"] if is_home else m["away_name"]
+        opp_name = m["away_name"] if is_home else m["home_name"]
+        my_s = m["home_score"] if is_home else m["away_score"]
+        op_s = m["away_score"] if is_home else m["home_score"]
+        res_raw = m.get("result", "") or ""
+        result = {"win": "승", "draw": "무", "loss": "패"}.get(res_raw, res_raw)
+        detail = payload.get("detail", {}) or {}
+        out.append({
+            "year": m["year"], "week": m["week"],
+            "date": week_to_iso_date_str(m["year"], m["week"]),
+            "position": payload.get("position", ""),
+            "team_name": my_name, "opp_name": opp_name,
+            "comp": m["league_name"],
+            "goals": m.get("goals", 0) or 0, "assists": m.get("assists", 0) or 0,
+            "saves": m.get("saves", 0) or 0, "conceded": op_s,
+            "rating": m.get("rating", 0) or 0,
+            "shots": detail.get("shots", 0), "shots_on": detail.get("shots_on", 0),
+            "key_passes": detail.get("key_passes", 0), "dribbles": detail.get("dribbles", 0),
+            "blocks": detail.get("blocks", 0), "pass_acc": detail.get("pass_acc", 0),
+            "score": f"{my_s}-{op_s}", "result": result,
+            # [2026-08 신설, PHASE 5: 경기 묶음(연승/연패/로테이션/결장)
+            # 서술용] played=False인 경기가 "벤치(로테이션)"였는지 "스쿼드
+            # 자체에서 빠진 결장(부상/징계 등)"이었는지 구분해서 넘긴다 —
+            # 이미 detail_json에 있던 값을 그대로 노출하는 것뿐, 새 계산
+            # 아님.
+            "my_played": 1 if payload.get("played") else 0,
+            "benched": 1 if payload.get("benched") else 0,
+        })
+    return out
+
+
 def get_my_promotions():
     """내가 실제 재직한 기간의 승강 기록 조회 (커리어 창 / 은퇴 창 공용).
     우승과 동일 기준: 리그 경기가 끝나는 35주 시점에 그 팀 소속이었던 해의
@@ -6397,14 +6505,23 @@ def _check_sale_push_forced_sale(p, cur_year, cur_week):
             conn.close()
             return
         interest_ids = {main_row["id"]}
-        interest_names = []
+        interest_teams = []
+        # [2026-08 수정, 신민용 요청: "관심 구단이 장식용 이름만 뜨는데,
+        # 클릭하면 그 팀이 원하는 조건이 뜨게 하고 싶다"] 이름 문자열만
+        # 저장하던 걸 팀 식별 정보(팀id/이름/리그/국가/부/등급) 전체로
+        # 확장 — UI에서 이 정보로 get_sale_push_alt_offer(team_id)를 불러
+        # 그 팀 기준 조건을 즉석 계산해 보여줄 수 있게 한다.
         for _ in range(4):
             _r = _find_sale_push_candidate(c, my_tid, grades, cur_ovr - 8, cur_ovr + 5,
                                            exclude_ids=interest_ids)
             if not _r:
                 break
             interest_ids.add(_r["id"])
-            interest_names.append(_r["name"])
+            interest_teams.append({
+                "team_id": _r["id"], "team_name": _r["name"],
+                "league_name": _r["lname"], "country": _r["country"],
+                "flag": _r["flag"], "tier": _r["tier"], "grade": _r["grade"],
+            })
 
         my_age = p.get("age", 25)
         contract_years = _calc_contract_years(my_age, main_row["tier"], main_row["country"])
@@ -6434,7 +6551,7 @@ def _check_sale_push_forced_sale(p, cur_year, cur_week):
             "grade": main_row["grade"], "salary": salary,
             "market_fee": market_fee, "transfer_fee": sale_fee,
             "discount_pct": discount, "contract_years": contract_years,
-            "interest_teams": interest_names,
+            "interest_teams": interest_teams,
             "score": score, "reasons": reasons,
             "gen_year": cur_year, "gen_week": cur_week,
         }
@@ -6445,11 +6562,80 @@ def _check_sale_push_forced_sale(p, cur_year, cur_week):
         print("_check_sale_push_forced_sale 오류(건너뜀):", e)
 
 
-def accept_sale_push_proposal():
+def get_sale_push_alt_offer(team_id):
+    """[2026-08 신설, 신민용 요청: "관심 구단을 클릭하면 그 팀이 원하는
+    조건이 뜨게"] 판매추진 제안의 "관심 구단" 목록에 있는 팀 하나를 골라
+    클릭했을 때, 그 팀 기준으로 실제 조건(연봉/이적료/계약기간)을 즉석
+    계산해서 반환한다 — main_row(주 후보)를 만들 때와 완전히 동일한
+    계산식(할인율만 지금 대기 중인 제안의 discount_pct를 그대로 재사용,
+    "판매 결심 자체"는 이미 확정된 것이라 팀마다 새로 굴리지 않음).
+    반환: 성공 시 proposal 형식과 동일한 dict, 실패 시 None."""
+    p = get_player()
+    if not p:
+        return None
+    raw = p.get("sale_push_proposal_json") or ""
+    if not raw:
+        return None
+    try:
+        base_proposal = json.loads(raw)
+    except Exception:
+        return None
+
+    conn = get_conn()
+    row = conn.execute(
+        """SELECT t.id, t.name, l.name as lname, l.tier,
+                  cn.name as country, cn.flag, cn.grade
+           FROM teams t JOIN leagues l ON t.league_id=l.id
+           JOIN countries cn ON l.country_id=cn.id WHERE t.id=?""",
+        (team_id,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+
+    st = get_state() or {}
+    cur_year = st.get("current_year", 0)
+    my_age = p.get("age", 25)
+    contract_years = _calc_contract_years(my_age, row["tier"], row["country"])
+    salary = _calc_salary(row["grade"], row["tier"], p.get("ovr", 40),
+                          row["country"], row["name"], year=cur_year,
+                          team_id=row["id"], talent_tier=p.get("talent_tier"))
+    _contract_end = p.get("contract_end_year", 0)
+    _remain = (max(0, _contract_end - cur_year) if _contract_end else None)
+    market_fee = estimate_transfer_fee(
+        row["grade"], row["tier"], p.get("ovr", 0),
+        country=row["country"], team_name=row["name"],
+        position=get_field_pos(p), age=p.get("age"),
+        talent_cap=p.get("talent_cap"), contract_remaining_years=_remain,
+        year=cur_year, team_id=row["id"],
+        effective_ovr=calc_effective_ovr(p, ovr=p.get("ovr", 0)),
+    )
+    discount = base_proposal.get("discount_pct", 0.3)
+    sale_fee = int(market_fee * (1 - discount))
+
+    return {
+        "team_id": row["id"], "team_name": row["name"],
+        "league_name": row["lname"], "country": row["country"],
+        "flag": row["flag"], "tier": row["tier"],
+        "grade": row["grade"], "salary": salary,
+        "market_fee": market_fee, "transfer_fee": sale_fee,
+        "discount_pct": discount, "contract_years": contract_years,
+        "interest_teams": base_proposal.get("interest_teams", []),
+        "score": base_proposal.get("score", 4),
+        "reasons": base_proposal.get("reasons", []),
+        "gen_year": base_proposal.get("gen_year", cur_year),
+        "gen_week": base_proposal.get("gen_week", 0),
+    }
+
+
+def accept_sale_push_proposal(team_id=None):
     """[2026-08 신설, 3단계] 판매 제안 수락 — 즉시 이적하지 않고
     pending_sale_transfer_json에 "예약"해둔다. 실제 이적은 다음 비시즌
     전환 시점(_end_of_season → _execute_pending_sale_transfer)에
-    실행된다. 반환: True면 성공적으로 예약됨."""
+    실행된다. 반환: True면 성공적으로 예약됨.
+
+    team_id: [2026-08 신설] 주어지고 지금 대기 중인 제안의 주 후보와
+    다르면(=관심 구단 목록에서 다른 팀을 클릭해 골랐으면), 그 팀 기준
+    조건(get_sale_push_alt_offer)으로 대체해서 예약한다."""
     p = get_player()
     if not p:
         return False
@@ -6460,6 +6646,11 @@ def accept_sale_push_proposal():
         proposal = json.loads(raw)
     except Exception:
         return False
+
+    if team_id and team_id != proposal.get("team_id"):
+        alt = get_sale_push_alt_offer(team_id)
+        if alt:
+            proposal = alt
 
     update_player(sale_push_proposal_json="",
                   pending_sale_transfer_json=json.dumps(proposal, ensure_ascii=False),
@@ -12411,6 +12602,59 @@ DIRECT_APPLY_MAX = 4
 TALENT_GATE_MIN_BY_GRADE = {"SS": 88, "S": 88, "A": 78, "B": 69, "C": 60, "D": 0, "E": 0, "F": 0}
 _GATE_GRADE_ORDER = ["SS", "S", "A", "B", "C", "D", "E", "F"]
 
+# [2026-08 신설, 신민용 리포트+GPT 협업 설계 확정: "재능 게이트가 고정
+# 국가등급만 보고 그 리그가 지금 실제로 몇 수준인지는 전혀 안 본다"]
+# 실측 사례: 이 세이브에서 한국(B등급, 기대 재능 69)의 실제 1부 평균
+# OVR이 67.1인데, 같은 B등급인 호주는 74.9였다 — 13시즌 진행되며 국가별
+# 리그 실력이 고정 등급과 계속 벌어질 수 있는 구조였다. 그렇다고 실제
+# 평균을 게이트로 그대로 쓰면 "침체→낮은 게이트→약한 유입→더 침체"
+# 식의 자기증폭 루프가 생길 위험이 있어(GPT 설계 검토에서 지적), 고정
+# 기준을 앵커로 두고 실제값을 40:60으로 섞은 뒤 좁은 범위로 clamp한다.
+# [단순화] "최근 N시즌 가중평균"까지는 이번에 넣지 않았다 — 팀 OVR
+# 자체가 이미 시즌전환 때 0.85/0.15 완만 수렴으로 설계돼 있어 한 시즌
+# 급변 리스크가 낮고, 아래 blend+clamp만으로도 과도한 진동은 막힌다.
+# 나중에 침체가 누적되는 게 계속 문제면 그때 시즌별 이력을 추가하기로.
+_TALENT_GATE_FIXED_WEIGHT  = 0.4
+_TALENT_GATE_ACTUAL_WEIGHT = 0.6
+_TALENT_GATE_CLAMP_LOW  = 4   # 기준보다 최대 이만큼까지만 완화
+_TALENT_GATE_CLAMP_HIGH = 5   # 기준보다 최대 이만큼까지만 강화
+
+
+def _actual_league_avg_ovr(country: str, tier: int):
+    """country의 tier부 리그 전체(모든 팀) AI 선수 평균 OVR. 팀이 없거나
+    데이터가 없으면 None(호출부는 이 경우 고정 기준만 쓴다).
+    [GPT 설계 검토 반영] 선수 개인 평균이 아니라 팀 단위로 먼저 평균낸
+    뒤 다시 평균 — 스타 한두 명이 리그 전체 지표를 왜곡하는 걸 줄인다."""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT AVG(ai.ovr) as team_avg FROM teams t
+               JOIN leagues l ON t.league_id = l.id
+               JOIN countries cn ON l.country_id = cn.id
+               JOIN ai_players ai ON ai.team_id = t.id
+               WHERE cn.name = ? AND l.tier = ?
+               GROUP BY t.id""", (country, tier)).fetchall()
+    finally:
+        conn.close()
+    vals = [r["team_avg"] for r in rows if r["team_avg"] is not None]
+    return (sum(vals) / len(vals)) if vals else None
+
+
+def dynamic_talent_gate(country: str, tier: int, gate_grade: str) -> float:
+    """[2026-08 신설] TALENT_GATE_MIN_BY_GRADE의 고정 하한을, 그 나라·부수
+    리그의 지금 실제 평균 OVR과 40:60으로 섞어 보정한 뒤, 기준 대비
+    -4~+5 범위로 clamp한 값을 반환한다. D~F(기준 0)는 원래도 사실상
+    누구나 통과라 그대로 0을 반환(섞을 이유 없음)."""
+    base = TALENT_GATE_MIN_BY_GRADE.get(gate_grade, 0)
+    if base <= 0:
+        return base
+    actual = _actual_league_avg_ovr(country, tier)
+    if actual is None:
+        return base
+    blended = base * _TALENT_GATE_FIXED_WEIGHT + actual * _TALENT_GATE_ACTUAL_WEIGHT
+    lo, hi = base - _TALENT_GATE_CLAMP_LOW, base + _TALENT_GATE_CLAMP_HIGH
+    return max(lo, min(hi, blended))
+
 
 def _gate_grade_for_tier(country_grade: str, tier: int) -> str:
     """[버그수정 2026-07] TALENT_GATE_MIN_BY_GRADE가 나라 등급만 보고 그
@@ -12675,8 +12919,13 @@ def calc_apply_prob_with_context(team_id, ctx):
 
     # [버그수정] 부수(tier)를 반영한 완화된 등급으로 게이트 판정 — 같은
     # 나라라도 하위 리그는 실제 요구 재능이 낮다.
+    # [2026-08 수정] 고정 기준(country_grade) 그대로 쓰지 않고, 그
+    # 리그의 지금 실제 평균 OVR을 섞은 동적 게이트(dynamic_talent_gate)로
+    # 판정한다 — 신민용 리포트: "한국은 B등급인데 실제 리그 수준(67.1)이
+    # 같은 B등급 호주(74.9)보다 훨씬 낮은데도 똑같은 재능 69를 요구해서,
+    # 팀 로스터가 약해도(66) 국가등급만으로 계속 막힌다."
     gate_grade = _gate_grade_for_tier(grade, row["tier"])
-    gate = TALENT_GATE_MIN_BY_GRADE.get(gate_grade, 0)
+    gate = dynamic_talent_gate(row["country"], row["tier"], gate_grade)
     if ctx["talent_cap"] < gate:
         return 0.005, True   # 재능 미달 — 사실상 불가능
 

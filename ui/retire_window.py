@@ -1984,11 +1984,44 @@ class RetireWindow(QDialog):
         from game_engine import get_my_promotions
         promos = get_my_promotions()
 
-        return p, entries, trophies, awards, intl_trophies, match_rows, absence_events, promos
+        # [2026-08 신설, PHASE 2: opponent_context_engine] 국제전(본선+
+        # 예선) 경기 목록 — "당시엔 그냥 한 경기였는데 그 상대가 나중에
+        # 그 대회에서 우승/준우승/4강까지 갔다"는 문장을 만드는 재료.
+        # 이미 위에서 absence_events용으로 캐시해둔 _cm3를 재사용하므로
+        # 추가 조회 비용이 없다.
+        intl_matches = []
+        try:
+            intl_matches = list(_cm3["intl_ms"]) + list(_cm3["qual_ms"])
+        except Exception:
+            pass
+
+        # [2026-08 신설, PHASE 5: 경기 묶음 서술] 리그 경기 전체(팀 재직
+        # 구분 없이 시간순) — story_generator가 (팀,연도)별로 재그룹해서
+        # 연승/연패/로테이션/결장 구간을 찾는다.
+        from game_engine import get_my_league_matches
+        league_matches = []
+        try:
+            league_matches = get_my_league_matches()
+        except Exception:
+            pass
+
+        return (p, entries, trophies, awards, intl_trophies, match_rows,
+                absence_events, promos, intl_matches, league_matches)
 
     def _open_story_book(self):
         """story_generator.py(로컬 문장 뱅크 기반, API 비사용)로 장문
-        연대기를 만들어 책 형태의 새 창(StoryBookWindow)으로 띄운다."""
+        연대기를 만들어 책 형태의 새 창(StoryBookWindow)으로 띄운다.
+        [2026-08 신설, 신민용 요청: "스토리 생성이 오래 걸리면 게임 시작
+        때 뜨는 바처럼 진행 중임을 보여줘야 한다"] center_panel.py의
+        _ProcessingOverlay(1년 넘기기 등에서 이미 검증된 바로 그 오버레이)를
+        재사용 — 버튼 텍스트만 바꾸는 예전 방식은 generate_story()가 Qt
+        이벤트 루프에 제어권을 안 넘기고 바로 실행되는 동기 호출이라 실제로는
+        화면 갱신이 아예 안 일어났다(버튼 글자가 "생성 중..."으로 안 보이고
+        그대로 멈춘 것처럼 보임). 오버레이를 띄운 직후 processEvents()로
+        강제 렌더링한 뒤에 무거운 계산을 시작해서, 최소한 "지금 뭘 하고
+        있는지"가 화면에 보이게 한다(진행률 세분화는 story_generator 내부가
+        단일 루프라 지금은 불가 — 추후 단계별 콜백을 넣으면 진행률 바로
+        확장 가능)."""
         # [2026-08 신설, 신민용 요청: "같은 종류의 창은 하나만"] 이미 열려
         # 있으면 새로 생성하지 않고(비용이 드는 문장 생성도 건너뛰고)
         # 기존 창을 앞으로 가져온다.
@@ -1997,14 +2030,22 @@ class RetireWindow(QDialog):
             return
         self.book_btn.setEnabled(False)
         self.book_btn.setText("⏳ 생성 중...")
+
+        from ui.center_panel import _ProcessingOverlay
+        from PyQt6.QtWidgets import QApplication
+        if getattr(self, "_story_overlay", None) is None:
+            self._story_overlay = _ProcessingOverlay(self)
+        self._story_overlay.show_message("📖 스토리 생성 중...")
+        QApplication.processEvents()
         try:
-            p, entries, trophies, awards, intl_trophies, match_rows, absence_events, promos = \
-                self._gather_story_inputs()
+            (p, entries, trophies, awards, intl_trophies, match_rows,
+             absence_events, promos, intl_matches, league_matches) = self._gather_story_inputs()
 
             import story_generator
             story_text = story_generator.generate_story(
                 p, entries, trophies, awards, promos=promos, intl_trophies=intl_trophies,
-                match_rows=match_rows, absence_events=absence_events)
+                match_rows=match_rows, absence_events=absence_events, intl_matches=intl_matches,
+                league_matches=league_matches)
 
             from ui.story_book_window import StoryBookWindow
             self._book_win = StoryBookWindow(p.get("name", "선수"), story_text, parent=self)
@@ -2014,6 +2055,7 @@ class RetireWindow(QDialog):
             self._book_win.finished.connect(_clear_book)
             self._book_win.show()
         finally:
+            self._story_overlay.hide()
             self.book_btn.setEnabled(True)
             self.book_btn.setText("📖 스토리 생성")
 

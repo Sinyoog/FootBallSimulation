@@ -196,16 +196,38 @@ class PlayerPanel(QWidget):
         season_v = QVBoxLayout(self.sec_season)
         season_v.setSpacing(4); season_v.setContentsMargins(0,0,0,0)
 
+        # [2026-08 신설, 신민용 요청: "시즌 탭만 봐도 소속팀/리그/연봉이
+        # 보이면 좋겠다 — 이것만 보려고 기본 탭까지 켜지 않게"] 등수 위에
+        # 소속팀·리그(몇부)·연봉·감독관계를 요약해서 보여준다. "기본" 탭의
+        # info_lay와 별개 위젯(season_top_lay)이라 refresh()에서 따로
+        # 채운다.
+        self.season_top_frame = QWidget()
+        self.season_top_lay   = QVBoxLayout(self.season_top_frame)
+        self.season_top_lay.setSpacing(3); self.season_top_lay.setContentsMargins(0,0,0,4)
+        season_v.addWidget(self.season_top_frame)
+
         self.lbl_rank = QLabel(""); self.lbl_rank.setObjectName("rankLabel")
         season_v.addWidget(self.lbl_rank)
         season_v.addWidget(self._mk_div())
 
+        self.vitals_frame = QWidget()
+        vitals_v = QVBoxLayout(self.vitals_frame)
+        vitals_v.setSpacing(4); vitals_v.setContentsMargins(0,0,0,0)
         self.lbl_stress = QLabel("스트레스  0")
         self.bar_stress = StatBar(bar_max=100); self.bar_stress.setFixedHeight(8)
         self.lbl_happy  = QLabel("행복도  0")
         self.bar_happy  = StatBar(bar_max=100); self.bar_happy.setFixedHeight(8)
-        for w in [self.lbl_stress, self.bar_stress, self.lbl_happy, self.bar_happy]:
-            season_v.addWidget(w)
+        # [2026-08 신설, 부상 시스템 확장 2단계] 신체 부담(injury_load) —
+        # 스트레스와 같은 원리(0~100, 훈련/경기로 증가·휴식으로 감소)로
+        # 동작하지만 별개 축이다: 스트레스는 "지금 당장 얼마나 지쳤는가"
+        # (짧은 주기로 오르내림), 신체 부담은 "장기간 얼마나 혹사됐는가"
+        # (휴식으로도 절반만 풀림 — game_engine._process_training 참고).
+        self.lbl_load = QLabel("신체 부담  0")
+        self.bar_load = StatBar(bar_max=100); self.bar_load.setFixedHeight(8)
+        for w in [self.lbl_stress, self.bar_stress, self.lbl_happy, self.bar_happy,
+                  self.lbl_load, self.bar_load]:
+            vitals_v.addWidget(w)
+        season_v.addWidget(self.vitals_frame)
         season_v.addWidget(self._mk_div())
 
         season_title = QLabel("이번 시즌"); season_title.setObjectName("secTitle")
@@ -454,7 +476,14 @@ class PlayerPanel(QWidget):
         rows.append(("명성",   f"{p.get('fame',0)} [{fame_lbl}]"))
         rows.append(("인기도", str(p.get("popularity",0))))
         rows.append(("팬수",   f"{p.get('fans',0):,}명"))
-        rows.append(("에이전트", f"[{p.get('agent_grade','없음')}등급]"))
+        # [2026-08 수정, 신민용 리포트: "에이전트가 등급만 뜨고 어디 전문인지
+        # 안 뜬다"] agent_window.py가 에이전트 계약 시 저장하는
+        # agent_continent(대륙 전문 분야)를 같이 표시한다. 없으면(대륙
+        # 배정이 안 된 예전 세이브 등) 등급만 그대로 표시.
+        _ag_cont = p.get("agent_continent", "") or ""
+        _ag_txt = f"[{p.get('agent_grade','없음')}등급 · {_ag_cont} 전문]" if _ag_cont \
+                  else f"[{p.get('agent_grade','없음')}등급]"
+        rows.append(("에이전트", _ag_txt))
         rows.append(("연봉",   "무급" if salary == 0 else
                      f"연 {fmt_money(salary)}  [주 {fmt_money(weekly)}]"))
         rows.append(("총자산", fmt_money(p.get("total_assets",0))))
@@ -462,6 +491,17 @@ class PlayerPanel(QWidget):
             rows.append(("감독관계", str(p.get("manager_relation",50))))
         for k, v in rows:
             self.info_lay.addWidget(_info_row(k, v))
+
+        # [2026-08 신설] 시즌 탭 상단 요약(소속팀/리그(몇부)/연봉/감독관계).
+        _clear_layout(self.season_top_lay)
+        self.season_top_lay.addWidget(_info_row("소속", team_name))
+        self.season_top_lay.addWidget(_info_row("리그", league_name))
+        self.season_top_lay.addWidget(_info_row(
+            "연봉", "무급" if salary == 0 else
+            f"연 {fmt_money(salary)}  [주 {fmt_money(weekly)}]"))
+        if not _hard:
+            self.season_top_lay.addWidget(
+                _info_row("감독관계", str(p.get("manager_relation", 50))))
 
         # 순위
         # [2026-08 수정, 신민용 요청: "확정 강등권이면 빨간색, 확정
@@ -476,17 +516,24 @@ class PlayerPanel(QWidget):
             self.lbl_rank.setText("팀 없음" if lang=="ko" else "No Team")
             self.lbl_rank.setStyleSheet("")
 
-        # 스트레스/행복도
+        # 스트레스/행복도/신체 부담
+        # [2026-08 신설, 신민용 확정: "스트레스나 행복도 그리고 신체 부담
+        # 얘네가 어려움 모드에서는 안보여야해"] OVR·재능등급·스탯바와 같은
+        # 취급 — 하드모드에서는 내부 컨디션 수치를 전부 숨긴다.
+        self.vitals_frame.setVisible(not _hard)
         if p.get("injured"):
             _idetail2 = p.get("injury_detail") or "부상"
             self.lbl_stress.setText(f"스트레스  {p['stress']}   🚑 {_idetail2} {p['injury_weeks']}일 남음")
         else:
             self.lbl_stress.setText(f"스트레스  {p['stress']}")
         self.lbl_happy.setText(f"행복도  {p['happiness']}")
+        self.lbl_load.setText(f"신체 부담  {p.get('injury_load', 0)}")
         self.bar_stress.set_values(p['stress'], 100)
         self.bar_stress._cur_color = QColor("#cc4400")
         self.bar_happy.set_values(p['happiness'], 100)
         self.bar_happy._cur_color = QColor("#00aa44")
+        self.bar_load.set_values(p.get('injury_load', 0), 100)
+        self.bar_load._cur_color = QColor("#a0522d")
 
         # 이번 시즌
         _clear_layout(self.season_lay)

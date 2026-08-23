@@ -2773,21 +2773,38 @@ class CenterPanel(QWidget):
         완전히 다른 개념: "상대 구단이 나에게 이적을 제안"이 아니라
         "우리 구단이 이미 판매를 결정하고 완성된 조건을 승인받으려는
         것"이라서, 연봉/이적료를 협상하는 버튼이 없다 — 수락/거절만
-        가능하다. 우측엔 "관심 구단" 목록(실제 오퍼가 아니라 구매
-        의향이 있는 팀들)을 장식적으로 보여준다."""
+        가능하다. 우측엔 "관심 구단" 목록을 보여준다.
+
+        [2026-08 수정, 신민용 요청 2건]
+        (1) "관심 구단이 관심만 있다고만 뜨는데, 클릭하면 그 팀이 원하는
+            조건이 좌측에 뜨게 하고 싶다" — 관심 구단 이름을 클릭 가능한
+            버튼으로 바꾸고, 누르면 game_engine.get_sale_push_alt_offer로
+            그 팀 기준 조건을 즉석 계산해 좌측 카드를 그 팀 것으로 갈아
+            끼운다("주 후보"로 다시 돌아가는 버튼도 별도 제공). 수락 시엔
+            지금 화면에 표시 중인(선택된) 팀 기준으로 예약된다.
+        (2) "오퍼창이 떠도 다른 창(세계 축구 기록실 등)을 건들 수 있게
+            해달라 — 이 팀이 어떤 팀인지 확인해야 하니" — dlg.exec()(모달,
+            뒤 UI 전부 잠김) 대신 dlg.show()(비모달)로 띄운다. 참조를
+            self._sale_push_dlg에 들고 있어야 즉시 GC되지 않는다."""
+        # 이미 떠 있으면 새로 안 만든다(매주 refresh 루프가 여러 번 이
+        # 메서드를 호출해도 창이 중복 생성되지 않게).
+        if getattr(self, "_sale_push_dlg", None) is not None:
+            return
         raw = p.get("sale_push_proposal_json") or ""
         if not raw:
             return
         import json as _json
         try:
-            proposal = _json.loads(raw)
+            main_proposal = _json.loads(raw)
         except Exception:
             return
 
         from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame
-        from game_engine import accept_sale_push_proposal, reject_sale_push_proposal
+        from game_engine import (accept_sale_push_proposal, reject_sale_push_proposal,
+                                  get_sale_push_alt_offer)
 
         dlg = QDialog(self)
+        dlg.setWindowModality(Qt.WindowModality.NonModal)
         dlg.setWindowTitle("🏟 판매추진 제안")
         dlg.setMinimumWidth(440)
         dlg.setStyleSheet(_DIALOG_STYLE)
@@ -2802,37 +2819,15 @@ class CenterPanel(QWidget):
 
         card = QFrame(); card.setObjectName("dlgCard")
         cl = QVBoxLayout(card); cl.setContentsMargins(14, 12, 14, 12); cl.setSpacing(5)
-        _flag = proposal.get("flag", "")
-        cl.addWidget(QLabel(
-            f"<b style='color:#fff;font-size:14px'>{_flag} {proposal['team_name']}</b>"))
-        cl.addWidget(QLabel(
-            f"<span style='color:#bbb'>{proposal['league_name']} ({proposal['country']}, "
-            f"{proposal['tier']}부)</span>"))
-        cl.addWidget(QLabel(""))
-        cl.addWidget(QLabel(
-            f"<span style='color:#bbb'>제시 연봉</span>  "
-            f"<b style='color:#00cc66'>{fmt_money(proposal['salary'])} / 년</b>"))
-        cl.addWidget(QLabel(
-            f"<span style='color:#bbb'>판매 금액</span>  "
-            f"<b style='color:#ffcc33'>{fmt_money(proposal['transfer_fee'])}</b>  "
-            f"<span style='color:#888;font-size:11px'>"
-            f"(시장가 {fmt_money(proposal['market_fee'])} 대비 "
-            f"{int(proposal['discount_pct']*100)}% 할인)</span>"))
-        cl.addWidget(QLabel(
-            f"<span style='color:#bbb'>계약 기간</span>  "
-            f"<b style='color:#fff'>{proposal['contract_years']}년</b>"))
         body.addWidget(card, 3)
 
-        interest = proposal.get("interest_teams") or []
+        interest = main_proposal.get("interest_teams") or []
+        ibox = None
         if interest:
             ibox = QFrame(); ibox.setObjectName("dlgCard")
             il = QVBoxLayout(ibox); il.setContentsMargins(10, 10, 10, 10); il.setSpacing(3)
-            il.addWidget(QLabel("<span style='color:#888;font-size:11px'>관심 구단</span>"))
-            for name in interest:
-                nl = QLabel(f"· {name}")
-                nl.setStyleSheet("color:#999;font-size:11px;")
-                il.addWidget(nl)
-            il.addStretch()
+            il.addWidget(QLabel("<span style='color:#888;font-size:11px'>관심 구단"
+                                 " (클릭하면 조건 확인)</span>"))
             body.addWidget(ibox, 1)
 
         root.addLayout(body)
@@ -2849,8 +2844,76 @@ class CenterPanel(QWidget):
         btn_row.addWidget(btn_accept, 1); btn_row.addWidget(btn_reject, 1)
         root.addLayout(btn_row)
 
+        # 지금 좌측 카드에 표시 중인(=수락 시 예약될) 팀. 처음엔 주 후보.
+        state = {"shown": main_proposal}
+
+        def _render_card(proposal, is_main):
+            while cl.count():
+                item = cl.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+            _flag = proposal.get("flag", "")
+            cl.addWidget(QLabel(
+                f"<b style='color:#fff;font-size:14px'>{_flag} {proposal['team_name']}</b>"))
+            cl.addWidget(QLabel(
+                f"<span style='color:#bbb'>{proposal['league_name']} ({proposal['country']}, "
+                f"{proposal['tier']}부)</span>"))
+            if not is_main:
+                back = QLabel("<span style='color:#66aaff;font-size:11px'>"
+                               "관심 구단이 원하는 조건 (주 후보 아님)</span>")
+                cl.addWidget(back)
+            cl.addWidget(QLabel(""))
+            cl.addWidget(QLabel(
+                f"<span style='color:#bbb'>제시 연봉</span>  "
+                f"<b style='color:#00cc66'>{fmt_money(proposal['salary'])} / 년</b>"))
+            cl.addWidget(QLabel(
+                f"<span style='color:#bbb'>판매 금액</span>  "
+                f"<b style='color:#ffcc33'>{fmt_money(proposal['transfer_fee'])}</b>  "
+                f"<span style='color:#888;font-size:11px'>"
+                f"(시장가 {fmt_money(proposal['market_fee'])} 대비 "
+                f"{int(proposal['discount_pct']*100)}% 할인)</span>"))
+            cl.addWidget(QLabel(
+                f"<span style='color:#bbb'>계약 기간</span>  "
+                f"<b style='color:#fff'>{proposal['contract_years']}년</b>"))
+            if not is_main:
+                bb = QPushButton("↩ 주 후보로 돌아가기")
+                bb.setObjectName("dlgNo")
+                bb.clicked.connect(lambda: _select_team(main_proposal, True))
+                cl.addWidget(bb)
+            state["shown"] = proposal
+
+        def _select_team(proposal, is_main):
+            _render_card(proposal, is_main)
+
+        def _on_interest_click(team_id):
+            alt = get_sale_push_alt_offer(team_id)
+            if alt:
+                _select_team(alt, False)
+            else:
+                show_toast(self, "조건을 불러올 수 없습니다.", "#cc0000", 1200)
+
+        if ibox is not None:
+            for team in interest:
+                _name = team.get("team_name", "") if isinstance(team, dict) else str(team)
+                _flag2 = team.get("flag", "") if isinstance(team, dict) else ""
+                if isinstance(team, dict) and team.get("team_id"):
+                    nb = QPushButton(f"· {_flag2} {_name}")
+                    nb.setObjectName("dlgNo")
+                    nb.setStyleSheet("text-align:left;color:#999;font-size:11px;"
+                                     "padding:3px 6px;")
+                    nb.clicked.connect(lambda _=False, tid=team["team_id"]: _on_interest_click(tid))
+                    ibox.layout().addWidget(nb)
+                else:
+                    nl = QLabel(f"· {_name}")
+                    nl.setStyleSheet("color:#999;font-size:11px;")
+                    ibox.layout().addWidget(nl)
+            ibox.layout().addStretch()
+
+        _render_card(main_proposal, True)
+
         def _accept():
-            accept_sale_push_proposal()
+            chosen = state["shown"]
+            accept_sale_push_proposal(chosen.get("team_id"))
             dlg.accept()
             if self.main_win:
                 self.main_win.refresh_all()
@@ -2861,9 +2924,14 @@ class CenterPanel(QWidget):
             if self.main_win:
                 self.main_win.refresh_all()
 
+        def _on_closed(_result=0):
+            self._sale_push_dlg = None
+
         btn_accept.clicked.connect(_accept)
         btn_reject.clicked.connect(_reject)
-        dlg.exec()
+        dlg.finished.connect(_on_closed)
+        self._sale_push_dlg = dlg
+        dlg.show()
 
     def _show_forced_commit(self, forced):
         """[복수국적] 22세 프리시즌(1~3주) — 평생 뛸 대표팀 국적을 강제로 확정.

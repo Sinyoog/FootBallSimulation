@@ -77,6 +77,40 @@ class StoryBookWindow(QDialog):
         self._build()
         self._render_page()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not getattr(self, "_fit_done_once", False):
+            self._fit_done_once = True
+            self._fit_window_to_content()
+
+    def _fit_window_to_content(self):
+        # [2026-08 수정, 신민용 요청: "세로 길이를 최대로 늘리는 게 아니라
+        # 글자 끝부분에 맞춰서"] 화면 최대 높이로 고정하는 대신, 지금
+        # 페이지 텍스트가 실제로 필요로 하는 높이만큼만 창을 늘린다 —
+        # 짧은 페이지는 짧게, 긴 페이지는 길게(화면 높이를 넘지 않는
+        # 선에서). heightForWidth는 레이아웃이 실제로 폭을 잡은 뒤에만
+        # 정확하므로, 레이아웃이 자리잡을 시간을 한 틱 준 뒤 계산한다.
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(0, self._apply_content_height)
+
+    def _apply_content_height(self):
+        w = self._text_label.width()
+        if w <= 0:
+            w = self.width() - 80
+        content_h = self._text_label.heightForWidth(max(1, w))
+        if content_h <= 0:
+            content_h = self._text_label.sizeHint().height()
+        # 텍스트 영역을 제외한 나머지(헤더/네비게이션/여백/페이지 카드
+        # 자체 패딩)를 대략적인 고정값으로 잡는다 — 정확한 값을 매번
+        # 다시 재는 대신, 지금 창 높이에서 스크롤 영역이 차지하는 비중이
+        # 아주 크다는 점(page_lay 여백 24*2 + 헤더/네비 ~100)만 반영.
+        chrome = 220
+        target_h = content_h + chrome
+        screen = self.screen()
+        max_h = screen.availableGeometry().height() if screen else 900
+        target_h = max(640, min(target_h, max_h))
+        self.resize(self.width(), target_h)
+
     # ── 페이지 나누기 ──────────────────────────────
     def _paginate(self, text: str):
         paragraphs = [p for p in text.split("\n\n") if p.strip()]
@@ -156,6 +190,10 @@ class StoryBookWindow(QDialog):
         self._page_num_lbl.setText(f"{self._page_idx + 1} / {len(self._pages)}")
         self._prev_btn.setEnabled(self._page_idx > 0)
         self._next_btn.setEnabled(self._page_idx < len(self._pages) - 1)
+        # [2026-08 신설] 페이지마다 문단 분량이 다르므로, 페이지를 넘길
+        # 때마다 그 페이지 내용에 맞춰 창 높이를 다시 맞춘다.
+        if getattr(self, "_fit_done_once", False):
+            self._fit_window_to_content()
 
     def _go_prev(self):
         if self._page_idx > 0:
@@ -186,7 +224,9 @@ class StoryBookWindow(QDialog):
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(self._story_text)
-            QMessageBox.information(self, "저장 완료", f"저장했습니다:\n{path}")
+            # [2026-08 수정, 신민용 요청: "저장된 후 '저장했습니다' 안내창은
+            # 안 뜨게"] 저장 자체는 그대로 하되, 성공 안내 팝업만 제거 —
+            # 파일 탐색기에 실제로 파일이 생기는 것으로 충분히 확인 가능.
         except Exception as e:
             QMessageBox.warning(self, "저장 실패", f"저장 중 오류가 발생했습니다:\n{e}")
 

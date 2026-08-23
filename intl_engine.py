@@ -4449,6 +4449,12 @@ def get_my_intl_matches(only_qual=False):
             "score": f"{my_s}-{op_s}", "result": result,
             "absence_reason": m.get("my_absence_reason"),
             "my_played": m.get("my_played", 0),
+            # [2026-08 신설, PHASE 2: opponent_context_engine] 이 경기가
+            # 열린 대회 id — 상대가 그 대회에서 최종적으로 어디까지
+            # 갔는지(opponent_context.get_intl_opponent_stage)를 나중에
+            # 조회하려면 필요하다. 기존 소비처는 이 키를 안 쓰므로
+            # 하위호환에 영향 없음(추가만, 제거/변경 없음).
+            "tournament_id": m["tournament_id"],
         })
     return out
 
