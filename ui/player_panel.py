@@ -3,7 +3,7 @@ ui/player_panel.py  ─  좌측 선수 정보 패널
 """
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QFrame
+    QFrame, QPushButton
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPainter, QBrush, QColor, QPen
@@ -33,6 +33,51 @@ _TALENT_COLOR = {
     "untalented":  "#2a2a2a",  # 가장 어두운 그레이
 }
 
+# ════════════════════════════════════════════════════════════════
+# [2026-08 신설] 신체(부상) 탭 — 부상 부위 실루엣 표시용 매핑.
+#
+# 주의: game_engine._apply_injury()는 아직 "구체 부상명"만 고르고
+# 좌/우 및 신체 zone은 별도로 저장하지 않는다(부상 시스템 설계 문서
+# 6번 항목 "초기에는 단일 게이지에서 결정"과 15번 항목 "좌우 구분"이
+# 아직 미확정 상태인 것과 동일 맥락). 그래서 이 매핑은 DB에 새 컬럼을
+# 추가하지 않고, 이미 존재하는 injury_detail 문자열만으로 어느 부위
+# [2026-08 신설] 등급별 강조 색상(부상 시스템 설계 문서 13번 항목:
+# 경미=노랑, 중간=주황, 심각=빨강, 매우심각=강한빨강).
+INJURY_TIER_COLOR = {
+    "경미":     QColor("#d4b106"),
+    "중간":     QColor("#e07b1a"),
+    "심각":     QColor("#cc3333"),
+    "매우 심각": QColor("#8b0000"),
+}
+
+# [2026-08] 부상 부위 zone 키 -> 한글 표시명. game_engine._apply_injury()가
+# injury_body_part에 실제 zone(예: 'l_knee', 'neck', 'r_hand')을 직접 저장해
+# 주므로, 예전처럼 부상명에서 부위를 추측하거나 좌/우를 해시로 지어낼 필요가
+# 없어졌다 — 여기서는 그 zone 키를 화면에 보여줄 한글 문구로만 바꿔준다.
+ZONE_KO = {
+    "head": "머리", "neck": "목", "chest": "가슴", "abdomen": "복부",
+    "back": "허리", "pelvis": "골반",
+    "shoulder": "어깨", "upper_arm": "팔", "elbow": "팔꿈치",
+    "forearm": "팔뚝", "hand": "손",
+    "thigh": "허벅지", "knee": "무릎", "calf": "종아리",
+    "ankle": "발목", "foot": "발",
+}
+_SIDE_KO = {"l": "왼쪽", "r": "오른쪽"}
+
+
+def zone_label_ko(zone_key: str) -> str:
+    """'l_knee' -> '왼쪽 무릎', 'neck' -> '목' 처럼 zone 키를 표시용
+    한글로 바꾼다. 실제 데이터가 없던 시절엔 이 좌/우를 이름 해시로
+    추측했지만, 이제 injury_body_part에 실제 값이 저장되므로 그대로
+    보여주면 된다."""
+    if not zone_key:
+        return "몸통"
+    if "_" in zone_key and zone_key.split("_", 1)[0] in _SIDE_KO:
+        side, base = zone_key.split("_", 1)
+        return f"{_SIDE_KO[side]} {ZONE_KO.get(base, base)}"
+    return ZONE_KO.get(zone_key, zone_key)
+
+
 PANEL_STYLE = """
 QWidget { background-color: #1e1e1e; color: #cccccc; font-size: 12px; }
 #pName  { color: #00ff66; font-size: 16px; font-weight: bold; }
@@ -47,6 +92,15 @@ QWidget { background-color: #1e1e1e; color: #cccccc; font-size: 12px; }
 #secTitle   { color: #888888; font-size: 11px;
               border-bottom: 1px solid #2a2a2a; padding-bottom: 2px; }
 #divider    { background-color: #2a2a2a; }
+QPushButton#tabBtn {
+    background-color: rgba(255,255,255,18); color:#888888;
+    border: 1px solid rgba(255,255,255,30); border-radius: 4px;
+    padding: 4px 0px; font-size: 11px; font-weight: bold;
+}
+QPushButton#tabBtn:hover { background-color: rgba(255,255,255,35); color:#bbbbbb; }
+QPushButton#tabBtn:checked {
+    background-color: #2d5a2d; color: #ffffff; border: 1px solid #4caf50;
+}
 QProgressBar { background-color: #2a2a2a; border-radius: 3px; border: none; }
 QProgressBar#stressBar::chunk { background-color: #cc4400; border-radius:3px; }
 QProgressBar#happyBar::chunk  { background-color: #00aa44; border-radius:3px; }
@@ -73,6 +127,17 @@ class PlayerPanel(QWidget):
 
     # ── 빌드 ─────────────────────────────────────
 
+    # [2026-08 신설, 신민용 확정: 탭 버튼 UI] 좌측 패널이 신체(부상 부위)
+    # 이미지 추가로 인해 세로로 너무 길어지는 걸 막기 위해, OVR 뱃지 위에
+    # "전체 | 기본 | 시즌 | 신체 | 스탯" 5개 토글 버튼을 두고 원하는
+    # 섹션만 눌러서 볼 수 있게 한다.
+    # - "전체": 지금까지 누른 개별 선택을 무시하고 기본→시즌→신체→스탯
+    #   고정 순서로 전부 표시.
+    # - 개별 4개 버튼: 다중 선택 가능(토글). 안 누르면 반투명, 누르면
+    #   초록색으로 표시되며, 표시 순서는 "누른 순서" 그대로 위에서부터
+    #   쌓인다(예: 신체→기본 순으로 누르면 신체 섹션이 기본보다 위).
+    DEFAULT_ORDER = ["기본", "시즌", "신체", "스탯"]
+
     def _build(self):
         self.lay = QVBoxLayout(self)
         self.lay.setContentsMargins(8,8,8,8)
@@ -91,66 +156,176 @@ class PlayerPanel(QWidget):
         name_row.setContentsMargins(0, 0, 0, 0)
         name_row.addWidget(self.lbl_name, 1)     # 이름이 늘어나면 이 쪽이 먼저 넓어짐
         name_row.addWidget(self.lbl_talent, 0)
+        self.lay.addLayout(name_row)
+
+        # 탭 버튼 행 (OVR 뱃지 바로 위)
+        tab_row = QHBoxLayout()
+        tab_row.setContentsMargins(0, 3, 0, 3)
+        tab_row.setSpacing(3)
+        self.tab_buttons: dict[str, QPushButton] = {}
+        self.btn_all = QPushButton("전체")
+        self.btn_all.setObjectName("tabBtn")
+        self.btn_all.setCheckable(True)
+        self.btn_all.clicked.connect(self._on_click_all)
+        tab_row.addWidget(self.btn_all)
+        for key in self.DEFAULT_ORDER:
+            b = QPushButton(key)
+            b.setObjectName("tabBtn")
+            b.setCheckable(True)
+            b.clicked.connect(lambda _checked, k=key: self._on_click_tab(k))
+            tab_row.addWidget(b)
+            self.tab_buttons[key] = b
+        self.lay.addLayout(tab_row)
 
         badge_row = QHBoxLayout()
         badge_row.setContentsMargins(0, 2, 0, 0)
         badge_row.addWidget(self.lbl_ovr, 0)
         badge_row.addWidget(self.lbl_state, 1)   # 부상 텍스트가 길면 이 라벨이 줄바꿈되며 늘어남
-        self.lay.addLayout(name_row)
         self.lay.addLayout(badge_row)
         self._div()
+
+        # ── 섹션별 콘텐츠(내용은 refresh()에서 채움) ──
 
         # 기본 정보 영역 (동적)
         self.info_frame = QWidget()
         self.info_lay   = QVBoxLayout(self.info_frame)
         self.info_lay.setSpacing(3); self.info_lay.setContentsMargins(0,0,0,0)
-        self.lay.addWidget(self.info_frame)
-        self._div()
 
-        # 팀 순위
+        # 시즌 섹션: 팀 순위 + 스트레스/행복도 + 이번 시즌 기록을 하나로 묶는다.
+        self.sec_season = QWidget()
+        season_v = QVBoxLayout(self.sec_season)
+        season_v.setSpacing(4); season_v.setContentsMargins(0,0,0,0)
+
         self.lbl_rank = QLabel(""); self.lbl_rank.setObjectName("rankLabel")
-        self.lay.addWidget(self.lbl_rank)
-        self._div()
+        season_v.addWidget(self.lbl_rank)
+        season_v.addWidget(self._mk_div())
 
-        # 스트레스 / 행복도 (0~100이 최대이므로 bar_max=100)
         self.lbl_stress = QLabel("스트레스  0")
         self.bar_stress = StatBar(bar_max=100); self.bar_stress.setFixedHeight(8)
         self.lbl_happy  = QLabel("행복도  0")
         self.bar_happy  = StatBar(bar_max=100); self.bar_happy.setFixedHeight(8)
         for w in [self.lbl_stress, self.bar_stress, self.lbl_happy, self.bar_happy]:
-            self.lay.addWidget(w)
-        self._div()
+            season_v.addWidget(w)
+        season_v.addWidget(self._mk_div())
 
-        # 이번 시즌
-        lbl = QLabel("이번 시즌"); lbl.setObjectName("secTitle")
-        self.lay.addWidget(lbl)
+        season_title = QLabel("이번 시즌"); season_title.setObjectName("secTitle")
+        season_v.addWidget(season_title)
         self.season_frame = QWidget()
         self.season_lay   = QVBoxLayout(self.season_frame)
         self.season_lay.setSpacing(2); self.season_lay.setContentsMargins(0,0,0,0)
-        self.lay.addWidget(self.season_frame)
-        self._div()
+        season_v.addWidget(self.season_frame)
 
-        # 스탯
+        # 신체 섹션(NEW): 부상 부위를 신체 실루엣으로 표시.
+        # (부상 시스템 설계 문서 10~13번 항목 — 해부학 도감이 아니라
+        #  "부상 위치만 알려주는 자연스러운 인체 실루엣" 컨셉)
+        self.sec_body = QWidget()
+        body_v = QVBoxLayout(self.sec_body)
+        body_v.setContentsMargins(0,0,0,0); body_v.setSpacing(6)
+
+        self.body_silhouette = BodySilhouette()
+        body_v.addWidget(self.body_silhouette)
+
+        self.lbl_body_detail = QLabel("🩹 부상 없음")
+        self.lbl_body_detail.setWordWrap(True)
+        self.lbl_body_detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_body_detail.setStyleSheet("color:#aaaaaa; font-size:12px; padding:2px 4px;")
+        body_v.addWidget(self.lbl_body_detail)
+
+        # 스탯 섹션: 신체(체력/스피드/점프/몸싸움) + 기술 + 정신 스탯 바.
+        self.sec_stat = QWidget()
+        stat_v = QVBoxLayout(self.sec_stat)
+        stat_v.setSpacing(4); stat_v.setContentsMargins(0,0,0,0)
         self.stat_rows: dict[str, StatRow] = {}
         self.stat_section_labels = []
+        _first = True
         for section, stats in [
             ("신체", ["stamina","speed","jump","strength"]),
             ("기술", ["shooting","passing","dribbling","tackling",
                       "heading","positioning","setpiece"]),
             ("정신", ["mental","confidence","leadership","concentration"]),
         ]:
+            if not _first:
+                stat_v.addWidget(self._mk_div())
+            _first = False
             sl = QLabel(section); sl.setObjectName("secTitle")
-            self.lay.addWidget(sl)
+            stat_v.addWidget(sl)
             self.stat_section_labels.append(sl)
             for s in stats:
                 row = StatRow(s)
                 self.stat_rows[s] = row
-                self.lay.addWidget(row)
-            self._div()
+                stat_v.addWidget(row)
+
+        self.sections = {
+            "기본": self.info_frame,
+            "시즌": self.sec_season,
+            "신체": self.sec_body,
+            "스탯": self.sec_stat,
+        }
+
+        # 선택된 섹션들이 "누른 순서"대로 쌓이는 콘텐츠 영역
+        self.content_frame = QWidget()
+        self.content_lay   = QVBoxLayout(self.content_frame)
+        self.content_lay.setSpacing(4); self.content_lay.setContentsMargins(0,0,0,0)
+        self.lay.addWidget(self.content_frame)
+
+        self._order = list(self.DEFAULT_ORDER)   # 기본값: 전체 보기(기존 화면과 동일)
+        self._sync_tab_buttons()
+        self._rebuild_content()
 
     def _div(self):
+        self.lay.addWidget(self._mk_div())
+
+    def _mk_div(self):
         f = QFrame(); f.setObjectName("divider"); f.setFixedHeight(1)
-        self.lay.addWidget(f)
+        return f
+
+    # ── 탭 버튼 로직 ─────────────────────────────
+
+    def _on_click_all(self):
+        # [2026-08 수정, 신민용 요청: "전체를 한번 더 누르면 다 꺼진 걸로"]
+        # 이미 전체(4개 다) 선택된 상태에서 다시 누르면 토글로 전부 해제.
+        if set(self._order) == set(self.DEFAULT_ORDER):
+            self._order = []
+        else:
+            self._order = list(self.DEFAULT_ORDER)
+        self._sync_tab_buttons()
+        self._rebuild_content()
+
+    def _on_click_tab(self, key):
+        if key in self._order:
+            self._order.remove(key)
+        else:
+            self._order.append(key)   # 누른 순서대로 맨 뒤(= 맨 아래)에 추가
+        self._sync_tab_buttons()
+        self._rebuild_content()
+
+    def _sync_tab_buttons(self):
+        for k, b in self.tab_buttons.items():
+            b.blockSignals(True)
+            b.setChecked(k in self._order)
+            b.blockSignals(False)
+        self.btn_all.blockSignals(True)
+        self.btn_all.setChecked(set(self._order) == set(self.DEFAULT_ORDER))
+        self.btn_all.blockSignals(False)
+
+    def _rebuild_content(self):
+        """content_lay를 self._order 순서대로 다시 채운다.
+        섹션 위젯은 deleteLater가 아니라 setParent(None)으로만 떼어내
+        (재사용을 위해) 다음 rebuild에서 다시 붙일 수 있게 한다."""
+        while self.content_lay.count():
+            item = self.content_lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+        _first = True
+        for key in self._order:
+            sec = self.sections.get(key)
+            if sec is None:
+                continue
+            if not _first:
+                self.content_lay.addWidget(self._mk_div())
+            _first = False
+            self.content_lay.addWidget(sec)
 
     # ── 갱신 ─────────────────────────────────────
 
@@ -189,15 +364,31 @@ class PlayerPanel(QWidget):
             self.lbl_talent.setText(f"★ {_tname}")
             self.lbl_talent.setStyleSheet(f"background-color: {_tcolor};")
 
-        if p.get("injured"):
-            _idetail = p.get("injury_detail") or "부상"
-            self.lbl_state.setText(f"🩹 {_idetail}({p['injury_weeks']}일)")
-            self.lbl_state.setObjectName("injBadge"); self.lbl_state.show()
-        elif p.get("slump"):
+        # [2026-08 수정, 신민용 요청: "OVR 옆 빨간 부상 표시는 없애자,
+        # 어차피 신체 탭에 뜨니까"] 부상 상세는 이제 신체 탭 전용 — 여기
+        # 배지는 슬럼프 상태만 계속 담당한다.
+        if p.get("slump") and not p.get("injured"):
             self.lbl_state.setText("😰 슬럼프")
             self.lbl_state.setObjectName("slumpBadge"); self.lbl_state.show()
         else:
             self.lbl_state.hide()
+
+        # 신체 탭: 부상 부위 실루엣 강조 + 상세 텍스트
+        # [2026-08] injury_body_part는 이제 game_engine._apply_injury()가
+        # 실제로 저장하는 값(추측 아님) — 그대로 갖다 쓰면 된다.
+        if p.get("injured"):
+            _bdetail = p.get("injury_detail") or "부상"
+            _btier   = p.get("injury_type") or "경미"
+            _zone = p.get("injury_body_part") or "abdomen"
+            _zone_ko = zone_label_ko(_zone)
+            _bcolor = INJURY_TIER_COLOR.get(_btier, INJURY_TIER_COLOR["경미"])
+            self.body_silhouette.set_highlight(_zone, _bcolor)
+            self.lbl_body_detail.setText(
+                f"🩹 {_zone_ko}\n{_bdetail}\n{_btier} · 회복까지 {p.get('injury_weeks',0)}일"
+            )
+        else:
+            self.body_silhouette.set_highlight(None, None)
+            self.lbl_body_detail.setText("🩹 부상 없음")
 
         # 기본 정보 재구성
         _clear_layout(self.info_lay)
@@ -382,6 +573,14 @@ class PlayerPanel(QWidget):
                 mx  = p.get(f"{s}_max",80)
                 row.update(sn.get(s,s), cur, mx)
 
+        # [2026-08] 어려움 난이도에서는 스탯 바가 전부 숨겨지므로 "스탯" 탭
+        # 버튼 자체도 숨긴다. 이미 선택돼 있었다면 표시 목록에서도 뺀다.
+        self.tab_buttons["스탯"].setVisible(not _hard)
+        if _hard and "스탯" in self._order:
+            self._order.remove("스탯")
+            self._sync_tab_buttons()
+            self._rebuild_content()
+
 
 def _info_row(key, val):
     """이미지처럼 '라벨칸 + 값칸'을 테두리 박스로 감싼 한 행.
@@ -510,5 +709,107 @@ class StatBar(QWidget):
         if 0 < mx_x < w:
             p.setPen(QPen(QColor(200, 200, 200, 140), 1))
             p.drawLine(mx_x, 0, mx_x, h)
+
+        p.end()
+
+class BodySilhouette(QWidget):
+    """부상 부위를 강조해서 보여주는 신체 실루엣 위젯.
+
+    부상 시스템 설계 문서 10~13번 항목 컨셉대로, 해부학 도감이 아니라
+    "부상 위치만 알려주는 자연스러운 실루엣"으로 그린다. 별도 SVG 에셋
+    파일 없이 코드베이스의 StatBar와 동일하게 QPainter로 직접 그려서
+    파일 하나만 옮겨도 바로 동작하게 했다(추후 진짜 삽화로 바꾸고
+    싶으면 paintEvent만 QSvgRenderer로 교체하면 됨).
+
+    [2026-08 확장, 신민용 요청] 부상 데이터 풀이 145종(목/어깨/골반/
+    허리/손목/발 등)으로 늘어나면서 예전 구조(가슴/배/팔/다리만 존재)로는
+    표시가 안 되는 부위가 많아졌다 — 목·어깨를 별도 zone으로 새로 쪼개고,
+    허리(back)·골반(pelvis) zone을 추가했고, 다리 끝에 발(foot) zone도
+    새로 붙였다(발가락 부상은 요청대로 별도 zone 없이 발에 포함). 손가락/
+    손목도 마찬가지로 손(hand) zone 하나로 통합.
+    """
+    # 디자인 좌표계(위→아래 170×336) 기준 각 부위 사각형: (x, y, w, h, 모서리반지름)
+    # [2026-08 수정, 신민용 리포트: "우측 팔이 엉덩이랑 붙어있다"] 팔(손/팔뚝)과
+    # 다리(허벅지 이하) 열의 중심이 캔버스 중심(x=85)을 기준으로 좌우 정확히
+    # 대칭이 아니었다 — 특히 pelvis가 85가 아니라 88 중심으로 3만큼 밀려있고,
+    # 다리 전체(허벅지~발)가 좌측은 중심에서 11만큼, 우측은 19만큼 떨어져
+    # 있어(비대칭) 우측 팔뚝/손이 골반·허벅지와 실제로 겹쳤다. 모든 좌우 쌍을
+    # 캔버스 중심 기준 정확히 같은 거리로 재배치하고, 인접하지 않은 부위끼리
+    # 겹치는 곳이 없는지 좌표 검증까지 마쳤다(팔/다리/골반/어깨 전 쌍 대칭
+    # 확인 + 전체 zone 쌍 겹침 0건 확인).
+    ZONE_RECTS = {
+        "neck":        (78, 42, 14, 10, 3),
+        "l_shoulder":  (40, 52, 26, 23, 9),
+        "r_shoulder":  (104, 52, 26, 23, 9),
+        "chest":       (66, 52, 38, 38, 8),
+        "abdomen":     (68, 90, 34, 35, 8),
+        "back":        (68, 125, 34, 18, 6),
+        "pelvis":      (59, 143, 52, 24, 10),
+        "l_upper_arm": (36, 75, 22, 44, 10),
+        "l_elbow":     (37, 119, 20, 14, 6),
+        "l_forearm":   (38, 133, 18, 44, 8),
+        "l_hand":      (35, 177, 24, 24, 10),
+        "r_upper_arm": (112, 75, 22, 44, 10),
+        "r_elbow":     (113, 119, 20, 14, 6),
+        "r_forearm":   (114, 133, 18, 44, 8),
+        "r_hand":      (111, 177, 24, 24, 10),
+        "l_thigh": (61, 167, 22, 64, 10),
+        "r_thigh": (87, 167, 22, 64, 10),
+        "l_knee":  (63, 231, 18, 16, 6),
+        "r_knee":  (89, 231, 18, 16, 6),
+        "l_calf":  (62, 247, 20, 52, 8),
+        "r_calf":  (88, 247, 20, 52, 8),
+        "l_ankle": (64, 299, 16, 14, 5),
+        "r_ankle": (90, 299, 16, 14, 5),
+        "l_foot":  (61, 313, 22, 16, 6),
+        "r_foot":  (87, 313, 22, 16, 6),
+    }
+    HEAD_RECT = (68, 6, 34, 36)   # 원(머리) — x,y,w,h
+    DESIGN_W, DESIGN_H = 170, 336
+    DEFAULT_COLOR = QColor("#3a3a3a")
+
+    def __init__(self):
+        super().__init__()
+        self.setMinimumSize(95, 190)
+        self._zone = None
+        self._color = None
+
+    def set_highlight(self, zone: str | None, color):
+        """zone=None이면 부상 없음(전부 기본색). zone은 ZONE_RECTS 키거나 'head'."""
+        self._zone = zone
+        self._color = color
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        avail_w, avail_h = self.width(), self.height()
+        scale = max(0.01, min(avail_w / self.DESIGN_W, avail_h / self.DESIGN_H))
+        off_x = (avail_w - self.DESIGN_W * scale) / 2
+        off_y = (avail_h - self.DESIGN_H * scale) / 2
+        p.translate(off_x, off_y)
+        p.scale(scale, scale)
+        p.setPen(Qt.PenStyle.NoPen)
+
+        # 머리
+        hx, hy, hw, hh = self.HEAD_RECT
+        p.setBrush(QBrush(self._color if self._zone == "head" else self.DEFAULT_COLOR))
+        p.drawEllipse(hx, hy, hw, hh)
+
+        # 목 / 어깨 / 몸통 / 팔 / 다리
+        for zone, (x, y, w, h, r) in self.ZONE_RECTS.items():
+            p.setBrush(QBrush(self._color if zone == self._zone else self.DEFAULT_COLOR))
+            p.drawRoundedRect(x, y, w, h, r, r)
+
+        # 강조 부위 하이라이트 테두리 (한 번 더 눈에 띄게)
+        if self._zone:
+            p.setPen(QPen(QColor(255, 255, 255, 170), 2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            if self._zone == "head":
+                p.drawEllipse(hx, hy, hw, hh)
+            elif self._zone in self.ZONE_RECTS:
+                x, y, w, h, r = self.ZONE_RECTS[self._zone]
+                p.drawRoundedRect(x, y, w, h, r, r)
 
         p.end()

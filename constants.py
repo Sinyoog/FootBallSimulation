@@ -1,4 +1,5 @@
 # constants.py
+import random
 
 GAME_START_YEAR = 2000
 PLAYER_START_AGE = 16
@@ -950,6 +951,308 @@ INJURY_TIER_CHANCE = {
     "경미": 0.60, "중간": 0.28, "심각": 0.10, "매우 심각": 0.02,
 }
 
+# ════════════════════════════════════════════════════════════════
+# [2026-08 신설, 부상 시스템 확장 1차] 신민용 제공 부상 데이터 풀
+# (실제 스포츠의학 자료 기반 100여 개 항목)을 그대로 데이터화한다.
+#
+# 위 INJURY_TYPES/INJURY_DETAILS/INJURY_TIER_CHANCE(구버전)는 등급을 먼저
+# 뽑고 그 등급 안에서 구체 부상을 고르는 2단계 방식이었다 — 이제는 부상
+# 하나하나가 자기 발생가중치(weight)를 직접 들고 있어서 "회복기간이 긴
+# 부상일수록 덜 뽑히게" 훨씬 세밀하게 조절할 수 있다. 구버전 dict들은
+# 다른 곳에서 참조하는 코드가 없어 그대로 남겨두되(하위호환/비교용),
+# _apply_injury()는 이제 아래 INJURY_POOL만 사용한다.
+#
+# 필드:
+#   id           고유 식별자(영문, snake_case)
+#   body_part    신체 실루엣 zone 키(ui/player_panel.py의 BodySilhouette와 동일
+#                네이밍) — sided=True면 런타임에 'l_'/'r_' 접두사가 랜덤으로 붙는다.
+#   sided        좌/우 구분이 있는 부위인지(팔다리 등) — 없으면(머리/목/척추/
+#                골반/가슴 등 중앙 부위) 접두사 없이 그대로 사용.
+#   name         화면에 표시될 한글 부상명
+#   tier         경미/중간/심각/매우 심각 — 기존 등급 체계와 동일 문자열
+#                (happy_penalty 등 등급 기반 로직을 그대로 재사용하기 위함)
+#   recovery_days 실제 발생 시 회복기간(일)을 이 (최소,최대) 범위에서
+#                random.randint로 뽑는다. [2026-08] 신민용 자료의 '경기 복귀
+#                기준' 값을 그대로 사용(의학적 완치가 아니라 게임용 기준).
+#   pos_cat      포지션별 발생가중치 보정 카테고리(INJURY_POSITION_MULT 키).
+#                None이면 포지션 보정 없음(대부분의 부상은 포지션 편차가
+#                크지 않다는 게 신민용 방향 — 명시적으로 지정된 것만 보정).
+# ════════════════════════════════════════════════════════════════
+
+# 등급별 기본 발생가중치. 숫자가 클수록 잘 뽑힘 — 회복기간이 짧을수록
+# (=등급이 낮을수록) 압도적으로 자주 나오게 설계(신민용 확정치 그대로).
+INJURY_TIER_BASE_WEIGHT = {
+    "경미": 100, "중간": 45, "심각": 12, "매우 심각": 2,
+}
+
+# 같은 '매우 심각' 등급이어도 특별히 더 희귀해야 하는 항목(신민용 확정:
+# "180~365일짜리 부상은 처음부터 극희귀로 잡아두는 게 좋음") — 등급
+# 기본 가중치(2) 대신 이 값을 쓴다. 값은 예시로 준 "ACL 완전파열=1,
+# 아킬레스건 완전파열=0.5"를 기준점 삼아 비슷한 수준의 초중증 부상들에
+# 상대적으로 배분했다 — 1차 구현 단계 잠정치, 장기 시뮬레이션(100~200년)
+# 실측 후 위아래로 조정 예정(신민용 방향과 동일).
+INJURY_WEIGHT_OVERRIDE = {
+    "acl_complete":            1.0,
+    "achilles_complete":       0.5,
+    "femur_fracture":          0.3,
+    "pelvis_fracture":         0.5,
+    "cervical_fracture":       0.3,
+    "femoral_neck_fracture":   0.4,
+    "multi_ligament_injury":   0.4,
+    "patellar_tendon_rupture": 0.8,
+    "pcl_injury":              0.8,
+    "hip_labrum":              0.8,
+    "tibia_fibula_fracture":   0.6,
+    "hamstring_complete":      0.8,
+    "quad_complete_tear":      0.8,
+}
+
+# (id, body_part, sided, name, tier, (최소일,최대일), pos_cat)
+_INJURY_POOL_RAW = [
+    # ── 1. 머리/얼굴 (unsided) ──
+    ("head_contusion",        "head", False, "두부 타박상",       "경미", (2, 7),    "face"),
+    ("face_contusion",        "head", False, "안면 타박상",       "경미", (2, 7),    "face"),
+    ("nose_contusion",        "head", False, "코 타박상",         "경미", (2, 7),    "face"),
+    ("face_laceration",       "head", False, "안면 열상",         "경미", (3, 14),   "face"),
+    ("concussion",            "head", False, "뇌진탕",            "중간", (7, 21),   "face"),
+    ("concussion_severe",     "head", False, "심한 뇌진탕",       "심각", (21, 42),  "face"),
+    ("nasal_fracture",        "head", False, "코뼈 골절",         "중간", (14, 35),  "face"),
+    ("zygomatic_fracture",    "head", False, "광대뼈 골절",       "심각", (28, 56),  "face"),
+    ("orbital_fracture",      "head", False, "안와 골절",         "심각", (42, 84),  "face"),
+    ("mandible_fracture",     "head", False, "하악골 골절",       "심각", (42, 90),  "face"),
+
+    # ── 2. 목 (unsided) ──
+    ("neck_strain",           "neck", False, "목 근육 염좌",      "경미", (3, 14),   None),
+    ("neck_tension",          "neck", False, "목 근육 긴장",      "경미", (3, 14),   None),
+    ("cervical_contusion",    "neck", False, "경추 타박상",       "경미", (7, 21),   None),
+    ("cervical_sprain",       "neck", False, "경추 염좌",         "중간", (14, 42),  None),
+    ("cervical_disc",         "neck", False, "경추 디스크 손상",  "심각", (28, 90),  None),
+    ("cervical_fracture",     "neck", False, "경추 골절",         "매우 심각", (90, 180), None),
+
+    # ── 3. 어깨 (sided) ──
+    ("shoulder_contusion",     "shoulder", True, "어깨 타박상",         "경미", (3, 10),   "shoulder"),
+    ("shoulder_muscle_sprain", "shoulder", True, "어깨 근육 염좌",      "경미", (7, 21),   "shoulder"),
+    ("shoulder_joint_sprain",  "shoulder", True, "어깨 관절 염좌",      "중간", (7, 28),   "shoulder"),
+    ("shoulder_dislocation",   "shoulder", True, "어깨 탈구",           "심각", (28, 84),  "shoulder"),
+    ("shoulder_labrum",        "shoulder", True, "어깨 관절순 손상",    "매우 심각", (42, 120), "shoulder"),
+    ("rotator_cuff",           "shoulder", True, "회전근개 손상",       "심각", (21, 90),  "shoulder"),
+    ("clavicle_fracture",      "shoulder", True, "쇄골 골절",           "심각", (42, 90),  "shoulder"),
+
+    # ── 4. 팔/팔꿈치 (sided) ──
+    ("arm_contusion",       "upper_arm", True, "팔 타박상",       "경미", (2, 7),   None),
+    ("arm_muscle_sprain",   "upper_arm", True, "팔 근육 염좌",    "경미", (5, 21),  None),
+    ("elbow_contusion",     "elbow",     True, "팔꿈치 타박상",   "경미", (3, 10),  None),
+    ("elbow_sprain",        "elbow",     True, "팔꿈치 염좌",     "중간", (7, 28),  None),
+    ("elbow_dislocation",   "elbow",     True, "팔꿈치 탈구",     "심각", (28, 70), None),
+    ("humerus_fracture",    "upper_arm", True, "상완골 골절",     "매우 심각", (60, 120), None),
+    ("olecranon_fracture",  "elbow",     True, "주두 골절",       "매우 심각", (60, 120), None),
+
+    # ── 5. 손/손목 (sided, 손가락·손목은 hand zone으로 통합) ──
+    ("hand_contusion",              "hand",    True, "손 타박상",           "경미", (2, 7),   "wrist"),
+    ("finger_contusion",            "hand",    True, "손가락 타박상",       "경미", (2, 7),   "finger"),
+    ("finger_sprain",               "hand",    True, "손가락 염좌",         "경미", (3, 14),  "finger"),
+    ("finger_dislocation",          "hand",    True, "손가락 탈구",         "중간", (14, 42), "finger"),
+    ("wrist_sprain",                "hand",    True, "손목 염좌",           "중간", (7, 28),  "wrist"),
+    ("wrist_ligament",              "hand",    True, "손목 인대 손상",      "심각", (21, 70), "wrist"),
+    ("radius_forearm_fracture",     "forearm", True, "요골 골절",           "매우 심각", (45, 90), "wrist"),
+    ("ulna_forearm_fracture",       "forearm", True, "척골 골절",           "매우 심각", (45, 90), "wrist"),
+    ("wrist_distal_radius_fracture","hand",    True, "손목 골절",           "매우 심각", (42, 90), "wrist"),
+    ("metacarpal_fracture",         "hand",    True, "중수골 골절",         "심각", (28, 70), "wrist"),
+    ("phalanx_fracture",            "hand",    True, "손가락 골절",         "중간", (21, 56), "finger"),
+
+    # ── 6. 가슴/갈비뼈 (unsided) ──
+    ("chest_contusion",     "chest", False, "가슴 타박상",       "경미", (3, 10),  None),
+    ("rib_contusion",       "chest", False, "갈비뼈 타박상",     "경미", (7, 21),  None),
+    ("intercostal_muscle",  "chest", False, "늑간근 손상",       "중간", (14, 42), None),
+    ("thoracic_sprain",     "chest", False, "흉곽 염좌",         "중간", (7, 28),  None),
+    ("single_rib_fracture", "chest", False, "단일 갈비뼈 골절",  "중간", (21, 42), None),
+    ("multi_rib_fracture",  "chest", False, "다발성 갈비뼈 골절", "심각", (42, 84), None),
+
+    # ── 7. 허리/척추 (unsided, 발생 확률 낮게 — 가중치로 처리) ──
+    ("low_back_strain",        "back", False, "허리 근육 긴장",     "경미", (3, 14),  None),
+    ("lumbar_sprain",          "back", False, "요추 염좌",          "중간", (7, 28),  None),
+    ("low_back_muscle_injury", "back", False, "허리 근육 손상",     "중간", (14, 42), None),
+    ("spinal_contusion",       "back", False, "척추 타박상",        "중간", (14, 42), None),
+    ("lumbar_disc",            "back", False, "요추 디스크 손상",   "매우 심각", (28, 90), None),
+
+    # ── 8. 골반/엉덩이 (unsided) ──
+    ("pelvis_contusion",     "pelvis", False, "골반 타박상",         "경미", (3, 10),   None),
+    ("glute_contusion",      "pelvis", False, "둔근 타박상",         "경미", (3, 10),   None),
+    ("glute_strain",         "pelvis", False, "둔근 근육 긴장",      "경미", (7, 21),   None),
+    ("glute_tear",           "pelvis", False, "둔근 근육 파열",      "심각", (21, 56),  None),
+    ("hip_sprain",           "pelvis", False, "고관절 염좌",         "중간", (14, 42),  None),
+    ("hip_impingement",      "pelvis", False, "고관절 충돌 증후군",  "중간", (14, 60),  None),
+    ("hip_labrum",           "pelvis", False, "고관절 관절순 손상",  "매우 심각", (42, 120), None),
+    ("pelvis_fracture",      "pelvis", False, "골반 골절",           "매우 심각", (90, 180), None),
+    ("femoral_neck_fracture","pelvis", False, "대퇴골 경부 골절",    "매우 심각", (120, 240), None),
+
+    # ── 9. 사타구니/내전근 (thigh zone, sided) ──
+    ("groin_pain",             "thigh", True, "사타구니 통증",       "경미", (3, 14),  "groin"),
+    ("adductor_sprain",        "thigh", True, "내전근 염좌",         "경미", (7, 21),  "groin"),
+    ("adductor_muscle_injury", "thigh", True, "내전근 근육 손상",    "중간", (14, 42), "groin"),
+    ("adductor_partial_tear",  "thigh", True, "내전근 부분 파열",    "심각", (21, 56), "groin"),
+    ("adductor_complete_tear", "thigh", True, "내전근 완전 파열",    "매우 심각", (42, 90), "groin"),
+    ("sports_hernia",          "thigh", True, "스포츠 탈장",         "심각", (28, 84), "groin"),
+
+    # ── 10. 허벅지 - 햄스트링 (sided) ──
+    ("hamstring_tension",  "thigh", True, "햄스트링 근육 긴장",     "경미", (5, 14),   "hamstring"),
+    ("hamstring_minor",    "thigh", True, "햄스트링 경미한 손상",   "경미", (7, 21),   "hamstring"),
+    ("hamstring_partial",  "thigh", True, "햄스트링 부분 파열",     "중간", (21, 42),  "hamstring"),
+    ("hamstring_moderate", "thigh", True, "햄스트링 중등도 파열",   "심각", (28, 56),  "hamstring"),
+    ("hamstring_severe",   "thigh", True, "햄스트링 중증 파열",     "매우 심각", (42, 90),  "hamstring"),
+    ("hamstring_complete", "thigh", True, "햄스트링 완전 파열",     "매우 심각", (90, 180), "hamstring"),
+
+    # ── 11. 허벅지 - 대퇴사두근 (sided) ──
+    ("quad_contusion",     "thigh", True, "대퇴사두근 타박상",     "경미", (3, 14),   None),
+    ("quad_tension",       "thigh", True, "대퇴사두근 근육 긴장",  "경미", (5, 14),   None),
+    ("quad_injury",        "thigh", True, "대퇴사두근 손상",       "중간", (7, 28),   None),
+    ("quad_partial_tear",  "thigh", True, "대퇴사두근 부분 파열",  "심각", (21, 56),  None),
+    ("quad_severe_tear",   "thigh", True, "대퇴사두근 중증 파열",  "매우 심각", (42, 90),  None),
+    ("quad_complete_tear", "thigh", True, "대퇴사두근 완전 파열",  "매우 심각", (90, 180), None),
+
+    # ── 12. 허벅지 - 기타 (sided) ──
+    ("thigh_contusion",             "thigh", True, "대퇴근 타박상",        "경미", (3, 14),  None),
+    ("rectus_femoris_injury",       "thigh", True, "대퇴직근 손상",        "중간", (7, 42),  None),
+    ("tensor_fasciae_latae_injury", "thigh", True, "대퇴근막장근 손상",    "경미", (7, 28),  None),
+    ("thigh_cramp",                 "thigh", True, "허벅지 근육 경련",     "경미", (1, 3),   None),
+    ("femur_fracture",              "thigh", True, "대퇴골 골절",          "매우 심각", (180, 365), None),
+
+    # ── 13. 무릎 - 인대 (sided) ──
+    ("knee_sprain",             "knee", True, "무릎 염좌",                    "경미", (7, 21),   "knee_ligament"),
+    ("mcl_minor",                "knee", True, "내측측부인대(MCL) 경미 손상", "중간", (14, 28),  "knee_ligament"),
+    ("mcl_partial",              "knee", True, "MCL 부분 파열",               "중간", (28, 56),  "knee_ligament"),
+    ("mcl_complete",             "knee", True, "MCL 완전 파열",               "심각", (56, 90),  "knee_ligament"),
+    ("lcl_injury",               "knee", True, "외측측부인대(LCL) 손상",      "심각", (21, 60),  "knee_ligament"),
+    ("acl_partial",              "knee", True, "전방십자인대(ACL) 부분 손상", "매우 심각", (60, 150), "knee_ligament"),
+    ("acl_complete",             "knee", True, "전방십자인대(ACL) 완전 파열", "매우 심각", (180, 300), "knee_ligament"),
+    ("pcl_injury",               "knee", True, "후방십자인대(PCL) 손상",      "매우 심각", (60, 180), "knee_ligament"),
+    ("multi_ligament_injury",    "knee", True, "다중 인대 손상",              "매우 심각", (180, 365), "knee_ligament"),
+
+    # ── 14. 무릎 - 반월상연골 (sided) ──
+    ("meniscus_minor",     "knee", True, "반월상연골 타박/경미 손상", "중간", (7, 21),   "knee_ligament"),
+    ("meniscus_tear",      "knee", True, "반월상연골 파열",           "심각", (28, 70),  "knee_ligament"),
+    ("meniscus_repair",    "knee", True, "반월상연골 봉합술",         "매우 심각", (60, 120), "knee_ligament"),
+    ("meniscus_resection", "knee", True, "반월상연골 절제술",         "심각", (30, 60),  "knee_ligament"),
+
+    # ── 15. 무릎 - 힘줄/관절 (sided) ──
+    ("patellar_tendinitis",     "knee", True, "슬개건염",              "중간", (14, 60),  None),
+    ("patellar_tendon_partial", "knee", True, "슬개건 부분 손상",      "심각", (28, 90),  None),
+    ("patellar_tendon_rupture", "knee", True, "슬개건 파열",           "매우 심각", (120, 240), None),
+    ("patella_contusion",       "knee", True, "슬개골 타박상",         "경미", (7, 21),   None),
+    ("patellofemoral_pain",     "knee", True, "슬개대퇴 통증 증후군",  "중간", (14, 60),  None),
+    ("knee_synovitis",          "knee", True, "무릎 관절염/활액막염",  "경미", (7, 42),   None),
+    ("patella_fracture",        "knee", True, "슬개골 골절",           "매우 심각", (60, 120), None),
+
+    # ── 16. 종아리 (sided) ──
+    ("calf_contusion",       "calf", True, "종아리 타박상",     "경미", (3, 10),   None),
+    ("calf_tension",         "calf", True, "종아리 근육 긴장",  "경미", (5, 14),   None),
+    ("calf_injury",          "calf", True, "종아리 근육 손상",  "중간", (7, 28),   None),
+    ("gastrocnemius_partial","calf", True, "비복근 부분 파열",  "심각", (21, 56),  None),
+    ("soleus_injury",        "calf", True, "가자미근 손상",     "중간", (14, 42),  None),
+    ("calf_severe_tear",     "calf", True, "종아리 중증 파열",  "매우 심각", (42, 90),  None),
+    ("tibia_fracture",       "calf", True, "경골 골절",         "매우 심각", (90, 180), None),
+    ("fibula_fracture",      "calf", True, "비골 골절",         "심각", (45, 90),  None),
+    ("tibia_fibula_fracture","calf", True, "경골+비골 골절",    "매우 심각", (120, 240), None),
+
+    # ── 17. 아킬레스건 (ankle zone, sided) ──
+    ("achilles_pain",        "ankle", True, "아킬레스건 통증",      "중간", (7, 42),   None),
+    ("achilles_tendinitis",  "ankle", True, "아킬레스건염",         "심각", (21, 90),  None),
+    ("achilles_partial",     "ankle", True, "아킬레스건 부분 손상", "매우 심각", (60, 150), None),
+    ("achilles_complete",    "ankle", True, "아킬레스건 완전 파열", "매우 심각", (180, 365), None),
+
+    # ── 18. 발목 (sided) ──
+    ("ankle_contusion",           "ankle", True, "발목 타박상",              "경미", (2, 7),    "ankle_sprain"),
+    ("ankle_sprain_minor",        "ankle", True, "발목 염좌 경미",           "경미", (3, 10),   "ankle_sprain"),
+    ("ankle_sprain_moderate",     "ankle", True, "발목 염좌 중등도",         "중간", (14, 28),  "ankle_sprain"),
+    ("ankle_sprain_severe",       "ankle", True, "발목 염좌 중증",           "심각", (28, 60),  "ankle_sprain"),
+    ("lateral_ligament_injury",   "ankle", True, "외측 인대 손상",           "중간", (14, 42),  "ankle_sprain"),
+    ("lateral_ligament_partial",  "ankle", True, "외측 인대 부분 파열",      "심각", (21, 56),  "ankle_sprain"),
+    ("lateral_ligament_complete", "ankle", True, "외측 인대 완전 파열",      "매우 심각", (42, 90),  "ankle_sprain"),
+    ("deltoid_ligament_injury",   "ankle", True, "내측 삼각인대 손상",       "매우 심각", (28, 90),  "ankle_sprain"),
+    ("high_ankle_sprain",         "ankle", True, "발목 경비인대 손상(High ankle sprain)", "매우 심각", (30, 90), "ankle_sprain"),
+    ("ankle_fracture",            "ankle", True, "발목 골절",                "매우 심각", (60, 150), "ankle_sprain"),
+
+    # ── 19. 발/발가락 (foot zone, sided — 발가락은 발에 통합) ──
+    ("foot_contusion",         "foot", True, "발 타박상",           "경미", (2, 7),    None),
+    ("plantar_fasciitis",      "foot", True, "발바닥 근막염",       "중간", (14, 60),  None),
+    ("foot_dorsum_contusion",  "foot", True, "발등 타박상",         "경미", (3, 10),   None),
+    ("metatarsal_contusion",   "foot", True, "중족골 타박상",       "경미", (7, 21),   None),
+    ("toe_sprain",             "foot", True, "발가락 염좌",         "경미", (3, 14),   None),
+    ("metatarsal_fracture",    "foot", True, "중족골 골절",         "심각", (42, 90),  None),
+    ("foot_bone_fracture",     "foot", True, "발뼈 골절",           "매우 심각", (42, 120), None),
+    ("toe_fracture",           "foot", True, "발가락 골절",         "중간", (21, 56),  None),
+    ("big_toe_joint_injury",   "foot", True, "엄지발가락 관절 손상","중간", (14, 42),  None),
+    ("talus_fracture",         "foot", True, "거골 골절",           "매우 심각", (90, 180), None),
+    ("calcaneus_fracture",     "foot", True, "종골 골절",           "매우 심각", (90, 180), None),
+
+    # ── 21. 피부/기타 (부위는 흔한 발생 위치로 배치, sided) ──
+    ("skin_abrasion",             "calf", True,  "피부 찰과상",         "경미", (1, 3),  None),
+    ("skin_laceration",           "calf", True,  "피부 열상",           "경미", (2, 10), None),
+    ("skin_laceration_stitches",  "calf", True,  "봉합이 필요한 열상",  "경미", (5, 21), None),
+    ("toenail_injury",            "foot", True,  "발톱 손상",           "경미", (3, 21), None),
+    ("hematoma",                  "thigh",True,  "혈종",                "경미", (3, 21), None),
+    ("muscle_cramp",              "calf", True,  "근육 경련",           "경미", (1, 3),  None),
+    ("heat_exhaustion",           "abdomen", False, "탈수/열탈진",       "경미", (1, 3),  None),
+]
+
+INJURY_POOL = [
+    {
+        "id": _id, "body_part": _bp, "sided": _sd, "name": _nm, "tier": _tr,
+        "recovery_days": _rd, "pos_cat": _pc,
+        "weight": INJURY_WEIGHT_OVERRIDE.get(_id, INJURY_TIER_BASE_WEIGHT.get(_tr, 10)),
+    }
+    for (_id, _bp, _sd, _nm, _tr, _rd, _pc) in _INJURY_POOL_RAW
+]
+
+# 포지션 그룹 — 기존 position_group()(GK/DEF/ATK 3그룹, CDM을 DEF로 취급)과는
+# 목적이 달라 별도로 둔다. 부상 위치 보정은 실제 스포츠의학 관점(GK=손/손목/
+# 어깨 특화, MF=활동량 기반 햄스트링/발목 등)이 기준이라 CDM은 MF로 분류.
+INJURY_POS_GROUP = {
+    "GK": "GK",
+    "CB": "DF", "LB": "DF", "RB": "DF",
+    "CDM": "MF", "CM": "MF", "CAM": "MF",
+    "LW": "FW", "RW": "FW", "CF": "FW", "ST": "FW",
+}
+
+
+def get_injury_pos_group(position: str) -> str:
+    """포지션 문자열 → 'GK'/'DF'/'MF'/'FW'. 못 찾으면 'MF'(가장 무난한 기본값)."""
+    return INJURY_POS_GROUP.get(position, "MF")
+
+
+# [2026-08 신설, 신민용 확정 — 1차 구현은 명시적으로 지정된 카테고리만
+# 보정] "포지션마다 부상 확률 전체를 다르게"가 아니라 "부상 종류별
+# 발생가중치를 포지션에 따라 보정"하는 구조. pos_cat이 None인 부상(대다수)은
+# 포지션 무관 동일 가중치 — 실제 축구도 특정 포지션이 특정 부상만 걸리는
+# 게 아니므로, 명시적 근거가 있는 카테고리에만 약하게(0.7~2.0배) 적용한다.
+INJURY_POSITION_MULT = {
+    "hamstring":     {"GK": 0.7, "DF": 1.0, "MF": 1.2, "FW": 1.2},
+    "ankle_sprain":  {"GK": 0.9, "DF": 1.1, "MF": 1.2, "FW": 1.2},
+    "knee_ligament": {"GK": 0.8, "DF": 1.1, "MF": 1.1, "FW": 1.2},
+    "groin":         {"GK": 0.7, "DF": 0.9, "MF": 1.2, "FW": 1.2},
+    "shoulder":      {"GK": 1.8, "DF": 1.0, "MF": 0.7, "FW": 0.6},
+    "finger":        {"GK": 2.0, "DF": 0.5, "MF": 0.3, "FW": 0.3},
+    "wrist":         {"GK": 1.8, "DF": 0.7, "MF": 0.4, "FW": 0.3},
+    "face":          {"GK": 1.4, "DF": 1.1, "MF": 1.0, "FW": 1.0},
+}
+
+
+def pick_injury(position: str = None):
+    """INJURY_POOL에서 가중치 기반으로 부상 하나를 뽑는다.
+    position이 주어지면 pos_cat이 있는 항목에 한해 INJURY_POSITION_MULT로
+    가중치를 보정(전체 발생확률이 아니라 '어떤 부상이 나올지'만 보정 —
+    신민용 확정 원칙: "부상 발생 → 부상 종류 결정 → 포지션 보정" 순서).
+    반환: INJURY_POOL의 항목 dict 하나(그대로 복사하지 않고 참조 반환하므로
+    호출부에서 내용을 변경하지 말 것)."""
+    grp = get_injury_pos_group(position) if position else None
+    weights = []
+    for entry in INJURY_POOL:
+        w = entry["weight"]
+        if grp and entry["pos_cat"]:
+            w = w * INJURY_POSITION_MULT.get(entry["pos_cat"], {}).get(grp, 1.0)
+        weights.append(w)
+    return random.choices(INJURY_POOL, weights=weights, k=1)[0]
+
 # 성격
 PERSONALITY_EFFECTS = {
     "성실함":   {"train_eff": 1.20},
@@ -959,13 +1262,18 @@ PERSONALITY_EFFECTS = {
     "소심함":   {"big_match_rating": -0.3},
     "승부욕":   {"losing_rating": +0.3},
     "리더십":   {"team_win_bonus": 0.03},
-    # [2026-08 재설계, 신민용+GPT 협의: "폭력적 성향이 레드카드를 직접
-    # 올리는 게 아니라 옐로카드를 통해 드러나야 한다"] 예전엔 스트레이트
-    # 레드 확률(1.2%)에 +5%p를 얹어 폭력적 = 레드카드 단골이 됐는데, 이제
-    # 스트레이트 레드는 전 선수 공통(성격 무관)이고 폭력적 성격은 대신
-    # 옐로카드 확률(9%→12%)을 올린다 — 카드를 자주 받고, 가끔 그게
-    # 경고누적정지나 2차 옐로 퇴장으로 이어지는 방식으로 성향이 드러난다.
-    "폭력적":   {"yellow_card_chance": 0.03},
+    # [2026-08 옐로카드 시스템 도입 시, 신민용+GPT 협의] 원래 폭력적
+    # 성격은 스트레이트 레드 확률(1.2%)에만 +5%p를 얹었는데, 옐로카드를
+    # 도입하며 "폭력적 성향이 옐로카드를 통해서도 드러나야 한다"는 방향
+    # 으로 yellow_card_chance(+3%p)를 추가했다.
+    # [2026-08 재조정, 신민용 밸런스 요청: "폭력적인 경우엔 레드를 2~3장
+    # 받을 정도로 눈에 띄어야 한다"] yellow_card_chance만으로는 시즌
+    # 기대 레드카드가 0.6~0.7장까지 떨어져 성격 효과가 잘 안 느껴졌다 —
+    # 스트레이트 레드에도 다시 보정을 얹는다(예전 +5%p보다 낮은 +4%p로
+    # 완화). 시즌 44경기 기준 기대치: 스트레이트 레드(1.2%+4%=5.2%/경기)
+    # 약 2.3장 + 2차옐로 경유 약 0.16장 ≈ 시즌 합계 2.5장 근처(TUNE LATER,
+    # 실제 리그별 경기 수 14~58경기 편차가 있어 몬테카를로 재검증 필요).
+    "폭력적":   {"yellow_card_chance": 0.03, "red_card_chance": 0.04},
     "완벽주의": {"high_train_bonus": 1.10, "low_train_penalty": 0.90},
     "멘탈갑":   {"slump_chance_mult": 0.70},
     "겁쟁이":   {"cup_rating": -0.5},
@@ -3124,14 +3432,42 @@ COUNTRY_LEAGUE_OVR_OVERRIDE = {
 
 def get_ovr_range(grade: str, tier: int, country: str = None):
     """등급+tier(+국가) -> (하한, 상한) OVR 범위. country가
-    COUNTRY_LEAGUE_OVR_OVERRIDE에 있고 tier==1이면 그 오버라이드를 최우선
-    사용한다(등급 문자는 연봉 등에 계속 쓰이지만, 실제 스쿼드 OVR 범위는
-    이 함수를 거치는 모든 호출부 — 초기 시딩, 성장, 은퇴자 교체 — 에서
-    항상 동일하게 오버라이드된 값을 본다). tier2 이하나 오버라이드 없는
-    국가는 원래 grade별 OVR_RANGES를 그대로 반환한다."""
-    if country and tier == 1 and country in COUNTRY_LEAGUE_OVR_OVERRIDE:
-        return COUNTRY_LEAGUE_OVR_OVERRIDE[country]
-    return OVR_RANGES.get(grade, {}).get(tier)
+    COUNTRY_LEAGUE_OVR_OVERRIDE에 있으면:
+      - tier==1: 오버라이드 값을 그대로 사용.
+      - tier>=2: [2026-08 버그수정, 신민용 리포트: "K1 OVR을 내렸더니 K2랑
+        겹친다(일본도 동일)"] 예전엔 오버라이드가 tier1에만 적용되고
+        tier2 이하는 grade 기본표(OVR_RANGES)를 그대로 썼다 — 그래서 tier1을
+        내려도 tier2는 안 따라 내려가 두 리그가 겹치거나(심하면 역전)
+        되는 문제가 있었다. 이제는 "오버라이드가 grade 기본 tier1 대비
+        얼마나 이동했는지(delta)"를 그대로 tier2 이하에도 적용한다 — 1부를
+        내리면 하위 리그도 같은 폭만큼 같이 내려가는 자연스러운 피라미드
+        구조가 자동으로 유지된다. grade 표에 그 tier가 아예 없으면(예:
+        B등급엔 5부가 없음) _tier_top_ovr()과 동일한 STEP 감쇠로 추정한
+        기본값에 delta를 적용한다.
+    오버라이드가 없는 국가/tier는 원래 grade별 OVR_RANGES를 그대로 반환한다."""
+    grade_ranges = OVR_RANGES.get(grade, {})
+    if country and country in COUNTRY_LEAGUE_OVR_OVERRIDE:
+        o_lo, o_hi = COUNTRY_LEAGUE_OVR_OVERRIDE[country]
+        if tier == 1:
+            return (o_lo, o_hi)
+        base_t1 = grade_ranges.get(1)
+        if base_t1:
+            base_tn = grade_ranges.get(tier)
+            if base_tn is None and grade_ranges:
+                deepest_tier = max(grade_ranges)
+                deepest_lo, deepest_hi = grade_ranges[deepest_tier]
+                STEP = 8
+                extra = tier - deepest_tier
+                base_tn = (max(15, deepest_lo - extra * STEP),
+                           max(15, deepest_hi - extra * STEP))
+            if base_tn:
+                delta_lo = o_lo - base_t1[0]
+                delta_hi = o_hi - base_t1[1]
+                new_lo = max(10, base_tn[0] + delta_lo)
+                new_hi = max(new_lo + 4, base_tn[1] + delta_hi)  # 최소 폭 보장(역전 방지)
+                return (new_lo, min(100, new_hi))
+    return grade_ranges.get(tier)
+
 
 
 def get_league_grade(country_name: str, fallback_grade: str = "F") -> str:

@@ -3230,12 +3230,17 @@ class CenterPanel(QWidget):
 
     def _on_join_done(self, dlg):
         if dlg.chosen:
-            # [2026-08 수정, 신민용 확정] offer=dlg.chosen을 넘겨야
-            # join_team이 기간 협상 결과(contract_years)를 실제 계약에
-            # 반영한다 — transfer_type="입단"이라 이적료 승인 게이트
-            # (transfer_type=="오퍼" 전용)는 여전히 안 걸린다.
-            join_team(dlg.chosen["team_id"], dlg.chosen["salary"],
-                      transfer_type="입단", offer=dlg.chosen)
+            # [2026-08 수정, 신민용 요청: "클럽월드컵 도중 소속이 바뀌면
+            # 오류날 수 있다 — 입단도 시즌 시작 순간에 반영되게"] 예전엔
+            # join_team()을 여기서 바로 불렀는데, 이제 reserve_join_transfer로
+            # 예약만 해두고 실제 이적은 다음 상/하반기 시작 주차
+            # (game_engine._advance_week)에서 실행한다. offer=dlg.chosen을
+            # 그대로 넘겨야 join_team이 기간 협상 결과(contract_years)를
+            # 실제 계약에 반영한다.
+            from game_engine import reserve_join_transfer
+            reserve_join_transfer(dlg.chosen["team_id"], dlg.chosen["salary"],
+                                  dlg.chosen.get("team_name", ""),
+                                  transfer_type="입단", offer=dlg.chosen)
             if self.main_win: self.main_win.refresh_all()
 
     def _show_auto_offer(self, week: int):
@@ -3286,7 +3291,15 @@ class CenterPanel(QWidget):
 
     def _on_auto_offer_done(self, dlg):
         if dlg.chosen:
-            join_team(dlg.chosen["team_id"], dlg.chosen["salary"], transfer_type="오퍼", offer=dlg.chosen)
+            # [2026-08 수정, 신민용 요청: "클럽월드컵 도중 소속이 바뀌면
+            # 오류날 수 있다"] join_team() 즉시 실행 대신 예약만 해두고,
+            # 실제 이적은 다음 상/하반기 시작 주차에 실행된다. 이 구간
+            # 안에서 더 좋은 오퍟를 다시 수락하면 자동으로 마지막 선택으로
+            # 교체된다(reserve_join_transfer가 같은 필드를 덮어씀).
+            from game_engine import reserve_join_transfer
+            reserve_join_transfer(dlg.chosen["team_id"], dlg.chosen["salary"],
+                                  dlg.chosen.get("team_name", ""),
+                                  transfer_type="오퍼", offer=dlg.chosen)
             if self.main_win: self.main_win.refresh_all()
 
     def _restore_pending_offer_window(self):

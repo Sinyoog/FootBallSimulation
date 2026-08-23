@@ -1081,7 +1081,8 @@ def start_qualifying_if_needed(year):
         # 이어지는 걸 막는다(월드컵 본선/기타 국제대회 그룹인 intl_suspension/
         # season_yellow_intl은 여기서 건드리지 않음 — 별도 그룹이라 그대로 유지).
         from game_engine import update_player as _reset_wcq
-        _reset_wcq(wc_qual_suspension=0, season_yellow_wc_qual=0)
+        _reset_wcq(wc_qual_suspension=0, season_yellow_wc_qual=0,
+                   yellow_susp_progress_wc_qual=0)
 
         _clear_entry_cache()
         my_nats, nat_info, committed = _gather_nat_context(p)

@@ -1540,6 +1540,15 @@ def init_db():
         # 수락 시 즉시 이적하지 않고 "예약" 상태로 저장 — 다음 비시즌
         # 전환 시점(_end_of_season)에 실제 이적을 실행한다.
         "ALTER TABLE my_player ADD COLUMN pending_sale_transfer_json TEXT DEFAULT ''",
+        # [2026-08 신설, 신민용 요청: "클럽월드컵 도중 소속이 바뀌면 오류날
+        # 수 있다 — 입단/오퍟 수락도 시즌 시작 순간(상반기 4주차/하반기
+        # 시작 주차)에 실제로 반영되게 하자"] pending_sale_transfer_json과
+        # 완전히 동일한 "예약 이적" 패턴 — 오퍟/입단을 수락해도 join_team()을
+        # 즉시 부르지 않고 여기에 저장해뒀다가, _advance_week가 다음
+        # 시즌구간 시작 주차에 진입하는 순간 실행한다. 같은 필드를 덮어쓰는
+        # 구조라 그 사이 더 좋은 오퍟를 새로 수락하면 자연히 "가장 마지막
+        # 선택"으로 교체된다.
+        "ALTER TABLE my_player ADD COLUMN pending_join_transfer_json TEXT DEFAULT ''",
         # [2026-08 신설, 옐로카드 시스템] 레드카드와 동일한 "대회별 결장
         # 카운터" 패턴을 슈퍼컵/월드컵예선에도 추가 — 지금까지 슈퍼컵은
         # cl_suspension을 챔스/유로파/컨퍼런스와 그대로 같이 썼고(참가팀이
@@ -1561,11 +1570,33 @@ def init_db():
         "ALTER TABLE my_player ADD COLUMN season_yellow_wc_qual INTEGER DEFAULT 0",
         "ALTER TABLE my_player ADD COLUMN season_yellow_intl INTEGER DEFAULT 0",
         "ALTER TABLE my_player ADD COLUMN season_yellow_po INTEGER DEFAULT 0",
+        # [2026-08 버그수정, 신민용 리포트: "팀 이력에 옐로카드가 갑자기
+        # 0이 됐다(8월인데 시즌 리셋도 아닌데)"] 원인: season_yellow_*를
+        # "이번 시즌 총 받은 옐로 수"(표시용)와 "5장 채우면 다음경기
+        # 결장+0리셋"(징계 판정용 진행 카운터) 두 용도로 같이 썼다 —
+        # 5장 채워서 정지가 걸리는 순간 표시값까지 같이 0으로 날아갔다.
+        # season_yellow_*는 이제 "표시 전용"(카드 받을 때마다 계속
+        # 누적, 시즌 끝날 때만 리셋)으로 남기고, 5장 문턱 판정은 아래
+        # 별도 진행 카운터(yellow_susp_progress_*)로 분리한다 — 이
+        # 필드만 5장 도달 시 0으로 리셋된다.
+        "ALTER TABLE my_player ADD COLUMN yellow_susp_progress_league INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN yellow_susp_progress_cup INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN yellow_susp_progress_europe INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN yellow_susp_progress_super_cup INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN yellow_susp_progress_cwc INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN yellow_susp_progress_wc_qual INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN yellow_susp_progress_intl INTEGER DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN yellow_susp_progress_po INTEGER DEFAULT 0",
         # 통산(커리어) 누적 — total_red_cards_all/total_red_cards_league와
         # 동일 패턴. 2차 옐로(경고누적 퇴장)도 여기엔 정상적으로 +1씩
         # 반영된다(시즌 누적 징계 카운터에만 안 얹을 뿐).
         "ALTER TABLE my_player ADD COLUMN total_yellow_all INTEGER DEFAULT 0",
         "ALTER TABLE my_player ADD COLUMN total_yellow_league INTEGER DEFAULT 0",
+        # [2026-08 신설, 부상 시스템 확장] 부상 부위를 이름 문자열에서 추측하지
+        # 않고 실제로 저장한다 — injury_detail(부상명)/injury_type(등급)과
+        # 별개 축. 값은 신체 실루엣 zone 키(예: 'l_knee', 'neck', 'r_hand')
+        # 그대로 저장해 ui/player_panel.py가 그대로 갖다 쓸 수 있게 한다.
+        "ALTER TABLE my_player ADD COLUMN injury_body_part TEXT DEFAULT ''",
     ]:
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,
@@ -3693,10 +3724,17 @@ def _tier_top_ovr(grade, tier, continent_bonus=0, country=None):
     """그 등급·tier 리그에서 도달 가능한 최고 OVR.
     continent_bonus: 대륙별 OVR 보정치 (유럽+1, 아시아-3 등)
     country: [2026-08 신설] COUNTRY_LEAGUE_OVR_OVERRIDE에 등록된 나라면
-        tier1 상한을 그 오버라이드 값으로 대체한다(등급 문자는 그대로 두고
+        상한을 그 오버라이드 기반 값으로 대체한다(등급 문자는 그대로 두고
         실제 스쿼드 OVR 범위만 별도 조정하는 용도). 오버라이드가 적용되면
         continent_bonus는 더하지 않는다 — 오버라이드 값 자체가 이미 그
         나라에 특화된 값이라, 대륙 단위 보정을 얹으면 이중 보정이 된다.
+        [2026-08 버그수정, 신민용 리포트: "K1 OVR을 내렸더니 K2랑 겹친다"]
+        예전엔 이 대체가 tier==1일 때만 일어나고 tier2 이하는 대륙보정만
+        더한 grade 기본표를 그대로 썼다 — get_ovr_range()가 이미
+        "오버라이드가 tier1 기본값 대비 이동한 만큼(delta)을 tier2 이하에도
+        동일 적용"하도록 고쳐졌으니, 여기서도 tier에 상관없이
+        get_ovr_range()를 거쳐 그 값을 그대로 쓴다(로직 이원화 방지 —
+        이번 버그 자체가 이 함수와 get_ovr_range가 따로 놀아서 생겼었다).
 
     [버그수정 2026-07] 예전엔 OVR_RANGES에 그 등급의 tier가 정의 안 돼
     있으면(예: SS 5부, S 6부처럼 나중에 부수가 늘었는데 표를 못 채운 경우)
@@ -3707,8 +3745,10 @@ def _tier_top_ovr(grade, tier, continent_bonus=0, country=None):
     한 부수당 일정폭(STEP)씩 자연스럽게 더 깎아 내려가도록 한다 — 등급표에
     없는 부수가 나와도(향후 부수를 더 늘려도) 항상 "한 단계 위보다는 낮고,
     급격한 단절은 없는" 값이 나온다."""
-    if country and tier == 1 and country in COUNTRY_LEAGUE_OVR_OVERRIDE:
-        return COUNTRY_LEAGUE_OVR_OVERRIDE[country][1]
+    if country and country in COUNTRY_LEAGUE_OVR_OVERRIDE:
+        _rng = get_ovr_range(grade, tier, country)
+        if _rng:
+            return min(100, _rng[1])
     grade_ranges = OVR_RANGES.get(grade, {})
     rng = grade_ranges.get(tier)
     if rng:

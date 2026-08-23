@@ -2771,34 +2771,38 @@ def _process_training(p, week, ttype, focus_stat=None, day=None):
 
 
 def _apply_injury(p, week, day=None):
-    # [2026-07 확장] 등급(경미/중간/심각/매우 심각)을 먼저 확률로 고르고,
-    # 그 등급 안의 구체 부상(INJURY_DETAILS)을 하나 더 골라서 그 부상
-    # 고유의 좁은 회복 범위로 주수를 정한다 — "부상!"으로 뭉뚱그리지 않고
-    # "왼쪽 발목 인대 파열" 식으로 실제로 뭐가 다쳤는지 로그/화면에 남는다.
+    # [2026-08 재작성, 부상 시스템 확장 1차] 등급을 먼저 확률로 고르고 그
+    # 등급 안에서 구체 부상을 고르던 기존 2단계 방식(INJURY_TIER_CHANCE→
+    # INJURY_DETAILS) 대신, constants.INJURY_POOL(신민용 제공 스포츠의학
+    # 자료 기반 145개 항목)에서 항목별 발생가중치로 직접 하나를 뽑는다 —
+    # 회복기간이 긴 부상일수록 가중치가 낮게 설계돼 있어 "긴 부상일수록
+    # 드물게" 발생한다(자세한 설계는 constants.py INJURY_POOL 주석 참고).
+    # 포지션(GK/DF/MF/FW)에 따라 손/손목/어깨(GK↑) vs 햄스트링/사타구니/
+    # 발목(필드 플레이어↑) 쪽 발생가중치가 약하게(0.7~2.0배) 보정된다 —
+    # "부상 발생 확률 자체"가 아니라 "어떤 부상이 나올지"만 보정하는
+    # 구조(신민용 확정 원칙).
     #
-    # [2026-07 버그 수정] INJURY_TYPES/INJURY_DETAILS의 범위는 '주' 단위로
-    # 설계했다(예: ACL 파열 24~32주 ≈ 실제 6~8개월 회복 기간). 그런데
-    # _process_injury_week가 (일 단위 진행 체계에서) 하루에 한 번씩 호출돼
-    # injury_weeks를 매번 -1 해왔다 — 즉 '주' 필드인데 실제로는 매일
-    # 깎여서, 8주 부상이 실제로는 8일 만에 나아버리는 버그가 있었다(회복
-    # 기간이 의도한 것의 1/7로 단축). 이제 주수를 실제 일수로 환산해서
-    # 저장한다(예: 8주 → 56일) — injury_weeks 필드명은 마이그레이션을
-    # 피하려고 그대로 두지만, 이제부터는 '남은 일수'를 담는다.
-    roll = random.random()
-    cum = 0.0
-    itype = "경미"
-    for tier, chance in INJURY_TIER_CHANCE.items():
-        cum += chance
-        if roll < cum:
-            itype = tier
-            break
-    detail_pool = INJURY_DETAILS.get(itype) or [(itype, INJURY_TYPES[itype])]
-    detail_name, (wmin, wmax) = random.choice(detail_pool)
-    weeks = random.randint(wmin, wmax)
-    days = weeks * DAYS_PER_WEEK
+    # [부위 저장] 이제 부상명에서 부위를 추측하지 않고 실제 zone 키를
+    # injury_body_part에 그대로 저장한다 — ui/player_panel.py의 신체
+    # 실루엣이 이 값을 바로 갖다 쓴다. 좌/우가 있는 부위(sided=True)는
+    # 여기서 실제로 랜덤 배정(예전처럼 이름 해시로 추측하지 않음).
+    #
+    # recovery_days는 '주'가 아니라 '일' 단위로 직접 저장된 값(신민용 제공
+    # 자료가 실제 경기 복귀 기준 '일수')이라 DAYS_PER_WEEK를 곱하지 않는다
+    # — injury_weeks 필드명은 예전 마이그레이션 그대로 두지만 실제로는
+    # '남은 일수'.
+    entry = pick_injury(p.get("position"))
+    itype = entry["tier"]
+    detail_name = entry["name"]
+    lo, hi = entry["recovery_days"]
+    days = random.randint(lo, hi)
+    body_part = entry["body_part"]
+    if entry["sided"]:
+        body_part = f"{random.choice(['l', 'r'])}_{body_part}"
     # 등급이 심할수록 행복도 타격도 커지게(기존엔 등급 무관 고정 -20).
     happy_penalty = {"경미": 10, "중간": 15, "심각": 20, "매우 심각": 30}.get(itype, 20)
     update_player(injured=1, injury_weeks=days, injury_type=itype, injury_detail=detail_name,
+                  injury_body_part=body_part,
                   happiness=max(0, p["happiness"] - happy_penalty))
     add_log(f"🚑 {detail_name} ({itype})!  {_day_label(week, day)}  ({days}일 휴식 필요)", "injury")
 
@@ -2806,7 +2810,8 @@ def _apply_injury(p, week, day=None):
 def _process_injury_week(p, week, day=None):
     left = p["injury_weeks"] - 1
     if left <= 0:
-        update_player(injured=0, injury_weeks=0, injury_type="", injury_detail="")
+        update_player(injured=0, injury_weeks=0, injury_type="", injury_detail="",
+                      injury_body_part="")
         add_log(f"✅ {p.get('injury_detail') or '부상'} 회복!  {_day_label(week, day)}", "injury")
     else:
         # [2026-07 신설, 신민용 설계+확정: "인기도 = 최근 화제성 — 못 뛰면
@@ -3625,6 +3630,25 @@ YELLOW_GROUP_FIELD = {
     "po_suspension":        "season_yellow_po",
 }
 
+# [2026-08 버그수정, 신민용 리포트: "팀 이력에 옐로카드가 갑자기 0이
+# 됐다"] YELLOW_GROUP_FIELD(season_yellow_*)를 "이번 시즌 총 받은
+# 옐로"(표시용, career_entries.yellow_cards 스냅샷 소스)와 "5장 채우면
+# 다음경기 결장+0리셋"(징계 판정용) 두 용도로 같이 썼더니, 5장째에서
+# 징계가 걸리는 순간 화면 표시값까지 같이 0으로 날아갔다. 판정용
+# "진행 카운터"를 별도 필드로 완전히 분리한다 — season_yellow_*는
+# 이제부터 순수 표시 전용(카드 받을 때마다 계속 누적, 시즌 끝날 때만
+# 0으로 리셋)이고, 5장 문턱 판정은 이 필드만 본다.
+YELLOW_PROGRESS_FIELD = {
+    "red_card_suspension":  "yellow_susp_progress_league",
+    "cup_suspension":       "yellow_susp_progress_cup",
+    "cl_suspension":        "yellow_susp_progress_europe",
+    "super_cup_suspension": "yellow_susp_progress_super_cup",
+    "cwc_suspension":       "yellow_susp_progress_cwc",
+    "wc_qual_suspension":   "yellow_susp_progress_wc_qual",
+    "intl_suspension":      "yellow_susp_progress_intl",
+    "po_suspension":        "yellow_susp_progress_po",
+}
+
 
 def _roll_yellow_card(p):
     """이번 경기 '첫 번째' 옐로카드 판정. '폭력적' 성격이면 PERSONALITY_
@@ -3636,9 +3660,9 @@ def _roll_yellow_card(p):
 
 def _roll_card_events(p, field):
     """한 경기의 카드 판정을 스트레이트 레드 → 첫 옐로 → 2차 옐로 순으로
-    굴리고, 옐로 관련 DB 카운터(통산/시즌누적)까지 이 함수 안에서 전부
-    반영한다 — 호출부(리그/컵/챔스류/슈퍼컵/클럽월드컵/국가대표/승강PO)가
-    각자 반복 구현할 필요 없이 여기 한 곳만 쓰면 된다.
+    굴리고, 옐로 관련 DB 카운터(통산/시즌표시/징계진행)까지 이 함수 안에서
+    전부 반영한다 — 호출부(리그/컵/챔스류/슈퍼컵/클럽월드컵/국가대표/
+    승강PO)가 각자 반복 구현할 필요 없이 여기 한 곳만 쓰면 된다.
 
     field: 그 경기가 속한 대회의 결장카운터 필드명(red_card_suspension 등).
 
@@ -3657,34 +3681,42 @@ def _roll_card_events(p, field):
     if not _roll_yellow_card(p):
         return False, None, [], 0
 
-    # 첫 옐로 — 통산 + 시즌(대회사이클) 누적 카운터 반영.
+    # 첫 옐로 — 통산 + 시즌표시(season_yellow_*) + 징계진행
+    # (yellow_susp_progress_*) 세 카운터 모두 +1.
     season_field = YELLOW_GROUP_FIELD.get(field)
+    progress_field = YELLOW_PROGRESS_FIELD.get(field)
     p2 = get_player() or p
     _updates = {"total_yellow_all": p2.get("total_yellow_all", 0) + 1}
     _is_league = (field == "red_card_suspension")
     if _is_league:
         _updates["total_yellow_league"] = p2.get("total_yellow_league", 0) + 1
-    _season_cnt = p2.get(season_field, 0) + 1 if season_field else 0
     if season_field:
-        _updates[season_field] = _season_cnt
+        _updates[season_field] = p2.get(season_field, 0) + 1
+    _progress_cnt = p2.get(progress_field, 0) + 1 if progress_field else 0
+    if progress_field:
+        _updates[progress_field] = _progress_cnt
     minute = _sample_minutes(1, 15, 85)[0]
     events = [(minute, "🟨 경고")]
 
     if random.random() < SECOND_YELLOW_CHANCE:
-        # 2차 옐로(경고누적 퇴장) — 통산에는 +1 더 반영하되, 시즌 누적
-        # "징계" 카운터는 첫 옐로 값 그대로 둔다(5장 문턱과 겹치지 않게).
+        # 2차 옐로(경고누적 퇴장) — 통산과 시즌표시엔 +1 더 반영해 실제로
+        # 그 경기에서 카드를 두 장 받은 걸 그대로 기록한다. 징계진행
+        # 카운터만 첫 옐로 값 그대로 두고 건드리지 않는다(5장 문턱과
+        # 겹치지 않게 — 이 경기는 어차피 퇴장으로 결장 처리됨).
         _updates["total_yellow_all"] += 1
         if _is_league:
             _updates["total_yellow_league"] += 1
+        if season_field:
+            _updates[season_field] += 1
         update_player(**_updates)
         return True, "second_yellow", events, 2
 
-    # 첫 옐로만으로 끝난 경우 — 시즌 누적이 문턱(5장)에 도달했으면 다음
-    # 경기 결장 처리 + 카운터 리셋(2차 옐로로 이어졌다면 위에서 이미
-    # return 됐으므로 여기 오지 않아 징계 중복 걱정이 없다).
-    if season_field and _season_cnt >= YELLOW_SUSPENSION_THRESHOLD:
+    # 첫 옐로만으로 끝난 경우 — 징계진행 카운터가 문턱(5장)에 도달했으면
+    # 다음 경기 결장 처리 + 그 진행 카운터만 리셋(시즌표시 카운터는 그대로
+    # 유지 — "이번 시즌 총 몇 장"이라는 화면 표시가 안 끊기게).
+    if progress_field and _progress_cnt >= YELLOW_SUSPENSION_THRESHOLD:
         _updates[field] = 1
-        _updates[season_field] = 0
+        _updates[progress_field] = 0
     update_player(**_updates)
     return False, None, events, 1
 
@@ -6502,6 +6534,54 @@ def _execute_pending_sale_transfer(p, year):
             f"(판매금액 {fmt_money(proposal.get('transfer_fee', 0))})", "event", year, 52)
 
 
+def reserve_join_transfer(team_id, salary, team_name, transfer_type="오퍼", offer=None):
+    """[2026-08 신설, 신민용 요청: "클럽월드컵 도중 소속이 바뀌면 오류날
+    수 있다"] 오퍟/입단 수락 시 join_team()을 즉시 부르지 않고 여기 예약만
+    해둔다 — pending_sale_transfer_json(판매추진)과 완전히 동일한 패턴.
+    같은 필드를 덮어쓰는 구조라, 이 시즌 구간 안에서 더 좋은 오퍟를 다시
+    수락하면 자동으로 "가장 마지막에 고른 팀"으로 교체된다(이전 예약은
+    그냥 덮어써져서 사라짐 — 원한 동작 그대로).
+    offer: join_team에 그대로 넘길 offer dict(계약연수 등) — UI가 만든
+    dlg.chosen을 그대로 넘기면 된다(JSON 직렬화 가능한 값들만 있어야 함)."""
+    proposal = {"team_id": team_id, "salary": salary, "team_name": team_name,
+                "transfer_type": transfer_type, "offer": offer or {}}
+    st = get_state() or {}
+    try:
+        update_player(pending_join_transfer_json=json.dumps(proposal, ensure_ascii=False))
+    except (TypeError, ValueError) as e:
+        # [안전장치] offer dict에 직렬화 불가능한 값이 섞여 있으면 예약
+        # 자체가 조용히 실패해서 오퍟가 통째로 증발하는 것보다는, 예전
+        # 방식(즉시 이적)으로 폴백하는 게 낫다.
+        print(f"reserve_join_transfer 직렬화 실패, 즉시 이적으로 폴백: {e}")
+        join_team(team_id, salary, transfer_type=transfer_type, offer=offer)
+        return
+    add_log(f"📋 {team_name} 이적 확정 — 다음 시즌 구간이 시작되면 실제로 이적합니다",
+            "event", st.get("current_year"), st.get("current_week"))
+
+
+def _execute_pending_join_transfer(p, year, week):
+    """[2026-08 신설] _advance_week가 상/하반기 시작 주차(FIRST_HALF_START/
+    SECOND_HALF_START)에 진입할 때 호출 — reserve_join_transfer로 예약해둔
+    이적이 있으면 이 시점에 실제로 실행한다. 클럽월드컵 등 비시즌 대회가
+    전부 끝난 뒤(새 시즌 구간이 열리는 순간)이므로 대회 진행 중 소속이
+    바뀌는 정합성 문제가 생기지 않는다."""
+    raw = p.get("pending_join_transfer_json") or ""
+    if not raw:
+        return
+    try:
+        proposal = json.loads(raw)
+    except Exception:
+        update_player(pending_join_transfer_json="")
+        return
+
+    update_player(pending_join_transfer_json="")
+    join_team(proposal["team_id"], proposal.get("salary", 0),
+              transfer_type=proposal.get("transfer_type", "오퍼"),
+              offer=proposal.get("offer") or None)
+    add_log(f"✅ 예약 이적 실행 — {proposal['team_name']}에 입단했습니다",
+            "event", year, week)
+
+
 def _advance_week(p, base_week, n_weeks=4):
     new_week = base_week + n_weeks
     new_year = p["current_year"]
@@ -6578,6 +6658,18 @@ def _advance_week(p, base_week, n_weeks=4):
             #   그 시점 소속 팀이 1위면 그 즉시 우승을 기록한다.
             #   (연말까지 안 기다리고 바로 '성적'에 반영)
             _lock_league_title_after_season(p, new_year)
+
+    # [2026-08 신설, 신민용 요청: "입단/오퍟 반영을 시즌 시작 순간으로"]
+    # 상반기 시작(FIRST_HALF_START=4주)이나 하반기 시작(SECOND_HALF_START)
+    # 주차에 진입하는 바로 이 순간, 그 전까지 쌓아둔 예약 이적이 있으면
+    # 실행한다 — 프리시즌/국제오프시즌 구간에 수락한 오퍟는 다음 상반기
+    # 시작에, 중간휴식기(겨울 이적시장) 구간에 수락한 오퍟는 하반기 시작에
+    # 반영된다. 이 시점은 클럽월드컵 등 비시즌 대회가 전부 끝난 뒤라 대회
+    # 도중 소속이 바뀌는 정합성 문제가 없다.
+    if new_week in (FIRST_HALF_START, SECOND_HALF_START):
+        _p_pending = get_player()
+        if _p_pending:
+            _execute_pending_join_transfer(_p_pending, new_year, new_week)
 
     # [2026-07 신설, 신민용+GPT 다회 설계 확정: "구단 판매 추진" 시스템]
     # 매주(정확히는 _advance_week가 호출될 때마다) 5개 조건 점수를
@@ -9121,6 +9213,12 @@ def _end_of_season(p, year):
                         season_yellow_league=0, season_yellow_cup=0,
                         season_yellow_europe=0, season_yellow_super_cup=0,
                         season_yellow_cwc=0, season_yellow_po=0,
+                        # [2026-08 버그수정과 함께 추가] 징계진행 카운터도
+                        # 같은 시즌 리셋 지점에 맞춰 같이 0으로 — 새 시즌은
+                        # 5장 문턱도 처음부터 다시 세는 게 맞다.
+                        yellow_susp_progress_league=0, yellow_susp_progress_cup=0,
+                        yellow_susp_progress_europe=0, yellow_susp_progress_super_cup=0,
+                        yellow_susp_progress_cwc=0, yellow_susp_progress_po=0,
                         season_injury_matches_missed=0,
                         season_suspension_matches_missed=0,
                         season_bench_matches_missed=0,
@@ -14037,6 +14135,7 @@ def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None
                       season_pass_acc_sum=0, season_pass_acc_cnt=0,
                       season_red_cards_league=0,
                       season_yellow_league=0,
+                      yellow_susp_progress_league=0,
                       season_injury_matches_missed=0,
                       season_suspension_matches_missed=0,
                       season_bench_matches_missed=0)

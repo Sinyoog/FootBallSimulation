@@ -598,10 +598,16 @@ def _retire_and_replace(c, year, ai_rows=None):
         #  좁혀서, 실제로 몇 시즌 성장해야 에이스 근처에 도달하도록 한다.
         grade, tier, _bonus, cname, continent, _tname, _club_strength = team_info.get(
             r["team_id"], ("D", 1, 0, "", "유럽", "", 0.0))
-        # [2026-08] tier1이 COUNTRY_LEAGUE_OVR_OVERRIDE 등록국이면 그 값을
-        # 최우선 사용 — 이미 그 나라 실측에 맞춘 값이라 대륙/국가 보정(_bonus)은
-        # 중복 적용하지 않는다(초기 시딩의 _tier_top_ovr(country=...)와 동일 원칙).
-        _is_override = tier == 1 and cname in COUNTRY_LEAGUE_OVR_OVERRIDE
+        # [2026-08] COUNTRY_LEAGUE_OVR_OVERRIDE 등록국이면 최우선 사용 —
+        # 이미 그 나라 실측에 맞춘 값이라 대륙/국가 보정(_bonus)은 중복
+        # 적용하지 않는다(초기 시딩의 _tier_top_ovr(country=...)와 동일 원칙).
+        # [2026-08 버그수정, 신민용 리포트: "K1 OVR을 내렸더니 K2랑 겹친다"]
+        # 예전엔 이 판정이 tier==1일 때만 걸려서, tier2 이하 신인은
+        # get_ovr_range()가 이미 델타-캐스케이드한 값 위에 _bonus까지 또
+        # 더해지는 이중보정이 있었다 — get_ovr_range 자체가 이제 모든
+        # tier에서 오버라이드를 반영하므로, 여기 판정도 tier 무관하게
+        # 국가 등록 여부만 본다.
+        _is_override = cname in COUNTRY_LEAGUE_OVR_OVERRIDE
         ovr_rng = get_ovr_range(grade, tier, cname)
         if ovr_rng:
             lo, hi = ovr_rng
