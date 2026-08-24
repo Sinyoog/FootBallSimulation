@@ -65,6 +65,7 @@ def _game_confirm(parent, title: str, message: str) -> bool:
     yes.clicked.connect(lambda: (result.__setitem__(0,True), dlg.accept()))
     no.clicked.connect(dlg.reject)
     dlg.exec()
+    dlg.deleteLater()
     return result[0]
 
 
@@ -88,6 +89,7 @@ def _game_warning(parent, title: str, message: str):
     ok.clicked.connect(dlg.accept)
     lay.addWidget(ok, alignment=Qt.AlignmentFlag.AlignCenter)
     dlg.exec()
+    dlg.deleteLater()
 
 
 from database import get_conn

@@ -137,7 +137,18 @@ def search_teams(name_query=None, continent=None, country_id=None, grade=None, t
     q = ("SELECT t.id, t.name, l.id as league_id, l.name as league_name, l.tier, "
          "cn.id as country_id, cn.name as country, cn.flag as flag, cn.grade as cgrade, "
          "cn.continent as continent, "
-         "(SELECT AVG(ovr) FROM ai_players WHERE team_id=t.id) as avg_ovr "
+         # [2026-08 수정, 신민용 리포트: "입단 화면엔 45.9인데 실제 들어가보면
+         # 47로 뜬다"] 벤치 인원 확장(11→18명) 이후 game_engine._team_avg_ovr()은
+         # "선발 11명(OVR 상위 11명) 평균"으로 이미 바뀌었는데, 이 지원 화면은
+         # 여전히 옛날 방식(스쿼드 전체 AVG(ovr), 벤치 낮은 OVR에 그대로
+         # 끌려 내려감)을 쓰고 있어서 두 화면이 서로 다른 숫자를 보여주고
+         # 있었다 — "작년 시즌 값"이 아니라 "다른 계산식"이 원인이었다.
+         # 같은 상위 11명 기준으로 통일한다(club_strength·명문팀 보너스처럼
+         # 매치 시뮬레이션 전용 동적 보정은 여기선 제외 — 이 화면은 "지금
+         # 이 팀 스쿼드가 어느 정도 수준인지"를 보여주는 용도라 순수 스쿼드
+         # 평균이 맞다).
+         "(SELECT AVG(ovr) FROM (SELECT ovr FROM ai_players WHERE team_id=t.id "
+         "ORDER BY ovr DESC LIMIT 11)) as avg_ovr "
          "FROM teams t JOIN leagues l ON t.league_id=l.id "
          "JOIN countries cn ON l.country_id=cn.id WHERE 1=1")
     params = []

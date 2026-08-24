@@ -19,6 +19,38 @@ from game_engine import (
 from constants import TRAINING_CONFIG, FOCUS_TRAIN_STATS, ALL_STATS, MATCH_STRESS
 
 
+def _match_card_color(mi):
+    """[2026-08 신설, 신민용 리포트: "다음주 미리보기 박스 색이 가운데
+    일정 카드 색이랑 다르게 뜬다(예: 네이션스컵 예선이 카드에선 핑크인데
+    미리보기에선 빨강)"] 예전엔 다음주 미리보기 박스(_update_next_week_preview)가
+    자기만의 단순화된 색 규칙(국대=주황/빨강 2색만)을 따로 갖고 있어서,
+    실제 주간일정카드가 2026-08에 세분화된 배색(국대 본선=레드/그 외=핑크,
+    챔스=블루/유로파=오렌지/컨퍼런스=그린/슈퍼컵=골드 등)과 점점 어긋났다.
+    두 군데서 색을 각자 판단하는 구조 자체가 드리프트의 원인이므로, 카드
+    렌더링에 쓰이는 것과 동일한 판정 순서·색상표를 이 함수 하나로 통일해
+    다음주 미리보기도 그대로 재사용한다(카드 쪽 코드는 라벨 텍스트/배경
+    조합이라 그대로 유지, 이 함수는 "포인트 색상"만 뽑아낸 것)."""
+    if not mi:
+        return "#333"
+    if mi.get("intl"):
+        return "#ff3333" if mi.get("kind") in ("world", "continent") else "#ff66b2"
+    if mi.get("cl"):
+        _CL_KIND_COLOR = {
+            "champions":  "#4466ff",
+            "europa":     "#ff7700",
+            "conference": "#215131",
+            "super_cup":  "#ffd700",
+        }
+        return _CL_KIND_COLOR.get(mi.get("cl_kind"), "#ffd24d")
+    if mi.get("cup"):
+        return "#c48aff"
+    if mi.get("cwc"):
+        return "#00bfff"
+    if mi.get("po"):
+        return "#ffee55"
+    return "#66ff99"
+
+
 def show_toast(parent, msg, color="#cc4400", duration=1200):
     """1초 뒤 사라지는 토스트 경고"""
     lbl = QLabel(msg, parent)
@@ -340,6 +372,12 @@ class CenterPanel(QWidget):
 
         self.nwp_boxes: list[QLabel] = []
         nwp_row = QHBoxLayout(); nwp_row.setSpacing(3)
+        # [2026-08 신설, 신민용 요청] 이 박스 7개가 "다음주" 일정 미리보기라는
+        # 걸 한눈에 알 수 있도록 좌측에 라벨을 붙인다(예전엔 라벨 없이
+        # 박스만 있어서 뭘 나타내는지 문구로는 알 수 없었다 — 툴팁에만 있었음).
+        nwp_lbl = QLabel("다음주"); nwp_lbl.setStyleSheet(
+            "color:#999; font-size:11px; font-weight:bold;")
+        nwp_row.addWidget(nwp_lbl)
         for _ in range(DAY_BUNDLE_SIZE):
             b = QLabel("")
             b.setFixedSize(14, 14)
@@ -347,8 +385,11 @@ class CenterPanel(QWidget):
             self.nwp_boxes.append(b)
             nwp_row.addWidget(b)
         nwp_wrap = QWidget(); nwp_wrap.setLayout(nwp_row)
-        nwp_wrap.setToolTip("다음 주 일정 미리보기 (초록=리그, 보라=컵, 황금=챔스, "
-                            "주황=월드컵/대륙컵, 빨강=국대, 회색=경기 없음)")
+        # [2026-08 색상 통일] 아래 색상 표는 이제 _match_card_color()가
+        # 실제 주간일정카드와 공유하는 판정 순서를 그대로 따른다.
+        nwp_wrap.setToolTip("다음 주 일정 미리보기 (초록=리그, 보라=컵, 하늘=CWC, "
+                            "노랑=승강PO, 블루=챔스/오렌지=유로파/그린=컨퍼런스/골드=슈퍼컵, "
+                            "레드=국대 본선/핑크=국대 예선·기타, 회색=경기 없음)")
         phase_row.addWidget(nwp_wrap, 0)
         self.lay.addLayout(phase_row)
 
@@ -1627,7 +1668,9 @@ class CenterPanel(QWidget):
         btn_ok.clicked.connect(dlg.accept)
         spin.setFocus()
 
-        if dlg.exec() == QDialog.DialogCode.Accepted:
+        _yr_result = dlg.exec()
+        dlg.deleteLater()
+        if _yr_result == QDialog.DialogCode.Accepted:
             self._set_mode_year(years=spin.value())
 
     def _set_mode_year(self, years=1):
@@ -1949,12 +1992,58 @@ class CenterPanel(QWidget):
             # [타이밍] 1주차 화면 먼저 갱신 후 팝업 표시
             if self.main_win:
                 self.main_win.refresh_all()
-            QApplication.processEvents()
             self._show_forced_commit(forced)
+            # [2026-08 재수정, 신민용 리포트+실측 로그 확인: "국가대표 관련
+            # 창이 흰 빈 창으로 여러 개 떠서 도배된다"] 예전엔 여기 두
+            # processEvents() 호출로 "밀린 페인트를 흘려보낸다"고 생각했는데,
+            # 실측 [GHOST-DEBUG] 로그로 추적해보니 반대 효과였다 —
+            # _show_forced_commit 내부의 _do_commit도 QTimer.singleShot(0,
+            # ...)으로 후속 토스트/refresh_all()을 예약해두는데, 바로 아래
+            # processEvents()가 이벤트 루프를 재진입하면서 그 큐에 쌓인
+            # 콜백을 여기 안에서 중첩 실행해버렸다 — 모달이 모달 안에서
+            # 처리되는 재진입 구조 자체가 흰 창 문제의 원인이었다(아래
+            # _show_nat_choice 쪽과 동일 — 그쪽은 QTimer.singleShot으로
+            # 재진입 없이 순서대로 처리하도록 고쳤다). 여기는 그 뒤에
+            # 이어지는 추가 작업이 없으므로 그냥 processEvents() 호출
+            # 자체를 없앤다 — _do_commit의 QTimer(0)이 알아서 다음 이벤트
+            # 루프 틱에 정상 처리된다.
         # [복수국적] 두 나라 다 본선 진출 → 대표팀 선택 팝업 (선택 전까지 차출 보류)
+        # [2026-08 버그수정, 신민용 리포트+실측 로그 확인: "국가 선택 확인
+        # 누르면 흰 창이 우다다닥 뜬다"] 실제 [GHOST-DEBUG] 로그로 추적한
+        # 결과 — _show_nat_choice(모달)가 열려있는 "동안" 사용자가 나라를
+        # 고르면(_do_choice) 그 안에서 QTimer.singleShot(0, ...)으로 후속
+        # 다이얼로그·refresh_all()을 "다음 이벤트 루프 틱"으로 예약해둔다.
+        # 그런데 _show_nat_choice() 자체가 반환되자마자(같은 콜스택 안에서)
+        # 이 함수(_on_advance_finished)가 계속 실행되어 맨 아래에서 또
+        # refresh_all()을 동기 호출했다 — 그 refresh_all()의
+        # processEvents()가 이벤트 루프를 재진입하면서, 방금 큐에 쌓여있던
+        # QTimer 콜백(_after_close — 결과창을 새로 열고 refresh_all()을
+        # 또 부름)을 그 안에서 중첩 실행해버렸다. 즉 "모달 하나 처리 중에
+        # 또 다른 모달이 processEvents() 안에서 중첩으로 열리고 닫히는"
+        # 재진입 구조가 실제 원인이었다(로그에서 바깥쪽 refresh_all()의
+        # processEvents()가 2.9초짜리로 찍힌 게 그 증거 — 그 안에 결과창
+        # 상호작용 전체와 안쪽 refresh_all() 전체가 통째로 물려 있었다).
+        # 고침: 대표팀 선택 팝업이 실제로 떴으면(pend가 참), 이 함수의
+        # 나머지(재계약/판매추진/오퍼 팝업, 마지막 refresh_all() 등)를
+        # 곧바로 이어서 실행하지 않고 QTimer.singleShot(0, ...)으로
+        # 한 틱 늦춘다 — 그러면 이미 큐에 쌓여있던 _after_close가 먼저
+        # 정상적으로(재진입 없이) 처리되고, 그 다음에 이 함수의 나머지가
+        # 이어진다. 대표팀 선택 팝업이 안 떴으면(pend 없음) 기존과 동일하게
+        # 즉시 이어서 실행한다(동작 변화 없음).
         pend = intl_engine.get_pending_choice()
         if pend:
             self._show_nat_choice(pend)
+            QTimer.singleShot(0, lambda: self._on_advance_finished_continue(
+                p2, st2, bundle_done, new_week, in_zone))
+            return
+        self._on_advance_finished_continue(p2, st2, bundle_done, new_week, in_zone)
+
+    def _on_advance_finished_continue(self, p2, st2, bundle_done, new_week, in_zone):
+        """[2026-08 신설] _on_advance_finished의 나머지 절반 — 대표팀 선택
+        팝업이 떴을 때만 QTimer로 한 틱 늦춰서 부르고, 안 떴으면 바로 이어서
+        부른다(위 _on_advance_finished 끝부분 주석 참고). 원래 한 함수였던
+        걸 재진입 방지를 위해 쪼갠 것뿐, 로직 자체는 그대로다."""
+        from PyQt6.QtWidgets import QApplication
 
         # 재계약 팝업은 '새 시즌 진입 직후 즉시' 떠야 한다.
         #   오퍼 플래그(_contract_renew_offer)는 연말(52주) 처리에서 세팅되므로,
@@ -2444,28 +2533,23 @@ class CenterPanel(QWidget):
     def _update_next_week_preview(self, bundle_start, p, st=None):
         """[2026-07 신설] 우측 상단 작은 박스 7개 — 다음 주(현재 표시 중인
         7일 묶음의 바로 다음 7일) 일정을 대회 종류별 색으로 간단히 미리
-        보여준다. 4번 색상 규칙(리그=초록/컵=보라/챔스=황금/국대=주황·빨강)과
-        동일한 배색을 쓰며, 경기 없는 날(훈련/휴식)은 회색으로 둔다.
+        보여준다. 경기 없는 날(훈련/휴식, "대회 전 휴식"인 하루 전날 포함)은
+        회색으로 둔다 — _get_match_for_day가 "대회 전 휴식"인 날엔 애초에
+        None(경기 없음)을 반환하므로 이 함수가 따로 걸러낼 필요는 없다.
         [2026-07 버그수정] 소속 클럽이 없어도(국대만 있는 어린 선수 등)
-        국제전은 뜰 수 있으므로 has_team 게이트 없이 항상 조회한다."""
+        국제전은 뜰 수 있으므로 has_team 게이트 없이 항상 조회한다.
+        [2026-08 버그수정, 신민용 리포트: "미리보기 박스 색이 가운데
+        일정카드 색이랑 다르게 뜬다"] 이 함수가 자체 색상표를 따로 갖고
+        있어 주간일정카드(2026-08 세분화 배색)와 점점 어긋났던 게 원인
+        → 카드와 동일한 판정을 쓰는 _match_card_color()로 교체해 항상
+        같은 색이 뜨도록 통일."""
         if not hasattr(self, "nwp_boxes"):
             return
         next_start = bundle_start + DAY_BUNDLE_SIZE
         for i, box in enumerate(self.nwp_boxes):
             d = next_start + i
             mi = self._get_match_for_day(d, p, st=st)
-            if not mi:
-                color = "#333"
-            elif mi.get("intl"):
-                color = "#ffaa33" if mi.get("kind") in ("world", "continent") else "#ff6666"
-            elif mi.get("cl"):
-                color = "#ffd24d"
-            elif mi.get("cup"):
-                color = "#c48aff"
-            elif mi.get("po"):
-                color = "#ffee55"
-            else:
-                color = "#66ff99"
+            color = _match_card_color(mi)
             box.setStyleSheet(f"background:{color};border-radius:3px;")
 
     def _get_match_for_day(self, day, p, st=None):
@@ -2811,6 +2895,7 @@ class CenterPanel(QWidget):
         btn_reject.clicked.connect(_reject)
         _refresh()
         dlg.exec()
+        dlg.deleteLater()
 
     def _show_sale_push_proposal(self, p):
         """[2026-08 신설, 3단계: 판매추진 전용 UI, 신민용+GPT 검토 확정]
@@ -2909,6 +2994,7 @@ class CenterPanel(QWidget):
         btn_accept.clicked.connect(_accept)
         btn_reject.clicked.connect(_reject)
         dlg.exec()
+        dlg.deleteLater()
 
     def _show_forced_commit(self, forced):
         """[복수국적] 22세 프리시즌(1~3주) — 평생 뛸 대표팀 국적을 강제로 확정.
@@ -2953,8 +3039,12 @@ class CenterPanel(QWidget):
         def _do_commit(nat):
             intl_engine.commit_nationality(nat)
             dlg.accept()
-            show_toast(self, f"🌍 {nat} 대표로 국적을 확정했습니다!", "#1a4d8f", 2000)
-            if self.main_win: self.main_win.refresh_all()
+            # [2026-08 버그수정] _show_nat_choice의 _do_choice와 동일한 이유로,
+            # dlg가 완전히 닫힌 뒤에 토스트·refresh를 실행하도록 한 박자 늦춘다.
+            def _after_close():
+                show_toast(self, f"🌍 {nat} 대표로 국적을 확정했습니다!", "#1a4d8f", 2000)
+                if self.main_win: self.main_win.refresh_all()
+            QTimer.singleShot(0, _after_close)
 
         # 국적 수만큼 버튼을 세로로 쌓아 글자 잘림/창 크기 문제 방지
         for opt in opts:
@@ -2966,6 +3056,7 @@ class CenterPanel(QWidget):
         # 닫기·취소 불가 (반드시 선택)
         dlg.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
         dlg.exec()
+        dlg.deleteLater()
         self._forced_commit_open = False
 
     def _show_nat_choice(self, pend):
@@ -3025,21 +3116,84 @@ class CenterPanel(QWidget):
         def _do_choice(opt):
             # [복수대륙컵] 선택한 옵션의 대회로 출전. 옵션에 tournament_id가
             #   있으면 그것을(각 대륙컵), 없으면 pend 대표 tid를 사용(구버전 호환).
+            # [2026-08 버그수정, 신민용 리포트: "확인 눌러도 여전히 흰 창이
+            # 여러 개 뜬다"] 중첩 모달 타이밍(아래 QTimer)을 고쳤는데도
+            # 재현된 걸 다시 보니, 진짜 병목은 다른 자리였다 —
+            # intl_engine.choose_national_team()이 dlg.accept()보다도 먼저,
+            # 이 버튼 클릭 핸들러 안에서 곧바로 _enrich_countries()(대륙
+            # 전체 국가, 많으면 50~200개국 OVR 재계산)를 동기 호출한다.
+            # 즉 다이얼로그가 아직 "열려있는" 상태에서 이미 UI 스레드가
+            # 한동안 막혀 있었을 수 있다 — 이건 다이얼로그 순서를 아무리
+            # 손봐도 못 잡는 별개의 원인. 무거운 호출 직전에 대기 커서 +
+            # processEvents()로 지금까지 밀린 페인트를 먼저 비워서, 최소한
+            # "멈추기 직전" 화면이 지저분한 상태로 안 남게 한다(완전한
+            # 해결은 아니고, 이 계산 자체를 가볍게 만드는 게 근본 해결—
+            # 일단 증상 완화용).
+            # [참고, 신민용 요청으로 확인] 같은 다이얼로그 그룹의 다른
+            # 두 곳(_show_forced_commit._do_commit → commit_nationality,
+            # _do_decline/_do_decline_option → decline_national_team*)은
+            # 둘 다 update_player() 한 번 + 가벼운 기록 저장뿐이라
+            # _enrich_countries() 같은 무거운 호출이 없다 — 이 WaitCursor
+            # 보정은 여기(_do_choice) 한 곳만 필요하다.
+            from PyQt6.QtWidgets import QApplication
+            import time as _time_dbg
+            print(f"[GHOST-DEBUG] _do_choice 진입 {_time_dbg.perf_counter():.3f}")
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            QApplication.processEvents()
             tid = opt.get("tournament_id", pend["tournament_id"])
+            _t_before_choose = _time_dbg.perf_counter()
             res = intl_engine.choose_national_team(tid, opt["nat"])
+            print(f"[GHOST-DEBUG] choose_national_team 완료, 소요 {(_time_dbg.perf_counter()-_t_before_choose)*1000:.1f}ms")
+            QApplication.restoreOverrideCursor()
+            print(f"[GHOST-DEBUG] dlg.accept() 직전 {_time_dbg.perf_counter():.3f}")
             dlg.accept()
-            if res:
-                self._show_callup_result(opt["nat"], res)
-            if self.main_win: self.main_win.refresh_all()
+            print(f"[GHOST-DEBUG] dlg.accept() 직후, QTimer 예약 {_time_dbg.perf_counter():.3f}")
+            # [2026-08 버그수정, 신민용 리포트: "국가대표 발탁 선택 후 작은
+            # 흰 창이 여러 개 떴다 사라진다"] dlg.accept()는 창을 "닫으라고
+            # 예약"만 할 뿐, 실제 네이티브 창이 닫히는 건 이 핸들러가
+            # 리턴해서 Qt 이벤트 루프로 돌아간 뒤다. 그런데 바로 다음 줄에서
+            # 또 다른 모달 다이얼로그(_show_callup_result)를 곧바로 열면,
+            # dlg가 아직 화면에서 안 닫힌 상태 위에 새 모달 창이 겹쳐
+            # 뜨는 꼴이 되어(중첩 모달) Windows에서 창 전환이 한꺼번에
+            # 몰려 처리되며 빈 창이 깜빡이는 것으로 보일 수 있다.
+            # QTimer.singleShot(0, ...)으로 dlg가 완전히 닫힌 뒤(다음
+            # 이벤트 루프 틱)에 후속 다이얼로그·refresh를 열도록 한 박자
+            # 늦춘다.
+            # [2026-08 신설, 신민용 요청: "정확히 뭔지 감도 안 오지?"라는
+            # 지적에 대한 정직한 대응] 지금까지 세 번의 수정(중첩모달
+            # 타이밍/WaitCursor/deleteLater) 전부 "이럴 것 같다"는 추측이었지
+            # 실제로 이 화면을 띄워서 확인한 적이 없다 — GUI를 못 띄우는
+            # 환경이라 매번 코드만 읽고 짐작했다. 더 이상 추측으로 다섯
+            # 번째 수정을 내놓는 대신, 다음에 이 증상이 재현될 때 정확히
+            # 어느 지점에서 시간이 걸리는지 신민용이 직접 콘솔 로그로
+            # 확인할 수 있도록 각 단계에 타임스탬프를 찍어둔다(아래
+            # _after_close 안까지 포함). 이 로그들을 다음 리포트에 그대로
+            # 붙여주면, 그걸 근거로 진짜 원인을 좁힐 수 있다.
+            def _after_close():
+                print(f"[GHOST-DEBUG] _after_close 진입(QTimer 발동) {_time_dbg.perf_counter():.3f}")
+                if res:
+                    _t_cr = _time_dbg.perf_counter()
+                    self._show_callup_result(opt["nat"], res)
+                    print(f"[GHOST-DEBUG] _show_callup_result 반환(다이얼로그 닫힘) {_time_dbg.perf_counter():.3f}, 창 떠있던 시간 {(_time_dbg.perf_counter()-_t_cr)*1000:.1f}ms")
+                if self.main_win:
+                    _t_ra = _time_dbg.perf_counter()
+                    self.main_win.refresh_all()
+                    print(f"[GHOST-DEBUG] refresh_all 완료, 소요 {(_time_dbg.perf_counter()-_t_ra)*1000:.1f}ms")
+                print(f"[GHOST-DEBUG] _after_close 종료 {_time_dbg.perf_counter():.3f}")
+            QTimer.singleShot(0, _after_close)
 
         def _do_decline():
             # [단일 후보 전용] 후보가 1개뿐일 때의 "아니오" — 그 대회 전체를 닫는다.
             intl_engine.decline_national_team(pend["tournament_id"])
             dlg.accept()
             _nat_str = "/".join(o["nat"] for o in opts)
-            show_toast(self, f"🚫 {_nat_str} 발탁을 거절했습니다 (기록에 남음)",
-                       "#aa6633", 2000)
-            if self.main_win: self.main_win.refresh_all()
+            # [2026-08 버그수정] 위 _do_choice와 동일한 이유로, dlg가 완전히
+            # 닫힌 뒤에 토스트·refresh를 실행하도록 한 박자 늦춘다.
+            def _after_close():
+                show_toast(self, f"🚫 {_nat_str} 발탁을 거절했습니다 (기록에 남음)",
+                           "#aa6633", 2000)
+                if self.main_win: self.main_win.refresh_all()
+            QTimer.singleShot(0, _after_close)
 
         # [2026-08 재설계, 신민용 요청: "그레나다에서 아니요를 누르면 그
         # 나라 버튼만 회색으로 비활성화되고, 나머지 나라는 같은 창에 그대로
@@ -3067,8 +3221,9 @@ class CenterPanel(QWidget):
             if not remaining:
                 # 마지막 후보까지 전부 거절됐으면 그제서야 창을 닫는다.
                 dlg.accept()
+                # [2026-08 버그수정] 위와 동일한 이유로 refresh를 한 박자 늦춘다.
                 if self.main_win:
-                    self.main_win.refresh_all()
+                    QTimer.singleShot(0, self.main_win.refresh_all)
 
         btn_row = QHBoxLayout(); btn_row.setSpacing(8)
         if single:
@@ -3113,6 +3268,7 @@ class CenterPanel(QWidget):
         # 선택을 강제 (닫기 버튼 비활성 — 예/아니오/거절 중 하나는 눌러야 함)
         dlg.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
         dlg.exec()
+        dlg.deleteLater()
         self._nat_choice_open = False
 
     def _show_callup_result(self, nat, res):
@@ -3175,7 +3331,12 @@ class CenterPanel(QWidget):
         btn = QPushButton("확인"); btn.setObjectName("dlgChoice")
         btn.clicked.connect(dlg.accept)
         lay.addWidget(btn)
+        import time as _time_dbg
+        print(f"[GHOST-DEBUG] _show_callup_result dlg.exec() 진입 {_time_dbg.perf_counter():.3f}")
         dlg.exec()
+        print(f"[GHOST-DEBUG] _show_callup_result dlg.exec() 반환(확인 눌러 닫힘) {_time_dbg.perf_counter():.3f}")
+        dlg.deleteLater()
+        print(f"[GHOST-DEBUG] _show_callup_result deleteLater() 호출 완료 {_time_dbg.perf_counter():.3f}")
 
     def _do_toggle_offers(self):
         """오퍼 알림 ON/OFF 토글. 팀 입단(무소속 강제 입단)에는 영향 없음."""
@@ -3608,7 +3769,9 @@ class CenterPanel(QWidget):
 
         b_no.setDefault(True)   # 엔터 시 기본은 '계속'
 
-        if dlg.exec() == QDialog.DialogCode.Accepted:
+        _retire_confirm = dlg.exec()
+        dlg.deleteLater()
+        if _retire_confirm == QDialog.DialogCode.Accepted:
             # [2026-08 신설, 신민용 요청: "같은 종류의 창은 하나만"]
             if getattr(self, "_retire_win", None) is not None:
                 self._retire_win.raise_(); self._retire_win.activateWindow()

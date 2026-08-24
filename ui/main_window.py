@@ -28,6 +28,22 @@ QSplitter::handle { background-color: #2a2a2a; }
 
 
 def _game_confirm(parent, title: str, message: str) -> bool:
+    # [2026-08 버그수정, 신민용 리포트: "국가 선택이든 뭐든, 확인 버튼
+    # 눌러서 창 닫히면 흰 창이 우다다닥 떴다가 한번에 사라진다"] 지난
+    # 시도들(다이얼로그 순서 조정, WaitCursor 등)은 전부 헛다리였다 —
+    # 진짜 원인은 이 앱의 QDialog(self)/QDialog(parent) 생성부 전체가
+    # (center_panel.py 7곳, formation_widget.py의 PlayerStatPopup —
+    # 선수 클릭할 때마다 뜨는 가장 빈번한 팝업, 이 파일과
+    # retire_window.py의 공용 헬퍼까지) dlg.exec() 이후 한 번도
+    # deleteLater()를 안 불렀다는 것 — Qt 객체 소멸을 파이썬 GC에게
+    # 통째로 맡긴 셈이다. 참조 순환(시그널 연결이 dlg↔버튼↔람다를 서로
+    # 물고 있음) 때문에 단순 참조카운트로는 안 지워지고 GC 사이클이 돌
+    # 때까지 미뤄지는데, 그 사이클이 한 번에 여러 개를 몰아서 정리하면
+    # 그때마다 각 다이얼로그의 네이티브 창이 파괴되면서 잠깐씩
+    # 깜빡이다 한꺼번에 사라지는 것으로 보인다 — "여러 개가 우다다닥
+    # 나왔다 한번에 사라진다"는 목격담과 정확히 일치. dlg.exec()
+    # 직후 deleteLater()를 명시로 호출해 즉시(다음 이벤트 루프 틱)
+    # 파괴되도록 고친다.
     from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
     from PyQt6.QtCore import Qt
     dlg = QDialog(parent)
@@ -52,6 +68,7 @@ def _game_confirm(parent, title: str, message: str) -> bool:
     yes.clicked.connect(lambda: (result.__setitem__(0,True), dlg.accept()))
     no.clicked.connect(dlg.reject)
     dlg.exec()
+    dlg.deleteLater()
     return result[0]
 
 
@@ -75,6 +92,7 @@ def _game_warning(parent, title: str, message: str):
     ok.clicked.connect(dlg.accept)
     lay.addWidget(ok, alignment=Qt.AlignmentFlag.AlignCenter)
     dlg.exec()
+    dlg.deleteLater()
 
 
 class MainWindow(QMainWindow):
@@ -160,13 +178,42 @@ class MainWindow(QMainWindow):
     # ── 갱신 ──────────────────────────────────────
 
     def refresh_all(self):
+        # [2026-08 버그수정, 신민용 리포트: "오퍼든 입단이든 국가대표든
+        # 뭐든 창이 뜨면 흰 작은 창이 깜빡인다"] 국가대표 발탁 다이얼로그는
+        # "닫히기 전에 다음 모달을 또 여는" 중첩 타이밍이 원인이라 그
+        # 지점만 따로 고쳤지만(QTimer.singleShot), 오퍼/입단 등 다른 흐름은
+        # 그 패턴이 아니라 단순히 "다이얼로그가 막 닫힌 직후 refresh_all()
+        # 이 무거운 작업(일정 창 13탭 재구성 등)을 곧바로 동기 실행"하는
+        # 구조였다 — 즉 다이얼로그가 실제로 화면에서 사라지는 페인트
+        # 이벤트가 처리되기도 전에 다음 무거운 작업이 이어져서, 그 동안
+        # OS가 "응답 없음"으로 보고 유령 창을 잠깐 띄우는 것으로 보인다.
+        # refresh_all()은 다이얼로그가 닫힌 뒤 거의 모든 흐름(오퍼 수락/
+        # 입단/국가대표 확정 등)이 공통으로 부르는 지점이라, 여기 맨 앞에서
+        # 한 번 이벤트 루프에 제어권을 돌려주면(processEvents) 밀린 페인트/
+        # 창닫힘 이벤트부터 먼저 처리되고 나서 무거운 갱신이 시작된다 —
+        # 개별 다이얼로그 호출부를 하나하나 찾아 고치는 대신 한 곳에서
+        # 공통으로 막는다. advance_days의 매일/매주 반복 호출(hot path)은
+        # 그대로 두되(성능 이슈로 이미 세심하게 조율된 구간), 여기 진입
+        # 시점의 processEvents() 자체는 대기 이벤트가 없으면 사실상 즉시
+        # 반환되어 그 경로 성능에 미치는 영향은 미미하다.
+        from PyQt6.QtWidgets import QApplication
+        import time as _time_dbg
+        _t0 = _time_dbg.perf_counter()
+        print(f"[GHOST-DEBUG] refresh_all() 진입 {_t0:.3f}")
+        QApplication.processEvents()
+        print(f"[GHOST-DEBUG] processEvents() 완료, 소요 {(_time_dbg.perf_counter()-_t0)*1000:.1f}ms")
+        _t1 = _time_dbg.perf_counter()
         self.refresh_light()
+        print(f"[GHOST-DEBUG] refresh_light() 완료, 소요 {(_time_dbg.perf_counter()-_t1)*1000:.1f}ms")
         # 진행(NEXT DAY) 직후 열려 있는 보조 창들을 함께 갱신한다.
         #   - 순위표 창은 이미 refresh_light()에서 매일 갱신되므로 여기선
         #     일정 창만 추가로 갱신한다(묶음/1주 끝에만 — 13개 탭 동기
         #     렌더링 비용이 있어 매일 부르면 안 됨).
         #   - 창이 닫혔거나 파괴됐으면 조용히 건너뛴다(비용 0).
+        _t2 = _time_dbg.perf_counter()
         self._refresh_aux_window("_schedule_win")
+        print(f"[GHOST-DEBUG] _refresh_aux_window(일정창) 완료, 소요 {(_time_dbg.perf_counter()-_t2)*1000:.1f}ms")
+        print(f"[GHOST-DEBUG] refresh_all() 전체 종료, 총 소요 {(_time_dbg.perf_counter()-_t0)*1000:.1f}ms")
 
     def refresh_light(self):
         """[2026-08 신설, 신민용 리포트: "하루씩 진행이 1주씩보다 더 렉걸린다"]

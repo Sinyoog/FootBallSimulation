@@ -12,7 +12,7 @@ from game_engine import (get_player, get_team_rank, get_team_rank_with_zone_colo
                          is_hard_mode, get_season_all_competition_appearances,
                          _get_season_total_matches)
 from constants import (ALL_STATS, STAT_KO, STAT_EN, _LEGACY_TALENT_ALIAS,
-                       TALENT_TIER_KO, TALENT_TIER_EN)
+                       TALENT_TIER_KO, TALENT_TIER_EN, MANAGER_TYPES)
 
 # [2026-08 수정, 신민용 확정: 9단계 확장] 예전엔 이 파일이 constants.py와
 # 별개로 자기만의 5단계(worldclass~ordinary) 이름 복사본을 들고 있었다 —
@@ -117,6 +117,11 @@ QProgressBar#happyBar::chunk  { background-color: #00aa44; border-radius:3px; }
             background-color: #1c1c1c; border: 1px solid #3a3a3a;
             border-top-right-radius: 4px; border-bottom-right-radius: 4px;
             padding: 4px 6px; }
+/* [2026-08 신설] 감독관계처럼 값칸을 2개(숫자+성향)로 나눠 보여줄 때 —
+   첫 번째 값칸은 오른쪽도 각지게(다음 칸과 맞닿음), 구분선만 얇게. */
+#infoValMid { color: #e0e0e0; font-size: 12px;
+              background-color: #1c1c1c; border: 1px solid #3a3a3a;
+              border-right: 1px solid #2a2a2a; padding: 4px 6px; }
 """
 
 
@@ -489,10 +494,21 @@ class PlayerPanel(QWidget):
         rows.append(("연봉",   "무급" if salary == 0 else
                      f"연 {fmt_money(salary)}  [주 {fmt_money(weekly)}]"))
         rows.append(("총자산", fmt_money(p.get("total_assets",0))))
-        if not _hard:
-            rows.append(("감독관계", str(p.get("manager_relation",50))))
         for k, v in rows:
             self.info_lay.addWidget(_info_row(k, v))
+        # [2026-08 수정, 신민용 리포트: "감독관계 성향 설명 문구가 쓸데없다 +
+        # 팀이 없는데도 감독관계가 표시된다"] 감독 성향은 이름만 표시(desc
+        # 문구 제거)하고, 소속팀이 없으면(current_team_id 없음) 애초에 감독이
+        # 없는 상태이므로 호감도/성향 모두 "-"로 표시한다.
+        _has_team = bool(p.get("current_team_id"))
+        if not _hard:
+            if _has_team:
+                _mt = p.get("manager_type", "베테랑 신뢰")
+                _rel_txt, _mt_txt = str(p.get("manager_relation", 50)), _mt
+            else:
+                _rel_txt, _mt_txt = "-", "-"
+            self.info_lay.addWidget(_info_row_2val(
+                "감독관계", _rel_txt, _mt_txt))
 
         # [2026-08 신설] 시즌 탭 상단 요약(소속팀/리그(몇부)/연봉/감독관계).
         _clear_layout(self.season_top_lay)
@@ -502,8 +518,13 @@ class PlayerPanel(QWidget):
             "연봉", "무급" if salary == 0 else
             f"연 {fmt_money(salary)}  [주 {fmt_money(weekly)}]"))
         if not _hard:
-            self.season_top_lay.addWidget(
-                _info_row("감독관계", str(p.get("manager_relation", 50))))
+            if _has_team:
+                _mt2 = p.get("manager_type", "베테랑 신뢰")
+                _rel2_txt, _mt2_txt = str(p.get("manager_relation", 50)), _mt2
+            else:
+                _rel2_txt, _mt2_txt = "-", "-"
+            self.season_top_lay.addWidget(_info_row_2val(
+                "감독관계", _rel2_txt, _mt2_txt))
 
         # 순위
         # [2026-08 수정, 신민용 요청: "확정 강등권이면 빨간색, 확정
@@ -566,7 +587,15 @@ class PlayerPanel(QWidget):
         # 이번 시즌 리그 전체 일정(league_total) 대비 N/전체(%) 형식으로,
         # 그 옆에 전 대회(컵·챔스·국대 등 포함) 통합 출전 수를 같이 보여준다.
         _league_total = _get_season_total_matches(p.get("current_team_id"))
-        _league_rate = round(sm / _league_total * 100, 1) if _league_total else 0.0
+        # [2026-08 안전장치, 신민용 리포트: "출전이 137%로 뜬다"] 근본 원인은
+        # game_engine._end_of_season의 season_matches 리셋이 함수 뒷부분
+        # 로직 실패 시 통째로 스킵되던 버그였고 그건 별도로 고쳤다(리셋을
+        # 스냅샷 직후로 이동) — 다만 화면 표시 자체도, 승격/강등으로 리그
+        # 팀 수(=분모)가 바뀌는 등의 드문 경계 상황에서 실제 출전(sm)이
+        # 분모를 넘어서더라도 100% 초과로 보이지 않게 표시만 클램프한다
+        # (실제 경기 수 sm/_league_total 값 자체는 그대로 보여줌 — 숨기는
+        # 건 %뿐).
+        _league_rate = min(100.0, round(sm / _league_total * 100, 1)) if _league_total else 0.0
         _all_played, _all_total = get_season_all_competition_appearances(p)
         _appear_text = f"{sm}/{_league_total} ({_league_rate}%) · 총 {_all_played}경기"
 
@@ -664,6 +693,37 @@ def _info_row(key, val):
 
     h.addWidget(kl)
     h.addWidget(vl, 1)   # 값칸이 남는 폭을 모두 차지
+    return w
+
+
+def _info_row_2val(key, val1, val2, ratio=(1, 2)):
+    """[2026-08 신설, 신민용 요청: "감독 호감도 표시하는 상자를 1대2로
+    나눠서 2에 감독의 목표(성향)를 넣는 게 좋을 거 같은데"] _info_row와
+    같은 라벨칸 + 그 옆에 값칸을 2개(좁은 쪽=수치, 넓은 쪽=성향 텍스트)
+    1:2 비율로 배치. 감독관계(숫자)+감독 성향 표시 전용."""
+    w = QFrame()
+    w.setObjectName("infoRow")
+    h = QHBoxLayout(w)
+    h.setContentsMargins(0, 0, 0, 0)
+    h.setSpacing(0)
+
+    kl = QLabel(key)
+    kl.setObjectName("infoKey")
+    kl.setFixedWidth(64)
+    kl.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter)
+
+    vl1 = QLabel(val1)
+    vl1.setObjectName("infoValMid")
+    vl1.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignCenter)
+
+    vl2 = QLabel(val2)
+    vl2.setObjectName("infoVal")
+    vl2.setWordWrap(True)
+    vl2.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+
+    h.addWidget(kl)
+    h.addWidget(vl1, ratio[0])
+    h.addWidget(vl2, ratio[1])
     return w
 
 

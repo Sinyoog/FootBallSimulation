@@ -1,7 +1,7 @@
 """
 database.py - 전체 SQLite 기반. JSON 없음.
 """
-import sqlite3, os, sys, random, time, threading
+import sqlite3, os, sys, random, time, threading, math
 from data.countries import COUNTRY_DATA
 from data.leagues import LEAGUE_DATA
 from data.names import NAME_DATA
@@ -3308,9 +3308,26 @@ def _insert_player_names(c):
 # 많고 GK는 자국 선호), 일부 아시아 리그는 외국인 등록 인원 자체를
 # 제한한다(K리그 등). 월드컵 골든볼처럼 "실제 선수" 기반 국가대표 상을
 # 만들기 위한 선행 작업.
+# [2026-08 재조정, 신민용 확정: "국가급별 해외파 비율표"로 전면 교체]
+# 기존 값은 등급 하나 전체가 한 단계씩 낮게 잡혀 있었다(예: 실측 기준
+# S급이 55% 해외파여야 하는데 기존엔 SS만 55%였고 S는 45%) — 아래
+# 표(기본값=base) 그대로 옮긴다. "권장 범위"는 팀별 자연스러운 변동폭
+# 참고용이라 여기 단일 확률에는 안 넣고, 그 대신 팀마다 실제 굴러가는
+# random() 결과 자체가 이미 자연스러운 편차를 만든다.
+#   국가급   기본 해외파   권장 범위   특징
+#   S        55%          45~70%     세계적인 선수층, 해외 빅리그 진출 활발
+#   A        40%          30~55%     해외파와 자국리그 선수가 혼합
+#   B        30%          20~45%     해외 진출 선수 일부 존재
+#   C        20%          10~30%     대부분 자국/인접국 리그
+#   D        12%          5~20%      해외파가 소수
+#   E        7%           0~15%      대부분 국내리그
+#   F 이하   3%           0~10%      극소수 해외파
+# SS(잉글랜드 단독)는 표에 없는 최상위 등급이라 S(55%)에서 한 단계 더
+# 올려 65%로 잡는다(세계 최고 리그·최고 연봉 — 자국 선수 비중이 오히려
+# S급보다도 낮다는 통념 반영).
 DOMESTIC_PROB_BY_GRADE = {
-    "SS": 0.45, "S": 0.55, "A": 0.70, "B": 0.80,
-    "C": 0.88, "D": 0.93, "E": 0.96, "F": 0.98,
+    "SS": 0.35, "S": 0.45, "A": 0.60, "B": 0.70,
+    "C": 0.80, "D": 0.88, "E": 0.93, "F": 0.97,
 }
 POS_FOREIGN_MULT = {
     # [2026-07 조정, 신민용 지적: "국대 GK 경쟁 풀에 해외파가 있을 수
@@ -3449,7 +3466,7 @@ def get_country_avg_squad_ovr(country, positions=None, min_count=8, top_n=3):
     return sum(sum(g) / len(g) for g in filled) / len(filled)
 
 
-def get_country_squad_players(country, positions=None, min_count=8):
+def get_country_squad_players(country, positions=None, min_count=8, target_ovr=None):
     """[2026-07 신설, 신민용 지적: "8명 미만인 나라는 자국 1부나 남의 나라
     2부에서도 채울 수 있지 않나 — 실제 카보베르데 키퍼가 터키 2부"]
     국적 태그된 선수만으론 소국의 스쿼드가 너무 얇을 수 있어서 3단계로
@@ -3463,38 +3480,106 @@ def get_country_squad_players(country, positions=None, min_count=8):
          2부 이하 리그에서 대륙 우선 → 전체 순으로 채움("해외 하위리그
          진출" 실제 패턴 반영)
     반환: 포지션 슬롯 순서(positions 인자 순서)대로 채워진 선수 dict 리스트
-    (부족하면 그만큼 짧게 반환 — 호출부가 len()으로 판단)."""
+    (부족하면 그만큼 짧게 반환 — 호출부가 len()으로 판단).
+
+    [2026-08 버그수정, 신민용 리포트: "베트남 대표팀인데 뜨는 선수가
+    베트남인이 아닌 것 같다 + 개인 OVR은 77~84인데 팀 평균은 44로 뜬다"]
+    3)단계(해외 하위리그 대타)가 RANDOM()으로 아무나 뽑다 보니, 그 나라의
+    실제 계산된 대표팀 평균 실력(target_ovr)과 완전히 동떨어진 선수가
+    태연히 섞여 들어갔다 — 이 나라 대표팀이 왜 갑자기 유럽 톱리그급
+    선수를 보유하는지 설명이 안 되는 상황. target_ovr을 주면 이 두
+    폭넓은 대타 단계(3·4)는 무작위 대신 target_ovr에 가장 가까운 OVR
+    선수부터 채운다 — 어차피 국적 태그가 없는 임시 대타이므로, 최소한
+    "이 나라 대표팀 평균 실력과 비슷한 선수"로 골라야 화면에 뜨는 개인
+    OVR과 팀 평균이 말이 된다.
+
+    [2026-08 버그수정, 신민용 리포트: "리그 선수들은 스탯이 들쭉날쭉한데
+    국제대회 선수는 체력/스피드/슈팅 전부 89로 똑같이 뜬다 — 국제대회용
+    가상 선수를 새로 만든 것 같다"] 실제로는 가상 생성이 아니라 이
+    함수의 SELECT 자체가 개별 스탯 컬럼을 안 가져오고 ovr 하나만 가져온
+    게 원인이었다 — 호출부(_make_intl_real_players 등)가 부족한 나머지
+    스탯을 전부 ovr 값으로 채워 넣다 보니 "모든 스탯이 OVR과 똑같은"
+    부자연스러운 선수가 됐다. ai_players의 실제 개별 스탯 컬럼을 전부
+    SELECT하도록 고쳤다 — 이제 이 함수가 반환하는 선수는 진짜 그
+    선수의 스탯(체력/스피드/슈팅 등 제각각)을 그대로 갖고 있다. 겸사겸사
+    소속팀의 국가/tier도 같이 가져와("몇부" 표시용) 호출부가 추가 조회
+    없이 쓸 수 있게 했다.
+
+    [2026-08 신설, 신민용 요청: "OVR 50인 나라가 있으면 최대는 60~70이
+    맞다 — 잉글랜드 1부에 베트남 선수가 있을 순 있지만, 자국 축구 수준에
+    따라 진출 가능한 리그 수준도 나뉜다. 실제로 지금 빅5 등 메이저 1부
+    주전엔 베트남 국적 선수가 없다"] 지금까지 target_ovr 매칭은
+    3·4단계(국적 태그 없는 해외 대타)에만 적용됐고, 1·2단계(진짜 국적
+    태그된 선수/자국 리그 선수)는 그냥 "가장 높은 OVR"을 무조건 뽑았다
+    — 그래서 베트남 국적 태그가 우연히 EPL급 팀에서 생성됐다면(국적은
+    전 세계 어디서든 무작위 배정되므로 이론상 가능), 국대 선발에서 그
+    비현실적인 값을 그대로 최우선으로 뽑아버렸다. 이제 target_ovr이
+    주어지면 모든 단계에 공통으로 "target_ovr + 18"을 상한으로 건다 —
+    그 나라 대표팀 평균보다 최대 18 위까지만 허용한다는 뜻. +18은 "이
+    나라 에이스가 평균보다 눈에 띄게 강할 수 있다"는 여지는 남기면서
+    (튀르키예 1부에서 뛰는 핵심 대한민국 선수 같은 케이스), OVR 50짜리
+    나라에 90대 선수가 뽑히는 극단치는 막는다. 국적 태그된 선수(1단계)가
+    이 상한에 걸려 밀려나면, 그 선수는 그냥 그 나라 대표팀에 못 들어가는
+    것으로 처리된다(실제로도 국가대표 발탁은 국적만으로 보장되지
+    않는다)."""
     positions = positions or ["GK", "CB", "CB", "LB", "RB", "CDM", "CM", "CAM", "LW", "RW", "ST"]
     conn = get_conn()
     slots = [None] * len(positions)
     used_ids: set = set()
+    _stat_cols = ",".join(f"ap.{s}" for s in ALL_STATS)
+    _OVR_CAP_MARGIN = 18
+    _ovr_cap = round(target_ovr) + _OVR_CAP_MARGIN if target_ovr is not None else None
 
-    def _fill(where_sql, params, randomize=False):
+    def _fill(where_sql, params, randomize=False, match_ovr=False, cap=True):
         for i, pos in enumerate(positions):
             if slots[i] is not None:
                 continue
             ph = ",".join(str(x) for x in used_ids) or "0"
-            order_by = "RANDOM()" if randomize else "ap.ovr DESC"
+            _cap = _ovr_cap if cap else None
+            cap_sql = " AND ap.ovr<=?" if _cap is not None else ""
+            cap_params = (_cap,) if _cap is not None else ()
+            if match_ovr and target_ovr is not None:
+                order_by = "ABS(ap.ovr - ?) ASC"
+                order_params = (target_ovr,)
+            elif randomize:
+                order_by = "RANDOM()"
+                order_params = ()
+            else:
+                order_by = "ap.ovr DESC"
+                order_params = ()
             row = conn.execute(
-                f"""SELECT ap.id, ap.name, ap.position, ap.ovr, t.name AS club
+                f"""SELECT ap.id, ap.name, ap.position, ap.ovr, ap.age, {_stat_cols},
+                           t.name AS club, t.current_tier AS club_tier, cn.name AS club_country
                     FROM ai_players ap JOIN teams t ON ap.team_id=t.id
                     JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
-                    WHERE {where_sql} AND ap.position=? AND ap.id NOT IN ({ph})
+                    WHERE {where_sql} AND ap.position=? AND ap.id NOT IN ({ph}){cap_sql}
                     ORDER BY {order_by} LIMIT 1""",
-                (*params, pos)).fetchone()
+                (*params, pos, *cap_params, *order_params)).fetchone()
             if row:
                 slots[i] = dict(row)
                 used_ids.add(row["id"])
 
+    # [2026-08 버그수정, 신민용 리포트: "국대 화면에서 후보가 나라마다
+    # 6명/9명/11명/0명으로 들쭉날쭉하고, 심지어 가상 선수로 통째로
+    # 대체될 때가 있다 — 1부 리그 하나만 해도 최소 88명은 있을 텐데"]
+    # 위 target_ovr+18 상한을 모든 단계에 무조건 걸었던 게 원인이었다 —
+    # 특히 2단계(cn.name=?, "이 나라 자국 리그 소속 선수 전체")는 애초에
+    # 그 나라 리그 등급/tier로 이미 적절한 OVR 범위에서 생성된 선수들이라
+    # 이 상한이 또 걸릴 이유가 없는데, 걸려 있다 보니 후보 12자리(특히
+    # GK가 2번 나오는 등 포지션이 겹치는 자리)를 채울 만큼 남은 후보가
+    # 자주 부족해졌다. 이제 2단계는 상한 없이(cap=False) 그 나라 리그
+    # 전체를 그대로 쓴다 — 1단계(국적 태그, 세계 어디서든 뛸 수 있어
+    # 상한이 필요)와 3·4단계(국적 무관 해외 대타, match_ovr로 이미 근접
+    # 매칭 중이라 상한은 안전장치 역할만)는 그대로 상한을 유지한다.
     _fill("ap.nationality=?", (country,))
     if sum(1 for s in slots if s) < min_count:
-        _fill("cn.name=?", (country,))
+        _fill("cn.name=?", (country,), cap=False)
     if sum(1 for s in slots if s) < min_count:
         _init_nationality_tables()
         cont = _COUNTRY_CONTINENT.get(country, "")
-        _fill("t.current_tier>=2 AND cn.continent=? AND cn.name!=?", (cont, country), randomize=True)
+        _fill("t.current_tier>=2 AND cn.continent=? AND cn.name!=?", (cont, country), match_ovr=True)
     if sum(1 for s in slots if s) < min_count:
-        _fill("t.current_tier>=2 AND cn.name!=?", (country,), randomize=True)
+        _fill("t.current_tier>=2 AND cn.name!=?", (country,), match_ovr=True)
     conn.close()
     return [s for s in slots if s]
 
@@ -3512,14 +3597,143 @@ def _init_nationality_tables():
         _CONTINENT_COUNTRIES[cont] = lst
 
 
-def _weighted_country_pick(candidates):
+_GRADE_TIER = {"F": 0, "E": 1, "D": 2, "C": 3, "B": 4, "A": 5, "S": 6, "SS": 7}
+
+# [2026-08 재조정, GPT 리뷰 반영] 등급 gap 하나만으로 국적을 결정하면
+# "비슷한 수준 국가끼리만 이동"이 되어 브라질처럼 전 세계에 고르게
+# 퍼지는 실제 축구 이적 패턴(CIES 자료 기준 브라질이 세계에서 가장
+# 폭넓게 선수를 수출하는 국가)을 못 담는다는 지적을 받아 두 가지를
+# 추가한다.
+#   1) EXPORTER_STRENGTH — "이 나라는 자국 등급과 무관하게 전 세계로
+#      선수를 폭넓게 내보낸다"는 특성을 가진 소수 국가에 가중치 보너스.
+#      실측 기반 정밀 마이그레이션 매트릭스(국가쌍 200x200)까지는 안
+#      가고, 잘 알려진 "축구 수출국" 몇 곳만 손으로 올렸다 — 나머지는
+#      기존 등급-근접 로직 그대로.
+#   2) level_fit(구 exp(-gap/1.5))의 감쇠를 완화(1.5→2.5)하고 바닥값을
+#      둬서(최소 0.10) "드물다"가 "존재하지 않는다"로 굳어지지 않게 한다.
+EXPORTER_STRENGTH = {
+    "브라질": 2.5, "아르헨티나": 1.8, "나이지리아": 1.6, "세네갈": 1.5,
+    "가나": 1.4, "코트디부아르": 1.4, "카메룬": 1.4, "크로아티아": 1.5,
+    "세르비아": 1.4, "우루과이": 1.6, "콜롬비아": 1.4, "모로코": 1.6,
+    # [2026-08 추가, GPT 리뷰: "잉글랜드/독일처럼 랭크는 높은데 실제로는
+    # 자국 리그에 대표팀 선수 대부분이 남는 나라를 별도로 눌러줘야 한다"]
+    # 지금까지 EXPORTER_STRENGTH는 "보너스"만 있어서, 랭크가 높은데도
+    # 실제 해외 진출은 적은 나라(잉글랜드·독일 등)가 다른 나라 로스터의
+    # "외국인 슬롯" 후보로 뽑힐 때 순전히 랭크 가중치(1/(rank+5))만으로
+    # 과대 대표됐다 — 잉글랜드 국대는 실제로 거의 EPL/EFL에만 남아있는데,
+    # 시스템상으론 랭크 상위라 아무 나라 외국인 슬롯에나 자주 등장할 수
+    # 있었다. 1.0 미만 값으로 "이 나라는 랭크에 비해 해외로 잘 안
+    # 나간다"를 표현한다 — 폴란드/스위스처럼 반대로 유독 많이 나가는
+    # 나라는 그대로 1.0 초과 보너스를 준다.
+    "잉글랜드": 0.3, "독일": 0.5, "스페인": 0.6, "이탈리아": 0.6,
+    "스위스": 1.6, "폴란드": 1.4,
+}
+
+# [2026-08 참고, GPT가 제안한 "90개국×5단계 목적지리그 티어 비율표"는
+# 채택하지 않음 — 이유: (1) 이미 target_ovr 매칭으로 "어느 나라의 몇 부에
+# 있는가"가 선수 개인 OVR을 통해 자동으로 반영된다(잉글랜드 2부에서
+# 생성된 선수는 이미 2부 수준 스탯을 가지므로, 그 OVR이 한국 대표팀
+# 목표치와 가까울 때만 자연히 뽑힌다 — 별도 "몇 부 확률" 테이블이
+# 필요 없다). (2) 국가 90개 × 목적지별 세분 비율을 손으로 다 채우는 건
+# 앞서 합의한 "MIGRATION_TIE_BONUS를 무작정 늘리지 않는다" 원칙과
+# 정면으로 배치되고, 결국 처음에 보류했던 200×200 매트릭스의 축소판이
+# 된다. 대신 이미 있는 세 다이얼(EXPORTER_STRENGTH/MIGRATION_TIE_BONUS/
+# CONTINENT_SAME_PROB)로 같은 효과의 상당 부분을 훨씬 적은 데이터로
+# 낸다는 원칙을 유지한다.
+
+# [2026-08 신설, 실측 검증 후 추가] 위 EXPORTER_STRENGTH(국가 단위 배율)만
+# 있으면 "브라질은 어디서나 조금씩 보인다"는 되지만, 언어/식민지 관계로
+# 유독 강하게 묶인 특정 목적지-출신 "경로"는 여전히 못 담는다 — 실측
+# 시뮬레이션(200팀×18명)에서 포르투갈 팀의 해외 국적 상위 6개국에
+# 브라질이 아예 안 들어간 게(0.58%) 대표적 사례. 브라질→포르투갈은
+# CIES 등에서 반복적으로 확인되는 대표적 이적 경로라 이 결과는 명백히
+# 비현실적이다. 국가쌍 200×200 전체 매트릭스(GPT가 제안했던 안)까지는
+# 안 가고, 언어/식민지 관계로 특히 잘 알려진 경로 소수만 손으로 등록—
+# (목적지, 출신) 튜플 키, EXPORTER_STRENGTH와 별개로 추가 곱해진다.
+MIGRATION_TIE_BONUS = {
+    ("포르투갈", "브라질"): 3.0, ("포르투갈", "앙골라"): 1.8,
+    ("포르투갈", "카보베르데"): 1.8, ("포르투갈", "모잠비크"): 1.6,
+    ("스페인", "아르헨티나"): 2.0, ("스페인", "콜롬비아"): 1.6,
+    ("스페인", "멕시코"): 1.5, ("스페인", "우루과이"): 1.6,
+    ("프랑스", "세네갈"): 1.8, ("프랑스", "코트디부아르"): 1.8,
+    ("프랑스", "카메룬"): 1.6, ("프랑스", "알제리"): 1.8, ("프랑스", "모로코"): 1.6,
+    ("잉글랜드", "나이지리아"): 1.5, ("잉글랜드", "가나"): 1.4,
+    ("이탈리아", "알바니아"): 1.5,
+    ("네덜란드", "수리남"): 2.0,
+    # [2026-08 신설, 신민용 지적: "대한민국 국대 중 5대리그는 적어도
+    # 튀르키예 1부 같은 데서 뛰는 경우가 있고, 그 선수들은 대표팀 핵심
+    # 주전급이지 아무나가 아니다"] 실제로 손흥민 이전에도 이을용·박지성
+    # 이후 세대에서 한국 선수의 튀르키예 진출 사례가 꾸준했다 — Korea가
+    # EXPORTER_STRENGTH에 오를 만큼 전 세계적으로 폭넓게 퍼지는 수준은
+    # 아니지만, 튀르키예라는 특정 목적지와는 유독 잘 연결된다는 점만
+    # 별도로 반영한다. 참고로 이 선수의 "핵심 주전급" 실력 문제는 여기
+    # (어느 나라 출신인가) 소관이 아니라 get_country_squad_players의
+    # 국가대표 스쿼드 선발 로직(포지션당 OVR 최고 선수 선택, 어디서
+    # 뛰든 상관없이 이미 그렇게 되어 있음) 쪽에서 자연히 해결된다 — 여기
+    # 튀르키예 항목은 "그런 선수가 등장할 확률"만 올려준다.
+    ("튀르키예", "대한민국"): 1.8,
+}
+
+def _weighted_country_pick(candidates, dest_grade=None, dest_country=None):
     """[(나라, fifa_rank), ...] 중 랭크가 좋을수록(숫자가 작을수록) 더 잘
-    뽑히게 가중 추첨. 후보가 비어있으면 None."""
+    뽑히게 가중 추첨. 후보가 비어있으면 None.
+
+    [2026-08 버그수정, 신민용 리포트: "B등급 국가 선수가 해외파로 나가도
+    B 이하 리그가 대부분이어야 하는데, 지금은 목적지 리그 등급과 무관하게
+    전세계에서 랭크 가중 추첨하니까 최약체 리그에도 브라질/프랑스 국적
+    선수가 태연히 섞여 들어간다 — 반대로 최상위 리그에 하위권 국가 선수만
+    잔뜩 있는 것도 이상하다"] dest_grade(목적지 팀 등급)를 주면, 후보의
+    자체 등급이 목적지 등급과 가까울수록 가중치를 살리고 멀수록 깎는다.
+    dest_grade를 안 주면(스타 슬롯 등 "그 나라의 예외적으로 뛰어난 수출
+    자원" 개념) 예전처럼 순수 랭크 가중만 쓴다.
+
+    [2026-08 재조정, GPT 리뷰: "gap 하나로는 브라질처럼 전 세계에 고르게
+    퍼지는 실제 이적 패턴을 못 담는다 + 감쇠(1.5)가 너무 강해서 gap
+    2~3만 돼도 사실상 배제 수준이 된다"] 두 가지 반영:
+      - 감쇠 상수를 1.5→2.5로 완화하고 최소 가중치를 0.10으로 바닥을
+        둔다(같은 등급 1.00, 1단계 0.67, 2단계 0.45, 3단계 0.30,
+        4단계+ 0.10대까지만 떨어짐 — "드물다"와 "아예 없다"를 구분).
+      - EXPORTER_STRENGTH에 등록된 나라는 gap 감쇠 적용 후에 추가
+        배율을 곱한다 — 등급 격차가 있어도 브라질 같은 나라는 여전히
+        상대적으로 자주 뽑힌다.
+      - dest_country를 주면 MIGRATION_TIE_BONUS(언어/식민지 특정 경로)도
+        추가로 곱한다."""
     if not candidates:
         return None
-    weights = [1.0 / (rank + 5) for _, rank in candidates]
+    if dest_grade is not None:
+        dest_tier = _GRADE_TIER.get(dest_grade, 3)
+        weights = []
+        for n, rank in candidates:
+            cand_tier = _GRADE_TIER.get(_grade_from_rank(rank), 3)
+            gap = abs(dest_tier - cand_tier)
+            level_fit = max(0.10, math.exp(-gap / 2.5))
+            tie = MIGRATION_TIE_BONUS.get((dest_country, n), 1.0)
+            weights.append((1.0 / (rank + 5)) * level_fit * EXPORTER_STRENGTH.get(n, 1.0) * tie)
+    else:
+        weights = [(1.0 / (rank + 5)) * EXPORTER_STRENGTH.get(n, 1.0) for n, rank in candidates]
     return random.choices([n for n, _ in candidates], weights=weights, k=1)[0]
 
+
+# [2026-08 신설, GPT 리뷰: "대륙 내 70% / 대륙 간 30% 고정은 현실보다
+# 단순하다 — 유럽은 대륙 내 이동이 압도적으로 강하고, 아프리카는 반대로
+# 대륙 간(주로 유럽행) 이동이 대륙 내 이동보다 흔하다"] 대륙별로 다른
+# 기본값을 준다. 실측 통계로 정밀 검증한 값은 아니고(CIES 자료 기반
+# 방향성만 참고한 시작점), 나중에 더 다듬을 여지가 있다는 전제로 우선
+# 반영한다 — 표에 없는 대륙은 기존 70%로 폴백.
+CONTINENT_SAME_PROB = {
+    "유럽": 0.80, "남미": 0.75, "아시아": 0.65,
+    "아프리카": 0.45, "북미": 0.65, "오세아니아": 0.40,
+}
+
+# [2026-08 신설, GPT 리뷰: "하위 리그 스타 슬롯까지 세계 최상급 인재를
+# 60% 확률로 뽑으면 하위권 리그가 금방 비현실적으로 강해진다"] 스타
+# 슬롯(전 세계 무관 랭크 가중 추첨) 발동 확률을 목적지 등급별로 나눈다
+# — 상위 리그일수록 "세계 각지 특급 자원"이 실제로도 더 흔하고, 하위
+# 리그일수록 그런 스타가 드물어야 한다는 방향.
+STAR_PROB_BY_DEST_GRADE = {
+    "SS": 0.75, "S": 0.65, "A": 0.50, "B": 0.35,
+    "C": 0.25, "D": 0.15, "E": 0.10, "F": 0.05,
+}
 
 def _pick_nationality(team_country, team_continent, grade, pos, is_star, foreign_count, quota):
     """이 슬롯의 국적을 정한다. 반환: (nationality, new_foreign_count)."""
@@ -3539,19 +3753,21 @@ def _pick_nationality(team_country, team_continent, grade, pos, is_star, foreign
     # 고정 목록 대신 전세계 국가를 피파랭킹 가중 추첨한다 — 강국(랭크
     # 1~9위)은 가중치가 압도적으로 높아 여전히 대부분의 스타 해외파를
     # 차지하지만, 그 외 나라도 실력(랭크)에 비례한 실질적 확률을 갖는다.
-    if is_star and random.random() < 0.6:
+    if is_star and random.random() < STAR_PROB_BY_DEST_GRADE.get(grade, 0.6):
         cand = [(n, r) for n, r in _ALL_COUNTRIES_BY_RANK if n != team_country]
         nat = _weighted_country_pick(cand) or team_country
         return nat, foreign_count + 1
 
-    if random.random() < 0.7:
-        # 같은 대륙 다른 나라 (FIFA랭크 가중)
+    same_prob = CONTINENT_SAME_PROB.get(team_continent, 0.7)
+    if random.random() < same_prob:
+        # 같은 대륙 다른 나라 (FIFA랭크 가중 + 목적지 등급 근접 가중)
         pool = [(n, r) for n, r in _CONTINENT_COUNTRIES.get(team_continent, []) if n != team_country]
     else:
-        # 다른 대륙 (FIFA랭크 가중, "축구 수출국" 위주로 자연스럽게 쏠림)
+        # 다른 대륙 (FIFA랭크 가중 + 목적지 등급 근접 가중, "축구 수출국"
+        # 위주로 자연스럽게 쏠리되 목적지 등급과 너무 동떨어진 나라는 배제)
         pool = [(n, r) for cont, lst in _CONTINENT_COUNTRIES.items() if cont != team_continent
                 for n, r in lst]
-    nat = _weighted_country_pick(pool) or team_country
+    nat = _weighted_country_pick(pool, dest_grade=grade, dest_country=team_country) or team_country
     return nat, foreign_count + 1
 
 
@@ -3566,7 +3782,34 @@ def _pick_nationality(team_country, team_continent, grade, pos, is_star, foreign
 # 공격수 2명)를 따름 — DF는 CB+RB, MF는 CM+CAM, FW는 ST+LW로 분산.
 TEAM_STARTER_COUNT = 11
 TEAM_POSITIONS = ["GK","CB","CB","LB","RB","CDM","CM","CAM","LW","RW","ST",
-                   "GK","CB","RB","CM","CAM","ST","LW"]
+                   "GK","GK","CB","LB","RB","CB","CDM","CM","CAM","ST","LW","RW"]
+
+# [2026-08 신설, 신민용 리포트: "리그에서 아군 후보는 7명인데 적 후보는
+# 8명이야 — 후보가 팀마다 다른데, 최소 GK2/DF3/MF3/FW3(11명)~최대
+# GK2/DF4/MF4/FW4(14명)로 맞춰줘"] 예전엔 모든 팀이 TEAM_POSITIONS
+# 하나(주전11+고정 벤치7)를 그대로 썼다 — 그러다 시즌이 지나 이적으로
+# 팀별 인원이 15~22명 사이에서 자연스럽게 벌어지면서(이전에 합의한
+# 스쿼드 크기 안전망) "몇 명이 후보인가"도 팀마다 들쭉날쭉해졌다. 이제
+# 팀 생성 시점부터 벤치를 포지션 그룹별(GK 고정 2 / DF·MF·FW 각
+# 3~4 무작위)로 만들어 벤치가 항상 11~14명, 총 스쿼드 22~25명이 되도록
+# 한다 — 팀마다 벤치 "숫자"는 자연스럽게 다르되(11~14 사이), 포지션
+# 구성비는 항상 이 틀을 지킨다.
+_BENCH_DF_POOL = ["CB", "LB", "RB"]
+_BENCH_MF_POOL = ["CDM", "CM", "CAM"]
+_BENCH_FW_POOL = ["ST", "LW", "RW"]
+
+def _build_squad_positions():
+    """팀 하나의 포지션 목록(주전 11 + 벤치 11~14)을 새로 만든다. 주전은
+    기존 4-4-2 기준 그대로(스타 슬롯/역할 배정 로직이 이 순서에 의존),
+    벤치만 매 호출마다 무작위로 GK2 + DF(3~4) + MF(3~4) + FW(3~4)를
+    뽑는다."""
+    starters = ["GK", "CB", "CB", "LB", "RB", "CDM", "CM", "CAM", "LW", "RW", "ST"]
+    bench = ["GK", "GK"]
+    bench += [random.choice(_BENCH_DF_POOL) for _ in range(random.randint(3, 4))]
+    bench += [random.choice(_BENCH_MF_POOL) for _ in range(random.randint(3, 4))]
+    bench += [random.choice(_BENCH_FW_POOL) for _ in range(random.randint(3, 4))]
+    return starters + bench
+
 KEY_STATS_BY_POS = {
     "GK":  ["positioning","concentration","mental","jump","stamina"],
     "CB":  ["tackling","heading","jump","positioning","concentration"],
@@ -4174,7 +4417,7 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
     # 치르게 된다. 삽입되는 데이터·순서·트랜잭션 범위는 기존과 완전히 동일.
     _rows = []
 
-    for idx, pos in enumerate(TEAM_POSITIONS):
+    for idx, pos in enumerate(_build_squad_positions()):
         # 리그 전체에서 아직 안 쓴 이름 우선 사용
         available = [n for n in name_pool if n not in league_used]
         if not available:

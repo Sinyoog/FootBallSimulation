@@ -9455,6 +9455,40 @@ def _end_of_season(p, year, progress_cb=None):
     _prior_season_rating_sum = p.get("season_rating_sum", 0.0)
     _prior_season_rating_cnt = p.get("season_rating_cnt", 0)
 
+    # [2026-08 버그수정, 신민용 리포트: "이번 시즌 출전이 시작부터 22로
+    # 뜨고 나중엔 137%까지 간다"] 원인 추적 결과 — season_* 리셋이 이
+    # 함수 훨씬 뒤쪽(성장/노화/시상/방출·임대 판정이 전부 끝난 뒤)의
+    # stat_updates 딕셔너리에 얹혀서 딱 한 번, 함수 끝자락에서만
+    # commit됐다. 그 사이에 있는 로직(개인수상 _process_awards, 자연
+    # 성장 update_player 등) 중 하나라도 예외를 던지면 그 아래 코드가
+    # 전부 건너뛰어지면서 season_matches=0 리셋 자체가 DB에 반영되지
+    # 않고 그대로 "지난 시즌 다 뛴 총 경기수"(예: 22)가 새 시즌까지
+    # 이월된다 — 그 위에 새 시즌 경기가 계속 더해지니 곧 분모(그
+    # 시즌의 리그 전체 경기수)를 넘어서 100%를 초과하는 출전율이 뜬다.
+    # season_matches 등은 위에서 이미 _prior_*로 스냅샷을 떠뒀으므로
+    # (아래 성장 판정 등은 여전히 p 딕셔너리의 원래 값을 그대로 읽는다
+    # — update_player()는 DB만 갱신하고 이 함수의 p 지역변수는 안
+    # 건드림), 그 어떤 뒤쪽 로직이 실패하더라도 최소한 이 리셋만은
+    # 반드시 DB에 남도록 스냅샷 직후 독립적으로 즉시 commit한다.
+    # (award_*는 1.5단계 개인수상 산정이 이 값을 읽은 뒤에만 리셋해야
+    # 하므로 그대로 아래 4번 자리에 남겨둔다.)
+    update_player(season_matches=0, season_goals=0, season_assists=0,
+                  season_saves=0, season_rating_sum=0, season_rating_cnt=0,
+                  season_goals_against=0,
+                  season_shots=0, season_shots_on=0, season_key_passes=0,
+                  season_dribbles=0, season_blocks=0,
+                  season_pass_acc_sum=0, season_pass_acc_cnt=0,
+                  season_red_cards_league=0,
+                  season_yellow_league=0, season_yellow_cup=0,
+                  season_yellow_europe=0, season_yellow_super_cup=0,
+                  season_yellow_cwc=0, season_yellow_po=0,
+                  yellow_susp_progress_league=0, yellow_susp_progress_cup=0,
+                  yellow_susp_progress_europe=0, yellow_susp_progress_super_cup=0,
+                  yellow_susp_progress_cwc=0, yellow_susp_progress_po=0,
+                  season_injury_matches_missed=0,
+                  season_suspension_matches_missed=0,
+                  season_bench_matches_missed=0)
+
     # [귀화] 거주 연수 갱신 + 귀화 자격 체크. 이 함수 진입 시점엔 current_team_id가
     #   아직 살아있다(아래 계약만료 처리 전). next_year 기준으로 판정.
     _update_residency_and_naturalization(year + 1)
@@ -9638,31 +9672,11 @@ def _end_of_season(p, year, progress_cb=None):
     # season_*와 달리 여기(진짜 시즌 종료 시점, 1.5단계 개인수상 산정이
     # 이미 끝난 뒤)에서만 초기화한다 — join_team()의 이적 리셋 코드는
     # 일부러 이 필드들을 건드리지 않는다.
-    stat_updates.update(season_matches=0, season_goals=0, season_assists=0,
-                        season_saves=0, season_rating_sum=0, season_rating_cnt=0,
-                        season_goals_against=0,
-                        season_shots=0, season_shots_on=0, season_key_passes=0,
-                        season_dribbles=0, season_blocks=0,
-                        season_pass_acc_sum=0, season_pass_acc_cnt=0,
-                        season_red_cards_league=0,
-                        # [2026-08 신설, 옐로카드 시스템] 클럽 계열 카드
-                        # 누적 그룹(리그/국내컵/유럽대항전/슈퍼컵/클럽월드컵/
-                        # 승강PO)은 매 시즌 리셋 — red_cards와 동일 시점.
-                        # 국가대표 계열(wc_qual/intl)은 여기서 건드리지
-                        # 않는다(대회 사이클 기준 리셋이라 별도 훅 사용).
-                        season_yellow_league=0, season_yellow_cup=0,
-                        season_yellow_europe=0, season_yellow_super_cup=0,
-                        season_yellow_cwc=0, season_yellow_po=0,
-                        # [2026-08 버그수정과 함께 추가] 징계진행 카운터도
-                        # 같은 시즌 리셋 지점에 맞춰 같이 0으로 — 새 시즌은
-                        # 5장 문턱도 처음부터 다시 세는 게 맞다.
-                        yellow_susp_progress_league=0, yellow_susp_progress_cup=0,
-                        yellow_susp_progress_europe=0, yellow_susp_progress_super_cup=0,
-                        yellow_susp_progress_cwc=0, yellow_susp_progress_po=0,
-                        season_injury_matches_missed=0,
-                        season_suspension_matches_missed=0,
-                        season_bench_matches_missed=0,
-                        award_matches=0, award_goals=0, award_assists=0,
+    # [2026-08 수정] season_*(출전/골/카드 등) 리셋은 더 이상 여기서 하지
+    # 않는다 — 위쪽(개인수상·성장·노화보다 먼저) 스냅샷 직후로 옮겨서,
+    # 이 사이 로직이 예외를 던져도 season_matches 리셋만은 항상 반영되게
+    # 했다(자세한 이유는 그 위치의 주석 참고). award_*만 그대로 여기 둔다.
+    stat_updates.update(award_matches=0, award_goals=0, award_assists=0,
                         award_saves=0, award_goals_against=0,
                         award_rating_sum=0, award_rating_cnt=0)
     update_player(**stat_updates)
@@ -9703,7 +9717,8 @@ def _end_of_season(p, year, progress_cb=None):
     _tp1 = _time_perf2.perf_counter()
     try:
         from ai_lifecycle import run_ai_offseason
-        run_ai_offseason(year, verbose_log=add_log, progress_cb=progress_cb)
+        run_ai_offseason(year, verbose_log=add_log, progress_cb=progress_cb,
+                         my_team_id=p.get("current_team_id"))
     except Exception as _e:
         add_log(f"⚠ 이적시장 처리 중 오류: {_e}", "event", year, 52)
     if DEBUG_RELEGATION_TRACKING:

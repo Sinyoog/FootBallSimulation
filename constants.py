@@ -4631,3 +4631,26 @@ def format_result_with_absence(m: dict) -> str:
     곳에서만 결과 문자열을 순수하게 반환하도록 바꿨다 — absence_reason은
     더 이상 표시에 쓰지 않는다."""
     return m.get("result", "")
+
+# ══════════════════════════════════════════════════════════════
+# [2026-08 신설, 신민용 리포트: "포메이션엔 AI 73QU로 뜨는데 이적 로그엔
+# AI (331454)로 따로 뜬다"] AI 선수 표시 코드 — ai_players.id(전세계
+# 유일 PK)를 4자리 36진수(0-9,A-Z)로 바꿔 "AI"+4자(항상 정확히 6자)
+# 형식으로 만든다. 예전엔 이 변환이 ui/formation_widget.py 안에만 있어서
+# (포메이션 화면 전용), 세이브 전체 기간에 걸친 영구 기록인 이적
+# 로그(ai_lifecycle.py)는 "AI (id)"라는 별도 형식을 썼다 — 같은 선수인데
+# 화면마다 표시가 달라 헷갈렸다. 여기 하나로 합쳐서 두 곳이 똑같은 코드를
+# 쓰게 한다(36**4 = 1,679,616명까지 절대 안 겹침).
+# ══════════════════════════════════════════════════════════════
+_AI_CODE_DIGITS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+def ai_player_code(pid) -> str:
+    """ai_players.id → "AI"+4자리 36진수 코드(항상 정확히 6자). pid가
+    없거나 음수(가상/폴백 선수)면 "AI0000"."""
+    if pid is None or pid < 0:
+        return "AI0000"
+    n = int(pid); out = []
+    for _ in range(4):
+        n, r = divmod(n, 36)
+        out.append(_AI_CODE_DIGITS[r])
+    return "AI" + "".join(reversed(out))
