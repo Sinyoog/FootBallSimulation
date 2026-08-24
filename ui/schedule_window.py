@@ -242,6 +242,16 @@ class ScheduleWindow(QDialog):
 
         self._tab = QTabWidget()
         self._root.addWidget(self._tab)
+        # [2026-08 신설, 신민용 요청: "내가 참여 안 하는 경기까지 뜰 때
+        # 렉이 있는데, 이거 없애면 버퍼링이 줄어들까"] "전체 일정"/
+        # "컵대회(전체 일정)" 탭은 그 리그·컵대회 전체 경기(수백 건)를
+        # 담는 유일한 탭들이라 매번 다시 그리는 비용이 가장 크다(PERF-SCHED
+        # 계측으로 확인됨) — 그렇다고 정보 자체를 없애면 라이벌 팀 결과
+        # 확인 같은 실사용 가치가 사라지므로, "지금 안 보고 있으면 안
+        # 그린다"는 지연 로딩으로 바꾼다(world_browser_window.py의
+        # _lazy_tabs와 동일 패턴). 탭을 실제로 클릭하는 순간에만 빌드.
+        self._sched_lazy_builders = {}
+        self._tab.currentChanged.connect(self._lazy_show_sched_tab)
         self._fill_tabs()
 
         btn = QPushButton("닫기"); btn.clicked.connect(self.close)
@@ -344,6 +354,7 @@ class ScheduleWindow(QDialog):
         self._champ_fetch_cache = {}
 
         cur = self._tab.currentIndex()
+        cur_label = self._tab.tabText(cur) if 0 <= cur < self._tab.count() else None
 
         from PyQt6.QtWidgets import QAbstractScrollArea
         scroll_pos = {}
@@ -354,10 +365,16 @@ class ScheduleWindow(QDialog):
             if sa:
                 scroll_pos[i] = sa.verticalScrollBar().value()
 
+        # [2026-08 신설] 탭을 지우고 다시 채우는 동안 currentChanged가
+        # 매번 튀면 _lazy_show_sched_tab이 지금 재구성 중인(아직 유효하지
+        # 않은) 인덱스를 붙잡고 오작동할 수 있다 — 재구성이 끝날 때까지
+        # 시그널을 막아둔다.
+        self._tab.blockSignals(True)
         while self._tab.count():
             w = self._tab.widget(0)
             self._tab.removeTab(0)
             if w: w.deleteLater()
+        self._sched_lazy_builders = {}
 
         all_data = get_schedule(self.league_id, self.season)
         my_data  = [r for r in all_data
@@ -365,7 +382,12 @@ class ScheduleWindow(QDialog):
         _sw_marks.append(("get_schedule", _time_sw.perf_counter()))
 
         self._tab.addTab(self._make_table(my_data, my_view=True),  "내 경기")
-        self._tab.addTab(self._make_table(all_data, my_view=False), "전체 일정")
+        if cur_label == "전체 일정":
+            self._tab.addTab(self._make_table(all_data, my_view=False), "전체 일정")
+        else:
+            _idx = self._tab.addTab(QWidget(), "전체 일정")
+            self._sched_lazy_builders[_idx] = \
+                lambda ad=all_data: self._make_table(ad, my_view=False)
         _sw_marks.append(("내경기+전체일정 테이블", _time_sw.perf_counter()))
 
         # 국제대회(본선) 탭
@@ -459,9 +481,18 @@ class ScheduleWindow(QDialog):
         cup_my_w = self._make_cup_tab(my_view=True)
         if cup_my_w:
             self._tab.addTab(cup_my_w, "🎖️ 컵대회(내 경기)")
-        cup_all_w = self._make_cup_tab(my_view=False)
-        if cup_all_w:
-            self._tab.addTab(cup_all_w, "🎖️ 컵대회(전체 일정)")
+        # [2026-08 신설] "컵대회(전체 일정)"도 "전체 일정"과 같은 이유로
+        # 지연 로딩 대상 — 다만 이 탭은 존재 여부 자체가 조건부(그 시즌에
+        # 컵대회가 없거나 아직 경기가 없으면 탭을 안 보여줘야 함)라서,
+        # 지금 안 보고 있을 땐 무거운 전체 빌드(_make_cup_tab) 대신 가벼운
+        # COUNT 쿼리로만 존재 여부를 확인한다.
+        if cur_label == "🎖️ 컵대회(전체 일정)":
+            cup_all_w = self._make_cup_tab(my_view=False)
+            if cup_all_w:
+                self._tab.addTab(cup_all_w, "🎖️ 컵대회(전체 일정)")
+        elif self._cup_all_exists():
+            _idx = self._tab.addTab(QWidget(), "🎖️ 컵대회(전체 일정)")
+            self._sched_lazy_builders[_idx] = lambda: self._make_cup_tab(my_view=False)
         _sw_marks.append(("컵대회", _time_sw.perf_counter()))
         # [2026-07 신설] 챔피언스리그·국제대회처럼 컵대회도 토너먼트
         # 대진표(브래킷)로 보여주는 탭 — 4강 이후 결승/3·4위전이 생기면서
@@ -493,6 +524,7 @@ class ScheduleWindow(QDialog):
 
         if 0 <= cur < self._tab.count():
             self._tab.setCurrentIndex(cur)
+        self._tab.blockSignals(False)
 
         if scroll_pos:
             def _restore():
@@ -505,6 +537,47 @@ class ScheduleWindow(QDialog):
                     if sa:
                         sa.verticalScrollBar().setValue(v)
             QTimer.singleShot(0, _restore)
+
+    def _lazy_show_sched_tab(self, idx):
+        """[2026-08 신설] "전체 일정"/"컵대회(전체 일정)" 자리에 넣어둔
+        플레이스홀더를, 사용자가 실제로 그 탭을 클릭하는 순간에만 진짜
+        내용으로 교체한다 — world_browser_window.py의 _lazy_show_wb_tab과
+        동일 패턴. 이미 실빌드된 탭이거나 대상이 아니면 아무 것도 안 함."""
+        pending = self._sched_lazy_builders.get(idx)
+        if pending is None:
+            return
+        builder = pending
+        del self._sched_lazy_builders[idx]
+        label = self._tab.tabText(idx)
+        real_widget = builder() or QWidget()
+        old_widget = self._tab.widget(idx)
+        self._tab.blockSignals(True)
+        self._tab.removeTab(idx)
+        self._tab.insertTab(idx, real_widget, label)
+        self._tab.setCurrentIndex(idx)
+        self._tab.blockSignals(False)
+        if old_widget:
+            old_widget.deleteLater()
+
+    def _cup_all_exists(self):
+        """[2026-08 신설] "컵대회(전체 일정)" 탭을 보여줘야 하는지만 싸게
+        확인 — _make_cup_tab(my_view=False)처럼 전체 행을 가져와 표
+        위젯까지 만드는 대신 COUNT 쿼리 한 번으로 끝낸다. 지금 그 탭을
+        보고 있지 않을 때(=지연 로딩 대상일 때)만 쓰인다."""
+        from competition import cup_engine
+        from game_engine import get_state, get_player
+        st = get_state(); p = get_player()
+        if not st or not p or not p.get("current_team_id"):
+            return False
+        t = cup_engine._my_cup_tournament(p, st["current_year"])
+        if not t:
+            return False
+        conn = get_conn()
+        n = conn.execute(
+            "SELECT COUNT(*) AS c FROM cup_matches WHERE tournament_id=?",
+            (t["id"],)).fetchone()["c"]
+        conn.close()
+        return n > 0
 
     # ── 국제대회 탭 ──────────────────────────────
 
@@ -1823,8 +1896,21 @@ class ScheduleWindow(QDialog):
         구조라, 초반 라운드는 참가팀 수가 뒤죽박죽이고 라운드명도
         32강/16강처럼 정형화되지 않는다(_round_name 참고) — 이 상태로
         전체 라운드를 브래킷 하나에 다 우겨넣으면 화면이 지저분해진다는
-        지적을 받아, 이 탭은 대진이 안정된 이후인 '8강부터'만(=본선)
-        그린다. 그 이전 라운드는 기존 '🎖️ 컵대회' 표 탭에서 계속 볼 수 있다."""
+        지적을 받아, 이 탭은 대진이 안정된 이후(=본선, cup_engine.
+        _round_name이 is_pure_ko=True로 표준 강수 이름을 붙이기 시작한
+        시점)만 그린다. 그 이전 라운드는 기존 '🎖️ 컵대회' 표 탭에서
+        계속 볼 수 있다.
+
+        [2026-08 버그수정, 신민용 리포트: "본선은 라운드가 아닌 ㅁㅁ강으로
+        시작하는 것부터인데, 16강부터 시작하는 나라가 8강부터 뜬다"]
+        예전엔 본선 시작을 무조건 '8강'으로 하드코딩해서(round_name IN
+        ('8강','4강','결승','3·4위전')), 컵대회 참가팀이 많아 본선이
+        16강/32강/64강부터 시작하는 나라는 그 앞 표준 강수 라운드들이
+        통째로 잘려나갔다 — _round_name이 이미 "표준 강수 이름이 붙었으면
+        그게 곧 본선 시작"이라는 판정을 끝내주므로, 여기서 다시 '8강'
+        하나로 하드코딩할 필요가 없다. 표준 강수 이름 집합 전체를 걸러서
+        실제로 존재하는 가장 이른 라운드부터(64강이든 16강이든 8강이든)
+        자동으로 잡는다."""
         from competition import cup_engine
         from game_engine import get_state, get_player
 
@@ -1837,12 +1923,18 @@ class ScheduleWindow(QDialog):
         if not t:
             return None
 
+        # cup_engine._round_name의 표준 강수 명칭 전체(챔스처럼 64강까지
+        # 갈 수 있는 대형 컵대회도 커버) — is_pure_ko=True일 때만 붙는
+        # 이름들이라, 이 이름이 붙어있다는 것 자체가 "이미 본선"이라는 뜻.
+        _STANDARD_STAGES = ["64강", "32강", "16강", "8강", "4강", "결승"]
+
         my_tid = p["current_team_id"]
         conn = get_conn()
         rows = [dict(r) for r in conn.execute(
             """SELECT * FROM cup_matches WHERE tournament_id=?
-               AND round_name IN ('8강', '4강', '결승', '3·4위전')
-               ORDER BY round_idx ASC, id ASC""", (t["id"],)).fetchall()]
+               AND round_name IN (?,?,?,?,?,?,'3·4위전')
+               ORDER BY round_idx ASC, id ASC""",
+            (t["id"], *_STANDARD_STAGES)).fetchall()]
         if not rows:
             conn.close()
             return None
@@ -1857,8 +1949,15 @@ class ScheduleWindow(QDialog):
                 return "?"
             return f"{e['team_name']} ({e['tier']}부)"
 
-        # 라운드 순서 고정(8강→4강→결승, 3·4위전은 결승과 같은 주차라 옆에 배치).
-        stage_order = {"8강": 0, "4강": 1, "결승": 2, "3·4위전": 2}
+        # 라운드 순서 — 실제로 존재하는 표준 강수만 뽑아서(64강이든 16강
+        # 이든 8강이든, 그 대회가 실제로 본선을 시작하는 지점부터) 순서를
+        # 매긴다. 3·4위전은 결승과 같은 주차라 옆에 배치(기존과 동일).
+        present_stages = [s for s in _STANDARD_STAGES
+                           if any(r["round_name"] == s for r in rows)]
+        stage_order = {name: i for i, name in enumerate(present_stages)}
+        if "결승" in stage_order:
+            stage_order["3·4위전"] = stage_order["결승"]
+        _start_stage = present_stages[0] if present_stages else "8강"
 
         bracket_matches = []
         for m in rows:
@@ -1897,7 +1996,7 @@ class ScheduleWindow(QDialog):
         lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(10)
 
-        hdr = QLabel(f"🎖️ {t['year']}년 {t['name']}  (본선: 8강~)" +
+        hdr = QLabel(f"🎖️ {t['year']}년 {t['name']}  (본선: {_start_stage}~)" +
                      (f"  —  현재 성적: {t['my_result']}" if t.get("my_result") else ""))
         hdr.setStyleSheet("color:#c48aff;font-size:14px;font-weight:bold;")
         lay.addWidget(hdr)

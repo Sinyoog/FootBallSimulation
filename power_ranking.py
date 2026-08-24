@@ -114,9 +114,68 @@ SAME_LEAGUE_DISCOUNT = 0.9  # 대륙대항전에서 같은 리그 팀끼리 붙�
 # 우승과 맞먹는 수준) 잡는다. TUNE LATER — 실측 후 조정 대상.
 LEAGUE_SEASON_DELTA_CAP = 100.0
 
+# [2026-08 신설, 신민용+GPT 확정 — 실측(헤드리스 실제 시즌 시뮬레이션)으로
+# 확인된 문제: "게임 시작 첫 시즌(2000년)에 레알/바르사/바이에른/도르트문트/
+# 마르세유 등 강팀 거의 전부가 실제 성적과 무관하게 A:league -100(하한
+# 캡)에 몰린다"] 처음엔 첫 시즌만 캡을 완화(40)하는 방향으로 시도했으나,
+# 실제 매치엔진으로 1시즌을 통째로 돌려 raw(클램프 전 원본값)를 찍어보니
+# 레알 -152.8/바이에른 -144.4/마르세유 -139.2/도르트문트 -98.3/바르사
+# -55.6로 팀마다 값은 다르지만 전부 -40보다도 훨씬 더 마이너스라, 캡을
+# 아무리 낮춰도 다들 그 캡 하나로 다시 뭉쳐버림을 확인했다(진단 결론:
+# 캡 문제가 아니라 기대승률 계산 자체의 스케일 불일치).
+#
+# 원인: 초기 시드값(1400+(OVR-60)×30)이 만드는 Elo 격차가, 실제 매치
+# 시뮬레이션 엔진(스탯/club_strength 기반, 전혀 다른 스케일)이 실제로
+# 만들어내는 팀간 승률 격차보다 훨씬 가파르다 — 예: 레알 시드 기준
+# "기대승점 36.2/38"(승률 95%)를 요구했는데 실제 매치엔진 승률은 62%
+# (23.5/38)였다. 이건 레알이 그 시즌에 유난히 못한 게 아니라, 시드
+# 공식이 "이 정도는 이겨야 정상"이라고 잡은 기준 자체가 실제 엔진의
+# 승률 분포보다 원래 너무 높았던 것.
+#
+# 수정 방향(신민용+GPT 확정): team_ps 자체·grade_for_ps()·챔스/컵 Elo·
+# 매치엔진·_regress_a는 전혀 건드리지 않는다 — 딱 이 함수(리그 A레이어)
+# 안에서 expected_score에 넘기는 "레이팅 격차"만 압축해서, 실제 매치엔진의
+# 완만한 승률 분포에 맞춘다. 목표는 "기대승점을 실제승점과 똑같이 맞추는
+# 것"이 아니라(그러면 Elo가 매치엔진을 그냥 베끼는 꼴이 됨) "강팀이 우승권
+# 성적을 냈는데도 기대치가 비현실적으로 높아서 하한에 박히는 현상만
+# 없애고, 강팀-약팀 간 실력차 반영 자체는 유지하는 것". 압축률은 실측
+# (아래 검증 결과 참고)으로 확정 — 100%(무압축)/75%/50%/40% 네 후보를
+# 동일 시드·동일 시즌으로 비교해 40%가 가장 균형 잡힌 결과를 냈다.
+#
+# 이 압축을 적용한 뒤로는 LEAGUE_SEASON_DELTA_CAP도 다시 원래 ±100
+# 그대로 쓴다(위 실험용 INITIAL_SEASON_NEGATIVE_CAP=40은 진단 전용이었고
+# 최종 구현에서는 제거 — gap 압축과 낮은 캡을 동시에 걸면 이중 억제가
+# 된다는 지적에 따름).
+#
+# [실측 확정치] 동일 시드(random.seed(999))·동일 2000시즌으로 100%/75%/
+# 50%/40%/30% 다섯 후보를 실제 매치엔진으로 비교(레알/바르사/바이에른/
+# 도르트문트/마르세유 5팀):
+#   100%: 전원 -100 캡에 그대로 몰림(5/5)
+#    75%: 4/5 여전히 캡에 몰림
+#    50%: 1/5 캡에 몰림(레알-83.8/바르사-40.8/바이에른-67.4/도르트문트
+#         -100.0(캡)/마르세유-97.8)
+#    40%: 캡 걸리는 팀 없음(레알-57.5/바르사-17.1/바이에른-56.0/
+#         도르트문트-94.3/마르세유-83.9) — 그래도 도르트문트·마르세유가
+#         여전히 -80~-94대로 다소 과함
+#    30%: 캡 걸리는 팀 없음, 그리고 결과 순서가 실제 승점 순서(바르사
+#         28.0>레알 24.5>바이에른 21.5>마르세유 19.0>도르트문트 18.0)와
+#         정확히 일치(바르사 +11.9로 소폭 플러스 — 다섯 팀 중 실제로
+#         가장 잘했으니 타당, 레알 -36.2/바이에른 -33.3로 "큰 폭이지만
+#         비정상적이지 않은" 음수, 도르트문트 -70.3로 실제로 제일
+#         못한 팀답게 가장 큰 페널티) — 30%로 최종 확정.
+LEAGUE_ELO_GAP_COMPRESSION = 0.30
+
 
 def expected_score(rating_a: float, rating_b: float, home_bonus: float = 0.0) -> float:
     return 1.0 / (1.0 + 10 ** (((rating_b) - (rating_a + home_bonus)) / 400.0))
+
+
+def expected_score_from_gap(gap: float) -> float:
+    """[2026-08 신설] expected_score(a,b)와 완전히 같은 수식을, 이미 계산해둔
+    격차(gap=a-b)로부터 바로 구한다 — LEAGUE_ELO_GAP_COMPRESSION으로 압축한
+    gap을 넣기 위한 용도(_update_team_a_from_league 전용). expected_score()
+    자체는 다른 곳(챔스/컵 등)에서 원본 그대로 계속 쓰이므로 손대지 않았다."""
+    return 1.0 / (1.0 + 10 ** (-gap / 400.0))
 
 
 def match_delta(rating_home: float, rating_away: float, grade_home: str, grade_away: str,
@@ -443,6 +502,99 @@ def ensure_power_ranking_tables(conn):
 # 비워서(다음 시즌엔 무조건 새로 읽음) 시즌 간 데이터가 섞일 일이 없다.
 _team_ab_cache: dict = {}
 
+# [2026-08 신설, 신민용 요청: "레알 23위→2위/바르셀로나 4위→14위 같은
+# 급변동을 감으로 재계산하지 말고 실제 로그로 바로 판별하고 싶다"]
+# _RELEGATION_DEBUG_TRACKING(game_engine.py)과 완전히 같은 패턴 — 평소엔
+# 완전히 꺼진 상태로 오버헤드 0, 이 플래그를 켜고 추적하고 싶은 팀
+# id들을 _POWER_DEBUG_TEAM_IDS에 넣으면 그 팀들에 한해 _add_team_a/
+# _add_team_b가 불릴 때마다 "어느 소스(리그/챔스/국내컵/클럽월드컵/
+# 강등페널티/시즌전환회귀 등)에서 얼마씩 A/B가 변했는지"를 콘솔+파일
+# 로그에 남긴다. DB 스키마·컬럼은 전혀 안 늘어난다(팀당 A/B가 시즌마다
+# 그대로 덮어써지는 현재 구조 특성상 사후 복원이 불가능하므로, 다음에
+# 같은 문제가 또 생겼을 때 이 로그부터 켜고 재현하면 된다).
+# [2026-08 신설, 신민용 요청: "레알 23위→2위/바르셀로나 4위→14위 같은
+# 급변동을 감으로 재계산하지 말고 실제 로그로 바로 판별하고 싶다"]
+# _RELEGATION_DEBUG_TRACKING(game_engine.py)과 완전히 같은 패턴 — 평소엔
+# 완전히 꺼진 상태로 오버헤드 0, 이 플래그를 켜고 추적하고 싶은 팀
+# id들을 _POWER_DEBUG_TEAM_IDS에 넣으면 그 팀들에 한해 _add_team_a/
+# _add_team_b가 불릴 때마다 "어느 소스(리그/챔스/국내컵/클럽월드컵/
+# 강등페널티/시즌전환회귀 등)에서 얼마씩 A/B가 변했는지"를 콘솔+파일
+# 로그에 남긴다. DB 스키마·컬럼은 전혀 안 늘어난다(팀당 A/B가 시즌마다
+# 그대로 덮어써지는 현재 구조 특성상 사후 복원이 불가능하므로, 다음에
+# 같은 문제가 또 생겼을 때 이 로그부터 켜고 재현하면 된다).
+#
+# [사용법 — 파이썬 콘솔 필요 없음] 아래 두 줄만 고치고 게임을 실행하면
+# 끝난다:
+#   1) DEBUG_POWER_RANKING_TRACKING = False → True로 바꾼다.
+#   2) _POWER_DEBUG_TEAM_NAMES 리스트에 추적하고 싶은 팀 이름을 정확히
+#      적는다(게임 안에 실제로 등록된 팀명과 철자까지 똑같아야 함).
+# 그 상태로 게임을 켜고 시즌을 한 번(연도전환 1회) 넘기면, 게임을 실행한
+# 폴더(game.db가 있는 폴더와 같은 곳)에 power_ranking_debug.log 파일이
+# 자동으로 생기거나 이어서 쌓인다 — 그 파일을 열어보면 됨. 다 보고 나면
+# 다시 False로 꺼두는 걸 권장(계속 켜두면 매 시즌마다 파일이 계속
+# 불어남).
+DEBUG_POWER_RANKING_TRACKING = True
+_POWER_DEBUG_TEAM_NAMES = [] #파워랭킹 오류 검사하고 싶음 넣으셈
+_POWER_DEBUG_TEAM_IDS: set = set()
+_POWER_DEBUG_LOG_PATH = "power_ranking_debug.log"
+
+
+def set_power_debug_teams_by_name(conn, names) -> list:
+    """이름(들)으로 team_id를 찾아 _POWER_DEBUG_TEAM_IDS에 등록한다.
+    편의 함수 — DEBUG_POWER_RANKING_TRACKING=True로 켜둔 뒤 이 함수를
+    한 번 호출해두면 그 뒤 run_year_end_power_ranking_update가 돌 때마다
+    자동으로 추적된다. 반환값: 실제로 찾아서 등록된 (team_id, name) 목록
+    (오타 등으로 못 찾은 이름은 조용히 빠짐 — 호출부에서 반환값 길이로
+    확인 가능)."""
+    global _POWER_DEBUG_TEAM_IDS
+    if isinstance(names, str):
+        names = [names]
+    found = []
+    for name in names:
+        row = conn.execute("SELECT id, name FROM teams WHERE name=?", (name,)).fetchone()
+        if row:
+            _POWER_DEBUG_TEAM_IDS.add(row[0])
+            found.append((row[0], row[1]))
+    return found
+
+
+def _power_debug_log(conn, team_id: int, layer: str, source: str, delta: float):
+    """DEBUG_POWER_RANKING_TRACKING이 꺼져 있거나 이 팀이 추적 대상이
+    아니면 즉시 리턴(오버헤드 없음). 켜져 있으면 delta가 0이어도(변화
+    없음을 확인하고 싶을 수 있어) 그대로 기록한다."""
+    if not DEBUG_POWER_RANKING_TRACKING or team_id not in _POWER_DEBUG_TEAM_IDS:
+        return
+    row = conn.execute("SELECT name FROM teams WHERE id=?", (team_id,)).fetchone()
+    name = row[0] if row else f"team#{team_id}"
+    line = f"[{name}] {layer} / {source}: {delta:+.2f}"
+    print(f"[POWER-DEBUG] {line}")
+    try:
+        with open(_POWER_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _power_debug_snapshot(conn, label: str):
+    """DEBUG_POWER_RANKING_TRACKING 켜져있을 때, 추적 대상 팀 전원의
+    현재 a_rating/b_rating을 한 줄로 남긴다 — run_year_end_power_ranking_
+    update 시작 직전(시즌 시작 값)/끝난 직후(시즌 종료 값) 두 번 호출하면
+    "그 시즌 동안 A/B가 각각 얼마나 움직였는지" 최종 합계도 자연히
+    비교 가능해진다."""
+    if not DEBUG_POWER_RANKING_TRACKING or not _POWER_DEBUG_TEAM_IDS:
+        return
+    for team_id in _POWER_DEBUG_TEAM_IDS:
+        row = conn.execute("SELECT name FROM teams WHERE id=?", (team_id,)).fetchone()
+        name = row[0] if row else f"team#{team_id}"
+        a, b = _get_team_ab(conn, team_id)
+        line = f"[{name}] === {label}: A={a:.2f} B={b:.2f} PS={a+b:.2f} ==="
+        print(f"[POWER-DEBUG] {line}")
+        try:
+            with open(_POWER_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
 
 def _get_team_ab(conn, team_id: int):
     cached = _team_ab_cache.get(team_id)
@@ -465,7 +617,7 @@ def _get_team_grade(conn, team_id: int) -> str:
     return grade_for_ps(_get_team_rating(conn, team_id))
 
 
-def _add_team_a(conn, team_id: int, delta: float, year: int):
+def _add_team_a(conn, team_id: int, delta: float, year: int, source: str = ""):
     a, b = _get_team_ab(conn, team_id)
     conn.execute("""INSERT INTO team_power_rating(team_id, a_rating, b_rating, last_updated_year)
                      VALUES(?,?,?,?)
@@ -473,9 +625,10 @@ def _add_team_a(conn, team_id: int, delta: float, year: int):
                         a_rating=excluded.a_rating, last_updated_year=excluded.last_updated_year""",
                  (team_id, a + delta, b, year))
     _team_ab_cache[team_id] = (a + delta, b)
+    _power_debug_log(conn, team_id, "A", source or "?", delta)
 
 
-def _add_team_b(conn, team_id: int, delta: float, year: int):
+def _add_team_b(conn, team_id: int, delta: float, year: int, source: str = ""):
     a, b = _get_team_ab(conn, team_id)
     conn.execute("""INSERT INTO team_power_rating(team_id, a_rating, b_rating, last_updated_year)
                      VALUES(?,?,?,?)
@@ -486,6 +639,7 @@ def _add_team_b(conn, team_id: int, delta: float, year: int):
     conn.execute("""INSERT INTO team_b_history(team_id, year, b_gain) VALUES(?,?,?)
                      ON CONFLICT(team_id, year) DO UPDATE SET b_gain=b_gain+excluded.b_gain""",
                  (team_id, year, delta))
+    _power_debug_log(conn, team_id, "B", source or "?", delta)
 
 
 def _get_country_ab(conn, country: str):
@@ -685,7 +839,7 @@ def _team_continent_for_champions(conn, team_id: int) -> Optional[str]:
 
 def _update_team_a_from_matches(conn, matches_table: str, tournament_id: int, year: int,
                                  comp_weight: float, use_stage_col: bool = True,
-                                 discount_same_league: bool = False):
+                                 discount_same_league: bool = False, source: str = ""):
     stage_col = "stage" if use_stage_col else "round_idx"
     rows = conn.execute(
         f"""SELECT home_team_id, away_team_id, home_score, away_score, pso_winner, {stage_col}
@@ -708,8 +862,8 @@ def _update_team_a_from_matches(conn, matches_table: str, tournament_id: int, ye
         rh, ra = _get_team_rating(conn, home_id), _get_team_rating(conn, away_id)
         gh, ga = grade_for_ps(rh), grade_for_ps(ra)
         d_home, d_away = match_delta(rh, ra, gh, ga, r, comp_weight, sw, is_final=is_final)
-        _add_team_a(conn, home_id, d_home, year)
-        _add_team_a(conn, away_id, d_away, year)
+        _add_team_a(conn, home_id, d_home, year, source=source or f"match:{matches_table}#{tournament_id}")
+        _add_team_a(conn, away_id, d_away, year, source=source or f"match:{matches_table}#{tournament_id}")
 
 
 def get_team_ps_map(conn, team_ids) -> dict:
@@ -844,15 +998,24 @@ def _update_team_a_from_league(conn, evaluation_year: int):
         avg_grade = grade_for_ps(avg_opponent_ps)
         w = base_w * league_tier_weight(tier)
         actual_points = (wins or 0) * 1.0 + (draws or 0) * 0.5
-        e = expected_score(rating, avg_opponent_ps)   # [2026-08 v3.2] 두 번째 인자만
-                                                        # league_avg → avg_opponent_ps로
-                                                        # 교체, expected_score() 함수
-                                                        # 자체는 손대지 않음(GPT 합의사항)
+        # [2026-08 신설, 신민용+GPT 확정 — gap 압축] 시드 기반 레이팅 격차가
+        # 실제 매치엔진의 완만한 승률 분포보다 훨씬 가파른 문제(위
+        # LEAGUE_ELO_GAP_COMPRESSION 정의부 설명 참고) — expected_score()를
+        # 그대로 쓰는 대신, gap(=rating-avg_opponent_ps) 자체를 압축한 뒤
+        # 그 압축된 gap으로 기대승률을 계산한다. rating/avg_opponent_ps
+        # 값 자체나 grade_for_ps 판정에는 전혀 영향 없음 — 이 기대승점
+        # 계산 한 곳에만 적용.
+        gap = rating - avg_opponent_ps
+        e = expected_score_from_gap(gap * LEAGUE_ELO_GAP_COMPRESSION)
         expected_points = e * n_games
         k_match = (k_for_grade(grade) + k_for_grade(avg_grade)) / 2.0
         raw = k_match * w * (actual_points - expected_points)
         delta = max(-LEAGUE_SEASON_DELTA_CAP, min(LEAGUE_SEASON_DELTA_CAP, raw))
-        _add_team_a(conn, team_id, delta, evaluation_year)
+        # [2026-08 신설, 진단용] 클램프 전 raw값도 함께 남긴다 — 다음에
+        # 비슷한 문제가 생기면 이 값으로 바로 원인(캡 문제 vs calibration
+        # 문제)을 구분할 수 있다.
+        _power_debug_log(conn, team_id, "A", f"league_raw(actual={actual_points:.1f},expected={expected_points:.1f})", raw)
+        _add_team_a(conn, team_id, delta, evaluation_year, source="A:league")
 
 
 def update_team_ratings_for_year(conn, evaluation_year: int):
@@ -872,7 +1035,8 @@ def update_team_ratings_for_year(conn, evaluation_year: int):
             _update_team_a_from_matches(
                 conn, matches_table, tid, evaluation_year, weight,
                 use_stage_col=(category != "domestic_cup"),
-                discount_same_league=(category in ("champions", "europa", "conference")))
+                discount_same_league=(category in ("champions", "europa", "conference")),
+                source=f"A:{category}")
     conn.commit()
 
 
@@ -998,7 +1162,7 @@ def update_team_b_for_year(conn, evaluation_year: int):
             if rank == 1:
                 bonus *= decay
             _add_team_b(conn, team_id, bonus * TEAM_COMPETITION_WEIGHT["league"] * tier_w,
-                        evaluation_year)
+                        evaluation_year, source="B:league_placement")
 
     # 1b) [2026-08 신설, 신민용 버그 리포트: "우승 보정만 있고 강등(패배)
     # 보정이 없다"] 강등은 그 자체로 레이어B 페널티 — 강등 단계 수 ×
@@ -1013,7 +1177,7 @@ def update_team_b_for_year(conn, evaluation_year: int):
     for team_id, from_tier, to_tier in relegations:
         levels = max(1, (to_tier or 0) - (from_tier or 0))
         penalty = RELEGATION_BASE_PENALTY * levels * league_tier_weight(from_tier)
-        _add_team_b(conn, team_id, penalty, evaluation_year)
+        _add_team_b(conn, team_id, penalty, evaluation_year, source="B:relegation_penalty")
 
     # 2) 국제/국내컵 계열 대회 성적 보너스 (deepest-stage 판정)
     for category, (tournaments_table, matches_table) in _CLUB_COMP_TABLES.items():
@@ -1027,7 +1191,7 @@ def update_team_b_for_year(conn, evaluation_year: int):
                 conn, matches_table, tid, use_stage_col=(category != "domestic_cup"))
             for team_id, tier in placements.items():
                 base = PLACEMENT_BASE_SCORE[tier]
-                _add_team_b(conn, team_id, base * weight, evaluation_year)
+                _add_team_b(conn, team_id, base * weight, evaluation_year, source=f"B:{category}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1241,6 +1405,8 @@ def apply_team_season_regression(conn, evaluation_year: int, league_power_cache:
                 convergence = 0.25
         new_a = _regress_a(a, seed_ps, convergence)
         new_b = _decay_b(b, CLUB_B_DECAY_RATE)
+        _power_debug_log(conn, team_id, "A", f"regress(seed={seed_ps:.1f},conv={convergence:.2f})", new_a - a)
+        _power_debug_log(conn, team_id, "B", f"decay(rate={CLUB_B_DECAY_RATE:.2f})", new_b - b)
         conn.execute("""UPDATE team_power_rating SET a_rating=?, b_rating=?, last_updated_year=?
                          WHERE team_id=?""", (new_a, new_b, evaluation_year, team_id))
         # [2026-08 신설] 이 UPDATE는 _add_team_a/_add_team_b를 거치지 않는
@@ -1371,6 +1537,18 @@ def run_year_end_power_ranking_update(conn, evaluation_year: int):
     ensure_initial_team_power_ranking(conn)
     ensure_initial_country_power_ranking(conn)
 
+    # [2026-08 신설] 파이썬 콘솔에서 set_power_debug_teams_by_name()을 따로
+    # 호출할 필요 없이, 켜져 있으면(DEBUG_POWER_RANKING_TRACKING=True) 여기서
+    # _POWER_DEBUG_TEAM_NAMES를 자동으로 team_id로 변환해 등록한다 —
+    # 파일 상단 이름 목록만 고치고 게임을 실행하면 그대로 동작.
+    if DEBUG_POWER_RANKING_TRACKING and not _POWER_DEBUG_TEAM_IDS:
+        found = set_power_debug_teams_by_name(conn, _POWER_DEBUG_TEAM_NAMES)
+        missing = set(_POWER_DEBUG_TEAM_NAMES) - {n for _, n in found}
+        if missing:
+            print(f"[POWER-DEBUG] 경고: 이 이름들을 못 찾았습니다(철자 확인): {missing}")
+
+    _power_debug_snapshot(conn, f"{evaluation_year}시즌 시작(계산 전)")
+
     update_team_ratings_for_year(conn, evaluation_year)
     update_team_b_for_year(conn, evaluation_year)
     update_country_ratings_for_year(conn, evaluation_year)
@@ -1379,6 +1557,8 @@ def run_year_end_power_ranking_update(conn, evaluation_year: int):
     league_power_cache = compute_league_power(conn, evaluation_year)
     apply_team_season_regression(conn, evaluation_year, league_power_cache)
     apply_country_season_regression(conn, evaluation_year)
+
+    _power_debug_snapshot(conn, f"{evaluation_year}시즌 종료(회귀/감쇠 후)")
 
     compute_team_power_rankings(conn, evaluation_year)
     compute_country_power_rankings(conn, evaluation_year)

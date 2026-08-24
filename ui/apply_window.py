@@ -67,6 +67,8 @@ class ApplyWindow(QDialog):
         self.chosen = None
         self._rows = []          # 현재 검색 결과 (search_teams 반환값)
         self._selected_team_id = None
+        self._selected_team_name = None
+        self._team_info_wins = []  # [2026-08 신설] "📊 최근 성적"으로 띄운 창들 — GC 방지용 보관
         # [2026-08 신설, 난이도 시스템] 어려움 난이도는 "누가 강팀인지" 알
         # 수 없어야 하므로(신민용 확정) 평균OVR 컬럼과 OVR 정렬 필터를
         # 뺀다 — 부(1부/2부)·국가등급(S/A/B..)·이름검색은 그대로 유지
@@ -166,6 +168,14 @@ class ApplyWindow(QDialog):
         bottom = QHBoxLayout()
         self.detail_lbl = QLabel("팀을 선택하세요")
         bottom.addWidget(self.detail_lbl, 1)
+        # [2026-08 신설, 신민용 요청: "입단/오퍼 창이 떠 있는 동안에도 다른
+        # 창(팀 성적 등)을 열어서 비교하고 싶다"] 이 창도 OfferWindow에서
+        # exec()로 열리는 자식 다이얼로그라 그 문제를 똑같이 겪는다 —
+        # 선택된 팀의 세계 기록실을 비모달로 띄우는 버튼을 추가한다.
+        self.info_btn = QPushButton("📊 최근 성적")
+        self.info_btn.setEnabled(False)
+        self.info_btn.clicked.connect(self._open_team_info)
+        bottom.addWidget(self.info_btn)
         self.apply_btn = QPushButton("🔎 이 팀에 지원하기")
         self.apply_btn.setObjectName("applyBtn")
         self.apply_btn.setEnabled(False)
@@ -194,6 +204,31 @@ class ApplyWindow(QDialog):
         idx = self.country_combo.findData(prev_id)
         self.country_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.country_combo.blockSignals(False)
+
+    def _open_team_info(self):
+        """[2026-08 신설] 선택된 팀의 세계 기록실(연도별 성적/수상)을
+        이 창을 닫지 않고 별도 비모달 창으로 띄운다 — offer_window.py의
+        동명 메서드와 동일 패턴."""
+        tid, tname = self._selected_team_id, self._selected_team_name
+        if tid is None:
+            return
+        for w in self._team_info_wins:
+            if getattr(w, "_info_team_id", None) == tid:
+                w.raise_(); w.activateWindow()
+                return
+        from ui.world_browser_window import WorldBrowserWindow
+        win = WorldBrowserWindow(self)
+        win._info_team_id = tid
+        win.tabs.setCurrentIndex(1)          # "🏟 팀 검색" 탭
+        win._show_team_detail(tid, tname)
+        self._team_info_wins.append(win)
+
+        def _cleanup(*_a, w=win):
+            if w in self._team_info_wins:
+                self._team_info_wins.remove(w)
+        win.finished.connect(_cleanup)
+        win.show()
+        win.raise_(); win.activateWindow()
 
     def _on_grade_changed(self, *_):
         self._refresh_country_options(grade=self.grade_combo.currentData())
@@ -246,6 +281,7 @@ class ApplyWindow(QDialog):
                 self.table.setItem(i, j, item)
         self.table.clearSelection()
         self._selected_team_id = None
+        self._selected_team_name = None
         self.detail_lbl.setText("팀을 선택하세요")
         self.apply_btn.setEnabled(False)
 
@@ -253,11 +289,15 @@ class ApplyWindow(QDialog):
         rows = self.table.selectionModel().selectedRows()
         if not rows:
             self._selected_team_id = None
+            self._selected_team_name = None
             self.apply_btn.setEnabled(False)
+            self.info_btn.setEnabled(False)
             return
         idx = rows[0].row()
         r = self._rows[idx]
         self._selected_team_id = r["id"]
+        self._selected_team_name = r["name"]
+        self.info_btn.setEnabled(True)
         # [2026-08 수정, 난이도 시스템] 어려움 난이도는 성공 가능성을
         # 아예 계산해서 보여주지 않는다 — 현실처럼 "일단 지원해봐야 아는"
         # 상태로 둔다(신민용 확정).

@@ -540,6 +540,54 @@ def build_season_match_narratives(league_matches):
     return out
 
 
+def build_transfer_level_sentence(prev_season, cur_season):
+    """[2026-08 신설, 신민용 요청: "팀을 옮기는 게 전 시즌이랑 비슷한
+    수준이면 비슷하게, 팀 수준이 낮아지면 낮아진 걸로 해석해야 한다"]
+    직전 시즌과 이번 시즌의 tier(부수)·salary(연봉)만 비교한다 — 둘 다
+    career_entries에 이미 있는 값이라 새 데이터 없이 바로 가능하다.
+    "왜 옮겼는지"는 절대 추측하지 않고, tier가 오르면 상승/내리면 하락/
+    같으면 수평이동이라는 사실만 말하고, 연봉이 뚜렷이 오르내렸으면
+    ("15% 이상 차이) 그 사실도 덧붙인다 — "돈을 보고 갔다" 같은 동기
+    단정은 하지 않고 연봉 숫자 자체의 방향만 보여준다.
+    prev_season이 없으면(데뷔 시즌 등) 빈 문자열."""
+    if not prev_season or not cur_season:
+        return ""
+    pt, ct = prev_season.get("tier", 0), cur_season.get("tier", 0)
+    if not pt or not ct:
+        return ""
+    if ct < pt:
+        level = "이전 소속팀보다 한 단계 높은 무대로 올라선 이적이었다."
+    elif ct > pt:
+        level = "이전 소속팀보다 낮은 단계의 리그로 내려간 이적이었다."
+    else:
+        level = "리그 단계 자체는 이전 소속팀과 같은 수평 이동이었다."
+    ps, cs = prev_season.get("salary", 0), cur_season.get("salary", 0)
+    pay = ""
+    if ps and cs:
+        if cs >= ps * 1.15:
+            pay = " 연봉은 이전 소속팀보다 뚜렷하게 올랐다."
+        elif cs <= ps * 0.85:
+            pay = " 연봉은 오히려 이전 소속팀보다 낮아졌다."
+    return level + pay
+
+
+def build_season_transfer_narratives(seasons):
+    """seasons(build_seasons() 결과, 시간순)를 훑어 팀이 실제로 바뀐
+    지점마다 build_transfer_level_sentence()를 적용한다.
+    반환: {(team_name, start_year): sentence}."""
+    out = {}
+    prev_playing = None
+    for s in seasons:
+        cur_team = s.get("team_name", "")
+        if prev_playing is not None and cur_team and cur_team != prev_playing.get("team_name", ""):
+            sentence = build_transfer_level_sentence(prev_playing, s)
+            if sentence:
+                out[(cur_team, s.get("start_year", 0))] = sentence
+        if s.get("matches", 0) > 0 or s.get("team_name"):
+            prev_playing = s
+    return out
+
+
 def build_analysis(seasons):
     """순수 계산값만 담는다 — 해석 기준(예: '전성기 평점 몇 이상')이 나중에
     바뀌어도 이 값들은 다시 계산할 필요가 없다."""
@@ -3405,10 +3453,15 @@ def render_chapter(rng, chapter_seasons, all_seasons, awards_by_year, trophy_yea
                                         memory=memory, chapter_character=chapter_character,
                                         categories=categories, turning_indices=turning_indices))
             # [2026-08 신설, PHASE 5] 이 시즌의 연승/연패/로테이션/결장
-            # 구간 문장이 있으면 시즌 문단 바로 뒤에 이어붙인다.
+            # 구간 문장, [2026-08 신설] 이적 시 팀 수준(부수/연봉) 비교
+            # 문장이 있으면 시즌 문단 바로 뒤에 이어붙인다(이적 비교가
+            # 먼저, 그다음 그 시즌 안의 경기 흐름).
             if memory:
-                _mn_key = (s.get("team_name", ""), s.get("start_year", 0))
-                _mn = memory.get("match_narratives", {}).get(_mn_key)
+                _key = (s.get("team_name", ""), s.get("start_year", 0))
+                _tn = memory.get("transfer_narratives", {}).get(_key)
+                if _tn:
+                    parts.append(_tn)
+                _mn = memory.get("match_narratives", {}).get(_key)
                 if _mn:
                     parts.append(" ".join(_mn))
 
@@ -3865,6 +3918,9 @@ def generate_story(player, entries, trophies, awards, promos=None, intl_trophies
     # 문장을 미리 계산해 memory에 실어둔다 — render_chapter가 시즌 문단
     # 뒤에 바로 이어붙인다.
     memory["match_narratives"] = build_season_match_narratives(league_matches)
+    # [2026-08 신설] 이적 시 팀 수준(부수/연봉) 비교 문장도 같은 방식으로
+    # 미리 계산해 memory에 실어둔다.
+    memory["transfer_narratives"] = build_season_transfer_narratives(seasons)
     chapters = build_story_arcs(seasons, all_categories, awards_by_year, trophy_years, intl_by_year)
 
     # [2026-07 신설, 분량 확장] 전환점 인덱스를 한 번만 계산해서 시즌

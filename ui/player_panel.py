@@ -8,7 +8,9 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPainter, QBrush, QColor, QPen
 
-from game_engine import get_player, get_team_rank, get_team_rank_with_zone_color, fmt_money, is_hard_mode
+from game_engine import (get_player, get_team_rank, get_team_rank_with_zone_color, fmt_money,
+                         is_hard_mode, get_season_all_competition_appearances,
+                         _get_season_total_matches)
 from constants import (ALL_STATS, STAT_KO, STAT_EN, _LEGACY_TALENT_ALIAS,
                        TALENT_TIER_KO, TALENT_TIER_EN)
 
@@ -559,6 +561,15 @@ class PlayerPanel(QWidget):
         except Exception:
             _cs = 0
 
+        # [2026-08 신설, 신민용 요청: "출전이 리그전만 표시된다 — N/전체
+        # 형식으로, 커리어처럼 총경기도 같이, 출전율도"] 리그 출전(sm)은
+        # 이번 시즌 리그 전체 일정(league_total) 대비 N/전체(%) 형식으로,
+        # 그 옆에 전 대회(컵·챔스·국대 등 포함) 통합 출전 수를 같이 보여준다.
+        _league_total = _get_season_total_matches(p.get("current_team_id"))
+        _league_rate = round(sm / _league_total * 100, 1) if _league_total else 0.0
+        _all_played, _all_total = get_season_all_competition_appearances(p)
+        _appear_text = f"{sm}/{_league_total} ({_league_rate}%) · 총 {_all_played}경기"
+
         from constants import position_group
         pos = p.get("position","")
         grp = position_group(pos)
@@ -567,7 +578,7 @@ class PlayerPanel(QWidget):
             total_shots = ss + sga
             save_rate = round(ss / total_shots * 100, 1) if total_shots > 0 else 0.0
             s_rows = [
-                ("출전",     f"{sm}경기"),
+                ("출전",     _appear_text),
                 ("선방",     f"{ss}회 ({save_rate}%)"),
                 ("실점",     f"{sga}골"),
                 ("무실점",   f"{_cs}경기"),
@@ -577,7 +588,7 @@ class PlayerPanel(QWidget):
         elif grp == "DEF":
             # 수비수: 무실점·차단·패스성공이 핵심. 골/어시는 보조.
             s_rows = [
-                ("출전",     f"{sm}경기"),
+                ("출전",     _appear_text),
                 ("무실점",   f"{_cs}경기"),
                 ("차단",     f"{d_blk}회"),
                 ("패스성공", f"{d_pac}%"),
@@ -587,7 +598,7 @@ class PlayerPanel(QWidget):
         elif pos in ("CM", "CDM", "CAM"):
             # 미드필더: 골/어시 + 기회창출·패스·차단
             s_rows = [
-                ("출전",     f"{sm}경기"),
+                ("출전",     _appear_text),
                 ("골/어시",  f"{sg}골 {sa}A"),
                 ("기회창출", f"{d_kp}회"),
                 ("패스성공", f"{d_pac}%"),
@@ -597,7 +608,7 @@ class PlayerPanel(QWidget):
         else:
             # 공격수/윙어: 골/어시 + 슈팅·유효슈팅·기회창출·드리블
             s_rows = [
-                ("출전",     f"{sm}경기"),
+                ("출전",     _appear_text),
                 ("골/어시",  f"{sg}골 {sa}A"),
                 ("슈팅",     f"{d_sh} (유효 {d_sho})"),
                 ("기회창출", f"{d_kp}회"),

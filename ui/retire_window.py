@@ -336,6 +336,15 @@ class RetireWindow(QDialog):
         _trc = p.get("total_red_cards_all", 0)
         if _trc > 0:
             stats.append(("🟥레드카드", f"{_trc}회"))
+        # [2026-08 신설, 부상 시스템 확장 — 은퇴 기록] 통산 부상 횟수/총
+        # 결장일 — GPT 권고대로 "전체 이력을 그대로 복붙"하지 않고 요약
+        # 수치만 통계박스에, 상세 목록은 아래 별도 섹션으로 분리.
+        _inj_rows_for_stats = [dict(r) for r in get_conn().execute(
+            "SELECT actual_days FROM injury_history WHERE player_id=1").fetchall()]
+        if _inj_rows_for_stats:
+            _inj_days_total = sum(r["actual_days"] or 0 for r in _inj_rows_for_stats)
+            stats.append(("🩹통산부상", f"{len(_inj_rows_for_stats)}회"))
+            stats.append(("총결장", f"{_inj_days_total}일"))
         for k, v in stats:
             sw = QFrame(); sl = QVBoxLayout(sw); sl.setContentsMargins(4,4,4,4)
             kl = QLabel(k); kl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -363,6 +372,10 @@ class RetireWindow(QDialog):
             awards = []
         from game_engine import get_my_promotions
         promos   = get_my_promotions()
+        # [2026-08 신설, 부상 시스템 확장 — 은퇴 기록] 부상 이력(최신순).
+        injuries = [dict(r) for r in c.execute(
+            "SELECT * FROM injury_history WHERE player_id=1 ORDER BY history_id DESC"
+        ).fetchall()]
         conn.close()
 
         # ── 개인 수상 하이라이트 (있을 때만, 최상단 강조) ──
@@ -405,6 +418,15 @@ class RetireWindow(QDialog):
         t3.setObjectName("secTitle")
         lay.addWidget(t3)
         lay.addWidget(self._promo_table(promos))
+
+        # ── 부상 이력 ────────────────────────────────
+        # [2026-08 신설] 통산 부상 요약은 위 통계박스에서 이미 보여줬으니
+        # 여기는 상세 목록만 — GPT 권고: "전체 이력을 그대로 복붙하기보다
+        # 통산 횟수/총 결장일은 요약 박스에, 상세는 별도 섹션으로".
+        t3b = QLabel(f"🩹 부상 이력  ({len(injuries)})")
+        t3b.setObjectName("secTitle")
+        lay.addWidget(t3b)
+        lay.addWidget(self._injury_table(injuries))
 
         # ── 국제전 기록 ──────────────────────────────
         # [2026-08 성능 수정] get_my_*_matches() 6개를 한 번씩만 조회해
@@ -798,6 +820,43 @@ class RetireWindow(QDialog):
         tbl.resizeColumnsToContents()
         tbl.resizeRowsToContents()
         tbl.setFixedHeight(30 + min(len(visible), 7) * 28)
+        return tbl
+
+    def _injury_table(self, injuries):
+        """[2026-08 신설] 부상 이력 표 — career_window의 부상 이력 탭과
+        동일한 컬럼/스타일. 최신순 고정(호출부에서 정렬 완료)."""
+        if not injuries:
+            lbl = QLabel("부상 이력 없음"); lbl.setStyleSheet("color:#555;")
+            return lbl
+        from ui.player_panel import zone_label_ko
+        from constants import INJURY_POOL
+        _name_by_id = {e["id"]: e["name"] for e in INJURY_POOL}
+        _tier_color = {"경미": "#d4b106", "중간": "#e07b1a",
+                       "심각": "#cc3333", "매우 심각": "#8b0000"}
+        cols = ["기간", "결장일", "부상명", "부위", "등급", "재발"]
+        tbl = QTableWidget(len(injuries), len(cols))
+        tbl.setHorizontalHeaderLabels(cols)
+        tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        tbl.verticalHeader().setVisible(False)
+        for i in range(len(cols)):
+            tbl.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+        for i, inj in enumerate(injuries):
+            if inj.get("return_date"):
+                period = f"{inj['start_date']} ~ {inj['return_date']}"
+                days = str(inj.get("actual_days") or "")
+            else:
+                period = f"{inj['start_date']} ~ (진행중)"
+                days = "진행중"
+            body = zone_label_ko(inj.get("body_part") or "")
+            tier = inj.get("tier") or ""
+            name = _name_by_id.get(inj.get("injury_id"), inj.get("injury_id") or "")
+            recur = "재발" if inj.get("was_recurrence") else ""
+            for j, v in enumerate([period, days, name, body, tier, recur]):
+                item = QTableWidgetItem(str(v))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if j == 4 and tier in _tier_color:
+                    item.setForeground(QColor(_tier_color[tier]))
+                tbl.setItem(i, j, item)
         return tbl
 
     def _club_totals_table(self, entries):
@@ -1984,44 +2043,11 @@ class RetireWindow(QDialog):
         from game_engine import get_my_promotions
         promos = get_my_promotions()
 
-        # [2026-08 신설, PHASE 2: opponent_context_engine] 국제전(본선+
-        # 예선) 경기 목록 — "당시엔 그냥 한 경기였는데 그 상대가 나중에
-        # 그 대회에서 우승/준우승/4강까지 갔다"는 문장을 만드는 재료.
-        # 이미 위에서 absence_events용으로 캐시해둔 _cm3를 재사용하므로
-        # 추가 조회 비용이 없다.
-        intl_matches = []
-        try:
-            intl_matches = list(_cm3["intl_ms"]) + list(_cm3["qual_ms"])
-        except Exception:
-            pass
-
-        # [2026-08 신설, PHASE 5: 경기 묶음 서술] 리그 경기 전체(팀 재직
-        # 구분 없이 시간순) — story_generator가 (팀,연도)별로 재그룹해서
-        # 연승/연패/로테이션/결장 구간을 찾는다.
-        from game_engine import get_my_league_matches
-        league_matches = []
-        try:
-            league_matches = get_my_league_matches()
-        except Exception:
-            pass
-
-        return (p, entries, trophies, awards, intl_trophies, match_rows,
-                absence_events, promos, intl_matches, league_matches)
+        return p, entries, trophies, awards, intl_trophies, match_rows, absence_events, promos
 
     def _open_story_book(self):
         """story_generator.py(로컬 문장 뱅크 기반, API 비사용)로 장문
-        연대기를 만들어 책 형태의 새 창(StoryBookWindow)으로 띄운다.
-        [2026-08 신설, 신민용 요청: "스토리 생성이 오래 걸리면 게임 시작
-        때 뜨는 바처럼 진행 중임을 보여줘야 한다"] center_panel.py의
-        _ProcessingOverlay(1년 넘기기 등에서 이미 검증된 바로 그 오버레이)를
-        재사용 — 버튼 텍스트만 바꾸는 예전 방식은 generate_story()가 Qt
-        이벤트 루프에 제어권을 안 넘기고 바로 실행되는 동기 호출이라 실제로는
-        화면 갱신이 아예 안 일어났다(버튼 글자가 "생성 중..."으로 안 보이고
-        그대로 멈춘 것처럼 보임). 오버레이를 띄운 직후 processEvents()로
-        강제 렌더링한 뒤에 무거운 계산을 시작해서, 최소한 "지금 뭘 하고
-        있는지"가 화면에 보이게 한다(진행률 세분화는 story_generator 내부가
-        단일 루프라 지금은 불가 — 추후 단계별 콜백을 넣으면 진행률 바로
-        확장 가능)."""
+        연대기를 만들어 책 형태의 새 창(StoryBookWindow)으로 띄운다."""
         # [2026-08 신설, 신민용 요청: "같은 종류의 창은 하나만"] 이미 열려
         # 있으면 새로 생성하지 않고(비용이 드는 문장 생성도 건너뛰고)
         # 기존 창을 앞으로 가져온다.
@@ -2030,22 +2056,14 @@ class RetireWindow(QDialog):
             return
         self.book_btn.setEnabled(False)
         self.book_btn.setText("⏳ 생성 중...")
-
-        from ui.center_panel import _ProcessingOverlay
-        from PyQt6.QtWidgets import QApplication
-        if getattr(self, "_story_overlay", None) is None:
-            self._story_overlay = _ProcessingOverlay(self)
-        self._story_overlay.show_message("📖 스토리 생성 중...")
-        QApplication.processEvents()
         try:
-            (p, entries, trophies, awards, intl_trophies, match_rows,
-             absence_events, promos, intl_matches, league_matches) = self._gather_story_inputs()
+            p, entries, trophies, awards, intl_trophies, match_rows, absence_events, promos = \
+                self._gather_story_inputs()
 
             import story_generator
             story_text = story_generator.generate_story(
                 p, entries, trophies, awards, promos=promos, intl_trophies=intl_trophies,
-                match_rows=match_rows, absence_events=absence_events, intl_matches=intl_matches,
-                league_matches=league_matches)
+                match_rows=match_rows, absence_events=absence_events)
 
             from ui.story_book_window import StoryBookWindow
             self._book_win = StoryBookWindow(p.get("name", "선수"), story_text, parent=self)
@@ -2055,7 +2073,6 @@ class RetireWindow(QDialog):
             self._book_win.finished.connect(_clear_book)
             self._book_win.show()
         finally:
-            self._story_overlay.hide()
             self.book_btn.setEnabled(True)
             self.book_btn.setText("📖 스토리 생성")
 

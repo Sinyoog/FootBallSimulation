@@ -17,7 +17,7 @@ from match_sim import tactical_engine
 from database import (get_conn, calc_ovr, ALL_STATS,
                       rescale_team_to_target_ovr, rescale_teams_to_target_ovr_batch,
                       get_league_avg_ovr,
-                      get_league_strong_ovr)
+                      get_league_strong_ovr, TEAM_STARTER_COUNT)
 from constants import *  # PHYSICAL_STATS, TECHNICAL_STATS, MENTAL_STATS 포함
 
 _pending_transfer_type: str = ""  # join_team → _save_career_entry 전달용. ''=대기(잔류 시즌)
@@ -1547,7 +1547,7 @@ def advance_4weeks(schedule: list):
         flush_log_buffer()
 
 
-def advance_days(schedule: list):
+def advance_days(schedule: list, progress_cb=None):
     """[2026-07 일 단위 진행] schedule 길이만큼 '하루씩 원자적으로' 전진시킨다.
 
     설계 핵심 — 검증된 advance_4weeks(주 단위 엔진)를 그대로 재사용:
@@ -1903,7 +1903,7 @@ def advance_days(schedule: list):
             if week % 4 == 2:
                 _do_flush = True
 
-            _advance_week(p_latest, week, 1)   # current_week/year/season 갱신(검증된 로직)
+            _advance_week(p_latest, week, 1, progress_cb=progress_cb)   # current_week/year/season 갱신(검증된 로직)
             _pw2_t2 = _time_pw2.perf_counter()
             if _pw2_t2 - _pw2_t0 >= 0.1:
                 print(f"[PERF-WEEKTAIL] {week}주차: _pay_salary {_pw2_t1-_pw2_t0:.3f}s | "
@@ -2252,36 +2252,36 @@ def effective_training_stress(p, ttype):
     return stress_chg
 
 
-# [2026-08 신설, 부상 시스템 확장 2단계] 휴식이 신체 부담(injury_load)을
-# 스트레스만큼 화끈하게 못 풀게 하는 배율. stress≠injury_load 설계 의도
-# (stress=단기 피로/휴식으로 바로 회복, injury_load=장기 누적 부담/한 번
-# 쉰다고 확 안 풀림)를 살리는 최소한의 장치 — 정확한 값은 잠정치이며
-# 장기 시뮬레이션 결과를 보고 조정할 예정(신민용 방향: 숫자는 나중에).
-INJURY_LOAD_REST_DECAY_MULT = 0.5
-
-
 def effective_training_injury_load(p, ttype):
-    """선수의 신체특징(부상체질 등)을 반영한 '실제 적용' 신체 부담 변화량.
+    """선수의 나이/신체특징을 반영한 '실제 적용' 신체 부담(injury_load) 변화량.
 
-    [2026-08 신설] "이 수치도 스트레스랑 같은 원리로"(신민용 확정) —
-    기본 증가폭은 TRAINING_CONFIG[ttype]['stress']를 그대로 재사용한다
-    (훈련 강도가 셀수록 스트레스도, 신체 부담도 함께 오른다는 같은 신호).
-    다른 점은 두 가지뿐: ①부상체질은 증가분에 injury_load_mult(1.5배)가
-    곱해진다(예전엔 "훈련마다 확률적으로 바로 부상"이었던 걸 "부담이 더
-    빨리 쌓여 100에 더 빨리 도달"하는 방식으로 대체). ②휴식일 때 감소폭은
-    INJURY_LOAD_REST_DECAY_MULT만큼만 적용(스트레스보다 천천히 빠짐).
+    [2026-08 v5 재설계, 신민용+GPT 확정] v4(stress_delta 재사용 + ×1.8
+    배율 + 기존 경기×1.4)는 두 배율이 곱셈으로 겹쳐 폭발했다(3.9). 이번엔
+    stress_delta를 아예 재사용하지 않고, 처음부터 독립적인 자체 스케일
+    (INJURY_LOAD_TRAINING_VALUE)로 시작한다 — 배율을 곱하는 게 아니라
+    애초에 작은 숫자로 설계해서 곱셈 폭발 여지 자체를 없앤다. 목표: 중강도
+    (4)-휴식(7)은 거의 회복, 고강도(14)-휴식(7)은 절반이 남아 반복하면
+    서서히 누적(14→7→21→14→28→21...). stress는 이번엔 다시 안 건드림
+    (GPT: "이번에는 stress를 다시 같이 만지지 말고 injury_load만 독립적으로
+    조정하는 게 핵심").
+
+    경기 쪽은 이 함수가 아니라 _simulate_match에서 기존 방식(stress_delta
+    ×age_mult×MATCH_INJURY_LOAD_MULT) 그대로 유지 — GPT: "경기는 기존
+    age×match 방식 유지".
     """
-    cfg = TRAINING_CONFIG.get(ttype)
-    if not cfg:
-        return 0
-    from constants import PHYSICAL_TRAIT_EFFECTS as _PTE
-    trait_fx = _PTE.get(p.get("physical_trait", "무난함"), {})
-    load_chg = cfg["stress"]
     if ttype == "휴식":
-        load_chg = int(load_chg * INJURY_LOAD_REST_DECAY_MULT)
-    elif "injury_load_mult" in trait_fx:
-        load_chg = int(load_chg * trait_fx["injury_load_mult"])
-    return load_chg
+        from constants import INJURY_LOAD_REST_RECOVERY
+        return INJURY_LOAD_REST_RECOVERY
+    from constants import (PHYSICAL_TRAIT_EFFECTS as _PTE, get_injury_load_age_mult,
+                            INJURY_LOAD_TRAINING_VALUE)
+    base = INJURY_LOAD_TRAINING_VALUE.get(ttype)
+    if base is None:
+        return 0
+    trait_fx = _PTE.get(p.get("physical_trait", "무난함"), {})
+    load_chg = base * get_injury_load_age_mult(p.get("age", 20))
+    if "injury_load_mult" in trait_fx:
+        load_chg *= trait_fx["injury_load_mult"]
+    return int(load_chg)
 
 
 def _get_stat_start_map(p):
@@ -2295,6 +2295,37 @@ def _get_stat_start_map(p):
         return json.loads(raw)
     except (ValueError, TypeError):
         return {}
+
+
+def _apply_rest_stat_decay(p):
+    """[2026-08 신설, 신민용 확정: "부상당해 쉴 때도 일반 휴식처럼 스탯
+    감소가 있어야"] 원래 _process_training의 휴식 분기 전용이던 스탯
+    감소 로직을 분리 — 부상으로 인한 강제 휴식(_process_injury_week)에도
+    똑같이 적용하기 위함(중복 코드 방지). 저강도 훈련 상승폭의 절반
+    크기로 스탯 1~2개를 깎는다(성장기 여부 무관, 20 밑으로는 안 깎음).
+    반환: {스탯명: 변화량} — 호출부가 update_player에 그대로 반영."""
+    _stat_starts = _ensure_stat_start(p, ALL_STATS)
+    _phy_pool  = [s for s in PHYSICAL_STATS
+                  if s in FOCUS_TRAIN_STATS.get(p["position"], PHYSICAL_STATS)]
+    _tech_pool = [s for s in TECHNICAL_STATS
+                  if s in FOCUS_TRAIN_STATS.get(p["position"], TECHNICAL_STATS)]
+    _rest_pool = (_phy_pool or PHYSICAL_STATS) + (_tech_pool or TECHNICAL_STATS)
+    _rest_below = [s for s in _rest_pool if p.get(s, 40) > 20]
+    _lo_cfg = TRAINING_CONFIG["저강도"]
+    _REST_PENALTY_MULT = 0.5
+    _n_dec = random.choices([1, 2], weights=[60, 40])[0]
+    stat_changes = {}
+    for stat in random.sample(_rest_below, min(_n_dec, len(_rest_below))):
+        cur = p.get(stat, 40)
+        _mx = p.get(f"{stat}_max", 80)
+        _start = _stat_starts.get(stat, p.get(stat, 40))
+        _rest_soft = _progress_soft(cur, _start, _mx)
+        dec = round(random.uniform(_lo_cfg["gain_min"], _lo_cfg["gain_max"])
+                    * _REST_PENALTY_MULT * _rest_soft, 1)
+        new_val = round(max(20, cur - dec), 1)
+        if new_val != cur:
+            stat_changes[stat] = round(new_val - cur, 1)
+    return stat_changes
 
 
 def _ensure_stat_start(p, stat_list):
@@ -2362,6 +2393,12 @@ def _process_training(p, week, ttype, focus_stat=None, day=None):
 
     stress_chg = effective_training_stress(p, ttype)
     injury_load_chg = effective_training_injury_load(p, ttype)
+    # [2026-08 v3, GPT 4차 검토 확정: "100 초과 판정은 세션 시작값이 아니라
+    # 활동으로 증가한 뒤의 값으로"] 여기서 미리 계산해둔다 — 아래 부상
+    # 체크(비휴식 분기)가 "이번 세션 반영 후" 값을 보게 하기 위함. 뒤쪽
+    # "업데이트" 구간에서 이 값을 다시 계산하지 않고 그대로 재사용한다.
+    new_stress = max(0, min(100, p.get("stress", 0) + stress_chg))
+    new_load   = max(0, min(100, p.get("injury_load", 0) + injury_load_chg))
 
     happy_chg = 0
     stat_changes = {}
@@ -2382,37 +2419,9 @@ def _process_training(p, week, ttype, focus_stat=None, day=None):
         # (중강도 3회)과 하락분(휴식 4회, 저강도급)이 서로 상쇄돼 스탯이
         # ±0 근처 또는 소폭 상승에 그친다 — 고강도/휴식 반복으로 무한정
         # 한계치를 찍는 건 막히고, 실제로 쉬어야 할 이유가 생긴다.
-        _phy_pool  = [s for s in PHYSICAL_STATS
-                      if s in FOCUS_TRAIN_STATS.get(p["position"], PHYSICAL_STATS)]
-        _tech_pool = [s for s in TECHNICAL_STATS
-                      if s in FOCUS_TRAIN_STATS.get(p["position"], TECHNICAL_STATS)]
-        _rest_pool = (_phy_pool or PHYSICAL_STATS) + (_tech_pool or TECHNICAL_STATS)
-        _rest_below = [s for s in _rest_pool if p.get(s, 40) > 20]  # 20 밑으로는 안 깎음
-        _lo_cfg = TRAINING_CONFIG["저강도"]
-        # [2026-07 재조정, 신민용 확정: "일단 이렇게 해서"] 일 단위(하루 1결정,
-        # 주 7일 중 경기 1일 소모) 기준으로 다시 시뮬레이션해보니, 저강도
-        # 100% 그대로 적용 시 월드클래스가 피크 나이(23~25세)에도 정상
-        # 도달치보다 한참 못 미치는 부작용이 있었다(경기 스트레스가 고강도
-        # 만큼 세서 휴식을 자주 강제당하는데, 그 휴식마다 100% 페널티가
-        # 겹쳐 과도하게 깎임). 저강도의 50% 크기로 낮춰 — 고강도/휴식 무한
-        # 반복 익스플로잇은 계속 막히면서, 정상적인 시즌 진행(경기+훈련
-        # 혼합)에서는 피크 나이대에 무리 없이 도달할 수 있게 한다.
-        _REST_PENALTY_MULT = 0.5
-        _n_dec = random.choices([1, 2], weights=[60, 40])[0]
-        for stat in random.sample(_rest_below, min(_n_dec, len(_rest_below))):
-            cur = p.get(stat, 40)
-            # [2026-08 신설, 신민용 확정] 휴식 감소폭도 훈련 gain과 같은
-            # 진행률(%) 커브로 스케일링한다 — 한계에 가까운(원숙한) 스탯일수록
-            # 휴식으로 덜 깎이고, 아직 한계와 먼(성장기) 스탯은 원래 크기
-            # 그대로 깎인다.
-            _mx = p.get(f"{stat}_max", 80)
-            _start = _stat_starts.get(stat, p.get(stat, 40))
-            _rest_soft = _progress_soft(cur, _start, _mx)
-            dec = round(random.uniform(_lo_cfg["gain_min"], _lo_cfg["gain_max"])
-                        * _REST_PENALTY_MULT * _rest_soft, 1)
-            new_val = round(max(20, cur - dec), 1)
-            if new_val != cur:
-                stat_changes[stat] = round(new_val - cur, 1)
+        # [2026-08] 실제 감소 로직은 _apply_rest_stat_decay()로 분리 —
+        # 부상 중 강제 휴식(_process_injury_week)도 동일 로직을 쓰기 위함.
+        stat_changes.update(_apply_rest_stat_decay(p))
         happy_chg = random.randint(4, 8)
         # [2026-07 신설] '긍정적' 성격의 happy_gain_mult 연결 (정의만 돼있고
         # 실제 행복도 계산엔 미연결 상태였음) — 상승분에만 배율 적용.
@@ -2424,21 +2433,28 @@ def _process_training(p, week, ttype, focus_stat=None, day=None):
                 log_parts.append(f"   {STAT_KO.get(s,s)} {v:+.1f}")
 
     else:
-        # [2026-08 재설계, 신민용 확정: "훈련에서 확률적으로 부상을 입히는
-        # 기능은 없애야" — 부상 시스템 확장 2단계] 예전엔 훈련 종류별
-        # injury_chance로 매 세션 랜덤 룰렛을 돌려 부상을 줬다. 이제 그
-        # 룰렛은 완전히 없앤다 — 대신 이번 세션 시작 시점에 이미 stress나
-        # injury_load(신체 부담)가 과부하(100)였는지만 본다. 이는 기존에
-        # 있던 "stress>=100 → 부상 확정" 안전장치와 완전히 같은 원리를
-        # injury_load에도 그대로 얹은 것뿐이다(신민용 확정: "이 수치도
-        # 스트레스랑 같은 원리로"). 강철체질(injury_immune)은 이 조건을
-        # 만족해도 부상을 입지 않는다 — 신체 부담이 100을 찍어도 예외.
-        from constants import PHYSICAL_TRAIT_EFFECTS
+        # [2026-08 v3 재설계, GPT 3~4차 검토 + 신민용 확정 — 부상 시스템
+        # 확장 3단계] 예전엔 훈련 종류별 injury_chance 룰렛(1단계) →
+        # stress/injury_load 100 하드 임계값만(2단계) 이었는데, 이제 100
+        # 미만 구간에도 완만한 확률을 추가한다. 100 이상은 여전히 "최종
+        # 안전장치"로 무조건 발동 — 단 판정 기준값을 세션 시작 시점이
+        # 아니라 "이번 세션 반영 후"(new_stress/new_load, 위에서 미리
+        # 계산해둠) 값으로 본다. "이번 활동 때문에 한계를 넘었다"는 인과
+        # 관계가 명확하도록(GPT 지적). 강철체질(injury_immune)은 100
+        # 이상이든 확률 판정이든 전부 예외 — 절대 안 다친다.
+        from constants import PHYSICAL_TRAIT_EFFECTS, calc_injury_probability
         trait_fx = PHYSICAL_TRAIT_EFFECTS.get(p.get("physical_trait", "무난함"), {})
         immune = bool(trait_fx.get("injury_immune"))
-        if not immune and (p.get("stress", 0) >= 100 or p.get("injury_load", 0) >= 100):
-            _apply_injury(p, week, day=day)
-            return
+        if not immune:
+            if new_stress >= 100 or new_load >= 100:
+                _apply_injury(p, week, day=day, stress=new_stress, injury_load=new_load,
+                              activity_type="training", training_type=ttype)
+                return
+            _inj_prob = calc_injury_probability(new_stress, new_load)
+            if random.random() < _inj_prob:
+                _apply_injury(p, week, day=day, stress=new_stress, injury_load=new_load,
+                              activity_type="training", training_type=ttype)
+                return
 
         # ── 훈련 스탯 상승 ──────────────────────────────────
         # 집중훈련: 지정 스탯 1개
@@ -2710,9 +2726,10 @@ def _process_training(p, week, ttype, focus_stat=None, day=None):
             log_parts.append("   (변화 없음)")
 
     # 업데이트
-    new_stress  = max(0, min(100, p["stress"] + stress_chg))
-    new_happy   = max(0, min(100, p["happiness"] + happy_chg))
-    new_load    = max(0, min(100, p.get("injury_load", 0) + injury_load_chg))
+    # [2026-08 v3] new_stress/new_load는 위에서(부상 체크 이전에) 이미
+    # 계산해둔 값을 그대로 재사용 — 여기서 다시 계산하지 않는다(중복 계산
+    # 방지 + 부상 체크가 본 값과 실제 저장되는 값이 항상 일치하도록).
+    new_happy = max(0, min(100, p["happiness"] + happy_chg))
     updates = dict(stress=new_stress, happiness=new_happy, injury_load=new_load)
     max_ups   = {k: v for k, v in stat_changes.items() if k.endswith("_max_up")}
     real_changes = {k: v for k, v in stat_changes.items() if not k.endswith("_max_up")}
@@ -2790,7 +2807,82 @@ def _process_training(p, week, ttype, focus_stat=None, day=None):
         add_log(line, "training")
 
 
-def _apply_injury(p, week, day=None):
+def get_active_recurrence_vulnerability(player_id, today_year, today_day):
+    """[2026-08 신설, GPT 확정 — 부상 시스템 확장 5단계: 재발] 지금 재발
+    취약기가 활성화돼 있으면 그 body_part(예: 'l_knee')를 반환, 없으면
+    None. 복귀 완료(return_date IS NOT NULL)된 90일+ 부상 중 가장 최근
+    것 하나만 본다 — 여러 취약 부위를 동시에 활성화하지 않는다(GPT
+    확정: "재발 판정 기준은 마지막 중증 부상 하나만 보면 됨").
+    vulnerable_until = return_date + clamp(expected_days*0.25, 21, 70)일이
+    지났으면(오늘이 그 이후면) 이미 취약기가 끝난 것으로 보고 None."""
+    if today_day is None or today_year is None:
+        return None
+    conn = get_conn()
+    row = conn.execute(
+        """SELECT body_part, return_date, expected_days FROM injury_history
+           WHERE player_id=? AND return_date IS NOT NULL AND expected_days>=90
+           ORDER BY history_id DESC LIMIT 1""",
+        (player_id,)).fetchone()
+    if not row or not row["return_date"]:
+        return None
+    vulnerable_days = max(21, min(70, int(row["expected_days"] * 0.25)))
+    return_abs = iso_date_str_to_absolute_day(row["return_date"])
+    today_abs = iso_date_str_to_absolute_day(day_to_iso_date_str(today_year, today_day))
+    if today_abs <= return_abs + vulnerable_days:
+        return row["body_part"]
+    return None
+
+
+def _record_injury_history_start(player_id, entry, body_part_final, expected_days, day,
+                                  was_recurrence=0):
+    """[2026-08 신설] 부상 발생 시 injury_history에 새 이력 행을 기록.
+    return_date/actual_days는 NULL로 남겨두고(아직 복귀 전),
+    _record_injury_history_return()이 복귀 시점에 채운다. day가 없으면
+    (날짜 정보 없는 옛 호출 경로) 이력 기록 자체를 생략 — 부상 처리
+    자체는 이 함수와 무관하게 그대로 진행되므로 안전하다."""
+    if day is None:
+        return
+    st = get_state()
+    year = st.get("current_year")
+    if year is None:
+        return
+    start_date = day_to_iso_date_str(year, day)
+    expected_return_date = add_days_to_iso_date_str(year, day, expected_days)
+    conn = get_conn()
+    conn.execute(
+        """INSERT INTO injury_history
+           (player_id, injury_id, body_part, tier, start_date, expected_days,
+            expected_return_date, return_date, actual_days, was_recurrence)
+           VALUES (?,?,?,?,?,?,?,NULL,NULL,?)""",
+        (player_id, entry["id"], body_part_final, entry["tier"],
+         start_date, expected_days, expected_return_date, int(bool(was_recurrence))))
+    conn.commit()
+
+
+def _record_injury_history_return(player_id, day):
+    """[2026-08 신설] 부상 회복 완료 시 이 선수의 '아직 안 돌아온'(return_date
+    IS NULL) 이력 행을 복귀일로 채운다. 한 선수는 동시에 부상을 하나만
+    가지므로(injured 플래그가 단일 상태) player_id만으로 유일하게 찾아진다.
+    actual_days는 지금은 항상 expected_days와 같다 — 회복을 앞당기거나
+    늘리는 시스템(재활 등)이 아직 없어서다. 그런 시스템이 생기면 여기서
+    실제 값을 따로 계산해 넣으면 된다."""
+    if day is None:
+        return
+    st = get_state()
+    year = st.get("current_year")
+    if year is None:
+        return
+    return_date = day_to_iso_date_str(year, day)
+    conn = get_conn()
+    conn.execute(
+        """UPDATE injury_history SET return_date=?, actual_days=expected_days
+           WHERE player_id=? AND return_date IS NULL""",
+        (return_date, player_id))
+    conn.commit()
+
+
+def _apply_injury(p, week, day=None, stress=None, injury_load=None,
+                   activity_type=None, training_type=None):
     # [2026-08 재작성, 부상 시스템 확장 1차] 등급을 먼저 확률로 고르고 그
     # 등급 안에서 구체 부상을 고르던 기존 2단계 방식(INJURY_TIER_CHANCE→
     # INJURY_DETAILS) 대신, constants.INJURY_POOL(신민용 제공 스포츠의학
@@ -2802,6 +2894,16 @@ def _apply_injury(p, week, day=None):
     # "부상 발생 확률 자체"가 아니라 "어떤 부상이 나올지"만 보정하는
     # 구조(신민용 확정 원칙).
     #
+    # [2026-08 v3 추가, 부상 시스템 확장 3단계] injury_load가 높을수록
+    # 심각/매우심각 쪽으로 부상 등급 분포가 이동한다(constants.
+    # INJURY_LOAD_SEVERITY_CURVE) — 호출부(_process_training/추후 매치)가
+    # "이번 세션 반영 후" 값을 넘겨주면 그 값 기준으로, 안 넘겨주면
+    # p['injury_load'](기존 저장값)를 그대로 쓴다.
+    #
+    # stress/injury_load 인자: 호출부가 이미 "이번 세션 반영 후" 값을
+    # 계산해뒀다면(현재는 _process_training만 해당) 여기서 다시 계산하지
+    # 않고 그대로 저장한다 — 안 넘기면(기존 호출부 호환) 기존 값 유지.
+    #
     # [부위 저장] 이제 부상명에서 부위를 추측하지 않고 실제 zone 키를
     # injury_body_part에 그대로 저장한다 — ui/player_panel.py의 신체
     # 실루엣이 이 값을 바로 갖다 쓴다. 좌/우가 있는 부위(sided=True)는
@@ -2811,27 +2913,88 @@ def _apply_injury(p, week, day=None):
     # 자료가 실제 경기 복귀 기준 '일수')이라 DAYS_PER_WEEK를 곱하지 않는다
     # — injury_weeks 필드명은 예전 마이그레이션 그대로 두지만 실제로는
     # '남은 일수'.
-    entry = pick_injury(p.get("position"))
+    # [2026-08 신설] activity_type/training_type — 지금은 pick_injury() 안의
+    # get_training_injury_multiplier가 항상 1.0이라 결과에 영향 없지만,
+    # 나중에 훈련 종류별 부상 보정을 켤 때 호출부를 다시 안 고치도록
+    # 인터페이스만 미리 통과시켜둔다(GPT 권고).
+    # [2026-08 구현, 부상 시스템 확장 5단계: 재발 — GPT 확정 스펙]
+    # 재발 취약기가 활성화돼 있으면(90일+ 부상 복귀 후 clamp(예상일수*0.25,
+    # 21,70)일 이내) 그 부위 계열의 가중치가 고강도훈련×1.4/경기×1.9로
+    # 올라간다("부상 발생 확률"이 아니라 "그 부위가 하필 나올 확률"만).
+    st = get_state()
+    _vuln_bp = get_active_recurrence_vulnerability(p.get("id", 1), st.get("current_year"), day)
+    _load_for_severity = injury_load if injury_load is not None else p.get("injury_load", 0)
+    entry = pick_injury(p.get("position"), injury_load=_load_for_severity,
+                         activity_type=activity_type, training_type=training_type,
+                         vulnerable_body_part=_vuln_bp)
     itype = entry["tier"]
     detail_name = entry["name"]
     lo, hi = entry["recovery_days"]
     days = random.randint(lo, hi)
     body_part = entry["body_part"]
     if entry["sided"]:
-        body_part = f"{random.choice(['l', 'r'])}_{body_part}"
+        # [재발] 취약 부위와 같은 계열(예: 'knee')이 뽑혔고 그 취약 부위에
+        # 좌/우 기록이 있으면, 그 방향으로 살짝 더 치우치게(75%) 좌/우를
+        # 정한다 — "그 부위가 다시 다칠 확률"이 재발의 핵심이므로 완전
+        # 무작위(50/50)보다 실제 재발(같은 쪽) 쪽에 가중치를 두는 게 맞음.
+        # 그래도 100%는 아님 — 반대쪽 보상 부상도 현실적으로 있으므로.
+        _vuln_side = None
+        if _vuln_bp and "_" in _vuln_bp:
+            _s, _b = _vuln_bp.split("_", 1)
+            if _s in ("l", "r") and _b == body_part:
+                _vuln_side = _s
+        if _vuln_side:
+            _other = "r" if _vuln_side == "l" else "l"
+            side = random.choices([_vuln_side, _other], weights=[75, 25])[0]
+        else:
+            side = random.choice(["l", "r"])
+        body_part = f"{side}_{body_part}"
+    # was_recurrence: 직전 활성 재발 취약기의 부위와 좌우까지 정확히 같은
+    # body_part가 이번에 뽑혔을 때만 1(GPT 확정: "동일한 body_part가
+    # 선택된 경우에만 was_recurrence=1" — 부위는 같아도 좌우가 다르면 0).
+    was_recurrence = 1 if (_vuln_bp and body_part == _vuln_bp) else 0
     # 등급이 심할수록 행복도 타격도 커지게(기존엔 등급 무관 고정 -20).
     happy_penalty = {"경미": 10, "중간": 15, "심각": 20, "매우 심각": 30}.get(itype, 20)
-    update_player(injured=1, injury_weeks=days, injury_type=itype, injury_detail=detail_name,
-                  injury_body_part=body_part,
-                  happiness=max(0, p["happiness"] - happy_penalty))
+    _updates = dict(injured=1, injury_weeks=days, injury_type=itype, injury_detail=detail_name,
+                     injury_body_part=body_part,
+                     happiness=max(0, p["happiness"] - happy_penalty))
+    if stress is not None:
+        _updates["stress"] = stress
+    if injury_load is not None:
+        _updates["injury_load"] = injury_load
+    update_player(**_updates)
+    _record_injury_history_start(p.get("id", 1), entry, body_part, days, day,
+                                  was_recurrence=was_recurrence)
     add_log(f"🚑 {detail_name} ({itype})!  {_day_label(week, day)}  ({days}일 휴식 필요)", "injury")
 
 
 def _process_injury_week(p, week, day=None):
+    # [2026-08 v3, GPT 4차 검토 + 신민용 확정 — 부상 시스템 확장 3단계]
+    # 예전엔 부상 중엔 injury_weeks(남은 일수)와 가끔 popularity만 건드리고
+    # stress/injury_load는 전혀 안 건드려서, 부상당한 순간 값이 회복될
+    # 때까지 그대로 얼어붙어 있었다(실제로 신민용이 "신체 부담이 80에서
+    # 멈춘다"로 관찰한 원인). "120일 동안 아무것도 못 하고 쉬는데 부담이
+    # 그대로인 건 이상하다"는 지적에 따라, 부상 중에도 평소 휴식(ttype=
+    # "휴식")과 완전히 동일한 공식으로 계속 회복시킨다 — 별도의 "부상 중
+    # 전용" 회복식을 만들지 않고 하나로 통일(v3 확정: 회복은 상황 무관
+    # 동일).
+    _stress_chg = effective_training_stress(p, "휴식")
+    _load_chg   = effective_training_injury_load(p, "휴식")
+    new_stress = max(0, min(100, p.get("stress", 0) + _stress_chg))
+    new_load   = max(0, min(100, p.get("injury_load", 0) + _load_chg))
+    # [2026-08 신설, 신민용 확정: "부상당해 쉴 때도 일반 휴식처럼 스탯
+    # 감소가 있어야"] 부상 중엔 훈련을 아예 못 하니 실질적으로 매일이
+    # "강제 휴식"인데, 지금까지는 이 기간에 스탯 감소가 전혀 없었다 —
+    # 일반 휴식과 동일한 로직(_apply_rest_stat_decay)을 매일 그대로 적용.
+    _stat_chg = _apply_rest_stat_decay(p)
+    _stat_updates = {s: p.get(s, 40) + d for s, d in _stat_chg.items()}
+
     left = p["injury_weeks"] - 1
     if left <= 0:
         update_player(injured=0, injury_weeks=0, injury_type="", injury_detail="",
-                      injury_body_part="")
+                      injury_body_part="", stress=new_stress, injury_load=new_load,
+                      **_stat_updates)
+        _record_injury_history_return(p.get("id", 1), day)
         add_log(f"✅ {p.get('injury_detail') or '부상'} 회복!  {_day_label(week, day)}", "injury")
     else:
         # [2026-07 신설, 신민용 설계+확정: "인기도 = 최근 화제성 — 못 뛰면
@@ -2843,7 +3006,8 @@ def _process_injury_week(p, week, day=None):
         pop_updates = {}
         if pop > 0 and random.random() < 0.15:
             pop_updates["popularity"] = pop - 1
-        update_player(injury_weeks=left, **pop_updates)
+        update_player(injury_weeks=left, stress=new_stress, injury_load=new_load,
+                      **_stat_updates, **pop_updates)
         detail = p.get("injury_detail") or "부상"
         add_log(f"🚑 {detail} 휴식  {_day_label(week, day)}  ({left}일 남음)", "injury")
 
@@ -3157,34 +3321,33 @@ def _simulate_match(p, week, info: dict, day=None):
     # [2026-07 조정, 신민용 지적: "경기 스트레스가 고강도 훈련만큼은 돼야
     # 하지 않나"] 기존엔 3~8로, 고강도 훈련 스트레스(+20)의 1/4~1/2에
     # 불과했다 — 실제 경기는 전력 질주·태클·결과 압박까지 겹쳐 단일
-    # 훈련 세션보다 덜하지 않다고 보는 게 맞다. 고강도 훈련(20)과 같거나
-    # 넘는 수준으로 올리되, 홈/원정·나이 차등(원정↑, 30대↓)은 그대로 유지.
-    # [2026-07 재조정, 신민용 확정] 고강도 훈련(16)과 균형 맞춰 경기
-    # 스트레스도 14/18로 하향 — "경기 있는 주엔 고강도 1회가 자연스러운
-    # 선택"이 되도록. 30대는 그보다 더 낮게(체력 안배) 유지.
-    # [2026-07 재조정, 신민용 확정] 3단계 연령 구간: 25세 미만 18/22,
-    # 25~29세 16/20, 30대 10/14 (체력 안배 반영, 나이 들수록 완만하게 감소).
-    if age >= 30:
-        match_stress = 10 if info.get("is_home") else 14
-    elif age >= 25:
-        match_stress = 16 if info.get("is_home") else 20
-    else:
-        match_stress = 18 if info.get("is_home") else 22
+    # [2026-08 재설계, 신민용+GPT 확정: "스트레스는 훈련보다 리그 경기에서
+    # 더 쌓이며, 승/무/패에 따라 차이가 있어야"] 홈/원정·나이 기반 고정값
+    # 대신 경기 결과(승/무/패) 기반으로 전환 — 이긴 경기는 신체적으로는
+    # 똑같이 뛰었어도 심리적 스트레스가 적고, 진 경기는 몸+심리 부담이
+    # 겹쳐 더 크다는 원칙(GPT: "경기 기본 부하 + 결과에 따른 스트레스
+    # 보정이 합쳐진 값"). base + result_modifier 구조로 둬서 나중에
+    # 라이벌전/컵결승/연패 같은 상황을 result_modifier 옆에 얹기 쉽게
+    # 한다. 홈/원정·나이 차등은 이번 개편으로 제거 — 결과 기반이 주축이
+    # 되고, 장기 나이 효과는 이미 injury_load의 age_mult가 담당.
+    match_stress = MATCH_STRESS_BASE + MATCH_RESULT_STRESS_MOD.get(my_result, 0)
     ns = min(100, p["stress"] + match_stress)
-    # [2026-08 신설, 부상 시스템 확장 2단계, 신민용 확정: "경기 출전도
-    # 신체 부담을 늘림"] 실제로 뛴 경기만 부담을 쌓는다(벤치/결장은
-    # 제외 — played가 이미 그 조건을 담고 있음). 스트레스와 같은 원리로
-    # match_stress를 그대로 재사용하고, 부상체질만 1.5배로 더 쌓인다.
-    # 이 시점에 신체 부담 100 과부하로 인한 강제 부상 판정은 하지 않는다
-    # (그 트리거는 지금은 훈련 세션에서만 확인 — _process_training 참고,
-    # 매치 쪽까지 트리거를 얹는 건 다음 단계에서 검토).
+    # [2026-08 v5 재수정 — 실측 후 재설계] 훈련이 독립 작은 스케일로
+    # 바뀌면서 경기도 그 스케일에 맞는 자체 값(INJURY_LOAD_MATCH_VALUE)을
+    # 쓴다 — stress의 match_stress(옛 큰 값)를 더 이상 재사용하지 않음
+    # (재사용하면 경기 하나가 훈련 6일 전체보다 커져버리는 게 실측으로
+    # 확인됨). stress 자체는 여전히 안 건드림 — injury_load 계산에만
+    # 나이 배율(age_mult)을 곱한다.
     if played:
-        from constants import PHYSICAL_TRAIT_EFFECTS as _PTE_match
+        from constants import (PHYSICAL_TRAIT_EFFECTS as _PTE_match,
+                               get_injury_load_age_mult, INJURY_LOAD_MATCH_VALUE)
         _trait_fx_match = _PTE_match.get(p.get("physical_trait", "무난함"), {})
-        _load_chg = match_stress
+        _age_mult = get_injury_load_age_mult(p.get("age", 20))
+        _match_load_base = INJURY_LOAD_MATCH_VALUE.get(my_result, 0)
+        _load_chg = _match_load_base * _age_mult
         if "injury_load_mult" in _trait_fx_match:
-            _load_chg = int(_load_chg * _trait_fx_match["injury_load_mult"])
-        new_load = max(0, min(100, p.get("injury_load", 0) + _load_chg))
+            _load_chg *= _trait_fx_match["injury_load_mult"]
+        new_load = max(0, min(100, p.get("injury_load", 0) + int(_load_chg)))
     else:
         new_load = p.get("injury_load", 0)
     nh = p["happiness"]
@@ -3197,6 +3360,61 @@ def _simulate_match(p, week, info: dict, day=None):
     elif my_result == "loss": nh = max(0,   nh-3)
     if p.get("slump"):
         nh = max(0, nh - 15)
+
+    # [2026-08 신설, 부상 시스템 확장 — 경기 중 부상, 신민용 확정]
+    # "훈련 부상 = 관리의 결과 / 경기 부상 = 경기에서 발생하는 희귀한
+    # 사고"라는 성격 차이를 명확히 둔다 — 훈련처럼 risk_score를 합성하지
+    # 않고, 부상체질만 5%(그 외 전부 1%) 고정 기본확률 × injury_load
+    # 완만한 보정(최대 ×2.5, 상한 15%)이라는 단순한 구조. 강철체질은
+    # 애초에 면역이라 확률 계산 자체를 안 함. "관리 잘해서 경기 나갔더니
+    # 경기에서 계속 다친다"는 이상한 결과를 피하려고 기본값 자체를
+    # 낮게(1~5%) 잡음. 재발(취약 부위 가중치 ×1.9)은 여기서도 기존
+    # 훈련과 동일한 원칙(전체 확률이 아니라 부위 선택 가중치에만 적용)을
+    # 그대로 따른다 — pick_injury()가 vulnerable_body_part를 받아 알아서
+    # 처리하므로 이 확률 계산에는 별도로 안 얹는다.
+    _injury_extra_updates = {}
+    if played:
+        from constants import PHYSICAL_TRAIT_EFFECTS as _PTE_inj
+        _trait_fx_inj = _PTE_inj.get(p.get("physical_trait", "무난함"), {})
+        _immune = bool(_trait_fx_inj.get("injury_immune"))
+        if not _immune:
+            _match_hurt = (ns >= 100 or new_load >= 100)
+            if not _match_hurt:
+                from constants import calc_match_injury_probability
+                _mprob = calc_match_injury_probability(new_load, p.get("physical_trait", "무난함"))
+                _match_hurt = random.random() < _mprob
+            if _match_hurt:
+                _mst = get_state()
+                _vuln_bp = get_active_recurrence_vulnerability(
+                    p.get("id", 1), _mst.get("current_year"), day)
+                _entry = pick_injury(p.get("position"), injury_load=new_load,
+                                      activity_type="match", training_type=None,
+                                      vulnerable_body_part=_vuln_bp)
+                _idays = random.randint(*_entry["recovery_days"])
+                _ibp = _entry["body_part"]
+                if _entry["sided"]:
+                    _vs = None
+                    if _vuln_bp and "_" in _vuln_bp:
+                        _s, _b = _vuln_bp.split("_", 1)
+                        if _s in ("l", "r") and _b == _ibp:
+                            _vs = _s
+                    if _vs:
+                        _other = "r" if _vs == "l" else "l"
+                        _side = random.choices([_vs, _other], weights=[75, 25])[0]
+                    else:
+                        _side = random.choice(["l", "r"])
+                    _ibp = f"{_side}_{_ibp}"
+                _was_recur = 1 if (_vuln_bp and _ibp == _vuln_bp) else 0
+                _happy_penalty = {"경미": 10, "중간": 15, "심각": 20,
+                                   "매우 심각": 30}.get(_entry["tier"], 20)
+                nh = max(0, nh - _happy_penalty)
+                _injury_extra_updates = dict(
+                    injured=1, injury_weeks=_idays, injury_type=_entry["tier"],
+                    injury_detail=_entry["name"], injury_body_part=_ibp)
+                _record_injury_history_start(p.get("id", 1), _entry, _ibp, _idays, day,
+                                              was_recurrence=_was_recur)
+                add_log(f"🚑 {_entry['name']} ({_entry['tier']})! 경기 중 부상  "
+                        f"{_day_label(week, day)}  ({_idays}일 휴식 필요)", "injury")
 
     mental_updates = {}
     if played:
@@ -3213,9 +3431,10 @@ def _simulate_match(p, week, info: dict, day=None):
             mental_updates[ms] = cur - 1
         add_log(f"⚠ 경기 불참  {_day_label(week, day)}  {STAT_KO.get(ms,ms)} -1", "training")
 
-    # [최적화] 감독관계·인기도·스트레스·행복·멘탈·신체부담 모두 1회 update_player로 통합
+    # [최적화] 감독관계·인기도·스트레스·행복·멘탈·신체부담·부상 모두 1회 update_player로 통합
     update_player(manager_relation=new_rel, popularity=new_pop,
-                  stress=ns, happiness=nh, injury_load=new_load, **mental_updates)
+                  stress=ns, happiness=nh, injury_load=new_load,
+                  **mental_updates, **_injury_extra_updates)
 
     _write_match_log(p, week, info["league_name"], is_home,
                      home_id, away_id, hs, as_,
@@ -3256,7 +3475,18 @@ def _team_avg_ovr(c, team_id):
     cached = _team_ovr_cache.get(team_id)
     if cached is not None:
         return cached
-    c.execute("SELECT AVG(ovr) as v FROM ai_players WHERE team_id=?", (team_id,))
+    # [2026-08 수정, 벤치 인원 확장: "팀 OVR = 실제 선발 11명 평균"] 예전엔
+    # 스쿼드 전체(벤치 포함) 평균을 그대로 팀 OVR로 썼는데, 벤치가 11명→
+    # 18명(주전7 추가)으로 늘면서 이 평균이 벤치의 낮은 OVR에 계속 끌려
+    # 내려가는 문제가 생긴다. OVR 상위 11명만 평균 내는 방식으로 바꾼다 —
+    # 포메이션 화면(_players_for_team)·경기 시뮬레이션 선발 로직
+    # (match_flow.py)이 이미 "OVR 상위 11명 = 선발"이라는 동일한 전제를
+    # 쓰고 있어(둘 다 ORDER BY ovr DESC LIMIT 11), 이 함수도 그 전제에
+    # 맞춰 통일한다. 아직 벤치가 없는(정확히 11명인) 팀은 결과가 기존과
+    # 완전히 동일하다.
+    c.execute("""SELECT AVG(ovr) as v FROM (
+                    SELECT ovr FROM ai_players WHERE team_id=?
+                    ORDER BY ovr DESC LIMIT 11)""", (team_id,))
     row = c.fetchone()
     val = row["v"] if row and row["v"] else 45
     # [2026-07 신설, 신민용 리포트: "명문팀(prestige_clubs.py)이 그래도
@@ -3345,11 +3575,30 @@ def _team_avg_ovr_with_me(c, team_id, p):
     c.execute("""SELECT ovr FROM ai_players WHERE team_id=? AND position=?
                  ORDER BY ovr DESC LIMIT 1""", (team_id, my_pos))
     row = c.fetchone()
-    if not row or my_ovr <= row["ovr"]:
-        return base_avg   # 그 자리 기존 주전보다 낫지 않으면 그대로
+    # [2026-08 수정, 신민용 리포트: "39/44경기 뛰었는데 화면엔 벤치로
+    # 나온다" — 포메이션 화면과 동일한 원인을 여기서도 재확인] 순수 OVR
+    # 스냅샷 비교만 쓰면, 이번 시즌 내내 사실상 주전으로 뛰어온 선수도
+    # 그 순간의 미세한 OVR 역전 하나로 "주전 아님" 취급돼 팀 OVR 계산에서
+    # 빠질 수 있었다. 이번 시즌 실제 출전율이 뚜렷하게 높으면(과반 이상,
+    # 최소 5경기 이상 표본) OVR 비교와 무관하게 주전으로 취급한다 —
+    # 포메이션 화면(ui/formation_widget.py의 동일 로직)과 판정 기준을
+    # 통일한다.
+    _played = p.get("season_matches", 0)
+    _total_sn = (_played + p.get("season_bench_matches_missed", 0)
+                 + p.get("season_injury_matches_missed", 0)
+                 + p.get("season_suspension_matches_missed", 0))
+    _actual_starter = _total_sn >= 5 and (_played / _total_sn) >= 0.5
+    if not row or (my_ovr <= row["ovr"] and not _actual_starter):
+        return base_avg   # 그 자리 기존 주전보다 낫지 않고, 실제로도 주전급이 아니면 그대로
+    # [2026-08 수정, 벤치 인원 확장] base_avg가 이제 스쿼드 전체가 아니라
+    # 상위 11명(선발) 평균이므로, 여기서 "선수 한 명 교체"로 평균이 변하는
+    # 폭도 그 11명 기준으로 나눠야 맞다(스쿼드가 18명이 됐다고 분모를
+    # 18로 쓰면 내 교체 효과가 부당하게 희석된다). 스쿼드가 11명보다 적은
+    # 예외 상황(강등 직후 등)만 실제 인원으로 낮춘다.
     n_row = c.execute("SELECT COUNT(*) AS n FROM ai_players WHERE team_id=?",
                        (team_id,)).fetchone()
-    n = n_row["n"] if n_row else 0
+    n_actual = n_row["n"] if n_row else 0
+    n = min(n_actual, TEAM_STARTER_COUNT) if n_actual else 0
     if not n:
         return base_avg
     return base_avg + (my_ovr - row["ovr"]) / n
@@ -6773,7 +7022,7 @@ def _execute_pending_join_transfer(p, year, week):
             "event", year, week)
 
 
-def _advance_week(p, base_week, n_weeks=4):
+def _advance_week(p, base_week, n_weeks=4, progress_cb=None):
     new_week = base_week + n_weeks
     new_year = p["current_year"]
     new_season = p["current_season"]
@@ -6797,7 +7046,7 @@ def _advance_week(p, base_week, n_weeks=4):
         _t1 = _time_perf.perf_counter()
         # [귀화] 거주 연수 갱신 + 자격 체크는 _end_of_season 안에서 처리
         #   (그 시점에 current_team_id가 아직 살아있어 소속국가를 읽을 수 있음)
-        _end_of_season(p, new_year-1)
+        _end_of_season(p, new_year-1, progress_cb=progress_cb)
         _t2 = _time_perf.perf_counter()
         # [실시간 전환] 승강제 결과가 반영된 뒤(= teams.league_id 확정 후) 전 세계
         # 모든 리그의 새 시즌 일정을 미리 깔아 둔다. 이후 매주 _sim_all_ai_matches가
@@ -9190,7 +9439,7 @@ def _recalc_field_pos_after_offseason(p):
         pass
 
 
-def _end_of_season(p, year):
+def _end_of_season(p, year, progress_cb=None):
     # 커리어 기록은 37~40주차 진입 시 이미 저장됨 → 여기선 생략
 
     # [2026-07 버그수정, 신민용 리포트: "발롱도르급 선수가 말도 안 되게
@@ -9454,7 +9703,7 @@ def _end_of_season(p, year):
     _tp1 = _time_perf2.perf_counter()
     try:
         from ai_lifecycle import run_ai_offseason
-        run_ai_offseason(year, verbose_log=add_log)
+        run_ai_offseason(year, verbose_log=add_log, progress_cb=progress_cb)
     except Exception as _e:
         add_log(f"⚠ 이적시장 처리 중 오류: {_e}", "event", year, 52)
     if DEBUG_RELEGATION_TRACKING:
@@ -10924,7 +11173,16 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
             # 정반대 문제가 생길 수 있어, 하위 20%ile(리그 하위권 시작 —
             # 신입답게 고전은 하지만 완전히 최하위는 아닌 수준)로 확정한다.
             _upper_avg = _cached_league_strong_ovr(upper_lid, 0.20)
-            _lower_strong = _cached_league_strong_ovr(lower_lid, 0.75)
+            # [2026-08 신설, 신민용 확정: "일반 강등팀 하부리그 안착 분포"]
+            # 예전엔 여기서 _lower_strong 하나(pct=0.75 고정)를 미리 계산해
+            # 강등팀 전원에게 그대로 썼다 — 이제 명문/일반 여부에 따라
+            # 타겟이 갈리므로, 명문팀 전용 고정값만 여기서 미리 구해두고
+            # (기존 그대로) 일반팀은 아래 강등 루프 안에서 팀별로 확률
+            # 샘플링한 pct를 그때그때 넘겨 계산한다(constants.
+            # sample_general_relegation_landing_pct 참고, 팀마다 다른
+            # 지점에 착지할 수 있어야 하므로 루프 밖에서 한 번만 계산하면
+            # 안 됨).
+            _lower_strong_prestige = _cached_league_strong_ovr(lower_lid, 0.75)
 
 
             for top_lower in top_lower_list:
@@ -11007,8 +11265,20 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
                     _mtype = _mtype_prestige
                 _momentum_reset_updates.append(
                     (_mtype, MOMENTUM_START_BY_TYPE[_mtype], bottom_upper["id"]))
-                if _lower_strong is not None:
-                    _rescale_jobs.append((bottom_upper["id"], _lower_strong))
+                # [2026-08 신설, 신민용 확정: "일반 강등팀 하부리그 안착
+                # 분포"] 명문팀(prestige_level 1~3)은 기존처럼 상위 25%
+                # 고정 지점(_lower_strong_prestige) 그대로 유지. 일반팀은
+                # constants.GENERAL_RELEGATION_LANDING_BANDS 확률표로 매번
+                # 새로 뽑은 percentile을 써서, 강등마다 다른 지점(가끔은
+                # 진짜 강등권 근처)에 착지할 수 있게 한다.
+                if _bu_plevel > 0:
+                    _bu_target_ovr = _lower_strong_prestige
+                else:
+                    from constants import sample_general_relegation_landing_pct
+                    _bu_landing_pct = sample_general_relegation_landing_pct()
+                    _bu_target_ovr = _cached_league_strong_ovr(lower_lid, _bu_landing_pct)
+                if _bu_target_ovr is not None:
+                    _rescale_jobs.append((bottom_upper["id"], _bu_target_ovr))
                     if DEBUG_RELEGATION_TRACKING:
                         _RELEGATION_DEBUG_TRACK[bottom_upper["id"]] = {
                             "name": bu_info["name"], "season": season, "checkpoints": {}}
@@ -11593,6 +11863,36 @@ def _blocked_offer_team_ids(cur_year) -> set:
         (cur_year,)).fetchall()
     conn.close()
     return {r["team_id"] for r in rows}
+
+
+def get_season_all_competition_appearances(p) -> tuple:
+    """[2026-08 신설, 신민용 요청: "출전이 리그전만 표시된다 — 커리어처럼
+    총경기도 같이 보여달라"] season_matches는 _simulate_match(리그 경기)
+    에서만 갱신되는 리그 전용 카운터라 컵/챔스/유로파/컨퍼런스/슈퍼컵/
+    클럽월드컵/국가대표 출전은 반영되지 않는다. match_details는 이
+    모든 대회가 공유하는 저장 헬퍼(_save_match_detail, "리그/챔스/국대
+    모두 이 헬퍼를 공유한다")를 통해 매 경기(벤치 포함) 저장되므로, 여기서
+    이번 시즌 전체를 다시 집계한다.
+    반환: (played, total) — played=실제 출전(벤치/부상/징계 제외),
+    total=이번 시즌 기록된 전체 경기 수(벤치 포함)."""
+    season = p.get("current_season", 0) if p else 0
+    if not season:
+        return (0, 0)
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT detail_json FROM match_details WHERE season=?", (season,)).fetchall()
+    conn.close()
+    played = 0
+    total = 0
+    for r in rows:
+        total += 1
+        try:
+            payload = json.loads(r["detail_json"])
+            if payload.get("played"):
+                played += 1
+        except Exception:
+            pass
+    return (played, total)
 
 
 def _get_season_total_matches(tid) -> int:
@@ -14247,11 +14547,16 @@ def _enforce_foreign_quota_on_join(team_id, team_country, my_nationality):
     외국인 쿼터 초과 시 유망주 자리를 자국 선수로 채우는 것과 비슷한
     그림)해서 쿼터를 맞춘다. 내가 자국 선수면(quota 안 걸림) 아무것도
     안 한다."""
-    from database import FOREIGN_QUOTA_CAP
-    quota = FOREIGN_QUOTA_CAP.get(team_country)
-    if quota is None or my_nationality == team_country:
-        return   # 쿼터 없는 나라거나, 내가 자국 선수라 쿼터에 안 걸림
+    from database import get_foreign_quota_range
     conn = get_conn()
+    _crow = conn.execute("""SELECT cn.continent AS continent FROM teams t
+                             JOIN countries cn ON t.country_id=cn.id
+                             WHERE t.id=?""", (team_id,)).fetchone()
+    continent = _crow["continent"] if _crow else None
+    _quota_lo, quota = get_foreign_quota_range(team_country, continent)
+    if my_nationality == team_country:
+        conn.close()
+        return   # 내가 자국 선수라 쿼터에 안 걸림
     foreigners = conn.execute(
         """SELECT id, ovr FROM ai_players WHERE team_id=? AND nationality!=? AND nationality!=''
            ORDER BY ovr ASC""", (team_id, team_country)).fetchall()

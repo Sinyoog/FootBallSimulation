@@ -389,6 +389,35 @@ def week_to_iso_date_str_end(season_year: int, week: int) -> str:
     day = week * DAYS_PER_WEEK
     return day_to_iso_date_str(season_year, day)
 
+
+def add_days_to_iso_date_str(season_year: int, day: int, add_days: int) -> str:
+    """[2026-08 신설, 부상 이력용] (season_year, day) 기준에서 add_days만큼
+    뒤의 날짜를 ISO 문자열로. day는 current_day처럼 큰 누적값일 수 있어서
+    (연초로 리셋되지 않음) 실제 datetime을 쓰지 않는다 — 이 게임 캘린더는
+    1년=364일(실제 그레고리력 365/366일과 다름)이라 Python datetime으로
+    계산하면 여러 해가 지날수록 오차가 누적된다. 대신 day_to_calendar_date가
+    쓰는 것과 동일한 364일 경계 기준으로 몇 번째 해로 넘어가는지만 직접
+    계산해서 season_year를 그만큼 보정한다."""
+    year_blocks_before = (day - 1) // 364
+    total_day = day + add_days
+    year_blocks_after = (total_day - 1) // 364
+    year_offset = year_blocks_after - year_blocks_before
+    return day_to_iso_date_str(season_year + year_offset, total_day)
+
+
+def iso_date_str_to_absolute_day(iso_str: str) -> int:
+    """[2026-08 신설, 재발 취약기 판정용] 'YYYY-MM-DD' -> 절대 일수
+    (연도*364 + 그 해의 며칠째). 이 함수로 변환한 값끼리만 대소 비교가
+    유효하다(예: 취약기 만료일이 지났는지 판정) — 이 게임 캘린더가
+    1년=364일이라 실제 그레고리력 날짜 차이 계산과는 안 맞음."""
+    y, m, d = map(int, iso_str.split("-"))
+    day_of_year = d
+    for month, length in zip(_CALENDAR_MONTH_ORDER, _CALENDAR_MONTH_LENGTH):
+        if month == m:
+            break
+        day_of_year += length
+    return y * 364 + day_of_year
+
 # ── 기존(주 단위) 코드와의 호환용 파생값 ──────────────────────────
 # game_engine.py 등 아직 'week' 정수로 시즌 구간을 비교하는 코드가 많아서,
 # 위 day 상수들로부터 주차를 역산해 그대로 제공한다. 이 값들 자체를
@@ -658,16 +687,21 @@ INTL_QUAL_WEEK           = day_to_week(WINTER_OFFER_START_DAY)  # 트리거용 �
 _TRAIN_GAIN_SCALE = 4 / 7
 
 TRAINING_CONFIG = {
-    # [2026-07 재조정, 신민용 확정] 경기 스트레스(14/18)와 균형 맞춰
-    # "경기 있는 주엔 고강도 1회가 자연스러운 선택"이 되도록 재설계.
-    # 고강도 20→16(경기와 비슷한 수준), 중강도 15→12, 휴식 -15→-20
-    # (고강도보다 확실히 세게 — 경기 스트레스까지 흡수할 여유를 줌).
-    # 저강도(8)/강점훈련·약점훈련(16)은 그대로 유지.
-    "고강도":   {"stress":+16, "injury_chance":0.05, "gain_min":4.0 * _TRAIN_GAIN_SCALE, "gain_max":5.5 * _TRAIN_GAIN_SCALE, "exceed_limit":True},  # [2026-07] 부상확률 0.20→0.10 (요청: 1/2로 낮춤)
-    "강점훈련": {"stress":+14, "injury_chance":0.00, "gain_min":3.3 * _TRAIN_GAIN_SCALE, "gain_max":4.6 * _TRAIN_GAIN_SCALE, "exceed_limit":False, "focus_mode":"strong"},
-    "약점훈련": {"stress":+14, "injury_chance":0.00, "gain_min":3.3 * _TRAIN_GAIN_SCALE, "gain_max":4.6 * _TRAIN_GAIN_SCALE, "exceed_limit":False, "focus_mode":"weak"},
-    "중강도":   {"stress":+12, "injury_chance":0.00, "gain_min":2.0 * _TRAIN_GAIN_SCALE, "gain_max":3.0 * _TRAIN_GAIN_SCALE, "exceed_limit":False},
-    "저강도":   {"stress":+ 8, "injury_chance":0.00, "gain_min":1.1 * _TRAIN_GAIN_SCALE, "gain_max":1.8 * _TRAIN_GAIN_SCALE, "exceed_limit":False},
+    # [2026-08 재조정, 부상 시스템 QA-0 — 신민용+GPT 확정] 실측 결과 기존
+    # 값(16/14/12/8/-20)으로는 "정상 운영"만 해도 stress가 월 1회꼴로
+    # 100(하드캡→강제부상)에 도달했다(90+ 체류 13.0%, 100도달 15년간 89회).
+    # 목표: "중강도 위주로 적당히 쉬며 뛰면 부담이 거의 안 쌓이고, 고강도를
+    # 자주 섞어야만 서서히 위험해지는" 구조(신민용 확정 철학). 휴식(-20)은
+    # 그대로 유지(100→0 회복이 5일이면 충분해서 회복 쪽은 문제가 아니었음
+    # — 실측으로 확인됨) — 증가 쪽만 낮췄다. 같은 테스트 패턴으로 재실측한
+    # 결과: 90+ 체류 13.0%→5.2%, 100도달 89→26회(15년) — 상대적 강도 순서
+    # (고강도>강점/약점>중강도>저강도)는 그대로 유지. 자세한 실측 과정은
+    # 부상시스템 설계 문서 참고. 1차 실험값 — 추가 QA로 조정 예정.
+    "고강도":   {"stress":+11, "injury_chance":0.05, "gain_min":4.0 * _TRAIN_GAIN_SCALE, "gain_max":5.5 * _TRAIN_GAIN_SCALE, "exceed_limit":True},
+    "강점훈련": {"stress":+9,  "injury_chance":0.00, "gain_min":3.3 * _TRAIN_GAIN_SCALE, "gain_max":4.6 * _TRAIN_GAIN_SCALE, "exceed_limit":False, "focus_mode":"strong"},
+    "약점훈련": {"stress":+9,  "injury_chance":0.00, "gain_min":3.3 * _TRAIN_GAIN_SCALE, "gain_max":4.6 * _TRAIN_GAIN_SCALE, "exceed_limit":False, "focus_mode":"weak"},
+    "중강도":   {"stress":+5,  "injury_chance":0.00, "gain_min":2.0 * _TRAIN_GAIN_SCALE, "gain_max":3.0 * _TRAIN_GAIN_SCALE, "exceed_limit":False},
+    "저강도":   {"stress":+3,  "injury_chance":0.00, "gain_min":1.1 * _TRAIN_GAIN_SCALE, "gain_max":1.8 * _TRAIN_GAIN_SCALE, "exceed_limit":False},
     "휴식":     {"stress":-20, "injury_chance":0.00, "gain_min":-1 * _TRAIN_GAIN_SCALE,  "gain_max":-1 * _TRAIN_GAIN_SCALE,  "exceed_limit":False},
 }
 
@@ -1237,20 +1271,264 @@ INJURY_POSITION_MULT = {
 }
 
 
-def pick_injury(position: str = None):
-    """INJURY_POOL에서 가중치 기반으로 부상 하나를 뽑는다.
-    position이 주어지면 pos_cat이 있는 항목에 한해 INJURY_POSITION_MULT로
-    가중치를 보정(전체 발생확률이 아니라 '어떤 부상이 나올지'만 보정 —
-    신민용 확정 원칙: "부상 발생 → 부상 종류 결정 → 포지션 보정" 순서).
+def _lerp_curve(points, x):
+    """points: [(x0,y0),(x1,y1),...] x 오름차순 정렬된 구간표를 선형보간.
+    x가 범위 밖이면 양 끝값으로 clamp. 확률/배율 커브 전부 이 함수 하나로
+    통일해서 쓴다(위험 factor 커브, 위험 배율 커브, 심각도 배율 커브 등)."""
+    if x <= points[0][0]:
+        return points[0][1]
+    if x >= points[-1][0]:
+        return points[-1][1]
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        if x0 <= x <= x1:
+            t = (x - x0) / (x1 - x0)
+            return y0 + (y1 - y0) * t
+    return points[-1][1]
+
+
+# ════════════════════════════════════════════════════════════════
+# [2026-08 신설, 부상 시스템 확장 3단계 — GPT 3~4차 검토 + 신민용 확정]
+# stress/injury_load → 부상 발생 확률. 하드 임계값(100=강제부상)은 "최종
+# 안전장치"로 남기고, 100 미만 구간에도 완만하게 확률이 붙는 구조.
+# risk_score(0~1 factor)와 injury_probability(실제 %)를 완전히 분리한다
+# — 섞어서 계산하면(예: 0.002+0.45+0.55=1.002) 의미 없는 값이 나온다는
+# 지적을 반영.
+# ════════════════════════════════════════════════════════════════
+
+# stress/injury_load 각각을 0~1 위험 factor로 바꾸는 구간표(선형보간).
+# 둘 다 같은 형태를 쓴다 — 50 미만은 사실상 안전, 90 넘어가면 급격히 위험.
+INJURY_RISK_FACTOR_CURVE = [
+    (0, 0.00), (50, 0.00), (65, 0.10), (80, 0.30),
+    (90, 0.60), (97, 0.85), (100, 1.00),
+]
+
+# 위 stress_factor/load_factor를 가중합쳐 combined_factor(0~1)를 만들 때의
+# 가중치. injury_load 쪽을 더 크게 — "이 시스템의 존재 이유가 stress와
+# 별개로 장기 혹사를 추적하는 것"이기 때문(GPT 근거).
+INJURY_RISK_STRESS_WEIGHT = 0.45
+INJURY_RISK_LOAD_WEIGHT   = 0.55
+
+# combined_factor(0~1) → 기본확률에 곱할 배율.
+INJURY_RISK_MULT_CURVE = [
+    (0.00, 1.0), (0.25, 1.5), (0.50, 3.0),
+    (0.75, 6.0), (0.90, 12.0), (0.97, 25.0), (1.00, 25.0),
+]
+
+# 세션당 기본 확률과 상한 — 둘 다 잠정치, QA 1 결과 보고 조정 예정.
+# base: "부상 없는 평상시"에도 걸리는 최소 확률. max: 100 미만 구간에서
+# 아무리 위험해도 이 값을 넘지 않음(100 이상은 별도로 무조건 발동).
+INJURY_BASE_PROBABILITY = 0.0015   # 0.15%
+INJURY_MAX_PROBABILITY  = 0.08     # 8% (GPT 권고 5~10% 구간의 중간값)
+
+
+def calc_injury_probability(stress: float, injury_load: float) -> float:
+    """100 미만 구간에서 이번 세션에 부상이 발생할 확률(0~1)을 계산.
+    100 이상 강제발동은 호출부에서 별도로 처리(이 함수는 그 경우 안 씀)."""
+    stress_factor = _lerp_curve(INJURY_RISK_FACTOR_CURVE, stress)
+    load_factor   = _lerp_curve(INJURY_RISK_FACTOR_CURVE, injury_load)
+    combined = (INJURY_RISK_STRESS_WEIGHT * stress_factor
+                + INJURY_RISK_LOAD_WEIGHT * load_factor)
+    mult = _lerp_curve(INJURY_RISK_MULT_CURVE, combined)
+    return min(INJURY_MAX_PROBABILITY, INJURY_BASE_PROBABILITY * mult)
+
+
+# ════════════════════════════════════════════════════════════════
+# [2026-08 신설, 부상 시스템 확장 — 경기 중 부상] 신민용 확정: 훈련 부상은
+# "관리의 결과"(stress/injury_load가 쌓이면 위험도 같이 오르는 연속적 구조),
+# 경기 부상은 "경기에서 발생하는 희귀한 사고"라는 성격 차이를 명확히 둔다.
+# 그래서 훈련과 같은 risk_score 합성 방식을 쓰지 않고, 포지션·부상체질별
+# 고정 기본 확률(매우 낮음) × injury_load 보정이라는 훨씬 단순한 구조로
+# 간다 — "관리 잘해서 경기 나갔더니 경기에서 계속 다친다"는 이상한
+# 결과를 피하기 위해 injury_load 보정 자체도 완만하게(최대 2.5배) 잡는다.
+# ════════════════════════════════════════════════════════════════
+
+# 경기당 기본 부상 확률(신민용 확정치) — 부상체질만 명시, 나머지는 전부
+# 동일하게 기본값(강철체질은 애초에 injury_immune이라 이 표 자체를 안 봄 —
+# 호출부에서 면역 체크가 먼저 걸린다).
+MATCH_INJURY_BASE_PROBABILITY = {
+    "부상체질": 0.05,
+}
+MATCH_INJURY_BASE_PROBABILITY_DEFAULT = 0.01
+
+# injury_load에 따른 경기 부상 확률 배율 — 완만하게(최대 ×2.5). 훈련 쪽
+# INJURY_RISK_MULT_CURVE(최대 ×25)를 그대로 갖다 쓰면 기본 1~5%에 곱해져
+# 극단적으로 커지므로(예: 5%×25=125%) 별도의 훨씬 완만한 커브를 쓴다.
+MATCH_INJURY_LOAD_RISK_CURVE = [
+    (0, 1.0), (50, 1.0), (70, 1.3), (85, 1.7), (95, 2.1), (100, 2.5),
+]
+# 최종 확률 상한 — injury_load가 극단(100 근처)이어도 이 값을 못 넘음.
+MATCH_INJURY_MAX_PROBABILITY = 0.15
+
+
+def calc_match_injury_probability(injury_load: float, physical_trait: str) -> float:
+    """경기 1회당 부상 확률(0~1). 강철체질(injury_immune)은 호출부에서
+    이 함수 자체를 안 부르고 걸러낸다 — 이 함수는 "면역이 아닌 선수"만
+    대상으로 한다."""
+    base = MATCH_INJURY_BASE_PROBABILITY.get(physical_trait, MATCH_INJURY_BASE_PROBABILITY_DEFAULT)
+    mult = _lerp_curve(MATCH_INJURY_LOAD_RISK_CURVE, injury_load)
+    return min(MATCH_INJURY_MAX_PROBABILITY, base * mult)
+
+
+# [2026-08 신설] injury_load가 높을수록 심각/매우심각 쪽으로 부상 종류
+# 가중치가 이동하도록 — 등급(tier)별로 서로 다른 커브를 곱한다. 84와 85
+# 사이에 갑자기 다른 세상이 되지 않도록 계단식이 아니라 연속 선형보간.
+# 숫자는 "심각" 등급에 대해 GPT가 준 예시(20→×0.8 ... 95→×2.2)를 기준점
+# 삼아, 등급이 낮을수록 반대 방향(낮은 load일 때 유리)으로, 등급이 높을
+# 수록 더 가파르게 되도록 대칭적으로 확장한 잠정치 — QA 후 조정 예정.
+INJURY_LOAD_SEVERITY_CURVE = {
+    "경미":     [(0, 1.3), (20, 1.2), (50, 1.0), (70, 0.8), (85, 0.6), (95, 0.4), (100, 0.4)],
+    "중간":     [(0, 1.0), (20, 1.0), (50, 1.0), (70, 1.05), (85, 1.1), (95, 1.1), (100, 1.1)],
+    "심각":     [(0, 0.7), (20, 0.8), (50, 1.0), (70, 1.3), (85, 1.7), (95, 2.2), (100, 2.2)],
+    "매우 심각": [(0, 0.4), (20, 0.5), (50, 1.0), (70, 1.6), (85, 2.4), (95, 3.4), (100, 3.4)],
+}
+
+# [2026-08 신설] 나이가 들수록 injury_load가 더 크게 쌓이는 배율. 20대=1.0,
+# 30대=1.2, 40대=1.4, 50대 이상=1.6(상한 clamp). 저장하지 않고 나이에서
+# 매번 즉시 계산(GPT 권고 — "시즌 전환 때만 갱신"은 생일이 시즌 중일 수
+# 있어 부정확해질 여지가 있고, 이런 단순 산술은 매 세션 계산해도 성능에
+# 영향 없음).
+def get_injury_load_age_mult(age: int) -> float:
+    return min(1.6, 1.0 + max(0, (age - 20) // 10) * 0.2)
+
+
+# [2026-08 v5 신설, 신민용+GPT 확정 — v4 실패 이후 재설계] injury_load
+# 훈련 증가값을 stress_delta 재사용에서 완전히 독립된 자체 스케일로
+# 분리한다. v4가 실패한 이유는 stress_delta(11)를 그대로 베이스로 쓰고
+# 거기에 배율(×1.8)+경기배율(×1.4)을 곱해서 두 배율이 겹쳐 곱셈 폭발이
+# 났기 때문 — 이번엔 처음부터 작은 자체 숫자로 시작해서 배율을 겹치지
+# 않는다. 목표: 중강도(4)-휴식(7)은 거의 회복, 고강도(14)-휴식(7)은
+# 절반이 남아서 반복하면 서서히 누적(14→7→21→14→28→21...). "stress는
+# 이번엔 다시 안 건드린다"는 원칙 — 이 표는 stress와 완전히 무관.
+INJURY_LOAD_TRAINING_VALUE = {
+    "저강도": 2,
+    "중강도": 4,
+    "강점훈련": 7,
+    "약점훈련": 7,
+    "고강도": 14,
+}
+# injury_load 전용 휴식 회복값 — stress의 -20과 별개. -7/-11도 실측해봤으나
+# -7은 A(중강도3+휴식3+경기1) 같은 "안전해야 할" 패턴까지 연 2.53회로
+# 터졌고(경기 자체가 새 훈련 스케일보다 상대적으로 커서), -11도 B(고강도
+# 2회+휴식3+경기1)가 연 3.00회로 아직 높았다. -13에서 A/B(고강도 0~2회)는
+# 연 0.2~0.4회로 안전, C/D(고강도 3~4회)는 연 4.3~5.9회로 뚜렷하게
+# 위험해지는 깔끔한 계단이 나와 이 값으로 확정(자세한 실측 과정은 부상
+# 시스템 설계 문서 3.13 참고).
+INJURY_LOAD_REST_RECOVERY = -13
+
+
+# [2026-08 v5 수정 — 실측 후 GPT 지시 재검토] "경기는 기존 age×match
+# 방식 유지"로 시작했으나, 실제로 돌려보니 문제가 발견됨: 훈련은 독립
+# 스케일로 작게 줄었는데(고강도=14) 경기는 옛 stress 기반 큰 값(승6~패16)
+# ×1.4를 그대로 써서 경기 하나(평균 15.4)가 "중강도3+휴식3" 6일 전체
+# 순변화(-9)보다 커져버렸다 — 결과적으로 경기가 있는 주는 훈련을 어떻게
+# 짜든 거의 항상 순증가로 뒤집혀서, "안전해야 할" 패턴(A)까지 연 2.53회로
+# 폭증(실측 확인). 그래서 경기도 훈련과 같은 독립 스케일 원칙으로
+# 맞춘다 — MATCH_INJURY_LOAD_MULT는 더 이상 쓰지 않고, 승/무/패 각각의
+# injury_load 값을 훈련 스케일과 비슷한 크기로 직접 지정(경기가 "고강도
+# 훈련 한 번과 비슷하거나 약간 더 부담" 수준이 되도록 — 실제로 경기가
+# 어떤 단일 훈련보다도 신체 부담이 크다는 원래 취지는 유지하되 스케일만
+# 맞춤).
+INJURY_LOAD_MATCH_VALUE = {"win": 4, "draw": 8, "loss": 13}
+
+# [2026-08 신설, 신민용+GPT 확정: "스트레스는 리그 경기에서 더 쌓이며
+# 승/무/패에 따라 차이가 있어야"] 경기 stress = 기본부하 + 결과보정.
+# 1차 실험값 — 승6 / 무11 / 패16. base+modifier로 분리해두면 나중에
+# 라이벌전/컵결승/연패 같은 상황을 modifier 쪽에 추가로 얹기 쉽다.
+MATCH_STRESS_BASE = 10
+MATCH_RESULT_STRESS_MOD = {"win": -4, "draw": 1, "loss": 6}
+
+
+def get_position_multiplier(entry: dict, pos_group: str = None) -> float:
+    """부상 종류 하나(entry)에 대한 포지션 보정 배율. pos_group은
+    get_injury_pos_group()의 반환값('GK'/'DF'/'MF'/'FW')."""
+    if pos_group and entry["pos_cat"]:
+        return INJURY_POSITION_MULT.get(entry["pos_cat"], {}).get(pos_group, 1.0)
+    return 1.0
+
+
+def get_severity_multiplier(entry: dict, injury_load: float = None) -> float:
+    """injury_load가 높을수록 심각/매우심각 쪽으로 분포를 이동시키는 배율
+    (INJURY_LOAD_SEVERITY_CURVE, 등급별 연속 보정)."""
+    if injury_load is not None:
+        curve = INJURY_LOAD_SEVERITY_CURVE.get(entry["tier"])
+        if curve:
+            return _lerp_curve(curve, injury_load)
+    return 1.0
+
+
+def get_recurrence_multiplier(entry: dict, pos_group: str = None,
+                               activity_type: str = None, training_type: str = None,
+                               vulnerable_body_part: str = None) -> float:
+    """[2026-08 구현, GPT 확정 — 부상 시스템 확장 5단계: 재발]
+    vulnerable_body_part(예: 'l_knee', 재발 취약기가 활성화된 부위)가 주어지고
+    이 entry의 부위(좌우 접두사 뗀 기준 — 재발 판정은 부위 단위, 좌우는
+    _apply_injury에서 별도로 그 방향에 살짝 더 치우치게 뽑음)가 같으면,
+    activity_type/training_type에 따라 가중치를 올린다. "부상 발생 확률"이
+    아니라 "발생했을 때 하필 그 부위일 확률"만 올리는 것 — 일반 훈련은
+    보정 없음(×1.0 그대로), 고강도 훈련·경기만 취약 부위 가중치를 올린다."""
+    if not vulnerable_body_part:
+        return 1.0
+    parts = vulnerable_body_part.split("_", 1)
+    base_vuln = parts[1] if len(parts) == 2 and parts[0] in ("l", "r") else vulnerable_body_part
+    if entry["body_part"] != base_vuln:
+        return 1.0
+    if activity_type == "match":
+        return INJURY_RECURRENCE_MULT.get("경기", 1.0)
+    if training_type == "고강도":
+        return INJURY_RECURRENCE_MULT.get("고강도", 1.0)
+    return INJURY_RECURRENCE_MULT.get("기본", 1.0)
+
+
+# [2026-08 신설, GPT 확정] 재발 취약기 중 부위 가중치 배율. "일반 훈련은
+# 재발 보정 없음"이 곧 ×1.0이라는 뜻 — 고강도/경기만 명시적으로 올린다.
+INJURY_RECURRENCE_MULT = {
+    "기본": 1.0,   # 중강도/저강도/강점/약점훈련 등 — 보정 없음
+    "고강도": 1.4,
+    "경기": 1.9,
+}
+
+
+def get_training_injury_multiplier(entry: dict, activity_type: str = None,
+                                    training_type: str = None) -> float:
+    """[2026-08 신설, 자리만 확보 — GPT 권고] 나중에 훈련 종류가 세분화되면
+    (예: 스프린트→햄스트링/종아리, 점프→무릎/발목, GK반사훈련→손/손목/어깨
+    같은 방향) 여기서 activity_type("training"/"match")과 training_type
+    (구체 훈련 종류)에 따라 부상 종류별 가중치를 보정할 자리. 지금은 훈련
+    종류 자체가 세분화되지 않았고 그 배율을 미리 정하면 나중에 훈련
+    시스템이 바뀔 때 다시 갈아엎어야 하므로, 인터페이스만 만들고 항상
+    1.0을 반환한다."""
+    return 1.0
+
+
+def get_injury_weight(entry: dict, position: str = None, injury_load: float = None,
+                       activity_type: str = None, training_type: str = None,
+                       vulnerable_body_part: str = None) -> float:
+    """부상 종류 하나(entry)의 최종 추첨 가중치 = 기본가중치 × 각 보정의
+    곱. 보정을 여기 한 곳에 모아두면 새 보정(재발, 훈련종류별 등)이
+    추가돼도 pick_injury() 자체는 안 건드려도 된다."""
+    pos_group = get_injury_pos_group(position) if position else None
+    w = entry["weight"]
+    w *= get_position_multiplier(entry, pos_group)
+    w *= get_severity_multiplier(entry, injury_load)
+    w *= get_recurrence_multiplier(entry, pos_group, activity_type, training_type,
+                                    vulnerable_body_part)
+    w *= get_training_injury_multiplier(entry, activity_type, training_type)
+    return w
+
+
+def pick_injury(position: str = None, injury_load: float = None,
+                 activity_type: str = None, training_type: str = None,
+                 vulnerable_body_part: str = None):
+    """INJURY_POOL에서 가중치 기반으로 부상 하나를 뽑는다. 실제 가중치
+    계산은 get_injury_weight()에 위임(보정 항목이 늘어나도 이 함수는
+    안 바뀜). vulnerable_body_part가 주어지면(재발 취약기 활성 중) 그
+    부위 계열 항목의 가중치가 activity_type/training_type에 따라 올라간다
+    (get_recurrence_multiplier — 재발 시스템, 2026-08 구현).
     반환: INJURY_POOL의 항목 dict 하나(그대로 복사하지 않고 참조 반환하므로
     호출부에서 내용을 변경하지 말 것)."""
-    grp = get_injury_pos_group(position) if position else None
-    weights = []
-    for entry in INJURY_POOL:
-        w = entry["weight"]
-        if grp and entry["pos_cat"]:
-            w = w * INJURY_POSITION_MULT.get(entry["pos_cat"], {}).get(grp, 1.0)
-        weights.append(w)
+    weights = [get_injury_weight(entry, position, injury_load, activity_type,
+                                  training_type, vulnerable_body_part)
+               for entry in INJURY_POOL]
     return random.choices(INJURY_POOL, weights=weights, k=1)[0]
 
 # 성격
@@ -2463,6 +2741,64 @@ TIER_AUDIT_LOGGING = False
 # 싶어지더라도 "순위 확정 후 결과를 바꾸는" 방식은 피할 것.
 
 
+# [2026-08 신설, 신민용 확정: "일반 강등팀 하부리그 안착 분포"] 예전엔
+# 일반(비명문) 강등팀도 명문팀과 마찬가지로 새 리그 상위 25%(pct=0.75)
+# 지점 하나로 완전히 결정론적으로 이동시켰다 — 강등된 원인(원래 스쿼드가
+# 약해서/불운해서 등)과 무관하게 "강등만 당하면 다들 새 리그 상위권에서
+# 시작"하는 부자연스러운 구조였다. 신민용 요청에 따라, 목표 지점을
+# 고정값이 아니라 "구간을 먼저 확률로 뽑고, 그 구간 안에서 다시 균등난수로
+# percentile을 뽑는" 2단계 방식으로 바꾼다 — 같은 팀이라도 강등할 때마다
+# 다른 지점에 착지할 수 있다.
+#
+# (lo_pct, hi_pct, weight) 튜플의 리스트. lo_pct/hi_pct는
+# _cached_league_strong_ovr()/get_league_strong_ovr류 함수가 쓰는 것과
+# 동일한 pct 관례(0.0=새 리그에서 가장 약한 팀 지점, 1.0=가장 강한 팀
+# 지점 — sorted(team_avgs) 오름차순 인덱싱 기준)를 그대로 쓴다. weight는
+# 이 구간이 뽑힐 확률(전체 합 1.0).
+#
+# 신민용이 준 요구사항은 "그 강등팀이 하부리그에서 차지할 순위 구간"
+# 기준(예: 상위 1~10% = 새 리그에서 등수로 봤을 때 최상위 1~10위 구간)
+# 이라 "상위 X%"는 강한 쪽이므로 pct 관례로는 (1 - X/100)에 가깝다.
+# "강등권"(진짜 위험한 하위권 중에서도 최하단)은 "하위 40%" 안에 포함된
+# 부분집합으로 보고, 두 구간이 서로 겹치지 않도록 강등권 몫(하위 10%)을
+# 하위40% 쪽에서 미리 떼어냈다 — prestige_clubs.py의 상위권/중위권/
+# 하위권/강등권 4단 구분과 같은 관례(강등권은 하위권 중 최하단 서브셋).
+#   상위 1~10%(랭크)  → pct [0.90, 1.00]  15%
+#   상위 10~25%(랭크) → pct [0.75, 0.90)  30%
+#   상위 25~40%(랭크) → pct [0.60, 0.75)  30%
+#   40~60%(랭크)      → pct [0.40, 0.60)  18%
+#   하위 40%(랭크, 강등권 제외) → pct [0.10, 0.40)  6%
+#   강등권(랭크 최하단) → pct [0.00, 0.10)  1%
+# 명문팀(prestige_level 1~3)에는 적용하지 않는다 — 명문팀은 기존처럼
+# 상위 25%(pct=0.75) 고정 지점을 그대로 유지한다(_process_promotion_
+# relegation 참고). 필요하면 나중에 명문팀 전용 분포도 별도로 설계 가능.
+GENERAL_RELEGATION_LANDING_BANDS = [
+    (0.00, 0.10, 0.01),   # 강등권
+    (0.10, 0.40, 0.06),   # 하위 40%(강등권 제외)
+    (0.40, 0.60, 0.18),   # 40~60%
+    (0.60, 0.75, 0.30),   # 상위 25~40%
+    (0.75, 0.90, 0.30),   # 상위 10~25%
+    (0.90, 1.00, 0.15),   # 상위 1~10%
+]
+
+
+def sample_general_relegation_landing_pct() -> float:
+    """GENERAL_RELEGATION_LANDING_BANDS 확률표에 따라 구간을 하나 뽑고,
+    그 구간 안에서 다시 균등난수로 percentile(pct, 0.0~1.0)을 하나 뽑아
+    반환한다. 반환값은 _cached_league_strong_ovr(league_id, pct=...)에
+    그대로 넘길 수 있는 형식이다."""
+    r = random.random()
+    cum = 0.0
+    for lo, hi, w in GENERAL_RELEGATION_LANDING_BANDS:
+        cum += w
+        if r <= cum:
+            return random.uniform(lo, hi)
+    # 부동소수 누적오차로 cum이 1.0에 살짝 못 미쳐 루프를 다 돌아버리는
+    # 경우에 대한 안전망 — 마지막 구간에서 뽑는다.
+    lo, hi, _ = GENERAL_RELEGATION_LANDING_BANDS[-1]
+    return random.uniform(lo, hi)
+
+
 def club_strength_delta_for_rank(rank: int, n_teams: int) -> float:
     """순위(1부터)와 리그 참가팀 수를 받아 시즌 종료 시 club_strength에
     더할 델타를 반환한다. CLUB_STRENGTH_DELTA_BY_RANK_PCT를 순회하며
@@ -2754,7 +3090,23 @@ OVR_RANGES = {
     # 대비 남미(0)라 S 재조정만으로 자연히 84~88보다 한 단계 낮은
     # 83~87대에 들어온다(실측으로 재확인 완료) — 별도 COUNTRY_OVR_ADJ는
     # 필요 없었다.
-    "SS":{1:(90,100),2:(81,95),3:(78,90),4:(66,78),5:(56,68),6:(46,58),
+    # [2026-08 재조정, 신민용 확정: "챔피언십(2부) 우승권도 89~90은
+    # 되어야 한다"] SS는 잉글랜드 전용 등급이라 여기(2부 상한)만 올려도
+    # 다른 나라엔 영향이 없다. get_ovr_range()가 COUNTRY_LEAGUE_OVR_
+    # OVERRIDE["잉글랜드"](88,98) 대비 이 tier1(90,100) 기본값의 델타(각
+    # -2)를 그대로 이 tier2 값에도 적용하므로, 여기 상한을 95→100으로
+    # 올리면 실제 잉글랜드 2부 상한은 93→98로 함께 올라간다(database.py의
+    # STAR_STRENGTH_PENALTY_MAX_BY_GRADE["SS"], SS 2부 엘리트 슬롯 상한
+    # 조정과 함께 실측 반영, 3부 이하는 그대로 유지).
+    # [2026-08 재조정, 신민용 지적: "잉글 2부가 스페인/이탈리아/독일/
+    # 프랑스 2부보다 하한은 너무 낮고(79) 상한은 1부와 같다(98) — 하한
+    # 84대, 상한 91~92가 맞는듯"] get_ovr_range()가 COUNTRY_LEAGUE_OVR_
+    # OVERRIDE["잉글랜드"](88,98) 대비 이 tier1(90,100) 기본값의 델타
+    # (각 -2)를 그대로 tier2에도 적용하는 구조라, 여기 tier2를
+    # (81,100)→(86,94)로 올리면 실제 잉글랜드 2부 범위가 (79,98)→
+    # (84,92)가 된다 — 실측한 스페인(84,92)/이탈리아·독일(82,92)/
+    # 프랑스(83,92)와 정확히 같은 상한(92)대로 맞춰짐.
+    "SS":{1:(90,100),2:(86,94),3:(78,90),4:(66,78),5:(56,68),6:(46,58),
           7:(38,50),8:(30,42),9:(22,34),10:(15,26)},
     "S": {1:(85,96), 2:(80,90),3:(76,88),4:(62,73),5:(52,64),6:(44,56),
           7:(36,48),8:(28,40),9:(20,32),10:(15,24)},
@@ -3395,30 +3747,30 @@ COUNTRY_LEAGUE_OVR_OVERRIDE = {
     "키프로스": (55, 60),
     "벨라루스": (52, 58),
     "룩셈부르크": (53, 59),
-    "남아프리카공화국": (65, 82),  # [3차 실측 83.30→소폭 하향] 목표: 간판(마멜로디) 평균 81~82
+    "남아프리카공화국": {1: (65, 82), 2: (56, 70), 3: (45, 59)},  # [3차 실측 83.30→소폭 하향] 목표: 간판(마멜로디) 평균 81~82
     "아랍에미리트": (65, 70),
     "중국": (55, 61),
     "튀르키예": (83, 89),
     # [2026-08 신설] 목표: 간판(알 아흘리/자말렉) 평균 86. 일반 이집트
     # 리그 팀들도 이 상한대로 소폭 오르지만, 실제 도약분 대부분은
     # GLOBAL_PRESTIGE_STAR_CFG(prestige_level>=2 전용)가 담당한다.
-    "이집트": (68, 87),  # [3차 실측 87.91→소폭 하향]
+    "이집트": {1: (68, 87), 2: (60, 74), 3: (50, 64)},  # [3차 실측 87.91→소폭 하향]
     # [2026-08 신설] 목표: 간판(위다드/라자) 평균 86. 이집트와 동일 논리.
-    "모로코": (68, 87),  # [3차 실측 87.42→소폭 하향]
+    "모로코": {1: (68, 87), 2: (60, 74), 3: (50, 64), 4: (39, 53)},  # [3차 실측 87.42→소폭 하향]
     # [2026-08 신설, 신민용 요청: "튀니지 1부 OVR 83대로"] 이집트·모로코와
     # 동일 패턴(등급 B + GLOBAL_PRESTIGE_STAR_CFG)으로 처리.
-    "튀니지": (66, 86),  # [1차 실측 81.25→소폭 상향]
+    "튀니지": {1: (66, 86), 2: (59, 73), 3: (48, 62)},  # [1차 실측 81.25→소폭 상향]
     # [2026-08 신설, 신민용 지적: "한국이 지금 70~80인데 75대로 내려야
     # 한다"] 한국은 기존 override가 없어 OVR_RANGES["B"][1](82)+대륙보정
     # 으로 tier_top≈80.5가 잡혀 있었다 — 목표(간판 평균 75, 상위팀
     # 76~79)에 맞춰 상한을 낮춘다.
-    "대한민국": (58, 74),  # [1차 실측 76.39→소폭 하향]
+    "대한민국": {1: (58, 74), 2: (50, 62), 3: (40, 52), 4: (28, 42)},  # [1차 실측 76.39→소폭 하향]
     # [2026-08 신설, 신민용 지적: "일본도 85대로 내려야 한다" → 이후 GPT
     # 교차검토에서 사우디(85)를 아시아 기준점으로 삼고 일본은 그보다
     # 한 단계 아래(83~84)로 재조정] 기존 override(85,90)가 평균 88.78을
     # 만들고 있었다 — 상한을 낮춰 목표(간판 평균 83~84, 상위팀 84~86)에
     # 맞춘다.
-    "스페인": (89, 98),
+    "스페인": {1: (89, 98), 2: (82, 90), 3: (74, 84), 4: (64, 74), 5: (53, 63)},
     # [2026-08 재조정, 신민용 확정: "이탈리아·독일도 잉글랜드·스페인·
     # 프랑스와 같은 95대로 나와야 한다"] 위 star_prestige_bonus S전용
     # +2.0 제거 이후 실측(6회 평균)해보니 이탈리아·독일 레벨3 명문팀만
@@ -3428,21 +3780,42 @@ COUNTRY_LEAGUE_OVR_OVERRIDE = {
     # worldclass/elite 목표식이 이 tier_top에서 그대로 -1 되므로 재현성
     # 100%). "이 넷을 사실상 동급으로 두자"는 방향에 맞춰 상한을 98로
     # 맞춘다.
-    "이탈리아": (87, 98),
-    "독일": (87, 98),
-    "프랑스": (88, 98),
-    "브라질": (84, 95),
-    "잉글랜드": (88, 98),
+    # [2026-08 재조정, 신민용 지적: "스페인 3부(80~90)가 5개국 중 유독
+    # 하한이 높다 — 잉글·이탈·독일·프랑스와 나란히 2부 중위권 밑으로
+    # 내려와야 한다"] 델타 전파 방식(튜플)은 나라마다 tier1 하한이
+    # 미묘히 달라(스페인 89 vs 이탈리아·독일 87) 하위 부수까지 나라별로
+    # 정확히 맞추기 어려웠다 — 빅5 5개국은 부수별 값을 직접 지정하는
+    # 딕셔너리 형태로 바꿔서, "2부 중위권보다는 낮게, 인접 나라들과는
+    # 나란히" 정확히 재현한다. 5개국 모두 이 원칙(그 부수 상한 < 한 단계
+    # 위 부수 중위값)을 만족하는지 확인 완료.
+    "이탈리아": {1: (87, 98), 2: (81, 89), 3: (73, 83), 4: (63, 73), 5: (52, 62)},
+    "독일": {1: (87, 98), 2: (81, 89), 3: (73, 83), 4: (63, 73), 5: (52, 62)},
+    "프랑스": {1: (88, 98), 2: (82, 90), 3: (74, 84), 4: (64, 74), 5: (53, 63)},
+    # [2026-08 재조정, 신민용 확정: "3부(75~87)가 2부 중위권(84)을 침범
+    # 한다 — 2부가 강한 건 인정하되 3부만 분리" — 5부(51,63)까지는 이미
+    # 안전(4부/5부는 원래도 버퍼 충분)해서 손대지 않고, 3부(75,87)→
+    # (72,82)만 낮췄다. 실제 리그 정의(data/leagues.py)를 확인해보니
+    # 브라질 세리에A~D(1~4부) 외에 에스토두알 2부/3부(5~6부)까지 실존
+    # — 6부는 아직 딕셔너리에 채우지 않은 상태(별도 제안 대기).
+    "브라질": {1: (84, 95), 2: (79, 89), 3: (72, 82), 4: (61, 72), 5: (51, 63)},
+    "잉글랜드": {1: (88, 98), 2: (85, 92), 3: (76, 86), 4: (64, 74), 5: (53, 63)},
     "멕시코": (81, 91),  # [신민용 요청: "미국이랑 비슷하게"] 미국(81,91)과 동일하게 맞춤
     # [2026-08 신설, 신민용 요청: "캐나다도 평균 OVR 82쯤으로"]
-    "캐나다": (60, 85),  # [1차 실측 80.14→소폭 상향]
+    # [2026-08 재조정, 신민용 지적: "튜플(60,85) 델타 전파가 2부(54~77)/
+    # 3부(43~66)를 20점 넘게 벌려놓는다"] data/leagues.py로 실제 리그
+    # 개수 확인(캐나디안 프리미어리그/리그1 캐나다/캐나다 내셔널 아마추어
+    # 리그 — 딱 3부까지만 실존, 4부 이상 데이터 없음) 후 부수별 직접
+    # 지정으로 전환.
+    "캐나다": {1: (60, 85), 2: (55, 69), 3: (46, 58)},
     "스코틀랜드": (78, 89),
 }
 
 
 def get_ovr_range(grade: str, tier: int, country: str = None):
     """등급+tier(+국가) -> (하한, 상한) OVR 범위. country가
-    COUNTRY_LEAGUE_OVR_OVERRIDE에 있으면:
+    COUNTRY_LEAGUE_OVR_OVERRIDE에 있으면 값 형태에 따라 두 가지로 동작한다:
+
+    [형태 1] (하한,상한) 튜플 — tier1 기준 델타 전파 방식(기존):
       - tier==1: 오버라이드 값을 그대로 사용.
       - tier>=2: [2026-08 버그수정, 신민용 리포트: "K1 OVR을 내렸더니 K2랑
         겹친다(일본도 동일)"] 예전엔 오버라이드가 tier1에만 적용되고
@@ -3454,12 +3827,29 @@ def get_ovr_range(grade: str, tier: int, country: str = None):
         구조가 자동으로 유지된다. grade 표에 그 tier가 아예 없으면(예:
         B등급엔 5부가 없음) _tier_top_ovr()과 동일한 STEP 감쇠로 추정한
         기본값에 delta를 적용한다.
+
+    [형태 2] {tier: (하한,상한), ...} 딕셔너리 — 부수별 직접 지정
+      (2026-08 신설, 신민용 지적: "빅5는 같은 S/SS 등급 기본표를 공유하는데
+      나라마다 1부 하한이 미묘하게 달라서(스페인 89 vs 프랑스 88), 델타
+      전파만으로는 나라별 2~5부 목표치를 정확히 재현할 수 없다 — 예를 들어
+      스페인·프랑스는 2부 이하 목표가 완전히 같아야 하는데 델타가 서로
+      달라서 결과가 미묘하게 갈라짐"). 이런 나라는 tier마다 값을 직접
+      박아둔다 — 딕셔너리에 그 tier가 있으면 그 값을 그대로 쓰고, 없는
+      tier(예: 6부 이상)만 tier1 값을 기준으로 형태 1과 동일한 델타
+      전파로 보완한다.
+
     오버라이드가 없는 국가/tier는 원래 grade별 OVR_RANGES를 그대로 반환한다."""
     grade_ranges = OVR_RANGES.get(grade, {})
     if country and country in COUNTRY_LEAGUE_OVR_OVERRIDE:
-        o_lo, o_hi = COUNTRY_LEAGUE_OVR_OVERRIDE[country]
-        if tier == 1:
-            return (o_lo, o_hi)
+        override = COUNTRY_LEAGUE_OVR_OVERRIDE[country]
+        if isinstance(override, dict):
+            if tier in override:
+                return override[tier]
+            o_lo, o_hi = override.get(1, grade_ranges.get(1, (30, 30)))
+        else:
+            o_lo, o_hi = override
+            if tier == 1:
+                return (o_lo, o_hi)
         base_t1 = grade_ranges.get(1)
         if base_t1:
             base_tn = grade_ranges.get(tier)

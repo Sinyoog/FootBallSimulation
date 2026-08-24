@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QFrame, QScrollArea, QWidget, QComboBox
 )
 from PyQt6.QtCore import Qt, QTimer
-from game_engine import fmt_money
+from game_engine import fmt_money, get_difficulty
 from ui.center_panel import show_toast
 
 STYLE = """
@@ -30,6 +30,9 @@ QDialog { background:#1e1e1e; color:#ccc; }
           padding:6px 14px; font-size:12px; }
 #negBtn:hover { background:#3a3a8a; }
 #negBtn:disabled { background:#333; color:#555; }
+#infoBtn { background:transparent; color:#88aadd; border:1px solid #445566;
+           border-radius:4px; padding:2px 8px; font-size:10px; }
+#infoBtn:hover { background:#2a3a4a; }
 #noOffer { color:#666666; font-size:13px; }
 QComboBox {
     background:#2a2a2a; color:#ccc; border:1px solid #444;
@@ -52,6 +55,12 @@ class OfferWindow(QDialog):
         self.chosen     = None
         self.all_failed = False          # 모든 오퍼 결렬 여부 (1년 훈련 분기용)
         self._close_btn = None           # 닫기 버튼 참조 (전부 결렬 시 활성화)
+        # [2026-08 신설, 신민용 요청: "입단/오퍼 창이 떠 있는 동안에도 다른
+        # 창(팀 성적 등)을 열어서 비교하고 싶다"] 카드마다 "📊 최근 성적"
+        # 버튼으로 WorldBrowserWindow(비모달)를 띄우는데, 참조를 안 들고
+        # 있으면 파이썬 GC가 바로 회수해서 창이 뜨자마자 닫혀버린다 — 열린
+        # 창들을 여기 붙잡아둔다(닫히면 finished 시그널로 알아서 목록에서 제거).
+        self._team_info_wins = []
         # [2026-07 신설, 신민용 요청] kind("join"/"auto_offer")가 주어지면
         # 이 창의 상태(오퍼 목록·협상 진행도·직접지원 결과)를 DB에 저장해서,
         # 결정을 내리기 전에 게임을 껐다 켜도 새로 랜덤 생성하지 않고 같은
@@ -307,6 +316,31 @@ class OfferWindow(QDialog):
         lay.addWidget(btn)
         return card
 
+    def _open_team_info(self, tid, tname):
+        """[2026-08 신설] 카드의 "📊 최근 성적" 버튼 — 이 창(exec()로 열려
+        있음)을 닫지 않고도 그 팀의 세계 기록실(연도별 성적/수상)을 별도
+        비모달 창으로 띄운다. 이미 그 팀 창이 열려 있으면 새로 만들지
+        않고 앞으로 가져온다(center_panel._do_world_browser와 동일 패턴)."""
+        if tid is None:
+            return
+        for w in self._team_info_wins:
+            if getattr(w, "_info_team_id", None) == tid:
+                w.raise_(); w.activateWindow()
+                return
+        from ui.world_browser_window import WorldBrowserWindow
+        win = WorldBrowserWindow(self)
+        win._info_team_id = tid
+        win.tabs.setCurrentIndex(1)          # "🏟 팀 검색" 탭
+        win._show_team_detail(tid, tname)
+        self._team_info_wins.append(win)
+
+        def _cleanup(*_a, w=win):
+            if w in self._team_info_wins:
+                self._team_info_wins.remove(w)
+        win.finished.connect(_cleanup)
+        win.show()
+        win.raise_(); win.activateWindow()
+
     def _open_apply_search(self):
         from ui.apply_window import ApplyWindow
         dlg = ApplyWindow(self.lang, self)
@@ -350,6 +384,19 @@ class OfferWindow(QDialog):
                              "border-radius:3px; padding:1px 5px;")
             h1.addWidget(zl)
         h1.addStretch()
+        # [2026-08 신설, 신민용 요청: "입단/오퍼 창을 띄운 채로 팀 작년
+        # 성적 같은 걸 비교하고 싶다"] 이 창은 exec()로 열려 진행(next day)을
+        # 막는 용도라 dlg.exec() 자체는 그대로 두되(그 목적은 시간 진행
+        # 정합성 문제라 여기와 무관), 카드마다 이 버튼으로 그 팀의 세계
+        # 기록실(WorldBrowserWindow, 비모달)을 새로 띄워서 열어둔 채 계속
+        # 비교할 수 있게 한다 — 창을 닫지 않아도 됨.
+        info_btn = QPushButton("📊 최근 성적")
+        info_btn.setObjectName("infoBtn")
+        info_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        info_btn.clicked.connect(
+            lambda _, tid=offer.get("team_id"), tname=offer.get("team_name"):
+                self._open_team_info(tid, tname))
+        h1.addWidget(info_btn)
         lay.addLayout(h1)
 
         # ── 행2: 국가 | 리그명 (분리) ────────────────────────
@@ -367,6 +414,18 @@ class OfferWindow(QDialog):
         league_lbl = QLabel(f"🏆 {league_name}")
         league_lbl.setStyleSheet("color:#cccccc; font-size:11px;")
         h2.addWidget(country_lbl); h2.addWidget(sep_lbl); h2.addWidget(league_lbl)
+        # [2026-08 신설, 신민용 요청: "난이도 쉬움일 때는 팀 입단에서 그
+        # 팀의 현재 OVR도 보여달라"] 어려움/보통 난이도는 "누가 강팀인지"
+        # 정보를 최대한 숨기는 기존 설계(apply_window.py의 평균OVR 컬럼도
+        # 어려움에서만 뺌)와 다르게, 여기는 쉬움 전용으로 한정한다 — 오퍼
+        # 자체에 이미 team_avg_ovr이 계산돼 있어(game_engine._enrich_offer)
+        # 재조회 없이 바로 쓴다.
+        if get_difficulty() == "easy" and offer.get("team_avg_ovr") is not None:
+            ovr_lbl = QLabel(f"⚽ 팀 평균 OVR {offer['team_avg_ovr']:.1f}")
+            ovr_lbl.setStyleSheet(
+                "color:#ffd700; font-size:11px; font-weight:bold;"
+                "background:#332b00; border-radius:3px; padding:1px 5px; margin-left:6px;")
+            h2.addWidget(ovr_lbl)
         h2.addStretch()
         lay.addLayout(h2)
 

@@ -505,6 +505,24 @@ def init_db():
         ON ai_transfer_log(year)""")
     c.execute("""CREATE INDEX IF NOT EXISTS idx_ai_transfer_log_teams
         ON ai_transfer_log(from_team_id, to_team_id)""")
+
+    # [2026-08 신설, 부상 시스템 확장 4단계 — GPT 검토 확정 스키마]
+    # 부상 이력 — 커리어/은퇴 창 표시 + 재발(다음 단계) 판정용. history_id를
+    # 별도 PK로 두는 이유: 같은 선수가 같은 injury_id(부상 종류)를 여러 번
+    # 겪을 수 있어서 injury_id 자체는 고유키가 될 수 없음.
+    # expected_days(부상 풀이 가진 원래 예상 회복기간) vs actual_days(실제
+    # 결장일)를 분리 — 지금은 항상 같지만(재활 등으로 앞당기는 시스템이
+    # 아직 없음), 나중에 그런 시스템이 생겨도 스키마를 안 바꿔도 되게.
+    # return_date/actual_days는 NULL 허용 — 부상 중인 선수는 아직 복귀 전.
+    c.execute("""CREATE TABLE IF NOT EXISTS injury_history(
+        history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        player_id INTEGER NOT NULL,
+        injury_id TEXT, body_part TEXT, tier TEXT,
+        start_date TEXT, expected_days INTEGER, expected_return_date TEXT,
+        return_date TEXT, actual_days INTEGER,
+        was_recurrence INTEGER DEFAULT 0)""")
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_injury_history_player
+        ON injury_history(player_id)""")
     c.execute(f"""CREATE TABLE IF NOT EXISTS my_player(
         id INTEGER PRIMARY KEY,
         name TEXT, nationality TEXT, flag TEXT,
@@ -2709,7 +2727,14 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
     # 그대로 남아있었고, league_id/team_id가 새 게임에서도 재사용되는
     # 구조라 이전 플레이 때 그 자리에 있던 "다른 팀"의 승/무/패 기록이
     # 새 게임의 순위표 조회(get_league_standings)에 잘못 섞여 나왔다.
-    for t in ["my_player","career_entries","promotion_log","trophy_log","awards",
+    # [2026-08 버그수정, 신민용 리포트: "은퇴 이후 새 게임을 시작해도
+    # 부상 이력이 남아있다"] injury_history는 my_player(id=1)에만 종속되는
+    # 테이블인데(위 스키마 주석 참고, ai_players 쪽 부상은 여기 기록 안 됨)
+    # my_player 자체는 DELETE 후 새 id=1로 재생성되면서도 이 테이블은 삭제
+    # 목록에서 빠져 있었다 — 그래서 이전 캐릭터의 과거 부상 이력이 새로
+    # 시작한 캐릭터의 player_id=1과 그대로 매칭돼 커리어/은퇴 창에 이전
+    # 플레이의 부상 기록이 섞여 나왔다.
+    for t in ["my_player","injury_history","career_entries","promotion_log","trophy_log","awards",
               "game_log","match_results","match_results_archive","match_details",
               "season_state","qual_results","offer_refused","league_season_standings",
               "intl_history","intl_tournaments","intl_entries","intl_matches","nat_generation",
@@ -3297,8 +3322,58 @@ POS_FOREIGN_MULT = {
     "CDM": 1.0, "CM": 1.0, "CAM": 1.1,
     "LW": 1.2, "RW": 1.2, "CF": 1.2, "ST": 1.3,
 }
-# 팀당 외국인 등록 상한 (없는 나라는 무제한 — 확률만 적용).
-FOREIGN_QUOTA_CAP = {"대한민국": 4, "일본": 5, "중국": 5, "카타르": 4, "사우디아라비아": 8}
+# [2026-08 전면 재설계, 신민용 확정: "18명 로스터 기준 국가별 외국인 보유
+# 범위표"로 교체] 예전엔 5개국만 고정 상한(단일 숫자)을 가졌고 나머지는
+# 전부 무제한이었다. 이제 (하한, 상한) 범위로 바꾸고, 표에 없는 나라도
+# 대륙 기본값으로 전부 범위가 생긴다(더 이상 "무제한"인 나라 없음).
+# 상한(hi)은 기존과 동일하게 _pick_nationality의 하드 캡으로 계속 쓰고,
+# 하한(lo)은 팀 생성 시점에만 별도로 맞춰준다(_generate_team_players의
+# _topup_foreign_floor 참고) — 이적/은퇴교체 등 세이브 진행 중에는 하한을
+# 강제하지 않는다(실제 축구단도 시즌마다 외국인 비율이 자연스럽게
+# 오르내리므로, 상한 위반만 계속 막고 하한은 그대로 흘러가게 둔다).
+FOREIGN_QUOTA_RANGE = {
+    "사우디아라비아": (6, 9), "카타르": (6, 9), "아랍에미리트": (5, 7),
+    "일본": (4, 7), "태국": (5, 8), "호주": (4, 6),
+    "대한민국": (3, 5), "중국": (3, 5), "인도네시아": (4, 7),
+    "말레이시아": (5, 8), "베트남": (2, 4), "인도": (4, 6),
+    "이란": (1, 3), "우즈베키스탄": (2, 4), "모로코": (2, 4),
+    "이집트": (3, 5), "알제리": (1, 3), "튀니지": (2, 4),
+    "남아프리카공화국": (3, 5), "나이지리아": (0, 2), "가나": (0, 2),
+    "세네갈": (0, 2),
+    "잉글랜드": (9, 13), "포르투갈": (8, 12), "벨기에": (7, 11),
+    "네덜란드": (6, 10), "독일": (7, 11), "이탈리아": (8, 12),
+    "스페인": (6, 10), "프랑스": (6, 10), "튀르키예": (7, 11),
+    "그리스": (5, 9), "스위스": (6, 10), "오스트리아": (5, 9),
+    "체코": (4, 7), "폴란드": (4, 7), "세르비아": (3, 5),
+    "크로아티아": (3, 6), "루마니아": (3, 5),
+    "브라질": (3, 6), "아르헨티나": (2, 4), "우루과이": (2, 4),
+    "칠레": (3, 5), "콜롬비아": (2, 4), "에콰도르": (3, 5),
+    "파라과이": (2, 4), "페루": (2, 4),
+    "멕시코": (5, 8), "미국": (5, 8), "캐나다": (4, 6),
+    "코스타리카": (2, 4), "자메이카": (1, 3), "뉴질랜드": (2, 4),
+}
+
+# 위 표에 없는 나라는 대륙 기본값으로 처리한다(북중미는 이 게임의 대륙
+# 분류상 "북미"에 이미 포함돼 있다 — data/countries.py 참고: 코스타리카/
+# 파나마/자메이카 등이 전부 "북미"로 태깅됨).
+FOREIGN_QUOTA_RANGE_BY_CONTINENT = {
+    "아시아": (1, 2), "아프리카": (1, 2), "남미": (1, 3),
+    "북미": (1, 3), "오세아니아": (1, 3), "유럽": (3, 5),
+}
+
+
+def get_foreign_quota_range(country, continent=None):
+    """국가별 외국인 보유 목표 범위(lo, hi) 반환. 표에 등록된 나라는 그
+    값을, 없으면 대륙 기본값을, 대륙 정보조차 없으면 안전 기본값(1,3)을
+    반환한다 — 이제 어떤 나라도 "무제한"으로 남지 않는다."""
+    rng = FOREIGN_QUOTA_RANGE.get(country)
+    if rng:
+        return rng
+    if continent:
+        rng = FOREIGN_QUOTA_RANGE_BY_CONTINENT.get(continent)
+        if rng:
+            return rng
+    return (1, 3)
 # [2026-07 리팩터] 예전엔 스타 슬롯 해외파 국가를 이 고정 목록에서만
 # 뽑았는데, 그러면 목록 밖 나라(한국 등 대부분)는 빅클럽 스타 해외파가
 # 사실상 나올 수 없었다. 이제 _pick_nationality()는 전세계 국가를 피파
@@ -3482,7 +3557,16 @@ def _pick_nationality(team_country, team_continent, grade, pos, is_star, foreign
 
 # ─── AI 선수 생성 ──────────────────────────────────────────────
 # OVR_RANGES는 이제 파일 상단에서 constants.py로부터 가져온다 (단일 소스).
-TEAM_POSITIONS = ["GK","CB","CB","LB","RB","CDM","CM","CAM","LW","RW","ST"]
+# [2026-08 신설, 신민용 확정: 벤치 인원 확장 1단계] 주전 11자리 뒤에 후보
+# 7자리(GK1/DF2/MF2/FW2)를 추가. 아래 TEAM_STARTER_COUNT(=11)로 두 구간을
+# 나눠서 쓴다 — 스타 슬롯 추첨(_star_counts)/역할 순번(role_idx, 0~10 고정
+# 스케일)은 기존 그대로 앞 11자리(주전)에만 적용하고, 후보 7자리는 별도
+# 감쇠 곡선(_bench_target_ovr)으로 생성한다(_generate_team_players 참고).
+# 포지션 구성은 실제 벤치 뎁스 관례(GK 1명, 수비 2명, 미드필더 2명,
+# 공격수 2명)를 따름 — DF는 CB+RB, MF는 CM+CAM, FW는 ST+LW로 분산.
+TEAM_STARTER_COUNT = 11
+TEAM_POSITIONS = ["GK","CB","CB","LB","RB","CDM","CM","CAM","LW","RW","ST",
+                   "GK","CB","RB","CM","CAM","ST","LW"]
 KEY_STATS_BY_POS = {
     "GK":  ["positioning","concentration","mental","jump","stamina"],
     "CB":  ["tackling","heading","jump","positioning","concentration"],
@@ -3664,7 +3748,13 @@ def _star_counts(grade, team_strength, continent_bonus=0, n_slots=11, tier=1,
             # 가까이는 일반 곡선(_target_ovr, tier2 상한 기준)을 따르게 해
             # "에이스급 몇 명은 확실히 강하지만 전체 스쿼드는 확연히 아래"
             # 라는 현실적인 챔피언십 느낌을 되살린다.
-            n_elite = min(5, max(0, n_slots - n_world))
+            # [2026-08 재조정, 신민용 확정: "챔피언십 우승권도 89~90은
+            # 되어야 한다"] 5개로는 STAR_STRENGTH_PENALTY_MAX_BY_GRADE
+            # 조정만으론 최상위권 목표(89~90)에 못 미쳤다(실측) — 엘리트
+            # 슬롯을 늘려 그 팀의 더 많은 자리가 일반 곡선(_target_ovr, 벤치
+            # 쪽으로 갈수록 낮게 깎이는 완만한 커브) 대신 스타 슬롯값을
+            # 받게 한다. SS 2부 전용 분기라 다른 나라 2부에는 영향 없음.
+            n_elite = min(7, max(0, n_slots - n_world))
         elif tier == 2 and grade == "S":
             # [2026-07 신설, 신민용 지적: "세군다·세리에B·분데스2·리그2는
             # 현실에서도 상당히 강한 2부 리그인데 엘리트 슬롯이 3개로 확
@@ -3684,7 +3774,8 @@ def _star_counts(grade, team_strength, continent_bonus=0, n_slots=11, tier=1,
     return n_world, n_elite
 
 
-def _star_target_ovr(tier_top, kind, el_offset=(6, 14), prestige_bonus=0.0, team_strength=1.0):
+def _star_target_ovr(tier_top, kind, el_offset=(6, 14), prestige_bonus=0.0, team_strength=1.0,
+                      penalty_max=None):
     """스타 슬롯 하나의 목표 OVR. 리그 상한(tier_top) 바로 아래에서 결정 —
     월드클래스는 거의 상한 그 자체, 엘리트는 등급별 el_offset만큼 그 아래
     (SS/S는 좁은 오프셋 = 상위권 엘리트, A는 넓은 오프셋 = 하위권 엘리트).
@@ -3707,7 +3798,12 @@ def _star_target_ovr(tier_top, kind, el_offset=(6, 14), prestige_bonus=0.0, team
     그대로 적용된다. wc_base/wc_bonus/el_fill_rest/el_offset 등 스타 슬롯
     '개수' 구조는 이번엔 건드리지 않고, 가장 작은 변경(OVR 값 자체에만
     team_strength 연동)으로 먼저 실측한다."""
-    strength_penalty = (1.0 - team_strength) * STAR_STRENGTH_PENALTY_MAX
+    # [2026-08 수정] 이 함수가 STAR_STRENGTH_PENALTY_MAX(모듈 하단에 정의)
+    # 보다 파일상 앞에 있어서, 함수 정의 시점 기본값으로 그 상수를 직접
+    # 참조하면 NameError가 난다 — None 기본값으로 받고 여기서 늦게 해석한다.
+    if penalty_max is None:
+        penalty_max = STAR_STRENGTH_PENALTY_MAX
+    strength_penalty = (1.0 - team_strength) * penalty_max
     if kind == "worldclass":
         return tier_top - random.uniform(0, 4) - strength_penalty + prestige_bonus
     lo, hi = el_offset
@@ -3724,6 +3820,15 @@ def _star_target_ovr(tier_top, kind, el_offset=(6, 14), prestige_bonus=0.0, team
 # 다르게 주는 대신 독일 override 하한을 미세조정하는 쪽으로 흡수하기로
 # 확정(감쇠는 전 국가 공통값 유지가 원칙) — COUNTRY_LEAGUE_OVR_OVERRIDE 참고.
 STAR_STRENGTH_PENALTY_MAX = 4.0
+
+# [2026-08 신설, 신민용 확정: "잉글랜드 하위권도 91~92는 되게, 챔피언십
+# 우승권은 89~90은 되어야 한다"] 위 4.0은 S등급(스페인/프랑스/독일/
+# 이탈리아/브라질 공용) 목표 밴드에 맞춰 이미 정밀 튜닝된 값이라(바로 위
+# 주석 참고) 여기서 건드리면 그 나라들까지 같이 움직인다 — 그런데 SS등급은
+# "전 세계에서 잉글랜드 하나뿐"(STAR_COUNT_BY_GRADE 주석 참고)이라, SS만
+# 별도로 낮은 감쇠를 줘도 다른 나라엔 전혀 영향이 없다. 등급별 오버라이드가
+# 없으면(S 등 나머지 전부) 위 전역값 그대로 쓴다.
+STAR_STRENGTH_PENALTY_MAX_BY_GRADE = {"SS": 1.0}
 
 
 def _tier_top_ovr(grade, tier, continent_bonus=0, country=None):
@@ -3809,6 +3914,28 @@ def _target_ovr(grade, tier, team_strength, role_idx, continent_bonus=0, prestig
     return result
 
 
+# [2026-08 신설, 벤치 인원 확장 1단계] 후보(벤치) 슬롯 하나가 그 앞
+# 슬롯보다 추가로 더 깎이는 폭. _target_ovr의 role_idx(0~10, "0=에이스…
+# 10=막내") 스케일은 11자리(주전) 전제로 이미 정밀 튜닝돼 있어 그대로
+# 두고, 벤치는 "막내(role_idx=10)" 지점을 출발선으로 삼아 거기서부터
+# 서열(bench_rank)만큼 선형으로 더 깎는 별도 곡선을 쓴다.
+BENCH_OVR_DECAY_PER_SLOT = 2.5
+
+
+def _bench_target_ovr(grade, tier, team_strength, bench_rank, continent_bonus=0,
+                       prestige_bonus=0, country=None):
+    """벤치(후보) 선수 목표 OVR. bench_rank: 0=벤치 1번째(GK) … 6=벤치
+    마지막(LW). 기존 _target_ovr(role_idx=10, 주전 중 가장 낮은 지점)을
+    출발선으로 삼아 bench_rank가 깊어질수록 BENCH_OVR_DECAY_PER_SLOT만큼
+    추가로 뺀다. _target_ovr 내부의 하한 클램프(effective_lo)를 그대로
+    거친 뒤에 감쇠를 얹으므로, 주전 하한 로직(팀간 격차 유지용)에 영향을
+    주지 않고 벤치만 그보다 확실히 낮게 내려간다. 절대 하한 30은 극단적인
+    약체팀에서도 음수/비현실적 값이 나오지 않도록 하는 안전장치.
+    """
+    base = _target_ovr(grade, tier, team_strength, 10, continent_bonus, prestige_bonus, country)
+    return max(30.0, base - BENCH_OVR_DECAY_PER_SLOT * (bench_rank + 1))
+
+
 def _generate_all_ai_players(c, progress_cb=None):
     # 리그 단위로 묶어 8팀에 강→약 강도를 분배해야 팀 간 위계가 생긴다.
     # [리그등급 분리] cn.grade는 국대 등급 → 리그 OVR/연봉엔 COUNTRY_LEAGUE_GRADE 사용
@@ -3873,6 +4000,36 @@ def _generate_all_ai_players(c, progress_cb=None):
             _done += 1
             if progress_cb and (_done % 20 == 0 or _done == _total_teams):
                 progress_cb(_done, _total_teams, team.get("cname", ""))
+
+
+def _topup_foreign_floor(_rows, star_kind_by_slot, team_country, team_continent,
+                          quota_lo, foreign_count):
+    """[2026-08 신설] 팀 생성 직후 실제 외국인 수가 국가별 목표 범위
+    하한(quota_lo)에 못 미치면, 벤치(후보) 자리부터 우선해서 자국 선수
+    일부를 외국인으로 바꿔 하한을 맞춘다. 스타 슬롯(star_kind_by_slot)은
+    "축구 강국 우선" 로직으로 이미 국적이 확정된 자리라 건드리지 않는다.
+    _rows는 (팀id,이름,포지션,...,국적) 튜플 리스트 — 국적이 마지막
+    원소라 인덱스 -1로 바로 수정한다."""
+    if foreign_count >= quota_lo:
+        return foreign_count
+    _init_nationality_tables()
+    deficit = quota_lo - foreign_count
+    domestic_idx = [i for i in range(len(_rows))
+                    if i not in star_kind_by_slot and _rows[i][-1] == team_country]
+    # 벤치(TEAM_STARTER_COUNT 이상)부터 우선 — bool 정렬(False가 먼저)로
+    # "벤치인가(i>=TEAM_STARTER_COUNT)"가 True인 항목을 앞으로 보낸다.
+    domestic_idx.sort(key=lambda i: i < TEAM_STARTER_COUNT)
+    for i in domestic_idx[:deficit]:
+        pool = [(n, r) for n, r in _CONTINENT_COUNTRIES.get(team_continent, [])
+                if n != team_country]
+        nat = _weighted_country_pick(pool) or team_country
+        if nat == team_country:
+            continue
+        row = list(_rows[i])
+        row[-1] = nat
+        _rows[i] = tuple(row)
+        foreign_count += 1
+    return foreign_count
 
 
 def _generate_team_players(c, team, team_strength, league_used: set = None, name_pool_cache: dict = None):
@@ -3946,7 +4103,9 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
     tier_top = _tier_top_ovr(grade, tier, continent_bonus, team.get("cname", ""))
     n_world, n_elite = _star_counts(grade, team_strength, continent_bonus, tier=tier,
                                      country=team.get("cname", ""), prestige_level=_plevel)
-    star_slot_idx = list(range(len(TEAM_POSITIONS)))
+    # [2026-08 수정, 벤치 인원 확장] 스타 슬롯은 후보(벤치) 자리엔 절대
+    # 배정하지 않는다 — 주전 11자리(TEAM_STARTER_COUNT) 안에서만 추첨.
+    star_slot_idx = list(range(TEAM_STARTER_COUNT))
     random.shuffle(star_slot_idx)
     star_kind_by_slot = {}
     for i in star_slot_idx[:n_world]:
@@ -3968,8 +4127,12 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
     # 구간(n_star~10)의 role_idx만 셔플해서 나눠 갖는다 — _target_ovr의
     # role_idx 해석(0=에이스…10=막내)과 스케일(role_idx/10.0)은 그대로다.
     n_star = len(star_kind_by_slot)
-    non_star_positions = [i for i in range(len(TEAM_POSITIONS)) if i not in star_kind_by_slot]
-    remaining_ranks = list(range(n_star, len(TEAM_POSITIONS)))
+    # [2026-08 수정, 벤치 인원 확장] 이 role_idx(0~10) 셔플도 주전 11자리
+    # 안에서만 이뤄진다 — _target_ovr의 role_mult 스케일(role_idx/10.0)이
+    # "11자리 중 순번"을 전제로 튜닝돼 있어, 후보 7자리를 여기 섞으면 그
+    # 스케일이 깨진다(후보는 아래에서 _bench_target_ovr로 별도 처리).
+    non_star_positions = [i for i in range(TEAM_STARTER_COUNT) if i not in star_kind_by_slot]
+    remaining_ranks = list(range(n_star, TEAM_STARTER_COUNT))
     random.shuffle(remaining_ranks)
     role_indices = dict(zip(non_star_positions, remaining_ranks))
 
@@ -3990,12 +4153,20 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
     # 우선 쓴다 — override가 없는 S/SS 나라는 기존 88 그대로, override로
     # 국가별 하위권 수준을 세분화한 나라는 그 세분화된 하한이 실제로
     # 의미를 갖도록(그렇지 않으면 override 하한을 아무리 낮춰도 무용지물).
+    # [2026-08 버그수정, 신민용 리포트: "KeyError: 0" — 빅5/브라질/대한민국
+    # 등 일부 나라를 COUNTRY_LEAGUE_OVR_OVERRIDE에서 딕셔너리 형식({tier:
+    # (lo,hi)})으로 바꾸면서, 여기서 튜플 인덱싱(_country_override[0])을
+    # 그대로 가정하던 코드가 깨졌다 — 딕셔너리는 정수 0으로 인덱싱할 수
+    # 없다. get_ovr_range()가 튜플/딕셔너리 두 형식을 이미 다 처리하므로
+    # 그걸 거쳐서 하한을 꺼내도록 통일한다(로직 이원화 방지 — _tier_top_ovr/
+    # _target_ovr도 이미 같은 이유로 get_ovr_range를 거친다).
     _country_override = COUNTRY_LEAGUE_OVR_OVERRIDE.get(team.get("cname", ""))
     if tier == 1 and _country_override:
-        _elite_floor = _country_override[0]
+        _elite_floor = get_ovr_range(grade, 1, team.get("cname", ""))[0]
     else:
         _elite_floor = ELITE_FLOOR_BY_GRADE.get(grade) if tier == 1 else None
-    _quota = FOREIGN_QUOTA_CAP.get(team.get("cname", ""))
+    _quota_lo, _quota_hi = get_foreign_quota_range(team.get("cname", ""), continent)
+    _quota = _quota_hi
     _foreign_count = 0
     # [2026-08 최적화] 선수 11명치 INSERT를 한 명씩 execute()하는 대신 모아뒀다가
     # 팀 끝에서 executemany() 한 번으로 묶는다. 매 execute() 호출마다 발생하는
@@ -4010,8 +4181,18 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
             available = name_pool
         name = random.choice(available)
         league_used.add(name)
-        if idx in star_kind_by_slot:
-            target = _star_target_ovr(tier_top, star_kind_by_slot[idx], _el_offset, _star_prestige_bonus, team_strength)
+        if idx >= TEAM_STARTER_COUNT:
+            # [2026-08 신설, 벤치 인원 확장] 후보(벤치) 자리 — 스타 슬롯
+            # 대상이 아니고, elite_floor(SS/S 1부 "전원 스타" 방어선)도
+            # 적용하지 않는다(벤치는 그 방어선보다 확실히 아래여야 함).
+            target = _bench_target_ovr(grade, tier, team_strength, idx - TEAM_STARTER_COUNT,
+                                       continent_bonus, prestige_bonus, team.get("cname", ""))
+        elif idx in star_kind_by_slot:
+            # [2026-08 신설] 등급별 감쇠 오버라이드(현재 SS만) — 없으면
+            # STAR_STRENGTH_PENALTY_MAX(전역값) 그대로 사용.
+            _penalty_max = STAR_STRENGTH_PENALTY_MAX_BY_GRADE.get(grade, STAR_STRENGTH_PENALTY_MAX)
+            target = _star_target_ovr(tier_top, star_kind_by_slot[idx], _el_offset, _star_prestige_bonus,
+                                      team_strength, penalty_max=_penalty_max)
             if _elite_floor is not None:
                 # [2026-07 버그 수정] 엘리트 오프셋의 랜덤 폭(uniform 상한) 때문에
                 # 국가보정이 낮은 S급 나라(예: 대륙보정 0인 브라질)에서 드물게
@@ -4056,6 +4237,15 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
              stats["tackling"],stats["heading"],stats["positioning"],
              stats["setpiece"],stats["mental"],stats["confidence"],
              stats["leadership"],stats["concentration"],ovr,age,sub_role,nationality))
+
+    # [2026-08 신설, 외국인 보유 범위표 하한 보장] 확률 기반 배정만으로는
+    # 상한(quota_hi)은 정확히 지켜지지만 하한(quota_lo)은 못 미칠 수 있다
+    # (특히 잉글랜드처럼 하한이 높은 나라). 벤치(후보) 자리부터 우선해서
+    # 자국 선수 일부를 외국인으로 바꿔 하한을 맞춘다 — 팀 생성 시점 1회만
+    # 적용, 이후 이적/은퇴교체는 자연스러운 변동을 그대로 둔다.
+    _foreign_count = _topup_foreign_floor(
+        _rows, star_kind_by_slot, team.get("cname", ""), continent,
+        _quota_lo, _foreign_count)
 
     c.executemany("""INSERT INTO ai_players
         (team_id,name,position,stamina,speed,jump,strength,shooting,passing,

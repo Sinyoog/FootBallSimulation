@@ -72,10 +72,22 @@ if _HAS_NUMPY:
         _WEIGHT_VEC_NP[_pos] = _wv
 
 
-def run_ai_offseason(year, verbose_log=None):
+def run_ai_offseason(year, verbose_log=None, progress_cb=None):
     """시즌 종료 시 1회 호출. AI 선수 생애주기 전체 처리.
-    verbose_log: add_log 함수(있으면 요약 한 줄 남김)."""
+    verbose_log: add_log 함수(있으면 요약 한 줄 남김).
+    [2026-08 신설, 신민용 요청: "시즌 전환 처리 중... 이거 얼마나 남았는지
+    표시 안 되나"] progress_cb: callable(done:int, total:int, label:str)
+    형태의 콜백(있으면 4단계 각각 시작 시 1회씩 호출) — UI 쪽(center_panel.py
+    _AdvanceWorker)이 이걸로 진행률 바를 갱신한다. None이면(헤드리스 실행
+    등) 그냥 무시되며 기존 동작과 완전히 동일하다."""
     import time as _time_perf
+    _TOTAL_STAGES = 4
+    def _report(done, label):
+        if progress_cb:
+            try:
+                progress_cb(done, _TOTAL_STAGES, label)
+            except Exception:
+                pass   # UI 콜백 실패로 시즌전환 자체가 죽으면 안 됨
     conn = get_conn()
     c = conn.cursor()
 
@@ -84,6 +96,7 @@ def run_ai_offseason(year, verbose_log=None):
     # 이후에 시작하고 commit/캐시무효화는 범위 밖이라 이 구간들이 안 보였다.
     # 원인 확정 전이므로 로직은 그대로 두고 타이머만 촘촘히 추가한다.
     _t_start = _time_perf.perf_counter()
+    _report(0, "선수 나이·성장 처리 중")
     _ensure_ai_ages(c)               # 구버전 세이브 age 보정
     _ensure_ai_sub_roles(c)          # 구버전 세이브 sub_role 보정
     _t_ensure = _time_perf.perf_counter()
@@ -101,12 +114,16 @@ def run_ai_offseason(year, verbose_log=None):
         "contract_end_year, last_transfer_year FROM ai_players ORDER BY id").fetchall()
     _t_shared = _time_perf.perf_counter()
 
+    _report(1, "은퇴 및 신인 영입 중")
     retired    = _retire_and_replace(c, year, shared_ai_rows)
     _ta2 = _time_perf.perf_counter()
+    _report(2, "전세계 이적시장 처리 중")
     moved      = _transfer_market(c, year, shared_ai_rows, verbose_log=verbose_log)
     _ta3 = _time_perf.perf_counter()
+    _report(3, "포메이션 갱신 중")
     formations = _shuffle_formations(c)
     _ta4 = _time_perf.perf_counter()
+    _report(4, "시즌 전환 마무리 중")
     # [2026-07 신설, 진단용] game_engine._advance_week의 [PERF] 로그와 짝을
     # 이루는 세부 단계 측정 — "AI생애주기 N초" 중 실제로 어느 서브단계
     # (성장/은퇴·세대교체/이적시장/전술변경)가 무거운지 콘솔에서 바로 보인다.
@@ -504,7 +521,7 @@ def _retire_and_replace(c, year, ai_rows=None):
       등 하위호환) 기존처럼 이 함수가 직접 조회한다."""
     from constants import (OVR_RANGES, CONTINENT_OVR_BONUS, COUNTRY_OVR_ADJ, SUB_ROLES,
                            get_country_league_grade, get_ovr_range, COUNTRY_LEAGUE_OVR_OVERRIDE)
-    from database import _pick_nationality, FOREIGN_QUOTA_CAP
+    from database import _pick_nationality, get_foreign_quota_range
     retired = 0
 
     # 팀 → 리그등급/tier/보정치 선조회 (은퇴자마다 JOIN 방지)
@@ -713,7 +730,7 @@ def _retire_and_replace(c, year, ai_rows=None):
         cur_foreign = foreign_count_by_team.get(tid, 0)
         if old_nat and old_nat != cname:
             cur_foreign = max(0, cur_foreign - 1)
-        quota = FOREIGN_QUOTA_CAP.get(cname)
+        _q_lo, quota = get_foreign_quota_range(cname, continent)
         new_nat, cur_foreign = _pick_nationality(cname, continent, grade, r["position"],
                                                   False, cur_foreign, quota)
         foreign_count_by_team[tid] = cur_foreign

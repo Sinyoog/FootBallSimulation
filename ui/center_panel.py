@@ -119,17 +119,21 @@ class _ProcessingOverlay(QWidget):
         self._sub_label.hide()
         self._reposition_and_show()
 
-    def show_progress(self, text, done: int, total: int):
+    def show_progress(self, text, done: int, total: int, unit: str = "주"):
         """[2026-08 신설] 진행률 바가 있는 버전 — 1년 넘기기처럼 여러 단계로
         나뉘는 작업에 쓴다. 이미 떠 있는 상태에서 done/total만 바꿔가며
         반복 호출해도 된다(매번 geometry를 다시 잡으므로 창 크기 변경에도
-        안전)."""
+        안전).
+        [2026-08 확장, 신민용 요청: "시즌전환도 얼마나 남았는지 보이면
+        좋겠다"] unit 파라미터 추가 — 기존 1년 넘기기는 "N / 52주"(기본값
+        그대로), 시즌전환 내부 단계 표시는 "N / 4단계"처럼 다른 단위를
+        쓸 수 있게 일반화."""
         self._label.setText(text)
         self._bar.show()
         self._sub_label.show()
         self._bar.setMaximum(max(1, total))
         self._bar.setValue(done)
-        self._sub_label.setText(f"{done} / {total}주")
+        self._sub_label.setText(f"{done} / {total}{unit}")
         self._reposition_and_show()
 
 TRAIN_OPTS_KO = ["고강도","중강도","강점훈련","약점훈련","저강도","휴식"]
@@ -237,6 +241,12 @@ class _AdvanceWorker(QThread):
     main_win 전체를 비활성화해 직렬화를 보장한다."""
     finished_ok = pyqtSignal()
     failed = pyqtSignal(str)
+    # [2026-08 신설, 신민용 요청: "시즌 전환 처리 중... 이거 얼마나 남았는지
+    # 표시 안 되나"] run_ai_offseason의 4단계(나이/성장→은퇴/신인→이적시장→
+    # 포메이션)마다 1회씩 emit — pyqtSignal은 워커 스레드에서 emit해도
+    # Qt가 알아서 메인(GUI) 스레드로 큐잉해 전달하므로 직접 위젯을 건드리지
+    # 않아도 스레드 안전하다.
+    stage_progress = pyqtSignal(int, int, str)
 
     def __init__(self, schedule, parent=None):
         super().__init__(parent)
@@ -244,7 +254,9 @@ class _AdvanceWorker(QThread):
 
     def run(self):
         try:
-            advance_days(self._schedule)
+            advance_days(self._schedule,
+                         progress_cb=lambda done, total, label:
+                             self.stage_progress.emit(done, total, label))
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -440,8 +452,12 @@ class CenterPanel(QWidget):
         pvlay.addWidget(QLabel("이번 주 예상 변화"))
         self.lbl_pv_stress = QLabel("예상 스트레스: 0")
         self.lbl_pv_happy  = QLabel("예상 행복도: +0")
+        # [2026-08 신설, 신민용 확정: "예상 스트레스/예상 행복도는 있는데
+        # 예상 신체부담 수치는 없어"] 신체 부담(injury_load)도 같은 자리에
+        # 같은 형태로 미리보기 추가.
+        self.lbl_pv_load   = QLabel("예상 신체부담: +0")
         self.lbl_pv_match  = QLabel("경기 수: 0경기")
-        for w in [self.lbl_pv_stress, self.lbl_pv_happy, self.lbl_pv_match]:
+        for w in [self.lbl_pv_stress, self.lbl_pv_happy, self.lbl_pv_load, self.lbl_pv_match]:
             pvlay.addWidget(w)
         self.lay.addWidget(pvbox)
 
@@ -1411,12 +1427,22 @@ class CenterPanel(QWidget):
 
     def _update_preview(self):
         total_stress = 0
+        total_load = 0
         # 휴식 행복도는 실제로 random.randint(4,8) → 평균 6으로 추산하되,
         # 표시는 범위(+4~8)임을 알 수 있게 한다.
         rest_count = 0
         # 성격/신체특징 stress_mult 가 반영된 '실제 적용' 스트레스를 표시한다.
-        from game_engine import effective_training_stress, get_player
+        from game_engine import (effective_training_stress, effective_training_injury_load,
+                                  get_player, is_hard_mode)
         p = get_player() or {}
+        # [2026-08 신설, 신민용 확정: "어려움 난이도일 때 얘네(예상 스트레스/
+        # 행복도/신체부담) 보이는데 빼야해"] player_panel.py의 vitals_frame과
+        # 같은 원칙 — 하드모드에서는 내부 컨디션 수치를 여기서도 숨긴다.
+        # 경기 수(lbl_pv_match)는 일정 정보일 뿐 컨디션이 아니라서 계속 표시.
+        _hard = is_hard_mode(p)
+        self.lbl_pv_stress.setVisible(not _hard)
+        self.lbl_pv_happy.setVisible(not _hard)
+        self.lbl_pv_load.setVisible(not _hard)
         for i, cb in enumerate(self.week_combos):
             if not cb.isVisible():
                 # [2026-07 버그수정, 신민용 리포트: "경기일엔 스트레스 +8이
@@ -1434,7 +1460,9 @@ class CenterPanel(QWidget):
             sel   = cb.currentText()
             ttype = TRAIN_MAP_KO.get(sel, "중강도")
             s_chg = effective_training_stress(p, ttype)
+            l_chg = effective_training_injury_load(p, ttype)
             total_stress += s_chg
+            total_load += l_chg
             if ttype == "휴식":
                 rest_count += 1
             sign = "+" if s_chg >= 0 else ""
@@ -1442,6 +1470,8 @@ class CenterPanel(QWidget):
 
         ss = "+" if total_stress >= 0 else ""
         self.lbl_pv_stress.setText(f"예상 스트레스: {ss}{total_stress}")
+        ls = "+" if total_load >= 0 else ""
+        self.lbl_pv_load.setText(f"예상 신체부담: {ls}{total_load}")
         if rest_count:
             # 휴식 1회당 +4~8 → 합산 범위로 표시
             self.lbl_pv_happy.setText(
@@ -1814,10 +1844,17 @@ class CenterPanel(QWidget):
         if _is_season_transition:
             self._show_processing_overlay(
                 "⏳ 시즌 전환 처리 중...\n(전세계 이적시장 · 신인 영입 · 승강제 반영)")
+            # [2026-08 신설, 신민용 요청] 정적 문구만으론 얼마나 남았는지
+            # 알 수 없다는 지적 — run_ai_offseason의 4단계 진행을 그대로
+            # 진행률 바로 보여준다(0/4에서 시작, stage_progress로 갱신).
+            self._proc_overlay.show_progress(
+                "⏳ 시즌 전환 처리 중...", 0, 4, unit="단계")
         else:
             self._show_processing_overlay("⏳ 진행 중...")
 
         self._advance_worker = _AdvanceWorker(schedule, self)
+        if _is_season_transition:
+            self._advance_worker.stage_progress.connect(self._on_advance_stage_progress)
         self._advance_worker.finished_ok.connect(
             lambda: self._on_advance_finished())
         self._advance_worker.failed.connect(self._on_advance_failed)
@@ -1833,6 +1870,14 @@ class CenterPanel(QWidget):
         # 무관하게 Qt가 안전한 시점에 알아서 정리해준다.
         self._advance_worker.finished.connect(self._advance_worker.deleteLater)
         self._advance_worker.start()
+
+    def _on_advance_stage_progress(self, done, total, label):
+        """[2026-08 신설] run_ai_offseason의 4단계 진행을 오버레이 진행률
+        바에 반영. 워커 스레드가 emit한 신호를 메인 스레드에서 받아
+        처리하므로 위젯 접근이 안전하다(Qt의 자동 큐 연결)."""
+        if self._proc_overlay is not None:
+            self._proc_overlay.show_progress(
+                f"⏳ {label}...", done, total, unit="단계")
 
     def _on_advance_finished(self):
         from PyQt6.QtWidgets import QApplication
@@ -2773,38 +2818,21 @@ class CenterPanel(QWidget):
         완전히 다른 개념: "상대 구단이 나에게 이적을 제안"이 아니라
         "우리 구단이 이미 판매를 결정하고 완성된 조건을 승인받으려는
         것"이라서, 연봉/이적료를 협상하는 버튼이 없다 — 수락/거절만
-        가능하다. 우측엔 "관심 구단" 목록을 보여준다.
-
-        [2026-08 수정, 신민용 요청 2건]
-        (1) "관심 구단이 관심만 있다고만 뜨는데, 클릭하면 그 팀이 원하는
-            조건이 좌측에 뜨게 하고 싶다" — 관심 구단 이름을 클릭 가능한
-            버튼으로 바꾸고, 누르면 game_engine.get_sale_push_alt_offer로
-            그 팀 기준 조건을 즉석 계산해 좌측 카드를 그 팀 것으로 갈아
-            끼운다("주 후보"로 다시 돌아가는 버튼도 별도 제공). 수락 시엔
-            지금 화면에 표시 중인(선택된) 팀 기준으로 예약된다.
-        (2) "오퍼창이 떠도 다른 창(세계 축구 기록실 등)을 건들 수 있게
-            해달라 — 이 팀이 어떤 팀인지 확인해야 하니" — dlg.exec()(모달,
-            뒤 UI 전부 잠김) 대신 dlg.show()(비모달)로 띄운다. 참조를
-            self._sale_push_dlg에 들고 있어야 즉시 GC되지 않는다."""
-        # 이미 떠 있으면 새로 안 만든다(매주 refresh 루프가 여러 번 이
-        # 메서드를 호출해도 창이 중복 생성되지 않게).
-        if getattr(self, "_sale_push_dlg", None) is not None:
-            return
+        가능하다. 우측엔 "관심 구단" 목록(실제 오퍼가 아니라 구매
+        의향이 있는 팀들)을 장식적으로 보여준다."""
         raw = p.get("sale_push_proposal_json") or ""
         if not raw:
             return
         import json as _json
         try:
-            main_proposal = _json.loads(raw)
+            proposal = _json.loads(raw)
         except Exception:
             return
 
         from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame
-        from game_engine import (accept_sale_push_proposal, reject_sale_push_proposal,
-                                  get_sale_push_alt_offer)
+        from game_engine import accept_sale_push_proposal, reject_sale_push_proposal
 
         dlg = QDialog(self)
-        dlg.setWindowModality(Qt.WindowModality.NonModal)
         dlg.setWindowTitle("🏟 판매추진 제안")
         dlg.setMinimumWidth(440)
         dlg.setStyleSheet(_DIALOG_STYLE)
@@ -2819,15 +2847,37 @@ class CenterPanel(QWidget):
 
         card = QFrame(); card.setObjectName("dlgCard")
         cl = QVBoxLayout(card); cl.setContentsMargins(14, 12, 14, 12); cl.setSpacing(5)
+        _flag = proposal.get("flag", "")
+        cl.addWidget(QLabel(
+            f"<b style='color:#fff;font-size:14px'>{_flag} {proposal['team_name']}</b>"))
+        cl.addWidget(QLabel(
+            f"<span style='color:#bbb'>{proposal['league_name']} ({proposal['country']}, "
+            f"{proposal['tier']}부)</span>"))
+        cl.addWidget(QLabel(""))
+        cl.addWidget(QLabel(
+            f"<span style='color:#bbb'>제시 연봉</span>  "
+            f"<b style='color:#00cc66'>{fmt_money(proposal['salary'])} / 년</b>"))
+        cl.addWidget(QLabel(
+            f"<span style='color:#bbb'>판매 금액</span>  "
+            f"<b style='color:#ffcc33'>{fmt_money(proposal['transfer_fee'])}</b>  "
+            f"<span style='color:#888;font-size:11px'>"
+            f"(시장가 {fmt_money(proposal['market_fee'])} 대비 "
+            f"{int(proposal['discount_pct']*100)}% 할인)</span>"))
+        cl.addWidget(QLabel(
+            f"<span style='color:#bbb'>계약 기간</span>  "
+            f"<b style='color:#fff'>{proposal['contract_years']}년</b>"))
         body.addWidget(card, 3)
 
-        interest = main_proposal.get("interest_teams") or []
-        ibox = None
+        interest = proposal.get("interest_teams") or []
         if interest:
             ibox = QFrame(); ibox.setObjectName("dlgCard")
             il = QVBoxLayout(ibox); il.setContentsMargins(10, 10, 10, 10); il.setSpacing(3)
-            il.addWidget(QLabel("<span style='color:#888;font-size:11px'>관심 구단"
-                                 " (클릭하면 조건 확인)</span>"))
+            il.addWidget(QLabel("<span style='color:#888;font-size:11px'>관심 구단</span>"))
+            for name in interest:
+                nl = QLabel(f"· {name}")
+                nl.setStyleSheet("color:#999;font-size:11px;")
+                il.addWidget(nl)
+            il.addStretch()
             body.addWidget(ibox, 1)
 
         root.addLayout(body)
@@ -2844,76 +2894,8 @@ class CenterPanel(QWidget):
         btn_row.addWidget(btn_accept, 1); btn_row.addWidget(btn_reject, 1)
         root.addLayout(btn_row)
 
-        # 지금 좌측 카드에 표시 중인(=수락 시 예약될) 팀. 처음엔 주 후보.
-        state = {"shown": main_proposal}
-
-        def _render_card(proposal, is_main):
-            while cl.count():
-                item = cl.takeAt(0)
-                if item.widget():
-                    item.widget().deleteLater()
-            _flag = proposal.get("flag", "")
-            cl.addWidget(QLabel(
-                f"<b style='color:#fff;font-size:14px'>{_flag} {proposal['team_name']}</b>"))
-            cl.addWidget(QLabel(
-                f"<span style='color:#bbb'>{proposal['league_name']} ({proposal['country']}, "
-                f"{proposal['tier']}부)</span>"))
-            if not is_main:
-                back = QLabel("<span style='color:#66aaff;font-size:11px'>"
-                               "관심 구단이 원하는 조건 (주 후보 아님)</span>")
-                cl.addWidget(back)
-            cl.addWidget(QLabel(""))
-            cl.addWidget(QLabel(
-                f"<span style='color:#bbb'>제시 연봉</span>  "
-                f"<b style='color:#00cc66'>{fmt_money(proposal['salary'])} / 년</b>"))
-            cl.addWidget(QLabel(
-                f"<span style='color:#bbb'>판매 금액</span>  "
-                f"<b style='color:#ffcc33'>{fmt_money(proposal['transfer_fee'])}</b>  "
-                f"<span style='color:#888;font-size:11px'>"
-                f"(시장가 {fmt_money(proposal['market_fee'])} 대비 "
-                f"{int(proposal['discount_pct']*100)}% 할인)</span>"))
-            cl.addWidget(QLabel(
-                f"<span style='color:#bbb'>계약 기간</span>  "
-                f"<b style='color:#fff'>{proposal['contract_years']}년</b>"))
-            if not is_main:
-                bb = QPushButton("↩ 주 후보로 돌아가기")
-                bb.setObjectName("dlgNo")
-                bb.clicked.connect(lambda: _select_team(main_proposal, True))
-                cl.addWidget(bb)
-            state["shown"] = proposal
-
-        def _select_team(proposal, is_main):
-            _render_card(proposal, is_main)
-
-        def _on_interest_click(team_id):
-            alt = get_sale_push_alt_offer(team_id)
-            if alt:
-                _select_team(alt, False)
-            else:
-                show_toast(self, "조건을 불러올 수 없습니다.", "#cc0000", 1200)
-
-        if ibox is not None:
-            for team in interest:
-                _name = team.get("team_name", "") if isinstance(team, dict) else str(team)
-                _flag2 = team.get("flag", "") if isinstance(team, dict) else ""
-                if isinstance(team, dict) and team.get("team_id"):
-                    nb = QPushButton(f"· {_flag2} {_name}")
-                    nb.setObjectName("dlgNo")
-                    nb.setStyleSheet("text-align:left;color:#999;font-size:11px;"
-                                     "padding:3px 6px;")
-                    nb.clicked.connect(lambda _=False, tid=team["team_id"]: _on_interest_click(tid))
-                    ibox.layout().addWidget(nb)
-                else:
-                    nl = QLabel(f"· {_name}")
-                    nl.setStyleSheet("color:#999;font-size:11px;")
-                    ibox.layout().addWidget(nl)
-            ibox.layout().addStretch()
-
-        _render_card(main_proposal, True)
-
         def _accept():
-            chosen = state["shown"]
-            accept_sale_push_proposal(chosen.get("team_id"))
+            accept_sale_push_proposal()
             dlg.accept()
             if self.main_win:
                 self.main_win.refresh_all()
@@ -2924,14 +2906,9 @@ class CenterPanel(QWidget):
             if self.main_win:
                 self.main_win.refresh_all()
 
-        def _on_closed(_result=0):
-            self._sale_push_dlg = None
-
         btn_accept.clicked.connect(_accept)
         btn_reject.clicked.connect(_reject)
-        dlg.finished.connect(_on_closed)
-        self._sale_push_dlg = dlg
-        dlg.show()
+        dlg.exec()
 
     def _show_forced_commit(self, forced):
         """[복수국적] 22세 프리시즌(1~3주) — 평생 뛸 대표팀 국적을 강제로 확정.
@@ -3298,17 +3275,28 @@ class CenterPanel(QWidget):
 
     def _on_join_done(self, dlg):
         if dlg.chosen:
-            # [2026-08 수정, 신민용 요청: "클럽월드컵 도중 소속이 바뀌면
-            # 오류날 수 있다 — 입단도 시즌 시작 순간에 반영되게"] 예전엔
-            # join_team()을 여기서 바로 불렀는데, 이제 reserve_join_transfer로
-            # 예약만 해두고 실제 이적은 다음 상/하반기 시작 주차
-            # (game_engine._advance_week)에서 실행한다. offer=dlg.chosen을
-            # 그대로 넘겨야 join_team이 기간 협상 결과(contract_years)를
-            # 실제 계약에 반영한다.
-            from game_engine import reserve_join_transfer
-            reserve_join_transfer(dlg.chosen["team_id"], dlg.chosen["salary"],
-                                  dlg.chosen.get("team_name", ""),
-                                  transfer_type="입단", offer=dlg.chosen)
+            # [2026-08 재수정, 신민용 리포트: "팀이 없을 때 입단해도 시즌
+            # 시작 주차까지 기다려야 하는 건 이상하다 — 이건 원래 소속팀이
+            # 있다가 다른 팀으로 옮기는 경우(오퍼 수락)에만 필요한
+            # 지연이지, 무소속 상태에서 새로 입단하는 경우엔 지연시킬
+            # 이유가 없다"] 이 핸들러(_on_join_done)는 btn_join
+            # ("🏟 팀 입단") 클릭으로만 도달하는데, btn_join 자체가
+            # setVisible(not has_team)이라 무소속일 때만 노출된다 — 즉
+            # 여기 들어오는 시점엔 항상 current_team_id가 비어 있다.
+            # 2026-08 1차 수정 때 "클럽월드컵 도중 소속이 바뀌면 오류날 수
+            # 있다"는 이유로 이 흐름도 reserve_join_transfer(예약, 다음
+            # 상/하반기 시작 주차에 실행)로 함께 바꿨는데, 그 사고 시나리오는
+            # "이미 어느 팀 소속으로 그 팀의 진행 중인 대회에 참가하고
+            # 있다가 다른 팀으로 갈아타는" 경우에만 해당한다 — 무소속
+            # 상태에는애초에 내가 얽혀 있는 진행 중인 내 대회 참가 이력
+            # 자체가 없으므로 즉시 입단해도 그 문제가 재발하지 않는다.
+            # 그래서 무소속→입단은 join_team()을 즉시 호출(2026-08 이전
+            # 원래 동작)하도록 되돌리고, 소속팀이 있는 상태에서 다른 팀
+            # 오퍟를 받는 _on_auto_offer_done 쪽만 reserve_join_transfer
+            # (시즌 시작 시점 반영)로 그대로 유지한다.
+            from game_engine import join_team
+            join_team(dlg.chosen["team_id"], dlg.chosen["salary"],
+                      transfer_type="입단", offer=dlg.chosen)
             if self.main_win: self.main_win.refresh_all()
 
     def _show_auto_offer(self, week: int):

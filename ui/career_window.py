@@ -199,6 +199,12 @@ class CareerWindow(QDialog):
             awards = []
         # 내가 그 팀에 실제로 있던 기간의 승강 기록 (공용 헬퍼)
         promos = get_my_promotions()
+        # [2026-08 신설, 부상 시스템 확장 — 커리어 기록] 부상 이력.
+        # 최신순 고정(history_id DESC) — "이번 시즌 얼마나 다쳤나"부터
+        # 바로 보이는 게 과거 기록부터 스크롤해서 찾는 것보다 자연스럽다.
+        injuries = [dict(r) for r in c.execute(
+            "SELECT * FROM injury_history WHERE player_id=1 ORDER BY history_id DESC"
+        ).fetchall()]
         conn.close()
 
         tabs = QTabWidget()
@@ -207,6 +213,7 @@ class CareerWindow(QDialog):
         tabs.addTab(self._trophy_tab(trophies), f"성적 ({len(trophies)})")
         tabs.addTab(self._award_tab(awards), f"개인 수상 ({len(awards)})")
         tabs.addTab(self._promo_tab(promos),  f"승강 ({len(promos)})")
+        tabs.addTab(self._injury_tab(injuries), f"부상 이력 ({len(injuries)})")
 
         import intl_engine
         intl_ms = intl_engine.get_my_intl_matches()
@@ -887,6 +894,36 @@ class CareerWindow(QDialog):
             vals = [str(t.get("year","")), team_str, comp_str, result]
             for j, v in enumerate(vals):
                 self._set(tbl, i, j, v, color if j == 3 else None)
+        lay.addWidget(tbl)
+        return w
+
+    def _injury_tab(self, injuries):
+        """[2026-08 신설] 부상 이력 탭 — 최신순 고정(호출부에서 정렬 완료).
+        진행 중인 부상(복귀 전, return_date NULL)은 "(진행중)"으로 표시."""
+        w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(0,0,0,0)
+        if not injuries:
+            lay.addWidget(QLabel("부상 이력 없음")); return w
+        from ui.player_panel import zone_label_ko
+        from constants import INJURY_POOL
+        _name_by_id = {e["id"]: e["name"] for e in INJURY_POOL}
+        _tier_color = {"경미": "#d4b106", "중간": "#e07b1a",
+                       "심각": "#cc3333", "매우 심각": "#8b0000"}
+        cols = ["기간", "결장일", "부상명", "부위", "등급", "재발"]
+        tbl = self._make_table(len(injuries), cols)
+        for i, inj in enumerate(injuries):
+            if inj.get("return_date"):
+                period = f"{inj['start_date']} ~ {inj['return_date']}"
+                days = str(inj.get("actual_days") or "")
+            else:
+                period = f"{inj['start_date']} ~ (진행중)"
+                days = "진행중"
+            body = zone_label_ko(inj.get("body_part") or "")
+            tier = inj.get("tier") or ""
+            name = _name_by_id.get(inj.get("injury_id"), inj.get("injury_id") or "")
+            recur = "재발" if inj.get("was_recurrence") else ""
+            vals = [period, days, name, body, tier, recur]
+            for j, v in enumerate(vals):
+                self._set(tbl, i, j, v, _tier_color.get(tier) if j == 4 else None)
         lay.addWidget(tbl)
         return w
 

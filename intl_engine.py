@@ -2275,6 +2275,44 @@ def _enrich_countries(rows, year=None):
     return rows
 
 
+def _apply_my_ovr_to_qual_rows(rows, p, my_nats, nat_info):
+    """[2026-08 신설, 신민용 요청: "내가 국대로 뽑혔을 때는 내 OVR도
+    예선 컷오프 기준 국가 OVR 계산에 반영되게 해달라"] _enrich_countries는
+    fast=True라 실제 스쿼드(내 선수 포함)를 전혀 조회하지 않고 순수
+    밴드 공식값만 쓴다 — 그래서 유저가 그 나라 대표팀에 낄 실력이어도
+    예선 컷오프 판정엔 지금까지 아무 영향이 없었다.
+
+    여기서는 내 후보국(my_nats — committed면 이미 [committed] 하나로
+    좁혀진 상태라 많아야 1~3개국, 200여 개국을 도는 _enrich_countries와
+    달리 부담 없음)에 한해서만 _check_selection으로 "내가 실제로 그
+    나라 대표팀에 뽑힐 실력인지"를 먼저 검증한다. 뽑힐 실력이면 23인
+    스쿼드(INTL_SQUAD_QUOTA 합) 평균에 나 한 명이 낀 것처럼
+    (내 OVR − 국가 OVR)/23 만큼만 그 나라 OVR을 밀어올리거나(내가 평균
+    이상) 끌어내린다(내가 평균 이하) — 스쿼드 전체를 다시 조회하지
+    않고도 "내가 있으면 평균이 이만큼 움직인다"를 근사한다. 뽑힐
+    실력이 안 되면(포지션 경쟁에서 밀림 등) 기존처럼 내 존재는 그 나라
+    OVR에 전혀 영향을 주지 않는다 — "내가 국대에 껴야만" 반영되게 하는
+    게 요청 취지였기 때문."""
+    candidates = [n for n in my_nats if n]
+    my_ovr = p.get("ovr", 0) if p else 0
+    if not candidates or not my_ovr:
+        return
+    from constants import INTL_SQUAD_QUOTA
+    squad_size = sum(INTL_SQUAD_QUOTA.values())  # 23 (GK3+DF8+MF8+FW4)
+    for r in rows:
+        name = r.get("name", "")
+        if name not in candidates:
+            continue
+        info = nat_info.get(name, {})
+        grade = info.get("grade", r.get("grade", "F"))
+        continent = info.get("continent", r.get("continent", ""))
+        if _check_selection(p, grade, country=name, continent=continent):
+            old_ovr = r["ovr"]
+            r["ovr"] = round(min(100.0, max(1.0,
+                old_ovr + (my_ovr - old_ovr) / squad_size)), 2)
+            r["my_ovr_applied"] = True   # 디버그/로그용 — "내 OVR 반영됨" 표시
+
+
 def _sim_single_match_ai(home, away):
     """단판 AI vs AI 시뮬. 전력 기반 확률로 승패 결정. 승자 dict 반환."""
     h_str = home.get("ovr", 50); a_str = away.get("ovr", 50)
@@ -2329,6 +2367,9 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
     all_rows = _enrich_countries(_conf_countries(continent), year=year)
     if len(all_rows) < 4:
         return
+
+    # [2026-08 신설] 내가 후보국 대표팀에 뽑힐 실력이면 그 나라 OVR에도 반영
+    _apply_my_ovr_to_qual_rows(all_rows, p, my_nats, nat_info)
 
     # FIFA 랭크(ovr) 기준 정렬
     all_rows.sort(key=lambda r: r["ovr"], reverse=True)

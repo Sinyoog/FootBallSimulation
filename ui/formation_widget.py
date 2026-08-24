@@ -6,7 +6,7 @@ ui/formation_widget.py
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QDialog,
     QTableWidget, QTableWidgetItem, QPushButton, QComboBox,
-    QSizePolicy, QFrame
+    QSizePolicy, QFrame, QScrollArea, QGridLayout
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QPainter, QBrush, QPen, QFont
@@ -29,6 +29,25 @@ def _players_for_team(team_id):
         "SELECT * FROM ai_players WHERE team_id=? ORDER BY ovr DESC LIMIT 11",
         (team_id,)).fetchall()
     conn.close()
+    return _mask_ai_names([dict(r) for r in rows])
+
+def _full_squad_for_team(team_id):
+    """[2026-08 신설] 포메이션 화면 아래 "전체 명단" 패널 전용 — 기존
+    _players_for_team은 평균 OVR·포메이션 배치용으로 상위 11명만
+    (LIMIT 11) 가져오는데, 이건 그 팀의 스쿼드 전체(벤치 포함)가
+    필요하다. 다른 곳에서 쓰는 평균 OVR/시작 라인업 계산 로직은 전혀
+    건드리지 않기 위해 별도 함수로 분리했다. team_id가 없으면(국제대회
+    가상 국가대표팀처럼 실제 스쿼드 자체가 없는 경우) None을 반환해
+    호출부가 "명단 없음"으로 처리하게 한다."""
+    if not team_id:
+        return None
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM ai_players WHERE team_id=? ORDER BY ovr DESC",
+        (team_id,)).fetchall()
+    conn.close()
+    if not rows:
+        return None
     return _mask_ai_names([dict(r) for r in rows])
 
 def _mask_ai_names(rows):
@@ -305,11 +324,18 @@ class _FormationCanvas(QWidget):
         self._player_at: dict = {}
         self._positions_xy: list = []
         self._hovered_slot = -1
-        self.setMinimumHeight(300)
+        # [2026-08 신설] 명단 패널 추가로 캔버스 자체는 절반 크기로
+        # 줄어들 수 있으므로, 최소 높이도 그에 맞춰 낮춘다(기존 300 →
+        # 160). 원/글자 크기는 paintEvent에서 실제 폭·높이에 맞춰
+        # 동적으로 계산한다(_calc_positions가 self._circle_d에 저장).
+        self.setMinimumHeight(160)
         self.setMinimumWidth(260)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setStyleSheet("background-color:#1a3a1a;border-radius:6px;")
         self.setMouseTracking(True)
+        self._circle_d = 48          # paintEvent가 실제 크기에 맞춰 갱신
+        self._roster: list = []      # [2026-08 신설] 전체 스쿼드(명단 패널용)
+        self._starter_ids: set = set()  # 그 중 지금 포메이션에 들어간 선수 id
 
     def _calc_avg_ovr(self, ndigits=0):
         """현재 로드된 선수들의 평균 OVR.
@@ -362,7 +388,7 @@ class _FormationCanvas(QWidget):
             _self_mod._ovr_cache_invalidated = False
 
         if _cache is not None and _cache_key in _cache:
-            self.formation, self.players = _cache[_cache_key]
+            self.formation, self.players, self._roster, self._starter_ids = _cache[_cache_key]
             self._player_at = {}; self._positions_xy = []
             self.update()
             return
@@ -400,6 +426,8 @@ class _FormationCanvas(QWidget):
                 me = {"id": -1, "name": p.get("name", "나"),
                       "position": my_pos, "_slot_idx": my_slot_idx,
                       "ovr": p.get("ovr", 40), "is_me": True,
+                      "injured": bool(p.get("injured")),
+                      "age": p.get("age", 0),
                       **{s: p.get(s, 0) for s in ALL_STATS}}
                 players.append(me)
             for i, sp in enumerate(slots_only):
@@ -442,24 +470,57 @@ class _FormationCanvas(QWidget):
                 me = {"id": -1, "name": p.get("name", "나"),
                       "position": p.get("position", "MF"), "_slot_idx": my_slot_idx,
                       "ovr": p.get("ovr", 40), "is_me": True,
+                      "injured": bool(p.get("injured")),
+                      "age": p.get("age", 0),
                       **{s: p.get(s, 0) for s in ALL_STATS}}
 
-                if rival is None or me["ovr"] > rival["ovr"]:
-                    # 내가 그 자리 주전보다 낫다 (또는 빈 자리) → 선발 출전
+                # [2026-08 신설, 신민용 리포트: "39/44경기 뛰었는데 화면엔
+                # 벤치로 나온다"] 예전엔 "그 순간 이 자리 최고 OVR 선수 1명과
+                # 비교"만으로 주전/벤치를 정했는데, 실제 경기 출전 여부는
+                # 이거랑 완전히 다른 확률 판정(_check_bench, 팀평균OVR격차+
+                # 감독관계 등 종합)을 따른다 — 그래서 실제로는 시즌 내내
+                # 거의 다 뛴 선수도 화면 여는 순간의 미세한 OVR 역전 하나로
+                # 벤치로 표시되는 불일치가 있었다. 이번 시즌 실제 출전율이
+                # 뚜렷하게 높으면(과반 이상, 최소 5경기 이상 표본) OVR
+                # 스냅샷 비교와 무관하게 주전으로 표시한다 — 화면이 "지금
+                # 이 순간의 가정"이 아니라 "실제로 뛰고 있는 선수"를 보여
+                # 주는 게 맞다는 원칙.
+                _played = p.get("season_matches", 0)
+                _total_sn = (_played + p.get("season_bench_matches_missed", 0)
+                             + p.get("season_injury_matches_missed", 0)
+                             + p.get("season_suspension_matches_missed", 0))
+                _actual_starter = _total_sn >= 5 and (_played / _total_sn) >= 0.5
+
+                if rival is None or me["ovr"] > rival["ovr"] or _actual_starter:
+                    # 내가 그 자리 주전보다 낫다 (또는 빈 자리, 또는 실제로
+                    # 이번 시즌 주전급으로 뛰어왔다) → 선발 출전
                     rest = [pl for pl in slot_filled if pl is not None and pl is not rival]
                     self.players = [me] + rest
                 else:
                     # 그 자리 주전이 나보다 낫다 → 벤치 (베스트11 그대로 표시, 나는 제외)
                     self.players = [pl for pl in slot_filled if pl is not None]
+                # [2026-08 신설] 명단 패널용 — 전체 스쿼드(all_ai) + 나(me)를
+                # 합친 게 "우리 팀 전체 명단"이다. 주전 여부는 self.players
+                # (방금 확정된 최종 출전 11명)의 id 집합으로 판정한다 —
+                # 내가 벤치든 선발이든 이 집합엔 항상 정확히 반영돼 있다.
+                self._roster = all_ai + [me]
+                self._starter_ids = {pl.get("id") for pl in self.players}
             else:
                 self.players = _mask_ai_names([dict(r) for r in conn.execute(
                     "SELECT * FROM ai_players WHERE team_id=? ORDER BY ovr DESC LIMIT 11",
                     (team_id,)).fetchall()])
+                self._roster = list(self.players)
+                self._starter_ids = {pl.get("id") for pl in self.players}
             conn.close()
+
+        if intl_nat:
+            self._roster = list(self.players)
+            self._starter_ids = {pl.get("id") for pl in self.players}
 
         # 캐시 저장
         if _cache is not None:
-            _cache[_cache_key] = (self.formation, list(self.players))
+            _cache[_cache_key] = (self.formation, list(self.players),
+                                   list(self._roster), set(self._starter_ids))
             # 캐시 크기 제한 (오래된 항목 제거)
             if len(_cache) > 30:
                 oldest = next(iter(_cache))
@@ -490,6 +551,13 @@ class _FormationCanvas(QWidget):
         # 그 함수 주석 참고(포지션 몰린 스쿼드에서의 연쇄 오배치 수정).
         slot_filled = _greedy_fill_slots(raw_players, slots_only)
         self.players = [pl for pl in slot_filled if pl is not None]
+        # [2026-08 신설] 명단 패널용 — 상대팀도 전체 스쿼드를 따로 가져온다
+        # (team_id가 있는 실제 클럽팀만 가능. 국제대회 가상 국가대표팀처럼
+        # team_id가 없으면 애초에 벤치 데이터 자체가 없으므로 지금 보이는
+        # 11명이 곧 전체 명단이다).
+        full_squad = _full_squad_for_team(team.get("team_id"))
+        self._roster = full_squad if full_squad else list(self.players)
+        self._starter_ids = {pl.get("id") for pl in self.players}
         self._player_at = {}; self._positions_xy = []
         self.update()
 
@@ -502,7 +570,8 @@ class _FormationCanvas(QWidget):
         painter.setPen(QPen(QColor("#2a5a2a"), 1))
         painter.drawRect(12, 8, w-24, h-16)
         painter.drawLine(12, h//2, w-12, h//2)
-        painter.drawEllipse(w//2-24, h//2-24, 48, 48)
+        _cc_d = max(20, min(48, min(w, h)//7))
+        painter.drawEllipse(w//2-_cc_d//2, h//2-_cc_d//2, _cc_d, _cc_d)
 
         slots = FORMATION_SLOTS.get(self.formation, FORMATION_SLOTS["4-4-2"])
         positions_xy = self._calc_positions(slots, w, h)
@@ -565,26 +634,39 @@ class _FormationCanvas(QWidget):
         for i, (px, py, pos, _slot_idx) in enumerate(positions_xy):
             pl = player_at.get(i)
             is_me = pl.get("is_me", False) if pl else False
+            # [2026-08 신설, 신민용 요청: "부상당해서 못 나갈 때는 금색
+            # 말고 빨간색으로"] 부상 여부는 load_my_team()에서 me dict에
+            # "injured"로 태깅해둔다.
+            is_injured_me = is_me and bool(pl and pl.get("injured"))
             is_hov = (i == self._hovered_slot)
-            color = "#ffcc00" if is_me else _pos_color(pos)
+            d = self._circle_d
+            r = d // 2
+            if is_injured_me:
+                color = "#cc2222"
+            elif is_me:
+                color = "#ffcc00"
+            else:
+                color = _pos_color(pos)
             painter.setBrush(QBrush(QColor(color)))
             pen_color = "#00ff88" if is_hov else ("#000" if is_me else "#000")
             pen_w = 3 if is_hov else (2 if is_me else 1)
             painter.setPen(QPen(QColor(pen_color), pen_w))
-            painter.drawEllipse(px-24, py-24, 48, 48)
+            painter.drawEllipse(px-r, py-r, d, d)
             if is_hov:
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.setPen(QPen(QColor("#00ff8860"), 4))
-                painter.drawEllipse(px-28, py-28, 56, 56)
+                painter.drawEllipse(px-r-4, py-r-4, d+8, d+8)
             painter.setPen(QPen(QColor("#000" if is_me else "#fff")))
-            f = QFont(); f.setPointSize(10); f.setBold(True); painter.setFont(f)
+            f = QFont(); f.setPointSize(max(6, min(10, d // 5))); f.setBold(True); painter.setFont(f)
             # 내 선수는 배치 포지션(field_pos) 표시, AI는 슬롯 포지션
             _disp_pos = pl.get("field_pos", pos) if (pl and is_me) else pos
-            painter.drawText(px-24, py-24, 48, 48, Qt.AlignmentFlag.AlignCenter, _disp_pos[:2])
+            painter.drawText(px-r, py-r, d, d, Qt.AlignmentFlag.AlignCenter, _disp_pos[:2])
             if pl:
-                f2 = QFont(); f2.setPointSize(9); f2.setBold(is_me); painter.setFont(f2)
-                painter.setPen(QPen(QColor("#ffff00" if is_me else "#ddd")))
-                painter.drawText(px-30, py+26, 60, 16,
+                f2 = QFont(); f2.setPointSize(max(6, min(9, d // 6))); f2.setBold(is_me); painter.setFont(f2)
+                _name_color = "#ff6666" if is_injured_me else ("#ffff00" if is_me else "#ddd")
+                painter.setPen(QPen(QColor(_name_color)))
+                _name_w = max(40, d + 12)
+                painter.drawText(px-_name_w//2, py+r+2, _name_w, 16,
                                  Qt.AlignmentFlag.AlignCenter, pl["name"][:4])
         painter.end()
 
@@ -600,7 +682,15 @@ class _FormationCanvas(QWidget):
         같은 것으로 착각해 배열 인덱스로 그냥 zip하면(과거 paintEvent가
         하던 방식) 완전히 다른 슬롯끼리 짝지어진다 — slot_idx를 함께
         내려줘서 어느 코드도 순서에 의존하지 않고 원본 인덱스로 직접
-        찾아가게 한다."""
+        찾아가게 한다.
+
+        [2026-08 신설] 명단 패널이 추가되면서 캔버스 자체가 절반 크기로
+        줄어들 수 있는데, 원 지름이 예전처럼 48px 고정이면 세로(행 간격)
+        든 가로(한 행 안에 5명 붙는 백파이브 등)든 좁아진 자리에 원이
+        겹칠 수 있다 — 세로/가로 두 제약 중 더 빡빡한 쪽에 맞춰 지름을
+        동적으로 정하고(self._circle_d), paintEvent/마우스 히트박스가
+        전부 이 값을 그대로 따라간다. 원래 크기(축소 전)에서는 여전히
+        48px 그대로 나오도록 상한을 48로 고정 — 기존 화면은 완전히 동일."""
         rows = {}; row_order = []
         for idx, pos in enumerate(slots):
             k = _row_key(pos)
@@ -608,6 +698,10 @@ class _FormationCanvas(QWidget):
             rows[k].append((idx, pos))
         sorted_rows = sorted(row_order, key=lambda x: _row_priority(x))
         total = len(sorted_rows); result = []
+        max_row_cnt = max((len(v) for v in rows.values()), default=1)
+        row_h = (h - 32) / max(1, total)
+        col_w = w / (max_row_cnt + 1)
+        self._circle_d = int(max(16, min(48, row_h * 0.82, col_w * 0.78)))
         for ri, rk in enumerate(sorted_rows):
             # 같은 행 안에서 _pos_x_order 기준 좌→우 정렬 (원본 인덱스는 유지)
             poss = sorted(rows[rk], key=lambda t: _pos_x_order(t[1]))
@@ -619,8 +713,9 @@ class _FormationCanvas(QWidget):
 
     def mouseMoveEvent(self, event):
         mx, my = event.pos().x(), event.pos().y()
+        hit_r2 = max(144, int(self._circle_d * 0.42) ** 2)
         new = next((i for i, (px, py, _, _s) in enumerate(self._positions_xy)
-                    if (mx-px)**2+(my-py)**2 < 400), -1)
+                    if (mx-px)**2+(my-py)**2 < hit_r2), -1)
         if new != self._hovered_slot:
             self._hovered_slot = new
             self.setCursor(Qt.CursorShape.PointingHandCursor if new >= 0
@@ -634,11 +729,146 @@ class _FormationCanvas(QWidget):
         if is_hard_mode():
             return
         mx, my = event.pos().x(), event.pos().y()
+        hit_r2 = max(144, int(self._circle_d * 0.42) ** 2)
         for i, (px, py, _, _s) in enumerate(self._positions_xy):
-            if (mx-px)**2+(my-py)**2 < 400:
+            if (mx-px)**2+(my-py)**2 < hit_r2:
                 pl = self._player_at.get(i)
                 if pl: PlayerStatPopup(pl, self).exec()
                 break
+
+
+# ─────────────────────────────────────────────
+# 전체 명단 패널 (2026-08 신설)
+# ─────────────────────────────────────────────
+
+class _RosterPanel(QScrollArea):
+    """[2026-08 신설, 신민용 요청: "본선 11명 말고 각 팀 전체 선수가
+    누구누구인지 떠야하잖아 — 주전은 상자 녹색, 이름 클릭하면 스탯"]
+    _FormationCanvas 오른쪽에 붙는 스크롤 가능한 전체 스쿼드 명단(2026-08
+    수정: 아래가 아니라 오른쪽 배치로 변경 — 세로 공간이 좁아 열을 2개로
+    줄임). 이름 자체는(포메이션 화면 전체가 이미 그렇듯) 나 자신만
+    실명이고 나머지는 전부 "AI"로 표시되므로, 포지션+OVR을 이름 옆에
+    같이 붙여서 서로 구분되게 한다."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self.setMinimumWidth(150)
+        self.setStyleSheet(
+            "QScrollArea{background:#161616;border:1px solid #2a2a2a;border-radius:4px;}")
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._body = QWidget()
+        self._body.setStyleSheet("background:transparent;")
+        self._grid = QGridLayout(self._body)
+        self._grid.setContentsMargins(4, 4, 4, 4)
+        self._grid.setSpacing(3)
+        self.setWidget(self._body)
+        self._cols = 1
+
+    def _make_group_header(self, text: str) -> QLabel:
+        """[2026-08 신설, 신민용 요청: "이름 표시하는 곳을 파란색으로"]
+        "주전"/"후보" 구분 라벨 — 개별 선수 행이 아니라 이 헤더 텍스트
+        자체가 파란색이다. 개별 선수 행 색상과는 완전히 별개."""
+        lbl = QLabel(text)
+        lbl.setStyleSheet(
+            "color:#5aa9ff;font-size:10px;font-weight:bold;"
+            "padding:4px 2px 2px 2px;border-bottom:1px solid #2a2a2a;")
+        return lbl
+
+    def _make_player_button(self, pl: dict, is_starter: bool) -> QPushButton:
+        is_me = bool(pl.get("is_me"))
+        is_injured_me = is_me and bool(pl.get("injured"))
+        label = f"{pl.get('name','')[:6]} ({pl.get('position','')} {pl.get('ovr',0)})"
+        btn = QPushButton(label)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        if is_injured_me:
+            # [2026-08 신설, 신민용 요청: "부상당해서 못 나갈 때는
+            # 금색 말고 빨간색으로"] 포메이션 캔버스와 동일한 규칙.
+            style = ("background:#4a1414;color:#ffb0b0;border:1px solid #cc2222;"
+                     "border-radius:4px;padding:3px 6px;font-size:10px;font-weight:bold;")
+        elif is_me:
+            # 나는 주전/벤치와 무관하게 항상 노란색으로 — 포메이션
+            # 캔버스에서 "나"를 표시하는 색과 통일.
+            style = ("background:#4a3a00;color:#ffe066;border:1px solid #ffcc00;"
+                     "border-radius:4px;padding:3px 6px;font-size:10px;font-weight:bold;")
+        elif is_starter:
+            # 주전 — 상자를 녹색으로.
+            style = ("background:#1e4a1e;color:#eaffea;border:1px solid #3fae3f;"
+                     "border-radius:4px;padding:3px 6px;font-size:10px;font-weight:bold;")
+        else:
+            # [2026-08 수정, 신민용 요청: "후보 선수는 색 없이"] 그룹 구분은
+            # 위 "후보" 헤더가 이미 담당하므로, 개별 벤치 선수 행은 주전
+            # (녹색)과 구분되는 무채색 스타일로 — 파란 글자로 강조하던
+            # 기존 스타일을 폐기.
+            style = ("background:#1c1c1c;color:#aaa;border:1px solid #333;"
+                     "border-radius:4px;padding:3px 6px;font-size:10px;")
+        btn.setStyleSheet(style + "text-align:left;")
+        if is_hard_mode():
+            # [2026-08] 어려움 난이도는 포메이션 캔버스와 동일하게
+            # 클릭해도 스탯이 안 뜬다 — 커서도 일반 화살표로 되돌린다.
+            btn.setCursor(Qt.CursorShape.ArrowCursor)
+        else:
+            btn.clicked.connect(lambda _, p=pl: PlayerStatPopup(p, self).exec())
+        return btn
+
+    def set_roster(self, players: list, starter_ids: set):
+        # 기존 버튼/라벨 정리
+        while self._grid.count():
+            item = self._grid.takeAt(0)
+            w = item.widget()
+            if w:
+                w.setParent(None); w.deleteLater()
+        if not players:
+            empty = QLabel("명단 없음")
+            empty.setStyleSheet("color:#666;font-size:10px;")
+            self._grid.addWidget(empty, 0, 0)
+            return
+        # [2026-08 수정, 신민용 요청: "주전들 위에, 그런 식으로" → 이후
+        # "주전"/"후보" 구분 헤더로 재요청] 정렬 우선순위는 그대로 "주전
+        # 여부 먼저, 그 안에서 포지션·OVR"이지만, 이제 그 경계에 실제
+        # 헤더 라벨 행을 끼워 넣는다(스케치 참고: 주전 헤더 → 주전 목록
+        # → 후보 헤더 → 후보 목록).
+        _cat_order = {"GK": 0, "DEF": 1, "MID": 2, "ATK": 3}
+        def _sort_key(pl):
+            return (_cat_order.get(_pos_category(pl.get("position", "")), 4),
+                    -(pl.get("ovr", 0) or 0))
+        starters = sorted((pl for pl in players if pl.get("id") in starter_ids), key=_sort_key)
+        bench = sorted((pl for pl in players if pl.get("id") not in starter_ids), key=_sort_key)
+
+        row = 0
+        if starters:
+            self._grid.addWidget(self._make_group_header("주전"), row, 0); row += 1
+            for pl in starters:
+                self._grid.addWidget(self._make_player_button(pl, is_starter=True), row, 0)
+                row += 1
+        if bench:
+            self._grid.addWidget(self._make_group_header("후보"), row, 0); row += 1
+            for pl in bench:
+                self._grid.addWidget(self._make_player_button(pl, is_starter=False), row, 0)
+                row += 1
+
+
+class _TeamPanel(QWidget):
+    """[2026-08 신설] 포메이션 캔버스 + 전체 명단 패널을 가로로 묶는
+    컨테이너(좌: 캔버스, 우: 명단). FormationWidget이 좌/우 각각 하나씩
+    가진다.
+    [2026-08 수정, 신민용 요청: "위아래가 아니라 좌측 포메이션/우측
+    선수들로"] 세로(QVBoxLayout, 캔버스 위·명단 아래)에서 가로
+    (QHBoxLayout, 캔버스 좌·명단 우)로 변경. 캔버스 쪽은 이제 세로로는
+    안 눌리고 가로로만 좁아지므로, _FormationCanvas._calc_positions의
+    원 지름 계산(세로/가로 두 제약 중 더 빡빡한 쪽)이 자동으로 가로
+    제약(col_w) 쪽을 따라간다 — 별도 수정 없이 그대로 작동."""
+    def __init__(self, is_opponent=False, parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        self.canvas = _FormationCanvas(is_opponent=is_opponent)
+        self.roster = _RosterPanel(self)
+        lay.addWidget(self.canvas, 3)
+        lay.addWidget(self.roster, 2)
+
+    def refresh_roster(self):
+        self.roster.set_roster(self.canvas._roster, self.canvas._starter_ids)
 
 
 # ─────────────────────────────────────────────
@@ -673,7 +903,7 @@ class FormationWidget(QWidget):
         self._opp_teams = []
         # [최적화] load_my_team 캐시: (team_id, intl_nat) → (formation, players)
         # refresh()마다 동일 팀을 재쿼리하지 않도록 캐시. team_id/intl_nat 변경 시 자동 갱신.
-        self._my_team_cache: dict = {}   # {(team_id, intl_nat): (formation, players)}
+        self._my_team_cache: dict = {}   # {(team_id, intl_nat, sig): (formation, players, roster, starter_ids)}
         self._my_team_cache_key = None   # 마지막으로 로드한 캐시 키
 
         self.setStyleSheet("background:transparent;")
@@ -735,21 +965,28 @@ class FormationWidget(QWidget):
         self.combo.currentIndexChanged.connect(self._on_opp_select)
         info_row.addWidget(self.combo, 5)
 
-        # ── 3행: 캔버스 좌우
+        # ── 3행: 캔버스(절반 크기) + 전체 명단 패널, 좌우
+        # [2026-08 신설, 신민용 요청: "본선 11명 말고 전체 선수 명단도
+        # 봐야 하고, 그러려면 포메이션 캔버스 크기를 절반으로 줄여야
+        # 한다"] 캔버스를 직접 넣는 대신 _TeamPanel(캔버스+명단 세로 묶음)
+        # 을 넣는다 — 기존에 self._my_canvas/self._opp_canvas를 참조하던
+        # 코드는 그대로 두기 위해 별칭(alias)으로 canvas를 그대로 연결.
         split = QHBoxLayout()
         split.setSpacing(4)
         lay.addLayout(split)
 
-        self._my_canvas = _FormationCanvas(is_opponent=False)
-        split.addWidget(self._my_canvas, 5)
+        self._my_panel  = _TeamPanel(is_opponent=False)
+        self._my_canvas = self._my_panel.canvas
+        split.addWidget(self._my_panel, 5)
 
         div = QFrame()
         div.setFrameShape(QFrame.Shape.VLine)
         div.setStyleSheet("QFrame{color:#333;}")
         split.addWidget(div)
 
-        self._opp_canvas = _FormationCanvas(is_opponent=True)
-        split.addWidget(self._opp_canvas, 5)
+        self._opp_panel  = _TeamPanel(is_opponent=True)
+        self._opp_canvas = self._opp_panel.canvas
+        split.addWidget(self._opp_panel, 5)
 
         # 힌트 바
         # [2026-08 신설, 난이도 시스템] 어려움 난이도에선 클릭해도 스탯이
@@ -815,6 +1052,7 @@ class FormationWidget(QWidget):
 
         # ── 내 팀 캔버스 (국제전이면 국가대표 모드)
         self._my_canvas.load_my_team(team_id, intl_nat=my_nat)
+        self._my_panel.refresh_roster()
 
         # ── 좌측 레이블: 국제전 → 국가명+OVR / 리그 → 팀명+OVR
         # [2026-08 신설, 난이도 시스템] 어려움 난이도는 "평균 OVR 76" 같은
@@ -974,6 +1212,7 @@ class FormationWidget(QWidget):
             return
         t = self._opp_teams[idx]
         self._opp_canvas.load_opp_team(t)
+        self._opp_panel.refresh_roster()
 
 
 # ─────────────────────────────────────────────
@@ -1131,6 +1370,15 @@ class PlayerStatPopup(QDialog):
         hdr = QLabel(f"{pl.get('name','')}  [{pl.get('position','')}]  OVR {pl.get('ovr',0)}")
         hdr.setStyleSheet("color:#00cc44;font-size:13px;font-weight:bold;")
         lay.addWidget(hdr)
+
+        # [2026-08 신설, 신민용 요청: "선수 눌렀을 때 나이도 뜨게"] 국제대회
+        # 가상 AI(intl_nat 분기의 랜덤 생성 상대)처럼 age 정보 자체가 없는
+        # 경우도 있어 값이 있을 때만 표시한다.
+        age = pl.get("age")
+        if age:
+            age_lbl = QLabel(f"🎂 {age}세")
+            age_lbl.setStyleSheet("color:#888;font-size:11px;")
+            lay.addWidget(age_lbl)
 
         # [2026-07 신설, 신민용 요청] 국적 표시
         nat = pl.get("nationality", "")
