@@ -10,7 +10,7 @@ from PyQt6.QtGui import QPainter, QBrush, QColor, QPen
 
 from game_engine import (get_player, get_team_rank, get_team_rank_with_zone_color, fmt_money,
                          is_hard_mode, get_season_all_competition_appearances,
-                         _get_season_total_matches)
+                         _get_season_total_matches, team_matches_played_in_window, get_state)
 from constants import (ALL_STATS, STAT_KO, STAT_EN, _LEGACY_TALENT_ALIAS,
                        TALENT_TIER_KO, TALENT_TIER_EN, MANAGER_TYPES)
 
@@ -425,6 +425,7 @@ class PlayerPanel(QWidget):
         team_name   = "없음"
         league_name = "—"
         tier        = 0
+        _raw_league_name = ""  # [2026-08 신설] team_matches_played_in_window에 넘길 원본 리그명
         if p.get("current_team_id"):
             from database import get_conn
             conn = get_conn()
@@ -436,6 +437,7 @@ class PlayerPanel(QWidget):
             if row:
                 team_name   = row["name"]
                 league_name = f"{row['lname']}({row['tier']}부)"
+                _raw_league_name = row["lname"]
                 tier        = row["tier"]
 
         fame_lbl = _fame(p.get("fame",0), lang)
@@ -509,6 +511,16 @@ class PlayerPanel(QWidget):
                 _rel_txt, _mt_txt = "-", "-"
             self.info_lay.addWidget(_info_row_2val(
                 "감독관계", _rel_txt, _mt_txt))
+        # [2026-08 신설, 신민용 요청: "감독관계 아래에 구단 목표도
+        # 표시해달라 — 구단 목표: 중위권 안정 이런 식으로"] club_ambition은
+        # 이미 "중위권 안정"/"우승 도전" 같은 한글 문구 그대로 저장돼
+        # 있어서(_infer_team_ambition/입단 시 offer의 ambition을 그대로
+        # 옮겨 씀) 별도 라벨 매핑 없이 값 그대로 쓴다. 소속팀이 없으면
+        # 감독관계와 동일하게 "-"로 표시(어려움 난이도에서는 감독관계와
+        # 같은 취급으로 같이 숨김).
+        if not _hard:
+            _amb_txt = p.get("club_ambition", "") if _has_team else "-"
+            self.info_lay.addWidget(_info_row("구단 목표", _amb_txt or "-"))
 
         # [2026-08 신설] 시즌 탭 상단 요약(소속팀/리그(몇부)/연봉/감독관계).
         _clear_layout(self.season_top_lay)
@@ -525,6 +537,15 @@ class PlayerPanel(QWidget):
                 _rel2_txt, _mt2_txt = "-", "-"
             self.season_top_lay.addWidget(_info_row_2val(
                 "감독관계", _rel2_txt, _mt2_txt))
+        # [2026-08 신설, 신민용 요청] 기본 탭과 동일하게 시즌 탭 요약에도
+        # 감독관계 바로 아래에 구단 목표를 추가 — season_top_frame이
+        # lbl_rank(순위, "공동 10위/14팀") 바로 위에 배치돼 있으므로
+        # (season_v.addWidget 순서), 여기 마지막 줄로 추가하면 자연스럽게
+        # "감독관계 아래 / 순위 위" 자리에 들어간다.
+        if not _hard:
+            _amb2_txt = p.get("club_ambition", "") if _has_team else "-"
+            self.season_top_lay.addWidget(_info_row("구단 목표", _amb2_txt or "-"))
+
 
         # 순위
         # [2026-08 수정, 신민용 요청: "확정 강등권이면 빨간색, 확정
@@ -582,11 +603,25 @@ class PlayerPanel(QWidget):
         except Exception:
             _cs = 0
 
-        # [2026-08 신설, 신민용 요청: "출전이 리그전만 표시된다 — N/전체
-        # 형식으로, 커리어처럼 총경기도 같이, 출전율도"] 리그 출전(sm)은
-        # 이번 시즌 리그 전체 일정(league_total) 대비 N/전체(%) 형식으로,
-        # 그 옆에 전 대회(컵·챔스·국대 등 포함) 통합 출전 수를 같이 보여준다.
-        _league_total = _get_season_total_matches(p.get("current_team_id"))
+        # [2026-08 수정, 신민용 리포트: "5주차인데 리그 경기가 1경기밖에
+        # 없는데 왜 출전이 0/22로 뜨냐, 0/1이어야 하고 리그가 진행되면서
+        # 커리어의 팀 이력 출전처럼 늘어나야 한다"] 예전 요청("N/전체
+        # 형식으로")을 분모=시즌 전체 예정 경기수(_get_season_total_matches,
+        # 예: 22)로 구현했었는데, 그러면 시즌 초반엔 실제로 열린 경기보다
+        # 분모가 훨씬 커서 "0/22"처럼 아직 일어나지도 않은 경기까지 이미
+        # 다 센 것처럼 보였다 — 커리어 탭의 "팀 이력" 출전(team_matches_
+        # played_in_window)은 애초에 "그 기간 동안 실제로 열린 경기 수"만
+        # 세는 방식이라 이 문제가 없다(진행 중인 시즌은 자동으로 현재
+        # 주차까지만). 같은 함수를 그대로 재사용해 "이번 시즌 시작(1주차)
+        # ~ 지금"까지 실제로 열린 리그 경기 수로 분모를 바꾼다 — 시즌이
+        # 끝나면 자연히 전체 경기수(22 등)와 같아진다.
+        _cur_year = get_state().get("current_year") or 0
+        _league_total = None
+        if p.get("current_team_id") and _raw_league_name and _cur_year:
+            _league_total = team_matches_played_in_window(
+                p["current_team_id"], _raw_league_name, _cur_year, 1, 0, 0)
+        if not _league_total:
+            _league_total = _get_season_total_matches(p.get("current_team_id"))
         # [2026-08 안전장치, 신민용 리포트: "출전이 137%로 뜬다"] 근본 원인은
         # game_engine._end_of_season의 season_matches 리셋이 함수 뒷부분
         # 로직 실패 시 통째로 스킵되던 버그였고 그건 별도로 고쳤다(리셋을

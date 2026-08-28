@@ -383,7 +383,8 @@ def _fee_form_mult(ovr, effective_ovr) -> float:
 FEE_TO_SALARY_MULT = {1: 5, 2: 4, 3: 3, 4: 2}
 
 
-def _fee_affordability_cap(country, tier, team_name, team_id, year) -> float:
+def _fee_affordability_cap(country, tier, team_name, team_id, year,
+                            strength_mult=None) -> float:
     """[2026-08 신설, 15-3-B] "이 구단이 일반적으로 감당할 수 있는 이적료의
     상한"(억원) — "이 가격에 반드시 살 수 있다"가 아니라 지불여력의 대략적
     상한선. 이미 검증된 연봉 캡 인프라(_calc_salary의 COUNTRY_SALARY_CAP/
@@ -398,7 +399,14 @@ def _fee_affordability_cap(country, tier, team_name, team_id, year) -> float:
     transfer_fee의 raw_fee 쪽에서 이미 prestige_mult(1.664 등)를 곱하고
     있어서 여기서 또 곱하면 이중 반영된다(GPT 지적 사항). 국가×tier
     경제력만 반영하고, club_strength만 별도로 좁게(0.9~1.15) 얹는다.
-    """
+
+    strength_mult: [2026-08 성능수정, 프로파일링으로 확인] 호출부
+    (estimate_transfer_fee)가 이미 자기 raw_fee 계산에 쓰려고
+    _club_strength_fee_mult(team_id)를 한 번 구해두는데, 이 함수가
+    그 값을 안 받고 또 스스로 구하면 같은 이적료 추정 1건마다
+    teams 테이블 SELECT가 2번씩 나갔다(둘 다 완전히 같은 team_id,
+    같은 값). 미리 계산해둔 값을 넘겨받으면 그대로 재사용하고,
+    안 넘기면(하위호환) 예전처럼 직접 구한다 — 결과값은 항상 동일."""
     from constants import get_league_grade
     wealth = get_league_grade(country, "F") if country else "F"
     top_salary_thousand = _calc_salary(wealth, tier, 99, country=country,
@@ -407,7 +415,9 @@ def _fee_affordability_cap(country, tier, team_name, team_id, year) -> float:
     mult = FEE_TO_SALARY_MULT.get(tier, FEE_TO_SALARY_MULT.get(4, 8))
     cap = top_salary_eok * mult
     # club_strength만 좁게 반영(prestige 중복 방지, 위 docstring 참고)
-    cap *= _club_strength_fee_mult(team_id) if team_id else 1.0
+    if strength_mult is None:
+        strength_mult = _club_strength_fee_mult(team_id) if team_id else 1.0
+    cap *= strength_mult
     return cap
 
 
@@ -511,7 +521,11 @@ def estimate_transfer_fee(grade, tier, ovr, country=None, team_name=None,
     # "구단 사정으로 먼저 걸러지고, 그래도 남은 극단치만 절대상한이 받는다"
     # 는 의미상 순서를 이렇게 둔다.
     if country and tier:
-        _afford_cap = _fee_affordability_cap(country, tier, team_name, team_id, year)
+        # [2026-08 성능수정] strength_mult는 위에서 이미 구해뒀다 — 그대로
+        # 넘겨서 _fee_affordability_cap 내부의 중복 DB 조회를 없앤다
+        # (반환값은 기존과 동일).
+        _afford_cap = _fee_affordability_cap(country, tier, team_name, team_id, year,
+                                              strength_mult=strength_mult)
         val_eok = _apply_fee_affordability(val_eok, _afford_cap)
     # [2026-08 신설, 신민용+GPT 검토 확정] 소프트캡을 통과해도 극단적으로
     # 조건이 몰리면(명문+고club_strength+어린나이+큰잠재력+긴계약이 전부
@@ -559,7 +573,7 @@ def estimate_transfer_fee(grade, tier, ovr, country=None, team_name=None,
             "potential_mult": p_mult, "rank_mult": rank_mult, "strength_mult": strength_mult,
             "combined_mult": combined_mult,
             "effective_ovr": effective_ovr, "form_mult": _fee_form_mult(ovr, effective_ovr),
-            "affordability_cap": _fee_affordability_cap(country, tier, team_name, team_id, year) if country and tier else None,
+            "affordability_cap": _fee_affordability_cap(country, tier, team_name, team_id, year, strength_mult=strength_mult) if country and tier else None,
             "capped_mult": capped_mult, "economy_index": eidx,
         }}
     return final

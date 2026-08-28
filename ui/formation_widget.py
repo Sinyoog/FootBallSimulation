@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QFrame, QScrollArea, QGridLayout, QLineEdit
 )
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor, QPainter, QBrush, QPen, QFont
+from PyQt6.QtGui import QColor, QPainter, QBrush, QPen, QFont, QFontMetrics
 
 from database import get_conn
 from constants import FORMATION_SLOTS, STAT_KO, ALL_STATS, POSITION_COMPAT
@@ -75,11 +75,26 @@ def _mask_ai_names(rows):
     뜨는데 포메이션엔 AI 73QU로 따로 뜬다"] 이 코드 변환 로직을
     constants.ai_player_code()로 옮겨 ai_lifecycle.py의 이적 로그 표시와
     공유한다 — 이제 어느 화면에서든 같은 선수는 항상 같은 코드로 보인다.
+
+    [2026-08 확장, 신민용 요청: "AICD8C 이 식별코드로 뜨는 선수의 이름을
+    내가 직접 입력할 수 있게 — 포메이션에도 내가 지은 이름으로 뜨지만
+    코드로도 계속 검색은 가능해야 한다"] 사용자가 이름을 지어준 선수는
+    (world_browser.py "선수 검색"의 이름 헤더 클릭 → 이름 변경) 코드
+    대신 그 이름을 쓴다. rows 전체 id를 한 번에 모아 배치 조회하므로
+    (get_ai_player_custom_names) 포메이션에 11~23명이 한 번에 뜨는
+    상황에서도 선수마다 따로 쿼리하지 않는다 — 이름이 없는 선수만
+    기존처럼 ai_player_code로 폴백.
     """
     from constants import ai_player_code
+    from database import get_ai_player_custom_names
+    ids = [r.get("id") for r in rows if r.get("id") is not None]
+    custom_names = get_ai_player_custom_names(ids)
     for r in rows:
         pid = r.get("id")
-        r["name"] = ai_player_code(pid) if pid is not None else "AI"
+        if pid is None:
+            r["name"] = "AI"
+        else:
+            r["name"] = custom_names.get(pid) or ai_player_code(pid)
     return rows
 
 def _avg_ovr(players):
@@ -139,8 +154,55 @@ def _make_intl_virtual_players(avg_ovr: float) -> list:
 # 나라로도 100% 항상 채워질 수 없는 슬롯이었다 — 나라가 약해서가
 # 아니라 애초에 존재하지 않는 포지션을 요청한 게 원인. 실제 생성되는
 # 포지션인 "CM"으로 교체한다.
+# [2026-08 확장, 신민용 요청: "26명 엔트리 기준 GK3/DF8~9/MF8~9/FW5~6"]
+# 예전 23명(GK3/DF8/MF9/FW3)은 GK·DF·MF는 이미 요청 범위 안이었지만
+# FW가 크게 부족했다(3명) — 후보 쪽 FW를 2명→5명으로 늘려서 최종
+# 스쿼드가 GK3/DF8/MF9/FW6=26명이 되게 한다.
 _INTL_BENCH_POSITIONS = ["GK", "GK", "CB", "CB", "LB", "RB",
-                         "CDM", "CM", "CAM", "CM", "ST", "LW"]
+                         "CDM", "CM", "CAM", "CM", "ST", "ST", "ST", "ST", "ST"]
+# [2026-08 신설, 신민용 요청: "예선 때 뽑은 26명 그대로 본선까지"] 대회
+# 전체(주전+후보 26명)를 한 번에 뽑을 때 쓰는 포지션 리스트 — 아래
+# get_or_create_intl_squad 계열 함수와 기존 _make_intl_real_players(폴백
+# 경로용으로 계속 남겨둠)가 공유한다.
+_INTL_STARTER_POSITIONS = ["GK", "CB", "CB", "LB", "RB", "CM", "CM", "CAM", "LW", "RW", "ST"]
+_INTL_FULL_SQUAD_POSITIONS = _INTL_STARTER_POSITIONS + _INTL_BENCH_POSITIONS
+
+
+def _intl_players_from_rows(picked):
+    """[2026-08 신설] get_country_squad_players/get_or_create_intl_squad가
+    돌려준 raw row들을 포메이션 화면이 쓰는 선수 dict 형태로 통일 변환
+    (이름 커스텀 적용 포함) — _make_intl_real_players/_make_intl_persistent_
+    players가 공유."""
+    from database import get_ai_player_custom_names
+    from constants import ai_player_code
+    custom_names = get_ai_player_custom_names([r["id"] for r in picked])
+    result = []
+    for r in picked:
+        result.append({"id": r["id"], "name": custom_names.get(r["id"]) or ai_player_code(r["id"]),
+                        "position": r["position"],
+                        "ovr": r["ovr"], "is_me": False, "club": r["club"],
+                        "club_tier": r.get("club_tier"), "club_country": r.get("club_country"),
+                        "age": r.get("age"), "appearances": r.get("appearances", 0),
+                        **{s: r.get(s, r["ovr"]) for s in ALL_STATS}})
+    return result
+
+
+def _make_intl_persistent_players(tournament_id, country: str, avg_ovr: float):
+    """[2026-08 신설, 신민용 요청: "예선전 때 뽑은 애들 그대로 본선까지
+    가는거야 — 지금은 경기할 때마다 국대 26명이 매번 새로 뽑힌다, 이러면
+    안돼"] database.get_or_create_intl_squad로 이 대회(tournament_id)의
+    이 나라(country) 26인을 (있으면) 그대로 재사용, (없으면) 처음 한 번
+    뽑아서 고정한다 — _make_intl_real_players(매번 새로 뽑음)를 국제대회
+    문맥이 있는 모든 호출부에서 대체한다. tournament_id가 없는 예외적인
+    경우(문맥 없이 단독 호출 등)에는 기존 _make_intl_real_players로
+    자동 폴백."""
+    if not tournament_id:
+        return _make_intl_real_players(country, avg_ovr)
+    from database import get_or_create_intl_squad
+    picked = get_or_create_intl_squad(tournament_id, country, avg_ovr, _INTL_FULL_SQUAD_POSITIONS)
+    if len(picked) < 8:
+        return None
+    return _intl_players_from_rows(picked)
 
 
 def _make_intl_real_players(country: str, avg_ovr: float):
@@ -155,26 +217,23 @@ def _make_intl_real_players(country: str, avg_ovr: float):
     아래서 전 스탯을 ovr로 채워 넣었었다), 그 실제 값을 그대로 쓴다.
 
     [2026-08 신설, 신민용 리포트: "월드컵도 주전/후보가 있어야 하는데
-    11명만 뽑힌다"] 4-4-2 주전 11명 자리에 _INTL_BENCH_POSITIONS(12명)를
-    이어붙여 한 번에 23명(INTL_SQUAD_QUOTA 기준)을 뽑는다 — 앞 11개가
-    주전, 나머지 12개가 후보로 반환된다(호출부가 순서 그대로 나눠 씀).
+    11명만 뽑힌다"] 4-4-2 주전 11명 자리에 _INTL_BENCH_POSITIONS(15명)를
+    이어붙여 한 번에 26명(GK3/DF8/MF9/FW6)을 뽑는다 — 앞 11개가
+    주전, 나머지가 후보로 반환된다(호출부가 순서 그대로 나눠 씀).
     min_count는 여전히 8 그대로(주전 자리 최소 보장 기준) — 후보 자리는
     부족해도 그냥 그만큼만 덜 채워져서 반환되며, 이 경우 라도 주전
-    11명은 이미 확보돼 있으므로 화면이 깨지지 않는다."""
+    11명은 이미 확보돼 있으므로 화면이 깨지지 않는다.
+
+    [2026-08 신설] tournament_id가 있는 문맥에서는 이제 이 함수 대신
+    _make_intl_persistent_players(대회 내내 26인 고정)를 쓴다 — 이
+    함수는 그 폴백 경로 및 tournament_id 없는 예외적 단독 호출용으로만
+    남는다."""
     from database import get_country_squad_players
-    from constants import ai_player_code
-    positions = ["GK", "CB", "CB", "LB", "RB", "CM", "CM", "CAM", "LW", "RW", "ST"] + _INTL_BENCH_POSITIONS
-    picked = get_country_squad_players(country, positions=positions, min_count=8, target_ovr=round(avg_ovr))
+    picked = get_country_squad_players(country, positions=_INTL_FULL_SQUAD_POSITIONS,
+                                        min_count=8, target_ovr=round(avg_ovr))
     if len(picked) < 8:
         return None
-    result = []
-    for r in picked:
-        result.append({"id": r["id"], "name": ai_player_code(r["id"]), "position": r["position"],
-                        "ovr": r["ovr"], "is_me": False, "club": r["club"],
-                        "club_tier": r.get("club_tier"), "club_country": r.get("club_country"),
-                        "age": r.get("age"),
-                        **{s: r.get(s, r["ovr"]) for s in ALL_STATS}})
-    return result
+    return _intl_players_from_rows(picked)
 
 
 def _fetch_intl_opponents(tournament_id, my_nat, grp=None):
@@ -199,7 +258,7 @@ def _fetch_intl_opponents(tournament_id, my_nat, grp=None):
     result = []
     for r in rows:
         avg = r["ovr"] or 50
-        players = _make_intl_real_players(r["country"], avg) or _make_intl_virtual_players(avg)
+        players = _make_intl_persistent_players(tournament_id, r["country"], avg) or _make_intl_virtual_players(avg)
         # [2026-08 재수정, 신민용 명확화: "국대는 합을 맞춰본 선수들이
         # 아니니 팀 전체 OVR은 계산치(포메이션/케미 반영)로 가는 게
         # 맞고, 대신 실제 11명은 각자 소속팀에서 잘하는 진짜 선수여야
@@ -236,11 +295,21 @@ def _fetch_intl_ko_opp(tournament_id, my_nat, week):
         (tournament_id, opp)).fetchone()
     conn.close()
     avg = fr["ovr"] if fr and fr["ovr"] else 50
+    # [2026-08 버그수정, 신민용 리포트: "토너먼트(1대1)일 때 상대 국가
+    # 선수단이 전부 AI 1~11 가짜 선수로만 뜬다 — 실제 존재하는 AI가
+    # 아니고 스탯도 전부 OVR 그대로(예: OVR90이면 전 스탯 90), 후보도
+    # 없다"] 조별리그용 _fetch_intl_opponents는 진작에 "실제 국적
+    # 선수 우선, 얇은 나라만 가상 폴백"(_make_intl_real_players(...) or
+    # _make_intl_virtual_players(...))으로 고쳐져 있었는데, 토너먼트(1대1)
+    # 대진용인 이 함수만 그 수정이 안 들어가 있어서 항상 가상 선수
+    # (_make_intl_virtual_players, 정확히 11명만·후보 없음·전 스탯이
+    # OVR과 동일)로 직행하고 있었다 — 같은 패턴으로 통일한다.
+    players = _make_intl_persistent_players(tournament_id, opp, avg) or _make_intl_virtual_players(avg)
     return [{"team_id": None, "name": opp,
              "flag": fr["flag"] if fr else "",
              "avg_ovr": round(avg),
              "formation": "4-4-2",
-             "players": _make_intl_virtual_players(avg)}]
+             "players": players}]
 
 # [2026-08 신설, 신민용 리포트: "우측 상대팀 포메이션 확인 기능이 월드컵
 # 외 국제대회(클럽 월드컵)에서는 안 뜬다"] _resolve_opponents가 intl/cl만
@@ -439,18 +508,34 @@ class _FormationCanvas(QWidget):
         precise = round(sum(ovrs) / len(ovrs), 2)   # 내부 계산은 항상 소수 2자리
         return round(precise, ndigits) if ndigits else round(precise)
 
-    def load_my_team(self, team_id, intl_nat: str = ""):
+    def load_my_team(self, team_id, intl_nat: str = "", tournament_id=None):
         """리그팀 또는 국가대표팀 로드.
         intl_nat이 있으면 그 국가 intl_entries 기준으로 포메이션을 그린다.
-        [최적화] (team_id, intl_nat) 키로 캐시 — refresh()마다 동일 팀 재쿼리 방지.
-        캐시는 FormationWidget 레벨(_my_team_cache)에서 관리.
+        [최적화] (team_id, intl_nat, tournament_id) 키로 캐시 — refresh()마다
+        동일 팀 재쿼리 방지. 캐시는 FormationWidget 레벨(_my_team_cache)에서 관리.
+
+        [2026-08 신설, 신민용 요청: "상대팀(AI 국가)은 대회 내내 26인이
+        고정되는데, 내 대표팀 나머지 25명은 여전히 화면 열 때마다 새로
+        뽑힌다 — 이것도 고정해야 한다"] tournament_id가 있으면(국제대회
+        문맥) database.get_or_create_intl_squad로 이 대회에서 이미 고정된
+        (또는 처음이면 새로 고정하는) 26인 풀에서 내 슬롯을 뺀 나머지를
+        채운다 — 상대팀이 쓰는 것과 완전히 동일한 영구 명단 소스라, 나를
+        뺀 25명은 이 대회가 끝날 때까지 항상 같다. tournament_id가 없는
+        예외적인 경우(문맥 없이 단독 호출 등)에는 기존처럼 매번 새로
+        뽑는 get_country_squad_players로 폴백한다.
         """
         from game_engine import get_player
         p = get_player()
 
-        # 캐시 키: 내 선수 OVR/포지션도 반영 (레벨업 시 캐시 무효화)
-        _p_sig = (p.get("ovr", 0), p.get("position", "")) if p else (0, "")
-        _cache_key = (team_id, intl_nat, _p_sig)
+        # 캐시 키: 내 선수 OVR/포지션/부상 상태도 반영 (레벨업·부상/회복 시 캐시 무효화)
+        # [2026-08 버그수정, 신민용 리포트: "부상 한번 걸리고 나면 부상이
+        # 없어도 포메이션이 빨갛게 뜰 때가 있다"] 예전엔 (ovr, position)만
+        # 서명에 들어가 있었다 — 부상이 생기거나 나아도 보통 OVR·포지션은
+        # 그대로라서, 부상 상태(빨간색)로 한 번 캐싱된 화면이 회복 이후에도
+        # 캐시 키가 안 바뀌어 그대로 재사용됐다(회복해도 계속 빨간 화면).
+        # injured를 서명에 포함시켜 부상/회복 전환마다 캐시가 갈리게 한다.
+        _p_sig = (p.get("ovr", 0), p.get("position", ""), bool(p.get("injured"))) if p else (0, "", False)
+        _cache_key = (team_id, intl_nat, tournament_id, _p_sig)
         # 부모(FormationWidget)의 캐시에 접근
         _widget = self.parent()
         while _widget and not hasattr(_widget, "_my_team_cache"):
@@ -539,11 +624,21 @@ class _FormationCanvas(QWidget):
             # (명단 패널에만 표시, 필드엔 안 나감)로 나눠서 쓴다.
             remaining_slots = [(i, sp) for i, sp in enumerate(slots_only)
                                 if not (p and i == my_slot_idx)]
-            from database import get_country_squad_players
+            from database import get_country_squad_players, get_or_create_intl_squad, get_ai_player_custom_names
             from constants import ai_player_code
-            picked = get_country_squad_players(
-                intl_nat, positions=[sp for _, sp in remaining_slots] + _INTL_BENCH_POSITIONS,
-                min_count=8, target_ovr=avg_ovr) if intl_nat else []
+            if intl_nat and tournament_id:
+                # [2026-08 신설] 대회 내내 고정되는 26인 풀(상대팀과 동일
+                # 소스) — 나(me)는 이 풀에 아예 없으므로(ai_players가
+                # 아니라 별도 존재) 그대로 써도 "나를 뺀 25명 고정"이
+                # 자연히 성립한다. 아래 매칭 로직은 이 26명 중 내 슬롯
+                # 포지션을 요구하지 않으므로(remaining_slots가 이미 내
+                # 자리를 뺐음) 그 자리에 맞는 선수는 그냥 후보로 남는다.
+                picked = get_or_create_intl_squad(
+                    tournament_id, intl_nat, avg_ovr, _INTL_FULL_SQUAD_POSITIONS)
+            else:
+                picked = get_country_squad_players(
+                    intl_nat, positions=[sp for _, sp in remaining_slots] + _INTL_BENCH_POSITIONS,
+                    min_count=8, target_ovr=avg_ovr) if intl_nat else []
             bench_players = []
             if len(picked) >= 8:
                 # [2026-08 버그수정, 신민용 리포트: "국대 후보가 10명인데
@@ -564,6 +659,9 @@ class _FormationCanvas(QWidget):
                 # 주전/후보를 나눈다 — 못 채운 자리가 있어도 나머지가
                 # 밀리지 않는다.
                 pool = list(picked)
+                # [2026-08 신설, 신민용 요청: "여기도 내가 지은 이름으로
+                # 뜨게"] 배치 조회로 N+1 방지(_mask_ai_names와 동일 원칙).
+                custom_names = get_ai_player_custom_names([r["id"] for r in pool])
                 starter_picked = []
                 for i, sp in remaining_slots:
                     match_idx = next((k for k, r in enumerate(pool) if r["position"] == sp), None)
@@ -572,7 +670,7 @@ class _FormationCanvas(QWidget):
                 for (i, sp), r in zip(remaining_slots, starter_picked):
                     if r is None:
                         continue
-                    players.append({"id": r["id"], "name": ai_player_code(r["id"]),
+                    players.append({"id": r["id"], "name": custom_names.get(r["id"]) or ai_player_code(r["id"]),
                                      "position": sp, "_slot_idx": i,
                                      "ovr": r["ovr"], "is_me": False,
                                      "club": r["club"], "club_tier": r.get("club_tier"),
@@ -580,7 +678,7 @@ class _FormationCanvas(QWidget):
                                      "age": r.get("age"),
                                      **{s: r.get(s, r["ovr"]) for s in ALL_STATS}})
                 for r in bench_picked:
-                    bench_players.append({"id": r["id"], "name": ai_player_code(r["id"]),
+                    bench_players.append({"id": r["id"], "name": custom_names.get(r["id"]) or ai_player_code(r["id"]),
                                      "position": r["position"], "ovr": r["ovr"], "is_me": False,
                                      "club": r["club"], "club_tier": r.get("club_tier"),
                                      "club_country": r.get("club_country"),
@@ -902,11 +1000,12 @@ class _FormationCanvas(QWidget):
             self.update()
 
     def mousePressEvent(self, event):
-        # [2026-08 신설, 난이도 시스템] 어려움 난이도는 선수를 클릭해도
-        # 스탯 팝업이 뜨지 않는다(신민용 확정: "그냥 포메이션만 표시" —
-        # 내 선수/상대 선수 구분 없이 예외 없음).
-        if is_hard_mode():
-            return
+        # [2026-08 수정, 신민용 요청: "어려움 모드일 때는 포메이션에서
+        # 선수 상세 설정이 아예 안 뜨잖아 — 이름/국적/포지션/나이는
+        # 뜨게 해줘"] 예전엔 어려움 난이도에서 클릭 자체를 막아 팝업이
+        # 아예 안 떴다 — 이제 클릭은 항상 허용하고, PlayerStatPopup
+        # 내부에서 어려움 모드일 때 OVR·스탯·소속팀 표시만 숨긴다(신원
+        # 식별용 4개 항목만 남김).
         mx, my = event.pos().x(), event.pos().y()
         hit_r2 = max(144, int(self._circle_d * 0.42) ** 2)
         for i, (px, py, _, _s) in enumerate(self._positions_xy):
@@ -1005,16 +1104,18 @@ class _RosterPanel(QScrollArea):
             style = ("background:#1c1c1c;color:#aaa;border:1px solid #333;"
                      "border-radius:4px;padding:5px 8px;font-size:10px;")
         btn.setStyleSheet(style + "text-align:left;")
-        if is_hard_mode():
-            # [2026-08] 어려움 난이도는 포메이션 캔버스와 동일하게
-            # 클릭해도 스탯이 안 뜬다 — 커서도 일반 화살표로 되돌린다.
-            btn.setCursor(Qt.CursorShape.ArrowCursor)
-        else:
-            def _open_popup(_=False, p=pl):
-                _popup = PlayerStatPopup(p, self)
-                _popup.exec()
-                _popup.deleteLater()
-            btn.clicked.connect(_open_popup)
+        # [2026-08 수정, 신민용 요청: "포메이션에서 좌측(캔버스)뿐 아니라
+        # 우측 주전/후보 버튼들 눌러도 (이름/포지션/나이/국적) 떠야 해"]
+        # 예전엔 어려움 난이도에서 이 버튼들만 클릭 자체를 막았다(캔버스는
+        # 이미 클릭 허용 + 팝업 내부에서 정보 제한으로 바뀌었는데, 이
+        # 패널만 그 수정이 안 들어가 있었다) — 이제 항상 클릭 가능하고,
+        # PlayerStatPopup 내부가 어려움 난이도일 때 신원 4개 항목만
+        # 보여주는 건 이미 처리돼 있으므로 여기서는 그냥 항상 연결한다.
+        def _open_popup(_=False, p=pl):
+            _popup = PlayerStatPopup(p, self)
+            _popup.exec()
+            _popup.deleteLater()
+        btn.clicked.connect(_open_popup)
         return btn
 
     def set_roster(self, players: list, starter_ids: set):
@@ -1078,6 +1179,37 @@ class _TeamPanel(QWidget):
         self.roster.set_roster(self.canvas._roster, self.canvas._starter_ids)
 
 
+def apply_custom_name_live(player_id: int, new_name: str):
+    """[2026-08 신설, 신민용 요청: "이름 변경했는데 나갔다 들어와야
+    바뀐다 — 실시간으로 안 되나? 한 번에 하나씩만 바꾸는 건데"]
+    _ovr_cache_invalidated 플래그는 "다음에 이 팀을 다시 불러올 때"만
+    적용되는 예약이라, 지금 이미 화면에 떠 있는 포메이션(내 팀/상대팀
+    양쪽 다)은 그 시점이 올 때까지(주 진행, 팀 재선택 등) 안 바뀐다.
+    한 번에 선수 한 명만 바꾸는 가벼운 작업이므로, 그 대신 지금 열려
+    있는 모든 _TeamPanel(내 팀·상대팀 캔버스+명단 패널 둘 다 이
+    클래스 하나를 씀)을 뒤져서 이 선수 id가 보이면 그 자리에서 바로
+    이름을 바꾸고 다시 그린다 — DB 재조회 없이 화면만 즉시 갱신되는
+    가벼운 패치라, 몇 명이 떠 있든 순식간에 끝난다."""
+    from PyQt6.QtWidgets import QApplication
+    app = QApplication.instance()
+    if app is None:
+        return
+    for w in app.allWidgets():
+        if not isinstance(w, _TeamPanel):
+            continue
+        changed = False
+        for pl in w.canvas.players:
+            if pl.get("id") == player_id:
+                pl["name"] = new_name
+                changed = True
+        for pl in w.canvas._roster:
+            if pl.get("id") == player_id:
+                pl["name"] = new_name
+                changed = True
+        if changed:
+            w.canvas.update()
+            w.refresh_roster()
+
 # ─────────────────────────────────────────────
 # 메인 위젯
 # ─────────────────────────────────────────────
@@ -1139,6 +1271,7 @@ class FormationWidget(QWidget):
         self._filter_btns = []   # [(QPushButton, context_dict), ...]
         self._filter_team_id = None
         self._filter_manager_rel = 50
+        self._filter_context = None
 
         # ── 1행: 대회명 구분선 (에이전트/은퇴 버튼과 캔버스 사이)
         self.lbl_ctx = QLabel()
@@ -1200,7 +1333,9 @@ class FormationWidget(QWidget):
         # 안 뜨므로("그냥 포메이션만 표시") 안내 문구도 그에 맞게 바꾼다
         # — 안 그러면 "클릭 → 스탯"이라고 해놓고 아무 반응이 없어 버그처럼
         # 보일 수 있다.
-        _hint_text = "포메이션만 표시" if is_hard_mode() else "클릭 → 스탯"
+        # [2026-08 수정, 신민용 요청] 어려움 모드에서도 이제 클릭하면
+        # 신원(이름/포지션/나이/국적)은 뜬다 — 힌트 문구도 그에 맞춰 수정.
+        _hint_text = "클릭 → 신원만 표시" if is_hard_mode() else "클릭 → 스탯"
         hint_bar = QHBoxLayout()
         lh = QLabel(_hint_text); lh.setStyleSheet(_HINT_STYLE)
         rh = QLabel(_hint_text); rh.setStyleSheet(_HINT_STYLE)
@@ -1216,8 +1351,22 @@ class FormationWidget(QWidget):
         선택"(예전 동작과 동일하게 우선순위상 가장 중요한 대회)이다."""
         self._filter_team_id = team_id
         self._filter_manager_rel = manager_rel
+        self._filter_context = context
         self._build_filter_row(options or [], context)
         self._apply_context(team_id, context, manager_rel)
+
+    def refresh_now(self):
+        """[2026-08 신설, 신민용 요청: "이름 변경했는데 실시간으로 반영이
+        안 되고 나갔다 들어와야 바뀐다"] _ovr_cache_invalidated 플래그를
+        세워두는 것만으로는 부족하다 — 이 플래그는 "다음에 누가
+        load_my_team()을 부르면 그때 캐시를 비워라"는 예약일 뿐이라,
+        포메이션 화면이 이미 화면에 떠 있는 동안엔 아무도 다시 그
+        메서드를 안 불러서(주 진행 등 다른 트리거가 있어야 함) 반영이
+        미뤄졌다. 지금 로드돼 있던 team_id/context/manager_rel 그대로
+        _apply_context를 즉시 재호출해서(캐시는 호출부가 이미 무효화해둔
+        상태이므로 자동으로 DB에서 새로 읽는다) 화면에 바로 반영한다."""
+        if self._filter_team_id is not None:
+            self._apply_context(self._filter_team_id, self._filter_context, self._filter_manager_rel)
 
     def _build_filter_row(self, options: list, active_context: dict):
         # 기존 버튼 정리
@@ -1258,7 +1407,10 @@ class FormationWidget(QWidget):
         my_nat  = context.get("my_nat", "") if is_intl else ""
 
         # ── 내 팀 캔버스 (국제전이면 국가대표 모드)
-        self._my_canvas.load_my_team(team_id, intl_nat=my_nat)
+        # [2026-08 신설] context["tournament_id"]를 그대로 실어 보내서
+        # load_my_team이 나를 뺀 25명도 대회 내내 고정된 명단을 쓰게 한다.
+        _tid = context.get("tournament_id") if is_intl and context else None
+        self._my_canvas.load_my_team(team_id, intl_nat=my_nat, tournament_id=_tid)
         self._my_panel.refresh_roster()
 
         # ── 좌측 레이블: 국제전 → 국가명+OVR / 리그 → 팀명+OVR
@@ -1595,6 +1747,20 @@ class _CopyableField(QLineEdit):
         self.selectAll()
 
 
+def _sized_copyable_field(text: str, stylesheet: str) -> _CopyableField:
+    """[2026-08 신설] _CopyableField는 QLineEdit 기본 sizeHint를 그대로
+    쓰면 실제 글자 수와 무관하게 폭이 너무 넓게 잡힌다(원래는 club_field
+    처럼 한 줄에 하나만 두고 stretch=1로 늘려서 이 문제가 안 보였음) —
+    이름/포지션/OVR 세 개를 한 줄에 나란히 붙일 땐 내용 길이만큼만
+    차지해야 자연스럽다. QFontMetrics로 실제 텍스트 폭을 재서 고정폭으로
+    맞춘다(패딩+커서 여유분 포함)."""
+    field = _CopyableField(text)
+    field.setStyleSheet(stylesheet)
+    fm = QFontMetrics(field.font())
+    field.setFixedWidth(fm.horizontalAdvance(text) + 24)
+    return field
+
+
 class PlayerStatPopup(QDialog):
     def __init__(self, pl: dict, parent=None):
         super().__init__(parent)
@@ -1604,32 +1770,67 @@ class PlayerStatPopup(QDialog):
         self.setStyleSheet("QDialog{background:#1e1e1e;color:#ccc;}")
         lay = QVBoxLayout(self)
 
-        hdr = QLabel(f"{pl.get('name','')}  [{pl.get('position','')}]  OVR {pl.get('ovr',0)}")
-        hdr.setStyleSheet("color:#00cc44;font-size:13px;font-weight:bold;")
-        lay.addWidget(hdr)
-
-        # [2026-08 신설, 신민용 요청: "선수 눌렀을 때 나이도 뜨게"] 국제대회
-        # 가상 AI(intl_nat 분기의 랜덤 생성 상대)처럼 age 정보 자체가 없는
-        # 경우도 있어 값이 있을 때만 표시한다.
+        # [2026-08 수정, 신민용 요청: "이름/포지션/OVR가 테두리 있는 상자
+        # (필드 위젯)로 되어 있는데, 아래 스탯처럼 일반 테이블 뷰(텍스트/
+        # 그리드)로 통일해달라 — 나이/국적도 '항목 : 값' 형태로 같은
+        # 표 안에 나열"] 예전엔 이름/포지션/OVR을 _CopyableField(테두리
+        # 있는 QLineEdit 상자) 세 개로, 나이/국적은 또 별개의 QLabel
+        # 줄로 따로 보여줬다 — 이제 아래 스탯 표(tbl, "스탯"/"수치" 2열
+        # QTableWidget)와 완전히 같은 스타일의 작은 표 하나로 통일해서
+        # 이름/포지션/OVR/나이/국적을 전부 "항목 | 값" 행으로 나열한다.
+        # age/nationality는 기존과 동일하게 값이 있을 때만 행을 추가한다
+        # (국제대회 가상 AI처럼 age 자체가 없는 경우가 있어서).
+        # [2026-08 확장, 신민용 요청: "어려움 모드일 때 포메이션에서 선수
+        # 상세 설정이 아예 안 뜨는데, 이름/국적/포지션/나이는 뜨게 해줘"]
+        # 어려움 난이도는 OVR 행 자체를 아예 안 넣는다(신원 식별용 4개
+        # 항목 — 이름/포지션/나이/국적 — 만 남긴다).
+        _hard = is_hard_mode()
+        info_rows = [
+            ("이름", pl.get('name', '')),
+            ("포지션", pl.get('position', '')),
+        ]
+        if not _hard:
+            info_rows.append(("OVR", str(pl.get('ovr', 0))))
         age = pl.get("age")
         if age:
-            age_lbl = QLabel(f"🎂 {age}세")
-            age_lbl.setStyleSheet("color:#888;font-size:11px;")
-            lay.addWidget(age_lbl)
-
-        # [2026-07 신설, 신민용 요청] 국적 표시
+            info_rows.append(("나이", f"{age}세"))
         nat = pl.get("nationality", "")
         if nat:
-            nat_lbl = QLabel(f"🌍 {nat}")
-            nat_lbl.setStyleSheet("color:#888;font-size:11px;")
-            lay.addWidget(nat_lbl)
+            info_rows.append(("국적", nat))
+
+        info_tbl = QTableWidget(len(info_rows), 2)
+        info_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        info_tbl.horizontalHeader().setVisible(False)
+        info_tbl.verticalHeader().setVisible(False)
+        info_tbl.verticalHeader().setDefaultSectionSize(22)
+        info_tbl.setStyleSheet(
+            "QTableWidget{background:#1e1e1e;color:#ccc;gridline-color:#2a2a2a;border:none;}")
+        for i, (label, value) in enumerate(info_rows):
+            label_item = QTableWidgetItem(label)
+            label_item.setForeground(QColor("#888"))
+            info_tbl.setItem(i, 0, label_item)
+            value_item = QTableWidgetItem(value)
+            # 이름 행만 기존 hdr(초록 굵은 글씨) 색을 그대로 유지.
+            if label == "이름":
+                f = value_item.font(); f.setBold(True); value_item.setFont(f)
+                value_item.setForeground(QColor("#00cc44"))
+            else:
+                value_item.setForeground(QColor("#ccc"))
+            info_tbl.setItem(i, 1, value_item)
+        info_tbl.horizontalHeader().setStretchLastSection(True)
+        info_tbl.setFixedHeight(22 * len(info_rows) + 4)
+        lay.addWidget(info_tbl)
 
         # [2026-07 신설, 신민용 요청] 소속팀 표시 (국제대회 화면에서 상대국
         # 선수 클릭 시 — "어느 클럽 소속인지"가 국적보다 새 정보이므로 표시)
         # [2026-08 수정, 신민용 요청: "클릭하면 복붙할 수 있는 상자로"]
         # 팀명이 길거나 특이한 표기라 그대로 검색해보고 싶을 때가 있어,
         # 읽기 전용 QLabel 대신 클릭 시 전체 선택되는 _CopyableField로 바꿨다.
-        club = pl.get("club", "")
+        # [2026-08 확장, 신민용 요청] 어려움 난이도는 소속팀도 숨긴다 —
+        # 이름/포지션/나이/국적 4개 항목 외엔 아무것도 안 보여준다는
+        # 원칙에 맞춰, 클럽 정보(간접적으로 상대 실력을 짐작하게 함)도
+        # 제외.
+        club = pl.get("club", "") if not _hard else ""
         if club:
             club_row = QHBoxLayout(); club_row.setSpacing(4)
             club_icon = QLabel("🏟️"); club_icon.setStyleSheet("font-size:11px;")
@@ -1653,19 +1854,22 @@ class PlayerStatPopup(QDialog):
                 league_row.addWidget(league_field, 1)
                 lay.addLayout(league_row)
 
-        tbl = QTableWidget(len(ALL_STATS), 2)
-        tbl.setHorizontalHeaderLabels(["스탯","수치"])
-        tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        tbl.setStyleSheet(
-            "QTableWidget{background:#1e1e1e;color:#ccc;gridline-color:#2a2a2a;border:none;}"
-            "QHeaderView::section{background:#252525;color:#888;border:none;padding:2px;}")
-        tbl.verticalHeader().setVisible(False)
-        tbl.verticalHeader().setDefaultSectionSize(22)
-        for i, s in enumerate(ALL_STATS):
-            tbl.setItem(i, 0, QTableWidgetItem(STAT_KO.get(s, s)))
-            tbl.setItem(i, 1, QTableWidgetItem(str(pl.get(s, 0))))
-        tbl.horizontalHeader().setStretchLastSection(True)
-        lay.addWidget(tbl)
+        # [2026-08 확장, 신민용 요청] 어려움 난이도는 세부 스탯 표 자체를
+        # 안 그린다 — 이름/포지션/나이/국적 4개 항목만 남는다.
+        if not _hard:
+            tbl = QTableWidget(len(ALL_STATS), 2)
+            tbl.setHorizontalHeaderLabels(["스탯","수치"])
+            tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+            tbl.setStyleSheet(
+                "QTableWidget{background:#1e1e1e;color:#ccc;gridline-color:#2a2a2a;border:none;}"
+                "QHeaderView::section{background:#252525;color:#888;border:none;padding:2px;}")
+            tbl.verticalHeader().setVisible(False)
+            tbl.verticalHeader().setDefaultSectionSize(22)
+            for i, s in enumerate(ALL_STATS):
+                tbl.setItem(i, 0, QTableWidgetItem(STAT_KO.get(s, s)))
+                tbl.setItem(i, 1, QTableWidgetItem(str(pl.get(s, 0))))
+            tbl.horizontalHeader().setStretchLastSection(True)
+            lay.addWidget(tbl)
 
         ok = QPushButton("닫기")
         ok.setStyleSheet("background:#2a2a2a;color:#ccc;border:1px solid #444;"

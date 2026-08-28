@@ -4291,38 +4291,7 @@
 {
   "country_name": "말라위",
   "total_teams": 42,
-  "affiliates": [
-    {
-      "team_name": "실버 B",
-      "tier": 2,
-      "parent_team_name": "실버 스트라이커스"
-    },
-    {
-      "team_name": "원더러스 B",
-      "tier": 2,
-      "parent_team_name": "마이티 무탈라 원더러스"
-    },
-    {
-      "team_name": "빅 불리츠 B",
-      "tier": 3,
-      "parent_team_name": "냐사 빅 불리츠 FC"
-    },
-    {
-      "team_name": "블란타이어 B",
-      "tier": 3,
-      "parent_team_name": "블란타이어 유나이티드"
-    },
-    {
-      "team_name": "릴롱궤 B",
-      "tier": 3,
-      "parent_team_name": "릴롱궤 스타스"
-    },
-    {
-      "team_name": "음주주 B",
-      "tier": 3,
-      "parent_team_name": "음주주 시티"
-    }
-  ],
+  "affiliates": [],
   "review": []
 }
 

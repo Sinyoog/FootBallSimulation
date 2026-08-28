@@ -923,7 +923,8 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
     from game_engine import (add_log, get_player, update_player,
                              _player_perf, _my_result, _update_pop, _gen_score,
                              _save_match_detail, _soft_cap,
-                             _check_suspended, _roll_red_card, _apply_red_card_dismissal,
+                             _check_suspended, _check_bench, _roll_red_card,
+                             _apply_red_card_dismissal,
                              _roll_card_events,
                              _week_intl_cl_day, _log_highlight, _min_sortkey)
     from competition.champions_engine import _get_field_pos
@@ -951,6 +952,14 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
     _my_ovr = p.get("ovr", 40)
     _team_ovr = he["ovr"] if is_home else ae["ovr"]
     _gap = max(0.0, _my_ovr - _team_ovr)
+    # [2026-08 신설, 신민용 리포트: "챔스/유로파/컨퍼런스/슈퍼컵도 리그처럼
+    # 벤치가 있어야 한다"] 리그와 동일한 _check_bench를 재사용하되, 비교
+    # 기준은 이 대회에서 실제로 뛰는 "이 팀"(_team_ovr) — 이미 위에서
+    # 홈/원정에 맞게 뽑아둔 값을 그대로 넘긴다. 출전정지면 벤치 확률
+    # 계산 자체가 무의미하므로 건너뛴다(우선순위: 징계 > 벤치).
+    _benched = (not _suspended) and _check_bench(p, team_avg_ovr=_team_ovr)
+    if _benched:
+        add_log("🪑 벤치 대기로 결장", "event")
     _star = 1.0 + max(0.0, (_my_ovr - 60) / 40.0) ** 1.8 * 3.0
     bonus = _gap * 0.30 * _star + max(0.0, _my_ovr - 50) * 0.08
     bonus = _soft_cap(bonus, 30.0)
@@ -958,7 +967,7 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
     _pe = PERSONALITY_EFFECTS.get(p.get("personality", ""), {})
     if "team_win_bonus" in _pe:
         bonus *= (1.0 + _pe["team_win_bonus"])
-    if _suspended:
+    if _suspended or _benched:
         bonus = 0.0
     h_ovr = he["ovr"] + (bonus if is_home else 0)
     a_ovr = ae["ovr"] + (0 if is_home else bonus)
@@ -971,11 +980,15 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
         pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
     hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
 
-    if _suspended:
+    if _suspended or _benched:
         goals, assists, saves, rating = 0, 0, 0, 0.0
         events, detail = [], {"shots": 0, "shots_on": 0, "key_passes": 0,
                               "dribbles": 0, "blocks": 0, "pass_acc": 0.0}
-        _absence_reason = "suspension"
+        # [2026-08 신설] 벤치는 "결장 사유"가 아니다 — career_window/
+        # retire_window가 이미 my_played=0 + absence_reason=NULL을
+        # "벤치"로 표시하는 규칙을 쓰고 있으므로(_absence_override 등)
+        # 여기서도 그 규칙을 그대로 따른다(출전정지만 사유 문자열을 남김).
+        _absence_reason = "suspension" if _suspended else None
         _yellow_cnt = 0
     else:
         _opp_ovr = (ae["ovr"] if is_home else he["ovr"])
@@ -989,7 +1002,7 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
             _absence_reason = _card_reason
         elif _yellow_ev:
             events = list(events) + _yellow_ev
-    if not _suspended and "big_match_rating" in _pe:
+    if not (_suspended or _benched) and "big_match_rating" in _pe:
         rating = max(3.0, min(10.0, round(rating + _pe["big_match_rating"], 1)))
     my_result = _my_result(outcome, is_home)
     my_conceded = (as_ if is_home else hs)
@@ -1006,7 +1019,7 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
                     day=?, my_absence_reason=?, my_yellow_cards=?
                     WHERE id=?""",
                  (hs, as_, pso_winner, pso_score,
-                  0 if _suspended else 1, _get_field_pos(p),
+                  0 if (_suspended or _benched) else 1, _get_field_pos(p),
                   saves, goals, assists, rating,
                   detail["shots"], detail["shots_on"], detail["key_passes"],
                   detail["dribbles"], detail["blocks"], detail["pass_acc"],
@@ -1047,7 +1060,7 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
     detail_id = _save_match_detail(
         p, week, comp_name, is_home, home_disp, away_disp,
         hs, as_, my_result, goals, assists, saves, rating,
-        events, True, False, detail, pso=pso)
+        events, not (_suspended or _benched), _benched, detail, pso=pso)
     marker = f" [match:{detail_id}]" if detail_id else ""
 
     add_log("─" * 44, "sep")

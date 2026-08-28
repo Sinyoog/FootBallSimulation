@@ -268,6 +268,10 @@ class CareerWindow(QDialog):
         tabs.addTab(self._po_tab(po_ms, p), f"⚖ 승강 플레이오프 ({len(po_ms)})")
         root.addWidget(tabs)
 
+        # [2026-08 성능수정] 위 탭들이 만든 모든 표에 이제서야 한 번만
+        # ResizeToContents를 건다 — _make_table 주석 참고.
+        self._finalize_tables()
+
         # [2026-08 신설, 신민용 요청: "커리어 기록이 없으면 창이 제일
         # 작게 뜨는데, 창 기본 크기를 위에 탭 버튼들 크기에 맞춰달라"]
         # 커리어 데이터가 거의 없는 캐릭터(막 시작한 선수 등)는 각 탭
@@ -306,9 +310,29 @@ class CareerWindow(QDialog):
         tbl.setHorizontalHeaderLabels(cols)
         tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         tbl.verticalHeader().setVisible(False)
-        for i in range(len(cols)):
-            tbl.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+        # [2026-08 성능수정, 신민용 리포트: "커리어가 화려해질수록(경기/
+        # 수상 기록이 많을수록) 커리어창이 렉걸린다"] 여기서 바로
+        # ResizeToContents를 걸면, 이 표를 채우는 각 탭 메서드가 뒤이어
+        # 부르는 setItem() 수백~수천 번(경기 기록이 많은 탭일수록 더
+        # 많음)마다 그 컬럼 폭을 다시 계산한다 — 행이 늘어날수록 이
+        # 재계산이 누적돼 체감 렉으로 이어진다. 지금은 가벼운 기본
+        # (Interactive) 모드로만 두고 이 표를 리스트에 등록해뒀다가,
+        # _build()가 모든 탭의 데이터를 다 채운 맨 끝에서 딱 한 번만
+        # ResizeToContents로 전환한다(_finalize_tables 참고) — 최종
+        # 화면(컬럼 폭)은 완전히 동일하고, "행마다 반복 계산" →
+        # "한 번만 계산"으로 바뀔 뿐이다.
+        if not hasattr(self, "_all_tables"):
+            self._all_tables = []
+        self._all_tables.append(tbl)
         return tbl
+
+    def _finalize_tables(self):
+        """_make_table로 만든 모든 표에 ResizeToContents를 한 번에
+        적용 — _build() 끝에서 1회만 호출한다."""
+        for tbl in getattr(self, "_all_tables", []):
+            for i in range(tbl.columnCount()):
+                tbl.horizontalHeader().setSectionResizeMode(
+                    i, QHeaderView.ResizeMode.ResizeToContents)
 
     def _set(self, tbl, r, c, v, color=None):
         item = QTableWidgetItem(str(v))
@@ -1206,6 +1230,14 @@ class CareerWindow(QDialog):
                     + [_emap.get(c, "—") for c in extra_cols]
                     + [str(m["rating"]), m.get("score", "") or "—", res])
             _reason_label = _absence_override(m, len(vals), 6 + len(extra_cols))
+            # [2026-08 버그수정, 신민용 리포트: "컵대회/챔스처럼 승강 PO도
+            # 벤치가 표시돼야 한다"] 다른 대회 탭들은 my_played=0 +
+            # absence_reason=NULL을 "벤치"로 추론하는데, po_history엔
+            # my_played 컬럼 자체가 없어(그 추론이 불가능해서) 대신
+            # promotion_playoff_engine.py가 벤치일 때 absence_reason에
+            # 직접 "bench" 문자열을 남긴다 — 그 값을 그대로 라벨링한다.
+            if _reason_label is None and m.get("absence_reason") == "bench":
+                _reason_label = "벤치"
             if _reason_label:
                 vals = list(vals)
                 vals[4] = "—"; vals[5] = "—"

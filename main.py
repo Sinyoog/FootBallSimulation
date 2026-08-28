@@ -127,7 +127,7 @@ def main():
     seed_win.show()
     QApplication.processEvents()
     try:
-        seed_initial_data(progress_cb=seed_win.report)
+        seed_initial_data(progress_cb=seed_win.report, skip_ai_regen=True)
     except SeedCancelled:
         # 아직 commit() 전이므로 지금까지의 INSERT를 통째로 되돌린다.
         # → DB엔 아무것도 안 남고, 다음 실행 시 처음부터 다시 생성된다.

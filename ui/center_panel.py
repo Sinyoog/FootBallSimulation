@@ -3535,38 +3535,20 @@ class CenterPanel(QWidget):
         from ui.offer_window import OfferWindow
 
         if kind == "join":
+            # [2026-08 수정, 신민용 리포트: "1주차에 게임 껐다 이어하기 하면
+            # 팀 입단 창이 강제로 뜬다"] 예전엔 여기서 곧바로 dlg.exec()로
+            # 입단 창을 자동으로 다시 띄웠는데, 그러면 사용자가 "🏟 팀 입단"
+            # 버튼을 누르기도 전에(다른 걸 먼저 하고 싶어도) 매 접속마다
+            # 강제로 그 창부터 봐야 했다. 오퍼 리롤 방지(같은 목록 유지)는
+            # DB에 저장된 상태(restore)가 이미 하고 있으므로, 여기서는 그냥
+            # 저장된 상태를 건드리지 않고 둔다 — 버튼은 기본값(_join_used
+            # =False)대로 활성화된 채 남고, 사용자가 실제로 "🏟 팀 입단"을
+            # 누르면 _do_join()이 이 저장된 상태를 그대로 불러와 새로
+            # 리롤하지 않고 이어서 보여준다.
             if p.get("current_team_id"):
                 # 이미 소속 팀이 생긴 비정상 상태 — 남은 상태만 정리.
                 clear_pending_offer_state()
-                return
-            self._join_used = True
-            self.btn_join.setEnabled(False)
-            _restored_offers = restore.get("offers", [])
-            from game_engine import refresh_offer_rank_info
-            refresh_offer_rank_info(_restored_offers)
-            dlg = OfferWindow(_restored_offers, p.get("language", "ko"), self,
-                              title=restore.get("title", "🏟 팀 입단"),
-                              force_select=restore.get("force_select", True),
-                              grid=restore.get("grid", True),
-                              apply_slots=restore.get("apply_slots", 4),
-                              kind="join", restore_state=restore)
-            self._offer_dlg = dlg
-            dlg.exec()
-            if not dlg.chosen and getattr(dlg, "all_failed", False):
-                self._skip_join_lock = True
-                self._join_used = True
-                self.btn_join.setEnabled(False)
-                show_toast(self, "📅 모든 협상 결렬 — 올해는 입단을 보류하고 1년 더 훈련합니다.",
-                           "#cc6600", 2200)
-                if self.main_win: self.main_win.refresh_all()
-                return
-            if not dlg.chosen:
-                # 팀을 안 고르고 그냥 닫은 경우 — 상태는 저장돼 있으니 버튼을
-                # 다시 눌러 열면 완전히 같은 목록이 그대로 뜬다.
-                self._join_used = False
-                self.btn_join.setEnabled(True)
-                return
-            self._on_join_done(dlg)
+            return
 
         elif kind == "auto_offer":
             if not p.get("current_team_id"):

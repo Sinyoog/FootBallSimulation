@@ -1810,19 +1810,30 @@ def _continent_group_for(continent: str) -> list:
 
 
 def get_team_power_history(conn, team_id: int) -> list:
+    """[2026-08 확장, 신민용 요청: "파워랭킹에서 팀 클릭하면 뜨는 전체
+    순위/대륙 순위에 국가 내 순위도 추가해달라"] 대륙 순위(continent
+    범위 안에서 rank<= 자기 rank인 팀 수)와 같은 방식으로, 같은 나라
+    (country) 안에서의 순위도 같이 계산해 반환한다 — 반환 튜플이
+    (ranking_year, rank, continent_rank)에서 (ranking_year, rank,
+    continent_rank, country_rank) 4개로 늘어난다."""
     ensure_power_ranking_tables(conn)
     rows = conn.execute(
-        """SELECT ranking_year, rank, continent FROM team_power_rankings
+        """SELECT ranking_year, rank, continent, country FROM team_power_rankings
            WHERE team_id=? ORDER BY ranking_year DESC""", (team_id,)).fetchall()
     result = []
-    for ranking_year, rank, continent in rows:
+    for ranking_year, rank, continent, country in rows:
         group = _continent_group_for(continent)
         placeholders = ",".join("?" * len(group))
         crow = conn.execute(
             f"""SELECT COUNT(*) FROM team_power_rankings
                 WHERE ranking_year=? AND continent IN ({placeholders}) AND rank<=?""",
             (ranking_year, *group, rank)).fetchone()
-        result.append((ranking_year, rank, crow[0] if crow else rank))
+        country_row = conn.execute(
+            """SELECT COUNT(*) FROM team_power_rankings
+               WHERE ranking_year=? AND country=? AND rank<=?""",
+            (ranking_year, country, rank)).fetchone()
+        result.append((ranking_year, rank, crow[0] if crow else rank,
+                        country_row[0] if country_row else rank))
     return result
 
 

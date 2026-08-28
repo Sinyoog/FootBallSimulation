@@ -469,17 +469,24 @@ def get_logs(since_id=0):
     깨끗해지고 다시 쌓이게"] 각 줄이 어느 연도(year) 소속인지를 호출부가
     알아야 연도 경계를 찾아 화면을 비울 수 있다 — entry 텍스트만 주던 걸
     (entry, year) 튜플로 바꿨다(game_log.year 컬럼은 원래부터 있었음,
-    여태 안 내려주고 있었을 뿐)."""
+    여태 안 내려주고 있었을 뿐).
+
+    [2026-08 확장, 로그 필터 버튼(전체/핵심/경기) 신설] log_type도 같이
+    내려준다(entry, year, log_type) — 이미 add_log() 호출부마다 event/
+    injury/match/normal/salary/sep/slump/training으로 태깅해서 game_log
+    테이블에 저장은 계속 해왔는데(스키마에도 처음부터 있던 컬럼) 여태
+    호출부가 안 읽고 있었을 뿐이다. ui/log_panel.py가 이 값으로 "핵심"
+    (훈련·휴식 + 경기 기록만)/"경기"(경기 기록만) 필터를 계산한다."""
     flush_log_buffer()  # 버퍼에 남은 로그 먼저 기록
     conn = get_conn()
     c = conn.cursor()
     if since_id:
-        c.execute("SELECT id, entry, year FROM game_log WHERE id>? ORDER BY id ASC", (since_id,))
+        c.execute("SELECT id, entry, year, log_type FROM game_log WHERE id>? ORDER BY id ASC", (since_id,))
     else:
-        c.execute("SELECT id, entry, year FROM game_log ORDER BY id ASC")
+        c.execute("SELECT id, entry, year, log_type FROM game_log ORDER BY id ASC")
     rows = c.fetchall()
     conn.close()
-    entries = [(r["entry"], r["year"]) for r in rows]
+    entries = [(r["entry"], r["year"], r["log_type"]) for r in rows]
     max_id = rows[-1]["id"] if rows else since_id
     return entries, max_id
 
@@ -666,15 +673,30 @@ def create_player(name: str, position: str, sub_role: str,
     # 하드코딩돼 있어서 새로 추가된 신/슈퍼스타/아마추어/재능없음이 랜덤
     # 추첨에 절대 안 걸렸다 — TALENT_TIER_ORDER를 그대로 순회하도록 고쳐서
     # 새 등급이 추가/변경돼도 이 루프는 항상 최신 목록을 따라간다.
+    # [2026-08 수정, 난이도 시스템 13번] 어려움 난이도에서는 "신"(god)이
+    # 새 선수 생성 확률 추첨에서 아예 나오지 않아야 한다(신민용 확정) —
+    # 혹시라도 talent_tier="god"이 넘어와도(예: 방어적 호출부 실수) 어려움
+    # 이면 무효 처리해 확률 추첨으로 되돌린다. 어려움 전용 8단계 확률표
+    # (TALENT_TIER_HARD_PROB, god 제외)를 쓴다.
+    if difficulty == "hard" and talent_tier == "god":
+        talent_tier = None
     if talent_tier not in TALENT_TIERS:
         _r = random.random()
         _acc = 0.0
-        talent_tier = "pro"
-        for _tname in TALENT_TIER_ORDER:
-            _acc += TALENT_TIERS[_tname]["prob"]
-            if _r < _acc:
-                talent_tier = _tname
-                break
+        if difficulty == "hard":
+            talent_tier = "pro"
+            for _tname in TALENT_TIER_ORDER_HARD:
+                _acc += TALENT_TIER_HARD_PROB[_tname]
+                if _r < _acc:
+                    talent_tier = _tname
+                    break
+        else:
+            talent_tier = "pro"
+            for _tname in TALENT_TIER_ORDER:
+                _acc += TALENT_TIERS[_tname]["prob"]
+                if _r < _acc:
+                    talent_tier = _tname
+                    break
     _tt = TALENT_TIERS[talent_tier]
     talent_cap = random.randint(_tt["cap_min"], _tt["cap_max"])
 
@@ -867,8 +889,14 @@ def create_player(name: str, position: str, sub_role: str,
     # [2026-08 신설] 실제 선택된 시작 연도를 영구 저장 — intl_engine.py가
     # 이걸 기준으로 월드컵/네이션스컵/클럽월드컵/지역컵 개최년도를 다시
     # 계산한다(자세한 이유는 database.set_game_start_year 주석 참고).
-    from database import set_game_start_year
+    from database import set_game_start_year, seed_initial_ovr_history
     set_game_start_year(_start_year)
+    # [2026-08 신설, 신민용 리포트: "OVR 기록이 2000/2001/2002년 다 비어있다"]
+    # ai_player_ovr_history는 매 시즌 종료 시점에만 채워져서, 시즌 전환이
+    # 한 번도 없었던 이 세이브의 첫 해는 채울 계기가 없었다 — 지금
+    # (전세계 선수단은 이미 생성 완료, 시작 연도도 방금 확정) 한 번
+    # 아카이브해서 첫 해부터 정확한 기록이 남게 한다.
+    seed_initial_ovr_history(_start_year)
 
     # [전성기 OVR] 시작 OVR로 초기화 (이후 update_player가 자동으로 최고치 갱신).
     conn.execute("UPDATE my_player SET peak_ovr=? WHERE id=1", (ovr,))
@@ -3775,11 +3803,20 @@ def _pending_transfer_bench_mult(p) -> float:
     return min(2.2, mult)
 
 
-def _check_bench(p):
+def _check_bench(p, team_avg_ovr=None):
     """OVR 격차(팀 수준 대비)를 주 변수로, 감독 관계로 보정한 벤치 판정.
-    [기능1/2] 계약 역할 + 감독 성향으로 추가 보정."""
+    [기능1/2] 계약 역할 + 감독 성향으로 추가 보정.
+
+    [2026-08 확장, 신민용 리포트: "챔스/유로파 등 국제클럽대회·컵대회·
+    국가대표(월드컵 등)엔 벤치가 아예 없다 — 부상/출전정지만 있고 로테이션
+    개념 자체가 빠져있다"] 원래는 리그 경기(_simulate_match)에서만 쓰여서
+    항상 "내 소속 클럽 팀" 평균 OVR(_my_team_avg_ovr)을 기준으로 삼았는데,
+    국가대표 A매치는 비교 기준이 "국가대표팀 평균 OVR"이어야 한다(클럽에서
+    벤치 멤버라도 국가대표에선 주전일 수 있고 그 반대도 가능) — 그래서
+    team_avg_ovr을 넘기면 그 값을 그대로 기준으로 쓰고, 안 넘기면(기존
+    리그 호출부는 그대로 동작) _my_team_avg_ovr(p)로 폴백한다."""
     rel = p.get("manager_relation", 50)
-    team_avg = _my_team_avg_ovr(p)
+    team_avg = team_avg_ovr if team_avg_ovr is not None else _my_team_avg_ovr(p)
     gap = team_avg - p.get("ovr", 40)   # +면 내가 팀 수준에 못 미침
 
     base = 0.90
@@ -7111,6 +7148,45 @@ def _advance_week(p, base_week, n_weeks=4, progress_cb=None):
         if _p_pending:
             _execute_pending_join_transfer(_p_pending, new_year, new_week)
 
+    # [2026-08 신설, 상반기/하반기 이적 기록 분리 기능, 신민용 요청:
+    # "1993 기록이 2개로 나뉘며 상반기는 이팀 하반기는 2팀... 상황에
+    # 따라 중간에도 AI 선수들 이적이 가능하긴 하나 이때는 0~2명 정도만"]
+    # 하반기 시작 주차에 진입하는 이 순간 (1) 지금까지(=상반기) 치른
+    # 경기만 반영된 순위표를 스냅샷으로 남기고 — 시즌이 끝나면 원본
+    # match_results가 결국 요약/압축돼 상반기 시점을 나중엔 복원할 수
+    # 없으므로 지금 미리 떠둬야 한다 — (2) 아주 작은 규모(리그당 팀 수
+    # 기준 오프시즌의 약 1/10)로 AI끼리 이적 창구를 한 번 더 연다.
+    # 세계 축구 기록실 "선수 검색"이 이 스냅샷 + ai_transfer_log.
+    # is_mid_season을 보고 그 해 기록을 상반기/하반기 두 줄로 쪼갠다.
+    if new_week == SECOND_HALF_START:
+        try:
+            _conn_half = get_conn()
+            _league_ids = [r[0] for r in _conn_half.execute(
+                "SELECT DISTINCT league_id FROM match_results WHERE season=?",
+                (new_season,)).fetchall()]
+            _half_rows = []
+            for _lid in _league_ids:
+                for _row in get_league_standings(_lid, season=new_season, conn=_conn_half):
+                    _half_rows.append((_lid, new_season, new_year, _row["id"],
+                                        _row["wins"], _row["draws"], _row["losses"],
+                                        _row["goals_for"], _row["goals_against"]))
+            if _half_rows:
+                _conn_half.executemany(
+                    """INSERT OR REPLACE INTO league_season_standings_half
+                       (league_id, season, year, team_id, wins, draws, losses,
+                        goals_for, goals_against)
+                       VALUES (?,?,?,?,?,?,?,?,?)""", _half_rows)
+                _conn_half.commit()
+            _conn_half.close()
+        except Exception as _e:
+            add_log(f"⚠ 상반기 순위 스냅샷 오류: {_e}", "event", new_year, new_week)
+
+        try:
+            from ai_lifecycle import run_ai_mid_season_transfer
+            run_ai_mid_season_transfer(new_year, verbose_log=add_log, my_team_id=p.get("current_team_id"))
+        except Exception as _e:
+            add_log(f"⚠ 겨울 이적시장 처리 중 오류: {_e}", "event", new_year, new_week)
+
     # [2026-07 신설, 신민용+GPT 다회 설계 확정: "구단 판매 추진" 시스템]
     # 매주(정확히는 _advance_week가 호출될 때마다) 5개 조건 점수를
     # 재계산 — 오퍼가 매주 뜨는 기존 구조와 맞추기 위해 연말 1회가 아니라
@@ -9720,6 +9796,18 @@ def _end_of_season(p, year, progress_cb=None):
         run_ai_offseason(year, verbose_log=add_log, progress_cb=progress_cb,
                          my_team_id=p.get("current_team_id"))
     except Exception as _e:
+        # [2026-08 강화, 신민용 리포트: "10년 한번에 진행하면 OVR 기록이
+        # 안 되는 경우가 있다"] 이 예외가 조용히 삼켜지면서(로그 한 줄만
+        # 남고 그 해의 나이/성장/은퇴/이적 처리가 통째로 날아갔을 가능성이
+        # 큰 원인이었다 — ai_lifecycle.run_ai_offseason 안에서 이번 해
+        # 나이·성장·OVR 아카이브 직후 한 번 먼저 commit하도록 고쳐서
+        # (ai_lifecycle.py 참고) 최소한 그 부분은 이 예외가 나도 살아남게
+        # 했지만, 그래도 어디서 왜 실패했는지 콘솔에서 바로 보이도록
+        # 전체 트레이스백을 같이 찍는다(사용자에게 보이는 로그는 기존과
+        # 동일하게 한 줄만).
+        import traceback as _tb
+        print(f"[AI생애주기 오류] {year}년: {_e}")
+        _tb.print_exc()
         add_log(f"⚠ 이적시장 처리 중 오류: {_e}", "event", year, 52)
     if DEBUG_RELEGATION_TRACKING:
         for _tid in _RELEGATION_DEBUG_TRACK:
@@ -11555,6 +11643,18 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
     except Exception as _e:
         add_log(f"[리스케일 오류] {_e}", "normal", year, 52)
     _pr_t7 = _time_pr.perf_counter()
+
+    # [2026-08 신설, 신민용 리포트: "승격/강등해도 스탯 균일 이동만 하고
+    # 스쿼드 구성은 안 바뀐다 — 팀 개편(방출 포함)이 있어야 하는 거
+    # 아니냐"] 위 rescale은 전원 같은 델타로 평행이동만 하는 것이라 개인별
+    # 순위·구성은 그대로였다 — ai_lifecycle.apply_squad_turnover_after_
+    # movement가 그 팀 하위권 일부를 새 tier 수준 신규 선수로 교체(일부는
+    # 그냥 방출)해서 실제 "팀 개편"이 일어나게 한다.
+    try:
+        from ai_lifecycle import apply_squad_turnover_after_movement
+        apply_squad_turnover_after_movement(_rescale_jobs, year)
+    except Exception as _e:
+        add_log(f"[스쿼드 개편 오류] {_e}", "normal", year, 52)
 
     if DEBUG_RELEGATION_TRACKING:
         for _tid in _RELEGATION_DEBUG_TRACK:

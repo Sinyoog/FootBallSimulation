@@ -16,13 +16,18 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QTableWidget, QTableWidgetItem,
     QHeaderView, QPushButton, QTabWidget, QWidget, QSplitter, QFrame,
     QAbstractItemView, QScrollArea, QGridLayout, QSizePolicy,
-    QStyledItemDelegate, QStyle, QMenu, QMessageBox, QSpinBox
+    QStyledItemDelegate, QStyle, QMenu, QMessageBox, QSpinBox, QCompleter,
+    QButtonGroup
 )
 from PyQt6.QtCore import Qt, QTimer, QRect, QSize
-from PyQt6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter, QShortcut, QKeySequence
+from PyQt6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter, QShortcut, QKeySequence, QIntValidator
 
 import world_browser as wb
-from database import get_conn, get_game_start_year
+from database import (get_conn, get_game_start_year, TEAM_POSITIONS,
+                       get_ai_player_custom_name, set_ai_player_custom_name,
+                       get_ai_player_custom_names)
+from constants import ai_player_code
+from game_engine import is_hard_mode
 import power_ranking as pr
 
 # [2026-08 신설, 신민용 리포트: "복사하면 국기/국가/부수까지 같이 복사된다,
@@ -365,6 +370,7 @@ class WorldBrowserWindow(QDialog):
             (self._build_region_tab,       "🌏 역대 지역컵"),
             (self._build_country_tab,      "🌍 국가 검색"),
             (self._build_power_ranking_tab,"📊 파워랭킹"),
+            (self._build_player_search_tab,"🔎 선수 검색"),
         ]
         for builder, label in _lazy_tabs:
             placeholder = QWidget()
@@ -1170,6 +1176,12 @@ class WorldBrowserWindow(QDialog):
     _TEAM_COUNT_COL_W = 46
     _LEAGUE_COL_W = 168
     _TROPHY_COL_W = 140
+    # [2026-08 신설] "선수 검색" 탭 전용 칸 폭 — 이름/등급/국가/리그는 팀
+    # 검색과 같은 값을 그대로 재사용하고, 선수 고유 항목(포지션/국적/OVR)만
+    # 새로 정의한다.
+    _POS_COL_W = 46
+    _NAT_COL_W = 110
+    _OVR_COL_W = 44
 
     def _league_row_widget(self, lg):
         """리그 목록 한 줄 — 왼쪽부터 [리그명(고정폭)] [등급] [국가] [부수]
@@ -2140,12 +2152,17 @@ class WorldBrowserWindow(QDialog):
         # 기준(get_team_power_ranking_grouped의 새 6탭 구조와 동일 원칙,
         # _continent_group_for가 이제 병합 없이 단일 대륙만 돌려주므로
         # get_team_power_history가 그대로 "그 대륙 안에서의 순위"를 준다).
+        # [2026-08 확장, 신민용 요청: "전체 순위/대륙 순위에 국가 순위도
+        # 추가해달라"] get_team_power_history가 이제 4개(연도,전체,대륙,
+        # 국가)를 주므로, 국가 이름도 같이 조회해 라벨에 쓴다.
         continent_row = get_conn().execute(
-            """SELECT cn.continent FROM teams t JOIN countries cn ON t.country_id = cn.id
+            """SELECT cn.continent, cn.name FROM teams t JOIN countries cn ON t.country_id = cn.id
                WHERE t.id=?""", (tid,)).fetchone()
         team_continent = continent_row[0] if continent_row else ""
-        rank_by_year = {y: (r, cr) for y, r, cr in pr.get_team_power_history(get_conn(), tid)}
+        team_country = continent_row[1] if continent_row else ""
+        rank_by_year = {y: (r, cr, ctr) for y, r, cr, ctr in pr.get_team_power_history(get_conn(), tid)}
         self._team_copy_continent = team_continent
+        self._team_copy_country = team_country
         self._team_copy_rank_by_year = rank_by_year
 
         tbl.setRowCount(len(years))
@@ -2162,7 +2179,7 @@ class WorldBrowserWindow(QDialog):
             tbl.setItem(i, 0, year_item)
 
             # [2026-08 신설, 신민용 요청] 연도-리그 사이 순위 칸 — 전체
-            # 순위(위)와 대륙 순위(아래) 2줄. get_team_power_history의
+            # 순위/대륙 순위/국가 순위 3줄. get_team_power_history의
             # ranking_year는 "그 시즌 성적이 발표된 연도(evaluation_year+1)"
             # 라서 이 표의 연도(entry["year"]=실제 뛴 시즌)와 다르다 —
             # 발표 시점 기준으로 보이는 게 자연스러우므로 evaluation_year+1로
@@ -2170,7 +2187,9 @@ class WorldBrowserWindow(QDialog):
             rp = rank_by_year.get(entry["year"] + 1)
             if rp:
                 rank_main = f"전체 순위: {rp[0]}"
-                rank_record = f"{team_continent} 순위: {rp[1]}" if team_continent else f"대륙 순위: {rp[1]}"
+                continent_label = f"{team_continent} 순위: {rp[1]}" if team_continent else f"대륙 순위: {rp[1]}"
+                country_label = f"{team_country} 순위: {rp[2]}" if team_country else f"국가 순위: {rp[2]}"
+                rank_record = f"{continent_label}\n{country_label}"
             else:
                 rank_main, rank_record = "-", None
             tbl.setCellWidget(i, 1, self._two_line_cell(rank_main, "#88ddaa", rank_record))
@@ -2256,7 +2275,8 @@ class WorldBrowserWindow(QDialog):
             return
         rank_by_year = getattr(self, "_team_copy_rank_by_year", {})
         continent = getattr(self, "_team_copy_continent", "")
-        text = self._format_team_history_text(tname, hist, rank_by_year, continent)
+        country = getattr(self, "_team_copy_country", "")
+        text = self._format_team_history_text(tname, hist, rank_by_year, continent, country)
         QGuiApplication.clipboard().setText(text)
 
         # 눌렀을 때 복사됐다는 걸 눈으로 확인할 수 있게 버튼 라벨을
@@ -2267,7 +2287,7 @@ class WorldBrowserWindow(QDialog):
         self.team_copy_btn.setText("✅ 복사됨")
         QTimer.singleShot(1200, lambda: self.team_copy_btn.setText("📋 기록 복사"))
 
-    def _format_team_history_text(self, tname, hist, rank_by_year=None, continent=""):
+    def _format_team_history_text(self, tname, hist, rank_by_year=None, continent="", country=""):
         """hist(get_team_history 반환값)를 사람이 읽어도, LLM에 그대로
         붙여넣어도 되는 평문으로 직렬화한다. 화면 표와 같은 정보(연도별
         순위/리그/국내컵/클럽대항전/클럽월드컵 결과 + 각자 전적, 맨 위 통산
@@ -2278,6 +2298,9 @@ class WorldBrowserWindow(QDialog):
         표(team_detail_tbl)에 이미 있는 전체/대륙 순위 컬럼을 복사 텍스트
         에도 똑같이 넣는다 — rank_by_year는 {evaluation_year+1: (전체순위,
         대륙순위)} 형태(_show_team_detail에서 이미 계산해둔 것 재사용).
+        [2026-08 확장, 신민용 요청: "전체 순위/대륙 순위에 국가 순위도
+        추가해달라"] rank_by_year 튜플이 (전체,대륙,국가) 3개로 늘어나서
+        복사 텍스트에도 국가 순위를 같이 넣는다.
         """
         rank_by_year = rank_by_year or {}
         awards, years = hist["awards"], hist["years"]
@@ -2309,7 +2332,8 @@ class WorldBrowserWindow(QDialog):
                 rp = rank_by_year.get(entry["year"] + 1)
                 if rp:
                     cont_label = f"{continent} " if continent else ""
-                    parts.append(f"순위: 전체 {rp[0]}위 / {cont_label}대륙 {rp[1]}위")
+                    country_label = f"{country} " if country else ""
+                    parts.append(f"순위: 전체 {rp[0]}위 / {cont_label}대륙 {rp[1]}위 / {country_label}국가 {rp[2]}위")
                 if entry.get("league"):
                     rec = f" ({entry['league_record']})" if entry.get("league_record") else ""
                     parts.append(f"리그: {entry['league']}{rec}")
@@ -2328,6 +2352,1357 @@ class WorldBrowserWindow(QDialog):
                 lines.append(" | ".join(parts))
 
         return "\n".join(lines)
+
+    # ─────────────────────────────────────────
+    # 탭: 선수 검색 (2026-08 신설) — "파워랭킹" 탭 옆에 위치. 팀 검색 탭
+    # (_build_team_tab)과 완전히 같은 UX(대륙/국가/등급/부수 필터 + 검색창
+    # + 좌측 목록/우측 상세). 현재는 우측에 "지금 소속팀 + 그 팀의 최신
+    # 파워랭킹(전체/대륙)"만 보여준다 — 골/도움/경기수 같은 시즌별 커리어
+    # 스탯은 세계 축구 기록실 설계 논의에서 확인된 것처럼 시즌 아카이브
+    # 테이블이 먼저 있어야 하므로 지금은 대상 밖(차후 확장 예정). 은퇴
+    # 선수는 은퇴 시 ai_players 행 자체가 삭제되는 기존 설계상 자동으로
+    # 검색 대상에서 빠진다(현재 데이터가 있는 현역 선수만).
+    # ─────────────────────────────────────────
+    def _build_player_search_tab(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 8, 0, 0)
+
+        info = QLabel("ℹ️ 선수 하나를 골라 소속팀 기록과 국가대표 기록을 확인하세요. "
+                      "(현재 데이터가 있는 현역 선수만 — 은퇴 선수는 제외됩니다. "
+                      "포메이션 화면과 동일하게 식별코드로 표시됩니다)")
+        info.setStyleSheet("color:#888;font-size:11px;")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+
+        # [2026-08 신설] 필터 전용 디바운스 — 아래 모든 필터 위젯(콤보/
+        # 스핀박스/검색창)이 공유한다. 예전엔 콤보 선택이 바뀔 때마다
+        # _refresh_player_list를 즉시 호출했는데, 실제 게임 DB(선수
+        # 수만~수십만 명) 기준으로 목록 재구성(delegate 300행 렌더링+
+        # _ensure_list_fits 스플리터 재계산)이 매번 값싸지 않아 필터를
+        # 연달아 건드리면(콤보 드롭다운 스크롤, 나이 스핀박스 화살표
+        # 연타 등) 그때마다 쌓여 버벅였다 — 검색창과 동일한 250ms
+        # 디바운스로 통일해, 짧은 시간 안의 연속 조작은 마지막 것만
+        # 실제로 반영되게 한다.
+        self._player_filter_debounce = QTimer(self)
+        self._player_filter_debounce.setSingleShot(True)
+        self._player_filter_debounce.setInterval(250)
+        self._player_filter_debounce.timeout.connect(self._refresh_player_list)
+
+        def _debounced_refresh(*_a):
+            self._player_filter_debounce.start()
+
+        filt = QHBoxLayout()
+        filt.setSpacing(8)
+        # [2026-08 수정, 신민용 요청: "국가와 국적을 나눠야 한다, 대륙은
+        # 국적과 연관되어 있게"] 대륙/국적은 선수의 실제 국적 기준(용병도
+        # 정확히 찾을 수 있게), 국가는 기존처럼 '현재 뛰는 리그의 나라'
+        # 기준(팀 검색 탭과 동일 UX) — 서로 독립적이라 대륙을 바꿔도
+        # "국가" 목록은 그대로 전체 유지된다.
+        # [2026-08 신설, 신민용 요청: "필터 길이를 늘린 김에 직접 입력하는
+        # 칸들도 만들어도 될듯"] 211개국 드롭다운을 매번 스크롤하는 대신
+        # 타이핑으로 좁힐 수 있게 setEditable(True)+QCompleter(부분일치)를
+        # 붙인다 — 값은 여전히 목록에 있는 실제 항목으로만 확정되므로
+        # (완전 자유 텍스트 필터가 아니라 "타이핑 가능한 드롭다운"),
+        # id 역매칭 로직(_selected_player_*_id)은 그대로 재사용 가능하다.
+        # [2026-08 신설, 신민용 요청: "위에 대륙/전체 이런게 띄어져 있으니
+        # UI적으로 불편하니 옆으로 붙이고"] setEditable(True)로 바뀐(직접
+        # 입력 가능) 콤보들은 기본 크기정책이 가로로 늘어나는 쪽이라,
+        # 창이 넓어질수록 라벨-콤보 사이 간격이 벌어져 보였다 — 최대
+        # 폭을 고정해 늘어나지 않게 하고, 아래 filt 끝에 addStretch를
+        # 둬서 남는 공간은 오른쪽 끝으로만 몰리게 한다.
+        _COMBO_MAX_W = 150
+        lbl1 = QLabel("대륙(국적)"); lbl1.setStyleSheet("color:#888;font-size:11px;")
+        self.player_nat_cont_combo = QComboBox()
+        self.player_nat_cont_combo.setMaximumWidth(_COMBO_MAX_W)
+        self.player_nat_cont_combo.addItem(_ALL)
+        for cont in wb.list_continents():
+            self.player_nat_cont_combo.addItem(cont)
+        self._make_combo_typable(self.player_nat_cont_combo)
+        self.player_nat_cont_combo.currentTextChanged.connect(self._on_player_nat_continent_changed)
+        filt.addWidget(lbl1)
+        filt.addWidget(self.player_nat_cont_combo)
+
+        lbl2 = QLabel("국적"); lbl2.setStyleSheet("color:#888;font-size:11px;")
+        self.player_nat_combo = QComboBox()
+        self.player_nat_combo.setMaximumWidth(_COMBO_MAX_W)
+        self.player_nat_combo.addItem(_ALL)
+        self._make_combo_typable(self.player_nat_combo)
+        self.player_nat_combo.currentTextChanged.connect(_debounced_refresh)
+        filt.addWidget(lbl2)
+        filt.addWidget(self.player_nat_combo)
+
+        lbl2b = QLabel("국가(소속리그)"); lbl2b.setStyleSheet("color:#888;font-size:11px;")
+        self.player_country_combo = QComboBox()
+        self.player_country_combo.setMaximumWidth(_COMBO_MAX_W)
+        self.player_country_combo.addItem(_ALL)
+        # [2026-08 수정, 신민용 리포트: "🇰🇷 대한민국처럼 국기 이모지가
+        # 앞에 KR 같은 글자로 깨져 보인다 — 없애서 대한민국 이렇게만
+        # 뜨게 해달라"] Windows 등 일부 환경에서 국기 이모지(유니코드
+        # regional indicator 두 글자 조합)가 실제 국기 아이콘 대신 알파벳
+        # 두 글자 그대로 렌더링돼서, 국가명 앞에 "KR " 같은 게 붙어 보이는
+        # 문제였다 — 이 필터 콤보들은 국기 프리픽스 없이 국가명만 쓴다.
+        for c in wb.list_countries():
+            self.player_country_combo.addItem(c["name"])
+        self._make_combo_typable(self.player_country_combo)
+        self.player_country_combo.currentTextChanged.connect(self._on_player_club_country_changed)
+        filt.addWidget(lbl2b)
+        filt.addWidget(self.player_country_combo)
+
+        # [2026-08 신설, 신민용 요청: "국가(소속리그) → 리그 → 팀 3단계
+        # 필터... 리그 선택(많아봤자 7개니 직접 입력 없음, 기본 전체)...
+        # 선택하면 그 년도 당시 그 리그에 있는 팀들이 필터로 뜸"]
+        # 리그 콤보는 country_combo가 바뀔 때마다(_on_player_club_country_
+        # changed) list_leagues_for_country()로 다시 채워지고, 팀 콤보는
+        # 리그 콤보가 바뀔 때마다(_on_player_league_changed) list_teams_
+        # in_league()로 다시 채워진다 — 국가/리그 미선택 상태에선 둘 다
+        # "전체" 하나만 있고 비활성화.
+        # [2026-08 신설] 아래 natteam/상태 버튼 쪽에서도 같은 스타일을
+        # 쓰므로 여기서 먼저 정의해 "경력 포함" 토글에 재사용한다(뒤에서
+        # 같은 이름으로 다시 정의해도 무해 — 완전히 같은 문자열).
+        _STATUS_BTN_STYLE = (
+            "QPushButton{background:#2a2a2a;color:#888;border:1px solid #3a3a3a;"
+            "border-radius:4px;padding:4px 10px;font-size:11px;}"
+            "QPushButton:checked{background:#0d3d1a;color:#00cc44;border-color:#00cc44;}")
+        lbl_league = QLabel("리그"); lbl_league.setStyleSheet("color:#888;font-size:11px;")
+        self.player_league_combo = QComboBox()
+        self.player_league_combo.setMaximumWidth(_COMBO_MAX_W)
+        self.player_league_combo.addItem(_ALL)
+        self.player_league_combo.setEnabled(False)
+        self.player_league_combo.currentTextChanged.connect(self._on_player_league_changed)
+        filt.addWidget(lbl_league)
+        filt.addWidget(self.player_league_combo)
+
+        lbl_team = QLabel("팀"); lbl_team.setStyleSheet("color:#888;font-size:11px;")
+        self.player_team_combo = QComboBox()
+        self.player_team_combo.setMaximumWidth(_COMBO_MAX_W)
+        self.player_team_combo.addItem(_ALL)
+        self.player_team_combo.setEnabled(False)
+        self.player_team_combo.currentTextChanged.connect(_debounced_refresh)
+        filt.addWidget(lbl_team)
+        filt.addWidget(self.player_team_combo)
+
+        # [2026-08 신설, 신민용 요청: "팀 기준: 현재 소속 / 경력 포함...
+        # 기본값은 현재 소속으로 하고, 사용자가 경력 포함을 켜면 현역도
+        # 과거 팀 경험까지 검색"]
+        # [2026-08 수정, 신민용 요청: "은퇴 검색도 이 토글을 따르게 —
+        # 꺼져 있으면 마지막 소속팀(은퇴 직전 팀) 기준으로, 켜면 경력에
+        # 그 팀이 있으면 다 뜨게"] 예전엔 은퇴 상태에선 이 토글과 무관
+        # 하게 백엔드가 항상 "경력(뛴 적 있으면)"으로 고정 검색했는데,
+        # 이제 현역/은퇴 모두 이 버튼 하나로 통일해서 따른다.
+        self.player_team_career_btn = QPushButton("팀 기준: 경력 포함")
+        self.player_team_career_btn.setCheckable(True)
+        self.player_team_career_btn.setChecked(False)
+        self.player_team_career_btn.setAutoDefault(False)
+        self.player_team_career_btn.setStyleSheet(_STATUS_BTN_STYLE)
+        self.player_team_career_btn.setToolTip(
+            "꺼짐(기본): 현역은 '현재 소속', 은퇴는 '마지막 소속팀(은퇴 직전 팀)'만 검색.\n"
+            "켜짐: 과거에 그 팀(국가(소속리그)/리그로 좁혔다면 그 범위의 팀들)에서\n"
+            "뛴 적이 있으면 포함 — 현역/은퇴 모두 동일하게 적용.")
+        self.player_team_career_btn.toggled.connect(_debounced_refresh)
+        filt.addWidget(self.player_team_career_btn)
+
+        # [2026-08 신설, 신민용 요청: "국가(소속리그)랑 상태(현역/은퇴)
+        # 사이에 국가대표 유무 표시를 넣어달라, 기본은 꺼짐(전부 보임),
+        # 켜면 기본은 '전체'(어느 연도든 한 번이라도 뽑힌 적), 연도를
+        # 입력하면 그 연도에 뽑혔던 선수만"] 체크 가능한 버튼 하나 +
+        # 그 옆에 연도 입력칸(버튼이 꺼져 있으면 비활성화, 켜지면 활성화
+        # 되고 비워두면 '전체'로 동작). _STATUS_BTN_STYLE(바로 아래
+        # 정의됨)과 톤을 맞추기 위해 버튼 스타일을 먼저 만들어 공유한다.
+        _STATUS_BTN_STYLE = (
+            "QPushButton{background:#2a2a2a;color:#888;border:1px solid #3a3a3a;"
+            "border-radius:4px;padding:4px 10px;font-size:11px;}"
+            "QPushButton:checked{background:#0d3d1a;color:#00cc44;border-color:#00cc44;}")
+        self.player_natteam_btn = QPushButton("🌍 국가대표")
+        self.player_natteam_btn.setCheckable(True)
+        self.player_natteam_btn.setChecked(False)
+        self.player_natteam_btn.setAutoDefault(False)
+        self.player_natteam_btn.setStyleSheet(_STATUS_BTN_STYLE)
+        filt.addWidget(self.player_natteam_btn)
+
+        self.player_natteam_year_edit = QLineEdit()
+        self.player_natteam_year_edit.setPlaceholderText("전체")
+        self.player_natteam_year_edit.setMaximumWidth(56)
+        self.player_natteam_year_edit.setValidator(QIntValidator(1900, 2200, self))
+        self.player_natteam_year_edit.setEnabled(False)
+        self.player_natteam_year_edit.setToolTip(
+            "비워두면 어느 연도든 국가대표로 한 번이라도 뽑힌 선수 전체.\n"
+            "연도를 입력하면(예: 2002) 그 해에 국가대표였던 선수만.")
+
+        def _on_natteam_toggled(checked):
+            self.player_natteam_year_edit.setEnabled(checked)
+            # [2026-08 신설, 신민용 요청: "국가대표 버튼을 비활성화하면
+            # 입력한 연도가 사라지고 전체로 바뀌게 해달라"] 꺼질 때
+            # 입력칸 값을 같이 지운다 — 안 지우면 다음에 다시 켰을 때
+            # 예전 연도가 그대로 남아 있어 "전체"가 아니라 그 연도로
+            # 바로 좁혀진 채 시작돼 버린다. textChanged가 _debounced_
+            # refresh에도 연결돼 있어 clear() 한 번으로 아래 refresh와
+            # 별개로 한 번 더 트리거되지만 디바운스라 실질 비용 없음.
+            if not checked:
+                self.player_natteam_year_edit.clear()
+            _debounced_refresh()
+        self.player_natteam_btn.toggled.connect(_on_natteam_toggled)
+        self.player_natteam_year_edit.textChanged.connect(_debounced_refresh)
+        filt.addWidget(self.player_natteam_year_edit)
+
+        # [2026-08 신설, 신민용 요청: "필터에 현역이랑 은퇴 버튼을 만들고
+        # 은퇴를 누르면 은퇴한 선수들만... 현역을 누르면 현역만... 기본
+        # 상태는 현역"] 체크 가능한 버튼 2개를 QButtonGroup으로 묶어
+        # 라디오처럼 배타적으로 동작시킨다.
+        status_lbl = QLabel("상태"); status_lbl.setStyleSheet("color:#888;font-size:11px;")
+        filt.addWidget(status_lbl)
+        self.player_status_group = QButtonGroup(self)
+        self.player_status_group.setExclusive(True)
+        _STATUS_BTN_STYLE = (
+            "QPushButton{background:#2a2a2a;color:#888;border:1px solid #3a3a3a;"
+            "border-radius:4px;padding:4px 10px;font-size:11px;}"
+            "QPushButton:checked{background:#0d3d1a;color:#00cc44;border-color:#00cc44;}")
+        self.player_status_active_btn = QPushButton("현역")
+        self.player_status_active_btn.setCheckable(True)
+        self.player_status_active_btn.setChecked(True)
+        self.player_status_active_btn.setAutoDefault(False)
+        self.player_status_active_btn.setStyleSheet(_STATUS_BTN_STYLE)
+        self.player_status_retired_btn = QPushButton("은퇴")
+        self.player_status_retired_btn.setCheckable(True)
+        self.player_status_retired_btn.setAutoDefault(False)
+        self.player_status_retired_btn.setStyleSheet(_STATUS_BTN_STYLE)
+        self.player_status_group.addButton(self.player_status_active_btn)
+        self.player_status_group.addButton(self.player_status_retired_btn)
+        self.player_status_active_btn.toggled.connect(_debounced_refresh)
+        self.player_status_retired_btn.toggled.connect(_debounced_refresh)
+        filt.addWidget(self.player_status_active_btn)
+        filt.addWidget(self.player_status_retired_btn)
+        filt.addStretch(1)
+        lay.addLayout(filt)
+
+        filt2 = QHBoxLayout()
+        filt2.setSpacing(8)
+        lbl3 = QLabel("등급"); lbl3.setStyleSheet("color:#888;font-size:11px;")
+        self.player_grade_combo = QComboBox()
+        self.player_grade_combo.addItem(_ALL)
+        for g in wb.list_grades():
+            self.player_grade_combo.addItem(g)
+        self.player_grade_combo.currentTextChanged.connect(_debounced_refresh)
+        filt2.addWidget(lbl3)
+        filt2.addWidget(self.player_grade_combo)
+
+        # [2026-08 제거, 신민용 리포트: "국가(소속리그)→리그 3단계 필터가
+        # 생기면서 리그 콤보 자체가 이미 부수를 확정한다(레이블에 '(1부)'
+        # 식으로 같이 뜬다) — 그런데 부수 콤보가 그대로 남아있어서, 리그를
+        # 고른 뒤 부수가 그 리그의 실제 부수와 다르면(예: 이전 선택이
+        # 남아있거나 실수로 다르게 골랐을 때) l.id=?와 l.tier=?가 동시에
+        # AND로 걸려 결과가 0건으로 사라지는 충돌이 났다. 리그 선택이
+        # 부수를 이미 포함하므로 별도 부수 필터는 중복이라 아예 제거."]
+        # [2026-08 신설, 신민용 요청: "필터에 포지션 필터도 넣어야 한다"]
+        # database.TEAM_POSITIONS(선수 생성 시 실제로 쓰이는 포지션 표기)를
+        # 그대로 재사용 — 순서 유지 중복제거만 해서 GK부터 ST까지 나열한다.
+        lbl5 = QLabel("포지션"); lbl5.setStyleSheet("color:#888;font-size:11px;")
+        self.player_pos_combo = QComboBox()
+        self.player_pos_combo.addItem(_ALL)
+        for pos in dict.fromkeys(TEAM_POSITIONS):
+            self.player_pos_combo.addItem(pos)
+        self.player_pos_combo.currentTextChanged.connect(_debounced_refresh)
+        filt2.addWidget(lbl5)
+        filt2.addWidget(self.player_pos_combo)
+
+        # [2026-08 신설, 신민용 요청: "나이도 필터에 포함하고 싶다"] 최소~
+        # 최대 스핀박스 2개 — 기본값(0/60)은 사실상 "전체"를 뜻하고, 사용자가
+        # 기본값에서 벗어나야만 실제 필터로 적용된다(_refresh_player_list
+        # 참고). 축구 선수 실제 연령대(10대 후반~40대)를 넉넉히 덮는 범위.
+        # [2026-08 수정, 신민용 요청: "기본 세팅을 0~99로 해야 클릭해서
+        # 바로 숫자 변경이 가능하다"] "전체"라는 플레이스홀더 텍스트가
+        # 앞에 붙어있으면 그것부터 지우고 숫자를 입력해야 했다 — 이제
+        # 범위를 0~99로 넓히고 처음부터 실제 숫자(0, 99)가 그대로 보이게
+        # 해서 클릭 즉시 숫자만 바꾸면 된다. setSpecialValueText 제거.
+        lbl6 = QLabel("나이"); lbl6.setStyleSheet("color:#888;font-size:11px;")
+        self.player_age_min_spin = QSpinBox()
+        self.player_age_min_spin.setRange(0, 99)
+        self.player_age_min_spin.setValue(0)
+        self.player_age_min_spin.valueChanged.connect(_debounced_refresh)
+        age_sep = QLabel("~"); age_sep.setStyleSheet("color:#888;")
+        self.player_age_max_spin = QSpinBox()
+        self.player_age_max_spin.setRange(0, 99)
+        self.player_age_max_spin.setValue(99)
+        self.player_age_max_spin.valueChanged.connect(_debounced_refresh)
+        filt2.addWidget(lbl6)
+        filt2.addWidget(self.player_age_min_spin)
+        filt2.addWidget(age_sep)
+        filt2.addWidget(self.player_age_max_spin)
+
+        self.player_search_box = QLineEdit()
+        self.player_search_box.setPlaceholderText("🔎 식별코드(AI0001) · 국적 · 팀명 검색")
+        self.player_search_box.textChanged.connect(_debounced_refresh)
+        filt2.addWidget(self.player_search_box, 1)
+
+        # [2026-08 신설, 신민용 요청: "우측 끝에 필터 초기화 버튼 — 누르면
+        # 필터 전체가 초기화"] 최근 검색 초기화 버튼(_build_recent_search_row)
+        # 과 동일한 톤으로 통일.
+        self.player_filter_reset_btn = QPushButton("🔄 필터 초기화")
+        self.player_filter_reset_btn.setAutoDefault(False)
+        self.player_filter_reset_btn.setDefault(False)
+        self.player_filter_reset_btn.setStyleSheet(
+            "QPushButton{background:#2a2a2a;color:#888;border:1px solid #3a3a3a;"
+            "border-radius:4px;padding:4px 10px;font-size:11px;}"
+            "QPushButton:hover{color:#cc4444;border-color:#cc4444;}")
+        self.player_filter_reset_btn.clicked.connect(self._on_player_filter_reset)
+        filt2.addWidget(self.player_filter_reset_btn)
+        lay.addLayout(filt2)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+        self._player_split = split
+        self.player_list = QListWidget()
+        self.player_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.player_list.itemClicked.connect(self._on_player_selected)
+        self.player_list.setItemDelegate(_GridRowDelegate(self, self.player_list))
+        player_header = self._list_header_row([
+            ("식별코드", self._NAME_COL_W, False),
+            ("포지션", self._POS_COL_W, True),
+            ("국적", self._NAT_COL_W, False),
+            ("OVR", self._OVR_COL_W, True),
+            ("등급", self._GRADE_COL_W, True),
+            ("소속팀 · 리그(부수)", self._LEAGUE_COL_W, False),
+        ])
+        split.addWidget(self._wrap_list_with_header(self.player_list, player_header))
+
+        # ── 우측 상세: 팀 검색 탭의 "연도별 기록" 박스와 같은 톤으로,
+        # (1) 지금 소속팀의 대회별 기록 박스 (2) 국적 국가대표팀의 국제대회
+        # 기록 박스 두 개를 세로로 쌓는다. 둘 다 내용에 맞춰 스스로 높이를
+        # 잡고(내부 스크롤바 없음), 전체를 QScrollArea 하나로 감싸 필요할
+        # 때만 바깥쪽이 스크롤된다.
+        right = QWidget()
+        right_lay = QVBoxLayout(right)
+        right_lay.setContentsMargins(10, 0, 0, 0)
+
+        self._player_recent_row = self._build_recent_search_row(
+            "player", self.player_search_box, self.player_list,
+            lambda it: it.data(Qt.ItemDataRole.UserRole + 1),
+            self._on_player_selected,
+            refresh_fn=self._refresh_player_list, debounce_timer=self._player_filter_debounce)
+        right_lay.addWidget(self._player_recent_row)
+
+        # [2026-08 재수정, 신민용 요청: "왜 아직도 태그형으로 표시하는거?
+        # 아래 연도별 기록처럼 그리드/테이블 형태로, 챔스 표시가 그렇게
+        # 되어있잖아"] 개별 상자(_sized_copyable_field)를 가로로 늘어놓은
+        # "태그형" 대신, 이 탭의 다른 표들(소속팀 대회 기록 등)과 완전히
+        # 같은 QTableWidget 1행짜리 그리드로 바꾼다 — 이 파일 최상단의
+        # _enable_plain_copy(tbl)를 그대로 재사용해 셀 선택 후 Ctrl+C나
+        # 우클릭 "복사"로 복사되게 한다(챔스/리그/컵 등 "역대 기록" 표들과
+        # 동일한 복사 방식).
+        self.player_detail_placeholder = QLabel("← 왼쪽에서 선수를 선택하세요")
+        self.player_detail_placeholder.setStyleSheet("color:#888;font-size:13px;")
+        right_lay.addWidget(self.player_detail_placeholder)
+
+        # [2026-08 재수정, 신민용 리포트: "클릭이 안 되고, 글자 길이에
+        # 따라 상자 크기가 달라야 하는데 다 똑같다"] _make_self_sizing_table
+        # 는 읽기전용 기록표용으로 설계돼 setSelectionMode(NoSelection)이
+        # 박혀있어서(아래 소속팀 대회 기록 표처럼 클릭으로 선택할 일이
+        # 없는 표들 전용) 셀을 아예 선택할 수가 없었다 — 그래서 복사도
+        # 안 됐던 것. standing_tbl 등 실제로 선택·복사가 되는 "역대 기록"
+        # 표들과 동일하게 plain QTableWidget으로 새로 만들고, 컬럼폭도
+        # Stretch(균등분배) 대신 ResizeToContents(내용 길이만큼)로 바꾼다.
+        self.player_detail_tbl = QTableWidget(0, 7)
+        self.player_detail_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.player_detail_tbl.verticalHeader().setVisible(False)
+        self.player_detail_tbl.setShowGrid(True)
+        # [2026-08 버그수정, 신민용 리포트: "이름 헤더를 파란색으로
+        # 표시해달라 했는데 안 된다"] 이 창 전체에 걸린 전역 스타일시트
+        # (이 파일 상단, "QHeaderView::section { ... color:#888; ... }")가
+        # 모든 표의 모든 헤더 칸 색을 강제로 회색 고정해서, 아래
+        # setHorizontalHeaderItem에 준 개별 칸 foreground 색(파란색)이
+        # 안 먹혔던 게 원인 — Qt 스타일시트는 QSS 규칙이 아이템 단위
+        # foreground 데이터보다 항상 우선한다. 이 표 자신의 스타일시트에
+        # "::section:first"(0번째 칸 전용 의사 상태, Qt가 지원)로 배경/
+        # 패딩은 전역과 동일하게 맞추고 색만 덮어써서 "이름" 칸 하나만
+        # 파란색으로 뜨게 한다.
+        self.player_detail_tbl.setStyleSheet(
+            "QTableWidget{gridline-color:#000; border:none;}"
+            "QHeaderView::section{background:#252525;color:#888;border:none;padding:5px;}"
+            "QHeaderView::section:first{color:#4da6ff;font-weight:bold;}")
+        self.player_detail_tbl.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.player_detail_tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.player_detail_tbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        # [2026-08 신설, 신민용 요청: "AICD8C 같은 식별코드로 뜨는 선수
+        # 이름을 내가 직접 지을 수 있게, '이름' 헤더를 클릭하면 이름
+        # 변경 창이 뜨고 그 헤더는 파란색으로 표시해달라"] setHorizontalHeaderLabels
+        # 대신 QTableWidgetItem을 직접 넣어야 "이름" 칸에 클릭 툴팁을
+        # 붙일 수 있다(색 자체는 위 ::section:first QSS가 담당 — 아이템
+        # foreground는 QSS에 가려 무시되므로 굳이 다시 안 건다).
+        _detail_headers = ["이름", "국적", "나이", "포지션", "OVR", "소속팀", "소속팀 국가"]
+        for _col, _label in enumerate(_detail_headers):
+            _hitem = QTableWidgetItem(_label)
+            if _col == 0:
+                _hitem.setToolTip("클릭하면 이 선수의 이름을 직접 지을 수 있습니다")
+            self.player_detail_tbl.setHorizontalHeaderItem(_col, _hitem)
+        self.player_detail_tbl.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents)
+        self.player_detail_tbl.horizontalHeader().setCursor(Qt.CursorShape.PointingHandCursor)
+        self.player_detail_tbl.horizontalHeader().sectionClicked.connect(
+            self._on_player_detail_header_clicked)
+        _enable_plain_copy(self.player_detail_tbl)
+        self.player_detail_tbl.hide()
+        right_lay.addWidget(self.player_detail_tbl)
+
+        # [2026-08 신설, 신민용 요청: "은퇴했으면... 그 아래에 표시를
+        # 해서 몇 년도에 은퇴했는지 표시하는거야"] 아래 "소속팀 대회
+        # 기록" 표는 은퇴 후에도 마지막 소속팀 기준 실제 연도별 기록을
+        # 그대로 보여주므로(별도 삭제 안 함), 이 라벨은 그 표 바로
+        # 아래에서 "이 선수는 은퇴했다"는 사실 자체만 짧게 보강해준다.
+        self.player_retirement_note = QLabel("")
+        self.player_retirement_note.setStyleSheet(
+            "color:#ff8844;font-size:12px;font-weight:bold;")
+        self.player_retirement_note.hide()
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_body = QWidget()
+        scroll_lay = QVBoxLayout(scroll_body)
+        scroll_lay.setContentsMargins(0, 6, 0, 0)
+        scroll_lay.setSpacing(14)
+
+        # 박스1: 소속팀 대회별 기록 (팀 검색 탭과 완전히 같은 렌더링 재사용)
+        team_box_title = QLabel("🏟 소속팀 대회 기록")
+        team_box_title.setStyleSheet("color:#eee;font-size:13px;font-weight:bold;")
+        scroll_lay.addWidget(team_box_title)
+        self.player_team_award_tbl = self._make_self_sizing_table(8, no_scroll=True)
+        self.player_team_award_tbl.horizontalHeader().setVisible(False)
+        # [2026-08 버그수정, 신민용 리포트: "수상 상자가 소속팀/OVR 표시를
+        # 인식 못 해서 아래 표와 폭이 안 맞고 잘려 보인다"] 아래
+        # player_team_tbl은 2번 컬럼(OVR)만 별도로 Fixed 폭(_OVR_COL_W)을
+        # 주는데(바로 아래), 이 award_tbl은 _make_self_sizing_table 기본값
+        # 그대로(1~7번 전부 Stretch)라 2번 칸이 아래 표보다 넓게 계산돼
+        # 버렸다 — 그 차이만큼 나머지 Stretch 칸들(소속팀·리그·국내컵 등)
+        # 폭이 밀려 두 표 경계선이 어긋나 보였던 것. team_detail_tbl/
+        # team_award_tbl 쌍과 동일한 원칙(두 표는 항상 같은 리사이즈 모드를
+        # 써야 어긋나지 않는다)에 따라 이 표에도 똑같이 2번 컬럼을
+        # Fixed+동일폭으로 맞춘다.
+        self.player_team_award_tbl.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Fixed)
+        self.player_team_award_tbl.setColumnWidth(2, self._OVR_COL_W)
+        scroll_lay.addWidget(self.player_team_award_tbl)
+        self.player_team_tbl = self._make_self_sizing_table(8, no_scroll=True)
+        self.player_team_tbl.setHorizontalHeaderLabels(
+            ["연도", "소속팀", "OVR", "리그", "국내컵", "클럽 대항전", "슈퍼컵", "클럽 월드컵"])
+        # [2026-08 신설, 신민용 요청: "소속팀과 리그 사이에 어차피 최대
+        # 100의 자리니 작은 상자칸 하나 넣고 OVR 표시"] 다른 칸은 폭을
+        # 늘려 채우는(Stretch) 칸인데 이 칸만 숫자 3자리면 충분해서 고정폭.
+        self.player_team_tbl.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Fixed)
+        self.player_team_tbl.setColumnWidth(2, self._OVR_COL_W)
+        # [2026-08 버그수정] 창 크기 변화 등으로 Stretch 폭이 다시 계산될
+        # 때 두 표가 계속 같은 값으로 맞춰지도록, team_detail_tbl/
+        # team_award_tbl 쌍과 동일하게 sectionResized를 따라가게 연결
+        # (중복 안전장치 — 이미 같은 리사이즈 모드라 보통은 저절로
+        # 일치하지만, 최초 렌더 타이밍 차이에 대비).
+        self.player_team_tbl.horizontalHeader().sectionResized.connect(
+            lambda idx, _old, new: self.player_team_award_tbl.setColumnWidth(idx, new))
+        scroll_lay.addWidget(self.player_team_tbl)
+        scroll_lay.addWidget(self.player_retirement_note)
+
+        # 박스2: 국가대표 출전 기록.
+        # [2026-08 재도입, 신민용 요청: "'예선전 탈락' 같은 개인 기록도
+        # 표시해줘"] 예전엔 이 자리에 있던 박스를 뺐었다(2026-08 제거,
+        # 신민용 리포트: "나간 애들만 떠야 하는데 안 나간 애들도 자기
+        # 나라 기록이 다 뜬다") — 그때는 AI 선수가 실제로 어느 국제대회
+        # 출전 명단에 뽑혔는지를 어디에도 저장하지 않아서, "이 선수의
+        # 국적 국가" 전체 기록을 선수 개인 기록인 것처럼 보여줄 수밖에
+        # 없었다(선수 개인 출전 여부와 무관해 오해를 줌). 그 사이 대회
+        # 내내 고정되는 26인 명단 테이블(intl_squad)이 새로 생기면서
+        # "이 선수가 실제로 이 대회 명단에 뽑혔었는가"가 정확히 기록되기
+        # 시작했다 — wb.get_player_intl_records가 그 명단 기록만 걸러서
+        # 돌려주므로 이제 다시 정확하게 보여줄 수 있다.
+        intl_box_title = QLabel("🌍 국가대표 출전 기록")
+        intl_box_title.setStyleSheet("color:#eee;font-size:13px;font-weight:bold;")
+        scroll_lay.addWidget(intl_box_title)
+        self.player_intl_tbl = self._make_self_sizing_table(5, no_scroll=True)
+        self.player_intl_tbl.setHorizontalHeaderLabels(
+            ["연도", "대회", "국가", "출전", "결과"])
+        self.player_intl_tbl.horizontalHeader().setSectionResizeMode(
+            3, QHeaderView.ResizeMode.Fixed)
+        self.player_intl_tbl.setColumnWidth(3, self._OVR_COL_W)
+        scroll_lay.addWidget(self.player_intl_tbl)
+
+        # [2026-08 신설] intl_squad는 2026-08부터 생긴 테이블이라 그 전에
+        # 이미 끝났거나 그 시점에 진행 중이던 대회는 이 선수가 그때
+        # 명단에 뽑혔었는지 자체가 기록에 없다 — 정확도의 한계를 짧게
+        # 안내(위 박스가 비어 보이거나 최근 대회만 있어도 버그가 아님).
+        future_note = QLabel("ℹ️ 위 출전 기록은 (2026-08 기준) 대회 내내 고정되는 명단이 "
+                             "도입된 이후 실제로 명단에 뽑혔던 대회만 표시됩니다 — "
+                             "그 이전에 이미 끝났거나 진행 중이던 대회는 기록이 없을 수 있습니다.")
+        future_note.setStyleSheet("color:#666;font-size:11px;")
+        future_note.setWordWrap(True)
+        scroll_lay.addWidget(future_note)
+        scroll_lay.addStretch(1)
+
+        scroll.setWidget(scroll_body)
+        right_lay.addWidget(scroll, 1)
+
+        split.addWidget(right)
+        split.setSizes([440, 900])
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        lay.addWidget(split, 1)
+
+        self._refresh_player_nat_combo()
+        self._refresh_player_list()
+        return w
+
+    def _make_self_sizing_table(self, n_cols, no_scroll=False):
+        """[2026-08 신설] "선수 검색" 우측 두 박스(소속팀 기록/국가대표
+        기록)용 — team_detail_tbl과 같은 톤(어두운 배경, 격자선)이지만
+        스플리터 안에서 독립 스크롤 없이 내용 높이만큼만 차지하도록
+        만든 QTableWidget. no_scroll=True면 자체 스크롤바를 끄고
+        바깥 QScrollArea 하나에만 맡긴다(중첩 스크롤 방지)."""
+        tbl = QTableWidget(0, n_cols)
+        tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        tbl.verticalHeader().setVisible(False)
+        tbl.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        tbl.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        tbl.setShowGrid(True)
+        tbl.setStyleSheet("QTableWidget{gridline-color:#000; border:none;}")
+        if no_scroll:
+            tbl.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        tbl.setColumnWidth(0, self._YEAR_COL_W if hasattr(self, "_YEAR_COL_W") else 64)
+        for c in range(1, n_cols):
+            tbl.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeMode.Stretch)
+        tbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        return tbl
+
+    def _resize_self_sizing_table(self, tbl):
+        """행이 다 채워진 뒤 호출 — 내용에 맞춰 표 자체의 높이를 고정한다
+        (내부 스크롤 없이, 바깥 QScrollArea가 전체를 스크롤하게 하기 위함).
+        Stretch 컬럼 폭은 레이아웃이 실제로 자리잡은 뒤에야 확정되므로,
+        팀 검색 탭(_finalize_team_detail_row_heights)과 같은 이유로 한 프레임
+        뒤에 다시 계산한다."""
+        _PAD = 6
+
+        def _fix():
+            tbl.resizeRowsToContents()
+            total = tbl.horizontalHeader().height() + 2
+            for r in range(tbl.rowCount()):
+                tbl.setRowHeight(r, tbl.rowHeight(r) + _PAD)
+                total += tbl.rowHeight(r)
+            tbl.setFixedHeight(max(total, tbl.horizontalHeader().height() + 24))
+
+        tbl.resizeRowsToContents()
+        QTimer.singleShot(0, _fix)
+
+    def _make_combo_typable(self, combo):
+        """[2026-08 신설, 신민용 요청: "직접 입력하는 칸들도 만들어도
+        될듯"] 콤보를 편집 가능하게 하고, 콤보 자신의 항목 목록(model)을
+        그대로 소스로 쓰는 QCompleter를 붙여 부분일치(MatchContains) 자동
+        완성이 뜨게 한다 — 211개국 드롭다운을 매번 스크롤하는 대신 몇 글자
+        입력해서 좁힐 수 있다. InsertPolicy를 NoInsert로 둬서 목록에 없는
+        임의 문자열을 새 항목으로 추가하진 않는다(값은 항상 실제 존재하는
+        항목 중 하나로만 확정 — 기존 id 역매칭 로직이 그대로 통한다).
+
+        [2026-08 신설, 신민용 요청: "대한민국 치고 엔터 누르면 자동으로
+        🇰🇷 대한민국 이렇게 붙게 하고 싶어"] 항목 표시 텍스트는 항상
+        "국기 대한민국"처럼 국기 이모지가 붙어있어서, 완성 목록 팝업에서
+        직접 클릭하지 않고 그냥 타이핑 후 엔터만 치면 findText가 정확히
+        일치하는 항목을 못 찾아 필터가 적용 안 됐다 — 엔터 시 타이핑한
+        텍스트를 포함하는 첫 항목으로 자동 스냅시킨다.
+
+        [2026-08 신설, 신민용 요청: "화살표가 안 보이니 파란색으로"]
+        setEditable(True)로 바뀌면서 드롭다운 화살표가 입력칸과 같은
+        톤이라 잘 안 보였다 — QComboBox::down-arrow를 실제 이미지 리소스
+        없이 CSS 테두리 삼각형 트릭으로 그려서 파란색으로 눈에 띄게 한다."""
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        completer = QCompleter(combo.model(), combo)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        combo.setCompleter(completer)
+        combo.setStyleSheet(
+            "QComboBox::drop-down{border:none;width:20px;}"
+            "QComboBox::down-arrow{image:none;width:0;height:0;"
+            "border-left:4px solid transparent;border-right:4px solid transparent;"
+            "border-top:6px solid #4da6ff;margin-right:6px;}")
+        combo.lineEdit().returnPressed.connect(lambda c=combo: self._resolve_typed_combo(c))
+
+    def _resolve_typed_combo(self, combo):
+        """엔터를 눌렀을 때, 타이핑한 텍스트를 포함하는 첫 항목으로
+        스냅(국기+국가명 형태로 자동 완성). 이미 정확히 일치하는 항목을
+        타이핑했으면(팝업에서 골랐거나 국기까지 직접 쳤으면) 그대로 둔다.
+        [2026-08 확장, 신민용 요청: "파워랭킹 국가 필터도 선수 검색
+        국적처럼 직접 입력되게"] 예전엔 이 함수가 "선수 검색" 전용
+        디바운스 타이머(self._player_filter_debounce)를 무조건 호출했다
+        — 다른 탭(파워랭킹 등)의 콤보에 이 헬퍼를 재사용하면 정작 그
+        탭의 목록은 안 갱신되고 엉뚱하게 선수 검색만 다시 조회되는
+        부작용이 있었다. blockSignals 없이 자연스럽게 setCurrentIndex/
+        setEditText를 호출해서, 그 콤보에 실제로 연결된
+        currentTextChanged 핸들러(어느 탭이든)가 알아서 반응하게 한다."""
+        typed = combo.currentText().strip()
+        if not typed:
+            return
+        if combo.findText(typed) >= 0:
+            return
+        needle = typed.lower()
+        for i in range(combo.count()):
+            item_text = combo.itemText(i)
+            if needle in item_text.lower():
+                combo.setCurrentIndex(i)
+                combo.setEditText(item_text)
+                break
+
+    def _on_player_filter_reset(self):
+        """[2026-08 신설, 신민용 요청: "우측 끝에 필터 초기화 버튼 —
+        누르면 필터 전체가 초기화"] 모든 필터 위젯을 기본값으로 되돌리고
+        딱 한 번만 재조회한다(각 위젯 리셋마다 개별 신호가 튀지 않도록
+        blockSignals로 막아둔 채 값만 바꾼 뒤 마지막에 한 번에 반영)."""
+        for combo in (self.player_nat_cont_combo, self.player_nat_combo, self.player_country_combo,
+                      self.player_grade_combo, self.player_pos_combo):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+        self.player_age_min_spin.blockSignals(True)
+        self.player_age_min_spin.setValue(0)
+        self.player_age_min_spin.blockSignals(False)
+        self.player_age_max_spin.blockSignals(True)
+        self.player_age_max_spin.setValue(99)
+        self.player_age_max_spin.blockSignals(False)
+        self.player_search_box.blockSignals(True)
+        self.player_search_box.clear()
+        self.player_search_box.blockSignals(False)
+        self.player_status_active_btn.blockSignals(True)
+        self.player_status_retired_btn.blockSignals(True)
+        self.player_status_active_btn.setChecked(True)
+        self.player_status_active_btn.blockSignals(False)
+        self.player_status_retired_btn.blockSignals(False)
+        # [2026-08 신설] 국가대표 필터도 기본(꺼짐, 연도칸 비움+비활성화)
+        # 으로 되돌린다 — "필터 초기화를 하면 국대 유무 표시를 안 하고
+        # 전부 보이는 형태"(신민용 확정).
+        self.player_natteam_btn.blockSignals(True)
+        self.player_natteam_btn.setChecked(False)
+        self.player_natteam_btn.blockSignals(False)
+        self.player_natteam_year_edit.blockSignals(True)
+        self.player_natteam_year_edit.clear()
+        self.player_natteam_year_edit.setEnabled(False)
+        self.player_natteam_year_edit.blockSignals(False)
+        # [2026-08 신설] 국가(소속리그)가 "전체"로 리셋됐으니 리그/팀
+        # 콤보도 "전체" 하나만 남기고 비활성화로 되돌린다 — 안 그러면
+        # 이전 국가 선택으로 좁혀진 리그/팀 목록이 그대로 남아있게 된다.
+        self.player_league_combo.blockSignals(True)
+        self.player_league_combo.clear()
+        self.player_league_combo.addItem(_ALL)
+        self.player_league_combo.setEnabled(False)
+        self.player_league_combo.blockSignals(False)
+        self._player_league_cache = []
+        self.player_team_combo.blockSignals(True)
+        self.player_team_combo.clear()
+        self.player_team_combo.addItem(_ALL)
+        self.player_team_combo.setEnabled(False)
+        self.player_team_combo.blockSignals(False)
+        self._player_team_cache = []
+        self.player_team_career_btn.blockSignals(True)
+        self.player_team_career_btn.setChecked(False)
+        self.player_team_career_btn.blockSignals(False)
+        self._player_filter_debounce.stop()
+        # 대륙(국적)이 "전체"로 리셋됐으니 "국적" 콤보도 전체 국가 목록으로
+        # 다시 채워야 한다(단순 setCurrentIndex(0)만으로는 목록 자체가
+        # 이전 대륙 선택으로 좁혀진 채 남아있음).
+        self._refresh_player_nat_combo()
+        self._refresh_player_list()
+
+    def _on_player_nat_continent_changed(self, *_a):
+        self._refresh_player_nat_combo()
+        self._player_filter_debounce.start()
+
+    def _refresh_player_nat_combo(self):
+        """[2026-08 수정] "국적" 콤보 — 이제 "대륙(국적)" 콤보 선택에 따라
+        후보 국가가 바뀐다(둘 다 선수의 실제 국적 기준). "국가(소속리그)"
+        콤보는 이제 이 대륙 선택과 무관하게 항상 전체 국가를 보여준다
+        (독립 필터가 됐으므로 _build_player_search_tab에서 전체 목록으로
+        한 번만 채워두고 여기서 다시 안 건드림)."""
+        cont = None if self.player_nat_cont_combo.currentText() == _ALL else self.player_nat_cont_combo.currentText()
+        cur = self.player_nat_combo.currentText()
+        self.player_nat_combo.blockSignals(True)
+        self.player_nat_combo.clear()
+        self.player_nat_combo.addItem(_ALL)
+        countries = wb.list_countries(continent=cont)
+        # [2026-08 수정, 신민용 요청: "국기 이모지 앞에 KR 같은 글자
+        # 없애서 대한민국 이렇게 뜨게"] 국적 콤보도 소속리그 콤보와
+        # 동일하게 국기 프리픽스 제거.
+        for c in countries:
+            self.player_nat_combo.addItem(c["name"])
+        idx = self.player_nat_combo.findText(cur)
+        self.player_nat_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.player_nat_combo.blockSignals(False)
+        self._player_nat_cache = countries
+
+    def _selected_player_nat_country_id(self):
+        txt = self.player_nat_combo.currentText()
+        if txt == _ALL:
+            return None
+        for c in getattr(self, "_player_nat_cache", []):
+            if c["name"] == txt:
+                return c["id"]
+        return None
+
+    def _selected_player_club_country_id(self):
+        """"국가(소속리그)" 콤보 — 대륙 선택과 무관하게 항상 전체 국가
+        목록이므로, wb.list_countries()를 다시 조회해 이름으로 역매칭한다
+        (국적 콤보처럼 대륙 변경 때마다 다시 채워지는 캐시가 없어서, 매번
+        전체 목록에서 찾는다 — 211개국 규모라 비용은 무시할 수준)."""
+        txt = self.player_country_combo.currentText()
+        if txt == _ALL:
+            return None
+        for c in wb.list_countries():
+            if c["name"] == txt:
+                return c["id"]
+        return None
+
+    # [2026-08 신설, 신민용 요청: "국가(소속리그) → 리그 → 팀 3단계
+    # 필터"] 국가(소속리그) 콤보가 바뀔 때마다 리그 콤보를 그 나라의
+    # 부수별 리그 목록으로 다시 채운다(전체로 돌아가면 리그/팀 둘 다
+    # "전체" 하나만 남기고 비활성화). 리그가 바뀌므로 팀 콤보도 항상
+    # 같이 리셋한다.
+    def _on_player_club_country_changed(self, *_a):
+        self._refresh_player_league_combo()
+        self._refresh_player_team_combo()
+        self._player_filter_debounce.start()
+
+    def _refresh_player_league_combo(self):
+        club_cid = self._selected_player_club_country_id()
+        self.player_league_combo.blockSignals(True)
+        self.player_league_combo.clear()
+        self.player_league_combo.addItem(_ALL)
+        leagues = wb.list_leagues_for_country(club_cid) if club_cid else []
+        _TIER_SUFFIX = {1: "1부", 2: "2부", 3: "3부", 4: "4부", 5: "5부", 6: "6부", 7: "7부"}
+        for lg in leagues:
+            suffix = _TIER_SUFFIX.get(lg["tier"], f"{lg['tier']}부")
+            self.player_league_combo.addItem(f"{lg['name']} ({suffix})")
+        self.player_league_combo.setCurrentIndex(0)
+        self.player_league_combo.setEnabled(bool(leagues))
+        self.player_league_combo.blockSignals(False)
+        self._player_league_cache = leagues
+
+    def _selected_player_league_id(self):
+        idx = self.player_league_combo.currentIndex()
+        cache = getattr(self, "_player_league_cache", [])
+        # 콤보 0번은 항상 "전체"라 idx-1이 캐시 인덱스와 맞물린다
+        # (표시 문자열엔 "(1부)" 같은 접미사가 붙어서 이름으로 역매칭할
+        # 수 없으므로, 채워 넣은 순서를 그대로 따르는 인덱스 매칭을 쓴다).
+        if idx <= 0 or idx - 1 >= len(cache):
+            return None
+        return cache[idx - 1]["id"]
+
+    # [2026-08 신설] 리그 콤보가 바뀔 때마다 팀 콤보를 그 리그 소속
+    # 팀 목록으로 다시 채운다("전체"로 돌아가면 팀도 "전체" 하나만
+    # 남기고 비활성화 — 국가만 고르고 리그를 안 고른 상태에서 팀까지
+    # 고르게 하면 어느 부수 팀인지 모호해지므로 막는다).
+    def _on_player_league_changed(self, *_a):
+        self._refresh_player_team_combo()
+        self._player_filter_debounce.start()
+
+    def _refresh_player_team_combo(self):
+        league_id = self._selected_player_league_id()
+        self.player_team_combo.blockSignals(True)
+        self.player_team_combo.clear()
+        self.player_team_combo.addItem(_ALL)
+        teams = wb.list_teams_in_league(league_id) if league_id else []
+        for t in teams:
+            self.player_team_combo.addItem(t["name"])
+        self.player_team_combo.setCurrentIndex(0)
+        self.player_team_combo.setEnabled(bool(teams))
+        self.player_team_combo.blockSignals(False)
+        self._player_team_cache = teams
+
+    def _selected_player_team_id(self):
+        txt = self.player_team_combo.currentText()
+        if txt == _ALL:
+            return None
+        for t in getattr(self, "_player_team_cache", []):
+            if t["name"] == txt:
+                return t["id"]
+        return None
+
+    def _refresh_player_list(self, *_a):
+        cont = None if self.player_nat_cont_combo.currentText() == _ALL else self.player_nat_cont_combo.currentText()
+        nat_cid = self._selected_player_nat_country_id()
+        club_cid = self._selected_player_club_country_id()
+        grade = None if self.player_grade_combo.currentText() == _ALL else self.player_grade_combo.currentText()
+        # [2026-08 제거] 부수 필터 삭제 — 리그 필터가 이미 부수를 확정하므로
+        # search_ai_players에는 항상 tier=None(무필터)을 넘긴다.
+        tier = None
+        pos = None if self.player_pos_combo.currentText() == _ALL else self.player_pos_combo.currentText()
+        # [2026-08 수정] 나이 스핀박스 기본값이 (0/99)로 바뀌었으므로
+        # "전체" 판정 기준도 60→99로 맞춘다.
+        min_age = self.player_age_min_spin.value() or None
+        max_age_v = self.player_age_max_spin.value()
+        max_age = max_age_v if max_age_v < 99 else None
+        q = self.player_search_box.text().strip() or None
+        status = "retired" if self.player_status_retired_btn.isChecked() else "active"
+        # [2026-08 신설] 국가대표 유무 필터 — 버튼이 꺼져 있으면 natteam=False
+        # (필터 없음, 전부 보임). 켜져 있으면 natteam=True + 연도칸이
+        # 비어있으면 natteam_year=None("전체" — 어느 연도든), 채워져
+        # 있으면 그 연도로 좁힌다.
+        natteam = self.player_natteam_btn.isChecked()
+        _nt_year_txt = self.player_natteam_year_edit.text().strip()
+        natteam_year = int(_nt_year_txt) if (natteam and _nt_year_txt) else None
+        # [2026-08 신설] 국가(소속리그) → 리그 → 팀 3단계 필터. team_mode는
+        # "경력 포함" 토글에 따라 현재/마지막 소속만 볼지, 과거 팀 경력
+        # 까지 볼지를 가른다 — [2026-08 수정, 신민용 요청: "은퇴 검색도
+        # 이 토글을 따르게(꺼짐=은퇴 직전 팀 기준, 켜짐=경력에 있으면
+        # 전부)"] 예전엔 은퇴 검색은 이 토글과 무관하게 항상 "경력"으로
+        # 고정돼 있었는데, 이제 현역과 똑같이 이 값을 그대로 따른다.
+        # league_id도 [2026-08 버그수정, 신민용 리포트: "은퇴 상태에서
+        # 국가(소속리그)/리그만 고르고 팀은 '전체'로 두면 그 나라·리그와
+        # 전혀 무관한 선수가 뜬다"] 대응으로 새로 넘긴다 — 팀까지 구체적
+        # 으로 안 고른 채 리그만 골라도 그 리그 안에서 걸러지도록.
+        team_id = self._selected_player_team_id()
+        league_id = self._selected_player_league_id()
+        team_mode = "career" if self.player_team_career_btn.isChecked() else "current"
+        players = wb.search_ai_players(name_query=q, continent=cont, country_id=club_cid,
+                                        nat_country_id=nat_cid, grade=grade, tier=tier,
+                                        position=pos, min_age=min_age, max_age=max_age,
+                                        status=status, limit=300,
+                                        natteam=natteam, natteam_year=natteam_year,
+                                        team_id=team_id, team_mode=team_mode,
+                                        league_id=league_id)
+
+        self.player_list.clear()
+        for pl in players:
+            # [2026-08 신설, 신민용 요청: "내 이름도 떠야 하고 다른
+            # 선수들과 다르게 이름으로 찾아지지만 내용은 똑같다"] my_player
+            # (MY_PLAYER_ID)만 실명을 그대로 표시하고, 나머지는 기존처럼
+            # ai_player_code로 가린다.
+            # [2026-08 확장, 신민용 요청: "AICD8C 식별코드로 뜨는 선수의
+            # 이름을 내가 지을 수 있게"] search_ai_players/
+            # search_retired_ai_players가 이제 custom_name도 같이
+            # 주므로, 지정된 이름이 있으면 코드 대신 그 이름을 쓴다.
+            code = pl["name"] if pl["player_id"] == wb.MY_PLAYER_ID else (
+                pl.get("custom_name") or ai_player_code(pl["player_id"]))
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, pl["player_id"])
+            item.setData(Qt.ItemDataRole.UserRole + 1, code)
+            item.setData(_GridRowDelegate._SPEC_ROLE, self._player_row_spec(pl, code))
+            self.player_list.addItem(item)
+        self._ensure_list_fits(self.player_list, self._player_split)
+
+    def _player_row_spec(self, pl, code):
+        # [2026-08 수정, 신민용 확정: "포메이션에 뜨는 것처럼 식별코드로
+        # 떠야 한다"] ai_players.name(data/names.py 기반 실제 이름)은 더
+        # 이상 표시하지 않고, 포메이션/이적 로그와 완전히 같은 규칙
+        # (constants.ai_player_code)으로 만든 코드를 그대로 쓴다 — 같은
+        # 선수는 화면이 달라도 항상 같은 코드로 보인다.
+        nat_text = f"{pl.get('nat_flag') or ''} {pl.get('nationality') or ''}".strip()
+        # [2026-08 신설, 신민용 요청: "은퇴한 선수도 검색할 수 있어야 해"]
+        # 은퇴 선수는 소속팀/등급이 전부 None이라 "None급"/"None · None"처럼
+        # 깨져 보이지 않게 별도로 처리 — 목록에서부터 "은퇴"로 바로 티나게.
+        if pl.get("is_retired"):
+            grade_text, grade_color = "은퇴", "#888888"
+            team_text = f"{pl.get('retirement_year', '-')}년 은퇴 · {pl.get('last_team_name') or '소속 정보 없음'}"
+        else:
+            grade_text = f"{pl['grade']}급" if pl.get("grade") else "-"
+            grade_color = _GRADE_COLORS.get(pl.get("grade"), "#888888")
+            team_text = (f"{pl['team_name']} · {pl['league_name']}({pl['tier']}부)"
+                         if pl.get("team_id") else "소속팀 없음")
+        # [2026-08 신설, 신민용 요청: "국대를 한 번이라도 뽑힌 선수들은
+        # 은퇴든 현역이든 이름(식별코드)가 파란색으로 뜨게"] wb.search_
+        # ai_players/search_retired_ai_players가 _annotate_natteam으로
+        # 채워둔 has_natteam을 그대로 읽는다 — 필터(국가대표 버튼)와
+        # 무관하게 항상 적용되는 표시.
+        _name_color = "#4da6ff" if pl.get("has_natteam") else "#eee"
+        return [
+            {"text": code, "width": self._NAME_COL_W, "color": _name_color, "bold": True},
+            {"text": pl.get("position") or "", "width": self._POS_COL_W,
+             "color": "#aaddff", "size": 11, "bold": True, "align": Qt.AlignmentFlag.AlignCenter},
+            {"text": nat_text, "width": self._NAT_COL_W, "color": "#aaddff"},
+            # [2026-08 신설, 신민용 요청: "어려움 모드일 때는 세계 축구
+            # 기록실에서 OVR 표시를 없애야 해 — 좌측에 뜨는 OVR"]
+            {"text": "-" if is_hard_mode() else str(pl.get("ovr", "")), "width": self._OVR_COL_W,
+             "color": "#ffcc00", "bold": True, "align": Qt.AlignmentFlag.AlignCenter},
+            {"text": grade_text, "width": self._GRADE_COL_W, "color": grade_color,
+             "size": 11, "bold": True, "align": Qt.AlignmentFlag.AlignCenter},
+            {"text": team_text, "width": self._LEAGUE_COL_W, "color": "#888"},
+        ]
+
+    def _on_player_selected(self, item):
+        pid = item.data(Qt.ItemDataRole.UserRole)
+        code = item.data(Qt.ItemDataRole.UserRole + 1)
+        if pid is None:
+            return
+        self._show_player_detail(pid)
+        self._record_recent_selection("player", code or "", "_player_recent_row")
+
+    def _show_player_detail(self, player_id):
+        d = wb.get_ai_player_detail(player_id)
+        if not d:
+            self.player_detail_placeholder.setText("← 왼쪽에서 선수를 선택하세요")
+            self.player_detail_placeholder.show()
+            self.player_detail_tbl.hide()
+            self.player_retirement_note.hide()
+            self.player_team_tbl.setRowCount(0)
+            self.player_team_award_tbl.setRowCount(0)
+            self.player_intl_tbl.setRowCount(0)
+            self._player_detail_pid = None
+            return
+        # [2026-08 신설, 신민용 요청: "이름 헤더 클릭하면 이름 변경"]
+        # 헤더 클릭 핸들러가 "지금 화면에 뜬 선수가 누구인지" 알아야
+        # 하므로 저장해둔다. my_player는 원래 실명이 그대로 표시되고
+        # 이름 변경 기능 대상이 아니므로 그대로 None 취급해 클릭해도
+        # 아무 일도 안 일어나게 한다(아래 핸들러에서 분기).
+        self._player_detail_pid = player_id if player_id != wb.MY_PLAYER_ID else None
+        # [2026-08 신설, 신민용 요청: "AICD8C 이 식별코드로 뜨는 선수의
+        # 이름을 내가 입력할 수 있게"] custom_name이 저장돼 있으면 그
+        # 이름을, 없으면 기존처럼 ai_player_code(id)를 표시한다.
+        code = d["name"] if player_id == wb.MY_PLAYER_ID else (d.get("custom_name") or ai_player_code(player_id))
+        self._fill_player_detail_row(code, d)
+
+        # [2026-08 수정, 신민용 요청: "은퇴해도 이전 커리어는 남아야 한다"]
+        # get_ai_player_detail이 이제 은퇴 선수도 team_id를 "마지막
+        # 소속팀"으로 채워 반환하므로(위 world_browser.py 참고), 은퇴
+        # 여부와 무관하게 team_id가 있으면 항상 _populate_player_team_box를
+        # 그대로 태운다 — 은퇴 전 실제로 뛰었던 연도들의 기록이 그대로
+        # 나온다. "은퇴했다"는 사실 자체는 그 표 바로 아래 별도 라벨로
+        # 보강한다(표를 통째로 대체하지 않음).
+        if d.get("team_id"):
+            self._populate_player_team_box(player_id, d["team_id"], d["team_name"],
+                                            retirement_year=d.get("retirement_year"),
+                                            current_age=d.get("age"),
+                                            final_ovr=d.get("ovr") if d.get("is_retired") else None)
+        else:
+            self.player_team_tbl.clearSpans()
+            self.player_team_award_tbl.clearContents()
+            self.player_team_award_tbl.setRowCount(0)
+            self._resize_self_sizing_table(self.player_team_award_tbl)
+            self.player_team_tbl.setRowCount(1)
+            empty = QTableWidgetItem("소속팀 없음")
+            empty.setForeground(QColor("#666"))
+            self.player_team_tbl.setItem(0, 0, empty)
+            self.player_team_tbl.setSpan(0, 0, 1, 8)
+            self._resize_self_sizing_table(self.player_team_tbl)
+
+        if d.get("is_retired"):
+            self.player_retirement_note.setText(
+                f"🏳 은퇴했습니다 — {d.get('retirement_year', '-')}년 은퇴, "
+                f"당시 {d.get('age', '-')}세"
+                + (f" (마지막 소속: {d['last_team_name']})" if d.get("last_team_name") else ""))
+            self.player_retirement_note.show()
+        else:
+            self.player_retirement_note.hide()
+
+        # [2026-08 신설] 국가대표 출전 기록 박스 — 소속팀 유무·은퇴 여부와
+        # 무관하게(국적은 은퇴해도 안 바뀜) 항상 채운다.
+        self._populate_player_intl_box(player_id)
+
+    def _populate_player_intl_box(self, player_id):
+        """[2026-08 신설, 신민용 요청: "'예선전 탈락' 같은 개인 기록도
+        표시해줘"] wb.get_player_intl_records로 이 선수가 실제로 대회
+        명단(intl_squad)에 뽑혔던 대회만 가져와 연도/대회/국가/출전/결과
+        표로 채운다. player_team_tbl과 같은 톤 — 기록이 없으면(intl_squad
+        도입 이전 대회뿐이거나, 애초에 대표팀에 뽑힌 적이 없으면) 안내
+        문구 한 줄만 표시한다."""
+        tbl = self.player_intl_tbl
+        tbl.setRowCount(0)
+        tbl.clearSpans()
+        records = wb.get_player_intl_records(player_id)
+        if not records:
+            tbl.setRowCount(1)
+            empty = QTableWidgetItem("국가대표 출전 기록 없음")
+            empty.setForeground(QColor("#666"))
+            tbl.setItem(0, 0, empty)
+            tbl.setSpan(0, 0, 1, 5)
+            self._resize_self_sizing_table(tbl)
+            return
+        tbl.setRowCount(len(records))
+        for row, rec in enumerate(records):
+            # [2026-08 신설, 신민용 요청: "출전/전체 경기 형식으로 — 전체
+            # 경기는 대회 규정 경기 수가 아니라 이 팀이 거기까지 가며
+            # 실제로 치른 경기 수"] 예: 예선 조별 6경기 중 3경기 출전이면
+            # "3/6", 본선에서 조별 3경기 + 16강 1경기까지 갔으면 분모가 4.
+            _apps = rec.get("appearances", 0)
+            _total = rec.get("total_games", 0)
+            _apps_text = f"{_apps}/{_total}" if _total else str(_apps)
+            cells = [str(rec["year"]), rec.get("name") or "?", rec.get("country") or "?",
+                     _apps_text, rec.get("result") or "?"]
+            for col, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if col in (0, 3):
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                tbl.setItem(row, col, item)
+        self._resize_self_sizing_table(tbl)
+
+    def _on_player_detail_header_clicked(self, section):
+        """[2026-08 신설, 신민용 요청: "'이름' 헤더를 클릭하면 이 선수의
+        이름을 변경할 수 있는 창이 뜨게"] 0번 칸("이름")을 눌렀을 때만
+        반응한다 — 나머지 칸(국적/나이/포지션/OVR/소속팀/소속팀 국가)은
+        읽기 전용 그대로. my_player(사용자 본인)는 _show_player_detail에서
+        self._player_detail_pid를 None으로 남겨두므로 여기서 자동으로
+        무시된다(이름 변경은 AI 선수 전용 기능 — 본인 이름은 캐릭터
+        생성 화면에서 이미 실명으로 정한 것이라 대상이 아님)."""
+        if section != 0:
+            return
+        pid = getattr(self, "_player_detail_pid", None)
+        if pid is None:
+            return
+        self._open_ai_rename_dialog(pid)
+
+    def _open_ai_rename_dialog(self, player_id):
+        """AI 선수 이름 변경 창. 현재 지정된 이름(없으면 빈칸 — placeholder에
+        지금 표시 중인 식별코드를 보여줘서 "비워두면 이 코드로 돌아간다"는
+        걸 알 수 있게 한다)을 입력칸에 채워서 띄운다. 저장을 누르면
+        set_ai_player_custom_name으로 저장하고, 화면(상세 표 + 좌측
+        검색 목록)을 즉시 다시 그려 새 이름이 바로 반영되게 한다."""
+        current = get_ai_player_custom_name(player_id)
+        code = ai_player_code(player_id)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("선수 이름 변경")
+        dlg.setStyleSheet("QDialog{background:#1e1e1e;color:#ccc;}")
+        dlg.setMinimumWidth(300)
+        v = QVBoxLayout(dlg)
+
+        info_lbl = QLabel(f"식별코드: {code}\n이 선수에게 부를 이름을 지어주세요.")
+        info_lbl.setStyleSheet("color:#888;font-size:11px;")
+        v.addWidget(info_lbl)
+
+        edit = QLineEdit(current)
+        edit.setPlaceholderText(f"비워두면 다시 \"{code}\"로 표시됩니다")
+        edit.setStyleSheet(
+            "QLineEdit{background:#161616;color:#eee;font-size:13px;"
+            "border:1px solid #333;border-radius:4px;padding:6px 8px;}"
+            "QLineEdit:focus{border:1px solid #4da6ff;}")
+        edit.selectAll()
+        v.addWidget(edit)
+
+        btn_row = QHBoxLayout()
+        save_btn = QPushButton("저장")
+        save_btn.setStyleSheet(
+            "background:#2d4a6b;color:#eee;border:1px solid #4a7ab0;"
+            "border-radius:4px;padding:6px 14px;")
+        cancel_btn = QPushButton("취소")
+        cancel_btn.setStyleSheet(
+            "background:#2a2a2a;color:#ccc;border:1px solid #444;"
+            "border-radius:4px;padding:6px 14px;")
+        btn_row.addStretch(1)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(save_btn)
+        v.addLayout(btn_row)
+
+        save_btn.clicked.connect(dlg.accept)
+        cancel_btn.clicked.connect(dlg.reject)
+        edit.returnPressed.connect(dlg.accept)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        set_ai_player_custom_name(player_id, edit.text())
+        # [2026-08 버그수정, 신민용 리포트: "이름 수정했는데 포메이션에는
+        # AIAXS2로 예전 코드가 그대로 뜬다" → 후속: "나갔다 들어와야
+        # 바뀐다, 실시간으로 안 되나? 어차피 한 번에 하나씩만 바꾸는데"]
+        # _ovr_cache_invalidated 플래그는 "다음에 이 팀이 다시 로드될
+        # 때"만 적용되는 예약이라, 지금 이미 화면에 떠 있는 포메이션은
+        # 그때까지(주 진행, 팀 재선택 등) 안 바뀐다 — 그래서 나갔다
+        # 들어와야만 반영됐다. apply_custom_name_live가 지금 열려 있는
+        # 모든 포메이션 화면(내 팀/상대팀 둘 다)을 뒤져 이 선수 id를
+        # 찾아 그 자리에서 바로 이름을 바꾸고 다시 그린다 — 한 명만
+        # 바꾸는 가벼운 작업이라 이 정도 즉시 패치로 충분하다.
+        # _ovr_cache_invalidated는 그래도 안전장치로 같이 세워둔다(이후
+        # 어떤 경로로든 캐시가 다시 로드될 때도 새 이름이 확실히 반영
+        # 되도록).
+        try:
+            import ui.formation_widget as _fw
+            _fw._ovr_cache_invalidated = True
+            _new_display = get_ai_player_custom_name(player_id) or ai_player_code(player_id)
+            _fw.apply_custom_name_live(player_id, _new_display)
+        except Exception:
+            pass
+        # 저장 직후 상세 표를 새로 그려 새 이름을 바로 반영하고, 좌측
+        # 검색 목록도 다시 조회해 목록에 뜬 이름도 같이 갱신한다.
+        self._show_player_detail(player_id)
+        self._refresh_player_list()
+
+    def _fill_player_detail_row(self, name_text, d):
+        """[2026-08 재수정, 신민용 요청: "왜 아직도 태그형으로 표시하는거?
+        아래 연도별 기록처럼 그리드/테이블 형태로"] 이름/국적/나이/포지션/
+        OVR/소속팀/소속팀 국가를 QTableWidget 1행에 채운다 — 이 탭의 다른
+        표(소속팀 대회 기록 등)와 완전히 같은 방식, 셀 선택 후 Ctrl+C나
+        우클릭 "복사"로 복사된다(_enable_plain_copy, 이 파일 상단 참고).
+        소속팀 파워랭킹은 표시하지 않는다(신민용 요청으로 제외)."""
+        tbl = self.player_detail_tbl
+        nat_text = f"{d.get('nat_flag') or ''} {d.get('nationality') or ''}".strip() or "국적 미상"
+        if d.get("is_retired"):
+            # [2026-08 신설, 신민용 요청: "은퇴하면 소속팀에 '은퇴했습니다'
+            # 라고 뜨고 이때 나이가 몇살인지 써줘"] — 이 상단 요약줄에서는
+            # 여전히 "은퇴했습니다"로 보여준다(아래 큰 표는 실제 연도별
+            # 기록을 그대로 보여주는 것과 별개로, 여기 요약칸엔 "지금
+            # 상태"를 짧게 담는 게 맞다).
+            team_text = f"은퇴했습니다 ({d.get('age', '-')}세, {d.get('retirement_year', '-')}년)"
+            team_country_text = "-"
+        elif d.get("team_id"):
+            team_text = f"{d['team_name']} ({d['league_name']} {d['tier']}부)"
+            team_country_text = f"{d.get('flag') or ''} {d.get('country') or ''}".strip()
+        else:
+            team_text = "소속팀 없음"
+            team_country_text = "-"
+
+        cells = [
+            (name_text, "#00cc44", True),
+            (nat_text, "#aaddff", False),
+            (f"{d.get('age', '-')}세", "#cccccc", False),
+            (d.get("position") or "-", "#aaddff", False),
+            # [2026-08 신설, 신민용 요청: "어려움 모드일 때... 그 선수를
+            # 클릭할 때 우측 위에 뜨는 OVR"도 없애야 해]
+            ("OVR -" if is_hard_mode() else f"OVR {d.get('ovr', '-')}", "#ffcc00", True),
+            (team_text, "#88ddaa", False),
+            (team_country_text, "#aaddff", False),
+        ]
+        tbl.setRowCount(1)
+        for col, (text, color, bold) in enumerate(cells):
+            item = QTableWidgetItem(text)
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            item.setForeground(QColor(color))
+            if bold:
+                f = item.font(); f.setBold(True); item.setFont(f)
+            # [2026-08 버그수정, 신민용 리포트: "소속팀 칸 복사하면 리그/
+            # 부수까지 같이 복사된다 — 챔스칸처럼 팀명만 복사되게 해달라"]
+            # 이 함수 docstring은 처음부터 _enable_plain_copy를 쓴다고
+            # 적혀 있었지만, 정작 team_text 셀에 _CLEAN_TEXT_ROLE을 채우는
+            # 코드가 빠져 있어서(다른 셀들처럼 원래 장식이 없는 텍스트라
+            # 문제가 없었을 뿐) 실제로는 화면에 보이는 전체 문자열이
+            # 그대로 복사되고 있었다 — 팀명만 별도로 채워준다.
+            if col == 5:  # 소속팀 칸
+                _clean = d.get("team_name") if d.get("team_id") and not d.get("is_retired") else None
+                if _clean:
+                    item.setData(_CLEAN_TEXT_ROLE, _clean)
+            tbl.setItem(0, col, item)
+        self._resize_self_sizing_table(tbl)
+        self.player_detail_placeholder.hide()
+        tbl.show()
+
+    def _populate_player_team_box(self, player_id, tid, tname, retirement_year=None,
+                                   current_age=None, final_ovr=None):
+        """[2026-08 신설, 2026-08 수정: "순위가 아니라 이 선수가 그 해에
+        실제로 속한 팀이 떠야 한다"] 팀 검색 탭 _show_team_detail의
+        "연도별 기록" 렌더링(수상 요약 행 + 연도별 리그/국내컵/클럽대항전/
+        슈퍼컵/클럽월드컵)을 "선수 검색" 탭 우측 박스에서도 재사용하되,
+        예전엔 여기 있던 "순위"(팀 파워랭킹) 칸을 없애고 그 자리에
+        "소속팀"(그 해에 이 선수가 실제로 있었던 팀, wb.get_ai_player_
+        team_timeline 재구성)을 넣는다 — 팀 순위는 이 표의 다른 대회
+        칸들과 성격이 달라(선수 개인과 무관한 팀 지표) 혼란을 줬었다.
+        같은 헬퍼(_two_line_cell/_cl_award_summary_cell/BURGUNDY)를 쓰되
+        대상 위젯만 self.player_team_tbl/self.player_team_award_tbl로
+        바꾼 것 — 기존 _show_team_detail은 손대지 않는다(회귀 위험 최소화)."""
+        tbl, award_tbl = self.player_team_tbl, self.player_team_award_tbl
+        tbl.setRowCount(0)
+        tbl.clearSpans()
+        award_tbl.clearContents()
+        # [2026-08 버그수정, 신민용 리포트: "리그 우승 5회로 보이는데
+        # 통산 수상엔 18회로 뜬다 — 팀 검색 데이터를 그대로 쓰는거
+        # 아니냐"] 정확한 지적이었다 — 예전엔 get_team_history(tid)로
+        # "현재/마지막 소속팀의 전체 역사"를 그대로 이 선수 기록인 것처럼
+        # 썼다. get_ai_player_career_history가 연도별 실제 소속팀
+        # (timeline)마다 그 팀의 그 해 기록만 병합해서, 팀을 옮긴
+        # 이력이 있으면 상반기/하반기가 아니라 "그 해에 실제로 있던
+        # 팀"의 성적만 붙고, 통산 수상도 이 선수가 실제로 그 팀에
+        # 있었던 연도만 재집계된다. current_age를 같이 넘겨서 출생 이전
+        # 연도(이적기록 없는 선수의 무기한 소급 추정 구간이 출생보다
+        # 앞서가며 나이가 음수로 뜨던 원인)도 잘라낸다.
+        hist = wb.get_ai_player_career_history(player_id, tid, retirement_year=retirement_year,
+                                                current_age=current_age)
+        awards, years = hist["awards"], hist["years"]
+        if not years and not any(awards.values()):
+            award_tbl.setRowCount(0)
+            self._resize_self_sizing_table(award_tbl)
+            tbl.setRowCount(1)
+            empty = QTableWidgetItem("기록 없음")
+            empty.setForeground(QColor("#666"))
+            tbl.setItem(0, 0, empty)
+            tbl.setSpan(0, 0, 1, 8)
+            self._resize_self_sizing_table(tbl)
+            return
+
+        award_tbl.setRowCount(1)
+        award_labels = [
+            ("수상", None),
+            ("", None),
+            ("", None),
+            (str(awards["league"]) if awards["league"] else "", "#4da6ff"),
+            (str(awards["cup"]) if awards["cup"] else "", "#c48aff"),
+        ]
+        for j, (text, color) in enumerate(award_labels):
+            cell = QTableWidgetItem(text)
+            cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            f = cell.font(); f.setBold(True); cell.setFont(f)
+            cell.setForeground(QColor(color) if color else QColor("#ffcc00"))
+            cell.setBackground(QColor("#2a2a2a"))
+            award_tbl.setItem(0, j, cell)
+        award_tbl.setCellWidget(0, 5, self._cl_award_summary_cell(
+            awards.get("cl_champions", 0), awards.get("el_champions", 0),
+            awards.get("ecl_champions", 0)))
+        sc_cell = QTableWidgetItem(str(awards.get("sc_champions", 0)) if awards.get("sc_champions") else "")
+        sc_cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        f = sc_cell.font(); f.setBold(True); sc_cell.setFont(f)
+        sc_cell.setForeground(QColor(BURGUNDY))
+        sc_cell.setBackground(QColor("#2a2a2a"))
+        award_tbl.setItem(0, 6, sc_cell)
+        cwc_cell = QTableWidgetItem(str(awards["cwc"]) if awards["cwc"] else "")
+        cwc_cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        f = cwc_cell.font(); f.setBold(True); cwc_cell.setFont(f)
+        cwc_cell.setForeground(QColor("#4dd0e1"))
+        cwc_cell.setBackground(QColor("#2a2a2a"))
+        award_tbl.setItem(0, 7, cwc_cell)
+        self._resize_self_sizing_table(award_tbl)
+
+        timeline = wb.get_ai_player_team_timeline(player_id, tid)
+        # [2026-08 신설, 신민용 요청: "년도별로 선수 OVR도 표시... 그때
+        # 뛸 때 OVR을 표시해줘"] 매 시즌 OVR 아카이브가 없어서 "그 해의
+        # 정확한 OVR"은 원칙적으로 모른다 — ai_transfer_log가 이적이
+        # 일어난 그 순간의 OVR만 기록해두므로, 그 연도에 한해서만 실제
+        # 값을 보여준다(없는 연도는 빈칸 — 부정확한 값을 정확한 척
+        # 보여주지 않는다). player_id가 MY_PLAYER_ID/은퇴 아카이브면
+        # 이적 로그가 없을 수 있어 빈 dict가 올 수 있음(정상).
+        # [2026-08 수정, 신민용 요청: "챔스 클릭하면 네모 안에 글자가
+        # 있고 네모를 클릭해서 복사하는 그 상자를 말한 거다"] 값이 있는
+        # 연도는 플레인 텍스트가 아니라 _sized_copyable_field(테두리
+        # [2026-08 수정, 신민용 요청: "OVR을 그리드로 맞춰서, 상자(패널)
+        # 말고 다른 칸들처럼"] 예전엔 여기서 클릭 복사용 상자 위젯
+        # (_sized_copyable_field)을 썼는데, 이제 아래 렌더링 루프에서
+        # 일반 QTableWidgetItem으로 통일해서 이 import/스타일은 더 이상
+        # 필요 없다.
+        ovr_checkpoints = wb.get_ai_player_ovr_checkpoints(player_id) if player_id > 0 else {}
+        # [2026-08 신설, 신민용 요청: "그 당시 OVR 스탯이 떠야해"] 은퇴
+        # 시점의 정확한 최종 OVR은 ai_players_retired.ovr에 그대로 남아
+        #있다(추정이 아니라 실제 기록값) — 혹시라도 그 해 아카이브가
+        # 비어있는 예외적인 경우(과거 세이브 이어하기 등) 이 값으로 채운다.
+        if retirement_year and final_ovr:
+            ovr_checkpoints[retirement_year] = final_ovr
+
+        # [2026-08 신설, 신민용 요청: "연도 2001(이때 나이) 이렇게도
+        # 뜨고"] 그 해 나이를 역산 — 은퇴 선수는 은퇴 연도/그때 나이를
+        # 정확히 알고 있으니(ai_players_retired) 그 기준으로, 현역
+        # 선수는 지금(현재 게임 연도)/현재 나이 기준으로 1년=1살 단순
+        # 역산한다(이 게임 나이 증가 규칙과 일치 — 매 시즌 정확히 1살).
+        age_ref_year = retirement_year if retirement_year else wb.get_current_game_year()
+
+        def _age_at(year):
+            if current_age is None or age_ref_year is None:
+                return None
+            return current_age - (age_ref_year - year)
+
+        # [2026-08 신설, 신민용 요청: "2004년 소속팀 없음이 뜨면 2004년
+        # 까지 기록되며 2005년부터는 아예 칸조차 없어야 해"] 은퇴 다음
+        # 해(소속팀 없음을 알리는 딱 한 줄) 이후로는 그 팀 역사가 계속
+        # 있어도 더 이상 이 선수와 무관하므로 행 자체를 아예 안 만든다
+        # (예전엔 팀이 존재하는 모든 연도를 계속 나열해 은퇴 후 몇 년치
+        # "소속팀 없음"이 줄줄이 나왔었다).
+        if retirement_year:
+            years = [y for y in years if y["year"] <= retirement_year + 1]
+
+        def _team_name_for_year(year):
+            # [2026-08 신설, 신민용 리포트: "2001년에 은퇴했으면 2002년
+            # 부터는 소속팀 없음(은퇴)이어야 하는데 첼시로 계속 뜬다"]
+            # get_ai_player_team_timeline의 마지막 구간은 end_year=None
+            # (그 이후 전체)이라 은퇴 후 연도까지 마지막 소속팀으로
+            # 그대로 잡혔다 — 은퇴 연도를 넘긴 해는 여기서 먼저 걸러
+            # None(=은퇴 표시)을 반환한다.
+            if retirement_year and year > retirement_year:
+                return None
+            for seg in timeline:
+                if (seg["start_year"] is None or year >= seg["start_year"]) and \
+                   (seg["end_year"] is None or year < seg["end_year"]):
+                    return seg["team_name"]
+            return tname
+
+        tbl.setRowCount(len(years))
+        for i, entry in enumerate(years):
+            age = _age_at(entry["year"])
+            year_text = f"{entry['year']} ({age}세)" if age is not None else str(entry["year"])
+            year_item = QTableWidgetItem(year_text)
+            year_item.setForeground(QColor("#ffcc00"))
+            f = year_item.font(); f.setBold(True); year_item.setFont(f)
+            tbl.setItem(i, 0, year_item)
+
+            # [2026-08 수정] 예전엔 여기가 팀 파워랭킹(전체/대륙 순위)
+            # 두 줄이었는데, "선수가 그 해에 실제로 속한 팀"으로 교체.
+            # [2026-08 확장, 상반기/하반기 이적 기록 분리 기능] entry가
+            # _half_season_league_entry가 만든 "상반기 스냅샷" 줄이면
+            # _team_name_for_year(그 연도의 최종/하반기 소속팀을 돌려줌)
+            # 대신 entry 자신에 적힌 원래(상반기) 팀 이름을 그대로 쓴다 —
+            # 같은 연도 두 줄이 서로 다른 팀임을 정확히 구분해야 하므로.
+            if entry.get("_is_half"):
+                player_team_name = entry.get("_half_team_name")
+            else:
+                player_team_name = _team_name_for_year(entry["year"])
+            is_retired_row = player_team_name is None
+            if is_retired_row:
+                team_cell = self._col_label(
+                    "소속팀 없음 (은퇴)", self._LEAGUE_COL_W, color="#666", bold=False)
+            else:
+                is_current = (player_team_name == tname)
+                team_cell = self._col_label(
+                    player_team_name, self._LEAGUE_COL_W,
+                    color="#88ddaa" if is_current else "#aaddff", bold=is_current)
+            tbl.setCellWidget(i, 1, team_cell)
+
+            # [2026-08 신설, 신민용 요청: "소속팀 없음이 뜬 그 줄은 리그든
+            # 국내컵이든 다 -로 떠야해"] 그 팀의 실제 대회 결과(entry)는
+            # 이 선수와 무관해진 뒤의 데이터이므로, 이 행에서만 전부 "-"로
+            # 강제하고 그 해 팀 실제 기록은 참조하지 않는다.
+            if is_retired_row:
+                tbl.setItem(i, 2, self._dim_dash_item())
+                for col in (3, 4, 5, 6, 7):
+                    tbl.setCellWidget(i, col, self._two_line_cell("-", "#555", None))
+                continue
+
+            # [2026-08 수정, 신민용 요청: "OVR 수치가 패널로 묶여 있는데
+            # 이거 다른 UI처럼 그리드로 맞춰서 만들어야 해"] 예전엔
+            # _sized_copyable_field(테두리 있는 상자)를 QHBoxLayout으로
+            # 가운데 정렬해 넣는 별도 위젯이었다 — "연도"/"소속팀" 등
+            # 이 표의 나머지 칸과 다르게 튀어 보였다. 다른 칸과 똑같이
+            # 일반 QTableWidgetItem으로 통일한다.
+            # [2026-08 확장, "OVR을 1년 단위로 다 저장해줘"] ovr_checkpoints
+            # 가 이제 ai_player_ovr_history(매년 아카이브)에서 오므로,
+            # 이적이 없었던 해도 정확한 값이 채워진다.
+            # [2026-08 신설, 신민용 요청: "어려움 모드일 때... 소속팀
+            # 대회 기록에 뜨는 OVR"도 없애야 해] 어려움이면 항상 "-".
+            ovr_at_year = None if is_hard_mode() else ovr_checkpoints.get(entry["year"])
+            if ovr_at_year:
+                ovr_item = QTableWidgetItem(str(ovr_at_year))
+                ovr_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                ovr_item.setForeground(QColor("#ffcc00"))
+                tbl.setItem(i, 2, ovr_item)
+            else:
+                tbl.setItem(i, 2, self._dim_dash_item())
+
+            lg_txt = entry["league"] or "-"
+            if "승격" in lg_txt:
+                lg_color = "#4da6ff"
+            elif "강등" in lg_txt:
+                lg_color = "#ff5555"
+            elif entry.get("league_champion"):
+                lg_color = "#ffd700"
+            else:
+                lg_color = "#ddd"
+            tbl.setCellWidget(i, 3, self._two_line_cell(lg_txt, lg_color, entry.get("league_record")))
+
+            cup_txt = entry["cup"] or "-"
+            cup_color = "#c48aff" if entry["cup"] else "#555"
+            tbl.setCellWidget(i, 4, self._two_line_cell(cup_txt, cup_color, entry.get("cup_record")))
+
+            cl_txt = entry["cl"] or "-"
+            _CL_KIND_COLOR = {"champions": "#1E4DB7", "europa": "#F28C28", "conference": "#20A464"}
+            cl_color = _CL_KIND_COLOR.get(entry.get("cl_kind"), "#555") if entry["cl"] else "#555"
+            tbl.setCellWidget(i, 5, self._two_line_cell(cl_txt, cl_color, entry.get("cl_record")))
+
+            sc_txt = entry.get("sc") or "-"
+            sc_color = BURGUNDY if entry.get("sc") else "#555"
+            tbl.setCellWidget(i, 6, self._two_line_cell(sc_txt, sc_color, entry.get("sc_record")))
+
+            cwc_txt = entry.get("cwc") or "-"
+            cwc_color = "#4dd0e1" if entry.get("cwc") else "#555"
+            tbl.setCellWidget(i, 7, self._two_line_cell(cwc_txt, cwc_color, entry.get("cwc_record")))
+        self._resize_self_sizing_table(tbl)
+
+    def _dim_dash_item(self):
+        item = QTableWidgetItem("-")
+        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        item.setForeground(QColor("#555"))
+        return item
 
     # ─────────────────────────────────────────
     # 탭1.6: 국가 검색 (2026-08 신설, 신민용 확정: "월드컵/대륙컵 우승
@@ -4112,6 +5487,15 @@ class WorldBrowserWindow(QDialog):
         team_search_row.addWidget(self.pr_team_search_box, 1)
         self.pr_team_country_combo = QComboBox()
         self.pr_team_country_combo.addItem("전체 국가")
+        # [2026-08 신설, 신민용 요청: "국가 필터에서 선수 검색 국적
+        # 입력처럼 내가 직접 입력할 수도 있으면 좋겠다 — '대'라고 치면
+        # 대한민국이 완성되는 것처럼"] 선수 검색 탭과 같은 헬퍼
+        # (_make_combo_typable) 재사용 — 타이핑하면 부분일치 자동완성이
+        # 뜨고 엔터로 확정된다. 대륙 탭이 바뀌어 이 콤보가 다시 채워져도
+        # (_pr_refresh_team_country_filter_options의 clear()+addItem())
+        # 컴플리터는 콤보 모델을 그대로 참조하므로 자동으로 최신 목록을
+        # 따라간다.
+        self._make_combo_typable(self.pr_team_country_combo)
         self.pr_team_country_combo.currentTextChanged.connect(self._on_pr_team_search_changed)
         team_search_row.addWidget(self.pr_team_country_combo)
         left_lay.addLayout(team_search_row)
@@ -4416,7 +5800,7 @@ class WorldBrowserWindow(QDialog):
             return
         history = pr.get_team_power_history(get_conn(), team_id)
         self._show_power_history_dialog(name_item.text() if name_item else "팀", history,
-                                         columns=["연도", "전체 순위", "대륙 순위"])
+                                         columns=["연도", "전체 순위", "대륙 순위", "국가 순위"])
 
     def _on_pr_country_row_double_clicked(self, row, _col):
         item = self.pr_country_tbl.item(row, 0)
@@ -4434,11 +5818,18 @@ class WorldBrowserWindow(QDialog):
         "연도, 전체 순위, 대륙 순위 이렇게 3개로 뜨게"] columns가 3개면
         팀용(연도/전체순위/대륙순위), 2개면 국가용(연도/순위) — history의
         각 행 튜플 길이도 그에 맞춰 (연도,전체,대륙) 또는 (연도,순위)로
-        들어온다."""
+        들어온다.
+        [2026-08 확장, 신민용 요청: "팀 클릭하면 뜨는 전체 순위/대륙 순위에
+        국가 순위도 추가해달라"] 팀용 columns가 4개(연도/전체/대륙/국가)로
+        늘어났다 — get_team_power_history가 이제 4-튜플을 주므로 이 표는
+        columns 길이만 보고 그대로 그려서 별도 분기 없이 자동으로 4열이
+        된다."""
         n_cols = len(columns)
         dlg = QDialog(self)
         dlg.setWindowTitle(f"{title} — 이전 순위")
-        dlg.resize(360 if n_cols == 3 else 280, 360)
+        # [2026-08 확장] 팀용 열이 3개→4개로 늘어난 만큼 창 폭도 넓힌다 —
+        # 국가용(2열)은 기존 그대로, 팀용은 열 개수에 비례해 계산.
+        dlg.resize(280 + 80 * max(n_cols - 2, 0), 360)
         v = QVBoxLayout(dlg)
         tbl = QTableWidget(0, n_cols)
         tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)

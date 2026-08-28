@@ -2,7 +2,8 @@
 ui/log_panel.py  ─  우측 로그 패널 (HTML 컬러 로그)
 """
 import re
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QTextBrowser
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                              QTextBrowser, QPushButton)
 from PyQt6.QtCore import Qt, QUrl
 from game_engine import get_logs, get_match_detail
 
@@ -67,12 +68,75 @@ def _colorize(line: str) -> str:
         escaped = STAT_UP_RE.sub(repl_up, escaped)
         escaped = STAT_DOWN_RE.sub(repl_down, escaped)
 
-    # 경기 헤더는 클릭 앵커로 (밑줄 + 손가락 커서 효과는 QTextBrowser가 처리)
+    # 경기 헤더는 클릭 앵커로 (손가락 커서 효과는 QTextBrowser가 처리).
+    # [2026-08 신설, 신민용 요청: "경기 글자는 클릭하면 볼 수 있는데
+    # 로그에 특별한 표시가 없으니 모를 수 있으니 상자로 감싸서 표시하고
+    # 싶다"] 예전엔 밑줄도 없이 문장 끝에 🔎 하나만 붙어서 클릭 가능한
+    # 줄이라는 게 잘 안 보였다 — 헤더 전체를 테두리 있는 상자(칩)로
+    # 감싸 한눈에 "누르는 곳"으로 보이게 한다.
     if match_id:
         return (f'<a href="match:{match_id}" style="color:{line_color};'
-                f'text-decoration:none;">{escaped}  🔎</a>')
+                f'text-decoration:none; border:1px solid #3d7a99; border-radius:4px;'
+                f'padding:1px 7px; background-color:#132733;">🔎 {escaped}</a>')
 
     return f'<span style="color:{line_color};">{escaped}</span>'
+
+
+# [2026-08 신설, 로그 필터 버튼(전체/핵심/경기) 신설, 신민용 요청: "로그
+# 글자 옆에 3개 버튼을 만들고 전체는 지금처럼, 핵심은 휴식·훈련 스탯 +
+# 경기 기록만, 경기는 순수하게 경기 기록만"] "경기" 블록(log_type="match")
+# 안에는 헤더/결과/평점 말고도 📊 리그 순위, 🪑 벤치대기·🚑 부상결장,
+# 다득점 등 하이라이트 배너처럼 같은 log_type을 공유하는 줄이 여럿
+# 섞여 있다 — 이것들은 log_type만으로는 못 걸러내서 텍스트 화이트리스트로
+# "경기 기록 3줄"(헤더/결과/평점)만 남긴다. 하이라이트 배너는 고정
+# 접두사가 없어(예: "🅰🔥 멀티 어시스트!", "극장골!" 등 매번 다름)
+# 블랙리스트로는 새로 추가되는 문구를 놓칠 수 있으므로, 반대로 "남길
+# 것"만 화이트리스트로 정의해 항상 안전하게 걸러지도록 했다.
+_MATCH_RESULT_RE = re.compile(r'\d+\s*-\s*\d+.*\((승|무|패)\)\s*$')
+
+
+def _is_match_core_line(stripped: str) -> bool:
+    """경기 로그 한 줄이 "순수 경기 기록"(헤더/결과/평점)인지 판정."""
+    if stripped.startswith("⚽ 경기"):
+        return True
+    if stripped.startswith("평점"):
+        return True
+    if _MATCH_RESULT_RE.search(stripped):
+        return True
+    return False
+
+
+def _passes_filter(text: str, log_type: str, mode: str) -> bool:
+    """mode: "all"(전체) | "core"(핵심) | "match"(경기).
+
+    log_type은 add_log() 호출부가 이미 붙여서 game_log 테이블에 저장해온
+    값(event/injury/match/normal/salary/sep/slump/training)을 그대로
+    쓴다 — 신민용이 "쓸데없는 글"로 지목한 주급(salary)/대진·진출 등
+    안내(event)/구분선(sep)은 log_type만으로 걸러진다. "휴식에서 얻는
+    스탯, 훈련에서 얻는 스탯, 그리고 경기 기록만"이라는 확정에 따라
+    injury(부상 발생 알림)·slump(슬럼프)·normal(구단 목표 변경 등)도
+    "핵심"/"경기" 어느 쪽에도 포함하지 않는다 — 화이트리스트 방식이라
+    이 목록에 없는 log_type이 새로 생겨도 기본적으로 숨겨진다."""
+    if mode == "all":
+        return True
+    if log_type == "training":
+        return mode == "core"
+    if log_type == "match":
+        return _is_match_core_line(text.strip())
+    return False
+
+
+# 필터 버튼 3종의 공통 스타일 — "로그" 라벨 옆 작은 토글 버튼.
+_LOG_MODE_BTN_QSS = """
+QPushButton {
+    background:#232323; color:#999; border:1px solid #333;
+    border-radius:4px; padding:1px 8px; font-size:10px;
+}
+QPushButton:checked {
+    background:#2d4a6b; color:#eee; border:1px solid #4a7ab0;
+}
+QPushButton:hover:!checked { background:#2a2a2a; }
+"""
 
 
 class LogPanel(QWidget):
@@ -91,11 +155,37 @@ class LogPanel(QWidget):
         # 연도(year) 소속인지 기억한다 — refresh()에서 새로 들어온 줄의
         # year가 이거랑 다르면 그 지점에서 화면을 비우고 새로 시작한다.
         self._last_year = None
+        # [2026-08 신설, 로그 필터 버튼] 지금 화면에 쌓인(=올해 분량)
+        # 원본 로그를 (text, log_type) 형태로 따로 캐시해둔다 — 필터
+        # 버튼을 눌러 모드를 바꿀 때 DB를 다시 안 읽고 이 캐시만 다시
+        # 걸러서 그리기 위함. 매년 초기화되므로(연도 경계에서 리셋)
+        # "20년 쌓인 로그" 성능 문제와는 무관하게 항상 최대 1년치만 쌓인다.
+        self._year_entries = []  # [(text, log_type), ...]
+        self._filter_mode = "all"  # "all" | "core" | "match"
+
         lay = QVBoxLayout(self); lay.setContentsMargins(8,8,8,8); lay.setSpacing(4)
 
+        header_w = QWidget()
+        header_w.setStyleSheet("border-bottom:1px solid #2a2a2a;")
+        header_row = QHBoxLayout(header_w)
+        header_row.setContentsMargins(0, 0, 0, 4)
+        header_row.setSpacing(4)
         t = QLabel("로그")
-        t.setStyleSheet("color:#888;font-size:11px;border-bottom:1px solid #2a2a2a;padding-bottom:2px;")
-        lay.addWidget(t)
+        t.setStyleSheet("color:#888;font-size:11px;border:none;")
+        header_row.addWidget(t)
+        header_row.addStretch(1)
+        self._mode_buttons = {}
+        for mode_key, mode_label in (("all", "전체"), ("core", "핵심"), ("match", "경기")):
+            btn = QPushButton(mode_label)
+            btn.setCheckable(True)
+            btn.setAutoExclusive(True)
+            btn.setFixedHeight(20)
+            btn.setStyleSheet(_LOG_MODE_BTN_QSS)
+            btn.clicked.connect(lambda _checked, m=mode_key: self._set_filter_mode(m))
+            header_row.addWidget(btn)
+            self._mode_buttons[mode_key] = btn
+        self._mode_buttons["all"].setChecked(True)
+        lay.addWidget(header_w)
 
         self.te = QTextBrowser()
         self.te.setReadOnly(True)
@@ -131,6 +221,39 @@ class LogPanel(QWidget):
         dlg = MatchDetailDialog(data, self)
         dlg.exec()
 
+    def _set_filter_mode(self, mode: str):
+        """[2026-08 신설, 로그 필터 버튼] 전체/핵심/경기 버튼 클릭 시
+        호출. DB를 다시 읽지 않고 self._year_entries 캐시를 새 모드로
+        다시 걸러서 통째로 다시 그린다(버튼 클릭 시 1회뿐이라 연차가
+        쌓여도 비용은 항상 "올해분"으로 고정 — refresh()의 증분 갱신
+        성능 원칙과 무관)."""
+        if mode == self._filter_mode:
+            return
+        self._filter_mode = mode
+        self._render_full()
+
+    def _render_full(self):
+        """self._year_entries 전체를 현재 필터 모드로 걸러 setHtml로
+        다시 그린다 — 연도 경계(새해)나 필터 모드 변경 시 사용."""
+        html_lines = [_colorize(text) for text, log_type in self._year_entries
+                      if _passes_filter(text, log_type, self._filter_mode)]
+        chunk_html = "<br>".join(html_lines)
+        self.te.setHtml(f'<div style="font-family:\'Malgun Gothic\',monospace;'
+                        f'font-size:12px;">{chunk_html}</div>')
+        self._scroll_to_bottom()
+
+    def _scroll_to_bottom(self):
+        # [2026-08 버그수정, 신민용 리포트: "패널을 나갔다 들어오면 로그가
+        # 맨 아래가 아니라 위쪽에서 시작한다"] setHtml()/append() 직후
+        # 곧바로 verticalScrollBar().setValue(maximum())을 부르면, 그
+        # 시점엔 아직 QTextBrowser가 방금 넣은 내용의 레이아웃 계산을
+        # 끝내지 않아 maximum()이 옛 값(갱신 전 스크롤 범위)을 돌려주는
+        # 경우가 있었다 — QTimer.singleShot(0, …)으로 한 이벤트 루프 턴
+        # 뒤로 미루면 그 시점엔 레이아웃이 이미 끝나 있어 maximum()이 정확하다.
+        from PyQt6.QtCore import QTimer
+        sb = self.te.verticalScrollBar()
+        QTimer.singleShot(0, lambda: sb.setValue(sb.maximum()))
+
     def refresh(self):
         """[2026-07 성능 수정, 신민용 리포트: "20년 쌓였을 때랑 방금
         시작했을 때랑 next day 속도가 같아야 하는데 다른 것 같다"]
@@ -157,15 +280,10 @@ class LogPanel(QWidget):
         몰려 들어와도 이 처리는 그대로 안전하다 — 배치 안에서 연도가
         몇 번을 바뀌든 마지막 전환 지점 하나만 찾으면 되기 때문.
 
-        [2026-08 버그수정, 신민용 리포트: "패널을 나갔다 들어오면 로그가
-        맨 아래가 아니라 위쪽에서 시작한다"] setHtml()/append() 직후
-        곧바로 verticalScrollBar().setValue(maximum())을 부르면, 그
-        시점엔 아직 QTextBrowser가 방금 넣은 내용의 레이아웃 계산을
-        끝내지 않아 maximum()이 옛 값(갱신 전 스크롤 범위)을 돌려주는
-        경우가 있었다 — 그 결과 "맨 아래로 보냈다고 생각했지만 실제로는
-        새로 늘어난 부분만큼 못 미친 위치"에 멈췄다. QTimer.singleShot(0, …)
-        으로 한 이벤트 루프 턴 뒤로 미루면 그 시점엔 레이아웃이 이미
-        끝나 있어 maximum()이 정확하다."""
+        [2026-08 확장, 로그 필터 버튼(전체/핵심/경기) 신설] get_logs()가
+        이제 log_type도 같이 준다. 새로 받아온 줄은 원본 그대로
+        self._year_entries에 캐시해두고(필터 모드 전환용), 화면에는
+        현재 필터 모드를 통과한 줄만 이어붙인다(_passes_filter)."""
         entries, new_last_id = get_logs(self._last_log_id)
         if not entries:
             return
@@ -174,7 +292,7 @@ class LogPanel(QWidget):
         start_idx = 0
         year_changed = False
         last_year = self._last_year
-        for i, (_text, year) in enumerate(entries):
+        for i, (_text, year, _log_type) in enumerate(entries):
             if last_year is not None and year != last_year:
                 start_idx = i
                 year_changed = True
@@ -182,18 +300,25 @@ class LogPanel(QWidget):
         self._last_year = last_year
 
         visible_entries = entries[start_idx:]
-        html_lines = [_colorize(text) for text, _year in visible_entries]
-        chunk_html = "<br>".join(html_lines)
-        if not self._initialized or year_changed:
-            self.te.setHtml(f'<div style="font-family:\'Malgun Gothic\',monospace;'
-                            f'font-size:12px;">{chunk_html}</div>')
-            self._initialized = True
+        if year_changed:
+            self._year_entries = [(text, log_type) for text, _year, log_type in visible_entries]
         else:
+            self._year_entries.extend((text, log_type) for text, _year, log_type in visible_entries)
+        self._last_log_id = new_last_id
+
+        if not self._initialized or year_changed:
+            self._render_full()
+            self._initialized = True
+            return
+
+        # 증분 갱신: 이번에 새로 들어온 줄 중 현재 필터를 통과한 것만
+        # append(기존 내용은 다시 그리지 않는다 — 위 refresh() docstring의
+        # "다음 날" 성능 원칙 유지).
+        html_lines = [_colorize(text) for text, _year, log_type in visible_entries
+                      if _passes_filter(text, log_type, self._filter_mode)]
+        if html_lines:
+            chunk_html = "<br>".join(html_lines)
             # QTextBrowser.append()은 기존 내용을 다시 파싱/렌더링하지 않고
             # 끝에 새 블록만 덧붙인다 — 여기가 "증분" 갱신의 핵심.
             self.te.append(chunk_html)
-        self._last_log_id = new_last_id
-
-        from PyQt6.QtCore import QTimer
-        sb = self.te.verticalScrollBar()
-        QTimer.singleShot(0, lambda: sb.setValue(sb.maximum()))
+            self._scroll_to_bottom()

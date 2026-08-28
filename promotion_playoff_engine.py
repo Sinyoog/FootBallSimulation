@@ -561,7 +561,8 @@ def simulate_my_po_match(week, p, day=None):
     from game_engine import (add_log, get_player, update_player,
                              _player_perf, _my_result, _update_pop, _gen_score,
                              _save_match_detail, _soft_cap,
-                             _check_suspended, _roll_red_card, _apply_red_card_dismissal,
+                             _check_suspended, _check_bench, _roll_red_card,
+                             _apply_red_card_dismissal,
                              _roll_card_events)
     from database import get_conn
     info = get_my_po_match(week, day=day, p=p)
@@ -582,6 +583,15 @@ def simulate_my_po_match(week, p, day=None):
         add_log(f"🟥 출전정지로 결장{'  (다음 경기부터 복귀)' if _new_susp == 0 else f'  (남은 정지 {_new_susp}경기)'}",
                 "event")
 
+    # [2026-08 신설, 신민용 리포트: "승강 플레이오프도 리그처럼 벤치가
+    # 있어야 한다"] 리그와 동일한 _check_bench 재사용, 비교 기준은 내
+    # 소속팀 OVR(my_ovr_team) — 승강 PO는 국내 club competition이라
+    # 챔스/컵과 동일하게 클럽 팀 기준이 맞다. 출전정지면 벤치 확률은
+    # 무의미하므로 건너뛴다.
+    _benched = (not _suspended) and _check_bench(p, team_avg_ovr=my_ovr_team)
+    if _benched:
+        add_log("🪑 벤치 대기로 결장", "event")
+
     # 내 출전 보너스 — cwc/챔스와 완전히 동일한 공식.
     _my_ovr = p.get("ovr", 40)
     _gap = max(0.0, _my_ovr - my_ovr_team)
@@ -592,7 +602,7 @@ def simulate_my_po_match(week, p, day=None):
     _pe = PERSONALITY_EFFECTS.get(p.get("personality", ""), {})
     if "team_win_bonus" in _pe:
         bonus *= (1.0 + _pe["team_win_bonus"])
-    if _suspended:
+    if _suspended or _benched:
         bonus = 0.0
     if is_home:
         h_ovr, a_ovr = my_ovr_team + bonus, opp_ovr_team
@@ -607,11 +617,11 @@ def simulate_my_po_match(week, p, day=None):
         pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
     hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
 
-    if _suspended:
+    if _suspended or _benched:
         goals, assists, saves, rating = 0, 0, 0, 0.0
         events, detail = [], {"shots": 0, "shots_on": 0, "key_passes": 0,
                               "dribbles": 0, "blocks": 0, "pass_acc": 0.0}
-        _absence_reason = "suspension"
+        _absence_reason = "suspension" if _suspended else None
         _yellow_cnt = 0
     else:
         _opp_ovr = a_ovr if is_home else h_ovr
@@ -625,7 +635,7 @@ def simulate_my_po_match(week, p, day=None):
             _absence_reason = _card_reason
         elif _yellow_ev:
             events = list(events) + _yellow_ev
-    if not _suspended and "big_match_rating" in _pe:
+    if not (_suspended or _benched) and "big_match_rating" in _pe:
         rating = max(3.0, min(10.0, round(rating + _pe["big_match_rating"], 1)))
     my_result = _my_result(outcome, is_home)
 
@@ -636,7 +646,7 @@ def simulate_my_po_match(week, p, day=None):
            my_absence_reason=?, my_yellow_cards=?
            WHERE id=?""",
         (hs, as_, pso_winner, pso_score,
-         0 if _suspended else 1, _get_field_pos_safe(p),
+         0 if (_suspended or _benched) else 1, _get_field_pos_safe(p) if not _benched else "",
          saves, goals, assists, rating, _absence_reason, _yellow_cnt, m["id"]))
     conn.commit()
 
@@ -665,7 +675,7 @@ def simulate_my_po_match(week, p, day=None):
     detail_id = _save_match_detail(
         p, week, "승강 플레이오프", is_home, home_disp, away_disp,
         hs, as_, my_result, goals, assists, saves, rating,
-        events, True, False, detail, pso=pso)
+        events, not (_suspended or _benched), _benched, detail, pso=pso)
     marker = f" [match:{detail_id}]" if detail_id else ""
 
     add_log("─" * 44, "sep")
@@ -686,17 +696,22 @@ def simulate_my_po_match(week, p, day=None):
     # 스탯 컬럼을 보여줄 수 있다.
     conceded = as_ if is_home else hs
     my_score = hs if is_home else as_
+    # [2026-08 신설] po_history엔 다른 대회 테이블(cl_matches 등)과 달리
+    # my_played 컬럼이 없다 — absence_reason만으로 결장 사유를 구분해야
+    # 하므로, 벤치는 None이 아니라 "bench" 문자열 자체를 남긴다(다른
+    # 대회처럼 "my_played=0 + reason=NULL → 벤치" 추론이 여기선 불가능).
+    _po_hist_absence = "bench" if _benched else _absence_reason
     conn2 = get_conn()
     conn2.execute(
         """INSERT INTO po_history(year, team_name, opp_name, result, goals, assists, rating,
                                    shots, shots_on, key_passes, dribbles, blocks, pass_acc,
-                                   saves, conceded, score, position)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                   saves, conceded, score, position, absence_reason)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (st_year_of(week), my_team_name, opp_name, rs, goals, assists, rating,
          detail.get("shots", 0), detail.get("shots_on", 0), detail.get("key_passes", 0),
          detail.get("dribbles", 0), detail.get("blocks", 0), detail.get("pass_acc", 0.0),
          saves, conceded, f"{my_score}-{conceded}",
-         _get_field_pos_safe(p) if not _suspended else ""))
+         _get_field_pos_safe(p) if not (_suspended or _benched) else "", _po_hist_absence))
     conn2.commit()
     conn2.close()
 

@@ -1023,7 +1023,8 @@ def simulate_my_cup_match(week, p, day=None):
     from game_engine import (add_log, get_player, update_player,
                              _player_perf, _my_result, _update_pop, _gen_score,
                              _save_match_detail, _soft_cap,
-                             _check_suspended, _roll_red_card, _apply_red_card_dismissal,
+                             _check_suspended, _check_bench, _roll_red_card,
+                             _apply_red_card_dismissal,
                              _roll_card_events)
     from constants import PERSONALITY_EFFECTS
     # [2026-07 버그수정] day 파라미터가 시그니처엔 있었지만 실제로
@@ -1056,6 +1057,12 @@ def simulate_my_cup_match(week, p, day=None):
     _my_ovr = p.get("ovr", 40)
     _team_ovr = he["ovr"] if is_home else ae["ovr"]
     _gap = max(0.0, _my_ovr - _team_ovr)
+    # [2026-08 신설, 신민용 리포트: "국내컵도 리그처럼 벤치가 있어야 한다"]
+    # 리그와 동일한 _check_bench 재사용, 비교 기준만 이 대회 팀 OVR로.
+    # 출전정지면 벤치 확률은 무의미하므로 건너뛴다(우선순위: 징계 > 벤치).
+    _benched = (not _suspended) and _check_bench(p, team_avg_ovr=_team_ovr)
+    if _benched:
+        add_log("🪑 벤치 대기로 결장", "event")
     _star = 1.0 + max(0.0, (_my_ovr - 60) / 40.0) ** 1.8 * 3.0
     bonus = _gap * 0.30 * _star + max(0.0, _my_ovr - 50) * 0.08
     bonus = _soft_cap(bonus, 30.0)
@@ -1065,7 +1072,7 @@ def simulate_my_cup_match(week, p, day=None):
     _pe = PERSONALITY_EFFECTS.get(p.get("personality", ""), {})
     if "team_win_bonus" in _pe:
         bonus *= (1.0 + _pe["team_win_bonus"])
-    if _suspended:
+    if _suspended or _benched:
         bonus = 0.0
     h_ovr = he["ovr"] + (bonus if is_home else 0)
     a_ovr = ae["ovr"] + (0 if is_home else bonus)
@@ -1077,11 +1084,11 @@ def simulate_my_cup_match(week, p, day=None):
         pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
     hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
 
-    if _suspended:
+    if _suspended or _benched:
         goals, assists, saves, rating = 0, 0, 0, 0.0
         events, detail = [], {"shots": 0, "shots_on": 0, "key_passes": 0,
                               "dribbles": 0, "blocks": 0, "pass_acc": 0.0}
-        _absence_reason = "suspension"
+        _absence_reason = "suspension" if _suspended else None
         _yellow_cnt = 0
     else:
         # [2026-07 통일] intl_engine(국제대회)과 동일하게 "오늘 상대의 실제 팀
@@ -1102,9 +1109,9 @@ def simulate_my_cup_match(week, p, day=None):
     # [2026-07 신설] '겁쟁이' 성격의 cup_rating(컵대회 전반 위축) +
     # '소심함'의 big_match_rating(결승전 한정 위축) 연결. 둘 다 정의만
     # 돼있고 실제 경기엔 연결이 안 돼있던 효과였다.
-    if not _suspended and "cup_rating" in _pe:
+    if not (_suspended or _benched) and "cup_rating" in _pe:
         rating = max(3.0, min(10.0, round(rating + _pe["cup_rating"], 1)))
-    if m.get("round_name") == "결승" and not _suspended and "big_match_rating" in _pe:
+    if m.get("round_name") == "결승" and not (_suspended or _benched) and "big_match_rating" in _pe:
         rating = max(3.0, min(10.0, round(rating + _pe["big_match_rating"], 1)))
     my_result = _my_result(outcome, is_home)
 
@@ -1122,7 +1129,7 @@ def simulate_my_cup_match(week, p, day=None):
                     my_dribbles=?, my_blocks=?, my_pass_acc=?,
                     my_absence_reason=?, my_yellow_cards=?
                     WHERE id=?""",
-                 (hs, as_, pso_winner, pso_score, 0 if _suspended else 1,
+                 (hs, as_, pso_winner, pso_score, 0 if (_suspended or _benched) else 1,
                   saves, goals, assists, rating, day,
                   detail["shots"], detail["shots_on"], detail["key_passes"],
                   detail["dribbles"], detail["blocks"], detail["pass_acc"],
@@ -1158,7 +1165,7 @@ def simulate_my_cup_match(week, p, day=None):
     detail_id = _save_match_detail(
         p, week, comp_name, is_home, home_disp, away_disp,
         hs, as_, my_result, goals, assists, saves, rating,
-        events, True, False, detail, pso=pso)
+        events, not (_suspended or _benched), _benched, detail, pso=pso)
     marker = f" [match:{detail_id}]" if detail_id else ""
 
     add_log("─" * 44, "sep")

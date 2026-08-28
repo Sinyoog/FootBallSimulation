@@ -909,6 +909,18 @@ def award_icon(award_type: str, fallback_map: dict = None) -> str:
 TALENT_TIER_ORDER = ["god", "worldclass", "superstar", "elite", "pro",
                      "semipro", "amateur", "ordinary", "untalented"]
 
+# [2026-08 신설, 난이도 시스템 13번] 어려움 난이도에서는 새 선수 생성 시 재능
+# 등급을 "신"(god)이 절대 뽑히지 않게 한다(신민용 확정) — god을 제외한 8개
+# 등급으로 재배분한 확률표를 별도로 둔다. 합계 100%, 중간 등급(프로)이 가장
+# 흔하고 양 끝(신급 바로 아래인 월드클래스, 최하단인 재능없음)이 가장 희귀한
+# 형태: 월드클래스5%/슈퍼스타12%/엘리트18%/프로20%/세미프로18%/아마추어12%/
+# 평범10%/재능없음5%.
+TALENT_TIER_ORDER_HARD = [t for t in TALENT_TIER_ORDER if t != "god"]
+TALENT_TIER_HARD_PROB = {
+    "worldclass": 0.05, "superstar": 0.12, "elite": 0.18, "pro": 0.20,
+    "semipro": 0.18, "amateur": 0.12, "ordinary": 0.10, "untalented": 0.05,
+}
+
 # (구버전 호환) 예전 티어명을 새 티어로 매핑 — worldclass/elite/pro/semipro/
 # ordinary는 이름이 그대로 남아있어(캡 수치만 재조정) 기존 세이브의
 # talent_tier 값이 별도 변환 없이도 새 TALENT_TIERS에서 바로 유효하다.
@@ -3264,6 +3276,49 @@ LEAGUE_SQUAD_STANDARD = {
     "F":  {"wc_per_team": (0, 0), "min_talent": "ordinary", "min_ovr": 35},
 }
 
+
+
+# ── 나이별 OVR 성장 곡선(잠재치 대비 비율) ──────────────────
+# [2026-08 신설, 신민용 확정(GPT 협업 설계)] "16~17세에 이미 잠재치를
+# 거의 다 찍는" 문제(생성 시점 스케일링이 신인 교체/스쿼드 보정 경로엔
+# 아예 안 걸려있던 버그, ai_lifecycle.py 참고)를 계기로 나이별 성장
+# 곡선 자체를 명시적인 표로 교체한다 — 기존 "16세 86~93%→22세 100%
+# 선형보간" 대신, 나이마다 정확한 목표 비율을 지정하고 26세부터 완전
+# 성숙(100%)으로 본다. database.py(_generate_team_players, 최초 생성)와
+# ai_lifecycle.py(_retire_and_replace/_rebalance_squad_sizes, 신인 교체)
+# 양쪽이 이 표 하나를 공유해야 두 생성 경로가 항상 일치한다.
+AGE_OVR_FRACTION = {
+    16: 0.70, 17: 0.74, 18: 0.78, 19: 0.83, 20: 0.90,
+    21: 0.92, 22: 0.94, 23: 0.96, 24: 0.97, 25: 0.98,
+}
+AGE_OVR_FRACTION_MATURE_AGE = 26  # 이 나이부터 100%(스케일 없음)
+
+# [2026-08 신설] 1% 확률의 "조기 성장형" 특급 유망주 — 같은 나이라도
+# 일반 곡선보다 훨씬 높은 비율에서 시작해 26세 이전에 이미 정상급에
+# 근접한다("16살인데 이미 프로가 주목하는 괴물" 케이스).
+AGE_OVR_FRACTION_ELITE = {
+    16: 0.81, 17: 0.83, 18: 0.85, 19: 0.88, 20: 0.91,
+    21: 0.93, 22: 0.95, 23: 0.965, 24: 0.975, 25: 0.985,
+}
+AGE_OVR_ELITE_CHANCE = 0.01  # 신인/유망주 생성 시 이 표를 대신 쓸 확률
+
+
+def roll_age_ovr_fraction(age: int) -> float:
+    """이 나이의 선수가 잠재치(target) 대비 실제로 발현할 비율을 굴린다.
+    26세 이상이면 스케일 없이 1.0(기존 동작과 동일). 1% 확률로 조숙형
+    표를 쓰고, 표에서 나온 값에도 약간의 랜덤 오차(±2%p)를 얹어 같은
+    나이라도 개인차가 자연스럽게 생기게 한다."""
+    if age >= AGE_OVR_FRACTION_MATURE_AGE:
+        return 1.0
+    table = (AGE_OVR_FRACTION_ELITE if random.random() < AGE_OVR_ELITE_CHANCE
+             else AGE_OVR_FRACTION)
+    base = table.get(age)
+    if base is None:
+        # 16 미만(비정상 데이터 방어) 또는 표에 없는 나이는 가장 가까운
+        # 정의된 값으로 클램프.
+        nearest = min(table.keys(), key=lambda a: abs(a - age)) if age < 16 else 25
+        base = table.get(nearest, table[25])
+    return max(0.5, min(1.0, base + random.uniform(-0.02, 0.02)))
 
 
 # ── 리그 부유도(연봉 수준) 오버라이드 ───────────────────────

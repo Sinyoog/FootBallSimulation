@@ -1143,7 +1143,8 @@ def simulate_my_cwc_match(week, p, day=None):
     from game_engine import (add_log, get_player, update_player,
                              _player_perf, _my_result, _update_pop, _gen_score,
                              _save_match_detail, _soft_cap,
-                             _check_suspended, _roll_red_card, _apply_red_card_dismissal,
+                             _check_suspended, _check_bench, _roll_red_card,
+                             _apply_red_card_dismissal,
                              _roll_card_events)
     info = get_my_cwc_match(week, day=day)
     if not info:
@@ -1167,6 +1168,12 @@ def simulate_my_cwc_match(week, p, day=None):
     _my_ovr = p.get("ovr", 40)
     _team_ovr = he["ovr"] if is_home else ae["ovr"]
     _gap = max(0.0, _my_ovr - _team_ovr)
+    # [2026-08 신설, 신민용 리포트: "클럽월드컵도 리그처럼 벤치가 있어야
+    # 한다"] 리그와 동일한 _check_bench 재사용, 비교 기준만 이 대회 팀
+    # OVR로. 출전정지면 벤치 확률은 무의미하므로 건너뛴다.
+    _benched = (not _suspended) and _check_bench(p, team_avg_ovr=_team_ovr)
+    if _benched:
+        add_log("🪑 벤치 대기로 결장", "event")
     _star = 1.0 + max(0.0, (_my_ovr - 60) / 40.0) ** 1.8 * 3.0
     bonus = _gap * 0.30 * _star + max(0.0, _my_ovr - 50) * 0.08
     bonus = _soft_cap(bonus, 30.0)
@@ -1174,7 +1181,7 @@ def simulate_my_cwc_match(week, p, day=None):
     _pe = PERSONALITY_EFFECTS.get(p.get("personality", ""), {})
     if "team_win_bonus" in _pe:
         bonus *= (1.0 + _pe["team_win_bonus"])
-    if _suspended:
+    if _suspended or _benched:
         bonus = 0.0
     h_ovr = he["ovr"] + (bonus if is_home else 0)
     a_ovr = ae["ovr"] + (0 if is_home else bonus)
@@ -1187,11 +1194,11 @@ def simulate_my_cwc_match(week, p, day=None):
         pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
     hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
 
-    if _suspended:
+    if _suspended or _benched:
         goals, assists, saves, rating = 0, 0, 0, 0.0
         events, detail = [], {"shots": 0, "shots_on": 0, "key_passes": 0,
                               "dribbles": 0, "blocks": 0, "pass_acc": 0.0}
-        _absence_reason = "suspension"
+        _absence_reason = "suspension" if _suspended else None
         _yellow_cnt = 0
     else:
         _opp_ovr = (ae["ovr"] if is_home else he["ovr"])
@@ -1205,7 +1212,7 @@ def simulate_my_cwc_match(week, p, day=None):
             _absence_reason = _card_reason
         elif _yellow_ev:
             events = list(events) + _yellow_ev
-    if not _suspended and "big_match_rating" in _pe:
+    if not (_suspended or _benched) and "big_match_rating" in _pe:
         rating = max(3.0, min(10.0, round(rating + _pe["big_match_rating"], 1)))
     my_result = _my_result(outcome, is_home)
     my_conceded = (as_ if is_home else hs)
@@ -1220,7 +1227,7 @@ def simulate_my_cwc_match(week, p, day=None):
                     my_absence_reason=?, my_yellow_cards=?
                     WHERE id=?""",
                  (hs, as_, pso_winner, pso_score,
-                  0 if _suspended else 1, _get_field_pos_safe(p),
+                  0 if (_suspended or _benched) else 1, _get_field_pos_safe(p),
                   saves, goals, assists, rating,
                   detail["shots"], detail["shots_on"], detail["key_passes"],
                   detail["dribbles"], detail["blocks"], detail["pass_acc"],
@@ -1261,7 +1268,7 @@ def simulate_my_cwc_match(week, p, day=None):
     detail_id = _save_match_detail(
         p, week, comp_name, is_home, home_disp, away_disp,
         hs, as_, my_result, goals, assists, saves, rating,
-        events, True, False, detail, pso=pso)
+        events, not (_suspended or _benched), _benched, detail, pso=pso)
     marker = f" [match:{detail_id}]" if detail_id else ""
 
     add_log("─" * 44, "sep")

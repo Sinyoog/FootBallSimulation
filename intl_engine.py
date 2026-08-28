@@ -2859,6 +2859,55 @@ def _resolve_pso(h_ovr, a_ovr):
     return winner_home, score
 
 
+# [2026-08 신설, 신민용 요청: "월드컵 로테이션도 중요하며 출전을 몇 번
+# 했는지만 표시해줘" + "선발 기준은 OVR/나이 위주로"] ui/formation_widget.py
+# 의 _INTL_STARTER_POSITIONS/_INTL_BENCH_POSITIONS와 완전히 동일한 값 —
+# get_or_create_intl_squad가 26인 풀을 새로 뽑을 때 쓰는 포지션 구성이라
+# 두 파일이 어긋나면 화면에 보이는 26인과 실제 고정된 26인이 갈라진다
+# (UI 쪽은 PyQt 의존이라 여기서 직접 import하지 않고 그대로 복제 유지 —
+# 값을 바꿀 땐 반드시 양쪽 다 같이 바꿔야 한다).
+_INTL_MATCHDAY_STARTER_POS = ["GK", "CB", "CB", "LB", "RB", "CM", "CM", "CAM", "LW", "RW", "ST"]
+_INTL_MATCHDAY_BENCH_POS = ["GK", "GK", "CB", "CB", "LB", "RB",
+                            "CDM", "CM", "CAM", "CM", "ST", "ST", "ST", "ST", "ST"]
+_INTL_MATCHDAY_FULL_POS = _INTL_MATCHDAY_STARTER_POS + _INTL_MATCHDAY_BENCH_POS
+# 로테이션 강도 — 이미 이 대회에서 뛴 횟수 1회당 이만큼 선발 점수를 깎는다.
+# 국대 선발 기준(_fill의 ovr - age차*0.3)과 같은 척도라, 예를 들어 OVR이
+# 3 정도 차이나는 두 후보는 3회 이상 출전 격차가 나야 역전된다 — "실력
+# 격차가 크면 여전히 실력이 이긴다"는 원칙은 유지하면서, 실력이 비슷한
+# 후보끼리는 그동안 덜 뛴 쪽이 우선권을 가져 로테이션이 자연히 생긴다.
+_INTL_ROTATION_PENALTY = 1.0
+
+
+def _pick_intl_starters(tournament_id, country, avg_ovr):
+    """이번 경기에 실제로 뛰는 11명을 이 대회 동안 고정된 26인 풀
+    (database.get_or_create_intl_squad)에서 골라낸다 — 예선/본선을
+    통틀어 대회 내내 같은 풀을 쓰므로, 다른 경기에서 이미 여러 번 뛴
+    선수는 이번엔 살짝 밀릴 수 있다(로테이션). 국대 선발 기준과 동일한
+    'OVR 주 기준(27세 근접 소폭 가중)' 철학에 출전 횟수 페널티만 얹는다.
+    풀이 8명 미만(극단적으로 부실한 팀)이면 빈 리스트를 반환 —
+    호출부는 이 경우 그냥 출전 카운트를 건너뛴다(경기 결과 자체는
+    이 함수와 무관하게 이미 팀 평균 OVR로 결정돼 있어 영향 없음)."""
+    from database import get_or_create_intl_squad
+    pool = get_or_create_intl_squad(tournament_id, country, avg_ovr, _INTL_MATCHDAY_FULL_POS)
+    if len(pool) < 8:
+        return []
+
+    def _score(r):
+        return (r["ovr"] - abs(r.get("age", 27) - 27) * 0.3
+                - r.get("appearances", 0) * _INTL_ROTATION_PENALTY)
+
+    remaining = list(pool)
+    starters = []
+    for pos in _INTL_MATCHDAY_STARTER_POS:
+        cands = [r for r in remaining if r["position"] == pos]
+        if not cands:
+            continue
+        best = max(cands, key=_score)
+        starters.append(best)
+        remaining.remove(best)
+    return starters
+
+
 def _sim_ai_match(t, m, my_played=False, conn=None, reason="injury", batch=None):
     """AI끼리(또는 내가 결장한 내 경기) 시뮬.
 
@@ -2888,6 +2937,26 @@ def _sim_ai_match(t, m, my_played=False, conn=None, reason="injury", batch=None)
     # cup_engine은 이미 diff를 넘기고 있었는데 국제대회 조별/예선 AI 매치만
     # 빠져 있었음.
     hs, as_ = _gen_intl_score(outcome, he["ovr"] - ae["ovr"])
+
+    # [2026-08 신설, 신민용 요청: "출전을 몇 번 했는지만 표시해줘"] 이 경기의
+    # 실제 스타팅 11(양 팀 각각)을 정하고 그 선수들만 intl_squad.appearances를
+    # +1 한다. _sim_ai_match는 이 경기(m)가 미진행(home_score=-1)일 때만
+    # 호출되고 호출 즉시 결과를 채워 다시는 이 경기로 안 돌아오므로(화면을
+    # 몇 번을 열고 닫아도 재호출되지 않음), 여기가 중복 카운트 걱정 없는
+    # 유일한 지점이다 — UI 쪽(포메이션 화면 렌더링)에 걸면 화면을 열 때마다
+    # 매번 다시 올라가 버려서 여기로 옮겨야만 했다. 실패해도(예: 아직 26인
+    # 풀이 없어 새로 뽑는 중 예외 등) 출전 카운트는 부가 기능일 뿐 경기
+    # 결과 자체엔 영향이 없어야 하므로 조용히 넘어간다.
+    try:
+        from database import bump_intl_squad_appearances
+        home_starters = _pick_intl_starters(t["id"], m["home"], he["ovr"])
+        away_starters = _pick_intl_starters(t["id"], m["away"], ae["ovr"])
+        if home_starters:
+            bump_intl_squad_appearances(t["id"], m["home"], [r["id"] for r in home_starters])
+        if away_starters:
+            bump_intl_squad_appearances(t["id"], m["away"], [r["id"] for r in away_starters])
+    except Exception:
+        pass
 
     # [2026-07 신설] 이 경기가 실제로 진행되는 날짜를 지금 시점 기준으로
     # 한 번 계산해 저장한다 — 나중에 커리어/은퇴창에서 재계산 없이 그대로 쓴다.
@@ -2986,7 +3055,8 @@ def simulate_my_match(week, p, day=None):
     from game_engine import (add_log, get_player, update_player,
                              _player_perf, _my_result, _update_pop, _gen_score,
                              _save_match_detail, _soft_cap,
-                             _check_suspended, _roll_red_card, _apply_red_card_dismissal,
+                             _check_suspended, _check_bench, _roll_red_card,
+                             _apply_red_card_dismissal,
                              _roll_card_events)
     info = get_my_match(week, day=day)
     if not info:
@@ -3045,6 +3115,16 @@ def simulate_my_match(week, p, day=None):
     _my_ovr = p.get("ovr", 40)
     _team_ovr = he["ovr"] if is_home else ae["ovr"]
     _gap = max(0.0, _my_ovr - _team_ovr)
+    # [2026-08 신설, 신민용 리포트: "월드컵 등 국가대표도 리그처럼 벤치가
+    # 있어야 한다"] 리그와 동일한 _check_bench 재사용 — 비교 기준은
+    # _team_ovr(이 경기에서 내가 속한 팀의 OVR)인데, 국가대표 경기에선
+    # 이 값 자체가 이미 "국가대표팀 평균 OVR"이라(클럽 OVR이 아님) 별도
+    # 보정 없이 그대로 넘기면 된다 — 클럽에선 벤치 멤버라도 국가대표에선
+    # 주전일 수 있고 그 반대도 가능하다는 원칙이 자연스럽게 반영된다.
+    # 출전정지면 벤치 확률은 무의미하므로 건너뛴다.
+    _benched = (not _suspended) and _check_bench(p, team_avg_ovr=_team_ovr)
+    if _benched:
+        add_log("🪑 벤치 대기로 결장", "event")
     _star = 1.0 + max(0.0, (_my_ovr - 60) / 40.0) ** 1.8 * 3.0
     bonus = _gap * 0.30 * _star + max(0.0, _my_ovr - 50) * 0.08
     bonus = _soft_cap(bonus, 30.0)
@@ -3054,7 +3134,7 @@ def simulate_my_match(week, p, day=None):
     _pe = PERSONALITY_EFFECTS.get(p.get("personality", ""), {})
     if "team_win_bonus" in _pe:
         bonus *= (1.0 + _pe["team_win_bonus"])
-    if _suspended:
+    if _suspended or _benched:
         bonus = 0.0
     h_ovr = he["ovr"] + (bonus if is_home else 0)
     a_ovr = ae["ovr"] + (0 if is_home else bonus)
@@ -3066,11 +3146,11 @@ def simulate_my_match(week, p, day=None):
         pso_winner = m["home"] if win_home else m["away"]
     hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
 
-    if _suspended:
+    if _suspended or _benched:
         goals, assists, saves, rating = 0, 0, 0, 0.0
         events, detail = [], {"shots": 0, "shots_on": 0, "key_passes": 0,
                               "dribbles": 0, "blocks": 0, "pass_acc": 0.0}
-        _absence_reason = "suspension"
+        _absence_reason = "suspension" if _suspended else None
         _yellow_cnt = 0
     else:
         # [수정] 국제대회 개인 경기력은 '상대 국가대표 평균 OVR'을 dom 기준으로
@@ -3092,7 +3172,7 @@ def simulate_my_match(week, p, day=None):
             events = list(events) + _yellow_ev
     # [2026-07 신설] '소심함' 성격의 big_match_rating 연결 — 국가대표 경기는
     # 전부 빅매치 성격이라(챔스와 동일 기준) 모든 경기에 적용한다.
-    if not _suspended and "big_match_rating" in _pe:
+    if not (_suspended or _benched) and "big_match_rating" in _pe:
         rating = max(3.0, min(10.0, round(rating + _pe["big_match_rating"], 1)))
     my_result = _my_result(outcome, is_home)
     my_conceded = (as_ if is_home else hs)
@@ -3113,7 +3193,7 @@ def simulate_my_match(week, p, day=None):
                     day=?, my_absence_reason=?, my_yellow_cards=?
                     WHERE id=?""",
                  (hs, as_, pso_winner, pso_score,
-                  0 if _suspended else 1, nat, _get_field_pos(p),
+                  0 if (_suspended or _benched) else 1, nat, _get_field_pos(p),
                   saves, goals, assists, rating,
                   detail["shots"], detail["shots_on"], detail["key_passes"],
                   detail["dribbles"], detail["blocks"], detail["pass_acc"],
@@ -3178,7 +3258,7 @@ def simulate_my_match(week, p, day=None):
     detail_id = _save_match_detail(
         p, week, comp_name, is_home, home_disp, away_disp,
         hs, as_, my_result, goals, assists, saves, rating,
-        events, True, False, detail, pso=pso)
+        events, not (_suspended or _benched), _benched, detail, pso=pso)
     marker = f" [match:{detail_id}]" if detail_id else ""
 
     add_log("─" * 44, "sep")

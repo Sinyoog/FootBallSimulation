@@ -511,6 +511,10 @@ class RetireWindow(QDialog):
 
         lay.addStretch()
 
+        # [2026-08 성능수정] 위에서 만든 모든 표에 이제서야 한 번만
+        # ResizeToContents를 건다 — _make_table 주석 참고.
+        self._finalize_tables()
+
         # ── 하단 버튼: 좌측 패널 바닥에 고정 (화면 크기와 무관하게 항상 보임) ──
         btn_row = QHBoxLayout()
         btn_row.setContentsMargins(16, 6, 16, 10)
@@ -840,8 +844,12 @@ class RetireWindow(QDialog):
         tbl.setHorizontalHeaderLabels(cols)
         tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         tbl.verticalHeader().setVisible(False)
-        for i in range(len(cols)):
-            tbl.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+        # [2026-08 성능수정] 이 표는 _make_table을 안 거치는 별도 코드라
+        # ResizeToContents를 즉시 걸고 있었다 — 다른 표들과 동일하게
+        # _finalize_tables에서 일괄 처리하도록 등록만 해둔다.
+        if not hasattr(self, "_all_tables"):
+            self._all_tables = []
+        self._all_tables.append(tbl)
         for i, inj in enumerate(injuries):
             if inj.get("return_date"):
                 period = f"{inj['start_date']} ~ {inj['return_date']}"
@@ -1313,8 +1321,21 @@ class RetireWindow(QDialog):
                     str(m["goals"]), str(m["assists"])]
                     + [_emap.get(c, "—") for c in extra_cols]
                     + [str(m["rating"]), m.get("score", "") or "—", m["result"]])
-            if m.get("absence_reason"):
+            # [2026-08 버그수정, 신민용 리포트: "컵대회/챔스처럼 승강 PO도
+            # 부상/출전정지/벤치가 제대로 표시돼야 한다"] 예전엔 absence_
+            # reason이 뭐든(true-ish) 무조건 전체 결장 취급했다 — 이러면
+            # red_card(실제로 뛴 경기, 스탯도 진짜)까지 결장으로 지워버린다
+            # (다른 테이블들은 이미 _FULL_ABSENCE_REASONS로 injury/suspension
+            # 만 걸러내고 있었는데 이 테이블만 예외였다). 그리고 po_history엔
+            # my_played 컬럼이 없어 다른 테이블처럼 "벤치" 추론이 안 되므로,
+            # promotion_playoff_engine.py가 벤치일 때 남기는 "bench" 문자열을
+            # 직접 확인한다.
+            _reason_label = None
+            if m.get("absence_reason") in _FULL_ABSENCE_REASONS:
                 _reason_label = _ABSENCE_LABEL.get(m["absence_reason"], m["absence_reason"])
+            elif m.get("absence_reason") == "bench":
+                _reason_label = "벤치"
+            if _reason_label:
                 vals = list(vals)
                 vals[4] = "—"; vals[5] = "—"
                 for _k in range(6, 6 + len(extra_cols)):
@@ -1363,15 +1384,32 @@ class RetireWindow(QDialog):
         tbl.setHorizontalHeaderLabels(cols)
         tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         tbl.verticalHeader().setVisible(False)
-        # 모든 컬럼 내용에 맞게 자동 조정
-        for i in range(len(cols)):
-            tbl.horizontalHeader().setSectionResizeMode(
-                i, QHeaderView.ResizeMode.ResizeToContents)
+        # [2026-08 성능수정, 신민용 리포트: "재능 좋은 선수로 오래 뛰면
+        # 은퇴/커리어창이 심하게 렉걸린다"] 여기서 바로 ResizeToContents를
+        # 걸면, 이 표를 채우는 각 메서드가 뒤이어 부르는 setItem() 수백~
+        # 수천 번(경기/수상 기록이 많을수록 더 많음)마다 그 컬럼 폭을
+        # 다시 계산한다 — 커리어가 길수록(=이 창이 렉걸리는 바로 그
+        # 경우) 이 재계산이 누적된다. 지금은 가벼운 기본(Interactive)
+        # 모드로만 두고 표를 리스트에 등록해뒀다가, _build()가 모든 표에
+        # 데이터를 다 채운 맨 끝에서 딱 한 번만 ResizeToContents로
+        # 전환한다(_finalize_tables 참고) — 최종 화면(컬럼 폭)은 완전히
+        # 동일하고, "행마다 반복 계산" → "한 번만 계산"으로 바뀔 뿐이다.
+        if not hasattr(self, "_all_tables"):
+            self._all_tables = []
+        self._all_tables.append(tbl)
         tbl.setStyleSheet("QTableWidget{background:#1e1e1e;color:#ccc;"
                           "gridline-color:#2a2a2a;border:none;}"
                           "QHeaderView::section{background:#252525;color:#888;border:none;padding:4px;}"
                           "QTableWidget::item{padding:4px 8px;}")
         return tbl
+
+    def _finalize_tables(self):
+        """_make_table로 만든 모든 표에 ResizeToContents를 한 번에
+        적용 — _build() 끝에서 1회만 호출한다."""
+        for tbl in getattr(self, "_all_tables", []):
+            for i in range(tbl.columnCount()):
+                tbl.horizontalHeader().setSectionResizeMode(
+                    i, QHeaderView.ResizeMode.ResizeToContents)
 
     def _set_item(self, tbl, row, col, val):
         item = QTableWidgetItem(str(val))
@@ -1899,7 +1937,12 @@ class RetireWindow(QDialog):
         lines.append(f"▶ 승강 플레이오프 기록  ({len(po_ms2)}경기)")
         if po_ms2:
             for pm in po_ms2:
-                if pm.get("absence_reason"):
+                # [2026-08 버그수정] po_history엔 my_played가 없어 벤치를
+                # absence_reason="bench" 문자열로 직접 남긴다 — _ABSENCE_LABEL엔
+                # "bench" 항목이 없어 그대로 두면 영어 원문("bench")이 노출됐다.
+                if pm.get("absence_reason") == "bench":
+                    lines.append(f"  • {pm['year']}년  {pm['team_name']} vs {pm['opp_name']}  ─  벤치")
+                elif pm.get("absence_reason"):
                     _reason = _ABSENCE_LABEL.get(pm["absence_reason"], pm["absence_reason"])
                     lines.append(f"  • {pm['year']}년  {pm['team_name']} vs {pm['opp_name']}  ─  {_reason}")
                 else:
