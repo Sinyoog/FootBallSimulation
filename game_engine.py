@@ -11733,7 +11733,7 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
                 gt_p = _my_grade_tier(p_up)
                 if gt_p:
                     g_wealth, g_tier, g_country = gt_p
-                    new_sal = _clamp_salary_to_cap(new_sal, g_wealth, g_country, g_tier)
+                    new_sal = _clamp_salary_to_cap(new_sal, g_wealth, g_country, g_tier, year=year)
                 _pct = int(round((mult - 1) * 100))
                 add_log(f"💰 승격 연봉 인상! {fmt_money(old_sal)} → {fmt_money(new_sal)} "
                         f"(+{_pct}%, 평균평점 {season_avg_rating:.2f})", "event", year, 52)
@@ -12246,7 +12246,8 @@ def _calc_offer_salary(p, grade, tier, ovr, country, team_name, year=None,
         form_mult = max(0.70, min(1.0, math.sqrt(ratio)))
     lo, hi = rand_range
     salary = int(base * form_mult * random.uniform(lo, hi))
-    return _clamp_salary_to_cap(salary, grade, country, tier, ovr=ovr, talent_tier=talent_tier)
+    return _clamp_salary_to_cap(salary, grade, country, tier, ovr=ovr,
+                                talent_tier=talent_tier, year=year)
 
 
 def generate_offers(count=5, force=False) -> list:
@@ -15011,7 +15012,8 @@ def negotiate_renewal() -> dict:
         gt = _my_grade_tier(p)
         if gt:
             g_wealth, g_tier, g_country = gt
-            new_salary = _clamp_salary_to_cap(new_salary, g_wealth, g_country, g_tier)
+            new_salary = _clamp_salary_to_cap(new_salary, g_wealth, g_country, g_tier,
+                                              ovr=p.get("ovr"), year=cur_year)
         new_end = max(p.get("contract_end_year", cur_year), cur_year) + cfg["extend_years"]
         new_rel = min(100, rel + 5)
         update_player(salary=new_salary, contract_end_year=new_end,

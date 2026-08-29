@@ -649,7 +649,18 @@ def _age_and_progress_np(c, rows, team_cap, orphan_fallback):
     # _age_and_progress 함수 docstring 참고. random 모듈 시드가 같으면
     # 이 시즌의 성장/노화 난수도 항상 동일해진다.
     rng = np.random.default_rng(random.getrandbits(64))
-    unique_positions = set(pos_list)
+    # [2026-08 버그수정, 전체 최적화 감사 중 발견 — 신민용이 예전에
+    # "PYTHONHASHSEED=0을 고정해도 완전히 재현되지 않는다"고 했던 원인]
+    # 아래 세 군데의 `for pos in unique_positions:` 루프는 순회 순서대로
+    # numpy 난수를 뽑아 쓴다. 그런데 파이썬 set의 순회 순서는 원소(문자열)
+    # 해시에 좌우되고, 그 해시는 프로세스마다 무작위로 바뀐다(해시 무작위화).
+    # 즉 같은 시드로 돌려도 실행할 때마다 포지션 처리 순서가 달라져
+    # 성장/노화 결과가 통째로 달라지고 있었다 — 시즌 결과 재현이 원천적으로
+    # 불가능했던 지점. sorted()로 순서를 못박아 같은 시드면 항상 같은 결과가
+    # 나오게 한다. 다루는 포지션 집합·처리 내용은 전혀 바뀌지 않고
+    # (전부 처리하는 건 동일) 순서만 고정되며, 애초에 이 순서에 의미가
+    # 부여된 로직도 없다(포지션별로 독립적으로 처리).
+    unique_positions = sorted(set(pos_list))
 
     # ── 성장기: 키스탯 70% / 전체스탯 30%, 1~3회, +1~3, 팀 상한까지 ──
     for pos in unique_positions:
@@ -1460,15 +1471,35 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
         "SELECT id, team_id, position, age, name, ovr, contract_end_year, last_transfer_year "
         "FROM ai_players").fetchall()
     team_players: dict = {}
-    for r in all_players_rows:
-        team_players.setdefault(r["team_id"], []).append({
-            "id": r["id"], "position": r["position"],
-            "name": r["name"] if "name" in r.keys() else "",
-            "age": r["age"] if "age" in r.keys() and r["age"] else 25,
-            "ovr": r["ovr"] if r["ovr"] is not None else 50,
-            "contract_end_year": r["contract_end_year"] if "contract_end_year" in r.keys() else 0,
-            "last_transfer_year": r["last_transfer_year"] if "last_transfer_year" in r.keys() else 0,
-        })
+    # [2026-08 최적화] 예전엔 행마다 `"name" in r.keys()` 식으로 컬럼 존재
+    # 여부를 매번 확인했다. sqlite3.Row.keys()는 호출할 때마다 컬럼 이름
+    # 리스트를 새로 만들어 돌려주는 메서드라, 26만 행 × 컬럼 4개 =
+    # 108만 회나 리스트를 만들고 버리고 있었다(cProfile 실측). 한 결과셋
+    # 안에서는 컬럼 구성이 절대 바뀌지 않으므로 첫 행에서 딱 한 번만
+    # 확인하고 그 결과를 재사용한다 — 판정 결과·기본값 처리는 동일.
+    if all_players_rows:
+        _cols = set(all_players_rows[0].keys())
+        _has_name = "name" in _cols
+        _has_age = "age" in _cols
+        _has_cend = "contract_end_year" in _cols
+        _has_lty = "last_transfer_year" in _cols
+        for r in all_players_rows:
+            _age = (r["age"] if _has_age else None) or 25
+            _ovr = r["ovr"]
+            team_players.setdefault(r["team_id"], []).append({
+                "id": r["id"], "position": r["position"],
+                "name": r["name"] if _has_name else "",
+                "age": _age,
+                "ovr": _ovr if _ovr is not None else 50,
+                "contract_end_year": r["contract_end_year"] if _has_cend else 0,
+                "last_transfer_year": r["last_transfer_year"] if _has_lty else 0,
+            })
+    # [2026-08 2차 최적화] 팀별 "인원 가중치" 표를 미리 만들어둔다.
+    # size_w = exp(-(인원 - _SQUAD_TARGET)/0.15)는 인원(정수)만의 함수라,
+    # 예전처럼 후보를 평가할 때마다(시즌당 267만 회) len()으로 세고 exp를
+    # 부르는 대신 여기서 팀당 한 번만 계산해두고 이적으로 인원이 실제로
+    # 바뀔 때만(이적 1건당 2팀) 갱신하면 된다. 값 자체는 예전 식 그대로다.
+    _sw_by_tid = {tid: _size_weight(len(plist)) for tid, plist in team_players.items()}
     _tm3 = _time_tm.perf_counter()
 
     # 이적 결과 누적 후 executemany
@@ -1489,6 +1520,15 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
     _cur_season = _season_row["current_season"] if _season_row else 0
     transfer_log_rows = []
     my_team_events = []   # [2026-08 신설] (방향, p_entry, old_tid, new_tid) — 우리 팀 관여 이적만
+
+    # [2026-08 최적화] 이적 루프 전용 캐시 2종(이 호출 안에서만 살아있음).
+    #  _intl_pool_by_rank: 국제 이동(5%) 후보군을 등급 rank별로 1회만 조립.
+    #  _pool_meta_cache : 후보 풀 리스트별 (팀평균OVR / sigma분모 / SS·S여부)
+    #                     배열. team_avg·dst_prestige_by_tid·dst_grade_by_tid는
+    #                     이 루프 내내 불변이라 풀마다 한 번만 만들면 된다.
+    # 둘 다 "매번 다시 계산하던 같은 값"을 재사용하는 것뿐이라 결과는 동일.
+    _intl_pool_by_rank: dict = {}
+    _pool_meta_cache: dict = {}
 
     for lid, tids in by_league.items():
         if len(tids) < 2:
@@ -1525,11 +1565,28 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
                         # 최상위(S/SS) 선수도 그 아래 A급까지 곧장 갈 수
                         # 있게 한다 — 위로는 그대로 +1까지만(상승 이적은
                         # 점진적이어야 자연스러움, 비대칭 유지).
-                        cand = []
-                        for r in (rank - 2, rank - 1, rank, rank + 1):
-                            cand.extend(tier1_by_grade.get(r, []))
-                        cand = [t for t in cand if t != src]
-                        dst_pool_tids = cand if len(cand) >= 1 else tids
+                        # [2026-08 최적화] 이 후보군은 "등급 rank"에만 의존
+                        # 하는데(rank-2 ~ rank+1의 tier1 팀 전부, 전세계
+                        # 1,200팀 규모), 예전엔 이적 한 건마다 매번 리스트를
+                        # 새로 이어붙이고 다시 한 번 필터해서 통째로 복사했다
+                        # — 시즌당 이 경로만 3,700회쯤 타므로 440만 회분의
+                        # 불필요한 리스트 생성이었다. rank별로 딱 한 번만
+                        # 만들어 재사용한다(같은 리스트 객체를 계속 넘기게
+                        # 되므로 _do_one_transfer_cached의 풀 메타데이터
+                        # 캐시도 그대로 적중한다).
+                        # src 제외는 예전엔 여기서 했지만 어차피
+                        # _do_one_transfer_cached의 가중치 루프가 t != src를
+                        # 한 번 더 거른다 — src는 자기 rank 풀에 반드시
+                        # 포함되므로(rank가 (rank-2..rank+1) 범위 안에 있음)
+                        # "src를 뺀 뒤 1개 이상"은 "빼기 전 2개 이상"과
+                        # 항상 같은 조건이라 판정 결과도 동일하다.
+                        cand = _intl_pool_by_rank.get(rank)
+                        if cand is None:
+                            cand = []
+                            for r in (rank - 2, rank - 1, rank, rank + 1):
+                                cand.extend(tier1_by_grade.get(r, []))
+                            _intl_pool_by_rank[rank] = cand
+                        dst_pool_tids = cand if len(cand) >= 2 else tids
 
                 # [2026-08 신설, 신민용 요청: "사우디·미국 1부 위주로 가는
                 # 그림"] 국제이동(87%/8% 아닌 위 else 분기)이고 src가
@@ -1547,7 +1604,8 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
                     protect_strength=_STAR_PROTECT_BY_CATEGORY[cat],
                     veteran_pool_tids=_veteran_pool,
                     dst_grade_by_tid=dst_grade_by_tid,
-                    dst_prestige_by_tid=dst_prestige_by_tid)
+                    dst_prestige_by_tid=dst_prestige_by_tid,
+                    pool_cache=_pool_meta_cache, sw_by_tid=_sw_by_tid)
                 if result:
                     for new_tid, pid, old_tid in result:
                         new_contract_end = year + random.randint(2, 4)
@@ -1571,6 +1629,9 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
                         _old_list = team_players.get(old_tid, [])
                         _idx = next((i for i, e in enumerate(_old_list) if e["id"] == pid), None)
                         p_entry = _old_list.pop(_idx) if _idx is not None else None
+                        if p_entry is not None:
+                            # 인원이 바뀐 팀만 가중치 표를 갱신(위 _sw_by_tid 주석 참고)
+                            _sw_by_tid[old_tid] = _size_weight(len(_old_list))
                         if p_entry:
                             # [2026-08 신설, 이적 로그] p_entry는 아직 이적 전 값(포지션/
                             # 나이/OVR)이라 이 시점에 기록해야 정확하다 — 아래에서
@@ -1601,7 +1662,9 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
                                 my_team_events.append((direction, dict(p_entry), old_tid, new_tid))
                             p_entry["contract_end_year"] = new_contract_end
                             p_entry["last_transfer_year"] = year
-                            team_players.setdefault(new_tid, []).append(p_entry)
+                            _new_list = team_players.setdefault(new_tid, [])
+                            _new_list.append(p_entry)
+                            _sw_by_tid[new_tid] = _size_weight(len(_new_list))
                             if verbose_log is not None:
                                 _fee = _estimate_ai_transfer_fee_display(p_entry, old_tid, new_tid, year, team_row_by_tid)
                                 if _fee:
@@ -1615,6 +1678,12 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
     _tm4 = _time_tm.perf_counter()
 
     if transfer_updates:
+        # [2026-08 최적화] 위 스냅샷과 같은 이유 — WHERE id=? 로 8만 건을
+        # 갱신하는데 순서가 뒤죽박죽이면 매번 다른 페이지를 오간다. id 순으로
+        # 정렬하면 앞에서 뒤로 한 번 훑는 형태가 된다. 안정 정렬이라 같은
+        # 선수가 두 번 들어 있어도(맞트레이드 등) 원래의 앞뒤 순서가 유지되므로
+        # 마지막에 적용되는 값이 예전과 같다 — 최종 결과 동일.
+        transfer_updates.sort(key=_tu_key)
         c.executemany(
             "UPDATE ai_players SET team_id=?, contract_end_year=?, last_transfer_year=? WHERE id=?",
             transfer_updates)
@@ -1730,8 +1799,30 @@ def _estimate_ai_transfer_fee_display(p_entry, old_tid, new_tid, year, team_row_
         return None
 
 
+# [2026-08 최적화] 아래 _do_one_transfer_cached 전용 순수함수 메모이즈 2종.
+# 둘 다 "입력이 정수(또는 작은 정수)뿐인 수식"이라 값이 항상 같으므로
+# 캐싱해도 결과가 달라질 여지가 전혀 없다 — 계산식 자체는 원본 그대로다.
+_CONTRACT_DECAY = {k: 0.6 ** k for k in range(0, 13)}   # 0.6 ** 남은계약연수
+from operator import itemgetter as _itemgetter
+_ins_key = _itemgetter(0)   # executemany 전에 기본키 순으로 정렬할 때 쓰는 key
+_tu_key  = _itemgetter(3)   # 이적 UPDATE 배치를 player_id 순으로 정렬
+_SIZE_W_CACHE: dict = {}
+
+
+def _size_weight(dst_size):
+    """exp(-(스쿼드인원 - _SQUAD_TARGET) / 0.15) — 인원(정수)만의 함수라
+    한 번 계산한 값을 그대로 재사용한다. 시즌당 math.exp 호출 약 290만 회
+    감소(실측 5,771,032회 중 절반가량이 이 식이었다)."""
+    w = _SIZE_W_CACHE.get(dst_size)
+    if w is None:
+        w = math.exp(-(dst_size - _SQUAD_TARGET) / 0.15)
+        _SIZE_W_CACHE[dst_size] = w
+    return w
+
+
 def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, protect_strength=0.85,
-                             veteran_pool_tids=None, dst_grade_by_tid=None, dst_prestige_by_tid=None):
+                             veteran_pool_tids=None, dst_grade_by_tid=None, dst_prestige_by_tid=None,
+                             pool_cache=None, sw_by_tid=None):
     """[최적화] ORDER BY RANDOM() 없이 Python-side shuffle로 이적 처리.
     team_players: {team_id: [{"id","position","ovr","contract_end_year",
     "last_transfer_year"}, ...]} 선조회 캐시.
@@ -1797,7 +1888,14 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
         return None
 
     # 최소 잔류기간: 작년(또는 그 이후)에 이미 이적한 선수는 이번엔 후보 제외
-    eligible = [p for p in src_players if (year - p.get("last_transfer_year", 0)) >= 1]
+    # [2026-08 최적화] team_players의 각 항목은 _transfer_market이 만들 때
+    # 6개 키를 항상 전부 채우고(빠지는 경우가 구조적으로 없음), 이적으로
+    # 팀을 옮겨 다니는 동안에도 같은 dict가 그대로 재사용된다 — 그래서
+    # 이 함수 전체에서 .get(키, 기본값) 대신 직접 인덱싱을 쓴다. cProfile
+    # 실측상 이 함수 하나가 dict.get을 2,421만 회 호출하고 있었는데(시즌당
+    # 이적 7.4만 건 × 후보 선수 수 × 키 6개), 결과는 완전히 동일하면서
+    # 호출당 오버헤드만 사라진다.
+    eligible = [p for p in src_players if (year - p["last_transfer_year"]) >= 1]
     if not eligible:
         return None
 
@@ -1805,24 +1903,30 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
     if n == 1:
         mover = eligible[0]
     else:
-        ranked = sorted(range(n), key=lambda i: -eligible[i].get("ovr", 50))
-        rank_of = {}
-        for pos_rank, idx in enumerate(ranked):
-            rank_of[idx] = pos_rank
-        weights = []
-        for i in range(n):
-            w = 0.15 + protect_strength * (rank_of[i] / max(1, n - 1))
-            _cend = eligible[i].get("contract_end_year", 0) or 0
+        # [2026-08 최적화] 예전엔 sorted(range(n), key=lambda i: -eligible[i].get("ovr",50))
+        # 로 정렬해서 비교 한 번마다 파이썬 람다 + dict.get이 돌았다(실측
+        # 람다 호출만 151만 회). OVR을 미리 한 번씩만 꺼내 리스트로 만들고
+        # 그 리스트의 __getitem__을 key로 쓰면 비교 자체는 C 레벨에서 끝난다
+        # — 키 값(-ovr)도, 동점자 순서(파이썬 정렬은 안정 정렬)도 예전과
+        # 완전히 동일하므로 뽑히는 선수가 달라지지 않는다.
+        _neg_ovr = [-e["ovr"] for e in eligible]
+        ranked = sorted(range(n), key=_neg_ovr.__getitem__)
+        _inv = n - 1   # n>=2 이므로 예전의 max(1, n-1)과 항상 같은 값
+        weights = [0.0] * n
+        for pos_rank, i in enumerate(ranked):
+            _e = eligible[i]
+            w = 0.15 + protect_strength * (pos_rank / _inv)
+            _cend = _e["contract_end_year"] or 0
             remain = max(0, _cend - year) if _cend else 2   # 미설정=중립(2년 취급)
-            w *= 0.6 ** remain
+            w *= _CONTRACT_DECAY.get(remain) or 0.6 ** remain
             # [2026-07 v3] 어린 선수(22세 이하)·고OVR(80+)·계약만료 임박(1년
             # 이하)일수록 이 풀(국내 다른 tier/국제 이동)로 실제 이동될
             # 성향을 살짝 높인다. dst_pool_tids가 src 포함 같은 리그 그대로면
             # (=87% 케이스) 이 보정은 사실상 의미 없이 상쇄되므로 안전하다.
-            _age = eligible[i].get("age", 25)
+            _age = _e["age"]
             if _age <= 22:
                 w *= 1.3
-            if eligible[i].get("ovr", 50) >= 80:
+            if _e["ovr"] >= 80:
                 w *= 1.5
             if _cend and (_cend - year) <= 1:
                 w *= 1.4
@@ -1831,7 +1935,7 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
             # 내 최약체는 아니어도" 나이 자체를 이유로 세대교체를 하므로.
             if _age >= 33:
                 w *= 1.0 + 0.10 * (_age - 32)
-            weights.append(w)
+            weights[i] = w
         mover = random.choices(eligible, weights=weights, k=1)[0]
 
     # [2026-08 신설, 신민용 요청: "사우디·미국 1부 위주로 가는 그림"]
@@ -1839,16 +1943,17 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
     # 60% 확률로 목적지 후보를 여기로 바꾼다 — 나머지 40%/veteran_pool
     # 자체가 비어있는 경우엔 기존 등급대 기반 일반 후보군을 그대로 쓴다
     # (은퇴 무대로 완전히 강제하지 않고 개인차/확률을 남겨둔다).
-    if veteran_pool_tids and mover.get("age", 25) >= 30 and random.random() < 0.6:
-        _vp = [t for t in veteran_pool_tids if t != src]
-        if _vp:
-            dst_pool_tids = _vp
+    if veteran_pool_tids and mover["age"] >= 30 and random.random() < 0.6:
+        # [2026-08 최적화] 예전엔 여기서 매번 [t for t in veteran_pool_tids
+        # if t != src]로 새 리스트를 만들었다 — src 제외는 아래 가중치
+        # 루프가 어차피 한 번 더 하므로, 여기서는 "src를 뺐을 때 남는 팀이
+        # 하나라도 있는지"만 O(1)로 판정하고 원본 리스트를 그대로 넘긴다
+        # (아래 풀 메타데이터 캐시가 같은 리스트 객체를 재사용할 수 있게
+        # 하는 효과도 있다). 판정 결과·이후 동작은 예전과 동일.
+        if len(veteran_pool_tids) > 1 or veteran_pool_tids[0] != src:
+            dst_pool_tids = veteran_pool_tids
 
-    dst_candidates = [t for t in dst_pool_tids if t != src]
-    if not dst_candidates:
-        return None
-
-    mover_ovr = mover.get("ovr", 50)
+    mover_ovr = mover["ovr"]
     # 가우시안 가중치: 목적지 팀 평균OVR이 이 선수 수준과 비슷할수록(약간
     # 위쪽 포함) 가중치가 크다. sigma=15 → 격차 15면 가중치 약 0.61배,
     # 격차 30이면 약 0.14배로 실질 배제 수준까지 떨어진다.
@@ -1876,43 +1981,120 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
     # 170(sigma≈9.2)으로 좁혀서 격차 10 안팎은 예전과 비슷하게 흔하되
     # (0.55 부근), 격차 20 근처부터는 급격히 희박해지게(0.09 부근) 만든다
     # — "가끔은 있어도 되지만 흔하면 안 된다"는 요청에 맞춘 튜닝.
+    # [2026-08 최적화] 아래 루프가 이 함수 — 나아가 시즌 전환 전체 —
+    # 에서 가장 뜨거운 지점이었다. cProfile 실측으로 math.exp가 시즌당
+    # 5,771,032회 호출됐는데, 목적지 후보 하나당 2~3회씩 도는 게 원인이다
+    # (특히 국제 이동(5%) 후보군은 한 번에 1,200팀 규모). 세 가지를 고친다:
+    #
+    #  (a) team_avg / dst_prestige_by_tid / dst_grade_by_tid는 _transfer_market이
+    #      루프 시작 전에 한 번 만든 뒤 끝까지 바뀌지 않는다 — 그래서
+    #      "이 후보 풀의 팀별 (평균OVR, sigma 분모, SS/S 여부)"도 불변이다.
+    #      풀 리스트 객체 단위로 이 배열들을 한 번만 만들어 캐시하면
+    #      (pool_cache) 이후 호출에서는 dict 조회 자체가 사라진다.
+    #  (b) size_w = exp(-(스쿼드인원 - _SQUAD_TARGET)/0.15)는 인원(정수)만의
+    #      순수 함수라 값을 메모이즈할 수 있다(_size_weight).
+    #  (c) 나이 페널티는 후보마다 값이 똑같은데 루프 안에서 매번 다시
+    #      계산하고 있었다 — 루프 밖으로 한 번만 끌어올린다.
+    #
+    # 계산식·상수·후보 순서는 전혀 건드리지 않았으므로 가중치 값도,
+    # random.choices가 뽑는 결과도 예전과 완전히 동일하다.
+    _meta = pool_cache.get(id(dst_pool_tids)) if pool_cache is not None else None
+    if _meta is None or _meta[0] is not dst_pool_tids:
+        _avgs = [team_avg.get(t, 50) for t in dst_pool_tids]
+        if dst_prestige_by_tid:
+            _dens = []
+            for t in dst_pool_tids:
+                _p = dst_prestige_by_tid.get(t, 0)
+                _dens.append(35.0 if _p >= 3 else (60.0 if _p >= 2 else 170.0))
+        else:
+            _dens = [170.0] * len(dst_pool_tids)
+        _tops = ([(dst_grade_by_tid.get(t) in ("SS", "S")) for t in dst_pool_tids]
+                 if dst_grade_by_tid is not None else None)
+        _meta = (dst_pool_tids, _avgs, _dens, _tops)
+        if pool_cache is not None:
+            pool_cache[id(dst_pool_tids)] = _meta
+        # 인원 가중치 표에 이 풀의 팀이 하나라도 빠져 있으면(= 선수 명단이
+        # 아예 비어 있는 팀) 여기서 채워둔다. 예전 코드의
+        # len(team_players.get(t, [])) → 0 과 같은 값이며, 풀마다 딱 한 번만
+        # 돌기 때문에(위 캐시에 걸림) 후보 평가 루프에서는 조건 검사 없이
+        # sw_by_tid[t] 한 번으로 끝낼 수 있다.
+        if sw_by_tid is not None:
+            _sw0 = _size_weight(0)
+            for _t in dst_pool_tids:
+                if _t not in sw_by_tid:
+                    sw_by_tid[_t] = _sw0
+    _, _avgs, _dens, _tops = _meta
+    # 하위호환: sw_by_tid 없이 호출되는 옛 경로(_do_one_transfer)에서는
+    # 예전과 똑같이 team_players에서 그때그때 만들어 쓴다.
+    _sw_by_tid = sw_by_tid if sw_by_tid is not None else {
+        t: _size_weight(len(team_players.get(t, ()))) for t in dst_pool_tids}
+
+    # 나이 페널티(후보와 무관하게 mover 하나로 결정되는 상수) 선계산.
+    _age_penalty = 1.0
+    _apply_age_penalty = False
+    if _tops is not None and mover["age"] >= 33:
+        _apply_age_penalty = True
+        _age_excess = mover["age"] - 32
+        _legend_relief = max(0.0, (mover_ovr - 85) / 15.0)
+        _denom = 18.0 + 40.0 * _legend_relief
+        _age_penalty = math.exp(-(_age_excess * _age_excess) / _denom)
+
+    # [2026-08 2차 최적화] 이 루프는 시즌 전환 전체에서 가장 많이 도는
+    # 구간(시즌당 후보 평가 267만 회)이라 "한 번당 몇 나노초"가 그대로
+    # 총 시간이 된다. 1차 최적화 뒤 프로파일에 남아 있던 세 가지를 없앤다:
+    #  · _size_weight()를 후보마다 호출 — 값 자체는 이미 캐시돼 있었지만
+    #    파이썬 함수 호출이 267만 번이라 그 오버헤드가 계산보다 더 컸다.
+    #    호출자가 넘겨주는 _sw_by_tid(팀별 인원 가중치 표)에서 dict 조회
+    #    한 번으로 끝낸다 — 이 표는 팀 인원이 실제로 바뀔 때(이적 1건당
+    #    2팀)만 갱신하면 되므로, 시즌당 15만 회 갱신으로 267만 회의
+    #    "dict.get + len + 함수호출"을 대체하는 셈이다.
+    #  · enumerate + _avgs[_i] + _dens[_i] 인덱싱 → zip으로 한 번에 꺼낸다.
+    #  · 나이 페널티가 없는 대다수 경우에도 후보마다 if를 두 번씩 확인 →
+    #    적용 여부는 mover 하나로 정해지므로 루프를 두 갈래로 나눈다.
+    # 아래 두 갈래 모두 예전과 같은 식을 같은 순서로 계산한다:
+    #   ovr_w  : 명문팀(prestige_level>=2)일수록 좁은 격차만 허용하도록
+    #            sigma 분모를 줄인 값(170 일반 / 60 레벨2 / 35 레벨3) —
+    #            이 분모는 팀별로 불변이라 _dens에 미리 담아둔 것이다.
+    #   size_w : 목표 인원(_SQUAD_TARGET)에서 멀어질수록 급감하는 가중치.
+    #   나이   : 목적지가 SS/S(5대 리그급)면 33세부터 초과분의 제곱에
+    #            비례해 감쇠(OVR 85 초과는 분모를 넓혀 소폭 완화) — 값이
+    #            mover 하나로 정해지므로 루프 밖에서 이미 계산해뒀다.
+    _exp = math.exp
+    dst_candidates = []
     weights = []
-    for t in dst_candidates:
-        gap = team_avg.get(t, 50) - mover_ovr
-        # [2026-08 신설, 신민용 리포트: "OVR81따리가 레알 마드리드나
-        # 바르셀로나에 있을 수 있냐"] 진짜 명문팀(prestige_level>=2)은
-        # 일반 팀보다 훨씬 좁은 격차만 허용하도록 sigma(분모)를 대폭
-        # 줄인다 — 170(일반, sigma≈13)→60(레벨2, sigma≈7.7)/35(레벨3
-        # 레알·바르사급, sigma≈5.9). 격차 9(OVR81→평균90) 기준
-        # 일반 0.62배였던 게 레벨3에서는 0.10배까지 떨어진다.
-        _dst_plvl = (dst_prestige_by_tid or {}).get(t, 0)
-        _sigma_denom = 35.0 if _dst_plvl >= 3 else (60.0 if _dst_plvl >= 2 else 170.0)
-        ovr_w = math.exp(-(gap * gap) / _sigma_denom)
-        dst_size = len(team_players.get(t, []))
-        size_w = math.exp(-(dst_size - _SQUAD_TARGET) / 0.15)
-        # [2026-08 신설, 신민용 리포트: "38~39세 OVR84~86이 바르셀로나로
-        # 이적한다"] 목적지가 SS/S(5대 리그급)면 33세부터 나이 초과분의
-        # 제곱에 비례해 급격히 감쇠하는 페널티를 곱한다. OVR이 85를
-        # 넘는 선수는 감쇠 폭(분모)을 넓혀서 살짝 완화 — "노장 슈퍼스타가
-        # 아주 가끔 빅클럽에 남는" 예외 정도만 허용하고, 84~86 수준의
-        # 그냥 준수한 베테랑은 33세만 넘어도 사실상 후보에서 배제된다.
-        age_penalty = 1.0
-        if dst_grade_by_tid is not None and mover.get("age", 25) >= 33:
-            _dst_grade = dst_grade_by_tid.get(t)
-            if _dst_grade in ("SS", "S"):
-                _age_excess = mover.get("age", 25) - 32
-                _legend_relief = max(0.0, (mover_ovr - 85) / 15.0)
-                _denom = 18.0 + 40.0 * _legend_relief
-                age_penalty = math.exp(-(_age_excess * _age_excess) / _denom)
-        weights.append(ovr_w * size_w * age_penalty)
-    if sum(weights) <= 0:
+    _wsum = 0.0
+    _dc_append = dst_candidates.append
+    _w_append = weights.append
+    if _apply_age_penalty:
+        for t, _avg, _den, _top in zip(dst_pool_tids, _avgs, _dens, _tops):
+            if t == src:
+                continue
+            gap = _avg - mover_ovr
+            w = _exp(-(gap * gap) / _den) * _sw_by_tid[t]
+            if _top:
+                w *= _age_penalty
+            _dc_append(t)
+            _w_append(w)
+            _wsum += w
+    else:
+        for t, _avg, _den in zip(dst_pool_tids, _avgs, _dens):
+            if t == src:
+                continue
+            gap = _avg - mover_ovr
+            w = _exp(-(gap * gap) / _den) * _sw_by_tid[t]
+            _dc_append(t)
+            _w_append(w)
+            _wsum += w
+    if not dst_candidates:
+        return None
+    if _wsum <= 0:
         dst = random.choice(dst_candidates)
     else:
         dst = random.choices(dst_candidates, weights=weights, k=1)[0]
 
     dst_players = team_players.get(dst, [])
     same_pos = [p for p in dst_players if p["position"] == mover["position"]
-                and (year - p.get("last_transfer_year", 0)) >= 1]
+                and (year - p["last_transfer_year"]) >= 1]
 
     # [2026-08 버그수정, 신민용 리포트: "상대팀에서 선수가 나가면 무조건
     # 그 팀에서 한 명이 우리 쪽으로 오는 식인데 현실은 이렇게 안
@@ -2161,6 +2343,14 @@ def _snapshot_season_positions(c, year):
                 inserts.append((p["id"], year, p["position"] or "", roles.get(p["id"], "")))
 
     if inserts:
+        # [2026-08 최적화] player_id 순으로 정렬해서 넣는다. 이 표의 기본키는
+        # (player_id, year)이고 WITHOUT ROWID라 키 순서가 곧 저장 순서인데,
+        # 위 루프는 "팀별"로 돌기 때문에 player_id가 뒤죽박죽인 채로 26만 건이
+        # 들어갔다 — B-tree 입장에서는 매번 다른 페이지를 열어 중간에 끼워넣는
+        # 셈이라 페이지 분할이 계속 일어난다. 키 순으로 넣으면 뒤쪽에 차곡차곡
+        # 붙기만 하면 된다. 정렬은 안정 정렬이고 (player_id, year)가 이 목록
+        # 안에서 유일하므로(선수 한 명당 이 해에 한 행) 저장 결과는 완전히 동일.
+        inserts.sort(key=_ins_key)
         c.executemany(
             "INSERT OR REPLACE INTO ai_player_position_history(player_id, year, position, role) "
             "VALUES (?,?,?,?)", inserts)

@@ -536,7 +536,8 @@ def search_retired_ai_players(name_query=None, continent=None, nat_country_id=No
                     q += f" AND r.last_team_id IN ({ph})"; params += list(_scope_ids)
             else:
                 q += f" AND r.last_team_id IN ({ph})"; params += list(_scope_ids)
-    q += " ORDER BY r.ovr DESC LIMIT ?"
+    # [2026-08] 위 search_ai_players와 같은 이유로 동점자 순서를 id로 고정.
+    q += " ORDER BY r.ovr DESC, r.id LIMIT ?"
     params.append(limit)
     rows = [dict(row) for row in conn.execute(q, params).fetchall()]
     conn.close()
@@ -796,7 +797,17 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
                 q += (" AND (t.name LIKE ? OR l.name LIKE ? OR cn.name LIKE ? "
                       "OR p.nationality LIKE ? OR p.name LIKE ? OR cust.custom_name LIKE ?)")
                 params += [like, like, like, like, like, like]
-    q += " ORDER BY p.ovr DESC LIMIT ?"
+    # [2026-08 최적화, 동점 처리 명시화] 정렬 기준은 예전 그대로 "OVR
+    # 내림차순 상위 N"이지만, 동점(같은 OVR) 선수들 사이의 순서는 여태
+    # SQL이 정해주지 않았다 — 실제로는 그때그때 SQLite가 고른 조인 순서에
+    # 따라 결정됐고, 그래서 상위 N의 경계선에 동점자가 몰리면 "누가 잘리고
+    # 누가 남는지"가 데이터가 쌓이는 대로 슬금슬금 바뀔 수 있었다(같은
+    # 조건으로 두 번 검색해도 순서가 달라질 여지). 여기에 p.id를 2차 기준
+    # 으로 명시해 항상 같은 결과가 나오게 고정한다(동점이면 먼저 만들어진
+    # 선수 우선). ai_players.id는 rowid라 idx_aiplayers_ovr(ovr DESC)가
+    # 이미 "OVR 내림차순 → id 오름차순" 순서로 저장돼 있어, 이 2차 기준을
+    # 붙여도 인덱스만으로 정렬이 끝난다(추가 비용 0).
+    q += " ORDER BY p.ovr DESC, p.id LIMIT ?"
     params.append(limit if not name_query else max(limit, 500))
     rows = [dict(r) for r in conn.execute(q, params).fetchall()]
     conn.close()

@@ -580,9 +580,17 @@ def init_db():
     # 한 번에 저장한다 — ai_transfer_log(이적이 일어난 해만)와 달리
     # 이적 여부와 무관하게 매년 전원 기록. player_id+year 복합 PK라
     # 같은 해 두 번 저장돼도 덮어쓰기(INSERT OR REPLACE)만 하면 된다.
+    # [2026-08 최적화] WITHOUT ROWID — 이 표는 (player_id, year) 복합 PK로만
+    # 읽고 쓰는 순수 키-값 아카이브인데, 일반(rowid) 테이블이면 SQLite가
+    # "데이터 B-tree(rowid 기준)" + "PK 유니크 인덱스" 두 개를 따로 유지한다
+    # (실측: 데이터 4.5MB에 자동 인덱스가 4.7MB — 정확히 2배 저장·2배 쓰기).
+    # WITHOUT ROWID는 PK 자체를 데이터 저장 순서로 쓰므로 인덱스가 사라져
+    # 저장공간·INSERT OR REPLACE 비용이 둘 다 절반이 된다. 조회/쿼리 문법은
+    # 완전히 동일하며(이 표에 rowid를 쓰는 코드는 없음) 결과도 동일하다.
+    # 기존 세이브는 아래 _migrate_history_tables()가 같은 형태로 재구축한다.
     c.execute("""CREATE TABLE IF NOT EXISTS ai_player_ovr_history(
         player_id INTEGER, year INTEGER, ovr INTEGER,
-        PRIMARY KEY(player_id, year))""")
+        PRIMARY KEY(player_id, year)) WITHOUT ROWID""")
 
     # [2026-08 신설, 신민용 요청: "이 시즌에 얘가 어디 포지션을 갔는지가
     # 중요한거야"] 등록 포지션(ai_players.position, 변하지 않는 "주포")과
@@ -593,9 +601,12 @@ def init_db():
     # ai_player_ovr_history와 동일 — 이 기능 신설 이후 시즌만 정확하고,
     # 그 이전 과거 시즌은 소급 적용이 안 된다(월드 브라우저 쪽에서
     # 이 기록이 없는 연도는 기존처럼 이적 시점 등록 포지션으로 대체 표시).
+    # [2026-08 최적화] 위 ai_player_ovr_history와 같은 이유로 WITHOUT ROWID.
+    # 이 표는 전세계 선수 전원 × 매 시즌이라 세이브에서 가장 큰 표가 되기
+    # 쉬워서(실측 세이브: 데이터 129MB + 자동 인덱스 106MB) 효과가 가장 크다.
     c.execute("""CREATE TABLE IF NOT EXISTS ai_player_position_history(
         player_id INTEGER, year INTEGER, position TEXT, role TEXT DEFAULT '',
-        PRIMARY KEY(player_id, year))""")
+        PRIMARY KEY(player_id, year)) WITHOUT ROWID""")
 
     # [2026-08 신설, 신민용 리포트: "선수 검색에서 나(my_player)를 보면
     # OVR이 하나도 안 찍혀있다"] ai_player_ovr_history와 완전히 같은
@@ -1895,6 +1906,26 @@ def init_db():
         # 몰려 10초 이상 걸리는 게 확인됨. 이 인덱스로 조건에 맞는 행만
         # 바로 찾아 정렬 없이(ovr DESC를 인덱스 순서로 커버) 가져온다.
         "CREATE INDEX IF NOT EXISTS idx_aiplayers_nat_pos_ovr ON ai_players(nationality, position, ovr DESC)",
+        # [2026-08 신설, 신민용 요청: "세계 축구 기록실 선수 검색이 느리다"]
+        # world_browser.search_ai_players()는 어떤 필터 조합이든 마지막에
+        # 항상 "ORDER BY p.ovr DESC LIMIT N"으로 끝난다. ovr 단독 인덱스가
+        # 없어서 SQLite가 매 검색마다 ai_players 26만 행 전체를 teams/leagues/
+        # countries와 조인한 뒤 임시 B-tree로 통째로 정렬하고 있었다
+        # (EXPLAIN QUERY PLAN: "USE TEMP B-TREE FOR ORDER BY"). 이 인덱스가
+        # 있으면 OVR 높은 순으로 인덱스를 훑다가 LIMIT만큼 채우면 즉시
+        # 멈추므로 정렬 자체가 사라진다 — 실측 152ms→2ms(약 70배), 경력(년)
+        # 필터를 켠 경우(상관 서브쿼리 2개)는 411ms→2ms. 쓰기 쪽 부담은
+        # 이미 있는 idx_aiplayers_nat_pos_ovr에 ovr이 포함돼 있어 성격이
+        # 같고, 실측상 시즌전환 UPDATE 26만 건에서 유의미한 차이 없음.
+        # id를 2번째 컬럼으로 같이 넣는 이유: 검색 쿼리의 정렬을
+        # "ORDER BY p.ovr DESC, p.id"로 명시했기 때문(동점자 순서를 고정해
+        # 같은 조건이면 항상 같은 목록이 나오게 함 — world_browser.py 주석
+        # 참고). ovr 단독 인덱스로는 SQLite가 이 2차 기준을 인덱스로 못
+        # 풀어서 다시 임시 정렬로 되돌아간다(실측 확인).
+        "CREATE INDEX IF NOT EXISTS idx_aiplayers_ovr_id ON ai_players(ovr DESC, id)",
+        # 은퇴 선수 검색(search_retired_ai_players)도 같은 형태로
+        # "ORDER BY r.ovr DESC, r.id LIMIT ?"로 끝나므로 같은 인덱스를 준다.
+        "CREATE INDEX IF NOT EXISTS idx_ai_players_retired_ovr_id ON ai_players_retired(ovr DESC, id)",
         "CREATE INDEX IF NOT EXISTS idx_mr_week_season   ON match_results(week, season)",
         "CREATE INDEX IF NOT EXISTS idx_mr_league_season ON match_results(league_id, season)",
         "CREATE INDEX IF NOT EXISTS idx_mr_day_season    ON match_results(day, season)",
@@ -2048,6 +2079,7 @@ def init_db():
     repair_duplicate_season_schedules()   # 유령 중복 시즌 일정 정리 (1회성, 아래 참고)
     repair_stray_intl_is_my_flags()   # 복수국적 미선택국 is_my 오염 정리 (1회성, 아래 참고)
     repair_cwc_match_groups()   # 클럽월드컵 매치 grp 백필 (1회성, 아래 참고)
+    _migrate_history_tables()   # 선수 이력 2표 고아행 정리 + WITHOUT ROWID 재구축 (1회성, 아래 참고)
     compact_existing_match_archive()   # 기존 세이브 match_results_archive 요약+정리 (1회성, 아래 참고)
     # [2026-08 신설] init_db()는 QA/AB테스트 스크립트 등이 DB_PATH를 바꿔가며
     # 같은 프로세스 안에서 여러 번 호출하기도 한다 — 그때마다 get_state()
@@ -2499,6 +2531,107 @@ def repair_stray_intl_is_my_flags():
         conn.rollback()
     finally:
         conn.close()
+
+
+def _migrate_history_tables():
+    """[2026-08 신설, 전체 최적화 감사 중 발견] 선수 연도별 이력 2표
+    (ai_player_ovr_history / ai_player_position_history)를 한 번만 손봐서
+    (1) 고아행 정리 (2) WITHOUT ROWID 재구축 을 동시에 처리한다.
+    meta 플래그로 세이브당 딱 1회만 돌고, 그 뒤로는 SELECT 한 번으로 끝난다.
+
+    ── (1) 고아행 정리 ────────────────────────────────────────
+    ai_player_position_history가 reset_game_data()의 삭제 목록에서 빠져
+    있었다(쌍둥이 표인 ai_player_ovr_history는 들어 있었음 — 이 프로젝트에서
+    반복돼온 "새 표를 삭제 목록에 넣는 걸 깜빡함" 패턴). 그래서 은퇴 후
+    새 게임을 시작해도 이전 판의 포지션 이력이 통째로 남았고, 새 게임을
+    반복할 때마다 이 표만 계속 불어났다. 실측 세이브 기준 7,344,610행 중
+    7,064,538행(96%)이 아래 세 번째 범주였다:
+
+        ai_player_position_history의 player_id
+          ├─ ai_players에 있음          → 현역 선수    → 보존
+          ├─ ai_players_retired에 있음  → 은퇴 선수    → 보존(은퇴 선수 검색용)
+          └─ 둘 다 없음                 → 과거 판 선수 → 삭제 대상
+
+    은퇴 선수 이력은 "선수 검색 > 은퇴" 기능이 실제로 읽는 정상 데이터라
+    반드시 보존한다 — 삭제 대상은 어떤 선수 레코드에도 연결되지 않는
+    고아행뿐이다. ai_players.id는 AUTOINCREMENT라 재사용되지 않으므로
+    이 행들이 현재 게임 화면에 잘못 뜨고 있던 것은 아니지만, 인메모리
+    DB 전체 크기를 키워 게임 시작 로딩과 자동저장(4주마다 flush_to_disk)을
+    계속 느리게 만들고 있었다(실측: 로딩 1.30s→0.04s, 자동저장 1.66s→0.32s).
+
+    ── (2) WITHOUT ROWID 재구축 ──────────────────────────────
+    두 표 모두 (player_id, year) 복합 PK로만 읽고 쓰는 순수 키-값 아카이브라,
+    일반(rowid) 테이블이면 데이터 B-tree와 PK 유니크 인덱스를 2벌 유지하게
+    된다(실측: ovr 쪽 데이터 4.5MB + 자동 인덱스 4.7MB). WITHOUT ROWID면
+    PK 자체가 저장 순서가 되어 인덱스가 사라지고, 매 시즌 전환의
+    INSERT OR REPLACE 26만 건도 B-tree 한 개만 갱신하면 된다. 두 표에
+    rowid를 참조하는 코드가 없음을 전수 확인했다(조회 결과·쿼리 문법 동일).
+
+    DELETE 대신 "보존할 행만 새 표에 복사 → 원본 DROP → RENAME" 방식을
+    쓰는 이유: 삭제 대상이 96%라 지울 행을 하나씩 지우는 것보다 남길
+    행(28만)만 옮기는 쪽이 훨씬 싸다(실측 10.9s → 2.3s). 재구축이라
+    WITHOUT ROWID 전환도 같은 작업 안에서 공짜로 같이 끝난다."""
+    conn = get_conn(); c = conn.cursor()
+    try:
+        done = c.execute(
+            "SELECT value FROM meta WHERE key='history_tables_migrated_v1'").fetchone()
+    except sqlite3.OperationalError:
+        return
+    if done and done["value"] == "1":
+        return
+
+    import time as _t_mig
+    _t0 = _t_mig.perf_counter()
+    for tbl, cols, coldef in (
+            ("ai_player_ovr_history", "player_id, year, ovr",
+             "player_id INTEGER, year INTEGER, ovr INTEGER"),
+            ("ai_player_position_history", "player_id, year, position, role",
+             "player_id INTEGER, year INTEGER, position TEXT, role TEXT DEFAULT ''")):
+        try:
+            # 이미 WITHOUT ROWID이고 고아행도 없으면(=신규 세이브) 건너뛴다.
+            sql_row = c.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (tbl,)).fetchone()
+            if not sql_row:
+                continue
+            already_wr = "WITHOUT ROWID" in (sql_row["sql"] or "").upper()
+            orphans = c.execute(
+                f"""SELECT COUNT(*) AS n FROM {tbl} h
+                    WHERE NOT EXISTS(SELECT 1 FROM ai_players p WHERE p.id = h.player_id)
+                      AND NOT EXISTS(SELECT 1 FROM ai_players_retired r WHERE r.id = h.player_id)"""
+            ).fetchone()["n"]
+            if already_wr and orphans == 0:
+                continue
+            c.execute(f"DROP TABLE IF EXISTS _mig_{tbl}")
+            c.execute(f"CREATE TABLE _mig_{tbl}({coldef}, "
+                      f"PRIMARY KEY(player_id, year)) WITHOUT ROWID")
+            c.execute(
+                f"""INSERT INTO _mig_{tbl}({cols})
+                    SELECT {cols} FROM {tbl} h
+                    WHERE EXISTS(SELECT 1 FROM ai_players p WHERE p.id = h.player_id)
+                       OR EXISTS(SELECT 1 FROM ai_players_retired r WHERE r.id = h.player_id)""")
+            kept = c.execute(f"SELECT COUNT(*) AS n FROM _mig_{tbl}").fetchone()["n"]
+            c.execute(f"DROP TABLE {tbl}")
+            c.execute(f"ALTER TABLE _mig_{tbl} RENAME TO {tbl}")
+            print(f"[MIGRATE] {tbl}: 고아행 {orphans:,}행 정리, {kept:,}행 보존"
+                  f"{' (+WITHOUT ROWID 전환)' if not already_wr else ''}")
+        except sqlite3.OperationalError as e:
+            # 어느 한 표가 실패해도 게임 실행 자체를 막지 않는다(다음 실행에 재시도).
+            print(f"[MIGRATE] {tbl} 건너뜀: {e}")
+            try: c.execute(f"DROP TABLE IF EXISTS _mig_{tbl}")
+            except sqlite3.OperationalError: pass
+            conn.commit()
+            return
+    c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('history_tables_migrated_v1','1')")
+    conn.commit()
+    # DROP만으로는 비워진 페이지가 DB 안에 "빈 자리"로 남고, flush_to_disk()의
+    # backup API는 그 빈 페이지까지 그대로 파일로 복사한다 — 자동저장 시간이
+    # 안 줄어드는 원인이 되므로 여기서 한 번 정리한다(reset_game_data가
+    # 대량 DELETE 뒤에 VACUUM을 도는 것과 같은 이유·같은 방식).
+    try:
+        conn.execute("VACUUM")
+    except sqlite3.OperationalError:
+        pass
+    print(f"[MIGRATE] 선수 이력 표 재구축 완료 {_t_mig.perf_counter()-_t0:.2f}s")
 
 
 def repair_cwc_match_groups():
@@ -3020,6 +3153,20 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
               # 재사용) — 안 비우면 새 게임의 다른 선수가 이전 판 OVR
               # 이력을 이어받는다.
               "ai_player_ovr_history",
+              # [2026-08 버그수정, 최적화 감사 중 발견 — 이 프로젝트에서
+              # 반복돼온 "새 테이블을 이 삭제 목록에 추가하는 걸 깜빡함"
+              # 패턴의 또 한 건] ai_player_position_history가 바로 위
+              # ai_player_ovr_history와 완전히 같은 시점(run_ai_offseason)에
+              # 같은 키(player_id, year)로 쌓이는 쌍둥이 표인데, ovr 쪽만
+              # 삭제 목록에 들어있고 position 쪽은 빠져 있었다. 그 결과
+              # 은퇴 후 새 게임을 시작해도 이전 판의 포지션 이력이 통째로
+              # 남았고, 새 게임을 반복할수록 이 표만 무한 증식했다
+              # (실측 세이브: 7,344,610행 중 7,064,538행(96%)이 이미
+              # 존재하지 않는 이전 판 선수의 유령 행 — 그 세이브 파일
+              # 333MB 중 236MB가 이 표 하나였다). 새 게임 시작 시 반드시
+              # 같이 비운다. 기존 세이브에 이미 쌓인 유령 행은
+              # _migrate_history_tables()가 1회 정리한다.
+              "ai_player_position_history",
               # [2026-08 신설] my_player 전용 연도별 OVR 아카이브도 새
               # 게임에서 비워야 한다 — 안 비우면 새로 만든 캐릭터의 선수
               # 검색 화면에 이전 캐릭터의 OVR 이력이 그대로 뜬다.
@@ -3928,6 +4075,36 @@ def get_country_squad_players(country, positions=None, min_count=8, target_ovr=N
     return [s for s in slots if s]
 
 
+def _my_player_intl_slot(tournament_id, country):
+    """[2026-08 신설, 신민용 확정: "내가 뽑히면 나를 포함해서 인원을 뽑는 거고,
+    내가 없으면 날 제외하고 인원을 뽑아야지"] 이 대회(tournament_id)에서
+    이 나라(country) 대표팀에 '내 선수'가 실제로 발탁됐는지 판정해서,
+    발탁됐으면 내 포지션을, 아니면 None을 돌려준다.
+
+    intl_tournaments의 my_nat(내가 고른 나라)과 my_selected(1=선발,
+    0=미선발, 2=예선 진출 실패)로 판정한다 — my_selected가 1일 때만
+    내가 그 26인 엔트리의 한 자리를 실제로 차지한다.
+
+    내 선수는 ai_players가 아니라 my_player 표에 따로 있어서 AI 26인 풀을
+    뽑는 쿼리에는 절대 안 잡힌다. 그래서 이 판정 없이 26명을 그대로 뽑으면
+    "AI 26 + 나 = 27"이 되어 엔트리가 한 명 늘어난다 — 호출부는 이 결과로
+    뽑을 인원을 25로 줄이고 내 포지션 자리를 하나 비워둔다."""
+    try:
+        conn = get_conn()
+        trow = conn.execute(
+            "SELECT my_nat, my_selected FROM intl_tournaments WHERE id=?",
+            (tournament_id,)).fetchone()
+        if not trow or (trow["my_nat"] or "") != country or trow["my_selected"] != 1:
+            conn.close()
+            return None
+        prow = conn.execute("SELECT position FROM my_player WHERE id=1").fetchone()
+        conn.close()
+        return (prow["position"] if prow else None) or "CM"
+    except sqlite3.OperationalError:
+        # 구버전 세이브 등 컬럼이 없으면 예전처럼 전원 AI로 뽑는다.
+        return None
+
+
 def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
     """[2026-08 신설, 신민용 요청: "예선전 때 뽑은 애들 그대로 본선까지
     가는거야 — 지금은 경기할 때마다 국대 26명이 매번 새로 뽑힌다, 이러면
@@ -3978,6 +4155,30 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
         result = [dict(r) for r in prows]
         for r in result:
             r["appearances"] = appear_by_id.get(r["id"], 0)
+        # [2026-08 신설] 이 대회 명단이 이미 26인으로 고정된 뒤에 내가
+        # 발탁될 수도 있다(예선 명단이 먼저 만들어지고, 그 다음에 내가
+        # 그 나라를 골라 선발되는 순서). 그러면 "AI 26 + 나 = 27"이 되므로
+        # 여기서 실제로 한 자리를 비워준다 — 화면 표시만 줄이는 게 아니라
+        # intl_squad 행 자체를 지워야 상대팀 시뮬(로테이션·출전 카운트)과
+        # 본선 명단 승계까지 25인으로 일관되게 이어진다.
+        # 누구를 뺄지: 이 대회에서 아직 한 경기도 안 뛴(appearances=0)
+        # 선수 중 OVR이 가장 낮은 쪽. 이미 뛴 선수는 기록이 남아 있으므로
+        # 절대 건드리지 않는다(뺄 사람이 없으면 그냥 둔다).
+        _my_pos = _my_player_intl_slot(tournament_id, country)
+        if _my_pos:
+            _target = len(positions) - 1
+            _cut = [r for r in result if not r["appearances"]]
+            _cut.sort(key=lambda r: ((r["ovr"] or 0), -(r["age"] or 0)))
+            _drop_ids = set()
+            while len(result) - len(_drop_ids) > _target and _cut:
+                _drop_ids.add(_cut.pop(0)["id"])
+            if _drop_ids:
+                conn_d = get_conn()
+                conn_d.executemany(
+                    "DELETE FROM intl_squad WHERE tournament_id=? AND country=? AND player_id=?",
+                    [(tournament_id, country, pid) for pid in _drop_ids])
+                conn_d.commit(); conn_d.close()
+                result = [r for r in result if r["id"] not in _drop_ids]
         return result
 
     trow = conn.execute(
@@ -4012,9 +4213,31 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
             conn2.close()
             if len(prows) >= 8:
                 picked = [dict(r) for r in prows]
+                # [2026-08 신설] 예선 명단을 본선으로 물려받는 경로. 예선
+                # 때는 내가 발탁이 안 됐다가 본선에서 발탁되는 경우가 있어
+                # (예선 26인 → 본선에도 26인 + 나 = 27), 물려받은 명단도
+                # 여기서 한 자리 줄인다. 뺄 대상은 OVR 최하위 — 이 시점엔
+                # 아직 이 대회 출전 기록(appearances)이 없으므로 그것만
+                # 기준으로 삼는다.
+                _my_pos_inh = _my_player_intl_slot(tournament_id, country)
+                if _my_pos_inh and len(picked) > len(positions) - 1:
+                    picked.sort(key=lambda r: ((r["ovr"] or 0), -(r["age"] or 0)))
+                    picked = picked[len(picked) - (len(positions) - 1):]
 
     if picked is None:
-        picked = get_country_squad_players(country, positions=positions, min_count=8,
+        # [2026-08 신설] 내가 이 대표팀에 발탁됐으면 내가 엔트리 한 자리를
+        # 차지하므로, AI는 25명만 뽑는다. 빼는 자리는 "내 포지션과 같은
+        # 자리 하나" — 내가 ST면 ST 한 자리를 내가 메우는 셈이라 포지션
+        # 구성이 자연스럽게 유지된다(같은 포지션 자리가 없으면 맨 끝
+        # 자리를 하나 줄인다).
+        _my_pos = _my_player_intl_slot(tournament_id, country)
+        _positions = list(positions)
+        if _my_pos and len(_positions) > 1:
+            if _my_pos in _positions:
+                _positions.remove(_my_pos)
+            else:
+                _positions.pop()
+        picked = get_country_squad_players(country, positions=_positions, min_count=8,
                                             target_ovr=round(avg_ovr) if avg_ovr is not None else None)
     if not picked:
         return []

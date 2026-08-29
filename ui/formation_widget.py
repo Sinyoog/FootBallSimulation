@@ -663,11 +663,66 @@ class _FormationCanvas(QWidget):
                 # [2026-08 신설, 신민용 요청: "여기도 내가 지은 이름으로
                 # 뜨게"] 배치 조회로 N+1 방지(_mask_ai_names와 동일 원칙).
                 custom_names = get_ai_player_custom_names([r["id"] for r in pool])
-                starter_picked = []
-                for i, sp in remaining_slots:
-                    match_idx = next((k for k, r in enumerate(pool) if r["position"] == sp), None)
-                    starter_picked.append(pool.pop(match_idx) if match_idx is not None else None)
-                bench_picked = pool  # 주전 배정에 안 쓰인 나머지 전부가 후보
+                # [2026-08 버그수정, 신민용 리포트+스크린샷: "국대가 주전 9명
+                # 후보 17명으로 뜬다 — 주전은 11명이어야 하고 후보도 정해진
+                # 숫자가 있는데, 상대팀은 멀쩡하다"]
+                # 원인: 여기서 r["position"] == sp 로 "포지션 문자열이 정확히
+                # 같은지"만 봤다. 그런데 26인 풀은 _INTL_FULL_SQUAD_POSITIONS
+                # (…, "LW", "RW", …) 기준으로 뽑히는 반면, 화면에 그려지는
+                # 슬롯(slots_only)은 그 팀의 포메이션에서 나오므로 4-4-2면
+                # "LM"/"RM"을 요구한다. LW는 LM과 같은 자리인데도 문자열이
+                # 다르다는 이유로 매치에 실패해 그 두 자리가 빈 채로 남고
+                # (스크린샷의 이름 없는 LM/RM 동그라미), 정작 그 LW/RW
+                # 선수들은 통째로 후보로 밀려났다 — 주전 9 / 후보 17의 정체가
+                # 이것이다. 상대팀이 멀쩡했던 건 그쪽은 이 경로를 타지 않고
+                # intl_engine._pick_intl_starters로 별도 선발하기 때문.
+                #
+                # 고침: 이 앱의 다른 모든 포메이션 배치와 동일하게
+                # formation_logic._greedy_fill_slots에 맡긴다. 이 함수는
+                # POSITION_COMPAT(호환 포지션표)로 LW↔LM 같은 관계를 이미
+                # 알고 있고, ①정확/호환 매치 → ②카테고리(GK/DEF/MID/ATK)
+                # 매치 → ③남는 자리 순으로 3단계 배정하므로 후보가 충분한
+                # 한 슬롯이 비지 않는다. 덤으로 OVR 내림차순으로 배정하기
+                # 때문에, 예전처럼 "DB가 돌려준 임의 순서에서 먼저 걸린
+                # 선수"가 아니라 실제로 잘하는 선수가 주전이 된다.
+                # [주의] 여기서 `from formation_logic import _greedy_fill_slots`를
+                # 하면 안 된다. 함수 안에서 이름을 대입하는 순간 그 이름이
+                # 이 함수 전체의 지역 변수가 되어버려서, 이 분기(국가대표)를
+                # 타지 않는 평소 경로에서는 아래쪽 slot_filled = _greedy_fill_slots(...)
+                # 가 UnboundLocalError로 죽는다. 이 파일 맨 아래에 이미
+                # 모듈 수준 import가 있으므로 그대로 쓰면 된다.
+                _cand = [{"_i": k, "position": r["position"], "ovr": r["ovr"] or 0}
+                         for k, r in enumerate(pool)]
+                _placed = _greedy_fill_slots(_cand, [sp for _, sp in remaining_slots])
+                starter_picked = [pool[c["_i"]] if c is not None else None for c in _placed]
+                _used_idx = {c["_i"] for c in _placed if c is not None}
+                # 주전 배정에 안 쓰인 나머지 전부가 후보(원래 풀 순서 유지)
+                bench_picked = [r for k, r in enumerate(pool) if k not in _used_idx]
+
+                # [2026-08 신설, 신민용 확정: "내가 뽑히면 나를 포함해서
+                # 인원을 뽑는 거고, 내가 없으면 날 제외하고 인원을 뽑아야지"]
+                # 대표팀 엔트리는 _INTL_FULL_SQUAD_POSITIONS 길이(26명)로
+                # 고정이다. 그런데 내 선수는 ai_players가 아니라 별도
+                # 존재라 26인 풀에 애초에 들어있지 않다 — 그래서 내가
+                # 발탁되면 "풀 26 + 나 = 27명"이 되어 엔트리가 한 명
+                # 늘어나 있었다(내가 없을 때는 26명 그대로라 정상).
+                # 내가 주전 한 자리를 차지한 만큼 후보 끝자리 한 명이
+                # 밀려나야 앞뒤가 맞으므로, 총원이 26이 되도록 후보에서
+                # OVR이 가장 낮은 선수부터 덜어낸다(주전은 건드리지 않는다 —
+                # 실제로 뛰는 11명이 바뀌면 안 되므로).
+                # 이건 화면에 보이는 엔트리만의 조정이다. DB의 intl_squad
+                # (대회 내내 고정되는 26인, 상대팀 시뮬과 공유)는 그대로
+                # 두어야 예선→본선 명단 승계가 깨지지 않는다.
+                _squad_size = len(_INTL_FULL_SQUAD_POSITIONS)
+                _me_count = sum(1 for pl in players if pl.get("is_me"))
+                _starter_from_pool = sum(1 for c in _placed if c is not None)
+                _bench_target = _squad_size - _me_count - _starter_from_pool
+                if _me_count and 0 <= _bench_target < len(bench_picked):
+                    _drop = sorted(range(len(bench_picked)),
+                                   key=lambda k: (bench_picked[k]["ovr"] or 0,
+                                                  -(bench_picked[k].get("age") or 0)))
+                    _drop = set(_drop[:len(bench_picked) - _bench_target])
+                    bench_picked = [r for k, r in enumerate(bench_picked) if k not in _drop]
                 for (i, sp), r in zip(remaining_slots, starter_picked):
                     if r is None:
                         continue
@@ -1154,7 +1209,10 @@ class _RosterPanel(QScrollArea):
             item = self._grid.takeAt(0)
             w = item.widget()
             if w:
-                w.setParent(None); w.deleteLater()
+                # [2026-08] setParent(None)은 그 찰나 위젯을 최상위 창으로
+                # 만든다(_build_filter_row 주석 참고) — 부모를 떼지 않고
+                # 숨긴 뒤 삭제 예약만 한다. 결과는 동일하게 "제거"다.
+                w.hide(); w.deleteLater()
         if not players:
             empty = QLabel("명단 없음")
             empty.setStyleSheet("color:#666;font-size:10px;")
@@ -1404,8 +1462,23 @@ class FormationWidget(QWidget):
 
     def _build_filter_row(self, options: list, active_context: dict):
         # 기존 버튼 정리
+        # [2026-08 버그수정, 신민용 리포트+스크린샷: "국가대표 나라 선택에서
+        # 선택하면 흰색 작은 창이 여러 개 와라락 떴다가 사라진다"]
+        # 예전엔 여기서 btn.setParent(None)만 하고 끝냈다. Qt에서 부모가
+        # 없는 위젯은 그 자체로 "최상위 창"이라, 이 버튼들이 삭제되지 않고
+        # 화면 밖에 창 후보로 계속 살아남았다(재사용하지도 않으므로 누수이기도
+        # 했다). 그리고 이 함수는 대표팀 관련 컨텍스트가 늘어날 때 —
+        # 즉 국가대표를 선택한 직후 refresh 흐름에서 — 옵션이 2개 이상이
+        # 되면서 바로 호출된다. 그때 모달이 닫히며 Qt가 최상위 창 목록을
+        # 다시 훑는 타이밍과 겹쳐, 이 유령 버튼들이 잠깐 진짜 창으로 그려진
+        # 것으로 보인다(스크린샷의 작은 흰 창 크기·개수가 이 필터 버튼과
+        # 일치한다 — QPushButton 기본 크기에 타이틀바만 붙은 모습).
+        # 부모를 떼지 않고(=한순간도 최상위 창이 되지 않게) 숨긴 뒤 바로
+        # 삭제 예약한다. 어차피 아래에서 전부 새로 만들므로 재사용 대상이
+        # 아니다.
         for btn, _ctx in self._filter_btns:
-            btn.setParent(None)
+            btn.hide()
+            btn.deleteLater()
         self._filter_btns = []
         if len(options) < 2:
             self._filter_row_w.setVisible(False)

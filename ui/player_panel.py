@@ -297,9 +297,58 @@ class PlayerPanel(QWidget):
         self.content_lay.setSpacing(4); self.content_lay.setContentsMargins(0,0,0,0)
         self.lay.addWidget(self.content_frame)
 
-        self._order = list(self.DEFAULT_ORDER)   # 기본값: 전체 보기(기존 화면과 동일)
+        # [2026-08 신설] _rebuild_content()에서 잠시 떼어낸 섹션 위젯을
+        # 담아두는 "보관용" 위젯. 자세한 이유는 _rebuild_content() 주석 참고 —
+        # 요약하면, 부모 없이(setParent(None)) 떼어두면 그 위젯이 잠깐
+        # 최상위 창(=화면에 뜰 수 있는 창)이 되어버리기 때문에, 대신 항상
+        # 숨겨져 있는 이 위젯 밑에 붙여둔다. 자기 자신도 숨김 상태라
+        # 화면에는 아무것도 안 나온다.
+        self._park = QWidget(self)
+        self._park.hide()
+
+        # [2026-08 신설, 신민용 요청: "전체/기본/시즌/신체/스탯 선택 후
+        # 나갔다 들어오면 전체로 돌아가 있어서 매번 다시 세팅해야 한다"]
+        # 저장해둔 탭 선택을 복원한다. 저장된 게 없거나 형식이 깨졌으면
+        # 예전과 똑같이 전체 보기로 시작한다.
+        self._order = self._load_saved_order()
         self._sync_tab_buttons()
         self._rebuild_content()
+
+    # ── 탭 선택 상태 저장/복원 ───────────────────
+    # [2026-08 신설] 세이브의 meta 표에 그대로 얹는다(플레이 진행 데이터가
+    # 아니라 화면 설정이지만, 이 게임은 설정 파일을 따로 두지 않고 meta를
+    # 잡다한 1회성 플래그 보관소로 이미 쓰고 있으므로 같은 방식을 따른다).
+    # 저장/복원이 실패해도 게임 진행에는 아무 영향이 없어야 하므로 모든
+    # 실패를 조용히 삼키고 기본값(전체 보기)으로 넘어간다.
+    _ORDER_META_KEY = "ui_player_panel_order"
+
+    def _load_saved_order(self):
+        try:
+            from database import get_conn
+            row = get_conn().execute(
+                "SELECT value FROM meta WHERE key=?", (self._ORDER_META_KEY,)).fetchone()
+            if not row or not row["value"]:
+                return list(self.DEFAULT_ORDER)
+            # 값 형식: "기본,시즌" — 빈 문자열이면 "전부 해제"(전체 버튼
+            # 두 번 누른 상태)라는 뜻이므로 빈 리스트가 정상이다.
+            raw = row["value"]
+            if raw == "-":
+                return []
+            saved = [k for k in raw.split(",") if k in self.sections]
+            return saved
+        except Exception:
+            return list(self.DEFAULT_ORDER)
+
+    def _save_order(self):
+        try:
+            from database import get_conn
+            conn = get_conn()
+            # 빈 리스트와 "저장된 적 없음"을 구분해야 해서 빈 값은 "-"로 적는다.
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                         (self._ORDER_META_KEY, ",".join(self._order) if self._order else "-"))
+            conn.commit()
+        except Exception:
+            pass
 
     def _div(self):
         self.lay.addWidget(self._mk_div())
@@ -319,6 +368,7 @@ class PlayerPanel(QWidget):
             self._order = list(self.DEFAULT_ORDER)
         self._sync_tab_buttons()
         self._rebuild_content()
+        self._save_order()
 
     def _on_click_tab(self, key):
         if key in self._order:
@@ -327,6 +377,7 @@ class PlayerPanel(QWidget):
             self._order.append(key)   # 누른 순서대로 맨 뒤(= 맨 아래)에 추가
         self._sync_tab_buttons()
         self._rebuild_content()
+        self._save_order()
 
     def _sync_tab_buttons(self):
         for k, b in self.tab_buttons.items():
@@ -339,13 +390,48 @@ class PlayerPanel(QWidget):
 
     def _rebuild_content(self):
         """content_lay를 self._order 순서대로 다시 채운다.
-        섹션 위젯은 deleteLater가 아니라 setParent(None)으로만 떼어내
-        (재사용을 위해) 다음 rebuild에서 다시 붙일 수 있게 한다."""
+        섹션 위젯은 삭제하지 않고 숨김 보관용 위젯(self._park)으로 잠시
+        옮겨뒀다가 다음 rebuild에서 다시 붙인다.
+
+        [2026-08 버그수정, 신민용 리포트: "국대 선택 창에서 선택하고 창이
+        사라지면 흰색 창이 여러 개 0.1초 안에 와라락 떴다가 사라진다"]
+        예전엔 여기서 떼어낸 위젯을 w.setParent(None)으로 놔뒀다. Qt에서
+        부모가 없는 위젯은 그 자체로 "최상위 창"이다 — 즉 이 순간 섹션
+        4개 + 구분선 3개가 한꺼번에 독립된 빈 창 후보가 됐다. 평소에는
+        재배치가 같은 틱 안에서 끝나 눈에 안 띄지만, 대표팀 선택처럼
+        다이얼로그가 닫히면서 refresh_all()이 도는 흐름에서는 그 중간에
+        이벤트 루프가 한 번 돌아(refresh_all 맨 앞의 processEvents 포함)
+        이 떼어진 위젯들이 실제로 네이티브 창으로 만들어졌다가 곧바로
+        다시 부모가 붙으면서 사라진다 — "흰 창 여러 개가 와라락"이 정확히
+        이 개수(7개)와 타이밍(0.1초)에 들어맞는다.
+
+        고침 두 가지:
+          ① 섹션은 부모 없이 두지 않고, 항상 숨겨져 있는 self._park 밑으로
+             옮긴다. 부모가 있으니 최상위 창이 될 수 없고, 그 부모가
+             숨김 상태라 화면에도 안 나온다. 재사용 목적(위젯을 살려두고
+             다시 붙이기)은 그대로 달성된다.
+          ② 구분선(_mk_div로 매번 새로 만드는 QFrame)은 재사용하지도
+             않으면서 setParent(None)으로 계속 떠다니기만 했다 — 즉
+             rebuild할 때마다 부모 없는 위젯이 계속 쌓이는 누수였다.
+             이제 확실히 삭제한다.
+        각 위젯을 옮기기 전에 hide()를 먼저 부르는 이유: setParent()가
+        내부적으로 창을 다시 만드는 경로를 타더라도, 이미 숨김 상태면
+        화면에 그려질 일이 없기 때문이다."""
+        _section_ids = {id(w) for w in self.sections.values()}
         while self.content_lay.count():
             item = self.content_lay.takeAt(0)
             w = item.widget()
-            if w is not None:
-                w.setParent(None)
+            if w is None:
+                continue
+            w.hide()
+            if id(w) in _section_ids:
+                w.setParent(self._park)     # 재사용할 섹션 → 숨김 보관
+            else:
+                # 구분선 → 폐기. setParent(None)을 거치지 않는 이유는 위와
+                # 같다 — 부모를 뗀 그 찰나에 최상위 창이 되어버리므로,
+                # 부모를 그대로 둔 채 숨기고 삭제만 예약한다(레이아웃에서는
+                # 위 takeAt으로 이미 빠진 상태라 화면에 남지 않는다).
+                w.deleteLater()
         _first = True
         for key in self._order:
             sec = self.sections.get(key)
@@ -355,6 +441,7 @@ class PlayerPanel(QWidget):
                 self.content_lay.addWidget(self._mk_div())
             _first = False
             self.content_lay.addWidget(sec)
+            sec.show()   # 위에서 hide()로 숨겨뒀으므로 다시 붙일 때 되살린다
 
     # ── 갱신 ─────────────────────────────────────
 

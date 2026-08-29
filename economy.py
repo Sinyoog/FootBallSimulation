@@ -672,7 +672,7 @@ def _cap_relief_mult(ovr) -> float:
     return 1.0 + (t ** 3) * 5.0    # OVR40: 1.0배 ~ OVR105: 6.0배, 항상 매끄럽게 증가
 
 
-def _clamp_salary_to_cap(sal, wealth, country=None, tier=1, is_special=False, ovr=None, talent_tier=None):
+def _clamp_salary_to_cap(sal, wealth, country=None, tier=1, is_special=False, ovr=None, talent_tier=None, year=None):
     """[버그수정 2026-07, 신민용 지적] 등급/국가별 연봉 상한 최종 안전망.
 
     _calc_salary는 자기 내부에서만 캡을 체크하는데, 재계약 협상 성공
@@ -700,28 +700,51 @@ def _clamp_salary_to_cap(sal, wealth, country=None, tier=1, is_special=False, ov
     ovr 인자가 주어지면 _cap_relief_mult로 엘리트/월드클래스 구간의 상한을
     완화한다. 기본값 None → 기존 호출부는 하위호환(완화 없음).
 
-    talent_tier: [2026-08 신설] "god"면 이 함수의 상한 로직 자체를
-    건너뛴다 — _calc_salary에서 이미 GOD_TIER_SALARY_MULT로 상한을
-    뚫어놓은 값을, 호출부가 안전망 삼아 이 함수로 다시 클램프하면서
-    도로 눌러버리는 걸 막기 위함(재계약/이적 오퍼 경로 다수가 이렇게
-    두 함수를 순서대로 부른다)."""
-    if talent_tier == "god":
-        return max(0, int(sal))
-    from constants import COUNTRY_SALARY_CAP, LOWER_TIER_SALARY_CAP
-    relief = _cap_relief_mult(ovr)
+    talent_tier: [2026-08 신설] "god"면 등급 캡(_salary_cap_table)은
+      뚫도록 둔다 — _calc_salary가 GOD_TIER_SALARY_MULT로 이미 뚫어놓은
+      값을 호출부가 안전망 삼아 다시 클램프하면서 도로 눌러버리는 걸
+      막기 위함(재계약/이적 오퍼 경로 다수가 두 함수를 순서대로 부른다).
+      [2026-08 재수정, 신민용 지적: "유럽 5대리그 연봉이 3천억"] 예전엔
+      god이면 이 함수를 통째로 통과(return sal)시켰는데, 그러면 재계약
+      인상(old_salary×1.3)이나 승격 인상(×2.0)이 아무 상한 없이 복리로
+      누적되는 경로가 열렸다. 이제 국가 캡(COUNTRY_SALARY_CAP)과 하위
+      tier 캡은 god이어도 그대로 적용한다 — 국가 캡은 "그 리그에서 나올
+      수 있는 최고 연봉"이라 신급 재능이라도 리그를 안 옮기면 넘을 수
+      없는 값이기 때문.
+
+    year: [2026-08 신설] 주어지면 캡에 economy_index(year)를 곱한다.
+      캡 값 자체가 2026년 기준 앵커라, 안 곱하면 2040년대 재계약이
+      2026년 캡에 눌려 오히려 연봉이 깎이는 역전이 생긴다.
+      None이면 1.0(하위호환)."""
+    from constants import (COUNTRY_SALARY_CAP, LOWER_TIER_SALARY_CAP,
+                           SALARY_CURVE_OVERRIDE)
+    eidx = economy_index(year) if year is not None else 1.0
+    # [2026-08 버그수정, 신민용 지적: "유럽 5대리그에서 연봉 3천억이 찍힌다"]
+    # _cap_relief_mult는 "실측 앵커 곡선이 없는 나라"의 평평한 캡이 엘리트
+    # 구간을 뭉개는 걸 푸는 장치다(브라질 OVR88+ 전부 30억 고정 수정).
+    # 그런데 SALARY_CURVE_OVERRIDE가 있는 tier1 리그(잉글랜드/스페인/독일/
+    # 이탈리아/프랑스/사우디/대한민국)는 커브 자체가 이미 OVR별 progression을
+    # 갖고 있어 평탄화가 애초에 생기지 않는다 — 여기까지 relief를 곱하면
+    # (OVR100에서 4.93배) 잉글랜드 캡이 1조까지 열려서, 재계약/승격 인상이
+    # 반복될수록 연봉이 사실상 무한히 불어났다(이게 3천억의 주범).
+    # 커브 리그 tier1은 relief 없이 캡을 곧 절대 상한으로 쓴다.
+    _curve_tier1 = (tier == 1 and country in SALARY_CURVE_OVERRIDE)
+    relief = 1.0 if _curve_tier1 else _cap_relief_mult(ovr)
     country_cap = COUNTRY_SALARY_CAP.get(country, 0) if (country and not is_special) else 0
     if country_cap > 0:
-        sal = min(sal, int(_tier_scaled_country_cap(country_cap, tier) * relief))
-    else:
+        sal = min(sal, max(1, int(_tier_scaled_country_cap(country_cap, tier) * relief * eidx)))
+    elif talent_tier != "god":
+        # 국가 캡이 없는 나라에서만 등급 캡으로 폴백 — god은 이 등급 캡을
+        # 뚫는다(위 talent_tier 설명 참고).
         cap = _tier_scaled_country_cap(_salary_cap_table().get(wealth, 0), tier)
         if cap > 0:
-            sal = min(sal, int(cap * relief))
+            sal = min(sal, max(1, int(cap * relief * eidx)))
     if country and not is_special and tier >= 2:
         _lt = LOWER_TIER_SALARY_CAP.get(country, {})
         if _lt:
             lt_cap = _lt.get(tier, _lt[max(_lt.keys())])
             if lt_cap > 0:
-                sal = min(sal, int(lt_cap * relief))
+                sal = min(sal, max(1, int(lt_cap * relief * eidx)))
     return max(0, int(sal))
 
 
@@ -786,14 +809,24 @@ def _calc_salary(grade, tier, ovr, country=None, team_name=None, year=None, team
     # 국대등급(grade)과 무관하게 국가명 자체로 판정하므로 SPECIAL 여부와도 독립적.
     if tier == 1 and country in SALARY_CURVE_OVERRIDE:
         sal = salary_curve_value(country, ovr)
-        cap = COUNTRY_SALARY_CAP.get(country, 0)
-        if cap > 0:
-            sal = min(sal, cap)
+        # [2026-08 버그수정, 신민용 지적: "유럽 5대리그에서 연봉이 3천억씩
+        # 찍힌다 — 3천억 이상은 사우디 같은 곳에서나 가능하다"] 국가 캡을
+        # 배율을 곱하기 *전에* 씌우고 있었다 — 그래서 캡이 사실상 캡이
+        # 아니었다. 캡(2,050억)을 통과한 뒤 명문 프리미엄(×1.12·열기) ×
+        # 팀 체급(×1.10) × 경제지수(2040년 ×1.35) × god(×1.6)이 차례로
+        # 곱해져서 최종 4,959억까지 나왔다. 캡은 "이 리그에서 나올 수 있는
+        # 최고 연봉"이라는 뜻이므로, 모든 배율을 다 곱한 *최종값*에
+        # 씌워야 한다. 단 캡 값 자체는 2026년 기준 앵커라서 시대 배율
+        # (economy_index)만은 캡에도 같이 적용한다 — 안 그러면 2040년대
+        # 최상위 구간이 2026년 캡에 통째로 눌려 평평해진다.
+        _final = max(0, int(_apply_prestige(sal) * strength_mult * eidx))
         # [2026-08 신설] god 등급 전용 프리미엄 — 아래 일반 분기와 동일한
         # 로직(_calc_salary docstring의 talent_tier 설명 참고).
-        _final = max(0, int(_apply_prestige(sal) * strength_mult * eidx))
         if talent_tier == "god":
             _final = int(_final * GOD_TIER_SALARY_MULT)
+        cap = COUNTRY_SALARY_CAP.get(country, 0)
+        if cap > 0:
+            _final = min(_final, max(1, int(cap * eidx)))
         return _final
 
     is_special = country and country in SPECIAL_SALARY_COUNTRIES
@@ -948,10 +981,12 @@ def _calc_salary(grade, tier, ovr, country=None, team_name=None, year=None, team
         from constants import COUNTRY_SALARY_CAP
         _country_cap_val = COUNTRY_SALARY_CAP.get(country, 0)
 
+    _applied_cap = 0   # [2026-08 신설] 실제로 적용된 상한(천원) — 함수 끝에서 최종값 재클램프에 재사용
     if _country_cap_val > 0:
         # 국가별 캡이 있으면 그것만 적용 — 더 낮은 범용 등급 캡을 추가로
         # 덧씌우지 않는다(_clamp_salary_to_cap과 동일한 우선순위).
-        sal = min(sal, int(_tier_scaled_country_cap(_country_cap_val, tier) * _cap_relief_mult(ovr)))
+        _applied_cap = int(_tier_scaled_country_cap(_country_cap_val, tier) * _cap_relief_mult(ovr))
+        sal = min(sal, _applied_cap)
     else:
         # [버그수정 2026-07, 신민용 지적: "K1이랑 K2가 둘 다 30억으로 고정"]
         #   이 캡이 tier를 구분 안 해서, LOWER_TIER_SALARY_CAP이 따로 없는
@@ -964,7 +999,8 @@ def _calc_salary(grade, tier, ovr, country=None, team_name=None, year=None, team
         #   엘리트(81~94)·월드클래스(95+) 구간만 상한을 단계적으로 풀어준다.
         cap = _tier_scaled_country_cap(_salary_cap.get(wealth, 0), tier)
         if cap > 0:
-            sal = min(sal, int(cap * _cap_relief_mult(ovr)))
+            _applied_cap = int(cap * _cap_relief_mult(ovr))
+            sal = min(sal, _applied_cap)
     # [버그수정] 양극화 리그(SALARY_CURVE_OVERRIDE 적용국)는 tier1만 재계산돼서
     #   COUNTRY_SALARY_CAP이 tier1 기준 안전망(예: 잉글랜드 550억)으로 상향됐다.
     #   그 캡이 2부 이하에도 그대로 적용되면 "1부보다 2부가 더 비싼" 역전이
@@ -985,7 +1021,9 @@ def _calc_salary(grade, tier, ovr, country=None, team_name=None, year=None, team
                 # 빠져 있었다 — 과거 "브라질 OVR88+ 전부 30억 고정" 등 같은
                 # 증상을 여러 번 고치면서 이 지점만 누락된 것으로 보인다.
                 # 다른 두 캡과 동일한 패턴으로 맞춘다.
-                sal = min(sal, int(lt_cap * _cap_relief_mult(ovr)))
+                _lt_applied = int(lt_cap * _cap_relief_mult(ovr))
+                _applied_cap = _lt_applied if _applied_cap <= 0 else min(_applied_cap, _lt_applied)
+                sal = min(sal, _lt_applied)
     # [2026-08 신설, 신민용 확정: "재능이 신급인 선수만 국가별 상한을
     # 뚫는 초월적 스타 연봉이 나와야 한다"] 위 모든 등급별/국가별 상한을
     # 이미 다 통과한 최종값에, god 등급일 때만 추가 프리미엄을 곱한다.
@@ -994,6 +1032,14 @@ def _calc_salary(grade, tier, ovr, country=None, team_name=None, year=None, team
     _final = max(0, int(_apply_prestige(sal) * strength_mult * eidx))
     if talent_tier == "god":
         _final = int(_final * GOD_TIER_SALARY_MULT)
+    # [2026-08 버그수정, 신민용 지적: "연봉 3천억"] 위 커브 분기와 같은
+    # 문제 — 캡을 다 씌운 뒤에 명문/팀체급/god 배율이 곱해져서 캡을 그냥
+    # 넘어가고 있었다. 방금 실제로 적용한 상한(_applied_cap: 국가캡 또는
+    # 등급캡, relief·tier 스케일까지 반영된 값)에 시대 배율만 곱해서
+    # 최종값에 한 번 더 씌운다. relief를 그대로 물려받으므로 브라질
+    # OVR88+ 평탄화 같은 기존 수정 사항은 깨지지 않는다.
+    if _applied_cap > 0:
+        _final = min(_final, max(1, int(_applied_cap * eidx)))
     return _final
 
 

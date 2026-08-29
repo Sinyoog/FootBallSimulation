@@ -424,7 +424,11 @@ class MatchDetailDialog(QDialog):
                 import random
                 random.setstate(pre_seed_state)
             self._right_layout.removeWidget(self._right_widget)
-            self._right_widget.setParent(None)
+            # [2026-08] setParent(None)은 부모를 뗀 그 순간부터 deleteLater가
+            # 실제로 도는 다음 이벤트 루프 틱까지 이 위젯을 "최상위 창"으로
+            # 만든다(유령 흰 창의 원인 — ui/formation_widget._build_filter_row
+            # 주석 참고). 부모를 그대로 둔 채 숨기고 삭제만 예약한다.
+            self._right_widget.hide()
             self._right_widget.deleteLater()
             self._right_widget = None
 
@@ -440,7 +444,8 @@ class MatchDetailDialog(QDialog):
         """왼쪽 통계 패널 비우기."""
         if self._left_stats_widget is not None:
             self._left_layout.removeWidget(self._left_stats_widget)
-            self._left_stats_widget.setParent(None)
+            # [2026-08] 위 _clear_right_panel과 같은 이유.
+            self._left_stats_widget.hide()
             self._left_stats_widget.deleteLater()
             self._left_stats_widget = None
         self._left_container.setFixedWidth(0)
