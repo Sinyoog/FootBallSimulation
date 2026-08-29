@@ -594,7 +594,7 @@ def init_db():
     # 그 이전 과거 시즌은 소급 적용이 안 된다(월드 브라우저 쪽에서
     # 이 기록이 없는 연도는 기존처럼 이적 시점 등록 포지션으로 대체 표시).
     c.execute("""CREATE TABLE IF NOT EXISTS ai_player_position_history(
-        player_id INTEGER, year INTEGER, position TEXT,
+        player_id INTEGER, year INTEGER, position TEXT, role TEXT DEFAULT '',
         PRIMARY KEY(player_id, year))""")
 
     # [2026-08 신설, 신민용 리포트: "선수 검색에서 나(my_player)를 보면
@@ -1791,6 +1791,14 @@ def init_db():
         # 구분하는 플래그. get_ai_player_career_history가 이 값을 보고
         # "그 해 기록을 상반기/하반기 두 줄로 쪼갤지"를 판단한다.
         "ALTER TABLE ai_transfer_log ADD COLUMN is_mid_season INTEGER DEFAULT 0",
+        # [2026-08 신설, 신민용 요청: "선수 검색 소속팀 대회 기록에 그 해
+        # 주전/로테이션/대기/유망주였는지 연도별로 표시"] ai_player_
+        # position_history는 이미 매 시즌 전환마다 팀별 로스터를 훑고
+        # 있으므로(ai_lifecycle._snapshot_season_positions), 그 자리에서
+        # 같이 계산해 이 컬럼에 남긴다(formation_logic.compute_squad_roles
+        # 참고). 이 컬럼 신설 이전 과거 시즌은 당연히 빈 문자열 — 세계
+        # 브라우저 쪽에서 "-"로 대체 표시한다.
+        "ALTER TABLE ai_player_position_history ADD COLUMN role TEXT DEFAULT ''",
     ]:
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,
@@ -3232,8 +3240,21 @@ def rescale_team_to_target_ovr(team_id, target_ovr, conn=None):
     - [중요] 대상은 ai_players 뿐. 플레이어 본인(my_player 테이블)은
       구조적으로 분리되어 있어 절대 변경되지 않는다(내 팀 승격 시 동료 AI만 강화).
 
+    [2026-08 버그수정, 신민용 리포트: "선수 검색에서 나이 먹고 OVR이
+    떨어져야 할 시점(피크 지난 노쇠기)인데 오히려 오르는 애들이 있다"]
+    원인: 이 델타는 나이·노화와 완전히 무관하게 팀 전원에게 균일 적용돼서,
+    ai_lifecycle._age_and_progress가 그 시즌 이미 노화로 스탯을 깎아둔
+    노쇠기(피크 이후, ai_lifecycle._AI_PEAK_END=29 초과) 선수도 팀이
+    승격하면(delta가 +) 그 하락분을 덮어쓰고 OVR이 올라가 버렸다.
+    "젊은 선수는 팀 승격에 따라 올라가는 게 맞지만, 이미 하락 구간에
+    들어선 선수는 올라가면 안 된다"(신민용 확정)에 따라, delta가 +일
+    때만 노쇠기 선수를 이 리스케일에서 제외한다(스탯·OVR 그대로 유지).
+    delta가 -(강등 등)일 때는 노쇠기도 기존처럼 그대로 다 받는다 — 이미
+    하락 중인 선수가 팀 수준까지 더 떨어지는 것 자체는 자연스러우므로.
+
     반환: (적용된 delta:int, before_avg:float, after_avg:float) — 변경 없으면 delta=0.
     """
+    from ai_lifecycle import _AI_PEAK_END
     own = False
     if conn is None:
         conn = get_conn(); own = True
@@ -3257,9 +3278,17 @@ def rescale_team_to_target_ovr(team_id, target_ovr, conn=None):
         update_rows = []
         ovr_sum = 0
         for r in rows:
+            age = r["age"]
+            # 위 docstring 참고 — delta가 +인데 노쇠기 선수면 이 선수만
+            # 델타 0(변경 없음) 처리하고, 그 외(delta가 - 이거나 아직
+            # 노쇠기가 아님)엔 팀 델타를 그대로 적용.
+            player_delta = 0 if (delta > 0 and age is not None and age > _AI_PEAK_END) else delta
+            if player_delta == 0:
+                ovr_sum += r["ovr"]
+                continue
             new_stats = {}
             for s in ALL_STATS:
-                new_stats[s] = min(99, max(1, int(r[s]) + delta))
+                new_stats[s] = min(99, max(1, int(r[s]) + player_delta))
             new_ovr = calc_ovr(r["position"], new_stats)
             ovr_sum += new_ovr
             update_rows.append((
@@ -3270,18 +3299,20 @@ def rescale_team_to_target_ovr(team_id, target_ovr, conn=None):
                 new_stats["confidence"], new_stats["leadership"],
                 new_stats["concentration"], new_ovr, r["id"]))
 
-        conn.executemany(
-            """UPDATE ai_players SET
-               stamina=?,speed=?,jump=?,strength=?,shooting=?,passing=?,
-               dribbling=?,tackling=?,heading=?,positioning=?,setpiece=?,
-               mental=?,confidence=?,leadership=?,concentration=?,ovr=?
-               WHERE id=?""", update_rows)
+        if update_rows:
+            conn.executemany(
+                """UPDATE ai_players SET
+                   stamina=?,speed=?,jump=?,strength=?,shooting=?,passing=?,
+                   dribbling=?,tackling=?,heading=?,positioning=?,setpiece=?,
+                   mental=?,confidence=?,leadership=?,concentration=?,ovr=?
+                   WHERE id=?""", update_rows)
         if own:
             conn.commit()
 
-        # [최적화] 방금 계산해 저장한 new_ovr 합계로 after_avg를 바로 구해
-        # 추가 SELECT(AVG) 왕복을 없앰. DB에 저장된 값과 동일하므로 결과는 같음.
-        after_avg = ovr_sum / len(update_rows) if update_rows else before_avg
+        # [최적화] 방금 계산해 저장한 new_ovr 합계(노쇠기 제외분은 원래
+        # ovr을 그대로 더함)로 after_avg를 바로 구해 추가 SELECT(AVG)
+        # 왕복을 없앰. DB에 저장된 값과 동일하므로 결과는 같음.
+        after_avg = ovr_sum / len(rows)
         return (delta, before_avg, after_avg)
     finally:
         if own:
@@ -3302,9 +3333,15 @@ def rescale_teams_to_target_ovr_batch(jobs, conn=None):
 
     jobs: [(team_id, target_ovr), ...]
     반환: {team_id: (delta, before_avg, after_avg)} — 팀에 선수가 없으면 항목 생략.
+
+    [2026-08 버그수정] rescale_team_to_target_ovr과 동일 — delta가 +
+    (승격 등)일 때 노쇠기(ai_lifecycle._AI_PEAK_END 초과) 선수는 이
+    리스케일에서 제외해 "나이 먹고 OVR이 오히려 오르는" 왜곡을 막는다.
+    delta가 -(강등 등)면 노쇠기도 기존처럼 그대로 다 받는다.
     """
     if not jobs:
         return {}
+    from ai_lifecycle import _AI_PEAK_END
     own = False
     if conn is None:
         conn = get_conn(); own = True
@@ -3335,9 +3372,14 @@ def rescale_teams_to_target_ovr_batch(jobs, conn=None):
 
             ovr_sum = 0
             for r in team_rows:
+                age = r["age"]
+                player_delta = 0 if (delta > 0 and age is not None and age > _AI_PEAK_END) else delta
+                if player_delta == 0:
+                    ovr_sum += r["ovr"]
+                    continue
                 new_stats = {}
                 for s in ALL_STATS:
-                    new_stats[s] = min(99, max(1, int(r[s]) + delta))
+                    new_stats[s] = min(99, max(1, int(r[s]) + player_delta))
                 new_ovr = calc_ovr(r["position"], new_stats)
                 ovr_sum += new_ovr
                 update_rows.append((
@@ -4219,16 +4261,42 @@ _BENCH_DF_POOL = ["CB", "LB", "RB"]
 _BENCH_MF_POOL = ["CDM", "CM", "CAM"]
 _BENCH_FW_POOL = ["ST", "LW", "RW"]
 
+# [2026-08 재조정, 신민용 확정: "후보 포지션 비율 — 미드필더 35~40%,
+# 수비수 30~35%, 공격수·윙어 20~25%, 골키퍼 5~10%(13명 벤치 기준 각각
+# 4~5/4~5/3/1~2명)"] 예전엔 벤치를 GK 고정 2명 + DF/MF/FW 각 3~4명
+# (자릿수만 무작위, 그룹 간 비중은 사실상 균등)으로 뽑아서 이 비율과
+# 안 맞았다(GK 비중이 과했고 DF·MF·FW가 거의 동률). 이제 자리 하나마다
+# 아래 비율(각 구간의 중앙값 — 7.5/32.5/37.5/22.5, 합 100%)로 그룹을
+# 먼저 뽑고 그 그룹 풀에서 구체 포지션을 고른다.
+_BENCH_GROUP_WEIGHTS = [("GK", 7.5), ("DF", 32.5), ("MF", 37.5), ("FW", 22.5)]
+_BENCH_GROUP_POOLS = {"GK": ["GK"], "DF": _BENCH_DF_POOL,
+                       "MF": _BENCH_MF_POOL, "FW": _BENCH_FW_POOL}
+
+
+def roll_bench_position():
+    """벤치(후보) 포지션 하나를 위 비율대로 뽑아 구체 포지션 문자열로
+    반환한다. _build_squad_positions(팀 최초 생성)와 ai_lifecycle.
+    _rebalance_squad_sizes(이적으로 스쿼드가 얇아진 팀에 매 시즌 유망주를
+    보충하는 함수)가 이 함수를 공유해야 한다 — 둘 중 하나라도 낡은
+    TEAM_POSITIONS(그룹 비중이 이 비율과 다른 옛 고정 리스트)를 계속
+    쓰면, 시즌을 거듭할수록 보충되는 인원이 그 낡은 비중 쪽으로 스쿼드
+    구성을 다시 끌고 가 버려 이 비율이 서서히 무너진다."""
+    groups = [g for g, _w in _BENCH_GROUP_WEIGHTS]
+    weights = [w for _g, w in _BENCH_GROUP_WEIGHTS]
+    grp = random.choices(groups, weights=weights, k=1)[0]
+    return random.choice(_BENCH_GROUP_POOLS[grp])
+
+
 def _build_squad_positions():
     """팀 하나의 포지션 목록(주전 11 + 벤치 11~14)을 새로 만든다. 주전은
     기존 4-4-2 기준 그대로(스타 슬롯/역할 배정 로직이 이 순서에 의존),
-    벤치만 매 호출마다 무작위로 GK2 + DF(3~4) + MF(3~4) + FW(3~4)를
-    뽑는다."""
+    벤치는 매 자리 roll_bench_position()으로 독립 추첨한다(11~14명).
+    백업 골키퍼가 한 명도 없는 팀이 나오지 않도록(주전 GK가 다치거나
+    이적하면 대체 불가) 최소 1명은 강제로 보장한다."""
     starters = ["GK", "CB", "CB", "LB", "RB", "CDM", "CM", "CAM", "LW", "RW", "ST"]
-    bench = ["GK", "GK"]
-    bench += [random.choice(_BENCH_DF_POOL) for _ in range(random.randint(3, 4))]
-    bench += [random.choice(_BENCH_MF_POOL) for _ in range(random.randint(3, 4))]
-    bench += [random.choice(_BENCH_FW_POOL) for _ in range(random.randint(3, 4))]
+    bench = [roll_bench_position() for _ in range(random.randint(11, 14))]
+    if "GK" not in bench:
+        bench[random.randrange(len(bench))] = "GK"
     return starters + bench
 
 KEY_STATS_BY_POS = {

@@ -343,7 +343,22 @@ class WorldBrowserWindow(QDialog):
         # 홈팀/스코어/원정팀)가 나란히 있어도 스크롤 없이 다 보이는 폭.
         # [2026-08 수정] 화면(작업 영역)보다 이 크기가 크면 그대로 화면
         # 밖으로 넘어가 버리므로, 화면 안에 들어오게 잘라서 적용한다.
-        _clamp_and_resize(self, 1600, 700)
+        # [2026-08 재수정, 신민용 요청: "가로 화면을 모니터에 맞춰서
+        # 커지게 해달라"] 예전엔 요청 크기 자체가 1600×700 고정이라,
+        # _clamp_and_resize는 "화면이 이보다 작을 때만" 줄여줬을 뿐
+        # 화면이 훨씬 큰 모니터에서도 항상 1600×700 그대로 떠서 화면
+        # 한복판에 작게 떠 있었다 — 요청 크기 자체를 작업 영역 비율
+        # (가로 92%, 세로 88%)로 계산해서, 최소 1600×700은 보장하되
+        # (작은 화면은 기존처럼 _clamp_and_resize가 그 밑으로 잘라줌)
+        # 큰 모니터에서는 그만큼 더 커지게 한다.
+        _screen = self.screen() or QGuiApplication.primaryScreen()
+        if _screen:
+            _avail = _screen.availableGeometry()
+            _target_w = max(1600, int(_avail.width() * 0.92))
+            _target_h = max(700, int(_avail.height() * 0.88))
+        else:
+            _target_w, _target_h = 1600, 700
+        _clamp_and_resize(self, _target_w, _target_h)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(14, 12, 14, 12)
@@ -1213,6 +1228,10 @@ class WorldBrowserWindow(QDialog):
     # — 3글자 포지션(CDM/CAM/CDM 등)이 잘리지 않도록 이 표 전용으로 살짝
     # 더 넓힌 폭을 따로 둔다(다른 화면의 _POS_COL_W는 그대로 유지).
     _POS_COL_W_WIDE = 58
+    # [2026-08 신설, 신민용 요청: "소속팀 대회 기록에 연도별로 주전/
+    # 로테이션/대기/유망주 표시"] "로테이션"(4글자)까지 안 잘리게 포지션
+    # 칸보다 살짝 넓게.
+    _ROLE_COL_W = 64
 
     def _league_row_widget(self, lg):
         """리그 목록 한 줄 — 왼쪽부터 [리그명(고정폭)] [등급] [국가] [부수]
@@ -2467,6 +2486,10 @@ class WorldBrowserWindow(QDialog):
                 parts = [f"{row['year']}년 ({age_txt})", f"소속팀: {row['team_name']}"]
                 parts.append(f"포지션: {row['position']}" if row.get("position") else "포지션: -")
                 parts.append(f"OVR: {row['ovr']}" if row.get("ovr") else "OVR: -")
+                # [2026-08 신설, 신민용 요청: "복사할 때 년도별로 얘가
+                # 주전인지 아닌지 뜨는거지"] role은 이 기능 신설 이전
+                # 시즌엔 없을 수 있어(row.get("role") None) "역할: -"로.
+                parts.append(f"역할: {row['role']}" if row.get("role") else "역할: -")
                 if entry.get("league"):
                     rec = f" ({entry['league_record']})" if entry.get("league_record") else ""
                     parts.append(f"리그: {entry['league']}{rec}")
@@ -2786,6 +2809,29 @@ class WorldBrowserWindow(QDialog):
         filt2.addWidget(age_sep)
         filt2.addWidget(self.player_age_max_spin)
 
+        # [2026-08 신설, 신민용 요청: "선수 기간(경력)도 나이처럼 0~99
+        # 필터를 만들고 싶다 — 기본 상태는 전체"] 경력 기준은 ai_player_
+        # ovr_history(매 시즌 종료 시 한 줄씩 쌓이는 아카이브)에 이 선수
+        # id로 쌓인 행 수 — "2017, 2018, 2019 이렇게 3개면 3년"(신민용
+        # 확정). 나이 필터와 완전히 같은 패턴(0~99, 기본값 그대로면
+        # 무필터, wb.search_ai_players의 min/max_career_years로 전달).
+        lbl7 = QLabel("경력"); lbl7.setStyleSheet("color:#888;font-size:11px;")
+        self.player_career_min_spin = QSpinBox()
+        self.player_career_min_spin.setRange(0, 99)
+        self.player_career_min_spin.setValue(0)
+        self.player_career_min_spin.setSuffix("년")
+        self.player_career_min_spin.valueChanged.connect(_debounced_refresh)
+        career_sep = QLabel("~"); career_sep.setStyleSheet("color:#888;")
+        self.player_career_max_spin = QSpinBox()
+        self.player_career_max_spin.setRange(0, 99)
+        self.player_career_max_spin.setValue(99)
+        self.player_career_max_spin.setSuffix("년")
+        self.player_career_max_spin.valueChanged.connect(_debounced_refresh)
+        filt2.addWidget(lbl7)
+        filt2.addWidget(self.player_career_min_spin)
+        filt2.addWidget(career_sep)
+        filt2.addWidget(self.player_career_max_spin)
+
         # [2026-08 신설, 신민용 요청: "이름 검색이 팀/국적 등과 겹쳐서
         # 충돌나는게 불편, 앞에 필터를 달아서 전체/이름으로 나눠달라 —
         # 필터 초기화하면 이름이 기본값"] "이름"이면 이 선수 자신의
@@ -2907,7 +2953,13 @@ class WorldBrowserWindow(QDialog):
             "QHeaderView::section{background:#252525;color:#888;border:none;padding:5px;}"
             "QHeaderView::section:first{color:#4da6ff;font-weight:bold;}")
         self.player_detail_tbl.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.player_detail_tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # [2026-08 수정, 신민용 리포트: "모니터가 작아지면 글자가 잘린다"]
+        # 이 표는 ResizeToContents라 칸 폭 자체는 내용 길이대로 정해지는데
+        # (Stretch처럼 억지로 안 눌림), 표 위젯 자신은 Expanding이라 창이
+        # 좁아지면 위젯 폭이 칸들의 합보다 작아진다 — 그런데 가로
+        # 스크롤바가 꺼져 있어서 넘친 칸이 그냥 잘려 보이기만 하고 볼
+        # 방법이 없었다. AsNeeded로 켜서 좁을 때만 스크롤바가 나타나게 한다.
+        self.player_detail_tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.player_detail_tbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         # [2026-08 신설, 신민용 요청: "AICD8C 같은 식별코드로 뜨는 선수
         # 이름을 내가 직접 지을 수 있게, '이름' 헤더를 클릭하면 이름
@@ -2960,38 +3012,56 @@ class WorldBrowserWindow(QDialog):
         # 슈퍼컵,클럽월드컵). 수상 요약 상자(player_team_award_tbl)는 항상
         # 이 표와 같은 컬럼 수·폭이어야 어긋나지 않으므로(팀 검색 탭과 동일
         # 원칙) 같이 늘린다.
-        self.player_team_award_tbl = self._make_self_sizing_table(9, no_scroll=True)
+        # [2026-08 재확장, 신민용 요청: "OVR과 소속팀 사이(요약행)에 있던
+        # 주전/로테/대기/유망주 표시는 없애고, 대신 여기 연도별 기록에
+        # 그 해 기준으로 표시해야 한다"] 9→10개로 다시 늘리고 "OVR" 바로
+        # 뒤에 "역할"을 끼워 넣는다(연도,소속팀,포지션,OVR,역할,리그,
+        # 국내컵,클럽대항전,슈퍼컵,클럽월드컵).
+        self.player_team_award_tbl = self._make_self_sizing_table(10, no_scroll=True)
         self.player_team_award_tbl.horizontalHeader().setVisible(False)
         # [2026-08 버그수정, 신민용 리포트: "수상 상자가 소속팀/OVR 표시를
         # 인식 못 해서 아래 표와 폭이 안 맞고 잘려 보인다"] 아래
-        # player_team_tbl은 포지션·OVR 두 컬럼만 별도로 Fixed 폭을
+        # player_team_tbl은 포지션·OVR·역할 세 컬럼만 별도로 Fixed 폭을
         # 주는데(바로 아래), 이 award_tbl은 _make_self_sizing_table 기본값
         # 그대로(나머지 전부 Stretch)라 그 두 칸이 아래 표보다 넓게 계산돼
         # 버렸다 — 그 차이만큼 나머지 Stretch 칸들(소속팀·리그·국내컵 등)
         # 폭이 밀려 두 표 경계선이 어긋나 보였던 것. team_detail_tbl/
         # team_award_tbl 쌍과 동일한 원칙(두 표는 항상 같은 리사이즈 모드를
         # 써야 어긋나지 않는다)에 따라 이 표에도 똑같이 맞춘다.
+        # [2026-08 신설] "소속팀" 칸(1)은 실제로는 _col_label이 만드는
+        # 라벨 위젯(_LEAGUE_COL_W 폭)을 그대로 담는 자리라, 위 Interactive
+        # 기본폭(130)만으로는 좁을 수 있다 — 그 라벨과 같은 폭으로 맞춘다.
+        self.player_team_award_tbl.setColumnWidth(1, self._LEAGUE_COL_W)
         self.player_team_award_tbl.horizontalHeader().setSectionResizeMode(
             2, QHeaderView.ResizeMode.Fixed)
         self.player_team_award_tbl.setColumnWidth(2, self._POS_COL_W_WIDE)
         self.player_team_award_tbl.horizontalHeader().setSectionResizeMode(
             3, QHeaderView.ResizeMode.Fixed)
         self.player_team_award_tbl.setColumnWidth(3, self._OVR_COL_W)
+        self.player_team_award_tbl.horizontalHeader().setSectionResizeMode(
+            4, QHeaderView.ResizeMode.Fixed)
+        self.player_team_award_tbl.setColumnWidth(4, self._ROLE_COL_W)
         scroll_lay.addWidget(self.player_team_award_tbl)
-        self.player_team_tbl = self._make_self_sizing_table(9, no_scroll=True)
+        self.player_team_tbl = self._make_self_sizing_table(10, no_scroll=True)
         self.player_team_tbl.setHorizontalHeaderLabels(
-            ["연도", "소속팀", "포지션", "OVR", "리그", "국내컵", "클럽 대항전", "슈퍼컵", "클럽 월드컵"])
+            ["연도", "소속팀", "포지션", "OVR", "역할", "리그", "국내컵", "클럽 대항전", "슈퍼컵", "클럽 월드컵"])
         # [2026-08 신설, 신민용 요청: "소속팀과 리그 사이에 어차피 최대
         # 100의 자리니 작은 상자칸 하나 넣고 OVR 표시"] 다른 칸은 폭을
         # 늘려 채우는(Stretch) 칸인데 이 칸만 숫자 3자리면 충분해서 고정폭.
         # [2026-08 확장] 포지션 칸도 "CM"/"ST" 같은 짧은 텍스트라 같은
         # 이유로 고정폭(선수 목록 포지션 칸과 같은 폭 재사용).
+        self.player_team_tbl.setColumnWidth(1, self._LEAGUE_COL_W)
         self.player_team_tbl.horizontalHeader().setSectionResizeMode(
             2, QHeaderView.ResizeMode.Fixed)
         self.player_team_tbl.setColumnWidth(2, self._POS_COL_W_WIDE)
         self.player_team_tbl.horizontalHeader().setSectionResizeMode(
             3, QHeaderView.ResizeMode.Fixed)
         self.player_team_tbl.setColumnWidth(3, self._OVR_COL_W)
+        # [2026-08 신설] "역할"(주전/로테이션/대기/유망주) 칸도 짧은
+        # 텍스트라 같은 이유로 고정폭.
+        self.player_team_tbl.horizontalHeader().setSectionResizeMode(
+            4, QHeaderView.ResizeMode.Fixed)
+        self.player_team_tbl.setColumnWidth(4, self._ROLE_COL_W)
         # [2026-08 버그수정] 창 크기 변화 등으로 Stretch 폭이 다시 계산될
         # 때 두 표가 계속 같은 값으로 맞춰지도록, team_detail_tbl/
         # team_award_tbl 쌍과 동일하게 sectionResized를 따라가게 연결
@@ -2999,6 +3069,19 @@ class WorldBrowserWindow(QDialog):
         # 일치하지만, 최초 렌더 타이밍 차이에 대비).
         self.player_team_tbl.horizontalHeader().sectionResized.connect(
             lambda idx, _old, new: self.player_team_award_tbl.setColumnWidth(idx, new))
+        # [2026-08 신설, 신민용 요청: "가로 스크롤을 만들어달라"] 두 표가
+        # 이제 각자 자기 가로 스크롤바를 가질 수 있게 됐는데(_make_self_
+        # sizing_table이 AsNeeded로 켰음), "수상" 요약 행(award_tbl)은
+        # player_team_tbl과 같은 칸 폭을 그대로 따라가는 "얼어붙은 헤더
+        # 아래 한 줄"일 뿐이라 자기 스크롤바가 따로 나타나면 스크롤바가
+        # 두 줄로 겹쳐 보이고, 사용자가 아래 표만 옆으로 밀면 위 수상
+        # 행은 그대로 있어서 칸이 어긋나 보인다 — award_tbl 자신의
+        # 가로 스크롤바는 꺼두고, 대신 player_team_tbl을 옆으로 밀 때마다
+        # 그 스크롤 위치를 그대로 따라가게 연결해서 항상 같이 움직인다.
+        self.player_team_award_tbl.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.player_team_tbl.horizontalScrollBar().valueChanged.connect(
+            self.player_team_award_tbl.horizontalScrollBar().setValue)
         scroll_lay.addWidget(self.player_team_tbl)
         scroll_lay.addWidget(self.player_retirement_note)
 
@@ -3020,6 +3103,9 @@ class WorldBrowserWindow(QDialog):
         self.player_intl_tbl = self._make_self_sizing_table(5, no_scroll=True)
         self.player_intl_tbl.setHorizontalHeaderLabels(
             ["연도", "대회", "국가", "출전", "결과"])
+        # [2026-08 신설] "대회" 칸은 "2000 유럽 네이션스컵 예선"처럼 길게
+        # 나올 수 있어 Interactive 기본폭(130)으로는 좁을 수 있다 — 넓힌다.
+        self.player_intl_tbl.setColumnWidth(1, 210)
         self.player_intl_tbl.horizontalHeader().setSectionResizeMode(
             3, QHeaderView.ResizeMode.Fixed)
         self.player_intl_tbl.setColumnWidth(3, self._OVR_COL_W)
@@ -3054,8 +3140,25 @@ class WorldBrowserWindow(QDialog):
         """[2026-08 신설] "선수 검색" 우측 두 박스(소속팀 기록/국가대표
         기록)용 — team_detail_tbl과 같은 톤(어두운 배경, 격자선)이지만
         스플리터 안에서 독립 스크롤 없이 내용 높이만큼만 차지하도록
-        만든 QTableWidget. no_scroll=True면 자체 스크롤바를 끄고
-        바깥 QScrollArea 하나에만 맡긴다(중첩 스크롤 방지)."""
+        만든 QTableWidget. no_scroll=True면 자체 세로 스크롤바를 끄고
+        바깥 QScrollArea 하나에만 맡긴다(중첩 스크롤 방지 — 세로만
+        해당, 아래 가로 스크롤바는 no_scroll과 무관하게 항상 켠다).
+
+        [2026-08 수정, 신민용 리포트: "모니터가 작아지면 글자가 잘린다
+        — 가로 스크롤을 만드는 게 낫다"] Stretch 칸은 창이 좁아지면
+        내용 길이와 무관하게 끝없이 눌려서 텍스트가 잘렸는데(예:
+        "22승 5무 11패"), 가로 스크롤바 자체도 꺼져 있어서(ScrollBarAlwaysOff)
+        잘린 부분을 볼 방법이 없었다. Stretch(칸들이 뷰포트 폭에 맞춰
+        끝없이 늘었다 줄었다 함) 대신 Interactive(칸마다 고정폭으로
+        시작하고, 창이 좁아져도 그 밑으로 안 줄어듦 — 사용자가 드래그로
+        직접 조절하는 것만 반영)로 바꾸고 가로 스크롤바를 AsNeeded로
+        켠다. 창이 넓을 땐 남는 오른쪽 여백이 예전 Stretch만큼 꽉 안
+        채워질 수 있지만(트레이드오프), 창이 좁아져도 글자가 잘리는 대신
+        표 전체가 뷰포트보다 넓어지면서 가로 스크롤바가 나타나 옆으로
+        움직여 볼 수 있다 — "잘려서 안 보임" → "스크롤해서 다 보임"으로
+        바뀌는 것이 이번 수정의 핵심. 호출부(player_team_tbl 등)가 특정
+        칸(포지션/OVR/역할처럼 원래도 짧은 텍스트)을 Fixed로 다시
+        덮어쓰는 것은 그대로 유지된다(이 루프보다 나중에 실행되므로)."""
         tbl = QTableWidget(0, n_cols)
         tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         tbl.verticalHeader().setVisible(False)
@@ -3065,11 +3168,12 @@ class WorldBrowserWindow(QDialog):
         tbl.setStyleSheet("QTableWidget{gridline-color:#000; border:none;}")
         if no_scroll:
             tbl.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         tbl.setColumnWidth(0, self._YEAR_COL_W if hasattr(self, "_YEAR_COL_W") else 64)
         for c in range(1, n_cols):
-            tbl.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeMode.Stretch)
+            tbl.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeMode.Interactive)
+            tbl.setColumnWidth(c, 130)
         tbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         return tbl
 
@@ -3167,6 +3271,13 @@ class WorldBrowserWindow(QDialog):
         self.player_age_max_spin.blockSignals(True)
         self.player_age_max_spin.setValue(99)
         self.player_age_max_spin.blockSignals(False)
+        # [2026-08 신설] 경력(년) 필터도 기본값(0/99)으로 되돌린다.
+        self.player_career_min_spin.blockSignals(True)
+        self.player_career_min_spin.setValue(0)
+        self.player_career_min_spin.blockSignals(False)
+        self.player_career_max_spin.blockSignals(True)
+        self.player_career_max_spin.setValue(99)
+        self.player_career_max_spin.blockSignals(False)
         self.player_search_box.blockSignals(True)
         self.player_search_box.clear()
         self.player_search_box.blockSignals(False)
@@ -3346,6 +3457,11 @@ class WorldBrowserWindow(QDialog):
         min_age = self.player_age_min_spin.value() or None
         max_age_v = self.player_age_max_spin.value()
         max_age = max_age_v if max_age_v < 99 else None
+        # [2026-08 신설] 경력(년) 필터 — 나이 필터와 동일한 "기본값(0/99)
+        # 이면 무필터" 규칙.
+        min_career_years = self.player_career_min_spin.value() or None
+        max_career_years_v = self.player_career_max_spin.value()
+        max_career_years = max_career_years_v if max_career_years_v < 99 else None
         q = self.player_search_box.text().strip() or None
         name_mode = "code" if self.player_name_mode_combo.currentText() == "이름" else "all"
         custom_named_only = self.player_custom_named_btn.isChecked()
@@ -3377,7 +3493,9 @@ class WorldBrowserWindow(QDialog):
                                         natteam=natteam, natteam_year=natteam_year,
                                         team_id=team_id, team_mode=team_mode,
                                         league_id=league_id, name_mode=name_mode,
-                                        custom_named_only=custom_named_only)
+                                        custom_named_only=custom_named_only,
+                                        min_career_years=min_career_years,
+                                        max_career_years=max_career_years)
 
         self.player_list.clear()
         for pl in players:
@@ -3408,9 +3526,25 @@ class WorldBrowserWindow(QDialog):
         # [2026-08 신설, 신민용 요청: "은퇴한 선수도 검색할 수 있어야 해"]
         # 은퇴 선수는 소속팀/등급이 전부 None이라 "None급"/"None · None"처럼
         # 깨져 보이지 않게 별도로 처리 — 목록에서부터 "은퇴"로 바로 티나게.
+        # [2026-08 수정, 신민용 요청: "등급 칸은 폭이 좁아서 기간(2006~2010
+        # 같은)을 넣으면 잘려 보인다 — 등급엔 은퇴 나이를, 소속팀·리그
+        # (폭이 넓은 칸) 쪽에 뛰었던 기간을 표시하는 게 맞다"] 첫 시도는
+        # 등급 자리에 기간을 넣었는데 그 칸이 좁아 "2000..."처럼 잘려서
+        # 오히려 안 보였다 — 짧은 값(나이)은 좁은 등급 칸에, 긴 값(기간)은
+        # 넓은 소속팀 칸에 배치하도록 자리를 맞바꿨다. 등급 칸: 은퇴 당시
+        # 나이(ai_players_retired.age). 소속팀 칸: wb._annotate_career_span
+        # 이 채운 career_start_year~career_end_year(ai_player_ovr_history
+        # 행 수 기준) + 은퇴 직전 팀 — 기록이 아예 없는 구세이브 선수는
+        # "20XX년 은퇴"로 폴백.
         if pl.get("is_retired"):
-            grade_text, grade_color = "은퇴", "#888888"
-            team_text = f"{pl.get('retirement_year', '-')}년 은퇴 · {pl.get('last_team_name') or '소속 정보 없음'}"
+            grade_text = f"{pl['age']}세" if pl.get("age") is not None else "은퇴"
+            grade_color = "#888888"
+            c_start, c_end = pl.get("career_start_year"), pl.get("career_end_year")
+            if c_start and c_end:
+                span_text = f"{c_start}~{c_end}" if c_start != c_end else f"{c_start}"
+            else:
+                span_text = f"{pl.get('retirement_year', '-')}년 은퇴"
+            team_text = f"{span_text} · {pl.get('last_team_name') or '소속 정보 없음'}"
         else:
             grade_text = f"{pl['grade']}급" if pl.get("grade") else "-"
             grade_color = _GRADE_COLORS.get(pl.get("grade"), "#888888")
@@ -3500,7 +3634,7 @@ class WorldBrowserWindow(QDialog):
             empty = QTableWidgetItem("소속팀 없음")
             empty.setForeground(QColor("#666"))
             self.player_team_tbl.setItem(0, 0, empty)
-            self.player_team_tbl.setSpan(0, 0, 1, 8)
+            self.player_team_tbl.setSpan(0, 0, 1, 10)
             self._resize_self_sizing_table(self.player_team_tbl)
 
         if d.get("is_retired"):
@@ -3749,7 +3883,7 @@ class WorldBrowserWindow(QDialog):
             empty = QTableWidgetItem("기록 없음")
             empty.setForeground(QColor("#666"))
             tbl.setItem(0, 0, empty)
-            tbl.setSpan(0, 0, 1, 9)
+            tbl.setSpan(0, 0, 1, 10)
             self._resize_self_sizing_table(tbl)
             self._player_copy_rows = []
             return
@@ -3758,8 +3892,10 @@ class WorldBrowserWindow(QDialog):
         # [2026-08 확장] 포지션 컬럼이 소속팀(1)과 OVR(이제 3) 사이(2)에
         # 끼어들면서, 이 요약 행도 그 자리에 빈칸을 하나 더 넣어야
         # 아래 표와 컬럼이 어긋나지 않는다.
+        # [2026-08 재확장] "역할"(4) 칸이 새로 끼어들면서 빈칸 하나 더 추가.
         award_labels = [
             ("수상", None),
+            ("", None),
             ("", None),
             ("", None),
             ("", None),
@@ -3773,7 +3909,7 @@ class WorldBrowserWindow(QDialog):
             cell.setForeground(QColor(color) if color else QColor("#ffcc00"))
             cell.setBackground(QColor("#2a2a2a"))
             award_tbl.setItem(0, j, cell)
-        award_tbl.setCellWidget(0, 6, self._cl_award_summary_cell(
+        award_tbl.setCellWidget(0, 7, self._cl_award_summary_cell(
             awards.get("cl_champions", 0), awards.get("el_champions", 0),
             awards.get("ecl_champions", 0)))
         sc_cell = QTableWidgetItem(str(awards.get("sc_champions", 0)) if awards.get("sc_champions") else "")
@@ -3781,13 +3917,13 @@ class WorldBrowserWindow(QDialog):
         f = sc_cell.font(); f.setBold(True); sc_cell.setFont(f)
         sc_cell.setForeground(QColor(BURGUNDY))
         sc_cell.setBackground(QColor("#2a2a2a"))
-        award_tbl.setItem(0, 7, sc_cell)
+        award_tbl.setItem(0, 8, sc_cell)
         cwc_cell = QTableWidgetItem(str(awards["cwc"]) if awards["cwc"] else "")
         cwc_cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         f = cwc_cell.font(); f.setBold(True); cwc_cell.setFont(f)
         cwc_cell.setForeground(QColor("#4dd0e1"))
         cwc_cell.setBackground(QColor("#2a2a2a"))
-        award_tbl.setItem(0, 8, cwc_cell)
+        award_tbl.setItem(0, 9, cwc_cell)
         self._resize_self_sizing_table(award_tbl)
 
         timeline = wb.get_ai_player_team_timeline(player_id, tid)
@@ -3817,6 +3953,13 @@ class WorldBrowserWindow(QDialog):
         # 대상이 아니라 항상 빈 dict(기존처럼 career_entries 포지션 사용).
         position_checkpoints = (wb.get_ai_player_position_checkpoints(player_id)
                                  if player_id != wb.MY_PLAYER_ID and player_id > 0 else {})
+        # [2026-08 신설, 신민용 요청: "그 해 주전/로테이션/대기/유망주였는지
+        # 연도별로 표시 — 위(요약행)의 지금 스냅샷 하나가 아니라 여기
+        # 연도별 기록에"] position_checkpoints와 완전히 같은 패턴(같은
+        # 테이블·같은 신설 시점 제약)으로 ai_player_position_history.role을
+        # 읽는다. my_player는 이 아카이브 대상이 아니라 항상 빈 dict.
+        role_checkpoints = (wb.get_ai_player_role_checkpoints(player_id)
+                             if player_id != wb.MY_PLAYER_ID and player_id > 0 else {})
         # [2026-08 신설, 신민용 요청: "그 당시 OVR 스탯이 떠야해"] 은퇴
         # 시점의 정확한 최종 OVR은 ai_players_retired.ovr에 그대로 남아
         #있다(추정이 아니라 실제 기록값) — 혹시라도 그 해 아카이브가
@@ -3943,11 +4086,12 @@ class WorldBrowserWindow(QDialog):
             if is_retired_row:
                 tbl.setItem(i, 2, self._dim_dash_item())
                 tbl.setItem(i, 3, self._dim_dash_item())
-                for col in (4, 5, 6, 7, 8):
+                tbl.setItem(i, 4, self._dim_dash_item())
+                for col in (5, 6, 7, 8, 9):
                     tbl.setCellWidget(i, col, self._two_line_cell("-", "#555", None))
                 self._player_copy_rows.append({
                     "year": entry["year"], "age": age, "is_retired_row": True,
-                    "team_name": None, "position": None, "ovr": None, "entry": None})
+                    "team_name": None, "position": None, "ovr": None, "role": None, "entry": None})
                 continue
 
             # [2026-08 수정, 신민용 요청: "OVR 수치가 패널로 묶여 있는데
@@ -3970,10 +4114,26 @@ class WorldBrowserWindow(QDialog):
             else:
                 tbl.setItem(i, 3, self._dim_dash_item())
 
+            # [2026-08 신설, 신민용 요청: "그 해 주전/로테이션/대기/유망주
+            # 였는지"] 이 기능 신설 이전 시즌은 role_checkpoints에 값이
+            # 없으므로(빈 dict) "-"로 대체 — 다른 이 기능 이전 과거 데이터
+            # (position_checkpoints 등)와 동일한 폴백 방식.
+            _ROLE_COLORS = {"주전": "#4da6ff", "로테이션": "#88ddaa",
+                            "대기": "#cccc66", "유망주": "#cc88ff"}
+            role_at_year = role_checkpoints.get(entry["year"])
+            if role_at_year:
+                role_item = QTableWidgetItem(role_at_year)
+                role_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                role_item.setForeground(QColor(_ROLE_COLORS.get(role_at_year, "#ccc")))
+                f = role_item.font(); f.setBold(True); role_item.setFont(f)
+                tbl.setItem(i, 4, role_item)
+            else:
+                tbl.setItem(i, 4, self._dim_dash_item())
+
             self._player_copy_rows.append({
                 "year": entry["year"], "age": age, "is_retired_row": False,
                 "team_name": player_team_name, "position": player_position,
-                "ovr": ovr_at_year, "entry": entry})
+                "ovr": ovr_at_year, "role": role_at_year, "entry": entry})
 
             lg_txt = entry["league"] or "-"
             if "승격" in lg_txt:
@@ -3984,24 +4144,24 @@ class WorldBrowserWindow(QDialog):
                 lg_color = "#ffd700"
             else:
                 lg_color = "#ddd"
-            tbl.setCellWidget(i, 4, self._two_line_cell(lg_txt, lg_color, entry.get("league_record")))
+            tbl.setCellWidget(i, 5, self._two_line_cell(lg_txt, lg_color, entry.get("league_record")))
 
             cup_txt = entry["cup"] or "-"
             cup_color = "#c48aff" if entry["cup"] else "#555"
-            tbl.setCellWidget(i, 5, self._two_line_cell(cup_txt, cup_color, entry.get("cup_record")))
+            tbl.setCellWidget(i, 6, self._two_line_cell(cup_txt, cup_color, entry.get("cup_record")))
 
             cl_txt = entry["cl"] or "-"
             _CL_KIND_COLOR = {"champions": "#1E4DB7", "europa": "#F28C28", "conference": "#20A464"}
             cl_color = _CL_KIND_COLOR.get(entry.get("cl_kind"), "#555") if entry["cl"] else "#555"
-            tbl.setCellWidget(i, 6, self._two_line_cell(cl_txt, cl_color, entry.get("cl_record")))
+            tbl.setCellWidget(i, 7, self._two_line_cell(cl_txt, cl_color, entry.get("cl_record")))
 
             sc_txt = entry.get("sc") or "-"
             sc_color = BURGUNDY if entry.get("sc") else "#555"
-            tbl.setCellWidget(i, 7, self._two_line_cell(sc_txt, sc_color, entry.get("sc_record")))
+            tbl.setCellWidget(i, 8, self._two_line_cell(sc_txt, sc_color, entry.get("sc_record")))
 
             cwc_txt = entry.get("cwc") or "-"
             cwc_color = "#4dd0e1" if entry.get("cwc") else "#555"
-            tbl.setCellWidget(i, 8, self._two_line_cell(cwc_txt, cwc_color, entry.get("cwc_record")))
+            tbl.setCellWidget(i, 9, self._two_line_cell(cwc_txt, cwc_color, entry.get("cwc_record")))
         self._resize_self_sizing_table(tbl)
 
     def _dim_dash_item(self):

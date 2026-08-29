@@ -127,3 +127,55 @@ def _greedy_fill_slots(candidates, slots_only):
         pl["_slot_idx"] = i
 
     return slot_filled
+
+
+# ─────────────────────────────────────────────
+# [2026-08 신설, 신민용 요청: "선수 검색 소속팀 대회 기록에 그 해 이
+# 선수가 주전/로테이션/대기/유망주 중 뭐였는지 연도별로 보여달라"]
+# ─────────────────────────────────────────────
+# 경기당 출전율(%)로 나누고 싶어했지만 AI 선수는 경기별 출전 기록을 안
+# 남긴다(전세계 매주 수천 경기 × AI 2.6만 명을 다 기록하면 저장·연산
+# 비용이 감당 안 됨) — 대신 "그 시즌 이 팀 로스터 안에서 OVR 순위가
+# 몇 번째인가"로 근사한다. 비중은 주전 40% : 로테이션 30% : 대기 25% :
+# 유망주 15%(신민용이 준 구간의 중앙값, 정규화 전 합 110 → 아래서 총합
+# 으로 나눠 정확히 100%가 되게 함).
+# [2026-08 수정, 신민용 요청: "마지막 구간(유망주 및 전력외)은 나이로
+# 갈라야 한다"] 마지막 구간에 걸린 선수만 나이로 한 번 더 갈라 19세
+# 이하만 "유망주"를 유지하고, 20세 이상은 "대기"로 합류시킨다(이 게임
+# 성장곡선이 25세까지 계속 크므로 — ai_lifecycle._AI_PEAK_START — 19세면
+# 아직 성장 초반이라 "재원"이 맞고, 20세부턴 낮은 OVR이 "아직 안 커서"
+# 보다 "지금 실력이 이 정도"에 더 가깝다고 봄).
+#
+# ai_lifecycle._snapshot_season_positions(매 시즌 전환마다 팀별 로스터를
+# 이미 훑고 있음)가 그 자리에서 이 함수로 같이 계산해 ai_player_
+# position_history.role에 영구히 남긴다 — 매번 다시 계산하지 않고
+# "그 해 실제 로스터 기준"으로 한 번만 계산해 고정하는 것이 핵심(지금
+# 로스터로 과거 연도를 되짚어 계산하면 그 사이 이적으로 로스터 자체가
+# 달라져 있어 부정확함).
+_ROLE_TIER_WEIGHTS = [("주전", 40), ("로테이션", 30), ("대기", 25), ("유망주", 15)]
+_ROLE_YOUNG_MAX_AGE = 19
+
+
+def compute_squad_roles(pool):
+    """pool: [(id, ovr, age), ...] — 한 팀 로스터 전체(주전+후보 다 포함,
+    보통 22~25명). 반환: {id: role_label}. O(n log n)이며 n이 스쿼드
+    크기(수십 명) 수준이라 팀 하나당 사실상 즉시 끝난다."""
+    n = len(pool)
+    if n == 0:
+        return {}
+    ordered = sorted(pool, key=lambda t: -(t[1] or 0))
+    total_w = sum(w for _label, w in _ROLE_TIER_WEIGHTS)
+    result = {}
+    for idx, (pid, _ovr, age) in enumerate(ordered):
+        frac = (idx + 1) / n
+        running = 0
+        role = _ROLE_TIER_WEIGHTS[-1][0]
+        for label, w in _ROLE_TIER_WEIGHTS:
+            running += w
+            if frac <= running / total_w:
+                role = label
+                break
+        if role == "유망주" and not (age is not None and age <= _ROLE_YOUNG_MAX_AGE):
+            role = "대기"
+        result[pid] = role
+    return result

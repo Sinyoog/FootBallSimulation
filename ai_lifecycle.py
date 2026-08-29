@@ -18,7 +18,8 @@ ai_players.ovr / team_id 가 바뀌므로 마지막에 OVR 캐시를 무효화�
 """
 import random
 import math
-from database import (get_conn, calc_ovr, ALL_STATS, KEY_STATS_BY_POS, TEAM_POSITIONS)
+from database import (get_conn, calc_ovr, ALL_STATS, KEY_STATS_BY_POS,
+                      roll_bench_position)
 
 try:
     import numpy as np
@@ -2031,7 +2032,19 @@ def _rebalance_squad_sizes(c, year):
             _q_lo, quota = get_foreign_quota_range(cname, continent)
             foreign_ct = 0
             for _ in range(need):
-                pos = random.choice(TEAM_POSITIONS)
+                # [2026-08 버그수정, 신민용 리포트: "지금 팀 후보 포지션
+                # 비율이 이상하게 됐다(키퍼 3, 수비 3, 미드 2, 공격 5)"]
+                # 예전엔 여기서 TEAM_POSITIONS(주전11+옛 고정벤치12 통짜
+                # 리스트)를 균등 추첨했는데, 이 리스트의 그룹 비중(GK≈13%
+                # /DF≈35%/MF≈26%/FW≈26%)이 database._build_squad_positions
+                # (팀 최초 생성)가 목표로 하는 벤치 비율(GK 5~10%/DF
+                # 30~35%/MF 35~40%/FW 20~25%)과 전혀 달랐다 — 이적으로
+                # 얇아진 팀을 매 시즌 이 함수로 보충할 때마다 그 낡은
+                # 비중 쪽으로 스쿼드가 계속 다시 끌려가, 수십 시즌이
+                # 지나면 처음 생성 비율이 완전히 무너져 있었다. 이제 최초
+                # 생성과 똑같은 roll_bench_position()을 써서 두 경로가
+                # 항상 같은 목표 비율로 수렴하게 한다.
+                pos = roll_bench_position()
                 target = random.randint(lo, max(lo, (lo + hi) // 2))
                 age = random.randint(*_AI_NEWBIE_AGE)
                 # [2026-08 버그수정, _youth_target_scale 주석 참고] 이 경로도
@@ -2109,12 +2122,17 @@ def _snapshot_season_positions(c, year):
     ai_player_ovr_history와 완전히 같은 타이밍(매 시즌 전환)에 호출된다.
     [한계] 이 기능 신설 이전 과거 시즌엔 소급 적용이 안 된다 — 그 이전
     연도는 세계 브라우저 쪽에서 이적 시점 등록 포지션으로 대체 표시한다."""
-    from formation_logic import _greedy_fill_slots
+    from formation_logic import _greedy_fill_slots, compute_squad_roles
     from constants import FORMATION_SLOTS
 
+    # [2026-08 확장, 신민용 요청: "그 해 주전/로테이션/대기/유망주였는지도
+    # 연도별로 표시"] 역할 계산(formation_logic.compute_squad_roles)이
+    # 나이도 필요해서 age를 같이 뽑는다 — 이 함수가 이미 팀별 로스터
+    # 전체를 훑고 있으므로(베스트XI 슬롯 배정용) 추가 쿼리 없이 그대로
+    # 재사용한다.
     rows = c.execute(
         """SELECT ap.id AS id, ap.team_id AS team_id, ap.position AS position,
-                  ap.ovr AS ovr, t.formation AS formation
+                  ap.ovr AS ovr, ap.age AS age, t.formation AS formation
            FROM ai_players ap JOIN teams t ON ap.team_id = t.id
            WHERE ap.team_id IS NOT NULL""").fetchall()
     if not rows:
@@ -2131,20 +2149,21 @@ def _snapshot_season_positions(c, year):
         candidates = [{"id": p["id"], "position": p["position"], "ovr": p["ovr"] or 0}
                       for p in players]
         placed = _greedy_fill_slots(candidates, slots)
+        roles = compute_squad_roles([(p["id"], p["ovr"], p["age"]) for p in players])
         started_ids = set()
         for slot_idx, pl in enumerate(placed):
             if pl is None:
                 continue
-            inserts.append((pl["id"], year, slots[slot_idx]))
+            inserts.append((pl["id"], year, slots[slot_idx], roles.get(pl["id"], "")))
             started_ids.add(pl["id"])
         for p in players:
             if p["id"] not in started_ids:
-                inserts.append((p["id"], year, p["position"] or ""))
+                inserts.append((p["id"], year, p["position"] or "", roles.get(p["id"], "")))
 
     if inserts:
         c.executemany(
-            "INSERT OR REPLACE INTO ai_player_position_history(player_id, year, position) "
-            "VALUES (?,?,?)", inserts)
+            "INSERT OR REPLACE INTO ai_player_position_history(player_id, year, position, role) "
+            "VALUES (?,?,?,?)", inserts)
 
 
 def seed_initial_position_history(year):

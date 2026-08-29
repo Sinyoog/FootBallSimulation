@@ -244,7 +244,8 @@ def _my_player_search_row():
 
 
 def _my_player_matches_filters(d, continent, nat_country_name, country_id, tier, position,
-                                min_age, max_age, grade_country_ids, team_id=None, league_id=None):
+                                min_age, max_age, grade_country_ids, team_id=None, league_id=None,
+                                min_career_years=None, max_career_years=None):
     """my_player 행이 search_ai_players()에 걸린 필터를 통과하는지 검사
     — AI 선수 쪽 SQL WHERE와 정확히 같은 조건을 파이썬으로 재현한다
     (my_player는 딱 한 명이라 SQL에 태울 필요 없이 이렇게 검사하는 게
@@ -279,6 +280,17 @@ def _my_player_matches_filters(d, continent, nat_country_name, country_id, tier,
     # 한 명뿐이라 실사용 영향 미미).
     if team_id and d.get("team_id") != team_id:
         return False
+    # [2026-08 신설] 경력(년) 필터 — AI 선수는 ai_player_ovr_history를
+    # 세지만, my_player는 별도 테이블(my_player_ovr_history, player_id
+    # 없이 year만 PK)에 같은 타이밍으로 쌓이므로 그걸 센다.
+    if min_career_years is not None or max_career_years is not None:
+        conn = get_conn()
+        cnt = conn.execute("SELECT COUNT(*) AS c FROM my_player_ovr_history").fetchone()["c"]
+        conn.close()
+        if min_career_years is not None and cnt < min_career_years:
+            return False
+        if max_career_years is not None and cnt > max_career_years:
+            return False
     return True
 
 
@@ -305,6 +317,39 @@ def _annotate_natteam(rows):
     conn.close()
     for r in rows:
         r["has_natteam"] = r["player_id"] in found
+    return rows
+
+
+def _annotate_career_span(rows):
+    """[2026-08 신설, 신민용 요청: "은퇴창 등급 자리에 은퇴 대신 이 선수가
+    뛰었던 기간을 표시, 20XX년 은퇴 옆에 은퇴 나이도 표시"] ai_player_ovr_
+    history(player_id, year, ovr — 매 시즌 종료 시 한 줄씩 쌓이는 아카이브,
+    PK가 (player_id, year)라 한 해당 한 행)를 player_id로 그룹핑해 한 번에
+    조회한다 — "2017, 2018, 2019 이렇게 3개 행이 있으면 3년"이라는 경력
+    기준(신민용 확정)을 그대로 따른다. _annotate_natteam과 동일한 패턴
+    (개별 선수마다 쿼리하지 않고 IN절로 한 번에 묶어 조회)으로, 각 행에
+    career_start_year/career_end_year/career_years를 채워 넣는다. 이
+    아카이브가 없던 시절부터 있던 구세이브 선수이거나 데뷔 첫 해 시즌
+    종료를 아직 한 번도 못 맞은 선수는 기록이 0개일 수 있어 career_years=
+    0/start·end=None으로 남는다(호출부가 이 경우를 대비해야 함)."""
+    if not rows:
+        return rows
+    ids = [r["player_id"] for r in rows if r.get("player_id") is not None]
+    spans = {}
+    if ids:
+        conn = get_conn()
+        ph = ",".join("?" * len(ids))
+        for row in conn.execute(
+                f"SELECT player_id, MIN(year) AS min_y, MAX(year) AS max_y, COUNT(*) AS cnt "
+                f"FROM ai_player_ovr_history WHERE player_id IN ({ph}) GROUP BY player_id",
+                ids).fetchall():
+            spans[row["player_id"]] = (row["min_y"], row["max_y"], row["cnt"])
+        conn.close()
+    for r in rows:
+        start_y, end_y, cnt = spans.get(r.get("player_id"), (None, None, 0))
+        r["career_start_year"] = start_y
+        r["career_end_year"] = end_y
+        r["career_years"] = cnt
     return rows
 
 
@@ -373,7 +418,8 @@ def search_retired_ai_players(name_query=None, continent=None, nat_country_id=No
                                 position=None, min_age=None, max_age=None, limit=200,
                                 natteam=False, natteam_year=None, team_id=None,
                                 country_id=None, league_id=None, team_mode="current",
-                                name_mode="all", custom_named_only=False):
+                                name_mode="all", custom_named_only=False,
+                                min_career_years=None, max_career_years=None):
     """[2026-08 신설/수정, 신민용 요청: "은퇴한 선수도 차후 검색할 수
     있어야 해" / "필터에 현역·은퇴 버튼"] ai_players_retired(은퇴 스냅샷
     아카이브)에서 검색한다. 등급/부수 필터는 은퇴 선수엔 저장돼 있지 않아
@@ -430,6 +476,18 @@ def search_retired_ai_players(name_query=None, continent=None, nat_country_id=No
             q += " AND r.age>=?"; params.append(min_age)
         if max_age is not None:
             q += " AND r.age<=?"; params.append(max_age)
+        # [2026-08 신설, 신민용 요청: "선수 검색 필터에 경력(년) 필터도
+        # 0~99 기본값으로"] ai_player_ovr_history에 이 선수 id로 쌓인
+        # 행 수(=몇 년치 시즌을 뛰었는지, _annotate_career_span과 동일
+        # 기준)를 상관 서브쿼리로 세어 그 범위로 거른다.
+        if min_career_years is not None:
+            q += (" AND (SELECT COUNT(*) FROM ai_player_ovr_history h "
+                  "WHERE h.player_id = r.id) >= ?")
+            params.append(min_career_years)
+        if max_career_years is not None:
+            q += (" AND (SELECT COUNT(*) FROM ai_player_ovr_history h "
+                  "WHERE h.player_id = r.id) <= ?")
+            params.append(max_career_years)
         if custom_named_only:
             q += " AND cust.custom_name IS NOT NULL AND cust.custom_name != ''"
         if name_query:
@@ -483,6 +541,7 @@ def search_retired_ai_players(name_query=None, continent=None, nat_country_id=No
     rows = [dict(row) for row in conn.execute(q, params).fetchall()]
     conn.close()
     _annotate_natteam(rows)
+    _annotate_career_span(rows)
     for r in rows:
         r["team_id"] = None
         r["team_name"] = None
@@ -519,7 +578,7 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
                        grade=None, tier=None, position=None, min_age=None, max_age=None,
                        status="active", limit=200, natteam=False, natteam_year=None,
                        team_id=None, team_mode="current", league_id=None, name_mode="all",
-                       custom_named_only=False):
+                       custom_named_only=False, min_career_years=None, max_career_years=None):
     """[2026-08 수정, 신민용 요청: "국가와 국적을 나눠야 한다, 대륙은
     국적과 연관되어 있게"] 대륙(continent)/국적(nat_country_id)은 이제
     선수의 실제 국적(ai_players.nationality) 기준이고, 국가(country_id)는
@@ -580,7 +639,8 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
             position=position, min_age=min_age, max_age=max_age, limit=limit,
             natteam=natteam, natteam_year=natteam_year, team_id=team_id,
             country_id=country_id, league_id=league_id, team_mode=team_mode,
-            name_mode=name_mode, custom_named_only=custom_named_only)
+            name_mode=name_mode, custom_named_only=custom_named_only,
+            min_career_years=min_career_years, max_career_years=max_career_years)
         conn.close()
         return rows
 
@@ -679,6 +739,18 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
         q += " AND p.age>=?"; params.append(min_age)
     if max_age is not None:
         q += " AND p.age<=?"; params.append(max_age)
+    # [2026-08 신설, 신민용 요청: "선수 검색 필터에 경력(년) 필터도
+    # 0~99 기본값으로"] search_retired_ai_players와 동일한 기준(ai_player_
+    # ovr_history에 이 선수 id로 쌓인 행 수 = 뛴 시즌 수)으로 현역 선수도
+    # 거른다.
+    if min_career_years is not None:
+        q += (" AND (SELECT COUNT(*) FROM ai_player_ovr_history h "
+              "WHERE h.player_id = p.id) >= ?")
+        params.append(min_career_years)
+    if max_career_years is not None:
+        q += (" AND (SELECT COUNT(*) FROM ai_player_ovr_history h "
+              "WHERE h.player_id = p.id) <= ?")
+        params.append(max_career_years)
     if grade_country_ids is not None:
         q += " AND cn.id IN (%s)" % ",".join("?" * len(grade_country_ids))
         params += grade_country_ids
@@ -767,7 +839,8 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
             my_row, continent=continent, nat_country_name=nat_country_name,
             country_id=country_id, tier=tier, position=position,
             min_age=min_age, max_age=max_age, grade_country_ids=grade_country_ids,
-            team_id=team_id, league_id=league_id):
+            team_id=team_id, league_id=league_id,
+            min_career_years=min_career_years, max_career_years=max_career_years):
         if name_query:
             needle = name_query.strip().lower()
             if name_mode == "code":
@@ -1157,6 +1230,23 @@ def get_ai_player_position_checkpoints(player_id):
         "ORDER BY year ASC", (player_id,)).fetchall()
     conn.close()
     return {r["year"]: r["position"] for r in rows if r["position"]}
+
+
+def get_ai_player_role_checkpoints(player_id):
+    """[2026-08 신설, 신민용 요청: "소속팀 대회 기록에 그 해 주전/로테이션/
+    대기/유망주였는지 연도별로 표시, 위(요약행)의 단일 스냅샷 태그는
+    빼고 아래(연도별 기록)로 옮겨라"] get_ai_player_position_checkpoints
+    와 완전히 같은 패턴 — ai_player_position_history.role(매 시즌 전환
+    마다 ai_lifecycle._snapshot_season_positions가 그 해 실제 로스터
+    기준으로 계산해 남김, formation_logic.compute_squad_roles 참고)에서
+    그대로 읽는다. 반환: {year: role}. 이 컬럼 신설 이전 시즌은 값이
+    없으므로(빈 dict) 호출부가 "-"로 대체 표시해야 한다."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT year, role FROM ai_player_position_history WHERE player_id=? "
+        "ORDER BY year ASC", (player_id,)).fetchall()
+    conn.close()
+    return {r["year"]: r["role"] for r in rows if r["role"]}
 
 
 def get_my_player_ovr_checkpoints():
