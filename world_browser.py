@@ -1143,6 +1143,22 @@ def get_ai_player_ovr_checkpoints(player_id):
     return {r["year"]: r["ovr"] for r in rows}
 
 
+def get_ai_player_position_checkpoints(player_id):
+    """[2026-08 신설, 신민용 요청: "이 시즌에 얘가 어디 포지션을 갔는지가
+    중요한거야"] get_ai_player_ovr_checkpoints와 완전히 같은 패턴 —
+    ai_player_position_history(매 시즌 전환마다 ai_lifecycle._snapshot_
+    season_positions가 그 시즌 포메이션 기준 실제 슬롯을 기록)에서 그대로
+    읽는다. 반환: {year: position}. 이 아카이브 신설 이전 시즌은 여기
+    없으므로(빈 dict), 호출부가 기존처럼 ai_transfer_log 기반 등록
+    포지션으로 대체 표시해야 한다."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT year, position FROM ai_player_position_history WHERE player_id=? "
+        "ORDER BY year ASC", (player_id,)).fetchall()
+    conn.close()
+    return {r["year"]: r["position"] for r in rows if r["position"]}
+
+
 def get_my_player_ovr_checkpoints():
     """get_ai_player_ovr_checkpoints의 my_player 버전 — my_player_ovr_history
     (game_engine._end_of_season이 매 시즌전환마다 기록, 세이브 첫 해는

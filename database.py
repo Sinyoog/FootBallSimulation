@@ -584,6 +584,19 @@ def init_db():
         player_id INTEGER, year INTEGER, ovr INTEGER,
         PRIMARY KEY(player_id, year))""")
 
+    # [2026-08 신설, 신민용 요청: "이 시즌에 얘가 어디 포지션을 갔는지가
+    # 중요한거야"] 등록 포지션(ai_players.position, 변하지 않는 "주포")과
+    # 별개로, 그 시즌 실제로 그 팀 포메이션에서 어느 자리를 맡았는지(예:
+    # 주포 CB인데 그 시즌 스쿼드 사정상 LB로 뛴 경우)를 시즌마다 스냅샷
+    # 떠서 남긴다 — ai_player_ovr_history와 완전히 같은 타이밍(매 시즌
+    # 전환, ai_lifecycle.run_ai_offseason)에 같이 기록된다. 한계는
+    # ai_player_ovr_history와 동일 — 이 기능 신설 이후 시즌만 정확하고,
+    # 그 이전 과거 시즌은 소급 적용이 안 된다(월드 브라우저 쪽에서
+    # 이 기록이 없는 연도는 기존처럼 이적 시점 등록 포지션으로 대체 표시).
+    c.execute("""CREATE TABLE IF NOT EXISTS ai_player_position_history(
+        player_id INTEGER, year INTEGER, position TEXT,
+        PRIMARY KEY(player_id, year))""")
+
     # [2026-08 신설, 신민용 리포트: "선수 검색에서 나(my_player)를 보면
     # OVR이 하나도 안 찍혀있다"] ai_player_ovr_history와 완전히 같은
     # 목적이지만 my_player 전용(세이브당 my_player가 하나뿐이라

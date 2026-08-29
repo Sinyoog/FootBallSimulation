@@ -1206,6 +1206,13 @@ class WorldBrowserWindow(QDialog):
     _POS_COL_W = 46
     _NAT_COL_W = 110
     _OVR_COL_W = 44
+    # [2026-08 신설, 신민용 리포트: "선수 경력(연도별 기록) 표의 포지션
+    # 칸에서 CDM만 잘려서 CD...로 보인다"] 선수 목록의 "포지션" 칸(delegate
+    # 커스텀 페인트, _POS_COL_W)과 이 표(일반 QTableWidgetItem, Qt가 넘치는
+    # 텍스트를 그냥 자름)는 렌더링 방식이 달라서 같은 폭이 여기선 부족했다
+    # — 3글자 포지션(CDM/CAM/CDM 등)이 잘리지 않도록 이 표 전용으로 살짝
+    # 더 넓힌 폭을 따로 둔다(다른 화면의 _POS_COL_W는 그대로 유지).
+    _POS_COL_W_WIDE = 58
 
     def _league_row_widget(self, lg):
         """리그 목록 한 줄 — 왼쪽부터 [리그명(고정폭)] [등급] [국가] [부수]
@@ -2966,7 +2973,7 @@ class WorldBrowserWindow(QDialog):
         # 써야 어긋나지 않는다)에 따라 이 표에도 똑같이 맞춘다.
         self.player_team_award_tbl.horizontalHeader().setSectionResizeMode(
             2, QHeaderView.ResizeMode.Fixed)
-        self.player_team_award_tbl.setColumnWidth(2, self._POS_COL_W)
+        self.player_team_award_tbl.setColumnWidth(2, self._POS_COL_W_WIDE)
         self.player_team_award_tbl.horizontalHeader().setSectionResizeMode(
             3, QHeaderView.ResizeMode.Fixed)
         self.player_team_award_tbl.setColumnWidth(3, self._OVR_COL_W)
@@ -2981,7 +2988,7 @@ class WorldBrowserWindow(QDialog):
         # 이유로 고정폭(선수 목록 포지션 칸과 같은 폭 재사용).
         self.player_team_tbl.horizontalHeader().setSectionResizeMode(
             2, QHeaderView.ResizeMode.Fixed)
-        self.player_team_tbl.setColumnWidth(2, self._POS_COL_W)
+        self.player_team_tbl.setColumnWidth(2, self._POS_COL_W_WIDE)
         self.player_team_tbl.horizontalHeader().setSectionResizeMode(
             3, QHeaderView.ResizeMode.Fixed)
         self.player_team_tbl.setColumnWidth(3, self._OVR_COL_W)
@@ -3802,6 +3809,14 @@ class WorldBrowserWindow(QDialog):
         ovr_checkpoints = (wb.get_my_player_ovr_checkpoints() if player_id == wb.MY_PLAYER_ID
                            else wb.get_ai_player_ovr_checkpoints(player_id) if player_id > 0
                            else {})
+        # [2026-08 신설, 신민용 요청: "이 시즌에 얘가 어디 포지션을
+        # 갔는지가 중요한거야"] ai_player_position_history(시즌 전환마다
+        # 그 시즌 포메이션 기준 실제 슬롯을 기록해둔 것) — 있으면 최우선,
+        # 없는 연도(이 기능 신설 이전 과거 시즌)는 아래에서 기존처럼
+        # 이적 시점 등록 포지션으로 대체한다. my_player는 이 아카이브
+        # 대상이 아니라 항상 빈 dict(기존처럼 career_entries 포지션 사용).
+        position_checkpoints = (wb.get_ai_player_position_checkpoints(player_id)
+                                 if player_id != wb.MY_PLAYER_ID and player_id > 0 else {})
         # [2026-08 신설, 신민용 요청: "그 당시 OVR 스탯이 떠야해"] 은퇴
         # 시점의 정확한 최종 OVR은 ai_players_retired.ovr에 그대로 남아
         #있다(추정이 아니라 실제 기록값) — 혹시라도 그 해 아카이브가
@@ -3895,7 +3910,12 @@ class WorldBrowserWindow(QDialog):
                 player_position = entry.get("_main_position") or current_position
             else:
                 player_team_name = _team_name_for_year(entry["year"])
-                player_position = _position_for_year(entry["year"]) or current_position
+                # [2026-08 신설] 시즌별 실제 포메이션 슬롯 아카이브가 있으면
+                # 그걸 최우선으로 — 이적 시점 등록 포지션(_position_for_year)
+                # 보다 정확하다(예: 등록은 CB인데 그 시즌 스쿼드 사정상
+                # LB를 봤을 경우). 아카이브가 없는 과거 연도만 기존 방식으로.
+                player_position = (position_checkpoints.get(entry["year"])
+                                   or _position_for_year(entry["year"]) or current_position)
             is_retired_row = player_team_name is None
             if is_retired_row:
                 team_cell = self._col_label(

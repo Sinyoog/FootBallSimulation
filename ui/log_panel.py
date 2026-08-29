@@ -128,14 +128,18 @@ def _passes_filter(text: str, log_type: str, mode: str) -> bool:
     return False
 
 
-def _colorize_news(year, text: str) -> str:
+def _colorize_news(year, week, text: str) -> str:
     """[2026-08 신설, "뉴스" 필터 전용] 다른 탭과 달리 연도 경계에서
     화면이 안 비워지고 여러 해가 한 화면에 계속 쌓이므로, 각 줄이 몇
     년도 소식인지 앞에 회색으로 붙여준다. _colorize()가 쓰는 정규식
     중 일부(^⚽ 경기, ^─+$)는 줄 맨 앞을 기준으로 매칭하므로, 연도
     표시는 _colorize()가 처리한 결과 바깥에 별도로 붙여서 그 매칭에
-    전혀 영향을 안 준다."""
-    return f'<span style="color:#666;">[{year}년]</span> ' + _colorize(text)
+    전혀 영향을 안 준다.
+
+    [2026-08 확장, 신민용 요청: "[2008년]만 뜨는데 [2008년 1주차]
+    처럼 주차까지 표시하는 게 좋을듯"] 연도만으로는 그 해 안에서 몇
+    주차 소식인지 구분이 안 돼 표시를 week까지 넓힌다."""
+    return f'<span style="color:#666;">[{year}년 {week}주차]</span> ' + _colorize(text)
 
 
 # 필터 버튼 3종의 공통 스타일 — "로그" 라벨 옆 작은 토글 버튼.
@@ -178,9 +182,10 @@ class LogPanel(QWidget):
         # 뉴스 탭은 연도별로 계속 쌓이고 1년 단위로 안 잘렸으면"] 다른
         # 탭(all/core/match)은 self._year_entries가 매년 통째로 갈아
         # 끼워지지만(위 refresh() 참고), 뉴스는 게임 세션 내내 전부
-        # 누적한다 — [(year, text), ...]. log_type="news"인 줄만 담는다
-        # (ai_lifecycle.py의 주요 이적/영입·방출/이적시장 마감 로그).
-        self._news_entries = []  # [(year, text), ...]
+        # 누적한다 — [(year, week, text), ...]. log_type="news"인 줄만
+        # 담는다(ai_lifecycle.py의 주요 이적/영입·방출/이적시장 마감 로그).
+        # [2026-08 확장, 신민용 요청: 주차까지 표시] week도 같이 담는다.
+        self._news_entries = []  # [(year, week, text), ...]
 
         lay = QVBoxLayout(self); lay.setContentsMargins(8,8,8,8); lay.setSpacing(4)
 
@@ -260,7 +265,7 @@ class LogPanel(QWidget):
         줄 앞에 연도를 붙인다(_colorize_news) — 그 외 모드는 기존과
         동일."""
         if self._filter_mode == "news":
-            html_lines = [_colorize_news(year, text) for year, text in self._news_entries]
+            html_lines = [_colorize_news(year, week, text) for year, week, text in self._news_entries]
         else:
             html_lines = [_colorize(text) for text, log_type in self._year_entries
                           if _passes_filter(text, log_type, self._filter_mode)]
@@ -323,13 +328,13 @@ class LogPanel(QWidget):
         # 문제가 그대로 재현된다(이게 바로 "뉴스가 뜨자마자 지워진다"던
         # 원인) — 뉴스만은 연도 경계와 무관하게 항상 전부 챙긴다.
         self._news_entries.extend(
-            (year, text) for text, year, log_type in entries if log_type == "news")
+            (year, week, text) for text, year, week, log_type in entries if log_type == "news")
 
         # 이 배치 안에서 마지막으로 연도가 바뀌는 지점을 찾는다.
         start_idx = 0
         year_changed = False
         last_year = self._last_year
-        for i, (_text, year, _log_type) in enumerate(entries):
+        for i, (_text, year, _week, _log_type) in enumerate(entries):
             if last_year is not None and year != last_year:
                 start_idx = i
                 year_changed = True
@@ -338,9 +343,9 @@ class LogPanel(QWidget):
 
         visible_entries = entries[start_idx:]
         if year_changed:
-            self._year_entries = [(text, log_type) for text, _year, log_type in visible_entries]
+            self._year_entries = [(text, log_type) for text, _year, _week, log_type in visible_entries]
         else:
-            self._year_entries.extend((text, log_type) for text, _year, log_type in visible_entries)
+            self._year_entries.extend((text, log_type) for text, _year, _week, log_type in visible_entries)
         self._last_log_id = new_last_id
 
         if not self._initialized or year_changed:
@@ -353,10 +358,10 @@ class LogPanel(QWidget):
         # "다음 날" 성능 원칙 유지).
         # [2026-08 신설] "뉴스" 모드는 연도 표시가 붙은 별도 포맷을 쓴다.
         if self._filter_mode == "news":
-            html_lines = [_colorize_news(year, text) for text, year, log_type in visible_entries
+            html_lines = [_colorize_news(year, week, text) for text, year, week, log_type in visible_entries
                           if log_type == "news"]
         else:
-            html_lines = [_colorize(text) for text, _year, log_type in visible_entries
+            html_lines = [_colorize(text) for text, _year, _week, log_type in visible_entries
                           if _passes_filter(text, log_type, self._filter_mode)]
         if html_lines:
             chunk_html = "<br>".join(html_lines)

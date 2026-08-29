@@ -350,6 +350,13 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None):
     _ta3b = _time_perf.perf_counter()
     _report(3, "포메이션 갱신 중")
     formations = _shuffle_formations(c)
+    # [2026-08 신설, 신민용 요청: "이 시즌에 얘가 어디 포지션을 갔는지가
+    # 중요한거야"] 방금 이번 시즌 포메이션이 확정됐으니(바로 위), 그
+    # 포메이션대로 로스터를 채웠을 때 각 선수가 맡는 자리를 여기서 같이
+    # 스냅샷한다 — "전술변경" 단계 시간에 합산돼 찍히지만(별도 계측 없이
+    # 얹음), 실측상 팀당 계산량이 작아(선수 20~30명 vs 슬롯 11개 비교)
+    # 시즌 시뮬레이션 전체에 유의미한 지연을 주지 않는다.
+    _snapshot_season_positions(c, year)
     _ta4 = _time_perf.perf_counter()
     _report(4, "시즌 전환 마무리 중")
     # [2026-07 신설, 진단용] game_engine._advance_week의 [PERF] 로그와 짝을
@@ -2078,6 +2085,82 @@ def _rebalance_squad_sizes(c, year):
 # ─────────────────────────────────────────────
 # 5. 포메이션 변경 (감독 교체 컨셉)
 # ─────────────────────────────────────────────
+def _snapshot_season_positions(c, year):
+    """[2026-08 신설, 신민용 요청: "이 시즌에 얘가 어디 포지션을 갔는지가
+    중요한거야 — 위(선수 검색 맨 위 요약행)는 주포라 안 변하는 게
+    맞는데, 연도별 기록엔 그 시즌 실제로 어느 자리서 뛰었는지가 있어야
+    한다"] 등록 포지션(ai_players.position, 안 바뀌는 "주포")과 별개로,
+    이 시즌 각 팀의 실제 포메이션(teams.formation)에 로스터를 채워 넣었을
+    때 이 선수가 어느 슬롯을 맡는지를 매 시즌 스냅샷으로 남긴다.
+
+    화면(포메이션 탭)에 뜨는 것과 다른 알고리즘을 쓰면 "선수 검색은
+    CB라는데 포메이션 화면은 LB"처럼 또 다른 불일치가 생기므로,
+    formation_logic._greedy_fill_slots(여러 후보를 슬롯에 배정하는 바로
+    그 함수 — ui/formation_widget.py도 동일 모듈에서 가져다 쓴다)를
+    그대로 재사용한다 — OVR 상위 11명(베스트 XI)에 든 선수는 그 슬롯
+    포지션을, 나머지(후보) 선수는 등록 포지션 그대로 기록한다(이
+    게임엔 후보용 별도 포메이션 개념이 없으므로).
+
+    [주의] ui.formation_widget에서 직접 import하지 않는다 — 그 모듈은
+    PyQt6을 import하므로, headless_runner.py 등 PyQt6 없는 헤드리스
+    환경에서 ai_lifecycle.py를 그냥 import하는 것만으로 죽는다.
+    formation_logic.py(Qt 의존성 없는 순수 로직 전용)에서 가져온다.
+
+    ai_player_ovr_history와 완전히 같은 타이밍(매 시즌 전환)에 호출된다.
+    [한계] 이 기능 신설 이전 과거 시즌엔 소급 적용이 안 된다 — 그 이전
+    연도는 세계 브라우저 쪽에서 이적 시점 등록 포지션으로 대체 표시한다."""
+    from formation_logic import _greedy_fill_slots
+    from constants import FORMATION_SLOTS
+
+    rows = c.execute(
+        """SELECT ap.id AS id, ap.team_id AS team_id, ap.position AS position,
+                  ap.ovr AS ovr, t.formation AS formation
+           FROM ai_players ap JOIN teams t ON ap.team_id = t.id
+           WHERE ap.team_id IS NOT NULL""").fetchall()
+    if not rows:
+        return
+
+    by_team = {}
+    for r in rows:
+        by_team.setdefault(r["team_id"], []).append(r)
+
+    inserts = []
+    for _team_id, players in by_team.items():
+        formation = players[0]["formation"] or "4-4-2"
+        slots = FORMATION_SLOTS.get(formation, FORMATION_SLOTS["4-4-2"])
+        candidates = [{"id": p["id"], "position": p["position"], "ovr": p["ovr"] or 0}
+                      for p in players]
+        placed = _greedy_fill_slots(candidates, slots)
+        started_ids = set()
+        for slot_idx, pl in enumerate(placed):
+            if pl is None:
+                continue
+            inserts.append((pl["id"], year, slots[slot_idx]))
+            started_ids.add(pl["id"])
+        for p in players:
+            if p["id"] not in started_ids:
+                inserts.append((p["id"], year, p["position"] or ""))
+
+    if inserts:
+        c.executemany(
+            "INSERT OR REPLACE INTO ai_player_position_history(player_id, year, position) "
+            "VALUES (?,?,?)", inserts)
+
+
+def seed_initial_position_history(year):
+    """[2026-08 신설] seed_initial_ovr_history(database.py)와 같은 이유 —
+    시즌 전환이 한 번도 없었던 세이브 첫 해는 _snapshot_season_positions을
+    부를 계기가 없어 영구히 빈칸이 된다. 캐릭터 생성 직후(game_engine.py가
+    seed_initial_ovr_history 바로 다음 자리에서 호출) 한 번 아카이브해서
+    첫 해부터 정확하게 남긴다. formation_widget 의존성 때문에 database.py가
+    아니라 여기(ai_lifecycle.py)에 둔다."""
+    conn = get_conn()
+    c = conn.cursor()
+    _snapshot_season_positions(c, year)
+    conn.commit()
+    conn.close()
+
+
 def _shuffle_formations(c):
     """일부 팀의 포메이션 변경. 시즌마다 ~20% 팀이 전술 교체.
     [최적화] executemany로 일괄 UPDATE."""

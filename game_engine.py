@@ -476,17 +476,23 @@ def get_logs(since_id=0):
     injury/match/normal/salary/sep/slump/training으로 태깅해서 game_log
     테이블에 저장은 계속 해왔는데(스키마에도 처음부터 있던 컬럼) 여태
     호출부가 안 읽고 있었을 뿐이다. ui/log_panel.py가 이 값으로 "핵심"
-    (훈련·휴식 + 경기 기록만)/"경기"(경기 기록만) 필터를 계산한다."""
+    (훈련·휴식 + 경기 기록만)/"경기"(경기 기록만) 필터를 계산한다.
+
+    [2026-08 확장, 신민용 요청: "뉴스에 [2008년]만 뜨는데 [2008년 1주차]
+    처럼 주차까지 표시하는 게 좋을듯"] week도 같이 내려준다(entry, year,
+    week, log_type) — year/log_type과 마찬가지로 game_log.week 컬럼은
+    원래부터 있었고(_day_label이 로그 문구 자체에 "N주차"를 넣을 때 이미
+    쓰던 값) 이 함수가 여태 안 내려주고 있었을 뿐이다."""
     flush_log_buffer()  # 버퍼에 남은 로그 먼저 기록
     conn = get_conn()
     c = conn.cursor()
     if since_id:
-        c.execute("SELECT id, entry, year, log_type FROM game_log WHERE id>? ORDER BY id ASC", (since_id,))
+        c.execute("SELECT id, entry, year, week, log_type FROM game_log WHERE id>? ORDER BY id ASC", (since_id,))
     else:
-        c.execute("SELECT id, entry, year, log_type FROM game_log ORDER BY id ASC")
+        c.execute("SELECT id, entry, year, week, log_type FROM game_log ORDER BY id ASC")
     rows = c.fetchall()
     conn.close()
-    entries = [(r["entry"], r["year"], r["log_type"]) for r in rows]
+    entries = [(r["entry"], r["year"], r["week"], r["log_type"]) for r in rows]
     max_id = rows[-1]["id"] if rows else since_id
     return entries, max_id
 
@@ -900,6 +906,12 @@ def create_player(name: str, position: str, sub_role: str,
     # [2026-08 신설] my_player도 같은 이유로 시작 연도 OVR을 남겨둔다
     # (안 그러면 선수 검색에서 나를 조회했을 때 그 해만 영구히 빈칸).
     seed_my_player_initial_ovr(_start_year, ovr)
+    # [2026-08 신설] "그 시즌 실제 포메이션 포지션" 스냅샷(ai_player_
+    # position_history)도 같은 이유로 시작 연도에 한 번 채워둔다 —
+    # ai_lifecycle.seed_initial_ovr_history와 완전히 같은 목적, ui.
+    # formation_widget 의존성 때문에 ai_lifecycle.py 쪽에 둔 함수다.
+    from ai_lifecycle import seed_initial_position_history
+    seed_initial_position_history(_start_year)
 
     # [전성기 OVR] 시작 OVR로 초기화 (이후 update_player가 자동으로 최고치 갱신).
     conn.execute("UPDATE my_player SET peak_ovr=? WHERE id=1", (ovr,))

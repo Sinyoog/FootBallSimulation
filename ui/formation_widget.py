@@ -592,12 +592,13 @@ class _FormationCanvas(QWidget):
             # paintEvent가 순서에 의존하지 않고 원본 슬롯으로 직접 매칭한다.
             slots_only = FORMATION_SLOTS["4-4-2"]
             my_pos = p.get("position", "CM") if p else "CM"
-            my_slot_idx, _field_pos, _mismatch = _best_slot_for_player(my_pos, slots_only)
+            my_slot_idx, my_field_pos, _mismatch = _best_slot_for_player(my_pos, slots_only)
 
             players = []
             if p:
                 me = {"id": -1, "name": p.get("name", "나"),
                       "position": my_pos, "_slot_idx": my_slot_idx,
+                      "field_pos": my_field_pos,
                       "ovr": p.get("ovr", 40), "is_me": True,
                       "injured": bool(p.get("injured")),
                       "age": p.get("age", 0), "nationality": p.get("nationality", ""),
@@ -671,7 +672,7 @@ class _FormationCanvas(QWidget):
                     if r is None:
                         continue
                     players.append({"id": r["id"], "name": custom_names.get(r["id"]) or ai_player_code(r["id"]),
-                                     "position": sp, "_slot_idx": i,
+                                     "position": sp, "_slot_idx": i, "field_pos": sp,
                                      "ovr": r["ovr"], "is_me": False,
                                      "club": r["club"], "club_tier": r.get("club_tier"),
                                      "club_country": r.get("club_country"),
@@ -689,7 +690,8 @@ class _FormationCanvas(QWidget):
                     ovr_v = max(30, min(99, avg_ovr + random.randint(-4, 4)))
                     base = {s: ovr_v for s in ALL_STATS}
                     players.append({"id": -(i+2), "name": f"AI {i+1}", "position": sp,
-                                     "_slot_idx": i, "ovr": ovr_v, "is_me": False, **base})
+                                     "_slot_idx": i, "field_pos": sp,
+                                     "ovr": ovr_v, "is_me": False, **base})
             self.players = players
             # [2026-08 신설] 명단 패널용 — 주전(players) + 후보(bench_players).
             # bench_players는 실제 선수 풀이 8명 미만이라 가상 폴백을 탄
@@ -719,6 +721,15 @@ class _FormationCanvas(QWidget):
                 # 맞는 선수가 먼저 자기 자리를 차지하고, 잉여만 마지막에
                 # 남는 자리로 밀리게 한다(자세한 설명은 그 함수 주석 참고).
                 slot_filled = _greedy_fill_slots(all_ai, slots_only)
+                # [2026-08 버그수정, 신민용 리포트: "주전 명단에 GK가 2명
+                # 뜬다"] _greedy_fill_slots는 각 선수에 _slot_idx만 태깅하고
+                # 등록 포지션(position)은 그대로 둔다 — 명단 패널(_make_
+                # player_button)이 실제 배정 자리를 보여줄 수 있도록,
+                # 여기서 슬롯 배정이 끝난 즉시 그 자리의 실제 포지션을
+                # field_pos로 같이 태깅해둔다.
+                for _pl in slot_filled:
+                    if _pl is not None:
+                        _pl["field_pos"] = slots_only[_pl["_slot_idx"]]
 
                 # 2) 내 포지션에 맞는 슬롯을 찾아, 그 자리의 기존 선수와 OVR 비교
                 my_slot_idx, field_pos, mismatch_rank = _best_slot_for_player(
@@ -727,6 +738,7 @@ class _FormationCanvas(QWidget):
 
                 me = {"id": -1, "name": p.get("name", "나"),
                       "position": p.get("position", "MF"), "_slot_idx": my_slot_idx,
+                      "field_pos": field_pos,
                       "ovr": p.get("ovr", 40), "is_me": True,
                       "injured": bool(p.get("injured")),
                       "age": p.get("age", 0), "nationality": p.get("nationality", ""),
@@ -813,6 +825,12 @@ class _FormationCanvas(QWidget):
         # [2026-08 버그수정] 배정은 _greedy_fill_slots가 담당 — 자세한 설명은
         # 그 함수 주석 참고(포지션 몰린 스쿼드에서의 연쇄 오배치 수정).
         slot_filled = _greedy_fill_slots(raw_players, slots_only)
+        # [2026-08 버그수정, 신민용 리포트: "주전 명단에 GK가 2명 뜬다"]
+        # load_my_team과 동일한 이유 — 슬롯 배정 직후 실제 배정 자리를
+        # field_pos로 태깅해서 명단 패널이 등록 포지션 대신 이걸 쓰게 한다.
+        for _pl in slot_filled:
+            if _pl is not None:
+                _pl["field_pos"] = slots_only[_pl["_slot_idx"]]
         self.players = [pl for pl in slot_filled if pl is not None]
         # [2026-08 신설] 명단 패널용 — 상대팀도 전체 스쿼드를 따로 가져온다
         # (team_id가 있는 실제 클럽팀만 가능했었다).
@@ -1067,13 +1085,25 @@ class _RosterPanel(QScrollArea):
         # 숨기고 있었는데, 이 명단 패널 버튼 라벨만 빠져 있었다. 어려움
         # 난이도에서는 OVR 대신 포지션/나이/국적을 보여준다(신민용 확정
         # 요청 포맷).
+        # [2026-08 버그수정, 신민용 리포트: "주전 명단에 GK가 2명 뜬다"]
+        # 예전엔 이 라벨이 항상 pl["position"](등록된 "주포", 안 바뀌는
+        # 값)을 보여줬다 — 그런데 포메이션 슬롯은 GK 등 일부 포지션이
+        # 팀당 정확히 하나뿐이라, 주포가 같은(예: GK) 선수가 둘 이상이면
+        # 실제로는 한 명만 그 슬롯을 차지하고 나머지는 다른 자리로 밀려서
+        # 배정된다(_greedy_fill_slots). 그런데 라벨은 여전히 "주포"만
+        # 보여주니 화면상 "주전에 GK가 2명"처럼 보였다 — 실제 배치는
+        # 정상이고 표시만 틀렸던 것. 슬롯 배정이 끝난 선수는 그 자리에서
+        # 실제로 뛰는 포지션(field_pos, load_my_team/load_opp_team이 슬롯
+        # 배정 직후 태깅)을 우선 보여주고, 슬롯 배정 자체가 없는 후보
+        # 선수만 기존처럼 등록 포지션을 보여준다.
+        _pos_label = pl.get("field_pos") or pl.get("position", "")
         if is_hard_mode():
             _age = pl.get("age") or 0
             _nat = pl.get("nationality") or ""
-            _detail = f"{pl.get('position','')}" + (f", {_age}세" if _age else "") + (f", {_nat}" if _nat else "")
+            _detail = f"{_pos_label}" + (f", {_age}세" if _age else "") + (f", {_nat}" if _nat else "")
             label = f"{pl.get('name','')[:6]} ({_detail})"
         else:
-            label = f"{pl.get('name','')[:6]} ({pl.get('position','')} {pl.get('ovr',0)})"
+            label = f"{pl.get('name','')[:6]} ({_pos_label} {pl.get('ovr',0)})"
         btn = QPushButton(label)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         # [2026-08 신설, 신민용 요청: "우측 상자들 크기를 최대한 우측
@@ -1630,109 +1660,16 @@ def _row_key(pos):
     if pos in ("CAM","LM","RM"): return "MID2"  # 공격형 미드/윙미드 = 별도 행
     return "ATK"
 
-def _pos_category(pos):
-    if pos == "GK": return "GK"
-    if pos in ("CB","LB","RB","LWB","RWB","SW"): return "DEF"
-    if pos in ("CDM","CM","CAM","LM","RM","DM","AM"): return "MID"
-    return "ATK"
+# [2026-08 리팩터, 신민용 요청건("이 시즌에 얘가 어디 포지션을 갔는지가
+# 중요한거야")으로 ai_lifecycle.py도 이 슬롯 배정 알고리즘이 필요해짐]
+# _pos_category/_best_slot_for_player/_greedy_fill_slots는 원래 여기
+# 정의돼 있었는데, ai_lifecycle.py(헤드리스 실행에서도 도는 백엔드
+# 생애주기 로직)가 이 파일을 그냥 import하면 위쪽의 PyQt6 의존성이
+# 통째로 딸려 들어와 PyQt6 없는 헤드리스 환경(headless_runner.py 등)을
+# 깨뜨린다 — 그래서 Qt 의존성 없는 formation_logic.py로 옮기고 여기서는
+# 그걸 import해서 쓴다(로직/동작 완전히 동일, 위치만 이동).
+from formation_logic import _pos_category, _best_slot_for_player, _greedy_fill_slots
 
-
-def _best_slot_for_player(primary_pos, slots):
-    """주요 포지션에서 포메이션 슬롯 중 가장 자연스러운 슬롯 인덱스 반환.
-    POSITION_COMPAT 우선순위 리스트 기준: 앞에 있는 슬롯일수록 높은 우선순위.
-    반환: (slot_index, field_pos, mismatch_rank)
-      mismatch_rank=0: 완벽 매치 / 1: 2순위 / 2: 3순위 ...
-    [주의] '나(me)' 한 명의 슬롯을 결정할 때만 쓴다. 여러 후보를 한꺼번에
-    슬롯에 채울 때는(AI 11명 등) 아래 _greedy_fill_slots를 쓴다 — 이
-    함수의 최종 폴백(호환/카테고리 매치가 전혀 없을 때 slots[0]을 그냥
-    반환)은 후보가 하나뿐일 때는 무해하지만, 여러 명을 순서대로 돌리면서
-    쓰면 포지션이 몰린(예: GK 2명) 잉여 후보가 엉뚱한 자리를 가로채고
-    그 여파로 뒤 후보들이 줄줄이 밀리는 문제가 있었다(2026-08 버그수정,
-    신민용 리포트: "RB 의 주포가 GK로 뜨고 ST가 CB으로 간다").
-    """
-    compat = POSITION_COMPAT.get(primary_pos, [primary_pos])
-    # 이미 할당된 슬롯 제외 없이 최적 슬롯만 찾음 (호출 시 이미 할당된 슬롯 제외 처리)
-    best_idx, best_rank = 0, 999
-    for si, slot_pos in enumerate(slots):
-        if slot_pos in compat:
-            rank = compat.index(slot_pos)
-            if rank < best_rank:
-                best_rank = rank
-                best_idx = si
-    if best_rank == 999:
-        # 호환 없으면 카테고리로 fallback
-        my_cat = _pos_category(primary_pos)
-        for si, slot_pos in enumerate(slots):
-            if _pos_category(slot_pos) == my_cat:
-                return si, slot_pos, 4
-        return 0, slots[0] if slots else primary_pos, 4
-    return best_idx, slots[best_idx], best_rank
-
-
-def _greedy_fill_slots(candidates, slots_only):
-    """여러 후보 선수를 포메이션 슬롯(slots_only, 원본 순서)에 배정한다.
-    각 배정된 선수 dict에 원본 슬롯 인덱스를 "_slot_idx"로 태깅하고,
-    slots_only와 같은 길이의 리스트(빈 자리는 None)를 반환한다.
-
-    [2026-08 버그수정, 신민용 리포트: "상대팀 포메이션에서 RB 의 주포가
-    GK로 뜨고 ST가 CB으로 가며 GK는 클릭해도 스탯이 안 떠"] 예전엔 후보
-    전원을 OVR 내림차순으로 한 번에 훑으면서, 각자 차례가 오면 그 자리에서
-    바로 "정확한 포지션 매치 → 카테고리 매치 → 그냥 첫 빈 슬롯" 순으로
-    즉시 확정지었다. 그런데 스쿼드에 같은 포지션이 몰려있으면(예: GK가
-    상위 OVR 11명 안에 2명 다 들어옴) 두 번째 GK는 정확한 매치도 카테고리
-    매치도 없다(GK 슬롯은 하나뿐이고 이미 찼으므로) — 그래서 "그냥 첫
-    빈 슬롯"으로 강제 확정되는데, 하필 그 자리가 아직 자기 차례가 안 온
-    진짜 RB 선수의 자리였다. 그러면 진짜 RB 선수는 이후 순서에서 밀려나
-    엉뚱한 자리(ST 등)로 떠밀리고, 그 자리에 있던 선수도 또 밀리는 식으로
-    연쇄 오배치가 일어난다. 또한 진짜 GK 슬롯 자체가 다른 잉여 선수에게
-    가로채여 아예 안 채워지는 경우도 있었다(클릭해도 스탯 안 뜨는 원인).
-
-    이제 3단계로 나눠서, 포지션이 정확히/카테고리로 맞는 선수가 항상
-    먼저 자기 자리를 차지하게 하고, 그렇게도 안 맞는 잉여 선수만 맨
-    마지막에 진짜 남는 자리로 보낸다:
-      1) 정확한 포지션 호환(POSITION_COMPAT) 매치만 전원 시도
-      2) 1)에서 못 찾은 선수만 카테고리(GK/DEF/MID/ATK) 매치 시도
-      3) 그래도 남은 선수만 마지막 수단으로 아무 빈 슬롯에 순서대로
-    """
-    slot_filled = [None] * len(slots_only)
-    remaining = sorted(candidates, key=lambda x: -(x.get("ovr", 0) or 0))
-
-    def _find_compat_slot(pl):
-        pos = pl.get("position", "CM")
-        compat = POSITION_COMPAT.get(pos, [pos])
-        best_i, best_rank = None, 999
-        for i, sp in enumerate(slots_only):
-            if slot_filled[i] is None and sp in compat:
-                r = compat.index(sp)
-                if r < best_rank:
-                    best_rank = r; best_i = i
-        return best_i
-
-    def _find_category_slot(pl):
-        cat = _pos_category(pl.get("position", "CM"))
-        for i, sp in enumerate(slots_only):
-            if slot_filled[i] is None and _pos_category(sp) == cat:
-                return i
-        return None
-
-    for phase_fn in (_find_compat_slot, _find_category_slot):
-        still_left = []
-        for pl in remaining:
-            i = phase_fn(pl)
-            if i is not None:
-                slot_filled[i] = pl
-                pl["_slot_idx"] = i
-            else:
-                still_left.append(pl)
-        remaining = still_left
-
-    # 3) 진짜 마지막 수단 — 위 두 단계로도 못 채운 선수는 남은 빈 슬롯에 순서대로.
-    open_idx = [i for i in range(len(slot_filled)) if slot_filled[i] is None]
-    for i, pl in zip(open_idx, remaining):
-        slot_filled[i] = pl
-        pl["_slot_idx"] = i
-
-    return slot_filled
 
 def _row_priority(k):
     # 위(공격)→아래(GK) 순서: ATK=0, MID2=1, MID=2, DEF=3, GK=4
