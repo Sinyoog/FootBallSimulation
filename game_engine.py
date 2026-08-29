@@ -889,7 +889,7 @@ def create_player(name: str, position: str, sub_role: str,
     # [2026-08 신설] 실제 선택된 시작 연도를 영구 저장 — intl_engine.py가
     # 이걸 기준으로 월드컵/네이션스컵/클럽월드컵/지역컵 개최년도를 다시
     # 계산한다(자세한 이유는 database.set_game_start_year 주석 참고).
-    from database import set_game_start_year, seed_initial_ovr_history
+    from database import set_game_start_year, seed_initial_ovr_history, seed_my_player_initial_ovr
     set_game_start_year(_start_year)
     # [2026-08 신설, 신민용 리포트: "OVR 기록이 2000/2001/2002년 다 비어있다"]
     # ai_player_ovr_history는 매 시즌 종료 시점에만 채워져서, 시즌 전환이
@@ -897,6 +897,9 @@ def create_player(name: str, position: str, sub_role: str,
     # (전세계 선수단은 이미 생성 완료, 시작 연도도 방금 확정) 한 번
     # 아카이브해서 첫 해부터 정확한 기록이 남게 한다.
     seed_initial_ovr_history(_start_year)
+    # [2026-08 신설] my_player도 같은 이유로 시작 연도 OVR을 남겨둔다
+    # (안 그러면 선수 검색에서 나를 조회했을 때 그 해만 영구히 빈칸).
+    seed_my_player_initial_ovr(_start_year, ovr)
 
     # [전성기 OVR] 시작 OVR로 초기화 (이후 update_player가 자동으로 최고치 갱신).
     conn.execute("UPDATE my_player SET peak_ovr=? WHERE id=1", (ovr,))
@@ -9809,6 +9812,24 @@ def _end_of_season(p, year, progress_cb=None):
         print(f"[AI생애주기 오류] {year}년: {_e}")
         _tb.print_exc()
         add_log(f"⚠ 이적시장 처리 중 오류: {_e}", "event", year, 52)
+
+    # [2026-08 신설, 신민용 리포트: "선수 검색에서 나를 보면 OVR이 하나도
+    # 안 찍혀있다"] AI는 바로 위 run_ai_offseason 안에서 매 시즌 이 시점에
+    # ai_player_ovr_history를 아카이브하는데, my_player는 그 루틴을 안
+    # 타서 대응하는 아카이브가 아예 없었다 — 같은 시점(연도 전환, year=
+    # 이번에 끝난 시즌)에 내 OVR도 한 줄 남긴다. get_player()로 다시
+    # 조회하는 이유는 위에서 넘겨받은 p가 이 시즌 동안의 훈련 성장을
+    # 전부 반영한 최신 상태라는 보장이 없어서(다른 곳들도 이 시점엔
+    # get_player() 재조회를 쓰는 패턴과 동일) — 이 한 줄 실패로 연도
+    # 전환 전체가 막히면 안 되므로 방어적으로 감싼다.
+    try:
+        _p_now = get_player()
+        if _p_now:
+            from database import record_my_player_ovr_snapshot
+            record_my_player_ovr_snapshot(year, _p_now.get("ovr", 0))
+    except Exception as _e:
+        print(f"[내 OVR 아카이브 오류] {year}년: {_e}")
+
     if DEBUG_RELEGATION_TRACKING:
         for _tid in _RELEGATION_DEBUG_TRACK:
             _relegation_debug_snapshot(_tid, "개막 직전(이적시장 마감 후)")

@@ -325,6 +325,30 @@ def seed_initial_ovr_history(year):
         conn.commit()
 
 
+def seed_my_player_initial_ovr(year, ovr):
+    """[2026-08 신설] seed_initial_ovr_history의 my_player 버전 —
+    세이브 첫 해(시즌 전환이 한 번도 없었던 시점)는 record_my_player_
+    ovr_snapshot(game_engine._end_of_season 안에서 매 시즌 전환마다
+    호출)이 아직 한 번도 안 돌았으므로, 캐릭터 생성 직후 한 번 이
+    함수로 시작 연도 OVR을 남겨둔다."""
+    conn = get_conn()
+    conn.execute("INSERT OR REPLACE INTO my_player_ovr_history(year, ovr) VALUES (?,?)",
+                 (year, ovr))
+    conn.commit()
+
+
+def record_my_player_ovr_snapshot(year, ovr):
+    """[2026-08 신설] ai_player_ovr_history를 아카이브하는 매 시즌전환
+    시점(game_engine._end_of_season, ai_lifecycle.run_ai_offseason 직후)
+    에 my_player의 OVR도 같은 타이밍으로 한 줄 남긴다. year는 그 해
+    한 번만 있으므로(PRIMARY KEY) 같은 해 여러 번 호출돼도 마지막 값만
+    남는다(INSERT OR REPLACE)."""
+    conn = get_conn()
+    conn.execute("INSERT OR REPLACE INTO my_player_ovr_history(year, ovr) VALUES (?,?)",
+                 (year, ovr))
+    conn.commit()
+
+
 def get_conn():
     global _pool_conn
     if _pool_conn is None:
@@ -559,6 +583,15 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS ai_player_ovr_history(
         player_id INTEGER, year INTEGER, ovr INTEGER,
         PRIMARY KEY(player_id, year))""")
+
+    # [2026-08 신설, 신민용 리포트: "선수 검색에서 나(my_player)를 보면
+    # OVR이 하나도 안 찍혀있다"] ai_player_ovr_history와 완전히 같은
+    # 목적이지만 my_player 전용(세이브당 my_player가 하나뿐이라
+    # player_id 없이 year만 PK) — game_engine._end_of_season이 AI OVR을
+    # 아카이브하는 바로 그 시점에 내 OVR도 같이 한 줄 남긴다("시즌 시작
+    # 시점" 기준, ai_player_ovr_history와 동일한 타이밍).
+    c.execute("""CREATE TABLE IF NOT EXISTS my_player_ovr_history(
+        year INTEGER PRIMARY KEY, ovr INTEGER)""")
 
     # [2026-08 신설, 신민용 요청: "선수가 은퇴하면 소속팀에 '은퇴했습니다'
     # 라고 뜨고... 얘네도 차후 검색할 수 있어야 해"] 예전엔 은퇴 시
@@ -2965,7 +2998,11 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
               # [2026-08 신설, 연도별 OVR 아카이브] 위와 같은 이유(id
               # 재사용) — 안 비우면 새 게임의 다른 선수가 이전 판 OVR
               # 이력을 이어받는다.
-              "ai_player_ovr_history"]:
+              "ai_player_ovr_history",
+              # [2026-08 신설] my_player 전용 연도별 OVR 아카이브도 새
+              # 게임에서 비워야 한다 — 안 비우면 새로 만든 캐릭터의 선수
+              # 검색 화면에 이전 캐릭터의 OVR 이력이 그대로 뜬다.
+              "my_player_ovr_history"]:
         c.execute(f"DELETE FROM {t}")
     c.execute("UPDATE teams SET wins=0,draws=0,losses=0,goals_for=0,goals_against=0")
     _reset_teams_to_league_data(c)

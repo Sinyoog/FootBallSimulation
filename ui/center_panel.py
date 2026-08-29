@@ -1217,7 +1217,10 @@ class CenterPanel(QWidget):
                 p["current_team_id"],
                 context=_ctx,
                 options=_options,
-                manager_rel=p.get("manager_relation", 50))
+                manager_rel=p.get("manager_relation", 50),
+                # [2026-08 버그수정] 상대팀 목록 캐시 무효화용 — 아래
+                # formation_widget.load_team()의 ctx_key 주석 참고.
+                year=p.get("current_year"))
 
         self._update_preview()
 
@@ -3116,71 +3119,52 @@ class CenterPanel(QWidget):
         def _do_choice(opt):
             # [복수대륙컵] 선택한 옵션의 대회로 출전. 옵션에 tournament_id가
             #   있으면 그것을(각 대륙컵), 없으면 pend 대표 tid를 사용(구버전 호환).
-            # [2026-08 버그수정, 신민용 리포트: "확인 눌러도 여전히 흰 창이
-            # 여러 개 뜬다"] 중첩 모달 타이밍(아래 QTimer)을 고쳤는데도
-            # 재현된 걸 다시 보니, 진짜 병목은 다른 자리였다 —
-            # intl_engine.choose_national_team()이 dlg.accept()보다도 먼저,
-            # 이 버튼 클릭 핸들러 안에서 곧바로 _enrich_countries()(대륙
-            # 전체 국가, 많으면 50~200개국 OVR 재계산)를 동기 호출한다.
-            # 즉 다이얼로그가 아직 "열려있는" 상태에서 이미 UI 스레드가
-            # 한동안 막혀 있었을 수 있다 — 이건 다이얼로그 순서를 아무리
-            # 손봐도 못 잡는 별개의 원인. 무거운 호출 직전에 대기 커서 +
-            # processEvents()로 지금까지 밀린 페인트를 먼저 비워서, 최소한
-            # "멈추기 직전" 화면이 지저분한 상태로 안 남게 한다(완전한
-            # 해결은 아니고, 이 계산 자체를 가볍게 만드는 게 근본 해결—
-            # 일단 증상 완화용).
-            # [참고, 신민용 요청으로 확인] 같은 다이얼로그 그룹의 다른
-            # 두 곳(_show_forced_commit._do_commit → commit_nationality,
-            # _do_decline/_do_decline_option → decline_national_team*)은
-            # 둘 다 update_player() 한 번 + 가벼운 기록 저장뿐이라
-            # _enrich_countries() 같은 무거운 호출이 없다 — 이 WaitCursor
-            # 보정은 여기(_do_choice) 한 곳만 필요하다.
-            from PyQt6.QtWidgets import QApplication
-            import time as _time_dbg
-            print(f"[GHOST-DEBUG] _do_choice 진입 {_time_dbg.perf_counter():.3f}")
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            QApplication.processEvents()
+            #
+            # [2026-08 근본 수정, 신민용 리포트: "확인 눌러도 여전히 흰 창이
+            # 여러 개 뜬다"] 진짜 원인 — intl_engine.choose_national_team()이
+            # dlg.accept()보다도 먼저, 이 버튼 클릭 핸들러 안에서 곧바로
+            # _enrich_countries()(대륙 전체 국가, 많으면 50~200개국 OVR
+            # 재계산)를 동기 호출했다. 즉 지금 열려 있는 다이얼로그가 아직
+            # 화면에서 안 닫힌 상태로 UI 스레드가 한참 막혀 있었고, 그 와중에
+            # 대기 커서 + processEvents()로 페인트를 억지로 흘려보내려 하니
+            # 다이얼로그들이 절반만 그려진 채 열렸다 닫혔다 하는 것처럼(흰
+            # 빈 창 여러 개) 보였다 — WaitCursor/processEvents()는 증상만
+            # 가릴 뿐 이 블로킹 자체를 없애지 못했다.
+            #
+            # 고침: 무거운 계산(choose_national_team)을 버튼 클릭 핸들러
+            # 안에서 곧바로 부르지 않는다. ①dlg.accept()로 지금 창부터
+            # 완전히 닫고 → ②QTimer.singleShot(0, ...)으로 "다음 이벤트
+            # 루프 틱"에 무거운 계산을 실행 → ③계산이 끝난 뒤 다시
+            # QTimer.singleShot(0, ...)으로 결과 다이얼로그를 연다. 각
+            # 단계 사이에 실제 창닫기/그리기가 이벤트 루프를 한 번씩
+            # 거치도록 강제해서, 두 모달이 화면 위에서 겹치거나 덜 그려진
+            # 채 남는 상황 자체를 없앤다(재진입 없이 순서대로 처리).
+            #
+            # [참고] 같은 다이얼로그 그룹의 다른 두 곳(_show_forced_commit.
+            # _do_commit → commit_nationality, _do_decline/_do_decline_option
+            # → decline_national_team*)은 둘 다 update_player() 한 번 +
+            # 가벼운 기록 저장뿐이라 이 문제가 없다 — 무거운 호출이 있는
+            # 여기만 이렇게 단계를 나눠야 한다.
             tid = opt.get("tournament_id", pend["tournament_id"])
-            _t_before_choose = _time_dbg.perf_counter()
-            res = intl_engine.choose_national_team(tid, opt["nat"])
-            print(f"[GHOST-DEBUG] choose_national_team 완료, 소요 {(_time_dbg.perf_counter()-_t_before_choose)*1000:.1f}ms")
-            QApplication.restoreOverrideCursor()
-            print(f"[GHOST-DEBUG] dlg.accept() 직전 {_time_dbg.perf_counter():.3f}")
+            nat = opt["nat"]
             dlg.accept()
-            print(f"[GHOST-DEBUG] dlg.accept() 직후, QTimer 예약 {_time_dbg.perf_counter():.3f}")
-            # [2026-08 버그수정, 신민용 리포트: "국가대표 발탁 선택 후 작은
-            # 흰 창이 여러 개 떴다 사라진다"] dlg.accept()는 창을 "닫으라고
-            # 예약"만 할 뿐, 실제 네이티브 창이 닫히는 건 이 핸들러가
-            # 리턴해서 Qt 이벤트 루프로 돌아간 뒤다. 그런데 바로 다음 줄에서
-            # 또 다른 모달 다이얼로그(_show_callup_result)를 곧바로 열면,
-            # dlg가 아직 화면에서 안 닫힌 상태 위에 새 모달 창이 겹쳐
-            # 뜨는 꼴이 되어(중첩 모달) Windows에서 창 전환이 한꺼번에
-            # 몰려 처리되며 빈 창이 깜빡이는 것으로 보일 수 있다.
-            # QTimer.singleShot(0, ...)으로 dlg가 완전히 닫힌 뒤(다음
-            # 이벤트 루프 틱)에 후속 다이얼로그·refresh를 열도록 한 박자
-            # 늦춘다.
-            # [2026-08 신설, 신민용 요청: "정확히 뭔지 감도 안 오지?"라는
-            # 지적에 대한 정직한 대응] 지금까지 세 번의 수정(중첩모달
-            # 타이밍/WaitCursor/deleteLater) 전부 "이럴 것 같다"는 추측이었지
-            # 실제로 이 화면을 띄워서 확인한 적이 없다 — GUI를 못 띄우는
-            # 환경이라 매번 코드만 읽고 짐작했다. 더 이상 추측으로 다섯
-            # 번째 수정을 내놓는 대신, 다음에 이 증상이 재현될 때 정확히
-            # 어느 지점에서 시간이 걸리는지 신민용이 직접 콘솔 로그로
-            # 확인할 수 있도록 각 단계에 타임스탬프를 찍어둔다(아래
-            # _after_close 안까지 포함). 이 로그들을 다음 리포트에 그대로
-            # 붙여주면, 그걸 근거로 진짜 원인을 좁힐 수 있다.
-            def _after_close():
-                print(f"[GHOST-DEBUG] _after_close 진입(QTimer 발동) {_time_dbg.perf_counter():.3f}")
-                if res:
-                    _t_cr = _time_dbg.perf_counter()
-                    self._show_callup_result(opt["nat"], res)
-                    print(f"[GHOST-DEBUG] _show_callup_result 반환(다이얼로그 닫힘) {_time_dbg.perf_counter():.3f}, 창 떠있던 시간 {(_time_dbg.perf_counter()-_t_cr)*1000:.1f}ms")
-                if self.main_win:
-                    _t_ra = _time_dbg.perf_counter()
-                    self.main_win.refresh_all()
-                    print(f"[GHOST-DEBUG] refresh_all 완료, 소요 {(_time_dbg.perf_counter()-_t_ra)*1000:.1f}ms")
-                print(f"[GHOST-DEBUG] _after_close 종료 {_time_dbg.perf_counter():.3f}")
-            QTimer.singleShot(0, _after_close)
+
+            def _run_heavy_choice():
+                from PyQt6.QtWidgets import QApplication
+                QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+                try:
+                    res = intl_engine.choose_national_team(tid, nat)
+                finally:
+                    QApplication.restoreOverrideCursor()
+
+                def _after_close():
+                    if res:
+                        self._show_callup_result(nat, res)
+                    if self.main_win:
+                        self.main_win.refresh_all()
+                QTimer.singleShot(0, _after_close)
+
+            QTimer.singleShot(0, _run_heavy_choice)
 
         def _do_decline():
             # [단일 후보 전용] 후보가 1개뿐일 때의 "아니오" — 그 대회 전체를 닫는다.
@@ -3331,12 +3315,8 @@ class CenterPanel(QWidget):
         btn = QPushButton("확인"); btn.setObjectName("dlgChoice")
         btn.clicked.connect(dlg.accept)
         lay.addWidget(btn)
-        import time as _time_dbg
-        print(f"[GHOST-DEBUG] _show_callup_result dlg.exec() 진입 {_time_dbg.perf_counter():.3f}")
         dlg.exec()
-        print(f"[GHOST-DEBUG] _show_callup_result dlg.exec() 반환(확인 눌러 닫힘) {_time_dbg.perf_counter():.3f}")
         dlg.deleteLater()
-        print(f"[GHOST-DEBUG] _show_callup_result deleteLater() 호출 완료 {_time_dbg.perf_counter():.3f}")
 
     def _do_toggle_offers(self):
         """오퍼 알림 ON/OFF 토글. 팀 입단(무소속 강제 입단)에는 영향 없음."""

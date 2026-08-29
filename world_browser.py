@@ -372,7 +372,8 @@ def _scope_team_ids(conn, country_id=None, league_id=None, team_id=None):
 def search_retired_ai_players(name_query=None, continent=None, nat_country_id=None,
                                 position=None, min_age=None, max_age=None, limit=200,
                                 natteam=False, natteam_year=None, team_id=None,
-                                country_id=None, league_id=None, team_mode="current"):
+                                country_id=None, league_id=None, team_mode="current",
+                                name_mode="all", custom_named_only=False):
     """[2026-08 신설/수정, 신민용 요청: "은퇴한 선수도 차후 검색할 수
     있어야 해" / "필터에 현역·은퇴 버튼"] ai_players_retired(은퇴 스냅샷
     아카이브)에서 검색한다. 등급/부수 필터는 은퇴 선수엔 저장돼 있지 않아
@@ -429,13 +430,23 @@ def search_retired_ai_players(name_query=None, continent=None, nat_country_id=No
             q += " AND r.age>=?"; params.append(min_age)
         if max_age is not None:
             q += " AND r.age<=?"; params.append(max_age)
+        if custom_named_only:
+            q += " AND cust.custom_name IS NOT NULL AND cust.custom_name != ''"
         if name_query:
             needle = name_query.strip()
             if needle:
                 like = f"%{needle}%"
-                q += (" AND (r.name LIKE ? OR r.nationality LIKE ? OR r.last_team_name LIKE ? "
-                      "OR cust.custom_name LIKE ?)")
-                params += [like, like, like, like]
+                # [2026-08 신설, 신민용 요청: "이름이 팀/국적 등과 겹쳐서
+                # 충돌나는게 불편하다"] name_mode="code"(필터가 "이름"일
+                # 때)면 이 선수 자신의 식별용 필드(내가 지어준 이름)만
+                # 매칭하고, 국적/마지막 소속팀명은 아예 제외한다.
+                if name_mode == "code":
+                    q += " AND cust.custom_name LIKE ?"
+                    params += [like]
+                else:
+                    q += (" AND (r.name LIKE ? OR r.nationality LIKE ? OR r.last_team_name LIKE ? "
+                          "OR cust.custom_name LIKE ?)")
+                    params += [like, like, like, like]
         _nt_sql, _nt_params = _natteam_filter_sql(natteam, natteam_year)
         if _nt_sql:
             q += _nt_sql.format(alias="r"); params += _nt_params
@@ -507,7 +518,8 @@ def _decode_ai_code(text):
 def search_ai_players(name_query=None, continent=None, country_id=None, nat_country_id=None,
                        grade=None, tier=None, position=None, min_age=None, max_age=None,
                        status="active", limit=200, natteam=False, natteam_year=None,
-                       team_id=None, team_mode="current", league_id=None):
+                       team_id=None, team_mode="current", league_id=None, name_mode="all",
+                       custom_named_only=False):
     """[2026-08 수정, 신민용 요청: "국가와 국적을 나눠야 한다, 대륙은
     국적과 연관되어 있게"] 대륙(continent)/국적(nat_country_id)은 이제
     선수의 실제 국적(ai_players.nationality) 기준이고, 국가(country_id)는
@@ -543,7 +555,22 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
     똑같이 났다 — 실제 AI 선수 수가 2.6만 명 규모라 이름 검색에 SQL
     LIKE를 직접 거는 게 훨씬 정확하고, 실측상으로도 이 규모에선 느리지
     않다(팀 검색과 동일 판단). 그 컷을 없애고 SQL LIKE 직접 필터로
-    되돌렸다."""
+    되돌렸다.
+
+    [2026-08 신설, 신민용 요청: "이름 검색에서 팀명 등과 충돌나서 불편"]
+    name_mode="all"(기본)이면 기존과 동일하게 팀명/국적/리그명/국가명까지
+    같이 매칭한다. name_mode="code"("이름" 필터)면 이 선수 자신의 식별용
+    필드(내가 지어준 커스텀 이름 + 코드 부분일치)만 매칭하고 팀/국적/
+    리그/국가명은 아예 검색 대상에서 빼서, 예를 들어 팀명과 우연히
+    겹치는 검색어를 넣어도 그 팀 소속 선수 전체가 쏟아지는 일이 없다.
+
+    [2026-08 신설, 신민용 요청: "내가 이름 바꾼 선수만 보고 싶다 — 다른
+    필터랑 같이 켜서 그 안에서만 걸러지게"] custom_named_only=True면
+    다른 조건 전부와 AND로 묶여, 내가 커스텀 이름을 지어준 선수(직접
+    지정한 이름이 있는 경우)만 남는다. my_player는 이 방식으로 이름을
+    지어준 적이 없으므로(rename은 AI 전용) 이 필터가 켜지면 결과에서
+    자동으로 빠진다.
+    """
     from constants import get_league_grade, ai_player_code
     conn = get_conn()
 
@@ -552,7 +579,8 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
             name_query=name_query, continent=continent, nat_country_id=nat_country_id,
             position=position, min_age=min_age, max_age=max_age, limit=limit,
             natteam=natteam, natteam_year=natteam_year, team_id=team_id,
-            country_id=country_id, league_id=league_id, team_mode=team_mode)
+            country_id=country_id, league_id=league_id, team_mode=team_mode,
+            name_mode=name_mode, custom_named_only=custom_named_only)
         conn.close()
         return rows
 
@@ -654,6 +682,8 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
     if grade_country_ids is not None:
         q += " AND cn.id IN (%s)" % ",".join("?" * len(grade_country_ids))
         params += grade_country_ids
+    if custom_named_only:
+        q += " AND cust.custom_name IS NOT NULL AND cust.custom_name != ''"
     # [2026-08 신설, 신민용 요청: "국가(소속리그)→리그→팀 3단계 필터...
     # 팀 필터는 '현재 소속'과 '경력'을 구분하는 게 좋음... 현역은 기본적
     # 으로 현재 소속팀 기준... 사용자가 경력 포함을 켜면 현역도 과거 팀
@@ -679,9 +709,21 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
         needle = name_query.strip()
         if needle:
             like = f"%{needle}%"
-            q += (" AND (t.name LIKE ? OR l.name LIKE ? OR cn.name LIKE ? "
-                  "OR p.nationality LIKE ? OR p.name LIKE ? OR cust.custom_name LIKE ?)")
-            params += [like, like, like, like, like, like]
+            if name_mode == "code":
+                # [2026-08 버그수정, 신민용 리포트: "이름 필터로 '뱅'을
+                # 검색했는데 전혀 관련없는 선수들이 잔뜩 뜬다"] p.name은
+                # 화면 어디에도 안 보이는 내부용 실제 생성 이름(예: "디에고
+                # 사이스니스")인데, 여기 포함시켜서 그 숨겨진 이름에 우연히
+                # "뱅" 같은 음절이 들어간 선수가 4천 명 넘게 걸렸다 —
+                # "이름" 필터는 화면에 실제로 보이는 식별용 필드(내가
+                # 지어준 커스텀 이름 + 식별코드)만 매칭해야 하므로 p.name
+                # 은 아예 뺀다.
+                q += " AND cust.custom_name LIKE ?"
+                params += [like]
+            else:
+                q += (" AND (t.name LIKE ? OR l.name LIKE ? OR cn.name LIKE ? "
+                      "OR p.nationality LIKE ? OR p.name LIKE ? OR cust.custom_name LIKE ?)")
+                params += [like, like, like, like, like, like]
     q += " ORDER BY p.ovr DESC LIMIT ?"
     params.append(limit if not name_query else max(limit, 500))
     rows = [dict(r) for r in conn.execute(q, params).fetchall()]
@@ -720,7 +762,7 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
     # 내내 고정되는 건 나머지 동료 25명뿐 — load_my_team 참고) natteam
     # 필터로는 내가 실제 국대 출신인지 정확히 알 수 없다 — 필터가 켜져
     # 있으면 부정확하게 끼워 넣지 않고 그냥 제외한다.
-    my_row = _my_player_search_row() if not natteam else None
+    my_row = _my_player_search_row() if not (natteam or custom_named_only) else None
     if my_row and _my_player_matches_filters(
             my_row, continent=continent, nat_country_name=nat_country_name,
             country_id=country_id, tier=tier, position=position,
@@ -728,9 +770,14 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
             team_id=team_id, league_id=league_id):
         if name_query:
             needle = name_query.strip().lower()
-            haystack = [(my_row["name"] or "").lower(), (my_row["team_name"] or "").lower(),
-                        (my_row["nationality"] or "").lower(), (my_row["league_name"] or "").lower(),
-                        (my_row["country"] or "").lower()]
+            if name_mode == "code":
+                # "이름" 필터에서 나(my_player)는 실명이 곧 식별용
+                # 필드이므로 팀/국적/리그/국가는 매칭 대상에서 뺀다.
+                haystack = [(my_row["name"] or "").lower()]
+            else:
+                haystack = [(my_row["name"] or "").lower(), (my_row["team_name"] or "").lower(),
+                            (my_row["nationality"] or "").lower(), (my_row["league_name"] or "").lower(),
+                            (my_row["country"] or "").lower()]
             if any(needle in h for h in haystack):
                 rows = [my_row] + rows
         else:
@@ -850,13 +897,13 @@ def get_ai_player_team_timeline(player_id, current_team_id):
     start_year=None은 "그 이전 전체", end_year=None은 "그 이후 전체"."""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT year, from_team_id, to_team_id FROM ai_transfer_log "
+        "SELECT year, from_team_id, to_team_id, player_position FROM ai_transfer_log "
         "WHERE player_id=? ORDER BY year ASC", (player_id,)).fetchall()
     if not rows:
         name_row = conn.execute("SELECT name FROM teams WHERE id=?", (current_team_id,)).fetchone()
         conn.close()
         return [{"start_year": None, "end_year": None, "team_id": current_team_id,
-                 "team_name": name_row["name"] if name_row else "?"}]
+                 "team_name": name_row["name"] if name_row else "?", "position": None}]
     team_ids = {r["from_team_id"] for r in rows} | {r["to_team_id"] for r in rows}
     if current_team_id:
         team_ids.add(current_team_id)
@@ -865,14 +912,23 @@ def get_ai_player_team_timeline(player_id, current_team_id):
                    conn.execute(f"SELECT id, name FROM teams WHERE id IN ({ph})", list(team_ids))}
     conn.close()
 
+    # [2026-08 신설, 신민용 요청: "소속팀일 때 포지션이 뭐였는지도 적어야
+    # 하는거 아니야 — 팀마다 포지션이 다르잖아"] ai_transfer_log.player_position
+    # 은 그 이적이 일어난 "순간"에 기록해둔 포지션이다(연도별 아카이브는
+    # 아니고 이적 시점 스냅샷). 첫 이적 이전 구간(소급 추정 구간)은 알
+    # 방법이 없으니 첫 이적 시점 값으로 근사한다 — team_id를 첫 이적의
+    # from_team_id로 소급 추정하는 것과 같은 원칙(정확한 값이 없으면
+    # 가장 가까운 시점의 값으로 근사, 완전히 지어내지 않음).
     segments = [{"start_year": None, "end_year": rows[0]["year"],
                  "team_id": rows[0]["from_team_id"],
-                 "team_name": name_by_tid.get(rows[0]["from_team_id"], "?")}]
+                 "team_name": name_by_tid.get(rows[0]["from_team_id"], "?"),
+                 "position": rows[0]["player_position"] or None}]
     for i, r in enumerate(rows):
         end = rows[i + 1]["year"] if i + 1 < len(rows) else None
         segments.append({"start_year": r["year"], "end_year": end,
                           "team_id": r["to_team_id"],
-                          "team_name": name_by_tid.get(r["to_team_id"], "?")})
+                          "team_name": name_by_tid.get(r["to_team_id"], "?"),
+                          "position": r["player_position"] or None})
     return segments
 
 
@@ -1010,23 +1066,25 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
     # 빈 값("-")으로 둔다(리그 성적만 상반기 기준으로 정확히 보여준다).
     conn = get_conn()
     mid_rows = conn.execute(
-        "SELECT year, from_team_id FROM ai_transfer_log WHERE player_id=? AND is_mid_season=1",
+        "SELECT year, from_team_id, player_position FROM ai_transfer_log "
+        "WHERE player_id=? AND is_mid_season=1",
         (player_id,)).fetchall()
-    mid_by_year = {r["year"]: r["from_team_id"] for r in mid_rows}
+    mid_by_year = {r["year"]: (r["from_team_id"], r["player_position"]) for r in mid_rows}
     if mid_by_year:
         final_out = []
         for e in out:
             final_out.append(e)
-            from_tid = mid_by_year.get(e["year"])
+            from_tid, half_pos = mid_by_year.get(e["year"], (None, None))
             if from_tid:
-                final_out.append(_half_season_league_entry(conn, from_tid, e["year"]))
+                final_out.append(_half_season_league_entry(conn, from_tid, e["year"],
+                                                             half_position=half_pos))
         out = final_out
     conn.close()
 
     return {"awards": awards, "years": out}
 
 
-def _half_season_league_entry(conn, team_id, year):
+def _half_season_league_entry(conn, team_id, year, half_position=None):
     """[2026-08 신설, 상반기/하반기 이적 기록 분리 기능] league_season_
     standings_half(하반기 시작 순간에 떠둔 상반기까지의 순위 스냅샷)에서
     이 팀의 그 해 상반기 성적 한 줄을 만든다. get_team_history의 연도별
@@ -1043,7 +1101,8 @@ def _half_season_league_entry(conn, team_id, year):
              # 최종/하반기 소속팀)를 쓰지 말고 여기 적힌 원래(상반기) 팀
              # 이름을 그대로 쓰라"는 신호로 읽는다 — 같은 연도의 두 줄이
              # 서로 다른 팀 소속임을 정확히 구분해서 보여주기 위함.
-             "_is_half": True, "_half_team_name": trow["name"] if trow else "?"}
+             "_is_half": True, "_half_team_name": trow["name"] if trow else "?",
+             "_half_position": half_position or None}
     row = conn.execute(
         "SELECT league_id, wins, draws, losses, goals_for, goals_against "
         "FROM league_season_standings_half WHERE team_id=? AND year=?",
@@ -1082,6 +1141,139 @@ def get_ai_player_ovr_checkpoints(player_id):
         "ORDER BY year ASC", (player_id,)).fetchall()
     conn.close()
     return {r["year"]: r["ovr"] for r in rows}
+
+
+def get_my_player_ovr_checkpoints():
+    """get_ai_player_ovr_checkpoints의 my_player 버전 — my_player_ovr_history
+    (game_engine._end_of_season이 매 시즌전환마다 기록, 세이브 첫 해는
+    database.seed_my_player_initial_ovr가 채움)에서 그대로 읽는다.
+    반환: {year: ovr}."""
+    conn = get_conn()
+    rows = conn.execute("SELECT year, ovr FROM my_player_ovr_history ORDER BY year ASC").fetchall()
+    conn.close()
+    return {r["year"]: r["ovr"] for r in rows}
+
+
+def get_my_player_career_history():
+    """[2026-08 신설, 신민용 리포트: "선수 검색에서 나를 보면 1992년에도
+    울산으로 뜨는데 실제 커리어는 광주였다"] get_ai_player_career_history는
+    내부적으로 get_ai_player_team_timeline(ai_transfer_log 기반)을 쓰는데,
+    ai_transfer_log는 "AI끼리의" 이적만 기록하는 로그라 my_player의 이적은
+    거기 전혀 안 남는다 — 그 결과 my_player로 이 파이프라인을 태우면
+    "현재 소속팀 하나로 전체 기간을 채운" 완전히 틀린 타임라인이 나왔다
+    (모든 과거 연도가 지금 소속팀으로 표시됨).
+
+    career_entries(내가 실제로 재직했던 기간의 원본 — 게임 내 "커리어"
+    화면이 이미 정확히 보여주는 바로 그 데이터, start_year/start_week~
+    end_year/end_week·팀·리그·그 재직기간 승무패까지 전부 있음)를 직접
+    사용해 연도별로 재구성한다. 같은 해에 상/하반기 이적이 있으면(그 해를
+    나눠 걸치는 재직 기록이 2개 이상) get_ai_player_career_history가
+    AI에 대해 하는 것과 동일한 모양으로 — "하반기"(그 해를 마무리한 팀)
+    전체 기록 한 줄 + 그 아래 "상반기"(먼저 있던 팀)의 그 재직 기간 동안
+    실제로 쌓인 승무패 요약 한 줄을 추가한다. AI 쪽은 이 상반기 요약을
+    league_season_standings_half(반기 스냅샷 테이블)에서 가져오지만,
+    my_player는 career_entries 자신의 wins/draws/losses가 이미 정확히
+    "그 재직 기간 동안" 값이라 별도 스냅샷 조회 없이 그대로 쓸 수 있다.
+    한 번도 팀이 없었던 해(무소속 공백 연도)는 어떤 재직 기록도 그 해를
+    걸치지 않으므로 자연히 행 자체가 안 생긴다.
+
+    반환 형식은 get_ai_player_career_history와 완전히 동일 — {"awards":
+    {...}, "years": [...]} — _populate_player_team_box가 그대로 쓸 수
+    있다. 각 non-half entry에는 그 해의 실제 소속팀 이름을 _main_team_name
+    으로 같이 담아, 호출부가 get_ai_player_team_timeline을 다시 거치지
+    않고도(내가 여기서 이미 정확히 알고 있으므로) 바로 쓸 수 있게 한다."""
+    conn = get_conn()
+    stints = [dict(r) for r in conn.execute(
+        "SELECT team_id, team_name, league_name, tier, position, start_year, start_week, "
+        "end_year, end_week, wins, draws, losses "
+        "FROM career_entries ORDER BY start_year ASC, start_week ASC, id ASC").fetchall()]
+    conn.close()
+
+    _empty_awards = {"league": 0, "cup": 0, "cl": 0, "cwc": 0,
+                      "cl_champions": 0, "el_champions": 0, "ecl_champions": 0, "sc_champions": 0}
+    if not stints:
+        return {"awards": dict(_empty_awards), "years": []}
+
+    cur_year = get_current_game_year()
+    for st in stints:
+        if not st["end_year"]:
+            # 0 = 아직도 재직 중인(닫히지 않은) 기록 — 지금(현재 게임
+            # 연도)까지 걸치는 것으로 취급.
+            st["end_year"] = cur_year or st["start_year"]
+
+    by_year = {}
+    for st in stints:
+        # [2026-08 버그수정, 신민용 리포트: "2001년 이적하면 2002년 시즌
+        # 시작할 때 실제로 반영되는데, 이걸 2002년 극초반엔 예전 팀에
+        # 있었다고 잘못 인식해서 상/하반기 스플릿이 생긴다"] join_team()
+        # 이 실제로 실행되는 시점(reserve_join_transfer로 예약된 이적이
+        # "다음 시즌 시작 주차"에 발동)의 연도/주차를 그대로 이전 팀
+        # 재직기록의 end_year/end_week로 찍어버려서(game_engine._save_
+        # career_entry), 실제로는 그 해에 단 1경기도 안 뛰었는데 그 해도
+        # "재직했다"고 겹쳐 잡히는 경계 아티팩트가 있다 — 그 결과 진짜
+        # 이적(그 해 안에서 실제로 절반씩 뛴 경우)과 구분이 안 돼서
+        # 스크린샷처럼 "0승 0무 0패"짜리 유령 반기 행이 끼어들었다.
+        # 이 스틴트의 마지막 해(end_year)가 시작 해(start_year)와
+        # 다르면서(=진짜 여러 해를 걸친 재직) 그 해에 실제 기록(승+무+
+        # 패)이 하나도 없으면, 그 해는 이 재직 기록이 실제로 걸친 해로
+        # 치지 않는다(마지막 해만 잘라내고 나머지는 그대로 유지).
+        _end_y = st["end_year"]
+        if (_end_y != st["start_year"]
+                and not ((st.get("wins") or 0) + (st.get("draws") or 0) + (st.get("losses") or 0))):
+            _end_y -= 1
+        for y in range(st["start_year"], _end_y + 1):
+            by_year.setdefault(y, []).append(st)
+
+    _hist_cache = {}
+    def _hist_for(tid_):
+        if tid_ not in _hist_cache:
+            _hist_cache[tid_] = get_team_history(tid_) if tid_ else {"awards": {}, "years": []}
+        return _hist_cache[tid_]
+
+    import re as _re
+    _rank1_re = _re.compile(r"\[1등(?:/\d+팀)?\]")
+    awards = dict(_empty_awards)
+    out = []
+    for y in sorted(by_year.keys(), reverse=True):
+        sts = sorted(by_year[y], key=lambda s: (s["start_year"], s["start_week"] or 0))
+        main_st = sts[-1]   # 그 해를 마무리한(=하반기) 재직 기록이 "그 해 대표" 기록
+        team_hist = _hist_for(main_st["team_id"])
+        src = next((e for e in team_hist["years"] if e["year"] == y), None)
+        entry = dict(src) if src else {"year": y, "league": None, "cup": None,
+                                        "cl": None, "cwc": None, "sc": None, "cl_kind": None}
+        entry["_main_team_name"] = main_st["team_name"]
+        # [2026-08 신설, 신민용 요청: "소속팀일 때 포지션이 뭐였는지도"]
+        # my_player는 career_entries에 재직 스틴트마다 포지션이 그대로
+        # 있으니(추정 불필요), 그 해를 마무리한(하반기) 스틴트의 값을 쓴다.
+        entry["_main_position"] = main_st.get("position") or None
+        out.append(entry)
+        if entry.get("league") and _rank1_re.search(entry["league"]):
+            awards["league"] += 1
+        if entry.get("cup") and "[우승]" in entry["cup"]:
+            awards["cup"] += 1
+        if entry.get("cl") and "[우승]" in entry["cl"]:
+            awards["cl"] += 1
+            if entry.get("cl_kind") == "champions": awards["cl_champions"] += 1
+            elif entry.get("cl_kind") == "europa": awards["el_champions"] += 1
+            elif entry.get("cl_kind") == "conference": awards["ecl_champions"] += 1
+        if entry.get("cwc") and "[우승]" in entry["cwc"]:
+            awards["cwc"] += 1
+        if entry.get("sc") and "[우승]" in entry["sc"]:
+            awards["sc_champions"] += 1
+
+        for prev_st in reversed(sts[:-1]):
+            w = prev_st.get("wins") or 0
+            d = prev_st.get("draws") or 0
+            l = prev_st.get("losses") or 0
+            lg_name = prev_st.get("league_name") or ""
+            tier = prev_st.get("tier")
+            record = f"{w}승 {d}무 {l}패"
+            lg_text = f"{lg_name}({tier}부) 상반기 {record}" if (lg_name and tier) else f"상반기 {record}"
+            out.append({"year": y, "league": lg_text, "cup": None, "cl": None,
+                        "cwc": None, "sc": None, "cl_kind": None,
+                        "_is_half": True, "_half_team_name": prev_st["team_name"],
+                        "_half_position": prev_st.get("position") or None})
+    return {"awards": awards, "years": out}
 
 
 def list_continents():

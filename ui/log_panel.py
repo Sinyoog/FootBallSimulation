@@ -107,7 +107,7 @@ def _is_match_core_line(stripped: str) -> bool:
 
 
 def _passes_filter(text: str, log_type: str, mode: str) -> bool:
-    """mode: "all"(전체) | "core"(핵심) | "match"(경기).
+    """mode: "all"(전체) | "core"(핵심) | "match"(경기) | "news"(뉴스).
 
     log_type은 add_log() 호출부가 이미 붙여서 game_log 테이블에 저장해온
     값(event/injury/match/normal/salary/sep/slump/training)을 그대로
@@ -119,11 +119,23 @@ def _passes_filter(text: str, log_type: str, mode: str) -> bool:
     이 목록에 없는 log_type이 새로 생겨도 기본적으로 숨겨진다."""
     if mode == "all":
         return True
+    if mode == "news":
+        return log_type == "news"
     if log_type == "training":
         return mode == "core"
     if log_type == "match":
         return _is_match_core_line(text.strip())
     return False
+
+
+def _colorize_news(year, text: str) -> str:
+    """[2026-08 신설, "뉴스" 필터 전용] 다른 탭과 달리 연도 경계에서
+    화면이 안 비워지고 여러 해가 한 화면에 계속 쌓이므로, 각 줄이 몇
+    년도 소식인지 앞에 회색으로 붙여준다. _colorize()가 쓰는 정규식
+    중 일부(^⚽ 경기, ^─+$)는 줄 맨 앞을 기준으로 매칭하므로, 연도
+    표시는 _colorize()가 처리한 결과 바깥에 별도로 붙여서 그 매칭에
+    전혀 영향을 안 준다."""
+    return f'<span style="color:#666;">[{year}년]</span> ' + _colorize(text)
 
 
 # 필터 버튼 3종의 공통 스타일 — "로그" 라벨 옆 작은 토글 버튼.
@@ -161,7 +173,14 @@ class LogPanel(QWidget):
         # 걸러서 그리기 위함. 매년 초기화되므로(연도 경계에서 리셋)
         # "20년 쌓인 로그" 성능 문제와는 무관하게 항상 최대 1년치만 쌓인다.
         self._year_entries = []  # [(text, log_type), ...]
-        self._filter_mode = "all"  # "all" | "core" | "match"
+        self._filter_mode = "all"  # "all" | "core" | "match" | "news"
+        # [2026-08 신설, 신민용 요청: "이적 뉴스가 뜨자마자 지워진다 —
+        # 뉴스 탭은 연도별로 계속 쌓이고 1년 단위로 안 잘렸으면"] 다른
+        # 탭(all/core/match)은 self._year_entries가 매년 통째로 갈아
+        # 끼워지지만(위 refresh() 참고), 뉴스는 게임 세션 내내 전부
+        # 누적한다 — [(year, text), ...]. log_type="news"인 줄만 담는다
+        # (ai_lifecycle.py의 주요 이적/영입·방출/이적시장 마감 로그).
+        self._news_entries = []  # [(year, text), ...]
 
         lay = QVBoxLayout(self); lay.setContentsMargins(8,8,8,8); lay.setSpacing(4)
 
@@ -175,7 +194,7 @@ class LogPanel(QWidget):
         header_row.addWidget(t)
         header_row.addStretch(1)
         self._mode_buttons = {}
-        for mode_key, mode_label in (("all", "전체"), ("core", "핵심"), ("match", "경기")):
+        for mode_key, mode_label in (("all", "전체"), ("core", "핵심"), ("match", "경기"), ("news", "뉴스")):
             btn = QPushButton(mode_label)
             btn.setCheckable(True)
             btn.setAutoExclusive(True)
@@ -234,9 +253,17 @@ class LogPanel(QWidget):
 
     def _render_full(self):
         """self._year_entries 전체를 현재 필터 모드로 걸러 setHtml로
-        다시 그린다 — 연도 경계(새해)나 필터 모드 변경 시 사용."""
-        html_lines = [_colorize(text) for text, log_type in self._year_entries
-                      if _passes_filter(text, log_type, self._filter_mode)]
+        다시 그린다 — 연도 경계(새해)나 필터 모드 변경 시 사용.
+
+        [2026-08 신설] "뉴스" 모드는 self._year_entries(매년 갈아 끼워짐)
+        대신 self._news_entries(세션 내내 누적, 연도 포함)를 쓰고, 각
+        줄 앞에 연도를 붙인다(_colorize_news) — 그 외 모드는 기존과
+        동일."""
+        if self._filter_mode == "news":
+            html_lines = [_colorize_news(year, text) for year, text in self._news_entries]
+        else:
+            html_lines = [_colorize(text) for text, log_type in self._year_entries
+                          if _passes_filter(text, log_type, self._filter_mode)]
         chunk_html = "<br>".join(html_lines)
         self.te.setHtml(f'<div style="font-family:\'Malgun Gothic\',monospace;'
                         f'font-size:12px;">{chunk_html}</div>')
@@ -288,6 +315,16 @@ class LogPanel(QWidget):
         if not entries:
             return
 
+        # [2026-08 신설] "뉴스"(log_type="news")는 연도 슬라이싱(아래
+        # visible_entries) 전에, 이번에 새로 받아온 entries 전체에서
+        # 뽑아 self._news_entries에 누적한다 — 슬라이싱 이후 값을 쓰면
+        # "지난 연도 마지막 주(52주)에 찍힌 뉴스가, 같은 배치 안에서
+        # 새해로 넘어가는 순간 그 지난 연도 몫과 함께 통째로 버려지는"
+        # 문제가 그대로 재현된다(이게 바로 "뉴스가 뜨자마자 지워진다"던
+        # 원인) — 뉴스만은 연도 경계와 무관하게 항상 전부 챙긴다.
+        self._news_entries.extend(
+            (year, text) for text, year, log_type in entries if log_type == "news")
+
         # 이 배치 안에서 마지막으로 연도가 바뀌는 지점을 찾는다.
         start_idx = 0
         year_changed = False
@@ -314,8 +351,13 @@ class LogPanel(QWidget):
         # 증분 갱신: 이번에 새로 들어온 줄 중 현재 필터를 통과한 것만
         # append(기존 내용은 다시 그리지 않는다 — 위 refresh() docstring의
         # "다음 날" 성능 원칙 유지).
-        html_lines = [_colorize(text) for text, _year, log_type in visible_entries
-                      if _passes_filter(text, log_type, self._filter_mode)]
+        # [2026-08 신설] "뉴스" 모드는 연도 표시가 붙은 별도 포맷을 쓴다.
+        if self._filter_mode == "news":
+            html_lines = [_colorize_news(year, text) for text, year, log_type in visible_entries
+                          if log_type == "news"]
+        else:
+            html_lines = [_colorize(text) for text, _year, log_type in visible_entries
+                          if _passes_filter(text, log_type, self._filter_mode)]
         if html_lines:
             chunk_html = "<br>".join(html_lines)
             # QTextBrowser.append()은 기존 내용을 다시 파싱/렌더링하지 않고

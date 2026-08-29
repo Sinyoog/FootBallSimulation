@@ -1272,6 +1272,7 @@ class FormationWidget(QWidget):
         self._filter_team_id = None
         self._filter_manager_rel = 50
         self._filter_context = None
+        self._filter_year = None
 
         # ── 1행: 대회명 구분선 (에이전트/은퇴 버튼과 캔버스 사이)
         self.lbl_ctx = QLabel()
@@ -1343,7 +1344,8 @@ class FormationWidget(QWidget):
         hint_bar.addWidget(lh); hint_bar.addStretch(); hint_bar.addWidget(rh)
         lay.addLayout(hint_bar)
 
-    def load_team(self, team_id, context: dict = None, options: list = None, manager_rel: int = 50):
+    def load_team(self, team_id, context: dict = None, options: list = None, manager_rel: int = 50,
+                  year=None):
         """options: [(label, context_dict_or_None), ...] — center_panel.py가
         "이번 주 내가 걸쳐 있는 모든 대회"를 순서대로 넘겨준다(예: 리그+챔스가
         겹치는 주엔 [("리그", None), ("챔피언스", {...})]). 2개 이상이면
@@ -1352,8 +1354,9 @@ class FormationWidget(QWidget):
         self._filter_team_id = team_id
         self._filter_manager_rel = manager_rel
         self._filter_context = context
+        self._filter_year = year
         self._build_filter_row(options or [], context)
-        self._apply_context(team_id, context, manager_rel)
+        self._apply_context(team_id, context, manager_rel, year)
 
     def refresh_now(self):
         """[2026-08 신설, 신민용 요청: "이름 변경했는데 실시간으로 반영이
@@ -1366,7 +1369,8 @@ class FormationWidget(QWidget):
         _apply_context를 즉시 재호출해서(캐시는 호출부가 이미 무효화해둔
         상태이므로 자동으로 DB에서 새로 읽는다) 화면에 바로 반영한다."""
         if self._filter_team_id is not None:
-            self._apply_context(self._filter_team_id, self._filter_context, self._filter_manager_rel)
+            self._apply_context(self._filter_team_id, self._filter_context,
+                                self._filter_manager_rel, self._filter_year)
 
     def _build_filter_row(self, options: list, active_context: dict):
         # 기존 버튼 정리
@@ -1400,9 +1404,9 @@ class FormationWidget(QWidget):
     def _on_filter_clicked(self, context):
         for btn, ctx in self._filter_btns:
             btn.setChecked(ctx is context or repr(ctx) == repr(context))
-        self._apply_context(self._filter_team_id, context, self._filter_manager_rel)
+        self._apply_context(self._filter_team_id, context, self._filter_manager_rel, self._filter_year)
 
-    def _apply_context(self, team_id, context: dict = None, manager_rel: int = 50):
+    def _apply_context(self, team_id, context: dict = None, manager_rel: int = 50, year=None):
         is_intl = bool(context and context.get("intl"))
         my_nat  = context.get("my_nat", "") if is_intl else ""
 
@@ -1481,6 +1485,23 @@ class FormationWidget(QWidget):
         # ── 상대팀 목록 (캐시)
         # [버그수정] 캐시 키에 league_id 포함: 승강 후 같은 team_id라도
         #   리그가 바뀌면 상대팀 목록을 새로 조회한다.
+        # [2026-08 버그수정, 신민용 리포트: "52→1주 승강전이 반영 안 되고
+        # 나갔다 들어와야 한다 — 인천이 강등됐는데 상대팀 목록에 그대로
+        # 남아있고 주전 6명/후보 17명처럼 깨져 보인다"] 위 league_id
+        # 캐시키는 "내 팀"의 리그가 바뀔 때만 걸린다 — 상대팀 목록에 있는
+        # '다른' 팀(예: 인천)이 승강했을 땐 내 team_id/league_id는 그대로
+        # 라 캐시가 전혀 안 깨졌다. 그 결과 _opp_teams가 승강 이전 스냅샷
+        # 그대로 남고, 그 안의 선수 명단(players)도 예전 것이라 새로
+        # 강등된 팀의 실제(라이브) 스쿼드와 어긋나 슬롯 배정이 깨졌다
+        # (starter 산정에 쓰는 raw_players는 이 스냅샷, 명단 패널은
+        # _full_squad_for_team으로 매번 라이브 조회라 서로 안 맞음).
+        # year를 캐시키에 추가하면, 52→1주 전환(연도가 바뀌는) 시점의
+        # 첫 refresh에서 무조건 캐시가 깨져 상대팀 목록 전체를 다시
+        # 조회한다 — 매주 바뀌는 값이 아니라 딱 그 전환 시점 한 번만
+        # 걸리므로 불필요한 재조회도 없다. _fill_combo()가 재조회 후
+        # setCurrentIndex(0)으로 항상 첫 팀을 선택하므로, 강등된 팀이
+        # 선택돼 있었다면 자동으로 새 목록의 맨 위 팀으로 바뀐다(요청한
+        # 동작 그대로 — 별도 코드 불필요).
         _cur_league_id = 0
         if not (context and (context.get("intl") or context.get("cl") or context.get("cwc"))):
             try:
@@ -1490,7 +1511,7 @@ class FormationWidget(QWidget):
                 _cur_league_id = _lr["league_id"] if _lr else 0
             except Exception:
                 _cur_league_id = 0
-        ctx_key = (team_id, repr(context), _cur_league_id)
+        ctx_key = (team_id, repr(context), _cur_league_id, year)
         if ctx_key != self._last_ctx:
             self._last_ctx = ctx_key
             self._opp_teams = self._resolve_opponents(team_id, context)
@@ -1798,6 +1819,27 @@ class PlayerStatPopup(QDialog):
         if nat:
             info_rows.append(("국적", nat))
 
+        # [2026-08 신설, 신민용 요청: "포메이션에서 선수 클릭했을 때도
+        # 세계 축구 기록실 선수 검색처럼 이름을 눌러서 바로 지어줄 수
+        # 있게, 바뀐 이름이 포메이션·선수 검색에 실시간으로 반영되게"]
+        # world_browser_window.py의 "이름" 헤더(파란색, 클릭→이름변경)와
+        # 같은 대상 판정을 쓴다 — 실제 ai_players 레코드(id 있음)이고
+        # 본인(is_me)이 아닌 경우에만 이름 변경 가능. 국제대회 가상
+        # 상대(id 없는 폴백 선수)나 나 자신은 기존처럼 초록색 그대로.
+        self._pl = pl
+        # [2026-08 신설] 본인(is_me)은 물론, 실제 ai_players 레코드가
+        # 없는 가상/폴백 선수(_make_intl_virtual_players 등이 부여하는
+        # 음수 id — constants.ai_player_code가 pid<0을 이미 "가상
+        # 선수"로 취급하는 것과 동일한 판정)도 이름 변경 대상에서
+        # 제외한다. 그런 id로 set_ai_player_custom_name을 부르면 DB에
+        # 존재하지 않는 선수에게 이름을 지어주는 꼴이 된다.
+        _rename_pid = pl.get("id")
+        if pl.get("is_me") or _rename_pid is None or _rename_pid < 0:
+            _rename_pid = None
+        self._rename_pid = _rename_pid
+        self._name_row_idx = None
+        self._name_value_item = None
+
         info_tbl = QTableWidget(len(info_rows), 2)
         info_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         info_tbl.horizontalHeader().setVisible(False)
@@ -1807,18 +1849,33 @@ class PlayerStatPopup(QDialog):
             "QTableWidget{background:#1e1e1e;color:#ccc;gridline-color:#2a2a2a;border:none;}")
         for i, (label, value) in enumerate(info_rows):
             label_item = QTableWidgetItem(label)
-            label_item.setForeground(QColor("#888"))
-            info_tbl.setItem(i, 0, label_item)
             value_item = QTableWidgetItem(value)
-            # 이름 행만 기존 hdr(초록 굵은 글씨) 색을 그대로 유지.
             if label == "이름":
+                self._name_row_idx = i
+                self._name_value_item = value_item
                 f = value_item.font(); f.setBold(True); value_item.setFont(f)
                 value_item.setForeground(QColor("#00cc44"))
+                if _rename_pid is not None:
+                    # world_browser.py "선수 검색"에서 파란색으로 표시되는
+                    # 건 값이 아니라 "이름" 라벨 쪽이었다 — 여기서도 값
+                    # (AI75DH 등)은 기존 초록색 그대로 두고, 라벨 칸("이름"
+                    # 글자 자체)만 파란색(#4da6ff)+굵게 바꿔서 그게 클릭
+                    # 대상이라는 걸 알려준다.
+                    lf = label_item.font(); lf.setBold(True); label_item.setFont(lf)
+                    label_item.setForeground(QColor("#4da6ff"))
+                    label_item.setToolTip("클릭하면 이 선수의 이름을 직접 지을 수 있습니다")
+                else:
+                    label_item.setForeground(QColor("#888"))
             else:
+                label_item.setForeground(QColor("#888"))
                 value_item.setForeground(QColor("#ccc"))
+            info_tbl.setItem(i, 0, label_item)
             info_tbl.setItem(i, 1, value_item)
         info_tbl.horizontalHeader().setStretchLastSection(True)
         info_tbl.setFixedHeight(22 * len(info_rows) + 4)
+        if _rename_pid is not None:
+            info_tbl.setCursor(Qt.CursorShape.PointingHandCursor)
+            info_tbl.cellClicked.connect(self._on_info_cell_clicked)
         lay.addWidget(info_tbl)
 
         # [2026-07 신설, 신민용 요청] 소속팀 표시 (국제대회 화면에서 상대국
@@ -1876,3 +1933,96 @@ class PlayerStatPopup(QDialog):
                          "border-radius:4px;padding:5px;")
         ok.clicked.connect(self.close)
         lay.addWidget(ok)
+
+    def _on_info_cell_clicked(self, row, col):
+        """[2026-08 신설, 신민용 요청] "이름" 행의 라벨 칸(0번 칸, "이름"
+        글자 자체 — world_browser.py에서 파란색으로 표시되던 게 값이
+        아니라 라벨 쪽이었던 것과 동일)을 눌렀을 때만 반응한다 — 나머지
+        행(포지션/OVR/나이/국적)과 값 칸(1번)은 그대로 읽기전용. 본인·id
+        없는 가상 선수는 애초에 _rename_pid가 None이라 클릭 연결 자체를
+        안 해뒀으므로 여기까지 안 온다."""
+        if row != self._name_row_idx or col != 0:
+            return
+        self._open_rename_dialog()
+
+    def _open_rename_dialog(self):
+        """AI 선수 이름 변경 창 — world_browser.py의 "선수 검색" 상세
+        패널에 있는 _open_ai_rename_dialog와 완전히 동일한 저장 로직
+        (get_ai_player_custom_name/set_ai_player_custom_name)을 그대로
+        쓴다. 저장 후:
+          1) 이 팝업 자신의 표시를 즉시 갱신
+          2) apply_custom_name_live로 지금 열려 있는 모든 포메이션 화면
+             (내 팀/상대팀 캔버스+명단, 이 팝업을 띄운 화면 포함)에 즉시 반영
+          3) 세계 축구 기록실(선수 검색)이 지금 열려 있으면 그쪽 목록/
+             상세 패널도 즉시 반영 — world_browser.py 쪽에서 반대 방향
+             (선수 검색에서 바꾸면 포메이션에 반영)은 이미 되어 있었는데,
+             이 방향(포메이션에서 바꾸면 선수 검색에 반영)만 빠져 있었다.
+        """
+        pid = self._rename_pid
+        if pid is None:
+            return
+        from database import get_ai_player_custom_name, set_ai_player_custom_name
+        from constants import ai_player_code
+        current = get_ai_player_custom_name(pid) or ""
+        code = ai_player_code(pid)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("선수 이름 변경")
+        dlg.setStyleSheet("QDialog{background:#1e1e1e;color:#ccc;}")
+        dlg.setMinimumWidth(300)
+        v = QVBoxLayout(dlg)
+
+        info_lbl = QLabel(f"식별코드: {code}\n이 선수에게 부를 이름을 지어주세요.")
+        info_lbl.setStyleSheet("color:#888;font-size:11px;")
+        v.addWidget(info_lbl)
+
+        edit = QLineEdit(current)
+        edit.setPlaceholderText(f"비워두면 다시 \"{code}\"로 표시됩니다")
+        edit.setStyleSheet(
+            "QLineEdit{background:#161616;color:#eee;font-size:13px;"
+            "border:1px solid #333;border-radius:4px;padding:6px 8px;}"
+            "QLineEdit:focus{border:1px solid #4da6ff;}")
+        edit.selectAll()
+        v.addWidget(edit)
+
+        btn_row = QHBoxLayout()
+        save_btn = QPushButton("저장")
+        save_btn.setStyleSheet(
+            "background:#2d4a6b;color:#eee;border:1px solid #4a7ab0;"
+            "border-radius:4px;padding:6px 14px;")
+        cancel_btn = QPushButton("취소")
+        cancel_btn.setStyleSheet(
+            "background:#2a2a2a;color:#ccc;border:1px solid #444;"
+            "border-radius:4px;padding:6px 14px;")
+        btn_row.addStretch(1)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(save_btn)
+        v.addLayout(btn_row)
+
+        save_btn.clicked.connect(dlg.accept)
+        cancel_btn.clicked.connect(dlg.reject)
+        edit.returnPressed.connect(dlg.accept)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        set_ai_player_custom_name(pid, edit.text())
+        new_display = get_ai_player_custom_name(pid) or code
+
+        global _ovr_cache_invalidated
+        _ovr_cache_invalidated = True
+
+        # 1) 이 팝업 자신 갱신
+        self._pl["name"] = new_display
+        self.setWindowTitle(f"{new_display}  [{self._pl.get('position','')}]")
+        if self._name_value_item is not None:
+            self._name_value_item.setText(new_display)
+
+        # 2) 지금 열려 있는 모든 포메이션 화면(이 화면 포함)에 즉시 반영
+        apply_custom_name_live(pid, new_display)
+
+        # 3) 세계 축구 기록실(선수 검색)이 열려 있으면 그쪽도 즉시 반영
+        try:
+            from ui.world_browser_window import apply_custom_name_live_to_browser
+            apply_custom_name_live_to_browser(pid)
+        except Exception:
+            pass

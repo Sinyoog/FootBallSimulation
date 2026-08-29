@@ -304,6 +304,30 @@ class _GridRowDelegate(QStyledItemDelegate):
         return QSize(total_w, max_h + self._V_MARGIN * 2)
 
 
+def apply_custom_name_live_to_browser(player_id: int):
+    """[2026-08 신설, 신민용 요청: "포메이션에서 선수 이름을 바꾸면
+    선수 검색에도 바로 반영되게"] _open_ai_rename_dialog가 "선수
+    검색"에서 이름을 바꿨을 때 formation_widget.apply_custom_name_live로
+    열려 있는 포메이션 화면에 즉시 반영하던 것의 반대 방향 — 포메이션
+    (PlayerStatPopup)에서 이름을 바꿨을 때 지금 열려 있는 모든
+    세계 축구 기록실 창의 "선수 검색" 목록/상세 패널에 새 이름을
+    즉시 반영한다. DB(set_ai_player_custom_name)는 formation_widget
+    쪽에서 이미 저장을 끝낸 뒤 호출하므로, 여기서는 화면 갱신만 한다."""
+    from PyQt6.QtWidgets import QApplication
+    app = QApplication.instance()
+    if app is None:
+        return
+    for w in app.allWidgets():
+        if not isinstance(w, WorldBrowserWindow):
+            continue
+        try:
+            w._refresh_player_list()
+            if getattr(w, "_player_detail_pid", None) == player_id:
+                w._show_player_detail(player_id)
+        except RuntimeError:
+            pass  # 창이 이미 닫혀 C++ 객체가 삭제된 경우
+
+
 class WorldBrowserWindow(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2353,6 +2377,122 @@ class WorldBrowserWindow(QDialog):
 
         return "\n".join(lines)
 
+    # [2026-08 신설, 신민용 요청: "선수 검색에도 복사하기 버튼을 만들어서
+    # 이름/국적/나이/포지션/OVR/소속팀 같은 기본 정보와, 몇 년에 몇 살이며
+    # 어떤 팀이었고 그때 OVR가 몇이며 그때 팀 성적이 어땠는지를 연도별로
+    # 전부 복사해달라"] 팀 검색의 _on_copy_team_history_clicked와 완전히
+    # 같은 패턴 — self._player_copy_*(_show_player_detail/
+    # _populate_player_team_box/_populate_player_intl_box가 화면을 그리며
+    # 이미 채워둔 값)를 재조회 없이 그대로 재사용한다.
+    def _on_copy_player_history_clicked(self):
+        name = getattr(self, "_player_copy_name", None)
+        d = getattr(self, "_player_copy_d", None)
+        if not name or not d:
+            return
+        team_hist = getattr(self, "_player_copy_team_hist", None)
+        rows = getattr(self, "_player_copy_rows", [])
+        intl_records = getattr(self, "_player_copy_intl_records", [])
+        text = self._format_player_history_text(name, d, team_hist, rows, intl_records)
+        QGuiApplication.clipboard().setText(text)
+
+        # 눌렀을 때 복사됐다는 걸 눈으로 확인할 수 있게 버튼 라벨을
+        # 잠깐 바꿨다가 되돌린다(팀 검색 복사 버튼과 동일한 방식).
+        self.player_copy_btn.setText("✅ 복사됨")
+        QTimer.singleShot(1200, lambda: self.player_copy_btn.setText("📋 기록 복사"))
+
+    def _format_player_history_text(self, name, d, team_hist, rows, intl_records):
+        """d(get_ai_player_detail 반환값) + rows(_populate_player_team_box가
+        화면 렌더링과 동시에 쌓아둔 연도별 해석 결과: 그 해 나이·소속팀·
+        OVR·entry) + intl_records(get_player_intl_records)를 사람이 읽어도,
+        LLM에 그대로 붙여넣어도 되는 평문으로 직렬화한다. 화면과 다른
+        계산을 새로 하지 않고 이미 화면에 쓴 값만 그대로 옮긴다(어긋남
+        방지) — 팀 쪽 _format_team_history_text와 같은 원칙."""
+        lines = [f"[{name} 선수 기록]"]
+
+        # ── 기본 정보 한 줄 (player_detail_tbl 맨 위 요약 행과 동일 로직) ──
+        nat_text = f"{d.get('nat_flag') or ''} {d.get('nationality') or ''}".strip() or "국적 미상"
+        if d.get("is_retired"):
+            team_text = f"은퇴함 ({d.get('retirement_year', '-')}년 은퇴, 당시 {d.get('age', '-')}세)"
+            if d.get("last_team_name"):
+                team_text += f" — 마지막 소속: {d['last_team_name']}"
+        elif d.get("team_id"):
+            country_txt = f"{d.get('flag') or ''} {d.get('country') or ''}".strip()
+            team_text = f"{d['team_name']} ({d['league_name']} {d['tier']}부, {country_txt or '-'})"
+        else:
+            team_text = "소속팀 없음"
+        ovr_text = "-" if is_hard_mode() else str(d.get("ovr", "-"))
+        lines.append(
+            f"국적: {nat_text} | 나이: {d.get('age', '-')}세 | 포지션: {d.get('position') or '-'} | "
+            f"OVR: {ovr_text} | 소속: {team_text}")
+        lines.append("")
+
+        # ── 소속팀 기준 통산 수상 (팀 검색 쪽과 같은 포맷) ──
+        awards = (team_hist or {}).get("awards") or {}
+        award_bits = []
+        if awards.get("league"):
+            award_bits.append(f"리그 우승 {awards['league']}회")
+        if awards.get("cup"):
+            award_bits.append(f"국내컵 우승 {awards['cup']}회")
+        if awards.get("cl_champions"):
+            award_bits.append(f"챔피언스리그(급) 우승 {awards['cl_champions']}회")
+        if awards.get("el_champions"):
+            award_bits.append(f"유로파리그(급) 우승 {awards['el_champions']}회")
+        if awards.get("ecl_champions"):
+            award_bits.append(f"컨퍼런스리그(급) 우승 {awards['ecl_champions']}회")
+        if awards.get("sc_champions"):
+            award_bits.append(f"슈퍼컵 우승 {awards['sc_champions']}회")
+        if awards.get("cwc"):
+            award_bits.append(f"클럽 월드컵 우승 {awards['cwc']}회")
+        lines.append("소속팀 기준 통산 수상: " + (" · ".join(award_bits) if award_bits else "없음"))
+        lines.append("")
+
+        # ── 연도별 기록: 몇 년에 몇 살, 어느 팀, 그때 OVR, 그때 팀 성적 ──
+        lines.append("[연도별 기록]")
+        if not rows:
+            lines.append("(연도별 기록 없음)")
+        else:
+            for row in rows:
+                age_txt = f"{row['age']}세" if row.get("age") is not None else "나이 미상"
+                if row["is_retired_row"]:
+                    lines.append(f"{row['year']}년 ({age_txt}) | 소속팀 없음 (은퇴)")
+                    continue
+                entry = row["entry"] or {}
+                parts = [f"{row['year']}년 ({age_txt})", f"소속팀: {row['team_name']}"]
+                parts.append(f"포지션: {row['position']}" if row.get("position") else "포지션: -")
+                parts.append(f"OVR: {row['ovr']}" if row.get("ovr") else "OVR: -")
+                if entry.get("league"):
+                    rec = f" ({entry['league_record']})" if entry.get("league_record") else ""
+                    parts.append(f"리그: {entry['league']}{rec}")
+                if entry.get("cup"):
+                    rec = f" ({entry['cup_record']})" if entry.get("cup_record") else ""
+                    parts.append(f"국내컵: {entry['cup']}{rec}")
+                if entry.get("cl"):
+                    rec = f" ({entry['cl_record']})" if entry.get("cl_record") else ""
+                    parts.append(f"클럽대항전: {entry['cl']}{rec}")
+                if entry.get("sc"):
+                    rec = f" ({entry['sc_record']})" if entry.get("sc_record") else ""
+                    parts.append(f"슈퍼컵: {entry['sc']}{rec}")
+                if entry.get("cwc"):
+                    rec = f" ({entry['cwc_record']})" if entry.get("cwc_record") else ""
+                    parts.append(f"클럽월드컵: {entry['cwc']}{rec}")
+                lines.append(" | ".join(parts))
+        lines.append("")
+
+        # ── 국가대표 기록 ──
+        lines.append("[국가대표 기록]")
+        if not intl_records:
+            lines.append("(국가대표 출전 기록 없음)")
+        else:
+            for rec in intl_records:
+                apps = rec.get("appearances", 0)
+                total = rec.get("total_games", 0)
+                apps_text = f"{apps}/{total}" if total else str(apps)
+                lines.append(
+                    f"{rec.get('year')}년 | {rec.get('name') or '?'} ({rec.get('country') or '?'}) | "
+                    f"출전 {apps_text} | 결과: {rec.get('result') or '?'}")
+
+        return "\n".join(lines)
+
     # ─────────────────────────────────────────
     # 탭: 선수 검색 (2026-08 신설) — "파워랭킹" 탭 옆에 위치. 팀 검색 탭
     # (_build_team_tab)과 완전히 같은 UX(대륙/국가/등급/부수 필터 + 검색창
@@ -2549,14 +2689,24 @@ class WorldBrowserWindow(QDialog):
         # 은퇴를 누르면 은퇴한 선수들만... 현역을 누르면 현역만... 기본
         # 상태는 현역"] 체크 가능한 버튼 2개를 QButtonGroup으로 묶어
         # 라디오처럼 배타적으로 동작시킨다.
-        status_lbl = QLabel("상태"); status_lbl.setStyleSheet("color:#888;font-size:11px;")
-        filt.addWidget(status_lbl)
-        self.player_status_group = QButtonGroup(self)
-        self.player_status_group.setExclusive(True)
+        # [2026-08 신설, 신민용 요청: "내가 이름 바꾼 선수만 보고 싶다 —
+        # 다른 필터와 같이 켜서 그 안에서만 걸러지게(AND)"] 체크 토글 —
+        # 다른 라디오 버튼(현역/은퇴)과 달리 배타적이지 않은 독립 On/Off.
         _STATUS_BTN_STYLE = (
             "QPushButton{background:#2a2a2a;color:#888;border:1px solid #3a3a3a;"
             "border-radius:4px;padding:4px 10px;font-size:11px;}"
             "QPushButton:checked{background:#0d3d1a;color:#00cc44;border-color:#00cc44;}")
+        self.player_custom_named_btn = QPushButton("✏ 이름 변경만")
+        self.player_custom_named_btn.setCheckable(True)
+        self.player_custom_named_btn.setAutoDefault(False)
+        self.player_custom_named_btn.setStyleSheet(_STATUS_BTN_STYLE)
+        self.player_custom_named_btn.toggled.connect(_debounced_refresh)
+        filt.addWidget(self.player_custom_named_btn)
+
+        status_lbl = QLabel("상태"); status_lbl.setStyleSheet("color:#888;font-size:11px;")
+        filt.addWidget(status_lbl)
+        self.player_status_group = QButtonGroup(self)
+        self.player_status_group.setExclusive(True)
         self.player_status_active_btn = QPushButton("현역")
         self.player_status_active_btn.setCheckable(True)
         self.player_status_active_btn.setChecked(True)
@@ -2629,6 +2779,17 @@ class WorldBrowserWindow(QDialog):
         filt2.addWidget(age_sep)
         filt2.addWidget(self.player_age_max_spin)
 
+        # [2026-08 신설, 신민용 요청: "이름 검색이 팀/국적 등과 겹쳐서
+        # 충돌나는게 불편, 앞에 필터를 달아서 전체/이름으로 나눠달라 —
+        # 필터 초기화하면 이름이 기본값"] "이름"이면 이 선수 자신의
+        # 식별용 필드(내가 지어준 이름 + 코드)만 매칭하고, "전체"면
+        # 기존처럼 팀명/국적/리그명/국가명까지 다 같이 매칭한다.
+        self.player_name_mode_combo = QComboBox()
+        self.player_name_mode_combo.addItems([_ALL, "이름"])
+        self.player_name_mode_combo.setCurrentIndex(1)
+        self.player_name_mode_combo.currentIndexChanged.connect(_debounced_refresh)
+        filt2.addWidget(self.player_name_mode_combo)
+
         self.player_search_box = QLineEdit()
         self.player_search_box.setPlaceholderText("🔎 식별코드(AI0001) · 국적 · 팀명 검색")
         self.player_search_box.textChanged.connect(_debounced_refresh)
@@ -2679,6 +2840,26 @@ class WorldBrowserWindow(QDialog):
             self._on_player_selected,
             refresh_fn=self._refresh_player_list, debounce_timer=self._player_filter_debounce)
         right_lay.addWidget(self._player_recent_row)
+
+        # [2026-08 신설, 신민용 요청: "선수 검색에도 팀 검색처럼 복사하기
+        # 버튼을 만들어서 이름/국적/나이/포지션/OVR/소속팀 같은 기본 정보와
+        # 연도별(몇 살에 어느 팀, 그때 OVR, 그때 팀 성적) 기록을 전부
+        # GPT/제미나이가 알아들을 수 있는 텍스트로 뽑아달라"] 팀 검색 탭의
+        # team_copy_btn/_on_copy_team_history_clicked/_format_team_history_text와
+        # 완전히 같은 패턴 — 대상만 선수로 바뀐다. 표는 화면 보기용이고,
+        # 이 버튼은 _show_player_detail·_populate_player_team_box·
+        # _populate_player_intl_box가 각자 채워두는 self._player_copy_*
+        # 값들을 재조회 없이 그대로 재사용해 클립보드에 복사한다.
+        player_title_row = QHBoxLayout()
+        self.player_copy_btn = QPushButton("📋 기록 복사")
+        self.player_copy_btn.setEnabled(False)
+        self.player_copy_btn.setToolTip(
+            "이 선수의 기본 정보와 연도별(나이·소속팀·그때 OVR·그때 팀 성적) 기록을 "
+            "텍스트로 복사합니다(GPT/제미나이 등에 붙여넣기용)")
+        self.player_copy_btn.clicked.connect(self._on_copy_player_history_clicked)
+        player_title_row.addStretch(1)
+        player_title_row.addWidget(self.player_copy_btn)
+        right_lay.addLayout(player_title_row)
 
         # [2026-08 재수정, 신민용 요청: "왜 아직도 태그형으로 표시하는거?
         # 아래 연도별 기록처럼 그리드/테이블 형태로, 챔스 표시가 그렇게
@@ -2764,31 +2945,46 @@ class WorldBrowserWindow(QDialog):
         team_box_title = QLabel("🏟 소속팀 대회 기록")
         team_box_title.setStyleSheet("color:#eee;font-size:13px;font-weight:bold;")
         scroll_lay.addWidget(team_box_title)
-        self.player_team_award_tbl = self._make_self_sizing_table(8, no_scroll=True)
+        # [2026-08 확장, 신민용 요청: "소속팀일 때 포지션이 뭐였는지도
+        # 적어야 한다 — 팀마다 포지션이 다르다, 위(상단 요약행)의 주포와
+        # 다르게 여기 아래는 그때그때의 세부 포지션. OVR이랑 소속팀 사이에
+        # 넣어달라"] 컬럼을 8→9개로 늘리고 "소속팀"과 "OVR" 사이에 "포지션"
+        # 을 끼워 넣는다(연도,소속팀,포지션,OVR,리그,국내컵,클럽대항전,
+        # 슈퍼컵,클럽월드컵). 수상 요약 상자(player_team_award_tbl)는 항상
+        # 이 표와 같은 컬럼 수·폭이어야 어긋나지 않으므로(팀 검색 탭과 동일
+        # 원칙) 같이 늘린다.
+        self.player_team_award_tbl = self._make_self_sizing_table(9, no_scroll=True)
         self.player_team_award_tbl.horizontalHeader().setVisible(False)
         # [2026-08 버그수정, 신민용 리포트: "수상 상자가 소속팀/OVR 표시를
         # 인식 못 해서 아래 표와 폭이 안 맞고 잘려 보인다"] 아래
-        # player_team_tbl은 2번 컬럼(OVR)만 별도로 Fixed 폭(_OVR_COL_W)을
+        # player_team_tbl은 포지션·OVR 두 컬럼만 별도로 Fixed 폭을
         # 주는데(바로 아래), 이 award_tbl은 _make_self_sizing_table 기본값
-        # 그대로(1~7번 전부 Stretch)라 2번 칸이 아래 표보다 넓게 계산돼
+        # 그대로(나머지 전부 Stretch)라 그 두 칸이 아래 표보다 넓게 계산돼
         # 버렸다 — 그 차이만큼 나머지 Stretch 칸들(소속팀·리그·국내컵 등)
         # 폭이 밀려 두 표 경계선이 어긋나 보였던 것. team_detail_tbl/
         # team_award_tbl 쌍과 동일한 원칙(두 표는 항상 같은 리사이즈 모드를
-        # 써야 어긋나지 않는다)에 따라 이 표에도 똑같이 2번 컬럼을
-        # Fixed+동일폭으로 맞춘다.
+        # 써야 어긋나지 않는다)에 따라 이 표에도 똑같이 맞춘다.
         self.player_team_award_tbl.horizontalHeader().setSectionResizeMode(
             2, QHeaderView.ResizeMode.Fixed)
-        self.player_team_award_tbl.setColumnWidth(2, self._OVR_COL_W)
+        self.player_team_award_tbl.setColumnWidth(2, self._POS_COL_W)
+        self.player_team_award_tbl.horizontalHeader().setSectionResizeMode(
+            3, QHeaderView.ResizeMode.Fixed)
+        self.player_team_award_tbl.setColumnWidth(3, self._OVR_COL_W)
         scroll_lay.addWidget(self.player_team_award_tbl)
-        self.player_team_tbl = self._make_self_sizing_table(8, no_scroll=True)
+        self.player_team_tbl = self._make_self_sizing_table(9, no_scroll=True)
         self.player_team_tbl.setHorizontalHeaderLabels(
-            ["연도", "소속팀", "OVR", "리그", "국내컵", "클럽 대항전", "슈퍼컵", "클럽 월드컵"])
+            ["연도", "소속팀", "포지션", "OVR", "리그", "국내컵", "클럽 대항전", "슈퍼컵", "클럽 월드컵"])
         # [2026-08 신설, 신민용 요청: "소속팀과 리그 사이에 어차피 최대
         # 100의 자리니 작은 상자칸 하나 넣고 OVR 표시"] 다른 칸은 폭을
         # 늘려 채우는(Stretch) 칸인데 이 칸만 숫자 3자리면 충분해서 고정폭.
+        # [2026-08 확장] 포지션 칸도 "CM"/"ST" 같은 짧은 텍스트라 같은
+        # 이유로 고정폭(선수 목록 포지션 칸과 같은 폭 재사용).
         self.player_team_tbl.horizontalHeader().setSectionResizeMode(
             2, QHeaderView.ResizeMode.Fixed)
-        self.player_team_tbl.setColumnWidth(2, self._OVR_COL_W)
+        self.player_team_tbl.setColumnWidth(2, self._POS_COL_W)
+        self.player_team_tbl.horizontalHeader().setSectionResizeMode(
+            3, QHeaderView.ResizeMode.Fixed)
+        self.player_team_tbl.setColumnWidth(3, self._OVR_COL_W)
         # [2026-08 버그수정] 창 크기 변화 등으로 Stretch 폭이 다시 계산될
         # 때 두 표가 계속 같은 값으로 맞춰지도록, team_detail_tbl/
         # team_award_tbl 쌍과 동일하게 sectionResized를 따라가게 연결
@@ -2967,6 +3163,15 @@ class WorldBrowserWindow(QDialog):
         self.player_search_box.blockSignals(True)
         self.player_search_box.clear()
         self.player_search_box.blockSignals(False)
+        # [2026-08 신설] 이름 검색 필터도 기본값("이름")으로 되돌린다 —
+        # "전체"가 아니라 "이름"이 기본이라는 점에 주의(요청 확정 사항).
+        self.player_name_mode_combo.blockSignals(True)
+        self.player_name_mode_combo.setCurrentIndex(1)
+        self.player_name_mode_combo.blockSignals(False)
+        # [2026-08 신설] "이름 변경만" 토글도 꺼짐으로 되돌린다.
+        self.player_custom_named_btn.blockSignals(True)
+        self.player_custom_named_btn.setChecked(False)
+        self.player_custom_named_btn.blockSignals(False)
         self.player_status_active_btn.blockSignals(True)
         self.player_status_retired_btn.blockSignals(True)
         self.player_status_active_btn.setChecked(True)
@@ -3135,6 +3340,8 @@ class WorldBrowserWindow(QDialog):
         max_age_v = self.player_age_max_spin.value()
         max_age = max_age_v if max_age_v < 99 else None
         q = self.player_search_box.text().strip() or None
+        name_mode = "code" if self.player_name_mode_combo.currentText() == "이름" else "all"
+        custom_named_only = self.player_custom_named_btn.isChecked()
         status = "retired" if self.player_status_retired_btn.isChecked() else "active"
         # [2026-08 신설] 국가대표 유무 필터 — 버튼이 꺼져 있으면 natteam=False
         # (필터 없음, 전부 보임). 켜져 있으면 natteam=True + 연도칸이
@@ -3162,7 +3369,8 @@ class WorldBrowserWindow(QDialog):
                                         status=status, limit=300,
                                         natteam=natteam, natteam_year=natteam_year,
                                         team_id=team_id, team_mode=team_mode,
-                                        league_id=league_id)
+                                        league_id=league_id, name_mode=name_mode,
+                                        custom_named_only=custom_named_only)
 
         self.player_list.clear()
         for pl in players:
@@ -3240,6 +3448,9 @@ class WorldBrowserWindow(QDialog):
             self.player_team_award_tbl.setRowCount(0)
             self.player_intl_tbl.setRowCount(0)
             self._player_detail_pid = None
+            self.player_copy_btn.setEnabled(False)
+            self._player_copy_name = None
+            self._player_copy_d = None
             return
         # [2026-08 신설, 신민용 요청: "이름 헤더 클릭하면 이름 변경"]
         # 헤더 클릭 핸들러가 "지금 화면에 뜬 선수가 누구인지" 알아야
@@ -3252,6 +3463,13 @@ class WorldBrowserWindow(QDialog):
         # 이름을, 없으면 기존처럼 ai_player_code(id)를 표시한다.
         code = d["name"] if player_id == wb.MY_PLAYER_ID else (d.get("custom_name") or ai_player_code(player_id))
         self._fill_player_detail_row(code, d)
+        # [2026-08 신설] 복사 버튼이 재조회 없이 쓸 수 있도록 기본 정보를
+        # 인스턴스에 저장해둔다 — 연도별 기록/국가대표 기록은 아래에서
+        # 각각 _populate_player_team_box/_populate_player_intl_box가 채운다.
+        self._player_copy_name = code
+        self._player_copy_d = d
+        self._player_copy_team_hist = None
+        self._player_copy_rows = []
 
         # [2026-08 수정, 신민용 요청: "은퇴해도 이전 커리어는 남아야 한다"]
         # get_ai_player_detail이 이제 은퇴 선수도 team_id를 "마지막
@@ -3264,7 +3482,8 @@ class WorldBrowserWindow(QDialog):
             self._populate_player_team_box(player_id, d["team_id"], d["team_name"],
                                             retirement_year=d.get("retirement_year"),
                                             current_age=d.get("age"),
-                                            final_ovr=d.get("ovr") if d.get("is_retired") else None)
+                                            final_ovr=d.get("ovr") if d.get("is_retired") else None,
+                                            current_position=d.get("position"))
         else:
             self.player_team_tbl.clearSpans()
             self.player_team_award_tbl.clearContents()
@@ -3289,6 +3508,10 @@ class WorldBrowserWindow(QDialog):
         # [2026-08 신설] 국가대표 출전 기록 박스 — 소속팀 유무·은퇴 여부와
         # 무관하게(국적은 은퇴해도 안 바뀜) 항상 채운다.
         self._populate_player_intl_box(player_id)
+        # 기본 정보(이름/국적/나이/포지션/OVR/소속팀)만 있어도 복사할
+        # 가치가 있으므로, 연도별·국가대표 기록 유무와 무관하게 여기서
+        # 활성화한다(각 기록이 비어 있으면 포맷 함수가 "기록 없음"으로 채움).
+        self.player_copy_btn.setEnabled(True)
 
     def _populate_player_intl_box(self, player_id):
         """[2026-08 신설, 신민용 요청: "'예선전 탈락' 같은 개인 기록도
@@ -3301,6 +3524,8 @@ class WorldBrowserWindow(QDialog):
         tbl.setRowCount(0)
         tbl.clearSpans()
         records = wb.get_player_intl_records(player_id)
+        # [2026-08 신설] 복사 버튼용 — 화면과 같은 국가대표 기록 원본 저장.
+        self._player_copy_intl_records = records
         if not records:
             tbl.setRowCount(1)
             empty = QTableWidgetItem("국가대표 출전 기록 없음")
@@ -3475,7 +3700,7 @@ class WorldBrowserWindow(QDialog):
         tbl.show()
 
     def _populate_player_team_box(self, player_id, tid, tname, retirement_year=None,
-                                   current_age=None, final_ovr=None):
+                                   current_age=None, final_ovr=None, current_position=None):
         """[2026-08 신설, 2026-08 수정: "순위가 아니라 이 선수가 그 해에
         실제로 속한 팀이 떠야 한다"] 팀 검색 탭 _show_team_detail의
         "연도별 기록" 렌더링(수상 요약 행 + 연도별 리그/국내컵/클럽대항전/
@@ -3502,8 +3727,13 @@ class WorldBrowserWindow(QDialog):
         # 있었던 연도만 재집계된다. current_age를 같이 넘겨서 출생 이전
         # 연도(이적기록 없는 선수의 무기한 소급 추정 구간이 출생보다
         # 앞서가며 나이가 음수로 뜨던 원인)도 잘라낸다.
-        hist = wb.get_ai_player_career_history(player_id, tid, retirement_year=retirement_year,
-                                                current_age=current_age)
+        hist = (wb.get_my_player_career_history() if player_id == wb.MY_PLAYER_ID else
+                wb.get_ai_player_career_history(player_id, tid, retirement_year=retirement_year,
+                                                current_age=current_age))
+        # [2026-08 신설] 복사 버튼(_format_player_history_text)이 화면과
+        # 완전히 같은 값을 쓰도록, 아래에서 화면에 그리는 것과 같은 hist를
+        # 그대로 저장해둔다.
+        self._player_copy_team_hist = hist
         awards, years = hist["awards"], hist["years"]
         if not years and not any(awards.values()):
             award_tbl.setRowCount(0)
@@ -3512,13 +3742,18 @@ class WorldBrowserWindow(QDialog):
             empty = QTableWidgetItem("기록 없음")
             empty.setForeground(QColor("#666"))
             tbl.setItem(0, 0, empty)
-            tbl.setSpan(0, 0, 1, 8)
+            tbl.setSpan(0, 0, 1, 9)
             self._resize_self_sizing_table(tbl)
+            self._player_copy_rows = []
             return
 
         award_tbl.setRowCount(1)
+        # [2026-08 확장] 포지션 컬럼이 소속팀(1)과 OVR(이제 3) 사이(2)에
+        # 끼어들면서, 이 요약 행도 그 자리에 빈칸을 하나 더 넣어야
+        # 아래 표와 컬럼이 어긋나지 않는다.
         award_labels = [
             ("수상", None),
+            ("", None),
             ("", None),
             ("", None),
             (str(awards["league"]) if awards["league"] else "", "#4da6ff"),
@@ -3531,7 +3766,7 @@ class WorldBrowserWindow(QDialog):
             cell.setForeground(QColor(color) if color else QColor("#ffcc00"))
             cell.setBackground(QColor("#2a2a2a"))
             award_tbl.setItem(0, j, cell)
-        award_tbl.setCellWidget(0, 5, self._cl_award_summary_cell(
+        award_tbl.setCellWidget(0, 6, self._cl_award_summary_cell(
             awards.get("cl_champions", 0), awards.get("el_champions", 0),
             awards.get("ecl_champions", 0)))
         sc_cell = QTableWidgetItem(str(awards.get("sc_champions", 0)) if awards.get("sc_champions") else "")
@@ -3539,13 +3774,13 @@ class WorldBrowserWindow(QDialog):
         f = sc_cell.font(); f.setBold(True); sc_cell.setFont(f)
         sc_cell.setForeground(QColor(BURGUNDY))
         sc_cell.setBackground(QColor("#2a2a2a"))
-        award_tbl.setItem(0, 6, sc_cell)
+        award_tbl.setItem(0, 7, sc_cell)
         cwc_cell = QTableWidgetItem(str(awards["cwc"]) if awards["cwc"] else "")
         cwc_cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         f = cwc_cell.font(); f.setBold(True); cwc_cell.setFont(f)
         cwc_cell.setForeground(QColor("#4dd0e1"))
         cwc_cell.setBackground(QColor("#2a2a2a"))
-        award_tbl.setItem(0, 7, cwc_cell)
+        award_tbl.setItem(0, 8, cwc_cell)
         self._resize_self_sizing_table(award_tbl)
 
         timeline = wb.get_ai_player_team_timeline(player_id, tid)
@@ -3564,7 +3799,9 @@ class WorldBrowserWindow(QDialog):
         # (_sized_copyable_field)을 썼는데, 이제 아래 렌더링 루프에서
         # 일반 QTableWidgetItem으로 통일해서 이 import/스타일은 더 이상
         # 필요 없다.
-        ovr_checkpoints = wb.get_ai_player_ovr_checkpoints(player_id) if player_id > 0 else {}
+        ovr_checkpoints = (wb.get_my_player_ovr_checkpoints() if player_id == wb.MY_PLAYER_ID
+                           else wb.get_ai_player_ovr_checkpoints(player_id) if player_id > 0
+                           else {})
         # [2026-08 신설, 신민용 요청: "그 당시 OVR 스탯이 떠야해"] 은퇴
         # 시점의 정확한 최종 OVR은 ai_players_retired.ovr에 그대로 남아
         #있다(추정이 아니라 실제 기록값) — 혹시라도 그 해 아카이브가
@@ -3608,7 +3845,29 @@ class WorldBrowserWindow(QDialog):
                     return seg["team_name"]
             return tname
 
+        # [2026-08 신설, 신민용 요청: "소속팀일 때 포지션이 뭐였는지도
+        # 적어야 하는거 아니야 — 팀마다 포지션이 다르잖아, 위(상단 요약행)
+        # 는 주포고 여기 아래는 세부 포지션"] _team_name_for_year와 완전히
+        # 같은 구조 — timeline 세그먼트에 실려온 포지션(ai_transfer_log.
+        # player_position, 이적 시점 스냅샷)을 그 해에 매칭한다. 세그먼트에
+        # 값이 없으면(첫 이적 이전 소급 구간 등) 지금 알고 있는 최신
+        # 포지션(current_position)으로 근사한다.
+        def _position_for_year(year):
+            if retirement_year and year > retirement_year:
+                return None
+            for seg in timeline:
+                if (seg["start_year"] is None or year >= seg["start_year"]) and \
+                   (seg["end_year"] is None or year < seg["end_year"]):
+                    return seg.get("position")
+            return current_position
+
         tbl.setRowCount(len(years))
+        # [2026-08 신설] 복사 버튼용 — 화면에 그리는 것과 완전히 같은
+        # 값(그 해 나이·소속팀·OVR·retired 여부·entry 원본)을 행마다
+        # 그대로 쌓아둔다. 화면 렌더링 로직(나이 역산/소속팀 타임라인
+        # 조회/은퇴 이후 절단 등)을 복사 텍스트용으로 다시 짜면 둘이
+        # 미묘하게 어긋날 위험이 있어, 아예 같은 루프 안에서 같이 채운다.
+        self._player_copy_rows = []
         for i, entry in enumerate(years):
             age = _age_at(entry["year"])
             year_text = f"{entry['year']} ({age}세)" if age is not None else str(entry["year"])
@@ -3626,8 +3885,17 @@ class WorldBrowserWindow(QDialog):
             # 같은 연도 두 줄이 서로 다른 팀임을 정확히 구분해야 하므로.
             if entry.get("_is_half"):
                 player_team_name = entry.get("_half_team_name")
+                player_position = entry.get("_half_position") or current_position
+            elif entry.get("_main_team_name") is not None:
+                # [2026-08 신설] get_my_player_career_history가 만든
+                # entry — 자기 자신이 이미 그 해의 정확한 소속팀을
+                # 알고 있으므로(_team_name_for_year는 ai_transfer_log
+                # 기반이라 my_player에는 안 맞음) 그대로 쓴다.
+                player_team_name = entry.get("_main_team_name")
+                player_position = entry.get("_main_position") or current_position
             else:
                 player_team_name = _team_name_for_year(entry["year"])
+                player_position = _position_for_year(entry["year"]) or current_position
             is_retired_row = player_team_name is None
             if is_retired_row:
                 team_cell = self._col_label(
@@ -3639,14 +3907,27 @@ class WorldBrowserWindow(QDialog):
                     color="#88ddaa" if is_current else "#aaddff", bold=is_current)
             tbl.setCellWidget(i, 1, team_cell)
 
+            # [2026-08 신설, 신민용 요청: "소속팀일 때 포지션이 뭐였는지도"]
+            # 소속팀(1)과 OVR(3) 사이(2)에 세부 포지션. 은퇴 이후 행은
+            # 바로 아래에서 전부 "-"로 덮어쓰므로 여기선 신경 안 써도 된다.
+            if not is_retired_row:
+                pos_item = QTableWidgetItem(player_position or "-")
+                pos_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                pos_item.setForeground(QColor("#aaddff") if player_position else QColor("#555"))
+                tbl.setItem(i, 2, pos_item)
+
             # [2026-08 신설, 신민용 요청: "소속팀 없음이 뜬 그 줄은 리그든
             # 국내컵이든 다 -로 떠야해"] 그 팀의 실제 대회 결과(entry)는
             # 이 선수와 무관해진 뒤의 데이터이므로, 이 행에서만 전부 "-"로
             # 강제하고 그 해 팀 실제 기록은 참조하지 않는다.
             if is_retired_row:
                 tbl.setItem(i, 2, self._dim_dash_item())
-                for col in (3, 4, 5, 6, 7):
+                tbl.setItem(i, 3, self._dim_dash_item())
+                for col in (4, 5, 6, 7, 8):
                     tbl.setCellWidget(i, col, self._two_line_cell("-", "#555", None))
+                self._player_copy_rows.append({
+                    "year": entry["year"], "age": age, "is_retired_row": True,
+                    "team_name": None, "position": None, "ovr": None, "entry": None})
                 continue
 
             # [2026-08 수정, 신민용 요청: "OVR 수치가 패널로 묶여 있는데
@@ -3665,9 +3946,14 @@ class WorldBrowserWindow(QDialog):
                 ovr_item = QTableWidgetItem(str(ovr_at_year))
                 ovr_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 ovr_item.setForeground(QColor("#ffcc00"))
-                tbl.setItem(i, 2, ovr_item)
+                tbl.setItem(i, 3, ovr_item)
             else:
-                tbl.setItem(i, 2, self._dim_dash_item())
+                tbl.setItem(i, 3, self._dim_dash_item())
+
+            self._player_copy_rows.append({
+                "year": entry["year"], "age": age, "is_retired_row": False,
+                "team_name": player_team_name, "position": player_position,
+                "ovr": ovr_at_year, "entry": entry})
 
             lg_txt = entry["league"] or "-"
             if "승격" in lg_txt:
@@ -3678,24 +3964,24 @@ class WorldBrowserWindow(QDialog):
                 lg_color = "#ffd700"
             else:
                 lg_color = "#ddd"
-            tbl.setCellWidget(i, 3, self._two_line_cell(lg_txt, lg_color, entry.get("league_record")))
+            tbl.setCellWidget(i, 4, self._two_line_cell(lg_txt, lg_color, entry.get("league_record")))
 
             cup_txt = entry["cup"] or "-"
             cup_color = "#c48aff" if entry["cup"] else "#555"
-            tbl.setCellWidget(i, 4, self._two_line_cell(cup_txt, cup_color, entry.get("cup_record")))
+            tbl.setCellWidget(i, 5, self._two_line_cell(cup_txt, cup_color, entry.get("cup_record")))
 
             cl_txt = entry["cl"] or "-"
             _CL_KIND_COLOR = {"champions": "#1E4DB7", "europa": "#F28C28", "conference": "#20A464"}
             cl_color = _CL_KIND_COLOR.get(entry.get("cl_kind"), "#555") if entry["cl"] else "#555"
-            tbl.setCellWidget(i, 5, self._two_line_cell(cl_txt, cl_color, entry.get("cl_record")))
+            tbl.setCellWidget(i, 6, self._two_line_cell(cl_txt, cl_color, entry.get("cl_record")))
 
             sc_txt = entry.get("sc") or "-"
             sc_color = BURGUNDY if entry.get("sc") else "#555"
-            tbl.setCellWidget(i, 6, self._two_line_cell(sc_txt, sc_color, entry.get("sc_record")))
+            tbl.setCellWidget(i, 7, self._two_line_cell(sc_txt, sc_color, entry.get("sc_record")))
 
             cwc_txt = entry.get("cwc") or "-"
             cwc_color = "#4dd0e1" if entry.get("cwc") else "#555"
-            tbl.setCellWidget(i, 7, self._two_line_cell(cwc_txt, cwc_color, entry.get("cwc_record")))
+            tbl.setCellWidget(i, 8, self._two_line_cell(cwc_txt, cwc_color, entry.get("cwc_record")))
         self._resize_self_sizing_table(tbl)
 
     def _dim_dash_item(self):

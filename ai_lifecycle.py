@@ -404,7 +404,7 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None):
         _rebalance_txt = f" · 스쿼드 보정(영입 {topped_up}명/조기은퇴 {forced_out}명)" if (topped_up or forced_out) else ""
         verbose_log(
             f"🔄 이적시장 마감: 이적 {moved}건 · 은퇴/세대교체 {retired}명 · "
-            f"전술 변경 {formations}팀{_rebalance_txt}", "event", year, 52)
+            f"전술 변경 {formations}팀{_rebalance_txt}", "news", year, 52)
 
     return {"grew": grew, "aged": aged, "retired": retired,
             "moved": moved, "formations": formations,
@@ -1467,7 +1467,12 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
     # [2026-07 v2] 이적 시 새 계약(2~4년)과 이적연도를 같이 기록한다 —
     # (new_team_id, new_contract_end_year, last_transfer_year, player_id)
     transfer_updates = []
-    _big_transfer = None   # (fee, name_or_ovr, src_lid_name..) — verbose_log용, 최고액 1건만 추적
+    # [2026-08 신설, 신민용 요청: "주요 이적도 스페인/프랑스/독일/이탈리아/
+    # 잉글랜드 각각 1명씩, 이름도 표시해서 각각 가장 비싼 이적료들을
+    # 보여달라"] 예전엔 전세계 통틀어 딱 1건(_big_transfer)만 추적했는데,
+    # 목적지 리그 국가별로 최고액 1건씩(5개국) 따로 추적하도록 확장.
+    _MAJOR_TRANSFER_COUNTRIES = ("스페인", "프랑스", "독일", "이탈리아", "잉글랜드")
+    _big_transfer_by_country: dict = {}   # {country_name: (fee, ovr, src_name, dst_name, player_id)}
 
     # [2026-08 신설, "명문팀 lifecycle 조사" 요청] AI 이적 로그 배치 —
     # season은 이 함수 호출당 한 번만 조회(이적 건마다 조회하면 수천 건
@@ -1591,8 +1596,13 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
                             team_players.setdefault(new_tid, []).append(p_entry)
                             if verbose_log is not None:
                                 _fee = _estimate_ai_transfer_fee_display(p_entry, old_tid, new_tid, year, team_row_by_tid)
-                                if _fee and (_big_transfer is None or _fee[0] > _big_transfer[0]):
-                                    _big_transfer = _fee
+                                if _fee:
+                                    _dst_row2 = team_row_by_tid.get(new_tid)
+                                    _dst_country = _dst_row2["cname"] if _dst_row2 else None
+                                    if _dst_country in _MAJOR_TRANSFER_COUNTRIES:
+                                        _prev = _big_transfer_by_country.get(_dst_country)
+                                        if _prev is None or _fee[0] > _prev[0]:
+                                            _big_transfer_by_country[_dst_country] = (*_fee, p_entry["id"])
                     moved += 1
     _tm4 = _time_tm.perf_counter()
 
@@ -1614,10 +1624,19 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
           f"이적루프({len(by_league)}개리그) {_tm4-_tm3:.3f}s | "
           f"executemany({len(transfer_updates)}건) {_tm5-_tm4:.3f}s")
 
-    if verbose_log is not None and _big_transfer is not None:
-        fee, ovr, src_name, dst_name = _big_transfer
-        verbose_log(f"💰 주요 이적: OVR{ovr} 선수  {src_name} → {dst_name}  "
-                     f"예상 이적료 약 {fee/100000:.0f}억원", "event", year, 52)
+    if verbose_log is not None and _big_transfer_by_country:
+        from constants import ai_player_code
+        from database import get_ai_player_custom_name
+        # [2026-08 신설] 국가별로(5대리그) 최고액 1건씩, 이름도 같이 표시.
+        # log_type="news" — ui/log_panel.py의 "뉴스" 탭 전용 필터 대상.
+        for _country in _MAJOR_TRANSFER_COUNTRIES:
+            _entry = _big_transfer_by_country.get(_country)
+            if not _entry:
+                continue
+            fee, ovr, src_name, dst_name, _pid = _entry
+            _tag = get_ai_player_custom_name(_pid) or ai_player_code(_pid)
+            verbose_log(f"💰 주요 이적({_country}): {_tag} (OVR{ovr})  {src_name} → {dst_name}  "
+                        f"예상 이적료 약 {fee/100000:.0f}억원", "news", year, 52)
 
     # [2026-08 신설, 신민용 요청: "우리팀에 누가 나가고 누가 들어왔는지
     # 로그에 표시해달라"] 위 "주요 이적"(전세계 최고액 1건)과 별개로,
@@ -1637,14 +1656,22 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
             # 이름을 내가 지을 수 있게 — 이적 로그도 내가 지은 이름으로"]
             # 사용자가 지어준 이름이 있으면 코드 대신 그 이름을 쓴다.
             _tag = get_ai_player_custom_name(p_entry['id']) or ai_player_code(p_entry['id'])
+            # [2026-08 신설, 신민용 요청: "우리팀이 뭔지도 표시해달라 —
+            # 나중에 다른 팀으로 옮기면 저게 언제 어느 팀에서 있었던
+            # 일인지 알 수가 없다"] 그때 당시의 "우리팀" 이름을 명시
+            # 적으로 같이 남긴다 — my_team_id는 이 호출 시점(그 이적이
+            # 실제로 일어난 그 해)의 소속팀이므로, 나중에 다른 팀으로
+            # 이적해도 이 로그 한 줄만 보면 그때 어느 팀 소속으로 겪은
+            # 일인지 항상 알 수 있다.
+            _my_team_name = team_row_by_tid.get(my_team_id, {}).get("tname", "우리팀")
             if direction == "out":
                 _dst = team_row_by_tid.get(new_tid, {}).get("tname", "?")
                 verbose_log(f"📤 방출 — {_tag} ({p_entry.get('position','')} OVR{p_entry.get('ovr',0)}) "
-                            f"→ {_dst}{_fee_txt}", "event", year, 52)
+                            f"{_my_team_name} → {_dst}{_fee_txt}", "news", year, 52)
             else:
                 _src = team_row_by_tid.get(old_tid, {}).get("tname", "?")
                 verbose_log(f"📥 영입 — {_tag} ({p_entry.get('position','')} OVR{p_entry.get('ovr',0)}) "
-                            f"← {_src}{_fee_txt}", "event", year, 52)
+                            f"{_src} → {_my_team_name}{_fee_txt}", "news", year, 52)
 
     return moved
 
