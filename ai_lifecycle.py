@@ -1208,6 +1208,44 @@ def _retire_and_replace(c, year, ai_rows=None):
 # ─────────────────────────────────────────────
 # 4. 이적 시장 (활발하게)
 # ─────────────────────────────────────────────
+# [2026-08 신설, 15-7-3, 신민용+GPT 검토: "국제 이동(5%) 확률이 출신국
+# 등급/선수 OVR과 무관하게 완전히 균일하다 — D급 리그 평균OVR58인데
+# 72면 엄청난 아웃라이어인데, S급 평균88에 92는 그렇게 특별하지 않다.
+# 그러니 'OVR 절대값'이 아니라 '자기 시장 대비 상대적 위치'로 유출
+# 확률을 올려야 한다"] 국제 이동 분기 확률(기본 5%)에 곱하는 승수.
+# 두 요인을 곱한다:
+#   1) outlier_mult — 이 팀 스쿼드 최고 OVR이 팀 평균보다 얼마나 튀는가.
+#      (국가 전체 평균 대신 소속팀 평균을 쓴다 — team_avg가 이미 캐싱돼
+#      있어 추가 집계 없이 재사용 가능하고, 약체 리그일수록 팀 평균 자체가
+#      국가 평균에 가깝다.)
+#   2) market_mult — 그 팀이 속한 국가등급이 얼마나 약한가(LEAGUE_GRADE_RANK
+#      1=F~8=SS, 낮을수록 약함). SS/S는 사실상 보정 없음(신민용: "거긴
+#      유출이 아니라 선수의 선택 문제") — F급에 가까울수록 배율이 커진다.
+# 결과는 0.05(원래 고정값)에 곱해질 배수이고, 최종 국제이동 비중은
+# min(0.35, 0.05*승수)로 캡을 씌워 폭주를 막는다(아래 호출부 참고).
+# 아웃라이어가 없고(gap<=0) 등급도 SS/S면 승수는 정확히 1.0 — 즉 기존
+# 균일 5% 동작과 100% 동일하게 유지된다(회귀 없음 보장).
+_OUTLIER_GAP_DIVISOR = 10.0
+_OUTLIER_COMPONENT_CAP = 3.0
+_MARKET_RANK_STEP = 0.15
+
+
+def _outlier_intl_multiplier(best_ovr, team_avg_ovr, grade_rank) -> float:
+    """[2026-08 재조정] 최초 버전(outlier_mult × market_mult을 각각
+    독립적으로 곱함)은 gap=0(아웃라이어 없음)이어도 약체 등급이면 기본
+    5%가 최대 9%대까지 올라가는 부작용이 있었다(신민용 원칙 위반: "약체
+    등급이라고 평범한 선수까지 유출 확률이 오르면 안 된다 — 아웃라이어일
+    때만"). market 보정을 outlier_component에 곱하는 형태로 바꿔서,
+    gap=0이면 등급과 무관하게 정확히 1.0(=5% 그대로)이 나오게 한다 —
+    "시장이 약할수록 아웃라이어가 더 잘 빠져나간다"이지 "약체 시장 평균
+    선수도 잘 빠져나간다"가 아니기 때문."""
+    gap = max(0.0, (best_ovr or 0) - (team_avg_ovr or 0))
+    outlier_component = min(_OUTLIER_COMPONENT_CAP, gap / _OUTLIER_GAP_DIVISOR)
+    rank = grade_rank if grade_rank is not None else 8   # 등급 정보 없으면 보정 없음(SS 취급)
+    market_scale = 1.0 + max(0, 8 - rank) * _MARKET_RANK_STEP
+    return 1.0 + outlier_component * market_scale
+
+
 def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
                       volume_scale=1.0, is_mid_season=False):
     """선수들이 팀 간 이동. 같은 리그 내 + 국내 다른 tier + 국제 이동.
@@ -1257,6 +1295,11 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
 
     from constants import get_country_league_grade
     from economy import LEAGUE_GRADE_RANK
+    # [2026-08 신설, 신민용 리포트: "중간 이적한 해 상반기 팀에 역할이
+    # 안 뜬다/떠도 하반기 팀이랑 똑같이 뜬다"] 아래 mover 처리 루프에서
+    # is_mid_season일 때만 이적 나가기 직전 역할을 계산하는 데 쓴다 —
+    # 루프 안에서 매번 import하지 않도록 함수 시작에서 한 번만 가져온다.
+    from formation_logic import compute_squad_roles
 
     # [2026-08 계측 추가, 신민용 리포트: "이적시장 0.92s가 어디서 쓰이는지
     # 쪼개보자"] 아직 로직은 그대로 두고 구간별 시간만 찍는다 —
@@ -1544,13 +1587,29 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
             # ≈ 1명 등, 카테고리가 강할수록 시즌 도중 이적도 자연히 더 적다).
             if volume_scale != 1.0:
                 out_quota = max(0, int(round(out_quota * volume_scale)))
+            # [2026-08 신설, 15-7-3] out_quota 루프 시작 전에 이 팀의 "국제
+            # 이동 승수"를 한 번만 계산해둔다(선수 하나하나가 아니라 팀
+            # 단위 슬롯 확률이라 매 반복 재계산할 필요가 없음 — cat/
+            # out_quota와 동일한 패턴). 팀 스쿼드 최고 OVR을 아웃라이어
+            # 신호로 쓴다.
+            _src_players_ovrs = [pl["ovr"] for pl in team_players.get(src, []) if pl.get("ovr")]
+            _src_best_ovr = max(_src_players_ovrs) if _src_players_ovrs else team_avg.get(src, 50)
+            _intl_mult = _outlier_intl_multiplier(
+                _src_best_ovr, team_avg.get(src, 50), team_grade_rank.get(src))
+            # 국제이동 비중을 5%*_intl_mult로 가변화(최대 35% 캡) — 승수가
+            # 정확히 1.0(아웃라이어 없음 + SS/S급)이면 0.87/0.95 그대로라
+            # 기존 동작과 100% 동일하다. 국내 다른 tier(8%) 폭은 고정 유지.
+            _intl_share = min(0.35, 0.05 * _intl_mult)
+            _same_league_upper = 1.0 - 0.08 - _intl_share
+            _domestic_other_upper = 1.0 - _intl_share
             for _ in range(out_quota):
                 src_tier = team_tier.get(src, 1)
-                # 후보군 결정: 87% 같은 리그 / 8% 국내 다른 tier / 5% 국제(tier1만)
+                # 후보군 결정: (같은 리그) / (국내 다른 tier, 8% 고정) /
+                # (국제, 기본 5%이나 위 _intl_share로 가변)
                 roll = random.random()
-                if roll < 0.87 or src_tier != 1:
+                if roll < _same_league_upper or src_tier != 1:
                     dst_pool_tids = tids
-                elif roll < 0.95:
+                elif roll < _domestic_other_upper:
                     cid = team_to_cid.get(src)
                     cand = by_country_tier.get((cid, 2), []) or by_country_tier.get((cid, src_tier + 1), [])
                     dst_pool_tids = cand if len(cand) >= 1 else tids
@@ -1594,8 +1653,13 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
                 # 넘긴다 — _do_one_transfer_cached가 실제 mover(선수)가
                 # 정해진 뒤에 그 선수 나이를 보고, 나이 든 선수면 이 풀을
                 # 우선 후보로 쓴다(뒤에서 구현).
+                # [2026-08 수정, 15-7-3] 국제이동 분기 상한이 0.95 고정에서
+                # _domestic_other_upper(가변)로 바뀌었으므로 이 판정도
+                # 그에 맞춰 같이 옮긴다 — 안 옮기면 _intl_share가 커진
+                # 팀에서 roll이 0.90~0.95 사이일 때 "국제 이동"인데도
+                # veteran_pool 판정에서는 여전히 빠지는 불일치가 생긴다.
                 _veteran_pool = (veteran_pool_tids
-                                 if (roll >= 0.95 and src_tier == 1
+                                 if (roll >= _domestic_other_upper and src_tier == 1
                                      and (team_grade_rank.get(src) or 0) >= 7)
                                  else None)
 
@@ -1628,6 +1692,28 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
                         # 남긴다.
                         _old_list = team_players.get(old_tid, [])
                         _idx = next((i for i, e in enumerate(_old_list) if e["id"] == pid), None)
+                        # [2026-08 신설, 신민용 리포트: "중간 이적한 해에
+                        # 상반기 팀엔 역할(주전/로테이션 등)이 안 뜬다 —
+                        # 뜨더라도 하반기 팀이랑 완전히 똑같이 뜨는데,
+                        # 실제로는 상반기 팀에서 후보였다"] world_browser.py의
+                        # 반기 표시(_half_season_league_entry)는 지금까지
+                        # ai_player_position_history.role(연도 하나당 한
+                        # 값 — 그 해 "최종/하반기" 소속팀 스냅샷)을 상/하반기
+                        # 두 줄에 그대로 같이 썼다 — 상반기(이 시점 old_tid)
+                        # 팀 로스터 기준 역할이 따로 없었기 때문. pop() 하기
+                        # 직전(선수 본인이 아직 이 로스터에 포함돼 있을 때)
+                        # compute_squad_roles로 "나가기 직전 그 팀에서의
+                        # 역할"을 계산해 이적 로그에 같이 남긴다 — 오프시즌
+                        # (연 1회, 팀당 1~2건이지만 세계 전체로는 수만 건)은
+                        # world_browser.py가 애초에 반기 분리 표시를 안 해서
+                        # 이 값이 쓰이지도 않으므로, is_mid_season(팀당
+                        # 0~2명 규모)일 때만 계산해 비용을 그 작은 물량으로
+                        # 가둔다.
+                        _dep_role = ""
+                        if is_mid_season and _idx is not None:
+                            _dep_role = compute_squad_roles(
+                                [(e["id"], e.get("ovr"), e.get("age")) for e in _old_list]
+                            ).get(pid, "")
                         p_entry = _old_list.pop(_idx) if _idx is not None else None
                         if p_entry is not None:
                             # 인원이 바뀐 팀만 가중치 표를 갱신(위 _sw_by_tid 주석 참고)
@@ -1650,7 +1736,7 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
                                 old_tid, new_tid,
                                 team_prestige.get(old_tid, 0), team_prestige.get(new_tid, 0),
                                 round(team_avg.get(old_tid, 0), 2), round(team_avg.get(new_tid, 0), 2),
-                                _actual_ttype, 1 if is_mid_season else 0))
+                                _actual_ttype, 1 if is_mid_season else 0, _dep_role))
                             # [2026-08 신설, 신민용 요청: "우리팀에 누가
                             # 나가고 누가 들어왔는지"] 우리 팀이 관여한
                             # 건이면(방출 또는 영입) 별도로 모아둔다 —
@@ -1692,14 +1778,27 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
             """INSERT INTO ai_transfer_log(
                 season, year, player_id, player_name, player_position, player_age, player_ovr,
                 from_team_id, to_team_id, from_team_prestige, to_team_prestige,
-                from_team_avg_ovr, to_team_avg_ovr, transfer_type, is_mid_season)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                from_team_avg_ovr, to_team_avg_ovr, transfer_type, is_mid_season, player_role)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             transfer_log_rows)
     _tm5 = _time_tm.perf_counter()
     print(f"[PERF-TM]  teams조회(서브쿼리포함) {_tm1-_tm0:.3f}s | "
           f"그룹핑 {_tm2-_tm1:.3f}s | team_players빌드 {_tm3-_tm2:.3f}s | "
           f"이적루프({len(by_league)}개리그) {_tm4-_tm3:.3f}s | "
           f"executemany({len(transfer_updates)}건) {_tm5-_tm4:.3f}s")
+
+    # [2026-08 버그수정, 신민용 리포트: "이적 뉴스가 실제론 28주차(겨울
+    # 이적시장 마감=WINTER_OFFER_END_DAY) 사건인데 52주차로 뜬다"] 이 함수는
+    # 오프시즌 전체 처리(run_ai_offseason, 연 1회·시즌이 완전히 끝난 뒤라
+    # 진짜 52주차)와 시즌 도중 겨울 이적시장(run_ai_mid_season_transfer,
+    # is_mid_season=True로 호출)이 공유해서 부르는데, 아래 "news" 로그들은
+    # 호출 맥락과 무관하게 항상 week=52를 찍고 있었다 — 오프시즌 호출은
+    # 실제로 52주차라 우연히 맞았지만, 겨울 이적시장 호출 때도 그대로 52가
+    # 찍혀서 실제 사건 시점(겨울 이적시장 마감 주차)과 어긋났다.
+    # is_mid_season일 땐 WINTER_OFFER_END_DAY를 주차로 환산해 실제 마감
+    # 시점을 쓴다.
+    from constants import day_to_week, WINTER_OFFER_END_DAY
+    _news_week = day_to_week(WINTER_OFFER_END_DAY) if is_mid_season else 52
 
     if verbose_log is not None and _big_transfer_by_country:
         from constants import ai_player_code
@@ -1713,7 +1812,7 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
             fee, ovr, src_name, dst_name, _pid = _entry
             _tag = get_ai_player_custom_name(_pid) or ai_player_code(_pid)
             verbose_log(f"💰 주요 이적({_country}): {_tag} (OVR{ovr})  {src_name} → {dst_name}  "
-                        f"예상 이적료 약 {fee/100000:.0f}억원", "news", year, 52)
+                        f"예상 이적료 약 {fee/100000:.0f}억원", "news", year, _news_week)
 
     # [2026-08 신설, 신민용 요청: "우리팀에 누가 나가고 누가 들어왔는지
     # 로그에 표시해달라"] 위 "주요 이적"(전세계 최고액 1건)과 별개로,
@@ -1744,11 +1843,11 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
             if direction == "out":
                 _dst = team_row_by_tid.get(new_tid, {}).get("tname", "?")
                 verbose_log(f"📤 방출 — {_tag} ({p_entry.get('position','')} OVR{p_entry.get('ovr',0)}) "
-                            f"{_my_team_name} → {_dst}{_fee_txt}", "news", year, 52)
+                            f"{_my_team_name} → {_dst}{_fee_txt}", "news", year, _news_week)
             else:
                 _src = team_row_by_tid.get(old_tid, {}).get("tname", "?")
                 verbose_log(f"📥 영입 — {_tag} ({p_entry.get('position','')} OVR{p_entry.get('ovr',0)}) "
-                            f"{_src} → {_my_team_name}{_fee_txt}", "news", year, 52)
+                            f"{_src} → {_my_team_name}{_fee_txt}", "news", year, _news_week)
 
     return moved
 
@@ -1896,6 +1995,35 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
     # 이적 7.4만 건 × 후보 선수 수 × 키 6개), 결과는 완전히 동일하면서
     # 호출당 오버헤드만 사라진다.
     eligible = [p for p in src_players if (year - p["last_transfer_year"]) >= 1]
+    if not eligible:
+        return None
+
+    # [2026-08 신설, 신민용 요청: "마지막 GK/마지막 CB 같은 선수가 정상
+    # 판매 후보로 들어가면 안 된다 — 그 선수를 팔면 팀에 해당 포지션
+    # 그룹이 0명이 되는가만 검사해서 막아야 한다"] 원인: 위 eligible은
+    # "작년에 이적했는가"만 볼 뿐 포지션은 전혀 안 봐서, 팀의 유일한
+    # GK도 다른 후보와 똑같이(순위가 낮으면 오히려 더 높은 확률로) 팔려
+    # 나갈 수 있었다 — 신민용 리포트: GK가 0명이라 LW 주포 선수가 GK로
+    # 뛴 사례. 이 아래 필터는 그 경로 자체를 차단한다: "팔면 그 포지션
+    # 그룹(GK/DF/MF/FW, _pos_category 기준)이 팀에서 0명이 되는 선수"만
+    # 후보에서 제외하고, 그 외에는 기존 판매 확률 가중치(OVR순위/나이/
+    # 계약)를 그대로 둔다 — 신민용 명시 요청대로 가중치 자체는 절대
+    # 안 건드림. src_players(시간 필터 전 팀 전체 로스터) 기준으로
+    # 그룹별 인원을 세야 정확하다(마지막 1명 판정은 "지금 이 팀에 몇
+    # 명 있는가"의 문제이지 "언제 이적했는가"와는 무관하므로).
+    from formation_logic import _pos_category
+    _GROUP_KEY = {"GK": "GK", "DEF": "DF", "MID": "MF", "ATK": "FW"}
+    _grp_count: dict = {}
+    for _p in src_players:
+        _g = _GROUP_KEY.get(_pos_category(_p["position"]), "MF")
+        _grp_count[_g] = _grp_count.get(_g, 0) + 1
+    _protected_ids = {p["id"] for p in eligible
+                       if _grp_count.get(_GROUP_KEY.get(_pos_category(p["position"]), "MF"), 0) <= 1}
+    if _protected_ids and len(_protected_ids) < len(eligible):
+        eligible = [p for p in eligible if p["id"] not in _protected_ids]
+    # (매우 드문 극단적 예외: 팀 전체가 포지션 그룹당 딱 1명씩이라 위
+    # 필터가 eligible을 통째로 비워버리는 경우엔 적용하지 않는다 —
+    # 이적 자체가 완전히 멈추는 것보다는 기존 동작이 낫다.)
     if not eligible:
         return None
 
@@ -2175,6 +2303,9 @@ def _rebalance_squad_sizes(c, year):
                            get_country_league_grade, get_ovr_range, COUNTRY_LEAGUE_OVR_OVERRIDE)
     from database import _pick_nationality, get_foreign_quota_range
     from data.prestige_clubs import prestige_level as _rebal_prestige_level
+    from database import _BENCH_GROUP_WEIGHTS, _BENCH_GROUP_POOLS
+    from formation_logic import _pos_category
+    _GROUP_KEY = {"GK": "GK", "DEF": "DF", "MID": "MF", "ATK": "FW"}
 
     team_rows = c.execute(
         """SELECT t.id AS tid, t.name AS tname, t.current_tier AS tier,
@@ -2187,6 +2318,14 @@ def _rebalance_squad_sizes(c, year):
     counts: dict = {}
     for r in c.execute("SELECT team_id, COUNT(*) n FROM ai_players GROUP BY team_id").fetchall():
         counts[r["team_id"]] = r["n"]
+    # [2026-08 신설, 신민용 리포트: "키퍼/수비수/미드필더/공격수 비율을
+    # 맞춰뒀는데 안 따르는거 같다 — 내 팀 후보 14명 중 5명이 키퍼고
+    # 수비수가 0명"] 원인은 AI 이적(_transfer_market)이 포지션을 전혀
+    # 안 보고 OVR/나이/계약만으로 사고팔기 때문(내 팀 소속 AI 동료도
+    # 예외 없음) — 아래 그룹별 스냅샷은 이 편향을 잡아내기 위한 자료.
+    roster_by_team: dict = {}
+    for r in c.execute("SELECT id, team_id, position, ovr FROM ai_players").fetchall():
+        roster_by_team.setdefault(r["team_id"], []).append((r["id"], r["position"], r["ovr"]))
 
     name_cache = _build_name_cache(c)
     topped_up = 0
@@ -2258,11 +2397,107 @@ def _rebalance_squad_sizes(c, year):
 
         elif n > _SQUAD_MAX:
             excess = n - _SQUAD_MAX
-            rows = c.execute(
-                "SELECT id FROM ai_players WHERE team_id=? ORDER BY ovr ASC LIMIT ?",
-                (tid, excess)).fetchall()
-            delete_ids.extend(r["id"] for r in rows)
-            forced_out += len(rows)
+            # [2026-08 신설, 신민용 요청: "강제 조기은퇴도 이적 가드와
+            # 같은 문제(마지막 GK/DF 등이 최저OVR이면 그냥 잘려서 그
+            # 그룹이 0명이 됨)를 가진다 — 최저OVR 우선순위는 그대로
+            # 두고, '이 선수를 자르면 그 포지션 그룹이 0명이 되는가'만
+            # 추가로 걸러라"] 위 이적 가드(_do_one_transfer_cached)와
+            # 완전히 동일한 원칙: 정렬 기준(최저 OVR 우선)은 손대지
+            # 않고, 후보 목록에서 "그 그룹의 마지막 1명"만 건너뛴다.
+            # roster_by_team은 이 함수 진입 시점(=은퇴/이적이 이미 끝난
+            # 뒤) 1회 조회한 스냅샷이라 지금 이 팀의 실제 구성과 일치한다.
+            roster = roster_by_team.get(tid, [])
+            _grp_count_max: dict = {}
+            for _pid, _ppos, _povr in roster:
+                _g = _GROUP_KEY.get(_pos_category(_ppos), "MF")
+                _grp_count_max[_g] = _grp_count_max.get(_g, 0) + 1
+            _protected_max = {_pid for _pid, _ppos, _povr in roster
+                              if _grp_count_max.get(_GROUP_KEY.get(_pos_category(_ppos), "MF"), 0) <= 1}
+            _candidates = sorted(roster, key=lambda t: t[2])  # 기존과 동일: OVR 오름차순
+            picks = [_pid for _pid, _ppos, _povr in _candidates if _pid not in _protected_max][:excess]
+            # (극단적 예외) 보호 대상을 뺀 후보만으론 목표 감축분을 못
+            # 채우면(팀 전체가 그룹당 1명씩에 가까운 경우) 나머지는 기존
+            # 방식대로 보호 대상에서도 채운다 — 스쿼드가 영구히 과다한
+            # 상태로 남는 것보다는 이 편이 낫다(신민용 원안의 "매우 드문
+            # 극단 예외" 취급과 동일한 원칙).
+            if len(picks) < excess:
+                _picked = set(picks)
+                _rest = [_pid for _pid, _ppos, _povr in _candidates if _pid not in _picked]
+                picks.extend(_rest[:excess - len(picks)])
+            delete_ids.extend(picks)
+            forced_out += len(picks)
+
+        else:
+            # [2026-08 신설] 총원은 22~25 정상범위라서 위 두 분기 다
+            # 발동을 안 하는 팀들 — 그런데 총원이 정상이어도 그 안의
+            # 포지션 그룹 구성비는 이적 편향으로 심하게 틀어져 있을 수
+            # 있다(신민용 리포트 사례: 25명인데 GK 5/DF 0). 여기서는
+            # 총원을 그대로 유지한 채(스왑: 가장 넘치는 그룹 최저OVR
+            # 1명을 빼고 가장 부족한 그룹에 1명을 채움) _BENCH_GROUP_
+            # WEIGHTS(위 database.py의 벤치 목표 비율과 동일 기준) 대비
+            # "명백히 비정상"인 선(0명이거나 기대치의 40% 미만 = 부족,
+            # 기대치의 2.2배 이상 = 과다)에서만 발동해서, 정상적인
+            # 통계적 편차까지 억지로 깎아내리진 않는다.
+            roster = roster_by_team.get(tid, [])
+            if roster:
+                group_players: dict = {"GK": [], "DF": [], "MF": [], "FW": []}
+                for pid, ppos, povr in roster:
+                    grp = _GROUP_KEY.get(_pos_category(ppos), "MF")
+                    group_players[grp].append((pid, povr))
+                total_n = len(roster)
+                deficient, surplus = [], []
+                for grp, w in _BENCH_GROUP_WEIGHTS:
+                    expected = total_n * (w / 100.0)
+                    actual = len(group_players[grp])
+                    if actual == 0 or actual < expected * 0.4:
+                        deficient.append(grp)
+                    elif actual > max(expected * 2.2, expected + 3):
+                        surplus.append((grp, actual - expected))
+                if deficient and surplus:
+                    surplus.sort(key=lambda x: -x[1])
+                    ovr_rng = get_ovr_range(grade, tier, cname)
+                    if ovr_rng:
+                        _lo, _hi = ovr_rng
+                        if not is_override:
+                            _lo, _hi = _lo + bonus, _hi + bonus
+                    else:
+                        _lo, _hi = 40, 55
+                    _plvl = _rebal_prestige_level(cname, tname)
+                    _used = set()
+                    _q_lo, _quota = get_foreign_quota_range(cname, continent)
+                    _foreign_ct = 0
+                    for si, grp in enumerate(deficient):
+                        if si >= len(surplus):
+                            break
+                        sgrp, _ = surplus[si]
+                        weakest = min(group_players[sgrp], key=lambda t: t[1])
+                        delete_ids.append(weakest[0])
+                        group_players[sgrp].remove(weakest)
+                        _pos = random.choice(_BENCH_GROUP_POOLS[grp])
+                        _target = random.randint(_lo, max(_lo, (_lo + _hi) // 2))
+                        _age = random.randint(*_AI_NEWBIE_AGE)
+                        _scaled = _youth_target_scale(_target, _age)
+                        if ovr_rng:
+                            _prestige_base = {3: 1, 2: 2, 1: 3}.get(_plvl, 4)
+                            _grade_adj = {"SS": 0, "S": 0, "A": 0, "B": 1, "C": 1,
+                                         "D": 2, "E": 2, "F": 3}.get(grade, 2)
+                            _young_floor_off = _prestige_base + _grade_adj
+                            _scaled = max(_scaled, ovr_rng[0] - _young_floor_off)
+                        _stats = _gen_stats(_pos, _scaled)
+                        _ovr = calc_ovr(_pos, _stats)
+                        _sub_role = random.choice(SUB_ROLES.get(_pos, ["기본"]))
+                        _nat, _foreign_ct = _pick_nationality(cname, continent, grade, _pos,
+                                                              False, _foreign_ct, _quota)
+                        _name = _random_name(c, tid, name_cache, used_in_team=_used)
+                        new_rows.append((tid, _name, _pos,
+                            _stats["stamina"], _stats["speed"], _stats["jump"], _stats["strength"],
+                            _stats["shooting"], _stats["passing"], _stats["dribbling"],
+                            _stats["tackling"], _stats["heading"], _stats["positioning"],
+                            _stats["setpiece"], _stats["mental"], _stats["confidence"],
+                            _stats["leadership"], _stats["concentration"], _ovr, _age, _sub_role, _nat,
+                            year + random.randint(2, 4), 0))
+                        topped_up += 1
+                        forced_out += 1
 
     if new_rows:
         c.executemany("""INSERT INTO ai_players
@@ -2368,6 +2603,77 @@ def seed_initial_position_history(year):
     _snapshot_season_positions(c, year)
     conn.commit()
     conn.close()
+
+
+def snapshot_my_player_position(year):
+    """[2026-08 신설, 신민용 요청: "세계 축구 기록실 선수 검색에서 AI는
+    연도별 주전/로테이션/대기/유망주가 뜨는데 나(my_player)는 안 뜬다"]
+    _snapshot_season_positions()는 ai_players만 훑고 my_player는 대상이
+    아니라서 생긴 공백을 메운다.
+
+    [설계 — 신민용+GPT 검토] _snapshot_season_positions() 자체(전세계
+    ai_players 26만 건을 매 시즌 훑는 무거운 함수)를 고쳐서 my_player를
+    끼워 넣는 대신, my_player가 소속된 팀 하나만 targeted 조회하는 별도
+    함수로 분리했다 — 이유는 두 가지. (1) 성능: 이미 O(전세계)인 그
+    함수에 로직을 더 얹기보다, my_player 소속팀 로스터(팀당 20명대)만
+    보는 이 함수가 훨씬 싸다. (2) 안전성: 매 시즌 전체 AI 이력을 쌓는
+    핵심 공용 함수를 건드리면 실수 시 파급 범위가 전세계 선수단이라
+    커진다 — my_player 전용 로직을 완전히 분리해두면 이 기능 하나만
+    독립적으로 검증·롤백할 수 있다.
+
+    베스트11 배정은 formation_logic._greedy_fill_slots/compute_squad_roles
+    를 그대로 재사용해 _snapshot_season_positions와 동일한 알고리즘으로
+    맞춘다(그래야 "포메이션 화면은 주전인데 선수 검색은 후보"같은 또
+    다른 불일치가 안 생김). my_player의 id는 ai_players.id와 값이
+    겹칠 수 있으므로("__ME__" 같은 문자열 sentinel을 써서) 이 함수
+    안에서만 쓰고 절대 저장하지 않는다 — 저장은 my_player_position_
+    history(year 단일 PK, player_id 없음)에 한다.
+
+    소속팀이 없으면(무소속) 그 해는 기록하지 않는다 — AI가 방출/은퇴로
+    한 해 team_id가 없으면 그 해 role_checkpoints에 값이 없는 것과
+    동일한 동작."""
+    from formation_logic import _greedy_fill_slots, compute_squad_roles
+    from constants import FORMATION_SLOTS
+
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        me = c.execute(
+            "SELECT current_team_id, position, ovr, age FROM my_player WHERE id=1").fetchone()
+        if not me or not me["current_team_id"]:
+            return
+        team_id = me["current_team_id"]
+        team_row = c.execute("SELECT formation FROM teams WHERE id=?", (team_id,)).fetchone()
+        if not team_row:
+            return
+        formation = team_row["formation"] or "4-4-2"
+        teammates = c.execute(
+            "SELECT id, position, ovr, age FROM ai_players WHERE team_id=?", (team_id,)).fetchall()
+
+        ME = "__ME__"
+        candidates = [{"id": r["id"], "position": r["position"], "ovr": r["ovr"] or 0}
+                      for r in teammates]
+        candidates.append({"id": ME, "position": me["position"], "ovr": me["ovr"] or 0})
+        pool = [(r["id"], r["ovr"], r["age"]) for r in teammates]
+        pool.append((ME, me["ovr"], me["age"]))
+
+        slots = FORMATION_SLOTS.get(formation, FORMATION_SLOTS["4-4-2"])
+        placed = _greedy_fill_slots(candidates, slots)
+        roles = compute_squad_roles(pool)
+
+        my_position = me["position"] or ""
+        for slot_idx, pl in enumerate(placed):
+            if pl is not None and pl["id"] == ME:
+                my_position = slots[slot_idx]
+                break
+        my_role = roles.get(ME, "")
+
+        c.execute(
+            "INSERT OR REPLACE INTO my_player_position_history(year, position, role) VALUES (?,?,?)",
+            (year, my_position, my_role))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _shuffle_formations(c):

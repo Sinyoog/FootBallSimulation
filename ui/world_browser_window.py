@@ -91,6 +91,18 @@ def _enable_plain_copy(tbl):
     sc.setContext(Qt.ShortcutContext.WidgetShortcut)
     sc.activated.connect(_copy_selected)
 
+    # [2026-08 확장, 신민용 리포트: "포메이션 화면 선수 정보 표는 클릭하고
+    # Ctrl+C 해도 복사가 안 된다"] ui/formation_widget.py.PlayerStatPopup의
+    # 표들은 WASD 단축키가 표의 "타이핑해서 셀 찾기" 기능에 가로채이지
+    # 않도록 setFocusPolicy(NoFocus)를 일부러 걸어둔다 — 그러면 위
+    # WidgetShortcut(표 자신이 포커스를 가져야 작동)은 그 표에서 절대
+    # 발동하지 않는다. 그런 화면은 표에 단축키를 못 걸고 대신 다이얼로그
+    # 레벨에 하나만 걸어 "지금 선택된 셀이 있는 표"를 찾아 복사해야
+    # 하는데, 그러려면 이 함수가 쓰는 것과 같은 클린텍스트 복사 로직이
+    # 필요하다 — _copy_selected를 반환해서 그쪽에서 그대로 재사용하게
+    # 한다(기존 호출부는 반환값을 안 받아도 그만이라 하위 호환 그대로).
+    return _copy_selected
+
 
 def _attach_label_copy(label, clean_text):
     """[2026-08 신설, 신민용 리포트: "경기 상세 내역(대진표)에서도 국기/
@@ -3949,17 +3961,24 @@ class WorldBrowserWindow(QDialog):
         # 갔는지가 중요한거야"] ai_player_position_history(시즌 전환마다
         # 그 시즌 포메이션 기준 실제 슬롯을 기록해둔 것) — 있으면 최우선,
         # 없는 연도(이 기능 신설 이전 과거 시즌)는 아래에서 기존처럼
-        # 이적 시점 등록 포지션으로 대체한다. my_player는 이 아카이브
-        # 대상이 아니라 항상 빈 dict(기존처럼 career_entries 포지션 사용).
-        position_checkpoints = (wb.get_ai_player_position_checkpoints(player_id)
-                                 if player_id != wb.MY_PLAYER_ID and player_id > 0 else {})
+        # 이적 시점 등록 포지션으로 대체한다.
+        # [2026-08 수정, 신민용 리포트: "AI는 연도별 주전/로테이션/대기/
+        # 유망주가 뜨는데 나(my_player)는 왜 안 뜨냐 — 나도 판수 대비
+        # 출전 기록은 이미 저장되잖아"] 예전엔 my_player가 이 아카이브
+        # 대상이 아니라며 항상 빈 dict를 썼는데, 이제 ai_lifecycle.
+        # snapshot_my_player_position()이 매 시즌 my_player 전용
+        # 아카이브(my_player_position_history)를 남기므로 그걸 읽는다.
+        position_checkpoints = (wb.get_my_player_position_checkpoints() if player_id == wb.MY_PLAYER_ID
+                                 else wb.get_ai_player_position_checkpoints(player_id) if player_id > 0
+                                 else {})
         # [2026-08 신설, 신민용 요청: "그 해 주전/로테이션/대기/유망주였는지
         # 연도별로 표시 — 위(요약행)의 지금 스냅샷 하나가 아니라 여기
         # 연도별 기록에"] position_checkpoints와 완전히 같은 패턴(같은
-        # 테이블·같은 신설 시점 제약)으로 ai_player_position_history.role을
-        # 읽는다. my_player는 이 아카이브 대상이 아니라 항상 빈 dict.
-        role_checkpoints = (wb.get_ai_player_role_checkpoints(player_id)
-                             if player_id != wb.MY_PLAYER_ID and player_id > 0 else {})
+        # 테이블·같은 신설 시점 제약)으로 role을 읽는다. my_player도
+        # 위와 동일한 이유로 이제 전용 아카이브에서 읽는다.
+        role_checkpoints = (wb.get_my_player_role_checkpoints() if player_id == wb.MY_PLAYER_ID
+                             else wb.get_ai_player_role_checkpoints(player_id) if player_id > 0
+                             else {})
         # [2026-08 신설, 신민용 요청: "그 당시 OVR 스탯이 떠야해"] 은퇴
         # 시점의 정확한 최종 OVR은 ai_players_retired.ovr에 그대로 남아
         #있다(추정이 아니라 실제 기록값) — 혹시라도 그 해 아카이브가
@@ -4118,9 +4137,19 @@ class WorldBrowserWindow(QDialog):
             # 였는지"] 이 기능 신설 이전 시즌은 role_checkpoints에 값이
             # 없으므로(빈 dict) "-"로 대체 — 다른 이 기능 이전 과거 데이터
             # (position_checkpoints 등)와 동일한 폴백 방식.
+            # [2026-08 버그수정, 신민용 리포트: "중간 이적한 해 상반기
+            # 팀엔 역할이 안 뜬다 — 뜨더라도 하반기 팀이랑 완전히 똑같이
+            # 뜨는데 실제로는 상반기 팀에서 후보였다"] role_checkpoints는
+            # (player_id, year) 키라 그 해 "최종/하반기" 소속팀 스냅샷
+            # 하나뿐이다 — 위 player_position과 같은 이유로, 상반기 줄
+            # (entry["_is_half"])은 그 값 대신 entry["_half_role"](이적
+            # 나가기 직전 상반기 팀 로스터 기준으로 이미 계산해둔 값 —
+            # world_browser.get_ai_player_career_history/_half_season_
+            # league_entry 참고)을 써야 한다.
             _ROLE_COLORS = {"주전": "#4da6ff", "로테이션": "#88ddaa",
                             "대기": "#cccc66", "유망주": "#cc88ff"}
-            role_at_year = role_checkpoints.get(entry["year"])
+            role_at_year = (entry.get("_half_role") if entry.get("_is_half")
+                             else role_checkpoints.get(entry["year"]))
             if role_at_year:
                 role_item = QTableWidgetItem(role_at_year)
                 role_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)

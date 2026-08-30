@@ -568,7 +568,8 @@ def init_db():
         from_team_prestige INTEGER DEFAULT 0, to_team_prestige INTEGER DEFAULT 0,
         from_team_avg_ovr REAL DEFAULT 0, to_team_avg_ovr REAL DEFAULT 0,
         transfer_type TEXT DEFAULT '',
-        is_mid_season INTEGER DEFAULT 0)""")
+        is_mid_season INTEGER DEFAULT 0,
+        player_role TEXT DEFAULT '')""")
     c.execute("""CREATE INDEX IF NOT EXISTS idx_ai_transfer_log_year
         ON ai_transfer_log(year)""")
     c.execute("""CREATE INDEX IF NOT EXISTS idx_ai_transfer_log_teams
@@ -616,6 +617,17 @@ def init_db():
     # 시점" 기준, ai_player_ovr_history와 동일한 타이밍).
     c.execute("""CREATE TABLE IF NOT EXISTS my_player_ovr_history(
         year INTEGER PRIMARY KEY, ovr INTEGER)""")
+
+    # [2026-08 신설, 신민용 요청: "세계 축구 기록실 선수 검색에서 AI는
+    # 연도별 주전/로테이션/대기/유망주가 뜨는데 왜 나(my_player)는 안
+    # 뜨냐 — 나도 판수 대비 출전 기록은 이미 저장되잖아"] ai_player_
+    # position_history와 완전히 같은 목적이지만 my_player 전용
+    # (my_player_ovr_history와 동일하게 player_id 없이 year만 PK —
+    # 세이브당 my_player가 하나뿐이므로). 실제 계산(팀 로스터 안에서
+    # 베스트11에 들었는지)은 ai_lifecycle.snapshot_my_player_position()이
+    # 담당 — 여기 스키마는 그 결과를 담는 그릇일 뿐이다.
+    c.execute("""CREATE TABLE IF NOT EXISTS my_player_position_history(
+        year INTEGER PRIMARY KEY, position TEXT, role TEXT DEFAULT '')""")
 
     # [2026-08 신설, 신민용 요청: "선수가 은퇴하면 소속팀에 '은퇴했습니다'
     # 라고 뜨고... 얘네도 차후 검색할 수 있어야 해"] 예전엔 은퇴 시
@@ -1810,6 +1822,17 @@ def init_db():
         # 참고). 이 컬럼 신설 이전 과거 시즌은 당연히 빈 문자열 — 세계
         # 브라우저 쪽에서 "-"로 대체 표시한다.
         "ALTER TABLE ai_player_position_history ADD COLUMN role TEXT DEFAULT ''",
+        # [2026-08 신설, 신민용 리포트: "중간 이적한 해에 상반기 팀(예:
+        # 대전중구 독수리FC)에 역할(주전/로테이션 등)이 안 뜬다 — 뜨더라도
+        # 하반기 팀이랑 똑같이 뜨는거 같던데, 실제로는 상반기 팀에서
+        # 후보였다"] ai_transfer_log.player_position(이적 시점 스냅샷)과
+        # 완전히 같은 패턴 — "이적 나가기 직전, 그 팀 로스터 기준" 역할을
+        # 이적 순간에 한 번 계산해 같이 남긴다. world_browser.py의 반기
+        # 표시(_half_season_league_entry)가 이 값을 쓰면, 상/하반기 두
+        # 줄이 각자 그 시점 소속팀 기준으로 다른 역할을 보여줄 수 있다
+        # (year 하나로만 찾는 ai_player_position_history.role은 그 해
+        # "최종/하반기" 소속팀 스냅샷 하나뿐이라 상반기 팀엔 못 쓴다).
+        "ALTER TABLE ai_transfer_log ADD COLUMN player_role TEXT DEFAULT ''",
     ]:
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,
@@ -2080,6 +2103,7 @@ def init_db():
     repair_stray_intl_is_my_flags()   # 복수국적 미선택국 is_my 오염 정리 (1회성, 아래 참고)
     repair_cwc_match_groups()   # 클럽월드컵 매치 grp 백필 (1회성, 아래 참고)
     _migrate_history_tables()   # 선수 이력 2표 고아행 정리 + WITHOUT ROWID 재구축 (1회성, 아래 참고)
+    _migrate_phantom_career_entries()   # 유령 재직기록(길이0·0경기) 정리 (1회성, 아래 참고)
     compact_existing_match_archive()   # 기존 세이브 match_results_archive 요약+정리 (1회성, 아래 참고)
     # [2026-08 신설] init_db()는 QA/AB테스트 스크립트 등이 DB_PATH를 바꿔가며
     # 같은 프로세스 안에서 여러 번 호출하기도 한다 — 그때마다 get_state()
@@ -2634,6 +2658,46 @@ def _migrate_history_tables():
     print(f"[MIGRATE] 선수 이력 표 재구축 완료 {_t_mig.perf_counter()-_t0:.2f}s")
 
 
+def _migrate_phantom_career_entries():
+    """[2026-08 신설, 신민용 리포트: "선수 검색에 이전 팀+새 팀이 그 해에
+    같이 뜬다 — 불필요한 중복"] game_engine.join_team()의 "이전 팀 커리어
+    기록 닫기" 호출이 예전엔 이미 닫혀 있는 항목(예: 44~52주 국제
+    오프시즌에 수락한 오퍟가 다음 시즌 시작 주차에 실행될 때, 그 사이
+    연도가 넘어가면서 _advance_week가 먼저 닫아버린 경우)을 다시 닫으려
+    하면 "닫을 게 없으면 그냥 새로 하나 INSERT"해버려서, 시작=끝이 완전히
+    같은 시각(같은 연도·같은 주차)이고 경기 수도 0인 길이 0짜리 유령
+    재직 기록이 생겼다(코드는 이번에 고쳤지만 — join_team() 호출부에
+    allow_insert=False 추가 — 이미 지난 플레이에서 생성된 이 유령 행은
+    세이브에 그대로 남아있으므로 별도로 정리해야 한다).
+
+    이런 행은 진짜 재직 기록일 수가 없다(시작 시각과 끝 시각이 완전히
+    같으면서 경기를 하나도 안 뛴 재직 기간은 이 게임에 존재하지 않음 —
+    정상적인 재직은 항상 닫히는 시점이 시작 시점보다 뒤이거나, 적어도
+    한 경기 이상의 활동 기록을 남긴다) — 조건에 맞는 행은 무조건 삭제해도
+    안전하다. meta 플래그로 세이브당 1회만 돈다."""
+    conn = get_conn(); c = conn.cursor()
+    try:
+        done = c.execute(
+            "SELECT value FROM meta WHERE key='career_entries_phantom_cleanup_v1'").fetchone()
+    except sqlite3.OperationalError:
+        return
+    if done and done["value"] == "1":
+        return
+    try:
+        n = c.execute(
+            """DELETE FROM career_entries
+               WHERE end_year > 0
+                 AND start_year = end_year AND start_week = end_week
+                 AND matches = 0 AND wins = 0 AND draws = 0 AND losses = 0"""
+        ).rowcount
+        c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('career_entries_phantom_cleanup_v1','1')")
+        conn.commit()
+        if n:
+            print(f"[MIGRATE] career_entries 유령 재직기록 {n}건 정리")
+    except sqlite3.OperationalError as e:
+        print(f"[MIGRATE] career_entries 유령 재직기록 정리 건너뜀: {e}")
+
+
 def repair_cwc_match_groups():
     """[2026-07 버그 수정, 신민용 리포트: "클럽월드컵 경기 일정 여니
     'no such column: grp' 에러"] cwc_matches 테이블에 애초에 grp 컬럼이
@@ -3170,7 +3234,13 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
               # [2026-08 신설] my_player 전용 연도별 OVR 아카이브도 새
               # 게임에서 비워야 한다 — 안 비우면 새로 만든 캐릭터의 선수
               # 검색 화면에 이전 캐릭터의 OVR 이력이 그대로 뜬다.
-              "my_player_ovr_history"]:
+              "my_player_ovr_history",
+              # [2026-08 신설] my_player 전용 연도별 포지션/역할 아카이브도
+              # 같은 이유로 비운다 — 바로 위 my_player_ovr_history와 정확히
+              # 같은 실수(새 표를 이 목록에 추가하는 걸 깜빡함)를 이 프로젝트가
+              # 이미 ai_player_position_history에서 한 번 겪은 적이 있어서
+              # (_migrate_history_tables 주석 참고) 신설 시점에 바로 같이 넣는다.
+              "my_player_position_history"]:
         c.execute(f"DELETE FROM {t}")
     c.execute("UPDATE teams SET wins=0,draws=0,losses=0,goals_for=0,goals_against=0")
     _reset_teams_to_league_data(c)

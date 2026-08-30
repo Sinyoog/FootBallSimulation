@@ -3166,7 +3166,18 @@ RELEASE_REL_THRESHOLD = 30
 def tier_weights_by_ovr(ovr):
     # 반환값: [tier1, tier2, tier3, tier4, tier5] 가중치
     # 4·5부는 OVR이 낮을수록, 1부는 OVR이 높을수록 가중치 높음
-    if ovr >= 80:   return [70, 22, 6,  2,  0]
+    # [2026-08 신설, 신민용+GPT 검토: "오퍼 시스템 재설계 — OVR 80 이상을
+    # 전부 동일하게(70/22/6/2/0) 취급하면 OVR80과 OVR100이 '어느 티어를
+    # 시도해볼지'에서 구분이 안 된다. 7부에서 OVR95 같은 괴물급은 6부→
+    # 5부→4부를 굳이 안 거치고 1부 후보로 바로 잡히는 게 더 자연스럽다"는
+    # 논의 결과, 80대를 그대로 두고 90~94/95+ 두 구간을 추가로 쪼갠다.
+    # 1부 비중을 100%에 가깝게 밀어붙이진 않는다(신민용 확정: "1부 100%는
+    # 피해야 함") — 2부 이하로도 소량은 흘러가게 남겨서, 최종 통과 여부는
+    # 여전히 _team_fits_me()의 실제 팀 수준 매칭에 맡긴다. 이 표는 '어느
+    # 티어를 후보로 뽑아볼지'의 확률일 뿐, 오퍼 성사 자체를 보장하지 않는다.
+    if ovr >= 95:   return [88, 10, 2,  0,  0]
+    elif ovr >= 90: return [80, 16, 3,  1,  0]
+    elif ovr >= 80: return [70, 22, 6,  2,  0]
     elif ovr >= 70: return [45, 35, 14, 5,  1]
     elif ovr >= 60: return [20, 38, 28, 11, 3]
     elif ovr >= 50: return [8,  28, 38, 20, 6]
@@ -3373,6 +3384,57 @@ def transfer_region_mod(my_continent: str, target_continent: str) -> float:
     if my_continent == target_continent:
         return SAME_CONTINENT_TRANSFER_BONUS
     return TRANSFER_REGION_MOD.get((my_continent, target_continent), DEFAULT_CROSS_CONTINENT_PENALTY)
+
+
+# [2026-08 신설, 신민용+GPT 검토: "해외 자동 오퍼(_fill_foreign_pool)에는
+# 대륙 보정이 전혀 안 걸려 있다 — 국가 등급만 보고 완전 무작위로 나라를
+# 고른다"] transfer_region_mod()는 원래 직접 지원(calc_apply_prob_with_
+# context) 전용으로 설계됐고, 그 값(+4/-6/-10 등)은 "마진에 더하는 점수"
+# 스케일이다 — 이 숫자를 그대로 후보 선택 확률의 배수로 쓰면 안 된다
+# (신민용 지적: "+4를 4배로 바꾸면 밸런스가 완전히 달라진다"). 그래서
+# 마진용 스케일과 완전히 분리된, 후보 가중치 전용의 완만한 변환을 하나
+# 더 둔다. 0.05/점 기울기 + [0.35, 1.5] 클램프로 잡아서, 같은 대륙(+4)은
+# 약 1.2배, 아시아→유럽(-9)은 약 0.55배 수준의 "부드러운 쏠림"만
+# 만든다 — 이걸로 오퍼 자체가 막히거나 폭증하지 않는다(최종 성사 여부는
+# 여전히 _team_fits_me()의 실력 게이트가 결정).
+REGION_WEIGHT_SLOPE = 0.05
+REGION_WEIGHT_MIN = 0.35
+REGION_WEIGHT_MAX = 1.5
+
+
+def foreign_pool_region_weight(my_continent: str, target_continent: str) -> float:
+    """_fill_foreign_pool 등 '해외 후보국 선택' 단계 전용 가중치 배수.
+    transfer_region_mod()와 원본 정의(TRANSFER_REGION_MOD)는 그대로
+    재사용하되, 결과값은 마진 점수가 아니라 0.35~1.5 사이의 배수로
+    변환해서 돌려준다 — 직접 지원 쪽 마진 계산과는 완전히 독립적이다."""
+    mod = transfer_region_mod(my_continent, target_continent)
+    mult = 1.0 + mod * REGION_WEIGHT_SLOPE
+    return max(REGION_WEIGHT_MIN, min(REGION_WEIGHT_MAX, mult))
+
+
+# [2026-08 신설, 신민용+GPT 검토: "브라질처럼 해외로 선수가 많이 나가는
+# 나라가 있다 — 근데 이걸 국가쌍 override 수십 개(브라질→포르투갈,
+# 브라질→일본, 브라질→한국...)로 만들면 나중에 계속 늘어나기만 한다.
+# 목적지 안 가리고 '이 나라 선수는 해외에 자주 노출된다'는 단일 배수
+# 하나면 충분하다"] 국가쌍 테이블 대신 국가 단독 배수로 시작한다.
+# [2026-08 확정, 신민용 지적: "이미 대륙가중치+티어가중치까지 겹치니
+# 1.5배는 세다 — 1.15~1.25 정도로 보수적으로 시작해서 시뮬레이션 보고
+# 조정하자"] 초기값은 구간 하단에 가깝게 잡는다. foreign_pool_region_
+# weight()와는 완전히 별개의 곱셈 항으로 적용해야 한다 — 두 가중치를
+# 한 변수에 합쳐버리면, 나중에 "브라질 선수가 왜 과도하게 해외로 나가나"
+# 를 조사할 때 대륙 효과인지 수출국 효과인지 구분할 수 없게 된다.
+EXPORT_MARKET_BONUS = {
+    "브라질": 1.20,
+    "아르헨티나": 1.15,
+    "나이지리아": 1.15,
+}
+
+
+def export_market_weight(country: str) -> float:
+    """해외 후보국 선택 시 곱하는 '선수 수출 성향' 배수. 목적지와 무관하게
+    출신국 하나로만 결정 — foreign_pool_region_weight()와 독립적인 별도
+    항이라 로그/디버깅 시 두 효과를 분리해서 볼 수 있다."""
+    return EXPORT_MARKET_BONUS.get(country, 1.0)
 
 
 # [신규] 나라별 OVR 미세조정 — 같은 등급(A 등) 안에서도 실제로는 재정·용병

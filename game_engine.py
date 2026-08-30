@@ -910,8 +910,13 @@ def create_player(name: str, position: str, sub_role: str,
     # position_history)도 같은 이유로 시작 연도에 한 번 채워둔다 —
     # ai_lifecycle.seed_initial_ovr_history와 완전히 같은 목적, ui.
     # formation_widget 의존성 때문에 ai_lifecycle.py 쪽에 둔 함수다.
-    from ai_lifecycle import seed_initial_position_history
+    from ai_lifecycle import seed_initial_position_history, snapshot_my_player_position
     seed_initial_position_history(_start_year)
+    # [2026-08 신설] my_player도 같은 이유로 시작 연도 포지션/역할을
+    # 남겨둔다(안 그러면 선수 검색에서 나를 조회했을 때 그 해만 영구히
+    # 빈칸) — 다만 대부분 이 시점엔 아직 무소속(다음 해부터 입단 가능)
+    # 이라 실제로는 조용히 아무 것도 안 남기고 끝나는 게 정상이다.
+    snapshot_my_player_position(_start_year)
 
     # [전성기 OVR] 시작 OVR로 초기화 (이후 update_player가 자동으로 최고치 갱신).
     conn.execute("UPDATE my_player SET peak_ovr=? WHERE id=1", (ovr,))
@@ -1322,6 +1327,32 @@ def _ensure_career_entry(p, st):
     global _pending_transfer_type
     tid = p.get("current_team_id", 0)
     if not tid: return
+
+    # [버그수정 2026-08, 신민용 리포트: "2001년 50주차에 이적을 확정했는데
+    # 실제 반영(join_team 실행)은 2002년 시즌 시작(FIRST_HALF_START=4주)에
+    # 되고, 그 사이 2002년 1~3주차 동안 예전 팀(아솔 클라로 누마즈) 소속의
+    # 0승0무0패짜리 유령 '상반기' 기록이 낀다"] reserve_join_transfer로
+    # 예약된 이적(pending_join_transfer_json)이 있으면, 실제 실행 시점
+    # (_execute_pending_join_transfer)까지는 current_team_id가 아직 '떠날
+    # 팀'을 그대로 가리킨다. 그런데 하필 연도가 막 넘어간 직후라
+    # _close_career_entry가 그 팀의 항목을 이미 정상적으로 닫아놨다면, 이
+    # 함수는 "열린 항목이 없다"고 보고 그 사이 몇 주(보통 1~3주)만 걸치는
+    # 완전히 가짜인 새 스틴트를 또 만들어버렸다 — 그 몇 주 동안은 실제로
+    # 뛴 경기가 없어(0승0무0패) 이적이 실행되며 그대로 닫히면 "0승0무0패
+    # 유령 상반기" 행으로 화면에 남았다(world_browser.get_my_player_career_
+    # history의 "같은 해 안에서 시작·종료" 스틴트는 진짜 반기 이적과 구분할
+    # 방법이 없어 걸러내지 못함). 예약된 이적이 있고 그 대상 팀이 지금
+    # 팀과 다르면, 지금 팀에서의 재직은 사실상 이미 끝난 것이므로 새 항목을
+    # 만들지 않는다 — 이적이 실제로 실행될 때 join_team()이 이미 닫혀 있는
+    # 그 항목에 exit_type만 정확히 덧칠한다(allow_insert=False 분기).
+    try:
+        _pending_raw = p.get("pending_join_transfer_json") or ""
+        if _pending_raw:
+            _pending = json.loads(_pending_raw)
+            if _pending.get("team_id") and _pending["team_id"] != tid:
+                return
+    except Exception:
+        pass
 
     conn = get_conn()
     c = conn.cursor()
@@ -9842,6 +9873,16 @@ def _end_of_season(p, year, progress_cb=None):
     except Exception as _e:
         print(f"[내 OVR 아카이브 오류] {year}년: {_e}")
 
+    # [2026-08 신설, 신민용 요청: "선수 검색에서 AI는 연도별 주전/로테이션/
+    # 대기/유망주가 뜨는데 나는 왜 안 뜨냐"] 바로 위 OVR 아카이브와 같은
+    # 시점·같은 방어 패턴(실패해도 연도 전환 자체를 막지 않음)으로 내
+    # 포지션/역할도 한 줄 남긴다.
+    try:
+        from ai_lifecycle import snapshot_my_player_position
+        snapshot_my_player_position(year)
+    except Exception as _e:
+        print(f"[내 포지션 아카이브 오류] {year}년: {_e}")
+
     if DEBUG_RELEGATION_TRACKING:
         for _tid in _RELEGATION_DEBUG_TRACK:
             _relegation_debug_snapshot(_tid, "개막 직전(이적시장 마감 후)")
@@ -12330,6 +12371,10 @@ def generate_offers(count=5, force=False) -> list:
     age         = p.get("age", 17)
     agent       = p.get("agent_grade", AGENT_NONE)
     nationality = p.get("nationality", "")
+    # [2026-08 신설, 15-7-1] 해외 자동 오퍼(_fill_foreign_pool) 후보국
+    # 가중치용 — 직접 지원(calc_apply_prob_with_context)에만 걸려있던
+    # 대륙 접근성 보정을 패시브 오퍼에도 연결하기 위해 미리 구해둔다.
+    _my_continent = get_country_continent(nationality)
     has_team    = bool(p.get("current_team_id", 0))
     my_tid      = p.get("current_team_id", 0)
     grades      = _suitable_grades(ovr, agent)
@@ -12542,6 +12587,20 @@ def generate_offers(count=5, force=False) -> list:
         if _unproven_tier_floor is not None and _unproven_tier_floor <= _max_t:
             _tiers = list(range(_unproven_tier_floor, _max_t + 1))
             _weights = tier_weights_by_ovr_n(ovr, _max_t)[_unproven_tier_floor - 1:]
+            # [2026-08 버그수정, 시나리오 테스트 중 발견: "ValueError: Total
+            # of weights must be greater than zero"] tier_weights_by_ovr는
+            # 고OVR일수록 뒷쪽(하위) tier 가중치가 0으로 떨어지는 표다
+            # (예: OVR95는 [88,10,2,0,0,0,0]). unproven_tier_floor가 딱
+            # 그 0-가중치 구간만 남기고 잘라버리면(예: 7부 소속 미검증
+            # OVR95가 6~7부로만 후보 제한) 슬라이스 합이 0이 되어
+            # random.choices가 죽는다 — 이 버그는 이번 15-7-1 변경 이전에도
+            # OVR80대에서 이미 존재했다(단지 못 뛴 신인이 드물어 안 걸렸을
+            # 뿐). 전부 0이면 허용된 tier 안에서 균등 추첨으로 폴백한다 —
+            # "검증 안 된 신인은 후보 tier 폭 자체를 좁힌다"는 원래 설계
+            # 의도(높은 OVR이 그 좁은 범위 안에서까지 상위쪽으로 쏠릴
+            # 필요는 없음)와도 자연스럽게 맞는다.
+            if sum(_weights) <= 0:
+                _weights = [1] * len(_tiers)
         _tr = 0
         while len(pool) < want and _tr < 60:
             _tr += 1
@@ -12598,6 +12657,28 @@ def generate_offers(count=5, force=False) -> list:
 
         _f_tiers   = [1, 2, 3]
         _f_weights = tier_weights_by_ovr_n(ovr, 3)
+        # [2026-08 버그수정, 검증 테스트 중 발견: "17세 미검증 OVR95가 7부
+        # 소속인데 해외 1부 오퍼가 계속 뜬다"] _unproven_tier_floor/
+        # _unproven_margin_cap은 원래 "OVR94 신급 재능이 0경기로 스페인
+        # 1부/2부 오퍼를 받는다"는 리포트(15-6 사전조치 2단계 주석 참고)를
+        # 막으려고 만든 장치인데, 실제 구현은 _fill_country_pool(국내/
+        # 고향/직전리그처럼 특정 국가 하나를 지정해서 채우는 풀)에만
+        # 적용돼 있었고, 정작 "국가 등급으로 무작위 해외국을 고르는" 이
+        # _fill_foreign_pool엔 전혀 연결이 안 돼 있었다 — 그래서 정확히
+        # 그 버그가 해외 오퍼 경로로는 여전히 재현된다(margin 체크만으론
+        # 못 걸러짐: OVR95는 이미 웬만한 팀 평균보다 높아 margin cap이
+        # 3.0이어도 거의 항상 통과). _fill_country_pool과 동일한 원리로
+        # 후보 tier 폭 자체를 제한한다 — 미검증 선수는 원래 해외 후보
+        # tier인 [1,2,3]과 "국내 tier - reach" 범위의 교집합만 허용한다.
+        if _unproven_tier_floor is not None:
+            _f_tiers_allowed = [t for t in _f_tiers if t >= _unproven_tier_floor]
+            if not _f_tiers_allowed:
+                return pool   # 미검증 + 국내 최하위권 → 해외 1~3부 후보 자체가 없음(정상)
+            _idx = [_f_tiers.index(t) for t in _f_tiers_allowed]
+            _f_tiers = _f_tiers_allowed
+            _f_weights = [_f_weights[i] for i in _idx]
+            if sum(_f_weights) <= 0:
+                _f_weights = [1] * len(_f_tiers)
         _tr = 0
         while want > 0 and _tr < 80:
             _tr += 1
@@ -12629,7 +12710,27 @@ def generate_offers(count=5, force=False) -> list:
             if not cands:
                 continue
             cands.sort(key=lambda r: _team_avg_cache_offers.get(r["id"], 0), reverse=True)
-            _w = [get_passive_offer_rank_weight(i + 1) for i in range(len(cands))]
+            # [2026-08 신설, 15-7-1, 신민용+GPT 검토: "패시브 해외 오퍼가
+            # 국가 등급만 보고 완전 무작위로 나라를 골라서, 같은 대륙끼리
+            # 오퍼가 많아야 한다는 현실감이 전혀 없다"] 순위 가중치(_w)에
+            # foreign_pool_region_weight()를 한 번 더 곱한다 — 마진 스케일
+            # (+4/-6/-10)을 그대로 배수로 쓰지 않고, 별도로 0.35~1.5 사이로
+            # 압축된 완만한 가중치만 적용한다(값 자체는 transfer_region_mod
+            # 재사용, 변환은 별개 — 값 정의 이원화 방지). 마진 게이트
+            # (_team_fits_me)는 그대로이므로 오퍼 총량/성사 여부엔 영향 없고,
+            # "같은 후보군 안에서 어느 나라가 더 자주 뽑히는가"만 바뀐다.
+            # [2026-08 신설, 15-7-2] EXPORT_MARKET_BONUS(수출국 배수)를
+            # foreign_pool_region_weight(대륙 배수)와 별개의 곱셈 항으로
+            # 유지한다 — 신민용 지적대로 두 개를 한 줄에 뭉쳐버리면 나중에
+            # "이 나라가 해외 후보에 과도하게 뽑히는 게 대륙 때문인지
+            # 수출국 보정 때문인지" 구분이 안 된다. 각 항을 별도 리스트로
+            # 먼저 만들고 마지막에 합치는 방식으로 분리해둔다(둘 중 하나만
+            # 끄고 테스트하기도 쉬워진다).
+            _rank_w   = [get_passive_offer_rank_weight(i + 1) for i in range(len(cands))]
+            _region_w = [foreign_pool_region_weight(_my_continent, get_country_continent(r["country"]))
+                         for r in cands]
+            _export_w = [export_market_weight(r["country"]) for r in cands]
+            _w = [a * b * e for a, b, e in zip(_rank_w, _region_w, _export_w)]
             row = random.choices(cands, _w)[0]
             _wealth_g = get_league_grade(row["country"], row["grade"])
             salary = _calc_offer_salary(p, _wealth_g, tier, ovr, row["country"], row["name"],
@@ -14810,8 +14911,26 @@ def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None
         if transfer_type == "판매추진" and offer:
             exit_t = "판매추진"
             _sale_push_fee = offer.get("transfer_fee")
+        # [2026-08 버그수정, 신민용 리포트: "50주차에 오퍟 수락했는데 선수
+        # 검색에 그 해(도착 연도) 이전 팀도 같이 뜬다 — 불필요한 중복
+        # 기록"] reserve_join_transfer로 예약된 이적은 "다음 시즌 구간
+        # 시작"에 실행되는데, 그 시점이 연도 경계를 막 넘은 직후라면
+        # _advance_week가 "연도 넘어갈 때 현재 팀 커리어 항목 닫기"
+        # (_close_career_entry)를 이미 먼저 실행해서 이전 팀 항목이 그
+        # 시점에 이미 닫혀 있는 경우가 흔하다(특히 국제 오프시즌인 44~52
+        # 주차에 수락한 오퍟는 항상 이렇게 된다). 그런데 아래 _save_career_
+        # entry는 allow_insert 기본값(True)이라, "닫을 열린 항목이 없으면"
+        # (existing=None) 그냥 넘어가는 대신 완전히 새로운 행을 INSERT해
+        # 버렸다 — start_year=end_year=cur_year(join_team 실행 시점의
+        # 스태일한 연도/주차)인 길이 0짜리 유령 행이 이전 팀 이름으로
+        # 하나 더 생기는 것("2003 이전팀 + 2003 새팀" 중복의 정체). 이미
+        # 닫혀 있으면 새로 만들 필요가 없다 — allow_insert=False로 넘기면
+        # _save_career_entry가 "이미 닫힌 항목만 존재" 분기를 타서, 새
+        # 행을 만드는 대신 가장 최근에 닫힌 그 팀 항목에 exit_type만
+        # 덧칠한다(정상 케이스—열린 항목이 아직 있는 경우—는 existing이
+        # 잡히므로 이 옵션과 무관하게 기존과 동일하게 동작).
         _save_career_entry(p, cur_year, cur_week, force_new=True, exit_type=exit_t,
-                           transfer_fee=_sale_push_fee)
+                           transfer_fee=_sale_push_fee, allow_insert=False)
         # [2026-07 버그수정, 신민용 리포트: "임대 중에 새 팀으로 오퍼가 오면
         # 임대 개념이 사라져야 하는데 안 그렇다"] 임대 중(loan_from_team_id
         # 세팅됨)에 다른 팀 오퍼를 수락해서 join_team이 또 호출되면, 이

@@ -177,7 +177,11 @@ class LogPanel(QWidget):
         # 걸러서 그리기 위함. 매년 초기화되므로(연도 경계에서 리셋)
         # "20년 쌓인 로그" 성능 문제와는 무관하게 항상 최대 1년치만 쌓인다.
         self._year_entries = []  # [(text, log_type), ...]
-        self._filter_mode = "all"  # "all" | "core" | "match" | "news"
+        # [2026-08 신설, 신민용 요청: "뉴스를 선택하고 게임을 끄면 다시
+        # 켰을 때도 뉴스가 고정되어 있으면 좋겠다"] ui/player_panel.py의
+        # 탭 선택 저장과 동일한 방식(meta 표)으로 마지막 선택 필터를
+        # 기억해서 시작할 때 복원한다. "all" | "core" | "match" | "news"
+        self._filter_mode = self._load_saved_filter_mode()
         # [2026-08 신설, 신민용 요청: "이적 뉴스가 뜨자마자 지워진다 —
         # 뉴스 탭은 연도별로 계속 쌓이고 1년 단위로 안 잘렸으면"] 다른
         # 탭(all/core/match)은 self._year_entries가 매년 통째로 갈아
@@ -208,7 +212,7 @@ class LogPanel(QWidget):
             btn.clicked.connect(lambda _checked, m=mode_key: self._set_filter_mode(m))
             header_row.addWidget(btn)
             self._mode_buttons[mode_key] = btn
-        self._mode_buttons["all"].setChecked(True)
+        self._mode_buttons[self._filter_mode].setChecked(True)
         lay.addWidget(header_w)
 
         self.te = QTextBrowser()
@@ -254,7 +258,40 @@ class LogPanel(QWidget):
         if mode == self._filter_mode:
             return
         self._filter_mode = mode
+        self._save_filter_mode()
         self._render_full()
+
+    # ── 필터 선택 저장/복원 ─────────────────────────
+    # [2026-08 신설, 신민용 요청: "뉴스를 선택하고 게임을 끄면 다시 켰을
+    # 때 뉴스가 고정되어 있었으면"] ui/player_panel.py._ORDER_META_KEY와
+    # 완전히 동일한 패턴 — 세이브의 meta 표에 마지막 선택을 얹어둔다(이
+    # 게임은 설정 파일을 따로 안 두고 meta를 잡다한 1회성 플래그
+    # 보관소로 이미 쓰고 있음). 저장/복원 실패는 전부 조용히 삼키고
+    # 기본값("전체")으로 폴백 — 화면 설정일 뿐이라 실패해도 게임
+    # 진행에는 아무 영향이 없어야 한다.
+    _MODE_META_KEY = "ui_log_panel_filter_mode"
+    _VALID_MODES = ("all", "core", "match", "news")
+
+    def _load_saved_filter_mode(self) -> str:
+        try:
+            from database import get_conn
+            row = get_conn().execute(
+                "SELECT value FROM meta WHERE key=?", (self._MODE_META_KEY,)).fetchone()
+            if row and row["value"] in self._VALID_MODES:
+                return row["value"]
+        except Exception:
+            pass
+        return "all"
+
+    def _save_filter_mode(self):
+        try:
+            from database import get_conn
+            conn = get_conn()
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                         (self._MODE_META_KEY, self._filter_mode))
+            conn.commit()
+        except Exception:
+            pass
 
     def _render_full(self):
         """self._year_entries 전체를 현재 필터 모드로 걸러 setHtml로

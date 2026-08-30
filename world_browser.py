@@ -981,8 +981,8 @@ def get_ai_player_team_timeline(player_id, current_team_id):
     start_year=None은 "그 이전 전체", end_year=None은 "그 이후 전체"."""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT year, from_team_id, to_team_id, player_position FROM ai_transfer_log "
-        "WHERE player_id=? ORDER BY year ASC", (player_id,)).fetchall()
+        "SELECT year, from_team_id, to_team_id, player_position, is_mid_season FROM ai_transfer_log "
+        "WHERE player_id=? ORDER BY year ASC, is_mid_season DESC", (player_id,)).fetchall()
     if not rows:
         name_row = conn.execute("SELECT name FROM teams WHERE id=?", (current_team_id,)).fetchone()
         conn.close()
@@ -996,20 +996,33 @@ def get_ai_player_team_timeline(player_id, current_team_id):
                    conn.execute(f"SELECT id, name FROM teams WHERE id IN ({ph})", list(team_ids))}
     conn.close()
 
-    # [2026-08 신설, 신민용 요청: "소속팀일 때 포지션이 뭐였는지도 적어야
-    # 하는거 아니야 — 팀마다 포지션이 다르잖아"] ai_transfer_log.player_position
-    # 은 그 이적이 일어난 "순간"에 기록해둔 포지션이다(연도별 아카이브는
-    # 아니고 이적 시점 스냅샷). 첫 이적 이전 구간(소급 추정 구간)은 알
-    # 방법이 없으니 첫 이적 시점 값으로 근사한다 — team_id를 첫 이적의
-    # from_team_id로 소급 추정하는 것과 같은 원칙(정확한 값이 없으면
-    # 가장 가까운 시점의 값으로 근사, 완전히 지어내지 않음).
-    segments = [{"start_year": None, "end_year": rows[0]["year"],
+    # [2026-08 버그수정, 신민용 스크린샷 리포트: "선수 검색에 그 해 이전
+    # 팀+새 팀이 같이 뜬다"] ai_transfer_log.year는 두 종류의 이적에서
+    # 서로 다른 의미다 — 겨울 이적시장(is_mid_season=1, ai_lifecycle.
+    # run_ai_mid_season_transfer)은 그 이적이 실제로 일어난 "그 해"를
+    # 그대로 찍지만, 연간 오프시즌 이적(is_mid_season=0, run_ai_offseason)은
+    # "그 시즌이 막 끝난 해"를 찍는다(game_engine._end_of_season(p,
+    # new_year-1)이 그 값을 그대로 run_ai_offseason에 넘김) — 실제로 새
+    # 팀에 합류하는 건 항상 그 다음 해부터인데, 아래 세그먼트 경계가
+    # 이 두 종류를 구분 없이 raw year 그대로 썼다. 그 결과 오프시즌
+    # 이적으로 옮긴 해(year) 자체가 "새 팀 소속"으로 잘못 잡혀서(원래는
+    # 그 해 끝까지 이전 팀 소속이어야 함), 원 소속팀의 진짜 그 해 기록이
+    # 통째로 사라지고 새 팀 쪽으로 밀려 들어갔다 — 그 새 팀이 하필 같은
+    # 해에 또 겨울 이적시장으로 옮긴 경우, "이전 팀"(원래 그 해를 채워야
+    # 했던 팀)과 "새 팀"(오프시즌 이적으로 잘못 당겨진 소속)이 같은
+    # 연도에 나란히 뜨는 것처럼 보였다. 실제 발효 연도(effective year)를
+    # 이적 종류별로 따로 계산해 세그먼트 경계로 쓴다 — 겨울 이적시장은
+    # year 그대로, 오프시즌 이적은 year+1(다음 해부터 새 팀 소속).
+    def _eff_year(r):
+        return r["year"] if r["is_mid_season"] else r["year"] + 1
+
+    segments = [{"start_year": None, "end_year": _eff_year(rows[0]),
                  "team_id": rows[0]["from_team_id"],
                  "team_name": name_by_tid.get(rows[0]["from_team_id"], "?"),
                  "position": rows[0]["player_position"] or None}]
     for i, r in enumerate(rows):
-        end = rows[i + 1]["year"] if i + 1 < len(rows) else None
-        segments.append({"start_year": r["year"], "end_year": end,
+        end = _eff_year(rows[i + 1]) if i + 1 < len(rows) else None
+        segments.append({"start_year": _eff_year(r), "end_year": end,
                           "team_id": r["to_team_id"],
                           "team_name": name_by_tid.get(r["to_team_id"], "?"),
                           "position": r["player_position"] or None})
@@ -1150,25 +1163,27 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
     # 빈 값("-")으로 둔다(리그 성적만 상반기 기준으로 정확히 보여준다).
     conn = get_conn()
     mid_rows = conn.execute(
-        "SELECT year, from_team_id, player_position FROM ai_transfer_log "
+        "SELECT year, from_team_id, player_position, player_role FROM ai_transfer_log "
         "WHERE player_id=? AND is_mid_season=1",
         (player_id,)).fetchall()
-    mid_by_year = {r["year"]: (r["from_team_id"], r["player_position"]) for r in mid_rows}
+    mid_by_year = {r["year"]: (r["from_team_id"], r["player_position"], r["player_role"])
+                   for r in mid_rows}
     if mid_by_year:
         final_out = []
         for e in out:
             final_out.append(e)
-            from_tid, half_pos = mid_by_year.get(e["year"], (None, None))
+            from_tid, half_pos, half_role = mid_by_year.get(e["year"], (None, None, None))
             if from_tid:
                 final_out.append(_half_season_league_entry(conn, from_tid, e["year"],
-                                                             half_position=half_pos))
+                                                             half_position=half_pos,
+                                                             half_role=half_role))
         out = final_out
     conn.close()
 
     return {"awards": awards, "years": out}
 
 
-def _half_season_league_entry(conn, team_id, year, half_position=None):
+def _half_season_league_entry(conn, team_id, year, half_position=None, half_role=None):
     """[2026-08 신설, 상반기/하반기 이적 기록 분리 기능] league_season_
     standings_half(하반기 시작 순간에 떠둔 상반기까지의 순위 스냅샷)에서
     이 팀의 그 해 상반기 성적 한 줄을 만든다. get_team_history의 연도별
@@ -1186,7 +1201,16 @@ def _half_season_league_entry(conn, team_id, year, half_position=None):
              # 이름을 그대로 쓰라"는 신호로 읽는다 — 같은 연도의 두 줄이
              # 서로 다른 팀 소속임을 정확히 구분해서 보여주기 위함.
              "_is_half": True, "_half_team_name": trow["name"] if trow else "?",
-             "_half_position": half_position or None}
+             "_half_position": half_position or None,
+             # [2026-08 신설, 신민용 리포트: "상반기 팀에 역할이 안 뜬다 —
+             # 뜨더라도 하반기 팀이랑 완전히 똑같이 뜨는데 실제로는 상반기
+             # 팀에서 후보였다"] ai_transfer_log.player_role(이적 나가기
+             # 직전, 그 팀 로스터 기준으로 이적 순간에 계산해둔 값 —
+             # ai_lifecycle._transfer_market 참고)을 그대로 싣는다. UI가
+             # role_checkpoints(그 해 "최종/하반기" 소속팀 스냅샷 하나뿐)
+             # 대신 이 값을 쓰면, 상반기 팀은 상반기 팀 기준 역할을 보여줄
+             # 수 있다.
+             "_half_role": half_role or None}
     row = conn.execute(
         "SELECT league_id, wins, draws, losses, goals_for, goals_against "
         "FROM league_season_standings_half WHERE team_id=? AND year=?",
@@ -1269,6 +1293,27 @@ def get_my_player_ovr_checkpoints():
     rows = conn.execute("SELECT year, ovr FROM my_player_ovr_history ORDER BY year ASC").fetchall()
     conn.close()
     return {r["year"]: r["ovr"] for r in rows}
+
+
+def get_my_player_position_checkpoints():
+    """get_ai_player_position_checkpoints의 my_player 버전 — my_player_
+    position_history(ai_lifecycle.snapshot_my_player_position이 매
+    시즌전환마다 기록)에서 그대로 읽는다. 반환: {year: position}."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT year, position FROM my_player_position_history ORDER BY year ASC").fetchall()
+    conn.close()
+    return {r["year"]: r["position"] for r in rows if r["position"]}
+
+
+def get_my_player_role_checkpoints():
+    """get_ai_player_role_checkpoints의 my_player 버전 — 같은 테이블의
+    role 컬럼에서 읽는다. 반환: {year: role}."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT year, role FROM my_player_position_history ORDER BY year ASC").fetchall()
+    conn.close()
+    return {r["year"]: r["role"] for r in rows if r["role"]}
 
 
 def get_my_player_career_history():
@@ -1382,6 +1427,21 @@ def get_my_player_career_history():
             w = prev_st.get("wins") or 0
             d = prev_st.get("draws") or 0
             l = prev_st.get("losses") or 0
+            # [버그수정 2026-08, 신민용 리포트: "2002년 시즌 시작 전 팀(아솔
+            # 클라로 누마즈)이 2002년 상반기로 또 뜬다"] 위쪽의 "여러 해를
+            # 걸친 스틴트" 유령 방지 로직(_end_y -= 1)은 start_year==end_year
+            # (같은 해 안에서 시작·종료된) 스틴트는 애초에 대상으로 보지 않아,
+            # game_engine._ensure_career_entry가 예약 이적 실행 대기 중(다음
+            # 시즌 시작 전 며칠)에 실수로 만들어버린 "0경기짜리 같은 해 스틴트"
+            # 까지는 못 걸렀다(해당 근본 원인은 game_engine.py에서 직접
+            # 수정했지만, 이미 그 버그로 오염된 기존 세이브의 career_entries
+            # 에는 여전히 이런 0경기 유령 행이 남아있을 수 있다). 실제로 반년
+            # 가까이 뛴 재직이라면 무승부만 쌓였더라도 최소 한 경기는 있는 게
+            # 정상이므로, 0승0무0패인 반기 요약은 화면에 내보내지 않는다
+            # (진짜 있었던 재직 자체는 위 main_st/다른 스틴트에 이미 반영돼
+            # 있어 이 필터로 실제 커리어 정보가 사라지지 않는다).
+            if not (w + d + l):
+                continue
             lg_name = prev_st.get("league_name") or ""
             tier = prev_st.get("tier")
             record = f"{w}승 {d}무 {l}패"
