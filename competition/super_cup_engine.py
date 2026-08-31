@@ -136,6 +136,51 @@ _CONTINENTS = ("유럽", "아시아", "아프리카", "북남미")
 _SF_DAY = week_to_day(SC_START_WEEK)          # Day1 — 준결승 2경기
 _FINAL_DAY = _SF_DAY + 5                       # Day6 — 3·4위전 + 결승
 
+
+def _pick_sc_days(my_tid, cur_season):
+    """[2026-08 버그수정, 신민용 리포트: "슈퍼컵이 경기가 진행됐다고는
+    뜨는데 일정엔 안 보인다 — 리그랑 겹치면서 그러는 것 같다"] 원래
+    SF/결승 요일(_SF_DAY=그 주 1일차="일요일", _FINAL_DAY=+5일="금요일")은
+    고정값이라 국내리그와 실제로 같은 날 겹칠 수 있었다 — 특히 SF 요일
+    (일요일)은 game_engine._week_intl_cl_day(챔스/유로파/컨퍼런스/국내컵이
+    쓰는 국내리그 안 겹치는 요일 자동선택, 화→금→수→목→월→토→일 순으로
+    시도)가 정확히 "다른 요일이 전부 겹쳐야만 겨우 고르는 최후순위"로
+    다루는 요일이다 — 그만큼 국내리그가 자주 놓이는 요일이라는 뜻인데,
+    슈퍼컵 SF는 하필 그 요일에 못박혀 있었다. 같은 팀이 같은 날 국내리그
+    경기와 슈퍼컵 경기를 동시에 갖는 데이터 자체가 잘못이므로(화면
+    표시뿐 아니라 실제로도 한 팀이 하루에 두 경기를 뛰는 셈), _week_
+    intl_cl_day와 같은 원리(주변 주차 국내 경기일과 하루 이내로는 안
+    겹치게)로 "SF/결승 요일 조합" 후보 중 국내 경기와 안 겹치는 조합을
+    고른다. 후보는 (기존 기본값인 일+금) 다음으로 (월+토) 단 두 개뿐이다
+    — 결승이 SF보다 5일 뒤여야 한다는 설계(한 주 안에서 Day1→Day6)를
+    지키면서 그 주(week_start~+6) 안에 들어가려면 SF는 0 또는 1 오프셋
+    (그래야 SF+5가 6을 넘지 않음)만 가능하기 때문이다. 둘 다 겹치면
+    (극히 드문 경우) 기존 기본값을 그대로 쓴다 — 이전과 다를 바 없는
+    상황이니 나빠지진 않는다. 내 팀이 이 대회에 참가하지 않으면(my_tid=0,
+    AI끼리만 진행되는 나머지 3개 대륙) 국내 일정을 조회할 필요가 아예
+    없어 기본값을 그대로 쓴다 — AI 팀끼리는 겹쳐도 화면에 보이는 문제가
+    없고, 매번 이 조회를 하면 성능만 낭비된다."""
+    if not my_tid:
+        return _SF_DAY, _FINAL_DAY
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT day FROM match_results WHERE week IN (?,?,?) AND season=?
+           AND day IS NOT NULL AND (home_team_id=? OR away_team_id=?)""",
+        (SC_START_WEEK - 1, SC_START_WEEK, SC_START_WEEK + 1, cur_season,
+         my_tid, my_tid)).fetchall()
+    conn.close()
+    dom_days = [r["day"] for r in rows if r["day"] is not None]
+
+    def _conflicts(cand):
+        return any(abs(cand - dd) <= 1 for dd in dom_days if dd is not None)
+
+    week_start = _SF_DAY
+    for sf_off, f_off in ((0, 5), (1, 6)):
+        sf_cand, f_cand = week_start + sf_off, week_start + f_off
+        if not _conflicts(sf_cand) and not _conflicts(f_cand):
+            return sf_cand, f_cand
+    return _SF_DAY, _FINAL_DAY
+
 # [2026-08 최적화, club_world_cup_engine.py와 동일한 이유] 이 주차 이하로
 # 처리할 슈퍼컵 대회가 하나도 없는 날엔 DB 조회 없이 바로 빠지는 캐시.
 _sc_has_active_cache = None
@@ -219,10 +264,13 @@ def _build_super_cup(year, continent):
         return
 
     name = SUPER_CUP_NAME.get(continent, "슈퍼컵")
-    from game_engine import get_player
+    from game_engine import get_player, get_state
     p = get_player()
     my_tid = p.get("current_team_id", 0) if p else 0
     my_in = 1 if any(s[0] == my_tid for s in seeds) else 0
+    _st = get_state()
+    _cur_season = _st["current_season"] if _st else 1
+    sf_day, final_day = _pick_sc_days(my_tid if my_in else 0, _cur_season)
 
     conn = get_conn(); c = conn.cursor()
     c.execute("""INSERT INTO sc_tournaments(year, continent, name, status,
@@ -249,7 +297,7 @@ def _build_super_cup(year, continent):
     # OVR 기준으로 1v4/2v3으로 짝짓는다.
     t = get_tournament(SC_CFG, year, continent)
     start_knockout(SC_CFG, t, [s[0] for s in seeds], SC_ROUND_WEEKS)
-    _set_match_days(tid, "SF", _SF_DAY)
+    _set_match_days(tid, "SF", sf_day)
     # [2026-08 버그수정, 신민용 리포트: "챔스는 기록이 남는데 슈퍼컵은
     # 1년 다 돌려도 대회만 생기고 경기가 하나도 시뮬 안 된다"] 실제
     # 세이브로 재현됨: process_super_cup_week가 맨 처음(아직 챔스/유로파/
@@ -406,8 +454,15 @@ def process_super_cup_week(week, day=None):
 
         if sf and all(m["home_score"] >= 0 for m in sf) and not f_exists:
             advance_round(SC_CFG, t, "SF", "F", SC_ROUND_WEEKS)
-            _set_match_days(t["id"], "F", _FINAL_DAY)
-            _set_match_days(t["id"], "TP", _FINAL_DAY)
+            # [2026-08 버그수정] SF와 같은 (my_tid, season) 조합으로 다시
+            # 고르면 _pick_sc_days가 결정적이라 SF 생성 때와 정확히 같은
+            # 결승 요일이 나온다 — 별도로 저장해둘 필요 없이 매번 다시
+            # 계산해도 안전하다(주변 주차 국내 경기일은 시즌 시작 때
+            # 이미 확정되어 이후 안 바뀜).
+            _, f_day = _pick_sc_days(t["my_team_id"] if t.get("my_in") else 0,
+                                      st["current_season"])
+            _set_match_days(t["id"], "F", f_day)
+            _set_match_days(t["id"], "TP", f_day)
             _invalidate_sc_active_cache()   # 새로 생긴 경기가 있으니 캐시 갱신
             continue
 

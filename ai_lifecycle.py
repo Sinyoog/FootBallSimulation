@@ -23,7 +23,10 @@ from database import (get_conn, calc_ovr, ALL_STATS, KEY_STATS_BY_POS,
                       roll_bench_position)
 # [2026-08 신설, 포메이션 20개 확장 + 스쿼드 적합도 시스템] 모듈 레벨에서
 # _FORMATIONS 동기화(아래)와 _shuffle_formations()에 필요.
-from constants import FORMATION_SLOTS, FORMATION_REEVAL_PROB
+# [2026-08 신설, 세계 축구 기록실 연도별 평점/골/도움 요약] legs_for_team_count
+# 는 _snapshot_season_ratings가 리그별 실제 풀시즌 경기수를 구할 때 쓴다
+# (game_engine._league_full_season_matches와 동일 공식).
+from constants import FORMATION_SLOTS, FORMATION_REEVAL_PROB, legs_for_team_count
 
 try:
     import numpy as np
@@ -331,6 +334,11 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None):
     # positions 주석 참고). 맨 아래에서 이번 오프시즌 신규 선수만
     # 한 번 더 보충한다.
     _snapshot_season_positions(c, year, rows=shared_ai_rows)
+    # [2026-08 신설, 세계 축구 기록실 연도별 평점/골/도움 요약] 같은
+    # 이유(로스터가 바뀌기 전, "이번 시즌을 실제로 뛴" 팀 기준)로 여기서
+    # 같이 스냅샷한다 — shared_ai_rows는 sub_role/league_id가 없어 그대로
+    # 재사용할 수 없으므로 이 함수 내부에서 자체 쿼리한다.
+    _snapshot_season_ratings(c, year)
 
     _report(1, "은퇴 및 신인 영입 중")
     retired    = _retire_and_replace(c, year, shared_ai_rows)
@@ -409,6 +417,23 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None):
         c.executemany(
             "INSERT OR REPLACE INTO hist.ai_player_ovr_history(player_id, year, ovr) VALUES (?,?,?)",
             [(r["id"], year, r["ovr"]) for r in _new_this_season])
+
+    # [2026-09 신설, 성능 감사 5위 — 선수 검색 "경력(년)" 필터 상관 서브쿼리
+    # 제거] 이 시즌의 OVR 이력 기록(위 두 executemany)과 은퇴 처리
+    # (_retire_and_replace)가 모두 끝난 지금 시점에, ai_players/
+    # ai_players_retired의 career_years 컬럼을 실제 이력 기준으로 맞춘다.
+    # 이 값이 있어야 world_browser의 경력 필터가 후보 행마다 COUNT(*)
+    # 서브쿼리를 도는 대신 컬럼 비교 한 번으로 끝난다(값의 정의는 기존
+    # 필터와 동일하므로 검색 결과는 바뀌지 않는다 — database.refresh_
+    # career_years 주석 참고). 은퇴 선수는 '올해 은퇴한 사람'만 갱신한다.
+    _t_cy0 = _time_perf.perf_counter()
+    try:
+        from database import refresh_career_years
+        refresh_career_years(conn, retirement_year=year)
+    except Exception as _e:
+        print(f"[PERF-LIFECYCLE] career_years 갱신 건너뜀: {_e}")
+    _t_cy1 = _time_perf.perf_counter()
+    print(f"[PERF-LIFECYCLE] {year}년: career_years 갱신 {_t_cy1-_t_cy0:.2f}s")
 
     _t_commit0 = _time_perf.perf_counter()
     conn.commit()
@@ -2807,6 +2832,77 @@ def _snapshot_season_positions(c, year, only_missing=False, rows=None):
         c.executemany(
             "INSERT OR REPLACE INTO hist.ai_player_position_history(player_id, year, position, role) "
             "VALUES (?,?,?,?)", inserts)
+
+
+def _snapshot_season_ratings(c, year):
+    """[2026-08 신설, 신민용 요청: "세계 축구 기록실 연도별 기록 밑에
+    그 해 평균 평점/골/도움 요약을 얇은 행으로 하나 더 보여달라"]
+
+    AI 선수는 개별 경기를 실제로 시뮬레이션하지 않는다(세계 전역 수십만
+    명을 매 경기 계산하는 건 불가능 — match_sim.tactical_engine은 오직
+    '내 리그 경기' 하나만 이렇게 정교하게 돈다). 대신 game_engine.
+    _estimate_ai_season(포지션/OVR/팀 강도 기반 통계 추정 — 베스트11·
+    발롱도르 후보 산정에도 이미 쓰이는 그 공식)을 이번 시즌을 마친 로스터
+    기준으로 한 번씩 돌려 그 결과를 hist.ai_player_season_stats에
+    archive한다.
+
+    _snapshot_season_positions와 완전히 같은 타이밍(은퇴/이적으로 로스터가
+    바뀌기 전, run_ai_offseason 맨 앞)에 호출해야 team_id가 "이번 시즌을
+    실제로 마친 팀"이 된다 — _collect_league_candidates가 매번 새로
+    구하는 team_avg/league_avg/리그 풀시즌 경기수를 여기서는 전세계
+    팀·리그를 한 번의 그룹핑으로 미리 계산해 재사용한다(팀/리그 수가
+    커도 추가 쿼리 없이 단일 스캔으로 처리).
+
+    [한계] ai_player_ovr_history와 동일 — 이 기능 신설 이후 시즌만
+    정확하고, 그 이전 과거 시즌은 소급 적용이 안 된다. 시즌 중 이적한
+    선수는 여기엔 "그 해를 마무리한(하반기) 팀" 기준 풀시즌 추정치
+    하나만 저장되고, 상반기 팀 몫은 world_browser.get_ai_player_career_
+    history가 조회 시점에 경기수 비율로 쪼개 근사한다."""
+    from game_engine import _estimate_ai_season
+
+    rows = c.execute(
+        """SELECT ap.id AS id, ap.position AS position, ap.ovr AS ovr,
+                  ap.sub_role AS sub_role, ap.team_id AS team_id, t.league_id AS league_id
+           FROM ai_players ap JOIN teams t ON ap.team_id = t.id
+           WHERE ap.team_id IS NOT NULL""").fetchall()
+    if not rows:
+        return
+
+    # 팀별 평균 OVR, 리그별 평균 OVR, 리그별 소속 팀 집합(풀시즌 경기수
+    # 계산용) — 전세계 선수를 한 번만 훑어서 세 집계를 동시에 만든다.
+    team_ovr_sum, team_ovr_n = {}, {}
+    league_ovr_sum, league_ovr_n = {}, {}
+    league_teams = {}
+    for r in rows:
+        tid, lid, ovr = r["team_id"], r["league_id"], r["ovr"] or 0
+        team_ovr_sum[tid] = team_ovr_sum.get(tid, 0) + ovr
+        team_ovr_n[tid] = team_ovr_n.get(tid, 0) + 1
+        league_ovr_sum[lid] = league_ovr_sum.get(lid, 0) + ovr
+        league_ovr_n[lid] = league_ovr_n.get(lid, 0) + 1
+        league_teams.setdefault(lid, set()).add(tid)
+
+    team_avg = {tid: team_ovr_sum[tid] / team_ovr_n[tid] for tid in team_ovr_sum}
+    league_avg = {lid: league_ovr_sum[lid] / league_ovr_n[lid] for lid in league_ovr_sum}
+    # game_engine._league_full_season_matches와 동일 공식(팀 수-1 × 다전제).
+    league_matches = {}
+    for lid, tids in league_teams.items():
+        n = len(tids)
+        league_matches[lid] = max(1, (n - 1) * legs_for_team_count(n))
+
+    inserts = []
+    for r in rows:
+        tid, lid = r["team_id"], r["league_id"]
+        fsm = league_matches.get(lid, 38)
+        g, a, rt = _estimate_ai_season(
+            r["ovr"] or 0, r["position"], team_avg.get(tid, 50.0),
+            league_avg.get(lid, 50.0), r["sub_role"], full_season_matches=fsm)
+        inserts.append((r["id"], year, tid, fsm, g, a, rt))
+
+    inserts.sort(key=lambda t: (t[0], t[1]))
+    c.executemany(
+        "INSERT OR REPLACE INTO hist.ai_player_season_stats"
+        "(player_id, year, team_id, matches, goals, assists, rating) "
+        "VALUES (?,?,?,?,?,?,?)", inserts)
 
 
 def seed_initial_position_history(year):

@@ -161,28 +161,137 @@ class MatchStatsPanel(QWidget):
         root.addStretch()
 
 
+def _rating_color(rating):
+    """평점 배지 색 — FotMob류 매치센터와 같은 관례(초록=잘함, 노랑/주황=
+    평범, 빨강=부진)를 그대로 따른다."""
+    if rating >= 7.5:
+        return "#2e9e4f"
+    if rating >= 6.6:
+        return "#4a8f3c"
+    if rating >= 6.0:
+        return "#c99a2e"
+    return "#c0392b"
+
+
+def _lineup_player_row(entry, accent):
+    """라인업 평점 패널의 선수 한 줄 — 포지션/이름(+OVR) | 평점 배지.
+    entry가 None이면(그 슬롯에 실제 선수가 안 잡힌 경우) 빈 자리로 표시."""
+    w = QWidget()
+    h = QHBoxLayout(w); h.setContentsMargins(2, 2, 2, 2); h.setSpacing(6)
+    if entry is None:
+        pos_lbl = QLabel("-")
+        pos_lbl.setStyleSheet("color:#444;font-size:10px;")
+        pos_lbl.setFixedWidth(28)
+        name_lbl = QLabel("(공석)")
+        name_lbl.setStyleSheet("color:#444;font-size:11px;")
+        h.addWidget(pos_lbl); h.addWidget(name_lbl, 1)
+        return w
+
+    is_me = bool(entry.get("is_me"))
+    pos_lbl = QLabel(entry.get("position", ""))
+    pos_lbl.setStyleSheet(f"color:{accent};font-size:10px;font-weight:bold;")
+    pos_lbl.setFixedWidth(28)
+
+    name_txt = entry.get("name", "") or "-"
+    extra = []
+    g, a = entry.get("goals", 0), entry.get("assists", 0)
+    if entry.get("is_gk"):
+        if entry.get("saves", 0):
+            extra.append(f"선방{entry['saves']}")
+    else:
+        if g:
+            extra.append(f"⚽{g}")
+        if a:
+            extra.append(f"🅰{a}")
+    extra_txt = ("  " + " ".join(extra)) if extra else ""
+    name_lbl = QLabel(f"{'⭐ ' if is_me else ''}{name_txt} ({entry.get('ovr', 0)}){extra_txt}")
+    name_lbl.setStyleSheet(
+        f"color:{'#ffe27a' if is_me else '#ddd'};font-size:11px;"
+        f"{'font-weight:bold;' if is_me else ''}")
+    name_lbl.setWordWrap(False)
+
+    rating_lbl = QLabel(f"{entry.get('rating', 0):.1f}")
+    rating_lbl.setFixedWidth(34)
+    rating_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    rating_lbl.setStyleSheet(
+        f"background:{_rating_color(entry.get('rating', 0))};color:#fff;"
+        "font-size:11px;font-weight:bold;border-radius:4px;padding:2px 0;")
+
+    h.addWidget(pos_lbl)
+    h.addWidget(name_lbl, 1)
+    h.addWidget(rating_lbl)
+    return w
+
+
+class LineupRatingsPanel(QWidget):
+    """[2026-08 신설, 신민용 요청: "경기 상세에서 22명 선수 평점을
+    FotMob처럼 보여달라"] game_engine._save_match_detail이 저장한
+    payload["player_ratings"](tactical_engine가 만든 22명 개인 기록+평점)를
+    양팀 두 열로 나란히 보여준다. 지금은 리그 경기(전술 엔진 사용)만 실제
+    값이 있고, 그 외 대회는 비어 있어 안내 문구만 뜬다 — 억지로 채우지
+    않는다(MatchStatsPanel의 team_stats 없음 처리와 같은 원칙)."""
+
+    def __init__(self, data, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet("background:#161616;")
+        payload = data.get("payload", {}) or {}
+        pr = payload.get("player_ratings") or {}
+        home_list = pr.get("home") or []
+        away_list = pr.get("away") or []
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(8)
+
+        hdr = QLabel("⭐ 라인업 평점")
+        hdr.setStyleSheet("color:#fff;font-size:14px;font-weight:bold;")
+        root.addWidget(hdr)
+
+        if not home_list and not away_list:
+            note = QLabel("이 경기는 선수별 평점 데이터가 없습니다\n"
+                          "(리그 경기가 아니거나, 업데이트 이전 기록입니다).")
+            note.setStyleSheet("color:#555;font-size:12px;")
+            note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            note.setWordWrap(True)
+            root.addStretch(); root.addWidget(note); root.addStretch()
+            return
+
+        cols = QHBoxLayout(); cols.setSpacing(12)
+        for name_key, side_list, accent in (
+                ("home_name", home_list, _HOME_COLOR),
+                ("away_name", away_list, _AWAY_COLOR)):
+            col = QWidget()
+            cv = QVBoxLayout(col); cv.setContentsMargins(0, 0, 0, 0); cv.setSpacing(3)
+            side_hdr = QLabel(data.get(name_key, ""))
+            side_hdr.setStyleSheet(f"color:{accent};font-size:12px;font-weight:bold;")
+            side_hdr.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            cv.addWidget(side_hdr)
+            for entry in side_list:
+                cv.addWidget(_lineup_player_row(entry, accent))
+            cv.addStretch()
+            cols.addWidget(col, 1)
+        root.addLayout(cols)
+        root.addStretch()
+
+
 class MatchDetailDialog(QDialog):
     def __init__(self, data, parent=None):
         super().__init__(parent)
         self.setWindowTitle("경기 상세")
         self.setStyleSheet("QDialog{background:#161616;}")
         self._data = data
-        self._right_widget = None      # 현재 오른쪽에 펼쳐진 위젯(시뮬 전용)
-        self._left_stats_widget = None  # 현재 왼쪽에 펼쳐진 위젯(통계 전용)
+        self._right_widget = None      # 현재 오른쪽(시뮬 칸)에 펼쳐진 위젯(시뮬 전용)
+        self._left_stats_widget = None  # [2026-08] 이름은 _left_*지만 실제로는 가운데 패널 "오른쪽"에 뜨는 통계 전용 위젯
+        self._lineup_widget = None      # 맨 오른쪽 끝 — 라인업 평점 전용
 
-        # ── 전체 레이아웃: [왼쪽=통계 패널] [가운데=기존 상세 내용] [오른쪽=시뮬 패널] ──
-        #   시뮬(오른쪽)과 완전히 대칭되는 구조 — 통계도 기존 420px 칸
-        #   안에 욱여넣지 않고, 독립된 패널로 왼쪽에 펼쳐진다.
+        # ── 전체 레이아웃: [가운데=기존 상세 내용] [통계] [시뮬] [라인업 평점] ──
+        #   [2026-08 변경, 신민용 요청: "경기 통계도 우측에 뜨게"] 예전엔
+        #   통계만 가운데 칸의 왼쪽에 반대 방향으로 펼쳐졌는데, 이제 통계·
+        #   시뮬·라인업 평점 셋 다 가운데 칸 오른쪽에 나란히 독립 패널로
+        #   펼쳐진다(각자 고정폭, 서로 안 건드림).
         outer = QHBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-
-        self._left_container = QWidget()
-        self._left_container.setStyleSheet("background:#101010;border-right:1px solid #2a2a2a;")
-        self._left_layout = QVBoxLayout(self._left_container)
-        self._left_layout.setContentsMargins(0, 0, 0, 0)
-        self._left_container.setFixedWidth(0)  # 처음엔 접혀 있음
-        outer.addWidget(self._left_container)
 
         left_widget = QWidget()
         left_widget.setFixedWidth(420)
@@ -191,12 +300,36 @@ class MatchDetailDialog(QDialog):
         root.setSpacing(10)
         outer.addWidget(left_widget)
 
+        # [2026-08 변경, 신민용 요청: "경기 통계도 우측에 뜨게, 얘만
+        # 좌측이라 어색하다"] 예전엔 이 컨테이너가 가운데(420px) "왼쪽"에
+        # 붙어서 시뮬/라인업 평점(둘 다 오른쪽)과 반대 방향으로 펼쳐졌다.
+        # 변수명(_left_container 등)은 그대로 두되(다른 메서드들이 이미
+        # 이 이름을 참조 중이라 이름 자체를 바꾸면 변경 범위만 커짐),
+        # outer 레이아웃에 넣는 "위치"만 가운데 패널 다음(오른쪽)으로
+        # 옮겨서 시뮬/라인업 평점과 같은 방향에 나란히 펼쳐지게 한다.
+        self._left_container = QWidget()
+        self._left_container.setStyleSheet("background:#101010;border-left:1px solid #2a2a2a;")
+        self._left_layout = QVBoxLayout(self._left_container)
+        self._left_layout.setContentsMargins(0, 0, 0, 0)
+        self._left_container.setFixedWidth(0)  # 처음엔 접혀 있음
+        outer.addWidget(self._left_container)
+
         self._right_container = QWidget()
         self._right_container.setStyleSheet("background:#101010;border-left:1px solid #2a2a2a;")
         self._right_layout = QVBoxLayout(self._right_container)
         self._right_layout.setContentsMargins(0, 0, 0, 0)
         self._right_container.setFixedWidth(0)  # 처음엔 접혀 있음
         outer.addWidget(self._right_container)
+
+        # [2026-08 신설] 라인업 평점 전용 패널 — 통계/시뮬과 같은 패턴으로
+        # 맨 끝에 독립된 칸을 하나 더 둔다. 시뮬 보기와 동시에 열어도
+        # 서로 안 건드리게 완전히 분리.
+        self._lineup_container = QWidget()
+        self._lineup_container.setStyleSheet("background:#101010;border-left:1px solid #2a2a2a;")
+        self._lineup_layout = QVBoxLayout(self._lineup_container)
+        self._lineup_layout.setContentsMargins(0, 0, 0, 0)
+        self._lineup_container.setFixedWidth(0)  # 처음엔 접혀 있음
+        outer.addWidget(self._lineup_container)
 
         self._base_height = 620
         self.setMinimumSize(420, 560)
@@ -246,6 +379,14 @@ class MatchDetailDialog(QDialog):
                 "QPushButton:hover{background:#3a3a3a;}")
             stats_btn.clicked.connect(lambda: self._show_stats())
             bh.addWidget(stats_btn)
+
+            lineup_btn = QPushButton("⭐ 라인업 평점")
+            lineup_btn.setStyleSheet(
+                "QPushButton{background:#2a2a2a;color:#ccc;border:1px solid #444;"
+                "border-radius:6px;padding:6px;font-size:12px;font-weight:bold;}"
+                "QPushButton:hover{background:#3a3a3a;}")
+            lineup_btn.clicked.connect(lambda: self._show_lineup_ratings())
+            bh.addWidget(lineup_btn)
 
             root.addWidget(btn_row)
 
@@ -431,6 +572,12 @@ class MatchDetailDialog(QDialog):
             self._right_widget.hide()
             self._right_widget.deleteLater()
             self._right_widget = None
+        # [2026-08 버그수정] 예전엔 이 함수가 위젯만 치우고 컨테이너 폭은
+        # 그대로 둬서(_open_right_panel이 바로 뒤이어 새 폭을 덮어씌우는
+        # 경우에만 문제가 없었음), 토글로 닫기만 할 때는 위젯 없이 폭만
+        # 760px로 남아 빈 회색 칸이 떠 있었다. _clear_left_stats/
+        # _clear_lineup_panel과 동일하게 여기서도 폭을 0으로 되돌린다.
+        self._right_container.setFixedWidth(0)
 
     def _open_right_panel(self, widget, width=760):
         """[시뮬 전용] 오른쪽 패널은 이제 시뮬 뷰어만 사용한다."""
@@ -441,7 +588,8 @@ class MatchDetailDialog(QDialog):
         self._resize_for_content()
 
     def _clear_left_stats(self):
-        """왼쪽 통계 패널 비우기."""
+        """통계 패널 비우기 (가운데 패널 오른쪽에 뜬다 — 변수명은 옛 구조의
+        흔적이라 '왼쪽'이지만 실제 표시 위치와는 무관)."""
         if self._left_stats_widget is not None:
             self._left_layout.removeWidget(self._left_stats_widget)
             # [2026-08] 위 _clear_right_panel과 같은 이유.
@@ -451,24 +599,59 @@ class MatchDetailDialog(QDialog):
         self._left_container.setFixedWidth(0)
 
     def _open_left_panel(self, widget, width=300):
-        """[통계 전용] 왼쪽 패널 — 오른쪽 시뮬 패널과 완전히 대칭 구조."""
+        """[통계 전용] 가운데 패널 오른쪽에 뜨는 통계 패널."""
         self._clear_left_stats()
         self._left_stats_widget = widget
         self._left_layout.addWidget(widget)
         self._left_container.setFixedWidth(width)
         self._resize_for_content()
 
+    def _clear_lineup_panel(self):
+        """[2026-08 신설] 라인업 평점 패널 비우기 — _clear_left_stats와
+        동일한 이유(유령 흰 창 방지)로 부모를 떼지 않고 숨긴 뒤 삭제 예약."""
+        if self._lineup_widget is not None:
+            self._lineup_layout.removeWidget(self._lineup_widget)
+            self._lineup_widget.hide()
+            self._lineup_widget.deleteLater()
+            self._lineup_widget = None
+        self._lineup_container.setFixedWidth(0)
+
+    def _open_lineup_panel(self, widget, width=440):
+        self._clear_lineup_panel()
+        self._lineup_widget = widget
+        self._lineup_layout.addWidget(widget)
+        self._lineup_container.setFixedWidth(width)
+        self._resize_for_content()
+
+    def _show_lineup_ratings(self):
+        """[2026-08 버그수정, 신민용 리포트: "버튼 한 번 더 누르면 그
+        창 닫히게 해줘"] 이미 열려 있으면 닫고(토글), 닫혀 있으면 연다."""
+        if self._lineup_widget is not None:
+            self._clear_lineup_panel()
+            self._resize_for_content()
+            return
+        self._open_lineup_panel(LineupRatingsPanel(self._data, self), width=440)
+
     def _resize_for_content(self):
-        """현재 왼쪽(통계 유무)·오른쪽(시뮬 유무) 상태에 맞춰 다이얼로그
-        너비를 다시 계산한다. 통계·시뮬 모두 각자 고정폭 패널로 독립돼
+        """현재 왼쪽(통계 유무)·오른쪽(시뮬 유무)·라인업 평점 유무에 맞춰
+        다이얼로그 너비를 다시 계산한다. 셋 다 각자 고정폭 패널로 독립돼
         있어서(기존 420px 칸은 안 건드림) 높이는 항상 기본값 그대로다."""
         left_w = 300 if self._left_stats_widget is not None else 0
         right_w = 760 if self._right_widget is not None else 0
-        new_w = left_w + 420 + right_w
+        lineup_w = 440 if self._lineup_widget is not None else 0
+        new_w = left_w + 420 + right_w + lineup_w
         self.setMinimumSize(420, self._base_height)
         self.resize(new_w, self._base_height)
 
     def _show_sim(self):
+        """[2026-08 버그수정, 신민용 리포트: "버튼 한 번 더 누르면 그
+        창 닫히게 해줘"] 이미 열려 있으면 닫고(토글), 닫혀 있으면 연다.
+        닫을 때는 시뮬 패널만 접고, 자동으로 같이 열렸던 통계 패널은
+        그대로 둔다(사용자가 통계 버튼으로 따로 껐다 켰다 할 수 있게)."""
+        if self._right_widget is not None:
+            self._clear_right_panel()
+            self._resize_for_content()
+            return
         from ui.match_sim_viewer import MatchSimViewer
         sim_widget = MatchSimViewer(self._data, self)
         # [핵심] 새 창(QDialog.show()) 대신 이 다이얼로그 오른쪽에 인라인으로
@@ -476,20 +659,25 @@ class MatchDetailDialog(QDialog):
         # 자식 위젯처럼 레이아웃에 들어간다. 내부 로직은 그대로 재사용.
         sim_widget.setWindowFlags(Qt.WindowType.Widget)
         self._open_right_panel(sim_widget, width=760)
-        # [신규] 시뮬 보기가 켜지면 팀 경기 통계도 왼쪽에 독립 패널로 띄운다.
-        #   (통계=왼쪽 별도 패널, 상세 정보=가운데 420px, 시뮬=오른쪽 별도 패널)
+        # [신규] 시뮬 보기가 켜지면 팀 경기 통계도 독립 패널로 같이 띄운다.
+        #   (가운데 420px 다음에 통계 → 시뮬 → 라인업 평점 순으로 나란히)
         if self._left_stats_widget is None:
             self._open_left_panel(MatchStatsPanel(self._data, self), width=300)
 
     def _show_stats(self):
-        """"경기 통계"는 시뮬 표시 여부와 무관하게 항상 왼쪽 독립 패널로
-        뜬다 — 오른쪽 패널은 시뮬 전용이라 여기서 건드리지 않는다. 시뮬이
-        이미 오른쪽에 떠 있다면 그대로 유지된 채 왼쪽에 통계만 추가/갱신."""
+        """[2026-08 버그수정, 신민용 리포트: "버튼 한 번 더 누르면 그
+        창 닫히게 해줘"] 이미 열려 있으면 닫고(토글), 닫혀 있으면 연다.
+        오른쪽 패널은 시뮬 전용이라 여기서 건드리지 않는다."""
+        if self._left_stats_widget is not None:
+            self._clear_left_stats()
+            self._resize_for_content()
+            return
         self._open_left_panel(MatchStatsPanel(self._data, self), width=300)
 
     def closeEvent(self, event):
         self._clear_right_panel()
         self._clear_left_stats()
+        self._clear_lineup_panel()
         super().closeEvent(event)
 
     def _add_close(self, root):

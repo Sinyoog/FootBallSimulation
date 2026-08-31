@@ -182,6 +182,15 @@ def is_hard_mode(p=None) -> bool:
     return get_difficulty(p) == "hard"
 
 
+def is_easy_mode(p=None) -> bool:
+    """[2026-08 신설, 신민용 요청: "쉬움 난이도에서는 상대팀이든 우리팀이든
+    나 빼고 선수들의 한계 스탯(OVR)을 조정할 수 있게"] 쉬움 난이도에서만
+    켜지는 기능(AI 선수 스탯 편집 등)의 게이트 조건. is_hard_mode와 짝을
+    이루는 헬퍼 — '보통' 난이도는 이 값이 False이므로(OVR은 보여도 편집은
+    안 됨), 실질적으로 스탯 편집은 쉬움에서만 가능하다."""
+    return get_difficulty(p) == "easy"
+
+
 def update_player(**kw):
     if not kw:
         return
@@ -543,6 +552,37 @@ def get_match_detail(detail_id):
         d["payload"]["lineup_stats"] = json.loads(d.get("lineup_stats") or "{}")
     except Exception:
         d["payload"]["lineup_stats"] = {}
+    # [2026-08 신설] 22명 개인 기록+평점 — 리그 경기(전술 엔진 사용)만
+    # 실제 값이 있고, 그 외 대회는 빈 dict라 ui/match_detail_dialog.py가
+    # 자동으로 "라인업+평점" 섹션을 생략한다.
+    try:
+        d["payload"]["player_ratings"] = json.loads(d.get("player_ratings") or "{}")
+    except Exception:
+        d["payload"]["player_ratings"] = {}
+    # [2026-08 버그수정, 신민용 리포트: "이름 변경하면 라인업 평점에도
+    # 바뀐 이름으로 떠야 한다 — 예전에 뛴 경기라도"] player_ratings의
+    # name은 경기를 저장할 당시(tactical_engine._build_player_ratings)에
+    # 한 번 문자열로 확정돼 JSON에 그대로 박혀버린다 — 그 이후에 그
+    # 선수 이름을 새로 지어줘도(또는 처음 지어줘도) 이미 저장된 옛
+    # 경기 기록의 name은 저장 시점 값 그대로 남아 안 바뀌었다. id는
+    # 그대로 저장돼 있으므로, 조회할 때마다(=매번 이 경기 상세를 열
+    # 때마다) "지금" 지어진 이름/코드로 다시 계산해서 덮어쓴다 —
+    # 포메이션 화면·세계 축구 기록실이 이름 변경을 실시간으로 반영하는
+    # 것과 동일한 원칙을 여기도 적용한 것.
+    try:
+        _pr = d["payload"]["player_ratings"]
+        _ids = [e.get("id") for _side in ("home", "away")
+                for e in (_pr.get(_side) or []) if e and e.get("id") is not None]
+        if _ids:
+            from database import get_ai_player_custom_names
+            from constants import ai_player_code
+            _custom = get_ai_player_custom_names(_ids)
+            for _side in ("home", "away"):
+                for e in (_pr.get(_side) or []):
+                    if e and e.get("id") is not None:
+                        e["name"] = _custom.get(e["id"]) or ai_player_code(e["id"])
+    except Exception:
+        pass
     return d
 
 
@@ -3240,6 +3280,7 @@ def _simulate_match(p, week, info: dict, day=None):
     # (OVR 차이 확률표)으로 조용히 폴백한다.
     engine_stats = None
     engine_plog = None
+    player_ratings = None
     try:
         from match_sim.tactical_engine import simulate_my_match
         home_formation = _team_formation(c, home_id)
@@ -3254,6 +3295,12 @@ def _simulate_match(p, week, info: dict, day=None):
         hs, as_ = sim["home_score"], sim["away_score"]
         engine_stats = {"home": sim["home_stats"], "away": sim["away_stats"]}
         engine_plog = sim["possession_log"]
+        # [2026-08 신설, 신민용 요청: "경기 시뮬레이션에 다른 선수들
+        # OVR·스탯도 반영해서 정교화하고, 경기 상세에서 22명 평점을
+        # 보여달라"] 전술엔진이 이미 계산한 22명 개인 기록+평점을 그대로
+        # 받아 저장 단계(_write_match_log → _save_match_detail)로 넘긴다.
+        player_ratings = {"home": sim.get("home_player_ratings") or [],
+                          "away": sim.get("away_player_ratings") or []}
         outcome = "draw" if hs == as_ else ("home" if hs > as_ else "away")
         # [정리] 이전엔 여기서 diff(홈-원정 전력차)를 다시 계산했는데, hs/as_는
         # 이미 위 전술엔진(simulate_my_match)이 정한 값이라 이 diff는 outcome/
@@ -3304,6 +3351,47 @@ def _simulate_match(p, week, info: dict, day=None):
                 p, reason=_card_reason)
         elif _yellow_ev:
             events = list(events) + _yellow_ev
+
+        # [2026-08 신설, 신민용 요청: "경기 상세에서 22명 평점 보여줄 때
+        # 나도 당연히 껴야지"] player_ratings의 22명은 전술엔진이 실제
+        # ai_players 로스터에서 뽑은 11명씩(_select_lineup)이라 "나"는
+        # 애초에 그 안에 없다(내 개인 기록은 my_player 테이블 별도 관리 —
+        # match_sim_viewer.py가 이미 같은 이유로 "my_slot" 개념을 따로
+        # 쓰는 것과 동일한 사정). 내 포지션과 라벨이 같은 슬롯을 찾아
+        # 그 자리를 방금 계산된 내 실제 기록(goals/assists/saves/rating)
+        # 으로 통째로 바꿔치기한다 — _find_my_slot(ui/match_sim_viewer.py)
+        # 과 똑같은 우선순위(정확 일치 → POSITION_COMPAT 호환 → GK 아닌
+        # 아무 자리)로 슬롯을 고른다.
+        if player_ratings is not None:
+            _side_key = "home" if is_home else "away"
+            _my_list = player_ratings.get(_side_key)
+            if _my_list:
+                _labels = [r.get("position") if r else None for r in _my_list]
+                _idx = None
+                for _i, _lab in enumerate(_labels):
+                    if _lab == my_position:
+                        _idx = _i; break
+                if _idx is None:
+                    for _want in POSITION_COMPAT.get(my_position, [my_position]):
+                        for _i, _lab in enumerate(_labels):
+                            if _lab == _want:
+                                _idx = _i; break
+                        if _idx is not None:
+                            break
+                if _idx is None:
+                    for _i, _lab in enumerate(_labels):
+                        if _lab is not None and _lab != "GK":
+                            _idx = _i; break
+                if _idx is not None:
+                    _my_list[_idx] = {
+                        "id": None, "name": p.get("name") or "나",
+                        "position": _labels[_idx], "ovr": my_ovr,
+                        "goals": goals, "assists": assists,
+                        "shots": detail.get("shots", 0),
+                        "shots_on": detail.get("shots_on", 0),
+                        "saves": saves, "is_gk": (my_position == "GK"),
+                        "rating": rating, "is_me": True,
+                    }
 
         # [2026-08 신설, 골 시상 시스템 v4] 실제로 골을 넣었으면 즉시
         # goal_events에 기록(is_mine=1, is_pseudo=0) — "올해의 골" 판정의
@@ -3540,7 +3628,8 @@ def _simulate_match(p, week, info: dict, day=None):
     _write_match_log(p, week, info["league_name"], is_home,
                      home_id, away_id, hs, as_,
                      my_result, goals, assists, saves, rating, events, played, benched,
-                     detail=detail, engine_stats=engine_stats, engine_plog=engine_plog, day=day)
+                     detail=detail, engine_stats=engine_stats, engine_plog=engine_plog, day=day,
+                     player_ratings=player_ratings)
 
 
 _team_prestige_cache: dict = {}
@@ -5509,7 +5598,7 @@ def _derive_match_stats(is_home, hs, as_, goals, assists, saves, pos, detail, en
 def _save_match_detail(p, week, comp_name, is_home, home_name, away_name,
                        hs, as_, result, goals, assists, saves, rating,
                        events, played, benched, detail=None, pso=None, engine_stats=None,
-                       engine_plog=None):
+                       engine_plog=None, player_ratings=None):
     """경기 상세를 match_details 에 저장하고 detail_id 를 돌려준다.
        리그/챔스/국대 모두 이 헬퍼를 공유한다(팀명은 호출자가 직접 넘김).
        events 정규화(분 배정·시간순)도 여기서 처리. 실패 시 None 반환.
@@ -5520,7 +5609,15 @@ def _save_match_detail(p, week, comp_name, is_home, home_name, away_name,
        시뮬레이션 통계({"home":{...},"away":{...}}). 있으면 _derive_match_stats가
        공식 추정 대신 이 실측값을 기준으로 쓴다.
        engine_plog: 전술 엔진이 만든 진짜 분 단위 possession_log. 있으면
-       match_flow의 사후 필러 생성 대신 이걸 개인 서사와 병합해서 쓴다."""
+       match_flow의 사후 필러 생성 대신 이걸 개인 서사와 병합해서 쓴다.
+       player_ratings: [2026-08 신설, 신민용 요청: "경기 시뮬레이션에
+       다른 선수들 OVR·스탯도 반영하고, 경기 상세에서 22명 전원 평점을
+       보여달라"] tactical_engine.simulate_tactical_match이 만든
+       {"home":[...11명(또는 None)...], "away":[...]} — 지금은 리그
+       경기(game_engine._simulate_match)만 이 값을 실제로 채워 넘긴다.
+       그 외 대회(챔스/컵/국제대회 등)는 아직 전술 엔진 자체를 안 쓰므로
+       None 그대로 넘어오고, match_detail_dialog.py는 이 값이 없으면
+       기존처럼 팀 단위 통계 화면으로 조용히 폴백한다(강제 아님)."""
     timed = []
     if played:
         for ev in events:
@@ -5608,14 +5705,15 @@ def _save_match_detail(p, week, comp_name, is_home, home_name, away_name,
             """INSERT INTO match_details
                (year,week,season,league_name,is_home,home_name,away_name,
                 home_score,away_score,result,rating,goals,assists,saves,
-                detail_json,possession_log,lineup_stats)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                detail_json,possession_log,lineup_stats,player_ratings)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (st.get("current_year"), week, st.get("current_season"),
              comp_name, 1 if is_home else 0, home_name, away_name,
              hs, as_, result, rating, goals, assists, saves,
              json.dumps(payload, ensure_ascii=False),
              json.dumps(possession_log, ensure_ascii=False),
-             json.dumps(lineup_stats, ensure_ascii=False)))
+             json.dumps(lineup_stats, ensure_ascii=False),
+             json.dumps(player_ratings or {}, ensure_ascii=False)))
         detail_id = cur.lastrowid
         conn2.commit()
         conn2.close()
@@ -5674,7 +5772,8 @@ def _augment_events_with_names(c, p, is_home, hid, aid, hs, as_,
 def _write_match_log(p, week, league_name, is_home,
                      hid, aid, hs, as_,
                      result, goals, assists, saves, rating, events, played, benched,
-                     detail=None, engine_stats=None, engine_plog=None, day=None):
+                     detail=None, engine_stats=None, engine_plog=None, day=None,
+                     player_ratings=None):
     # [최적화] 팀명을 세션 캐시에서 조회 (매 경기 get_conn 제거)
     conn = get_conn()
     c = conn.cursor()
@@ -5697,12 +5796,13 @@ def _write_match_log(p, week, league_name, is_home,
     detail_id = _save_match_detail(p, week, league_name, is_home, hn, an,
                                    hs, as_, result, goals, assists, saves, rating,
                                    events, played, benched, detail, engine_stats=engine_stats,
-                                   engine_plog=engine_plog)
+                                   engine_plog=engine_plog, player_ratings=player_ratings)
 
     # ── 로그: 헤더 한 줄(클릭 가능) + 결과 + 핵심 요약 + 순위 ──────────
     #   상세 이벤트(전/후반)는 로그에서 빼고 상세 창으로 옮겨 로그를 간결하게.
-    #   헤더에 [match:{id}] 마커를 박아두면 log_panel 이 클릭 앵커로 변환한다.
-    marker = f" [match:{detail_id}]" if detail_id else ""
+    #   헤더에 [match:{id}:{kind}] 마커를 박아두면 log_panel 이 클릭 앵커
+    #   + 대회별 색 상자로 변환한다(kind="league").
+    marker = f" [match:{detail_id}:league]" if detail_id else ""
     add_log("─"*44, "sep")
     add_log(f"⚽ 경기  [{league_name}]  {_day_label(week, day)}  ({loc}){marker}", "match")
     add_log(f"   {hn} {hs}-{as_} {an}  ({rs})", "match")
@@ -9776,6 +9876,33 @@ def _end_of_season(p, year, progress_cb=None):
     _prior_season_matches    = p.get("season_matches", 0)
     _prior_season_rating_sum = p.get("season_rating_sum", 0.0)
     _prior_season_rating_cnt = p.get("season_rating_cnt", 0)
+
+    # [2026-08 신설, 신민용 요청: "세계 축구 기록실 연도별 기록 밑에 평균
+    # 평점/골/도움 요약을 얇은 행으로 하나 더 보여달라"] AI는 개별 경기를
+    # 실제로 시뮬레이션하지 않아 추정치(ai_lifecycle._snapshot_season_ratings
+    # 참고)를 쓰지만, 나(my_player)는 매 경기 실제로 시뮬레이션되므로
+    # (game_engine._simulate_match/_player_perf) 추정 없이 이번 시즌
+    # 실측값(season_matches/season_goals/season_assists/season_rating_sum·cnt)을
+    # 리셋 직전에 그대로 archive한다 — ai_player_ovr_history/season_stats와
+    # 완전히 같은 타이밍(시즌 전환, 리셋 전). 시즌 중 이적한 해의 상반기
+    # 몫은 career_entries가 이미 정확히 갖고 있으므로(_save_career_entry의
+    # force_new=True 분기가 이적 순간 그 팀 몫을 확정해 닫는다) 여기서
+    # 따로 챙기지 않는다 — world_browser.get_my_player_career_history가
+    # 그 stint를 직접 읽어다 쓴다.
+    if p.get("current_team_id"):
+        _prior_rating = (round(_prior_season_rating_sum / _prior_season_rating_cnt, 2)
+                          if _prior_season_rating_cnt else 0.0)
+        try:
+            _conn_sr = get_conn()
+            _conn_sr.execute(
+                "INSERT OR REPLACE INTO my_player_season_stats"
+                "(year, team_id, matches, goals, assists, rating) VALUES (?,?,?,?,?,?)",
+                (year, p.get("current_team_id"), _prior_season_matches,
+                 p.get("season_goals", 0), p.get("season_assists", 0), _prior_rating))
+            _conn_sr.commit()
+            _conn_sr.close()
+        except Exception:
+            pass
 
     # [2026-08 버그수정, 신민용 리포트: "이번 시즌 출전이 시작부터 22로
     # 뜨고 나중엔 137%까지 간다"] 원인 추적 결과 — season_* 리셋이 이

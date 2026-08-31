@@ -972,13 +972,45 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
     h_ovr = he["ovr"] + (bonus if is_home else 0)
     a_ovr = ae["ovr"] + (0 if is_home else bonus)
 
-    outcome = match_outcome(h_ovr, a_ovr)
+    # [2026-08 신설, 신민용 요청: "챔피언스리그처럼 다른 국가 팀이랑 하면
+    # 라인업 평점이 안 뜬다"] champions_engine.simulate_my_cl_match와 완전히
+    # 동일한 패턴 — 유로파/컨퍼런스/슈퍼컵이 이 함수 하나를 공유하므로
+    # 여기 한 번만 고치면 세 대회 전부 적용된다. 중립 구장 가정이라
+    # home_adv=0.0.
+    my_position = p.get("position", "")
+    engine_stats = None
+    engine_plog = None
+    player_ratings = None
+    try:
+        from match_sim.tactical_engine import simulate_my_match as _sim_tactical
+        from game_engine import _team_formation
+        _fconn = get_conn()
+        _c = _fconn.cursor()
+        home_formation = _team_formation(_c, m["home_team_id"])
+        away_formation = _team_formation(_c, m["away_team_id"])
+        _fconn.close()
+        sim = _sim_tactical(
+            m["home_team_id"], m["away_team_id"], home_formation, away_formation,
+            home_boost=(bonus if is_home else 0.0),
+            away_boost=(bonus if not is_home else 0.0),
+            home_boost_position=(my_position if is_home else None),
+            away_boost_position=(my_position if not is_home else None),
+            home_adv=0.0)
+        hs, as_ = sim["home_score"], sim["away_score"]
+        engine_stats = {"home": sim["home_stats"], "away": sim["away_stats"]}
+        engine_plog = sim["possession_log"]
+        player_ratings = {"home": sim.get("home_player_ratings") or [],
+                          "away": sim.get("away_player_ratings") or []}
+        outcome = "draw" if hs == as_ else ("home" if hs > as_ else "away")
+    except Exception:
+        outcome = match_outcome(h_ovr, a_ovr)
+        hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
+
     pso_winner, pso_score = 0, ""
     is_ko = (m["stage"] != "league")
     if outcome == "draw" and is_ko:
         win_home, pso_score = resolve_pso(h_ovr, a_ovr)
         pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
-    hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
 
     if _suspended or _benched:
         goals, assists, saves, rating = 0, 0, 0, 0.0
@@ -1004,6 +1036,42 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
             events = list(events) + _yellow_ev
     if not (_suspended or _benched) and "big_match_rating" in _pe:
         rating = max(3.0, min(10.0, round(rating + _pe["big_match_rating"], 1)))
+
+    # [2026-08 신설, 신민용 요청] champions_engine과 동일한 "나" 슬롯
+    # 바꿔치기 — 전술엔진 로스터엔 "나"가 없으므로 포지션이 같은 슬롯을
+    # 찾아 방금 계산된 내 실제 기록으로 덮어쓴다.
+    if player_ratings is not None:
+        _side_key = "home" if is_home else "away"
+        _my_list = player_ratings.get(_side_key)
+        if _my_list:
+            _labels = [r.get("position") if r else None for r in _my_list]
+            _idx = None
+            for _i, _lab in enumerate(_labels):
+                if _lab == my_position:
+                    _idx = _i; break
+            if _idx is None:
+                from constants import POSITION_COMPAT
+                for _want in POSITION_COMPAT.get(my_position, [my_position]):
+                    for _i, _lab in enumerate(_labels):
+                        if _lab == _want:
+                            _idx = _i; break
+                    if _idx is not None:
+                        break
+            if _idx is None:
+                for _i, _lab in enumerate(_labels):
+                    if _lab is not None and _lab != "GK":
+                        _idx = _i; break
+            if _idx is not None:
+                _my_list[_idx] = {
+                    "id": None, "name": p.get("name") or "나",
+                    "position": _labels[_idx], "ovr": p.get("ovr", 40),
+                    "goals": goals, "assists": assists,
+                    "shots": detail.get("shots", 0),
+                    "shots_on": detail.get("shots_on", 0),
+                    "saves": saves, "is_gk": (my_position == "GK"),
+                    "rating": rating, "is_me": True,
+                }
+
     my_result = _my_result(outcome, is_home)
     my_conceded = (as_ if is_home else hs)
 
@@ -1060,8 +1128,19 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
     detail_id = _save_match_detail(
         p, week, comp_name, is_home, home_disp, away_disp,
         hs, as_, my_result, goals, assists, saves, rating,
-        events, not (_suspended or _benched), _benched, detail, pso=pso)
-    marker = f" [match:{detail_id}]" if detail_id else ""
+        events, not (_suspended or _benched), _benched, detail, pso=pso,
+        engine_stats=engine_stats, engine_plog=engine_plog, player_ratings=player_ratings)
+    # [2026-08 신설] 이 함수는 유로파/컨퍼런스/슈퍼컵 3개 대회가 공유하므로
+    # (europa_engine.py/conference_engine.py/super_cup_engine.py) 헤더
+    # 마커의 kind는 고정 리터럴이 아니라 cfg.award_prefix로 구분한다 —
+    # ui/log_panel.py가 대회별 상자 색을 고를 때 쓴다.
+    _AWARD_PREFIX_TO_KIND = {
+        "유로파리그": "europa",
+        "컨퍼런스리그": "conference",
+        "슈퍼컵": "supercup",
+    }
+    _kind = _AWARD_PREFIX_TO_KIND.get(cfg.award_prefix, "cup")
+    marker = f" [match:{detail_id}:{_kind}]" if detail_id else ""
 
     add_log("─" * 44, "sep")
     add_log(f"🏆 {comp_name}  {week}주차{marker}", "match")

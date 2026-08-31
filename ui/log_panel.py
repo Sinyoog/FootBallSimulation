@@ -36,13 +36,44 @@ COLOR_RULES = [
 STAT_UP_RE   = re.compile(r'(\+\d+)')
 STAT_DOWN_RE = re.compile(r'(?<![0-9])(-\d+)')
 
+# [2026-08 신설, 신민용 요청: "경기 상자를 각 대회 색으로 구별하고 싶다 —
+# 리그는 녹색, 컵대회는 보라색, 다른 대회들도 각자 색으로"] 각 대회 엔진의
+# add_log() 마커가 이제 "[match:{id}:{kind}]" 형태로 대회 종류(kind)까지
+# 함께 실어보낸다(구버전 세이브에 남은 마커는 kind가 없을 수 있어 그 경우엔
+# _DEFAULT_BOX_COLOR로 폴백). ui/world_browser_window.py의 기존 대회별
+# 색 관례(챔스/유로파/컨퍼런스/클럽월드컵/국내컵)를 그대로 재사용하고,
+# 리그·국제전(국가대표)·승강 플레이오프는 기존에 전용 색이 없어 새로
+# 골랐다.
+_COMP_COLORS = {
+    "league":     "#2ecc71",  # 리그 (초록)
+    "cl":         "#1E4DB7",  # UEFA 챔피언스리그 (기존 관례)
+    "europa":     "#F28C28",  # UEFA 유로파리그 (기존 관례)
+    "conference": "#20A464",  # UEFA 컨퍼런스리그 (기존 관례)
+    "supercup":   "#800020",  # 슈퍼컵 (버건디, 기존 관례)
+    "cwc":        "#4dd0e1",  # FIFA 클럽 월드컵 (기존 관례)
+    "cup":        "#c48aff",  # 국내컵 (보라, 기존 관례)
+    "intl":       "#e91e63",  # 국가대표 A매치 (신설)
+    "po":         "#78909c",  # 승강 플레이오프 (신설)
+}
+_DEFAULT_BOX_COLOR = "#3d7a99"  # kind 정보 없는 구버전 로그용 폴백(예전 고정색)
+
+
+def _box_bg(hex_color: str, alpha: float = 0.15) -> str:
+    """대회 테두리색을 은은한 반투명 배경색으로 변환(rgba)."""
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
 
 def _colorize(line: str) -> str:
     """줄 하나를 HTML span으로 변환"""
-    # 경기 헤더의 [match:{id}] 마커 → 클릭 앵커로 분리 추출.
-    #   마커는 표시에서 제거하고, 헤더 전체를 <a>로 감싸 클릭 가능하게 만든다.
-    m_match = re.search(r'\[match:(\d+)\]', line)
+    # 경기 헤더의 [match:{id}] 또는 [match:{id}:{kind}] 마커 → 클릭 앵커로
+    # 분리 추출. 마커는 표시에서 제거하고, 헤더 전체를 <a>로 감싸 클릭
+    # 가능하게 만든다. kind가 있으면 대회별 색을, 없으면(구버전 로그)
+    # 기존 고정색을 쓴다.
+    m_match = re.search(r'\[match:(\d+)(?::([a-z_]+))?\]', line)
     match_id = m_match.group(1) if m_match else None
+    match_kind = m_match.group(2) if m_match else None
     if m_match:
         line = line.replace(m_match.group(0), "").rstrip()
 
@@ -75,9 +106,11 @@ def _colorize(line: str) -> str:
     # 줄이라는 게 잘 안 보였다 — 헤더 전체를 테두리 있는 상자(칩)로
     # 감싸 한눈에 "누르는 곳"으로 보이게 한다.
     if match_id:
+        box_color = _COMP_COLORS.get(match_kind, _DEFAULT_BOX_COLOR)
+        box_bg = _box_bg(box_color)
         return (f'<a href="match:{match_id}" style="color:{line_color};'
-                f'text-decoration:none; border:1px solid #3d7a99; border-radius:4px;'
-                f'padding:1px 7px; background-color:#132733;">🔎 {escaped}</a>')
+                f'text-decoration:none; border:1px solid {box_color}; border-radius:4px;'
+                f'padding:1px 7px; background-color:{box_bg};">🔎 {escaped}</a>')
 
     return f'<span style="color:{line_color};">{escaped}</span>'
 
@@ -96,7 +129,22 @@ _MATCH_RESULT_RE = re.compile(r'\d+\s*-\s*\d+.*\((승|무|패)\)\s*$')
 
 
 def _is_match_core_line(stripped: str) -> bool:
-    """경기 로그 한 줄이 "순수 경기 기록"(헤더/결과/평점)인지 판정."""
+    """경기 로그 한 줄이 "순수 경기 기록"(헤더/결과/평점)인지 판정.
+
+    [2026-08 버그수정, 신민용 리포트: "경기 필터로 걸러보면 리그만 뜨고
+    챔피언스리그 같은 다른 대회는 안 뜬다"] 예전엔 헤더 판정을
+    `stripped.startswith("⚽ 경기")`로만 했는데, 이건 리그 헤더
+    (game_engine.py의 "⚽ 경기  [...]  ...")에만 해당하는 접두사였다 —
+    챔피언스리그/유로파/컨퍼런스/슈퍼컵/클럽월드컵("🏆 ..."), 국제전
+    ("🌍 ..."), 승강 플레이오프("⚖ ...")는 전부 다른 접두사를 쓰다 보니
+    화이트리스트를 통과 못 하고 걸러졌다 — 헤더 줄은 정작 log_type이
+    "match"로 똑같이 저장되는데도 "경기" 필터에서만 사라져 보였던 것.
+    모든 대회 엔진이 헤더에 공통으로 심어두는 "[match:{id}]" 마커(클릭
+    앵커용, _colorize 참고)를 "이 줄은 경기 헤더다"의 대회 무관 보편
+    신호로 대신 쓴다 — 이 검사는 _colorize가 마커를 지우기 전의 원본
+    텍스트를 받으므로 항상 안전하게 잡힌다."""
+    if "[match:" in stripped:
+        return True
     if stripped.startswith("⚽ 경기"):
         return True
     if stripped.startswith("평점"):

@@ -2968,15 +2968,41 @@ class WorldBrowserWindow(QDialog):
         # 눌렀을 때 복사됐다는 걸 눈으로 확인할 수 있게 버튼 라벨을
         # 잠깐 바꿨다가 되돌린다(팀 검색 복사 버튼과 동일한 방식).
         self.player_copy_btn.setText("✅ 복사됨")
-        QTimer.singleShot(1200, lambda: self.player_copy_btn.setText("📋 기록 복사"))
+        QTimer.singleShot(1200, lambda: self.player_copy_btn.setText("📋 요약 복사"))
 
-    def _format_player_history_text(self, name, d, team_hist, rows, intl_records):
+    def _on_copy_player_full_history_clicked(self):
+        """[2026-08 신설, 신민용 요청: "기록 복사할 때 이것도(연도별 평균
+        평점/골/도움) 같이 복사되는 버튼을 추가해줘"] _on_copy_player_
+        history_clicked(요약 복사)와 완전히 같은 데이터를 쓰되,
+        _format_player_history_text에 include_stats=True만 추가로 넘겨
+        연도별 평점/골/도움 요약 줄까지 포함시킨다."""
+        name = getattr(self, "_player_copy_name", None)
+        d = getattr(self, "_player_copy_d", None)
+        if not name or not d:
+            return
+        team_hist = getattr(self, "_player_copy_team_hist", None)
+        rows = getattr(self, "_player_copy_rows", [])
+        intl_records = getattr(self, "_player_copy_intl_records", [])
+        text = self._format_player_history_text(name, d, team_hist, rows, intl_records,
+                                                  include_stats=True)
+        QGuiApplication.clipboard().setText(text)
+        self.player_full_copy_btn.setText("✅ 복사됨")
+        QTimer.singleShot(1200, lambda: self.player_full_copy_btn.setText("📋 기록 복사"))
+
+    def _format_player_history_text(self, name, d, team_hist, rows, intl_records,
+                                     include_stats=False):
         """d(get_ai_player_detail 반환값) + rows(_populate_player_team_box가
         화면 렌더링과 동시에 쌓아둔 연도별 해석 결과: 그 해 나이·소속팀·
         OVR·entry) + intl_records(get_player_intl_records)를 사람이 읽어도,
         LLM에 그대로 붙여넣어도 되는 평문으로 직렬화한다. 화면과 다른
         계산을 새로 하지 않고 이미 화면에 쓴 값만 그대로 옮긴다(어긋남
-        방지) — 팀 쪽 _format_team_history_text와 같은 원칙."""
+        방지) — 팀 쪽 _format_team_history_text와 같은 원칙.
+
+        include_stats=True면 row["stat"](화면의 얇은 요약 행과 같은 데이터
+        — AI는 추정치, 나는 실측치)가 있는 연도마다 그 뒤에 평균 평점/골/
+        도움 한 줄을 덧붙인다(신민용 요청: "기록 복사할 때 이것도 같이
+        기록복사되는 버튼을 추가해줘" — "요약 복사" 버튼은 기존 그대로
+        False, "기록 복사" 버튼만 True로 호출)."""
         lines = [f"[{name} 선수 기록]"]
 
         # ── 기본 정보 한 줄 (player_detail_tbl 맨 위 요약 행과 동일 로직) ──
@@ -3050,6 +3076,16 @@ class WorldBrowserWindow(QDialog):
                     rec = f" ({entry['cwc_record']})" if entry.get("cwc_record") else ""
                     parts.append(f"클럽월드컵: {entry['cwc']}{rec}")
                 lines.append(" | ".join(parts))
+                # [2026-08 신설, 신민용 요청: "기록 복사할 때 이것도 같이
+                # 기록복사되는 버튼을 추가해줘"] 화면의 얇은 요약 행과
+                # 완전히 같은 값(row["stat"])을 그 연도 줄 바로 밑에
+                # 덧붙인다 — include_stats=True("기록 복사" 버튼)일 때만.
+                if include_stats and row.get("stat"):
+                    st = row["stat"]
+                    st_bits = [f"{st['matches']}경기" if st.get("matches") is not None else None,
+                               f"평균평점 {st['rating']:.2f}" if st.get("rating") is not None else None,
+                               f"{st.get('goals', 0)}골 {st.get('assists', 0)}도움"]
+                    lines.append("  ⚽ " + " · ".join(b for b in st_bits if b))
         lines.append("")
 
         # ── 국가대표 기록 ──
@@ -3502,15 +3538,29 @@ class WorldBrowserWindow(QDialog):
         # 이 버튼은 _show_player_detail·_populate_player_team_box·
         # _populate_player_intl_box가 각자 채워두는 self._player_copy_*
         # 값들을 재조회 없이 그대로 재사용해 클립보드에 복사한다.
+        # [2026-08 개편, 신민용 요청: "기록 복사할 때 이것도(연도별 평균
+        # 평점/골/도움 요약) 같이 복사되는 버튼을 추가해줘, 원래 기록
+        # 복사는 요약 복사로 이름 변경하고"] 기존 버튼 하나(자세한 연도별
+        # 기록은 있지만 평점/골/도움 요약 줄은 없음)를 "요약 복사"로
+        # 이름만 바꿔 그대로 남기고, 그 옆에 "기록 복사"라는 새 버튼을
+        # 추가한다 — 이쪽이 요약 복사와 완전히 같은 내용에 더해 연도별
+        # 평점/골/도움 요약 줄(_player_copy_rows[i]["stat"])까지 포함한다.
         player_title_row = QHBoxLayout()
-        self.player_copy_btn = QPushButton("📋 기록 복사")
+        self.player_copy_btn = QPushButton("📋 요약 복사")
         self.player_copy_btn.setEnabled(False)
         self.player_copy_btn.setToolTip(
             "이 선수의 기본 정보와 연도별(나이·소속팀·그때 OVR·그때 팀 성적) 기록을 "
             "텍스트로 복사합니다(GPT/제미나이 등에 붙여넣기용)")
         self.player_copy_btn.clicked.connect(self._on_copy_player_history_clicked)
+        self.player_full_copy_btn = QPushButton("📋 기록 복사")
+        self.player_full_copy_btn.setEnabled(False)
+        self.player_full_copy_btn.setToolTip(
+            "요약 복사 내용에 더해, 연도별 평균 평점·골·도움 요약까지 함께 "
+            "텍스트로 복사합니다(GPT/제미나이 등에 붙여넣기용)")
+        self.player_full_copy_btn.clicked.connect(self._on_copy_player_full_history_clicked)
         player_title_row.addStretch(1)
         player_title_row.addWidget(self.player_copy_btn)
+        player_title_row.addWidget(self.player_full_copy_btn)
         right_lay.addLayout(player_title_row)
 
         # [2026-08 재수정, 신민용 요청: "왜 아직도 태그형으로 표시하는거?
@@ -4349,6 +4399,7 @@ class WorldBrowserWindow(QDialog):
             self.player_intl_tbl.setRowCount(0)
             self._player_detail_pid = None
             self.player_copy_btn.setEnabled(False)
+            self.player_full_copy_btn.setEnabled(False)
             self._player_copy_name = None
             self._player_copy_d = None
             return
@@ -4412,6 +4463,7 @@ class WorldBrowserWindow(QDialog):
         # 가치가 있으므로, 연도별·국가대표 기록 유무와 무관하게 여기서
         # 활성화한다(각 기록이 비어 있으면 포맷 함수가 "기록 없음"으로 채움).
         self.player_copy_btn.setEnabled(True)
+        self.player_full_copy_btn.setEnabled(True)
 
     def _populate_player_intl_box(self, player_id):
         """[2026-08 신설, 신민용 요청: "'예선전 탈락' 같은 개인 기록도
@@ -4803,20 +4855,34 @@ class WorldBrowserWindow(QDialog):
                     return seg.get("position")
             return current_position
 
-        tbl.setRowCount(len(years))
+        # [2026-08 신설, 신민용 요청: "연도별 기록 밑에 평균 평점/골/도움
+        # 요약을 얇은 행으로 하나 더"] entry에 _stat_rating이 붙어있는
+        # 행마다(world_browser.get_ai_player_career_history/get_my_player_
+        # career_history가 미리 붙여둠) 그 아래 행을 하나씩 더 써야 하므로,
+        # 실제로 그릴 총 행 수를 먼저 세어 setRowCount에 반영한다(은퇴
+        # 표시 행은 대상 아님 — is_retired_row는 entry 자체가 아니라
+        # player_team_name==None 판정이라 여기선 값을 미리 알 수 없지만,
+        # get_ai_player_career_history/get_my_player_career_history 둘 다
+        # 은퇴 이후 연도의 entry에는애초에 _stat_* 를 붙이지 않는다).
+        _extra_stat_rows = sum(1 for e in years if e.get("_stat_rating") is not None)
+        tbl.setRowCount(len(years) + _extra_stat_rows)
         # [2026-08 신설] 복사 버튼용 — 화면에 그리는 것과 완전히 같은
         # 값(그 해 나이·소속팀·OVR·retired 여부·entry 원본)을 행마다
         # 그대로 쌓아둔다. 화면 렌더링 로직(나이 역산/소속팀 타임라인
         # 조회/은퇴 이후 절단 등)을 복사 텍스트용으로 다시 짜면 둘이
         # 미묘하게 어긋날 위험이 있어, 아예 같은 루프 안에서 같이 채운다.
         self._player_copy_rows = []
+        # [2026-08 신설] 위 _extra_stat_rows 때문에 표의 실제 행 번호가
+        # 이제 years의 인덱스(i)와 더 이상 1:1이 아니다 — 요약 행이
+        # 끼어들 때마다 밀리므로 별도 카운터로 추적한다.
+        row_idx = 0
         for i, entry in enumerate(years):
             age = _age_at(entry["year"])
             year_text = f"{entry['year']} ({age}세)" if age is not None else str(entry["year"])
             year_item = QTableWidgetItem(year_text)
             year_item.setForeground(QColor("#ffcc00"))
             f = year_item.font(); f.setBold(True); year_item.setFont(f)
-            tbl.setItem(i, 0, year_item)
+            tbl.setItem(row_idx, 0, year_item)
 
             # [2026-08 수정] 예전엔 여기가 팀 파워랭킹(전체/대륙 순위)
             # 두 줄이었는데, "선수가 그 해에 실제로 속한 팀"으로 교체.
@@ -4852,7 +4918,7 @@ class WorldBrowserWindow(QDialog):
                 team_cell = self._col_label(
                     player_team_name, self._LEAGUE_COL_W,
                     color="#88ddaa" if is_current else "#aaddff", bold=is_current)
-            tbl.setCellWidget(i, 1, team_cell)
+            tbl.setCellWidget(row_idx, 1, team_cell)
 
             # [2026-08 신설, 신민용 요청: "소속팀일 때 포지션이 뭐였는지도"]
             # 소속팀(1)과 OVR(3) 사이(2)에 세부 포지션. 은퇴 이후 행은
@@ -4861,21 +4927,23 @@ class WorldBrowserWindow(QDialog):
                 pos_item = QTableWidgetItem(player_position or "-")
                 pos_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 pos_item.setForeground(QColor("#aaddff") if player_position else QColor("#555"))
-                tbl.setItem(i, 2, pos_item)
+                tbl.setItem(row_idx, 2, pos_item)
 
             # [2026-08 신설, 신민용 요청: "소속팀 없음이 뜬 그 줄은 리그든
             # 국내컵이든 다 -로 떠야해"] 그 팀의 실제 대회 결과(entry)는
             # 이 선수와 무관해진 뒤의 데이터이므로, 이 행에서만 전부 "-"로
             # 강제하고 그 해 팀 실제 기록은 참조하지 않는다.
             if is_retired_row:
-                tbl.setItem(i, 2, self._dim_dash_item())
-                tbl.setItem(i, 3, self._dim_dash_item())
-                tbl.setItem(i, 4, self._dim_dash_item())
+                tbl.setItem(row_idx, 2, self._dim_dash_item())
+                tbl.setItem(row_idx, 3, self._dim_dash_item())
+                tbl.setItem(row_idx, 4, self._dim_dash_item())
                 for col in (5, 6, 7, 8, 9):
-                    tbl.setCellWidget(i, col, self._two_line_cell("-", "#555", None))
+                    tbl.setCellWidget(row_idx, col, self._two_line_cell("-", "#555", None))
                 self._player_copy_rows.append({
                     "year": entry["year"], "age": age, "is_retired_row": True,
-                    "team_name": None, "position": None, "ovr": None, "role": None, "entry": None})
+                    "team_name": None, "position": None, "ovr": None, "role": None, "entry": None,
+                    "stat": None})
+                row_idx += 1
                 continue
 
             # [2026-08 수정, 신민용 요청: "OVR 수치가 패널로 묶여 있는데
@@ -4894,9 +4962,9 @@ class WorldBrowserWindow(QDialog):
                 ovr_item = QTableWidgetItem(str(ovr_at_year))
                 ovr_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 ovr_item.setForeground(QColor("#ffcc00"))
-                tbl.setItem(i, 3, ovr_item)
+                tbl.setItem(row_idx, 3, ovr_item)
             else:
-                tbl.setItem(i, 3, self._dim_dash_item())
+                tbl.setItem(row_idx, 3, self._dim_dash_item())
 
             # [2026-08 신설, 신민용 요청: "그 해 주전/로테이션/대기/유망주
             # 였는지"] 이 기능 신설 이전 시즌은 role_checkpoints에 값이
@@ -4920,14 +4988,25 @@ class WorldBrowserWindow(QDialog):
                 role_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 role_item.setForeground(QColor(_ROLE_COLORS.get(role_at_year, "#ccc")))
                 f = role_item.font(); f.setBold(True); role_item.setFont(f)
-                tbl.setItem(i, 4, role_item)
+                tbl.setItem(row_idx, 4, role_item)
             else:
-                tbl.setItem(i, 4, self._dim_dash_item())
+                tbl.setItem(row_idx, 4, self._dim_dash_item())
+
+            # [2026-08 신설, 신민용 요청: "연도별 기록 밑에 평균 평점/골/
+            # 도움 요약을 얇은 행으로 하나 더"] world_browser가 이미 붙여둔
+            # _stat_*(AI는 hist.ai_player_season_stats 추정치, 나는
+            # my_player_season_stats/career_entries 실측치 — 어느 쪽이든
+            # 여기선 구분 없이 그대로 읽기만 한다)를 복사 데이터에도 같이
+            # 담아둔다.
+            _stat = None
+            if entry.get("_stat_rating") is not None:
+                _stat = {"matches": entry.get("_stat_matches"), "goals": entry.get("_stat_goals"),
+                          "assists": entry.get("_stat_assists"), "rating": entry.get("_stat_rating")}
 
             self._player_copy_rows.append({
                 "year": entry["year"], "age": age, "is_retired_row": False,
                 "team_name": player_team_name, "position": player_position,
-                "ovr": ovr_at_year, "role": role_at_year, "entry": entry})
+                "ovr": ovr_at_year, "role": role_at_year, "entry": entry, "stat": _stat})
 
             lg_txt = entry["league"] or "-"
             if "승격" in lg_txt:
@@ -4938,24 +5017,43 @@ class WorldBrowserWindow(QDialog):
                 lg_color = "#ffd700"
             else:
                 lg_color = "#ddd"
-            tbl.setCellWidget(i, 5, self._two_line_cell(lg_txt, lg_color, entry.get("league_record")))
+            tbl.setCellWidget(row_idx, 5, self._two_line_cell(lg_txt, lg_color, entry.get("league_record")))
 
             cup_txt = entry["cup"] or "-"
             cup_color = "#c48aff" if entry["cup"] else "#555"
-            tbl.setCellWidget(i, 6, self._two_line_cell(cup_txt, cup_color, entry.get("cup_record")))
+            tbl.setCellWidget(row_idx, 6, self._two_line_cell(cup_txt, cup_color, entry.get("cup_record")))
 
             cl_txt = entry["cl"] or "-"
             _CL_KIND_COLOR = {"champions": "#1E4DB7", "europa": "#F28C28", "conference": "#20A464"}
             cl_color = _CL_KIND_COLOR.get(entry.get("cl_kind"), "#555") if entry["cl"] else "#555"
-            tbl.setCellWidget(i, 7, self._two_line_cell(cl_txt, cl_color, entry.get("cl_record")))
+            tbl.setCellWidget(row_idx, 7, self._two_line_cell(cl_txt, cl_color, entry.get("cl_record")))
 
             sc_txt = entry.get("sc") or "-"
             sc_color = BURGUNDY if entry.get("sc") else "#555"
-            tbl.setCellWidget(i, 8, self._two_line_cell(sc_txt, sc_color, entry.get("sc_record")))
+            tbl.setCellWidget(row_idx, 8, self._two_line_cell(sc_txt, sc_color, entry.get("sc_record")))
 
             cwc_txt = entry.get("cwc") or "-"
             cwc_color = "#4dd0e1" if entry.get("cwc") else "#555"
-            tbl.setCellWidget(i, 9, self._two_line_cell(cwc_txt, cwc_color, entry.get("cwc_record")))
+            tbl.setCellWidget(row_idx, 9, self._two_line_cell(cwc_txt, cwc_color, entry.get("cwc_record")))
+
+            row_idx += 1
+            # [2026-08 신설, 신민용 요청: "44경기면 22경기로 나눠지겠지"]
+            # 이 연도(또는 반기) 바로 밑에, 세로가 얇은 요약 행을 하나 더
+            # 그린다 — 단순 텍스트 한 줄이라 resizeRowsToContents가 알아서
+            # 위 두 줄짜리 셀들보다 훨씬 얇게 잡아준다(별도 setRowHeight
+            # 불필요).
+            if _stat is not None:
+                _stat_bits = [f"{_stat['matches']}경기" if _stat.get("matches") is not None else None,
+                              f"평균평점 {_stat['rating']:.2f}" if _stat.get("rating") is not None else None,
+                              f"{_stat.get('goals', 0)}골 {_stat.get('assists', 0)}도움"]
+                _stat_text = "⚽ " + "  ·  ".join(b for b in _stat_bits if b)
+                stat_item = QTableWidgetItem(_stat_text)
+                stat_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                stat_item.setForeground(QColor("#ffb347"))
+                _sf = stat_item.font(); _sf.setPointSize(max(8, _sf.pointSize() - 1)); stat_item.setFont(_sf)
+                tbl.setItem(row_idx, 0, stat_item)
+                tbl.setSpan(row_idx, 0, 1, 10)
+                row_idx += 1
         self._resize_self_sizing_table(tbl)
 
     def _dim_dash_item(self):

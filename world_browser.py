@@ -486,14 +486,21 @@ def search_retired_ai_players(name_query=None, continent=None, nat_country_id=No
         # [2026-08 신설, 신민용 요청: "선수 검색 필터에 경력(년) 필터도
         # 0~99 기본값으로"] ai_player_ovr_history에 이 선수 id로 쌓인
         # 행 수(=몇 년치 시즌을 뛰었는지, _annotate_career_span과 동일
-        # 기준)를 상관 서브쿼리로 세어 그 범위로 거른다.
+        # 기준)로 거른다.
+        # [2026-09 성능 수정, 감사 5위] 예전엔 이 조건이
+        #   (SELECT COUNT(*) FROM hist.ai_player_ovr_history h WHERE h.player_id=r.id)
+        # 라는 상관 서브쿼리라서, 후보 행 하나하나마다 히스토리 DB를 다시
+        # 세야 했다 — ai_players_retired만 실측 369,238행이고 매년 계속
+        # 늘어나므로, 이 필터를 다른 조건 없이 단독으로 걸면 사실상 전수
+        # 스캔이었다. 같은 값을 ai_players_retired.career_years 컬럼에
+        # 미리 채워두고(database.refresh_career_years — 매 시즌 전환마다
+        # 실제 이력 기준으로 재계산) 여기선 인덱스 비교만 한다. 컬럼의
+        # 정의가 예전 서브쿼리와 글자 그대로 같으므로 검색 결과는 동일하다.
         if min_career_years is not None:
-            q += (" AND (SELECT COUNT(*) FROM hist.ai_player_ovr_history h "
-                  "WHERE h.player_id = r.id) >= ?")
+            q += " AND COALESCE(r.career_years, 0) >= ?"
             params.append(min_career_years)
         if max_career_years is not None:
-            q += (" AND (SELECT COUNT(*) FROM hist.ai_player_ovr_history h "
-                  "WHERE h.player_id = r.id) <= ?")
+            q += " AND COALESCE(r.career_years, 0) <= ?"
             params.append(max_career_years)
         if custom_named_only:
             q += " AND cust.custom_name IS NOT NULL AND cust.custom_name != ''"
@@ -751,13 +758,14 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
     # 0~99 기본값으로"] search_retired_ai_players와 동일한 기준(ai_player_
     # ovr_history에 이 선수 id로 쌓인 행 수 = 뛴 시즌 수)으로 현역 선수도
     # 거른다.
+    # [2026-09 성능 수정, 감사 5위] 위 search_retired_ai_players와 같은
+    # 이유로 상관 서브쿼리 → 미리 채워둔 ai_players.career_years 컬럼
+    # 비교로 교체. 값의 정의가 같아 결과는 동일하다.
     if min_career_years is not None:
-        q += (" AND (SELECT COUNT(*) FROM hist.ai_player_ovr_history h "
-              "WHERE h.player_id = p.id) >= ?")
+        q += " AND COALESCE(p.career_years, 0) >= ?"
         params.append(min_career_years)
     if max_career_years is not None:
-        q += (" AND (SELECT COUNT(*) FROM hist.ai_player_ovr_history h "
-              "WHERE h.player_id = p.id) <= ?")
+        q += " AND COALESCE(p.career_years, 0) <= ?"
         params.append(max_career_years)
     if grade_country_ids is not None:
         q += " AND cn.id IN (%s)" % ",".join("?" * len(grade_country_ids))
@@ -1168,6 +1176,21 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
 
     out = [merged_by_year[y] for y in sorted(merged_by_year.keys(), reverse=True)]
 
+    # [2026-08 신설, 신민용 요청: "연도별 기록 밑에 평균 평점/골/도움
+    # 요약을 얇은 행으로 하나 더 보여달라"] ai_lifecycle._snapshot_season_
+    # ratings가 시즌 전환마다 archive해둔 추정치(hist.ai_player_season_stats)
+    # 를 연도별로 붙인다 — 이 기능 신설 이전 시즌은 값이 없어(dict에 키
+    # 자체가 없음) 자연히 "-"로 표시된다(ovr_checkpoints 등과 동일한
+    # 소급 불가 원칙).
+    stat_by_year = get_ai_player_season_stats(player_id)
+    for e in out:
+        srow = stat_by_year.get(e["year"])
+        if srow:
+            e["_stat_matches"] = srow["matches"]
+            e["_stat_goals"] = srow["goals"]
+            e["_stat_assists"] = srow["assists"]
+            e["_stat_rating"] = srow["rating"]
+
     # get_team_history와 완전히 동일한 판정 기준으로 "이 선수가 실제로
     # 그 팀에 있었던 연도"만 다시 집계.
     import re as _re
@@ -1220,22 +1243,35 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
             final_out.append(e)
             from_tid, half_pos, half_role = mid_by_year.get(e["year"], (None, None, None))
             if from_tid:
-                final_out.append(_half_season_league_entry(conn, from_tid, e["year"],
-                                                             half_position=half_pos,
-                                                             half_role=half_role))
+                final_out.append(_half_season_league_entry(
+                    conn, from_tid, e["year"], half_position=half_pos, half_role=half_role,
+                    full_stat={"matches": e.get("_stat_matches"), "goals": e.get("_stat_goals"),
+                               "assists": e.get("_stat_assists"), "rating": e.get("_stat_rating")},
+                    main_entry=e))
         out = final_out
     conn.close()
 
     return {"awards": awards, "years": out}
 
 
-def _half_season_league_entry(conn, team_id, year, half_position=None, half_role=None):
+def _half_season_league_entry(conn, team_id, year, half_position=None, half_role=None,
+                                full_stat=None, main_entry=None):
     """[2026-08 신설, 상반기/하반기 이적 기록 분리 기능] league_season_
     standings_half(하반기 시작 순간에 떠둔 상반기까지의 순위 스냅샷)에서
     이 팀의 그 해 상반기 성적 한 줄을 만든다. get_team_history의 연도별
     entry와 같은 키 구성을 쓰지만, 리그 칸만 채우고 나머지(국내컵/클럽
     대항전/슈퍼컵/클럽월드컵)는 전부 빈 값 — 이 대회들은 "상반기까지"라는
-    개념 자체가 없다(리그처럼 왕복 2다리로 나뉘지 않음)."""
+    개념 자체가 없다(리그처럼 왕복 2다리로 나뉘지 않음).
+
+    [2026-08 신설, 신민용 요청: "이땐 경기 기록이 시즌 총 44경기면 22경기로
+    나눠지겠지"] full_stat({"matches","goals","assists","rating"} — 그 해를
+    마무리한 하반기 팀 기준 풀시즌 추정치, get_ai_player_career_history가
+    hist.ai_player_season_stats에서 미리 조회해 넘겨줌)과 main_entry(그
+    풀시즌 추정치가 실려있는 원본 entry dict)를 같이 받으면, 이 팀(상반기
+    팀)에서 실제로 치른 경기 수(wins+draws+losses, 아래 조회)만큼 비율로
+    골/도움을 쪼개 이 반기 몫으로 붙이고 main_entry에서는 그만큼 빼준다 —
+    AI는 선수 개인의 실제 경기 기록이 없어 정확한 반기 값이 아니라
+    추정치의 비례 배분이다(평점은 총합이 아니라 평균이라 그대로 유지)."""
     trow = conn.execute("SELECT name FROM teams WHERE id=?", (team_id,)).fetchone()
     entry = {"year": year, "league": None, "cup": None, "cl": None, "cwc": None, "sc": None,
              "league_record": None, "cup_record": None, "cl_record": None, "cwc_record": None,
@@ -1274,7 +1310,61 @@ def _half_season_league_entry(conn, team_id, year, half_position=None, half_role
     rank = next((i + 1 for i, r in enumerate(ranked) if r["team_id"] == team_id), None)
     if lg and rank:
         entry["league"] = f"{lg['name']}({lg['tier']}부) [{rank}등/{len(ranked)}팀]  (상반기)"
+
+    # [2026-08 신설, 신민용 요청: "44경기면 22경기로 나눠지겠지"] 이
+    # 팀(상반기)에서 실제로 치른 경기 수(방금 조회한 row의 wins+draws+
+    # losses)만큼 비율로 full_stat(하반기 팀 기준 풀시즌 추정치)을 쪼갠다.
+    if full_stat and full_stat.get("matches"):
+        half_matches = (row["wins"] or 0) + (row["draws"] or 0) + (row["losses"] or 0)
+        full_matches = full_stat["matches"]
+        if half_matches > 0 and full_matches > 0:
+            ratio = min(1.0, half_matches / full_matches)
+            half_goals = round((full_stat.get("goals") or 0) * ratio)
+            half_assists = round((full_stat.get("assists") or 0) * ratio)
+            entry["_stat_matches"] = half_matches
+            entry["_stat_goals"] = half_goals
+            entry["_stat_assists"] = half_assists
+            entry["_stat_rating"] = full_stat.get("rating")
+            if main_entry is not None:
+                main_entry["_stat_matches"] = max(0, full_matches - half_matches)
+                main_entry["_stat_goals"] = max(0, (full_stat.get("goals") or 0) - half_goals)
+                main_entry["_stat_assists"] = max(0, (full_stat.get("assists") or 0) - half_assists)
+                # 평점(rating)은 총합이 아니라 평균이므로 나누지 않고 그대로 둔다.
     return entry
+
+
+def get_ai_player_season_stats(player_id):
+    """[2026-08 신설, 신민용 요청: "세계 축구 기록실 연도별 기록 밑에 평균
+    평점/골/도움 요약을 얇은 행으로 하나 더 보여달라"] ai_lifecycle.
+    _snapshot_season_ratings가 시즌 전환마다 archive해둔 추정치(hist.
+    ai_player_season_stats)를 그대로 읽는다 — get_ai_player_ovr_checkpoints
+    와 완전히 같은 패턴. 반환: {year: {"matches","goals","assists","rating",
+    "team_id"}}. 이 아카이브 신설 이전 시즌은 값이 없으므로(빈 dict)
+    호출부가 "-"로 대체 표시해야 한다."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT year, team_id, matches, goals, assists, rating "
+        "FROM hist.ai_player_season_stats WHERE player_id=? ORDER BY year ASC",
+        (player_id,)).fetchall()
+    conn.close()
+    return {r["year"]: {"team_id": r["team_id"], "matches": r["matches"],
+                         "goals": r["goals"], "assists": r["assists"],
+                         "rating": r["rating"]} for r in rows}
+
+
+def get_my_player_season_stats():
+    """get_ai_player_season_stats의 my_player 버전 — my_player_season_stats
+    (game_engine._end_of_season이 season_* 리셋 직전 실측값을 그대로
+    archive)에서 읽는다. 반환: {year: {"matches","goals","assists","rating",
+    "team_id"}}."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT year, team_id, matches, goals, assists, rating "
+        "FROM my_player_season_stats ORDER BY year ASC").fetchall()
+    conn.close()
+    return {r["year"]: {"team_id": r["team_id"], "matches": r["matches"],
+                         "goals": r["goals"], "assists": r["assists"],
+                         "rating": r["rating"]} for r in rows}
 
 
 def get_ai_player_ovr_checkpoints(player_id):
@@ -1391,11 +1481,19 @@ def get_my_player_career_history():
     으로 같이 담아, 호출부가 get_ai_player_team_timeline을 다시 거치지
     않고도(내가 여기서 이미 정확히 알고 있으므로) 바로 쓸 수 있게 한다."""
     conn = get_conn()
+    # [2026-08 확장, 신민용 요청: "연도별 기록 밑에 평균 평점/골/도움 요약을
+    # 얇은 행으로 하나 더"] matches/goals/assists/avg_rating을 추가로 읽는다
+    # — 시즌 중 이적한 해의 "상반기(먼저 있던 팀)" 몫은 이 실측 스틴트
+    # 값을 그대로 쓴다(아래 prev_st 루프 참고, AI처럼 추정할 필요가 없다 —
+    # 나는 매 경기 실제로 시뮬레이션되므로 이 컬럼들이 이미 정확한 실측치).
     stints = [dict(r) for r in conn.execute(
         "SELECT team_id, team_name, league_name, tier, position, start_year, start_week, "
-        "end_year, end_week, wins, draws, losses "
+        "end_year, end_week, wins, draws, losses, matches, goals, assists, avg_rating "
         "FROM career_entries ORDER BY start_year ASC, start_week ASC, id ASC").fetchall()]
     conn.close()
+    # "그 해를 마무리한(하반기)" 팀 기준 연도별 실측 요약 — my_player_
+    # season_stats(game_engine._end_of_season이 season_* 리셋 직전 archive).
+    _my_stat_by_year = get_my_player_season_stats()
 
     _empty_awards = {"league": 0, "cup": 0, "cl": 0, "cwc": 0,
                       "cl_champions": 0, "el_champions": 0, "ecl_champions": 0, "sc_champions": 0}
@@ -1454,6 +1552,16 @@ def get_my_player_career_history():
         # my_player는 career_entries에 재직 스틴트마다 포지션이 그대로
         # 있으니(추정 불필요), 그 해를 마무리한(하반기) 스틴트의 값을 쓴다.
         entry["_main_position"] = main_st.get("position") or None
+        # [2026-08 신설, 신민용 요청: "연도별 기록 밑에 평균 평점/골/도움
+        # 요약을"] my_player_season_stats(그 해를 마무리한 팀 기준 실측
+        # 요약)에서 그대로 붙인다 — 이 아카이브 신설 이전 시즌은 값이
+        # 없으므로(dict에 그 연도 키 자체가 없음) 자연히 "-"로 표시된다.
+        _my_stat = _my_stat_by_year.get(y)
+        if _my_stat:
+            entry["_stat_matches"] = _my_stat["matches"]
+            entry["_stat_goals"] = _my_stat["goals"]
+            entry["_stat_assists"] = _my_stat["assists"]
+            entry["_stat_rating"] = _my_stat["rating"]
         out.append(entry)
         if entry.get("league") and _rank1_re.search(entry["league"]):
             awards["league"] += 1
@@ -1492,10 +1600,22 @@ def get_my_player_career_history():
             tier = prev_st.get("tier")
             record = f"{w}승 {d}무 {l}패"
             lg_text = f"{lg_name}({tier}부) 상반기 {record}" if (lg_name and tier) else f"상반기 {record}"
-            out.append({"year": y, "league": lg_text, "cup": None, "cl": None,
+            _half_entry = {"year": y, "league": lg_text, "cup": None, "cl": None,
                         "cwc": None, "sc": None, "cl_kind": None,
                         "_is_half": True, "_half_team_name": prev_st["team_name"],
-                        "_half_position": prev_st.get("position") or None})
+                        "_half_position": prev_st.get("position") or None}
+            # [2026-08 신설, 신민용 요청: "이땐 경기 기록이... 나눠지겠지"]
+            # 나는 이 상반기 재직 기간 동안 실제로 시뮬레이션된 경기 기록이
+            # career_entries 자신의 matches/goals/assists/avg_rating에 이미
+            # 정확히 남아있다(AI처럼 비례 배분으로 추정할 필요가 없음) —
+            # 0경기 유령 스틴트는 위에서 이미 걸렀으므로(if not (w+d+l))
+            # matches도 항상 0보다 크다.
+            if prev_st.get("matches"):
+                _half_entry["_stat_matches"] = prev_st.get("matches")
+                _half_entry["_stat_goals"] = prev_st.get("goals") or 0
+                _half_entry["_stat_assists"] = prev_st.get("assists") or 0
+                _half_entry["_stat_rating"] = prev_st.get("avg_rating") or 0.0
+            out.append(_half_entry)
     return {"awards": awards, "years": out}
 
 

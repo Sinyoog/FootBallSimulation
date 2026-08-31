@@ -2962,6 +2962,34 @@ def _pick_intl_starters(tournament_id, country, avg_ovr):
     return starters
 
 
+def _intl_tactical_lineup(tournament_id, country, avg_ovr):
+    """[2026-08 신설, 신민용 요청: "챔피언스리그처럼 다른 국가 팀이랑 하면
+    라인업 평점이 안 뜬다"] 국가대표는 클럽(ai_players.team_id)과 달리
+    "26인 소집 명단"(intl_squad)에서 매 경기 스타팅 11을 고른다 —
+    match_sim.match_flow._select_lineup(팀 로스터 기반)을 그대로 못 쓰므로
+    같은 결과물(FORMATION_SLOTS 순서, 빈 슬롯은 None)을 여기서 직접
+    만든다. _pick_intl_starters와 완전히 동일한 재료(get_or_create_intl_squad
+    +_greedy_fill_slots)로 계산하므로 이미 고정된 주전 11명과 항상
+    일치한다 — 다만 _pick_intl_starters는 화면 표시/출전카운트용으로
+    None 슬롯을 걸러내 반환하는 반면, 여기는 tactical_engine이 요구하는
+    "슬롯 인덱스와 정렬된 목록"(빈 슬롯 그대로 None)이 필요해서 필터링
+    전 상태를 그대로 돌려준다. 풀이 8명 미만이면 None(호출부가 예전
+    방식으로 폴백)."""
+    from database import get_or_create_intl_squad
+    from formation_logic import _greedy_fill_slots
+    pool = get_or_create_intl_squad(tournament_id, country, avg_ovr, _INTL_MATCHDAY_FULL_POS)
+    if len(pool) < 8:
+        return None
+
+    def _score(r):
+        return r["ovr"] - abs(r.get("age", 27) - 27) * 0.3
+
+    scored_pool = [dict(r, ovr=_score(r)) for r in pool]
+    id_to_row = {r["id"]: r for r in pool}
+    placed = _greedy_fill_slots(scored_pool, _INTL_MATCHDAY_STARTER_POS)
+    return [id_to_row[p["id"]] if p is not None else None for p in placed]
+
+
 def _sim_ai_match(t, m, my_played=False, conn=None, reason="injury", batch=None):
     """AI끼리(또는 내가 결장한 내 경기) 시뮬.
 
@@ -3193,12 +3221,44 @@ def simulate_my_match(week, p, day=None):
     h_ovr = he["ovr"] + (bonus if is_home else 0)
     a_ovr = ae["ovr"] + (0 if is_home else bonus)
 
-    outcome = _match_outcome(h_ovr, a_ovr, knockout)
+    # [2026-08 신설, 신민용 요청: "챔피언스리그처럼 다른 국가 팀이랑 하면
+    # 라인업 평점이 안 뜬다"] 국가대표도 라인업 평점을 지원한다. 클럽과
+    # 달리 team_id 기반 로스터가 없어 match_sim.tactical_engine.
+    # simulate_my_match(편의 함수)를 못 쓰고, 대신 26인 소집 명단에서
+    # _intl_tactical_lineup으로 직접 슬롯 정렬 라인업을 만들어 저수준
+    # 함수(simulate_tactical_match)를 호출한다. 국가대표는 "중립 구장
+    # 가정"(_match_outcome 주석 참고)이라 home_adv=0.0.
+    my_position = p.get("position", "")
+    engine_stats = None
+    engine_plog = None
+    player_ratings = None
+    try:
+        from match_sim.tactical_engine import simulate_tactical_match
+        home_lineup = _intl_tactical_lineup(t["id"], m["home"], he["ovr"])
+        away_lineup = _intl_tactical_lineup(t["id"], m["away"], ae["ovr"])
+        if home_lineup is None or away_lineup is None:
+            raise ValueError("intl squad pool too small")
+        sim = simulate_tactical_match(
+            home_lineup, away_lineup,
+            home_boost=(bonus if is_home else 0.0),
+            away_boost=(bonus if not is_home else 0.0),
+            home_boost_position=(my_position if is_home else None),
+            away_boost_position=(my_position if not is_home else None),
+            home_adv=0.0)
+        hs, as_ = sim["home_score"], sim["away_score"]
+        engine_stats = {"home": sim["home_stats"], "away": sim["away_stats"]}
+        engine_plog = sim["possession_log"]
+        player_ratings = {"home": sim.get("home_player_ratings") or [],
+                          "away": sim.get("away_player_ratings") or []}
+        outcome = "draw" if hs == as_ else ("home" if hs > as_ else "away")
+    except Exception:
+        outcome = _match_outcome(h_ovr, a_ovr, knockout)
+        hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
+
     pso_winner, pso_score = "", ""
     if knockout and outcome == "draw":
         win_home, pso_score = _resolve_pso(h_ovr, a_ovr)
         pso_winner = m["home"] if win_home else m["away"]
-    hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
 
     if _suspended or _benched:
         goals, assists, saves, rating = 0, 0, 0, 0.0
@@ -3228,6 +3288,42 @@ def simulate_my_match(week, p, day=None):
     # 전부 빅매치 성격이라(챔스와 동일 기준) 모든 경기에 적용한다.
     if not (_suspended or _benched) and "big_match_rating" in _pe:
         rating = max(3.0, min(10.0, round(rating + _pe["big_match_rating"], 1)))
+
+    # [2026-08 신설, 신민용 요청] champions_engine과 동일한 "나" 슬롯
+    # 바꿔치기 — 26인 소집 명단엔 "나"가 없으므로(따로 my_player 관리)
+    # 포지션이 같은 슬롯을 찾아 방금 계산된 내 실제 기록으로 덮어쓴다.
+    if player_ratings is not None:
+        _side_key = "home" if is_home else "away"
+        _my_list = player_ratings.get(_side_key)
+        if _my_list:
+            _labels = [r.get("position") if r else None for r in _my_list]
+            _idx = None
+            for _i, _lab in enumerate(_labels):
+                if _lab == my_position:
+                    _idx = _i; break
+            if _idx is None:
+                from constants import POSITION_COMPAT
+                for _want in POSITION_COMPAT.get(my_position, [my_position]):
+                    for _i, _lab in enumerate(_labels):
+                        if _lab == _want:
+                            _idx = _i; break
+                    if _idx is not None:
+                        break
+            if _idx is None:
+                for _i, _lab in enumerate(_labels):
+                    if _lab is not None and _lab != "GK":
+                        _idx = _i; break
+            if _idx is not None:
+                _my_list[_idx] = {
+                    "id": None, "name": p.get("name") or "나",
+                    "position": _labels[_idx], "ovr": p.get("ovr", 40),
+                    "goals": goals, "assists": assists,
+                    "shots": detail.get("shots", 0),
+                    "shots_on": detail.get("shots_on", 0),
+                    "saves": saves, "is_gk": (my_position == "GK"),
+                    "rating": rating, "is_me": True,
+                }
+
     my_result = _my_result(outcome, is_home)
     my_conceded = (as_ if is_home else hs)
 
@@ -3312,8 +3408,9 @@ def simulate_my_match(week, p, day=None):
     detail_id = _save_match_detail(
         p, week, comp_name, is_home, home_disp, away_disp,
         hs, as_, my_result, goals, assists, saves, rating,
-        events, not (_suspended or _benched), _benched, detail, pso=pso)
-    marker = f" [match:{detail_id}]" if detail_id else ""
+        events, not (_suspended or _benched), _benched, detail, pso=pso,
+        engine_stats=engine_stats, engine_plog=engine_plog, player_ratings=player_ratings)
+    marker = f" [match:{detail_id}:intl]" if detail_id else ""
 
     add_log("─" * 44, "sep")
     # [2026-07 신설, 신민용 요청: "48주차가 아니라 11월 27일처럼 실제

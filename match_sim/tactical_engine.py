@@ -195,18 +195,48 @@ class _TeamModel:
         self.gk_q = _gk_quality(self.gk) + boost * w["gk"]
 
 
-def _resolve_shot(rng, side, lane, minute, shooter_pool, opp_gk_q, home_stats, away_stats, plog):
-    """슈팅 하나를 판정해서 team_stats/possession_log를 갱신한다.
-    반환값: 골이 들어갔으면 "home"/"away", 아니면 None."""
+def _pstat(player_stats, p):
+    """[2026-08 신설, 신민용 요청: "경기 시뮬레이션에 다른 선수들의 OVR·
+    스탯도 계산해서 정교한 결과를 뽑고, 경기 상세에서 22명 전원 평점을
+    보여달라"] player_stats(선수 id -> 개인 기록 누적 dict)에서 이 선수의
+    항목을 찾아 반환 — 없으면 0으로 초기화해 새로 만든다. id가 없는(가상
+    폴백) 선수는 객체 자체의 파이썬 id()를 키로 대신 써서 최소한 이번
+    한 경기 안에서는 같은 객체가 같은 기록으로 누적되게 한다."""
+    key = p.get("id")
+    if key is None:
+        key = id(p)
+    rec = player_stats.get(key)
+    if rec is None:
+        rec = {"shots": 0, "shots_on": 0, "goals": 0, "assists": 0,
+               "saves": 0, "goals_conceded": 0}
+        player_stats[key] = rec
+    return rec
+
+
+def _resolve_shot(rng, side, lane, minute, shooter_pool, opp_gk, opp_gk_q,
+                   home_stats, away_stats, home_player_stats, away_player_stats, plog):
+    """슈팅 하나를 판정해서 team_stats/possession_log/선수별 개인 기록
+    (슈팅·유효슈팅·골·도움·선방·실점)을 함께 갱신한다.
+    반환값: 골이 들어갔으면 "home"/"away", 아니면 None.
+
+    [2026-08 확장] 예전엔 shooter_pool에서 슈팅 스탯 가중으로 슈터를
+    뽑아놓고도 그 신원을 결과에 전혀 남기지 않았다(팀+결과만 기록) —
+    이제 그 선수 개인 기록에 직접 누적한다. 어시스트는 완전한 패스체인
+    시뮬레이션 대신, 골이 들어갔을 때 같은 레인 공격 풀에서 슈터를 뺀
+    나머지를 패스 능력 가중으로 뽑아 일정 확률로 붙이는 근사치다."""
     stats = home_stats if side == "home" else away_stats
+    my_pstats = home_player_stats if side == "home" else away_player_stats
+    opp_pstats = away_player_stats if side == "home" else home_player_stats
     stats["shots"] += 1
 
     if shooter_pool:
         weights = [max(1.0, p.get("shooting", 50)) for p in shooter_pool]
         shooter = rng.choices(shooter_pool, weights=weights, k=1)[0]
     else:
-        shooter = {}
-    shot_stat = shooter.get("shooting", 50)
+        shooter = None
+    shot_stat = shooter.get("shooting", 50) if shooter else 50
+    if shooter is not None:
+        _pstat(my_pstats, shooter)["shots"] += 1
 
     on_target_p = max(0.15, min(0.78, 0.30 + (shot_stat - 50) / 150.0))
     if rng.random() >= on_target_p:
@@ -215,6 +245,8 @@ def _resolve_shot(rng, side, lane, minute, shooter_pool, opp_gk_q, home_stats, a
         return None
 
     stats["shots_on"] += 1
+    if shooter is not None:
+        _pstat(my_pstats, shooter)["shots_on"] += 1
     # [버그수정 2026-07, 신민용 지적: "EPL에서 2-9, 7-0 같은 스코어가
     # 너무 자주 나온다 — 현실에서 10:1은 진짜 실력차 없인 안 나온다"]
     # 실측: 동일 능력치(78) 두 팀 400경기를 이 함수 그대로 돌려보니 경기당
@@ -229,11 +261,106 @@ def _resolve_shot(rng, side, lane, minute, shooter_pool, opp_gk_q, home_stats, a
     if rng.random() < save_p:
         plog.append({"min": float(minute), "team": side, "zone": "att", "lane": lane,
                      "outcome": "save", "me": False, "text": None})
+        if opp_gk is not None:
+            _pstat(opp_pstats, opp_gk)["saves"] += 1
         return None
 
     plog.append({"min": float(minute), "team": side, "zone": "att", "lane": lane,
                  "outcome": "goal", "me": False, "text": None})
+    if shooter is not None:
+        _pstat(my_pstats, shooter)["goals"] += 1
+    if opp_gk is not None:
+        _pstat(opp_pstats, opp_gk)["goals_conceded"] += 1
+    if shooter_pool and len(shooter_pool) > 1 and rng.random() < 0.62:
+        creator_pool = [p for p in shooter_pool if p is not shooter]
+        if creator_pool:
+            weights2 = [max(1.0, p.get("passing", 50)) for p in creator_pool]
+            creator = rng.choices(creator_pool, weights=weights2, k=1)[0]
+            _pstat(my_pstats, creator)["assists"] += 1
     return side
+
+
+def _lineup_avg_ovr(lineup):
+    vals = [p.get("ovr", 50) for p in lineup if p is not None]
+    return sum(vals) / len(vals) if vals else 50.0
+
+
+def _build_player_ratings(lineup, player_stats, gf, ga, gk, rng):
+    """[2026-08 신설] 경기 종료 후 이 팀 11명 전원(라인업 슬롯 순서 그대로,
+    빈 슬롯은 None)의 개인 기록 + 평점을 만든다.
+
+    평점 공식은 game_engine._player_perf(내 선수 전용 평점)와 같은
+    발상 — 기본값에서 시작해 팀 결과/개인 기여/포지션별 특성을 더하고
+    빼는 방식 — 을 22명 전체로 일반화한 것이다. 다만 이 엔진은 개별
+    수비 액션(태클 성공/실패 등)까지는 분 단위로 추적하지 않으므로,
+    비GK 필드 플레이어의 평점은 "팀 결과 + 그 선수의 골/도움 기여 +
+    그 선수 OVR이 이 라인업 평균보다 얼마나 높은가(에이스는 골이 없어도
+    경기를 지배한 것으로 봄)"를 근거로 삼는다 — 완전한 개인 이벤트
+    로그가 아니라 근사치라는 점은 명확히 해둔다.
+
+    [2026-08 버그수정, 신민용 리포트: "라인업 평점에 뜨는 이름이
+    AI0JP8이 아니라 names.py에서 뽑힌 실제 이름이다"] ai_players.name은
+    data/names.py에서 뽑은 내부 시드값일 뿐, 화면에는 항상 마스킹된
+    표시명(ui/formation_widget._mask_ai_names와 완전히 동일한 규칙 —
+    사용자가 직접 지어준 커스텀 이름이 있으면 그걸, 없으면
+    constants.ai_player_code로 만든 "AI"+코드)을 써야 한다. 이 값은
+    실제로 존재하는 그 선수(가상으로 지어낸 게 아니라 그 팀 로스터에서
+    _select_lineup이 실제로 뽑은 ai_players 레코드)이고, 문제는 이름
+    '표시' 단계뿐이었다."""
+    real_ids = [p.get("id") for p in lineup if p is not None and p.get("id") is not None]
+    try:
+        from database import get_ai_player_custom_names
+        custom_names = get_ai_player_custom_names(real_ids) if real_ids else {}
+    except Exception:
+        custom_names = {}
+    from constants import ai_player_code
+
+    def _display_name(pl):
+        pid = pl.get("id")
+        if pid is None:
+            return pl.get("name", "") or "AI"
+        return custom_names.get(pid) or ai_player_code(pid)
+
+    avg_ovr = _lineup_avg_ovr(lineup)
+    clean_sheet = (ga == 0)
+    result_mod = 0.45 if gf > ga else (-0.35 if gf < ga else 0.0)
+    out = []
+    for i, p in enumerate(lineup):
+        if p is None:
+            out.append(None)
+            continue
+        is_gk = (p is gk)
+        key = p.get("id")
+        if key is None:
+            key = id(p)
+        pstat = player_stats.get(key, {})
+        base = 6.3 + result_mod
+        base += max(-0.6, min(0.6, (p.get("ovr", 50) - avg_ovr) / 40.0))
+        base += pstat.get("goals", 0) * 0.75
+        base += pstat.get("assists", 0) * 0.4
+        base += max(0, pstat.get("shots_on", 0) - pstat.get("goals", 0)) * 0.05
+        if is_gk:
+            base += pstat.get("saves", 0) * 0.12
+            conceded = pstat.get("goals_conceded", 0)
+            if clean_sheet:
+                base += 0.5
+            base -= max(0, conceded - 1) * 0.15
+        elif clean_sheet:
+            # 필드 플레이어도 완봉승엔 소폭 가산(수비 기여를 개인 이벤트
+            # 없이도 어느 정도 반영 — 실제 수비 기여도는 못 따로 추적함).
+            base += 0.15
+        base += rng.gauss(0, 0.25)
+        label = _FALLBACK_SLOTS[i] if i < len(_FALLBACK_SLOTS) else p.get("position", "CM")
+        out.append({
+            "id": p.get("id"), "name": _display_name(p), "position": label,
+            "ovr": p.get("ovr", 50),
+            "goals": pstat.get("goals", 0), "assists": pstat.get("assists", 0),
+            "shots": pstat.get("shots", 0), "shots_on": pstat.get("shots_on", 0),
+            "saves": pstat.get("saves", 0) if is_gk else 0,
+            "is_gk": is_gk,
+            "rating": round(max(3.0, min(10.0, base)), 1),
+        })
+    return out
 
 
 def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost=0.0,
@@ -290,6 +417,11 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
 
     home_stats = {"shots": 0, "shots_on": 0, "corners": 0, "fouls": 0}
     away_stats = {"shots": 0, "shots_on": 0, "corners": 0, "fouls": 0}
+    # [2026-08 신설] 선수 id(또는 id 없는 폴백 선수는 파이썬 id()) ->
+    # {"shots","shots_on","goals","assists","saves","goals_conceded"} 누적.
+    # _resolve_shot이 채우고, 경기 종료 후 아래에서 평점으로 환산한다.
+    home_player_stats = {}
+    away_player_stats = {}
     home_score = away_score = 0
     plog = []
 
@@ -354,7 +486,8 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
 
         if roll < shot_chance:
             scorer_side = _resolve_shot(
-                rng, side, lane, minute, shooter_pool, dfn_opp.gk_q, home_stats, away_stats, plog)
+                rng, side, lane, minute, shooter_pool, dfn_opp.gk, dfn_opp.gk_q,
+                home_stats, away_stats, home_player_stats, away_player_stats, plog)
             if scorer_side == "home":
                 home_score += 1
             elif scorer_side == "away":
@@ -392,10 +525,20 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
     away_stats["poss"] = 100 - home_poss_pct
 
     plog.sort(key=lambda r: r["min"])
+    # [2026-08 신설] 22명(양팀 라인업 슬롯 순서, 빈 슬롯은 None) 전원의
+    # 개인 기록 + 평점 — ui/match_detail_dialog.py가 이 값이 있으면
+    # FotMob 스타일 라인업+평점 화면을 보여준다(없으면 기존처럼 팀 단위
+    # 통계만 보여주는 화면으로 자동 폴백).
+    home_player_ratings = _build_player_ratings(
+        home_lineup, home_player_stats, home_score, away_score, home.gk, rng)
+    away_player_ratings = _build_player_ratings(
+        away_lineup, away_player_stats, away_score, home_score, away.gk, rng)
     return {
         "home_score": home_score, "away_score": away_score,
         "home_stats": home_stats, "away_stats": away_stats,
         "possession_log": plog,
+        "home_player_ratings": home_player_ratings,
+        "away_player_ratings": away_player_ratings,
     }
 
 

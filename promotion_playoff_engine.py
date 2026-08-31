@@ -676,7 +676,7 @@ def simulate_my_po_match(week, p, day=None):
         p, week, "승강 플레이오프", is_home, home_disp, away_disp,
         hs, as_, my_result, goals, assists, saves, rating,
         events, not (_suspended or _benched), _benched, detail, pso=pso)
-    marker = f" [match:{detail_id}]" if detail_id else ""
+    marker = f" [match:{detail_id}:po]" if detail_id else ""
 
     add_log("─" * 44, "sep")
     add_log(f"⚖ 승강 플레이오프  {week}주차{marker}", "match")

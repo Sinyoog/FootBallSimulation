@@ -435,15 +435,32 @@ def ensure_power_ranking_tables(conn):
         a_rating REAL DEFAULT 0, b_rating REAL DEFAULT 0,
         last_updated_year INTEGER DEFAULT 0)""")
     # 연도별 스냅샷(발표 파워랭킹) — 표시 PS = a_rating+b_rating, 스무딩 없음(5.3).
-    c.execute("""CREATE TABLE IF NOT EXISTS team_power_rankings(
+    # [2026-09 DB 분리 2차, 성능 감사 1위] 이 표는 매년 전 세계 팀 수만큼
+    # (실측 11,393행) 한 번 쌓이고 그 뒤로는 절대 안 바뀌는 순수 연도별
+    # 스냅샷인데(실측 15시즌 182,288행), 여태 main(game.db)에 살면서
+    # 자동저장(flush_to_disk의 전체 backup)·시작 로딩·주기 VACUUM 비용에
+    # 매년 영구히 가산되고 있었다. ai_player_ovr_history와 같은 해법으로
+    # hist(별도 파일 history.db)에 둔다 — 데이터는 그대로 두고 backup
+    # 대상('main' 스키마)에서만 빠진다. 무자격 테이블 이름은 SQLite가
+    # main → 붙은 DB 순으로 찾으므로 이 파일의 다른 SELECT/INSERT는
+    # 한 글자도 안 고쳐도 그대로 동작한다. 기존 세이브는 database.
+    # _migrate_history_db_split_v2()가 1회 이전한다.
+    c.execute("""CREATE TABLE IF NOT EXISTS hist.team_power_rankings(
         ranking_year INTEGER, evaluation_year INTEGER,
         team_id INTEGER, team_name TEXT, continent TEXT, country TEXT,
         rating REAL, rank INTEGER, prev_rank INTEGER,
         PRIMARY KEY(ranking_year, team_id))""")
-    c.execute("""CREATE INDEX IF NOT EXISTS idx_tpr_year_continent
+    c.execute("""CREATE INDEX IF NOT EXISTS hist.idx_tpr_year_continent
         ON team_power_rankings(ranking_year, continent, rank)""")
-    c.execute("""CREATE INDEX IF NOT EXISTS idx_tpr_team
+    c.execute("""CREATE INDEX IF NOT EXISTS hist.idx_tpr_team
         ON team_power_rankings(team_id, ranking_year)""")
+    # [2026-09 신설, 성능 감사] get_team_power_history의 '국가 내 순위'
+    # 계산은 (ranking_year, country, rank) 조건으로 세는데, 여태 이 조합을
+    # 커버하는 인덱스가 없어서(idx_tpr_year_continent는 continent 기준)
+    # 매번 그 해 전체 팀(실측 11,393행)을 훑어야 했다. 이 인덱스가 있으면
+    # 그 나라 팀들(보통 수십 개)만 범위 스캔한다.
+    c.execute("""CREATE INDEX IF NOT EXISTS hist.idx_tpr_year_country
+        ON team_power_rankings(ranking_year, country, rank)""")
     c.execute("""CREATE TABLE IF NOT EXISTS country_power_rankings(
         ranking_year INTEGER, evaluation_year INTEGER,
         country TEXT, continent TEXT,
@@ -463,7 +480,9 @@ def ensure_power_ranking_tables(conn):
         league_id INTEGER, year INTEGER, power REAL,
         PRIMARY KEY(league_id, year))""")
     # 팀별 레이어B 획득 이력(리그파워 국제실적보정 ②용, 최근 5년 조회)
-    c.execute("""CREATE TABLE IF NOT EXISTS team_b_history(
+    # [2026-09 DB 분리 2차] 위 team_power_rankings와 같은 이유·같은 규모
+    # (실측 168,525행, 매년 +11,393)로 같이 hist에 둔다.
+    c.execute("""CREATE TABLE IF NOT EXISTS hist.team_b_history(
         team_id INTEGER, year INTEGER, b_gain REAL,
         PRIMARY KEY(team_id, year))""")
     # [2026-08 v3.2 신설, 리그 상대강도] 그 시즌에 실제로 만난 상대들의
@@ -1820,21 +1839,59 @@ def get_team_power_history(conn, team_id: int) -> list:
     rows = conn.execute(
         """SELECT ranking_year, rank, continent, country FROM team_power_rankings
            WHERE team_id=? ORDER BY ranking_year DESC""", (team_id,)).fetchall()
-    result = []
-    for ranking_year, rank, continent, country in rows:
-        group = _continent_group_for(continent)
+    if not rows:
+        return []
+
+    # [2026-09 성능 수정, 감사 항목 4위 "연차 수에 비례하는 N+1"] 예전엔
+    # 위에서 가져온 연도 행을 파이썬 for문으로 돌면서 연도마다 COUNT(*)를
+    # 2번(대륙 순위 1 + 국가 순위 1)씩 개별 실행했다 — 즉 쿼리 수가
+    # '연도 수 × 2'로, 게임을 오래 할수록 팀 하나 클릭할 때마다 선형으로
+    # 계속 늘어났다(15년차 최대 30개, 150년차면 300개). 세계기록실에서
+    # 팀 상세를 열 때마다 매번 발생하는 UI 경로라 체감이 크다.
+    #
+    # 같은 계산을 '연도별 GROUP BY 집계' 2개로 바꿔, 쿼리 횟수를 연도 수와
+    # 무관하게 고정한다(총 3회: 본문 1 + 대륙 1 + 국가 1). 계산식 자체는
+    # 완전히 동일하다 — "그 해, 같은 범위 안에서 rank가 나보다 작거나 같은
+    # 팀의 수"를 세는 것이고, 자기 자신도 항상 포함되므로(rank<=rank) 결과
+    # 값은 예전과 100% 같다. 반환 튜플 형식/순서도 그대로.
+    #
+    # 대륙 그룹(_continent_group_for)이 연도마다 다를 수 있으므로(팀의
+    # continent 값이 바뀐 아주 드문 경우) 그룹별로 나눠 집계한다 — 실제로는
+    # 거의 항상 그룹이 1개라 쿼리도 1번이다.
+    years_by_group = {}
+    for r in rows:
+        group = tuple(_continent_group_for(r[2]))
+        years_by_group.setdefault(group, []).append(r[0])
+
+    cont_rank = {}
+    for group, _years in years_by_group.items():
         placeholders = ",".join("?" * len(group))
-        crow = conn.execute(
-            f"""SELECT COUNT(*) FROM team_power_rankings
-                WHERE ranking_year=? AND continent IN ({placeholders}) AND rank<=?""",
-            (ranking_year, *group, rank)).fetchone()
-        country_row = conn.execute(
-            """SELECT COUNT(*) FROM team_power_rankings
-               WHERE ranking_year=? AND country=? AND rank<=?""",
-            (ranking_year, country, rank)).fetchone()
-        result.append((ranking_year, rank, crow[0] if crow else rank,
-                        country_row[0] if country_row else rank))
-    return result
+        for y, cnt in conn.execute(
+                f"""SELECT p.ranking_year, COUNT(*)
+                    FROM team_power_rankings p
+                    JOIN team_power_rankings me
+                      ON me.team_id=? AND me.ranking_year=p.ranking_year
+                    WHERE p.continent IN ({placeholders}) AND p.rank<=me.rank
+                    GROUP BY p.ranking_year""",
+                (team_id, *group)).fetchall():
+            cont_rank[y] = cnt
+
+    country_rank = {}
+    for y, cnt in conn.execute(
+            """SELECT p.ranking_year, COUNT(*)
+               FROM team_power_rankings p
+               JOIN team_power_rankings me
+                 ON me.team_id=? AND me.ranking_year=p.ranking_year
+               WHERE p.country=me.country AND p.rank<=me.rank
+               GROUP BY p.ranking_year""", (team_id,)).fetchall():
+        country_rank[y] = cnt
+
+    # 집계에서 빠진 연도(이론상 없음 — 자기 자신이 항상 한 건 잡힌다)는
+    # 예전 코드와 똑같이 전체 rank를 그대로 대체값으로 쓴다.
+    return [(ranking_year, rank,
+             cont_rank.get(ranking_year, rank),
+             country_rank.get(ranking_year, rank))
+            for ranking_year, rank, continent, country in rows]
 
 
 def get_country_power_history(conn, country: str) -> list:

@@ -2683,6 +2683,36 @@ class CenterPanel(QWidget):
         if po:
             return po
 
+        # [2026-08 버그수정 2차, 신민용 리포트: "슈퍼컵이 경기가 진행됐다고는
+        # 뜨는데 일정엔 안 보인다 — 리그랑 겹치면서 그러는 것 같다"]
+        # 직전 수정(아래 챔스/유로파/컨퍼런스와 같은 줄에 슈퍼컵을 추가한
+        # 것)이 잘못된 자리였다 — 바로 위 주석대로 "day가 진짜 있는
+        # intl/cwc/PO만 day로 직접 조회하고, 아직 day가 없는 챔스/유로파/
+        # 컨퍼런스/국내컵은 _week_intl_cl_day가 정한 '그 주의 딱 하루'에만
+        # 확인한다"는 구분 기준을 그대로 따랐어야 했는데, 슈퍼컵은 사실
+        # sc_matches.day에 실제 날짜(_SF_DAY/_FINAL_DAY, super_cup_engine.
+        # _set_match_days 참고)가 채워지는 대회라 PO/CWC와 같은 부류다.
+        # 그런데 실제로는 아래(챔스 등과 같은 줄)에 있어서 "그 주 딱 하루"
+        # (_week_intl_cl_day, 국내리그와 안 겹치는 요일을 화→금→...
+        # 순으로 고름) 게이트에 걸렸다 — 슈퍼컵의 진짜 날짜(_SF_DAY=그 주
+        # 첫날=일요일)는 이 게이트가 거의 고르지 않는 요일(안 겹치는
+        # 요일을 찾다가 최후순위로나 겨우 고르는 요일)이라, 사실상 게이트
+        # 조건(day == _week_intl_cl_day(...))이 거의 항상 거짓이 되어
+        # 슈퍼컵 당일에도 이 화면엔 절대 안 뜨고 있었다(실제 경기 처리는
+        # advance_days→super_cup_engine.process_super_cup_week가 이 게이트와
+        # 무관하게 별도로 진행되므로 정상적으로 진행/기록은 됐다 — 그래서
+        # "경기는 됐는데 화면엔 안 보인다"는 리포트와 정확히 일치). 게다가
+        # 하필 그 요일(일요일)은 국내리그 경기가 잦은 요일이라, PO/CWC와
+        # 같은 줄로 옮겨 여기서 먼저 확인하더라도 실제로 같은 날 국내리그
+        # 경기가 걸려 있으면 이 함수 맨 위 match_results 조회가 먼저
+        # 걸려 슈퍼컵이 가려질 수 있다 — 그 요일 자체를 국내리그와 안
+        # 겹치게 고르는 별도 수정을 super_cup_engine._pick_sc_days에 했다.
+        from competition import super_cup_engine
+        scm = super_cup_engine.get_my_super_cup_match(week, day=day, p=p, st=st)
+        if scm:
+            scm["cl_kind"] = "super_cup"
+            return scm
+
         from game_engine import _week_intl_cl_day
         if day != _week_intl_cl_day(week, p, st=st):
             return None
@@ -2702,19 +2732,6 @@ class CenterPanel(QWidget):
         if eclm:
             eclm["cl_kind"] = "conference"
             return eclm
-        # [2026-08 버그수정, 신민용 리포트: "슈퍼컵이 center_panel에 안
-        # 뜬다"] 챔스/유로파/컨퍼런스는 여기서 확인하면서 슈퍼컵만 빠져
-        # 있었다 — game_engine.advance_days 쪽은 super_cup_engine을 제대로
-        # 호출해 실제 경기 처리는 정상 진행됐지만(1454~1782행), 화면
-        # 표시 함수인 이 함수는 아예 조회를 안 해서 슈퍼컵 당일에도
-        # "훈련" 카드만 보이는 상태였다. 챔스/유로파/컨퍼런스와 동일하게
-        # cl_kind="super_cup"을 붙여 반환한다(색상 스타일은 _CL_KIND_STYLE에
-        # 이미 있음 — 926행 참고).
-        from competition import super_cup_engine
-        scm = super_cup_engine.get_my_super_cup_match(week, day=day, p=p, st=st)
-        if scm:
-            scm["cl_kind"] = "super_cup"
-            return scm
         from competition import cup_engine
         return cup_engine.get_my_cup_match(week, day=day, p=p, st=st)
 

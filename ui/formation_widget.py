@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QDialog,
     QTableWidget, QTableWidgetItem, QPushButton, QComboBox,
     QSizePolicy, QFrame, QScrollArea, QGridLayout, QLineEdit,
-    QPlainTextEdit
+    QPlainTextEdit, QSpinBox
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import (QColor, QPainter, QBrush, QPen, QFont, QFontMetrics,
@@ -15,7 +15,7 @@ from PyQt6.QtGui import (QColor, QPainter, QBrush, QPen, QFont, QFontMetrics,
 
 from database import get_conn
 from constants import FORMATION_SLOTS, STAT_KO, ALL_STATS, POSITION_COMPAT
-from game_engine import is_hard_mode
+from game_engine import is_hard_mode, is_easy_mode
 
 # 승강/리스케일 후 OVR 캐시 무효화 플래그 (game_engine._invalidate_team_ovr_cache가 세팅)
 _ovr_cache_invalidated: bool = False
@@ -59,6 +59,19 @@ def _full_squad_for_team(team_id):
     if not rows:
         return None
     return _mask_ai_names([dict(r) for r in rows])
+
+def _fetch_single_ai_player(player_id):
+    """[2026-08 신설] 쉬움 난이도 스탯 편집 저장 직후, 이 팝업 자신을
+    최신 값(재계산된 15개 스탯 + 새 OVR)으로 즉시 갱신하기 위한 단건
+    조회. _players_for_team과 동일하게 표시용 이름 마스킹을 거친다.
+    선수가 없으면(이미 이적/은퇴 등으로 사라진 경우) None."""
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM ai_players WHERE id=?", (player_id,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return _mask_ai_names([dict(row)])[0]
+
 
 def _mask_ai_names(rows):
     """[2026-07] 포메이션 화면에 실제 개인 이름 대신 'AI'만 표시한다 — 이미
@@ -1785,7 +1798,23 @@ class FormationWidget(QWidget):
 
         lay.addLayout(ctx_row)
 
-        # ── 2행: 내 팀 정보(좌) + 상대팀 콤보(우)
+        # ── 2행: 내 팀 정보(좌) + 상대팀 콤보+복사버튼(우)
+        # [2026-08 버그수정, 신민용 리포트: "타팀 선택지 UI가 중간을 넘어가
+        # 지저분해 보인다"] 예전엔 lbl_my(5) / combo(5) / copy_squad_btn(0)를
+        # 한 줄에 나란히 놓았다. 문제는 바로 아래 3행(split)이 my_panel(5) /
+        # 구분선 / opp_panel(5) 딱 2칸으로 절반씩 나뉘는데, 이 정보 줄은
+        # 폭을 차지하는 위젯이 3개(copy_squad_btn까지)라 5:5:0 스트레치로
+        # 나눠도 "5 스트레치 몫"의 절대폭이 copy_squad_btn 폭만큼 줄어든다.
+        # 그 결과 lbl_my/combo 경계가 실제 화면 중앙(=my_panel/opp_panel
+        # 경계)보다 왼쪽으로 밀리고, combo 오른쪽엔 copy_squad_btn 앞까지
+        # 붕 뜬 빈 공간이 생겨 "선택 상자가 중앙을 넘어와 있고 그 옆은
+        # 텅 비어 지저분한" 모양이 됐다.
+        # 수정: copy_squad_btn을 lbl_my와 같은 줄의 "5 스트레치" 경쟁에서
+        # 아예 빼고, combo와 한 묶음(sub-layout)으로 오른쪽 5칸 안에
+        # 같이 넣는다. 이러면 lbl_my(5) : [combo+버튼](5) 비율이 정확히
+        # my_panel(5) : opp_panel(5)과 같아져 아래 캔버스와 폭이 그대로
+        # 맞물리고, combo는 그 5칸 안에서 남는 공간을 전부 채워 늘어나며
+        # 버튼은 그 오른쪽 끝에 딱 붙는다.
         info_row = QHBoxLayout()
         info_row.setSpacing(6)
         lay.addLayout(info_row)
@@ -1799,6 +1828,7 @@ class FormationWidget(QWidget):
 
         self.combo = QComboBox()
         self.combo.setFixedHeight(26)
+        self.combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.combo.setStyleSheet(
             "QComboBox{background:#2a2a2a;color:#cccccc;border:1px solid #444;"
             "border-radius:4px;padding:2px 8px;font-size:11px;}"
@@ -1807,7 +1837,6 @@ class FormationWidget(QWidget):
             "QComboBox QAbstractItemView{background:#1e1e1e;color:#ccc;"
             "selection-background-color:#3a6a3a;border:1px solid #444;outline:none;}")
         self.combo.currentIndexChanged.connect(self._on_opp_select)
-        info_row.addWidget(self.combo, 5)
 
         # [2026-08 신설, 신민용 요청: "포메이션 우측 위에 복사하기 버튼을
         # 만들건데, 누르면 이 당시 주전/후보 선수 기록들을 위에서부터
@@ -1823,7 +1852,12 @@ class FormationWidget(QWidget):
             "border-radius:4px;padding:2px 10px;font-size:11px;}"
             "QPushButton:hover{border:1px solid #888;background:#383838;}")
         self.copy_squad_btn.clicked.connect(self._on_copy_squad_clicked)
-        info_row.addWidget(self.copy_squad_btn, 0)
+
+        opp_box = QHBoxLayout()
+        opp_box.setSpacing(6)
+        opp_box.addWidget(self.combo, 1)
+        opp_box.addWidget(self.copy_squad_btn, 0)
+        info_row.addLayout(opp_box, 5)
 
         # ── 3행: 캔버스(절반 크기) + 전체 명단 패널, 좌우
         # [2026-08 신설, 신민용 요청: "본선 11명 말고 전체 선수 명단도
@@ -2583,6 +2617,21 @@ class PlayerStatPopup(QDialog):
         nat = pl.get("nationality", "")
         if nat:
             info_rows.append(("국적", nat))
+        # [2026-08 수정, 신민용 요청: "국대일 때 뜨는 현재 소속팀/리그
+        # 표시가 다른 항목들과 형태가 달라서 어색하다 — 저것도 좌우 2개로
+        # 나눠서 그리드 형태로"] 예전엔 이 둘만 아이콘+_CopyableField로
+        # 된 별도 줄(club_row/league_row, 아래 참고)이었는데, 이제 위
+        # 이름/포지션/OVR/나이/국적과 완전히 같은 info_tbl 행("현재 팀"/
+        # "소속 리그" | 값)으로 통일한다. 어려움 난이도는 club 자체가
+        # 아래에서 이미 ""로 비워지므로(클럽 정보 숨김 원칙) 자동으로
+        # 두 행 다 안 생긴다.
+        _club_for_rows = pl.get("club", "") if not _hard else ""
+        if _club_for_rows:
+            info_rows.append(("현재 팀", _club_for_rows))
+            _club_country = pl.get("club_country", "")
+            _club_tier = pl.get("club_tier")
+            if _club_country and _club_tier:
+                info_rows.append(("소속 리그", f"{_club_country} ({_club_tier}부)"))
 
         # [2026-08 신설, 신민용 요청: "포메이션에서 선수 클릭했을 때도
         # 세계 축구 기록실 선수 검색처럼 이름을 눌러서 바로 지어줄 수
@@ -2604,6 +2653,15 @@ class PlayerStatPopup(QDialog):
         self._rename_pid = _rename_pid
         self._name_row_idx = None
         self._name_value_item = None
+        self._ovr_row_idx = None
+        self._ovr_value_item = None
+        # [2026-08 신설, 신민용 요청: "쉬움 난이도에서 상대팀이든 우리팀이든
+        # 나 빼고 선수들의 한계 스탯(OVR)을 조정할 수 있게"] 이름 변경과
+        # 같은 대상 판정(_rename_pid — 나 자신·id 없는/가상 선수 제외)에
+        # 난이도 조건만 추가한다. '보통' 난이도는 OVR 숫자는 보여도 편집은
+        # 안 되고(쉬움만 편집 가능), '어려움'은 OVR 행 자체가 info_rows에
+        # 없으므로 이 값이 있어도 그릴 자리가 없다.
+        self._ovr_edit_pid = _rename_pid if is_easy_mode() else None
 
         info_tbl = QTableWidget(len(info_rows), 2)
         info_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -2641,6 +2699,19 @@ class PlayerStatPopup(QDialog):
                     label_item.setToolTip("클릭하면 이 선수의 이름을 직접 지을 수 있습니다")
                 else:
                     label_item.setForeground(QColor("#888"))
+            elif label == "OVR":
+                # [2026-08 신설] "이름" 행과 같은 방식 — 편집 가능할 때만
+                # 라벨 칸을 파란색+굵게로 눈에 띄게 하고, 아니면 평범하게.
+                self._ovr_row_idx = i
+                self._ovr_value_item = value_item
+                value_item.setForeground(QColor("#ccc"))
+                if self._ovr_edit_pid is not None:
+                    lf = label_item.font(); lf.setBold(True); label_item.setFont(lf)
+                    label_item.setForeground(QColor("#4da6ff"))
+                    label_item.setToolTip(
+                        "클릭하면 이 선수의 한계 스탯(OVR)을 조정할 수 있습니다 (쉬움 난이도 전용)")
+                else:
+                    label_item.setForeground(QColor("#888"))
             else:
                 label_item.setForeground(QColor("#888"))
                 value_item.setForeground(QColor("#ccc"))
@@ -2648,7 +2719,7 @@ class PlayerStatPopup(QDialog):
             info_tbl.setItem(i, 1, value_item)
         info_tbl.horizontalHeader().setStretchLastSection(True)
         info_tbl.setFixedHeight(22 * len(info_rows) + 4)
-        if _rename_pid is not None:
+        if _rename_pid is not None or self._ovr_edit_pid is not None:
             info_tbl.setCursor(Qt.CursorShape.PointingHandCursor)
             info_tbl.cellClicked.connect(self._on_info_cell_clicked)
         self._lay.addWidget(info_tbl)
@@ -2672,36 +2743,10 @@ class PlayerStatPopup(QDialog):
 
         # [2026-07 신설, 신민용 요청] 소속팀 표시 (국제대회 화면에서 상대국
         # 선수 클릭 시 — "어느 클럽 소속인지"가 국적보다 새 정보이므로 표시)
-        # [2026-08 수정, 신민용 요청: "클릭하면 복붙할 수 있는 상자로"]
-        # 팀명이 길거나 특이한 표기라 그대로 검색해보고 싶을 때가 있어,
-        # 읽기 전용 QLabel 대신 클릭 시 전체 선택되는 _CopyableField로 바꿨다.
-        # [2026-08 확장, 신민용 요청] 어려움 난이도는 소속팀도 숨긴다 —
-        # 이름/포지션/나이/국적 4개 항목 외엔 아무것도 안 보여준다는
-        # 원칙에 맞춰, 클럽 정보(간접적으로 상대 실력을 짐작하게 함)도
-        # 제외.
-        club = pl.get("club", "") if not _hard else ""
-        if club:
-            club_row = QHBoxLayout(); club_row.setSpacing(4)
-            club_icon = QLabel("🏟️"); club_icon.setStyleSheet("font-size:11px;")
-            club_row.addWidget(club_icon)
-            club_field = _CopyableField(club)
-            club_row.addWidget(club_field, 1)
-            self._lay.addLayout(club_row)
-
-            # [2026-08 신설, 신민용 요청: "소속팀명 옆에 상자 하나 더
-            # 만들어서 어느나라 (몇부)인지 표시해줘"] 국제대회 화면에서
-            # 실제 선수를 뽑아오면서 그 선수가 뛰는 클럽의 국가/tier도
-            # 같이 가져오게 해뒀다(get_country_squad_players) — 그 값을
-            # 팀명 옆 별도 복붙 가능 상자에 "국가명 (N부)" 형식으로 보여준다.
-            club_country = pl.get("club_country", "")
-            club_tier = pl.get("club_tier")
-            if club_country and club_tier:
-                league_row = QHBoxLayout(); league_row.setSpacing(4)
-                league_icon = QLabel("🏆"); league_icon.setStyleSheet("font-size:11px;")
-                league_row.addWidget(league_icon)
-                league_field = _CopyableField(f"{club_country} ({club_tier}부)")
-                league_row.addWidget(league_field, 1)
-                self._lay.addLayout(league_row)
+        # [2026-08 수정] 예전엔 여기서 아이콘+_CopyableField로 된 별도 줄
+        # (club_row/league_row)을 그렸는데, 위 info_rows 쪽으로 옮겨서
+        # "현재 팀"/"소속 리그" 행으로 info_tbl 그리드에 합쳤다(어려움
+        # 난이도에서 숨기는 것도 위 _club_for_rows 판정으로 그대로 유지).
 
         # [2026-08 확장, 신민용 요청] 어려움 난이도는 세부 스탯 표 자체를
         # 안 그린다 — 이름/포지션/나이/국적 4개 항목만 남는다.
@@ -2835,9 +2880,16 @@ class PlayerStatPopup(QDialog):
         행(포지션/OVR/나이/국적)과 값 칸(1번)은 그대로 읽기전용. 본인·id
         없는 가상 선수는 애초에 _rename_pid가 None이라 클릭 연결 자체를
         안 해뒀으므로 여기까지 안 온다."""
-        if row != self._name_row_idx or col != 0:
+        if col != 0:
             return
-        self._open_rename_dialog()
+        if row == self._name_row_idx:
+            self._open_rename_dialog()
+            return
+        # [2026-08 신설] OVR 라벨 칸 클릭 → 쉬움 난이도 전용 스탯 편집 창.
+        # _ovr_edit_pid가 None이면(보통/어려움 난이도, 또는 애초에 이
+        # 표에 OVR 행이 없는 경우) 여기 도달해도 조용히 무시된다.
+        if row == self._ovr_row_idx and self._ovr_edit_pid is not None:
+            self._open_stat_edit_dialog()
 
     def _open_rename_dialog(self):
         """AI 선수 이름 변경 창 — world_browser.py의 "선수 검색" 상세
@@ -2927,3 +2979,95 @@ class PlayerStatPopup(QDialog):
             apply_custom_name_live_to_browser(pid)
         except Exception:
             pass
+
+    def _open_stat_edit_dialog(self):
+        """[2026-08 신설, 신민용 요청: "쉬움 난이도에서는 상대팀이든
+        우리팀이든 나 빼고 선수들의 한계 스탯(OVR)을 조정할 수 있게 하고
+        싶어 ... OVR을 늘리는 거에 따라 현재 스탯이 조정되게 해줘(플레이어도
+        OVR100이랑 OVR70이 스탯이 다른 것처럼)"] 목표 OVR을 입력받아
+        database.rescale_ai_player_to_target_ovr()로 15개 스탯 전부를 같은
+        델타만큼 평행이동시켜 재계산한다 — 승격/강등 때 팀 전체에 이미
+        쓰던 rescale_team_to_target_ovr()의 개인용 버전이라, 그 선수 고유의
+        스탯 분포(개성)는 유지한 채 전체 수준만 오르내린다. _open_rename_dialog와
+        동일한 구조(모달 하나, 저장 시 팝업 자신 갱신 + 화면 즉시 반영)."""
+        pid = self._ovr_edit_pid
+        if pid is None:
+            return
+        from database import rescale_ai_player_to_target_ovr
+        cur_ovr = int(self._pl.get("ovr", 50) or 50)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("한계 스탯(OVR) 조정 — 쉬움 난이도")
+        dlg.setStyleSheet("QDialog{background:#1e1e1e;color:#ccc;}")
+        dlg.setMinimumWidth(300)
+        v = QVBoxLayout(dlg)
+
+        info_lbl = QLabel(
+            f"현재 OVR: {cur_ovr}\n"
+            "새 목표 OVR을 정하면 세부 스탯 15개가 전부 같은 폭으로\n"
+            "함께 오르내립니다(이 선수만의 강약 분포는 그대로 유지).")
+        info_lbl.setStyleSheet("color:#888;font-size:11px;")
+        v.addWidget(info_lbl)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("목표 OVR:"))
+        spin = QSpinBox()
+        spin.setRange(1, 99)
+        spin.setValue(cur_ovr)
+        spin.setStyleSheet(
+            "QSpinBox{background:#161616;color:#eee;font-size:13px;"
+            "border:1px solid #333;border-radius:4px;padding:4px 6px;}")
+        row.addWidget(spin, 1)
+        v.addLayout(row)
+
+        btn_row = QHBoxLayout()
+        save_btn = QPushButton("적용")
+        save_btn.setStyleSheet(
+            "background:#2d4a6b;color:#eee;border:1px solid #4a7ab0;"
+            "border-radius:4px;padding:6px 14px;")
+        cancel_btn = QPushButton("취소")
+        cancel_btn.setStyleSheet(
+            "background:#2a2a2a;color:#ccc;border:1px solid #444;"
+            "border-radius:4px;padding:6px 14px;")
+        btn_row.addStretch(1)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(save_btn)
+        v.addLayout(btn_row)
+
+        save_btn.clicked.connect(dlg.accept)
+        cancel_btn.clicked.connect(dlg.reject)
+
+        _accepted = dlg.exec() == QDialog.DialogCode.Accepted
+        _target = spin.value()
+        # [2026-08 최적화/누수수정] _open_rename_dialog와 동일한 이유 —
+        # 부모(self)가 있는 QDialog는 파이썬 참조가 사라져도 C++ 객체가
+        # 계속 살아남는다. 다 쓴 즉시 삭제 예약.
+        dlg.deleteLater()
+        if not _accepted or _target == cur_ovr:
+            return
+
+        delta, before_ovr, after_ovr = rescale_ai_player_to_target_ovr(pid, _target)
+
+        global _ovr_cache_invalidated
+        _ovr_cache_invalidated = True
+
+        # 1) 이 팝업 자신을 최신 스탯/OVR로 갱신 (club 등 원래 있던
+        #    부가 정보는 새로 조회한 dict에 없으므로 옮겨 붙인다).
+        fresh = _fetch_single_ai_player(pid)
+        if fresh is not None:
+            for k in ("club", "club_country", "club_tier"):
+                if k in self._pl and k not in fresh:
+                    fresh[k] = self._pl[k]
+            self.load_player(fresh)
+
+        # 2) 지금 열려 있는 이 포메이션 화면(캔버스/명단/평균 OVR 헤더)에
+        #    즉시 반영 — 이름 변경(apply_custom_name_live)과 달리 OVR
+        #    변경은 헤더의 "평균 OVR" 텍스트까지 다시 계산해야 하므로,
+        #    개별 위젯을 일일이 패치하는 대신 refresh_now()로 지금 로드된
+        #    team_id/context 그대로 DB에서 다시 통째로 그린다(이미 이
+        #    목적으로 만들어진 기존 메서드 재사용).
+        if self._nav is not None:
+            try:
+                self._nav.refresh_now()
+            except Exception:
+                pass

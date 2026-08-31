@@ -921,13 +921,49 @@ def simulate_my_cl_match(week, p, day=None):
     h_ovr = he["ovr"] + (bonus if is_home else 0)
     a_ovr = ae["ovr"] + (0 if is_home else bonus)
 
-    outcome = _match_outcome(h_ovr, a_ovr)
+    # [2026-08 신설, 신민용 요청: "챔피언스리그처럼 다른 국가 팀이랑 하면
+    # 라인업 평점이 안 뜬다"] 리그(game_engine._simulate_match)와 동일한
+    # 원칙 — "내가 직접 보는 경기"만 실제 포메이션 매치업(match_sim.
+    # tactical_engine)으로 정교하게 돌리고, 실패하면 예전 방식(팀 OVR
+    # 차이 확률표)으로 조용히 폴백한다. 챔스 상대는 실제 다른 나라
+    # ai_players 로스터라(entry()가 진짜 teams 행에서 뽑음) 리그와 완전히
+    # 같은 방식으로 로스터/포메이션을 가져올 수 있다. 챔스는 "중립 구장
+    # 가정"(위 competition_common.match_outcome 주석 참고)이라 리그와
+    # 달리 home_adv=0.0으로 넘긴다.
+    my_position = p.get("position", "")
+    engine_stats = None
+    engine_plog = None
+    player_ratings = None
+    try:
+        from match_sim.tactical_engine import simulate_my_match
+        from game_engine import _team_formation
+        _fconn = get_conn()
+        _c = _fconn.cursor()
+        home_formation = _team_formation(_c, m["home_team_id"])
+        away_formation = _team_formation(_c, m["away_team_id"])
+        _fconn.close()
+        sim = simulate_my_match(
+            m["home_team_id"], m["away_team_id"], home_formation, away_formation,
+            home_boost=(bonus if is_home else 0.0),
+            away_boost=(bonus if not is_home else 0.0),
+            home_boost_position=(my_position if is_home else None),
+            away_boost_position=(my_position if not is_home else None),
+            home_adv=0.0)
+        hs, as_ = sim["home_score"], sim["away_score"]
+        engine_stats = {"home": sim["home_stats"], "away": sim["away_stats"]}
+        engine_plog = sim["possession_log"]
+        player_ratings = {"home": sim.get("home_player_ratings") or [],
+                          "away": sim.get("away_player_ratings") or []}
+        outcome = "draw" if hs == as_ else ("home" if hs > as_ else "away")
+    except Exception:
+        outcome = _match_outcome(h_ovr, a_ovr)
+        hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
+
     pso_winner, pso_score = 0, ""
     is_ko = (m["stage"] != "league")  # [2026-07 버그 수정] 조별리그->리그 스테이지 개편 후 남아있던 옛 스테이지명 비교
     if outcome == "draw" and is_ko:
         win_home, pso_score = _resolve_pso(h_ovr, a_ovr)
         pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
-    hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
 
     if _suspended or _benched:
         goals, assists, saves, rating = 0, 0, 0, 0.0
@@ -954,6 +990,44 @@ def simulate_my_cl_match(week, p, day=None):
     # 경기에 적용한다.
     if not (_suspended or _benched) and "big_match_rating" in _pe:
         rating = max(3.0, min(10.0, round(rating + _pe["big_match_rating"], 1)))
+
+    # [2026-08 신설, 신민용 요청: "챔스도 라인업 평점이 떠야지"]
+    # game_engine._simulate_match과 완전히 동일한 패턴 — 전술엔진이 뽑은
+    # 22명 중 "나"는 애초에 없으므로(그 로스터는 ai_players뿐), 내
+    # 포지션과 라벨이 같은 슬롯을 찾아 방금 계산된 내 실제 기록으로
+    # 바꿔치기한다(_find_my_slot과 동일한 우선순위).
+    if player_ratings is not None:
+        _side_key = "home" if is_home else "away"
+        _my_list = player_ratings.get(_side_key)
+        if _my_list:
+            _labels = [r.get("position") if r else None for r in _my_list]
+            _idx = None
+            for _i, _lab in enumerate(_labels):
+                if _lab == my_position:
+                    _idx = _i; break
+            if _idx is None:
+                from constants import POSITION_COMPAT
+                for _want in POSITION_COMPAT.get(my_position, [my_position]):
+                    for _i, _lab in enumerate(_labels):
+                        if _lab == _want:
+                            _idx = _i; break
+                    if _idx is not None:
+                        break
+            if _idx is None:
+                for _i, _lab in enumerate(_labels):
+                    if _lab is not None and _lab != "GK":
+                        _idx = _i; break
+            if _idx is not None:
+                _my_list[_idx] = {
+                    "id": None, "name": p.get("name") or "나",
+                    "position": _labels[_idx], "ovr": p.get("ovr", 40),
+                    "goals": goals, "assists": assists,
+                    "shots": detail.get("shots", 0),
+                    "shots_on": detail.get("shots_on", 0),
+                    "saves": saves, "is_gk": (my_position == "GK"),
+                    "rating": rating, "is_me": True,
+                }
+
     my_result = _my_result(outcome, is_home)
     my_conceded = (as_ if is_home else hs)
 
@@ -1019,8 +1093,9 @@ def simulate_my_cl_match(week, p, day=None):
     detail_id = _save_match_detail(
         p, week, comp_name, is_home, home_disp, away_disp,
         hs, as_, my_result, goals, assists, saves, rating,
-        events, not (_suspended or _benched), _benched, detail, pso=pso)
-    marker = f" [match:{detail_id}]" if detail_id else ""
+        events, not (_suspended or _benched), _benched, detail, pso=pso,
+        engine_stats=engine_stats, engine_plog=engine_plog, player_ratings=player_ratings)
+    marker = f" [match:{detail_id}:cl]" if detail_id else ""
 
     add_log("─" * 44, "sep")
     add_log(f"🏆 {comp_name}  {week}주차{marker}", "match")
