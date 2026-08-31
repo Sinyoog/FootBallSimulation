@@ -3011,6 +3011,51 @@ LEAGUE_RELATIVE_MARGIN_BANDS = [
 ]
 LEAGUE_RELATIVE_MARGIN_FALLBACK = 5   # 하위 20% = 최하위권 (그 이상 전부 포함)
 
+# 4-1) 해외(자국 외) 팀의 오퍼 마진 페널티 — 위 리그 내 상대적 위치
+#      마진에서 이 값만큼 빼서 해외 진출을 자국 이적보다 더 빡빡하게
+#      만든다. 예: 명문팀(마진1) 기준 해외면 마진-1(사실상 내가 팀
+#      평균보다 강해야 통과), 최하위권(마진5) 기준 해외면 마진3 정도로
+#      여전히 어느 정도는 열려 있음. _AGENT_CONTINENT_BONUS(전문 에이전트
+#      보정)와 합산 적용되므로 대륙 전문 에이전트가 있으면 완화된다.
+FOREIGN_OFFER_MARGIN_PENALTY = 2
+
+# 4-2) 해외 오퍼 성사 확률(pass_fraction)에 곱하는 나이 보정 — 나이가
+#      들수록 해외 이적 시장의 관심이 자연스럽게 줄어드는 효과. 이미
+#      effective_ovr/출전량/평점/인기/지역 보정이 시장성을 결정하므로
+#      나이는 약한 감쇠/보너스로만 얹는다. (상한 나이, 배수) 오름차순 —
+#      해당 나이 이하 첫 구간이 적용된다. 33세 이상 구간만 별도 처리
+#      (아래 FOREIGN_OFFER_AGE_MULT_33PLUS* 참고).
+#      [2026-08 신설] 후보 가중치(_w, random.choices 상대비중)가 아니라
+#      pass_fraction(성사 확률)에 곱해야 실제로 효과가 있다 — _w는 선수
+#      한 명에게 모든 후보가 동일한 값이라 상대 가중치 정규화 과정에서
+#      상쇄되어 사실상 무효과가 된다(나라마다 다른 지역/수출국 가중치와
+#      다른 점).
+FOREIGN_OFFER_AGE_MULT = [
+    (22, 1.08),
+    (25, 1.05),
+    (28, 1.00),
+    (30, 0.95),
+    (32, 0.90),
+]
+# [2026-08 신설, 신민용 지시] 33세 이상 감쇠폭은 재능 등급에 따라 다르게 —
+# 월드클래스/신급은 30대 중후반까지도 실제로 뛰는 선수가 있으므로(에이징
+# 커브 자체가 이미 이들을 우대) 노쇠 감쇠를 -20%가 아니라 -15%로 완화한다.
+# 그 외 재능 등급은 기존 -20% 그대로.
+FOREIGN_OFFER_AGE_MULT_33PLUS = 0.80
+FOREIGN_OFFER_AGE_MULT_33PLUS_ELITE_TALENT = 0.85
+FOREIGN_OFFER_ELITE_TALENT_TIERS = {"god", "worldclass"}
+
+
+def get_foreign_offer_age_mult(age: int, talent_tier: str = None) -> float:
+    """해외 오퍼 성사 확률에 곱할 나이 배수. 33세 이상은 재능 등급(god/
+    worldclass면 완화된 -15%, 그 외는 기존 -20%)에 따라 갈린다."""
+    for cap, mult in FOREIGN_OFFER_AGE_MULT:
+        if age <= cap:
+            return mult
+    if talent_tier in FOREIGN_OFFER_ELITE_TALENT_TIERS:
+        return FOREIGN_OFFER_AGE_MULT_33PLUS_ELITE_TALENT
+    return FOREIGN_OFFER_AGE_MULT_33PLUS
+
 # 5) 패시브 오퍼(자동 오퍼·무소속 입단) 후보 선별 — 마진 통과 후보를 팀
 #    평균 OVR 높은 순으로 줄 세운 뒤, 등수 구간별 가중치로 추첨한다
 #    (고정 정렬로 뽑으면 매번 같은 상위 1~2팀만 나오는 문제를 피하기 위함).
@@ -4605,6 +4650,17 @@ OFFER_ROLES = {
     "주전 경쟁":   {"bench_mult": 0.85, "rel_init": 50, "press": 1.05, "desc": "경쟁을 통한 주전 도전"},
     "로테이션":    {"bench_mult": 1.25, "rel_init": 48, "press": 0.85, "desc": "로테이션 자원"},
     "유망주 영입": {"bench_mult": 1.40, "rel_init": 55, "press": 0.70, "desc": "미래를 보고 육성"},
+}
+
+# [2026-08 신설, 신민용+GPT 1차 구현 ③] 계약 역할별 "감독이 기대하는
+# 실제 출전 비율"(0~1). game_engine._calc_manager_rel에서 실제 출전
+# 비율(팀이 이번 시즌 이미 치른 경기 대비 season_matches)과 비교해 갭이
+# 크면 관계에 작은 보정을 준다. OFFER_ROLES와 키를 그대로 공유한다.
+ROLE_EXPECTED_PLAYTIME = {
+    "주전 보장":   0.85,
+    "주전 경쟁":   0.55,
+    "로테이션":    0.35,
+    "유망주 영입": 0.15,
 }
 
 # 감독 관심도: 오퍼 카드에 표시 + 입단 시 감독관계 가산

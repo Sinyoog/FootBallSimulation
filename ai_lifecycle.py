@@ -18,6 +18,7 @@ ai_players.ovr / team_id 가 바뀌므로 마지막에 OVR 캐시를 무효화�
 """
 import random
 import math
+import contextlib   # [2026-08 최적화] _indexes_off_for_mass_update용
 from database import (get_conn, calc_ovr, ALL_STATS, KEY_STATS_BY_POS,
                       roll_bench_position)
 
@@ -289,7 +290,7 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None):
     # 한다 — 은퇴 예정자도 이 시점엔 아직 ai_players에 남아있으므로
     # "은퇴하는 그 해"까지 정상적으로 기록된다.
     c.executemany(
-        "INSERT OR REPLACE INTO ai_player_ovr_history(player_id, year, ovr) VALUES (?,?,?)",
+        "INSERT OR REPLACE INTO hist.ai_player_ovr_history(player_id, year, ovr) VALUES (?,?,?)",
         [(r["id"], year, r["ovr"]) for r in shared_ai_rows])
 
     # [2026-08 신설, 신민용 리포트: "1년씩 진행하면 기록되는데 10년을
@@ -317,6 +318,13 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None):
     # 없었는데 지금 생긴" id만 한 번에 추려 그 선수들도 데뷔 연도로
     # archive한다(아래 "신규 선수 데뷔연도 archive" 참고).
     _season_start_ids = {r["id"] for r in shared_ai_rows}
+
+    # [2026-08 버그수정, 신민용 리포트: "은퇴 선수 마지막 팀에서 역할이
+    # -로 뜬다"] 은퇴·이적으로 로스터가 흔들리기 "전"에 이번 시즌을
+    # 실제로 뛴 상태 그대로를 먼저 스냅샷한다(상세는 _snapshot_season_
+    # positions 주석 참고). 맨 아래에서 이번 오프시즌 신규 선수만
+    # 한 번 더 보충한다.
+    _snapshot_season_positions(c, year, rows=shared_ai_rows)
 
     _report(1, "은퇴 및 신인 영입 중")
     retired    = _retire_and_replace(c, year, shared_ai_rows)
@@ -357,7 +365,10 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None):
     # 스냅샷한다 — "전술변경" 단계 시간에 합산돼 찍히지만(별도 계측 없이
     # 얹음), 실측상 팀당 계산량이 작아(선수 20~30명 vs 슬롯 11개 비교)
     # 시즌 시뮬레이션 전체에 유의미한 지연을 주지 않는다.
-    _snapshot_season_positions(c, year)
+    # [2026-08 수정] 본 스냅샷은 이제 위(은퇴 처리 직전)에서 이미 찍었다 —
+    # 여기서는 이번 오프시즌에 새로 생긴 선수만 보충한다(이미 기록된
+    # 선수의 값은 덮어쓰지 않는다).
+    _snapshot_season_positions(c, year, only_missing=True)
     _ta4 = _time_perf.perf_counter()
     _report(4, "시즌 전환 마무리 중")
     # [2026-07 신설, 진단용] game_engine._advance_week의 [PERF] 로그와 짝을
@@ -390,7 +401,7 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None):
     _new_this_season = [r for r in _final_ids_rows if r["id"] not in _season_start_ids]
     if _new_this_season:
         c.executemany(
-            "INSERT OR REPLACE INTO ai_player_ovr_history(player_id, year, ovr) VALUES (?,?,?)",
+            "INSERT OR REPLACE INTO hist.ai_player_ovr_history(player_id, year, ovr) VALUES (?,?,?)",
             [(r["id"], year, r["ovr"]) for r in _new_this_season])
 
     _t_commit0 = _time_perf.perf_counter()
@@ -593,6 +604,47 @@ def _age_and_progress(c):
     return _result
 
 
+# [2026-08 최적화] 전 선수(26만 행) 나이/스탯/OVR 일괄 UPDATE 전용 —
+# ai_players에는 ovr이 들어간 인덱스가 2개(idx_aiplayers_nat_pos_ovr,
+# idx_aiplayers_ovr_id) 있어서, 한 행을 고칠 때마다 그 인덱스 B-트리에서
+# 옛 항목을 지우고 새 항목을 끼워 넣는 일이 행마다 2번씩 일어난다.
+# 26만 행을 한꺼번에 갱신할 때는 인덱스를 잠깐 내렸다가 끝나고 한 번에
+# 다시 만드는 쪽이 훨씬 싸다(정렬 한 번으로 끝나므로).
+#   · 갱신하는 컬럼(age/스탯/ovr)을 실제로 참조하는 인덱스만 내린다 —
+#     team_id 인덱스(idx_aiplayers_team)는 이 UPDATE와 무관한데다, 이게
+#     없으면 같은 시즌전환 안의 이적시장 팀 조회가 125초까지 폭발한다
+#     (실측 확인). 절대 건드리지 않는다.
+#   · 중간에 무슨 일이 생겨도 인덱스가 사라진 채로 남지 않도록 finally로
+#     반드시 복구한다.
+#   · 인덱스는 순수 성능용이라 이 처리로 게임 데이터·결과는 전혀 달라지지 않는다.
+_MASS_UPDATE_COLS = ("ovr", "age") + tuple(ALL_STATS)
+
+
+@contextlib.contextmanager
+def _indexes_off_for_mass_update(c):
+    dropped = []
+    try:
+        for r in c.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='index' AND tbl_name='ai_players' "
+                "AND sql IS NOT NULL").fetchall():
+            _name, _sql = r[0], r[1]
+            _cols = _sql[_sql.find("("):].lower()
+            if any(col in _cols for col in _MASS_UPDATE_COLS):
+                dropped.append((_name, _sql))
+        for _name, _ in dropped:
+            c.execute(f"DROP INDEX IF EXISTS {_name}")
+    except Exception:
+        dropped = []   # 조회/삭제 실패 시엔 그냥 예전처럼 인덱스를 둔 채로 진행
+    try:
+        yield
+    finally:
+        for _name, _sql in dropped:
+            try:
+                c.execute(_sql)
+            except Exception:
+                pass   # 인덱스는 성능용이라 재생성에 실패해도 게임은 정상 동작
+
+
 def _age_and_progress_np(c, rows, team_cap, orphan_fallback):
     """벡터화 버전 — 선수 5.9만 명(+향후 확장분)을 파이썬 for문 없이 numpy로 처리.
     로직(확률/증감폭/키스탯 가중치)은 순수 파이썬 버전과 동일하게 유지했다."""
@@ -767,9 +819,10 @@ def _age_and_progress_np(c, rows, team_cap, orphan_fallback):
     _npf_t1 = _time_npf.perf_counter()
 
     set_clause = ", ".join(f"{s}=?" for s in ALL_STATS)
-    c.executemany(
-        f"UPDATE ai_players SET age=?, {set_clause}, ovr=? WHERE id=?",
-        updates)
+    with _indexes_off_for_mass_update(c):
+        c.executemany(
+            f"UPDATE ai_players SET age=?, {set_clause}, ovr=? WHERE id=?",
+            updates)
     _npf_t2 = _time_npf.perf_counter()
     print(f"[PERF-AGE-NP]  numpy계산 {_npf_t1-_npf_t0:.3f}s | "
           f"executemany({len(updates)}건) {_npf_t2-_npf_t1:.3f}s")
@@ -848,9 +901,10 @@ def _age_and_progress_py(c, rows, team_cap, orphan_fallback):
         updates.append((new_age, *vals, new_ovr, pid))
 
     set_clause = ", ".join(f"{s}=?" for s in ALL_STATS)
-    c.executemany(
-        f"UPDATE ai_players SET age=?, {set_clause}, ovr=? WHERE id=?",
-        updates)
+    with _indexes_off_for_mass_update(c):
+        c.executemany(
+            f"UPDATE ai_players SET age=?, {set_clause}, ovr=? WHERE id=?",
+            updates)
 
     if _orphan_team_ids:
         import sys as _sys
@@ -1168,7 +1222,7 @@ def _retire_and_replace(c, year, ai_rows=None):
         new_rows.append((
             r["team_id"], name, r["position"],
             *[stats[s] for s in ALL_STATS], new_ovr, new_age, new_sub_role, new_nat,
-            year + random.randint(3, 5), 0))
+            year + random.randint(3, 5), 0, year))
         retired += 1
 
     if new_rows:
@@ -1183,8 +1237,8 @@ def _retire_and_replace(c, year, ai_rows=None):
         c.executemany(
             f"""INSERT INTO ai_players
                 (team_id,name,position,{_STAT_COLS},ovr,age,sub_role,nationality,
-                 contract_end_year,last_transfer_year)
-                VALUES(?,?,?,{','.join('?' for _ in ALL_STATS)},?,?,?,?,?,?)""",
+                 contract_end_year,last_transfer_year,created_year)
+                VALUES(?,?,?,{','.join('?' for _ in ALL_STATS)},?,?,?,?,?,?,?)""",
             new_rows)
 
     # [2026-08 신설, 진단용] 추적 대상 팀들의 이번 시즌 은퇴/신인 교체 요약을
@@ -1919,6 +1973,16 @@ def _size_weight(dst_size):
     return w
 
 
+# [2026-08 최적화] 포지션 문자열 → 판매보호 판정용 그룹키(GK/DF/MF/FW).
+# 예전 코드의 _GROUP_KEY[_pos_category(pos)]를 한 단계로 미리 합쳐둔 표다
+# (formation_logic._POS_CATEGORY와 같은 분류를 그대로 쓴다). 표에 없는
+# 포지션(ST/LW/RW/CF/SS 등)은 예전 _pos_category의 최종 폴백 "ATK"에
+# 대응하는 "FW"로 떨어지므로 결과가 완전히 같다.
+_POS_GROUP = {"GK": "GK",
+              "CB": "DF", "LB": "DF", "RB": "DF", "LWB": "DF", "RWB": "DF", "SW": "DF",
+              "CDM": "MF", "CM": "MF", "CAM": "MF", "LM": "MF", "RM": "MF", "DM": "MF", "AM": "MF"}
+
+
 def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, protect_strength=0.85,
                              veteran_pool_tids=None, dst_grade_by_tid=None, dst_prestige_by_tid=None,
                              pool_cache=None, sw_by_tid=None):
@@ -2011,14 +2075,20 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
     # 안 건드림. src_players(시간 필터 전 팀 전체 로스터) 기준으로
     # 그룹별 인원을 세야 정확하다(마지막 1명 판정은 "지금 이 팀에 몇
     # 명 있는가"의 문제이지 "언제 이적했는가"와는 무관하므로).
-    from formation_logic import _pos_category
-    _GROUP_KEY = {"GK": "GK", "DEF": "DF", "MID": "MF", "ATK": "FW"}
+    # [2026-08 최적화] 예전엔 선수 한 명당 "함수 호출(_pos_category) →
+    # 그 결과로 _GROUP_KEY.get" 2단계를 거쳤다. 시즌당 이적 7.4만 건 ×
+    # 팀 로스터 23명 × 2회(집계+판정)라 이 2단계만 350만 회 넘게 돌았다.
+    # 포지션 문자열 → 그룹키는 순수 대응이므로 모듈 상단에서 한 번
+    # 합쳐둔 표(_POS_GROUP)로 조회 한 번에 끝낸다 — 매핑 결과는 예전과
+    # 완전히 동일(표에 없는 포지션은 ATK→"FW"로 떨어지는 것까지 동일).
     _grp_count: dict = {}
+    _pg = _POS_GROUP
     for _p in src_players:
-        _g = _GROUP_KEY.get(_pos_category(_p["position"]), "MF")
+        _g = _pg.get(_p["position"], "FW")
         _grp_count[_g] = _grp_count.get(_g, 0) + 1
+    _gc = _grp_count.get
     _protected_ids = {p["id"] for p in eligible
-                       if _grp_count.get(_GROUP_KEY.get(_pos_category(p["position"]), "MF"), 0) <= 1}
+                       if _gc(_pg.get(p["position"], "FW"), 0) <= 1}
     if _protected_ids and len(_protected_ids) < len(eligible):
         eligible = [p for p in eligible if p["id"] not in _protected_ids]
     # (매우 드문 극단적 예외: 팀 전체가 포지션 그룹당 딱 1명씩이라 위
@@ -2392,7 +2462,7 @@ def _rebalance_squad_sizes(c, year):
                     stats["tackling"], stats["heading"], stats["positioning"],
                     stats["setpiece"], stats["mental"], stats["confidence"],
                     stats["leadership"], stats["concentration"], ovr, age, sub_role, nat,
-                    year + random.randint(2, 4), 0))
+                    year + random.randint(2, 4), 0, year))
                 topped_up += 1
 
         elif n > _SQUAD_MAX:
@@ -2495,7 +2565,7 @@ def _rebalance_squad_sizes(c, year):
                             _stats["tackling"], _stats["heading"], _stats["positioning"],
                             _stats["setpiece"], _stats["mental"], _stats["confidence"],
                             _stats["leadership"], _stats["concentration"], _ovr, _age, _sub_role, _nat,
-                            year + random.randint(2, 4), 0))
+                            year + random.randint(2, 4), 0, year))
                         topped_up += 1
                         forced_out += 1
 
@@ -2504,8 +2574,8 @@ def _rebalance_squad_sizes(c, year):
             (team_id,name,position,stamina,speed,jump,strength,shooting,passing,
              dribbling,tackling,heading,positioning,setpiece,
              mental,confidence,leadership,concentration,ovr,age,sub_role,nationality,
-             contract_end_year,last_transfer_year)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", new_rows)
+             contract_end_year,last_transfer_year,created_year)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", new_rows)
     if delete_ids:
         c.executemany("DELETE FROM ai_players WHERE id=?", [(i,) for i in delete_ids])
 
@@ -2515,7 +2585,7 @@ def _rebalance_squad_sizes(c, year):
 # ─────────────────────────────────────────────
 # 5. 포메이션 변경 (감독 교체 컨셉)
 # ─────────────────────────────────────────────
-def _snapshot_season_positions(c, year):
+def _snapshot_season_positions(c, year, only_missing=False, rows=None):
     """[2026-08 신설, 신민용 요청: "이 시즌에 얘가 어디 포지션을 갔는지가
     중요한거야 — 위(선수 검색 맨 위 요약행)는 주포라 안 변하는 게
     맞는데, 연도별 기록엔 그 시즌 실제로 어느 자리서 뛰었는지가 있어야
@@ -2541,27 +2611,98 @@ def _snapshot_season_positions(c, year):
     연도는 세계 브라우저 쪽에서 이적 시점 등록 포지션으로 대체 표시한다."""
     from formation_logic import _greedy_fill_slots, compute_squad_roles
     from constants import FORMATION_SLOTS
+    import json
 
     # [2026-08 확장, 신민용 요청: "그 해 주전/로테이션/대기/유망주였는지도
     # 연도별로 표시"] 역할 계산(formation_logic.compute_squad_roles)이
     # 나이도 필요해서 age를 같이 뽑는다 — 이 함수가 이미 팀별 로스터
     # 전체를 훑고 있으므로(베스트XI 슬롯 배정용) 추가 쿼리 없이 그대로
     # 재사용한다.
-    rows = c.execute(
-        """SELECT ap.id AS id, ap.team_id AS team_id, ap.position AS position,
-                  ap.ovr AS ovr, ap.age AS age, t.formation AS formation
-           FROM ai_players ap JOIN teams t ON ap.team_id = t.id
-           WHERE ap.team_id IS NOT NULL""").fetchall()
+    # [2026-08 신설, 신민용 리포트: "은퇴 선수의 마지막 시즌 역할이 -로
+    # 뜬다"] 이 함수는 원래 시즌 전환의 맨 끝(은퇴·이적·포메이션 변경이
+    # 전부 끝난 뒤)에 딱 한 번만 돌았다 — 그런데 그 시점엔 이번 시즌을
+    # 마지막으로 은퇴한 선수가 ai_players에서 이미 삭제된 뒤라, 그
+    # 선수의 마지막 시즌만 이 표에 행이 아예 안 생겼다(그래서 화면에
+    # 역할이 "-"로 떴다. OVR/포지션은 ai_player_ovr_history 쪽에서
+    # 나오므로 그 줄 자체는 정상적으로 보였고 역할 칸만 비었던 것).
+    # 이제 두 번 나눠 부른다:
+    #   1) 은퇴·이적 처리 "전"에 한 번 (only_missing=False) — 이번 시즌을
+    #      실제로 뛴 로스터 그대로가 남는다. 은퇴자도 아직 살아 있고,
+    #      오프시즌 이적자도 아직 옛 팀 소속이라 연도 귀속이 정확해진다.
+    #   2) 전부 끝난 뒤 한 번 더 (only_missing=True) — 이번 오프시즌에
+    #      새로 생긴 선수(은퇴 대체 신인 등)만 채운다. 이 선수들은
+    #      ai_player_ovr_history에도 이번 해로 기록되므로(데뷔연도
+    #      archive), 여기서도 같이 채워야 화면에 역할 칸만 비지 않는다.
+    # only_missing=True일 땐 아직 이 해 행이 없는 선수가 있는 팀만
+    # 훑는다 — 역할(팀 내 OVR 순위)은 그 팀 로스터 전체가 있어야
+    # 계산되므로 팀 단위로 가져오되, 실제로 저장하는 건 빠져 있던
+    # 선수 행뿐이라 이미 1)에서 기록된 값은 절대 덮어쓰지 않는다.
+    _missing_ids = None
+    if only_missing:
+        _missing = c.execute(
+            """SELECT ap.id, ap.team_id FROM ai_players ap
+               WHERE ap.team_id IS NOT NULL
+                 AND NOT EXISTS (SELECT 1 FROM hist.ai_player_position_history h
+                                 WHERE h.player_id = ap.id AND h.year = ?)""",
+            (year,)).fetchall()
+        if not _missing:
+            return
+        _missing_ids = {r[0] for r in _missing}
+        # 대상 팀만 골라 오되, 팀 id를 SQL 문자열에 몇천 개씩 나열하면
+        # (IN (...)) 그 구문을 만들고 파싱하는 것만으로도 느려진다 —
+        # 임시표에 넣고 JOIN으로 좁힌다. 임시표는 이 연결에서만 보이며
+        # 끝나고 바로 지운다.
+        c.execute("DROP TABLE IF EXISTS temp._snap_target_teams")
+        c.execute("CREATE TEMP TABLE _snap_target_teams(team_id INTEGER PRIMARY KEY)")
+        c.executemany("INSERT OR IGNORE INTO temp._snap_target_teams(team_id) VALUES(?)",
+                      [(r[1],) for r in _missing])
+        rows = c.execute(
+            """SELECT ap.id AS id, ap.team_id AS team_id, ap.position AS position,
+                      ap.ovr AS ovr, ap.age AS age, t.formation AS formation
+               FROM ai_players ap
+               JOIN temp._snap_target_teams st ON st.team_id = ap.team_id
+               JOIN teams t ON ap.team_id = t.id""").fetchall()
+        c.execute("DROP TABLE IF EXISTS temp._snap_target_teams")
+    elif rows is None:
+        rows = c.execute(
+            """SELECT ap.id AS id, ap.team_id AS team_id, ap.position AS position,
+                      ap.ovr AS ovr, ap.age AS age, t.formation AS formation
+               FROM ai_players ap JOIN teams t ON ap.team_id = t.id
+               WHERE ap.team_id IS NOT NULL""").fetchall()
     if not rows:
         return
 
+    # [2026-08 최적화] 호출부가 이미 떠 놓은 선수 목록(rows)을 넘겨주면
+    # 26만 행을 다시 JOIN해서 읽지 않는다 — 대신 그 목록엔 팀 포메이션이
+    # 없으므로 teams(1만여 행, 훨씬 쌈)만 따로 읽어 팀→포메이션 표를
+    # 만들어 쓴다. 결과는 JOIN해서 읽었을 때와 동일.
+    _form_by_team = None
+    if not only_missing and "formation" not in rows[0].keys():
+        _form_by_team = {r[0]: r[1] for r in
+                         c.execute("SELECT id, formation FROM teams").fetchall()}
+
     by_team = {}
     for r in rows:
-        by_team.setdefault(r["team_id"], []).append(r)
+        _tid = r["team_id"]
+        if _tid is None:
+            continue   # 무소속(rows를 넘겨받은 경로엔 섞여 있을 수 있음)
+        by_team.setdefault(_tid, []).append(r)
 
     inserts = []
+    # [2026-08 신설, 신민용 요청: "팀 검색에서 연도를 클릭하면 그 해
+    # 포메이션이 떠야 한다"] 아래 루프가 팀마다 어차피 계산하는 placed
+    # (슬롯별 베스트11 배정)를 선수 단위(inserts)로 흩어 담기 직전에,
+    # 팀 단위로도 그대로 한 벌 더 챙겨둔다 — 새 연산이 아니라 이미 계산된
+    # 결과를 한 번 더 저장하는 것뿐이라 비용이 거의 없다. only_missing=True
+    # 두 번째 패스(오프시즌 최종 로스터 기준)에서도 다시 채워지는데,
+    # INSERT OR REPLACE라 나중 값(더 확정된 최종 로스터)이 이긴다 —
+    # 오히려 더 정확해지므로 굳이 이 패스를 걸러낼 필요가 없다.
+    team_inserts = []
     for _team_id, players in by_team.items():
-        formation = players[0]["formation"] or "4-4-2"
+        if _form_by_team is not None:
+            formation = _form_by_team.get(_team_id) or "4-4-2"
+        else:
+            formation = players[0]["formation"] or "4-4-2"
         slots = FORMATION_SLOTS.get(formation, FORMATION_SLOTS["4-4-2"])
         candidates = [{"id": p["id"], "position": p["position"], "ovr": p["ovr"] or 0}
                       for p in players]
@@ -2576,6 +2717,30 @@ def _snapshot_season_positions(c, year):
         for p in players:
             if p["id"] not in started_ids:
                 inserts.append((p["id"], year, p["position"] or "", roles.get(p["id"], "")))
+        slots_payload = [{"slot": slots[i], "id": (pl["id"] if pl else None)}
+                          for i, pl in enumerate(placed)]
+        # [2026-08 신설, 신민용 리포트: "팀도 주전 후보가 있는데 왜 안떠?"]
+        # 포메이션 11자리에 못 들어간 나머지 로스터(=후보)도 OVR 내림차순으로
+        # 같이 저장해둔다 — 국가대표 스쿼드 화면(get_country_tournament_squad)의
+        # 주전/후보 패턴과 동일하게 맞추기 위함. 새 연산 없이 이미 위에서 구한
+        # started_ids/players를 그대로 재사용.
+        bench_payload = [{"id": p["id"], "position": p["position"] or ""}
+                          for p in sorted(
+                              (p for p in players if p["id"] not in started_ids),
+                              key=lambda p: -(p["ovr"] or 0))]
+        team_inserts.append((_team_id, year, formation,
+                              json.dumps(slots_payload), json.dumps(bench_payload)))
+
+    if _missing_ids is not None:
+        # 팀 로스터 전체로 슬롯·역할을 계산했지만, 실제로 저장하는 건
+        # 이 해 행이 없던 선수(이번 오프시즌 신규 생성)뿐이다.
+        inserts = [t for t in inserts if t[0] in _missing_ids]
+
+    if team_inserts:
+        c.executemany(
+            "INSERT OR REPLACE INTO hist.team_season_lineup"
+            "(team_id, year, formation, slots_json, bench_json) "
+            "VALUES (?,?,?,?,?)", team_inserts)
 
     if inserts:
         # [2026-08 최적화] player_id 순으로 정렬해서 넣는다. 이 표의 기본키는
@@ -2587,7 +2752,7 @@ def _snapshot_season_positions(c, year):
         # 안에서 유일하므로(선수 한 명당 이 해에 한 행) 저장 결과는 완전히 동일.
         inserts.sort(key=_ins_key)
         c.executemany(
-            "INSERT OR REPLACE INTO ai_player_position_history(player_id, year, position, role) "
+            "INSERT OR REPLACE INTO hist.ai_player_position_history(player_id, year, position, role) "
             "VALUES (?,?,?,?)", inserts)
 
 
@@ -2861,7 +3026,7 @@ def apply_squad_turnover_after_movement(rescale_jobs, year, turnover_frac=0.25,
                                                 False, foreign_ct, quota)
             name = _random_name(c, team_id, name_cache, used_in_team=used)
             new_rows.append((team_id, name, pos, *[stats[s] for s in ALL_STATS], ovr, age,
-                              sub_role, nat, year + random.randint(2, 4), 0))
+                              sub_role, nat, year + random.randint(2, 4), 0, year))
             replaced += 1
 
     if del_ids:
@@ -2870,8 +3035,8 @@ def apply_squad_turnover_after_movement(rescale_jobs, year, turnover_frac=0.25,
         c.executemany(
             f"""INSERT INTO ai_players
                 (team_id,name,position,{_STAT_COLS},ovr,age,sub_role,nationality,
-                 contract_end_year,last_transfer_year)
-                VALUES(?,?,?,{','.join('?' for _ in ALL_STATS)},?,?,?,?,?,?)""",
+                 contract_end_year,last_transfer_year,created_year)
+                VALUES(?,?,?,{','.join('?' for _ in ALL_STATS)},?,?,?,?,?,?,?)""",
             new_rows)
     conn.commit()
     return replaced, released

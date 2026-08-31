@@ -208,6 +208,11 @@ class AgentWindow(QDialog):
         self.lang = lang
         p = get_player()
         self.cur_grade    = p.get("agent_grade", AGENT_NONE) if p else AGENT_NONE
+        # [2026-08 신설, 신민용 리포트: "F 무명 에이전트여도 이게 아시아
+        # 전문인지 뭔지 모른다"] update_player가 이미 agent_continent를
+        # 저장해두므로(_select 참고, game_engine._team_fits_me의
+        # AGENT_CONTINENT_BONUS에도 쓰임) 여기서 같이 읽어 표시만 하면 됨.
+        self.cur_continent = (p.get("agent_continent", "") or "") if p else ""
         self.ovr_tier = _ovr_tier(p.get("ovr", 40) if p else 40)
         self.offer_pool = _load_or_generate_offer_pool(p) if p else []
         self.offers = [o["grade"] for o in self.offer_pool]
@@ -229,7 +234,8 @@ class AgentWindow(QDialog):
         cur_info = AGENT_INFO[self.cur_grade]
         cur_box = QFrame(); cur_box.setObjectName("agCard")
         cbl = QVBoxLayout(cur_box); cbl.setContentsMargins(12,8,12,8)
-        cbl.addWidget(QLabel(f"현재: {cur_info[0]} [{self.cur_grade}] {cur_info[1]}"))
+        _cont_txt = f"  ({self.cur_continent} 전문)" if self.cur_continent else ""
+        cbl.addWidget(QLabel(f"현재: {cur_info[0]} [{self.cur_grade}] {cur_info[1]}{_cont_txt}"))
         root.addWidget(cur_box)
 
         scroll = QScrollArea(); scroll.setWidgetResizable(True)

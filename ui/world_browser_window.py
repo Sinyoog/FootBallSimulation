@@ -20,15 +20,24 @@ from PyQt6.QtWidgets import (
     QButtonGroup
 )
 from PyQt6.QtCore import Qt, QTimer, QRect, QSize
-from PyQt6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter, QShortcut, QKeySequence, QIntValidator
+from PyQt6.QtGui import (QColor, QFont, QFontMetrics, QGuiApplication, QPainter,
+                          QBrush, QPen, QShortcut, QKeySequence, QIntValidator)
 
 import world_browser as wb
 from database import (get_conn, get_game_start_year, TEAM_POSITIONS,
                        get_ai_player_custom_name, set_ai_player_custom_name,
                        get_ai_player_custom_names)
-from constants import ai_player_code
+from constants import ai_player_code, FORMATION_SLOTS
 from game_engine import is_hard_mode
 import power_ranking as pr
+# [2026-08 신설, 신민용 요청: "내가 분명 포메이션 형태로 보내달라 했는데
+# 왜 없어?"] 국가대표 스쿼드/팀 시즌 라인업을 실제 포메이션 화면과 똑같은
+# 초록 피치 배치로 그리기 위해, 그 화면(_FormationCanvas)이 쓰는 순수
+# 배치 헬퍼만 가져다 쓴다 — 이 함수들은 Qt 위젯 상태에 의존하지 않는
+# 순수 함수(포지션 문자열/좌표 계산만)라 그대로 재사용해도 안전하다.
+# formation_widget.py는 이 모듈을 최상단에서 import하지 않으므로(내부
+# 함수 안에서만 지연 import) 순환 임포트 문제가 없다.
+from ui.formation_widget import _row_key, _row_priority, _pos_x_order, _pos_color
 
 # [2026-08 신설, 신민용 리포트: "복사하면 국기/국가/부수까지 같이 복사된다,
 # 팀명만 복사되게 해달라"] 셀 화면 텍스트("🇺🇸 토론토 FC (미국)", "보루시아
@@ -36,6 +45,10 @@ import power_ranking as pr
 # 저장하기 위한 전용 데이터 롤. 기존에 이미 UserRole(연도/시즌, team_id 등)을
 # 여러 곳에서 쓰고 있어서 충돌을 피하려고 +50 오프셋을 둔다.
 _CLEAN_TEXT_ROLE = Qt.ItemDataRole.UserRole + 50
+# [2026-08 신설, 최적화] 선수 검색 목록의 각 줄이 어떤 검색 결과
+# (dict)에서 만들어졌는지 그대로 보관하는 롤 — 이름만 바뀐 경우
+# 목록 전체를 다시 조회하지 않고 그 줄만 다시 그리기 위해 쓴다.
+_PLAYER_ROW_DATA_ROLE = Qt.ItemDataRole.UserRole + 51
 
 
 def _enable_plain_copy(tbl):
@@ -102,6 +115,209 @@ def _enable_plain_copy(tbl):
     # 필요하다 — _copy_selected를 반환해서 그쪽에서 그대로 재사용하게
     # 한다(기존 호출부는 반환값을 안 받아도 그만이라 하위 호환 그대로).
     return _copy_selected
+
+
+def _calc_static_pitch_positions(slots, w, h):
+    """[2026-08 신설] ui/formation_widget.py의 _FormationCanvas._calc_positions와
+    완전히 동일한 배치 알고리즘을 그대로 복제한 것 — 라이브 포메이션 화면과
+    똑같이 위(공격)→아래(GK) 세로 행으로 쌓는다.
+
+    [2026-08 좌우로 바꿨다가 재수정, 신민용 리포트: "비율을 1번(라이브
+    포메이션 화면)처럼 만들어달라니까 왜 2번(좌우로 눕힌 버전)처럼 만든거?"]
+    한 번은 "좌우로 바꿔달라"는 요청을 받아 축 자체를 스왑했었는데, 실제
+    라이브 화면(_FormationCanvas)은 세로(위=공격~아래=GK)로 그려서 그
+    스왑이 오히려 실제 화면과 달라지는 결과였다 — 축은 원래 방식(세로)
+    그대로 되돌리고, 실제 문제였던 "가로로 길쭉하게 눌린 비율"은
+    _StaticPitchView 쪽 위젯 크기 제약(최대 폭 고정)으로 따로 고쳤다.
+    그 메서드는 self._circle_d에 결과를 저장하는데 여기는 인스턴스가 없는
+    정적 위젯이라 (positions, circle_d) 튜플로 함께 반환한다. 반환 튜플의
+    4번째 값(slot_idx)은 원본 slots 리스트에서의 인덱스 — 화면 표시용으로
+    행(GK/DEF/MID/MID2/ATK)별로 재정렬된 순서와는 다르므로, 선수 매칭은
+    항상 이 slot_idx로 해야 한다."""
+    rows = {}; row_order = []
+    for idx, pos in enumerate(slots):
+        k = _row_key(pos)
+        if k not in rows: rows[k] = []; row_order.append(k)
+        rows[k].append((idx, pos))
+    sorted_rows = sorted(row_order, key=lambda x: _row_priority(x))
+    total = len(sorted_rows); result = []
+    max_row_cnt = max((len(v) for v in rows.values()), default=1)
+    row_h = (h - 32) / max(1, total)
+    col_w = w / (max_row_cnt + 1)
+    circle_d = int(max(16, min(48, row_h * 0.82, col_w * 0.78)))
+    for ri, rk in enumerate(sorted_rows):
+        poss = sorted(rows[rk], key=lambda t: _pos_x_order(t[1]))
+        cnt = len(poss)
+        ry = 16 + int((ri + 0.5) * (h - 32) / total)
+        for ci, (idx, pos) in enumerate(poss):
+            result.append((int((ci + 1) * w / (cnt + 1)), ry, pos, idx))
+    return result, circle_d
+
+
+class _StaticPitchView(QWidget):
+    """[2026-08 신설, 신민용 요청: "내가 분명 포메이션 형태로 보내달라
+    했는데 왜 없어?"] 국가대표 스쿼드(그 대회 주전)와 팀 시즌 라인업을
+    라이브 포메이션 화면(_FormationCanvas)과 같은 초록 피치 + 원형 마커
+    스타일로 그리는 읽기 전용 정적 위젯. 라이브 캔버스는 현재 게임
+    상태(부상/선택 하이라이트/드래그/패널 연동 등)에 강하게 결합돼 있어
+    그대로 재사용하기 어려워, 배치 계산 알고리즘만 그대로 복제한 얇은
+    전용 위젯을 새로 만들었다. 신민용이 명시적으로 "OVR은 필요없어"라고
+    했으므로 이름과 포지션만 표시한다.
+
+    slot_players: slots와 같은 길이의 리스트, 각 원소는
+    (slot_position_str, display_name, player_id_or_None).
+
+    slots: [2026-08 확장] 국제대회 스쿼드는 FORMATION_SLOTS에 등록된
+    이름 있는 포메이션이 아니라 intl_engine._INTL_MATCHDAY_STARTER_POS
+    같은 고정 11자리 포지션 리스트를 쓰므로, formation 이름 대신 슬롯
+    포지션 리스트를 직접 넘길 수 있게 했다. slots를 넘기면 formation은
+    화면에 표시되는 라벨 용도로만 쓰이고 실제 배치는 slots 기준."""
+
+    def __init__(self, formation, slot_players, on_click=None, parent=None, slots=None):
+        super().__init__(parent)
+        self.formation = formation if formation in FORMATION_SLOTS else "4-4-2"
+        self._explicit_slots = slots
+        self.slot_players = slot_players
+        self._on_click = on_click
+        self._positions_xy = []
+        self._circle_d = 40
+        # [2026-08 신설, 신민용 리포트: "비율을 1번(라이브 포메이션
+        # 화면)처럼 만들어달라니까 왜 2번처럼 만든거?"] 이 위젯이 놓이는
+        # 곳(국가/팀 검색의 펼침 카드)은 라이브 포메이션 화면과 달리 옆에
+        # 명단 패널이 없어 위젯이 카드 전체 폭(다이얼로그 폭만큼)으로
+        # 쭉 늘어나 버린다 — 그러면 세로 행 간격이 극단적으로 눌려 얇고
+        # 긴 띠처럼 보인다. 라이브 화면(대략 세로가 가로보다 긴 비율)과
+        # 비슷하게 보이도록 폭에 상한을 걸어 늘어나지 않게 한다.
+        self.setMinimumSize(360, 420)
+        self.setMaximumWidth(460)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def sizeHint(self):
+        return QSize(420, 460)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = self.width(); h = self.height()
+
+        painter.fillRect(0, 0, w, h, QBrush(QColor("#1a3a1a")))
+        painter.setPen(QPen(QColor("#2a5a2a"), 1))
+        painter.drawRect(12, 8, w - 24, h - 16)
+        painter.drawLine(12, h // 2, w - 12, h // 2)
+        cc_d = max(20, min(48, min(w, h) // 7))
+        painter.drawEllipse(w // 2 - cc_d // 2, h // 2 - cc_d // 2, cc_d, cc_d)
+
+        slots = self._explicit_slots or FORMATION_SLOTS.get(self.formation, FORMATION_SLOTS["4-4-2"])
+        positions_xy, circle_d = _calc_static_pitch_positions(slots, w, h)
+        self._positions_xy = positions_xy
+        self._circle_d = circle_d
+
+        for i, (px, py, pos, slot_idx) in enumerate(positions_xy):
+            sp = self.slot_players[slot_idx] if slot_idx < len(self.slot_players) else None
+            pid = sp[2] if sp else None
+            name = (sp[1] if sp else None) or "(공석)"
+            d = circle_d; r = d // 2
+            painter.setBrush(QBrush(QColor(_pos_color(pos))))
+            painter.setPen(QPen(QColor("#000"), 1))
+            painter.drawEllipse(px - r, py - r, d, d)
+            painter.setPen(QPen(QColor("#fff")))
+            f = QFont(); f.setPointSize(max(6, min(10, d // 5))); f.setBold(True)
+            painter.setFont(f)
+            painter.drawText(px - r, py - r, d, d, Qt.AlignmentFlag.AlignCenter, pos[:2])
+            f2 = QFont(); f2.setPointSize(max(6, min(9, d // 6)))
+            painter.setFont(f2)
+            painter.setPen(QPen(QColor("#ddd" if pid is not None else "#666")))
+            name_w = max(48, d + 16)
+            painter.drawText(px - name_w // 2, py + r + 2, name_w, 16,
+                              Qt.AlignmentFlag.AlignCenter, name[:6])
+        painter.end()
+
+    def mousePressEvent(self, event):
+        if not self._on_click:
+            return
+        mx, my = event.position().x(), event.position().y()
+        hit_r2 = max(144, int(self._circle_d * 0.55) ** 2)
+        for px, py, _pos, slot_idx in self._positions_xy:
+            if (mx - px) ** 2 + (my - py) ** 2 < hit_r2:
+                sp = self.slot_players[slot_idx] if slot_idx < len(self.slot_players) else None
+                pid = sp[2] if sp else None
+                if pid is not None:
+                    self._on_click(pid)
+                return
+
+
+def _build_squad_roster_panel(starters, bench, on_click=None, height=460):
+    """[2026-08 재작업, 신민용 리포트: "좌측에 포메이션을 저렇게 박으면
+    우측에 후보 선수들의 이름을 나열해야지 — 주전들은 초록색으로, 후보들은
+    아래에 색이 없는 원래 상태로 나열"] 예전엔 후보만 피치 아래에 칩으로
+    나열했는데(_build_bench_chip_row), 이제 라이브 포메이션 화면(ui/
+    formation_widget.py의 _TeamPanel._make_player_button/_make_group_
+    header)과 완전히 같은 구성 — 주전 헤더+녹색 목록, 후보 헤더+무채색
+    목록 — 을 피치 오른쪽에 배치한다. 색상 값도 그 화면과 정확히 동일한
+    값(#1e4a1e 녹색/#1c1c1c 무채색)을 그대로 가져왔다.
+
+    [2026-08 재작업, 신민용 리포트: "칸이 넓은데 좌측엔 주전, 우측엔
+    후보로 2줄(2칸)로 나눠서 표시해줘"] 처음엔 주전 헤더+목록, 후보
+    헤더+목록을 세로로 하나씩 쌓았는데(폭이 넓은 카드에서 선수 한 명당
+    한 줄씩만 차지해 공간 낭비) — 이제 왼쪽 칸엔 주전, 오른쪽 칸엔
+    후보를 나란히 두 칼럼으로 배치해 같은 폭을 두 배 효율적으로 쓴다.
+
+    starters/bench의 각 원소는 position/slot/pos, display_name/name,
+    id 키 중 있는 걸 유연하게 찾는다(국가 스쿼드·팀 라인업 두 데이터
+    형태를 모두 받기 위함). 스크롤 영역으로 감싸 피치와 높이를 맞춘다
+    (후보가 많으면 카드 전체가 한없이 길어지는 것 방지)."""
+    panel = QWidget()
+    cols_lay = QHBoxLayout(panel)
+    cols_lay.setContentsMargins(0, 0, 4, 0)
+    cols_lay.setSpacing(10)
+
+    def _hdr(text, count):
+        lbl = QLabel(f"{text} ({count})")
+        lbl.setStyleSheet(
+            "color:#5aa9ff;font-size:13px;font-weight:bold;"
+            "padding:4px 2px 2px 2px;border-bottom:1px solid #2a2a2a;")
+        return lbl
+
+    def _row(p, is_starter):
+        pos = p.get("position") or p.get("slot") or p.get("pos") or "-"
+        name = p.get("display_name") or p.get("name") or "-"
+        pid = p.get("id")
+        lbl = QLabel(f"{pos}  {name}")
+        if is_starter:
+            style = ("background:#1e4a1e;color:#eaffea;border:1px solid #3fae3f;"
+                      "border-radius:4px;padding:5px 8px;font-size:11px;font-weight:bold;")
+        else:
+            style = ("background:#1c1c1c;color:#aaa;border:1px solid #333;"
+                      "border-radius:4px;padding:5px 8px;font-size:11px;")
+        lbl.setStyleSheet(style)
+        if pid is not None and on_click:
+            lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+            lbl.mousePressEvent = lambda _e, _pid=pid: on_click(_pid)
+        return lbl
+
+    def _build_column(items, is_starter, label):
+        col = QWidget()
+        vlay = QVBoxLayout(col)
+        vlay.setContentsMargins(0, 0, 0, 0)
+        vlay.setSpacing(4)
+        if items:
+            vlay.addWidget(_hdr(label, len(items)))
+            for p in items:
+                vlay.addWidget(_row(p, is_starter))
+        vlay.addStretch(1)
+        return col
+
+    cols_lay.addWidget(_build_column(starters, True, "주전"), 1)
+    cols_lay.addWidget(_build_column(bench, False, "후보"), 1)
+
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setWidget(panel)
+    scroll.setFixedHeight(height)
+    scroll.setFrameShape(QFrame.Shape.NoFrame)
+    scroll.setStyleSheet("QScrollArea{background:transparent;} QWidget{background:transparent;}")
+    return scroll
 
 
 def _attach_label_copy(label, clean_text):
@@ -333,15 +549,29 @@ def apply_custom_name_live_to_browser(player_id: int):
         if not isinstance(w, WorldBrowserWindow):
             continue
         try:
-            w._refresh_player_list()
+            # [2026-08 최적화] 예전엔 무조건 _refresh_player_list()로 최대
+            # 300명을 다시 검색했다 — 선수 검색 탭을 아직 열어본 적도
+            # 없는 창에서까지 그랬다. 그 줄 하나만 갱신하고, 이름 관련
+            # 필터가 걸려 있어 목록 구성 자체가 바뀔 수 있을 때만 예전
+            # 방식으로 전체를 다시 조회한다.
+            if not w._apply_rename_to_player_list(player_id):
+                w._refresh_player_list()
             if getattr(w, "_player_detail_pid", None) == player_id:
                 w._show_player_detail(player_id)
-        except RuntimeError:
-            pass  # 창이 이미 닫혀 C++ 객체가 삭제된 경우
+            _rr = getattr(w, "_player_recent_row", None)
+            if _rr is not None:
+                _rr.refresh()   # [2026-08 신설] 최근 검색 버튼 글자도 새 이름으로
+        except (AttributeError, RuntimeError):
+            pass  # 선수 검색 탭 미생성 / 창이 이미 닫혀 C++ 객체가 삭제된 경우
 
 
 class WorldBrowserWindow(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, open_player_id=None):
+        """open_player_id: [2026-08 신설, 신민용 요청: "포메이션에서 선수를
+        누르면 세계 기록실에서 그 선수를 눌렀을 때 뜨는 우측 패널이 바로
+        떠야 한다"] 넘기면 창이 뜨자마자 "선수 검색" 탭으로 전환하고 그
+        선수의 상세를 바로 연다(open_to_player 참고) — 검색해서 찾아
+        들어가는 과정을 생략한다."""
         super().__init__(parent)
         self.setWindowModality(Qt.WindowModality.NonModal)
         self.setWindowTitle("세계 축구 기록실")
@@ -423,10 +653,23 @@ class WorldBrowserWindow(QDialog):
             (self._build_power_ranking_tab,"📊 파워랭킹"),
             (self._build_player_search_tab,"🔎 선수 검색"),
         ]
+        self._player_search_tab_idx = None
         for builder, label in _lazy_tabs:
             placeholder = QWidget()
             idx = tabs.addTab(placeholder, label)
             self._wb_lazy_builders[idx] = (builder, label)
+            # [버그수정] `builder is self._build_player_search_tab`는 항상
+            # False였다 — self.xxx로 바운드 메서드에 접근할 때마다 매번
+            # 새 MethodType 객체가 생겨서, 같은 메서드를 가리켜도 `is`
+            # 동일성 비교는 성립하지 않는다(값은 같아도 다른 객체 —
+            # `a == b`는 True, `a is b`는 False). 그래서
+            # _player_search_tab_idx가 한 번도 안 채워졌고, open_to_player가
+            # "선수 검색" 탭으로 전환을 못 해서 그 탭이 아직 한 번도 안
+            # 열린 상태에서 부르면(_show_player_detail이 참조하는
+            # player_detail_tbl 등 위젯 자체가 아직 없음) AttributeError로
+            # 죽었다. 라벨 문자열로 비교하면 이 문제가 없다.
+            if label == "🔎 선수 검색":
+                self._player_search_tab_idx = idx
         tabs.currentChanged.connect(self._lazy_show_wb_tab)
         _wb_marks.append(("(나머지 10개 지연 배치)", _time_wb.perf_counter()))
 
@@ -444,6 +687,22 @@ class WorldBrowserWindow(QDialog):
         close_btn.clicked.connect(self.close)
         lay.addWidget(close_btn)
         self._first_show_done = False
+
+        if open_player_id is not None:
+            self.open_to_player(open_player_id)
+
+    def open_to_player(self, player_id):
+        """[2026-08 신설] 포메이션 화면(선수 클릭 → 세계 기록실 열기)과
+        "스쿼드 전원 기록 복사" 기능이 공유하는 진입점 — "선수 검색"
+        탭으로 전환하고(아직 안 지어졌으면 이 시점에 지어짐,
+        _lazy_show_wb_tab) 그 선수의 상세를 바로 연다. 창을 보여주지
+        않고(show() 없이) 이 메서드만 반복 호출해도 안전하므로, 화면에
+        띄우지 않는 "헤더리스" 인스턴스를 만들어 여러 선수를 순회하며
+        _player_copy_*(복사 버튼이 쓰는 것과 같은 값)만 뽑아내는 용도로도
+        쓸 수 있다."""
+        if self._player_search_tab_idx is not None:
+            self.tabs.setCurrentIndex(self._player_search_tab_idx)
+        self._show_player_detail(player_id)
 
     def _lazy_show_wb_tab(self, idx):
         """[2026-08 v3.5 신설] 지연 배치해둔 탭을 처음 클릭하는 순간에만
@@ -634,7 +893,7 @@ class WorldBrowserWindow(QDialog):
     # 우측 상세 패널의 "← 왼쪽에서 OO을 선택하세요" 타이틀 바로 위에 둔다
     # (신민용 확인 요청).
     def _build_recent_search_row(self, kind, search_box, list_widget, name_from_item_fn, select_fn,
-                                  refresh_fn=None, debounce_timer=None):
+                                  refresh_fn=None, debounce_timer=None, label_fn=None):
         """search_box: 이 탭의 QLineEdit(검색창). list_widget: 이 탭의
         QListWidget. name_from_item_fn(item): 리스트 항목에서 "깨끗한"
         이름(국기/등급 등 장식 없이)을 뽑아내는 함수. select_fn(item):
@@ -725,8 +984,18 @@ class WorldBrowserWindow(QDialog):
                 btn_box.addWidget(empty_lbl)
                 return
             for q in items:
-                b = QPushButton(q)
-                b.setToolTip(q)
+                # [2026-08 신설, 신민용 요청: "AI7PTQ를 클릭해 둔 뒤 그 선수
+                # 이름을 카린으로 바꾸면 최근 검색의 AI7PTQ도 카린으로
+                # 바뀌어야 한다"] 선수 탭은 이제 "그때 화면에 뜬 글자"가
+                # 아니라 선수 id("#123" 형태)를 저장한다 — 여기서 그 id를
+                # 지금의 표시 이름으로 풀어서 버튼에 쓴다(label_fn). 다른
+                # 탭이나 예전에 문자열로 저장된 항목은 label_fn이 그대로
+                # 돌려주므로 예전과 동일하게 보인다.
+                label = label_fn(q) if label_fn is not None else q
+                if not label:
+                    continue   # 더 이상 풀 수 없는 항목(삭제된 선수 등)은 조용히 건너뜀
+                b = QPushButton(label)
+                b.setToolTip(label)
                 # 같은 이유(Enter → autoDefault 버튼 오발동 방지)로 여기도 끈다.
                 b.setAutoDefault(False)
                 b.setDefault(False)
@@ -735,7 +1004,7 @@ class WorldBrowserWindow(QDialog):
                     "QPushButton{background:#232323;color:#aad4ff;border:1px solid #3a3a3a;"
                     "border-radius:10px;padding:2px 10px;font-size:11px;}"
                     "QPushButton:hover{border-color:#00cc44;color:#fff;}")
-                b.clicked.connect(lambda _checked=False, qq=q: _pick(qq))
+                b.clicked.connect(lambda _checked=False, qq=label: _pick(qq))
                 btn_box.addWidget(b)
 
         def _reset():
@@ -747,12 +1016,19 @@ class WorldBrowserWindow(QDialog):
         _refresh()
         return row
 
-    def _record_recent_selection(self, kind, name, recent_row_attr):
+    def _record_recent_selection(self, kind, name, recent_row_attr, stored=None):
         """리스트에서 항목을 실제로 클릭해 들어갔을 때 호출 — 그 항목의
-        정식 이름을 kind별 최근 검색 기록 맨 앞에 남긴다."""
+        정식 이름을 kind별 최근 검색 기록 맨 앞에 남긴다.
+
+        [2026-08 신설] stored를 주면 그 값을 대신 저장한다 — 선수 탭이
+        표시 이름 대신 선수 id("#123")를 남기기 위한 것. 이렇게 해야
+        (1) 나중에 이름을 바꿔도 최근 검색 버튼 글자가 같이 바뀌고,
+        (2) 같은 선수를 이름 바꾸기 전/후에 각각 클릭해도 칸을 두 개
+        차지하지 않는다(예전엔 "AI7PTQ"와 "카린"이 서로 다른 문자열이라
+        8칸짜리 목록을 둘이서 잡아먹었다)."""
         if not name:
             return
-        wb.add_recent_search(kind, name)
+        wb.add_recent_search(kind, stored if stored else name)
         row = getattr(self, recent_row_attr, None)
         if row is not None:
             row.refresh()
@@ -1732,7 +2008,7 @@ class WorldBrowserWindow(QDialog):
         lay.setContentsMargins(0, 8, 0, 0)
 
         info = QLabel("ℹ️ 팀 하나를 골라 그 팀의 연도별 기록(리그 순위·승격/강등·"
-                      "컵대회·챔피언스리그)을 확인하세요.")
+                      "컵대회·챔피언스리그)을 확인하세요. 💡 연도를 클릭하면 그 해 포메이션이 펼쳐져요.")
         info.setStyleSheet("color:#888;font-size:11px;")
         info.setWordWrap(True)
         lay.addWidget(info)
@@ -1915,6 +2191,12 @@ class WorldBrowserWindow(QDialog):
         # 스크롤바가 없어서 그 폭을 그대로 두면 어긋난다. 스크롤바 폭만큼
         # 항상 예약해서 두 표의 뷰포트 폭을 애초에 똑같이 만든다.
         self.team_detail_tbl.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        # [2026-08 신설, 신민용 요청: "팀 검색에서 연도를 클릭하면 그 해
+        # 이 팀의 포메이션(이름만)이 떠야 한다"] 국가 검색의 연도/대회
+        # 인라인 펼치기(_on_country_detail_cell_clicked)와 같은 패턴 —
+        # "연도"(0번) 칸을 클릭하면 바로 아래에 그 해 포메이션 카드를
+        # 펼친다.
+        self.team_detail_tbl.cellClicked.connect(self._on_team_detail_cell_clicked)
         right_lay.addWidget(self.team_detail_tbl, 1)
 
         split.addWidget(right)
@@ -2129,6 +2411,12 @@ class WorldBrowserWindow(QDialog):
         탭으로 전환하고 그 팀 상세를 띄운다(open_team_by_id 참고)."""
         self.team_detail_title.setText(f"📋 {tname}  역대 기록")
 
+        # [2026-08 신설] 다른 팀을 고르면 표를 통째로 다시 그리므로, 이전
+        # 팀에서 펼쳐둔 연도별 포메이션 카드가 있으면(있던 행 인덱스를
+        # 그대로 들고 있는 채로) 먼저 접어서 상태를 깨끗하게 정리한다 —
+        # 국가 검색의 _refresh_country_detail_table과 동일한 이유.
+        self._collapse_team_detail_row()
+
         tbl = self.team_detail_tbl
         tbl.setRowCount(0)
         # [2026-08 신설] 복사 버튼이 지금 표에 그릴 데이터를 그대로 재사용할 수
@@ -2324,6 +2612,185 @@ class WorldBrowserWindow(QDialog):
 
         tbl.resizeRowsToContents()
         QTimer.singleShot(0, _pad)
+
+    # [2026-08 신설, 신민용 요청: "팀 검색에서 연도를 클릭하면 그 해
+    # 이 팀의 포메이션(이름만, OVR은 필요없음)이 떠야 한다"] 국가 검색의
+    # "연도 클릭 → 인라인 펼치기"(_on_country_detail_cell_clicked)와
+    # 완전히 같은 패턴 — 한 번에 하나만 펼치고, 같은 연도를 다시 누르면
+    # 접는다.
+    def _collapse_team_detail_row(self):
+        exp = getattr(self, "_team_expanded", None)
+        if not exp:
+            return
+        tbl = self.team_detail_tbl
+        detail_row = exp.get("detail_row")
+        if detail_row is not None and 0 <= detail_row < tbl.rowCount():
+            tbl.removeRow(detail_row)
+        self._team_expanded = None
+
+    def _on_team_detail_cell_clicked(self, row, col):
+        if col != 0:
+            return
+        tbl = self.team_detail_tbl
+        item = tbl.item(row, 0)
+        if not item:
+            return
+        try:
+            year = int(item.text())
+        except (TypeError, ValueError):
+            return
+        tid = getattr(self, "_team_copy_tid", None)
+        if tid is None:
+            return
+
+        exp = getattr(self, "_team_expanded", None)
+        same_year = bool(exp) and exp.get("year") == year
+        # 이미 다른 연도가 펼쳐져 있으면 먼저 접는다 — 접으면 그 아래
+        # 행들이 위로 당겨져 인덱스가 바뀌므로, 이후 목표 행은 연도
+        # 텍스트로 다시 찾아낸다(국가 검색과 동일한 이유).
+        self._collapse_team_detail_row()
+        if same_year:
+            return
+
+        target_row = None
+        for r in range(tbl.rowCount()):
+            it = tbl.item(r, 0)
+            if it and it.text() == str(year):
+                target_row = r
+                break
+        if target_row is None:
+            return
+
+        tname = getattr(self, "_team_copy_name", None) or ""
+        widget = self._build_team_year_lineup_widget(tid, year, f"{year}년 {tname} 포메이션")
+
+        detail_row = target_row + 1
+        tbl.insertRow(detail_row)
+        tbl.setSpan(detail_row, 0, 1, 7)
+        tbl.setCellWidget(detail_row, 0, widget)
+        tbl.resizeRowToContents(detail_row)
+        h = widget.sizeHint().height()
+        if h > tbl.rowHeight(detail_row):
+            tbl.setRowHeight(detail_row, h + 8)
+        self._team_expanded = {"year": year, "detail_row": detail_row}
+        year_item = tbl.item(target_row, 0)
+        if year_item:
+            tbl.scrollToItem(year_item)
+
+    def _build_team_year_lineup_widget(self, tid, year, header_title):
+        """[2026-08 신설] wb.get_team_season_lineup()이 돌려주는 그 해
+        슬롯별 선수(이름만, 신민용 요청대로 OVR 없음)를 국가 검색 스쿼드
+        카드(_build_country_squad_detail_widget)와 같은 스타일로 그린다.
+        데이터가 없으면(이 기능 신설 이전 과거 시즌 등) 그 사실을 그대로
+        안내한다.
+
+        [2026-08 재작업, 신민용 리포트: "내가 분명 포메이션 형태로
+        보내달라 했는데 왜 없어?" / "팀도 주전 후보가 있는데 왜 안떠?"]
+        표(QTableWidget) 대신 국가 스쿼드와 같은 _StaticPitchView로
+        주전을 그리고, 아래에 후보(bench_json — ai_lifecycle이 새로
+        같이 저장하기 시작함) 칩 목록을 추가한다. starters는 이미
+        ai_lifecycle._snapshot_season_positions이 저장 시점에
+        _greedy_fill_slots로 슬롯 배정을 끝내둔 상태라("slot" 필드가
+        FORMATION_SLOTS[formation] 원본 순서와 1:1 대응) 여기서 다시
+        배정할 필요가 없다."""
+        data = wb.get_team_season_lineup(tid, year)
+        box = QFrame()
+        box.setStyleSheet(
+            "background:#262626;border:1px solid #3a3a3a;border-left:3px solid #4da6ff;"
+            "border-radius:6px;")
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(16, 12, 16, 14)
+        lay.setSpacing(10)
+
+        starters = data.get("starters") or []
+        bench = data.get("bench") or []
+
+        # [2026-08 신설, 신민용 요청: "이 대회명(여기서는 연도) 써진 줄
+        # 우측에 복사하기 버튼을 놔줘"] 국가 스쿼드 카드와 동일한 위치·
+        # 스타일로 헤더 행 오른쪽 끝에 배치.
+        header_row = QHBoxLayout()
+        title = QLabel(f"🧩 {header_title}")
+        title.setStyleSheet("color:#4da6ff;font-size:13px;font-weight:bold;")
+        header_row.addWidget(title)
+        header_row.addStretch(1)
+        _btn_qss = (
+            "QPushButton{background:#333;color:#ddd;border:1px solid #4a4a4a;"
+            "border-radius:4px;padding:3px 10px;font-size:11px;}"
+            "QPushButton:hover{background:#3d3d3d;}")
+        if starters:
+            # [2026-08 신설, 신민용 요청: "복사하기 버튼을 2개 만들건데
+            # 1번째는 주전만, 2번째는 지금처럼 스쿼드 전체 — 주전 복사는
+            # 주전으로 뛰었던 선수 11명만"] 후보 없이 slot에 실제로 배정된
+            # (id가 있는) 선수만 골라 별도 버튼으로 복사한다.
+            starter_copy_btn = QPushButton("📋 주전 기록 복사")
+            starter_copy_btn.setStyleSheet(_btn_qss)
+            _starter_ids = [s.get("id") for s in starters]
+            starter_copy_btn.clicked.connect(
+                lambda: self._copy_squad_player_records(
+                    _starter_ids, starter_copy_btn, "📋 주전 기록 복사"))
+            header_row.addWidget(starter_copy_btn)
+        if starters or bench:
+            squad_copy_btn = QPushButton("📋 스쿼드 기록 복사")
+            squad_copy_btn.setStyleSheet(_btn_qss)
+            _ids = [s.get("id") for s in (starters + bench)]
+            squad_copy_btn.clicked.connect(
+                lambda: self._copy_squad_player_records(_ids, squad_copy_btn))
+            header_row.addWidget(squad_copy_btn)
+            # [2026-08 신설, 신민용 요청: "요약 복사 — 이 연도 스쿼드를
+            # 뽑으면, 선수 기록에서 그 연도에 해당하는 부분만 남기고
+            # 나머지 연도는 빼줘"] 이 위젯은 이미 특정 "연도"(year 인자)
+            # 단위이므로 그 값 하나만 target_years로 넘기면 된다.
+            summary_copy_btn = QPushButton("📋 요약 복사")
+            summary_copy_btn.setStyleSheet(_btn_qss)
+            _summary_years = {year}
+            summary_copy_btn.clicked.connect(
+                lambda: self._copy_squad_player_records(
+                    _ids, summary_copy_btn, "📋 요약 복사", target_years=_summary_years))
+            header_row.addWidget(summary_copy_btn)
+        lay.addLayout(header_row)
+
+        if not starters:
+            empty = QLabel(
+                "이 연도는 포메이션 기록이 없습니다 — 이 기능이 생기기 전 과거 시즌은 소급 조회가 안 됩니다.")
+            empty.setStyleSheet("color:#666;font-size:11px;")
+            empty.setWordWrap(True)
+            lay.addWidget(empty)
+            return box
+
+        formation = data.get("formation") or "4-4-2"
+        if data.get("formation"):
+            flabel = QLabel(f"포메이션: {data['formation']}")
+            flabel.setStyleSheet("color:#888;font-size:11px;")
+            lay.addWidget(flabel)
+
+        slot_players = [(s.get("slot") or "", s.get("display_name"), s.get("id")) for s in starters]
+        pitch = _StaticPitchView(formation=formation, slot_players=slot_players,
+                                  on_click=self.open_to_player)
+
+        # [2026-08 재작업, 신민용 리포트: "좌측에 포메이션을 저렇게 박으면
+        # 우측에 후보 선수들의 이름을 나열해야지 — 주전들은 초록색으로,
+        # 후보들은 아래에 색이 없는 원래 상태로 나열"] 피치(좌)와 명단
+        # 패널(우, 주전 초록/후보 무채색)을 가로로 나란히 배치. 명단에는
+        # 실제 배정된 선수만(공석/선수없음 제외) 넣는다.
+        content_row = QHBoxLayout()
+        content_row.setSpacing(14)
+        content_row.addWidget(pitch)
+        _real_starters = [s for s in starters if s.get("id") is not None]
+        roster = _build_squad_roster_panel(_real_starters, bench, on_click=self.open_to_player)
+        content_row.addWidget(roster, 1)
+        lay.addLayout(content_row)
+        return box
+
+    def _open_world_browser_from_team_lineup(self, starters, row):
+        """[2026-08 신설] 팀 검색의 그 해 포메이션 표에서 이름을 클릭하면
+        그 선수의 세계 기록실 상세를 이 창 안에서 바로 연다 — 국가 검색
+        스쿼드 표의 _open_world_browser_from_country_squad와 동일한 패턴."""
+        if row < 0 or row >= len(starters):
+            return
+        pid = starters[row].get("id")
+        if pid is None:
+            return
+        self.open_to_player(pid)
 
     # [2026-08 신설, 신민용 요청: "팀 검색에 복사하기 버튼을 만들어서
     # 누르면 이 팀의 연도별 기록을 텍스트로 뽑고 싶다 — 지피티나 제미나이가
@@ -2614,6 +3081,22 @@ class WorldBrowserWindow(QDialog):
         filt.addWidget(lbl2)
         filt.addWidget(self.player_nat_combo)
 
+        # [2026-08 신설, 신민용 요청: "국가(소속리그)부터 팀 기준: 경력
+        # 포함까지 하나의 묶음으로 알아볼 수 있게 겉에 상자로 감싸달라"]
+        # 국가(소속리그)→리그→팀 3단계 필터 + 팀 직접입력 + 경력 포함
+        # 토글까지 전부 한 그룹이라는 걸 시각적으로 드러내려고 이 다섯
+        # 위젯 묶음만 별도 QFrame(테두리 박스)에 담아 filt에 하나로
+        # 얹는다 — 배치/시그널 연결 로직 자체는 기존과 동일, 어디에
+        # addWidget하는지만 filt에서 club_filter_lay로 바뀐다.
+        club_filter_box = QFrame()
+        club_filter_box.setObjectName("player_club_filter_box")
+        club_filter_box.setStyleSheet(
+            "QFrame#player_club_filter_box{border:1px solid #3a3a3a;"
+            "border-radius:6px;background:transparent;}")
+        club_filter_lay = QHBoxLayout(club_filter_box)
+        club_filter_lay.setContentsMargins(8, 3, 8, 3)
+        club_filter_lay.setSpacing(8)
+
         lbl2b = QLabel("국가(소속리그)"); lbl2b.setStyleSheet("color:#888;font-size:11px;")
         self.player_country_combo = QComboBox()
         self.player_country_combo.setMaximumWidth(_COMBO_MAX_W)
@@ -2628,8 +3111,8 @@ class WorldBrowserWindow(QDialog):
             self.player_country_combo.addItem(c["name"])
         self._make_combo_typable(self.player_country_combo)
         self.player_country_combo.currentTextChanged.connect(self._on_player_club_country_changed)
-        filt.addWidget(lbl2b)
-        filt.addWidget(self.player_country_combo)
+        club_filter_lay.addWidget(lbl2b)
+        club_filter_lay.addWidget(self.player_country_combo)
 
         # [2026-08 신설, 신민용 요청: "국가(소속리그) → 리그 → 팀 3단계
         # 필터... 리그 선택(많아봤자 7개니 직접 입력 없음, 기본 전체)...
@@ -2652,17 +3135,50 @@ class WorldBrowserWindow(QDialog):
         self.player_league_combo.addItem(_ALL)
         self.player_league_combo.setEnabled(False)
         self.player_league_combo.currentTextChanged.connect(self._on_player_league_changed)
-        filt.addWidget(lbl_league)
-        filt.addWidget(self.player_league_combo)
+        club_filter_lay.addWidget(lbl_league)
+        club_filter_lay.addWidget(self.player_league_combo)
 
         lbl_team = QLabel("팀"); lbl_team.setStyleSheet("color:#888;font-size:11px;")
         self.player_team_combo = QComboBox()
         self.player_team_combo.setMaximumWidth(_COMBO_MAX_W)
         self.player_team_combo.addItem(_ALL)
         self.player_team_combo.setEnabled(False)
-        self.player_team_combo.currentTextChanged.connect(_debounced_refresh)
-        filt.addWidget(lbl_team)
-        filt.addWidget(self.player_team_combo)
+        self.player_team_combo.currentTextChanged.connect(self._on_player_team_combo_changed)
+        club_filter_lay.addWidget(lbl_team)
+        club_filter_lay.addWidget(self.player_team_combo)
+
+        # [2026-08 신설, 신민용 요청: "팀 옆에 직접입력을 하나 만들어서
+        # 거기에 입력하면 앞의 국가(소속리그)/리그가 그 팀이 지금 있는
+        # 곳에 맞춰 자동으로 채워지게 — 예를 들어 헬퍼FC가 K3리그에
+        # 있으면 헬퍼FC를 치는 순간 국가는 대한민국, 리그는 K3로 자동
+        # 세팅. 팀 콤보 자체는 뒤에 입력한 이 텍스트가 곧 팀 필터가
+        # 되므로 안 바뀌어도 무방. 팀 기준: 경력 포함 토글도 그대로
+        # 적용돼야 함"] 국가(소속리그)/리그 콤보처럼 매번 전체 목록을
+        # 스크롤하지 않고 팀명을 바로 타이핑할 수 있는 자유 입력 칸.
+        # [최적화] 매 키 입력마다 DB 조회+콤보 재구성+목록 재조회가
+        # 겹치면 버벅이므로(위 player_filter_debounce와 같은 이유),
+        # 이 칸 전용 디바운스(_player_team_direct_debounce)를 따로 두고
+        # 타이핑이 잠시 멈췄을 때만 실제 조회(_apply_player_team_direct_
+        # input)가 실행되게 한다 — 팀 수가 수천 단위라 QCompleter로
+        # 매번 후보를 띄우는 방식은 일부러 쓰지 않았다(입력 즉시 콤보
+        # 자동완성 목록을 갱신하는 비용이 오히려 더 큼).
+        lbl_team_direct = QLabel("직접입력"); lbl_team_direct.setStyleSheet("color:#888;font-size:11px;")
+        self.player_team_direct_edit = QLineEdit()
+        self.player_team_direct_edit.setMaximumWidth(_COMBO_MAX_W)
+        self.player_team_direct_edit.setPlaceholderText("팀명 직접입력")
+        self.player_team_direct_edit.setToolTip(
+            "팀명을 직접 입력하면 그 팀이 지금 있는 국가(소속리그)/리그가\n"
+            "자동으로 채워지고, 그 팀 자체가 검색 기준이 됩니다.\n"
+            "(왼쪽 '팀' 콤보 선택과는 별개 — 이 칸에 값이 있으면 이 칸이 우선)")
+        self._player_team_direct_match = None
+        self._player_team_direct_debounce = QTimer(self)
+        self._player_team_direct_debounce.setSingleShot(True)
+        self._player_team_direct_debounce.setInterval(300)
+        self._player_team_direct_debounce.timeout.connect(self._apply_player_team_direct_input)
+        self.player_team_direct_edit.textChanged.connect(
+            lambda *_a: self._player_team_direct_debounce.start())
+        club_filter_lay.addWidget(lbl_team_direct)
+        club_filter_lay.addWidget(self.player_team_direct_edit)
 
         # [2026-08 신설, 신민용 요청: "팀 기준: 현재 소속 / 경력 포함...
         # 기본값은 현재 소속으로 하고, 사용자가 경력 포함을 켜면 현역도
@@ -2672,6 +3188,9 @@ class WorldBrowserWindow(QDialog):
         # 그 팀이 있으면 다 뜨게"] 예전엔 은퇴 상태에선 이 토글과 무관
         # 하게 백엔드가 항상 "경력(뛴 적 있으면)"으로 고정 검색했는데,
         # 이제 현역/은퇴 모두 이 버튼 하나로 통일해서 따른다.
+        # [2026-08 신설] 팀 직접입력 칸으로 찾은 팀에도 동일하게 적용된다
+        # (_refresh_player_list에서 team_id를 직접입력 매치로 덮어써도
+        # team_mode는 그대로 이 버튼 값을 따름).
         self.player_team_career_btn = QPushButton("팀 기준: 경력 포함")
         self.player_team_career_btn.setCheckable(True)
         self.player_team_career_btn.setChecked(False)
@@ -2682,7 +3201,9 @@ class WorldBrowserWindow(QDialog):
             "켜짐: 과거에 그 팀(국가(소속리그)/리그로 좁혔다면 그 범위의 팀들)에서\n"
             "뛴 적이 있으면 포함 — 현역/은퇴 모두 동일하게 적용.")
         self.player_team_career_btn.toggled.connect(_debounced_refresh)
-        filt.addWidget(self.player_team_career_btn)
+        club_filter_lay.addWidget(self.player_team_career_btn)
+
+        filt.addWidget(club_filter_box)
 
         # [2026-08 신설, 신민용 요청: "국가(소속리그)랑 상태(현역/은퇴)
         # 사이에 국가대표 유무 표시를 넣어달라, 기본은 꺼짐(전부 보임),
@@ -2903,7 +3424,8 @@ class WorldBrowserWindow(QDialog):
             "player", self.player_search_box, self.player_list,
             lambda it: it.data(Qt.ItemDataRole.UserRole + 1),
             self._on_player_selected,
-            refresh_fn=self._refresh_player_list, debounce_timer=self._player_filter_debounce)
+            refresh_fn=self._refresh_player_list, debounce_timer=self._player_filter_debounce,
+            label_fn=self._recent_player_label)
         right_lay.addWidget(self._player_recent_row)
 
         # [2026-08 신설, 신민용 요청: "선수 검색에도 팀 검색처럼 복사하기
@@ -3335,6 +3857,11 @@ class WorldBrowserWindow(QDialog):
         self.player_team_career_btn.blockSignals(True)
         self.player_team_career_btn.setChecked(False)
         self.player_team_career_btn.blockSignals(False)
+        # [2026-08 신설, 신민용 요청: "필터 초기화 기본값은 (팀 직접입력에)
+        # 아무것도 입력되지 않은 것"] 직접입력 칸/매치/전용 디바운스까지
+        # 전부 비운다 — _clear_player_team_direct_input()이 정확히 이 일을
+        # 하므로 그대로 재사용.
+        self._clear_player_team_direct_input()
         self._player_filter_debounce.stop()
         # 대륙(국적)이 "전체"로 리셋됐으니 "국적" 콤보도 전체 국가 목록으로
         # 다시 채워야 한다(단순 setCurrentIndex(0)만으로는 목록 자체가
@@ -3396,6 +3923,13 @@ class WorldBrowserWindow(QDialog):
     # "전체" 하나만 남기고 비활성화). 리그가 바뀌므로 팀 콤보도 항상
     # 같이 리셋한다.
     def _on_player_club_country_changed(self, *_a):
+        # [2026-08 신설] 팀 직접입력으로 자동 채워진 상태에서 사용자가
+        # 국가(소속리그)를 손으로 바꾸면, 그 직접입력 값이 방금 세팅한
+        # 국가와 어긋나 버리므로(계속 예전 팀 기준으로 조회) 직접입력
+        # 칸을 비워 "다시 일반 필터 모드"로 되돌린다. 이 콤보를 직접입력
+        # 로직 스스로 세팅할 때는 항상 blockSignals로 감싸므로, 여기까지
+        # 신호가 도달했다는 건 사용자가 실제로 건드렸다는 뜻이다.
+        self._clear_player_team_direct_input()
         self._refresh_player_league_combo()
         self._refresh_player_team_combo()
         self._player_filter_debounce.start()
@@ -3430,6 +3964,83 @@ class WorldBrowserWindow(QDialog):
     # 남기고 비활성화 — 국가만 고르고 리그를 안 고른 상태에서 팀까지
     # 고르게 하면 어느 부수 팀인지 모호해지므로 막는다).
     def _on_player_league_changed(self, *_a):
+        # [2026-08 신설] 위 _on_player_club_country_changed와 같은 이유 —
+        # 리그를 손으로 바꾸면 팀 직접입력 값이 어긋나므로 비운다.
+        self._clear_player_team_direct_input()
+        self._refresh_player_team_combo()
+        self._player_filter_debounce.start()
+
+    # [2026-08 신설] "팀" 콤보를 사용자가 직접 고르는 경우도 팀 직접입력
+    # 값과 어긋날 수 있으므로(직접입력이 우선 적용되던 상태에서 콤보를
+    # 또 손으로 바꾸면 어느 쪽을 따라야 할지 모호해짐) 마찬가지로 비운
+    # 뒤 기존과 동일하게 디바운스 재조회.
+    def _on_player_team_combo_changed(self, *_a):
+        self._clear_player_team_direct_input()
+        self._player_filter_debounce.start()
+
+    def _clear_player_team_direct_input(self):
+        """[2026-08 신설] 팀 직접입력 칸/매치 상태를 비운다. 텍스트가
+        이미 비어 있으면 아무 것도 안 함(불필요한 신호 방지). textChanged
+        가 다시 디바운스를 돌리지 않도록 blockSignals로 감싼다 — 이 함수는
+        국가/리그/팀 콤보를 "사용자가 직접" 바꿨을 때만 호출되므로, 그
+        직후 이어지는 _player_filter_debounce.start()가 정확한 한 번의
+        재조회를 담당한다."""
+        self._player_team_direct_debounce.stop()
+        self._player_team_direct_match = None
+        if self.player_team_direct_edit.text():
+            self.player_team_direct_edit.blockSignals(True)
+            self.player_team_direct_edit.clear()
+            self.player_team_direct_edit.blockSignals(False)
+        self.player_team_direct_edit.setStyleSheet("")
+
+    def _apply_player_team_direct_input(self):
+        """[2026-08 신설, 신민용 요청: "팀 직접입력에 입력하면 앞의 국가
+        (소속리그)/리그가 그 팀이 지금 있는 곳에 맞춰 자동으로 채워지게 —
+        팀 콤보 자체는 뒤에 입력한 텍스트가 곧 팀 필터가 되니 안 바뀌어도
+        됨"] player_team_direct_edit.textChanged가 시작시킨 전용 디바운스
+        (_player_team_direct_debounce, 300ms)가 끝난 뒤에만 실행된다 —
+        타이핑 중간중간 매번 DB 조회 + 국가/리그 콤보 재구성이 겹치면
+        버벅이는 걸 막기 위함(신민용이 직접 짚은 최적화 우려 대응).
+        찾은 팀은 self._player_team_direct_match에 저장해 두고
+        _refresh_player_list가 팀/리그/국가 필터로 그대로 재사용한다."""
+        text = self.player_team_direct_edit.text().strip()
+        self._player_team_direct_match = None
+        if not text:
+            self.player_team_direct_edit.setStyleSheet("")
+            self._player_filter_debounce.start()
+            return
+        match = wb.find_team_by_name(text)
+        if not match:
+            # 일치하는 팀이 없으면 조용히 무시하지 않고 테두리를 빨갛게
+            # 표시해 "이 이름의 팀을 못 찾았다"는 걸 바로 알 수 있게 한다.
+            self.player_team_direct_edit.setStyleSheet(
+                "QLineEdit{border:1px solid #cc4444;}")
+            self._player_filter_debounce.start()
+            return
+        self.player_team_direct_edit.setStyleSheet("")
+        self._player_team_direct_match = match
+        # 아래 두 콤보는 blockSignals로 감싼 채 세팅한다 — 그래야
+        # _on_player_club_country_changed/_on_player_league_changed가
+        # "사용자가 직접 바꿨다"고 오인해 방금 채운 이 직접입력 값을
+        # 스스로 지워버리는 걸(위 두 핸들러 맨 앞 참고) 막을 수 있다.
+        self.player_country_combo.blockSignals(True)
+        idx = self.player_country_combo.findText(match["country_name"])
+        if idx >= 0:
+            self.player_country_combo.setCurrentIndex(idx)
+        self.player_country_combo.blockSignals(False)
+        self._refresh_player_league_combo()
+        cache = getattr(self, "_player_league_cache", [])
+        target_idx = 0
+        for i, lg in enumerate(cache):
+            if lg["id"] == match["league_id"]:
+                target_idx = i + 1  # 콤보 0번은 항상 "전체"
+                break
+        self.player_league_combo.blockSignals(True)
+        self.player_league_combo.setCurrentIndex(target_idx)
+        self.player_league_combo.blockSignals(False)
+        # 팀 콤보는 목록만 그 리그 소속으로 새로 채워 넣고("전체"인
+        # 상태로) 선택 자체는 건드리지 않는다 — 실제 팀 필터는 아래
+        # _refresh_player_list에서 이 직접입력 매치를 우선 사용한다.
         self._refresh_player_team_combo()
         self._player_filter_debounce.start()
 
@@ -3497,6 +4108,16 @@ class WorldBrowserWindow(QDialog):
         # 으로 안 고른 채 리그만 골라도 그 리그 안에서 걸러지도록.
         team_id = self._selected_player_team_id()
         league_id = self._selected_player_league_id()
+        # [2026-08 신설, 신민용 요청: "팀 직접입력에 값을 넣으면 그게 곧
+        # 팀 필터 — 팀 콤보는 뒤에 입력한 게 있으니 안 바뀌어도 됨"] 팀
+        # 콤보는 직접입력을 써도 일부러 "전체"로 남겨두므로(위 _apply_
+        # player_team_direct_input 참고) 여기서 위 _selected_player_team_id()
+        # 결과(None)를 그 매치된 팀 id로 덮어쓴다. 국가(소속리그)/리그는
+        # 이미 그 함수가 콤보 자체를 팀 기준으로 세팅해 두었으므로 위
+        # club_cid/league_id도 자연히 그 팀의 국가/리그와 일치한다.
+        _direct_match = getattr(self, "_player_team_direct_match", None)
+        if self.player_team_direct_edit.text().strip() and _direct_match:
+            team_id = _direct_match["team_id"]
         team_mode = "career" if self.player_team_career_btn.isChecked() else "current"
         players = wb.search_ai_players(name_query=q, continent=cont, country_id=club_cid,
                                         nat_country_id=nat_cid, grade=grade, tier=tier,
@@ -3525,8 +4146,50 @@ class WorldBrowserWindow(QDialog):
             item.setData(Qt.ItemDataRole.UserRole, pl["player_id"])
             item.setData(Qt.ItemDataRole.UserRole + 1, code)
             item.setData(_GridRowDelegate._SPEC_ROLE, self._player_row_spec(pl, code))
+            item.setData(_PLAYER_ROW_DATA_ROLE, pl)   # [2026-08 신설] 이름만 바뀌었을 때 이 줄만 다시 그리기 위함
             self.player_list.addItem(item)
         self._ensure_list_fits(self.player_list, self._player_split)
+
+    def _apply_rename_to_player_list(self, player_id) -> bool:
+        """[2026-08 신설, 최적화] AI 선수 이름을 바꿨을 때, 좌측 검색
+        목록에서 그 선수 줄 하나만 새 이름으로 다시 그린다.
+
+        예전엔 이름을 하나 바꿀 때마다 _refresh_player_list()로 최대
+        300명을 DB에서 다시 검색하고 목록 위젯을 통째로 지웠다 다시
+        만들었다 — 이름을 100명 넘게 바꾸면 그 비용이 그대로 100번
+        반복된다(스크롤 위치와 선택도 매번 초기화됐다).
+
+        단, "이름 때문에 목록에 뜨고 안 뜨고가 갈리는" 필터가 걸려
+        있으면 이름을 바꾼 결과 그 선수가 목록에서 빠져야 할 수도
+        있으므로 이 빠른 경로를 쓰지 않고 False를 돌려준다(호출부가
+        예전처럼 전체 재조회로 폴백). 대상: 이름 검색어가 들어 있을
+        때 / "✏ 이름 변경만" 필터가 켜져 있을 때.
+        """
+        try:
+            if self.player_search_box.text().strip():
+                return False
+            if self.player_custom_named_btn.isChecked():
+                return False
+            lst = self.player_list
+        except (AttributeError, RuntimeError):
+            return False   # 선수 검색 탭이 아직 만들어지지 않았거나 창이 닫힌 경우
+        for i in range(lst.count()):
+            item = lst.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) != player_id:
+                continue
+            pl = item.data(_PLAYER_ROW_DATA_ROLE)
+            if not pl:
+                return False
+            # 지정 이름을 지웠으면(빈 문자열 저장) 원래 식별코드로 되돌아간다 —
+            # _refresh_player_list가 목록을 만들 때 쓰는 규칙과 완전히 동일.
+            new_code = get_ai_player_custom_name(player_id) or ai_player_code(player_id)
+            item.setData(Qt.ItemDataRole.UserRole + 1, new_code)
+            item.setData(_GridRowDelegate._SPEC_ROLE, self._player_row_spec(pl, new_code))
+            item.setData(_PLAYER_ROW_DATA_ROLE, pl)
+            return True
+        # 지금 보이는 목록에 없는 선수(다른 필터로 걸러진 상태 등) —
+        # 목록에 변화가 없으므로 다시 조회할 이유도 없다.
+        return True
 
     def _player_row_spec(self, pl, code):
         # [2026-08 수정, 신민용 확정: "포메이션에 뜨는 것처럼 식별코드로
@@ -3582,13 +4245,32 @@ class WorldBrowserWindow(QDialog):
             {"text": team_text, "width": self._LEAGUE_COL_W, "color": "#888"},
         ]
 
+    def _recent_player_label(self, stored):
+        """[2026-08 신설] 최근 검색에 저장된 값 → 버튼에 쓸 표시 이름.
+        "#123"처럼 id로 저장된 항목은 지금 지정된 이름(없으면 식별코드)
+        으로 그때그때 풀어서 보여주므로, 이름을 바꾸면 버튼 글자도
+        자동으로 따라 바뀐다. 예전 방식으로 저장된 문자열 항목
+        (이 기능 이전에 쌓인 것)은 그대로 돌려줘서 기존 목록이
+        갑자기 사라지지 않게 한다 — 그 항목들은 계속 쓰다 보면
+        자연히 뒤로 밀려 없어진다."""
+        if not isinstance(stored, str):
+            return ""
+        if stored.startswith("#") and stored[1:].isdigit():
+            return get_ai_player_custom_name(int(stored[1:])) or ai_player_code(int(stored[1:]))
+        return stored
+
     def _on_player_selected(self, item):
         pid = item.data(Qt.ItemDataRole.UserRole)
         code = item.data(Qt.ItemDataRole.UserRole + 1)
         if pid is None:
             return
         self._show_player_detail(pid)
-        self._record_recent_selection("player", code or "", "_player_recent_row")
+        # [2026-08 수정] AI 선수는 표시 이름 대신 id를 저장한다(위
+        # _recent_player_label 주석 참고). my_player는 이름 변경
+        # 대상이 아니고 id도 음수(MY_PLAYER_ID=-1)라 예전처럼 이름
+        # 문자열을 그대로 남긴다.
+        _stored = f"#{pid}" if isinstance(pid, int) and pid >= 0 else None
+        self._record_recent_selection("player", code or "", "_player_recent_row", stored=_stored)
 
     def _show_player_detail(self, player_id):
         d = wb.get_ai_player_detail(player_id)
@@ -3766,9 +4448,18 @@ class WorldBrowserWindow(QDialog):
         cancel_btn.clicked.connect(dlg.reject)
         edit.returnPressed.connect(dlg.accept)
 
-        if dlg.exec() != QDialog.DialogCode.Accepted:
+        _accepted = dlg.exec() == QDialog.DialogCode.Accepted
+        _new_text = edit.text()
+        # [2026-08 최적화/누수수정] QDialog는 부모(self=이 창)가 있으면
+        # 파이썬 참조가 사라져도 C++ 객체가 부모에 매달린 채 계속
+        # 살아남는다 — 이름을 100명 넘게 바꾸면 그만큼의 숨은
+        # 다이얼로그(각각 입력칸·버튼 여러 개)가 이 창 밑에 쌓이고,
+        # 앱 전체 위젯을 훑는 코드(apply_custom_name_live 등)가 그만큼
+        # 계속 느려진다. 다 쓴 즉시 삭제 예약.
+        dlg.deleteLater()
+        if not _accepted:
             return
-        set_ai_player_custom_name(player_id, edit.text())
+        set_ai_player_custom_name(player_id, _new_text)
         # [2026-08 버그수정, 신민용 리포트: "이름 수정했는데 포메이션에는
         # AIAXS2로 예전 코드가 그대로 뜬다" → 후속: "나갔다 들어와야
         # 바뀐다, 실시간으로 안 되나? 어차피 한 번에 하나씩만 바꾸는데"]
@@ -3792,7 +4483,16 @@ class WorldBrowserWindow(QDialog):
         # 저장 직후 상세 표를 새로 그려 새 이름을 바로 반영하고, 좌측
         # 검색 목록도 다시 조회해 목록에 뜬 이름도 같이 갱신한다.
         self._show_player_detail(player_id)
-        self._refresh_player_list()
+        # [2026-08 최적화] 목록 전체 재조회 대신 그 줄만 갱신(불가능한
+        # 필터 상황이면 _apply_rename_to_player_list가 False를 돌려주고
+        # 예전과 똑같이 전체 재조회로 폴백한다).
+        if not self._apply_rename_to_player_list(player_id):
+            self._refresh_player_list()
+        # [2026-08 신설] 최근 검색 버튼도 새 이름으로 다시 그린다
+        # (id로 저장돼 있으므로 다시 그리기만 하면 새 이름이 나온다).
+        _rr = getattr(self, "_player_recent_row", None)
+        if _rr is not None:
+            _rr.refresh()
 
     def _fill_player_detail_row(self, name_text, d):
         """[2026-08 재수정, 신민용 요청: "왜 아직도 태그형으로 표시하는거?
@@ -4403,7 +5103,7 @@ class WorldBrowserWindow(QDialog):
         # 쪽이 요청에 맞다 — 팝업 대신 인라인 확장으로 교체.
         self.country_detail_tbl.cellClicked.connect(self._on_country_detail_cell_clicked)
         right_lay.addWidget(self.country_detail_tbl, 1)
-        hint = QLabel("💡 연도를 클릭하면 이 국가의 경기 기록이 펼쳐지고, 대회명을 클릭하면 대회 전체 일정을 볼 수 있어요")
+        hint = QLabel("💡 연도를 클릭하면 경기 기록이, 대회명을 클릭하면 그 당시 주전/후보 명단이 펼쳐지고, 종류를 클릭하면 대회 전체 일정을 볼 수 있어요")
         hint.setStyleSheet("color:#666;font-size:10px;")
         right_lay.addWidget(hint)
 
@@ -4787,14 +5487,23 @@ class WorldBrowserWindow(QDialog):
     def _on_country_detail_cell_clicked(self, row, col):
         # [2026-08 신설, 신민용 요청: "대회명을 클릭하면 그 대회 전체 일정
         # (예전에 보여주던 팝업)이 떠야 한다"] 연도(0번)는 이 국가 관점의
-        # 인라인 경기기록 토글, 대회명(2번)은 원래대로 대회 전체(전 참가국
-        # 조편성+토너먼트 대진) 팝업을 그대로 연다 — 서로 다른 목적이라
-        # 컬럼으로 분리한다.
-        if col == 2:
+        # 인라인 경기기록 토글, 대회 전체 팝업(전 참가국 조편성+토너먼트
+        # 대진)은 별도 컬럼으로 분리한다.
+        # [2026-08 재수정, 신민용 요청: "대회명 말고 옆의 종류(대륙컵 등)를
+        # 눌러야 그 대회 전체 일정이 뜨게 해달라"] 대회명(2번) 칸은 이제
+        # 그냥 텍스트일 뿐이고, 종류(3번) 칸을 눌러야 팝업이 열린다.
+        if col == 3:
             self._open_country_title_detail(row, col)
             return
-        if col != 0:
+        # [2026-08 신설, 신민용 요청: "대회를 클릭하면 그 대회 당시 주전들과
+        # 후보들이 떠야 한다"] 연도(0번)는 경기 기록, 대회명(2번)은 스쿼드
+        # (주전/후보) — 같은 "표 안에 한 줄 펼치기" 자리를 공유하되 종류가
+        # 다르면 서로 다른 내용을 그린다(_country_expanded의 "kind"로 구분).
+        # 한 번에 하나만 펼치는 규칙은 그대로 유지 — 다른 걸 클릭하면 먼저
+        # 펼쳐진 걸 접는다.
+        if col not in (0, 2):
             return
+        kind = "match" if col == 0 else "squad"
         tbl = self.country_detail_tbl
         item = tbl.item(row, 0)
         if not item:
@@ -4803,12 +5512,12 @@ class WorldBrowserWindow(QDialog):
         if tid is None:
             return
         exp = getattr(self, "_country_expanded", None)
-        same_year = bool(exp) and exp.get("tid") == tid
-        # 이미 다른 연도가 펼쳐져 있으면 먼저 접는다(한 번에 하나만 펼침) —
-        # 접으면 그 아래 행들이 위로 당겨져 인덱스가 바뀔 수 있으므로,
-        # 이후 목표 행은 tid로 다시 찾아낸다(아래 참고).
+        same = bool(exp) and exp.get("tid") == tid and exp.get("kind") == kind
+        # 이미 다른 게 펼쳐져 있으면(연도든 대회든) 먼저 접는다(한 번에
+        # 하나만 펼침) — 접으면 그 아래 행들이 위로 당겨져 인덱스가 바뀔
+        # 수 있으므로, 이후 목표 행은 tid로 다시 찾아낸다(아래 참고).
         self._collapse_country_detail_row()
-        if same_year:
+        if same:
             return
 
         target_row = None
@@ -4825,10 +5534,12 @@ class WorldBrowserWindow(QDialog):
             return
         name_item = tbl.item(target_row, 2)
         kind_item = tbl.item(target_row, 3)
-        year_txt = item.text()
+        year_item = tbl.item(target_row, 0)
+        year_txt = year_item.text() if year_item else ""
         header = (f"{year_txt} {name_item.text() if name_item else ''} "
                   f"({kind_item.text() if kind_item else ''})").strip()
-        widget = self._build_country_year_detail_widget(tid, country, header)
+        widget = (self._build_country_year_detail_widget(tid, country, header) if kind == "match"
+                  else self._build_country_squad_detail_widget(tid, country, header, year_txt))
 
         detail_row = target_row + 1
         tbl.insertRow(detail_row)
@@ -4841,8 +5552,10 @@ class WorldBrowserWindow(QDialog):
         h = widget.sizeHint().height()
         if h > tbl.rowHeight(detail_row):
             tbl.setRowHeight(detail_row, h + 8)
-        self._country_expanded = {"tid": tid, "orig_row": target_row, "detail_row": detail_row}
-        tbl.scrollToItem(item)
+        self._country_expanded = {"tid": tid, "orig_row": target_row,
+                                   "detail_row": detail_row, "kind": kind}
+        if year_item:
+            tbl.scrollToItem(year_item)
 
     def _build_country_year_detail_widget(self, tid, country, header_title):
         """국가 검색 표에서 연도를 펼쳤을 때 보여줄 내용 — 이 국가가 속한
@@ -4952,6 +5665,194 @@ class WorldBrowserWindow(QDialog):
                 row_lay.addWidget(score_lbl)
                 lay.addWidget(row_w)
         return box
+
+    def _build_country_squad_detail_widget(self, tid, country, header_title, year_txt=None):
+        """[2026-08 신설, 신민용 요청: "국가 검색에서 대회를 클릭하면
+        그 대회 당시 주전들과 후보들이 떠야 한다"] _build_country_year_
+        detail_widget(연도 클릭 → 경기 기록)과 완전히 같은 카드 스타일로,
+        wb.get_country_tournament_squad()가 돌려주는 이 대회의 26인 풀을
+        주전(11)/후보로 나눠 보여준다. 데이터 자체는 intl_squad에 이미
+        저장돼 있는 걸 그대로 읽는 것뿐이라 새로 계산하지 않는다.
+
+        [2026-08 재작업, 신민용 리포트: "내가 분명 포메이션 형태로
+        보내달라 했는데 왜 없어?"] 표(QTableWidget)였던 주전 목록을
+        _StaticPitchView(라이브 포메이션 화면과 같은 초록 피치 스타일)로
+        바꿨다. starters는 position 문자열로 대략 정렬돼 있을 뿐 11개
+        슬롯에 1:1로 배정돼 있진 않으므로(과거 버그로 9~10명만 기록된
+        대회도 있음), 클럽팀 포메이션과 똑같이 formation_logic.
+        _greedy_fill_slots(POSITION_COMPAT 기반)로 화면 배치만 다시
+        계산한다 — 저장된 주전 명단 자체(누가 주전인지)는 그대로,
+        "어느 자리에 그리느냐"만 시각화를 위해 재계산.
+
+        year_txt: [2026-08 신설, 신민용 요청: "요약 복사 — 이 스쿼드에
+        해당하는 연도만 남기고 선수 기록 복사"] 호출부(_on_country_
+        detail_cell_clicked)가 이미 표에서 읽어둔 "연도" 칸 텍스트를
+        그대로 넘겨준다 — "요약 복사" 버튼의 target_years로 쓴다."""
+        from intl_engine import _INTL_MATCHDAY_STARTER_POS
+        from formation_logic import _greedy_fill_slots
+        squad = wb.get_country_tournament_squad(tid, country)
+        box = QFrame()
+        box.setStyleSheet(
+            "background:#262626;border:1px solid #3a3a3a;border-left:3px solid #ffcc00;"
+            "border-radius:6px;")
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(16, 12, 16, 14)
+        lay.setSpacing(10)
+
+        starters, bench = squad.get("starters") or [], squad.get("bench") or []
+
+        # [2026-08 신설, 신민용 요청: "이 대회명 써진 줄 우측에 복사하기
+        # 버튼을 놔줘"] 헤더 행에 제목 라벨과 나란히(오른쪽 끝) 배치.
+        header_row = QHBoxLayout()
+        title = QLabel(f"👥 {header_title}")
+        title.setStyleSheet("color:#ffcc00;font-size:13px;font-weight:bold;")
+        header_row.addWidget(title)
+        header_row.addStretch(1)
+        _btn_qss = (
+            "QPushButton{background:#333;color:#ddd;border:1px solid #4a4a4a;"
+            "border-radius:4px;padding:3px 10px;font-size:11px;}"
+            "QPushButton:hover{background:#3d3d3d;}")
+        if starters:
+            # [2026-08 신설, 신민용 요청: "복사하기 버튼을 2개 만들건데
+            # 1번째는 주전만, 2번째는 지금처럼 스쿼드 전체 — 주전 복사는
+            # 주전으로 뛰었던 선수 11명만"]
+            starter_copy_btn = QPushButton("📋 주전 기록 복사")
+            starter_copy_btn.setStyleSheet(_btn_qss)
+            _starter_ids = [r.get("id") for r in starters]
+            starter_copy_btn.clicked.connect(
+                lambda: self._copy_squad_player_records(
+                    _starter_ids, starter_copy_btn, "📋 주전 기록 복사"))
+            header_row.addWidget(starter_copy_btn)
+        if starters or bench:
+            squad_copy_btn = QPushButton("📋 스쿼드 기록 복사")
+            squad_copy_btn.setStyleSheet(_btn_qss)
+            _ids = [r.get("id") for r in (starters + bench)]
+            squad_copy_btn.clicked.connect(
+                lambda: self._copy_squad_player_records(_ids, squad_copy_btn))
+            header_row.addWidget(squad_copy_btn)
+            # [2026-08 신설, 신민용 요청: "요약 복사 — 이 대회 연도에
+            # 해당하는 선수 기록 부분만 남기고 복사"] year_txt(표의
+            # "연도" 칸 텍스트, 예: "2000")를 정수로 파싱해 target_years로
+            # 넘긴다 — 못 읽으면(과거 데이터 등) 버튼 자체를 만들지 않는다
+            # (걸러줄 기준 연도가 없으면 "요약"이라는 이름이 무의미하므로).
+            _year_int = None
+            try:
+                _year_int = int(str(year_txt).strip()) if year_txt else None
+            except (TypeError, ValueError):
+                _year_int = None
+            if _year_int is not None:
+                summary_copy_btn = QPushButton("📋 요약 복사")
+                summary_copy_btn.setStyleSheet(_btn_qss)
+                _summary_years = {_year_int}
+                summary_copy_btn.clicked.connect(
+                    lambda: self._copy_squad_player_records(
+                        _ids, summary_copy_btn, "📋 요약 복사", target_years=_summary_years))
+                header_row.addWidget(summary_copy_btn)
+        lay.addLayout(header_row)
+
+        if not starters and not bench:
+            empty = QLabel("스쿼드 기록이 없습니다.")
+            empty.setStyleSheet("color:#666;font-size:11px;")
+            lay.addWidget(empty)
+            return box
+
+        if squad.get("approx"):
+            note = QLabel("⚠ 이 대회는 주전/후보 구분 기록이 없어(출전 횟수 기준) 상위 11명을 주전으로 표시합니다.")
+            note.setStyleSheet("color:#888;font-size:10px;")
+            note.setWordWrap(True)
+            lay.addWidget(note)
+
+        # [2026-08 재작업, 신민용 리포트: "좌측에 포메이션을 저렇게 박으면
+        # 우측에 후보 선수들의 이름을 나열해야지 — 주전들은 초록색으로,
+        # 후보들은 아래에 색이 없는 원래 상태로 나열"] 피치(좌)와 명단
+        # 패널(우, 주전 초록/후보 무채색)을 가로로 나란히 배치.
+        content_row = QHBoxLayout()
+        content_row.setSpacing(14)
+        if starters:
+            cands = [dict(r) for r in starters]
+            placed = _greedy_fill_slots(cands, _INTL_MATCHDAY_STARTER_POS)
+            slot_players = [
+                (_INTL_MATCHDAY_STARTER_POS[i],
+                 (p.get("display_name") if p else None),
+                 (p.get("id") if p else None))
+                for i, p in enumerate(placed)]
+            pitch = _StaticPitchView(
+                formation="", slot_players=slot_players, slots=_INTL_MATCHDAY_STARTER_POS,
+                on_click=self.open_to_player)
+            content_row.addWidget(pitch)
+        roster = _build_squad_roster_panel(starters, bench, on_click=self.open_to_player)
+        content_row.addWidget(roster, 1)
+        lay.addLayout(content_row)
+        return box
+
+    def _open_world_browser_from_country_squad(self, players, row):
+        """[2026-08 신설] 국가 검색의 대회 스쿼드 표에서 선수 이름을
+        클릭하면(포지션/OVR 칸이어도 무방 — 행 전체 클릭) 그 선수의
+        세계 기록실 상세를 바로 연다. 이 창 자체가 이미 세계 기록실이므로
+        새 창을 띄우지 않고 "선수 검색" 탭으로 전환해서 그 자리에서 보여준다."""
+        if row < 0 or row >= len(players):
+            return
+        pid = players[row].get("id")
+        if pid is None:
+            return
+        self.open_to_player(pid)
+
+    def _copy_squad_player_records(self, ids, btn, reset_label="📋 스쿼드 기록 복사", target_years=None):
+        """[2026-08 신설, 신민용 요청: "이 대회명 써진 줄 우측에 복사하기
+        버튼을 놔줘 — 여기 들어간 선수들의 선수 기록을 한꺼번에 복사하는
+        용도"] ui/formation_widget.py의 _on_copy_squad_clicked와 완전히
+        같은 하베스터 패턴을 쓴다 — 지금 이 창(self)을 그대로 써서 선수
+        마다 open_to_player를 부르면 그때마다 "선수 검색" 탭으로 화면이
+        전환돼버려, 사용자가 보고 있던 국가/팀 검색 화면이 계속 다른
+        탭으로 튀는 문제가 생긴다. 그래서 화면에 띄우지 않는 별도
+        WorldBrowserWindow 인스턴스를 하나 더 만들어 그 안에서만 조회하고
+        끝나면 버린다. 기존 country_copy_btn/team_copy_btn(그 나라/팀
+        자체의 트로피·시즌 기록 텍스트를 복사)과는 전혀 다른 기능 —
+        여기서는 이 스쿼드에 속한 선수 개개인의 [선수 기록] 텍스트를
+        모아서 한 번에 복사한다.
+
+        [2026-08 확장, 신민용 요청: "복사하기 버튼을 2개 만들건데 하나는
+        주전만, 하나는 스쿼드 전체"] 같은 창(주전만/전체 스쿼드)에 버튼이
+        2개가 되면서 눌렀을 때 되돌아갈 라벨도 버튼마다 달라야 하므로
+        reset_label을 인자로 받는다.
+
+        [2026-08 확장, 신민용 요청: "요약 복사 — 2006년 월드컵 주전을
+        뽑으면, 선수 기록 중 그 2006년에 해당하는 [연도별 기록]/
+        [국가대표 기록]만 남기고 나머지 연도는 빼줘"] target_years(연도
+        집합)를 넘기면 rows(연도별 기록)·intl_records(국가대표 기록)를
+        그 연도에 속한 항목만 남기고 걸러서 넘긴다 — 기본 정보 한 줄과
+        "소속팀 기준 통산 수상"(원래도 연도 무관한 커리어 총합) 줄은
+        그대로 둔다. None이면(기본값) 기존처럼 전체 연도를 다 넣는다."""
+        ids = [i for i in dict.fromkeys(ids) if i is not None]
+        if not ids:
+            return
+        harvester = WorldBrowserWindow(self)
+        texts = []
+        try:
+            for pid in ids:
+                try:
+                    harvester.open_to_player(pid)
+                except Exception:
+                    continue
+                name = getattr(harvester, "_player_copy_name", None)
+                d = getattr(harvester, "_player_copy_d", None)
+                if not name or not d:
+                    continue
+                team_hist = getattr(harvester, "_player_copy_team_hist", None)
+                rows = getattr(harvester, "_player_copy_rows", [])
+                intl_records = getattr(harvester, "_player_copy_intl_records", [])
+                if target_years is not None:
+                    rows = [r for r in rows if r.get("year") in target_years]
+                    intl_records = [r for r in intl_records if r.get("year") in target_years]
+                texts.append(harvester._format_player_history_text(
+                    name, d, team_hist, rows, intl_records))
+        finally:
+            harvester.deleteLater()
+        if not texts:
+            return
+        QGuiApplication.clipboard().setText("\n".join(texts))
+        btn.setText("✅ 복사됨")
+        QTimer.singleShot(1200, lambda: btn.setText(reset_label))
 
     # ─────────────────────────────────────────
     # 탭2: 컵대회 검색 (2026-07 신설)

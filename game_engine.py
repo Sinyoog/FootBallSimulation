@@ -1651,9 +1651,9 @@ def advance_days(schedule: list, progress_cb=None):
         return
 
     st = get_state()
-    print(f"[ADVANCE] ENTER schedule_len={len(schedule)} first_day={schedule[0][0] if schedule else None} "
-          f"current_day={st.get('current_day')} current_week={st.get('current_week')} "
-          f"current_season={st.get('current_season')} current_year={st.get('current_year')}")
+    # [2026-08 정리, 신민용 확정] 일 단위 진행 리팩터 당시 디버그용으로
+    # 넣었던 매주 무조건 출력 트레이스 — 기능 검증이 끝나 더 이상 필요
+    # 없어 제거(신민용 리포트: "이제 없애도 될 것 같다").
     if not schedule:
         print("[ADVANCE] EXIT reason=empty_schedule")
         return
@@ -5138,6 +5138,122 @@ def _salary_press(p) -> float:
     return 1.0 + (ratio - 1.0) * 0.31
 
 
+def _actual_playtime_ratio(p):
+    """[2026-08 신설, 신민용+GPT 1차 구현 ③] 이번 시즌 '팀이 이미 치른
+    경기 수' 대비 내 실제 출전 비율(0~1). 풀시즌(38경기 등) 기준으로
+    나누면 시즌 초반엔 팀이 2경기밖에 안 치렀어도 분모가 38이라 무조건
+    낮게 나와 노이즈가 크다 — _my_team_importance_ratio에서 이미 검증된
+    것과 같은 방식(season_matches / match_results로 센 팀 기치른 경기 수)을
+    그대로 재사용한다. 팀이 아직 3경기도 안 치렀으면 표본 부족으로 보고
+    None을 반환해 호출부가 이번 보정을 건너뛰게 한다."""
+    my_tid = p.get("current_team_id", 0)
+    if not my_tid:
+        return None
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            """SELECT COUNT(*) c FROM match_results
+               WHERE season=? AND (home_team_id=? OR away_team_id=?) AND home_score>=0""",
+            (p.get("current_season", 1), my_tid, my_tid)).fetchone()
+        team_played = row["c"] if row else 0
+    except Exception:
+        team_played = 0
+    if team_played < 3:
+        return None
+    season_matches = p.get("season_matches", 0) or 0
+    return min(1.0, season_matches / team_played)
+
+
+def _roll_manager_preferences() -> dict:
+    """[2026-08 신설, 신민용+GPT 1차 구현 ④] 감독 개인 취향 5축(youth/
+    star/workrate/versatility/biggame)을 새로 뽑는다. manager_type을 새로
+    뽑는 시점(입단, 감독 교체)마다 매번 같이 호출해야 한다 — 선수 개인의
+    고정 성격이 아니라 "지금 감독이 이 선수를 보는 개인적 시선"이라서,
+    감독이 바뀌면 이 값도 통째로 다시 뽑혀야 "A 감독은 좋아했는데 B
+    감독이 오니 평가가 달라진다"가 자연스럽게 나온다.
+    [신민용 지적 반영] 균등분포(-1~1)로 뽑으면 극단값이 너무 흔해진다 —
+    정규분포(표준편차 0.28)로 뽑아 대부분(약 68%) -0.28~+0.28 근처의
+    평범한 취향이 나오고, ±0.7 이상의 뚜렷한 개성은 드물게만(약 2%)
+    나오도록 한다. [-1,1] clamp는 표준편차 대비 충분히 넓어 clamp에
+    걸리는 경우가 거의 없다(정규분포 특성상 자연스럽게 유계)."""
+    def _roll():
+        return round(max(-1.0, min(1.0, random.gauss(0, 0.28))), 3)
+    return {
+        "mgr_pref_youth": _roll(),
+        "mgr_pref_star": _roll(),
+        "mgr_pref_workrate": _roll(),
+        "mgr_pref_versatility": _roll(),
+        "mgr_pref_biggame": _roll(),
+    }
+
+
+def _manager_preference_adjustment(p) -> int:
+    """[2026-08 신설, 신민용+GPT 1차 구현 ④] 감독 개인 취향 5축을 각각
+    "취향 값 × 선수의 해당 실제 특성"으로 상호작용시켜 작은 보정치(전체
+    합산 후 ±3 clamp)를 만든다.
+    [신민용 지적 핵심] 취향 원값을 그대로 더하면 안 된다 — 예를 들어
+    star_preference=+0.8이라고 매 경기 +0.8을 주는 게 아니라, popularity가
+    실제로 높을 때만 그 취향이 발현돼야 한다(곱셈 구조). popularity 자체가
+    manager_relation과 별개 축이라는 기존 원칙(인기도 시스템 자체는 안
+    건드림)도 그대로 유지한다. 리그 경기(played 분기)에서만 호출한다 —
+    ②③과 동일한 스코프."""
+    from constants import MANAGER_TYPES, PERSONALITY_EFFECTS
+
+    total = 0.0
+
+    # ① youth: MANAGER_TYPES.youth_pref_age(>0=이 나이 이하 선호/유스 중시,
+    # -1=베테랑 선호, 0=중립)를 "기준 나이" 앵커로 재사용해, 실제 나이와의
+    # 거리를 -1~+1로 정규화한 뒤 개인 취향과 곱한다.
+    mt = MANAGER_TYPES.get(p.get("manager_type", "베테랑 신뢰"), {})
+    yp = mt.get("youth_pref_age", 0)
+    ref_age = yp if yp > 0 else (30 if yp == -1 else 26)
+    age = p.get("age", 25)
+    young_score = max(-1.0, min(1.0, (ref_age - age) / 8.0))
+    total += p.get("mgr_pref_youth", 0.0) * young_score
+
+    # ② star: popularity(0~100, 기존 인기도 시스템 값 그대로 재사용 — 여기
+    # 서는 읽기만 하고 안 건드림)를 -1~+1로 정규화해 개인 취향과 곱한다.
+    pop = p.get("popularity", 50) or 50
+    star_score = max(-1.0, min(1.0, (pop - 50) / 50.0))
+    total += p.get("mgr_pref_star", 0.0) * star_score
+
+    # ③ work_rate: 기존 personality의 train_eff(훈련 효율)를 재사용해
+    # -1~+1 근면성 점수로 정규화(성실함/훈련광=+1.0, 게으름=-1.0, 그 외
+    # train_eff 미지정 성격=0 중립).
+    _train_eff = PERSONALITY_EFFECTS.get(p.get("personality", ""), {}).get("train_eff", 1.0)
+    workrate_score = max(-1.0, min(1.0, (_train_eff - 1.0) / 0.20))
+    total += p.get("mgr_pref_workrate", 0.0) * workrate_score
+
+    # ④ versatility: 입단 시점 mismatch_rank(주 포지션에서 얼마나 벗어난
+    # 자리에 배치됐었는지, 0=주 포지션 그대로)를 "실제로 발휘된 유틸리티"
+    # 로 본다 — 주 포지션 그대로면(rank=0) 취향이 있어도 발현되지 않는다.
+    versatility_score = min(1.0, (p.get("mismatch_rank", 0) or 0) / 2.0)
+    total += p.get("mgr_pref_versatility", 0.0) * versatility_score
+
+    # ⑤ big_game: [신민용 지적] "중요 경기에서 잘했느냐"와 "중요 경기를
+    # 중요하게 보는 감독이냐"를 분리한다 — 선호가 0 이하(무관심/부정적)면
+    # 민감도를 0으로 둬서 잘해도 크게 안 챙기고 못해도 크게 실망하지
+    # 않게 한다(max(0, ...)). 기준선은 7.0(이 함수 다른 곳에서도 "잘한
+    # 경기" 기준으로 쓰는 값과 동일) — 중요 경기는 평범한 성적(6점대)도
+    # 살짝 아쉬움으로 잡히는 게 자연스럽다. 컵/챔스/클럽월드컵/슈퍼컵
+    # 매치만 league_name으로 필터링, 표본 2경기 미만이면 건너뛴다(결승
+    # 여부까지는 1차에서 구분하지 않음 — 신민용 확정).
+    try:
+        _big_rows = get_conn().execute(
+            "SELECT rating FROM match_details WHERE rating IS NOT NULL AND "
+            "(league_name LIKE '%컵%' OR league_name LIKE '%챔피언스%' "
+            "OR league_name LIKE '%클럽월드컵%' OR league_name LIKE '%슈퍼컵%') "
+            "ORDER BY id DESC LIMIT 5").fetchall()
+    except Exception:
+        _big_rows = []
+    if len(_big_rows) >= 2:
+        _avg_big = sum(r["rating"] for r in _big_rows) / len(_big_rows)
+        _sensitivity = max(0.0, p.get("mgr_pref_biggame", 0.0))
+        total += max(-2.0, min(2.0, _sensitivity * (_avg_big - 7.0)))
+
+    return int(round(max(-3.0, min(3.0, total))))
+
+
 def _calc_manager_rel(p, rating, result, played, not_played_penalty=1) -> int:
     """[최적화] 감독 관계 신규값 계산만 (update_player 제거 → 호출자가 통합).
 
@@ -5172,15 +5288,28 @@ def _calc_manager_rel(p, rating, result, played, not_played_penalty=1) -> int:
     1.50까지 벌어져 계약조건이 활약보다 과하게 우세해짐 — GPT 지적
     반영). 승/패(±1)는 그대로 둔다 — 이건 선수 개인이 아니라 팀 전체
     결과라 기대치 배율을 곱하면 "비싼 선수가 있는 팀이 이겨도 감독이
-    덜 기뻐한다"는 이상한 결과가 나온다."""
-    from constants import MANAGER_TYPES, OFFER_ROLES
+    덜 기뻐한다"는 이상한 결과가 나온다.
+
+    [2026-08 추가, 신민용+GPT 1차 구현 ①] 구단 목표(club_ambition) 축을
+    exp_mult에 추가로 곱한다 — release 임계치 계산(_check_forced_release
+    쪽)에서만 쓰이던 OFFER_AMBITION.press를 여기서도 재사용한다(신규 상수
+    없음). "우승 도전" 구단이면 같은 활약이어도 감독이 덜 감동하고
+    (exp_mult↑ → 보너스는 나눠서 줄고 페널티는 곱해서 커짐), "강등 회피"
+    구단이면 반대로 조금만 해도 후하게 평가한다. 기존 clamp(0.75~1.35)를
+    그대로 재사용한다 — role_press×salary_press만으로 이미 상한 근처인
+    경우(예: 주전 보장+고평가 연봉)엔 ambition을 곱해도 clamp에 의해
+    사실상 변화가 없고, 여유가 있는 경우에만 추가로 작용해 자연스럽게
+    영향력이 제한된다. 승/패(±1) 보너스는 여기에 관여하지 않으므로
+    지시대로 영향 없음."""
+    from constants import MANAGER_TYPES, OFFER_ROLES, OFFER_AMBITION
     mt = MANAGER_TYPES.get(p.get("manager_type", "베테랑 신뢰"), {})
     gain_m = mt.get("rel_gain_mult", 1.0)
     loss_m = mt.get("rel_loss_mult", 1.0)
 
     role = p.get("contract_role", "주전 경쟁")
     role_press = OFFER_ROLES.get(role, {}).get("press", 1.0)
-    exp_mult = max(0.75, min(1.35, role_press * _salary_press(p)))
+    amb_press = OFFER_AMBITION.get(p.get("club_ambition", "중위권 안정"), {}).get("press", 1.0)
+    exp_mult = max(0.75, min(1.35, role_press * _salary_press(p) * amb_press))
 
     rel = p.get("manager_relation", 50)
     if not played:
@@ -5195,6 +5324,50 @@ def _calc_manager_rel(p, rating, result, played, not_played_penalty=1) -> int:
         elif rating < 5.0:  rel = max(0, rel - round(3 * loss_m * exp_mult))
         if result == "win":    rel = min(100, rel + 1)
         elif result == "loss": rel = max(0, rel - round(1 * loss_m))
+
+        # [2026-08 추가, 신민용+GPT 1차 구현 ②] 최근 폼 — "이번 한 경기"
+        # 스윙과는 별개로, 최근 흐름 자체를 감독이 어떻게 보는지 작게
+        # 반영한다. match_details는 리그/컵/챔스/국대를 모두 이 함수
+        # 호출 이전에 저장된 과거 경기만 담고 있다(현재 경기 row는 호출자
+        # _write_match_log가 이 함수 리턴 이후에 넣음 — 그래서 아래 쿼리는
+        # 자연스럽게 "이번 경기 들어오기 직전까지의 흐름"만 본다). 표본이
+        # 너무 적으면(2경기 이하) 노이즈로 판단해 보정하지 않는다. 폭을
+        # ±1로 못박아 "한 경기 반등/부진으로 관계가 크게 안 흔들리게"라는
+        # 요청을 그대로 지킨다.
+        try:
+            _recent = get_conn().execute(
+                "SELECT rating FROM match_details WHERE rating IS NOT NULL "
+                "ORDER BY id DESC LIMIT 5").fetchall()
+        except Exception:
+            _recent = []
+        if len(_recent) >= 3:
+            _avg_recent = sum(r["rating"] for r in _recent) / len(_recent)
+            if _avg_recent >= 7.0:
+                rel = min(100, rel + 1)
+            elif _avg_recent <= 4.5:
+                rel = max(0, rel - 1)
+
+        # [2026-08 추가, 신민용+GPT 1차 구현 ③] 기대 역할 ↔ 실제 출전 갭.
+        # "주전 보장인데 35%밖에 못 뛰면 악화 / 주전 경쟁에 55%면 정상 /
+        # 로테이션에 55%면 상승 / 유망주 영입에 45%면 크게 상승"이라는
+        # 예시를 그대로 재현하도록 ROLE_EXPECTED_PLAYTIME 임계값을 정했다.
+        # 표본 부족(팀이 3경기 미만 치른 시즌 초반) 시 _actual_playtime_
+        # ratio가 None을 돌려주므로 그 경우엔 보정을 아예 건너뛴다.
+        from constants import ROLE_EXPECTED_PLAYTIME
+        _actual_pct = _actual_playtime_ratio(p)
+        if _actual_pct is not None:
+            _expected_pct = ROLE_EXPECTED_PLAYTIME.get(role, 0.55)
+            _gap = _actual_pct - _expected_pct
+            if _gap >= 0.25:      rel = min(100, rel + 3)
+            elif _gap >= 0.10:    rel = min(100, rel + 1)
+            elif _gap <= -0.25:   rel = max(0, rel - 3)
+            elif _gap <= -0.10:   rel = max(0, rel - 1)
+
+        # [2026-08 추가, 신민용+GPT 1차 구현 ④] 감독 개인 취향(manager_
+        # preferences). 전부 0(기존 세이브/미생성 상태)이면 _manager_
+        # preference_adjustment가 정확히 0을 돌려주므로 기존 관계 계산과
+        # 동일하다 — 하위호환 안전.
+        rel = max(0, min(100, rel + _manager_preference_adjustment(p)))
     return rel
 
 
@@ -10167,7 +10340,11 @@ def _maybe_change_manager(p, year):
 
     from constants import MANAGER_TYPE_LIST, MANAGER_TYPE_WEIGHTS
     new_type = random.choices(MANAGER_TYPE_LIST, weights=MANAGER_TYPE_WEIGHTS)[0]
-    update_player(manager_type=new_type, manager_relation=50)
+    # [2026-08 추가, 신민용+GPT 1차 구현 ④] 감독이 바뀌면 이 선수를 보는
+    # "개인적 취향"도 새 감독 기준으로 다시 뽑는다 — manager_type/
+    # manager_relation과 항상 같이 리셋되는 게 설계 의도.
+    update_player(manager_type=new_type, manager_relation=50,
+                  **_roll_manager_preferences())
     conn = get_conn(); c = conn.cursor()
     row = c.execute("SELECT name FROM teams WHERE id=?", (tid,)).fetchone()
     conn.close()
@@ -10707,9 +10884,8 @@ def enforce_affiliate_children_tier(parent_team_id: int, year: int) -> None:
             # 으로 재귀 전파할 것도 없다(기존의 queue.append 제거).
             picked_ids = _affiliate_callup_from_child(conn, pid, child["id"])
             if picked_ids:
-                print(f"[산하팀 전력조정-PO] {year}년 {child['name']}에서 "
-                      f"{len(picked_ids)}명 콜업 (모팀 플레이오프 결과와 tier 충돌 → "
-                      f"리그·순위는 유지, 산하팀 전력만 조정)")
+                # [2026-08 정리, 신민용 확정] 기능 검증용 콘솔 print 제거
+                # (동작 자체는 그대로 — 콜업 로직/any_change 갱신만 유지).
                 any_change = True
 
     if any_change:
@@ -11618,8 +11794,9 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
                     _tname = _team_info_cache.get(_tid, ("", ""))[0]
                     _picked_ids = _affiliate_callup_from_child(conn, _pid_cur, _tid)
                     if _picked_ids:
-                        print(f"[산하팀 전력조정] {year}년 {_tname}에서 {len(_picked_ids)}명 "
-                              f"콜업 (모팀과 tier 충돌 → 리그·순위는 유지, 산하팀 전력만 조정)")
+                        # [2026-08 정리, 신민용 확정] 기능 검증용 콘솔 print 제거
+                        # (아래 _audit()의 tier_audit.jsonl 기록은 그대로 유지 —
+                        # 콘솔 출력만 없앤다).
                         _audit({**_audit_base, "correction_action": "CALLUP",
                                 "skip_reason": "CORRECTED", "result_tier": _cur_tier,
                                 "callup_player_count": len(_picked_ids)})
@@ -12394,6 +12571,14 @@ def generate_offers(count=5, force=False) -> list:
     _agent_continent = p.get("agent_continent", "") or ""
     _AGENT_CONTINENT_BONUS = 2.0
 
+    # [2026-08 신설, 밸런스 조정] 해외 팀 오퍼 마진 페널티 — 자국 마진과
+    # 동일 기준을 쓰면 "K리그 평점 6.4가 유럽 2부 오퍼를 받는다" 처럼
+    # 현실보다 해외 진출이 쉬워진다. 팀 소속국이 내 보유 국적(귀화 등
+    # 복수국적 포함) 중 어디에도 안 속하면 마진에서 이 값을 뺀다.
+    from constants import FOREIGN_OFFER_MARGIN_PENALTY, get_foreign_offer_age_mult
+    _my_nat_names = {p.get(k) for k in ("nationality", "nationality2", "nationality3", "nationality4")
+                      if p.get(k)}
+
     # [2026-08 재설계, 15-3: _form_margin_mult → effective_ovr로 대체]
     # 기존엔 form이 나쁘면 "마진(허용 갭)"만 좁혔는데, 비교 기준인 ovr
     # 자체가 그대로라서 원래 OVR이 높은 선수는 마진이 좁아져도 여전히
@@ -12540,6 +12725,8 @@ def generate_offers(count=5, force=False) -> list:
             margin = min(margin, _unproven_margin_cap)
         if _agent_continent and get_country_continent(team_row["country"]) == _agent_continent:
             margin += _AGENT_CONTINENT_BONUS
+        if team_row["country"] not in _my_nat_names:
+            margin -= FOREIGN_OFFER_MARGIN_PENALTY
         return (team_avg - _effective_ovr) <= margin
 
     first_join = (not has_team and age <= 18)
@@ -12679,12 +12866,47 @@ def generate_offers(count=5, force=False) -> list:
             _f_weights = [_f_weights[i] for i in _idx]
             if sum(_f_weights) <= 0:
                 _f_weights = [1] * len(_f_tiers)
-        _tr = 0
-        while want > 0 and _tr < 80:
-            _tr += 1
-            _grade_filter = random.choice(grades)
+        # [2026-08 재설계, 신민용 지적 — 총 4차에 걸쳐 확정] 처음엔 (등급,
+        # tier)를 완전 무작위로 재추첨하며 want를 채울 때까지 최대 80회
+        # 재시도했다(→ 등급마다 재시도 횟수 제한으로 1차 수정, → tier를
+        # 매 시도 재추첨하지 않고 등급당 1회 고정으로 2차 수정, → 무작위
+        # 표본 대신 전체 모집단을 조회하는 것으로 3차 수정) — 그런데도
+        # 매 단계 어블레이션(페널티 0/2/3/4, LIMIT 20/3, 전체조회)에도
+        # 결과가 거의 그대로였다(60회 전부 2.97~3.00/회). 3차까지 마친
+        # 뒤에야 진짜 원인이 드러났다: 250~400개 팀짜리 등급·tier
+        # 버킷엔 항상 예외적으로 약한 팀이 몇십 개씩 섞여 있어서,
+        # "통과하는 팀이 하나라도 있으면 성사"인 한 마진을 아무리
+        # 조여도(A1 기준 최약체 팀조차 내 수준보다 -7.1 낮은 정도라
+        # -30 가까이 가야) 실패가 안 나온다. 4차 최종 수정: '있다/없다'가
+        # 아니라 '전체 중 얼마나 되는가(pass_fraction)'로 성사를
+        # 확률적으로 정한다 — 통과 비율이 낮으면(예외적으로만 맞음)
+        # 낮은 확률로만, 높으면(전반적으로 맞음) 높은 확률로 성사된다.
+        # 이제야 FOREIGN_OFFER_MARGIN_PENALTY가 통과 비율 자체를 낮춰
+        # 실제 성사 확률에 직접 영향을 준다. tier 선택 가중치
+        # (_f_weights, OVR 기반)는 그대로 유지.
+        _grade_order = list(grades)
+        random.shuffle(_grade_order)
+
+        for _grade_filter in _grade_order:
+            if want <= 0:
+                break
             tier = 3 if force_max_tier else random.choices(_f_tiers, _f_weights)[0]
             _excl = [cid for cid in exclude_country_ids if cid]
+            # [2026-08 재설계 3차, 신민용 지적] 2차 수정(등급당 tier 1회
+            # 고정)도 결과가 거의 그대로였다(60회 전부 2.97~3.00/회) —
+            # LIMIT을 20→3으로 낮춰 재실측해도 마찬가지였다. 계산해보면
+            # 원인이 명확하다: 개별 팀 통과율이 16~20%만 되어도 "무작위
+            # 표본 N개 중 하나라도 통과하면 성사" 방식에서는 시도 횟수 ×
+            # 표본 크기(예: 3회×LIMIT3=9번 추첨)만으로 성사 확률이
+            # 80~87%까지 뛴다 — 표본 크기를 줄이는 정도로는 이 구조를
+            # 못 이긴다. 진짜 필요한 건 "무작위 표본 중 하나 걸리면
+            # 통과"가 아니라 "그 등급·tier에 실제로 맞는 팀이 있는가"를
+            # 정확히 묻는 것. _team_avg_cache_offers(전체 팀 평균 OVR)가
+            # 이미 계산돼 있으므로, 무작위 LIMIT 표본을 버리고 해당
+            # (등급,tier)의 팀 전체를 가져와 마진 통과 여부를 정확히
+            # 판정한다 — 전체를 다 보고도 통과하는 팀이 하나도 없으면
+            # 그 등급은 진짜로 실패(모집단 전체가 기준이므로 재시도해도
+            # 결과가 똑같아 attempts 재시도 루프 자체가 불필요해졌다).
             if _excl:
                 placeholders = ",".join("?" * len(_excl))
                 c.execute(f"""SELECT t.id,t.name,l.id as lid,l.name as lname,l.tier,
@@ -12692,23 +12914,43 @@ def generate_offers(count=5, force=False) -> list:
                              FROM teams t
                              JOIN leagues l ON t.league_id=l.id
                              JOIN countries cn ON l.country_id=cn.id
-                             WHERE cn.grade=? AND l.tier=? AND cn.id NOT IN ({placeholders})
-                             ORDER BY RANDOM() LIMIT 20""", tuple([_grade_filter, tier] + _excl))
+                             WHERE cn.grade=? AND l.tier=? AND cn.id NOT IN ({placeholders})""",
+                          tuple([_grade_filter, tier] + _excl))
             else:
                 c.execute("""SELECT t.id,t.name,l.id as lid,l.name as lname,l.tier,
                                     cn.name as country,cn.flag,cn.grade
                              FROM teams t
                              JOIN leagues l ON t.league_id=l.id
                              JOIN countries cn ON l.country_id=cn.id
-                             WHERE cn.grade=? AND l.tier=?
-                             ORDER BY RANDOM() LIMIT 20""", (_grade_filter, tier))
-            # [상위권 우선 가중치 추첨 2026-07] _fill_country_pool과 동일한
-            #   원리 — 넉넉히 뽑아서 마진 통과분만 남기고, 팀 평균 OVR
-            #   내림차순 순위별 가중치로 추첨한다.
-            cands = [r for r in c.fetchall()
-                     if r["id"] not in exclude_ids and r["id"] != my_tid and _team_fits_me(r)]
+                             WHERE cn.grade=? AND l.tier=?""", (_grade_filter, tier))
+            _all_rows = [r for r in c.fetchall() if r["id"] not in exclude_ids and r["id"] != my_tid]
+            if not _all_rows:
+                continue   # 이 등급·tier엔 후보 팀 자체가 없음(제외 목록 등) — 포기
+            cands = [r for r in _all_rows if _team_fits_me(r)]
             if not cands:
-                continue
+                continue   # 전체를 다 봐도 마진 통과하는 팀이 하나도 없음 — 그 등급 포기
+            # [2026-08 재설계, 신민용 지적: "그래도 3부는 이례적으로 약한
+            # 팀이 항상 몇 개는 있다"] 모집단 전체를 봐도 통과하는 팀이
+            # '있기만 하면' 무조건 오퍼가 성사되는 것도 비현실적이다 —
+            # 250~400개 팀짜리 등급에서 예외적으로 약한 팀 몇십 개가
+            # 항상 섞여 있기 때문에, 마진을 아무리 조여도(심지어 -30
+            # 수준까지 가야) "한 팀도 없음"이 나오질 않는다(실측: A1
+            # 기준 최약체 팀도 내 수준보다 겨우 -7.1 낮음). 통과하는
+            # 팀이 '있다/없다'가 아니라 '전체 중 얼마나 되는가'로 성사
+            # 여부를 확률적으로 정한다 — 통과 비율이 낮은(예외적으로만
+            # 맞는 팀이 있는) 등급·tier는 그만큼 낮은 확률로만 오퍼가
+            # 성사되고, 통과 비율이 높은(전반적으로 내 수준과 맞는)
+            # 등급·tier는 높은 확률로 성사된다. 이러면 이제 FOREIGN_
+            # OFFER_MARGIN_PENALTY가 통과 비율 자체를 낮춰 실제 성사
+            # 확률에 직접 영향을 준다.
+            pass_fraction = len(cands) / len(_all_rows)
+            # [2026-08 신설, 신민용 지적] 나이 보정 — 이미 effective_ovr/
+            # 출전량/평점/인기/지역 보정이 시장성을 결정하므로 나이는
+            # pass_fraction에 약하게 곱하는 정도로만 얹는다(선수 한 명에게
+            # 동일한 값이라 _w가 아니라 여기가 실제 효과를 내는 지점).
+            pass_fraction = min(1.0, pass_fraction * get_foreign_offer_age_mult(age, p.get("talent_tier")))
+            if random.random() >= pass_fraction:
+                continue   # 맞는 팀은 있지만 그 등급·tier 안에서 비중이 작아 이번엔 불발
             cands.sort(key=lambda r: _team_avg_cache_offers.get(r["id"], 0), reverse=True)
             # [2026-08 신설, 15-7-1, 신민용+GPT 검토: "패시브 해외 오퍼가
             # 국가 등급만 보고 완전 무작위로 나라를 골라서, 같은 대륙끼리
@@ -15036,12 +15278,16 @@ def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None
         _field_pos = p.get("position", "CM") if p else "CM"
         _mismatch_rank = 0
 
+    # [2026-08 추가, 신민용+GPT 1차 구현 ④] 새로 입단할 때도 새 감독에
+    # 대한 개인 취향을 같이 뽑는다 — manager_type이 새로 정해지는 시점과
+    # 항상 짝을 이뤄야 하는 값.
     update_player(current_team_id=team_id, current_league_id=row["lid"],
                   salary=salary, manager_relation=rel_init,
                   contract_years=c_yrs, contract_end_year=c_end,
                   current_tier=row["tier"],
                   contract_role=role, club_ambition=ambition,
                   manager_type=mgr_type,
+                  **_roll_manager_preferences(),
                   appearance_bonus_k=app_bonus, goal_bonus_k=goal_bonus,
                   transfer_requested=0,
                   field_pos=_field_pos, mismatch_rank=_mismatch_rank,
@@ -15106,6 +15352,20 @@ def negotiate_renewal() -> dict:
         return {"ok": False, "success": False, "msg": "소속팀이 없습니다.",
                 "old_salary": 0, "new_salary": 0, "manager_relation": 0}
 
+    st = get_state()
+    cur_year = st["current_year"] if st else p.get("current_year", GAME_START_YEAR)
+    cur_season = st["current_season"] if st else p.get("current_season", 1)
+
+    # [2026-08 신설, 밸런스 조정] 시즌당 1회 제한 — 성공하면 바로 다시
+    # 협상 가능해서 연속 시도로 OVR별 연봉 캡까지 빠르게 접근하는 문제가
+    # 있었다(몬테카를로 실측: 6연속 시도 시 1.00x→1.38~1.43x). 성공/실패
+    # 무관하게 협상을 "시도"한 시점에 이번 시즌 기록을 남겨 막는다.
+    if p.get("renewal_negotiated_season", 0) == cur_season:
+        return {"ok": False, "success": False,
+                "msg": "이번 시즌에는 이미 재계약 협상을 진행했습니다. 다음 시즌에 다시 시도해주세요.",
+                "old_salary": p.get("salary", 0), "new_salary": p.get("salary", 0),
+                "manager_relation": p.get("manager_relation", 50)}
+
     rc = p.get("season_rating_cnt", 0); rs = p.get("season_rating_sum", 0.0)
     avg_rating = round(rs / rc, 2) if rc > 0 else 6.5
     rel = p.get("manager_relation", 50)
@@ -15117,8 +15377,6 @@ def negotiate_renewal() -> dict:
     prob = max(0.05, min(0.95, prob))
 
     old_salary = p.get("salary", 0)
-    st = get_state()
-    cur_year = st["current_year"] if st else p.get("current_year", GAME_START_YEAR)
 
     if random.random() < prob:
         lo, hi = cfg["raise_success"]
@@ -15136,7 +15394,7 @@ def negotiate_renewal() -> dict:
         new_end = max(p.get("contract_end_year", cur_year), cur_year) + cfg["extend_years"]
         new_rel = min(100, rel + 5)
         update_player(salary=new_salary, contract_end_year=new_end,
-                      manager_relation=new_rel)
+                      manager_relation=new_rel, renewal_negotiated_season=cur_season)
         # [2026-07 버그수정, 신민용 리포트: "2002~2006년 김천 상무에서
         # 재계약해서 계속 뛴 건데 커리어/은퇴 요약 어디에도 '재계약'이
         # 안 뜬다"] 자연 계약만료 시 팀이 제안하는 재계약(mark_contract_
@@ -15155,7 +15413,7 @@ def negotiate_renewal() -> dict:
                 "manager_relation": new_rel}
     else:
         new_rel = max(0, rel + cfg["raise_fail_rel"])
-        update_player(manager_relation=new_rel)
+        update_player(manager_relation=new_rel, renewal_negotiated_season=cur_season)
         add_log(f"🚫 재계약 협상 결렬. 구단이 인상안을 거절했다. (관계 {new_rel})", "event")
         return {"ok": True, "success": False,
                 "msg": "구단이 인상안을 거절했습니다. 감독 관계가 소폭 하락했습니다.",

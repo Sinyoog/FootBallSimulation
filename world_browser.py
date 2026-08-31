@@ -341,7 +341,7 @@ def _annotate_career_span(rows):
         ph = ",".join("?" * len(ids))
         for row in conn.execute(
                 f"SELECT player_id, MIN(year) AS min_y, MAX(year) AS max_y, COUNT(*) AS cnt "
-                f"FROM ai_player_ovr_history WHERE player_id IN ({ph}) GROUP BY player_id",
+                f"FROM hist.ai_player_ovr_history WHERE player_id IN ({ph}) GROUP BY player_id",
                 ids).fetchall():
             spans[row["player_id"]] = (row["min_y"], row["max_y"], row["cnt"])
         conn.close()
@@ -384,10 +384,17 @@ def _team_ever_player_ids(conn, team_ids):
     if not team_ids:
         return set()
     ph = ",".join("?" * len(team_ids))
+    # [2026-08 버그수정] 오래된 이적은 ai_transfer_log_archive로 옮겨가
+    # 있으므로(database._prune_ai_transfer_log), 이 필터도 원본 테이블만
+    # 보면 "5시즌 넘게 이 팀 소속이 없었던" 선수를 놓친다 — 두 테이블을
+    # 함께 조회한다.
     rows = conn.execute(
         f"SELECT DISTINCT player_id FROM ai_transfer_log "
+        f"WHERE from_team_id IN ({ph}) OR to_team_id IN ({ph}) "
+        f"UNION "
+        f"SELECT DISTINCT player_id FROM ai_transfer_log_archive "
         f"WHERE from_team_id IN ({ph}) OR to_team_id IN ({ph})",
-        team_ids + team_ids).fetchall()
+        team_ids + team_ids + team_ids + team_ids).fetchall()
     return {r["player_id"] for r in rows}
 
 
@@ -481,11 +488,11 @@ def search_retired_ai_players(name_query=None, continent=None, nat_country_id=No
         # 행 수(=몇 년치 시즌을 뛰었는지, _annotate_career_span과 동일
         # 기준)를 상관 서브쿼리로 세어 그 범위로 거른다.
         if min_career_years is not None:
-            q += (" AND (SELECT COUNT(*) FROM ai_player_ovr_history h "
+            q += (" AND (SELECT COUNT(*) FROM hist.ai_player_ovr_history h "
                   "WHERE h.player_id = r.id) >= ?")
             params.append(min_career_years)
         if max_career_years is not None:
-            q += (" AND (SELECT COUNT(*) FROM ai_player_ovr_history h "
+            q += (" AND (SELECT COUNT(*) FROM hist.ai_player_ovr_history h "
                   "WHERE h.player_id = r.id) <= ?")
             params.append(max_career_years)
         if custom_named_only:
@@ -745,11 +752,11 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
     # ovr_history에 이 선수 id로 쌓인 행 수 = 뛴 시즌 수)으로 현역 선수도
     # 거른다.
     if min_career_years is not None:
-        q += (" AND (SELECT COUNT(*) FROM ai_player_ovr_history h "
+        q += (" AND (SELECT COUNT(*) FROM hist.ai_player_ovr_history h "
               "WHERE h.player_id = p.id) >= ?")
         params.append(min_career_years)
     if max_career_years is not None:
-        q += (" AND (SELECT COUNT(*) FROM ai_player_ovr_history h "
+        q += (" AND (SELECT COUNT(*) FROM hist.ai_player_ovr_history h "
               "WHERE h.player_id = p.id) <= ?")
         params.append(max_career_years)
     if grade_country_ids is not None:
@@ -980,9 +987,20 @@ def get_ai_player_team_timeline(player_id, current_team_id):
              "team_id": int, "team_name": str}, ...] 연도 오름차순.
     start_year=None은 "그 이전 전체", end_year=None은 "그 이후 전체"."""
     conn = get_conn()
+    # [2026-08 버그수정, 신민용 리포트: "은퇴 선수 기록에서 모든 연도가
+    # 은퇴 전 마지막 팀 하나로 도배된다"] ai_transfer_log는 database.
+    # _prune_ai_transfer_log가 5시즌보다 오래된 행을 ai_transfer_log_
+    # archive(같은 컬럼의 슬림 버전)로 옮겨두므로, 두 테이블을 UNION ALL로
+    # 합쳐야 오래된 이적까지 포함한 전체 커리어가 재구성된다 — 한쪽만
+    # 보면 최근 5시즌 안에 이적하지 않은 선수(사실상 은퇴자 전원)는
+    # "이적을 한 번도 안 한 선수"로 오판된다.
     rows = conn.execute(
         "SELECT year, from_team_id, to_team_id, player_position, is_mid_season FROM ai_transfer_log "
-        "WHERE player_id=? ORDER BY year ASC, is_mid_season DESC", (player_id,)).fetchall()
+        "WHERE player_id=? "
+        "UNION ALL "
+        "SELECT year, from_team_id, to_team_id, player_position, is_mid_season FROM ai_transfer_log_archive "
+        "WHERE player_id=? "
+        "ORDER BY year ASC, is_mid_season DESC", (player_id, player_id)).fetchall()
     if not rows:
         name_row = conn.execute("SELECT name FROM teams WHERE id=?", (current_team_id,)).fetchone()
         conn.close()
@@ -1087,10 +1105,29 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
     # 에만 예전처럼 birth_year+16으로 근사한다.
     conn_h = get_conn()
     _hist_row = conn_h.execute(
-        "SELECT MIN(year) AS y FROM ai_player_ovr_history WHERE player_id=?",
+        "SELECT MIN(year) AS y FROM hist.ai_player_ovr_history WHERE player_id=?",
         (player_id,)).fetchone()
-    conn_h.close()
     _earliest_known_year = _hist_row["y"] if _hist_row and _hist_row["y"] is not None else None
+
+    # [2026-08 신설, 신민용 리포트: "선수 검색에서 방금 생긴 신인이
+    # 생년+16세로 역산한 가짜 과거 커리어(그 팀의 실제 역대 성적이
+    # 그대로 붙어버림)를 보여준다"] ovr_history는 시즌전환(오프시즌)
+    # 스냅샷 때만 쌓이므로, 이번 시즌에 막 생성된 완전 신인은 위
+    # _earliest_known_year가 항상 None이다 — 그러면 무조건 아래 나이
+    # 역산 폴백을 타서, "실제로 생성된 연도"보다 훨씬 이른 과거까지
+    # 그 팀의 실제 역대 성적이 잘못 붙어버렸다(나이만으론 "이번 시즌에
+    # 막 생긴 신인"과 "구세이브라 스냅샷이 없을 뿐인 베테랑"을 구분할
+    # 수 없기 때문). ai_players.created_year(선수 생성 시점을 직접
+    # 기록, ai_lifecycle의 3개 신인생성 지점+초기 월드시드가 채움 —
+    # 0이면 이 필드 신설 이전 구세이브 선수라는 뜻)를 나이 역산과
+    # 별개로 조회해, ovr_history가 없을 때 이 값을 우선 하한으로 쓴다.
+    _cy_row = conn_h.execute(
+        "SELECT created_year FROM ai_players WHERE id=?", (player_id,)).fetchone()
+    if not _cy_row or not _cy_row["created_year"]:
+        _cy_row = conn_h.execute(
+            "SELECT created_year FROM ai_players_retired WHERE id=?", (player_id,)).fetchone()
+    _created_year = _cy_row["created_year"] if _cy_row and _cy_row["created_year"] else None
+    conn_h.close()
 
     # [2026-08 버그수정, 신민용 스크린샷 리포트: "22세인데 2000년 기록에
     # 7세/8세/9세로 뛴다"] birth_year(출생년도) 자체로만 잘라내면 "음수
@@ -1103,6 +1140,9 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
     if _earliest_known_year is not None:
         earliest_debut_year = (max(earliest_debut_year, _earliest_known_year)
                                 if earliest_debut_year is not None else _earliest_known_year)
+    elif _created_year is not None:
+        earliest_debut_year = (max(earliest_debut_year, _created_year)
+                                if earliest_debut_year is not None else _created_year)
 
     ceiling = (retirement_year + 1) if retirement_year else ((get_current_game_year() or 9999) + 1)
 
@@ -1162,10 +1202,16 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
     # 챔스/슈퍼컵/클럽월드컵은 "반기" 개념이 없으므로 그 줄에서는 전부
     # 빈 값("-")으로 둔다(리그 성적만 상반기 기준으로 정확히 보여준다).
     conn = get_conn()
+    # [2026-08 버그수정] 위 get_ai_player_team_timeline과 같은 이유로
+    # ai_transfer_log_archive도 함께 조회해야 오래전 상반기 이적까지
+    # 정확히 반영된다.
     mid_rows = conn.execute(
         "SELECT year, from_team_id, player_position, player_role FROM ai_transfer_log "
+        "WHERE player_id=? AND is_mid_season=1 "
+        "UNION ALL "
+        "SELECT year, from_team_id, player_position, player_role FROM ai_transfer_log_archive "
         "WHERE player_id=? AND is_mid_season=1",
-        (player_id,)).fetchall()
+        (player_id, player_id)).fetchall()
     mid_by_year = {r["year"]: (r["from_team_id"], r["player_position"], r["player_role"])
                    for r in mid_rows}
     if mid_by_year:
@@ -1245,7 +1291,7 @@ def get_ai_player_ovr_checkpoints(player_id):
     경우처럼 기록이 아예 없는 선수는 빈 dict."""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT year, ovr FROM ai_player_ovr_history WHERE player_id=? "
+        "SELECT year, ovr FROM hist.ai_player_ovr_history WHERE player_id=? "
         "ORDER BY year ASC", (player_id,)).fetchall()
     conn.close()
     return {r["year"]: r["ovr"] for r in rows}
@@ -1261,7 +1307,7 @@ def get_ai_player_position_checkpoints(player_id):
     포지션으로 대체 표시해야 한다."""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT year, position FROM ai_player_position_history WHERE player_id=? "
+        "SELECT year, position FROM hist.ai_player_position_history WHERE player_id=? "
         "ORDER BY year ASC", (player_id,)).fetchall()
     conn.close()
     return {r["year"]: r["position"] for r in rows if r["position"]}
@@ -1278,7 +1324,7 @@ def get_ai_player_role_checkpoints(player_id):
     없으므로(빈 dict) 호출부가 "-"로 대체 표시해야 한다."""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT year, role FROM ai_player_position_history WHERE player_id=? "
+        "SELECT year, role FROM hist.ai_player_position_history WHERE player_id=? "
         "ORDER BY year ASC", (player_id,)).fetchall()
     conn.close()
     return {r["year"]: r["role"] for r in rows if r["role"]}
@@ -1544,6 +1590,37 @@ def list_teams_in_league(league_id):
         (league_id,)).fetchall()]
     conn.close()
     return rows
+
+
+def find_team_by_name(name_query):
+    """[2026-08 신설, 신민용 요청: "선수 검색 '팀' 옆에 직접입력 칸을
+    만들어서, 거기 팀명을 입력하면 앞의 국가(소속리그)/리그가 그 팀이
+    지금 있는 곳에 맞춰 자동으로 채워지게"] 팀명 하나로 그 팀이 지금
+    (=이 세이브가 진행 중인 현재 시점, list_teams_in_league와 동일 기준
+    — teams.league_id는 승강 처리 때 즉시 갱신되므로 별도 연도 처리
+    불필요) 속한 국가/리그/팀 id를 한 번에 찾아 돌려준다.
+
+    직접입력 칸이라 타이핑마다(디바운스가 있어도) 호출될 수 있어,
+    search_teams()처럼 최대 500행을 끌어와 파이썬에서 다루는 대신 —
+    "정확히 일치 > 접두 일치 > 그 외" 순으로 SQL에서 바로 정렬해 1행만
+    가져오는 전용 경량 쿼리를 쓴다(팀 수가 많아도 부담이 거의 없다).
+    일치하는 팀이 없으면 None."""
+    if not name_query:
+        return None
+    conn = get_conn()
+    like = f"%{name_query}%"
+    row = conn.execute(
+        "SELECT t.id as team_id, t.name as team_name, "
+        "l.id as league_id, l.name as league_name, l.tier, "
+        "cn.id as country_id, cn.name as country_name "
+        "FROM teams t JOIN leagues l ON t.league_id=l.id "
+        "JOIN countries cn ON l.country_id=cn.id "
+        "WHERE t.name LIKE ? "
+        "ORDER BY (t.name = ?) DESC, (t.name LIKE ?) DESC, t.name "
+        "LIMIT 1",
+        (like, name_query, f"{name_query}%")).fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 
 # 국가 등급 고정 순서(강함→약함). DB에 실제 존재하는 값만 걸러서 쓴다.
@@ -3330,6 +3407,90 @@ def get_country_intl_match_log(tournament_id, country_name):
     return {"group_standings": group_standings, "stages": stages}
 
 
+def get_country_tournament_squad(tournament_id, country_name):
+    """[2026-08 신설, 신민용 요청: "국가 검색에서 대회를 클릭하면 그 대회
+    당시 이 나라 주전들과 후보들이 떠야 한다"] intl_squad에 이미 저장돼
+    있는 이 대회의 26인 풀(intl_engine._pick_intl_starters/database.
+    get_or_create_intl_squad가 채워둔 것)을 읽기 전용으로 반환한다 —
+    database.get_or_create_intl_squad와 달리 풀이 없으면 새로 뽑지
+    않고 그냥 빈 결과를 돌려준다(단순 조회 화면에서 실제 스쿼드를
+    새로 만들어버리면 안 되므로).
+
+    [한계] starter 플래그(이번 로테이션 버그수정으로 신설)가 채워지는
+    건 그 수정 이후에 처음 소집되는 대회부터다 — 그 이전에 이미 끝난
+    대회는 모든 선수의 starter가 0이라 주전/후보를 가를 수 없다. 그런
+    경우엔 출전 횟수(appearances) 내림차순 상위 11명을 주전으로 간주해
+    표시한다(완전히 정확하진 않지만 실제로 많이 뛴 선수가 주전이었을
+    확률이 가장 높다)."""
+    from constants import ai_player_code
+    from database import get_ai_player_custom_names
+    from intl_engine import _INTL_MATCHDAY_STARTER_POS
+
+    conn = get_conn(); c = conn.cursor()
+    rows = c.execute(
+        "SELECT player_id, appearances, starter FROM intl_squad "
+        "WHERE tournament_id=? AND country=?",
+        (tournament_id, country_name)).fetchall()
+    if not rows:
+        conn.close()
+        return {"starters": [], "bench": [], "approx": False}
+
+    ids = [r["player_id"] for r in rows]
+    appear_by_id = {r["player_id"]: r["appearances"] for r in rows}
+    starter_by_id = {r["player_id"]: r["starter"] for r in rows}
+    placeholders = ",".join("?" * len(ids))
+    prows = c.execute(
+        f"""SELECT ap.id, ap.name, ap.position, ap.ovr, ap.age,
+                   t.name AS club, t.current_tier AS club_tier, cn.name AS club_country
+            FROM ai_players ap JOIN teams t ON ap.team_id=t.id
+            JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
+            WHERE ap.id IN ({placeholders})""", ids).fetchall()
+    squad = [dict(r) for r in prows]
+
+    # [2026-08 버그수정, 신민용 리포트: "스쿼드 기록 복사를 했을 때 은퇴
+    # 선수가 있으면 은퇴 선수도 똑같이 기록 복사를 하는거잖아"] 위 조회는
+    # ai_players(현역)만 INNER JOIN한다 — 은퇴 시 ai_players 행 자체가
+    # 삭제되는 기존 설계상, 대회 당시엔 뛰었지만 지금 시점엔 이미 은퇴한
+    # 선수는 이 JOIN에서 통째로 빠진다. 그러면 화면(주전/후보 목록)에서도
+    # 안 보이고, "주전/스쿼드 기록 복사" 버튼에 넘어가는 id 목록에도 애초에
+    # 없어 복사가 안 됐다. get_team_season_lineup이 은퇴 선수를 이미
+    # ai_players_retired에서 폴백 조회하는 것과 같은 패턴으로, ai_players
+    # 조회에서 빠진 나머지 id만 여기서 마저 채운다.
+    _found_ids = {r["id"] for r in squad}
+    missing_ids = [i for i in ids if i not in _found_ids]
+    if missing_ids:
+        placeholders2 = ",".join("?" * len(missing_ids))
+        rrows = c.execute(
+            f"""SELECT id, name, position, ovr, age, last_team_name AS club
+                FROM ai_players_retired WHERE id IN ({placeholders2})""", missing_ids).fetchall()
+        for r in rrows:
+            d = dict(r)
+            d["club_tier"] = None
+            d["club_country"] = None
+            squad.append(d)
+    conn.close()
+
+    custom_names = get_ai_player_custom_names(ids)
+    for r in squad:
+        r["appearances"] = appear_by_id.get(r["id"], 0)
+        r["starter"] = bool(starter_by_id.get(r["id"], 0))
+        r["display_name"] = custom_names.get(r["id"]) or ai_player_code(r["id"])
+
+    approx = not any(r["starter"] for r in squad)
+    if approx:
+        squad.sort(key=lambda r: -(r["appearances"] or 0))
+        starters, bench = squad[:11], squad[11:]
+    else:
+        starters = [r for r in squad if r["starter"]]
+        bench = [r for r in squad if not r["starter"]]
+
+    _pos_order = {pos: i for i, pos in enumerate(dict.fromkeys(_INTL_MATCHDAY_STARTER_POS))}
+    starters.sort(key=lambda r: (_pos_order.get(r["position"], 99), -(r["ovr"] or 0)))
+    bench.sort(key=lambda r: -(r["appearances"] or 0))
+
+    return {"starters": starters, "bench": bench, "approx": approx}
+
+
 def get_wc_qualifier_summary(wc_year):
     """이 월드컵(연도)의 대륙별 예선 통과국 목록 (qual_results 기반 요약).
     [주의] 조별리그 단위 상세가 아니라 '최종 통과국 명단'까지만 제공한다.
@@ -3999,3 +4160,90 @@ def get_team_history(team_id: int):
         if e["sc"] and "[우승]" in e["sc"]:
             awards["sc_champions"] += 1
     return {"awards": awards, "years": out}
+
+
+def get_team_season_lineup(team_id: int, year: int):
+    """[2026-08 신설, 신민용 요청: "팀 검색에서 연도를 클릭하면 그 해
+    이 팀의 포메이션(이름만, OVR은 필요없음)이 떠야 한다"]
+    ai_lifecycle._snapshot_season_positions가 매 시즌 전환마다 팀별로
+    저장해둔 hist.team_season_lineup(슬롯별 player_id, 실제 포메이션
+    화면과 같은 로직으로 계산됨)을 읽어, 화면에 바로 뿌릴 수 있게
+    이름까지 붙여서 반환한다.
+
+    [한계] 이 기능이 신설된 시점 이후에 처음 맞는 시즌 전환부터 쌓인다
+    — 그 이전 과거 시즌(예: 2000~2003년처럼 이미 지나간 시즌)은 그 해
+    이 팀 로스터가 누구였는지 자체를 지금 있는 어떤 데이터로도 재구성할
+    방법이 없어 기록이 없다(ai_player_position_history와 동일한 한계).
+    그런 연도는 starters가 빈 리스트로 온다 — 호출부가 "기록 없음"으로
+    처리한다."""
+    from constants import ai_player_code
+    from database import get_ai_player_custom_names
+
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT formation, slots_json, bench_json FROM hist.team_season_lineup "
+        "WHERE team_id=? AND year=?", (team_id, year)).fetchone()
+    if not row:
+        conn.close()
+        return {"formation": "", "starters": [], "bench": []}
+
+    import json
+    slots = json.loads(row["slots_json"] or "[]")
+    # [2026-08 신설, 신민용 리포트: "팀도 주전 후보가 있는데 왜 안떠?"]
+    # ai_lifecycle._snapshot_season_positions가 이제 bench_json도 같이
+    # 저장해둔다 — 기존 세이브라 이 컬럼이 비어있는(과거 스냅샷) 행은
+    # '[]'로 남아 bench가 그냥 빈 리스트로 온다(starters와 동일한 한계).
+    bench_slots = json.loads(row["bench_json"] or "[]")
+    ids = [s["id"] for s in slots if s.get("id") is not None]
+    ids += [b["id"] for b in bench_slots if b.get("id") is not None]
+    # [버그수정, 신민용 리포트: "선수 이름이 내가 지은 것도 아닌데 왜
+    # 저렇게(실제 축구선수 이름처럼) 뜨냐 — AI06H7 이런 코드로 떠야
+    # 한다"] ai_players.name(내부용 원본 이름)을 커스텀 이름 다음
+    # 폴백으로 잘못 썼다 — 이 게임의 확립된 규칙(formation_widget.py/
+    # world_browser_window._show_player_detail 등 전체 화면 공통)은
+    # "커스텀 이름 → 없으면 AI 코드"이고 ai_players.name은 애초에 화면에
+    # 노출하지 않는다. 여기서는 그 컬럼을 "이 id가 실제로 존재하는지"
+    # 확인하는 용도로만 쓰고(은퇴 등으로 사라진 선수는 표시에서 제외),
+    # 표시 이름 자체엔 절대 쓰지 않는다.
+    known_ids = set()
+    if ids:
+        placeholders = ",".join("?" * len(ids))
+        # 은퇴한 선수도 있을 수 있으므로 ai_players 먼저, 없으면
+        # ai_players_retired에서 존재 확인(get_ai_player_career_history 등
+        # 다른 곳과 동일한 관례) — 이름 값 자체는 안 쓴다.
+        for r in conn.execute(
+                f"SELECT id FROM ai_players WHERE id IN ({placeholders})", ids).fetchall():
+            known_ids.add(r["id"])
+        _missing = [i for i in ids if i not in known_ids]
+        if _missing:
+            placeholders2 = ",".join("?" * len(_missing))
+            for r in conn.execute(
+                    f"SELECT id FROM ai_players_retired WHERE id IN ({placeholders2})",
+                    _missing).fetchall():
+                known_ids.add(r["id"])
+    conn.close()
+
+    custom_names = get_ai_player_custom_names(ids) if ids else {}
+    starters = []
+    for s in slots:
+        pid = s.get("id")
+        if pid is None:
+            starters.append({"slot": s.get("slot", ""), "id": None, "display_name": "(공석)"})
+            continue
+        if pid not in known_ids:
+            # 스냅샷 당시엔 있었지만 지금은 어디에도(현역/은퇴 아카이브)
+            # 남아있지 않은 극단적 예외 — 조용히 "선수 없음"으로 표시.
+            starters.append({"slot": s.get("slot", ""), "id": None, "display_name": "(선수 없음)"})
+            continue
+        display_name = custom_names.get(pid) or ai_player_code(pid)
+        starters.append({"slot": s.get("slot", ""), "id": pid, "display_name": display_name})
+
+    bench = []
+    for b in bench_slots:
+        pid = b.get("id")
+        if pid is None or pid not in known_ids:
+            continue
+        display_name = custom_names.get(pid) or ai_player_code(pid)
+        bench.append({"position": b.get("position", ""), "id": pid, "display_name": display_name})
+
+    return {"formation": row["formation"] or "", "starters": starters, "bench": bench}

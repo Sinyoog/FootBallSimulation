@@ -24,11 +24,22 @@ ui/formation_widget.py와 ai_lifecycle.py 둘 다 여기서 import해서 쓴다
 from constants import POSITION_COMPAT
 
 
+# [2026-08 최적화] 아래 _pos_category는 시즌 전환 한 번에 350만 회 넘게
+# 호출된다(이적 판매후보 포지션그룹 집계 + 포메이션 슬롯 배정). 원래는
+# 호출마다 문자열을 튜플 3개와 차례로 대조했는데, 값 자체는 포지션
+# 문자열만의 순수 함수라 그냥 표로 만들어두면 조회 한 번으로 끝난다.
+# 표에 없는 포지션이 전부 "ATK"로 떨어지는 것도 예전 동작 그대로다.
+_POS_CATEGORY = {"GK": "GK"}
+for _p in ("CB", "LB", "RB", "LWB", "RWB", "SW"):
+    _POS_CATEGORY[_p] = "DEF"
+for _p in ("CDM", "CM", "CAM", "LM", "RM", "DM", "AM"):
+    _POS_CATEGORY[_p] = "MID"
+del _p
+_POS_CATEGORY_GET = _POS_CATEGORY.get   # 뜨거운 루프에서 속성 조회까지 줄이려고 미리 바인딩
+
+
 def _pos_category(pos):
-    if pos == "GK": return "GK"
-    if pos in ("CB", "LB", "RB", "LWB", "RWB", "SW"): return "DEF"
-    if pos in ("CDM", "CM", "CAM", "LM", "RM", "DM", "AM"): return "MID"
-    return "ATK"
+    return _POS_CATEGORY_GET(pos, "ATK")
 
 
 def _best_slot_for_player(primary_pos, slots):
@@ -102,10 +113,15 @@ def _greedy_fill_slots(candidates, slots_only):
                     best_rank = r; best_i = i
         return best_i
 
+    # [2026-08 최적화] 슬롯들의 카테고리는 이 호출 내내 변하지 않는데,
+    # 예전엔 후보 한 명을 볼 때마다 슬롯 전부를 다시 분류했다(후보×슬롯
+    # 만큼 반복). 한 번만 만들어 두고 재사용한다 — 결과는 동일.
+    _slot_cats = [_POS_CATEGORY_GET(sp, "ATK") for sp in slots_only]
+
     def _find_category_slot(pl):
-        cat = _pos_category(pl.get("position", "CM"))
-        for i, sp in enumerate(slots_only):
-            if slot_filled[i] is None and _pos_category(sp) == cat:
+        cat = _POS_CATEGORY_GET(pl.get("position", "CM"), "ATK")
+        for i, sc in enumerate(_slot_cats):
+            if slot_filled[i] is None and sc == cat:
                 return i
         return None
 

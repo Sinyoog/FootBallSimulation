@@ -310,6 +310,7 @@ class MainWindow(QMainWindow):
             nat_html = self._nationality_html(p)
             if nat_html:
                 txt += f"  |  {nat_html}"
+            txt += f"  |  {p['name']}"
             if p.get("current_team_id"):
                 from database import get_conn
                 conn = get_conn()
@@ -317,7 +318,8 @@ class MainWindow(QMainWindow):
                                    (p["current_team_id"],)).fetchone()
                 conn.close()
                 if row: txt += f"  |  {row['name']}"
-            txt += f"  |  {p['name']} {p['age']}세"
+            txt += f"  |  총재산 {fmt_money(p.get('total_assets', 0))}"
+            txt += f"  |  팀연봉 {fmt_money(p.get('salary', 0))}"
         else:
             txt = f"{year}  |  S{season} W{week}  |  [{phase}]"
             txt += f"  |  {p['name']} {p['age']}"

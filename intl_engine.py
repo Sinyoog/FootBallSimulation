@@ -147,7 +147,32 @@ def _get_generation_coef(name, year):
     저장해두고, 8~12년 주기로만 새 목표치를 뽑은 뒤 그 목표를 향해
     매년 조금씩(NAT_GENERATION_STEP) 다가간다 — 같은 해에 여러 번
     불려도 같은 값을 반환하고(연도 단위 일관성), 연도가 바뀌면 딱
-    그만큼만 진행시킨다."""
+    그만큼만 진행시킨다.
+
+    [2026-08 성능수정, 신민용 리포트: "27→28주(예선 생성 트리거)에 텀이
+    있다"] 이 함수는 _nat_team_ovr을 통해 월드컵/대륙컵/지역컵 예선
+    시드 계산(전세계 200여 개국을 한 번에 순회하는 4곳 — intl_engine.py의
+    _nat_team_ovr 호출부 전부 fast=True로 이 루프용)에서 나라마다 한 번씩
+    불린다 — 즉 예선이 열리는 해엔 이 함수 하나가 한 트리거당 최대
+    200번 호출된다. 그런데 호출마다 conn.commit()을 개별적으로 실행하고
+    있었다 — SQLite의 commit은 (인메모리 DB라 fsync는 없어도) 저널/WAL
+    갱신 오버헤드가 매번 붙는 연산이라, 이 게임의 다른 대량 처리
+    지점(OVR 아카이브 등)은 전부 "다 계산한 뒤 executemany + commit 딱
+    1번"으로 되어 있는데 이 함수만 그 패턴을 안 따르고 있었다.
+
+    이 커넥션(get_conn())은 앱 생명주기 내내 살아있는 단일 인메모리
+    커넥션이라, 여기서 commit()을 안 해도 같은 커넥션 안에서는 방금 쓴
+    값이 그대로 다음 조회에 보인다(SQLite는 자기 자신의 미커밋 쓰기는
+    항상 볼 수 있음) — 그래서 이 함수를 부르는 루프 안에서 나라를
+    바꿔가며 반복 호출해도 아무 문제가 없다. 실제로 디스크/스냅샷에
+    반영되려면 다른 커넥션(flush_to_disk의 스냅샷 커넥션 등)이 봐야
+    하는데, 이 함수는 항상 게임 진행 중(_advance_week의 일일 루프 안)
+    에서만 불리고, 그 루프는 매일 current_day를 갱신하며 반드시 한 번
+    더 commit()을 한다(game_engine._advance_week) — 그 커밋이 이 함수가
+    미뤄둔 쓰기까지 같은 트랜잭션으로 함께 반영해준다. 그 사이(같은 날
+    안)에 정확히 크래시가 나면 이번 세대 계수 갱신 1건만 유실되는데,
+    이건 국가대표 OVR 생성용 절차적 노이즈일 뿐이라 잃어도 다음 호출에
+    다시 자연스럽게 계산된다 — 실제 게임 데이터 손실이 아니다."""
     if not name or not year:
         return 1.0
     from constants import NAT_GENERATION_STEP, NAT_GENERATION_RANGE, NAT_GENERATION_CYCLE_YEARS
@@ -162,15 +187,12 @@ def _get_generation_coef(name, year):
         coef = round(random.uniform(*NAT_GENERATION_RANGE), 4)
         c.execute("""INSERT INTO nat_generation(country, coef, target, cycle_start_year, cycle_len, last_year)
                      VALUES(?,?,?,?,?,?)""", (name, coef, target, year, cycle_len, year))
-        conn.commit()
-        conn.close()
         return coef
 
     coef, target = row["coef"], row["target"]
     cycle_start, cycle_len = row["cycle_start_year"], row["cycle_len"]
     last_year = row["last_year"]
     if year <= last_year:
-        conn.close()
         return coef   # 같은 해(또는 과거) 재조회 — 이미 저장된 값 그대로
 
     y = last_year
@@ -183,8 +205,6 @@ def _get_generation_coef(name, year):
         coef = round(coef + (target - coef) * NAT_GENERATION_STEP, 4)
     c.execute("""UPDATE nat_generation SET coef=?, target=?, cycle_start_year=?, cycle_len=?, last_year=?
                  WHERE country=?""", (coef, target, cycle_start, cycle_len, y, name))
-    conn.commit()
-    conn.close()
     return coef
 
 
@@ -2870,41 +2890,75 @@ _INTL_MATCHDAY_STARTER_POS = ["GK", "CB", "CB", "LB", "RB", "CM", "CM", "CAM", "
 _INTL_MATCHDAY_BENCH_POS = ["GK", "GK", "CB", "CB", "LB", "RB",
                             "CDM", "CM", "CAM", "CM", "ST", "ST", "ST", "ST", "ST"]
 _INTL_MATCHDAY_FULL_POS = _INTL_MATCHDAY_STARTER_POS + _INTL_MATCHDAY_BENCH_POS
-# 로테이션 강도 — 이미 이 대회에서 뛴 횟수 1회당 이만큼 선발 점수를 깎는다.
-# 국대 선발 기준(_fill의 ovr - age차*0.3)과 같은 척도라, 예를 들어 OVR이
-# 3 정도 차이나는 두 후보는 3회 이상 출전 격차가 나야 역전된다 — "실력
-# 격차가 크면 여전히 실력이 이긴다"는 원칙은 유지하면서, 실력이 비슷한
-# 후보끼리는 그동안 덜 뛴 쪽이 우선권을 가져 로테이션이 자연히 생긴다.
-_INTL_ROTATION_PENALTY = 1.0
+# [2026-08 버그수정, 신민용 리포트: "월드컵 출전기록이 이상하게 흩어진다
+# — 주전 골키퍼도 3연속 못 뛰고 2/3·1/3·0/3으로 나뉜다"] 예전엔 여기서
+# "이미 뛴 횟수 1회당 선발 점수 -1.0" 로테이션 페널티를 매 경기 다시
+# 매겨 포지션별 선발을 처음부터 다시 경쟁시켰다. 그런데 이 AI 26인
+# 풀에는(내 선수와 달리) 부상·출전정지 같은 결장 사유가 애초에 없어서,
+# 그 페널티가 사실상 "OVR이 비슷한 후보를 강제로 돌아가며 세우는" 역할만
+# 했다 — 같은 포지션 후보끼리 OVR이 2~3점만 차이나도(백업 골키퍼가
+# 흔히 그렇다) 한두 경기 만에 순위가 뒤집혔다. 실제 대표팀은 그렇게
+# 매 경기 주전을 바꾸지 않는다(특히 골키퍼는 부상 아니면 대회 내내
+# 거의 고정). 그래서 지금은 대회에서 처음 소집되는 시점에 포지션별
+# 최적 11명을 딱 한 번 뽑아 고정하고(database.set_intl_squad_starters),
+# 이후 이 대회의 모든 경기는 그 표시를 그대로 따른다 — 출전횟수는
+# 계속 집계하되(화면 표시용) 다음 선발에 더 이상 영향을 주지 않는다.
 
 
 def _pick_intl_starters(tournament_id, country, avg_ovr):
     """이번 경기에 실제로 뛰는 11명을 이 대회 동안 고정된 26인 풀
-    (database.get_or_create_intl_squad)에서 골라낸다 — 예선/본선을
-    통틀어 대회 내내 같은 풀을 쓰므로, 다른 경기에서 이미 여러 번 뛴
-    선수는 이번엔 살짝 밀릴 수 있다(로테이션). 국대 선발 기준과 동일한
-    'OVR 주 기준(27세 근접 소폭 가중)' 철학에 출전 횟수 페널티만 얹는다.
-    풀이 8명 미만(극단적으로 부실한 팀)이면 빈 리스트를 반환 —
-    호출부는 이 경우 그냥 출전 카운트를 건너뛴다(경기 결과 자체는
-    이 함수와 무관하게 이미 팀 평균 OVR로 결정돼 있어 영향 없음)."""
-    from database import get_or_create_intl_squad
+    (database.get_or_create_intl_squad)에서 골라낸다. 대회에서 이 나라가
+    처음 소집되는 시점에 포지션별 최적(OVR 주 기준, 27세 근접 소폭 가중)
+    11명을 딱 한 번 뽑아 database.set_intl_squad_starters로 영구
+    고정하고, 그 다음부터는 이번 경기든 다음 경기든 항상 그 11명을
+    그대로 반환한다(매 경기 다시 경쟁시키지 않음 — 실제 대표팀처럼
+    대회 내내 같은 주전 유지). 풀이 8명 미만(극단적으로 부실한 팀)이면
+    빈 리스트를 반환 — 호출부는 이 경우 그냥 출전 카운트를 건너뛴다
+    (경기 결과 자체는 이 함수와 무관하게 이미 팀 평균 OVR로 결정돼
+    있어 영향 없음)."""
+    from database import get_or_create_intl_squad, set_intl_squad_starters
+    from formation_logic import _greedy_fill_slots
     pool = get_or_create_intl_squad(tournament_id, country, avg_ovr, _INTL_MATCHDAY_FULL_POS)
     if len(pool) < 8:
         return []
 
-    def _score(r):
-        return (r["ovr"] - abs(r.get("age", 27) - 27) * 0.3
-                - r.get("appearances", 0) * _INTL_ROTATION_PENALTY)
+    # [2026-08 버그수정, 신민용 리포트: "국제대회 왜 주전이 8명 이렇게
+    # 떠? 11로 잘 뜨는 곳도 있고 8~10 이렇게 뜨는 경우도 있다"] 이
+    # starter=1 표시는 대회에서 처음 소집될 때 "한 번만" 계산해서 영구
+    # 고정해두는 값이다 — 그런데 아래 패치(POSITION_COMPAT 기반
+    # _greedy_fill_slots 도입) 이전에 이미 계산·저장된 세이브는, 그때
+    # 쓰던 예전 알고리즘(정확 포지션 일치만) 결과가 그대로 DB에 박제돼
+    # 있다. 그래서 "already가 있으면 무조건 그대로 반환"만 하면, 코드는
+    # 고쳐졌어도 이미 저장된 예전 세이브의 불완전한(8~10명) 주전 명단은
+    # 절대 다시 계산되지 않는다. 풀에 11명 이상 있는데 이미 표시된
+    # 주전이 11명보다 적으면 — 그건 정상적으로는 나올 수 없는 상태(이제
+    # 알고리즘이 항상 11명을 다 채우므로)이므로 예전 버그의 잔재로 보고
+    # 한 번만 다시 계산해 덮어쓴다. 11명이 이미 맞게 채워져 있으면(또는
+    # 풀 자체가 11명 미만인 극단적으로 부실한 팀이면) 그대로 반환해
+    # "대회 내내 같은 주전 유지" 원칙을 지킨다.
+    already = [r for r in pool if r.get("starter")]
+    target_n = min(11, len(pool))
+    if len(already) >= target_n:
+        return already
 
-    remaining = list(pool)
-    starters = []
-    for pos in _INTL_MATCHDAY_STARTER_POS:
-        cands = [r for r in remaining if r["position"] == pos]
-        if not cands:
-            continue
-        best = max(cands, key=_score)
-        starters.append(best)
-        remaining.remove(best)
+    def _score(r):
+        return r["ovr"] - abs(r.get("age", 27) - 27) * 0.3
+
+    # [2026-08 버그수정, 신민용 리포트: "국제대회 왜 주전이 9~10명 이렇게
+    # 떠?"] 예전엔 슬롯 포지션 문자열과 정확히 같은 포지션의 후보가 풀에
+    # 없으면(예: 26인 풀에 CAM이 한 명도 없음) 그 슬롯을 그냥 건너뛰어서
+    # 11명을 못 채웠다. 클럽팀 포메이션 배정에 쓰는 것과 동일한
+    # formation_logic._greedy_fill_slots(POSITION_COMPAT 기반 호환 슬롯 →
+    # 카테고리 매치 → 마지막 수단 순으로 3단계 배정)로 교체해, 풀에 11명
+    # 이상 있으면 항상 11자리를 전부 채운다. 원래 나이 보정 점수(_score)를
+    # 유지하기 위해 임시로 ovr 필드만 그 점수로 덮어쓴 사본을 넘기고(원본
+    # pool dict는 건드리지 않음), 배정 결과는 id로 원본 행을 다시 찾아
+    # 반환한다.
+    scored_pool = [dict(r, ovr=_score(r)) for r in pool]
+    id_to_row = {r["id"]: r for r in pool}
+    placed = _greedy_fill_slots(scored_pool, _INTL_MATCHDAY_STARTER_POS)
+    starters = [id_to_row[p["id"]] for p in placed if p is not None]
+    set_intl_squad_starters(tournament_id, country, [r["id"] for r in starters])
     return starters
 
 

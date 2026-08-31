@@ -38,6 +38,29 @@ else:
 
 DB_PATH = os.path.join(_APP_DIR, "game.db")
 
+
+def _history_db_path():
+    """[2026-08 신설, DB 분리] ai_player_ovr_history/ai_player_position_history
+    (선수 전원 × 매 시즌, 세이브에서 가장 큰 두 표 — 실측 22년 세이브
+    기준 237MB)를 game.db의 'main' 스키마가 아니라 이 경로의 별도 파일에
+    'hist'로 ATTACH해서 보관한다. 목적: (1) load_from_disk()/flush_to_disk()
+    가 Connection.backup()으로 'main' 스키마만 복사하므로(기본 동작,
+    ATTACH된 스키마는 안 건드림 — 직접 재현해 확인함), 이 두 표를 main에서
+    빼면 그만큼 매 시즌전환 자동저장(flush_to_disk_async)이 가벼워진다
+    (실측: 같은 세이브로 pages=1000 청크 backup 재현 시 2.70s → 0.54s).
+    (2) 게임 진행에 필요 없는(선수 검색 화면에서만 조회하는) 데이터가
+    매번 인메모리 라이브 DB에 통째로 올라갈 이유가 없어진다.
+
+    고정 상수로 안 두고 함수로 만든 이유: extended_ab_test.py/headless_
+    runner.py/qa_custom_run.py/rng_probe.py/run_ab_test.py/wb_audit_run.py
+    가 실행 중에 database.DB_PATH를 서로 다른 테스트용 세이브 경로로
+    바꿔치기한다(QA 병렬 실행) — DB_PATH 기준 고정 경로로 안 만들면 이
+    스크립트들이 전부 같은 history.db 하나를 공유해 테스트끼리 데이터가
+    섞인다. 항상 '그 순간의' DB_PATH를 기준으로 계산해 game.db와 항상
+    짝을 맞춘다."""
+    base, _ext = os.path.splitext(DB_PATH)
+    return base + ".history.db"
+
 # ── [최적화] 인메모리 라이브 DB + 디스크 백업 ──────────────────────
 # 실측 결과, 게임 진행 중(주간 tick·시즌종료 등)의 SQLite 비용 대부분이
 # "매 commit마다 디스크에 fsync"하는 데서 나왔다(디스크 대비 인메모리가
@@ -257,6 +280,21 @@ def _new_raw_conn():
     conn.execute("PRAGMA cache_size=-65536")   # 약 64MB 페이지 캐시
     conn.execute("PRAGMA temp_store=MEMORY")   # 정렬/임시 테이블을 메모리에서 처리
     conn.execute("PRAGMA mmap_size=536870912") # 512MB mmap I/O
+    # [2026-08 신설, DB 분리] 선수 이력 2표(ai_player_ovr_history/
+    # ai_player_position_history)가 사는 별도 파일을 이 연결에 'hist'로
+    # 붙인다 — _history_db_path() 참고. ATTACH는 커넥션 단위라, 이
+    # 함수가 만드는 라이브 커넥션(get_conn()의 유일한 실제 커넥션)에서
+    # 딱 한 번만 붙이면 이후 모든 쿼리(get_conn()을 거치는 전부)가
+    # hist.테이블명으로 접근 가능해진다. 파일이 없으면 SQLite가 처음
+    # 쓰기 시점에 알아서 새로 만든다(신규 세이브와 동일하게 동작).
+    # [주의] flush_to_disk()/load_from_disk()가 쓰는 별도의 '스냅샷
+    # 전용' 커넥션(_pool_conn과 절대 안 섞이게 일부러 분리해둔 것)은
+    # Connection.backup()만 호출하고 사용자 쿼리를 절대 안 돌리므로
+    # hist를 붙일 필요가 없다 — 그리고 backup()은 인자를 안 주면
+    # 'main' 스키마만 복사해 hist는 자동으로 제외된다(직접 재현해
+    # 확인함) — 그래서 이 두 표가 이제 자동저장/시작로딩 복사 대상에서
+    # 자연스럽게 빠진다.
+    conn.execute("ATTACH DATABASE ? AS hist", (_history_db_path(),))
     return conn
 
 # [2026-08 신설, 신민용 리포트: "1986년으로 시작하면 국제대회가 하나도 안
@@ -320,7 +358,7 @@ def seed_initial_ovr_history(year):
     rows = conn.execute("SELECT id, ovr FROM ai_players").fetchall()
     if rows:
         conn.executemany(
-            "INSERT OR REPLACE INTO ai_player_ovr_history(player_id, year, ovr) VALUES (?,?,?)",
+            "INSERT OR REPLACE INTO hist.ai_player_ovr_history(player_id, year, ovr) VALUES (?,?,?)",
             [(r["id"], year, r["ovr"]) for r in rows])
         conn.commit()
 
@@ -574,6 +612,43 @@ def init_db():
         ON ai_transfer_log(year)""")
     c.execute("""CREATE INDEX IF NOT EXISTS idx_ai_transfer_log_teams
         ON ai_transfer_log(from_team_id, to_team_id)""")
+    # [2026-08 성능수정, 렉 조사] ai_transfer_log에 player_id 인덱스가
+    # 없어서 world_browser.get_ai_player_team_timeline 등의
+    # "WHERE player_id=?" 조회가 매번 테이블 전체(실측 46만 행)를
+    # SCAN했다(EXPLAIN QUERY PLAN으로 확인) — 선수 검색에서 선수 하나
+    # 클릭할 때마다 이 풀스캔이 발생해 세이브가 오래될수록(행이 계속
+    # 쌓일수록) 점점 느려지는 구조였다. 인덱스 추가로 SEARCH(인덱스 사용)로
+    # 바뀐다.
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_ai_transfer_log_player
+        ON ai_transfer_log(player_id)""")
+
+    # [2026-08 버그수정, 신민용 리포트: "은퇴 선수 기록에서 모든 연도가
+    # 은퇴 전 마지막 팀 하나로 도배된다"] world_browser.get_ai_player_
+    # team_timeline이 선수의 연도별 실제 소속팀을 재구성할 때 이
+    # ai_transfer_log를 근거로 쓰는데, 바로 아래 _prune_ai_transfer_log가
+    # "이 테이블을 SELECT하는 곳이 코드베이스에 단 한 곳도 없다"는(그
+    # 당시엔 사실이었던) 전제로 5시즌보다 오래된 행을 그냥 DELETE해왔다.
+    # 그 전제가 이후 world_browser의 커리어 기록 기능이 생기면서 깨졌고,
+    # 결과적으로 최근 5시즌 안에 이적하지 않은 모든 선수(사실상 은퇴한
+    # 선수 전원 + 오래 눌러앉은 활성 선수)는 로그가 텅 비어 "이적을 한
+    # 번도 안 한 선수"로 오판되어 전체 커리어가 현재/마지막 소속팀 하나로
+    # 잘못 채워졌다. 원본 테이블의 무거운 디버그 전용 컬럼(player_name/
+    # age/ovr, prestige, avg_ovr, transfer_type — 코드베이스 전체에서
+    # SELECT하는 곳이 실제로 없음, ai_lifecycle.py의 INSERT만 존재)은
+    # 굳이 영구 보존할 필요가 없으므로, 그 컬럼들만 뺀 슬림한 테이블에
+    # 옮겨 담아 "화면에 필요한 최소 정보"는 영구 보존하면서 DB 용량
+    # 증가는 억제한다(단순 무한 보존은 신민용이 실측한 "50시즌에 152만
+    # 행" 문제를 다시 불러온다).
+    c.execute("""CREATE TABLE IF NOT EXISTS ai_transfer_log_archive(
+        id INTEGER PRIMARY KEY,
+        season INTEGER, year INTEGER, player_id INTEGER,
+        from_team_id INTEGER, to_team_id INTEGER,
+        player_position TEXT DEFAULT '', player_role TEXT DEFAULT '',
+        is_mid_season INTEGER DEFAULT 0)""")
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_ai_transfer_log_archive_player
+        ON ai_transfer_log_archive(player_id)""")
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_ai_transfer_log_archive_teams
+        ON ai_transfer_log_archive(from_team_id, to_team_id)""")
 
     # [2026-08 신설, 신민용 요청: "선수 검색에서 OVR이 이적 순간에만
     # 찍히던데, 1년 단위로 그 해 OVR이 다 찍혀있어야 한다"] 매 시즌
@@ -589,7 +664,11 @@ def init_db():
     # 저장공간·INSERT OR REPLACE 비용이 둘 다 절반이 된다. 조회/쿼리 문법은
     # 완전히 동일하며(이 표에 rowid를 쓰는 코드는 없음) 결과도 동일하다.
     # 기존 세이브는 아래 _migrate_history_tables()가 같은 형태로 재구축한다.
-    c.execute("""CREATE TABLE IF NOT EXISTS ai_player_ovr_history(
+    # [2026-08 신설, DB 분리] 신규 세이브는 이제 애초에 hist(별도 파일
+    # history.db, _history_db_path() 참고) 스키마에 생성한다 — 기존
+    # 세이브(main에 이미 있던 세이브)는 아래 _migrate_history_db_split()이
+    # main→hist로 1회 이전한다.
+    c.execute("""CREATE TABLE IF NOT EXISTS hist.ai_player_ovr_history(
         player_id INTEGER, year INTEGER, ovr INTEGER,
         PRIMARY KEY(player_id, year)) WITHOUT ROWID""")
 
@@ -605,9 +684,29 @@ def init_db():
     # [2026-08 최적화] 위 ai_player_ovr_history와 같은 이유로 WITHOUT ROWID.
     # 이 표는 전세계 선수 전원 × 매 시즌이라 세이브에서 가장 큰 표가 되기
     # 쉬워서(실측 세이브: 데이터 129MB + 자동 인덱스 106MB) 효과가 가장 크다.
-    c.execute("""CREATE TABLE IF NOT EXISTS ai_player_position_history(
+    c.execute("""CREATE TABLE IF NOT EXISTS hist.ai_player_position_history(
         player_id INTEGER, year INTEGER, position TEXT, role TEXT DEFAULT '',
         PRIMARY KEY(player_id, year)) WITHOUT ROWID""")
+
+    # [2026-08 신설, 신민용 요청: "팀 검색에서 연도를 클릭하면 그 해
+    # 이 팀의 포메이션(주전 11명)이 떠야 한다"] ai_lifecycle.
+    # _snapshot_season_positions가 시즌 전환마다 팀별로 이미 계산하는
+    # 베스트11 슬롯 배정(_greedy_fill_slots, formation_logic.py — 실제
+    # 포메이션 화면과 같은 로직)을, 선수 단위(ai_player_position_history)
+    # 로만 남기고 버리던 것을 팀 단위로도 같이 저장한다. 팀당 1행이라
+    # (선수 단위인 ai_player_position_history보다 행 수가 훨씬 적음)
+    # 추가 저장 비용은 미미하고, 계산 자체는 이미 하고 있던 걸 재사용
+    # 하므로 추가 연산 비용도 없다. slots_json: [{"slot":"GK","id":123},
+    # ...] 형태로 슬롯 순서(formation_logic.FORMATION_SLOTS[formation])를
+    # 그대로 보존 — 같은 포지션 라벨(CB 두 명 등)이 있어도 순서로 구분된다.
+    # [한계] ai_player_position_history와 동일 — 이 기능 신설 이후
+    # 시즌만 정확하고, 그 이전 과거 시즌은 소급 적용이 안 된다(그 해
+    # 이 팀 로스터가 누구였는지 자체를 지금 어떤 데이터로도 재구성할
+    # 방법이 없음 — ai_transfer_log도 이 기능들 신설 이후 이적만 기록).
+    c.execute("""CREATE TABLE IF NOT EXISTS hist.team_season_lineup(
+        team_id INTEGER, year INTEGER, formation TEXT DEFAULT '',
+        slots_json TEXT DEFAULT '[]', bench_json TEXT DEFAULT '[]',
+        PRIMARY KEY(team_id, year)) WITHOUT ROWID""")
 
     # [2026-08 신설, 신민용 리포트: "선수 검색에서 나(my_player)를 보면
     # OVR이 하나도 안 찍혀있다"] ai_player_ovr_history와 완전히 같은
@@ -917,7 +1016,7 @@ def init_db():
     # (유로/AFCON/지역컵 등)에 공통으로 적용된다.
     c.execute("""CREATE TABLE IF NOT EXISTS intl_squad(
         tournament_id INTEGER, country TEXT, player_id INTEGER,
-        appearances INTEGER DEFAULT 0,
+        appearances INTEGER DEFAULT 0, starter INTEGER DEFAULT 0,
         PRIMARY KEY(tournament_id, country, player_id))""")
     c.execute("""CREATE INDEX IF NOT EXISTS idx_intl_squad_lookup
         ON intl_squad(tournament_id, country)""")
@@ -1383,6 +1482,18 @@ def init_db():
         # 한다 — 그래서 대량 백필이 없어도 안전하다.
         "ALTER TABLE ai_players ADD COLUMN contract_end_year INTEGER DEFAULT 0",
         "ALTER TABLE ai_players ADD COLUMN last_transfer_year INTEGER DEFAULT 0",
+        # [버그수정, 신민용 리포트: 선수 검색 상세창에서 "sqlite3.OperationalError:
+        # no such column: created_year"] ai_lifecycle.py의 은퇴대체 INSERT는
+        # 처음부터 ai_players.created_year(선수 생성 연도, world_browser.py가
+        # 커리어 데뷔 연도 추정에 사용)를 같이 써왔는데, 정작 이 컬럼을 만드는
+        # ALTER TABLE 마이그레이션이 빠져 있었다 — 조용히 실패하는 게 아니라
+        # 컬럼 자체가 없어 그 INSERT부터 예외였을 자리라 사실상 죽은 코드였고,
+        # world_browser가 그 컬럼을 SELECT하는 순간에야 드러난 것.
+        "ALTER TABLE ai_players ADD COLUMN created_year INTEGER DEFAULT 0",
+        # 위와 같은 이유 — world_browser.get_ai_player_career_history가
+        # ai_players에 없으면(이미 은퇴) ai_players_retired에서 같은 컬럼을
+        # 폴백 조회하는데, 이 테이블엔 애초에 이 컬럼 자체가 없었다.
+        "ALTER TABLE ai_players_retired ADD COLUMN created_year INTEGER DEFAULT 0",
         # [세부역할 2026-07] AI 선수도 세부역할(SUB_ROLES)을 갖도록 컬럼 추가.
         #  기존엔 이 컬럼 자체가 없어서 sub_role은 내 선수(my_player)에만
         #  있었다 — 세부역할별 매치 가중치(_SUB_ROLE_MATCH_MOD)를 AI 시즌
@@ -1833,6 +1944,46 @@ def init_db():
         # (year 하나로만 찾는 ai_player_position_history.role은 그 해
         # "최종/하반기" 소속팀 스냅샷 하나뿐이라 상반기 팀엔 못 쓴다).
         "ALTER TABLE ai_transfer_log ADD COLUMN player_role TEXT DEFAULT ''",
+        # [2026-08 신설, 신민용+GPT 1차 구현 ④] "감독 개인 취향" —
+        # manager_type(성향 유형)과는 별개로, 같은 유형이어도 감독마다
+        # 이 선수를 보는 시선이 조금씩 달라지게 하는 5개 축. -1.0~+1.0,
+        # 0에 가까울수록 평범한 취향. 선수 개인 성격이 아니라 "현재
+        # 감독의 개인적 선호"이므로 join_team/_maybe_change_manager 등
+        # manager_type을 새로 뽑는 시점마다 이 값도 같이 새로 뽑는다
+        # (game_engine._roll_manager_preferences 참고) — 감독이 바뀌면
+        # 이 선수에 대한 평가 기준 자체가 바뀌는 게 의도된 설계다.
+        "ALTER TABLE my_player ADD COLUMN mgr_pref_youth REAL DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN mgr_pref_star REAL DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN mgr_pref_workrate REAL DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN mgr_pref_versatility REAL DEFAULT 0",
+        "ALTER TABLE my_player ADD COLUMN mgr_pref_biggame REAL DEFAULT 0",
+        # [2026-08 신설, 재계약 협상 밸런스 조정] 협상을 "시도"한(성공/실패
+        # 무관) 시즌 번호를 저장 — negotiate_renewal()이 같은 시즌엔 재시도를
+        # 막는 데 사용(시즌당 1회 제한). 0이면 아직 이번 세이브에서 한 번도
+        # 협상하지 않은 상태(current_season은 1부터 시작하므로 항상 구분됨).
+        "ALTER TABLE my_player ADD COLUMN renewal_negotiated_season INTEGER DEFAULT 0",
+        # [2026-08 버그수정, 신민용 리포트: "2006 월드컵 출전기록이 이상하게
+        # 흩어진다 — 주전 골키퍼도 3연속 못 뛰고 2/3, 1/3, 0/3으로 갈린다"]
+        # 원인: intl_engine._pick_intl_starters가 매 경기 'OVR-출전횟수×1.0'
+        # 점수로 포지션별 선발을 처음부터 다시 뽑고 있었다 — AI 26인 풀은
+        # (내 선수와 달리) 부상/출전정지 개념이 아예 없는데도 이미 뛴
+        # 횟수만으로 페널티를 매겨, 같은 포지션 후보끼리 OVR이 2~3점만
+        # 차이나도(백업 GK가 흔히 그렇다) 한두 경기 만에 순위가 뒤집혔다.
+        # 그 결과 실제 대표팀이면 대회 내내 거의 고정인 주전(특히 GK)이
+        # 게임에선 매 경기 바뀌며 출전 기록이 인위적으로 분산됐다.
+        # 수정: 대회에서 처음 소집되는 시점에 포지션별 최적 11명을 딱
+        # 한 번 뽑아 이 컬럼(starter=1)으로 고정하고, 이후 이 대회의 모든
+        # 경기는 매번 다시 경쟁시키지 않고 이 표시를 그대로 따른다 —
+        # 실제 대표팀처럼 대회 내내 같은 주전이 유지된다.
+        "ALTER TABLE intl_squad ADD COLUMN starter INTEGER DEFAULT 0",
+        # [2026-08 신설, 신민용 리포트: "팀도 주전 후보가 있는데 왜 안떠?"]
+        # team_season_lineup은 원래 그 해 주전 11자리(slots_json)만 저장했다
+        # — ai_lifecycle._snapshot_season_positions가 그 해 로스터 중 포메이션에
+        # 못 들어간 나머지(후보)도 이제 이 컬럼에 함께 저장한다. CREATE TABLE
+        # 쪽엔 이미 bench_json을 넣어뒀지만, 기존 세이브는 테이블이 이미 만들어져
+        # 있어 CREATE TABLE IF NOT EXISTS가 컬럼을 추가해주지 않으므로 별도
+        # 마이그레이션이 필요하다.
+        "ALTER TABLE hist.team_season_lineup ADD COLUMN bench_json TEXT DEFAULT '[]'",
     ]:
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,
@@ -2103,6 +2254,7 @@ def init_db():
     repair_stray_intl_is_my_flags()   # 복수국적 미선택국 is_my 오염 정리 (1회성, 아래 참고)
     repair_cwc_match_groups()   # 클럽월드컵 매치 grp 백필 (1회성, 아래 참고)
     _migrate_history_tables()   # 선수 이력 2표 고아행 정리 + WITHOUT ROWID 재구축 (1회성, 아래 참고)
+    _migrate_history_db_split()   # 선수 이력 2표 main→history.db(hist) 이전 (1회성, 아래 참고)
     _migrate_phantom_career_entries()   # 유령 재직기록(길이0·0경기) 정리 (1회성, 아래 참고)
     compact_existing_match_archive()   # 기존 세이브 match_results_archive 요약+정리 (1회성, 아래 참고)
     # [2026-08 신설] init_db()는 QA/AB테스트 스크립트 등이 DB_PATH를 바꿔가며
@@ -2365,25 +2517,46 @@ def archive_old_seasons(current_season):
 
 # [2026-08 신설, 신민용 리포트: "50년 세이브 실측 — ai_transfer_log가
 # 152만 행까지 쌓였다"] 이 테이블은 AI 이적 시장 처리(ai_lifecycle.py)가
-# 매 시즌 계속 INSERT만 하는 로그성 테이블인데, 전체 코드베이스를 뒤져봐도
-# 이걸 SELECT하는 곳이 단 한 곳도 없다 — UI/월드 기록실 어디에도 노출되지
-# 않는 순수 기록용(디버그/추후 확장 대비)이라, match_results처럼 "역대
-# 조회"를 위해 영구 보존해야 할 이유가 없다. 그렇다고 완전히 안 남기기엔
-# 나중에 이적 시장 밸런스를 디버깅할 때 최근 몇 시즌 흐름은 참고할 수
-# 있어야 하므로, 완전 삭제 대신 "최근 N시즌만" 유지하는 보존 정책으로
-# 접근한다 — match_results/cup 계열과 달리 화면에 노출되는 값이 전혀
-# 없으므로 요약 테이블 없이 오래된 행을 그냥 지워도 안전하다.
+# 매 시즌 계속 INSERT만 하는 로그성 테이블이라 "최근 N시즌만" 유지하는
+# 보존 정책을 도입했었다.
+#
+# [2026-08 버그수정, 신민용 리포트: "은퇴 선수 기록에서 모든 연도가
+# 은퇴 전 마지막 팀 하나로 도배된다"] 위 전제("이걸 SELECT하는 곳이
+# 단 한 곳도 없다")가 이후 world_browser.get_ai_player_team_timeline
+# (선수 검색 "연도별 기록")이 생기면서 깨졌다 — 그 함수는 정확히 이
+# 테이블에서 "그 선수가 실제로 몇 년도에 어느 팀에 있었는지"를
+# 재구성하는데, 옛날 행이 통째로 DELETE되어 사라지면 "이적을 한 번도
+# 안 한 선수"로 오판해 전체 커리어를 현재/마지막 소속팀 하나로 잘못
+# 채워버린다 — 최근 N시즌 안에 이적하지 않은 선수(사실상 은퇴자 전원)가
+# 여기 걸린다. 그렇다고 완전 무제한 보존은 원래 문제(50시즌에 152만 행)를
+# 다시 불러오므로, DELETE 대신 "화면이 실제로 쓰는 컬럼만 남긴 슬림
+# 테이블(ai_transfer_log_archive)로 옮겨 담기"로 바꾼다 — player_name/
+# age/ovr, prestige, avg_ovr, transfer_type(코드베이스 어디서도 SELECT
+# 안 되는 디버그 전용 컬럼, ai_lifecycle.py의 INSERT만 존재)는 버리고,
+# world_browser.py가 실제로 읽는 컬럼(연도/소속팀/포지션/역할/반기여부)
+# 만 영구 보존한다. world_browser.py의 관련 SELECT 3곳(get_ai_player_
+# team_timeline, get_ai_player_career_history의 상반기 조회,
+# _team_ever_player_ids)은 두 테이블을 UNION ALL로 함께 조회하도록
+# 맞춰 고쳤다.
 AI_TRANSFER_LOG_RETENTION_SEASONS = 5
 
 
 def _prune_ai_transfer_log(conn, current_season) -> float:
-    """ai_transfer_log에서 (current_season - 보존시즌수) 이전 행을 삭제.
+    """ai_transfer_log에서 (current_season - 보존시즌수) 이전 행을
+    ai_transfer_log_archive(슬림 컬럼만)로 옮기고 원본에서는 삭제.
     archive_old_seasons와 같은 타이밍(연도전환)에 호출되며, 반환값은
     소요 시간(초) — [PERF] 로그용."""
     _t0 = time.perf_counter()
     c = conn.cursor()
     _cutoff = current_season - AI_TRANSFER_LOG_RETENTION_SEASONS
     if _cutoff > 0:
+        c.execute(
+            """INSERT OR IGNORE INTO ai_transfer_log_archive(
+                id, season, year, player_id, from_team_id, to_team_id,
+                player_position, player_role, is_mid_season)
+               SELECT id, season, year, player_id, from_team_id, to_team_id,
+                      player_position, player_role, is_mid_season
+               FROM ai_transfer_log WHERE season<?""", (_cutoff,))
         c.execute("DELETE FROM ai_transfer_log WHERE season<?", (_cutoff,))
         conn.commit()
     return time.perf_counter() - _t0
@@ -2409,7 +2582,13 @@ def _maybe_periodic_vacuum(conn) -> float:
     """archive_old_seasons()가 매 시즌 전환 시 호출. meta.seasons_since_vacuum
     카운터를 증가시키고, VACUUM_SEASON_INTERVAL에 도달하면 VACUUM을 돌리고
     카운터를 0으로 리셋한다. 반환값은 이번 호출에서 실제로 VACUUM을 도는 데
-    걸린 시간(초) — 안 돌았으면 0.0(archive_old_seasons의 [PERF] 로그용)."""
+    걸린 시간(초) — 안 돌았으면 0.0(archive_old_seasons의 [PERF] 로그용).
+
+    [2026-08 DB 분리] bare VACUUM은 'main'(game.db) 스키마만 정리한다 —
+    ai_player_ovr_history/ai_player_position_history가 이제 hist(별도
+    파일 history.db)에 살고, 여기도 match_results와 똑같이 매 시즌
+    INSERT OR REPLACE가 쌓이는 표라 안 돌보면 같은 단편화 문제가 그대로
+    재현된다. main과 같은 주기로 hist도 같이 정리한다."""
     c = conn.cursor()
     row = c.execute("SELECT value FROM meta WHERE key='seasons_since_vacuum'").fetchone()
     try:
@@ -2423,6 +2602,10 @@ def _maybe_periodic_vacuum(conn) -> float:
         return 0.0
     _tv0 = time.perf_counter()
     conn.execute("VACUUM")
+    try:
+        conn.execute("VACUUM hist")
+    except sqlite3.OperationalError:
+        pass
     _tv1 = time.perf_counter()
     c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('seasons_since_vacuum', '0')")
     conn.commit()
@@ -2656,6 +2839,80 @@ def _migrate_history_tables():
     except sqlite3.OperationalError:
         pass
     print(f"[MIGRATE] 선수 이력 표 재구축 완료 {_t_mig.perf_counter()-_t0:.2f}s")
+
+
+def _migrate_history_db_split():
+    """[2026-08 신설, DB 분리 — "선수 검색 은퇴 선수 기록이 전부 마지막
+    팀으로 도배된다" 버그 조사 중 발견한 렉 원인 후속 조치] 선수 이력
+    2표(ai_player_ovr_history/ai_player_position_history)를 game.db의
+    'main' 스키마에서 별도 파일 history.db('hist'로 ATTACH, _history_
+    db_path() 참고)로 옮긴다. 위 _migrate_history_tables()가 먼저
+    끝나 있어야(고아행 정리 + WITHOUT ROWID 재구축) 이미 깨끗해진
+    데이터만 옮긴다 — init_db()에서 반드시 그 다음 순서로 호출한다.
+
+    meta 플래그로 세이브당 1회만 실행(그 뒤엔 SELECT 1번으로 끝).
+    신규 세이브는 애초에 CREATE TABLE 자체가 hist에 생기므로(위 init_db()
+    본문) main에 같은 이름 표가 없어 이 함수는 조용히 건너뛴다.
+
+    [주의] main(인메모리 :memory:)과 hist(실제 디스크 파일) 사이의
+    다중 DB 트랜잭션은 SQLite 규칙상 크래시 원자성이 보장되지 않는다
+    (main이 ':memory:'면 rollback-journal이어도 원자적이지 않음 —
+    공식 문서 확인함). 이 함수는 세이브당 딱 1번, 짧게 실행되는
+    일회성 이전 작업이라 그 좁은 크래시 창에 걸릴 확률이 극히 낮고,
+    설령 걸려도(main.X는 지워졌는데 hist.X insert가 아직 디스크에
+    안 갔거나 등) 재시작 시 이 함수가 다시 시도할 뿐 데이터가 사라지진
+    않는다(아래 두 단계 모두 재실행해도 안전하게 설계 — INSERT OR
+    IGNORE + '테이블이 아직 main에 있으면'을 조건으로 삼음)."""
+    conn = get_conn(); c = conn.cursor()
+    try:
+        done = c.execute(
+            "SELECT value FROM meta WHERE key='history_db_split_v1'").fetchone()
+    except sqlite3.OperationalError:
+        return
+    if done and done["value"] == "1":
+        return
+
+    import time as _t_mig
+    _t0 = _t_mig.perf_counter()
+    moved_any = False
+    for tbl, cols in (
+            ("ai_player_ovr_history", "player_id, year, ovr"),
+            ("ai_player_position_history", "player_id, year, position, role")):
+        try:
+            # main 스키마(game.db)에 이 표가 아직 남아있는지 확인 — 신규
+            # 세이브는 애초에 hist에서 시작했으므로 여기 안 걸리고 넘어간다.
+            sql_row = c.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (tbl,)).fetchone()
+            if not sql_row:
+                continue
+            n_before = c.execute(f"SELECT COUNT(*) AS n FROM main.{tbl}").fetchone()["n"]
+            c.execute(f"INSERT OR IGNORE INTO hist.{tbl}({cols}) "
+                      f"SELECT {cols} FROM main.{tbl}")
+            n_hist = c.execute(f"SELECT COUNT(*) AS n FROM hist.{tbl}").fetchone()["n"]
+            c.execute(f"DROP TABLE main.{tbl}")
+            moved_any = True
+            print(f"[MIGRATE] {tbl}: game.db → history.db 이전 "
+                  f"{n_before:,}행 (hist 누적 {n_hist:,}행)")
+        except sqlite3.OperationalError as e:
+            # 한쪽 표가 실패해도 게임 실행 자체는 막지 않는다 — 다음 실행에
+            # 재시도(meta 플래그를 아직 안 세웠으므로 자동으로 다시 시도됨).
+            print(f"[MIGRATE] {tbl} history.db 이전 건너뜀(다음 실행에 재시도): {e}")
+            conn.commit()
+            return
+    c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('history_db_split_v1','1')")
+    conn.commit()
+    if moved_any:
+        # main(game.db)에서 표를 통째로 DROP한 직후라 비워진 페이지가 그대로
+        # 파일에 남는다 — VACUUM으로 정리해야 flush_to_disk()가 실제로
+        # 작아진 파일을 저장한다. hist(history.db)도 방금 대량 INSERT를
+        # 받았으니 같이 정리한다(둘 다 각자의 파일이라 스키마별로 따로
+        # VACUUM해야 함 — bare VACUUM은 main만 대상).
+        try:
+            conn.execute("VACUUM")
+            conn.execute("VACUUM hist")
+        except sqlite3.OperationalError:
+            pass
+    print(f"[MIGRATE] history.db 분리 완료 {_t_mig.perf_counter()-_t0:.2f}s")
 
 
 def _migrate_phantom_career_entries():
@@ -3216,7 +3473,12 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
               # [2026-08 신설, 연도별 OVR 아카이브] 위와 같은 이유(id
               # 재사용) — 안 비우면 새 게임의 다른 선수가 이전 판 OVR
               # 이력을 이어받는다.
-              "ai_player_ovr_history",
+              # [2026-08 DB 분리] 이 표는 이제 main이 아니라 hist(별도
+              # 파일 history.db, _history_db_path() 참고)에 산다 — 이
+              # DELETE FROM 목록은 아래에서 그냥 f"DELETE FROM {t}"로
+              # 도는 단순 루프라 스키마 접두어를 명시해야 한다(안 붙이면
+              # SQLite가 main을 먼저 찾는데 이제 main엔 이 표가 없다).
+              "hist.ai_player_ovr_history",
               # [2026-08 버그수정, 최적화 감사 중 발견 — 이 프로젝트에서
               # 반복돼온 "새 테이블을 이 삭제 목록에 추가하는 걸 깜빡함"
               # 패턴의 또 한 건] ai_player_position_history가 바로 위
@@ -3230,7 +3492,9 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
               # 333MB 중 236MB가 이 표 하나였다). 새 게임 시작 시 반드시
               # 같이 비운다. 기존 세이브에 이미 쌓인 유령 행은
               # _migrate_history_tables()가 1회 정리한다.
-              "ai_player_position_history",
+              # [2026-08 DB 분리] 위 ai_player_ovr_history와 같은 이유로
+              # hist. 접두어 필요.
+              "hist.ai_player_position_history",
               # [2026-08 신설] my_player 전용 연도별 OVR 아카이브도 새
               # 게임에서 비워야 한다 — 안 비우면 새로 만든 캐릭터의 선수
               # 검색 화면에 이전 캐릭터의 OVR 이력이 그대로 뜬다.
@@ -3274,6 +3538,14 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
     # 새 게임을 누를 때만 1회 도는 작업이라(인메모리 DB 기준 1초 내외)
     # 실제 플레이 중 버튼 반응성에는 영향이 없다.
     conn.execute("VACUUM")
+    # [2026-08 DB 분리] 위 DELETE 목록의 hist.ai_player_ovr_history/
+    # hist.ai_player_position_history도 방금 대량 삭제됐다 — bare VACUUM은
+    # main만 정리하므로 hist도 따로 정리해야 history.db 파일 크기가
+    # 실제로 줄어든다.
+    try:
+        conn.execute("VACUUM hist")
+    except sqlite3.OperationalError:
+        pass
     conn.close()
 
 # ─── OVR 가중치 ───────────────────────────────────────────────
@@ -4204,11 +4476,12 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
     상위 예선이 없으므로 이 조회 자체를 건너뛴다."""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT player_id, appearances FROM intl_squad WHERE tournament_id=? AND country=?",
+        "SELECT player_id, appearances, starter FROM intl_squad WHERE tournament_id=? AND country=?",
         (tournament_id, country)).fetchall()
     if rows:
         ids = [r["player_id"] for r in rows]
         appear_by_id = {r["player_id"]: r["appearances"] for r in rows}
+        starter_by_id = {r["player_id"]: r["starter"] for r in rows}
         placeholders = ",".join("?" * len(ids))
         _stat_cols = ",".join(f"ap.{s}" for s in ALL_STATS)
         # [안전장치] 대회가 여러 시즌에 걸쳐 안 끝나는 극단적인 경우
@@ -4225,6 +4498,7 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
         result = [dict(r) for r in prows]
         for r in result:
             r["appearances"] = appear_by_id.get(r["id"], 0)
+            r["starter"] = starter_by_id.get(r["id"], 0)
         # [2026-08 신설] 이 대회 명단이 이미 26인으로 고정된 뒤에 내가
         # 발탁될 수도 있다(예선 명단이 먼저 만들어지고, 그 다음에 내가
         # 그 나라를 골라 선발되는 순서). 그러면 "AI 26 + 나 = 27"이 되므로
@@ -4320,7 +4594,43 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
     conn3.close()
     for r in picked:
         r["appearances"] = 0
+        r["starter"] = 0
     return picked
+
+
+def set_intl_squad_starters(tournament_id, country, player_ids):
+    """[2026-08 버그수정, 신민용 리포트: "월드컵 출전기록이 이상하게
+    흩어진다 — 주전 골키퍼도 3연속 못 뛰고 출전이 나뉜다"] 이 대회에서
+    이 나라가 처음 소집됐을 때 딱 한 번 뽑은 주전 11명(player_ids)을
+    intl_squad.starter=1로 영구 표시한다. get_or_create_intl_squad가
+    이후 이 대회의 모든 경기에서 이 표시를 그대로 돌려주므로,
+    intl_engine._pick_intl_starters가 매 경기 출전횟수 페널티로 포지션별
+    선발을 다시 경쟁시키던 기존 동작(실제로는 있지도 않은 AI 26인 풀의
+    "부상"을 흉내 내려다 OVR이 비슷한 후보끼리 한두 경기 만에 순위가
+    뒤집혀 버렸다 — 특히 백업 GK끼리 OVR차가 작아 골키퍼가 제일 심하게
+    영향받았다)이 사라지고, 실제 대표팀처럼 대회 내내 같은 주전이
+    유지된다.
+
+    [2026-08 버그수정, 신민용 리포트: "국제대회 왜 주전이 8명 이렇게
+    떠?"] 예전엔 넘어온 player_ids만 starter=1로 켜고 나머지는 손대지
+    않았다 — intl_engine._pick_intl_starters가 예전 알고리즘으로 이미
+    불완전하게(예: 8명) 저장해둔 세이브를 새 알고리즘으로 다시 계산해
+    이 함수를 또 부르면, 새로 뽑힌 11명은 켜지지만 예전에 잘못 켜져
+    있던 표시는 그대로 남아 결과적으로 11명보다 많은 선수가 starter=1로
+    뒤섞이는 문제가 있었다. 그래서 항상 "이 대회·이 나라의 starter 표시를
+    통째로 지우고 새로 켜는" 방식(완전 교체)으로 바꿔 몇 번을 다시
+    불러도 항상 정확히 player_ids만 starter=1이 되게 한다."""
+    if not player_ids:
+        return
+    conn = get_conn()
+    conn.execute(
+        "UPDATE intl_squad SET starter=0 WHERE tournament_id=? AND country=?",
+        (tournament_id, country))
+    conn.executemany(
+        "UPDATE intl_squad SET starter=1 WHERE tournament_id=? AND country=? AND player_id=?",
+        [(tournament_id, country, pid) for pid in player_ids])
+    conn.commit()
+    conn.close()
 
 
 def bump_intl_squad_appearances(tournament_id, country, player_ids):

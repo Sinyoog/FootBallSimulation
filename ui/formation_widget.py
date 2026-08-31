@@ -19,6 +19,14 @@ from game_engine import is_hard_mode
 # 승강/리스케일 후 OVR 캐시 무효화 플래그 (game_engine._invalidate_team_ovr_cache가 세팅)
 _ovr_cache_invalidated: bool = False
 
+# [2026-08 신설, 최적화] 지금 살아 있는 _TeamPanel들의 약한 참조 집합 —
+# apply_custom_name_live가 예전엔 QApplication.allWidgets()로 앱 안의 모든
+# 위젯(수천 개)을 훑어서 _TeamPanel만 골라냈다. 이름을 여러 명 바꾸면 그
+# 전수 스캔이 매번 반복된다. 패널은 화면당 2개뿐이므로 생성 시 여기 등록해
+# 두고 바로 꺼내 쓴다. 약한 참조라 창이 닫히면 알아서 빠진다.
+import weakref as _weakref
+_LIVE_TEAM_PANELS: "_weakref.WeakSet" = _weakref.WeakSet()
+
 
 # ─────────────────────────────────────────────
 # 상대팀 데이터 조회
@@ -1170,6 +1178,26 @@ class _FormationCanvas(QWidget):
 # 전체 명단 패널 (2026-08 신설)
 # ─────────────────────────────────────────────
 
+def _player_button_label(pl: dict, hard: bool) -> str:
+    """[2026-08 리팩터] 명단 패널 버튼에 찍히는 글자 — _make_player_button과
+    update_player_name(이름만 바뀐 경우)이 공유한다. 내용은 예전
+    _make_player_button 안에 인라인으로 있던 것을 그대로 옮긴 것이라
+    표시 결과는 100% 동일하다.
+
+    [2026-08 버그수정 이력, 신민용 리포트: "주전 명단에 GK가 2명 뜬다"]
+    슬롯 배정이 끝난 선수는 실제로 뛰는 자리(field_pos)를, 슬롯 배정이
+    없는 후보는 등록 포지션을 보여준다.
+    [2026-08 수정 이력, 신민용 리포트: "어려움 난이도인데 OVR 숫자가
+    그대로 뜬다"] 어려움에서는 OVR 대신 포지션/나이/국적을 보여준다."""
+    _pos_label = pl.get("field_pos") or pl.get("position", "")
+    if hard:
+        _age = pl.get("age") or 0
+        _nat = pl.get("nationality") or ""
+        _detail = f"{_pos_label}" + (f", {_age}세" if _age else "") + (f", {_nat}" if _nat else "")
+        return f"{pl.get('name','')[:6]} ({_detail})"
+    return f"{pl.get('name','')[:6]} ({_pos_label} {pl.get('ovr',0)})"
+
+
 class _RosterPanel(QScrollArea):
     """[2026-08 신설, 신민용 요청: "본선 11명 말고 각 팀 전체 선수가
     누구누구인지 떠야하잖아 — 주전은 상자 녹색, 이름 클릭하면 스탯"]
@@ -1199,6 +1227,7 @@ class _RosterPanel(QScrollArea):
         # deleteLater 예약됨).
         self._selected_id = None
         self._btn_by_id: dict = {}
+        self._pl_by_id: dict = {}   # [2026-08 신설] id → 그 버튼이 보여주는 선수 dict
 
     def _make_group_header(self, text: str, count: int) -> QLabel:
         """[2026-08 신설, 신민용 요청: "이름 표시하는 곳을 파란색으로"]
@@ -1213,7 +1242,15 @@ class _RosterPanel(QScrollArea):
             "padding:4px 2px 2px 2px;border-bottom:1px solid #2a2a2a;")
         return lbl
 
-    def _make_player_button(self, pl: dict, is_starter: bool) -> QPushButton:
+    def _make_player_button(self, pl: dict, is_starter: bool, hard=None) -> QPushButton:
+        # [2026-08 최적화] hard(어려움 난이도 여부)는 예전엔 버튼마다
+        # is_hard_mode()를 불렀다 — 그때마다 my_player 테이블을 다시
+        # 조회하므로 명단 한 번 그릴 때 22번(양쪽 패널이면 44번) 왕복했다.
+        # 난이도는 한 게임 안에서 바뀌지 않으므로 set_roster가 한 번만
+        # 구해서 넘겨준다(값이 안 넘어오면 예전처럼 직접 조회 — 다른
+        # 호출부가 생겨도 동작이 달라지지 않게).
+        if hard is None:
+            hard = is_hard_mode()
         is_me = bool(pl.get("is_me"))
         is_injured_me = is_me and bool(pl.get("injured"))
         # [2026-08 수정, 신민용 리포트: "어려움 난이도인데 이름 옆에 OVR
@@ -1233,15 +1270,7 @@ class _RosterPanel(QScrollArea):
         # 실제로 뛰는 포지션(field_pos, load_my_team/load_opp_team이 슬롯
         # 배정 직후 태깅)을 우선 보여주고, 슬롯 배정 자체가 없는 후보
         # 선수만 기존처럼 등록 포지션을 보여준다.
-        _pos_label = pl.get("field_pos") or pl.get("position", "")
-        if is_hard_mode():
-            _age = pl.get("age") or 0
-            _nat = pl.get("nationality") or ""
-            _detail = f"{_pos_label}" + (f", {_age}세" if _age else "") + (f", {_nat}" if _nat else "")
-            label = f"{pl.get('name','')[:6]} ({_detail})"
-        else:
-            label = f"{pl.get('name','')[:6]} ({_pos_label} {pl.get('ovr',0)})"
-        btn = QPushButton(label)
+        btn = QPushButton(_player_button_label(pl, hard))
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         # [2026-08 신설, 신민용 요청: "우측 상자들 크기를 최대한 우측
         # 크기에 맞춰서 키우고 세로 길이도 1.2배 정도"] 가로는 부모
@@ -1279,6 +1308,7 @@ class _RosterPanel(QScrollArea):
         _pid = pl.get("id")
         if _pid is not None:
             self._btn_by_id[_pid] = btn
+            self._pl_by_id[_pid] = pl
         # [2026-08 수정, 신민용 요청: "포메이션에서 좌측(캔버스)뿐 아니라
         # 우측 주전/후보 버튼들 눌러도 (이름/포지션/나이/국적) 떠야 해"]
         # 예전엔 어려움 난이도에서 이 버튼들만 클릭 자체를 막았다(캔버스는
@@ -1306,7 +1336,9 @@ class _RosterPanel(QScrollArea):
         # id→버튼 매핑은 전부 무효 — 선택 상태도 같이 초기화한다(팀을
         # 새로 불러오는 시점엔 팝업도 정리되는 게 자연스럽다).
         self._btn_by_id = {}
+        self._pl_by_id = {}   # [2026-08 신설] 이름만 바뀐 경우 버튼 하나만 다시 그리기 위한 역참조
         self._selected_id = None
+        _hard = is_hard_mode()   # [2026-08 최적화] 버튼마다 DB 재조회하지 않도록 한 번만
         # 기존 버튼/라벨 정리
         while self._grid.count():
             item = self._grid.takeAt(0)
@@ -1336,13 +1368,30 @@ class _RosterPanel(QScrollArea):
         if starters:
             self._grid.addWidget(self._make_group_header("주전", len(starters)), row, 0); row += 1
             for pl in starters:
-                self._grid.addWidget(self._make_player_button(pl, is_starter=True), row, 0)
+                self._grid.addWidget(self._make_player_button(pl, is_starter=True, hard=_hard), row, 0)
                 row += 1
         if bench:
             self._grid.addWidget(self._make_group_header("후보", len(bench)), row, 0); row += 1
             for pl in bench:
-                self._grid.addWidget(self._make_player_button(pl, is_starter=False), row, 0)
+                self._grid.addWidget(self._make_player_button(pl, is_starter=False, hard=_hard), row, 0)
                 row += 1
+
+    def update_player_name(self, player_id) -> bool:
+        """[2026-08 신설, 최적화] 선수 "이름만" 바뀌었을 때(사용자가 AI
+        선수 이름을 지어줬을 때) 그 버튼 하나의 글자만 다시 만든다.
+        예전엔 이름 한 명 바꿀 때마다 set_roster로 명단 22개 버튼을
+        전부 지우고 새로 만들었다 — 이름을 100명 넘게 바꾸면 그 비용이
+        그대로 100번 반복됐다. 선택 하이라이트(_selected_id) 상태도
+        그대로 유지된다(버튼을 안 부수므로)."""
+        btn = self._btn_by_id.get(player_id)
+        pl = self._pl_by_id.get(player_id)
+        if btn is None or pl is None:
+            return False
+        try:
+            btn.setText(_player_button_label(pl, is_hard_mode()))
+        except RuntimeError:
+            return False   # 이미 삭제된 버튼(방어적 처리)
+        return True
 
     def set_selected_id(self, player_id):
         """[2026-08 신설, 신민용 요청: "우측에도 똑같이 내가 킨 선수의
@@ -1393,6 +1442,7 @@ class _TeamPanel(QWidget):
         # 만들어진 뒤에야 서로를 가리킬 수 있어서 여기서 미리 못 넣음).
         self.is_opponent = is_opponent
         self.nav = None
+        _LIVE_TEAM_PANELS.add(self)   # [2026-08 신설] apply_custom_name_live용 등록
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(4)
@@ -1446,25 +1496,28 @@ def apply_custom_name_live(player_id: int, new_name: str):
     클래스 하나를 씀)을 뒤져서 이 선수 id가 보이면 그 자리에서 바로
     이름을 바꾸고 다시 그린다 — DB 재조회 없이 화면만 즉시 갱신되는
     가벼운 패치라, 몇 명이 떠 있든 순식간에 끝난다."""
-    from PyQt6.QtWidgets import QApplication
-    app = QApplication.instance()
-    if app is None:
-        return
-    for w in app.allWidgets():
-        if not isinstance(w, _TeamPanel):
-            continue
-        changed = False
-        for pl in w.canvas.players:
-            if pl.get("id") == player_id:
-                pl["name"] = new_name
-                changed = True
-        for pl in w.canvas._roster:
-            if pl.get("id") == player_id:
-                pl["name"] = new_name
-                changed = True
-        if changed:
-            w.canvas.update()
-            w.refresh_roster()
+    for w in list(_LIVE_TEAM_PANELS):
+        try:
+            changed = False
+            for pl in w.canvas.players:
+                if pl.get("id") == player_id:
+                    pl["name"] = new_name
+                    changed = True
+            for pl in w.canvas._roster:
+                if pl.get("id") == player_id:
+                    pl["name"] = new_name
+                    changed = True
+            if changed:
+                w.canvas.update()
+                # [2026-08 최적화] 예전엔 refresh_roster()로 명단 22개
+                # 버튼을 전부 지우고 새로 만들었다 — 바뀐 건 글자 하나
+                # 뿐인데도. 해당 버튼의 글자만 갈아끼우고, 그 경로가
+                # 어떤 이유로든 실패하면(목록에 없는 선수 등) 예전처럼
+                # 전체 재구성으로 폴백한다.
+                if not w.roster.update_player_name(player_id):
+                    w.refresh_roster()
+        except RuntimeError:
+            _LIVE_TEAM_PANELS.discard(w)   # 이미 닫혀 C++ 객체가 사라진 패널
 
 # ─────────────────────────────────────────────
 # 메인 위젯
@@ -1562,6 +1615,22 @@ class FormationWidget(QWidget):
         self.combo.currentIndexChanged.connect(self._on_opp_select)
         info_row.addWidget(self.combo, 5)
 
+        # [2026-08 신설, 신민용 요청: "포메이션 우측 위에 복사하기 버튼을
+        # 만들건데, 누르면 이 당시 주전/후보 선수 기록들을 위에서부터
+        # 순서대로 한 번에 복사할 수 있어야 한다"] 세계 기록실 선수 검색의
+        # "📋 기록 복사"(_format_player_history_text)와 완전히 같은 포맷을
+        # 선수마다 반복 적용해 이어붙인다 — _on_copy_squad_clicked 참고.
+        self.copy_squad_btn = QPushButton("📋 스쿼드 기록 복사")
+        self.copy_squad_btn.setFixedHeight(26)
+        self.copy_squad_btn.setToolTip(
+            "지금 내 팀 스쿼드(주전→후보 순) 전원의 선수 기록을 세계 기록실과 같은 포맷으로 한 번에 복사합니다")
+        self.copy_squad_btn.setStyleSheet(
+            "QPushButton{background:#2a2a2a;color:#cccccc;border:1px solid #444;"
+            "border-radius:4px;padding:2px 10px;font-size:11px;}"
+            "QPushButton:hover{border:1px solid #888;background:#383838;}")
+        self.copy_squad_btn.clicked.connect(self._on_copy_squad_clicked)
+        info_row.addWidget(self.copy_squad_btn, 0)
+
         # ── 3행: 캔버스(절반 크기) + 전체 명단 패널, 좌우
         # [2026-08 신설, 신민용 요청: "본선 11명 말고 전체 선수 명단도
         # 봐야 하고, 그러려면 포메이션 캔버스 크기를 절반으로 줄여야
@@ -1597,6 +1666,7 @@ class FormationWidget(QWidget):
         self.opp_panel = self._opp_panel
         self._active_popup = None   # 지금 열려 있는 PlayerStatPopup(없으면 None)
         self._active_panel = None   # 그 팝업이 속한 _TeamPanel(하이라이트 정리용)
+        self._world_browser_win = None  # [2026-08 신설] 선수 클릭 시 여는 세계 기록실 창(재사용용)
 
         # 힌트 바
         # [2026-08 신설, 난이도 시스템] 어려움 난이도에선 클릭해도 스탯이
@@ -1873,9 +1943,39 @@ class FormationWidget(QWidget):
             self.combo.addItem(f"{flag}{t['name']}{suffix}")
         self.combo.blockSignals(False)
         self.combo.setCurrentIndex(0)
+        # [2026-08 신설] 위 setCurrentIndex(0)은 clear() 직후라 이미 0번이
+        # 현재 항목인 경우 currentIndexChanged가 안 뜬다 — 그러면 파란
+        # 표시가 안 걸리므로 여기서 직접 한 번 칠해준다.
+        self._mark_current_opp_item()
         self._render_opp(0)
 
+    def _mark_current_opp_item(self):
+        """[2026-08 신설, 신민용 요청: "우측 팀 이름을 눌러 목록이 열렸을
+        때, 지금 내가 켜 놓은 팀이 파란 상자로 보여야 그게 열려 있다는
+        의미가 된다"] 콤보 목록에서 현재 선택된 항목만 파란 배경+파란
+        글자로 칠한다. 색은 명단 패널의 선택 하이라이트(_RosterPanel.
+        set_selected_id)와 같은 톤(#173a5e / #eaf6ff)으로 맞춰서 화면
+        전체가 "지금 보고 있는 것 = 파란색"으로 일관되게 읽히도록 했다.
+
+        마우스를 올린 항목의 초록 하이라이트(selection-background-color)와
+        섞여도 구분이 되도록 글자를 굵게 같이 준다. 목록을 다시 채울
+        때(_fill_combo)와 선택이 바뀔 때마다 호출되며, 이전에 칠해둔
+        항목은 여기서 같이 원상복구한다(setItemData에 빈 QVariant를
+        넣으면 그 역할의 지정이 사라져 기본 스타일로 돌아간다)."""
+        cur = self.combo.currentIndex()
+        for i in range(self.combo.count()):
+            if i == cur:
+                self.combo.setItemData(i, QColor("#173a5e"), Qt.ItemDataRole.BackgroundRole)
+                self.combo.setItemData(i, QColor("#eaf6ff"), Qt.ItemDataRole.ForegroundRole)
+                f = self.combo.font(); f.setBold(True)
+                self.combo.setItemData(i, f, Qt.ItemDataRole.FontRole)
+            else:
+                self.combo.setItemData(i, None, Qt.ItemDataRole.BackgroundRole)
+                self.combo.setItemData(i, None, Qt.ItemDataRole.ForegroundRole)
+                self.combo.setItemData(i, None, Qt.ItemDataRole.FontRole)
+
     def _on_opp_select(self, idx):
+        self._mark_current_opp_item()
         self._render_opp(idx)
 
     def _render_opp(self, idx):
@@ -1895,49 +1995,177 @@ class FormationWidget(QWidget):
         빠뜨려서 팝업이 계속 쌓이는 사고가 나기 쉽다 — 신민용이 먼저
         지적한 "무한으로 창이 열리면 안 된다"는 우려가 정확히 이 지점).
         """
-        if self._active_popup is not None:
+        # [2026-08 변경, 신민용 요청: "포메이션에서 선수를 누르면 스탯
+        # 팝업 대신 세계 축구 기록실에서 그 선수를 눌렀을 때 뜨는 우측
+        # 패널(연도별 기록/국가대표 기록/기록 복사/이름 변경)이 그대로
+        # 떠야 한다"] 실제 ai_players 레코드가 있는 선수(본인 id=-1
+        # 포함, world_browser.MY_PLAYER_ID와 동일 — AI는 id>=0)는 세계
+        # 기록실 창을 그 선수로 바로 연다. 반면 국제대회 등에서 스쿼드가
+        # 8명 미만일 때 채워 넣는 가상 폴백 선수(id<-1, constants.
+        # ai_player_code 문서 참고 — 실제 ai_players 행이 없어 세계
+        # 기록실에 조회할 대상 자체가 없음)는 기존 PlayerStatPopup(신원
+        # 최소 정보만 보여주는 경로)을 그대로 유지한다.
+        pid = pl.get("id")
+        if pid is not None and pid >= -1:
+            panel.canvas.set_selected_id(pid)
+            panel.roster.set_selected_id(pid)
+            if self._active_panel is not None and self._active_panel is not panel:
+                self._active_panel.canvas.clear_selected()
+                self._active_panel.roster.clear_selected()
+            self._active_panel = panel
+            self._open_world_browser_for_player(pid)
+            return
+        # [2026-08 최적화, 신민용 리포트: "포메이션에서 WASD로 움직일 때
+        # 끊긴다"] 예전엔 키를 누를 때마다 팝업을 close()로 부수고 새
+        # PlayerStatPopup을 만들어 show()+activateWindow()까지 했다 —
+        # 창 하나를 통째로 만들고 없애는 건 OS 창 관리자까지 왕복하는
+        # 작업이라, 표시할 내용(선수 15개 스탯)에 비해 압도적으로 비싸고
+        # 연타할수록 눈에 띄게 끊긴다. 이제 이미 떠 있는 팝업이 있으면
+        # 그 창을 그대로 두고 load_player()로 내용만 갈아끼운다 — 화면에
+        # 보이는 결과(같은 자리에 한 개의 팝업, 같은 항목들)는 동일하다.
+        popup = self._active_popup
+        if popup is not None:
             try:
-                self._active_popup.close()
+                popup.isVisible()   # C++ 객체가 이미 지워졌는지 확인용
             except RuntimeError:
-                pass   # 이미 C++ 쪽 객체가 지워졌으면 무시(방어적 처리)
-        if self._active_panel is not None:
-            self._active_panel.canvas.clear_selected()
-            self._active_panel.roster.clear_selected()   # [2026-08 신설] 명단 쪽 하이라이트도 같이 정리
+                popup = None
+                self._active_popup = None
+                self._active_panel = None
 
-        popup = PlayerStatPopup(pl, self, nav=self, panel=panel)
-        popup.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        popup.finished.connect(lambda _r, pn=panel: self._on_popup_closed(pn))
+        # 이전에 하이라이트돼 있던 패널이 이번 대상과 다르면(A/D로 반대편
+        # 팀으로 넘어간 경우) 그쪽 하이라이트를 먼저 정리한다. 같은
+        # 패널이면 set_selected_id가 내부에서 알아서 이전 선택을 지운다.
+        if self._active_panel is not None and self._active_panel is not panel:
+            self._active_panel.canvas.clear_selected()
+            self._active_panel.roster.clear_selected()
+
+        if popup is not None:
+            popup.load_player(pl, panel)
+        else:
+            popup = PlayerStatPopup(pl, self, nav=self, panel=panel)
+            popup.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            # [2026-08 수정] 예전엔 생성 시점의 panel을 람다에 묶어뒀는데,
+            # 이제 팝업 하나가 A/D로 좌우 패널을 오가며 재사용되므로
+            # "닫힐 때의 패널"은 그때그때 _active_panel을 봐야 맞다.
+            popup.finished.connect(self._on_popup_closed)
+            self._active_popup = popup
+
         panel.canvas.set_selected_id(pl.get("id"))
         panel.roster.set_selected_id(pl.get("id"))   # [2026-08 신설] 명단 쪽도 파란 테두리로 표시
-        self._active_popup = popup
         self._active_panel = panel
         # [2026-07 기존 관례] 이 화면의 팝업은 원래 모달(exec)이었다 —
         # WASD로 팝업을 유지한 채 하이라이트/전환을 하려면 이제 비모달
         # (show)이어야 한다. NonModal이라 게임의 나머지 조작(주 진행 등)을
         # 막지 않는다는 점은 기존과 동일.
-        popup.show()
-        popup.raise_()
-        popup.activateWindow()
-        # [2026-08 버그수정, 신민용 리포트: "WASD를 눌러도 아무 반응이
-        # 없다"] show()가 끝나면 Qt가 다이얼로그 안의 첫 포커스 가능한
-        # 자식(위 info_tbl/tbl은 이제 NoFocus라 제외되지만, 혹시 다른
-        # 자식이나 이전 포커스 상태가 남아있는 경우까지 방어) 쪽으로
-        # 포커스를 줄 수 있다 — 여기서 다이얼로그 자신에게 명시적으로
-        # 포커스를 못박아, 키 입력이 확실히 PlayerStatPopup.keyPressEvent로
-        # 오게 한다.
-        popup.setFocus(Qt.FocusReason.OtherFocusReason)
+        if not popup.isVisible():
+            popup.show()
+        # [2026-08 최적화] 이미 이 팝업이 활성 창이면(= WASD 전환처럼
+        # 키 입력이 바로 이 창에서 온 경우) raise/activate를 건너뛴다 —
+        # 창 활성화 요청도 창 관리자 왕복이라 연타 시 끊김의 주범이다.
+        # 캔버스/명단 클릭으로 들어온 경우엔 활성 창이 본체 창이므로
+        # 예전과 똑같이 팝업을 앞으로 올리고 활성화한다.
+        if not popup.isActiveWindow():
+            popup.raise_()
+            popup.activateWindow()
+            # [2026-08 버그수정, 신민용 리포트: "WASD를 눌러도 아무 반응이
+            # 없다"] show()가 끝나면 Qt가 다이얼로그 안의 첫 포커스 가능한
+            # 자식(위 info_tbl/tbl은 이제 NoFocus라 제외되지만, 혹시 다른
+            # 자식이나 이전 포커스 상태가 남아있는 경우까지 방어) 쪽으로
+            # 포커스를 줄 수 있다 — 여기서 다이얼로그 자신에게 명시적으로
+            # 포커스를 못박아, 키 입력이 확실히 PlayerStatPopup.keyPressEvent로
+            # 오게 한다.
+            popup.setFocus(Qt.FocusReason.OtherFocusReason)
 
-    def _on_popup_closed(self, panel: "_TeamPanel"):
-        """팝업이 (WASD 전환이 아니라) 닫기 버튼/ESC/창닫기로 실제로
-        닫혔을 때 하이라이트와 활성 상태를 정리한다. WASD로 전환될 때는
-        open_player_popup()이 close()를 먼저 호출해 이 콜백이 먼저
-        실행되지만, 그 직후 바로 새 활성 팝업/패널을 다시 세팅하므로
-        결과적으로 깜빡임 없이 자연스럽게 이어진다."""
-        if self._active_panel is panel:
-            panel.canvas.clear_selected()
-            panel.roster.clear_selected()   # [2026-08 신설]
-            self._active_popup = None
-            self._active_panel = None
+    def _open_world_browser_for_player(self, player_id):
+        """[2026-08 신설] 세계 기록실 창을 player_id로 바로 연다. 이미
+        이 화면에서 연 창이 떠 있으면(닫지 않고 다른 선수를 또 클릭한
+        경우) 새 창을 또 띄우지 않고 그 창의 내용만 갈아끼운다 —
+        PlayerStatPopup 재사용과 같은 원칙(창을 계속 쌓지 않는다)."""
+        win = self._world_browser_win
+        if win is not None:
+            try:
+                win.isVisible()   # C++ 객체가 이미 지워졌는지 확인용
+            except RuntimeError:
+                win = None
+                self._world_browser_win = None
+        if win is not None:
+            win.open_to_player(player_id)
+            win.raise_()
+            win.activateWindow()
+            return
+        from ui.world_browser_window import WorldBrowserWindow
+        win = WorldBrowserWindow(self, open_player_id=player_id)
+        win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        win.finished.connect(self._on_world_browser_closed)
+        self._world_browser_win = win
+        win.show()
+        win.raise_()
+        win.activateWindow()
+
+    def _on_world_browser_closed(self, *_a):
+        self._world_browser_win = None
+
+    def _on_copy_squad_clicked(self):
+        """[2026-08 신설, 신민용 요청] 지금 내 팀 스쿼드(주전→후보 순,
+        _TeamPanel.get_full_roster_ordered와 동일한 순서)를 순회하며 각
+        선수를 세계 기록실 선수 검색과 똑같은 "[이름 선수 기록]" 포맷
+        (연도별 기록 + 국가대표 기록, 은퇴 선수 포맷 포함)으로 뽑아
+        전부 이어붙여 클립보드에 복사한다.
+
+        새 포맷 코드를 따로 만들지 않고, world_browser_window.
+        WorldBrowserWindow(_show_player_detail이 이미 채워두는
+        _player_copy_*  값 + _format_player_history_text)를 그대로
+        재사용한다 — 화면과 다른 계산을 하면 둘이 어긋날 위험이 있어서,
+        기존 "선수 하나 복사" 버튼과 완전히 같은 경로를 선수 수만큼
+        반복한다. 이 창은 화면에 띄우지 않고(show() 호출 없음) 데이터만
+        뽑아내는 용도로만 잠깐 쓰고 버린다."""
+        roster = self._my_panel.get_full_roster_ordered()
+        ids = [pl.get("id") for pl in roster
+               if pl.get("id") is not None and pl.get("id") >= -1]
+        if not ids:
+            return
+        from ui.world_browser_window import WorldBrowserWindow
+        harvester = WorldBrowserWindow(self)
+        texts = []
+        try:
+            for pid in ids:
+                try:
+                    harvester.open_to_player(pid)
+                except Exception:
+                    continue
+                name = getattr(harvester, "_player_copy_name", None)
+                d = getattr(harvester, "_player_copy_d", None)
+                if not name or not d:
+                    continue
+                team_hist = getattr(harvester, "_player_copy_team_hist", None)
+                rows = getattr(harvester, "_player_copy_rows", [])
+                intl_records = getattr(harvester, "_player_copy_intl_records", [])
+                texts.append(harvester._format_player_history_text(
+                    name, d, team_hist, rows, intl_records))
+        finally:
+            harvester.deleteLater()
+        if not texts:
+            return
+        QGuiApplication.clipboard().setText("\n".join(texts))
+
+        self.copy_squad_btn.setText("✅ 복사됨")
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(1200, lambda: self.copy_squad_btn.setText("📋 스쿼드 기록 복사"))
+
+    def _on_popup_closed(self, *_a):
+        """팝업이 닫기 버튼/ESC/창닫기로 실제로 닫혔을 때 하이라이트와
+        활성 상태를 정리한다. [2026-08 수정] 팝업이 재사용되면서 WASD
+        전환 때는 이제 close()가 아예 호출되지 않으므로, 이 콜백은 진짜
+        "닫힘"에서만 실행된다."""
+        panel = self._active_panel
+        if panel is not None:
+            try:
+                panel.canvas.clear_selected()
+                panel.roster.clear_selected()   # [2026-08 신설]
+            except RuntimeError:
+                pass   # 화면이 통째로 사라진 뒤 닫힘 신호가 온 경우
+        self._active_popup = None
+        self._active_panel = None
 
 
 # ─────────────────────────────────────────────
@@ -2059,7 +2287,61 @@ class PlayerStatPopup(QDialog):
         self.setWindowTitle(f"{pl.get('name','')}  [{pl.get('position','')}]")
         self.setMinimumWidth(260)
         self.setStyleSheet("QDialog{background:#1e1e1e;color:#ccc;}")
-        lay = QVBoxLayout(self)
+        # [2026-08 최적화] 레이아웃/Ctrl+C 단축키는 팝업 하나당 한 번만
+        # 만들고, 실제 내용은 load_player()가 채운다 — W/A/S/D로 다른
+        # 선수로 넘어갈 때 팝업 창 자체를 매번 부수고 새로 만들면(창
+        # 생성·표시·활성화가 OS 창 관리자까지 왕복하는 무거운 작업)
+        # 키를 연타할 때 눈에 띄게 끊긴다. 이제 open_player_popup()이
+        # 같은 창을 그대로 두고 load_player()로 내용만 갈아끼운다.
+        self._lay = QVBoxLayout(self)
+        self._copy_fns = []
+        # [2026-08 버그수정] 아래 두 표(info_tbl/tbl)는 W/A/S/D 포커스
+        # 가로채기를 막으려고 NoFocus라, 표 자신에 걸린 Ctrl+C
+        # (WidgetShortcut)는 작동하지 않는다 — 이 다이얼로그(StrongFocus,
+        # 표를 클릭해도 포커스가 여기 그대로 남음) 레벨에 하나만 걸고,
+        # 지금 셀이 선택된 표를 찾아 그 표의 복사 함수(_enable_plain_copy가
+        # 반환한 것 — 우클릭 메뉴와 완전히 같은 로직)를 그대로 부른다.
+        _copy_sc = QShortcut(QKeySequence.StandardKey.Copy, self)
+        _copy_sc.activated.connect(self._copy_from_selected_table)
+        self.load_player(pl)
+
+    def _copy_from_selected_table(self):
+        for _t, _copy_fn in self._copy_fns:
+            try:
+                if _t.selectedItems():
+                    _copy_fn()
+                    return
+            except RuntimeError:
+                continue   # 내용 교체로 이미 삭제된 표(방어적 처리)
+
+    @staticmethod
+    def _clear_layout(lay):
+        """[2026-08 신설] load_player()가 내용을 갈아끼우기 전에 기존
+        위젯/중첩 레이아웃(소속팀 줄 등)을 비운다. setParent(None)은 그
+        찰나 위젯을 최상위 창으로 만들어 흰 빈 창이 깜빡이는 원인이
+        되므로(_RosterPanel.set_roster와 동일한 이유) 부모를 떼지 않고
+        숨긴 뒤 삭제만 예약한다."""
+        while lay.count():
+            item = lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.hide(); w.deleteLater()
+                continue
+            sub = item.layout()
+            if sub is not None:
+                PlayerStatPopup._clear_layout(sub)
+                sub.deleteLater()
+
+    def load_player(self, pl: dict, panel=None):
+        """[2026-08 신설, 최적화] 이 팝업이 보여줄 선수를 교체한다 —
+        표시되는 내용은 예전(선수마다 팝업을 새로 만들던 때)과 100%
+        동일하고, 창 자체만 재사용한다. panel을 같이 넘기면 A/D로
+        반대쪽 팀으로 넘어갈 때 기준 패널도 같이 바뀐다."""
+        if panel is not None:
+            self._panel = panel
+        self.setWindowTitle(f"{pl.get('name','')}  [{pl.get('position','')}]")
+        self._clear_layout(self._lay)
+        self._copy_fns = []
 
         # [2026-08 수정, 신민용 요청: "이름/포지션/OVR가 테두리 있는 상자
         # (필드 위젯)로 되어 있는데, 아래 스탯처럼 일반 테이블 뷰(텍스트/
@@ -2156,7 +2438,7 @@ class PlayerStatPopup(QDialog):
         if _rename_pid is not None:
             info_tbl.setCursor(Qt.CursorShape.PointingHandCursor)
             info_tbl.cellClicked.connect(self._on_info_cell_clicked)
-        lay.addWidget(info_tbl)
+        self._lay.addWidget(info_tbl)
         # [2026-08 버그수정, 신민용 리포트: "포메이션에서 이름 옆 표를
         # 클릭하고 Ctrl+C 해도 복사가 안 된다 — 세계 축구 기록실은 같은
         # 그리드도 복사되는데"] world_browser_window._enable_plain_copy가
@@ -2191,7 +2473,7 @@ class PlayerStatPopup(QDialog):
             club_row.addWidget(club_icon)
             club_field = _CopyableField(club)
             club_row.addWidget(club_field, 1)
-            lay.addLayout(club_row)
+            self._lay.addLayout(club_row)
 
             # [2026-08 신설, 신민용 요청: "소속팀명 옆에 상자 하나 더
             # 만들어서 어느나라 (몇부)인지 표시해줘"] 국제대회 화면에서
@@ -2206,7 +2488,7 @@ class PlayerStatPopup(QDialog):
                 league_row.addWidget(league_icon)
                 league_field = _CopyableField(f"{club_country} ({club_tier}부)")
                 league_row.addWidget(league_field, 1)
-                lay.addLayout(league_row)
+                self._lay.addLayout(league_row)
 
         # [2026-08 확장, 신민용 요청] 어려움 난이도는 세부 스탯 표 자체를
         # 안 그린다 — 이름/포지션/나이/국적 4개 항목만 남는다.
@@ -2224,7 +2506,7 @@ class PlayerStatPopup(QDialog):
                 tbl.setItem(i, 0, QTableWidgetItem(STAT_KO.get(s, s)))
                 tbl.setItem(i, 1, QTableWidgetItem(str(pl.get(s, 0))))
             tbl.horizontalHeader().setStretchLastSection(True)
-            lay.addWidget(tbl)
+            self._lay.addWidget(tbl)
             # [2026-08 버그수정] info_tbl과 동일한 이유로 이 표도 NoFocus라
             # WidgetShortcut Ctrl+C가 안 먹는다 — 복사 함수만 등록해서
             # 위 다이얼로그 레벨 Ctrl+C가 같이 처리하게 한다.
@@ -2234,21 +2516,28 @@ class PlayerStatPopup(QDialog):
         ok.setStyleSheet("background:#2a2a2a;color:#ccc;border:1px solid #444;"
                          "border-radius:4px;padding:5px;")
         ok.clicked.connect(self.close)
-        lay.addWidget(ok)
+        self._lay.addWidget(ok)
 
-        # [2026-08 버그수정] 위 info_tbl/tbl 등록부 주석 참고 — 두 표 다
-        # NoFocus라 표 자신에 걸린 Ctrl+C(WidgetShortcut)는 못 쓰므로,
-        # 이 다이얼로그(StrongFocus, 표를 클릭해도 포커스가 여기 그대로
-        # 남음) 레벨에 하나만 건다. 지금 셀이 선택된 표를 찾아 그 표의
-        # 복사 함수(_enable_plain_copy가 반환한 것 — 우클릭 메뉴와 완전히
-        # 같은 로직이라 클린텍스트 처리 등도 항상 일치)를 그대로 부른다.
-        def _copy_from_selected_table():
-            for _t, _copy_fn in self._copy_fns:
-                if _t.selectedItems():
-                    _copy_fn()
-                    return
-        _copy_sc = QShortcut(QKeySequence.StandardKey.Copy, self)
-        _copy_sc.activated.connect(_copy_from_selected_table)
+        # [2026-08 버그수정, 신민용 리포트: "WASD로 넘기면 스탯 표가
+        # 사라지고 이름/포지션/OVR/나이/국적 줄만 남는다"] 처음엔 여기서
+        # 무조건 adjustSize()를 불렀는데, "이미 화면에 떠 있는" 창에
+        # adjustSize를 걸면 방금 갈아끼운 내용이 레이아웃에 반영되기
+        # 전의 크기로 줄어들면서 스탯 표(유일하게 늘어나는 항목)가
+        # 헤더만 남기고 납작하게 접혔다 — 첫 생성 때는 창이 아직 안
+        # 보이는 상태라 이 문제가 없어서 클릭으로 연 팝업은 멀쩡했다.
+        #   · 아직 안 보이는 창(첫 생성): 예전대로 adjustSize.
+        #   · 이미 보이는 창(WASD 전환): 레이아웃을 즉시 갱신만 하고
+        #     크기는 유지한다. 필요할 때만(소속팀 줄이 늘어 내용이 더
+        #     커진 경우 등) 키우고, 줄이지는 않는다 — 줄이는 방향이
+        #     바로 위의 접힘 현상이었으므로 아예 막는다.
+        if not self.isVisible():
+            self.adjustSize()
+        else:
+            self._lay.activate()
+            _hint = self.sizeHint()
+            if _hint.width() > self.width() or _hint.height() > self.height():
+                self.resize(max(self.width(), _hint.width()),
+                            max(self.height(), _hint.height()))
 
     def keyPressEvent(self, event):
         """[2026-08 신설, 신민용 요청: "W/S로 우측(지금 보고 있는 팀)
@@ -2375,9 +2664,16 @@ class PlayerStatPopup(QDialog):
         cancel_btn.clicked.connect(dlg.reject)
         edit.returnPressed.connect(dlg.accept)
 
-        if dlg.exec() != QDialog.DialogCode.Accepted:
+        _accepted = dlg.exec() == QDialog.DialogCode.Accepted
+        _new_text = edit.text()
+        # [2026-08 최적화/누수수정] QDialog는 부모(self)가 있으면 파이썬
+        # 쪽 참조가 사라져도 C++ 객체가 부모에 매달린 채 계속 살아남는다
+        # — 이름을 100명 넘게 바꾸면 그만큼의 숨은 다이얼로그(각각
+        # 입력칸·버튼 여러 개)가 화면 뒤에 쌓인다. 다 쓴 즉시 삭제 예약.
+        dlg.deleteLater()
+        if not _accepted:
             return
-        set_ai_player_custom_name(pid, edit.text())
+        set_ai_player_custom_name(pid, _new_text)
         new_display = get_ai_player_custom_name(pid) or code
 
         global _ovr_cache_invalidated
