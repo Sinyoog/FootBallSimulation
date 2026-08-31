@@ -2256,6 +2256,7 @@ def init_db():
     _migrate_history_tables()   # 선수 이력 2표 고아행 정리 + WITHOUT ROWID 재구축 (1회성, 아래 참고)
     _migrate_history_db_split()   # 선수 이력 2표 main→history.db(hist) 이전 (1회성, 아래 참고)
     _migrate_phantom_career_entries()   # 유령 재직기록(길이0·0경기) 정리 (1회성, 아래 참고)
+    _migrate_orphaned_ai_players()   # 이름 지어놓고 통째로 사라진 고아 ai_players 복구 (1회성, 아래 참고)
     compact_existing_match_archive()   # 기존 세이브 match_results_archive 요약+정리 (1회성, 아래 참고)
     # [2026-08 신설] init_db()는 QA/AB테스트 스크립트 등이 DB_PATH를 바꿔가며
     # 같은 프로세스 안에서 여러 번 호출하기도 한다 — 그때마다 get_state()
@@ -2953,6 +2954,116 @@ def _migrate_phantom_career_entries():
             print(f"[MIGRATE] career_entries 유령 재직기록 {n}건 정리")
     except sqlite3.OperationalError as e:
         print(f"[MIGRATE] career_entries 유령 재직기록 정리 건너뜀: {e}")
+
+
+def _migrate_orphaned_ai_players():
+    """[2026-08 신설, 신민용 리포트: "'따효니'라고 이름 지어준 선수가
+    세계 기록실 라인업에 '(공석)'으로 뜨고, 선수 검색에서도 아예 안
+    보인다"] 원인규명: ai_lifecycle.py의 _rebalance_squad_sizes(포지션
+    균형 조정)/apply_squad_turnover_after_movement(승강 후 물갈이) 두
+    함수가 스쿼드에서 밀려난 선수를 DELETE FROM ai_players로 곧바로
+    지우면서, 정상 은퇴 경로(_retire_and_replace)와 달리 ai_players_
+    retired 아카이브를 전혀 안 남겼다(이번에 같이 고쳐서 앞으로는
+    _archive_forced_out_players로 DELETE 직전에 항상 아카이브한다 —
+    ai_lifecycle.py 참고). ai_player_custom_names(이름)는 player_id
+    기준으로 별개 테이블이라 그대로 남아있었지만, 정작 그 id를 가리키는
+    ai_players/ai_players_retired 행이 둘 다 없어져서 선수를 조회하는
+    모든 화면에서 완전히 사라진 것처럼 보였다(사용자 세이브 실측:
+    커스텀 이름 62명 중 5명, 전체로는 사상 존재했던 730,011명 중
+    162,105명(22%)이 이 상태).
+
+    이 함수는 세이브 로드 시 1회, 이미 이렇게 고아가 된 선수를
+    복구한다 — hist.ai_player_position_history/ai_player_ovr_history
+    (실제로 그 해에 뛰었다는 기록)에는 있는데 ai_players/ai_players_
+    retired 둘 다에 없는 id를 찾아, 마지막으로 기록된 연도의 포지션/
+    OVR로 ai_players_retired 행을 최선을 다해 재구성한다. 나이/마지막
+    소속팀은 이력표 자체에 없는 정보라 복구 불가능(age=0, last_team_id
+    =0으로 둔다) — 국적만 intl_squad(그 선수가 대표팀으로 뛴 기록)에
+    남아있으면 거기 country 값으로 채우고, 없으면 빈 문자열. name은
+    ai_player_code(id)로 채워(커스텀 이름이 있는 선수는 어차피 화면에
+    항상 커스텀 이름이 우선 표시되므로 이 name 값 자체는 거의 안 보임).
+    meta 플래그로 세이브당 1회만 돈다.
+
+    [2026-08 추가 발견, 신민용 리포트: "파일 교체+재시작까지 했는데도
+    (공석)이 그대로 뜬다"] 최초 구현은 orphan_ids(수십만 개일 수 있음)를
+    통째로 하나의 `WHERE player_id IN (?,?,...)` 절에 다 밀어넣었다 —
+    SQLite는 한 쿼리의 바인드 파라미터 개수에 상한이 있고(SQLITE_MAX_
+    VARIABLE_NUMBER, 빌드에 따라 기본값이 999인 경우가 흔함), 그 상한을
+    넘으면 sqlite3.OperationalError가 나는데 이 함수의 바깥 try/except가
+    그 예외를 조용히 삼켜버린다(콘솔에만 찍히고 GUI 게임에선 아무도 못
+    봄) — 그러면 이번 실행에서 meta 플래그가 안 세워지니 다음에 또
+    시도는 하지만, 매번 같은 자리에서 같은 이유로 계속 실패해 사용자
+    입장에선 "아무리 재시작해도 그대로"로 보인다(개발 환경 파이썬은
+    이 상한이 커서 재현이 안 됐던 것 — 실제 배포 환경 SQLite 빌드에서만
+    드러나는 문제). _chunked_in()으로 500개씩 나눠 여러 번 조회하도록
+    고쳐서, 어떤 SQLite 빌드에서도 상한에 걸리지 않게 한다."""
+    from constants import ai_player_code
+
+    def _chunked_in(cur, sql_tmpl, ids, chunk=500):
+        """sql_tmpl은 정확히 하나의 '{ph}' 자리표시자를 포함해야 하며,
+        그 자리에 그때그때 청크 길이만큼의 '?,?,...'를 채워 넣는다.
+        각 청크의 결과 행을 이어붙여 반환(전체 한 번에 IN(...)에 넣지
+        않으므로 SQLite 파라미터 상한과 무관하게 항상 안전하다)."""
+        out = []
+        for i in range(0, len(ids), chunk):
+            part = ids[i:i + chunk]
+            ph = ",".join("?" * len(part))
+            out.extend(cur.execute(sql_tmpl.format(ph=ph), part).fetchall())
+        return out
+
+    conn = get_conn(); c = conn.cursor()
+    try:
+        done = c.execute(
+            "SELECT value FROM meta WHERE key='orphan_ai_players_repair_v1'").fetchone()
+    except sqlite3.OperationalError:
+        return
+    if done and done["value"] == "1":
+        return
+    try:
+        orphan_ids = [r["player_id"] for r in c.execute("""
+            SELECT DISTINCT player_id FROM hist.ai_player_position_history ph
+            WHERE NOT EXISTS (SELECT 1 FROM ai_players p WHERE p.id=ph.player_id)
+              AND NOT EXISTS (SELECT 1 FROM ai_players_retired r WHERE r.id=ph.player_id)
+        """).fetchall()]
+        if orphan_ids:
+            last_pos = {}
+            for r in _chunked_in(
+                    c, "SELECT player_id, position, year FROM hist.ai_player_position_history "
+                       "WHERE player_id IN ({ph})", orphan_ids):
+                pid = r["player_id"]
+                if pid not in last_pos or r["year"] > last_pos[pid][1]:
+                    last_pos[pid] = (r["position"], r["year"])
+            last_ovr = {}
+            for r in _chunked_in(
+                    c, "SELECT player_id, ovr, year FROM hist.ai_player_ovr_history "
+                       "WHERE player_id IN ({ph})", orphan_ids):
+                pid = r["player_id"]
+                if pid not in last_ovr or r["year"] > last_ovr[pid][1]:
+                    last_ovr[pid] = (r["ovr"], r["year"])
+            nat_by_id = {}
+            for r in _chunked_in(
+                    c, "SELECT DISTINCT player_id, country FROM intl_squad "
+                       "WHERE player_id IN ({ph})", orphan_ids):
+                nat_by_id.setdefault(r["player_id"], r["country"])
+
+            archive_rows = []
+            for pid in orphan_ids:
+                pos, pyear = last_pos.get(pid, ("", 0))
+                ovr, oyear = last_ovr.get(pid, (0, 0))
+                ret_year = max(pyear, oyear) or 0
+                archive_rows.append((pid, ai_player_code(pid), pos, ovr, 0,
+                                      nat_by_id.get(pid, ""), 0, "", ret_year))
+            c.executemany(
+                """INSERT OR REPLACE INTO ai_players_retired
+                   (id, name, position, ovr, age, nationality, last_team_id,
+                    last_team_name, retirement_year)
+                   VALUES(?,?,?,?,?,?,?,?,?)""", archive_rows)
+        c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('orphan_ai_players_repair_v1','1')")
+        conn.commit()
+        if orphan_ids:
+            print(f"[MIGRATE] 고아 ai_players {len(orphan_ids)}명 ai_players_retired로 복구")
+    except sqlite3.OperationalError as e:
+        print(f"[MIGRATE] 고아 ai_players 복구 건너뜀: {e}")
 
 
 def repair_cwc_match_groups():

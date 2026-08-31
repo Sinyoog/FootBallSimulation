@@ -2354,6 +2354,52 @@ _SQUAD_TARGET   = 23   # 정상범위(22~25)의 중간값
 _SQUAD_MIN      = 22   # 이 밑으로 떨어지면 유망주 영입 (주전11+벤치 최소11)
 _SQUAD_MAX      = 25   # 이 위로 넘어가면 조기 은퇴 (주전11+벤치 최대14)
 
+
+def _archive_forced_out_players(c, ids, year):
+    """[2026-08 신설, 신민용 리포트: "이름 지어준 선수(따효니)가 갑자기
+    화면(세계기록실 라인업 등)에서 '(공석)'으로 사라졌다"] 원인규명:
+    _rebalance_squad_sizes(포지션 균형 조정)와 apply_squad_turnover_
+    after_movement(승강 후 물갈이) 둘 다 스쿼드에서 밀려난 선수를
+    DELETE FROM ai_players로 곧바로 지우는데, 정상 은퇴 경로
+    (_retire_and_replace)와 달리 ai_players_retired 아카이브를 전혀
+    안 남겼다 — ai_player_code(id)/이름(ai_player_custom_names)이
+    가리킬 실제 행이 아예 없어져서, 이름을 지어준 선수라도 이후 모든
+    조회 화면(세계 기록실 라인업/선수 검색 등)에서 완전히 자취를
+    감춰버렸다(사용자 세이브 실측: 커스텀 이름 62명 중 5명, 전체로는
+    사상 존재했던 730,011명 중 162,105명(22%)이 이 상태였음).
+
+    두 함수 모두 실제 DELETE 직전에 이 함수를 호출해, 삭제될 선수의
+    마지막 상태(이름/포지션/OVR/나이/국적/소속팀)를 _retire_and_replace
+    와 똑같은 형태로 ai_players_retired에 먼저 남긴다 — 그 다음에야
+    진짜 DELETE가 실행되므로, id가 조회 불가능해지는 순간 자체가
+    생기지 않는다. ids는 이미 이 시점의 ai_players에 실존하는 행이라
+    (아직 지우기 전이므로) 조회가 항상 성공한다."""
+    if not ids:
+        return
+    placeholders = ",".join("?" * len(ids))
+    rows = c.execute(
+        f"""SELECT id, name, position, ovr, age, nationality, team_id
+            FROM ai_players WHERE id IN ({placeholders})""", ids).fetchall()
+    if not rows:
+        return
+    team_ids = {r["team_id"] for r in rows if r["team_id"]}
+    team_names = {}
+    if team_ids:
+        tph = ",".join("?" * len(team_ids))
+        team_names = {r["id"]: r["name"] for r in c.execute(
+            f"SELECT id, name FROM teams WHERE id IN ({tph})", list(team_ids)).fetchall()}
+    archive_rows = [
+        (r["id"], r["name"], r["position"], r["ovr"], r["age"], r["nationality"],
+         r["team_id"], team_names.get(r["team_id"], ""), year)
+        for r in rows
+    ]
+    c.executemany(
+        """INSERT OR REPLACE INTO ai_players_retired
+           (id, name, position, ovr, age, nationality, last_team_id,
+            last_team_name, retirement_year)
+           VALUES(?,?,?,?,?,?,?,?,?)""", archive_rows)
+
+
 def _rebalance_squad_sizes(c, year):
     """[2026-08 신설, 신민용 리포트: "이적으로 인한 스쿼드 인원 불균형을
     보정하는 장치가 없다"] 은퇴 교체(_retire_and_replace)는 기존 행을
@@ -2577,6 +2623,7 @@ def _rebalance_squad_sizes(c, year):
              contract_end_year,last_transfer_year,created_year)
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", new_rows)
     if delete_ids:
+        _archive_forced_out_players(c, delete_ids, year)
         c.executemany("DELETE FROM ai_players WHERE id=?", [(i,) for i in delete_ids])
 
     return topped_up, forced_out
@@ -3030,6 +3077,7 @@ def apply_squad_turnover_after_movement(rescale_jobs, year, turnover_frac=0.25,
             replaced += 1
 
     if del_ids:
+        _archive_forced_out_players(c, del_ids, year)
         c.executemany("DELETE FROM ai_players WHERE id=?", [(i,) for i in del_ids])
     if new_rows:
         c.executemany(
