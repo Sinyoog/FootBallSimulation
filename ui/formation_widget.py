@@ -6,7 +6,8 @@ ui/formation_widget.py
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QDialog,
     QTableWidget, QTableWidgetItem, QPushButton, QComboBox,
-    QSizePolicy, QFrame, QScrollArea, QGridLayout, QLineEdit
+    QSizePolicy, QFrame, QScrollArea, QGridLayout, QLineEdit,
+    QPlainTextEdit
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import (QColor, QPainter, QBrush, QPen, QFont, QFontMetrics,
@@ -1519,6 +1520,173 @@ def apply_custom_name_live(player_id: int, new_name: str):
         except RuntimeError:
             _LIVE_TEAM_PANELS.discard(w)   # 이미 닫혀 C++ 객체가 사라진 패널
 
+
+_RENAME_SCOPE_BTN_STYLE = (
+    "QPushButton{background:#2a2a2a;color:#888888;border:1px solid #444444;"
+    "padding:4px 12px;border-radius:4px;font-size:11px;}"
+    "QPushButton:disabled{color:#444444;border:1px solid #333333;}"
+    "QPushButton:checked{background:#2d5a2d;color:#ffffff;border:1px solid "
+    "#4caf50;font-weight:bold;}")
+
+
+def open_bulk_rename_dialog(parent, starters: list, bench: list) -> list:
+    """[2026-08 신설, 신민용 요청: "이름 일괄변경 — 리그명 표시줄 좌우/
+    세계기록실 대회명 옆에 버튼을 만들어서, 쉼표로 구분한 이름을 위에서
+    부터 순서대로 배정하고 싶다"] 메인 포메이션 화면(FormationWidget)과
+    세계 축구 기록실(world_browser_window.py의 대회 스쿼드 카드)이 이
+    함수 하나를 공유한다 — 두 화면 다 "주전 목록 + 후보 목록"이라는
+    같은 모양의 데이터를 다루고, 규칙도 동일해서 따로 만들 이유가 없다.
+
+    starters/bench: 각 원소가 최소 {"id": ...}를 가진 dict 리스트, 화면에
+    보이는 순서 그대로(주전 1번→N번, 후보 1번→M번). 이름 표시용 키는
+    호출부마다 달라서("name" 또는 "display_name") 여기선 안 쓴다.
+
+    - 위쪽 전체/주전/후보/미변경 버튼으로 적용 범위를 고른다 — 전체=
+      주전부터 시작해 후보까지 이어서, 주전만 선택=주전만, 후보만
+      선택=후보 1번부터 별도로 새로 시작, 미변경만 선택=지금
+      custom_name이 아예 없는(화면에 식별코드 그대로 뜨는) 선수만
+      주전→후보 순서로 골라서 그 안에서 1번부터 새로 시작(이적/신인
+      영입으로 새로 들어온 선수만 마저 지어주고 싶을 때 이미 지어둔
+      선수까지 다시 훑지 않아도 되게).
+    - 입력한 이름은 쉼표(,)로 나눠 그 범위의 위에서부터 순서대로
+      배정한다. 이름 개수가 대상 인원보다 적으면 그만큼만 바뀌고
+      나머지는 원래 이름을 그대로 둔다(입력 안 된 뒷사람은 미적용).
+      많으면 초과분은 그냥 버린다.
+    - 실제 ai_players 레코드가 있는 선수(id>=0, world_browser.
+      MY_PLAYER_ID인 나 자신(-1)과 국제대회 스쿼드가 부족할 때 채워
+      넣는 가상 폴백 선수(id<-1)는 이름을 저장할 DB 행 자체가 없어
+      대상에서 제외)만 대상으로 한다.
+
+    반환값: 실제로 바뀐 (player_id, new_name) 쌍 리스트(취소했거나
+    아무도 안 바뀌면 빈 리스트) — 호출부가 자기 화면을 어떻게 다시
+    그릴지는 스스로 판단해야 하므로(포메이션 화면은 apply_custom_name_live
+    로 충분하지만, 세계 기록실의 대회 스쿼드 카드는 그 카드 자체를
+    다시 그려야 해서) 새로고침은 각 호출부 책임으로 남긴다."""
+    from database import set_ai_player_custom_name, get_ai_player_custom_name
+
+    def _nameable(lst):
+        return [p for p in lst if p.get("id") is not None and p.get("id") >= 0]
+
+    starter_targets = _nameable(starters)
+    bench_targets = _nameable(bench)
+    all_targets = starter_targets + bench_targets
+    if not all_targets:
+        return []
+    # [2026-08 신설, 신민용 요청: "전체/주전/후보 말고 이름 변경 안 된
+    # 애들만 대상으로 하는 범위도 추가해달라"] 이적/신인영입 등으로
+    # 새로 들어온 선수만 마저 이름 지어주고 싶을 때, 이미 지어준
+    # 선수까지 다시 훑을 필요 없게 — 지금 custom_name이 아예 없는
+    # (=화면에 식별코드 그대로 뜨는) 선수만 골라 all_targets와 같은
+    # 순서(주전→후보)로 별도 범위를 만든다.
+    unnamed_targets = [p for p in all_targets
+                        if not get_ai_player_custom_name(p.get("id"))]
+
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("이름 일괄변경")
+    dlg.setStyleSheet("QDialog{background:#1e1e1e;color:#ccc;}")
+    dlg.setMinimumWidth(420)
+    v = QVBoxLayout(dlg)
+
+    info_lbl = QLabel(
+        "쉼표(,)로 구분해 위에서부터 순서대로 이름을 지어주세요.\n"
+        "예: 김병지,이을용,황선홍")
+    info_lbl.setStyleSheet("color:#888;font-size:11px;")
+    v.addWidget(info_lbl)
+
+    # ── 적용 범위(전체/주전/후보/미변경) 선택 행
+    scope_row = QHBoxLayout()
+    scope_btns = {}
+    for key, label, targets in (
+        ("all", "전체", all_targets),
+        ("starter", "주전", starter_targets),
+        ("bench", "후보", bench_targets),
+        ("unnamed", "미변경", unnamed_targets),
+    ):
+        b = QPushButton(f"{label} ({len(targets)}명)")
+        b.setCheckable(True)
+        b.setStyleSheet(_RENAME_SCOPE_BTN_STYLE)
+        b.setEnabled(bool(targets))
+        scope_row.addWidget(b)
+        scope_btns[key] = b
+    scope_row.addStretch(1)
+    v.addLayout(scope_row)
+
+    # 기본 선택: 주전/후보가 둘 다 있으면 전체, 하나만 있으면 그쪽.
+    _default_scope = ("all" if (starter_targets and bench_targets)
+                       else ("starter" if starter_targets else "bench"))
+    scope_btns[_default_scope].setChecked(True)
+
+    def _pick_scope(chosen_key):
+        for k, b in scope_btns.items():
+            b.setChecked(k == chosen_key)
+    for k, b in scope_btns.items():
+        if b.isEnabled():
+            b.clicked.connect(lambda _checked, kk=k: _pick_scope(kk))
+
+    edit = QPlainTextEdit()
+    edit.setPlaceholderText("김병지,이을용,황선홍, ...")
+    edit.setStyleSheet(
+        "QPlainTextEdit{background:#161616;color:#eee;font-size:12px;"
+        "border:1px solid #333;border-radius:4px;padding:6px 8px;}"
+        "QPlainTextEdit:focus{border:1px solid #4da6ff;}")
+    edit.setFixedHeight(90)
+    v.addWidget(edit)
+
+    btn_row = QHBoxLayout()
+    save_btn = QPushButton("저장")
+    save_btn.setStyleSheet(
+        "background:#2d4a6b;color:#eee;border:1px solid #4a7ab0;"
+        "border-radius:4px;padding:6px 14px;")
+    cancel_btn = QPushButton("취소")
+    cancel_btn.setStyleSheet(
+        "background:#2a2a2a;color:#ccc;border:1px solid #444;"
+        "border-radius:4px;padding:6px 14px;")
+    btn_row.addStretch(1)
+    btn_row.addWidget(cancel_btn)
+    btn_row.addWidget(save_btn)
+    v.addLayout(btn_row)
+
+    save_btn.clicked.connect(dlg.accept)
+    cancel_btn.clicked.connect(dlg.reject)
+
+    _accepted = dlg.exec() == QDialog.DialogCode.Accepted
+    _text = edit.toPlainText()
+    # [누수수정, 기존 개별 이름변경 다이얼로그와 동일한 이유] 부모(parent)가
+    # 있는 QDialog는 파이썬 참조가 사라져도 C++ 객체가 부모에 매달려
+    # 계속 살아남는다 — 다 쓴 즉시 삭제 예약.
+    dlg.deleteLater()
+    if not _accepted:
+        return []
+
+    scope_key = next((k for k, b in scope_btns.items() if b.isChecked()), "all")
+    target_list = {"all": all_targets, "starter": starter_targets,
+                    "bench": bench_targets, "unnamed": unnamed_targets}[scope_key]
+    names = [n.strip() for n in _text.split(",") if n.strip()]
+
+    changed = []
+    for pl, new_name in zip(target_list, names):
+        pid = pl.get("id")
+        set_ai_player_custom_name(pid, new_name)
+        changed.append((pid, new_name))
+
+    if changed:
+        global _ovr_cache_invalidated
+        _ovr_cache_invalidated = True
+        for pid, new_name in changed:
+            apply_custom_name_live(pid, new_name)
+        # [2026-08 신설] 세계 축구 기록실이 지금 열려 있으면 그쪽 목록/
+        # 상세 패널도 즉시 반영 — _open_rename_dialog(개별 이름변경)가
+        # 이미 쓰는 것과 같은 경로. 여러 명이라 순환import 우려 없이
+        # 함수 지역 import로 한 번만 가져온다.
+        try:
+            from ui.world_browser_window import apply_custom_name_live_to_browser
+            for pid, _new_name in changed:
+                apply_custom_name_live_to_browser(pid)
+        except Exception:
+            pass
+    return changed
+
+
 # ─────────────────────────────────────────────
 # 메인 위젯
 # ─────────────────────────────────────────────
@@ -1543,6 +1711,12 @@ _CTX_STYLE = {
 _BOX_STYLE  = "background:#2a2a2a;border:1px solid #444;border-radius:4px;padding:4px 8px;"
 _LABEL_STYLE = f"color:#cccccc;font-size:11px;{_BOX_STYLE}"
 _HINT_STYLE  = "color:#555;font-size:9px;"
+# [2026-08 신설] 리그명 표시줄 좌우 "이름 일괄변경" 버튼 — 기존 다크 박스
+# 계열(_BOX_STYLE)과 톤은 맞추되 버튼임을 알 수 있게 hover를 추가한다.
+_RENAME_BTN_STYLE = (
+    "QPushButton{background:#2a2a2a;color:#cccccc;border:1px solid #444444;"
+    "border-radius:4px;padding:4px 8px;font-size:10px;}"
+    "QPushButton:hover{background:#383838;border:1px solid #777777;}")
 
 class FormationWidget(QWidget):
     def __init__(self):
@@ -1584,12 +1758,32 @@ class FormationWidget(QWidget):
         self._filter_year = None
 
         # ── 1행: 대회명 구분선 (에이전트/은퇴 버튼과 캔버스 사이)
+        # [2026-08 신설, 신민용 요청: "이 리그명 줄 좌우에 이름 일괄변경
+        # 버튼을 만들어서 좌측은 우리팀, 우측은 상대팀 이름을 쉼표로
+        # 구분해 한 번에 바꾸고 싶다"] 이전엔 lay에 lbl_ctx 하나만 바로
+        # 얹었는데, 그 좌우에 버튼을 하나씩 놓으려면 가로 레이아웃으로
+        # 감싸야 한다. lbl_ctx 자체의 폭/정렬/스타일은 그대로 유지.
+        ctx_row = QHBoxLayout()
+        ctx_row.setSpacing(4)
+
+        self.btn_rename_my = QPushButton("✏ 우리팀 이름")
+        self.btn_rename_my.setStyleSheet(_RENAME_BTN_STYLE)
+        self.btn_rename_my.clicked.connect(lambda: self._open_bulk_rename_for_panel(self._my_panel))
+        ctx_row.addWidget(self.btn_rename_my)
+
         self.lbl_ctx = QLabel()
         self.lbl_ctx.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_ctx.setStyleSheet(
             f"color:#aaffaa;font-size:11px;font-weight:bold;{_BOX_STYLE}")
         self.lbl_ctx.setFixedHeight(26)
-        lay.addWidget(self.lbl_ctx)
+        ctx_row.addWidget(self.lbl_ctx, 1)
+
+        self.btn_rename_opp = QPushButton("✏ 상대팀 이름")
+        self.btn_rename_opp.setStyleSheet(_RENAME_BTN_STYLE)
+        self.btn_rename_opp.clicked.connect(lambda: self._open_bulk_rename_for_panel(self._opp_panel))
+        ctx_row.addWidget(self.btn_rename_opp)
+
+        lay.addLayout(ctx_row)
 
         # ── 2행: 내 팀 정보(좌) + 상대팀 콤보(우)
         info_row = QHBoxLayout()
@@ -1985,6 +2179,17 @@ class FormationWidget(QWidget):
         self._opp_canvas.load_opp_team(t)
         self._opp_panel.refresh_roster()
 
+    def _open_bulk_rename_for_panel(self, panel: "_TeamPanel"):
+        """[2026-08 신설, 신민용 요청] 리그명 줄 좌/우 버튼이 부르는
+        진입점 — 그 패널(내 팀/상대팀)의 주전/후보 순서 그대로
+        open_bulk_rename_dialog에 넘긴다. 이름이 바뀌면 그 함수 안에서
+        apply_custom_name_live가 이미 이 패널(포함해 지금 열려 있는 모든
+        포메이션 화면)을 즉시 갱신하므로 여기서 추가로 할 일은 없다."""
+        starters = panel.get_starters_ordered()
+        full = panel.get_full_roster_ordered()
+        bench = full[len(starters):]
+        open_bulk_rename_dialog(self, starters, bench)
+
     def open_player_popup(self, pl: dict, panel: "_TeamPanel"):
         """[2026-08 신설, 신민용 요청: "선수 클릭 시 파란 하이라이트 +
         팝업에서 WASD로 다른 선수/팀으로 이동"] 선수 클릭(캔버스 클릭,
@@ -1995,26 +2200,18 @@ class FormationWidget(QWidget):
         빠뜨려서 팝업이 계속 쌓이는 사고가 나기 쉽다 — 신민용이 먼저
         지적한 "무한으로 창이 열리면 안 된다"는 우려가 정확히 이 지점).
         """
-        # [2026-08 변경, 신민용 요청: "포메이션에서 선수를 누르면 스탯
-        # 팝업 대신 세계 축구 기록실에서 그 선수를 눌렀을 때 뜨는 우측
-        # 패널(연도별 기록/국가대표 기록/기록 복사/이름 변경)이 그대로
-        # 떠야 한다"] 실제 ai_players 레코드가 있는 선수(본인 id=-1
-        # 포함, world_browser.MY_PLAYER_ID와 동일 — AI는 id>=0)는 세계
-        # 기록실 창을 그 선수로 바로 연다. 반면 국제대회 등에서 스쿼드가
-        # 8명 미만일 때 채워 넣는 가상 폴백 선수(id<-1, constants.
-        # ai_player_code 문서 참고 — 실제 ai_players 행이 없어 세계
-        # 기록실에 조회할 대상 자체가 없음)는 기존 PlayerStatPopup(신원
-        # 최소 정보만 보여주는 경로)을 그대로 유지한다.
-        pid = pl.get("id")
-        if pid is not None and pid >= -1:
-            panel.canvas.set_selected_id(pid)
-            panel.roster.set_selected_id(pid)
-            if self._active_panel is not None and self._active_panel is not panel:
-                self._active_panel.canvas.clear_selected()
-                self._active_panel.roster.clear_selected()
-            self._active_panel = panel
-            self._open_world_browser_for_player(pid)
-            return
+        # [2026-08 재수정, 신민용 리포트: "메인화면은 원래 저 스탯
+        # 팝업이 눌렀을 때 바로 떠야 하는데 왜 사라졌냐"] 바로 위
+        # [2026-08 변경] 이력대로 한때 실제 AI 레코드는 클릭 시 무조건
+        # 세계 기록실 창이 뜨도록 바뀌었었는데, 그 결과 메인화면 클릭의
+        # 핵심 가치였던 "가볍고 빠른 팝업 + WASD로 옆 선수 훑어보기"가
+        # 사라져 버렸다는 리포트를 받았다. 클릭 시 기본 동작은 다시
+        # PlayerStatPopup으로 되돌리고, 세계 기록실(연도별 기록/국가대표
+        # 기록/기록 복사/이름 변경)이 필요할 때는 아래 PlayerStatPopup
+        # 안의 "🌍 세계기록실에서 상세 보기" 버튼으로 필요할 때만 연다
+        # (_open_world_browser_for_player는 그대로 남겨 그 버튼과
+        # WorldBrowserWindow의 WASD 전환에 계속 쓰인다).
+
         # [2026-08 최적화, 신민용 리포트: "포메이션에서 WASD로 움직일 때
         # 끊긴다"] 예전엔 키를 누를 때마다 팝업을 close()로 부수고 새
         # PlayerStatPopup을 만들어 show()+activateWindow()까지 했다 —
@@ -2076,11 +2273,23 @@ class FormationWidget(QWidget):
             # 오게 한다.
             popup.setFocus(Qt.FocusReason.OtherFocusReason)
 
-    def _open_world_browser_for_player(self, player_id):
+    def _open_world_browser_for_player(self, player_id, panel: "_TeamPanel" = None):
         """[2026-08 신설] 세계 기록실 창을 player_id로 바로 연다. 이미
         이 화면에서 연 창이 떠 있으면(닫지 않고 다른 선수를 또 클릭한
         경우) 새 창을 또 띄우지 않고 그 창의 내용만 갈아끼운다 —
-        PlayerStatPopup 재사용과 같은 원칙(창을 계속 쌓지 않는다)."""
+        PlayerStatPopup 재사용과 같은 원칙(창을 계속 쌓지 않는다).
+
+        [2026-08 재추가, 신민용 요청: "포메이션에서 선수 클릭하면 세계
+        기록실이 뜨는 건 유지하되, WASD로 옆 선수/반대팀으로 빠르게
+        넘어가는 건 되살려달라"] panel을 world_browser_window.
+        WorldBrowserWindow에 nav(=self)/panel과 함께 넘겨주면, 그 창이
+        떠 있는 동안 PlayerStatPopup.keyPressEvent와 완전히 같은 규칙
+        으로 W/A/S/D를 직접 처리한다(구현은 WorldBrowserWindow.
+        keyPressEvent 참고) — 다음 선수도 실제 AI 레코드(id>=-1)면 이
+        메서드를 다시 타고 이 창이 그대로 재사용되고, 국제대회 가상
+        폴백 선수(id<-1)면 open_player_popup의 기존 분기대로 자연스럽게
+        PlayerStatPopup으로 넘어간다(직접 클릭했을 때와 동일한 동작이라
+        여기서 별도로 처리할 필요가 없다)."""
         win = self._world_browser_win
         if win is not None:
             try:
@@ -2089,18 +2298,22 @@ class FormationWidget(QWidget):
                 win = None
                 self._world_browser_win = None
         if win is not None:
+            win._fm_nav = self
+            win._fm_panel = panel
             win.open_to_player(player_id)
             win.raise_()
             win.activateWindow()
+            win.setFocus(Qt.FocusReason.OtherFocusReason)
             return
         from ui.world_browser_window import WorldBrowserWindow
-        win = WorldBrowserWindow(self, open_player_id=player_id)
+        win = WorldBrowserWindow(self, open_player_id=player_id, nav=self, panel=panel)
         win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         win.finished.connect(self._on_world_browser_closed)
         self._world_browser_win = win
         win.show()
         win.raise_()
         win.activateWindow()
+        win.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _on_world_browser_closed(self, *_a):
         self._world_browser_win = None
@@ -2511,6 +2724,26 @@ class PlayerStatPopup(QDialog):
             # WidgetShortcut Ctrl+C가 안 먹는다 — 복사 함수만 등록해서
             # 위 다이얼로그 레벨 Ctrl+C가 같이 처리하게 한다.
             self._copy_fns.append((tbl, _enable_plain_copy(tbl)))
+
+        # [2026-08 신설, 신민용 요청: "클릭했을 때 기본은 이 팝업이어야
+        # 하지만, 예전에 요청했던 세계 기록실(연도별 기록/국가대표 기록/
+        # 기록 복사/이름 변경) 상세도 필요할 때 볼 수 있어야 한다"] 실제
+        # ai_players 레코드가 있는 선수(id>=-1, 나 자신 포함 — world_
+        # browser.MY_PLAYER_ID와 동일)만 버튼을 보여준다. 국제대회 등
+        # 스쿼드가 부족할 때 채워 넣는 가상 폴백 선수(id<-1)는 세계
+        # 기록실에 조회할 DB 행 자체가 없어 버튼을 만들지 않는다.
+        # _open_world_browser_for_player가 nav/panel을 그대로 넘겨주므로
+        # 이 버튼으로 연 세계 기록실 창에서도 WASD 전환이 그대로 작동한다.
+        _wb_pid = pl.get("id")
+        if _wb_pid is not None and _wb_pid >= -1 and self._nav is not None:
+            wb_btn = QPushButton("🌍 세계기록실에서 상세 보기")
+            wb_btn.setStyleSheet(
+                "background:#22344a;color:#cfe6ff;border:1px solid #3a6a9a;"
+                "border-radius:4px;padding:5px;")
+            wb_btn.clicked.connect(
+                lambda _c=False, _pid=_wb_pid, _panel=self._panel:
+                    self._nav._open_world_browser_for_player(_pid, _panel))
+            self._lay.addWidget(wb_btn)
 
         ok = QPushButton("닫기")
         ok.setStyleSheet("background:#2a2a2a;color:#ccc;border:1px solid #444;"

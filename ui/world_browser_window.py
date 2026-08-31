@@ -37,7 +37,8 @@ import power_ranking as pr
 # 순수 함수(포지션 문자열/좌표 계산만)라 그대로 재사용해도 안전하다.
 # formation_widget.py는 이 모듈을 최상단에서 import하지 않으므로(내부
 # 함수 안에서만 지연 import) 순환 임포트 문제가 없다.
-from ui.formation_widget import _row_key, _row_priority, _pos_x_order, _pos_color
+from ui.formation_widget import (
+    _row_key, _row_priority, _pos_x_order, _pos_color, open_bulk_rename_dialog)
 
 # [2026-08 신설, 신민용 리포트: "복사하면 국기/국가/부수까지 같이 복사된다,
 # 팀명만 복사되게 해달라"] 셀 화면 텍스트("🇺🇸 토론토 FC (미국)", "보루시아
@@ -566,13 +567,28 @@ def apply_custom_name_live_to_browser(player_id: int):
 
 
 class WorldBrowserWindow(QDialog):
-    def __init__(self, parent=None, open_player_id=None):
+    def __init__(self, parent=None, open_player_id=None, nav=None, panel=None):
         """open_player_id: [2026-08 신설, 신민용 요청: "포메이션에서 선수를
         누르면 세계 기록실에서 그 선수를 눌렀을 때 뜨는 우측 패널이 바로
         떠야 한다"] 넘기면 창이 뜨자마자 "선수 검색" 탭으로 전환하고 그
         선수의 상세를 바로 연다(open_to_player 참고) — 검색해서 찾아
-        들어가는 과정을 생략한다."""
+        들어가는 과정을 생략한다.
+
+        nav/panel: [2026-08 재추가, 신민용 요청: "그렇게 세계기록실이
+        뜨는 건 유지하되, WASD로 옆 선수/반대팀으로 넘어가는 기능은
+        되살려달라"] 포메이션 화면(ui/formation_widget.py의
+        FormationWidget/_TeamPanel)에서 열렸을 때만 넘어온다 —
+        formation_widget.py._open_world_browser_for_player 참고. 독립적
+        으로(메인 메뉴, 팀 검색 화면 등에서) 연 창은 둘 다 None이라
+        keyPressEvent가 그냥 평범한 다이얼로그 기본 동작으로 남는다."""
         super().__init__(parent)
+        self._fm_nav = nav
+        self._fm_panel = panel
+        self._fm_player_id = None
+        # [2026-08 신설] 아래 keyPressEvent가 W/A/S/D를 받으려면 이 창
+        # 자신이 포커스를 들고 있어야 한다(내부 표/입력칸에 초점이 있으면
+        # 거기로 먼저 감) — PlayerStatPopup(StrongFocus)과 동일한 정책.
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setWindowModality(Qt.WindowModality.NonModal)
         self.setWindowTitle("세계 축구 기록실")
         self.setStyleSheet(STYLE)
@@ -703,6 +719,55 @@ class WorldBrowserWindow(QDialog):
         if self._player_search_tab_idx is not None:
             self.tabs.setCurrentIndex(self._player_search_tab_idx)
         self._show_player_detail(player_id)
+        self._fm_player_id = player_id   # [2026-08 신설] keyPressEvent의 W/S 기준값
+
+    def keyPressEvent(self, event):
+        """[2026-08 신설, 신민용 요청: "포메이션 화면 선수 클릭 시 세계
+        기록실이 뜨는 건 유지하되, WASD로 옆 선수/반대팀으로 빠르게
+        넘어가는 기능은 되살려달라"] ui/formation_widget.py.
+        PlayerStatPopup.keyPressEvent와 완전히 동일한 규칙 — 이 창이
+        포메이션 화면에서 열렸을 때(self._fm_nav/self._fm_panel 있음)만
+        동작하고, 독립적으로 연 창은 기존 QDialog 기본 동작 그대로다.
+
+        - W/S: self._fm_panel의 "주전(N)→후보(M)" 전체 순서에서 한 칸
+          위/아래 선수로 전환(맨 끝에서 반대쪽 끝으로 순환).
+        - A: 지금 상대팀(우측)을 보고 있을 때만 내 팀(좌측) 주전 맨 위
+          선수로 전환.
+        - D: 지금 내 팀(좌측)을 보고 있을 때만 상대팀(우측) 주전 맨 위
+          선수로 전환.
+        모든 전환은 nav.open_player_popup()을 다시 거친다 — 다음 선수도
+        실제 AI 레코드(id>=-1)면 이 창이 그대로 재사용되고(open_to_player
+        가 다시 불려 _fm_player_id도 같이 갱신됨), 국제대회 가상 폴백
+        선수(id<-1)면 자연스럽게 PlayerStatPopup으로 넘어간다."""
+        if self._fm_nav is None or self._fm_panel is None:
+            return super().keyPressEvent(event)
+
+        key = event.key()
+        if key in (Qt.Key.Key_W, Qt.Key.Key_S):
+            roster = self._fm_panel.get_full_roster_ordered()
+            ids = [p.get("id") for p in roster]
+            if not roster or self._fm_player_id not in ids:
+                return super().keyPressEvent(event)
+            idx = ids.index(self._fm_player_id)
+            new_idx = (idx - 1) % len(roster) if key == Qt.Key.Key_W else (idx + 1) % len(roster)
+            self._fm_nav.open_player_popup(roster[new_idx], self._fm_panel)
+            return
+
+        if key == Qt.Key.Key_A and self._fm_panel.is_opponent:
+            target = self._fm_nav.my_panel
+            starters = target.get_starters_ordered()
+            if starters:
+                self._fm_nav.open_player_popup(starters[0], target)
+            return
+
+        if key == Qt.Key.Key_D and not self._fm_panel.is_opponent:
+            target = self._fm_nav.opp_panel
+            starters = target.get_starters_ordered()
+            if starters:
+                self._fm_nav.open_player_popup(starters[0], target)
+            return
+
+        super().keyPressEvent(event)
 
     def _lazy_show_wb_tab(self, idx):
         """[2026-08 v3.5 신설] 지연 배치해둔 탭을 처음 클릭하는 순간에만
@@ -5704,14 +5769,25 @@ class WorldBrowserWindow(QDialog):
         # [2026-08 신설, 신민용 요청: "이 대회명 써진 줄 우측에 복사하기
         # 버튼을 놔줘"] 헤더 행에 제목 라벨과 나란히(오른쪽 끝) 배치.
         header_row = QHBoxLayout()
-        title = QLabel(f"👥 {header_title}")
-        title.setStyleSheet("color:#ffcc00;font-size:13px;font-weight:bold;")
-        header_row.addWidget(title)
-        header_row.addStretch(1)
         _btn_qss = (
             "QPushButton{background:#333;color:#ddd;border:1px solid #4a4a4a;"
             "border-radius:4px;padding:3px 10px;font-size:11px;}"
             "QPushButton:hover{background:#3d3d3d;}")
+        title = QLabel(f"👥 {header_title}")
+        title.setStyleSheet("color:#ffcc00;font-size:13px;font-weight:bold;")
+        header_row.addWidget(title)
+        # [2026-08 신설, 신민용 요청: "대회명 바로 옆에 이름 한번에
+        # 변경 버튼을 만들어서, 쉼표로 구분해 주전 1번째부터 순서대로
+        # 배정하고 싶다"] 대회명 라벨 바로 옆(복사 버튼들보다 앞쪽)에
+        # 배치 — 공용 open_bulk_rename_dialog(formation_widget.py)를
+        # 그대로 재사용한다(포메이션 화면의 좌/우 버튼과 동일 함수).
+        if starters or bench:
+            rename_btn = QPushButton("✏ 이름 일괄변경")
+            rename_btn.setStyleSheet(_btn_qss)
+            rename_btn.clicked.connect(
+                lambda: self._on_bulk_rename_country_squad(tid, country, header_title, year_txt))
+            header_row.addWidget(rename_btn)
+        header_row.addStretch(1)
         if starters:
             # [2026-08 신설, 신민용 요청: "복사하기 버튼을 2개 만들건데
             # 1번째는 주전만, 2번째는 지금처럼 스쿼드 전체 — 주전 복사는
@@ -5784,6 +5860,32 @@ class WorldBrowserWindow(QDialog):
         content_row.addWidget(roster, 1)
         lay.addLayout(content_row)
         return box
+
+    def _on_bulk_rename_country_squad(self, tid, country, header_title, year_txt):
+        """[2026-08 신설, 신민용 요청] 대회명 옆 "이름 일괄변경" 버튼의
+        진입점. open_bulk_rename_dialog(formation_widget.py와 공유하는
+        함수)로 이 대회의 주전/후보 이름을 한 번에 바꾼 뒤, 지금 펼쳐진
+        이 카드를 최신 데이터로 다시 지어 새 이름이 접었다 펴지 않아도
+        바로 보이게 한다(_on_country_detail_cell_clicked이 처음 펼칠 때
+        쓰는 것과 완전히 같은 셀 위젯 교체 절차)."""
+        squad = wb.get_country_tournament_squad(tid, country)
+        starters, bench = squad.get("starters") or [], squad.get("bench") or []
+        changed = open_bulk_rename_dialog(self, starters, bench)
+        if not changed:
+            return
+        exp = getattr(self, "_country_expanded", None)
+        if not exp or exp.get("tid") != tid:
+            return
+        tbl = self.country_detail_tbl
+        detail_row = exp.get("detail_row")
+        if detail_row is None or not (0 <= detail_row < tbl.rowCount()):
+            return
+        new_widget = self._build_country_squad_detail_widget(tid, country, header_title, year_txt)
+        tbl.setCellWidget(detail_row, 0, new_widget)
+        tbl.resizeRowToContents(detail_row)
+        h = new_widget.sizeHint().height()
+        if h > tbl.rowHeight(detail_row):
+            tbl.setRowHeight(detail_row, h + 8)
 
     def _open_world_browser_from_country_squad(self, players, row):
         """[2026-08 신설] 국가 검색의 대회 스쿼드 표에서 선수 이름을
