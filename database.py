@@ -1686,6 +1686,12 @@ def init_db():
         # receive_transfer_offers를 새로 만들었다가, 기존 토글이 있다는
         # 걸 나중에 발견해서 제거하고 통합함). 판매추진 ON/OFF만 새 필드.
         "ALTER TABLE my_player ADD COLUMN allow_club_sale_push INTEGER DEFAULT 1",
+        # [2026-08 신설, 신민용 요청: "국대 발탁 자동 거절 버튼"] 켜두면
+        # 대표팀 발탁 제안 팝업(Yes/No 창) 자체를 띄우지 않고 자동으로
+        # 거절 처리한다(intl_engine.decline_national_team과 동일한 경로 —
+        # 커리어 기록에도 정상적으로 '발탁 거절'로 남는다). 기본값 0(꺼짐)
+        # → 기존 세이브는 지금까지와 동일하게 팝업이 뜬다.
+        "ALTER TABLE my_player ADD COLUMN auto_decline_callup INTEGER DEFAULT 0",
         # 판매추진 상태 — 시작일/마지막오퍼일/이 기간 전용 거절횟수(일반
         # transfer_rejection_count와 의미가 달라 분리)/종료판정용 저점수
         # 연속주차 카운터.
@@ -1740,6 +1746,17 @@ def init_db():
         # 더 강한 회복 모멘텀을 준다(_process_promotion_relegation 참고).
         # 강등되면 +1, 강등을 면하면(잔류/승격) 0으로 리셋.
         "ALTER TABLE teams ADD COLUMN relegation_streak INTEGER DEFAULT 0",
+        # [2026-08 신설, 신민용 확정: 포메이션 20개 확장 + 전술 성향 시스템]
+        # tactic_tendency: 팀 생성 시 1회 가중 랜덤 배정되는 장기 전술 철학
+        # (VERY_ATTACKING~VERY_DEFENSIVE, constants.TACTIC_TENDENCIES 참고) —
+        # club_ambition(시즌마다 성적 보고 갱신되는 단기 목표)과 달리 감독
+        # 시스템이 따로 생기기 전까지는 안 바뀐다. formation_fit_bonus: 그
+        # 시즌 실제 로스터가 현재 포메이션에 얼마나 맞는지(formation_logic.
+        # formation_fit_bonus 계산 결과, ±SQUAD_FORMATION_FIT_MAX)를 매
+        # 시즌 캐싱해둔 값 — 매치 시뮬 때마다 재계산하지 않고 이 컬럼을
+        # 바로 읽는다(_formation_bias, game_engine.py 참고).
+        "ALTER TABLE teams ADD COLUMN tactic_tendency TEXT DEFAULT 'BALANCED'",
+        "ALTER TABLE teams ADD COLUMN formation_fit_bonus REAL DEFAULT 0",
         # [2026-08 v3.3 신설, 신민용 지적: "재계약 여부가 이번 시즌 OVR
         # 스냅샷 하나로만 기계적으로 결정된다 — 근속·과거 기여도도 봐야
         # 한다"] 이 클럽에서 연속으로 뛴 시즌 수. join_team()에서 새 팀
@@ -3441,11 +3458,17 @@ def _reset_formations_from_seed(c):
     seed_cnt = c.execute("SELECT COUNT(*) c FROM team_formation_seed").fetchone()["c"]
     if seed_cnt == 0:
         c.execute("INSERT INTO team_formation_seed(team_id, formation) SELECT id, formation FROM teams")
-        return
-    c.execute("""UPDATE teams SET formation = (
-                    SELECT formation FROM team_formation_seed
-                    WHERE team_formation_seed.team_id = teams.id)
-                 WHERE id IN (SELECT team_id FROM team_formation_seed)""")
+    else:
+        c.execute("""UPDATE teams SET formation = (
+                        SELECT formation FROM team_formation_seed
+                        WHERE team_formation_seed.team_id = teams.id)
+                     WHERE id IN (SELECT team_id FROM team_formation_seed)""")
+    # [2026-08 신설, 포메이션 20개 확장 + 스쿼드 적합도 시스템] formation_fit_bonus는
+    # "그 세이브의 실제 로스터"를 기준으로 계산된 캐시값이라, 새 게임으로
+    # 선수단이 통째로 재생성되면 그대로 두면 직전 플레이의 스쿼드 기준
+    # 잔여값이 첫 시즌 매치 시뮬에 그대로 새어 들어간다 — 0으로 리셋해두면
+    # 시즌 첫 전환(_shuffle_formations)에서 새 로스터 기준으로 다시 계산된다.
+    c.execute("UPDATE teams SET formation_fit_bonus = 0")
 
 
 def _reset_club_strength(c):
@@ -4171,7 +4194,13 @@ def sync_countries():
 
 # ─── 리그/팀 데이터 ───────────────────────────────────────────
 
-FORMATIONS = ["4-4-2","4-3-3","3-5-2","4-2-3-1","5-3-2","4-1-4-1","3-4-3"]
+# [2026-08 확장, 신민용 확정: 포메이션 7개 → 20개] constants.FORMATION_SLOTS의
+# 키와 항상 동일하게 유지해야 한다 — 여기서 따로 하드코딩하지 않고
+# 그 딕셔너리에서 직접 가져온다(예전엔 두 리스트가 따로 있어서 하나만
+# 고치고 잊어버리는 사고가 날 수 있었다).
+from constants import FORMATION_SLOTS as _FORMATION_SLOTS_FOR_SEED
+from constants import FORMATION_STYLE, TACTIC_TENDENCIES, TACTIC_TENDENCY_WEIGHTS, TACTIC_TENDENCY_LEAN
+FORMATIONS = list(_FORMATION_SLOTS_FOR_SEED.keys())
 
 def _tier_to_int(tier):
     """LEAGUE_DATA의 tier 키를 정수로 정규화.
@@ -4205,11 +4234,26 @@ def _insert_leagues_and_teams(c, progress_cb=None):
             c.execute("INSERT INTO leagues(country_id,tier,name) VALUES(?,?,?)",
                       (cid, tier, league_name))
             lid = c.lastrowid
-            team_rows = [(lid, cid, team_name, random.choice(FORMATIONS), tier)
-                         for team_name in teams]
+            # [2026-08 신설, 신민용 확정] 팀 생성 시점엔 아직 로스터가 없어
+            # (선수 생성은 이후 별도 패스인 _generate_all_ai_players에서
+            # 진행) 스쿼드 적합도 기반 선택은 불가능하다 — 대신 전술 성향
+            # (tactic_tendency)을 먼저 가중 랜덤으로 뽑고, 그 성향과 결이
+            # 맞는 포메이션(FORMATION_STYLE 값이 성향의 TACTIC_TENDENCY_LEAN에
+            # 가까울수록 더 잘 뽑히는 가중치)을 골라 최소한의 일관성은
+            # 갖춘 상태로 시작한다. 첫 시즌 전환부터는 ai_lifecycle의
+            # 스쿼드 적합도 기반 재평가가 정상적으로 이어받는다.
+            team_rows = []
+            for team_name in teams:
+                tendency = random.choices(TACTIC_TENDENCIES, TACTIC_TENDENCY_WEIGHTS)[0]
+                lean = TACTIC_TENDENCY_LEAN[tendency]
+                _f_names = list(FORMATIONS)
+                _f_weights = [max(0.05, 1.5 - abs(lean - FORMATION_STYLE[f])) for f in _f_names]
+                formation = random.choices(_f_names, _f_weights)[0]
+                team_rows.append((lid, cid, team_name, formation, tier, tendency))
             if team_rows:
                 c.executemany(
-                    "INSERT INTO teams(league_id,country_id,name,formation,current_tier) VALUES(?,?,?,?,?)",
+                    """INSERT INTO teams(league_id,country_id,name,formation,current_tier,tactic_tendency)
+                       VALUES(?,?,?,?,?,?)""",
                     team_rows)
         if progress_cb: progress_cb(_i, _total, country_name)
 

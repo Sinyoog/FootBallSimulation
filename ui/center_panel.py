@@ -545,9 +545,16 @@ class CenterPanel(QWidget):
         # 자발적 관심)과 판매추진 토글(내 구단이 나를 시장에 내놓는 것)은
         # 서로 다른 층위라 별개 버튼으로 둔다.
         self.btn_sale_push_toggle = QPushButton("🏟 판매추진 ON"); self.btn_sale_push_toggle.setObjectName("actBtn")
+        # [2026-08 신설, 신민용 요청: "국대 발탁 자동 거절 버튼"] 22세 이후
+        # 대표팀을 스스로 골랐다면, 그 뒤로도 매 대회 발탁 제안이 Yes/No
+        # 팝업으로 뜬다(intl_engine._create_tournament의 my_sel=3 경로).
+        # 이 버튼을 켜두면 그 팝업을 아예 띄우지 않고 자동으로 거절한다
+        # (_auto_decline_all_pending과 동일한 방식 재사용).
+        self.btn_nat_auto_decline = QPushButton("🌍 국대 발탁 자동거절 OFF"); self.btn_nat_auto_decline.setObjectName("actBtn")
         self.btn_retire = QPushButton("🚪 은퇴");     self.btn_retire.setObjectName("actBtn")
         self.btn_world  = QPushButton("🌍 세계 기록실"); self.btn_world.setObjectName("actBtn")
-        for b in [self.btn_agent, self.btn_offer_toggle, self.btn_sale_push_toggle, self.btn_retire, self.btn_world]:
+        for b in [self.btn_agent, self.btn_offer_toggle, self.btn_sale_push_toggle,
+                  self.btn_nat_auto_decline, self.btn_retire, self.btn_world]:
             row2.addWidget(b)
         row2.addStretch()
         self.lay.addLayout(row2)
@@ -564,6 +571,7 @@ class CenterPanel(QWidget):
         self.btn_agent.clicked.connect(self._do_agent)
         self.btn_offer_toggle.clicked.connect(self._do_toggle_offers)
         self.btn_sale_push_toggle.clicked.connect(self._do_toggle_sale_push)
+        self.btn_nat_auto_decline.clicked.connect(self._do_toggle_nat_auto_decline)
         self.btn_retire.clicked.connect(self._do_retire)
         self.btn_world.clicked.connect(self._do_world_browser)
 
@@ -1190,6 +1198,19 @@ class CenterPanel(QWidget):
                 "단, 매우 심각한 상황(강등+계약임박+불화 등 다수 겹침)에서는 "
                 "그래도 구단이 최종 결정을 내릴 수 있습니다.")
 
+        # [국대 발탁 자동거절 토글] 켜져 있으면 대표팀 발탁 제안 Yes/No
+        # 팝업 자체를 띄우지 않고 자동으로 거절한다.
+        auto_decline_on = bool(p.get("auto_decline_callup", 0))
+        if auto_decline_on:
+            self.btn_nat_auto_decline.setText("🌍 국대 발탁 자동거절 ON")
+            self.btn_nat_auto_decline.setToolTip(
+                "대표팀 발탁 제안이 오면 팝업 없이 자동으로 거절합니다. 클릭하면 끕니다.")
+        else:
+            self.btn_nat_auto_decline.setText("🌍 국대 발탁 자동거절 OFF")
+            self.btn_nat_auto_decline.setToolTip(
+                "클릭하면 대표팀 발탁 제안을 팝업 없이 자동으로 거절하도록 켭니다. "
+                "(22세 이후 대표팀을 선택해두면 그 나라에서만 발탁 제안이 옵니다)")
+
         # 모드 토글 버튼: 묶음 진행 중(_step_idx>0)엔 전환 불가 → 회색 비활성.
         # 전환 가능할 때(묶음 시작 전)는 파란색으로 강조.
         switchable = (self._step_idx == 0)
@@ -1774,12 +1795,18 @@ class CenterPanel(QWidget):
             return
         pend = intl_engine.get_pending_choice()
         if pend:
-            show_toast(self, "⚠  먼저 대표팀을 선택해야 합니다!", "#cc6600", 1600)
-            self._show_nat_choice(pend)
-            from PyQt6.QtWidgets import QApplication
-            QApplication.restoreOverrideCursor()
-            self.adv_btn.setEnabled(True)
-            return
+            # [2026-08 신설] 국대 발탁 자동거절 토글이 켜져 있으면 팝업을
+            # 띄우지 않고 곧바로 자동 거절 처리한 뒤 진행을 계속한다.
+            if bool(p.get("auto_decline_callup", 0)):
+                self._auto_decline_all_pending(intl_engine)
+                show_toast(self, "🌍 국가대표 발탁을 자동으로 거절했습니다", "#666666", 1800)
+            else:
+                show_toast(self, "⚠  먼저 대표팀을 선택해야 합니다!", "#cc6600", 1600)
+                self._show_nat_choice(pend)
+                from PyQt6.QtWidgets import QApplication
+                QApplication.restoreOverrideCursor()
+                self.adv_btn.setEnabled(True)
+                return
 
         week = st["current_week"]
         from constants import DAYS_PER_WEEK
@@ -2035,10 +2062,16 @@ class CenterPanel(QWidget):
         # 즉시 이어서 실행한다(동작 변화 없음).
         pend = intl_engine.get_pending_choice()
         if pend:
-            self._show_nat_choice(pend)
-            QTimer.singleShot(0, lambda: self._on_advance_finished_continue(
-                p2, st2, bundle_done, new_week, in_zone))
-            return
+            # [2026-08 신설] 국대 발탁 자동거절 토글이 켜져 있으면 팝업을
+            # 띄우지 않고 자동으로 거절한 뒤 그대로 이어서 진행한다.
+            if bool(p2.get("auto_decline_callup", 0)):
+                self._auto_decline_all_pending(intl_engine)
+                show_toast(self, "🌍 국가대표 발탁을 자동으로 거절했습니다", "#666666", 1800)
+            else:
+                self._show_nat_choice(pend)
+                QTimer.singleShot(0, lambda: self._on_advance_finished_continue(
+                    p2, st2, bundle_done, new_week, in_zone))
+                return
         self._on_advance_finished_continue(p2, st2, bundle_done, new_week, in_zone)
 
     def _on_advance_finished_continue(self, p2, st2, bundle_done, new_week, in_zone):
@@ -3350,6 +3383,26 @@ class CenterPanel(QWidget):
         else:
             show_toast(self, "🏟 구단 판매 추진을 억제합니다  (단, 매우 심각한 상황에선 최종 결정 가능)",
                       "#666666", 2500)
+        if self.main_win: self.main_win.refresh_all()
+
+    def _do_toggle_nat_auto_decline(self):
+        """[2026-08 신설] 국대 발탁 자동거절 ON/OFF 토글.
+        ON이면 대표팀 발탁 제안(Yes/No 팝업)이 뜨지 않고 자동으로 거절
+        처리된다 — _auto_decline_all_pending과 동일한 경로(decline_national_team)를
+        타므로 커리어 기록에도 정상적으로 '발탁 거절'로 남는다."""
+        p = get_player()
+        if not p: return
+        from game_engine import update_player
+        cur = bool(p.get("auto_decline_callup", 0))
+        new_val = 0 if cur else 1
+        update_player(auto_decline_callup=new_val)
+        if new_val:
+            show_toast(self, "🌍 국대 발탁을 앞으로 자동 거절합니다", "#666666", 2000)
+            # 켜는 즉시 이미 대기 중인 발탁 제안이 있으면 곧바로 정리한다.
+            import intl_engine
+            self._auto_decline_all_pending(intl_engine)
+        else:
+            show_toast(self, "🌍 국대 발탁 제안을 다시 팝업으로 물어봅니다", "#006622", 2000)
         if self.main_win: self.main_win.refresh_all()
 
     def _do_join(self):

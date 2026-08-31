@@ -83,6 +83,7 @@ def _invalidate_team_ovr_cache():
     _league_ovr_cache.clear()
     _league_tier_cache.clear()
     _team_formation_cache.clear()
+    _team_formation_fit_cache.clear()
     # 승강으로 팀이 다른 리그로 이동해도 팀명은 안 바뀌므로 _team_name_cache는 비우지 않음
 
     # [2026-08 신설, 성능] 국내컵 엔진의 "나라·티어별 팀 목록"/cup_entries
@@ -2078,9 +2079,35 @@ def _team_formation(c, team_id):
     return val
 
 
+# [2026-08 신설, 포메이션 20개 확장 + 스쿼드 적합도 시스템] teams.
+# formation_fit_bonus(그 시즌 실제 로스터가 현재 포메이션에 얼마나
+# 맞는지, ai_lifecycle._shuffle_formations가 매 시즌 계산해 캐싱해둔
+# 값)를 세션 캐시로 읽는다 — _team_formation과 동일한 패턴(PK 조회를
+# 세션 동안 0비용화), _invalidate_team_ovr_cache가 같이 비운다.
+_team_formation_fit_cache: dict = {}
+
+
+def _formation_fit_bias(c, team_id):
+    """스쿼드-포메이션 적합도에 따른 소폭 전력 보정치
+    (constants.SQUAD_FORMATION_FIT_MAX 참조, ±1.0 이내). formation_fit_bonus는
+    선수 개별 능력치를 올리는 게 아니라 이 보정 하나로만 반영된다."""
+    cached = _team_formation_fit_cache.get(team_id)
+    if cached is not None:
+        return cached
+    c.execute("SELECT formation_fit_bonus FROM teams WHERE id=?", (team_id,))
+    row = c.fetchone()
+    val = (row["formation_fit_bonus"] if row else None) or 0.0
+    _team_formation_fit_cache[team_id] = val
+    return val
+
+
 def _formation_bias(c, team_id):
-    """포메이션 스타일에 따른 소폭 전력 보정치 (FORMATION_STYLE 참조, ±1.5 이내)."""
-    return FORMATION_STYLE.get(_team_formation(c, team_id), 0.0)
+    """포메이션 보정치 = 정적 스타일(FORMATION_STYLE, ±1.5) + 스쿼드 적합도
+    (_formation_fit_bias, ±1.0) — 최대 ±2.5. [2026-08 재조정, 신민용 확정]
+    club_strength/prestige 보정 재조정 때와 같은 원칙: 포메이션 하나로
+    실력차(OVR)가 뒤집힐 만큼 커지면 안 된다."""
+    return (FORMATION_STYLE.get(_team_formation(c, team_id), 0.0)
+            + _formation_fit_bias(c, team_id))
 
 
 def _match_win_probs(diff):
@@ -12554,6 +12581,24 @@ def generate_offers(count=5, force=False) -> list:
     _my_continent = get_country_continent(nationality)
     has_team    = bool(p.get("current_team_id", 0))
     my_tid      = p.get("current_team_id", 0)
+    # [2026-08 버그수정, 신민용 리포트: "오퍼를 수락해서 이적을 확정했는데
+    # (reserve_join_transfer로 예약되고, 다음 상/하반기 시작 시점에
+    # _execute_pending_join_transfer가 실제로 실행 — 시즌 도중 소속이
+    # 바뀌는 정합성 문제를 막기 위한 의도된 지연) 정작 그 사이(예약~
+    # 실제 실행 전, 시즌 종료~다음 시즌 시작 구간)에 오퍼창이 다시 열리면
+    # 방금 합류하기로 확정한 그 팀이 또 오퍼로 뜬다"] 원인: 예약 이적은
+    # 실행 전까지 current_team_id를 그대로 옛 팀으로 유지하는데, 아래
+    # 후보 필터링은 전부 "현재 팀만"(r['id'] != my_tid) 제외해서 '이미
+    # 합류하기로 확정한 다음 팀'은 제외 대상에서 빠져 있었다. 예약된
+    # 이적이 있으면 그 목적지 팀도 같이 제외 대상에 넣는다.
+    _pending_dest_tid = 0
+    _pending_raw_gen = p.get("pending_join_transfer_json") or ""
+    if _pending_raw_gen:
+        try:
+            _pending_dest_tid = int(json.loads(_pending_raw_gen).get("team_id") or 0)
+        except Exception:
+            _pending_dest_tid = 0
+    _self_team_ids = {my_tid, _pending_dest_tid} - {0}
     grades      = _suitable_grades(ovr, agent)
     # [2026-07 버그수정, 신민용 지적: "인기도/명성이 직접 지원엔 반영되는데
     # 자동 오퍼엔 전혀 안 쓰인다"] calc_apply_prob_with_context()는 이미
@@ -12807,7 +12852,7 @@ def generate_offers(count=5, force=False) -> list:
             #   한다 — 하위권은 어차피 직접 지원으로도 갈 수 있어 패시브
             #   오퍼 슬롯을 거기 쓸 이유가 없다.
             cands = [r for r in c.fetchall()
-                     if r["id"] not in exclude_ids and r["id"] != my_tid and _team_fits_me(r)]
+                     if r["id"] not in exclude_ids and r["id"] not in _self_team_ids and _team_fits_me(r)]
             if not cands:
                 continue
             cands.sort(key=lambda r: _team_avg_cache_offers.get(r["id"], 0), reverse=True)
@@ -12923,7 +12968,7 @@ def generate_offers(count=5, force=False) -> list:
                              JOIN leagues l ON t.league_id=l.id
                              JOIN countries cn ON l.country_id=cn.id
                              WHERE cn.grade=? AND l.tier=?""", (_grade_filter, tier))
-            _all_rows = [r for r in c.fetchall() if r["id"] not in exclude_ids and r["id"] != my_tid]
+            _all_rows = [r for r in c.fetchall() if r["id"] not in exclude_ids and r["id"] not in _self_team_ids]
             if not _all_rows:
                 continue   # 이 등급·tier엔 후보 팀 자체가 없음(제외 목록 등) — 포기
             cands = [r for r in _all_rows if _team_fits_me(r)]
@@ -13058,7 +13103,7 @@ def generate_offers(count=5, force=False) -> list:
                 row = c.fetchone()
                 if not row: return False
             if any(o["team_id"] == row["id"] for o in offers): return False
-            if row["id"] == my_tid: return False
+            if row["id"] in _self_team_ids: return False
             _wealth_g = get_league_grade(row["country"], row["grade"])
             salary = _calc_offer_salary(p, _wealth_g, tier, ovr, row["country"], row["name"],
                                          year=p.get("current_year"), team_id=row["id"],
@@ -13125,7 +13170,7 @@ def generate_offers(count=5, force=False) -> list:
             row = c.fetchone()
             if not row: continue
             if any(o["team_id"] == row["id"] for o in offers): continue
-            if row["id"] == my_tid: continue
+            if row["id"] in _self_team_ids: continue
             if not _team_fits_me(row): continue
             _wealth_g = get_league_grade(row["country"], row["grade"])
             salary = _calc_offer_salary(p, _wealth_g, tier, ovr, row["country"], row["name"],
@@ -13159,7 +13204,7 @@ def generate_offers(count=5, force=False) -> list:
                 row = c.fetchone()
                 if not row: continue
                 if any(o["team_id"] == row["id"] for o in offers): continue
-                if row["id"] == my_tid: continue
+                if row["id"] in _self_team_ids: continue
                 if not _team_fits_me(row): continue
                 _wealth_g = get_league_grade(row["country"], row["grade"])
                 salary = _calc_offer_salary(p, _wealth_g, tier, ovr, row["country"], row["name"],

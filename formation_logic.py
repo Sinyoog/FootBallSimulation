@@ -21,7 +21,7 @@ ui/formation_widget.py와 ai_lifecycle.py 둘 다 여기서 import해서 쓴다
 같은 알고리즘을 쓰므로 서로 다른 결과가 나올 일이 없다), 위치만
 공용 모듈로 옮긴 것.
 """
-from constants import POSITION_COMPAT
+from constants import POSITION_COMPAT, POSITION_MISMATCH_PENALTY
 
 
 # [2026-08 최적화] 아래 _pos_category는 시즌 전환 한 번에 350만 회 넘게
@@ -195,3 +195,108 @@ def compute_squad_roles(pool):
             role = "대기"
         result[pid] = role
     return result
+
+
+# ─────────────────────────────────────────────
+# [2026-08 신설, 신민용 확정: "포메이션 20개 확장 + 스쿼드 적합도 시스템"]
+# 팀 로스터가 특정 포메이션 슬롯 구성에 얼마나 잘 맞는지를 계산한다.
+# ai_lifecycle._update_formations_and_fit()(시즌 전환 시 모든 팀의
+# 포메이션 재검토/formation_fit_bonus 캐시 갱신)과 game_engine._formation_
+# bias()(경기 시뮬 보정, 캐시된 값만 읽음)가 이 모듈의 함수를 공용으로
+# 쓴다 — Qt 의존성 없는 이 파일에 두는 이유는 파일 맨 위 docstring과
+# 동일(헤드리스 환경에서도 import 가능해야 함).
+# ─────────────────────────────────────────────
+def _mismatch_rank(player_pos, slot_pos):
+    """_best_slot_for_player와 동일한 우선순위 규칙으로 (선수 주포지션,
+    배정된 슬롯) 한 쌍의 미스매치 등급을 구한다. 0=완벽 매치, 값이
+    클수록 어색한 배치 — POSITION_MISMATCH_PENALTY 인덱스로 그대로 쓴다."""
+    compat = POSITION_COMPAT.get(player_pos, [player_pos])
+    if slot_pos in compat:
+        return compat.index(slot_pos)
+    if _pos_category(player_pos) == _pos_category(slot_pos):
+        return 4   # 카테고리만 일치 — _best_slot_for_player의 카테고리 폴백과 동일 등급
+    return 4        # 완전 폴백도 동일 등급(POSITION_MISMATCH_PENALTY 마지막 값 재사용)
+
+
+def formation_fit_penalty(roster, slots):
+    """roster: [{'position': pos, 'ovr': ovr}, ...] (스쿼드 전체, 보통
+    20~25명 — 상위 OVR 11명이 자연스럽게 주전으로 뽑힌다. _greedy_fill_
+    slots와 동일한 알고리즘이라 "이 시즌 실제 주전 슬롯 배정"과 항상
+    같은 기준으로 계산된다).
+    slots: FORMATION_SLOTS[formation] (길이 11).
+    반환: OVR 가중 평균 미스매치 페널티(0.0~0.15, POSITION_MISMATCH_
+    PENALTY 범위 그대로) — 낮을수록 이 스쿼드가 이 포메이션에 잘 맞는다."""
+    if not roster or not slots:
+        return 0.0
+    filled = _greedy_fill_slots(list(roster), list(slots))
+    total_ovr = 0.0
+    weighted_penalty = 0.0
+    for slot_pos, pl in zip(slots, filled):
+        if pl is None:
+            continue
+        ovr = pl.get("ovr", 0) or 0
+        rank = _mismatch_rank(pl.get("position", "CM"), slot_pos)
+        idx = min(rank, len(POSITION_MISMATCH_PENALTY) - 1)
+        weighted_penalty += ovr * POSITION_MISMATCH_PENALTY[idx]
+        total_ovr += ovr
+    if total_ovr <= 0:
+        return 0.0
+    return weighted_penalty / total_ovr
+
+
+def formation_fit_norm(avg_penalty, max_penalty=0.15):
+    """formation_fit_penalty() 결과(0~0.15)를 여러 포메이션 후보를 서로
+    비교하는 선택 로직용으로 0~1 정규화한다 — 낮은 페널티일수록 1에
+    가깝다(스쿼드가 잘 맞는 포메이션일수록 점수가 높다)."""
+    if max_penalty <= 0:
+        return 1.0
+    return max(0.0, min(1.0, 1.0 - avg_penalty / max_penalty))
+
+
+def formation_fit_bonus(avg_penalty):
+    """[2026-08 신설, 신민용 확정: "포메이션 적합도는 선수 능력치를 직접
+    올리는 게 아니라 팀 전술 효율 보정으로만 쓴다"] formation_fit_penalty()
+    결과를 경기 시뮬레이션(game_engine._formation_bias)에 더해지는
+    ±constants.SQUAD_FORMATION_FIT_MAX 범위의 보너스로 변환한다.
+    SQUAD_FORMATION_FIT_BASELINE_PENALTY(평균적인 어긋남 정도)보다 덜
+    어긋나면 +, 더 어긋나면 - — 실력차(OVR)를 뒤집을 정도로 크지 않게
+    club_strength/prestige 재조정 때와 같은 원칙으로 상한을 걸었다."""
+    from constants import (SQUAD_FORMATION_FIT_MAX,
+                           SQUAD_FORMATION_FIT_BASELINE_PENALTY,
+                           SQUAD_FORMATION_FIT_PENALTY_SPAN)
+    raw = (SQUAD_FORMATION_FIT_BASELINE_PENALTY - avg_penalty) / SQUAD_FORMATION_FIT_PENALTY_SPAN
+    return max(-SQUAD_FORMATION_FIT_MAX,
+               min(SQUAD_FORMATION_FIT_MAX, raw * SQUAD_FORMATION_FIT_MAX))
+
+
+def choose_formation(roster, current_formation, tendency, rng=None):
+    """[2026-08 신설, 신민용 확정: "score = squad_fit(60%) + tendency_fit(30%)
+    + random(10%), 상위 몇 개 후보 중 가중 랜덤"] 시즌 전환 시 포메이션을
+    재검토하는 팀에 대해 호출한다(재검토 여부 자체는 constants.
+    FORMATION_REEVAL_PROB로 호출부에서 먼저 굴린다 — 이 함수는 "재검토
+    한다면 무엇을 고를지"만 담당).
+    roster: [{'position':pos,'ovr':ovr}, ...] 그 팀 스쿼드 전체.
+    current_formation: 지금 쓰고 있는 포메이션(동점 시 유지 성향에 참고 가능,
+    현재는 후보 풀에 포함만 시키고 특별 가중치는 안 둠).
+    tendency: constants.TACTIC_TENDENCIES 중 하나.
+    반환: (선택된 포메이션 이름, 그 포메이션의 formation_fit_penalty 값)
+    — 후자는 호출부가 formation_fit_bonus() 캐싱에 바로 재사용한다."""
+    import random as _random
+    from constants import (FORMATION_SLOTS, FORMATION_STYLE, TACTIC_TENDENCY_LEAN,
+                           FORMATION_SCORE_WEIGHTS, FORMATION_CANDIDATE_TOP_N)
+    _rng = rng or _random
+    lean = TACTIC_TENDENCY_LEAN.get(tendency, 0.0)
+    w = FORMATION_SCORE_WEIGHTS
+    scored = []
+    for name, slots in FORMATION_SLOTS.items():
+        penalty = formation_fit_penalty(roster, slots)
+        squad_fit = formation_fit_norm(penalty)
+        tendency_fit = max(0.0, 1.0 - abs(lean - FORMATION_STYLE.get(name, 0.0)) / 3.0)
+        score = (w["squad_fit"] * squad_fit + w["tendency_fit"] * tendency_fit
+                 + w["random"] * _rng.random())
+        scored.append((score, name, penalty))
+    scored.sort(key=lambda t: -t[0])
+    top = scored[:FORMATION_CANDIDATE_TOP_N] or scored
+    weights = [max(0.01, s) for s, _n, _p in top]
+    chosen_score, chosen_name, chosen_penalty = _rng.choices(top, weights)[0]
+    return chosen_name, chosen_penalty

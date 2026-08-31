@@ -21,6 +21,9 @@ import math
 import contextlib   # [2026-08 최적화] _indexes_off_for_mass_update용
 from database import (get_conn, calc_ovr, ALL_STATS, KEY_STATS_BY_POS,
                       roll_bench_position)
+# [2026-08 신설, 포메이션 20개 확장 + 스쿼드 적합도 시스템] 모듈 레벨에서
+# _FORMATIONS 동기화(아래)와 _shuffle_formations()에 필요.
+from constants import FORMATION_SLOTS, FORMATION_REEVAL_PROB
 
 try:
     import numpy as np
@@ -212,8 +215,11 @@ def _ai_retirement_probability(age, ovr, position, category="mid", intl_factor=1
         p *= intl_factor
     return min(1.0, p)
 
-# 포메이션 후보 (감독 교체 시 랜덤 선택)
-_FORMATIONS = ["4-4-2", "4-3-3", "4-2-3-1", "3-5-2", "4-1-4-1", "3-4-3", "5-3-2"]
+# [2026-08 버그수정, 신민용 확정: 포메이션 20개 확장] 예전엔 이 리스트가
+# constants.FORMATION_SLOTS와 따로 하드코딩돼 있어서(7개, 심지어 그때도
+# 이미 미묘하게 순서/구성이 달랐다) 하나만 고치고 잊어버리는 사고가 날 수
+# 있었다 — 이제 FORMATION_SLOTS 키를 그대로 가져와 항상 동기화한다.
+_FORMATIONS = list(FORMATION_SLOTS.keys())
 
 # ALL_STATS 인덱스 선조회 (반복 list.index 방지)
 _STAT_COLS = ",".join(ALL_STATS)
@@ -2889,18 +2895,60 @@ def snapshot_my_player_position(year):
 
 
 def _shuffle_formations(c):
-    """일부 팀의 포메이션 변경. 시즌마다 ~20% 팀이 전술 교체.
-    [최적화] executemany로 일괄 UPDATE."""
+    """[2026-08 재설계, 신민용 확정: "포메이션 20개 확장 + 스쿼드 적합도/
+    전술 성향 기반 선택"] 예전엔 팀의 20%가 완전 무작위로 다른 포메이션을
+    뽑았다(스쿼드 구성도 감독 성향도 전혀 안 봄) — 함수 이름은 하위호환
+    (rng_probe.py가 이 이름으로 monkeypatch, database.py 여러 주석이 이
+    이름을 언급)을 위해 그대로 두지만 내부 로직은 완전히 새로 짰다.
+
+    모든 팀에 대해 매 시즌:
+      1) teams.formation_fit_bonus 캐시를 이번 시즌 확정된 로스터 기준
+         으로 항상 갱신한다 — 포메이션이 안 바뀌어도 이적/은퇴로 로스터
+         구성 자체는 매년 바뀌므로 재계산이 필요하다. 실제 매치 시뮬
+         보정(game_engine._formation_bias)은 이 캐시값만 읽는다(매치마다
+         재계산하지 않음).
+      2) constants.FORMATION_REEVAL_PROB 확률에 걸린 팀만 포메이션 자체를
+         재검토한다 — formation_logic.choose_formation()이 스쿼드 적합도
+         (60%) + 전술 성향 적합도(30%) + 랜덤(10%)으로 점수를 매겨 상위
+         5개 후보 중 가중 랜덤으로 고른다("수비 성향 팀이 무조건 5-4-1만
+         고르지 않는다"는 신민용 요청 반영). 안 걸린 팀은 기존 포메이션
+         유지.
+    반환: 실제로 포메이션이 바뀐 팀 수(기존 반환값과 동일한 의미)."""
+    import formation_logic as _flogic
+
+    teams = c.execute("SELECT id, formation, tactic_tendency FROM teams").fetchall()
+    ai_rows = c.execute("SELECT team_id, position, ovr FROM ai_players").fetchall()
+    roster_by_team: dict = {}
+    for r in ai_rows:
+        roster_by_team.setdefault(r["team_id"], []).append(
+            {"position": r["position"], "ovr": r["ovr"]})
+
     changed = 0
-    teams = c.execute("SELECT id, formation FROM teams").fetchall()
-    updates = []
+    formation_updates = []   # (formation, team_id)
+    fit_updates = []         # (fit_bonus, team_id)
     for t in teams:
-        if random.random() < 0.20:
-            new_f = random.choice([f for f in _FORMATIONS if f != t["formation"]])
-            updates.append((new_f, t["id"]))
-            changed += 1
-    if updates:
-        c.executemany("UPDATE teams SET formation=? WHERE id=?", updates)
+        roster = roster_by_team.get(t["id"])
+        if not roster:
+            continue   # 로스터가 아직 없는 극초반(부트스트랩) 상황 방어
+        cur_formation = t["formation"] or "4-4-2"
+        tendency = t["tactic_tendency"] or "BALANCED"
+
+        if random.random() < FORMATION_REEVAL_PROB:
+            new_formation, penalty = _flogic.choose_formation(roster, cur_formation, tendency)
+            if new_formation != cur_formation:
+                changed += 1
+                formation_updates.append((new_formation, t["id"]))
+                cur_formation = new_formation
+        else:
+            slots = FORMATION_SLOTS.get(cur_formation, FORMATION_SLOTS["4-4-2"])
+            penalty = _flogic.formation_fit_penalty(roster, slots)
+
+        fit_updates.append((_flogic.formation_fit_bonus(penalty), t["id"]))
+
+    if formation_updates:
+        c.executemany("UPDATE teams SET formation=? WHERE id=?", formation_updates)
+    if fit_updates:
+        c.executemany("UPDATE teams SET formation_fit_bonus=? WHERE id=?", fit_updates)
     return changed
 
 
