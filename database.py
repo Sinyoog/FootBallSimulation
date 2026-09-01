@@ -881,6 +881,24 @@ def init_db():
         matches INTEGER, goals INTEGER, assists INTEGER, rating REAL,
         PRIMARY KEY(player_id, year)) WITHOUT ROWID""")
 
+    # [2026-09 신설, 신민용 요청: "리그/국내컵/클럽대항전/슈퍼컵/클럽월드컵
+    # 다 평점·골·어시를 다르게 둬야 하는데 그게 안 되어 있다"] 위
+    # ai_player_season_stats는 그 해 "리그" 성적만 담는 표였는데(리그가
+    # 아닌 대회는 아예 별도 컬럼·표가 없었음) — 국내컵/클럽대항전(CL·EL·
+    # ECL 통합)/슈퍼컵/클럽월드컵 4개 대회의 추정치를 별도로 담는 표.
+    # 리그는 이미 위 표에 있으므로 여기 competition 값에서 제외하고
+    # 'cup'/'cl'/'sc'/'cwc' 4종만 쓴다(world_browser.py가 이미 팀 단위
+    # 진출기록 문구를 만들 때 쓰는 competition 구분과 동일한 이름).
+    # 한 선수가 한 해에 여러 대회에 나갔을 수 있어(예: 국내컵+챔스 동시
+    # 진행) player_id 하나가 이 표에 최대 4행을 가질 수 있다 — PK에
+    # competition을 포함시킨 이유. 팀이 그 해 그 대회 자체에 안 나갔으면
+    # 행 자체가 안 생긴다(자세한 계산 근거는 ai_lifecycle._snapshot_
+    # season_ratings 참고).
+    c.execute("""CREATE TABLE IF NOT EXISTS hist.ai_player_season_stats_by_comp(
+        player_id INTEGER, year INTEGER, competition TEXT,
+        matches INTEGER, goals INTEGER, assists INTEGER, rating REAL,
+        PRIMARY KEY(player_id, year, competition)) WITHOUT ROWID""")
+
     # [2026-08 신설, 신민용 리포트: "선수 검색에서 나(my_player)를 보면
     # OVR이 하나도 안 찍혀있다"] ai_player_ovr_history와 완전히 같은
     # 목적이지만 my_player 전용(세이브당 my_player가 하나뿐이라
@@ -2210,6 +2228,15 @@ def init_db():
         # 막는 데 사용(시즌당 1회 제한). 0이면 아직 이번 세이브에서 한 번도
         # 협상하지 않은 상태(current_season은 1부터 시작하므로 항상 구분됨).
         "ALTER TABLE my_player ADD COLUMN renewal_negotiated_season INTEGER DEFAULT 0",
+        # [2026-09 신설, 신민용 요청: "경기 전날 고강도 훈련을 하면 경기
+        # 부상 확률을 높여줘"] 바로 전날에 무슨 훈련을 했는지 알아야
+        # _simulate_match가 그 정보를 보고 경기 부상 확률에 반영할 수
+        # 있는데, 지금까지는 그날그날 훈련 종류를 다음날까지 남겨두는
+        # 값이 전혀 없었다 — 매 훈련(_process_training)이 끝날 때마다
+        # 이번 훈련 종류로 갱신하고, 경기가 있는 날엔 그 경기 시뮬레이션
+        # (_simulate_match)이 "어제 값"으로 그대로 읽은 뒤 다시 빈 값으로
+        # 리셋한다(그날은 훈련이 아니라 경기였으므로).
+        "ALTER TABLE my_player ADD COLUMN last_training_type TEXT DEFAULT ''",
         # [2026-08 버그수정, 신민용 리포트: "2006 월드컵 출전기록이 이상하게
         # 흩어진다 — 주전 골키퍼도 3연속 못 뛰고 2/3, 1/3, 0/3으로 갈린다"]
         # 원인: intl_engine._pick_intl_starters가 매 경기 'OVR-출전횟수×1.0'
@@ -3969,6 +3996,12 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
               # 반복돼온 "새 표를 이 목록에 추가하는 걸 깜빡함" 패턴을
               # 신설 시점에 바로 방지.
               "hist.ai_player_season_stats",
+              # [2026-09 신설] 대회별(국내컵/클럽대항전/슈퍼컵/클럽월드컵)
+              # 평점·골·도움 추정치 아카이브도 바로 위 ai_player_season_stats와
+              # 완전히 같은 이유(같은 시점에 같이 쌓이는 쌍둥이 표)로 새 게임
+              # 시작 시 반드시 같이 비운다 — 이 프로젝트가 반복해서 겪은 "새
+              # 표를 이 목록에 추가하는 걸 깜빡함" 패턴을 신설 시점에 바로 방지.
+              "hist.ai_player_season_stats_by_comp",
               # [2026-08 신설] my_player 전용 연도별 OVR 아카이브도 새
               # 게임에서 비워야 한다 — 안 비우면 새로 만든 캐릭터의 선수
               # 검색 화면에 이전 캐릭터의 OVR 이력이 그대로 뜬다.
@@ -3992,7 +4025,7 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
     for _t in ("team_power_rankings", "team_b_history",
                "league_season_standings", "league_season_standings_half",
                "ai_player_ovr_history", "ai_player_position_history",
-               "ai_player_season_stats"):
+               "ai_player_season_stats", "ai_player_season_stats_by_comp"):
         try:
             c.execute(f"DELETE FROM main.{_t}")
         except sqlite3.OperationalError:
@@ -4117,6 +4150,33 @@ def set_ai_player_custom_name(player_id: int, custom_name: str, conn=None):
     conn.commit()
     if _own:
         conn.close()
+
+
+def set_ai_player_nationality(player_id: int, nationality: str, conn=None) -> bool:
+    """[2026-09 신설, 신민용 요청: "국적도 내가 입력하면 변하게"] 이름/OVR
+    편집과 같은 방식(쉬움 난이도 전용 조작, UI 쪽 게이트는 호출부 책임)으로
+    AI 선수의 국적을 직접 지정한다. ai_players.nationality는 국가명 그대로
+    담는 평문 텍스트 컬럼이라(countries.name과 LEFT JOIN으로 국기 등을
+    붙여 표시 — get_ai_player_detail 등 참고), 임의 문자열이 그대로
+    들어가면 화면상 국기가 안 붙거나 존재하지 않는 나라가 될 수 있다 —
+    countries 테이블에 실제 존재하는 이름인지 검증한 뒤에만 반영한다.
+    선수가 없거나(retired 등 ai_players에 없는 id 포함) 국가명이 유효하지
+    않으면 아무것도 바꾸지 않고 False."""
+    _own = conn is None
+    conn = conn or get_conn()
+    try:
+        row = conn.execute("SELECT id FROM ai_players WHERE id=?", (player_id,)).fetchone()
+        if not row:
+            return False
+        valid = conn.execute("SELECT 1 FROM countries WHERE name=?", (nationality,)).fetchone()
+        if not valid:
+            return False
+        conn.execute("UPDATE ai_players SET nationality=? WHERE id=?", (nationality, player_id))
+        conn.commit()
+        return True
+    finally:
+        if _own:
+            conn.close()
 
 
 def calc_ovr(position, stats, cap=100):

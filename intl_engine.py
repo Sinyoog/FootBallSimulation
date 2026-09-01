@@ -225,19 +225,37 @@ def _nat_team_ovr(grade, name="", continent="", fast=False, year=None):
     세대만 바뀐다"는 설계 원칙을 결과값에도 반영한다. year를 안 넘기면
     (연도 무관 호출) 계수 없이 밴드 삼각분포만 쓴다.
 
-    [실제 스쿼드 블렌딩] ai_players.nationality로 실제 스쿼드를 구성할
-    수 있으면(포지션별 8명 이상) 그 실제 평균을 70%, 밴드 기반 공식값을
-    30%로 블렌딩한다. fast=True면 이 블렌딩을 건너뛰고 공식값만 쓴다
-    (월드컵 예선처럼 200여 개국을 한 번에 순회하는 대량 호출 지점 전용
-    — 나라마다 실제 스쿼드 조회까지 다 태우면 체감될 만큼 느려진다)."""
+    [실제 스쿼드 반영] ai_players.nationality로 실제 스쿼드를 구성할 수
+    있으면(포지션별 8명 이상) 그 실제 평균(_get_real_squad_ovr)을 그대로
+    쓴다(2026-09 수정 — 예전엔 이 실제 평균을 70%만 반영하고 나머지 30%는
+    아래 밴드 기반 공식값을 섞었는데, 그러면 실제 선수 개개인 OVR이 아무리
+    높아도 그 30%만큼 낮게 나올 수 있었다 — get_nat_ovr_band 정의부 아래
+    수정 사유 주석 참고). 스쿼드가 min_count(8명/포지션) 미만이라 실제
+    평균 자체를 못 구하는 나라만 아래 공식값을 그대로 쓴다. fast=True면
+    이 실제 평균 조회 자체를 건너뛰고 무조건 공식값만 쓴다(월드컵 예선처럼
+    200여 개국을 한 번에 순회하는 대량 호출 지점 전용 — 나라마다 실제
+    스쿼드 조회까지 다 태우면 체감될 만큼 느려진다)."""
     lo, mid, hi = get_nat_ovr_band(name, grade)
     gen_coef = _get_generation_coef(name, year) if (name and year) else 1.0
     formula_val = min(100.0, max(1.0, random.triangular(lo, hi, mid) * gen_coef))
     if fast:
         return formula_val
     real_val = _get_real_squad_ovr(name) if name else None
+    # [2026-09 수정, 신민용 리포트: "선수 개개인 OVR이 높아도 국가대표
+    # 전체 OVR은 낮게 뜬다 — 그 평균치가 실제로 맞아야 하는 것 아니냐"]
+    # 예전엔 여기서 real_val 70% + formula_val(밴드 기반, 실제 선수 없이
+    # FIFA랭크만으로 뽑는 절차적 값) 30%를 블렌딩했다 — 위 주석(2026-07,
+    # "프랑스가 88 정도로 뜬다")이 이미 같은 증상을 한 번 지적했었고, 그때
+    # fast=True(포뮬러만)를 fast=False(블렌딩)로만 바꿨는데도 여전히
+    # formula_val 몫(30%)만큼 실제 스쿼드 평균보다 낮게 나올 수 있었다
+    # (실측 예시로 재현: 실제 베스트11 평균 97.5여도 블렌딩 결과 89 정도).
+    # 이제 실제 스쿼드 데이터를 구할 수 있으면(포지션별 8명 이상) 그
+    # 평균을 그대로 쓴다 — "에이스 한 명이 95여도 나머지가 68~80대면
+    # 평균은 78 정도가 맞다"는 사용자 설계 의도와 일치. 스쿼드가 너무
+    # 얇아 real_val 자체가 없는 나라(min_count=8 미달)만 기존처럼
+    # formula_val(밴드 기반)로 대체한다.
     if real_val is not None:
-        return round(min(100.0, max(1.0, 0.7 * real_val + 0.3 * formula_val)), 2)
+        return round(min(100.0, max(1.0, real_val)), 2)
     return formula_val
 
 STAGE_KO = {"group": "조별리그", "R32": "32강", "R16": "16강", "QF": "8강", "SF": "4강", "F": "결승", "TP": "3/4위전",

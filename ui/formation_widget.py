@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QDialog,
     QTableWidget, QTableWidgetItem, QPushButton, QComboBox,
     QSizePolicy, QFrame, QScrollArea, QGridLayout, QLineEdit,
-    QPlainTextEdit, QSpinBox
+    QPlainTextEdit, QSpinBox, QCompleter
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import (QColor, QPainter, QBrush, QPen, QFont, QFontMetrics,
@@ -1534,6 +1534,222 @@ def apply_custom_name_live(player_id: int, new_name: str):
             _LIVE_TEAM_PANELS.discard(w)   # 이미 닫혀 C++ 객체가 사라진 패널
 
 
+def apply_ovr_edit_live(player_id: int):
+    """[2026-09 신설, 신민용 요청: "OVR도 이름처럼 선수 검색에서 바꿀 수
+    있게" — OVR을 조정한 뒤(이 화면의 PlayerStatPopup이든 세계 축구
+    기록실 "선수 검색"이든) 지금 열려 있는 모든 포메이션 화면에 즉시
+    반영한다. 이름 변경(apply_custom_name_live)과 달리 캔버스 자체엔
+    OVR이 안 그려져도 헤더의 "평균 OVR" 텍스트까지 다시 계산해야
+    하므로, 개별 위젯 패치 대신 각 화면이 이미 갖고 있는
+    refresh_now()로 통째로 다시 그린다. 같은 nav(내 팀·상대팀 패널
+    둘 다 이 클래스를 씀)가 _LIVE_TEAM_PANELS에 중복 등록돼 있어도
+    한 번만 새로고침한다."""
+    seen_navs = set()
+    for w in list(_LIVE_TEAM_PANELS):
+        try:
+            has_player = any(pl.get("id") == player_id for pl in w.canvas._roster)
+            if not has_player or w.nav is None or id(w.nav) in seen_navs:
+                continue
+            seen_navs.add(id(w.nav))
+            w.nav.refresh_now()
+        except RuntimeError:
+            _LIVE_TEAM_PANELS.discard(w)
+
+
+def apply_nationality_edit_live(player_id: int, new_nationality: str):
+    """[2026-09 신설] 국적 변경 실시간 반영 — apply_custom_name_live와
+    같은 구조. 라이브 포메이션 캔버스 자체엔 국적이 그려지지 않으므로
+    다시 그릴 필요는 없지만, 로스터 dict의 nationality 값은 갱신해둔다
+    (같은 팀을 다시 조회하지 않고 이 dict를 그대로 재사용하는 경로가
+    나중에 생기더라도 낡은 국적이 뜨지 않도록 하는 안전장치)."""
+    for w in list(_LIVE_TEAM_PANELS):
+        try:
+            for pl in w.canvas.players:
+                if pl.get("id") == player_id:
+                    pl["nationality"] = new_nationality
+            for pl in w.canvas._roster:
+                if pl.get("id") == player_id:
+                    pl["nationality"] = new_nationality
+        except RuntimeError:
+            _LIVE_TEAM_PANELS.discard(w)
+
+
+def open_ovr_edit_dialog(parent, player_id: int, cur_ovr: int):
+    """[2026-09 신설, 신민용 요청: "OVR도 이름처럼 선수 검색에서 바꿀 수
+    있게 만들고, 변경칸에 숫자 적고 엔터 누르면 적용 버튼을 누른 것과
+    동일하게"] "한계 스탯(OVR) 조정" 창 — 포메이션 팝업
+    (PlayerStatPopup._open_stat_edit_dialog)과 세계 축구 기록실 "선수
+    검색" 상세 패널이 함께 쓰는 공용 창(open_bulk_rename_dialog와 같은
+    공유 방식). DB 반영 + 지금 열려 있는 모든 포메이션 화면 실시간
+    반영까지 여기서 전부 처리하고, 호출부는 반환값으로 자기 자신의
+    화면(팝업 자신, 또는 선수 검색 상세 표)만 새로 그리면 된다.
+    반환: 실제로 저장했으면 (delta, before_ovr, after_ovr), 취소/변경없음이면 None."""
+    from database import rescale_ai_player_to_target_ovr
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("한계 스탯(OVR) 조정 — 쉬움 난이도")
+    dlg.setStyleSheet("QDialog{background:#1e1e1e;color:#ccc;}")
+    dlg.setMinimumWidth(300)
+    v = QVBoxLayout(dlg)
+
+    info_lbl = QLabel(
+        f"현재 OVR: {cur_ovr}\n"
+        "새 목표 OVR을 정하면 세부 스탯 15개가 전부 같은 폭으로\n"
+        "함께 오르내립니다(이 선수만의 강약 분포는 그대로 유지).")
+    info_lbl.setStyleSheet("color:#888;font-size:11px;")
+    v.addWidget(info_lbl)
+
+    row = QHBoxLayout()
+    row.addWidget(QLabel("목표 OVR:"))
+    spin = QSpinBox()
+    spin.setRange(1, 99)
+    spin.setValue(cur_ovr)
+    spin.setStyleSheet(
+        "QSpinBox{background:#161616;color:#eee;font-size:13px;"
+        "border:1px solid #333;border-radius:4px;padding:4px 6px;}")
+    row.addWidget(spin, 1)
+    v.addLayout(row)
+
+    btn_row = QHBoxLayout()
+    save_btn = QPushButton("적용")
+    save_btn.setStyleSheet(
+        "background:#2d4a6b;color:#eee;border:1px solid #4a7ab0;"
+        "border-radius:4px;padding:6px 14px;")
+    cancel_btn = QPushButton("취소")
+    cancel_btn.setStyleSheet(
+        "background:#2a2a2a;color:#ccc;border:1px solid #444;"
+        "border-radius:4px;padding:6px 14px;")
+    btn_row.addStretch(1)
+    btn_row.addWidget(cancel_btn)
+    btn_row.addWidget(save_btn)
+    v.addLayout(btn_row)
+
+    save_btn.clicked.connect(dlg.accept)
+    cancel_btn.clicked.connect(dlg.reject)
+    # [2026-09 신설, 신민용 요청: "변경칸에 숫자를 적고 엔터를 누르면
+    # 적용 버튼을 누른 기능을 넣어야 해"] QSpinBox 내부 QLineEdit의
+    # 엔터를 "적용" 버튼 클릭과 동일하게 연결한다.
+    spin.lineEdit().returnPressed.connect(dlg.accept)
+
+    _accepted = dlg.exec() == QDialog.DialogCode.Accepted
+    _target = spin.value()
+    dlg.deleteLater()
+    if not _accepted or _target == cur_ovr:
+        return None
+
+    delta, before_ovr, after_ovr = rescale_ai_player_to_target_ovr(player_id, _target)
+
+    global _ovr_cache_invalidated
+    _ovr_cache_invalidated = True
+    apply_ovr_edit_live(player_id)
+    try:
+        from ui.world_browser_window import refresh_ai_player_detail_in_browsers
+        refresh_ai_player_detail_in_browsers(player_id)
+    except Exception:
+        pass
+    return (delta, before_ovr, after_ovr)
+
+
+def open_nationality_edit_dialog(parent, player_id: int, current_nationality: str):
+    """[2026-09 신설, 신민용 요청: "국적은 내가 입력하면 변하게 하고,
+    잉글 이렇게 치고 엔터를 누르면 자동완성 되는 기능"] "국적 변경" 창 —
+    포메이션 팝업과 세계 축구 기록실 "선수 검색" 상세 패널이 함께
+    쓰는 공용 창. world_browser_window.py의 "국적" 필터 콤보
+    (_make_combo_typable/_resolve_typed_combo)와 동일한 "타이핑 후
+    엔터 자동완성" 동작을 재현하되, 값은 항상 countries 테이블에 실제
+    존재하는 국가명 중 하나로만 확정된다(InsertPolicy.NoInsert — 목록에
+    없는 임의 문자열은 저장되지 않는다).
+    반환: 실제로 저장했으면 새 국적 문자열, 취소/변경없음/저장실패면 None."""
+    import world_browser as wb
+    from database import set_ai_player_nationality
+
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("국적 변경 — 쉬움 난이도")
+    dlg.setStyleSheet("QDialog{background:#1e1e1e;color:#ccc;}")
+    dlg.setMinimumWidth(300)
+    v = QVBoxLayout(dlg)
+
+    info_lbl = QLabel(
+        f"현재 국적: {current_nationality or '없음'}\n"
+        "국가명을 입력하세요 — 몇 글자만 쳐도 엔터를 누르면\n"
+        "일치하는 국가명으로 자동완성됩니다.")
+    info_lbl.setStyleSheet("color:#888;font-size:11px;")
+    v.addWidget(info_lbl)
+
+    combo = QComboBox()
+    combo.addItem("")
+    for c in wb.list_countries():
+        combo.addItem(c["name"])
+    combo.setEditable(True)
+    combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+    completer = QCompleter(combo.model(), combo)
+    completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+    completer.setFilterMode(Qt.MatchFlag.MatchContains)
+    completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+    combo.setCompleter(completer)
+    combo.setStyleSheet(
+        "QComboBox{background:#161616;color:#eee;font-size:13px;"
+        "border:1px solid #333;border-radius:4px;padding:4px 6px;}"
+        "QComboBox:focus{border:1px solid #4da6ff;}"
+        "QComboBox::drop-down{border:none;width:20px;}"
+        "QComboBox::down-arrow{image:none;width:0;height:0;"
+        "border-left:4px solid transparent;border-right:4px solid transparent;"
+        "border-top:6px solid #4da6ff;margin-right:6px;}")
+
+    def _resolve_typed(*_a):
+        typed = combo.currentText().strip()
+        if not typed or combo.findText(typed) >= 0:
+            return
+        needle = typed.lower()
+        for i in range(combo.count()):
+            item_text = combo.itemText(i)
+            if item_text and needle in item_text.lower():
+                combo.setCurrentIndex(i)
+                combo.setEditText(item_text)
+                break
+    combo.lineEdit().returnPressed.connect(_resolve_typed)
+
+    idx = combo.findText(current_nationality or "")
+    combo.setCurrentIndex(idx if idx >= 0 else 0)
+    if current_nationality and idx < 0:
+        combo.setEditText(current_nationality)
+    v.addWidget(combo)
+
+    btn_row = QHBoxLayout()
+    save_btn = QPushButton("저장")
+    save_btn.setStyleSheet(
+        "background:#2d4a6b;color:#eee;border:1px solid #4a7ab0;"
+        "border-radius:4px;padding:6px 14px;")
+    cancel_btn = QPushButton("취소")
+    cancel_btn.setStyleSheet(
+        "background:#2a2a2a;color:#ccc;border:1px solid #444;"
+        "border-radius:4px;padding:6px 14px;")
+    btn_row.addStretch(1)
+    btn_row.addWidget(cancel_btn)
+    btn_row.addWidget(save_btn)
+    v.addLayout(btn_row)
+
+    save_btn.clicked.connect(dlg.accept)
+    cancel_btn.clicked.connect(dlg.reject)
+
+    _accepted = dlg.exec() == QDialog.DialogCode.Accepted
+    _new_nat = combo.currentText().strip()
+    dlg.deleteLater()
+    if not _accepted or _new_nat == (current_nationality or ""):
+        return None
+    if not set_ai_player_nationality(player_id, _new_nat):
+        return None
+
+    global _ovr_cache_invalidated
+    _ovr_cache_invalidated = True
+    apply_nationality_edit_live(player_id, _new_nat)
+    try:
+        from ui.world_browser_window import refresh_ai_player_detail_in_browsers
+        refresh_ai_player_detail_in_browsers(player_id)
+    except Exception:
+        pass
+    return _new_nat
+
+
 _RENAME_SCOPE_BTN_STYLE = (
     "QPushButton{background:#2a2a2a;color:#888888;border:1px solid #444444;"
     "padding:4px 12px;border-radius:4px;font-size:11px;}"
@@ -2662,6 +2878,11 @@ class PlayerStatPopup(QDialog):
         # 안 되고(쉬움만 편집 가능), '어려움'은 OVR 행 자체가 info_rows에
         # 없으므로 이 값이 있어도 그릴 자리가 없다.
         self._ovr_edit_pid = _rename_pid if is_easy_mode() else None
+        self._nat_row_idx = None
+        self._nat_value_item = None
+        # [2026-09 신설, 신민용 요청: "국적도 내가 입력하면 변하게"] OVR과
+        # 완전히 동일한 대상 판정·난이도 조건(쉬움 난이도 전용).
+        self._nat_edit_pid = _rename_pid if is_easy_mode() else None
 
         info_tbl = QTableWidget(len(info_rows), 2)
         info_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -2712,6 +2933,20 @@ class PlayerStatPopup(QDialog):
                         "클릭하면 이 선수의 한계 스탯(OVR)을 조정할 수 있습니다 (쉬움 난이도 전용)")
                 else:
                     label_item.setForeground(QColor("#888"))
+            elif label == "국적":
+                # [2026-09 신설] "OVR" 행과 완전히 같은 방식 — 편집
+                # 가능할 때만 라벨 칸을 파란색+굵게로 눈에 띄게 하고,
+                # 아니면 평범하게.
+                self._nat_row_idx = i
+                self._nat_value_item = value_item
+                value_item.setForeground(QColor("#ccc"))
+                if self._nat_edit_pid is not None:
+                    lf = label_item.font(); lf.setBold(True); label_item.setFont(lf)
+                    label_item.setForeground(QColor("#4da6ff"))
+                    label_item.setToolTip(
+                        "클릭하면 이 선수의 국적을 직접 지정할 수 있습니다 (쉬움 난이도 전용)")
+                else:
+                    label_item.setForeground(QColor("#888"))
             else:
                 label_item.setForeground(QColor("#888"))
                 value_item.setForeground(QColor("#ccc"))
@@ -2719,7 +2954,8 @@ class PlayerStatPopup(QDialog):
             info_tbl.setItem(i, 1, value_item)
         info_tbl.horizontalHeader().setStretchLastSection(True)
         info_tbl.setFixedHeight(22 * len(info_rows) + 4)
-        if _rename_pid is not None or self._ovr_edit_pid is not None:
+        if (_rename_pid is not None or self._ovr_edit_pid is not None
+                or self._nat_edit_pid is not None):
             info_tbl.setCursor(Qt.CursorShape.PointingHandCursor)
             info_tbl.cellClicked.connect(self._on_info_cell_clicked)
         self._lay.addWidget(info_tbl)
@@ -2890,6 +3126,11 @@ class PlayerStatPopup(QDialog):
         # 표에 OVR 행이 없는 경우) 여기 도달해도 조용히 무시된다.
         if row == self._ovr_row_idx and self._ovr_edit_pid is not None:
             self._open_stat_edit_dialog()
+            return
+        # [2026-09 신설] "국적" 라벨 칸 클릭 → 쉬움 난이도 전용 국적
+        # 편집 창. OVR과 동일한 판정.
+        if row == self._nat_row_idx and self._nat_edit_pid is not None:
+            self._open_nationality_edit_dialog()
 
     def _open_rename_dialog(self):
         """AI 선수 이름 변경 창 — world_browser.py의 "선수 검색" 상세
@@ -2988,71 +3229,22 @@ class PlayerStatPopup(QDialog):
         database.rescale_ai_player_to_target_ovr()로 15개 스탯 전부를 같은
         델타만큼 평행이동시켜 재계산한다 — 승격/강등 때 팀 전체에 이미
         쓰던 rescale_team_to_target_ovr()의 개인용 버전이라, 그 선수 고유의
-        스탯 분포(개성)는 유지한 채 전체 수준만 오르내린다. _open_rename_dialog와
-        동일한 구조(모달 하나, 저장 시 팝업 자신 갱신 + 화면 즉시 반영)."""
+        스탯 분포(개성)는 유지한 채 전체 수준만 오르내린다.
+        [2026-09 재작업, 신민용 요청: "OVR도 선수 검색에서 이름처럼 바꿀
+        수 있게"] 다이얼로그 자체(엔터=적용 포함)와 DB 반영, 열려 있는
+        모든 포메이션 화면/세계 축구 기록실 반영은 이제 공용 함수
+        open_ovr_edit_dialog()가 전부 처리한다 — 여기서는 이 팝업
+        자신의 표시만 최신 스탯으로 다시 그린다."""
         pid = self._ovr_edit_pid
         if pid is None:
             return
-        from database import rescale_ai_player_to_target_ovr
         cur_ovr = int(self._pl.get("ovr", 50) or 50)
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle("한계 스탯(OVR) 조정 — 쉬움 난이도")
-        dlg.setStyleSheet("QDialog{background:#1e1e1e;color:#ccc;}")
-        dlg.setMinimumWidth(300)
-        v = QVBoxLayout(dlg)
-
-        info_lbl = QLabel(
-            f"현재 OVR: {cur_ovr}\n"
-            "새 목표 OVR을 정하면 세부 스탯 15개가 전부 같은 폭으로\n"
-            "함께 오르내립니다(이 선수만의 강약 분포는 그대로 유지).")
-        info_lbl.setStyleSheet("color:#888;font-size:11px;")
-        v.addWidget(info_lbl)
-
-        row = QHBoxLayout()
-        row.addWidget(QLabel("목표 OVR:"))
-        spin = QSpinBox()
-        spin.setRange(1, 99)
-        spin.setValue(cur_ovr)
-        spin.setStyleSheet(
-            "QSpinBox{background:#161616;color:#eee;font-size:13px;"
-            "border:1px solid #333;border-radius:4px;padding:4px 6px;}")
-        row.addWidget(spin, 1)
-        v.addLayout(row)
-
-        btn_row = QHBoxLayout()
-        save_btn = QPushButton("적용")
-        save_btn.setStyleSheet(
-            "background:#2d4a6b;color:#eee;border:1px solid #4a7ab0;"
-            "border-radius:4px;padding:6px 14px;")
-        cancel_btn = QPushButton("취소")
-        cancel_btn.setStyleSheet(
-            "background:#2a2a2a;color:#ccc;border:1px solid #444;"
-            "border-radius:4px;padding:6px 14px;")
-        btn_row.addStretch(1)
-        btn_row.addWidget(cancel_btn)
-        btn_row.addWidget(save_btn)
-        v.addLayout(btn_row)
-
-        save_btn.clicked.connect(dlg.accept)
-        cancel_btn.clicked.connect(dlg.reject)
-
-        _accepted = dlg.exec() == QDialog.DialogCode.Accepted
-        _target = spin.value()
-        # [2026-08 최적화/누수수정] _open_rename_dialog와 동일한 이유 —
-        # 부모(self)가 있는 QDialog는 파이썬 참조가 사라져도 C++ 객체가
-        # 계속 살아남는다. 다 쓴 즉시 삭제 예약.
-        dlg.deleteLater()
-        if not _accepted or _target == cur_ovr:
+        result = open_ovr_edit_dialog(self, pid, cur_ovr)
+        if result is None:
             return
 
-        delta, before_ovr, after_ovr = rescale_ai_player_to_target_ovr(pid, _target)
-
-        global _ovr_cache_invalidated
-        _ovr_cache_invalidated = True
-
-        # 1) 이 팝업 자신을 최신 스탯/OVR로 갱신 (club 등 원래 있던
-        #    부가 정보는 새로 조회한 dict에 없으므로 옮겨 붙인다).
+        # 이 팝업 자신을 최신 스탯/OVR로 갱신 (club 등 원래 있던 부가
+        # 정보는 새로 조회한 dict에 없으므로 옮겨 붙인다).
         fresh = _fetch_single_ai_player(pid)
         if fresh is not None:
             for k in ("club", "club_country", "club_tier"):
@@ -3060,14 +3252,19 @@ class PlayerStatPopup(QDialog):
                     fresh[k] = self._pl[k]
             self.load_player(fresh)
 
-        # 2) 지금 열려 있는 이 포메이션 화면(캔버스/명단/평균 OVR 헤더)에
-        #    즉시 반영 — 이름 변경(apply_custom_name_live)과 달리 OVR
-        #    변경은 헤더의 "평균 OVR" 텍스트까지 다시 계산해야 하므로,
-        #    개별 위젯을 일일이 패치하는 대신 refresh_now()로 지금 로드된
-        #    team_id/context 그대로 DB에서 다시 통째로 그린다(이미 이
-        #    목적으로 만들어진 기존 메서드 재사용).
-        if self._nav is not None:
-            try:
-                self._nav.refresh_now()
-            except Exception:
-                pass
+    def _open_nationality_edit_dialog(self):
+        """[2026-09 신설, 신민용 요청: "국적은 내가 입력하면 변하게"]
+        _open_stat_edit_dialog와 동일한 구조 — 다이얼로그·DB 반영·화면
+        반영은 공용 함수 open_nationality_edit_dialog()가 전부 처리하고,
+        여기서는 이 팝업 자신의 "국적" 값 칸만 새로 표시한다(캔버스에는
+        국적이 그려지지 않으므로 그 외엔 다시 그릴 게 없다)."""
+        pid = self._nat_edit_pid
+        if pid is None:
+            return
+        cur_nat = self._pl.get("nationality", "") or ""
+        new_nat = open_nationality_edit_dialog(self, pid, cur_nat)
+        if new_nat is None:
+            return
+        self._pl["nationality"] = new_nat
+        if self._nat_value_item is not None:
+            self._nat_value_item.setText(new_nat)

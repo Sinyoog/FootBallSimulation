@@ -28,7 +28,7 @@ from database import (get_conn, get_game_start_year, TEAM_POSITIONS,
                        get_ai_player_custom_name, set_ai_player_custom_name,
                        get_ai_player_custom_names)
 from constants import ai_player_code, FORMATION_SLOTS
-from game_engine import is_hard_mode
+from game_engine import is_hard_mode, is_easy_mode
 import power_ranking as pr
 # [2026-08 신설, 신민용 요청: "내가 분명 포메이션 형태로 보내달라 했는데
 # 왜 없어?"] 국가대표 스쿼드/팀 시즌 라인업을 실제 포메이션 화면과 똑같은
@@ -38,7 +38,8 @@ import power_ranking as pr
 # formation_widget.py는 이 모듈을 최상단에서 import하지 않으므로(내부
 # 함수 안에서만 지연 import) 순환 임포트 문제가 없다.
 from ui.formation_widget import (
-    _row_key, _row_priority, _pos_x_order, _pos_color, open_bulk_rename_dialog)
+    _row_key, _row_priority, _pos_x_order, _pos_color, open_bulk_rename_dialog,
+    open_ovr_edit_dialog, open_nationality_edit_dialog)
 
 # [2026-08 신설, 신민용 리포트: "복사하면 국기/국가/부수까지 같이 복사된다,
 # 팀명만 복사되게 해달라"] 셀 화면 텍스트("🇺🇸 토론토 FC (미국)", "보루시아
@@ -564,6 +565,71 @@ def apply_custom_name_live_to_browser(player_id: int):
                 _rr.refresh()   # [2026-08 신설] 최근 검색 버튼 글자도 새 이름으로
         except (AttributeError, RuntimeError):
             pass  # 선수 검색 탭 미생성 / 창이 이미 닫혀 C++ 객체가 삭제된 경우
+
+
+def refresh_ai_player_detail_in_browsers(player_id: int):
+    """[2026-09 신설, 신민용 요청: "OVR도 이름처럼 선수 검색에서 바꿀 수
+    있게, 국적도 직접 입력으로 바꿀 수 있게"] 포메이션 화면에서 OVR·
+    국적을 바꿨을 때(이름 변경의 apply_custom_name_live_to_browser와
+    같은 반대 방향) 지금 열려 있는 모든 세계 축구 기록실 창의 "선수
+    검색" 좌측 목록/우측 상세를 즉시 새로고침한다. 이름 변경과 달리
+    OVR·국적은 한 번에 한 명만 바꾸는 조작이고(이름 일괄변경 같은 대량
+    케이스가 없음) 목록 줄의 값 자체·칸 폭 스펙까지 다시 계산돼야
+    하므로, 줄 하나만 패치하는 최적화 없이 그냥 전체 재조회한다."""
+    from PyQt6.QtWidgets import QApplication
+    app = QApplication.instance()
+    if app is None:
+        return
+    for w in app.allWidgets():
+        if not isinstance(w, WorldBrowserWindow):
+            continue
+        try:
+            w._refresh_player_list()
+            if getattr(w, "_player_detail_pid", None) == player_id:
+                w._show_player_detail(player_id)
+        except (AttributeError, RuntimeError):
+            pass  # 선수 검색 탭 미생성 / 창이 이미 닫혀 C++ 객체가 삭제된 경우
+
+
+class _EditableFieldHeader(QHeaderView):
+    """[2026-09 신설, 신민용 요청: "OVR도 이름처럼 선수 검색에서 바꿀 수
+    있게, 국적도 직접 입력으로 바꿀 수 있게"] player_detail_tbl 헤더
+    7칸(이름/국적/나이/포지션/OVR/소속팀/소속팀 국가) 중 "이름"(0번)은
+    이미 이 표 자신의 스타일시트("::section:first")로 파란색 처리가
+    돼 있는데, "국적"(1번)·"OVR"(4번)은 첫 칸도 마지막 칸도 아니라서
+    Qt 스타일시트의 ::section:first/:last 의사선택자만으로는 칠할 방법이
+    없다 — 그 두 칸만 직접 그리고 나머지(이름 포함)는 기존 QSS 렌더링
+    (super().paintSection)에 그대로 맡긴다. 어느 칸을 파란색으로 칠할지는
+    난이도(쉬움 여부)로 한 번만 정해지고 게임 도중 난이도는 바뀌지
+    않으므로(difficulty-system.md), 생성 시점에 고정해서 넘겨받는다."""
+    def __init__(self, blue_sections: set, parent=None):
+        super().__init__(Qt.Orientation.Horizontal, parent)
+        # [2026-09 버그수정, 신민용 리포트: "이름 변경이 막혔다"] QTableWidget이
+        # 자동으로 만들어주는 기본 헤더는 Qt 내부적으로 sectionsClickable=True가
+        # 이미 켜진 채로 생성되는데, 이 헤더는 내가 직접 새로 만들어
+        # setHorizontalHeader()로 통째로 교체한 것이라 그 기본 설정이 빠져
+        # (기본값 False) 헤더 클릭 자체가 아예 씹혔다 — "이름"·"국적"·"OVR"
+        # 전부 클릭이 안 먹혔던 진짜 원인. 원래 기본 헤더와 동일하게 명시적으로
+        # 켜준다(highlightSections도 원래 기본 헤더의 동작과 맞춘다).
+        self.setSectionsClickable(True)
+        self.setHighlightSections(True)
+        self._blue_sections = blue_sections
+
+    def paintSection(self, painter, rect, logicalIndex):
+        if logicalIndex not in self._blue_sections:
+            super().paintSection(painter, rect, logicalIndex)
+            return
+        painter.save()
+        painter.fillRect(rect, QColor("#252525"))
+        painter.setPen(QColor("#4da6ff"))
+        f = QFont(painter.font())
+        f.setBold(True)
+        painter.setFont(f)
+        text = self.model().headerData(logicalIndex, self.orientation(), Qt.ItemDataRole.DisplayRole)
+        painter.drawText(rect.adjusted(5, 0, -5, 0),
+                          int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
+                          str(text or ""))
+        painter.restore()
 
 
 class WorldBrowserWindow(QDialog):
@@ -2430,6 +2496,19 @@ class WorldBrowserWindow(QDialog):
             lay.addWidget(rec_lbl)
         return w
 
+    def _comp_stat_cell(self, stat, color):
+        """[2026-09 신설, 신민용 요청: "리그/국내컵/클럽대항전/슈퍼컵/
+        클럽월드컵 다 평점·골·어시를 다르게 둬야 하는데... 경기수는
+        빼고, 그 | 이거 텍스트 말고 상자로 칸칸 나누라는거야"] 대회별
+        평점/골/어시스트 요약을, 바로 위 대회 결과 칸과 완전히 같은
+        상자 스타일(_two_line_cell)로 그 대회 칸 바로 아래에 그린다 —
+        예전엔 대회 구분 없이 한 줄로 합쳐서(그나마도 경기수까지
+        같이) 표 전체를 가로지르는 텍스트 한 줄이었다. 요청대로
+        경기수는 표시하지 않는다."""
+        main_text = f"⭐ {stat['rating']:.2f}"
+        record = f"⚽ {stat.get('goals', 0)}골  🅰 {stat.get('assists', 0)}A"
+        return self._two_line_cell(main_text, color, record, bold=True)
+
     def _cl_award_summary_cell(self, n_cl, n_el, n_ecl):
         """[2026-08 신설, 신민용 확정: "클럽 대항전 수상 합계는 하나로
         합치지 않고 파랑(챔스)/주황(유로파)/초록(컨퍼런스) 숫자를 한 칸 씩
@@ -3077,15 +3156,27 @@ class WorldBrowserWindow(QDialog):
                     parts.append(f"클럽월드컵: {entry['cwc']}{rec}")
                 lines.append(" | ".join(parts))
                 # [2026-08 신설, 신민용 요청: "기록 복사할 때 이것도 같이
-                # 기록복사되는 버튼을 추가해줘"] 화면의 얇은 요약 행과
-                # 완전히 같은 값(row["stat"])을 그 연도 줄 바로 밑에
-                # 덧붙인다 — include_stats=True("기록 복사" 버튼)일 때만.
-                if include_stats and row.get("stat"):
-                    st = row["stat"]
-                    st_bits = [f"{st['matches']}경기" if st.get("matches") is not None else None,
-                               f"평균평점 {st['rating']:.2f}" if st.get("rating") is not None else None,
-                               f"{st.get('goals', 0)}골 {st.get('assists', 0)}도움"]
-                    lines.append("  ⚽ " + " · ".join(b for b in st_bits if b))
+                # 기록복사되는 버튼을 추가해줘"] include_stats=True("기록
+                # 복사" 버튼)일 때만, 그 연도 줄 바로 밑에 대회별 요약을
+                # 덧붙인다.
+                # [2026-09 재작업, 신민용 요청: "경기수는 없애줘 ... 리그/
+                # 국내컵/클럽대항전/슈퍼컵/클럽월드컵 다 평점·골·어시를
+                # 다르게 둬야 한다"] 화면의 대회별 상자 행(entry의
+                # _comp_stats — 위 lines.append 직전의 리그/국내컵/
+                # 클럽대항전/슈퍼컵/클럽월드컵 문구와 같은 entry에서 옴)과
+                # 완전히 같은 값을, 그 대회를 실제로 뛴 것만 한 줄씩
+                # 덧붙인다(경기수 표시 안 함).
+                if include_stats:
+                    _comp_stats = entry.get("_comp_stats")
+                    if _comp_stats:
+                        _COMP_LABEL = {"league": "리그", "cup": "국내컵", "cl": "클럽대항전",
+                                       "sc": "슈퍼컵", "cwc": "클럽월드컵"}
+                        for _comp, _label in _COMP_LABEL.items():
+                            _cs = _comp_stats.get(_comp)
+                            if _cs:
+                                lines.append(
+                                    f"  ⚽ {_label}: 평균평점 {_cs['rating']:.2f}  "
+                                    f"{_cs.get('goals', 0)}골 {_cs.get('assists', 0)}A")
         lines.append("")
 
         # ── 국가대표 기록 ──
@@ -3585,6 +3676,16 @@ class WorldBrowserWindow(QDialog):
         # Stretch(균등분배) 대신 ResizeToContents(내용 길이만큼)로 바꾼다.
         self.player_detail_tbl = QTableWidget(0, 7)
         self.player_detail_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        # [2026-09 신설, 신민용 요청: "OVR도 이름처럼 바꿀 수 있게, 국적도
+        # 직접 입력으로 바꿀 수 있게"] "국적"(1번)·"OVR"(4번) 헤더도
+        # "이름"(0번)처럼 파란색+클릭 가능하게 만들어야 하는데, 그 둘은
+        # 첫/마지막 칸이 아니라 아래 "::section:first" QSS 트릭을 못
+        # 쓴다 — 전용 헤더뷰(_EditableFieldHeader)로 통째로 교체해
+        # 필요한 칸만 직접 그린다(난이도는 게임 도중 안 바뀌므로 지금
+        # 한 번만 계산). 반드시 아래 다른 헤더 설정보다 먼저 바꿔야
+        # horizontalHeader() 참조들이 이 새 헤더를 가리킨다.
+        self.player_detail_tbl.setHorizontalHeader(
+            _EditableFieldHeader({1, 4} if is_easy_mode() else set(), self.player_detail_tbl))
         self.player_detail_tbl.verticalHeader().setVisible(False)
         self.player_detail_tbl.setShowGrid(True)
         # [2026-08 버그수정, 신민용 리포트: "이름 헤더를 파란색으로
@@ -3621,6 +3722,10 @@ class WorldBrowserWindow(QDialog):
             _hitem = QTableWidgetItem(_label)
             if _col == 0:
                 _hitem.setToolTip("클릭하면 이 선수의 이름을 직접 지을 수 있습니다")
+            elif _col == 1 and is_easy_mode():
+                _hitem.setToolTip("클릭하면 이 선수의 국적을 직접 지정할 수 있습니다 (쉬움 난이도 전용)")
+            elif _col == 4 and is_easy_mode():
+                _hitem.setToolTip("클릭하면 이 선수의 한계 스탯(OVR)을 조정할 수 있습니다 (쉬움 난이도 전용)")
             self.player_detail_tbl.setHorizontalHeaderItem(_col, _hitem)
         self.player_detail_tbl.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.ResizeToContents)
@@ -4409,6 +4514,14 @@ class WorldBrowserWindow(QDialog):
         # 이름 변경 기능 대상이 아니므로 그대로 None 취급해 클릭해도
         # 아무 일도 안 일어나게 한다(아래 핸들러에서 분기).
         self._player_detail_pid = player_id if player_id != wb.MY_PLAYER_ID else None
+        # [2026-09 신설, 신민용 요청: "OVR도 이름처럼 바꿀 수 있게, 국적도
+        # 직접 입력으로 바꿀 수 있게"] "국적"/"OVR" 헤더 클릭 핸들러용 —
+        # 이름과 달리 은퇴 선수는 대상에서 제외한다(ai_players_retired는
+        # 그 시점의 확정 커리어 기록이라 OVR·국적을 지금 와서 조작할
+        # 대상이 아님 — rescale_ai_player_to_target_ovr/
+        # set_ai_player_nationality 둘 다 ai_players 테이블 전용).
+        self._player_detail_stat_pid = (
+            player_id if (player_id != wb.MY_PLAYER_ID and not d.get("is_retired")) else None)
         # [2026-08 신설, 신민용 요청: "AICD8C 이 식별코드로 뜨는 선수의
         # 이름을 내가 입력할 수 있게"] custom_name이 저장돼 있으면 그
         # 이름을, 없으면 기존처럼 ai_player_code(id)를 표시한다.
@@ -4511,13 +4624,57 @@ class WorldBrowserWindow(QDialog):
         읽기 전용 그대로. my_player(사용자 본인)는 _show_player_detail에서
         self._player_detail_pid를 None으로 남겨두므로 여기서 자동으로
         무시된다(이름 변경은 AI 선수 전용 기능 — 본인 이름은 캐릭터
-        생성 화면에서 이미 실명으로 정한 것이라 대상이 아님)."""
-        if section != 0:
+        생성 화면에서 이미 실명으로 정한 것이라 대상이 아님).
+        [2026-09 확장, 신민용 요청: "OVR도 이름처럼 바꿀 수 있게, 국적도
+        직접 입력으로 바꿀 수 있게"] 1번 칸("국적")·4번 칸("OVR")도
+        같은 방식으로 반응하되, 이름과 달리 쉬움 난이도 전용이고(OVR
+        조정과 동일한 원칙) 은퇴 선수는 제외된다(_player_detail_stat_pid
+        참고) — 이 두 조건 중 하나라도 안 맞으면(보통/어려움 난이도,
+        은퇴 선수, 본인) 조용히 무시된다."""
+        if section == 0:
+            pid = getattr(self, "_player_detail_pid", None)
+            if pid is None:
+                return
+            self._open_ai_rename_dialog(pid)
             return
-        pid = getattr(self, "_player_detail_pid", None)
+        if section not in (1, 4) or not is_easy_mode():
+            return
+        pid = getattr(self, "_player_detail_stat_pid", None)
         if pid is None:
             return
-        self._open_ai_rename_dialog(pid)
+        if section == 1:
+            self._open_nationality_edit_dialog(pid)
+        else:
+            self._open_ovr_edit_dialog(pid)
+
+    def _open_ovr_edit_dialog(self, player_id):
+        """[2026-09 신설, 신민용 요청: "OVR도 이름처럼 선수 검색에서 바꿀
+        수 있게"] 다이얼로그·DB 반영·열려 있는 모든 포메이션 화면 반영은
+        공용 함수 open_ovr_edit_dialog(formation_widget.py, 엔터=적용
+        포함)가 전부 처리한다 — 여기서는 저장 후 이 창의 상세 표/좌측
+        목록만 새로 그린다."""
+        d = wb.get_ai_player_detail(player_id)
+        if not d:
+            return
+        cur_ovr = int(d.get("ovr", 50) or 50)
+        if open_ovr_edit_dialog(self, player_id, cur_ovr) is None:
+            return
+        self._show_player_detail(player_id)
+        self._refresh_player_list()
+
+    def _open_nationality_edit_dialog(self, player_id):
+        """[2026-09 신설, 신민용 요청: "국적도 직접 입력으로 바꿀 수 있게,
+        잉글 치고 엔터누르면 자동완성"] 마찬가지로 공용 함수
+        open_nationality_edit_dialog(formation_widget.py, 타이핑+엔터
+        자동완성 포함)를 재사용한다."""
+        d = wb.get_ai_player_detail(player_id)
+        if not d:
+            return
+        cur_nat = d.get("nationality") or ""
+        if open_nationality_edit_dialog(self, player_id, cur_nat) is None:
+            return
+        self._show_player_detail(player_id)
+        self._refresh_player_list()
 
     def _open_ai_rename_dialog(self, player_id):
         """AI 선수 이름 변경 창. 현재 지정된 이름(없으면 빈칸 — placeholder에
@@ -4856,15 +5013,21 @@ class WorldBrowserWindow(QDialog):
             return current_position
 
         # [2026-08 신설, 신민용 요청: "연도별 기록 밑에 평균 평점/골/도움
-        # 요약을 얇은 행으로 하나 더"] entry에 _stat_rating이 붙어있는
+        # 요약을 얇은 행으로 하나 더"] entry에 _comp_stats이 붙어있는
         # 행마다(world_browser.get_ai_player_career_history/get_my_player_
         # career_history가 미리 붙여둠) 그 아래 행을 하나씩 더 써야 하므로,
         # 실제로 그릴 총 행 수를 먼저 세어 setRowCount에 반영한다(은퇴
         # 표시 행은 대상 아님 — is_retired_row는 entry 자체가 아니라
         # player_team_name==None 판정이라 여기선 값을 미리 알 수 없지만,
         # get_ai_player_career_history/get_my_player_career_history 둘 다
-        # 은퇴 이후 연도의 entry에는애초에 _stat_* 를 붙이지 않는다).
-        _extra_stat_rows = sum(1 for e in years if e.get("_stat_rating") is not None)
+        # 은퇴 이후 연도의 entry에는애초에 _comp_stats를 안 붙인다).
+        # [2026-09 수정] 판정 기준을 _stat_rating(리그 전용) 대신
+        # _comp_stats(대회별 통합, 아래 실제 렌더링 루프의 판정과 정확히
+        # 동일)로 맞춘다 — 리그 데이터가 없어도 국내컵/클럽대항전 등만
+        # 있는 경우까지 놓치지 않기 위함(현재 데이터 구조상 실제로는
+        # 거의 항상 같이 있지만, 행 수 계산과 실제 렌더링 조건이 어긋나면
+        # 표 행이 부족/과다해지는 사고로 이어지므로 안전하게 맞춰둔다).
+        _extra_stat_rows = sum(1 for e in years if e.get("_comp_stats"))
         tbl.setRowCount(len(years) + _extra_stat_rows)
         # [2026-08 신설] 복사 버튼용 — 화면에 그리는 것과 완전히 같은
         # 값(그 해 나이·소속팀·OVR·retired 여부·entry 원본)을 행마다
@@ -5039,20 +5202,29 @@ class WorldBrowserWindow(QDialog):
             row_idx += 1
             # [2026-08 신설, 신민용 요청: "44경기면 22경기로 나눠지겠지"]
             # 이 연도(또는 반기) 바로 밑에, 세로가 얇은 요약 행을 하나 더
-            # 그린다 — 단순 텍스트 한 줄이라 resizeRowsToContents가 알아서
-            # 위 두 줄짜리 셀들보다 훨씬 얇게 잡아준다(별도 setRowHeight
-            # 불필요).
-            if _stat is not None:
-                _stat_bits = [f"{_stat['matches']}경기" if _stat.get("matches") is not None else None,
-                              f"평균평점 {_stat['rating']:.2f}" if _stat.get("rating") is not None else None,
-                              f"{_stat.get('goals', 0)}골 {_stat.get('assists', 0)}도움"]
-                _stat_text = "⚽ " + "  ·  ".join(b for b in _stat_bits if b)
-                stat_item = QTableWidgetItem(_stat_text)
-                stat_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                stat_item.setForeground(QColor("#ffb347"))
-                _sf = stat_item.font(); _sf.setPointSize(max(8, _sf.pointSize() - 1)); stat_item.setFont(_sf)
-                tbl.setItem(row_idx, 0, stat_item)
-                tbl.setSpan(row_idx, 0, 1, 10)
+            # 그린다.
+            # [2026-09 재작업, 신민용 요청: "리그/국내컵/클럽대항전/
+            # 슈퍼컵/클럽월드컵 다 평점·골·어시를 다르게 둬야 하는데
+            # 그게 안 되어 있다 ... 경기수는 없애줘 ... 그 | 이거 텍스트
+            # 말고 상자로 칸칸 나누라는거야"] 대회 구분 없이 표 전체를
+            # 가로지르던 텍스트 한 줄(경기수 포함) 대신, entry에 붙은
+            # _comp_stats(world_browser.get_ai_player_career_history/
+            # get_my_player_career_history가 채움 — 대회별 대회를 실제로
+            # 뛴 것만 키가 존재)를 그 대회 결과 칸(5~9번, 바로 위)과
+            # 같은 열에 상자로 하나씩 그린다. 색은 바로 위 결과 칸과
+            # 같은 색(lg_color/cup_color/cl_color/sc_color/cwc_color,
+            # 이 반복문 안에서 이미 계산해둔 값)을 그대로 재사용해 같은
+            # 대회끼리 시각적으로 이어져 보이게 한다.
+            _comp_stats = entry.get("_comp_stats")
+            if _comp_stats:
+                _COMP_COL_COLOR = {
+                    "league": (5, lg_color), "cup": (6, cup_color), "cl": (7, cl_color),
+                    "sc": (8, sc_color), "cwc": (9, cwc_color),
+                }
+                for _comp, (_col, _color) in _COMP_COL_COLOR.items():
+                    _cs = _comp_stats.get(_comp)
+                    if _cs:
+                        tbl.setCellWidget(row_idx, _col, self._comp_stat_cell(_cs, _color))
                 row_idx += 1
         self._resize_self_sizing_table(tbl)
 

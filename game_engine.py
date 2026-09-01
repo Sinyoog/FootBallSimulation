@@ -2591,7 +2591,7 @@ def _process_training(p, week, ttype, focus_stat=None, day=None):
                 _apply_injury(p, week, day=day, stress=new_stress, injury_load=new_load,
                               activity_type="training", training_type=ttype)
                 return
-            _inj_prob = calc_injury_probability(new_stress, new_load)
+            _inj_prob = calc_injury_probability(new_stress, new_load, ttype=ttype)
             if random.random() < _inj_prob:
                 _apply_injury(p, week, day=day, stress=new_stress, injury_load=new_load,
                               activity_type="training", training_type=ttype)
@@ -2872,6 +2872,10 @@ def _process_training(p, week, ttype, focus_stat=None, day=None):
     # 방지 + 부상 체크가 본 값과 실제 저장되는 값이 항상 일치하도록).
     new_happy = max(0, min(100, p["happiness"] + happy_chg))
     updates = dict(stress=new_stress, happiness=new_happy, injury_load=new_load)
+    # [2026-09 신설, 신민용 요청: "경기 전날 고강도 훈련을 하면 경기 부상
+    # 확률을 높여줘"] 오늘 한 훈련 종류를 저장해둔다 — 내일이 경기 날이면
+    # _simulate_match가 이 값을 읽어 "어제 고강도였는지"를 판정한다.
+    updates["last_training_type"] = ttype
     max_ups   = {k: v for k, v in stat_changes.items() if k.endswith("_max_up")}
     real_changes = {k: v for k, v in stat_changes.items() if not k.endswith("_max_up")}
     for s, delta in real_changes.items():
@@ -3459,6 +3463,10 @@ def _simulate_match(p, week, info: dict, day=None):
             season_saves=p.get("season_saves",0)+saves,
             season_rating_sum=p.get("season_rating_sum",0)+rating,
             season_rating_cnt=p.get("season_rating_cnt",0)+1,
+            # [2026-09 신설] 경기를 치렀으니 "전날 훈련" 기록을 비운다 —
+            # 안 비우면 그다음 경기(그 사이 훈련 없이 연전으로 이어지는
+            # 경우)가 며칠 전 고강도 값을 잘못 물려받는다.
+            last_training_type="",
             season_goals_against=p.get("season_goals_against",0)+_ga,
             # [2026-08 신설] award_* — season_*와 똑같이 쌓지만 이적해도
             # 리셋 안 되는 시즌 전체 누적(시상 계산 전용, _primary_club_
@@ -3570,7 +3578,9 @@ def _simulate_match(p, week, info: dict, day=None):
             _match_hurt = (ns >= 100 or new_load >= 100)
             if not _match_hurt:
                 from constants import calc_match_injury_probability
-                _mprob = calc_match_injury_probability(new_load, p.get("physical_trait", "무난함"))
+                _mprob = calc_match_injury_probability(
+                    new_load, p.get("physical_trait", "무난함"),
+                    prev_day_high_intensity=(p.get("last_training_type") == "고강도"))
                 _match_hurt = random.random() < _mprob
             if _match_hurt:
                 _mst = get_state()
@@ -10053,6 +10063,29 @@ def _end_of_season(p, year, progress_cb=None):
             annual_drop = decline_tbl[-1][2]
 
         if annual_drop > 0:
+            # [2026-09 신설, 신민용 지적: "노화는 숨겨진 한계 스탯(재능
+            # 상한)까지 내려야 하는데 지금은 안 그런다 — 재능이 프로인
+            # 애가 고강도를 풀로 해도 100을 못 찍는 것처럼, 신급이 나이
+            # 먹고 고강도를 풀로 조져도 그 나이의 한계 안에서만 올라와야
+            # 하는데, 지금은 노화로 깎인 스탯이 고강도 훈련으로 그대로
+            # 다시 올라온다"] 위(스탯별 _max)는 이미 annual_drop만큼
+            # 깎이는데, 정작 고강도/집중훈련의 "돌파 천장"(_apply_training
+            # 의 break_cap = talent_cap+12 등, line ~2806/2837)은 캐릭터
+            # 생성 시점에 딱 한 번 정해진 원본 p["talent_cap"]을 매번
+            # 그대로 읽어써서 나이와 무관하게 고정돼 있었다 — 그래서
+            # _max가 아무리 깎여도 고강도 훈련이 그 원본 talent_cap
+            # 근처까지 다시 뚫어버릴 수 있었다(노화가 사실상 무의미해짐).
+            # talent_cap 자체도 매 시즌 같은 annual_drop(연간 OVR 낙폭)만큼
+            # 깎아서, "이 나이대에 도달 가능한 진짜 한계"가 시간이 갈수록
+            # 실제로 낮아지게 한다 — 스탯별 share/pos_mult로 다시 쪼개지
+            # 않는다(talent_cap은 스탯 하나가 아니라 선수 전체의 OVR급
+            # 상한이라, 그 낙폭을 그대로 적용하는 게 스탯별 _max 낙폭들의
+            # 평균과 정확히 맞아떨어진다).
+            _old_talent_cap = p.get("talent_cap", 88)
+            _new_talent_cap = max(AGING_STAT_FLOOR, round(_old_talent_cap - annual_drop))
+            if _new_talent_cap < _old_talent_cap:
+                stat_updates["talent_cap"] = _new_talent_cap
+
             pos_mult = AGING_POS_MULT.get(pos, 1.0)
 
             # 계열 비중 정규화: 전체 스탯에 평균 1.0이 되도록.
@@ -11683,13 +11716,17 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
             # [2026-08 신설, 신민용 확정: "일반 강등팀 하부리그 안착 분포"]
             # 예전엔 여기서 _lower_strong 하나(pct=0.75 고정)를 미리 계산해
             # 강등팀 전원에게 그대로 썼다 — 이제 명문/일반 여부에 따라
-            # 타겟이 갈리므로, 명문팀 전용 고정값만 여기서 미리 구해두고
-            # (기존 그대로) 일반팀은 아래 강등 루프 안에서 팀별로 확률
+            # 타겟이 갈리므로, 일반팀은 아래 강등 루프 안에서 팀별로 확률
             # 샘플링한 pct를 그때그때 넘겨 계산한다(constants.
             # sample_general_relegation_landing_pct 참고, 팀마다 다른
             # 지점에 착지할 수 있어야 하므로 루프 밖에서 한 번만 계산하면
             # 안 됨).
-            _lower_strong_prestige = _cached_league_strong_ovr(lower_lid, 0.75)
+            # [2026-09 수정, 신민용 리포트: "명문팀이 3년 안 복귀를 못 한다"]
+            # 명문팀도 더 이상 여기서 미리 계산한 고정값(pct=0.75, "상위
+            # 25%"일 뿐 1위를 보장 못 함)을 안 쓴다 — 아래 강등 루프 안에서
+            # 그 팀의 실제 등급(_bu_plevel)에 맞는 percentile로 그때그때
+            # 다시 계산한다(constants.PRESTIGE_RELEGATION_LANDING_PCT
+            # 정의부 주석 참고).
 
 
             for top_lower in top_lower_list:
@@ -11773,13 +11810,21 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
                 _momentum_reset_updates.append(
                     (_mtype, MOMENTUM_START_BY_TYPE[_mtype], bottom_upper["id"]))
                 # [2026-08 신설, 신민용 확정: "일반 강등팀 하부리그 안착
-                # 분포"] 명문팀(prestige_level 1~3)은 기존처럼 상위 25%
-                # 고정 지점(_lower_strong_prestige) 그대로 유지. 일반팀은
-                # constants.GENERAL_RELEGATION_LANDING_BANDS 확률표로 매번
-                # 새로 뽑은 percentile을 써서, 강등마다 다른 지점(가끔은
-                # 진짜 강등권 근처)에 착지할 수 있게 한다.
+                # 분포"] 일반팀은 constants.GENERAL_RELEGATION_LANDING_BANDS
+                # 확률표로 매번 새로 뽑은 percentile을 써서, 강등마다 다른
+                # 지점(가끔은 진짜 강등권 근처)에 착지할 수 있게 한다.
+                # [2026-09 수정, 신민용 리포트: "명문팀이 3년 안 복귀를
+                # 못 한다 — 이겼던 팀이 보너스를 받아서 그런 것 같다"]
+                # 명문팀은 예전엔 등급 무관하게 "상위 25%"(pct=0.75) 고정
+                # 지점에만 착지했는데, 그건 1위를 보장하는 자리가 아니라서
+                # 그 사이 다른 팀이 정상적으로 쌓는 club_strength(실적
+                # 기반)만으로도 순위에서 앞설 수 있었다 — 등급별로 그
+                # 리그 최상위에 훨씬 가깝게 착지하도록 상향한다(constants.
+                # PRESTIGE_RELEGATION_LANDING_PCT 정의부 주석 참고).
                 if _bu_plevel > 0:
-                    _bu_target_ovr = _lower_strong_prestige
+                    from constants import PRESTIGE_RELEGATION_LANDING_PCT
+                    _bu_target_ovr = _cached_league_strong_ovr(
+                        lower_lid, PRESTIGE_RELEGATION_LANDING_PCT.get(_bu_plevel, 0.75))
                 else:
                     from constants import sample_general_relegation_landing_pct
                     _bu_landing_pct = sample_general_relegation_landing_pct()

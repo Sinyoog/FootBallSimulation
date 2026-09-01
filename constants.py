@@ -1332,16 +1332,33 @@ INJURY_RISK_MULT_CURVE = [
 INJURY_BASE_PROBABILITY = 0.0015   # 0.15%
 INJURY_MAX_PROBABILITY  = 0.08     # 8% (GPT 권고 5~10% 구간의 중간값)
 
+# [2026-09 신설, 신민용 리포트: "고강도 훈련도 지금은 부상 확률이 아예
+# 없는 거나 마찬가지다 — 1%정도는 넣어줘"] 위 INJURY_BASE_PROBABILITY는
+# stress/injury_load가 둘 다 낮은(50 미만) 평소엔 0.15%에 mult=1.0이
+# 그대로 곱해져 사실상 체감이 안 됐다 — 고강도를 휴식과 번갈아 관리
+# 잘하면 stress/load가 항상 50 밑에 머물러 몇 시즌을 해도 부상을 거의
+# 못 본다는 뜻. "재능 프로가 고강도 풀로 해도 100을 못 찍는 것처럼,
+# 고강도는 그 자체로 부상 위험이 있는 훈련이어야 한다"는 설계 의도에
+# 맞춰, 고강도 세션 전용 기본확률을 훨씬 높게 잡는다 — stress/load가
+# 낮은 평소에도 최소 1%는 깔리고, 여기에 기존 mult(stress/load 위험도)가
+# 그대로 곱해져 더 위험할 땐 더 위험해진다. 중강도/저강도/휴식은
+# 기존 INJURY_BASE_PROBABILITY 그대로 유지(요청 범위 밖).
+HIGH_INTENSITY_INJURY_BASE_PROBABILITY = 0.01   # 1%
 
-def calc_injury_probability(stress: float, injury_load: float) -> float:
+
+def calc_injury_probability(stress: float, injury_load: float, ttype: str = None) -> float:
     """100 미만 구간에서 이번 세션에 부상이 발생할 확률(0~1)을 계산.
-    100 이상 강제발동은 호출부에서 별도로 처리(이 함수는 그 경우 안 씀)."""
+    100 이상 강제발동은 호출부에서 별도로 처리(이 함수는 그 경우 안 씀).
+    [2026-09 확장] ttype="고강도"면 위 HIGH_INTENSITY_INJURY_BASE_PROBABILITY
+    (1%)를 기본확률로 쓴다 — 그 외(중강도/저강도/휴식/None)는 기존과
+    동일하게 INJURY_BASE_PROBABILITY(0.15%)."""
     stress_factor = _lerp_curve(INJURY_RISK_FACTOR_CURVE, stress)
     load_factor   = _lerp_curve(INJURY_RISK_FACTOR_CURVE, injury_load)
     combined = (INJURY_RISK_STRESS_WEIGHT * stress_factor
                 + INJURY_RISK_LOAD_WEIGHT * load_factor)
     mult = _lerp_curve(INJURY_RISK_MULT_CURVE, combined)
-    return min(INJURY_MAX_PROBABILITY, INJURY_BASE_PROBABILITY * mult)
+    base = HIGH_INTENSITY_INJURY_BASE_PROBABILITY if ttype == "고강도" else INJURY_BASE_PROBABILITY
+    return min(INJURY_MAX_PROBABILITY, base * mult)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1371,13 +1388,27 @@ MATCH_INJURY_LOAD_RISK_CURVE = [
 # 최종 확률 상한 — injury_load가 극단(100 근처)이어도 이 값을 못 넘음.
 MATCH_INJURY_MAX_PROBABILITY = 0.15
 
+# [2026-09 신설, 신민용 요청: "경기 전날 고강도 훈련을 하면 경기 부상
+# 확률을 높여줘"] injury_load 곡선만으로는 고강도 세션 딱 한 번만으로는
+# 거의 안 움직인다(위 커브가 50 미만이면 배율 1.0 그대로라, 그 전까지
+# 잘 관리해온 선수라면 하루 고강도 정도로는 50을 잘 안 넘음) — "바로
+# 전날 고강도를 했다"는 사실 자체에 대한 별도의 직접적인 배율을 둔다.
+MATCH_INJURY_PREV_HIGH_INTENSITY_MULT = 1.5
 
-def calc_match_injury_probability(injury_load: float, physical_trait: str) -> float:
+
+def calc_match_injury_probability(injury_load: float, physical_trait: str,
+                                   prev_day_high_intensity: bool = False) -> float:
     """경기 1회당 부상 확률(0~1). 강철체질(injury_immune)은 호출부에서
     이 함수 자체를 안 부르고 걸러낸다 — 이 함수는 "면역이 아닌 선수"만
-    대상으로 한다."""
+    대상으로 한다.
+    [2026-09 확장] prev_day_high_intensity=True(경기 바로 전날 고강도
+    훈련을 했음)면 MATCH_INJURY_PREV_HIGH_INTENSITY_MULT(1.5배)를 추가로
+    곱한다 — injury_load 배율과는 별개로 겹쳐 적용된다(둘 다 반영해야
+    "몸 상태 자체도 안 좋은데 전날 무리까지 했다"가 제대로 표현됨)."""
     base = MATCH_INJURY_BASE_PROBABILITY.get(physical_trait, MATCH_INJURY_BASE_PROBABILITY_DEFAULT)
     mult = _lerp_curve(MATCH_INJURY_LOAD_RISK_CURVE, injury_load)
+    if prev_day_high_intensity:
+        mult *= MATCH_INJURY_PREV_HIGH_INTENSITY_MULT
     return min(MATCH_INJURY_MAX_PROBABILITY, base * mult)
 
 
@@ -2920,6 +2951,55 @@ def sample_general_relegation_landing_pct() -> float:
     # 경우에 대한 안전망 — 마지막 구간에서 뽑는다.
     lo, hi, _ = GENERAL_RELEGATION_LANDING_BANDS[-1]
     return random.uniform(lo, hi)
+
+
+# [2026-09 신설, 신민용 리포트: "prestige_clubs.py 팀들은 강등당해도 최대
+# 3년 안에 복귀하게 해뒀는데 복귀를 못하고 계속 강등당한다 — 이겼던 팀이
+# 보너스를 받거나 승격한 팀이 무언가를 받아서 그런 것 같다"] 원인 확인:
+# 위 GENERAL_RELEGATION_LANDING_BANDS 주석에 이미 적혀 있듯, 명문팀은
+# 등급(1~3) 구분 없이 무조건 하위 리그의 상위 25%(pct=0.75) 지점에만
+# 착지했다 — "상위 25%"는 그 리그에서 1등을 확신할 수 있는 자리가 아니라
+# 그냥 중상위권일 뿐이라, 다른 팀이 club_strength(실적 기반, update_
+# club_strength_after_season)를 잘 쌓거나 자기 나름대로 좋은 시즌을 보내면
+# (사용자가 말한 "이겼던 팀의 보너스") 얼마든지 순위에서 앞설 수 있었다.
+# 실제로 강등 회복 momentum(relegation_recovery_p1/p2/p3, MOMENTUM_
+# SCHEDULES)의 club_strength 보너스도 CLUB_STRENGTH_MIN~MAX(-4~+4)에
+# 그대로 클램프되므로, 착실히 잘하고 있는 다른 팀이 정상적으로 도달할 수
+# 있는 상한과 사실상 같은 수준으로 눌린다 — 즉 명문팀의 진짜 우위는
+# "3년 안 복귀를 보장할 만큼" 크지 않았다. 등급이 높을수록 그 리그
+# 최상위에 훨씬 가깝게 착지하도록(3급=거의 확실한 1위권, 2급=최상위권,
+# 1급=상위권) 등급별로 나눈다 — _process_promotion_relegation의 강등
+# 착지 지점 계산이 이 값을 쓴다.
+PRESTIGE_RELEGATION_LANDING_PCT = {3: 0.97, 2: 0.92, 1: 0.85}
+
+# [2026-09 신설, 신민용+GPT 협업: "명문팀은 은퇴자를 유망주 즉시 생성으로
+# 채우지 않는다 — 먼저 시장에서 검증된 선수를 영입 시도하고, 정말 적합한
+# 선수가 없을 때만 자체 유스 생성을 fallback으로 쓴다"] 지금까지
+# _retire_and_replace는 명문팀이든 아니든 항상 그 자리에 16~21세 원석을
+# 새로 심었다 — 현실은 반대로, 큰 팀일수록 은퇴 공백을 이미 어딘가에서
+# 검증된 선수를 사와서 메우고, 진짜 어린 원석은 작은 팀에서 자라다가
+# 이적으로 올라가는 피라미드 구조다. 등급이 높을수록 "영입으로 채울
+# 확률"을 높게 잡는다(신민용이 직접 제시한 표) — 못 채우면(확률 미달 또는
+# 적합한 후보가 시장에 없음) 기존 유스 생성으로 자연히 폴백한다.
+BUY_REPLACEMENT_PROB_BY_GRADE = {
+    "SS": 0.90, "S": 0.85, "A": 0.70, "B": 0.50,
+    "C": 0.30, "D": 0.10, "E": 0.10, "F": 0.05,
+}
+# prestige_level(명문 등급, prestige_clubs.py)이 이 문턱 이상이면, 그 팀이
+# 등록된 나라의 리그 등급이 SS/S가 아니어도 최소 S급 취급으로 위 표를
+# 적용한다 — "명문은 명문"이라는 원칙(다른 명문 보정들과 동일)을 여기도
+# 맞춘다.
+BIG_CLUB_PRESTIGE_THRESHOLD = 2
+# 영입 후보를 찾을 때 목표 OVR(은퇴자가 원래 있던 자리의 "성인 잠재치")
+# 대비 허용하는 폭 — (아래로 허용치, 위로 허용치). "레알 마드리드 평균
+# 89면 84~90 정도를 찾는다"는 신민용 예시에 맞춰, 목표보다 살짝 낮은
+# 선수까지는 넉넉히 허용하고 위로는 좁게(과분한 선수는 애초에 시장에
+# 잘 안 나옴) 잡는다.
+BUY_REPLACEMENT_OVR_BAND = (10, 4)
+# 영입 후보 중 이 나이 이하면 성장여력을 감안해 뽑힐 가중치를 올린다
+# ("젊고 성장 가능성이 높은 선수" 우선순위).
+BUY_REPLACEMENT_YOUNG_AGE = 26
+BUY_REPLACEMENT_YOUNG_WEIGHT = 1.6
 
 
 def club_strength_delta_for_rank(rank: int, n_teams: int) -> float:

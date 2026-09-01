@@ -870,19 +870,22 @@ class CenterPanel(QWidget):
 
             # [2026-07 추가 버그수정, 신민용 리포트: "결승 진출이 확정됐는데
             # 그 전날(3/4위전 날)이 강제 휴식으로 안 바뀌고 그냥 고강도로
-            # 뜬다"] 위 패치는 '오늘 경기가 생겼는지'만 확인했지, '내일
-            # 경기가 새로 확정돼서 오늘이 경기 전날 강제휴식이 돼야 하는지'는
-            # 다시 안 봤다. 대진이 잠금 시점 이후에 결정되는 경우(4강 결과에
-            # 따라 결승/3-4위전 중 하나가 확정)엔 이 관계도 매 새로고침마다
-            # 다시 확인해야 한다 — _build_week_sched가 처음 잠글 때 쓰던
-            # 것과 동일한 규칙("내일이 진짜 경기면 오늘은 무조건 휴식")을
+            # 뜬다"] 위 패치는 '오늘 경기가 생겼는지'만 확인했지, 강제
+            # 휴식이 걸려야 할 다른 날도 다시 안 봤다. 대진이 잠금 시점
+            # 이후에 결정되는 경우(4강 결과에 따라 결승/3-4위전 중 하나가
+            # 확정)엔 이 관계도 매 새로고침마다 다시 확인해야 한다 —
+            # _build_week_sched가 처음 잠글 때 쓰던 것과 동일한 규칙을
             # 여기서도 그대로 적용한다.
+            # [2026-09 변경, 신민용 요청: "대회 전 휴식을 경기 다음날
+            # 강제 휴식으로 바꿔줘"] 규칙 자체가 "내일이 경기면 오늘 휴식"
+            # 에서 "어제가 경기였으면 오늘 휴식"으로 바뀌었으므로, 이
+            # 재확인 패치도 어제(_d-1) 쪽을 본다.
             _by_day = {x[0]: x for x in self._locked_sched}
             for _i, (_d, _ttype, _detail) in enumerate(self._locked_sched):
                 if _d < day or _ttype == "경기":
                     continue
-                _next_item = _by_day.get(_d + 1)
-                if _next_item and _next_item[1] == "경기" and _ttype != "휴식":
+                _prev_item = _by_day.get(_d - 1)
+                if _prev_item and _prev_item[1] == "경기" and _ttype != "휴식":
                     self._locked_sched[_i] = (_d, "휴식", None)
 
             _match_cache = {}
@@ -1090,44 +1093,44 @@ class CenterPanel(QWidget):
                 # 원래 그날 뭘 골라놨었는지(예: 고강도)가 화면에서 아예
                 # 사라지고, 진짜 사용자가 "휴식"을 고른 것처럼 보였다.
                 # 이제는 경기 매치 라벨(ml)과 똑같은 방식으로 콤보 자체를
-                # 숨기고 "🛌 대회 전 휴식" 전용 라벨을 보여준다 — 콤보의
-                # currentText는 절대 안 건드리므로 사용자의 원래 선택이
-                # 화면 밑에 그대로 보존되고, 그 경기가 없어지면 콤보가
-                # 다시 나타나면서 원래 선택이 그대로 드러난다(별도 복원
-                # 로직이 필요 없어짐). 실제 스트레스/휴식 효과는 이 표시와
-                # 무관하게 _advance의 스케줄 빌더가 "내일 경기 있으면 오늘
-                # 무조건 휴식 처리"로 그대로 적용한다.
-                next_mi = _match_cache.get(d + 1)
-                if not next_mi:
+                # 숨기고 전용 라벨을 보여준다 — 콤보의 currentText는 절대
+                # 안 건드리므로 사용자의 원래 선택이 화면 밑에 그대로
+                # 보존되고, 그 경기가 없어지면 콤보가 다시 나타나면서
+                # 원래 선택이 그대로 드러난다(별도 복원 로직이 필요
+                # 없어짐).
+                # [2026-09 변경, 신민용 요청: "대회 전 휴식을 경기 다음날
+                # 강제 휴식으로 바꿔줘"] 강제 휴식 시점을 경기 "전날"에서
+                # 경기 "다음날"로 바꾼다 — 실제 스트레스/휴식 효과는 이
+                # 표시와 무관하게 _advance의 스케줄 빌더(_build_week_sched)
+                # 가 "어제 경기 있었으면 오늘 무조건 휴식 처리"로 그대로
+                # 적용한다.
+                prev_mi = _match_cache.get(d - 1)
+                if not prev_mi:
                     # [2026-07 버그수정, 신민용 리포트: "클럽 월드컵 16강이
                     # 11월 19일인데 그 전날(18일)에 파란색 '경기 전 휴식'
-                    # 표시가 안 뜬다"] 예전엔 d+1이 캐시에 아예 없을 때만
-                    # (사실상 번들 마지막 날 등 예외 상황) 라이브로 다시
-                    # 확인했다 — 그런데 하루씩 모드에서 캐시는 번들이
-                    # 잠긴 시점 기준이라, R16 같은 조별리그 이후 셸이 그
-                    # 뒤에(같은 주 안에서) 확정돼도 이미 지나간 날짜의
-                    # 패치 루프는 더는 그 앞날(d)까지 되짚어 갱신하지
-                    # 않는다 — 그 결과 d+1에 실제 경기가 생겼는데도 캐시엔
-                    # 여전히 None으로 남아 이 미리보기가 낡은 채로 굳어있을
-                    # 수 있었다. 캐시가 "경기 없음"(None)이라고 할 때는
-                    # 항상 가볍게 한 번 더 살아있는 조회로 재확인한다 —
-                    # 실제 경기가 있으면 캐시보다 라이브가 항상 옳고,
-                    # 없으면 조회 결과도 그대로 None이라 손해가 없다.
-                    next_mi = self._get_match_for_day(d + 1, p, st=st)
+                    # 표시가 안 뜬다"] 예전엔 참조하는 날이 캐시에 아예
+                    # 없을 때만(사실상 번들 경계 등 예외 상황) 라이브로
+                    # 다시 확인했다 — 그런데 하루씩 모드에서 캐시는 번들이
+                    # 잠긴 시점 기준이라, 그 범위 밖 날짜는 캐시에 없을 수
+                    # 있다. 캐시가 "경기 없음"(None)이라고 할 때는 항상
+                    # 가볍게 한 번 더 살아있는 조회로 재확인한다 — 실제
+                    # 경기가 있으면 캐시보다 라이브가 항상 옳고, 없으면
+                    # 조회 결과도 그대로 None이라 손해가 없다.
+                    prev_mi = self._get_match_for_day(d - 1, p, st=st)
                 # [2026-07 안전장치] "미정" placeholder(아직 대진 미확정
                 # 미래 라운드)는 실제 경기가 아니라 advance_days의 강제
-                # 휴식 로직도 이걸 모른다 — 여기서 "내일 경기 있음"으로
-                # 취급해 "대회 전 휴식"을 미리 보여주면, 실제로 진행했을 때
-                # 적용되는 훈련(사용자가 고른 값)과 화면 미리보기가
-                # 어긋난다. pending은 이 미리보기 트리거에서 제외한다.
-                if next_mi and next_mi.get("pending"):
-                    next_mi = None
-                if next_mi:
+                # 휴식 로직도 이걸 모른다 — 여기서 "어제 경기 있음"으로
+                # 취급해 "경기 다음날 휴식"을 미리 보여주면, 실제로
+                # 진행했을 때 적용되는 훈련(사용자가 고른 값)과 화면
+                # 미리보기가 어긋난다. pending은 이 미리보기 트리거에서
+                # 제외한다.
+                if prev_mi and prev_mi.get("pending"):
+                    prev_mi = None
+                if prev_mi:
                     cb.hide()
-                    loc_txt = "원정 이동" if next_mi.get("is_home") is False else "경기 하루 전"
-                    hl.setText(f"🚌 {loc_txt} (스트레스 -15)")
+                    hl.setText("🛌 경기 다음날 (스트레스 -15)")
                     if ml:
-                        ml.setText("🛌 대회 전 휴식")
+                        ml.setText("🛌 경기 다음날 휴식")
                         # [2026-08 색상 확정, 신민용 최종 승인]
                         ml.setStyleSheet("color:#88bbff;font-weight:bold;font-size:12px;"
                                          "background:#1a243a;border-radius:4px;padding:4px;")
@@ -1850,14 +1853,17 @@ class CenterPanel(QWidget):
                 if mi:
                     sched.append((d, "경기", mi))
                 else:
-                    # [2026-07 확장] 경기 하루 전엔(홈/원정 무관) 이동/컨디션
-                    # 관리 목적으로 무조건 휴식을 강제한다(실제 프로팀 루틴과
-                    # 동일, 이틀 연속 경기 방지) — 사용자가 그날 다른 훈련을
-                    # 골라놨어도 경기 전날이면 덮어쓴다.
-                    next_mi = self._get_match_for_day(d + 1, p, st=st)
-                    if next_mi and next_mi.get("pending"):
-                        next_mi = None
-                    if next_mi:
+                    # [2026-09 변경, 신민용 요청: "대회 전 휴식을 경기 다음날
+                    # 강제 휴식으로 바꿔줘"] 예전엔 경기 하루 "전"에 강제
+                    # 휴식이었다(이동/컨디션 관리 목적) — 이제는 경기 하루
+                    # "후"에 강제 휴식으로 바뀐다(경기를 뛴 다음날 회복
+                    # 목적, 이틀 연속 경기 방지라는 원래 취지는 동일). 오늘
+                    # 바로 전날(d-1)에 경기가 있었으면 오늘 훈련 선택을
+                    # 덮어쓴다.
+                    prev_mi = self._get_match_for_day(d - 1, p, st=st)
+                    if prev_mi and prev_mi.get("pending"):
+                        prev_mi = None
+                    if prev_mi:
                         ttype = "휴식"
                     # 강점/약점훈련은 엔진이 스탯을 자동 선별하므로 detail 불필요.
                     sched.append((d, ttype, None))
@@ -1884,11 +1890,12 @@ class CenterPanel(QWidget):
                     if mi:
                         sched.append((d, "경기", mi))
                     else:
-                        # 경기 전날 휴식 강제(홈/원정 무관) — 위 _build_week_sched 주석 참고.
-                        next_mi = self._get_match_for_day(d + 1, p, st=st)
-                        if next_mi and next_mi.get("pending"):
-                            next_mi = None
-                        if next_mi:
+                        # [2026-09 변경] 경기 다음날 휴식 강제로 변경 — 위
+                        # _build_week_sched 주석 참고.
+                        prev_mi = self._get_match_for_day(d - 1, p, st=st)
+                        if prev_mi and prev_mi.get("pending"):
+                            prev_mi = None
+                        if prev_mi:
                             ttype = "휴식"
                         sched.append((d, ttype, None))
                 self._locked_sched = sched
@@ -2194,9 +2201,9 @@ class CenterPanel(QWidget):
 
     def _build_pattern_week_sched(self, day, p, st, pattern):
         """_build_week_sched와 동일한 규칙(경기 있는 날은 자동으로 "경기",
-        경기 전날은 강제 휴식)으로 7일 일정을 만들되, 콤보박스를 실시간으로
-        읽는 대신 고정된 pattern(7개 문자열)을 반복 소스로 쓴다 — 1년
-        넘기기 동안 매주 똑같은 패턴을 재사용하기 위함."""
+        경기 다음날은 강제 휴식)으로 7일 일정을 만들되, 콤보박스를 실시간
+        으로 읽는 대신 고정된 pattern(7개 문자열)을 반복 소스로 쓴다 —
+        1년 넘기기 동안 매주 똑같은 패턴을 재사용하기 위함."""
         sched = []
         for i in range(DAY_BUNDLE_SIZE):
             d     = day + i
@@ -2208,10 +2215,11 @@ class CenterPanel(QWidget):
             if mi:
                 sched.append((d, "경기", mi))
             else:
-                next_mi = self._get_match_for_day(d + 1, p, st=st)
-                if next_mi and next_mi.get("pending"):
-                    next_mi = None
-                if next_mi:
+                # [2026-09 변경] 경기 다음날 휴식 강제로 변경 — _build_week_sched 주석 참고.
+                prev_mi = self._get_match_for_day(d - 1, p, st=st)
+                if prev_mi and prev_mi.get("pending"):
+                    prev_mi = None
+                if prev_mi:
                     ttype = "휴식"
                 sched.append((d, ttype, None))
         return sched
@@ -2569,9 +2577,10 @@ class CenterPanel(QWidget):
     def _update_next_week_preview(self, bundle_start, p, st=None):
         """[2026-07 신설] 우측 상단 작은 박스 7개 — 다음 주(현재 표시 중인
         7일 묶음의 바로 다음 7일) 일정을 대회 종류별 색으로 간단히 미리
-        보여준다. 경기 없는 날(훈련/휴식, "대회 전 휴식"인 하루 전날 포함)은
-        회색으로 둔다 — _get_match_for_day가 "대회 전 휴식"인 날엔 애초에
-        None(경기 없음)을 반환하므로 이 함수가 따로 걸러낼 필요는 없다.
+        보여준다. 경기 없는 날(훈련/휴식, "경기 다음날 휴식"인 하루 다음날
+        포함)은 회색으로 둔다 — _get_match_for_day는 그날 실제 경기가
+        있는지만 보므로(강제 휴식 여부와 무관) 이 함수가 따로 걸러낼
+        필요는 없다.
         [2026-07 버그수정] 소속 클럽이 없어도(국대만 있는 어린 선수 등)
         국제전은 뜰 수 있으므로 has_team 게이트 없이 항상 조회한다.
         [2026-08 버그수정, 신민용 리포트: "미리보기 박스 색이 가운데

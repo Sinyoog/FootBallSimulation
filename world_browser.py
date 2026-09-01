@@ -1182,14 +1182,27 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
     # 를 연도별로 붙인다 — 이 기능 신설 이전 시즌은 값이 없어(dict에 키
     # 자체가 없음) 자연히 "-"로 표시된다(ovr_checkpoints 등과 동일한
     # 소급 불가 원칙).
+    # [2026-09 확장, 신민용 요청: "리그/국내컵/클럽대항전/슈퍼컵/클럽
+    # 월드컵 다 평점·골·어시를 다르게 둬야 하는데 그게 안 되어 있다"]
+    # 기존 _stat_*(리그 전용, 위 하반기 분리 로직이 그대로 참조하므로
+    # 유지)에 더해, 대회별로 나눈 _comp_stats도 같이 붙인다 — 리그는
+    # 같은 srow를 재사용하고 국내컵/클럽대항전/슈퍼컵/클럽월드컵은
+    # hist.ai_player_season_stats_by_comp에서 조회한다.
     stat_by_year = get_ai_player_season_stats(player_id)
+    comp_by_year = get_ai_player_season_stats_by_comp(player_id)
     for e in out:
         srow = stat_by_year.get(e["year"])
+        comp_stats = {}
         if srow:
             e["_stat_matches"] = srow["matches"]
             e["_stat_goals"] = srow["goals"]
             e["_stat_assists"] = srow["assists"]
             e["_stat_rating"] = srow["rating"]
+            comp_stats["league"] = {"matches": srow["matches"], "goals": srow["goals"],
+                                     "assists": srow["assists"], "rating": srow["rating"]}
+        comp_stats.update(comp_by_year.get(e["year"], {}))
+        if comp_stats:
+            e["_comp_stats"] = comp_stats
 
     # get_team_history와 완전히 동일한 판정 기준으로 "이 선수가 실제로
     # 그 팀에 있었던 연도"만 다시 집계.
@@ -1350,6 +1363,27 @@ def get_ai_player_season_stats(player_id):
     return {r["year"]: {"team_id": r["team_id"], "matches": r["matches"],
                          "goals": r["goals"], "assists": r["assists"],
                          "rating": r["rating"]} for r in rows}
+
+
+def get_ai_player_season_stats_by_comp(player_id):
+    """[2026-09 신설, 신민용 요청: "리그/국내컵/클럽대항전/슈퍼컵/클럽
+    월드컵 다 평점·골·어시를 다르게 둬야 한다"] get_ai_player_season_
+    stats(리그 전용)의 대회별 버전 — ai_lifecycle._snapshot_season_ratings가
+    같이 archive해둔 hist.ai_player_season_stats_by_comp를 그대로 읽는다.
+    반환: {year: {competition: {"matches","goals","assists","rating"}}},
+    competition은 'cup'/'cl'/'sc'/'cwc' 중 그 해 실제로 데이터가 있는 것만."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT year, competition, matches, goals, assists, rating "
+        "FROM hist.ai_player_season_stats_by_comp WHERE player_id=? ORDER BY year ASC",
+        (player_id,)).fetchall()
+    conn.close()
+    out = {}
+    for r in rows:
+        out.setdefault(r["year"], {})[r["competition"]] = {
+            "matches": r["matches"], "goals": r["goals"],
+            "assists": r["assists"], "rating": r["rating"]}
+    return out
 
 
 def get_my_player_season_stats():
@@ -1562,6 +1596,15 @@ def get_my_player_career_history():
             entry["_stat_goals"] = _my_stat["goals"]
             entry["_stat_assists"] = _my_stat["assists"]
             entry["_stat_rating"] = _my_stat["rating"]
+            # [2026-09 신설] AI 쪽(get_ai_player_career_history)과 같은
+            # _comp_stats 구조를 맞춰준다 — 나는 요청 범위 밖(신민용 확정:
+            # "AI 선수 표시가 목적, 나는 굳이 안 넣어도 됨")이라 리그
+            # 하나만 채운다. 화면(world_browser_window.py)이 AI/본인을
+            # 구분하지 않고 _comp_stats에 있는 대회만 그대로 그리므로,
+            # 이렇게만 채워도 리그 박스 하나로 자연스럽게 표시된다.
+            entry["_comp_stats"] = {"league": {
+                "matches": _my_stat["matches"], "goals": _my_stat["goals"],
+                "assists": _my_stat["assists"], "rating": _my_stat["rating"]}}
         out.append(entry)
         if entry.get("league") and _rank1_re.search(entry["league"]):
             awards["league"] += 1

@@ -7,8 +7,16 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt
 
-from game_engine import get_player, get_state, fmt_money
+from game_engine import get_player, get_state, fmt_money, get_difficulty
 from constants import SEASON_PHASES
+
+# [2026-09 신설] 상단 표시줄용 난이도 한글/영문 라벨 — start_screen.py의
+# 쉬움/보통/어려움 표기와 동일하게 맞춘다.
+_DIFF_LABELS = {
+    "easy":   ("쉬움",   "Easy"),
+    "normal": ("보통",   "Normal"),
+    "hard":   ("어려움", "Hard"),
+}
 
 STYLE = """
 QMainWindow, QWidget { background-color: #1a1a1a; color: #e0e0e0;
@@ -305,8 +313,14 @@ class MainWindow(QMainWindow):
         season = st["current_season"]
         phase  = _phase_label(week, self.lang)
 
+        # [2026-09 신설] 년도 앞에 현재 난이도, "N시즌 M주차"와 "[페이즈]"
+        # 사이에 나이를 추가 표시 — 년생(생년)은 노출하지 않고 나이만.
+        diff_idx   = 0 if self.lang == "ko" else 1
+        diff_label = _DIFF_LABELS.get(get_difficulty(p), _DIFF_LABELS["easy"])[diff_idx]
+
         if self.lang == "ko":
-            txt = f"{year}년  |  {season}시즌 {week}주차  |  [{phase}]"
+            txt = (f"{diff_label}  |  {year}년  |  {season}시즌 {week}주차  "
+                   f"|  {p['age']}세  |  [{phase}]")
             nat_html = self._nationality_html(p)
             if nat_html:
                 txt += f"  |  {nat_html}"
@@ -321,8 +335,8 @@ class MainWindow(QMainWindow):
             txt += f"  |  총재산 {fmt_money(p.get('total_assets', 0))}"
             txt += f"  |  팀연봉 {fmt_money(p.get('salary', 0))}"
         else:
-            txt = f"{year}  |  S{season} W{week}  |  [{phase}]"
-            txt += f"  |  {p['name']} {p['age']}"
+            txt = f"{diff_label}  |  {year}  |  S{season} W{week}  |  {p['age']}  |  [{phase}]"
+            txt += f"  |  {p['name']}"
 
         self.top_label.setText(txt)
 

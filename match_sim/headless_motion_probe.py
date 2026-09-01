@@ -1,57 +1,74 @@
 # -*- coding: utf-8 -*-
-"""match_sim_viewer.py의 22명 움직임 품질을 자동으로 검사하는 헤드리스
-회귀 테스트. 매번 눈으로 재생해서 확인할 필요 없이, 아래 세 가지를 자동
-으로 잡아낸다:
+"""match_sim/headless_motion_probe.py — 22명 움직임 회귀 검사 + 품질 계량.
 
-  1. 순간이동  — 한 틱 사이 비정상적으로 큰 좌표 이동
-  2. 고정      — 경기 내내(또는 아주 긴 구간) 사실상 안 움직이는 선수
-  3. 팀 내 겹침 — 같은 팀 선수 두 명이 완전히 같은 자리에 뭉치는 경우
-     (상대 팀과의 밀착 마크는 실제 축구에서도 정상이라 검사 대상에서 뺀다)
+## 무엇이 바뀌었나 (v2)
 
-[중요] 코너킥/PK 크라우드 스냅, 하프타임 재배치, 골/파울 재개처럼 게임이
-"의도적으로" 순간 배치하는 상황이 실제로 존재한다(신민용 확인 완료 —
-"애들 이동하는데 시간 빼기 싫어서 넣은 것"). 이런 의도된 스냅까지 버그로
-잡아내면 오탐만 늘어나서 검증 자체가 무의미해지므로, 해당 프레임의 배너
-텍스트로 "의도된 전환 구간"을 식별해 화이트리스트 처리한다 — 이 스크립트를
-쓸 때 새로 배너 문구를 추가했다면 _WHITELIST_BANNER_KEYWORDS도 같이 확인할 것.
+**Qt가 더 이상 필요 없다.** 예전엔 시뮬레이션이 `MatchSimViewer(QDialog)`
+안에 살아서, 이 스크립트가 `QT_QPA_PLATFORM=offscreen`으로 Qt를 띄우고
+다이얼로그를 생성해야만 돌았다. 시스템에 Qt 런타임(libEGL 등)이 없으면
+아예 못 돌았고, CI에서도 무거웠다. 이제 시뮬은 `match_sim/sim_engine.py`의
+`MatchSimEngine`이고 순수 파이썬이라 그냥 돌아간다.
 
-사용법:
-    QT_QPA_PLATFORM=offscreen python3 tests/headless_motion_probe.py
-    (또는 --trials N 으로 시나리오 개수 조절, --seed N 으로 재현)
+## 두 가지 검사
 
-exit code 0 = 이상 없음, 1 = 이슈 발견(내용은 표준출력에 상세히 찍힘).
+이 스크립트는 성격이 다른 두 질문에 답한다. 둘 다 필요하다.
+
+  **(1) 결함 검사 (--defects, 기본 켜짐)** — "버그가 없는가"
+      순간이동 / 고정 / 팀 내 겹침. exit code에 반영된다.
+      의도된 스냅(코너 크라우드, 하프타임 재배치, 파울 재개 등)은
+      `last_restart_clock`으로 식별해 화이트리스트 처리한다.
+
+  **(2) 품질 계량 (--metrics)** — "축구처럼 보이는가"
+      motion_metrics.py로 이동거리/속도/대형/압박밀도/자율성을 실축
+      단위(m, m/s, km)로 환산해 참조 밴드와 대조한다.
+
+(1)만으로는 부족하다는 게 이 프로젝트에서 실제로 확인됐다 — 결함 0건인
+채로도 "선수당 이동거리 3.2km(실축 9~12km), 한 프레임에 움직이는 선수
+1.4명(실축 8~18명)"이 나온다. 결함이 없는 것과 축구처럼 보이는 것은
+다른 문제다.
+
+## 사용법
+
+    python3 -m match_sim.headless_motion_probe --trials 12 --metrics
+    python3 -m match_sim.headless_motion_probe --trials 30 --metrics --no-defects
+
+exit code 0 = 결함 없음, 1 = 결함 발견.
 """
 import argparse
 import os
 import random
 import sys
 
-sys.path.insert(0, ".")
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-
-from PyQt6.QtWidgets import QApplication
-_app = QApplication.instance() or QApplication(sys.argv)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import game_engine
-import match_flow
-from ui.match_sim_viewer import MatchSimViewer
+from match_sim import match_flow
+from match_sim.sim_engine import MatchSimEngine
+from match_sim.motion_metrics import (
+    analyze_frames, aggregate, format_report, format_detail)
 
-# 의도된 순간 전환으로 간주할 배너 키워드. 이 문구가 현재 또는 직전 프레임
-# 배너에 있으면 그 틱의 이동은 "게임이 일부러 스냅한 것"으로 보고 넘어간다.
+# 의도된 순간 전환으로 간주할 배너 키워드.
 _WHITELIST_BANNER_KEYWORDS = (
     "코너킥", "페널티", "PK", "GOAL", "골!", "후반 시작", "전반 시작",
     "파울", "선방", "승부차기", "실점",
 )
 
-MAX_JUMP_PER_TICK = 0.22    # 화이트리스트 안 걸린 틱에서 이 이상 이동하면 이상
-STATIONARY_EPS = 0.03       # 경기 전체 이동거리 합이 이 이하면 "고정"
+# [Phase 2] 고정 임계(0.22)는 틱 길이가 3.6초일 때 만든 값이다. 틱 길이가
+# 바뀌면 "물리적으로 가능한 최대 이동"도 바뀌므로 프레임 간격에서 유도한다.
+# 기준: 최고속도 11 m/s로 그 시간 동안 갈 수 있는 거리 + 여유.
+def _max_jump_for(dt_min):
+    dt_s = dt_min * 60.0
+    return (11.0 * dt_s) / 105.0 * 1.6 + 0.02
+
+
+MAX_JUMP_PER_TICK = 0.22
+STATIONARY_EPS = 0.03
 TEAMMATE_OVERLAP_EPS = 0.012
 
 
 def make_scenario(rng, is_home=True):
     """실제 게임 엔진의 통계/이벤트 생성 공식을 그대로 써서 진짜와 동일한
-    형태의 payload를 만든다(test_match_flow.py의 시나리오 생성기와 동일한
-    패턴)."""
+    형태의 payload를 만든다."""
     hs = rng.randint(0, 5)
     as_ = rng.randint(0, 5)
     my_score = hs if is_home else as_
@@ -62,10 +79,10 @@ def make_scenario(rng, is_home=True):
     detail = {"shots": rng.randint(0, 8), "shots_on": rng.randint(0, 4),
               "key_passes": rng.randint(0, 5), "dribbles": rng.randint(0, 5),
               "blocks": rng.randint(0, 6), "pass_acc": round(rng.uniform(0.55, 0.95), 3)}
-    team_stats = game_engine._derive_match_stats(is_home, hs, as_, goals, assists, saves, "CM", detail)
+    team_stats = game_engine._derive_match_stats(
+        is_home, hs, as_, goals, assists, saves, "CM", detail)
 
-    events = []
-    used = set()
+    events, used = [], set()
 
     def pick_minute():
         for _ in range(20):
@@ -94,70 +111,63 @@ def make_scenario(rng, is_home=True):
     payload = {
         "events": [[m, t] for m, t in events],
         "position": rng.choice(["ST", "CM", "CB", "LW", "GK"]),
-        "detail": detail,
-        "team_stats": team_stats,
-        "possession_log": possession_log,
-        "lineup_stats": lineup_stats,
+        "detail": detail, "team_stats": team_stats,
+        "possession_log": possession_log, "lineup_stats": lineup_stats,
     }
-    return {
-        "payload": payload, "is_home": is_home,
-        "home_name": home_name, "away_name": away_name,
-        "home_score": hs, "away_score": as_,
-    }
+    return {"payload": payload, "is_home": is_home,
+            "home_name": home_name, "away_name": away_name,
+            "home_score": hs, "away_score": as_}
 
 
 def _is_whitelisted(frame_before, frame_after):
-    # [수정] 배너 텍스트 추측 방식은 스로인처럼 원래 배너가 안 뜨는 의도된
-    # 스냅을 실제 버그로 오탐했다(실측: 실제 세이브 데이터의 match#3에서
-    # away#9 RW의 스로인 스냅이 "순간이동 버그"로 잘못 잡힘). 이제 코드가
-    # 직접 기록하는 last_restart_clock(스로인/골킥/코너크라우드/파울재개/
-    # 씬시작/하프타임 등 모든 의도된 스냅 지점에서 갱신됨)을 봐서, 이번
-    # 틱 사이에 실제로 의도된 재개가 있었는지 정확히 판별한다.
+    """코드가 직접 기록하는 last_restart_clock(스로인/골킥/코너크라우드/
+    파울재개/씬시작/하프타임 등 모든 의도된 스냅 지점에서 갱신됨)을 봐서,
+    이번 틱 사이에 실제로 의도된 재개가 있었는지 판별한다."""
     if frame_after.get("last_restart_clock", -99.0) >= frame_before["clock"]:
         return True
     for f in (frame_before, frame_after):
-        text = f.get("banner_text") or ""
-        if any(k in text for k in _WHITELIST_BANNER_KEYWORDS):
+        if any(k in (f.get("banner_text") or "") for k in _WHITELIST_BANNER_KEYWORDS):
             return True
     return False
 
 
-def analyze(viewer, label, verbose=True):
-    frames = viewer._frames
+def check_defects(eng, label, verbose=True):
+    """결함 검사 — 순간이동 / 고정 / 팀 내 겹침."""
+    frames = eng.frames
     n = len(frames)
     issues = []
+    max_jump = _max_jump_for(eng._FRAME_DT)
 
     for side in ("home", "away"):
-        team = viewer.home_players if side == "home" else viewer.away_players
+        team = eng.home_players if side == "home" else eng.away_players
         for i in range(len(team)):
             xs = [f[side][i][0] for f in frames]
             ys = [f[side][i][1] for f in frames]
-            total_move = sum(abs(xs[k] - xs[k - 1]) + abs(ys[k] - ys[k - 1]) for k in range(1, n))
+            total_move = sum(abs(xs[k] - xs[k - 1]) + abs(ys[k] - ys[k - 1])
+                             for k in range(1, n))
             if total_move < STATIONARY_EPS:
                 issues.append(f"[고정] {side}#{i}({team[i]['pos']}) 전체 이동량={total_move:.4f}")
             for k in range(1, n):
                 jump = abs(xs[k] - xs[k - 1]) + abs(ys[k] - ys[k - 1])
-                if jump > MAX_JUMP_PER_TICK and not _is_whitelisted(frames[k - 1], frames[k]):
+                if jump > max_jump and not _is_whitelisted(frames[k - 1], frames[k]):
                     issues.append(
-                        f"[순간이동] {side}#{i}({team[i]['pos']}) frame {k} clock={frames[k]['clock']:.2f} "
-                        f"이동={jump:.3f} banner_before={frames[k-1]['banner_text']!r} "
-                        f"banner_after={frames[k]['banner_text']!r}")
+                        f"[순간이동] {side}#{i}({team[i]['pos']}) frame {k} "
+                        f"clock={frames[k]['clock']:.2f} 이동={jump:.3f}")
 
-    same_team_overlap = 0
+    overlap = 0
     for f in frames:
         if any(k in (f.get("banner_text") or "") for k in _WHITELIST_BANNER_KEYWORDS):
-            continue  # 의도된 크라우드/수비벽 밀집 구간은 겹침 검사에서 제외
+            continue
         if f["clock"] - f.get("last_restart_clock", -99.0) < 0.7:
-            continue  # 재개 직후 짧은 정렬 구간(수비벽 등)도 제외
+            continue
         for pts in (f["home"], f["away"]):
             for a in range(len(pts)):
                 for b in range(a + 1, len(pts)):
-                    dx = pts[a][0] - pts[b][0]
-                    dy = pts[a][1] - pts[b][1]
+                    dx, dy = pts[a][0] - pts[b][0], pts[a][1] - pts[b][1]
                     if (dx * dx + dy * dy) ** 0.5 < TEAMMATE_OVERLAP_EPS:
-                        same_team_overlap += 1
-    if same_team_overlap > n * 0.03:
-        issues.append(f"[팀내겹침과다] 오픈플레이 중 같은 팀 겹침 {same_team_overlap}건 (프레임 {n}장 중)")
+                        overlap += 1
+    if overlap > n * 0.03:
+        issues.append(f"[팀내겹침과다] 오픈플레이 중 같은 팀 겹침 {overlap}건 (프레임 {n}장 중)")
 
     if verbose:
         print(f"--- {label} (frames={n}) ---")
@@ -175,18 +185,37 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--trials", type=int, default=10)
     ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--metrics", action="store_true", help="움직임 품질 계량 리포트 출력")
+    ap.add_argument("--no-defects", action="store_true", help="결함 검사 생략")
+    ap.add_argument("--quiet", action="store_true", help="경기별 상세 출력 생략")
     args = ap.parse_args()
 
     rng = random.Random(args.seed)
     total_issues = 0
+    reports = []
+
     for trial in range(args.trials):
         data = make_scenario(rng, is_home=rng.choice([True, False]))
-        viewer = MatchSimViewer(data)
-        issues = analyze(viewer, f"trial#{trial}")
-        total_issues += len(issues)
+        eng = MatchSimEngine(data)
+        eng.simulate()
+        if not args.no_defects:
+            total_issues += len(check_defects(eng, f"trial#{trial}", verbose=not args.quiet))
+        if args.metrics:
+            reports.append(analyze_frames(
+                eng.frames,
+                [p["pos"] for p in eng.home_players],
+                [p["pos"] for p in eng.away_players],
+                [(p["hx"], p["hy"]) for p in eng.home_players],
+                [(p["hx"], p["hy"]) for p in eng.away_players]))
 
-    print(f"\n=== 총 이슈 {total_issues}건 (시나리오 {args.trials}개) ===")
-    sys.exit(1 if total_issues else 0)
+    if args.metrics and reports:
+        print()
+        print(format_report(aggregate(reports), title=f"움직임 품질 계량 ({len(reports)}경기)"))
+        print(format_detail(reports[0]))
+
+    if not args.no_defects:
+        print(f"\n=== 결함 총 {total_issues}건 (시나리오 {args.trials}개) ===")
+        sys.exit(1 if total_issues else 0)
 
 
 if __name__ == "__main__":

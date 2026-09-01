@@ -11,9 +11,10 @@ game_engine.get_match_detail(id) 가 돌려주는 dict 를 받아
 그대로 재사용한다 — 로직을 중복 구현하지 않기 위함.
 """
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
-                             QScrollArea, QWidget, QFrame, QPushButton)
+                             QScrollArea, QWidget, QFrame, QPushButton,
+                             QSizePolicy)
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QPainter, QColor
+from PyQt6.QtGui import QPainter, QColor, QBrush, QPen, QFont
 
 
 def _fmt_min(m):
@@ -65,6 +66,13 @@ def _row(label, value, vcolor="#ffffff"):
 # ─────────────────────────────────────────
 _HOME_COLOR = "#4488ff"
 _AWAY_COLOR = "#ff5566"
+
+# [2026-09 조정, 신민용 리포트: "포메이션에 따라 원 크기가 들쭉날쭉하고
+# 이름도 잘린다 — 라인업 평점 칸 가로를 늘려달라"] 기존 440px는 한 줄에
+# 5명(5백의 DEF행 등)이 들어가는 대형에서 원이 눌리는 원인이었다 —
+# _open_lineup_panel/_resize_for_content가 전부 이 값 하나만 보고 폭을
+# 맞추므로, 여기서만 바꾸면 다이얼로그 전체 너비 계산까지 한 번에 맞다.
+_LINEUP_PANEL_WIDTH = 620
 
 
 class _PossBar(QWidget):
@@ -223,13 +231,203 @@ def _lineup_player_row(entry, accent):
     return w
 
 
+# ─────────────────────────────────────────
+# 포메이션 시각화 (위/아래 배치)
+# [2026-08 신설, 신민용 요청: "라인업 평점이 지금은 좌우로만 나뉘어
+# 있는데, 실제 포메이션처럼 위/아래로 배치해서 필드 위에서 보고 싶다 —
+# 선수는 원으로, 원 안엔 평점, 원 아래엔 이름. 기존 좌우 목록은 그
+# 아래로 내려서 그대로 두면 된다"] tactical_engine._build_player_ratings가
+# 22명 각각에 붙여준 "position"은 항상 ui/formation_widget._FormationCanvas가
+# 쓰는 것과 같은 슬롯 라벨 체계이므로, 그 라벨을 그대로 재사용해 행(GK→
+# DEF→MID→MID2→ATK)으로 묶고 각 행 안에서 좌→우로 배열한다 — 로직 자체는
+# formation_widget._row_key/_row_priority/_pos_x_order와 동일한 원리지만,
+# 이 파일은 그 모듈(스쿼드/이적 관련 무거운 DB 조회가 잔뜩 딸려 있음)을
+# 통째로 import하지 않기 위해 필요한 부분만 이 파일 안에 작게 복제해둔다.
+# ─────────────────────────────────────────
+_FALLBACK_MATCH_SLOTS = ["GK", "CB", "CB", "LB", "RB", "LM", "CM", "CM", "RM", "ST", "ST"]
+
+_FP_POS_X_ORDER = {
+    "LW": 0, "CF": 1, "ST": 2, "SS": 2, "RW": 4,
+    "LM": 0, "CAM": 2, "RM": 4,
+    "CM": 2, "CDM": 2, "DM": 2,
+    "LWB": 0, "LB": 1, "CB": 2, "RB": 3, "RWB": 4, "SW": 2,
+    "GK": 2,
+}
+
+
+def _fp_pos_x_order(pos):
+    return _FP_POS_X_ORDER.get(pos, 2)
+
+
+def _fp_row_key(pos):
+    if pos == "GK": return "GK"
+    if pos in ("CB", "LB", "RB", "LWB", "RWB", "SW"): return "DEF"
+    if pos in ("CDM", "CM", "DM"): return "MID"
+    if pos in ("CAM", "LM", "RM"): return "MID2"
+    return "ATK"
+
+
+def _fp_row_priority(k):
+    # 하프라인(0)에 가까울수록 공격진 — 위/아래 각 절반 안에서 하프라인
+    # 쪽에 ATK가 오도록 하는 기준. 아래팀은 그대로, 위팀은 paintEvent에서
+    # 이 순서를 뒤집어(mirrored) 하프라인 쪽에 ATK가 오게 만든다.
+    return {"ATK": 0, "MID2": 1, "MID": 2, "DEF": 3, "GK": 4}.get(k, 2)
+
+
+class _MatchFormationPitch(QWidget):
+    """양 팀 11명을 하프라인 기준 위(top)/아래(bottom)에 실제 포진처럼
+    그리는 캔버스. 선수는 원으로, 원 안엔 평점, 원 아래엔 이름을 표시한다.
+    위쪽 팀은 하프라인 쪽에 공격진이 오도록 상하 반전해서 배치한다(실제
+    중계 그래픽과 같은 관례). 폭·높이는 이 위젯이 실제로 차지한 크기에
+    맞춰 매번 다시 계산한다 — 고정 좌표가 없어서 패널 폭이 얼마든 그
+    안에 꽉 차게 그려진다."""
+
+    # [2026-09] 캔버스 위/아래 가장자리에 확보해두는 여백 — 가장 바깥
+    # 줄(보통 GK)의 원과 이름표가 위젯 경계에 잘리지 않게 하기 위함
+    # (신민용 리포트: "아래 키퍼 이름까지 보여야 하니 경기장 가장자리를
+    # 좀 늘리고").
+    _EDGE_PAD = 26
+
+    def __init__(self, top_list, top_name, top_accent,
+                 bottom_list, bottom_name, bottom_accent, parent=None):
+        super().__init__(parent)
+        self._top = top_list or []
+        self._bottom = bottom_list or []
+        self._top_name = top_name or ""
+        self._bottom_name = bottom_name or ""
+        self._top_accent = top_accent
+        self._bottom_accent = bottom_accent
+        # [2026-09 재조정, 신민용 리포트: "전체 창을 키울 게 아니라 라인업
+        # 평점 안에서 포메이션 영역 자체를 늘리면 되는거다"] 다이얼로그
+        # 전체 높이는 다시 원래대로 되돌리고(_base_height), 이 캔버스만
+        # 스크롤 가능한 패널 안에서 충분히 크게 그려지도록 최소 높이를
+        # 넉넉히 잡는다 — 아래 라인업 목록은 그만큼 스크롤해서 보면 된다.
+        self.setMinimumHeight(680)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+
+    def _group_rows(self, entries):
+        """entries(11개, 빈 슬롯은 None) → (rows, sorted_rows, max_row_cnt).
+        rows: {행키: [(idx,label,entry), ...]}, sorted_rows: 하프라인에
+        가까운 행(ATK)부터 먼 행(GK) 순."""
+        rows = {}
+        row_order = []
+        for idx, entry in enumerate(entries):
+            label = entry.get("position") if entry else None
+            if not label:
+                label = _FALLBACK_MATCH_SLOTS[idx] if idx < len(_FALLBACK_MATCH_SLOTS) else "CM"
+            k = _fp_row_key(label)
+            if k not in rows:
+                rows[k] = []; row_order.append(k)
+            rows[k].append((idx, label, entry))
+        sorted_rows = sorted(row_order, key=_fp_row_priority)
+        max_row_cnt = max((len(v) for v in rows.values()), default=1)
+        return rows, sorted_rows, max_row_cnt
+
+    def _positions_for(self, rows, sorted_rows, w, row_h, halfway_y, direction):
+        """halfway_y를 기준으로 direction(+1=아래팀, -1=위팀)쪽으로 행을
+        하나씩 쌓는다. row_h가 양 팀 공통값이라 두 팀 모두 같은 '한 줄
+        높이'를 쓰게 되고, 그래서 나중에 계산하는 원 지름도 자연스럽게
+        같아진다(포메이션 줄 수가 달라도 원 크기가 달라지지 않음)."""
+        positions = []
+        for ri, rk in enumerate(sorted_rows):
+            items = sorted(rows[rk], key=lambda t: _fp_pos_x_order(t[1]))
+            cnt = len(items)
+            ry = int(halfway_y + direction * (ri + 0.5) * row_h)
+            for ci, (idx, label, entry) in enumerate(items):
+                rx = int((ci + 1) * w / (cnt + 1))
+                positions.append((rx, ry, entry))
+        return positions
+
+    def paintEvent(self, _ev):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+
+        painter.fillRect(0, 0, w, h, QBrush(QColor("#123a1a")))
+        painter.setPen(QPen(QColor("#2f6b34"), 1))
+        painter.drawRect(6, 6, w - 12, h - 12)
+        halfway_y = h / 2.0
+        painter.drawLine(6, int(halfway_y), w - 6, int(halfway_y))
+        cc_d = max(30, min(70, min(w, h) // 5))
+        painter.drawEllipse(int(w / 2 - cc_d / 2), int(halfway_y - cc_d / 2), cc_d, cc_d)
+
+        # [2026-09 신설] 양 팀의 포메이션 "줄 수"가 다르면(예: 5줄짜리
+        # 3-4-1-2 vs 4줄짜리 4-3-3) 예전엔 같은 절반 높이를 각자 자기
+        # 줄 수로 나눠서 한 줄 높이가 서로 달라졌고, 그 결과 원 지름도
+        # 팀마다 달라 보였다(신민용 리포트: "위 선수 원이 아래보다
+        # 1.5배 작다 — 현실엔 그런 거 없잖아"). 이제 두 팀 중 줄이 더
+        # 많은 쪽 기준으로 "공통 한 줄 높이"를 하나 정해서 양쪽 다
+        # 그대로 쓴다 — 줄이 적은 팀은 그만큼 하프라인 쪽/가장자리 쪽에
+        # 살짝 여유 공간이 남을 뿐, 원 크기 자체는 항상 두 팀이 동일.
+        top_rows, top_sorted, top_maxcnt = self._group_rows(self._top)
+        bot_rows, bot_sorted, bot_maxcnt = self._group_rows(self._bottom)
+        rows_top = len(top_sorted) or 1
+        rows_bot = len(bot_sorted) or 1
+        max_rows = max(rows_top, rows_bot, 1)
+
+        usable_h = max(1.0, h - 2 * self._EDGE_PAD)
+        half_h = usable_h / 2.0
+        row_h = half_h / max_rows
+
+        top_positions = self._positions_for(top_rows, top_sorted, w, row_h, halfway_y, direction=-1)
+        bot_positions = self._positions_for(bot_rows, bot_sorted, w, row_h, halfway_y, direction=+1)
+
+        max_row_cnt = max(top_maxcnt, bot_maxcnt, 1)
+        col_w = w / (max_row_cnt + 1)
+        d = int(max(30, min(84, row_h * 0.62, col_w * 0.68)))
+
+        placements = [(x, y, entry, self._top_accent) for x, y, entry in top_positions]
+        placements += [(x, y, entry, self._bottom_accent) for x, y, entry in bot_positions]
+
+        for x, y, entry, accent in placements:
+            r = d // 2
+            is_me = bool(entry and entry.get("is_me"))
+            painter.setBrush(QBrush(QColor("#ffcc00" if is_me else accent)))
+            painter.setPen(QPen(QColor("#000"), 2 if is_me else 1))
+            painter.drawEllipse(x - r, y - r, d, d)
+
+            rating_txt = f"{entry.get('rating', 0):.1f}" if entry else "-"
+            f = QFont(); f.setPointSize(max(7, min(15, d // 4))); f.setBold(True)
+            painter.setFont(f)
+            painter.setPen(QPen(QColor("#000" if is_me else "#fff")))
+            painter.drawText(x - r, y - r, d, d, Qt.AlignmentFlag.AlignCenter, rating_txt)
+
+            name_txt = "(공석)" if not entry else (("⭐" if is_me else "") + (entry.get("name") or "-"))
+            f2 = QFont(); f2.setPointSize(max(7, min(11, d // 5))); f2.setBold(is_me)
+            painter.setFont(f2)
+            painter.setPen(QPen(QColor("#666" if not entry else ("#ffe27a" if is_me else "#eee"))))
+            name_w = max(56, d + 28)
+            painter.drawText(x - name_w // 2, y + r + 2, name_w, 16,
+                             Qt.AlignmentFlag.AlignCenter, name_txt[:8])
+
+        f3 = QFont(); f3.setPointSize(10); f3.setBold(True)
+        painter.setFont(f3)
+        painter.setPen(QPen(QColor(self._top_accent)))
+        painter.drawText(10, 4, w - 20, 18,
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self._top_name)
+        painter.setPen(QPen(QColor(self._bottom_accent)))
+        painter.drawText(10, h - 20, w - 20, 18,
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self._bottom_name)
+        painter.end()
+
+
 class LineupRatingsPanel(QWidget):
     """[2026-08 신설, 신민용 요청: "경기 상세에서 22명 선수 평점을
     FotMob처럼 보여달라"] game_engine._save_match_detail이 저장한
     payload["player_ratings"](tactical_engine가 만든 22명 개인 기록+평점)를
-    양팀 두 열로 나란히 보여준다. 지금은 리그 경기(전술 엔진 사용)만 실제
-    값이 있고, 그 외 대회는 비어 있어 안내 문구만 뜬다 — 억지로 채우지
-    않는다(MatchStatsPanel의 team_stats 없음 처리와 같은 원칙)."""
+    보여준다. 지금은 리그 경기(전술 엔진 사용)만 실제 값이 있고, 그 외
+    대회는 비어 있어 안내 문구만 뜬다 — 억지로 채우지 않는다
+    (MatchStatsPanel의 team_stats 없음 처리와 같은 원칙).
+
+    [2026-08 개편, 신민용 요청: "포메이션이 지금은 좌우로만 나뉘어
+    있는데, 위/아래로 실제 필드처럼 배치해서 전체 포메이션을 확인하고
+    싶다 — 선수는 원으로, 원 안엔 평점, 원 아래엔 이름. 기존 좌우 목록은
+    그 아래로 내려서 그대로 두면 된다"] 위쪽엔 _MatchFormationPitch로
+    양팀 포진을 시각적으로 그리고, 그 아래에 기존 좌우 두 열 목록을
+    그대로 둔다(구조·내용은 변경 없음, 위치만 아래로 이동). 전체를
+    QScrollArea로 감싸 — 패널 폭은 고정(440px)이라도 포메이션 캔버스는
+    항상 그 폭에 맞춰 그려지고(_MatchFormationPitch가 자기 크기를 그대로
+    씀), 세로로 넘치는 만큼만 스크롤된다."""
 
     def __init__(self, data, parent=None):
         super().__init__(parent)
@@ -256,6 +454,25 @@ class LineupRatingsPanel(QWidget):
             root.addStretch(); root.addWidget(note); root.addStretch()
             return
 
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}"
+                             "QScrollBar:vertical{background:#1a1a1a;width:6px;}"
+                             "QScrollBar::handle:vertical{background:#3a3a3a;border-radius:3px;}")
+        inner = QWidget(); inner.setStyleSheet("background:transparent;")
+        iv = QVBoxLayout(inner); iv.setContentsMargins(0, 0, 0, 0); iv.setSpacing(10)
+
+        # ── 위: 포메이션 시각화 (원=선수, 원 안=평점, 원 아래=이름) ──
+        pitch = _MatchFormationPitch(
+            top_list=away_list, top_name=data.get("away_name", ""), top_accent=_AWAY_COLOR,
+            bottom_list=home_list, bottom_name=data.get("home_name", ""), bottom_accent=_HOME_COLOR)
+        iv.addWidget(pitch)
+
+        line = QFrame(); line.setFrameShape(QFrame.Shape.HLine)
+        line.setStyleSheet("color:#2a2a2a;")
+        iv.addWidget(line)
+
+        # ── 아래: 기존 좌우 목록 (그대로) ──
         cols = QHBoxLayout(); cols.setSpacing(12)
         for name_key, side_list, accent in (
                 ("home_name", home_list, _HOME_COLOR),
@@ -270,8 +487,11 @@ class LineupRatingsPanel(QWidget):
                 cv.addWidget(_lineup_player_row(entry, accent))
             cv.addStretch()
             cols.addWidget(col, 1)
-        root.addLayout(cols)
-        root.addStretch()
+        iv.addLayout(cols)
+        iv.addStretch()
+
+        scroll.setWidget(inner)
+        root.addWidget(scroll, 1)
 
 
 class MatchDetailDialog(QDialog):
@@ -331,6 +551,15 @@ class MatchDetailDialog(QDialog):
         self._lineup_container.setFixedWidth(0)  # 처음엔 접혀 있음
         outer.addWidget(self._lineup_container)
 
+        # [2026-09 재조정, 신민용 리포트: "전체 창을 굳이 안 키워도 되는데
+        # — 라인업 평점 안에서 포메이션 영역만 늘리면 되는거다"] 처음엔
+        # 다이얼로그 전체 높이를 키웠었는데, 그러면 원 크기 불일치 같은
+        # 진짜 문제는 그대로인 채 창만 커져서 의미가 없었다. 다이얼로그
+        # 기본 높이는 원래 값으로 되돌리고, 대신 라인업 평점 패널 안의
+        # _MatchFormationPitch 자체의 최소 높이를 넉넉히 키운다 — 그
+        # 패널은 이미 QScrollArea라 포메이션이 커진 만큼 아래 기존
+        # 좌우 목록이 스크롤로 밀려 내려갈 뿐, 다이얼로그 자체는 커지지
+        # 않는다.
         self._base_height = 620
         self.setMinimumSize(420, 560)
         self.resize(420, self._base_height)
@@ -616,7 +845,7 @@ class MatchDetailDialog(QDialog):
             self._lineup_widget = None
         self._lineup_container.setFixedWidth(0)
 
-    def _open_lineup_panel(self, widget, width=440):
+    def _open_lineup_panel(self, widget, width=_LINEUP_PANEL_WIDTH):
         self._clear_lineup_panel()
         self._lineup_widget = widget
         self._lineup_layout.addWidget(widget)
@@ -630,7 +859,7 @@ class MatchDetailDialog(QDialog):
             self._clear_lineup_panel()
             self._resize_for_content()
             return
-        self._open_lineup_panel(LineupRatingsPanel(self._data, self), width=440)
+        self._open_lineup_panel(LineupRatingsPanel(self._data, self), width=_LINEUP_PANEL_WIDTH)
 
     def _resize_for_content(self):
         """현재 왼쪽(통계 유무)·오른쪽(시뮬 유무)·라인업 평점 유무에 맞춰
@@ -638,7 +867,7 @@ class MatchDetailDialog(QDialog):
         있어서(기존 420px 칸은 안 건드림) 높이는 항상 기본값 그대로다."""
         left_w = 300 if self._left_stats_widget is not None else 0
         right_w = 760 if self._right_widget is not None else 0
-        lineup_w = 440 if self._lineup_widget is not None else 0
+        lineup_w = _LINEUP_PANEL_WIDTH if self._lineup_widget is not None else 0
         new_w = left_w + 420 + right_w + lineup_w
         self.setMinimumSize(420, self._base_height)
         self.resize(new_w, self._base_height)

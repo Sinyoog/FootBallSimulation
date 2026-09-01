@@ -81,7 +81,7 @@ def _sigmoid(x):
         return 0.0 if x < 0 else 1.0
 
 
-def _assign_zones(lineup, is_home):
+def _assign_zones(lineup, is_home, slot_labels=None):
     """[{"player":dict, "lane":..., "third":...}, ...]. lineup은
     FORMATION_SLOTS[formation] 순서와 대응하는 선수 dict 리스트(None 허용).
     원정팀은 홈팀과 정반대 방향을 보고 뛰므로, 전후좌표(x)뿐 아니라
@@ -93,12 +93,27 @@ def _assign_zones(lineup, is_home):
     dfn_opp.dfn[lane])이 두 팀을 같은 레인 라벨끼리 비교하는 구조라서,
     좌우 능력치가 비대칭인 스쿼드(예: 왼쪽 윙어는 강한데 오른쪽 풀백은
     약한 팀)를 상대할 때 실제로는 안 맞붙어야 할 반대편 선수와 매치업이
-    계산되는 원인이었다."""
+    계산되는 원인이었다.
+
+    [2026-09 버그수정, 신민용 리포트: "우리팀 포메이션은 5-2-3인데
+    라인업 화면엔 무조건 4-2-2-2로 뜬다 — 상대팀도 실제(4-2-1-3)와
+    다르게 뜬다"] slot_labels(그 라인업을 실제로 뽑을 때 쓴
+    FORMATION_SLOTS[formation])를 안 받으면 이 함수가 항상 하드코딩된
+    4-4-2 라벨(_FALLBACK_SLOTS)로 매 선수의 위치를 다시 칠했다 —
+    lineup 자체는 _select_lineup()이 그 팀의 실제 포메이션 슬롯 순서로
+    뽑아주는데, 라벨만 여기서 딴 걸로 덮어써서 실제 배치와 표시/구역
+    계산이 어긋났다. 이 어긋남은 화면 표시뿐 아니라 _third_of(공격/
+    수비/중원 역할 분류)에도 그대로 들어가 매치업 계산 자체에 영향을
+    준다. 이제 호출부(simulate_tactical_match)가 그 라인업을 만들 때
+    쓴 실제 슬롯 리스트를 넘겨주면 그걸 쓰고, 안 넘기면(기존 호출부·
+    국제대회처럼 원래 4-4-2뿐인 경우) 예전과 동일하게 _FALLBACK_SLOTS로
+    폴백한다 — 하위 호환 100% 유지."""
+    labels = slot_labels if slot_labels else _FALLBACK_SLOTS
     out = []
     for i, pl in enumerate(lineup):
         if pl is None:
             continue
-        label = _FALLBACK_SLOTS[i] if i < len(_FALLBACK_SLOTS) else pl.get("position", "CM")
+        label = labels[i] if i < len(labels) else pl.get("position", "CM")
         bx, by = _POS_XY.get(label, (0.44, 0.5))
         x = bx if is_home else (1.0 - bx)
         y = by if is_home else (1.0 - by)
@@ -179,8 +194,8 @@ class _TeamModel:
     수비/공격/중원 전역에 고르게 얹기 위한 값(game_engine._simulate_match가
     이미 계산해둔 bonus를 그대로 받는다)."""
 
-    def __init__(self, lineup, is_home, boost=0.0, boost_position=None):
-        zoned = _assign_zones(lineup, is_home)
+    def __init__(self, lineup, is_home, boost=0.0, boost_position=None, slot_labels=None):
+        zoned = _assign_zones(lineup, is_home, slot_labels)
         self.gk = next((z["player"] for z in zoned if z["pos"] == "GK"), None)
         w = _boost_weights_for(boost_position) if boost else _DEFAULT_BOOST_WEIGHTS
         self.att = {}
@@ -285,7 +300,7 @@ def _lineup_avg_ovr(lineup):
     return sum(vals) / len(vals) if vals else 50.0
 
 
-def _build_player_ratings(lineup, player_stats, gf, ga, gk, rng):
+def _build_player_ratings(lineup, player_stats, gf, ga, gk, rng, slot_labels=None):
     """[2026-08 신설] 경기 종료 후 이 팀 11명 전원(라인업 슬롯 순서 그대로,
     빈 슬롯은 None)의 개인 기록 + 평점을 만든다.
 
@@ -306,7 +321,17 @@ def _build_player_ratings(lineup, player_stats, gf, ga, gk, rng):
     constants.ai_player_code로 만든 "AI"+코드)을 써야 한다. 이 값은
     실제로 존재하는 그 선수(가상으로 지어낸 게 아니라 그 팀 로스터에서
     _select_lineup이 실제로 뽑은 ai_players 레코드)이고, 문제는 이름
-    '표시' 단계뿐이었다."""
+    '표시' 단계뿐이었다.
+
+    [2026-09 버그수정, 신민용 리포트: "포메이션이 5-2-3인데 라인업
+    화면엔 4-2-2-2로 뜬다"] _assign_zones와 같은 이유로, 여기 출력되는
+    각 선수의 "position"도 실제 포메이션과 무관하게 항상 _FALLBACK_SLOTS
+    (4-4-2 라벨)로 찍히고 있었다 — ui/match_detail_dialog.py의 라인업
+    평점·포메이션 시각화가 이 값을 그대로 보여주므로 화면에 실제
+    포메이션과 다른 모양이 떴다. slot_labels(호출부가 이 lineup을 뽑을
+    때 쓴 실제 FORMATION_SLOTS[formation])를 받으면 그걸 쓰고, 안
+    받으면 예전처럼 _FALLBACK_SLOTS로 폴백한다."""
+    labels = slot_labels if slot_labels else _FALLBACK_SLOTS
     real_ids = [p.get("id") for p in lineup if p is not None and p.get("id") is not None]
     try:
         from database import get_ai_player_custom_names
@@ -350,7 +375,7 @@ def _build_player_ratings(lineup, player_stats, gf, ga, gk, rng):
             # 없이도 어느 정도 반영 — 실제 수비 기여도는 못 따로 추적함).
             base += 0.15
         base += rng.gauss(0, 0.25)
-        label = _FALLBACK_SLOTS[i] if i < len(_FALLBACK_SLOTS) else p.get("position", "CM")
+        label = labels[i] if i < len(labels) else p.get("position", "CM")
         out.append({
             "id": p.get("id"), "name": _display_name(p), "position": label,
             "ovr": p.get("ovr", 50),
@@ -365,7 +390,8 @@ def _build_player_ratings(lineup, player_stats, gf, ga, gk, rng):
 
 def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost=0.0,
                              home_boost_position=None, away_boost_position=None,
-                             home_adv=3.0, seed=None):
+                             home_adv=3.0, seed=None,
+                             home_formation=None, away_formation=None):
     """포메이션 매치업을 실제로 계산해서 90분(+추가시간) 경기를 시뮬레이션한다.
 
     Args:
@@ -380,6 +406,13 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
             폴백.
         home_adv: 홈 이점(중원 퀄리티에 가산).
         seed: 지정하면 결정론적 재현.
+        home_formation/away_formation: [2026-09 신설, 신민용 리포트: "포메이션이
+            5-2-3인데 라인업 화면엔 4-2-2-2로 뜬다"] home_lineup/away_lineup을
+            실제로 뽑을 때 쓴 FORMATION_SLOTS 키(예: "5-2-3"). 넘기면 구역
+            계산(_TeamModel/_assign_zones)과 라인업 평점의 포지션 라벨이
+            전부 이 실제 포메이션 기준으로 맞춰진다. None이면(기존 호출부·
+            항상 4-4-2뿐인 국제대회 등) 예전과 동일하게 4-4-2 라벨로
+            폴백한다 — 하위 호환 100% 유지.
 
     Returns:
         {"home_score", "away_score", "home_stats", "away_stats", "possession_log"}
@@ -392,8 +425,18 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
     """
     rng = random.Random(seed) if seed is not None else random
 
-    home = _TeamModel(home_lineup, True, boost=home_boost, boost_position=home_boost_position)
-    away = _TeamModel(away_lineup, False, boost=away_boost, boost_position=away_boost_position)
+    home_slots = away_slots = None
+    if home_formation or away_formation:
+        from constants import FORMATION_SLOTS
+        if home_formation:
+            home_slots = FORMATION_SLOTS.get(home_formation)
+        if away_formation:
+            away_slots = FORMATION_SLOTS.get(away_formation)
+
+    home = _TeamModel(home_lineup, True, boost=home_boost, boost_position=home_boost_position,
+                       slot_labels=home_slots)
+    away = _TeamModel(away_lineup, False, boost=away_boost, boost_position=away_boost_position,
+                       slot_labels=away_slots)
 
     # [신규 — 경기 당일 컨디션] 매 분마다 실력 평균으로 수렴하는 구조라,
     # 분 단위 시뮬레이션만으로는 실제 축구의 "약팀이 어쩌다 강팀을 잡는"
@@ -432,8 +475,8 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
     # 부상시간 포함 대략 96분 정도로.
     total_minutes = 96
 
-    home_zoned = _assign_zones(home_lineup, True)
-    away_zoned = _assign_zones(away_lineup, False)
+    home_zoned = _assign_zones(home_lineup, True, home_slots)
+    away_zoned = _assign_zones(away_lineup, False, away_slots)
 
     # [최적화] home.att/dfn, away.att/dfn(레인별 공격/수비 퀄리티)은 이
     # 시점 이후로 루프 안에서 전혀 바뀌지 않는다(경기당일 컨디션 보정도
@@ -530,9 +573,9 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
     # FotMob 스타일 라인업+평점 화면을 보여준다(없으면 기존처럼 팀 단위
     # 통계만 보여주는 화면으로 자동 폴백).
     home_player_ratings = _build_player_ratings(
-        home_lineup, home_player_stats, home_score, away_score, home.gk, rng)
+        home_lineup, home_player_stats, home_score, away_score, home.gk, rng, home_slots)
     away_player_ratings = _build_player_ratings(
-        away_lineup, away_player_stats, away_score, home_score, away.gk, rng)
+        away_lineup, away_player_stats, away_score, home_score, away.gk, rng, away_slots)
     return {
         "home_score": home_score, "away_score": away_score,
         "home_stats": home_stats, "away_stats": away_stats,
@@ -613,4 +656,6 @@ def simulate_my_match(home_team_id, away_team_id, home_formation, away_formation
                                     away_boost=away_boost,
                                     home_boost_position=home_boost_position,
                                     away_boost_position=away_boost_position,
-                                    home_adv=home_adv, seed=seed)
+                                    home_adv=home_adv, seed=seed,
+                                    home_formation=home_formation,
+                                    away_formation=away_formation)
