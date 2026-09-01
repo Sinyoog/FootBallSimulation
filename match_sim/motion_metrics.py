@@ -93,11 +93,25 @@ REFERENCE = {
     "def_fwd_gap_m":           (22.0, 42.0, "수비라인~공격라인 간격"),
     "press_within_5m":         (0.8, 2.5,   "볼 5m 내 선수 수(양팀)"),
     "press_within_10m":        (2.5, 6.0,   "볼 10m 내 선수 수(양팀)"),
-    "home_leash_mean_m":       (8.0, 18.0,  "포메이션 기준점 이탈(평균)"),
-    "home_leash_p95_m":        (22.0, 45.0, "포메이션 기준점 이탈(상위 5%)"),
+    # [정의 변경] 원래는 "포메이션 기준점(hx,hy)에서 얼마나 벗어나는가"를
+    # 쟀다. 그런데 블록 라인 높이가 들어가면서 팀 전체가 볼을 따라 통째로
+    # ±20m씩 미끄러지므로, 이 정의로는 정상 동작이 곧바로 "이탈 과다"로
+    # 찍힌다. 실제 트래킹 연구도 포메이션 템플릿이 아니라 **그 선수의
+    # 경기 평균 위치**를 기준으로 재므로 그쪽으로 맞춘다. 그래야 공개
+    # 참조값과 비교가 가능하다.
+    "home_leash_mean_m":       (7.0, 13.0,  "평균 위치로부터의 이탈(평균)"),
+    "home_leash_p95_m":        (16.0, 32.0, "평균 위치로부터의 이탈(상위 5%)"),
     "movers_per_frame":        (8.0, 18.0,  "동시에 움직이는 선수 수(22명 중)"),
     "centroid_ball_corr":      (0.55, 0.90, "팀 중심 x ↔ 볼 x 상관"),
     "lateral_share":           (0.30, 0.55, "총 이동 중 좌우 성분 비율"),
+    # [신규] "수비수가 하프라인 뒤에서 구경한다"를 직접 재는 지표.
+    # 볼이 상대 파이널서드(공격 방향 70% 지점 너머)에 있을 때, 공격 중인
+    # 팀의 백라인(CB/FB)이 어디 서 있는가 — 공격 방향 기준 0~1.
+    # 실축에서는 이때 백라인이 하프라인 근처(0.45~0.62)까지 올라가서
+    # 피치를 압축한다. 자기 박스 앞(0.2 이하)에 머무르면 명백히 이상하다.
+    "atk_backline_high":       (0.42, 0.64, "공격 시 백라인 높이(볼 파이널서드)"),
+    # 반대로 수비 중일 때 블록이 얼마나 내려앉는가.
+    "def_backline_low":        (0.10, 0.30, "수비 시 백라인 높이(볼 우리 진영)"),
 }
 
 
@@ -244,7 +258,9 @@ def analyze_frames(frames, home_pos, away_pos,
                 "lateral_share": lat / (lat + lon) if (lat + lon) > 0 else 0.0,
             }
             if homexy is not None and i < len(homexy):
-                hx, hy = homexy[i]
+                # 기준점 = 그 선수의 경기 평균 위치(트래킹 연구의 통용 정의)
+                hx = sum(xs) / len(xs)
+                hy = sum(ys) / len(ys)
                 leash = sorted(_to_m(xs[k] - hx, ys[k] - hy) for k in range(n))
                 rec["leash_mean"] = sum(leash) / len(leash)
                 rec["leash_p95"] = _pct(leash, 0.95)
@@ -315,6 +331,35 @@ def analyze_frames(frames, home_pos, away_pos,
     }
 
     # ══════════════════════════════════════════════════════
+    # C-2. 블록 라인 높이 — 국면별
+    # ══════════════════════════════════════════════════════
+    atk_high, def_low = [], []
+    for side, poslist, _h in teams:
+        back = [i for i, p in enumerate(poslist) if p in _DEF]
+        if not back:
+            continue
+        fwd = 1.0 if side == "home" else -1.0
+
+        def _u(v, _f=fwd):
+            return v if _f > 0 else 1.0 - v
+        for k in live:
+            f = frames[k]
+            poss = f.get("possession")
+            if poss is None:
+                continue
+            ball_u = _u(f["ball"][0])
+            bl = sum(_u(f[side][i][0]) for i in back) / len(back)
+            if poss == side and ball_u > 0.70:
+                atk_high.append(bl)
+            elif poss != side and ball_u < 0.35:
+                def_low.append(bl)
+    out["lines"] = {
+        "atk_backline_high": (sum(atk_high) / len(atk_high)) if atk_high else float("nan"),
+        "def_backline_low": (sum(def_low) / len(def_low)) if def_low else float("nan"),
+        "n_atk_samples": len(atk_high), "n_def_samples": len(def_low),
+    }
+
+    # ══════════════════════════════════════════════════════
     # D. 자율성 — 동시에 움직이는 인원 수
     #   현재 구조의 핵심 결함("22명 중 5명만 행동")을 직접 계량한다.
     # ══════════════════════════════════════════════════════
@@ -359,6 +404,8 @@ def analyze_frames(frames, home_pos, away_pos,
         "movers_per_frame": out["movers"]["movers_per_frame"],
         "centroid_ball_corr": _st.mean(out["teams"][s]["centroid_ball_corr"] for s in ("home", "away")),
         "lateral_share": sum(r["lateral_share"] for r in of) / len(of),
+        "atk_backline_high": out["lines"]["atk_backline_high"],
+        "def_backline_low": out["lines"]["def_backline_low"],
     }
     if any("leash_mean" in r for r in of):
         ls = [r for r in of if "leash_mean" in r]

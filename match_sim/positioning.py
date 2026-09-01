@@ -60,6 +60,37 @@ STICKY_RADIUS_M = 7.0    # 직전 목표 주변 이 반경까지 보너스
 PRESS_SIGMA_M = 9.0      # 압박 가치가 볼 주변에서 감쇠하는 스케일
 HALFSPACE_SIGMA = 0.075  # 하프스페이스 밴드 폭(정규화 y)
 
+# ══════════════════════════════════════════════════════════════════
+#  블록 라인 높이 (line height)
+# ══════════════════════════════════════════════════════════════════
+#
+# [왜 필요한가] 처음 버전에는 이 개념이 아예 없었다. 존(zone)의 중심이
+# 포메이션 기준점 hx에 **고정**돼 있어서, 우리 팀이 상대 박스에서 공격
+# 중이어도 센터백은 자기 페널티박스 앞에 그대로 서 있었다("수비수가
+# 하프라인 뒤에서 구경한다"는 지적 그대로). 전진 가치를 볼 기준으로
+# 바꿔놨지만, 볼에서 60m 떨어진 CB의 존 안에는 애초에 전진 가치가 있는
+# 칸이 하나도 없어서 필드가 평평해지고 존 중심에 눌러앉은 것이다.
+#
+# 실제 축구에서 팀은 **블록 전체가 볼을 따라 오르내린다**. 공격 시에는
+# 백라인이 볼보다 30~40m 뒤까지 밀고 올라가 피치를 압축하고(그래야
+# 세컨볼을 줍고 상대가 빠져나가지 못한다), 수비 시에는 볼과 자기 골문
+# 사이로 내려앉는다.
+#
+# 그래서 존 중심을 고정 hx가 아니라 **"목표 백라인 + 그 선수의 고유
+# 깊이"**로 계산한다. 대형의 모양(선수 간 상대적 깊이)은 그대로 유지한
+# 채로 블록만 통째로 미끄러진다.
+#
+# 아래 숫자는 실축 트래킹의 대략적 값이다:
+#   공격 시 백라인 ≈ 볼 - 34m,  하한 자기 박스 앞 / 상한 상대 진영 초입
+#   수비 시 백라인 ≈ 볼 - 15m,  더 낮게 내려앉는다
+ATK_BACKLINE_GAP = 0.37   # 공격 시 백라인이 볼보다 이만큼 뒤 (정규화 x ≈ 36m)
+DEF_BACKLINE_GAP = 0.15   # 수비 시 (≈ 16m)
+ATK_BACKLINE_MIN, ATK_BACKLINE_MAX = 0.13, 0.56
+DEF_BACKLINE_MIN, DEF_BACKLINE_MAX = 0.10, 0.46
+# 블록이 목표 라인으로 얼마나 따라가는가. 1.0이면 완전히 따라간다.
+# 선수별 깊이는 유지되므로 대형은 안 무너진다.
+LINE_FOLLOW = 0.75
+
 
 # ══════════════════════════════════════════════════════════════════
 #  정적 필드 — 격자에만 의존하므로 한 번 계산해서 캐시한다
@@ -90,6 +121,36 @@ def _static(grid):
     if _STATIC is None or _STATIC.grid is not grid:
         _STATIC = _StaticFields(grid)
     return _STATIC
+
+
+_BACKLINE_POS = {"CB", "LB", "RB", "LWB", "RWB"}
+
+
+def _zone_aff_dyn(grid, pl, r, dyn_hx):
+    """존 가중치 — 중심 x는 매 틱 바뀌고(블록 라인 높이), 중심 y는 고정이다.
+
+    [성능] 격자가 (ny × nx) 순서로 평탄화돼 있으므로 x 성분은 nx개(32),
+    y 성분은 ny개(20)만 계산하면 된다. y 성분은 경기 내내 안 변하니
+    선수 dict에 캐시하고, x 성분만 매 틱 32개 지수 연산으로 다시 만든다.
+    640칸을 통째로 다시 계산하는 것보다 훨씬 싸다.
+    """
+    if HAVE_NUMPY:
+        key = (id(grid), pl["hy"], r["sigma_y"], r["zone"])
+        c = pl.get("_zone_y_cache")
+        if c is None or c[0] != key:
+            dy = (np.asarray(grid.ys, dtype=np.float32) - pl["hy"]) * PITCH_WID_M / r["sigma_y"]
+            zy = np.exp(-0.5 * dy * dy) ** r["zone"]
+            c = (key, np.repeat(zy, grid.nx))
+            pl["_zone_y_cache"] = c
+        dx = (np.asarray(grid.xs, dtype=np.float32) - dyn_hx) * PITCH_LEN_M / r["sigma_x"]
+        zx = np.tile(np.exp(-0.5 * dx * dx) ** r["zone"], grid.ny)
+        return zx * c[1]
+    out = []
+    for k in range(grid.n):
+        dx = (grid.cx[k] - dyn_hx) * PITCH_LEN_M / r["sigma_x"]
+        dy = (grid.cy[k] - pl["hy"]) * PITCH_WID_M / r["sigma_y"]
+        out.append(math.exp(-0.5 * (dx * dx + dy * dy)) ** r["zone"])
+    return out
 
 
 def _zone_aff_cached(grid, pl, r):
@@ -225,6 +286,29 @@ def compute_targets(home_players, away_players, ball_x, ball_y,
 
         goalside = _goalside(grid, ball_x, own_goal_x)
 
+        # ── 블록 라인 높이 ──
+        # 공격 방향을 +로 하는 좌표 u로 바꿔서 계산한 뒤 되돌린다.
+        # (원정팀은 x가 감소하는 쪽이 공격 방향이라 그대로 쓰면 부호가 뒤집힌다.)
+        _fwd = 1.0 if atk_goal_x > 0.5 else -1.0
+        def _to_u(x):
+            return x if _fwd > 0 else (1.0 - x)
+        def _from_u(u):
+            return u if _fwd > 0 else (1.0 - u)
+
+        _back_idx = [i for i, p in enumerate(team) if p["pos"] in _BACKLINE_POS]
+        if _back_idx:
+            _cur_back_u = sum(_to_u(team[i]["hx"]) for i in _back_idx) / len(_back_idx)
+            _ball_u = _to_u(ball_x)
+            if in_poss:
+                _tgt_back_u = min(ATK_BACKLINE_MAX, max(ATK_BACKLINE_MIN,
+                                                        _ball_u - ATK_BACKLINE_GAP))
+            else:
+                _tgt_back_u = min(DEF_BACKLINE_MAX, max(DEF_BACKLINE_MIN,
+                                                        _ball_u - DEF_BACKLINE_GAP))
+            _shift_u = (_tgt_back_u - _cur_back_u) * LINE_FOLLOW
+        else:
+            _shift_u = 0.0
+
         # 수비 국면의 "위험한 칸" — 상대에게 가치가 높은데 우리가 아직
         # 점유하지 못한 칸. 이걸 미리 밟는 게 수비 포지셔닝이다.
         if HAVE_NUMPY:
@@ -248,7 +332,10 @@ def compute_targets(home_players, away_players, ball_x, ball_y,
             r = roles[i]
             vmax = pl.get("vmax_ms", r["vmax"])
 
-            zone = _zone_aff_cached(grid, pl, r)
+            # 블록 이동을 반영한 동적 존 중심. 대형의 상대적 깊이는
+            # 그대로 유지되고 블록만 통째로 미끄러진다.
+            dyn_hx = min(0.93, max(0.05, _from_u(_to_u(pl["hx"]) + _shift_u)))
+            zone = _zone_aff_dyn(grid, pl, r, dyn_hx)
             travel = sm._travel_cost(grid, pl, vmax)
 
             if in_poss:

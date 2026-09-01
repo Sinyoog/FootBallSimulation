@@ -1075,6 +1075,9 @@ class MatchSimEngine:
             "banner_color": self.banner_color,
             "banner_alpha": self.banner_alpha,
             "last_restart_clock": self._last_restart_clock,
+            # [Phase 2] 계측이 "지금 누가 공격 중인지"를 알아야 라인 높이
+            # 같은 국면별 지표를 잴 수 있다. 렌더러는 안 쓴다.
+            "possession": self.possession,
         }
 
     def _reset_live_state(self):

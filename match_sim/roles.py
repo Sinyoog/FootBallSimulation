@@ -122,24 +122,24 @@ ROLES = {
     # 내리게 한다. goalside/deny가 충분히 높아 뒷공간은 여전히 지킨다.
     "CB": _r(control=0.45, prog=0.22, threat=0.02, pass_=0.46,
              deny=0.95, press=0.24, goalside=0.85,
-             zone=1.10, sigma_x=18.0, sigma_y=15.0, cost=0.26, vmax=7.5),
+             zone=1.20, sigma_x=16.0, sigma_y=14.0, cost=0.28, vmax=7.5),
 
     # ── 풀백 ──
     # 폭을 담당하고 전진 가담도 한다. 존이 세로로 길다(오버래핑).
     "LB": _r(control=0.38, prog=0.58, threat=0.10, pass_=0.58,
              width=0.45, deny=0.72, press=0.34, goalside=0.58,
-             zone=0.95, sigma_x=25.0, sigma_y=15.0, cost=0.22, vmax=7.9),
+             zone=1.05, sigma_x=21.0, sigma_y=13.0, cost=0.26, vmax=7.9),
     "RB": _r(control=0.38, prog=0.58, threat=0.10, pass_=0.58,
              width=0.45, deny=0.72, press=0.34, goalside=0.58,
-             zone=0.95, sigma_x=25.0, sigma_y=15.0, cost=0.22, vmax=7.9),
+             zone=1.05, sigma_x=21.0, sigma_y=13.0, cost=0.26, vmax=7.9),
 
     # ── 윙백 — 풀백보다 훨씬 공격적. 스리백 포메이션의 폭 담당. ──
     "LWB": _r(control=0.35, prog=0.70, threat=0.16, pass_=0.55,
               width=0.60, deny=0.60, press=0.35, goalside=0.48,
-              zone=0.95, sigma_x=26.0, sigma_y=14.0, cost=0.26, vmax=8.1),
+              zone=1.00, sigma_x=22.0, sigma_y=13.0, cost=0.28, vmax=8.1),
     "RWB": _r(control=0.35, prog=0.70, threat=0.16, pass_=0.55,
               width=0.60, deny=0.60, press=0.35, goalside=0.48,
-              zone=0.95, sigma_x=26.0, sigma_y=14.0, cost=0.26, vmax=8.1),
+              zone=1.00, sigma_x=22.0, sigma_y=13.0, cost=0.28, vmax=8.1),
 
     # ── 수비형 미드필더 ──
     # 전진을 억제하고 "안전한 출구"가 되는 게 일. deny가 높아서 백라인
@@ -148,7 +148,7 @@ ROLES = {
     # 깊은 곳에 있으면 pass_ 가 높은 칸이 그쪽에 생기기 때문.
     "CDM": _r(control=0.60, prog=0.28, threat=0.05, pass_=0.72,
               deny=0.90, press=0.40, goalside=0.68,
-              zone=1.05, sigma_x=21.0, sigma_y=17.0, cost=0.24, vmax=7.5),
+              zone=1.15, sigma_x=18.0, sigma_y=15.0, cost=0.28, vmax=7.5),
 
     # ── 중앙 미드필더 ──
     # 가장 균형잡힌 역할. 존이 넓어서 박스투박스로 오르내린다.
@@ -157,20 +157,20 @@ ROLES = {
     # _advancing_mid_idx / _holding_mid_idx 를 손으로 지정하지 않는다.
     "CM": _r(control=0.45, prog=0.50, threat=0.20, pass_=0.75,
              halfspace=0.30, deny=0.75, press=0.42, goalside=0.55,
-             zone=0.90, sigma_x=24.0, sigma_y=18.0, cost=0.28, vmax=7.6),
+             zone=0.96, sigma_x=21.0, sigma_y=16.0, cost=0.30, vmax=7.6),
 
     # ── 공격형 미드필더 ──
     "CAM": _r(control=0.35, prog=0.62, threat=0.55, pass_=0.85,
               halfspace=0.45, deny=0.45, press=0.40, goalside=0.30,
-              zone=0.75, sigma_x=25.0, sigma_y=20.0, cost=0.24, vmax=7.7),
+              zone=0.84, sigma_x=22.0, sigma_y=17.0, cost=0.27, vmax=7.7),
 
     # ── 측면 미드필더 ──
     "LM": _r(control=0.35, prog=0.58, threat=0.28, pass_=0.65,
              width=0.50, deny=0.65, press=0.38, goalside=0.45,
-             zone=0.95, sigma_x=23.0, sigma_y=15.0, cost=0.27, vmax=7.9),
+             zone=1.05, sigma_x=19.0, sigma_y=14.0, cost=0.31, vmax=7.9),
     "RM": _r(control=0.35, prog=0.58, threat=0.28, pass_=0.65,
              width=0.50, deny=0.65, press=0.38, goalside=0.45,
-             zone=0.95, sigma_x=23.0, sigma_y=15.0, cost=0.27, vmax=7.9),
+             zone=1.05, sigma_x=19.0, sigma_y=14.0, cost=0.31, vmax=7.9),
 
     # ── 윙어 ──
     # width가 높아 볼이 자기 쪽에 있으면 터치라인까지 벌리고, 반대쪽에
@@ -178,19 +178,19 @@ ROLES = {
     # 예전엔 이 두 동작이 각각 별도의 if/else 분기였다.
     "LW": _r(control=0.30, prog=0.70, threat=0.55, pass_=0.70,
              width=0.65, halfspace=0.25, deny=0.40, press=0.36, goalside=0.22,
-             zone=0.80, sigma_x=24.0, sigma_y=18.0, cost=0.27, vmax=8.5),
+             zone=0.88, sigma_x=22.0, sigma_y=16.0, cost=0.29, vmax=8.5),
     "RW": _r(control=0.30, prog=0.70, threat=0.55, pass_=0.70,
              width=0.65, halfspace=0.25, deny=0.40, press=0.36, goalside=0.22,
-             zone=0.80, sigma_x=24.0, sigma_y=18.0, cost=0.27, vmax=8.5),
+             zone=0.88, sigma_x=22.0, sigma_y=16.0, cost=0.29, vmax=8.5),
 
     # ── 스트라이커 / 센터포워드 ──
     # threat 최대. 존이 가장 넓어서 라인 사이/뒷공간을 자유롭게 찾는다.
     "ST": _r(control=0.28, prog=0.72, threat=0.95, pass_=0.72,
              deny=0.28, press=0.40, goalside=0.12,
-             zone=0.72, sigma_x=23.0, sigma_y=20.0, cost=0.26, vmax=8.1),
+             zone=0.80, sigma_x=21.0, sigma_y=18.0, cost=0.28, vmax=8.1),
     "CF": _r(control=0.34, prog=0.62, threat=0.85, pass_=0.85,
              halfspace=0.30, deny=0.34, press=0.40, goalside=0.18,
-             zone=0.66, sigma_x=25.0, sigma_y=21.0, cost=0.20, vmax=8.0),
+             zone=0.76, sigma_x=22.0, sigma_y=18.0, cost=0.25, vmax=8.0),
 }
 
 _FALLBACK = _r()
