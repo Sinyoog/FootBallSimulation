@@ -87,6 +87,34 @@ _AI_PEAK_END     = 29         # 노화 시작
 _AI_GROWTH_TOUCHES = (4, 8)     # 성장기 한 시즌에 건드리는 스탯 개수(범위)
 _AI_GROWTH_CATCHUP_FRAC = 0.35  # 한 번 터치할 때 (팀 상한-현재값) 중 회복하는 비율
 
+# [2026-09 신설, 신민용 리포트: "명문팀(성장상한99)에서 자라도 97~99가
+# 거의 안 나온다"] 위 _AI_GROWTH_TOUCHES는 "70% 확률로 핵심스탯 5개 중
+# 하나, 30% 확률로 15개 스탯 전체 중 하나"로 한 터치풀을 공유했다 —
+# 그런데 포지션별 OVR 가중치(database.WEIGHTS)는 핵심스탯이 대략 절반,
+# 나머지 10개 비핵심스탯이 나머지 절반을 차지한다. 그 결과 실측(세이브
+# 검증): 성장상한99팀 24~26세 선수 핵심스탯 평균 96.1(상한 근접) vs
+# 비핵심스탯 평균 81.9(초기값 근처에 정체) — OVR은 가중평균이라 비핵심
+# 스탯이 못 따라오는 만큼 최종 OVR이 95~96대에서 막히고, 97~99는 사실상
+# 안 나왔다(실제 세이브: 생존 25.6만명 중 97 딱 1명, 역대 71.7만명
+# 통틀어도 98/97 각 1명뿐).
+# 신민용이 직접 제시한 목표(명문팀 졸업생 기준): 92~94=40~50%(주전급),
+# 95~96=20~30%(에이스급), 97~98=5~8%(월드클래스), 99=1~2%(역사적
+# 최정상급). 이 표에 맞춰 헤드리스 시뮬레이션(디버트나이 16~20 편차+
+# 도중 이적으로 성장상한99팀 합류 시점 편차까지 모델링)으로 스윕 검증한
+# 결과: "핵심스탯 터치풀과 완전히 분리된, 같은 크기의 비핵심스탯 전용
+# 터치풀"을 추가하는 게 가장 근접했다(<92:27.9%, 92~94:39.8%,
+# 95~96:25.9%, 97~98:6.3%, 99: 극희귀하지만 도달 가능 — 나머지 버킷은
+# 전부 요청 범위 안에 들어옴). 기존 "70/30 공유풀" 방식은 폐기하고,
+# 핵심스탯 터치는 이제 100% 핵심스탯만(희석 없이), 비핵심스탯은 완전히
+# 별도의 동일 크기 터치예산(_AI_GROWTH_TOUCHES_NONKEY)을 받는다 — 사실상
+# 시즌당 총 터치수가 늘어나 핵심스탯 수렴도 더 좋아지고, 비핵심스탯도
+# 처음으로 의미 있게 상한에 다가간다. 99는 "1% 조숙형 특급 유망주
+# (constants.AGE_OVR_FRACTION_ELITE) + 데뷔부터 은퇴급 없이 성장상한99
+# 팀에서 9년 풀타임 성장"이 동시에 맞아떨어져야 하는 극희귀 케이스로
+# 남는다 — "역사적 최정상급"이라는 취지에 맞다고 판단, 별도로 손대지
+# 않음(건드리면 다른 시스템에도 영향).
+_AI_GROWTH_TOUCHES_NONKEY = (4, 8)  # 비핵심스탯 전용 터치 예산(핵심과 동일 크기, 완전 별도 풀)
+
 
 def _youth_target_scale(target, age):
     """[2026-08 4차 재설계] 16~24세 신인의 target(성인 잠재치)을
@@ -223,8 +251,95 @@ def _ages_well(player_id: int) -> bool:
     하게 되어 부자연스러우므로, player_id 기반 결정적 해시로 커리어
     내내 고정된 값을 쓴다 — id는 선수마다 유일하고 사실상 무작위로
     배정되므로 이 해시 결과도 자연히 정확히 반반(짝/홀)으로 갈리고,
-    별도 DB 컬럼 없이 항상 같은 값이 재현된다."""
+    별도 DB 컬럼 없이 항상 같은 값이 재현된다.
+    [2026-09] 노화 로직 자체는 아래 _mgmt_tier_and_mult(5단계)로
+    교체됐지만, 이 함수는 다른 곳에서 참조할 수도 있어 그대로 남겨둔다."""
     return ((player_id * 2654435761) & 0xFFFFFFFF) % 2 == 0
+
+
+# [2026-09 재설계, 신민용 리포트: "노화가 너무 후해 — 28세95→40세84~87은
+# 5대리그급 선수가 40세에도 안 은퇴하고 버티게 만든다"] 예전 _ages_well
+# (관리 잘함/못함 반반, 하락 '횟수'만 다르게)는 목표치가 아예 없는
+# 방식이라 실측 40세 평균이 84.8~87.4에 그쳤다(사용자 목표 대비 15점+
+# 차이, 실제 게임함수로 2,000명 헤드리스 검증 완료). "나이별 목표
+# 하락률을 먼저 정하고 그 안에서 어떤 스탯을 뺄지 결정"(사용자 명시
+# 요청)하는 구조로 전면 교체한다.
+#
+# [1단계] 기준곡선: "평균적인 자기관리" 선수가 전성기(29세) OVR 대비
+# 나이별로 몇 % 하락해야 하는지의 누적비율표. 신민용이 최종 확정한
+# 목표표(95 시작 기준, 구간은 중간값 사용 — 33세90~91→90.5,
+# 34세88~89→88.5, 35세86~88→87, 36세84~86→85, 37세81~84→82.5,
+# 38세78~81→79.5, 39세75~78→76.5, 40세72~76→74, 40세 평균 목표는
+# 73~76 — "40세 69~72"였던 1차안은 "너무 극단적"이라는 본인 피드백으로
+# 이번에 상향 조정됨)를 "전성기 대비 누적 하락률"로 환산했다(40세 기준
+# (95-74)/95=22.1% 하락). 41세 이후는 목표표가 없어 39→40 구간 직전
+# 몇 년의 평균 증가폭(연 약 2.9%p)을 그대로 이어 외삽했다 — 이 구간은
+# 추정치이므로 실측 후 조정 가능.
+_AGING_DECLINE_SCHEDULE = {
+    29: 0.0000, 30: 0.0105, 31: 0.0211, 32: 0.0316, 33: 0.0474,
+    34: 0.0684, 35: 0.0842, 36: 0.1053, 37: 0.1316, 38: 0.1632,
+    39: 0.1947, 40: 0.2211, 41: 0.2495, 42: 0.2789, 43: 0.3095,
+    44: 0.3411, 45: 0.3737,
+}
+_AGING_DECLINE_MAX_AGE = max(_AGING_DECLINE_SCHEDULE)
+_AGING_DECLINE_LAST_STEP = (_AGING_DECLINE_SCHEDULE[_AGING_DECLINE_MAX_AGE]
+                             - _AGING_DECLINE_SCHEDULE[_AGING_DECLINE_MAX_AGE - 1])
+
+
+def _aging_base_decline_pct(age: int) -> float:
+    """전성기(29세) 대비 이 나이의 "기준" 누적 하락률(자기관리 보정 전).
+    45세를 넘어가는 초고령 선수는 마지막 구간 증가폭을 그대로 이어
+    선형 외삽한다(표 밖은 실측 데이터가 없는 추정 구간)."""
+    if age <= 29:
+        return 0.0
+    if age in _AGING_DECLINE_SCHEDULE:
+        return _AGING_DECLINE_SCHEDULE[age]
+    if age > _AGING_DECLINE_MAX_AGE:
+        return (_AGING_DECLINE_SCHEDULE[_AGING_DECLINE_MAX_AGE]
+                + _AGING_DECLINE_LAST_STEP * (age - _AGING_DECLINE_MAX_AGE))
+    return 0.0  # 방어적 폴백(정수 나이라 이론상 도달 안 함)
+
+
+# [2단계] 자기관리 등급 — 신민용이 직접 제시한 5단계 확률/보정폭.
+#   "매우좋음 10%/좋음 25%/보통 45%/나쁨 15%/매우나쁨 5%"
+#   각 등급 내에서도 보정폭 범위 안에서 개인별로 살짝씩 달라진다.
+# direction: -1=기준 하락률을 줄임(더 완만하게 늙음), +1=늘림(더 가파르게).
+_MGMT_TIERS = (
+    # (등급명, 누적확률상한, (보정폭 최소,최대), 방향)
+    ("매우좋음", 0.10, (0.15, 0.25), -1),
+    ("좋음",     0.35, (0.05, 0.15), -1),
+    ("보통",     0.80, (0.00, 0.00),  0),
+    ("나쁨",     0.95, (0.10, 0.20), +1),
+    ("매우나쁨", 1.00, (0.25, 0.40), +1),
+)
+
+
+def _mgmt_tier_and_mult(player_id: int):
+    """이 선수의 자기관리 등급과 하락률 보정계수(-0.40~+0.40 범위)를
+    player_id 기반 결정적 해시로 고정 배정한다(_ages_well과 같은 철학
+    — 매 시즌 다시 뽑지 않고 커리어 내내 유지, 별도 DB 컬럼 불필요).
+    서로 다른 두 해시를 써서 (1)등급 자체와 (2)그 등급 안에서의 구체적
+    보정폭이 독립적으로 갈리게 한다. 보정계수가 음수면 기준 하락률보다
+    덜 떨어지는(자기관리가 좋은) 선수, 양수면 더 가파르게 떨어지는
+    선수다."""
+    h1 = ((player_id * 2654435761) & 0xFFFFFFFF) / 0xFFFFFFFF
+    h2 = ((player_id * 40503 + 12345) & 0xFFFFFFFF) / 0xFFFFFFFF
+    for name, cum, (lo, hi), direction in _MGMT_TIERS:
+        if h1 < cum:
+            return name, direction * (lo + h2 * (hi - lo))
+    return "보통", 0.0
+
+
+def _aging_target_ovr(peak_ovr: int, age: int, player_id: int) -> int:
+    """전성기 OVR·나이·개인 자기관리 보정을 종합해 "이 나이의 목표
+    OVR"을 계산한다. 노화 로직은 매 시즌 이 목표치와 현재 OVR의 차이만큼만
+    스탯을 깎는다(사용자 명시 요청: "연령별 목표 하락량을 먼저 정하고 그
+    안에서 어떤 스탯이 떨어질지를 결정하는 구조")."""
+    base_pct = _aging_base_decline_pct(age)
+    _, mult = _mgmt_tier_and_mult(player_id)
+    eff_pct = base_pct * (1.0 + mult)
+    eff_pct = max(0.0, min(0.75, eff_pct))  # 안전 클램프(음수 하락/과도한 폭락 방지)
+    return max(15, int(round(peak_ovr * (1.0 - eff_pct))))
 
 
 def _ai_retirement_probability(age, ovr, position, category="mid", intl_factor=1.0):
@@ -263,6 +378,13 @@ if _HAS_NUMPY:
     _DEFAULT_KEY_IDX_NP = np.array([STAT_IDX[s] for s in ALL_STATS[:5]])
     _KEY_IDX_BY_POS_NP = {
         pos: np.array([STAT_IDX[s] for s in keys]) for pos, keys in KEY_STATS_BY_POS.items()
+    }
+    # [2026-09 신설, _AI_GROWTH_TOUCHES_NONKEY 정의부 주석 참고] 핵심스탯의
+    # 여집합(그 포지션 핵심 5개를 뺀 나머지) — 비핵심스탯 전용 성장 터치풀에 사용.
+    _DEFAULT_NONKEY_IDX_NP = np.array([STAT_IDX[s] for s in ALL_STATS[5:]])
+    _NONKEY_IDX_BY_POS_NP = {
+        pos: np.array([STAT_IDX[s] for s in ALL_STATS if s not in keys])
+        for pos, keys in KEY_STATS_BY_POS.items()
     }
     # 포지션별 OVR 가중치를 (15,) 벡터로 1회 캐싱 (매 시즌 재구성 방지)
     _WEIGHT_VEC_NP = {}
@@ -364,6 +486,10 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None):
     # 같이 스냅샷한다 — shared_ai_rows는 sub_role/league_id가 없어 그대로
     # 재사용할 수 없으므로 이 함수 내부에서 자체 쿼리한다.
     _snapshot_season_ratings(c, year)
+    # [2026-09 신설] 국가대표 평점/골/어시 스냅샷 — 위와 완전히 같은
+    # 타이밍(로스터가 은퇴/이적으로 바뀌기 전, 이 해 대회가 이미 끝난
+    # 시점)에 호출한다.
+    _snapshot_intl_season_ratings(c, year)
 
     _report(1, "은퇴 및 신인 영입 중")
     retired    = _retire_and_replace(c, year, shared_ai_rows)
@@ -383,6 +509,26 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None):
     _report(2, "전세계 이적시장 처리 중")
     moved      = _transfer_market(c, year, shared_ai_rows, verbose_log=verbose_log, my_team_id=my_team_id)
     _ta3 = _time_perf.perf_counter()
+    # [2026-09 신설, 신민용 요청: "명문팀은 상시로 좋은 선수를 스카우팅
+    # 해야 한다 — 3급은 압도적인 선수, 2급/1급은 상대적으로 덜한 선수"]
+    # 은퇴/이적시장과 완전히 별개인 상시 스카우팅 — _retire_and_replace는
+    # 은퇴가 나야만 채우고, _transfer_market은 등급 무관 확률로 도는데,
+    # 이건 "은퇴 여부와 무관하게 명문팀만 매 시즌 세계 최상위권을 노리는"
+    # 전용 통로. 최신 team_id 반영이 필요해 자체 쿼리한다(위 shared_ai_rows
+    # 재조회와 같은 이유).
+    scouted    = _prestige_scouting(c, year)
+    # [2026-09 신설, 신민용 요청: "이적 종류(이적/임대)도 구분해야 한다"]
+    # _transfer_market이 이번 시즌 새로 내보낸 임대 건과는 무관하게,
+    # "이전에 나가있던 임대 중 이번에 복귀할 때가 된" 선수를 원 소속팀
+    # 으로 되돌린다 — 매 시즌 한 번씩 확인해야 몇 년 전 임대도 놓치지
+    # 않는다.
+    loan_returned = _process_loan_returns(c, year)
+    # [2026-09 신설, 신민용 요청: "계약을 몇년치 했냐인건데... 기간이
+    # 늘어나면 연장 이런식으로"] 이번 시즌 이적시장에서 안 팔리고 계약도
+    # 만료된 선수를 재계약 처리한다 — _transfer_market 이후에 호출해야
+    # "이번 시즌에 실제로 안 팔린 선수만" 대상이 된다.
+    renewed = _process_contract_renewals(c, year)
+    _ta3b0 = _time_perf.perf_counter()
     # [2026-08 신설, 신민용 리포트: "이적으로 인한 스쿼드 인원 불균형을
     # 보정하는 장치가 없다 — 짧은 팀엔 10대 선수를 추가하고, 자리 못 구한
     # 애들은 은퇴시키면 되잖아, 다 30대까지 뛰는 것도 아니고 20대에
@@ -417,7 +563,8 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None):
           f"성장/노화({'numpy' if _HAS_NUMPY else 'PURE-PYTHON!'}) {_ta1-_ta0:.2f}s | "
           f"shared_ai_rows조회 {_t_shared-_ta1:.2f}s | "
           f"은퇴·세대교체 {_ta2-_t_shared:.2f}s | 이적시장 {_ta3-_ta2:.2f}s | "
-          f"스쿼드 인원 보정 {_ta3b-_ta3:.2f}s | 전술변경 {_ta4-_ta3b:.2f}s")
+          f"명문팀 스카우팅 {_ta3b0-_ta3:.2f}s | "
+          f"스쿼드 인원 보정 {_ta3b-_ta3b0:.2f}s | 전술변경 {_ta4-_ta3b:.2f}s")
     # [2026-08 신설, 신민용 리포트: "시즌 지날수록 은퇴·세대교체가 느려지는데
     # 처리 대상(은퇴자 수) 자체가 느는 건지 건당 비용이 느는 건지 구분이
     # 안 된다"] 위 [PERF] 줄은 이미 "은퇴·세대교체 X.XXs"를 찍고 있었지만
@@ -427,6 +574,7 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None):
     # 값이라 여기 한 줄만 추가하면 시즌별로 나란히 비교할 수 있다 —
     # 로직/결과는 전혀 안 건드리고 로그만 추가.
     print(f"[PERF-LIFECYCLE] {year}년: 은퇴/세대교체 {retired}명 · 이적 {moved}건 · "
+          f"명문팀 스카우팅 {scouted}건 · 임대 복귀 {loan_returned}명 · 재계약 {renewed}명 · "
           f"소요시간 {_ta2-_t_shared:.3f}s"
           + (f" ({(_ta2-_t_shared)/retired*1000:.2f}ms/명)" if retired else ""))
 
@@ -643,8 +791,10 @@ def _age_and_progress(c):
 
     rows = c.connection.cursor()
     rows.row_factory = None  # 위치 접근만 쓰므로 Row 래핑 생략 (5.9만 행 fetch 오버헤드 절감)
+    # [2026-09 신설] ovr(하락 전 현재값)·peak_ovr(전성기 기준점) 추가 —
+    # 목표OVR 기반 노화 재설계(_AGING_DECLINE_SCHEDULE 정의부 주석 참고)에 필요.
     rows = rows.execute(
-        "SELECT id, position, age, team_id, " + _STAT_COLS + " FROM ai_players").fetchall()
+        "SELECT id, position, age, team_id, " + _STAT_COLS + ", ovr, peak_ovr FROM ai_players").fetchall()
     _ap_t2 = _time_ap.perf_counter()
     if not rows:
         return 0, 0
@@ -718,11 +868,15 @@ def _age_and_progress_np(c, rows, team_cap, orphan_fallback):
     pos_arr = np.array(pos_list)
     ages = np.array([(r[2] or 20) for r in rows], dtype=np.int64)
     tids = [r[3] for r in rows]
+    # [2026-09 신설] 목표OVR 기반 노화(_AGING_DECLINE_SCHEDULE 정의부 주석
+    # 참고)용 — 하락 전 현재 ovr과 전성기 기준점(peak_ovr, 0이면 아직 미확정).
+    cur_ovr_arr = np.array([(r[19] or 0) for r in rows], dtype=np.int64)
+    peak_ovr_arr = np.array([(r[20] or 0) for r in rows], dtype=np.int64)
 
     # None/0 스탯은 기존과 동일하게 50으로 보정 (구버전 세이브 방어)
     # [최적화] 중첩 리스트(list-of-tuples)를 np.array로 바로 변환하는 것보다
     # 1차원으로 펼친 뒤 reshape하는 편이 실측상 더 빠름(타입 추론 오버헤드 감소).
-    _flat = [v for r in rows for v in r[4:]]
+    _flat = [v for r in rows for v in r[4:19]]
     raw = np.array(_flat, dtype=np.float64).reshape(N, _N_STATS)
     vals_arr = np.where(np.isnan(raw) | (raw == 0), 50.0, raw).astype(np.int64)
 
@@ -770,19 +924,23 @@ def _age_and_progress_np(c, rows, team_cap, orphan_fallback):
     # 부여된 로직도 없다(포지션별로 독립적으로 처리).
     unique_positions = sorted(set(pos_list))
 
-    # ── 성장기: 키스탯 70% / 전체스탯 30%, 팀 상한까지 격차비례 회복 ──
-    # [2026-09 수정, 위 _AI_GROWTH_TOUCHES/_AI_GROWTH_CATCHUP_FRAC 주석
-    # 참고] 예전엔 매번 고정 +1~3점만 더해서 9시즌을 다 채워도 격차의
-    # 15%도 못 좁혔다 — 이제 터치 횟수를 늘리고(1~3회 → 4~8회), 매번
-    # "남은 격차(cap-cur) × 회복비율"만큼 올린다(격차가 크면 크게, 다
-    # 채워갈수록 자연히 완만해지는 커브 — my_player 훈련 시스템의
-    # progress_soft와 같은 철학).
+    # ── 성장기: 핵심스탯 전용 터치풀 + 비핵심스탯 전용 터치풀(완전 분리),
+    #    각각 팀 상한까지 격차비례 회복 ──
+    # [2026-09 재설계, 위 _AI_GROWTH_TOUCHES_NONKEY 정의부 주석 참고]
+    # 예전엔 "70% 핵심 / 30% 전체15개 공유풀"이라 비핵심스탯(포지션
+    # 가중치의 대략 절반)이 성장기 내내 터치를 거의 못 받았다(실측 세이브:
+    # 성장상한99팀 24~26세 핵심평균96.1 vs 비핵심평균81.9) — 그 결과
+    # 명문팀에서 자라도 OVR이 95~96대에서 막히고 97~99는 사실상 안
+    # 나왔다. 이제 핵심/비핵심을 완전히 분리된 터치예산으로 나눠 각자
+    # 독립적으로 상한에 다가가게 한다(핵심 쪽은 희석이 없어져 수렴이 더
+    # 빨라지고, 비핵심 쪽은 처음으로 의미 있는 성장기회를 받는다).
     for pos in unique_positions:
         idxs = np.where(growth_mask & (pos_arr == pos))[0]
         Ng = len(idxs)
         if Ng == 0:
             continue
         key_idx = _KEY_IDX_BY_POS_NP.get(pos, _DEFAULT_KEY_IDX_NP)
+        nonkey_idx = _NONKEY_IDX_BY_POS_NP.get(pos, _DEFAULT_NONKEY_IDX_NP)
         n_up = rng.integers(_AI_GROWTH_TOUCHES[0], _AI_GROWTH_TOUCHES[1] + 1, size=Ng)
         for rnd in range(_AI_GROWTH_TOUCHES[1]):
             active = n_up > rnd
@@ -790,11 +948,19 @@ def _age_and_progress_np(c, rows, team_cap, orphan_fallback):
                 continue
             act_idx = idxs[active]
             m = len(act_idx)
-            use_key = rng.random(m) < 0.7
-            chosen = np.where(
-                use_key,
-                key_idx[rng.integers(0, len(key_idx), size=m)],
-                rng.integers(0, _N_STATS, size=m))
+            chosen = key_idx[rng.integers(0, len(key_idx), size=m)]
+            cur = vals_arr[act_idx, chosen]
+            cap = cap_by_row[act_idx]
+            gain = np.maximum(1, np.round((cap - cur) * _AI_GROWTH_CATCHUP_FRAC)).astype(np.int64)
+            vals_arr[act_idx, chosen] = np.minimum(cap, cur + gain)
+        n_up2 = rng.integers(_AI_GROWTH_TOUCHES_NONKEY[0], _AI_GROWTH_TOUCHES_NONKEY[1] + 1, size=Ng)
+        for rnd in range(_AI_GROWTH_TOUCHES_NONKEY[1]):
+            active = n_up2 > rnd
+            if not active.any():
+                continue
+            act_idx = idxs[active]
+            m = len(act_idx)
+            chosen = nonkey_idx[rng.integers(0, len(nonkey_idx), size=m)]
             cur = vals_arr[act_idx, chosen]
             cap = cap_by_row[act_idx]
             gain = np.maximum(1, np.round((cap - cur) * _AI_GROWTH_CATCHUP_FRAC)).astype(np.int64)
@@ -826,44 +992,71 @@ def _age_and_progress_np(c, rows, team_cap, orphan_fallback):
             cur = vals_arr[act_idx, chosen]
             vals_arr[act_idx, chosen] = np.clip(cur + delta, 15, 99)
 
-    # ── 노화기: 키스탯 70% / 전체스탯 30%(관리 못하는 절반) 또는
-    #    신체스탯 65% / 전체스탯 30%(관리 잘하는 절반), 나이 비례 하락 ──
-    # [2026-08 버그수정, 신민용 리포트: "35세 OVR94가 37세에 93밖에 안
-    # 떨어졌다 — 노화가 OVR에 제대로 반영 안 되는 거 아니냐"] 예전엔
-    # 포지션과 무관하게 신체스탯(65%)/전체스탯(35%) 중에서만 깎았는데,
-    # OVR은 포지션별 가중평균(calc_ovr_from_list)이라 그 포지션에서
-    # 가중치가 낮은 스탯만 계속 깎이면 실제로는 계속 노화 중인데도 OVR엔
-    # 거의 안 잡히는 왜곡이 생겼다(실측: 35세 OVR94→37세 OVR93).
-    # [2026-08 확장, 신민용 요청: "관리를 잘하면 완만하게, 못하면
-    # 원래대로 가파르게 꺾이는 선수가 반반씩 있으면 좋겠다"] _ages_well
-    # (player_id 기반, 커리어 내내 고정) 로 정확히 반반 갈라서, 관리를
-    # 잘하는 쪽은 옛 방식(신체스탯 위주, OVR엔 완만하게만 반영)을 그대로
-    # 쓰고 못하는 쪽만 키스탯 위주(성장기와 대칭)로 확실히 깎는다.
-    well_arr = ((pids_arr_full.astype(np.int64) * 2654435761) & 0xFFFFFFFF) % 2 == 0
-    for pos in unique_positions:
-        for well in (True, False):
-            idxs = np.where(aging_mask & (pos_arr == pos) & (well_arr == well))[0]
-            if len(idxs) == 0:
+    # ── 노화기: 목표OVR까지 반복 하락(전성기 대비 나이별 목표% + 개인
+    #    자기관리 등급 보정) ──
+    # [2026-09 재설계, 위 _AGING_DECLINE_SCHEDULE/_MGMT_TIERS 정의부 주석
+    # 참고] 예전엔 "나이 비례 하락 '횟수'"만 있고 목표치가 없어 실측
+    # 28세95→40세84.8~87.4로 사용자가 원한 73~76보다 너무 완만했다.
+    # 이제 전성기(peak_ovr) 대비 나이별 목표 OVR을 먼저 계산하고, 그
+    # 목표에 도달할 때까지만(최대 40라운드 안전장치) 스탯을 깎는다 —
+    # 스탯 선택 편향(신체스탯 위주 vs 키스탯 위주)은 기존 well/not-well
+    # 구조를 그대로 재사용하되, 이제는 개인 자기관리 보정계수의 부호로
+    # 결정한다(보정이 음수=완만=신체스탯 위주, 양수 이상=가파름=키스탯
+    # 위주).
+    idxs = np.where(aging_mask)[0]
+    if len(idxs):
+        # 1) 전성기(peak_ovr) 기준점 확정 — 이번이 노화 첫 시즌(29→30)이거나
+        #    구버전 세이브에서 아직 못 채워진 행은 "이번 시즌 하락 전 ovr"을
+        #    기준점으로 고정한다(그 값도 없는 극히 드문 경우만 즉석 계산).
+        need_peak = peak_ovr_arr[idxs] <= 0
+        if need_peak.any():
+            _fb = idxs[need_peak]
+            _zero_cur = cur_ovr_arr[_fb] <= 0
+            if _zero_cur.any():
+                for _j in _fb[_zero_cur]:
+                    cur_ovr_arr[_j] = calc_ovr_from_list(pos_list[_j], vals_arr[_j].tolist())
+            peak_ovr_arr[_fb] = cur_ovr_arr[_fb]
+
+        # 2) 나이별 기준 하락률 × 개인 자기관리 보정계수 → 목표 OVR.
+        ages_i = new_age[idxs]
+        base_pct = np.array([_aging_base_decline_pct(int(a)) for a in ages_i])
+        mods = np.array([_mgmt_tier_and_mult(int(p))[1] for p in pids_arr_full[idxs]])
+        eff_pct = np.clip(base_pct * (1.0 + mods), 0.0, 0.75)
+        target_arr = np.maximum(15, np.round(peak_ovr_arr[idxs] * (1.0 - eff_pct))).astype(np.int64)
+        good_mgmt = mods <= 0
+
+        for pos in unique_positions:
+            sel = pos_arr[idxs] == pos
+            if not sel.any():
                 continue
+            act_idx = idxs[sel]              # vals_arr 기준 행 인덱스
+            tgt = target_arr[sel]
+            good = good_mgmt[sel]
             key_idx = _KEY_IDX_BY_POS_NP.get(pos, _DEFAULT_KEY_IDX_NP)
-            decline_n = 2 + (new_age[idxs] - _AI_PEAK_END) // 2
-            max_rounds = int(decline_n.max())
-            _pool = _PHYS_IDX_NP if well else key_idx
-            _pool_prob = 0.65 if well else 0.7
-            for rnd in range(max_rounds):
-                active = decline_n > rnd
+            wv = _WEIGHT_VEC_NP.get(pos, _WEIGHT_VEC_NP["CM"])
+            wsum = _WEIGHT_SUMS.get(pos, _WEIGHT_SUMS["CM"])
+
+            for rnd in range(40):
+                cur_ovr_now = (vals_arr[act_idx] @ wv) / wsum
+                active = cur_ovr_now > (tgt + 0.5)
                 if not active.any():
-                    continue
-                act_idx = idxs[active]
-                m = len(act_idx)
-                use_pool = rng.random(m) < _pool_prob
+                    break
+                a_idx = act_idx[active]
+                a_good = good[active]
+                m = len(a_idx)
+                use_phys = a_good & (rng.random(m) < 0.65)
+                use_key = (~a_good) & (rng.random(m) < 0.70)
                 chosen = np.where(
-                    use_pool,
-                    _pool[rng.integers(0, len(_pool), size=m)],
-                    rng.integers(0, _N_STATS, size=m))
+                    a_good,
+                    np.where(use_phys,
+                             _PHYS_IDX_NP[rng.integers(0, len(_PHYS_IDX_NP), size=m)],
+                             rng.integers(0, _N_STATS, size=m)),
+                    np.where(use_key,
+                             key_idx[rng.integers(0, len(key_idx), size=m)],
+                             rng.integers(0, _N_STATS, size=m)))
                 dec = rng.integers(1, 4, size=m)
-                cur = vals_arr[act_idx, chosen]
-                vals_arr[act_idx, chosen] = np.maximum(15, cur - dec)
+                cur = vals_arr[a_idx, chosen]
+                vals_arr[a_idx, chosen] = np.maximum(15, cur - dec)
 
     # ── OVR 재계산 (포지션별 가중치 벡터와 행렬곱, 5.9만 명 순회 없이 일괄 처리) ──
     ovr_out = np.empty(N, dtype=np.int64)
@@ -874,16 +1067,18 @@ def _age_and_progress_np(c, rows, team_cap, orphan_fallback):
         total = vals_arr[mask] @ wv / wsum
         ovr_out[mask] = np.clip(np.round(total), 1, 100).astype(np.int64)
 
-    # [최적화] (age, *stats, ovr, id) 튜플을 파이썬 루프로 만드는 대신
-    # column_stack으로 한 번에 이어붙여 tolist() — sqlite3.executemany는
+    # [최적화] (age, *stats, ovr, peak_ovr, id) 튜플을 파이썬 루프로 만드는
+    # 대신 column_stack으로 한 번에 이어붙여 tolist() — sqlite3.executemany는
     # 튜플뿐 아니라 리스트 행도 그대로 받아준다. 5.9만 회 언패킹 루프 제거.
-    updates = np.column_stack([new_age, vals_arr, ovr_out, pids_arr_full]).tolist()
+    # [2026-09] peak_ovr_arr 추가 — 노화 진입 시점에 확정된 전성기 기준점을
+    # 그대로 저장해야 다음 시즌에도 같은 기준으로 목표OVR을 계산한다.
+    updates = np.column_stack([new_age, vals_arr, ovr_out, peak_ovr_arr, pids_arr_full]).tolist()
     _npf_t1 = _time_npf.perf_counter()
 
     set_clause = ", ".join(f"{s}=?" for s in ALL_STATS)
     with _indexes_off_for_mass_update(c):
         c.executemany(
-            f"UPDATE ai_players SET age=?, {set_clause}, ovr=? WHERE id=?",
+            f"UPDATE ai_players SET age=?, {set_clause}, ovr=?, peak_ovr=? WHERE id=?",
             updates)
     _npf_t2 = _time_npf.perf_counter()
     print(f"[PERF-AGE-NP]  numpy계산 {_npf_t1-_npf_t0:.3f}s | "
@@ -897,6 +1092,11 @@ def _age_and_progress_np(c, rows, team_cap, orphan_fallback):
               file=_sys.stderr)
 
     return int(growth_mask.sum()), int(aging_mask.sum())
+
+
+# [2026-09 신설] _age_and_progress_py 전용 — 포지션별 "비핵심스탯 목록"
+# 캐시(매 선수마다 리스트 컴프리헨션 새로 만들지 않도록 1회 계산 후 재사용).
+_NONKEY_STATS_BY_POS: dict = {}
 
 
 def _age_and_progress_py(c, rows, team_cap, orphan_fallback):
@@ -921,16 +1121,29 @@ def _age_and_progress_py(c, rows, team_cap, orphan_fallback):
         else:
             _cap = orphan_fallback
             _orphan_team_ids.add(tid)
-        vals = [v or 50 for v in r[4:]]
+        vals = [v or 50 for v in r[4:19]]
+        cur_ovr_val = r[19] or 0
+        peak_ovr_val = r[20] or 0
         keys = KEY_STATS_BY_POS.get(pos, _default_keys)
+        nonkeys = _NONKEY_STATS_BY_POS.get(pos)
+        if nonkeys is None:
+            nonkeys = [s for s in ALL_STATS if s not in keys]
+            _NONKEY_STATS_BY_POS[pos] = nonkeys
 
         if new_age <= _AI_PEAK_START:
-            # [2026-09 수정] 위 _age_and_progress_np와 동일 로직으로
-            # 교체 — 격차비례 성장(_AI_GROWTH_TOUCHES/_AI_GROWTH_CATCHUP_
-            # FRAC 정의부 주석 참고).
+            # [2026-09 재설계] 위 _age_and_progress_np와 동일하게, 핵심/
+            # 비핵심을 완전히 분리된 터치풀로 처리 — _AI_GROWTH_TOUCHES_
+            # NONKEY 정의부 주석 참고(예전 70/30 공유풀은 폐기).
             n_up = _randint(*_AI_GROWTH_TOUCHES)
             for _ in range(n_up):
-                s = _choice(keys if _random() < 0.7 else ALL_STATS)
+                s = _choice(keys)
+                i = STAT_IDX[s]
+                gap = _cap - vals[i]
+                gain = max(1, round(gap * _AI_GROWTH_CATCHUP_FRAC))
+                vals[i] = min(_cap, vals[i] + gain)
+            n_up2 = _randint(*_AI_GROWTH_TOUCHES_NONKEY)
+            for _ in range(n_up2):
+                s = _choice(nonkeys)
                 i = STAT_IDX[s]
                 gap = _cap - vals[i]
                 gain = max(1, round(gap * _AI_GROWTH_CATCHUP_FRAC))
@@ -946,16 +1159,19 @@ def _age_and_progress_py(c, rows, team_cap, orphan_fallback):
                 i = STAT_IDX[s]
                 vals[i] = min(99, max(15, vals[i] + _choice([-1, 1, 1])))
         else:
-            # [2026-08 확장, 신민용 요청: "관리를 잘하면 완만하게, 못하면
-            # 원래대로 가파르게 꺾이는 선수가 반반씩 있으면 좋겠다"]
-            # _ages_well(고정된 개인 성향, 반반)로 갈라서 — 관리를 잘하는
-            # 쪽은 예전 방식(신체스탯 위주 65%, OVR엔 완만하게만 반영)을
-            # 그대로 쓰고, 못하는 쪽만 위에서 고친 키스탯 위주(70%) 방식을
-            # 쓴다. 두 방식 다 이미 실측 검증된 것들이라 새로 검증할 필요
-            # 없이 그대로 재사용.
-            decline_n = 2 + (new_age - _AI_PEAK_END) // 2
-            _well = _ages_well(pid)
-            for _ in range(decline_n):
+            # [2026-09 재설계] 위 _age_and_progress_np와 동일 — 목표OVR
+            # 기반 노화(_AGING_DECLINE_SCHEDULE/_MGMT_TIERS 정의부 주석
+            # 참고). 전성기(peak_ovr)를 이번이 처음이면 확정하고, 나이×
+            # 개인 자기관리 보정으로 목표 OVR을 계산한 뒤 거기 도달할
+            # 때까지만(최대 40회 안전장치) 스탯을 깎는다.
+            if not peak_ovr_val:
+                peak_ovr_val = cur_ovr_val or calc_ovr_from_list(pos, vals)
+            target = _aging_target_ovr(peak_ovr_val, new_age, pid)
+            _, _mult = _mgmt_tier_and_mult(pid)
+            _well = _mult <= 0
+            for _ in range(40):
+                if calc_ovr_from_list(pos, vals) <= target:
+                    break
                 if _well:
                     s = _choice(_AGING_PHYS_STATS) if _random() < 0.65 else _choice(ALL_STATS)
                 else:
@@ -965,12 +1181,12 @@ def _age_and_progress_py(c, rows, team_cap, orphan_fallback):
             aged += 1
 
         new_ovr = calc_ovr_from_list(pos, vals)
-        updates.append((new_age, *vals, new_ovr, pid))
+        updates.append((new_age, *vals, new_ovr, peak_ovr_val, pid))
 
     set_clause = ", ".join(f"{s}=?" for s in ALL_STATS)
     with _indexes_off_for_mass_update(c):
         c.executemany(
-            f"UPDATE ai_players SET age=?, {set_clause}, ovr=? WHERE id=?",
+            f"UPDATE ai_players SET age=?, {set_clause}, ovr=?, peak_ovr=? WHERE id=?",
             updates)
 
     if _orphan_team_ids:
@@ -986,6 +1202,144 @@ def _age_and_progress_py(c, rows, team_cap, orphan_fallback):
 # ─────────────────────────────────────────────
 # 3. 은퇴 + 신인 교체
 # ─────────────────────────────────────────────
+def _process_loan_returns(c, year):
+    """[2026-09 신설, 신민용 요청: "이적 종류(이적/임대)도 구분해야 한다"]
+    on_loan_from_team_id가 설정된(0이 아닌) 선수 중 loan_return_year가
+    이번 연도(또는 이미 지남)에 도달한 선수를 원 소속팀으로 복귀시킨다.
+    복귀 후엔 두 필드 다 초기화(0)해서 "임대 중"이 아닌 상태로 되돌린다
+    — team_id는 그대로 두면 임대처에 영구히 눌러앉는 꼴이 되므로 반드시
+    on_loan_from_team_id로 되돌려야 한다. 원 소속팀이 그 사이 없어졌거나
+    (극히 드문 데이터 정합성 예외) 원 소속팀 자체 스쿼드 인원 보정은
+    다음 _rebalance_squad_sizes가 알아서 처리하므로 여기서는 신경 안
+    쓴다.
+    [2026-09 확장] 복귀도 ai_transfer_log에 한 줄 남긴다(fee=0, is_loan=0
+    — 새로 임대를 나가는 게 아니라 "임대가 끝나서 원래 자리로 돌아옴") —
+    안 남기면 world_browser.get_ai_player_team_timeline이 이 복귀를
+    구간 경계로 못 알아채서, 세계 축구 기록실에 "임대 중"이던 팀 소속이
+    실제 복귀 이후까지 계속 이어진 것처럼 잘못 표시된다.
+    반환: 복귀 처리된 인원 수."""
+    rows = c.execute(
+        "SELECT id, name, position, age, ovr, salary, team_id, on_loan_from_team_id, "
+        "contract_end_year FROM ai_players "
+        "WHERE on_loan_from_team_id != 0 AND loan_return_year <= ?", (year,)).fetchall()
+    if not rows:
+        return 0
+    updates = [(r["on_loan_from_team_id"], r["id"]) for r in rows]
+    c.executemany(
+        "UPDATE ai_players SET team_id=?, on_loan_from_team_id=0, loan_return_year=0 WHERE id=?",
+        updates)
+    _season_row = c.execute("SELECT current_season FROM season_state WHERE id=1").fetchone()
+    _cur_season = _season_row["current_season"] if _season_row else 1
+    log_rows = [(
+        _cur_season, year, r["id"], r["name"], r["position"], r["age"] or 25, r["ovr"],
+        r["team_id"], r["on_loan_from_team_id"], 0, 0, 0.0, 0.0,
+        "임대 복귀", 0, "", 0, 0, 0, r["salary"] or 0, r["contract_end_year"] or 0) for r in rows]
+    c.executemany(
+        """INSERT INTO ai_transfer_log(
+            season, year, player_id, player_name, player_position, player_age, player_ovr,
+            from_team_id, to_team_id, from_team_prestige, to_team_prestige,
+            from_team_avg_ovr, to_team_avg_ovr, transfer_type, is_mid_season, player_role,
+            fee, is_loan, loan_return_year, salary, contract_end_year)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        log_rows)
+    return len(updates)
+
+
+def _process_contract_renewals(c, year):
+    """[2026-09 신설, 신민용 요청: "계약을 몇년치 했냐인건데... 기간이
+    늘어나면 연장 이런식으로 하고 연봉 수치도 변화하잖아"] 지금까지 AI
+    선수는 이적할 때만 새 계약(=새 연봉)이 생겼다 — 그대로 한 팀에 계속
+    있으면 계약이 만료돼도 아무 일도 안 일어났다. 이 시즌 계약이
+    만료된(그리고 임대 중이 아닌) 선수를 대상으로 재계약 여부를 굴린다
+    — _transfer_market이 이미 "계약만료 임박" 선수를 이적 후보로 더 잘
+    뽑도록 가중치를 주고 있으므로, 여기는 그 이적시장이 끝난 뒤(그래서
+    이번 시즌에 실제로 안 팔린 선수만 남은 상태에서) 호출하는 게 맞다
+    — run_ai_offseason에서 _transfer_market 다음, _prestige_scouting과
+    함께 호출.
+    반환: 재계약 처리된 인원 수."""
+    from constants import (AI_CONTRACT_RENEWAL_PROB, AI_CONTRACT_RENEWAL_DURATION_YEARS)
+    from constants import get_country_league_grade
+    rows = c.execute(
+        "SELECT id, name, position, age, ovr, team_id FROM ai_players "
+        "WHERE contract_end_year <= ? AND contract_end_year > 0 "
+        "AND on_loan_from_team_id = 0", (year,)).fetchall()
+    if not rows:
+        return 0
+    team_rows = c.execute(
+        """SELECT t.id, t.name, t.current_tier AS tier, cn.name AS cname FROM teams t
+           JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id""").fetchall()
+    tinfo_by_tid = {t["id"]: (t["cname"], t["name"], t["tier"]) for t in team_rows}
+    _grade_cache: dict = {}
+
+    def _grade_of(tid_):
+        cname_ = tinfo_by_tid.get(tid_, ("", "", 1))[0]
+        if cname_ not in _grade_cache:
+            _grade_cache[cname_] = get_country_league_grade(cname_)
+        return _grade_cache[cname_]
+
+    _season_row = c.execute("SELECT current_season FROM season_state WHERE id=1").fetchone()
+    _cur_season = _season_row["current_season"] if _season_row else 1
+    updates = []
+    log_rows = []
+    for r in rows:
+        if random.random() >= AI_CONTRACT_RENEWAL_PROB:
+            continue  # 재계약 불발 — 계약 만료 상태 그대로 두면 다음 시즌
+            # 이적시장에서 "계약 임박" 가중치로 계속 이적 후보가 된다.
+        cname, tname, tier = tinfo_by_tid.get(r["team_id"], ("", "", 1))
+        grade = _grade_of(r["team_id"])
+        new_salary = _calc_ai_salary(grade, tier, r["ovr"], cname, tname, r["team_id"], year)
+        # [2026-09 버그수정, 구현 직후 헤드리스 검증 중 자체 발견: "재계약
+        # 기간을 2~5년으로 뽑았는데 표시되는 기간이 1~4년으로 한 해씩
+        # 짧게 나온다"] world_browser의 duration 계산은 실제 발효연도
+        # (effective_year — 오프시즌 이적/재계약은 다음 해부터 발효,
+        # get_ai_player_salary_history 주석 참고)를 기준으로 하는데,
+        # 여기서 만료연도를 셀 때는 발효 전(year)을 기준으로 셌던 게
+        # 원인 — year+1(발효연도)부터 세야 의도한 기간 그대로 표시된다.
+        new_cend = year + 1 + random.randint(*AI_CONTRACT_RENEWAL_DURATION_YEARS)
+        updates.append((new_cend, new_salary, r["id"]))
+        log_rows.append((
+            _cur_season, year, r["id"], r["name"], r["position"], r["age"] or 25, r["ovr"],
+            r["team_id"], r["team_id"], 0, 0, 0.0, 0.0, "연장", 0, "", 0, 0, 0,
+            new_salary, new_cend))
+    if updates:
+        c.executemany(
+            "UPDATE ai_players SET contract_end_year=?, salary=? WHERE id=?", updates)
+    if log_rows:
+        c.executemany(
+            """INSERT INTO ai_transfer_log(
+                season, year, player_id, player_name, player_position, player_age, player_ovr,
+                from_team_id, to_team_id, from_team_prestige, to_team_prestige,
+                from_team_avg_ovr, to_team_avg_ovr, transfer_type, is_mid_season, player_role,
+                fee, is_loan, loan_return_year, salary, contract_end_year)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            log_rows)
+    return len(updates)
+
+
+def _calc_ai_salary(grade, tier, ovr, cname, tname, team_id, year):
+    """[2026-09 신설, 신민용 요청: "이적이면 연봉이 써지는거고"] AI 선수
+    연봉 계산 — economy._calc_salary()를 그대로 재사용한다(talent_tier
+    파라미터는 my_player 전용이라 안 넘긴다). AI 쪽에서 이 함수를 처음
+    쓰기 시작하는 것이라(economy._calc_salary 자체 docstring에 "ai_
+    lifecycle.py는 이 함수를 아예 호출하지 않는다"고 적혀 있던 게 이제
+    바뀜), 혹시 모를 예외로 시즌 진행 전체가 멈추면 안 되므로 실패는
+    조용히 0으로 흡수한다.
+    [2026-09 성능수정, 구현 직후 헤드리스 검증 중 자체 발견: "이적시장
+    루프(86,689명 처리) 236초"] _calc_salary에 team_id를 넘기면 내부에서
+    club_strength 조회용으로 매번 새 DB 커넥션을 열고 닫는다(economy.
+    _get_club_strength) — _transfer_market은 원래 이런 건별 DB 왕복을
+    없애려고 팀 정보를 통째로 미리 캐싱해두는 구조인데, 여기서 그 원칙을
+    깨고 건당(최대 8만 건대) 커넥션을 열어버린 게 병목이었다. team_id는
+    club_strength 보정(0.95~1.10, 원래도 좁은 범위)에만 쓰이므로, 넘기지
+    않고 중립(1.0)으로 흡수한다 — AI는 단순해야 한다는 이 파일의 기존
+    원칙과도 맞다."""
+    try:
+        from economy import _calc_salary
+        return _calc_salary(grade, tier, ovr, country=cname, team_name=tname, year=year)
+    except Exception:
+        return 0
+
+
 def _build_buy_pools(rows):
     """[2026-09 신설] 명문팀이 은퇴자를 유스 생성 대신 시장에서 영입으로
     채울 때 쓰는 후보 풀 — 포지션별로 OVR 오름차순 정렬해서 bisect로
@@ -1067,6 +1421,179 @@ def _find_buy_replacement(position, target_ovr, dst_team_id, dst_cname,
     weights = [BUY_REPLACEMENT_YOUNG_WEIGHT if (r["age"] or 25) <= BUY_REPLACEMENT_YOUNG_AGE else 1.0
                for r in chosen]
     return random.choices(chosen, weights=weights, k=1)[0]
+
+
+def _prestige_scouting(c, year):
+    """[2026-09 신설, 신민용 요청: "유럽 1부리그 팀들, 특히 3급은 압도적인
+    선수를, 2급/1급은 상대적으로 덜한 선수를 영입하려 해야 한다 — 토트넘은
+    강등은 안 당해도 16~17위인 적이 있으니"] _retire_and_replace의 "은퇴
+    자리 채우기"와 달리, 은퇴와 무관하게 명문팀이 시즌마다 상시로 스쿼드의
+    약한 자리를 시장에서 스카우팅해 업그레이드를 시도한다. 등급이 높을수록
+    후보를 훨씬 좁고 높은 상위권에서만 찾는다(PRESTIGE_SCOUT_TOP_
+    PERCENTILE). 실제 돈이 오가는 이적료 협상을 시뮬레이션하지 않으므로
+    (AI는 플레이어보다 단순해야 한다는 이 파일의 기존 원칙), 영입은 항상
+    "그 자리의 지금 최약체 선수와 1:1 맞교환"으로 처리한다 — 그러면 양쪽
+    팀 다 그 포지션 인원이 그대로 유지돼(같은 자리에 다른 선수가 들어올
+    뿐) 별도의 보호 로직 없이도 스쿼드가 비는 사고가 안 생긴다.
+
+    [2026-09 버그수정, 구현 직후 헤드리스 검증 중 자체 발견] prestige_
+    clubs.PRESTIGE_TEAMS의 "명문 등급(1~3)"은 국가별 상대 등급이지
+    세계 공통 절대 등급이 아니다(각 리그마다 그 나라 안에서의 명문일
+    뿐 — 잠비아 무풀리라 원더러스도, 인도네시아 PSM 마카사르도 각자
+    자국 최고 명문이라 3급으로 등록돼 있다). 처음 버전은 이걸 놓치고
+    "3급이면 세계 상위 0.5%"를 그대로 적용해서, 잠비아 3급 팀이
+    토트넘 선수를 스카우팅해가는 등 리그 격차를 완전히 무시한 결과가
+    나왔다 — economy.LEAGUE_GRADE_RANK(국가 리그 등급 서열, F=1~SS=8)
+    로 후보의 리그가 목적지 리그보다 강하면 후보에서 제외하도록 고쳤다
+    (약한 리그가 강한 리그에서 뺏어오는 방향은 막고, 강한 리그 명문팀은
+    세계 전체가 후보 풀인 건 그대로 유지 — SS/S급은 사실상 전세계가
+    후보군이라 "유럽 1부리그는 특히 잘하는 선수를 영입" 요청과도
+    맞아떨어진다).
+    반환: 성사된 스카우팅 건수."""
+    from constants import (PRESTIGE_SCOUT_BAND, PRESTIGE_SCOUT_ATTEMPTS_PER_SEASON,
+                           PRESTIGE_SCOUT_MIN_GAP)
+    from constants import get_country_league_grade
+    from economy import LEAGUE_GRADE_RANK
+    from data.prestige_clubs import PRESTIGE_TEAMS
+
+    rows = c.execute(
+        "SELECT id, team_id, position, age, ovr, name, nationality FROM ai_players").fetchall()
+    pools = _build_buy_pools(rows)
+
+    team_rows = c.execute(
+        """SELECT t.id, t.name, t.current_tier AS tier, cn.name AS cname FROM teams t
+           JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id""").fetchall()
+    tid_by_name = {(t["cname"], t["name"]): t["id"] for t in team_rows}
+    tinfo_by_tid = {t["id"]: (t["cname"], t["name"], t["tier"]) for t in team_rows}
+    _grade_cache: dict = {}
+
+    def _grade_rank_of(tid_):
+        cname_ = cname_by_tid.get(tid_)
+        if cname_ is None:
+            return 1
+        if cname_ not in _grade_cache:
+            _grade_cache[cname_] = LEAGUE_GRADE_RANK.get(get_country_league_grade(cname_), 1)
+        return _grade_cache[cname_]
+
+    _grade_str_cache: dict = {}
+
+    def _grade_of(tid_):
+        cname_ = cname_by_tid.get(tid_)
+        if cname_ is None:
+            return "F"
+        if cname_ not in _grade_str_cache:
+            _grade_str_cache[cname_] = get_country_league_grade(cname_)
+        return _grade_str_cache[cname_]
+
+    cname_by_tid = {t["id"]: t["cname"] for t in team_rows}
+
+    prestige_clubs = []  # [(team_id, level), ...]
+    for cname, levels in PRESTIGE_TEAMS.items():
+        for level, names in levels.items():
+            for tname in names:
+                tid = tid_by_name.get((cname, tname))
+                if tid is not None:
+                    prestige_clubs.append((tid, level))
+    random.shuffle(prestige_clubs)  # 등록 순서에 따른 편향 방지
+
+    team_players: dict = {}
+    for r in rows:
+        team_players.setdefault(r["team_id"], []).append(r)
+
+    used_ids: set = set()
+    swap_updates = []
+    log_rows = []
+    _season_row = c.execute("SELECT current_season FROM season_state WHERE id=1").fetchone()
+    _cur_season = _season_row["current_season"] if _season_row else 1
+    n_swaps = 0
+
+    for tid, level in prestige_clubs:
+        squad = team_players.get(tid, [])
+        if not squad:
+            continue
+        dst_rank = _grade_rank_of(tid)
+        lo_pct, hi_pct = PRESTIGE_SCOUT_BAND.get(level, (0.03, 0.10))
+        n_attempts = PRESTIGE_SCOUT_ATTEMPTS_PER_SEASON.get(level, 1)
+        positions = list({p["position"] for p in squad})
+        random.shuffle(positions)
+        for pos in positions[:n_attempts]:
+            weak = min((p for p in squad if p["position"] == pos and p["id"] not in used_ids),
+                       key=lambda p: p["ovr"], default=None)
+            if weak is None:
+                continue
+            pool = pools.get(pos)
+            if not pool:
+                continue
+            rows_sorted, _ = pool
+            n = len(rows_sorted)
+            # [2026-09 수정] 등급별 구간을 서로 안 겹치게 분리 — 위
+            # PRESTIGE_SCOUT_BAND 정의부 주석 참고. hi_cut(구간 시작,
+            # 더 상위)~lo_cut(구간 끝, 더 하위) 사이만 후보로 삼는다.
+            hi_cut = n - max(1, int(n * lo_pct))
+            lo_cut = max(0, n - int(n * hi_pct))
+            top_band = rows_sorted[lo_cut:hi_cut]
+            cands = [r for r in top_band
+                     if r["team_id"] != tid and r["id"] not in used_ids
+                     and r["ovr"] >= weak["ovr"] + PRESTIGE_SCOUT_MIN_GAP
+                     and _grade_rank_of(r["team_id"]) <= dst_rank]
+            if not cands:
+                continue
+            target = random.choice(cands)
+            used_ids.add(weak["id"])
+            used_ids.add(target["id"])
+            # [2026-09 신설, 신민용 요청: "이적이면 연봉이 써지는거고"]
+            # 맞바꾼 두 선수 다 새 소속팀 기준으로 연봉을 다시 계산한다.
+            _tid_cname, _tid_tname, _tid_tier = tinfo_by_tid.get(tid, ("", "", 1))
+            _old_cname, _old_tname, _old_tier = tinfo_by_tid.get(target["team_id"], ("", "", 1))
+            _target_salary = _calc_ai_salary(_grade_of(tid), _tid_tier, target["ovr"],
+                                              _tid_cname, _tid_tname, tid, year)
+            _weak_salary = _calc_ai_salary(_grade_of(target["team_id"]), _old_tier, weak["ovr"],
+                                            _old_cname, _old_tname, target["team_id"], year)
+            from economy import estimate_transfer_fee
+            _fee = estimate_transfer_fee(_grade_of(tid), _tid_tier, target["ovr"],
+                                          country=_tid_cname,
+                                          position=target["position"], year=year) or 0
+            # [2026-09 버그수정, 신민용 리포트: "2005년에 2년 계약했는데
+            # 2007년까지 그대로 뜬다"] 위 _process_contract_renewals와 같은
+            # effective_year 보정 누락 버그 — 여기(명문팀 스카우팅 맞교환)도
+            # 항상 오프시즌 이적(is_mid_season=0, 아래 log_rows 참고)이라
+            # 실제 발효는 year+1부터인데, 만료연도는 발효 전(year) 기준으로
+            # 셌다. 그 결과 "N년 계약"이 표시상 (N-1)년으로 나오는 데 그치지
+            # 않고, _process_contract_renewals의 재계약 판정(contract_end_
+            # year<=year)까지 한 해 늦게 걸려 그 계약이 의도한 기간보다
+            # 1년 더 길게 실제로 유지되는 문제로 이어졌다 — year+1부터
+            # 세도록 통일.
+            _weak_cend = year + 1 + random.randint(3, 5)
+            _target_cend = year + 1 + random.randint(3, 5)
+            swap_updates.append((target["team_id"], _weak_cend, year,
+                                  _weak_salary, weak["id"]))
+            swap_updates.append((tid, _target_cend, year,
+                                  _target_salary, target["id"]))
+            log_rows.append((_cur_season, year, target["id"], target["name"], target["position"],
+                              target["age"] or 25, target["ovr"], target["team_id"], tid,
+                              0, level, 0.0, 0.0, "명문팀 스카우팅", 0, "", _fee, 0, 0,
+                              _target_salary, _target_cend))
+            log_rows.append((_cur_season, year, weak["id"], weak["name"], weak["position"],
+                              weak["age"] or 25, weak["ovr"], tid, target["team_id"],
+                              level, 0, 0.0, 0.0, "명문팀 스카우팅(반대급부)", 0, "", 0, 0, 0,
+                              _weak_salary, _weak_cend))
+            n_swaps += 1
+
+    if swap_updates:
+        c.executemany(
+            "UPDATE ai_players SET team_id=?, contract_end_year=?, last_transfer_year=?, "
+            "salary=? WHERE id=?",
+            swap_updates)
+    if log_rows:
+        c.executemany(
+            """INSERT INTO ai_transfer_log(
+                season, year, player_id, player_name, player_position, player_age, player_ovr,
+                from_team_id, to_team_id, from_team_prestige, to_team_prestige,
+                from_team_avg_ovr, to_team_avg_ovr, transfer_type, is_mid_season, player_role,
+                fee, is_loan, loan_return_year, salary, contract_end_year)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            log_rows)
+    return n_swaps
 
 
 def _retire_and_replace(c, year, ai_rows=None):
@@ -1355,12 +1882,31 @@ def _retire_and_replace(c, year, ai_rows=None):
                     foreign_count_by_team[_bought["team_id"]] = max(
                         0, foreign_count_by_team.get(_bought["team_id"], 0) - 1)
                 team_used_names.setdefault(r["team_id"], set()).add(_bought["name"])
+                # [2026-09 신설, 신민용 요청: "이적이면 연봉이 써지는거고
+                # 오퍼도 있고"] 새 소속팀 기준으로 연봉을 다시 계산하고,
+                # 이적료도 계산해 로그에 남긴다(예전엔 표시용으로만 즉석
+                # 계산하고 버렸는데, 이제 실제로 저장한다).
+                _new_salary = _calc_ai_salary(grade, tier, _bought["ovr"], cname, _tname,
+                                               r["team_id"], year)
+                from economy import estimate_transfer_fee
+                _fee = estimate_transfer_fee(grade, tier, _bought["ovr"], country=cname,
+                                              position=_bought["position"], year=year) or 0
+                # [2026-09 버그수정, 신민용 리포트: "2005년에 2년 계약했는데
+                # 2007년까지 그대로 뜬다"] 위 _process_contract_renewals/
+                # 명문팀 스카우팅과 같은 effective_year 보정 누락 — 여기
+                # (은퇴대체 시장영입)도 항상 오프시즌(is_mid_season=0, 아래
+                # transfer_log_rows 참고)이라 실제 발효는 year+1부터인데
+                # 만료연도를 발효 전(year) 기준으로 셌다. year+1부터 세도록
+                # 통일 — 그래야 표시 기간도 정확해지고, 재계약 판정
+                # (contract_end_year<=year)도 의도한 시점에 걸린다.
+                _bought_cend = year + 1 + random.randint(3, 5)
                 transfer_updates.append((
-                    r["team_id"], year + random.randint(3, 5), year, _bought["id"]))
+                    r["team_id"], _bought_cend, year, _new_salary, _bought["id"]))
                 transfer_log_rows.append((
                     _cur_season, year, _bought["id"], _bought["name"], _bought["position"],
                     _bought["age"] or 25, _bought["ovr"], _bought["team_id"], r["team_id"],
-                    _src_plvl or 0, _plvl or 0, 0.0, 0.0, "은퇴대체 영입", 0, ""))
+                    _src_plvl or 0, _plvl or 0, 0.0, 0.0, "은퇴대체 영입", 0, "", _fee, 0, 0,
+                    _new_salary, _bought_cend))
                 retire_deletes.append((r["id"],))
                 retire_archives.append((r["id"], r["name"], r["position"], r["ovr"], age,
                                          r["nationality"], r["team_id"],
@@ -1437,7 +1983,8 @@ def _retire_and_replace(c, year, ai_rows=None):
         new_rows.append((
             r["team_id"], name, r["position"],
             *[stats[s] for s in ALL_STATS], new_ovr, new_age, new_sub_role, new_nat,
-            year + random.randint(3, 5), 0, year))
+            year + random.randint(3, 5), 0, year,
+            _calc_ai_salary(grade, tier, new_ovr, cname, _tname, r["team_id"], year)))
         retired += 1
 
     if retire_archives:
@@ -1452,8 +1999,8 @@ def _retire_and_replace(c, year, ai_rows=None):
         c.executemany(
             f"""INSERT INTO ai_players
                 (team_id,name,position,{_STAT_COLS},ovr,age,sub_role,nationality,
-                 contract_end_year,last_transfer_year,created_year)
-                VALUES(?,?,?,{','.join('?' for _ in ALL_STATS)},?,?,?,?,?,?,?)""",
+                 contract_end_year,last_transfer_year,created_year,salary)
+                VALUES(?,?,?,{','.join('?' for _ in ALL_STATS)},?,?,?,?,?,?,?,?)""",
             new_rows)
     # [2026-09 신설] 위 "명문팀 은퇴대체 영입" 건 — 신인 INSERT(new_rows)와
     # 완전히 별개라, new_rows가 비어있어도(이번 시즌 유스 생성이 하나도
@@ -1463,15 +2010,17 @@ def _retire_and_replace(c, year, ai_rows=None):
     # — 위로 끌어올려 new_rows와 무관하게 항상 실행되도록 이미 고쳐둠).
     if transfer_updates:
         c.executemany(
-            "UPDATE ai_players SET team_id=?, contract_end_year=?, last_transfer_year=? WHERE id=?",
+            "UPDATE ai_players SET team_id=?, contract_end_year=?, last_transfer_year=?, "
+            "salary=? WHERE id=?",
             transfer_updates)
     if transfer_log_rows:
         c.executemany(
             """INSERT INTO ai_transfer_log(
                 season, year, player_id, player_name, player_position, player_age, player_ovr,
                 from_team_id, to_team_id, from_team_prestige, to_team_prestige,
-                from_team_avg_ovr, to_team_avg_ovr, transfer_type, is_mid_season, player_role)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                from_team_avg_ovr, to_team_avg_ovr, transfer_type, is_mid_season, player_role,
+                fee, is_loan, loan_return_year, salary, contract_end_year)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             transfer_log_rows)
 
     # [2026-08 신설, 진단용] 추적 대상 팀들의 이번 시즌 은퇴/신인 교체 요약을
@@ -1580,8 +2129,9 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
     """
     moved = 0
 
-    from constants import get_country_league_grade
-    from economy import LEAGUE_GRADE_RANK
+    from constants import (get_country_league_grade, AI_LOAN_PROBABILITY_YOUNG,
+                           AI_LOAN_PROBABILITY_OLD, AI_LOAN_DURATION_YEARS)
+    from economy import LEAGUE_GRADE_RANK, estimate_transfer_fee
     # [2026-08 신설, 신민용 리포트: "중간 이적한 해 상반기 팀에 역할이
     # 안 뜬다/떠도 하반기 팀이랑 똑같이 뜬다"] 아래 mover 처리 루프에서
     # is_mid_season일 때만 이적 나가기 직전 역할을 계산하는 데 쓴다 —
@@ -1836,6 +2386,11 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
     # [2026-07 v2] 이적 시 새 계약(2~4년)과 이적연도를 같이 기록한다 —
     # (new_team_id, new_contract_end_year, last_transfer_year, player_id)
     transfer_updates = []
+    # [2026-09 신설, 신민용 요청: "이적이면 연봉이 써지는거고, 이적 종류
+    # (이적/임대)도 구분해야 한다"] transfer_updates(팀/계약/최근이적연도
+    # — 위 안전장치, p_entry 조회 실패해도 항상 실행됨)와 별개로, p_entry를
+    # 확실히 아는 경우에만 연봉/임대여부를 채운다.
+    salary_loan_updates = []   # (salary, on_loan_from_team_id, loan_return_year, player_id)
     # [2026-08 신설, 신민용 요청: "주요 이적도 스페인/프랑스/독일/이탈리아/
     # 잉글랜드 각각 1명씩, 이름도 표시해서 각각 가장 비싼 이적료들을
     # 보여달라"] 예전엔 전세계 통틀어 딱 1건(_big_transfer)만 추적했는데,
@@ -1959,7 +2514,17 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
                     pool_cache=_pool_meta_cache, sw_by_tid=_sw_by_tid)
                 if result:
                     for new_tid, pid, old_tid in result:
-                        new_contract_end = year + random.randint(2, 4)
+                        # [2026-09 버그수정, 신민용 리포트: "2005년에 2년
+                        # 계약했는데 2007년까지 그대로 뜬다"] 위
+                        # _process_contract_renewals와 같은 effective_year
+                        # 보정 누락 — 여기(일반 이적시장)는 is_mid_season에
+                        # 따라 발효시점이 갈린다(겨울 이적은 그 해 그대로,
+                        # 오프시즌 이적은 다음 해부터 — get_ai_player_
+                        # salary_history 정의부 주석 참고). 오프시즌일 때만
+                        # year+1부터 세야 의도한 기간이 정확히 표시되고,
+                        # 재계약 판정(contract_end_year<=year)도 한 해
+                        # 일찍 당겨져 의도한 시점에 걸린다.
+                        new_contract_end = (year if is_mid_season else year + 1) + random.randint(2, 4)
                         transfer_updates.append((new_tid, new_contract_end, year, pid))
                         # [2026-08 성능 수정, 신민용 리포트: "52주차→1주차 렉"]
                         # 예전엔 이동한 선수를 원 소속팀 리스트에서 지울 때
@@ -2017,13 +2582,41 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
                                 _actual_ttype = "국내 타부수"
                             else:
                                 _actual_ttype = "국제 이동"
+                            # [2026-09 신설, 신민용 요청: "이적 종류(이적/임대)도
+                            # 구분하고, 이적이면 연봉이 써지는거고 이적료도 있어야
+                            # 한다"] p_entry(포지션/나이/OVR)를 아는 이 시점에서만
+                            # 계산 가능 — 어릴수록(23세 이하) 임대로 가는 비율이
+                            # 높다(AI_LOAN_PROBABILITY_*, "AI는 단순해야 한다"
+                            # 원칙대로 나이 하나만으로 가볍게 가른다).
+                            _dst_row2s = team_row_by_tid.get(new_tid)
+                            _dst_grade2 = dst_grade_by_tid.get(new_tid, "F")
+                            _dst_tier2 = _dst_row2s["tier"] if _dst_row2s else 1
+                            _dst_cname2 = _dst_row2s["cname"] if _dst_row2s else ""
+                            _dst_tname2 = _dst_row2s["tname"] if _dst_row2s else ""
+                            _p_ovr2 = p_entry.get("ovr", 50)
+                            _p_age2 = p_entry.get("age", 25)
+                            _is_loan = random.random() < (
+                                AI_LOAN_PROBABILITY_YOUNG if _p_age2 <= 23 else AI_LOAN_PROBABILITY_OLD)
+                            _loan_return2 = year + random.randint(*AI_LOAN_DURATION_YEARS) if _is_loan else 0
+                            _new_salary2 = _calc_ai_salary(_dst_grade2, _dst_tier2, _p_ovr2,
+                                                            _dst_cname2, _dst_tname2, new_tid, year)
+                            _fee2 = estimate_transfer_fee(_dst_grade2, _dst_tier2, _p_ovr2,
+                                                           country=_dst_cname2,
+                                                           position=p_entry.get("position"),
+                                                           year=year) or 0
+                            if _is_loan:
+                                _fee2 = int(_fee2 * 0.1)  # 임대료는 완전이적료의 일부만
+                            salary_loan_updates.append((
+                                _new_salary2, old_tid if _is_loan else 0, _loan_return2, pid))
                             transfer_log_rows.append((
                                 _cur_season, year, pid, p_entry.get("name", ""), p_entry.get("position", ""),
                                 p_entry.get("age", 0), p_entry.get("ovr", 0),
                                 old_tid, new_tid,
                                 team_prestige.get(old_tid, 0), team_prestige.get(new_tid, 0),
                                 round(team_avg.get(old_tid, 0), 2), round(team_avg.get(new_tid, 0), 2),
-                                _actual_ttype, 1 if is_mid_season else 0, _dep_role))
+                                _actual_ttype, 1 if is_mid_season else 0, _dep_role,
+                                _fee2, 1 if _is_loan else 0, _loan_return2, _new_salary2,
+                                new_contract_end))
                             # [2026-08 신설, 신민용 요청: "우리팀에 누가
                             # 나가고 누가 들어왔는지"] 우리 팀이 관여한
                             # 건이면(방출 또는 영입) 별도로 모아둔다 —
@@ -2060,13 +2653,22 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
         c.executemany(
             "UPDATE ai_players SET team_id=?, contract_end_year=?, last_transfer_year=? WHERE id=?",
             transfer_updates)
+    if salary_loan_updates:
+        # [2026-09 신설] 위 transfer_updates와 순서 무관 — 대상 컬럼이
+        # 겹치지 않으므로(team_id/contract_end_year/last_transfer_year 대
+        # salary/on_loan_from_team_id/loan_return_year) 어느 쪽이 먼저
+        # 적용돼도 결과가 같다.
+        c.executemany(
+            "UPDATE ai_players SET salary=?, on_loan_from_team_id=?, loan_return_year=? WHERE id=?",
+            salary_loan_updates)
     if transfer_log_rows:
         c.executemany(
             """INSERT INTO ai_transfer_log(
                 season, year, player_id, player_name, player_position, player_age, player_ovr,
                 from_team_id, to_team_id, from_team_prestige, to_team_prestige,
-                from_team_avg_ovr, to_team_avg_ovr, transfer_type, is_mid_season, player_role)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                from_team_avg_ovr, to_team_avg_ovr, transfer_type, is_mid_season, player_role,
+                fee, is_loan, loan_return_year, salary, contract_end_year)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             transfer_log_rows)
     _tm5 = _time_tm.perf_counter()
     print(f"[PERF-TM]  teams조회(서브쿼리포함) {_tm1-_tm0:.3f}s | "
@@ -3072,7 +3674,7 @@ def _snapshot_season_ratings(c, year):
     쓰는 것과 동일한 원본 데이터)로 바꿔서 같은 _estimate_ai_season
     공식에 넣는다. 그 팀이 그 해 그 대회에 아예 안 나갔으면(경기수 0)
     그 팀 선수들은 그 대회 행 자체가 안 생긴다."""
-    from game_engine import _estimate_ai_season
+    from game_engine import _estimate_ai_season, _estimate_ai_clean_sheets, _estimate_ai_gk_saves
 
     rows = c.execute(
         """SELECT ap.id AS id, ap.position AS position, ap.ovr AS ovr,
@@ -3110,13 +3712,30 @@ def _snapshot_season_ratings(c, year):
         g, a, rt = _estimate_ai_season(
             r["ovr"] or 0, r["position"], team_avg.get(tid, 50.0),
             league_avg.get(lid, 50.0), r["sub_role"], full_season_matches=fsm)
-        inserts.append((r["id"], year, tid, fsm, g, a, rt))
+        # [2026-09 신설, 신민용 요청: "GK들은 골 어시보단 선방률 이런걸로
+        # 표시해야 하잖아"] 골/도움과 별개로 클린시트(무실점 경기 수)도
+        # 같이 추정한다 — GK가 아닌 포지션도 값 자체는 계산·저장해두지만
+        # (계산 비용이 적어 굳이 분기할 필요 없음), 화면에서 GK만 이
+        # 값을 골/도움 대신 보여준다(world_browser_window.py).
+        cs = _estimate_ai_clean_sheets(
+            r["position"], r["ovr"] or 0, team_avg.get(tid, 50.0),
+            league_avg.get(lid, 50.0), full_season_matches=fsm)
+        # [2026-09 재수정, 신민용 요청: "클린시트 말고 선방:14 실점:1
+        # 선방률:93.5%로 떠야한다"] game_engine._estimate_ai_gk_saves
+        # 정의부 주석 참고 — GK만 의미 있는 값이라 GK일 때만 계산한다
+        # (그 외 포지션은 컬럼 기본값 0 그대로).
+        saves = goals_conceded = 0
+        if r["position"] == "GK":
+            saves, goals_conceded = _estimate_ai_gk_saves(
+                r["ovr"] or 0, team_avg.get(tid, 50.0), league_avg.get(lid, 50.0),
+                full_season_matches=fsm)
+        inserts.append((r["id"], year, tid, fsm, g, a, rt, cs, saves, goals_conceded))
 
     inserts.sort(key=lambda t: (t[0], t[1]))
     c.executemany(
         "INSERT OR REPLACE INTO hist.ai_player_season_stats"
-        "(player_id, year, team_id, matches, goals, assists, rating) "
-        "VALUES (?,?,?,?,?,?,?)", inserts)
+        "(player_id, year, team_id, matches, goals, assists, rating, clean_sheets, saves, goals_conceded) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)", inserts)
 
     # [2026-09 신설] 대회별(국내컵/클럽대항전/슈퍼컵/클럽월드컵) 추정치 —
     # 위 리그와 완전히 같은 공식·team_avg/league_avg를 재사용하되, 이번
@@ -3159,14 +3778,98 @@ def _snapshot_season_ratings(c, year):
             g, a, rt = _estimate_ai_season(
                 r["ovr"] or 0, r["position"], team_avg.get(tid, 50.0),
                 league_avg.get(lid, 50.0), r["sub_role"], full_season_matches=fsm)
-            by_comp_inserts.append((r["id"], year, comp, fsm, g, a, rt))
+            cs = _estimate_ai_clean_sheets(
+                r["position"], r["ovr"] or 0, team_avg.get(tid, 50.0),
+                league_avg.get(lid, 50.0), full_season_matches=fsm)
+            saves = goals_conceded = 0
+            if r["position"] == "GK":
+                saves, goals_conceded = _estimate_ai_gk_saves(
+                    r["ovr"] or 0, team_avg.get(tid, 50.0), league_avg.get(lid, 50.0),
+                    full_season_matches=fsm)
+            by_comp_inserts.append((r["id"], year, comp, fsm, g, a, rt, cs, saves, goals_conceded))
 
     if by_comp_inserts:
         by_comp_inserts.sort(key=lambda t: (t[0], t[1], t[2]))
         c.executemany(
             "INSERT OR REPLACE INTO hist.ai_player_season_stats_by_comp"
-            "(player_id, year, competition, matches, goals, assists, rating) "
-            "VALUES (?,?,?,?,?,?,?)", by_comp_inserts)
+            "(player_id, year, competition, matches, goals, assists, rating, clean_sheets, saves, goals_conceded) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)", by_comp_inserts)
+
+
+def _snapshot_intl_season_ratings(c, year):
+    """[2026-09 신설, 신민용 요청: "국가대표에도 평점이랑 골 어시 이런걸
+    넣고 싶어"] 위 _snapshot_season_ratings(클럽)와 완전히 같은 원리 —
+    개별 국제경기를 실제로 시뮬레이션하지 않으므로(세계 전역 수만 명분
+    불가능), game_engine._estimate_ai_season/_estimate_ai_clean_sheets로
+    즉석 추정해 intl_squad(rating/goals/assists/clean_sheets 컬럼, 위
+    마이그레이션 참고)에 저장한다.
+
+    이 게임은 모든 국제대회가 "1년 단위 완결"(기존 확정 설계)이므로
+    이 해(t.year=year)에 열린 대회의 intl_squad 행만 대상으로 하면
+    충분하다 — run_ai_offseason 초반(로스터가 은퇴/이적으로 바뀌기 전,
+    _snapshot_season_ratings와 동일 타이밍)에 호출하면 그 대회는 이미
+    끝나 appearances가 최종값으로 확정돼 있다.
+
+    team_avg/league_avg 대응: 클럽의 "소속팀 평균 OVR"/"리그 평균 OVR"에
+    맞춰, 국제대회에서는 "이 선수의 국가대표팀(같은 대회·같은 국가)
+    평균 OVR"/"이 대회 전체 참가국 평균 OVR"을 쓴다 — 상대적으로 더
+    강한 대표팀 소속일수록(그 대회 평균 대비) 골/도움/평점이 소폭
+    더 높게 나오는 클럽 쪽과 같은 논리. full_season_matches는 그 선수의
+    실제 출전 횟수(appearances, bump_intl_squad_appearances가 경기마다
+    올린 실측값)를 그대로 쓴다 — 클럽처럼 "이 팀이 몇 경기짜리 시즌을
+    뛰었는지" 유추할 필요 없이 이미 정확한 값이 있다.
+
+    [한계] intl_squad 자체가 2026-08 신설이라 그 이전 대회는 소급 불가
+    (클럽 ai_player_season_stats와 동일 원칙) — appearances=0인 행(실제
+    출전 없이 명단에만 있던 선수)은 저장할 통계가 없어 건너뛴다."""
+    from game_engine import _estimate_ai_season, _estimate_ai_clean_sheets, _estimate_ai_gk_saves
+
+    rows = c.execute(
+        """SELECT s.tournament_id, s.country, s.player_id, s.appearances,
+                  ap.position AS position, ap.ovr AS ovr, ap.sub_role AS sub_role
+           FROM intl_squad s
+           JOIN intl_tournaments t ON t.id = s.tournament_id
+           JOIN ai_players ap ON ap.id = s.player_id
+           WHERE t.year=? AND s.appearances > 0""", (year,)).fetchall()
+    if not rows:
+        return
+
+    # (tournament_id, country) 단위 대표팀 평균 OVR + tournament_id 단위
+    # 전체 참가국 평균 OVR("이 대회 수준") — 한 번의 스캔으로 동시 집계.
+    team_ovr_sum, team_ovr_n = {}, {}
+    tourney_ovr_sum, tourney_ovr_n = {}, {}
+    for r in rows:
+        key = (r["tournament_id"], r["country"])
+        ovr = r["ovr"] or 0
+        team_ovr_sum[key] = team_ovr_sum.get(key, 0) + ovr
+        team_ovr_n[key] = team_ovr_n.get(key, 0) + 1
+        tourney_ovr_sum[r["tournament_id"]] = tourney_ovr_sum.get(r["tournament_id"], 0) + ovr
+        tourney_ovr_n[r["tournament_id"]] = tourney_ovr_n.get(r["tournament_id"], 0) + 1
+
+    team_avg = {k: team_ovr_sum[k] / team_ovr_n[k] for k in team_ovr_sum}
+    tourney_avg = {k: tourney_ovr_sum[k] / tourney_ovr_n[k] for k in tourney_ovr_sum}
+
+    updates = []
+    for r in rows:
+        key = (r["tournament_id"], r["country"])
+        t_avg = team_avg.get(key, r["ovr"] or 50.0)
+        l_avg = tourney_avg.get(r["tournament_id"], t_avg)
+        fsm = r["appearances"]
+        g, a, rt = _estimate_ai_season(r["ovr"] or 0, r["position"], t_avg, l_avg,
+                                        r["sub_role"], full_season_matches=fsm)
+        cs = _estimate_ai_clean_sheets(r["position"], r["ovr"] or 0, t_avg, l_avg,
+                                        full_season_matches=fsm)
+        saves = goals_conceded = 0
+        if r["position"] == "GK":
+            saves, goals_conceded = _estimate_ai_gk_saves(r["ovr"] or 0, t_avg, l_avg,
+                                                            full_season_matches=fsm)
+        updates.append((rt, g, a, cs, saves, goals_conceded,
+                        r["tournament_id"], r["country"], r["player_id"]))
+
+    updates.sort(key=lambda t: (t[6], t[7], t[8]))
+    c.executemany(
+        "UPDATE intl_squad SET rating=?, goals=?, assists=?, clean_sheets=?, saves=?, goals_conceded=? "
+        "WHERE tournament_id=? AND country=? AND player_id=?", updates)
 
 
 def seed_initial_position_history(year):

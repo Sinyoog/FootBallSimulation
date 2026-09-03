@@ -1662,7 +1662,29 @@ def advance_4weeks(schedule: list):
         flush_log_buffer()
 
 
-def advance_days(schedule: list, progress_cb=None):
+def advance_days(*args, **kwargs):
+    """[진단 래퍼] 주 진행 전체가 몇 초 걸렸는지 파일에 남긴다.
+
+    [왜 필요한가] "진행 중..." 오버레이가 7초 넘게 떠 있는데, 그게 전부
+    라이브 시뮬 때문이라고 가정하고 프리페치만 고쳤다 — 그건 검증되지 않은
+    가정이었다. 이 함수 안에서는 675개 리그 AI 경기(_sim_all_ai_matches),
+    컵/챔스 주간 처리, 훈련·부상·이적·순위 재계산이 전부 돌아간다. 라이브
+    시뮬은 그중 하나일 뿐이다.
+
+    총 시간을 먼저 재야 어디를 고쳐야 하는지 정해진다. 기존 [PERF-WEEK]/
+    [PERF-SIM]은 print라 PyQt 앱에서 안 보였다 — 같이 파일로 돌렸다.
+    """
+    import time as _t_adv
+    _t0 = _t_adv.perf_counter()
+    try:
+        return _advance_days_impl(*args, **kwargs)
+    finally:
+        _el = _t_adv.perf_counter() - _t0
+        if _el >= 0.3:
+            _live_debug("[진행 총계] %.2f초" % _el)
+
+
+def _advance_days_impl(schedule: list, progress_cb=None):
     """[2026-07 일 단위 진행] schedule 길이만큼 '하루씩 원자적으로' 전진시킨다.
 
     설계 핵심 — 검증된 advance_4weeks(주 단위 엔진)를 그대로 재사용:
@@ -1857,8 +1879,8 @@ def advance_days(schedule: list, progress_cb=None):
                 _sim_my_unscheduled_match(week, p, cur_season, day=day)
 
         _dispatch_total = _time_day.perf_counter() - _day_t0
-        if _dispatch_total >= 0.1:
-            print(f"[PERF-DISPATCH] {week}주차 {day}일차 경기/훈련 처리 {_dispatch_total:.3f}s "
+        if _dispatch_total >= 0.05:
+            _live_debug(f"[PERF-DISPATCH] {week}주차 {day}일차 경기/훈련 처리 {_dispatch_total:.3f}s "
                   f"(stype={stype!r})")
 
         is_week_last_day = (day % DAYS_PER_WEEK == 0)
@@ -1908,7 +1930,7 @@ def advance_days(schedule: list, progress_cb=None):
         # 버그수정 주석과 동일한 이유).
         super_cup_engine.process_super_cup_week(week, day=day)
         if _diw_t2 - _diw_t0 >= 0.05:
-            print(f"[PERF-DAILYHOOK] {week}주차 {day}일차: "
+            _live_debug(f"[PERF-DAILYHOOK] {week}주차 {day}일차: "
                   f"process_intl_week {_diw_t1-_diw_t0:.3f}s | "
                   f"process_cwc_week {_diw_t2-_diw_t1:.3f}s")
 
@@ -1951,7 +1973,7 @@ def advance_days(schedule: list, progress_cb=None):
             except Exception:
                 pass
             _t43_3 = _time_43.perf_counter()
-            print(f"[PERF-YEAR] {week}주차(CLUB_SEASON_END_DAY) 세부: "
+            _live_debug(f"[PERF-YEAR] {week}주차(CLUB_SEASON_END_DAY) 세부: "
                   f"finalize_club_season={_t43_1-_t43_0:.3f}s | "
                   f"promotion_playoffs={_t43_2-_t43_1:.3f}s | "
                   f"PRAGMA optimize={_t43_3-_t43_2:.3f}s")
@@ -1964,7 +1986,7 @@ def advance_days(schedule: list, progress_cb=None):
         promotion_playoff_engine.process_po_week(week, day=day)
         _t_po1 = _time_diw.perf_counter()
         if _t_po1 - _t_po0 >= 0.05:
-            print(f"[PERF-DAILYHOOK] {week}주차 {day}일차: process_po_week {_t_po1-_t_po0:.3f}s")
+            _live_debug(f"[PERF-DAILYHOOK] {week}주차 {day}일차: process_po_week {_t_po1-_t_po0:.3f}s")
 
 
         _do_flush = False
@@ -1991,11 +2013,14 @@ def advance_days(schedule: list, progress_cb=None):
             _sim_all_ai_matches(week, p.get("current_league_id", 0), cur_season)
             _pw_t5 = _time_mod.perf_counter()
             _pw_total = _pw_t5 - _pw_t0
-            if _pw_total >= 0.3:
-                print(f"[PERF-WEEK] {week}주차 마무리 {_pw_total:.2f}s "
-                      f"(국제대회 {_pw_t1-_pw_t0:.2f}s | 챔스 {_pw_t2-_pw_t1:.2f}s | "
-                      f"클럽WC {_pw_t3-_pw_t2:.2f}s | 국내컵 {_pw_t4-_pw_t3:.2f}s | "
-                      f"리그시뮬 {_pw_t5-_pw_t4:.2f}s)")
+            if _pw_total >= 0.05:
+                # [진단] print는 PyQt 앱에서 콘솔이 없어 아무도 못 본다.
+                # 파일로 남겨야 실제로 확인된다.
+                _live_debug(
+                    f"[주 마무리] {week}주차 {_pw_total:.2f}s "
+                    f"(국제대회 {_pw_t1-_pw_t0:.2f}s | 챔스 {_pw_t2-_pw_t1:.2f}s | "
+                    f"클럽WC {_pw_t3-_pw_t2:.2f}s | 국내컵 {_pw_t4-_pw_t3:.2f}s | "
+                    f"리그시뮬 {_pw_t5-_pw_t4:.2f}s)")
 
             p_latest = get_player()
             # [2026-07 수정, 신민용 지적: "축구는 주급으로 준다"] 4주마다
@@ -2021,7 +2046,7 @@ def advance_days(schedule: list, progress_cb=None):
             _advance_week(p_latest, week, 1, progress_cb=progress_cb)   # current_week/year/season 갱신(검증된 로직)
             _pw2_t2 = _time_pw2.perf_counter()
             if _pw2_t2 - _pw2_t0 >= 0.1:
-                print(f"[PERF-WEEKTAIL] {week}주차: _pay_salary {_pw2_t1-_pw2_t0:.3f}s | "
+                _live_debug(f"[PERF-WEEKTAIL] {week}주차: _pay_salary {_pw2_t1-_pw2_t0:.3f}s | "
                       f"_advance_week {_pw2_t2-_pw2_t1:.3f}s")
 
         # current_day 전진 (주/연도 경계와 무관하게 매일 정확히 1회).
@@ -2089,8 +2114,8 @@ def advance_days(schedule: list, progress_cb=None):
         flush_log_buffer()
 
         _day_total = _time_day.perf_counter() - _day_t0
-        if _day_total >= 0.1:
-            print(f"[PERF-DAY] {week}주차 {day}일차 처리 {_day_total:.3f}s "
+        if _day_total >= 0.05:
+            _live_debug(f"[PERF-DAY] {week}주차 {day}일차 처리 {_day_total:.3f}s "
                   f"(stype={stype!r} | 그주마지막날={is_week_last_day} | "
                   f"경기있음={_had_match} | 부상={bool(p.get('injured'))})")
 
@@ -2359,8 +2384,8 @@ def _sim_all_ai_matches(week, my_league_id, season):
     conn.close()
     _sim_t4 = _time_sim.perf_counter()
     _sim_total = _sim_t4 - _sim_t0
-    if _sim_total >= 0.1:
-        print(f"[PERF-SIM]  _sim_all_ai_matches({week}주차, {len(matches)}경기, "
+    if _sim_total >= 0.05:
+        _live_debug(f"[AI리그] {week}주차 {len(matches)}경기, "
               f"OVR캐시 {_sim_ovr_cache_hits_before}→{len(_team_ovr_cache)}) 세부: "
               f"경기조회 {_sim_t1-_sim_t0:.3f}s | 시뮬루프 {_sim_t2-_sim_t1:.3f}s | "
               f"executemany({len(batch_results)}건) {_sim_t3-_sim_t2:.3f}s | "
@@ -3199,7 +3224,31 @@ def _age_curve_mult(age):
     return 1.0
 
 
+def _live_debug(msg):
+    """[2026-09 진단] 라이브 시뮬이 실제로 쓰였는지를 파일에 남긴다.
+
+    PyQt 앱은 콘솔이 안 보이는 경우가 많아 print로는 확인이 안 된다.
+    game_engine.py 옆에 live_sim.log 를 만들어 한 줄씩 덧붙인다.
+    실패해도 게임 진행을 막으면 안 되므로 전부 감싼다.
+    """
+    try:
+        import os
+        import datetime
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "live_sim.log")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("[%s] %s\n"
+                    % (datetime.datetime.now().strftime("%m-%d %H:%M:%S"), msg))
+    except Exception:
+        pass
+
+
 def _simulate_match(p, week, info: dict, day=None):
+    # [계측] 라이브 물리엔진 제거(2026-09) 이후엔 이 함수 전체가 수 ms
+    # 수준이어야 정상이다 — 구간별 소요시간은 여전히 남겨둬서(_sm) 혹시
+    # 다시 느려지면 어디가 범인인지 바로 보이게 한다.
+    import time as _t_sm
+    _sm = [("진입", _t_sm.perf_counter())]
     conn = get_conn()
     c = conn.cursor()
     st = get_state()  # 현재 게임 상태 (연도 등)
@@ -3283,8 +3332,52 @@ def _simulate_match(p, week, info: dict, day=None):
     # 예외가 나도 경기 진행 자체가 막히면 안 되므로, 실패 시 예전 방식
     # (OVR 차이 확률표)으로 조용히 폴백한다.
     engine_stats = None
+    engine_detail = None
     engine_plog = None
     player_ratings = None
+    scorer_ratings = None
+    # [2026-09 제거, 신민용 확정: "경기 시뮬레이션(라이브 물리엔진)이
+    # 최적화를 너무 잡아먹는다 — 시뮬 영상은 완전히 없애고 통계·평점은
+    # 그대로 유지"]
+    #
+    # 예전엔 여기서 물리 기반 라이브 시뮬(match_sim/live/, 90분을
+    # dt=0.12초 단위로 22명 전원 실제 이동/판단시켜 스코어를 뽑는 방식)을
+    # 돌렸다. 실측 순수계산 7.5초, 백그라운드 프리페치(주 진행 직후 미리
+    # 돌려서 매치데이엔 0초로 숨기는 장치)를 붙여도 실전 로그 기준
+    # 19~24초씩 그대로 진행이 막혔다 — 45,000 물리스텝×22명이 근본
+    # 비용이라(prefetch.py 주석 참고) 계산량 자체를 줄이는 튜닝으론
+    # 15%밖에 못 줄였다.
+    #
+    # tactical_engine(포메이션 레인별 공격/수비 매치업을 분 단위로 굴리는
+    # 가벼운 엔진, 원래도 라이브 시뮬 실패 시 폴백으로 이미 쓰이고 있었음)
+    # 으로 완전히 대체한다. 같은 라인업으로 실측 0.002초(약 3,700배)이고
+    # 스코어/스탯/평점(player_ratings)/possession_log 전부 라이브 시뮬과
+    # 동일한 포맷으로 나온다. 유일하게 사라지는 건 "▶ 시뮬 보기" 2D
+    # 애니메이션(공/22명 좌표는 물리엔진에만 있던 데이터라 여기엔 없음) —
+    # ui/match_sim_viewer.py와 그 진입 버튼도 같이 제거했다.
+    #
+    # [득점자 표시] tactical_engine의 possession_log는 골마다 실제
+    # scorer_id를 남기므로(_resolve_shot), 내가 관여 안 한 우리 팀
+    # 득점도 이제 실명(masked 표시명)으로 보여줄 수 있다 —
+    # _augment_events_with_names 참고. 예전엔 "이름 없이 문구만"이었는데,
+    # 그건 당시(로스터에서 랜덤으로 이름을 뽑던 시절) 이름이 뒤죽박죽
+    # 나와서 그랬던 것이지 지금은 실제 시뮬이 계산한 진짜 득점자라 문제
+    # 없다.
+    #
+    # [정합성] 라이브 엔진은 "나"도 22명 중 하나로 직접 시뮬레이션해서
+    # 개인기록이 팀 스코어와 항상 100% 맞물렸었다. tactical_engine엔
+    # "나"가 없어서(AI 로스터만 시뮬) 내 골/도움은 여전히 _player_perf가
+    # 별도로 굴리지만, my_score를 상한으로 클램프하므로(goals=min(goals,
+    # my_score), 어시도 (my_score-goals) 이내로 cap — _player_perf 참고)
+    # 숫자 자체가 어긋나는 일은 없다. 상세화면 타임라인의 분(分)이 팀
+    # possession_log 필러와 초 단위로 살짝 어긋날 수는 있지만, 예전에
+    # 문제였던 "스코어보드 0-0인데 영상엔 29분골"류의 눈에 띄는 모순은
+    # 그 영상 자체가 없어졌으니 원천적으로 재발할 수 없다.
+    #
+    # tactical_engine이 예외를 던져도(라인업 조회 실패 등) 경기 진행
+    # 자체가 막히면 안 되므로, 그럴 땐 예전 OVR 확률표로 조용히 내려간다.
+    live_record = None
+    _sm.append(("준비(OVR/라인업/징계)", _t_sm.perf_counter()))
     try:
         from match_sim.tactical_engine import simulate_my_match
         home_formation = _team_formation(c, home_id)
@@ -3298,19 +3391,20 @@ def _simulate_match(p, week, info: dict, day=None):
             home_adv=_home_advantage())
         hs, as_ = sim["home_score"], sim["away_score"]
         engine_stats = {"home": sim["home_stats"], "away": sim["away_stats"]}
+        engine_detail = {"home": sim.get("home_stats_detail"), "away": sim.get("away_stats_detail")}
         engine_plog = sim["possession_log"]
-        # [2026-08 신설, 신민용 요청: "경기 시뮬레이션에 다른 선수들
-        # OVR·스탯도 반영해서 정교화하고, 경기 상세에서 22명 평점을
-        # 보여달라"] 전술엔진이 이미 계산한 22명 개인 기록+평점을 그대로
-        # 받아 저장 단계(_write_match_log → _save_match_detail)로 넘긴다.
         player_ratings = {"home": sim.get("home_player_ratings") or [],
                           "away": sim.get("away_player_ratings") or []}
+        # [2026-09 신설] 아래에서 "내 슬롯"을 내 실제 기록으로 덮어쓰기
+        # 전에, 득점자 이름 조회용으로 원본(치환 전) 스냅샷을 따로
+        # 떠둔다. player_ratings는 이 뒤에서 리스트 안 dict를 제자리
+        # 치환하므로, 얕은 복사라도 안 해두면 실제로 그 자리에서 골을
+        # 넣은 AI의 이름이 사라져(내 슬롯으로 덮여) "우리 팀 나머지
+        # 득점"에 이름이 안 붙는 경우가 생긴다(내가 그 자리를 맡은
+        # 포지션에서, 내가 안 넣은 골이 그 슬롯 선수 골이었던 드문 case).
+        scorer_ratings = {"home": [dict(r) if r else None for r in player_ratings["home"]],
+                          "away": [dict(r) if r else None for r in player_ratings["away"]]}
         outcome = "draw" if hs == as_ else ("home" if hs > as_ else "away")
-        # [정리] 이전엔 여기서 diff(홈-원정 전력차)를 다시 계산했는데, hs/as_는
-        # 이미 위 전술엔진(simulate_my_match)이 정한 값이라 이 diff는 outcome/
-        # 스코어 어디에도 쓰이지 않는 죽은 변수였다. 게다가 _home_advantage()를
-        # 여기서 한 번 더 호출해 위(home_adv=...)에서 뽑은 값과 다른 난수를
-        # 낭비하고 있었다 — 결과에 영향은 없었지만 불필요한 계산이라 제거.
     except Exception:
         home_ovr2 = home_ovr + (bonus if is_home else 0.0)
         away_ovr2 = away_ovr + (bonus if not is_home else 0.0)
@@ -3341,6 +3435,7 @@ def _simulate_match(p, week, info: dict, day=None):
         _opp_sot = None
         if engine_stats is not None and my_position == "GK":
             _opp_sot = engine_stats["away"]["shots_on"] if is_home else engine_stats["home"]["shots_on"]
+        _sm.append(("경기결정(tactical)", _t_sm.perf_counter()))
         goals, assists, saves, rating, events, detail = _player_perf(
             p, outcome, is_home, hs, as_, c=c, opp_ovr=_opp_ovr, opp_sot=_opp_sot)
         if p.get("slump"):
@@ -3356,16 +3451,20 @@ def _simulate_match(p, week, info: dict, day=None):
         elif _yellow_ev:
             events = list(events) + _yellow_ev
 
+        # [2026-09 정리] 라이브 물리엔진이 있던 시절엔 여기서 "나"를 시뮬
+        # 안 22명 중 하나(my_slot)로 취급해 내 골/도움을 그 결과로 통째로
+        # 덮어썼다(팀 스코어와 100% 정합 보장 목적). tactical_engine엔
+        # "나"가 없으므로 그 자리를 그냥 뺐다 — 위 _player_perf가 이미
+        # my_score를 상한으로 클램프해서 계산하므로(goals=min(goals,
+        # my_score) 등) 골/도움 개수 자체는 여전히 팀 스코어를 넘지 않는다.
+
         # [2026-08 신설, 신민용 요청: "경기 상세에서 22명 평점 보여줄 때
         # 나도 당연히 껴야지"] player_ratings의 22명은 전술엔진이 실제
         # ai_players 로스터에서 뽑은 11명씩(_select_lineup)이라 "나"는
-        # 애초에 그 안에 없다(내 개인 기록은 my_player 테이블 별도 관리 —
-        # match_sim_viewer.py가 이미 같은 이유로 "my_slot" 개념을 따로
-        # 쓰는 것과 동일한 사정). 내 포지션과 라벨이 같은 슬롯을 찾아
-        # 그 자리를 방금 계산된 내 실제 기록(goals/assists/saves/rating)
-        # 으로 통째로 바꿔치기한다 — _find_my_slot(ui/match_sim_viewer.py)
-        # 과 똑같은 우선순위(정확 일치 → POSITION_COMPAT 호환 → GK 아닌
-        # 아무 자리)로 슬롯을 고른다.
+        # 애초에 그 안에 없다(내 개인 기록은 my_player 테이블 별도 관리).
+        # 내 포지션과 라벨이 같은 슬롯을 찾아 그 자리를 방금 계산된 내
+        # 실제 기록(goals/assists/saves/rating)으로 통째로 바꿔치기한다
+        # (정확 일치 → POSITION_COMPAT 호환 → GK 아닌 아무 자리 순).
         if player_ratings is not None:
             _side_key = "home" if is_home else "away"
             _my_list = player_ratings.get(_side_key)
@@ -3423,6 +3522,7 @@ def _simulate_match(p, week, info: dict, day=None):
     my_result = _my_result(outcome, is_home)
 
     # 팀 전적 업데이트 (같은 conn 내에서)
+    _sm.append(("개인성적/카드", _t_sm.perf_counter()))
     _update_team_rec(c, home_id, away_id, outcome, hs, as_)
 
     # [2026-08 v3.2 신설, 신민용 지적: "내가 직접 하는 경기도 결과로
@@ -3494,6 +3594,7 @@ def _simulate_match(p, week, info: dict, day=None):
         )
 
     # [최적화] get_player 재조회 없이 p에서 직접 계산 후 update_player 1회 통합
+    _sm.append(("팀전적반영", _t_sm.perf_counter()))
     new_rel = _calc_manager_rel(p, rating, my_result, played)
     # [2026-07 신설] 인기도가 리그 등급을 반영하도록 이 경기 리그의 등급을
     # 조회한다(위에서 이미 conn을 닫았으므로 짧게 새로 연다) — 실패해도
@@ -3635,12 +3736,24 @@ def _simulate_match(p, week, info: dict, day=None):
                   stress=ns, happiness=nh, injury_load=new_load,
                   **mental_updates, **_injury_extra_updates)
 
+    _sm.append(("스탯/관계/부상", _t_sm.perf_counter()))
     _write_match_log(p, week, info["league_name"], is_home,
                      home_id, away_id, hs, as_,
                      my_result, goals, assists, saves, rating, events, played, benched,
-                     detail=detail, engine_stats=engine_stats, engine_plog=engine_plog, day=day,
-                     player_ratings=player_ratings)
+                     detail=detail, engine_stats=engine_stats, engine_detail=engine_detail,
+                     engine_plog=engine_plog, day=day,
+                     player_ratings=player_ratings, scorer_ratings=scorer_ratings,
+                     live_record=live_record)
 
+    _sm.append(("경기기록저장", _t_sm.perf_counter()))
+    try:
+        _tot = _sm[-1][1] - _sm[0][1]
+        if _tot >= 0.05:
+            _parts = " | ".join("%s %.2fs" % (_sm[k][0], _sm[k][1] - _sm[k - 1][1])
+                                for k in range(1, len(_sm)))
+            _live_debug("[내경기] %.2fs — %s" % (_tot, _parts))
+    except Exception:
+        pass
 
 _team_prestige_cache: dict = {}
 PRESTIGE_MATCH_BONUS = 8.0
@@ -5522,13 +5635,15 @@ def _update_pop(p, goals, assists, rating):
 
 
 def _derive_match_stats(is_home, hs, as_, goals, assists, saves, pos, detail, engine_stats=None):
-    """[경기 통계] 점유율/슈팅/코너/파울/패스성공률을 만든다.
+    """[경기 통계] 점유율/슈팅/코너/파울/패스성공률/오프사이드/카드/세이브
+    — 실제 중계화면에 뜨는 "표시용" 10개를 만든다.
 
     [신규] engine_stats가 주어지면(내 경기를 새 전술 엔진으로 시뮬레이션한
     경우) — {"home":{...}, "away":{...}} 형태, 각 항목은
-    {"poss","shots","shots_on","corners","fouls"} — 그 실제 시뮬레이션
-    결과를 기준값으로 쓴다. 공식으로 사후에 지어내는 게 아니라 실제로
-    벌어진 슈팅/코너/파울 횟수라는 뜻. 없으면(폴백 상황 등) 예전처럼
+    {"poss","shots","shots_on","corners","fouls","pass_acc","offsides",
+    "yellow_cards","red_cards","saves"} — 그 실제 시뮬레이션 결과를
+    기준값으로 쓴다. 공식으로 사후에 지어내는 게 아니라 실제로 벌어진
+    슈팅/코너/파울/패스/카드 횟수라는 뜻. 없으면(폴백 상황 등) 예전처럼
     점유율/스코어 기반 공식으로 만든다.
 
     설계 원칙 — 순서가 중요하다:
@@ -5544,7 +5659,13 @@ def _derive_match_stats(is_home, hs, as_, goals, assists, saves, pos, detail, en
     슈팅: engine_stats가 있으면 그 값을 베이스로, 내 개인 슈팅 기록을 하한선 보장.
     유효슈팅: 최소한 그 팀이 넣은 골 수만큼은 보장(골은 유효슈팅에서만 나옴).
     코너/파울: engine_stats가 있으면 그 값, 없으면 슈팅·점유율에서 파생.
-    패스 성공률: 내 개인 pass_acc를 우리 팀 값의 기준점으로 삼음.
+    패스 성공률: [2026-09 개정] engine_stats가 실제 패스 집계값(pass_acc)을
+      주면 그걸 최우선으로 쓴다(실측이라 formula보다 정확) — 없을 때만
+      예전처럼 내 개인 pass_acc → 그것도 없으면 점유율 기반 공식.
+    오프사이드/카드: engine_stats가 있으면 그 값, 없으면 슈팅/파울에서
+      파생(레드카드는 워낙 드문 사건이라 공식만으로는 안 만들고 0 유지).
+    세이브: engine_stats가 있으면 그 값(내가 GK로 직접 세운 기록 하한 보장),
+      없으면 상대 유효슈팅 - 상대 득점(=내가 막아낸 수)으로 근사.
     """
     my_score = hs if is_home else as_
     opp_score = as_ if is_home else hs
@@ -5565,8 +5686,20 @@ def _derive_match_stats(is_home, hs, as_, goals, assists, saves, pos, detail, en
         opp_corners = opp_eng.get("corners", 0)
         my_fouls = max(1, my_eng.get("fouls", 0))
         opp_fouls = max(1, opp_eng.get("fouls", 0))
-        my_pass_acc = detail.get("pass_acc") or (0.66 + my_poss * 0.0026)
-        opp_pass_acc = 0.66 + opp_poss * 0.0026
+        my_pass_acc = my_eng.get("pass_acc")
+        if my_pass_acc is None:
+            my_pass_acc = detail.get("pass_acc") or (0.66 + my_poss * 0.0026)
+        opp_pass_acc = opp_eng.get("pass_acc")
+        if opp_pass_acc is None:
+            opp_pass_acc = 0.66 + opp_poss * 0.0026
+        my_offsides = my_eng.get("offsides", 0)
+        opp_offsides = opp_eng.get("offsides", 0)
+        my_yellow = my_eng.get("yellow_cards", 0)
+        opp_yellow = opp_eng.get("yellow_cards", 0)
+        my_red = my_eng.get("red_cards", 0)
+        opp_red = opp_eng.get("red_cards", 0)
+        my_saves = max((saves if pos == "GK" else 0), my_eng.get("saves", 0))
+        opp_saves = opp_eng.get("saves", 0)
     else:
         diff = my_score - opp_score
         my_poss = 50 + round(20 * math.tanh(diff / 2.5))
@@ -5591,16 +5724,33 @@ def _derive_match_stats(is_home, hs, as_, goals, assists, saves, pos, detail, en
         my_pass_acc = detail.get("pass_acc") or (0.66 + my_poss * 0.0026)
         opp_pass_acc = 0.66 + opp_poss * 0.0026
 
+        my_offsides = max(0, round(my_shots * 0.15))
+        opp_offsides = max(0, round(opp_shots * 0.15))
+        my_yellow = max(0, round(my_fouls * 0.30))
+        opp_yellow = max(0, round(opp_fouls * 0.30))
+        my_red = 0    # 워낙 드문 사건이라 공식만으로는 안 만든다(0 유지).
+        opp_red = 0
+        my_saves = max((saves if pos == "GK" else 0), max(0, opp_shots_on - opp_score))
+        opp_saves = max(0, my_shots_on - my_score)
+
     home_stats, away_stats = (
         {"poss": my_poss, "shots": my_shots, "shots_on": my_shots_on,
-         "corners": my_corners, "fouls": my_fouls, "pass_acc": round(my_pass_acc, 3)},
+         "corners": my_corners, "fouls": my_fouls, "pass_acc": round(my_pass_acc, 3),
+         "offsides": my_offsides, "yellow_cards": my_yellow, "red_cards": my_red,
+         "saves": my_saves},
         {"poss": opp_poss, "shots": opp_shots, "shots_on": opp_shots_on,
-         "corners": opp_corners, "fouls": opp_fouls, "pass_acc": round(opp_pass_acc, 3)},
+         "corners": opp_corners, "fouls": opp_fouls, "pass_acc": round(opp_pass_acc, 3),
+         "offsides": opp_offsides, "yellow_cards": opp_yellow, "red_cards": opp_red,
+         "saves": opp_saves},
     ) if is_home else (
         {"poss": opp_poss, "shots": opp_shots, "shots_on": opp_shots_on,
-         "corners": opp_corners, "fouls": opp_fouls, "pass_acc": round(opp_pass_acc, 3)},
+         "corners": opp_corners, "fouls": opp_fouls, "pass_acc": round(opp_pass_acc, 3),
+         "offsides": opp_offsides, "yellow_cards": opp_yellow, "red_cards": opp_red,
+         "saves": opp_saves},
         {"poss": my_poss, "shots": my_shots, "shots_on": my_shots_on,
-         "corners": my_corners, "fouls": my_fouls, "pass_acc": round(my_pass_acc, 3)},
+         "corners": my_corners, "fouls": my_fouls, "pass_acc": round(my_pass_acc, 3),
+         "offsides": my_offsides, "yellow_cards": my_yellow, "red_cards": my_red,
+         "saves": my_saves},
     )
     return {"home": home_stats, "away": away_stats}
 
@@ -5608,7 +5758,7 @@ def _derive_match_stats(is_home, hs, as_, goals, assists, saves, pos, detail, en
 def _save_match_detail(p, week, comp_name, is_home, home_name, away_name,
                        hs, as_, result, goals, assists, saves, rating,
                        events, played, benched, detail=None, pso=None, engine_stats=None,
-                       engine_plog=None, player_ratings=None):
+                       engine_detail=None, engine_plog=None, player_ratings=None, live_record=None):
     """경기 상세를 match_details 에 저장하고 detail_id 를 돌려준다.
        리그/챔스/국대 모두 이 헬퍼를 공유한다(팀명은 호출자가 직접 넘김).
        events 정규화(분 배정·시간순)도 여기서 처리. 실패 시 None 반환.
@@ -5618,6 +5768,13 @@ def _save_match_detail(p, week, comp_name, is_home, home_name, away_name,
        engine_stats: 전술 엔진(match_sim.tactical_engine)이 만든 실제
        시뮬레이션 통계({"home":{...},"away":{...}}). 있으면 _derive_match_stats가
        공식 추정 대신 이 실측값을 기준으로 쓴다.
+       engine_detail: [2026-09 신설] engine_stats("표시용" 10개) 옆에
+       나란히 오는 세부 통계({"home":{...},"away":{...}}, 각 항목은
+       tactical_engine._new_stats_detail()의 키 — 총패스/크로스/태클/
+       가로채기/클리어링/블록/공중볼/드리블/볼탈취/서드·박스진입/
+       빅찬스/xG·xA/골대/프리킥/PK/선방률). 화면엔 기본 노출 안 하고
+       payload["team_stats_detail"]에 그대로 저장만 해둔다(나중에 선수
+       통계·분석 등에 재활용하기 위함).
        engine_plog: 전술 엔진이 만든 진짜 분 단위 possession_log. 있으면
        match_flow의 사후 필러 생성 대신 이걸 개인 서사와 병합해서 쓴다.
        player_ratings: [2026-08 신설, 신민용 요청: "경기 시뮬레이션에
@@ -5691,6 +5848,11 @@ def _save_match_detail(p, week, comp_name, is_home, home_name, away_name,
             lineup_stats = match_flow.generate_lineup_stats(home_name, away_name)
         except Exception:
             lineup_stats = {}
+    # [2026-09 핵심] 라이브 시뮬로 돌린 경기는 **그 시뮬이 쓴 라인업 그대로**를
+    # 저장해야 한다. 여기서 새로 뽑으면 시뮬이 굴린 11명과 화면에 뜨는
+    # 11명이 달라져서, 시드를 맞춰도 다른 경기가 재생된다.
+    if live_record is not None and live_record.get("lineup_stats"):
+        lineup_stats = live_record["lineup_stats"]
 
     payload = {
         "events": [[m, t] for m, t in timed],
@@ -5708,6 +5870,8 @@ def _save_match_detail(p, week, comp_name, is_home, home_name, away_name,
             "pass_acc": detail.get("pass_acc", 0.0),
         },
         "team_stats": team_stats,
+        "team_stats_detail": ({"home": engine_detail.get("home"), "away": engine_detail.get("away")}
+                              if engine_detail else None),
     }
     try:
         conn2 = get_conn()
@@ -5733,21 +5897,24 @@ def _save_match_detail(p, week, comp_name, is_home, home_name, away_name,
 
 
 def _augment_events_with_names(c, p, is_home, hid, aid, hs, as_,
-                               goals, assists, played, events):
-    """[텍스트-영상 싱크] 이벤트 문구를 다듬는다.
+                               goals, assists, played, events,
+                               live_record=None, engine_plog=None, player_ratings=None):
+    """[텍스트-싱크] 이벤트 문구를 다듬는다.
 
       - 내가 넣은 골/어시(⚽·🎯 세트피스·🎯 페널티킥·🅰)와 그 외 내 개인
         활약(선방·차단·드리블 등) → 뒤에 "(내 이름)"을 붙인다.
       - 실점(🥅)은 내가 한 행동이 아니라 상대가 넣은 것이므로 이름을
         붙이지 않는다.
-      - 우리 팀이 넣었지만 내가 골도 어시도 아닌 나머지 득점은, 로스터에서
-        아무 이름이나 랜덤으로 뽑아 붙이지 않고 "어떤 골인지"만(문구만)
-        타임라인에 추가한다 — 이름 없는 일반 골로 표시.
+      - 우리 팀이 넣었지만 내가 골도 어시도 아닌 나머지 득점 → 이제
+        tactical_engine의 possession_log(scorer_id)+player_ratings로
+        실제 득점자 이름을 붙인다(아래 _team_goal_scorers).
 
-    [수정 이력] 처음엔 로스터에서 동료/상대 이름을 랜덤으로 뽑아 붙였는데,
-    국가별로 이름이 뒤죽박죽 나와 어색했다. 지금은 이름은 오직 "내 이름"
-    하나만 쓰고, 내가 관여 안 한 골은 이름 없이 사실(득점 존재·시점·종류)만
-    보여준다.
+    [수정 이력] 2026-09 이전엔 로스터에서 동료 이름을 랜덤으로 뽑아
+    붙였다가 국가별로 뒤죽박죽 나와 어색해서 "이름 없이 문구만"으로
+    후퇴했었다. 지금은 랜덤 추측이 아니라 tactical_engine이 실제로 계산한
+    득점자(그 경기 그 팀 로스터에서 진짜로 슈팅을 때린 선수)라 다시 이름을
+    붙여도 어색할 이유가 없다 — 라이브 물리엔진 제거(2026-09)로 얻은 실제
+    데이터를 그대로 재활용.
     """
     try:
         if not played:
@@ -5768,27 +5935,148 @@ def _augment_events_with_names(c, p, is_home, hid, aid, hs, as_,
             else:
                 new_events.append(tag(str(ev)))
 
-        # 내가 골도 어시도 아닌 우리 팀의 나머지 득점 — 이름 없이 문구만.
+        # 내가 골도 어시도 아닌 우리 팀의 나머지 득점.
         remaining = max(0, my_score - goals - assists)
         if remaining > 0:
-            for m in _sample_minutes(remaining, 3, 90):
-                new_events.append((m, random.choice(GOAL_PHRASES["normal"])))
+            scored = _team_goal_scorers(engine_plog, player_ratings, is_home,
+                                        new_events, remaining)
+            if scored:
+                for m, scorer_name in scored:
+                    phrase = random.choice(GOAL_PHRASES["normal"])
+                    new_events.append((m, f"{phrase} ({scorer_name})" if scorer_name else phrase))
+            else:
+                # possession_log가 없거나(구버전 기록) 개수가 안 맞으면
+                # 예전처럼 분만 랜덤으로 흩뿌리고 이름은 생략한다.
+                mins = _sample_minutes(remaining, 3, 90)
+                for m in mins:
+                    new_events.append((m, random.choice(GOAL_PHRASES["normal"])))
 
         return new_events
     except Exception:
         return events
 
 
+def _goal_minutes_from_events(events):
+    """events(개인 이벤트 목록, (분,문구) 튜플)에서 "⚽"가 포함된(=내가
+    직접 넣은 골) 항목의 분(정수)만 뽑아 리스트로 돌려준다. _team_goal_
+    scorers/_match_scorer_summary 둘 다에서 쓰는 공용 추출 로직."""
+    out = []
+    for ev in events or []:
+        if isinstance(ev, tuple) and len(ev) == 2 and "⚽" in str(ev[1]):
+            try:
+                out.append(int(ev[0]))
+            except Exception:
+                pass
+    return out
+
+
+def _team_goal_scorers(engine_plog, player_ratings, is_home, my_events_so_far, need):
+    """tactical_engine의 possession_log(각 "goal" 레코드에 scorer_id가
+    실려온다)와 그 팀 player_ratings(id→표시명)를 대조해, 내가 관여 안 한
+    우리 팀 나머지 득점의 (실제 분, 실제 득점자 이름) 목록을 돌려준다.
+
+    내 골/어시는 이미 my_events_so_far에 실제 분과 함께 올라와 있으므로
+    그 분(⚽ 표시가 붙은 것)은 제외한다 — _live_goal_minutes가 하던 것과
+    동일한 방식. 정보가 부족하면(구버전 기록·라인업 조회 실패 등) None을
+    돌려줘서 호출부가 예전처럼(이름 없이 랜덤 분) 폴백하게 한다."""
+    try:
+        if not engine_plog or not player_ratings:
+            return None
+        side = "home" if is_home else "away"
+        id_to_name = {r["id"]: r["name"] for r in (player_ratings.get(side) or [])
+                     if r and r.get("id") is not None and r.get("name")}
+        if not id_to_name:
+            return None
+        used = _goal_minutes_from_events(my_events_so_far)
+        out = []
+        for r in engine_plog:
+            if r.get("team") != side or r.get("outcome") != "goal":
+                continue
+            m = int(r.get("min", 0))
+            if m in used:
+                used.remove(m)   # 이미 내 골 이벤트로 소모된 분 — 한 번만 제외
+                continue
+            out.append((r.get("min"), id_to_name.get(r.get("scorer_id"))))
+        if len(out) < need:
+            return None           # 앞뒤가 안 맞으면 손대지 않는다(폴백)
+        return sorted(out, key=lambda x: x[0])[:need]
+    except Exception:
+        return None
+
+
+def _match_scorer_summary(engine_plog, player_ratings, hn, an,
+                          my_side=None, my_name=None, my_goal_minutes=None):
+    """[2026-09 신설, 신민용 요청: "맨 처음 뜨는 글에 골을 누가 넣었는지
+    표시하자"] 경기 로그 맨 위 요약 줄에 붙일 "N' 이름, N' 이름" 형식의
+    득점자 한 줄. tactical_engine의 possession_log(scorer_id)+
+    player_ratings(id→표시명)만 조회하면 되므로 추가 계산 비용이 사실상
+    없다(둘 다 이미 만들어져 있는 데이터). 홈/원정 어느 쪽이든 득점자
+    이름을 못 찾으면(빈 슬롯 슈팅 등) 그 골만 조용히 건너뛴다. 정보
+    자체가 없으면(구버전 기록·폴백 경로) 빈 문자열 → 호출부가 줄 자체를
+    생략한다.
+
+    [2026-09 수정, 신민용 리포트: "내가 골을 넣었을 때는 (이름) 이렇게
+    안 뜨던데"] tactical_engine의 plog는 "나"를 모른다(AI 로스터만
+    시뮬레이션) — 그래서 내가 실제로 넣은 골도 그 자리를 채운 AI
+    선수 이름으로 표시되고 있었다. my_side/my_name/my_goal_minutes(내
+    골이 실제로 터진 분들, _goal_minutes_from_events로 뽑음)를 받아서,
+    그 분에 해당하는 우리 팀 골만 AI 이름 대신 내 이름으로 바꿔 끼운다
+    — _team_goal_scorers가 "우리 팀 나머지 득점"에서 내 분을 제외하는
+    것과 정반대로, 여기서는 내 분을 찾아서 내 이름으로 치환한다."""
+    try:
+        if not engine_plog or not player_ratings:
+            return ""
+
+        def _names_for(side, team_name):
+            id_to_name = {r["id"]: r["name"] for r in (player_ratings.get(side) or [])
+                         if r and r.get("id") is not None and r.get("name")}
+            if not id_to_name:
+                return []
+            goal_evs = sorted(
+                (r for r in engine_plog if r.get("team") == side and r.get("outcome") == "goal"),
+                key=lambda r: r.get("min", 0))
+            mine_left = list(my_goal_minutes) if (my_goal_minutes and side == my_side) else []
+            out = []
+            for r in goal_evs:
+                m = int(r.get("min", 0))
+                if m in mine_left:
+                    mine_left.remove(m)
+                    name = my_name
+                else:
+                    name = id_to_name.get(r.get("scorer_id"))
+                if name:
+                    out.append("%d' %s" % (m, name))
+            return out
+
+        h = _names_for("home", hn)
+        a = _names_for("away", an)
+        parts = []
+        if h:
+            parts.append(f"{hn}: " + ", ".join(h))
+        if a:
+            parts.append(f"{an}: " + ", ".join(a))
+        return "⚽ " + " · ".join(parts) if parts else ""
+    except Exception:
+        return ""
+
+
 def _write_match_log(p, week, league_name, is_home,
                      hid, aid, hs, as_,
                      result, goals, assists, saves, rating, events, played, benched,
-                     detail=None, engine_stats=None, engine_plog=None, day=None,
-                     player_ratings=None):
+                     detail=None, engine_stats=None, engine_detail=None, engine_plog=None, day=None,
+                     player_ratings=None, scorer_ratings=None, live_record=None):
     # [최적화] 팀명을 세션 캐시에서 조회 (매 경기 get_conn 제거)
     conn = get_conn()
     c = conn.cursor()
     hn = _team_name(c, hid, "홈팀")
     an = _team_name(c, aid, "원정팀")
+
+    # [2026-09] 득점자 이름 조회는 player_ratings(내 슬롯이 이미 치환된
+    # 표시용 버전)가 아니라 scorer_ratings(치환 전 원본 스냅샷)를 우선
+    # 쓴다 — 안 그러면 "내가 맡은 포지션의 AI가 넣은 골"의 이름이
+    # 내 슬롯 치환 때문에 사라진다. scorer_ratings가 없는(구버전 호출)
+    # 경우에만 player_ratings로 폴백.
+    _name_src = scorer_ratings or player_ratings
 
     # [텍스트-영상 싱크 확장] 이벤트 텍스트에 실제 선수 이름을 붙이고, 내가
     # 직접 관여하지 않은 우리 팀의 나머지 득점도 실제 로스터 선수 이름으로
@@ -5797,7 +6085,10 @@ def _write_match_log(p, week, league_name, is_home,
     # DB 이슈 등) 경기 저장 자체는 절대 막히면 안 되므로 전부 try/except로
     # 감싸고, 실패 시 이름 태깅 없이 기존 동작으로 조용히 폴백한다.
     events = _augment_events_with_names(c, p, is_home, hid, aid, hs, as_,
-                                        goals, assists, played, events)
+                                        goals, assists, played, events,
+                                        live_record=live_record,
+                                        engine_plog=engine_plog,
+                                        player_ratings=_name_src)
     conn.close()
 
     loc = "홈" if is_home else "원정"
@@ -5806,7 +6097,8 @@ def _write_match_log(p, week, league_name, is_home,
     detail_id = _save_match_detail(p, week, league_name, is_home, hn, an,
                                    hs, as_, result, goals, assists, saves, rating,
                                    events, played, benched, detail, engine_stats=engine_stats,
-                                   engine_plog=engine_plog, player_ratings=player_ratings)
+                                   engine_detail=engine_detail, engine_plog=engine_plog,
+                                   player_ratings=player_ratings, live_record=live_record)
 
     # ── 로그: 헤더 한 줄(클릭 가능) + 결과 + 핵심 요약 + 순위 ──────────
     #   상세 이벤트(전/후반)는 로그에서 빼고 상세 창으로 옮겨 로그를 간결하게.
@@ -5816,6 +6108,13 @@ def _write_match_log(p, week, league_name, is_home,
     add_log("─"*44, "sep")
     add_log(f"⚽ 경기  [{league_name}]  {_day_label(week, day)}  ({loc}){marker}", "match")
     add_log(f"   {hn} {hs}-{as_} {an}  ({rs})", "match")
+    _scorers = _match_scorer_summary(
+        engine_plog, _name_src, hn, an,
+        my_side=("home" if is_home else "away"),
+        my_name=(p.get("name") or "나"),
+        my_goal_minutes=_goal_minutes_from_events(events))
+    if _scorers:
+        add_log(f"   {_scorers}", "match")
 
     if not played:
         add_log("   🪑 벤치 대기" if benched else "   🚑 부상 결장", "match")
@@ -7475,7 +7774,7 @@ def _advance_week(p, base_week, n_weeks=4, progress_cb=None):
         except Exception:
             pass
         _t3b = _time_perf.perf_counter()
-        print(f"[PERF] 연도전환 총 {_t3b-_t0:.2f}s "
+        _live_debug(f"[PERF] 연도전환 총 {_t3b-_t0:.2f}s "
               f"(커리어정리 {_t1-_t0:.2f}s | _end_of_season {_t2-_t1:.2f}s | "
               f"일정생성 {_t3-_t2:.2f}s | 파워랭킹 {_t3c-_t3:.2f}s | "
               f"PRAGMA optimize {_t3b-_t3c:.2f}s)")
@@ -7769,6 +8068,36 @@ def _estimate_ai_clean_sheets(pos, ovr, team_avg, league_avg, full_season_matche
     scale = full_season_matches / 38.0
     cs = base_cs_per_38 * team_factor * ovr_factor * scale * random.uniform(0.8, 1.2)
     return max(0, round(cs))
+
+
+def _estimate_ai_gk_saves(ovr, team_avg, league_avg, full_season_matches=14):
+    """[2026-09 신설, 신민용 요청: "클린시트 말고 선방:14 실점:1 선방률:
+    93.5% 이런식으로 떠야한다"] 이 함수도 위 _estimate_ai_season/_estimate_
+    ai_clean_sheets와 완전히 같은 철학이다 — 이 게임은 개별 슈팅이든
+    개별 골이든 실제로 이벤트 단위로 시뮬레이션하지 않는다(그건 GK뿐
+    아니라 골/도움/평점도 전부 마찬가지 — _estimate_ai_season도 실제
+    슈팅 데이터가 아니라 포지션·OVR·팀전력 기반 통계적 추정치다). 그러니
+    "선방률" 역시 같은 방식(GK 본인 OVR+소속팀 전력으로 통계적으로
+    그럴듯한 수치를 추정)으로 얼마든지 만들 수 있다 — "개별 슈팅을
+    시뮬레이션 안 해서 못 만든다"는 이전 답변은 틀렸다.
+
+    설계: (1) 경기당 피슈팅수 기준치(4.2, 리그 평균 유효슈팅 실측 근사)에서
+    소속팀이 평균보다 강할수록 상대의 유효슈팅 자체가 줄어든다고 보고
+    낮춘다. (2) 기본 선방률은 GK 본인 OVR에서 산출(OVR60→64%, OVR99→
+    79.6% 근방 — 실제 톱리그 GK 선방률 65~80% 대와 맞춘 캘리브레이션)하고
+    소속팀 전력에 따라 소폭 가산(강팀 뒤에서는 상대적으로 질 좋은
+    기회만 걸러져 옴). (3) 피슈팅수×선방률로 선방을, 나머지를 실점으로
+    역산해 saves+conceded=shots_faced가 항상 정확히 맞물리게 한다(표시
+    시점에 선방률을 saves/(saves+conceded)로 재계산해도 항상 일치).
+    반환: (saves, goals_conceded)."""
+    shots_per_game = max(2.0, min(7.0, 4.2 * (1.0 - (team_avg - league_avg) * 0.01)))
+    shots_faced = max(0, round(shots_per_game * full_season_matches * random.uniform(0.85, 1.15)))
+    base_save_pct = 0.60 + max(0, min(50, ovr - 50)) / 50.0 * 0.20
+    team_bonus = (team_avg - league_avg) * 0.001
+    save_pct = max(0.45, min(0.92, base_save_pct + team_bonus + random.uniform(-0.05, 0.05)))
+    saves = round(shots_faced * save_pct)
+    goals_conceded = max(0, shots_faced - saves)
+    return saves, goals_conceded
 
 
 def _cap_additive_bonus(raw_bonus: float, base_score: float, cap_ratio: float = 0.10) -> float:
@@ -10247,7 +10576,7 @@ def _end_of_season(p, year, progress_cb=None):
         for _tid in _RELEGATION_DEBUG_TRACK:
             _relegation_debug_snapshot(_tid, "개막 직전(이적시장 마감 후)")
     _tp2 = _time_perf2.perf_counter()
-    print(f"[PERF]   _end_of_season 세부: AI생애주기 {_tp2-_tp1:.2f}s "
+    _live_debug(f"[PERF]   _end_of_season 세부: AI생애주기 {_tp2-_tp1:.2f}s "
           f"(승강제 타이밍은 43주 _finalize_club_season으로 이동 — 여기 안 잡힘)")
 
     # 6. 강제 방출 체크 (이슈8 강화) — 우승 판정이 끝난 뒤에 처리
@@ -10989,7 +11318,7 @@ def _finalize_club_season(p, year):
     _tfcs1 = _time_fcs.perf_counter()
     _process_promotion_relegation(year, season_avg_rating)
     _tfcs2 = _time_fcs.perf_counter()
-    print(f"[PERF-SEASON] finalize_club_season 세부: "
+    _live_debug(f"[PERF-SEASON] finalize_club_season 세부: "
           f"finish_incomplete_matches={_tfcs1-_tfcs0:.3f}s | "
           f"promotion_relegation={_tfcs2-_tfcs1:.3f}s")
 
@@ -12116,7 +12445,7 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
 
     _invalidate_team_ovr_cache()
     _pr_t9 = _time_pr.perf_counter()
-    print(f"[PERF-PROMO] _process_promotion_relegation 세부: "
+    _live_debug(f"[PERF-PROMO] _process_promotion_relegation 세부: "
           f"my_player/season조회 {_pr_t1-_pr_t0:.3f}s | "
           f"teams+leagues조회 {_pr_t2-_pr_t1:.3f}s | "
           f"standings계산({len(all_league_ids)}개리그) {_pr_t3-_pr_t2:.3f}s | "
@@ -12360,7 +12689,7 @@ def _generate_all_league_schedules(season: int, year: int):
         conn.commit()
         conn.close()
         _tg5 = _time_perf3.perf_counter()
-        print(f"[PERF]   일정생성 세부: 아카이브이동 {_tg1-_tg0:.2f}s | "
+        _live_debug(f"[PERF]   일정생성 세부: 아카이브이동 {_tg1-_tg0:.2f}s | "
               f"완비판정조회 {_tg2-_tg1:.2f}s | 기존경기dedup조회 {_tg3-_tg2:.2f}s | "
               f"일정계산 {_tg4-_tg3:.2f}s | INSERT+commit {_tg5-_tg4:.2f}s | "
               f"(대상리그 {len(need_league_ids)}개, 신규경기 {len(new_rows)}건)")
@@ -12370,7 +12699,7 @@ def _generate_all_league_schedules(season: int, year: int):
         _tg_idx0 = _time_perf3.perf_counter()
         rebuild_match_results_indexes(_idx_conn.cursor())
         _idx_conn.commit()
-        print(f"[PERF]   인덱스재생성 {_time_perf3.perf_counter()-_tg_idx0:.2f}s")
+        _live_debug(f"[PERF]   인덱스재생성 {_time_perf3.perf_counter()-_tg_idx0:.2f}s")
 
 
 # [2026-07 신설, 신민용 리포트: "폴란드에서 3년 뛴 선수인데 왜 K리그가

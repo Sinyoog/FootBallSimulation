@@ -228,8 +228,34 @@ def _pstat(player_stats, p):
     return rec
 
 
+def _new_stats_detail():
+    """[2026-09 신설] "표시용" team_stats(점유율/슈팅/유효슈팅/코너/파울/
+    패스성공률/오프사이드/카드/세이브 — 10개, 실제 중계화면 느낌)와 별도로
+    엔진 내부에서 계산해두는 세부 통계 그릇. 화면엔 기본적으로 안 뿌리고
+    (나중에 선수 통계·분석 등에 재활용하기 위해) 같이 저장만 해둔다.
+
+    전부 기존 분당 시뮬레이션 루프(shot_chance/corner_chance/foul_chance로
+    스코어를 결정하는 그 로직)는 손대지 않고, 그 결과에 병렬로 얹어서
+    누적한다 — 경기 결과에 영향을 주지 않으므로 속도·밸런스 둘 다 그대로."""
+    return {
+        "passes": 0, "passes_ok": 0,
+        "crosses": 0, "crosses_ok": 0,
+        "tackles": 0, "tackles_ok": 0,
+        "interceptions": 0, "clearances": 0, "blocks": 0,
+        "aerial_duels": 0, "aerial_duels_ok": 0,
+        "dribbles": 0, "dribbles_ok": 0,
+        "turnovers_won": 0, "turnovers_lost": 0,
+        "final_third_entries": 0, "box_entries": 0,
+        "big_chances": 0, "big_chances_missed": 0,
+        "xg": 0.0, "xa": 0.0,
+        "woodwork": 0, "free_kicks": 0, "penalties": 0,
+        "save_pct": 0.0,
+    }
+
+
 def _resolve_shot(rng, side, lane, minute, shooter_pool, opp_gk, opp_gk_q,
-                   home_stats, away_stats, home_player_stats, away_player_stats, plog):
+                   home_stats, away_stats, home_player_stats, away_player_stats, plog,
+                   home_detail, away_detail):
     """슈팅 하나를 판정해서 team_stats/possession_log/선수별 개인 기록
     (슈팅·유효슈팅·골·도움·선방·실점)을 함께 갱신한다.
     반환값: 골이 들어갔으면 "home"/"away", 아니면 None.
@@ -238,11 +264,23 @@ def _resolve_shot(rng, side, lane, minute, shooter_pool, opp_gk, opp_gk_q,
     뽑아놓고도 그 신원을 결과에 전혀 남기지 않았다(팀+결과만 기록) —
     이제 그 선수 개인 기록에 직접 누적한다. 어시스트는 완전한 패스체인
     시뮬레이션 대신, 골이 들어갔을 때 같은 레인 공격 풀에서 슈터를 뺀
-    나머지를 패스 능력 가중으로 뽑아 일정 확률로 붙이는 근사치다."""
+    나머지를 패스 능력 가중으로 뽑아 일정 확률로 붙이는 근사치다.
+
+    [2026-09 확장, xG/xA] on_target_p(유효슈팅 확률)*(1-save_p)(안 막힐
+    확률)를 "이 슈팅의 결과가 나오기 전 기대 득점(xG)"으로 그대로 쓴다 —
+    이미 계산해두는 값이라 추가 비용이 없다. xA는 신민용 확정 설계대로
+    "그 슈팅의 xG를 마지막 기여자에게 배분": 실제 어시스트가 붙으면 그
+    도움 선수에게, 골로 안 이어진 유효슈팅도 일정 확률로 "키패스"를 굴려
+    같은 방식으로 배분한다(어시스트 기록 없이도 창조적 기여를 평가할 수
+    있게 하기 위함, 향후 개인 스탯 확장 대비)."""
     stats = home_stats if side == "home" else away_stats
+    detail = home_detail if side == "home" else away_detail
+    opp_detail = away_detail if side == "home" else home_detail
     my_pstats = home_player_stats if side == "home" else away_player_stats
     opp_pstats = away_player_stats if side == "home" else home_player_stats
     stats["shots"] += 1
+    detail["final_third_entries"] += 1
+    detail["box_entries"] += 1
 
     if shooter_pool:
         weights = [max(1.0, p.get("shooting", 50)) for p in shooter_pool]
@@ -254,7 +292,19 @@ def _resolve_shot(rng, side, lane, minute, shooter_pool, opp_gk, opp_gk_q,
         _pstat(my_pstats, shooter)["shots"] += 1
 
     on_target_p = max(0.15, min(0.78, 0.30 + (shot_stat - 50) / 150.0))
+    save_p = max(0.08, min(0.90, 0.63 + (opp_gk_q - shot_stat) / 120.0))
+    shot_xg = round(on_target_p * (1.0 - save_p), 4)
+    detail["xg"] += shot_xg
+    is_big_chance = shot_xg >= 0.35
+
     if rng.random() >= on_target_p:
+        # [세분화] 빗나간 슈팅 중 일부는 "완전히 벗어남"이 아니라 "골대를
+        # 맞고 나감"으로 표시만 더 얹는다 — 유효슈팅/스코어 판정은 그대로.
+        if rng.random() < 0.05:
+            detail["woodwork"] += 1
+        if is_big_chance:
+            detail["big_chances"] += 1
+            detail["big_chances_missed"] += 1
         plog.append({"min": float(minute), "team": side, "zone": "att", "lane": lane,
                      "outcome": "shot_off", "me": False, "text": None})
         return None
@@ -262,26 +312,29 @@ def _resolve_shot(rng, side, lane, minute, shooter_pool, opp_gk, opp_gk_q,
     stats["shots_on"] += 1
     if shooter is not None:
         _pstat(my_pstats, shooter)["shots_on"] += 1
-    # [버그수정 2026-07, 신민용 지적: "EPL에서 2-9, 7-0 같은 스코어가
-    # 너무 자주 나온다 — 현실에서 10:1은 진짜 실력차 없인 안 나온다"]
-    # 실측: 동일 능력치(78) 두 팀 400경기를 이 함수 그대로 돌려보니 경기당
-    # 평균 총골 3.46(실제 EPL 2.6~2.8 대비 25%+ 높음), 6골 이상 경기가
-    # 14.5%(실제는 3~5% 수준)나 나왔다 — save_p 기준값(0.5)이 너무 낮아서
-    # (유효슈팅의 절반만 막힘) 골 전환율이 실제 축구보다 높게 잡혀 있던
-    # 게 원인. 기준값을 0.63으로 올리니 동일 조건에서 평균 2.67골, 6골+
-    # 비율 6.0%로 실제 축구 근처까지 내려왔다(실력차가 진짜로 큰 대진,
-    # 예: OVR 90 vs 60은 여전히 평균 6.5:0.05로 확실하게 압도함 — 이건
-    # 랜덤 블로아웃이 아니라 진짜 실력차 블로아웃이라 그대로 유지됨).
-    save_p = max(0.08, min(0.90, 0.63 + (opp_gk_q - shot_stat) / 120.0))
     if rng.random() < save_p:
-        plog.append({"min": float(minute), "team": side, "zone": "att", "lane": lane,
-                     "outcome": "save", "me": False, "text": None})
+        # 유효슈팅이 막힘 — 그중 일부는 "수비수 블록"으로 더 세분화하고
+        # (상대 수비 기여 스탯), 골로 이어지지 않았어도 그 장면을 만든
+        # 선수에게 키패스/xA를 확률적으로 인정한다.
+        if rng.random() < 0.30:
+            opp_detail["blocks"] += 1
         if opp_gk is not None:
             _pstat(opp_pstats, opp_gk)["saves"] += 1
+        if is_big_chance:
+            detail["big_chances"] += 1
+            detail["big_chances_missed"] += 1
+        if shooter_pool and len(shooter_pool) > 1 and rng.random() < 0.35:
+            detail["xa"] += shot_xg
+        plog.append({"min": float(minute), "team": side, "zone": "att", "lane": lane,
+                     "outcome": "save", "me": False, "text": None})
         return None
 
+    # 골.
+    if is_big_chance:
+        detail["big_chances"] += 1
     plog.append({"min": float(minute), "team": side, "zone": "att", "lane": lane,
-                 "outcome": "goal", "me": False, "text": None})
+                 "outcome": "goal", "me": False, "text": None,
+                 "scorer_id": (shooter.get("id") if shooter is not None else None)})
     if shooter is not None:
         _pstat(my_pstats, shooter)["goals"] += 1
     if opp_gk is not None:
@@ -292,6 +345,7 @@ def _resolve_shot(rng, side, lane, minute, shooter_pool, opp_gk, opp_gk_q,
             weights2 = [max(1.0, p.get("passing", 50)) for p in creator_pool]
             creator = rng.choices(creator_pool, weights=weights2, k=1)[0]
             _pstat(my_pstats, creator)["assists"] += 1
+            detail["xa"] += shot_xg
     return side
 
 
@@ -415,8 +469,18 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
             폴백한다 — 하위 호환 100% 유지.
 
     Returns:
-        {"home_score", "away_score", "home_stats", "away_stats", "possession_log"}
-        home_stats/away_stats: {"poss","shots","shots_on","corners","fouls"}
+        {"home_score", "away_score", "home_stats", "away_stats",
+         "home_stats_detail", "away_stats_detail", "possession_log", ...}
+        home_stats/away_stats: 실제 중계화면에 보여줄 "표시용" 10개 —
+            {"poss","shots","shots_on","corners","fouls","pass_acc",
+             "offsides","yellow_cards","red_cards","saves"}. pass_acc는
+             실제 패스 시도/성공 집계(0으로 나뉠 일 없이 항상 0.0~1.0
+             사이 값)로 항상 채워진다.
+        home_stats_detail/away_stats_detail: [2026-09 신설] 화면엔 기본
+            노출 안 하고 저장만 해두는 세부 통계 — _new_stats_detail()의
+            키 그대로(총패스/성공패스, 크로스, 태클, 가로채기, 클리어링,
+            블록, 공중볼, 드리블, 볼탈취/상실, 서드·박스 진입, 빅찬스,
+            xG/xA, 골대, 프리킥, PK, 선방률).
         possession_log: match_flow.generate_possession_log()와 같은 레코드
             형식([{"min","team","zone","outcome","me","text"}, ...]) — 이번
             단계에서는 팀 결과(스코어/통계)만 이 로그의 골/슈팅 합계와
@@ -458,8 +522,14 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
     home.gk_q += home_form * 0.5
     away.gk_q += away_form * 0.5
 
-    home_stats = {"shots": 0, "shots_on": 0, "corners": 0, "fouls": 0}
-    away_stats = {"shots": 0, "shots_on": 0, "corners": 0, "fouls": 0}
+    home_stats = {"shots": 0, "shots_on": 0, "corners": 0, "fouls": 0,
+                  "offsides": 0, "yellow_cards": 0, "red_cards": 0, "saves": 0}
+    away_stats = {"shots": 0, "shots_on": 0, "corners": 0, "fouls": 0,
+                  "offsides": 0, "yellow_cards": 0, "red_cards": 0, "saves": 0}
+    # [2026-09 신설] "표시용" 10개 옆에 별도로 두는 세부 통계 그릇 —
+    # _new_stats_detail() 참고.
+    home_detail = _new_stats_detail()
+    away_detail = _new_stats_detail()
     # [2026-08 신설] 선수 id(또는 id 없는 폴백 선수는 파이썬 id()) ->
     # {"shots","shots_on","goals","assists","saves","goals_conceded"} 누적.
     # _resolve_shot이 채우고, 경기 종료 후 아래에서 평점으로 환산한다.
@@ -519,6 +589,21 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
 
         lane = rng.choices(lanes, weights=weights, k=1)[0]
         quality = quality_by_lane[lane]
+        atk_detail = home_detail if side == "home" else away_detail
+        dfn_detail = away_detail if side == "home" else home_detail
+
+        # [2026-09 신설] 패스는 슈팅/코너/파울/빌드업과 무관하게 "이번 분에
+        # 볼을 가진 팀"이면 항상 몇 번씩 오간다고 보고 매 분 누적한다(기존
+        # shot_chance/corner_chance/foul_chance 판정과는 완전히 별개 —
+        # 결과 결정 로직은 안 건드림). 성공률은 이 레인의 quality(공격측이
+        # 수비를 얼마나 압도하는가)에 연동 — 밀어붙이는 팀일수록 패스가
+        # 더 잘 이어진다는 감각.
+        _pass_n = 3 + rng.randrange(0, 4)          # 분당 3~6회
+        _pass_p = max(0.55, min(0.95, 0.68 + (quality - 0.5) * 0.35))
+        _pass_ok = int(round(_pass_n * _pass_p + rng.uniform(-0.4, 0.4)))
+        _pass_ok = max(0, min(_pass_n, _pass_ok))
+        atk_detail["passes"] += _pass_n
+        atk_detail["passes_ok"] += _pass_ok
 
         roll = rng.random()
         shot_chance = 0.075 + quality * 0.23             # 대략 7.5~30.5%
@@ -530,18 +615,33 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
         if roll < shot_chance:
             scorer_side = _resolve_shot(
                 rng, side, lane, minute, shooter_pool, dfn_opp.gk, dfn_opp.gk_q,
-                home_stats, away_stats, home_player_stats, away_player_stats, plog)
+                home_stats, away_stats, home_player_stats, away_player_stats, plog,
+                home_detail, away_detail)
             if scorer_side == "home":
                 home_score += 1
             elif scorer_side == "away":
                 away_score += 1
         elif roll < shot_chance + corner_chance:
             (home_stats if side == "home" else away_stats)["corners"] += 1
+            atk_detail["final_third_entries"] += 1
             plog.append({"min": float(minute), "team": side, "zone": "att", "lane": lane,
                          "outcome": "corner", "me": False, "text": None})
         elif roll < shot_chance + corner_chance + foul_chance:
             fouling_side = "away" if side == "home" else "home"
             (home_stats if fouling_side == "home" else away_stats)["fouls"] += 1
+            fouled_detail = atk_detail    # 파울을 당한(=프리킥/PK를 얻는) 쪽
+            # [2026-09 신설] 파울 하나를 프리킥/PK와 카드 유무로 세분화한다.
+            # 공격측이 이미 그 레인을 크게 압도(quality 높음)하던 중 끊긴
+            # 파울만 낮은 확률로 PK(박스 안 파울)로 승격 — 나머지는 프리킥.
+            if quality > 0.68 and rng.random() < 0.10:
+                fouled_detail["penalties"] += 1
+            else:
+                fouled_detail["free_kicks"] += 1
+            _card_roll = rng.random()
+            if _card_roll < 0.006:
+                (home_stats if fouling_side == "home" else away_stats)["red_cards"] += 1
+            elif _card_roll < 0.11:
+                (home_stats if fouling_side == "home" else away_stats)["yellow_cards"] += 1
             plog.append({"min": float(minute), "team": fouling_side, "zone": "mid", "lane": lane,
                          "outcome": "foul", "me": False, "text": None})
         else:
@@ -559,6 +659,48 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
                 zone = "def"
             else:
                 zone = "mid"
+
+            # [2026-09 신설] 이 "특별한 일 없는" 국면도 실제로 무슨 장면
+            # 이었는지 세부 통계로 나눠 둔다 — possession_log 텍스트/필러
+            # 로직도, 위 shot/corner/foul 판정도 안 건드리고 병렬로만
+            # 누적한다.
+            if zone == "att":
+                atk_detail["final_third_entries"] += 1
+                sub = rng.random()
+                if lane != "C" and sub < 0.22:
+                    atk_detail["crosses"] += 1
+                    if rng.random() < (0.35 + quality * 0.25):
+                        atk_detail["crosses_ok"] += 1
+                elif sub < 0.40:
+                    atk_detail["dribbles"] += 1
+                    if rng.random() < (0.40 + quality * 0.30):
+                        atk_detail["dribbles_ok"] += 1
+                elif sub < 0.45:
+                    # 침투 시도가 오프사이드로 끊김
+                    (home_stats if side == "home" else away_stats)["offsides"] += 1
+            elif zone == "def":
+                # 공격측이 밀리는 국면 — 수비측이 볼을 따낸다.
+                sub = rng.random()
+                if sub < 0.30:
+                    dfn_detail["tackles"] += 1
+                    if rng.random() < (0.45 + (1.0 - quality) * 0.30):
+                        dfn_detail["tackles_ok"] += 1
+                        dfn_detail["turnovers_won"] += 1
+                        atk_detail["turnovers_lost"] += 1
+                elif sub < 0.50:
+                    dfn_detail["interceptions"] += 1
+                    dfn_detail["turnovers_won"] += 1
+                    atk_detail["turnovers_lost"] += 1
+                elif sub < 0.65:
+                    dfn_detail["clearances"] += 1
+            if rng.random() < 0.06:
+                dfn_detail["aerial_duels"] += 1
+                atk_detail["aerial_duels"] += 1
+                if rng.random() < 0.5:
+                    dfn_detail["aerial_duels_ok"] += 1
+                else:
+                    atk_detail["aerial_duels_ok"] += 1
+
             plog.append({"min": float(minute), "team": side, "zone": zone, "lane": lane,
                          "outcome": "buildup", "me": False, "text": None})
 
@@ -566,6 +708,29 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
     home_poss_pct = max(28, min(72, home_poss_pct))
     home_stats["poss"] = home_poss_pct
     away_stats["poss"] = 100 - home_poss_pct
+
+    # [2026-09 신설] pass_acc는 team_stats(표시용)에 반드시 존재해야 하는
+    # 값이라(MatchStatsPanel이 h_st['pass_acc']를 그대로 참조) 0으로
+    # 나누는 경우까지 여기서 안전하게 처리해 확정한다. saves(표시용)는
+    # 이 경기에서 뛴 GK들의 개인 saves 합으로 집계 — GK가 둘 이상 나올
+    # 일은 없지만(교체 미시뮬레이션) 합으로 두면 어떤 경우에도 안전하다.
+    home_stats["pass_acc"] = round(
+        home_detail["passes_ok"] / home_detail["passes"], 3) if home_detail["passes"] else 0.0
+    away_stats["pass_acc"] = round(
+        away_detail["passes_ok"] / away_detail["passes"], 3) if away_detail["passes"] else 0.0
+    home_stats["saves"] = sum(v.get("saves", 0) for v in home_player_stats.values())
+    away_stats["saves"] = sum(v.get("saves", 0) for v in away_player_stats.values())
+
+    # [선방률] 이 팀 GK가 막은 슈팅 / (막은 슈팅 + 실점) — 실점은 상대
+    # 스코어와 동일(우리 골문에 들어간 공 = 상대가 넣은 골).
+    home_conceded = away_score
+    away_conceded = home_score
+    home_detail["save_pct"] = round(
+        home_stats["saves"] / (home_stats["saves"] + home_conceded), 3
+    ) if (home_stats["saves"] + home_conceded) else 0.0
+    away_detail["save_pct"] = round(
+        away_stats["saves"] / (away_stats["saves"] + away_conceded), 3
+    ) if (away_stats["saves"] + away_conceded) else 0.0
 
     plog.sort(key=lambda r: r["min"])
     # [2026-08 신설] 22명(양팀 라인업 슬롯 순서, 빈 슬롯은 None) 전원의
@@ -579,6 +744,7 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
     return {
         "home_score": home_score, "away_score": away_score,
         "home_stats": home_stats, "away_stats": away_stats,
+        "home_stats_detail": home_detail, "away_stats_detail": away_detail,
         "possession_log": plog,
         "home_player_ratings": home_player_ratings,
         "away_player_ratings": away_player_ratings,

@@ -723,6 +723,10 @@ class CenterPanel(QWidget):
         if not p or not st:
             return
 
+        # [2026-09 제거] 라이브 물리엔진을 없애면서(경기결정=tactical_engine,
+        # 실측 0.002초) 프리페치 부트스트랩도 같이 제거했다 — 더는 미리
+        # 돌려둘 무거운 계산이 없다.
+
         # [2026-08 버그수정, 신민용 리포트: "1년씩 돌린 후 팀 입단하면 이제
         # 1년씩 돌리진 못하는데, 우측 버튼엔 여전히 1년으로 남아있다"]
         # 1년 넘기기는 팀이 없을 때만 쓸 수 있는 모드(_set_mode_year 진입
@@ -1933,8 +1937,9 @@ class CenterPanel(QWidget):
             self._show_processing_overlay("⏳ 진행 중...")
 
         self._advance_worker = _AdvanceWorker(schedule, self)
-        if _is_season_transition:
-            self._advance_worker.stage_progress.connect(self._on_advance_stage_progress)
+        # [2026-09] 예전엔 시즌 전환일 때만 진행률을 받았다. 이제는 평범한
+        # 주 진행에도 경기 시뮬(약 7초)이 들어가므로 항상 연결한다.
+        self._advance_worker.stage_progress.connect(self._on_advance_stage_progress)
         self._advance_worker.finished_ok.connect(
             lambda: self._on_advance_finished())
         self._advance_worker.failed.connect(self._on_advance_failed)
