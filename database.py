@@ -498,6 +498,63 @@ def _migrate_backfill_career_years():
     print(f"[MIGRATE] career_years 백필 완료 {_t:.2f}s")
 
 
+# [2026-09 신설, 신민용 리포트: "대회 필터에 월드컵이나 유로 같은 게 안
+# 보인다"] award_kind/competition 컬럼을 season_individual_awards에
+# 새로 추가하면서, 그 이전에 이미 계산돼 저장된 개인상 행(기존 세이브)은
+# 이 두 컬럼이 비어있다 — "대회" 필터 드롭다운은 이 컬럼을 직접
+# SELECT DISTINCT하므로, 비어있으면 그 대회가 필터 목록에서 통째로 빠져
+# 보였다(값 자체는 award_type 문자열 안에 그대로 있는데도). award_type
+# 에서 역파싱해 한 번만 채워 넣는다(세이브당 1회, meta 플래그로 완료
+# 체크 — career_years_backfill_v1과 동일 패턴).
+_AWARD_KIND_SUFFIXES = (
+    # 긴 접미어부터 먼저 검사해야 "MVP"가 "구단 올해의 선수" 등 안에서
+    # 잘못 먼저 매치되는 일이 없다(실제로는 공백 경계로 나뉘어 있어
+    # 겹칠 일은 없지만, 순서를 명확히 하기 위해 긴 것부터 나열).
+    "구단 올해의 선수", "올해의 수비수", "영플레이어", "베스트11",
+    "골든글러브", "도움왕", "득점왕", "MVP",
+)
+
+
+def _split_award_type_for_backfill(award_type, category):
+    """award_type("{대회명} {부문}" 형식) → (competition, award_kind)로
+    역파싱. category='world'(발롱도르/FIFA 푸스카스상 등 세계 고유상)는
+    대회명 개념이 없으므로 competition=None, award_kind=award_type 그대로."""
+    if category == 'world':
+        return None, award_type
+    for kind in _AWARD_KIND_SUFFIXES:
+        if award_type == kind:
+            return None, kind
+        suffix = " " + kind
+        if award_type.endswith(suffix):
+            return award_type[: -len(suffix)].strip() or None, kind
+    return None, award_type
+
+
+def _migrate_backfill_award_kind_competition():
+    conn = get_conn(); c = conn.cursor()
+    try:
+        done = c.execute(
+            "SELECT value FROM meta WHERE key='award_kind_backfill_v1'").fetchone()
+    except sqlite3.OperationalError:
+        return
+    if done and done["value"] == "1":
+        return
+    try:
+        rows = c.execute(
+            """SELECT id, award_type, category FROM hist.season_individual_awards
+               WHERE award_kind IS NULL OR award_kind=''""").fetchall()
+    except sqlite3.OperationalError:
+        return  # 이 마이그레이션보다 먼저 실행돼야 할 컬럼 추가 자체가 아직 없는 아주 옛 세이브
+    for r in rows:
+        comp, kind = _split_award_type_for_backfill(r["award_type"], r["category"] or "world")
+        c.execute(
+            "UPDATE hist.season_individual_awards SET award_kind=?, competition=? WHERE id=?",
+            (kind, comp, r["id"]))
+    c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('award_kind_backfill_v1','1')")
+    conn.commit()
+    print(f"[MIGRATE] 개인상 award_kind/competition 백필 완료 ({len(rows)}행)")
+
+
 def seed_my_player_initial_ovr(year, ovr):
     """[2026-08 신설] seed_initial_ovr_history의 my_player 버전 —
     세이브 첫 해(시즌 전환이 한 번도 없었던 시점)는 record_my_player_
@@ -909,6 +966,39 @@ def init_db():
         player_id INTEGER, year INTEGER, competition TEXT,
         matches INTEGER, goals INTEGER, assists INTEGER, rating REAL,
         PRIMARY KEY(player_id, year, competition)) WITHOUT ROWID""")
+
+    # [2026-09 신설, 신민용 요청: "발롱도르 등 개인상도 AI 선수들끼리(그리고
+    # 나 자신도 같은 기준으로) 세계 단위로 계산해서 세계기록실에서 보고
+    # 싶다"] 그 해 발롱도르 Top30 / FIFA 푸스카스상 Top10을 담는 표 —
+    # player_id는 ai_players.id 또는 world_browser.MY_PLAYER_ID(-1, 내
+    # 선수도 같은 파이프라인으로 채점해 순위를 매기므로). 설계 문서
+    # design_ballon_dor.md 참고. score_* 컬럼들은 표에 그대로 컬럼으로
+    # 노출할 세부 점수 breakdown(트로피/평점/생산성/포지션보정) — 후보
+    # 게이트(등급/국제무대 증명)는 이 표에 안 남고 game_engine.py의
+    # _get_ballon_candidates가 계산 시점에만 걸러낸다.
+    # UNIQUE(year, award_type, rank)는 계산 재실행 시 중복 INSERT를 막는
+    # 안전망(1차 방어는 game_engine._compute_season_individual_awards의
+    # award_type별 완료 체크).
+    c.execute("""CREATE TABLE IF NOT EXISTS hist.season_individual_awards(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        year INTEGER NOT NULL,
+        award_type TEXT NOT NULL,
+        rank INTEGER NOT NULL,
+        player_id INTEGER NOT NULL,
+        team_id INTEGER,
+        position TEXT,
+        total_score REAL,
+        score_trophy REAL,
+        score_rating REAL,
+        score_goals_assists REAL,
+        score_position_adj REAL,
+        goal_event_id INTEGER,
+        category TEXT DEFAULT 'world',
+        UNIQUE(year, award_type, rank))""")
+    c.execute("""CREATE INDEX IF NOT EXISTS hist.idx_sia_year_award
+               ON season_individual_awards(year, award_type, rank)""")
+    c.execute("""CREATE INDEX IF NOT EXISTS hist.idx_sia_player
+               ON season_individual_awards(player_id)""")
 
     # [2026-08 신설, 신민용 리포트: "선수 검색에서 나(my_player)를 보면
     # OVR이 하나도 안 찍혀있다"] ai_player_ovr_history와 완전히 같은
@@ -2056,6 +2146,14 @@ def init_db():
         # 더 강한 회복 모멘텀을 준다(_process_promotion_relegation 참고).
         # 강등되면 +1, 강등을 면하면(잔류/승격) 0으로 리셋.
         "ALTER TABLE teams ADD COLUMN relegation_streak INTEGER DEFAULT 0",
+        # [2026-09 신설, 신민용 확정: "중위권 정체 탈출" momentum] 명문팀
+        # (prestige_level>=BIG_CLUB_PRESTIGE_THRESHOLD)이 강등은 안 당했지만
+        # 몇 시즌째 중위권(순위 백분위 STAGNATION_TRIGGER_PCT 초과)에 머무는지
+        # 세는 카운터 — relegation_streak과 같은 패턴이지만 판정 대상이
+        # "강등"이 아니라 "중위권 정체"라는 점만 다르다. 1~4위 정도로
+        # 복귀하면 0으로 리셋, 5~8위권이면 유지, 9위 이하면 +1
+        # (game_engine.py _process_promotion_relegation 참고).
+        "ALTER TABLE teams ADD COLUMN stagnation_streak INTEGER DEFAULT 0",
         # [2026-08 신설, 신민용 확정: 포메이션 20개 확장 + 전술 성향 시스템]
         # tactic_tendency: 팀 생성 시 1회 가중 랜덤 배정되는 장기 전술 철학
         # (VERY_ATTACKING~VERY_DEFENSIVE, constants.TACTIC_TENDENCIES 참고) —
@@ -2402,6 +2500,48 @@ def init_db():
         "ALTER TABLE hist.ai_player_season_stats_by_comp ADD COLUMN goals_conceded INTEGER DEFAULT 0",
         "ALTER TABLE intl_squad ADD COLUMN saves INTEGER DEFAULT 0",
         "ALTER TABLE intl_squad ADD COLUMN goals_conceded INTEGER DEFAULT 0",
+        # [2026-09 신설, 신민용 요청: "국제대회 클럽 대항전 리그전도 만들라고
+        # 했잖아"] season_individual_awards가 처음엔 발롱도르/푸스카스만
+        # 담을 계획이라 이 컬럼이 없었다 — 이제 클럽 대항전/국제대회(그리고
+        # 곧 리그전) 개인상도 같은 표에 같이 저장하면서, "이 행이 세계상/
+        # 클럽대항전/국제대회/리그전 중 어디 카테고리인지"를 구분할 값이
+        # 필요해졌다. 기존 값은 전부 발롱도르/푸스카스였으므로 기본값
+        # 'world'로 채우면 과거 저장분도 그대로 맞는다.
+        "ALTER TABLE hist.season_individual_awards ADD COLUMN category TEXT DEFAULT 'world'",
+        # [2026-09 신설, 신민용 리포트: "팀은 안 떠, 국적 칸도 따로 만들고
+        # 상 종류/대회명별 필터도 있어야 한다"] 예전엔 "선수 검색"과 완전히
+        # 같은 화면(get_ai_player_detail)을 매번 다시 조회해서 팀명/국적을
+        # 채웠는데, 그 조회가 "지금 이 순간의 소속팀"이라 이후 이적하면
+        # 수상 당시 팀과 달라지고(세계기록실 취지에 안 맞음), 무소속으로
+        # 잠깐 걸치는 시점이면 통째로 빈 문자열이 될 수 있었다 — 저장
+        # 시점에 팀명/국적/국기를 스냅샷으로 같이 남겨서 이후 무슨 일이
+        # 있어도 항상 채워져 있게 한다(단, 표시 "이름"은 여전히 그때그때
+        # 최신 커스텀이름을 즉석 조회 — 이름은 스냅샷하면 안 된다, 사용자가
+        # 나중에 이름을 바꾸면 과거 수상 기록에도 바로 반영돼야 하므로).
+        # award_kind(부문: MVP/득점왕/도움왕/베스트11/영플레이어/올해의
+        # 수비수/구단 올해의 선수/발롱도르/FIFA 푸스카스상)와 competition
+        # (대회/리그명, 세계상은 NULL)은 UI 필터(대회명별/부문별)가 문자열
+        # 파싱 없이 바로 쓸 수 있도록 award_type과 별개로 분리 저장한다.
+        "ALTER TABLE hist.season_individual_awards ADD COLUMN team_name TEXT",
+        "ALTER TABLE hist.season_individual_awards ADD COLUMN nationality TEXT",
+        "ALTER TABLE hist.season_individual_awards ADD COLUMN nat_flag TEXT",
+        "ALTER TABLE hist.season_individual_awards ADD COLUMN award_kind TEXT",
+        "ALTER TABLE hist.season_individual_awards ADD COLUMN competition TEXT",
+        # [2026-09 신설, 신민용 요청: "리그 필터는 대회/부문이 아니라 국가|
+        # 몇부|부문으로, 골/도움도 따로 표시해야 한다"] 리그전 전용 필터축
+        # (국가/부)과, 순수 생산력 수치(골/도움을 합산값 하나로만 남기지
+        # 않고 각각)를 별도 컬럼으로 저장한다 — league_country/league_tier는
+        # category='league'가 아닌 행에서는 항상 NULL.
+        "ALTER TABLE hist.season_individual_awards ADD COLUMN league_country TEXT",
+        "ALTER TABLE hist.season_individual_awards ADD COLUMN league_tier INTEGER",
+        "ALTER TABLE hist.season_individual_awards ADD COLUMN stat_goals INTEGER",
+        "ALTER TABLE hist.season_individual_awards ADD COLUMN stat_assists INTEGER",
+        # [2026-09 신설, 신민용 요청: "키퍼는 선방 실점 이렇게 해서 보내고"]
+        # 골든글러브(GK 최다 클린시트) 등 키퍼 전용 개인상 표시용.
+        "ALTER TABLE hist.season_individual_awards ADD COLUMN stat_saves INTEGER",
+        "ALTER TABLE hist.season_individual_awards ADD COLUMN stat_goals_conceded INTEGER",
+        "CREATE INDEX IF NOT EXISTS hist.idx_sia_league_country ON season_individual_awards(category, year, league_country, league_tier)",
+        "CREATE INDEX IF NOT EXISTS hist.idx_sia_category_year ON season_individual_awards(category, year)",
     ]:
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,
@@ -2693,6 +2833,7 @@ def init_db():
     _migrate_history_db_split()   # 선수 이력 2표 main→history.db(hist) 이전 (1회성, 아래 참고)
     _migrate_history_db_split_v2()  # 파워랭킹/시즌순위 4표 main→history.db 이전 (1회성)
     _migrate_backfill_career_years()  # career_years 컬럼 1회성 백필 (아래 참고)
+    _migrate_backfill_award_kind_competition()  # 개인상 award_kind/competition 1회성 백필 (아래 참고)
     _migrate_phantom_career_entries()   # 유령 재직기록(길이0·0경기) 정리 (1회성, 아래 참고)
     _migrate_orphaned_ai_players()   # 이름 지어놓고 통째로 사라진 고아 ai_players 복구 (1회성, 아래 참고)
     compact_existing_match_archive()   # 기존 세이브 match_results_archive 요약+정리 (1회성, 아래 참고)

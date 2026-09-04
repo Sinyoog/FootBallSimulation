@@ -620,7 +620,19 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
     # [2026-09 신설] 국가대표 평점/골/어시 스냅샷 — 위와 완전히 같은
     # 타이밍(로스터가 은퇴/이적으로 바뀌기 전, 이 해 대회가 이미 끝난
     # 시점)에 호출한다.
-    _snapshot_intl_season_ratings(c, year)
+    # [2026-09 버그수정, 신민용 지적: "국제대회 개인 활약을 발롱도르에
+    # 반영해야 하는데 이 스냅샷이 없어서 못 쓴다"고 생각했으나, 실제로는
+    # 이 스냅샷 자체가 위 _snapshot_season_ratings와 똑같은 문제를 안고
+    # 있었다 — game_engine._end_of_season은 _compute_season_individual_
+    # awards(발롱도르 계산)보다 먼저 _snapshot_season_ratings만 조기
+    # 호출해두고 skip_season_snapshot=True로 여기서 또 안 돌게 막았는데,
+    # 이 국가대표 스냅샷은 그 가드 밖에 있어서 "발롱도르 계산 시점엔
+    # 아직 없고, 한참 뒤 여기서야 채워지는" 순서 문제가 있었다. 이제 위와
+    # 같은 skip_season_snapshot 가드 안으로 옮긴다 — game_engine.py 쪽에도
+    # 같은 조기 호출을 추가했다(아래 game_engine._end_of_season "1.4단계"
+    # 참고).
+    if not skip_season_snapshot:
+        _snapshot_intl_season_ratings(c, year)
 
     # [2026-09 버그수정, 신민용 리포트: "세계 기록실에서 특정 연도만
     # 포메이션 기록이 없다 — 시작 연도만 떠있고 그 다음 해부터 사라진다"]
@@ -1516,7 +1528,8 @@ def _build_team_pos_group_count(rows):
 
 
 def _find_buy_replacement(position, target_ovr, dst_team_id, dst_cname,
-                           pools, team_info, team_pos_group_count, used_ids):
+                           pools, team_info, team_pos_group_count, used_ids,
+                           global_scouting=False):
     """[2026-09 신설, 신민용+GPT 협업: "명문팀은 은퇴자를 유망주 즉시
     생성으로 채우지 않고, 먼저 시장에서 검증된 선수를 영입 시도한다"]
     target_ovr(은퇴자 자리의 "성인 잠재치") 기준 BUY_REPLACEMENT_OVR_BAND
@@ -1527,6 +1540,23 @@ def _find_buy_replacement(position, target_ovr, dst_team_id, dst_cname,
     가중추첨으로 처리). 어릴수록(BUY_REPLACEMENT_YOUNG_AGE 이하) 뽑힐
     확률을 높이고, 자기 팀 소속·이미 이번 시즌에 다른 은퇴자리로 뽑힌
     선수·자기 팀에서 그 포지션그룹 마지막 1명은 후보에서 제외한다.
+
+    [2026-09 확장, 신민용 지적: "브라질처럼 선수 풀이 큰 나라는 국내
+    우선 검색이 항상 1단계에서 후보를 찾아버려서, 정작 그 위의 좋은
+    선수가 해외로 안 흘러나간다 — 국가 등급은 좋은 선수가 나올 확률에만
+    영향을 줘야지, 일단 나온 선수가 어디로 갈지를 국적/자국 우선으로
+    가둬버리면 안 된다"] 목적지 팀이 SS/S급 리그거나 prestige_level>=2
+    (호출부가 판정해 global_scouting로 넘김 — 판정 기준을 이 함수 안에
+    새로 만들지 않고 호출부의 기존 grade/_plvl 계산을 그대로 재사용)면
+    검색 순서를 뒤집어 전세계(자국 제외) 후보를 먼저 보고, 없을 때만
+    자국으로 좁힌다. 이때도 후보 평가 자체(OVR 밴드, 포지션그룹 보호,
+    나이 가중치)는 전혀 건드리지 않고 "어느 순서로 국내/해외를 보는가"
+    만 바꾼다 — 그리고 _prestige_scouting이 이미 쓰고 있는 "약한 리그가
+    강한 리그에서 못 뺏어온다"는 동일한 가드(LEAGUE_GRADE_RANK, 후보의
+    리그 등급이 목적지보다 높으면 제외)를 global_scouting 경로에만 추가로
+    적용한다 — 그래야 전세계 검색으로 바뀐 게 "명문팀이 항상 세계 최고
+    OVR만 쓸어간다"는 반대 방향 쏠림으로 이어지지 않는다(일반 팀의 기존
+    국내/해외 2단계 동작은 이 가드 없이 그대로 유지).
     반환: 뽑힌 선수 행(sqlite3.Row) 또는 후보가 없으면 None."""
     from constants import BUY_REPLACEMENT_OVR_BAND, BUY_REPLACEMENT_YOUNG_AGE, BUY_REPLACEMENT_YOUNG_WEIGHT
     pool = pools.get(position)
@@ -1541,6 +1571,14 @@ def _find_buy_replacement(position, target_ovr, dst_team_id, dst_cname,
     if not cands:
         return None
 
+    dst_rank = 4
+    _grade_rank = None
+    if global_scouting:
+        from economy import LEAGUE_GRADE_RANK
+        _grade_rank = LEAGUE_GRADE_RANK
+        _dst_ti = team_info.get(dst_team_id)
+        dst_rank = _grade_rank.get(_dst_ti[0] if _dst_ti else "D", 4)
+
     def _filter(same_country):
         out = []
         for r in cands:
@@ -1552,15 +1590,24 @@ def _find_buy_replacement(position, target_ovr, dst_team_id, dst_cname,
                 continue
             if (not same_country) and cname_r == dst_cname:
                 continue
+            if global_scouting:
+                r_rank = _grade_rank.get(ti[0] if ti else "D", 1)
+                if r_rank > dst_rank:
+                    continue   # 약한 목적지가 더 강한 리그에서 못 뺏어옴
             grp = _POS_GROUP.get(r["position"], "FW")
             if team_pos_group_count.get((r["team_id"], grp), 0) <= 1:
                 continue
             out.append(r)
         return out
 
-    chosen = _filter(True)
-    if not chosen:
-        chosen = _filter(False)
+    if global_scouting:
+        chosen = _filter(False)   # 전세계(자국 제외) 우선
+        if not chosen:
+            chosen = _filter(True)   # 없으면 자국으로 폴백
+    else:
+        chosen = _filter(True)    # 기존 동작: 자국 우선
+        if not chosen:
+            chosen = _filter(False)   # 없으면 해외로 폴백
     if not chosen:
         return None
     weights = [BUY_REPLACEMENT_YOUNG_WEIGHT if (r["age"] or 25) <= BUY_REPLACEMENT_YOUNG_AGE else 1.0
@@ -1811,7 +1858,8 @@ def _retire_and_replace(c, year, ai_rows=None):
     # 같이 담아서, 이후 루프에서는 dict 조회만 하도록 고친다.
     from data.prestige_clubs import is_prestige, prestige_level, PRESTIGE_LEVEL_OVR_BONUS
     from constants import (CLUB_STRENGTH_OVR_BONUS_K, CLUB_STRENGTH_OVR_BONUS_MIN,
-                           CLUB_STRENGTH_OVR_BONUS_MAX, CLUB_STRENGTH_OVR_BONUS_MODE)
+                           CLUB_STRENGTH_OVR_BONUS_MAX, CLUB_STRENGTH_OVR_BONUS_MODE,
+                           STAGNATION_TARGET_OVR_BONUS, STAGNATION_BUY_PROB_BONUS)
     # [2026-08 신설, 은퇴 시스템 tier 연동] 국가별 "가장 깊은 부수"를
     # 미리 조회해둔다 — 7부까지 있는 나라는 6~7부, 5부까지인 나라는
     # 5부가 그 나라의 "최하위"가 되도록, tier를 국가마다 다른 절대
@@ -1820,10 +1868,12 @@ def _retire_and_replace(c, year, ai_rows=None):
     country_max_tier = {r["cid"]: r["mt"] for r in c.execute(
         "SELECT country_id AS cid, MAX(tier) AS mt FROM leagues GROUP BY country_id").fetchall()}
 
-    team_info = {}  # {team_id: (grade, tier, bonus, cname, continent, tname, club_strength, retire_cat)}
+    team_info = {}  # {team_id: (grade, tier, bonus, cname, continent, tname, club_strength, retire_cat, max_tier, momentum_type, momentum_seasons_left)}
     for r in c.execute(
             """SELECT t.id AS tid, t.name AS tname, t.current_tier AS tier,
                       t.club_strength AS club_strength,
+                      t.momentum_type AS momentum_type,
+                      t.momentum_seasons_left AS momentum_seasons_left,
                       cn.id AS cid, cn.name AS cname, cn.continent AS continent
                FROM teams t
                JOIN leagues l ON t.league_id = l.id
@@ -1842,7 +1892,8 @@ def _retire_and_replace(c, year, ai_rows=None):
         _max_tier = country_max_tier.get(r["cid"], _tier)
         _retire_cat = _retire_league_category(grade, _tier, _max_tier)
         team_info[r["tid"]] = (grade, _tier, bonus, r["cname"], r["continent"], r["tname"],
-                                r["club_strength"] or 0.0, _retire_cat, _max_tier)
+                                r["club_strength"] or 0.0, _retire_cat, _max_tier,
+                                r["momentum_type"] or "", r["momentum_seasons_left"] or 0)
 
     # [2026-08 신설, 신민용 확정(GPT 협업): "월드컵 등 국제대회에 출전할
     # 정도면 29세 이전 은퇴는 이상하잖아"] 국가대표(어느 대회든 intl_squad
@@ -1944,8 +1995,14 @@ def _retire_and_replace(c, year, ai_rows=None):
         #  + 대륙/나라 보정. [조정] 예전엔 중간값+5까지 허용해서 신인이 데뷔부터
         #  거의 에이스급으로 들어왔다(A등급 기준 82~91). 하단~중간(82~86)으로
         #  좁혀서, 실제로 몇 시즌 성장해야 에이스 근처에 도달하도록 한다.
-        grade, tier, _bonus, cname, continent, _tname, _club_strength, _cat_unused, _mt_unused = team_info.get(
-            r["team_id"], ("D", 1, 0, "", "유럽", "", 0.0, "mid", 1))
+        (grade, tier, _bonus, cname, continent, _tname, _club_strength, _cat_unused, _mt_unused,
+         _mom_type, _mom_left) = team_info.get(
+            r["team_id"], ("D", 1, 0, "", "유럽", "", 0.0, "mid", 1, "", 0))
+        # [2026-09 신설, "중위권 정체 탈출" momentum] 이 팀이 지금 그
+        # momentum이 활성 상태인지 — constants.STAGNATION_TARGET_OVR_BONUS/
+        # STAGNATION_BUY_PROB_BONUS 정의부 주석 참고. club_strength 보너스와
+        # 별개로 대체 선수 목표 OVR·시장 영입 확률에 직접 가산한다.
+        _stag_active = _mom_left > 0 and _mom_type.startswith("mid_table_stagnation")
         # [2026-08] COUNTRY_LEAGUE_OVR_OVERRIDE 등록국이면 최우선 사용 —
         # 이미 그 나라 실측에 맞춘 값이라 대륙/국가 보정(_bonus)은 중복
         # 적용하지 않는다(초기 시딩의 _tier_top_ovr(country=...)와 동일 원칙).
@@ -2043,6 +2100,14 @@ def _retire_and_replace(c, year, ai_rows=None):
             _cs_bonus = 0.0
         target += _cs_bonus
 
+        # [2026-09 신설, "중위권 정체 탈출" momentum] 위 club_strength 보정과
+        # 별개로, 그 팀이 지금 이 momentum이 활성 상태면 대체 선수 목표 OVR에
+        # 추가로 더한다(constants.STAGNATION_TARGET_OVR_BONUS). 순위 자체를
+        # 직접 보정하는 게 아니라 "다음 세대는 조금 더 강하게 뽑아 온다"는
+        # 간접 효과다.
+        if _stag_active:
+            target += STAGNATION_TARGET_OVR_BONUS.get(_mom_type, 0.0)
+
         # [2026-09 신설, 신민용+GPT 협업: "명문팀은 은퇴자를 유망주 즉시
         # 생성으로 채우지 않고, 먼저 시장에서 검증된 선수를 영입 시도한다
         # — 정말 적합한 선수가 없을 때만 자체 유스 생성을 fallback으로
@@ -2056,10 +2121,26 @@ def _retire_and_replace(c, year, ai_rows=None):
         if _plvl >= BIG_CLUB_PRESTIGE_THRESHOLD and _buy_grade not in ("SS", "S"):
             _buy_grade = "S"
         _buy_prob = BUY_REPLACEMENT_PROB_BY_GRADE.get(_buy_grade, 0.10)
+        # [2026-09 신설, "중위권 정체 탈출" momentum] 위 target 가산과 같은
+        # 이유 — 시장에서 검증된 선수를 사려는 시도 자체를 더 자주 하게
+        # 만든다(constants.STAGNATION_BUY_PROB_BONUS). 0.97 상한은 다른
+        # 확률 캡과 동일한 관례(완전한 100%는 피함).
+        if _stag_active:
+            _buy_prob = min(0.97, _buy_prob + STAGNATION_BUY_PROB_BONUS.get(_mom_type, 0.0))
         if random.random() < _buy_prob:
+            # [2026-09 신설, 신민용 확정: "국가 등급은 좋은 선수가 나올
+            # 확률에만 영향을 줘야지, 이미 나온 좋은 선수가 어디로 갈지를
+            # 국내 우선 검색으로 가둬버리면 안 된다"] 목적지가 SS/S급
+            # 리그거나(원래도 여기서 이미 계산돼 있는 grade) 프레스티지
+            # 2급 이상(_plvl, 위에서 이미 계산됨)이면 _find_buy_replacement가
+            # 국내 우선 대신 전세계 우선으로 찾도록 플래그만 넘긴다 —
+            # 판정 기준을 새로 만들지 않고 이 시점에 이미 있는 계산을
+            # 재사용(brazil 등 선수 풀이 큰 나라의 폐쇄 루프 완화용).
+            _global_scouting = grade in ("SS", "S") or _plvl >= BIG_CLUB_PRESTIGE_THRESHOLD
             _bought = _find_buy_replacement(
                 r["position"], round(target), r["team_id"], cname,
-                _buy_pools, team_info, _buy_pos_group_count, _buy_used_ids)
+                _buy_pools, team_info, _buy_pos_group_count, _buy_used_ids,
+                global_scouting=_global_scouting)
             if _bought is not None:
                 _buy_used_ids.add(_bought["id"])
                 _bgrp = _POS_GROUP.get(_bought["position"], "FW")
@@ -2408,12 +2489,19 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
     teams = [dict(r) for r in c.execute(
         """SELECT t.id AS tid, t.league_id AS lid, t.current_tier AS tier,
                   t.name AS tname, cn.id AS cid, cn.name AS cname,
+                  t.momentum_type AS momentum_type, t.momentum_seasons_left AS momentum_seasons_left,
                   (SELECT AVG(ovr) FROM ai_players WHERE team_id=t.id) AS avg_ovr
            FROM teams t
            JOIN leagues l ON t.league_id = l.id
            JOIN countries cn ON l.country_id = cn.id
            ORDER BY t.id""").fetchall()]
     team_avg = {t["tid"]: (t["avg_ovr"] or 50) for t in teams}
+    # [2026-09 신설, "중위권 정체 탈출" momentum] 이 momentum이 활성 상태인
+    # 팀은 방출 쪽(_team_category)에서 "낮은 OVR 선수 정리 우선순위 ↑"를
+    # 담당한다 — 아래 _team_category에서 참조.
+    _stagnant_tids = {t["tid"] for t in teams
+                       if (t["momentum_seasons_left"] or 0) > 0
+                       and (t["momentum_type"] or "").startswith("mid_table_stagnation")}
     # [2026-08 신설, 신민용 리포트: "38~39세 OVR84~86짜리가 바르셀로나로
     # 이적하고, 유럽 5대 리그가 왜 저런 퇴물급을 영입하냐"] 목적지 선택이
     # 순수 OVR 격차·스쿼드 크기만 보고 나이는 전혀 안 봤던 게 원인 —
@@ -2619,12 +2707,23 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
             return "promoted"
         pct = rank_pct_by_team.get(tid)
         if pct is None:
-            return "mid"
-        if pct <= 0.25:
-            return "strong"
-        if pct >= 0.75:
+            cat = "mid"
+        elif pct <= 0.25:
+            cat = "strong"
+        elif pct >= 0.75:
+            cat = "weak"
+        else:
+            cat = "mid"
+        # [2026-09 신설, "중위권 정체 탈출" momentum, 신민용 확정: "낮은
+        # OVR 선수 정리 우선순위 ↑"] 순위만 보면 "mid"(4~7위 정도)로 분류될
+        # 명문팀이라도, 이 momentum이 활성 상태면 "weak"과 같은 강도로
+        # 방출한다 — 실제 순위를 건드리지 않고 스쿼드 회전만 가속하는
+        # 방식(신민용 요청: 기존 카테고리 체계를 재활용, 새 등급을 안 만듦).
+        # 이미 "weak"/"relegated"인 팀은 그대로 둔다(더 강하게 만들 필요
+        # 없음 — 이미 그 카테고리의 공격적인 방출 폭을 쓰고 있음).
+        if cat == "mid" and tid in _stagnant_tids:
             return "weak"
-        return "mid"
+        return cat
 
     # [최적화] 팀별 선수 목록을 _retire_and_replace와 공유된 스냅샷에서 재사용
     all_players_rows = ai_rows if ai_rows is not None else c.execute(
@@ -4042,7 +4141,8 @@ def _snapshot_season_ratings(c, year, team_goals_for=None):
     공식에 넣는다. 그 팀이 그 해 그 대회에 아예 안 나갔으면(경기수 0)
     그 팀 선수들은 그 대회 행 자체가 안 생긴다."""
     from game_engine import (_estimate_ai_season, _estimate_ai_clean_sheets, _estimate_ai_gk_saves,
-                              _team_goal_scale_factors)
+                              _team_goal_scale_factors, _apply_squad_depth_decay)
+    from constants import get_goal_env_mult
 
     rows = c.execute(
         """SELECT ap.id AS id, ap.position AS position, ap.ovr AS ovr,
@@ -4073,6 +4173,16 @@ def _snapshot_season_ratings(c, year, team_goals_for=None):
         n = len(tids)
         league_matches[lid] = max(1, (n - 1) * legs_for_team_count(n))
 
+    # [2026-09 신설, 신민용 요청: "국가별로 리그 득점 계수를 하나 두는 게
+    # 좋다"] 리그별 국가 득점 환경 배율 — 전세계 리그를 한 번에 조회해
+    # lid -> 배율 딕셔너리로 미리 만들어둔다(_estimate_ai_season 호출부가
+    # 리그당 반복해서 조회할 필요 없게).
+    _league_country = {r["lid"]: r["country"] for r in c.execute(
+        """SELECT l.id AS lid, cn.name AS country FROM leagues l
+           JOIN countries cn ON l.country_id = cn.id""").fetchall()}
+    league_goal_mult = {lid: get_goal_env_mult(_league_country.get(lid))
+                         for lid in league_teams}
+
     # [2026-09 신설, "Tier B" 실제 골 합계 보정] 위 _estimate_ai_season는
     # 선수 개개인을 OVR 기반으로 독립 추정하므로, 한 팀 전원의 추정 골을
     # 더해도 그 팀이 이번 시즌 실제로 넣은 골(team_goals_for, 시즌 종료
@@ -4089,7 +4199,8 @@ def _snapshot_season_ratings(c, year, team_goals_for=None):
         fsm = league_matches.get(lid, 38)
         g, a, rt = _estimate_ai_season(
             r["ovr"] or 0, r["position"], team_avg.get(tid, 50.0),
-            league_avg.get(lid, 50.0), r["sub_role"], full_season_matches=fsm)
+            league_avg.get(lid, 50.0), r["sub_role"], full_season_matches=fsm,
+            goal_env_mult=league_goal_mult.get(lid, 1.0))
         # [2026-09 신설, 신민용 요청: "GK들은 골 어시보단 선방률 이런걸로
         # 표시해야 하잖아"] 골/도움과 별개로 클린시트(무실점 경기 수)도
         # 같이 추정한다 — GK가 아닌 포지션도 값 자체는 계산·저장해두지만
@@ -4108,6 +4219,20 @@ def _snapshot_season_ratings(c, year, team_goals_for=None):
                 r["ovr"] or 0, team_avg.get(tid, 50.0), league_avg.get(lid, 50.0),
                 full_season_matches=fsm)
         raw.append([r["id"], year, tid, fsm, g, a, rt, cs, saves, goals_conceded])
+
+    # [2026-09 신설, 신민용 리포트: "팀 골이 30개면 애들이 골고루 나눠
+    # 갖는 것 같다 — 득점왕이 10골 정도밖에 안 된다"] 스쿼드 뎁스 감쇠 —
+    # team_goals_for 스케일링 전에 적용해야 "팀 추정 합계"가 이미 쏠린
+    # 모양이 되고, 그 다음 실제 골 합계로 스케일링해도 쏠린 모양이 그대로
+    # 유지된다(game_engine._apply_squad_depth_decay 문서 참고). raw는
+    # 컬럼 위치 고정 리스트(rows와 같은 순서로 1:1 대응)라, 그 자리에서
+    # goals(row[4])/assists(row[5])만 덮어쓰는 얇은 dict 래퍼를 만들어
+    # 공유 함수에 넘긴 뒤 결과를 다시 raw에 되돌려 쓴다.
+    _depth_rows = [{"team_id": r["team_id"], "position": r["position"], "ovr": r["ovr"] or 0,
+                     "goals": row[4], "assists": row[5]} for r, row in zip(rows, raw)]
+    _apply_squad_depth_decay(_depth_rows, key_fn=lambda d: (d["team_id"], d["position"]))
+    for row, d in zip(raw, _depth_rows):
+        row[4], row[5] = d["goals"], d["assists"]
 
     if team_goals_for:
         # [2026-09 통일, 신민용 요청: "득점왕 판정도 세계기록실 골이랑 같은
@@ -4175,7 +4300,8 @@ def _snapshot_season_ratings(c, year, team_goals_for=None):
                 continue
             g, a, rt = _estimate_ai_season(
                 r["ovr"] or 0, r["position"], team_avg.get(tid, 50.0),
-                league_avg.get(lid, 50.0), r["sub_role"], full_season_matches=fsm)
+                league_avg.get(lid, 50.0), r["sub_role"], full_season_matches=fsm,
+                goal_env_mult=league_goal_mult.get(lid, 1.0))
             cs = _estimate_ai_clean_sheets(
                 r["position"], r["ovr"] or 0, team_avg.get(tid, 50.0),
                 league_avg.get(lid, 50.0), full_season_matches=fsm)

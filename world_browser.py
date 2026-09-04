@@ -2928,6 +2928,350 @@ def _attach_placements_and_flags(rows, conn):
     return rows
 
 
+# ─────────────────────────────────────────
+# 4.5. 역대 개인상(발롱도르/푸스카스) — 2026-09 신설
+# ─────────────────────────────────────────
+def get_individual_award_years():
+    """역대 개인상(발롱도르/푸스카스)이 계산된 연도 목록(최신순) — 세계
+    기록실 "역대 개인상" 탭 좌측 연도 목록에 그대로 쓴다."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT DISTINCT year FROM hist.season_individual_awards ORDER BY year DESC"
+    ).fetchall()
+    conn.close()
+    return [r["year"] for r in rows]
+
+
+def get_season_individual_awards(year, award_type):
+    """그 해 award_type('발롱도르' 또는 'FIFA 푸스카스상')의 저장된 순위
+    목록 — 선수 이름/팀명/국적까지 채워서 반환한다. player_id가
+    MY_PLAYER_ID(-1)면 get_ai_player_detail이 알아서 my_player로 채운다
+    (AI와 완전히 같은 반환 형태 — world_browser 기존 관례). 푸스카스상
+    행은 goal_event_id로 goal_events를 조회해 "어떤 슛이었는지"
+    설명(shot_desc)도 같이 채운다(2026-09 신설, 신민용 요청)."""
+    from constants import ai_player_code
+    from game_engine import _goal_shot_desc
+    conn = get_conn()
+    rows = [dict(r) for r in conn.execute(
+        """SELECT rank, player_id, team_id, position, total_score,
+                  score_trophy, score_rating, score_goals_assists, score_position_adj,
+                  goal_event_id, team_name, nationality, nat_flag
+           FROM hist.season_individual_awards
+           WHERE year=? AND award_type=? ORDER BY rank""",
+        (year, award_type)).fetchall()]
+
+    goal_ids = [r["goal_event_id"] for r in rows if r.get("goal_event_id") is not None]
+    goal_map = {}
+    if goal_ids:
+        qmarks = ",".join("?" * len(goal_ids))
+        for grow in conn.execute(
+                f"SELECT * FROM goal_events WHERE id IN ({qmarks})", goal_ids).fetchall():
+            goal_map[grow["id"]] = grow
+    conn.close()
+
+    for r in rows:
+        d = get_ai_player_detail(r["player_id"]) or {}
+        # [버그수정] ai_players.name(=data/names.py 원본 생성 이름, 예:
+        # "가브리엘 페르브뤼헌레안")을 그대로 보여주면 안 된다 — 이
+        # 게임의 다른 모든 화면(_show_player_detail 등)은 AI 선수를
+        # "커스텀 이름이 있으면 그 이름, 없으면 AI코드(예: AICD8C)"로만
+        # 표시하는 규칙을 쓴다. 여기도 완전히 같은 규칙을 따른다(이름은
+        # 절대 스냅샷하지 않고 항상 최신 커스텀이름을 즉석 조회 — 이름을
+        # 바꾸면 여기도 바로 반영돼야 하므로).
+        if r["player_id"] == MY_PLAYER_ID:
+            r["name"] = d.get("name") or "나"
+        else:
+            r["name"] = d.get("custom_name") or ai_player_code(r["player_id"])
+        # [2026-09 확장] team_name/nationality/nat_flag는 저장 시점 스냅샷을
+        # 우선 쓴다(수상 당시 소속이 정확히 남게) — 마이그레이션 이전 옛
+        # 데이터처럼 비어있을 때만 라이브 조회로 폴백.
+        r["team_name"] = r.get("team_name") or d.get("team_name") or ""
+        r["nat_flag"] = r.get("nat_flag") or d.get("nat_flag") or ""
+        r["nationality"] = r.get("nationality") or d.get("nationality") or ""
+        gid = r.get("goal_event_id")
+        r["shot_desc"] = _goal_shot_desc(goal_map.get(gid)) if gid is not None else ""
+    return rows
+
+
+def get_ballon_dor_winner(year):
+    """그 해 발롱도르 1위(rank=1) 수상자의 {player_id, name} — "역대
+    개인상" 세계상 패널의 연도 목록 옆에 붙는 보조 칸(2026-09 신설,
+    신민용 요청: "연도 옆에 그 당시 발롱도르 누가 탔는지 표시")이 쓴다.
+    player_id까지 같이 반환해 그 칸을 더블클릭하면 바로 선수 상세로
+    이동할 수 있게 한다(다른 개인상 표의 행 클릭과 동일한 관례). 없으면
+    None(그 해 아직 계산 전이거나 후보가 아예 없었던 극단적 예외)."""
+    from constants import ai_player_code
+    conn = get_conn()
+    row = conn.execute(
+        """SELECT player_id FROM hist.season_individual_awards
+           WHERE year=? AND award_type='발롱도르' AND rank=1""", (year,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    pid = row["player_id"]
+    d = get_ai_player_detail(pid) or {}
+    if pid == MY_PLAYER_ID:
+        name = d.get("name") or "나"
+    else:
+        name = d.get("custom_name") or ai_player_code(pid)
+    return {"player_id": pid, "name": name}
+
+
+# [2026-09 신설, 신민용 요청: "선수 검색에서 연도를 눌렀을 때 그 아래에
+# 한 줄을 더 만들고 거기에 받은 상들을 적는거 어때?"] 선수 검색 탭의
+# "연도별 기록"에서 연도를 펼치면(ui.world_browser_window._on_player_
+# team_year_clicked) 그 해 리그/컵/CL 스탯 요약 행이 이미 뜨는데,
+# 그 해 이 선수가 실제로 받은 개인상(발롱도르/푸스카스/리그·클럽대항전·
+# 국제대회 MVP·득점왕·베스트11 등)은 안 뜨고 있었다 — season_individual_
+# awards를 player_id 기준으로 한 번에 다 읽어 연도별로 묶어둔다(연도마다
+# 따로 쿼리하지 않고 이 선수의 전체 수상 이력을 한 번의 쿼리로 캐싱 —
+# _populate_player_team_box가 이미 연도 목록을 한 번에 순회하는 구조라
+# 여기서도 한 번만 조회하는 게 자연스럽다).
+def get_player_awards_by_year(player_id):
+    """{year: [표시용 문자열, ...]} — 그 선수가 받은 모든 개인상을 연도별로
+    묶어서 반환. 표시 문자열은 award_type(예: "발롱도르", "프리미어리그
+    MVP", "유럽 챔피언스리그 도움왕")을 기본으로 쓰되:
+      - 발롱도르/푸스카스(세계 단일 순위, category='world')는 순위가
+        핵심 정보라 "발롱도르 5위"처럼 rank를 덧붙인다.
+      - 베스트11은 자동으로 포지션이 곧 "몇 번째"인 슬롯이라 rank
+        숫자 자체는 의미가 없으므로 대신 포지션을 "(ST)"처럼 덧붙인다.
+      - 구단 올해의 선수는 팀마다 rank(1,2,3...)로 구분되는 서로 다른
+        팀 상이라 팀명을 "(레알 마드리드)"처럼 덧붙인다.
+      - 나머지(MVP/득점왕/도움왕/영플레이어/올해의 수비수/골든글러브/
+        골든볼 등)는 애초에 부문당 1명뿐이라 rank가 항상 1이므로 그냥
+        award_type 그대로 보여준다."""
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT year, award_type, award_kind, rank, position, team_name
+           FROM hist.season_individual_awards WHERE player_id=? ORDER BY year, rank""",
+        (player_id,)).fetchall()
+    conn.close()
+    by_year = {}
+    for r in rows:
+        kind = r["award_kind"] or r["award_type"]
+        # [주의] 실제 저장되는 award_kind는 "발롱도르"와 "FIFA 푸스카스상"
+        # (2009년 이전은 "올해의 최고의 골") — game_engine._save_ballon_
+        # dor_top30/_process_goal_awards가 쓰는 문자열과 정확히 맞춘다.
+        if kind in ("발롱도르", "FIFA 푸스카스상", "올해의 최고의 골"):
+            label = f"{r['award_type']} {r['rank']}위"
+        elif kind == "베스트11":
+            label = f"{r['award_type']}" + (f" ({r['position']})" if r["position"] else "")
+        elif kind == "구단 올해의 선수":
+            label = f"{r['award_type']}" + (f" ({r['team_name']})" if r["team_name"] else "")
+        else:
+            label = r["award_type"]
+        by_year.setdefault(r["year"], []).append(label)
+    return by_year
+
+
+# [2026-09 신설] 클럽 대항전(챔스/유로파/컨퍼런스/클럽월드컵/슈퍼컵) +
+# 국제대회(월드컵/대륙컵/지역컵) + 리그전 개인상 — game_engine._compute_
+# club_comp_individual_awards/_compute_intl_individual_awards/_compute_
+# league_individual_awards가 저장한 행을 읽는다. 발롱도르/푸스카스와
+# 같은 season_individual_awards 테이블을 공유하되, category 컬럼
+# ('world'/'club'/'intl'/'league')으로 카테고리를 구분한다(award_type
+# 텍스트만으로 구분하면 이름이 겹칠 위험이 있어 컬럼으로 명확히 분리 —
+# database.py의 category 마이그레이션 참고).
+#
+# [2026-09 확장, 신민용 리포트: "팀은 안 떠 / 국적 칸도 따로 / 대회명별
+# 상별 필터도 있어야 한다"] team_name/nationality/nat_flag는 이제 저장
+# 시점 스냅샷(수상 당시 소속 — game_engine._award_identity_snapshot)을
+# 우선 쓴다. 옛 세이브(이 마이그레이션 이전에 이미 계산돼 있던 행)는
+# 이 컬럼들이 비어있을 수 있어, 그때만 기존처럼 get_ai_player_detail
+# 라이브 조회로 폴백한다. award_kind/competition은 UI가 "대회명별/
+# 부문별" 필터를 문자열 파싱 없이 바로 걸 수 있도록 award_type과 별개로
+# 저장된 컬럼이다.
+def _get_category_award_years(category):
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT DISTINCT year FROM hist.season_individual_awards
+           WHERE category=? ORDER BY year DESC""", (category,)).fetchall()
+    conn.close()
+    return [r["year"] for r in rows]
+
+
+def get_category_competitions(year, category):
+    """그 해 해당 카테고리에 실제로 존재하는 대회명(competition) 목록
+    (중복제거·이름순) — "역대 개인상" 탭의 "대회" 필터 드롭다운용."""
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT DISTINCT competition FROM hist.season_individual_awards
+           WHERE year=? AND category=? AND competition IS NOT NULL AND competition != ''
+           ORDER BY competition""", (year, category)).fetchall()
+    conn.close()
+    return [r["competition"] for r in rows]
+
+
+def get_category_award_kinds(year, category, competition=None):
+    """그 해 해당 카테고리(선택적으로 특정 대회 한정)에 존재하는 부문
+    (award_kind, 예: MVP/득점왕/베스트11) 목록 — "부문" 필터 드롭다운용."""
+    conn = get_conn()
+    q = """SELECT DISTINCT award_kind FROM hist.season_individual_awards
+           WHERE year=? AND category=? AND award_kind IS NOT NULL AND award_kind != ''"""
+    params = [year, category]
+    if competition:
+        q += " AND competition=?"
+        params.append(competition)
+    rows = conn.execute(q + " ORDER BY award_kind", params).fetchall()
+    conn.close()
+    return [r["award_kind"] for r in rows]
+
+
+def _get_category_awards(year, category, competition=None, award_kind=None,
+                          league_country=None, league_tier=None):
+    """그 해 해당 카테고리 개인상 전체(대회/부문별로 여러 행) — 선수 이름/
+    팀명/국적까지 채워서 반환. competition/award_kind를 주면 그 조건으로
+    좁힌다(둘 다 None이면 그 해 전체). league_country/league_tier는
+    category='league' 전용 필터축("국가|몇부"). award_type 알파벳(가나다)
+    순으로 정렬해 같은 대회는 자연스럽게 모여 보이게 한다(MVP/득점왕이
+    이름이 같은 접두어를 공유하므로)."""
+    from constants import ai_player_code
+    conn = get_conn()
+    q = """SELECT award_type, award_kind, competition, rank, player_id, team_id, position,
+                  total_score, score_rating, score_goals_assists, stat_goals, stat_assists,
+                  stat_saves, stat_goals_conceded,
+                  team_name, nationality, nat_flag, league_country, league_tier
+           FROM hist.season_individual_awards
+           WHERE year=? AND category=?"""
+    params = [year, category]
+    if competition:
+        q += " AND competition=?"
+        params.append(competition)
+    if award_kind:
+        q += " AND award_kind=?"
+        params.append(award_kind)
+    if league_country:
+        q += " AND league_country=?"
+        params.append(league_country)
+    if league_tier:
+        q += " AND league_tier=?"
+        params.append(league_tier)
+    rows = [dict(r) for r in conn.execute(q + " ORDER BY award_type, rank", params).fetchall()]
+    for r in rows:
+        d = get_ai_player_detail(r["player_id"]) or {}
+        # [2026-09, 신민용 요청: "이름 바꾸면 여기도 바로 반영돼야 한다"]
+        # 이름은 절대 스냅샷하지 않고 항상 이 시점 최신 커스텀이름을 즉석
+        # 조회한다 — 그래야 "선수 검색"에서 이름을 바꾸는 즉시 여기도
+        # 반영된다.
+        if r["player_id"] == MY_PLAYER_ID:
+            r["name"] = d.get("name") or "나"
+        else:
+            r["name"] = d.get("custom_name") or ai_player_code(r["player_id"])
+        r["team_name"] = r.get("team_name") or d.get("team_name") or ""
+        r["nat_flag"] = r.get("nat_flag") or d.get("nat_flag") or ""
+        r["nationality"] = r.get("nationality") or d.get("nationality") or ""
+    return rows
+
+
+def get_club_comp_award_years():
+    """클럽 대항전(챔스/유로파/컨퍼런스/클럽월드컵/슈퍼컵) 개인상이
+    계산된 연도 목록(최신순)."""
+    return _get_category_award_years("club")
+
+
+def get_club_comp_award_competitions(year):
+    """그 해 클럽 대항전 개인상이 있는 대회명 목록(필터 드롭다운용)."""
+    return get_category_competitions(year, "club")
+
+
+def get_club_comp_award_kinds(year, competition=None):
+    """그 해 클럽 대항전 개인상 부문 목록(필터 드롭다운용)."""
+    return get_category_award_kinds(year, "club", competition)
+
+
+def get_club_comp_awards(year, competition=None, award_kind=None):
+    """그 해 클럽 대항전 개인상 — competition/award_kind로 좁힐 수 있다."""
+    return _get_category_awards(year, "club", competition, award_kind)
+
+
+def get_intl_award_years():
+    """국제대회(월드컵/대륙컵/지역컵) 개인상이 계산된 연도 목록(최신순)."""
+    return _get_category_award_years("intl")
+
+
+def get_intl_award_competitions(year):
+    """그 해 국제대회 개인상이 있는 대회명 목록(필터 드롭다운용)."""
+    return get_category_competitions(year, "intl")
+
+
+def get_intl_award_kinds(year, competition=None):
+    """그 해 국제대회 개인상 부문 목록(필터 드롭다운용)."""
+    return get_category_award_kinds(year, "intl", competition)
+
+
+def get_intl_awards(year, competition=None, award_kind=None):
+    """그 해 국제대회 개인상 — competition/award_kind로 좁힐 수 있다."""
+    return _get_category_awards(year, "intl", competition, award_kind)
+
+
+# [2026-09 신설, 신민용 확정: "리그는 구현이 제대로 안 됨"] game_engine.
+# _compute_league_individual_awards가 저장한 category='league' 행을
+# 읽는다. "구단 올해의 선수"는 competition이 팀명이 아니라 리그명으로
+# 저장되고(팀은 team_name 스냅샷 컬럼으로 구분) rank로 팀을 순서대로
+# 나열하므로, award_kind="구단 올해의 선수"로 필터한 뒤 화면에서
+# team_name 컬럼으로 어느 팀 상인지 보여주면 된다.
+#
+# [2026-09 확장, 신민용 요청: "리그 필터는 대회/부문이 아니라 국가|몇부|
+# 부문으로 가야 한다"] 클럽 대항전/국제대회는 "대회명" 하나로 필터가
+# 충분하지만(대회 수가 적음), 리그는 전세계 모든 국가×모든 부(tier)가
+# 대상이라(710개+) 리그명을 그대로 나열하면 필터가 감당이 안 된다 —
+# "국가 선택 → 그 국가의 부 선택 → 부문 선택" 2단 캐스케이딩으로
+# 바꾼다. league_country/league_tier 컬럼을 그대로 쓴다(리그명=
+# competition은 그대로 저장돼 있어 필요하면 여전히 조회 가능).
+def get_league_award_years():
+    """리그전 개인상이 계산된 연도 목록(최신순)."""
+    return _get_category_award_years("league")
+
+
+def get_league_award_countries(year):
+    """그 해 리그전 개인상이 있는 국가명 목록(가나다순) — "국가" 필터
+    드롭다운용."""
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT DISTINCT league_country FROM hist.season_individual_awards
+           WHERE year=? AND category='league' AND league_country IS NOT NULL
+           ORDER BY league_country""", (year,)).fetchall()
+    conn.close()
+    return [r["league_country"] for r in rows]
+
+
+def get_league_award_tiers(year, country):
+    """그 해 그 국가에 리그전 개인상이 있는 부(tier) 목록(오름차순, 1=1부)
+    — "부" 필터 드롭다운용."""
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT DISTINCT league_tier FROM hist.season_individual_awards
+           WHERE year=? AND category='league' AND league_country=? AND league_tier IS NOT NULL
+           ORDER BY league_tier""", (year, country)).fetchall()
+    conn.close()
+    return [r["league_tier"] for r in rows]
+
+
+def get_league_award_kinds(year, country=None, tier=None):
+    """그 해(선택적으로 국가/부 한정) 리그전 개인상 부문 목록(필터
+    드롭다운용)."""
+    conn = get_conn()
+    q = """SELECT DISTINCT award_kind FROM hist.season_individual_awards
+           WHERE year=? AND category='league' AND award_kind IS NOT NULL AND award_kind != ''"""
+    params = [year]
+    if country:
+        q += " AND league_country=?"
+        params.append(country)
+    if tier:
+        q += " AND league_tier=?"
+        params.append(tier)
+    rows = conn.execute(q + " ORDER BY award_kind", params).fetchall()
+    conn.close()
+    return [r["award_kind"] for r in rows]
+
+
+def get_league_awards(year, country=None, tier=None, award_kind=None):
+    """그 해 리그전 개인상 — country(국가명)/tier(몇부)/award_kind로
+    좁힐 수 있다."""
+    return _get_category_awards(
+        year, "league", award_kind=award_kind, league_country=country, league_tier=tier)
+
+
 def get_wc_history(limit=100):
     """완료된 월드컵(kind='world') 대회의 연도별 1~4위 목록."""
     conn = get_conn(); c = conn.cursor()

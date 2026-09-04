@@ -32,28 +32,39 @@ finish_tournament(SF 스테이지에서 진 두 팀을 자동으로 3/4위전에
 day를 다르게 주려면 생성 직후 별도 UPDATE가 한 번 더 필요한데, 그정도
 차이는 "한 주 안에 끝난다"는 원래 취지에 영향이 없어 단순화했다.]
 
-[season_id 설계 결정 — 신민용이 명확화를 요청한 지점]
-"2060 시즌"의 슈퍼컵은 "2060년 챔스/유로파/컨퍼런스"를 그대로 쓴다(신민용이
-제시한 두 옵션 중 첫 번째: "2060 챔스 우승/준우승/2060 유로파 우승/2060
-컨퍼런스 우승", 2060년 챔스/유로파/컨퍼런스가 전부 끝나면 그 4팀으로
-바로 그 해 슈퍼컵을 연다). "상반기 대회 → 하반기 슈퍼컵"처럼 시즌을
-넘겨서 직전 시즌 우승팀을 갖고 오는 방식은 채택하지 않았다 — 이유:
-  1) 이 게임의 대륙대항전(cl/el/ecl_tournaments)은 애초에 "그 해(year)
-     하나" 단위로 완결되는 구조라(champions_engine.CL_START_WEEK~
-     CL_END_WEEK가 전부 같은 시즌 안), "직전 시즌 우승팀"을 넘겨받으려면
-     그 우승팀이 "다음 시즌에도 여전히 존재/식별 가능"해야 하는데 —
-     팀은 매 시즌 리그가 바뀌거나(승강) 심지어 사라질 수도 있어(팀
-     삭제/재편) 그 사이 상태가 안전하게 보존된다는 보장이 없다.
-  2) "2060 시즌 첫 슈퍼컵"에 넘겨줄 "2059 시즌 우승팀"이 없는 게임
-     시작 초반(예: 게임 시작 연도 자체) 부트스트랩 문제가 아예 없어진다
-     — 같은 해 안에서 다 끝나므로 항상 "이번 해에 확정된 챔피언"이
-     존재할 때만 슈퍼컵이 열린다.
-  3) cl/el/ecl_tournaments가 전부 'year' 컬럼 하나로 이미 시즌을
-     식별하고 있어서(별도 season_id 개념이 게임에 아예 없음), 새
-     개념을 추가하지 않고 기존 'year' 그대로 재사용할 수 있다.
-캘린더상으로도 챔스/유로파/컨퍼런스가 전부 CL_END_WEEK(23주차)에
-끝나므로, 슈퍼컵을 그보다 뒤(SC_START_WEEK=25주차)에 두면 "이번 해 3개
-대회가 전부 끝난 뒤 곧바로 이번 해 슈퍼컵"이 자연스럽게 성립한다.
+[season_id 설계 결정 — 2026-09 재설계, 신민용 확정]
+예전엔("2060 시즌"의 슈퍼컵은 "2060년 챔스/유로파/컨퍼런스"를 그대로
+써서 그 해 3개 대회가 다 끝난 뒤(29주차) 곧바로 그 해 슈퍼컵을 여는
+방식이었다 — 이유는 팀 존속성 보장 문제와 게임 시작 연도 부트스트랩
+문제를 피하기 위해서였다(아래 옛 설명 참고).
+
+신민용 지적: "실제 UEFA 슈퍼컵처럼 전 시즌 챔스/유로파/컨퍼런스 우승팀이
+'다음 시즌 초반'에 붙는 게 맞다 — 이러면 시즌 안에서 다 끝나는 문제가
+없고, 게임 시작 연도처럼 전년도 데이터가 아예 없을 때만 그 대륙 팀
+OVR 상위 4팀으로 대신 붙이면 된다"는 방향으로 확정. 즉:
+  - "year년 슈퍼컵"은 이제 "(year-1)년" 챔스 우승/준우승 + 유로파
+    우승 + 컨퍼런스 우승 4팀을 쓰고, 시즌 초반(SC_START_WEEK, 프리
+    시즌 구간)에 연다 — 실제 UEFA 슈퍼컵(8월, 새 시즌 개막 직전)과
+    동일한 타이밍.
+  - 옛 설계가 걱정했던 "팀 존속성"(승강/재편으로 전년도 우승팀 team_id
+    가 사라질 수 있음) 문제는 실제로는 이례적 경우이고, 그래도 생기면
+    아래 _prev_season_finalists가 4팀 중 하나라도 없으면 None을 반환해
+    자동으로 부트스트랩 경로(OVR 상위 4팀)로 폴백하므로 안전하다.
+  - "전년도 데이터가 없는" 진짜 부트스트랩(게임 시작 연도 자체 —
+    year-1에 아직 챔스/유로파/컨퍼런스가 열린 적이 없음)은 이제 유일한
+    예외 케이스가 아니라 위 폴백과 완전히 같은 경로로 처리된다 —
+    "그 대륙 팀 OVR 상위 4팀을 1234 시드로 붙인다"(_bootstrap_top_ovr_
+    seeds). start_knockout이 어차피 OVR 기준 1v4/2v3 대진을 자동으로
+    짜주므로, 이 4팀을 넘기기만 하면 나머지 로직(SF→3/4위전+결승)은
+    실제 우승팀 4팀을 넘겼을 때와 완전히 동일하게 동작한다.
+
+[옛 설명, 참고용 — 위 재설계로 대체됨]
+같은 해 안에서 다 끝나는 방식을 골랐던 이유는: (1) 팀이 다음 시즌에도
+여전히 존재/식별 가능해야 한다는 보장이 없었고, (2) 게임 시작 연도
+부트스트랩 문제 자체가 없어지며, (3) 별도 season_id 없이 기존 'year'
+컬럼을 그대로 재사용할 수 있어서였다 — 이번 재설계로 (1)(2)는 위
+폴백 경로로, (3)은 "year=슈퍼컵이 열리는 해"로 그대로 유지된다(어느
+연도의 챔스/유로파/컨퍼런스를 참조하는지만 year-1로 바뀜).
 
 [내가 경기를 안 뛰어도 기록이 남아야 한다] sim_ai_match/finish_tournament/
 record_my_exit는 CL/EL/ECL과 완전히 같은 공용 함수라, 내 팀이 참가하지
@@ -87,18 +98,21 @@ SUPER_CUP_NAME = {
     "북미": "콩카카프 그랜드 슈퍼컵",
 }
 
-# CL_END_WEEK(23주차)에 챔스/유로파/컨퍼런스가 전부 끝나므로, 그 뒤로
-# 여유를 두고 25주차에 시작한다. 한 주(7일) 안에서 Day1(준결승) → Day6(3/4위전+결승).
-# [2026-08 v3.5 재수정, 신민용 리포트: "24주차는 국제예선~휴식기(25~28주)
-# 이전이라 아직 상반기 끝자락이지, 진짜 하반기가 아니다 — 국내컵 결승이
-# 뒤로 밀리는지도 같이 생각해야 한다"] 정확한 지적 — 진짜 "하반기"는
-# 국제예선~휴식기(INTL_QUAL_WEEK~휴식기끝, 실측 25~28주)가 끝난 뒤인
-# 29주차부터다. 슈퍼컵을 29주차로 당기고, cup_engine.CUP_ROUND_WEEKS_POOL
-# 쪽의 국내컵 1부 합류 라운드를 30주차로 재조정했다 — 이러면 뒤 라운드
-# 간격을 굳이 좁힐 필요도 없이(2주가 아니라 원래대로 2주 그대로 둬도)
-# 국내컵 마지막 라운드가 원래(이 수정 전) 위치인 42주차 그대로 유지되어
-# 결승이 전혀 안 밀린다(실측 확인).
-SC_START_WEEK = 29
+# [2026-09 재조정, 신민용 확정: "실제 UEFA 슈퍼컵처럼 전 시즌 우승팀들이
+# 다음 시즌 초반에 붙는 게 맞다"] 예전엔 "그 해 챔스/유로파/컨퍼런스가
+# 전부 끝난 뒤"(29주차, 옛 설명 아래 참고)였는데, 이제 참가 4팀 자체가
+# "전년도" 우승팀들이라 이번 해 안에서 그 대회들이 끝나길 기다릴 필요가
+# 없다 — 프리시즌(CLUB_PRESEASON_START_DAY~END_DAY = 1~21일 = 1~3주차)
+# 안에서, 리그가 시작하는 4주차보다 확실히 앞서 끝나도록 2주차에 연다
+# (Day1=8일, Day6=13일 — 둘 다 여전히 프리시즌 구간 안). 실제 UEFA
+# 슈퍼컵도 새 시즌 개막 직전(8월 초)에 열리는 것과 같은 타이밍이다.
+# 프리시즌엔 국내리그 경기 자체가 없으므로 _pick_sc_days의 "국내 일정과
+# 안 겹치게" 보정도 자연히 걸릴 일이 없다(dom_days가 항상 빈 리스트).
+#
+# [옛 설명, 참고용] 예전엔 "그 해 챔스/유로파/컨퍼런스가 끝난 뒤"였으므로
+# CL_END_WEEK(23주차) 이후, 정확히는 진짜 "하반기" 시작점인 29주차에
+# 열었었다 — 이 재설계로 더 이상 해당 사항 없음.
+SC_START_WEEK = 2
 SC_STAGE_KO = {"SF": "4강", "F": "결승", "TP": "3/4위전"}
 # [2026-08 수정, 11순위] "준결승"/"3·4위전" 대신 champions_engine.STAGE_KO와
 # 완전히 같은 표기("4강"/"3/4위전")로 맞췄다 — schedule_window.py의
@@ -223,52 +237,107 @@ def _set_match_days(tid, stage, day):
     conn.close()
 
 
-def _build_super_cup(year, continent):
-    """그 해·그 대륙의 챔스/유로파/컨퍼런스가 전부 status='done'이면
-    4팀을 확정하고 준결승 대진(start_knockout)을 만든다. 이미 만들어져
-    있으면 아무것도 안 함. 셋 중 하나라도 아직 안 끝났으면 조용히
-    넘어간다(다음 날 다시 확인)."""
-    if get_tournament(SC_CFG, year, continent):
-        return   # 이미 생성됨
-
-    cl_t = get_tournament(CHAMPIONS_CFG, year, continent)
-    el_t = get_tournament(EUROPA_CFG, year, continent)
-    ecl_t = get_tournament(CONFERENCE_CFG, year, continent)
+def _prev_season_finalists(year, continent):
+    """(year-1)년 그 대륙 챔스/유로파/컨퍼런스가 전부 status='done'이면
+    4팀 시드(dict 리스트, team_id/role/team_name/flag/country/grade/ovr)를
+    반환 — 셋 중 하나라도 없거나 안 끝났거나, 우승/준우승팀을 특정할
+    수 없거나(예: 결승이 비정상 종료), 팀이 겹치면(정상적으론 안 겹치지만
+    승강/재편으로 team_id가 꼬인 극단적 예외) None을 반환해 호출부가
+    _bootstrap_top_ovr_seeds로 폴백하게 한다."""
+    prev = year - 1
+    cl_t = get_tournament(CHAMPIONS_CFG, prev, continent)
+    el_t = get_tournament(EUROPA_CFG, prev, continent)
+    ecl_t = get_tournament(CONFERENCE_CFG, prev, continent)
     if not (cl_t and el_t and ecl_t):
-        return
+        return None
     if not (cl_t["status"] == "done" and el_t["status"] == "done" and ecl_t["status"] == "done"):
-        return
+        return None
 
     cl_champion, cl_runner_up = _finalist_pair("cl_matches", cl_t["id"])
-    if not (cl_champion and cl_runner_up):
-        return
     el_champion = el_t["winner_team_id"] or None
     ecl_champion = ecl_t["winner_team_id"] or None
-    if not (el_champion and ecl_champion):
-        return
+    if not (cl_champion and cl_runner_up and el_champion and ecl_champion):
+        return None
 
-    seeds = [
+    raw = [
         (cl_champion, "cl_champion", CHAMPIONS_CFG, cl_t["id"]),
         (cl_runner_up, "cl_runner_up", CHAMPIONS_CFG, cl_t["id"]),
         (el_champion, "el_champion", EUROPA_CFG, el_t["id"]),
         (ecl_champion, "ecl_champion", CONFERENCE_CFG, ecl_t["id"]),
     ]
-    # [방어적 처리] 정상적으로는 4팀이 겹칠 수 없다(같은 시즌에 한 팀이
-    # 서로 다른 두 단계 대회 결승에 동시에 있을 수 없음 — continental_
-    # qualification.py가 대회별로 슬롯을 배타적으로 나눠 배정하므로).
-    # 그래도 데이터가 꼬여 겹치면 슈퍼컵 자체를 건너뛴다(어설프게 3팀
-    # 대회를 여는 것보다 안전).
-    if len({s[0] for s in seeds}) != 4:
-        from game_engine import add_log
-        add_log(f"⚠️ {SUPER_CUP_NAME.get(continent, '슈퍼컵')}({year}년): "
-                f"참가 4팀 중 겹치는 팀이 있어 이번 해는 건너뜁니다.", "event")
+    if len({r[0] for r in raw}) != 4:
+        return None
+
+    seeds = []
+    for team_id, role, src_cfg, src_tid in raw:
+        src = entry(src_cfg, src_tid, team_id)
+        seeds.append({
+            "team_id": team_id, "role": role,
+            "team_name": src.get("team_name", "?"), "flag": src.get("flag", ""),
+            "country": src.get("country", ""), "grade": src.get("grade", ""),
+            "ovr": src.get("ovr", 50),
+        })
+    return seeds
+
+
+def _bootstrap_top_ovr_seeds(continent):
+    """[2026-09 신설, 신민용 확정: "게임 시작 후 바로 생기는 슈퍼컵은
+    (전년도가 없어) 일정이 없잖아 — 이때는 각 대륙별로 OVR 수치 높은
+    애들끼리 1234 해서 붙어줘"] _prev_season_finalists가 None을 반환할
+    때(주로 게임 시작 연도라 "전년도" 자체가 존재하지 않는 경우) 쓰는
+    폴백 — 그 대륙(CONTINENT_MAP 기준 나라들) 1부 리그 팀 중 스쿼드
+    평균 OVR 상위 4팀을 그대로 시드로 쓴다. start_knockout이 어차피
+    OVR 기준으로 1v4/2v3 대진을 자동으로 짜므로(1위 vs 4위, 2위 vs
+    3위), 여기서 순서만 OVR 내림차순으로 넘기면 "1234"가 그대로
+    반영된다."""
+    from competition.champions_engine import CONTINENT_MAP
+    game_conts = [gc for gc, ck in CONTINENT_MAP.items() if ck == continent]
+    if not game_conts:
+        return None
+    conn = get_conn()
+    placeholders = ",".join("?" * len(game_conts))
+    rows = [dict(r) for r in conn.execute(
+        f"""SELECT t.id AS team_id, t.name AS team_name, cn.flag AS flag,
+                   cn.name AS country, cn.grade AS grade,
+                   (SELECT AVG(ovr) FROM ai_players WHERE team_id=t.id) AS ovr
+            FROM teams t JOIN leagues l ON t.league_id=l.id
+                         JOIN countries cn ON l.country_id=cn.id
+            WHERE l.tier=1 AND cn.continent IN ({placeholders})""",
+        game_conts).fetchall()]
+    conn.close()
+    rows = [r for r in rows if r.get("ovr")]
+    rows.sort(key=lambda r: r["ovr"], reverse=True)
+    top4 = rows[:4]
+    if len(top4) < 4:
+        return None   # 이 대륙에 팀 자체가 4개도 없는 극단적 예외
+    for i, r in enumerate(top4, start=1):
+        r["role"] = f"ovr_seed_{i}"
+    return top4
+
+
+def _build_super_cup(year, continent):
+    """그 해(year) 그 대륙 슈퍼컵을 만든다. 참가 4팀은 원칙적으로
+    (year-1)년 챔스 우승/준우승 + 유로파 우승 + 컨퍼런스 우승
+    (_prev_season_finalists) — 실제 UEFA 슈퍼컵처럼 "전 시즌 우승팀들이
+    새 시즌 초반에 맞붙는다". 전년도 데이터가 없거나(게임 시작 연도)
+    팀이 겹치는 등 예외면 그 대륙 팀 OVR 상위 4팀으로 대신한다
+    (_bootstrap_top_ovr_seeds). 이미 만들어져 있으면 아무것도 안 하고,
+    두 경로 다 실패하면(극단적 예외) 조용히 넘어간다(다음 날 다시 시도)."""
+    if get_tournament(SC_CFG, year, continent):
+        return   # 이미 생성됨
+
+    seeds = _prev_season_finalists(year, continent)
+    used_bootstrap = seeds is None
+    if used_bootstrap:
+        seeds = _bootstrap_top_ovr_seeds(continent)
+    if not seeds:
         return
 
     name = SUPER_CUP_NAME.get(continent, "슈퍼컵")
     from game_engine import get_player, get_state
     p = get_player()
     my_tid = p.get("current_team_id", 0) if p else 0
-    my_in = 1 if any(s[0] == my_tid for s in seeds) else 0
+    my_in = 1 if any(s["team_id"] == my_tid for s in seeds) else 0
     _st = get_state()
     _cur_season = _st["current_season"] if _st else 1
     sf_day, final_day = _pick_sc_days(my_tid if my_in else 0, _cur_season)
@@ -280,12 +349,8 @@ def _build_super_cup(year, continent):
               (year, continent, name, "sf", my_in, my_tid if my_in else 0, my_in))
     tid = c.lastrowid
 
-    entry_rows = []
-    for team_id, role, src_cfg, src_tid in seeds:
-        src = entry(src_cfg, src_tid, team_id)
-        entry_rows.append((tid, team_id, src.get("team_name", "?"), src.get("flag", ""),
-                            src.get("country", ""), src.get("grade", ""),
-                            src.get("ovr", 50), role))
+    entry_rows = [(tid, s["team_id"], s["team_name"], s["flag"], s["country"],
+                   s["grade"], s["ovr"], s["role"]) for s in seeds]
     c.executemany("""INSERT INTO sc_entries
                         (tournament_id, team_id, team_name, flag, country,
                          grade, ovr, alive, seed_role)
@@ -297,25 +362,19 @@ def _build_super_cup(year, continent):
     # 준결승 대진 — start_knockout(CL/EL/ECL과 동일한 공용 로직)이 4팀을
     # OVR 기준으로 1v4/2v3으로 짝짓는다.
     t = get_tournament(SC_CFG, year, continent)
-    start_knockout(SC_CFG, t, [s[0] for s in seeds], SC_ROUND_WEEKS)
+    start_knockout(SC_CFG, t, [s["team_id"] for s in seeds], SC_ROUND_WEEKS)
     _set_match_days(tid, "SF", sf_day)
     # [2026-08 버그수정, 신민용 리포트: "챔스는 기록이 남는데 슈퍼컵은
-    # 1년 다 돌려도 대회만 생기고 경기가 하나도 시뮬 안 된다"] 실제
-    # 세이브로 재현됨: process_super_cup_week가 맨 처음(아직 챔스/유로파/
-    # 컨퍼런스가 하나도 안 끝난 날) 호출됐을 때 "처리할 대회가 없다"고
-    # 판단해 _sc_has_active_cache=False로 캐시해버린다. 그런데 여기서
-    # 나중에(3개 대회가 다 끝난 뒤) 대회를 실제로 만들어도, 이 캐시
-    # 무효화를 안 해주면 process_super_cup_week가 "캐시상 처리할 게
-    # 없다"고 믿고 매번 맨 위에서 바로 return해버려서 — 방금 만든
-    # 준결승 경기를 영원히 시뮬레이션 하지 않는다(sc_tournaments엔
-    # 대회가 생겼는데 sc_matches는 전부 -1로 멈춰있는 상태로 확인됨).
-    # 대회를 실제로 만들 때마다 캐시를 무효화해서, 다음 호출이 다시
-    # DB를 확인하게 한다.
+    # 1년 다 돌려도 대회만 생기고 경기가 하나도 시뮬 안 된다"] 대회를
+    # 실제로 만들 때마다 캐시를 무효화해서, 다음 호출이 다시 DB를
+    # 확인하게 한다(안 그러면 "처리할 대회가 없다"로 캐시된 채 방금
+    # 만든 준결승 경기를 영원히 시뮬레이션 안 함).
     _invalidate_sc_active_cache()
 
     from game_engine import add_log
-    cl_e = entry(CHAMPIONS_CFG, cl_t["id"], cl_champion)
-    add_log(f"🏆 {year}년 {name} 참가팀 확정: {cl_e.get('flag','')}{cl_e.get('team_name','?')} "
+    _src_note = "(전년도 데이터 없어 대륙 OVR 상위 4팀으로 대체) " if used_bootstrap else ""
+    add_log(f"🏆 {year}년 {name} 참가팀 확정: {_src_note}"
+            f"{seeds[0].get('flag','')}{seeds[0].get('team_name','?')} "
             f"외 3팀 ({SC_STAGE_KO['SF']} {day_to_week(_SF_DAY)}주차)", "event")
 
 
