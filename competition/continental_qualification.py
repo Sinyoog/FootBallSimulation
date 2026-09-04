@@ -48,7 +48,24 @@ def _europa_slots_from_rank(continent: str, rank_idx: int) -> int:
         if rank_idx < 27:
             return 1
         return 0
-    # [TENTATIVE] 아시아/아프리카/북남미 — 확정 수치 받기 전까지 유럽과
+    # [2026-09 버그수정, 신민용 리포트: "유로파/챔스 참가팀이 왔다갔다한다"]
+    # 남미(12개국)만 실제로 이 비율 스케일링 공식으로는 정원(32)에 구조적으로
+    # 못 미쳤다 — "상위 1/3은 2장, 나머지는 1장"짜리 2단 커브의 최댓값은
+    # two_cut(≤n) + one_cut(≤n)인데, n=12면 아무리 후하게 잡아도
+    # 4+12=16이 한계라 32장을 절대 못 채운다(북미/아시아/아프리카는
+    # 국가 수가 많아 이 커브의 최댓값이 정원을 훌쩍 넘어서 캡으로 정확히
+    # 잘렸을 뿐 — 실측: 북미 44산출→32캡 정상, 남미는 16산출로 캡 자체가
+    # 무의미했음). 그래서 남미는 champions_engine._slots_from_rank의
+    # 남미 커브처럼 국가당 슬롯 상한을 2가 아니라 4까지 열어 별도로
+    # 정의한다 — 여유(정원 32 대비 35)를 둬서 한두 나라 리그 데이터가
+    # 아직 얇아도(시즌 극초반) 정원 미달이 안 나게 한다.
+    if continent == "남미":
+        if rank_idx < 3:
+            return 4   # 1~3위
+        if rank_idx < 8:
+            return 3   # 4~8위
+        return 2       # 9~12위 (12개국×평균 2.9장 ≈ 35장, 32장 캡보다 여유)
+    # [TENTATIVE] 아시아/아프리카/북미 — 확정 수치 받기 전까지 유럽과
     # 동일한 비율(상위 1/3 국가는 2장, 나머지는 1장 — 유럽 확정 수치가
     # "27개국 중 1~9위 2장/10~27위 1장"이므로 그 비율은 9/27, 27/27)로
     # 그 대륙 실제 국가 수에 맞춰 스케일링.
@@ -58,7 +75,9 @@ def _europa_slots_from_rank(continent: str, rank_idx: int) -> int:
     # — 북남미(45개국)에서 목표 정원(36)보다 한참 적은 30장만 나온 원인.
     # 분모를 27로 고치면 슬롯 합계가 정원(36)을 넉넉히 넘게 배분되고,
     # allocate_continental_slots()가 정원에서 정확히 잘라주므로(캡 로직
-    # 자체는 원래 정상) 결과적으로 정확히 36장이 채워진다.
+    # 자체는 원래 정상) 결과적으로 정확히 36장이 채워진다. 이 스케일링은
+    # 국가 수가 충분히 많은 대륙(아시아/아프리카/북미)에서만 정원을
+    # 넘기므로 안전하다 — 남미처럼 국가 수가 적으면 위 전용 분기를 탄다.
     from competition.champions_engine import CONTINENT_MAP
     n_countries = _n_countries_in_continent(continent)
     two_cut = max(1, round(n_countries * 9 / 27))
@@ -78,7 +97,16 @@ def _conference_slots_from_rank(continent: str, rank_idx: int) -> int:
         if rank_idx < 23:
             return 2
         return 0
-    # [TENTATIVE] 아시아/아프리카/북남미 — 위와 동일한 이유로 비율
+    # [2026-09 버그수정] _europa_slots_from_rank와 동일한 이유 — 남미
+    # (12개국)는 비율 스케일링 공식으로 정원(32)에 구조적으로 못 미쳐서
+    # 전용 커브를 쓴다(여유를 둬서 37장 산출 → 32캡으로 정확히 잘림).
+    if continent == "남미":
+        if rank_idx < 4:
+            return 4   # 1~4위
+        if rank_idx < 9:
+            return 3   # 5~9위
+        return 2       # 10~12위
+    # [TENTATIVE] 아시아/아프리카/북미 — 위와 동일한 이유로 비율
     # 스케일링(유럽 확정 수치 "23개국 중 1~10위 1장/11~23위 2장"의
     # 비율 10/23, 23/23을 그대로 사용).
     # [2026-08 버그수정] europa와 동일한 원인(분모 54→23) 수정.
@@ -95,7 +123,9 @@ def _conference_slots_from_rank(continent: str, rank_idx: int) -> int:
 # [2026-08 확정, 신민용 요청] 유로파/컨퍼런스는 챔스와 달리 대륙 무관하게
 # 전부 36장 — 북남미 챔스만 48로 확대된 건 챔스 전용 결정이라(위
 # champions_engine.CL_TEAMS_BY_CONTINENT 참고) 여기엔 안 물려받는다.
-QUALIFICATION_TEAM_CAP = {"유럽": 36, "북남미": 36, "아시아": 36, "아프리카": 36}
+# [2026-09 개편] "북남미" → 남미/북미 분리. 챔스 정원(32)에 맞춰 유로파/
+# 컨퍼런스도 남미·북미는 32로 통일한다(다른 대륙은 그대로 36 유지).
+QUALIFICATION_TEAM_CAP = {"유럽": 36, "남미": 32, "북미": 32, "아시아": 36, "아프리카": 36}
 
 
 def _n_countries_in_continent(continent: str) -> int:
@@ -180,7 +210,11 @@ def allocate_continental_slots(continent: str, season: int, year: int = None):
     for rank_idx, lg in enumerate(countries):
         if all(len(out[k]) >= cap_by_comp[k] for k in out):
             break
-        ch_slots = _cl.get_cl_slots(lg["country"], lg["grade"], continent, year)
+        # [2026-09 버그수정] rank_idx를 넘겨서, 계수 실측이 아직 없는
+        # 첫 시즌에도 남미가 등급 폴백(정원 미달 원인)이 아니라
+        # _slots_from_rank 커브를 쓰게 한다 — champions_engine.get_cl_slots
+        # 주석 참고.
+        ch_slots = _cl.get_cl_slots(lg["country"], lg["grade"], continent, year, rank_idx)
         eu_slots = _europa_slots_from_rank(continent, rank_idx)
         cf_slots = _conference_slots_from_rank(continent, rank_idx)
         if ch_slots <= 0 and eu_slots <= 0 and cf_slots <= 0:
@@ -240,7 +274,8 @@ def start_all_continental_competitions(year, season):
     my_cont = _cl_mod._my_continent(p)
     my_tid = p.get("current_team_id", 0)
 
-    for cont in ("유럽", "아시아", "아프리카", "북남미"):
+    # [2026-09 개편] "북남미" → 남미/북미 분리(5개 대륙).
+    for cont in ("유럽", "아시아", "아프리카", "남미", "북미"):
         alloc = allocate_continental_slots(cont, prev_season, year)
         this_my_tid = my_tid if cont == my_cont else 0
 

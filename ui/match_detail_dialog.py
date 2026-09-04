@@ -4,17 +4,22 @@ ui/match_detail_dialog.py  ─  로그에서 경기 헤더 클릭 시 뜨는 상
 game_engine.get_match_detail(id) 가 돌려주는 dict 를 받아
 전/후반 타임라인 · 평점 · 세부 지표 · 총평을 보기 좋게 펼쳐 보여준다.
 
-[구조] "▶ 시뮬 보기" / "📊 경기 통계"는 예전엔 각각 새 창(QDialog.show())을
-열었는데, 이제는 새 창을 띄우지 않고 이 다이얼로그 자체가 오른쪽으로
-펼쳐지면서(가로 폭이 늘어나면서) 그 안에 인라인으로 들어간다. 시뮬 뷰어
-(MatchSimViewer)는 QDialog로 만들어진 걸 windowFlags만 Widget으로 바꿔서
-그대로 재사용한다 — 로직을 중복 구현하지 않기 위함.
+[구조] "📊 경기 통계" / "⭐ 라인업 평점"은 새 창(QDialog.show())을 열지
+않고, 이 다이얼로그 자체가 오른쪽으로 펼쳐지면서(가로 폭이 늘어나면서)
+그 안에 인라인으로 들어간다.
+
+[2026-09 제거] "▶ 시뮬 보기"(MatchSimViewer, match_sim/live 물리엔진의
+2D 애니메이션 재생)는 라이브 물리엔진 자체를 없애면서 함께 제거했다 —
+경기 결정은 이제 tactical_engine(포메이션 매치업)이 하고, 물리 좌표
+데이터가 없어 재생할 것이 없기 때문. 통계/평점은 그대로 유지된다.
 """
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                              QScrollArea, QWidget, QFrame, QPushButton,
                              QSizePolicy)
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPainter, QColor, QBrush, QPen, QFont
+
+from game_engine import is_hard_mode
 
 
 def _fmt_min(m):
@@ -165,6 +170,16 @@ class MatchStatsPanel(QWidget):
         root.addWidget(_stat_compare_row("파울", h_st["fouls"], a_st["fouls"]))
         root.addWidget(_stat_compare_row(
             "패스 성공률", f"{h_st['pass_acc']*100:.0f}%", f"{a_st['pass_acc']*100:.0f}%"))
+        # [2026-09 신설] 오프사이드/카드/세이브 — 예전 저장분(이 필드들이
+        # 없는 경기)도 있으므로 .get(key, 0)으로 안전하게 읽는다.
+        root.addWidget(_stat_compare_row(
+            "오프사이드", h_st.get("offsides", 0), a_st.get("offsides", 0)))
+        root.addWidget(_stat_compare_row(
+            "옐로카드", h_st.get("yellow_cards", 0), a_st.get("yellow_cards", 0)))
+        root.addWidget(_stat_compare_row(
+            "레드카드", h_st.get("red_cards", 0), a_st.get("red_cards", 0)))
+        root.addWidget(_stat_compare_row(
+            "세이브", h_st.get("saves", 0), a_st.get("saves", 0)))
 
         root.addStretch()
 
@@ -181,9 +196,29 @@ def _rating_color(rating):
     return "#c0392b"
 
 
-def _lineup_player_row(entry, accent):
-    """라인업 평점 패널의 선수 한 줄 — 포지션/이름(+OVR) | 평점 배지.
-    entry가 None이면(그 슬롯에 실제 선수가 안 잡힌 경우) 빈 자리로 표시."""
+class _ClickableLabel(QLabel):
+    """[2026-09 신설, 신민용 요청: "경기 상세 이름 클릭하면 세계 기록실
+    에서 그 선수를 검색한 기능을 넣고 싶어"] 클릭 가능한 QLabel — 클릭
+    시 생성자에 넘긴 콜백을 player_id 인자로 호출한다."""
+    def __init__(self, text, player_id, on_click):
+        super().__init__(text)
+        self._player_id = player_id
+        self._on_click = on_click
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mousePressEvent(self, ev):
+        if self._on_click is not None:
+            self._on_click(self._player_id)
+            return
+        super().mousePressEvent(ev)
+
+
+def _lineup_player_row(entry, accent, on_player_click=None, hard_mode=False):
+    """라인업 평점 패널의 선수 한 줄 — 포지션/이름(+OVR, 어려움 난이도면
+    비표시) | 평점 배지.
+    entry가 None이면(그 슬롯에 실제 선수가 안 잡힌 경우) 빈 자리로 표시.
+    on_player_click이 주어지고 entry에 유효한 id가 있으면 이름을 클릭
+    가능하게(밑줄+포인터 커서) 만든다."""
     w = QWidget()
     h = QHBoxLayout(w); h.setContentsMargins(2, 2, 2, 2); h.setSpacing(6)
     if entry is None:
@@ -212,10 +247,24 @@ def _lineup_player_row(entry, accent):
         if a:
             extra.append(f"🅰{a}")
     extra_txt = ("  " + " ".join(extra)) if extra else ""
-    name_lbl = QLabel(f"{'⭐ ' if is_me else ''}{name_txt} ({entry.get('ovr', 0)}){extra_txt}")
-    name_lbl.setStyleSheet(
-        f"color:{'#ffe27a' if is_me else '#ddd'};font-size:11px;"
-        f"{'font-weight:bold;' if is_me else ''}")
+    ovr_txt = "" if hard_mode else f" ({entry.get('ovr', 0)})"
+    name_full = f"{'⭐ ' if is_me else ''}{name_txt}{ovr_txt}{extra_txt}"
+    name_color = '#ffe27a' if is_me else '#ddd'
+    name_weight = 'font-weight:bold;' if is_me else ''
+    player_id = entry.get("id")
+    # [2026-09] 실제 ai_players 레코드가 있는 선수(id>=-1, 나 자신 포함 —
+    # world_browser.MY_PLAYER_ID와 동일)만 클릭 가능하게 한다. 국제대회
+    # 스쿼드가 부족할 때 채워 넣는 가상 폴백 선수(id<-1)는 세계 기록실에
+    # 조회할 DB 행 자체가 없다(ui/formation_widget.py와 동일한 기준).
+    _clickable = (on_player_click is not None and player_id is not None
+                  and player_id >= -1)
+    if _clickable:
+        name_lbl = _ClickableLabel(name_full, player_id, on_player_click)
+        name_lbl.setStyleSheet(
+            f"color:{name_color};font-size:11px;{name_weight}text-decoration:underline;")
+    else:
+        name_lbl = QLabel(name_full)
+        name_lbl.setStyleSheet(f"color:{name_color};font-size:11px;{name_weight}")
     name_lbl.setWordWrap(False)
 
     rating_lbl = QLabel(f"{entry.get('rating', 0):.1f}")
@@ -288,8 +337,22 @@ class _MatchFormationPitch(QWidget):
     # 좀 늘리고").
     _EDGE_PAD = 26
 
+    # [2026-09 버그수정, 신민용 리포트: "포메이션에서 원 크기가 저렇게
+    # 달라지던데"] 예전엔 원 지름 d를 "이 경기의" 실제 최대 줄 수
+    # (max_rows)·한 줄당 실제 최대 인원(max_row_cnt)으로 나눠서 계산했다
+    # — 그래서 같은 다이얼로그·같은 패널 폭이라도 포메이션이 다르면(예:
+    # 백4 vs 백5, 4줄 vs 5줄) col_w/row_h가 달라져 원 크기 자체가 경기마다
+    # 들쭉날쭉했다. 이제 그 계산에 "이 경기의 실제 값" 대신 축구에서
+    # 나올 수 있는 최댓값(줄 5개: GK/DEF/MID/MID2/ATK, 한 줄 최대 5명:
+    # 백5 등)을 고정 기준으로 써서, 원 지름이 포메이션 모양과 무관하게
+    # 항상 같은 값으로 나오게 한다 — 실제 줄 수가 기준보다 적으면 그만큼
+    # 여유 공간이 남을 뿐, 원 크기는 절대 변하지 않는다.
+    _REF_MAX_ROWS = 5
+    _REF_MAX_PER_ROW = 5
+
     def __init__(self, top_list, top_name, top_accent,
-                 bottom_list, bottom_name, bottom_accent, parent=None):
+                 bottom_list, bottom_name, bottom_accent, parent=None,
+                 on_player_click=None):
         super().__init__(parent)
         self._top = top_list or []
         self._bottom = bottom_list or []
@@ -297,6 +360,14 @@ class _MatchFormationPitch(QWidget):
         self._bottom_name = bottom_name or ""
         self._top_accent = top_accent
         self._bottom_accent = bottom_accent
+        # [2026-09 신설, 신민용 요청: "경기 상세 이름 클릭하면 세계
+        # 기록실에서 그 선수를 검색한 기능을 넣고 싶어"] 원을 클릭했을 때
+        # 호출할 콜백(player_id를 인자로 받음). 히트테스트용으로 매
+        # paintEvent마다 그린 원들의 (x,y,반지름,entry)를 _placements에
+        # 저장해뒀다가 mousePressEvent에서 그대로 재사용한다.
+        self._on_player_click = on_player_click
+        self._placements = []
+        self.setMouseTracking(True)
         # [2026-09 재조정, 신민용 리포트: "전체 창을 키울 게 아니라 라인업
         # 평점 안에서 포메이션 영역 자체를 늘리면 되는거다"] 다이얼로그
         # 전체 높이는 다시 원래대로 되돌리고(_base_height), 이 캔버스만
@@ -372,12 +443,18 @@ class _MatchFormationPitch(QWidget):
         top_positions = self._positions_for(top_rows, top_sorted, w, row_h, halfway_y, direction=-1)
         bot_positions = self._positions_for(bot_rows, bot_sorted, w, row_h, halfway_y, direction=+1)
 
-        max_row_cnt = max(top_maxcnt, bot_maxcnt, 1)
-        col_w = w / (max_row_cnt + 1)
-        d = int(max(30, min(84, row_h * 0.62, col_w * 0.68)))
+        # [2026-09 버그수정] d(원 지름)는 이 경기의 실제 max_row_cnt/
+        # max_rows가 아니라 고정 기준값(_REF_MAX_PER_ROW/_REF_MAX_ROWS)만
+        # 으로 계산 — 포메이션이 달라도(백4/백5, 4줄/5줄) 항상 같은 크기.
+        ref_row_h = half_h / self._REF_MAX_ROWS
+        ref_col_w = w / (self._REF_MAX_PER_ROW + 1)
+        d = int(max(30, min(84, ref_row_h * 0.62, ref_col_w * 0.68)))
 
         placements = [(x, y, entry, self._top_accent) for x, y, entry in top_positions]
         placements += [(x, y, entry, self._bottom_accent) for x, y, entry in bot_positions]
+
+        # 클릭 히트테스트용으로 이번에 그린 원들의 좌표를 저장해둔다.
+        self._placements = [(x, y, d // 2, entry) for x, y, entry, _accent in placements]
 
         for x, y, entry, accent in placements:
             r = d // 2
@@ -410,6 +487,35 @@ class _MatchFormationPitch(QWidget):
                          Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self._bottom_name)
         painter.end()
 
+    def _hit_player(self, pos):
+        """pos(QPoint)가 어떤 선수 원 안에 있는지 찾아 entry를 돌려준다
+        (없으면 None). paintEvent가 매번 채워두는 self._placements를
+        그대로 히트테스트한다."""
+        for x, y, r, entry in self._placements:
+            if entry is None:
+                continue
+            pid = entry.get("id")
+            # id<-1 = 국제대회 가상 폴백 선수(DB 행 없음) — 클릭 불가.
+            if pid is None or pid < -1:
+                continue
+            dx, dy = pos.x() - x, pos.y() - y
+            if dx * dx + dy * dy <= r * r:
+                return entry
+        return None
+
+    def mousePressEvent(self, ev):
+        entry = self._hit_player(ev.position().toPoint())
+        if entry is not None and self._on_player_click is not None:
+            self._on_player_click(entry["id"])
+            return
+        super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev):
+        entry = self._hit_player(ev.position().toPoint())
+        self.setCursor(Qt.CursorShape.PointingHandCursor if entry is not None
+                        else Qt.CursorShape.ArrowCursor)
+        super().mouseMoveEvent(ev)
+
 
 class LineupRatingsPanel(QWidget):
     """[2026-08 신설, 신민용 요청: "경기 상세에서 22명 선수 평점을
@@ -429,7 +535,7 @@ class LineupRatingsPanel(QWidget):
     항상 그 폭에 맞춰 그려지고(_MatchFormationPitch가 자기 크기를 그대로
     씀), 세로로 넘치는 만큼만 스크롤된다."""
 
-    def __init__(self, data, parent=None):
+    def __init__(self, data, parent=None, on_player_click=None):
         super().__init__(parent)
         self.setStyleSheet("background:#161616;")
         payload = data.get("payload", {}) or {}
@@ -465,7 +571,8 @@ class LineupRatingsPanel(QWidget):
         # ── 위: 포메이션 시각화 (원=선수, 원 안=평점, 원 아래=이름) ──
         pitch = _MatchFormationPitch(
             top_list=away_list, top_name=data.get("away_name", ""), top_accent=_AWAY_COLOR,
-            bottom_list=home_list, bottom_name=data.get("home_name", ""), bottom_accent=_HOME_COLOR)
+            bottom_list=home_list, bottom_name=data.get("home_name", ""), bottom_accent=_HOME_COLOR,
+            on_player_click=on_player_click)
         iv.addWidget(pitch)
 
         line = QFrame(); line.setFrameShape(QFrame.Shape.HLine)
@@ -473,6 +580,10 @@ class LineupRatingsPanel(QWidget):
         iv.addWidget(line)
 
         # ── 아래: 기존 좌우 목록 (그대로) ──
+        # [버그수정] 어려움 난이도에서 OVR이 비표시되어야 하는데 이 목록의
+        # 이름 옆 괄호에는 난이도 확인 없이 항상 OVR이 찍혀 나오고 있었다
+        # — 루프마다 DB를 다시 조회하지 않도록 한 번만 계산해서 넘긴다.
+        _hard = is_hard_mode()
         cols = QHBoxLayout(); cols.setSpacing(12)
         for name_key, side_list, accent in (
                 ("home_name", home_list, _HOME_COLOR),
@@ -484,7 +595,8 @@ class LineupRatingsPanel(QWidget):
             side_hdr.setAlignment(Qt.AlignmentFlag.AlignCenter)
             cv.addWidget(side_hdr)
             for entry in side_list:
-                cv.addWidget(_lineup_player_row(entry, accent))
+                cv.addWidget(_lineup_player_row(entry, accent, on_player_click=on_player_click,
+                                                 hard_mode=_hard))
             cv.addStretch()
             cols.addWidget(col, 1)
         iv.addLayout(cols)
@@ -500,9 +612,12 @@ class MatchDetailDialog(QDialog):
         self.setWindowTitle("경기 상세")
         self.setStyleSheet("QDialog{background:#161616;}")
         self._data = data
-        self._right_widget = None      # 현재 오른쪽(시뮬 칸)에 펼쳐진 위젯(시뮬 전용)
         self._left_stats_widget = None  # [2026-08] 이름은 _left_*지만 실제로는 가운데 패널 "오른쪽"에 뜨는 통계 전용 위젯
         self._lineup_widget = None      # 맨 오른쪽 끝 — 라인업 평점 전용
+        # [2026-09 신설] 이름 클릭 → 세계 기록실 선수 검색용. formation_
+        # widget.py의 "선수 하나만 계속 재사용" 패턴과 동일 — 창을 계속
+        # 새로 쌓지 않고 이미 떠 있으면 그 창을 그 선수로 갱신한다.
+        self._world_browser_win = None
 
         # ── 전체 레이아웃: [가운데=기존 상세 내용] [통계] [시뮬] [라인업 평점] ──
         #   [2026-08 변경, 신민용 요청: "경기 통계도 우측에 뜨게"] 예전엔
@@ -534,16 +649,8 @@ class MatchDetailDialog(QDialog):
         self._left_container.setFixedWidth(0)  # 처음엔 접혀 있음
         outer.addWidget(self._left_container)
 
-        self._right_container = QWidget()
-        self._right_container.setStyleSheet("background:#101010;border-left:1px solid #2a2a2a;")
-        self._right_layout = QVBoxLayout(self._right_container)
-        self._right_layout.setContentsMargins(0, 0, 0, 0)
-        self._right_container.setFixedWidth(0)  # 처음엔 접혀 있음
-        outer.addWidget(self._right_container)
-
-        # [2026-08 신설] 라인업 평점 전용 패널 — 통계/시뮬과 같은 패턴으로
-        # 맨 끝에 독립된 칸을 하나 더 둔다. 시뮬 보기와 동시에 열어도
-        # 서로 안 건드리게 완전히 분리.
+        # [2026-08 신설] 라인업 평점 전용 패널 — 통계와 같은 패턴으로
+        # 맨 끝에 독립된 칸을 하나 더 둔다.
         self._lineup_container = QWidget()
         self._lineup_container.setStyleSheet("background:#101010;border-left:1px solid #2a2a2a;")
         self._lineup_layout = QVBoxLayout(self._lineup_container)
@@ -592,14 +699,6 @@ class MatchDetailDialog(QDialog):
         if played:
             btn_row = QWidget()
             bh = QHBoxLayout(btn_row); bh.setContentsMargins(0, 0, 0, 0); bh.setSpacing(6)
-
-            sim_btn = QPushButton("▶ 시뮬 보기")
-            sim_btn.setStyleSheet(
-                "QPushButton{background:#1a4d8f;color:#fff;border:1px solid #3a7fd5;"
-                "border-radius:6px;padding:6px;font-size:12px;font-weight:bold;}"
-                "QPushButton:hover{background:#2360ad;}")
-            sim_btn.clicked.connect(lambda: self._show_sim())
-            bh.addWidget(sim_btn)
 
             stats_btn = QPushButton("📊 경기 통계")
             stats_btn.setStyleSheet(
@@ -777,45 +876,6 @@ class MatchDetailDialog(QDialog):
 
         self._add_close(root)
 
-    # ── 오른쪽 패널 펼치기/접기 ──────────────────────────────
-    def _clear_right_panel(self):
-        """오른쪽에 떠 있던 위젯을 치운다. 시뮬 뷰어였다면 QTimer부터 반드시
-        멈춘다 — 안 그러면 화면에서 사라진 뒤에도 백그라운드에서 계속 돌면서
-        불필요하게 CPU를 먹거나, 이미 지워진 위젯을 참조하다 에러가 날 수 있다.
-        시뮬 뷰어는 결정론적 재생을 위해 열려있는 동안 전역 random 상태를
-        고정해두는데(_pre_seed_rng_state), 패널 전환 시엔 closeEvent가 안
-        불리므로 여기서도 직접 복원해줘야 한다."""
-        if self._right_widget is not None:
-            timer = getattr(self._right_widget, "timer", None)
-            if timer is not None:
-                timer.stop()
-            pre_seed_state = getattr(self._right_widget, "_pre_seed_rng_state", None)
-            if pre_seed_state is not None:
-                import random
-                random.setstate(pre_seed_state)
-            self._right_layout.removeWidget(self._right_widget)
-            # [2026-08] setParent(None)은 부모를 뗀 그 순간부터 deleteLater가
-            # 실제로 도는 다음 이벤트 루프 틱까지 이 위젯을 "최상위 창"으로
-            # 만든다(유령 흰 창의 원인 — ui/formation_widget._build_filter_row
-            # 주석 참고). 부모를 그대로 둔 채 숨기고 삭제만 예약한다.
-            self._right_widget.hide()
-            self._right_widget.deleteLater()
-            self._right_widget = None
-        # [2026-08 버그수정] 예전엔 이 함수가 위젯만 치우고 컨테이너 폭은
-        # 그대로 둬서(_open_right_panel이 바로 뒤이어 새 폭을 덮어씌우는
-        # 경우에만 문제가 없었음), 토글로 닫기만 할 때는 위젯 없이 폭만
-        # 760px로 남아 빈 회색 칸이 떠 있었다. _clear_left_stats/
-        # _clear_lineup_panel과 동일하게 여기서도 폭을 0으로 되돌린다.
-        self._right_container.setFixedWidth(0)
-
-    def _open_right_panel(self, widget, width=760):
-        """[시뮬 전용] 오른쪽 패널은 이제 시뮬 뷰어만 사용한다."""
-        self._clear_right_panel()
-        self._right_widget = widget
-        self._right_layout.addWidget(widget)
-        self._right_container.setFixedWidth(width)
-        self._resize_for_content()
-
     def _clear_left_stats(self):
         """통계 패널 비우기 (가운데 패널 오른쪽에 뜬다 — 변수명은 옛 구조의
         흔적이라 '왼쪽'이지만 실제 표시 위치와는 무관)."""
@@ -859,39 +919,54 @@ class MatchDetailDialog(QDialog):
             self._clear_lineup_panel()
             self._resize_for_content()
             return
-        self._open_lineup_panel(LineupRatingsPanel(self._data, self), width=_LINEUP_PANEL_WIDTH)
+        self._open_lineup_panel(
+            LineupRatingsPanel(self._data, self, on_player_click=self._open_player_search),
+            width=_LINEUP_PANEL_WIDTH)
+
+    def _open_player_search(self, player_id):
+        """[2026-09 신설, 신민용 요청: "경기 상세 이름 클릭하면 세계
+        기록실에서 그 선수를 검색한 기능을 넣고 싶어"] ui/formation_
+        widget.py._open_world_browser_for와 같은 패턴 — 이미 창이 떠
+        있으면 그 창을 이 선수로 갱신하고, 없으면 새로 연다. 항상
+        비모달로 띄워서(WA_DeleteOnClose + show()) 경기 상세·다른 창과
+        동시에 조작할 수 있다."""
+        # id<-1 = 국제대회 스쿼드가 부족할 때 채워 넣는 가상 폴백 선수 —
+        # ai_players에 실제 행이 없어 세계 기록실에서 조회할 수 없다.
+        if player_id is None or player_id < -1:
+            return
+        win = self._world_browser_win
+        if win is not None:
+            try:
+                win.isVisible()
+            except RuntimeError:
+                win = None
+                self._world_browser_win = None
+        if win is not None:
+            win.open_to_player(player_id)
+            win.raise_()
+            win.activateWindow()
+            return
+        from ui.world_browser_window import WorldBrowserWindow
+        win = WorldBrowserWindow(self, open_player_id=player_id)
+        win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        win.finished.connect(self._on_world_browser_closed)
+        self._world_browser_win = win
+        win.show()
+        win.raise_()
+        win.activateWindow()
+
+    def _on_world_browser_closed(self, *_a):
+        self._world_browser_win = None
 
     def _resize_for_content(self):
-        """현재 왼쪽(통계 유무)·오른쪽(시뮬 유무)·라인업 평점 유무에 맞춰
-        다이얼로그 너비를 다시 계산한다. 셋 다 각자 고정폭 패널로 독립돼
-        있어서(기존 420px 칸은 안 건드림) 높이는 항상 기본값 그대로다."""
+        """현재 왼쪽(통계 유무)·라인업 평점 유무에 맞춰 다이얼로그 너비를
+        다시 계산한다. 각자 고정폭 패널로 독립돼 있어서(기존 420px 칸은
+        안 건드림) 높이는 항상 기본값 그대로다."""
         left_w = 300 if self._left_stats_widget is not None else 0
-        right_w = 760 if self._right_widget is not None else 0
         lineup_w = _LINEUP_PANEL_WIDTH if self._lineup_widget is not None else 0
-        new_w = left_w + 420 + right_w + lineup_w
+        new_w = left_w + 420 + lineup_w
         self.setMinimumSize(420, self._base_height)
         self.resize(new_w, self._base_height)
-
-    def _show_sim(self):
-        """[2026-08 버그수정, 신민용 리포트: "버튼 한 번 더 누르면 그
-        창 닫히게 해줘"] 이미 열려 있으면 닫고(토글), 닫혀 있으면 연다.
-        닫을 때는 시뮬 패널만 접고, 자동으로 같이 열렸던 통계 패널은
-        그대로 둔다(사용자가 통계 버튼으로 따로 껐다 켰다 할 수 있게)."""
-        if self._right_widget is not None:
-            self._clear_right_panel()
-            self._resize_for_content()
-            return
-        from ui.match_sim_viewer import MatchSimViewer
-        sim_widget = MatchSimViewer(self._data, self)
-        # [핵심] 새 창(QDialog.show()) 대신 이 다이얼로그 오른쪽에 인라인으로
-        # 붙인다 — windowFlags를 Widget으로 바꾸면 독립된 창 대신 평범한
-        # 자식 위젯처럼 레이아웃에 들어간다. 내부 로직은 그대로 재사용.
-        sim_widget.setWindowFlags(Qt.WindowType.Widget)
-        self._open_right_panel(sim_widget, width=760)
-        # [신규] 시뮬 보기가 켜지면 팀 경기 통계도 독립 패널로 같이 띄운다.
-        #   (가운데 420px 다음에 통계 → 시뮬 → 라인업 평점 순으로 나란히)
-        if self._left_stats_widget is None:
-            self._open_left_panel(MatchStatsPanel(self._data, self), width=300)
 
     def _show_stats(self):
         """[2026-08 버그수정, 신민용 리포트: "버튼 한 번 더 누르면 그
@@ -904,7 +979,6 @@ class MatchDetailDialog(QDialog):
         self._open_left_panel(MatchStatsPanel(self._data, self), width=300)
 
     def closeEvent(self, event):
-        self._clear_right_panel()
         self._clear_left_stats()
         self._clear_lineup_panel()
         super().closeEvent(event)

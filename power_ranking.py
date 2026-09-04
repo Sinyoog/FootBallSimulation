@@ -100,6 +100,66 @@ def k_for_grade(grade: str) -> float:
 
 
 # ══════════════════════════════════════════════════════════════
+# 1.5. 부진 스트릭 — "관성 붕괴" 장치 (2026-09 신설, 신민용+GPT 설계
+#      "올라가는 건 느리게, 몇 시즌 연속 부진하면 그때부턴 빠르게")
+# ══════════════════════════════════════════════════════════════
+# 설계 원칙: k_for_grade는 "기본 관성"만 담당한다(등급 높을수록 경기
+# 하나에 덜 흔들림 — 그대로 유지). 거기에 "최근 몇 시즌 연속으로 등급
+# 대비 기대 이하 성적"이라는 별도 축을 얹어서, 관성 자체가 무너지는
+# 효과를 낸다 — 한 시즌 못한 건 무시하되(streak 1까지는 배율 없음),
+# 2~3시즌 연속이면 K가 커지기 시작해서 4~5시즌 연속이면 사실상 최하위
+# 등급(F)만큼 출렁이게 된다. 반대로 상승 쪽엔 이 스트릭을 절대 적용하지
+# 않는다(신민용 명시적 요청 — "약팀이 한 시즌 잘했다고 바로 강팀 취급
+# 하면 안 됨", 상승은 계속 느리게).
+#
+# 팀은 "리그 순위 백분위"로, 국가는 "대회 도달 스테이지"로 판단 기준이
+# 다르므로 각각 별도 표를 둔다(둘 다 update_team_b_for_year/update_
+# country_b_for_year에서 매 시즌 1회 판정 후 DB에 저장 — 다음 시즌
+# 레이어A 계산(match_delta)이 이 값을 읽어서 K를 키운다).
+
+# 팀: 이 백분위(순위/참가팀수)까지는 "기대 이하"로 안 본다. 이걸 넘어서면
+# (더 낮은 순위) 그 시즌은 부진으로 집계.
+EXPECTED_PERCENTILE_CEILING = {
+    "SS": 0.15, "S": 0.25, "A": 0.40, "B": 0.55,
+    "C": 0.70, "D": 0.85, "E": 0.95, "F": 1.01,
+}
+# 국가: 대회 도달 스테이지를 서수로 변환(0=조별탈락, -1=예선 탈락으로
+# 본선行 자체를 못 함). 이 서수 미만이면(더 얕은 라운드) 그 해는 부진.
+_STAGE_TIER_ORDINAL = {
+    "group_exit": 0, "round16": 1, "quarterfinal": 2,
+    "semifinal": 3, "runner_up": 4, "champion": 5,
+}
+COUNTRY_EXPECTED_TIER_FLOOR = {
+    "SS": 3, "S": 2, "A": 1, "B": 0, "C": 0, "D": 0, "E": 0, "F": 0,
+}
+
+# 부진 스트릭 → 레이어A(K) 배율. streak 0~1은 배율 없음("한 시즌 못했다고
+# 안 무너짐"), 2시즌째부터 서서히 커져서 5시즌째부터 고정 상한.
+STREAK_K_MULTIPLIER = {0: 1.0, 1: 1.0, 2: 1.25, 3: 1.5, 4: 2.0, 5: 2.75}
+# 부진 스트릭 → 레이어B 하락 페널티 배율(상승 쪽 보너스엔 절대 적용 안 함).
+STREAK_PENALTY_MULTIPLIER = {1: 1.0, 2: 1.2, 3: 1.5, 4: 1.8, 5: 2.0}
+# 국가 전용 — "그 등급치고 못했다"는 신호에 대한 신규 소규모 페널티.
+# 기존 COUNTRY_PLACEMENT_BASE_SCORE(우승~조별탈락 배점표)는 이미 여러
+# 세션에 걸쳐 튜닝된 값이라 그대로 두고 건드리지 않는다(3.6 배점표
+# 근처 주석 참고) — 그 표가 못 잡아내는 "기대 이하" 신호만 이 값으로
+# 별도로 추가한다.
+COUNTRY_UNDERPERFORM_BASE_PENALTY = -4.0
+
+
+def _streak_bucket(streak: int) -> int:
+    return max(0, min(int(streak or 0), 5))
+
+
+def effective_k_for_grade(grade: str, streak: int) -> float:
+    """등급 기본 K에 부진 스트릭 배율을 곱하되, 최종값은 최하위 등급(F)의
+    기본 K를 넘지 않게 상한을 둔다(신민용 명시적 요청 — "K가 무작정
+    널뛰기하면 안 된다", SS팀이 몰락해도 딱 F팀 수준까지만 출렁임)."""
+    base = k_for_grade(grade)
+    mult = STREAK_K_MULTIPLIER[_streak_bucket(streak)]
+    return min(k_for_grade("F"), base * mult)
+
+
+# ══════════════════════════════════════════════════════════════
 # 2. Elo 엔진 (3.2) — 대칭(제로섬) 매치 델타
 # ══════════════════════════════════════════════════════════════
 
@@ -180,14 +240,20 @@ def expected_score_from_gap(gap: float) -> float:
 
 def match_delta(rating_home: float, rating_away: float, grade_home: str, grade_away: str,
                  actual_home: float, comp_weight: float, stage_weight: float,
-                 is_final: bool = False, home_bonus: float = HOME_BONUS):
+                 is_final: bool = False, home_bonus: float = HOME_BONUS,
+                 streak_home: int = 0, streak_away: int = 0):
     """3.2 공식. actual_home: 홈팀 관점 실제결과(R값, 아래 match_result_r 참고).
     돌려주는 (delta_home, delta_away)는 반드시 부호만 반대인 동일 크기 —
     한쪽이 얻은 점수는 정확히 반대쪽이 잃는다(설계 원칙 7, 3.2 확정).
     상한을 자른 뒤에도 대칭이 유지되도록, delta_home을 먼저 자르고
-    delta_away는 그 잘린 값의 부호만 반대로 계산한다."""
+    delta_away는 그 잘린 값의 부호만 반대로 계산한다.
+    [2026-09 신설] streak_home/streak_away: 각 팀/국가의 부진 스트릭 —
+    k_for_grade 대신 effective_k_for_grade로 K를 구해서, 부진이 누적된
+    쪽은 이 경기의 결과가 실력 재평가에 더 크게 반영되게 한다(제로섬은
+    그대로 유지 — 델타 자체는 여전히 부호만 반대인 동일 크기)."""
     e_home = expected_score(rating_home, rating_away, home_bonus)
-    k_match = (k_for_grade(grade_home) + k_for_grade(grade_away)) / 2.0
+    k_match = (effective_k_for_grade(grade_home, streak_home)
+               + effective_k_for_grade(grade_away, streak_away)) / 2.0
     raw = k_match * comp_weight * stage_weight * (actual_home - e_home)
     cap = DELTA_CAP_FINAL if is_final else DELTA_CAP
     delta_home = max(-cap, min(cap, raw))
@@ -215,12 +281,47 @@ def match_result_r(home_score: int, away_score: int, pso_winner=None, home_id=No
 
 TEAM_COMPETITION_WEIGHT = {
     "league": 1.0, "domestic_cup": 0.6, "super_cup": 0.5,
-    "europa": 1.1, "conference": 0.8, "club_world_cup": 1.8,
-    # champions는 대륙별로 다름 → TEAM_CHAMPIONS_WEIGHT_BY_CONTINENT
+    "club_world_cup": 1.8,
+    # champions/europa/conference는 대륙별로 다름 →
+    # TEAM_CHAMPIONS_WEIGHT_BY_CONTINENT / TEAM_EUROPA_WEIGHT_BY_CONTINENT /
+    # TEAM_CONFERENCE_WEIGHT_BY_CONTINENT
 }
+# [2026-09 정정, 신민용 확정: "우승할 때 점수 순위는 챔스: 유럽 > 남미 >
+# 아프리카 > 아시아 > 북미 이렇게 가야돼, 유로파급이나 컨퍼런스급도
+# 마찬가지"] 예전엔 유럽/북미/아시아/아프리카가 전부 1.6으로 동률이고
+# 남미만 1.7로 튀는 애매한 표였다 — 5개 대륙을 확정된 서열대로 전부
+# 다른 값으로 촘촘히 벌려놓는다. 유로파/컨퍼런스도 같은 대륙 서열을
+# 그대로 따르되, 대회 자체의 격차(챔스 1.4~1.8 > 유로파 0.9~1.3 >
+# 컨퍼런스 0.6~1.0)는 유지한다 — 즉 "북미 챔스"가 "유럽 컨퍼런스"보다
+# 낮아지는 일은 없다(각 티어 내에서만 대륙 서열이 갈림).
 TEAM_CHAMPIONS_WEIGHT_BY_CONTINENT = {
-    "유럽": 1.6, "북남미": 1.7, "아시아": 1.6, "아프리카": 1.6,
+    "유럽": 1.8, "남미": 1.7, "아프리카": 1.6, "아시아": 1.5, "북미": 1.4,
 }
+TEAM_EUROPA_WEIGHT_BY_CONTINENT = {
+    "유럽": 1.3, "남미": 1.2, "아프리카": 1.1, "아시아": 1.0, "북미": 0.9,
+}
+TEAM_CONFERENCE_WEIGHT_BY_CONTINENT = {
+    "유럽": 1.0, "남미": 0.9, "아프리카": 0.8, "아시아": 0.7, "북미": 0.6,
+}
+_CLUB_CONTINENT_WEIGHT_TABLE = {
+    "champions": TEAM_CHAMPIONS_WEIGHT_BY_CONTINENT,
+    "europa": TEAM_EUROPA_WEIGHT_BY_CONTINENT,
+    "conference": TEAM_CONFERENCE_WEIGHT_BY_CONTINENT,
+}
+
+
+def _club_comp_weight(category: str, continent) -> float:
+    """category(champions/europa/conference/domestic_cup/super_cup/...)와
+    continent(챔스/유로파/컨퍼런스만 의미 있음, 그 외는 무시)로 팀 대회
+    가중치를 돌려준다. 대륙별 표가 있는 3개 대회는 그 표에서, 없으면
+    TEAM_COMPETITION_WEIGHT의 고정값을 쓴다."""
+    table = _CLUB_CONTINENT_WEIGHT_TABLE.get(category)
+    if table is not None:
+        # champions 기본값 1.6 유지(과거 세이브의 미분류/구표기 continent
+        # 대비 안전한 중간값), europa/conference도 각 표의 중간값을 기본값으로.
+        default = {"champions": 1.6, "europa": 1.1, "conference": 0.8}[category]
+        return table.get(continent, default)
+    return TEAM_COMPETITION_WEIGHT[category]
 
 # stage 라벨(실제 DB에 쓰이는 값: group/league/PO/R16/QF/SF/TP/F)을
 # 3.5 단계가중치로 매핑. 'league'(CL 스위스리그 페이즈)와 'group'은 조별
@@ -305,25 +406,30 @@ RELEGATION_BASE_PENALTY = -14.0  # 강등 1단계당 기본 페널티(리그가�
 # 이제 중~하위권도 세분화된다. 백분위 비교는 <= 부등호라 자동으로 ceil()과
 # 동일한 효과를 낸다(예: 18팀 리그 상위10% 컷오프는 1.8 → 2위까지 포함).
 def league_placement_bonus(final_rank: int, n_teams: int) -> float:
+    """[2026-09 재조정, 신민용 확정: "1위 +20 vs 최하위 -8은 방향이 이상하다
+    — 상승은 느리게, 하락은 부진이 쌓일수록 빨라지는 구조가 맞다"] 상승 쪽
+    폭을 확실히 줄이고(+20→+10), 하락 쪽은 기본 폭 자체도 살짝 늘렸다
+    (-8→-9) — 실제 "부진 스트릭에 따른 가속"은 이 함수가 아니라 호출부
+    (update_team_b_for_year)에서 STREAK_PENALTY_MULTIPLIER로 마이너스
+    값에만 추가로 곱해진다(상승 쪽엔 그 배율을 절대 적용 안 함)."""
     if n_teams <= 0:
         return 0.0
     if final_rank == 1:
-        return 20.0   # mutually exclusive — 아래 상위10% 밴드와 안 겹침
+        return 10.0   # mutually exclusive — 아래 상위10% 밴드와 안 겹침
+    if final_rank == n_teams:
+        return -9.0   # 리터럴 꼴찌 — 아래 하위10% 밴드보다 한 단계 더
     percentile = final_rank / n_teams
     if percentile <= 0.10:
-        return 10.0
-    if percentile <= 0.20:
-        return 6.0
+        return 5.0
     if percentile <= 0.25:
-        return 3.0
-    if percentile <= 0.50:
-        return 0.0
+        return 2.0
     if percentile <= 0.75:
-        return -2.0
+        return 0.0
     if percentile <= 0.90:
-        return -5.0
-    return -8.0   # 91~100% — 강등팀도 이 밴드에 자연히 포함(별도 행 없음,
-                  # 실제 강등 이벤트 페널티는 RELEGATION_BASE_PENALTY로 별개 처리)
+        return -3.0
+    return -6.0   # 91~99% (리터럴 꼴찌는 위에서 이미 처리됨) — 강등팀도
+                  # 이 밴드에 자연히 포함(별도 행 없음, 실제 강등 이벤트
+                  # 페널티는 RELEGATION_BASE_PENALTY로 별개 처리)
 
 
 # 국내리그/지역컵 연속우승 감쇠 (3.7/4.7)
@@ -344,21 +450,27 @@ COUNTRY_TIER_WEIGHT = {
     "asian_cup": 1.1, "afcon": 1.1,
 }
 # 지역컵 5단계 세분화(4.3). REGION_CUP_NAME의 키(지역명) 기준.
+# [2026-09 정정, 신민용: "골드컵도 지역컵으로 가는거고... 코파보다 낮은
+# 가중치"] 골드컵(북미)은 대륙컵(CONF) 티어가 아니라 여기 지역컵(REGION)
+# 티어 소속이다 — 남미(코파 아메리카)는 이 표에 없어 기본값(0.9)을 쓰므로,
+# "코파보다 낮게"를 만족하도록 0.9보다 낮은 값을 명시한다.
+# [2026-09 정정, 신민용 확정: "골드컵은 동남아같은 지역컵보단 높지만
+# 코파보단 낮은거고"] 코파 아메리카(남미)가 이 표에 없어서 기본값(0.9)을
+# 쓰고 있었는데, 그러면 동남아시아(0.9)와 동률이라 "골드컵 > 동남아,
+# 골드컵 < 코파"를 만족시킬 자리가 없었다 — 코파를 최상위로 명시하고
+# (지역컵 중 가장 격이 높다는 설계 의도), 골드컵을 동남아(0.9)보다
+# 위·코파(1.3)보다 아래인 1.0으로 둔다.
 REGIONAL_CUP_TIER_WEIGHT = {
+    "남미": 1.3,  # 코파 아메리카 — 지역컵 중 최상위
     "서아시아": 1.2, "서아프리카": 1.2,
-    "중앙아메리카": 1.1, "오세아니아": 1.1,
+    "오세아니아": 1.1,
+    "북미": 1.0,  # 골드컵 — 동남아 등 일반 지역컵보단 위, 코파보단 아래
     "동아시아": 1.0, "남부아프리카": 1.0,
     "동남아시아": 0.9, "북아프리카": 0.9, "중앙아프리카": 0.9,
-    "동아프리카": 0.7, "카리브": 0.8,
+    "동아프리카": 0.7,
     "중앙아시아": 0.6, "남아시아": 0.6,
 }
 QUALIFIER_FAIL_BASE_PENALTY = -8  # 4.6, 대회가중치를 곱해서 적용
-
-# intl_tournaments.kind → COUNTRY_TIER_WEIGHT 키. euro는 kind='continent'를
-# 대륙컵과 공유하고 name으로만 구분(world_browser 관례와 동일).
-_COUNTRY_KIND_MAP_BY_CONTINENT = {
-    "아시아": "asian_cup", "아프리카": "afcon", "아메리카": "americas_cup", "유럽": None,
-}
 
 
 def _country_tournament_weight(kind: str, name: str) -> Optional[tuple]:
@@ -367,12 +479,26 @@ def _country_tournament_weight(kind: str, name: str) -> Optional[tuple]:
     if kind == "world":
         return ("world_cup", COUNTRY_TIER_WEIGHT["world_cup"])
     if kind == "region":
-        return ("region", None)  # 가중치는 지역명 확인 후 결정
+        return ("region", None)  # 가중치는 지역명 확인 후 결정(골드컵 포함)
+    if kind in ("power_eval", "power_eval_extra"):
+        # [2026-09 신설] 랭킹 평가전 — 레이어A(MatchRating)엔 반영하되
+        # (그래서 여기 등록함) 레이어B(성적 보너스)는 update_country_b_
+        # for_year에서 이 kind를 명시적으로 건너뛰어 완전히 배제한다
+        # (신민용 확정: "MatchRating만, AchievementRating 없음" 원칙).
+        # 가중치는 지역컵 최하단(0.6)보다는 높고 일반 예선 기본값(1.0)과
+        # 같은 중립값 — 실력이 비슷한 팀끼리 붙는 대회라 결과 자체의
+        # "이변 정보량"은 충분해서 굳이 낮출 필요는 없다고 판단.
+        return ("power_eval", 1.0)
     if kind == "continent":
         if name and EURO_NAME in name:
             return ("euro", COUNTRY_TIER_WEIGHT["euro"])
-        # continent 값 자체가 tournament 테이블엔 없으므로 이름으로 유추
-        for region, key in (("아시안컵", "asian_cup"), ("아프리카", "afcon"), ("아메리카", "americas_cup")):
+        # continent 값 자체가 tournament 테이블엔 없으므로 이름으로 유추.
+        # [2026-09 정정] 대륙컵(네이션스컵) 티어는 다시 유럽/남북미 통합
+        # ("남북미 대륙컵")/아시아/아프리카 4개뿐이다("대륙컵"이라는 단어가
+        # 이 4개 이름 중 "남북미 대륙컵"에만 들어있어 substring으로 안전하게
+        # 구분됨). 골드컵은 이제 kind='region'이라 여기 안 걸린다.
+        for region, key in (("아시안컵", "asian_cup"), ("아프리카", "afcon"),
+                             ("대륙컵", "americas_cup")):
             if name and region in name:
                 return (key, COUNTRY_TIER_WEIGHT[key])
         return ("continental_unknown", 1.1)
@@ -434,6 +560,18 @@ def ensure_power_ranking_tables(conn):
         country TEXT PRIMARY KEY,
         a_rating REAL DEFAULT 0, b_rating REAL DEFAULT 0,
         last_updated_year INTEGER DEFAULT 0)""")
+    # [2026-09 신설, 부진 스트릭] 기존 세이브엔 이 컬럼이 없으므로 ALTER
+    # TABLE로 추가 — 이미 있으면(신규 세이브 또는 재실행) SQLite가
+    # "duplicate column" OperationalError를 던지는데, 다른 마이그레이션들과
+    # 동일하게 조용히 무시한다.
+    for _ddl in (
+        "ALTER TABLE team_power_rating ADD COLUMN underperform_streak INTEGER DEFAULT 0",
+        "ALTER TABLE country_power_rating ADD COLUMN underperform_streak INTEGER DEFAULT 0",
+    ):
+        try:
+            c.execute(_ddl)
+        except Exception:
+            pass
     # 연도별 스냅샷(발표 파워랭킹) — 표시 PS = a_rating+b_rating, 스무딩 없음(5.3).
     # [2026-09 DB 분리 2차, 성능 감사 1위] 이 표는 매년 전 세계 팀 수만큼
     # (실측 11,393행) 한 번 쌓이고 그 뒤로는 절대 안 바뀌는 순수 연도별
@@ -520,6 +658,11 @@ def ensure_power_ranking_tables(conn):
 # 하지 않기 위함"이다. run_year_end_power_ranking_update 시작 시 매번
 # 비워서(다음 시즌엔 무조건 새로 읽음) 시즌 간 데이터가 섞일 일이 없다.
 _team_ab_cache: dict = {}
+# [2026-09 신설, 부진 스트릭] 위 _team_ab_cache와 완전히 같은 패턴/이유
+# (연 1회 배치 동안만 유효, run_year_end_power_ranking_update 시작 시
+# 매번 비움) — a_rating/b_rating과 별개 축이라 별도 캐시로 둔다.
+_team_streak_cache: dict = {}
+_country_streak_cache: dict = {}
 
 # [2026-08 신설, 신민용 요청: "레알 23위→2위/바르셀로나 4위→14위 같은
 # 급변동을 감으로 재계산하지 말고 실제 로그로 바로 판별하고 싶다"]
@@ -636,6 +779,29 @@ def _get_team_grade(conn, team_id: int) -> str:
     return grade_for_ps(_get_team_rating(conn, team_id))
 
 
+def _get_team_streak(conn, team_id: int) -> int:
+    """직전 시즌까지 누적된 부진 스트릭. _team_ab_cache와 동일한 패턴 —
+    이번 배치 동안 이미 읽었거나 쓴 값은 다시 SELECT하지 않는다."""
+    cached = _team_streak_cache.get(team_id)
+    if cached is not None:
+        return cached
+    row = conn.execute(
+        "SELECT underperform_streak FROM team_power_rating WHERE team_id=?", (team_id,)
+    ).fetchone()
+    result = (row[0] or 0) if row else 0
+    _team_streak_cache[team_id] = result
+    return result
+
+
+def _set_team_streak(conn, team_id: int, streak: int):
+    """update_team_b_for_year가 이번 시즌 판정을 끝낸 뒤 1회 호출 —
+    team_power_rating 행은 이 시점엔 이미 레이어A(update_team_ratings_
+    for_year)에서 그 팀의 a_rating이 갱신되며 존재가 보장된다."""
+    conn.execute("UPDATE team_power_rating SET underperform_streak=? WHERE team_id=?",
+                 (streak, team_id))
+    _team_streak_cache[team_id] = streak
+
+
 def _add_team_a(conn, team_id: int, delta: float, year: int, source: str = ""):
     a, b = _get_team_ab(conn, team_id)
     conn.execute("""INSERT INTO team_power_rating(team_id, a_rating, b_rating, last_updated_year)
@@ -677,6 +843,24 @@ def _get_country_rating(conn, country: str) -> float:
 
 def _get_country_grade(conn, country: str) -> str:
     return grade_for_ps(_get_country_rating(conn, country))
+
+
+def _get_country_streak(conn, country: str) -> int:
+    cached = _country_streak_cache.get(country)
+    if cached is not None:
+        return cached
+    row = conn.execute(
+        "SELECT underperform_streak FROM country_power_rating WHERE country=?", (country,)
+    ).fetchone()
+    result = (row[0] or 0) if row else 0
+    _country_streak_cache[country] = result
+    return result
+
+
+def _set_country_streak(conn, country: str, streak: int):
+    conn.execute("UPDATE country_power_rating SET underperform_streak=? WHERE country=?",
+                 (streak, country))
+    _country_streak_cache[country] = streak
 
 
 def _add_country_a(conn, country: str, delta: float, year: int):
@@ -849,10 +1033,12 @@ def _team_continent_for_champions(conn, team_id: int) -> Optional[str]:
     if not row:
         return None
     continent = row[0]
+    # [2026-09 개편] "북남미" 통합 폐지 — champions_engine.CONTINENT_MAP과
+    # 동일한 규칙(오세아니아→아시아, 남미/북미는 각자 독립)으로 맞춘다.
     if continent in ("아시아", "오세아니아"):
         return "아시아"
     if continent in ("북미", "남미"):
-        return "북남미"
+        return continent
     return continent
 
 
@@ -880,7 +1066,9 @@ def _update_team_a_from_matches(conn, matches_table: str, tournament_id: int, ye
             sw *= SAME_LEAGUE_DISCOUNT
         rh, ra = _get_team_rating(conn, home_id), _get_team_rating(conn, away_id)
         gh, ga = grade_for_ps(rh), grade_for_ps(ra)
-        d_home, d_away = match_delta(rh, ra, gh, ga, r, comp_weight, sw, is_final=is_final)
+        sh, sa = _get_team_streak(conn, home_id), _get_team_streak(conn, away_id)
+        d_home, d_away = match_delta(rh, ra, gh, ga, r, comp_weight, sw, is_final=is_final,
+                                      streak_home=sh, streak_away=sa)
         _add_team_a(conn, home_id, d_home, year, source=source or f"match:{matches_table}#{tournament_id}")
         _add_team_a(conn, away_id, d_away, year, source=source or f"match:{matches_table}#{tournament_id}")
 
@@ -1027,7 +1215,11 @@ def _update_team_a_from_league(conn, evaluation_year: int):
         gap = rating - avg_opponent_ps
         e = expected_score_from_gap(gap * LEAGUE_ELO_GAP_COMPRESSION)
         expected_points = e * n_games
-        k_match = (k_for_grade(grade) + k_for_grade(avg_grade)) / 2.0
+        # [2026-09 신설] 상대(avg_grade)는 실제 팀이 아니라 '그 시즌 만난
+        # 상대들의 평균'이라는 가상값이라 스트릭 개념이 없다 — team_id
+        # 자신의 스트릭만 자기 쪽 K에 반영한다.
+        k_match = (effective_k_for_grade(grade, _get_team_streak(conn, team_id))
+                   + k_for_grade(avg_grade)) / 2.0
         raw = k_match * w * (actual_points - expected_points)
         delta = max(-LEAGUE_SEASON_DELTA_CAP, min(LEAGUE_SEASON_DELTA_CAP, raw))
         # [2026-08 신설, 진단용] 클램프 전 raw값도 함께 남긴다 — 다음에
@@ -1041,16 +1233,17 @@ def update_team_ratings_for_year(conn, evaluation_year: int):
     ensure_power_ranking_tables(conn)
     _update_team_a_from_league(conn, evaluation_year)
     for category, (tournaments_table, matches_table) in _CLUB_COMP_TABLES.items():
+        # [2026-09 정정] 유로파/컨퍼런스도 챔스처럼 continent별로 가중치가
+        # 갈리므로(대륙 서열: 유럽>남미>아프리카>아시아>북미) 이 셋 다
+        # continent 컬럼을 읽는다 — domestic_cup/super_cup만 대륙 무관.
+        _has_continent = category in _CLUB_CONTINENT_WEIGHT_TABLE
         tids_rows = conn.execute(
             f"SELECT id, continent FROM {tournaments_table} WHERE year=?"
-            if category == "champions" else
+            if _has_continent else
             f"SELECT id, NULL FROM {tournaments_table} WHERE year=?",
             (evaluation_year,)).fetchall()
         for tid, continent in tids_rows:
-            if category == "champions":
-                weight = TEAM_CHAMPIONS_WEIGHT_BY_CONTINENT.get(continent, 1.6)
-            else:
-                weight = TEAM_COMPETITION_WEIGHT[category]
+            weight = _club_comp_weight(category, continent)
             _update_team_a_from_matches(
                 conn, matches_table, tid, evaluation_year, weight,
                 use_stage_col=(category != "domestic_cup"),
@@ -1172,16 +1365,40 @@ def update_team_b_for_year(conn, evaluation_year: int):
         tier_w = league_tier_weight(tier_of_league.get(league_id))
         for rank, (team_id, _pts) in enumerate(standings, start=1):
             bonus = league_placement_bonus(rank, n)
+            # [2026-09 신설, 부진 스트릭] "이 등급이면 이 순위까지는 정상"
+            # 이라는 기대치(EXPECTED_PERCENTILE_CEILING)를 그 시즌 실제
+            # 백분위와 비교해서, 기대 이하면 streak+1·아니면 streak=0으로
+            # 리셋한다. 등급은 이 시점(레이어A가 이미 반영된 뒤) 기준 —
+            # "이번 시즌 실력 대비 이번 시즌 순위"로 근사한다(TUNE LATER,
+            # 정밀하게 하려면 시즌 시작 시점 등급을 별도 스냅샷해야 함).
+            grade = _get_team_grade(conn, team_id)
+            percentile = (rank / n) if n else 1.0
+            is_underperform = percentile > EXPECTED_PERCENTILE_CEILING.get(grade, 1.01)
+            old_streak = _get_team_streak(conn, team_id)
+            new_streak = old_streak + 1 if is_underperform else 0
             # [2026-08 v3.2] 하위권 밴드가 마이너스를 돌려주므로 더 이상
-            # "bonus<=0이면 스킵"하면 안 된다 — 정확히 0(중위권, 26~50%)일
-            # 때만 스킵(어차피 더할 게 없음), 마이너스는 그대로 적용해야
+            # "bonus<=0이면 스킵"하면 안 된다 — 정확히 0(중위권)일 때만
+            # 스킵(어차피 더할 게 없음), 마이너스는 그대로 적용해야
             # "우승만 보정되고 부진은 반영 안 되는" 예전 비대칭이 안 생긴다.
-            if bonus == 0:
-                continue
+            if bonus < 0 and is_underperform:
+                # 상승 쪽(양수 bonus)엔 이 배율을 절대 적용하지 않는다 —
+                # "기대 이하가 아닌데 순위표상 마이너스 밴드"(낮은 등급이
+                # 원래 하위권인 경우)에도 적용 안 됨, 딱 "그 등급치고
+                # 부진"일 때만 가속.
+                bucket = min(new_streak, 5)
+                bonus *= STREAK_PENALTY_MULTIPLIER.get(bucket, STREAK_PENALTY_MULTIPLIER[5])
             if rank == 1:
                 bonus *= decay
-            _add_team_b(conn, team_id, bonus * TEAM_COMPETITION_WEIGHT["league"] * tier_w,
-                        evaluation_year, source="B:league_placement")
+            if bonus != 0:
+                _add_team_b(conn, team_id, bonus * TEAM_COMPETITION_WEIGHT["league"] * tier_w,
+                            evaluation_year, source="B:league_placement")
+            else:
+                # bonus가 0이라 _add_team_b를 안 거쳤어도 team_power_rating
+                # 행 자체는 있어야 스트릭을 저장할 수 있다(레이어A에서 이미
+                # _add_team_a가 이 팀에 호출됐어야 정상이지만, 만에 하나를
+                # 대비해 델타 0으로 안전하게 존재를 보장).
+                _add_team_a(conn, team_id, 0.0, evaluation_year, source="streak-touch")
+            _set_team_streak(conn, team_id, new_streak)
 
     # 1b) [2026-08 신설, 신민용 버그 리포트: "우승 보정만 있고 강등(패배)
     # 보정이 없다"] 강등은 그 자체로 레이어B 페널티 — 강등 단계 수 ×
@@ -1200,12 +1417,12 @@ def update_team_b_for_year(conn, evaluation_year: int):
 
     # 2) 국제/국내컵 계열 대회 성적 보너스 (deepest-stage 판정)
     for category, (tournaments_table, matches_table) in _CLUB_COMP_TABLES.items():
+        _has_continent = category in _CLUB_CONTINENT_WEIGHT_TABLE
         rows = conn.execute(
-            f"SELECT id, {'continent' if category == 'champions' else 'NULL'} "
+            f"SELECT id, {'continent' if _has_continent else 'NULL'} "
             f"FROM {tournaments_table} WHERE year=?", (evaluation_year,)).fetchall()
         for tid, continent in rows:
-            weight = (TEAM_CHAMPIONS_WEIGHT_BY_CONTINENT.get(continent, 1.6)
-                      if category == "champions" else TEAM_COMPETITION_WEIGHT[category])
+            weight = _club_comp_weight(category, continent)
             placements = _deepest_stage_participants(
                 conn, matches_table, tid, use_stage_col=(category != "domestic_cup"))
             for team_id, tier in placements.items():
@@ -1237,7 +1454,9 @@ def _update_country_a_from_matches(conn, tournament_id: int, year: int, weight: 
         is_final = (stage == "F")
         rh, ra = _get_country_rating(conn, home), _get_country_rating(conn, away)
         gh, ga = grade_for_ps(rh), grade_for_ps(ra)
-        d_home, d_away = match_delta(rh, ra, gh, ga, r, weight, sw, is_final=is_final)
+        sh, sa = _get_country_streak(conn, home), _get_country_streak(conn, away)
+        d_home, d_away = match_delta(rh, ra, gh, ga, r, weight, sw, is_final=is_final,
+                                      streak_home=sh, streak_away=sa)
         _add_country_a(conn, home, d_home, year)
         _add_country_a(conn, away, d_away, year)
 
@@ -1288,7 +1507,22 @@ def update_country_b_for_year(conn, evaluation_year: int):
     qual_rows = [(tid, kind, name) for tid, kind, name in rows if kind and kind.endswith("_qual")]
     main_rows = [(tid, kind, name) for tid, kind, name in rows if not (kind and kind.endswith("_qual"))]
 
+    # [2026-09 신설, 부진 스트릭] 이 해에 이 나라가 실제로 뭔가(본선 또는
+    # 예선탈락)에 관여했는지, 관여했다면 그중 "최고" 도달 스테이지가
+    # 뭐였는지를 먼저 다 모은다 — 같은 해에 여러 대회(예: 대륙컵+지역컵)에
+    # 나갔으면 더 잘한 쪽 기준으로 그 해를 평가한다(가장 후한 해석).
+    # 예선 탈락(본선 진출 실패)은 group_exit보다도 아래인 -1로 취급.
+    country_best_tier_this_year: dict = {}
+    country_qual_fail_weight: dict = {}
+
     for tid, kind, name in main_rows:
+        if kind in ("power_eval", "power_eval_extra"):
+            # [2026-09 신설] 레이어B(성적 보너스) 완전 배제 — 위
+            # _country_tournament_weight 등록 주석 참고. 레이어A는 이미
+            # update_country_ratings_for_year에서 정상 반영됨. 스트릭
+            # 판정 대상에서도 마찬가지로 제외(순위 판별 전용 대회라
+            # "부진"의 증거로 쓰지 않는다).
+            continue
         wk = _intl_tournament_weight_key(kind, name)
         if wk is None:
             continue
@@ -1308,6 +1542,9 @@ def update_country_b_for_year(conn, evaluation_year: int):
                 if category == "region" and region:
                     decay = _apply_country_regional_streak(conn, region, country)
             _add_country_b(conn, country, base * weight * decay, evaluation_year)
+            ordinal = _STAGE_TIER_ORDINAL[tier]
+            country_best_tier_this_year[country] = max(
+                country_best_tier_this_year.get(country, -1), ordinal)
 
     # 예선 탈락 페널티(4.6): 예선에 참가했지만 같은 해 본선 entries에 없는 국가
     for qtid, qkind, qname in qual_rows:
@@ -1326,7 +1563,45 @@ def update_country_b_for_year(conn, evaluation_year: int):
                     (tid,)).fetchall()}
         failed = qual_countries - main_countries
         for country in failed:
-            _add_country_b(conn, country, QUALIFIER_FAIL_BASE_PENALTY * base_weight, evaluation_year)
+            country_best_tier_this_year[country] = max(
+                country_best_tier_this_year.get(country, -1), -1)
+            country_qual_fail_weight[country] = country_qual_fail_weight.get(country, 0.0) + base_weight
+
+    # [2026-09 신설, 부진 스트릭] 위에서 모은 "이 해 최고 성적"을 등급별
+    # 기대 스테이지(COUNTRY_EXPECTED_TIER_FLOOR)와 비교해 streak를
+    # 갱신하고, 기대 이하인 나라에는 (a) 예선탈락 페널티가 있으면 그
+    # 페널티에 스트릭 배율을 곱하고, (b) 예선탈락이 없어도(본선은
+    # 나갔지만 그 등급치고 초라한 성적) 신규 소규모 페널티를 스트릭
+    # 배율로 곱해 적용한다. 상승 방향에는 이 로직이 아예 관여하지 않는다
+    # (country_best_tier_this_year에 없는, 즉 이 해에 아무 증거도 없는
+    # 나라는 streak를 건드리지 않고 그냥 넘어간다).
+    for country, best_tier in country_best_tier_this_year.items():
+        grade = _get_country_grade(conn, country)
+        floor = COUNTRY_EXPECTED_TIER_FLOOR.get(grade, 0)
+        is_underperform = best_tier < floor
+        old_streak = _get_country_streak(conn, country)
+        new_streak = old_streak + 1 if is_underperform else 0
+        qual_w = country_qual_fail_weight.get(country)
+        if is_underperform:
+            bucket = min(new_streak, 5)
+            mult = STREAK_PENALTY_MULTIPLIER.get(bucket, STREAK_PENALTY_MULTIPLIER[5])
+            if qual_w:
+                _add_country_b(conn, country, QUALIFIER_FAIL_BASE_PENALTY * qual_w * mult,
+                                evaluation_year)
+            else:
+                _add_country_b(conn, country, COUNTRY_UNDERPERFORM_BASE_PENALTY * mult,
+                                evaluation_year)
+        elif qual_w:
+            # 이론상 예선탈락(best_tier=-1)은 항상 floor(최소 0) 밑이라
+            # is_underperform=True가 되므로 이 분기는 실제로는 안 타지만,
+            # 방어적으로 남겨둔다(배율 없이 기본 페널티만).
+            _add_country_b(conn, country, QUALIFIER_FAIL_BASE_PENALTY * qual_w, evaluation_year)
+        # streak 저장 전, 이 나라 country_power_rating 행이 반드시 있어야
+        # 한다(위에서 _add_country_b를 한 번도 안 거쳤을 수 있는 "기대
+        # 이상을 해낸" 케이스 방어용 — 델타 0 터치로 존재만 보장).
+        _add_country_a(conn, country, 0.0, evaluation_year)
+        _set_country_streak(conn, country, new_streak)
+
     conn.commit()
 
 
@@ -1551,6 +1826,8 @@ def run_year_end_power_ranking_update(conn, evaluation_year: int):
     # [2026-08 신설, 성능] 이번 배치(연 1회) 동안만 유효한 _team_ab_cache를
     # 매번 새로 비운다 — 위 _team_ab_cache 선언부 설명 참고.
     _team_ab_cache.clear()
+    _team_streak_cache.clear()
+    _country_streak_cache.clear()
 
     ensure_power_ranking_tables(conn)
     ensure_initial_team_power_ranking(conn)

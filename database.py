@@ -347,6 +347,17 @@ def _new_raw_conn():
         conn.execute("PRAGMA hist.mmap_size=%d" % _calc_mmap_size(_history_db_path()))
     except sqlite3.OperationalError:
         pass
+    # [2026-09 신설, 신민용 리포트: "국대 선발이 그냥 OVR순이면 노화 재설계
+    # 이후 40대가 여러 명 뽑히는 이상한 상황이 생길 수 있다"] 포지션군·
+    # 나이대·전성기(peak_ovr) 기반 선발 점수(constants.intl_selection_score)를
+    # SQL에서 직접 ORDER BY로 쓸 수 있도록 커스텀 함수로 등록한다 —
+    # get_country_squad_players() 참고. 커넥션마다(=풀에 딱 하나뿐인 라이브
+    # 커넥션 기준 1회) 등록하면 이후 모든 쿼리에서 재사용 가능.
+    try:
+        from constants import intl_selection_score as _intl_score_fn
+        conn.create_function("intl_score", 4, _intl_score_fn, deterministic=True)
+    except (sqlite3.OperationalError, sqlite3.NotSupportedError):
+        pass  # 아주 오래된 sqlite3(3.8 미만 등) 환경 방어 — 실패해도 폴백 없이 그냥 스킵
     return conn
 
 # [2026-08 신설, 신민용 리포트: "1986년으로 시작하면 국제대회가 하나도 안
@@ -1050,6 +1061,18 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         year INTEGER, team_name TEXT, from_tier INTEGER,
         to_tier INTEGER, league_name TEXT)""")
+    # [2026-09 신설, 신민용 요청: "국대 발탁 자동거절 옆에 국대 은퇴 버튼 —
+    # 누르면 커리어 성적에 국대 은퇴가 뜨고, 다시 끄면 은퇴 취소가 뜨게"]
+    # 국가대표 은퇴/복귀를 누른 시점마다 한 줄씩 쌓는 이력 테이블. action은
+    # '은퇴' 또는 '은퇴 취소'만 들어간다 — 실제 은퇴처럼 되돌릴 수 없게
+    # 만들면 재미없다는 신민용 판단에 따라 몇 번이든 번복 가능하고, 그
+    # 번복 이력 전체가 그대로 커리어 기록(career_window._intl_tab)에
+    # 남는다. [참고: 이 표는 나중에 스토리 생성 기능(story_generator.py)이
+    # "은퇴했다가 복귀한 선수" 같은 서사를 만들 때 참고할 좋은 원재료가
+    # 될 수 있다 — 지금 당장 연결하는 건 아니고 기록만 남겨둔다.]
+    c.execute("""CREATE TABLE IF NOT EXISTS nat_retirement_log(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        year INTEGER, week INTEGER, action TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS trophy_log(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         year INTEGER, team_name TEXT, league_name TEXT,
@@ -1096,6 +1119,24 @@ def init_db():
         ON goal_events(year, competition_type, competition_id)""")
     c.execute("""CREATE INDEX IF NOT EXISTS idx_goal_events_mine
         ON goal_events(is_mine)""")
+
+    # [2026-09 신설, 신민용 리포트: "AI 선수 시즌 골이 팀 실제 득점 합계랑
+    # 안 맞는다 — 내 경기(내 리그 매치)는 누가 넣었는지 tactical_engine이
+    # 실제로 알고 있는데 왜 시즌 기록엔 반영이 안 되냐"] 내 팀이 뛰는
+    # 경기는 tactical_engine이 양쪽 22명 전원(나를 대신한 슬롯 제외)의
+    # 실제 골/도움을 possession_log(scorer_id)로 정확히 알고 있다 — 지금
+    # 까지는 이게 경기 로그 표시(scorer_ratings)용으로만 쓰이고 시즌
+    # 통계 아카이브(ai_lifecycle._snapshot_season_ratings)엔 반영이
+    # 안 됐다. 이 표는 "이번 해, 내 경기에서 실제로 관측된" 골/도움/
+    # 출전수를 선수별로 누적해뒀다가, 시즌 전환 시 _estimate_ai_season
+    # (순수 추정)과 블렌딩할 때 쓴다 — 남은(나와 안 겹친) 경기수만큼만
+    # 추정을 더하는 식. season_state가 매 시즌 초기화하듯 이 표도 그 해
+    # 몫을 다 쓰고 나면 비운다(연도 넘어 계속 누적되는 표가 아님).
+    c.execute("""CREATE TABLE IF NOT EXISTS ai_player_realstat_season(
+        player_id INTEGER, year INTEGER,
+        goals INTEGER DEFAULT 0, assists INTEGER DEFAULT 0, matches INTEGER DEFAULT 0,
+        PRIMARY KEY(player_id, year)) WITHOUT ROWID""")
+
     c.execute(f"""CREATE TABLE IF NOT EXISTS game_log(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         entry TEXT, log_type TEXT DEFAULT 'normal',
@@ -1720,6 +1761,18 @@ def init_db():
         # 한다 — 그래서 대량 백필이 없어도 안전하다.
         "ALTER TABLE ai_players ADD COLUMN contract_end_year INTEGER DEFAULT 0",
         "ALTER TABLE ai_players ADD COLUMN last_transfer_year INTEGER DEFAULT 0",
+        # [2026-09 신설, 신민용 요청: "이적 종류(이적/임대)도 구분하고, 이적이면
+        # 연봉도 계산되고 이적료도 있어야 한다"] AI 선수는 지금까지 연봉이라는
+        # 개념 자체가 없었고, 이적도 전부 "즉시 완전이적"으로만 처리됐다.
+        # salary는 economy._calc_salary()로 계산해 채운다(신규 생성/이적 시점에
+        # lazy-init — contract_end_year와 같은 방식, 5.9만 명 일괄 백필 없음).
+        # on_loan_from_team_id는 0이면 임대가 아니라는 뜻, 0이 아니면 그 값이
+        # "원 소속팀"이고 team_id는 현재 뛰고 있는 임대처 팀 — loan_return_year가
+        # 되면 team_id를 다시 on_loan_from_team_id로 되돌리고 둘 다 초기화한다
+        # (ai_lifecycle._process_loan_returns).
+        "ALTER TABLE ai_players ADD COLUMN salary INTEGER DEFAULT 0",
+        "ALTER TABLE ai_players ADD COLUMN on_loan_from_team_id INTEGER DEFAULT 0",
+        "ALTER TABLE ai_players ADD COLUMN loan_return_year INTEGER DEFAULT 0",
         # [버그수정, 신민용 리포트: 선수 검색 상세창에서 "sqlite3.OperationalError:
         # no such column: created_year"] ai_lifecycle.py의 은퇴대체 INSERT는
         # 처음부터 ai_players.created_year(선수 생성 연도, world_browser.py가
@@ -1941,6 +1994,14 @@ def init_db():
         # 커리어 기록에도 정상적으로 '발탁 거절'로 남는다). 기본값 0(꺼짐)
         # → 기존 세이브는 지금까지와 동일하게 팝업이 뜬다.
         "ALTER TABLE my_player ADD COLUMN auto_decline_callup INTEGER DEFAULT 0",
+        # [2026-09 신설, 신민용 요청: "국대 발탁 자동거절 옆에 국대 은퇴
+        # 버튼"] ON이면 국가대표에서 은퇴한 상태 — auto_decline_callup과
+        # 동일한 경로(ui/center_panel.py의 발탁 대기 처리부)에서 함께
+        # 검사해 대기 중인 발탁 제안을 전부 자동 거절한다. auto_decline_
+        # callup과 별도 필드로 둔 이유: 이건 "발탁 팝업이 귀찮아서 끔"이
+        # 아니라 "국가대표를 그만두겠다는 선언"이라 커리어 기록(위
+        # nat_retirement_log)에 남고, 은퇴/복귀 이력 자체가 의미를 갖는다.
+        "ALTER TABLE my_player ADD COLUMN nat_retired INTEGER DEFAULT 0",
         # 판매추진 상태 — 시작일/마지막오퍼일/이 기간 전용 거절횟수(일반
         # transfer_rejection_count와 의미가 달라 분리)/종료판정용 저점수
         # 연속주차 카운터.
@@ -2210,6 +2271,46 @@ def init_db():
         # (year 하나로만 찾는 ai_player_position_history.role은 그 해
         # "최종/하반기" 소속팀 스냅샷 하나뿐이라 상반기 팀엔 못 쓴다).
         "ALTER TABLE ai_transfer_log ADD COLUMN player_role TEXT DEFAULT ''",
+        # [2026-09 신설, 위 ai_players.salary/on_loan_from_team_id와 같은 요청]
+        # fee: 표시용으로만 쓰던 estimate_transfer_fee() 결과를 이제 실제로
+        # 로그 행마다 저장한다(예전엔 즉석 계산 후 버려짐 — _estimate_ai_
+        # transfer_fee_display 주석 참고). is_loan=1이면 임대 이적이고,
+        # loan_return_year에 복귀 예정 연도가 들어간다(0이면 완전이적이라
+        # 복귀 없음).
+        "ALTER TABLE ai_transfer_log ADD COLUMN fee INTEGER DEFAULT 0",
+        "ALTER TABLE ai_transfer_log ADD COLUMN is_loan INTEGER DEFAULT 0",
+        "ALTER TABLE ai_transfer_log ADD COLUMN loan_return_year INTEGER DEFAULT 0",
+        # [2026-09 신설] 위와 같은 이유로 5시즌 지나 archive로 옮겨간 오래된
+        # 이적 기록도 임대 여부는 남아있어야 "세계 축구 기록실"에서 옛날
+        # 임대 이력도 계속 표시할 수 있다(_prune_ai_transfer_log가 이관할 때
+        # 같이 옮김).
+        "ALTER TABLE ai_transfer_log_archive ADD COLUMN is_loan INTEGER DEFAULT 0",
+        # [2026-09 신설, 신민용 요청: "이적이면 연봉이 써지는거고... 4년
+        # 계약이면 2000~2003년까진 같은 거니 2000년만 기록하면 되는거니"]
+        # 연도별 스냅샷이 아니라(계약은 갱신/이적 시점에만 바뀌므로 그럴
+        # 필요가 없음) 이적/은퇴대체영입/스카우팅/임대복귀/신인생성처럼
+        # "그 시점에 새 연봉이 정해지는 이벤트"마다 그 값을 여기 같이
+        # 남겨서, 특정 연도의 연봉은 "그 연도 이전 가장 최근 기록"으로
+        # 재구성한다(팀 소속 재구성과 완전히 같은 원리).
+        "ALTER TABLE ai_transfer_log ADD COLUMN salary INTEGER DEFAULT 0",
+        "ALTER TABLE ai_transfer_log_archive ADD COLUMN salary INTEGER DEFAULT 0",
+        # [2026-09 신설] 위 salary와 같은 이유 — archive로 넘어간 오래된
+        # 기록도 "이적/임대/은퇴대체영입/명문팀스카우팅" 종류 문구가
+        # 남아있어야 세계 축구 기록실에서 옛날 기록도 종류를 표시할 수
+        # 있다.
+        "ALTER TABLE ai_transfer_log_archive ADD COLUMN transfer_type TEXT DEFAULT ''",
+        # [2026-09 신설] 위 salary/transfer_type과 같은 이유 — archive로
+        # 넘어간 오래된 기록도 이적료가 남아있어야 세계 축구 기록실에서
+        # 옛날 기록의 이적료도 표시할 수 있다.
+        "ALTER TABLE ai_transfer_log_archive ADD COLUMN fee INTEGER DEFAULT 0",
+        # [2026-09 신설, 신민용 요청: "계약을 언제부터 했냐가 아니라 몇년치
+        # 했냐인건데... 기간이 늘어나면 연장 이런식으로"] 계약 "기간"(몇
+        # 년짜리 계약)을 보여주려면 그 계약이 끝나는 해(contract_end_year)
+        # 도 그 시점 로그에 같이 남아있어야 duration=contract_end_year-
+        # 계약연도로 계산할 수 있다 — 지금까지는 ai_players.contract_end_
+        # year(현재값 하나)만 있어서 과거 계약의 기간은 알 방법이 없었다.
+        "ALTER TABLE ai_transfer_log ADD COLUMN contract_end_year INTEGER DEFAULT 0",
+        "ALTER TABLE ai_transfer_log_archive ADD COLUMN contract_end_year INTEGER DEFAULT 0",
         # [2026-08 신설, 신민용+GPT 1차 구현 ④] "감독 개인 취향" —
         # manager_type(성향 유형)과는 별개로, 같은 유형이어도 감독마다
         # 이 선수를 보는 시선이 조금씩 달라지게 하는 5개 축. -1.0~+1.0,
@@ -2259,12 +2360,68 @@ def init_db():
         # 있어 CREATE TABLE IF NOT EXISTS가 컬럼을 추가해주지 않으므로 별도
         # 마이그레이션이 필요하다.
         "ALTER TABLE hist.team_season_lineup ADD COLUMN bench_json TEXT DEFAULT '[]'",
+        # [2026-09 신설, 신민용 요청: "GK들은 골 어시보단 선방률 이런걸로
+        # 표시해야 하잖아"] 이미 있는 클린시트(무실점 경기) 추정 로직
+        # (game_engine._estimate_ai_clean_sheets)을 GK 대회별 요약에도
+        # 같이 저장한다 — 실제 슈팅/선방 횟수를 시뮬레이션하진 않으므로
+        # "선방률"이라는 정밀한 수치까지는 못 만들지만, 클린시트 수가
+        # GK 성적을 보여주는 가장 가까운 기존 지표다.
+        "ALTER TABLE hist.ai_player_season_stats_by_comp ADD COLUMN clean_sheets INTEGER DEFAULT 0",
+        "ALTER TABLE hist.ai_player_season_stats ADD COLUMN clean_sheets INTEGER DEFAULT 0",
+        # [2026-09 신설, 신민용 요청: "노화가 너무 후해 — 나이별 목표
+        # OVR표를 만들고 그 목표까지 떨어지게 해줘"] 예전 노화(ai_lifecycle.
+        # _age_and_progress)는 "나이 들수록 스탯 하락 '횟수'만 조금씩
+        # 늘리는" 방식이라 목표치가 아예 없었다(실측: 28세95→40세 84~87,
+        # 사용자 목표 72~76과 15점 이상 차이). 이제 "이 선수의 전성기(29세)
+        # OVR 대비 나이별 목표 하락률"로 계산하려면 그 기준점(전성기 OVR)이
+        # 있어야 한다 — 매 시즌 현재값 기준으로 누적 계산하면 반올림 오차가
+        # 누적되고 팀 이적 등으로 기준이 흔들릴 수 있어서, 노화 시작 시점의
+        # OVR을 이 컬럼에 한 번 고정해두고 그 이후 모든 나이의 목표 OVR을
+        # 항상 이 값 기준으로 계산한다(ai_lifecycle._AGING_DECLINE_SCHEDULE
+        # 참고).
+        "ALTER TABLE ai_players ADD COLUMN peak_ovr INTEGER DEFAULT 0",
+        # [2026-09 신설, 신민용 요청: "국가대표에도 평점이랑 골 어시 이런걸
+        # 넣고 싶어"] intl_squad는 지금까지 appearances(출전 횟수)만
+        # 있었다 — 클럽 시즌기록(hist.ai_player_season_stats)과 같은
+        # 방식(game_engine._estimate_ai_season/_estimate_ai_clean_sheets로
+        # 즉석 추정, 실제 개별경기 시뮬레이션은 안 함)으로 대회별 평점/
+        # 골/어시/클린시트도 저장한다(ai_lifecycle._snapshot_intl_season_
+        # ratings 참고, run_ai_offseason에서 매 시즌 호출).
+        "ALTER TABLE intl_squad ADD COLUMN rating REAL DEFAULT 0",
+        "ALTER TABLE intl_squad ADD COLUMN goals INTEGER DEFAULT 0",
+        "ALTER TABLE intl_squad ADD COLUMN assists INTEGER DEFAULT 0",
+        "ALTER TABLE intl_squad ADD COLUMN clean_sheets INTEGER DEFAULT 0",
+        # [2026-09 신설, 신민용 요청: "클린시트 말고 선방:14 실점:1
+        # 선방률:93.5% 이런식으로 떠야한다"] game_engine._estimate_ai_gk_
+        # saves로 GK의 선방/실점을 추정해 저장한다(선방률은 표시 시점에
+        # saves/(saves+goals_conceded)로 계산 — 저장된 값끼리 항상 정확히
+        # 맞물리게). 클럽 시즌기록 2종+국가대표(intl_squad) 전부 동일.
+        "ALTER TABLE hist.ai_player_season_stats ADD COLUMN saves INTEGER DEFAULT 0",
+        "ALTER TABLE hist.ai_player_season_stats ADD COLUMN goals_conceded INTEGER DEFAULT 0",
+        "ALTER TABLE hist.ai_player_season_stats_by_comp ADD COLUMN saves INTEGER DEFAULT 0",
+        "ALTER TABLE hist.ai_player_season_stats_by_comp ADD COLUMN goals_conceded INTEGER DEFAULT 0",
+        "ALTER TABLE intl_squad ADD COLUMN saves INTEGER DEFAULT 0",
+        "ALTER TABLE intl_squad ADD COLUMN goals_conceded INTEGER DEFAULT 0",
     ]:
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,
         #  그 외 진짜 버그로 인한 예외는 숨기지 않는다. 동작은 기존과 동일.)
         try: c.execute(migration)
         except sqlite3.OperationalError: pass
+
+    # [2026-09 신설, 위 peak_ovr 컬럼 주석 참고] 기존 세이브에 이미 있던
+    # (이 컬럼 추가 이전부터 존재하던) 노화기(29세 초과) AI 선수는
+    # peak_ovr이 0으로 비어있다 — 진짜 전성기 값을 소급 재구성할 방법이
+    # 없으므로(그 시점 스탯을 저장해두지 않았음), 최선의 근사치로 "현재
+    # ovr"을 전성기 기준점으로 삼는다(이미 어느 정도 늙은 상태이므로 실제
+    # 전성기보다는 약간 낮게 잡히는 보수적 근사 — 하지만 이 시점부터는
+    # 목표곡선이 정확하게 적용된다). peak_ovr>0인 행은 이미 처리된
+    # 것이므로 건드리지 않음(멱등 — 매번 실행해도 안전).
+    try:
+        c.execute(
+            "UPDATE ai_players SET peak_ovr = ovr WHERE (peak_ovr IS NULL OR peak_ovr = 0) AND age > 29")
+    except sqlite3.OperationalError:
+        pass
 
     # [2026-07 신설, 국제대회 일 단위 전환 Phase 1.5] intl_matches/cl_matches/
     # cup_matches의 day는 기존에 "내 경기가 아니면 0"으로 채워져 있었다
@@ -2835,9 +2992,11 @@ def _prune_ai_transfer_log(conn, current_season) -> float:
         c.execute(
             """INSERT OR IGNORE INTO ai_transfer_log_archive(
                 id, season, year, player_id, from_team_id, to_team_id,
-                player_position, player_role, is_mid_season)
+                player_position, player_role, is_mid_season, is_loan, salary, transfer_type, fee,
+                contract_end_year)
                SELECT id, season, year, player_id, from_team_id, to_team_id,
-                      player_position, player_role, is_mid_season
+                      player_position, player_role, is_mid_season, is_loan, salary, transfer_type, fee,
+                      contract_end_year
                FROM ai_transfer_log WHERE season<?""", (_cutoff,))
         c.execute("DELETE FROM ai_transfer_log WHERE season<?", (_cutoff,))
         conn.commit()
@@ -3894,6 +4053,7 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
     # 시작한 캐릭터의 player_id=1과 그대로 매칭돼 커리어/은퇴 창에 이전
     # 플레이의 부상 기록이 섞여 나왔다.
     for t in ["my_player","injury_history","career_entries","promotion_log","trophy_log","awards",
+              "nat_retirement_log",
               "game_log","match_results","match_results_archive","match_details",
               "season_state","qual_results","offer_refused",
               # [2026-09 DB 분리 2차] 이 표들은 이제 main이 아니라 hist에
@@ -5001,24 +5161,39 @@ def get_country_squad_players(country, positions=None, min_count=8, target_ovr=N
                 order_by = "RANDOM()"
                 order_params = ()
             else:
-                # [2026-08 확장, 신민용 요청: "국적 기준으로 최상위 라인
-                # 뽑고 나이도 비교해서 뽑는게 나을듯"] 예전엔 OVR 하나만
-                # 보고 뽑았다 — OVR이 주 기준인 건 그대로 두되(가중치
-                # 0.3으로 살짝만 관여), 나이가 국제무대에 적합한 성숙기
-                # (27세 근방)에 가까울수록 근소하게 우대해서, OVR이
-                # 거의 같을 때 10대 유망주보다 검증된 성인 선수가 먼저
-                # 뽑히게 한다. 계수가 작아 OVR 차이가 조금만 나도 여전히
-                # OVR이 우선한다(나이는 어디까지나 보조 기준).
-                order_by = "(ap.ovr - ABS(ap.age - 27) * 0.3) DESC"
+                # [2026-09 재설계, 신민용 리포트: "노화 재설계 이후 40대가
+                # 국대에 여러 명 뽑히는 이상한 상황이 생길 수 있다"] 예전
+                # "(ap.ovr - ABS(ap.age-27)*0.3) DESC"는 27세 대칭이라
+                # 유망주에게도 페널티를 먹였고, 40세도 겨우 -3.9점이라
+                # OVR 5~10점 차이에 쉽게 뒤집혔다. constants.
+                # intl_selection_score(SQL엔 intl_score로 등록, _new_raw_conn
+                # 참고)로 교체 — 33세까지 페널티 없음, 그 이후 나이대별로
+                # 가팔라지되 포지션군(GK 관대→CB→미드→윙어/공격수 민감)과
+                # 전성기(peak_ovr, 레전드급이면 크게 감면)를 함께 반영한다.
+                order_by = "intl_score(ap.ovr, ap.age, ap.position, ap.peak_ovr) DESC"
                 order_params = ()
-            row = conn.execute(
-                f"""SELECT ap.id, ap.name, ap.position, ap.ovr, ap.age, {_stat_cols},
-                           t.name AS club, t.current_tier AS club_tier, cn.name AS club_country
-                    FROM ai_players ap JOIN teams t ON ap.team_id=t.id
-                    JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
-                    WHERE {where_sql} AND ap.position=? AND ap.id NOT IN ({ph}){cap_sql}
-                    ORDER BY {order_by} LIMIT 1""",
-                (*params, pos, *cap_params, *order_params)).fetchone()
+            try:
+                row = conn.execute(
+                    f"""SELECT ap.id, ap.name, ap.position, ap.ovr, ap.age, {_stat_cols},
+                               t.name AS club, t.current_tier AS club_tier, cn.name AS club_country
+                        FROM ai_players ap JOIN teams t ON ap.team_id=t.id
+                        JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
+                        WHERE {where_sql} AND ap.position=? AND ap.id NOT IN ({ph}){cap_sql}
+                        ORDER BY {order_by} LIMIT 1""",
+                    (*params, pos, *cap_params, *order_params)).fetchone()
+            except sqlite3.OperationalError:
+                # [방어] intl_score 커스텀 함수 등록이 어떤 이유로든 실패한
+                # 아주 예외적인 환경 — 예전 27세 대칭 공식으로 폴백해 선발
+                # 자체는 끊기지 않게 한다.
+                _fallback_order = "(ap.ovr - ABS(ap.age - 27) * 0.3) DESC" if order_by.startswith("intl_score") else order_by
+                row = conn.execute(
+                    f"""SELECT ap.id, ap.name, ap.position, ap.ovr, ap.age, {_stat_cols},
+                               t.name AS club, t.current_tier AS club_tier, cn.name AS club_country
+                        FROM ai_players ap JOIN teams t ON ap.team_id=t.id
+                        JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
+                        WHERE {where_sql} AND ap.position=? AND ap.id NOT IN ({ph}){cap_sql}
+                        ORDER BY {_fallback_order} LIMIT 1""",
+                    (*params, pos, *cap_params, *order_params)).fetchone()
             if row:
                 slots[i] = dict(row)
                 used_ids.add(row["id"])
@@ -5324,6 +5499,16 @@ EXPORTER_STRENGTH = {
     # 나라는 그대로 1.0 초과 보너스를 준다.
     "잉글랜드": 0.3, "독일": 0.5, "스페인": 0.6, "이탈리아": 0.6,
     "스위스": 1.6, "폴란드": 1.4,
+    # [2026-09 추가, 신민용+GPT 협업: "잉글랜드 SS급 기준 대한민국 기대값을
+    # 0.5~1명/16시즌에서 1~1.5명/16시즌 정도로 올려야 한다 — 다만 보장은
+    # 아니고 확률적으로(0명도 정상, 2~3명이면 운 좋은 세대). 그리고 일본은
+    # 한국보다 해외진출이 훨씬 많은 게 현실적(2025년 조사 기준 해외활동
+    # 선수 일본287명 vs 한국138명, 유럽만 보면 일본137 vs 한국35)"] 대한민국은
+    # 실측 잉글랜드 기대값이 대략 1.9배(=아래 MIGRATION_TIE_BONUS와 곱해진
+    # 합산 배율) 오르도록 1.2, 일본은 그보다 뚜렷이 높게 2.0을 준다(EXPORTER_
+    # STRENGTH만으로 정확한 실측 비율까지는 재현 못 하지만, "한국보다 훨씬
+    # 흔하다"는 방향성은 확실히 담는다).
+    "대한민국": 1.2, "일본": 2.0,
 }
 
 # [2026-08 참고, GPT가 제안한 "90개국×5단계 목적지리그 티어 비율표"는
@@ -5369,6 +5554,16 @@ MIGRATION_TIE_BONUS = {
     # 뛰든 상관없이 이미 그렇게 되어 있음) 쪽에서 자연히 해결된다 — 여기
     # 튀르키예 항목은 "그런 선수가 등장할 확률"만 올려준다.
     ("튀르키예", "대한민국"): 1.8,
+    # [2026-09 추가, 신민용 요청: "2000~2024년 한국 선수 유럽 진출 — 독일
+    # 32회, 프랑스·잉글랜드 14회, 벨기에·스페인 10회 정도로 목적지가
+    # 균등하지 않고 독일에 뚜렷하게 쏠린다"] 위 튀르키예 항목과 같은
+    # 원리로, 실측 빈도 순서(독일 > 프랑스=잉글랜드 > 벨기에=스페인)만
+    # 상대적으로 반영한다 — EXPORTER_STRENGTH(대한민국 전체 보너스)와
+    # 곱해져서 최종 배율이 되므로, 절대 수치보다 "독일이 확실히 더
+    # 흔하다"는 순서/격차가 핵심이다.
+    ("독일", "대한민국"): 2.2, ("프랑스", "대한민국"): 1.6,
+    ("잉글랜드", "대한민국"): 1.6, ("벨기에", "대한민국"): 1.3,
+    ("스페인", "대한민국"): 1.3,
 }
 
 def _weighted_country_pick(candidates, dest_grade=None, dest_country=None):

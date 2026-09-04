@@ -1662,7 +1662,29 @@ def advance_4weeks(schedule: list):
         flush_log_buffer()
 
 
-def advance_days(schedule: list, progress_cb=None):
+def advance_days(*args, **kwargs):
+    """[진단 래퍼] 주 진행 전체가 몇 초 걸렸는지 파일에 남긴다.
+
+    [왜 필요한가] "진행 중..." 오버레이가 7초 넘게 떠 있는데, 그게 전부
+    라이브 시뮬 때문이라고 가정하고 프리페치만 고쳤다 — 그건 검증되지 않은
+    가정이었다. 이 함수 안에서는 675개 리그 AI 경기(_sim_all_ai_matches),
+    컵/챔스 주간 처리, 훈련·부상·이적·순위 재계산이 전부 돌아간다. 라이브
+    시뮬은 그중 하나일 뿐이다.
+
+    총 시간을 먼저 재야 어디를 고쳐야 하는지 정해진다. 기존 [PERF-WEEK]/
+    [PERF-SIM]은 print라 PyQt 앱에서 안 보였다 — 같이 파일로 돌렸다.
+    """
+    import time as _t_adv
+    _t0 = _t_adv.perf_counter()
+    try:
+        return _advance_days_impl(*args, **kwargs)
+    finally:
+        _el = _t_adv.perf_counter() - _t0
+        if _el >= 0.3:
+            _live_debug("[진행 총계] %.2f초" % _el)
+
+
+def _advance_days_impl(schedule: list, progress_cb=None):
     """[2026-07 일 단위 진행] schedule 길이만큼 '하루씩 원자적으로' 전진시킨다.
 
     설계 핵심 — 검증된 advance_4weeks(주 단위 엔진)를 그대로 재사용:
@@ -1857,8 +1879,8 @@ def advance_days(schedule: list, progress_cb=None):
                 _sim_my_unscheduled_match(week, p, cur_season, day=day)
 
         _dispatch_total = _time_day.perf_counter() - _day_t0
-        if _dispatch_total >= 0.1:
-            print(f"[PERF-DISPATCH] {week}주차 {day}일차 경기/훈련 처리 {_dispatch_total:.3f}s "
+        if _dispatch_total >= 0.05:
+            _live_debug(f"[PERF-DISPATCH] {week}주차 {day}일차 경기/훈련 처리 {_dispatch_total:.3f}s "
                   f"(stype={stype!r})")
 
         is_week_last_day = (day % DAYS_PER_WEEK == 0)
@@ -1908,7 +1930,7 @@ def advance_days(schedule: list, progress_cb=None):
         # 버그수정 주석과 동일한 이유).
         super_cup_engine.process_super_cup_week(week, day=day)
         if _diw_t2 - _diw_t0 >= 0.05:
-            print(f"[PERF-DAILYHOOK] {week}주차 {day}일차: "
+            _live_debug(f"[PERF-DAILYHOOK] {week}주차 {day}일차: "
                   f"process_intl_week {_diw_t1-_diw_t0:.3f}s | "
                   f"process_cwc_week {_diw_t2-_diw_t1:.3f}s")
 
@@ -1951,7 +1973,7 @@ def advance_days(schedule: list, progress_cb=None):
             except Exception:
                 pass
             _t43_3 = _time_43.perf_counter()
-            print(f"[PERF-YEAR] {week}주차(CLUB_SEASON_END_DAY) 세부: "
+            _live_debug(f"[PERF-YEAR] {week}주차(CLUB_SEASON_END_DAY) 세부: "
                   f"finalize_club_season={_t43_1-_t43_0:.3f}s | "
                   f"promotion_playoffs={_t43_2-_t43_1:.3f}s | "
                   f"PRAGMA optimize={_t43_3-_t43_2:.3f}s")
@@ -1964,7 +1986,7 @@ def advance_days(schedule: list, progress_cb=None):
         promotion_playoff_engine.process_po_week(week, day=day)
         _t_po1 = _time_diw.perf_counter()
         if _t_po1 - _t_po0 >= 0.05:
-            print(f"[PERF-DAILYHOOK] {week}주차 {day}일차: process_po_week {_t_po1-_t_po0:.3f}s")
+            _live_debug(f"[PERF-DAILYHOOK] {week}주차 {day}일차: process_po_week {_t_po1-_t_po0:.3f}s")
 
 
         _do_flush = False
@@ -1991,11 +2013,14 @@ def advance_days(schedule: list, progress_cb=None):
             _sim_all_ai_matches(week, p.get("current_league_id", 0), cur_season)
             _pw_t5 = _time_mod.perf_counter()
             _pw_total = _pw_t5 - _pw_t0
-            if _pw_total >= 0.3:
-                print(f"[PERF-WEEK] {week}주차 마무리 {_pw_total:.2f}s "
-                      f"(국제대회 {_pw_t1-_pw_t0:.2f}s | 챔스 {_pw_t2-_pw_t1:.2f}s | "
-                      f"클럽WC {_pw_t3-_pw_t2:.2f}s | 국내컵 {_pw_t4-_pw_t3:.2f}s | "
-                      f"리그시뮬 {_pw_t5-_pw_t4:.2f}s)")
+            if _pw_total >= 0.05:
+                # [진단] print는 PyQt 앱에서 콘솔이 없어 아무도 못 본다.
+                # 파일로 남겨야 실제로 확인된다.
+                _live_debug(
+                    f"[주 마무리] {week}주차 {_pw_total:.2f}s "
+                    f"(국제대회 {_pw_t1-_pw_t0:.2f}s | 챔스 {_pw_t2-_pw_t1:.2f}s | "
+                    f"클럽WC {_pw_t3-_pw_t2:.2f}s | 국내컵 {_pw_t4-_pw_t3:.2f}s | "
+                    f"리그시뮬 {_pw_t5-_pw_t4:.2f}s)")
 
             p_latest = get_player()
             # [2026-07 수정, 신민용 지적: "축구는 주급으로 준다"] 4주마다
@@ -2021,7 +2046,7 @@ def advance_days(schedule: list, progress_cb=None):
             _advance_week(p_latest, week, 1, progress_cb=progress_cb)   # current_week/year/season 갱신(검증된 로직)
             _pw2_t2 = _time_pw2.perf_counter()
             if _pw2_t2 - _pw2_t0 >= 0.1:
-                print(f"[PERF-WEEKTAIL] {week}주차: _pay_salary {_pw2_t1-_pw2_t0:.3f}s | "
+                _live_debug(f"[PERF-WEEKTAIL] {week}주차: _pay_salary {_pw2_t1-_pw2_t0:.3f}s | "
                       f"_advance_week {_pw2_t2-_pw2_t1:.3f}s")
 
         # current_day 전진 (주/연도 경계와 무관하게 매일 정확히 1회).
@@ -2089,8 +2114,8 @@ def advance_days(schedule: list, progress_cb=None):
         flush_log_buffer()
 
         _day_total = _time_day.perf_counter() - _day_t0
-        if _day_total >= 0.1:
-            print(f"[PERF-DAY] {week}주차 {day}일차 처리 {_day_total:.3f}s "
+        if _day_total >= 0.05:
+            _live_debug(f"[PERF-DAY] {week}주차 {day}일차 처리 {_day_total:.3f}s "
                   f"(stype={stype!r} | 그주마지막날={is_week_last_day} | "
                   f"경기있음={_had_match} | 부상={bool(p.get('injured'))})")
 
@@ -2359,8 +2384,8 @@ def _sim_all_ai_matches(week, my_league_id, season):
     conn.close()
     _sim_t4 = _time_sim.perf_counter()
     _sim_total = _sim_t4 - _sim_t0
-    if _sim_total >= 0.1:
-        print(f"[PERF-SIM]  _sim_all_ai_matches({week}주차, {len(matches)}경기, "
+    if _sim_total >= 0.05:
+        _live_debug(f"[AI리그] {week}주차 {len(matches)}경기, "
               f"OVR캐시 {_sim_ovr_cache_hits_before}→{len(_team_ovr_cache)}) 세부: "
               f"경기조회 {_sim_t1-_sim_t0:.3f}s | 시뮬루프 {_sim_t2-_sim_t1:.3f}s | "
               f"executemany({len(batch_results)}건) {_sim_t3-_sim_t2:.3f}s | "
@@ -3199,7 +3224,31 @@ def _age_curve_mult(age):
     return 1.0
 
 
+def _live_debug(msg):
+    """[2026-09 진단] 라이브 시뮬이 실제로 쓰였는지를 파일에 남긴다.
+
+    PyQt 앱은 콘솔이 안 보이는 경우가 많아 print로는 확인이 안 된다.
+    game_engine.py 옆에 live_sim.log 를 만들어 한 줄씩 덧붙인다.
+    실패해도 게임 진행을 막으면 안 되므로 전부 감싼다.
+    """
+    try:
+        import os
+        import datetime
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "live_sim.log")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("[%s] %s\n"
+                    % (datetime.datetime.now().strftime("%m-%d %H:%M:%S"), msg))
+    except Exception:
+        pass
+
+
 def _simulate_match(p, week, info: dict, day=None):
+    # [계측] 라이브 물리엔진 제거(2026-09) 이후엔 이 함수 전체가 수 ms
+    # 수준이어야 정상이다 — 구간별 소요시간은 여전히 남겨둬서(_sm) 혹시
+    # 다시 느려지면 어디가 범인인지 바로 보이게 한다.
+    import time as _t_sm
+    _sm = [("진입", _t_sm.perf_counter())]
     conn = get_conn()
     c = conn.cursor()
     st = get_state()  # 현재 게임 상태 (연도 등)
@@ -3283,8 +3332,52 @@ def _simulate_match(p, week, info: dict, day=None):
     # 예외가 나도 경기 진행 자체가 막히면 안 되므로, 실패 시 예전 방식
     # (OVR 차이 확률표)으로 조용히 폴백한다.
     engine_stats = None
+    engine_detail = None
     engine_plog = None
     player_ratings = None
+    scorer_ratings = None
+    # [2026-09 제거, 신민용 확정: "경기 시뮬레이션(라이브 물리엔진)이
+    # 최적화를 너무 잡아먹는다 — 시뮬 영상은 완전히 없애고 통계·평점은
+    # 그대로 유지"]
+    #
+    # 예전엔 여기서 물리 기반 라이브 시뮬(match_sim/live/, 90분을
+    # dt=0.12초 단위로 22명 전원 실제 이동/판단시켜 스코어를 뽑는 방식)을
+    # 돌렸다. 실측 순수계산 7.5초, 백그라운드 프리페치(주 진행 직후 미리
+    # 돌려서 매치데이엔 0초로 숨기는 장치)를 붙여도 실전 로그 기준
+    # 19~24초씩 그대로 진행이 막혔다 — 45,000 물리스텝×22명이 근본
+    # 비용이라(prefetch.py 주석 참고) 계산량 자체를 줄이는 튜닝으론
+    # 15%밖에 못 줄였다.
+    #
+    # tactical_engine(포메이션 레인별 공격/수비 매치업을 분 단위로 굴리는
+    # 가벼운 엔진, 원래도 라이브 시뮬 실패 시 폴백으로 이미 쓰이고 있었음)
+    # 으로 완전히 대체한다. 같은 라인업으로 실측 0.002초(약 3,700배)이고
+    # 스코어/스탯/평점(player_ratings)/possession_log 전부 라이브 시뮬과
+    # 동일한 포맷으로 나온다. 유일하게 사라지는 건 "▶ 시뮬 보기" 2D
+    # 애니메이션(공/22명 좌표는 물리엔진에만 있던 데이터라 여기엔 없음) —
+    # ui/match_sim_viewer.py와 그 진입 버튼도 같이 제거했다.
+    #
+    # [득점자 표시] tactical_engine의 possession_log는 골마다 실제
+    # scorer_id를 남기므로(_resolve_shot), 내가 관여 안 한 우리 팀
+    # 득점도 이제 실명(masked 표시명)으로 보여줄 수 있다 —
+    # _augment_events_with_names 참고. 예전엔 "이름 없이 문구만"이었는데,
+    # 그건 당시(로스터에서 랜덤으로 이름을 뽑던 시절) 이름이 뒤죽박죽
+    # 나와서 그랬던 것이지 지금은 실제 시뮬이 계산한 진짜 득점자라 문제
+    # 없다.
+    #
+    # [정합성] 라이브 엔진은 "나"도 22명 중 하나로 직접 시뮬레이션해서
+    # 개인기록이 팀 스코어와 항상 100% 맞물렸었다. tactical_engine엔
+    # "나"가 없어서(AI 로스터만 시뮬) 내 골/도움은 여전히 _player_perf가
+    # 별도로 굴리지만, my_score를 상한으로 클램프하므로(goals=min(goals,
+    # my_score), 어시도 (my_score-goals) 이내로 cap — _player_perf 참고)
+    # 숫자 자체가 어긋나는 일은 없다. 상세화면 타임라인의 분(分)이 팀
+    # possession_log 필러와 초 단위로 살짝 어긋날 수는 있지만, 예전에
+    # 문제였던 "스코어보드 0-0인데 영상엔 29분골"류의 눈에 띄는 모순은
+    # 그 영상 자체가 없어졌으니 원천적으로 재발할 수 없다.
+    #
+    # tactical_engine이 예외를 던져도(라인업 조회 실패 등) 경기 진행
+    # 자체가 막히면 안 되므로, 그럴 땐 예전 OVR 확률표로 조용히 내려간다.
+    live_record = None
+    _sm.append(("준비(OVR/라인업/징계)", _t_sm.perf_counter()))
     try:
         from match_sim.tactical_engine import simulate_my_match
         home_formation = _team_formation(c, home_id)
@@ -3298,19 +3391,20 @@ def _simulate_match(p, week, info: dict, day=None):
             home_adv=_home_advantage())
         hs, as_ = sim["home_score"], sim["away_score"]
         engine_stats = {"home": sim["home_stats"], "away": sim["away_stats"]}
+        engine_detail = {"home": sim.get("home_stats_detail"), "away": sim.get("away_stats_detail")}
         engine_plog = sim["possession_log"]
-        # [2026-08 신설, 신민용 요청: "경기 시뮬레이션에 다른 선수들
-        # OVR·스탯도 반영해서 정교화하고, 경기 상세에서 22명 평점을
-        # 보여달라"] 전술엔진이 이미 계산한 22명 개인 기록+평점을 그대로
-        # 받아 저장 단계(_write_match_log → _save_match_detail)로 넘긴다.
         player_ratings = {"home": sim.get("home_player_ratings") or [],
                           "away": sim.get("away_player_ratings") or []}
+        # [2026-09 신설] 아래에서 "내 슬롯"을 내 실제 기록으로 덮어쓰기
+        # 전에, 득점자 이름 조회용으로 원본(치환 전) 스냅샷을 따로
+        # 떠둔다. player_ratings는 이 뒤에서 리스트 안 dict를 제자리
+        # 치환하므로, 얕은 복사라도 안 해두면 실제로 그 자리에서 골을
+        # 넣은 AI의 이름이 사라져(내 슬롯으로 덮여) "우리 팀 나머지
+        # 득점"에 이름이 안 붙는 경우가 생긴다(내가 그 자리를 맡은
+        # 포지션에서, 내가 안 넣은 골이 그 슬롯 선수 골이었던 드문 case).
+        scorer_ratings = {"home": [dict(r) if r else None for r in player_ratings["home"]],
+                          "away": [dict(r) if r else None for r in player_ratings["away"]]}
         outcome = "draw" if hs == as_ else ("home" if hs > as_ else "away")
-        # [정리] 이전엔 여기서 diff(홈-원정 전력차)를 다시 계산했는데, hs/as_는
-        # 이미 위 전술엔진(simulate_my_match)이 정한 값이라 이 diff는 outcome/
-        # 스코어 어디에도 쓰이지 않는 죽은 변수였다. 게다가 _home_advantage()를
-        # 여기서 한 번 더 호출해 위(home_adv=...)에서 뽑은 값과 다른 난수를
-        # 낭비하고 있었다 — 결과에 영향은 없었지만 불필요한 계산이라 제거.
     except Exception:
         home_ovr2 = home_ovr + (bonus if is_home else 0.0)
         away_ovr2 = away_ovr + (bonus if not is_home else 0.0)
@@ -3341,6 +3435,7 @@ def _simulate_match(p, week, info: dict, day=None):
         _opp_sot = None
         if engine_stats is not None and my_position == "GK":
             _opp_sot = engine_stats["away"]["shots_on"] if is_home else engine_stats["home"]["shots_on"]
+        _sm.append(("경기결정(tactical)", _t_sm.perf_counter()))
         goals, assists, saves, rating, events, detail = _player_perf(
             p, outcome, is_home, hs, as_, c=c, opp_ovr=_opp_ovr, opp_sot=_opp_sot)
         if p.get("slump"):
@@ -3356,16 +3451,20 @@ def _simulate_match(p, week, info: dict, day=None):
         elif _yellow_ev:
             events = list(events) + _yellow_ev
 
+        # [2026-09 정리] 라이브 물리엔진이 있던 시절엔 여기서 "나"를 시뮬
+        # 안 22명 중 하나(my_slot)로 취급해 내 골/도움을 그 결과로 통째로
+        # 덮어썼다(팀 스코어와 100% 정합 보장 목적). tactical_engine엔
+        # "나"가 없으므로 그 자리를 그냥 뺐다 — 위 _player_perf가 이미
+        # my_score를 상한으로 클램프해서 계산하므로(goals=min(goals,
+        # my_score) 등) 골/도움 개수 자체는 여전히 팀 스코어를 넘지 않는다.
+
         # [2026-08 신설, 신민용 요청: "경기 상세에서 22명 평점 보여줄 때
         # 나도 당연히 껴야지"] player_ratings의 22명은 전술엔진이 실제
         # ai_players 로스터에서 뽑은 11명씩(_select_lineup)이라 "나"는
-        # 애초에 그 안에 없다(내 개인 기록은 my_player 테이블 별도 관리 —
-        # match_sim_viewer.py가 이미 같은 이유로 "my_slot" 개념을 따로
-        # 쓰는 것과 동일한 사정). 내 포지션과 라벨이 같은 슬롯을 찾아
-        # 그 자리를 방금 계산된 내 실제 기록(goals/assists/saves/rating)
-        # 으로 통째로 바꿔치기한다 — _find_my_slot(ui/match_sim_viewer.py)
-        # 과 똑같은 우선순위(정확 일치 → POSITION_COMPAT 호환 → GK 아닌
-        # 아무 자리)로 슬롯을 고른다.
+        # 애초에 그 안에 없다(내 개인 기록은 my_player 테이블 별도 관리).
+        # 내 포지션과 라벨이 같은 슬롯을 찾아 그 자리를 방금 계산된 내
+        # 실제 기록(goals/assists/saves/rating)으로 통째로 바꿔치기한다
+        # (정확 일치 → POSITION_COMPAT 호환 → GK 아닌 아무 자리 순).
         if player_ratings is not None:
             _side_key = "home" if is_home else "away"
             _my_list = player_ratings.get(_side_key)
@@ -3397,32 +3496,65 @@ def _simulate_match(p, week, info: dict, day=None):
                         "rating": rating, "is_me": True,
                     }
 
-        # [2026-08 신설, 골 시상 시스템 v4] 실제로 골을 넣었으면 즉시
-        # goal_events에 기록(is_mine=1, is_pseudo=0) — "올해의 골" 판정의
-        # 근거 데이터. 리그 경기 훅만 우선 반영(컵/국제대회는 각 엔진에
-        # 별도 훅이 필요해 다음 단계로 미룸 — 설계문서 5절 열린 질문 참고).
-        if played and goals > 0:
-            _lg_id = info.get("league_id", 0)
-            if _lg_id:
-                _lg_row = c.execute(
-                    """SELECT cn.name AS cname, cn.grade AS cgrade, l.name AS lname
-                       FROM leagues l JOIN countries cn ON l.country_id=cn.id
-                       WHERE l.id=?""", (_lg_id,)).fetchone()
-                if _lg_row:
-                    from constants import get_league_grade
-                    _my_grade_now = get_league_grade(_lg_row["cname"], _lg_row["cgrade"])
-                    _opp_id_now = away_id if is_home else home_id
-                    _opp_ovr_now = away_ovr if is_home else home_ovr
-                    _my_team_ovr_now = home_ovr if is_home else away_ovr
-                    for _ in range(goals):
-                        _record_goal_event(
-                            c, p, st["current_year"], week, my_tid, _opp_id_now,
-                            "league", _lg_id, _lg_id, _lg_row["lname"],
-                            _my_grade_now, _opp_ovr_now, team_ovr=_my_team_ovr_now)
+    # [2026-09 신설, 신민용 리포트: "AI 시즌 골이 팀 실제 득점 합계랑
+    # 안 맞는다 — 내 경기는 누가 넣었는지 실제로 알고 있잖아"] 내 팀이
+    # 뛰는 경기는 tactical_engine이 22명 전원의 진짜 골/도움을 알고
+    # 있으므로(scorer_ratings — 내 슬롯 치환 전 원본 스냅샷), 그 실측치를
+    # ai_player_realstat_season에 선수별로 누적해둔다. 나로 치환된 슬롯
+    # (_side_key/_idx, played일 때만 존재)은 실제로는 그 AI 선수가 안
+    # 뛰고 내가 대신 뛴 자리라 제외 — 그 슬롯 빼고는 양쪽 다 진짜 출전
+    # 기록이다(내가 결장했으면 내 슬롯도 실제 AI가 뛴 것이므로 제외할
+    # 필요가 없다). 시즌 전환 시 ai_lifecycle._snapshot_season_ratings가
+    # 이 값을 추정치와 블렌딩한 뒤 비운다.
+    if scorer_ratings is not None:
+        _exclude_side = _side_key if (played and player_ratings is not None) else None
+        _exclude_idx = _idx if (played and player_ratings is not None) else None
+        _acc_year = st["current_year"]
+        for _side in ("home", "away"):
+            for _i, _entry in enumerate(scorer_ratings.get(_side) or []):
+                if _entry is None:
+                    continue
+                if _side == _exclude_side and _i == _exclude_idx:
+                    continue   # 내가 대신 뛴 자리 — 그 AI는 실제로 이 경기 안 뜀
+                _pid = _entry.get("id")
+                if _pid is None:
+                    continue
+                c.execute(
+                    """INSERT INTO ai_player_realstat_season(player_id, year, goals, assists, matches)
+                       VALUES (?, ?, ?, ?, 1)
+                       ON CONFLICT(player_id, year) DO UPDATE SET
+                           goals = goals + excluded.goals,
+                           assists = assists + excluded.assists,
+                           matches = matches + 1""",
+                    (_pid, _acc_year, _entry.get("goals", 0) or 0, _entry.get("assists", 0) or 0))
+
+    # [2026-08 신설, 골 시상 시스템 v4] 실제로 골을 넣었으면 즉시
+    # goal_events에 기록(is_mine=1, is_pseudo=0) — "올해의 골" 판정의
+    # 근거 데이터. 리그 경기 훅만 우선 반영(컵/국제대회는 각 엔진에
+    # 별도 훅이 필요해 다음 단계로 미룸 — 설계문서 5절 열린 질문 참고).
+    if played and goals > 0:
+        _lg_id = info.get("league_id", 0)
+        if _lg_id:
+            _lg_row = c.execute(
+                """SELECT cn.name AS cname, cn.grade AS cgrade, l.name AS lname
+                   FROM leagues l JOIN countries cn ON l.country_id=cn.id
+                   WHERE l.id=?""", (_lg_id,)).fetchone()
+            if _lg_row:
+                from constants import get_league_grade
+                _my_grade_now = get_league_grade(_lg_row["cname"], _lg_row["cgrade"])
+                _opp_id_now = away_id if is_home else home_id
+                _opp_ovr_now = away_ovr if is_home else home_ovr
+                _my_team_ovr_now = home_ovr if is_home else away_ovr
+                for _ in range(goals):
+                    _record_goal_event(
+                        c, p, st["current_year"], week, my_tid, _opp_id_now,
+                        "league", _lg_id, _lg_id, _lg_row["lname"],
+                        _my_grade_now, _opp_ovr_now, team_ovr=_my_team_ovr_now)
 
     my_result = _my_result(outcome, is_home)
 
     # 팀 전적 업데이트 (같은 conn 내에서)
+    _sm.append(("개인성적/카드", _t_sm.perf_counter()))
     _update_team_rec(c, home_id, away_id, outcome, hs, as_)
 
     # [2026-08 v3.2 신설, 신민용 지적: "내가 직접 하는 경기도 결과로
@@ -3494,6 +3626,7 @@ def _simulate_match(p, week, info: dict, day=None):
         )
 
     # [최적화] get_player 재조회 없이 p에서 직접 계산 후 update_player 1회 통합
+    _sm.append(("팀전적반영", _t_sm.perf_counter()))
     new_rel = _calc_manager_rel(p, rating, my_result, played)
     # [2026-07 신설] 인기도가 리그 등급을 반영하도록 이 경기 리그의 등급을
     # 조회한다(위에서 이미 conn을 닫았으므로 짧게 새로 연다) — 실패해도
@@ -3635,12 +3768,24 @@ def _simulate_match(p, week, info: dict, day=None):
                   stress=ns, happiness=nh, injury_load=new_load,
                   **mental_updates, **_injury_extra_updates)
 
+    _sm.append(("스탯/관계/부상", _t_sm.perf_counter()))
     _write_match_log(p, week, info["league_name"], is_home,
                      home_id, away_id, hs, as_,
                      my_result, goals, assists, saves, rating, events, played, benched,
-                     detail=detail, engine_stats=engine_stats, engine_plog=engine_plog, day=day,
-                     player_ratings=player_ratings)
+                     detail=detail, engine_stats=engine_stats, engine_detail=engine_detail,
+                     engine_plog=engine_plog, day=day,
+                     player_ratings=player_ratings, scorer_ratings=scorer_ratings,
+                     live_record=live_record)
 
+    _sm.append(("경기기록저장", _t_sm.perf_counter()))
+    try:
+        _tot = _sm[-1][1] - _sm[0][1]
+        if _tot >= 0.05:
+            _parts = " | ".join("%s %.2fs" % (_sm[k][0], _sm[k][1] - _sm[k - 1][1])
+                                for k in range(1, len(_sm)))
+            _live_debug("[내경기] %.2fs — %s" % (_tot, _parts))
+    except Exception:
+        pass
 
 _team_prestige_cache: dict = {}
 PRESTIGE_MATCH_BONUS = 8.0
@@ -5522,13 +5667,15 @@ def _update_pop(p, goals, assists, rating):
 
 
 def _derive_match_stats(is_home, hs, as_, goals, assists, saves, pos, detail, engine_stats=None):
-    """[경기 통계] 점유율/슈팅/코너/파울/패스성공률을 만든다.
+    """[경기 통계] 점유율/슈팅/코너/파울/패스성공률/오프사이드/카드/세이브
+    — 실제 중계화면에 뜨는 "표시용" 10개를 만든다.
 
     [신규] engine_stats가 주어지면(내 경기를 새 전술 엔진으로 시뮬레이션한
     경우) — {"home":{...}, "away":{...}} 형태, 각 항목은
-    {"poss","shots","shots_on","corners","fouls"} — 그 실제 시뮬레이션
-    결과를 기준값으로 쓴다. 공식으로 사후에 지어내는 게 아니라 실제로
-    벌어진 슈팅/코너/파울 횟수라는 뜻. 없으면(폴백 상황 등) 예전처럼
+    {"poss","shots","shots_on","corners","fouls","pass_acc","offsides",
+    "yellow_cards","red_cards","saves"} — 그 실제 시뮬레이션 결과를
+    기준값으로 쓴다. 공식으로 사후에 지어내는 게 아니라 실제로 벌어진
+    슈팅/코너/파울/패스/카드 횟수라는 뜻. 없으면(폴백 상황 등) 예전처럼
     점유율/스코어 기반 공식으로 만든다.
 
     설계 원칙 — 순서가 중요하다:
@@ -5544,7 +5691,13 @@ def _derive_match_stats(is_home, hs, as_, goals, assists, saves, pos, detail, en
     슈팅: engine_stats가 있으면 그 값을 베이스로, 내 개인 슈팅 기록을 하한선 보장.
     유효슈팅: 최소한 그 팀이 넣은 골 수만큼은 보장(골은 유효슈팅에서만 나옴).
     코너/파울: engine_stats가 있으면 그 값, 없으면 슈팅·점유율에서 파생.
-    패스 성공률: 내 개인 pass_acc를 우리 팀 값의 기준점으로 삼음.
+    패스 성공률: [2026-09 개정] engine_stats가 실제 패스 집계값(pass_acc)을
+      주면 그걸 최우선으로 쓴다(실측이라 formula보다 정확) — 없을 때만
+      예전처럼 내 개인 pass_acc → 그것도 없으면 점유율 기반 공식.
+    오프사이드/카드: engine_stats가 있으면 그 값, 없으면 슈팅/파울에서
+      파생(레드카드는 워낙 드문 사건이라 공식만으로는 안 만들고 0 유지).
+    세이브: engine_stats가 있으면 그 값(내가 GK로 직접 세운 기록 하한 보장),
+      없으면 상대 유효슈팅 - 상대 득점(=내가 막아낸 수)으로 근사.
     """
     my_score = hs if is_home else as_
     opp_score = as_ if is_home else hs
@@ -5565,8 +5718,20 @@ def _derive_match_stats(is_home, hs, as_, goals, assists, saves, pos, detail, en
         opp_corners = opp_eng.get("corners", 0)
         my_fouls = max(1, my_eng.get("fouls", 0))
         opp_fouls = max(1, opp_eng.get("fouls", 0))
-        my_pass_acc = detail.get("pass_acc") or (0.66 + my_poss * 0.0026)
-        opp_pass_acc = 0.66 + opp_poss * 0.0026
+        my_pass_acc = my_eng.get("pass_acc")
+        if my_pass_acc is None:
+            my_pass_acc = detail.get("pass_acc") or (0.66 + my_poss * 0.0026)
+        opp_pass_acc = opp_eng.get("pass_acc")
+        if opp_pass_acc is None:
+            opp_pass_acc = 0.66 + opp_poss * 0.0026
+        my_offsides = my_eng.get("offsides", 0)
+        opp_offsides = opp_eng.get("offsides", 0)
+        my_yellow = my_eng.get("yellow_cards", 0)
+        opp_yellow = opp_eng.get("yellow_cards", 0)
+        my_red = my_eng.get("red_cards", 0)
+        opp_red = opp_eng.get("red_cards", 0)
+        my_saves = max((saves if pos == "GK" else 0), my_eng.get("saves", 0))
+        opp_saves = opp_eng.get("saves", 0)
     else:
         diff = my_score - opp_score
         my_poss = 50 + round(20 * math.tanh(diff / 2.5))
@@ -5591,16 +5756,33 @@ def _derive_match_stats(is_home, hs, as_, goals, assists, saves, pos, detail, en
         my_pass_acc = detail.get("pass_acc") or (0.66 + my_poss * 0.0026)
         opp_pass_acc = 0.66 + opp_poss * 0.0026
 
+        my_offsides = max(0, round(my_shots * 0.15))
+        opp_offsides = max(0, round(opp_shots * 0.15))
+        my_yellow = max(0, round(my_fouls * 0.30))
+        opp_yellow = max(0, round(opp_fouls * 0.30))
+        my_red = 0    # 워낙 드문 사건이라 공식만으로는 안 만든다(0 유지).
+        opp_red = 0
+        my_saves = max((saves if pos == "GK" else 0), max(0, opp_shots_on - opp_score))
+        opp_saves = max(0, my_shots_on - my_score)
+
     home_stats, away_stats = (
         {"poss": my_poss, "shots": my_shots, "shots_on": my_shots_on,
-         "corners": my_corners, "fouls": my_fouls, "pass_acc": round(my_pass_acc, 3)},
+         "corners": my_corners, "fouls": my_fouls, "pass_acc": round(my_pass_acc, 3),
+         "offsides": my_offsides, "yellow_cards": my_yellow, "red_cards": my_red,
+         "saves": my_saves},
         {"poss": opp_poss, "shots": opp_shots, "shots_on": opp_shots_on,
-         "corners": opp_corners, "fouls": opp_fouls, "pass_acc": round(opp_pass_acc, 3)},
+         "corners": opp_corners, "fouls": opp_fouls, "pass_acc": round(opp_pass_acc, 3),
+         "offsides": opp_offsides, "yellow_cards": opp_yellow, "red_cards": opp_red,
+         "saves": opp_saves},
     ) if is_home else (
         {"poss": opp_poss, "shots": opp_shots, "shots_on": opp_shots_on,
-         "corners": opp_corners, "fouls": opp_fouls, "pass_acc": round(opp_pass_acc, 3)},
+         "corners": opp_corners, "fouls": opp_fouls, "pass_acc": round(opp_pass_acc, 3),
+         "offsides": opp_offsides, "yellow_cards": opp_yellow, "red_cards": opp_red,
+         "saves": opp_saves},
         {"poss": my_poss, "shots": my_shots, "shots_on": my_shots_on,
-         "corners": my_corners, "fouls": my_fouls, "pass_acc": round(my_pass_acc, 3)},
+         "corners": my_corners, "fouls": my_fouls, "pass_acc": round(my_pass_acc, 3),
+         "offsides": my_offsides, "yellow_cards": my_yellow, "red_cards": my_red,
+         "saves": my_saves},
     )
     return {"home": home_stats, "away": away_stats}
 
@@ -5608,7 +5790,7 @@ def _derive_match_stats(is_home, hs, as_, goals, assists, saves, pos, detail, en
 def _save_match_detail(p, week, comp_name, is_home, home_name, away_name,
                        hs, as_, result, goals, assists, saves, rating,
                        events, played, benched, detail=None, pso=None, engine_stats=None,
-                       engine_plog=None, player_ratings=None):
+                       engine_detail=None, engine_plog=None, player_ratings=None, live_record=None):
     """경기 상세를 match_details 에 저장하고 detail_id 를 돌려준다.
        리그/챔스/국대 모두 이 헬퍼를 공유한다(팀명은 호출자가 직접 넘김).
        events 정규화(분 배정·시간순)도 여기서 처리. 실패 시 None 반환.
@@ -5618,6 +5800,13 @@ def _save_match_detail(p, week, comp_name, is_home, home_name, away_name,
        engine_stats: 전술 엔진(match_sim.tactical_engine)이 만든 실제
        시뮬레이션 통계({"home":{...},"away":{...}}). 있으면 _derive_match_stats가
        공식 추정 대신 이 실측값을 기준으로 쓴다.
+       engine_detail: [2026-09 신설] engine_stats("표시용" 10개) 옆에
+       나란히 오는 세부 통계({"home":{...},"away":{...}}, 각 항목은
+       tactical_engine._new_stats_detail()의 키 — 총패스/크로스/태클/
+       가로채기/클리어링/블록/공중볼/드리블/볼탈취/서드·박스진입/
+       빅찬스/xG·xA/골대/프리킥/PK/선방률). 화면엔 기본 노출 안 하고
+       payload["team_stats_detail"]에 그대로 저장만 해둔다(나중에 선수
+       통계·분석 등에 재활용하기 위함).
        engine_plog: 전술 엔진이 만든 진짜 분 단위 possession_log. 있으면
        match_flow의 사후 필러 생성 대신 이걸 개인 서사와 병합해서 쓴다.
        player_ratings: [2026-08 신설, 신민용 요청: "경기 시뮬레이션에
@@ -5691,6 +5880,11 @@ def _save_match_detail(p, week, comp_name, is_home, home_name, away_name,
             lineup_stats = match_flow.generate_lineup_stats(home_name, away_name)
         except Exception:
             lineup_stats = {}
+    # [2026-09 핵심] 라이브 시뮬로 돌린 경기는 **그 시뮬이 쓴 라인업 그대로**를
+    # 저장해야 한다. 여기서 새로 뽑으면 시뮬이 굴린 11명과 화면에 뜨는
+    # 11명이 달라져서, 시드를 맞춰도 다른 경기가 재생된다.
+    if live_record is not None and live_record.get("lineup_stats"):
+        lineup_stats = live_record["lineup_stats"]
 
     payload = {
         "events": [[m, t] for m, t in timed],
@@ -5708,6 +5902,8 @@ def _save_match_detail(p, week, comp_name, is_home, home_name, away_name,
             "pass_acc": detail.get("pass_acc", 0.0),
         },
         "team_stats": team_stats,
+        "team_stats_detail": ({"home": engine_detail.get("home"), "away": engine_detail.get("away")}
+                              if engine_detail else None),
     }
     try:
         conn2 = get_conn()
@@ -5733,21 +5929,24 @@ def _save_match_detail(p, week, comp_name, is_home, home_name, away_name,
 
 
 def _augment_events_with_names(c, p, is_home, hid, aid, hs, as_,
-                               goals, assists, played, events):
-    """[텍스트-영상 싱크] 이벤트 문구를 다듬는다.
+                               goals, assists, played, events,
+                               live_record=None, engine_plog=None, player_ratings=None):
+    """[텍스트-싱크] 이벤트 문구를 다듬는다.
 
       - 내가 넣은 골/어시(⚽·🎯 세트피스·🎯 페널티킥·🅰)와 그 외 내 개인
         활약(선방·차단·드리블 등) → 뒤에 "(내 이름)"을 붙인다.
       - 실점(🥅)은 내가 한 행동이 아니라 상대가 넣은 것이므로 이름을
         붙이지 않는다.
-      - 우리 팀이 넣었지만 내가 골도 어시도 아닌 나머지 득점은, 로스터에서
-        아무 이름이나 랜덤으로 뽑아 붙이지 않고 "어떤 골인지"만(문구만)
-        타임라인에 추가한다 — 이름 없는 일반 골로 표시.
+      - 우리 팀이 넣었지만 내가 골도 어시도 아닌 나머지 득점 → 이제
+        tactical_engine의 possession_log(scorer_id)+player_ratings로
+        실제 득점자 이름을 붙인다(아래 _team_goal_scorers).
 
-    [수정 이력] 처음엔 로스터에서 동료/상대 이름을 랜덤으로 뽑아 붙였는데,
-    국가별로 이름이 뒤죽박죽 나와 어색했다. 지금은 이름은 오직 "내 이름"
-    하나만 쓰고, 내가 관여 안 한 골은 이름 없이 사실(득점 존재·시점·종류)만
-    보여준다.
+    [수정 이력] 2026-09 이전엔 로스터에서 동료 이름을 랜덤으로 뽑아
+    붙였다가 국가별로 뒤죽박죽 나와 어색해서 "이름 없이 문구만"으로
+    후퇴했었다. 지금은 랜덤 추측이 아니라 tactical_engine이 실제로 계산한
+    득점자(그 경기 그 팀 로스터에서 진짜로 슈팅을 때린 선수)라 다시 이름을
+    붙여도 어색할 이유가 없다 — 라이브 물리엔진 제거(2026-09)로 얻은 실제
+    데이터를 그대로 재활용.
     """
     try:
         if not played:
@@ -5768,27 +5967,148 @@ def _augment_events_with_names(c, p, is_home, hid, aid, hs, as_,
             else:
                 new_events.append(tag(str(ev)))
 
-        # 내가 골도 어시도 아닌 우리 팀의 나머지 득점 — 이름 없이 문구만.
+        # 내가 골도 어시도 아닌 우리 팀의 나머지 득점.
         remaining = max(0, my_score - goals - assists)
         if remaining > 0:
-            for m in _sample_minutes(remaining, 3, 90):
-                new_events.append((m, random.choice(GOAL_PHRASES["normal"])))
+            scored = _team_goal_scorers(engine_plog, player_ratings, is_home,
+                                        new_events, remaining)
+            if scored:
+                for m, scorer_name in scored:
+                    phrase = random.choice(GOAL_PHRASES["normal"])
+                    new_events.append((m, f"{phrase} ({scorer_name})" if scorer_name else phrase))
+            else:
+                # possession_log가 없거나(구버전 기록) 개수가 안 맞으면
+                # 예전처럼 분만 랜덤으로 흩뿌리고 이름은 생략한다.
+                mins = _sample_minutes(remaining, 3, 90)
+                for m in mins:
+                    new_events.append((m, random.choice(GOAL_PHRASES["normal"])))
 
         return new_events
     except Exception:
         return events
 
 
+def _goal_minutes_from_events(events):
+    """events(개인 이벤트 목록, (분,문구) 튜플)에서 "⚽"가 포함된(=내가
+    직접 넣은 골) 항목의 분(정수)만 뽑아 리스트로 돌려준다. _team_goal_
+    scorers/_match_scorer_summary 둘 다에서 쓰는 공용 추출 로직."""
+    out = []
+    for ev in events or []:
+        if isinstance(ev, tuple) and len(ev) == 2 and "⚽" in str(ev[1]):
+            try:
+                out.append(int(ev[0]))
+            except Exception:
+                pass
+    return out
+
+
+def _team_goal_scorers(engine_plog, player_ratings, is_home, my_events_so_far, need):
+    """tactical_engine의 possession_log(각 "goal" 레코드에 scorer_id가
+    실려온다)와 그 팀 player_ratings(id→표시명)를 대조해, 내가 관여 안 한
+    우리 팀 나머지 득점의 (실제 분, 실제 득점자 이름) 목록을 돌려준다.
+
+    내 골/어시는 이미 my_events_so_far에 실제 분과 함께 올라와 있으므로
+    그 분(⚽ 표시가 붙은 것)은 제외한다 — _live_goal_minutes가 하던 것과
+    동일한 방식. 정보가 부족하면(구버전 기록·라인업 조회 실패 등) None을
+    돌려줘서 호출부가 예전처럼(이름 없이 랜덤 분) 폴백하게 한다."""
+    try:
+        if not engine_plog or not player_ratings:
+            return None
+        side = "home" if is_home else "away"
+        id_to_name = {r["id"]: r["name"] for r in (player_ratings.get(side) or [])
+                     if r and r.get("id") is not None and r.get("name")}
+        if not id_to_name:
+            return None
+        used = _goal_minutes_from_events(my_events_so_far)
+        out = []
+        for r in engine_plog:
+            if r.get("team") != side or r.get("outcome") != "goal":
+                continue
+            m = int(r.get("min", 0))
+            if m in used:
+                used.remove(m)   # 이미 내 골 이벤트로 소모된 분 — 한 번만 제외
+                continue
+            out.append((r.get("min"), id_to_name.get(r.get("scorer_id"))))
+        if len(out) < need:
+            return None           # 앞뒤가 안 맞으면 손대지 않는다(폴백)
+        return sorted(out, key=lambda x: x[0])[:need]
+    except Exception:
+        return None
+
+
+def _match_scorer_summary(engine_plog, player_ratings, hn, an,
+                          my_side=None, my_name=None, my_goal_minutes=None):
+    """[2026-09 신설, 신민용 요청: "맨 처음 뜨는 글에 골을 누가 넣었는지
+    표시하자"] 경기 로그 맨 위 요약 줄에 붙일 "N' 이름, N' 이름" 형식의
+    득점자 한 줄. tactical_engine의 possession_log(scorer_id)+
+    player_ratings(id→표시명)만 조회하면 되므로 추가 계산 비용이 사실상
+    없다(둘 다 이미 만들어져 있는 데이터). 홈/원정 어느 쪽이든 득점자
+    이름을 못 찾으면(빈 슬롯 슈팅 등) 그 골만 조용히 건너뛴다. 정보
+    자체가 없으면(구버전 기록·폴백 경로) 빈 문자열 → 호출부가 줄 자체를
+    생략한다.
+
+    [2026-09 수정, 신민용 리포트: "내가 골을 넣었을 때는 (이름) 이렇게
+    안 뜨던데"] tactical_engine의 plog는 "나"를 모른다(AI 로스터만
+    시뮬레이션) — 그래서 내가 실제로 넣은 골도 그 자리를 채운 AI
+    선수 이름으로 표시되고 있었다. my_side/my_name/my_goal_minutes(내
+    골이 실제로 터진 분들, _goal_minutes_from_events로 뽑음)를 받아서,
+    그 분에 해당하는 우리 팀 골만 AI 이름 대신 내 이름으로 바꿔 끼운다
+    — _team_goal_scorers가 "우리 팀 나머지 득점"에서 내 분을 제외하는
+    것과 정반대로, 여기서는 내 분을 찾아서 내 이름으로 치환한다."""
+    try:
+        if not engine_plog or not player_ratings:
+            return ""
+
+        def _names_for(side, team_name):
+            id_to_name = {r["id"]: r["name"] for r in (player_ratings.get(side) or [])
+                         if r and r.get("id") is not None and r.get("name")}
+            if not id_to_name:
+                return []
+            goal_evs = sorted(
+                (r for r in engine_plog if r.get("team") == side and r.get("outcome") == "goal"),
+                key=lambda r: r.get("min", 0))
+            mine_left = list(my_goal_minutes) if (my_goal_minutes and side == my_side) else []
+            out = []
+            for r in goal_evs:
+                m = int(r.get("min", 0))
+                if m in mine_left:
+                    mine_left.remove(m)
+                    name = my_name
+                else:
+                    name = id_to_name.get(r.get("scorer_id"))
+                if name:
+                    out.append("%d' %s" % (m, name))
+            return out
+
+        h = _names_for("home", hn)
+        a = _names_for("away", an)
+        parts = []
+        if h:
+            parts.append(f"{hn}: " + ", ".join(h))
+        if a:
+            parts.append(f"{an}: " + ", ".join(a))
+        return "⚽ " + " · ".join(parts) if parts else ""
+    except Exception:
+        return ""
+
+
 def _write_match_log(p, week, league_name, is_home,
                      hid, aid, hs, as_,
                      result, goals, assists, saves, rating, events, played, benched,
-                     detail=None, engine_stats=None, engine_plog=None, day=None,
-                     player_ratings=None):
+                     detail=None, engine_stats=None, engine_detail=None, engine_plog=None, day=None,
+                     player_ratings=None, scorer_ratings=None, live_record=None):
     # [최적화] 팀명을 세션 캐시에서 조회 (매 경기 get_conn 제거)
     conn = get_conn()
     c = conn.cursor()
     hn = _team_name(c, hid, "홈팀")
     an = _team_name(c, aid, "원정팀")
+
+    # [2026-09] 득점자 이름 조회는 player_ratings(내 슬롯이 이미 치환된
+    # 표시용 버전)가 아니라 scorer_ratings(치환 전 원본 스냅샷)를 우선
+    # 쓴다 — 안 그러면 "내가 맡은 포지션의 AI가 넣은 골"의 이름이
+    # 내 슬롯 치환 때문에 사라진다. scorer_ratings가 없는(구버전 호출)
+    # 경우에만 player_ratings로 폴백.
+    _name_src = scorer_ratings or player_ratings
 
     # [텍스트-영상 싱크 확장] 이벤트 텍스트에 실제 선수 이름을 붙이고, 내가
     # 직접 관여하지 않은 우리 팀의 나머지 득점도 실제 로스터 선수 이름으로
@@ -5797,7 +6117,10 @@ def _write_match_log(p, week, league_name, is_home,
     # DB 이슈 등) 경기 저장 자체는 절대 막히면 안 되므로 전부 try/except로
     # 감싸고, 실패 시 이름 태깅 없이 기존 동작으로 조용히 폴백한다.
     events = _augment_events_with_names(c, p, is_home, hid, aid, hs, as_,
-                                        goals, assists, played, events)
+                                        goals, assists, played, events,
+                                        live_record=live_record,
+                                        engine_plog=engine_plog,
+                                        player_ratings=_name_src)
     conn.close()
 
     loc = "홈" if is_home else "원정"
@@ -5806,7 +6129,8 @@ def _write_match_log(p, week, league_name, is_home,
     detail_id = _save_match_detail(p, week, league_name, is_home, hn, an,
                                    hs, as_, result, goals, assists, saves, rating,
                                    events, played, benched, detail, engine_stats=engine_stats,
-                                   engine_plog=engine_plog, player_ratings=player_ratings)
+                                   engine_detail=engine_detail, engine_plog=engine_plog,
+                                   player_ratings=player_ratings, live_record=live_record)
 
     # ── 로그: 헤더 한 줄(클릭 가능) + 결과 + 핵심 요약 + 순위 ──────────
     #   상세 이벤트(전/후반)는 로그에서 빼고 상세 창으로 옮겨 로그를 간결하게.
@@ -5816,6 +6140,13 @@ def _write_match_log(p, week, league_name, is_home,
     add_log("─"*44, "sep")
     add_log(f"⚽ 경기  [{league_name}]  {_day_label(week, day)}  ({loc}){marker}", "match")
     add_log(f"   {hn} {hs}-{as_} {an}  ({rs})", "match")
+    _scorers = _match_scorer_summary(
+        engine_plog, _name_src, hn, an,
+        my_side=("home" if is_home else "away"),
+        my_name=(p.get("name") or "나"),
+        my_goal_minutes=_goal_minutes_from_events(events))
+    if _scorers:
+        add_log(f"   {_scorers}", "match")
 
     if not played:
         add_log("   🪑 벤치 대기" if benched else "   🚑 부상 결장", "match")
@@ -7475,7 +7806,7 @@ def _advance_week(p, base_week, n_weeks=4, progress_cb=None):
         except Exception:
             pass
         _t3b = _time_perf.perf_counter()
-        print(f"[PERF] 연도전환 총 {_t3b-_t0:.2f}s "
+        _live_debug(f"[PERF] 연도전환 총 {_t3b-_t0:.2f}s "
               f"(커리어정리 {_t1-_t0:.2f}s | _end_of_season {_t2-_t1:.2f}s | "
               f"일정생성 {_t3-_t2:.2f}s | 파워랭킹 {_t3c-_t3:.2f}s | "
               f"PRAGMA optimize {_t3b-_t3c:.2f}s)")
@@ -7638,6 +7969,18 @@ def _advance_week(p, base_week, n_weeks=4, progress_cb=None):
         except Exception as e:
             add_log(f"⚠ 국제대회 생성 오류: {e}", "event")
 
+    # [2026-09 신설] 랭킹 평가전(power_eval) — 클럽월드컵 해 25주(발탁/
+    # 조추첨) 진입 시 생성. 첫 매치데이가 26주(day176)라 위 두 훅과
+    # 동일 원칙으로 "경기 시작 전 주"에 미리 만들어둔다(25주 자체가
+    # 원래 발탁 전용이라 -1 보정 불필요 — POWER_EVAL_CALLUP_WEEK가 이미
+    # 그 "전 주" 역할).
+    from constants import POWER_EVAL_CALLUP_WEEK
+    if new_week == POWER_EVAL_CALLUP_WEEK:
+        try:
+            intl_engine.start_power_eval_if_needed(new_year)
+        except Exception as e:
+            add_log(f"⚠ 랭킹 평가전 생성 오류: {e}", "event")
+
     # CL_START_WEEK(8주차) 진입: 클럽 대항전(챔스/유로파/컨퍼런스) 3개
     # 동시 시작 (매년). 출전팀 선발은 직전 시즌(이미 끝난 시즌)의 최종
     # 순위 기준 — continental_qualification이 대륙당 국가 순위 계산을
@@ -7771,6 +8114,36 @@ def _estimate_ai_clean_sheets(pos, ovr, team_avg, league_avg, full_season_matche
     return max(0, round(cs))
 
 
+def _estimate_ai_gk_saves(ovr, team_avg, league_avg, full_season_matches=14):
+    """[2026-09 신설, 신민용 요청: "클린시트 말고 선방:14 실점:1 선방률:
+    93.5% 이런식으로 떠야한다"] 이 함수도 위 _estimate_ai_season/_estimate_
+    ai_clean_sheets와 완전히 같은 철학이다 — 이 게임은 개별 슈팅이든
+    개별 골이든 실제로 이벤트 단위로 시뮬레이션하지 않는다(그건 GK뿐
+    아니라 골/도움/평점도 전부 마찬가지 — _estimate_ai_season도 실제
+    슈팅 데이터가 아니라 포지션·OVR·팀전력 기반 통계적 추정치다). 그러니
+    "선방률" 역시 같은 방식(GK 본인 OVR+소속팀 전력으로 통계적으로
+    그럴듯한 수치를 추정)으로 얼마든지 만들 수 있다 — "개별 슈팅을
+    시뮬레이션 안 해서 못 만든다"는 이전 답변은 틀렸다.
+
+    설계: (1) 경기당 피슈팅수 기준치(4.2, 리그 평균 유효슈팅 실측 근사)에서
+    소속팀이 평균보다 강할수록 상대의 유효슈팅 자체가 줄어든다고 보고
+    낮춘다. (2) 기본 선방률은 GK 본인 OVR에서 산출(OVR60→64%, OVR99→
+    79.6% 근방 — 실제 톱리그 GK 선방률 65~80% 대와 맞춘 캘리브레이션)하고
+    소속팀 전력에 따라 소폭 가산(강팀 뒤에서는 상대적으로 질 좋은
+    기회만 걸러져 옴). (3) 피슈팅수×선방률로 선방을, 나머지를 실점으로
+    역산해 saves+conceded=shots_faced가 항상 정확히 맞물리게 한다(표시
+    시점에 선방률을 saves/(saves+conceded)로 재계산해도 항상 일치).
+    반환: (saves, goals_conceded)."""
+    shots_per_game = max(2.0, min(7.0, 4.2 * (1.0 - (team_avg - league_avg) * 0.01)))
+    shots_faced = max(0, round(shots_per_game * full_season_matches * random.uniform(0.85, 1.15)))
+    base_save_pct = 0.60 + max(0, min(50, ovr - 50)) / 50.0 * 0.20
+    team_bonus = (team_avg - league_avg) * 0.001
+    save_pct = max(0.45, min(0.92, base_save_pct + team_bonus + random.uniform(-0.05, 0.05)))
+    saves = round(shots_faced * save_pct)
+    goals_conceded = max(0, shots_faced - saves)
+    return saves, goals_conceded
+
+
 def _cap_additive_bonus(raw_bonus: float, base_score: float, cap_ratio: float = 0.10) -> float:
     """[2026-07 신설, GPT 2차 피드백 반영: "빅게임 보너스도 상한이 있어야
     한 경기 때문에 MVP가 뒤집히는 걸 막을 수 있다"] 결승/준결승 같은
@@ -7874,50 +8247,61 @@ def _club_award_score(pos, goals, assists, rating, ovr, cs=0):
     return rating * 50.0 + goals * 2.0 + assists * 2.0 + ovr * 0.5 + cs * 1.0
 
 
-def _evaluate_extra_awards(pool, my_pos, my_age=25, weight_fn=None, young_age_cutoff=21):
-    """[2026-07 신설] 베스트11/영플레이어 공용 판정 — 리그 상 로직과 동일한
-    4그룹(GK/DF/MF/FW) 점수식을 그대로 재사용한다. pool의 각 원소는
-    {"position","goals","assists","rating","ovr","cs","age","is_mine"} 키를
-    가져야 한다. 반환: 내가 받은 상 이름 리스트(예: ["베스트11","영플레이어"]).
+def _rank_among_ai(my_val, ai_vals_desc):
+    """[2026-09 신설, 공유함수] 내 값이 AI 값들(내림차순 정렬된 리스트) 사이에서
+    몇 등인지(1부터) 반환 — 동점이면 내가 우선(기존 관례 유지). 원래
+    intl_engine._award_intl_awards 안에 로컬 함수로 중복 정의돼 있던 걸
+    여기로 뽑아 도메스틱(베스트11 top-K 등)과 국제대회 양쪽이 공유한다."""
+    rank = 1
+    for v in ai_vals_desc:
+        if v > my_val:
+            rank += 1
+        else:
+            break
+    return rank
 
-    [2026-07 확장, 신민용 확정: "대회 MVP/베스트11에 팀 성적(진출 라운드)을
-    반영하자"] weight_fn을 주면 각 후보의 점수에 그 팀/국가의 '진출 라운드
-    가중치'를 곱해서 비교한다. None이면(기본값 — 리그 상 등 원래 호출부)
-    기존과 완전히 동일하게 동작한다. 후보를 아예 자르는 게 아니라 점수에
-    곱하는 방식이라, 우승 못 해도 개인 활약이 압도적이면 여전히 역전
-    가능하다(예: 2010 월드컵 포를란류 케이스)."""
+
+# [2026-09 신설] 베스트11 포지션군별 정원 — 기존 주석에 이미 있던 실제
+# 포메이션(GK1/DF4/MF3/FW3) 그대로. "그룹 1등만 수상"에서 "그 정원만큼
+# 상위권 전원 수상"으로 바뀌면서 상수로 뽑음.
+_BEST11_GROUP_SLOTS = {"GK": 1, "DF": 4, "MF": 3, "FW": 3}
+
+
+def _evaluate_extra_awards(pool, my_pos, my_age=25, weight_fn=None, young_age_cutoff=21):
+    """[2026-09 재설계, 신민용 확정: "베스트11은 포지션별로 평점 최상위
+    (포메이션 정원만큼)가 받고, 영플레이어는 어린 선수 중 평점 1위가
+    받는 원리가 맞다"] 기존엔 골/도움/OVR/클린시트를 섞은 가중치 공식
+    (_best11_score 등)으로 그룹 1등 한 명만 뽑았는데, 이제 순수 평점
+    하나로만 비교하고 — 베스트11은 실제 포메이션 정원(GK1/DF4/MF3/FW3,
+    _BEST11_GROUP_SLOTS)만큼 상위권 전원에게 준다. 내 평점이 내가 속한
+    그룹의 AI들 중 그 정원 등수 안에 들면(동점은 나 우선, _rank_among_ai)
+    수상. weight_fn(팀순위/국제대회 진출라운드 가중치)은 기존처럼 베스트11
+    비교에만 적용하고, 영플레이어는 순수 평점만 본다(가중치 없음 — 리그
+    쪽 기존 관례를 국제대회 쪽에도 통일).
+
+    pool의 각 원소는 {"position","rating","age","is_mine"} 키만 있으면
+    된다(goals/assists/ovr/cs는 더 이상 안 씀). 반환: 내가 받은 상 이름
+    리스트(예: ["베스트11","영플레이어"])."""
     def _w(x):
         return weight_fn(x) if weight_fn else 1.0
     won = []
-    if my_pos in GK_POS:
-        group = [x for x in pool if x["position"] in GK_POS]
-        if group:
-            best = max(group, key=lambda x: _best11_score_gk_df(x.get("cs", 0), x["rating"], x["ovr"]) * _w(x))
-            if best["is_mine"]:
-                won.append("베스트11")
-    elif my_pos in DF_POS:
-        group = [x for x in pool if x["position"] in DF_POS]
-        if group:
-            best = max(group, key=lambda x: _best11_score_gk_df(x.get("cs", 0), x["rating"], x["ovr"]) * _w(x))
-            if best["is_mine"]:
-                won.append("베스트11")
-    elif my_pos in MF_POS:
-        group = [x for x in pool if x["position"] in MF_POS]
-        if group:
-            best = max(group, key=lambda x: _best11_score_mf(x["goals"], x["assists"], x["rating"], x["ovr"]) * _w(x))
-            if best["is_mine"]:
-                won.append("베스트11")
-    elif my_pos in FW_POS:
-        group = [x for x in pool if x["position"] in FW_POS]
-        if group:
-            best = max(group, key=lambda x: _best11_score(x["goals"], x["assists"], x["rating"], x["ovr"]) * _w(x))
-            if best["is_mine"]:
-                won.append("베스트11")
+    _grp_pos = {"GK": GK_POS, "DF": DF_POS, "MF": MF_POS, "FW": FW_POS}
+    for gname, poslist in _grp_pos.items():
+        if my_pos not in poslist:
+            continue
+        group = [x for x in pool if x["position"] in poslist]
+        me = next((x for x in group if x["is_mine"]), None)
+        if me is None:
+            break
+        ai_vals = sorted((x["rating"] * _w(x) for x in group if not x["is_mine"]), reverse=True)
+        my_val = me["rating"] * _w(me)
+        if _rank_among_ai(my_val, ai_vals) <= _BEST11_GROUP_SLOTS[gname]:
+            won.append("베스트11")
+        break
 
     young_cands = [x for x in pool if x.get("age", 30) <= young_age_cutoff]
     if young_cands:
-        best_young = max(young_cands, key=lambda x: _position_award_score(
-            x["position"], x["goals"], x["assists"], x["rating"], x["ovr"], x.get("cs", 0)) * _w(x))
+        best_young = max(young_cands, key=lambda x: x["rating"])
         if best_young["is_mine"]:
             won.append("영플레이어")
     return won
@@ -7938,14 +8322,65 @@ def _best11_score_mf(goals, assists, rating, ovr):
     return goals*1.5 + assists*1.5 + rating*5 + ovr*0.3
 
 
-def _collect_league_candidates(c, league_id, exclude_my_team=None, full_season_matches=14):
-    """리그 내 모든 팀의 AI 공격 포지션 선수들 시즌 성적 추정 → 후보 리스트.
+def _team_goal_scale_factors(team_estimated_goals, team_goals_for):
+    """[2026-09 신설, 신민용 리포트: "세계 축구 기록실에 뜨는 골(_snapshot_
+    season_ratings, hist.ai_player_season_stats)은 팀 실제 득점에 맞게
+    보정됐는데, 득점왕/도움왕 같은 개인수상 판정(_process_awards→
+    _collect_league_candidates)은 여전히 순수 OVR 추정치라 서로 안 맞을 수
+    있다"] — "화면에 보이는 골"과 "수상 판정에 쓰이는 골"이 항상 같은
+    보정을 받도록, ai_lifecycle._snapshot_season_ratings와 여기
+    _collect_league_candidates가 이 함수 하나를 공유한다.
 
-    [최적화] 기존엔 팀마다 ai_players를 2번씩(전체 OVR 집계용 + 공격수 목록용)
+    team_estimated_goals: {team_id: 그 팀 선수 전원의 _estimate_ai_season
+      골 합계}, team_goals_for: {team_id: 그 팀이 이번 시즌 실제로 넣은 골
+      (teams.goals_for 스냅샷)}. 반환: {team_id: scale_factor}(실제/추정
+      비율) — 실제값이 없거나 0이거나 추정합계가 0인 팀은 키 자체가
+      없으므로, 호출부는 항상 .get(tid)이 None이면 원본 그대로 둔다."""
+    scale = {}
+    for tid, real_total in (team_goals_for or {}).items():
+        est_total = team_estimated_goals.get(tid, 0)
+        if real_total and real_total > 0 and est_total > 0:
+            scale[tid] = real_total / est_total
+    return scale
+
+
+def _collect_league_candidates(c, league_id, exclude_my_team=None, full_season_matches=14,
+                                team_goals_for=None, year=None):
+    """리그 내 모든 팀의 AI 후보 선수들의 시즌 성적 → 후보 리스트.
+
+    [최적화] 기존엔 팀마다 ai_players를 2번씩(전체 OVR 집계용 + 후보 목록용)
       조회해 20팀 리그면 40+ 쿼리(N+1)가 돌았다. teams JOIN으로 팀별 평균 OVR을
-      1쿼리에, 공격수 목록을 1쿼리에 모아 총 2쿼리로 줄였다. 결과·계산은 동일.
+      1쿼리에, 후보 목록을 1쿼리에 모아 총 2쿼리로 줄였다. 결과·계산은 동일.
+
+    [2026-09 재설계, 신민용 리포트: "세계기록실에 뜨는 그 선수 기록을 그대로
+      갖다써서 비교하면 되는 거 아니야?"] year가 주어지면(자연스러운 시즌
+      종료 경로) 여기서 다시 추정하지 않고, hist.ai_player_season_stats에
+      이미 저장된 값을 그대로 읽는다 — game_engine._end_of_season이
+      _process_awards를 부르기 '직전'에 ai_lifecycle._snapshot_season_
+      ratings로 이번 시즌 AI 골/도움/평점을 먼저 archiving해두기 때문에,
+      이 시점엔 그 저장이 이미 끝나 있다. 세계기록실 화면에 뜨는 숫자와
+      수상 판정에 쓰는 숫자가 이제 완전히 같은 값(같은 계산·같은 랜덤
+      드로우 결과)이라, 더 이상 팀 골 합계 스케일링을 여기서 다시 할
+      필요도 없다(이미 저장 단계에서 다 반영됨).
+      year가 없으면(시즌 중 은퇴 — finalize_season_for_retire — 처럼 그 해
+      아카이브가 아직 없는 경로) 기존처럼 _estimate_ai_season으로 즉석
+      추정하고, team_goals_for({team_id: 실제 시즌 골, 아직 리셋 전 값)가
+      있으면 그 팀 후보 전원의 추정 골 합계 대비 실제 골 비율로 스케일링한다
+      (_team_goal_scale_factors 공유 — 최선의 근사치일 뿐, 시즌이 아직 안
+      끝난 시점이라 그 실제 골 자체도 최종치는 아니다). 도움은 실측
+      대응치가 없어 스케일링하지 않는다(기존과 동일 원칙).
+
+    [2026-09 버그수정 자체발견] 영플레이어상 판정(pool 안의 x.get("age",30))이
+      쓸 age 필드가 이 함수의 반환값(cands)엔 원래 없었다 — 그래서 AI 후보는
+      전부 기본값 30으로 취급돼 "23세 이하 젊은 풀"에 단 한 번도 안 들어갔고,
+      결과적으로 영플레이어상은 사실상 AI 비교 없이 "내가 23세 이하기만
+      하면 받는" 상이었다. ap.age를 SELECT에 추가해 실제 AI 나이가 반영되게
+      고쳤다 — 이번 재설계(평점 기준 비교)가 실제로 작동하려면 반드시
+      필요한 수정이라 같이 넣는다.
     """
-    # 팀별 평균 OVR + 리그 평균을 단일 JOIN 집계로.
+    # 팀별 평균 OVR + 리그 평균을 단일 JOIN 집계로. (year 유무와 무관하게
+    # 매번 계산 — league_avg 반환값은 호출부가 필요하면 쓰고, year 분기
+    # 없이도 가벼운 쿼리라 분기 복잡도를 늘리지 않는 쪽을 택함.)
     team_rows = c.execute(
         """SELECT t.id AS tid, AVG(ap.ovr) AS avg_ovr, COUNT(ap.id) AS n,
                   SUM(ap.ovr) AS sum_ovr
@@ -7972,9 +8407,32 @@ def _collect_league_candidates(c, league_id, exclude_my_team=None, full_season_m
     # 붙어서 진다"는 구조였다. 전 포지션을 다 모으고, 포지션별 가중치는
     # 아래 _position_award_score()가 따로 처리한다.
     ALL_AWARD_POS = GK_POS + DF_POS + MF_POS + FW_POS
+
+    if year is not None:
+        # 아카이브에서 그대로 읽기 — _snapshot_season_ratings가 방금 저장한
+        # 값(세계기록실 "기록 복사"에 보이는 것과 완전히 동일)을 그대로 쓴다.
+        placeholders = ",".join("?" for _ in ALL_AWARD_POS)
+        hist_rows = c.execute(
+            """SELECT ap.team_id AS tid, ap.name, ap.position, ap.ovr, ap.age AS age,
+                      h.goals AS goals, h.assists AS assists, h.rating AS rating,
+                      h.clean_sheets AS cs, h.matches AS matches
+               FROM hist.ai_player_season_stats h
+               JOIN ai_players ap ON ap.id = h.player_id
+               JOIN teams t ON ap.team_id = t.id
+               WHERE h.year=? AND t.league_id=? AND ap.position IN ({})"""
+            .format(placeholders),
+            (year, league_id, *ALL_AWARD_POS)).fetchall()
+        cands = [{
+            "name": r["name"], "position": r["position"], "ovr": r["ovr"], "age": r["age"] or 30,
+            "goals": r["goals"], "assists": r["assists"], "rating": r["rating"],
+            "is_mine": False, "cs": r["cs"] or 0,
+            "matches": r["matches"] or full_season_matches, "team_id": r["tid"],
+        } for r in hist_rows]
+        return cands, league_avg
+
     placeholders = ",".join("?" for _ in ALL_AWARD_POS)
     atk_rows = c.execute(
-        """SELECT ap.team_id AS tid, ap.name, ap.position, ap.ovr, ap.sub_role
+        """SELECT ap.team_id AS tid, ap.name, ap.position, ap.ovr, ap.sub_role, ap.age AS age
            FROM ai_players ap JOIN teams t ON ap.team_id=t.id
            WHERE t.league_id=? AND ap.position IN ({})""".format(placeholders),
         (league_id, *ALL_AWARD_POS)).fetchall()
@@ -7987,10 +8445,22 @@ def _collect_league_candidates(c, league_id, exclude_my_team=None, full_season_m
         cs = _estimate_ai_clean_sheets(r["position"], r["ovr"], tavg, league_avg,
                                         full_season_matches) if r["position"] in GK_POS + DF_POS else 0
         cands.append({
-            "name": r["name"], "position": r["position"], "ovr": r["ovr"],
+            "name": r["name"], "position": r["position"], "ovr": r["ovr"], "age": r["age"] or 30,
             "goals": g, "assists": a, "rating": rt, "is_mine": False, "cs": cs,
             "matches": full_season_matches, "team_id": r["tid"],
         })
+
+    if team_goals_for:
+        team_estimated_sum = {}
+        for x in cands:
+            team_estimated_sum[x["team_id"]] = team_estimated_sum.get(x["team_id"], 0) + x["goals"]
+        team_scale = _team_goal_scale_factors(team_estimated_sum, team_goals_for)
+        if team_scale:
+            for x in cands:
+                s = team_scale.get(x["team_id"])
+                if s is not None:
+                    x["goals"] = max(0, round(x["goals"] * s))
+
     return cands, league_avg
 
 
@@ -9134,7 +9604,8 @@ def _process_goal_awards(c, p, year, tid, league_id, lname, grade, tier, cands, 
                 my_awards.append((label, _goal_detail_text(c, my_best), my_best["id"]))
 
 
-def _process_awards(p, year, season_goals, season_assists, season_rating, season_cs, season_goals_against=0):
+def _process_awards(p, year, season_goals, season_assists, season_rating, season_cs, season_goals_against=0,
+                     use_archived_ai_stats=False):
     """시즌 종료 시 개인 수상 산정. 내 선수 실제 성적 + AI 추정 비교.
 
     [득점왕/도움왕 최소 기준]
@@ -9142,7 +9613,15 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
       깔린 시즌엔 2골/2도움으로도 타이틀이 나오는 비현실적 상황이 생긴다.
       → 1위 조건에 더해 '출전 경기수 기반 최소 산출 기준'을 통과해야 수상.
          (풀시즌 7라운드*2 = 14경기 기준. 경기당 최소 생산성으로 환산)
-    """
+
+    [2026-09 신설] use_archived_ai_stats — True면 AI 경쟁자 풀을 즉석
+      추정하지 않고 hist.ai_player_season_stats에 이미 저장된 이번 시즌
+      값을 그대로 읽는다(_collect_league_candidates에 year를 넘김). 자연
+      스러운 시즌종료 경로(game_engine._end_of_season)는 이 함수를 부르기
+      직전에 이미 그 저장을 끝내놨으므로 True로 호출 — 세계기록실에 뜨는
+      숫자와 완전히 같은 값으로 판정된다. finalize_season_for_retire(시즌
+      중 은퇴)는 그 해 아카이브가 아직 없으므로 기본값 False(즉석 추정)를
+      그대로 쓴다."""
     # [2026-08 버그수정, 신민용 리포트: "시즌 중 이적하면 season_*가
     # 0으로 리셋되면서 이적 전 활약이 시상 계산에서 통째로 사라진다"]
     # 예전엔 p.get("current_team_id")를 그대로 썼다 — 시즌 종료 처리가
@@ -9170,7 +9649,26 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
         # 하므로, 아래에서 쓰던 FULL_SEASON_MATCHES 계산을 후보 수집보다
         # 앞으로 끌어왔다(계산 내용 자체는 그대로, 호출 순서만 변경).
         FULL_SEASON_MATCHES = _league_full_season_matches(p, team_id=tid)
-        cands, league_avg = _collect_league_candidates(c, league_id, full_season_matches=FULL_SEASON_MATCHES)
+        if use_archived_ai_stats:
+            # [2026-09 재설계] 세계기록실에 이미 저장된 이번 시즌 값을 그대로
+            # 읽는다 — 즉석 추정도, teams.goals_for 스케일링도 필요 없다
+            # (저장 시점에 이미 다 반영됨).
+            cands, league_avg = _collect_league_candidates(
+                c, league_id, full_season_matches=FULL_SEASON_MATCHES, year=year)
+        else:
+            # [2026-09 신설, 신민용 리포트: "득점왕 판정이 세계기록실 골 기록이랑
+            # 안 맞을 수 있다"] teams.goals_for(이번 시즌 실제 득점)는 시즌 통계가
+            # 리셋되기 전인 이 시점엔 아직 살아있다(리셋은 _end_of_season 뒷부분,
+            # finalize_season_for_retire 경로는 애초에 리셋 자체를 안 함) — 이걸
+            # 그대로 넘겨 AI 후보 골도 _snapshot_season_ratings(세계기록실)와
+            # 같은 보정을 받게 한다(단, 이 경로는 그 해 아카이브가 아직 없어
+            # 즉석 추정이라 완전히 같은 값까지는 보장 못 하는 최선의 근사치).
+            _league_team_goals_for = {
+                r["id"]: r["goals_for"] for r in
+                c.execute("SELECT id, goals_for FROM teams WHERE league_id=?", (league_id,)).fetchall()}
+            cands, league_avg = _collect_league_candidates(
+                c, league_id, full_season_matches=FULL_SEASON_MATCHES,
+                team_goals_for=_league_team_goals_for)
         # 내 선수 추가
         me = {
             "name": p.get("name","나"), "position": p.get("position","ST"),
@@ -9229,167 +9727,79 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
         if top_assist["is_mine"] and season_assists >= min_assists_for_title:
             my_awards.append(("도움왕", f"{season_assists}도움"))
 
-        # 베스트11 — 포지션 그룹별 최고 점수 1위 선정 (포메이션: GK1/DF4/MF3/FW3)
-        # [2026-07 신설, 신민용 확정: "꼴찌 팀 센터백이 베스트11인 건 드물다"]
-        # 팀 순위를 아주 작게(±3% 이내) 반영한다 — _team_rank_mult 참고.
+        # 베스트11 + 영플레이어 — [2026-09 재설계, 신민용 확정: "베스트11은
+        # 포지션별로 평점 최상위(포메이션 정원만큼)가 받고, 영플레이어는
+        # 어린 선수 중 평점 1위가 받는 원리가 맞다"] 국제대회(intl_engine.
+        # _award_intl_awards)와 완전히 같은 기준을 쓰는 공유함수
+        # `_evaluate_extra_awards`(순수 평점 비교, 베스트11은 정원 GK1/DF4/
+        # MF3/FW3만큼 top-K 전원 수상)로 통일. 팀 순위 가중(±3%)은 베스트11
+        # 비교에만 그대로 적용(_rank_mult_for, 기존과 동일 원칙).
         _team_ranks, _n_teams_in_league = _league_team_ranks(c, league_id)
 
         def _rank_mult_for(x):
             return _team_rank_mult(_team_ranks.get(x.get("team_id"), _n_teams_in_league // 2 or 1),
                                     _n_teams_in_league)
 
-        my_pos = p.get("position","ST")
-        my_best11 = False
-        best_df = None  # [올해의 수비수 신설] DF 분기 밖에서도 안전하게 참조하기 위한 기본값
-        cs_for_me = _calc_clean_sheets_for_player(p, team_id=tid, matches=_primary_matches)
-        
-        if my_pos in GK_POS:
-            # GK 그룹
-            gk_cands = [x for x in pool if x["position"] in GK_POS]
-            if gk_cands:
-                # [2026-07 버그수정, 신민용 리포트: "꼴찌팀에 평점 5~6대인
-                # 골키퍼가 베스트11을 7번이나 받는다"] AI 후보의 cs_est를
-                # 내 선수 자신의 season_cs*0.5로 대신 계산하고 있었다 —
-                # 즉 "AI 경쟁자"가 항상 내 클린시트의 절반으로 고정돼,
-                # 내가 클린시트를 1개라도 기록하면 사실상 무조건 그 AI를
-                # 이기는 구조였다(실력·팀 순위와 무관). _collect_league_
-                # candidates()가 이미 각 AI GK 본인의 OVR·소속팀 전력
-                # 기준으로 cs를 제대로 추정해뒀으므로(x["cs"]), 그 값을
-                # 그대로 쓴다.
-                gk_scores = []
-                for x in gk_cands:
-                    cs_est = cs_for_me if x["is_mine"] else x.get("cs", 0)
-                    score = _best11_score_gk_df(cs_est, x["rating"], x["ovr"]) * _rank_mult_for(x)
-                    gk_scores.append((x, score))
-                best_gk = max(gk_scores, key=lambda x: x[1])
-                if best_gk[0]["is_mine"]:
-                    my_best11 = True
-        
-        elif my_pos in DF_POS:
-            # DF 그룹 (CB, LB, RB 등)
-            df_cands = [x for x in pool if x["position"] in DF_POS]
-            if df_cands:
-                # [2026-07 버그수정] GK와 동일한 문제 — 이제 _collect_league_
-                # candidates()가 DF도 팀 전력 기준으로 cs를 추정해주므로
-                # (위 GK_POS+DF_POS 수정) 그 값을 그대로 쓴다.
-                df_scores = []
-                for x in df_cands:
-                    cs_est = cs_for_me if x["is_mine"] else x.get("cs", 0)
-                    score = _best11_score_gk_df(cs_est, x["rating"], x["ovr"]) * _rank_mult_for(x)
-                    df_scores.append((x, score))
-                best_df = max(df_scores, key=lambda x: x[1])
-                if best_df[0]["is_mine"]:
-                    my_best11 = True
-        
-        elif my_pos in MF_POS:
-            # MF 그룹 (CDM, CM, CAM)
-            mf_cands = [x for x in pool if x["position"] in MF_POS]
-            if mf_cands:
-                best_mf = max(mf_cands, key=lambda x: _best11_score_mf(x["goals"],x["assists"],x["rating"],x["ovr"]) * _rank_mult_for(x))
-                if best_mf["is_mine"]:
-                    my_best11 = True
-        
-        elif my_pos in FW_POS:
-            # FW 그룹 (LW, RW, CF, ST)
-            fw_cands = [x for x in pool if x["position"] in FW_POS]
-            if fw_cands:
-                best_fw = max(fw_cands, key=lambda x: _best11_score(x["goals"],x["assists"],x["rating"],x["ovr"]) * _rank_mult_for(x))
-                if best_fw["is_mine"]:
-                    my_best11 = True
-        
-        if my_best11:
-            my_awards.append(("베스트11", f"베스트11 ({my_pos})"))
+        my_pos = p.get("position", "ST")
+        for _label in _evaluate_extra_awards(pool, my_pos, p.get("age", 25),
+                                              weight_fn=_rank_mult_for, young_age_cutoff=23):
+            if _label == "베스트11":
+                my_awards.append(("베스트11", f"베스트11 ({my_pos})"))
+            else:
+                my_awards.append(("영플레이어", f"{lname} 영플레이어"))
 
-        # [2026-07 신설, 신민용 확정] 올해의 수비수 (Defender of the Year)
-        # — 베스트11(DF)이 이미 계산해둔 "리그 DF_POS 전체 중 최고 1명"
-        # (_best11_score_gk_df 기반 best_df)을 그대로 재사용한다. 별도
-        # 점수식을 새로 만들지 않는다 — 실제 축구에서도 Defender of the
-        # Season과 Team of the Season 수비수가 같은 선수인 경우가 흔해서,
-        # 베스트11(DF)과 같은 조건으로 겹쳐 받는 게 오히려 현실적이다.
-        # 차이는 최소 출전 비율 게이트(MVP와 동일한 65%) 하나 — 베스트11은
-        # 이 게이트가 없어서 "반 시즌만 뛰고 어쩌다 DF 풀 1등"도 통과할 수
-        # 있는데, 개인 단독상인 올해의 수비수는 그 상황까진 막는다.
-        # [2026-08 버그수정, 신민용+GPT 검토 확정: "홍명보 평점 6.4/6.7
-        # 시즌이 올해의 수비수를 받는 건 과하다"] 다른 모든 단독 개인상
-        # (MVP 7.0, 구단 올해의 선수 6.2, 골든글러브 클린시트+품질검증)은
-        # 전부 절대 최소선이 있는데, 이 상만 베스트11(DF)과 완전히 동일한
-        # 순수 상대평가라 평점 최소선이 없었다 — "그 시즌 DF 풀에서
-        # 1등"이기만 하면 그 1등의 평점 자체가 낮아도(약한 시즌) 받아버림.
-        # DOTY_MIN_RATING(6.9)을 추가 — MVP(7.0)보다 살짝 낮고 구단
-        # 올해의 선수(6.2)보다는 높은 위계. 베스트11은 최소선을 넣지
-        # 않는다(의도적 유지) — "그 시즌 그 자리에서 가장 잘한 선수"는
-        # 상대평가만으로 충분하고, "올해의 수비수"라 부를 만한 절대
-        # 수준까지 요구하는 건 이 상만이다.
+        # [2026-09 재설계, 신민용 확정: "올해의 수비수도 평점 1등이 받으면
+        # 되는거 아니야?"] 기존 클린시트/OVR 가중 공식(_best11_score_gk_df
+        # 재사용) 대신, DF_POS 풀 안에서 순수 평점 1위만 비교한다. 베스트11
+        # (DF, top-4)과는 별개 계산이 됐지만 — 이 상 자체가 원래도 "DF 풀
+        # 1등"(top-1) 의미였으므로 오히려 더 정확해졌다. 게이트(출전율65%
+        # +최소평점6.9)는 그대로 유지.
         DOTY_MIN_PLAY_RATIO = 0.65
         DOTY_MIN_RATING = 6.9
-        if (best_df is not None and best_df[0]["is_mine"]
-                and sm >= DOTY_MIN_PLAY_RATIO * FULL_SEASON_MATCHES
-                and season_rating >= DOTY_MIN_RATING):
-            my_awards.append(("올해의 수비수", f"{lname} 올해의 수비수"))
+        if my_pos in DF_POS:
+            df_group = [x for x in pool if x["position"] in DF_POS]
+            _me_df = next((x for x in df_group if x["is_mine"]), None)
+            _ai_df_ratings = sorted((x["rating"] * _rank_mult_for(x) for x in df_group if not x["is_mine"]),
+                                     reverse=True)
+            if (_me_df is not None
+                    and _rank_among_ai(_me_df["rating"] * _rank_mult_for(_me_df), _ai_df_ratings) == 1
+                    and sm >= DOTY_MIN_PLAY_RATIO * FULL_SEASON_MATCHES
+                    and season_rating >= DOTY_MIN_RATING):
+                my_awards.append(("올해의 수비수", f"{lname} 올해의 수비수"))
 
-        # MVP (전체 베스트11 점수 1위)
-        # [2026-07 수정] 포지션 무관 공격수 편향 공식(_best11_score) 대신
-        # 포지션별 가중 점수식(_position_award_score) 사용 — 수비수/GK도
-        # 자기 포지션 기준으로 정당하게 MVP 후보가 될 수 있게.
-        # [2026-07 확장, 설계문서 v2 반영] "몇 경기 반짝 잘해서 MVP를 가져가는"
-        # 상황을 막기 위해 최소 출전 비율(65%)·최소 평점(7.0) 게이트를 추가한다.
-        # 출전 비율 자체를 점수식에 또 반영하진 않는다 — 문턱(게이트)과 점수
-        # 가중치에 같은 값을 이중으로 쓰면 문턱을 넘은 후보끼리 또 출전율로
-        # 차등이 생겨 사실상 같은 조건을 두 번 평가하는 셈이 되기 때문이다.
+        # MVP — [2026-09 재설계] 포지션별 가중 공식(_position_award_score)
+        # 대신 순수 평점 1위(전 포지션 통합 풀). 게이트(출전율65%+최소평점7.0)
+        # 는 그대로 유지.
         MVP_MIN_PLAY_RATIO = 0.65
         MVP_MIN_RATING = 7.0
-        mvp = max(pool, key=lambda x: _position_award_score(
-            x["position"], x["goals"], x["assists"], x["rating"], x["ovr"], x.get("cs", 0)) * _rank_mult_for(x))
+        mvp = max(pool, key=lambda x: x["rating"] * _rank_mult_for(x))
         if (mvp["is_mine"] and sm >= MVP_MIN_PLAY_RATIO * FULL_SEASON_MATCHES
                 and season_rating >= MVP_MIN_RATING):
             my_awards.append(("MVP", f"{lname} 올해의 선수"))
 
-        # [2026-07 신설, 신민용 확정] 구단 올해의 선수 (Club Player of the
-        # Year) — 리그 전체가 아니라 "내 팀 로스터끼리만" 비교하는 내부
-        # 투표 개념. pool의 각 항목엔 이미 team_id가 들어있어(_collect_
-        # league_candidates가 채워둠) 새 쿼리 없이 필터링만으로 후보 풀을
-        # 좁힐 수 있다. MVP보다 경쟁 풀이 훨씬 작으므로(리그 전체 vs 내
-        # 팀 로스터) 게이트도 그만큼 낮게 잡는다 — 출전 비율은 MVP와
-        # 동일(65%)하게 유지하되, 최소 평점은 7.0 대신 6.2로 낮춘다("팀
-        # 내 확실한 핵심"이지 "리그 최정상급"까지는 아니어도 되는 상).
-        # [2026-08 버그수정, 신민용 리포트: "구단 올해의 선수인데 라벨이
-        # '프리미어리그 구단 올해의 선수'로 리그 이름이 붙어 나온다 —
-        # 이건 리그 상이 아니라 내 팀만의 상이니 팀 이름이 붙어야 한다"]
-        # 비교 자체는 처음부터 club_pool(팀 로스터)로 정확히 좁혀서 하고
-        # 있었지만, 라벨 문자열만 다른 리그 상들과 똑같이 lname(리그 이름)을
-        # 그대로 붙여쓰고 있었다 — _team_name(c, tid)로 실제 소속팀 이름을
-        # 붙이도록 고친다.
+        # 구단 올해의 선수 — [2026-09 재설계, 신민용 확정: "구단 올해의 키퍼는
+        # 구단 올해의 선수 안에 키퍼도 들어갈 수 있다는 거고 이것도 평균평점으로
+        # 가면 될듯"] _club_award_score(골/도움/OVR/클린시트 가중) 대신 순수
+        # 평점 1위. club_pool은 원래도 포지션 제한이 없어(team_id로만 필터)
+        # GK도 이미 후보에 포함돼 있었으므로, 별도의 "구단 올해의 키퍼" 상을
+        # 새로 만들 필요 없이 이 상 하나로 커버된다(GK가 팀 내 평점 1위면
+        # 자연스럽게 이 상을 받음). 게이트(출전율65%+최소평점6.2)는 그대로 유지.
         CLUB_POTY_MIN_PLAY_RATIO = 0.65
         CLUB_POTY_MIN_RATING = 6.2
         club_pool = [x for x in pool if x.get("team_id") == tid]
         if club_pool:
-            club_best = max(club_pool, key=lambda x: _club_award_score(
-                x["position"], x["goals"], x["assists"], x["rating"], x["ovr"], x.get("cs", 0)))
+            club_best = max(club_pool, key=lambda x: x["rating"])
             if (club_best["is_mine"] and sm >= CLUB_POTY_MIN_PLAY_RATIO * FULL_SEASON_MATCHES
                     and season_rating >= CLUB_POTY_MIN_RATING):
                 my_awards.append(("구단 올해의 선수", f"{_team_name(c, tid)} 구단 올해의 선수"))
 
         # 골든글러브 (GK 최다 클린시트 — 내가 GK이고 클린시트 많을 때)
-        # [2026-07 확장, GPT 피드백: "클린시트 개수만 보면 안 되고 세이브율·
-        # 평균실점도 봐야 한다"] AI 골키퍼는 세이브/실점 추정치가 없어서
-        # 클린시트 1위 비교는 그대로 두고, 내 선수 자신의 세이브율·평균실점이
-        # 최소 품질 기준을 넘는지를 _gk_quality_ok()로 추가 검증한다.
+        # [변경 없음] 이 상만 원래부터 AI 비교가 아니라 내 선수 절대기준
+        # (클린시트10+세이브율/실점 품질검증)이라 이번 재설계 대상이 아님.
         if (p.get("position") == "GK" and season_cs >= 10
                 and _gk_quality_ok(p.get("award_saves", p.get("season_saves", 0)), season_goals_against,
                                     sm, FULL_SEASON_MATCHES)):
             my_awards.append(("골든글러브", f"{season_cs} 클린시트"))
-
-        # 영플레이어 (YPOTY) — [2026-07 변경, 신민용 확정: "리그는 23세 이하,
-        # 국제대회는 21세 이하로 나누는 게 더 현실적"] EPL/UEFA 실제 기준
-        # (23세 이하)에 맞춘다 — 챔스 영플레이어(이미 23세로 조정됨)와 통일.
-        # 월드컵/대륙컵(intl_engine._award_intl_awards)은 21세 그대로 유지.
-        # 상급 상 수상 조건 제거: 매 시즌 "유망주 중 최고"를 배출하기 위함
-        young_cands = [x for x in pool if x.get("age", 30) <= 23]
-        if young_cands:
-            young_best = max(young_cands, key=lambda x: _position_award_score(
-                x["position"], x["goals"], x["assists"], x["rating"], x["ovr"], x.get("cs", 0)))
-            if young_best["is_mine"]:
-                my_awards.append(("영플레이어", f"{lname} 영플레이어"))
 
         # 발롱도르 (S/A급 1부 + 세계 정상급 OVR + 압도적 성적 + 꾸준한 고평점)
         # [2026-07] 득점왕/도움왕과 동일하게, 리그별 실제 풀시즌 경기 수
@@ -9606,8 +10016,17 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
         # 아니라 내 대륙으로만 좁힌 쿼리" 하나뿐이다. 발롱도르보다 후보군이
         # 훨씬 작으므로 문턱(OVR/등급)도 그만큼 낮춘다 — SS/S 등급이 아니어도,
         # 그 대륙 1부리그 소속이면 후보가 될 수 있다.
+        # [2026-09 개편, 신민용 확정: "남미 북미를 나눌려고 해"] 아래
+        # _my_continent는 countries.continent 원값("남미"/"북미"/"오세아니아"
+        # 등)을 그대로 쓴다 — CONTINENT_TO_CONF로 묶은 연맹 키가 아니다.
+        # [버그수정] 예전엔 "아메리카"/"오세아니아" 키가 있었는데 countries.
+        # continent에는 그 값 자체가 존재한 적이 없어(항상 "남미"/"북미"/
+        # "오세아니아") 남미·북미·오세아니아 선수는 대륙상 후보 판정 자체가
+        # 조용히 항상 거짓이었다 — 원값 그대로 남미/북미/오세아니아 키로 고친다.
         _CONTINENT_POY = {"유럽": "UEFA 올해의 선수", "아시아": "AFC 올해의 선수",
-                          "아메리카": "CONMEBOL 올해의 선수", "아프리카": "CAF 올해의 선수"}
+                          "오세아니아": "AFC 올해의 선수",
+                          "남미": "코메볼 올해의 선수", "북미": "콩카카프 올해의 선수",
+                          "아프리카": "CAF 올해의 선수"}
         _my_cont_row = c.execute("""SELECT cn.continent FROM teams t
             JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
             WHERE t.id=?""", (tid,)).fetchone()
@@ -9976,6 +10395,26 @@ def _end_of_season(p, year, progress_cb=None):
     _rs0 = p.get("season_rating_sum", 0.0)
     season_avg_rating = round(_rs0/_rc0, 2) if _rc0 else 6.0
 
+    # 1.4 [2026-09 신설, 신민용 리포트: "세계기록실에 뜨는 그 선수 기록을
+    #     그대로 갖다써서 득점왕 등을 판정하면 되는 거 아니야?"] 맞는
+    #     말이라 그렇게 바꾼다 — 이번 시즌 AI 골/도움/평점을 여기서 먼저
+    #     세계기록실(hist.ai_player_season_stats)에 archiving해두고, 바로
+    #     아래 1.5단계 개인수상 판정이 그 저장된 값을 그대로 읽어 쓰게
+    #     한다(_process_awards(use_archived_ai_stats=True)). 이 시점은
+    #     원래 run_ai_offseason 안에서 나중에(AI 나이/노화 처리 이후)
+    #     스냅샷하던 타이밍보다도 이르다 — 즉 "이번 시즌을 실제로 뛴 그대로"의
+    #     OVR 기준이라 의미상 더 정확하다(노화 반영 후 OVR로 계산되던 기존
+    #     타이밍보다 적절). team_goals_for도 팀 통계가 리셋되기 전인 지금
+    #     구해서 넘긴다. run_ai_offseason은 이 스냅샷을 다시 하지 않도록
+    #     skip_season_snapshot=True로 부른다(아래 5.7단계) — 안 그러면
+    #     같은 시즌을 또 다른 랜덤값으로 덮어써서 다시 어긋난다.
+    conn0 = get_conn()
+    _early_team_goals_for = {
+        r[0]: r[1] for r in conn0.execute("SELECT id, goals_for FROM teams").fetchall()}
+    from ai_lifecycle import _snapshot_season_ratings
+    _snapshot_season_ratings(conn0.cursor(), year, team_goals_for=_early_team_goals_for)
+    conn0.commit()
+
     # 1.5 개인 수상 산정 (통계 리셋 이전에 실행). 최소 출전 기준은 위
     #     finalize_season_for_retire와 동일 원칙(리그 실제 풀시즌의 35%).
     # [2026-08 버그수정, 신민용 리포트: "시즌 중 이적하면 이전 팀 활약이
@@ -9998,6 +10437,7 @@ def _end_of_season(p, year, progress_cb=None):
             season_rating=award_avg_rating,
             season_cs=_season_cs,
             season_goals_against=p.get("award_goals_against", p.get("season_goals_against", 0)),
+            use_archived_ai_stats=True,
         )
 
     # 2. 자연 성장 (10경기 이상, 성장기=peak 이전 + max 여유 있을 때만)
@@ -10174,6 +10614,12 @@ def _end_of_season(p, year, progress_cb=None):
     # 실제 세이브(game.db)로 재현·확인 후, 초기화 코드를 원래 있어야 할
     # 이 위치로 옮겼다 — 이제 진짜 연도가 넘어갈 때만(52→1주) 초기화된다.
     conn = get_conn()
+    # [2026-09 신설, Tier B 준비] AI 선수 시즌 골 추정치를 팀 실제 득점
+    # 합계에 맞추려면(_snapshot_season_ratings) "이번 시즌 이 팀이 진짜
+    # 넣은 골"이 필요한데, 그 값이 바로 아래에서 0으로 리셋된다 — 리셋
+    # 직전에 팀별 goals_for를 스냅샷해뒀다가 run_ai_offseason으로 넘긴다.
+    _team_goals_for_snapshot = {
+        r[0]: r[1] for r in conn.execute("SELECT id, goals_for FROM teams").fetchall()}
     conn.execute("UPDATE teams SET wins=0,draws=0,losses=0,goals_for=0,goals_against=0")
     conn.commit()
     conn.close()
@@ -10199,8 +10645,14 @@ def _end_of_season(p, year, progress_cb=None):
     _tp1 = _time_perf2.perf_counter()
     try:
         from ai_lifecycle import run_ai_offseason
+        # [2026-09 신설] 위 1.4단계에서 이번 시즌 세계기록실 스냅샷을 이미
+        # 끝내놨으므로(개인수상 판정이 그 값을 그대로 읽어써야 해서 더
+        # 일찍 당김), 여기서 또 하면 같은 시즌이 다른 랜덤값으로 덮어써져
+        # 다시 어긋난다 — skip_season_snapshot=True로 중복 실행을 막는다.
         run_ai_offseason(year, verbose_log=add_log, progress_cb=progress_cb,
-                         my_team_id=p.get("current_team_id"))
+                         my_team_id=p.get("current_team_id"),
+                         team_goals_for=_team_goals_for_snapshot,
+                         skip_season_snapshot=True)
     except Exception as _e:
         # [2026-08 강화, 신민용 리포트: "10년 한번에 진행하면 OVR 기록이
         # 안 되는 경우가 있다"] 이 예외가 조용히 삼켜지면서(로그 한 줄만
@@ -10247,7 +10699,7 @@ def _end_of_season(p, year, progress_cb=None):
         for _tid in _RELEGATION_DEBUG_TRACK:
             _relegation_debug_snapshot(_tid, "개막 직전(이적시장 마감 후)")
     _tp2 = _time_perf2.perf_counter()
-    print(f"[PERF]   _end_of_season 세부: AI생애주기 {_tp2-_tp1:.2f}s "
+    _live_debug(f"[PERF]   _end_of_season 세부: AI생애주기 {_tp2-_tp1:.2f}s "
           f"(승강제 타이밍은 43주 _finalize_club_season으로 이동 — 여기 안 잡힘)")
 
     # 6. 강제 방출 체크 (이슈8 강화) — 우승 판정이 끝난 뒤에 처리
@@ -10989,7 +11441,7 @@ def _finalize_club_season(p, year):
     _tfcs1 = _time_fcs.perf_counter()
     _process_promotion_relegation(year, season_avg_rating)
     _tfcs2 = _time_fcs.perf_counter()
-    print(f"[PERF-SEASON] finalize_club_season 세부: "
+    _live_debug(f"[PERF-SEASON] finalize_club_season 세부: "
           f"finish_incomplete_matches={_tfcs1-_tfcs0:.3f}s | "
           f"promotion_relegation={_tfcs2-_tfcs1:.3f}s")
 
@@ -12116,7 +12568,7 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
 
     _invalidate_team_ovr_cache()
     _pr_t9 = _time_pr.perf_counter()
-    print(f"[PERF-PROMO] _process_promotion_relegation 세부: "
+    _live_debug(f"[PERF-PROMO] _process_promotion_relegation 세부: "
           f"my_player/season조회 {_pr_t1-_pr_t0:.3f}s | "
           f"teams+leagues조회 {_pr_t2-_pr_t1:.3f}s | "
           f"standings계산({len(all_league_ids)}개리그) {_pr_t3-_pr_t2:.3f}s | "
@@ -12360,7 +12812,7 @@ def _generate_all_league_schedules(season: int, year: int):
         conn.commit()
         conn.close()
         _tg5 = _time_perf3.perf_counter()
-        print(f"[PERF]   일정생성 세부: 아카이브이동 {_tg1-_tg0:.2f}s | "
+        _live_debug(f"[PERF]   일정생성 세부: 아카이브이동 {_tg1-_tg0:.2f}s | "
               f"완비판정조회 {_tg2-_tg1:.2f}s | 기존경기dedup조회 {_tg3-_tg2:.2f}s | "
               f"일정계산 {_tg4-_tg3:.2f}s | INSERT+commit {_tg5-_tg4:.2f}s | "
               f"(대상리그 {len(need_league_ids)}개, 신규경기 {len(new_rows)}건)")
@@ -12370,7 +12822,7 @@ def _generate_all_league_schedules(season: int, year: int):
         _tg_idx0 = _time_perf3.perf_counter()
         rebuild_match_results_indexes(_idx_conn.cursor())
         _idx_conn.commit()
-        print(f"[PERF]   인덱스재생성 {_time_perf3.perf_counter()-_tg_idx0:.2f}s")
+        _live_debug(f"[PERF]   인덱스재생성 {_time_perf3.perf_counter()-_tg_idx0:.2f}s")
 
 
 # [2026-07 신설, 신민용 리포트: "폴란드에서 3년 뛴 선수인데 왜 K리그가
@@ -12724,13 +13176,16 @@ def generate_offers(count=5, force=False) -> list:
     HAS_TEAM_FOREIGN        = 5 + _bonus   # 이적요청이면 +2 → 계약중12→이적요청14
 
     # [2026-07 신설, 구단판매추진 설계 확정] 판매추진 점수에 따라 오퍼
-    # 개수(확률의 대리 지표)를 배율로 늘린다: 2점=x1.2, 3점=x1.5, 4점+=x2.0.
+    # 개수(확률의 대리 지표)를 배율로 늘린다: 2점=x1.2, 3점=x1.5, 4점+=x1.7.
     # 판매추진 비활성/토글 꺼짐이면 배율 1.0(영향 없음).
+    # [2026-09 재조정, 신민용 지적: "x2.0은 꽤 강하다"] 4점+ 상한을
+    # 2.0->1.7로 낮춤 — 판매추진 자체는 유지(구단이 적극적으로 팔려는
+    # 행동이라 선수 시장가치를 왜곡하는 건 아니라는 원래 설계는 그대로).
     _sale_push_mult = 1.0
     if p.get("sale_push_active") and p.get("allow_club_sale_push", 1):
         _sp_score, _ = _calc_sale_push_score(p, p.get("current_year", 0))
         if _sp_score >= 4:
-            _sale_push_mult = 2.0
+            _sale_push_mult = 1.7
         elif _sp_score == 3:
             _sale_push_mult = 1.5
         elif _sp_score == 2:
@@ -12779,7 +13234,15 @@ def generate_offers(count=5, force=False) -> list:
     # 오퍼는 안 통하는" 불일치가 있었다. 동일한 곡선(_apply_pop_mod/
     # _apply_fame_mod)으로 계산해 오퍼 쪽 마진에도 더해준다 — 화제성/명성이
     # 높을수록 살짝 더 높은 수준의 팀에서도 오퍼가 뜰 수 있게.
-    _pop_fame_bonus = min(4.0, (_apply_pop_mod(p.get("popularity", 0)) + _apply_fame_mod(p.get("fame", 0))) / 3.0)
+    # [2026-09 재설계, 신민용 지적: "인기도가 실력 부족을 팀 마진으로
+    #   직접 상쇄하는 건 이상하다 — 인기 선수는 여러 팀에서 연락이 많이
+    #   오는 거지, 실력보다 훨씬 높은 팀에서 연락이 오는 게 되면 안 된다"]
+    #   popularity는 마진(팀 급)에서 완전히 빼고 대신 _offer_probability
+    #   (오퍼가 뜨는지 자체)에 반영한다. fame(커리어 업적)만 마진에 남기되
+    #   상한도 기존(합산 4.0, 사실상 fame 단독으로도 거의 다 채웠음)보다
+    #   낮춘다 — popularity가 아직 자체 공식이 골/도움 편중이라 손볼 예정
+    #   이라, 이번엔 fame 쪽 상한만 보수적으로 좁힌다.
+    _fame_bonus = min(2.5, _apply_fame_mod(p.get("fame", 0)) / 3.0)
 
     # [2026-08 신설, 신민용 요청: "대륙별 전문 에이전트 — 아시아 에이전트는
     # 아시아 팀에 대한 보정을 준다"] 계약한 에이전트의 전문 대륙
@@ -12921,11 +13384,13 @@ def generate_offers(count=5, force=False) -> list:
 
     def _team_fits_me(team_row) -> bool:
         """팀 평균 OVR 대비 내 effective_ovr 차이가 '그 팀의 리그 내
-           상대적 위치별 마진(+ 인기도/명성 보너스)' 이내면 True. 명문
-           팀일수록 마진이 작아(빡빡) 검증된 선수만 입단 가능, 하위권/
-           강등권 팀일수록 관대하다. 인기도/명성이 높으면(화제성 있는
-           선수) 약간 더 높은 수준의 팀에서도 오퍼가 뜰 수 있다
-           (direct-apply 확률 계산과 동일한 원리 — _pop_fame_bonus 참고).
+           상대적 위치별 마진(+ 명성 보너스)' 이내면 True. 명문 팀일수록
+           마진이 작아(빡빡) 검증된 선수만 입단 가능, 하위권/강등권
+           팀일수록 관대하다. 명성(커리어 업적)이 높으면 약간 더 높은
+           수준의 팀에서도 오퍼가 뜰 수 있다.
+           [2026-09 재설계] 인기도(popularity)는 여기서 뺐다 — 화제성이
+           팀 급을 직접 올려주는 건 이상해서, 대신 _offer_probability의
+           오퍼 발생 확률 쪽으로 옮겼다(_fame_bonus는 fame 전용).
            [2026-08 재설계, 15-3] 이번 시즌 활약이 나쁘면 비교 기준
            자체(_effective_ovr)가 낮아져 명문팀은 사실상 배제되고,
            하위권팀은 그래도 어느 정도 갭을 허용한다 — margin은 더 이상
@@ -12937,7 +13402,7 @@ def generate_offers(count=5, force=False) -> list:
         team_avg = _team_avg_cache_offers.get(team_row["id"])
         if team_avg is None:
             return True
-        margin = _team_relative_margin(team_row) + _pop_fame_bonus
+        margin = _team_relative_margin(team_row) + _fame_bonus
         if _unproven_margin_cap is not None:
             margin = min(margin, _unproven_margin_cap)
         if _agent_continent and get_country_continent(team_row["country"]) == _agent_continent:
@@ -14235,7 +14700,17 @@ def _offer_probability(p, week: int) -> float:
     weeks_left = max(0, weeks_left)
     contract_mult = get_contract_urgency_mult(weeks_left)
 
-    calculated = base * perf * contract_mult
+    # [2026-09 재설계, 신민용 지적: "인기도가 팀 마진(어느 급 팀이 오냐)을
+    #   상쇄하는 건 이상하다 — 인기 선수는 여러 팀에서 연락이 많이 오는
+    #   거지, 실력보다 훨씬 높은 팀에서 연락이 오는 게 되면 안 된다"]
+    #   popularity의 역할을 마진(generate_offers의 _fame_bonus, fame
+    #   전용으로 분리)에서 여기(오퍼가 뜨는지 자체)로 옮겼다 — "화제성
+    #   있으면 팀 급이 오르는" 대신 "화제성 있으면 관심 자체가 늘어난다"는
+    #   원칙. popularity 공식(_calc_pop) 자체는 아직 골/도움 편중이라
+    #   추후 별도로 손볼 예정 — 이번엔 오퍼 로직만 정리.
+    pop_bonus = 0.15 * (p.get("popularity", 0) / 100.0)
+
+    calculated = base * perf * contract_mult + pop_bonus
     return min(0.95, max(guaranteed, calculated))
 
 

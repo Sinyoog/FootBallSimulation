@@ -551,10 +551,19 @@ class CenterPanel(QWidget):
         # 이 버튼을 켜두면 그 팝업을 아예 띄우지 않고 자동으로 거절한다
         # (_auto_decline_all_pending과 동일한 방식 재사용).
         self.btn_nat_auto_decline = QPushButton("🌍 국대 발탁 자동거절 OFF"); self.btn_nat_auto_decline.setObjectName("actBtn")
+        # [2026-09 신설, 신민용 요청: "국대 발탁 자동거절 on off 옆에 국대
+        # 은퇴 버튼 — 누르면 커리어 성적에 국대 은퇴가 뜨고, 다시 끄면
+        # 국대 은퇴 취소가 뜨게"] 자동거절 토글 바로 옆에 배치 — 자동거절이
+        # "팝업이 귀찮아서 끔"이라면 이건 "국가대표를 그만두겠다는 선언"
+        # 이라 커리어 기록(nat_retirement_log)에 남는다는 점이 다르다.
+        # 실제 은퇴처럼 되돌릴 수 없게 하면 재미없다는 신민용 판단에 따라
+        # 몇 번이든 켰다 껐다 할 수 있고, 그 번복 이력 전체가 그대로
+        # 커리어 성적(career_window._intl_tab)에 남는다.
+        self.btn_nat_retire = QPushButton("🏳 국가대표 은퇴 OFF"); self.btn_nat_retire.setObjectName("actBtn")
         self.btn_retire = QPushButton("🚪 은퇴");     self.btn_retire.setObjectName("actBtn")
         self.btn_world  = QPushButton("🌍 세계 기록실"); self.btn_world.setObjectName("actBtn")
         for b in [self.btn_agent, self.btn_offer_toggle, self.btn_sale_push_toggle,
-                  self.btn_nat_auto_decline, self.btn_retire, self.btn_world]:
+                  self.btn_nat_auto_decline, self.btn_nat_retire, self.btn_retire, self.btn_world]:
             row2.addWidget(b)
         row2.addStretch()
         self.lay.addLayout(row2)
@@ -572,6 +581,7 @@ class CenterPanel(QWidget):
         self.btn_offer_toggle.clicked.connect(self._do_toggle_offers)
         self.btn_sale_push_toggle.clicked.connect(self._do_toggle_sale_push)
         self.btn_nat_auto_decline.clicked.connect(self._do_toggle_nat_auto_decline)
+        self.btn_nat_retire.clicked.connect(self._do_toggle_nat_retire)
         self.btn_retire.clicked.connect(self._do_retire)
         self.btn_world.clicked.connect(self._do_world_browser)
 
@@ -722,6 +732,10 @@ class CenterPanel(QWidget):
         st = get_state()
         if not p or not st:
             return
+
+        # [2026-09 제거] 라이브 물리엔진을 없애면서(경기결정=tactical_engine,
+        # 실측 0.002초) 프리페치 부트스트랩도 같이 제거했다 — 더는 미리
+        # 돌려둘 무거운 계산이 없다.
 
         # [2026-08 버그수정, 신민용 리포트: "1년씩 돌린 후 팀 입단하면 이제
         # 1년씩 돌리진 못하는데, 우측 버튼엔 여전히 1년으로 남아있다"]
@@ -1213,6 +1227,43 @@ class CenterPanel(QWidget):
             self.btn_nat_auto_decline.setToolTip(
                 "클릭하면 대표팀 발탁 제안을 팝업 없이 자동으로 거절하도록 켭니다. "
                 "(22세 이후 대표팀을 선택해두면 그 나라에서만 발탁 제안이 옵니다)")
+
+        # [2026-09 신설] 국가대표 은퇴 토글 — ON이면 위 자동거절과 같은
+        # 경로로 대기 중인 발탁 제안을 전부 거절 처리하되(아래 세 호출부의
+        # auto_decline_on 판정에 nat_retired도 같이 반영), 커리어 기록에
+        # '국대 은퇴'/'국대 은퇴 취소'로 남는다는 점이 다르다.
+        nat_retired_on = bool(p.get("nat_retired", 0))
+        # [2026-09 신설, 신민용 요청: "이거 여러번 누를 수 있으면 안되니
+        # 1년에 한 번만 누를 수 있게"] 가장 최근 토글이 올해 안에 있었으면
+        # 버튼 자체를 비활성화 — 클릭 핸들러(_do_toggle_nat_retire)도
+        # 같은 조건을 한 번 더 검사하지만(방어적 이중 체크), 평소엔 이
+        # setEnabled(False)로 아예 눌리지 않아 사용자가 바로 알 수 있다.
+        _nr_last_year = self._nat_retire_last_toggle_year()
+        _nr_locked = (_nr_last_year is not None and _nr_last_year == year)
+        self.btn_nat_retire.setEnabled(not _nr_locked)
+        if nat_retired_on:
+            self.btn_nat_retire.setText("🏳 국가대표 은퇴 ON")
+            if _nr_locked:
+                self.btn_nat_retire.setToolTip(
+                    "국가대표팀에서 은퇴한 상태입니다(커리어 기록에 남음). "
+                    f"{year}년엔 이미 상태를 변경했습니다 — 내년부터 다시 "
+                    "누를 수 있습니다.")
+            else:
+                self.btn_nat_retire.setToolTip(
+                    "국가대표팀에서 은퇴한 상태입니다(커리어 기록에 남음). "
+                    "클릭하면 은퇴를 취소하고 대표팀에 복귀합니다. "
+                    "(1년에 한 번만 변경 가능)")
+        else:
+            self.btn_nat_retire.setText("🏳 국가대표 은퇴 OFF")
+            if _nr_locked:
+                self.btn_nat_retire.setToolTip(
+                    f"{year}년엔 이미 상태를 변경했습니다 — 국가대표 은퇴는 "
+                    "1년에 한 번만 바꿀 수 있습니다. 내년부터 다시 누를 수 있습니다.")
+            else:
+                self.btn_nat_retire.setToolTip(
+                    "클릭하면 국가대표팀에서 은퇴합니다 — 앞으로 발탁 제안을 받지 "
+                    "않고, 커리어 기록에 '국대 은퇴'가 남습니다. 언제든 다시 눌러 "
+                    "은퇴를 취소(복귀)할 수 있지만, 1년에 한 번만 변경 가능합니다.")
 
         # 모드 토글 버튼: 묶음 진행 중(_step_idx>0)엔 전환 불가 → 회색 비활성.
         # 전환 가능할 때(묶음 시작 전)는 파란색으로 강조.
@@ -1798,9 +1849,10 @@ class CenterPanel(QWidget):
             return
         pend = intl_engine.get_pending_choice()
         if pend:
-            # [2026-08 신설] 국대 발탁 자동거절 토글이 켜져 있으면 팝업을
-            # 띄우지 않고 곧바로 자동 거절 처리한 뒤 진행을 계속한다.
-            if bool(p.get("auto_decline_callup", 0)):
+            # [2026-08 신설, 2026-09 확장] 국대 발탁 자동거절 토글 또는
+            # 국가대표 은퇴 상태면 팝업을 띄우지 않고 곧바로 자동 거절
+            # 처리한 뒤 진행을 계속한다.
+            if bool(p.get("auto_decline_callup", 0)) or bool(p.get("nat_retired", 0)):
                 self._auto_decline_all_pending(intl_engine)
                 show_toast(self, "🌍 국가대표 발탁을 자동으로 거절했습니다", "#666666", 1800)
             else:
@@ -1933,8 +1985,9 @@ class CenterPanel(QWidget):
             self._show_processing_overlay("⏳ 진행 중...")
 
         self._advance_worker = _AdvanceWorker(schedule, self)
-        if _is_season_transition:
-            self._advance_worker.stage_progress.connect(self._on_advance_stage_progress)
+        # [2026-09] 예전엔 시즌 전환일 때만 진행률을 받았다. 이제는 평범한
+        # 주 진행에도 경기 시뮬(약 7초)이 들어가므로 항상 연결한다.
+        self._advance_worker.stage_progress.connect(self._on_advance_stage_progress)
         self._advance_worker.finished_ok.connect(
             lambda: self._on_advance_finished())
         self._advance_worker.failed.connect(self._on_advance_failed)
@@ -2069,9 +2122,10 @@ class CenterPanel(QWidget):
         # 즉시 이어서 실행한다(동작 변화 없음).
         pend = intl_engine.get_pending_choice()
         if pend:
-            # [2026-08 신설] 국대 발탁 자동거절 토글이 켜져 있으면 팝업을
-            # 띄우지 않고 자동으로 거절한 뒤 그대로 이어서 진행한다.
-            if bool(p2.get("auto_decline_callup", 0)):
+            # [2026-08 신설, 2026-09 확장] 국대 발탁 자동거절 토글 또는
+            # 국가대표 은퇴 상태면 팝업을 띄우지 않고 자동으로 거절한 뒤
+            # 그대로 이어서 진행한다.
+            if bool(p2.get("auto_decline_callup", 0)) or bool(p2.get("nat_retired", 0)):
                 self._auto_decline_all_pending(intl_engine)
                 show_toast(self, "🌍 국가대표 발탁을 자동으로 거절했습니다", "#666666", 1800)
             else:
@@ -3429,6 +3483,66 @@ class CenterPanel(QWidget):
             self._auto_decline_all_pending(intl_engine)
         else:
             show_toast(self, "🌍 국대 발탁 제안을 다시 팝업으로 물어봅니다", "#006622", 2000)
+        if self.main_win: self.main_win.refresh_all()
+
+    def _nat_retire_last_toggle_year(self):
+        """[2026-09 신설] database.nat_retirement_log에서 가장 최근 은퇴/
+        복귀 토글이 있었던 연도(없으면 None) — refresh()의 버튼 활성화
+        판정과 _do_toggle_nat_retire의 클릭 시점 이중 체크 둘 다 이
+        함수 하나로 통일해서 기준이 어긋나지 않게 한다."""
+        from database import get_conn
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT year FROM nat_retirement_log ORDER BY id DESC LIMIT 1").fetchone()
+        conn.close()
+        return row[0] if row else None
+
+    def _do_toggle_nat_retire(self):
+        """[2026-09 신설, 신민용 요청: "국대 발탁 자동거절 옆에 국대 은퇴
+        버튼 — 누르면 커리어 성적에 국대 은퇴가 뜨고, 다시 끄면 국대 은퇴
+        취소가 뜨게"] ON이면 국가대표에서 은퇴한 상태 — _do_toggle_nat_
+        auto_decline과 같은 방식으로 대기 중인 발탁 제안을 곧바로 정리
+        하지만, 그와 별도로 database.nat_retirement_log에 '은퇴'/'은퇴
+        취소' 한 줄을 남긴다 — ui/career_window.py._intl_tab이 이 이력을
+        그대로 보여준다. 실제 은퇴처럼 되돌릴 수 없게 하면 재미없다는
+        판단에 따라 몇 번이든 다시 켜고 끌 수 있다(번복 자체가 정상 동작).
+
+        [참고, 지금 당장 반영하는 건 아님] 이 토글이 쌓는 은퇴/복귀 이력은
+        나중에 story_generator.py가 "은퇴했다가 복귀한 선수" 같은 서사를
+        만들 때 쓸 수 있는 원재료다 — 스토리 쪽에 바로 연결하지는 않되,
+        이런 용도로 재사용할 수 있다는 점만 염두에 둔다."""
+        p = get_player()
+        if not p: return
+        from game_engine import update_player, get_state, add_log
+        from database import get_conn
+        st = get_state()
+        year, week = st["current_year"], st["current_week"]
+        # [2026-09 신설, 신민용 요청: "1년에 한 번만 누를 수 있게"] refresh()의
+        # setEnabled(False)로 평소엔 버튼 자체가 안 눌리지만, 혹시 화면이
+        # 아직 갱신되기 전에 연속 클릭되는 경우까지 막는 방어적 이중 체크.
+        _last_year = self._nat_retire_last_toggle_year()
+        if _last_year is not None and _last_year == year:
+            show_toast(self, f"⚠ 국가대표 은퇴 상태는 1년에 한 번만 바꿀 수 있습니다 "
+                              f"({year}년엔 이미 변경했습니다)", "#cc6600", 2200)
+            return
+        cur = bool(p.get("nat_retired", 0))
+        new_val = 0 if cur else 1
+        update_player(nat_retired=new_val)
+        action = "은퇴" if new_val else "은퇴 취소"
+        conn = get_conn()
+        conn.execute("INSERT INTO nat_retirement_log(year, week, action) VALUES(?,?,?)",
+                     (year, week, action))
+        conn.commit()
+        conn.close()
+        if new_val:
+            add_log(f"🏳 {year}년  국가대표 은퇴", "event", year, week)
+            show_toast(self, "🏳 국가대표팀에서 은퇴했습니다 (커리어 기록에 남음)", "#666666", 2200)
+            # 켜는 즉시 이미 대기 중인 발탁 제안이 있으면 곧바로 정리한다.
+            import intl_engine
+            self._auto_decline_all_pending(intl_engine)
+        else:
+            add_log(f"🏳 {year}년  국가대표 은퇴 취소 (복귀)", "event", year, week)
+            show_toast(self, "🏳 국가대표 은퇴를 취소하고 복귀합니다", "#006622", 2200)
         if self.main_win: self.main_win.refresh_all()
 
     def _do_join(self):

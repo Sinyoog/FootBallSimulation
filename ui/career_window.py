@@ -954,7 +954,25 @@ class CareerWindow(QDialog):
     def _intl_tab(self, matches, p):
         """국제전(A매치) 경기별 기록: 기간/포지션/국가/대회/상대/스탯/평점/스코어/결과."""
         w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(0,0,0,0)
+
+        # [2026-09 신설, 신민용 요청: "국대 발탁 자동거절 옆에 국대 은퇴
+        # 버튼 — 누르면 커리어 성적에 국대 은퇴가 뜨게"] center_panel.py의
+        # 국가대표 은퇴 토글이 database.nat_retirement_log에 쌓아둔 은퇴/
+        # 복귀 이력을 한 줄씩 보여준다. A매치 기록(matches)이 하나도 없어도
+        # (예: 대표팀 선택 직후 바로 은퇴한 경우) 이 이력만은 보여야 하므로
+        # 아래 "기록 없음" 조기 반환보다 먼저 조회해둔다.
+        conn = get_conn()
+        _nat_events = conn.execute(
+            "SELECT year, week, action FROM nat_retirement_log ORDER BY id ASC").fetchall()
+        conn.close()
+
         if not matches:
+            if _nat_events:
+                for _yr, _wk, _act in _nat_events:
+                    _color = "#ff8844" if _act == "은퇴" else "#66cc88"
+                    el = QLabel(f"🏳 {_yr}년 {_wk}주차  국가대표 {_act}")
+                    el.setStyleSheet(f"color:{_color};font-size:11px;padding:1px 4px;")
+                    lay.addWidget(el)
             lay.addWidget(QLabel("국제전 기록 없음")); return w
 
         # 통산 A매치 요약
@@ -972,6 +990,13 @@ class CareerWindow(QDialog):
         sl = QLabel(f"🌍 {summary}")
         sl.setStyleSheet("color:#66ccff;font-size:12px;font-weight:bold;padding:4px;")
         lay.addWidget(sl)
+
+        if _nat_events:
+            for _yr, _wk, _act in _nat_events:
+                _color = "#ff8844" if _act == "은퇴" else "#66cc88"
+                el = QLabel(f"🏳 {_yr}년 {_wk}주차  국가대표 {_act}")
+                el.setStyleSheet(f"color:{_color};font-size:11px;padding:1px 4px;")
+                lay.addWidget(el)
 
         from constants import position_group
         _pos = p.get("position", "")

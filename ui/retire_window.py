@@ -440,6 +440,23 @@ class RetireWindow(QDialog):
         lay.addWidget(t35)
         lay.addWidget(self._intl_table(intl_ms, p))
 
+        # ── 국가대표 은퇴 이력 ────────────────────────
+        # [2026-09 신설, 신민용 요청: "이거 은퇴창에도 국대 은퇴가 떠야
+        # 해"] center_panel.py의 국가대표 은퇴 토글이 database.
+        # nat_retirement_log에 쌓아둔 은퇴/복귀 이력 — career_window.py.
+        # _intl_tab과 똑같은 자료를 여기(최종 은퇴창)에서도 보여준다.
+        # 한 번도 누른 적 없으면(이력 없음) 섹션 자체를 만들지 않는다.
+        _nat_events = self._nat_retirement_events()
+        if _nat_events:
+            t35n = QLabel(f"🏳 국가대표 은퇴 이력  ({len(_nat_events)})")
+            t35n.setObjectName("secTitle")
+            lay.addWidget(t35n)
+            for _yr, _wk, _act in _nat_events:
+                _color = "#ff8844" if _act == "은퇴" else "#66cc88"
+                el = QLabel(f"🏳 {_yr}년 {_wk}주차  국가대표 {_act}")
+                el.setStyleSheet(f"color:{_color};font-size:11px;padding:1px 4px;")
+                lay.addWidget(el)
+
         # ── 국제전(예선) 기록 ─────────────────────────
         qual_ms = _cm["qual_ms"]
         if qual_ms:
@@ -1138,6 +1155,16 @@ class RetireWindow(QDialog):
         tbl.resizeRowsToContents()
         tbl.setFixedHeight(30 + min(len(promos), 5) * 28)
         return tbl
+
+    def _nat_retirement_events(self):
+        """[2026-09 신설] database.nat_retirement_log 전체를 시간순으로
+        반환 — career_window.py._intl_tab과 동일한 조회(중복 정의, 두
+        파일이 서로 import하지 않는 기존 원칙과 동일한 이유)."""
+        conn = get_conn()
+        rows = conn.execute(
+            "SELECT year, week, action FROM nat_retirement_log ORDER BY id ASC").fetchall()
+        conn.close()
+        return rows
 
     def _intl_table(self, matches, p):
         """국제전(A매치) 경기별 기록 테이블 (포지션별 세부 지표)."""
@@ -1845,6 +1872,15 @@ class RetireWindow(QDialog):
         else:
             lines.append("  없음")
         lines.append("")
+
+        # [2026-09 신설] 국가대표 은퇴 이력 — 한 번도 누른 적 없으면
+        # (이력 없음) 이 섹션 자체를 넣지 않는다.
+        _nat_events2 = self._nat_retirement_events()
+        if _nat_events2:
+            lines.append(f"▶ 국가대표 은퇴 이력  ({len(_nat_events2)}건)")
+            for _yr, _wk, _act in _nat_events2:
+                lines.append(f"  • {_yr}년 {_wk}주차  국가대표 {_act}")
+            lines.append("")
 
         # 국제전(예선) 기록
         qual_ms2 = _cm2["qual_ms"]

@@ -83,7 +83,8 @@ SUPER_CUP_NAME = {
     "아시아": "AFC 그랜드 슈퍼컵",
     "유럽": "UEFA 슈퍼컵 플러스",
     "아프리카": "CAF 슈퍼컵 프리미어",
-    "북남미": "APF 그랜드 슈퍼컵",
+    "남미": "코메볼 그랜드 슈퍼컵",
+    "북미": "콩카카프 그랜드 슈퍼컵",
 }
 
 # CL_END_WEEK(23주차)에 챔스/유로파/컨퍼런스가 전부 끝나므로, 그 뒤로
@@ -132,7 +133,7 @@ SC_CFG = CompetitionConfig(
     suspension_field="super_cup_suspension",
 )
 
-_CONTINENTS = ("유럽", "아시아", "아프리카", "북남미")
+_CONTINENTS = ("유럽", "아시아", "아프리카", "남미", "북미")
 _SF_DAY = week_to_day(SC_START_WEEK)          # Day1 — 준결승 2경기
 _FINAL_DAY = _SF_DAY + 5                       # Day6 — 3·4위전 + 결승
 

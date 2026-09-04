@@ -36,6 +36,16 @@ COLOR_RULES = [
 STAT_UP_RE   = re.compile(r'(\+\d+)')
 STAT_DOWN_RE = re.compile(r'(?<![0-9])(-\d+)')
 
+
+def _win_alive(w):
+    """w의 C++ 쪽 QObject가 아직 살아있는지 확인 (deleteLater로 이미
+    지워진 창을 리스트에 남겨두면 나중에 접근할 때 RuntimeError가 남)."""
+    try:
+        w.isVisible()
+        return True
+    except RuntimeError:
+        return False
+
 # [2026-08 신설, 신민용 요청: "경기 상자를 각 대회 색으로 구별하고 싶다 —
 # 리그는 녹색, 컵대회는 보라색, 다른 대회들도 각자 색으로"] 각 대회 엔진의
 # add_log() 마커가 이제 "[match:{id}:{kind}]" 형태로 대회 종류(kind)까지
@@ -214,6 +224,13 @@ class LogPanel(QWidget):
         # 이전 세이브의 로그 id와 섞일 걱정이 없다.
         self._last_log_id = 0
         self._initialized = False
+        # [2026-09 신설, 신민용 요청: "경기 상세를 켰다고 다른 창을 못
+        # 만지게 하지 마 — 세계 기록실 선수 검색도 같이 되게"] 경기 상세
+        # 창을 모달(exec)이 아니라 비모달(show)로 띄우면서, 파이썬 GC가
+        # 곧바로 회수해 창이 뜨자마자 닫혀버리지 않도록 참조를 붙잡아둔다
+        # (ui/offer_window.py._team_info_wins와 동일한 패턴) — 닫히면
+        # finished 시그널로 알아서 목록에서 제거된다.
+        self._match_detail_wins = []
         # [2026-08 신설, 신민용 요청: "로그를 1년 단위로, 새해 시작하면
         # 깨끗해지고 다시 쌓이게"] 지금 화면에 쌓여 있는 내용이 어느
         # 연도(year) 소속인지 기억한다 — refresh()에서 새로 들어온 줄의
@@ -294,8 +311,26 @@ class LogPanel(QWidget):
         if not data:
             return
         from ui.match_detail_dialog import MatchDetailDialog
+        # [2026-09 변경, 신민용 리포트: "경기 상세를 켰다고 다른 창(다른
+        # 로그, 세계 기록실 등)을 못 만지게 하지 마"] 예전엔 dlg.exec()
+        # (애플리케이션 모달)로 띄워서 이 창이 떠 있는 동안 다른 모든
+        # 창(방금 이 창 안에서 새로 연 세계 기록실 포함)이 입력을 못 받았다.
+        # 이제 비모달로 띄워서 동시에 다른 창도 그대로 조작 가능하다.
         dlg = MatchDetailDialog(data, self)
-        dlg.exec()
+        dlg.setWindowModality(Qt.WindowModality.NonModal)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self._match_detail_wins = [w for w in self._match_detail_wins if _win_alive(w)]
+        self._match_detail_wins.append(dlg)
+        dlg.finished.connect(lambda *_a, d=dlg: self._on_match_detail_closed(d))
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _on_match_detail_closed(self, dlg):
+        try:
+            self._match_detail_wins.remove(dlg)
+        except ValueError:
+            pass
 
     def _set_filter_mode(self, mode: str):
         """[2026-08 신설, 로그 필터 버튼] 전체/핵심/경기 버튼 클릭 시

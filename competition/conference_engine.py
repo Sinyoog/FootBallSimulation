@@ -22,7 +22,8 @@ ECL_CUP_NAME = {
     "유럽": "UEFA 컨퍼런스리그",
     "아시아": "AFC 챌린지리그",
     "아프리카": "CAF 아프리카 클럽 챌린지컵",
-    "북남미": "아메리카 클럽 챌린지컵",
+    "남미": "코파 데 라 리가",
+    "북미": "콩카카프 센트럴컵",
 }
 
 CONFERENCE_CFG = CompetitionConfig(
@@ -152,7 +153,7 @@ def process_ecl_week(week):
     if not st:
         return
     year = st["current_year"]
-    for cont in ("유럽", "아시아", "아프리카", "북남미"):
+    for cont in ("유럽", "아시아", "아프리카", "남미", "북미"):
         t = get_ecl_tournament(year, cont)
         if not t or t["status"] == "done":
             continue

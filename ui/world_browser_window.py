@@ -28,7 +28,7 @@ from database import (get_conn, get_game_start_year, TEAM_POSITIONS,
                        get_ai_player_custom_name, set_ai_player_custom_name,
                        get_ai_player_custom_names)
 from constants import ai_player_code, FORMATION_SLOTS
-from game_engine import is_hard_mode, is_easy_mode
+from game_engine import is_hard_mode, is_easy_mode, fmt_money
 import power_ranking as pr
 # [2026-08 신설, 신민용 요청: "내가 분명 포메이션 형태로 보내달라 했는데
 # 왜 없어?"] 국가대표 스쿼드/팀 시즌 라인업을 실제 포메이션 화면과 똑같은
@@ -632,6 +632,34 @@ class _EditableFieldHeader(QHeaderView):
         painter.restore()
 
 
+class _SmoothScrollTableWidget(QTableWidget):
+    """[2026-09 신설, 신민용 리포트(재발): "국가 검색이든 팀 검색이든
+    세부 창이 떴을 때 휠로 움직이면 너무 확 움직여서 아래를 못 본다"]
+    이 표들(국가/팀 상세 — 연도 행을 펼치면 그 아래 조 순위표·경기
+    결과가 통째로 들어가 행 높이가 아주 커짐)은 이전에 이미
+    ScrollPerPixel+singleStep(24)로 한 차례 손봤는데도(team_detail_tbl/
+    country_detail_tbl 참고) 여전히 너무 빠르다는 리포트가 다시 들어왔다
+    — 원인은 Qt 기본 휠 처리가 singleStep에 OS의 "휠 한 칸=몇 줄"
+    설정(wheelScrollLines, 보통 3이지만 환경마다 다르고 일부는 더 큼)을
+    그대로 곱해버려서, singleStep을 아무리 줄여도 최종 이동량이 OS
+    설정에 종속적이었기 때문이다. wheelEvent를 직접 오버라이드해서 OS
+    설정을 완전히 우회하고, 표준 휠 노치(120 delta) 1번당 이동할
+    픽셀 수를 여기서 직접 고정한다 — 이제 환경과 무관하게 항상 같은
+    (더 작은) 폭으로만 움직인다. 트랙패드처럼 delta가 120 미만으로
+    잘게 들어오는 경우도 비례 처리(steps=delta/120.0)해 끊기지 않는다."""
+    _WHEEL_STEP_PX = 40  # 표준 휠 노치 1번당 스크롤 픽셀 수(기존 체감보다 작게)
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        if delta == 0:
+            super().wheelEvent(event)
+            return
+        bar = self.verticalScrollBar()
+        steps = delta / 120.0
+        bar.setValue(bar.value() - int(steps * self._WHEEL_STEP_PX))
+        event.accept()
+
+
 class WorldBrowserWindow(QDialog):
     def __init__(self, parent=None, open_player_id=None, nav=None, panel=None):
         """open_player_id: [2026-08 신설, 신민용 요청: "포메이션에서 선수를
@@ -723,9 +751,14 @@ class WorldBrowserWindow(QDialog):
 
         self._wb_lazy_builders = {}   # {tab_index: (builder_fn, label)}
         _lazy_tabs = [
-            (self._build_cl_tab,           "🏆 역대 챔피언스리그"),
-            (self._build_el_tab,           "🥈 역대 유로파리그"),
-            (self._build_ecl_tab,          "🥉 역대 컨퍼런스리그"),
+            # [2026-09 수정, 신민용 요청: "챔스/유로파/컨퍼런스를 '클럽
+            # 대항전' 탭 하나로 묶고, 필터 옆 토글 버튼으로 전환하는 게
+            # UI적으로 낫다"] 예전엔 아래 3개가 독립 탭이었다(모두
+            # _build_cl_style_tab을 그대로 재사용하는 동일 구조였음) —
+            # _build_club_tab 하나로 합치고, 어떤 대회를 볼지는 그 탭
+            # 안의 토글 버튼으로 고른다. 세계기록실 탭 수도 13→11로
+            # 줄어 로딩 부담이 조금 준다.
+            (self._build_club_tab,         "🏆 역대 클럽 대항전"),
             (self._build_sc_tab,           "🏵 역대 슈퍼컵"),
             (self._build_cwc_tab,          "🌍 역대 클럽 월드컵"),
             (self._build_wc_tab,           "🌐 역대 월드컵"),
@@ -2231,10 +2264,20 @@ class WorldBrowserWindow(QDialog):
         title_row.addWidget(self.team_copy_btn)
         right_lay.addLayout(title_row)
 
-        self.team_detail_tbl = QTableWidget(0, 7)
+        self.team_detail_tbl = _SmoothScrollTableWidget(0, 7)
         self.team_detail_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.team_detail_tbl.verticalHeader().setVisible(False)
         self.team_detail_tbl.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        # [2026-09 신설, 신민용 리포트: "국가 검색이든 팀 검색이든 세부 창이
+        # 떴을 때 휠로 움직이면 너무 확 움직여서 불편해"] Qt 기본 스크롤
+        # 모드(ScrollPerItem)는 휠 한 칸에 "행 3개"를 넘기는데, 이 표는
+        # 연도 행을 클릭하면 그 아래 매치 상세(대진표 등)가 통째로 한
+        # 행에 펼쳐져(스크린샷의 초록 박스) 그 행 높이가 다른 행보다
+        # 훨씬 크다 — 행 단위 스크롤이라 그 큰 행을 한 번에 훌쩍 건너뛰는
+        # 식으로 체감된다. 픽셀 단위 스크롤로 바꾸고 한 칸당 이동량도
+        # 줄여서 항상 일정하고 완만하게 움직이게 한다.
+        self.team_detail_tbl.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.team_detail_tbl.verticalScrollBar().setSingleStep(24)
         # [2026-08 확장, 13순위] "슈퍼컵" 컬럼을 클럽 대항전과 클럽 월드컵
         # 사이에 추가(신민용 확정 순서: 리그|국내컵|클럽대항전|슈퍼컵|
         # 클럽월드컵).
@@ -2496,7 +2539,32 @@ class WorldBrowserWindow(QDialog):
             lay.addWidget(rec_lbl)
         return w
 
-    def _comp_stat_cell(self, stat, color):
+    def _simple_transfer_label(self, transfer_type, is_loan):
+        """[2026-09 신설, 신민용 요청: "이적 오퍼 입단 방출 이걸로
+        나누는게 깔끔한데 왜 리그내 이런식으로 표시하는거야"] ai_
+        transfer_log.transfer_type엔 "리그내"/"국내 타부수"/"국제
+        이동"처럼 이적시장 내부에서 "어떤 경로로 옮겼는지"(원래는 뉴스
+        로그 등 다른 용도로 쓰던 값) 그대로 저장돼 있는데, 이 화면에서는
+        그런 내부 구분보다 축구팬이 바로 알아볼 수 있는 4가지(이적/오퍼/
+        입단/방출)로 보여주는 게 낫다는 지적 — 저장값 자체(다른 곳에서도
+        읽을 수 있으니)는 안 건드리고 표시할 때만 이렇게 단순화해서
+        보여준다. 정확한 매핑: 일반 이적시장(리그내/국내 타부수/국제
+        이동)·명문팀 스카우팅으로 새로 온 선수=이적, 임대(is_loan)=오퍼,
+        은퇴 대체로 새로 합류=입단, 명문팀 스카우팅으로 밀려난 반대급부
+        선수=방출, 임대 복귀=복귀."""
+        if is_loan:
+            return "오퍼"
+        _MAP = {
+            "리그내": "이적", "국내 타부수": "이적", "국제 이동": "이적",
+            "명문팀 스카우팅": "이적",
+            "은퇴대체 영입": "입단",
+            "명문팀 스카우팅(반대급부)": "방출",
+            "임대 복귀": "복귀",
+            "연장": "연장",
+        }
+        return _MAP.get(transfer_type, transfer_type or "기록")
+
+    def _comp_stat_cell(self, stat, color, is_gk=False):
         """[2026-09 신설, 신민용 요청: "리그/국내컵/클럽대항전/슈퍼컵/
         클럽월드컵 다 평점·골·어시를 다르게 둬야 하는데... 경기수는
         빼고, 그 | 이거 텍스트 말고 상자로 칸칸 나누라는거야"] 대회별
@@ -2504,9 +2572,23 @@ class WorldBrowserWindow(QDialog):
         상자 스타일(_two_line_cell)로 그 대회 칸 바로 아래에 그린다 —
         예전엔 대회 구분 없이 한 줄로 합쳐서(그나마도 경기수까지
         같이) 표 전체를 가로지르는 텍스트 한 줄이었다. 요청대로
-        경기수는 표시하지 않는다."""
+        경기수는 표시하지 않는다.
+        [2026-09 재수정, 신민용 요청: "클린시트 말고 선방:14 실점:1
+        선방률:93.5% 이런식으로 떠야한다"] GK는 클린시트 대신 선방/실점/
+        선방률을 보여준다 — game_engine._estimate_ai_gk_saves 정의부
+        주석 참고(골/도움/평점도 실제 슈팅 이벤트가 아니라 통계적
+        추정치이므로, 선방률도 같은 방식으로 추정 가능하다는 게 핵심).
+        선방률은 저장된 saves/goals_conceded로 그때그때 계산해 항상
+        정확히 맞물리게 한다."""
         main_text = f"⭐ {stat['rating']:.2f}"
-        record = f"⚽ {stat.get('goals', 0)}골  🅰 {stat.get('assists', 0)}A"
+        if is_gk:
+            _sv = stat.get("saves", 0) or 0
+            _gc = stat.get("goals_conceded", 0) or 0
+            _shots = _sv + _gc
+            _pct = f"{(_sv / _shots * 100):.1f}%" if _shots else "-"
+            record = f"🧤 선방{_sv} 실점{_gc} 선방률{_pct}"
+        else:
+            record = f"⚽ {stat.get('goals', 0)}골  🅰 {stat.get('assists', 0)}A"
         return self._two_line_cell(main_text, color, record, bold=True)
 
     def _cl_award_summary_cell(self, n_cl, n_el, n_ecl):
@@ -2889,7 +2971,8 @@ class WorldBrowserWindow(QDialog):
             _summary_years = {year}
             summary_copy_btn.clicked.connect(
                 lambda: self._copy_squad_player_records(
-                    _ids, summary_copy_btn, "📋 요약 복사", target_years=_summary_years))
+                    _ids, summary_copy_btn, "📋 요약 복사", target_years=_summary_years,
+                    include_stats=False))
             header_row.addWidget(summary_copy_btn)
         lay.addLayout(header_row)
 
@@ -3169,14 +3252,46 @@ class WorldBrowserWindow(QDialog):
                 if include_stats:
                     _comp_stats = entry.get("_comp_stats")
                     if _comp_stats:
+                        # [2026-09 재수정, 신민용 요청: "클린시트 말고
+                        # 선방:14 실점:1 선방률:93.5% 이런식으로 떠야한다"]
+                        # GK는 클린시트 대신 선방/실점/선방률(위 _comp_
+                        # stat_cell과 완전히 같은 계산·표기)로 표시한다.
+                        _is_gk_club = (d.get("position") == "GK")
                         _COMP_LABEL = {"league": "리그", "cup": "국내컵", "cl": "클럽대항전",
                                        "sc": "슈퍼컵", "cwc": "클럽월드컵"}
                         for _comp, _label in _COMP_LABEL.items():
                             _cs = _comp_stats.get(_comp)
                             if _cs:
-                                lines.append(
-                                    f"  ⚽ {_label}: 평균평점 {_cs['rating']:.2f}  "
-                                    f"{_cs.get('goals', 0)}골 {_cs.get('assists', 0)}A")
+                                if _is_gk_club:
+                                    _sv = _cs.get("saves", 0) or 0
+                                    _gc = _cs.get("goals_conceded", 0) or 0
+                                    _shots = _sv + _gc
+                                    _pct = f"{(_sv / _shots * 100):.1f}%" if _shots else "-"
+                                    lines.append(
+                                        f"  🧤 {_label}: 평균평점 {_cs['rating']:.2f}  "
+                                        f"선방{_sv} 실점{_gc} 선방률{_pct}")
+                                else:
+                                    lines.append(
+                                        f"  ⚽ {_label}: 평균평점 {_cs['rating']:.2f}  "
+                                        f"{_cs.get('goals', 0)}골 {_cs.get('assists', 0)}A")
+                    # [2026-09 신설, 신민용 요청: "기록 복사에는 저것도
+                    # 다 뜨는거지만"] 화면(펼침 상태)과 무관하게 복사는
+                    # 항상 연봉/이적종류/계약연도/이적료까지 포함한다.
+                    _sal = entry.get("salary")
+                    if _sal:
+                        _type_label = self._simple_transfer_label(
+                            entry.get("salary_transfer_type"), entry.get("salary_is_loan"))
+                        _sal_line = f"  💰 연봉 {fmt_money(_sal)}"
+                        _cyrs = entry.get("salary_contract_years")
+                        if _cyrs:
+                            _sal_line += f" (계약: {_cyrs}년)"
+                        elif entry.get("salary_debut_year"):
+                            _sal_line += f" (계약년도: {entry['salary_debut_year']}년)"
+                        _sal_line += f" [{_type_label}]"
+                        _fee = entry.get("salary_fee") or 0
+                        if _fee:
+                            _sal_line += f"  🤝 이적료 {fmt_money(_fee)}"
+                        lines.append(_sal_line)
         lines.append("")
 
         # ── 국가대표 기록 ──
@@ -3184,6 +3299,7 @@ class WorldBrowserWindow(QDialog):
         if not intl_records:
             lines.append("(국가대표 출전 기록 없음)")
         else:
+            _is_gk = (d.get("position") == "GK")
             for rec in intl_records:
                 apps = rec.get("appearances", 0)
                 total = rec.get("total_games", 0)
@@ -3191,6 +3307,23 @@ class WorldBrowserWindow(QDialog):
                 lines.append(
                     f"{rec.get('year')}년 | {rec.get('name') or '?'} ({rec.get('country') or '?'}) | "
                     f"출전 {apps_text} | 결과: {rec.get('result') or '?'}")
+                # [2026-09 신설, 신민용 요청: "국가대표에도 평점이랑 골
+                # 어시 이런걸 넣고 싶어"] 클럽 쪽 대회별 평점/골/어시
+                # 줄(위 include_stats 블록)과 같은 원칙 — "기록 복사"류
+                # (include_stats=True)에만 붙이고 "요약 복사"는 가볍게
+                # 유지한다. rating이 0이면(그 대회 스냅샷 미실행 —
+                # intl_squad 신설 이전 대회 등) 줄 자체를 생략한다.
+                if include_stats and rec.get("rating"):
+                    if _is_gk:
+                        _sv = rec.get("saves", 0) or 0
+                        _gc = rec.get("goals_conceded", 0) or 0
+                        _shots = _sv + _gc
+                        _pct = f"{(_sv / _shots * 100):.1f}%" if _shots else "-"
+                        lines.append(
+                            f"  🧤 평균평점 {rec['rating']:.2f}  선방{_sv} 실점{_gc} 선방률{_pct}")
+                    else:
+                        lines.append(
+                            f"  ⚽ 평균평점 {rec['rating']:.2f}  {rec.get('goals', 0)}골 {rec.get('assists', 0)}A")
 
         return "\n".join(lines)
 
@@ -3836,6 +3969,12 @@ class WorldBrowserWindow(QDialog):
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.player_team_tbl.horizontalScrollBar().valueChanged.connect(
             self.player_team_award_tbl.horizontalScrollBar().setValue)
+        # [2026-09 신설, 신민용 요청: "연도(2000(26세)) 클릭하면 아래에
+        # 평점/연봉/이적종류가 펼쳐지고 다시 클릭하면 접히는거지"] 이
+        # 표가 다시 그려질 때마다(선수를 바꿔볼 때마다) 매번 connect하면
+        # 연결이 계속 누적돼 중복 발화하므로, 위젯 생성 시점인 여기서
+        # 딱 한 번만 연결한다.
+        self.player_team_tbl.cellClicked.connect(self._on_player_team_year_clicked)
         scroll_lay.addWidget(self.player_team_tbl)
         scroll_lay.addWidget(self.player_retirement_note)
 
@@ -3854,15 +3993,22 @@ class WorldBrowserWindow(QDialog):
         intl_box_title = QLabel("🌍 국가대표 출전 기록")
         intl_box_title.setStyleSheet("color:#eee;font-size:13px;font-weight:bold;")
         scroll_lay.addWidget(intl_box_title)
-        self.player_intl_tbl = self._make_self_sizing_table(5, no_scroll=True)
+        self.player_intl_tbl = self._make_self_sizing_table(6, no_scroll=True)
         self.player_intl_tbl.setHorizontalHeaderLabels(
-            ["연도", "대회", "국가", "출전", "결과"])
+            ["연도", "대회", "국가", "출전", "결과", "성적"])
         # [2026-08 신설] "대회" 칸은 "2000 유럽 네이션스컵 예선"처럼 길게
         # 나올 수 있어 Interactive 기본폭(130)으로는 좁을 수 있다 — 넓힌다.
         self.player_intl_tbl.setColumnWidth(1, 210)
         self.player_intl_tbl.horizontalHeader().setSectionResizeMode(
             3, QHeaderView.ResizeMode.Fixed)
         self.player_intl_tbl.setColumnWidth(3, self._OVR_COL_W)
+        # [2026-09 신설, 신민용 리포트: "국제대회 성적 저거 글 잘리는데
+        # 글자 다 보이게 칸을 맞춰"] "성적" 칸(5번, ⭐평점 ⚽N골 🅰NA 또는
+        # ⭐평점 🧤N회)이 Interactive 기본폭에 잘려 보였다 — "대회" 칸(1번)
+        # 처럼 이 칸도 내용 길이에 맞춰 명시적으로 넓힌다.
+        # [2026-09 재수정] GK 텍스트가 "⭐7.15 🧤선방14실점1(93.5%)"로
+        # 더 길어져 170px로도 잘릴 수 있어 220px로 재조정.
+        self.player_intl_tbl.setColumnWidth(5, 220)
         scroll_lay.addWidget(self.player_intl_tbl)
 
         # [2026-08 신설] intl_squad는 2026-08부터 생긴 테이블이라 그 전에
@@ -4571,20 +4717,23 @@ class WorldBrowserWindow(QDialog):
 
         # [2026-08 신설] 국가대표 출전 기록 박스 — 소속팀 유무·은퇴 여부와
         # 무관하게(국적은 은퇴해도 안 바뀜) 항상 채운다.
-        self._populate_player_intl_box(player_id)
+        self._populate_player_intl_box(player_id, position=d.get("position"))
         # 기본 정보(이름/국적/나이/포지션/OVR/소속팀)만 있어도 복사할
         # 가치가 있으므로, 연도별·국가대표 기록 유무와 무관하게 여기서
         # 활성화한다(각 기록이 비어 있으면 포맷 함수가 "기록 없음"으로 채움).
         self.player_copy_btn.setEnabled(True)
         self.player_full_copy_btn.setEnabled(True)
 
-    def _populate_player_intl_box(self, player_id):
+    def _populate_player_intl_box(self, player_id, position=None):
         """[2026-08 신설, 신민용 요청: "'예선전 탈락' 같은 개인 기록도
         표시해줘"] wb.get_player_intl_records로 이 선수가 실제로 대회
         명단(intl_squad)에 뽑혔던 대회만 가져와 연도/대회/국가/출전/결과
         표로 채운다. player_team_tbl과 같은 톤 — 기록이 없으면(intl_squad
         도입 이전 대회뿐이거나, 애초에 대표팀에 뽑힌 적이 없으면) 안내
-        문구 한 줄만 표시한다."""
+        문구 한 줄만 표시한다.
+        [2026-09 확장, 신민용 요청: "국가대표에도 평점이랑 골 어시 이런걸
+        넣고 싶어"] "성적" 칸을 추가 — GK는 클럽 기록과 동일하게 골/도움
+        대신 클린시트를 보여준다(position으로 판정)."""
         tbl = self.player_intl_tbl
         tbl.setRowCount(0)
         tbl.clearSpans()
@@ -4596,9 +4745,10 @@ class WorldBrowserWindow(QDialog):
             empty = QTableWidgetItem("국가대표 출전 기록 없음")
             empty.setForeground(QColor("#666"))
             tbl.setItem(0, 0, empty)
-            tbl.setSpan(0, 0, 1, 5)
+            tbl.setSpan(0, 0, 1, 6)
             self._resize_self_sizing_table(tbl)
             return
+        _is_gk = (position == "GK")
         tbl.setRowCount(len(records))
         for row, rec in enumerate(records):
             # [2026-08 신설, 신민용 요청: "출전/전체 경기 형식으로 — 전체
@@ -4608,11 +4758,23 @@ class WorldBrowserWindow(QDialog):
             _apps = rec.get("appearances", 0)
             _total = rec.get("total_games", 0)
             _apps_text = f"{_apps}/{_total}" if _total else str(_apps)
+            _rating = rec.get("rating") or 0
+            if _rating:
+                if _is_gk:
+                    _sv = rec.get("saves", 0) or 0
+                    _gc = rec.get("goals_conceded", 0) or 0
+                    _shots = _sv + _gc
+                    _pct = f"{(_sv / _shots * 100):.1f}%" if _shots else "-"
+                    _stat_text = f"⭐{_rating:.2f}  🧤선방{_sv}실점{_gc}({_pct})"
+                else:
+                    _stat_text = f"⭐{_rating:.2f}  ⚽{rec.get('goals', 0)}골 🅰{rec.get('assists', 0)}A"
+            else:
+                _stat_text = "-"
             cells = [str(rec["year"]), rec.get("name") or "?", rec.get("country") or "?",
-                     _apps_text, rec.get("result") or "?"]
+                     _apps_text, rec.get("result") or "?", _stat_text]
             for col, text in enumerate(cells):
                 item = QTableWidgetItem(text)
-                if col in (0, 3):
+                if col in (0, 3, 5):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 tbl.setItem(row, col, item)
         self._resize_self_sizing_table(tbl)
@@ -4826,6 +4988,36 @@ class WorldBrowserWindow(QDialog):
         self.player_detail_placeholder.hide()
         tbl.show()
 
+    def _player_team_expanded_years(self, player_id):
+        """[2026-09 신설, 신민용 요청: "연도(2000(26세)) 클릭하면 아래에
+        평점/연봉/이적종류가 펼쳐지고 다시 클릭하면 접히는거지"] 지금
+        펼쳐진 연도 목록을 선수별로 따로 기억해둔다(다른 선수를 봤다가
+        돌아와도 그 선수의 펼침 상태가 유지되도록 player_id로 구분) —
+        __init__을 따로 안 건드려도 되게 getattr로 지연 생성한다."""
+        if not hasattr(self, "_player_team_expanded_by_pid"):
+            self._player_team_expanded_by_pid = {}
+        return self._player_team_expanded_by_pid.setdefault(player_id, set())
+
+    def _on_player_team_year_clicked(self, row, col):
+        """[2026-09 신설] "연도" 칸(0번 열)을 클릭하면 그 행의 연도를
+        펼침/접기 토글하고 표를 다시 그린다 — 상태 전환 자체는 데이터가
+        아니라 순수 UI 상태라 _populate_player_team_box를 통째로 다시
+        불러도 (필요한 원본 데이터는 이미 다 캐싱돼 있어) 비용이 적다."""
+        if col != 0:
+            return
+        item = self._player_team_tbl_ref.item(row, 0)
+        if item is None:
+            return
+        _year = item.data(Qt.ItemDataRole.UserRole)
+        if _year is None:
+            return
+        expanded = self._player_team_expanded_years(self._player_team_tbl_pid)
+        if _year in expanded:
+            expanded.discard(_year)
+        else:
+            expanded.add(_year)
+        self._populate_player_team_box(*self._player_team_tbl_args, **self._player_team_tbl_kwargs)
+
     def _populate_player_team_box(self, player_id, tid, tname, retirement_year=None,
                                    current_age=None, final_ovr=None, current_position=None):
         """[2026-08 신설, 2026-08 수정: "순위가 아니라 이 선수가 그 해에
@@ -4843,6 +5035,15 @@ class WorldBrowserWindow(QDialog):
         tbl.setRowCount(0)
         tbl.clearSpans()
         award_tbl.clearContents()
+        # [2026-09 신설, 신민용 요청: "연도 클릭하면 펼쳐지고 다시 클릭
+        # 하면 접히는거지"] _on_player_team_year_clicked이 토글 후 이
+        # 화면을 그대로 다시 그리려면 원래 호출 인자를 기억해둬야 한다.
+        self._player_team_tbl_ref = tbl
+        self._player_team_tbl_pid = player_id
+        self._player_team_tbl_args = (player_id, tid, tname)
+        self._player_team_tbl_kwargs = dict(
+            retirement_year=retirement_year, current_age=current_age,
+            final_ovr=final_ovr, current_position=current_position)
         # [2026-08 버그수정, 신민용 리포트: "리그 우승 5회로 보이는데
         # 통산 수상엔 18회로 뜬다 — 팀 검색 데이터를 그대로 쓰는거
         # 아니냐"] 정확한 지적이었다 — 예전엔 get_team_history(tid)로
@@ -4996,6 +5197,20 @@ class WorldBrowserWindow(QDialog):
                     return seg["team_name"]
             return tname
 
+        def _is_loan_for_year(year):
+            # [2026-09 신설, 신민용 요청: "세계 축구 기록실에 이제는 임대
+            # 이적도 표시하는거지"] _team_name_for_year와 완전히 같은
+            # 구간 탐색이지만 반환값만 다르다 — 팀명 문자열 자체엔 손을
+            # 안 대야 아래 is_current 비교(player_team_name == tname)나
+            # 다른 팀명 매칭 로직이 안 깨진다.
+            if retirement_year and year > retirement_year:
+                return False
+            for seg in timeline:
+                if (seg["start_year"] is None or year >= seg["start_year"]) and \
+                   (seg["end_year"] is None or year < seg["end_year"]):
+                    return bool(seg.get("is_loan"))
+            return False
+
         # [2026-08 신설, 신민용 요청: "소속팀일 때 포지션이 뭐였는지도
         # 적어야 하는거 아니야 — 팀마다 포지션이 다르잖아, 위(상단 요약행)
         # 는 주포고 여기 아래는 세부 포지션"] _team_name_for_year와 완전히
@@ -5027,7 +5242,12 @@ class WorldBrowserWindow(QDialog):
         # 있는 경우까지 놓치지 않기 위함(현재 데이터 구조상 실제로는
         # 거의 항상 같이 있지만, 행 수 계산과 실제 렌더링 조건이 어긋나면
         # 표 행이 부족/과다해지는 사고로 이어지므로 안전하게 맞춰둔다).
-        _extra_stat_rows = sum(1 for e in years if e.get("_comp_stats"))
+        # [2026-09 확장, 신민용 요청: "연도 아래에 이적/오퍼 종류, 소속팀
+        # 아래에 연봉, 이적료도"] 대회 기록(_comp_stats)이 없어도 연봉
+        # 기록(salary)만 있는 해도 이 요약 행이 필요해졌다 — 둘 중
+        # 하나라도 있으면 그린다.
+        _extra_stat_rows = sum(1 for e in years if (e.get("_comp_stats") or e.get("salary"))
+                                and e["year"] in self._player_team_expanded_years(player_id))
         tbl.setRowCount(len(years) + _extra_stat_rows)
         # [2026-08 신설] 복사 버튼용 — 화면에 그리는 것과 완전히 같은
         # 값(그 해 나이·소속팀·OVR·retired 여부·entry 원본)을 행마다
@@ -5039,12 +5259,20 @@ class WorldBrowserWindow(QDialog):
         # 이제 years의 인덱스(i)와 더 이상 1:1이 아니다 — 요약 행이
         # 끼어들 때마다 밀리므로 별도 카운터로 추적한다.
         row_idx = 0
+        _expanded = self._player_team_expanded_years(player_id)
         for i, entry in enumerate(years):
             age = _age_at(entry["year"])
-            year_text = f"{entry['year']} ({age}세)" if age is not None else str(entry["year"])
+            # [2026-09 신설, 신민용 요청: "연도 클릭하면 아래에 평점/연봉/
+            # 이적종류가 펼쳐지고 다시 클릭하면 접히는거지"] 펼침 상태를
+            # 화살표로 표시하고, 클릭 핸들러가 이 칸에서 연도값을 다시
+            # 꺼낼 수 있게 UserRole에 원본 값을 심어둔다(문자열 파싱 대신).
+            _arrow = "▼ " if entry["year"] in _expanded else "▶ "
+            year_text = f"{_arrow}{entry['year']} ({age}세)" if age is not None else f"{_arrow}{entry['year']}"
             year_item = QTableWidgetItem(year_text)
             year_item.setForeground(QColor("#ffcc00"))
             f = year_item.font(); f.setBold(True); year_item.setFont(f)
+            year_item.setData(Qt.ItemDataRole.UserRole, entry["year"])
+            year_item.setToolTip("클릭하면 이 연도의 상세 기록(평점·연봉·이적종류)을 펼치거나 접습니다")
             tbl.setItem(row_idx, 0, year_item)
 
             # [2026-08 수정] 예전엔 여기가 팀 파워랭킹(전체/대륙 순위)
@@ -5078,8 +5306,16 @@ class WorldBrowserWindow(QDialog):
                     "소속팀 없음 (은퇴)", self._LEAGUE_COL_W, color="#666", bold=False)
             else:
                 is_current = (player_team_name == tname)
+                # [2026-09 신설, 신민용 요청: "세계 축구 기록실에 이제는
+                # 임대 이적도 표시하는거지"] is_current 비교는 반드시 원본
+                # player_team_name으로 먼저 끝내고, 화면에 그릴 문자열만
+                # 따로 만든다 — 안 그러면 "(임대)" 접미사 때문에 같은
+                # 팀인데도 is_current가 안 맞아버린다.
+                _display_name = player_team_name
+                if _is_loan_for_year(entry["year"]):
+                    _display_name = f"{player_team_name} (임대)"
                 team_cell = self._col_label(
-                    player_team_name, self._LEAGUE_COL_W,
+                    _display_name, self._LEAGUE_COL_W,
                     color="#88ddaa" if is_current else "#aaddff", bold=is_current)
             tbl.setCellWidget(row_idx, 1, team_cell)
 
@@ -5203,28 +5439,85 @@ class WorldBrowserWindow(QDialog):
             # [2026-08 신설, 신민용 요청: "44경기면 22경기로 나눠지겠지"]
             # 이 연도(또는 반기) 바로 밑에, 세로가 얇은 요약 행을 하나 더
             # 그린다.
-            # [2026-09 재작업, 신민용 요청: "리그/국내컵/클럽대항전/
-            # 슈퍼컵/클럽월드컵 다 평점·골·어시를 다르게 둬야 하는데
-            # 그게 안 되어 있다 ... 경기수는 없애줘 ... 그 | 이거 텍스트
-            # 말고 상자로 칸칸 나누라는거야"] 대회 구분 없이 표 전체를
-            # 가로지르던 텍스트 한 줄(경기수 포함) 대신, entry에 붙은
-            # _comp_stats(world_browser.get_ai_player_career_history/
-            # get_my_player_career_history가 채움 — 대회별 대회를 실제로
-            # 뛴 것만 키가 존재)를 그 대회 결과 칸(5~9번, 바로 위)과
-            # 같은 열에 상자로 하나씩 그린다. 색은 바로 위 결과 칸과
-            # 같은 색(lg_color/cup_color/cl_color/sc_color/cwc_color,
-            # 이 반복문 안에서 이미 계산해둔 값)을 그대로 재사용해 같은
-            # 대회끼리 시각적으로 이어져 보이게 한다.
+            # [2026-09 재작업, 리그/국내컵/클럽대항전/슈퍼컵/클럽월드컵
+            # 대회별 상자로 분리 — 이전 세션에서 이미 완료.]
+            # [2026-09 재작업, 신민용 요청: "연도(2000(26세)) 클릭하면
+            # 아래에 평점 박스들이 펼쳐지고, 연봉이랑 이적/임대 종류도
+            # 같이 보여줘 — 다시 클릭하면 접히게. 기록 복사엔 항상 다
+            # 포함"] 이 요약 행 자체를 그 연도가 펼쳐져 있을 때만 그린다
+            # — _extra_stat_rows(행수 사전계산)의 판정 기준과 정확히
+            # 일치해야 한다(안 그러면 표 행이 남거나 모자란다).
             _comp_stats = entry.get("_comp_stats")
-            if _comp_stats:
+            _year_expanded = entry["year"] in _expanded
+            _sal = entry.get("salary")
+            if (_comp_stats or _sal) and _year_expanded:
                 _COMP_COL_COLOR = {
                     "league": (5, lg_color), "cup": (6, cup_color), "cl": (7, cl_color),
                     "sc": (8, sc_color), "cwc": (9, cwc_color),
                 }
-                for _comp, (_col, _color) in _COMP_COL_COLOR.items():
-                    _cs = _comp_stats.get(_comp)
-                    if _cs:
-                        tbl.setCellWidget(row_idx, _col, self._comp_stat_cell(_cs, _color))
+                if _comp_stats:
+                    for _comp, (_col, _color) in _COMP_COL_COLOR.items():
+                        _cs = _comp_stats.get(_comp)
+                        if _cs:
+                            tbl.setCellWidget(row_idx, _col, self._comp_stat_cell(
+                                _cs, _color, is_gk=(player_position == "GK")))
+                # [2026-09 재작업, 신민용 요청: "연도 아래에 이적인지
+                # 오퍼인지 뜨고 소속팀 아래에 연봉 쓰고 포지션 OVR 역할
+                # 칸 하나로 합쳐서 이적이면 이적료 쓰고, 계약년도는
+                # 오퍼(년도) 이렇게"] 0번 칸(연도 자리)엔 "{종류}({계약
+                # 연도})" 라벨을, 1번 칸(소속팀 자리)엔 연봉만, 2~4번
+                # 칸(포지션/OVR/역할)은 setSpan으로 하나로 합쳐서 이적료를
+                # 보여준다. 연봉 기록 자체가 없는 해(한 번도 이적/은퇴
+                # 대체/스카우팅을 안 겪은 선수)는 이 세 칸을 아예 안
+                # 그린다(0원처럼 잘못된 값을 정확한 척 보여주지 않기
+                # 위함, 다른 "기록 없는 연도" 처리와 동일 원칙).
+                if _sal:
+                    # [2026-09 재작업, 신민용 요청: "이적 오퍼 입단 방출
+                    # 이걸로 나누는게 깔끔한데... 년도는 2016에 묶여
+                    # 있으니 보여줄 필요가 없잖아"] 내부 구분(리그내/국내
+                    # 타부수 등) 대신 4가지로 단순화하고(_simple_transfer_
+                    # label), 이미 "연도" 칸에 뜨는 연도를 여기서 또
+                    # "(2016)" 식으로 반복 표시하지 않는다.
+                    _type_label = self._simple_transfer_label(
+                        entry.get("salary_transfer_type"), entry.get("salary_is_loan"))
+                    # [2026-09 버그수정, 신민용 스크린샷 리포트: "연도 아래
+                    # 글자가 '리그...'처럼 잘린다 — 위 칸(헤더/메인 행)은
+                    # 그대로 두고"] QTableWidgetItem은 칸 너비를 넘으면
+                    # 그냥 말줄임표로 잘라버린다 — 컬럼 폭 자체를 넓히면
+                    # 요청하신 대로 "위 칸(그 열 전체, 메인 행 포함)"까지
+                    # 같이 넓어져 버리므로 그건 안 된다. 대신 같은 행의
+                    # 다른 칸들(연봉·이적료)이 이미 쓰고 있는 _two_line_
+                    # cell(QLabel 기반, setWordWrap(True))로 바꾼다 —
+                    # 칸 너비는 그대로 두고 그 안에서 텍스트만 자동으로
+                    # 두 줄로 줄바꿈되므로, 이 요약 행만 살짝 높아질 뿐
+                    # 열 폭이나 다른(메인) 행 높이는 전혀 안 바뀐다.
+                    tbl.setCellWidget(row_idx, 0, self._two_line_cell(
+                        _type_label, "#c9a6ff", None, bold=True))
+
+                    # [2026-09 수정, 신민용 요청: "계약을 언제부터 했냐가
+                    # 아니라 몇년치 했냐인건데"] "계약: 2015" (체결연도)
+                    # 가 아니라 "계약: 4년"(기간)으로 — salary_contract_
+                    # years는 world_browser.get_ai_player_career_history가
+                    # contract_end_year - 체결연도로 미리 계산해둔 값.
+                    # 유스로 합류한 경우(계약 기간을 알 방법이 없음)는
+                    # 대신 데뷔 연도를 보여준다.
+                    _cyrs = entry.get("salary_contract_years")
+                    if _cyrs:
+                        _record = f"(계약: {_cyrs}년)"
+                    elif entry.get("salary_debut_year"):
+                        _record = f"(계약년도: {entry['salary_debut_year']}년)"
+                    else:
+                        _record = None
+                    tbl.setCellWidget(row_idx, 1, self._two_line_cell(
+                        f"💰 {fmt_money(_sal)}", "#ffd166", _record))
+
+                    tbl.setSpan(row_idx, 2, 1, 3)
+                    _fee = entry.get("salary_fee") or 0
+                    _fee_text = f"🤝 이적료 {fmt_money(_fee)}" if _fee else "-"
+                    _fee_item = QTableWidgetItem(_fee_text)
+                    _fee_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    _fee_item.setForeground(QColor("#9fd4a3") if _fee else QColor("#555"))
+                    tbl.setItem(row_idx, 2, _fee_item)
                 row_idx += 1
         self._resize_self_sizing_table(tbl)
 
@@ -5413,10 +5706,18 @@ class WorldBrowserWindow(QDialog):
         # [2026-08 신설, 신민용 요청] 연도와 대회 사이에 '순위'(그 해
         # 파워랭킹) 컬럼 추가 — 같은 연도에 기록이 여러 줄 있어도(예:
         # 2000년에 월드컵+지역컵 둘 다) 전부 같은 2000년 순위가 표시된다.
-        self.country_detail_tbl = QTableWidget(0, 6)
+        self.country_detail_tbl = _SmoothScrollTableWidget(0, 6)
         self.country_detail_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.country_detail_tbl.verticalHeader().setVisible(False)
         self.country_detail_tbl.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        # [2026-09 신설, 위 team_detail_tbl과 같은 이유 — 신민용 리포트:
+        # "국가 검색이든 팀 검색이든 세부 창이 떴을 때 휠로 움직이면 너무
+        # 확 움직여서 불편해"] 연도 행을 클릭하면 그 아래 대회 상세(조
+        # 순위표·경기 결과 등, 스크린샷의 초록 박스)가 그 행에 통째로
+        # 펼쳐져 행 높이가 들쭉날쭉해진다 — 기본 행단위 스크롤(ScrollPerItem)
+        # 이면 그 큰 행을 한 휠질에 훌쩍 건너뛰어 버벅이듯 느껴진다.
+        self.country_detail_tbl.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.country_detail_tbl.verticalScrollBar().setSingleStep(24)
         self.country_detail_tbl.setHorizontalHeaderLabels(["연도", "순위", "대회", "종류", "결과", "상세기록"])
         self.country_detail_tbl.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.ResizeToContents)
@@ -6092,7 +6393,8 @@ class WorldBrowserWindow(QDialog):
                 _summary_years = {_year_int}
                 summary_copy_btn.clicked.connect(
                     lambda: self._copy_squad_player_records(
-                        _ids, summary_copy_btn, "📋 요약 복사", target_years=_summary_years))
+                        _ids, summary_copy_btn, "📋 요약 복사", target_years=_summary_years,
+                        include_stats=False))
                 header_row.addWidget(summary_copy_btn)
         lay.addLayout(header_row)
 
@@ -6169,7 +6471,8 @@ class WorldBrowserWindow(QDialog):
             return
         self.open_to_player(pid)
 
-    def _copy_squad_player_records(self, ids, btn, reset_label="📋 스쿼드 기록 복사", target_years=None):
+    def _copy_squad_player_records(self, ids, btn, reset_label="📋 스쿼드 기록 복사", target_years=None,
+                                    include_stats=True):
         """[2026-08 신설, 신민용 요청: "이 대회명 써진 줄 우측에 복사하기
         버튼을 놔줘 — 여기 들어간 선수들의 선수 기록을 한꺼번에 복사하는
         용도"] ui/formation_widget.py의 _on_copy_squad_clicked와 완전히
@@ -6194,7 +6497,19 @@ class WorldBrowserWindow(QDialog):
         집합)를 넘기면 rows(연도별 기록)·intl_records(국가대표 기록)를
         그 연도에 속한 항목만 남기고 걸러서 넘긴다 — 기본 정보 한 줄과
         "소속팀 기준 통산 수상"(원래도 연도 무관한 커리어 총합) 줄은
-        그대로 둔다. None이면(기본값) 기존처럼 전체 연도를 다 넣는다."""
+        그대로 둔다. None이면(기본값) 기존처럼 전체 연도를 다 넣는다.
+
+        [2026-09 버그수정, 신민용 리포트: "주전 기록 복사/스쿼드 기록
+        복사/요약 복사 할 때 그 연도 아래 뜨는 리그 기록이랑 연봉/계약이
+        같이 복사가 안 된다"] 원인: 이 함수가 _format_player_history_text를
+        include_stats 인자 없이(=기본값 False) 호출하고 있어서, 단일 선수
+        화면의 "기록 복사" 버튼(include_stats=True — 대회별 평점/골/어시
+        +연봉/계약기간/이적료까지 포함)과 달리 "요약 복사"(include_stats=
+        False) 수준으로만 나갔다. "주전 기록 복사"/"스쿼드 기록 복사"는
+        이름 그대로 단일 선수의 "기록 복사"와 같은 상세 수준이어야 하므로
+        include_stats 기본값을 True로 바꿨다 — 이름이 "요약 복사"인
+        버튼만 호출부에서 명시적으로 False를 넘긴다(아래 두 호출부
+        참고)."""
         ids = [i for i in dict.fromkeys(ids) if i is not None]
         if not ids:
             return
@@ -6217,7 +6532,7 @@ class WorldBrowserWindow(QDialog):
                     rows = [r for r in rows if r.get("year") in target_years]
                     intl_records = [r for r in intl_records if r.get("year") in target_years]
                 texts.append(harvester._format_player_history_text(
-                    name, d, team_hist, rows, intl_records))
+                    name, d, team_hist, rows, intl_records, include_stats=include_stats))
         finally:
             harvester.deleteLater()
         if not texts:
@@ -6474,37 +6789,166 @@ class WorldBrowserWindow(QDialog):
         dlg.show()
 
     # ─────────────────────────────────────────
-    # 탭3: 역대 챔피언스리그
+    # 탭3: 역대 클럽 대항전 (챔피언스/유로파/컨퍼런스 통합)
     # ─────────────────────────────────────────
-    def _build_cl_tab(self):
-        return self._build_cl_style_tab(
-            tbl_attr="cl_tbl", combo_attr="cl_cont_combo",
-            history_fn=wb.get_cl_history, detail_fn=wb.get_cl_tournament_detail,
-            winner_color=Qt.GlobalColor.yellow,
-            rank_fn=wb.get_cl_style_rank_leaders, tab_title="챔피언스리그")
+    # [2026-09 신설, 신민용 요청: "챔스/유로파/컨퍼런스를 '클럽 대항전'
+    # 탭 하나로 묶고, 그 안에서 필터 옆 토글 버튼으로 전환하는 게 UI적으로
+    # 낫다"] 예전엔 _build_cl_tab/_build_el_tab/_build_ecl_tab 3개의
+    # 독립 탭이 있었다 — 셋 다 데이터 소스(history_fn/detail_fn/rank_fn)
+    # 만 다를 뿐 완전히 같은 화면(_build_cl_style_tab)을 재사용하던
+    # 구조라, 탭 자체를 하나로 합치고 대회 선택을 그 탭 안의 토글
+    # 버튼으로 옮겼다. 우승 강조색은 기존과 동일하게 셋 다 노란색
+    # (Qt.GlobalColor.yellow)으로 통일.
+    def _club_tab_specs(self):
+        """(내부 키, 토글 버튼 라벨, 최다순위 팝업 제목, 역대 기록
+        조회 함수, 대회 상세 조회 함수, 최다순위 집계 함수) 튜플 목록.
+        토글 버튼은 이 순서(챔피언스→유로파→컨퍼런스) 그대로 배치되고,
+        기본 선택값은 첫 번째 항목(챔피언스)이다."""
+        return [
+            ("cl",  "챔피언스",  "챔피언스리그",
+             wb.get_cl_history,  wb.get_cl_tournament_detail,  wb.get_cl_style_rank_leaders),
+            ("el",  "유로파",    "유로파리그",
+             wb.get_el_history,  wb.get_el_tournament_detail,  wb.get_el_rank_leaders),
+            ("ecl", "컨퍼런스",  "컨퍼런스리그",
+             wb.get_ecl_history, wb.get_ecl_tournament_detail, wb.get_ecl_rank_leaders),
+        ]
 
-    def _build_el_tab(self):
-        """[2026-08 신설] 역대 유로파리그 — 챔스와 완전히 같은 화면을
-        재사용, 데이터 소스(el_*)만 다르다.
-        [2026-08 수정, 신민용 리포트: "슈퍼컵/컨퍼런스/유로파는 1등이
-        다른 색이라 잘 안 보인다 — 월드컵/챔스처럼 노란색으로 통일해달라"]
-        winner_color를 대회 고유색(주황) 대신 CL/월드컵/클럽월드컵과
-        똑같은 Qt.GlobalColor.yellow로 통일."""
-        return self._build_cl_style_tab(
-            tbl_attr="el_tbl", combo_attr="el_cont_combo",
-            history_fn=wb.get_el_history, detail_fn=wb.get_el_tournament_detail,
-            winner_color=Qt.GlobalColor.yellow,
-            rank_fn=wb.get_el_rank_leaders, tab_title="유로파리그")
+    def _build_club_tab(self):
+        """대륙 필터 옆에 [챔피언스][유로파][컨퍼런스] 배타적 토글 버튼
+        (QButtonGroup)을 두고, 표/최다순위/더블클릭 상세를 전부 현재
+        선택된 대회 기준으로 갈아끼운다. 버튼 스타일은 "선수 검색" 탭의
+        현역/은퇴 토글(_STATUS_BTN_STYLE)과 동일한 색 언어를 쓴다."""
+        specs = self._club_tab_specs()
+        self._club_specs_by_key = {key: spec for key, *spec in specs}
+        self._club_comp = specs[0][0]   # 기본값: 챔피언스
 
-    def _build_ecl_tab(self):
-        """[2026-08 신설] 역대 컨퍼런스리그 — 위와 동일 패턴.
-        [2026-08 수정, 신민용 리포트: 위 _build_el_tab과 동일] 우승 강조색을
-        노란색으로 통일."""
-        return self._build_cl_style_tab(
-            tbl_attr="ecl_tbl", combo_attr="ecl_cont_combo",
-            history_fn=wb.get_ecl_history, detail_fn=wb.get_ecl_tournament_detail,
-            winner_color=Qt.GlobalColor.yellow,
-            rank_fn=wb.get_ecl_rank_leaders, tab_title="컨퍼런스리그")
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 8, 0, 0)
+
+        filt = QHBoxLayout()
+        lbl = QLabel("대륙"); lbl.setStyleSheet("color:#888;font-size:11px;")
+        combo = QComboBox()
+        for cont in [_ALL, "유럽", "아시아", "아프리카", "남미", "북미"]:
+            combo.addItem(cont)
+        combo.setCurrentText(RECORD_FILTER_DEFAULT)
+        self.club_cont_combo = combo
+        combo.currentTextChanged.connect(lambda *_a: self._refresh_club_table())
+        filt.addWidget(lbl)
+        filt.addWidget(combo)
+
+        filt.addSpacing(10)
+        comp_lbl = QLabel("대회"); comp_lbl.setStyleSheet("color:#888;font-size:11px;")
+        filt.addWidget(comp_lbl)
+        _COMP_TOGGLE_STYLE = (
+            "QPushButton{background:#2a2a2a;color:#888;border:1px solid #3a3a3a;"
+            "border-radius:4px;padding:4px 10px;font-size:11px;}"
+            "QPushButton:checked{background:#0d3d1a;color:#00cc44;border-color:#00cc44;}")
+        comp_group = QButtonGroup(w)
+        comp_group.setExclusive(True)
+        self._club_comp_buttons = {}
+        for key, label, *_rest in specs:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setAutoDefault(False)
+            btn.setDefault(False)
+            btn.setStyleSheet(_COMP_TOGGLE_STYLE)
+            btn.clicked.connect(lambda _checked, k=key: self._on_club_comp_changed(k))
+            comp_group.addButton(btn)
+            filt.addWidget(btn)
+            self._club_comp_buttons[key] = btn
+        self._club_comp_buttons[self._club_comp].setChecked(True)
+        self._club_comp_group = comp_group  # GC 방지용 참조 보관
+
+        filt.addStretch()
+        rank_btn = QPushButton("🥇 최다 순위")
+        rank_btn.setAutoDefault(False)
+        rank_btn.clicked.connect(self._on_club_tab_rank_clicked)
+        filt.addWidget(rank_btn)
+        lay.addLayout(filt)
+
+        tbl = QTableWidget(0, 0)
+        tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        tbl.verticalHeader().setVisible(False)
+        tbl.cellDoubleClicked.connect(self._open_club_tab_detail)
+        _enable_plain_copy(tbl)
+        self.club_tbl = tbl
+        lay.addWidget(tbl)
+        hint = QLabel("💡 대회를 더블클릭하면 리그 스테이지·토너먼트 상세를 볼 수 있어요")
+        hint.setStyleSheet("color:#666;font-size:10px;")
+        lay.addWidget(hint)
+
+        self._refresh_club_table()
+        return w
+
+    def _on_club_comp_changed(self, key):
+        """토글 버튼 클릭 — 선택된 대회를 바꾸고 표를 그 대회 기준으로
+        다시 채운다. 대륙 필터 선택은 대회를 바꿔도 그대로 유지된다."""
+        if key == self._club_comp:
+            return
+        self._club_comp = key
+        self._refresh_club_table()
+
+    def _refresh_club_table(self):
+        combo = self.club_cont_combo
+        tbl = self.club_tbl
+        cont = None if combo.currentText() == _ALL else combo.currentText()
+        _label, _title, history_fn, _detail_fn, _rank_fn = self._club_specs_by_key[self._club_comp]
+        rows = history_fn(continent=cont)
+        winner_color = Qt.GlobalColor.yellow
+        cols = ["연도", "대회", "🥇 우승", "🥈 준우승", "🥉 3위", "4위"]
+        tbl.clear()
+        tbl.setRowCount(len(rows))
+        tbl.setColumnCount(len(cols))
+        tbl.setHorizontalHeaderLabels(cols)
+        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+
+        def _fmt_team(r, key):
+            name = r.get(f"{key}_name") or ""
+            if not name:
+                return "-", None
+            flag = r.get(f"{key}_flag") or ""
+            country = r.get(f"{key}_country") or ""
+            base = f"{flag} {name}".strip()
+            return (f"{base} ({country})" if country else base), name
+
+        for i, r in enumerate(rows):
+            winner = _fmt_team(r, "winner")
+            runner_up = _fmt_team(r, "runner_up")
+            third = _fmt_team(r, "third")
+            fourth = _fmt_team(r, "fourth")
+            vals = [str(r["year"]), r["name"], winner[0], runner_up[0], third[0], fourth[0]]
+            clean_vals = [None, None, winner[1], runner_up[1], third[1], fourth[1]]
+            for j, v in enumerate(vals):
+                cell = QTableWidgetItem(v)
+                cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if clean_vals[j] and clean_vals[j] != v:
+                    cell.setData(_CLEAN_TEXT_ROLE, clean_vals[j])
+                if j == 2:
+                    cell.setForeground(winner_color)
+                if j == 0:
+                    cell.setData(Qt.ItemDataRole.UserRole, r["id"])
+                tbl.setItem(i, j, cell)
+        self._show_empty_state(tbl, rows, "아직 완료된 대회가 없습니다", len(cols))
+        self._grow_to_fit(tbl, stretch_col=1)
+
+    def _open_club_tab_detail(self, row, _col):
+        tbl = self.club_tbl
+        item = tbl.item(row, 0)
+        tid = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if tid is None:
+            return
+        _label, _title, _history_fn, detail_fn, _rank_fn = self._club_specs_by_key[self._club_comp]
+        name_item = tbl.item(row, 1)
+        title = f"{item.text()} {name_item.text() if name_item else ''}"
+        detail = detail_fn(tid)
+        dlg = TournamentDetailDialog(title, detail, team_based=True, parent=self)
+        dlg.exec()
+
+    def _on_club_tab_rank_clicked(self):
+        _label, tab_title, _history_fn, _detail_fn, rank_fn = self._club_specs_by_key[self._club_comp]
+        self._open_cl_style_rank_dialog(tab_title, rank_fn, RANKING_FILTER_DEFAULT)
 
     def _build_sc_tab(self):
         """[2026-08 신설, 10순위/11순위] 역대 슈퍼컵 — 위와 동일 패턴.
@@ -6542,7 +6986,7 @@ class WorldBrowserWindow(QDialog):
         filt = QHBoxLayout()
         lbl = QLabel("대륙"); lbl.setStyleSheet("color:#888;font-size:11px;")
         combo = QComboBox()
-        for cont in [_ALL, "유럽", "아시아", "아프리카", "북남미"]:
+        for cont in [_ALL, "유럽", "아시아", "아프리카", "남미", "북미"]:
             combo.addItem(cont)
         combo.setCurrentText(RECORD_FILTER_DEFAULT)
         setattr(self, combo_attr, combo)
@@ -6610,7 +7054,7 @@ class WorldBrowserWindow(QDialog):
         제외)을 같이 붙인다 — 클릭하면 이 팝업을 닫고 그 대회의 팝업을
         새로 연다."""
         options = [(_ALL, None), ("유럽", "유럽"), ("아시아", "아시아"),
-                   ("아프리카", "아프리카"), ("북남미", "북남미")]
+                   ("아프리카", "아프리카"), ("남미", "남미"), ("북미", "북미")]
         nav_buttons = []
         for label, other_title, other_fn, other_keys, other_labels in self._cl_style_rank_specs():
             if other_title == tab_title:
@@ -6823,7 +7267,9 @@ class WorldBrowserWindow(QDialog):
         lay = QVBoxLayout(w)
         lay.setContentsMargins(0, 8, 0, 0)
 
-        info = QLabel("ℹ️ 대회 발생 연도(4년 주기)가 되면 4개 대륙 전부 자동 생성됩니다.")
+        info = QLabel("ℹ️ 대회 발생 연도(4년 주기)가 되면 4개 대륙(유럽/아메리카(남북미 통합)/"
+                       "아시아/아프리카) 전부 자동 생성됩니다. 유로(EURO)는 지역컵과 같은 해에 "
+                       "별도로 열려요. (골드컵은 이 탭이 아니라 '역대 지역컵' 탭에서 볼 수 있어요)")
         info.setStyleSheet("color:#888;font-size:11px;")
         lay.addWidget(info)
 
@@ -6900,7 +7346,9 @@ class WorldBrowserWindow(QDialog):
         self._region_selected_name = None
 
         info = QLabel("ℹ️ 월드컵/대륙컵/클럽월드컵 어느 것과도 겹치지 않는 해(4년 주기)에 "
-                       "9개 지역(아시아 4·아프리카 3·북중미 2)에서 자동으로 열립니다.")
+                       "13개 지역(아시아 5·아프리카 5·남미 1·북미 1·오세아니아 1)에서 자동으로 "
+                       "열립니다. 북미(옛 UNCAF/카리브 통합, 골드컵)만 예외적으로 여름에 실제 "
+                       "예선을 거쳐 24개국이 본선에 올라요.")
         info.setStyleSheet("color:#888;font-size:11px;")
         info.setWordWrap(True)
         lay.addWidget(info)
@@ -6909,7 +7357,7 @@ class WorldBrowserWindow(QDialog):
         lbl = QLabel("대륙"); lbl.setStyleSheet("color:#888;font-size:11px;")
         self.region_cont_combo = QComboBox()
         self.region_cont_combo.addItem(_ALL)
-        for cont in ["아시아", "아프리카", "북중미", "남미", "오세아니아"]:
+        for cont in ["아시아", "아프리카", "남미", "북미", "오세아니아"]:
             self.region_cont_combo.addItem(cont)
         # [2026-08 되돌림, 신민용 리포트: "나라끼리 붙는 국제대회는 이 탭
         # 필터 기본값이 전체가 맞다 — 코파를 기본으로 하고 싶었던 건

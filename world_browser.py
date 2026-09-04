@@ -975,6 +975,44 @@ def get_ai_player_detail(player_id):
     return d
 
 
+def get_ai_player_salary_history(player_id):
+    """[2026-09 신설, 신민용 요청: "이적이면 연봉이 써지는거고... 4년
+    계약이면 2000~2003년까진 같은 거니 2000년만 기록하면 되는거니"]
+    연봉은 계약이 갱신되는 시점(이적/은퇴대체영입/스카우팅/임대복귀)에만
+    바뀌므로, get_ai_player_team_timeline과 완전히 같은 원리로 "그 연도
+    이전 가장 최근 기록"을 찾아 쓴다 — 매년 스냅샷을 쌓아둘 필요가 없다.
+    ai_transfer_log(salary가 0보다 큰 행만 — fee/is_loan만 있고 salary가
+    안 채워진 옛 로그나 예외 상황은 제외)를 반환한다.
+
+    [2026-09 버그수정, 구현 직후 헤드리스 검증 중 자체 발견: "같은 해에
+    이적이 두 번 있으면 어느 게 최신인지 순서가 안 맞을 수 있다"]
+    get_ai_player_team_timeline의 _eff_year와 똑같은 문제 — year 컬럼은
+    겨울 이적시장(is_mid_season=1)은 실제로 일어난 해를 그대로 찍지만,
+    연간 오프시즌 이적(is_mid_season=0)은 "그 시즌이 막 끝난 해"를 찍어서
+    실제 새 팀 합류는 항상 그 다음 해부터다 — 이 보정(effective year) 없이
+    year만으로 정렬하면 오프시즌 이적이 실제로 더 나중인데도 같은 해의
+    겨울 이적보다 먼저인 것처럼 뒤섞일 수 있었다. 여기서도 똑같이
+    effective year로 정렬해서 get_ai_player_team_timeline과 항상 같은
+    순서가 나오게 맞춘다.
+    반환: [(effective_year, salary, transfer_type, is_loan, fee, contract_end_year), ...] 오름차순."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT year, is_mid_season, salary, transfer_type, is_loan, fee, contract_end_year "
+        "FROM ai_transfer_log "
+        "WHERE player_id=? AND salary>0 "
+        "UNION ALL "
+        "SELECT year, is_mid_season, salary, transfer_type, is_loan, fee, contract_end_year "
+        "FROM ai_transfer_log_archive "
+        "WHERE player_id=? AND salary>0", (player_id, player_id)).fetchall()
+    conn.close()
+    out = [(r["year"] if r["is_mid_season"] else r["year"] + 1,
+            r["salary"], r["transfer_type"], bool(r["is_loan"]), r["fee"],
+            r["contract_end_year"], r["is_mid_season"])
+           for r in rows]
+    out.sort(key=lambda t: (t[0], t[6]))
+    return [(y, s, tt, il, fe, ce) for (y, s, tt, il, fe, ce, _ms) in out]
+
+
 def get_ai_player_team_timeline(player_id, current_team_id):
     """[2026-08 신설, 신민용 요청: "소속팀 대회 기록 박스에서 순위가
     아니라 이 선수가 그 해에 실제로 어느 팀 소속이었는지 나와야 한다"]
@@ -1003,17 +1041,18 @@ def get_ai_player_team_timeline(player_id, current_team_id):
     # 보면 최근 5시즌 안에 이적하지 않은 선수(사실상 은퇴자 전원)는
     # "이적을 한 번도 안 한 선수"로 오판된다.
     rows = conn.execute(
-        "SELECT year, from_team_id, to_team_id, player_position, is_mid_season FROM ai_transfer_log "
+        "SELECT year, from_team_id, to_team_id, player_position, is_mid_season, is_loan FROM ai_transfer_log "
         "WHERE player_id=? "
         "UNION ALL "
-        "SELECT year, from_team_id, to_team_id, player_position, is_mid_season FROM ai_transfer_log_archive "
+        "SELECT year, from_team_id, to_team_id, player_position, is_mid_season, is_loan FROM ai_transfer_log_archive "
         "WHERE player_id=? "
         "ORDER BY year ASC, is_mid_season DESC", (player_id, player_id)).fetchall()
     if not rows:
         name_row = conn.execute("SELECT name FROM teams WHERE id=?", (current_team_id,)).fetchone()
         conn.close()
         return [{"start_year": None, "end_year": None, "team_id": current_team_id,
-                 "team_name": name_row["name"] if name_row else "?", "position": None}]
+                 "team_name": name_row["name"] if name_row else "?", "position": None,
+                 "is_loan": False}]
     team_ids = {r["from_team_id"] for r in rows} | {r["to_team_id"] for r in rows}
     if current_team_id:
         team_ids.add(current_team_id)
@@ -1045,13 +1084,14 @@ def get_ai_player_team_timeline(player_id, current_team_id):
     segments = [{"start_year": None, "end_year": _eff_year(rows[0]),
                  "team_id": rows[0]["from_team_id"],
                  "team_name": name_by_tid.get(rows[0]["from_team_id"], "?"),
-                 "position": rows[0]["player_position"] or None}]
+                 "position": rows[0]["player_position"] or None, "is_loan": False}]
     for i, r in enumerate(rows):
         end = _eff_year(rows[i + 1]) if i + 1 < len(rows) else None
         segments.append({"start_year": _eff_year(r), "end_year": end,
                           "team_id": r["to_team_id"],
                           "team_name": name_by_tid.get(r["to_team_id"], "?"),
-                          "position": r["player_position"] or None})
+                          "position": r["player_position"] or None,
+                          "is_loan": bool(r["is_loan"])})
     return segments
 
 
@@ -1172,9 +1212,136 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
         for entry in team_hist["years"]:
             y = entry["year"]
             if seg_start <= y < seg_end:
-                merged_by_year[y] = entry
+                # [2026-09 신설, 신민용 요청: "세계 축구 기록실에 이제는
+                # 임대 이적도 표시하는거지"] entry는 _hist_for가 캐싱해둔
+                # 팀 통산 기록 dict를 그대로 참조하므로, 여기서 직접
+                # 수정하면 다른 선수/다른 구간이 같은 팀을 참조할 때도
+                # 값이 오염된다 — 얕은 복사본에만 is_loan을 얹는다.
+                # [2026-09 신설] _team_id_for_salary도 같이 얹는다 — 아래
+                # 연봉 즉석추정(_applicable이 비는 연도)이 "이 해에 실제로
+                # 뛴 팀"을 알아야 그 팀 등급/tier로 계산할 수 있는데,
+                # entry 자체(팀 통산 기록)엔 team_id가 없을 수 있어
+                # 이 시점에 확실히 아는 seg["team_id"]를 별도로 심어둔다.
+                merged_by_year[y] = dict(entry, is_loan=seg.get("is_loan", False),
+                                          _team_id_for_salary=seg["team_id"])
 
     out = [merged_by_year[y] for y in sorted(merged_by_year.keys(), reverse=True)]
+
+    # [2026-09 신설, 신민용 요청: "그 연도 클릭하면 아래에 연봉이랑
+    # 이적인지 임대인지도 뜨게"] "그 연도 이전 가장 최근 기록"을 찾아
+    # 연봉/이적종류를 붙인다 — get_ai_player_salary_history 정의부 주석
+    # 참고(계약 갱신 시점에만 바뀌므로 매년 스냅샷이 아니다).
+    #
+    # [2026-09 버그수정, 신민용 스크린샷+기록복사 리포트: "선수가 생겨났을
+    # 때(임대 등 초기 커리어) 평점은 있는데 연봉/계약은 빠져있다"] 예전엔
+    # "이 선수 커리어 전체에 salary 로그가 하나도 없을 때만" 현재 팀
+    # 기준으로 즉석 추정했다 — 그런데 이후에라도 단 한 번이라도 salary가
+    # 로그된 이적을 겪은 선수는(현재는 흔함) _salary_hist가 통째로
+    # "비어있지 않음" 판정을 받아 이 폴백 자체가 아예 꺼져버렸다. 그 결과
+    # "그 선수의 가장 이른 로그보다 더 과거"인 연도(임대 등 초기 커리어)는
+    # _applicable이 그 해만 비어도 조용히 연봉 줄이 빠졌다 — 선수 단위가
+    # 아니라 "이 연도" 단위로 판단해야 했다. 이제 연도(e)마다 개별적으로
+    # _applicable이 비면(=이 연도 이전에 로그된 계약이 하나도 없음) 그
+    # 자리에서 "그 해 실제 소속팀 등급/tier + 그 해 OVR"로 즉석 추정한다
+    # (DB에 쓰지 않고 표시에만 쓰는 값이라 안전 — 위 최초스쿼드 폴백과
+    # 같은 원칙, 적용 범위만 "선수 전체"에서 "그 연도"로 좁혔다).
+    _salary_hist = get_ai_player_salary_history(player_id)
+
+    # 연도별 OVR 조회(그 해 즉석추정에 그 해 실제 OVR을 쓰기 위함) — 한
+    # 번만 조회해 캐싱, 없는 연도는 아래에서 현재 OVR로 대신한다.
+    conn_ovrh = get_conn()
+    _ovr_by_year = {r["year"]: r["ovr"] for r in conn_ovrh.execute(
+        "SELECT year, ovr FROM hist.ai_player_ovr_history WHERE player_id=?",
+        (player_id,)).fetchall()}
+    _cur_row = conn_ovrh.execute(
+        "SELECT ovr, created_year FROM ai_players WHERE id=?", (player_id,)).fetchone()
+    conn_ovrh.close()
+    _cur_ovr_fallback = (_cur_row["ovr"] if _cur_row else None) or None
+
+    _team_grade_cache: dict = {}
+
+    def _est_salary_for(team_id_, ovr_):
+        """team_id_ 시점 소속팀 등급/tier + ovr_로 economy._calc_salary 즉석
+        계산 — DB 저장 없이 표시 전용(안전, world 생성 타이밍과 무관)."""
+        if not team_id_ or not ovr_:
+            return 0
+        if team_id_ not in _team_grade_cache:
+            conn_t = get_conn()
+            _team_grade_cache[team_id_] = conn_t.execute(
+                """SELECT t.name AS tname, t.current_tier AS tier, cn.name AS cname
+                   FROM teams t JOIN leagues l ON t.league_id=l.id
+                   JOIN countries cn ON l.country_id=cn.id WHERE t.id=?""",
+                (team_id_,)).fetchone()
+            conn_t.close()
+        _trow = _team_grade_cache[team_id_]
+        if not _trow:
+            return 0
+        from constants import get_country_league_grade
+        from economy import _calc_salary
+        _grade = get_country_league_grade(_trow["cname"])
+        try:
+            return _calc_salary(_grade, _trow["tier"], ovr_,
+                                 country=_trow["cname"], team_name=_trow["tname"])
+        except Exception:
+            return 0
+
+    # [2026-09 수정, 신민용 리포트: "왜 다 원래대로 돌려뒀어 — (데뷔:N년)
+    # 아니라 (계약년도)로 하고 '추정' 말고 이적/입단으로 표시하라고
+    # 했잖아"] 예전(오늘 이전) "유스" 라벨을 이번 수정에서 통합하며 실수로
+    # "추정"이라는 새 라벨로 뭉뚱그려버렸다 — 원래 요청은 로그가 없는
+    # 구간도 실제 로그 데이터처럼 "이적"/"입단"으로 자연스럽게 보이고,
+    # 괄호 안은 "데뷔"가 아니라 "계약년도"여야 한다는 것. 로그가 없는
+    # "구간"(같은 팀에서 로그 없이 이어지는 연속된 해들)을 통째로 찾아
+    # 그 구간이 "언제 시작됐는지"(직전 해에 다른 팀 소속이었으면 그 해가
+    # 시작점="이적", 그보다 이전 기록 자체가 없으면="입단") 딱 한 번만
+    # 판정해서, 그 구간 안의 모든 해에 똑같이 적용한다 — 실제 로그
+    # 데이터도 한 번의 이적 이벤트가 여러 해에 걸쳐 똑같은 라벨로
+    # 반복 표시되는 것과 동일한 원칙(위 _applicable 분기 참고).
+    _year_to_team = {e["year"]: e.get("_team_id_for_salary") for e in out}
+
+    def _fallback_span_info(y, team_id_):
+        span_start = y
+        while _year_to_team.get(span_start - 1) == team_id_:
+            span_start -= 1
+        prev_team = _year_to_team.get(span_start - 1)
+        label = "이적" if (prev_team and prev_team != team_id_) else "입단"
+        return span_start, label
+
+    for e in out:
+        _y = e["year"]
+        _applicable = [h for h in _salary_hist if h[0] <= _y]
+        if _applicable:
+            _latest = _applicable[-1]  # _salary_hist가 연도 오름차순이라 마지막이 최신
+            e["salary"] = _latest[1]
+            e["salary_transfer_type"] = _latest[2]
+            e["salary_is_loan"] = _latest[3]
+            e["salary_fee"] = _latest[4]
+            _cend = _latest[5]
+            # [2026-09 수정, 신민용 요청: "계약을 언제부터 했냐가 아니라
+            # 몇년치 했냐인건데"] 계약 "체결 연도"가 아니라 "기간"(몇
+            # 년짜리 계약)을 보여줘야 한다 — contract_end_year(그 시점에
+            # 함께 기록해둔 만료 연도)에서 체결 연도(_latest[0])를 뺀
+            # 값을 기간으로 넘긴다. contract_end_year 자체가 없는(이
+            # 기능 신설 이전) 옛 기록은 기간을 알 수 없으니 None.
+            e["salary_contract_years"] = (_cend - _latest[0]) if _cend else None
+        else:
+            # [2026-09 재수정] 이 연도 이전엔 로그된 계약이 하나도 없다 —
+            # 그 해 실제 소속팀(_team_id_for_salary)·그 해 OVR(없으면
+            # 현재 OVR)로 즉석 추정하되, 라벨은 위 _fallback_span_info로
+            # "이적"/"입단" 중 하나로 자연스럽게 표시한다(계약 기간은
+            # 알 수 없으므로 salary_contract_years는 그대로 None — UI가
+            # 이 경우 salary_debut_year를 "계약년도"로 대신 표시).
+            _team_id_y = e.get("_team_id_for_salary")
+            _ovr_y = _ovr_by_year.get(_y) or _cur_ovr_fallback
+            _est = _est_salary_for(_team_id_y, _ovr_y)
+            if _est:
+                _span_start, _label = _fallback_span_info(_y, _team_id_y)
+                e["salary"] = _est
+                e["salary_transfer_type"] = _label
+                e["salary_is_loan"] = bool(e.get("is_loan"))
+                e["salary_fee"] = 0
+                e["salary_contract_years"] = None
+                e["salary_debut_year"] = _span_start
 
     # [2026-08 신설, 신민용 요청: "연도별 기록 밑에 평균 평점/골/도움
     # 요약을 얇은 행으로 하나 더 보여달라"] ai_lifecycle._snapshot_season_
@@ -1199,7 +1366,10 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
             e["_stat_assists"] = srow["assists"]
             e["_stat_rating"] = srow["rating"]
             comp_stats["league"] = {"matches": srow["matches"], "goals": srow["goals"],
-                                     "assists": srow["assists"], "rating": srow["rating"]}
+                                     "assists": srow["assists"], "rating": srow["rating"],
+                                     "clean_sheets": srow.get("clean_sheets"),
+                                     "saves": srow.get("saves"),
+                                     "goals_conceded": srow.get("goals_conceded")}
         comp_stats.update(comp_by_year.get(e["year"], {}))
         if comp_stats:
             e["_comp_stats"] = comp_stats
@@ -1356,13 +1526,14 @@ def get_ai_player_season_stats(player_id):
     호출부가 "-"로 대체 표시해야 한다."""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT year, team_id, matches, goals, assists, rating "
+        "SELECT year, team_id, matches, goals, assists, rating, clean_sheets, saves, goals_conceded "
         "FROM hist.ai_player_season_stats WHERE player_id=? ORDER BY year ASC",
         (player_id,)).fetchall()
     conn.close()
     return {r["year"]: {"team_id": r["team_id"], "matches": r["matches"],
                          "goals": r["goals"], "assists": r["assists"],
-                         "rating": r["rating"]} for r in rows}
+                         "rating": r["rating"], "clean_sheets": r["clean_sheets"],
+                         "saves": r["saves"], "goals_conceded": r["goals_conceded"]} for r in rows}
 
 
 def get_ai_player_season_stats_by_comp(player_id):
@@ -1370,11 +1541,12 @@ def get_ai_player_season_stats_by_comp(player_id):
     월드컵 다 평점·골·어시를 다르게 둬야 한다"] get_ai_player_season_
     stats(리그 전용)의 대회별 버전 — ai_lifecycle._snapshot_season_ratings가
     같이 archive해둔 hist.ai_player_season_stats_by_comp를 그대로 읽는다.
-    반환: {year: {competition: {"matches","goals","assists","rating"}}},
-    competition은 'cup'/'cl'/'sc'/'cwc' 중 그 해 실제로 데이터가 있는 것만."""
+    반환: {year: {competition: {"matches","goals","assists","rating","clean_sheets",
+    "saves","goals_conceded"}}}, competition은 'cup'/'cl'/'sc'/'cwc' 중
+    그 해 실제로 데이터가 있는 것만."""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT year, competition, matches, goals, assists, rating "
+        "SELECT year, competition, matches, goals, assists, rating, clean_sheets, saves, goals_conceded "
         "FROM hist.ai_player_season_stats_by_comp WHERE player_id=? ORDER BY year ASC",
         (player_id,)).fetchall()
     conn.close()
@@ -1382,7 +1554,9 @@ def get_ai_player_season_stats_by_comp(player_id):
     for r in rows:
         out.setdefault(r["year"], {})[r["competition"]] = {
             "matches": r["matches"], "goals": r["goals"],
-            "assists": r["assists"], "rating": r["rating"]}
+            "assists": r["assists"], "rating": r["rating"],
+            "clean_sheets": r["clean_sheets"],
+            "saves": r["saves"], "goals_conceded": r["goals_conceded"]}
     return out
 
 
@@ -3172,6 +3346,9 @@ def get_country_tournament_results(country_name, limit=200):
     # 같은 성격(결승 없이 '본선 진출 여부'만 의미 있음)인데 이 특수 처리가
     # wc_qual만 잡고 있었다 — qual_results(kind='continent')로 통과 여부를
     # 확인하는 동일한 로직을 cont_qual에도 적용한다.
+    # [2026-09 정정] 골드컵(북미) 예선도 cont_qual이지만, 그 결과는
+    # intl_engine._save_qual_results에서 kind='region'으로 저장된다
+    # (골드컵이 대륙컵이 아니라 지역컵 티어 소속이라서) — 조회도 맞춰준다.
     cont_qual_tids = [t["id"] for t in tours if t["kind"] == "cont_qual"]
     cont_qualified_by_tid = {}
     if cont_qual_tids:
@@ -3179,11 +3356,49 @@ def get_country_tournament_results(country_name, limit=200):
             if t["kind"] != "cont_qual":
                 continue
             _cont = (t.get("continent") or "").strip() or "유럽"
+            _qk = "region" if _cont == "북미" else "continent"
             qr = c.execute(
-                "SELECT 1 FROM qual_results WHERE target_year=? AND kind='continent' "
+                "SELECT 1 FROM qual_results WHERE target_year=? AND kind=? "
                 "AND continent=? AND country=? LIMIT 1",
-                (t["year"], _cont, country_name)).fetchone()
+                (t["year"], _qk, _cont, country_name)).fetchone()
             cont_qualified_by_tid[t["id"]] = bool(qr)
+
+    # [2026-09 신설, 신민용 리포트: "랭킹 평가전 나머지 밴드가 국가 검색에
+    # 항상 '조별리그 탈락'으로만 뜬다"] power_eval_extra(라운드로빈만, KO
+    # 없음 — 순수하게 승자 개념이 없는 형식)는 아래 범용 분기(stages에서
+    # 최고 스테이지를 찾아 "OO 탈락"으로 표시)로는 표현이 안 된다 — 어차피
+    # 모든 참가국의 stage가 "group" 하나뿐이라 다 똑같이 "조별리그 탈락"
+    # 으로 뭉뚱그려졌었다. 대신 승점(승3/무1/패0)으로 실제 순위를 계산해서
+    # "N위 (총 M개국 중)"으로 보여준다.
+    pe_extra_tids = [t["id"] for t in tours if t["kind"] == "power_eval_extra"]
+    pe_rank_by_tid = {}
+    if pe_extra_tids:
+        ph3 = ",".join("?" * len(pe_extra_tids))
+        pe_rows = c.execute(
+            f"""SELECT tournament_id, home, away, home_score, away_score
+                FROM intl_matches WHERE tournament_id IN ({ph3}) AND home_score>=0""",
+            pe_extra_tids).fetchall()
+        pe_pts = {}
+        for r in pe_rows:
+            tid = r["tournament_id"]
+            h, a, hs, asc = r["home"], r["away"], r["home_score"], r["away_score"]
+            pe_pts.setdefault((tid, h), 0)
+            pe_pts.setdefault((tid, a), 0)
+            if hs > asc:
+                pe_pts[(tid, h)] += 3
+            elif hs < asc:
+                pe_pts[(tid, a)] += 3
+            else:
+                pe_pts[(tid, h)] += 1
+                pe_pts[(tid, a)] += 1
+        for tid in pe_extra_tids:
+            standings = sorted(
+                ((cn, pt) for (t_id, cn), pt in pe_pts.items() if t_id == tid),
+                key=lambda kv: -kv[1])
+            for rank_i, (cn, _pt) in enumerate(standings, start=1):
+                if cn == country_name:
+                    pe_rank_by_tid[tid] = (rank_i, len(standings))
+                    break
     conn.close()
 
     out = []
@@ -3217,6 +3432,16 @@ def get_country_tournament_results(country_name, limit=200):
                     result, tier = "조별리그 탈락", 1
                 else:
                     result, tier = "기록 없음", 0
+        elif t["kind"] == "power_eval_extra":
+            # [2026-09 신설] 라운드로빈만 하는 나머지 밴드 — 승자 개념이
+            # 없으므로 승점 순위를 그대로 결과로 보여준다.
+            pr = pe_rank_by_tid.get(t["id"])
+            if pr:
+                rank_i, total = pr
+                result, tier = f"{rank_i}위 ({total}개국 중)", (2 if rank_i == 1 else 1)
+                rank = max(0, 100 - rank_i)
+            else:
+                result, tier = "기록 없음", 0
         elif pl.get("winner") == country_name:
             result, tier, rank = "🥇 우승", 5, _PLACEMENT_RANK[5]
         elif pl.get("runner_up") == country_name:
@@ -3287,6 +3512,7 @@ def get_player_intl_records(player_id, limit=100):
     conn = get_conn(); c = conn.cursor()
     squad_rows = [dict(r) for r in c.execute(
         """SELECT s.tournament_id, s.country, s.appearances,
+                  s.rating, s.goals, s.assists, s.clean_sheets, s.saves, s.goals_conceded,
                   t.year, t.kind, t.name
            FROM intl_squad s JOIN intl_tournaments t ON t.id = s.tournament_id
            WHERE s.player_id=?
@@ -3316,10 +3542,18 @@ def get_player_intl_records(player_id, limit=100):
 
     out = []
     for r in squad_rows:
+        # [2026-09 신설, 신민용 요청: "국가대표에도 평점이랑 골 어시 이런걸
+        # 넣고 싶어"] ai_lifecycle._snapshot_intl_season_ratings가 그 대회
+        # 종료 시즌에 한 번 채워둔 값 — 아직 대회가 안 끝났거나(그 시즌
+        # 오프시즌 전) 이 기능 신설 이전 대회는 0("-"로 표시, 소급 불가
+        # 원칙은 클럽 기록과 동일).
+        _stat = {"rating": r.get("rating") or 0, "goals": r.get("goals") or 0,
+                 "assists": r.get("assists") or 0, "clean_sheets": r.get("clean_sheets") or 0,
+                 "saves": r.get("saves") or 0, "goals_conceded": r.get("goals_conceded") or 0}
         res = results_by_key.get((r["tournament_id"], r["country"]))
         if res:
             out.append({**res, "country": r["country"], "appearances": r["appearances"],
-                        "total_games": res.get("games", 0)})
+                        "total_games": res.get("games", 0), **_stat})
         else:
             # get_country_tournament_results는 완료된(status='done') 대회만
             # 잡는다 — 아직 진행 중인 대회는 최소 정보만 채워서 보여준다.
@@ -3331,7 +3565,7 @@ def get_player_intl_records(player_id, limit=100):
                         "kind": r["kind"] or "?", "name": r["name"] or "?",
                         "country": r["country"], "result": "진행 중",
                         "record": "", "appearances": r["appearances"],
-                        "total_games": n_games})
+                        "total_games": n_games, **_stat})
     conn2.close()
     out.sort(key=lambda x: (x["year"], x["id"]), reverse=True)
     return out

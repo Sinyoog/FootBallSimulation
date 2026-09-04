@@ -27,7 +27,8 @@ EL_CUP_NAME = {
     "유럽": "UEFA 유로파리그",
     "아시아": "AFC 챔피언스리그 투",
     "아프리카": "CAF 컨페더레이션컵",
-    "북남미": "아메리카 컨페더레이션컵",
+    "남미": "코파 수다메리카나",
+    "북미": "콩카카프 리그스컵",
 }
 
 EUROPA_CFG = CompetitionConfig(
@@ -183,14 +184,14 @@ def _finish_tournament(t):
 
 
 def process_el_week(week):
-    """CL_START_WEEK부터 매주 호출 — 4개 대륙 유로파 전부 처리."""
+    """CL_START_WEEK부터 매주 호출 — 5개 대륙 유로파 전부 처리."""
     from game_engine import get_state
     from competition.competition_common import process_one
     st = get_state()
     if not st:
         return
     year = st["current_year"]
-    for cont in ("유럽", "아시아", "아프리카", "북남미"):
+    for cont in ("유럽", "아시아", "아프리카", "남미", "북미"):
         t = get_el_tournament(year, cont)
         if not t or t["status"] == "done":
             continue

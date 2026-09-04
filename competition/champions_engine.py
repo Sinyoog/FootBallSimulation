@@ -108,24 +108,30 @@ CL_TEAMS = 36                # 기본(유럽) 리그 스테이지 참가 규모
 # 동일한 36으로 올리고, 북남미는 대륙 통합 규모가 가장 크다는 점을 반영해
 # 48로 확대했다. 아시아/아프리카는 이제 유럽과 완전히 같은 구조(경기 수·
 # 컷 라인 전부 그대로 재사용)라 별도 설계가 필요 없다.
-CL_TEAMS_BY_CONTINENT = {"유럽": 36, "북남미": 48, "아시아": 36, "아프리카": 36}
+# [2026-09 개편, 신민용 확정: "월드컵/챔스에서 남미 북미를 나눌려고 해"]
+# "북남미"(48팀 통합) → 남미(12개국)/북미(33개국) 개별 대륙으로 분리하며,
+# 규모는 "3개 대회(챔스/유로파/컨퍼런스) × 32팀"을 기본 틀로 잡는다(신민용
+# 확정) — 옛 북남미 48팀 통합 규모보다 둘 합(64)이 커지지만, 국가 수 격차가
+# 큰 두 대륙(남미 12개국 vs 북미 33개국)을 억지로 한 규모에 맞추지 않고
+# 각자 유럽/아시아/아프리카(36팀)에 준하는 독자 규모를 갖는 쪽을 택했다.
+CL_TEAMS_BY_CONTINENT = {"유럽": 36, "남미": 32, "북미": 32, "아시아": 36, "아프리카": 36}
 
 # 팀마다 리그 스테이지에서 치르는 경기 수(서로 다른 상대와 1경기씩).
-# 북남미(48팀)만 9경기 — 나머지 세 대륙(36팀)은 8경기로 동일.
-CL_LEAGUE_GAMES_BY_CONTINENT = {"유럽": 8, "북남미": 9, "아시아": 8, "아프리카": 8}
+# [2026-09 개편] 남미/북미(32팀)는 유럽/아시아/아프리카(36팀)와 규모가
+# 비슷해 옛 북남미(48팀) 전용 9경기 특례를 없애고 표준 8경기를 그대로 쓴다.
+CL_LEAGUE_GAMES_BY_CONTINENT = {"유럽": 8, "남미": 8, "북미": 8, "아시아": 8, "아프리카": 8}
 
 # 리그 스테이지 순위 1~N위: 플레이오프 없이 바로 다음 토너먼트 라운드 직행.
-CL_DIRECT_CUT_BY_CONTINENT = {"유럽": 8, "북남미": 16, "아시아": 8, "아프리카": 8}
+CL_DIRECT_CUT_BY_CONTINENT = {"유럽": 8, "남미": 8, "북미": 8, "아시아": 8, "아프리카": 8}
 
 # 리그 스테이지 순위 (직행 다음순위)~(직행+이 값)위: 플레이오프 대상.
 # 이 인원의 절반이 플레이오프를 통과해 직행팀과 합류한다.
-#   유럽/아시아/아프리카: 9~24위(16명) 플레이오프 → 8명 통과 → 직행 8 + 통과 8 = 16강(16팀)
-#   북남미: 17~48위(32명) 플레이오프 → 16명 통과 → 직행 16 + 통과 16 = 32강(32팀)
-#     [설계 의도] direct(16) + pool(32) = 48 = 전체 참가 팀 수 — 북남미는
-#     48팀 규모답게 리그 스테이지 순위만으로 완전 탈락하는 팀 없이 전원이
-#     직행 아니면 최소 플레이오프 기회를 받는다(유럽 등은 25~36위 12팀이
-#     리그 스테이지에서 그대로 광탈하는 것과 대비됨).
-CL_PLAYOFF_POOL_BY_CONTINENT = {"유럽": 16, "북남미": 32, "아시아": 16, "아프리카": 16}
+# [2026-09 개편] 남미/북미도 32팀 규모로 유럽/아시아/아프리카(36팀)와
+# 표준 포맷을 공유한다 — 직행 8 + 플레이오프 16(→8명 통과) = 16강(16팀),
+# 나머지(남미/북미는 25~32위 8팀)는 리그 스테이지에서 광탈(유럽 등과 동일
+# 원칙 — 옛 북남미 48팀 특례였던 "전원 최소 플레이오프 기회" 보장은 규모가
+# 줄면서 더 이상 유지하지 않는다).
+CL_PLAYOFF_POOL_BY_CONTINENT = {"유럽": 16, "남미": 16, "북미": 16, "아시아": 16, "아프리카": 16}
 
 def _cl_team_cap(continent: str) -> int:
     return CL_TEAMS_BY_CONTINENT.get(continent, CL_TEAMS)
@@ -198,13 +204,27 @@ def _slots_from_rank(continent: str, rank_idx: int) -> int:
     [2026-07 재조정, 신민용 확정] 4개 대륙 밴드를 각각 다르게 잡는다 —
     유럽/아시아/아프리카는 참가 규모(36개국)는 같아도 실제 상위권 쏠림
     정도가 다르고(유럽이 가장 쏠림), 북남미는 참가 규모 자체가 48개로
-    더 크다(+남미 강호 쏠림도 반영해 한 단계 더 후하게)."""
-    if continent == "북남미":
-        if rank_idx < 1:  return 6   # 1위
+    더 크다(+남미 강호 쏠림도 반영해 한 단계 더 후하게).
+    [2026-09 개편, 신민용 확정: "남미 북미를 나눌려고 해"] "북남미"
+    단일 밴드를 남미/북미로 분리한다.
+      남미(12개국, 정원 32): 브라질/아르헨티나급 쏠림이 강해 1위에게
+      가장 후하게(5장) 준다 — 12개국뿐이라 하위권도 최소 1장은 받는다.
+      북미(33개국, 정원 32): 미국/멕시코급 소수를 제외하면 국내 리그
+      인프라 격차가 크다 — 19위 밖은 챔스 슬롯 없이 유로파/컨퍼런스만
+      노리는 구조(실제 CONCACAF와 비슷하게 "챔스=강국 무대, 컨퍼런스=
+      약소국도 도전 가능"이 되도록 상위 쏠림을 아시아/아프리카보다 세게)."""
+    if continent == "남미":
+        if rank_idx < 1:  return 5   # 1위
         if rank_idx < 3:  return 4   # 2~3위
         if rank_idx < 6:  return 3   # 4~6위
-        if rank_idx < 12: return 2   # 7~12위
-        return 1                     # 13위~
+        if rank_idx < 10: return 2   # 7~10위
+        return 1                     # 11~12위
+    if continent == "북미":
+        if rank_idx < 1:  return 5   # 1위
+        if rank_idx < 3:  return 3   # 2~3위
+        if rank_idx < 8:  return 2   # 4~8위
+        if rank_idx < 18: return 1   # 9~18위
+        return 0                     # 19위~ (챔스 슬롯 없음 — 유로파/컨퍼런스로)
     if continent == "아시아":
         if rank_idx < 2:  return 4   # 1~2위
         if rank_idx < 5:  return 3   # 3~5위
@@ -247,11 +267,25 @@ def _country_coefficients(conn, continent: str, upto_year: int, n_seasons: int =
     return sorted(scores.items(), key=lambda kv: -kv[1])
 
 
-def get_cl_slots(country: str, grade: str, continent: str = None, year: int = None) -> int:
+def get_cl_slots(country: str, grade: str, continent: str = None, year: int = None,
+                  rank_idx: int = None) -> int:
     """나라별 챔스 슬롯 수. continent+year가 주어지면 최근 5시즌 실측
     계수로 동적 산정을 우선 시도하고, 데이터가 아직 부족하면(게임 초반)
     시드값(CL_SLOTS_OVERRIDE → 등급 기본값 순)으로 폴백한다.
-    continent/year를 안 넘기면(하위호환) 예전처럼 시드값만 바로 반환."""
+    continent/year를 안 넘기면(하위호환) 예전처럼 시드값만 바로 반환.
+
+    [2026-09 버그수정, 신민용 리포트: "남미 챔스가 시작 연도에 20팀만
+    참가한다"] CL_SLOTS_OVERRIDE는 유럽 국가만 등록돼 있고(잉글랜드/
+    스페인/...), 등급 기본값(CL_SLOTS_BY_GRADE, SS=5~F=1)도 국가당
+    최대 5장뿐이라 — 첫 시즌(아직 계수 기록이 하나도 없어 위 실측
+    분기를 못 타는 시점)엔 남미 12개국이 전부 이 폴백을 타는데, 이
+    폴백 총합이 32장(정원)에 구조적으로 못 미친다(등급 기본값만으론
+    12개국 다 합쳐도 32 근처도 안 나옴 — 실측: 20장). 북미(33개국)는
+    국가 수가 많아 같은 폴백으로도 우연히 32를 넘겨서 문제가 안
+    드러났을 뿐. rank_idx가 주어지고(호출부가 그 대륙 국가 순위를 이미
+    알고 있는 경우) continent가 남미면, 계수 실측이 아직 없어도
+    _slots_from_rank의 남미 전용 커브(등급순으로 매긴 rank_idx 기준,
+    총합 정확히 32)를 그대로 써서 첫 시즌부터 정원을 채운다."""
     if continent and year:
         conn = get_conn()
         ranking = _country_coefficients(conn, continent, year)
@@ -262,6 +296,8 @@ def get_cl_slots(country: str, grade: str, continent: str = None, year: int = No
                 return _slots_from_rank(continent, rank_map[country])
             # 랭킹엔 없지만(최근 5시즌 챔스에 한 번도 못 나간 나라) 데이터
             # 자체는 충분한 상황 — 시드값이 있으면 그걸, 없으면 최하위(1장).
+        elif continent == "남미" and rank_idx is not None:
+            return _slots_from_rank(continent, rank_idx)
     if country in CL_SLOTS_OVERRIDE:
         return CL_SLOTS_OVERRIDE[country]
     return CL_SLOTS_BY_GRADE.get(grade, 1)
@@ -282,21 +318,25 @@ STAGE_KO = {"league": "리그 스테이지", "PO": "플레이오프",
 _STAGE_ORDER = ["R32", "R16", "QF", "SF", "F"]
 
 # 대륙 그룹핑: 게임 내 continent 값 → 챔스 대륙 키
-#   오세아니아 → 아시아 편입, 북미/남미 → 북남미 통합
+#   오세아니아 → 아시아 편입, 북미/남미는 각자 독립 대륙(2026-09 개편,
+#   신민용 확정: "남미 북미를 나눌려고 해" — 예전엔 "북남미"로 통합했었다).
 CONTINENT_MAP = {
     "유럽": "유럽",
     "아시아": "아시아",
     "오세아니아": "아시아",
     "아프리카": "아프리카",
-    "북미": "북남미",
-    "남미": "북남미",
+    "북미": "북미",
+    "남미": "남미",
+    "북중미": "북미",  # 하위호환
 }
 # 대회 이름
 CL_CUP_NAME = {
     "유럽": "유럽 챔피언스리그",
     "아시아": "아시아 챔피언스리그",
     "아프리카": "아프리카 챔피언스리그",
-    "북남미": "북남미 챔피언스리그",
+    "남미": "남미 챔피언스리그",
+    "북미": "북미 챔피언스리그",
+    "북남미": "북미 챔피언스리그",  # 하위호환(옛 세이브 표기)
 }
 
 # [2026-08 신설] competition_common.py 공용 엔진에 연결하는 설정.
@@ -484,12 +524,12 @@ def start_champions_league(year, season):
     my_cont = _my_continent(p)
     my_tid = p.get("current_team_id", 0)
 
-    for cont in ("유럽", "아시아", "아프리카", "북남미"):
+    for cont in ("유럽", "아시아", "아프리카", "남미", "북미"):
         entries = _select_entries(cont, prev_season, year)
         if len(entries) < 4:
             continue  # 출전팀 부족하면 그 대륙 대회 생략
         _build_tournament(year, cont, entries, my_tid if cont == my_cont else 0)
-    print(f"[PERF] 챔스 4대륙 생성(슬롯 계산 포함) {time.perf_counter()-_t0:.2f}s")
+    print(f"[PERF] 챔스 5대륙 생성(슬롯 계산 포함) {time.perf_counter()-_t0:.2f}s")
 
     # ── 내 대회 안내 로그 (출전 자격 = 직전 시즌 내 리그 순위가 배정 슬롯 안) ──
     if my_cont and my_tid:
@@ -687,7 +727,7 @@ def process_cl_week(week):
         return
     year = st["current_year"]
 
-    for cont in ("유럽", "아시아", "아프리카", "북남미"):
+    for cont in ("유럽", "아시아", "아프리카", "남미", "북미"):
         t = get_cl_tournament(year, cont)
         if not t or t["status"] == "done":
             continue
