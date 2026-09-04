@@ -418,6 +418,27 @@ _IA_YEAR_LIST_STYLE = (
     "QListWidget::item{padding:7px 5px;}"
 )
 
+# [2026-09 신설, 신민용 요청: "세계 축구 기록실에 골든볼 외에 실버볼
+# 브론즈볼도 떠야지 / 대회 월드컵 부문 골든볼로 되어있는거 볼로 수정하고
+# 이걸 치면 골든볼 실버볼 브론즈볼이 3개 뜨게 해줘"] game_engine._save_
+# club_comp_award_rows가 이제 월드컵 MVP를 rank=1/2/3(골든볼/실버볼/
+# 브론즈볼)까지 저장하지만, award_kind/award_type 문자열 자체는 세
+# 순위 모두 "골든볼"로 통일해서 저장한다(스키마·기존 조회 하위호환을
+# 위해 — DB 설계는 game_engine._save_club_comp_award_rows 주석 참고).
+# 그래서 "부문" 필터 목록에는 원래 "골든볼" 항목 하나만 뜨는데, 그 안에
+# 실제로는 골든볼/실버볼/브론즈볼 3명이 다 들어있다는 걸 필터 라벨에서
+# 드러내려고 "볼"로 바꿔 보여준다(실제 DB 값 "골든볼"은 콤보 아이템의
+# userData로 그대로 들고 다녀 필터링엔 전혀 영향 없음 — 아래
+# _reload_ia_filterable_table가 currentData()를 우선 읽는다).
+# 표 쪽(_fill_ia_filterable_table)은 반대로 "부문" 하나로 뭉친 골든볼
+# 3행을 rank로 다시 풀어서 각자 골든볼/실버볼/브론즈볼로 보여준다.
+_IA_KIND_DISPLAY_OVERRIDE = {"골든볼": "볼"}
+# [2026-09] rank→실제 명칭 매핑은 world_browser.WC_BALL_RANK_LABEL이
+# 단일 소스(get_player_awards_by_year도 같은 상수를 쓴다) — 여기서
+# 별도로 다시 정의하면 나중에 하나만 고치고 다른 하나를 깜빡할 위험이
+# 있어 그대로 참조만 한다.
+_WC_BALL_RANK_LABEL = wb.WC_BALL_RANK_LABEL
+
 # [2026-08 신설, 신민용 요청: "기록실(챔스/유로파/컨퍼런스) 필터 기본값은
 # 전체, 최다 순위 팝업 필터 기본값은 유럽 — 이 둘은 기능적으로 별개의
 # filter state로 분리해야 한다"] 이름 그대로 두 화면의 기본값을 각각의
@@ -3230,6 +3251,12 @@ class WorldBrowserWindow(QDialog):
                 age_txt = f"{row['age']}세" if row.get("age") is not None else "나이 미상"
                 if row["is_retired_row"]:
                     lines.append(f"{row['year']}년 ({age_txt}) | 소속팀 없음 (은퇴)")
+                    # [2026-09 버그수정, 신민용 리포트: "받은 상들이 안떠"]
+                    # 은퇴 처리된 해에도 그 해 받은 상이 있을 수 있으므로
+                    # (예: 은퇴 시즌에 마지막 개인상) 아래 일반 분기와
+                    # 동일하게 찍어준다.
+                    if row.get("awards"):
+                        lines.append(f"  🏆 " + " · ".join(row["awards"]))
                     continue
                 entry = row["entry"] or {}
                 parts = [f"{row['year']}년 ({age_txt})", f"소속팀: {row['team_name']}"]
@@ -3255,6 +3282,18 @@ class WorldBrowserWindow(QDialog):
                     rec = f" ({entry['cwc_record']})" if entry.get("cwc_record") else ""
                     parts.append(f"클럽월드컵: {entry['cwc']}{rec}")
                 lines.append(" | ".join(parts))
+                # [2026-09 버그수정, 신민용 리포트: "세계 축구 기록실에서
+                # 선수 기록복사할 때 받은 상들이 안떠 / 국가·팀 검색의
+                # 주전·스쿼드 기록 복사에도 상은 안떠"] 화면(연도 펼침
+                # 상태)의 "🏆 ..." 요약 행과 같은 데이터(row["awards"] —
+                # 위 루프 시작부에서 채워둠)를 요약 복사/기록 복사 둘 다
+                # (include_stats 여부와 무관하게, 화면이 펼쳐졌든 안
+                # 펼쳐졌든) 항상 포함한다 — 이 함수 하나가 "선수 검색"
+                # 복사 버튼과, 그걸 그대로 재사용하는 국가/팀 검색의
+                # "주전 기록 복사"/"스쿼드 기록 복사"까지 전부 공유하므로
+                # 여기 한 곳만 고치면 네 화면 모두 한꺼번에 고쳐진다.
+                if row.get("awards"):
+                    lines.append(f"  🏆 " + " · ".join(row["awards"]))
                 # [2026-08 신설, 신민용 요청: "기록 복사할 때 이것도 같이
                 # 기록복사되는 버튼을 추가해줘"] include_stats=True("기록
                 # 복사" 버튼)일 때만, 그 연도 줄 바로 밑에 대회별 요약을
@@ -5298,6 +5337,17 @@ class WorldBrowserWindow(QDialog):
         _expanded = self._player_team_expanded_years(player_id)
         for i, entry in enumerate(years):
             age = _age_at(entry["year"])
+            # [2026-09 버그수정, 신민용 리포트: "선수 기록복사할 때 받은
+            # 상들이 안떠 / 주전·스쿼드 기록 복사에도 상은 안떠"] 화면
+            # 렌더링(아래 _year_expanded 블록)은 이 해에 받은 상을 이미
+            # _awards_by_year로 조회해뒀지만, 복사용 self._player_copy_rows
+            # 에는 그동안 이 값을 담지 않았다 — _format_player_history_text
+            # (선수 검색 복사 버튼과, 그걸 그대로 재사용하는 국가/팀 검색의
+            # "주전 기록 복사"/"스쿼드 기록 복사" 전부가 공유하는 단일
+            # 함수)가 읽을 데이터 자체가 없었으니 네 화면 모두 똑같이
+            # 빠져 있었던 것 — 여기서 미리 조회해 아래 두 append 모두에
+            # 실어준다(펼침 여부와 무관하게 복사는 항상 포함).
+            _year_awards = _awards_by_year.get(entry["year"])
             # [2026-09 신설, 신민용 요청: "연도 클릭하면 아래에 평점/연봉/
             # 이적종류가 펼쳐지고 다시 클릭하면 접히는거지"] 펼침 상태를
             # 화살표로 표시하고, 클릭 핸들러가 이 칸에서 연도값을 다시
@@ -5377,7 +5427,7 @@ class WorldBrowserWindow(QDialog):
                 self._player_copy_rows.append({
                     "year": entry["year"], "age": age, "is_retired_row": True,
                     "team_name": None, "position": None, "ovr": None, "role": None, "entry": None,
-                    "stat": None})
+                    "stat": None, "awards": _year_awards})
                 row_idx += 1
                 continue
 
@@ -5441,7 +5491,8 @@ class WorldBrowserWindow(QDialog):
             self._player_copy_rows.append({
                 "year": entry["year"], "age": age, "is_retired_row": False,
                 "team_name": player_team_name, "position": player_position,
-                "ovr": ovr_at_year, "role": role_at_year, "entry": entry, "stat": _stat})
+                "ovr": ovr_at_year, "role": role_at_year, "entry": entry, "stat": _stat,
+                "awards": _year_awards})
 
             lg_txt = entry["league"] or "-"
             if "승격" in lg_txt:
@@ -5561,8 +5612,9 @@ class WorldBrowserWindow(QDialog):
             # salary 요약 행과 완전히 같은 조건(연도가 펼쳐져 있을 때만)
             # 으로, 그 해 받은 개인상이 하나라도 있으면 전체 칸을 합쳐
             # 한 줄로 보여준다 — 여러 상을 받은 해(예: 리그 MVP + 리그
-            # 베스트11)는 " · "로 이어붙인다.
-            _year_awards = _awards_by_year.get(entry["year"])
+            # 베스트11)는 " · "로 이어붙인다. (_year_awards는 루프 위쪽에서
+            # 이미 조회해 self._player_copy_rows에도 실어뒀다 — 여기선
+            # 재사용만.)
             if _year_awards and _year_expanded:
                 _award_cell = self._two_line_cell(
                     f"🏆 {' · '.join(_year_awards)}", "#ffd700", None, bold=True)
@@ -6117,9 +6169,19 @@ class WorldBrowserWindow(QDialog):
                     if tid is None:
                         continue
                     log = wb.get_country_intl_match_log(tid, name)
-                    gs = log.get("group_standings")
-                    if gs and gs.get("rows"):
-                        lines.append(f"  ㄴ {gs['group']}조 순위표:")
+                    # [2026-09 버그수정] group_standings가 1차/2차 두 조를
+                    # 담은 리스트로 바뀌었다 — 예전엔 dict 하나였어서 조가
+                    # 두 개일 때 하나가 그냥 누락됐다. 둘 다(1차/2차) 조가
+                    # 있는 대회는 "조별리그1"/"조별리그2"를 붙여 구분한다.
+                    gs_list = log.get("group_standings") or []
+                    _multi_stage = len(gs_list) > 1
+                    for gs in gs_list:
+                        if not gs.get("rows"):
+                            continue
+                        stage_prefix = ""
+                        if _multi_stage:
+                            stage_prefix = "조별리그1 " if gs.get("stage") == "qual_group" else "조별리그2 "
+                        lines.append(f"  ㄴ {stage_prefix}{gs['group']}조 순위표:")
                         for rank_i, gr in enumerate(gs["rows"]):
                             mark = " ★" if gr["country"] == name else ""
                             lines.append(
@@ -6271,9 +6333,26 @@ class WorldBrowserWindow(QDialog):
         title.setStyleSheet("color:#00cc44;font-size:13px;font-weight:bold;")
         lay.addWidget(title)
 
-        gs = log.get("group_standings")
-        if gs and gs.get("rows"):
-            glabel = QLabel(f"⚽ {gs['group']}조 순위표")
+        # [2026-09 버그수정, 신민용 리포트: "조별리그가 1차/2차로 나뉘는
+        # 대회에서 세계 축구 기록실을 보면 조별리그1 순위표·조별리그1 결과·
+        # 조별리그2 순위표·조별리그2 결과 이렇게 4개로 나뉘어 떠야 하는데
+        # 하나로 뭉개져서 뜬다"] get_country_intl_match_log가 이제
+        # group_standings를 (1차/2차가 모두 있으면 둘 다 담은) 리스트로
+        # 돌려준다 — 예전엔 dict 하나뿐이라 2차 조가 있으면 1차 조 순위표가
+        # 통째로 사라졌다. 여기서 리스트를 순회하며 각 단계를 "조별리그1
+        # 순위표"/"조별리그2 순위표"로 구분해서 표를 하나씩 더 그린다(단일
+        # 단계 예선은 원래처럼 "N조 순위표" 그대로).
+        gs_list = log.get("group_standings") or []
+        _multi_stage = len(gs_list) > 1
+        for gs in gs_list:
+            if not gs.get("rows"):
+                continue
+            if _multi_stage:
+                stage_txt = "조별리그1" if gs.get("stage") == "qual_group" else "조별리그2"
+                glabel_txt = f"⚽ {stage_txt} · {gs['group']}조 순위표"
+            else:
+                glabel_txt = f"⚽ {gs['group']}조 순위표"
+            glabel = QLabel(glabel_txt)
             glabel.setStyleSheet("color:#ffcc00;font-size:12px;font-weight:bold;")
             lay.addWidget(glabel)
             rows = gs["rows"]
@@ -7110,6 +7189,14 @@ class WorldBrowserWindow(QDialog):
         comp_combo.addItem(_ALL)
         comp_combo.currentIndexChanged.connect(lambda _i, p=prefix: self._on_ia_filterable_comp_changed(p))
         self._make_combo_typable(comp_combo)
+        # [2026-09 버그수정, 신민용 리포트: "필터 옆에 입력하는 곳이랑
+        # 선택하는거 공간이 너무 좁아서 글자가 잘려"] 닫힌 콤보 자체는
+        # 지금까지 명시적 최소 너비가 없어서 레이아웃이 좁아지면 "월드컵"이
+        # "드컵"으로 잘려 보였다(펼쳐지는 팝업 목록만 _make_combo_typable이
+        # 이미 최소 240px로 넉넉히 잡아둔 상태였음 — 닫힌 상태 표시칸은
+        # 그 대상이 아니었다). 닫힌 상태 자체에도 최소 너비를 줘서 대회/
+        # 부문 이름이 안 잘리게 한다.
+        comp_combo.setMinimumWidth(150)
         filt_bar.addWidget(comp_combo)
         setattr(self, f"ia_{prefix}_comp_combo", comp_combo)
         kind_lbl = QLabel("부문"); kind_lbl.setStyleSheet("color:#888;font-size:11px;")
@@ -7118,6 +7205,7 @@ class WorldBrowserWindow(QDialog):
         kind_combo.addItem(_ALL)
         kind_combo.currentIndexChanged.connect(lambda _i, p=prefix: self._reload_ia_filterable_table(p))
         self._make_combo_typable(kind_combo)
+        kind_combo.setMinimumWidth(150)
         filt_bar.addWidget(kind_combo)
         setattr(self, f"ia_{prefix}_kind_combo", kind_combo)
         filt_bar.addStretch()
@@ -7184,7 +7272,16 @@ class WorldBrowserWindow(QDialog):
         실제 존재하는 값만 다시 채운다 — 연도나 대회가 바뀌면 그 조건에
         없는 값이 남아있으면 안 되므로 매번 새로 구성한다. 이전에 고른
         값이 새 목록에도 있으면 그대로 유지(사용자가 필터를 다시 고를
-        필요 없게)."""
+        필요 없게).
+
+        [2026-09 버그수정, 신민용 요청: "대회 월드컵 부문 골든볼로 되어있는거
+        볼로 수정"] "부문" 콤보(which=='kind')는 DB에 실제 저장된
+        award_kind 값(v) 대신 _IA_KIND_DISPLAY_OVERRIDE로 바꾼 표시
+        텍스트를 보여주되(현재는 "골든볼"→"볼" 하나뿐 — 월드컵 골든볼
+        부문에 실제로는 골든볼/실버볼/브론즈볼 3명이 rank로만 구분돼
+        들어있다는 걸 라벨로 드러낸다), 실제 DB 조회에 쓸 원본 값은
+        userData로 같이 넣어둔다 — _reload_ia_filterable_table이
+        currentData()를 우선 읽어서 필터링 자체는 "골든볼" 그대로 걸린다."""
         spec = self._ia_filter_specs[prefix]
         combo = getattr(self, f"ia_{prefix}_comp_combo" if which == "comp" else f"ia_{prefix}_kind_combo")
         prev = combo.currentText()
@@ -7193,7 +7290,10 @@ class WorldBrowserWindow(QDialog):
         combo.addItem(_ALL)
         values = spec["get_competitions"](year) if which == "comp" else spec["get_kinds"](year, competition)
         for v in values:
-            combo.addItem(v)
+            if which == "kind":
+                combo.addItem(_IA_KIND_DISPLAY_OVERRIDE.get(v, v), v)
+            else:
+                combo.addItem(v)
         idx = combo.findText(prev)
         combo.setCurrentIndex(idx if idx >= 0 else 0)
         combo.blockSignals(False)
@@ -7203,11 +7303,16 @@ class WorldBrowserWindow(QDialog):
         if year is None:
             return
         spec = self._ia_filter_specs[prefix]
-        comp_filter = getattr(self, f"ia_{prefix}_comp_combo").currentText()
-        kind_filter = getattr(self, f"ia_{prefix}_kind_combo").currentText()
+        comp_combo = getattr(self, f"ia_{prefix}_comp_combo")
+        kind_combo = getattr(self, f"ia_{prefix}_kind_combo")
+        comp_filter = comp_combo.currentText()
+        # [2026-09] kind_combo는 표시 텍스트("볼")와 실제 DB 값("골든볼")이
+        # 다를 수 있다 — currentData()에 원본 값이 있으면 그걸 필터로 쓰고,
+        # 없으면(override 대상이 아닌 일반 항목) 표시 텍스트를 그대로 쓴다.
+        kind_filter_text = kind_combo.currentText()
+        kind_filter = None if kind_filter_text == _ALL else (kind_combo.currentData() or kind_filter_text)
         rows = spec["get_awards"](
-            year, None if comp_filter == _ALL else comp_filter,
-            None if kind_filter == _ALL else kind_filter)
+            year, None if comp_filter == _ALL else comp_filter, kind_filter)
         self._fill_ia_filterable_table(prefix, rows)
 
     def _fill_ia_filterable_table(self, prefix, rows):
@@ -7224,7 +7329,17 @@ class WorldBrowserWindow(QDialog):
         보내라니까 클럽 대항전은 왜 없어 국제대회도 없고, 골+도움 이런식
         말고 골 도움 따로따로, 키퍼는 선방 실점 이렇게"] 리그전 표와
         동일한 원칙으로 포지션 칸 추가+골/도움 분리, GK 전용(선방/실점)
-        칸도 추가(GK가 아닌 행은 "-")."""
+        칸도 추가(GK가 아닌 행은 "-").
+
+        [2026-09 신설, 신민용 요청: "골든볼 실버볼 브론즈볼이 3개 뜨게
+        해줘"] award_type은 rank 1/2/3 세 행 모두 DB에 "월드컵 골든볼"로
+        똑같이 저장돼 있다(game_engine._save_club_comp_award_rows 참고 —
+        award_kind 문자열 자체를 통일해두고 rank로만 순위를 구분하는
+        설계). "부문" 콤보에서 "볼"을 골라 이 세 행이 한꺼번에 표에
+        뜨는 시점에, award_kind=="골든볼"인 행만 rank를 보고
+        _WC_BALL_RANK_LABEL로 실제 이름(골든볼/실버볼/브론즈볼)을 다시
+        입혀서 보여준다 — DB 스키마·다른 조회부는 그대로 두고 이 표시
+        단계에서만 풀어준다."""
         tbl = getattr(self, f"ia_{prefix}_tbl")
         spec = self._ia_filter_specs[prefix]
         cols = ["대회/부문", "선수", "국적", "팀", "포지션", "평점", "골", "도움", "선방", "실점"]
@@ -7240,7 +7355,12 @@ class WorldBrowserWindow(QDialog):
             team = r.get("team_name") or ""
             rating = r.get("score_rating")
             is_gk = (r.get("position") or "") == "GK"
-            vals = [r["award_type"], name, nat, team, r.get("position") or "",
+            award_label = r["award_type"]
+            if r.get("award_kind") == "골든볼":
+                ball_name = _WC_BALL_RANK_LABEL.get(r.get("rank"), r["award_kind"])
+                comp = r.get("competition") or ""
+                award_label = f"{comp} {ball_name}".strip()
+            vals = [award_label, name, nat, team, r.get("position") or "",
                     f"{rating:.2f}" if rating else "-",
                     str(int(r.get("stat_goals") or 0)), str(int(r.get("stat_assists") or 0)),
                     str(int(r.get("stat_saves") or 0)) if is_gk else "-",
@@ -7323,18 +7443,24 @@ class WorldBrowserWindow(QDialog):
         self.ia_league_country_combo = QComboBox()
         self.ia_league_country_combo.currentIndexChanged.connect(self._on_ia_league_country_changed)
         self._make_combo_typable(self.ia_league_country_combo)
+        # [2026-09 버그수정, 신민용 리포트: "필터 옆에 입력하는 곳이랑
+        # 선택하는거 공간이 너무 좁아서 글자가 잘려"] _build_ia_filterable_
+        # panel의 대회/부문 콤보와 동일한 이유로 닫힌 상태 최소 너비를 준다.
+        self.ia_league_country_combo.setMinimumWidth(150)
         filt_bar.addWidget(self.ia_league_country_combo)
         t_lbl = QLabel("부"); t_lbl.setStyleSheet("color:#888;font-size:11px;")
         filt_bar.addWidget(t_lbl)
         self.ia_league_tier_combo = QComboBox()
         self.ia_league_tier_combo.currentIndexChanged.connect(self._on_ia_league_tier_changed)
         self._make_combo_typable(self.ia_league_tier_combo)
+        self.ia_league_tier_combo.setMinimumWidth(90)
         filt_bar.addWidget(self.ia_league_tier_combo)
         k_lbl = QLabel("부문"); k_lbl.setStyleSheet("color:#888;font-size:11px;")
         filt_bar.addWidget(k_lbl)
         self.ia_league_kind_combo = QComboBox()
         self.ia_league_kind_combo.currentIndexChanged.connect(self._on_ia_league_kind_changed)
         self._make_combo_typable(self.ia_league_kind_combo)
+        self.ia_league_kind_combo.setMinimumWidth(150)
         filt_bar.addWidget(self.ia_league_kind_combo)
         filt_bar.addStretch()
         filt_bar_w.setVisible(False)
@@ -9091,8 +9217,23 @@ class TournamentDetailDialog(QDialog):
             lay.addWidget(self._section_label("🌍 예선 통과국"))
             lay.addWidget(self._build_qualifiers_box(qualifiers))
 
+        # [2026-09 버그수정, 신민용 리포트: "조별리그가 1차/2차 두 단계로
+        # 나뉘는 대회(아시아/북미/아프리카 월드컵 예선, 아프리카 포함)에서
+        # 세계 축구 기록실 팝업을 열면 조별리그1/조별리그2로 안 나뉘고
+        # 하나로만(그나마도 2차만) 뜬다"] get_intl_tournament_detail이 이제
+        # 1차를 "groups", 2차를 "groups2"로 나눠서 돌려준다 — 둘 다 있으면
+        # 섹션을 두 개("조별리그1"/"조별리그2")로 나눠 그리고, 2단계가
+        # 아닌 대회는 예전처럼 "조별리그" 섹션 하나만 그린다.
         groups = detail.get("groups") or {}
-        if groups:
+        groups2 = detail.get("groups2") or {}
+        if groups and groups2:
+            lay.addWidget(self._section_label("⚽ 조별리그1"))
+            lay.addWidget(self._build_groups_grid(groups, team_based, detail.get("advanced_from_stage1"),
+                                                    highlight_country=self._highlight_country))
+            lay.addWidget(self._section_label("⚽ 조별리그2"))
+            lay.addWidget(self._build_groups_grid(groups2, team_based, detail.get("qualified"),
+                                                    highlight_country=self._highlight_country))
+        elif groups:
             lay.addWidget(self._section_label("⚽ 조별리그"))
             lay.addWidget(self._build_groups_grid(groups, team_based, detail.get("qualified"),
                                                     highlight_country=self._highlight_country))
@@ -9109,7 +9250,7 @@ class TournamentDetailDialog(QDialog):
             for stage in knockout:
                 lay.addWidget(self._build_stage_box(stage, team_based))
 
-        if not groups and not league_standings and not knockout:
+        if not groups and not groups2 and not league_standings and not knockout:
             empty = QLabel("표시할 대진 기록이 없습니다.")
             empty.setStyleSheet("color:#888;font-size:12px;")
             lay.addWidget(empty)

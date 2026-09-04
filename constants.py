@@ -592,6 +592,23 @@ TOURNAMENT_SCHEDULE_RULES = {
         {"stage": "TP",    "round": 1, "match_count": 1,  "days": 1, "rest_after": 0, "cap": 1, "min_rest": 3},
         {"stage": "F",     "round": 1, "match_count": 1,  "days": 1, "rest_after": 0, "cap": 1, "min_rest": 3},
     ],
+    # [2026-09 신설] 64팀 체제 — WC_EXPAND_YEAR_64가 설정되기 전까지는
+    # 이 항목 자체가 그냥 미사용 상태(아무 대회도 tournament_type=
+    # "world_cup_64"로 생성되지 않음). 16조(64팀)라 그룹 라운드당
+    # 경기수만 world_cup_48(12조)의 4/3배(24→32)로 늘고, KO 체인은
+    # world_cup_48과 완전히 동일(조 1·2위=32팀이 정확히 떨어져서
+    # best-3rd 구제가 필요 없어 브래킷 크기가 48팀 체제의 R32와 같음).
+    "world_cup_64": [
+        {"stage": "group", "round": 1, "match_count": 32, "days": 4, "rest_after": 0, "cap": 8, "min_rest": 0},
+        {"stage": "group", "round": 2, "match_count": 32, "days": 4, "rest_after": 0, "cap": 8, "min_rest": 2},
+        {"stage": "group", "round": 3, "match_count": 32, "days": 4, "rest_after": 2, "cap": 8, "min_rest": 2},
+        {"stage": "R32",   "round": 1, "match_count": 16, "days": 1, "rest_after": 3, "cap": 16, "min_rest": 2},
+        {"stage": "R16",   "round": 1, "match_count": 8,  "days": 1, "rest_after": 3, "cap": 8, "min_rest": 2},
+        {"stage": "QF",    "round": 1, "match_count": 4,  "days": 1, "rest_after": 3, "cap": 4, "min_rest": 3},
+        {"stage": "SF",    "round": 1, "match_count": 2,  "days": 1, "rest_after": 3, "cap": 2, "min_rest": 3},
+        {"stage": "TP",    "round": 1, "match_count": 1,  "days": 1, "rest_after": 0, "cap": 1, "min_rest": 3},
+        {"stage": "F",     "round": 1, "match_count": 1,  "days": 1, "rest_after": 0, "cap": 1, "min_rest": 3},
+    ],
     # [잠정] 대륙컵(24개국, 6조): 조별리그 매치수만 world_cup_32의 3/4 규모로
     # 축소하고 나머지 라운드 구조는 동일하게 재사용. 실전 확인 전까지 잠정치.
     "continental": [
@@ -2604,48 +2621,85 @@ EURO_QUAL = {
     },
 }
 
+# ══════════════════════════════════════════════════════════════
+# [2026-09 전면 재설계, 신민용 리포트: "월드컵 예선전이 현실보다 가혹함"]
+# 기존 구조는 북미/아시아/아프리카에서 "조 1위 전원"이 시드 없는 완전
+# 무작위(random.shuffle) 단판(승부차기 포함) 플레이오프 대상이 되어, 자기
+# 조 최강팀도 정확히 절반이 동전던지기 한 판으로 탈락했다 — 실제 FIFA
+# 예선은 조 1위가 이렇게 쉽게 떨어지지 않는다(직행이거나, 플레이오프가
+# 있어도 다리 수가 많거나 애매한 순위만 대상).
+#
+# [재설계, 신민용+ChatGPT 설계 확정] "1차 조별리그(4팀, 편도 3경기)→상위
+# 2팀→2차 조별리그(4팀, 편도 3경기, 1차 1위/2위 포트로 재편성)→직행/
+# 와일드카드/(필요시)PO" 2단계 구조로 교체. 예선 창(4주=28일, 169~196일)
+# 안에서 매치데이 수가 기존(왕복6+PO1=7)과 정확히 동일(편도3+편도3+PO1=7)
+# 해서 캘린더 변경이 전혀 필요 없다 — 169/173/177(1차)/181/185/189(2차)/
+# 193(PO) 그대로. 유럽·남미는 참가국이 적거나 티켓이 많아 기존처럼
+# 단일단계(조별리그 왕복6경기)를 그대로 유지한다(단, 유럽 플레이오프는
+# 이제 완전 무작위 대신 시드 배정 — 상위 시드가 하위 시드와 붙는다).
+#
+# qual_cfg 스키마(대륙 하나당 dict):
+#   cutoff_bottom, n_groups, group_size, legs(1=편도/2=왕복) — 1차(단일단계면
+#   유일한) 조별리그 구성
+#   "stage2" 키가 있으면 2단계 체제: stage2 안에 그 단계의
+#     n_groups/direct_top/wildcard_rank/wildcard_count/po_* 를 담는다.
+#     advance_per_group1(기본 2)만큼 1차 각 조 상위팀이 2차로 진출.
+#   "stage2"가 없으면 단일단계: direct_top(매 조 상위 K팀이 조간비교 없이
+#     그대로 직행)/wildcard_rank+wildcard_count(특정 순위끼리 조간 성적
+#     비교해 상위 N팀 추가 직행)/po_teams+po_winners+po_pool_rank+po_seeded
+#     (특정 순위끼리 조간비교해 상위 po_teams팀이 PO, po_seeded=True면
+#     강한 시드가 약한 시드와 붙게 페어링, False면 기존처럼 무작위)
+#   quota — 이 대륙 최종 티켓 수(검증용, 항상 direct_top/wildcard_count/
+#     po_winners 합과 일치해야 함)
+# ══════════════════════════════════════════════════════════════
+
 WC_QUAL_32 = {
     "유럽": {
-        "cutoff_bottom": 6,    # 54 - 6 = 48개국 → 12조×4팀
-        "n_groups": 12, "group_size": 4,
-        "direct": 12,          # 조 1위 12팀 직행
-        "po_teams": 2,         # 조 2위 중 성적 상위 2팀 → 단판 1매치
-        "po_winners": 1,       # 승자 1팀 추가 (총 13)
-        "wildcard": 0, "quota": 13,
+        "cutoff_bottom": 6, "n_groups": 12, "group_size": 4, "legs": 2,
+        "direct_top": 1,                      # 조 1위 12팀 직행
+        "wildcard_rank": 0, "wildcard_count": 0,
+        "po_teams": 2, "po_winners": 1, "po_pool_rank": 2, "po_seeded": True,
+        "quota": 13,
     },
-    # [2026-09 개편] "아메리카"(45개국, 쿼터8) → 남미(12개국)/북미(33개국)로
-    # 분리. 남미는 국가 수가 3그룹×4팀에 딱 맞아 컷오프가 필요 없다.
     "남미": {
-        "cutoff_bottom": 0,    # 12개국 그대로 → 3조×4팀
-        "n_groups": 3, "group_size": 4,
-        "direct": 3,           # 조 1위 3팀 직행
-        "po_teams": 0, "po_winners": 0,
-        "wildcard": 2,         # 조 2위 중 성적 상위 2팀 와카 (총 5)
+        "cutoff_bottom": 0, "n_groups": 3, "group_size": 4, "legs": 2,
+        "direct_top": 1,                      # 조 1위 3팀 직행
+        "wildcard_rank": 2, "wildcard_count": 2,   # 조 2위 중 상위 2팀
+        "po_teams": 0, "po_winners": 0, "po_pool_rank": 0, "po_seeded": False,
         "quota": 5,
     },
     "북미": {
-        "cutoff_bottom": 9,    # 33 - 9 = 24개국 → 6조×4팀
-        "n_groups": 6, "group_size": 4,
-        "direct": 0,
-        "po_teams": 6,         # 조 1위 6팀 → 단판 3매치
-        "po_winners": 3,
-        "wildcard": 0, "quota": 3,
+        "cutoff_bottom": 9, "n_groups": 6, "group_size": 4, "legs": 1,
+        "advance_per_group1": 2,
+        "stage2": {
+            "n_groups": 3,                     # 1차 6조 top2=12팀 → 2차 3조×4
+            "direct_top": 1,                   # 2차 조 1위 3팀 직행
+            "wildcard_rank": 0, "wildcard_count": 0,
+            "po_teams": 0, "po_winners": 0, "po_pool_rank": 0, "po_seeded": False,
+        },
+        "quota": 3,
     },
     "아시아": {
-        "cutoff_bottom": 18,   # 58 - 18 = 40개국 → 10조×4팀
-        "n_groups": 10, "group_size": 4,
-        "direct": 0,
-        "po_teams": 10,        # 조 1위 10팀 → 단판 5매치
-        "po_winners": 5,
-        "wildcard": 0, "quota": 5,
+        "cutoff_bottom": 18, "n_groups": 10, "group_size": 4, "legs": 1,
+        "advance_per_group1": 2,
+        "stage2": {
+            "n_groups": 5,                     # 1차 10조 top2=20팀 → 2차 5조×4
+            "direct_top": 1,                   # 2차 조 1위 5팀 직행
+            "wildcard_rank": 0, "wildcard_count": 0,
+            "po_teams": 0, "po_winners": 0, "po_pool_rank": 0, "po_seeded": False,
+        },
+        "quota": 5,
     },
     "아프리카": {
-        "cutoff_bottom": 6,    # 54 - 6 = 48개국 → 12조×4팀
-        "n_groups": 12, "group_size": 4,
-        "direct": 0,
-        "po_teams": 12,        # 조 1위 12팀 → 단판 6매치
-        "po_winners": 6,
-        "wildcard": 0, "quota": 6,
+        "cutoff_bottom": 6, "n_groups": 12, "group_size": 4, "legs": 1,
+        "advance_per_group1": 2,
+        "stage2": {
+            "n_groups": 6,                     # 1차 12조 top2=24팀 → 2차 6조×4
+            "direct_top": 1,                   # 2차 조 1위 6팀 직행
+            "wildcard_rank": 0, "wildcard_count": 0,
+            "po_teams": 0, "po_winners": 0, "po_pool_rank": 0, "po_seeded": False,
+        },
+        "quota": 6,
     },
 }
 
@@ -2659,61 +2713,142 @@ WC_BEST_THIRDS_BIG = 8
 # [2026-09 개편] "아메리카"(13장) → 남미 7 + 북미 6으로 분리(합계 불변).
 WC_QUOTA_BIG = {"유럽": 16, "남미": 7, "북미": 6, "아시아": 10, "아프리카": 9}
 
-# 예선 세부 구조 (48팀 체제)
+# 예선 세부 구조 (48팀 체제) — 위 WC_QUAL_32와 동일한 신규 스키마
 WC_QUAL_48 = {
-    # 48팀 체제: 32팀 체제보다 참가국 많거나 같고, 뽑히는 팀도 증가.
-    # WC_EXPAND_YEAR(constants.py) 값에 연동되므로 해당 값만 바꾸면 자동 적용.
     "유럽": {
-        "cutoff_bottom": 6,    # 54 - 6 = 48개국 → 12조×4팀 (32팀 체제와 동일)
-        "n_groups": 12, "group_size": 4,
-        "direct": 12,          # 조 1위 12팀 직행
-        "po_teams": 8,         # 조 2위 중 성적 상위 8팀 → 단판 4매치
-        "po_winners": 4,       # 승자 4팀 추가 (총 16)
-        "wildcard": 0, "quota": 16,
+        "cutoff_bottom": 6, "n_groups": 12, "group_size": 4, "legs": 2,
+        "direct_top": 1,                      # 조 1위 12팀 직행
+        "wildcard_rank": 0, "wildcard_count": 0,
+        "po_teams": 8, "po_winners": 4, "po_pool_rank": 2, "po_seeded": True,
+        "quota": 16,
     },
-    # [2026-09 개편] "아메리카"(쿼터13) → 남미(12개국)/북미(33개국)로 분리.
     "남미": {
-        "cutoff_bottom": 0,    # 12개국 그대로 → 3조×4팀 (32팀 체제와 동일 조 편성)
-        "direct": 3,           # 조 1위 3팀 직행
-        "n_groups": 3, "group_size": 4,
-        "po_teams": 0, "po_winners": 0,
-        "wildcard": 3,         # 조 2위 3팀 전원 와카 (총 6)
+        "cutoff_bottom": 0, "n_groups": 3, "group_size": 4, "legs": 2,
+        "direct_top": 1,                      # 조 1위 3팀 직행
+        "wildcard_rank": 2, "wildcard_count": 3,   # 조 2위 3팀 전원
+        "po_teams": 0, "po_winners": 0, "po_pool_rank": 0, "po_seeded": False,
         "quota": 6,
     },
     "북미": {
-        "cutoff_bottom": 1,    # 33 - 1 = 32개국 → 8조×4팀 (32팀 체제 24개국 → 32개국)
-        "n_groups": 8, "group_size": 4,
-        "direct": 7,           # 조 1위 8팀 중 상위 7팀 직행
-        "po_teams": 0, "po_winners": 0,
-        "wildcard": 0, "quota": 7,
+        "cutoff_bottom": 1, "n_groups": 8, "group_size": 4, "legs": 1,
+        "advance_per_group1": 2,
+        "stage2": {
+            "n_groups": 4,                     # 1차 8조 top2=16팀 → 2차 4조×4
+            "direct_top": 1,                   # 2차 조 1위 4팀 직행
+            "wildcard_rank": 2, "wildcard_count": 3,   # 2차 조 2위 중 상위 3팀
+            "po_teams": 0, "po_winners": 0, "po_pool_rank": 0, "po_seeded": False,
+        },
+        "quota": 7,
     },
     "아시아": {
-        "cutoff_bottom": 18,   # 58 - 18 = 40개국 → 10조×4팀 (32팀 체제와 동일)
-        "n_groups": 10, "group_size": 4,
-        "direct": 10,          # 조 1위 10팀 전원 직행 (PO→전원통과는 단판구현 불가)
-        "po_teams": 0, "po_winners": 0,
-        "wildcard": 0, "quota": 10,
+        "cutoff_bottom": 18, "n_groups": 10, "group_size": 4, "legs": 1,
+        "advance_per_group1": 2,
+        "stage2": {
+            "n_groups": 5,                     # 1차 10조 top2=20팀 → 2차 5조×4
+            "direct_top": 2,                   # 2차 조 1·2위 전원 직행(5×2=10)
+            "wildcard_rank": 0, "wildcard_count": 0,
+            "po_teams": 0, "po_winners": 0, "po_pool_rank": 0, "po_seeded": False,
+        },
+        "quota": 10,
     },
     "아프리카": {
-        "cutoff_bottom": 6,    # 54 - 6 = 48개국 → 12조×4팀 (32팀 체제 50개국 → 48개국)
-        "n_groups": 12, "group_size": 4,
-        # [2026-08 버그수정, 신민용 리포트: "48강으로 확장됐는데 오히려
-        # 국제대회(예선) 화면에서 아프리카 진출팀이 회색(탈락)으로 더
-        # 많이 뜬다"] 원래 direct=9(조 1위 12팀 중 상위 9팀만 직행, 나머지
-        # 3팀+조 2위 전원은 애초에 진출 경로가 0)이었다 — 쿼터가 6→9로
-        # 늘었는데 그 늘어난 자리를 전부 "조 1위 순위 컷"으로만 채워서,
-        # 조 2위는 기회 자체가 없고 조 1위조차 3팀은 곧바로 탈락 처리됐다.
-        # 유럽/아메리카가 이미 쓰는 "조 1위 직행 + 조 2위 와일드카드"
-        # 패턴으로 맞춘다 — direct 6(상위 6팀) + wildcard 3(조 2위 중
-        # 상위 3팀) = 9(쿼터 그대로 유지), 대신 이제 조 2위 팀들도 진짜
-        # 진출 기회를 갖는다(32팀 체제 때 조 1위 12팀 전원이 플레이오프
-        # 기회를 가졌던 것과 비슷하게, 기회 자체가 아예 없어지진 않게).
-        "direct": 6,
-        "po_teams": 0, "po_winners": 0,
-        "wildcard": 3,          # 조 2위 중 성적 상위 3팀 와카 (총 9)
+        "cutoff_bottom": 6, "n_groups": 12, "group_size": 4, "legs": 1,
+        "advance_per_group1": 2,
+        "stage2": {
+            "n_groups": 6,                     # 1차 12조 top2=24팀 → 2차 6조×4
+            "direct_top": 1,                   # 2차 조 1위 6팀 직행
+            "wildcard_rank": 2, "wildcard_count": 3,   # 2차 조 2위 중 상위 3팀
+            "po_teams": 0, "po_winners": 0, "po_pool_rank": 0, "po_seeded": False,
+        },
         "quota": 9,
     },
 }
+
+# ══════════════════════════════════════════════════════════════
+# [2026-09 신설, 신민용: "64팀 본선 — 나중에 켤 것"] 언제든 켤 수 있게
+# 미리 설계·구현만 해두고, 실제 활성화는 WC_EXPAND_YEAR_64에 연도를
+# 넣기 전까지 절대 발동하지 않는다(None이면 완전 비활성 — wc_tier()가
+# 어떤 연도를 넣어도 32/48만 반환). 활성화하려면 이 상수 하나만 실제
+# 연도(int)로 바꾸면 그 해부터 자동으로 64팀 체제로 전환된다.
+# ══════════════════════════════════════════════════════════════
+WC_EXPAND_YEAR_64 = None   # 예: 2038 로 바꾸면 그 해부터 64팀 활성화. None=비활성
+WC_TEAMS_64  = 64
+WC_GROUPS_64 = 16   # 16조×4팀 → 조 1·2위(32팀)가 정확히 32강 브래킷과 일치
+# best-3rd 구제가 필요 없음(48팀 체제와 달리 조/팀 수가 딱 떨어짐)
+WC_QUOTA_64 = {"유럽": 22, "남미": 8, "북미": 9, "아시아": 13, "아프리카": 12}
+
+WC_QUAL_64 = {
+    "유럽": {
+        "cutoff_bottom": 6, "n_groups": 12, "group_size": 4, "legs": 2,
+        "direct_top": 1,                      # 조 1위 12팀 직행
+        "wildcard_rank": 2, "wildcard_count": 8,   # 조 2위 중 상위 8팀 직행
+        "po_teams": 4, "po_winners": 2, "po_pool_rank": 2, "po_seeded": True,
+        "quota": 22,                          # 12+8+2=22
+    },
+    # [특수 케이스] 남미는 64팀 체제에서 8/12장(2/3)이나 줘야 해서 4팀 조
+    # 방식이 안 맞는다 — 12개국을 6팀씩 2개조로 나눠(편도 5경기) 각 조
+    # 1~4위(상위 4팀)가 그대로 직행. 조별비교/와일드카드/PO 전부 불필요.
+    "남미": {
+        "cutoff_bottom": 0, "n_groups": 2, "group_size": 6, "legs": 1,
+        "direct_top": 4,                      # 매 조 1~4위 직행(조간비교 없음)
+        "wildcard_rank": 0, "wildcard_count": 0,
+        "po_teams": 0, "po_winners": 0, "po_pool_rank": 0, "po_seeded": False,
+        "quota": 8,                           # 2조×4=8
+    },
+    "북미": {
+        "cutoff_bottom": 1, "n_groups": 8, "group_size": 4, "legs": 1,
+        "advance_per_group1": 2,
+        "stage2": {
+            "n_groups": 4,                     # 1차 8조 top2=16팀 → 2차 4조×4
+            "direct_top": 2,                   # 2차 조 1·2위 전원 직행(4×2=8)
+            "wildcard_rank": 3, "wildcard_count": 1,   # 2차 조 3위 중 상위 1팀
+            "po_teams": 0, "po_winners": 0, "po_pool_rank": 0, "po_seeded": False,
+        },
+        "quota": 9,                           # 8+1=9
+    },
+    "아시아": {
+        "cutoff_bottom": 18, "n_groups": 10, "group_size": 4, "legs": 1,
+        "advance_per_group1": 2,
+        "stage2": {
+            "n_groups": 5,                     # 1차 10조 top2=20팀 → 2차 5조×4
+            "direct_top": 2,                   # 2차 조 1·2위 전원 직행(5×2=10)
+            "wildcard_rank": 3, "wildcard_count": 3,   # 2차 조 3위 중 상위 3팀
+            "po_teams": 0, "po_winners": 0, "po_pool_rank": 0, "po_seeded": False,
+        },
+        "quota": 13,                          # 10+3=13
+    },
+    "아프리카": {
+        "cutoff_bottom": 6, "n_groups": 12, "group_size": 4, "legs": 1,
+        "advance_per_group1": 2,
+        "stage2": {
+            "n_groups": 6,                     # 1차 12조 top2=24팀 → 2차 6조×4
+            "direct_top": 2,                   # 2차 조 1·2위 전원 직행(6×2=12)
+            "wildcard_rank": 0, "wildcard_count": 0,
+            "po_teams": 0, "po_winners": 0, "po_pool_rank": 0, "po_seeded": False,
+        },
+        "quota": 12,                          # 6×2=12
+    },
+}
+
+
+def wc_tier(year: int) -> int:
+    """해당 연도의 월드컵 체제(32/48/64)를 반환. WC_EXPAND_YEAR_64가
+    None(기본값, 비활성)이면 64는 절대 반환하지 않는다 — 64팀 인프라가
+    코드에 전부 구현되어 있어도, 이 값을 실제 연도로 바꾸기 전까지는
+    아무 것도 바뀌지 않는다(기존 32→48 전환과 완전히 동일한 방식)."""
+    if WC_EXPAND_YEAR_64 is not None and year >= WC_EXPAND_YEAR_64:
+        return 64
+    if year >= WC_EXPAND_YEAR:
+        return 48
+    return 32
+
+
+WC_TEAMS_BY_TIER  = {32: WC_TEAMS, 48: WC_TEAMS_BIG, 64: WC_TEAMS_64}
+WC_GROUPS_BY_TIER = {32: WC_GROUPS, 48: WC_GROUPS_BIG, 64: WC_GROUPS_64}
+WC_QUOTA_BY_TIER  = {32: WC_QUOTA, 48: WC_QUOTA_BIG, 64: WC_QUOTA_64}
+WC_QUAL_BY_TIER   = {32: WC_QUAL_32, 48: WC_QUAL_48, 64: WC_QUAL_64}
+WC_BEST_THIRDS_BY_TIER = {32: 0, 48: WC_BEST_THIRDS_BIG, 64: 0}
+WC_SCHEDULE_KEY_BY_TIER = {32: "world_cup_32", 48: "world_cup_48", 64: "world_cup_64"}
 
 # 국가 등급 → 대표팀 전력(OVR) / 예선 기본 점수
 # [버그수정 2026-07, 신민용 지적] "SS"(잉글랜드/EPL) 키가 이 4개 표에

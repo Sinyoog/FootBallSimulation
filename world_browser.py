@@ -3027,6 +3027,17 @@ def get_ballon_dor_winner(year):
 # 따로 쿼리하지 않고 이 선수의 전체 수상 이력을 한 번의 쿼리로 캐싱 —
 # _populate_player_team_box가 이미 연도 목록을 한 번에 순회하는 구조라
 # 여기서도 한 번만 조회하는 게 자연스럽다).
+# [2026-09 신설] game_engine._save_club_comp_award_rows가 월드컵 골든볼을
+# rank=1/2/3(골든볼/실버볼/브론즈볼)까지 저장하지만, award_kind/award_type
+# 문자열 자체는 세 순위 모두 "골든볼"로 통일해서 저장한다(스키마·기존
+# 조회 하위호환 목적 — 자세한 설계 이유는 game_engine._save_club_comp_
+# award_rows 주석 참고). 그래서 이 순위→실제 명칭 매핑을 world_browser
+# (데이터 레이어)에 단일 소스로 두고, get_player_awards_by_year(이 함수)와
+# ui/world_browser_window.py의 "역대 개인상" 표시 둘 다 이걸 그대로
+# 가져다 쓴다 — 하나만 고치면 두 곳 다 항상 일치.
+WC_BALL_RANK_LABEL = {1: "골든볼", 2: "실버볼", 3: "브론즈볼"}
+
+
 def get_player_awards_by_year(player_id):
     """{year: [표시용 문자열, ...]} — 그 선수가 받은 모든 개인상을 연도별로
     묶어서 반환. 표시 문자열은 award_type(예: "발롱도르", "프리미어리그
@@ -3037,12 +3048,17 @@ def get_player_awards_by_year(player_id):
         숫자 자체는 의미가 없으므로 대신 포지션을 "(ST)"처럼 덧붙인다.
       - 구단 올해의 선수는 팀마다 rank(1,2,3...)로 구분되는 서로 다른
         팀 상이라 팀명을 "(레알 마드리드)"처럼 덧붙인다.
-      - 나머지(MVP/득점왕/도움왕/영플레이어/올해의 수비수/골든글러브/
-        골든볼 등)는 애초에 부문당 1명뿐이라 rank가 항상 1이므로 그냥
+      - [2026-09 신설] 월드컵 골든볼은 award_type/award_kind가 rank
+        1/2/3 전부 "골든볼"로 통일 저장돼 있으므로(위 WC_BALL_RANK_LABEL
+        주석 참고), rank를 보고 골든볼/실버볼/브론즈볼로 다시 풀어서
+        보여준다 — 안 그러면 실버볼·브론즈볼 수상자도 그냥 "월드컵
+        골든볼"로 표시돼 버린다.
+      - 나머지(MVP/득점왕/도움왕/영플레이어/올해의 수비수/골든글러브
+        등)는 애초에 부문당 1명뿐이라 rank가 항상 1이므로 그냥
         award_type 그대로 보여준다."""
     conn = get_conn()
     rows = conn.execute(
-        """SELECT year, award_type, award_kind, rank, position, team_name
+        """SELECT year, award_type, award_kind, rank, position, team_name, competition
            FROM hist.season_individual_awards WHERE player_id=? ORDER BY year, rank""",
         (player_id,)).fetchall()
     conn.close()
@@ -3058,6 +3074,9 @@ def get_player_awards_by_year(player_id):
             label = f"{r['award_type']}" + (f" ({r['position']})" if r["position"] else "")
         elif kind == "구단 올해의 선수":
             label = f"{r['award_type']}" + (f" ({r['team_name']})" if r["team_name"] else "")
+        elif kind == "골든볼":
+            ball_name = WC_BALL_RANK_LABEL.get(r["rank"], kind)
+            label = f"{(r['competition'] or '').strip()} {ball_name}".strip()
         else:
             label = r["award_type"]
         by_year.setdefault(r["year"], []).append(label)
@@ -3973,7 +3992,20 @@ _INTL_KO_STAGE_ORDER = ["qual_po", "R32", "R16", "QF", "SF", "TP", "F"]
 
 
 def get_intl_tournament_detail(tournament_id):
-    """월드컵/네이션스컵 한 대회의 조별리그 순위표 + 토너먼트(녹아웃) 대진."""
+    """월드컵/네이션스컵 한 대회의 조별리그 순위표 + 토너먼트(녹아웃) 대진.
+
+    [2026-09 버그수정, 신민용 리포트: "조별리그가 1차/2차 두 단계로 나뉘는
+    대회(아시아/북미/아프리카 월드컵 예선 32·48·64강 체제, 아프리카 포함)에서
+    세계 축구 기록실을 보면 1차가 통째로 사라지고 2차만 뜬다"] 예전에는 2차
+    조("S2-"로 시작)가 존재하면 1차 엔트리를 아예 버리고 2차만 "조별리그"라는
+    이름으로 보여줬다(첫 스크린샷처럼 "조별리그" 팝업 안에 S2-A~D 4개 조뿐이고
+    1차 A~L조는 통째로 빠짐). 이제 1차는 "groups", 2차는 "groups2"로 각각
+    따로 계산해서 둘 다 돌려주고, 호출부(UI)가 "조별리그1"/"조별리그2" 두
+    섹션으로 나눠 그릴 수 있게 한다. "advanced_from_stage1"(1차→2차 진출국 —
+    2차 엔트리에 이름이 있으면 진출한 것으로 판정)도 같이 담아, 1차 표에서는
+    "최종 월드컵 진출"이 아니라 "2차 진출" 기준으로 흰색/회색을 칠하게 한다.
+    2단계가 아닌(단일 조별리그) 대회는 예전과 동일하게 groups 하나만 채워지고
+    groups2는 빈 dict, advanced_from_stage1은 None으로 남는다."""
     from intl_engine import STAGE_KO
     conn = get_conn(); c = conn.cursor()
 
@@ -3984,35 +4016,52 @@ def get_intl_tournament_detail(tournament_id):
     entries = [dict(r) for r in c.execute(
         "SELECT country, flag, grade, grp FROM intl_entries "
         "WHERE tournament_id=? AND grp != ''", (tournament_id,)).fetchall()]
-    groups = {}
-    for e in entries:
-        groups.setdefault(e["grp"], []).append({
-            "country": e["country"], "flag": e["flag"], "grade": e["grade"],
-            "wins": 0, "draws": 0, "losses": 0, "gf": 0, "ga": 0})
-    idx = {(g, t["country"]): t for g, teams in groups.items() for t in teams}
+    # [2026-09] 2단계 예선(북미/아시아/아프리카, wc_qual)은 같은 tournament_id
+    # 안에 1차 조("A".."L")와 2차 조("S2-A"..) 엔트리가 함께 들어있다.
+    _has_stage2 = any(e["grp"].startswith("S2-") for e in entries)
 
-    for m in c.execute(
-            "SELECT grp, home, away, home_score, away_score FROM intl_matches "
-            "WHERE tournament_id=? AND stage IN ('group','qual_group') AND home_score>=0",
-            (tournament_id,)).fetchall():
-        h, a = idx.get((m["grp"], m["home"])), idx.get((m["grp"], m["away"]))
-        if not h or not a:
-            continue
-        h["gf"] += m["home_score"]; h["ga"] += m["away_score"]
-        a["gf"] += m["away_score"]; a["ga"] += m["home_score"]
-        if m["home_score"] > m["away_score"]:   h["wins"] += 1;  a["losses"] += 1
-        elif m["home_score"] < m["away_score"]: a["wins"] += 1;  h["losses"] += 1
-        else:                                   h["draws"] += 1; a["draws"] += 1
-    for teams in groups.values():
-        for t in teams:
-            t["pts"] = t["wins"] * 3 + t["draws"]
-            t["gd"] = t["gf"] - t["ga"]
-        teams.sort(key=lambda t: (-t["pts"], -t["gd"], -t["gf"]))
+    def _build_groups(stage_entries, stage_names):
+        groups = {}
+        for e in stage_entries:
+            groups.setdefault(e["grp"], []).append({
+                "country": e["country"], "flag": e["flag"], "grade": e["grade"],
+                "wins": 0, "draws": 0, "losses": 0, "gf": 0, "ga": 0})
+        idx = {(g, t["country"]): t for g, teams in groups.items() for t in teams}
+        placeholders = ",".join("?" * len(stage_names))
+        for m in c.execute(
+                f"SELECT grp, home, away, home_score, away_score FROM intl_matches "
+                f"WHERE tournament_id=? AND stage IN ({placeholders}) AND home_score>=0",
+                (tournament_id, *stage_names)).fetchall():
+            h, a = idx.get((m["grp"], m["home"])), idx.get((m["grp"], m["away"]))
+            if not h or not a:
+                continue
+            h["gf"] += m["home_score"]; h["ga"] += m["away_score"]
+            a["gf"] += m["away_score"]; a["ga"] += m["home_score"]
+            if m["home_score"] > m["away_score"]:   h["wins"] += 1;  a["losses"] += 1
+            elif m["home_score"] < m["away_score"]: a["wins"] += 1;  h["losses"] += 1
+            else:                                   h["draws"] += 1; a["draws"] += 1
+        for teams in groups.values():
+            for t in teams:
+                t["pts"] = t["wins"] * 3 + t["draws"]
+                t["gd"] = t["gf"] - t["ga"]
+            teams.sort(key=lambda t: (-t["pts"], -t["gd"], -t["gf"]))
+        return groups
+
+    groups2 = {}
+    advanced_from_stage1 = None
+    if _has_stage2:
+        stage1_entries = [e for e in entries if not e["grp"].startswith("S2-")]
+        stage2_entries = [e for e in entries if e["grp"].startswith("S2-")]
+        groups = _build_groups(stage1_entries, ("qual_group",))
+        groups2 = _build_groups(stage2_entries, ("qual_group2",))
+        advanced_from_stage1 = {e["country"] for e in stage2_entries}
+    else:
+        groups = _build_groups(entries, ("group", "qual_group"))
 
     ko_rows = c.execute(
         "SELECT stage, home, away, home_score, away_score, pso_winner, pso_score "
         "FROM intl_matches WHERE tournament_id=? AND stage NOT IN "
-        "('group','qual_group') AND home_score>=0 ORDER BY id",
+        "('group','qual_group','qual_group2') AND home_score>=0 ORDER BY id",
         (tournament_id,)).fetchall()
     conn.close()
 
@@ -4051,7 +4100,8 @@ def get_intl_tournament_detail(tournament_id):
             if m.get("away"):
                 qualified.add(m["away"])
 
-    return {"groups": groups, "knockout": knockout, "qualified": qualified}
+    return {"groups": groups, "groups2": groups2, "advanced_from_stage1": advanced_from_stage1,
+            "knockout": knockout, "qualified": qualified}
 
 
 def get_country_intl_match_log(tournament_id, country_name):
@@ -4062,17 +4112,31 @@ def get_country_intl_match_log(tournament_id, country_name):
     개별 경기(상대·스코어·승/무/패)로 풀어서 반환한다. 같이 group_standings
     (이 국가가 속한 조의 순위표, get_intl_tournament_detail의 groups 계산과
     동일한 로직을 그 조 하나에만 적용)도 함께 담아 화면이 예시로 보여준
-    "조 순위표 + 라운드별 상대전적" 두 부분을 그대로 구성할 수 있게 한다."""
+    "조 순위표 + 라운드별 상대전적" 두 부분을 그대로 구성할 수 있게 한다.
+
+    [2026-09 버그수정, 신민용 리포트: "조별리그가 1차/2차 두 단계로 나뉘는
+    대회(아시아/북미/아프리카 월드컵 예선 32·48·64강 체제, 아프리카 포함)를
+    세계 축구 기록실에서 보면 조별리그1 순위표/조별리그1 결과/조별리그2
+    순위표/조별리그2 결과 이렇게 4개로 나뉘어 떠야 하는데 하나로 뭉개져서
+    뜬다"] 예전에는 `ORDER BY (grp LIKE 'S2-%') DESC` + fetchone()으로 2차
+    조 엔트리가 있으면 1차 조 엔트리를 아예 버리고 하나만 골랐다(2차가
+    없으면 1차만 있으니 결과적으로 매번 그룹 하나짜리 dict만 반환) — 그래서
+    이 나라가 1차/2차 모두 뛴 대회에서도 순위표는 2차 것 하나만 나왔다.
+    이제 이 나라가 속한 조 엔트리를(1차/2차 각각 있으면 둘 다) 전부 모아
+    group_standings를 "리스트"로 반환한다(1차가 있으면 [0]이 1차,
+    2차까지 있으면 [1]이 2차 — 순서 보장을 위해 fetchall 후 정렬)."""
     from intl_engine import STAGE_KO
     conn = get_conn(); c = conn.cursor()
 
-    grp_row = c.execute(
-        "SELECT grp FROM intl_entries WHERE tournament_id=? AND country=?",
-        (tournament_id, country_name)).fetchone()
-    my_group = grp_row["grp"] if grp_row and grp_row["grp"] else None
+    grp_rows = [dict(r) for r in c.execute(
+        "SELECT grp FROM intl_entries WHERE tournament_id=? AND country=? "
+        "AND grp != '' ORDER BY (grp LIKE 'S2-%') ASC",
+        (tournament_id, country_name)).fetchall()]
+    my_groups = [(r["grp"], "qual_group2" if r["grp"].startswith("S2-") else "qual_group")
+                 for r in grp_rows]
 
-    group_standings = None
-    if my_group:
+    group_standings_list = []
+    for my_group, my_group_stage in my_groups:
         entries = [dict(r) for r in c.execute(
             "SELECT country, flag, grade FROM intl_entries "
             "WHERE tournament_id=? AND grp=?", (tournament_id, my_group)).fetchall()]
@@ -4080,8 +4144,8 @@ def get_country_intl_match_log(tournament_id, country_name):
                  for e in entries}
         for m in c.execute(
                 "SELECT home, away, home_score, away_score FROM intl_matches "
-                "WHERE tournament_id=? AND grp=? AND stage IN ('group','qual_group') "
-                "AND home_score>=0", (tournament_id, my_group)).fetchall():
+                "WHERE tournament_id=? AND grp=? AND stage IN ('group', ?) "
+                "AND home_score>=0", (tournament_id, my_group, my_group_stage)).fetchall():
             h, a = table.get(m["home"]), table.get(m["away"])
             if not h or not a:
                 continue
@@ -4095,7 +4159,7 @@ def get_country_intl_match_log(tournament_id, country_name):
             t["pts"] = t["wins"] * 3 + t["draws"]
             t["gd"] = t["gf"] - t["ga"]
         rows.sort(key=lambda t: (-t["pts"], -t["gd"], -t["gf"]))
-        group_standings = {"group": my_group, "rows": rows}
+        group_standings_list.append({"group": my_group, "stage": my_group_stage, "rows": rows})
 
     conn.close()
 
@@ -4105,9 +4169,19 @@ def get_country_intl_match_log(tournament_id, country_name):
     # get_intl_tournament_detail()의 qualified 계산(예선 특수룰까지 처리된)을
     # 그대로 재사용한다 — 전체 대회 기준으로 한 번 계산해서 그중 내 조에
     # 해당하는 이름만 걸러 쓰면 되므로, 로직 중복 없이 항상 일관된다.
-    if group_standings is not None:
+    # [2026-09 확장] 1차 조 표는 "최종 월드컵 진출"이 아니라 "2차 진출"
+    # 기준으로 흰색/회색을 칠해야 맞다 — get_intl_tournament_detail이
+    # 함께 계산해주는 advanced_from_stage1(2차 엔트리에 이름이 있는 나라)을
+    # 쓴다. 2차 조 표(또는 애초에 2단계가 아닌 대회의 조 표)는 기존처럼
+    # 최종 qualified 기준.
+    if group_standings_list:
         full_detail = get_intl_tournament_detail(tournament_id)
-        group_standings["qualified"] = full_detail.get("qualified") or set()
+        tournament_has_stage2 = bool(full_detail.get("groups2"))
+        for gs in group_standings_list:
+            if tournament_has_stage2 and gs["stage"] == "qual_group":
+                gs["qualified"] = full_detail.get("advanced_from_stage1") or set()
+            else:
+                gs["qualified"] = full_detail.get("qualified") or set()
 
     conn = get_conn(); c = conn.cursor()
     match_rows = [dict(r) for r in c.execute(
@@ -4117,7 +4191,7 @@ def get_country_intl_match_log(tournament_id, country_name):
         (tournament_id, country_name, country_name)).fetchall()]
     conn.close()
 
-    stage_order = {"group": -2, "qual_group": -2}
+    stage_order = {"group": -2, "qual_group": -2, "qual_group2": -1}
     for i, s in enumerate(_INTL_KO_STAGE_ORDER):
         stage_order[s] = i
     by_stage = {}
@@ -4142,10 +4216,21 @@ def get_country_intl_match_log(tournament_id, country_name):
             matches.append({"opponent": opp, "my_score": my_score,
                              "opp_score": opp_score, "result": result,
                              "pso": bool(pso), "pso_score": m.get("pso_score") or ""})
-        stages.append({"stage": stage, "stage_ko": STAGE_KO.get(stage, stage),
-                        "matches": matches})
+        # [2026-09 버그수정] STAGE_KO는 "qual_group"→"조별리그"(1/2 구분 없음)로만
+        # 돼 있다 — 이 나라가 qual_group2(2차)도 뛴 대회에서는 1차를 그냥
+        # "조별리그"라고만 부르면 2차("조별리그2")와 구분이 안 된다(2번째
+        # 스크린샷에서 1차가 그냥 "조별리그"로, 2차가 라벨 없이 "qual_group2"
+        # 원문으로 새는 게 이 증상). 이 나라가 실제로 두 단계 모두 뛴 경우에만
+        # 1차를 "조별리그1"로 특별 표기하고, 단일 단계 예선은 기존처럼
+        # "조별리그" 그대로 둔다(STAGE_KO에 새로 추가된 "qual_group2"→
+        # "조별리그2"는 그대로 자동 적용됨).
+        if stage == "qual_group" and "qual_group2" in by_stage:
+            stage_ko = "조별리그1"
+        else:
+            stage_ko = STAGE_KO.get(stage, stage)
+        stages.append({"stage": stage, "stage_ko": stage_ko, "matches": matches})
 
-    return {"group_standings": group_standings, "stages": stages}
+    return {"group_standings": group_standings_list, "stages": stages}
 
 
 def get_country_tournament_squad(tournament_id, country_name):

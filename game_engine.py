@@ -10281,29 +10281,56 @@ def _club_comp_squad_pool(c, team_ids, year, competition, my_team_id, my_tournam
     return pool
 
 
+def _mvp_contribution(r):
+    """MVP 산정 기준 점수(참가도×평점, _get_player_comp_contribution과
+    동일한 0.2~1.3배 공식) — _pick_club_comp_mvp_and_scorer와
+    _pick_top_n_mvp가 공유한다. [2026-09 분리, 신민용 요청: "월드컵 골든볼
+    말고 실버볼·브론즈볼도 순위별로 뽑아야 한다"] 원래
+    _pick_club_comp_mvp_and_scorer 안에 지역 함수(closure)로만 있어서
+    "2등·3등"을 따로 뽑을 방법이 없었다 — 모듈 레벨로 빼서 두 함수가
+    완전히 동일한 기준으로 순위를 매기게 한다(그래야 n=1일 때
+    _pick_top_n_mvp의 1위가 _pick_club_comp_mvp_and_scorer의 mvp와
+    항상 일치)."""
+    matches = r.get("matches") or 0
+    if not matches:
+        return -1.0
+    participation = min(1.0, matches / 3.0)
+    quality = max(0.2, min(1.3, 1.0 + ((r.get("rating") or 6.0) - 6.0) / 1.5))
+    return participation * quality
+
+
+def _pick_top_n_mvp(pool, n):
+    """[2026-09 신설, 신민용 확정: "월드컵은 골든볼(1위)만 있는 게 아니라
+    실버볼(2위)·브론즈볼(3위)도 있어야 한다 — 국가/우승팀/준우승팀 제한
+    없이 순수 참가도×평점 순위로만"] pool을 _mvp_contribution 기준
+    내림차순(동점 시 평점 desc → player_id asc, _pick_club_comp_mvp_
+    and_scorer와 완전히 동일한 tie-break)으로 정렬해 상위 n명을 그대로
+    반환한다 — 국적·소속팀에 대한 어떤 필터도 없으므로 같은 나라(심지어
+    우승팀 하나)에서 1~3위가 전부 나와도 그대로 허용된다(사용자가 명시적
+    으로 요구한 동작). 득점왕과는 완전히 별도 함수(goals 기준)라
+    자연스럽게 독립적 — 득점왕이 동시에 top-n에 들어도 배제하지 않는다."""
+    if not pool:
+        return []
+    ranked = sorted(
+        pool, key=lambda r: (-_mvp_contribution(r), -(r.get("rating") or 0), r["player_id"]))
+    return ranked[:n]
+
+
 def _pick_club_comp_mvp_and_scorer(pool):
     """pool(_club_comp_squad_pool 반환값)에서 MVP(참가도×평점 최고,
     _get_player_comp_contribution과 동일한 0.2~1.3배 공식)와 득점왕
     (최다골, 0골이면 없음)을 뽑는다. 동점이면 player_id 오름차순(me=-1이
     가장 먼저)으로 결정론적 tie-break."""
-    def _contribution(r):
-        matches = r.get("matches") or 0
-        if not matches:
-            return -1.0
-        participation = min(1.0, matches / 3.0)
-        quality = max(0.2, min(1.3, 1.0 + ((r.get("rating") or 6.0) - 6.0) / 1.5))
-        return participation * quality
-
     if not pool:
         return None, None
-    mvp = max(pool, key=lambda r: (_contribution(r), r.get("rating") or 0, -r["player_id"]))
+    mvp = max(pool, key=lambda r: (_mvp_contribution(r), r.get("rating") or 0, -r["player_id"]))
     scorers = [r for r in pool if (r.get("goals") or 0) > 0]
     scorer = max(scorers, key=lambda r: (r["goals"], -r["player_id"])) if scorers else None
     return mvp, scorer
 
 
 def _save_club_comp_award_rows(c, year, award_prefix, mvp, scorer, category="club", extra=None,
-                                kind_rename=None):
+                                kind_rename=None, mvp_extra=None):
     """클럽 대항전과 국제대회 둘 다 이 함수를 공유한다(MVP/득점왕/도움왕/
     베스트11/영플레이어/올해의 수비수/골든글러브 선정 기준 자체가 대회
     종류와 무관하므로) — category로 두 카테고리를 구분해 저장한다(기본값
@@ -10318,13 +10345,29 @@ def _save_club_comp_award_rows(c, year, award_prefix, mvp, scorer, category="clu
     [2026-09 확장, 신민용 요청: "월드컵인데 골든부츠나 이런거 하나도
     안 뜨잖아"] kind_rename({"MVP":"골든볼", ...} 형태)을 주면 그 부문
     이름을 실제 그 대회의 공식 명칭으로 바꿔 저장한다 — 월드컵 호출부
-    (_compute_intl_individual_awards)가 넘긴다."""
+    (_compute_intl_individual_awards)가 넘긴다.
+
+    [2026-09 신설, 신민용 요청: "월드컵은 골든볼 말고 실버볼·브론즈볼도
+    떠야 한다"] mvp_extra(_pick_top_n_mvp(pool, 3)[1:] 형태 — mvp
+    바로 다음 순위부터 리스트)가 있으면 같은 "MVP" 부문 이름(kind_rename
+    적용 시 "골든볼")으로 rank=2,3...을 이어서 저장한다. award_type/
+    award_kind 문자열 자체는 rank=1과 완전히 동일하게 "골든볼"로
+    통일한다 — DB에는 rank로만 순위를 구분해두고, 실제 "실버볼"/
+    "브론즈볼"이라는 표시는 world_browser_window의 조회 화면에서
+    rank→이름 매핑으로 입힌다(스키마 변경 없이 기존 골든볼 rank=1
+    조회 코드와도 완전히 하위호환)."""
     def _kn(base):
         return (kind_rename or {}).get(base, base)
     entries = []
     if mvp:
         contribution_score = round((mvp.get("rating") or 0) * min(1.0, (mvp.get("matches") or 0) / 3.0), 2)
         entries.append((_kn("MVP"), 1, _award_entry_from_pool(mvp, total_score=contribution_score)))
+    if mvp_extra:
+        for i, cand in enumerate(mvp_extra):
+            rank = i + 2
+            contribution_score = round(
+                (cand.get("rating") or 0) * min(1.0, (cand.get("matches") or 0) / 3.0), 2)
+            entries.append((_kn("MVP"), rank, _award_entry_from_pool(cand, total_score=contribution_score)))
     if scorer:
         entries.append((_kn("득점왕"), 1, _award_entry_from_pool(scorer, total_score=float(scorer["goals"]))))
     if extra:
@@ -10482,7 +10525,16 @@ def _compute_intl_individual_awards(year):
     재사용한다 — "참가도×평점으로 MVP, 최다골로 득점왕"이라는 기준 자체가
     대회 종류와 무관하기 때문. 월드컵(kind='world')만 _WC_AWARD_KIND_
     RENAME으로 부문 이름을 실제 FIFA 명칭(골든볼/골든부트/영플레이어상)
-    으로 바꿔 저장한다."""
+    으로 바꿔 저장한다.
+
+    [2026-09 신설, 신민용 확정: "월드컵은 골든볼(1위) 하나만 있는 게
+    아니라 실버볼(2위)·브론즈볼(3위)도 있어야 한다 — 챔스/리그 MVP는
+    지금처럼 1명만 유지, 국가/우승팀/준우승팀 제한 절대 없이 순수
+    참가도×평점 순위로만, 득점왕과는 완전히 독립"] kind=='world'일
+    때만 _pick_top_n_mvp(pool, 3)로 상위 3명을 다시 뽑아(mvp와 동일
+    기준이라 1위는 항상 mvp와 같은 선수) 2·3위를 mvp_extra로 넘긴다.
+    대륙컵/지역컵(continent/region)은 원래대로 MVP 1명만 유지 —
+    "월드컵 전용" 원칙 그대로."""
     conn = get_conn(); c = conn.cursor()
     try:
         tournaments = c.execute(
@@ -10494,8 +10546,10 @@ def _compute_intl_individual_awards(year):
             mvp, scorer = _pick_club_comp_mvp_and_scorer(pool)
             extra = _pick_comp_extra_winners(pool)
             kind_rename = _WC_AWARD_KIND_RENAME if t["kind"] == "world" else None
+            mvp_extra = _pick_top_n_mvp(pool, 3)[1:] if (t["kind"] == "world" and pool) else None
             _save_club_comp_award_rows(
-                c, year, t["name"], mvp, scorer, category="intl", extra=extra, kind_rename=kind_rename)
+                c, year, t["name"], mvp, scorer, category="intl", extra=extra, kind_rename=kind_rename,
+                mvp_extra=mvp_extra)
         conn.commit()
     except Exception:
         conn.rollback()

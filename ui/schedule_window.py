@@ -92,16 +92,17 @@ def _intl_advance_count(t):
       - 직행팀수: 조 순위에서 이 순위 이하면 무조건 진출
       - 3위진출여부: True면 3위 팀들 중 일부도 진출 가능(주황 표시)
     """
-    from constants import WC_EXPAND_YEAR
+    from constants import wc_tier, WC_BEST_THIRDS_BY_TIER
     kind = t.get("kind", "")
     year = t.get("year", 0)
 
     if kind == "world":
-        # 48개국(2002~): 12조 → 조 1·2위 직행 + 3위 일부 진출
-        if year >= WC_EXPAND_YEAR:
-            return 2, True
-        # 32개국: 8조 → 조 1·2위 직행
-        return 2, False
+        # 48개국(2002~): 12조 → 조 1·2위 직행 + 3위 일부 진출.
+        # [2026-09 신설] 64팀 체제는 조 1·2위(32팀)가 브래킷과 딱 맞아서
+        # 3위 구제가 없다(WC_BEST_THIRDS_BY_TIER[64]==0) — wc_tier로
+        # 32/48/64를 구분해 has_thirds를 정확히 판정한다.
+        has_thirds = WC_BEST_THIRDS_BY_TIER[wc_tier(year)] > 0
+        return 2, has_thirds
 
     elif kind == "continent":
         # 대륙컵 24개국: 6조 → 조 1·2위 직행 + 3위 일부(CONT_BEST_THIRDS)
@@ -137,7 +138,7 @@ def _intl_third_qualified(t):
     """조별리그 종료 후 3위 중 실제 진출 확정된 국가 집합 반환.
     아직 조별리그 진행 중이면 빈 집합(주황으로 표시할 후보는 별도 처리).
     """
-    from constants import WC_EXPAND_YEAR, CONT_BEST_THIRDS
+    from constants import wc_tier, WC_BEST_THIRDS_BY_TIER, CONT_BEST_THIRDS
     from database import get_conn as _gc
     import intl_engine
 
@@ -148,8 +149,9 @@ def _intl_third_qualified(t):
     year = t.get("year", 0)
     tid  = t["id"]
 
-    # 3위 진출이 없는 대회
-    if kind == "world" and year < WC_EXPAND_YEAR:
+    # 3위 진출이 없는 대회 (64팀 체제는 조 1·2위만으로 브래킷이 딱 맞아
+    # 3위 구제 자체가 없다 — wc_tier로 32/48/64를 구분해서 판정)
+    if kind == "world" and WC_BEST_THIRDS_BY_TIER[wc_tier(year)] == 0:
         return set()
     if kind not in ("world", "continent", "region"):
         return set()
@@ -172,9 +174,8 @@ def _intl_third_qualified(t):
 
     # 몇 팀이 진출하는가
     if kind == "world":
-        # 48개국: 12조 × 3위 → 상위 8팀
-        from constants import WC_BEST_THIRDS_BIG
-        n_adv = WC_BEST_THIRDS_BIG
+        # 48/64개국: 조당 3위 → 상위 N팀(64팀은 위에서 이미 걸러져 여기 도달 안 함)
+        n_adv = WC_BEST_THIRDS_BY_TIER[wc_tier(year)]
     elif kind == "region":
         # [2026-08 신설] 지역컵은 규모가 대회마다 달라서 CONT_BEST_THIRDS
         # 고정값이 아니라, 그 대회 실제 참가국 수로 regional_cup_format을
@@ -595,7 +596,6 @@ class ScheduleWindow(QDialog):
         if mode == "qual_po" and not qual:
             return None
         _is_qual = t.get("kind") in ("wc_qual", "cont_qual")
-        _grp_stage = "qual_group" if _is_qual else "group"
 
         from PyQt6.QtWidgets import QScrollArea, QFrame
         p   = get_player()
@@ -656,6 +656,14 @@ class ScheduleWindow(QDialog):
         groups = [r["grp"] for r in conn.execute(
             "SELECT DISTINCT grp FROM intl_entries WHERE tournament_id=? ORDER BY grp",
             (t["id"],)).fetchall()]
+        # [2026-09 신설] 2단계 예선(북미/아시아/아프리카, wc_qual)은 같은
+        # 대회 안에 1차 조("A".."L")와 2차 조("S2-A"..)가 함께 있다 —
+        # 2차가 이미 생겼으면(1차가 끝났다는 뜻) 2차 조만 "지금의"
+        # 조별리그로 보여주고, 아직 1차뿐이면 1차 그대로 보여준다.
+        _has_stage2 = any(g.startswith("S2-") for g in groups)
+        if _has_stage2:
+            groups = [g for g in groups if g.startswith("S2-")]
+        _grp_stage = ("qual_group2" if _has_stage2 else "qual_group") if _is_qual else "group"
         if _is_qual and mode == "qual_po":
             ko_rows = [dict(r) for r in conn.execute(
                 """SELECT * FROM intl_matches WHERE tournament_id=? AND stage='qual_po'
@@ -720,7 +728,7 @@ class ScheduleWindow(QDialog):
             for g in groups:
                 _it_gs0 = _time_it.perf_counter()
                 if _is_qual:
-                    rows = intl_engine._qual_group_standings(t["id"], g)
+                    rows = intl_engine._qual_group_standings(t["id"], g, stage=_grp_stage)
                     for r in rows:
                         r.setdefault("w", 0); r.setdefault("d", 0); r.setdefault("l", 0)
                 else:
@@ -817,29 +825,44 @@ class ScheduleWindow(QDialog):
             # 경쟁 대상이다 — 대회 설정을 봐서 어느 순위가 실제 PO/와일드
             # 카드 후보인지 판단한다.
             if _is_qual:
-                from constants import WC_QUAL_32, WC_QUAL_48, EURO_QUAL, WC_EXPAND_YEAR
+                from constants import WC_QUAL_BY_TIER, wc_tier, EURO_QUAL
                 _qcontinent = intl_engine._conf_key((t.get("continent") or "").strip() or "유럽")
+                _race_rank_idx = None
                 if t.get("kind") == "cont_qual":
                     _qcfg = EURO_QUAL.get(_qcontinent, {})
+                    _direct_n_for_race = _qcfg.get("direct", len(groups))
+                    _race_rank_idx = 0 if _direct_n_for_race == 0 else 1
                 else:
-                    _qbig = t.get("year", 0) >= WC_EXPAND_YEAR
-                    _qcfg = (WC_QUAL_48 if _qbig else WC_QUAL_32).get(_qcontinent, {})
-                _direct_n_for_race = _qcfg.get("direct", len(groups))
-                _race_rank_idx = 0 if _direct_n_for_race == 0 else 1
-                _race_label = "1위" if _race_rank_idx == 0 else "2위"
+                    # [2026-09 재설계] 신규 스키마(direct_top/wildcard_rank/
+                    # po_pool_rank)에 맞춰 "실제로 경쟁하는 순위"를 계산.
+                    # 2단계 체제(북미/아시아/아프리카)는 1차 진행 중엔
+                    # (아직 2차 조가 없으면=_has_stage2 False) 애초에
+                    # 직행/와일드카드/PO 개념 자체가 없으니 이 표를 스킵.
+                    _root_cfg = WC_QUAL_BY_TIER[wc_tier(t.get("year", 0))].get(_qcontinent, {})
+                    _two_stage = "stage2" in _root_cfg
+                    if not (_two_stage and not _has_stage2):
+                        _active_cfg = _root_cfg.get("stage2") if _two_stage else _root_cfg
+                        _rr = _active_cfg.get("wildcard_rank") or _active_cfg.get("po_pool_rank")
+                        if _rr:
+                            _race_rank_idx = _rr - 1
 
-                runner_rows = []
-                for g in groups:
-                    rows = _group_rows_cache.get(g)
-                    if rows and len(rows) >= _race_rank_idx + 1:
-                        r2 = dict(rows[_race_rank_idx])
-                        r2["grp"] = g
-                        runner_rows.append(r2)
+                if _race_rank_idx is not None:
+                    _race_label = f"{_race_rank_idx + 1}위"
 
-                # 경쟁이 실제로 존재하는 경우에만 표를 그린다 — 전원이
-                # 그냥 직행(status가 전부 'direct')이면 굳이 안 보여준다.
-                _has_runner_race = any(
-                    _qual_status.get(r["country"], "eliminated") != "direct" for r in runner_rows)
+                    runner_rows = []
+                    for g in groups:
+                        rows = _group_rows_cache.get(g)
+                        if rows and len(rows) >= _race_rank_idx + 1:
+                            r2 = dict(rows[_race_rank_idx])
+                            r2["grp"] = g
+                            runner_rows.append(r2)
+
+                    # 경쟁이 실제로 존재하는 경우에만 표를 그린다 — 전원이
+                    # 그냥 직행(status가 전부 'direct')이면 굳이 안 보여준다.
+                    _has_runner_race = any(
+                        _qual_status.get(r["country"], "eliminated") != "direct" for r in runner_rows)
+                else:
+                    runner_rows, _has_runner_race = [], False
 
                 if runner_rows and _has_runner_race:
                     runner_rows.sort(

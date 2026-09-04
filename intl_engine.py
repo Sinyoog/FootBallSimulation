@@ -56,6 +56,10 @@ from constants import (
     CONT_TEAMS, CONT_GROUPS, CONT_BEST_THIRDS,
     CONFEDERATIONS, CONTINENT_TO_CONF, CONF_CUP_NAME,
     WC_QUAL_32, WC_QUAL_48, EURO_QUAL,
+    # [2026-09 신설] 64팀 예선/본선 사전설계(WC_EXPAND_YEAR_64가 None인
+    # 동안은 wc_tier()가 32/48만 반환하므로 비활성 상태 그대로 유지됨).
+    wc_tier, WC_TEAMS_BY_TIER, WC_GROUPS_BY_TIER, WC_QUOTA_BY_TIER,
+    WC_QUAL_BY_TIER, WC_BEST_THIRDS_BY_TIER, WC_SCHEDULE_KEY_BY_TIER,
     GRADE_TEAM_OVR, GRADE_QUAL_BASE, QUAL_NOISE,
     INTL_SELECTION_OVR, INTL_MAX_TIER, INTL_MIN_MATCHES,
     INTL_SELECTION_MARGIN, INTL_SQUAD_QUOTA,
@@ -259,7 +263,16 @@ def _nat_team_ovr(grade, name="", continent="", fast=False, year=None):
     return formula_val
 
 STAGE_KO = {"group": "조별리그", "R32": "32강", "R16": "16강", "QF": "8강", "SF": "4강", "F": "결승", "TP": "3/4위전",
-            "qual_group": "조별리그", "qual_po": "플레이오프"}
+            "qual_group": "조별리그", "qual_group2": "조별리그2", "qual_po": "플레이오프"}
+# [2026-09 버그수정, 신민용 리포트: "세계 축구 기록실에서 조별리그가 1차/2차로
+# 나뉘는 대회(아시아/북미/아프리카 월드컵 예선 32·48·64강 체제)를 보면 1차가
+# 통째로 안 뜨고 2차만 뜬다"] "qual_group2"에 대응하는 한글 라벨이 없어서
+# STAGE_KO.get(stage, stage)가 원본 영문 키를 그대로 흘려보내고 있었다
+# (2번째 스크린샷의 "qual_group2" 노출이 바로 이 증상) — 이제 "조별리그2"로
+# 정상 표시된다. 1차("qual_group")는 원래도 "조별리그"로 잘 나오지만, 2차가
+# 함께 있는 대회에서는 world_browser.get_country_intl_match_log에서 "조별리그1"로
+# 별도 표시해 1차/2차를 구분한다(단일 단계 예선까지 "1"을 붙이면 오히려
+# 어색하므로 STAGE_KO 자체는 그대로 "조별리그" 유지).
 
 # ── entry 캐시 ─────────────────────────────────────
 # intl_entries(ovr/flag/grade)는 대회 진행 중 불변 → (tid, country)별 1회 조회.
@@ -526,7 +539,7 @@ def choose_national_team(tournament_id, nat):
     # ① 컷오프 체크: 선택한 나라가 예선 풀 자체에 없으면 예선 진출 실패
     _cut_check = False
     try:
-        from constants import WC_QUAL_32, WC_QUAL_48, WC_EXPAND_YEAR, CONFEDERATIONS
+        from constants import WC_QUAL_BY_TIER, wc_tier, CONFEDERATIONS
         _qc2 = get_conn()
         _trow2 = _qc2.execute("SELECT year, kind, continent FROM intl_tournaments WHERE id=?",
                                (tournament_id,)).fetchone()
@@ -534,12 +547,11 @@ def choose_national_team(tournament_id, nat):
         if _trow2 and _trow2["kind"] in ("wc_qual", "cont_qual"):
             _tyear2 = _trow2["year"]
             _tconf2 = (_trow2["continent"] or "").strip()
-            _big2 = (_tyear2 + 1) >= WC_EXPAND_YEAR
             if _trow2["kind"] == "cont_qual":
                 from constants import EURO_QUAL
                 _qcfg2 = EURO_QUAL.get(_tconf2, {})
             else:
-                _qcfg2 = (WC_QUAL_48 if _big2 else WC_QUAL_32).get(_tconf2, {})
+                _qcfg2 = WC_QUAL_BY_TIER[wc_tier(_tyear2 + 1)].get(_tconf2, {})
             _all_rows2 = sorted(_enrich_countries(_conf_countries(_tconf2), year=_tyear2),
                                 key=lambda r: r["ovr"], reverse=True)
             _cutoff2 = _qcfg2.get("cutoff_bottom", 0)
@@ -1470,7 +1482,7 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
     if is_wc:
         kind, name = "world", "월드컵"
         entries = _qualify_world(year)
-        n_groups = WC_GROUPS_BIG if year >= WC_EXPAND_YEAR else WC_GROUPS
+        n_groups = WC_GROUPS_BY_TIER[wc_tier(year)]
         # 월드컵은 대륙 무관 → 내 국적 전부가 후보 대상
         cont_nats = [n for n in my_nats if n]
     elif my_region:
@@ -1792,7 +1804,7 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
     # 아니라 get_stage_rule이 항상 None을 반환 → day는 NULL로 남고 week만
     # 배정된다(기존에도 "잠정치 미확정 체제"에 이미 있던 안전한 폴백 경로,
     # 새 코드 아님).
-    tournament_type = (("world_cup_48" if year >= WC_EXPAND_YEAR else "world_cup_32")
+    tournament_type = (WC_SCHEDULE_KEY_BY_TIER[wc_tier(year)]
                         if is_wc else ("region" if kind == "region" else "continental"))
     tournament_start_day = week_to_day(w0)
     if my_nat:
@@ -2156,9 +2168,9 @@ def _qualify_world(year=0):
     - 예선 결과가 없는 연맹(이전 세이브 호환 등): 등급 기반 랜덤 선발
     - 쿼터 합산이 본선 팀 수(32 or 48)와 맞지 않으면 부족분을 랜덤으로 보충
     """
-    big = (year >= WC_EXPAND_YEAR)
-    quota_map = WC_QUOTA_BIG if big else WC_QUOTA
-    n_teams   = WC_TEAMS_BIG  if big else WC_TEAMS
+    _tier = wc_tier(year)
+    quota_map = WC_QUOTA_BY_TIER[_tier]
+    n_teams   = WC_TEAMS_BY_TIER[_tier]
 
     # 예선 통과국 로드
     conn = get_conn()
@@ -2344,8 +2356,7 @@ def _qualify_region(my_region):
 def _continent_qual_quota(qual_kind, continent, year):
     """이 대륙(연맹)이 올해(=예선과 같은 해) 본선에서 차지하는 진출 쿼터(장수)."""
     if qual_kind == "wc_qual":
-        big = year >= WC_EXPAND_YEAR
-        quota_map = WC_QUOTA_BIG if big else WC_QUOTA
+        quota_map = WC_QUOTA_BY_TIER[wc_tier(year)]
         ck = _conf_key(continent)
         return quota_map.get(ck, 4)
     else:
@@ -2459,11 +2470,16 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
             _cq_cup_name = CONF_CUP_NAME.get(continent, f"{continent} 대륙컵")
         _qual_full_name = f"{year} {_cq_cup_name} 예선"
     else:
-        big = year >= WC_EXPAND_YEAR
-        qual_cfg = WC_QUAL_48.get(continent) if big else WC_QUAL_32.get(continent)
+        qual_cfg = WC_QUAL_BY_TIER[wc_tier(year)].get(continent)
         _qual_full_name = f"{year} 월드컵 {continent} 예선"
     if not qual_cfg:
         return
+
+    # [2026-09 신설] 2단계 체제(북미/아시아/아프리카) 여부 — qual_cfg에
+    # "stage2" 키가 있으면 1차만 여기서 만들고(편도 3라운드), 2차는
+    # _finalize_qual_stage1이 1차 종료 시 별도로 생성한다. EURO_QUAL
+    # (cont_qual)은 이 키를 절대 안 쓰므로 항상 False — 기존 동작 그대로.
+    two_stage = ("stage2" in qual_cfg)
 
     # 예선 사이클 리셋 (pledge 해제)
     if not committed:
@@ -2581,9 +2597,10 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
         else:
             my_sel = 2; my_nat = ""; cand_nats_final = []
 
-    # ─── 조별리그 편성 ───
+    # ─── 조별리그 편성 (2단계 체제면 1차 조만 여기서 생성) ───
     n_groups   = qual_cfg["n_groups"]
     group_size = qual_cfg["group_size"]
+    legs       = qual_cfg.get("legs", 2)   # 1=편도, 2=왕복(홈+원정, 기존 방식)
 
     pool.sort(key=lambda r: r["ovr"], reverse=True)
     glabels = _qual_group_labels(n_groups)
@@ -2597,10 +2614,11 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
 
     # ─── DB 저장 ───
     name = _qual_full_name
+    status0 = "qual_stage1" if two_stage else "qual_group"
     conn = get_conn(); c = conn.cursor()
     c.execute("""INSERT INTO intl_tournaments(year, kind, name, status, my_selected, my_nat, cand_nats, continent)
                  VALUES(?,?,?,?,?,?,?,?)""",
-              (year, qual_kind, name, "qual_group", my_sel, my_nat,
+              (year, qual_kind, name, status0, my_sel, my_nat,
                ",".join(cand_nats_final), continent))
     tid = c.lastrowid
 
@@ -2649,9 +2667,15 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
     for g, members in groups.items():
         names = [e["name"] for e in members]
         fwd_rounds = _round_robin_schedule(names)
-        # 역방향: 홈↔원정 반전
-        rev_rounds = [[(a, h) for h, a in rnd] for rnd in fwd_rounds]
-        all_rounds = fwd_rounds + rev_rounds  # 4팀 조 기준 6라운드
+        if legs >= 2:
+            # 왕복(홈+원정 반전) — 기존 단일단계 체제(유럽/남미 32·48팀,
+            # cont_qual) 전부 여기로: 4팀 조 기준 6라운드.
+            rev_rounds = [[(a, h) for h, a in rnd] for rnd in fwd_rounds]
+            all_rounds = fwd_rounds + rev_rounds
+        else:
+            # 편도 — 2단계 체제(북미/아시아/아프리카)의 1차, 또는 남미
+            # 64팀(6팀 조, 편도 5라운드): 4팀 조면 3라운드.
+            all_rounds = fwd_rounds
 
         for rnd_idx, rnd_pairs in enumerate(all_rounds):
             day = INTL_QUAL_START_DAY + rnd_idx * INTL_QUAL_ROUND_GAP_DAYS
@@ -2688,6 +2712,243 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
         conn2.execute("UPDATE intl_tournaments SET my_result=? WHERE id=?",
                       ("예선 미선발", tid))
         conn2.commit(); conn2.close()
+
+
+def _build_stage2_groups(pot1, pot2, n_groups2, max_retries=8):
+    """[2026-09 신설] 2단계 체제(북미/아시아/아프리카) 2차 조 재편성.
+
+    pot1(1차 각 조 1위)/pot2(1차 각 조 2위)는 (origin_group, row) 튜플
+    리스트 — 각각 정확히 n_groups2*2개. 2차 조 하나당 포트1에서 2팀 +
+    포트2에서 2팀씩 배정(항상 정확히 4팀/조, i%n_groups2 순환 배정이라
+    보장됨). 같은 1차 조 출신끼리 2차에서 다시 만나는 조합을 최대한
+    피한다 — champions_engine(competition_common.league_phase_pairs)이
+    이미 쓰는 "몇 번 섞어보고 충돌 제일 적은 조합 채택" 방식과 동일한
+    수준의 보장(완전 배제를 100% 보증하진 않음, 이 프로젝트의 기존 관례).
+
+    반환: [[(origin_group, row), ...] * n_groups2] (조 하나당 4팀).
+    """
+    best_groups, best_conflicts = None, None
+    for _try in range(max_retries):
+        p1 = pot1[:]; p2 = pot2[:]
+        random.shuffle(p1); random.shuffle(p2)
+        groups = [[] for _ in range(n_groups2)]
+        for i, item in enumerate(p1):
+            groups[i % n_groups2].append(item)
+        for i, item in enumerate(p2):
+            groups[i % n_groups2].append(item)
+        conflicts = 0
+        for grp in groups:
+            origins = [og for og, _r in grp]
+            conflicts += len(origins) - len(set(origins))
+        if best_conflicts is None or conflicts < best_conflicts:
+            best_groups, best_conflicts = groups, conflicts
+        if conflicts == 0:
+            break
+    return best_groups
+
+
+def _qual_stage_standings_for(entries, matches):
+    """1차/2차 조별리그 순위표 계산(공용) — entries/matches는 그 조 것만."""
+    tbl = {e["country"]: {"country": e["country"], "flag": e["flag"], "ovr": e["ovr"],
+                          "grade": e.get("grade", "F"), "p": 0, "w": 0, "d": 0, "l": 0,
+                          "gf": 0, "ga": 0, "pts": 0}
+           for e in entries}
+    for m in matches:
+        h, a = tbl.get(m["home"]), tbl.get(m["away"])
+        if not h or not a:
+            continue
+        hs, as_ = m["home_score"], m["away_score"]
+        h["p"] += 1; a["p"] += 1
+        h["gf"] += hs; h["ga"] += as_
+        a["gf"] += as_; a["ga"] += hs
+        if hs > as_:
+            h["pts"] += 3; h["w"] += 1; a["l"] += 1
+        elif hs < as_:
+            a["pts"] += 3; a["w"] += 1; h["l"] += 1
+        else:
+            h["pts"] += 1; a["pts"] += 1; h["d"] += 1; a["d"] += 1
+    rows = list(tbl.values())
+    rows.sort(key=lambda r: (r["pts"], r["gf"] - r["ga"], r["gf"], r["ovr"]), reverse=True)
+    return rows
+
+
+def _finalize_qual_stage1(t):
+    """[2026-09 신설] 2단계 체제(북미/아시아/아프리카)의 1차 조별리그
+    (편도 3라운드, 169/173/177일) 종료 → 상위 2팀씩(포트1=조1위/포트2=
+    조2위)을 모아 2차 조를 재편성(_build_stage2_groups)하고, 181/185/
+    189일에 2차 조별리그(편도 3라운드, stage='qual_group2')를 생성한다.
+    status를 'qual_stage2'로 전환 — 이후 _finalize_qual_stage2가 처리.
+    """
+    from game_engine import add_log, get_player
+    tid = t["id"]
+    continent = _conf_key((t.get("continent") or "").strip() or "유럽")
+    qual_cfg = WC_QUAL_BY_TIER[wc_tier(t["year"])].get(continent, {})
+    stage2_cfg = qual_cfg.get("stage2") or {}
+    advance_n = qual_cfg.get("advance_per_group1", 2)
+
+    conn = get_conn()
+    grps = [r["grp"] for r in conn.execute(
+        "SELECT DISTINCT grp FROM intl_entries WHERE tournament_id=? ORDER BY grp", (tid,)).fetchall()]
+    _all_entries = [dict(r) for r in conn.execute(
+        "SELECT * FROM intl_entries WHERE tournament_id=?", (tid,)).fetchall()]
+    _all_matches = [dict(r) for r in conn.execute(
+        """SELECT * FROM intl_matches WHERE tournament_id=?
+           AND stage='qual_group' AND home_score>=0""", (tid,)).fetchall()]
+    conn.close()
+    _entries_by_grp: dict = {}
+    for e in _all_entries:
+        _entries_by_grp.setdefault(e["grp"], []).append(e)
+    _matches_by_grp: dict = {}
+    for m in _all_matches:
+        _matches_by_grp.setdefault(m["grp"], []).append(m)
+
+    pot1, pot2 = [], []   # (origin_group, row) — 포트1=1차 조1위, 포트2=조2위
+    for g in grps:
+        standings = _qual_stage_standings_for(_entries_by_grp.get(g, []), _matches_by_grp.get(g, []))
+        for rank_idx in range(advance_n):
+            if rank_idx < len(standings):
+                (pot1 if rank_idx == 0 else pot2).append((g, standings[rank_idx]))
+
+    n_groups2 = stage2_cfg.get("n_groups", max(1, len(pot1) // 2))
+    stage2_groups = _build_stage2_groups(pot1, pot2, n_groups2)
+
+    def _round_robin_schedule(names):
+        tm = list(names)
+        if len(tm) % 2 == 1:
+            tm.append(None)
+        nt = len(tm)
+        rounds = []
+        for _ in range(nt - 1):
+            pairs = []
+            for i in range(nt // 2):
+                h, a = tm[i], tm[nt - 1 - i]
+                if h is not None and a is not None:
+                    pairs.append((h, a))
+            rounds.append(pairs)
+            tm = [tm[0]] + [tm[-1]] + tm[1:-1]
+        return rounds
+
+    glabels2 = ["S2-" + x for x in _qual_group_labels(n_groups2)]
+    conn = get_conn(); c = conn.cursor()
+    p = get_player()
+    my_nat = _my_nat(t, p) if p else ""
+    cand_nats = {n for n in (t.get("cand_nats") or "").split(",") if n}
+
+    for gi, members in enumerate(stage2_groups):
+        g = glabels2[gi]
+        for _origin_g, row in members:
+            is_my = 1 if (row["country"] == my_nat or row["country"] in cand_nats) else 0
+            c.execute("""INSERT INTO intl_entries
+                         (tournament_id, country, flag, grade, ovr, grp, is_my, continent)
+                         VALUES(?,?,?,?,?,?,?,?)""",
+                      (tid, row["country"], row.get("flag", ""), row.get("grade", "F"),
+                       row["ovr"], g, is_my, continent))
+        names = [row["country"] for _og, row in members]
+        fwd_rounds = _round_robin_schedule(names)
+        for rnd_idx, rnd_pairs in enumerate(fwd_rounds):
+            day = INTL_QUAL_START_DAY + (3 + rnd_idx) * INTL_QUAL_ROUND_GAP_DAYS
+            wk = day_to_week(day)
+            for home_nat, away_nat in rnd_pairs:
+                is_my_match = 1 if (home_nat == my_nat or away_nat == my_nat or
+                                     home_nat in cand_nats or away_nat in cand_nats) else 0
+                c.execute("""INSERT INTO intl_matches
+                             (tournament_id, week, day, stage, grp, home, away, is_my, my_played)
+                             VALUES(?,?,?,?,?,?,?,?,?)""",
+                          (tid, wk, day, "qual_group2", g, home_nat, away_nat, is_my_match, 0))
+
+    c.execute("UPDATE intl_tournaments SET status='qual_stage2' WHERE id=?", (tid,))
+    conn.commit(); conn.close()
+    add_log(f"🌐 {t['name']} 1차 조별리그 종료 → 2차 조 편성 완료 ({n_groups2}개 조)", "event")
+
+
+def _finalize_qual_stage2(t):
+    """[2026-09 신설] 2단계 체제 2차 조별리그(편도 3라운드, 181/185/189일,
+    stage='qual_group2') 종료 → stage2_cfg의 direct_top/wildcard/po
+    설정에 따라 직행·와일드카드 확정, 필요하면 193일 플레이오프 생성
+    (status='qual_po') 또는 곧장 최종 저장(_save_qual_results).
+    """
+    from game_engine import add_log, get_player
+    tid = t["id"]
+    continent = _conf_key((t.get("continent") or "").strip() or "유럽")
+    qual_cfg = WC_QUAL_BY_TIER[wc_tier(t["year"])].get(continent, {})
+    stage2_cfg = qual_cfg.get("stage2") or {}
+
+    conn = get_conn()
+    grps = [r["grp"] for r in conn.execute(
+        "SELECT DISTINCT grp FROM intl_entries WHERE tournament_id=? AND grp LIKE 'S2-%' ORDER BY grp",
+        (tid,)).fetchall()]
+    _all_entries = [dict(r) for r in conn.execute(
+        "SELECT * FROM intl_entries WHERE tournament_id=? AND grp LIKE 'S2-%'", (tid,)).fetchall()]
+    _all_matches = [dict(r) for r in conn.execute(
+        """SELECT * FROM intl_matches WHERE tournament_id=?
+           AND stage='qual_group2' AND home_score>=0""", (tid,)).fetchall()]
+    conn.close()
+    _entries_by_grp: dict = {}
+    for e in _all_entries:
+        _entries_by_grp.setdefault(e["grp"], []).append(e)
+    _matches_by_grp: dict = {}
+    for m in _all_matches:
+        _matches_by_grp.setdefault(m["grp"], []).append(m)
+
+    by_rank: dict = {}
+    for g in grps:
+        standings = _qual_stage_standings_for(_entries_by_grp.get(g, []), _matches_by_grp.get(g, []))
+        for idx, row in enumerate(standings):
+            by_rank.setdefault(idx + 1, []).append(row)
+
+    direct_top     = stage2_cfg.get("direct_top", 1)
+    wildcard_rank  = stage2_cfg.get("wildcard_rank", 0)
+    wildcard_count = stage2_cfg.get("wildcard_count", 0)
+    po_teams       = stage2_cfg.get("po_teams", 0)
+    po_pool_rank   = stage2_cfg.get("po_pool_rank") or (wildcard_rank or (direct_top + 1))
+    po_seeded      = stage2_cfg.get("po_seeded", False)
+
+    direct_teams = []
+    for r in range(1, direct_top + 1):
+        direct_teams.extend(by_rank.get(r, []))
+
+    wc_pool_sorted = []
+    if wildcard_count > 0 and wildcard_rank:
+        wc_pool_sorted = sorted(by_rank.get(wildcard_rank, []),
+                                 key=lambda r: (r["pts"], r["gf"] - r["ga"], r["gf"], r["ovr"]),
+                                 reverse=True)
+        direct_teams = direct_teams + wc_pool_sorted[:wildcard_count]
+
+    if po_teams > 0:
+        if direct_teams:
+            _save_qual_results(t, continent, direct_teams, set_done=False)
+        if wildcard_rank == po_pool_rank and wildcard_count > 0:
+            pool_sorted, skip_n = wc_pool_sorted, wildcard_count
+        else:
+            pool_sorted = sorted(by_rank.get(po_pool_rank, []),
+                                  key=lambda r: (r["pts"], r["gf"] - r["ga"], r["gf"], r["ovr"]),
+                                  reverse=True)
+            skip_n = 0
+        po_pool = pool_sorted[skip_n: skip_n + po_teams]
+        if po_seeded:
+            n = len(po_pool)
+            _pairs = [(po_pool[i], po_pool[n - 1 - i]) for i in range(n // 2)]
+        else:
+            _shuf = list(po_pool); random.shuffle(_shuf)
+            _pairs = [(_shuf[i], _shuf[i + 1]) for i in range(0, len(_shuf) - 1, 2)]
+
+        conn = get_conn(); c = conn.cursor()
+        p = get_player()
+        my_nat = _my_nat(t, p) if p else ""
+        po_day = INTL_QUAL_START_DAY + 6 * INTL_QUAL_ROUND_GAP_DAYS
+        po_week = day_to_week(po_day)
+        for home, away in _pairs:
+            is_my = 1 if my_nat and (home["country"] == my_nat or away["country"] == my_nat) else 0
+            c.execute("""INSERT INTO intl_matches
+                         (tournament_id, week, day, stage, home, away, is_my, my_played)
+                         VALUES(?,?,?,?,?,?,?,?)""",
+                      (tid, po_week, po_day, "qual_po", home["country"], away["country"], is_my, 0))
+        c.execute("UPDATE intl_tournaments SET status='qual_po' WHERE id=?", (tid,))
+        conn.commit(); conn.close()
+        add_log(f"🏆 {t['name']} 플레이오프 시작! ({po_week}주차)", "event")
+        return
+
+    _save_qual_results(t, continent, direct_teams)
 
 
 def _qual_group_labels(n):
@@ -2799,6 +3060,12 @@ def _process_one_tournament_week(t, week, day=None):
         # 예선이 조별리그에서 멈춰버린다(실제로 이 버그로 재현됨).
         qual_group_last_day = INTL_QUAL_START_DAY + 5 * INTL_QUAL_ROUND_GAP_DAYS
         qual_po_day = INTL_QUAL_START_DAY + 6 * INTL_QUAL_ROUND_GAP_DAYS
+        # [2026-09 신설] 2단계 체제(북미/아시아/아프리카)의 1차/2차 조별리그
+        # 마감일 — 1차는 편도 3라운드(인덱스 0~2, 마지막=177일), 2차도
+        # 편도 3라운드지만 인덱스 3~5(마지막=189일, 기존 단일단계 6라운드
+        # 마지막 날짜와 우연히 같음 — 같은 일정표를 재사용하기 때문).
+        qual_stage1_last_day = INTL_QUAL_START_DAY + 2 * INTL_QUAL_ROUND_GAP_DAYS
+        qual_stage2_last_day = INTL_QUAL_START_DAY + 5 * INTL_QUAL_ROUND_GAP_DAYS
         # [2026-07 버그수정, 신민용 리포트: "플레이오프가 31주차에 열린다면서
         # 대진표에 팀만 뜨고 스코어가 영원히 안 나온다"] 이 마감 판정이
         # week 단위였다 — PO 경기 실제 day(214)가 그 주(31주차=211~217일)
@@ -2814,6 +3081,18 @@ def _process_one_tournament_week(t, week, day=None):
                     else (week >= day_to_week(qual_group_last_day))
             if ready:
                 _finalize_qual(t)   # 직행 확정 or qual_po 생성
+        # [2026-09 신설] 2단계 체제 1차 조별리그 마감 → 2차 조 편성
+        elif status == "qual_stage1":
+            ready = (day >= qual_stage1_last_day) if day is not None \
+                    else (week >= day_to_week(qual_stage1_last_day))
+            if ready:
+                _finalize_qual_stage1(t)   # 2차 조 편성(qual_stage2로 전환)
+        # [2026-09 신설] 2단계 체제 2차 조별리그 마감 → 직행/PO 확정
+        elif status == "qual_stage2":
+            ready = (day >= qual_stage2_last_day) if day is not None \
+                    else (week >= day_to_week(qual_stage2_last_day))
+            if ready:
+                _finalize_qual_stage2(t)   # 직행 확정 or qual_po 생성
         # 플레이오프: 완료 시 마감
         elif status == "qual_po":
             ready = (day >= qual_po_day) if day is not None \
@@ -2832,7 +3111,7 @@ def _process_one_tournament_week(t, week, day=None):
     # 주차가 아예 안 걸리거나 한 단계씩 밀려서 다음 라운드가 영원히
     # 안 생긴다. week 대신 stage 이름으로 "지금 어느 단계가 진행 중이고
     # 끝났는지"를 직접 판정하면 며칠/몇 주에 걸치든 항상 정확하다.
-    big = (t["year"] >= WC_EXPAND_YEAR) if t["kind"] == "world" else False
+    big = (wc_tier(t["year"]) >= 48) if t["kind"] == "world" else False
     if t["kind"] == "world":
         _ko_seq = ["R32", "R16", "QF", "SF", "F"] if big else ["R16", "QF", "SF", "F"]
     elif t["kind"] == "region":
@@ -3166,7 +3445,7 @@ def _sim_ai_match(t, m, my_played=False, conn=None, reason="injury", batch=None)
     from game_engine import add_log, get_player, _week_intl_cl_day
     he = _entry(t["id"], m["home"])
     ae = _entry(t["id"], m["away"])
-    knockout = m["stage"] not in ("group", "qual_group")  # [버그수정] 예선 조별도 무승부 허용
+    knockout = m["stage"] not in ("group", "qual_group", "qual_group2")  # [2026-09] 2단계 예선 2차도 무승부 허용
 
     outcome = _match_outcome(he["ovr"], ae["ovr"], knockout)
     pso_winner, pso_score = "", ""
@@ -3333,7 +3612,7 @@ def simulate_my_match(week, p, day=None):
     he = _entry(t["id"], m["home"])
     ae = _entry(t["id"], m["away"])
     is_home = info["is_home"]
-    knockout = m["stage"] not in ("group", "qual_group")  # [버그수정] 예선 조별도 무승부 허용
+    knockout = m["stage"] not in ("group", "qual_group", "qual_group2")  # [2026-09] 2단계 예선 2차도 무승부 허용
 
     # [2026-08 신설, 옐로카드 시스템] 월드컵 예선(wc_qual)은 본선과 카드
     # 누적 그룹을 분리한다 — 예선 마지막 경기에서 받은 퇴장/정지가 본선
@@ -3606,15 +3885,16 @@ def simulate_my_match(week, p, day=None):
 # 조별리그 마감 / 토너먼트 진행
 # ─────────────────────────────────────────────
 
-def _qual_group_standings(tid, grp):
-    """예선 조 순위 (stage='qual_group' 기준)."""
+def _qual_group_standings(tid, grp, stage="qual_group"):
+    """예선 조 순위. stage 기본값은 1차/단일단계(qual_group) — 2단계 체제
+    2차 조 순위를 보려면 stage='qual_group2'로 호출(grp도 "S2-A" 형태)."""
     conn = get_conn()
     entries = [dict(r) for r in conn.execute(
         "SELECT * FROM intl_entries WHERE tournament_id=? AND grp=?",
         (tid, grp)).fetchall()]
     matches = [dict(r) for r in conn.execute(
         """SELECT * FROM intl_matches WHERE tournament_id=? AND grp=?
-           AND stage='qual_group' AND home_score>=0""", (tid, grp)).fetchall()]
+           AND stage=? AND home_score>=0""", (tid, grp, stage)).fetchall()]
     conn.close()
 
     tbl = {e["country"]: {"country": e["country"], "flag": e["flag"], "ovr": e["ovr"],
@@ -3647,30 +3927,25 @@ def get_qual_advance_status(t):
     올라가는 팀들이 초록색으로 안 뜨고 조 1위만 뜬다"] UI(schedule_window)
     쪽의 기존 색상 결정(_intl_advance_count)은 예선 대회 설정을 전혀 보지
     않고 무조건 "조 1위만 직행, 나머지는 전부 탈락(회색)"으로 그려왔다.
-    실제로는 대륙/체제에 따라:
-      - 유로 예선: 조 1·2위 전원 직행(2위도 초록이어야 함)
-      - 월드컵 아메리카(48팀): 조 1위 직행 + 조 2위 중 성적 상위 N팀도
-        직행(와일드카드)
-      - 월드컵 유럽/48팀 체제 아프리카: 조 1위 직행 + 조 2위 중 성적
-        상위 N팀은 플레이오프(단판)로 나머지 자리를 놓고 경쟁
-    이 함수가 _finalize_qual과 동일한 설정표(WC_QUAL_32/48, EURO_QUAL)를
-    읽어 실제 진출 로직을 그대로 재현한다. 조별리그가 아직 진행 중이면
-    "지금까지의 성적 기준" 잠정 계산이며(다른 조별리그 UI와 동일한 방식),
-    조별리그가 끝난 뒤에는 실제 확정 결과와 일치한다.
+    이 함수가 실제 예선 로직(_finalize_qual/_finalize_qual_stage1/2와
+    동일한 설정표)을 그대로 재현해 진행 중에도 잠정 상태를 보여준다.
+
+    [2026-09 재설계] 2단계 체제(북미/아시아/아프리카, wc_qual)는 1차
+    조별리그 중엔 "누가 2차로 올라갈지"만 알 수 있고(po_bubble로 표시),
+    2차가 시작된 뒤에야 direct/po 판정이 의미가 생긴다 — status(대회
+    진행 단계)를 보고 어느 조별리그(1차/2차) 순위를 볼지 고른다.
 
     반환: {country: status}
-      'direct'     — 직행권 확보 (조 1위 직행 + 와일드카드로 직행 확정된 2위)
-      'po_bubble'  — 플레이오프 경쟁 중(아직 결과 미확정, 조별리그 진행
-                     중이면 "현재 기준 진출권" 후보)
+      'direct'     — 직행권 확보
+      'po_bubble'  — 아직 경쟁 중(2단계면 1차 상위권=2차 진출권 후보,
+                     2차라면 직행/PO 후보 미확정)
       'po_ok'      — 플레이오프 승리로 진출 확정
       'eliminated' — 탈락 / 진출 가능성 없음
     """
-    from constants import WC_QUAL_32, WC_QUAL_48, EURO_QUAL, WC_EXPAND_YEAR
+    from constants import EURO_QUAL
 
     tid = t["id"]
     conn = get_conn()
-    grps = [r["grp"] for r in conn.execute(
-        "SELECT DISTINCT grp FROM intl_entries WHERE tournament_id=? ORDER BY grp", (tid,)).fetchall()]
     all_countries = {r["country"] for r in conn.execute(
         "SELECT country FROM intl_entries WHERE tournament_id=?", (tid,)).fetchall()}
     po_matches = [dict(r) for r in conn.execute(
@@ -3678,62 +3953,154 @@ def get_qual_advance_status(t):
     conn.close()
 
     status = {c: "eliminated" for c in all_countries}
-    if not grps:
+    if not all_countries:
         return status
 
     continent = _conf_key((t.get("continent") or "").strip() or "유럽")
-    if t.get("kind") == "cont_qual":
-        qual_cfg = EURO_QUAL.get(continent, {})
+    is_wc = (t.get("kind") != "cont_qual")
+    qual_cfg = WC_QUAL_BY_TIER[wc_tier(t.get("year", 0))].get(continent, {}) if is_wc \
+        else EURO_QUAL.get(continent, {})
+    two_stage = is_wc and ("stage2" in qual_cfg)
+    t_status = t.get("status", "")
+
+    if two_stage and t_status == "qual_stage1":
+        # 1차 진행 중 — 아직 직행/PO 판정 자체가 무의미하니 "2차 진출권"
+        # 잠정 후보(조 1·2위)만 po_bubble, 나머지는 eliminated로 표시.
+        conn = get_conn()
+        grps = [r["grp"] for r in conn.execute(
+            "SELECT DISTINCT grp FROM intl_entries WHERE tournament_id=? ORDER BY grp", (tid,)).fetchall()]
+        conn.close()
+        advance_n = qual_cfg.get("advance_per_group1", 2)
+        for g in grps:
+            rows = _qual_group_standings(tid, g, stage="qual_group")
+            for row in rows[:advance_n]:
+                if row["country"] in status:
+                    status[row["country"]] = "po_bubble"
+        return status
+
+    if two_stage:
+        # 2차 이후(qual_stage2/qual_po/done) — 2차 조 순위 기준으로 판정.
+        conn = get_conn()
+        grps = [r["grp"] for r in conn.execute(
+            "SELECT DISTINCT grp FROM intl_entries WHERE tournament_id=? AND grp LIKE 'S2-%' ORDER BY grp",
+            (tid,)).fetchall()]
+        conn.close()
+        stage_cfg = qual_cfg.get("stage2") or {}
+        direct_top     = stage_cfg.get("direct_top", 1)
+        wildcard_rank  = stage_cfg.get("wildcard_rank", 0)
+        wildcard_count = stage_cfg.get("wildcard_count", 0)
+        po_teams       = stage_cfg.get("po_teams", 0)
+        po_pool_rank   = stage_cfg.get("po_pool_rank") or (wildcard_rank or (direct_top + 1))
+
+        by_rank: dict = {}
+        for g in grps:
+            rows = _qual_group_standings(tid, g, stage="qual_group2")
+            for idx, row in enumerate(rows):
+                by_rank.setdefault(idx + 1, []).append(row)
+
+        direct_set = set()
+        for r in range(1, direct_top + 1):
+            direct_set |= {row["country"] for row in by_rank.get(r, [])}
+
+        wc_sorted = []
+        if wildcard_count > 0 and wildcard_rank:
+            wc_sorted = sorted(by_rank.get(wildcard_rank, []),
+                                key=lambda r: (r["pts"], r["gf"]-r["ga"], r["gf"], r["ovr"]), reverse=True)
+            direct_set |= {row["country"] for row in wc_sorted[:wildcard_count]}
+
+        po_pool = []
+        if po_teams > 0:
+            if wildcard_rank == po_pool_rank and wc_sorted:
+                pool_sorted, skip_n = wc_sorted, wildcard_count
+            else:
+                pool_sorted = sorted(by_rank.get(po_pool_rank, []),
+                                      key=lambda r: (r["pts"], r["gf"]-r["ga"], r["gf"], r["ovr"]), reverse=True)
+                skip_n = 0
+            po_pool = pool_sorted[skip_n: skip_n + po_teams]
+
+        for c in direct_set:
+            if c in status:
+                status[c] = "direct"
+        for r in po_pool:
+            if r["country"] in status:
+                status[r["country"]] = "po_bubble"
     else:
-        big = t.get("year", 0) >= WC_EXPAND_YEAR
-        qual_cfg = (WC_QUAL_48 if big else WC_QUAL_32).get(continent, {})
+        # ── 단일단계(cont_qual 전부 + wc_qual 유럽/남미) — 기존 로직 유지 ──
+        conn = get_conn()
+        grps = [r["grp"] for r in conn.execute(
+            "SELECT DISTINCT grp FROM intl_entries WHERE tournament_id=? ORDER BY grp", (tid,)).fetchall()]
+        conn.close()
+        if not grps:
+            return status
 
-    direct_n = qual_cfg.get("direct", len(grps))
-    po_teams = qual_cfg.get("po_teams", 0)
-    wildcard = qual_cfg.get("wildcard", 0)
+        if not is_wc:
+            # cont_qual(EURO_QUAL) — 기존 old-schema 필드 그대로.
+            direct_n = qual_cfg.get("direct", len(grps))
+            po_teams = qual_cfg.get("po_teams", 0)
+            wildcard = qual_cfg.get("wildcard", 0)
 
-    winners, runners = [], []
-    for g in grps:
-        rows = _qual_group_standings(tid, g)
-        if len(rows) >= 1:
-            winners.append(rows[0])
-        if len(rows) >= 2:
-            runners.append(rows[1])
+            winners, runners = [], []
+            for g in grps:
+                rows = _qual_group_standings(tid, g)
+                if len(rows) >= 1: winners.append(rows[0])
+                if len(rows) >= 2: runners.append(rows[1])
 
-    # 조 라벨 순서가 아니라 성적순으로 상위 direct_n팀만 직행시킨다
-    # (_finalize_qual과 동일한 기준, 위 버그수정 참고).
-    if direct_n < len(winners):
-        winners = sorted(winners, key=lambda r: (r["pts"], r["gf"] - r["ga"], r["gf"], r["ovr"]),
-                          reverse=True)
-    direct_set = {w["country"] for w in winners[:direct_n]}
+            if direct_n < len(winners):
+                winners = sorted(winners, key=lambda r: (r["pts"], r["gf"]-r["ga"], r["gf"], r["ovr"]),
+                                  reverse=True)
+            direct_set = {w["country"] for w in winners[:direct_n]}
 
-    runners_sorted = sorted(runners, key=lambda r: (r["pts"], r["gf"] - r["ga"], r["gf"], r["ovr"]),
-                             reverse=True)
-    # [2026-08 버그수정, 신민용 리포트: "아프리카는 1등팀들끼리 플레이오프
-    # 하는 거 아니야?"] direct=0인 체제(32팀 예선의 아시아/아프리카)는
-    # _finalize_qual에서 실제로 "조 1위 전원이 직행 없이 플레이오프로
-    # 간다"(po_pool = winners[:po_teams])로 처리하는데, 여기서는 그 분기를
-    # 빼먹고 항상 조 2위(runners_sorted)를 플레이오프 후보로 잘못
-    # 계산했다 — 그 결과 실제 플레이오프에 진출한 조 1위팀들은 화면에
-    # 회색(탈락)으로, 정작 플레이오프와 무관한 조 2위팀들이 주황(경쟁
-    # 중)으로 뜨는 정반대 표시가 났다. _finalize_qual과 동일하게
-    # direct_n==0이면 조 1위(winners)를 플레이오프 후보로 삼는다.
-    if wildcard > 0:
-        direct_set |= {r["country"] for r in runners_sorted[:wildcard]}
-        po_pool = runners_sorted[wildcard:wildcard + po_teams]
-    elif direct_n == 0 and po_teams > 0:
-        po_pool = winners[:po_teams]
-    else:
-        po_pool = runners_sorted[:po_teams]
+            runners_sorted = sorted(runners, key=lambda r: (r["pts"], r["gf"]-r["ga"], r["gf"], r["ovr"]),
+                                     reverse=True)
+            if wildcard > 0:
+                direct_set |= {r["country"] for r in runners_sorted[:wildcard]}
+                po_pool = runners_sorted[wildcard:wildcard + po_teams]
+            elif direct_n == 0 and po_teams > 0:
+                po_pool = winners[:po_teams]
+            else:
+                po_pool = runners_sorted[:po_teams]
+        else:
+            # wc_qual 단일단계(유럽/남미) — 신규 스키마.
+            direct_top     = qual_cfg.get("direct_top", 1)
+            wildcard_rank  = qual_cfg.get("wildcard_rank", 0)
+            wildcard_count = qual_cfg.get("wildcard_count", 0)
+            po_teams       = qual_cfg.get("po_teams", 0)
+            po_pool_rank   = qual_cfg.get("po_pool_rank") or (wildcard_rank or (direct_top + 1))
 
-    for c in direct_set:
-        if c in status:
-            status[c] = "direct"
-    for r in po_pool:
-        if r["country"] in status:
-            status[r["country"]] = "po_bubble"
+            by_rank: dict = {}
+            for g in grps:
+                rows = _qual_group_standings(tid, g)
+                for idx, row in enumerate(rows):
+                    by_rank.setdefault(idx + 1, []).append(row)
 
-    # 플레이오프 경기 결과 반영 (경기가 끝난 만큼만 확정 상태로 갱신)
+            direct_set = set()
+            for r in range(1, direct_top + 1):
+                direct_set |= {row["country"] for row in by_rank.get(r, [])}
+
+            wc_sorted = []
+            if wildcard_count > 0 and wildcard_rank:
+                wc_sorted = sorted(by_rank.get(wildcard_rank, []),
+                                    key=lambda r: (r["pts"], r["gf"]-r["ga"], r["gf"], r["ovr"]), reverse=True)
+                direct_set |= {row["country"] for row in wc_sorted[:wildcard_count]}
+
+            po_pool = []
+            if po_teams > 0:
+                if wildcard_rank == po_pool_rank and wc_sorted:
+                    pool_sorted, skip_n = wc_sorted, wildcard_count
+                else:
+                    pool_sorted = sorted(by_rank.get(po_pool_rank, []),
+                                          key=lambda r: (r["pts"], r["gf"]-r["ga"], r["gf"], r["ovr"]), reverse=True)
+                    skip_n = 0
+                po_pool = pool_sorted[skip_n: skip_n + po_teams]
+
+        for c in direct_set:
+            if c in status:
+                status[c] = "direct"
+        for r in po_pool:
+            if r["country"] in status:
+                status[r["country"]] = "po_bubble"
+
+    # 플레이오프 경기 결과 반영 (경기가 끝난 만큼만 확정 상태로 갱신, 모든 경로 공통)
     for m in po_matches:
         h, a = m["home"], m["away"]
         hs = m.get("home_score", -1)
@@ -3765,7 +4132,6 @@ def _finalize_qual(t):
     [48팀 체제] 조 1위(+와일드카드) 직행 → 즉시 qual_results 저장.
     """
     from game_engine import add_log, get_player
-    from constants import WC_QUAL_32, WC_QUAL_48
 
     tid = t["id"]
     conn = get_conn()
@@ -3821,73 +4187,127 @@ def _finalize_qual(t):
     # 읽고 있었다 — 유로 예선(kind='cont_qual')도 월드컵 유럽 예선 설정
     # (직행12+플레이오프2)이 그대로 적용돼서, 원래 필요 없는 플레이오프
     # 단계를 기다리다 멈췄다. 대회 kind로 올바른 설정표를 고른다.
+    #
+    # [2026-09 재설계] 이 함수는 이제 "단일단계 체제"만 처리한다 —
+    # cont_qual(EURO_QUAL, 기존 로직 100% 그대로 유지) + wc_qual 중
+    # 유럽/남미(2단계로 안 바뀐 대륙, 신규 스키마)만 여기로 온다. 북미/
+    # 아시아/아프리카(wc_qual, 2단계 체제)는 애초에 status='qual_stage1'로
+    # 생성되므로 이 함수가 호출될 일이 없다(_finalize_qual_stage1/2가 처리).
     if t["kind"] == "cont_qual":
         from constants import EURO_QUAL
         qual_cfg = EURO_QUAL.get(continent, {})
-    else:
-        big = t["year"] >= WC_EXPAND_YEAR
-        qual_cfg = (WC_QUAL_48 if big else WC_QUAL_32).get(continent, {})
 
-    # 조별 1위/2위 수집
-    winners = []
-    runners = []
+        # ── 기존 로직 100% 그대로 (EURO_QUAL 전용, 절대 안 건드림) ──
+        winners = []
+        runners = []
+        for g in grps:
+            standings = _qual_standings_for(_entries_by_grp.get(g, []), _matches_by_grp.get(g, []))
+            if not standings:
+                continue
+            if len(standings) >= 1: winners.append(standings[0])
+            if len(standings) >= 2: runners.append(standings[1])
+
+        direct_n  = qual_cfg.get("direct", len(winners))
+        po_teams  = qual_cfg.get("po_teams", 0)
+        wildcard  = qual_cfg.get("wildcard", 0)
+
+        if direct_n < len(winners):
+            winners = sorted(winners, key=lambda r: (r["pts"], r["gf"] - r["ga"], r["gf"], r["ovr"]),
+                              reverse=True)
+        direct_teams = winners[:direct_n]
+
+        if wildcard > 0:
+            runners.sort(key=lambda r: (r["pts"], r["gf"]-r["ga"], r["gf"], r["ovr"]), reverse=True)
+            direct_teams = direct_teams + runners[:wildcard]
+
+        if po_teams > 0:
+            if direct_teams:
+                _save_qual_results(t, continent, direct_teams, set_done=False)
+            if direct_n == 0:
+                po_pool = winners[:po_teams]
+            else:
+                runners.sort(key=lambda r: (r["pts"], r["gf"]-r["ga"], r["gf"], r["ovr"]), reverse=True)
+                po_pool = runners[:po_teams]
+            random.shuffle(po_pool)
+            conn = get_conn(); c = conn.cursor()
+            p = get_player()
+            my_nat = _my_nat(t, p) if p else ""
+            po_day = INTL_QUAL_START_DAY + 6 * INTL_QUAL_ROUND_GAP_DAYS
+            po_week = day_to_week(po_day)
+            _po_pairs = [(po_pool[i], po_pool[i+1]) for i in range(0, len(po_pool)-1, 2)]
+            for home, away in _po_pairs:
+                is_my = 1 if my_nat and (home["country"] == my_nat or away["country"] == my_nat) else 0
+                c.execute("""INSERT INTO intl_matches
+                             (tournament_id, week, day, stage, home, away, is_my, my_played)
+                             VALUES(?,?,?,?,?,?,?,?)""",
+                          (tid, po_week, po_day, "qual_po", home["country"], away["country"], is_my, 0))
+            c.execute("UPDATE intl_tournaments SET status='qual_po' WHERE id=?", (tid,))
+            conn.commit(); conn.close()
+            add_log(f"🏆 {t['name']} 플레이오프 시작! ({po_week}주차)", "event")
+            return
+
+        _save_qual_results(t, continent, direct_teams)
+        return
+
+    # ── wc_qual 단일단계(유럽/남미) — 2026-09 신규 스키마 ──
+    qual_cfg = WC_QUAL_BY_TIER[wc_tier(t["year"])].get(continent, {})
+
+    # 조별 전체 순위(랭크별 리스트) 수집 — direct_top/wildcard_rank가
+    # 몇 위까지 필요로 하든(예: 남미 64팀 direct_top=4) 대응한다.
+    by_rank: dict = {}
     for g in grps:
         standings = _qual_standings_for(_entries_by_grp.get(g, []), _matches_by_grp.get(g, []))
-        if not standings:
-            continue
-        if len(standings) >= 1: winners.append(standings[0])
-        if len(standings) >= 2: runners.append(standings[1])
+        for idx, row in enumerate(standings):
+            by_rank.setdefault(idx + 1, []).append(row)
 
-    direct_n  = qual_cfg.get("direct", len(winners))
-    po_teams  = qual_cfg.get("po_teams", 0)
-    wildcard  = qual_cfg.get("wildcard", 0)
-    quota     = qual_cfg.get("quota", direct_n)
+    direct_top     = qual_cfg.get("direct_top", 1)
+    wildcard_rank  = qual_cfg.get("wildcard_rank", 0)
+    wildcard_count = qual_cfg.get("wildcard_count", 0)
+    po_teams       = qual_cfg.get("po_teams", 0)
+    po_pool_rank   = qual_cfg.get("po_pool_rank") or (wildcard_rank or (direct_top + 1))
+    po_seeded      = qual_cfg.get("po_seeded", False)
 
-    # ─── 직행 확정 ───
-    # [2026-08 버그수정, 신민용 리포트: "예선에서 실제로 올라가는 팀들이
-    # 초록색으로 안 뜨고 조 1위만 뜬다" 조사 중 발견] direct_n < 조 수
-    # (예: 아프리카 12조 → 상위 9팀만 직행, 3팀 탈락)인 체제에서, winners를
-    # 조 라벨 순서(A,B,C...) 그대로 잘라 항상 앞쪽 조 우승팀만 직행시키고
-    # 있었다 — "1위 중 상위 N팀"이라는 constants.py 주석의 의도와 달리
-    # 성적과 무관하게 조 순서로 당락이 갈리는 버그. 성적순 정렬 후 자른다.
-    if direct_n < len(winners):
-        winners = sorted(winners, key=lambda r: (r["pts"], r["gf"] - r["ga"], r["gf"], r["ovr"]),
-                          reverse=True)
-    direct_teams = winners[:direct_n]
+    # 직행(매 조 상위 direct_top명, 조간비교 없이 그대로)
+    direct_teams = []
+    for r in range(1, direct_top + 1):
+        direct_teams.extend(by_rank.get(r, []))
 
-    # 와일드카드 (아메리카 48팀 체제: 조 2위 중 상위 N팀)
-    if wildcard > 0:
-        runners.sort(key=lambda r: (r["pts"], r["gf"]-r["ga"], r["gf"], r["ovr"]), reverse=True)
-        direct_teams = direct_teams + runners[:wildcard]
+    # 와일드카드(특정 순위끼리 조간 성적비교, 상위 N팀 추가 직행)
+    wc_pool_sorted = []
+    if wildcard_count > 0 and wildcard_rank:
+        wc_pool_sorted = sorted(by_rank.get(wildcard_rank, []),
+                                 key=lambda r: (r["pts"], r["gf"]-r["ga"], r["gf"], r["ovr"]),
+                                 reverse=True)
+        direct_teams = direct_teams + wc_pool_sorted[:wildcard_count]
 
-    # ─── 플레이오프 필요한 체제 ───
-    # 32팀: 유럽(직행12+PO2→1), 아시아(PO10→5), 아프리카(PO12→6)
-    # 48팀: 유럽(직행12+PO8→4), 아시아(PO10→10), 아프리카(PO12→9)
     if po_teams > 0:
-        # [버그수정] 직행팀을 먼저 저장할 때 set_done=False를 전달해
-        # _save_qual_results가 status='done'으로 설정하는 것을 막는다.
-        # status='done'이 되면 process_intl_week가 다음 주차에 이 대회를 스킵해
-        # _finalize_qual_po가 호출되지 않고, PO 종료 로그도 출력되지 않는 버그 원인.
         if direct_teams:
             _save_qual_results(t, continent, direct_teams, set_done=False)
-
-        # PO 대상: direct_n==0이면 조 1위 전원, 아니면 조 2위 중 상위 po_teams팀
-        if direct_n == 0:
-            po_pool = winners[:po_teams]
+        # PO 후보 = po_pool_rank 순위끼리 조간비교, 와일드카드가 이미
+        # 가져간 만큼(wildcard_count) 다음 순번부터(같은 순위를 공유할 때만).
+        if wildcard_rank == po_pool_rank and wildcard_count > 0:
+            pool_sorted, skip_n = wc_pool_sorted, wildcard_count
         else:
-            # 유럽: 조 2위 중 성적 상위 po_teams팀
-            runners.sort(key=lambda r: (r["pts"], r["gf"]-r["ga"], r["gf"], r["ovr"]), reverse=True)
-            po_pool = runners[:po_teams]
+            pool_sorted = sorted(by_rank.get(po_pool_rank, []),
+                                  key=lambda r: (r["pts"], r["gf"]-r["ga"], r["gf"], r["ovr"]),
+                                  reverse=True)
+            skip_n = 0
+        po_pool = pool_sorted[skip_n: skip_n + po_teams]
 
-        random.shuffle(po_pool)
+        if po_seeded:
+            # 시드 배정: 강한 팀(앞쪽)과 약한 팀(뒤쪽)을 맞붙인다(완전
+            # 무작위 대신 1위 vs 꼴찌 … 식으로 — 신민용 개선 요청 반영).
+            n = len(po_pool)
+            _po_pairs = [(po_pool[i], po_pool[n - 1 - i]) for i in range(n // 2)]
+        else:
+            _shuf = list(po_pool); random.shuffle(_shuf)
+            _po_pairs = [(_shuf[i], _shuf[i+1]) for i in range(0, len(_shuf)-1, 2)]
+
         conn = get_conn(); c = conn.cursor()
         p = get_player()
         my_nat = _my_nat(t, p) if p else ""
-        # [2026-07 재설계] 조별 6라운드 뒤 7번째 라운드 = INTL_QUAL_START_DAY
-        # + 6*GAP. PO끼리도 서로 다른 나라라 같은 날짜 겹쳐도 무방.
         po_day = INTL_QUAL_START_DAY + 6 * INTL_QUAL_ROUND_GAP_DAYS
         po_week = day_to_week(po_day)
-        _po_pairs = [(po_pool[i], po_pool[i+1]) for i in range(0, len(po_pool)-1, 2)]
         for home, away in _po_pairs:
             is_my = 1 if my_nat and (home["country"] == my_nat or away["country"] == my_nat) else 0
             c.execute("""INSERT INTO intl_matches
@@ -4007,10 +4427,13 @@ def _finalize_qual_po(t):
     direct_teams = [{"country": r["country"], "flag": r["flag"],
                      "grade": r["grade"], "ovr": r["ovr"]} for r in existing_rows]
     # po_winners 값만큼만 PO 승자 반영 (유럽: 4팀 PO → 승자 2팀이지만 po_winners=1)
-    from constants import WC_QUAL_32, WC_QUAL_48, WC_EXPAND_YEAR
-    big = t["year"] >= WC_EXPAND_YEAR
-    qual_cfg = (WC_QUAL_48 if big else WC_QUAL_32).get(continent, {})
-    po_winners_n = qual_cfg.get("po_winners", len(winners))
+    # [2026-09 일반화] 2단계 체제(북미/아시아/아프리카)에서 PO가 생겼다면
+    # 그 설정은 qual_cfg["stage2"] 안에 있다 — 지금 확정된 설계에서는
+    # 전부 po_teams=0(PO 자체가 없음)이라 실제로는 안 타는 분기지만,
+    # 나중에 stage2에도 PO를 추가할 경우를 대비해 안전하게 both를 본다.
+    qual_cfg = WC_QUAL_BY_TIER[wc_tier(t["year"])].get(continent, {})
+    po_cfg = qual_cfg.get("stage2") or qual_cfg
+    po_winners_n = po_cfg.get("po_winners", len(winners))
     po_new = [w for w in winners if w["country"] not in existing_names][:po_winners_n]
     all_qualified = direct_teams + po_new
     _save_qual_results(t, continent, all_qualified)
@@ -4204,7 +4627,7 @@ def _finalize_groups(t, next_stage, next_week):
     tid = t["id"]
     is_wc = (t["kind"] == "world")
     is_region = (t["kind"] == "region")
-    is_big = is_wc and t["year"] >= WC_EXPAND_YEAR   # 48개국 시대
+    is_big = is_wc and wc_tier(t["year"]) >= 48   # 48개국 이상(48/64) 시대
 
     # [2026-07 최적화, 신민용 리포트: "국제대회 주간(47~51주)에 렉이 심하다"]
     # 원래 get_group_standings(tid, g)를 조 라벨마다 따로 호출했는데, 그
@@ -4226,8 +4649,9 @@ def _finalize_groups(t, next_stage, next_week):
     # regional_cup_format()을 다시 돌려 n_groups/best_thirds를 구한다 —
     # 조 편성 때 쓴 것과 완전히 같은 함수라 값도 항상 일치한다.
     if is_wc:
-        n_groups = WC_GROUPS_BIG if is_big else WC_GROUPS
-        n_best = WC_BEST_THIRDS_BIG if is_big else 0
+        _wtier = wc_tier(t["year"])
+        n_groups = WC_GROUPS_BY_TIER[_wtier]
+        n_best = WC_BEST_THIRDS_BY_TIER[_wtier]
     elif is_region:
         from constants import regional_cup_format
         _fmt = regional_cup_format(len(_all_entries))
