@@ -795,9 +795,13 @@ class WorldBrowserWindow(QDialog):
             # _build_club_tab 하나로 합치고, 어떤 대회를 볼지는 그 탭
             # 안의 토글 버튼으로 고른다. 세계기록실 탭 수도 13→11로
             # 줄어 로딩 부담이 조금 준다.
+            # [2026-09 후속, 신민용 요청: "슈퍼컵도 챔스/유로파/컨퍼런스처럼
+            # '역대 클럽 대항전' 탭 안 토글 버튼으로 들어가야 한다, 독립
+            # 탭으로 따로 있으면 안 된다"] 독립 탭이던 "🏵 역대 슈퍼컵"을
+            # 여기서 제거하고, _club_tab_specs()의 토글 목록(챔피언스→
+            # 유로파→컨퍼런스→슈퍼컵)에 합쳤다. 세계기록실 탭 수 11→10.
             (self._build_club_tab,         "🏆 역대 클럽 대항전"),
             (self._build_individual_awards_tab, "🎖 역대 개인상"),
-            (self._build_sc_tab,           "🏵 역대 슈퍼컵"),
             (self._build_cwc_tab,          "🌍 역대 클럽 월드컵"),
             (self._build_wc_tab,           "🌐 역대 월드컵"),
             (self._build_nc_tab,           "🎖 역대 네이션스컵"),
@@ -6931,8 +6935,15 @@ class WorldBrowserWindow(QDialog):
     def _club_tab_specs(self):
         """(내부 키, 토글 버튼 라벨, 최다순위 팝업 제목, 역대 기록
         조회 함수, 대회 상세 조회 함수, 최다순위 집계 함수) 튜플 목록.
-        토글 버튼은 이 순서(챔피언스→유로파→컨퍼런스) 그대로 배치되고,
-        기본 선택값은 첫 번째 항목(챔피언스)이다."""
+        토글 버튼은 이 순서(챔피언스→유로파→컨퍼런스→슈퍼컵) 그대로
+        배치되고, 기본 선택값은 첫 번째 항목(챔피언스)이다.
+
+        [2026-09 후속, 신민용 요청: "세계 축구 기록실 → 슈퍼컵이 아니라
+        세계 축구 기록실 → 역대 클럽 대항전 → 슈퍼컵이 되어야 한다"]
+        예전엔 독립 탭(_build_sc_tab)이었던 슈퍼컵을 여기 토글 목록에
+        합쳤다 — history_fn/detail_fn/rank_fn이 CL/EL/ECL과 완전히 같은
+        형태(get_cl_history 기반)라 이 목록에 항목 하나만 추가하면
+        나머지(표/상세/최다순위)는 전부 그대로 재사용된다."""
         return [
             ("cl",  "챔피언스",  "챔피언스리그",
              wb.get_cl_history,  wb.get_cl_tournament_detail,  wb.get_cl_style_rank_leaders),
@@ -6940,6 +6951,8 @@ class WorldBrowserWindow(QDialog):
              wb.get_el_history,  wb.get_el_tournament_detail,  wb.get_el_rank_leaders),
             ("ecl", "컨퍼런스",  "컨퍼런스리그",
              wb.get_ecl_history, wb.get_ecl_tournament_detail, wb.get_ecl_rank_leaders),
+            ("sc",  "슈퍼컵",    "슈퍼컵",
+             wb.get_super_cup_history, wb.get_super_cup_tournament_detail, wb.get_super_cup_rank_leaders),
         ]
 
     def _build_club_tab(self):
@@ -7837,82 +7850,13 @@ class WorldBrowserWindow(QDialog):
             return
         self.open_to_player(pid)
 
-    def _build_sc_tab(self):
-        """[2026-08 신설, 10순위/11순위] 역대 슈퍼컵 — 위와 동일 패턴.
-        [2026-08 수정, 신민용 리포트: 위 _build_el_tab과 동일] 예전엔
-        "경기 일정 화면과 색을 맞추자"는 이유로 버건디를 썼지만, 세계
-        기록실의 "우승" 강조는 다른 대회들과 일관되게 노란색으로
-        바꿔달라는 요청이 우선 — 경기 일정 화면(버건디)과는 별개다."""
-        return self._build_cl_style_tab(
-            tbl_attr="sc_tbl", combo_attr="sc_cont_combo",
-            history_fn=wb.get_super_cup_history, detail_fn=wb.get_super_cup_tournament_detail,
-            winner_color=Qt.GlobalColor.yellow,
-            rank_fn=wb.get_super_cup_rank_leaders, tab_title="슈퍼컵")
-
-    def _build_cl_style_tab(self, tbl_attr, combo_attr, history_fn, detail_fn, winner_color,
-                             rank_fn, tab_title):
-        """[2026-08 신설] _build_cl_tab의 로직을 그대로 일반화 — 테이블/콤보
-        위젯 속성명, 데이터 조회 함수, 우승 강조색만 매개변수로 뺐다.
-        위젯 자체는 self.<tbl_attr>/<combo_attr>로 저장해서(예: self.el_tbl)
-        기존 self.cl_tbl 패턴과 동일하게 다른 메서드에서도 접근 가능하다.
-
-        [2026-08 확장, 신민용 요청: "대륙 선택 버튼 우측에 역대 1~4등을
-        가장 많이 한 팀이 뜨는 창을 만들고, 기본값은 유럽으로"] rank_fn/
-        tab_title을 추가로 받아 '🥇 최다 순위' 버튼을 필터 옆에 놓는다.
-
-        [2026-08 수정, 신민용 요청: "일반 기록실 필터 기본값은 전체,
-        최다 순위 팝업 필터 기본값은 유럽 — 별개의 filter state로
-        분리해야 한다"] 이 탭(일반 기록실) 자체의 대륙 콤보 기본값은
-        RECORD_FILTER_DEFAULT(전체)를 쓴다. '최다 순위' 팝업의 기본값
-        (RANKING_FILTER_DEFAULT=유럽)은 _on_cl_style_rank_leaders_clicked
-        쪽에서 완전히 독립적으로 관리 — 이 콤보를 안 읽는다."""
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 8, 0, 0)
-
-        filt = QHBoxLayout()
-        lbl = QLabel("대륙"); lbl.setStyleSheet("color:#888;font-size:11px;")
-        combo = QComboBox()
-        for cont in [_ALL, "유럽", "아시아", "아프리카", "남미", "북미"]:
-            combo.addItem(cont)
-        combo.setCurrentText(RECORD_FILTER_DEFAULT)
-        setattr(self, combo_attr, combo)
-        combo.currentTextChanged.connect(
-            lambda *_a: self._refresh_cl_style_table(tbl_attr, combo_attr, history_fn, winner_color))
-        filt.addWidget(lbl)
-        filt.addWidget(combo)
-        filt.addStretch()
-        rank_btn = QPushButton("🥇 최다 순위")
-        rank_btn.clicked.connect(
-            lambda: self._on_cl_style_rank_leaders_clicked(combo_attr, rank_fn, tab_title))
-        filt.addWidget(rank_btn)
-        lay.addLayout(filt)
-
-        tbl = QTableWidget(0, 0)
-        tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        tbl.verticalHeader().setVisible(False)
-        tbl.cellDoubleClicked.connect(
-            lambda row, col: self._open_cl_style_detail(tbl_attr, detail_fn, row, col))
-        _enable_plain_copy(tbl)
-        setattr(self, tbl_attr, tbl)
-        lay.addWidget(tbl)
-        hint = QLabel("💡 대회를 더블클릭하면 리그 스테이지·토너먼트 상세를 볼 수 있어요")
-        hint.setStyleSheet("color:#666;font-size:10px;")
-        lay.addWidget(hint)
-
-        self._refresh_cl_style_table(tbl_attr, combo_attr, history_fn, winner_color)
-        return w
-
-    def _on_cl_style_rank_leaders_clicked(self, combo_attr, rank_fn, tab_title):
-        """[2026-08 수정, 신민용 리포트: "이거 최다 순위 구별하는 게 들어가기
-        전에 있는 탭 필터로 구분한 후 들어가야 되잖아 — 역대 지역컵처럼
-        별개로, 최다 순위 팝업 안에 필터를 넣어달라"] 예전엔 탭의 대륙
-        콤보(combo_attr) 상태를 그대로 읽어서 그 대륙 기준으로만 열었다
-        — 이제 네이션스컵/지역컵과 똑같이, 팝업 자체에 독립된 대륙
-        필터(유럽/아시아/아프리카/북남미)를 두고 기본값을 탭의 현재
-        선택과 무관하게 RANKING_FILTER_DEFAULT(유럽)로 고정한다. 필터를
-        바꾸면 팝업 안에서 바로 다시 집계해서 보여준다."""
-        self._open_cl_style_rank_dialog(tab_title, rank_fn, RANKING_FILTER_DEFAULT)
+    # [2026-09 후속] 역대 슈퍼컵 독립 탭(_build_sc_tab)과 그 전용 골격
+    # (_build_cl_style_tab/_refresh_cl_style_table/_open_cl_style_detail/
+    # _on_cl_style_rank_leaders_clicked)은 슈퍼컵이 _club_tab_specs()로
+    # 합쳐지며 더 쓰이지 않아 제거했다(참조하던 탭 등록도 함께 제거).
+    # 최다순위 팝업의 대회 간 이동 버튼 목록(_cl_style_rank_specs)과
+    # 그 팝업 자체(_open_cl_style_rank_dialog)는 "역대 클럽 대항전"
+    # 탭의 최다순위 버튼(_on_club_tab_rank_clicked)이 그대로 쓰므로 유지.
 
     # [2026-08 신설, 신민용 요청: "최다 순위 화면 상단에 [챔피언스][유로파]
     # [컨퍼런스][슈퍼컵] 이동 버튼 — 현재 화면은 제외"] 챔스/유로파/
@@ -7939,16 +7883,34 @@ class WorldBrowserWindow(QDialog):
         """대륙대회(챔스/유로파/컨퍼런스/슈퍼컵) '최다 순위' 팝업을 연다.
         상단에 같은 성격의 다른 대회로 바로 넘어가는 이동 버튼(현재 화면
         제외)을 같이 붙인다 — 클릭하면 이 팝업을 닫고 그 대회의 팝업을
-        새로 연다."""
+        새로 연다.
+
+        [2026-09 후속, 신민용 리포트: "남미를 누르고 유로파로 넘어가면
+        다시 유럽으로 바뀐다 — 남미로 유지된 채 유로파가 떠야 하고,
+        최다 순위 창도 하나만 떠야 한다"] 예전엔 이동 버튼 콜백이 대륙을
+        항상 RANKING_FILTER_DEFAULT(유럽)로 고정해서 열었다 — 이제
+        RankLeadersDialog._on_nav_clicked가 그 팝업에서 '현재 선택된
+        대륙'을 콜백에 같이 넘겨주고, 여기서는 그 값을 그대로 이어받아
+        다음 팝업을 연다(대륙 선택이 대회를 넘나들며 유지됨). 팝업을
+        새로 열 때마다 직전에 열려 있던 클럽 대항전 최다 순위 창을 먼저
+        닫아서(이동 버튼뿐 아니라 '🥇 최다 순위' 버튼을 다시 눌렀을
+        때도) 항상 이 팝업이 하나만 떠 있도록 보장한다."""
+        existing = getattr(self, "_club_rank_dlg", None)
+        if existing is not None:
+            try:
+                existing.close()
+            except RuntimeError:
+                pass   # 이미 파괴된 C++ 객체 — 무시하고 새로 연다
+
         options = [(_ALL, None), ("유럽", "유럽"), ("아시아", "아시아"),
                    ("아프리카", "아프리카"), ("남미", "남미"), ("북미", "북미")]
         nav_buttons = []
         for label, other_title, other_fn, other_keys, other_labels in self._cl_style_rank_specs():
             if other_title == tab_title:
                 continue   # 현재 보고 있는 화면은 이동 버튼에서 제외
-            nav_buttons.append((label, lambda t=other_title, f=other_fn, k=other_keys, kl=other_labels:
+            nav_buttons.append((label, lambda cont, t=other_title, f=other_fn, k=other_keys, kl=other_labels:
                                  self._open_cl_style_rank_dialog(
-                                     t, f, RANKING_FILTER_DEFAULT, keys=k, key_labels=kl)))
+                                     t, f, cont, keys=k, key_labels=kl)))
         dlg = RankLeadersDialog(tab_title, rank_fn(continent=continent_value),
                                  keys=keys, key_labels=list(key_labels),
                                  filter_label="대륙", filter_options=options,
@@ -7956,61 +7918,8 @@ class WorldBrowserWindow(QDialog):
                                  fetch_fn=lambda cont: rank_fn(continent=cont),
                                  nav_buttons=nav_buttons,
                                  parent=self)
+        self._club_rank_dlg = dlg
         dlg.show()
-
-    def _refresh_cl_style_table(self, tbl_attr, combo_attr, history_fn, winner_color):
-        combo = getattr(self, combo_attr)
-        tbl = getattr(self, tbl_attr)
-        cont = None if combo.currentText() == _ALL else combo.currentText()
-        rows = history_fn(continent=cont)
-        cols = ["연도", "대회", "🥇 우승", "🥈 준우승", "🥉 3위", "4위"]
-        tbl.clear()
-        tbl.setRowCount(len(rows))
-        tbl.setColumnCount(len(cols))
-        tbl.setHorizontalHeaderLabels(cols)
-        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-
-        def _fmt_team(r, key):
-            name = r.get(f"{key}_name") or ""
-            if not name:
-                return "-", None
-            flag = r.get(f"{key}_flag") or ""
-            country = r.get(f"{key}_country") or ""
-            base = f"{flag} {name}".strip()
-            return (f"{base} ({country})" if country else base), name
-
-        for i, r in enumerate(rows):
-            winner = _fmt_team(r, "winner")
-            runner_up = _fmt_team(r, "runner_up")
-            third = _fmt_team(r, "third")
-            fourth = _fmt_team(r, "fourth")
-            vals = [str(r["year"]), r["name"], winner[0], runner_up[0], third[0], fourth[0]]
-            clean_vals = [None, None, winner[1], runner_up[1], third[1], fourth[1]]
-            for j, v in enumerate(vals):
-                cell = QTableWidgetItem(v)
-                cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if clean_vals[j] and clean_vals[j] != v:
-                    cell.setData(_CLEAN_TEXT_ROLE, clean_vals[j])
-                if j == 2:
-                    cell.setForeground(winner_color)
-                if j == 0:
-                    cell.setData(Qt.ItemDataRole.UserRole, r["id"])
-                tbl.setItem(i, j, cell)
-        self._show_empty_state(tbl, rows, "아직 완료된 대회가 없습니다", len(cols))
-        self._grow_to_fit(tbl, stretch_col=1)
-
-    def _open_cl_style_detail(self, tbl_attr, detail_fn, row, _col):
-        tbl = getattr(self, tbl_attr)
-        item = tbl.item(row, 0)
-        tid = item.data(Qt.ItemDataRole.UserRole) if item else None
-        if tid is None:
-            return
-        name_item = tbl.item(row, 1)
-        title = f"{item.text()} {name_item.text() if name_item else ''}"
-        detail = detail_fn(tid)
-        dlg = TournamentDetailDialog(title, detail, team_based=True, parent=self)
-        dlg.exec()
 
     # ─────────────────────────────────────────
     # 탭2.5: 역대 클럽 월드컵 (2026-07 신설)
@@ -9039,9 +8948,10 @@ class RankLeadersDialog(QDialog):
 
         # [2026-08 신설, 신민용 요청: "최다 순위 화면 상단에 [챔피언스]
         # [유로파][컨퍼런스][슈퍼컵] 이동 버튼 — 현재 화면은 제외"]
-        # nav_buttons: [(라벨, 클릭시콜백), ...] — 콜백은 인자 없이 호출된다.
-        # 클릭하면 이 팝업을 닫고 콜백이 다음 팝업을 연다(그래서 항상
-        # 팝업이 하나만 떠 있다).
+        # nav_buttons: [(라벨, 클릭시콜백), ...] — 콜백은 이 팝업에서 현재
+        # 선택돼 있던 필터 값(대륙) 하나를 인자로 받아 호출된다(필터가
+        # 없는 다이얼로그면 None). 클릭하면 이 팝업을 닫고 콜백이 다음
+        # 팝업을 연다(그래서 항상 팝업이 하나만 떠 있다).
         if nav_buttons:
             nav_row = QHBoxLayout()
             nav_lbl = QLabel("다른 대회 보기")
@@ -9102,9 +9012,16 @@ class RankLeadersDialog(QDialog):
 
     def _on_nav_clicked(self, callback):
         """이동 버튼 클릭 — 이 팝업을 닫고(비모달이라 여러 개 안 겹치게)
-        콜백에게 다음 팝업을 열도록 맡긴다."""
+        콜백에게 다음 팝업을 열도록 맡긴다.
+
+        [2026-09 후속, 신민용 리포트: "남미 선택한 채로 다른 대회로
+        넘어가면 유럽으로 초기화된다"] 지금 이 팝업에서 선택돼 있던
+        필터(대륙) 값을 콜백에 같이 넘겨서, 다음 팝업도 그 값 그대로
+        열리게 한다 — 콜백은 이제 인자 없이가 아니라 이 값 하나를
+        받아 호출된다."""
+        current_filter = self._filter_combo.currentData() if self._filter_combo else None
         self.close()
-        callback()
+        callback(current_filter)
 
     def _on_filter_changed(self, _idx):
         if not self._fetch_fn or not self._filter_combo:

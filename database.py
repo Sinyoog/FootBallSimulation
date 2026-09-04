@@ -347,6 +347,35 @@ def _new_raw_conn():
         conn.execute("PRAGMA hist.mmap_size=%d" % _calc_mmap_size(_history_db_path()))
     except sqlite3.OperationalError:
         pass
+    # [2026-09 신설, 성능 감사 후속] 위 mmap_size와 완전히 같은 함정이
+    # cache_size/synchronous/journal_mode에도 있었다 — 이 셋도 전부
+    # '스키마별' 설정이라 위에서 스키마 없이 건 PRAGMA는 main에만 걸린다.
+    # 그런데 main은 USE_MEMORY_DB=True면 인메모리라 페이지 캐시도 저널도
+    # fsync도 아무 의미가 없고, 정작 실제 디스크 파일이자 매 시즌 전환의
+    # 무거운 쓰기가 전부 몰리는 hist(history.db)는 SQLite 기본값 그대로
+    # 방치돼 있었다 — 실측: cache 2MB, journal_mode=delete, synchronous=2
+    # (FULL). 즉 커밋마다 롤백 저널을 만들고 fsync까지 하고 있었다.
+    # 아래 init_db 끝의 WAL 설정 블록이 이걸 못 잡은 이유도 같다 — 그
+    # 블록은 if not USE_MEMORY_DB 안이라 인메모리 모드에선 통째로 스킵된다.
+    #
+    # 셋 다 파일 포맷·데이터·로직과 무관한 성능 파라미터이고, main에 이미
+    # 적용 중인 것과 같은 값(WAL+NORMAL은 SQLite 공식 권장 조합)을 hist에도
+    # 똑같이 걸어줄 뿐이다. 저장되는 기록의 내용은 전혀 달라지지 않는다.
+    try:
+        conn.execute("PRAGMA hist.cache_size=-65536")   # 약 64MB
+        conn.execute("PRAGMA hist.synchronous=NORMAL")
+    except sqlite3.OperationalError:
+        pass
+    # journal_mode만은 환경(네트워크 드라이브·OneDrive 동기화 폴더 등)에
+    # 따라 WAL 전환이 거부될 수 있다 — 실패해도 기존 delete 저널로 그대로
+    # 정상 동작하므로 조용히 넘어간다. history.db는 파일 단위로 복사·이동
+    # 하는 경로가 전혀 없어(ATTACH해서 제자리에서만 쓴다 — flush_to_disk/
+    # load_from_disk의 backup()은 main 스키마 전용) -wal/-shm 동반 파일이
+    # 생겨도 세이브 취급에 문제가 없다.
+    try:
+        conn.execute("PRAGMA hist.journal_mode=WAL")
+    except sqlite3.OperationalError:
+        pass
     # [2026-09 신설, 신민용 리포트: "국대 선발이 그냥 OVR순이면 노화 재설계
     # 이후 40대가 여러 명 뽑히는 이상한 상황이 생길 수 있다"] 포지션군·
     # 나이대·전성기(peak_ovr) 기반 선발 점수(constants.intl_selection_score)를
@@ -3089,10 +3118,23 @@ def archive_old_seasons(current_season):
         _tsp = time.perf_counter() - _tsp0
     _tal = _prune_ai_transfer_log(conn, current_season)
     _tvac = _maybe_periodic_vacuum(conn)
-    print(f"[PERF]   archive_old_seasons 세부: 과거시즌조회 {_ta1-_ta0:.2f}s | "
-          f"아카이브INSERT {_ta2-_ta1:.2f}s | match_results DELETE {_ta3-_ta2:.2f}s | "
-          f"commit {_ta4-_ta3:.2f}s | 요약+정리 {_tsp:.2f}s | ai_transfer_log정리 {_tal:.2f}s | "
-          f"주기VACUUM {_tvac:.2f}s | (대상시즌 {seasons})")
+    # [2026-09 신설] VACUUM 직후(파일 크기가 확정된 시점)에 mmap 창을 다시
+    # 건다 — refresh_mmap_size 정의부 주석 참고.
+    _tmm = time.perf_counter()
+    _mm = refresh_mmap_size(conn)
+    _tmm = time.perf_counter() - _tmm
+    _msg = (f"[PERF]   archive_old_seasons 세부: 과거시즌조회 {_ta1-_ta0:.2f}s | "
+            f"아카이브INSERT {_ta2-_ta1:.2f}s | match_results DELETE {_ta3-_ta2:.2f}s | "
+            f"commit {_ta4-_ta3:.2f}s | 요약+정리 {_tsp:.2f}s | ai_transfer_log정리 {_tal:.2f}s | "
+            f"주기VACUUM {_tvac:.2f}s | mmap재설정 {_tmm:.2f}s ({_mm}) | (대상시즌 {seasons})")
+    print(_msg)
+    # [2026-09] 이 줄도 여태 print로만 나가 live_sim.log에 안 남았다 —
+    # 주기VACUUM 비용이 "아카이브이동" 시간에 섞여 보이던 혼선의 원인.
+    try:
+        from game_engine import _live_debug
+        _live_debug(_msg)
+    except Exception:
+        pass
 
 
 # [2026-08 신설, 신민용 리포트: "50년 세이브 실측 — ai_transfer_log가
@@ -3192,6 +3234,39 @@ def _maybe_periodic_vacuum(conn) -> float:
     c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('seasons_since_vacuum', '0')")
     conn.commit()
     return _tv1 - _tv0
+
+
+# [2026-09 신설, 성능 감사 후속 — 실측으로 확인된 "한 번 실행 안에서만
+# 누적되는 저하"] _calc_mmap_size는 여태 _new_raw_conn()에서 '접속하는 그
+# 순간의 파일 크기' 기준으로 딱 한 번만 걸렸다. 그런데 history.db는 게임을
+# 켜 둔 채 시즌을 넘길 때마다 계속 커진다(실측 연 +26MB) — 즉 앱을 켠
+# 시점에 잡아둔 mmap 창을 실행 도중 파일이 추월하고, 추월당한 뒤로는 그
+# 초과분(=이번 시즌에 막 쓴 가장 뜨거운 페이지)이 mmap 밖으로 밀려난다.
+#
+# live_sim.log 실측이 정확히 이 모양이었다 — 한 번의 연속 실행 안에서
+# 시즌전환이 44→58초로 단조 증가하는데 앱을 껐다 켜면 47초로 되돌아오고,
+# 5시즌 주기 VACUUM으로는 회복되지 않는다(mmap_size는 파일 단편화가 아니라
+# 커넥션 설정이라 VACUUM이 건드릴 수 없다). 같은 구간에서 hist를 전혀 안
+# 건드리는 파워랭킹만 1.7초로 평평한 것도 이 진단과 일치한다.
+#
+# 해결: 시즌 전환마다 현재 파일 크기로 다시 계산해 건다. mmap_size는
+# 파일 포맷과 무관한 '연결별 읽기 성능 힌트'라 값이 바뀌어도 데이터·로직·
+# 결과에 영향이 전혀 없고(SQLite가 실패하면 조용히 일반 I/O로 폴백),
+# 비용도 PRAGMA 한 줄이라 사실상 0이다.
+def refresh_mmap_size(conn=None) -> str:
+    """main/hist의 mmap_size를 현재 파일 크기 기준으로 다시 건다.
+    반환값은 [PERF] 로그용 요약 문자열."""
+    if conn is None:
+        conn = get_conn()
+    _parts = []
+    for _schema, _path in (("main", DB_PATH), ("hist", _history_db_path())):
+        try:
+            _want = _calc_mmap_size(_path)
+            conn.execute("PRAGMA %s.mmap_size=%d" % (_schema, _want))
+            _parts.append("%s %dMB" % (_schema, _want // (1024 * 1024)))
+        except sqlite3.OperationalError:
+            pass
+    return " | ".join(_parts)
 
 
 def repair_duplicate_season_schedules():

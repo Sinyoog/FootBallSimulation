@@ -1,7 +1,12 @@
-# .gitignore
+@"
 live_sim.log
 *.log
 game.db
 game.history.db
+game.db-wal
+game.db-shm
+game.history.db-wal
+game.history.db-shm
 __pycache__/
 *.pyc
+"@ | Set-Content -Path .gitignore -Encoding utf8

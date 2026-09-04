@@ -116,6 +116,21 @@ _AI_GROWTH_CATCHUP_FRAC = 0.35  # 한 번 터치할 때 (팀 상한-현재값) �
 _AI_GROWTH_TOUCHES_NONKEY = (4, 8)  # 비핵심스탯 전용 터치 예산(핵심과 동일 크기, 완전 별도 풀)
 
 
+# [2026-09 신설, 성능 진단] 아래 [PERF*] 계측은 여태 print()로만 나갔다 —
+# PyQt 앱은 콘솔이 안 보이는 경우가 많고, live_sim.log에는 game_engine.
+# _live_debug로 나간 줄만 담겨서 'AI생애주기 47초'라는 합계만 보이고 그
+# 안의 어느 서브단계가 무거운지는 알 수 없었다(전체 시뮬의 61%가 블랙박스).
+# print는 그대로 두고 같은 줄을 로그에도 남긴다 — 계측 출력만 늘 뿐
+# 게임 로직·결과에는 전혀 영향이 없다.
+def _perf_log(msg):
+    print(msg)
+    try:
+        from game_engine import _live_debug   # 순환 import 회피용 지연 import
+        _live_debug(msg)
+    except Exception:
+        pass
+
+
 def _youth_target_scale(target, age):
     """[2026-08 4차 재설계] 16~24세 신인의 target(성인 잠재치)을
     constants.roll_age_ovr_fraction(나이별 명시적 표, 1% 확률 조숙형
@@ -597,6 +612,11 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
     # 없었는데 지금 생긴" id만 한 번에 추려 그 선수들도 데뷔 연도로
     # archive한다(아래 "신규 선수 데뷔연도 archive" 참고).
     _season_start_ids = {r["id"] for r in shared_ai_rows}
+    # [2026-09 계측] 아래 '은퇴·세대교체' 구간은 사실 (1)전 선수 OVR 이력
+    # 아카이브 (2)전 선수 포지션 스냅샷 (3)평점 스냅샷 (4)진짜 은퇴 처리가
+    # 뭉쳐 있어서 10~15초가 어디서 나는지 구분이 안 됐다(PERF-LIFECYCLE의
+    # ms/명도 은퇴자 수로 나눠 실제보다 과대평가된 값이었다). 쪼갠다.
+    _t_ovrarch = _time_perf.perf_counter()
 
     # [2026-08 버그수정, 신민용 리포트: "은퇴 선수 마지막 팀에서 역할이
     # -로 뜬다"] 은퇴·이적으로 로스터가 흔들리기 "전"에 이번 시즌을
@@ -604,6 +624,7 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
     # positions 주석 참고). 맨 아래에서 이번 오프시즌 신규 선수만
     # 한 번 더 보충한다.
     _snapshot_season_positions(c, year, rows=shared_ai_rows)
+    _t_snappos = _time_perf.perf_counter()
     # [2026-08 신설, 세계 축구 기록실 연도별 평점/골/도움 요약] 같은
     # 이유(로스터가 바뀌기 전, "이번 시즌을 실제로 뛴" 팀 기준)로 여기서
     # 같이 스냅샷한다 — shared_ai_rows는 sub_role/league_id가 없어 그대로
@@ -648,6 +669,7 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
     # 경로다. 위와 같은 원칙으로 여기서도 한 번 커밋해 방어한다.
     conn.commit()
 
+    _t_snaprate = _time_perf.perf_counter()
     _report(1, "은퇴 및 신인 영입 중")
     retired    = _retire_and_replace(c, year, shared_ai_rows)
     _ta2 = _time_perf.perf_counter()
@@ -701,6 +723,7 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
     _ta3b = _time_perf.perf_counter()
     _report(3, "포메이션 갱신 중")
     formations = _shuffle_formations(c)
+    _t_shuffle = _time_perf.perf_counter()
     # [2026-08 신설, 신민용 요청: "이 시즌에 얘가 어디 포지션을 갔는지가
     # 중요한거야"] 방금 이번 시즌 포메이션이 확정됐으니(바로 위), 그
     # 포메이션대로 로스터를 채웠을 때 각 선수가 맡는 자리를 여기서 같이
@@ -716,12 +739,16 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
     # [2026-07 신설, 진단용] game_engine._advance_week의 [PERF] 로그와 짝을
     # 이루는 세부 단계 측정 — "AI생애주기 N초" 중 실제로 어느 서브단계
     # (성장/은퇴·세대교체/이적시장/전술변경)가 무거운지 콘솔에서 바로 보인다.
-    print(f"[PERF]     ai_offseason 세부: ensure(age/subrole) {_t_ensure-_t_start:.2f}s | "
+    _perf_log(f"[PERF]     ai_offseason 세부: ensure(age/subrole) {_t_ensure-_t_start:.2f}s | "
           f"성장/노화({'numpy' if _HAS_NUMPY else 'PURE-PYTHON!'}) {_ta1-_ta0:.2f}s | "
           f"shared_ai_rows조회 {_t_shared-_ta1:.2f}s | "
-          f"은퇴·세대교체 {_ta2-_t_shared:.2f}s | 이적시장 {_ta3-_ta2:.2f}s | "
+          f"OVR이력아카이브 {_t_ovrarch-_t_shared:.2f}s | "
+          f"포지션스냅샷 {_t_snappos-_t_ovrarch:.2f}s | "
+          f"평점스냅샷 {_t_snaprate-_t_snappos:.2f}s | "
+          f"은퇴·세대교체 {_ta2-_t_snaprate:.2f}s | 이적시장 {_ta3-_ta2:.2f}s | "
           f"명문팀 스카우팅 {_ta3b0-_ta3:.2f}s | "
-          f"스쿼드 인원 보정 {_ta3b-_ta3b0:.2f}s | 전술변경 {_ta4-_ta3b:.2f}s")
+          f"스쿼드 인원 보정 {_ta3b-_ta3b0:.2f}s | "
+          f"전술셔플 {_t_shuffle-_ta3b:.2f}s | 포지션보충스냅샷 {_ta4-_t_shuffle:.2f}s")
     # [2026-08 신설, 신민용 리포트: "시즌 지날수록 은퇴·세대교체가 느려지는데
     # 처리 대상(은퇴자 수) 자체가 느는 건지 건당 비용이 느는 건지 구분이
     # 안 된다"] 위 [PERF] 줄은 이미 "은퇴·세대교체 X.XXs"를 찍고 있었지만
@@ -730,10 +757,10 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
     # 늘어난 버그"인지 구분할 수 없었다. retired/moved는 이미 계산돼 있는
     # 값이라 여기 한 줄만 추가하면 시즌별로 나란히 비교할 수 있다 —
     # 로직/결과는 전혀 안 건드리고 로그만 추가.
-    print(f"[PERF-LIFECYCLE] {year}년: 은퇴/세대교체 {retired}명 · 이적 {moved}건 · "
+    _perf_log(f"[PERF-LIFECYCLE] {year}년: 은퇴/세대교체 {retired}명 · 이적 {moved}건 · "
           f"명문팀 스카우팅 {scouted}건 · 임대 복귀 {loan_returned}명 · 재계약 {renewed}명 · "
-          f"소요시간 {_ta2-_t_shared:.3f}s"
-          + (f" ({(_ta2-_t_shared)/retired*1000:.2f}ms/명)" if retired else ""))
+          f"소요시간 {_ta2-_t_snaprate:.3f}s"
+          + (f" ({(_ta2-_t_snaprate)/retired*1000:.2f}ms/명)" if retired else ""))
 
     # [2026-08 신설, 위 _season_start_ids 주석 참고 — "신규 선수 데뷔연도
     # archive"] 이 시즌 동안 새로 생긴 선수 전부(은퇴 대체 신인 +
@@ -761,9 +788,9 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
         from database import refresh_career_years
         refresh_career_years(conn, retirement_year=year)
     except Exception as _e:
-        print(f"[PERF-LIFECYCLE] career_years 갱신 건너뜀: {_e}")
+        _perf_log(f"[PERF-LIFECYCLE] career_years 갱신 건너뜀: {_e}")
     _t_cy1 = _time_perf.perf_counter()
-    print(f"[PERF-LIFECYCLE] {year}년: career_years 갱신 {_t_cy1-_t_cy0:.2f}s")
+    _perf_log(f"[PERF-LIFECYCLE] {year}년: career_years 갱신 {_t_cy1-_t_cy0:.2f}s")
 
     _t_commit0 = _time_perf.perf_counter()
     conn.commit()
@@ -777,7 +804,7 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
     except Exception:
         pass
     _t_cache1 = _time_perf.perf_counter()
-    print(f"[PERF-AI]  commit={_t_commit1-_t_commit0:.3f}s | "
+    _perf_log(f"[PERF-AI]  commit={_t_commit1-_t_commit0:.3f}s | "
           f"cache_invalidate={_t_cache1-_t_commit1:.3f}s")
 
     if verbose_log:
@@ -961,7 +988,7 @@ def _age_and_progress(c):
     else:
         _result = _age_and_progress_py(c, rows, team_cap, _ORPHAN_CAP_FALLBACK)
     _ap_t3 = _time_ap.perf_counter()
-    print(f"[PERF-AGE] _age_and_progress({'numpy' if _HAS_NUMPY else 'python'}) 세부: "
+    _perf_log(f"[PERF-AGE] _age_and_progress({'numpy' if _HAS_NUMPY else 'python'}) 세부: "
           f"team_cap조회 {_ap_t1-_ap_t0:.3f}s | ai_players fetch({len(rows)}행) {_ap_t2-_ap_t1:.3f}s | "
           f"계산+DB쓰기 {_ap_t3-_ap_t2:.3f}s")
     return _result
@@ -1238,7 +1265,7 @@ def _age_and_progress_np(c, rows, team_cap, orphan_fallback):
             f"UPDATE ai_players SET age=?, {set_clause}, ovr=?, peak_ovr=? WHERE id=?",
             updates)
     _npf_t2 = _time_npf.perf_counter()
-    print(f"[PERF-AGE-NP]  numpy계산 {_npf_t1-_npf_t0:.3f}s | "
+    _perf_log(f"[PERF-AGE-NP]  numpy계산 {_npf_t1-_npf_t0:.3f}s | "
           f"executemany({len(updates)}건) {_npf_t2-_npf_t1:.3f}s")
 
     if _orphan_team_ids:
@@ -1497,7 +1524,7 @@ def _calc_ai_salary(grade, tier, ovr, cname, tname, team_id, year):
         return 0
 
 
-def _build_buy_pools(rows):
+def _build_buy_pools(rows, team_info=None):
     """[2026-09 신설] 명문팀이 은퇴자를 유스 생성 대신 시장에서 영입으로
     채울 때 쓰는 후보 풀 — 포지션별로 OVR 오름차순 정렬해서 bisect로
     원하는 구간만 빠르게 잘라 쓸 수 있게 한다. _retire_and_replace가 이미
@@ -1506,10 +1533,53 @@ def _build_buy_pools(rows):
     tmp: dict = {}
     for r in rows:
         tmp.setdefault(r["position"], []).append(r)
+    # [2026-09 최적화] 아래 entries에 넣을 "리그 등급랭크"를 여기서 한 번만
+    # 계산한다 — _find_buy_replacement의 global_scouting 가드가 후보마다
+    # LEAGUE_GRADE_RANK dict를 다시 찾던 것을 없앤다(실측상 그 경로가 전체
+    # 스캔의 98%라 시즌당 약 0.3초). 판정에 쓰는 표도, 기본값(1)도 원본과
+    # 완전히 같은 것을 쓴다.
+    _rank_of = {}
+    if team_info is not None:
+        try:
+            from economy import LEAGUE_GRADE_RANK as _rank_of
+        except Exception:
+            _rank_of = {}
     pools = {}
     for pos, lst in tmp.items():
         lst.sort(key=lambda r: r["ovr"])
-        pools[pos] = (lst, [r["ovr"] for r in lst])
+        ovrs = [r["ovr"] for r in lst]
+        # [2026-09 최적화] _find_buy_replacement가 은퇴자마다 전세계 밴드
+        # (포지션당 수천 명)를 파이썬으로 전수 순회하던 것을 없앤다. 실측
+        # (선수 25.5만·팀 12,750, 영입시도 8,000회): 39.05s → 6.23s.
+        #   - by_country : "자국 우선" 검색용 국가별 부분풀. 실측상
+        #     영입 시도의 90% 이상이 이 경로다(global_scouting은 SS/S
+        #     또는 prestige>=2 팀만 타므로 소수).
+        #   - 원소는 sqlite3.Row가 아니라 미리 뜯어놓은 튜플
+        #     (행, id, team_id, 국가, 등급랭크, 나이) — Row의 이름 조회는
+        #     컬럼명 순차 비교라 비싼데 후보당 4번씩 수천만 회 돌았다.
+        #     값은 시즌 내내 안 변하므로 여기서 한 번만 뜯어둔다.
+        #
+        # [결과 동일성] 부분풀은 전역 정렬 리스트를 앞에서부터 훑어
+        # 담으므로 "부분수열"이다 — 전역 밴드를 잘라 같은 조건으로 거른
+        # 것과 원소도, 그 순서도 정확히 같다. 순서가 같아야 뒤이은
+        # random.choices가 같은 난수 스트림에서 같은 선수를 뽑는다.
+        # 아래 _filter의 판정 조건은 한 줄도 바꾸지 않았고, 좁힌 뒤에도
+        # 원래 가드를 그대로 다시 검사한다(좁히기가 틀려도 결과 불변).
+        by_country: dict = {}
+        entries = []
+        if team_info is not None:
+            for r in lst:
+                _ti = team_info.get(r["team_id"])
+                _cn = _ti[3] if _ti else ""
+                _e = (r, r["id"], r["team_id"], _cn,
+                      _rank_of.get(_ti[0] if _ti else "D", 1), r["age"])
+                entries.append(_e)
+                _b = by_country.get(_cn)
+                if _b is None:
+                    _b = by_country[_cn] = ([], [])
+                _b[0].append(_e)
+                _b[1].append(r["ovr"])
+        pools[pos] = (lst, ovrs, by_country or None, entries or None)
     return pools
 
 
@@ -1519,11 +1589,20 @@ def _build_team_pos_group_count(rows):
     빼가면) 그 팀의 이 포지션그룹이 0명이 되는가"를 판정할 때 쓴다 —
     _do_one_transfer_cached의 "마지막 GK/마지막 CB는 판매 후보에서 제외"
     보호 원칙과 동일하다."""
+    # [2026-09 최적화] 예전엔 {(team_id, 그룹): 수} 한 겹이었는데, 그러면
+    # _find_buy_replacement가 후보 한 명을 볼 때마다 (team_id, grp) 튜플을
+    # 새로 만들어 조회해야 한다 — 실측상 그 루프가 시즌당 1,240만 번 돌아
+    # 튜플 생성만으로 0.8초가 나갔다. {그룹: {team_id: 수}} 두 겹으로 바꾸면
+    # 그룹 dict를 호출당 한 번만 꺼내두고 팀 id로 바로 찾으면 된다.
+    # 담기는 값과 의미는 완전히 동일하다.
     counts: dict = {}
     for r in rows:
         grp = _POS_GROUP.get(r["position"], "FW")
-        key = (r["team_id"], grp)
-        counts[key] = counts.get(key, 0) + 1
+        _g = counts.get(grp)
+        if _g is None:
+            _g = counts[grp] = {}
+        _tid = r["team_id"]
+        _g[_tid] = _g.get(_tid, 0) + 1
     return counts
 
 
@@ -1562,14 +1641,29 @@ def _find_buy_replacement(position, target_ovr, dst_team_id, dst_cname,
     pool = pools.get(position)
     if not pool:
         return None
-    rows_sorted, ovrs_sorted = pool
+    rows_sorted, ovrs_sorted, by_country, entries = pool
     lo = target_ovr - BUY_REPLACEMENT_OVR_BAND[0]
     hi = target_ovr + BUY_REPLACEMENT_OVR_BAND[1]
     i0 = bisect.bisect_left(ovrs_sorted, lo)
     i1 = bisect.bisect_right(ovrs_sorted, hi)
-    cands = rows_sorted[i0:i1]
-    if not cands:
+    if i0 >= i1:
         return None
+    # [2026-09 최적화] 전역 밴드 슬라이스(수천 명 복사)는 실제로 전세계를
+    # 훑어야 하는 경로에서만 만든다.
+    _cands_cell: list = []
+    def _global_cands():
+        if not _cands_cell:
+            _src = entries[i0:i1] if entries is not None else [
+                (r, r["id"], r["team_id"], None, 1, r["age"])
+                for r in rows_sorted[i0:i1]]
+            _cands_cell.append(_src)
+        return _cands_cell[0]
+    # 이 풀은 position별로 만들어지므로 안에 든 행의 position은 전부 같다
+    # — 후보마다 다시 구할 이유가 없어 한 번만 계산한다(결과 동일).
+    _grp = _POS_GROUP.get(position, "FW")
+    # 그룹별 팀 인원표를 호출당 한 번만 꺼내둔다(_build_team_pos_group_count
+    # 주석 참고 — 후보마다 튜플을 만들지 않기 위함).
+    _grp_counts = team_pos_group_count.get(_grp) or {}
 
     dst_rank = 4
     _grade_rank = None
@@ -1580,24 +1674,36 @@ def _find_buy_replacement(position, target_ovr, dst_team_id, dst_cname,
         dst_rank = _grade_rank.get(_dst_ti[0] if _dst_ti else "D", 4)
 
     def _filter(same_country):
+        # [2026-09 최적화] 자국 검색은 그 나라 부분풀의 밴드만 본다
+        # (_build_buy_pools 주석 참고 — 부분풀은 전역 정렬 리스트의
+        # 부분수열이라 원소·순서가 전역 밴드를 훑어 국적으로 거른 것과
+        # 정확히 같다).
+        _sub = by_country.get(dst_cname) if (same_country and by_country is not None) else None
+        if _sub is not None:
+            _srows, _sovrs = _sub
+            if not _srows:
+                return []
+            scan = _srows[bisect.bisect_left(_sovrs, lo):bisect.bisect_right(_sovrs, hi)]
+        elif same_country and by_country is not None:
+            return []   # 그 나라 후보 자체가 없음(기존과 동일한 결과)
+        else:
+            scan = _global_cands()
         out = []
-        for r in cands:
-            if r["team_id"] == dst_team_id or r["id"] in used_ids:
+        # e = (행, id, team_id, 국가, 등급랭크, 나이) — 판정 조건은 원본과
+        # 한 글자도 다르지 않고, 값을 어디서 읽어오는지만 다르다.
+        for e in scan:
+            if e[2] == dst_team_id or e[1] in used_ids:
                 continue
-            ti = team_info.get(r["team_id"])
-            cname_r = ti[3] if ti else ""
+            cname_r = e[3]
             if same_country and cname_r != dst_cname:
                 continue
             if (not same_country) and cname_r == dst_cname:
                 continue
-            if global_scouting:
-                r_rank = _grade_rank.get(ti[0] if ti else "D", 1)
-                if r_rank > dst_rank:
-                    continue   # 약한 목적지가 더 강한 리그에서 못 뺏어옴
-            grp = _POS_GROUP.get(r["position"], "FW")
-            if team_pos_group_count.get((r["team_id"], grp), 0) <= 1:
+            if global_scouting and e[4] > dst_rank:
+                continue   # 약한 목적지가 더 강한 리그에서 못 뺏어옴
+            if _grp_counts.get(e[2], 0) <= 1:
                 continue
-            out.append(r)
+            out.append(e)
         return out
 
     if global_scouting:
@@ -1610,9 +1716,11 @@ def _find_buy_replacement(position, target_ovr, dst_team_id, dst_cname,
             chosen = _filter(False)   # 없으면 해외로 폴백
     if not chosen:
         return None
-    weights = [BUY_REPLACEMENT_YOUNG_WEIGHT if (r["age"] or 25) <= BUY_REPLACEMENT_YOUNG_AGE else 1.0
-               for r in chosen]
-    return random.choices(chosen, weights=weights, k=1)[0]
+    weights = [BUY_REPLACEMENT_YOUNG_WEIGHT if (e[5] or 25) <= BUY_REPLACEMENT_YOUNG_AGE else 1.0
+               for e in chosen]
+    # chosen은 튜플 목록이지만 가중치 순서·개수가 원본과 같으므로 같은
+    # 난수 스트림에서 같은 자리를 뽑는다 — 행만 꺼내 돌려준다.
+    return random.choices(chosen, weights=weights, k=1)[0][0]
 
 
 def _prestige_scouting(c, year):
@@ -1740,7 +1848,10 @@ def _prestige_scouting(c, year):
             pool = pools.get(pos)
             if not pool:
                 continue
-            rows_sorted, _ = pool
+            # [2026-09] _build_buy_pools는 이제 5-튜플을 돌려준다
+            # (_find_buy_replacement의 검색 최적화용). 여기선 정렬된 행
+            # 리스트만 쓰므로 길이에 의존하지 않게 인덱스로 꺼낸다.
+            rows_sorted = pool[0]
             n = len(rows_sorted)
             # [2026-09 수정] 등급별 구간을 서로 안 겹치게 분리 — 위
             # PRESTIGE_SCOUT_BAND 정의부 주석 참고. hi_cut(구간 시작,
@@ -1843,6 +1954,15 @@ def _retire_and_replace(c, year, ai_rows=None):
     from constants import (OVR_RANGES, CONTINENT_OVR_BONUS, COUNTRY_OVR_ADJ, SUB_ROLES,
                            get_country_league_grade, get_ovr_range, COUNTRY_LEAGUE_OVR_OVERRIDE)
     from database import _pick_nationality, get_foreign_quota_range
+    # [2026-09 계측, 신민용 지적: "은퇴자 +21%인데 시간 +66% — 건당 비용
+    # 자체가 악화되고 있다"] 이 함수를 한 덩어리로 보면 그 원인이 누적
+    # 데이터(ai_players_retired 등)에 있는지 신인 생성에 있는지 구분이
+    # 안 된다. 준비/판정루프/대체자탐색/신인생성/DB쓰기로 쪼갠다.
+    import time as _time_rt
+    _rt0 = _time_rt.perf_counter()
+    _acc_buy = 0.0     # 후계자·대체자 탐색(_find_buy_replacement)
+    _acc_stats = 0.0   # 신인 능력치 생성(_gen_stats)
+    _acc_name = 0.0    # 신인 이름 배정(_random_name)
     retired = 0
 
     # 팀 → 리그등급/tier/보정치 선조회 (은퇴자마다 JOIN 방지)
@@ -1910,6 +2030,7 @@ def _retire_and_replace(c, year, ai_rows=None):
 
     # [최적화] 이름풀 전체 1회 로드 (은퇴자마다 ORDER BY RANDOM() 방지)
     name_cache = _build_name_cache(c)
+    _rt1 = _time_rt.perf_counter()   # 팀정보·국대명단·이름풀 조회까지
     # 팀→국가 캐시 초기화 (오프시즌 시작 시 리셋)
     _team_country_cache.clear()
 
@@ -1960,13 +2081,16 @@ def _retire_and_replace(c, year, ai_rows=None):
     # 자리를 채우러 뽑힌 선수"를 걸러내는 용도(같은 선수가 한 시즌에
     # 두 번 팔려나가는 것 방지).
     from constants import BUY_REPLACEMENT_PROB_BY_GRADE, BIG_CLUB_PRESTIGE_THRESHOLD
-    _buy_pools = _build_buy_pools(rows)
+    _rt2 = _time_rt.perf_counter()   # 선수행 전처리(이름/외국인 카운터)까지
+    _buy_pools = _build_buy_pools(rows, team_info)
     _buy_pos_group_count = _build_team_pos_group_count(rows)
     _buy_used_ids: set = set()
     transfer_updates = []    # (new_team_id, contract_end_year, last_transfer_year, player_id)
     transfer_log_rows = []   # ai_transfer_log INSERT용
     _season_row = c.execute("SELECT current_season FROM season_state WHERE id=1").fetchone()
     _cur_season = _season_row["current_season"] if _season_row else 1
+
+    _rt3 = _time_rt.perf_counter()   # 후보풀 구축까지
 
     for r in rows:
         age = r["age"] or 25
@@ -2137,15 +2261,18 @@ def _retire_and_replace(c, year, ai_rows=None):
             # 판정 기준을 새로 만들지 않고 이 시점에 이미 있는 계산을
             # 재사용(brazil 등 선수 풀이 큰 나라의 폐쇄 루프 완화용).
             _global_scouting = grade in ("SS", "S") or _plvl >= BIG_CLUB_PRESTIGE_THRESHOLD
+            _tb0 = _time_rt.perf_counter()
             _bought = _find_buy_replacement(
                 r["position"], round(target), r["team_id"], cname,
                 _buy_pools, team_info, _buy_pos_group_count, _buy_used_ids,
                 global_scouting=_global_scouting)
+            _acc_buy += _time_rt.perf_counter() - _tb0
             if _bought is not None:
                 _buy_used_ids.add(_bought["id"])
                 _bgrp = _POS_GROUP.get(_bought["position"], "FW")
-                _bkey = (_bought["team_id"], _bgrp)
-                _buy_pos_group_count[_bkey] = max(0, _buy_pos_group_count.get(_bkey, 1) - 1)
+                _bg = _buy_pos_group_count.setdefault(_bgrp, {})
+                _btid = _bought["team_id"]
+                _bg[_btid] = max(0, _bg.get(_btid, 1) - 1)
                 _src_tinfo = team_info.get(_bought["team_id"])
                 _src_plvl = prestige_level(_src_tinfo[3], _src_tinfo[5]) if _src_tinfo else 0
                 # [2026-09 신설] 영입한 선수의 국적/이름을 이 팀의 카운터에도
@@ -2212,7 +2339,9 @@ def _retire_and_replace(c, year, ai_rows=None):
                          "D": 2, "E": 2, "F": 3}.get(grade, 2)
             _young_floor_off = _prestige_base + _grade_adj
             _scaled_target = max(_scaled_target, ovr_rng[0] - _young_floor_off)
+        _tg0 = _time_rt.perf_counter()
         stats = _gen_stats(r["position"], _scaled_target)
+        _acc_stats += _time_rt.perf_counter() - _tg0
         new_ovr = calc_ovr(r["position"], stats)
         # [2026-08 신설, 진단용] 추적 대상 팀이면 이번에 생성된 신인 OVR을 기록.
         if DEBUG_PRESTIGE_TRACKING and r["team_id"] in _dbg:
@@ -2236,7 +2365,9 @@ def _retire_and_replace(c, year, ai_rows=None):
         foreign_count_by_team[tid] = cur_foreign
         # 팀 내 중복 방지: used_in_team에 팀 현재 이름 set 전달
         used = team_used_names.setdefault(r["team_id"], set())
+        _tn0 = _time_rt.perf_counter()
         name = _random_name(c, r["team_id"], name_cache, used_in_team=used)
+        _acc_name += _time_rt.perf_counter() - _tn0
         # [2026-08 버그수정, 신민용 리포트: "AI5가 은퇴하면 AI5가 다시
         # 생기는 게 아니라 AI11이 나타나야 하고, AI5는 그 은퇴한 선수로
         # 남아있어야 한다"] 예전엔 은퇴 교체를 "같은 행을 UPDATE"로
@@ -2265,14 +2396,18 @@ def _retire_and_replace(c, year, ai_rows=None):
             _calc_ai_salary(grade, tier, new_ovr, cname, _tname, r["team_id"], year)))
         retired += 1
 
+    _rt4 = _time_rt.perf_counter()   # 은퇴판정+대체자탐색+신인생성 루프까지
+
     if retire_archives:
         c.executemany(
             """INSERT OR REPLACE INTO ai_players_retired
                (id, name, position, ovr, age, nationality, last_team_id,
                 last_team_name, retirement_year)
                VALUES(?,?,?,?,?,?,?,?,?)""", retire_archives)
+    _rt5 = _time_rt.perf_counter()   # ai_players_retired 아카이브 적재
     if retire_deletes:
         c.executemany("DELETE FROM ai_players WHERE id=?", retire_deletes)
+    _rt6 = _time_rt.perf_counter()   # ai_players 은퇴자 DELETE
     if new_rows:
         c.executemany(
             f"""INSERT INTO ai_players
@@ -2280,6 +2415,7 @@ def _retire_and_replace(c, year, ai_rows=None):
                  contract_end_year,last_transfer_year,created_year,salary)
                 VALUES(?,?,?,{','.join('?' for _ in ALL_STATS)},?,?,?,?,?,?,?,?)""",
             new_rows)
+    _rt7 = _time_rt.perf_counter()   # ai_players 신인 INSERT
     # [2026-09 신설] 위 "명문팀 은퇴대체 영입" 건 — 신인 INSERT(new_rows)와
     # 완전히 별개라, new_rows가 비어있어도(이번 시즌 유스 생성이 하나도
     # 없었어도) 항상 독립적으로 반영돼야 한다(예전엔 이 블록 전체가
@@ -2300,6 +2436,17 @@ def _retire_and_replace(c, year, ai_rows=None):
                 fee, is_loan, loan_return_year, salary, contract_end_year)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             transfer_log_rows)
+    _rt8 = _time_rt.perf_counter()   # 이적(명문팀 영입) 반영+로그
+    _perf_log(
+        f"[RETIRE-PERF] {year}년 은퇴·세대교체 {_rt8-_rt0:.2f}s "
+        f"(은퇴 {retired}명 / 후보 {len(rows)}명) 세부: "
+        f"팀정보·명단조회 {_rt1-_rt0:.2f}s | 선수행전처리 {_rt2-_rt1:.2f}s | "
+        f"후보풀구축 {_rt3-_rt2:.2f}s | "
+        f"판정·생성루프 {_rt4-_rt3:.2f}s (대체자탐색 {_acc_buy:.2f}s · "
+        f"신인능력치 {_acc_stats:.2f}s · 신인이름 {_acc_name:.2f}s · "
+        f"그 외 {(_rt4-_rt3)-_acc_buy-_acc_stats-_acc_name:.2f}s) | "
+        f"retired적재 {_rt5-_rt4:.2f}s | 은퇴자DELETE {_rt6-_rt5:.2f}s | "
+        f"신인INSERT {_rt7-_rt6:.2f}s | 이적반영+로그 {_rt8-_rt7:.2f}s")
 
     # [2026-08 신설, 진단용] 추적 대상 팀들의 이번 시즌 은퇴/신인 교체 요약을
     # 한 줄씩 찍는다 — "강등 → 낮은 OVR 신인 → 추가 강등" 루프가 실제로
@@ -3068,7 +3215,7 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             transfer_log_rows)
     _tm5 = _time_tm.perf_counter()
-    print(f"[PERF-TM]  teams조회(서브쿼리포함) {_tm1-_tm0:.3f}s | "
+    _perf_log(f"[PERF-TM]  teams조회(서브쿼리포함) {_tm1-_tm0:.3f}s | "
           f"그룹핑 {_tm2-_tm1:.3f}s | team_players빌드 {_tm3-_tm2:.3f}s | "
           f"이적루프({len(by_league)}개리그) {_tm4-_tm3:.3f}s | "
           f"executemany({len(transfer_updates)}건) {_tm5-_tm4:.3f}s")

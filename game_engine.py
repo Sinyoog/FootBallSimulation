@@ -10710,12 +10710,29 @@ def _compute_season_individual_awards(year, my_ctx=None):
             (year,)).fetchone()
         if not need_ballon and not need_puskas and not need_club_comp and not need_league:
             return
+        # [2026-09 계측] 이 함수가 시즌전환의 두 번째로 큰 덩어리이고
+        # (실측 5.7초) 한 실행 안에서 3.3→5.7초로 74% 증가한다. 다만
+        # 발롱도르/베스트11 선정은 후보 순서가 결과에 직결되는 구역이라
+        # (순서만 바뀌어도 수상자가 달라짐) 구조는 일절 손대지 않고
+        # 어느 하위 단계가 무거운지만 먼저 나눠 찍는다.
+        import time as _t_aw
+        _aw0 = _t_aw.perf_counter()
+        _aw_ballon = _aw_puskas = _aw_club = _aw_intl = _aw_league = 0.0
+        _n_ballon = 0
         if need_ballon:
             candidates = _get_ballon_candidates(c, year)
+            _n_ballon = len(candidates) if candidates else 0
+            _aw1 = _t_aw.perf_counter()
             _save_ballon_dor_top30(c, year, candidates)
+            _aw_ballon = _t_aw.perf_counter() - _aw0
+            _aw_cand = _aw1 - _aw0
+        else:
+            _aw_cand = 0.0
+        _awA = _t_aw.perf_counter()
         if need_puskas:
             winners = _get_puskas_candidates(c, year)
             _save_puskas_top10(c, year, winners)
+        _aw_puskas = _t_aw.perf_counter() - _awA
         conn.commit()
         if need_club_comp:
             # 독립 트랜잭션 — _compute_club_comp_individual_awards/
@@ -10725,13 +10742,24 @@ def _compute_season_individual_awards(year, my_ctx=None):
             # INSERT OR IGNORE라 중복 호출돼도 안전하고(멱등), 정상
             # 흐름에서는 이 함수 자체가 연도당 한 번만 불리므로 실제
             # 낭비도 없다(발롱도르/푸스카스와 동일한 트레이드오프).
+            _awB = _t_aw.perf_counter()
             _compute_club_comp_individual_awards(year)
+            _awC = _t_aw.perf_counter()
+            _aw_club = _awC - _awB
             _compute_intl_individual_awards(year)
+            _aw_intl = _t_aw.perf_counter() - _awC
         if need_league:
             # 마찬가지로 독립 트랜잭션(자체 커넥션/커밋) — my_ctx는 호출부
             # (_end_of_season)가 "내가 이번 시즌 뛴 리그" 컨텍스트를 미리
             # 구성해 넘겨준다(없으면 세계 계산만, 내 상 병합은 스킵).
+            _awD = _t_aw.perf_counter()
             _compute_league_individual_awards(year, my_ctx=my_ctx)
+            _aw_league = _t_aw.perf_counter() - _awD
+        _live_debug(
+            f"[AWARD-PERF] {year}년 개인수상산정 {_t_aw.perf_counter()-_aw0:.2f}s 세부: "
+            f"발롱도르 {_aw_ballon:.2f}s (└후보수집 {_aw_cand:.2f}s · 후보 {_n_ballon}명) | "
+            f"푸스카스 {_aw_puskas:.2f}s | 클럽대항전 {_aw_club:.2f}s | "
+            f"국제대회 {_aw_intl:.2f}s | 리그전 {_aw_league:.2f}s")
     except Exception:
         conn.rollback()
         raise
@@ -11948,11 +11976,17 @@ def _end_of_season(p, year, progress_cb=None):
     #     구해서 넘긴다. run_ai_offseason은 이 스냅샷을 다시 하지 않도록
     #     skip_season_snapshot=True로 부른다(아래 5.7단계) — 안 그러면
     #     같은 시즌을 또 다른 랜덤값으로 덮어써서 다시 어긋난다.
+    # [2026-09 계측] live_sim.log 실측상 _end_of_season 중 AI생애주기를 뺀
+    # 나머지가 매 시즌 9~12초인데 이 구간엔 계측이 전혀 없어 어디가 무거운지
+    # 알 수 없었다(시즌전환 전체의 약 22%). 순수 계측만 추가한다.
+    import time as _time_eos
+    _te0 = _time_eos.perf_counter()
     conn0 = get_conn()
     _early_team_goals_for = {
         r[0]: r[1] for r in conn0.execute("SELECT id, goals_for FROM teams").fetchall()}
     from ai_lifecycle import _snapshot_season_ratings, _snapshot_intl_season_ratings
     _snapshot_season_ratings(conn0.cursor(), year, team_goals_for=_early_team_goals_for)
+    _te1 = _time_eos.perf_counter()
     # [2026-09 신설, 신민용 지적: "국제대회 개인 활약도 발롱도르에 반영해야
     # 한다"] 국가대표(월드컵/대륙컵 등) 평점/골/어시 스냅샷도 위 클럽 스냅샷과
     # 완전히 같은 이유로 여기서 조기 호출해야 한다 — 안 그러면 아래
@@ -11961,6 +11995,7 @@ def _end_of_season(p, year, progress_cb=None):
     # 호출은 한참 뒤라 너무 늦음). run_ai_offseason은 skip_season_snapshot=
     # True로 불러서 중복 실행을 막는다(ai_lifecycle.py 참고).
     _snapshot_intl_season_ratings(conn0.cursor(), year)
+    _te2 = _time_eos.perf_counter()
     conn0.commit()
 
     # 1.42 [2026-09 신설, "리그전 개인상" 세계 계산용] 아래 1.45단계가 쓸
@@ -11997,6 +12032,7 @@ def _end_of_season(p, year, progress_cb=None):
     #      때문(design_ballon_dor.md 6번/9번 참고, 자체 커넥션/트랜잭션으로
     #      독립 실행).
     _compute_season_individual_awards(year, my_ctx=_my_ctx)
+    _te3 = _time_eos.perf_counter()
 
     # 1.5 개인 수상 산정 (통계 리셋 이전에 실행). 최소 출전 기준은 위
     #     finalize_season_for_retire와 동일 원칙(리그 실제 풀시즌의 35%).
@@ -12226,6 +12262,10 @@ def _end_of_season(p, year, progress_cb=None):
     #   ai_players.ovr·team_id가 바뀌므로 내부에서 OVR 캐시를 무효화한다.
     import time as _time_perf2
     _tp1 = _time_perf2.perf_counter()
+    _live_debug(
+        f"[PERF]   _end_of_season 전반부(AI생애주기 이전) 세부: "
+        f"평점스냅샷 {_te1-_te0:.2f}s | 국대평점스냅샷 {_te2-_te1:.2f}s | "
+        f"개인수상산정 {_te3-_te2:.2f}s | 그 외(수상처리·스탯정리 등) {_tp1-_te3:.2f}s")
     try:
         from ai_lifecycle import run_ai_offseason
         # [2026-09 신설] 위 1.4단계에서 이번 시즌 세계기록실 스냅샷을 이미
