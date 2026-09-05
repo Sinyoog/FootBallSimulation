@@ -1,0 +1,13 @@
+[33mcommit be4e43a91836a9c615c843f2be7c2d2efe8ae5eb[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m)[m
+Author: shin min yong <minyoog34@naver.com>
+Date:   Sat Sep 5 08:07:48 2026 +0900
+
+    feat: v0.19.7 성능 최적화 및 밸런스 반영
+
+ .gitignore                 |   9 [32m+[m[31m-[m
+ ai_lifecycle.py            | 221 [32m++++++++++++++++++++[m[31m-----[m
+ database.py                |  83 [32m+++++++++[m[31m-[m
+ game_engine.py             |  40 [32m+++++[m
+ perf_regression.py         | 390 [32m+++++++++++++++++++++++++++++++++++++++++++++[m
+ ui/world_browser_window.py | 199 [32m+++++++[m[31m----------------[m
+ 6 files changed, 758 insertions(+), 184 deletions(-)

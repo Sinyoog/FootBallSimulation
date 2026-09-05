@@ -1426,10 +1426,21 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
             final_out.append(e)
             from_tid, half_pos, half_role = mid_by_year.get(e["year"], (None, None, None))
             if from_tid:
+                # [2026-09 버그수정, 신민용 리포트: "2005년 중간에 이적한
+                # AI 선수 — 상반기 팀(알 힐랄 와우) 줄을 클릭해도 아무것도
+                # 안 뜨고 하반기 팀(영 스타즈)만 클릭된다"] GK 선방/실점/
+                # 클린시트는 top-level _stat_*엔 없고 _comp_stats["league"]
+                # 에만 있다 — 아래 _half_season_league_entry가 이 값들까지
+                # 비례 배분해 상반기 줄의 _comp_stats를 채우려면 여기서
+                # 같이 넘겨줘야 한다(안 그러면 GK 선수만 여전히 빈 칸).
+                _lg_comp = (e.get("_comp_stats") or {}).get("league") or {}
                 final_out.append(_half_season_league_entry(
                     conn, from_tid, e["year"], half_position=half_pos, half_role=half_role,
                     full_stat={"matches": e.get("_stat_matches"), "goals": e.get("_stat_goals"),
-                               "assists": e.get("_stat_assists"), "rating": e.get("_stat_rating")},
+                               "assists": e.get("_stat_assists"), "rating": e.get("_stat_rating"),
+                               "clean_sheets": _lg_comp.get("clean_sheets"),
+                               "saves": _lg_comp.get("saves"),
+                               "goals_conceded": _lg_comp.get("goals_conceded")},
                     main_entry=e))
         out = final_out
     conn.close()
@@ -1504,15 +1515,53 @@ def _half_season_league_entry(conn, team_id, year, half_position=None, half_role
             ratio = min(1.0, half_matches / full_matches)
             half_goals = round((full_stat.get("goals") or 0) * ratio)
             half_assists = round((full_stat.get("assists") or 0) * ratio)
+            half_saves = round((full_stat.get("saves") or 0) * ratio)
+            half_conceded = round((full_stat.get("goals_conceded") or 0) * ratio)
+            half_clean_sheets = round((full_stat.get("clean_sheets") or 0) * ratio)
             entry["_stat_matches"] = half_matches
             entry["_stat_goals"] = half_goals
             entry["_stat_assists"] = half_assists
             entry["_stat_rating"] = full_stat.get("rating")
+            # [2026-09 버그수정, 신민용 리포트: "세계 축구 기록실에서 2005년
+            # 중간 이적한 AI 선수 — 상반기 팀(예: 알 힐랄 와우) 줄을 클릭
+            # 해도 아무것도 안 뜨고 하반기 팀(예: 영 스타즈) 줄만 클릭된다"]
+            # ui/world_browser_window.py._populate_player_team_box는 그 해가
+            # 펼쳐졌을 때 평점/골/도움 요약 박스를 entry["_comp_stats"]가
+            # 있어야만 그린다(행 수 사전계산도 실제 렌더링도 이 키 하나로
+            # 판정) — 바로 위 _stat_matches 등 top-level 필드는 복사(_player_
+            # copy_rows)용으로만 읽히고 화면 렌더링 쪽은 보지 않는다. 그래서
+            # 상반기 줄은 펼쳐도 화면엔 빈 칸이고, _comp_stats가 이미 채워져
+            # 있던 하반기(메인) 줄만 정상적으로 보였다 — "위(하반기) 팀만
+            # 클릭이 된다"로 보인 이유. 여기서도 채워야 실제로 그려진다.
+            entry["_comp_stats"] = {"league": {
+                "matches": half_matches, "goals": half_goals, "assists": half_assists,
+                "rating": full_stat.get("rating"), "clean_sheets": half_clean_sheets,
+                "saves": half_saves, "goals_conceded": half_conceded}}
             if main_entry is not None:
                 main_entry["_stat_matches"] = max(0, full_matches - half_matches)
                 main_entry["_stat_goals"] = max(0, (full_stat.get("goals") or 0) - half_goals)
                 main_entry["_stat_assists"] = max(0, (full_stat.get("assists") or 0) - half_assists)
                 # 평점(rating)은 총합이 아니라 평균이므로 나누지 않고 그대로 둔다.
+                # [2026-09 버그수정] main_entry["_comp_stats"]["league"]는 이
+                # 함수 호출 전에 이미 "그 해 전체(하반기 팀 기준) 풀시즌" 값
+                # (get_ai_player_career_history 위쪽 stat_by_year 루프)으로
+                # 채워져 있다 — 위에서 상반기 몫을 방금 만든 entry로 옮겼으니
+                # 그만큼 여기서도 빼야, 두 줄(상반기+하반기) 합계가 원래
+                # 풀시즌 값과 맞고 경기/골/도움이 두 줄에 중복 표시되지
+                # 않는다(44경기 시즌이면 상반기 22 + 하반기 22로 정확히
+                # 나뉘어야 한다는 신민용 요청과 동일한 원칙).
+                _m_comp = main_entry.get("_comp_stats")
+                if _m_comp and _m_comp.get("league"):
+                    _ml = _m_comp["league"]
+                    _ml["matches"] = main_entry["_stat_matches"]
+                    _ml["goals"] = main_entry["_stat_goals"]
+                    _ml["assists"] = main_entry["_stat_assists"]
+                    if _ml.get("saves") is not None:
+                        _ml["saves"] = max(0, (_ml.get("saves") or 0) - half_saves)
+                    if _ml.get("goals_conceded") is not None:
+                        _ml["goals_conceded"] = max(0, (_ml.get("goals_conceded") or 0) - half_conceded)
+                    if _ml.get("clean_sheets") is not None:
+                        _ml["clean_sheets"] = max(0, (_ml.get("clean_sheets") or 0) - half_clean_sheets)
     return entry
 
 

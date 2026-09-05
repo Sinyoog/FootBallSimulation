@@ -6042,6 +6042,31 @@ GLOBAL_PRESTIGE_STAR_CFG = {
     # 포지 FC(레벨3)만 명문 등록돼 있어 min_level=2로 둬도 사실상 레벨3만
     # 해당 — 목표가 이집트/모로코/튀니지보다 낮아(82) 슬롯을 더 보수적으로.
     "캐나다":       {"wc_base": 0, "wc_bonus": 1, "el_base": 4, "el_bonus": 2, "min_level": 2, "el_offset": (5, 10)},
+    # [2026-09 신설, 신민용 확정: "사우디는 prestige_clubs.py 소속 팀(알
+    # 힐랄/알나스르/알이티하드/알아흘리)만 84~88로 하고 나머지 1부는 J리그
+    # 상/중/하위권보다 낮게" — J리그 대비 목표: 빅4(레벨2 이상 전부 포함,
+    # min_level=2)는 J리그 최상위(약 80~81)보다도 높은 84~88, 빅4를
+    # 제외한 나머지 1부는 J리그 상/중/하위권 전부보다 낮게(위
+    # COUNTRY_LEAGUE_OVR_OVERRIDE 사우디 항목을 68~79로 낮춰서 처리).
+    # extra_bonus는 이 나라만의 추가 필드(_generate_team_players의
+    # _star_prestige_bonus 계산부 참고) — 국가 상한(tier_top)을 낮추면서도
+    # 빅4만 그 위로 다시 밀어올리기 위한 값이라, 다른 GLOBAL_PRESTIGE_
+    # STAR_CFG 등록국(이집트 등, extra_bonus 키 자체가 없음)에는 전혀
+    # 영향이 없다. el_base=10/wc_base=1로 11자리 대부분을 스타 슬롯으로
+    # 채우고(이집트처럼 "거의 전원 스타"), 어린 스타 슬롯 선수가 country
+    # 하한(68)까지 추락하지 않도록 하는 별도 하한도 같이 넣었다(아래
+    # _generate_team_players의 "_is_gp_star_here" 분기 참고). 헤드리스
+    # 재현(각 250회 평균): 알 힐랄(레벨3) 84.0~85.9, 알 나스르/알아흘리/
+    # 알 이티하드(레벨2) 82.7~84.8 — 전 구간 84~88 목표 안에 들어옴.
+    "사우디아라비아": {"wc_base": 1, "wc_bonus": 1, "el_base": 10, "el_bonus": 3,
+                    "min_level": 2, "el_offset": (1, 4), "extra_bonus": 18,
+                    # decoupled_young_floor: 아래 _generate_team_players의
+                    # 어린 스타 슬롯 하한 계산에서, country override의 lo
+                    # 대신 이 팀 자체 상한(tier_top+prestige_bonus) 기반
+                    # 하한을 쓰게 하는 옵트인 플래그 — 명시적으로 True를
+                    # 준 나라만 적용되고, 이 키가 없는 이집트/모로코/남아공/
+                    # 튀니지/캐나다는 기존 동작 그대로다.
+                    "decoupled_young_floor": True},
 }
 
 _MAX_WORLDCLASS_PER_TEAM = 4
@@ -6079,15 +6104,45 @@ def _star_counts(grade, team_strength, continent_bonus=0, n_slots=11, tier=1,
     2100위권). GLOBAL_PRESTIGE_STAR_CFG에 등록된 나라는, 그 나라의
     prestige_level이 등록된 min_level 이상인 팀에 한해서만(일반 팀은 전혀
     영향 없음) B/C 등급이어도 소규모 스타 슬롯을 받는다."""
-    cfg = STAR_COUNT_BY_GRADE.get(grade)
-    if not cfg:
-        gp = GLOBAL_PRESTIGE_STAR_CFG.get(country) if country else None
-        if gp and tier == 1 and prestige_level >= gp.get("min_level", 2):
+    # [2026-09 신설, 신민용 확정: "사우디는 프레스티지 4팀(알힐랄/알나스르/
+    # 알이티하드/알아흘리)만 J리그 최상위급(84~88)으로 튀고, 나머지 1부는
+    # J리그보다 낮아야 한다"] GLOBAL_PRESTIGE_STAR_CFG는 원래 STAR_COUNT_
+    # BY_GRADE에 등급 자체가 없는 B/C 등급 나라(이집트·모로코 등) 전용
+    # 이었다 — A/S/SS처럼 등급 자체 커브(cfg)가 있으면 이 분기를 아예
+    # 검사하지도 않았다. 그런데 사우디처럼 "등급은 A인데 그 안에서도 딱
+    # 4팀만 극단적으로 강해야 한다"는 요구는 A등급 공용 커브(el_base=1)
+    # 로는 표현이 안 된다(실측: 국가 상한을 크게 낮추면 4팀도 같이
+    # 낮아지고, 안 낮추면 나머지 14팀까지 다 같이 높아짐 — 어느 쪽으로도
+    # "4팀만 튀는" 분포가 안 나왔다). 그래서 등급 커브 유무와 무관하게,
+    # GLOBAL_PRESTIGE_STAR_CFG에 등록된 나라는 항상 이 분기를 먼저
+    # 검사한다 — 등록 안 된 나라(전 세계 대다수, SS/S/A 등급 전부 포함)는
+    # gp가 None이라 그대로 아래 등급 커브로 내려가므로 기존 동작과
+    # 100% 동일하다.
+    gp = GLOBAL_PRESTIGE_STAR_CFG.get(country) if country else None
+    if gp is not None:
+        # [2026-09 신설] 이 나라가 GLOBAL_PRESTIGE_STAR_CFG에 등록돼 있으면
+        # "그 나라의 스타 슬롯은 전적으로 이 표가 결정한다"로 의미를
+        # 넓힌다 — 이집트/모로코(등급 자체가 B/C라 애초에 그랬음)와 똑같이,
+        # 등록된 간판팀(prestige_level>=min_level)만 스타 슬롯을 받고
+        # 나머지는 등급 커브(STAR_COUNT_BY_GRADE)로 안 내려가고 그냥 스타
+        # 없음(0,0)으로 끝낸다. 사우디처럼 등급 자체는 A라 원래 cfg가
+        # 있는 나라도 이 표에 등록하면 "그 등급 공용 커브 대신 이 나라만의
+        # 소수 간판팀 커브"로 완전히 대체된다 — 안 그러면(이전 버전처럼
+        # min_level 미달 팀을 그냥 아래 등급 커브로 흘려보내면) 비간판팀도
+        # A등급 공용 커브(el_base=1)로 스타 슬롯을 받아버려서, "간판 4팀만
+        # 튀고 나머지는 확실히 낮다"는 분리가 실측상 전혀 안 됐다(빅4
+        # 84~86 vs 비간판 83~85로 사실상 차이가 없었음 — 리그 상한
+        # (tier_top)을 공유하는 한 등급 커브 자체가 비간판팀도 거의 같은
+        # 수준으로 밀어올렸기 때문).
+        if tier == 1 and prestige_level >= gp.get("min_level", 2):
             n_world = min(gp.get("wc_base", 0) + round(gp.get("wc_bonus", 0) * team_strength),
                           _MAX_WORLDCLASS_PER_TEAM)
             n_elite = min(gp.get("el_base", 0) + round(gp.get("el_bonus", 0) * team_strength),
                           _MAX_ELITE_PER_TEAM, max(0, n_slots - n_world))
             return n_world, n_elite
+        return 0, 0
+    cfg = STAR_COUNT_BY_GRADE.get(grade)
+    if not cfg:
         return 0, 0
     if tier >= 3:
         return 0, 0   # 3부 이상은 스타 취급 없음 — 전원 일반 곡선(_target_ovr)
@@ -6461,6 +6516,22 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
     # tier_top(98) + 동일한 레벨3 기본 보너스(3.0)로 사실상 동급이 되고,
     # 독일/이탈리아(tier_top 97)는 자연스럽게 한 단계 아래로 남는다.
 
+    # [2026-09 신설, 신민용 확정: "사우디는 빅4만 84~88, 나머지 1부는
+    # J리그보다 낮게"] 위 레벨별 기본 보너스(3.0/2.0/1.5)는 전 국가 공용
+    # 이라 여기서 못 건드린다 — 그런데 tier_top(국가 공통 상한) 하나를
+    # 낮추면 일반 커브(비간판팀)와 스타 커브(간판팀)가 같이 낮아져서
+    # "간판 4팀만 J리그보다 높고 나머지는 J리그보다 낮다"는 분리 자체가
+    # 안 나온다(실측 확인: 상한을 낮추면 비간판팀은 내려가지만 빅4도
+    # 거의 같은 폭으로 같이 내려감). GLOBAL_PRESTIGE_STAR_CFG에 country별
+    # extra_bonus를 추가로 두면, 그 나라만 "상한은 낮게(비간판팀 억제) +
+    # 등록된 간판팀만 이 추가 보너스로 상한 위까지 다시 밀어올리기"가
+    # 가능해진다 — Egypt/Morocco 등 기존 등록국은 extra_bonus 키 자체가
+    # 없어 0으로 폴백, 기존 값에 전혀 영향 없다.
+    if _plevel >= (GLOBAL_PRESTIGE_STAR_CFG.get(team.get("cname", ""), {})
+                   .get("min_level", 2)):
+        _star_prestige_bonus += GLOBAL_PRESTIGE_STAR_CFG.get(
+            team.get("cname", ""), {}).get("extra_bonus", 0.0)
+
     # 해당 국가 이름풀 전체를 가져온다 (리그 8팀 × 11명 = 최대 88개 필요)
     # [2026-08 최적화] 국가당 한 번만 SELECT, 이후 팀들은 캐시 재사용.
     _cid = team["cid"]
@@ -6634,6 +6705,45 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
         # 이라, 우선 "이 팀에 있는 한 이 정도는 돼야 한다"는 하한으로
         # 막는다).
         if age < AGE_OVR_FRACTION_MATURE_AGE:
+            # [2026-09 신설, 신민용 확정 — 사우디 빅4 재조정] 아래 일반
+            # 하한(country override의 lo 기반)은 "비간판팀도 어느 정도는
+            # 보장"하는 용도라, 사우디처럼 lo를 크게 낮춰 비간판팀을
+            # 억제하면 같은 나라 간판팀(빅4)의 어린 스타 슬롯 선수까지
+            # 덩달아 lo 근처까지 추락한다(실측 확인: 알 힐랄 18세 스타
+            # 슬롯이 69까지 떨어져 팀 평균을 8점 가까이 깎았다) — country
+            # 하한 하나로 "비간판 억제"와 "간판 보호"를 동시에 만족시킬
+            # 수 없는 구조적 충돌이다. GLOBAL_PRESTIGE_STAR_CFG에 등록된
+            # 나라의 '이번 슬롯이 실제로 그 표 기준을 만족한 스타 슬롯'
+            # 이라면, country lo 대신 이 팀의 실제 목표 상한(tier_top +
+            # 이번에 적용된 prestige_bonus)에서 소폭만 뺀 값을 하한으로
+            # 쓴다 — 등록 안 된 나라·비스타 슬롯·min_level 미달 팀은 이
+            # 분기 자체를 안 타 기존 동작과 100% 동일하다(이집트/모로코
+            # 등 이미 확정된 나라의 실측치에 영향 없음).
+            _gp_here = GLOBAL_PRESTIGE_STAR_CFG.get(team.get("cname", ""))
+            # [주의] decoupled_young_floor 키가 명시된 나라만 이 분기를
+            # 탄다 — 이집트/모로코/남아공/튀니지/캐나다는 이 키가 없어
+            # (gp.get(...)이 False로 폴백) 아래 else의 기존 country-lo
+            # 기반 로직을 100% 그대로 타므로, 그 나라들의 이미 확정된
+            # 실측치는 전혀 안 바뀐다 — 사우디만 새로 이 키를 True로 켰다.
+            _is_gp_star_here = (idx in star_kind_by_slot and _gp_here
+                                 and _gp_here.get("decoupled_young_floor")
+                                 and _plevel >= _gp_here.get("min_level", 2))
+            if _is_gp_star_here:
+                _yg = {3: 6, 2: 8, 1: 10}.get(_plevel, 12)
+                target = max(target, tier_top + _star_prestige_bonus - _yg)
+                stats = _gen_ai_stats(pos, target)
+                ovr = calc_ovr(pos, stats)
+                sub_role = random.choice(SUB_ROLES.get(pos, ["기본"]))
+                nationality, _foreign_count = _pick_nationality(
+                    team.get("cname", ""), continent, grade, pos,
+                    idx in star_kind_by_slot, _foreign_count, _quota)
+                _rows.append((team["tid"],name,pos,
+                     stats["stamina"],stats["speed"],stats["jump"],stats["strength"],
+                     stats["shooting"],stats["passing"],stats["dribbling"],
+                     stats["tackling"],stats["heading"],stats["positioning"],
+                     stats["setpiece"],stats["mental"],stats["confidence"],
+                     stats["leadership"],stats["concentration"],ovr,age,sub_role,nationality))
+                continue
             _young_rng = get_ovr_range(grade, tier, team.get("cname", ""))
             if _young_rng:
                 # [2026-08 재설계, 신민용 확정(GPT 협업) — "능력이 안 맞는

@@ -1608,7 +1608,7 @@ def _build_team_pos_group_count(rows):
 
 def _find_buy_replacement(position, target_ovr, dst_team_id, dst_cname,
                            pools, team_info, team_pos_group_count, used_ids,
-                           global_scouting=False):
+                           global_scouting=False, stats=None):
     """[2026-09 신설, 신민용+GPT 협업: "명문팀은 은퇴자를 유망주 즉시
     생성으로 채우지 않고, 먼저 시장에서 검증된 선수를 영입 시도한다"]
     target_ovr(은퇴자 자리의 "성인 잠재치") 기준 BUY_REPLACEMENT_OVR_BAND
@@ -1636,8 +1636,23 @@ def _find_buy_replacement(position, target_ovr, dst_team_id, dst_cname,
     적용한다 — 그래야 전세계 검색으로 바뀐 게 "명문팀이 항상 세계 최고
     OVR만 쓸어간다"는 반대 방향 쏠림으로 이어지지 않는다(일반 팀의 기존
     국내/해외 2단계 동작은 이 가드 없이 그대로 유지).
+
+    [2026-09 계측, 신민용 지적: "은퇴자는 조금 늘었는데 대체자탐색 시간은
+    훨씬 더 늘었다 — 단순 후보 수 증가로 설명이 안 된다"] stats(호출부가
+    공유하는 dict, None이면 그냥 아무것도 안 함 — 기존 호출부 동작·성능
+    100% 그대로)를 넘기면 이 함수가 자기 호출 통계를 카운터 증가만으로
+    남긴다: calls(총 호출), global_calls(global_scouting=True로 불린
+    횟수), global_scan_calls/global_scanned(실제로 전세계 슬라이스
+    _global_cands()를 만든 횟수와 그 합계 크기 — 여기서 나누면 평균
+    슬라이스 크기). "SS/S·프레스티지팀 비율이 늘어서 전세계 탐색 비중이
+    늘고, 그 슬라이스 자체도 커지고 있다"는 가설을 새 쿼리·새 반복문
+    없이(정수 증가뿐) 실측 확인하기 위함.
     반환: 뽑힌 선수 행(sqlite3.Row) 또는 후보가 없으면 None."""
     from constants import BUY_REPLACEMENT_OVR_BAND, BUY_REPLACEMENT_YOUNG_AGE, BUY_REPLACEMENT_YOUNG_WEIGHT
+    if stats is not None:
+        stats["calls"] = stats.get("calls", 0) + 1
+        if global_scouting:
+            stats["global_calls"] = stats.get("global_calls", 0) + 1
     pool = pools.get(position)
     if not pool:
         return None
@@ -1714,6 +1729,15 @@ def _find_buy_replacement(position, target_ovr, dst_team_id, dst_cname,
         chosen = _filter(True)    # 기존 동작: 자국 우선
         if not chosen:
             chosen = _filter(False)   # 없으면 해외로 폴백
+    # [2026-09 계측] _cands_cell은 _global_cands()가 최소 한 번이라도
+    # 호출됐을 때만(같은 함수 안에서 메모이즈) 채워진다 — 즉 이 호출이
+    # global_scouting=True로 시작했든, 자국 우선이 실패해 해외로 폴백
+    # 했든, "실제로 전세계 슬라이스를 훑었는지"를 이걸로 정확히 판별할
+    # 수 있다(추가 조건 판정 없이 이미 있는 메모이즈 캐시를 그대로 읽음).
+    if stats is not None and _cands_cell:
+        _n = len(_cands_cell[0])
+        stats["global_scan_calls"] = stats.get("global_scan_calls", 0) + 1
+        stats["global_scanned"] = stats.get("global_scanned", 0) + _n
     if not chosen:
         return None
     weights = [BUY_REPLACEMENT_YOUNG_WEIGHT if (e[5] or 25) <= BUY_REPLACEMENT_YOUNG_AGE else 1.0
@@ -2085,6 +2109,18 @@ def _retire_and_replace(c, year, ai_rows=None):
     _buy_pools = _build_buy_pools(rows, team_info)
     _buy_pos_group_count = _build_team_pos_group_count(rows)
     _buy_used_ids: set = set()
+    # [2026-09 계측, 신민용 지적: "은퇴자 +16%인데 대체자탐색 시간 +92% —
+    # 후보 풀은 오히려 줄었으니 단순 O(N) 증가가 아니다"] global_scouting
+    # (목적지가 SS/S급·프레스티지2+일 때 국내 우선 대신 전세계 우선으로
+    # 찾는 경로 — 위 _find_buy_replacement 주석 참고)이 해가 갈수록 더
+    # 자주 발동돼서(부익부로 SS/S·명문팀 비율 자체가 늘어남) 그 안에서
+    # 매번 훑는 전세계 슬라이스(_global_cands, 국가 서브풀보다 훨씬 큼)
+    # 비중이 늘어난 게 원인이라는 가설을 세웠다 — 이 dict 하나로 그
+    # 가설을 실측 확인한다(호출 횟수 자체는 어차피 세는 거라 오버헤드는
+    # 카운터 몇 개 증가뿐, 새 쿼리·새 루프 없음). 아래 _find_buy_
+    # replacement 호출마다 채워지고, 함수 끝 RETIRE-PERF 로그 한 줄에
+    # 그대로 붙인다.
+    _buy_stats: dict = {}
     transfer_updates = []    # (new_team_id, contract_end_year, last_transfer_year, player_id)
     transfer_log_rows = []   # ai_transfer_log INSERT용
     _season_row = c.execute("SELECT current_season FROM season_state WHERE id=1").fetchone()
@@ -2261,11 +2297,21 @@ def _retire_and_replace(c, year, ai_rows=None):
             # 판정 기준을 새로 만들지 않고 이 시점에 이미 있는 계산을
             # 재사용(brazil 등 선수 풀이 큰 나라의 폐쇄 루프 완화용).
             _global_scouting = grade in ("SS", "S") or _plvl >= BIG_CLUB_PRESTIGE_THRESHOLD
+            # [2026-09 계측] "SS/S·프레스티지2+ 목적지 비율이 해마다
+            # 늘어나는가"를 바로 검증할 수 있게, 실제 목적지 등급(_buy_grade
+            # — grade에 프레스티지 오버라이드까지 반영된 값) 분포를 호출
+            # 시점에 그대로 센다. _find_buy_replacement 내부가 아니라
+            # 여기서 세는 이유: 이 함수는 grade/등급 개념을 아예 모르고
+            # (position/OVR/팀ID만 받음) 그걸 위해 파라미터를 새로 늘리는
+            # 것보다, 이미 계산해둔 값을 호출부에서 바로 집계하는 쪽이
+            # 더 가볍고 함수 책임도 안 섞인다.
+            _buy_stats.setdefault("by_grade", {})
+            _buy_stats["by_grade"][_buy_grade] = _buy_stats["by_grade"].get(_buy_grade, 0) + 1
             _tb0 = _time_rt.perf_counter()
             _bought = _find_buy_replacement(
                 r["position"], round(target), r["team_id"], cname,
                 _buy_pools, team_info, _buy_pos_group_count, _buy_used_ids,
-                global_scouting=_global_scouting)
+                global_scouting=_global_scouting, stats=_buy_stats)
             _acc_buy += _time_rt.perf_counter() - _tb0
             if _bought is not None:
                 _buy_used_ids.add(_bought["id"])
@@ -2437,6 +2483,20 @@ def _retire_and_replace(c, year, ai_rows=None):
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             transfer_log_rows)
     _rt8 = _time_rt.perf_counter()   # 이적(명문팀 영입) 반영+로그
+    # [2026-09 계측, 신민용 지적: "global_scouting 비율/스캔량을 연도별로
+    # 남겨서 은퇴자+16%/시간+92% 불일치의 원인을 확정하자"] _buy_stats는
+    # 위 _find_buy_replacement 호출부/함수 내부에서 카운터 증가만으로
+    # 채워진 값이라 여기선 나눗셈 몇 번뿐 — 매 시즌 항상 켜둬도 비용이
+    # 없다(다른 PERF-* 로그들과 동일한 원칙).
+    _buy_calls = _buy_stats.get("calls", 0)
+    _buy_global_calls = _buy_stats.get("global_calls", 0)
+    _buy_global_pct = (_buy_global_calls / _buy_calls * 100) if _buy_calls else 0.0
+    _buy_scan_calls = _buy_stats.get("global_scan_calls", 0)
+    _buy_scanned = _buy_stats.get("global_scanned", 0)
+    _buy_avg_slice = (_buy_scanned / _buy_scan_calls) if _buy_scan_calls else 0.0
+    _buy_grade_txt = " ".join(
+        f"{g}:{n}" for g, n in sorted(_buy_stats.get("by_grade", {}).items(),
+                                        key=lambda kv: -kv[1])) or "-"
     _perf_log(
         f"[RETIRE-PERF] {year}년 은퇴·세대교체 {_rt8-_rt0:.2f}s "
         f"(은퇴 {retired}명 / 후보 {len(rows)}명) 세부: "
@@ -2447,6 +2507,11 @@ def _retire_and_replace(c, year, ai_rows=None):
         f"그 외 {(_rt4-_rt3)-_acc_buy-_acc_stats-_acc_name:.2f}s) | "
         f"retired적재 {_rt5-_rt4:.2f}s | 은퇴자DELETE {_rt6-_rt5:.2f}s | "
         f"신인INSERT {_rt7-_rt6:.2f}s | 이적반영+로그 {_rt8-_rt7:.2f}s")
+    _perf_log(
+        f"[BUY-SCOUT-PERF] {year}년 대체자탐색 계측: "
+        f"calls={_buy_calls} | global={_buy_global_calls}({_buy_global_pct:.1f}%) | "
+        f"global스캔={_buy_scan_calls}회 총{_buy_scanned}건 평균슬라이스={_buy_avg_slice:.0f} | "
+        f"목적지등급분포=[{_buy_grade_txt}]")
 
     # [2026-08 신설, 진단용] 추적 대상 팀들의 이번 시즌 은퇴/신인 교체 요약을
     # 한 줄씩 찍는다 — "강등 → 낮은 OVR 신인 → 추가 강등" 루프가 실제로

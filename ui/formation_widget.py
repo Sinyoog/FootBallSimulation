@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QFrame, QScrollArea, QGridLayout, QLineEdit,
     QPlainTextEdit, QSpinBox, QCompleter
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QObject, QEvent
 from PyQt6.QtGui import (QColor, QPainter, QBrush, QPen, QFont, QFontMetrics,
                           QShortcut, QKeySequence, QGuiApplication)
 
@@ -1877,6 +1877,30 @@ def open_bulk_rename_dialog(parent, starters: list, bench: list) -> list:
 
     save_btn.clicked.connect(dlg.accept)
     cancel_btn.clicked.connect(dlg.reject)
+
+    # [2026-09 신설, 신민용 리포트: "이름 짓고 엔터 누르면 지금은 한 칸
+    # 아래로 가는데, 엔터 누르면 저장하기가 눌린 것처럼 만들어줘"]
+    # QPlainTextEdit는 Enter를 기본적으로 줄바꿈으로 먹어버려서(위
+    # 개별 이름변경 QLineEdit 다이얼로그들과 달리) 다이얼로그 기본
+    # accept 단축키가 안 먹는다 — installEventFilter로 Enter/Return을
+    # 가로채 save_btn을 직접 누른 것처럼 만든다(Shift+Enter는 예외로
+    # 남겨둬, 혹시 여러 줄로 나눠 적고 싶을 때는 그대로 줄바꿈되게).
+    class _EnterClicksSave(QObject):
+        def __init__(self, btn, parent=None):
+            super().__init__(parent)
+            self._btn = btn
+
+        def eventFilter(self, obj, ev):
+            if ev.type() == QEvent.Type.KeyPress:
+                if ev.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not (
+                        ev.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+                    if self._btn.isEnabled():
+                        self._btn.click()
+                    return True
+            return False
+
+    _enter_to_save_filter = _EnterClicksSave(save_btn, dlg)
+    edit.installEventFilter(_enter_to_save_filter)
 
     _accepted = dlg.exec() == QDialog.DialogCode.Accepted
     _text = edit.toPlainText()

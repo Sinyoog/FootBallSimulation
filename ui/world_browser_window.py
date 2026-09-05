@@ -2980,11 +2980,23 @@ class WorldBrowserWindow(QDialog):
         title = QLabel(f"🧩 {header_title}")
         title.setStyleSheet("color:#4da6ff;font-size:13px;font-weight:bold;")
         header_row.addWidget(title)
-        header_row.addStretch(1)
         _btn_qss = (
             "QPushButton{background:#333;color:#ddd;border:1px solid #4a4a4a;"
             "border-radius:4px;padding:3px 10px;font-size:11px;}"
             "QPushButton:hover{background:#3d3d3d;}")
+        # [2026-09 신설, 신민용 요청: "국가 검색 대회 스쿼드에 있는 이름
+        # 일괄변경을 팀 검색에도 넣어달라"] 국가 검색 스쿼드 카드
+        # (_build_country_squad_detail_widget)의 rename_btn과 완전히 같은
+        # 위치·스타일·공용 함수(open_bulk_rename_dialog)를 그대로 쓴다 —
+        # 다른 점은 새로고침 대상이 country_detail_tbl이 아니라
+        # team_detail_tbl이라는 것뿐.
+        if starters or bench:
+            rename_btn = QPushButton("✏ 이름 일괄변경")
+            rename_btn.setStyleSheet(_btn_qss)
+            rename_btn.clicked.connect(
+                lambda: self._on_bulk_rename_team_squad(tid, year, header_title))
+            header_row.addWidget(rename_btn)
+        header_row.addStretch(1)
         if starters:
             # [2026-08 신설, 신민용 요청: "복사하기 버튼을 2개 만들건데
             # 1번째는 주전만, 2번째는 지금처럼 스쿼드 전체 — 주전 복사는
@@ -3049,6 +3061,33 @@ class WorldBrowserWindow(QDialog):
         content_row.addWidget(roster, 1)
         lay.addLayout(content_row)
         return box
+
+    def _on_bulk_rename_team_squad(self, tid, year, header_title):
+        """[2026-09 신설, 신민용 요청: "국가 검색 대회 스쿼드의 이름
+        일괄변경을 팀 검색에도 넣어달라"] 국가 검색의
+        _on_bulk_rename_country_squad와 완전히 같은 패턴 — 다만
+        새로고침 대상이 country_detail_tbl의 _country_expanded가 아니라
+        team_detail_tbl의 _team_expanded다(팀 검색은 한 번에 한 팀만
+        보고 있어서 tid를 따로 저장해두지 않았으므로, 여기선 이 위젯을
+        만들 때 이미 받아둔 tid 인자를 그대로 재사용해 다시 그린다)."""
+        data = wb.get_team_season_lineup(tid, year)
+        starters, bench = data.get("starters") or [], data.get("bench") or []
+        changed = open_bulk_rename_dialog(self, starters, bench)
+        if not changed:
+            return
+        exp = getattr(self, "_team_expanded", None)
+        if not exp or exp.get("year") != year:
+            return
+        tbl = self.team_detail_tbl
+        detail_row = exp.get("detail_row")
+        if detail_row is None or not (0 <= detail_row < tbl.rowCount()):
+            return
+        new_widget = self._build_team_year_lineup_widget(tid, year, header_title)
+        tbl.setCellWidget(detail_row, 0, new_widget)
+        tbl.resizeRowToContents(detail_row)
+        h = new_widget.sizeHint().height()
+        if h > tbl.rowHeight(detail_row):
+            tbl.setRowHeight(detail_row, h + 8)
 
     def _open_world_browser_from_team_lineup(self, starters, row):
         """[2026-08 신설] 팀 검색의 그 해 포메이션 표에서 이름을 클릭하면
@@ -6158,52 +6197,113 @@ class WorldBrowserWindow(QDialog):
             # 무조건 조회해서, 복사 텍스트에는 펼침 여부와 무관하게 항상
             # 전부 들어가게 한다.
             for t in results:
-                try:
-                    tname_ = t.get("name") or "-"
-                    kind_label = INTL_TOURNAMENT_KIND_LABELS.get(
-                        t.get("effective_kind", t.get("kind")), t.get("kind") or "-")
-                    result = t.get("result") or "-"
-                    rec = t.get("record")
-                    rec_txt = f" ({rec})" if rec else ""
-                    rank = year_rank.get(t.get("year"))
-                    rank_txt = f" | 순위: {rank}위" if rank else ""
-                    lines.append(f"{t.get('year')}년{rank_txt} | {tname_} [{kind_label}] : {result}{rec_txt}")
+                self._append_country_tournament_lines(lines, t, name, year_rank)
 
-                    tid = t.get("id")
-                    if tid is None:
-                        continue
-                    log = wb.get_country_intl_match_log(tid, name)
-                    # [2026-09 버그수정] group_standings가 1차/2차 두 조를
-                    # 담은 리스트로 바뀌었다 — 예전엔 dict 하나였어서 조가
-                    # 두 개일 때 하나가 그냥 누락됐다. 둘 다(1차/2차) 조가
-                    # 있는 대회는 "조별리그1"/"조별리그2"를 붙여 구분한다.
-                    gs_list = log.get("group_standings") or []
-                    _multi_stage = len(gs_list) > 1
-                    for gs in gs_list:
-                        if not gs.get("rows"):
-                            continue
-                        stage_prefix = ""
-                        if _multi_stage:
-                            stage_prefix = "조별리그1 " if gs.get("stage") == "qual_group" else "조별리그2 "
-                        lines.append(f"  ㄴ {stage_prefix}{gs['group']}조 순위표:")
-                        for rank_i, gr in enumerate(gs["rows"]):
-                            mark = " ★" if gr["country"] == name else ""
-                            lines.append(
-                                f"     {rank_i+1}. {gr['country']} "
-                                f"{gr['wins']}승{gr['draws']}무{gr['losses']}패 "
-                                f"(득실 {gr['gd']:+d}, 승점 {gr['pts']}){mark}")
-                    for stage in (log.get("stages") or []):
-                        for m in stage["matches"]:
-                            score_txt = f"{m['my_score']}:{m['opp_score']}"
-                            if m.get("pso"):
-                                pso_score = m.get("pso_score") or ""
-                                score_txt += f"(승부차기 {pso_score})" if pso_score else "(승부차기)"
-                            lines.append(
-                                f"  ㄴ {stage['stage_ko']} vs {m['opponent']} "
-                                f"{m['result']} {score_txt}")
-                except Exception:
+        return "\n".join(lines)
+
+    def _append_country_tournament_lines(self, lines, t, name, year_rank):
+        """[2026-09 신설, 신민용 요청: "국가 검색 요약 복사에 국제대회
+        기록 추가"] 국제대회 한 건(t)의 헤더 줄 + 조 순위표 + 경기 결과를
+        lines(list)에 이어 붙인다 — _format_country_history_text의 루프
+        본문을 그대로 뽑아낸 것뿐(포맷 100% 동일, 로직 변경 없음). 국가
+        전체 역사를 훑는 _format_country_history_text와, 선택한 대회
+        딱 하나만(+본선이면 예선 하나 더) 보여주는
+        _build_country_tournament_summary_text 양쪽에서 같이 쓰기 위해
+        공용 함수로 분리했다. 원래 코드처럼 예외가 나면 그 시점까지
+        append된 줄은 그대로 두고 조용히 멈춘다(호출부의 for-loop
+        continue와 동등)."""
+        from constants import INTL_TOURNAMENT_KIND_LABELS
+        try:
+            tname_ = t.get("name") or "-"
+            kind_label = INTL_TOURNAMENT_KIND_LABELS.get(
+                t.get("effective_kind", t.get("kind")), t.get("kind") or "-")
+            result = t.get("result") or "-"
+            rec = t.get("record")
+            rec_txt = f" ({rec})" if rec else ""
+            rank = year_rank.get(t.get("year"))
+            rank_txt = f" | 순위: {rank}위" if rank else ""
+            lines.append(f"{t.get('year')}년{rank_txt} | {tname_} [{kind_label}] : {result}{rec_txt}")
+
+            tid = t.get("id")
+            if tid is None:
+                return
+            log = wb.get_country_intl_match_log(tid, name)
+            # [2026-09 버그수정] group_standings가 1차/2차 두 조를
+            # 담은 리스트로 바뀌었다 — 예전엔 dict 하나였어서 조가
+            # 두 개일 때 하나가 그냥 누락됐다. 둘 다(1차/2차) 조가
+            # 있는 대회는 "조별리그1"/"조별리그2"를 붙여 구분한다.
+            gs_list = log.get("group_standings") or []
+            _multi_stage = len(gs_list) > 1
+            for gs in gs_list:
+                if not gs.get("rows"):
                     continue
+                stage_prefix = ""
+                if _multi_stage:
+                    stage_prefix = "조별리그1 " if gs.get("stage") == "qual_group" else "조별리그2 "
+                lines.append(f"  ㄴ {stage_prefix}{gs['group']}조 순위표:")
+                for rank_i, gr in enumerate(gs["rows"]):
+                    mark = " ★" if gr["country"] == name else ""
+                    lines.append(
+                        f"     {rank_i+1}. {gr['country']} "
+                        f"{gr['wins']}승{gr['draws']}무{gr['losses']}패 "
+                        f"(득실 {gr['gd']:+d}, 승점 {gr['pts']}){mark}")
+            for stage in (log.get("stages") or []):
+                for m in stage["matches"]:
+                    score_txt = f"{m['my_score']}:{m['opp_score']}"
+                    if m.get("pso"):
+                        pso_score = m.get("pso_score") or ""
+                        score_txt += f"(승부차기 {pso_score})" if pso_score else "(승부차기)"
+                    lines.append(
+                        f"  ㄴ {stage['stage_ko']} vs {m['opponent']} "
+                        f"{m['result']} {score_txt}")
+        except Exception:
+            return
 
+    def _build_country_tournament_summary_text(self, tid, country):
+        """[2026-09 신설/수정, 신민용 요청·리포트: "국가 검색 요약 복사 —
+        선택한 대회의 국제대회 기록(조 순위표·경기 결과)도 선수 기록
+        위에 같이 복사돼야 한다"] 처음엔 "본선을 선택하면 예선도 같이"만
+        (한쪽 방향) 구현했었는데, 실제로 포르투갈 2002 예선 대회 칸에서
+        요약 복사를 눌러보니 본선(월드컵) 기록이 통째로 안 나온다는
+        리포트를 받고 양방향으로 고쳤다 — 본선을 선택하든 예선을
+        선택하든, 같은 해에 둘 다 있으면 항상 [본선 블록] 다음에
+        [예선 블록] 순서로 같이 나간다(사용자 예시의 표시 순서 그대로).
+
+        _country_all_results(이미 _refresh_country_detail_table이 캐시해둔
+        국가 전체 대회 목록)에서 tid에 해당하는 대회를 찾아 그 kind로
+        본선/예선 짝을 찾는다 — 월드컵 본선(kind="world") ↔ 예선
+        (kind="wc_qual"), 대륙컵/유로 본선(kind="continent", 유로도 raw
+        kind는 continent와 동일) ↔ 예선(kind="cont_qual"). 짝이 되는
+        대회가 그 해에 없으면(예: 예선 탈락으로 본선 기록 자체가 없는
+        경우) 클릭한 대회 하나만 나간다. 이 매핑에 없는 종류(지역컵 등
+        예선 개념이 없는 대회)도 마찬가지로 그 대회 하나만 나간다."""
+        results = getattr(self, "_country_all_results", None) or []
+        t = next((r for r in results if r.get("id") == tid), None)
+        if not t:
+            return ""
+        year_rank = getattr(self, "_country_copy_year_rank", {})
+        year = t.get("year")
+
+        _finals_to_qual = {"world": "wc_qual", "continent": "cont_qual"}
+        _qual_to_finals = {v: k for k, v in _finals_to_qual.items()}
+
+        kind = t.get("kind")
+        if kind in _finals_to_qual:
+            finals_t = t
+            qual_t = next((r for r in results if r.get("kind") == _finals_to_qual[kind]
+                           and r.get("year") == year), None)
+        elif kind in _qual_to_finals:
+            qual_t = t
+            finals_t = next((r for r in results if r.get("kind") == _qual_to_finals[kind]
+                              and r.get("year") == year), None)
+        else:
+            finals_t, qual_t = t, None
+
+        lines = [f"[{year} {country} 국제대회 기록]"]
+        if finals_t:
+            self._append_country_tournament_lines(lines, finals_t, country, year_rank)
+        if qual_t:
+            self._append_country_tournament_lines(lines, qual_t, country, year_rank)
         return "\n".join(lines)
 
     def _open_country_title_detail(self, row, _col):
@@ -6524,10 +6624,18 @@ class WorldBrowserWindow(QDialog):
                 summary_copy_btn = QPushButton("📋 요약 복사")
                 summary_copy_btn.setStyleSheet(_btn_qss)
                 _summary_years = {_year_int}
+                # [2026-09 확장, 신민용 요청: "요약 복사 누르면 선수 기록
+                # 위에 이 대회(본선이면 같은 해 예선까지)의 국제대회
+                # 기록도 같이 복사돼야 한다"] prefix_text는 클릭 시점에
+                # 매번 새로 만든다(_build_country_tournament_summary_text
+                # 호출) — self._country_all_results가 그 사이 다른 나라
+                # 조회로 갱신됐을 수 있으므로 lambda 정의 시점에 미리
+                # 계산해두지 않는다.
                 summary_copy_btn.clicked.connect(
                     lambda: self._copy_squad_player_records(
                         _ids, summary_copy_btn, "📋 요약 복사", target_years=_summary_years,
-                        include_stats=False))
+                        include_stats=False,
+                        prefix_text=self._build_country_tournament_summary_text(tid, country)))
                 header_row.addWidget(summary_copy_btn)
         lay.addLayout(header_row)
 
@@ -6605,7 +6713,7 @@ class WorldBrowserWindow(QDialog):
         self.open_to_player(pid)
 
     def _copy_squad_player_records(self, ids, btn, reset_label="📋 스쿼드 기록 복사", target_years=None,
-                                    include_stats=True):
+                                    include_stats=True, prefix_text=""):
         """[2026-08 신설, 신민용 요청: "이 대회명 써진 줄 우측에 복사하기
         버튼을 놔줘 — 여기 들어간 선수들의 선수 기록을 한꺼번에 복사하는
         용도"] ui/formation_widget.py의 _on_copy_squad_clicked와 완전히
@@ -6642,7 +6750,14 @@ class WorldBrowserWindow(QDialog):
         이름 그대로 단일 선수의 "기록 복사"와 같은 상세 수준이어야 하므로
         include_stats 기본값을 True로 바꿨다 — 이름이 "요약 복사"인
         버튼만 호출부에서 명시적으로 False를 넘긴다(아래 두 호출부
-        참고)."""
+        참고).
+
+        [2026-09 신설, 신민용 요청: "국가 검색 요약 복사에 그 대회의
+        국제대회 기록(조 순위표·경기 결과)도 선수 기록 위에 같이
+        떠야 한다"] prefix_text를 넘기면 선수 기록들 앞에 한 줄 띄우고
+        그대로 붙여서 클립보드에 넣는다 — 기본값 ""(기존 동작 그대로,
+        다른 호출부는 건드릴 필요 없음). 대회 기록 자체는
+        _build_country_tournament_summary_text가 만든다."""
         ids = [i for i in dict.fromkeys(ids) if i is not None]
         if not ids:
             return
@@ -6670,7 +6785,10 @@ class WorldBrowserWindow(QDialog):
             harvester.deleteLater()
         if not texts:
             return
-        QGuiApplication.clipboard().setText("\n".join(texts))
+        final_text = "\n".join(texts)
+        if prefix_text:
+            final_text = prefix_text + "\n\n" + final_text
+        QGuiApplication.clipboard().setText(final_text)
         btn.setText("✅ 복사됨")
         QTimer.singleShot(1200, lambda: btn.setText(reset_label))
 
