@@ -587,7 +587,12 @@ def _finish_tournament(t):
 
     p = get_player()
     my_tid = p.get("current_team_id", 0) if p else 0
-    if t["my_in"] and my_tid:
+    # [2026-09 버그수정, CL/국내컵과 동일한 문제] my_in만 보면 "올해 어느
+    # 시점엔가 내가 등록됐었다"만 확인될 뿐, 등록 당시 팀(my_team_id)과
+    # 지금 팀이 같은지는 안 본다 — 시즌 중 이적해서 이 대회와 무관해진
+    # 뒤, 마침 지금 팀이 이 대회 우승/4강 등 성적을 낸 팀과 같으면 그
+    # 성적을 내 걸로 잘못 기록한다.
+    if t["my_in"] and my_tid and t.get("my_team_id") == my_tid:
         tp = conn.execute("SELECT * FROM cwc_matches WHERE tournament_id=? AND stage='TP'", (t["id"],)).fetchone()
         if my_tid == winner_id:
             result = "우승"

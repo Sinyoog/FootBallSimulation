@@ -428,6 +428,30 @@ def _fetch_cup_ko_opp(tournament_id, my_team_id, week):
              "formation": "4-4-2", "players": players}]
 
 
+def _fetch_lower_cup_ko_opp(tournament_id, my_team_id, week):
+    """3부/4부 국내컵 — _fetch_cup_ko_opp과 완전히 같은 패턴(조별리그
+    없는 순수 토너먼트, 항상 이번 주 상대 1팀만), 대상 테이블만
+    lower_cup_matches/lower_cup_entries로 교체."""
+    conn = get_conn()
+    m = conn.execute(
+        "SELECT * FROM lower_cup_matches WHERE tournament_id=? AND week=? "
+        "AND home_score=-1 AND (home_team_id=? OR away_team_id=?)",
+        (tournament_id, week, my_team_id, my_team_id)).fetchone()
+    if not m:
+        conn.close(); return None
+    opp_id = m["away_team_id"] if m["home_team_id"] == my_team_id else m["home_team_id"]
+    e = conn.execute(
+        "SELECT team_name, ovr FROM lower_cup_entries WHERE tournament_id=? AND team_id=?",
+        (tournament_id, opp_id)).fetchone()
+    conn.close()
+    if not e: return None
+    players = _players_for_team(opp_id)
+    avg = _avg_ovr(players) or round(e["ovr"] or 0)
+    return [{"team_id": opp_id, "name": e["team_name"],
+             "flag": "", "avg_ovr": avg,
+             "formation": "4-4-2", "players": players}]
+
+
 def _fetch_cwc_opponents(tournament_id, my_team_id, grp=None):
     """클럽 월드컵 상대팀 목록. grp 지정 시 내 조 팀만 반환(조별리그)."""
     conn = get_conn()
@@ -1958,6 +1982,7 @@ _CTX_STYLE = {
     "super_cup": ("color:#ffd700;", "⭐"),
     "cwc":       ("color:#66d9ff;", "🌐"),
     "cup":       ("color:#c48aff;", "🎖️"),
+    "lower_cup": ("color:#00A6A6;", "🏅"),
 }
 
 # actBtn과 동일한 다크 박스 스타일
@@ -2284,6 +2309,8 @@ class FormationWidget(QWidget):
                 kind = "cwc"
             elif context.get("cup"):
                 kind = "cup"
+            elif context.get("lower_cup"):
+                kind = "lower_cup"
             else:
                 kind = "league"
         else:
@@ -2391,6 +2418,12 @@ class FormationWidget(QWidget):
             tid  = context["tournament_id"]
             week = context.get("week", 0)
             return _fetch_cup_ko_opp(tid, team_id, week) or []
+        elif context and context.get("lower_cup"):
+            # 3부/4부 국내컵도 국내컵과 동일하게 조별리그 없는 순수
+            # 토너먼트라 항상 이번 주 상대 1팀만 보여준다.
+            tid  = context["tournament_id"]
+            week = context.get("week", 0)
+            return _fetch_lower_cup_ko_opp(tid, team_id, week) or []
         else:
             conn = get_conn()
             row = conn.execute("SELECT league_id FROM teams WHERE id=?", (team_id,)).fetchone()

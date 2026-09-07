@@ -15,11 +15,12 @@ game.db(코드베이스에 포함된 시드 템플릿, 시즌1 상태)를 원본
 사용법: python3 analyze_promotion_streaks.py [시즌수] [시드]
 (기본 20시즌, 시드 99)
 """
+import _path  # noqa: F401  (tools/ 에서 루트 모듈을 import 하기 위한 sys.path 부트스트랩)
 import sys
 import os
 from collections import defaultdict, Counter
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import headless_runner
 import database

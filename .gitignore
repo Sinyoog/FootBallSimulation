@@ -1,12 +1,27 @@
-@"
-live_sim.log
-*.log
+# ── 세이브 파일 ──────────────────────────────
 game.db
 game.history.db
 game.db-wal
 game.db-shm
 game.history.db-wal
 game.history.db-shm
+game.history.db.pre_pk_migration.bak
+
+# ── 실행 산출물 / 로그 ───────────────────────
+*.log
+live_sim.log
+qa_runs/
+*.jsonl
+!data/affiliate_raw.jsonl
+diag_result.txt
+profile_output.prof
+salary_probe_*.csv
+
+# ── 진단 스크립트 출력 ───────────────────────
+det_*.json
+h_*.json
+timing_*.txt
+
+# ── 파이썬 ───────────────────────────────────
 __pycache__/
 *.pyc
-"@ | Set-Content -Path .gitignore -Encoding utf8

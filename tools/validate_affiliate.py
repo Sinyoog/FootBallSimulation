@@ -1,6 +1,6 @@
 import sys, json, sqlite3
 sys.path.insert(0, '.')
-from leagues import LEAGUE_DATA
+from data.leagues import LEAGUE_DATA
 
 # --- 1. leagues.py 기준 진실 데이터 구축 ---
 country_index = {}  # country_name -> {"max_tier":.., "total":.., "teams": {(name,tier)}, "names": set(all names)}
@@ -30,7 +30,7 @@ except Exception:
     name_to_id = {}
 
 # --- 2. jsonl 로드 & 검증 (빈 줄로 구분된 pretty JSON 블록 파싱, country_id는 무시) ---
-raw = open('affiliate_raw.jsonl', encoding='utf-8').read()
+raw = open(os.path.join(_path.ROOT, 'data', 'affiliate_raw.jsonl'), encoding='utf-8').read()
 blocks = [b for b in raw.split('\n\n') if b.strip()]
 lines = blocks
 

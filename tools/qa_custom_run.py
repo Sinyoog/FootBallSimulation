@@ -8,6 +8,7 @@
 을 기록한다. headless_runner와 달리 schedule을 '현재 날짜'부터 시작해서
 day_mismatch로 즉시 종료되는 문제를 피한다.
 """
+import _path  # noqa: F401  (tools/ 에서 루트 모듈을 import 하기 위한 sys.path 부트스트랩)
 import datetime
 import os
 import shutil

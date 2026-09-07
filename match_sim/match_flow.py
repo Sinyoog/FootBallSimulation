@@ -208,4 +208,9 @@ def _make_rng(seed, events, my_score, opp_score):
     # 데이터면 항상 같은 로그가 나오게(재현성), 그러면서도 게임 엔진의
     # 전역 random 상태와는 완전히 분리되게.
     key = "|".join(f"{m}:{t}" for m, t in events) + f"|{my_score}-{opp_score}"
-    return random.Random(hash(key) & 0xffffffff)
+    # [2026-09 재현성 버그수정] 내장 hash()는 문자열에 대해 PYTHONHASHSEED로
+    # 랜덤화되므로 프로세스마다 값이 달라진다 — 위 주석이 말하는 "같은 경기
+    # 데이터면 항상 같은 로그"가 실제로는 한 프로세스 안에서만 성립했다.
+    # 시드에 무관하게 항상 같은 값을 주는 crc32로 교체(분포는 동일).
+    import zlib
+    return random.Random(zlib.crc32(key.encode("utf-8")) & 0xffffffff)

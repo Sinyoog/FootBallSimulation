@@ -7,10 +7,11 @@ database.py 파일을 import하고 있는지, 그 파일에 마이그레이션 �
 사용법: 이 파일을 FootBallSimulation-main 폴더(main.py와 같은 위치)에
 넣고 `python diagnose.py` 실행.
 """
+import _path  # noqa: F401  (tools/ 에서 루트 모듈을 import 하기 위한 sys.path 부트스트랩)
 import sys
 import os
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import database
 

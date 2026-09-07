@@ -29,6 +29,7 @@ random.choices()는 넘겨받은 리스트의 순서대로 인덱스를 뽑으�
 주의: 이 스크립트는 세이브 파일을 전혀 건드리지 않는다.
       data/leagues.py + constants.py로 메모리상에 가상 세계를 만들어 쓴다.
 """
+import _path  # noqa: F401  (tools/ 에서 루트 모듈을 import 하기 위한 sys.path 부트스트랩)
 import argparse
 import bisect
 import importlib.util
@@ -38,7 +39,7 @@ import sqlite3
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 SEED = 20260905
 
@@ -332,7 +333,7 @@ def main():
           % (len(team_info), len(rows), len(calls), n_gs,
              100.0 * n_gs / max(1, len(calls))))
 
-    here = os.path.dirname(os.path.abspath(__file__))
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     new = load_module(os.path.join(here, "ai_lifecycle.py"), "_rt_new")
 
     print("BEHAVIOR TEST — 게임 규칙(불변조건)")

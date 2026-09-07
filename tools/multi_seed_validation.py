@@ -15,6 +15,7 @@
 
 사용: python3 multi_seed_validation.py <시작DB> <시즌수> <seed1> [seed2] ...
 """
+import _path  # noqa: F401  (tools/ 에서 루트 모듈을 import 하기 위한 sys.path 부트스트랩)
 import sys
 
 from extended_ab_test import run_extended

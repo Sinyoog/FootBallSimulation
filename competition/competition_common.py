@@ -622,14 +622,27 @@ def finish_tournament(cfg, t, award_fn=None):
 
     p = get_player()
     my_tid = p.get("current_team_id", 0) if p else 0
-    if my_tid == winner:
-        record_my_exit(cfg, t, "우승")
-    elif my_tid == runner:
-        record_my_exit(cfg, t, "준우승")
-    elif my_tid == third:
-        record_my_exit(cfg, t, "3위")
-    elif my_tid == fourth:
-        record_my_exit(cfg, t, "4위")
+    # [2026-09 버그수정, 신민용 리포트: "아시아 챔스 뛰고 시즌 중 아스날로
+    # 이적했는데, 내가 가기 전에 아스날이 딴 유럽 챔스 우승이 내 발롱도르
+    # 점수로 들어온다"] 여기서 my_tid는 "지금 이 순간(대회가 끝난 시점)
+    # 내 소속팀"인데, 이걸 그대로 winner/runner/third/fourth와 비교하면
+    # 이 대회와 등록 당시(build_tournament 시점) 전혀 무관했던 팀으로
+    # 이적한 뒤에도, 마침 그 팀이 이 대회 우승팀이면 "내가 우승했다"고
+    # 잘못 기록해버린다 — 실제로 이 대회에서 단 한 경기도 안 뛰었어도.
+    # t["my_team_id"](등록 당시 내 팀)가 지금 내 팀과 같을 때만, 즉
+    # 시즌 내내(또는 최소한 이 대회 등록 시점부터) 계속 그 팀에 있었을
+    # 때만 이 대회 결과를 내 걸로 인정한다 — get_my_champions_matches가
+    # 이미 쓰고 있던 "등록 당시 팀과 현재 팀이 같을 때만 내 대회로 본다"
+    # 원칙(스케줄 화면)을 결과 기록에도 똑같이 적용.
+    if my_tid and t.get("my_in") and t.get("my_team_id") == my_tid:
+        if my_tid == winner:
+            record_my_exit(cfg, t, "우승")
+        elif my_tid == runner:
+            record_my_exit(cfg, t, "준우승")
+        elif my_tid == third:
+            record_my_exit(cfg, t, "3위")
+        elif my_tid == fourth:
+            record_my_exit(cfg, t, "4위")
 
     if award_fn:
         award_fn(t, my_tid)

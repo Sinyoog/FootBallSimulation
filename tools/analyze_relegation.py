@@ -140,5 +140,5 @@ def main(db_path):
 
 if __name__ == "__main__":
     path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "game.db")
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "game.db")
     main(path)

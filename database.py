@@ -457,6 +457,20 @@ def seed_initial_ovr_history(year):
         # 같이 맞춰둔다(전원 1년) — 안 하면 새 세이브 첫 해 동안만 경력
         # 필터가 0으로 보인다.
         refresh_career_years(conn)
+        # [2026-09 신설, 신민용 리포트: "새 선수 생성할 때 멈춘다"의 후속]
+        # hist 4표는 PK가 (year, player_id)라, player_id만으로 거는 조회는
+        # SQLite가 skip-scan을 골라야 빠르고 그 판단은 sqlite_stat1에
+        # 의존한다. 그런데 마이그레이션은 세이브 생성 직후(표가 비어 있을
+        # 때) 돌아서 통계 행이 아예 안 생긴다 — 새 세이브에서 이력이 처음
+        # 채워지는 지점이 바로 여기이므로, 이 순간 한 번 통계를 만들어준다
+        # (실측 0.05초). 이건 어디까지나 보조 장치다: 이 프로젝트의 조회는
+        # 전부 연도 조건을 명시하거나 GROUP BY 한 번으로 바꿔놔서 통계가
+        # 없어도 느려지지 않는다(refresh_career_years 주석 참고).
+        try:
+            conn.execute("ANALYZE hist")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
 
 
 def refresh_career_years(conn=None, retirement_year=None) -> float:
@@ -488,18 +502,40 @@ def refresh_career_years(conn=None, retirement_year=None) -> float:
         conn = get_conn()
     c = conn.cursor()
     try:
-        c.execute("""UPDATE ai_players SET career_years = (
-                         SELECT COUNT(*) FROM hist.ai_player_ovr_history h
-                         WHERE h.player_id = ai_players.id)""")
+        # [2026-09 재작성, 신민용 리포트: "새 선수 생성할 때 멈춘다"]
+        # 예전엔 선수 한 명당 상관 서브쿼리를 하나씩 돌렸다:
+        #     UPDATE ai_players SET career_years =
+        #       (SELECT COUNT(*) FROM hist.ai_player_ovr_history h
+        #        WHERE h.player_id = ai_players.id)
+        # PK가 (player_id, year)일 때는 그 서브쿼리가 인덱스 탐색이라
+        # 빨랐지만, PK를 (year, player_id)로 바꾼 뒤로는 player_id가
+        # 선행키가 아니라서 SQLite가 skip-scan을 쓸 수 있어야만 빠르다 —
+        # 그런데 skip-scan은 sqlite_stat1(ANALYZE 결과)이 있어야 선택되고,
+        # 새 세이브는 표가 비어 있을 때 ANALYZE가 도는 바람에 통계가
+        # 비어 있다. 그 상태에서는 서브쿼리 하나하나가 전체 스캔이 되어
+        # 26만 명 × 26만 행 = 사실상 무한 정지가 됐다.
+        #
+        # 통계에 기대지 않도록 아예 형태를 바꾼다: 이력을 GROUP BY로 한 번만
+        # 훑어 선수별 개수를 만든 뒤 그대로 써 넣는다. 스캔이 선수 수만큼이
+        # 아니라 딱 한 번이므로 PK 순서와 통계 유무에 전혀 영향받지 않고,
+        # 예전 스키마에서도 이쪽이 더 빠르다.
+        counts = c.execute(
+            "SELECT player_id, COUNT(*) FROM hist.ai_player_ovr_history "
+            "GROUP BY player_id").fetchall()
+        c.execute("UPDATE ai_players SET career_years = 0")
+        c.executemany("UPDATE ai_players SET career_years=? WHERE id=?",
+                       [(r[1], r[0]) for r in counts])
         if retirement_year is None:
-            c.execute("""UPDATE ai_players_retired SET career_years = (
-                             SELECT COUNT(*) FROM hist.ai_player_ovr_history h
-                             WHERE h.player_id = ai_players_retired.id)""")
+            c.execute("UPDATE ai_players_retired SET career_years = 0")
+            c.executemany("UPDATE ai_players_retired SET career_years=? WHERE id=?",
+                           [(r[1], r[0]) for r in counts])
         else:
-            c.execute("""UPDATE ai_players_retired SET career_years = (
-                             SELECT COUNT(*) FROM hist.ai_player_ovr_history h
-                             WHERE h.player_id = ai_players_retired.id)
-                         WHERE retirement_year = ?""", (retirement_year,))
+            c.execute("UPDATE ai_players_retired SET career_years = 0 "
+                      "WHERE retirement_year = ?", (retirement_year,))
+            c.executemany(
+                "UPDATE ai_players_retired SET career_years=? "
+                "WHERE id=? AND retirement_year=?",
+                [(r[1], r[0], retirement_year) for r in counts])
         conn.commit()
     except sqlite3.OperationalError as e:
         # 컬럼이 아직 없는 아주 오래된 세이브 등 — 검색 필터 쪽에 폴백이
@@ -582,6 +618,68 @@ def _migrate_backfill_award_kind_competition():
     c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('award_kind_backfill_v1','1')")
     conn.commit()
     print(f"[MIGRATE] 개인상 award_kind/competition 백필 완료 ({len(rows)}행)")
+
+
+# [2026-09 신설] game_engine._NATION_CONF와 값이 동일한 대륙→연맹 매핑을
+# 여기 그대로 복제해 둔다 — database.py에서 game_engine을 import하면
+# 순환참조가 생기므로(game_engine이 database를 import) 공유할 수 없다.
+# game_engine._NATION_CONF를 나중에 고치면 이쪽도 같이 맞춰야 한다.
+_INTL_CONTINENT_CONF_MAP = {
+    "유럽": "유럽", "남미": "아메리카", "북미": "아메리카", "북중미": "아메리카",
+    "아시아": "아시아", "오세아니아": "아시아", "아프리카": "아프리카",
+}
+
+
+def _migrate_backfill_intl_continent():
+    """[2026-09 신설, 신민용 리포트: "AFCON 우승한 세네갈 선수가 발롱도르
+    트로피 0점" — 원인 규명 결과 intl_engine._create_one_tournament()이
+    대륙컵(kind='continent') 생성 시 continent 컬럼을 빼먹고 저장해온
+    버그였음(코드 자체는 이미 수정 완료). 그런데 이미 진행된 세이브에는
+    그 버그 상태로 저장된 과거 대회 행이 남아있어(continent=''), 코드만
+    고쳐서는 "앞으로 새로 열리는 대회"만 정상화되고 과거 기록은 그대로
+    비어있다 — 이 1회성 백필로 기존 행을 채운다.
+
+    대회 하나는 항상 같은 연맹(confederation) 소속 국가들끼리만 열리므로,
+    intl_entries에서 그 대회의 참가국 아무거나 하나를 가져와 countries.
+    continent(원본 대륙: 유럽/남미/북미/북중미/아시아/오세아니아/아프리카)를
+    역조회한 뒤, 위 _INTL_CONTINENT_CONF_MAP(game_engine._NATION_CONF와
+    동일 값)을 거쳐 4연맹(유럽/아메리카/아시아/아프리카) 값으로 저장한다.
+
+    idempotent: continent가 이미 채워진 행은 WHERE절에서 애초에 제외되므로
+    몇 번을 다시 실행해도 안전하다(이미 백필된 세이브에서 재실행해도
+    변경 없음 — 신민용 요청사항)."""
+    conn = get_conn(); c = conn.cursor()
+    try:
+        done = c.execute(
+            "SELECT value FROM meta WHERE key='intl_continent_backfill_v1'").fetchone()
+    except sqlite3.OperationalError:
+        return
+    if done and done["value"] == "1":
+        return
+    try:
+        rows = c.execute(
+            """SELECT id FROM intl_tournaments
+               WHERE kind='continent' AND (continent IS NULL OR continent='')"""
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return  # continent 컬럼 자체가 아직 없는 아주 옛 세이브(이 마이그레이션보다 먼저 컬럼 추가 필요)
+    fixed = 0
+    for r in rows:
+        tid = r["id"]
+        entry = c.execute(
+            "SELECT country FROM intl_entries WHERE tournament_id=? LIMIT 1", (tid,)).fetchone()
+        if not entry:
+            continue
+        crow = c.execute(
+            "SELECT continent FROM countries WHERE name=?", (entry["country"],)).fetchone()
+        conf = _INTL_CONTINENT_CONF_MAP.get(crow["continent"]) if crow else None
+        if not conf:
+            continue
+        c.execute("UPDATE intl_tournaments SET continent=? WHERE id=?", (conf, tid))
+        fixed += 1
+    c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('intl_continent_backfill_v1','1')")
+    conn.commit()
+    print(f"[MIGRATE] intl_tournaments.continent 백필 완료 ({fixed}/{len(rows)}건)")
 
 
 def seed_my_player_initial_ovr(year, ovr):
@@ -1586,6 +1684,10 @@ def init_db():
         year INTEGER, team_name TEXT, result TEXT,
         goals INTEGER DEFAULT 0, assists INTEGER DEFAULT 0,
         caps INTEGER DEFAULT 0, rating REAL DEFAULT 0)""")
+    # [2026-09 신설] 3부/4부 국내컵(lower_cup_engine) — cup_tournaments/
+    # cup_entries/cup_matches/cup_history와 완전히 같은 원칙, 테이블만 분리.
+    from competition.lower_cup_engine import init_lower_cup_tables
+    init_lower_cup_tables(c)
     # ── 승강 플레이오프 (promotion_playoff_engine) ──────────────────
     # [2026-07 신설] _process_promotion_relegation이 43주에 순위를 확정할 때,
     # PO 대상(po_count 자리)에 걸린 팀은 즉시 이동시키지 않고 여기에
@@ -2860,9 +2962,14 @@ def init_db():
     repair_cwc_match_groups()   # 클럽월드컵 매치 grp 백필 (1회성, 아래 참고)
     _migrate_history_tables()   # 선수 이력 2표 고아행 정리 + WITHOUT ROWID 재구축 (1회성, 아래 참고)
     _migrate_history_db_split()   # 선수 이력 2표 main→history.db(hist) 이전 (1회성, 아래 참고)
+    # [2026-09] hist 4표 PK를 (year, player_id...) 선행으로 재구축 (1회성).
+    # 반드시 위 두 마이그레이션 뒤에 온다 — 고아행 정리·hist 이전이 끝난
+    # 뒤의 깨끗한 데이터만 옮기기 위해서다.
+    _migrate_history_pk_year_first()
     _migrate_history_db_split_v2()  # 파워랭킹/시즌순위 4표 main→history.db 이전 (1회성)
     _migrate_backfill_career_years()  # career_years 컬럼 1회성 백필 (아래 참고)
     _migrate_backfill_award_kind_competition()  # 개인상 award_kind/competition 1회성 백필 (아래 참고)
+    _migrate_backfill_intl_continent()   # 대륙컵 continent 컬럼 1회성 백필 (1회성, 아래 참고)
     _migrate_phantom_career_entries()   # 유령 재직기록(길이0·0경기) 정리 (1회성, 아래 참고)
     _migrate_orphaned_ai_players()   # 이름 지어놓고 통째로 사라진 고아 ai_players 복구 (1회성, 아래 참고)
     compact_existing_match_archive()   # 기존 세이브 match_results_archive 요약+정리 (1회성, 아래 참고)
@@ -3498,6 +3605,198 @@ def _migrate_history_tables():
     print(f"[MIGRATE] 선수 이력 표 재구축 완료 {_t_mig.perf_counter()-_t0:.2f}s")
 
 
+def _migrate_history_pk_year_first():
+    """[2026-09 신설, 신민용 승인: "history.db가 성장할수록 계속 악화되는
+    구조를 평탄화하는 구조적 최적화"] hist의 선수 이력 4표를
+    PRIMARY KEY(player_id, year, ...) → PRIMARY KEY(year, player_id, ...)로
+    재구축한다. meta 플래그로 세이브당 딱 1회만 돈다.
+
+    ── 왜 ────────────────────────────────────────────────────
+    4표 전부 WITHOUT ROWID라 PK 순서가 곧 디스크 저장 순서다. player_id가
+    선행키면 "새 연도 26만 행"이 트리 전체에 흩뿌려져 들어가서, 매년
+    사실상 표 전체 페이지를 다시 만진다. 그래서 연도전환이 시즌마다
+    단조 증가했다(실측 로그 4시즌: 평점스냅샷 +23%, OVR이력아카이브
+    +59%, 포지션스냅샷 +22% — 반면 순수 계산인 성장/노화는 -2%, 전술
+    셔플은 +7%로 평평했다).
+
+    연도를 앞에 두면 새 연도 행이 전부 트리 꼬리에 이어붙어 삽입이
+    평평해진다. 26만 행×24년 합성 실측:
+        현행 PK(player_id, year)   0.33s → 1.08s  (+227%, 누적 17.6s)
+        신규 PK(year, player_id)   0.37s → 0.39s  (  +5%, 누적  9.0s)
+    보조 인덱스(player_id, year)를 같이 만드는 안도 재봤지만, 그 인덱스가
+    흩뿌림 문제를 그대로 재현해서 누적 18.1s로 오히려 더 나빴고 파일만
+    50% 커졌다 — 그래서 보조 인덱스는 만들지 않는다.
+
+    ── 선수별 조회는 어떻게 되나 ─────────────────────────────
+    "WHERE player_id=?"는 선행키가 아니게 되지만, 연도 가짓수가 수십 개
+    뿐이라 SQLite가 skip-scan(SEARCH ... USING PRIMARY KEY (ANY(year) AND
+    player_id=?))을 쓴다. 실제 세이브 실측 0.008ms → 0.015ms로 두 배지만
+    절대값이 15마이크로초라 화면에서 체감되지 않는다. 연도 일괄 조회는
+    0.42s → 0.40s(동등), 표 전체 읽기는 2.59s → 1.73s(오히려 개선).
+
+    [중요] skip-scan은 sqlite_stat1(ANALYZE 결과)에 의존한다 — 통계가
+    없으면 계획이 SCAN으로 떨어져 선수별 조회가 220ms/선수로 폭락한다
+    (실측). 그래서 (1) 이 함수가 끝에 ANALYZE를 돌리고 sqlite_stat1이
+    실제로 생겼는지 확인하며 (2) 그것과 별개로 선수별 조회 지점들은
+    "WHERE year IN (연도목록) AND player_id=?" 형태로 연도 조건을 명시해
+    통계와 무관하게 항상 PK를 쓰도록 고쳐두었다(world_browser.py 참고).
+    (2)가 있으면 (1)이 실패해도 성능이 무너지지 않는다 — 이중 안전장치.
+
+    ── 안전장치 ──────────────────────────────────────────────
+    라이브 세이브의 스키마를 바꾸는 작업이라 성능보다 무결성이 우선이다.
+      1. 시작 전 history.db 전체를 .pre_pk_migration.bak으로 백업하고,
+         백업 파일이 실제로 열리고 행 수가 맞는지 확인한 뒤에만 진행한다.
+         같은 이름 백업이 이미 있으면 절대 덮어쓰지 않는다(먼저 돌다 만
+         흔적일 수 있으므로 .bak2, .bak3...으로 비켜서 만든다).
+      2. 새 표를 만들고 옮긴 뒤, 행 수 비교 + 양방향 EXCEPT로 전 행을
+         대조한다. 한 방향만 보면 누락은 잡아도 중복/변조는 놓친다.
+         대조가 하나라도 어긋나면 새 표를 버리고 원본을 그대로 둔 채
+         예외를 올린다(플래그도 안 세운다 → 다음 실행에서 재시도).
+      3. 전부 통과한 뒤에만 DROP + RENAME 한다.
+    백업 파일은 이 함수가 지우지 않는다 — 첫 실전 연도전환까지 확인한 뒤
+    사용자가 직접 지우면 된다.
+    """
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        done = c.execute(
+            "SELECT value FROM meta WHERE key='history_pk_year_first_v1'").fetchone()
+    except sqlite3.OperationalError:
+        return
+    if done and done["value"] == "1":
+        return
+
+    # (year, player_id, ...) 순으로 바꿀 4표 — (표이름, 새 PK 컬럼들, 컬럼 정의)
+    TARGETS = (
+        ("ai_player_season_stats", "year, player_id",
+         "player_id INTEGER, year INTEGER, team_id INTEGER, matches INTEGER, "
+         "goals INTEGER, assists INTEGER, rating REAL, clean_sheets INTEGER DEFAULT 0, "
+         "saves INTEGER DEFAULT 0, goals_conceded INTEGER DEFAULT 0"),
+        ("ai_player_season_stats_by_comp", "year, player_id, competition",
+         "player_id INTEGER, year INTEGER, competition TEXT, matches INTEGER, "
+         "goals INTEGER, assists INTEGER, rating REAL, clean_sheets INTEGER DEFAULT 0, "
+         "saves INTEGER DEFAULT 0, goals_conceded INTEGER DEFAULT 0"),
+        ("ai_player_ovr_history", "year, player_id",
+         "player_id INTEGER, year INTEGER, ovr INTEGER"),
+        ("ai_player_position_history", "year, player_id",
+         "player_id INTEGER, year INTEGER, position TEXT, role TEXT DEFAULT ''"),
+    )
+
+    # 이미 전부 (year, ...) 선행이면(신규 세이브 등) 조용히 플래그만 세운다.
+    todo = []
+    for tbl, newpk, coldef in TARGETS:
+        row = c.execute(
+            "SELECT sql FROM hist.sqlite_master WHERE type='table' AND name=?", (tbl,)).fetchone()
+        if not row or not row["sql"]:
+            continue          # 표 자체가 없는 세이브 — 건너뛴다
+        sql_up = " ".join((row["sql"] or "").split()).upper()
+        if "PRIMARY KEY(YEAR," in sql_up.replace("PRIMARY KEY (", "PRIMARY KEY("):
+            continue          # 이미 연도 선행
+        todo.append((tbl, newpk, coldef))
+    if not todo:
+        c.execute("INSERT OR REPLACE INTO meta(key, value) "
+                  "VALUES('history_pk_year_first_v1','1')")
+        conn.commit()
+        return
+
+    import os as _os
+    import time as _t_mig
+    _t0 = _t_mig.perf_counter()
+
+    # ── 1. 백업 ───────────────────────────────────────────────
+    hist_path = _history_db_path()
+    bak = hist_path + ".pre_pk_migration.bak"
+    if _os.path.exists(bak):
+        _n = 2
+        while _os.path.exists(f"{bak}{_n}"):
+            _n += 1
+        bak = f"{bak}{_n}"
+    # VACUUM INTO는 WAL 내용까지 반영한 '깨끗한 사본'을 만든다(단순 파일
+    # 복사는 -wal에 아직 남아있는 최신 커밋을 놓칠 수 있다).
+    c.execute("VACUUM hist INTO ?", (bak,))
+    _bak_conn = sqlite3.connect(f"file:{bak}?mode=ro", uri=True)
+    try:
+        for tbl, _pk, _cd in todo:
+            n_src = c.execute(f"SELECT COUNT(*) FROM hist.{tbl}").fetchone()[0]
+            n_bak = _bak_conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+            if n_src != n_bak:
+                raise RuntimeError(
+                    f"백업 검증 실패: {tbl} 원본 {n_src}행 vs 백업 {n_bak}행")
+    finally:
+        _bak_conn.close()
+    print(f"[MIGRATE-PK] 백업 완료 → {_os.path.basename(bak)} "
+          f"({_os.path.getsize(bak)/1e6:.0f}MB)")
+
+    # ── 2~3. 표별 재구축 + 전 행 대조 ─────────────────────────
+    for tbl, newpk, coldef in todo:
+        cols = [r["name"] for r in c.execute(f"PRAGMA hist.table_info({tbl})")]
+        collist = ", ".join(cols)
+        tmp = f"_pkmig_{tbl}"
+        c.execute(f"DROP TABLE IF EXISTS hist.{tmp}")
+        c.execute(f"CREATE TABLE hist.{tmp}({coldef}, PRIMARY KEY({newpk})) WITHOUT ROWID")
+        c.execute(f"INSERT INTO hist.{tmp}({collist}) "
+                  f"SELECT {collist} FROM hist.{tbl} ORDER BY {newpk}")
+        n_old = c.execute(f"SELECT COUNT(*) FROM hist.{tbl}").fetchone()[0]
+        n_new = c.execute(f"SELECT COUNT(*) FROM hist.{tmp}").fetchone()[0]
+        # 양방향 EXCEPT — 값 변조/누락/중복을 전부 잡는다(행 수만 비교하면
+        # "한 행이 사라지고 다른 행이 중복된" 경우를 놓친다).
+        miss = c.execute(
+            f"SELECT COUNT(*) FROM (SELECT {collist} FROM hist.{tbl} "
+            f"EXCEPT SELECT {collist} FROM hist.{tmp})").fetchone()[0]
+        extra = c.execute(
+            f"SELECT COUNT(*) FROM (SELECT {collist} FROM hist.{tmp} "
+            f"EXCEPT SELECT {collist} FROM hist.{tbl})").fetchone()[0]
+        if n_old != n_new or miss or extra:
+            c.execute(f"DROP TABLE IF EXISTS hist.{tmp}")
+            conn.commit()
+            raise RuntimeError(
+                f"PK 마이그레이션 검증 실패({tbl}): 행수 {n_old}→{n_new}, "
+                f"누락 {miss}, 초과 {extra} — 원본은 그대로 두었고 백업은 {bak}")
+        c.execute(f"DROP TABLE hist.{tbl}")
+        c.execute(f"ALTER TABLE hist.{tmp} RENAME TO {tbl}")
+        print(f"[MIGRATE-PK] {tbl} 재구축 완료 {n_new:,}행 "
+              f"(PK → {newpk}, 전 행 대조 통과)")
+    conn.commit()
+
+    # ── 4. ANALYZE + sqlite_stat1 확인 ────────────────────────
+    # skip-scan 계획이 서려면 hist 쪽 sqlite_stat1이 있어야 한다. 실패해도
+    # 게임은 진행돼야 하므로(위 이중 안전장치의 (2)가 있다) 경고만 남긴다.
+    try:
+        c.execute("ANALYZE hist")
+        conn.commit()
+        _has_stat = c.execute(
+            "SELECT COUNT(*) FROM hist.sqlite_master WHERE name='sqlite_stat1'").fetchone()[0]
+        _n_stat = 0
+        if _has_stat:
+            _n_stat = c.execute(
+                "SELECT COUNT(*) FROM hist.sqlite_stat1 WHERE tbl LIKE 'ai_player_%'").fetchone()[0]
+        if _n_stat:
+            print(f"[MIGRATE-PK] ANALYZE 완료 (hist.sqlite_stat1 {_n_stat}행)")
+        else:
+            # [2026-09] 표가 비어 있는 상태(새 세이브)에서 ANALYZE를 돌면
+            # SQLite가 통계 행 자체를 안 만든다. 그러면 나중에 26만 행이
+            # 들어와도 통계는 여전히 없는 채라, "player_id만으로 거는
+            # 조회"가 전부 전체 스캔이 된다(신민용 리포트 "새 선수 생성할
+            # 때 멈춘다"의 실제 원인이 이것이었다). 그래서 이 프로젝트는
+            # skip-scan에 성능을 의존하지 않는다 — 그런 조회는 전부
+            # 연도 조건을 명시하거나 GROUP BY 한 번으로 바꿔뒀다.
+            # 여기서는 사실을 정확히 남기기만 한다(경고가 아니라 정상 상황).
+            print("[MIGRATE-PK] hist.sqlite_stat1 없음(표가 비어 있어 정상) — "
+                  "선수별 조회는 통계에 의존하지 않도록 이미 고쳐져 있다")
+    except sqlite3.OperationalError as _e:
+        print(f"[MIGRATE-PK] 경고: ANALYZE 실패({_e}) — 연도 명시 쿼리로 동작은 유지된다")
+
+    c.execute("INSERT OR REPLACE INTO meta(key, value) "
+              "VALUES('history_pk_year_first_v1','1')")
+    conn.commit()
+    try:
+        conn.execute("VACUUM hist")
+    except sqlite3.OperationalError:
+        pass
+    print(f"[MIGRATE-PK] 선수 이력 PK 재설계 완료 {_t_mig.perf_counter()-_t0:.2f}s "
+          f"(백업 보존: {_os.path.basename(bak)} — 첫 연도전환 확인 후 삭제해도 된다)")
+
+
 def _migrate_history_db_split():
     """[2026-08 신설, DB 분리 — "선수 검색 은퇴 선수 기록이 전부 마지막
     팀으로 도배된다" 버그 조사 중 발견한 렉 원인 후속 조치] 선수 이력
@@ -3771,20 +4070,25 @@ def _migrate_orphaned_ai_players():
               AND NOT EXISTS (SELECT 1 FROM ai_players_retired r WHERE r.id=ph.player_id)
         """).fetchall()]
         if orphan_ids:
+            # [2026-09 재작성] 예전엔 orphan_ids를 청크로 쪼개
+            # "WHERE player_id IN (...)"를 여러 번 돌렸다. PK가
+            # (year, player_id)로 바뀐 뒤로는 player_id 단독 조건이
+            # sqlite_stat1(ANALYZE) 없이는 전체 스캔이라, 청크 수만큼
+            # 표를 통째로 훑게 된다(refresh_career_years와 같은 함정).
+            # 표를 한 번만 순회하고 파이썬에서 고아 id만 골라낸다.
+            _orphans = set(orphan_ids)
             last_pos = {}
-            for r in _chunked_in(
-                    c, "SELECT player_id, position, year FROM hist.ai_player_position_history "
-                       "WHERE player_id IN ({ph})", orphan_ids):
-                pid = r["player_id"]
-                if pid not in last_pos or r["year"] > last_pos[pid][1]:
-                    last_pos[pid] = (r["position"], r["year"])
+            for _pid, _pos, _yr in c.execute(
+                    "SELECT player_id, position, year "
+                    "FROM hist.ai_player_position_history").fetchall():
+                if _pid in _orphans and (_pid not in last_pos or _yr > last_pos[_pid][1]):
+                    last_pos[_pid] = (_pos, _yr)
             last_ovr = {}
-            for r in _chunked_in(
-                    c, "SELECT player_id, ovr, year FROM hist.ai_player_ovr_history "
-                       "WHERE player_id IN ({ph})", orphan_ids):
-                pid = r["player_id"]
-                if pid not in last_ovr or r["year"] > last_ovr[pid][1]:
-                    last_ovr[pid] = (r["ovr"], r["year"])
+            for _pid, _ovr, _yr in c.execute(
+                    "SELECT player_id, ovr, year "
+                    "FROM hist.ai_player_ovr_history").fetchall():
+                if _pid in _orphans and (_pid not in last_ovr or _yr > last_ovr[_pid][1]):
+                    last_ovr[_pid] = (_ovr, _yr)
             nat_by_id = {}
             for r in _chunked_in(
                     c, "SELECT DISTINCT player_id, country FROM intl_squad "
@@ -4231,7 +4535,23 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
     삭제는 그대로 다 수행). 실제 선수단 재생성은 그 다음 사용자가
     "새 게임"→"생성"/"랜덤 생성"을 눌러 reset_game_data()가 (skip 없이)
     다시 호출되는 시점에 진행률 창과 함께 정식으로 일어난다."""
+    # [2026-09 신설, 신민용 리포트: "새 선수 생성할 때 이렇게 멈추는데?"]
+    # 새 게임(세계 생성) 경로는 단계가 10개가 넘는데 여태 구간 계측이
+    # 하나도 없어서, 멈춘 것처럼 보일 때 어디가 범인인지 알 방법이 없었다
+    # (진행률 콜백이 도는 _regenerate_ai_players 말고는 전부 깜깜이다).
+    # 화면이 굳는 동안에도 터미널과 live_sim.log에 단계가 찍히게 한다.
+    import time as _t_rst
+    _rst_t0 = _t_rst.perf_counter()
+    _rst_marks = []
+
+    def _rst_mark(label):
+        _now = _t_rst.perf_counter()
+        _prev = _rst_marks[-1][1] if _rst_marks else _rst_t0
+        _rst_marks.append((label, _now))
+        print(f"[RESET] {label} {_now - _prev:.2f}s", flush=True)
+
     init_db()  # 마이그레이션 적용
+    _rst_mark("init_db")
     conn = get_conn(); c = conn.cursor()
     # [2026-08 버그수정, 신민용 리포트: "no such table: team_power_rating"
     # (완전히 새 설치본 등 파워랭킹 화면을 한 번도 연 적 없는 DB에서 새
@@ -4302,6 +4622,16 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
               "sc_tournaments","sc_entries","sc_matches","sc_history",
               "cwc_tournaments","cwc_entries","cwc_matches",
               "cup_tournaments","cup_entries","cup_matches","cup_history",
+              # [2026-09 버그수정, 신민용 리포트: "새 게임을 시작해도 이전
+              # 세계관의 3부/4부 컵대회가 그대로 남아있다"] lower_cup_*
+              # (competition/lower_cup_engine.py, 2026-09 신설)는 바로 위
+              # cup_*와 완전히 같은 구조·같은 수명인데 이 삭제 목록에만
+              # 빠져 있었다 — 이 프로젝트가 el_*/ecl_*/sc_*에서 이미 세 번
+              # 겪은 "새 대회 표를 이 목록에 추가하는 걸 깜빡함" 패턴의
+              # 네 번째 재발이다. team_id/league_id가 새 게임에서도
+              # 재사용되는 구조라, 안 지우면 이전 판의 3부/4부 컵 대진과
+              # 우승 기록이 새 게임의 엉뚱한 팀 것으로 그대로 남는다.
+              "lower_cup_tournaments","lower_cup_entries","lower_cup_matches","lower_cup_history",
               "po_pending_slots","po_tournaments","po_matches","po_history",
               # [2026-08 버그수정, 신민용 리포트: "새 게임(2000년) 시작했는데
               # 2001년 파워랭킹이 남아있다"] power_ranking.py의 8개 테이블
@@ -4406,12 +4736,16 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
             c.execute(f"DELETE FROM main.{_t}")
         except sqlite3.OperationalError:
             pass
+    _rst_mark("표 비우기(DELETE)")
     c.execute("UPDATE teams SET wins=0,draws=0,losses=0,goals_for=0,goals_against=0")
     _reset_teams_to_league_data(c)
+    _rst_mark("팀/리그 원본 복원")
     _regenerate_ai_players(c, progress_cb=progress_cb, skip_generation=skip_ai_regen)
+    _rst_mark("선수단 재생성" + (" (건너뜀)" if skip_ai_regen else ""))
     _reset_formations_from_seed(c)
     _reset_club_strength(c)
     conn.commit()
+    _rst_mark("포메이션/클럽전력 + commit")
     # season_state가 방금 통째로 지워졌으므로 get_state() 캐시도 반드시
     # 비워야 한다 — 안 그러면 새 게임 시작 직후에도 이전 플레이의 연도/
     # 주차가 캐시에 남아 화면에 계속 보이는 버그가 생긴다.
@@ -4420,6 +4754,22 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
         game_engine._invalidate_state_cache()
     except Exception:
         pass
+
+    # [2026-09 신설, 신민용 지적: "새 게임 할 때 live_sim.log도 삭제하고
+    # 다시 시작하는 로직을 안 만들면 계속 쌓일듯"] 위의 DELETE 목록과
+    # 완전히 같은 취지인데, 대상이 DB 테이블이 아니라 파일(game_engine.py
+    # 옆 live_sim.log)이라 그 목록에 안 걸려 있었다 — 새 게임을 시작해도
+    # 이전 판의 계측 줄이 그대로 남아, tools/time_probe.py처럼 로그 끝에서
+    # "[PERF] 연도전환 총"을 찾는 도구가 어느 판의 수치인지 구분할 수
+    # 없었다. 통째로 지우지 않고 live_sim.prev.log로 한 세대 넘긴다
+    # (game_engine.reset_live_log 주석 참고). 로그는 진단용 부산물이라
+    # 실패해도 새 게임 진행을 막으면 안 된다.
+    try:
+        import game_engine
+        game_engine.reset_live_log()
+    except Exception:
+        pass
+    _rst_mark("상태캐시 무효화 + 로그 회전")
 
     # [2026-08 신설, 신민용 리포트: "은퇴 이후 새 게임을 반복할수록 렉이
     # 쌓이는 것 같다"] 실제 세이브 4개(설치 직후/1트/2트/3트)를 dbstat으로
@@ -4438,6 +4788,7 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
     # 새 게임을 누를 때만 1회 도는 작업이라(인메모리 DB 기준 1초 내외)
     # 실제 플레이 중 버튼 반응성에는 영향이 없다.
     conn.execute("VACUUM")
+    _rst_mark("VACUUM(main)")
     # [2026-08 DB 분리] 위 DELETE 목록의 hist.ai_player_ovr_history/
     # hist.ai_player_position_history도 방금 대량 삭제됐다 — bare VACUUM은
     # main만 정리하므로 hist도 따로 정리해야 history.db 파일 크기가
@@ -4446,7 +4797,19 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
         conn.execute("VACUUM hist")
     except sqlite3.OperationalError:
         pass
+    _rst_mark("VACUUM(hist)")
     conn.close()
+    _rst_total = _t_rst.perf_counter() - _rst_t0
+    _rst_detail = " | ".join(
+        f"{_lab} {_tm - (_rst_marks[_i-1][1] if _i else _rst_t0):.2f}s"
+        for _i, (_lab, _tm) in enumerate(_rst_marks))
+    print(f"[RESET] 새 게임 세계 생성 총 {_rst_total:.2f}s ({_rst_detail})", flush=True)
+    try:
+        import game_engine
+        game_engine._live_debug(
+            f"[RESET] 새 게임 세계 생성 총 {_rst_total:.2f}s ({_rst_detail})")
+    except Exception:
+        pass
 
 # ─── OVR 가중치 ───────────────────────────────────────────────
 WEIGHTS = {
@@ -6815,6 +7178,27 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
          dribbling,tackling,heading,positioning,setpiece,
          mental,confidence,leadership,concentration,ovr,age,sub_role,nationality)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", _rows)
+    # [2026-09 버그수정, 신민용 리포트: "첫 입단인데 계약년도만 뜨고
+    # 계약기간이 안 뜬다 — 84억(계약년도:2000) 말고 84억(계약:5년)로
+    # 떠야지"] ai_lifecycle.py의 신인생성 3곳(은퇴대체/스쿼드보충 등)은
+    # 전부 contract_end_year/created_year를 채워서 만드는데, 정작 이
+    # 최초 월드시드(새 게임 시작 시 전 세계 스쿼드 최초 생성)만 이 두
+    # 컬럼을 안 채우고 있었다 — 그래서 게임 시작 연도(대개 2000년)에
+    # 데뷔한 것으로 보이는 모든 선수가 "몇 년 계약인지 모른다"는 폴백
+    # 표시로 빠졌다. 방금 넣은 행들은 AUTOINCREMENT라 직후 MAX(id)부터
+    # 역산하면 정확히 그 id 범위를 알 수 있다(이 함수 호출 동안 다른
+    # 코드가 ai_players에 끼어들 일이 없는 단일 스레드 순차 실행이라
+    # 안전) — cursor.lastrowid는 executemany 뒤에는 신뢰할 수 없어서
+    # (직접 확인: executemany 후 0을 반환) 쓰지 않는다.
+    _last_id = c.execute("SELECT MAX(id) FROM ai_players").fetchone()[0]
+    if _last_id and _rows:
+        _first_id = _last_id - len(_rows) + 1
+        _gsy = get_game_start_year()
+        _contract_updates = [(_gsy + random.randint(3, 5), _gsy, _pid)
+                              for _pid in range(_first_id, _last_id + 1)]
+        c.executemany(
+            "UPDATE ai_players SET contract_end_year=?, created_year=? WHERE id=?",
+            _contract_updates)
 
 
 def _gen_ai_stats(pos, target):

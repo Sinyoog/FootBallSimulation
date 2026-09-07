@@ -2591,11 +2591,19 @@ class WorldBrowserWindow(QDialog):
         입단/방출)로 보여주는 게 낫다는 지적 — 저장값 자체(다른 곳에서도
         읽을 수 있으니)는 안 건드리고 표시할 때만 이렇게 단순화해서
         보여준다. 정확한 매핑: 일반 이적시장(리그내/국내 타부수/국제
-        이동)·명문팀 스카우팅으로 새로 온 선수=이적, 임대(is_loan)=오퍼,
-        은퇴 대체로 새로 합류=입단, 명문팀 스카우팅으로 밀려난 반대급부
-        선수=방출, 임대 복귀=복귀."""
+        이동)·명문팀 스카우팅으로 새로 온 선수=이적, 은퇴 대체로 새로
+        합류=입단, 명문팀 스카우팅으로 밀려난 반대급부 선수=방출, 임대
+        복귀=복귀.
+
+        [2026-09 수정, 신민용 리포트: "팀명엔 (임대)로 뜨는데 요약 줄엔
+        오퍼+이적료+계약N년으로 떠서 마치 완전 이적한 것처럼 보인다"]
+        원래 "임대(is_loan)=오퍼"였던 매핑이 바로 이 혼란의 원인이었다 —
+        이제 임대는 오퍼가 아니라 있는 그대로 "임대"로 보여준다(금액 쪽도
+        _populate_player_team_box에서 "이적료"가 아니라 "임대료"로,
+        완전 이적료의 10~20%만 표시하도록 같이 수정했다 — 이 함수는 그냥
+        라벨 문자열만 결정)."""
         if is_loan:
-            return "오퍼"
+            return "임대"
         _MAP = {
             "리그내": "이적", "국내 타부수": "이적", "국제 이동": "이적",
             "명문팀 스카우팅": "이적",
@@ -2633,24 +2641,31 @@ class WorldBrowserWindow(QDialog):
             record = f"⚽ {stat.get('goals', 0)}골  🅰 {stat.get('assists', 0)}A"
         return self._two_line_cell(main_text, color, record, bold=True)
 
-    def _cl_award_summary_cell(self, n_cl, n_el, n_ecl):
+    def _multi_award_summary_cell(self, pairs):
         """[2026-08 신설, 신민용 확정: "클럽 대항전 수상 합계는 하나로
         합치지 않고 파랑(챔스)/주황(유로파)/초록(컨퍼런스) 숫자를 한 칸 씩
-        띄워서 따로 보여준다, 0회인 대회는 생략"] '수상' 요약 행의 클럽
-        대항전 칸 전용 — 셀 하나에 색이 다른 숫자를 최대 3개까지 나란히
-        배치한다. 전부 0이면 완전히 빈 칸.
+        띄워서 따로 보여준다, 0회인 대회는 생략"] '수상' 요약 행에서 셀
+        하나에 색이 다른 숫자를 여러 개 나란히 배치하는 범용 헬퍼 —
+        pairs는 [(값, 색상), ...]. 값이 0/None인 항목은 통째로 생략하고,
+        전부 0이면 완전히 빈 칸.
         [2026-08 버그수정, 신민용 리포트: "클럽 대항전 칸만 비어 보인다"]
         setCellWidget으로 넣는 QWidget은 옆 칸들(QTableWidgetItem +
         setBackground("#2a2a2a"))과 달리 배경을 안 넣으면 기본 배경(투명/
         회색)이 그대로 드러나서, 값이 있든 없든 그 칸만 튀어 보였다.
-        같은 배경색을 명시해서 통일한다."""
+        같은 배경색을 명시해서 통일한다.
+        [2026-09 확장, 신민용 요청: "3부/4부 우승도 국내컵 칸에 청록색
+        숫자로 같이 뜨게 해달라 — 클럽 대항전처럼"] 원래 클럽 대항전
+        전용(_cl_award_summary_cell, 3색 고정)이던 이 위젯을 범용으로
+        빼서, 국내컵 칸(_cup_award_summary_cell, 2색: 국내컵/3·4부컵)도
+        같은 위젯을 재사용하게 했다 — 렌더링 로직 중복을 피하기 위함이라
+        기존 클럽 대항전 칸의 동작·색상은 그대로다."""
         w = QWidget()
         w.setStyleSheet("background:#2a2a2a;")
         lay = QHBoxLayout(w)
         lay.setContentsMargins(6, 4, 6, 4)
         lay.setSpacing(8)
         lay.addStretch()
-        for n, color in ((n_cl, "#1E4DB7"), (n_el, "#F28C28"), (n_ecl, "#20A464")):
+        for n, color in pairs:
             if not n:
                 continue   # 0회인 대회는 통째로 생략(칸 자체를 안 만듦)
             lbl = QLabel(str(n))
@@ -2659,6 +2674,29 @@ class WorldBrowserWindow(QDialog):
             lay.addWidget(lbl)
         lay.addStretch()
         return w
+
+    def _cl_award_summary_cell(self, n_cl, n_el, n_ecl):
+        """'수상' 요약 행의 클럽 대항전 칸 전용 — 파랑(챔스)/주황(유로파)/
+        초록(컨퍼런스) 숫자를 한 칸에 같이. 렌더링은 _multi_award_summary_
+        cell 공유(위 문서 참고)."""
+        return self._multi_award_summary_cell(
+            [(n_cl, "#1E4DB7"), (n_el, "#F28C28"), (n_ecl, "#20A464")])
+
+    def _cup_award_summary_cell(self, n_cup, n_lower_cup):
+        """[2026-09 신설, 신민용 요청: "팀/선수 검색에서 3부/4부 컵대회
+        우승하면 국내컵 상자 위에 청록색으로 1이 추가로 올라가야 한다 —
+        챔스/유로파/컨퍼런스가 한 상자에 각자 색으로 같이 뜨는 거랑
+        똑같이"] '수상' 요약 행의 국내컵 칸 전용 — 기존엔 이 칸이 그냥
+        awards["cup"] 하나만 보여주는 단순 QTableWidgetItem이었는데,
+        이제 국내컵(보라, #c48aff)과 3·4부컵(청록, #00A6A6 — world_
+        browser_window.py의 다른 곳에서 lower_cup을 나타낼 때 이미 쓰던
+        색과 통일)을 클럽 대항전 칸과 같은 방식으로 나란히 보여준다.
+        awards.get("lower_cup_champions")는 world_browser.get_team_
+        history/get_ai_player_career_history/get_my_player_career_
+        history가 이제 3·4부컵 우승을 cl/cl_champions에 안 섞고 이
+        전용 키로 따로 집계해준 값이다."""
+        return self._multi_award_summary_cell(
+            [(n_cup, "#c48aff"), (n_lower_cup, "#00A6A6")])
 
     def _on_team_selected(self, item):
         tid = item.data(Qt.ItemDataRole.UserRole)
@@ -2729,7 +2767,10 @@ class WorldBrowserWindow(QDialog):
             ("수상", None),
             ("", None),  # [2026-08 신설] 순위 칸 — 요약행이라 해당 없음, 빈칸
             (str(awards["league"]) if awards["league"] else "", "#4da6ff"),
-            (str(awards["cup"]) if awards["cup"] else "", "#c48aff"),
+            # [2026-09 수정] 3번 컬럼(국내컵)도 이제 setCellWidget으로
+            # 그리므로(클럽 대항전 칸과 같은 패턴), 여기서는 빈 텍스트
+            # 칸으로만 자리를 잡아두고 아래에서 위젯을 얹는다.
+            ("", None),
         ]
         for j, (text, color) in enumerate(award_labels):
             cell = QTableWidgetItem(text)
@@ -2738,6 +2779,12 @@ class WorldBrowserWindow(QDialog):
             cell.setForeground(QColor(color) if color else QColor("#ffcc00"))
             cell.setBackground(QColor("#2a2a2a"))
             award_tbl.setItem(0, j, cell)
+
+        # [2026-09 신설, 신민용 요청: "3부/4부 우승도 국내컵 위에 청록색
+        # 숫자로 얹어달라"] 국내컵 수상 칸(3번 컬럼) — 국내컵(보라)과
+        # 3·4부컵(청록) 숫자를 클럽 대항전 칸과 같은 방식으로 한 칸에 같이.
+        award_tbl.setCellWidget(0, 3, self._cup_award_summary_cell(
+            awards.get("cup", 0), awards.get("lower_cup_champions", 0)))
 
         # 클럽 대항전 수상 칸(4번 컬럼) — 파랑/주황/초록 숫자를 한 칸에 같이.
         award_tbl.setCellWidget(0, 4, self._cl_award_summary_cell(
@@ -2840,7 +2887,12 @@ class WorldBrowserWindow(QDialog):
             # 파랑(#1E4DB7), 유로파는 주황(#F28C28), 컨퍼런스는 초록
             # (#20A464). 워터폴 구조상 한 해엔 하나만 걸리므로 cl_kind
             # 하나로 색이 딱 정해진다(참가 자체가 없으면 회색).
-            _CL_KIND_COLOR = {"champions": "#1E4DB7", "europa": "#F28C28", "conference": "#20A464"}
+            # [2026-09 확장, 신민용 요청: "3부/4부 팀은 이 칸에 3부/4부 국내컵
+            # 기록을 대신 넣어달라"] cl_kind="lower_cup"(get_team_history/
+            # get_ai_player_career_history가 채움)이면 이 대회 색(#00A6A6,
+            # 청록 — center_panel.py 일정 색과 통일)을 쓴다.
+            _CL_KIND_COLOR = {"champions": "#1E4DB7", "europa": "#F28C28",
+                               "conference": "#20A464", "lower_cup": "#00A6A6"}
             cl_color = _CL_KIND_COLOR.get(entry.get("cl_kind"), "#555") if entry["cl"] else "#555"
             tbl.setCellWidget(i, 4, self._two_line_cell(cl_txt, cl_color, entry.get("cl_record")))
 
@@ -3148,6 +3200,10 @@ class WorldBrowserWindow(QDialog):
             award_bits.append(f"리그 우승 {awards['league']}회")
         if awards.get("cup"):
             award_bits.append(f"국내컵 우승 {awards['cup']}회")
+        # [2026-09 신설] 화면(국내컵 상자 위 청록색 숫자)과 맞춰 복사 텍스트에도
+        # 3·4부컵 우승 횟수를 국내컵 바로 뒤에 넣는다.
+        if awards.get("lower_cup_champions"):
+            award_bits.append(f"3부/4부 국내컵 우승 {awards['lower_cup_champions']}회")
         if awards.get("cl_champions"):
             award_bits.append(f"챔피언스리그(급) 우승 {awards['cl_champions']}회")
         if awards.get("el_champions"):
@@ -3179,7 +3235,14 @@ class WorldBrowserWindow(QDialog):
                     parts.append(f"국내컵: {entry['cup']}{rec}")
                 if entry.get("cl"):
                     rec = f" ({entry['cl_record']})" if entry.get("cl_record") else ""
-                    parts.append(f"클럽대항전: {entry['cl']}{rec}")
+                    # [2026-09 신설, 신민용 확정: "표시는 클럽 대항전 칸에
+                    # 하되, 복사할 때는 클럽 대항전이 아니라 3부/4부
+                    # 국내컵이라고 나오게 해야 한다"] 화면(테이블)은
+                    # cl_kind와 무관하게 항상 "클럽 대항전" 칸에 그리지만,
+                    # 복사 텍스트는 이 대회를 실제 CL/EL/ECL과 헷갈리지
+                    # 않도록 이 값이 lower_cup일 때만 라벨을 바꾼다.
+                    _cl_label = "3부/4부 국내컵" if entry.get("cl_kind") == "lower_cup" else "클럽대항전"
+                    parts.append(f"{_cl_label}: {entry['cl']}{rec}")
                 if entry.get("sc"):
                     rec = f" ({entry['sc_record']})" if entry.get("sc_record") else ""
                     parts.append(f"슈퍼컵: {entry['sc']}{rec}")
@@ -3272,6 +3335,8 @@ class WorldBrowserWindow(QDialog):
             award_bits.append(f"리그 우승 {awards['league']}회")
         if awards.get("cup"):
             award_bits.append(f"국내컵 우승 {awards['cup']}회")
+        if awards.get("lower_cup_champions"):
+            award_bits.append(f"3부/4부 국내컵 우승 {awards['lower_cup_champions']}회")
         if awards.get("cl_champions"):
             award_bits.append(f"챔피언스리그(급) 우승 {awards['cl_champions']}회")
         if awards.get("el_champions"):
@@ -3304,7 +3369,16 @@ class WorldBrowserWindow(QDialog):
                 entry = row["entry"] or {}
                 parts = [f"{row['year']}년 ({age_txt})", f"소속팀: {row['team_name']}"]
                 parts.append(f"포지션: {row['position']}" if row.get("position") else "포지션: -")
-                parts.append(f"OVR: {row['ovr']}" if row.get("ovr") else "OVR: -")
+                # [2026-09 버그수정, 신민용 리포트: "세계 축구 기록실 선수/
+                # 팀 검색에서 복사할 때도 OVR가 뜨면 안 된다(어려움
+                # 난이도)"] 바로 위 기본 정보 한 줄(ovr_text, 3317번째 줄)은
+                # is_hard_mode()로 이미 가리고 있었는데, 연도별 기록 줄의
+                # OVR만 그 체크가 빠져 있어서 어려움 난이도에서도 복사
+                # 텍스트에 실제 수치가 그대로 새어나갔다. 화면(펼침 상태)
+                # 도 같은 값을 쓰므로 여기서 한 번만 고치면 화면·복사
+                # 양쪽 다 맞는다.
+                parts.append(("OVR: -" if is_hard_mode()
+                              else (f"OVR: {row['ovr']}" if row.get("ovr") else "OVR: -")))
                 # [2026-08 신설, 신민용 요청: "복사할 때 년도별로 얘가
                 # 주전인지 아닌지 뜨는거지"] role은 이 기능 신설 이전
                 # 시즌엔 없을 수 있어(row.get("role") None) "역할: -"로.
@@ -3317,7 +3391,14 @@ class WorldBrowserWindow(QDialog):
                     parts.append(f"국내컵: {entry['cup']}{rec}")
                 if entry.get("cl"):
                     rec = f" ({entry['cl_record']})" if entry.get("cl_record") else ""
-                    parts.append(f"클럽대항전: {entry['cl']}{rec}")
+                    # [2026-09 신설, 신민용 확정: "표시는 클럽 대항전 칸에
+                    # 하되, 복사할 때는 클럽 대항전이 아니라 3부/4부
+                    # 국내컵이라고 나오게 해야 한다"] 화면(테이블)은
+                    # cl_kind와 무관하게 항상 "클럽 대항전" 칸에 그리지만,
+                    # 복사 텍스트는 이 대회를 실제 CL/EL/ECL과 헷갈리지
+                    # 않도록 이 값이 lower_cup일 때만 라벨을 바꾼다.
+                    _cl_label = "3부/4부 국내컵" if entry.get("cl_kind") == "lower_cup" else "클럽대항전"
+                    parts.append(f"{_cl_label}: {entry['cl']}{rec}")
                 if entry.get("sc"):
                     rec = f" ({entry['sc_record']})" if entry.get("sc_record") else ""
                     parts.append(f"슈퍼컵: {entry['sc']}{rec}")
@@ -3356,8 +3437,17 @@ class WorldBrowserWindow(QDialog):
                         # GK는 클린시트 대신 선방/실점/선방률(위 _comp_
                         # stat_cell과 완전히 같은 계산·표기)로 표시한다.
                         _is_gk_club = (d.get("position") == "GK")
+                        # [2026-09 신설, 신민용 확정: "복사할 때는 3부/4부
+                        # 국내컵이라고 따로 나오게"] "cl"과는 별개 키라서
+                        # _comp_stats.get("lower_cup")이 있을 때만 이 줄이
+                        # 추가되고, 실제 CL/EL/ECL 기록("cl")과 절대 섞이지
+                        # 않는다 — entry["cl_kind"]=="lower_cup"인 해엔
+                        # comp_match_counts(ai_lifecycle._snapshot_season_
+                        # ratings)가 애초에 "cl"이 아니라 "lower_cup" 키로만
+                        # 채워두므로 방어적 분기도 필요 없다.
                         _COMP_LABEL = {"league": "리그", "cup": "국내컵", "cl": "클럽대항전",
-                                       "sc": "슈퍼컵", "cwc": "클럽월드컵"}
+                                       "sc": "슈퍼컵", "cwc": "클럽월드컵",
+                                       "lower_cup": "3부/4부 국내컵"}
                         for _comp, _label in _COMP_LABEL.items():
                             _cs = _comp_stats.get(_comp)
                             if _cs:
@@ -3389,7 +3479,8 @@ class WorldBrowserWindow(QDialog):
                         _sal_line += f" [{_type_label}]"
                         _fee = entry.get("salary_fee") or 0
                         if _fee:
-                            _sal_line += f"  🤝 이적료 {fmt_money(_fee)}"
+                            _fee_label = "임대료" if entry.get("salary_is_loan") else "이적료"
+                            _sal_line += f"  🤝 {_fee_label} {fmt_money(_fee)}"
                         lines.append(_sal_line)
         lines.append("")
 
@@ -5196,7 +5287,9 @@ class WorldBrowserWindow(QDialog):
             ("", None),
             ("", None),
             (str(awards["league"]) if awards["league"] else "", "#4da6ff"),
-            (str(awards["cup"]) if awards["cup"] else "", "#c48aff"),
+            # [2026-09 수정] 6번 컬럼(국내컵)도 클럽 대항전 칸과 같은 패턴
+            # (setCellWidget)으로 그리므로 여기선 빈칸으로만 자리를 잡는다.
+            ("", None),
         ]
         for j, (text, color) in enumerate(award_labels):
             cell = QTableWidgetItem(text)
@@ -5205,6 +5298,10 @@ class WorldBrowserWindow(QDialog):
             cell.setForeground(QColor(color) if color else QColor("#ffcc00"))
             cell.setBackground(QColor("#2a2a2a"))
             award_tbl.setItem(0, j, cell)
+        # [2026-09 신설, 신민용 요청: "선수 검색도 국내컵 위에 3부/4부
+        # 우승을 청록색으로 얹어달라"] 국내컵 수상 칸(6번 컬럼).
+        award_tbl.setCellWidget(0, 6, self._cup_award_summary_cell(
+            awards.get("cup", 0), awards.get("lower_cup_champions", 0)))
         award_tbl.setCellWidget(0, 7, self._cl_award_summary_cell(
             awards.get("cl_champions", 0), awards.get("el_champions", 0),
             awards.get("ecl_champions", 0)))
@@ -5364,7 +5461,12 @@ class WorldBrowserWindow(QDialog):
         _expanded_years = self._player_team_expanded_years(player_id)
         _extra_stat_rows = sum(1 for e in years if (e.get("_comp_stats") or e.get("salary"))
                                 and e["year"] in _expanded_years)
-        _extra_award_rows = sum(1 for e in years if _awards_by_year.get(e["year"])
+        # [2026-09 버그수정] 아래 실제 렌더링 루프가 상반기 줄(_is_half)엔
+        # 상 목록을 아예 안 붙이도록 바뀌었으므로, 행수 사전계산도 같은
+        # 조건(not e.get("_is_half"))으로 맞춰야 한다 — 안 맞으면 상반기
+        # 줄만큼 표 행이 남아서 빈 줄이 생기거나 다음 연도 행과 어긋난다.
+        _extra_award_rows = sum(1 for e in years if not e.get("_is_half")
+                                 and _awards_by_year.get(e["year"])
                                  and e["year"] in _expanded_years)
         tbl.setRowCount(len(years) + _extra_stat_rows + _extra_award_rows)
         # [2026-08 신설] 복사 버튼용 — 화면에 그리는 것과 완전히 같은
@@ -5390,7 +5492,13 @@ class WorldBrowserWindow(QDialog):
             # 함수)가 읽을 데이터 자체가 없었으니 네 화면 모두 똑같이
             # 빠져 있었던 것 — 여기서 미리 조회해 아래 두 append 모두에
             # 실어준다(펼침 여부와 무관하게 복사는 항상 포함).
-            _year_awards = _awards_by_year.get(entry["year"])
+            # [2026-09 버그수정, 신민용 리포트: "이적한 해엔 상반기/하반기
+            # 팀 둘 다에 그 해 받은 상이 똑같이 뜬다 — 하반기 팀에만
+            # 떠야 한다"] _awards_by_year는 연도 단위로만 조회되므로(개인상
+            # 판정 자체가 시즌 종료 시점 하나로만 이뤄짐), 상반기 줄
+            # (entry["_is_half"])에는 아예 붙이지 않는다 — 같은 해 두 줄
+            # 모두에 같은 상 목록이 중복 표시되는 걸 막는다.
+            _year_awards = None if entry.get("_is_half") else _awards_by_year.get(entry["year"])
             # [2026-09 신설, 신민용 요청: "연도 클릭하면 아래에 평점/연봉/
             # 이적종류가 펼쳐지고 다시 클릭하면 접히는거지"] 펼침 상태를
             # 화살표로 표시하고, 클릭 핸들러가 이 칸에서 연도값을 다시
@@ -5508,7 +5616,7 @@ class WorldBrowserWindow(QDialog):
             # world_browser.get_ai_player_career_history/_half_season_
             # league_entry 참고)을 써야 한다.
             _ROLE_COLORS = {"주전": "#4da6ff", "로테이션": "#88ddaa",
-                            "대기": "#cccc66", "유망주": "#cc88ff"}
+                            "대기": "#cccc66", "유망주": "#cc88ff", "전력외": "#999999"}
             role_at_year = (entry.get("_half_role") if entry.get("_is_half")
                              else role_checkpoints.get(entry["year"]))
             if role_at_year:
@@ -5553,7 +5661,12 @@ class WorldBrowserWindow(QDialog):
             tbl.setCellWidget(row_idx, 6, self._two_line_cell(cup_txt, cup_color, entry.get("cup_record")))
 
             cl_txt = entry["cl"] or "-"
-            _CL_KIND_COLOR = {"champions": "#1E4DB7", "europa": "#F28C28", "conference": "#20A464"}
+            # [2026-09 확장, 신민용 요청: "3부/4부 팀은 이 칸에 3부/4부 국내컵
+            # 기록을 대신 넣어달라"] cl_kind="lower_cup"(get_team_history/
+            # get_ai_player_career_history가 채움)이면 이 대회 색(#00A6A6,
+            # 청록 — center_panel.py 일정 색과 통일)을 쓴다.
+            _CL_KIND_COLOR = {"champions": "#1E4DB7", "europa": "#F28C28",
+                               "conference": "#20A464", "lower_cup": "#00A6A6"}
             cl_color = _CL_KIND_COLOR.get(entry.get("cl_kind"), "#555") if entry["cl"] else "#555"
             tbl.setCellWidget(row_idx, 7, self._two_line_cell(cl_txt, cl_color, entry.get("cl_record")))
 
@@ -5581,9 +5694,14 @@ class WorldBrowserWindow(QDialog):
             _year_expanded = entry["year"] in _expanded
             _sal = entry.get("salary")
             if (_comp_stats or _sal) and _year_expanded:
+                # [2026-09 신설] "클럽 대항전" 칸(7번)은 cl_kind로 이미
+                # champions/europa/conference/lower_cup 중 하나의 색으로
+                # 정해져 있으므로(cl_color), lower_cup도 같은 칸·같은
+                # 색을 그대로 재사용한다 — 한 해에 둘 다 값이 있을 수
+                # 없으므로(3/4부 팀은 CL/EL/ECL 자격이 없음) 충돌 없음.
                 _COMP_COL_COLOR = {
                     "league": (5, lg_color), "cup": (6, cup_color), "cl": (7, cl_color),
-                    "sc": (8, sc_color), "cwc": (9, cwc_color),
+                    "sc": (8, sc_color), "cwc": (9, cwc_color), "lower_cup": (7, cl_color),
                 }
                 if _comp_stats:
                     for _comp, (_col, _color) in _COMP_COL_COLOR.items():
@@ -5643,7 +5761,12 @@ class WorldBrowserWindow(QDialog):
 
                     tbl.setSpan(row_idx, 2, 1, 3)
                     _fee = entry.get("salary_fee") or 0
-                    _fee_text = f"🤝 이적료 {fmt_money(_fee)}" if _fee else "-"
+                    # [2026-09 수정, 신민용 리포트: "임대인데 이적료라고
+                    # 뜨면 완전 이적처럼 보인다"] salary_is_loan이면
+                    # "임대료"로 — 금액 자체도 game_engine/ai_lifecycle
+                    # 쪽에서 이미 완전 이적료의 10~20%만 계산해서 넘어온다.
+                    _fee_label = "임대료" if entry.get("salary_is_loan") else "이적료"
+                    _fee_text = f"🤝 {_fee_label} {fmt_money(_fee)}" if _fee else "-"
                     _fee_item = QTableWidgetItem(_fee_text)
                     _fee_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                     _fee_item.setForeground(QColor("#9fd4a3") if _fee else QColor("#555"))
@@ -6062,12 +6185,13 @@ class WorldBrowserWindow(QDialog):
     # get_country_tournament_results가 예선/유로까지 정확히 구분해서
     # 계산해둔 값)로 세 그룹을 나눈다:
     #   지역컵 그룹  = region(지역컵) + euro(유로 본선) + euro_qual(유로 예선)
+    #                  + region_qual(지역컵 예선 — 폐지된 옛 골드컵 예선 기록)
     #   월드컵 그룹  = world(월드컵 본선) + wc_qual(월드컵 예선)
     #   네이션스컵 그룹 = continent(대륙컵/네이션스컵 본선, 유로 제외) + cont_qual(그 예선)
     # 화면 표기(종류/대회명 칸)는 그대로 두고 — 이 필터는 어떤 행을
     # "보여줄지"만 결정한다, "어떻게 보일지"는 안 바꾼다.
     _COUNTRY_RESULT_KIND_GROUPS = {
-        "region_group": {"region", "euro", "euro_qual"},
+        "region_group": {"region", "euro", "euro_qual", "region_qual"},
         "world_group": {"world", "wc_qual"},
         "continent_group": {"continent", "cont_qual"},
     }
@@ -6813,6 +6937,17 @@ class WorldBrowserWindow(QDialog):
 
         filt = QHBoxLayout()
         filt.setSpacing(8)
+        # [2026-09 신설, 신민용 요청: "컵 대회 검색에 컵대회/3부·4부 컵대회
+        # 상단 필터 두 개를 둬서 나눠 보여달라"] 기존 위젯/레이아웃은 그대로
+        # 두고, self._cup_kind("cup"/"lower_cup") 하나로 5개 메서드의 데이터
+        # 소스만 분기한다 — 화면 구조 자체는 손대지 않는다.
+        lbl_kind = QLabel("구분"); lbl_kind.setStyleSheet("color:#888;font-size:11px;")
+        self.cup_kind_combo = QComboBox()
+        self.cup_kind_combo.addItem("컵대회")
+        self.cup_kind_combo.addItem("3부·4부 컵대회")
+        self.cup_kind_combo.currentIndexChanged.connect(self._on_cup_kind_changed)
+        filt.addWidget(lbl_kind)
+        filt.addWidget(self.cup_kind_combo)
         lbl1 = QLabel("대륙"); lbl1.setStyleSheet("color:#888;font-size:11px;")
         self.cup_cont_combo = QComboBox()
         self.cup_cont_combo.addItem(_ALL)
@@ -6889,8 +7024,22 @@ class WorldBrowserWindow(QDialog):
         lay.addWidget(split, 1)
 
         self._cup_country_cache = []
+        self._cup_kind = "cup"
         self._refresh_cup_country_list()
         return w
+
+    def _on_cup_kind_changed(self, _idx):
+        """'컵대회'/'3부·4부 컵대회' 토글 — 오른쪽 패널을 초기화하고
+        왼쪽 나라 목록의 '기록 있음' 배지 소스를 바꿔서 다시 그린다."""
+        self._cup_kind = "lower_cup" if self.cup_kind_combo.currentIndex() == 1 else "cup"
+        self.cup_title.setText("← 왼쪽에서 나라를 선택하세요")
+        self.cup_title.setStyleSheet("color:#c48aff;font-size:14px;font-weight:bold;")
+        self.cup_sub.setText("")
+        self.cup_tbl.clear()
+        self.cup_tbl.setRowCount(0)
+        self.cup_tbl.setColumnCount(0)
+        self.cup_rank_btn.setEnabled(False)
+        self._refresh_cup_country_list()
 
     def _refresh_cup_country_list(self, *_a):
         import time as _time_wc
@@ -6906,7 +7055,9 @@ class WorldBrowserWindow(QDialog):
 
         # [2026-08 최적화] 나라마다 wb.has_cup_data()를 따로 부르던 N+1
         # 쿼리를 1회 배치 조회로 교체 — 표시되는 배지 결과는 동일하다.
-        _cup_data_ids = wb.has_cup_data_bulk()
+        _cup_data_ids = (wb.has_lower_cup_data_bulk()
+                          if getattr(self, "_cup_kind", "cup") == "lower_cup"
+                          else wb.has_cup_data_bulk())
         _wc_t2 = _time_wc.perf_counter()
 
         self.cup_country_list.clear()
@@ -6972,15 +7123,21 @@ class WorldBrowserWindow(QDialog):
         cid = item.data(Qt.ItemDataRole.UserRole)
         if cid is None:
             return
-        rows = wb.get_cup_history(cid)
+        is_lower = getattr(self, "_cup_kind", "cup") == "lower_cup"
+        rows = wb.get_lower_cup_history(cid) if is_lower else wb.get_cup_history(cid)
         cname = item.data(Qt.ItemDataRole.UserRole + 1) or ""
-        self.cup_title.setText(f"🎖️ {cname} 역대 컵대회 기록")
+        icon = "🏅" if is_lower else "🎖️"
+        color = "#00A6A6" if is_lower else "#c48aff"
+        kind_label = "3부·4부컵" if is_lower else "컵대회"
+        self.cup_title.setText(f"{icon} {cname} 역대 {kind_label} 기록")
+        self.cup_title.setStyleSheet(f"color:{color};font-size:14px;font-weight:bold;")
         self._cup_copy_country_id = cid
         self._cup_copy_country_name = cname
+        self._cup_copy_is_lower = is_lower
         self.cup_rank_btn.setEnabled(bool(rows))
         self.cup_sub.setText(
             f"{rows[0]['name']}  ·  완료된 대회 {len(rows)}건" if rows
-            else "이 나라에서 완료된 컵대회 기록이 없습니다")
+            else f"이 나라에서 완료된 {kind_label} 기록이 없습니다")
 
         cols = ["연도", "대회명", "참여팀", "🏆 우승", "🥈 준우승", "🥉 3위", "4위"]
         tbl = self.cup_tbl
@@ -7023,20 +7180,26 @@ class WorldBrowserWindow(QDialog):
             return
         name_item = self.cup_tbl.item(row, 1)
         title = f"{item.text()}년 {name_item.text() if name_item else ''}"
-        detail = wb.get_cup_tournament_detail(tid)
+        is_lower = getattr(self, "_cup_copy_is_lower", False)
+        detail = (wb.get_lower_cup_tournament_detail(tid) if is_lower
+                  else wb.get_cup_tournament_detail(tid))
         dlg = TournamentDetailDialog(title, detail, team_based=True, parent=self)
         dlg.exec()
 
     def _on_cup_rank_leaders_clicked(self):
         cid = getattr(self, "_cup_copy_country_id", None)
         cname = getattr(self, "_cup_copy_country_name", "")
+        is_lower = getattr(self, "_cup_copy_is_lower", False)
         if cid is None:
             return
-        data = wb.get_cup_rank_leaders(cid)
-        dlg = RankLeadersDialog(f"{cname} 컵대회", data,
+        data = wb.get_lower_cup_rank_leaders(cid) if is_lower else wb.get_cup_rank_leaders(cid)
+        label = f"{cname} 3부·4부컵" if is_lower else f"{cname} 컵대회"
+        empty = ("아직 완료된 3부·4부컵 기록이 없습니다" if is_lower
+                 else "아직 완료된 컵대회 기록이 없습니다")
+        dlg = RankLeadersDialog(label, data,
                                  keys=("winner", "runner_up", "third", "fourth"),
                                  key_labels=["🥇 1위 팀", "🥈 2위 팀", "🥉 3위 팀", "4위 팀"],
-                                 empty_msg="아직 완료된 컵대회 기록이 없습니다", parent=self)
+                                 empty_msg=empty, parent=self)
         dlg.show()
 
     # ─────────────────────────────────────────
@@ -7254,6 +7417,7 @@ class WorldBrowserWindow(QDialog):
                 wb.get_club_comp_award_kinds, wb.get_club_comp_awards,
                 "이 해는 클럽 대항전 개인상 기록이 없습니다")),
             ("league", "리그전", self._build_ia_league_panel),
+            ("cup", "컵대회", self._build_ia_cup_panel),
         ]
         for idx, (key, label, builder) in enumerate(cats):
             btn = QPushButton(label)
@@ -7535,6 +7699,8 @@ class WorldBrowserWindow(QDialog):
                 self._reload_ia_filterable_table(prefix)
         if getattr(self, "ia_league_year_list", None) is not None:
             self._refresh_ia_league_table_if_selected()
+        if getattr(self, "ia_cup_year_list", None) is not None:
+            self._refresh_ia_cup_table_if_selected()
 
     # [2026-09 신설, 신민용 확정: "리그는 구현이 제대로 안 됨" → 후속:
     # "리그 필터는 대회/부문이 아니라 국가|몇부|부문으로 가야 한다 /
@@ -7755,6 +7921,200 @@ class WorldBrowserWindow(QDialog):
                     cell.setForeground(Qt.GlobalColor.green)
                 tbl.setItem(i, j, cell)
         self._show_empty_state(tbl, rows, "이 조건에 맞는 리그전 개인상 기록이 없습니다", len(cols))
+        self._grow_to_fit(tbl, stretch_col=1)
+
+    # [2026-09 신설, 신민용 요청: "개인상에 컵 대회도 추가할려고 해 —
+    # 컵 대회를 누르면 좌측에 년도가 뜨고 그걸 누르면 위에 필터에는
+    # 국가 필터 그리고 컵/3부·4부 선택하는 필터 그리고 상 종류를 나눌
+    # 거야"] 리그전 패널(_build_ia_league_panel)과 완전히 같은 골격
+    # (좌측 연도 목록 + 우측 국가/구분/부문 3단 캐스케이딩 필터 + 표) —
+    # "부"(tier) 축 대신 "구분"(컵대회/3부·4부컵, category 컬럼) 축을
+    # 쓴다는 점만 다르다. 국내컵과 3부·4부컵은 나라마다 대회 이름 자체가
+    # 전부 달라(CL/EL/ECL처럼 대륙 접두어로 구분하는 방식이 아님) 국가를
+    # 직접 필터축으로 둬야 어느 나라 대회인지 바로 알 수 있다.
+    def _build_ia_cup_panel(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        row = QHBoxLayout()
+        row.setSpacing(6)
+
+        self.ia_cup_year_list = QListWidget()
+        self.ia_cup_year_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.ia_cup_year_list.setMaximumWidth(130)
+        self.ia_cup_year_list.setStyleSheet(_IA_YEAR_LIST_STYLE)
+        self.ia_cup_year_list.itemClicked.connect(self._on_ia_cup_year_selected)
+        row.addWidget(self.ia_cup_year_list)
+
+        right = QWidget()
+        right_lay = QVBoxLayout(right)
+        right_lay.setContentsMargins(8, 0, 0, 0)
+
+        filt_bar_w = QWidget()
+        filt_bar = QHBoxLayout(filt_bar_w)
+        filt_bar.setContentsMargins(0, 0, 0, 6)
+        filt_bar.setSpacing(6)
+        c_lbl = QLabel("국가"); c_lbl.setStyleSheet("color:#888;font-size:11px;")
+        filt_bar.addWidget(c_lbl)
+        self.ia_cup_country_combo = QComboBox()
+        self.ia_cup_country_combo.currentIndexChanged.connect(self._on_ia_cup_country_changed)
+        self._make_combo_typable(self.ia_cup_country_combo)
+        self.ia_cup_country_combo.setMinimumWidth(150)
+        filt_bar.addWidget(self.ia_cup_country_combo)
+        t_lbl = QLabel("구분"); t_lbl.setStyleSheet("color:#888;font-size:11px;")
+        filt_bar.addWidget(t_lbl)
+        self.ia_cup_type_combo = QComboBox()
+        self.ia_cup_type_combo.addItem("컵대회", "cup")
+        self.ia_cup_type_combo.addItem("3부·4부컵", "lower_cup")
+        self.ia_cup_type_combo.currentIndexChanged.connect(self._on_ia_cup_type_changed)
+        self.ia_cup_type_combo.setMinimumWidth(110)
+        filt_bar.addWidget(self.ia_cup_type_combo)
+        k_lbl = QLabel("부문"); k_lbl.setStyleSheet("color:#888;font-size:11px;")
+        filt_bar.addWidget(k_lbl)
+        self.ia_cup_kind_combo = QComboBox()
+        self.ia_cup_kind_combo.currentIndexChanged.connect(self._on_ia_cup_kind_changed)
+        self._make_combo_typable(self.ia_cup_kind_combo)
+        self.ia_cup_kind_combo.setMinimumWidth(150)
+        filt_bar.addWidget(self.ia_cup_kind_combo)
+        filt_bar.addStretch()
+        filt_bar_w.setVisible(False)
+        right_lay.addWidget(filt_bar_w)
+        self.ia_cup_filt_bar = filt_bar_w
+
+        self.ia_cup_placeholder = QLabel("← 연도를 선택하세요")
+        self.ia_cup_placeholder.setStyleSheet("color:#888;font-size:12px;")
+        right_lay.addWidget(self.ia_cup_placeholder)
+
+        self.ia_cup_title = QLabel("")
+        self.ia_cup_title.setStyleSheet("color:#00A6A6;font-size:12px;font-weight:bold;")
+        self.ia_cup_title.setVisible(False)
+        right_lay.addWidget(self.ia_cup_title)
+
+        tbl = QTableWidget(0, 0)
+        tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        tbl.verticalHeader().setVisible(False)
+        tbl.cellDoubleClicked.connect(
+            lambda row_, _col: self._on_ia_player_row_clicked(self.ia_cup_tbl, row_))
+        tbl.setVisible(False)
+        _enable_plain_copy(tbl)
+        self.ia_cup_tbl = tbl
+        right_lay.addWidget(tbl, 1)
+
+        row.addWidget(right, 1)
+        lay.addLayout(row, 1)
+
+        self._refresh_ia_cup_year_list()
+        return w
+
+    def _refresh_ia_cup_year_list(self):
+        self.ia_cup_year_list.clear()
+        for year in wb.get_cup_award_years():
+            item = QListWidgetItem(str(year))
+            item.setData(Qt.ItemDataRole.UserRole, year)
+            self.ia_cup_year_list.addItem(item)
+
+    def _ia_cup_current_year(self):
+        item = self.ia_cup_year_list.currentItem()
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+    def _ia_cup_current_type(self):
+        return self.ia_cup_type_combo.currentData() or "cup"
+
+    def _on_ia_cup_year_selected(self, _item):
+        year = self._ia_cup_current_year()
+        if year is None:
+            return
+        self.ia_cup_placeholder.setVisible(False)
+        self.ia_cup_filt_bar.setVisible(True)
+        self.ia_cup_title.setVisible(True)
+        self.ia_cup_tbl.setVisible(True)
+        self._reload_ia_cup_country_combo(year)
+
+    def _reload_ia_cup_country_combo(self, year):
+        combo = self.ia_cup_country_combo
+        prev = combo.currentText()
+        combo.blockSignals(True)
+        combo.clear()
+        countries = wb.get_cup_award_countries(year)
+        combo.addItems(countries)
+        idx = combo.findText(prev)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+        self._reload_ia_cup_kind_combo()
+
+    def _on_ia_cup_country_changed(self, _idx):
+        self._reload_ia_cup_kind_combo()
+
+    def _on_ia_cup_type_changed(self, _idx):
+        self._reload_ia_cup_kind_combo()
+
+    def _reload_ia_cup_kind_combo(self):
+        year = self._ia_cup_current_year()
+        country = self.ia_cup_country_combo.currentText() or None
+        cup_type = self._ia_cup_current_type()
+        combo = self.ia_cup_kind_combo
+        prev = combo.currentText()
+        combo.blockSignals(True)
+        combo.clear()
+        kinds = wb.get_cup_award_kinds(year, kind=cup_type, country=country) if year is not None else []
+        combo.addItems(kinds)
+        idx = combo.findText(prev)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+        self._reload_ia_cup_table()
+
+    def _on_ia_cup_kind_changed(self, _idx):
+        self._reload_ia_cup_table()
+
+    def _reload_ia_cup_table(self):
+        year = self._ia_cup_current_year()
+        if year is None:
+            return
+        country = self.ia_cup_country_combo.currentText() or None
+        cup_type = self._ia_cup_current_type()
+        award_kind = self.ia_cup_kind_combo.currentText() or None
+        rows = wb.get_cup_awards(year, kind=cup_type, country=country, award_kind=award_kind)
+        type_label = self.ia_cup_type_combo.currentText()
+        self.ia_cup_title.setText(f"{country or ''} {type_label} · {award_kind or ''}".strip())
+        self._fill_ia_cup_table(rows)
+
+    def _refresh_ia_cup_table_if_selected(self):
+        # [2026-09 신설] 이름/국적 변경 시 실시간 반영용 — 리그전 패널의
+        # _refresh_ia_league_table_if_selected와 동일한 원칙(필터는 그대로
+        # 두고 표만 다시 그림).
+        if self._ia_cup_current_year() is not None and self.ia_cup_tbl.isVisible():
+            self._reload_ia_cup_table()
+
+    def _fill_ia_cup_table(self, rows):
+        """리그전 패널의 _fill_ia_league_table과 완전히 같은 표 구성
+        (GK는 골/도움 대신 선방/실점)."""
+        tbl = self.ia_cup_tbl
+        cols = ["순위", "선수", "국적", "팀", "포지션", "평점", "골", "도움", "선방", "실점"]
+        tbl.clear()
+        tbl.setRowCount(len(rows))
+        tbl.setColumnCount(len(cols))
+        tbl.setHorizontalHeaderLabels(cols)
+        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for i, r in enumerate(rows):
+            rating = r.get("score_rating")
+            is_gk = (r.get("position") or "") == "GK"
+            vals = [str(r["rank"]), r["name"], r.get("nationality") or "",
+                    r.get("team_name") or "", r.get("position") or "",
+                    f"{rating:.2f}" if rating else "-",
+                    str(int(r.get("stat_goals") or 0)), str(int(r.get("stat_assists") or 0)),
+                    str(int(r.get("stat_saves") or 0)) if is_gk else "-",
+                    str(int(r.get("stat_goals_conceded") or 0)) if is_gk else "-"]
+            for j, v in enumerate(vals):
+                cell = QTableWidgetItem(v)
+                cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if j == 0:
+                    cell.setData(Qt.ItemDataRole.UserRole, r["player_id"])
+                if r["player_id"] == wb.MY_PLAYER_ID:
+                    cell.setForeground(Qt.GlobalColor.green)
+                tbl.setItem(i, j, cell)
+        self._show_empty_state(tbl, rows, "이 조건에 맞는 컵 대회 개인상 기록이 없습니다", len(cols))
         self._grow_to_fit(tbl, stretch_col=1)
 
     # [2026-09 신설, 신민용 확정: "4열이 아니라 좌측 연도 목록 + 우측

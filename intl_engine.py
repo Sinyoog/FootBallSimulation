@@ -1175,13 +1175,17 @@ def start_qualifying_if_needed(year):
         return  # 이미 이 해 예선이 생성됨(유로/골드컵) → 중복 방지
     _clear_entry_cache()
     my_nats, nat_info, committed = _gather_nat_context(p)
-    # [2026-09 신설, 신민용 확정: "북미 지역컵 2개를 합쳐서 골드컵, 예선전을
-    # 거쳐 본선에 오르는 원리로"] 골드컵도 유로와 같은 cont_qual 메커니즘을
-    # 쓴다 — 다만 유로처럼 두 주기(2004/2001) 모두에 따로 열리는 게 아니라
-    # 지역컵 주기(2001,05,09..) 한 번만 연다(옛 UNCAF/카리브 지역컵 2개를
-    # 이 대회 하나로 흡수 통합했으므로). 그래서 유럽은 무조건 만들고,
-    # 골드컵(북미)은 is_euro_cycle(=지역컵 주기)일 때만 만든다.
-    cont_qual_confs = ["유럽"] + (["북미"] if is_euro_cycle else [])
+    # [2026-09 폐지, 신민용 확정: "골드컵 예선 이거 없애줘 — 보니까 다
+    # 올라가는데 할 이유가 없잖아. 골드컵도 44주차 이후에 하는 본선에서만
+    # 하는 걸로 해"] 골드컵 예선(cont_qual, 북미)은 실측상 예선의 의미가
+    # 전혀 없었다: 북미 33개국에서 하위 9개국을 컷오프한 24개국이 12조×2팀
+    # 으로 나뉘는데, 조 1위 12팀(direct) + 조 2위 12팀(wildcard) = 24팀이
+    # 그대로 전원 본선에 올라간다 — 예선을 치르든 안 치르든 진출국이 항상
+    # 똑같다(EURO_QUAL["북미"] 정의부 참고). 그래서 여름 예선 자체를 아예
+    # 만들지 않고, 다른 지역컵과 동일하게 44주차(INTL_CALLUP_WEEK) 본선
+    # 생성 시점에 _qualify_region("북미")의 OVR 상위컷으로 24개국을
+    # 정한다. 예선이 실제로 의미를 갖는 유럽(54개국→24개국)만 남긴다.
+    cont_qual_confs = ["유럽"]
     for _cq_cont in cont_qual_confs:
         try:
             _create_qual_tournament(year, "cont_qual", _cq_cont,
@@ -1259,15 +1263,9 @@ def start_intl_tournament(year):
             except Exception as e:
                 from game_engine import add_log
                 add_log(f"⚠ {year}년 유로(EURO) 생성 오류: {e}", "event")
-        # [2026-09 정정, 신민용: "골드컵도 지역컵으로 가는거고 지역컵에서
-        # 표시되어야 하는거고"] 골드컵을 유로처럼 별도 continent-tier
-        # 대회로 또 만들었던 게 잘못이었다 — 골드컵은 위 REGION_LIST 루프
-        # (REGION_CUP_NAME에 "북미" 포함됨)에서 이미 kind='region'으로
-        # 생성된다. 다만 그 루프가 부르는 _qualify_region("북미")이 여름에
-        # 미리 돌아간 cont_qual 예선 결과(qual_results, kind='region')를
-        # 최우선으로 읽어서 24개국 실제 예선 통과국을 그대로 본선에
-        # 채운다(_qualify_region/_save_qual_results의 "북미" 특수분기 참고) —
-        # 그래서 여기 별도 블록이 필요 없다.
+        # [2026-09] 골드컵(북미)은 위 REGION_LIST 루프에서 다른 지역컵과
+        # 완전히 똑같이 kind='region'으로 생성된다 — 예선 특수분기는
+        # 폐지됐다(start_qualifying_if_needed의 cont_qual_confs 주석 참고).
         _close_other_pending_when_committed(year)
         return
 
@@ -1523,10 +1521,11 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
     # 있는 게 지금은 유로뿐이라 이걸로 구분한다. qual_kind는 그 예선
     # 기록을 실제로 조회할 때 쓸 intl_tournaments.kind 값이다(월드컵은
     # 'wc_qual', 유로는 'cont_qual').
-    # [2026-09 정정] 골드컵은 이제 name_override 없이 my_region="북미"로만
-    # 들어오므로(REGION_LIST 루프), name_override 체크에 my_region=="북미"도
-    # 추가해서 실제 예선(cont_qual)을 거친 대회로 인식시킨다.
-    has_qualifying = is_wc or bool(name_override) or (my_region == "북미")
+    # [2026-09 폐지] 골드컵 예선이 없어졌으므로(진출국이 예선 참가국과
+    # 항상 동일 — start_qualifying_if_needed 주석 참고) 북미도 다른 지역컵과
+    # 똑같이 "예선 없는 대회"다 — 예전에 여기 있던 my_region=="북미" 예외를
+    # 되돌린다.
+    has_qualifying = is_wc or bool(name_override)
     qual_kind = "wc_qual" if is_wc else "cont_qual"
 
     # 출전국/선발 결정
@@ -1753,9 +1752,18 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
 
     conn = get_conn()
     c = conn.cursor()
-    c.execute("""INSERT INTO intl_tournaments(year, kind, name, status, my_selected, my_nat, cand_nats)
-                 VALUES(?,?,?,?,?,?,?)""",
-              (year, kind, name, "group", my_sel, my_nat, ",".join(cand_nats)))
+    # [2026-09 버그수정, 신민용 리포트: "AFCON 우승한 세네갈 선수가 발롱도르
+    # 트로피 점수 0점" — 원인: 이 INSERT에 continent 컬럼이 아예 빠져 있어서
+    # kind='continent' 대륙컵(유로/코파아메리카/아시안컵/AFCON) 전부 스키마
+    # 기본값('')으로 저장됨. _get_player_intl_bonus/_get_nationality_major_
+    # stage_result가 "continent=?"로 조회하는데 빈 문자열과는 매칭이 안 돼서
+    # 4개 연맹(유럽 포함) 전체의 대륙컵 우승 보너스가 조용히 0으로 새고 있었음.
+    # my_continent는 함수 인자로 이미 들어와 있으므로 그대로 저장만 하면 됨
+    # (region 대회는 호출부에서 my_continent=None으로 넘어와 NULL 저장되는데,
+    # kind='region'은 애초에 저 두 함수가 조회 대상으로 삼지 않아 무해함).
+    c.execute("""INSERT INTO intl_tournaments(year, kind, name, status, my_selected, my_nat, cand_nats, continent)
+                 VALUES(?,?,?,?,?,?,?,?)""",
+              (year, kind, name, "group", my_sel, my_nat, ",".join(cand_nats), my_continent))
     tid = c.lastrowid
 
     # 포트 추첨: 전력순 4개 포트 → 조마다 포트별 1팀
@@ -2305,34 +2313,15 @@ def _qualify_region(my_region):
     확정: "그 당시 국가 OVR 기준으로 낮은 국가는 참여 안 하는 걸로").
     풀이 이미 목표 이하면(예: CAFA 5개국 풀=5개국 목표) 전원 참가.
 
-    [2026-09 신설, 신민용: "골드컵도 지역컵으로 가는거고... 예선전을
-    거쳐 본선에 오르는 원리로"] 골드컵(북미)만은 예외 — 다른 지역컵과
-    달리 여름에 실제 예선(cont_qual, EURO_QUAL["북미"])을 거친다. 그
-    예선 결과(qual_results, kind='region')가 있으면 최우선으로 쓰고,
-    없으면(아직 예선을 안 돌렸거나 실패한 경우) 다른 지역컵과 동일한
-    OVR 상위컷으로 폴백한다."""
+    [2026-09 폐지] 예전엔 골드컵(북미)만 여름 예선(cont_qual)을 거쳐
+    그 통과국을 여기서 읽어왔지만, 그 예선은 진출국이 예선 참가국과
+    항상 똑같아서(전원 통과) 의미가 없다는 것이 확인돼 폐지됐다 —
+    이제 북미도 다른 모든 지역컵과 완전히 동일하게 이 함수의 OVR
+    상위컷 하나로만 결정된다(start_qualifying_if_needed 주석 참고)."""
     from game_engine import get_state
     from constants import COUNTRY_REGION, REGION_TARGET_SIZE
     st = get_state() or {}
     year = st.get("current_year", 0)
-
-    if my_region == "북미":
-        conn = get_conn()
-        qual_rows = [dict(r) for r in conn.execute(
-            """SELECT country, flag, grade, ovr FROM qual_results
-               WHERE target_year=? AND kind='region' AND continent='북미'""",
-            (year,)).fetchall()]
-        conn.close()
-        if qual_rows:
-            seen = set()
-            result = []
-            for q in qual_rows:
-                if q["country"] in seen:
-                    continue
-                seen.add(q["country"])
-                result.append({"name": q["country"], "flag": q["flag"],
-                                "grade": q["grade"], "ovr": q["ovr"]})
-            return result
 
     names = [c for c, r in COUNTRY_REGION.items() if r == my_region]
     conn = get_conn()
@@ -4461,11 +4450,11 @@ def _save_qual_results(t, continent, qualified_list, set_done=True):
 
     tid = t["id"]
     target_year = t["year"]
-    # [2026-09 정정] 골드컵(북미) 예선은 cont_qual 대회로 진행되지만
-    # (유로와 동일 메커니즘), 결과는 대륙컵 티어가 아니라 지역컵 티어로
-    # 저장한다 — 골드컵은 "역대 지역컵"에서 조회돼야 하므로
-    # (_qualify_region의 "북미" 분기가 여기서 kind='region'으로 저장된
-    # 행을 읽는다). 유로(유럽)는 그대로 'continent'로 저장.
+    # [2026-09] 골드컵 예선 폐지 이후 cont_qual은 유럽 전용이라 항상
+    # 'continent'다 — 옛 세이브에 남아있는 북미 cont_qual이 혹시라도 이
+    # 경로를 마저 타는 경우에만 예전처럼 지역컵 티어로 저장한다(그 결과를
+    # 읽던 _qualify_region의 북미 분기는 이미 폐지됐으므로 실제로 쓰이진
+    # 않지만, 옛 데이터를 대륙컵 티어로 잘못 섞어 넣지는 않게 유지).
     target_kind = ("world" if t["kind"] == "wc_qual"
                    else "region" if continent == "북미"
                    else "continent")

@@ -7,6 +7,7 @@ tier_audit.jsonl(보정 함수 내부 결정 기록)과 조합해서 "몇 시즌
 
 사용: python3 wb_audit_run.py <db_path> <시즌수> <seed>
 """
+import _path  # noqa: F401  (tools/ 에서 루트 모듈을 import 하기 위한 sys.path 부트스트랩)
 import json
 import os
 import sys

@@ -65,6 +65,22 @@ from constants import (
 )
 
 
+# [2026-09 신설, 성능 진단] ai_lifecycle._perf_log와 완전히 동일한 패턴 —
+# 연도전환 로그에는 지금까지 "파워랭킹 1.63s" 한 줄만 찍혔고, 그 안의 9개
+# 하위 단계(팀 A/B값 갱신, 국가 A/B값 갱신, 리그파워 계산, 시즌회귀 2종,
+# 팀/국가 랭킹 산출) 중 어디가 무거운지는 전혀 알 수 없었다 — 이 파일
+# 하나만 블랙박스로 남아 있던 상태. print는 그대로 두고 같은 줄을
+# live_sim.log에도 남긴다(순환 import 회피를 위해 지연 import) — 계측
+# 출력만 늘 뿐 계산 결과에는 전혀 영향이 없다.
+def _perf_log(msg):
+    print(msg)
+    try:
+        from game_engine import _live_debug
+        _live_debug(msg)
+    except Exception:
+        pass
+
+
 # ══════════════════════════════════════════════════════════════
 # 1. 등급(SS~F) ↔ PS 매핑 (2장) — 순수 표시용, PS에 영향 없음
 # ══════════════════════════════════════════════════════════════
@@ -282,6 +298,12 @@ def match_result_r(home_score: int, away_score: int, pso_winner=None, home_id=No
 TEAM_COMPETITION_WEIGHT = {
     "league": 1.0, "domestic_cup": 0.6, "super_cup": 0.5,
     "club_world_cup": 1.8,
+    # [2026-09 신설, 신민용 요청: "3부/4부 팀들은 서로 안 붙으니 이 대회로
+    # 상대전적이 생기는 거니까 파워랭킹에도 반영해야 한다"] 국내컵(0.6)
+    # 보다 격은 낮지만(3/4부 한정, 결승까지 가도 국내컵 우승만큼의 무게는
+    # 아님), 이 대회가 사실상 이 티어 팀들의 유일한 교차 데이터라 0으로
+    # 두면 의미가 없다 — 국내컵의 약 3/4 수준으로 설정.
+    "lower_cup": 0.4,
     # champions/europa/conference는 대륙별로 다름 →
     # TEAM_CHAMPIONS_WEIGHT_BY_CONTINENT / TEAM_EUROPA_WEIGHT_BY_CONTINENT /
     # TEAM_CONFERENCE_WEIGHT_BY_CONTINENT
@@ -1018,6 +1040,7 @@ _CLUB_COMP_TABLES = {
     "club_world_cup": ("cwc_tournaments", "cwc_matches"),
     "super_cup": ("sc_tournaments", "sc_matches"),
     "domestic_cup": ("cup_tournaments", "cup_matches"),
+    "lower_cup": ("lower_cup_tournaments", "lower_cup_matches"),
 }
 
 
@@ -1246,7 +1269,7 @@ def update_team_ratings_for_year(conn, evaluation_year: int):
             weight = _club_comp_weight(category, continent)
             _update_team_a_from_matches(
                 conn, matches_table, tid, evaluation_year, weight,
-                use_stage_col=(category != "domestic_cup"),
+                use_stage_col=(category not in ("domestic_cup", "lower_cup")),
                 discount_same_league=(category in ("champions", "europa", "conference")),
                 source=f"A:{category}")
     conn.commit()
@@ -1424,7 +1447,7 @@ def update_team_b_for_year(conn, evaluation_year: int):
         for tid, continent in rows:
             weight = _club_comp_weight(category, continent)
             placements = _deepest_stage_participants(
-                conn, matches_table, tid, use_stage_col=(category != "domestic_cup"))
+                conn, matches_table, tid, use_stage_col=(category not in ("domestic_cup", "lower_cup")))
             for team_id, tier in placements.items():
                 base = PLACEMENT_BASE_SCORE[tier]
                 _add_team_b(conn, team_id, base * weight, evaluation_year, source=f"B:{category}")
@@ -1562,7 +1585,14 @@ def update_country_b_for_year(conn, evaluation_year: int):
                     "SELECT DISTINCT country FROM intl_entries WHERE tournament_id=?",
                     (tid,)).fetchall()}
         failed = qual_countries - main_countries
-        for country in failed:
+        # [2026-09 재현성 버그수정] failed는 국가명(문자열) 집합이라
+        # 순회 순서가 PYTHONHASHSEED에 좌우된다. 여기서 채우는
+        # country_best_tier_this_year는 아래에서 .items()로 다시 순회하며
+        # DB에 streak/페널티를 기록하므로, 삽입 순서가 흔들리면 기록 순서와
+        # (부동소수 누적 순서까지) 실행마다 달라진다. 국가명 사전순으로
+        # 고정한다 — 각 국가에 들어가는 값 자체는 서로 독립이라(max/합)
+        # 순서를 바꿔도 결과값은 동일, 밸런스 무영향.
+        for country in sorted(failed):
             country_best_tier_this_year[country] = max(
                 country_best_tier_this_year.get(country, -1), -1)
             country_qual_fail_weight[country] = country_qual_fail_weight.get(country, 0.0) + base_weight
@@ -1835,6 +1865,8 @@ def run_year_end_power_ranking_update(conn, evaluation_year: int):
     """game_engine.py 연도전환 훅에서 호출하는 단일 진입점. 순서:
     레이어A(경기결과) → 레이어B(대회성적) → 시즌전환 리그레션(A:B 재분배)
     → 스냅샷 저장. evaluation_year=방금 끝난 시즌, ranking_year=eval+1."""
+    import time as _time_pr
+    _p0 = _time_pr.perf_counter()
     # [2026-08 신설, 성능] 이번 배치(연 1회) 동안만 유효한 _team_ab_cache를
     # 매번 새로 비운다 — 위 _team_ab_cache 선언부 설명 참고.
     _team_ab_cache.clear()
@@ -1856,20 +1888,30 @@ def run_year_end_power_ranking_update(conn, evaluation_year: int):
             print(f"[POWER-DEBUG] 경고: 이 이름들을 못 찾았습니다(철자 확인): {missing}")
 
     _power_debug_snapshot(conn, f"{evaluation_year}시즌 시작(계산 전)")
+    _p1 = _time_pr.perf_counter()
 
     update_team_ratings_for_year(conn, evaluation_year)
+    _p2 = _time_pr.perf_counter()
     update_team_b_for_year(conn, evaluation_year)
+    _p3 = _time_pr.perf_counter()
     update_country_ratings_for_year(conn, evaluation_year)
+    _p4 = _time_pr.perf_counter()
     update_country_b_for_year(conn, evaluation_year)
+    _p5 = _time_pr.perf_counter()
 
     league_power_cache = compute_league_power(conn, evaluation_year)
+    _p6 = _time_pr.perf_counter()
     apply_team_season_regression(conn, evaluation_year, league_power_cache)
+    _p7 = _time_pr.perf_counter()
     apply_country_season_regression(conn, evaluation_year)
+    _p8 = _time_pr.perf_counter()
 
     _power_debug_snapshot(conn, f"{evaluation_year}시즌 종료(회귀/감쇠 후)")
 
     compute_team_power_rankings(conn, evaluation_year)
+    _p9 = _time_pr.perf_counter()
     compute_country_power_rankings(conn, evaluation_year)
+    _p10 = _time_pr.perf_counter()
 
     # [2026-08 v3.2 신설] team_season_opp_strength는 이번 시즌 계산 전용
     # 임시 데이터 — 위 계산(특히 update_team_ratings_for_year의 리그
@@ -1884,6 +1926,20 @@ def run_year_end_power_ranking_update(conn, evaluation_year: int):
     if season_row:
         conn.execute("DELETE FROM team_season_opp_strength WHERE season=?", (season_row[0],))
         conn.commit()
+    _p11 = _time_pr.perf_counter()
+
+    # [2026-09 신설, 성능 진단] game_engine.py의 "파워랭킹 N초" 한 줄이
+    # 이 함수 하나를 통째로 감싸고 있어서, 예전엔 이 안의 9단계(팀/국가
+    # A값·B값 갱신, 리그파워 계산, 시즌회귀 2종, 팀/국가 랭킹 산출) 중
+    # 무엇이 무거운지 전혀 구분이 안 됐다 — ai_lifecycle의 [PERF] 계측과
+    # 같은 목적, 같은 방식(체크포인트 사이 델타)으로 세분화한다.
+    _perf_log(
+        f"[PERF-POWER] {evaluation_year}년 세부: 초기화+디버그스냅샷 {_p1-_p0:.3f}s | "
+        f"팀A값 {_p2-_p1:.3f}s | 팀B값 {_p3-_p2:.3f}s | "
+        f"국가A값 {_p4-_p3:.3f}s | 국가B값 {_p5-_p4:.3f}s | "
+        f"리그파워계산 {_p6-_p5:.3f}s | 팀시즌회귀 {_p7-_p6:.3f}s | "
+        f"국가시즌회귀 {_p8-_p7:.3f}s | 팀랭킹산출 {_p9-_p8:.3f}s | "
+        f"국가랭킹산출 {_p10-_p9:.3f}s | opp_strength정리 {_p11-_p10:.3f}s")
 
     return evaluation_year + 1
 

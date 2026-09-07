@@ -25,12 +25,13 @@ _calc_salary(grade, tier, ovr, country, team_name, year, team_id)를
 출력: salary_probe_raw.csv (country, tier, ovr, grade, team_name, team_id, raw_salary_krw)
       salary_probe_pivot.csv (country, tier, club_rank, OVR50, OVR55, ..., OVR99)
 """
+import _path  # noqa: F401  (tools/ 에서 루트 모듈을 import 하기 위한 sys.path 부트스트랩)
 
 import csv
 import sys
 import os
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from database import get_conn, load_from_disk
 from economy import _calc_salary
@@ -128,7 +129,7 @@ def main():
         return
 
     # ── raw CSV ──────────────────────────────────────────────
-    raw_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "salary_probe_raw.csv")
+    raw_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "salary_probe_raw.csv")
     fieldnames = list(raw_rows[0].keys())
     with open(raw_path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -136,7 +137,7 @@ def main():
         w.writerows(raw_rows)
 
     # ── pivot CSV: country, tier, club_rank -> OVR별 억원 ──────
-    pivot_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "salary_probe_pivot.csv")
+    pivot_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "salary_probe_pivot.csv")
     pivot_map = {}
     for r in raw_rows:
         key = (r["country"], r["tier"], r["club_rank"], r["team_name"])

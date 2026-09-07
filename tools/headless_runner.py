@@ -31,6 +31,7 @@ countries 테이블이 비어 create_player가 즉시 죽는 게 드러남). 이
 standalone 모드에서는 스크립트가 있는 위치의 game.db(있다면)를 seed
 템플릿으로 복사해서 쓴다 — 원본은 절대 안 건드리고 읽기만 한다.
 """
+import _path  # noqa: F401  (tools/ 에서 루트 모듈을 import 하기 위한 sys.path 부트스트랩)
 import datetime
 import os
 import shutil
@@ -41,7 +42,7 @@ import database
 import game_engine as ge
 from affiliate_integrity import run_all_checks
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def build_training_schedule(days=364):

@@ -4,7 +4,7 @@ ui/career_window.py
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel,
     QTableWidget, QTableWidgetItem, QHeaderView,
-    QPushButton, QTabWidget, QWidget, QFrame
+    QPushButton, QTabWidget, QWidget, QFrame, QSpinBox
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
@@ -85,6 +85,49 @@ def _is_personal_award(trophy):
     """
     comp = (trophy.get("competition") or "")
     return any(k in comp for k in _PERSONAL_AWARD_KEYWORDS)
+
+
+# [2026-09 신설, 신민용 요청: "커리어 기록 위에 연도 필터 — 기본은 전체,
+# 특정 연도 선택하면 그 해 기록만"] 탭마다 원본 데이터 모양이 달라서
+# (단발성 이벤트 vs 팀 재직 기간) 필터 함수를 용도별로 3개 나눈다.
+def _filter_by_year(rows, year, key="year"):
+    """year=None(전체)이면 그대로, 아니면 row[key]==year인 것만. 트로피/
+    개인수상/승강/A매치/컵·챔스류 매치(키는 종류마다 'year' 또는 't_year')
+    처럼 "그 해에 일어난 단발 이벤트" 데이터에 공통으로 쓴다."""
+    if year is None:
+        return rows
+    return [r for r in rows if r.get(key) == year]
+
+
+def _filter_entries_by_year(entries, year):
+    """career_entries(팀 재직 기간, start_year~end_year)는 단발 이벤트가
+    아니라 기간이므로 별도 처리 — 그 해가 재직 기간에 걸쳐 있으면 포함.
+    end_year=0은 "현재도 재직 중"이라는 뜻이라 현재 연도를 상한으로 쓴다."""
+    if year is None:
+        return entries
+    cur_year = get_state().get("current_year") or 0
+    out = []
+    for e in entries:
+        sy = e.get("start_year", 0) or 0
+        ey = e.get("end_year", 0) or 0
+        if not ey:
+            ey = cur_year or sy
+        if sy and sy <= year <= ey:
+            out.append(e)
+    return out
+
+
+def _filter_injuries_by_year(injuries, year):
+    """injury_history는 year 컬럼이 없고 start_date(문자열, 'YYYY-MM-DD')
+    만 있어서 앞 4자리로 연도를 추출해 비교한다."""
+    if year is None:
+        return injuries
+    out = []
+    for inj in injuries:
+        sd = inj.get("start_date") or ""
+        if sd[:4].isdigit() and int(sd[:4]) == year:
+            out.append(inj)
+    return out
 
 
 STYLE = """
@@ -181,7 +224,7 @@ class CareerWindow(QDialog):
         root.addLayout(summary)
 
         conn = get_conn(); c = conn.cursor()
-        entries  = [dict(r) for r in c.execute("SELECT * FROM career_entries ORDER BY id").fetchall()]
+        self._entries  = [dict(r) for r in c.execute("SELECT * FROM career_entries ORDER BY id").fetchall()]
         # trophy_log에는 리그/국제대회 우승뿐 아니라 발롱도르·MVP 같은 개인 수상도
         # 함께 적재된다. 우승 탭에는 '진짜 우승'만 보여야 하므로 개인 수상 행은 제외한다.
         # (개인 수상은 아래 awards 테이블 기반으로 '개인 수상' 탭에서 따로 표시됨)
@@ -191,86 +234,92 @@ class CareerWindow(QDialog):
         # get_my_trophies()가 내 재직 기간 기준으로 미리 걸러서 반환한다.
         from game_engine import get_my_trophies
         all_trophies = get_my_trophies()
-        trophies = [t for t in all_trophies if not _is_personal_award(t)]
+        self._trophies = [t for t in all_trophies if not _is_personal_award(t)]
         try:
-            awards = [dict(r) for r in c.execute(
+            self._awards = [dict(r) for r in c.execute(
                 "SELECT * FROM awards WHERE is_mine=1 ORDER BY year").fetchall()]
         except Exception:
-            awards = []
+            self._awards = []
         # 내가 그 팀에 실제로 있던 기간의 승강 기록 (공용 헬퍼)
-        promos = get_my_promotions()
+        self._promos = get_my_promotions()
         # [2026-08 신설, 부상 시스템 확장 — 커리어 기록] 부상 이력.
         # 최신순 고정(history_id DESC) — "이번 시즌 얼마나 다쳤나"부터
         # 바로 보이는 게 과거 기록부터 스크롤해서 찾는 것보다 자연스럽다.
-        injuries = [dict(r) for r in c.execute(
+        self._injuries = [dict(r) for r in c.execute(
             "SELECT * FROM injury_history WHERE player_id=1 ORDER BY history_id DESC"
         ).fetchall()]
         conn.close()
 
-        tabs = QTabWidget()
-        tabs.addTab(self._team_tab(entries),  "팀 이력")
-        tabs.addTab(self._club_totals_tab(entries), "전체 이력")
-        tabs.addTab(self._trophy_tab(trophies), f"성적 ({len(trophies)})")
-        tabs.addTab(self._award_tab(awards), f"개인 수상 ({len(awards)})")
-        tabs.addTab(self._promo_tab(promos),  f"승강 ({len(promos)})")
-        tabs.addTab(self._injury_tab(injuries), f"부상 이력 ({len(injuries)})")
-
         import intl_engine
-        intl_ms = intl_engine.get_my_intl_matches()
-        tabs.addTab(self._intl_tab(intl_ms, p), f"국제전 ({len(intl_ms)})")
-
-        qual_ms = intl_engine.get_my_qual_matches()
-        if qual_ms:
-            tabs.addTab(self._intl_tab(qual_ms, p), f"국제전(예선) ({len(qual_ms)})")
+        self._intl_ms = intl_engine.get_my_intl_matches()
+        self._qual_ms = intl_engine.get_my_qual_matches()
 
         from competition import champions_engine
-        cl_ms = champions_engine.get_my_cl_matches()
-        tabs.addTab(self._champions_tab(cl_ms, p), f"챔피언스 ({len(cl_ms)})")
+        self._cl_ms = champions_engine.get_my_cl_matches()
 
         from competition import europa_engine
-        el_ms = europa_engine.get_my_el_matches()
-        tabs.addTab(self._champions_tab(el_ms, p, history_table="el_history",
-                                         label="유로파리그", icon="🥈", color="#F28C28"),
-                    f"유로파 ({len(el_ms)})")
+        self._el_ms = europa_engine.get_my_el_matches()
 
         from competition import conference_engine
-        ecl_ms = conference_engine.get_my_ecl_matches()
-        tabs.addTab(self._champions_tab(ecl_ms, p, history_table="ecl_history",
-                                         label="컨퍼런스리그", icon="🥉", color="#20A464"),
-                    f"컨퍼런스 ({len(ecl_ms)})")
+        self._ecl_ms = conference_engine.get_my_ecl_matches()
 
         # [2026-08 신설, 14순위] 슈퍼컵 — 위와 완전히 같은 패턴(_champions_tab
         # 재사용). 연 1회·4팀뿐이라 대부분의 커리어에선 0경기로 나오는 게
         # 정상이다.
         from competition import super_cup_engine
-        sc_ms = super_cup_engine.get_my_sc_matches()
-        tabs.addTab(self._champions_tab(sc_ms, p, history_table="sc_history",
-                                         label="슈퍼컵", icon="🏵", color=BURGUNDY),
-                    f"슈퍼컵 ({len(sc_ms)})")
+        self._sc_ms = super_cup_engine.get_my_sc_matches()
 
         from competition import cup_engine
-        cup_ms = cup_engine.get_my_cup_matches()
-        tabs.addTab(self._cup_tab(cup_ms), f"컵대회 ({len(cup_ms)})")
+        self._cup_ms = cup_engine.get_my_cup_matches()
+        from competition import lower_cup_engine
+        self._lc_ms = lower_cup_engine.get_my_lower_cup_matches()
 
         from competition import club_world_cup_engine
-        cwc_ms = club_world_cup_engine.get_my_cwc_matches()
-        if cwc_ms:
-            tabs.addTab(self._cwc_tab(cwc_ms), f"클럽 월드컵 ({len(cwc_ms)})")
+        self._cwc_ms = club_world_cup_engine.get_my_cwc_matches()
 
         import promotion_playoff_engine
-        po_ms = promotion_playoff_engine.get_my_po_matches()
-        # [2026-07 버그수정, 신민용 리포트: "컵대회(0)/챔피언스(0)처럼
-        # 승강전(0) 탭이 안 뜬다"] 클럽월드컵(4년에 한 번뿐)처럼 조건부로
-        # 숨기면 안 된다 — 승강 PO는 매년 누구에게나 열릴 수 있는 흔한
-        # 가능성이라 컵대회/챔피언스와 같은 급으로, 0건이어도 항상 탭을
-        # 보여줘야 "이번엔 왜 안 걸렸지"가 아니라 "0건 = 안 걸렸구나"로
-        # 명확히 보인다.
-        tabs.addTab(self._po_tab(po_ms, p), f"⚖ 승강 플레이오프 ({len(po_ms)})")
-        root.addWidget(tabs)
+        self._po_ms = promotion_playoff_engine.get_my_po_matches()
+        self._p = p
 
-        # [2026-08 성능수정] 위 탭들이 만든 모든 표에 이제서야 한 번만
-        # ResizeToContents를 건다 — _make_table 주석 참고.
-        self._finalize_tables()
+        # [2026-09 신설, 신민용 요청: "커리어 기록 위에 연도 필터 — 기본은
+        # 전체, 연도 직접 입력하거나 화살표로 위아래 가능하게, 우측에
+        # 전체 버튼"] 세계 축구 기록실 파워랭킹 탭(pr_year_spin)과 똑같은
+        # 패턴 — 콤보박스 드롭다운 대신 QSpinBox(직접 입력+화살표)를 쓴다.
+        # "전체" 상태는 QSpinBox.specialValueText로 표현한다 — 범위의
+        # 최솟값(실제 기록 최소 연도-1)일 때만 숫자 대신 "전체" 문자를
+        # 보여주는 Qt 표준 기능이라, 별도 플래그 없이 스핀박스 값 하나가
+        # 곧 필터 상태의 유일한 출처가 된다. "전체" 버튼은 스핀박스를 그
+        # 최솟값으로 되돌리기만 하면 되므로(valueChanged가 알아서
+        # _populate_tabs를 다시 부름) 로직 중복이 없다.
+        filt_row = QHBoxLayout()
+        filt_lbl = QLabel("연도")
+        filt_lbl.setStyleSheet("color:#888;font-size:12px;")
+        _years = self._collect_available_years()  # 최신순 정렬돼 있음
+        if _years:
+            _min_y, _max_y = _years[-1], _years[0]
+        else:
+            _min_y = _max_y = get_state().get("current_year") or 2000
+        self._year_spin = QSpinBox()
+        self._year_spin.setRange(_min_y - 1, _max_y)
+        self._year_spin.setSpecialValueText("전체")
+        self._year_spin.setValue(_min_y - 1)
+        self._year_spin.setStyleSheet(
+            "QSpinBox { background:#252525; color:#ccc; border:1px solid #444;"
+            " border-radius:4px; padding:4px 8px; min-width:70px; }")
+        self._year_spin.valueChanged.connect(self._on_year_filter_changed)
+        self._year_all_btn = QPushButton("전체")
+        self._year_all_btn.setToolTip("연도 필터 해제 — 전체 기간 표시")
+        self._year_all_btn.clicked.connect(
+            lambda: self._year_spin.setValue(self._year_spin.minimum()))
+        filt_row.addWidget(filt_lbl)
+        filt_row.addWidget(self._year_spin)
+        filt_row.addWidget(self._year_all_btn)
+        filt_row.addStretch()
+        root.addLayout(filt_row)
+
+        self._tabs = QTabWidget()
+        self._populate_tabs(None)
+        root.addWidget(self._tabs)
 
         # [2026-08 신설, 신민용 요청: "커리어 기록이 없으면 창이 제일
         # 작게 뜨는데, 창 기본 크기를 위에 탭 버튼들 크기에 맞춰달라"]
@@ -280,17 +329,145 @@ class CareerWindow(QDialog):
         # 안 들어가서 두 줄로 줄바꿈되며 뭉개져 보인다. 탭 바가 실제로
         # 필요로 하는 폭(sizeHint)을 그대로 다이얼로그 최소 폭으로 잡아서,
         # 데이터가 얼마나 있든 탭 버튼 한 줄은 항상 안 깨지게 한다.
-        _tabbar_w = tabs.tabBar().sizeHint().width()
+        _tabbar_w = self._tabs.tabBar().sizeHint().width()
         self.setMinimumWidth(max(900, _tabbar_w + 40))
-        tabs.currentChanged.connect(lambda: self._fit_width())
+        self._tabs.currentChanged.connect(lambda: self._fit_width())
 
         btn = QPushButton("닫기")
         btn.setStyleSheet("background:#2a2a2a;color:#ccc;border:1px solid #444;"
                           "border-radius:4px;padding:6px;")
         btn.clicked.connect(self.close)
         root.addWidget(btn)
-        self._tabs = tabs
         self.adjustSize()
+
+    def _collect_available_years(self):
+        """연도 필터 스핀박스의 범위(최소~최대) 산정에 쓸 연도 목록 —
+        실제로 뭔가 기록이 있는 연도만 최신순으로. 팀 재직 기간
+        (career_entries)은 그 기간 전체(start_year~end_year, 진행중이면
+        현재 연도까지)를 펼쳐 담고, 나머지(트로피/개인수상/승강/A매치/
+        컵·챔스류 매치)는 단발 이벤트라 year(또는 t_year) 값 하나만
+        담는다. 부상은 start_date 앞 4자리."""
+        years = set()
+        cur_year = get_state().get("current_year") or 0
+        for e in self._entries:
+            sy = e.get("start_year", 0) or 0
+            ey = e.get("end_year", 0) or 0
+            if not ey:
+                ey = cur_year or sy
+            if sy and ey and sy <= ey:
+                years.update(range(sy, ey + 1))
+        for rows, key in (
+            (self._trophies, "year"), (self._awards, "year"), (self._promos, "year"),
+            (self._intl_ms, "year"), (self._qual_ms, "year"), (self._po_ms, "year"),
+            (self._cl_ms, "t_year"), (self._el_ms, "t_year"), (self._ecl_ms, "t_year"),
+            (self._sc_ms, "t_year"), (self._cup_ms, "t_year"), (self._lc_ms, "t_year"),
+            (self._cwc_ms, "t_year"),
+        ):
+            for r in rows:
+                y = r.get(key)
+                if y:
+                    years.add(y)
+        for inj in self._injuries:
+            sd = inj.get("start_date") or ""
+            if sd[:4].isdigit():
+                years.add(int(sd[:4]))
+        return sorted(years, reverse=True)
+
+    def _on_year_filter_changed(self, value):
+        year = None if value <= self._year_spin.minimum() else value
+        self._populate_tabs(year)
+        self._fit_width()
+
+    def _populate_tabs(self, year):
+        """연도 필터(year=None이면 전체) 적용해 탭 내용을 다시 채운다.
+        QTabWidget 자체는 재사용하고 내용물만 지웠다 다시 채운다 — 필터를
+        바꿀 때마다 다이얼로그 전체를 새로 만들 필요는 없다. _make_table이
+        쌓아두는 _all_tables도 매번 리셋해야 한다(안 그러면 이전 필터에서
+        만든, 이미 탭에서 떨어져나간 표까지 _finalize_tables가 계속
+        다시 리사이즈 계산하게 된다). 탭이 바뀌어도 가능하면 같은 탭이
+        선택된 채로 유지되도록 탭 제목(카운트 숫자 제외)으로 복원한다."""
+        cur_title = (self._tabs.tabText(self._tabs.currentIndex()).split(" (")[0]
+                     if self._tabs.count() else None)
+        self._tabs.clear()
+        self._all_tables = []
+        p = self._p
+
+        entries  = _filter_entries_by_year(self._entries, year)
+        trophies = _filter_by_year(self._trophies, year)
+        awards   = _filter_by_year(self._awards, year)
+        promos   = _filter_by_year(self._promos, year)
+        injuries = _filter_injuries_by_year(self._injuries, year)
+
+        self._tabs.addTab(self._team_tab(entries),  "팀 이력")
+        self._tabs.addTab(self._club_totals_tab(entries), "전체 이력")
+        self._tabs.addTab(self._trophy_tab(trophies), f"성적 ({len(trophies)})")
+        self._tabs.addTab(self._award_tab(awards), f"개인 수상 ({len(awards)})")
+        self._tabs.addTab(self._promo_tab(promos),  f"승강 ({len(promos)})")
+        self._tabs.addTab(self._injury_tab(injuries), f"부상 이력 ({len(injuries)})")
+
+        intl_ms = _filter_by_year(self._intl_ms, year)
+        self._tabs.addTab(self._intl_tab(intl_ms, p, year=year), f"국제전 ({len(intl_ms)})")
+
+        # [기존 동작 유지] 국제전(예선) 탭은 "커리어 통틀어 예선 출전이
+        # 한 번도 없으면" 아예 숨긴다 — 연도 필터로 그 해에 0건이 된
+        # 것과는 다른 경우이므로, 탭 존재 여부는 필터 이전(self._qual_ms)
+        # 기준으로, 탭 안의 내용/카운트만 필터링한다.
+        if self._qual_ms:
+            qual_ms = _filter_by_year(self._qual_ms, year)
+            self._tabs.addTab(self._intl_tab(qual_ms, p, year=year),
+                               f"국제전(예선) ({len(qual_ms)})")
+
+        cl_ms = _filter_by_year(self._cl_ms, year, key="t_year")
+        self._tabs.addTab(self._champions_tab(cl_ms, p, year=year), f"챔피언스 ({len(cl_ms)})")
+
+        el_ms = _filter_by_year(self._el_ms, year, key="t_year")
+        self._tabs.addTab(self._champions_tab(el_ms, p, history_table="el_history",
+                                               label="유로파리그", icon="🥈", color="#F28C28",
+                                               year=year),
+                           f"유로파 ({len(el_ms)})")
+
+        ecl_ms = _filter_by_year(self._ecl_ms, year, key="t_year")
+        self._tabs.addTab(self._champions_tab(ecl_ms, p, history_table="ecl_history",
+                                               label="컨퍼런스리그", icon="🥉", color="#20A464",
+                                               year=year),
+                           f"컨퍼런스 ({len(ecl_ms)})")
+
+        sc_ms = _filter_by_year(self._sc_ms, year, key="t_year")
+        self._tabs.addTab(self._champions_tab(sc_ms, p, history_table="sc_history",
+                                               label="슈퍼컵", icon="🏵", color=BURGUNDY,
+                                               year=year),
+                           f"슈퍼컵 ({len(sc_ms)})")
+
+        cup_ms = _filter_by_year(self._cup_ms, year, key="t_year")
+        self._tabs.addTab(self._cup_tab(cup_ms, year=year), f"컵대회 ({len(cup_ms)})")
+
+        lc_ms = _filter_by_year(self._lc_ms, year, key="t_year")
+        self._tabs.addTab(self._lower_cup_tab(lc_ms, year=year), f"3부·4부컵 ({len(lc_ms)})")
+
+        # [기존 동작 유지] 클럽 월드컵도 국제전(예선)과 같은 원칙 —
+        # 커리어 통틀어 한 번도 없으면 탭 자체를 숨긴다.
+        if self._cwc_ms:
+            cwc_ms = _filter_by_year(self._cwc_ms, year, key="t_year")
+            self._tabs.addTab(self._cwc_tab(cwc_ms, year=year), f"클럽 월드컵 ({len(cwc_ms)})")
+
+        po_ms = _filter_by_year(self._po_ms, year)
+        # [2026-07 버그수정, 신민용 리포트: "컵대회(0)/챔피언스(0)처럼
+        # 승강전(0) 탭이 안 뜬다"] 클럽월드컵(4년에 한 번뿐)처럼 조건부로
+        # 숨기면 안 된다 — 승강 PO는 매년 누구에게나 열릴 수 있는 흔한
+        # 가능성이라 컵대회/챔피언스와 같은 급으로, 0건이어도 항상 탭을
+        # 보여줘야 "이번엔 왜 안 걸렸지"가 아니라 "0건 = 안 걸렸구나"로
+        # 명확히 보인다.
+        self._tabs.addTab(self._po_tab(po_ms, p), f"⚖ 승강 플레이오프 ({len(po_ms)})")
+
+        # [2026-08 성능수정] 위 탭들이 만든 모든 표에 이제서야 한 번만
+        # ResizeToContents를 건다 — _make_table 주석 참고.
+        self._finalize_tables()
+
+        if cur_title:
+            for i in range(self._tabs.count()):
+                if self._tabs.tabText(i).split(" (")[0] == cur_title:
+                    self._tabs.setCurrentIndex(i)
+                    break
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -951,7 +1128,7 @@ class CareerWindow(QDialog):
         lay.addWidget(tbl)
         return w
 
-    def _intl_tab(self, matches, p):
+    def _intl_tab(self, matches, p, year=None):
         """국제전(A매치) 경기별 기록: 기간/포지션/국가/대회/상대/스탯/평점/스코어/결과."""
         w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(0,0,0,0)
 
@@ -965,6 +1142,8 @@ class CareerWindow(QDialog):
         _nat_events = conn.execute(
             "SELECT year, week, action FROM nat_retirement_log ORDER BY id ASC").fetchall()
         conn.close()
+        if year is not None:
+            _nat_events = [e for e in _nat_events if e["year"] == year]
 
         if not matches:
             if _nat_events:
@@ -1046,7 +1225,7 @@ class CareerWindow(QDialog):
         return w
 
     def _champions_tab(self, matches, p, history_table="cl_history", label="챔피언스리그",
-                        icon="🏆", color="#ffd24d"):
+                        icon="🏆", color="#ffd24d", year=None):
         """챔피언스리그 경기별 기록: 기간/포지션/팀/대회/상대/스탯/평점/스코어/결과.
         [2026-08 확장] history_table/label/icon/color를 매개변수로 빼서
         유로파리그(el_history)/컨퍼런스리그(ecl_history) 탭도 이 함수를
@@ -1058,9 +1237,12 @@ class CareerWindow(QDialog):
         # 같이 저장되므로(재사용), 이 챔스 탭에서는 반드시 제외해야 섞이지 않는다.
         conn = get_conn()
         try:
-            hist = [dict(r) for r in conn.execute(
-                f"SELECT * FROM {history_table} WHERE competition!=? ORDER BY year",
-                ("클럽 월드컵",)).fetchall()]
+            sql = f"SELECT * FROM {history_table} WHERE competition!=?"
+            params = ["클럽 월드컵"]
+            if year is not None:
+                sql += " AND year=?"
+                params.append(year)
+            hist = [dict(r) for r in conn.execute(sql + " ORDER BY year", params).fetchall()]
         except Exception:
             hist = []
         conn.close()
@@ -1123,7 +1305,7 @@ class CareerWindow(QDialog):
         lay.addWidget(tbl)
         return w
 
-    def _cwc_tab(self, matches):
+    def _cwc_tab(self, matches, year=None):
         """[2026-07 신설] 클럽 월드컵 경기별 기록. cup_tab과 같은 톤(세부 스탯 없이
         골/어시/선방/평점 중심)으로 보여준다. cl_history를 재사용하므로
         competition='클럽 월드컵'으로 반드시 필터링해서 챔스 기록과 안 섞이게 한다."""
@@ -1131,9 +1313,12 @@ class CareerWindow(QDialog):
 
         conn = get_conn()
         try:
-            hist = [dict(r) for r in conn.execute(
-                "SELECT * FROM cl_history WHERE competition=? ORDER BY year",
-                ("클럽 월드컵",)).fetchall()]
+            sql = "SELECT * FROM cl_history WHERE competition=?"
+            params = ["클럽 월드컵"]
+            if year is not None:
+                sql += " AND year=?"
+                params.append(year)
+            hist = [dict(r) for r in conn.execute(sql + " ORDER BY year", params).fetchall()]
         except Exception:
             hist = []
         conn.close()
@@ -1169,7 +1354,56 @@ class CareerWindow(QDialog):
         lay.addWidget(tbl)
         return w
 
-    def _cup_tab(self, matches):
+    def _lower_cup_tab(self, matches, year=None):
+        """3·4부컵 경기별 기록 — _cup_tab과 100% 동일한 패턴, 대상
+        테이블/색만 lower_cup_history / #00A6A6로 교체."""
+        w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(0, 0, 0, 0)
+
+        conn = get_conn()
+        try:
+            sql = "SELECT * FROM lower_cup_history"
+            params = []
+            if year is not None:
+                sql += " WHERE year=?"
+                params.append(year)
+            hist = [dict(r) for r in conn.execute(sql + " ORDER BY year", params).fetchall()]
+        except Exception:
+            hist = []
+        conn.close()
+
+        if hist:
+            parts = [f"{h['year']}년 {h['result']}" for h in hist]
+            hl = QLabel("🏅 " + "   ·   ".join(parts))
+            hl.setStyleSheet("color:#00A6A6;font-size:12px;font-weight:bold;padding:4px;")
+            hl.setWordWrap(True)
+            lay.addWidget(hl)
+
+        if not matches:
+            lay.addWidget(QLabel("3부·4부컵 출전 기록 없음"))
+            return w
+
+        cols = ["기간", "대회", "상대", "골", "어시", "선방", "실점", "평점", "스코어", "결과"]
+        tbl = self._make_table(len(matches), cols)
+        for i, m in enumerate(matches):
+            res = m["result"]
+            color = ("#00cc44" if res.startswith("승")
+                     else "#888888" if res == "무" else "#cc4444")
+            opp = m["opp"] + (f" ({m['opp_tier']}부)" if m.get("opp_tier") else "")
+            vals = [m['date'], f"{m['comp']} {m['stage']}", opp,
+                    str(m["goals"]), str(m["assists"]), str(m["saves"]), str(m["conceded"]),
+                    str(m["rating"]), m["score"], format_result_with_absence(m)]
+            _reason_label = _absence_override(m, len(vals), 7)
+            if _reason_label is None and not m.get("my_played", 1) and not m.get("absence_reason"):
+                _reason_label = "벤치"
+            if _reason_label:
+                vals[3] = "—"; vals[4] = "—"; vals[5] = "—"; vals[6] = "—"
+                vals[7] = _reason_label
+            for j, v in enumerate(vals):
+                self._set(tbl, i, j, v, color if j == len(vals) - 1 else None)
+        lay.addWidget(tbl)
+        return w
+
+    def _cup_tab(self, matches, year=None):
         """[2026-07 신설] 국내 컵대회 경기별 기록: 기간/라운드/상대/스탯/평점/스코어/결과.
         cup_matches는 챔스처럼 슈팅·패스% 같은 세부 스탯이 없어(모듈 스코프가
         더 작다), 골/어시/선방/평점 중심으로 국제전·챔스와 같은 톤으로 보여준다."""
@@ -1177,8 +1411,12 @@ class CareerWindow(QDialog):
 
         conn = get_conn()
         try:
-            hist = [dict(r) for r in conn.execute(
-                "SELECT * FROM cup_history ORDER BY year").fetchall()]
+            sql = "SELECT * FROM cup_history"
+            params = []
+            if year is not None:
+                sql += " WHERE year=?"
+                params.append(year)
+            hist = [dict(r) for r in conn.execute(sql + " ORDER BY year", params).fetchall()]
         except Exception:
             hist = []
         conn.close()

@@ -3,9 +3,10 @@ check_save.py — 세이브/파일 버전 진단 스크립트
 게임 폴더에서 `python check_save.py` 로 실행.
 커리어가 안 올라갈 때 원인을 찾아준다.
 """
+import _path  # noqa: F401  (tools/ 에서 루트 모듈을 import 하기 위한 sys.path 부트스트랩)
 import os, sqlite3, sys
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB   = os.path.join(BASE, "game.db")
 
 def main():

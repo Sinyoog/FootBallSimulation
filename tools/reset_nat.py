@@ -3,7 +3,7 @@
 # FootBallSimulation 폴더에 두고:  py reset_nat.py
 # 실행 후 다음 국가대표 대회(아프리카 네이션스컵/월드컵)에서 다시 선택 팝업이 뜬다.
 import sqlite3, os
-db = os.path.join(os.path.dirname(os.path.abspath(__file__)), "game.db")
+db = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "game.db")
 c = sqlite3.connect(db)
 p = c.execute("SELECT nationality, nationality2, nationality3, intl_committed FROM my_player WHERE id=1").fetchone()
 print("현재 고정국적:", p[3] if p else "?")

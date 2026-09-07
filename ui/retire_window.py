@@ -203,6 +203,7 @@ class RetireWindow(QDialog):
         if getattr(self, "_career_match_cache", None) is None:
             from competition import champions_engine
             from competition import cup_engine
+            from competition import lower_cup_engine
             import intl_engine
             from competition import club_world_cup_engine
             import promotion_playoff_engine
@@ -217,6 +218,7 @@ class RetireWindow(QDialog):
                 "ecl_ms": conference_engine.get_my_ecl_matches(),
                 "sc_ms": super_cup_engine.get_my_sc_matches(),
                 "cup_ms": cup_engine.get_my_cup_matches(),
+                "lower_cup_ms": lower_cup_engine.get_my_lower_cup_matches(),
                 "cwc_ms": club_world_cup_engine.get_my_cwc_matches(),
                 "po_ms": promotion_playoff_engine.get_my_po_matches(),
             }
@@ -499,6 +501,13 @@ class RetireWindow(QDialog):
         t37.setObjectName("secTitle")
         lay.addWidget(t37)
         lay.addWidget(self._cup_table(cup_ms))
+
+        # ── 3부·4부컵 기록 ──────────────────────────────
+        lc_ms = _cm["lower_cup_ms"]
+        t37c = QLabel(f"🏅 3부·4부컵 기록  ({len(lc_ms)})")
+        t37c.setObjectName("secTitle")
+        lay.addWidget(t37c)
+        lay.addWidget(self._cup_table(lc_ms))
 
         # ── 클럽 월드컵 기록 (있을 때만 — 4년에 한 번뿐이라 없는 게 정상) ──
         cwc_ms = _cm["cwc_ms"]

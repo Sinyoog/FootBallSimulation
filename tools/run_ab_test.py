@@ -8,6 +8,7 @@
 이제 실행마다 qa_runs/ 아래 타임스탬프 폴더를 새로 만들어 그 안에서만
 work_db를 만든다.
 """
+import _path  # noqa: F401  (tools/ 에서 루트 모듈을 import 하기 위한 sys.path 부트스트랩)
 import datetime
 import os
 import shutil

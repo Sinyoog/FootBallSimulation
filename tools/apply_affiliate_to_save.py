@@ -20,23 +20,24 @@
 사용법: game.db와 같은 폴더에 넣고 `py apply_affiliate_to_save.py`
 실행 전에 game.db 백업 권장.
 """
+import _path  # noqa: F401  (tools/ 에서 루트 모듈을 import 하기 위한 sys.path 부트스트랩)
 import sqlite3
 import os
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "game.db")
+DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "game.db")
 
 if not os.path.exists(DB_PATH):
     print(f"game.db를 못 찾았어: {DB_PATH}")
     raise SystemExit(1)
 
-jsonl_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "affiliate_raw.jsonl")
+jsonl_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "affiliate_raw.jsonl")
 if not os.path.exists(jsonl_path):
     print(f"data/affiliate_raw.jsonl을 못 찾았어: {jsonl_path}")
     print("이 파일이 있어야 분류를 적용할 수 있어 — 게임 폴더 안 data/ 서브폴더를 확인해줘.")
     raise SystemExit(1)
 
 import sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from affiliate_classify import apply_classification
 
 conn = sqlite3.connect(DB_PATH)

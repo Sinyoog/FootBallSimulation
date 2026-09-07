@@ -232,6 +232,53 @@ def _club_strength_salary_mult(team_id) -> float:
 
 
 def _team_rank_status_mult(team_id, tier: int = 1, season=None) -> float:
+    """[2026-09 최적화 래퍼] 계산 본체는 _team_rank_status_mult_uncached.
+
+    이 함수는 이적시장 한 번에 4,438회 불리는데, 매번 teams SELECT +
+    get_league_standings(순위표 재집계)를 새로 돈다(cProfile 실측: 누적
+    2.0s로 이적시장 시간의 상당 부분). 결과는 (team_id, tier, season)
+    만으로 결정되지만 순위표는 경기가 치러지면 바뀌는 '가변' 데이터라
+    프로세스 수명 캐시는 위험하다 — 그래서 경기가 단 한 경기도 치러지지
+    않는 구간(이적시장 루프)에서만 호출부가 begin_fee_batch() /
+    end_fee_batch()로 명시적으로 열고 닫는 캐시를 쓴다. 배치 밖에서는
+    캐시가 아예 비활성이라 예전과 100% 동일하게 매번 새로 계산한다.
+    본체는 순수 조회라 같은 입력이면 같은 값이 나오므로, 배치 구간
+    안에서 캐시를 써도 반환값이 달라지지 않는다."""
+    if not _FEE_BATCH["on"]:
+        return _team_rank_status_mult_uncached(team_id, tier, season)
+    _ck = (team_id, tier, season)
+    _rank_cache = _FEE_BATCH["rank"]
+    _v = _rank_cache.get(_ck)
+    if _v is None:
+        _v = _team_rank_status_mult_uncached(team_id, tier, season)
+        _rank_cache[_ck] = _v
+    return _v
+
+
+# ── [2026-09 최적화] 이적료 산정 배치 구간 ───────────────────────────
+# ai_lifecycle._transfer_market 처럼 "그 구간 동안 경기 결과·팀 순위가
+# 절대 바뀌지 않는" 루프가 begin/end로 감싸면, 그 안에서만 순위표 조회
+# 결과를 재사용한다. 반드시 try/finally로 짝을 맞춰 닫아야 한다 —
+# 안 닫으면 다음 주차 경기 결과가 반영 안 된 옛 순위가 계속 쓰인다.
+_FEE_BATCH = {"on": False, "rank": {}}
+
+
+def begin_fee_batch():
+    _FEE_BATCH["rank"].clear()
+    _FEE_BATCH["on"] = True
+
+
+def end_fee_batch():
+    _FEE_BATCH["on"] = False
+    _FEE_BATCH["rank"].clear()
+
+
+# 위 _fee_affordability_cap이 쓰는 순수 함수 메모(프로세스 수명 캐시로
+# 안전한 이유는 그 호출부 주석 참고).
+_TOP_SALARY_CACHE: dict = {}
+
+
+def _team_rank_status_mult_uncached(team_id, tier: int = 1, season=None) -> float:
     """[2026-07 신설] "같은 등급이라도 그 리그 안에서 상위권/하위권이면
     협상력이 다르다"는 지적 — 구단 재정 시스템은 안 만들고, 이미 있는
     "현재 리그 순위"만 가볍게 반영한다(±5% 이내). 명문팀 리스트 밖의
@@ -409,8 +456,20 @@ def _fee_affordability_cap(country, tier, team_name, team_id, year,
     안 넘기면(하위호환) 예전처럼 직접 구한다 — 결과값은 항상 동일."""
     from constants import get_league_grade
     wealth = get_league_grade(country, "F") if country else "F"
-    top_salary_thousand = _calc_salary(wealth, tier, 99, country=country,
-                                        team_name=None, year=year, team_id=None)
+    # [2026-09 최적화] 이 _calc_salary 호출은 (wealth, tier, country, year)
+    # 네 값만으로 결정되는 순수 함수다 — team_name/team_id를 일부러 안
+    # 넘기므로(위 docstring) 명문팀·구단체급 보정이 끼어들 여지가 없고,
+    # _calc_salary 자체도 random/DB를 전혀 안 쓴다(ast 확인). 그런데
+    # 이적시장 한 번에 98,341회 호출되며 매번 같은 값을 다시 계산하고
+    # 있었다(cProfile: 누적 1.5s). 순수 함수이므로 프로세스 수명 동안
+    # 캐시해도 값이 달라질 수 없다 — 상수 테이블은 런타임에 안 바뀌고
+    # year는 키에 포함돼 있다.
+    _fk = (wealth, tier, country, year)
+    top_salary_thousand = _TOP_SALARY_CACHE.get(_fk)
+    if top_salary_thousand is None:
+        top_salary_thousand = _calc_salary(wealth, tier, 99, country=country,
+                                            team_name=None, year=year, team_id=None)
+        _TOP_SALARY_CACHE[_fk] = top_salary_thousand
     top_salary_eok = top_salary_thousand / 100_000
     mult = FEE_TO_SALARY_MULT.get(tier, FEE_TO_SALARY_MULT.get(4, 8))
     cap = top_salary_eok * mult

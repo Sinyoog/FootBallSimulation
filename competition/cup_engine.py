@@ -1369,6 +1369,14 @@ def _advance_round(t, round_name, week, p=None):
         return  # 이 라운드는 아직 없거나 미완료
 
     my_tid = p.get("current_team_id", 0) if p else 0
+    # [2026-09 버그수정] 등록 당시 내 팀(t["my_team_id"])과 지금 내 팀이
+    # 같을 때만 이 대회의 탈락/3위/4위 결과를 내 걸로 인정한다 — 아래
+    # my_tid 비교들은 전부 "지금 소속팀이 이 라운드에 실제로 뛴 팀과
+    # 같은가"만 보는데, 시즌 중 이 대회와 무관한 다른 나라로 이적한
+    # 뒤 마침 그 나라에서도 이 대회 참가팀 중 하나로 흘러들어가면(예:
+    # 이적한 팀이 마침 이 대회 엔트리에도 있는 우연) 내가 실제로 한
+    # 경기도 안 뛴 결과가 내 커리어로 잘못 기록된다.
+    my_registered_ok = bool(t.get("my_in")) and t.get("my_team_id") == my_tid
 
     is_final = (round_name == "결승")
     is_tp    = (round_name == "3·4위전")
@@ -1394,7 +1402,7 @@ def _advance_round(t, round_name, week, p=None):
             # 않고 탈락 기록도 미룬다(3/4위전 결과가 진짜 최종 성적이다).
             sf_losers.append(loser)
             continue
-        if my_tid and loser == my_tid and not is_tp:
+        if my_tid and my_registered_ok and loser == my_tid and not is_tp:
             # 내 팀이 탈락하는 희귀 케이스만 기존처럼 그 자리에서 즉시 처리
             # (커밋 순서가 _record_my_exit 호출 전에 반드시 끝나야 하므로).
             if _loser_updates:
@@ -1456,7 +1464,7 @@ def _advance_round(t, round_name, week, p=None):
     if is_tp:
         winner = _winner_of(cur[0])
         loser  = cur[0]["away_team_id"] if winner == cur[0]["home_team_id"] else cur[0]["home_team_id"]
-        if my_tid in (winner, loser):
+        if my_registered_ok and my_tid in (winner, loser):
             result_label = "3위" if my_tid == winner else "4위"
             _record_my_exit(t, result_label, 4)
         # 결승도 끝났으면 같이 대회를 종료한다.
@@ -1527,7 +1535,12 @@ def _finish_tournament(t, winner_id):
     # 무관하게 항상 남으니(세계 기록실 조회용) 여기서 로그만 걸러낸다.
     if t["country_id"] == _my_country_id(p or {}):
         add_log(f"🏆 {t['year']}년 {t['name']} 우승: {we['team_name']}", "event")
-    if my_tid == winner_id:
+    # [2026-09 버그수정, 신민용 리포트: CL과 완전히 동일한 문제] 시즌 중
+    # 다른 나라로 이적해서 이 국내컵과 이미 무관해진 뒤에도, 마침 지금
+    # 소속팀이 이 대회 우승팀과 같으면(등록 당시엔 전혀 다른 팀이었어도)
+    # 우승을 내 걸로 잘못 기록했다 — t["my_team_id"](등록 당시 내 팀)가
+    # 지금 팀과 같을 때만 인정한다.
+    if my_tid and t.get("my_in") and t.get("my_team_id") == my_tid and my_tid == winner_id:
         _record_my_exit(t, "우승", 1)
 
 

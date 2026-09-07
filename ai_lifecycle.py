@@ -20,6 +20,7 @@ import random
 import math
 import bisect   # [2026-09 신설] _find_buy_replacement의 OVR 구간 탐색용
 import contextlib   # [2026-08 최적화] _indexes_off_for_mass_update용
+import economy as _economy   # [2026-09 최적화] 이적료 산정 배치 캐시 begin/end용
 from database import (get_conn, calc_ovr, ALL_STATS, KEY_STATS_BY_POS,
                       roll_bench_position)
 # [2026-08 신설, 포메이션 20개 확장 + 스쿼드 적합도 시스템] 모듈 레벨에서
@@ -34,6 +35,20 @@ try:
     _HAS_NUMPY = True
 except ImportError:
     _HAS_NUMPY = False
+
+# [2026-09 최적화, 대체자탐색] _find_buy_replacement의 "전세계 후보" 경로만
+# numpy 마스크로 바꾼다. 실측(24시즌차 실제 세이브, 2024 오프시즌):
+#   전세계 경로  1,867회 × 평균 6,619명 = 12,358,293회 파이썬 루프 (스캔의 98.5%)
+#   자국 경로   3,718회 × 평균    50명 =    185,047회            (1.5%)
+# 이 루프의 필터는 84.3%가 생존한다 — 6,619명을 훑어 5,577명 리스트를 만들고
+# 거기서 1명만 뽑는 구조라, "덜 거르게" 만들 여지가 없고 반복 횟수 자체를
+# 줄여야 한다. 후보의 순서·가중치·난수 소비를 그대로 두고 마스크 계산만
+# C 레벨로 내린다(프로토타입 실측 15.7배, 결과는 비트 단위로 동일 —
+# np.cumsum이 itertools.accumulate와 같은 순차 누적이라 부동소수점까지
+# 일치하고, random.choices와 마찬가지로 random()을 정확히 1회만 쓴다).
+# 문제가 생기면 이 플래그만 False로 내리면 예전 파이썬 경로로 즉시 복귀한다
+# (양쪽 코드가 나란히 남아 있고, 자국 경로는 애초에 안 건드렸다).
+USE_NUMPY_GLOBAL_POOL = True
 
 # ── [2026-08 신설, 신민용 요청: "명문팀 강등 스노우볼이 실제로
 #    _retire_and_replace 때문인지 시즌별로 확인하고 싶다"] ──────────
@@ -686,7 +701,16 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
         "contract_end_year, last_transfer_year FROM ai_players ORDER BY id").fetchall()
 
     _report(2, "전세계 이적시장 처리 중")
-    moved      = _transfer_market(c, year, shared_ai_rows, verbose_log=verbose_log, my_team_id=my_team_id)
+    # [2026-09 최적화] 이적시장 루프가 도는 동안은 경기가 단 한 경기도
+    # 치러지지 않아 리그 순위표가 절대 안 바뀐다 — 그 구간에서만
+    # economy._team_rank_status_mult(팀 순위 조회) 결과 재사용을 허용한다.
+    # 반드시 try/finally로 닫아야 한다(안 닫으면 다음 주차 경기 결과가
+    # 반영 안 된 옛 순위가 계속 쓰인다).
+    _economy.begin_fee_batch()
+    try:
+        moved  = _transfer_market(c, year, shared_ai_rows, verbose_log=verbose_log, my_team_id=my_team_id)
+    finally:
+        _economy.end_fee_batch()
     _ta3 = _time_perf.perf_counter()
     # [2026-09 신설, 신민용 요청: "명문팀은 상시로 좋은 선수를 스카우팅
     # 해야 한다 — 3급은 압도적인 선수, 2급/1급은 상대적으로 덜한 선수"]
@@ -837,8 +861,17 @@ def run_ai_mid_season_transfer(year, verbose_log=None, my_team_id=None):
     ai_rows = c.execute(
         "SELECT id, team_id, position, age, name, ovr, nationality, "
         "contract_end_year, last_transfer_year FROM ai_players ORDER BY id").fetchall()
-    moved = _transfer_market(c, year, ai_rows, verbose_log=verbose_log, my_team_id=my_team_id,
-                              volume_scale=0.15, is_mid_season=True)
+    # [2026-09 최적화] 이적시장 루프가 도는 동안은 경기가 단 한 경기도
+    # 치러지지 않아 리그 순위표가 절대 안 바뀐다 — 그 구간에서만
+    # economy._team_rank_status_mult(팀 순위 조회) 결과 재사용을 허용한다.
+    # 반드시 try/finally로 닫아야 한다(안 닫으면 다음 주차 경기 결과가
+    # 반영 안 된 옛 순위가 계속 쓰인다).
+    _economy.begin_fee_batch()
+    try:
+        moved = _transfer_market(c, year, ai_rows, verbose_log=verbose_log, my_team_id=my_team_id,
+                                  volume_scale=0.15, is_mid_season=True)
+    finally:
+        _economy.end_fee_batch()
     conn.commit()
     conn.close()
     # [2026-08 신설] 이적으로 team_id가 바뀐 선수가 있으므로, 포메이션
@@ -1539,6 +1572,7 @@ def _build_buy_pools(rows, team_info=None):
     # 스캔의 98%라 시즌당 약 0.3초). 판정에 쓰는 표도, 기본값(1)도 원본과
     # 완전히 같은 것을 쓴다.
     _rank_of = {}
+    _cty_code: dict = {}   # 국가명 -> 정수코드(numpy 비교용, 이 호출 안에서만 유효)
     if team_info is not None:
         try:
             from economy import LEAGUE_GRADE_RANK as _rank_of
@@ -1579,8 +1613,53 @@ def _build_buy_pools(rows, team_info=None):
                     _b = by_country[_cn] = ([], [])
                 _b[0].append(_e)
                 _b[1].append(r["ovr"])
-        pools[pos] = (lst, ovrs, by_country or None, entries or None)
+        # [2026-09 최적화] 전세계 경로 전용 numpy 미러(고정 배열).
+        # entries와 완전히 같은 순서·같은 값이며, 시즌 내내 안 변하는
+        # 것들만 담는다(팀ID/국가코드/리그등급랭크/나이). 변하는 것은
+        # used(아래 bool 배열)와 팀 포지션그룹 인원수(_build_team_pos_
+        # group_count의 "__ok__" 미러)뿐이라, 그 둘만 갱신하면 된다.
+        _np = None
+        if entries and USE_NUMPY_GLOBAL_POOL and _HAS_NUMPY:
+            try:
+                _np = (
+                    np.fromiter((e[2] for e in entries), np.int64, len(entries)),
+                    np.fromiter((_cty_code.setdefault(e[3], len(_cty_code)) for e in entries),
+                                np.int32, len(entries)),
+                    np.fromiter((e[4] for e in entries), np.int16, len(entries)),
+                    # 원본 판정이 (age or 25)이므로 그 치환을 여기서 미리 해둔다.
+                    np.fromiter(((e[5] or 25) for e in entries), np.int16, len(entries)),
+                    np.zeros(len(entries), dtype=bool),          # used 마스크
+                    {e[1]: i for i, e in enumerate(entries)},     # player_id -> 인덱스
+                    _cty_code,
+                    max(e[2] for e in entries),                   # 팀ID 최댓값(경계검사용)
+                )
+            except Exception:
+                _np = None   # 어떤 이유로든 실패하면 조용히 기존 경로로
+        pools[pos] = (lst, ovrs, by_country or None, entries or None, _np)
     return pools
+
+
+def _np_mark_buy_used(pools, row):
+    """[2026-09] _buy_used_ids.add()와 짝 — numpy used 마스크에도 같은
+    선수를 표시한다. 미러가 없으면(플래그 off / numpy 없음) 아무것도 안 함."""
+    pool = pools.get(row["position"]) if pools else None
+    _np = pool[4] if (pool and len(pool) > 4) else None
+    if _np is None:
+        return
+    i = _np[5].get(row["id"])
+    if i is not None:
+        _np[4][i] = True
+
+
+def _np_sync_grp_ok(team_pos_group_count, grp, team_id, new_count):
+    """[2026-09] _bg[tid] 갱신과 짝 — 원본 판정 `count <= 1 이면 제외`를
+    그대로 bool 배열(True=쓸 수 있음)에 반영한다."""
+    ok = team_pos_group_count.get("__ok__") if team_pos_group_count else None
+    if not ok:
+        return
+    arr = ok.get(grp)
+    if arr is not None and 0 <= team_id < arr.size:
+        arr[team_id] = (new_count > 1)
 
 
 def _build_team_pos_group_count(rows):
@@ -1603,6 +1682,26 @@ def _build_team_pos_group_count(rows):
             _g = counts[grp] = {}
         _tid = r["team_id"]
         _g[_tid] = _g.get(_tid, 0) + 1
+    # [2026-09 최적화] 전세계 경로 전용 미러 — 원본 판정
+    # `counts[grp].get(team_id, 0) <= 1 이면 제외`와 정확히 같은 뜻의
+    # bool 배열(True=후보로 쓸 수 있음). 표에 없는 팀은 기본 0이므로
+    # False로 남아 원본과 동일하게 제외된다. 그룹 키와 안 겹치는
+    # "__ok__"에 담아 호출부 시그니처를 안 바꾼다.
+    if USE_NUMPY_GLOBAL_POOL and _HAS_NUMPY and counts:
+        try:
+            _max_tid = max(max(g) for g in counts.values() if g)
+            counts["__ok__"] = {
+                grp: np.zeros(_max_tid + 1, dtype=bool) for grp in counts
+            }
+            for grp, g in counts.items():
+                if grp == "__ok__":
+                    continue
+                arr = counts["__ok__"][grp]
+                for _t, _n in g.items():
+                    if _n > 1:
+                        arr[_t] = True
+        except Exception:
+            counts.pop("__ok__", None)
     return counts
 
 
@@ -1656,7 +1755,8 @@ def _find_buy_replacement(position, target_ovr, dst_team_id, dst_cname,
     pool = pools.get(position)
     if not pool:
         return None
-    rows_sorted, ovrs_sorted, by_country, entries = pool
+    rows_sorted, ovrs_sorted, by_country, entries = pool[0], pool[1], pool[2], pool[3]
+    _npm = pool[4] if len(pool) > 4 else None
     lo = target_ovr - BUY_REPLACEMENT_OVR_BAND[0]
     hi = target_ovr + BUY_REPLACEMENT_OVR_BAND[1]
     i0 = bisect.bisect_left(ovrs_sorted, lo)
@@ -1721,14 +1821,72 @@ def _find_buy_replacement(position, target_ovr, dst_team_id, dst_cname,
             out.append(e)
         return out
 
+    # ── [2026-09 최적화] 전세계 경로 numpy 구현 ──────────────────
+    # _filter(False)(전세계 후보 수집) + 그 뒤의 가중추첨을 하나로 합친
+    # 것과 정확히 같은 일을 한다. 판정 조건은 위 _filter의 것을 그대로
+    # 옮겼고(순서만 다를 뿐 전부 AND라 결과집합 동일), 후보의 순서도
+    # 원본과 같은 "정렬 리스트의 부분수열"이라 뽑히는 자리도 같다.
+    # random.choices(pop, weights, k=1)의 내부 구현
+    #   cum = list(accumulate(weights)); total = cum[-1] + 0.0
+    #   return pop[bisect(cum, random() * total, 0, n - 1)]
+    # 을 numpy로 그대로 재현한다 — np.cumsum은 순차 누적이라 부동소수점
+    # 결과가 accumulate와 비트 단위로 같고, random()도 정확히 1회만 쓴다.
+    _ok_all = team_pos_group_count.get("__ok__") if team_pos_group_count else None
+    _ok_arr = _ok_all.get(_grp) if _ok_all else None
+    _np_ready = (USE_NUMPY_GLOBAL_POOL and _HAS_NUMPY and _npm is not None
+                 and _ok_arr is not None and _npm[7] < _ok_arr.size)
+
+    def _pick_global_np():
+        """전세계 후보를 마스크로 걸러 바로 1명을 뽑는다.
+        후보가 없으면 None(난수 소비 없음)."""
+        _t, _c, _r, _a, _u, _i2, _code, _tmax = _npm
+        _ts = _t[i0:i1]
+        m = (_ts != dst_team_id) & (~_u[i0:i1]) & (_c[i0:i1] != _code.get(dst_cname, -1))
+        m &= _ok_arr[_ts]
+        if global_scouting:
+            m &= (_r[i0:i1] <= dst_rank)
+        idx = np.flatnonzero(m)
+        n = idx.size
+        if n == 0:
+            return None
+        w = np.where(_a[i0:i1][idx] <= BUY_REPLACEMENT_YOUNG_AGE,
+                     BUY_REPLACEMENT_YOUNG_WEIGHT, 1.0)
+        cum = np.cumsum(w)
+        total = float(cum[-1]) + 0.0
+        j = int(np.searchsorted(cum, random.random() * total, side="right"))
+        if j > n - 1:
+            j = n - 1
+        return rows_sorted[i0 + int(idx[j])]
+
+    def _note_scan():
+        # 파이썬 경로의 _cands_cell 계측과 같은 의미(전세계 슬라이스를
+        # 실제로 훑었다)를 numpy 경로에서도 그대로 남긴다.
+        if stats is not None:
+            stats["global_scan_calls"] = stats.get("global_scan_calls", 0) + 1
+            stats["global_scanned"] = stats.get("global_scanned", 0) + (i1 - i0)
+
     if global_scouting:
-        chosen = _filter(False)   # 전세계(자국 제외) 우선
-        if not chosen:
+        if _np_ready:
+            _note_scan()
+            _hit = _pick_global_np()
+            if _hit is not None:
+                return _hit
             chosen = _filter(True)   # 없으면 자국으로 폴백
+        else:
+            chosen = _filter(False)   # 전세계(자국 제외) 우선
+            if not chosen:
+                chosen = _filter(True)   # 없으면 자국으로 폴백
     else:
         chosen = _filter(True)    # 기존 동작: 자국 우선
         if not chosen:
-            chosen = _filter(False)   # 없으면 해외로 폴백
+            if _np_ready:
+                _note_scan()
+                _hit = _pick_global_np()
+                if _hit is not None:
+                    return _hit
+                chosen = []
+            else:
+                chosen = _filter(False)   # 없으면 해외로 폴백
     # [2026-09 계측] _cands_cell은 _global_cands()가 최소 한 번이라도
     # 호출됐을 때만(같은 함수 안에서 메모이즈) 채워진다 — 즉 이 호출이
     # global_scouting=True로 시작했든, 자국 우선이 실패해 해외로 폴백
@@ -1828,9 +1986,21 @@ def _prestige_scouting(c, year):
     cname_by_tid = {t["id"]: t["cname"] for t in team_rows}
 
     prestige_clubs = []  # [(team_id, level), ...]
+    # [2026-09 재현성 버그수정] PRESTIGE_TEAMS[국가][등급]의 값은 set이다
+    # (data/prestige_clubs.py 구조 주석 참고). 파이썬 3.7+에서 dict은
+    # 삽입순서를 보존하지만 set은 원소 해시 순으로 순회하고, 문자열 해시는
+    # PYTHONHASHSEED에 따라 실행마다 달라진다 — 그래서 정렬 없이 그냥
+    # 순회하면 prestige_clubs의 초기 순서가 실행마다 바뀌고, 바로 아래
+    # random.shuffle()이 "같은 RNG 상태 + 다른 입력 순서"를 받아 서로 다른
+    # 순열을 내놓는다. 그 뒤 팀별로 도는 루프에서 random.shuffle(positions)의
+    # 소비량(포지션 종류 수)이 팀마다 달라 전역 RNG 스트림 자체가 갈라졌고,
+    # 이 시점 이후의 모든 난수가 어긋났다(같은 세이브·같은 시드로 두 번
+    # 돌렸을 때 결과가 달라지던 근본 원인). 팀명 사전순으로 고정한다 —
+    # 어차피 직후에 shuffle로 균등 섞기 때문에 밸런스에는 영향이 없다
+    # (정렬은 "shuffle에 들어가는 입력 순서"를 결정론적으로 만들 뿐).
     for cname, levels in PRESTIGE_TEAMS.items():
         for level, names in levels.items():
-            for tname in names:
+            for tname in sorted(names):
                 tid = tid_by_name.get((cname, tname))
                 if tid is not None:
                     prestige_clubs.append((tid, level))
@@ -1862,7 +2032,12 @@ def _prestige_scouting(c, year):
         _dst_ceiling = _dst_rng[1] if _dst_rng else 43
         lo_pct, hi_pct = PRESTIGE_SCOUT_BAND.get(level, (0.03, 0.10))
         n_attempts = PRESTIGE_SCOUT_ATTEMPTS_PER_SEASON.get(level, 1)
-        positions = list({p["position"] for p in squad})
+        # [2026-09 재현성 버그수정] 위 prestige_clubs와 같은 유형 —
+        # 집합 컴프리헨션 결과를 그대로 list()로 만들면 포지션 문자열의
+        # 해시 순서(=PYTHONHASHSEED 의존)로 나열된다. 정렬해 고정하되,
+        # 바로 아래 shuffle이 균등하게 섞으므로 어떤 포지션이 뽑히는지의
+        # 확률 분포는 기존과 완전히 동일하다(밸런스 무영향).
+        positions = sorted({p["position"] for p in squad})
         random.shuffle(positions)
         for pos in positions[:n_attempts]:
             weak = min((p for p in squad if p["position"] == pos and p["id"] not in used_ids),
@@ -2315,10 +2490,15 @@ def _retire_and_replace(c, year, ai_rows=None):
             _acc_buy += _time_rt.perf_counter() - _tb0
             if _bought is not None:
                 _buy_used_ids.add(_bought["id"])
+                # [2026-09 최적화] 위 set과 짝을 이루는 numpy used 마스크
+                # 갱신 — 둘이 어긋나면 전세계 경로가 다른 선수를 뽑게
+                # 되므로 반드시 같은 자리에서 같이 갱신한다.
+                _np_mark_buy_used(_buy_pools, _bought)
                 _bgrp = _POS_GROUP.get(_bought["position"], "FW")
                 _bg = _buy_pos_group_count.setdefault(_bgrp, {})
                 _btid = _bought["team_id"]
                 _bg[_btid] = max(0, _bg.get(_btid, 1) - 1)
+                _np_sync_grp_ok(_buy_pos_group_count, _bgrp, _btid, _bg[_btid])
                 _src_tinfo = team_info.get(_bought["team_id"])
                 _src_plvl = prestige_level(_src_tinfo[3], _src_tinfo[5]) if _src_tinfo else 0
                 # [2026-09 신설] 영입한 선수의 국적/이름을 이 팀의 카운터에도
@@ -2554,6 +2734,9 @@ def _retire_and_replace(c, year, ai_rows=None):
 _OUTLIER_GAP_DIVISOR = 10.0
 _OUTLIER_COMPONENT_CAP = 3.0
 _MARKET_RANK_STEP = 0.15
+# [2026-09 최적화] _outlier_intl_multiplier 메모 — 인자 세 개(스칼라)만으로
+# 값이 완전히 결정되는 순수 함수라 프로세스 수명 캐시가 안전하다.
+_OUTLIER_MULT_CACHE: dict = {}
 
 
 def _outlier_intl_multiplier(best_ovr, team_avg_ovr, grade_rank) -> float:
@@ -2565,11 +2748,22 @@ def _outlier_intl_multiplier(best_ovr, team_avg_ovr, grade_rank) -> float:
     gap=0이면 등급과 무관하게 정확히 1.0(=5% 그대로)이 나오게 한다 —
     "시장이 약할수록 아웃라이어가 더 잘 빠져나간다"이지 "약체 시장 평균
     선수도 잘 빠져나간다"가 아니기 때문."""
+    # [2026-09 최적화] 이적시장 한 번에 1,520,447회 호출된다(cProfile 실측:
+    # 누적 1.43s — mover 후보 한 명당 1회씩 도는 자리). 실제로 등장하는
+    # (OVR, 팀평균, 등급rank) 조합 수는 팀 수 × 로스터 OVR 종류 수준이라
+    # 캐시가 아주 잘 듣는다. 계산식·부동소수 연산 순서를 전혀 안 바꾸므로
+    # 반환값은 비트 단위로 동일하다.
+    _k = (best_ovr, team_avg_ovr, grade_rank)
+    _v = _OUTLIER_MULT_CACHE.get(_k)
+    if _v is not None:
+        return _v
     gap = max(0.0, (best_ovr or 0) - (team_avg_ovr or 0))
     outlier_component = min(_OUTLIER_COMPONENT_CAP, gap / _OUTLIER_GAP_DIVISOR)
     rank = grade_rank if grade_rank is not None else 8   # 등급 정보 없으면 보정 없음(SS 취급)
     market_scale = 1.0 + max(0, 8 - rank) * _MARKET_RANK_STEP
-    return 1.0 + outlier_component * market_scale
+    _v = 1.0 + outlier_component * market_scale
+    _OUTLIER_MULT_CACHE[_k] = _v
+    return _v
 
 
 # [2026-09 버그수정, 신민용 리포트: "나라별로 리그 OVR 상한이 다르게
@@ -3009,6 +3203,24 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
     # 둘 다 "매번 다시 계산하던 같은 값"을 재사용하는 것뿐이라 결과는 동일.
     _intl_pool_by_rank: dict = {}
     _pool_meta_cache: dict = {}
+    # [2026-09 최적화, 신민용 리포트: "52주차→1주차 렉"] 이적 1건이 성사될
+    # 때마다 도는 "후처리"(이적료+연봉 산정)가 이적루프 시간의 약 36%를
+    # 차지한다 — cProfile 실측으로 economy._calc_salary 181,363회(누적
+    # 3.45s), economy.estimate_transfer_fee 75,447회(누적 2.91s).
+    #
+    # 둘 다 이 경로에서는 완전히 결정론적이다. _calc_ai_salary는 team_id를
+    # 일부러 안 넘기므로(2026-09 성능수정 주석 참고) _calc_salary의 입력이
+    # (grade, tier, ovr, country, team_name, year)뿐이고, estimate_transfer_fee도
+    # 이 호출부에서는 난수를 전혀 쓰지 않는다(economy에서 난수를 쓰는 건
+    # my_player 오퍼 전용 offer_premium_mult 하나뿐). grade/tier/country/
+    # team_name은 전부 목적지 team_id 하나로 결정되고 year는 이 호출 내내
+    # 고정이므로, 실질 키는 (목적지 팀ID, OVR[, 포지션])이다.
+    #
+    # 캐시 수명은 이 함수 호출 1회 — year가 economy_index(year)를 통해
+    # 값에 들어가므로 시즌을 넘겨 재사용하면 안 된다.
+    # 실측 히트율: 이적료 34.4% / 연봉 22.9%.
+    _fee_cache: dict = {}
+    _salary_cache: dict = {}
 
     for lid, tids in by_league.items():
         if len(tids) < 2:
@@ -3207,14 +3419,31 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
                             _is_loan = random.random() < (
                                 AI_LOAN_PROBABILITY_YOUNG if _p_age2 <= 23 else AI_LOAN_PROBABILITY_OLD)
                             _loan_return2 = year + random.randint(*AI_LOAN_DURATION_YEARS) if _is_loan else 0
-                            _new_salary2 = _calc_ai_salary(_dst_grade2, _dst_tier2, _p_ovr2,
-                                                            _dst_cname2, _dst_tname2, new_tid, year)
-                            _fee2 = estimate_transfer_fee(_dst_grade2, _dst_tier2, _p_ovr2,
-                                                           country=_dst_cname2,
-                                                           position=p_entry.get("position"),
-                                                           year=year) or 0
+                            # (위 _salary_cache/_fee_cache 주석 참고 — 값은 동일,
+                            # 같은 (목적지팀, OVR[, 포지션]) 조합만 재사용한다)
+                            _sk = (new_tid, _p_ovr2)
+                            _new_salary2 = _salary_cache.get(_sk)
+                            if _new_salary2 is None:
+                                _new_salary2 = _calc_ai_salary(_dst_grade2, _dst_tier2, _p_ovr2,
+                                                                _dst_cname2, _dst_tname2, new_tid, year)
+                                _salary_cache[_sk] = _new_salary2
+                            _fk = (new_tid, _p_ovr2, p_entry.get("position"))
+                            _fee2 = _fee_cache.get(_fk)
+                            if _fee2 is None:
+                                _fee2 = estimate_transfer_fee(_dst_grade2, _dst_tier2, _p_ovr2,
+                                                               country=_dst_cname2,
+                                                               position=p_entry.get("position"),
+                                                               year=year) or 0
+                                _fee_cache[_fk] = _fee2
                             if _is_loan:
-                                _fee2 = int(_fee2 * 0.1)  # 임대료는 완전이적료의 일부만
+                                # [2026-09 수정, 신민용 확정: "임대는 이적료
+                                # 10~20%로 맞춰줘"] 고정 10%였던 걸 매번
+                                # 10~20% 사이 무작위 비율로 바꾼다 — _fee2는
+                                # 캐시(_fee_cache)에서 막 꺼낸 "완전 이적료"
+                                # 원본이라, 여기서 곱해도 캐시된 원본 값은
+                                # 그대로 유지된다(다음 선수가 같은 캐시키로
+                                # 조회해도 다시 완전 이적료부터 시작함).
+                                _fee2 = int(_fee2 * random.uniform(0.10, 0.20))
                             salary_loan_updates.append((
                                 _new_salary2, old_tid if _is_loan else 0, _loan_return2, pid))
                             transfer_log_rows.append((
@@ -3426,6 +3655,15 @@ _POS_GROUP = {"GK": "GK",
               "CB": "DF", "LB": "DF", "RB": "DF", "LWB": "DF", "RWB": "DF", "SW": "DF",
               "CDM": "MF", "CM": "MF", "CAM": "MF", "LM": "MF", "RM": "MF", "DM": "MF", "AM": "MF"}
 
+# [2026-09 최적화] 위 표와 완전히 같은 분류를 인덱스(0~3)로만 표현한 판.
+# _do_one_transfer_cached의 그룹 인원 집계 루프가 dict 카운터 대신 4칸짜리
+# 리스트를 쓸 수 있게 하기 위한 것 — 폴백(표에 없는 포지션 → "FW")도
+# 인덱스 3으로 똑같이 대응한다. 두 표는 항상 같이 고쳐야 하며, 아래
+# assert가 import 시점에 불일치를 즉시 잡는다.
+_GROUP_ORDER = ("GK", "DF", "MF", "FW")
+_POS_GROUP_IDX = {_p: _GROUP_ORDER.index(_g) for _p, _g in _POS_GROUP.items()}
+assert all(_GROUP_ORDER[_POS_GROUP_IDX[_p]] == _g for _p, _g in _POS_GROUP.items())
+
 
 def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, protect_strength=0.85,
                              veteran_pool_tids=None, dst_grade_by_tid=None, dst_prestige_by_tid=None,
@@ -3534,16 +3772,27 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
     # 포지션 문자열 → 그룹키는 순수 대응이므로 모듈 상단에서 한 번
     # 합쳐둔 표(_POS_GROUP)로 조회 한 번에 끝낸다 — 매핑 결과는 예전과
     # 완전히 동일(표에 없는 포지션은 ATK→"FW"로 떨어지는 것까지 동일).
-    _grp_count: dict = {}
+    # [2026-09 최적화] 여기가 이 함수에서 dict.get을 가장 많이 부르던
+    # 자리다(cProfile 실측: 이 함수 하나가 이적시장 한 번에 dict.get을
+    # 1,018만 회 호출, 그중 약 730만 회가 이 두 루프). 판정 결과는 그대로
+    # 두고 두 가지만 없앤다:
+    #  (a) 집계 루프에서 그룹 카운트를 dict.get 대신 4칸짜리 리스트
+    #      누산으로 바꾼다 — 포지션→그룹 조회가 1회만 남는다.
+    #  (b) "그룹 인원이 1명 이하인 그룹"이 하나도 없으면 _protected_ids는
+    #      반드시 빈 집합이고 아래 if도 항상 거짓이라 eligible이 전혀
+    #      바뀌지 않는다. 대다수 팀(포지션 그룹당 2명 이상)이 이 경우라
+    #      두 번째 스캔 자체를 건너뛴다 — 결과는 완전히 동일하다.
     _pg = _POS_GROUP
+    _gi = _POS_GROUP_IDX
+    _cnt = [0, 0, 0, 0]
     for _p in src_players:
-        _g = _pg.get(_p["position"], "FW")
-        _grp_count[_g] = _grp_count.get(_g, 0) + 1
-    _gc = _grp_count.get
-    _protected_ids = {p["id"] for p in eligible
-                       if _gc(_pg.get(p["position"], "FW"), 0) <= 1}
-    if _protected_ids and len(_protected_ids) < len(eligible):
-        eligible = [p for p in eligible if p["id"] not in _protected_ids]
+        _cnt[_gi.get(_p["position"], 3)] += 1
+    if _cnt[0] <= 1 or _cnt[1] <= 1 or _cnt[2] <= 1 or _cnt[3] <= 1:
+        _thin = {_GROUP_ORDER[_i] for _i in range(4) if _cnt[_i] <= 1}
+        _protected_ids = {p["id"] for p in eligible
+                           if _pg.get(p["position"], "FW") in _thin}
+        if _protected_ids and len(_protected_ids) < len(eligible):
+            eligible = [p for p in eligible if p["id"] not in _protected_ids]
     # (매우 드문 극단적 예외: 팀 전체가 포지션 그룹당 딱 1명씩이라 위
     # 필터가 eligible을 통째로 비워버리는 경우엔 적용하지 않는다 —
     # 이적 자체가 완전히 멈추는 것보다는 기존 동작이 낫다.)
@@ -3560,6 +3809,11 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
         # 그 리스트의 __getitem__을 key로 쓰면 비교 자체는 C 레벨에서 끝난다
         # — 키 값(-ovr)도, 동점자 순서(파이썬 정렬은 안정 정렬)도 예전과
         # 완전히 동일하므로 뽑히는 선수가 달라지지 않는다.
+        # [2026-09 최적화] team_avg는 이 루프 내내 불변인데(아래 (a) 주석)
+        # 후보 한 명마다 team_avg.get(src, 50)을 다시 부르고 있었다 —
+        # 이적시장 한 번에 152만 회. 값이 같으므로 루프 밖으로 뺀다.
+        _src_avg = team_avg.get(src, 50)
+        _oim = _outlier_intl_multiplier
         _neg_ovr = [-e["ovr"] for e in eligible]
         ranked = sorted(range(n), key=_neg_ovr.__getitem__)
         _inv = n - 1   # n>=2 이므로 예전의 max(1, n-1)과 항상 같은 값
@@ -3605,7 +3859,7 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
             # 보호(protect_strength)를 뚫고서라도 뽑힐 확률이 오른다.
             # gap<=0(아웃라이어 아님)이거나 SS/S급이면 배수가 정확히 1.0
             # 이라 그런 선수들에게는 기존 동작과 100% 동일하게 유지된다.
-            w *= _outlier_intl_multiplier(_e["ovr"], team_avg.get(src, 50), src_grade_rank)
+            w *= _oim(_e["ovr"], _src_avg, src_grade_rank)
             weights[i] = w
         mover = random.choices(eligible, weights=weights, k=1)[0]
 
@@ -4145,6 +4399,15 @@ def _rebalance_squad_sizes(c, year):
 # ─────────────────────────────────────────────
 # 5. 포메이션 변경 (감독 교체 컨셉)
 # ─────────────────────────────────────────────
+# [2026-09 신설] hist.team_season_lineup에 my_player를 담을 때 쓰는 예약 id.
+# world_browser.MY_PLAYER_ID와 같은 값이어야 한다 — 화면 쪽(선수 검색 상세,
+# 포메이션 클릭, 이름 일괄변경 제외 규칙)이 전부 이 값을 기준으로 동작하기
+# 때문. world_browser를 import하지 않는 이유는 순환 참조 방지(그쪽이
+# ai_lifecycle을 다시 끌어옴) — 값이 바뀔 일이 없는 예약 상수라 양쪽에
+# 같은 값을 두고 주석으로 묶어둔다.
+_MY_LINEUP_ID = -1
+
+
 def _snapshot_season_positions(c, year, only_missing=False, rows=None):
     """[2026-08 신설, 신민용 요청: "이 시즌에 얘가 어디 포지션을 갔는지가
     중요한거야 — 위(선수 검색 맨 위 요약행)는 주포라 안 변하는 게
@@ -4248,6 +4511,34 @@ def _snapshot_season_positions(c, year, only_missing=False, rows=None):
             continue   # 무소속(rows를 넘겨받은 경로엔 섞여 있을 수 있음)
         by_team.setdefault(_tid, []).append(r)
 
+    # [2026-09 버그수정, 신민용 리포트: "팀 검색에서 팀을 누르고 연도를
+    # 누르면 내 팀이 뜨는데, 거기 플레이어가 들어가 있으면 플레이어가
+    # 떠야 하는데 안 뜬다"] 원인: 이 함수는 ai_players만 훑고 my_player는
+    # 아예 조회하지 않는다 — 그래서 아래 team_season_lineup(팀 검색
+    # 연도별 스쿼드 카드가 그대로 읽는 표)에도 내 선수만 통째로 빠져
+    # 있었다. 예전엔 이 함수를 안 건드리려고 snapshot_my_player_position
+    # (my_player 소속팀 하나만 targeted 조회)을 따로 뒀는데, 그 함수는
+    # my_player_position_history(내 포지션/역할)만 저장할 뿐 팀 스쿼드
+    # 자체는 손대지 않았고, 애초에 오프시즌이 다 끝난 뒤(이적 반영 후)
+    # 실행되므로 "이번 시즌을 실제로 뛴 로스터"를 기준으로 팀 라인업을
+    # 다시 쓰면 오히려 다른 팀들과 기준이 어긋난다. 그래서 팀 스쿼드
+    # 스냅샷만큼은 여기(정확한 타이밍)에서 같이 처리한다.
+    #
+    # id는 world_browser.MY_PLAYER_ID(-1)를 그대로 쓴다 — ai_players.id는
+    # 항상 1 이상의 autoincrement라 충돌하지 않고, 선수 검색/포메이션
+    # 클릭(open_to_player)/이름 일괄변경(id>=0만 대상) 등 화면 쪽이 이미
+    # 이 예약값을 전부 알고 있어서 표시·클릭이 그대로 동작한다.
+    # ai_player_position_history 쪽에는 절대 안 넣는다(내 포지션/역할은
+    # my_player_position_history 전용 — snapshot_my_player_position 담당).
+    _me = None
+    try:
+        _me_row = c.execute(
+            "SELECT current_team_id, position, ovr, age FROM my_player WHERE id=1").fetchone()
+        if _me_row and _me_row["current_team_id"]:
+            _me = _me_row
+    except Exception:
+        _me = None   # my_player 표가 아직 없는 극초기/테스트 경로 방어
+
     inserts = []
     # [2026-08 신설, 신민용 요청: "팀 검색에서 연도를 클릭하면 그 해
     # 포메이션이 떠야 한다"] 아래 루프가 팀마다 어차피 계산하는 placed
@@ -4266,14 +4557,25 @@ def _snapshot_season_positions(c, year, only_missing=False, rows=None):
         slots = FORMATION_SLOTS.get(formation, FORMATION_SLOTS["4-4-2"])
         candidates = [{"id": p["id"], "position": p["position"], "ovr": p["ovr"] or 0}
                       for p in players]
+        role_pool = [(p["id"], p["ovr"], p["age"]) for p in players]
+        # [2026-09 버그수정] 내 소속팀이면 나도 로스터의 일원으로 같이
+        # 슬롯 배정/역할 산정에 넣는다(위 _me 주석 참고) — 그래야 팀
+        # 스쿼드 카드에 내가 뜨고, "내가 주전인데 팀 라인업엔 AI가 그
+        # 자리에 있다"는 불일치도 사라진다.
+        if _me is not None and _team_id == _me["current_team_id"]:
+            candidates.append({"id": _MY_LINEUP_ID, "position": _me["position"],
+                               "ovr": _me["ovr"] or 0})
+            role_pool.append((_MY_LINEUP_ID, _me["ovr"], _me["age"]))
         placed = _greedy_fill_slots(candidates, slots)
-        roles = compute_squad_roles([(p["id"], p["ovr"], p["age"]) for p in players])
+        roles = compute_squad_roles(role_pool)
         started_ids = set()
         for slot_idx, pl in enumerate(placed):
             if pl is None:
                 continue
-            inserts.append((pl["id"], year, slots[slot_idx], roles.get(pl["id"], "")))
             started_ids.add(pl["id"])
+            if pl["id"] == _MY_LINEUP_ID:
+                continue   # 내 포지션/역할은 my_player_position_history 담당
+            inserts.append((pl["id"], year, slots[slot_idx], roles.get(pl["id"], "")))
         for p in players:
             if p["id"] not in started_ids:
                 inserts.append((p["id"], year, p["position"] or "", roles.get(p["id"], "")))
@@ -4284,9 +4586,13 @@ def _snapshot_season_positions(c, year, only_missing=False, rows=None):
         # 같이 저장해둔다 — 국가대표 스쿼드 화면(get_country_tournament_squad)의
         # 주전/후보 패턴과 동일하게 맞추기 위함. 새 연산 없이 이미 위에서 구한
         # started_ids/players를 그대로 재사용.
+        # [2026-09 버그수정] players(ai_players만) 대신 candidates(나 포함)를
+        # 쓴다 — 원소 순서와 ovr 값이 players와 1:1로 같으므로 안정 정렬
+        # 결과도 기존과 동일하고, 내가 주전에 못 들었을 때만 후보 목록에
+        # 자연스럽게 합류한다.
         bench_payload = [{"id": p["id"], "position": p["position"] or ""}
                           for p in sorted(
-                              (p for p in players if p["id"] not in started_ids),
+                              (p for p in candidates if p["id"] not in started_ids),
                               key=lambda p: -(p["ovr"] or 0))]
         team_inserts.append((_team_id, year, formation,
                               json.dumps(slots_payload), json.dumps(bench_payload)))
@@ -4353,29 +4659,41 @@ def _snapshot_season_ratings(c, year, team_goals_for=None):
     공식에 넣는다. 그 팀이 그 해 그 대회에 아예 안 나갔으면(경기수 0)
     그 팀 선수들은 그 대회 행 자체가 안 생긴다."""
     from game_engine import (_estimate_ai_season, _estimate_ai_clean_sheets, _estimate_ai_gk_saves,
-                              _team_goal_scale_factors, _apply_squad_depth_decay)
+                              _team_goal_scale_factors, _apply_squad_depth_decay,
+                              _apply_ace_concentration, _apply_team_goal_budget)
     from constants import get_goal_env_mult
 
-    rows = c.execute(
+    _raw_rows = c.execute(
         """SELECT ap.id AS id, ap.position AS position, ap.ovr AS ovr,
                   ap.sub_role AS sub_role, ap.team_id AS team_id, t.league_id AS league_id
            FROM ai_players ap JOIN teams t ON ap.team_id = t.id
            WHERE ap.team_id IS NOT NULL""").fetchall()
-    if not rows:
+    if not _raw_rows:
         return
+    # [2026-09 성능] sqlite3.Row를 문자열 키로 인덱싱하는 건 컬럼 이름
+    # 목록을 매번 훑는 C 레벨 선형탐색이다. 이 함수는 26만 행을 리그 1회 +
+    # 대회 5회로 반복해서 도므로 그 조회만 수백만 회가 된다 — 조회 직후
+    # 한 번만 평탄한 튜플로 접어두고 이후 전 구간이 위치 인덱싱만 쓴다.
+    rows = [(r["id"], r["position"], r["ovr"] or 0, r["sub_role"],
+             r["team_id"], r["league_id"]) for r in _raw_rows]
+    del _raw_rows
 
     # 팀별 평균 OVR, 리그별 평균 OVR, 리그별 소속 팀 집합(풀시즌 경기수
     # 계산용) — 전세계 선수를 한 번만 훑어서 세 집계를 동시에 만든다.
+    # [2026-09 성능] 같은 패스에서 rows_by_team(팀 → 그 팀 선수의 행
+    # 인덱스)도 만들어둔다 — 아래 대회별 블록이 "그 대회 참가팀 선수만"
+    # 훑을 때 쓴다.
     team_ovr_sum, team_ovr_n = {}, {}
     league_ovr_sum, league_ovr_n = {}, {}
     league_teams = {}
-    for r in rows:
-        tid, lid, ovr = r["team_id"], r["league_id"], r["ovr"] or 0
+    rows_by_team = {}
+    for _i, (_pid, _pos, ovr, _sub, tid, lid) in enumerate(rows):
         team_ovr_sum[tid] = team_ovr_sum.get(tid, 0) + ovr
         team_ovr_n[tid] = team_ovr_n.get(tid, 0) + 1
         league_ovr_sum[lid] = league_ovr_sum.get(lid, 0) + ovr
         league_ovr_n[lid] = league_ovr_n.get(lid, 0) + 1
         league_teams.setdefault(lid, set()).add(tid)
+        rows_by_team.setdefault(tid, []).append(_i)
 
     team_avg = {tid: team_ovr_sum[tid] / team_ovr_n[tid] for tid in team_ovr_sum}
     league_avg = {lid: league_ovr_sum[lid] / league_ovr_n[lid] for lid in league_ovr_sum}
@@ -4406,31 +4724,39 @@ def _snapshot_season_ratings(c, year, team_goals_for=None):
     # 추정 유지) — 필요해지면 팀별 실제 도움 합계도 같은 방식으로 넘기면
     # 된다.
     raw = []
-    for r in rows:
-        tid, lid = r["team_id"], r["league_id"]
-        fsm = league_matches.get(lid, 38)
+    _raw_append = raw.append
+    # [2026-09 성능 2차] 예전엔 26만 행마다 league_matches/team_avg/
+    # league_avg/league_goal_mult를 각각 조회해 행당 dict.get이 4번씩
+    # (총 100만 회) 돌았다. tid가 정해지면 lid도 정해지므로 이 네 값은
+    # 팀당 한 벌뿐이다 — 팀별로 한 번만 묶어두고 행당 조회를 1번으로
+    # 줄인다(팀 수 약 1만 개). 값도 순서도 그대로다.
+    _team_ctx = {}
+    for _pid, _pos, _ovr, _sub, tid, lid in rows:
+        _cx = _team_ctx.get(tid)
+        if _cx is None:
+            _cx = _team_ctx[tid] = (league_matches.get(lid, 38),
+                                     team_avg.get(tid, 50.0),
+                                     league_avg.get(lid, 50.0),
+                                     league_goal_mult.get(lid, 1.0))
+        fsm, _ta, _la, _gm = _cx
         g, a, rt = _estimate_ai_season(
-            r["ovr"] or 0, r["position"], team_avg.get(tid, 50.0),
-            league_avg.get(lid, 50.0), r["sub_role"], full_season_matches=fsm,
-            goal_env_mult=league_goal_mult.get(lid, 1.0))
+            _ovr, _pos, _ta, _la, _sub, full_season_matches=fsm,
+            goal_env_mult=_gm)
         # [2026-09 신설, 신민용 요청: "GK들은 골 어시보단 선방률 이런걸로
         # 표시해야 하잖아"] 골/도움과 별개로 클린시트(무실점 경기 수)도
         # 같이 추정한다 — GK가 아닌 포지션도 값 자체는 계산·저장해두지만
         # (계산 비용이 적어 굳이 분기할 필요 없음), 화면에서 GK만 이
         # 값을 골/도움 대신 보여준다(world_browser_window.py).
-        cs = _estimate_ai_clean_sheets(
-            r["position"], r["ovr"] or 0, team_avg.get(tid, 50.0),
-            league_avg.get(lid, 50.0), full_season_matches=fsm)
+        cs = _estimate_ai_clean_sheets(_pos, _ovr, _ta, _la, full_season_matches=fsm)
         # [2026-09 재수정, 신민용 요청: "클린시트 말고 선방:14 실점:1
         # 선방률:93.5%로 떠야한다"] game_engine._estimate_ai_gk_saves
         # 정의부 주석 참고 — GK만 의미 있는 값이라 GK일 때만 계산한다
         # (그 외 포지션은 컬럼 기본값 0 그대로).
         saves = goals_conceded = 0
-        if r["position"] == "GK":
+        if _pos == "GK":
             saves, goals_conceded = _estimate_ai_gk_saves(
-                r["ovr"] or 0, team_avg.get(tid, 50.0), league_avg.get(lid, 50.0),
-                full_season_matches=fsm)
-        raw.append([r["id"], year, tid, fsm, g, a, rt, cs, saves, goals_conceded])
+                _ovr, _ta, _la, full_season_matches=fsm)
+        _raw_append([_pid, year, tid, fsm, g, a, rt, cs, saves, goals_conceded])
 
     # [2026-09 신설, 신민용 리포트: "팀 골이 30개면 애들이 골고루 나눠
     # 갖는 것 같다 — 득점왕이 10골 정도밖에 안 된다"] 스쿼드 뎁스 감쇠 —
@@ -4440,30 +4766,17 @@ def _snapshot_season_ratings(c, year, team_goals_for=None):
     # 컬럼 위치 고정 리스트(rows와 같은 순서로 1:1 대응)라, 그 자리에서
     # goals(row[4])/assists(row[5])만 덮어쓰는 얇은 dict 래퍼를 만들어
     # 공유 함수에 넘긴 뒤 결과를 다시 raw에 되돌려 쓴다.
-    _depth_rows = [{"team_id": r["team_id"], "position": r["position"], "ovr": r["ovr"] or 0,
+    _depth_rows = [{"team_id": r[4], "position": r[1], "ovr": r[2],
                      "goals": row[4], "assists": row[5]} for r, row in zip(rows, raw)]
     _apply_squad_depth_decay(_depth_rows, key_fn=lambda d: (d["team_id"], d["position"]))
+    # [2026-09 통일, 신민용 요청: "득점왕 판정도 세계기록실 골이랑 같은
+    # 보정을 쓰게"] 팀 실제 득점 배분도 _collect_league_candidates(개인수상
+    # 판정)와 완전히 같은 함수(_apply_team_goal_budget)를 공유한다.
+    # allow_zero=False — 여기 team_goals_for는 teams.goals_for 전체
+    # 스냅샷이라 아직 집계 안 된 팀이 0으로 섞일 수 있다(그 함수 주석 참고).
+    _apply_team_goal_budget(_depth_rows, lambda d: d["team_id"], team_goals_for)
     for row, d in zip(raw, _depth_rows):
         row[4], row[5] = d["goals"], d["assists"]
-
-    if team_goals_for:
-        # [2026-09 통일, 신민용 요청: "득점왕 판정도 세계기록실 골이랑 같은
-        # 보정을 쓰게" — 이 스케일 계수 계산 자체를 game_engine.
-        # _team_goal_scale_factors로 뽑아서 _collect_league_candidates(개인
-        # 수상 판정)와 완전히 같은 함수를 공유한다. 위 raw는 tuple이 아니라
-        # list라 row[4]를 그대로 덮어쓸 수 있어(row는 참조), 계수 계산만
-        # 공유 함수에 맡기고 적용은 여기서 그대로 한다.
-        team_estimated_sum = {}
-        for row in raw:
-            tid, g = row[2], row[4]
-            team_estimated_sum[tid] = team_estimated_sum.get(tid, 0) + g
-        team_scale = _team_goal_scale_factors(team_estimated_sum, team_goals_for)
-        if team_scale:
-            for row in raw:
-                tid = row[2]
-                scale = team_scale.get(tid)
-                if scale is not None:
-                    row[4] = max(0, round(row[4] * scale))
 
     inserts = [tuple(row) for row in raw]
     inserts.sort(key=lambda t: (t[0], t[1]))
@@ -4496,33 +4809,129 @@ def _snapshot_season_ratings(c, year, team_goals_for=None):
         for tid, n in _team_comp_match_counts(f"{_prefix}_matches", f"{_prefix}_tournaments").items():
             cl_counts[tid] = cl_counts.get(tid, 0) + n
 
+    # [2026-09 신설, 신민용 요청: "3부/4부 국내컵도 선수 평점/골/도움/
+    # 선방 기록이 생겨야 하지"] 국내컵(cup)과 완전히 같은 패턴 — 이
+    # 대회는 챔스/유로파/컨퍼런스처럼 리그와 겹치지 않는(3/4부 팀만
+    # 참가) 별개 대회라 그냥 5번째 키로 추가하면 된다. world_browser.py
+    # 쪽 _comp_stats["lower_cup"]으로 그대로 읽힌다.
     comp_match_counts = {
         "cup": _team_comp_match_counts("cup_matches", "cup_tournaments"),
         "cl":  cl_counts,
         "sc":  _team_comp_match_counts("sc_matches", "sc_tournaments"),
         "cwc": _team_comp_match_counts("cwc_matches", "cwc_tournaments"),
+        "lower_cup": _team_comp_match_counts("lower_cup_matches", "lower_cup_tournaments"),
+    }
+
+    # [2026-09 버그수정, 신민용 리포트: "국내컵/챔스 등 대회 초반 탈락한
+    # 선수도 그 대회에서 실제로 뛴 경기수 기준 풀시즌 기대치의 30%가량이
+    # 그대로 반영돼, 팀 실제 스코어(예: 0-2 탈락)와 전혀 안 맞는 골/도움이
+    # 나온다"] 위 리그(hist.ai_player_season_stats)는 team_goals_for로
+    # "Tier B" 보정을 받는데, 이 대회별 블록만 그 보정이 빠져 있었다 —
+    # _estimate_ai_season은 대회당 실제로 뛴 경기수(fsm)는 정확히 반영하지만
+    # "그 대회에서 실제로 넣은 골 합계"는 전혀 모른 채 팀 강도만으로 독립
+    # 추정하기 때문에, 한 팀이 이 대회에서 실제로 넣은 골 합계와 그 팀
+    # 선수들의 추정 골 합계가 우연히만 맞아떨어진다. _team_comp_match_counts와
+    # 완전히 같은 패턴으로 대회별 "실제 득점"(home_score/away_score 합)도
+    # 집계해서, 리그와 동일하게 team_goals_for 스케일링을 대회별로도
+    # 적용한다 — 이러면 "그 대회에서 이 팀 선수들 골을 다 더하면 그 대회
+    # 그 팀 실제 득점과 같다"가 보장된다(도움은 리그와 동일 원칙으로 대응
+    # 실측치가 없어 손대지 않는다).
+    def _team_comp_goals_for(table_matches, table_tournaments):
+        goals = {}
+        for side, score_col in (("home_team_id", "home_score"), ("away_team_id", "away_score")):
+            for row in c.execute(
+                    f"""SELECT m.{side} AS tid, COALESCE(SUM(m.{score_col}),0) AS g
+                        FROM {table_matches} m
+                        JOIN {table_tournaments} t ON m.tournament_id = t.id
+                        WHERE t.year=? AND m.home_score!=-1
+                        GROUP BY m.{side}""", (year,)).fetchall():
+                goals[row["tid"]] = goals.get(row["tid"], 0) + row["g"]
+        return goals
+
+    cl_goals = {}
+    for _prefix in ("cl", "el", "ecl"):
+        for tid, gsum in _team_comp_goals_for(f"{_prefix}_matches", f"{_prefix}_tournaments").items():
+            cl_goals[tid] = cl_goals.get(tid, 0) + gsum
+
+    comp_goals_for = {
+        "cup": _team_comp_goals_for("cup_matches", "cup_tournaments"),
+        "cl":  cl_goals,
+        "sc":  _team_comp_goals_for("sc_matches", "sc_tournaments"),
+        "cwc": _team_comp_goals_for("cwc_matches", "cwc_tournaments"),
+        "lower_cup": _team_comp_goals_for("lower_cup_matches", "lower_cup_tournaments"),
     }
 
     by_comp_inserts = []
-    for r in rows:
-        tid, lid = r["team_id"], r["league_id"]
-        for comp, counts in comp_match_counts.items():
-            fsm = counts.get(tid, 0)
-            if fsm <= 0:
-                continue
+    for comp, counts in comp_match_counts.items():
+        # [2026-09 성능, 신민용 리포트: "52주차→1주차 렉"] 예전엔 대회마다
+        # 전세계 26만 행을 통째로 다시 훑고 루프 안에서 `fsm<=0이면
+        # continue`로 걸렀다 — 5개 대회 × 26만 = 130만 회를 돌면서 실제로
+        # 계산까지 가는 건 24만 회(18%)뿐, 나머지 107만 회는 순수 낭비였다.
+        # 그 대회에 실제로 출전한 팀의 행 인덱스만 미리 모아서 훑는다.
+        #
+        # [주의] idxs.sort()는 생략하면 안 된다. _estimate_ai_season 등이
+        # 난수를 소비하므로, 순회 순서가 바뀌면 저장되는 골/도움/평점이
+        # 전부 달라진다 — 원본과 같은 rows 순서를 반드시 유지해야 한다.
+        idxs = []
+        for _tid, _n in counts.items():
+            if _n > 0:
+                _ridx = rows_by_team.get(_tid)
+                if _ridx:
+                    idxs.extend(_ridx)
+        idxs.sort()
+        comp_raw = []
+        comp_meta = []   # comp_raw와 1:1 대응하는 (position, ovr) — 뎁스 감쇠용
+        # [2026-09 성능 2차] 리그 루프와 같은 이유로 팀 단위 컨텍스트를 한
+        # 번만 만든다(대회별 블록은 40만 행이라 효과가 더 크다).
+        _cctx = {}
+        for _i in idxs:
+            _pid, _pos, _ovr, _sub, tid, lid = rows[_i]
+            _cx = _cctx.get(tid)
+            if _cx is None:
+                _cx = _cctx[tid] = (counts[tid], team_avg.get(tid, 50.0),
+                                     league_avg.get(lid, 50.0),
+                                     league_goal_mult.get(lid, 1.0))
+            fsm, _ta, _la, _gm = _cx
             g, a, rt = _estimate_ai_season(
-                r["ovr"] or 0, r["position"], team_avg.get(tid, 50.0),
-                league_avg.get(lid, 50.0), r["sub_role"], full_season_matches=fsm,
-                goal_env_mult=league_goal_mult.get(lid, 1.0))
-            cs = _estimate_ai_clean_sheets(
-                r["position"], r["ovr"] or 0, team_avg.get(tid, 50.0),
-                league_avg.get(lid, 50.0), full_season_matches=fsm)
+                _ovr, _pos, _ta, _la, _sub, full_season_matches=fsm,
+                goal_env_mult=_gm)
+            cs = _estimate_ai_clean_sheets(_pos, _ovr, _ta, _la, full_season_matches=fsm)
             saves = goals_conceded = 0
-            if r["position"] == "GK":
+            if _pos == "GK":
                 saves, goals_conceded = _estimate_ai_gk_saves(
-                    r["ovr"] or 0, team_avg.get(tid, 50.0), league_avg.get(lid, 50.0),
-                    full_season_matches=fsm)
-            by_comp_inserts.append((r["id"], year, comp, fsm, g, a, rt, cs, saves, goals_conceded))
+                    _ovr, _ta, _la, full_season_matches=fsm)
+            # tid를 맨 뒤에 임시로 붙여둔다 — 아래 스케일링에서 팀별로
+            # goals(index 4)를 찾아 덮어쓴 뒤, insert 직전에 다시 잘라낸다.
+            comp_raw.append([_pid, year, comp, fsm, g, a, rt, cs, saves, goals_conceded, tid])
+            comp_meta.append((_pos, _ovr))
+
+        # [2026-09 신설, 신민용 확정: "모든 대회가 그렇게 되어야 한다"]
+        # 스쿼드 뎁스 감쇠 — 리그(hist.ai_player_season_stats)와 개인상
+        # 판정(_collect_league_candidates)에는 이미 들어 있는데 이 대회별
+        # 블록만 빠져 있었다. 없으면 _estimate_ai_season의 포지션 기준치
+        # ±20%가 같은 포지션 주전/백업에게 거의 똑같이 붙어서, 아래 실득점
+        # 스케일을 걸어도 "팀 골을 로스터가 고르게 나눠 가진" 모양이 그대로
+        # 유지된다(득점왕이 안 튀는 원인). 반드시 스케일 '전에' 적용해야
+        # 쏠린 모양이 스케일 후에도 남는다 — 리그 쪽과 같은 순서다.
+        _depth_rows = [{"team_id": row[10], "position": m[0], "ovr": m[1],
+                         "goals": row[4], "assists": row[5], "matches": row[3]}
+                        for row, m in zip(comp_raw, comp_meta)]
+        _apply_squad_depth_decay(_depth_rows, key_fn=lambda d: (d["team_id"], d["position"]))
+        # [2026-09 신설] 포지션 사이의 집중 — 뎁스 감쇠는 같은 포지션
+        # 안에서만 몰아주므로, 이게 없으면 컵 13골이 [3,2,1,1,1,1]처럼
+        # 흩어진다(2003 세이브 실측: 국내컵 팀 톱1 비중 37%, 대회 최다
+        # 득점 7골). 짧은 대회일수록 세게 걸린다 — 국내컵(1~8경기)은
+        # 강하게, CL 결승 진출팀(13경기)은 절반쯤만.
+        _apply_ace_concentration(_depth_rows, lambda d: d["team_id"])
+        # allow_zero=True — comp_goals_for는 실제로 치른 경기(home_score
+        # !=-1) 행에서만 키를 만들므로, 값이 0이면 "경기는 했는데 한 골도
+        # 못 넣은 팀"이 확실하다. 그런 팀의 선수 개인 기록도 0이어야 한다.
+        _apply_team_goal_budget(_depth_rows, lambda d: d["team_id"],
+                                 comp_goals_for.get(comp), allow_zero=True)
+        for row, d in zip(comp_raw, _depth_rows):
+            row[4], row[5] = d["goals"], d["assists"]
+
+        by_comp_inserts.extend(tuple(row[:10]) for row in comp_raw)
 
     if by_comp_inserts:
         by_comp_inserts.sort(key=lambda t: (t[0], t[1], t[2]))
@@ -4536,8 +4945,37 @@ def _snapshot_intl_ratings_rows(c, rows):
     """[2026-09 신설] _snapshot_intl_tournament_ratings/_snapshot_intl_season_
     ratings 공유 핵심 로직 — 주어진 intl_squad 행들(이미 tournament_id로
     필터된 상태)에 대해 team_avg/tourney_avg 집계 후 추정치를 계산해
-    UPDATE한다. rows가 비어있으면 아무것도 안 함."""
-    from game_engine import _estimate_ai_season, _estimate_ai_clean_sheets, _estimate_ai_gk_saves
+    UPDATE한다. rows가 비어있으면 아무것도 안 함.
+
+    [2026-09 버그수정, 신민용 리포트: "잉글랜드 전체 골이 11인데 월드컵
+    골든부츠 1등이 잉글랜드 선수이며 14골"] 원인: 클럽 쪽(_snapshot_
+    season_ratings / by_comp 스냅샷)은 _estimate_ai_season의 순수 OVR
+    추정치를 그대로 쓰지 않고 두 단계를 더 거친다 —
+      (1) _apply_squad_depth_decay: (팀, 포지션) 안에서 OVR 1등에게
+          몰아주고 백업은 급감시켜 "골고루 나눠 갖는" 모양을 없앰
+      (2) _team_goal_scale_factors: 팀이 실제로 넣은 골 합계에 맞춰
+          전체를 비례 축소/확대
+    그런데 국제대회 경로만 이 둘이 통째로 빠져 있어서, 23명 스쿼드의
+    추정치가 그대로 저장됐다. 실측(2002 월드컵 세이브): 잉글랜드 실제
+    12골인데 AI 추정 합계 40골(3.3배), 벨기에는 3골인데 43골(14.3배).
+    개인상(_intl_award_pool)이 이 값을 그대로 읽으니 "팀 12골, 개인
+    14골"이 나온 것이다. 클럽과 똑같은 순서(뎁스 감쇠 → 실득점 스케일)
+    로 두 단계를 붙인다.
+
+    [클럽과 다른 점 — 의도된 것]
+    · 도움도 같은 계수로 스케일한다. 클럽 쪽은 골만 스케일하는데,
+      국제대회는 왜곡 배율이 3~14배라 골만 고치면 "팀 12골인데 도움왕
+      12도움" 같은 게 그대로 남는다. 골:도움 비율은 그대로 유지된다.
+    · 내 선수 득점을 AI 몫에서 뺀다. intl_squad는 AI 전용이고 내
+      기록은 intl_matches에서 따로 집계되므로(_intl_award_pool), 안
+      빼면 내가 넣은 만큼 팀 합계가 초과된다. 클럽은 한 팀에 AI가
+      20명 넘어 왜곡이 작지만 국가대표는 23명 중 1명이라 크게 티난다.
+    · 그 나라가 실제로 0골이면 AI도 0으로 만든다(경기를 치른 경우에
+      한해). 경기 자체가 없으면(아직 안 치른 대회) 스케일을 아예
+      건너뛰어 예전과 같이 둔다."""
+    from game_engine import (_estimate_ai_season, _estimate_ai_clean_sheets,
+                              _estimate_ai_gk_saves, _apply_squad_depth_decay,
+                              _apply_ace_concentration, _apply_team_goal_budget)
     if not rows:
         return
 
@@ -4556,7 +4994,10 @@ def _snapshot_intl_ratings_rows(c, rows):
     team_avg = {k: team_ovr_sum[k] / team_ovr_n[k] for k in team_ovr_sum}
     tourney_avg = {k: tourney_ovr_sum[k] / tourney_ovr_n[k] for k in tourney_ovr_sum}
 
+    # raw는 tuple이 아니라 list로 만든다 — 아래 두 보정 단계가 goals(1)/
+    # assists(2) 자리를 그 자리에서 덮어써야 하기 때문(클럽 쪽과 동일 패턴).
     updates = []
+    keys = []
     for r in rows:
         key = (r["tournament_id"], r["country"])
         t_avg = team_avg.get(key, r["ovr"] or 50.0)
@@ -4570,9 +5011,61 @@ def _snapshot_intl_ratings_rows(c, rows):
         if r["position"] == "GK":
             saves, goals_conceded = _estimate_ai_gk_saves(r["ovr"] or 0, t_avg, l_avg,
                                                             full_season_matches=fsm)
-        updates.append((rt, g, a, cs, saves, goals_conceded,
-                        r["tournament_id"], r["country"], r["player_id"]))
+        updates.append([rt, g, a, cs, saves, goals_conceded,
+                        r["tournament_id"], r["country"], r["player_id"]])
+        keys.append(key)
 
+    # ── (1) 스쿼드 뎁스 감쇠 — (대회, 국가, 포지션) 그룹 안에서 OVR
+    #        1등에게 몰아준다. 클럽은 (team_id, position)이 그룹 키인데,
+    #        국제대회는 한 선수가 여러 대회에 나올 수 있으므로 대회까지
+    #        키에 포함해야 대회별로 따로 계산된다. 반드시 아래 실득점
+    #        스케일 '전에' 적용해야, 쏠린 모양이 스케일 후에도 유지된다.
+    #        [2026-09 추가] "apps"(그 대회 출전수)를 같이 넘긴다 — 안
+    #        넘기면 OVR만 높고 한 경기도 안 뛴 선수가 1.15배 자리를
+    #        차지하고 실제 주전이 0.45배로 밀린다(2002 월드컵 실측
+    #        220개 그룹 중 62개가 이 상태였다). 자세한 건 _apply_squad_
+    #        depth_decay 문서 참고.
+    _depth_rows = [{"key": k, "position": r["position"], "ovr": r["ovr"] or 0,
+                     "goals": u[1], "assists": u[2],
+                     "apps": r["appearances"] or 0, "matches": r["appearances"] or 0}
+                    for r, u, k in zip(rows, updates, keys)]
+    _apply_squad_depth_decay(_depth_rows, key_fn=lambda d: (d["key"], d["position"]))
+    # ── (1-b) 포지션 사이의 집중 — 뎁스 감쇠만으로는 ST/LW/CAM/CM이
+    #        서로 고르게 나눠 갖는 모양이 남아서 골든부츠가 4골에서
+    #        멈춘다. 대회 길이(월드컵 7경기)만큼 강하게 걸린다.
+    _apply_ace_concentration(_depth_rows, lambda d: d["key"])
+
+    # ── (2) 그 나라가 이 대회에서 실제로 넣은 골에 맞춰 정수 배분 ────
+    _tids = sorted({k[0] for k in keys})
+    _real, _played, _mine = {}, {}, {}
+    for _t in _tids:
+        for _side, _sc in (("home", "home_score"), ("away", "away_score")):
+            for _m in c.execute(
+                    f"""SELECT {_side} AS nat, COUNT(*) AS n, COALESCE(SUM({_sc}),0) AS g
+                        FROM intl_matches
+                        WHERE tournament_id=? AND home_score>=0 AND away_score>=0
+                        GROUP BY {_side}""", (_t,)).fetchall():
+                _k = (_t, _m["nat"])
+                _real[_k] = _real.get(_k, 0) + _m["g"]
+                _played[_k] = _played.get(_k, 0) + _m["n"]
+        # 내 선수 득점은 AI에게 나눠줄 몫에서 뺀다(위 docstring 참고).
+        for _m in c.execute(
+                """SELECT my_nat AS nat, COALESCE(SUM(my_goals),0) AS g
+                   FROM intl_matches WHERE tournament_id=? AND my_played=1
+                   GROUP BY my_nat""", (_t,)).fetchall():
+            if _m["nat"]:
+                _mine[(_t, _m["nat"])] = _mine.get((_t, _m["nat"]), 0) + _m["g"]
+
+    # allow_zero=True — _budget은 실제로 치른 경기 행에서만 키를 만들므로
+    # 0이면 "경기는 했는데 무득점"이 확실하다. 아직 안 치른 대회는 키
+    # 자체가 없어 그대로 통과한다.
+    _budget = {k: max(0, _real.get(k, 0) - _mine.get(k, 0))
+               for k in set(keys) if _played.get(k, 0) > 0}
+    _apply_team_goal_budget(_depth_rows, lambda d: d["key"], _budget, allow_zero=True)
+    for u, d in zip(updates, _depth_rows):
+        u[1], u[2] = d["goals"], d["assists"]
+
+    updates = [tuple(u) for u in updates]
     updates.sort(key=lambda t: (t[6], t[7], t[8]))
     c.executemany(
         "UPDATE intl_squad SET rating=?, goals=?, assists=?, clean_sheets=?, saves=?, goals_conceded=? "
@@ -4770,15 +5263,21 @@ def _shuffle_formations(c):
         cur_formation = t["formation"] or "4-4-2"
         tendency = t["tactic_tendency"] or "BALANCED"
 
+        # [2026-09 성능] 같은 로스터로 포메이션 20개를 평가하므로 정렬·
+        # dict 접근을 팀당 1회로 접어두고 넘긴다(formation_logic.prep_roster
+        # 주석 참고 — 결과는 예전과 비트 단위로 동일하다고 실측 확인).
+        prepped = _flogic.prep_roster(roster)
         if random.random() < FORMATION_REEVAL_PROB:
-            new_formation, penalty = _flogic.choose_formation(roster, cur_formation, tendency)
+            new_formation, penalty = _flogic.choose_formation_prepped(
+                prepped, cur_formation, tendency)
             if new_formation != cur_formation:
                 changed += 1
                 formation_updates.append((new_formation, t["id"]))
                 cur_formation = new_formation
         else:
-            slots = FORMATION_SLOTS.get(cur_formation, FORMATION_SLOTS["4-4-2"])
-            penalty = _flogic.formation_fit_penalty(roster, slots)
+            _fname = cur_formation if cur_formation in FORMATION_SLOTS else "4-4-2"
+            penalty = _flogic.formation_fit_penalty_prepped(
+                prepped, _fname, FORMATION_SLOTS[_fname])
 
         fit_updates.append((_flogic.formation_fit_bonus(penalty), t["id"]))
 

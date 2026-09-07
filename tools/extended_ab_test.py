@@ -14,6 +14,7 @@ classification_status를 조회한다(팀명 매칭이라 동명 팀 케이스�
 
 사용: python3 extended_ab_test.py <off|on> <시작DB> <시즌수> <seed>
 """
+import _path  # noqa: F401  (tools/ 에서 루트 모듈을 import 하기 위한 sys.path 부트스트랩)
 import datetime
 import os
 import random

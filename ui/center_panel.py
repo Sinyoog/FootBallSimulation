@@ -44,6 +44,8 @@ def _match_card_color(mi):
         return _CL_KIND_COLOR.get(mi.get("cl_kind"), "#ffd24d")
     if mi.get("cup"):
         return "#c48aff"
+    if mi.get("lower_cup"):
+        return "#00A6A6"
     if mi.get("cwc"):
         return "#00bfff"
     if mi.get("po"):
@@ -1054,6 +1056,26 @@ class CenterPanel(QWidget):
                         ml.setText(f"🎖️ {match_info['league_name']} {rname} ({loc})\nvs {opp_disp}")
                         ml.setStyleSheet("color:#c48aff;font-weight:bold;font-size:12px;"
                                          "background:#2a1a3a;border-radius:4px;padding:4px;")
+                        ml.show()
+                elif match_info.get("lower_cup"):
+                    # [2026-09 버그수정, 신민용 리포트: "center_panel의
+                    # _match_card_color()(다음주 미리보기용)는 lower_cup을
+                    # #00A6A6(청록)으로 구분하는데, 정작 이 실제 일정카드
+                    # elif 체인엔 lower_cup 분기 자체가 없어서 마지막 else
+                    # (일반 리그, 초록)로 떨어져 리그 경기와 똑같이 보였다]
+                    # cup 분기와 동일한 필드 셰이프(league_name/round_name/
+                    # opp/opp_tier)를 그대로 쓰되, 색만 lower_cup 전용
+                    # 청록(#00A6A6)으로 분리해 다음주 미리보기와 통일한다.
+                    rname = match_info.get("round_name", "")
+                    opp   = match_info.get("opp", "")
+                    _otier = match_info.get("opp_tier")
+                    opp_disp = f"{opp} ({_otier}부)" if _otier else opp
+                    loc   = "홈" if match_info.get("is_home") else "원정"
+                    hl.setText(f"스트레스 +{self._match_stress_preview(p, match_info.get('is_home', False))}")
+                    if ml:
+                        ml.setText(f"🎖️ {match_info['league_name']} {rname} ({loc})\nvs {opp_disp}")
+                        ml.setStyleSheet("color:#00A6A6;font-weight:bold;font-size:12px;"
+                                         "background:#123333;border-radius:4px;padding:4px;")
                         ml.show()
                 elif match_info.get("cwc"):
                     # [2026-07 신설, 신민용 리포트: "클럽월드컵이 안 뜬다/색이
@@ -2745,6 +2767,16 @@ class CenterPanel(QWidget):
         po = promotion_playoff_engine.get_my_po_match(week, day=day, p=p, st=st)
         if po:
             return po
+
+        # [2026-09 신설] 3부/4부 국내컵도 PO/CWC와 같은 부류 — lower_cup_
+        # matches.day는 항상 실제 값이 채워져 있어(예선 여부와 무관하게
+        # start_lower_cup 단계에서 이미 확정) _week_intl_cl_day 게이트가
+        # 필요 없다. 국내컵(cup)은 아직 day가 없어 그 게이트 뒤에 남지만,
+        # 이 대회는 day로 바로 조회한다.
+        from competition import lower_cup_engine
+        lcm = lower_cup_engine.get_my_lower_cup_match(week, day=day, p=p, st=st)
+        if lcm:
+            return lcm
 
         # [2026-08 버그수정 2차, 신민용 리포트: "슈퍼컵이 경기가 진행됐다고는
         # 뜨는데 일정엔 안 보인다 — 리그랑 겹치면서 그러는 것 같다"]

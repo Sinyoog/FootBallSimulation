@@ -16,6 +16,7 @@ ai_lifecycle.py의 각 단계 함수를 monkeypatch해서 전/후 소비량을 �
 
 사용: python3 rng_probe.py <db_path> [시즌수]
 """
+import _path  # noqa: F401  (tools/ 에서 루트 모듈을 import 하기 위한 sys.path 부트스트랩)
 import os
 import random
 import sys

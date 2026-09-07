@@ -12,8 +12,9 @@ my_player를 그 상태로 세팅하고 generate_offers()를 1회 호출 + 짧�
 플레이하는 게 아니라, 다양한 상태 조합을 폭넓게 샘플링하는 방식 —
 분포 검증 목적에는 이쪽이 더 효율적이다(생성 시간도 훨씬 짧음).
 """
+import _path  # noqa: F401  (tools/ 에서 루트 모듈을 import 하기 위한 sys.path 부트스트랩)
 import sys, os, random, statistics
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import database
 database.init_db()

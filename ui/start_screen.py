@@ -462,6 +462,16 @@ QProgressBar::chunk { background-color: #2a8a2a; border-radius: 5px; }
         self._detail_lbl.setText(detail or "")
         QApplication.processEvents()
 
+    def show_stage(self, stage, detail="", pct=100):
+        """[2026-09 신설, 신민용 리포트: "새 선수 생성할 때 이렇게 멈추는데?"]
+        진행률(done/total)이 없는 단계를 위한 표시 — 문구만 바꾸고 이벤트를
+        한 번 돌린다. reset_game_data가 끝난 뒤에도 create_player가 몇 초
+        더 도는데(아래 _create 주석 참고) 그 구간을 이걸로 덮는다."""
+        self._stage_lbl.setText(stage)
+        self._bar.setValue(pct)
+        self._detail_lbl.setText(detail or "")
+        QApplication.processEvents()
+
 
 class NewPlayerDialog(QDialog):
     def __init__(self, parent=None):
@@ -477,12 +487,24 @@ class NewPlayerDialog(QDialog):
         StartScreen._new_game()/MainWindow.do_new_game()이 이 창을 띄우기도
         전에 미리 실행해서, 사용자 입장에선 "새 게임" 버튼을 누르자마자
         아무 피드백 없이 몇 초간 멈춘 것처럼 보였다. 진행률 창은 이 함수가
-        도는 동안에만 뜬다."""
+        도는 동안에만 뜬다.
+
+        [2026-09 수정, 신민용 리포트: "새 선수 생성할 때 이렇게 멈추는데?"]
+        예전엔 reset_game_data가 끝나자마자 이 창을 닫았는데, 그 뒤에
+        create_player가 실측 4~5초를 더 쓴다(전세계 일정 편성 2.5s +
+        포지션 이력 시딩 2.9s + OVR 이력 시딩 1.1s). 그 몇 초 동안은
+        진행률 창도 없고 메인 창도 아직 없어서, 시작 화면만 남은 채로
+        윈도우가 "(응답 없음)"으로 표시된다 — 실제로는 정상 작동 중인데
+        멈춘 것처럼 보이는 상태였다. 이제 창을 닫지 않고 돌려주고,
+        호출부가 create_player까지 끝낸 뒤에 닫는다.
+        """
         win = _WorldRegenProgressWindow(self)
         win.show()
         QApplication.processEvents()
         reset_game_data(progress_cb=win.report)
-        win.close()
+        win.show_stage("선수 생성 및 전세계 일정 편성 중...",
+                        "잠시만 기다려 주세요 (약 5초)")
+        return win
 
     def _build(self):
         # [2026-08 신설, 신민용 요청: "재능/신체특징/포지션/세부역할 클릭하면
@@ -994,7 +1016,7 @@ class NewPlayerDialog(QDialog):
         폼의 현재 선택과 무관하게 매번 새로 굴린다 — 특정 항목만 미리
         고정하고 싶으면 '✅ 생성' 버튼을 쓰면 된다(그쪽은 선택한 값은
         그대로, 안 고른 값만 랜덤으로 채운다)."""
-        self._regenerate_world_with_progress()
+        _prog_win = self._regenerate_world_with_progress()
         conn = get_conn()
         c = conn.cursor()
         c.execute("""SELECT id, name, flag FROM countries
@@ -1022,6 +1044,9 @@ class NewPlayerDialog(QDialog):
         create_player(rname, rpos, rrole, cname, cflag,
                       talent_tier=None, personality=None, physical_trait=None,
                       difficulty=rand_difficulty)
+        # [2026-09] "✅ 생성" 쪽과 같은 이유 — create_player까지 끝난 뒤에 닫는다.
+        if _prog_win is not None:
+            _prog_win.close()
         self.accept()
 
     def _update_ok_enabled(self):
@@ -1054,7 +1079,7 @@ class NewPlayerDialog(QDialog):
         # 우회 경로(엔터키 등)로 호출되면 여기서 한 번 더 막는다.
         if not self.ok_btn.isEnabled():
             return
-        self._regenerate_world_with_progress()
+        _prog_win = self._regenerate_world_with_progress()
         name = self.name_edit.text().strip()
         # 국적 먼저 확정 — 이름 자동생성(국적에 맞는 이름 뽑기)에 필요하므로,
         # 국적 선택 안 했으면(랜덤) 여기서 미리 하나 뽑아 이후 create_player
@@ -1118,4 +1143,9 @@ class NewPlayerDialog(QDialog):
                       personality=personality, physical_trait=trait,
                       start_year=start_year, start_age=start_age,
                       difficulty=self._difficulty)
+        # [2026-09] 세계 생성 + 선수 생성이 모두 끝난 뒤에야 진행률 창을
+        # 닫는다 — 예전엔 reset_game_data 직후에 닫혀서, create_player가
+        # 도는 4~5초 동안 아무 창도 없이 "(응답 없음)"으로 보였다.
+        if _prog_win is not None:
+            _prog_win.close()
         self.accept()

@@ -495,6 +495,20 @@ class ScheduleWindow(QDialog):
             _idx = self._tab.addTab(QWidget(), "🎖️ 컵대회(전체 일정)")
             self._sched_lazy_builders[_idx] = lambda: self._make_cup_tab(my_view=False)
         _sw_marks.append(("컵대회", _time_sw.perf_counter()))
+
+        # [2026-09 신설] 3부·4부 국내컵 탭 — 국내 컵대회 탭과 완전히 같은
+        # 패턴(내 경기/전체 일정 분리 + 전체 일정 지연 로딩).
+        lc_my_w = self._make_lower_cup_tab(my_view=True)
+        if lc_my_w:
+            self._tab.addTab(lc_my_w, "🏅 3부·4부컵(내 경기)")
+        if cur_label == "🏅 3부·4부컵(전체 일정)":
+            lc_all_w = self._make_lower_cup_tab(my_view=False)
+            if lc_all_w:
+                self._tab.addTab(lc_all_w, "🏅 3부·4부컵(전체 일정)")
+        elif self._lower_cup_all_exists():
+            _idx2 = self._tab.addTab(QWidget(), "🏅 3부·4부컵(전체 일정)")
+            self._sched_lazy_builders[_idx2] = lambda: self._make_lower_cup_tab(my_view=False)
+        _sw_marks.append(("3부·4부컵", _time_sw.perf_counter()))
         # [2026-07 신설] 챔피언스리그·국제대회처럼 컵대회도 토너먼트
         # 대진표(브래킷)로 보여주는 탭 — 4강 이후 결승/3·4위전이 생기면서
         # 다른 대회들과 같은 방식으로 표시할 수 있게 됐다.
@@ -576,6 +590,24 @@ class ScheduleWindow(QDialog):
         conn = get_conn()
         n = conn.execute(
             "SELECT COUNT(*) AS c FROM cup_matches WHERE tournament_id=?",
+            (t["id"],)).fetchone()["c"]
+        conn.close()
+        return n > 0
+
+    def _lower_cup_all_exists(self):
+        """3부·4부컵 버전 — _cup_all_exists와 완전히 같은 패턴, 대상
+        테이블만 lower_cup_tournaments/lower_cup_matches로 교체."""
+        from competition import lower_cup_engine
+        from game_engine import get_state, get_player
+        st = get_state(); p = get_player()
+        if not st or not p or not p.get("current_team_id"):
+            return False
+        t = lower_cup_engine._my_lower_cup_tournament(p, st["current_year"])
+        if not t:
+            return False
+        conn = get_conn()
+        n = conn.execute(
+            "SELECT COUNT(*) AS c FROM lower_cup_matches WHERE tournament_id=?",
             (t["id"],)).fetchone()["c"]
         conn.close()
         return n > 0
@@ -1907,6 +1939,99 @@ class ScheduleWindow(QDialog):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 if is_my:
                     item.setForeground(QColor("#c48aff"))
+                tbl.setItem(i, j, item)
+        conn.close()
+        lay.addWidget(tbl)
+        return outer
+
+    def _make_lower_cup_tab(self, my_view=False):
+        """3·4부컵 일정/결과 탭 — _make_cup_tab과 100% 동일한 패턴,
+        cup_matches/cup_entries 대신 lower_cup_matches/lower_cup_entries,
+        보라(#c48aff) 대신 청록(#00A6A6). lower_cup_matches.day는 항상
+        실제 값이 채워져 있어(예선 유무와 무관하게 start_lower_cup 단계
+        에서 이미 확정) 컵대회처럼 _week_intl_cl_day로 근사할 필요가 없다."""
+        from competition import lower_cup_engine
+        from game_engine import get_state, get_player, day_to_full_date_str
+
+        st = get_state()
+        p = get_player()
+        if not st or not p or not p.get("current_team_id"):
+            return None
+
+        t = lower_cup_engine._my_lower_cup_tournament(p, st["current_year"])
+        if not t:
+            return None
+
+        conn = get_conn()
+        rows = conn.execute(
+            """SELECT * FROM lower_cup_matches WHERE tournament_id=?
+               ORDER BY round_idx ASC, slot ASC""", (t["id"],)).fetchall()
+        conn.close()
+        if not rows:
+            return None
+
+        my_tid = p["current_team_id"]
+        if my_view:
+            rows = [r for r in rows
+                    if r["home_team_id"] == my_tid or r["away_team_id"] == my_tid]
+            if not rows:
+                return None
+
+        outer = QWidget()
+        lay = QVBoxLayout(outer)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+
+        hdr = QLabel(f"🏅 {t['year']}년 {t['name']}" +
+                     (f"  —  현재 성적: {t['my_result']}" if t.get("my_result") else "") +
+                     ("  (내 경기)" if my_view else "  (전체 일정)"))
+        hdr.setStyleSheet("color:#00A6A6;font-size:14px;font-weight:bold;")
+        lay.addWidget(hdr)
+
+        cols = ["라운드", "날짜", "홈팀", "스코어", "원정팀", "결과"]
+        tbl = QTableWidget(len(rows), len(cols))
+        tbl.setHorizontalHeaderLabels(cols)
+        tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        tbl.verticalHeader().setVisible(False)
+        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        tbl.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        tbl.setStyleSheet(
+            "QTableWidget{background:#1e1e1e;color:#ccc;gridline-color:#2a2a2a;border:none;}"
+            "QHeaderView::section{background:#252525;color:#888;border:none;padding:4px;}")
+
+        conn = get_conn()
+        entry_map = {
+            er["team_id"]: (er["team_name"], er["tier"])
+            for er in conn.execute(
+                "SELECT team_id, team_name, tier FROM lower_cup_entries WHERE tournament_id=?",
+                (t["id"],)).fetchall()
+        }
+        for i, r in enumerate(rows):
+            he = entry_map.get(r["home_team_id"])
+            ae = entry_map.get(r["away_team_id"])
+            hn = f"{he[0]} ({he[1]}부)" if he else "?"
+            an = f"{ae[0]} ({ae[1]}부)" if ae else "?"
+            played = r["home_score"] != -1
+            score = f"{r['home_score']}-{r['away_score']}" if played else "예정"
+            if played and r["pso_winner"]:
+                score += f" (승부차기 {r['pso_score']})"
+            is_my = r["home_team_id"] == my_tid or r["away_team_id"] == my_tid
+            if not played:
+                result = ""
+            elif r["pso_winner"]:
+                result = "승" if r["pso_winner"] == my_tid else "패"
+            else:
+                w2 = r["home_team_id"] if r["home_score"] > r["away_score"] else r["away_team_id"]
+                result = "승" if w2 == my_tid else ("무" if r["home_score"] == r["away_score"] else "패")
+            date_str = day_to_full_date_str(t["year"], r["day"])
+            vals = [r["round_name"], date_str, hn, score, an, result if (my_view or is_my) else ""]
+            for j, v in enumerate(vals):
+                item = QTableWidgetItem(str(v))
+                if j in (0, 1, 3, 5):
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if is_my:
+                    item.setForeground(QColor("#00A6A6"))
                 tbl.setItem(i, j, item)
         conn.close()
         lay.addWidget(tbl)
