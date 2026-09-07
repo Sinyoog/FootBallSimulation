@@ -200,7 +200,18 @@ def init_lower_cup_tables(c):
         is_my INTEGER DEFAULT 0, slot INTEGER DEFAULT 0,
         my_played INTEGER DEFAULT 0, my_goals INTEGER DEFAULT 0,
         my_assists INTEGER DEFAULT 0, my_saves INTEGER DEFAULT 0,
-        my_rating REAL DEFAULT 0)""")
+        my_rating REAL DEFAULT 0,
+        -- [2026-09 신설] "그 경기 당시 내 팀" — cup_matches.my_team_id와
+        -- 완전히 같은 원칙(database.py 주석 참고). 대회 단위 my_team_id는
+        -- 이적 시점에 갱신되므로(resync_my_lower_cup_registration) 과거
+        -- 경기의 홈/원정 판정 기준으로 쓸 수 없다.
+        my_team_id INTEGER DEFAULT 0)""")
+    # [2026-09 신설] 기존 세이브 마이그레이션 — 이 테이블들은 database.py의
+    # _MIGRATIONS가 아니라 여기서 CREATE되므로 ALTER도 같이 둔다.
+    try:
+        c.execute("ALTER TABLE lower_cup_matches ADD COLUMN my_team_id INTEGER DEFAULT 0")
+    except Exception:
+        pass   # 이미 있음
     c.execute("""CREATE TABLE IF NOT EXISTS lower_cup_history(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         year INTEGER, country_id INTEGER, team_name TEXT, result TEXT,
@@ -421,9 +432,10 @@ def _create_po_round(c, tid, pool, po_pool_size, week, my_team_id=None):
         is_my = 1 if my_team_id in (top[0], bottom[0]) else 0
         c.execute("""INSERT INTO lower_cup_matches
             (tournament_id, round_name, round_idx, week, day,
-             home_team_id, away_team_id, is_my, slot)
-            VALUES (?,?,?,?,?,?,?,?,?)""",
-            (tid, "예선 플레이오프", 0, week, day, top[0], bottom[0], is_my, slot))
+             home_team_id, away_team_id, is_my, slot, my_team_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (tid, "예선 플레이오프", 0, week, day, top[0], bottom[0], is_my, slot,
+             my_team_id if is_my else 0))
         slot += 1
 
 
@@ -442,15 +454,81 @@ def _create_ko_round(c, tid, team_ids, round_idx, week, my_team_id=None, round_n
         is_my = 1 if my_team_id in (home, away) else 0
         c.execute("""INSERT INTO lower_cup_matches
             (tournament_id, round_name, round_idx, week, day,
-             home_team_id, away_team_id, is_my, slot)
-            VALUES (?,?,?,?,?,?,?,?,?)""",
-            (tid, rname, round_idx, week, day, home, away, is_my, slot))
+             home_team_id, away_team_id, is_my, slot, my_team_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (tid, rname, round_idx, week, day, home, away, is_my, slot,
+             my_team_id if is_my else 0))
         slot += 1
 
 
 # ── 주간 처리 (game_engine.py 주간 루프에서 cup_engine.process_cup_week(week)
 #    바로 다음 줄에 process_lower_cup_week(week)를 추가 호출) ─────
+def resync_my_lower_cup_registration(p=None, year=None):
+    """[2026-09 신설] cup_engine.resync_my_cup_registration의 3·4부컵판 —
+    같은 결함, 같은 해법이다(그쪽 docstring에 원인 전체를 적어뒀다).
+
+    이 대회는 28주차(하반기 시작) 개막이라 여름 이적에는 안 걸리지만,
+    같은 28주차에 겨울 이적시장(run_ai_mid_season_transfer)이 함께 돌고
+    플레이어도 그 창구에서 팀을 옮길 수 있으므로 시점이 정확히 겹친다.
+    이적하면 새 팀 경기가 is_my=1로 찍히는데(라운드 생성 시 현재팀 기준)
+    get_my_lower_cup_match는 대회 단위 my_team_id로 판정해서 안 넘겨주고,
+    process_lower_cup_week는 is_my=1이면 건너뛰므로 아무도 진행시킬 수
+    없는 고아 경기가 되어 그 라운드에서 대회가 멈춘다.
+    """
+    from game_engine import get_player, get_state
+    if p is None:
+        p = get_player()
+    if not p:
+        return False
+    if year is None:
+        st = get_state()
+        if not st:
+            return False
+        year = st["current_year"]
+    my_tid = p.get("current_team_id", 0) or 0
+
+    conn = get_conn()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT id, my_in, my_team_id FROM lower_cup_tournaments WHERE year=?",
+        (year,)).fetchall()]
+    if not rows:
+        conn.close()
+        return False
+    entered = set()
+    if my_tid:
+        entered = {r["tournament_id"] for r in conn.execute(
+            "SELECT tournament_id FROM lower_cup_entries WHERE team_id=?",
+            (my_tid,)).fetchall()}
+    changed = False
+    c = conn.cursor()
+    for t in rows:
+        want = my_tid if (my_tid and t["id"] in entered) else 0
+        if (t["my_team_id"] or 0) == want:
+            continue
+        c.execute("UPDATE lower_cup_tournaments SET my_team_id=?, my_in=? WHERE id=?",
+                  (want, 1 if want else 0, t["id"]))
+        c.execute("""UPDATE lower_cup_matches
+                     SET is_my = (CASE WHEN home_team_id=? OR away_team_id=? THEN 1 ELSE 0 END),
+                         my_team_id = (CASE WHEN home_team_id=? OR away_team_id=? THEN ? ELSE 0 END)
+                     WHERE tournament_id=? AND home_score=-1""",
+                  (want, want, want, want, want, t["id"]))
+        changed = True
+    if changed:
+        conn.commit()
+    conn.close()
+    return changed
+
+
 def process_lower_cup_week(week):
+    # [2026-09 신설] 겨울 이적으로 소속팀이 바뀌었으면 먼저 등록을 맞춘다.
+    try:
+        resync_my_lower_cup_registration()
+    except Exception as _e:
+        print("[LOWERCUP] resync 실패(건너뜀):", _e, flush=True)
+    from game_engine import get_player
+    _p = get_player()
+    _my_tid_now = _p.get("current_team_id", 0) if _p else 0
+
     conn = get_conn(); c = conn.cursor()
     matches = c.execute(
         "SELECT * FROM lower_cup_matches WHERE week=? AND home_score=-1", (week,)).fetchall()
@@ -460,10 +538,30 @@ def process_lower_cup_week(week):
         m = dict(zip(cols, row))
         by_tournament.setdefault(m["tournament_id"], []).append(m)
 
+    # [2026-09 안전망, 신민용 확정 "C안"] 대회별 등록팀을 미리 읽어둔다 —
+    # is_my=1인데 등록팀도 현재팀도 아닌 경기는 플레이어가 뛸 방법이 없어
+    # (get_my_lower_cup_match가 등록팀≠현재팀이면 None) 대회 전체가 영구히
+    # 멈춘다. 위 resync가 그런 상태를 안 만들지만, 한 번이라도 생기면
+    # 치명적이라 실행 시점에도 한 겹 더 막는다.
+    _reg_by_tid = {}
+    if by_tournament:
+        _ph = ",".join("?" * len(by_tournament))
+        _reg_by_tid = {r[0]: (r[1] or 0) for r in c.execute(
+            f"SELECT id, my_team_id FROM lower_cup_tournaments WHERE id IN ({_ph})",
+            tuple(by_tournament.keys())).fetchall()}
+
     for tid, mlist in by_tournament.items():
         for m in mlist:
             if m["is_my"]:
-                continue   # 내 팀 경기는 실제 매치엔진(별도 훅)이 처리 — 여기선 AI전만
+                _reg = _reg_by_tid.get(tid, 0)
+                _h, _a = m["home_team_id"], m["away_team_id"]
+                if _reg and (_h == _reg or _a == _reg):
+                    continue   # 정상: 플레이어가 뛸 경기(별도 훅이 처리)
+                if _my_tid_now and (_h == _my_tid_now or _a == _my_tid_now):
+                    continue   # 정상: 지금 내 팀 경기
+                print(f"[LOWERCUP-ORPHAN] tournament_id={tid} match_id={m['id']} "
+                      f"week={week} is_my=1인데 등록팀({_reg})/현재팀({_my_tid_now}) "
+                      f"모두 불일치 — AI로 진행", flush=True)
             _sim_ai_lower_cup_match(c, m)
         _advance_lower_cup_round(c, tid, week)
     conn.commit(); conn.close()
@@ -726,7 +824,9 @@ def get_my_lower_cup_matches():
 
     out = []
     for m in rows:
-        my_tid = m["t_my_tid"]
+        # [2026-09 수정] 경기 행의 "그 경기 당시 내 팀" 우선, 없으면(옛 행)
+        # 대회 값으로 폴백 — cup_engine.get_my_cup_matches와 동일.
+        my_tid = m.get("my_team_id") or m["t_my_tid"]
         he = _entry_lookup(m["tournament_id"], m["home_team_id"])
         ae = _entry_lookup(m["tournament_id"], m["away_team_id"])
         is_home = (m["home_team_id"] == my_tid)

@@ -272,13 +272,18 @@ def build_tournament(cfg, year, continent, entries, my_tid, team_cap, games):
     for rd_idx, home, away in league_phase_pairs(entries, games, my_tid):
         wk = w0 + rd_idx
         is_my = 1 if my_tid in (home["team_id"], away["team_id"]) else 0
+        # [2026-09 신설] "그 경기 당시 내 팀"을 경기 행에 같이 박는다 —
+        # cup_matches.my_team_id와 완전히 같은 원칙(database.py 주석 참고).
+        # 대회 단위 my_team_id는 이적 시 갱신되므로(resync_my_registration)
+        # 과거 경기의 홈/원정 판정 기준으로 쓸 수 없다.
         match_rows.append((tid, "league", wk,
-                   home["team_id"], away["team_id"], is_my))
+                   home["team_id"], away["team_id"], is_my,
+                   my_tid if is_my else 0))
     c.executemany(f"""INSERT INTO {cfg.match_table}
                              (tournament_id, stage, week,
                               home_team_id, away_team_id,
-                              home_score, away_score, is_my, slot)
-                             VALUES(?,?,?,?,?,-1,-1,?,0)""", match_rows)
+                              home_score, away_score, is_my, slot, my_team_id)
+                             VALUES(?,?,?,?,?,-1,-1,?,0,?)""", match_rows)
     c.execute(f"UPDATE {cfg.tournament_table} SET status='league', first_stage='league' WHERE id=?",
               (tid,))
     conn.commit()
@@ -401,10 +406,11 @@ def finalize_league_phase(cfg, t, direct_cut, po_pool, playoff_week, start_knock
             is_my = 1 if my_tid in (home["team_id"], away["team_id"]) else 0
             c.execute(f"""INSERT INTO {cfg.match_table}
                          (tournament_id, stage, week, home_team_id, away_team_id,
-                          home_score, away_score, is_my, slot)
-                         VALUES(?,?,?,?,?,-1,-1,?,?)""",
+                          home_score, away_score, is_my, slot, my_team_id)
+                         VALUES(?,?,?,?,?,-1,-1,?,?,?)""",
                       (tid, "PO", playoff_week,
-                       home["team_id"], away["team_id"], is_my, slot))
+                       home["team_id"], away["team_id"], is_my, slot,
+                       my_tid if is_my else 0))
         c.execute(f"UPDATE {cfg.tournament_table} SET status='playoff' WHERE id=?", (tid,))
         conn.commit()
         conn.close()
@@ -494,9 +500,10 @@ def start_knockout(cfg, t, qualifier_ids, round_weeks, direct_ids=None, winner_i
         is_my = 1 if my_tid in (home, away) else 0
         c.execute(f"""INSERT INTO {cfg.match_table}
                      (tournament_id, stage, week, home_team_id, away_team_id,
-                      home_score, away_score, is_my, slot)
-                     VALUES(?,?,?,?,?,-1,-1,?,?)""",
-                  (tid, first_stage, next_week, home, away, is_my, slot))
+                      home_score, away_score, is_my, slot, my_team_id)
+                     VALUES(?,?,?,?,?,-1,-1,?,?,?)""",
+                  (tid, first_stage, next_week, home, away, is_my, slot,
+                   my_tid if is_my else 0))
     c.execute(f"UPDATE {cfg.tournament_table} SET status='ko', first_stage=? WHERE id=?",
               (first_stage, tid))
     conn.commit()
@@ -549,9 +556,10 @@ def advance_round(cfg, t, cur_stage, next_stage, round_weeks):
         is_my = 1 if my_tid in (home, away) else 0
         c.execute(f"""INSERT INTO {cfg.match_table}
                      (tournament_id, stage, week, home_team_id, away_team_id,
-                      home_score, away_score, is_my, slot)
-                     VALUES(?,?,?,?,?,-1,-1,?,?)""",
-                  (tid, next_stage, next_week, home, away, is_my, slot // 2))
+                      home_score, away_score, is_my, slot, my_team_id)
+                     VALUES(?,?,?,?,?,-1,-1,?,?,?)""",
+                  (tid, next_stage, next_week, home, away, is_my, slot // 2,
+                   my_tid if is_my else 0))
 
     if is_sf and len(losers) == 2:
         tp_home, tp_away = losers[0], losers[1]
@@ -559,9 +567,10 @@ def advance_round(cfg, t, cur_stage, next_stage, round_weeks):
         is_my_tp = 1 if my_tid in (tp_home, tp_away) else 0
         c.execute(f"""INSERT INTO {cfg.match_table}
                      (tournament_id, stage, week, home_team_id, away_team_id,
-                      home_score, away_score, is_my, slot)
-                     VALUES(?,?,?,?,?,-1,-1,?,999)""",
-                  (tid, "TP", tp_week, tp_home, tp_away, is_my_tp))
+                      home_score, away_score, is_my, slot, my_team_id)
+                     VALUES(?,?,?,?,?,-1,-1,?,999,?)""",
+                  (tid, "TP", tp_week, tp_home, tp_away, is_my_tp,
+                   my_tid if is_my_tp else 0))
         te_h = entry(cfg, tid, tp_home); te_a = entry(cfg, tid, tp_away)
         add_log(f"🥉 {t['name']} 3/4위전: {te_h['team_name']} vs {te_a['team_name']} ({tp_week}주차)", "event")
 
@@ -1236,6 +1245,72 @@ def get_my_matches_for_schedule(cfg, year):
     return out
 
 
+def resync_my_registration(cfg, year, p=None):
+    """[2026-09 신설, 신민용 리포트: "여름 비시즌에 이적했을 때 컵/대항전
+    일정이 이상해진다"] cup_engine.resync_my_cup_registration의 cfg판 —
+    챔스/유로파/컨퍼런스가 국내컵과 똑같은 결함을 갖고 있어 같은 방식으로
+    표준화한다.
+
+    ■ 결함
+    "이 경기가 내 경기냐"의 기준이 두 군데에서 달랐다.
+      · 경기 생성 → 그 시점 소속팀으로 is_my를 박는다
+      · 경기 진행/조회 → 대회 단위 my_team_id(대회 개막 시점 팀)로 판정
+    챔스는 5주차 개막이고 리그페이즈 대진이 그때 전부 한 번에 만들어지므로,
+    여름에 이적하면 그 시즌 내내
+      · 옛 소속팀 경기가 계속 "내 경기"로 남고
+      · 새 소속팀의 대항전 경기는 영원히 직접 뛸 수 없다
+    (국내컵과 달리 _process_one이 is_my 필터 없이 전부 AI로 돌리기 때문에
+     대회가 멈추지는 않는다 — 그래서 눈에 덜 띄었을 뿐 같은 결함이다.)
+
+    ■ 하는 일 — cup_engine과 동일한 순서
+      대회 등록팀 갱신 → 미완료 경기만 is_my/my_team_id 재계산 →
+      이미 치른 경기는 절대 수정하지 않음
+    반환: 실제로 바뀐 대회가 있었으면 True.
+    """
+    from game_engine import get_player
+    if p is None:
+        p = get_player()
+    if not p:
+        return False
+    my_tid = p.get("current_team_id", 0) or 0
+
+    conn = get_conn()
+    rows = [dict(r) for r in conn.execute(
+        f"SELECT id, my_in, my_team_id FROM {cfg.tournament_table} WHERE year=?",
+        (year,)).fetchall()]
+    if not rows:
+        conn.close()
+        return False
+    # 지금 내 팀이 그 대회 참가팀인 경우에만 "내 대회"로 잡는다 — 국내컵과
+    # 달리 대륙대항전은 나라가 아니라 팀 단위 출전이라, 참가 여부를 직접
+    # 확인해야 한다(이적한 팀이 그 대회에 아예 없으면 my_in=0).
+    entered = set()
+    if my_tid:
+        entered = {r["tournament_id"] for r in conn.execute(
+            f"SELECT tournament_id FROM {cfg.entry_table} WHERE team_id=?",
+            (my_tid,)).fetchall()}
+    changed = False
+    c = conn.cursor()
+    for t in rows:
+        want = my_tid if (my_tid and t["id"] in entered) else 0
+        if (t["my_team_id"] or 0) == want:
+            continue
+        c.execute(f"UPDATE {cfg.tournament_table} SET my_team_id=?, my_in=? WHERE id=?",
+                  (want, 1 if want else 0, t["id"]))
+        # want=0이면 home_team_id=0인 행이 없으므로 전부 0으로 떨어진다
+        # (= 옛 팀 대회는 전부 AI 진행).
+        c.execute(f"""UPDATE {cfg.match_table}
+                     SET is_my = (CASE WHEN home_team_id=? OR away_team_id=? THEN 1 ELSE 0 END),
+                         my_team_id = (CASE WHEN home_team_id=? OR away_team_id=? THEN ? ELSE 0 END)
+                     WHERE tournament_id=? AND home_score=-1""",
+                  (want, want, want, want, want, t["id"]))
+        changed = True
+    if changed:
+        conn.commit()
+    conn.close()
+    return changed
+
+
 def get_my_matches(cfg):
     """[2026-08 이동] champions_engine.get_my_cl_matches와 동일."""
     conn = get_conn()
@@ -1258,7 +1333,11 @@ def get_my_matches(cfg):
 
     out = []
     for m in rows:
-        my_tid = m["t_my_tid"]
+        # [2026-09 수정] 대회 단위 my_team_id는 이제 이적 시점에 갱신되므로
+        # (resync_my_registration) 대회 전체를 대표하지 않는다 — 경기 행에
+        # 박아둔 "그 경기 당시 내 팀"을 우선 쓴다. 그 컬럼이 생기기 전에
+        # 저장된 옛 행(0)만 예전처럼 대회 값으로 폴백한다.
+        my_tid = m.get("my_team_id") or m["t_my_tid"]
         is_home = (m["home_team_id"] == my_tid)
         opp_id = m["away_team_id"] if is_home else m["home_team_id"]
         my_s = m["home_score"] if is_home else m["away_score"]

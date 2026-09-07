@@ -2982,7 +2982,10 @@ class WorldBrowserWindow(QDialog):
             return
 
         tname = getattr(self, "_team_copy_name", None) or ""
-        widget = self._build_team_year_lineup_widget(tid, year, f"{year}년 {tname} 포메이션")
+        # [2026-09 신설] 새로 펼칠 때는 항상 하반기(half=False, 기존과 동일한
+        # "그 해를 마무리한" 로스터)부터 보여준다 — 상반기는 버튼으로 전환.
+        widget = self._build_team_year_lineup_widget(
+            tid, year, f"{year}년 {tname} 포메이션", half=False)
 
         detail_row = target_row + 1
         tbl.insertRow(detail_row)
@@ -2992,12 +2995,12 @@ class WorldBrowserWindow(QDialog):
         h = widget.sizeHint().height()
         if h > tbl.rowHeight(detail_row):
             tbl.setRowHeight(detail_row, h + 8)
-        self._team_expanded = {"year": year, "detail_row": detail_row}
+        self._team_expanded = {"year": year, "detail_row": detail_row, "half": False}
         year_item = tbl.item(target_row, 0)
         if year_item:
             tbl.scrollToItem(year_item)
 
-    def _build_team_year_lineup_widget(self, tid, year, header_title):
+    def _build_team_year_lineup_widget(self, tid, year, header_title, half=False):
         """[2026-08 신설] wb.get_team_season_lineup()이 돌려주는 그 해
         슬롯별 선수(이름만, 신민용 요청대로 OVR 없음)를 국가 검색 스쿼드
         카드(_build_country_squad_detail_widget)와 같은 스타일로 그린다.
@@ -3012,8 +3015,18 @@ class WorldBrowserWindow(QDialog):
         ai_lifecycle._snapshot_season_positions이 저장 시점에
         _greedy_fill_slots로 슬롯 배정을 끝내둔 상태라("slot" 필드가
         FORMATION_SLOTS[formation] 원본 순서와 1:1 대응) 여기서 다시
-        배정할 필요가 없다."""
-        data = wb.get_team_season_lineup(tid, year)
+        배정할 필요가 없다.
+
+        [2026-09 확장, 신민용 요청: "시즌 중 이적한 경우 상반기엔 있었지만
+        하반기엔 없는 선수가 포메이션에서 아예 안 보인다 — 상반기/하반기
+        버튼으로 나눠서 보여달라"] half가 현재 보고 있는 반기를 결정한다
+        (False=하반기, True=상반기) — wb.get_team_season_lineup에 그대로
+        전달할 뿐, 이 함수의 나머지 로직(피치·명단 렌더링)은 half와
+        무관하게 완전히 동일하다(어느 표에서 읽어왔든 starters/bench
+        형식이 같으므로). 주전/스쿼드/요약 복사 버튼도 여기서 만든
+        starters/bench를 그대로 참조하므로 자동으로 "지금 보고 있는
+        반기" 기준으로 복사된다."""
+        data = wb.get_team_season_lineup(tid, year, half=half)
         box = QFrame()
         box.setStyleSheet(
             "background:#262626;border:1px solid #3a3a3a;border-left:3px solid #4da6ff;"
@@ -3036,6 +3049,25 @@ class WorldBrowserWindow(QDialog):
             "QPushButton{background:#333;color:#ddd;border:1px solid #4a4a4a;"
             "border-radius:4px;padding:3px 10px;font-size:11px;}"
             "QPushButton:hover{background:#3d3d3d;}")
+        # [2026-09 신설, 신민용 요청: "상반기/하반기 포메이션을 버튼으로
+        # 나눠서 보여달라"] 포메이션 제목(title) 바로 뒤, 이름 일괄변경
+        # 버튼보다 앞에 배치 — 지금 보고 있는 쪽은 강조색(파랑), 나머지는
+        # 무채색 버튼으로 눌러서 전환한다. 같은 값을 눌러도 무해하게
+        # _switch_team_lineup_half가 조용히 무시한다.
+        _half_active_qss = (
+            "QPushButton{background:#4da6ff;color:#1a1a1a;border:1px solid #4da6ff;"
+            "border-radius:4px;padding:3px 10px;font-size:11px;font-weight:bold;}")
+        _half_inactive_qss = _btn_qss
+        first_half_btn = QPushButton("상반기")
+        first_half_btn.setStyleSheet(_half_active_qss if half else _half_inactive_qss)
+        first_half_btn.clicked.connect(
+            lambda: self._switch_team_lineup_half(tid, year, header_title, True))
+        second_half_btn = QPushButton("하반기")
+        second_half_btn.setStyleSheet(_half_inactive_qss if half else _half_active_qss)
+        second_half_btn.clicked.connect(
+            lambda: self._switch_team_lineup_half(tid, year, header_title, False))
+        header_row.addWidget(first_half_btn)
+        header_row.addWidget(second_half_btn)
         # [2026-09 신설, 신민용 요청: "국가 검색 대회 스쿼드에 있는 이름
         # 일괄변경을 팀 검색에도 넣어달라"] 국가 검색 스쿼드 카드
         # (_build_country_squad_detail_widget)의 rename_btn과 완전히 같은
@@ -3083,8 +3115,9 @@ class WorldBrowserWindow(QDialog):
         lay.addLayout(header_row)
 
         if not starters:
+            _half_word = "상반기" if half else "하반기"
             empty = QLabel(
-                "이 연도는 포메이션 기록이 없습니다 — 이 기능이 생기기 전 과거 시즌은 소급 조회가 안 됩니다.")
+                f"이 연도의 {_half_word} 포메이션 기록이 없습니다 — 이 기능이 생기기 전 과거 시즌은 소급 조회가 안 됩니다.")
             empty.setStyleSheet("color:#666;font-size:11px;")
             empty.setWordWrap(True)
             lay.addWidget(empty)
@@ -3121,25 +3154,57 @@ class WorldBrowserWindow(QDialog):
         새로고침 대상이 country_detail_tbl의 _country_expanded가 아니라
         team_detail_tbl의 _team_expanded다(팀 검색은 한 번에 한 팀만
         보고 있어서 tid를 따로 저장해두지 않았으므로, 여기선 이 위젯을
-        만들 때 이미 받아둔 tid 인자를 그대로 재사용해 다시 그린다)."""
-        data = wb.get_team_season_lineup(tid, year)
+        만들 때 이미 받아둔 tid 인자를 그대로 재사용해 다시 그린다).
+
+        [2026-09 확장, 상반기/하반기 버튼 신설] 지금 화면에 보이는 쪽이
+        상반기인지 하반기인지는 _team_expanded["half"]에 있다 — 일괄변경
+        대상 목록도, 새로고침 후 다시 그릴 때도 이 값을 그대로 써야
+        "하반기를 보고 있었는데 이름 바꾸고 나니 하반기로 바뀐다" 같은
+        전환이 안 생긴다."""
+        exp = getattr(self, "_team_expanded", None)
+        _half = bool(exp.get("half")) if exp and exp.get("year") == year else False
+        data = wb.get_team_season_lineup(tid, year, half=_half)
         starters, bench = data.get("starters") or [], data.get("bench") or []
         changed = open_bulk_rename_dialog(self, starters, bench)
         if not changed:
             return
-        exp = getattr(self, "_team_expanded", None)
         if not exp or exp.get("year") != year:
             return
         tbl = self.team_detail_tbl
         detail_row = exp.get("detail_row")
         if detail_row is None or not (0 <= detail_row < tbl.rowCount()):
             return
-        new_widget = self._build_team_year_lineup_widget(tid, year, header_title)
+        new_widget = self._build_team_year_lineup_widget(tid, year, header_title, half=_half)
         tbl.setCellWidget(detail_row, 0, new_widget)
         tbl.resizeRowToContents(detail_row)
         h = new_widget.sizeHint().height()
         if h > tbl.rowHeight(detail_row):
             tbl.setRowHeight(detail_row, h + 8)
+
+    def _switch_team_lineup_half(self, tid, year, header_title, half):
+        """[2026-09 신설, 신민용 요청: "시즌 중 이적한 경우 상반기엔
+        있었지만 하반기엔 없는 선수가 포메이션에서 아예 안 보인다 —
+        상반기/하반기를 버튼으로 나눠서 보여달라"] 팀 검색 연도별
+        포메이션 카드의 상반기/하반기 토글 버튼 핸들러 —
+        _on_bulk_rename_team_squad와 동일한 "위젯 다시 그려서 detail_row
+        셀에 갈아 끼우기" 패턴이다. 이미 보고 있는 반기를 다시 누르면
+        조용히 무시한다(불필요한 재조회·깜빡임 방지)."""
+        exp = getattr(self, "_team_expanded", None)
+        if not exp or exp.get("year") != year:
+            return
+        if bool(exp.get("half")) == bool(half):
+            return
+        tbl = self.team_detail_tbl
+        detail_row = exp.get("detail_row")
+        if detail_row is None or not (0 <= detail_row < tbl.rowCount()):
+            return
+        new_widget = self._build_team_year_lineup_widget(tid, year, header_title, half=half)
+        tbl.setCellWidget(detail_row, 0, new_widget)
+        tbl.resizeRowToContents(detail_row)
+        h = new_widget.sizeHint().height()
+        if h > tbl.rowHeight(detail_row):
+            tbl.setRowHeight(detail_row, h + 8)
+        exp["half"] = bool(half)
 
     def _open_world_browser_from_team_lineup(self, starters, row):
         """[2026-08 신설] 팀 검색의 그 해 포메이션 표에서 이름을 클릭하면

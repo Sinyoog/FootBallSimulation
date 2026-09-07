@@ -186,11 +186,19 @@ def _finish_tournament(t):
 def process_el_week(week):
     """CL_START_WEEK부터 매주 호출 — 5개 대륙 유로파 전부 처리."""
     from game_engine import get_state
-    from competition.competition_common import process_one
+    from competition.competition_common import process_one, resync_my_registration
     st = get_state()
     if not st:
         return
     year = st["current_year"]
+    # [2026-09 신설] 시즌 중 이적으로 소속팀이 바뀌었으면 먼저 대회 등록을
+    # 맞춘다 — 아래 is_my 판정이 전부 이 값을 전제로 한다
+    # (competition_common.resync_my_registration 주석 참고, 바뀐 게 없으면
+    #  SELECT 1~2회로 끝난다).
+    try:
+        resync_my_registration(EUROPA_CFG, year)
+    except Exception as _e:
+        print("[EL] resync_my_registration 실패(건너뜀):", _e, flush=True)
     for cont in ("유럽", "아시아", "아프리카", "남미", "북미"):
         t = get_el_tournament(year, cont)
         if not t or t["status"] == "done":

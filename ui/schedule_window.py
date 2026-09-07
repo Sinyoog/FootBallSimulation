@@ -1864,8 +1864,14 @@ class ScheduleWindow(QDialog):
 
         my_tid = p["current_team_id"]
         if my_view:
+            # [2026-09 수정, 신민용 리포트: "여름 이적하면 컵 일정이 이상해진다"]
+            # 예전엔 "지금 소속팀"만으로 걸러서, 시즌 중 이적하면 이적 전 팀에서
+            # 이미 뛴 컵 경기가 이 탭에서 통째로 사라졌다(커리어 기록에는 남아
+            # 있는데 일정 화면에서만 안 보임). 경기 행의 is_my(그 경기를 내가
+            # 뛴 경기로 확정 기록한 플래그)도 같이 본다 — 이적 전 경기는 is_my로,
+            # 이적 후 새 팀 경기는 my_tid로 들어온다.
             rows = [r for r in rows
-                    if r["home_team_id"] == my_tid or r["away_team_id"] == my_tid]
+                    if r["is_my"] or r["home_team_id"] == my_tid or r["away_team_id"] == my_tid]
             if not rows:
                 return None
 
@@ -1972,8 +1978,14 @@ class ScheduleWindow(QDialog):
 
         my_tid = p["current_team_id"]
         if my_view:
+            # [2026-09 수정, 신민용 리포트: "여름 이적하면 컵 일정이 이상해진다"]
+            # 예전엔 "지금 소속팀"만으로 걸러서, 시즌 중 이적하면 이적 전 팀에서
+            # 이미 뛴 컵 경기가 이 탭에서 통째로 사라졌다(커리어 기록에는 남아
+            # 있는데 일정 화면에서만 안 보임). 경기 행의 is_my(그 경기를 내가
+            # 뛴 경기로 확정 기록한 플래그)도 같이 본다 — 이적 전 경기는 is_my로,
+            # 이적 후 새 팀 경기는 my_tid로 들어온다.
             rows = [r for r in rows
-                    if r["home_team_id"] == my_tid or r["away_team_id"] == my_tid]
+                    if r["is_my"] or r["home_team_id"] == my_tid or r["away_team_id"] == my_tid]
             if not rows:
                 return None
 

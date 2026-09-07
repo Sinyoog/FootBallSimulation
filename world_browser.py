@@ -5729,7 +5729,7 @@ def get_team_history(team_id: int):
     return {"awards": awards, "years": out}
 
 
-def get_team_season_lineup(team_id: int, year: int):
+def get_team_season_lineup(team_id: int, year: int, half: bool = False):
     """[2026-08 신설, 신민용 요청: "팀 검색에서 연도를 클릭하면 그 해
     이 팀의 포메이션(이름만, OVR은 필요없음)이 떠야 한다"]
     ai_lifecycle._snapshot_season_positions가 매 시즌 전환마다 팀별로
@@ -5737,18 +5737,30 @@ def get_team_season_lineup(team_id: int, year: int):
     화면과 같은 로직으로 계산됨)을 읽어, 화면에 바로 뿌릴 수 있게
     이름까지 붙여서 반환한다.
 
+    [2026-09 확장, 신민용 요청: "시즌 중 이적한 경우 상반기엔 있었지만
+    하반기엔 없는 선수가 포메이션에서 아예 안 보인다 — 상반기/하반기를
+    버튼으로 나눠서 보여달라"] half=True면 hist.team_season_lineup_half
+    (ai_lifecycle._snapshot_team_lineup_half가 겨울 이적시장 직전에 찍는
+    "상반기까지" 스냅샷)를 대신 읽는다. half=False(기본값)는 기존과
+    완전히 동일하게 team_season_lineup("그 해를 마무리한(하반기)" 팀
+    기준, database.py 스키마 주석 참고)을 읽는다 — 기존 호출부는 아무것도
+    안 바꿔도 그대로 동작한다.
+
     [한계] 이 기능이 신설된 시점 이후에 처음 맞는 시즌 전환부터 쌓인다
     — 그 이전 과거 시즌(예: 2000~2003년처럼 이미 지나간 시즌)은 그 해
     이 팀 로스터가 누구였는지 자체를 지금 있는 어떤 데이터로도 재구성할
     방법이 없어 기록이 없다(ai_player_position_history와 동일한 한계).
     그런 연도는 starters가 빈 리스트로 온다 — 호출부가 "기록 없음"으로
-    처리한다."""
+    처리한다. half=True는 여기에 더해 _snapshot_team_lineup_half 신설
+    이전 시즌도 같은 이유로 비어 있다(team_season_lineup보다 늦게
+    생긴 기능이라 공백 구간이 좀 더 길 수 있다)."""
     from constants import ai_player_code
     from database import get_ai_player_custom_names
 
+    _table = "hist.team_season_lineup_half" if half else "hist.team_season_lineup"
     conn = get_conn()
     row = conn.execute(
-        "SELECT formation, slots_json, bench_json FROM hist.team_season_lineup "
+        f"SELECT formation, slots_json, bench_json FROM {_table} "
         "WHERE team_id=? AND year=?", (team_id, year)).fetchone()
     if not row:
         conn.close()

@@ -735,6 +735,15 @@ def process_cl_week(week):
     if not st:
         return
     year = st["current_year"]
+    # [2026-09 신설] 시즌 중 이적으로 소속팀이 바뀌었으면 먼저 대회 등록을
+    # 맞춘다 — 챔스는 5주차 개막에 리그페이즈 대진을 한 번에 다 만들어두므로,
+    # 이게 없으면 여름 이적 후 새 소속팀 챔스를 시즌 내내 직접 못 뛴다
+    # (competition_common.resync_my_registration 주석 참고).
+    try:
+        from competition.competition_common import resync_my_registration
+        resync_my_registration(CHAMPIONS_CFG, year)
+    except Exception as _e:
+        print("[CL] resync_my_registration 실패(건너뜀):", _e, flush=True)
 
     for cont in ("유럽", "아시아", "아프리카", "남미", "북미"):
         t = get_cl_tournament(year, cont)
@@ -1550,7 +1559,11 @@ def get_my_cl_matches():
         # 나왔다. cl_tournaments.my_team_id는 그 대회가 시작될 때 이미
         # "그 시점 내 팀"으로 고정 저장돼 있으므로, 그걸 그대로 쓴다 —
         # 이적을 몇 번을 하든 과거 기록은 항상 그 당시 팀 기준으로 정확하다.
-        my_tid = m["t_my_tid"]
+        # [2026-09 수정] 대회 단위 my_team_id는 이제 이적 시점에 갱신되므로
+        # (resync_my_registration) 대회 전체를 대표하지 않는다 — 경기 행에
+        # 박아둔 "그 경기 당시 내 팀"을 우선 쓴다. 그 컬럼이 생기기 전에
+        # 저장된 옛 행(0)만 예전처럼 대회 값으로 폴백한다.
+        my_tid = m.get("my_team_id") or m["t_my_tid"]
         is_home = (m["home_team_id"] == my_tid)
         opp_id = m["away_team_id"] if is_home else m["home_team_id"]
         my_s = m["home_score"] if is_home else m["away_score"]

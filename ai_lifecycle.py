@@ -2956,6 +2956,19 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
     # 캐싱 — 이적마다 다시 계산하면 수천 건 반복이라 성능에 영향을 준다.
     from data.prestige_clubs import prestige_level as _prestige_level_fn
     team_prestige = {t["tid"]: (_prestige_level_fn(t["cname"], t["tname"]) or 0) for t in teams}
+    # [2026-09 최적화, 이적시장 2차] 아래 _salary_cache의 키를 좁히기 위한
+    # 사전 계산. economy._calc_salary는 team_name을 오직
+    # prestige_salary_mult(country, team_name) 한 곳에서만 쓰고(그 외에는
+    # grade/tier/ovr/country/year만 본다. _calc_ai_salary가 team_id를 일부러
+    # 안 넘기므로 club_strength 보정도 항상 1.0), 그 안쪽 분기도
+    # `if team_name and country:`라 여기서 그 조건까지 그대로 재현한다.
+    # 즉 "같은 (등급, tier, 국가, 이 배율, OVR)"이면 연봉이 비트 단위로
+    # 같으므로, 팀ID 대신 이 배율을 키에 넣으면 같은 리그의 2,600여 팀이
+    # 한 칸으로 합쳐진다(배율 1.0이 대다수 — 명문팀만 값이 갈린다).
+    from data.prestige_clubs import prestige_salary_mult as _prestige_salary_mult_fn
+    sal_pmult_by_tid = {t["tid"]: (_prestige_salary_mult_fn(t["cname"], t["tname"])
+                                    if (t["tname"] and t["cname"]) else None)
+                        for t in teams}
     # [2026-08 최적화] verbose_log용 _estimate_ai_transfer_fee_display가
     # 이적마다 teams 리스트를 선형탐색(최대 2회) + 팀명 SQL SELECT 2회를
     # 추가로 날리고 있었다 — 여기서 tid→row 딕셔너리를 한 번만 만들어
@@ -3421,13 +3434,26 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
                             _loan_return2 = year + random.randint(*AI_LOAN_DURATION_YEARS) if _is_loan else 0
                             # (위 _salary_cache/_fee_cache 주석 참고 — 값은 동일,
                             # 같은 (목적지팀, OVR[, 포지션]) 조합만 재사용한다)
-                            _sk = (new_tid, _p_ovr2)
+                            # [2026-09 최적화] 예전 키는 (목적지팀ID, OVR)이라
+                            # 같은 리그의 20팀이 전부 따로 계산됐다(실측 히트율
+                            # 연봉 22.9% / 이적료 34.4%). 위 sal_pmult_by_tid
+                            # 주석대로 연봉은 (등급, tier, 국가, 명문배율, OVR)로,
+                            # 이적료는 (등급, tier, 국가, OVR, 포지션)으로 완전히
+                            # 결정되므로 키를 그쪽으로 바꾼다 — 계산식은 그대로고
+                            # 반환값도 비트 단위로 같다(결과 해시 불변으로 확인).
+                            # 실측: 이적루프 6.558s → 5.477s (-1.08s, -16.5%).
+                            _sk = (_dst_grade2, _dst_tier2, _dst_cname2,
+                                   sal_pmult_by_tid.get(new_tid), _p_ovr2)
                             _new_salary2 = _salary_cache.get(_sk)
                             if _new_salary2 is None:
                                 _new_salary2 = _calc_ai_salary(_dst_grade2, _dst_tier2, _p_ovr2,
                                                                 _dst_cname2, _dst_tname2, new_tid, year)
                                 _salary_cache[_sk] = _new_salary2
-                            _fk = (new_tid, _p_ovr2, p_entry.get("position"))
+                            # (estimate_transfer_fee는 이 호출부에서 team_name/
+                            #  team_id를 안 넘기므로 목적지 팀ID는 결과에 아무
+                            #  영향이 없다 — 아래 인자 목록 그대로가 키다.)
+                            _fk = (_dst_grade2, _dst_tier2, _dst_cname2,
+                                   _p_ovr2, p_entry.get("position"))
                             _fee2 = _fee_cache.get(_fk)
                             if _fee2 is None:
                                 _fee2 = estimate_transfer_fee(_dst_grade2, _dst_tier2, _p_ovr2,
@@ -3469,15 +3495,28 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
                             _new_list = team_players.setdefault(new_tid, [])
                             _new_list.append(p_entry)
                             _sw_by_tid[new_tid] = _size_weight(len(_new_list))
-                            if verbose_log is not None:
+                            # [2026-09 최적화, 신민용 "이적시장 7.4s" 2차]
+                            # _estimate_ai_transfer_fee_display는 이적 건마다
+                            # estimate_transfer_fee를 team_id까지 넘겨 부른다
+                            # (rank/club_strength 보정 경로 포함) — 그런데 그
+                            # 결과는 바로 아래 "목적지 국가가 5대 리그 나라인가"
+                            # 판정을 통과한 건에서만 쓰인다. 전세계 12,750팀 중
+                            # 그 5개국 비중은 한 자릿수%인데 나머지 90%+에 대해서도
+                            # 매번 계산만 하고 버리고 있었다. 판정을 계산 앞으로
+                            # 옮긴다 — 순수한 순서 교환이다(이 함수는 난수를 전혀
+                            # 쓰지 않고 DB도 안 바꾼다. 실측: rng_calls 480,229로
+                            # 동일, 결과 해시도 동일).
+                            # 실측(실제 세이브 79,233건 이적 기준, min-of-3):
+                            #   이적루프 7.383s → 6.558s (-0.83s, -11.2%)
+                            # _dst_row2가 없을 때 예전 코드는 _dst_country=None,
+                            # 지금은 _dst_cname2=""가 되는데 둘 다 5개국 튜플에
+                            # 없으므로 판정 결과가 같다.
+                            if verbose_log is not None and _dst_cname2 in _MAJOR_TRANSFER_COUNTRIES:
                                 _fee = _estimate_ai_transfer_fee_display(p_entry, old_tid, new_tid, year, team_row_by_tid)
                                 if _fee:
-                                    _dst_row2 = team_row_by_tid.get(new_tid)
-                                    _dst_country = _dst_row2["cname"] if _dst_row2 else None
-                                    if _dst_country in _MAJOR_TRANSFER_COUNTRIES:
-                                        _prev = _big_transfer_by_country.get(_dst_country)
-                                        if _prev is None or _fee[0] > _prev[0]:
-                                            _big_transfer_by_country[_dst_country] = (*_fee, p_entry["id"])
+                                    _prev = _big_transfer_by_country.get(_dst_cname2)
+                                    if _prev is None or _fee[0] > _prev[0]:
+                                        _big_transfer_by_country[_dst_cname2] = (*_fee, p_entry["id"])
                     moved += 1
     _tm4 = _time_tm.perf_counter()
 
@@ -3813,7 +3852,22 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
         # 후보 한 명마다 team_avg.get(src, 50)을 다시 부르고 있었다 —
         # 이적시장 한 번에 152만 회. 값이 같으므로 루프 밖으로 뺀다.
         _src_avg = team_avg.get(src, 50)
-        _oim = _outlier_intl_multiplier
+        # [2026-09 최적화, 이적시장 2차] _outlier_intl_multiplier를 이 루프에
+        # 한해 인라인한다. 이 함수는 mover 후보 한 명당 1회 도는 자리라
+        # 시즌당 1,438,098회 불리는데(실측), 안에 프로세스 수명 메모가 있어도
+        # "함수 호출 + 3-튜플 생성 + dict 조회"라는 고정 오버헤드는 그대로
+        # 남는다. src가 정해지면 market_scale(등급rank만의 함수)은 상수이므로
+        # 루프 밖으로 빼고, gap<=0이면 원식이 정확히 1.0을 돌려주므로
+        # (1.0 곱하기는 부동소수에서 항등) 곱셈 자체를 건너뛴다.
+        # 남는 경우의 식·연산 순서는 원본과 한 글자도 다르지 않다 —
+        # 결과 해시/rng_calls 불변으로 확인. 실측(min-of-5): 5.631s → 5.315s.
+        # (원본 함수는 다른 호출부[_transfer_market의 팀 단위 계산]에서
+        #  그대로 쓰이므로 삭제하지 않는다.)
+        _oim_ms = 1.0 + max(0, 8 - (src_grade_rank if src_grade_rank is not None else 8)) \
+                        * _MARKET_RANK_STEP
+        _oim_base = _src_avg or 0
+        _oim_cap = _OUTLIER_COMPONENT_CAP
+        _oim_div = _OUTLIER_GAP_DIVISOR
         _neg_ovr = [-e["ovr"] for e in eligible]
         ranked = sorted(range(n), key=_neg_ovr.__getitem__)
         _inv = n - 1   # n>=2 이므로 예전의 max(1, n-1)과 항상 같은 값
@@ -3859,7 +3913,10 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
             # 보호(protect_strength)를 뚫고서라도 뽑힐 확률이 오른다.
             # gap<=0(아웃라이어 아님)이거나 SS/S급이면 배수가 정확히 1.0
             # 이라 그런 선수들에게는 기존 동작과 100% 동일하게 유지된다.
-            w *= _oim(_e["ovr"], _src_avg, src_grade_rank)
+            # (위 _oim_ms 주석 참고 — _outlier_intl_multiplier 인라인)
+            _oim_gap = (_e["ovr"] or 0) - _oim_base
+            if _oim_gap > 0.0:
+                w *= 1.0 + min(_oim_cap, _oim_gap / _oim_div) * _oim_ms
             weights[i] = w
         mover = random.choices(eligible, weights=weights, k=1)[0]
 
@@ -4544,10 +4601,27 @@ def _snapshot_season_positions(c, year, only_missing=False, rows=None):
     # 포메이션이 떠야 한다"] 아래 루프가 팀마다 어차피 계산하는 placed
     # (슬롯별 베스트11 배정)를 선수 단위(inserts)로 흩어 담기 직전에,
     # 팀 단위로도 그대로 한 벌 더 챙겨둔다 — 새 연산이 아니라 이미 계산된
-    # 결과를 한 번 더 저장하는 것뿐이라 비용이 거의 없다. only_missing=True
-    # 두 번째 패스(오프시즌 최종 로스터 기준)에서도 다시 채워지는데,
-    # INSERT OR REPLACE라 나중 값(더 확정된 최종 로스터)이 이긴다 —
-    # 오히려 더 정확해지므로 굳이 이 패스를 걸러낼 필요가 없다.
+    # 결과를 한 번 더 저장하는 것뿐이라 비용이 거의 없다.
+    # [2026-09 버그수정, 신민용 리포트: "팀 검색 포메이션이랑 선수 검색
+    # 소속팀 기록이 안 맞을 때가 있다 — 팀 A 연도 포메이션에 뜬 선수를
+    # 눌러보면 선수 검색에선 그 해 팀 B 소속이라고 나온다"] 예전 주석은
+    # "only_missing=True 두 번째 패스가 다시 채워도 INSERT OR REPLACE라
+    # 나중(더 확정된) 값이 이겨서 오히려 더 정확해진다"고 판단했는데 —
+    # 틀렸다. 그 두 번째 패스는 이적시장(_transfer_market)·은퇴대체·
+    # 스쿼드보정이 전부 끝난 "뒤"에 돈다(호출부 순서 참고) — 즉 그 시점의
+    # ap.team_id는 "이번 시즌을 실제로 뛴 로스터"가 아니라 이미 다음 해부터
+    # 발효되는 오프시즌 이적까지 반영된 "확정된 다음 시즌 로스터"다.
+    # only_missing=True는 원래 "이번 오프시즌에 새로 생긴 신인의 개인
+    # 포지션 기록만 보충"하려는 목적이었는데(아래 _missing_ids 필터가
+    # inserts엔 실제로 적용됨), team_inserts(팀 단위 포메이션 스냅샷)엔
+    # 그 필터가 없어서 신인이 하나라도 낀 팀 전체 로스터가 통째로
+    # 재계산되어 1차 패스(정확한 값)를 덮어썼다 — 실측 검증(헤드리스
+    # 3시즌 76만 건 대조) 결과 25%가 이렇게 오염됨을 확인. 신인 한 명이
+    # 있는 팀은 대부분(사실상 거의 모든 팀, 매 시즌 은퇴대체/스쿼드보정으로
+    # 신인이 생기므로)이라 사실상 전세계 팀이 이 오염에 노출돼 있었다.
+    # 신인의 개인 포지션 기록(ai_player_position_history)엔 애초에 team_id가
+    # 없으므로 team_inserts는 이 두 번째 패스에서 아예 만들 필요가 없다 —
+    # 1차 패스가 이미 그 해 모든 팀의 정확한 스냅샷을 남겼다.
     team_inserts = []
     for _team_id, players in by_team.items():
         if _form_by_team is not None:
@@ -4594,8 +4668,13 @@ def _snapshot_season_positions(c, year, only_missing=False, rows=None):
                           for p in sorted(
                               (p for p in candidates if p["id"] not in started_ids),
                               key=lambda p: -(p["ovr"] or 0))]
-        team_inserts.append((_team_id, year, formation,
-                              json.dumps(slots_payload), json.dumps(bench_payload)))
+        # [2026-09 버그수정] only_missing=True(신인 보충 2차 패스)에서는
+        # team_inserts를 만들지 않는다 — 위 주석 참고, 이 시점의 로스터는
+        # "그 해 실제로 뛴 팀"이 아니라 이미 이적이 반영된 확정 로스터라
+        # 팀 포메이션 스냅샷 용도로 쓰면 안 된다.
+        if _missing_ids is None:
+            team_inserts.append((_team_id, year, formation,
+                                  json.dumps(slots_payload), json.dumps(bench_payload)))
 
     if _missing_ids is not None:
         # 팀 로스터 전체로 슬롯·역할을 계산했지만, 실제로 저장하는 건
@@ -4620,6 +4699,82 @@ def _snapshot_season_positions(c, year, only_missing=False, rows=None):
         c.executemany(
             "INSERT OR REPLACE INTO hist.ai_player_position_history(player_id, year, position, role) "
             "VALUES (?,?,?,?)", inserts)
+
+
+def _snapshot_team_lineup_half(c, year):
+    """[2026-09 신설, 신민용 요청: "시즌 중 이적한 경우 상반기엔 있었지만
+    하반기엔 없는 선수가 팀 검색 포메이션에서 아예 안 보인다 — 팀 검색을
+    열면 상반기/하반기 포메이션을 버튼으로 나눠서 보여줘야 한다"]
+
+    game_engine._advance_week가 하반기 시작 주차(SECOND_HALF_START)에
+    진입해 겨울 이적시장(ai_lifecycle.run_ai_mid_season_transfer)을 열기
+    "직전"에 호출된다 — 이 순간의 ap.team_id는 아직 이번 겨울 이적이
+    반영되기 전이므로 "상반기까지 실제로 뛴 팀"이다. _snapshot_season_
+    positions의 팀 단위 슬롯 배정과 완전히 같은 알고리즘(_greedy_fill_
+    slots, formation_logic.py)을 재사용해 화면(포메이션 탭)과 어긋나지
+    않게 한다 — 역할(주전/로테이션 등)은 이 표에서 안 쓰므로 계산하지
+    않는다.
+
+    hist.team_season_lineup_half(이 함수 전용)에 저장 — 기존 hist.
+    team_season_lineup(시즌 끝, 오프시즌 이적 "전" 스냅샷 — 상반기 이적은
+    이미 반영된 뒤라 사실상 "하반기" 로스터, database.py 주석 참고)과는
+    별개 표라 기존 화면·로직엔 전혀 영향이 없다.
+
+    [한계] 이 기능 신설 이전 과거 시즌은 소급 적용 안 됨 — 그 해는
+    화면에서 "상반기 기록 없음"으로 처리한다."""
+    from formation_logic import _greedy_fill_slots
+    from constants import FORMATION_SLOTS
+    import json
+
+    rows = c.execute(
+        """SELECT ap.id AS id, ap.team_id AS team_id, ap.position AS position,
+                  ap.ovr AS ovr, t.formation AS formation
+           FROM ai_players ap JOIN teams t ON ap.team_id = t.id
+           WHERE ap.team_id IS NOT NULL""").fetchall()
+    if not rows:
+        return
+
+    by_team = {}
+    for r in rows:
+        by_team.setdefault(r["team_id"], []).append(r)
+
+    # [내 선수도 포함] _snapshot_season_positions와 동일한 이유 —
+    # 그 주석 참고. 내가 상반기에 이 팀 소속이었으면 상반기 포메이션에도
+    # 같이 떠야 한다.
+    _me = None
+    try:
+        _me_row = c.execute(
+            "SELECT current_team_id, position, ovr FROM my_player WHERE id=1").fetchone()
+        if _me_row and _me_row["current_team_id"]:
+            _me = _me_row
+    except Exception:
+        _me = None
+
+    team_inserts = []
+    for _team_id, players in by_team.items():
+        formation = players[0]["formation"] or "4-4-2"
+        slots = FORMATION_SLOTS.get(formation, FORMATION_SLOTS["4-4-2"])
+        candidates = [{"id": p["id"], "position": p["position"], "ovr": p["ovr"] or 0}
+                      for p in players]
+        if _me is not None and _team_id == _me["current_team_id"]:
+            candidates.append({"id": _MY_LINEUP_ID, "position": _me["position"],
+                               "ovr": _me["ovr"] or 0})
+        placed = _greedy_fill_slots(candidates, slots)
+        started_ids = {pl["id"] for pl in placed if pl is not None}
+        slots_payload = [{"slot": slots[i], "id": (pl["id"] if pl else None)}
+                          for i, pl in enumerate(placed)]
+        bench_payload = [{"id": p["id"], "position": p["position"] or ""}
+                          for p in sorted(
+                              (p for p in candidates if p["id"] not in started_ids),
+                              key=lambda p: -(p["ovr"] or 0))]
+        team_inserts.append((_team_id, year, formation,
+                              json.dumps(slots_payload), json.dumps(bench_payload)))
+
+    if team_inserts:
+        c.executemany(
+            "INSERT OR REPLACE INTO hist.team_season_lineup_half"
+            "(team_id, year, formation, slots_json, bench_json) "
+            "VALUES (?,?,?,?,?)", team_inserts)
 
 
 def _snapshot_season_ratings(c, year, team_goals_for=None):

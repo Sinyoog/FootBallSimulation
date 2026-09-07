@@ -1053,6 +1053,23 @@ def init_db():
         slots_json TEXT DEFAULT '[]', bench_json TEXT DEFAULT '[]',
         PRIMARY KEY(team_id, year)) WITHOUT ROWID""")
 
+    # [2026-09 신설, 신민용 요청: "시즌 중간에 이적한 경우 상반기엔 있었지만
+    # 하반기엔 없는 선수가 팀 검색 포메이션에서 아예 안 보인다 — 팀 검색을
+    # 열었을 때 상반기/하반기 포메이션을 버튼으로 나눠서 보여달라"] 위
+    # team_season_lineup은 바로 위 주석대로 "그 해를 마무리한(하반기) 팀"
+    # 기준 스냅샷 하나뿐이라, 겨울 이적시장으로 그 팀을 떠난 선수는 그 해
+    # 그 팀 포메이션 어디에도 나타나지 않았다(반대로 그 해 도중 합류한
+    # 선수만 보임). ai_lifecycle._snapshot_team_lineup_half가 겨울
+    # 이적시장(run_ai_mid_season_transfer)이 열리기 "직전"(그 시점
+    # ap.team_id는 상반기까지 실제로 뛴 팀)에 딱 하나 더 찍어 여기에
+    # 저장한다 — team_season_lineup(사실상 하반기)과 별도 표라 기존
+    # 화면·로직엔 전혀 영향이 없다. 스키마·한계는 team_season_lineup과
+    # 동일(이 기능 신설 이전 과거 시즌은 소급 불가).
+    c.execute("""CREATE TABLE IF NOT EXISTS hist.team_season_lineup_half(
+        team_id INTEGER, year INTEGER, formation TEXT DEFAULT '',
+        slots_json TEXT DEFAULT '[]', bench_json TEXT DEFAULT '[]',
+        PRIMARY KEY(team_id, year)) WITHOUT ROWID""")
+
     # [2026-08 신설, 신민용 요청: "세계 축구 기록실 연도별 기록 밑에
     # 그 해 평균 평점/골/도움 같은 간단한 요약을 한 줄 더 보여달라
     # (얇은 행으로)"] AI 선수는 개별 경기를 실제로 시뮬레이션하지
@@ -1535,7 +1552,10 @@ def init_db():
         is_my INTEGER DEFAULT 0, slot INTEGER DEFAULT 0,
         my_played INTEGER DEFAULT 0, my_position TEXT DEFAULT '',
         my_saves INTEGER DEFAULT 0, my_goals INTEGER DEFAULT 0,
-        my_assists INTEGER DEFAULT 0, my_rating REAL DEFAULT 0)""")
+        my_assists INTEGER DEFAULT 0, my_rating REAL DEFAULT 0,
+        -- [2026-09 신설] "그 경기 당시 내 팀" — 위 cup_matches.my_team_id
+        -- 주석과 같은 이유. 대회 단위 my_team_id는 이적 시 갱신된다.
+        my_team_id INTEGER DEFAULT 0)""")
     # 챔스 대회별 내 성적 (월드컵 intl_history와 동일 구조: 몇강/우승/탈락 + 활약)
     c.execute("""CREATE TABLE IF NOT EXISTS cl_history(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1575,7 +1595,9 @@ def init_db():
             my_key_passes INTEGER DEFAULT 0, my_dribbles INTEGER DEFAULT 0,
             my_blocks INTEGER DEFAULT 0, my_pass_acc REAL DEFAULT 0,
             my_conceded INTEGER DEFAULT 0, grp TEXT DEFAULT '',
-            day INTEGER DEFAULT 0, my_absence_reason TEXT DEFAULT NULL)""")
+            day INTEGER DEFAULT 0, my_absence_reason TEXT DEFAULT NULL,
+            -- [2026-09 신설] "그 경기 당시 내 팀" — cl_matches와 동일.
+            my_team_id INTEGER DEFAULT 0)""")
         c.execute(f"""CREATE TABLE IF NOT EXISTS {_prefix}_history(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             year INTEGER, competition TEXT, team_name TEXT, result TEXT,
@@ -1644,7 +1666,11 @@ def init_db():
         my_key_passes INTEGER DEFAULT 0, my_dribbles INTEGER DEFAULT 0,
         my_blocks INTEGER DEFAULT 0, my_pass_acc REAL DEFAULT 0,
         my_conceded INTEGER DEFAULT 0, grp TEXT DEFAULT '',
-        day INTEGER DEFAULT 0, my_absence_reason TEXT DEFAULT NULL)""")
+        day INTEGER DEFAULT 0, my_absence_reason TEXT DEFAULT NULL,
+        -- [2026-09 신설] "그 경기 당시 내 팀" — cl_matches와 동일.
+        -- sc_matches도 competition_common의 공용 INSERT 경로를 쓰므로
+        -- 컬럼 구성이 cl_*와 정확히 같아야 한다.
+        my_team_id INTEGER DEFAULT 0)""")
     c.execute("""CREATE TABLE IF NOT EXISTS sc_history(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         year INTEGER, competition TEXT, team_name TEXT, result TEXT,
@@ -1678,7 +1704,16 @@ def init_db():
         is_my INTEGER DEFAULT 0, slot INTEGER DEFAULT 0,
         my_played INTEGER DEFAULT 0, my_goals INTEGER DEFAULT 0,
         my_assists INTEGER DEFAULT 0, my_saves INTEGER DEFAULT 0,
-        my_rating REAL DEFAULT 0)""")
+        my_rating REAL DEFAULT 0,
+        -- [2026-09 신설, 신민용 리포트: "여름 비시즌에 이적하면 컵 일정이
+        -- 8월에서 멈춘다"] 이 경기가 "내 경기"일 때 그 당시 내 소속팀.
+        -- 예전엔 cup_tournaments.my_team_id 하나(대회 시작 시점 고정)로
+        -- 대회 전체를 대표했는데, 이적 후에도 새 팀 컵경기를 직접 뛰게
+        -- 하려면 그 값이 시즌 중에 바뀌어야 한다. 그러면 이적 전에 이미
+        -- 치른 경기까지 새 팀 기준으로 홈/원정이 뒤바뀌어 표시되는
+        -- (2026-07에 한 번 고쳤던) 버그가 되살아난다. 경기 행 자체에
+        -- "그때 내 팀"을 박아두면 과거 기록은 영원히 안 흔들린다.
+        my_team_id INTEGER DEFAULT 0)""")
     c.execute("""CREATE TABLE IF NOT EXISTS cup_history(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         year INTEGER, team_name TEXT, result TEXT,
@@ -2339,6 +2374,20 @@ def init_db():
         "ALTER TABLE el_matches ADD COLUMN my_yellow_cards INTEGER DEFAULT 0",
         "ALTER TABLE ecl_matches ADD COLUMN my_yellow_cards INTEGER DEFAULT 0",
         "ALTER TABLE cup_matches ADD COLUMN my_yellow_cards INTEGER DEFAULT 0",
+        # [2026-09 신설] 위 CREATE TABLE의 my_team_id 주석 참고 — 기존
+        # 세이브에도 같은 컬럼을 붙인다. 기본값 0이면 cup_engine이
+        # cup_tournaments.my_team_id로 폴백하므로 기존 기록은 그대로 보인다.
+        "ALTER TABLE cup_matches ADD COLUMN my_team_id INTEGER DEFAULT 0",
+        # [2026-09 신설] 챔스/유로파/컨퍼런스도 국내컵과 완전히 같은 결함이
+        # 있었다 — 대회 시작 시점 팀으로 is_my를 박아두고 대회 단위
+        # my_team_id로 판정해서, 여름 이적 후에는 새 소속팀의 대륙대항전을
+        # 시즌 내내 직접 뛸 수 없었다(챔스는 5주차 개막이라 여름 이적에
+        # 그대로 노출). 같은 방식으로 경기 행에 "그때 내 팀"을 박는다.
+        "ALTER TABLE cl_matches ADD COLUMN my_team_id INTEGER DEFAULT 0",
+        "ALTER TABLE el_matches ADD COLUMN my_team_id INTEGER DEFAULT 0",
+        "ALTER TABLE ecl_matches ADD COLUMN my_team_id INTEGER DEFAULT 0",
+        # sc_matches도 competition_common의 공용 INSERT를 타므로 같이 맞춘다.
+        "ALTER TABLE sc_matches ADD COLUMN my_team_id INTEGER DEFAULT 0",
         "ALTER TABLE sc_matches ADD COLUMN my_yellow_cards INTEGER DEFAULT 0",
         "ALTER TABLE cwc_matches ADD COLUMN my_yellow_cards INTEGER DEFAULT 0",
         "ALTER TABLE intl_matches ADD COLUMN my_yellow_cards INTEGER DEFAULT 0",

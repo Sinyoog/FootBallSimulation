@@ -7971,6 +7971,16 @@ def _advance_week(p, base_week, n_weeks=4, progress_cb=None):
     # 세계 축구 기록실 "선수 검색"이 이 스냅샷 + ai_transfer_log.
     # is_mid_season을 보고 그 해 기록을 상반기/하반기 두 줄로 쪼갠다.
     if new_week == SECOND_HALF_START:
+        # [2026-09 계측 추가, 신민용 리포트: "28주차가 3.2초인데 PERF-TM
+        # 합계는 2.06초뿐 — 나머지 1.2초가 어디서 나오는지 모르겠다"]
+        # 이 블록은 하위컵 생성 / 상반기 순위 스냅샷 / 겨울 이적시장
+        # 세 가지를 연달아 하는데 계측이 겨울 이적시장(PERF-TM)에만
+        # 있었다. 게다가 28주차는 실기기 로그에서 시즌마다 2.70→3.24s로
+        # 자라는 유일한 구간이라(5시즌 실측) 어느 조각이 자라는지
+        # 구분이 필요하다. [RESET]/[CREATE]/[PERF]와 같은 패턴으로
+        # 구간만 찍는다 — 로직은 한 줄도 안 바꾼다.
+        import time as _time_half
+        _hf0 = _time_half.perf_counter()
         # [2026-09 신설] 3부/4부 국내컵(lower_cup_engine) 개막 — 국내 컵대회
         # (1~2부, 5주차 시작)와 달리 이 대회는 하반기 시즌에 들어가는 대회라
         # (신민용 확정: "리그 사이사이에 하는거지") 하반기 시작 주차에 연다.
@@ -7981,17 +7991,22 @@ def _advance_week(p, base_week, n_weeks=4, progress_cb=None):
             lower_cup_engine.start_lower_cup(new_year, new_season)
         except Exception as e:
             add_log(f"⚠ 3부·4부컵 생성 오류: {e}", "event")
+        _hf1 = _time_half.perf_counter()
+        _half_n_leagues = 0
         try:
             _conn_half = get_conn()
             _league_ids = [r[0] for r in _conn_half.execute(
                 "SELECT DISTINCT league_id FROM match_results WHERE season=?",
                 (new_season,)).fetchall()]
+            _half_n_leagues = len(_league_ids)
+            _hf1b = _time_half.perf_counter()
             _half_rows = []
             for _lid in _league_ids:
                 for _row in get_league_standings(_lid, season=new_season, conn=_conn_half):
                     _half_rows.append((_lid, new_season, new_year, _row["id"],
                                         _row["wins"], _row["draws"], _row["losses"],
                                         _row["goals_for"], _row["goals_against"]))
+            _hf1c = _time_half.perf_counter()
             if _half_rows:
                 _conn_half.executemany(
                     """INSERT OR REPLACE INTO league_season_standings_half
@@ -7999,15 +8014,50 @@ def _advance_week(p, base_week, n_weeks=4, progress_cb=None):
                         goals_for, goals_against)
                        VALUES (?,?,?,?,?,?,?,?,?)""", _half_rows)
                 _conn_half.commit()
+            # [2026-09 신설, 신민용 요청: "상반기/하반기 포메이션을 따로
+            # 보여달라"] 위 상반기 순위 스냅샷과 완전히 같은 시점(겨울
+            # 이적시장이 열리기 직전, ap.team_id가 아직 상반기 로스터인
+            # 순간)에 팀별 상반기 포메이션도 같이 찍어둔다 — 아래
+            # ai_lifecycle.run_ai_mid_season_transfer가 이 team_id들을
+            # 바꾸기 전에 반드시 먼저 실행돼야 한다.
+            try:
+                from ai_lifecycle import _snapshot_team_lineup_half
+                _snapshot_team_lineup_half(_conn_half, new_year)
+                _conn_half.commit()
+            except Exception as _e:
+                add_log(f"⚠ 상반기 포메이션 스냅샷 오류: {_e}", "event", new_year, new_week)
             _conn_half.close()
         except Exception as _e:
+            _hf1b = _hf1c = _time_half.perf_counter()
             add_log(f"⚠ 상반기 순위 스냅샷 오류: {_e}", "event", new_year, new_week)
 
+        _hf2 = _time_half.perf_counter()
         try:
             from ai_lifecycle import run_ai_mid_season_transfer
             run_ai_mid_season_transfer(new_year, verbose_log=add_log, my_team_id=p.get("current_team_id"))
         except Exception as _e:
             add_log(f"⚠ 겨울 이적시장 처리 중 오류: {_e}", "event", new_year, new_week)
+        _hf3 = _time_half.perf_counter()
+        # 상반기 순위 스냅샷은 리그마다 get_league_standings를 한 번씩
+        # 부르는 구조(리그 수 × match_results 조회)라 시즌이 쌓일수록
+        # 자랄 후보 1순위다 — 리그 수도 같이 찍어 "리그당 비용"을
+        # 비교할 수 있게 한다.
+        try:
+            print(f"[PERF-HALF] {new_year}년 28주차 하반기 진입 총 {_hf3-_hf0:.3f}s "
+                  f"(3·4부컵 생성 {_hf1-_hf0:.3f}s | "
+                  f"상반기순위 리그조회 {_hf1b-_hf1:.3f}s | "
+                  f"순위계산루프 {_hf1c-_hf1b:.3f}s | "
+                  f"스냅샷INSERT {_hf2-_hf1c:.3f}s | "
+                  f"겨울이적시장 {_hf3-_hf2:.3f}s) (대상리그 {_half_n_leagues}개)",
+                  flush=True)
+            _live_debug(f"[PERF-HALF] {new_year}년 28주차 하반기 진입 총 {_hf3-_hf0:.3f}s "
+                        f"(3·4부컵 생성 {_hf1-_hf0:.3f}s | "
+                        f"상반기순위 리그조회 {_hf1b-_hf1:.3f}s | "
+                        f"순위계산루프 {_hf1c-_hf1b:.3f}s | "
+                        f"스냅샷INSERT {_hf2-_hf1c:.3f}s | "
+                        f"겨울이적시장 {_hf3-_hf2:.3f}s) (대상리그 {_half_n_leagues}개)")
+        except Exception:
+            pass
 
     # [2026-07 신설, 신민용+GPT 다회 설계 확정: "구단 판매 추진" 시스템]
     # 매주(정확히는 _advance_week가 호출될 때마다) 5개 조건 점수를

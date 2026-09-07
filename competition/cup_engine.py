@@ -234,6 +234,80 @@ def _my_cup_tournament(p, year):
     return get_cup_tournament(year, cid)
 
 
+def resync_my_cup_registration(p=None, year=None):
+    """[2026-09 신설, 신민용 리포트: "여름 비시즌에 이적했을 때 경기 일정이
+    변한다 — 2001년 11월인데 8월 일정이 진행이 안 되어 있다"] 시즌 중
+    이적으로 소속팀이 바뀌면 국내컵의 "내 팀" 등록을 지금 소속팀으로
+    다시 맞춘다.
+
+    ■ 원인이었던 구조
+    같은 "내 경기냐" 판정이 두 군데에서 서로 다른 기준을 썼다.
+      · 경기 생성(_start_next_round)  → 지금 소속팀으로 is_my를 찍음
+      · 경기 진행(get_my_cup_match) → 대회 시작 시점 소속팀
+        (cup_tournaments.my_team_id)과 지금 팀이 같을 때만 넘겨줌
+    여름 이적을 하면 이 둘이 어긋난다. 이적 후 생성된 새 팀 경기는
+    is_my=1이라 AI 자동 진행(process_cup_week의 is_my=0 필터)에서 빠지고,
+    동시에 my_team_id가 옛 팀이라 플레이어에게도 안 넘어간다 — 아무도
+    진행시킬 수 없는 "고아 경기"가 되어 그 라운드에서 대회가 멈춘다.
+    (_advance_round는 그 라운드에 home_score=-1이 하나라도 있으면 즉시
+    리턴한다.) 화면에는 지나간 날짜의 경기가 계속 "예정"으로 남고,
+    메인 화면 주간 카드에도 컵대회가 안 뜬다.
+
+    ■ 여기서 하는 일 (신민용 확정: "이적 후 새 팀 컵 경기를 직접 뛰는 게
+      자연스럽다")
+      · cup_tournaments.my_team_id / my_in 을 지금 소속팀으로 갱신
+      · 아직 안 치른 경기(home_score=-1)의 is_my / my_team_id 재계산
+      · 다른 나라로 이적했으면 옛 나라 대회는 my_in=0으로 내려놓고
+        그 대회의 미치른 경기는 전부 is_my=0(=AI 진행)으로 되돌림
+    이미 치른 경기(home_score>=0)는 한 행도 안 건드린다 — 이적 전 팀에서
+    뛴 기록은 그 행의 my_team_id에 그대로 남아 커리어에 유지된다
+    (get_my_cup_matches 주석 참고).
+
+    process_cup_week 진입 때마다 호출된다. 바뀐 게 없으면 대회 목록
+    조회 1회로 끝나므로(아래 early-continue) 주차마다 도는 비용은 무시
+    가능하다 — 이적 경로가 5군데(입단/오퍼/방출/임대/임대복귀)라
+    각 호출부에 심는 것보다 여기 한 곳에 두는 쪽이 빠짐이 없다.
+    """
+    from game_engine import get_player, get_state
+    if p is None:
+        p = get_player()
+    if not p:
+        return False
+    if year is None:
+        st = get_state()
+        if not st:
+            return False
+        year = st["current_year"]
+
+    my_tid = p.get("current_team_id", 0) or 0
+    cur_cid = _my_country_id(p) if my_tid else None
+
+    conn = get_conn()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT id, country_id, my_in, my_team_id FROM cup_tournaments WHERE year=?",
+        (year,)).fetchall()]
+    changed = False
+    c = conn.cursor()
+    for t in rows:
+        want = my_tid if (my_tid and t["country_id"] == cur_cid) else 0
+        if (t["my_team_id"] or 0) == want:
+            continue
+        c.execute("UPDATE cup_tournaments SET my_team_id=?, my_in=? WHERE id=?",
+                  (want, 1 if want else 0, t["id"]))
+        # want=0이면 home_team_id=0인 행이 없으므로 CASE가 전부 0으로
+        # 떨어진다 — 즉 "옛 나라 대회는 전부 AI 진행"이 같은 문장으로 처리된다.
+        c.execute("""UPDATE cup_matches
+                     SET is_my = (CASE WHEN home_team_id=? OR away_team_id=? THEN 1 ELSE 0 END),
+                         my_team_id = (CASE WHEN home_team_id=? OR away_team_id=? THEN ? ELSE 0 END)
+                     WHERE tournament_id=? AND home_score=-1""",
+                  (want, want, want, want, want, t["id"]))
+        changed = True
+    if changed:
+        conn.commit()
+    conn.close()
+    return changed
+
+
 def get_my_cup_matches():
     """[2026-07 커리어 기록 추가] 내가 실제 출전한 국내 컵대회 경기 목록(시간순).
     champions_engine.get_my_cl_matches()와 같은 패턴.
@@ -286,7 +360,11 @@ def get_my_cup_matches():
         # (그 대회 시작 시점에 고정 저장된 내 팀)를 쓴다 — 안 그러면 그
         # 이후 이적한 경우 과거 경기의 상대가 그때의 내 팀 이름으로
         # 뒤바뀌어 표시되고 스코어/승패도 뒤집힌다.
-        my_tid = m["t_my_tid"]
+        # [2026-09 수정] 이제 cup_tournaments.my_team_id는 이적 시점에
+        # 갱신되므로(resync_my_cup_registration) 대회 전체를 대표하지
+        # 않는다 — 경기 행에 박아둔 "그때 내 팀"을 우선 쓴다. 이 컬럼이
+        # 생기기 전에 저장된 옛 행(0)만 예전처럼 대회 값으로 폴백한다.
+        my_tid = m.get("my_team_id") or m["t_my_tid"]
         he = _entry_lookup(m["tournament_id"], m["home_team_id"])
         ae = _entry_lookup(m["tournament_id"], m["away_team_id"])
         is_home = (m["home_team_id"] == my_tid)
@@ -843,8 +921,10 @@ def _start_next_round(t, p=None):
     for slot in range(0, len(pool), 2):
         home, away = pool[slot], pool[slot + 1]
         is_my = 1 if my_tid in (home[0], away[0]) else 0
+        # [2026-09 신설] "그때 내 팀"을 경기 행에 같이 박아둔다 —
+        # database.py cup_matches.my_team_id 주석 참고. is_my=0이면 0.
         _match_rows.append((tid, rname, round_counter, week, home[0], away[0], is_my, slot // 2,
-                            pool_entering))
+                            pool_entering, my_tid if is_my else 0))
     if not _match_rows:
         # [2026-08 신설] 이번 라운드가 부전승만으로 이루어져(_matches_this_round=0)
         # 실제 경기가 하나도 없다 — process_cup_week/_process_one은 그 주차에
@@ -861,8 +941,9 @@ def _start_next_round(t, p=None):
         return
     c.executemany("""INSERT INTO cup_matches
                      (tournament_id, round_name, round_idx, week,
-                      home_team_id, away_team_id, is_my, slot, pool_entering)
-                     VALUES(?,?,?,?,?,?,?,?,?)""", _match_rows)
+                      home_team_id, away_team_id, is_my, slot, pool_entering,
+                      my_team_id)
+                     VALUES(?,?,?,?,?,?,?,?,?,?)""", _match_rows)
     if byes:
         if _is_mine:
             if len(byes) == 1:
@@ -1277,6 +1358,13 @@ def process_cup_week(week):
     # 상수(2~3회)로 줄어든다.
     from game_engine import get_player
     p = get_player()
+    # [2026-09 신설] 시즌 중 이적으로 "내 팀"이 바뀌었으면 먼저 등록을
+    # 맞춘다 — 아래 is_my 판정이 전부 이 값을 전제로 한다.
+    # (resync 주석 참고: 바뀐 게 없으면 SELECT 1회로 끝난다.)
+    try:
+        resync_my_cup_registration(p=p)
+    except Exception as _e:
+        print("[CUP] resync_my_cup_registration 실패(건너뜀):", _e, flush=True)
     conn = get_conn()
     ts = [dict(r) for r in conn.execute(
         "SELECT * FROM cup_tournaments WHERE status='active'").fetchall()]
@@ -1289,10 +1377,35 @@ def process_cup_week(week):
             (week,)):
         round_names_by_tid.setdefault(r["tournament_id"], []).append(r["round_name"])
 
+    # [2026-09 안전망, 신민용 확정 "C안"] 예전엔 SQL에서 is_my=0만 뽑아
+    # AI로 돌렸다. 그런데 is_my=1인데 이 대회의 "내 팀"(my_team_id)도,
+    # 지금 내 팀도 아닌 경기는 플레이어가 뛸 방법이 아예 없다 —
+    # get_my_cup_match가 그런 경기는 절대 안 넘겨주기 때문이다.
+    # 위 resync_my_cup_registration이 이런 상태를 애초에 안 만들지만,
+    # 새로운 이적 경로가 추가되거나 순서가 어긋나 한 번이라도 생기면
+    # 대회 전체가 영구히 멈추는(_advance_round가 -1 하나에 리턴) 치명적
+    # 고장이라 실행 시점에도 한 겹 더 막는다.
+    #
+    # 정상 상황에서는 걸러지는 행 집합도, ORDER BY도 예전 쿼리와 완전히
+    # 같으므로 _sim_ai_match 호출 순서 = 난수 스트림이 그대로 유지된다
+    # (고아가 실제로 있을 때만 달라지고, 그건 의도된 복구다).
+    _reg_by_tid = {t["id"]: (t.get("my_team_id") or 0) for t in ts}
+    _my_tid_now = p.get("current_team_id", 0) if p else 0
     pending_by_tid: dict = {}
     for r in conn.execute(
-            """SELECT * FROM cup_matches WHERE week=? AND home_score=-1 AND is_my=0
+            """SELECT * FROM cup_matches WHERE week=? AND home_score=-1
                ORDER BY tournament_id, id""", (week,)):
+        if r["is_my"]:
+            _h, _a = r["home_team_id"], r["away_team_id"]
+            _reg = _reg_by_tid.get(r["tournament_id"], 0)
+            if _reg and (_h == _reg or _a == _reg):
+                continue          # 정상: 플레이어가 뛸 경기
+            if _my_tid_now and (_h == _my_tid_now or _a == _my_tid_now):
+                continue          # 정상: 지금 내 팀 경기(등록 갱신 직전 타이밍)
+            # 고아 — AI로 돌려 대회를 계속 진행시킨다.
+            print(f"[CUP-ORPHAN] tournament_id={r['tournament_id']} match_id={r['id']} "
+                  f"week={week} is_my=1인데 등록팀({_reg})/현재팀({_my_tid_now}) 모두 "
+                  f"불일치 — AI로 진행", flush=True)
         pending_by_tid.setdefault(r["tournament_id"], []).append(dict(r))
 
     _batch = []
@@ -1448,10 +1561,11 @@ def _advance_round(t, round_name, week, p=None):
                 conn = get_conn(); c = conn.cursor()
                 c.execute("""INSERT INTO cup_matches
                              (tournament_id, round_name, round_idx, week,
-                              home_team_id, away_team_id, is_my, slot)
-                             VALUES(?,?,?,?,?,?,?,999)""",
+                              home_team_id, away_team_id, is_my, slot,
+                              my_team_id)
+                             VALUES(?,?,?,?,?,?,?,999,?)""",
                           (tid, "3·4위전", fm["round_idx"], fm["week"],
-                           tp_home, tp_away, is_my_tp))
+                           tp_home, tp_away, is_my_tp, my_tid if is_my_tp else 0))
                 conn.commit(); conn.close()
                 he = _entry(tid, tp_home); ae = _entry(tid, tp_away)
                 # [2026-07 전체 국가 확장] 이제 컵대회가 모든 나라에서 열리므로,
