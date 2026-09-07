@@ -3530,16 +3530,24 @@ def get_player_awards_by_year(player_id):
         핵심 정보라 "발롱도르 5위"처럼 rank를 덧붙인다.
       - 베스트11은 자동으로 포지션이 곧 "몇 번째"인 슬롯이라 rank
         숫자 자체는 의미가 없으므로 대신 포지션을 "(ST)"처럼 덧붙인다.
-      - 구단 올해의 선수는 팀마다 rank(1,2,3...)로 구분되는 서로 다른
-        팀 상이라 팀명을 "(레알 마드리드)"처럼 덧붙인다.
+      - [2026-09 버그수정, 신민용 리포트: "구단 올해의 선수가 '프리미어
+        리그 구단 올해의 선수 (아스널)'로 뜨는데 이건 리그명이 아니라
+        팀명이 붙어야 맞다"] 구단 올해의 선수는 팀마다 rank(1,2,3...)로
+        구분되는 서로 다른 팀 상이라 리그명이 아니라 실제 그 상을 받은
+        팀명이 접두어여야 한다 — 예전엔 여기서 award_type(그때는 리그명
+        접두어로 저장돼 있었음) 뒤에 "(팀명)"을 한 번 더 덧붙이는 방식
+        이었는데, game_engine._save_individual_award_rows가 이제 저장
+        시점에 이미 "아스널 구단 올해의 선수"처럼 팀명을 접두어로 붙여
+        저장하므로(그쪽 주석 참고) 여기서 또 "(팀명)"을 덧붙이면
+        "아스널 구단 올해의 선수 (아스널)"처럼 팀명이 중복된다 — 그냥
+        award_type 그대로 보여준다(아래 "나머지" 분기와 합쳐짐).
       - [2026-09 신설] 월드컵 골든볼은 award_type/award_kind가 rank
         1/2/3 전부 "골든볼"로 통일 저장돼 있으므로(위 WC_BALL_RANK_LABEL
         주석 참고), rank를 보고 골든볼/실버볼/브론즈볼로 다시 풀어서
         보여준다 — 안 그러면 실버볼·브론즈볼 수상자도 그냥 "월드컵
         골든볼"로 표시돼 버린다.
-      - 나머지(MVP/득점왕/도움왕/영플레이어/올해의 수비수/골든글러브
-        등)는 애초에 부문당 1명뿐이라 rank가 항상 1이므로 그냥
-        award_type 그대로 보여준다."""
+      - 나머지(MVP/득점왕/도움왕/영플레이어/올해의 수비수/골든글러브/
+        구단 올해의 선수 등)는 award_type 그대로 보여준다."""
     conn = get_conn()
     rows = conn.execute(
         """SELECT year, award_type, award_kind, rank, position, team_name, competition
@@ -3556,8 +3564,6 @@ def get_player_awards_by_year(player_id):
             label = f"{r['award_type']} {r['rank']}위"
         elif kind == "베스트11":
             label = f"{r['award_type']}" + (f" ({r['position']})" if r["position"] else "")
-        elif kind == "구단 올해의 선수":
-            label = f"{r['award_type']}" + (f" ({r['team_name']})" if r["team_name"] else "")
         elif kind == "골든볼":
             ball_name = WC_BALL_RANK_LABEL.get(r["rank"], kind)
             label = f"{(r['competition'] or '').strip()} {ball_name}".strip()
@@ -5753,7 +5759,16 @@ def get_team_season_lineup(team_id: int, year: int, half: bool = False):
     그런 연도는 starters가 빈 리스트로 온다 — 호출부가 "기록 없음"으로
     처리한다. half=True는 여기에 더해 _snapshot_team_lineup_half 신설
     이전 시즌도 같은 이유로 비어 있다(team_season_lineup보다 늦게
-    생긴 기능이라 공백 구간이 좀 더 길 수 있다)."""
+    생긴 기능이라 공백 구간이 좀 더 길 수 있다).
+
+    [2026-09 확장, 신민용 요청: "외국인 용병들은 겉부분을 #FF7F00으로
+    강조해줘 — 그 당시 기준이니, 이 선수가 나중에 자국으로 돌아가도
+    (예: 2002년 한국에서 뛰던 브라질 선수가 2004년 브라질로 복귀) 2002년
+    한국 팀 기록에서는 그대로 강조가 남아야 한다"] starters/bench 각
+    원소에 "is_foreign"(bool)을 추가한다 — team_id(이 함수가 그리는
+    "그 해 그 팀")의 국가와 선수 국적(ai_players/ai_players_retired.
+    nationality, 은퇴해도 안 바뀌는 고정 필드)을 비교하므로, 선수의
+    현재 소속팀이 어디든 항상 "그 시절 기준"으로 정확하다."""
     from constants import ai_player_code
     from database import get_ai_player_custom_names
 
@@ -5784,6 +5799,22 @@ def get_team_season_lineup(team_id: int, year: int, half: bool = False):
     # 넘기고, 내 선수는 my_player에서 따로 확인한다.
     ai_ids = [i for i in ids if isinstance(i, int) and i >= 0]
     has_me = MY_PLAYER_ID in ids
+    # [2026-09 신설, 신민용 요청: "팀 검색 포메이션에서 외국인 용병은
+    # 겉부분을 #FF7F00으로 강조해달라 — 그 당시 기준이니, 나중에 이
+    # 선수가 자국으로 돌아가도 '그 해 그 팀' 기록엔 그대로 강조가 남아야
+    # 한다"] team_id는 이 함수가 그리는 "그 해 그 팀"을 그대로 가리키는
+    # 파라미터이지 선수의 현재 소속팀이 아니므로, 이 팀의 국가 하나만
+    # 구해서 그 팀 로스터 전원(과거 이 팀에 있었던 선수 포함)에게 동일
+    # 기준으로 비교하면 저절로 "그 당시 기준"이 된다 — 선수의 현재
+    # team_id를 다시 조회해서 비교하는 식으로 짜면 안 된다(그러면 나중에
+    # 자국으로 돌아간 선수는 과거 기록에서도 강조가 사라지는 정확히 그
+    # 버그가 난다).
+    _team_country_row = conn.execute(
+        """SELECT cn.name AS country FROM teams t
+           JOIN leagues l ON t.league_id = l.id
+           JOIN countries cn ON l.country_id = cn.id
+           WHERE t.id=?""", (team_id,)).fetchone()
+    team_country = _team_country_row["country"] if _team_country_row else ""
     # [버그수정, 신민용 리포트: "선수 이름이 내가 지은 것도 아닌데 왜
     # 저렇게(실제 축구선수 이름처럼) 뜨냐 — AI06H7 이런 코드로 떠야
     # 한다"] ai_players.name(내부용 원본 이름)을 커스텀 이름 다음
@@ -5794,45 +5825,70 @@ def get_team_season_lineup(team_id: int, year: int, half: bool = False):
     # 확인하는 용도로만 쓰고(은퇴 등으로 사라진 선수는 표시에서 제외),
     # 표시 이름 자체엔 절대 쓰지 않는다.
     known_ids = set()
+    nat_by_id = {}
     my_name = ""
+    my_is_foreign = False
     if has_me:
-        _me = conn.execute("SELECT name FROM my_player WHERE id=1").fetchone()
+        _me = conn.execute(
+            "SELECT name, nationality, nationality2, nationality3, nationality4 "
+            "FROM my_player WHERE id=1").fetchone()
         if _me:
             known_ids.add(MY_PLAYER_ID)
             my_name = _me["name"] or "나"
+            # [2026-09 신설] 나는 귀화 등으로 최대 4개 국적을 가질 수
+            # 있다(my_player.nationality~4) — 그 중 하나라도 이 팀의
+            # 나라와 같으면 자국 선수로 취급한다.
+            _my_nats = {(_me[k] or "") for k in
+                        ("nationality", "nationality2", "nationality3", "nationality4")}
+            _my_nats.discard("")
+            my_is_foreign = bool(team_country) and bool(_my_nats) and team_country not in _my_nats
     if ai_ids:
         ids = ai_ids
         placeholders = ",".join("?" * len(ids))
         # 은퇴한 선수도 있을 수 있으므로 ai_players 먼저, 없으면
         # ai_players_retired에서 존재 확인(get_ai_player_career_history 등
-        # 다른 곳과 동일한 관례) — 이름 값 자체는 안 쓴다.
+        # 다른 곳과 동일한 관례) — 이름 값 자체는 안 쓴다. 국적(nationality)은
+        # 같은 쿼리에서 같이 뽑아둔다(선수 은퇴/이적 여부와 무관하게 국적
+        # 자체는 안 바뀌는 고정 필드).
         for r in conn.execute(
-                f"SELECT id FROM ai_players WHERE id IN ({placeholders})", ids).fetchall():
+                f"SELECT id, nationality FROM ai_players WHERE id IN ({placeholders})",
+                ids).fetchall():
             known_ids.add(r["id"])
+            nat_by_id[r["id"]] = r["nationality"] or ""
         _missing = [i for i in ids if i not in known_ids]
         if _missing:
             placeholders2 = ",".join("?" * len(_missing))
             for r in conn.execute(
-                    f"SELECT id FROM ai_players_retired WHERE id IN ({placeholders2})",
+                    f"SELECT id, nationality FROM ai_players_retired WHERE id IN ({placeholders2})",
                     _missing).fetchall():
                 known_ids.add(r["id"])
+                nat_by_id[r["id"]] = r["nationality"] or ""
     conn.close()
+
+    def _is_foreign(pid):
+        if pid == MY_PLAYER_ID:
+            return my_is_foreign
+        nat = nat_by_id.get(pid, "")
+        return bool(team_country) and bool(nat) and nat != team_country
 
     custom_names = get_ai_player_custom_names(ai_ids) if ai_ids else {}
     starters = []
     for s in slots:
         pid = s.get("id")
         if pid is None:
-            starters.append({"slot": s.get("slot", ""), "id": None, "display_name": "(공석)"})
+            starters.append({"slot": s.get("slot", ""), "id": None, "display_name": "(공석)",
+                              "is_foreign": False})
             continue
         if pid not in known_ids:
             # 스냅샷 당시엔 있었지만 지금은 어디에도(현역/은퇴 아카이브)
             # 남아있지 않은 극단적 예외 — 조용히 "선수 없음"으로 표시.
-            starters.append({"slot": s.get("slot", ""), "id": None, "display_name": "(선수 없음)"})
+            starters.append({"slot": s.get("slot", ""), "id": None, "display_name": "(선수 없음)",
+                              "is_foreign": False})
             continue
         display_name = (my_name if pid == MY_PLAYER_ID
                         else (custom_names.get(pid) or ai_player_code(pid)))
-        starters.append({"slot": s.get("slot", ""), "id": pid, "display_name": display_name})
+        starters.append({"slot": s.get("slot", ""), "id": pid, "display_name": display_name,
+                          "is_foreign": _is_foreign(pid)})
 
     bench = []
     for b in bench_slots:
@@ -5841,6 +5897,7 @@ def get_team_season_lineup(team_id: int, year: int, half: bool = False):
             continue
         display_name = (my_name if pid == MY_PLAYER_ID
                         else (custom_names.get(pid) or ai_player_code(pid)))
-        bench.append({"position": b.get("position", ""), "id": pid, "display_name": display_name})
+        bench.append({"position": b.get("position", ""), "id": pid, "display_name": display_name,
+                       "is_foreign": _is_foreign(pid)})
 
     return {"formation": row["formation"] or "", "starters": starters, "bench": bench}

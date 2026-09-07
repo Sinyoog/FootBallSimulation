@@ -167,7 +167,12 @@ class _StaticPitchView(QWidget):
     했으므로 이름과 포지션만 표시한다.
 
     slot_players: slots와 같은 길이의 리스트, 각 원소는
-    (slot_position_str, display_name, player_id_or_None).
+    (slot_position_str, display_name, player_id_or_None) 3튜플이거나,
+    [2026-09 확장, 신민용 요청: "팀 검색 포메이션에서 외국인 용병은
+    겉부분을 #FF7F00으로 강조해달라"] 그 뒤에 is_foreign(bool)까지 붙은
+    4튜플. 3튜플로 넘기는 기존 호출부(국가 검색 대회 스쿼드 등 — 대표팀
+    선발은 전원 같은 국적이라 애초에 "외국인" 개념이 없다)는 그대로
+    is_foreign=False 취급돼 색이 안 바뀐다.
 
     slots: [2026-08 확장] 국제대회 스쿼드는 FORMATION_SLOTS에 등록된
     이름 있는 포메이션이 아니라 intl_engine._INTL_MATCHDAY_STARTER_POS
@@ -219,9 +224,14 @@ class _StaticPitchView(QWidget):
             sp = self.slot_players[slot_idx] if slot_idx < len(self.slot_players) else None
             pid = sp[2] if sp else None
             name = (sp[1] if sp else None) or "(공석)"
+            # [2026-09 신설, 신민용 요청: "외국인 용병은 겉부분을 #FF7F00
+            # 으로 강조해달라"] 4튜플(3번째 이후 is_foreign)로 넘어온
+            # 경우에만 읽는다 — 3튜플 호출부(국가 스쿼드 등)는 항상 False.
+            is_foreign = bool(sp[3]) if (sp and len(sp) > 3) else False
             d = circle_d; r = d // 2
             painter.setBrush(QBrush(QColor(_pos_color(pos))))
-            painter.setPen(QPen(QColor("#000"), 1))
+            painter.setPen(QPen(QColor("#FF7F00" if is_foreign else "#000"),
+                                 2 if is_foreign else 1))
             painter.drawEllipse(px - r, py - r, d, d)
             painter.setPen(QPen(QColor("#fff")))
             f = QFont(); f.setPointSize(max(6, min(10, d // 5))); f.setBold(True)
@@ -292,6 +302,16 @@ def _build_squad_roster_panel(starters, bench, on_click=None, height=460):
         else:
             style = ("background:#1c1c1c;color:#aaa;border:1px solid #333;"
                       "border-radius:4px;padding:5px 8px;font-size:11px;")
+        # [2026-09 신설, 신민용 요청: "팀 검색 포메이션에서 외국인 용병은
+        # 겉부분을 #FF7F00으로 강조해달라 — 상자 색(주전 초록/후보 무채색)은
+        # 그대로 두고 테두리만"] world_browser.get_team_season_lineup이
+        # 넣어주는 is_foreign만 읽는다 — 이 값이 없는 호출부(국가 검색
+        # 대회 스쿼드 등, 대표팀은 애초에 전원 같은 국적)는 조용히 그대로
+        # 기본 테두리를 쓴다. 뒤에 이어 붙이는 border 선언이 위 style의
+        # border를 덮어쓰므로(같은 속성 나중 값이 이김) 배경색은 안 건드리고
+        # 테두리만 바뀐다.
+        if p.get("is_foreign"):
+            style += "border:1px solid #FF7F00;"
         lbl.setStyleSheet(style)
         if pid is not None and on_click:
             lbl.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1714,7 +1734,12 @@ class WorldBrowserWindow(QDialog):
     # 새로 정의한다.
     _POS_COL_W = 46
     _NAT_COL_W = 110
-    _OVR_COL_W = 44
+    # [2026-09 버그수정, 신민용 리포트: "년도별 OVR 표시 칸 크기를 100까지
+    # 들어갈 수 있게"] calc_ovr의 상한(database.calc_ovr cap=100)이 실제로
+    # 100이라 3자리("100")까지 나올 수 있는데, 44px는 2자리("99") 기준
+    # 폭이라 3자리가 되면 잘릴 수 있었다 — 3자리도 여유 있게 들어가도록
+    # 넓힌다.
+    _OVR_COL_W = 56
     # [2026-08 신설, 신민용 리포트: "선수 경력(연도별 기록) 표의 포지션
     # 칸에서 CDM만 잘려서 CD...로 보인다"] 선수 목록의 "포지션" 칸(delegate
     # 커스텀 페인트, _POS_COL_W)과 이 표(일반 QTableWidgetItem, Qt가 넘치는
@@ -3129,7 +3154,8 @@ class WorldBrowserWindow(QDialog):
             flabel.setStyleSheet("color:#888;font-size:11px;")
             lay.addWidget(flabel)
 
-        slot_players = [(s.get("slot") or "", s.get("display_name"), s.get("id")) for s in starters]
+        slot_players = [(s.get("slot") or "", s.get("display_name"), s.get("id"),
+                         s.get("is_foreign", False)) for s in starters]
         pitch = _StaticPitchView(formation=formation, slot_players=slot_players,
                                   on_click=self.open_to_player)
 
@@ -3388,32 +3414,46 @@ class WorldBrowserWindow(QDialog):
         else:
             team_text = "소속팀 없음"
         ovr_text = "-" if is_hard_mode() else str(d.get("ovr", "-"))
-        lines.append(
-            f"국적: {nat_text} | 나이: {d.get('age', '-')}세 | 포지션: {d.get('position') or '-'} | "
-            f"OVR: {ovr_text} | 소속: {team_text}")
-        lines.append("")
+        # [2026-09 버그수정, 신민용 요청: "요약 복사는 국적·포지션(주포지션)만
+        # 뜨고, 나이·OVR·소속은 물론 '소속팀 기준 통산 수상' 줄도 안 떠야
+        # 한다"] "요약 복사"(include_stats=False, 선수 검색 자체의 요약
+        # 복사 버튼과 팀/국가 검색에서 선수 여러 명을 한꺼번에 복사할 때
+        # 공용으로 쓰임)는 이 두 줄(기본정보/통산수상) 자체를 완전히
+        # 건너뛰고 국적·포지션 한 줄만 남긴 뒤 곧장 [연도별 기록]으로
+        # 넘어간다 — 나이/OVR은 바로 아래 [연도별 기록]에 매년 다시
+        # 나오고, 통산 수상도 [연도별 기록] 각 연도 줄에 그 해 받은 상이
+        # 이미 따로 찍히므로 요약에서는 전부 군더더기다. "기록 복사"
+        # (include_stats=True, 선수 검색 화면 자체의 상세 복사 버튼)는
+        # 기존 그대로 전부 보여준다.
+        if include_stats:
+            lines.append(
+                f"국적: {nat_text} | 나이: {d.get('age', '-')}세 | 포지션: {d.get('position') or '-'} | "
+                f"OVR: {ovr_text} | 소속: {team_text}")
+            lines.append("")
 
-        # ── 소속팀 기준 통산 수상 (팀 검색 쪽과 같은 포맷) ──
-        awards = (team_hist or {}).get("awards") or {}
-        award_bits = []
-        if awards.get("league"):
-            award_bits.append(f"리그 우승 {awards['league']}회")
-        if awards.get("cup"):
-            award_bits.append(f"국내컵 우승 {awards['cup']}회")
-        if awards.get("lower_cup_champions"):
-            award_bits.append(f"3부/4부 국내컵 우승 {awards['lower_cup_champions']}회")
-        if awards.get("cl_champions"):
-            award_bits.append(f"챔피언스리그(급) 우승 {awards['cl_champions']}회")
-        if awards.get("el_champions"):
-            award_bits.append(f"유로파리그(급) 우승 {awards['el_champions']}회")
-        if awards.get("ecl_champions"):
-            award_bits.append(f"컨퍼런스리그(급) 우승 {awards['ecl_champions']}회")
-        if awards.get("sc_champions"):
-            award_bits.append(f"슈퍼컵 우승 {awards['sc_champions']}회")
-        if awards.get("cwc"):
-            award_bits.append(f"클럽 월드컵 우승 {awards['cwc']}회")
-        lines.append("소속팀 기준 통산 수상: " + (" · ".join(award_bits) if award_bits else "없음"))
-        lines.append("")
+            # ── 소속팀 기준 통산 수상 (팀 검색 쪽과 같은 포맷) ──
+            awards = (team_hist or {}).get("awards") or {}
+            award_bits = []
+            if awards.get("league"):
+                award_bits.append(f"리그 우승 {awards['league']}회")
+            if awards.get("cup"):
+                award_bits.append(f"국내컵 우승 {awards['cup']}회")
+            if awards.get("lower_cup_champions"):
+                award_bits.append(f"3부/4부 국내컵 우승 {awards['lower_cup_champions']}회")
+            if awards.get("cl_champions"):
+                award_bits.append(f"챔피언스리그(급) 우승 {awards['cl_champions']}회")
+            if awards.get("el_champions"):
+                award_bits.append(f"유로파리그(급) 우승 {awards['el_champions']}회")
+            if awards.get("ecl_champions"):
+                award_bits.append(f"컨퍼런스리그(급) 우승 {awards['ecl_champions']}회")
+            if awards.get("sc_champions"):
+                award_bits.append(f"슈퍼컵 우승 {awards['sc_champions']}회")
+            if awards.get("cwc"):
+                award_bits.append(f"클럽 월드컵 우승 {awards['cwc']}회")
+            lines.append("소속팀 기준 통산 수상: " + (" · ".join(award_bits) if award_bits else "없음"))
+            lines.append("")
+        else:
+            lines.append(f"국적: {nat_text} | 포지션: {d.get('position') or '-'}")
 
         # ── 연도별 기록: 몇 년에 몇 살, 어느 팀, 그때 OVR, 그때 팀 성적 ──
         lines.append("[연도별 기록]")
@@ -5226,7 +5266,12 @@ class WorldBrowserWindow(QDialog):
             (d.get("position") or "-", "#aaddff", False),
             # [2026-08 신설, 신민용 요청: "어려움 모드일 때... 그 선수를
             # 클릭할 때 우측 위에 뜨는 OVR"도 없애야 해]
-            ("OVR -" if is_hard_mode() else f"OVR {d.get('ovr', '-')}", "#ffcc00", True),
+            # [2026-09 버그수정, 신민용 리포트: "OVR가 위에(컬럼 헤더로)
+            # 이미 표시되니 칸 안에 또 'OVR 91'로 뜰 필요 없다 — 91로만
+            # 표시해도 된다"] 다른 칸들(나이/포지션 등)도 컬럼 헤더가
+            # 이미 그 뜻을 담고 있어서 칸 안엔 값만 넣는다 — OVR 칸만
+            # 유독 "OVR "을 값 앞에 한 번 더 붙이고 있었다.
+            ("-" if is_hard_mode() else str(d.get("ovr", "-")), "#ffcc00", True),
             (team_text, "#88ddaa", False),
             (team_country_text, "#aaddff", False),
         ]
@@ -6979,7 +7024,25 @@ class WorldBrowserWindow(QDialog):
             final_text = prefix_text + "\n\n" + final_text
         QGuiApplication.clipboard().setText(final_text)
         btn.setText("✅ 복사됨")
-        QTimer.singleShot(1200, lambda: btn.setText(reset_label))
+        # [2026-09 버그수정, 신민용 리포트: "요약 복사 누르니 RuntimeError:
+        # wrapped C/C++ object of type QPushButton has been deleted"]
+        # 이 btn은 self.xxx_copy_btn류(고정 레이아웃, 절대 안 없어짐)와
+        # 달리 팀/국가 연도별 카드 안에서 그때그때 새로 그려지는 위젯이다
+        # — 상반기/하반기 전환(_switch_team_lineup_half), 이름 일괄변경
+        # 새로고침, 다른 연도로 접었다 펼치기 등 전부 이 카드 위젯 전체를
+        # 새로 만들어 detail_row 셀에 갈아 끼운다(setCellWidget이 예전
+        # 위젯을 통째로 지움). 그 1.2초 타이머가 아직 안 끝난 상태에서
+        # 카드가 갈아 끼워지면, 타이머가 나중에 실행될 때 btn은 이미
+        # Qt가 지워버린 C++ 객체를 가리키는 죽은 파이썬 래퍼가 된다 —
+        # 그 상태에서 setText를 부르면 이 예외가 난다. 위젯이 그새
+        # 사라졌으면(=흔한 정상 상황, 복사 자체는 이미 끝났으므로 라벨을
+        # 못 되돌려도 기능상 문제 없음) 조용히 넘어간다.
+        def _reset_copy_btn_label(_btn=btn, _label=reset_label):
+            try:
+                _btn.setText(_label)
+            except RuntimeError:
+                pass
+        QTimer.singleShot(1200, _reset_copy_btn_label)
 
     # ─────────────────────────────────────────
     # 탭2: 컵대회 검색 (2026-07 신설)

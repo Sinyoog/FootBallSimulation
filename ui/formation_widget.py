@@ -505,6 +505,29 @@ def _fetch_cwc_ko_opp(tournament_id, my_team_id, week):
 # 포메이션 캔버스 (내 팀 / 상대팀 공용)
 # ─────────────────────────────────────────────
 
+def _is_player_foreign(pl: dict, team_country: str) -> bool:
+    """[2026-09 신설, 신민용 요청: "메인 화면 포메이션에서도 외국인 용병은
+    겉부분을 #FF7F00으로 강조해달라 — 내가 클릭한 것이 파란색으로 빛나는
+    게 우선"] pl(선수 dict — AI는 ai_players SELECT * 결과, 나는
+    load_my_team이 만든 me dict)의 국적이 team_country(그 팀이 속한
+    나라, load_my_team이 teams/leagues/countries에서 미리 구해 캔버스에
+    보관해둔 값)와 다르면 True. team_country가 비어있으면(국제전 등
+    "외국인" 개념이 없는 경우) 항상 False. 파란 선택 하이라이트는 이
+    함수가 그리는 기본 테두리 위에 별도 링/스타일로 덧그려지므로(캔버스는
+    _selected_id용 헤일로 오버레이, 명단 패널은 선택 시 border를 다시
+    덮어씀), 우선순위는 저절로 지켜진다 — 이 함수는 순서를 신경 쓸
+    필요 없이 "그냥 지금 이 선수가 외국인인가"만 답하면 된다."""
+    if not team_country or not pl:
+        return False
+    if pl.get("is_me"):
+        nats = {(pl.get(k) or "") for k in
+                ("nationality", "nationality2", "nationality3", "nationality4")}
+        nats.discard("")
+        return bool(nats) and team_country not in nats
+    nat = pl.get("nationality") or ""
+    return bool(nat) and nat != team_country
+
+
 class _FormationCanvas(QWidget):
     def __init__(self, is_opponent=False):
         super().__init__()
@@ -534,6 +557,12 @@ class _FormationCanvas(QWidget):
         # [2026-08 신설] 국제전일 때만 채워지는 "팀 전체 계산치(케미 반영)"
         # OVR — 헤더 표시용. club 매치 땐 None(그때는 실제 로스터 평균 사용).
         self._intl_formula_ovr = None
+        # [2026-09 신설, 신민용 요청: "메인 화면 포메이션도 외국인 용병은
+        # 겉부분을 #FF7F00으로 강조해달라"] load_my_team의 클럽팀 분기가
+        # 채운다 — 국제전(intl_nat)은 대표팀 전원이 같은 국적이라 "외국인"
+        # 개념 자체가 없으므로 빈 문자열로 둔다(paintEvent가 team_country가
+        # 없으면 조용히 강조를 건너뛴다).
+        self._team_country = ""
 
     def _calc_avg_ovr(self, ndigits=0):
         """현재 로드된 선수들의 평균 OVR.
@@ -602,13 +631,19 @@ class _FormationCanvas(QWidget):
             _self_mod._ovr_cache_invalidated = False
 
         if _cache is not None and _cache_key in _cache:
-            self.formation, self.players, self._roster, self._starter_ids, self._intl_formula_ovr = _cache[_cache_key]
+            (self.formation, self.players, self._roster, self._starter_ids,
+             self._intl_formula_ovr, self._team_country) = _cache[_cache_key]
             self._player_at = {}; self._positions_xy = []
             self.update()
             return
 
         if intl_nat:
             # ── 국제전: 내 국가대표팀 선수 구성 ──
+            # [2026-09 신설] 대표팀은 전원 같은 국적이라 "외국인" 개념이
+            # 없다 — 이 캔버스가 이전에 클럽팀을 그리다 재사용된 경우를
+            # 대비해 명시적으로 비워둔다(안 비우면 옛 클럽 국가가 남아있는
+            # 채로 재사용될 수 있음, 아래서 실제로 쓰이진 않지만 방어적으로).
+            self._team_country = ""
             # [2026-08 수정] 예전엔 "nationality1 기준으로 ai_players를
             # 국가별로 뽑을 수 없다"는 이유로 무조건 가상 11명을 만들었는데,
             # 지금은 get_country_squad_players로 실제 그 국적(또는 폴백)
@@ -808,8 +843,17 @@ class _FormationCanvas(QWidget):
         else:
             # ── 리그팀 ──
             conn = get_conn()
-            row = conn.execute("SELECT formation FROM teams WHERE id=?", (team_id,)).fetchone()
+            # [2026-09 확장, 신민용 요청: "메인 화면 포메이션도 외국인
+            # 용병은 겉부분을 #FF7F00으로 강조해달라"] formation과 같이
+            # 이 팀이 속한 나라 이름도 한 번에 구해둔다 — paintEvent/
+            # 명단 패널이 선수 국적과 비교할 기준.
+            row = conn.execute(
+                """SELECT t.formation AS formation, cn.name AS country
+                   FROM teams t JOIN leagues l ON t.league_id = l.id
+                   JOIN countries cn ON l.country_id = cn.id
+                   WHERE t.id=?""", (team_id,)).fetchone()
             self.formation = row["formation"] if row else "4-4-2"
+            self._team_country = row["country"] if row else ""
             self._intl_formula_ovr = None
             my_tid = p.get("current_team_id", 0) if p else 0
             if my_tid == team_id and p:
@@ -849,6 +893,13 @@ class _FormationCanvas(QWidget):
                       "ovr": p.get("ovr", 40), "is_me": True,
                       "injured": bool(p.get("injured")),
                       "age": p.get("age", 0), "nationality": p.get("nationality", ""),
+                      # [2026-09 신설] 귀화 등으로 최대 4개 국적을 가질 수
+                      # 있다(my_player.nationality2~4) — is_foreign 판정 시
+                      # 그 중 하나라도 이 팀의 나라와 같으면 자국 선수로
+                      # 취급한다(_is_player_foreign 참고).
+                      "nationality2": p.get("nationality2", ""),
+                      "nationality3": p.get("nationality3", ""),
+                      "nationality4": p.get("nationality4", ""),
                       **{s: p.get(s, 0) for s in ALL_STATS}}
 
                 # [2026-08 신설, 신민용 리포트: "39/44경기 뛰었는데 화면엔
@@ -902,7 +953,7 @@ class _FormationCanvas(QWidget):
         if _cache is not None:
             _cache[_cache_key] = (self.formation, list(self.players),
                                    list(self._roster), set(self._starter_ids),
-                                   self._intl_formula_ovr)
+                                   self._intl_formula_ovr, self._team_country)
             # 캐시 크기 제한 (오래된 항목 제거)
             if len(_cache) > 30:
                 oldest = next(iter(_cache))
@@ -948,6 +999,27 @@ class _FormationCanvas(QWidget):
         team_id가 없는 국제대회 쪽(full_squad=None)은 raw_players가
         이미 포지션별로 구성된 대표팀 명단이라 기존 그대로 둔다."""
         self.formation = team.get("formation") or "4-4-2"
+        # [2026-09 신설, 신민용 요청: "외국인 용병 강조가 좌측 우리팀만
+        # 아니라 우측 상대팀에도 떠야 한다"] load_my_team의 클럽팀 분기와
+        # 같은 방식으로, 이 상대팀의 team_id 하나만으로 나라를 구한다 —
+        # _fetch_league_opponents/_fetch_club_group_opponents/_fetch_cwc_
+        # opponents 등 상대팀을 만드는 함수가 8곳 넘게 흩어져 있어(전부
+        # team_id는 공통으로 담아 넘김) 그쪽을 하나하나 고치는 대신 여기
+        # 한 곳에서만 처리한다. team_id가 없으면(국제대회 상대 "국가",
+        # intl_opponents — 국가대표는 전원 같은 국적이라 애초에 "외국인"
+        # 개념이 없음) team_country가 빈 문자열로 남아 강조가 자연히
+        # 꺼진다.
+        _opp_tid = team.get("team_id")
+        self._team_country = ""
+        if _opp_tid:
+            _conn_c = get_conn()
+            _row_c = _conn_c.execute(
+                """SELECT cn.name AS country FROM teams t
+                   JOIN leagues l ON t.league_id = l.id
+                   JOIN countries cn ON l.country_id = cn.id
+                   WHERE t.id=?""", (_opp_tid,)).fetchone()
+            _conn_c.close()
+            self._team_country = _row_c["country"] if _row_c else ""
         raw_players = team.get("players") or []
         slots_only = FORMATION_SLOTS.get(self.formation, FORMATION_SLOTS["4-4-2"])
         # [2026-08 신설] 명단 패널용 — 상대팀도 전체 스쿼드를 따로 가져온다
@@ -1073,8 +1145,15 @@ class _FormationCanvas(QWidget):
             else:
                 color = _pos_color(pos)
             painter.setBrush(QBrush(QColor(color)))
-            pen_color = "#00ff88" if is_hov else ("#000" if is_me else "#000")
-            pen_w = 3 if is_hov else (2 if is_me else 1)
+            # [2026-09 신설, 신민용 요청: "메인 화면 포메이션도 외국인
+            # 용병은 겉부분을 #FF7F00으로 강조 — 내가 클릭한 파란 하이라이트가
+            # 우선"] 파란 선택 표시는 이 원 바깥에 별도 헤일로 링으로
+            # 덧그려지므로(아래 self._selected_id 분기), 여기서 기본
+            # 테두리 색만 정해도 선택 시엔 자동으로 파란 링이 위에 겹쳐져
+            # 우선순위가 지켜진다.
+            is_foreign = _is_player_foreign(pl, self._team_country)
+            pen_color = "#00ff88" if is_hov else ("#FF7F00" if is_foreign else "#000")
+            pen_w = 3 if is_hov else (2 if (is_me or is_foreign) else 1)
             painter.setPen(QPen(QColor(pen_color), pen_w))
             painter.drawEllipse(px-r, py-r, d, d)
             if is_hov:
@@ -1266,6 +1345,9 @@ class _RosterPanel(QScrollArea):
         self._selected_id = None
         self._btn_by_id: dict = {}
         self._pl_by_id: dict = {}   # [2026-08 신설] id → 그 버튼이 보여주는 선수 dict
+        # [2026-09 신설] set_roster가 채운다 — _make_player_button의
+        # is_foreign 판정 기준(_FormationCanvas._team_country와 동일 개념).
+        self._team_country = ""
 
     def _make_group_header(self, text: str, count: int) -> QLabel:
         """[2026-08 신설, 신민용 요청: "이름 표시하는 곳을 파란색으로"]
@@ -1337,6 +1419,15 @@ class _RosterPanel(QScrollArea):
             # 기존 스타일을 폐기.
             style = ("background:#1c1c1c;color:#aaa;border:1px solid #333;"
                      "border-radius:4px;padding:5px 8px;font-size:10px;")
+        # [2026-09 신설, 신민용 요청: "메인 화면 포메이션(우측 명단)도
+        # 외국인 용병은 겉부분을 #FF7F00으로 강조 — 파란 선택 하이라이트가
+        # 우선"] 배경/글자색은 그대로 두고 테두리 선언만 뒤에 덧붙인다 —
+        # 같은 속성은 나중 값이 이기므로 배경은 안 바뀌고 테두리만 바뀐다.
+        # set_selected_id가 선택 시 이 style(_base_qss) 뒤에 파란
+        # border를 한 번 더 이어붙이므로, 선택되면 자동으로 파란색이 이
+        # 주황 테두리 위에 덮어써진다(우선순위 자동 보장).
+        if _is_player_foreign(pl, self._team_country):
+            style += "border:1px solid #FF7F00;"
         btn.setStyleSheet(style + "text-align:left;")
         # [2026-08 신설] 선택 하이라이트 토글 시 이 "선택 안 됐을 때"
         # 스타일로 되돌아가야 하므로 버튼 자체에 저장해둔다. id가 있는
@@ -1369,7 +1460,11 @@ class _RosterPanel(QScrollArea):
         btn.clicked.connect(_open_popup)
         return btn
 
-    def set_roster(self, players: list, starter_ids: set):
+    def set_roster(self, players: list, starter_ids: set, team_country: str = ""):
+        # [2026-09 신설] 이후 _make_player_button 호출들이 참조할 수
+        # 있도록 인스턴스에 보관해둔다 — update_player_name처럼 버튼을
+        # 새로 만들지 않고 재사용하는 경로에서도 값이 남아있어야 하므로.
+        self._team_country = team_country
         # [2026-08 신설] 버튼을 통째로 새로 그리므로(바로 아래) 이전
         # id→버튼 매핑은 전부 무효 — 선택 상태도 같이 초기화한다(팀을
         # 새로 불러오는 시점엔 팝업도 정리되는 게 자연스럽다).
@@ -1496,7 +1591,11 @@ class _TeamPanel(QWidget):
         lay.addWidget(self.roster, 2)
 
     def refresh_roster(self):
-        self.roster.set_roster(self.canvas._roster, self.canvas._starter_ids)
+        # [2026-09 신설] 캔버스가 이미 구해둔 team_country를 그대로
+        # 넘긴다 — 명단 패널 쪽 테두리 강조가 캔버스와 항상 같은 기준을
+        # 쓰게 하기 위함(둘이 각자 조회하면 어긋날 위험이 있음).
+        self.roster.set_roster(self.canvas._roster, self.canvas._starter_ids,
+                                team_country=self.canvas._team_country)
 
     def get_starters_ordered(self) -> list:
         """[2026-08 신설, 신민용 요청: "W/S로 우측 포메이션 기준 위/아래
@@ -1660,7 +1759,8 @@ def open_ovr_edit_dialog(parent, player_id: int, cur_ovr: int):
     if not _accepted or _target == cur_ovr:
         return None
 
-    delta, before_ovr, after_ovr = rescale_ai_player_to_target_ovr(player_id, _target)
+    delta, before_ovr, after_ovr = rescale_ai_player_to_target_ovr(
+        player_id, _target, user_initiated=True)
 
     global _ovr_cache_invalidated
     _ovr_cache_invalidated = True

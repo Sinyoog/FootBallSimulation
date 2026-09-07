@@ -745,6 +745,18 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
     # 교체 없음)시켜 규모를 되돌린다.
     topped_up, forced_out = _rebalance_squad_sizes(c, year)
     _ta3b = _time_perf.perf_counter()
+    # [2026-09 신설, 신민용 요청: "선수의 한계치를 국가별로 최대 2명으로
+    # 둬서 3명 이상이 안나오게"] database._apply_intl_breakout(국제대회
+    # 소집 시 낮은 확률로 딱 한 명씩 "브레이크아웃"시키는 가산 장치)만으론
+    # 이 상한이 실제로 지켜지지 않는다 — 국적은 소속 클럽과 무관하게
+    # 무작위 배정되므로(_pick_nationality), 등급 낮은 나라 국적이 우연히
+    # 강한 클럽에서 성장해 90+를 찍는 경로가 이 브레이크아웃 장치와
+    # 완전히 별개로 원래부터 존재했다(실측: 헤드리스 4시즌 기준 크로아티아
+    # (B등급, 상한5) 국적 90+가 64명까지 쌓여 있었음 — 전부 이 "우연한
+    # 강클럽 배정" 경로, 브레이크아웃 장치가 만든 게 아님). 성장/이적이
+    # 전부 끝난 이 시점에 등급별 상한을 실제로 강제한다 — 초과분은
+    # 낮은 OVR부터(에이스 자리는 최대한 안 건드림) 90 밑으로 되돌린다.
+    _enforce_intl_breakout_caps(c, year)
     _report(3, "포메이션 갱신 중")
     formations = _shuffle_formations(c)
     _t_shuffle = _time_perf.perf_counter()
@@ -2585,7 +2597,7 @@ def _retire_and_replace(c, year, ai_rows=None):
         cur_foreign = foreign_count_by_team.get(tid, 0)
         if old_nat and old_nat != cname:
             cur_foreign = max(0, cur_foreign - 1)
-        _q_lo, quota = get_foreign_quota_range(cname, continent)
+        _q_lo, quota = get_foreign_quota_range(cname, continent, tier=tier)
         new_nat, cur_foreign = _pick_nationality(cname, continent, grade, r["position"],
                                                   False, cur_foreign, quota)
         foreign_count_by_team[tid] = cur_foreign
@@ -4290,7 +4302,7 @@ def _rebalance_squad_sizes(c, year):
                 lo, hi = 40, 55
             _plvl = _rebal_prestige_level(cname, tname)
             used = set()
-            _q_lo, quota = get_foreign_quota_range(cname, continent)
+            _q_lo, quota = get_foreign_quota_range(cname, continent, tier=tier)
             foreign_ct = 0
             for _ in range(need):
                 # [2026-08 버그수정, 신민용 리포트: "지금 팀 후보 포지션
@@ -4404,7 +4416,7 @@ def _rebalance_squad_sizes(c, year):
                         _lo, _hi = 40, 55
                     _plvl = _rebal_prestige_level(cname, tname)
                     _used = set()
-                    _q_lo, _quota = get_foreign_quota_range(cname, continent)
+                    _q_lo, _quota = get_foreign_quota_range(cname, continent, tier=tier)
                     _foreign_ct = 0
                     for si, grp in enumerate(deficient):
                         if si >= len(surplus):
@@ -5379,6 +5391,66 @@ def snapshot_my_player_position(year):
         conn.close()
 
 
+def _enforce_intl_breakout_caps(c, year):
+    """[2026-09 신설, 신민용 요청: "선수의 한계치를 국가별로 최대 2명으로
+    둬서 3명 이상이 안나오게 하고"] database._apply_intl_breakout(국제대회
+    소집 시점에만 낮은 확률로 딱 한 명씩 가산으로 "브레이크아웃"시키는
+    장치) 정의부 주석 참고 — 그 장치만으론 이 상한이 실제로 지켜지지
+    않는다. 국적은 소속 클럽과 완전히 무관하게 무작위 배정되고
+    (database._pick_nationality), OVR 성장 상한도 국적이 아니라 소속팀
+    등급으로만 정해지므로(constants.OVR_RANGES 기반 team_cap), 등급 낮은
+    나라 국적 선수가 우연히 강한 클럽으로 흘러들어가 성장하면서 90+를
+    찍는 경로가 브레이크아웃 장치와 완전히 별개로 원래부터 있었다
+    (database.get_country_avg_squad_ovr 정의부의 2026-07 리포트가 이미
+    같은 현상을 다른 맥락에서 지적한 바 있다 — 실측: 헤드리스 4시즌
+    기준 크로아티아(B등급, 상한5) 국적 90+가 64명까지 쌓여 있었는데
+    전부 이 "우연한 강클럽 배정" 경로였다).
+
+    성장·이적·스쿼드 인원보정이 전부 끝난 이 시점(run_ai_offseason의
+    _rebalance_squad_sizes 직후)에 전세계를 한 번 훑어, database.
+    _INTL_BREAKOUT_MAX_COUNT에 등록된 등급(B~F만 — SS/S/A는 애초에
+    tier1 OVR_RANGES 자체가 90대를 정상적으로 포함하므로 상한이 없다)
+    마다 그 나라 국적 90+ 인원이 상한을 넘으면, 초과분만 낮은 OVR부터
+    (그 나라 안에서 가장 확실한 에이스들은 절대 안 건드림) 85~89 사이
+    무작위 OVR로 되돌린다 — rescale_ai_player_to_target_ovr(기존 함수,
+    스탯을 평행이동시켜 그 선수 고유의 강약 분포는 유지)를 그대로
+    재사용한다.
+
+    [2026-09 신설, 신민용 리포트: "OVR 한도에 사용자가 변경한 경우는
+    예외처리 했나?"] "쉬움 난이도"에서 사용자가 직접 OVR을 맞춘 선수
+    (ai_players.ovr_user_locked=1)는 이 강제 트리밍에서 완전히 제외한다
+    — 상한 인원을 셀 때도 locked 인원은 아예 빼고(그래서 locked만으로
+    이미 상한을 넘어도 더는 안 건드림), 남는 자리 안에서만 unlocked
+    (자연 성장으로 우연히 90+를 찍은 선수) 중 낮은 OVR부터 트리밍한다."""
+    from database import _INTL_BREAKOUT_MAX_COUNT, rescale_ai_player_to_target_ovr
+    from constants import get_country_league_grade
+    rows = c.execute(
+        "SELECT id, nationality, ovr, ovr_user_locked FROM ai_players "
+        "WHERE ovr>=90 AND nationality!=''").fetchall()
+    if not rows:
+        return
+    by_nat: dict = {}
+    for r in rows:
+        by_nat.setdefault(r["nationality"], []).append((r["id"], r["ovr"], bool(r["ovr_user_locked"])))
+    for nat, lst in by_nat.items():
+        cap = _INTL_BREAKOUT_MAX_COUNT.get(get_country_league_grade(nat))
+        if cap is None or len(lst) <= cap:
+            continue
+        # [2026-09 신설, 신민용 요청: "OVR 한도에 사용자가 변경한 경우는
+        # 예외처리 했나?"] 사용자가 "쉬움 난이도"에서 직접 맞춘 선수
+        # (locked)는 절대 안 건드린다 — 상한 계산에서도 빼서, locked
+        # 인원이 이미 상한을 넘겨도(그 이상 손대지 않음) 나머지(자연
+        # 성장으로 우연히 90+ 찍은 unlocked)만 상한에 맞춰 트리밍한다.
+        locked = [(pid, ovr) for pid, ovr, lk in lst if lk]
+        unlocked = [(pid, ovr) for pid, ovr, lk in lst if not lk]
+        remaining_slots = max(0, cap - len(locked))
+        if len(unlocked) <= remaining_slots:
+            continue
+        unlocked.sort(key=lambda t: -t[1])   # 높은 OVR부터 — 남는 자리만큼은 그대로 둔다
+        for pid, _ovr in unlocked[remaining_slots:]:
+            rescale_ai_player_to_target_ovr(pid, random.randint(85, 89), conn=c)
+
+
 def _shuffle_formations(c):
     """[2026-08 재설계, 신민용 확정: "포메이션 20개 확장 + 스쿼드 적합도/
     전술 성향 기반 선택"] 예전엔 팀의 20%가 완전 무작위로 다른 포메이션을
@@ -5594,7 +5666,7 @@ def apply_squad_turnover_after_movement(rescale_jobs, year, turnover_frac=0.25,
         n_turn = min(max(1, int(round(n * turnover_frac))), n - 1)
         n_release = max(0, min(n_turn, int(round(n_turn * release_frac_of_turnover))))
         used = set()
-        _q_lo, quota = get_foreign_quota_range(cname, continent)
+        _q_lo, quota = get_foreign_quota_range(cname, continent, tier=tier)
         foreign_ct = 0
 
         for i, pl in enumerate(squad[:n_turn]):

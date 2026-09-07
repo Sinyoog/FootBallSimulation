@@ -10474,6 +10474,7 @@ def _get_ballon_candidates(c, year):
             "player_id": r["player_id"], "team_id": r["team_id"], "position": r["position"],
             "matches": r["matches"], "goals": r["goals"], "assists": r["assists"],
             "rating": r["rating"], "clean_sheets": r["clean_sheets"],
+            "nationality": r["nationality"],
             "trophy_bonus": _get_team_trophy_bonus(year, r["team_id"], r["player_id"], cache=_cache),
             "intl_bonus": _get_player_intl_bonus(year, r["player_id"], r["nationality"]),
         })
@@ -10499,6 +10500,7 @@ def _get_ballon_candidates(c, year):
                 "player_id": _SIA_MY_PLAYER_ID, "team_id": my_row["team_id"], "position": my_position,
                 "matches": my_row["matches"], "goals": my_row["goals"], "assists": my_row["assists"],
                 "rating": my_row["rating"], "clean_sheets": 0,
+                "nationality": my_nat,
                 "trophy_bonus": _get_team_trophy_bonus(year, my_row["team_id"], _SIA_MY_PLAYER_ID,
                                                         cache=_cache),
                 "intl_bonus": _get_player_intl_bonus(year, _SIA_MY_PLAYER_ID, my_nat),
@@ -10605,7 +10607,25 @@ def _save_individual_award_rows(c, year, category, competition, entries,
         pid = entry["player_id"]
         tid = entry.get("team_id")
         tname, nat, flag = _award_identity_snapshot(c, pid, tid)
-        award_type = f"{competition} {award_kind}" if competition else award_kind
+        # [2026-09 버그수정, 신민용 리포트: "구단 올해의 선수가 '프리미어
+        # 리그 구단 올해의 선수 (아스널)'로 뜨는데 이건 리그명이 아니라
+        # 팀명이 붙어야 맞다 — '아스널 구단 올해의 선수'가 맞는 것 같다"]
+        # 이 함수는 그 리그 전체 개인상(MVP/베스트11/올해의 수비수/구단
+        # 올해의 선수)을 한 번에 저장하는 공용 진입점이라, 나머지 상은
+        # 전부 "그 리그(competition) 소속"이라는 뜻으로 리그명을 접두어로
+        # 붙이는 게 맞다(프리미어리그 MVP 등) — 그런데 "구단 올해의 선수"
+        # 딱 하나만 리그 전체가 아니라 팀 하나하나에 매기는 상이라(팀마다
+        # 한 명씩, entry["team_id"]도 팀마다 다르게 들어옴) 리그명이 아니라
+        # 그 상을 받은 선수의 실제 소속팀(tname, 바로 위에서 이미 이
+        # entry 기준으로 조회해둠)이 접두어여야 한다. world_browser.
+        # _format_player_history_text 등 이 award_type 문자열을 그대로
+        # 표시하는 화면에서 자동으로 "아스널 구단 올해의 선수"가 되도록,
+        # 저장 시점에 이렇게 조립해둔다(표시할 때마다 매번 award_kind로
+        # 분기해 다시 조립하지 않아도 됨).
+        if award_kind == "구단 올해의 선수":
+            award_type = f"{tname} {award_kind}" if tname else award_kind
+        else:
+            award_type = f"{competition} {award_kind}" if competition else award_kind
         rows.append((
             year, award_type, rank, pid, tid, entry.get("position"),
             entry.get("total_score"), entry.get("score_trophy"), entry.get("score_rating"),
@@ -10715,9 +10735,14 @@ def _apply_ballon_team_trophy_decay(candidates):
     12명이 나란히 Top14를 채우던 것처럼, 우승팀이면 그 팀 선수 전원이
     거의 동일한 trophy_bonus를 그대로 받아 우르르 같이 올라가던 문제를
     막는다. intl_bonus(국가대표 성과)는 여기서 건드리지 않는다 —
-    "국가대표팀 전원이 같은 보너스를 받는다"는 별개 이슈로, 이번
-    피드백은 명확히 클럽(구단) 단위 중복 사례(팔메이라스/크루스
-    아술/시미즈)를 지적한 것이라 범위를 클럽 트로피로 좁힌다.
+    [2026-09 신설 당시] "국가대표팀 전원이 같은 보너스를 받는다"는
+    별개 이슈로, 이번 피드백은 명확히 클럽(구단) 단위 중복 사례(팔메이라스/
+    크루스 아술/시미즈)를 지적한 것이라 범위를 클럽 트로피로 좁혔었다.
+    [2026-09 후속] 그 별개 이슈는 신민용이 실제로 다시 리포트해서
+    _apply_ballon_intl_bonus_decay(바로 아래, 완전히 같은 해법을 국적
+    단위로 적용)로 처리했다 — 이 함수는 여전히 클럽 트로피만 담당한다
+    (두 감쇠는 서로 다른 필드를 건드리므로 독립적으로 순서 무관하게
+    같이 걸어도 안전).
     score_rating/score_goals_assists 같은 순수 개인 성적 점수는
     전혀 건드리지 않는다 — "개인 활약 > 팀 성과"라는 우선순위를
     지키기 위해, 이 감쇠는 오직 팀 성과 항목 안에서만 작동한다."""
@@ -10738,6 +10763,52 @@ def _apply_ballon_team_trophy_decay(candidates):
     return candidates
 
 
+def _apply_ballon_intl_bonus_decay(candidates):
+    """[2026-09 신설, 신민용 리포트: "월드컵 우승국이 발롱도르 Top30을
+    통째로 채운다 — CB/CDM/LB처럼 핵심이 아닌 포지션까지 에이스랑
+    똑같은 국제대회 가산점(intl_bonus)을 받는다"] 위 _apply_ballon_
+    team_trophy_decay(클럽 트로피 중복 억제, 2026-09 신설 당시 "국가대표팀
+    전원이 같은 보너스를 받는 건 별개 이슈"라고 명시적으로 범위를 클럽으로
+    좁혀뒀던 바로 그 이슈 — 이제 그 별개 이슈를 처리한다.
+
+    원인 실측: _get_player_intl_bonus의 개인 기여도 배율(participation×
+    quality)이 실질적으로 거의 다 포화된다 — participation은 3단계
+    계단함수(_intl_participation_factor)라 주전급이면 다 같은 100% 구간에
+    몰리고, quality(max(0.2, min(1.3, 1.0+(rating-6.0)/1.5)))는 평점
+    6.45만 넘으면 이미 상한 1.3에 도달한다 — 이 게임 평균 평점이 보통
+    7.0~7.5대라, 우승국 주전 11~20명 전원이 사실상 같은 최대 배율을
+    받아 intl_bonus 값이 서로 거의 구분되지 않았다(신민용 제시 실측:
+    프랑스 CB/CDM/LB/GK가 스트라이커와 나란히 13.0).
+
+    클럽 트로피와 완전히 같은 해법 — 같은 국적 후보들을 개인 활약(평점 →
+    골+도움 순)으로 국가대표팀 내부 순위를 매기고, 그 순위에 따라
+    intl_bonus만 _BALLON_TEAM_TROPHY_DECAY 비율로 깎는다(trophy_bonus/
+    score_rating/score_goals_assists 등 나머지 항목은 안 건드림 —
+    "국제대회에서 실제로 가장 두드러진 활약을 보인 소수만 온전한
+    가산점을 받고, 나머지 스쿼드는 참가에 대한 소액만 남는다"는 목적).
+    참고: candidates는 자국 리그(그 나라 tier1) 소속만 게이트를 통과한
+    이미 좁혀진 후보군이라(_get_ballon_candidates 참고), 그 후보들만
+    같은 국적끼리 묶는다 — 그 나라 대표팀 스쿼드 전체가 아니라 "발롱도르
+    후보 자격이 있는 사람들끼리의 국내 순위"라는 뜻이므로, 어차피
+    intl_bonus가 0인 비후보(리그 게이트 자체를 못 넘은 선수 등)는 여기
+    들어오지도 않는다."""
+    by_nat = {}
+    for cand in candidates:
+        nat = cand.get("nationality")
+        if nat:
+            by_nat.setdefault(nat, []).append(cand)
+    for members in by_nat.values():
+        if len(members) < 2:
+            continue
+        members.sort(key=lambda x: (
+            -(x.get("rating") or 0), -((x.get("goals") or 0) + (x.get("assists") or 0)),
+            x["player_id"]))
+        for i, cand in enumerate(members):
+            decay = _BALLON_TEAM_TROPHY_DECAY[min(i, len(_BALLON_TEAM_TROPHY_DECAY) - 1)]
+            cand["intl_bonus"] = round(cand.get("intl_bonus", 0.0) * decay, 2)
+    return candidates
+
+
 def _save_ballon_dor_top30(c, year, candidates):
     """게이트 통과자 전원을 채점 → deterministic 정렬(v2 피드백 #4:
     total_score desc, rating desc, goals+assists desc, player_id asc)
@@ -10748,8 +10819,15 @@ def _save_ballon_dor_top30(c, year, candidates):
     팀 후보들의 trophy_bonus를 팀 내 순위별로 먼저 감쇠시킨다 — 이
     함수가 받는 candidates는 _get_ballon_candidates가 그 해 게이트
     통과자 전원을 모아 반환한 리스트라, 팀 단위로 묶어 순위를 매기기
-    딱 좋은 시점이다(그 이전엔 아직 팀별로 몇 명이 후보인지 알 수 없음)."""
+    딱 좋은 시점이다(그 이전엔 아직 팀별로 몇 명이 후보인지 알 수 없음).
+
+    [2026-09 후속 확장, 신민용 리포트: "월드컵 우승국이 Top30을 통째로
+    채운다"] 같은 이유로 _apply_ballon_intl_bonus_decay도 같이 건다 —
+    이번엔 국적 단위로 intl_bonus(국가대표 성과 가산점)를 감쇠한다.
+    둘은 서로 다른 필드(trophy_bonus vs intl_bonus)만 건드리므로 순서는
+    상관없다."""
     candidates = _apply_ballon_team_trophy_decay(candidates)
+    candidates = _apply_ballon_intl_bonus_decay(candidates)
     scored = []
     for cand in candidates:
         s = _score_ballon_candidate(cand)
@@ -18543,11 +18621,13 @@ def _enforce_foreign_quota_on_join(team_id, team_country, my_nationality):
     안 한다."""
     from database import get_foreign_quota_range
     conn = get_conn()
-    _crow = conn.execute("""SELECT cn.continent AS continent FROM teams t
+    _crow = conn.execute("""SELECT cn.continent AS continent, t.current_tier AS tier
+                             FROM teams t
                              JOIN countries cn ON t.country_id=cn.id
                              WHERE t.id=?""", (team_id,)).fetchone()
     continent = _crow["continent"] if _crow else None
-    _quota_lo, quota = get_foreign_quota_range(team_country, continent)
+    _tier = _crow["tier"] if _crow else None
+    _quota_lo, quota = get_foreign_quota_range(team_country, continent, tier=_tier)
     if my_nationality == team_country:
         conn.close()
         return   # 내가 자국 선수라 쿼터에 안 걸림
