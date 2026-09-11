@@ -47,6 +47,31 @@ def _loan_out_duration_str(entry_list, idx, partner, fallback_sy, fallback_sw):
             return "진행중"
     return "진행중"
 
+
+def _loan_in_duration_str(entry_list, idx):
+    """[2026-09 버그수정, 신민용 리포트: "임대 간 곳 계약 컬럼에 원소속팀
+    계약기간(예: 5년)이 뜨는데, 그 팀에서 실제로 뛰는 기간은 임대기간
+    (예: 1년)뿐이니 계약 컬럼에도 임대기간이 떠야 한다"] 임대로 도착한
+    쪽(entry_list[idx], in_type=='임대')의 실제 임대 기간을 계산한다.
+    단년 임대(대부분)면 이 행 자기 자신의 시작~종료가 곧 전체 임대
+    기간이지만, 다년 임대(같은 팀에서 행이 여러 해로 이어지는 경우)일
+    수도 있으므로 idx부터 팀명이 같은 행이 이어지는 동안 계속 따라가
+    마지막 행의 종료 시점까지를 잰다. 아직 안 끝났으면(연속된 마지막
+    행에 end_year가 없으면) '진행중'."""
+    first = entry_list[idx]
+    team = first.get("team_name")
+    sy = first.get("start_year"); sw = first.get("start_week", 1)
+    last = first
+    for nxt in entry_list[idx + 1:]:
+        if nxt.get("team_name") != team:
+            break
+        last = nxt
+    ey = last.get("end_year"); ew = last.get("end_week", 52)
+    if not (sy and ey):
+        return "진행중"
+    total_weeks = max(1, (ey - sy) * 52 + (ew - sw))
+    return _fmt_loan_months(total_weeks)
+
 # [2026-07 신설, 신민용 리포트: "은퇴창엔 부상/벤치/출전정지로 뜨는데
 # 커리어 창(이 파일)엔 여전히 0.0/원문 영어(red_card)로 뜬다"] retire_window.py
 # 에서 만든 것과 동일한 결장 라벨 체계를 여기서도 그대로 쓴다 — injury/
@@ -756,9 +781,23 @@ class CareerWindow(QDialog):
             # (신민용 지적: "계약에는 임대보낸 팀 계약 기간을 그대로 가는
             # 게 맞다" — 임대처와 새로 계약을 맺은 것처럼 보이지 않도록
             # 별도 문구로 덮어쓰지 않는다).
-            if in_type == "임대" or i == 0 or cur_team != entries[i-1].get("team_name"):
-                # 임대, 또는 팀이 바뀌었거나 첫 행 → 계약년수 표시
-                # (임대는 원소속팀 계약을 그대로 유지하므로 동일하게 취급)
+            #
+            # [2026-09 재수정, 신민용 리포트: "임대 기간도 어차피 임대
+            # 보낸 팀의 계약기간과 같으니, 5년 이런게 뜨는 게 아니라
+            # 임대 기간(1년) 이게 떠야 한다"] 위 결정을 뒤집는다 — 임대
+            # 목적지 팀 행(in_type=='임대')에 원소속팀의 총 계약년수(예:
+            # 5년)를 그대로 보여주면, 실제로는 그 팀에서 1년만 뛰는데도
+            # 마치 그 팀과 5년 계약을 맺은 것처럼 읽힌다. 계약 컬럼은
+            # 이제 "이 행의 팀에서 실제로 뛰는 기간"을 뜻하도록 통일해,
+            # 임대 목적지 행에는 실제 임대 기간(_loan_in_duration_str)을
+            # 보여준다. 원소속팀 쪽 계약년수는 여전히 "이적" 컬럼의
+            # "OO에 임대(N년)" 표기와, 임대 간 곳이 아닌 다른 모든 행
+            # (입단/이적/연장/복귀)의 계약 컬럼에 그대로 남아 있다.
+            if in_type == "임대":
+                c_str = _loan_in_duration_str(visible, i)
+                prev_team = cur_team
+            elif i == 0 or cur_team != entries[i-1].get("team_name"):
+                # 팀이 바뀌었거나 첫 행(임대 아닌 정상 이적/입단) → 계약년수 표시
                 c_str = f"{c_yrs}년" if c_yrs else "—"
                 prev_team = cur_team
             elif in_type == "연장" or t_type == "연장":

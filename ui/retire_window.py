@@ -40,6 +40,31 @@ def _loan_out_duration_str(entry_list, idx, partner, fallback_sy, fallback_sw):
     return "진행중"
 
 
+def _loan_in_duration_str(entry_list, idx):
+    """[2026-09 버그수정, 신민용 리포트: "임대 간 곳 계약 컬럼에 원소속팀
+    계약기간(예: 5년)이 뜨는데, 그 팀에서 실제로 뛰는 기간은 임대기간
+    (예: 1년)뿐이니 계약 컬럼에도 임대기간이 떠야 한다"] career_window.py와
+    동일 로직 — 임대로 도착한 쪽(entry_list[idx], in_type=='임대')의 실제
+    임대 기간을 계산한다. 단년 임대(대부분)면 이 행 자기 자신의 시작~종료가
+    곧 전체 임대 기간이지만, 다년 임대(같은 팀에서 행이 여러 해로 이어지는
+    경우)일 수도 있으므로 idx부터 팀명이 같은 행이 이어지는 동안 계속
+    따라가 마지막 행의 종료 시점까지를 잰다. 아직 안 끝났으면(연속된
+    마지막 행에 end_year가 없으면) '진행중'."""
+    first = entry_list[idx]
+    team = first.get("team_name")
+    sy = first.get("start_year"); sw = first.get("start_week", 1)
+    last = first
+    for nxt in entry_list[idx + 1:]:
+        if nxt.get("team_name") != team:
+            break
+        last = nxt
+    ey = last.get("end_year"); ew = last.get("end_week", 52)
+    if not (sy and ey):
+        return "진행중"
+    total_weeks = max(1, (ey - sy) * 52 + (ew - sw))
+    return _fmt_loan_months(total_weeks)
+
+
 def _game_confirm(parent, title: str, message: str) -> bool:
     from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
     from PyQt6.QtCore import Qt
@@ -797,9 +822,16 @@ class RetireWindow(QDialog):
                     dur = _loan_out_duration_str(visible, i, _partner, sy, sw)
                     t_type = f"{_partner}에 임대({dur})" if _partner else f"임대({dur})"
 
-
-            if in_type == "임대" or i == 0 or cur_team != visible[i-1].get("team_name"):
-                # 임대, 또는 팀이 바뀌었거나 첫 행 → 계약년수 표시
+            # [2026-09 재수정, 신민용 리포트: career_window.py와 동일 —
+            # "임대 기간도 어차피 임대 보낸 팀의 계약기간과 같으니, 5년
+            # 이런게 뜨는 게 아니라 임대 기간(1년) 이게 떠야 한다"] 임대
+            # 목적지 행(in_type=='임대')은 원소속팀 계약년수 대신 실제
+            # 임대 기간을 보여준다 — career_window.py와 동일 로직.
+            if in_type == "임대":
+                c_str = _loan_in_duration_str(visible, i)
+                prev_team = cur_team
+            elif i == 0 or cur_team != visible[i-1].get("team_name"):
+                # 팀이 바뀌었거나 첫 행(임대 아닌 정상 이적/입단) → 계약년수 표시
                 c_str = f"{c_yrs}년" if c_yrs else "—"
                 prev_team = cur_team
             elif in_type == "연장" or t_type == "연장":
@@ -1635,7 +1667,14 @@ class RetireWindow(QDialog):
                     _fee_disp = e.get("transfer_fee", 0)
                     if _fee_disp:
                         t_type = f"{t_type} ({fmt_money(_fee_disp)})"
-                if in_type == "임대" or idx == 0 or e.get("team_name") != entries[idx-1].get("team_name"):
+                if in_type == "임대":
+                    # [2026-09 재수정, 신민용 리포트: career_window.py와 동일 —
+                    # "임대 기간도 어차피 임대 보낸 팀의 계약기간과 같으니,
+                    # 5년 이런게 뜨는 게 아니라 임대 기간(1년) 이게 떠야
+                    # 한다"] 임대 목적지 행은 원소속팀 계약년수 대신 실제
+                    # 임대 기간을 보여준다.
+                    c_str = _loan_in_duration_str(entries, idx)
+                elif idx == 0 or e.get("team_name") != entries[idx-1].get("team_name"):
                     c_str = f"{c_yrs}년" if c_yrs else "—"
                 elif in_type == "연장" or t_type == "연장":
                     c_str = f"{c_yrs}년" if c_yrs else "—"

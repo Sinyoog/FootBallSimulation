@@ -1103,6 +1103,71 @@ def _team_league_id_for_season(c, team_id, season):
     return row["league_id"] if row else None
 
 
+_TEAM_LEAGUE_MAP_CACHE: dict = {}
+
+
+def _team_league_id_map_for_year(c, year):
+    """[2026-09 버그수정, 신민용 리포트: "승격 시즌 리그 개인상(득점왕 등)이
+    승격 이후 리그로 잘못 뜬다"] _team_league_id_for_season과 목적은 완전히
+    같다(그 시즌 실제로 뛴 리그를 teams.league_id의 '지금 값' 대신 구함) —
+    다만 이건 전세계 모든 팀을 한 번에 훑는 개인상 집계 경로
+    (_collect_all_league_candidates/_compute_league_individual_awards/
+    _collect_league_candidates)용 배치판이다. 팀마다 개별 쿼리하면 그
+    함수들이 이미 없앤 N+1이 도로 생기므로, match_results(+아카이브)를
+    각각 한 번씩만 훑어 {team_id: league_id} 전체 맵을 한 번에 만든다.
+
+    season 대신 year로 필터하는 이유: 이 호출부들이 전부 이미 year 기준으로
+    동작하고(hist.ai_player_season_stats도 year가 키), match_results/
+    match_results_archive 둘 다 season과 별개로 year 컬럼을 갖고 있어
+    season 환산이 필요 없다. 같은 시즌(=같은 year) 안에서는 팀의 league_id가
+    항상 하나로 일관된다는 전제는 _team_league_id_for_season과 동일하게
+    유지된다(승강은 시즌 경계에서만 반영되므로).
+
+    [2026-09 성능수정] 이 함수는 한 번의 시즌 전환에서 여러 번 불린다
+    (_compute_league_individual_awards / _process_awards / 인자로 안 받은
+    _collect_*_candidates 폴백). 원래는 호출마다 그 해 전 경기를 홈/원정
+    두 벌(=경기수×2행, 실측 규모 17만 경기 → 34만 행)로 파이썬까지
+    끌어올려 setdefault를 돌렸다. 두 가지를 고친다:
+
+      (1) 집계를 SQLite 쪽으로: GROUP BY tid로 팀당 1행만 올린다 —
+          34만 행 → 11,393행. 위 전제("같은 year 안에서 한 팀의
+          league_id는 하나")가 성립하므로 어느 행을 고르든 값이 같고,
+          그래서 MIN(league_id)은 기존 setdefault(먼저 온 행 채택)와
+          같은 값을 준다. 오히려 기존 방식은 "먼저 오는 행"이 SQLite
+          스캔 순서에 의존해 버전/플랜에 따라 달라질 여지가 있었는데,
+          MIN은 항상 같은 값이라 결정론이 더 강해진다. 실측: 동일 결과,
+          0.306s → 0.140s (2.2배).
+      (2) 결과 메모이즈: 캐시 키에 year뿐 아니라 두 표의 그 해 행 수를
+          함께 넣는다. 이 맵의 내용은 (team, league) 쌍의 집합에만
+          의존하고, 그 집합은 행의 INSERT/DELETE로만 바뀐다(코드베이스
+          전체에서 match_results/archive에 대한 UPDATE는 home_score/
+          away_score뿐 — league_id/team_id를 바꾸는 UPDATE는 존재하지
+          않음을 전수 확인). 즉 내용이 바뀌면 행 수도 반드시 바뀌므로
+          이 키로 캐시가 낡을 수 없다(일정 생성/아카이브 이동/세이브
+          초기화 전부 행 수를 바꾼다). 헤드리스 QA·결정론 프로브처럼
+          한 프로세스에서 여러 세이브를 오가는 경우에도 안전하다."""
+    _key_counts = tuple(
+        c.execute(f"SELECT COUNT(*) FROM {t} WHERE year=?", (year,)).fetchone()[0]
+        for t in ("match_results", "match_results_archive"))
+    _key = (year, *_key_counts)
+    _hit = _TEAM_LEAGUE_MAP_CACHE.get(_key)
+    if _hit is not None:
+        return _hit
+    mapping: dict = {}
+    for table in ("match_results", "match_results_archive"):
+        for _tid, _lid in c.execute(
+                f"""SELECT tid, MIN(league_id) FROM (
+                        SELECT home_team_id AS tid, league_id FROM {table} WHERE year=?
+                        UNION ALL
+                        SELECT away_team_id AS tid, league_id FROM {table} WHERE year=?
+                    ) GROUP BY tid""",
+                (year, year)).fetchall():
+            mapping.setdefault(_tid, _lid)
+    _TEAM_LEAGUE_MAP_CACHE.clear()   # 연도 하나치만 들고 있으면 충분 — 무한 증식 방지
+    _TEAM_LEAGUE_MAP_CACHE[_key] = mapping
+    return mapping
+
+
 def _team_wdl_from_results(c, tid, league_id, season):
     """[버그수정 2026-07, 신민용 리포트: "커리어 팀 전적이 세계기록실 순위표랑
     다르다 — 실제 44경기 시즌인데 69승무패로 나온다"] teams.wins/draws/losses는
@@ -8870,7 +8935,7 @@ def _apply_ace_concentration(rows, key_fn):
 
 
 def _collect_league_candidates(c, league_id, exclude_my_team=None, full_season_matches=14,
-                                team_goals_for=None, year=None):
+                                team_goals_for=None, year=None, team_league_map=None):
     """리그 내 모든 팀의 AI 후보 선수들의 시즌 성적 → 후보 리스트.
 
     [최적화] 기존엔 팀마다 ai_players를 2번씩(전체 OVR 집계용 + 후보 목록용)
@@ -8902,6 +8967,21 @@ def _collect_league_candidates(c, league_id, exclude_my_team=None, full_season_m
       하면 받는" 상이었다. ap.age를 SELECT에 추가해 실제 AI 나이가 반영되게
       고쳤다 — 이번 재설계(평점 기준 비교)가 실제로 작동하려면 반드시
       필요한 수정이라 같이 넣는다.
+
+    [2026-09 버그수정, 신민용 리포트: "승격 시즌 리그 개인상(득점왕 등)이
+      승격 이후 리그로 잘못 뜬다"] year가 주어지는 경로(시즌 종료, 아래
+      참고)는 원래 t.league_id(teams의 "지금" 값)로 그 리그 후보를 걸렀다 —
+      그런데 승강 처리(_process_promotion_relegation)는 클럽 시즌이 끝나는
+      43주에 이미 실행돼 다음 시즌 리그로 반영되고, 개인상 계산은 훨씬 뒤인
+      52주(_end_of_season)에 일어난다. 그 사이 승격/강등된 팀 소속 선수는
+      "그 시즌 실제로 뛴 리그"가 아니라 "다음 시즌 리그"로 잘못 묶여
+      득점왕/도움왕/MVP/베스트11/영플레이어/올해의 수비수/구단 올해의 선수가
+      전부 엉뚱한 리그명으로 저장됐다. team_league_map({team_id: 그 시즌
+      실제 리그id}, _team_league_id_map_for_year 참고)이 주어지면 그걸로
+      "이 리그(league_id)에 그 시즌 실제로 있었던 팀" 목록을 구해 그 팀
+      소속 후보만 모은다 — teams.league_id 조인 자체를 없애 승격/강등
+      타이밍과 완전히 무관해진다. 그 시즌 경기 기록이 아예 없는 예외
+      (신생 리그 등)만 기존처럼 teams.league_id 기준으로 폴백한다.
     """
     # 팀별 평균 OVR + 리그 평균을 단일 JOIN 집계로. (year 유무와 무관하게
     # 매번 계산 — league_avg 반환값은 호출부가 필요하면 쓰고, year 분기
@@ -8934,20 +9014,31 @@ def _collect_league_candidates(c, league_id, exclude_my_team=None, full_season_m
     ALL_AWARD_POS = GK_POS + DF_POS + MF_POS + FW_POS
 
     if year is not None:
+        # [버그수정] t.league_id(현재값) 대신, 그 시즌 실제로 이 리그에
+        # 있었던 팀 집합으로 후보를 거른다 — 위 docstring 참고.
+        if team_league_map is None:
+            team_league_map = _team_league_id_map_for_year(c, year)
+        _team_ids = [tid for tid, lid in team_league_map.items() if lid == league_id]
+        if not _team_ids:
+            # 그 시즌 경기 기록이 아예 없는 예외(신생 리그 첫 해 등) — 기존처럼
+            # 현재 소속 기준으로 폴백(승강 타이밍 이슈가 애초에 생길 수 없는 경우).
+            _team_ids = [r["tid"] for r in c.execute(
+                "SELECT id AS tid FROM teams WHERE league_id=?", (league_id,)).fetchall()]
+        if not _team_ids:
+            return [], league_avg
+        _tid_ph = ",".join("?" for _ in _team_ids)
         # 아카이브에서 그대로 읽기 — _snapshot_season_ratings가 방금 저장한
         # 값(세계기록실 "기록 복사"에 보이는 것과 완전히 동일)을 그대로 쓴다.
         placeholders = ",".join("?" for _ in ALL_AWARD_POS)
         hist_rows = c.execute(
-            """SELECT ap.id AS player_id, ap.team_id AS tid, ap.name, ap.position, ap.ovr,
+            f"""SELECT ap.id AS player_id, ap.team_id AS tid, ap.name, ap.position, ap.ovr,
                       ap.age AS age, h.goals AS goals, h.assists AS assists, h.rating AS rating,
                       h.clean_sheets AS cs, h.saves AS saves, h.goals_conceded AS goals_conceded,
                       h.matches AS matches
                FROM hist.ai_player_season_stats h
                JOIN ai_players ap ON ap.id = h.player_id
-               JOIN teams t ON ap.team_id = t.id
-               WHERE h.year=? AND t.league_id=? AND ap.position IN ({})"""
-            .format(placeholders),
-            (year, league_id, *ALL_AWARD_POS)).fetchall()
+               WHERE h.year=? AND ap.team_id IN ({_tid_ph}) AND ap.position IN ({placeholders})""",
+            (year, *_team_ids, *ALL_AWARD_POS)).fetchall()
         # [2026-09 신설, "리그전 개인상" 세계 계산용] player_id를 추가했다 —
         # 예전엔 이 함수가 "내가 받았는가"만 판정하면 됐어서 AI 후보의
         # 실제 id가 필요 없었지만, 이제 season_individual_awards에 실제
@@ -9010,10 +9101,18 @@ def _collect_league_candidates(c, league_id, exclude_my_team=None, full_season_m
     return cands, league_avg
 
 
-def _collect_all_league_candidates(c, year, fsm_by_league):
+def _collect_all_league_candidates(c, year, fsm_by_league, team_league_map=None):
     """[2026-09 성능, N+1 제거] _collect_league_candidates(year=...)를 리그마다
     부르면 전세계 710개 리그 × 2쿼리 = 1,420회가 돈다. 개인수상산정
     프로파일에서 이 경로가 1.03초였다. 같은 결과를 쿼리 1회로 모아온다.
+
+    [2026-09 버그수정, 신민용 리포트: "승격 시즌 리그 개인상이 승격 이후
+    리그로 잘못 뜬다"] 아래 쿼리의 t.league_id(teams의 "지금" 값)로
+    후보를 묶으면, 43주 승강처리 이후 52주에 도는 이 함수가 승격/강등된
+    팀 소속 선수를 전부 "다음 시즌 리그"로 잘못 묶는다 — team_league_map
+    ({team_id: 그 시즌 실제 리그id}, _team_league_id_map_for_year 참고)이
+    있으면 그걸로 묶고, 그 팀이 맵에 없을 때만(그 시즌 경기기록이 아예
+    없는 예외) t.league_id로 폴백한다.
 
     반환: {league_id: [후보 dict, ...]} — 원소의 키·값은 _collect_league_
     candidates의 year 분기가 만드는 것과 완전히 동일하다.
@@ -9044,8 +9143,19 @@ def _collect_all_league_candidates(c, year, fsm_by_league):
         전송이 통째로 사라진다. 원본 _collect_league_candidates는
         다른 호출부(_process_awards 등)를 위해 그대로 둔다.
     """
+    if team_league_map is None:
+        team_league_map = _team_league_id_map_for_year(c, year)
     ALL_AWARD_POS = GK_POS + DF_POS + MF_POS + FW_POS
     placeholders = ",".join("?" for _ in ALL_AWARD_POS)
+    # [2026-09 성능 검토 메모 — 일부러 안 고침] 이 쿼리는 PK가 (player_id,
+    # year)인 hist를 "WHERE h.year=?"로 읽어 플래너가 SCAN h(전 시즌 스캔)
+    # 를 고른다. _get_ballon_candidates에서 했던 것처럼 ai_players를
+    # CROSS JOIN으로 바깥에 고정하면 스캔이 사라지지만, 여기는 결과가
+    # 24만 행(전세계 전원)이라 PK 프로브 20만 회 비용이 순차 스캔보다
+    # 오히려 비쌌다 — 실측(20만 선수×20시즌): SCAN 646ms vs 프로브
+    # 709ms로 역전. 결과가 4천여 행뿐인 _get_ballon_candidates와 정반대다.
+    # 시즌이 더 쌓이면(대략 25~30시즌 부근) 역전될 수 있으니, 그때 다시
+    # 재보고 바꾸는 게 맞다(바꾸는 방법은 _get_ballon_candidates 주석 참고).
     rows = c.execute(
         """SELECT t.league_id, ap.id, ap.team_id, ap.position, ap.age,
                   h.goals, h.assists, h.rating, h.clean_sheets, h.saves,
@@ -9057,7 +9167,8 @@ def _collect_all_league_candidates(c, year, fsm_by_league):
         (year, *ALL_AWARD_POS)).fetchall()
     out = {}
     for r in rows:
-        lid = r[0]
+        _tid = r[2]
+        lid = team_league_map.get(_tid, r[0])  # [버그수정] 그 시즌 실제 리그 우선, 없으면 t.league_id(현재값)로 폴백
         bucket = out.get(lid)
         if bucket is None:
             bucket = out[lid] = []
@@ -10452,18 +10563,29 @@ def _get_ballon_candidates(c, year):
     # 작년 값이 남는 일이 구조적으로 불가능하다.
     _cache = {}
 
+    # [2026-09 성능수정] _collect_all_league_candidates와 같은 이유 —
+    # "FROM hist... WHERE s.year=?"는 PK가 (player_id, year)라 SCAN s
+    # (전 시즌 전체 스캔)로 풀린다. 여기는 결과가 4천여 행뿐인데 그걸
+    # 뽑으려고 누적 전 행을 훑던 셈이라 낭비가 특히 크다. ai_players를
+    # CROSS JOIN으로 바깥에 고정해 hist를 PK로 찍게 한다 — teams 조인은
+    # 기존 그대로 s.team_id(그 해를 마무리한 팀) 기준을 유지한다
+    # (ap.team_id는 '지금' 소속이라 의미가 달라지므로 절대 바꾸지 않음).
+    # WHERE의 s.matches>=10만 ON으로 옮겼고(INNER JOIN이라 동치),
+    # 행 집합이 완전히 같음을 실측 확인했다(211ms → 144ms, 그리고 새
+    # 형태는 시즌이 쌓여도 비용이 늘지 않는다).
     ai_rows = c.execute(
         """SELECT s.player_id AS player_id, s.team_id AS team_id, s.matches AS matches,
                   s.goals AS goals, s.assists AS assists, s.rating AS rating,
                   s.clean_sheets AS clean_sheets,
                   ap.position AS position, ap.nationality AS nationality,
                   cn.grade AS grade
-           FROM hist.ai_player_season_stats s
-           JOIN ai_players ap ON ap.id = s.player_id
+           FROM ai_players ap
+           CROSS JOIN hist.ai_player_season_stats s
+             ON s.player_id = ap.id AND s.year=? AND s.matches>=10
            JOIN teams t ON t.id = s.team_id
            JOIN leagues l ON l.id = t.league_id
            JOIN countries cn ON cn.id = l.country_id
-           WHERE s.year=? AND l.tier=1 AND cn.grade IN ('SS','S','A') AND s.matches>=10""",
+           WHERE l.tier=1 AND cn.grade IN ('SS','S','A')""",
         (year,)).fetchall()
 
     for r in ai_rows:
@@ -10880,18 +11002,53 @@ def _get_puskas_candidates(c, year):
         trow = c.execute("SELECT league_id FROM teams WHERE id=?", (my_team_id,)).fetchone()
         my_league_id = trow["league_id"] if trow else None
 
+    # [2026-09 성능수정] 예전엔 아래 루프 안에서 리그마다 hist.ai_player_
+    # season_stats를 개별 조회했다. 그런데 이 표의 PK는 (player_id, year)
+    # 라서 year가 선행 컬럼이 아니고, year 단독 인덱스도 없다 — 그래서
+    # SQLite 쿼리플래너가 "WHERE s.year=? AND t.league_id=?"를 매번
+    # SCAN s(전 시즌 전체 스캔) + TEMP B-TREE 정렬로 처리했다(EXPLAIN
+    # QUERY PLAN으로 확인). 이 표는 매 시즌 전세계 선수 전원이 1행씩
+    # 쌓이는 구조(20만 행/시즌)라, 세이브가 오래될수록 "리그 수 × 누적
+    # 전체 행"만큼 스캔량이 커진다 — 시즌이 갈수록 시즌전환이 느려지는
+    # 전형적 패턴.
+    #
+    # 리그별 조회를 year 1회 조회로 합치고 리그별 버킷팅을 파이썬에서
+    # 한다(_collect_all_league_candidates_bulk가 이미 쓰는 패턴과 동일).
+    # 스캔은 리그 수와 무관하게 항상 1회.
+    #
+    # [결과 동일성] 기존 쿼리의 "ORDER BY s.goals DESC LIMIT 10"에서
+    # 동점자 순서는 SQLite 정렬기가 PK 순서(player_id 오름차순)로 들어온
+    # 행을 안정 정렬한 결과였다. 아래는 ORDER BY s.player_id로 같은 입력
+    # 순서를 만든 뒤 파이썬 sorted(안정 정렬 보장)로 goals 내림차순만
+    # 적용하므로 동점 순서까지 완전히 같다 — 20리그 × 20시즌(410만 행)
+    # 데이터로 기존/신규 결과가 리그별 상위 10명 튜플까지 bit-identical
+    # 함을 실측 확인했다(3.38s → 0.17s). 이 순서는 아래
+    # scope=f"world_puskas_league_pool{i}"의 i에 그대로 쓰여 골 생성
+    # 시드를 결정하므로 반드시 보존돼야 한다.
+    _pool_by_league: dict = {}
+    if leagues:
+        _lids = [lg["league_id"] for lg in leagues]
+        _lid_ph = ",".join("?" for _ in _lids)
+        for r in c.execute(
+                f"""SELECT t.league_id AS lid, s.player_id AS player_id,
+                           s.team_id AS team_id, s.goals AS goals, s.matches AS matches,
+                           ap.position AS position, ap.ovr AS ovr
+                    FROM hist.ai_player_season_stats s
+                    JOIN ai_players ap ON ap.id = s.player_id
+                    JOIN teams t ON t.id = s.team_id
+                    WHERE s.year=? AND s.goals>0 AND t.league_id IN ({_lid_ph})
+                    ORDER BY s.player_id""",
+                (year, *_lids)).fetchall():
+            _pool_by_league.setdefault(r["lid"], []).append(
+                {"player_id": r["player_id"], "team_id": r["team_id"],
+                 "goals": r["goals"], "matches": r["matches"],
+                 "position": r["position"], "ovr": r["ovr"]})
+
     league_winners = []
     for lg in leagues:
         league_id, lname, grade = lg["league_id"], lg["league_name"], lg["grade"]
-        scorer_rows = c.execute(
-            """SELECT s.player_id, s.team_id, s.goals, s.matches,
-                      ap.position AS position, ap.ovr AS ovr
-               FROM hist.ai_player_season_stats s
-               JOIN ai_players ap ON ap.id = s.player_id
-               JOIN teams t ON t.id = s.team_id
-               WHERE s.year=? AND t.league_id=? AND s.goals>0
-               ORDER BY s.goals DESC LIMIT ?""",
-            (year, league_id, _GOAL_POOL_SIZE)).fetchall()
+        scorer_rows = sorted(_pool_by_league.get(league_id, []),
+                             key=lambda x: -x["goals"])[:_GOAL_POOL_SIZE]
 
         # 원본 _process_goal_awards와 동일하게, 후보 한 명씩 개별 호출해
         # 각자의 final_score를 얻는다(한 번에 몰아 넣으면 최고 1개만
@@ -11545,9 +11702,17 @@ def _compute_league_individual_awards(year, my_ctx=None):
         # 710개 리그 × 5회가 돌았다. 전부 아래 세 번의 조회로 대체한다.
         # 팀 목록은 id 오름차순으로 담아두므로, 구단 올해의 선수 순번
         # (poty_rank)은 예전 "ORDER BY id" 쿼리와 정확히 같은 순서가 된다.
+        # [2026-09 버그수정, 신민용 리포트: "승격 시즌 리그 개인상이 승격
+        # 이후 리그로 잘못 뜬다"] teams.league_id는 "지금"(43주 승강처리
+        # 이후) 값이라, 승격/강등된 팀은 그 시즌 실제로 뛴 리그가 아니라
+        # 다음 시즌 리그로 잘못 묶인다 — _team_league_id_map_for_year로
+        # 그 시즌 실제 소속 리그를 우선 쓰고, 맵에 없는 팀(그 시즌 경기
+        # 기록이 아예 없는 예외)만 기존처럼 teams.league_id로 폴백한다.
+        _team_league_map = _team_league_id_map_for_year(c, year)
         _teams_by_league = {}
         for _tr in c.execute("SELECT id, league_id FROM teams ORDER BY id").fetchall():
-            _teams_by_league.setdefault(_tr["league_id"], []).append(_tr["id"])
+            _lid = _team_league_map.get(_tr["id"], _tr["league_id"])
+            _teams_by_league.setdefault(_lid, []).append(_tr["id"])
         # 리그별 풀시즌 경기수 — _league_full_season_matches와 같은 공식
         # (팀 수-1 × 다전제). 그 함수는 team_id로 리그를 되짚어 COUNT를
         # 돌지만, 여기서는 이미 리그별 팀 수를 알고 있으므로 바로 계산한다.
@@ -11555,7 +11720,8 @@ def _compute_league_individual_awards(year, my_ctx=None):
         for _lid, _tids in _teams_by_league.items():
             _n = len(_tids) or 20
             _fsm_by_league[_lid] = max(1, (_n - 1) * legs_for_team_count(_n))
-        _cands_by_league = _collect_all_league_candidates(c, year, _fsm_by_league)
+        _cands_by_league = _collect_all_league_candidates(
+            c, year, _fsm_by_league, team_league_map=_team_league_map)
         _sink = []
         for lg in leagues:
             league_id, lname, tier, country = lg["id"], lg["name"], lg["tier"], lg["country"]
@@ -12293,11 +12459,29 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
         return  # 무소속이면 수상 없음
     conn = get_conn(); c = conn.cursor()
     try:
-        lrow = c.execute("""SELECT l.id as lid, l.name as lname, l.tier,
-                                   cn.grade as grade, cn.name as cname
-                            FROM teams t JOIN leagues l ON t.league_id=l.id
-                            JOIN countries cn ON l.country_id=cn.id
-                            WHERE t.id=?""", (tid,)).fetchone()
+        # [2026-09 버그수정, 신민용 리포트: "승격 시즌 리그 개인상이 승격
+        # 이후 리그로 잘못 뜬다"] 평점 기반 상(MVP/베스트11/영플레이어/
+        # 올해의 수비수/구단 올해의 선수)의 기준은 위 주석대로 "시즌 종료
+        # 시점 소속팀"이 맞지만, teams.league_id를 그대로 쓰면 43주 승강
+        # 처리 이후(44~52주, 이 함수가 실제로 도는 시점)엔 이미 다음 시즌
+        # 리그를 가리킨다 — career_entries 쪽에 이미 쓰던 것과 동일한
+        # _team_league_id_for_season으로 그 시즌 실제 리그를 우선 쓰고,
+        # 이번 시즌 경기 기록이 아직 없으면(막 이적 직후 등) 기존처럼
+        # 현재 소속팀 리그로 폴백한다.
+        _season = p.get("current_season", 1)
+        _season_lid = _team_league_id_for_season(c, tid, _season)
+        lrow = None
+        if _season_lid is not None:
+            lrow = c.execute("""SELECT l.id as lid, l.name as lname, l.tier,
+                                       cn.grade as grade, cn.name as cname
+                                FROM leagues l JOIN countries cn ON l.country_id=cn.id
+                                WHERE l.id=?""", (_season_lid,)).fetchone()
+        if not lrow:
+            lrow = c.execute("""SELECT l.id as lid, l.name as lname, l.tier,
+                                       cn.grade as grade, cn.name as cname
+                                FROM teams t JOIN leagues l ON t.league_id=l.id
+                                JOIN countries cn ON l.country_id=cn.id
+                                WHERE t.id=?""", (tid,)).fetchone()
         if not lrow:
             conn.close(); return
         from constants import get_league_grade
@@ -12309,12 +12493,19 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
         # 하므로, 아래에서 쓰던 FULL_SEASON_MATCHES 계산을 후보 수집보다
         # 앞으로 끌어왔다(계산 내용 자체는 그대로, 호출 순서만 변경).
         FULL_SEASON_MATCHES = _league_full_season_matches(p, team_id=tid)
+        # [2026-09 성능] 아래 여러 리그(주 리그 + _splits로 쪼개진 나머지
+        # 리그)에서 _collect_league_candidates(year=...)를 반복 호출하므로,
+        # {team_id: 그 시즌 실제 리그id} 맵을 한 번만 만들어 공유한다
+        # (팀마다 개별 쿼리하지 않는 이유는 _team_league_id_map_for_year
+        # 문서 참고).
+        _team_league_map = _team_league_id_map_for_year(c, year) if use_archived_ai_stats else None
         if use_archived_ai_stats:
             # [2026-09 재설계] 세계기록실에 이미 저장된 이번 시즌 값을 그대로
             # 읽는다 — 즉석 추정도, teams.goals_for 스케일링도 필요 없다
             # (저장 시점에 이미 다 반영됨).
             cands, league_avg = _collect_league_candidates(
-                c, league_id, full_season_matches=FULL_SEASON_MATCHES, year=year)
+                c, league_id, full_season_matches=FULL_SEASON_MATCHES, year=year,
+                team_league_map=_team_league_map)
         else:
             # [2026-09 신설, 신민용 리포트: "득점왕 판정이 세계기록실 골 기록이랑
             # 안 맞을 수 있다"] teams.goals_for(이번 시즌 실제 득점)는 시즌 통계가
@@ -12405,7 +12596,8 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
                 _l_full = _league_full_season_matches(p, team_id=_sp["team_id"])
                 if use_archived_ai_stats:
                     _l_cands, _ = _collect_league_candidates(
-                        c, _lid, full_season_matches=_l_full, year=year)
+                        c, _lid, full_season_matches=_l_full, year=year,
+                        team_league_map=_team_league_map)
                 else:
                     # 즉석 추정 경로(시즌 중 은퇴 등)도 주 리그와 같은
                     # teams.goals_for 보정을 받게 한다.
@@ -13139,24 +13331,29 @@ def _end_of_season(p, year, progress_cb=None):
     #     말이라 그렇게 바꾼다 — 이번 시즌 AI 골/도움/평점을 여기서 먼저
     #     세계기록실(hist.ai_player_season_stats)에 archiving해두고, 바로
     #     아래 1.5단계 개인수상 판정이 그 저장된 값을 그대로 읽어 쓰게
-    #     한다(_process_awards(use_archived_ai_stats=True)). 이 시점은
-    #     원래 run_ai_offseason 안에서 나중에(AI 나이/노화 처리 이후)
-    #     스냅샷하던 타이밍보다도 이르다 — 즉 "이번 시즌을 실제로 뛴 그대로"의
-    #     OVR 기준이라 의미상 더 정확하다(노화 반영 후 OVR로 계산되던 기존
-    #     타이밍보다 적절). team_goals_for도 팀 통계가 리셋되기 전인 지금
-    #     구해서 넘긴다. run_ai_offseason은 이 스냅샷을 다시 하지 않도록
-    #     skip_season_snapshot=True로 부른다(아래 5.7단계) — 안 그러면
-    #     같은 시즌을 또 다른 랜덤값으로 덮어써서 다시 어긋난다.
+    #     한다(_process_awards(use_archived_ai_stats=True)).
+    #
+    #     [2026-09 리팩터, 신민용 확정: "포메이션처럼 43주차로 옮기자"]
+    #     리그/국내컵/CL·EL·ECL/슈퍼컵(전부 23주차 이전 종료)은 이제
+    #     game_engine._process_promotion_relegation(43주차, 승강 확정
+    #     직후 — apply_squad_turnover_after_movement가 로스터를 흔들기
+    #     "전")에서 archiving한다(team_goals_for도 그 시점에 같이 구해서
+    #     넘김) — 팀 포메이션 스냅샷과 완전히 같은 이유. 여기(52→1주
+    #     진입)선 그 부분은 다시 안 건드리고(include_league=False),
+    #     **클럽월드컵(CWC)만** 남겨서 처리한다 — CWC는 45주차부터 열려
+    #     (competition/club_world_cup_engine.CWC_START_DAY) 43주차
+    #     시점엔 아직 대회가 없고, 지금(대회가 다 끝난 뒤)은 43주차의
+    #     스쿼드 개편이 이미 반영된 "실제로 CWC를 뛴" 로스터라 오히려
+    #     이 타이밍이 CWC엔 맞다. run_ai_offseason은 여전히 skip_season_
+    #     snapshot=True로 불러서 중복 실행을 막는다(아래 5.7단계).
     # [2026-09 계측] live_sim.log 실측상 _end_of_season 중 AI생애주기를 뺀
     # 나머지가 매 시즌 9~12초인데 이 구간엔 계측이 전혀 없어 어디가 무거운지
     # 알 수 없었다(시즌전환 전체의 약 22%). 순수 계측만 추가한다.
     import time as _time_eos
     _te0 = _time_eos.perf_counter()
     conn0 = get_conn()
-    _early_team_goals_for = {
-        r[0]: r[1] for r in conn0.execute("SELECT id, goals_for FROM teams").fetchall()}
     from ai_lifecycle import _snapshot_season_ratings, _snapshot_intl_season_ratings
-    _snapshot_season_ratings(conn0.cursor(), year, team_goals_for=_early_team_goals_for)
+    _snapshot_season_ratings(conn0.cursor(), year, include_league=False, competitions=("cwc",))
     _te1 = _time_eos.perf_counter()
     # [2026-09 신설, 신민용 지적: "국제대회 개인 활약도 발롱도르에 반영해야
     # 한다"] 국가대표(월드컵/대륙컵 등) 평점/골/어시 스냅샷도 위 클럽 스냅샷과
@@ -15391,6 +15588,49 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
             _po_pending_inserts)
     _pr_t6 = _time_pr.perf_counter()
 
+    # [2026-09 신설, 신민용 확정: "하반기 포메이션은 2차 라운드에 실제
+    # 뛴 스쿼드를 보여줘야 한다"] 바로 아래 rescale/apply_squad_turnover_
+    # after_movement(승강 스쿼드 개편 — 하위권 일부 방출/교체)가 로스터를
+    # 흔들기 "직전"인 지금(리그 경기는 이미 다 끝났고 승강만 막 확정된
+    # 시점)에 "하반기" 팀 포메이션·역할 스냅샷을 찍는다. 예전엔 이 스냅샷을
+    # ai_lifecycle.run_ai_offseason 맨 앞(시즌이 완전히 끝난 훨씬 뒤)에서
+    # 찍었는데, 그 시점엔 이미 이 스쿼드 개편이 끝난 뒤라 "하반기"가 실제
+    # 2차 라운드 로스터가 아니라 "방출까지 끝난 시즌 종료 후" 로스터를
+    # 보여주고 있었다(강등팀만 후보가 9명까지 급감해 보이던 버그의
+    # 근본 원인). team_season_lineup(팀 포메이션 화면)·ai_player_position_
+    # history(선수별 그 해 역할) 둘 다 이 한 번으로 채워진다 — 이후
+    # 스쿼드 개편·은퇴·오프시즌 이적으로 새로 생기는 선수는 run_ai_offseason
+    # 쪽 only_missing=True 2차 패스가 그대로 커버한다(team_season_lineup은
+    # 그쪽에서 안 건드리도록 이미 되어 있어 이 스냅샷을 덮어쓰지 않는다).
+    try:
+        from ai_lifecycle import _snapshot_season_positions
+        _snapshot_season_positions(c, year)
+    except Exception as _e:
+        add_log(f"[하반기 포메이션 스냅샷 오류] {_e}", "normal", year, 52)
+    _pr_t6b = _time_pr.perf_counter()
+
+    # [2026-09 신설, 위와 같은 이유] 세계기록실 골/도움/평점 아카이브
+    # (hist.ai_player_season_stats — 발롱도르·골든부츠·베스트11 후보
+    # 산정에도 그대로 쓰임)도 같은 문제를 안고 있었다 — game_engine.
+    # _end_of_season "1.4단계"(52→1주 진입, 여기보다 훨씬 뒤)에서 찍던 걸
+    # 옮겨온다. 다만 클럽월드컵(CWC)은 45주차부터 열려(club_world_cup_
+    # engine.CWC_START_DAY) 지금 시점엔 아직 대회 자체가 없으므로, 리그/
+    # 국내컵/CL·EL·ECL/슈퍼컵만 여기서 archiving하고(competitions에서
+    # cwc 제외) CWC는 _end_of_season이 원래 타이밍대로(대회 다 끝난 뒤)
+    # 따로 담당한다(ai_lifecycle._snapshot_season_ratings 문서 참고).
+    # team_goals_for(그 팀이 이번 시즌 실제로 넣은 골 합계, "Tier B" 실측
+    # 보정용)는 teams.goals_for가 리셋되기 전(그 리셋은 52→1주 진입 때
+    # 일어남)이라 여기서 그대로 조회해도 안전하다.
+    try:
+        from ai_lifecycle import _snapshot_season_ratings
+        _team_goals_for_w43 = {
+            r[0]: r[1] for r in c.execute("SELECT id, goals_for FROM teams").fetchall()}
+        _snapshot_season_ratings(c, year, team_goals_for=_team_goals_for_w43,
+                                  competitions=("cup", "cl", "sc", "lower_cup"))
+    except Exception as _e:
+        add_log(f"[하반기 평점 스냅샷 오류] {_e}", "normal", year, 52)
+    _pr_t6c = _time_pr.perf_counter()
+
     # 승강팀 OVR 평형 일괄 적용
     # [기능 변경] 이 리스케일 자체(승강팀 OVR을 새 리그 수준에 맞추는 것)는
     # 유지하되, "⚙️ ... 리그 적응" 로그는 요청에 따라 화면에 더 이상
@@ -15434,7 +15674,9 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
           f"ai_players OVR스캔 {_pr_t4-_pr_t3:.3f}s | "
           f"승강판정루프({len(cids)}개국) {_pr_t5-_pr_t4:.3f}s | "
           f"executemany({len(_team_move_updates)}건) {_pr_t6-_pr_t5:.3f}s | "
-          f"리스케일({len(_rescale_jobs)}건) {_pr_t7-_pr_t6:.3f}s | "
+          f"하반기포메이션스냅샷 {_pr_t6b-_pr_t6:.3f}s | "
+          f"하반기평점스냅샷 {_pr_t6c-_pr_t6b:.3f}s | "
+          f"리스케일({len(_rescale_jobs)}건) {_pr_t7-_pr_t6c:.3f}s | "
           f"commit/close {_pr_t8-_pr_t7:.3f}s | 캐시무효화 {_pr_t9-_pr_t8:.3f}s")
 
     if my_new_league:

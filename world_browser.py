@@ -1341,6 +1341,15 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
             e["salary_transfer_type"] = _latest[2]
             e["salary_is_loan"] = _latest[3]
             e["salary_fee"] = _latest[4]
+            # [2026-09 신설, 신민용 요청: "이적/입단 정보를 매년 반복
+            # 표시하지 말고 팀이 실제로 바뀐 첫 해에만 보여줘"] _latest[0]은
+            # 이 계약/이적이 "발효된 해"(effective_year) 그 자체다 — 지금
+            # 보고 있는 연도(y_)가 정확히 그 해와 같을 때만 True. 화면·복사
+            # 쪽에서 이 플래그가 False인 해는 💰 연봉/이적종류/이적료 줄
+            # 자체를 건너뛴다(같은 계약이 이어지는 동안 매년 똑같은 내용이
+            # 반복 표시되던 것을 막기 위함 — 아래 _fallback_span_info 경로도
+            # 동일한 원칙으로 span_start와 비교).
+            e["salary_is_first_year"] = (y_ == _latest[0])
             _cend = _latest[5]
             # [2026-09 수정, 신민용 요청: "계약을 언제부터 했냐가 아니라
             # 몇년치 했냐인건데"] 계약 "체결 연도"가 아니라 "기간"(몇
@@ -1363,6 +1372,10 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
         e["salary_transfer_type"] = _label
         e["salary_is_loan"] = is_loan_default
         e["salary_fee"] = 0
+        # [2026-09 신설] 위 "적용 가능한 로그가 있을 때" 분기와 동일한
+        # 원칙 — 이 폴백 구간(로그가 아예 없어 즉석 추정하는 구간)에서도
+        # span_start(그 구간이 시작된 해)와 같을 때만 첫 해로 표시한다.
+        e["salary_is_first_year"] = (y_ == _span_start)
         # [2026-09 수정] contract_end_year가 span_start보다 뒤라면(=데뷔
         # 이후 한 번도 안 바뀐 실제 계약 기간) 그 차이를 그대로 "계약:
         # N년"으로 보여준다 — 모르는 게 아니라 이미 DB에 있는 값이므로
@@ -1466,11 +1479,41 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
         (player_id, player_id)).fetchall()
     mid_by_year = {r["year"]: (r["from_team_id"], r["player_position"], r["player_role"])
                    for r in mid_rows}
-    if mid_by_year:
+
+    # [2026-09 신설, 신민용 요청: "세계 선수 검색에서 상반기/하반기를 다
+    # 나눠야 한다 — 상반기엔 주전이었다가 하반기엔 로테이션으로 가는
+    # 경우도 떠야 하니까. 상 뜨는 거나 이런 건 어차피 비시즌 이적한
+    # 경우랑 같은 원리로 가면 되는 거잖아 — 같은 팀이라도 그 해가 2개
+    # 뜨는 거지, 이때 주전 로테 변경이 될 수 있으니"] 바로 위 mid_by_year
+    # 분기는 "팀 자체가 바뀐 해"만 다룬다 — 팀은 그대로인데 겨울 이적
+    # 시장 전후로 스쿼드 서열(다른 선수 성장/이적 등)이 바뀌어 역할만
+    # 바뀐 해는 대상이 아니었다. hist.ai_player_position_history_half
+    # (상반기, ai_lifecycle._snapshot_team_lineup_half 신설)와 기존
+    # ai_player_position_history(하반기/최종)를 비교해, 팀 변경 없이도
+    # 역할이 다른 해를 찾는다 — 이후 처리(비례 배분 등)는 팀이 바뀐
+    # 경우와 완전히 같은 _half_season_league_entry를 그대로 재사용한다
+    # (team_id만 "바뀐 팀"이 아니라 "그대로인 같은 팀"을 넘길 뿐).
+    _half_role_by_year = get_ai_player_role_checkpoints_half(player_id)
+    _half_pos_by_year = get_ai_player_position_checkpoints_half(player_id)
+    _full_role_by_year = get_ai_player_role_checkpoints(player_id)
+    _role_diff_years = {
+        y for y, h1 in _half_role_by_year.items()
+        if h1 and _full_role_by_year.get(y) and h1 != _full_role_by_year[y]
+        and y not in mid_by_year}  # 팀 자체가 바뀐 해는 위쪽 분기가 전담
+
+    if mid_by_year or _role_diff_years:
         final_out = []
         for e in out:
             final_out.append(e)
-            from_tid, half_pos, half_role = mid_by_year.get(e["year"], (None, None, None))
+            y = e["year"]
+            from_tid, half_pos, half_role = mid_by_year.get(y, (None, None, None))
+            # [2026-09 신설] 팀은 안 바뀌었는데 역할만 바뀐 해 — 반기
+            # 팀으로 "그대로인 같은 팀"(from_tid 자리에 현재 팀 id)을
+            # 넘긴다는 점만 다르고 그 뒤 흐름은 완전히 동일하다.
+            if not from_tid and y in _role_diff_years:
+                from_tid = e.get("_team_id_for_salary")
+                half_pos = _half_pos_by_year.get(y)
+                half_role = _half_role_by_year.get(y)
             if from_tid:
                 # [2026-09 버그수정, 신민용 리포트: "2005년 중간에 이적한
                 # AI 선수 — 상반기 팀(알 힐랄 와우) 줄을 클릭해도 아무것도
@@ -1481,24 +1524,28 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
                 # 같이 넘겨줘야 한다(안 그러면 GK 선수만 여전히 빈 칸).
                 _lg_comp = (e.get("_comp_stats") or {}).get("league") or {}
                 _half_e = _half_season_league_entry(
-                    conn, from_tid, e["year"], half_position=half_pos, half_role=half_role,
+                    conn, from_tid, y, half_position=half_pos, half_role=half_role,
                     full_stat={"matches": e.get("_stat_matches"), "goals": e.get("_stat_goals"),
                                "assists": e.get("_stat_assists"), "rating": e.get("_stat_rating"),
                                "clean_sheets": _lg_comp.get("clean_sheets"),
                                "saves": _lg_comp.get("saves"),
                                "goals_conceded": _lg_comp.get("goals_conceded")},
-                    main_entry=e)
+                    main_entry=e, full_role=_full_role_by_year.get(y))
                 # [2026-09 버그수정, 신민용 리포트: "브라이턴(상반기/원래
                 # 팀) 이때 시작·이적료 이런 게 아예 표시가 안 된다"]
                 # _half_season_league_entry는 리그 성적만 채우고 salary
                 # 관련 키는 아예 안 만들었다 — 위 메인 루프와 똑같은
                 # 로직(_assign_salary_fields)을 원래(상반기) 팀·그 해
-                # 기준으로 적용한다. strict_before=True로 "이 팀을 떠나는
-                # 바로 그 이적 로그"(=e["year"]에 찍힌 mid-season 기록,
-                # 이미 메인 쪽에 반영됨) 자체는 제외하고 그 이전 기록만
-                # 본다 — 안 그러면 새 팀 이야기가 원래 팀 줄에 섞인다.
-                _assign_salary_fields(_half_e, from_tid, e["year"],
-                                       is_loan_default=False, strict_before=True)
+                # 기준으로 적용한다. strict_before는 "팀 자체가 바뀐 해"만
+                # True — 이 해에 찍힌 이적 로그(e["year"], 이미 메인 쪽에
+                # 반영됨) 자체를 제외하고 그 이전 기록만 봐야 새 팀 이야기가
+                # 원래 팀 줄에 안 섞인다. 팀이 안 바뀐 해(역할만 다름)는
+                # 애초에 그 해에 찍힌 이적 로그 자체가 없으므로 이 구분이
+                # 필요 없다 — 메인 루프(strict_before 기본값 False)와
+                # 동일하게 적용한다.
+                _assign_salary_fields(_half_e, from_tid, y,
+                                       is_loan_default=False,
+                                       strict_before=bool(y in mid_by_year))
                 final_out.append(_half_e)
         out = final_out
     conn.close()
@@ -1507,7 +1554,7 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
 
 
 def _half_season_league_entry(conn, team_id, year, half_position=None, half_role=None,
-                                full_stat=None, main_entry=None):
+                                full_stat=None, main_entry=None, full_role=None):
     """[2026-08 신설, 상반기/하반기 이적 기록 분리 기능] league_season_
     standings_half(하반기 시작 순간에 떠둔 상반기까지의 순위 스냅샷)에서
     이 팀의 그 해 상반기 성적 한 줄을 만든다. get_team_history의 연도별
@@ -1521,9 +1568,29 @@ def _half_season_league_entry(conn, team_id, year, half_position=None, half_role
     hist.ai_player_season_stats에서 미리 조회해 넘겨줌)과 main_entry(그
     풀시즌 추정치가 실려있는 원본 entry dict)를 같이 받으면, 이 팀(상반기
     팀)에서 실제로 치른 경기 수(wins+draws+losses, 아래 조회)만큼 비율로
-    골/도움을 쪼개 이 반기 몫으로 붙이고 main_entry에서는 그만큼 빼준다 —
+    골/도움을 쪼개 이 반기 몫으로 붙이고 main_entry에서는 그만큼 빼준다.
+
+    [2026-09 확장, 신민용 요청: "골 어시 평점이든 2개로 나눠지면 상반기
+    하반기 나눠서 하는게 맞는거 같은데... 역할로 나누고"] 경기수 비율만
+    쓰면 "상반기 로테이션·하반기 주전"처럼 역할 자체가 바뀐 해도 두 줄이
+    골/도움을 거의 절반씩 똑같이 나눠 가져 비현실적이었다(발롱도르 등에
+    쓰이는 시즌 총합 자체는 절대 안 건드리는 선에서, 세계기록실 "표시"만
+    역할 비중을 반영하도록 재설계 — 신민용이 A안으로 확정). formation_logic.
+    _ROLE_TIER_WEIGHTS(주전40/로테이션30/대기25/유망주15, "전력외"는 유망주와
+    같은 통계적 구간이라 동일 가중치)를 경기수에 곱해 반반기 가중치를
+    만든다 — half_role==full_role(역할이 안 바뀐 흔한 이적)이면 가중치가
+    똑같이 곱해져 서로 상쇄되므로 기존 "경기수 비율" 그대로 나온다(하위
+    호환 100% 유지), 역할이 다를 때만 그 차이만큼 비중이 쏠린다.
+    평점은 총합이 아니라 평균이라 그대로 복사해왔었는데, 이제 game_engine.
+    _estimate_ai_season과 같은 골·도움 계수(0.02/0.015)로 "그 반기 몫의
+    골/도움이 반영된" 평점을 반기별로 따로 계산한다(OVR 기반 기본 평점은
+    시즌 내내 거의 고정이라 공유하고, 골/도움 가산분만 반기별로 분리) —
     AI는 선수 개인의 실제 경기 기록이 없어 정확한 반기 값이 아니라
-    추정치의 비례 배분이다(평점은 총합이 아니라 평균이라 그대로 유지)."""
+    추정치의 비례 배분이라는 원칙은 그대로다."""
+    from formation_logic import _ROLE_TIER_WEIGHTS
+    _ROLE_WEIGHT = dict(_ROLE_TIER_WEIGHTS)
+    _ROLE_WEIGHT["전력외"] = _ROLE_WEIGHT.get("유망주", 15)  # 유망주와 같은 통계적 구간(나이만 다름)
+    _DEFAULT_ROLE_WEIGHT = _ROLE_WEIGHT.get("대기", 25)  # 역할 정보가 없을 때(과거 데이터 공백 등) 중간값 폴백
     trow = conn.execute("SELECT name FROM teams WHERE id=?", (team_id,)).fetchone()
     entry = {"year": year, "league": None, "cup": None, "cl": None, "cwc": None, "sc": None,
              "league_record": None, "cup_record": None, "cl_record": None, "cwc_record": None,
@@ -1563,23 +1630,40 @@ def _half_season_league_entry(conn, team_id, year, half_position=None, half_role
     if lg and rank:
         entry["league"] = f"{lg['name']}({lg['tier']}부) [{rank}등/{len(ranked)}팀]  (상반기)"
 
-    # [2026-08 신설, 신민용 요청: "44경기면 22경기로 나눠지겠지"] 이
-    # 팀(상반기)에서 실제로 치른 경기 수(방금 조회한 row의 wins+draws+
-    # losses)만큼 비율로 full_stat(하반기 팀 기준 풀시즌 추정치)을 쪼갠다.
+    # [2026-08 신설, 신민용 요청: "44경기면 22경기로 나눠지겠지", 2026-09
+    # 확장: 역할 가중치] 이 팀(상반기)에서 실제로 치른 경기 수(방금 조회한
+    # row의 wins+draws+losses)에 역할 가중치를 곱해 비율로 full_stat(하반기
+    # 팀 기준 풀시즌 추정치)을 쪼갠다 — half_role==full_role이면 가중치가
+    # 상쇄돼 기존 경기수 비율과 동일한 결과가 나온다.
     if full_stat and full_stat.get("matches"):
         half_matches = (row["wins"] or 0) + (row["draws"] or 0) + (row["losses"] or 0)
         full_matches = full_stat["matches"]
         if half_matches > 0 and full_matches > 0:
-            ratio = min(1.0, half_matches / full_matches)
+            _rest_matches = max(0, full_matches - half_matches)
+            _half_w = _ROLE_WEIGHT.get(half_role, _DEFAULT_ROLE_WEIGHT) * half_matches
+            _rest_w = _ROLE_WEIGHT.get(full_role, _DEFAULT_ROLE_WEIGHT) * _rest_matches
+            ratio = min(1.0, _half_w / (_half_w + _rest_w)) if (_half_w + _rest_w) > 0 else 0.0
             half_goals = round((full_stat.get("goals") or 0) * ratio)
             half_assists = round((full_stat.get("assists") or 0) * ratio)
             half_saves = round((full_stat.get("saves") or 0) * ratio)
             half_conceded = round((full_stat.get("goals_conceded") or 0) * ratio)
             half_clean_sheets = round((full_stat.get("clean_sheets") or 0) * ratio)
+            # [2026-09 신설] 평점도 반기별로 다르게 — OVR 기반 기본 평점은
+            # game_engine._estimate_ai_season의 goals*0.02+assists*0.015
+            # 가산분을 역산해 떼어낸 뒤(base), 각 반기 몫의 골/도움으로
+            # 다시 가산한다. full_stat에 rating이 없으면(과거 데이터 공백)
+            # 기존처럼 그대로 복사하는 폴백을 유지한다.
+            _full_rating = full_stat.get("rating")
+            if _full_rating is not None:
+                _base_rating = (_full_rating - (full_stat.get("goals") or 0) * 0.02
+                                 - (full_stat.get("assists") or 0) * 0.015)
+                _half_rating = round(_base_rating + half_goals * 0.02 + half_assists * 0.015, 2)
+            else:
+                _half_rating = _full_rating
             entry["_stat_matches"] = half_matches
             entry["_stat_goals"] = half_goals
             entry["_stat_assists"] = half_assists
-            entry["_stat_rating"] = full_stat.get("rating")
+            entry["_stat_rating"] = _half_rating
             # [2026-09 버그수정, 신민용 리포트: "세계 축구 기록실에서 2005년
             # 중간 이적한 AI 선수 — 상반기 팀(예: 알 힐랄 와우) 줄을 클릭
             # 해도 아무것도 안 뜨고 하반기 팀(예: 영 스타즈) 줄만 클릭된다"]
@@ -1593,13 +1677,21 @@ def _half_season_league_entry(conn, team_id, year, half_position=None, half_role
             # 클릭이 된다"로 보인 이유. 여기서도 채워야 실제로 그려진다.
             entry["_comp_stats"] = {"league": {
                 "matches": half_matches, "goals": half_goals, "assists": half_assists,
-                "rating": full_stat.get("rating"), "clean_sheets": half_clean_sheets,
+                "rating": _half_rating, "clean_sheets": half_clean_sheets,
                 "saves": half_saves, "goals_conceded": half_conceded}}
             if main_entry is not None:
                 main_entry["_stat_matches"] = max(0, full_matches - half_matches)
                 main_entry["_stat_goals"] = max(0, (full_stat.get("goals") or 0) - half_goals)
                 main_entry["_stat_assists"] = max(0, (full_stat.get("assists") or 0) - half_assists)
-                # 평점(rating)은 총합이 아니라 평균이므로 나누지 않고 그대로 둔다.
+                # [2026-09 확장] 평점도 위(상반기)와 같은 원리로 반기별
+                # 몫(여기선 하반기=전체-상반기)의 골/도움을 반영해 다시
+                # 계산한다 — 예전엔 "평균이라 안 나눈다"며 풀시즌 값을
+                # 그대로 뒀는데, 그러면 상반기만 역할 반영되고 하반기는
+                # 안 바뀐 값(=풀시즌과 동일)으로 남아 부자연스러웠다.
+                if _full_rating is not None:
+                    main_entry["_stat_rating"] = round(
+                        _base_rating + main_entry["_stat_goals"] * 0.02
+                        + main_entry["_stat_assists"] * 0.015, 2)
                 # [2026-09 버그수정] main_entry["_comp_stats"]["league"]는 이
                 # 함수 호출 전에 이미 "그 해 전체(하반기 팀 기준) 풀시즌" 값
                 # (get_ai_player_career_history 위쪽 stat_by_year 루프)으로
@@ -1614,6 +1706,8 @@ def _half_season_league_entry(conn, team_id, year, half_position=None, half_role
                     _ml["matches"] = main_entry["_stat_matches"]
                     _ml["goals"] = main_entry["_stat_goals"]
                     _ml["assists"] = main_entry["_stat_assists"]
+                    if _full_rating is not None:
+                        _ml["rating"] = main_entry["_stat_rating"]
                     if _ml.get("saves") is not None:
                         _ml["saves"] = max(0, (_ml.get("saves") or 0) - half_saves)
                     if _ml.get("goals_conceded") is not None:
@@ -1784,6 +1878,34 @@ def get_ai_player_role_checkpoints(player_id):
     rows = conn.execute(
         f"SELECT year, role FROM hist.ai_player_position_history WHERE {_yc} AND player_id=? "
         "ORDER BY year ASC", (*_yp, player_id)).fetchall()
+    conn.close()
+    return {r["year"]: r["role"] for r in rows if r["role"]}
+
+
+def get_ai_player_position_checkpoints_half(player_id):
+    """get_ai_player_position_checkpoints의 "상반기" 버전 — hist.
+    ai_player_position_history_half(ai_lifecycle._snapshot_team_lineup_half가
+    겨울 이적시장 열리기 직전에 찍는 스냅샷)에서 읽는다. 반환:
+    {year: position}. get_ai_player_career_history가 "팀은 안 바뀌었는데
+    역할만 바뀐 해" 판정 및 상반기 줄 표시에 쓴다."""
+    conn = get_conn()
+    _yc, _yp = _hist_year_clause(conn)
+    rows = conn.execute(
+        f"SELECT year, position FROM hist.ai_player_position_history_half "
+        f"WHERE {_yc} AND player_id=? ORDER BY year ASC", (*_yp, player_id)).fetchall()
+    conn.close()
+    return {r["year"]: r["position"] for r in rows if r["position"]}
+
+
+def get_ai_player_role_checkpoints_half(player_id):
+    """get_ai_player_role_checkpoints의 "상반기" 버전 — 위 get_ai_player_
+    position_checkpoints_half와 같은 표에서 role만 읽는다. 반환:
+    {year: role}."""
+    conn = get_conn()
+    _yc, _yp = _hist_year_clause(conn)
+    rows = conn.execute(
+        f"SELECT year, role FROM hist.ai_player_position_history_half "
+        f"WHERE {_yc} AND player_id=? ORDER BY year ASC", (*_yp, player_id)).fetchall()
     conn.close()
     return {r["year"]: r["role"] for r in rows if r["role"]}
 
@@ -3499,6 +3621,59 @@ def get_ballon_dor_winner(year):
     else:
         name = d.get("custom_name") or ai_player_code(pid)
     return {"player_id": pid, "name": name}
+
+
+def get_ballon_dor_winners_by_year():
+    """[2026-09 성능수정] get_ballon_dor_winner(year)의 배치판 —
+    {year: {"player_id": ..., "name": ...}}.
+
+    "역대 개인상" 탭을 열 때 _refresh_ia_year_list가 연도마다
+    get_ballon_dor_winner를 불렀는데, 그 함수는 안에서 쿼리 1회 +
+    get_ai_player_detail(5-way LEFT JOIN) 1회를 다시 태운다. 즉 탭을 열
+    때마다 "연도 수 × 2쿼리(그 중 하나는 무거운 조인)"가 나갔고, 시즌이
+    쌓일수록 이 탭이 선형으로 느려졌다 — 사용자가 "게임이 갈수록
+    느려진다"고 느끼는 전형적 지점.
+
+    결과가 같은 이유: 원본이 get_ai_player_detail에서 실제로 읽는 값은
+    AI면 custom_name 하나, 내 선수(MY_PLAYER_ID)면 name 하나뿐이다
+    (그 외 컬럼은 이 화면에서 안 쓴다). 그래서 5-way 조인 대신
+    ai_player_custom_names만 한 번에 읽으면 된다. 폴백도 원본과 동일 —
+    custom_name이 없거나 선수 자체가 어디에도 없으면(get_ai_player_detail
+    이 None → d={} → d.get("custom_name") is None) ai_player_code(pid)로
+    떨어지고, 내 선수는 이름이 없으면 "나"가 된다."""
+    from constants import ai_player_code
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT year, player_id FROM hist.season_individual_awards
+           WHERE award_type='발롱도르' AND rank=1""").fetchall()
+    if not rows:
+        conn.close()
+        return {}
+    pids = {r["player_id"] for r in rows if r["player_id"] != MY_PLAYER_ID}
+    custom: dict = {}
+    _pl = sorted(pids)
+    for _i in range(0, len(_pl), 500):      # SQLite 변수 한도 대비 청크
+        _part = _pl[_i:_i + 500]
+        _ph = ",".join("?" * len(_part))
+        for _r in conn.execute(
+                f"SELECT player_id, custom_name FROM ai_player_custom_names "
+                f"WHERE player_id IN ({_ph})", _part).fetchall():
+            custom[_r["player_id"]] = _r["custom_name"]
+    my_name = None
+    if any(r["player_id"] == MY_PLAYER_ID for r in rows):
+        _my = _my_player_search_row() or {}
+        my_name = _my.get("name") or "나"
+    conn.close()
+
+    out: dict = {}
+    for r in rows:
+        pid = r["player_id"]
+        if pid == MY_PLAYER_ID:
+            name = my_name or "나"
+        else:
+            name = custom.get(pid) or ai_player_code(pid)
+        out[r["year"]] = {"player_id": pid, "name": name}
+    return out
 
 
 # [2026-09 신설, 신민용 요청: "선수 검색에서 연도를 눌렀을 때 그 아래에

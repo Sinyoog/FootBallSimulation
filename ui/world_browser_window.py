@@ -2612,13 +2612,28 @@ class WorldBrowserWindow(QDialog):
         transfer_log.transfer_type엔 "리그내"/"국내 타부수"/"국제
         이동"처럼 이적시장 내부에서 "어떤 경로로 옮겼는지"(원래는 뉴스
         로그 등 다른 용도로 쓰던 값) 그대로 저장돼 있는데, 이 화면에서는
-        그런 내부 구분보다 축구팬이 바로 알아볼 수 있는 4가지(이적/오퍼/
-        입단/방출)로 보여주는 게 낫다는 지적 — 저장값 자체(다른 곳에서도
-        읽을 수 있으니)는 안 건드리고 표시할 때만 이렇게 단순화해서
-        보여준다. 정확한 매핑: 일반 이적시장(리그내/국내 타부수/국제
-        이동)·명문팀 스카우팅으로 새로 온 선수=이적, 은퇴 대체로 새로
-        합류=입단, 명문팀 스카우팅으로 밀려난 반대급부 선수=방출, 임대
-        복귀=복귀.
+        그런 내부 구분보다 축구팬이 바로 알아볼 수 있는 라벨로 보여주는
+        게 낫다는 지적 — 저장값 자체(다른 곳에서도 읽을 수 있으니)는
+        안 건드리고 표시할 때만 이렇게 단순화해서 보여준다.
+
+        [2026-09 수정, 신민용 리포트: "'명문팀 스카우팅(반대급부)'로
+        온 선수가 [방출]로 뜨면, 그 선수가 지금 소속팀(도착팀)에서
+        방출당한 것처럼 보인다 — 실제로는 이전 팀에서 나와 이 팀으로
+        무료로 온 거니까 방출이 아니라 자유이적이 맞다"] 이 이벤트
+        (ai_lifecycle._process_prestige_scouting 참고 — 명문팀이 상대
+        팀의 유망주를 스카우팅해가는 대가로, 명문팀 소속 선수 한 명을
+        그 상대팀으로 같이 보내는 맞교환)는 항상 이적료 0에 반드시
+        도착팀(to_team_id)이 정해져 있다 — "계약이 남았는데 이적료
+        없이 특정 팀으로 실제로 이동"이니 정의상 자유이적이지, "구단이
+        계약을 끊어서 갈 곳 없이 내보내는" 방출과는 다르다. 확인 결과
+        AI 선수의 ai_transfer_log에 기록되는 이벤트 종류는 이 7가지
+        (리그내/국내 타부수/국제 이동/명문팀 스카우팅/명문팀 스카우팅
+        (반대급부)/은퇴대체 영입/임대 복귀)뿐이고, 그중 "도착팀 없이
+        진짜로 방출되는" 이벤트는 하나도 없다 — 그래서 이 매핑엔 이제
+        "방출" 라벨이 아예 없다. 정확한 매핑: 일반 이적시장(리그내/국내
+        타부수/국제 이동)·명문팀 스카우팅으로 새로 온 선수=이적, 은퇴
+        대체로 새로 합류=입단, 명문팀 스카우팅으로 밀려난 반대급부
+        선수=자유이적, 임대 복귀=복귀.
 
         [2026-09 수정, 신민용 리포트: "팀명엔 (임대)로 뜨는데 요약 줄엔
         오퍼+이적료+계약N년으로 떠서 마치 완전 이적한 것처럼 보인다"]
@@ -2633,7 +2648,7 @@ class WorldBrowserWindow(QDialog):
             "리그내": "이적", "국내 타부수": "이적", "국제 이동": "이적",
             "명문팀 스카우팅": "이적",
             "은퇴대체 영입": "입단",
-            "명문팀 스카우팅(반대급부)": "방출",
+            "명문팀 스카우팅(반대급부)": "자유이적",
             "임대 복귀": "복귀",
             "연장": "연장",
         }
@@ -3125,17 +3140,21 @@ class WorldBrowserWindow(QDialog):
             squad_copy_btn.clicked.connect(
                 lambda: self._copy_squad_player_records(_ids, squad_copy_btn))
             header_row.addWidget(squad_copy_btn)
-            # [2026-08 신설, 신민용 요청: "요약 복사 — 이 연도 스쿼드를
-            # 뽑으면, 선수 기록에서 그 연도에 해당하는 부분만 남기고
-            # 나머지 연도는 빼줘"] 이 위젯은 이미 특정 "연도"(year 인자)
-            # 단위이므로 그 값 하나만 target_years로 넘기면 된다.
+            # [2026-09 재작업, 신민용 요청: "요약 복사가 선수마다 팀
+            # 성적을 그대로 반복해서 너무 길다 — 팀 기록은 상/하반기
+            # 딱 한 번씩만 맨 위에 쓰고 선수는 주전부터 짧은 한 줄로만
+            # 나열, 반기별로 달라진 애들만 상반기에도 따로"] 이 버튼
+            # (팀 검색 "요약 복사"만) 전용으로 _build_team_year_summary_
+            # copy_text가 완전히 새 포맷을 만든다 — target_years 방식의
+            # 기존 _copy_squad_player_records 경로는 다른 화면(주전/
+            # 스쿼드 기록 복사, 선수 검색, 국가 검색)에 계속 그대로
+            # 쓰이므로 안 건드린다.
             summary_copy_btn = QPushButton("📋 요약 복사")
             summary_copy_btn.setStyleSheet(_btn_qss)
-            _summary_years = {year}
             summary_copy_btn.clicked.connect(
-                lambda: self._copy_squad_player_records(
-                    _ids, summary_copy_btn, "📋 요약 복사", target_years=_summary_years,
-                    include_stats=False))
+                lambda: self._copy_text_with_feedback(
+                    self._build_team_year_summary_copy_text(tid, year),
+                    summary_copy_btn, "📋 요약 복사"))
             header_row.addWidget(summary_copy_btn)
         lay.addLayout(header_row)
 
@@ -3461,169 +3480,140 @@ class WorldBrowserWindow(QDialog):
             lines.append("(연도별 기록 없음)")
         else:
             for row in rows:
-                age_txt = f"{row['age']}세" if row.get("age") is not None else "나이 미상"
-                if row["is_retired_row"]:
-                    lines.append(f"{row['year']}년 ({age_txt}) | 소속팀 없음 (은퇴)")
-                    # [2026-09 버그수정, 신민용 리포트: "받은 상들이 안떠"]
-                    # 은퇴 처리된 해에도 그 해 받은 상이 있을 수 있으므로
-                    # (예: 은퇴 시즌에 마지막 개인상) 아래 일반 분기와
-                    # 동일하게 찍어준다.
-                    if row.get("awards"):
-                        lines.append(f"  🏆 " + " · ".join(row["awards"]))
-                    continue
-                entry = row["entry"] or {}
-                parts = [f"{row['year']}년 ({age_txt})", f"소속팀: {row['team_name']}"]
-                parts.append(f"포지션: {row['position']}" if row.get("position") else "포지션: -")
-                # [2026-09 버그수정, 신민용 리포트: "세계 축구 기록실 선수/
-                # 팀 검색에서 복사할 때도 OVR가 뜨면 안 된다(어려움
-                # 난이도)"] 바로 위 기본 정보 한 줄(ovr_text, 3317번째 줄)은
-                # is_hard_mode()로 이미 가리고 있었는데, 연도별 기록 줄의
-                # OVR만 그 체크가 빠져 있어서 어려움 난이도에서도 복사
-                # 텍스트에 실제 수치가 그대로 새어나갔다. 화면(펼침 상태)
-                # 도 같은 값을 쓰므로 여기서 한 번만 고치면 화면·복사
-                # 양쪽 다 맞는다.
-                parts.append(("OVR: -" if is_hard_mode()
-                              else (f"OVR: {row['ovr']}" if row.get("ovr") else "OVR: -")))
-                # [2026-08 신설, 신민용 요청: "복사할 때 년도별로 얘가
-                # 주전인지 아닌지 뜨는거지"] role은 이 기능 신설 이전
-                # 시즌엔 없을 수 있어(row.get("role") None) "역할: -"로.
-                parts.append(f"역할: {row['role']}" if row.get("role") else "역할: -")
-                if entry.get("league"):
-                    rec = f" ({entry['league_record']})" if entry.get("league_record") else ""
-                    parts.append(f"리그: {entry['league']}{rec}")
-                if entry.get("cup"):
-                    rec = f" ({entry['cup_record']})" if entry.get("cup_record") else ""
-                    parts.append(f"국내컵: {entry['cup']}{rec}")
-                if entry.get("cl"):
-                    rec = f" ({entry['cl_record']})" if entry.get("cl_record") else ""
-                    # [2026-09 신설, 신민용 확정: "표시는 클럽 대항전 칸에
-                    # 하되, 복사할 때는 클럽 대항전이 아니라 3부/4부
-                    # 국내컵이라고 나오게 해야 한다"] 화면(테이블)은
-                    # cl_kind와 무관하게 항상 "클럽 대항전" 칸에 그리지만,
-                    # 복사 텍스트는 이 대회를 실제 CL/EL/ECL과 헷갈리지
-                    # 않도록 이 값이 lower_cup일 때만 라벨을 바꾼다.
-                    _cl_label = "3부/4부 국내컵" if entry.get("cl_kind") == "lower_cup" else "클럽대항전"
-                    parts.append(f"{_cl_label}: {entry['cl']}{rec}")
-                if entry.get("sc"):
-                    rec = f" ({entry['sc_record']})" if entry.get("sc_record") else ""
-                    parts.append(f"슈퍼컵: {entry['sc']}{rec}")
-                if entry.get("cwc"):
-                    rec = f" ({entry['cwc_record']})" if entry.get("cwc_record") else ""
-                    parts.append(f"클럽월드컵: {entry['cwc']}{rec}")
-                lines.append(" | ".join(parts))
-                # [2026-09 버그수정, 신민용 리포트: "세계 축구 기록실에서
-                # 선수 기록복사할 때 받은 상들이 안떠 / 국가·팀 검색의
-                # 주전·스쿼드 기록 복사에도 상은 안떠"] 화면(연도 펼침
-                # 상태)의 "🏆 ..." 요약 행과 같은 데이터(row["awards"] —
-                # 위 루프 시작부에서 채워둠)를 요약 복사/기록 복사 둘 다
-                # (include_stats 여부와 무관하게, 화면이 펼쳐졌든 안
-                # 펼쳐졌든) 항상 포함한다 — 이 함수 하나가 "선수 검색"
-                # 복사 버튼과, 그걸 그대로 재사용하는 국가/팀 검색의
-                # "주전 기록 복사"/"스쿼드 기록 복사"까지 전부 공유하므로
-                # 여기 한 곳만 고치면 네 화면 모두 한꺼번에 고쳐진다.
-                if row.get("awards"):
-                    lines.append(f"  🏆 " + " · ".join(row["awards"]))
-                # [2026-08 신설, 신민용 요청: "기록 복사할 때 이것도 같이
-                # 기록복사되는 버튼을 추가해줘"] include_stats=True("기록
-                # 복사" 버튼)일 때만, 그 연도 줄 바로 밑에 대회별 요약을
-                # 덧붙인다.
-                # [2026-09 재작업, 신민용 요청: "경기수는 없애줘 ... 리그/
-                # 국내컵/클럽대항전/슈퍼컵/클럽월드컵 다 평점·골·어시를
-                # 다르게 둬야 한다"] 화면의 대회별 상자 행(entry의
-                # _comp_stats — 위 lines.append 직전의 리그/국내컵/
-                # 클럽대항전/슈퍼컵/클럽월드컵 문구와 같은 entry에서 옴)과
-                # 완전히 같은 값을, 그 대회를 실제로 뛴 것만 한 줄씩
-                # 덧붙인다(경기수 표시 안 함).
-                if include_stats:
-                    _comp_stats = entry.get("_comp_stats")
-                    if _comp_stats:
-                        # [2026-09 재수정, 신민용 요청: "클린시트 말고
-                        # 선방:14 실점:1 선방률:93.5% 이런식으로 떠야한다"]
-                        # GK는 클린시트 대신 선방/실점/선방률(위 _comp_
-                        # stat_cell과 완전히 같은 계산·표기)로 표시한다.
-                        _is_gk_club = (d.get("position") == "GK")
-                        # [2026-09 신설, 신민용 확정: "복사할 때는 3부/4부
-                        # 국내컵이라고 따로 나오게"] "cl"과는 별개 키라서
-                        # _comp_stats.get("lower_cup")이 있을 때만 이 줄이
-                        # 추가되고, 실제 CL/EL/ECL 기록("cl")과 절대 섞이지
-                        # 않는다 — entry["cl_kind"]=="lower_cup"인 해엔
-                        # comp_match_counts(ai_lifecycle._snapshot_season_
-                        # ratings)가 애초에 "cl"이 아니라 "lower_cup" 키로만
-                        # 채워두므로 방어적 분기도 필요 없다.
-                        _COMP_LABEL = {"league": "리그", "cup": "국내컵", "cl": "클럽대항전",
-                                       "sc": "슈퍼컵", "cwc": "클럽월드컵",
-                                       "lower_cup": "3부/4부 국내컵"}
-                        for _comp, _label in _COMP_LABEL.items():
-                            _cs = _comp_stats.get(_comp)
-                            if _cs:
-                                if _is_gk_club:
-                                    _sv = _cs.get("saves", 0) or 0
-                                    _gc = _cs.get("goals_conceded", 0) or 0
-                                    _shots = _sv + _gc
-                                    _pct = f"{(_sv / _shots * 100):.1f}%" if _shots else "-"
-                                    lines.append(
-                                        f"  🧤 {_label}: 평균평점 {_cs['rating']:.2f}  "
-                                        f"선방{_sv} 실점{_gc} 선방률{_pct}")
-                                else:
-                                    lines.append(
-                                        f"  ⚽ {_label}: 평균평점 {_cs['rating']:.2f}  "
-                                        f"{_cs.get('goals', 0)}골 {_cs.get('assists', 0)}A")
-                    # [2026-09 신설, 신민용 요청: "기록 복사에는 저것도
-                    # 다 뜨는거지만"] 화면(펼침 상태)과 무관하게 복사는
-                    # 항상 연봉/이적종류/계약연도/이적료까지 포함한다.
-                    _sal = entry.get("salary")
-                    if _sal:
-                        _type_label = self._simple_transfer_label(
-                            entry.get("salary_transfer_type"), entry.get("salary_is_loan"))
-                        _sal_line = f"  💰 연봉 {fmt_money(_sal)}"
-                        _cyrs = entry.get("salary_contract_years")
-                        if _cyrs:
-                            _sal_line += f" (계약: {_cyrs}년)"
-                        elif entry.get("salary_debut_year"):
-                            _sal_line += f" (계약년도: {entry['salary_debut_year']}년)"
-                        _sal_line += f" [{_type_label}]"
-                        _fee = entry.get("salary_fee") or 0
-                        if _fee:
-                            _fee_label = "임대료" if entry.get("salary_is_loan") else "이적료"
-                            _sal_line += f"  🤝 {_fee_label} {fmt_money(_fee)}"
-                        lines.append(_sal_line)
+                lines.extend(self._format_year_row_lines(row, d, include_stats=include_stats))
         lines.append("")
 
         # ── 국가대표 기록 ──
-        lines.append("[국가대표 기록]")
-        if not intl_records:
-            lines.append("(국가대표 출전 기록 없음)")
-        else:
-            _is_gk = (d.get("position") == "GK")
-            for rec in intl_records:
-                apps = rec.get("appearances", 0)
-                total = rec.get("total_games", 0)
-                apps_text = f"{apps}/{total}" if total else str(apps)
-                lines.append(
-                    f"{rec.get('year')}년 | {rec.get('name') or '?'} ({rec.get('country') or '?'}) | "
-                    f"출전 {apps_text} | 결과: {rec.get('result') or '?'}")
-                # [2026-09 신설, 신민용 요청: "국가대표에도 평점이랑 골
-                # 어시 이런걸 넣고 싶어"] 클럽 쪽 대회별 평점/골/어시
-                # 줄(위 include_stats 블록)과 같은 원칙 — "기록 복사"류
-                # (include_stats=True)에만 붙이고 "요약 복사"는 가볍게
-                # 유지한다. rating이 0이면(그 대회 스냅샷 미실행 —
-                # intl_squad 신설 이전 대회 등) 줄 자체를 생략한다.
-                if include_stats and rec.get("rating"):
-                    if _is_gk:
-                        _sv = rec.get("saves", 0) or 0
-                        _gc = rec.get("goals_conceded", 0) or 0
-                        _shots = _sv + _gc
-                        _pct = f"{(_sv / _shots * 100):.1f}%" if _shots else "-"
-                        lines.append(
-                            f"  🧤 평균평점 {rec['rating']:.2f}  선방{_sv} 실점{_gc} 선방률{_pct}")
-                    else:
-                        lines.append(
-                            f"  ⚽ 평균평점 {rec['rating']:.2f}  {rec.get('goals', 0)}골 {rec.get('assists', 0)}A")
+        lines.extend(self._format_intl_records_lines(intl_records, d, include_stats=include_stats))
 
         return "\n".join(lines)
 
-    # ─────────────────────────────────────────
-    # 탭: 선수 검색 (2026-08 신설) — "파워랭킹" 탭 옆에 위치. 팀 검색 탭
+    def _format_intl_records_lines(self, intl_records, d, include_stats=False,
+                                    omit_if_empty=False):
+        """[2026-09 리팩터] _format_player_history_text의 "[국가대표 기록]"
+        블록을 그대로 빼서 함수로 만든 것(동작 100% 동일) —
+        _build_team_year_summary_copy_text가 상반기/하반기 두 줄로
+        갈라진 선수의 하반기 쪽에서만 국가대표 기록을 보여줄 때(상반기
+        쪽은 omit_if_empty와 별개로 아예 호출 안 함) 재사용한다.
+
+        omit_if_empty=True면 기록이 없을 때 "[국가대표 기록]" 제목 줄과
+        "(국가대표 출전 기록 없음)" 자리표시자를 통째로 생략한다(기존
+        호출은 항상 False라 동작이 전혀 안 바뀐다)."""
+        if not intl_records and omit_if_empty:
+            return []
+        lines = ["[국가대표 기록]"]
+        if not intl_records:
+            lines.append("(국가대표 출전 기록 없음)")
+            return lines
+        _is_gk = (d.get("position") == "GK")
+        for rec in intl_records:
+            apps = rec.get("appearances", 0)
+            total = rec.get("total_games", 0)
+            apps_text = f"{apps}/{total}" if total else str(apps)
+            lines.append(
+                f"{rec.get('year')}년 | {rec.get('name') or '?'} ({rec.get('country') or '?'}) | "
+                f"출전 {apps_text} | 결과: {rec.get('result') or '?'}")
+            if include_stats and rec.get("rating"):
+                if _is_gk:
+                    _sv = rec.get("saves", 0) or 0
+                    _gc = rec.get("goals_conceded", 0) or 0
+                    _shots = _sv + _gc
+                    _pct = f"{(_sv / _shots * 100):.1f}%" if _shots else "-"
+                    lines.append(
+                        f"  🧤 평균평점 {rec['rating']:.2f}  선방{_sv} 실점{_gc} 선방률{_pct}")
+                else:
+                    lines.append(
+                        f"  ⚽ 평균평점 {rec['rating']:.2f}  {rec.get('goals', 0)}골 {rec.get('assists', 0)}A")
+        return lines
+
+    def _format_year_row_lines(self, row, d, include_stats=False,
+                                skip_team_competition_line=False):
+        """[2026-09 리팩터] _format_player_history_text의 [연도별 기록]
+        루프 본문(연도 한 줄 + 🏆/⚽·🧤/💰 부가 줄)을 그대로 빼서 함수로
+        만든 것 — row 하나를 렌더링하는 이 로직 자체는 전혀 안 바꿨다
+        (동작 100% 동일, 호출부만 바뀜). _build_team_year_summary_copy_text
+        (팀 검색 "요약 복사" 전용 새 포맷, 신민용 요청: "팀 성적을 선수마다
+        반복하지 말고 맨 위에 한 번만")가 같은 선수의 특정 연도 row
+        하나만 따로(상반기 줄 따로, 하반기 줄 따로) 그릴 때 재사용한다.
+
+        skip_team_competition_line=True면 "| 리그: ... | 국내컵: ..." 부분을
+        통째로 생략한다 — 팀 단위 요약에서 이미 맨 위에 한 번 보여줬을
+        때만 쓴다(기존 _format_player_history_text 호출은 항상 False라
+        동작이 전혀 안 바뀐다)."""
+        out = []
+        age_txt = f"{row['age']}세" if row.get("age") is not None else "나이 미상"
+        if row["is_retired_row"]:
+            out.append(f"{row['year']}년 ({age_txt}) | 소속팀 없음 (은퇴)")
+            if row.get("awards"):
+                out.append(f"  🏆 " + " · ".join(row["awards"]))
+            return out
+        entry = row["entry"] or {}
+        parts = [f"{row['year']}년 ({age_txt})", f"소속팀: {row['team_name']}"]
+        parts.append(f"포지션: {row['position']}" if row.get("position") else "포지션: -")
+        parts.append(("OVR: -" if is_hard_mode()
+                      else (f"OVR: {row['ovr']}" if row.get("ovr") else "OVR: -")))
+        parts.append(f"역할: {row['role']}" if row.get("role") else "역할: -")
+        if not skip_team_competition_line:
+            if entry.get("league"):
+                rec = f" ({entry['league_record']})" if entry.get("league_record") else ""
+                parts.append(f"리그: {entry['league']}{rec}")
+            if entry.get("cup"):
+                rec = f" ({entry['cup_record']})" if entry.get("cup_record") else ""
+                parts.append(f"국내컵: {entry['cup']}{rec}")
+            if entry.get("cl"):
+                rec = f" ({entry['cl_record']})" if entry.get("cl_record") else ""
+                _cl_label = "3부/4부 국내컵" if entry.get("cl_kind") == "lower_cup" else "클럽대항전"
+                parts.append(f"{_cl_label}: {entry['cl']}{rec}")
+            if entry.get("sc"):
+                rec = f" ({entry['sc_record']})" if entry.get("sc_record") else ""
+                parts.append(f"슈퍼컵: {entry['sc']}{rec}")
+            if entry.get("cwc"):
+                rec = f" ({entry['cwc_record']})" if entry.get("cwc_record") else ""
+                parts.append(f"클럽월드컵: {entry['cwc']}{rec}")
+        out.append(" | ".join(parts))
+        if row.get("awards"):
+            out.append(f"  🏆 " + " · ".join(row["awards"]))
+        if include_stats:
+            _comp_stats = entry.get("_comp_stats")
+            if _comp_stats:
+                _is_gk_club = (d.get("position") == "GK")
+                _COMP_LABEL = {"league": "리그", "cup": "국내컵", "cl": "클럽대항전",
+                               "sc": "슈퍼컵", "cwc": "클럽월드컵",
+                               "lower_cup": "3부/4부 국내컵"}
+                for _comp, _label in _COMP_LABEL.items():
+                    _cs = _comp_stats.get(_comp)
+                    if _cs:
+                        if _is_gk_club:
+                            _sv = _cs.get("saves", 0) or 0
+                            _gc = _cs.get("goals_conceded", 0) or 0
+                            _shots = _sv + _gc
+                            _pct = f"{(_sv / _shots * 100):.1f}%" if _shots else "-"
+                            out.append(
+                                f"  🧤 {_label}: 평균평점 {_cs['rating']:.2f}  "
+                                f"선방{_sv} 실점{_gc} 선방률{_pct}")
+                        else:
+                            out.append(
+                                f"  ⚽ {_label}: 평균평점 {_cs['rating']:.2f}  "
+                                f"{_cs.get('goals', 0)}골 {_cs.get('assists', 0)}A")
+            _sal = entry.get("salary")
+            if _sal and entry.get("salary_is_first_year", True):
+                _type_label = self._simple_transfer_label(
+                    entry.get("salary_transfer_type"), entry.get("salary_is_loan"))
+                _sal_line = f"  💰 연봉 {fmt_money(_sal)}"
+                _cyrs = entry.get("salary_contract_years")
+                if _cyrs:
+                    _sal_line += f" (계약: {_cyrs}년)"
+                elif entry.get("salary_debut_year"):
+                    _sal_line += f" (계약년도: {entry['salary_debut_year']}년)"
+                _sal_line += f" [{_type_label}]"
+                _fee = entry.get("salary_fee") or 0
+                if _fee:
+                    _fee_label = "임대료" if entry.get("salary_is_loan") else "이적료"
+                    _sal_line += f"  🤝 {_fee_label} {fmt_money(_fee)}"
+                out.append(_sal_line)
+        return out
+
+
     # (_build_team_tab)과 완전히 같은 UX(대륙/국가/등급/부수 필터 + 검색창
     # + 좌측 목록/우측 상세). 현재는 우측에 "지금 소속팀 + 그 팀의 최신
     # 파워랭킹(전체/대륙)"만 보여준다 — 골/도움/경기수 같은 시즌별 커리어
@@ -5513,13 +5503,37 @@ class WorldBrowserWindow(QDialog):
                     return seg["team_name"]
             return tname
 
-        def _is_loan_for_year(year):
+        def _is_loan_for_year(year, is_half=False):
             # [2026-09 신설, 신민용 요청: "세계 축구 기록실에 이제는 임대
             # 이적도 표시하는거지"] _team_name_for_year와 완전히 같은
             # 구간 탐색이지만 반환값만 다르다 — 팀명 문자열 자체엔 손을
             # 안 대야 아래 is_current 비교(player_team_name == tname)나
             # 다른 팀명 매칭 로직이 안 깨진다.
+            #
+            # [2026-09 버그수정, 신민용 리포트: "시즌 중간에 전남→수원으로
+            # 임대 갔는데, 수원(임대)은 맞지만 전남에도 (임대)가 붙는다 —
+            # 다음 시즌 시작 시점에 임대 간 건 이 버그가 안 난다"] 원인은
+            # timeline 세그먼트 경계 자체에 있다 — 시즌 중 이적(is_mid_
+            # season=1)은 새 세그먼트의 start_year가 "그 해"(effective
+            # year=year 그대로)라, 원래 팀(전남) 세그먼트는 그 해가 되기
+            # 전(end_year==그 해)에 이미 끝나 있다. 그런데 같은 연도를
+            # "상반기(원래팀)"/"하반기(새팀)" 두 줄로 쪼개 보여주는 반기
+            # 표시 기능은 위쪽 timeline 자체는 그대로 두고 화면에서만
+            # 그 해를 두 줄로 나눠 보여주므로, 상반기 줄도 그냥 이
+            # year로만 조회하면 "그 해를 포함하는" 세그먼트(=이미 새 팀인
+            # 하반기 세그먼트)가 걸려 원래 팀 줄에도 새 팀의 임대 여부가
+            # 그대로 씌워진다. 상반기(원래팀) 줄은 "그 해를 포함하는"
+            # 세그먼트가 아니라 "그 해에 끝나는"(end_year==year) 세그먼트
+            # — 즉 시즌 중 이적으로 넘어가기 직전까지의 원래 재직 구간 —
+            # 를 찾아야 한다. 다음 시즌 시작 시점(오프시즌) 이적은애초에
+            # 상반기 줄 자체가 안 생기므로(같은 해를 공유하는 두 세그먼트가
+            # 없음) 이 구분이 필요 없어 버그가 안 났던 것과 정확히 맞는다.
             if retirement_year and year > retirement_year:
+                return False
+            if is_half:
+                for seg in timeline:
+                    if seg["end_year"] == year:
+                        return bool(seg.get("is_loan"))
                 return False
             for seg in timeline:
                 if (seg["start_year"] is None or year >= seg["start_year"]) and \
@@ -5569,7 +5583,17 @@ class WorldBrowserWindow(QDialog):
         # 사전계산에도 똑같이 반영해야 한다(안 그러면 표 행이 부족해짐).
         _awards_by_year = wb.get_player_awards_by_year(player_id)
         _expanded_years = self._player_team_expanded_years(player_id)
-        _extra_stat_rows = sum(1 for e in years if (e.get("_comp_stats") or e.get("salary"))
+        # [2026-09 버그수정, 신민용 리포트: "이적/입단 정보를 매년 반복
+        # 표시하지 말고 팀이 바뀐 첫 해에만 보여줘"] salary_is_first_year가
+        # False인 해(같은 계약이 이어지는 나머지 해)는 salary 요약 행의
+        # "존재 여부" 판정에서도 제외해야 한다 — 안 그러면 행수 사전계산과
+        # 실제 렌더링(아래 _year_expanded 루프)이 서로 다른 조건을 쓰게
+        # 돼 표 행이 남거나 모자란다. _comp_stats(평점/골/도움)는 이
+        # 판단과 무관하게 그대로 유지 — 그건 매년 실제로 다른 값이라
+        # 반복이 아니다.
+        _extra_stat_rows = sum(1 for e in years
+                                if (e.get("_comp_stats")
+                                    or (e.get("salary") and e.get("salary_is_first_year", True)))
                                 and e["year"] in _expanded_years)
         # [2026-09 버그수정] 아래 실제 렌더링 루프가 상반기 줄(_is_half)엔
         # 상 목록을 아예 안 붙이도록 바뀌었으므로, 행수 사전계산도 같은
@@ -5659,7 +5683,7 @@ class WorldBrowserWindow(QDialog):
                 # 따로 만든다 — 안 그러면 "(임대)" 접미사 때문에 같은
                 # 팀인데도 is_current가 안 맞아버린다.
                 _display_name = player_team_name
-                if _is_loan_for_year(entry["year"]):
+                if _is_loan_for_year(entry["year"], is_half=bool(entry.get("_is_half"))):
                     _display_name = f"{player_team_name} (임대)"
                 team_cell = self._col_label(
                     _display_name, self._LEAGUE_COL_W,
@@ -5802,7 +5826,10 @@ class WorldBrowserWindow(QDialog):
             # 일치해야 한다(안 그러면 표 행이 남거나 모자란다).
             _comp_stats = entry.get("_comp_stats")
             _year_expanded = entry["year"] in _expanded
-            _sal = entry.get("salary")
+            # [2026-09 버그수정, 신민용 리포트: "이적/입단 정보를 매년
+            # 반복 표시하지 말고 팀이 바뀐 첫 해에만"] 위 _extra_stat_rows
+            # 사전계산과 정확히 같은 조건이어야 한다(주석 참고).
+            _sal = entry.get("salary") if entry.get("salary_is_first_year", True) else None
             if (_comp_stats or _sal) and _year_expanded:
                 # [2026-09 신설] "클럽 대항전" 칸(7번)은 cl_kind로 이미
                 # champions/europa/conference/lower_cup 중 하나의 색으로
@@ -7022,7 +7049,17 @@ class WorldBrowserWindow(QDialog):
         final_text = "\n".join(texts)
         if prefix_text:
             final_text = prefix_text + "\n\n" + final_text
-        QGuiApplication.clipboard().setText(final_text)
+        self._copy_text_with_feedback(final_text, btn, reset_label)
+
+    def _copy_text_with_feedback(self, text, btn, reset_label):
+        """[2026-09 리팩터] _copy_squad_player_records 맨 끝(클립보드에
+        넣고 버튼 라벨을 1.2초간 "✅ 복사됨"으로 바꿨다 되돌리는 부분)을
+        빼서 함수로 만든 것 — _build_team_year_summary_copy_text(팀
+        검색 "요약 복사" 전용 새 포맷)도 똑같은 클립보드/라벨 동작이
+        필요해서 새로 안 베끼고 재사용한다. 동작은 원래와 완전히 동일."""
+        if not text:
+            return
+        QGuiApplication.clipboard().setText(text)
         btn.setText("✅ 복사됨")
         # [2026-09 버그수정, 신민용 리포트: "요약 복사 누르니 RuntimeError:
         # wrapped C/C++ object of type QPushButton has been deleted"]
@@ -7043,6 +7080,301 @@ class WorldBrowserWindow(QDialog):
             except RuntimeError:
                 pass
         QTimer.singleShot(1200, _reset_copy_btn_label)
+
+    def _build_team_year_summary_copy_text(self, tid, year):
+        """[2026-09 신설, 신민용 요청: "팀 검색 요약 복사가 선수마다 팀
+        성적(리그/국내컵/...)을 그대로 반복해서 너무 길다 — 팀 기록은
+        상반기/하반기 딱 한 번씩만 맨 위에 쓰고, 그 아래에 선수는 주전
+        부터 순서대로 짧은 한 줄(+수상/평점/연봉)만 나열해달라"]
+
+        [2026-09 재작업, 신민용 확정 — 후속 대화] 팀 기록 줄 포맷을
+        "{W}승{D}무{L}패 [{순위}등/{전체}팀]"로(리그 이름은 생략 — 이미
+        이 팀 페이지 맥락에서 뻔하므로, 국내컵/CL/슈퍼컵/클럽월드컵처럼
+        "어느 대회인지"가 중요한 건 이름을 그대로 유지) 단순화하고,
+        하반기 쪽 팀 기록엔 승격/강등이 있으면 그것도 붙인다.
+
+        [2026-09 재작업 2차, 신민용 재수정 — 실제 예시 첨부 후 확정]
+        직전 시도는 "나간/들어온/역할변화 선수를 전부 하반기 밑에" 몰아
+        넣고, 역할변화 선수는 한 블록 안에 두 줄을 쌓는 방식이었는데
+        틀렸다 — 실제 원하는 형태(신민용이 붙여준 예시)는:
+          · **상반기 섹션**: 그 반기 로스터 "전원"을(주전부터) 각자
+            독립된 완전한 블록(🏆/⚽/💰 다 포함)으로 보여준다 — 안 바뀐
+            선수도, 반기 중 역할이 바뀐 선수도(상반기 상태로), 시즌
+            중 팀을 떠난 선수도(우리 팀 소속이던 시절 기록으로, 태그
+            없이) 전부 여기 포함("이적은 시즌 시작할 때도 보는게
+            맞다" — 나간 선수라도 상반기 로스터엔 정상적으로 있었으므로).
+          · **하반기 섹션**: 팀 기록 다음에 "이번 시즌 있었던 일"만
+            나간(`[팀 이적]`)→들어온(`[팀 합류]`, "합류는 하반기에
+            합류한거")→역할변화(태그 없음, 하반기 상태) 순으로 각자
+            독립된 블록으로 다시 보여준다. 변화 없는 선수는 이미
+            상반기에서 완전히 보여줬으므로 여기서 반복 안 한다.
+          · 국가대표 기록은 두 번 나오는 선수(나간/역할변화)는 하반기
+            쪽 등장에서만(상반기 쪽은 omit_if_empty로 생략) — 한 번만
+            나오는 선수(변화없음/들어온)는 자기 유일한 등장에서.
+          · `[팀 합류]`(하반기 도중 합류, 겨울 이적시장 등으로 이적료
+            있을 수 있음)와 `[팀 이적]`(시즌 시작부터 있다가 하반기
+            들어가며 떠남)은 "언제 이 팀 소속이었나"가 기준이지 이적료
+            유무가 기준이 아니다.
+
+        팀 검색에서 연도를 눌렀을 때 쓰는 "요약 복사" 버튼 전용 새 포맷 —
+        다른 복사 버튼(주전/스쿼드 기록 복사, 선수 검색 자체 복사, 국가
+        검색 복사)은 이 함수와 무관하게 기존 그대로("_format_player_history_
+        text"/"_copy_squad_player_records") 동작한다.
+
+        [설계] hist.team_season_lineup(_half)의 그 해 실제 스냅샷(이 팀
+        로스터 자체의 ai_lifecycle 스냅샷 — "그 반기에 실제로 이 팀
+        소속이었나"의 ground truth)을 상/하반기 각각 조회해 두 로스터의
+        id 집합을 비교해 4분류(나간/들어온/역할변화/변화없음)한다.
+        "역할변화"·"나간"은 55차에서 만든 "같은 팀(혹은 이전 팀), 반기
+        분리" 데이터(get_ai_player_career_history의 half_row)를 그대로
+        가져다 쓴다. 각 선수 줄은 _format_year_row_lines(skip_team_
+        competition_line=True)로 그려 팀 성적 반복을 없앤다."""
+        import re
+        import world_browser as wb
+        conn = wb.get_conn()
+
+        trow = conn.execute("SELECT name FROM teams WHERE id=?", (tid,)).fetchone()
+        team_name = trow["name"] if trow else "?"
+
+        h1_lineup = wb.get_team_season_lineup(tid, year, half=True)
+        h2_lineup = wb.get_team_season_lineup(tid, year, half=False)
+
+        def _order(lineup):
+            return [p.get("id") for p in (lineup.get("starters") or []) + (lineup.get("bench") or [])
+                    if p.get("id") is not None and p.get("id") != wb.MY_PLAYER_ID]
+
+        h1_order, h2_order = _order(h1_lineup), _order(h2_lineup)
+        h1_set, h2_set = set(h1_order), set(h2_order)
+        all_ids = list(dict.fromkeys(h1_order + h2_order))
+        if not all_ids:
+            conn.close()
+            return ""
+
+        # ── 팀 단위 대회 요약(상/하반기 각 1번, 포메이션 포함) ──
+        team_hist_all = wb.get_team_history(tid)
+        h2_team_entry = next((e for e in team_hist_all.get("years", []) if e["year"] == year), None)
+        h1_team_entry = wb._half_season_league_entry(conn, tid, year)
+        conn.close()
+
+        _rank_re = re.compile(r"\[(\d+등/\d+팀)\]")
+        _wdl_re = re.compile(r"(\d+)승\s*(\d+)무\s*(\d+)패")
+
+        def _wdl_ints(record_str):
+            m = _wdl_re.search(record_str or "")
+            if not m:
+                return None
+            return tuple(int(x) for x in m.groups())
+
+        # [2026-09 버그수정, 신민용 리포트: "선수 검색 복사하기에서 상반기/
+        # 하반기 팀 기록을 보면 하반기가 상반기+하반기(그 해 최종 누적
+        # 기록)라 헷갈린다 — 총 경기가 44경기면 상반기 22 하반기 22로
+        # 나눠서 보여줘야지"] h1_team_entry(league_season_standings_half
+        # 기반, 진짜 상반기만 치른 실제 승/무/패)와 달리 h2_team_entry
+        # (wb.get_team_history → 그 해 최종 누적 승/무/패)는 원래 풀시즌
+        # 누적값이었다. 선수 개인 기록(_half_season_league_entry의 full_
+        # stat/main_entry 비례배분)은 이미 하반기만큼만 따로 계산해 보여
+        # 주고 있었는데, 팀 기록 줄만 이 처리가 빠져 있었다. 승/무/패는
+        # 추정치가 아니라 두 곳 다 실제 경기수 그대로이므로(리그 경기가
+        # 반기 도중 다른 리그로 안 옮겨가는 한) 풀시즌 누적에서 상반기
+        # 실제값을 그대로 빼면 하반기만의 정확한 실제 기록이 나온다.
+        _h2_only_record = None
+        if h2_team_entry and h1_team_entry:
+            _full_wdl = _wdl_ints(h2_team_entry.get("league_record"))
+            _half_wdl = _wdl_ints(h1_team_entry.get("league_record"))
+            if _full_wdl and _half_wdl:
+                _w, _d, _l = (max(0, f - h) for f, h in zip(_full_wdl, _half_wdl))
+                _h2_only_record = f"{_w}승 {_d}무 {_l}패"
+
+        def _record_and_rank(entry, half_only_record=None):
+            if not entry or not entry.get("league_record"):
+                return None
+            m = _rank_re.search(entry.get("league") or "")
+            rank_txt = f" [{m.group(1)}]" if m else ""
+            record_txt = half_only_record if half_only_record is not None else entry["league_record"]
+            return f"{record_txt}{rank_txt}"
+
+        def _promo_relegate_tag(entry):
+            txt = (entry or {}).get("league") or ""
+            if "승격" in txt:
+                return "승격"
+            if "강등" in txt:
+                return "강등"
+            return None
+
+        def _team_block(title, formation, entry, show_promo=False, half_only_record=None):
+            out = [f"[{title}]"]
+            if formation:
+                out.append(f"포메이션: {formation}")
+            # [2026-09 신설, 신민용 요청: "하반기 팀 기록에 하반기만의
+            # 실제 기록 아래에 '리그 최종 기록:'으로 상반기+하반기 합친
+            # 시즌 누적 기록도 같이 보여달라"] half_only_record가 있을
+            # 때만(=하반기 블록일 때만) 두 줄로 나눠 보여준다 — 승격/강등
+            # 태그는 그 해 최종 결과로 결정되는 정보라 하반기 실경기
+            # 기록이 아니라 이 누적 기록 줄에 붙인다.
+            if half_only_record is not None:
+                half_rr = _record_and_rank(entry, half_only_record=half_only_record)
+                if half_rr:
+                    out.append(half_rr)
+                full_rr = _record_and_rank(entry)
+                if full_rr:
+                    if show_promo:
+                        _tag = _promo_relegate_tag(entry)
+                        if _tag:
+                            full_rr += f" [{_tag}]"
+                    out.append(f"리그 최종 기록: {full_rr}")
+            else:
+                rr = _record_and_rank(entry)
+                if rr:
+                    if show_promo:
+                        _tag = _promo_relegate_tag(entry)
+                        if _tag:
+                            rr += f" [{_tag}]"
+                    out.append(rr)
+            if entry:
+                if entry.get("cup"):
+                    rec = f" ({entry['cup_record']})" if entry.get("cup_record") else ""
+                    out.append(f"국내컵: {entry['cup']}{rec}")
+                if entry.get("cl"):
+                    rec = f" ({entry['cl_record']})" if entry.get("cl_record") else ""
+                    _lbl = "3부/4부 국내컵" if entry.get("cl_kind") == "lower_cup" else "클럽대항전"
+                    out.append(f"{_lbl}: {entry['cl']}{rec}")
+                if entry.get("sc"):
+                    rec = f" ({entry['sc_record']})" if entry.get("sc_record") else ""
+                    out.append(f"슈퍼컵: {entry['sc']}{rec}")
+                if entry.get("cwc"):
+                    rec = f" ({entry['cwc_record']})" if entry.get("cwc_record") else ""
+                    out.append(f"클럽월드컵: {entry['cwc']}{rec}")
+            if len(out) == 1:
+                out.append("(기록 없음)")
+            return out
+
+        h1_block = _team_block("상반기 팀 기록", h1_lineup.get("formation"), h1_team_entry)
+        h2_block = _team_block("하반기 팀 기록", h2_lineup.get("formation"), h2_team_entry,
+                                show_promo=True, half_only_record=_h2_only_record)
+
+        # ── 선수별 그 해 기록 수집(get_ai_player_career_history가 이미
+        # 만들어둔 상/하반기 분리 결과를 그대로 재사용) ──
+        harvester = WorldBrowserWindow(self)
+        per_player = {}
+        try:
+            for pid in all_ids:
+                try:
+                    harvester.open_to_player(pid)
+                except Exception:
+                    continue
+                name = getattr(harvester, "_player_copy_name", None)
+                d = getattr(harvester, "_player_copy_d", None)
+                if not name or not d:
+                    continue
+                rows = getattr(harvester, "_player_copy_rows", [])
+                intl_records = getattr(harvester, "_player_copy_intl_records", [])
+                year_rows = [r for r in rows if r.get("year") == year and not r.get("is_retired_row")]
+                main_row = next((r for r in year_rows if not (r.get("entry") or {}).get("_is_half")), None)
+                half_row = next((r for r in year_rows if (r.get("entry") or {}).get("_is_half")), None)
+                per_player[pid] = {
+                    "name": name, "d": d, "main_row": main_row, "half_row": half_row,
+                    "intl": [r for r in intl_records if r.get("year") == year]}
+        finally:
+            harvester.deleteLater()
+
+        # ── 4분류: 나간/들어온/역할변화/변화없음 ──
+        left, joined, changed, unchanged = [], [], [], []
+        for pid in h1_order:
+            info = per_player.get(pid)
+            if not info:
+                continue
+            if pid not in h2_set:
+                half_on_us = info["half_row"] and info["half_row"]["team_name"] == team_name
+                # half_row가 우리 팀 걸로 확인될 때만 — 없으면 그 선수가
+                # 우리 팀 소속이던 시절 기록을 재구성할 방법이 없어
+                # (main_row는 이미 다른 팀 기록) 잘못된 팀 정보를
+                # 보여주느니 조용히 건너뛴다.
+                if half_on_us:
+                    left.append((pid, info))
+            else:
+                half_on_us = info["half_row"] and info["half_row"]["team_name"] == team_name
+                if half_on_us and info["half_row"] != info["main_row"]:
+                    changed.append((pid, info))
+                elif info["main_row"] and info["main_row"]["team_name"] == team_name:
+                    unchanged.append((pid, info))
+
+        for pid in h2_order:
+            info = per_player.get(pid)
+            if not info or not info["main_row"] or info["main_row"]["team_name"] != team_name:
+                continue
+            if pid not in h1_set:
+                joined.append((pid, info))
+
+        def _emit_player(info, row, tag=None, show_intl=True):
+            out = ["", f"[{info['name']} 선수 기록]"]
+            nat_text = (f"{info['d'].get('nat_flag') or ''} {info['d'].get('nationality') or ''}"
+                        .strip() or "국적 미상")
+            out.append(f"국적: {nat_text} | 포지션: {info['d'].get('position') or '-'}")
+            row_lines = self._format_year_row_lines(
+                row, info["d"], include_stats=True, skip_team_competition_line=True)
+            if tag and row_lines:
+                row_lines[0] = row_lines[0] + f" {tag}"
+            out.extend(row_lines)
+            if show_intl:
+                out.extend(self._format_intl_records_lines(
+                    info["intl"], info["d"], include_stats=True, omit_if_empty=True))
+            return out
+
+        def _move_tag(info_for_type, other_team_name, arrow):
+            """[2026-09 신설, 신민용 리포트: "팀 임대는 이적이 아니라
+            임대라 떠야 하고, 어디로 갔는지/어디서 왔는지도 떠야지"]
+            그냥 "[팀 이적]"/"[팀 합류]"로 뭉뚱그리지 말고, 실제 임대인지
+            완전 이적인지(_simple_transfer_label — 다른 화면의 💰 연봉
+            줄과 완전히 같은 판정 기준, is_loan이면 무조건 "임대")와
+            상대 팀 이름을 같이 보여준다. info_for_type은 "이 이동 자체를
+            기록한 쪽"의 entry — 나간 선수는 새 팀 쪽 entry(main_row,
+            새 팀에 "어떻게 왔는지"가 곧 우리 팀에서 "어떻게 나갔는지"),
+            들어온 선수는 우리 팀 쪽 entry(main_row, 우리 팀에 "어떻게
+            왔는지")를 넘긴다. 필요한 정보(거래유형/상대팀)가 없으면
+            (예: 그 해 안에 바로 은퇴해 새 팀 기록 자체가 없는 등)
+            조용히 태그만 단순하게 접는다."""
+            entry = (info_for_type or {}).get("entry") or {}
+            label = self._simple_transfer_label(
+                entry.get("salary_transfer_type"), entry.get("salary_is_loan"))
+            if other_team_name:
+                return f"[{label} {arrow} {other_team_name}]"
+            return f"[{label}]"
+
+        # [2026-09 확정, 신민용 재수정 — 후속 대화] "이적은 시즌 시작할
+        # 때도 보는게 맞고 합류는 하반기에 합류한거 그래서 처음에
+        # [상반기 팀 기록]에서 상반기 선수들의 포메이션과 기록들을 하고
+        # [하반기 팀 기록] 글자가 뜬 후 여기에 이적한 선수와 이적온
+        # 선수들 표시하는거지" — 상반기 섹션은 그 반기 로스터 "전원"을
+        # (주전부터) 각자 완전한 블록으로 보여준다: 안 바뀐 선수는 그
+        # 하나뿐인 기록으로, 반기 사이 역할이 바뀐 선수는 상반기 상태로,
+        # 나간 선수도 우리 팀 소속이던 시절 기록으로 — 전부 여기 포함.
+        # 하반기 섹션은 팀 기록 다음에 "이번 시즌 있었던 일"만 나간→
+        # 들어온→역할변화 순으로 모아 보여준다(변화없는 선수는 이미
+        # 상반기에서 다 보여줬으므로 반복 안 함). 국가대표 기록은 두 번
+        # 나오는 선수(나간/역할변화)는 하반기 쪽 등장에서만 보여준다
+        # (omit_if_empty=True로 상반기 쪽은 생략).
+        final_lines = list(h1_block)
+        for pid, info in left:
+            final_lines.extend(_emit_player(info, info["half_row"], show_intl=False))
+        for pid, info in changed:
+            final_lines.extend(_emit_player(info, info["half_row"], show_intl=False))
+        for pid, info in unchanged:
+            final_lines.extend(_emit_player(info, info["main_row"], show_intl=True))
+
+        final_lines.append("")
+        final_lines.extend(h2_block)
+        for pid, info in left:
+            _dest = info["main_row"]["team_name"] if info["main_row"] else None
+            _tag = _move_tag(info["main_row"], _dest, "→")
+            final_lines.extend(_emit_player(info, info["half_row"], _tag, show_intl=True))
+        for pid, info in joined:
+            _origin = info["half_row"]["team_name"] if info["half_row"] else None
+            _tag = _move_tag(info["main_row"], _origin, "←")
+            final_lines.extend(_emit_player(info, info["main_row"], _tag, show_intl=True))
+        for pid, info in changed:
+            final_lines.extend(_emit_player(info, info["main_row"], show_intl=True))
+
+        return "\n".join(final_lines)
 
     # ─────────────────────────────────────────
     # 탭2: 컵대회 검색 (2026-07 신설)

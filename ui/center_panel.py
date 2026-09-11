@@ -896,12 +896,27 @@ class CenterPanel(QWidget):
             # 강제 휴식으로 바꿔줘"] 규칙 자체가 "내일이 경기면 오늘 휴식"
             # 에서 "어제가 경기였으면 오늘 휴식"으로 바뀌었으므로, 이
             # 재확인 패치도 어제(_d-1) 쪽을 본다.
+            # [2026-09 버그수정, 신민용 리포트: "리그 마지막날 경기 후
+            # 다음주 첫날에 경기 다음날 휴식이 안 뜬다"] _by_day는 이
+            # 묶음(이번 주 7일)의 locked_sched에서만 만들어지므로, _d가
+            # 이 묶음의 첫날이면 어제(_d-1)는 지난주 마지막 날이라
+            # _by_day에 아예 없다 — 그래서 항상 "어제 경기 없음"으로
+            # 잘못 판단해 주 경계에서만 강제 휴식이 안 걸렸다.
+            # _build_week_sched와 동일하게, 묶음 밖(지난주) 날짜는
+            # include_played=True로 실제 조회해 이미 끝난 경기도 찾는다.
             _by_day = {x[0]: x for x in self._locked_sched}
             for _i, (_d, _ttype, _detail) in enumerate(self._locked_sched):
                 if _d < day or _ttype == "경기":
                     continue
                 _prev_item = _by_day.get(_d - 1)
-                if _prev_item and _prev_item[1] == "경기" and _ttype != "휴식":
+                if _prev_item is not None:
+                    _prev_was_match = _prev_item[1] == "경기"
+                else:
+                    _prev_mi = self._get_match_for_day(_d - 1, p, st=st, include_played=True)
+                    if _prev_mi and _prev_mi.get("pending"):
+                        _prev_mi = None
+                    _prev_was_match = bool(_prev_mi)
+                if _prev_was_match and _ttype != "휴식":
                     self._locked_sched[_i] = (_d, "휴식", None)
 
             _match_cache = {}
@@ -1152,7 +1167,10 @@ class CenterPanel(QWidget):
                     # 가볍게 한 번 더 살아있는 조회로 재확인한다 — 실제
                     # 경기가 있으면 캐시보다 라이브가 항상 옳고, 없으면
                     # 조회 결과도 그대로 None이라 손해가 없다.
-                    prev_mi = self._get_match_for_day(d - 1, p, st=st)
+                    # [2026-09 버그수정] d-1이 이미 지난 날(주 경계 등)이면
+                    # 그 경기는 이미 끝나 있는 게 정상이므로
+                    # include_played=True로 조회해야 찾을 수 있다.
+                    prev_mi = self._get_match_for_day(d - 1, p, st=st, include_played=True)
                 # [2026-07 안전장치] "미정" placeholder(아직 대진 미확정
                 # 미래 라운드)는 실제 경기가 아니라 advance_days의 강제
                 # 휴식 로직도 이걸 모른다 — 여기서 "어제 경기 있음"으로
@@ -1934,7 +1952,12 @@ class CenterPanel(QWidget):
                     # 목적, 이틀 연속 경기 방지라는 원래 취지는 동일). 오늘
                     # 바로 전날(d-1)에 경기가 있었으면 오늘 훈련 선택을
                     # 덮어쓴다.
-                    prev_mi = self._get_match_for_day(d - 1, p, st=st)
+                    # [2026-09 버그수정, 신민용 리포트: "리그 마지막날
+                    # 경기 후 다음주 첫날에 경기 다음날 휴식이 안 뜬다"]
+                    # i=0(이 묶음의 첫날)이면 d-1은 지난주 마지막 날이라
+                    # 이미 끝난 경기다 — include_played=True로 조회해야
+                    # home_score=-1 제약에 안 걸리고 찾아진다.
+                    prev_mi = self._get_match_for_day(d - 1, p, st=st, include_played=True)
                     if prev_mi and prev_mi.get("pending"):
                         prev_mi = None
                     if prev_mi:
@@ -1965,8 +1988,10 @@ class CenterPanel(QWidget):
                         sched.append((d, "경기", mi))
                     else:
                         # [2026-09 변경] 경기 다음날 휴식 강제로 변경 — 위
-                        # _build_week_sched 주석 참고.
-                        prev_mi = self._get_match_for_day(d - 1, p, st=st)
+                        # _build_week_sched 주석 참고. [2026-09 버그수정]
+                        # 마찬가지로 include_played=True로 지난주 마지막
+                        # 날(이미 끝난 경기)도 찾는다.
+                        prev_mi = self._get_match_for_day(d - 1, p, st=st, include_played=True)
                         if prev_mi and prev_mi.get("pending"):
                             prev_mi = None
                         if prev_mi:
@@ -2292,7 +2317,9 @@ class CenterPanel(QWidget):
                 sched.append((d, "경기", mi))
             else:
                 # [2026-09 변경] 경기 다음날 휴식 강제로 변경 — _build_week_sched 주석 참고.
-                prev_mi = self._get_match_for_day(d - 1, p, st=st)
+                # [2026-09 버그수정] include_played=True로 지난주 마지막
+                # 날(이미 끝난 경기)도 찾는다 — _build_week_sched 주석 참고.
+                prev_mi = self._get_match_for_day(d - 1, p, st=st, include_played=True)
                 if prev_mi and prev_mi.get("pending"):
                     prev_mi = None
                 if prev_mi:
@@ -2673,7 +2700,7 @@ class CenterPanel(QWidget):
             color = _match_card_color(mi)
             box.setStyleSheet(f"background:{color};border-radius:3px;")
 
-    def _get_match_for_day(self, day, p, st=None):
+    def _get_match_for_day(self, day, p, st=None, include_played=False):
         """그 날짜(day)에 내 경기가 있는지 확인.
         클럽 리그 경기는 match_results.day로 정확한 날짜가 있어 그대로 대조.
         국제대회/챔스는 day 컬럼이 없어(주 단위 대회) game_engine의
@@ -2687,7 +2714,24 @@ class CenterPanel(QWidget):
         p와 마찬가지로 st(게임 상태)도 호출부가 이미 조회해둔 게 있으면
         넘겨서 get_state() 재조회를 생략한다 — 하루 셀 하나당 이 함수가
         내부에서 부르는 get_my_match/get_my_cl_match 등이 전부 각자
-        get_state()를 다시 했었다."""
+        get_state()를 다시 했었다.
+
+        [2026-09 신설, 신민용 리포트: "리그 마지막날 경기 후 다음주 첫날에
+        경기 다음날 휴식이 안 뜬다"] 기본값(include_played=False)은 "아직
+        안 치른 경기만 찾는다"는 원래 뜻 그대로다 — 오늘/이후 날짜를 화면에
+        보여줄 땐 이게 맞다(이미 끝난 경기를 마치 예정된 경기처럼 보여주면
+        안 되므로). 그런데 "어제 경기가 있었는지"(경기 다음날 강제 휴식
+        판정, _build_week_sched 등)를 물어보는 호출부는 정반대다 — 물어보는
+        그 시점엔 어제 경기가 이미 끝나 있는 게 정상이다. 지금까지 이
+        구분이 없어서, 리그 마지막날 경기가 다음 주(=새 묶음) 첫날의
+        \"어제\"가 되는 경계에서만 그 경기가 이미 끝난 상태로 조회돼
+        조용히 안 잡혔다(같은 주 안에서는 아직 안 끝난 채로 조회되니
+        우연히 맞았을 뿐). include_played=True면 리그 조회의 home_score=-1
+        제약과, 국내컵(cup_engine)의 동일한 제약+\"대회 끝나면 무조건
+        None\" 게이트까지 함께 건너뛰어, 이미 끝난 경기도 그대로 찾는다.
+        그 외 대회(챔스/유로파/컨퍼런스/승강PO/CWC/슈퍼컵/3~4부 컵)는 이번
+        수정 범위 밖이라 이 플래그가 아직 안 통한다 — 다음에 그쪽에서도
+        같은 증상이 보고되면 같은 방식으로 넓히면 된다."""
         from constants import day_to_week, DAYS_PER_WEEK
         week = day_to_week(day)
         tid = p.get("current_team_id", 0)
@@ -2704,9 +2748,10 @@ class CenterPanel(QWidget):
                     from game_engine import get_state
                     st = get_state()
                 cur_season = st["current_season"] if st else 1
+                _played_clause = "" if include_played else "AND home_score=-1 "
                 row = conn.execute(
                     "SELECT * FROM match_results WHERE league_id=? AND week=? AND day=? "
-                    "AND (home_team_id=? OR away_team_id=?) AND home_score=-1 AND season=?",
+                    f"AND (home_team_id=? OR away_team_id=?) {_played_clause}AND season=?",
                     (lid, week, day, tid, tid, cur_season)).fetchone()
                 conn.close()
                 if row:
@@ -2828,7 +2873,7 @@ class CenterPanel(QWidget):
             eclm["cl_kind"] = "conference"
             return eclm
         from competition import cup_engine
-        return cup_engine.get_my_cup_match(week, day=day, p=p, st=st)
+        return cup_engine.get_my_cup_match(week, day=day, p=p, st=st, include_played=include_played)
 
     # ── 액션 ─────────────────────────────────────
 

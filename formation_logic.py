@@ -216,13 +216,167 @@ def _greedy_fill_slots(candidates, slots_only):
             still_left.append(pl)
 
     # 3) 진짜 마지막 수단 — 위 두 단계로도 못 채운 선수는 남은 빈 슬롯에 순서대로.
+    #
+    # [2026-09 버그수정, 신민용 리포트: "키퍼가 CM/ST로 뛴다 — 키퍼는
+    # 키퍼로 가야지"] 이 함수를 "팀 로스터 전체"(시즌 포지션 스냅샷 등)에
+    # 대고 부르면, GK 슬롯은 이미 1순위 GK가 차지해서 2번째·3번째 GK는
+    # 1)/2)단계 모두 실패하고 여기로 넘어온다 — 예전엔 그냥 "순서대로
+    # 아무 빈 슬롯"이라, OVR 높은 후보 순서상 그 GK가 하필 비어있는
+    # ST/CB 등 슬롯을 다른(진짜 그 자리가 필요한) 후보보다 먼저 가로챌
+    # 수 있었다(실측: 헤드리스 검증에서 GK 포지션 선수 52,222건 중 109건이
+    # ST/CB/RB 등으로 잘못 기록됨을 확인). GK↔비GK 경계만큼은 이 마지막
+    # 수단에서도 절대 안 넘도록, GK후보는 GK슬롯끼리·비GK후보는 비GK슬롯
+    # 끼리 먼저 순서대로 채우고, 그래도 남는 진짜 예외(포메이션에 GK
+    # 슬롯이 없는 등 사실상 불가능한 경우)만 기존처럼 아무 자리에나 채운다
+    # — "어떤 슬롯도 방치하지 않는다"는 기존 계약은 그대로 유지한다.
     if still_left:
         open_idx = [i for i in range(n) if slot_filled[i] is None]
-        for i, pl in zip(open_idx, still_left):
+        gk_open = [i for i in open_idx if _POS_CATEGORY_GET(slots_only[i], "ATK") == "GK"]
+        other_open = [i for i in open_idx if _POS_CATEGORY_GET(slots_only[i], "ATK") != "GK"]
+        gk_left = [pl for pl in still_left
+                   if _POS_CATEGORY_GET(pl.get("position", "CM"), "ATK") == "GK"]
+        other_left = [pl for pl in still_left
+                      if _POS_CATEGORY_GET(pl.get("position", "CM"), "ATK") != "GK"]
+        for i, pl in zip(gk_open, gk_left):
             slot_filled[i] = pl
             pl["_slot_idx"] = i
+        for i, pl in zip(other_open, other_left):
+            slot_filled[i] = pl
+            pl["_slot_idx"] = i
+        # 여기서 끝 — 예전엔 이 아래에 "그래도 남으면 진짜 아무 자리에나"
+        # 라는 완전 무경계 폴백이 하나 더 있었는데, 그게 있으면 위에서
+        # gk_open이 이미 바닥나(=GK 슬롯이 이미 다 찼음) 못 들어간 2군
+        # GK가 바로 이 무경계 폴백을 타고 ST 등으로 새 나갔다(실제로
+        # 처음 이 수정을 넣고 헤드리스로 재현했을 때 그대로 재현됨). GK
+        # 슬롯이 없으면 남는 GK 후보는 그냥 베스트11에서 빠지는 게
+        # 맞다(2군/3군 골키퍼가 벤치에 남는 건 정상이지 스트라이커로
+        # 뛰는 게 정상이 아니다) — 반대로 GK 슬롯에 채울 GK 후보가
+        # 없으면(로스터에 GK가 아예 없는 극단적 예외) 그 슬롯은 빈 채로
+        # 남긴다. 어느 쪽도 GK 경계를 넘어서까지 "일단 채우고 본다"는
+        # 대상이 아니다.
 
     return slot_filled
+
+
+# ─────────────────────────────────────────────
+# [2026-09 신설, 신민용+GPT 협업: "DF가 부족하다고 LB만 계속 영입하면
+# 안 된다 — CB/LB/RB 각각 실제로 부족한 포지션만 봐야 한다"]
+# ─────────────────────────────────────────────
+# database.roll_bench_position()은 그룹(GK/DF/MF/FW)만 가중치로 뽑고 그
+# 안의 구체 포지션은 균등 무작위라, 팀 현재 구성과 완전히 무관하게
+# 굴러간다 — 그 결과 "LB 4명 RB 0명" 같은 팀이 실제로 나올 수 있었다
+# (실측: database.roll_bench_position이 그룹 안에서 random.choice로
+# CB/LB/RB를 매번 독립 추첨 — 이미 몇 명인지 전혀 안 봄).
+#
+# 이 표는 "한 팀이 최소한 이 정도는 갖춰야 하는" 포지션별 필수 슬롯
+# 목표치다(주전 11명이 이미 GK1/CB2/LB1/RB1/CDM1/CM1/CAM1/LW1/RW1/ST1을
+# 채우므로, 이 표는 그 위에 GK·CM 백업까지 포함한 "합계" 기준선). 합
+# 13자리 — 등급별 스쿼드 목표치(22~28명)에서 이 13자리를 먼저 채우고,
+# 남는 자리는 기존 roll_bench_position()으로 그룹 비율만 지켜 자유롭게
+# 채운다(신민용 표현: "필수 슬롯 채우고 남은 자리는 전술/랜덤/유망주로").
+_SLOT_TARGETS = [
+    ("GK", 2), ("CB", 2), ("LB", 1), ("RB", 1),
+    ("CDM", 1), ("CM", 2), ("CAM", 1),
+    ("LW", 1), ("RW", 1), ("ST", 1),
+]
+# [2026-09 신설, 신민용+GPT 협업: "_transfer_market이 포지션을 안 보고
+# 사고팔아 팀 편중이 심하다"] compute_slot_deficiencies와 같은 표를
+# O(1) 목표치 조회용으로도 쓴다 — 아래 두 가중치 함수, 그리고
+# ai_lifecycle._transfer_market의 포지션 카운트 캐시가 참조한다.
+_SLOT_TARGET_MAP = dict(_SLOT_TARGETS)
+
+
+def position_demand_weight(count, target):
+    """[2026-09 신설, 신민용+GPT 협업: "GK 0명인데 일반적인 선호도보다
+    우선해야 한다", "CB 7명인데 또 사는 상황과 GK 1명뿐인 상황은 완전히
+    다르게 취급해야 한다"] _transfer_market의 목적지(매수) 선택 가중치에
+    곱하는 함수 — count(그 팀의 그 포지션 현재 인원)가 target(_SLOT_
+    TARGETS 기준 목표치) 대비 부족할수록 최대 4배까지 끌어당기고
+    (count=0이면 항상 4.0 — target 크기와 무관하게 "완전히 없음"은 가장
+    강한 신호), 과잉일수록 완만하게 억제한다(0에 수렴은 하지 않음 —
+    아주 좋은 조건이면 그래도 성사될 여지는 남겨둔다. 완전 차단은
+    formation_logic._greedy_fill_slots의 GK 경계 같은 별개 안전장치가
+    필요할 때만 쓴다).
+
+    target이 0 이하(=_SLOT_TARGETS에 없는 포지션 — LM/RM/DM/AM/SW/LWB/
+    RWB/CF 등)면 이 기능 적용 범위 밖이라 항상 중립(1.0)을 돌려준다 —
+    compute_slot_deficiencies와 완전히 같은 범위."""
+    if target <= 0:
+        return 1.0
+    if count < target:
+        return 1.0 + 3.0 * (target - count) / target
+    excess = count - target
+    return 1.0 / (1.0 + 1.5 * excess / target)
+
+
+def position_sell_weight(count, target):
+    """position_demand_weight의 매도(sell) 쪽 짝 — [2026-09 신설, 신민용
+    리포트: "매수만 막으면 CB 8명인 팀이 계속 CB를 들고 있으면서 다른
+    포지션을 못 사는 문제가 생긴다"] mover(누가 팔리는가) 선정 가중치에
+    곱해서, 과잉 포지션 선수는 더 잘 팔리고 부족하거나 딱 맞는 포지션
+    선수는 덜 팔리게(보호) 만든다. target 범위는 position_demand_weight와
+    동일(_SLOT_TARGETS 10개 핵심 포지션만, 그 외는 중립 1.0).
+
+    [주의] "팔면 그 포지션 그룹이 0명이 되는" 절대 보호(마지막 GK 등)는
+    이 함수보다 앞서 이미 별도로 처리된다(_do_one_transfer_cached의
+    eligible 필터, _pos_category 그룹 기준) — 이 함수는 그 필터를 통과한
+    후보들 사이의 상대적 판매 확률만 조정한다."""
+    if target <= 0:
+        return 1.0
+    if count <= target:
+        return max(0.3, count / target) if count > 0 else 0.3
+    excess = count - target
+    return 1.0 + 1.0 * excess / target
+
+
+def compute_slot_deficiencies(current_positions):
+    """current_positions(그 팀 현재 로스터의 position 문자열 리스트)를
+    보고, _SLOT_TARGETS 대비 실제로 부족한 포지션만 [(position, 부족한
+    인원수), ...] 형태로 반환한다(부족분이 없으면 빈 리스트).
+
+    POSITION_COMPAT를 그대로 활용해 "완전히 같은 포지션이 아니어도
+    커버 가능한 선수"를 먼저 소진시킨다 — 예를 들어 LB 목표가 1이고
+    로스터에 순수 LB는 없지만 CB가 있다면(POSITION_COMPAT["LB"]에 CB가
+    포함) 그 CB 한 명으로 LB 슬롯이 채워진 것으로 본다. 같은 선수가
+    여러 슬롯에 중복으로 카운트되지 않도록, 한 번 배정에 쓰인 선수는
+    로스터 사본(remaining)에서 즉시 제거한다.
+
+    슬롯 처리 순서는 "이 포지션을 커버할 수 있는 포지션 종류가 적은
+    순"(GK=자기 자신뿐이라 최우선, LW/RW처럼 대체 폭이 넓은 자리는
+    나중)이다 — 대체 폭이 넓은 자리를 먼저 처리하면 정작 대체 불가능한
+    자리(GK 등)가 필요한 선수를 그 넓은 자리가 먼저 채가 버릴 수 있다."""
+    remaining = list(current_positions)
+    deficiencies = []
+    order = sorted(_SLOT_TARGETS,
+                    key=lambda t: len(POSITION_COMPAT.get(t[0], [t[0]])))
+    for pos, target in order:
+        compat = POSITION_COMPAT.get(pos, [pos])
+        # [2026-09 버그수정, 자체 검증 중 발견: "CB만 4명인 로스터에서
+        # LB/RB가 둘 다 부족하다고 나오는데, CB 2명은 이미 CB 목표를
+        # 채웠으니 나머지 2명은 LB/RB 쪽으로 넘어가야 맞다"] 정확히 같은
+        # 포지션이라고 무조건 다 소진시키면 목표(target)를 넘는 surplus
+        # 까지 여기서 다 없어져 버려서, 뒤에 처리되는 다른 포지션이 그
+        # surplus를 POSITION_COMPAT로 이어받을 기회 자체가 사라진다 —
+        # 정확한 매치는 딱 target개수까지만 소진하고 나머지는 remaining에
+        # 그대로 둬야, surplus CB가 LB/RB 부족분을 실제로 메울 수 있다.
+        exact_idx = [i for i, p in enumerate(remaining) if p == pos][:target]
+        for i in sorted(exact_idx, reverse=True):
+            del remaining[i]
+        have = len(exact_idx)
+        if have < target:
+            need = target - have
+            comp_idx = []
+            for i, p in enumerate(remaining):
+                if p in compat:
+                    comp_idx.append(i)
+                    if len(comp_idx) >= need:
+                        break
+            for i in sorted(comp_idx, reverse=True):
+                del remaining[i]
+            have += len(comp_idx)
+        if have < target:
+            deficiencies.append((pos, target - have))
+    return deficiencies
 
 
 # ─────────────────────────────────────────────

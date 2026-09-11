@@ -214,3 +214,136 @@ def _make_rng(seed, events, my_score, opp_score):
     # 시드에 무관하게 항상 같은 값을 주는 crc32로 교체(분포는 동일).
     import zlib
     return random.Random(zlib.crc32(key.encode("utf-8")) & 0xffffffff)
+
+
+def generate_possession_log(is_home, team_stats, timed_events, my_score, opp_score):
+    """[구현부 — 이 파일 맨 위 모듈 독스트링에서 이미 계약을 문서화해뒀지만
+    실제 함수 본체가 빠져 있었다. game_engine._save_match_detail이
+    engine_plog 없이(=새 전술 엔진을 안 쓰는 챔스/컵/국제대회/승강
+    플레이오프 등) 이 함수를 직접 호출하는데, 정의가 없어서 항상
+    AttributeError로 크래시했다.]
+
+    tactical_engine.simulate_tactical_match이 만드는 진짜 시뮬레이션
+    plog와 완전히 같은 레코드 스키마({"min","team","zone","lane","outcome",
+    "me","text"})를 쓴다.
+
+    설계:
+      1. team_stats에서 사이드별 목표 개수(골/선방/빗나감/코너/파울)를
+         뽑아낸다. 슈팅=온타깃+빗나감, 골=min(온타깃, 실제 스코어)로
+         고정해서 "슈팅류 총합==shots", "온타깃(goal+save)==shots_on",
+         "골 개수==실제 득점 수" 세 불변식이 항상 정확히 맞는다
+         (game_engine._derive_match_stats가 이미 shots>=shots_on>=score를
+         보장하므로 음수가 나올 일이 없다).
+      2. 90분을 1분 단위로 돌면서 그 분의 점유팀을 poss(점유율) 가중치로
+         뽑고, 그 팀에 아직 안 배정한 목표 이벤트가 남아있으면 그걸 쓰고
+         없으면 "buildup"(특별한 일 없는 필러)을 채운다 — 로그 길이가
+         항상 90 근처가 되어 뷰어가 끊김 없이 재생할 수 있다. 아주 드물게
+         목표 이벤트 합이 90분보다 많으면(양 팀 슈팅+코너+파울 합이 90
+         초과) 남는 만큼 경기 후반부에 이어 붙인다 — "총합 일치"가
+         "정확히 90개"보다 우선하는 불변식이라서다.
+      3. 실제 개인 이벤트(골/도움/실점/선방/파울/코너 텍스트, 이미 정확한
+         분이 배정됨)를 같은 team+outcome 필러 슬롯 중 그 분과 가장 가까운
+         것 하나에 병합한다 — tactical_engine.merge_personal_events와 같은
+         원칙(발생 분은 그대로 유지, 슬롯의 시각만 그 쪽으로 당겨온다).
+         대응하는 필러 슬롯이 하나도 없으면(극단적 케이스) 새 레코드를
+         만들어서라도 실제 이벤트는 반드시 로그에 남긴다 — "총합 일치"
+         불변식보다 "실제 이벤트는 로그에 존재해야 한다" 불변식을 우선
+         한다(merge_personal_events는 반대로 조용히 버리는데, 그쪽은 엔진
+         자신이 만든 stats라 애초에 안 맞을 일이 거의 없어서 그래도 되지만
+         여긴 stats가 별도 공식으로 만들어지는 폴백 경로라 안전하게 둔다).
+
+    완전히 결정론적 — _make_rng()로 만든 로컬 Random만 쓰고 전역 random
+    상태는 건드리지 않는다(같은 스코어·같은 개인 이벤트면 항상 같은 로그).
+    """
+    my_side = "home" if is_home else "away"
+    opp_side = "away" if is_home else "home"
+    my_stats = team_stats.get(my_side) or {}
+    opp_stats = team_stats.get(opp_side) or {}
+
+    rng = _make_rng(None, timed_events, my_score, opp_score)
+
+    def _side_targets(stats, score):
+        shots = max(0, int(stats.get("shots", 0)))
+        shots_on = max(0, min(shots, int(stats.get("shots_on", 0))))
+        goals = max(0, min(shots_on, int(score)))
+        return {
+            "goal": goals,
+            "save": shots_on - goals,
+            "shot_off": shots - shots_on,
+            "corner": max(0, int(stats.get("corners", 0))),
+            "foul": max(0, int(stats.get("fouls", 0))),
+        }
+
+    def _zone_for(outcome):
+        if outcome == "foul":
+            return "mid"
+        if outcome == "buildup":
+            return rng.choices(("def", "mid", "att"), weights=(3, 4, 3), k=1)[0]
+        return "att"  # goal/save/shot_off/corner
+
+    my_queue = [o for o, n in _side_targets(my_stats, my_score).items() for _ in range(n)]
+    opp_queue = [o for o, n in _side_targets(opp_stats, opp_score).items() for _ in range(n)]
+    rng.shuffle(my_queue)
+    rng.shuffle(opp_queue)
+
+    my_poss_pct = max(1, min(99, int(my_stats.get("poss", 50))))
+    total_minutes = 90
+
+    log = []
+    for minute in range(1, total_minutes + 1):
+        if rng.random() * 100 < my_poss_pct:
+            side, queue = my_side, my_queue
+        else:
+            side, queue = opp_side, opp_queue
+        outcome = queue.pop() if queue else "buildup"
+        log.append({"min": float(minute), "team": side, "zone": _zone_for(outcome),
+                    "lane": rng.choice(("L", "C", "R")), "outcome": outcome,
+                    "me": False, "text": None})
+
+    # 90분 배정에서 다 못 채운 목표 이벤트(극단적으로 슈팅+코너+파울 합이
+    # 90을 넘는 케이스)는 후반부에 이어 붙여서라도 개수를 맞춘다.
+    leftover = [(my_side, o) for o in my_queue] + [(opp_side, o) for o in opp_queue]
+    for i, (side, outcome) in enumerate(leftover):
+        log.append({"min": total_minutes + (i + 1) * 0.01, "team": side,
+                    "zone": _zone_for(outcome), "lane": rng.choice(("L", "C", "R")),
+                    "outcome": outcome, "me": False, "text": None})
+
+    # 실제 개인 이벤트 병합 — tactical_engine.merge_personal_events와 동일한
+    # 원칙(발생 분은 유지, 같은 team+outcome 필러 슬롯 중 가장 가까운 것
+    # 하나만 당겨와서 text/me를 채운다).
+    kind_map = {
+        "goal_for": (my_side, "goal", True),
+        "goal_against": (opp_side, "goal", False),
+        "miss_for": (my_side, "save", True),
+        "save": (opp_side, "save", True),
+    }
+    used_idx = set()
+    for m, text in timed_events:
+        kind = _classify_personal(text)
+        if kind in kind_map:
+            side, outcome, me_flag = kind_map[kind]
+        elif kind == "foul":
+            side = my_side if "우리 팀" in text else opp_side
+            outcome, me_flag = "foul", False
+        elif kind == "corner":
+            side = my_side if "우리 팀" in text else opp_side
+            outcome, me_flag = "corner", False
+        else:
+            continue
+
+        candidates = [i for i, r in enumerate(log)
+                      if i not in used_idx and r["team"] == side and r["outcome"] == outcome
+                      and r["text"] is None]
+        if candidates:
+            best = min(candidates, key=lambda i: abs(log[i]["min"] - float(m)))
+            used_idx.add(best)
+            log[best]["min"] = float(m)
+            log[best]["text"] = text
+            log[best]["me"] = me_flag
+        else:
+            log.append({"min": float(m), "team": side, "zone": _zone_for(outcome),
+                        "lane": rng.choice(("L", "C", "R")), "outcome": outcome,
+                        "me": me_flag, "text": text})
+
+    log.sort(key=lambda r: r["min"])
+    return log

@@ -1717,14 +1717,20 @@ def open_ovr_edit_dialog(parent, player_id: int, cur_ovr: int):
     info_lbl = QLabel(
         f"현재 OVR: {cur_ovr}\n"
         "새 목표 OVR을 정하면 세부 스탯 15개가 전부 같은 폭으로\n"
-        "함께 오르내립니다(이 선수만의 강약 분포는 그대로 유지).")
+        "함께 오르내립니다(이 선수만의 강약 분포는 그대로 유지).\n"
+        "30세 이상(노화기) 선수는 입력한 값이 \"전성기 한계\"로 저장되고,\n"
+        "실제 반영되는 현재 OVR은 그 나이에 맞게 자연스럽게 낮아진 값입니다.")
     info_lbl.setStyleSheet("color:#888;font-size:11px;")
     v.addWidget(info_lbl)
 
     row = QHBoxLayout()
     row.addWidget(QLabel("목표 OVR:"))
     spin = QSpinBox()
-    spin.setRange(1, 99)
+    # [2026-09 버그수정, 신민용 리포트: "선수 OVR 입력 최대치를 100으로
+    # 할 수 있게 해줘"] database.calc_ovr의 기본 상한(cap=100)과
+    # 맞춰 99→100으로 상향 — rescale_ai_player_to_target_ovr 쪽도
+    # 같이 100까지 받도록 고쳐야 실제로 100이 반영된다.
+    spin.setRange(1, 100)
     spin.setValue(cur_ovr)
     spin.setStyleSheet(
         "QSpinBox{background:#161616;color:#eee;font-size:13px;"

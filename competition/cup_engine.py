@@ -414,10 +414,20 @@ def has_my_cup_match_between(week_from, week_to):
     return False
 
 
-def get_my_cup_match(week, day=None, p=None, st=None):
+def get_my_cup_match(week, day=None, p=None, st=None, include_played=False):
     """이번 주차(또는 특정 day)에 내가 뛸 컵대회 경기가 있으면 dict, 없으면 None.
 
-    [2026-07 최적화] p를 넘기면 get_player() 재조회를 생략한다."""
+    [2026-07 최적화] p를 넘기면 get_player() 재조회를 생략한다.
+
+    [2026-09 신설] include_played=True면 "아직 안 치른 경기"(home_score=-1)
+    라는 기본 제약과 "대회가 이미 끝났으면 무조건 None" 게이트를 둘 다
+    건너뛰고, 이미 끝난 경기도 그대로 찾아 반환한다 — 기본값(False)일 때의
+    동작(대진/시뮬레이션 진행용, AI 자동 진행 등 기존 모든 호출부)은 전혀
+    바뀌지 않는다. ui/center_panel.py가 "어제 컵 경기가 있었는지"(경기
+    다음날 강제 휴식 판정)를 확인할 때만 True로 부른다 — 그 경기가 결승
+    이라 대회 status가 이미 'done'으로 바뀌었거나, home_score가 이미
+    채워졌어도(둘 다 "이미 끝났다"는 정상적인 신호일 뿐) 여전히 "그날
+    경기가 있었다"는 사실 자체는 찾아야 하기 때문이다."""
     from game_engine import get_player, get_state
     if p is None:
         p = get_player()
@@ -429,23 +439,24 @@ def get_my_cup_match(week, day=None, p=None, st=None):
     if not tid:
         return None
     t = _my_cup_tournament(p, st["current_year"])
-    if not t or t["status"] == "done":
+    if not t or (t["status"] == "done" and not include_played):
         return None
     reg_tid = t.get("my_team_id", 0)
     if not reg_tid or reg_tid != tid:
         return None
 
     conn = get_conn()
+    _played_clause = "" if include_played else "AND home_score=-1 "
     if day is not None:
         m = conn.execute(
-            """SELECT * FROM cup_matches
-               WHERE tournament_id=? AND week=? AND home_score=-1
+            f"""SELECT * FROM cup_matches
+               WHERE tournament_id=? AND week=? {_played_clause}
                  AND (home_team_id=? OR away_team_id=?) AND (day=? OR day IS NULL OR day=0)""",
             (t["id"], week, tid, tid, day)).fetchone()
     else:
         m = conn.execute(
-            """SELECT * FROM cup_matches
-               WHERE tournament_id=? AND week=? AND home_score=-1
+            f"""SELECT * FROM cup_matches
+               WHERE tournament_id=? AND week=? {_played_clause}
                  AND (home_team_id=? OR away_team_id=?)""",
             (t["id"], week, tid, tid)).fetchone()
     if not m:
