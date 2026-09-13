@@ -739,9 +739,74 @@ def load_from_disk() -> bool:
         dst_pooled = get_conn()
         dst_real = object.__getattribute__(dst_pooled, "_real")
         src.backup(dst_real)   # game.db → 인메모리로 전체 복사
+        # [2026-09 신설, 신민용 리포트: "발롱도르가 아직 안 끝난 시즌의
+        # 트로피(챔스 우승 등)를 이미 알고 있다 — season_state는 51주차인데
+        # season_individual_awards엔 그 해 30명이 이미 계산돼 있다"] main
+        # (game.db)은 이 함수처럼 오토세이브 시점으로만 롤백되는데, hist
+        # (game.history.db)는 ATTACH된 실제 디스크 파일이라 매 커밋이 즉시
+        # 영구 반영되고 이 백업/복원 대상에서 원래부터 빠져 있다(바로 위
+        # 주석 참고). 그래서 "연도전환 처리(hist에 발롱도르 등을 커밋) →
+        # 몇 주 더 진행 → 다음 오토세이브 전에 비정상 종료"가 일어나면,
+        # 방금 복원된 main은 이전 주차로 돌아왔는데 hist에는 그보다 미래의
+        # 시즌 스탯·개인상이 그대로 남아 모순이 생긴다.
+        # _compute_season_individual_awards는 "그 연도 행이 하나라도
+        # 있으면 그 연도는 영구 스킵"하는 멱등성 체크라, 한 번 이렇게
+        # 어긋나면 해당 연도는 트로피가 다 확정된 뒤에도 절대 재계산되지
+        # 않고 옛 스냅샷 값에 영구히 고정된다(실제로 챔스 우승 트로피가
+        # 통째로 누락된 발롱도르 결과로 확인됨).
+        # main이 방금 이 함수로 복원된 "그 시점"을 기준으로, hist에 그
+        # 시점보다 미래(현재 진행 중이거나 아직 시작도 안 한 연도)의
+        # 기록이 남아있으면 지워서 main/hist를 같은 시점으로 다시 맞춘다
+        # — 근본 수정(hist를 스냅샷 대상에 포함시키는 것)은 저장 구조
+        # 자체를 바꿔야 해서 더 큰 작업이므로, 이번엔 로드 시점 자가 복구로
+        # 대응한다.
+        _repair_future_hist_data(dst_pooled)
         return True
     finally:
         src.close()
+
+
+# [2026-09 신설] load_from_disk()가 main을 복원한 직후 hist와의 시점
+# 불일치를 감지·복구할 때 지울 대상 표 — year 컬럼을 가진 hist 표 전부.
+# team_power_rankings는 컬럼명이 ranking_year/evaluation_year로 다르고
+# 발롱도르/야신상 계산과 무관한 별개 서브시스템(파워랭킹)이라 이번 복구
+# 범위에서 의도적으로 제외한다(_get_team_trophy_bonus 등 트로피 계산
+# 경로가 이 표를 전혀 참조하지 않음을 확인함).
+_HIST_YEAR_TABLES_FOR_REPAIR = (
+    "ai_player_season_stats", "ai_player_season_stats_by_comp",
+    "ai_player_ovr_history", "ai_player_position_history",
+    "ai_player_position_history_half", "season_individual_awards",
+    "league_season_standings", "league_season_standings_half",
+    "team_season_lineup", "team_season_lineup_half", "team_b_history",
+)
+
+
+def _repair_future_hist_data(conn):
+    """load_from_disk() 직후(=main이 막 복원된 시점) 매번 호출된다. main의
+    season_state.current_year보다 같거나 큰 연도의 hist 기록은 main 기준
+    "아직 시작도 안 했거나 진행 중이라 완결 처리가 안 됐어야 할" 연도이므로
+    존재 자체가 모순이다 — 이 함수가 그런 행을 전부 지워 main/hist를 같은
+    시점으로 되맞춘다(위 load_from_disk() 주석의 시나리오 참고).
+    season_state가 아직 없는 완전 신규 세이브(첫 실행)에서는 조용히 스킵."""
+    try:
+        row = conn.execute("SELECT current_year FROM season_state WHERE id=1").fetchone()
+    except sqlite3.OperationalError:
+        return
+    if not row or row["current_year"] is None:
+        return
+    cutoff_year = row["current_year"]
+    removed_any = False
+    for tbl in _HIST_YEAR_TABLES_FOR_REPAIR:
+        try:
+            cur = conn.execute(f"DELETE FROM hist.{tbl} WHERE year >= ?", (cutoff_year,))
+            if cur.rowcount:
+                removed_any = True
+                print(f"[HIST-REPAIR] hist.{tbl}: year>={cutoff_year} {cur.rowcount}행 삭제"
+                      f"(main/hist 시점 불일치 복구 — load_from_disk 참고)")
+        except sqlite3.OperationalError:
+            continue  # 이 세이브 버전엔 없는 표/컬럼일 수 있음 — 안전하게 건너뜀
+    if removed_any:
+        conn.commit()
 
 def _retry_on_windows_lock(func, *args, attempts=8, base_delay=0.2):
     """[2026-08 버그 수정, "게임 세계 생성 직후 PermissionError [WinError 5]"]
@@ -2753,6 +2818,12 @@ def init_db():
         # user_initiated=True로 불릴 때만 여기에 1을 찍는다(그 함수를
         # 자동 장치들도 재사용하므로, 인자로 명시적으로 구분).
         "ALTER TABLE ai_players ADD COLUMN ovr_user_locked INTEGER DEFAULT 0",
+        # [2026-09 신설, 위 compute_ai_growth_cap/roll_potential_ovr 정의부
+        # 주석 참고] AI 선수 개인별 "전성기 도달 가능 상한". 0이면 아직
+        # 배정 전(구버전 세이브)이라는 뜻 — 아래 백필 UPDATE와
+        # ai_lifecycle._age_and_progress(potential_ovr<=0이면 team_cap을
+        # 그대로 쓰는 하위호환 분기)가 이 상태를 처리한다.
+        "ALTER TABLE ai_players ADD COLUMN potential_ovr INTEGER DEFAULT 0",
         "CREATE INDEX IF NOT EXISTS hist.idx_sia_league_country ON season_individual_awards(category, year, league_country, league_tier)",
         "CREATE INDEX IF NOT EXISTS hist.idx_sia_category_year ON season_individual_awards(category, year)",
     ]:
@@ -2770,6 +2841,19 @@ def init_db():
     # 전성기보다는 약간 낮게 잡히는 보수적 근사 — 하지만 이 시점부터는
     # 목표곡선이 정확하게 적용된다). peak_ovr>0인 행은 이미 처리된
     # 것이므로 건드리지 않음(멱등 — 매번 실행해도 안전).
+    # [2026-09 신설, 위 potential_ovr 컬럼 주석 참고] 기존 세이브의 선수는
+    # potential_ovr이 0(미배정)이다 — 원래 어떤 star_kind로 생성됐는지
+    # 소급할 방법이 없으므로, 최선의 근사치로 "지금 OVR + 여유폭"을 잠재력
+    # 하한으로 잡는다(이미 그만큼 컸다는 사실 자체가 최소한 그 정도 재능이라는
+    # 증거이므로). ai_lifecycle._age_and_progress도 potential_ovr<=0인
+    # 행은(이 백필이 아직 안 닿은 극히 드문 경우) team_cap을 그대로 써서
+    # 하위호환을 이중으로 보장한다.
+    try:
+        c.execute(
+            "UPDATE ai_players SET potential_ovr = MIN(99, ovr + 3) "
+            "WHERE potential_ovr IS NULL OR potential_ovr = 0")
+    except sqlite3.OperationalError:
+        pass
     try:
         c.execute(
             "UPDATE ai_players SET peak_ovr = ovr WHERE (peak_ovr IS NULL OR peak_ovr = 0) AND age > 29")
@@ -6252,6 +6336,33 @@ _INTL_BREAKOUT_BAND_WEIGHTS = {
     "F": ((70, 80, 0.99999), (81, 85, 0.00001)),
 }
 
+# [2026-09 추가, 신민용 지적: "밴드 선택 확률(main vs breakout)만 등급별로
+# 차등화돼 있고, 정작 그 밴드 '안에서' 몇 OVR이 뽑히는지는 random.randint라
+# 완전 균등이다 — 그러면 C등급(가나·남아공·보스니아급) 국가에서 85와
+# 92(그 등급 최상단)가 똑같은 빈도로 나온다는 뜻이라 부자연스럽다"] 밴드
+# 하한(lo)이 가장 흔하고 상한(hi)으로 갈수록 기하급수적으로 희귀해지는
+# 가중치로 바꾼다. 등급이 낮을수록(국가 재능 풀이 얕을수록) 감쇠비를 더
+# 가파르게 둔다 — "C는 완만하게 내려가고, D는 그보다 조금 더, E/F는 훨씬
+# 가파르게"라는 요청 그대로. ratio가 1에 가까울수록 완만(거의 균등에
+# 가까움), 0에 가까울수록 급격(하한에 쏠림). main band·breakout band
+# 양쪽 다 이 원리를 그대로 적용한다(위 계층 구조 예시의 "93이 상대적으로
+# 흔하고 97이 극희귀"도 같은 원리이므로 밴드별로 다른 ratio를 따로 둘
+# 필요가 없다).
+_INTL_BREAKOUT_DECAY_RATIO = {"B": 0.90, "C": 0.86, "D": 0.78, "E": 0.70, "F": 0.62}
+
+
+def _decayed_band_ovr(lo, hi, ratio):
+    """[lo, hi] 구간에서 lo가 가장 흔하고 hi로 갈수록 ratio배씩(0<ratio<1)
+    희귀해지는 가중치로 정수 OVR 하나를 뽑는다. ratio가 작을수록(등급이
+    낮을수록) 상단이 더 급격히 희귀해진다 — ratio=1이면 기존과 동일한
+    완전 균등이 된다(회귀 시 안전한 폴백)."""
+    n = hi - lo + 1
+    if n <= 1 or ratio >= 1.0:
+        return random.randint(lo, hi)
+    weights = [ratio ** i for i in range(n)]
+    offset = random.choices(range(n), weights=weights, k=1)[0]
+    return lo + offset
+
 
 def _apply_intl_breakout(country, picked):
     """[2026-09 신설] get_or_create_intl_squad가 이 나라 대표팀을 이번
@@ -6291,12 +6402,14 @@ def _apply_intl_breakout(country, picked):
         return
     if random.random() >= step_probs[cur_count]:
         return
-    # 밴드 가중 추첨(등급별 기준선 근처 종형분포 + 97~99 천재 예외) 후
-    # 그 구간 안에서 균일 추첨.
+    # 밴드 가중 추첨(등급별 기준선 근처 종형분포 + 97~99 천재 예외) 후,
+    # 그 구간 안에서도 하한이 가장 흔하고 상한으로 갈수록 등급별 감쇠비로
+    # 희귀해지는 하향 분포로 뽑는다(균일 추첨 아님 — 위 _INTL_BREAKOUT_
+    # DECAY_RATIO 정의부 참고).
     bands = _INTL_BREAKOUT_BAND_WEIGHTS.get(grade)
     weights = [w for _, _, w in bands]
     lo, hi, _ = random.choices(bands, weights=weights, k=1)[0]
-    target_ovr = random.randint(lo, hi)
+    target_ovr = _decayed_band_ovr(lo, hi, _INTL_BREAKOUT_DECAY_RATIO.get(grade, 0.8))
     candidates = sorted(
         (r for r in picked if (r.get("ovr") or 0) < floor),
         key=lambda r: -(r.get("ovr") or 0))
@@ -7145,6 +7258,107 @@ STAR_STRENGTH_PENALTY_MAX = 4.0
 STAR_STRENGTH_PENALTY_MAX_BY_GRADE = {"SS": 1.0}
 
 
+# [2026-09 신설, 신민용+GPT 진단·설계: "강한 리그에서 9년 성장하면 누구나
+# team_cap(리그 상한)에 수렴한다" 버그 대응] 헤드리스 10시즌 실측으로 확정한
+# 원인 — AI 선수는 my_player와 달리 개인별 talent_cap이 없어 성장 목표가
+# team_cap(팀/리그 단위) 하나뿐이었다. 그 결과 97+ 선수가 49→441명(9배)으로
+# 폭증했는데, 그중 52.5%가 "성장기(25세)가 막 끝난" 25~27세에 몰려 있고
+# 31세+는 0명이었다 — "재능이 뛰어나 오래 유지"가 아니라 "누구나 상한 근처
+# 에서 잠깐 피크"였다는 뜻. ai_lifecycle._age_and_progress에 있던 team_cap
+# 공식을 그대로 추출해 공용화한다 — _generate_team_players(생성 시점
+# potential_ovr 산정)와 ai_lifecycle._retire_and_replace(신인 생성)도 이제
+# 이 함수를 써서 항상 같은 기준을 공유한다(공식이 여러 곳에 따로 있으면
+# 나중에 한쪽만 고쳐서 어긋나는 사고가 난다).
+def compute_ai_growth_cap(grade, tier, cname, continent):
+    """AI 선수 성장 상한(team_cap) — 그 팀이 속한 리그의 설계 OVR 상한
+    + 대륙/국가 보정 + 3(여유폭), 최대 99. '이 환경에서 최대 얼마까지
+    갈 수 있는가'라는 의미로, 개인별 potential_ovr과 별개로 유지한다
+    (실제 성장 목표는 min(team_cap, potential_ovr) — roll_potential_ovr
+    정의부 주석 참고)."""
+    from constants import CONTINENT_OVR_BONUS, COUNTRY_OVR_ADJ, get_ovr_range
+    rng = get_ovr_range(grade, tier or 1, cname)
+    top = rng[1] if rng else 43
+    bonus = round(CONTINENT_OVR_BONUS.get(continent, 0) + COUNTRY_OVR_ADJ.get(cname, 0))
+    if grade == "SS":
+        bonus = min(bonus, 0)
+    return min(99, top + bonus + 3)
+
+
+# [2026-09 신설, 위 compute_ai_growth_cap 주석 참고] AI 선수 개인별 "전성기
+# 도달 가능 상한". star_kind(월드클래스/엘리트/일반 — 이미 스쿼드 생성 때
+# 쓰는 분류, _star_counts 참고)별로 team_cap에서 얼마나 빼는지를 확률적으로
+# 정해서, "어느 팀에 있느냐"가 아니라 "이 선수가 어떤 재목이냐"가 최종
+# 도달치를 가르게 한다. [신민용+GPT 확정] 완전히 기계적으로 고정하지 않는다
+# — 월드클래스 슬롯이어도 가끔(20%) 94~96 선에서 끝날 수 있고, 일반 슬롯도
+# 아주 드물게(1.5%, "와일드카드") 엘리트~월드클래스급 잠재력을 받을 수 있다
+# ("생성 당시엔 평범했는데 나중에 발굴되는 유망주" 서사). potential_ovr은
+# 평생 고정 상한이 아니라 "전성기(peak)에 도달 가능한 상한"일 뿐 — 노화는
+# 기존 peak_ovr 기반 감쇠 스케줄을 그대로 쓴다(별도 처리 불필요).
+# 목표치(신민용+GPT 합의, 시즌10 헤드리스 기준 — 하드 조건 아닌 평가 기준):
+#   97+ : 70~100명 / 98+ : 20~40명 / 99 : 5~15명 (전체 인구 약 28만 명 기준)
+#
+# [2026-09 2차 개편, 신민용 요청: "잠재력이 team_cap에 종속되면 안 된다 —
+# 한국 하위팀에서도 극히 낮은 확률로 97+ 나와야 한다"] 실측 확인: 대한민국
+# 소속 선수 2,279명 전원의 potential_ovr 최댓값이 79였다 — 위 '일반' 분기의
+# 와일드카드(1.5%)조차 offset을 team_cap에서 빼는 구조라, team_cap 자체가
+# 낮은 나라/팀에서는 와일드카드가 걸려도 team_cap을 절대 넘지 못해 97+가
+# 원천 봉쇄돼 있었다(_star_counts가 (0,0)을 반환하는 국가는 모든 선수가
+# 이 '일반' 분기 하나로만 생성되므로, 한국처럼 GLOBAL_PRESTIGE_STAR_CFG에도
+# 없는 나라는 예외 없이 전원 여기 걸린다). '일반' 분기의 와일드카드만
+# team_cap과 완전히 분리된 "세계 공통 희귀 분포"로 재설계한다 — 그 외
+# (일반 비와일드카드, elite, worldclass) 분기는 기존 그대로 유지해 이미
+# 검증된 부분을 건드리지 않는다.
+_GLOBAL_WILDCARD_ABS_DIST = [
+    # (하한, 상한, 가중치) — team_cap과 무관한 절대값. 위 목표치(97+/98+/99)
+    # 예산의 극히 일부만 여기 배정한다 — 나머지 대부분은 기존처럼 강한
+    # 리그의 worldclass/elite 슬롯에서 나온다(이 분포는 "약팀·약소국에도
+    # 극히 드물게 원석이 있다"는 보조 경로일 뿐, 주 공급원이 아니다).
+    (80, 92, 850),
+    (93, 96, 128),
+    (97, 97, 15),
+    (98, 98, 6),
+    (99, 99, 1),
+]
+
+
+def _roll_global_wildcard_abs():
+    lo, hi, _w = random.choices(
+        _GLOBAL_WILDCARD_ABS_DIST,
+        weights=[w for *_, w in _GLOBAL_WILDCARD_ABS_DIST], k=1)[0]
+    return random.randint(lo, hi)
+
+
+def roll_potential_ovr(team_cap, kind=None):
+    """kind: 'worldclass' | 'elite' | None(일반 — 벤치 포함 나머지 전부)."""
+    if kind == "worldclass":
+        # [2026-09 재조정, 신민용+GPT 확정: "현실 축구는 97 스타가 제일
+        # 많고 98은 그보다 적고 99는 극소수 — 97:98:99 ≈ 5:2:1 정도가
+        # 자연스럽다"] 예전엔 offset 0~2를 균등추첨(0,1,2 각 1/3)해서
+        # 97/98/99가 거의 비슷한 비율로 나왔다 — 이제 offset=2(→97)를
+        # 가장 흔하게, 0(→99)을 가장 드물게 가중추첨한다. 99를 더 쉽게
+        # 만들 목적이 아니라 정반대(99는 그대로 두고 97 유입만 늘리는
+        # 목적)라, 정확히 이 가중치 뒤집기가 필요했다.
+        if random.random() < 0.8:
+            offset = random.choices([2, 1, 0], weights=[5, 2, 1], k=1)[0]
+        else:
+            offset = random.randint(3, 5)
+    elif kind == "elite":
+        offset = random.randint(4, 10)
+    else:
+        if random.random() < 0.015:
+            # [2026-09 수정] 와일드카드: team_cap과 무관한 세계 공통 희귀
+            # 분포에서 절대값을 뽑는다 — 소속팀/소속국의 team_cap이 아무리
+            # 낮아도(한국 하위팀 포함) 극히 낮은 확률로 97+가 나올 수 있다.
+            # 이 값 자체가 team_cap보다 낮게 나올 수도 있다(무조건 상향이
+            # 아니라 "team_cap 제약에서 풀려난 별도의 추첨"이라는 뜻) —
+            # 호출부가 이미 max(ovr, roll_potential_ovr(...))로 감싸고
+            # 있어 현재 OVR 밑으로 떨어지는 문제는 없다.
+            return max(1, min(99, _roll_global_wildcard_abs()))
+        else:
+            offset = random.randint(12, 25)
+    return max(1, min(99, team_cap - offset))
+
+
 def _tier_top_ovr(grade, tier, continent_bonus=0, country=None):
     """그 등급·tier 리그에서 도달 가능한 최고 OVR.
     continent_bonus: 대륙별 OVR 보정치 (유럽+1, 아시아-3 등)
@@ -7338,8 +7552,12 @@ def _topup_foreign_floor(_rows, star_kind_by_slot, team_country, team_continent,
     하한(quota_lo)에 못 미치면, 벤치(후보) 자리부터 우선해서 자국 선수
     일부를 외국인으로 바꿔 하한을 맞춘다. 스타 슬롯(star_kind_by_slot)은
     "축구 강국 우선" 로직으로 이미 국적이 확정된 자리라 건드리지 않는다.
-    _rows는 (팀id,이름,포지션,...,국적) 튜플 리스트 — 국적이 마지막
-    원소라 인덱스 -1로 바로 수정한다.
+    _rows는 (팀id,이름,포지션,...,국적,potential_ovr) 튜플 리스트. [2026-09
+    수정] potential_ovr이 국적 뒤에 새로 추가되면서 국적은 더 이상 마지막
+    원소가 아니다(인덱스 -2로 이동, potential_ovr이 -1) — 아래 두 군데
+    (domestic_idx 필터, row[-1] 대입)를 그에 맞춰 고쳤다. potential_ovr
+    자체는 국적이 바뀐다고 달라질 이유가 없으므로(재능은 국적과 무관) 그
+    값은 그대로 둔다.
 
     [2026-09 신설, 신민용 리포트: "용병은 어지간하면 주전에 속할 OVR을
     가지고 있는 게 맞다"] _generate_team_players 본문(국적을 먼저
@@ -7356,7 +7574,7 @@ def _topup_foreign_floor(_rows, star_kind_by_slot, team_country, team_continent,
     _init_nationality_tables()
     deficit = quota_lo - foreign_count
     domestic_idx = [i for i in range(len(_rows))
-                    if i not in star_kind_by_slot and _rows[i][-1] == team_country]
+                    if i not in star_kind_by_slot and _rows[i][-2] == team_country]
     # 벤치(TEAM_STARTER_COUNT 이상)부터 우선 — bool 정렬(False가 먼저)로
     # "벤치인가(i>=TEAM_STARTER_COUNT)"가 True인 항목을 앞으로 보낸다.
     domestic_idx.sort(key=lambda i: i < TEAM_STARTER_COUNT)
@@ -7367,7 +7585,7 @@ def _topup_foreign_floor(_rows, star_kind_by_slot, team_country, team_continent,
         if nat == team_country:
             continue
         row = list(_rows[i])
-        row[-1] = nat
+        row[-2] = nat
         pos = row[2]
         cur_ovr = row[18]
         if starter_floor is not None and cur_ovr < starter_floor:
@@ -7378,6 +7596,12 @@ def _topup_foreign_floor(_rows, star_kind_by_slot, team_country, team_continent,
             for si, s in enumerate(ALL_STATS):
                 row[3 + si] = _stats[s]
             row[18] = calc_ovr(pos, _stats)
+            # [2026-09 버그수정, 헤드리스 스모크테스트로 발견] 이 보정이
+            # ovr을 끌어올리는데 potential_ovr(마지막 원소)은 그대로 두면
+            # "잠재력이 지금 실력보다 낮다"는 모순이 다시 생길 수 있다 —
+            # database._generate_team_players 본문과 동일한 원칙으로
+            # 최소한 방금 끌어올린 ovr만큼은 potential_ovr도 같이 보장한다.
+            row[-1] = max(row[-1], row[18])
         _rows[i] = tuple(row)
         foreign_count += 1
     return foreign_count
@@ -7470,6 +7694,10 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
     tier_top = _tier_top_ovr(grade, tier, continent_bonus, team.get("cname", ""))
     n_world, n_elite = _star_counts(grade, team_strength, continent_bonus, tier=tier,
                                      country=team.get("cname", ""), prestige_level=_plevel)
+    # [2026-09 신설, roll_potential_ovr 정의부 주석 참고] 이 팀의 성장 상한
+    # (team_cap) — 아래 루프에서 각 선수의 star_kind와 함께 개인별
+    # potential_ovr(전성기 도달 가능 상한)을 정하는 기준이 된다.
+    _team_growth_cap = compute_ai_growth_cap(grade, tier, team.get("cname", ""), continent)
     # [2026-08 수정, 벤치 인원 확장] 스타 슬롯은 후보(벤치) 자리엔 절대
     # 배정하지 않는다 — 주전 11자리(TEAM_STARTER_COUNT) 안에서만 추첨.
     star_slot_idx = list(range(TEAM_STARTER_COUNT))
@@ -7708,6 +7936,16 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
                 stats = _gen_ai_stats(pos, target)
                 ovr = calc_ovr(pos, stats)
                 sub_role = random.choice(SUB_ROLES.get(pos, ["기본"]))
+                # [2026-09 신설] roll_potential_ovr 정의부 주석 참고 — 이
+                # 분기는 항상 star_kind_by_slot[idx]가 정의된 스타 슬롯이다.
+                # [2026-09 버그수정, 헤드리스 스모크테스트로 발견: "생성
+                # 직후인데 벌써 potential_ovr보다 ovr이 높은 선수가
+                # 23만+명"] potential_ovr은 target_ovr(기존 곡선)과 완전히
+                # 독립적으로 굴리므로, 우연히 potential보다 이미 높은 ovr로
+                # 태어날 수 있다(특히 이 분기처럼 ovr 자체가 높게 잡히는
+                # 스타 슬롯에서 흔함) — "잠재력이 지금 실력보다 낮다"는
+                # 모순이므로, 최소한 지금 ovr만큼은 항상 보장한다.
+                potential_ovr = max(ovr, roll_potential_ovr(_team_growth_cap, star_kind_by_slot[idx]))
                 # [2026-09 재배치] nationality는 이제 루프 맨 위에서 이미
                 # 정해져 있다(_is_foreign_slot 정의부 주석 참고) — 여기서
                 # 다시 뽑으면 같은 슬롯에 난수를 두 번 소비하고 결과가
@@ -7717,7 +7955,8 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
                      stats["shooting"],stats["passing"],stats["dribbling"],
                      stats["tackling"],stats["heading"],stats["positioning"],
                      stats["setpiece"],stats["mental"],stats["confidence"],
-                     stats["leadership"],stats["concentration"],ovr,age,sub_role,nationality))
+                     stats["leadership"],stats["concentration"],ovr,age,sub_role,nationality,
+                     potential_ovr))
                 continue
             _young_rng = get_ovr_range(grade, tier, team.get("cname", ""))
             if _young_rng:
@@ -7766,6 +8005,13 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
             ovr = calc_ovr(pos, stats)
         # [세부역할 2026-07] 포지션에 맞는 SUB_ROLES 중 하나를 무작위 배정.
         sub_role = random.choice(SUB_ROLES.get(pos, ["기본"]))
+        # [2026-09 신설] roll_potential_ovr 정의부 주석 참고 — 스타 슬롯이면
+        # 그 kind, 아니면(벤치 포함) None(일반, 와일드카드 확률 포함).
+        # [2026-09 버그수정] 위 (idx in star_kind_by_slot) 분기와 동일한
+        # 이유로 max(ovr, ...) 클램프 — "잠재력이 지금 실력보다 낮다"는
+        # 모순을 막는다(어린 선수는 나이 스케일링으로 ovr이 이미 낮아서
+        # 이 클램프가 거의 안 걸린다 — 주로 성인 선수에서만 의미 있음).
+        potential_ovr = max(ovr, roll_potential_ovr(_team_growth_cap, star_kind_by_slot.get(idx)))
         # [2026-09 재배치] nationality는 루프 맨 위에서 이미 정해져 있다
         # (_is_foreign_slot 정의부 주석 참고) — 그대로 재사용.
         _rows.append((team["tid"],name,pos,
@@ -7773,7 +8019,8 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
              stats["shooting"],stats["passing"],stats["dribbling"],
              stats["tackling"],stats["heading"],stats["positioning"],
              stats["setpiece"],stats["mental"],stats["confidence"],
-             stats["leadership"],stats["concentration"],ovr,age,sub_role,nationality))
+             stats["leadership"],stats["concentration"],ovr,age,sub_role,nationality,
+             potential_ovr))
 
         # [2026-09 신설] 위 _peak_seed_candidates 정의부 주석 참고 —
         # 상위권(스타 또는 비스타 상위 랭크, role_indices[idx]<=4) 슬롯이
@@ -7797,8 +8044,9 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
     c.executemany("""INSERT INTO ai_players
         (team_id,name,position,stamina,speed,jump,strength,shooting,passing,
          dribbling,tackling,heading,positioning,setpiece,
-         mental,confidence,leadership,concentration,ovr,age,sub_role,nationality)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", _rows)
+         mental,confidence,leadership,concentration,ovr,age,sub_role,nationality,
+         potential_ovr)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", _rows)
     # [2026-09 버그수정, 신민용 리포트: "첫 입단인데 계약년도만 뜨고
     # 계약기간이 안 뜬다 — 84억(계약년도:2000) 말고 84억(계약:5년)로
     # 떠야지"] ai_lifecycle.py의 신인생성 3곳(은퇴대체/스쿼드보충 등)은

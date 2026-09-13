@@ -411,28 +411,77 @@ _ROLE_TIER_WEIGHTS = [("주전", 40), ("로테이션", 30), ("대기", 25), ("�
 _ROLE_YOUNG_MAX_AGE = 19
 
 
-def compute_squad_roles(pool):
-    """pool: [(id, ovr, age), ...] — 한 팀 로스터 전체(주전+후보 다 포함,
-    보통 22~25명). 반환: {id: role_label}. O(n log n)이며 n이 스쿼드
-    크기(수십 명) 수준이라 팀 하나당 사실상 즉시 끝난다."""
-    n = len(pool)
-    if n == 0:
+# [2026-09 재설계, 신민용 리포트: "인테르 밀란이 GK 96/89 둘 다 있는데
+# 공격/미드필더에 90대가 몰려서 스쿼드 전체 OVR 등수로는 GK가 '주전'
+# 컷(상위 ~36.4%=40/110)에 아예 못 든다"] 예전 compute_squad_roles는
+# 포지션 구분 없이 스쿼드 전체를 OVR 하나로 줄세워 등수만 봤다 — 그런데
+# 실제 베스트11 슬롯 배정(_greedy_fill_slots)은 포지션을 정확히 지키므로
+# "실제로 그 자리에서 뛰는 선수"와 "주전이라고 표시되는 선수"가 어긋날
+# 수 있었다. 포지션별 인원이 적을수록(GK가 최소 보장 2명이라 가장 취약)
+# 그리고 다른 포지션에 고OVR 선수가 몰릴수록 더 쉽게 어긋난다.
+#
+# 이제 "주전" 여부는 percentile을 계산하지 않고 started_ids(그 호출부가
+# 이미 _greedy_fill_slots로 구해둔 실제 슬롯 배정 결과)를 그대로 따른다
+# — 정의상 100% 정확하고 별도 계산도 필요 없다. 나머지(로테이션/대기/
+# 유망주/전력외) 등급만 포지션 카테고리(GK/DEF/MID/ATK, 이 파일의
+# _pos_category와 동일 기준)로 나눠 그 그룹 안에서만 계산한다 — 그래야
+# GK 백업이 미드필더/공격수 뎁스와 뒤섞여 손해보지 않는다. 그룹 인원이
+# 적어(예: GK 백업 1~2명) percentile 자체가 무의미해지는 구간은 OVR
+# 내림차순 등수를 그대로 티어에 매핑한다(1등=로테이션, 2등=대기, 이후는
+# 전부 대기/유망주·전력외) — "GK 2명은 굳이 비율 계산하면 안 된다"는
+# 지적을 그대로 반영.
+#
+# started_ids를 아직 못 구한 소규모 호출부(예: 시즌 중 이적 로그용
+# "나가기 직전 역할" 계산 — 그 시점엔 formation/슬롯 배정을 다시 하지
+# 않음)를 위해, started_ids를 안 넘기면 "주전" 등급까지 포함해 카테고리별
+# percentile(기존 전체 비중 40/30/25/15)로 추정하는 폴백을 유지한다 —
+# 이 폴백도 최소한 카테고리 간 OVR 크로스 오염(스쿼드 전체 대비 GK 등수)은
+# 없앤다.
+def compute_squad_roles(pool, started_ids=None):
+    """pool: [(id, position, ovr, age), ...] — 한 팀 로스터 전체(주전+후보
+    다 포함, 보통 22~25명). started_ids: 그 팀 베스트11 실제 슬롯 배정
+    결과(_greedy_fill_slots)에서 뽑은 선수 id 집합 — 있으면 그 안의
+    선수는 무조건 "주전"으로 확정한다. 반환: {id: role_label}."""
+    if not pool:
         return {}
-    ordered = sorted(pool, key=lambda t: -(t[1] or 0))
-    total_w = sum(w for _label, w in _ROLE_TIER_WEIGHTS)
+    by_cat = {}
+    for pid, pos, ovr, age in pool:
+        by_cat.setdefault(_pos_category(pos or ""), []).append((pid, ovr, age))
+
     result = {}
-    for idx, (pid, _ovr, age) in enumerate(ordered):
-        frac = (idx + 1) / n
-        running = 0
-        role = _ROLE_TIER_WEIGHTS[-1][0]
-        for label, w in _ROLE_TIER_WEIGHTS:
-            running += w
-            if frac <= running / total_w:
-                role = label
-                break
-        if role == "유망주" and not (age is not None and age <= _ROLE_YOUNG_MAX_AGE):
-            role = "전력외"
-        result[pid] = role
+    if started_ids:
+        for pid in started_ids:
+            result[pid] = "주전"
+
+    def _assign(members, weights):
+        total_w = sum(w for _label, w in weights)
+        ordered = sorted(members, key=lambda t: -(t[1] or 0))
+        n = len(ordered)
+        for idx, (pid, _ovr, age) in enumerate(ordered):
+            if n <= len(weights):
+                # 인원이 적어 percentile이 의미 없는 구간 — 등수를 그대로
+                # 티어에 매핑한다(1등=weights[0], 2등=weights[1], ...
+                # 인원이 티어 수보다 적으면 마지막 남는 등수는 최하위 티어로).
+                label = weights[min(idx, len(weights) - 1)][0]
+            else:
+                frac = (idx + 1) / n
+                running = 0
+                label = weights[-1][0]
+                for lb, w in weights:
+                    running += w
+                    if frac <= running / total_w:
+                        label = lb
+                        break
+            if label == "유망주" and not (age is not None and age <= _ROLE_YOUNG_MAX_AGE):
+                label = "전력외"
+            result[pid] = label
+
+    for _cat, members in by_cat.items():
+        if started_ids:
+            rest = [(pid, ovr, age) for pid, ovr, age in members if pid not in started_ids]
+            _assign(rest, _ROLE_TIER_WEIGHTS[1:])
+        else:
+            _assign(members, _ROLE_TIER_WEIGHTS)
     return result
 
 

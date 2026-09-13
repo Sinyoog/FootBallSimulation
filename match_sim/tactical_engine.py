@@ -37,6 +37,38 @@ import random
 
 LANES = ("L", "C", "R")
 
+# [2026-09 신설, 신민용+GPT 설계: "72→75보다 82→85가, 그보다 92→95가,
+# 92→95보다 95→97이 더 크게 벌어져야 한다"] raw stat(0~99)을 "실질
+# 영향력 값"으로 바꾸는 공통 비선형 변환 — 모든 공격/수비/미드필드/GK/
+# 슈팅 계산이 이 함수 하나만 거치게 통일한다(개별 함수마다 따로 만들면
+# 나중에 한쪽만 고쳐서 어긋나는 사고가 난다). 80 이하는 기울기 1.00(=
+# 항등함수)이라 기존 보정 상수(사igmoid 나눗셈 값 등)와의 하위호환이
+# 그대로 유지된다 — 대다수 선수(80 이하)는 이 변환을 넣기 전과 결과가
+# 똑같고, 오직 80+ 구간에서만 격차가 벌어진다.
+# [2026-09, 신민용+GPT 확정] 99+("신급") 기울기 3.80은 1차 실험값 — 극단
+# 매치업(90 vs 95/99/102) 헤드리스 검증 후 확정 예정.
+_STAT_VALUE_BREAKPOINTS = (
+    (0,  80, 1.00),
+    (80, 90, 1.25),
+    (90, 95, 1.70),
+    (95, 99, 2.80),
+    (99, 999, 3.80),
+)
+
+
+def effective_stat(raw):
+    """raw stat(0~99, 드물게 99+ '신급')을 실질 영향력 값으로 변환.
+    _STAT_VALUE_BREAKPOINTS 정의부 주석 참고."""
+    if raw is None:
+        raw = 50
+    value = 0.0
+    for lo, hi, slope in _STAT_VALUE_BREAKPOINTS:
+        if raw <= lo:
+            break
+        seg = min(raw, hi) - lo
+        value += seg * slope
+    return value
+
 # 포지션 라벨 -> 기준 좌표. x: 0(자기 골문)~1(상대 골문), y: 0(왼쪽)~1(오른쪽).
 # match_sim_viewer._POS_XY와 같은 세계관을 공유하되(같은 좌표계 감각), 이
 # 모듈은 UI 레이어에 의존하면 안 되므로 별도로 갖고 있는 값이다.
@@ -131,14 +163,22 @@ def _avg(vals, default=50.0):
     return sum(vals) / len(vals) if vals else default
 
 
+def _player_attack_value(p):
+    return (p.get("shooting", 50) * 0.35 + p.get("dribbling", 50) * 0.30
+            + p.get("passing", 50) * 0.35)
+
+
+def _player_defense_value(p):
+    return (p.get("tackling", 50) * 0.45 + p.get("positioning", 50) * 0.35
+            + p.get("strength", 50) * 0.20)
+
+
 def _attack_quality(players):
-    return _avg((p.get("shooting", 50) * 0.35 + p.get("dribbling", 50) * 0.30
-                 + p.get("passing", 50) * 0.35) for p in players)
+    return _avg(_player_attack_value(p) for p in players)
 
 
 def _defense_quality(players):
-    return _avg((p.get("tackling", 50) * 0.45 + p.get("positioning", 50) * 0.35
-                 + p.get("strength", 50) * 0.20) for p in players)
+    return _avg(_player_defense_value(p) for p in players)
 
 
 def _midfield_quality(players):
@@ -147,7 +187,77 @@ def _midfield_quality(players):
                 for p in players)
 
 
+# [2026-09 신설, 신민용+GPT 설계: "포메이션을 11명의 배치로만 보지 말고
+# 팀 능력이 어느 방향(레인)으로 분배되는지를 보라"] 포지션별로 L/C/R
+# 공격·수비 레인에 얼마나 기여하는지 — 공격 기여와 수비 기여를 분리한다
+# (예: LW는 공격은 L에 강하게 기여하지만 수비는 L을 LB만큼 책임지지
+# 않는다). 1차 구현값이라 정확한 숫자는 헤드리스 검증 후 조정 대상.
+# att[ln]/dfn[ln] 계산 시 가중평균(weighted_sum/total_weight)으로 정규화
+# 하므로, 특정 레인에 선수가 몇 명 배치되든 "그 레인 평균 기여도"만
+# 반영되고 인원수 자체가 무한 보너스가 되지는 않는다 — 포메이션 차이는
+# "누가 그 레인에 얼마나 기여하는가"의 가중치 분포 변화로만 나타난다.
+ATT_LANE_AFFINITY = {
+    "LW":  {"L": 1.00, "C": 0.10, "R": 0.00},
+    "RW":  {"L": 0.00, "C": 0.10, "R": 1.00},
+    "ST":  {"L": 0.10, "C": 1.00, "R": 0.10},
+    "CF":  {"L": 0.10, "C": 1.00, "R": 0.10},
+    "CAM": {"L": 0.15, "C": 1.00, "R": 0.15},
+    "LM":  {"L": 0.75, "C": 0.30, "R": 0.00},
+    "RM":  {"L": 0.00, "C": 0.30, "R": 0.75},
+    "CM":  {"L": 0.15, "C": 0.70, "R": 0.15},
+    "CDM": {"L": 0.05, "C": 0.85, "R": 0.05},
+    "LB":  {"L": 0.45, "C": 0.10, "R": 0.00},
+    "RB":  {"L": 0.00, "C": 0.10, "R": 0.45},
+    "LWB": {"L": 0.75, "C": 0.15, "R": 0.00},
+    "RWB": {"L": 0.00, "C": 0.15, "R": 0.75},
+    "CB":  {"L": 0.05, "C": 0.55, "R": 0.05},
+    "GK":  {"L": 0.00, "C": 0.00, "R": 0.00},
+}
+
+DEF_LANE_AFFINITY = {
+    "LB":  {"L": 1.00, "C": 0.10, "R": 0.00},
+    "RB":  {"L": 0.00, "C": 0.10, "R": 1.00},
+    "LWB": {"L": 0.90, "C": 0.15, "R": 0.00},
+    "RWB": {"L": 0.00, "C": 0.15, "R": 0.90},
+    "CB":  {"L": 0.15, "C": 1.00, "R": 0.15},
+    "CDM": {"L": 0.10, "C": 0.75, "R": 0.10},
+    "CM":  {"L": 0.15, "C": 0.55, "R": 0.15},
+    "LM":  {"L": 0.55, "C": 0.25, "R": 0.00},
+    "RM":  {"L": 0.00, "C": 0.25, "R": 0.55},
+    "CAM": {"L": 0.05, "C": 0.25, "R": 0.05},
+    "LW":  {"L": 0.20, "C": 0.05, "R": 0.00},
+    "RW":  {"L": 0.00, "C": 0.05, "R": 0.20},
+    "ST":  {"L": 0.02, "C": 0.10, "R": 0.02},
+    "CF":  {"L": 0.02, "C": 0.10, "R": 0.02},
+    "GK":  {"L": 0.00, "C": 0.00, "R": 0.00},
+}
+
+
+def _lane_quality(zoned, ln, affinity_table, value_fn):
+    """affinity_table(포지션→레인 기여도)로 가중평균한 그 레인의 실질
+    퀄리티. affinity가 0인 선수는 그 레인 계산에서 완전히 빠진다(가중치
+    0). 분모(total_w)로 나누는 가중평균이라 그 레인에 선수가 많다고
+    무조건 값이 커지지 않는다 — 포메이션 차이는 "누가 얼마나 기여하는가"
+    분포로만 나타난다."""
+    total_w = 0.0
+    total_val = 0.0
+    for z in zoned:
+        aff = affinity_table.get(z["pos"], {}).get(ln, 0.0)
+        if aff <= 0:
+            continue
+        total_val += value_fn(z["player"]) * aff
+        total_w += aff
+    return total_val / total_w if total_w > 0 else 50.0
+
+
 def _gk_quality(gk):
+    # [2026-09, 신민용+GPT 설계: "증폭이 여러 단계에 중복 적용되면 안 된다"]
+    # 이 함수의 결과는 (a) home.gk_q(현재는 boost 분배에만 쓰임 — 경기
+    # 결과에 미치는 영향이 미미함)와 (b) _resolve_shot의 opp_gk_q(슈터와
+    # 직접 맞대결하는 "결정력의 순간") 두 곳에 쓰인다. 비선형 변환은
+    # (b) 목적에 맞춘 것이므로, 여기서는 원래 raw stat을 그대로 반환하고
+    # _resolve_shot 쪽에서 opp_gk_q에 effective_stat()을 그 자리에서
+    # 적용한다(중복 적용 방지 — 아래 _resolve_shot 주석 참고).
     if not gk:
         return 50.0
     return (gk.get("positioning", 50) * 0.5 + gk.get("concentration", 50) * 0.3
@@ -200,11 +310,15 @@ class _TeamModel:
         w = _boost_weights_for(boost_position) if boost else _DEFAULT_BOOST_WEIGHTS
         self.att = {}
         self.dfn = {}
+        # [2026-09 신설, ATT_LANE_AFFINITY/DEF_LANE_AFFINITY 정의부 주석
+        # 참고] 예전엔 lane+third로 하드 배정된 선수들만 평균냈다(예:
+        # LW는 항상 L-ATT에만 잡히고 수비 계산엔 전혀 안 들어감) — 이제
+        # 전체 11명을 대상으로 포지션별 레인 기여도(affinity)로 가중평균
+        # 한다. third(DEF/MID/ATT) 하드 배정은 슈터 후보 풀 선정(third==
+        # "ATT")에는 그대로 쓰이므로 _assign_zones 자체는 안 바꾼다.
         for ln in LANES:
-            att_players = [z["player"] for z in zoned if z["lane"] == ln and z["third"] == "ATT"]
-            def_players = [z["player"] for z in zoned if z["lane"] == ln and z["third"] == "DEF"]
-            self.att[ln] = _attack_quality(att_players) + boost * w["att"]
-            self.dfn[ln] = _defense_quality(def_players) + boost * w["dfn"]
+            self.att[ln] = _lane_quality(zoned, ln, ATT_LANE_AFFINITY, _player_attack_value) + boost * w["att"]
+            self.dfn[ln] = _lane_quality(zoned, ln, DEF_LANE_AFFINITY, _player_defense_value) + boost * w["dfn"]
         mid_players = [z["player"] for z in zoned if z["third"] == "MID"]
         self.mid = _midfield_quality(mid_players) + boost * w["mid"]
         self.gk_q = _gk_quality(self.gk) + boost * w["gk"]
@@ -283,16 +397,28 @@ def _resolve_shot(rng, side, lane, minute, shooter_pool, opp_gk, opp_gk_q,
     detail["box_entries"] += 1
 
     if shooter_pool:
-        weights = [max(1.0, p.get("shooting", 50)) for p in shooter_pool]
+        weights = [max(1.0, effective_stat(p.get("shooting", 50))) for p in shooter_pool]
         shooter = rng.choices(shooter_pool, weights=weights, k=1)[0]
     else:
         shooter = None
-    shot_stat = shooter.get("shooting", 50) if shooter else 50
+    shot_stat = effective_stat(shooter.get("shooting", 50)) if shooter else effective_stat(50)
     if shooter is not None:
         _pstat(my_pstats, shooter)["shots"] += 1
 
-    on_target_p = max(0.15, min(0.78, 0.30 + (shot_stat - 50) / 150.0))
-    save_p = max(0.08, min(0.90, 0.63 + (opp_gk_q - shot_stat) / 120.0))
+    # [2026-09, 신민용+GPT 설계: "증폭은 한 지점에서만"] opp_gk_q는
+    # _gk_quality()가 raw로 넘겨준 값 — 슈터와 정확히 같은 "결정력의 순간"
+    # 비교이므로 여기서 딱 한 번만 effective_stat을 적용한다(호출부인
+    # _TeamModel.gk_q 자체는 raw로 남겨 boost 분배 등 다른 용도에 중복
+    # 증폭이 새지 않게 한다).
+    eff_gk_q = effective_stat(opp_gk_q)
+    # [2026-09 재조정, 위 lane quality /24.0과 동일한 실측 근거] 150/120도
+    # 같은 이유로 과민했다 — effective_stat 변환(80+ 구간에서 값이 커짐)이
+    # 여기 들어오면서 기존 나눗값 그대로 두면 이중으로 민감해진다. 240/210
+    # 으로 넓혀서 "결정력 격차가 큰 의미를 갖되, 경기가 사실상 결정론이
+    # 되지는 않는" 지점을 실측으로 찾았다(90 vs 105 극단 매치업에서도
+    # 원정 100% 승리는 아님, 85+스타1명 캐리 시나리오도 검증됨).
+    on_target_p = max(0.15, min(0.78, 0.30 + (shot_stat - 50) / 240.0))
+    save_p = max(0.08, min(0.90, 0.63 + (eff_gk_q - shot_stat) / 210.0))
     shot_xg = round(on_target_p * (1.0 - save_p), 4)
     detail["xg"] += shot_xg
     is_big_chance = shot_xg >= 0.35
@@ -559,10 +685,26 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
     # 그대로라 시드 고정 시 결과는 동일하다(순수 캐싱, 로직 변경 없음).
     p_home_poss = _sigmoid((home_mid_total - away_mid_total) / 16.0)
 
-    def _prep_side(atk, dfn_opp, zoned_atk):
+    def _prep_side(atk, dfn_opp, zoned_atk, mid_edge):
         lane_scores = {ln: max(1.0, atk.att[ln] - dfn_opp.dfn[ln] + 50.0) for ln in LANES}
         lanes, weights = zip(*lane_scores.items())
-        quality_by_lane = {ln: _sigmoid((atk.att[ln] - dfn_opp.dfn[ln]) / 11.0) for ln in LANES}
+        # [2026-09 버그수정, 신민용+GPT 실측: "90 vs 99(9점 차)만 돼도
+        # 변환 없이도 원정승 82%·평균 4골 실점 — 극단 매치업이 이미
+        # 결정론적"] /11.0은 raw stat 차이만으로도 이미 과민했다. effective_
+        # stat 변환(아래 _resolve_shot의 결정력 지점)과는 별개 문제 — 이
+        # 레인 퀄리티는 "기회 빈도"를 정하는 곳이라 raw stat을 그대로 쓰되
+        # (증폭은 결정력 지점 한 곳에만 몰아준다는 원칙, effective_stat
+        # 정의부 주석 참고) 나눗값만 24.0으로 넓혀 민감도를 낮췄다 — 실측
+        # 검증(90/95/99/102/105 극단 매치업, 85+스타1명 캐리 시나리오)
+        # 완료.
+        # [2026-09 신설, 신민용+GPT 설계: "미드필드가 점유율만 만들고
+        # 기회 품질엔 안 들어간다"] mid_edge(이 팀 미드필드 - 상대 미드필드)
+        # 를 아주 작은 계수(0.15)로만 diff에 더한다 — "미드필드+10 →
+        # 슈팅확률+30%" 같은 직접 보정은 피하고, 이미 있는 공격/수비 퀄리티
+        # 격차 위에 미드필드 우위만큼만 살짝 얹는다(점유율 배분과는 별개
+        # 경로 — 점유율은 위 p_home_poss가 이미 담당).
+        quality_by_lane = {ln: _sigmoid((atk.att[ln] - dfn_opp.dfn[ln] + mid_edge * 0.15) / 24.0)
+                           for ln in LANES}
         att_pool_all = [z["player"] for z in zoned_atk if z["third"] == "ATT"]
         pool_by_lane = {}
         for ln in LANES:
@@ -571,9 +713,9 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
         return lanes, weights, quality_by_lane, pool_by_lane
 
     home_lanes, home_weights, home_quality_by_lane, home_pool_by_lane = \
-        _prep_side(home, away, home_zoned)
+        _prep_side(home, away, home_zoned, home_mid_total - away_mid_total)
     away_lanes, away_weights, away_quality_by_lane, away_pool_by_lane = \
-        _prep_side(away, home, away_zoned)
+        _prep_side(away, home, away_zoned, away_mid_total - home_mid_total)
 
     for minute in range(1, total_minutes + 1):
         poss_home = rng.random() < p_home_poss

@@ -430,7 +430,8 @@ def search_retired_ai_players(name_query=None, continent=None, nat_country_id=No
                                 natteam=False, natteam_year=None, team_id=None,
                                 country_id=None, league_id=None, team_mode="current",
                                 name_mode="all", custom_named_only=False,
-                                min_career_years=None, max_career_years=None):
+                                min_career_years=None, max_career_years=None,
+                                foreign_only=False):
     """[2026-08 신설/수정, 신민용 요청: "은퇴한 선수도 차후 검색할 수
     있어야 해" / "필터에 현역·은퇴 버튼"] ai_players_retired(은퇴 스냅샷
     아카이브)에서 검색한다. 등급/부수 필터는 은퇴 선수엔 저장돼 있지 않아
@@ -467,6 +468,9 @@ def search_retired_ai_players(name_query=None, continent=None, nat_country_id=No
          "cust.custom_name as custom_name "
          "FROM ai_players_retired r "
          "LEFT JOIN countries nc ON nc.name = r.nationality "
+         "LEFT JOIN teams lt ON lt.id = r.last_team_id "
+         "LEFT JOIN leagues ll ON ll.id = lt.league_id "
+         "LEFT JOIN countries lc ON lc.id = ll.country_id "
          "LEFT JOIN ai_player_custom_names cust ON cust.player_id = r.id "
          "WHERE 1=1")
     params = []
@@ -475,6 +479,13 @@ def search_retired_ai_players(name_query=None, continent=None, nat_country_id=No
     else:
         if continent:
             q += " AND nc.continent=?"; params.append(continent)
+        # [2026-09 신설, 신민용 요청: "국가(소속리그) 상자에 외국인 표시
+        # on/off"] search_ai_players(현역)와 동일한 원칙 — 국적이 마지막
+        # 소속팀 리그의 국가명과 다른 선수만 남긴다. 은퇴 선수는
+        # last_team_id가 "은퇴 직전 마지막 소속팀"이라 그 팀의 리그
+        # 국가를 기준으로 판정한다.
+        if foreign_only:
+            q += " AND (r.nationality IS NULL OR lc.name IS NULL OR r.nationality != lc.name)"
         if nat_country_id:
             nat_row = conn.execute("SELECT name FROM countries WHERE id=?", (nat_country_id,)).fetchone()
             if not nat_row:
@@ -597,7 +608,8 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
                        grade=None, tier=None, position=None, min_age=None, max_age=None,
                        status="active", limit=200, natteam=False, natteam_year=None,
                        team_id=None, team_mode="current", league_id=None, name_mode="all",
-                       custom_named_only=False, min_career_years=None, max_career_years=None):
+                       custom_named_only=False, min_career_years=None, max_career_years=None,
+                       foreign_only=False):
     """[2026-08 수정, 신민용 요청: "국가와 국적을 나눠야 한다, 대륙은
     국적과 연관되어 있게"] 대륙(continent)/국적(nat_country_id)은 이제
     선수의 실제 국적(ai_players.nationality) 기준이고, 국가(country_id)는
@@ -648,6 +660,14 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
     지정한 이름이 있는 경우)만 남는다. my_player는 이 방식으로 이름을
     지어준 적이 없으므로(rename은 AI 전용) 이 필터가 켜지면 결과에서
     자동으로 빠진다.
+    [2026-09 신설, 신민용 요청: "국가(소속리그) 상자 안에 외국인 표시
+    on/off를 만들어달라 — 켜면 그 국적이 아니면서 그 리그에서 뛰는
+    선수들을 볼 수 있게"] foreign_only=True면 국적(p.nationality)이
+    현재 소속팀 리그의 국가명(cn.name)과 다른 선수만 남긴다 —
+    country_id를 같이 지정하면 "그 나라 리그에서 뛰는 외국인"이 되고,
+    country_id 없이 이것만 켜면 "자국 리그가 아닌 곳에서 뛰는 선수
+    전원"이 된다. nat_country_id(국적 필터)와는 독립적 — 둘 다 걸면
+    AND로 같이 적용된다.
     """
     from constants import get_league_grade, ai_player_code
     conn = get_conn()
@@ -659,7 +679,8 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
             natteam=natteam, natteam_year=natteam_year, team_id=team_id,
             country_id=country_id, league_id=league_id, team_mode=team_mode,
             name_mode=name_mode, custom_named_only=custom_named_only,
-            min_career_years=min_career_years, max_career_years=max_career_years)
+            min_career_years=min_career_years, max_career_years=max_career_years,
+            foreign_only=foreign_only)
         conn.close()
         return rows
 
@@ -741,6 +762,13 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
             return []
     if country_id:
         q += " AND cn.id=?"; params.append(country_id)
+    # [2026-09 신설, 신민용 요청: "국가(소속리그) 상자에 외국인 표시
+    # on/off"] 국적(p.nationality)이 지금 뛰는 리그의 국가명(cn.name)과
+    # 다른 선수만 남긴다 — country_id로 리그 국가를 좁혔으면 "그 나라
+    # 안의 외국인 용병", 안 좁혔으면 "자국 리그가 아닌 곳에서 뛰는 선수
+    # 전원"이 된다.
+    if foreign_only:
+        q += " AND (p.nationality IS NULL OR p.nationality != cn.name)"
     # [2026-08 신설, 신민용 리포트 대응] "국가(소속리그)→리그→팀" 3단계
     # 필터 중 리그 단계는 예전엔 실제로 SQL에 걸리지 않았다(팀까지 구체
     # 적으로 골라야만 team_id로 필터됨) — 국가는 위 cn.id=?로 이미
@@ -1546,6 +1574,45 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
                 _assign_salary_fields(_half_e, from_tid, y,
                                        is_loan_default=False,
                                        strict_before=bool(y in mid_by_year))
+                # [2026-09 신설, 신민용 요청: "챔스/유로파/컨퍼런스는
+                # 상반기에 끝나니까 상반기 줄에 기록돼야 한다 — 3부/4부
+                # 컵대회는 하반기에 하니 하반기가 맞고, 전체 국내컵(1·2부)
+                # 은 시즌 내내 진행되니 이건 건드리지 않는다"] 이미 "내
+                # 선수" 쪽(get_my_player_career_history)엔 이 로직이 있고
+                # AI 쪽엔 없었다(둘이 쌍둥이 함수인데 한쪽만 고쳐진 채로
+                # 남아있던 경우 — 이 파일에서 반복적으로 나온 패턴과 동일).
+                # cl_kind가 champions/europa/conference(=챔스/유로파/
+                # 컨퍼런스)일 때만 상반기 줄로 옮긴다 — lower_cup(3·4부
+                # 국내컵)은 원래도 하반기에 진행되므로 그대로 두고, 일반
+                # 국내컵(cup 필드)도 이번 수정 대상에서 제외한다(시즌
+                # 내내 진행돼 한쪽 반기로 깔끔하게 못 자름 — 신민용 확인).
+                _half_team_hist = _hist_for(from_tid)
+                _half_src = next((h for h in _half_team_hist["years"] if h["year"] == y), None)
+                if _half_src and _half_src.get("cl_kind") in ("champions", "europa", "conference"):
+                    for _k in ("cl", "cl_record", "cl_champion", "cl_kind"):
+                        _half_e[_k] = _half_src.get(_k)
+                # [2026-09 버그수정, 신민용 리포트: "레알 마드리드로 겨울
+                # 이적한 선수 메인 줄에 레알 마드리드 자체의 챔스 기록
+                # ([플레이오프 탈락])이 붙어 나온다 — 실제로 그 선수는
+                # 챔스가 이미 끝난 뒤(챔스는 상반기에 끝남)에야 레알로
+                # 옮겼으니 그 경기를 하나도 못 뛰었는데도"] 팀 자체가
+                # 실제로 바뀐 해(mid_by_year)는, 새 팀(메인 줄) 자신의
+                # 그 해 챔스/유로파/컨퍼런스 기록이라도 선수가 그 시점엔
+                # 아직 그 팀에 없었으므로 무조건 지운다 — 원 팀(상반기
+                # 줄, 바로 위에서 옮겨 붙임)에 그 대회 기록이 있었든
+                # 없었든 상관없이(원 팀도 그 대회에 안 나갔다면 상반기
+                # 줄도, 메인 줄도 둘 다 그 대회는 "-"가 맞다). 팀은 그대로
+                # 인데 역할만 바뀐 해(_role_diff_years)는 반대로, "같은
+                # 팀 같은 기록"이 상반기로 옮겨간 경우에만 메인 줄
+                # 중복을 지운다(그 팀 자체의 유일한 기록이므로).
+                if e.get("cl_kind") in ("champions", "europa", "conference"):
+                    if y in mid_by_year:
+                        e["cl"] = e["cl_record"] = e["cl_kind"] = None
+                        e["cl_champion"] = False
+                    elif (y in _role_diff_years and _half_src
+                          and _half_src.get("cl_kind") in ("champions", "europa", "conference")):
+                        e["cl"] = e["cl_record"] = e["cl_kind"] = None
+                        e["cl_champion"] = False
                 final_out.append(_half_e)
         out = final_out
     conn.close()
@@ -3735,7 +3802,7 @@ def get_player_awards_by_year(player_id):
         # [주의] 실제 저장되는 award_kind는 "발롱도르"와 "FIFA 푸스카스상"
         # (2009년 이전은 "올해의 최고의 골") — game_engine._save_ballon_
         # dor_top30/_process_goal_awards가 쓰는 문자열과 정확히 맞춘다.
-        if kind in ("발롱도르", "FIFA 푸스카스상", "올해의 최고의 골"):
+        if kind in ("발롱도르", "야신상", "FIFA 푸스카스상", "올해의 최고의 골"):
             label = f"{r['award_type']} {r['rank']}위"
         elif kind == "베스트11":
             label = f"{r['award_type']}" + (f" ({r['position']})" if r["position"] else "")

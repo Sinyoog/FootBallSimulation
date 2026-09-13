@@ -3588,7 +3588,7 @@ def generate_epilogue(player, seasons, has_trophy, awards, intl_trophies, rng):
     if awards:
         from constants import normalize_award_bucket
         cnt = Counter(normalize_award_bucket(a.get("award_type", "")) for a in awards)
-        order = ["발롱도르", "MVP", "득점왕", "도움왕", "베스트11", "골든글러브", "영플레이어",
+        order = ["발롱도르", "야신상", "MVP", "득점왕", "도움왕", "베스트11", "골든글러브", "영플레이어",
                  "올해의 수비수", "구단 올해의 선수",
                  "FIFA 푸스카스상", "대회 최고의 골", "리그 올해의 골"]
         parts = [f"{k} {cnt[k]}회" for k in order if cnt.get(k)]

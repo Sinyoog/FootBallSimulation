@@ -73,6 +73,11 @@ _league_ovr_cache: dict = {}
 _league_tier_cache: dict = {}
 # 팀 이름 캐시: teams.name 은 세션 내 불변. _write_match_log 등에서 매번 SELECT 방지.
 _team_name_cache: dict = {}
+# [2026-09 신설, "국가별 득점환경" 1단계] league_id -> constants.
+# get_country_goal_mult(그 리그 소속 국가) 배율 캐시. leagues.country_id는
+# 게임 중 바뀌지 않는 세션 상수라 _team_ovr_cache와 동일하게 전역 1회
+# 조회 후 메모이즈한다. _get_league_goal_mult() 참고.
+_league_goal_mult_cache: dict = {}
 
 def _invalidate_team_ovr_cache():
     """ai_players OVR/소속이 일괄 변경되는 경우(리맵·신규 시드·승강) 호출.
@@ -85,6 +90,8 @@ def _invalidate_team_ovr_cache():
     _league_tier_cache.clear()
     _team_formation_cache.clear()
     _team_formation_fit_cache.clear()
+    _league_goal_mult_cache.clear()
+    _team_trophy_grade_weight_cache.clear()
     # 승강으로 팀이 다른 리그로 이동해도 팀명은 안 바뀌므로 _team_name_cache는 비우지 않음
 
     # [2026-08 신설, 성능] 국내컵 엔진의 "나라·티어별 팀 목록"/cup_entries
@@ -2322,7 +2329,7 @@ def _sim_my_team_match_as_ai(week, p, season):
         return
     conn = get_conn()
     c = conn.cursor()
-    c.execute("""SELECT mr.id, mr.home_team_id, mr.away_team_id
+    c.execute("""SELECT mr.id, mr.home_team_id, mr.away_team_id, mr.league_id
                  FROM match_results mr
                  WHERE mr.week=? AND mr.season=? AND mr.home_score=-1
                    AND (mr.home_team_id=? OR mr.away_team_id=?)
@@ -2335,7 +2342,9 @@ def _sim_my_team_match_as_ai(week, p, season):
         diff = ho - ao
         outcome = _roll_outcome(diff)
         # [버그수정] diff를 _gen_score에 전달 — 이전엔 인자 누락으로 항상 박빙 취급됐음
-        hs, as_ = _gen_score(outcome, diff)
+        # [2026-09 신설, "국가별 득점환경" 1단계]
+        _goal_mult = _get_league_goal_mult(c, m["league_id"])
+        hs, as_ = _gen_score(outcome, diff, goal_mult=_goal_mult)
         _td = {}; _accum_team_rec(_td, hid, aid, outcome, hs, as_); _flush_team_rec(c, _td)
         # [2026-08 v3.2 신설] 내 팀도 다른 팀들과 동일하게 상대강도 누적.
         import power_ranking as _pr
@@ -2391,7 +2400,9 @@ def _sim_my_unscheduled_match(week: int, p, season: int, day=None):
         diff = ho - ao
         outcome = _roll_outcome(diff)
         # [버그수정] diff를 _gen_score에 전달
-        hs, as_ = _gen_score(outcome, diff)
+        # [2026-09 신설, "국가별 득점환경" 1단계]
+        _goal_mult = _get_league_goal_mult(c, lid)
+        hs, as_ = _gen_score(outcome, diff, goal_mult=_goal_mult)
         _td = {}; _accum_team_rec(_td, row["home_team_id"], row["away_team_id"], outcome, hs, as_); _flush_team_rec(c, _td)
         # [2026-08 v3.2 신설] 내 팀도 다른 팀들과 동일하게 상대강도 누적.
         import power_ranking as _pr
@@ -2467,7 +2478,10 @@ def _sim_all_ai_matches(week, my_league_id, season):
         diff = ho - ao
         outcome = _roll_outcome(diff)
         # [버그수정] diff를 _gen_score에 전달 — 전체 리그 경기의 90%+가 여길 거침
-        hs, as_ = _gen_score(outcome, diff)
+        # [2026-09 신설, "국가별 득점환경" 1단계] 이 경기가 속한 리그의
+        # 국가별 득점 배율을 매치 스코어 생성에 직접 반영.
+        _goal_mult = _get_league_goal_mult(c, m["league_id"])
+        hs, as_ = _gen_score(outcome, diff, goal_mult=_goal_mult)
         _accum_team_rec(team_deltas, m["home_team_id"], m["away_team_id"], outcome, hs, as_)
         _pr.record_league_opp_strength(
             opp_acc, m["home_team_id"], m["away_team_id"],
@@ -4550,7 +4564,65 @@ def _roll_card_events(p, field):
     return False, None, events, 1
 
 
-def _gen_score(outcome, diff=0.0):
+# [2026-09 신설, "득점환경 v1.0"] _gen_score()의 박빙(adv<15) 구간이
+# diff=0(t=0)~diff=15(t=1) 사이를 보간할 때 쓰는 두 끝점 분포. 실측
+# EPL 스프레드(평균 diff 3.33, 최댓값 10.97)로 200시즌 시뮬레이션해
+# 리그 전체 평균 1.17→1.47골/경기(목표 1.4~1.5)를 확인한 값 —
+# _gen_score() 안의 "득점환경 v1.0" 코멘트 참고.
+_GEN_SCORE_WLO  = [24, 38, 26, 9, 3]     # 승리팀, t=0(균형)
+_GEN_SCORE_WHI  = [8, 24, 34, 24, 10]    # 승리팀, t=1(박빙 최대 격차)
+_GEN_SCORE_LWLO = [42, 42, 16]           # 패배팀, t=0
+_GEN_SCORE_LWHI = [55, 35, 10]           # 패배팀, t=1
+
+
+def _stoch_round_goal(v):
+    """[2026-09 신설, "국가별 득점환경" 1단계 보정] 확률적 반올림 —
+    v(골 수 × goal_mult, 실수)를 정수로 만들 때 그냥 round()를 쓰면
+    낮은 배율(예: 대한민국 0.74)에서 원래 1~2골처럼 작은 정수는 대부분
+    "그대로"(예: 1×0.74=0.74→round=1) 남고 4골 이상 같은 큰 값만
+    실제로 줄어들어, 다득점이 흔한 "박빙" 구간 특성상 평균이 의도한
+    배율보다 훨씬 덜(또는 배율>1일 땐 덜 늘어나게) 스케일되는 체계적
+    편향이 생긴다(실측: round() 방식은 대한민국 목표 배율 0.739인데
+    실제 평균은 0.649배로 나옴). 대신 소수부를 그 확률만큼 반올림
+    (예: 1.7 → 70% 확률로 2, 30% 확률로 1)하면 개별 경기는 여전히
+    정수 골이면서 기댓값은 v와 정확히 일치해, 많은 경기에 걸쳐 평균이
+    goal_mult 그대로 수렴한다(재검증: 0.739 배율 실측 0.731배로 정합)."""
+    lo = int(v)
+    frac = v - lo
+    return lo + (1 if random.random() < frac else 0)
+
+
+def _get_league_goal_mult(c, league_id):
+    """[2026-09 신설, "국가별 득점환경" 1단계, 신민용 리포트: "득점환경
+    v1.0 적용 후 대한민국 득점왕이 30골이 나온다 — 목표는 17골 안팎"]
+    league_id -> constants.get_country_goal_mult(그 리그 소속 국가) 배율.
+
+    기존 COUNTRY_GOAL_ENV_MULT/get_goal_env_mult는 _estimate_ai_season의
+    "개인별 추정치"에만 곱해지는데, 국내 리그 실제 기록은 그 추정치를
+    다시 그 팀의 진짜 시즌 골 합계(teams.goals_for)에 맞춰 재분배한다
+    (_apply_team_goal_budget) — 국가 배율이 한 나라 선수 전원에게
+    균일하게 곱해지므로 팀 내 상대 비중은 그대로라, 이 재분배 과정에서
+    사실상 지워졌다. 실제 골 합계를 만드는 _gen_score(outcome, diff)는
+    diff(팀간 OVR차)만 볼 뿐 국가를 모르므로, 이 배율을 아예 _gen_score
+    호출 시점에 넘겨 매치 스코어 자체를 국가별로 다르게 생성한다 —
+    이러면 teams.goals_for 자체가 국가마다 달라지므로 재분배를 거쳐도
+    지워지지 않는다.
+
+    leagues.country_id는 게임 중 바뀌지 않는 세션 상수라 전역 1회
+    조회(모든 리그를 한 번에) 후 _league_goal_mult_cache에 메모이즈—
+    _team_ovr_cache와 동일한 관례(리맵 시 _invalidate_team_ovr_cache가
+    같이 비움)."""
+    if not _league_goal_mult_cache:
+        from constants import get_country_goal_mult
+        rows = c.execute(
+            """SELECT l.id AS lid, cn.name AS country FROM leagues l
+               JOIN countries cn ON l.country_id = cn.id""").fetchall()
+        for r in rows:
+            _league_goal_mult_cache[r["lid"]] = get_country_goal_mult(r["country"])
+    return _league_goal_mult_cache.get(league_id, 1.0)
+
+
+def _gen_score(outcome, diff=0.0, goal_mult=1.0):
     """경기 스코어 생성. diff(홈-원정 전력차)가 클수록 이긴 쪽이 크게 이긴다.
     diff는 _simulate_match 에서 계산된 home_ovr-away_ovr (홈 보정 포함).
       - |diff| 0~15   → 박빙/우세: 이겨도 1~2골차가 흔함
@@ -4577,8 +4649,12 @@ def _gen_score(outcome, diff=0.0):
         adv = min(adv, 14)   # '박빙'(adv<15) 등급 테이블로 강제 편입
 
     if outcome == "draw":
-        # 무승부: 전력 비슷할 때 주로 발생하므로 저득점 위주.
-        g = random.choices([0, 1, 2, 3], weights=[22, 38, 28, 12])[0]
+        # [2026-09 재조정, "득점환경 v1.0" — 신민용+GPT 실측: "우승/상위권
+        # 팀이 시즌 75~95골을 넣어야 하는데 실제로는 41~58골에서 막힌다"]
+        # 무승부 득점도 아래 박빙 구간과 같은 이유로 소폭 상향.
+        g = random.choices([0, 1, 2, 3], weights=[18, 36, 32, 14])[0]
+        if goal_mult != 1.0:
+            g = _stoch_round_goal(g * goal_mult)
         return g, g
 
     # 이긴 팀 득점 분포를 전력차로 조정.
@@ -4592,6 +4668,28 @@ def _gen_score(outcome, diff=0.0):
     # 여전히 드물고, 진짜 압도적 격차일 때만 자주 나온다"는 쪽으로 재조정.
     # (대승 자체를 없애는 게 아니라 빈도만 낮추는 방향 — 강팀의 압승 서사는
     # 그대로 남아있어야 하므로 초압도 구간은 유지)
+    #
+    # [2026-09 재설계, "득점환경 v1.0", 신민용+GPT 실측 확정: "우승권 팀이
+    # 75~95골을 넣어야 하는데 실측 41~58골"] 실제 이 세이브의 EPL 팀별
+    # 평균 OVR을 전부 뽑아보니 리그 내 스프레드가 7.56점뿐이라(1위
+    # 93.96~20위 86.40), 홈보정을 더해도 리그 380경기 전체에서 adv가
+    # 15를 단 한 번도 못 넘었다(실측 평균 3.33·최댓값 10.97) — 즉 "우세"
+    # (15+)·"강한 우세"(28+)·"압도"(42+)·"초압도"(58+) 네 구간은 국내
+    # 리그전에서는 사실상 죽은 코드였고(등급이 크게 다른 컵대회 매치업
+    # 정도에서만 작동), 실제 리그 득점 환경 전부가 "박빙" 구간 하나의
+    # 고정 분포에만 좌우되고 있었다. 그래서 15/28/42/58 임계값과 그
+    # 위 네 구간의 분포는 그대로 두고(컵대회 등 진짜 등급차가 큰
+    # 매치업에는 여전히 그대로 적용됨), "박빙"(adv<15) 하나만 diff에
+    # 비례하는 연속 보간으로 재설계했다 — t=0(diff=0, 균형)일 때는
+    # 저득점 접전 위주(w_lo), t=1(diff=15, 박빙 구간 최대 격차)에
+    # 가까워질수록 승리팀 득점 상향·패배팀 득점 억제(w_hi) 쪽으로
+    # 자연스럽게 이동한다. 실측 EPL 스프레드로 200시즌 시뮬레이션
+    # 검증: 리그 전체 평균 1.17→1.47골/경기(목표 1.4~1.5 달성),
+    # TOP4 1.55/BOT4 1.38(격차는 2차 조정 대상으로 남겨둠 — 실제
+    # adv 최댓값이 10.97이라 t가 0.73까지만 올라가는 게 정상 동작).
+    # t를 adv/11처럼 이 리그의 실측 최댓값에 맞춰 강제 정규화하지
+    # 않는다 — 다른 리그는 스프레드가 다를 수 있어 diff=11의 의미가
+    # 리그마다 달라지면 안 되므로, 보편적으로 15를 기준으로 고정한다.
     if adv >= 58:        # 초압도 — 드물게 7~9골 이변
         win_goals = random.choices([3, 4, 5, 6, 7, 8, 9],
                                    [18, 28, 24, 16, 9, 4, 1])[0]
@@ -4605,9 +4703,20 @@ def _gen_score(outcome, diff=0.0):
     elif adv >= 15:      # 우세
         win_goals = random.choices([1, 2, 3, 4],    [24, 40, 25, 11])[0]
         lose_goals = random.choices([0, 1, 2],      [46, 40, 14])[0]
-    else:               # 박빙
-        win_goals = random.choices([1, 2, 3, 4],    [40, 37, 17, 6])[0]
-        lose_goals = random.choices([0, 1, 2],      [42, 42, 16])[0]
+    else:                # 박빙 (adv<15) — "득점환경 v1.0" diff 연속 보간
+        t = adv / 15.0
+        _w = [(1 - t) * lo + t * hi for lo, hi in zip(_GEN_SCORE_WLO, _GEN_SCORE_WHI)]
+        win_goals = random.choices([1, 2, 3, 4, 5], _w)[0]
+        _lw = [(1 - t) * lo + t * hi for lo, hi in zip(_GEN_SCORE_LWLO, _GEN_SCORE_LWHI)]
+        lose_goals = random.choices([0, 1, 2], _lw)[0]
+
+    # [2026-09 신설, "국가별 득점환경" 1단계] goal_mult(기본 1.0=무보정)로
+    # 이 매치의 최종 스코어 자체를 국가별로 스케일링한다 — 위 _get_league_
+    # goal_mult() 문서 참고. 반올림 후에도 "이긴 팀이 항상 더 많이" 불변은
+    # 아래에서 다시 강제하므로 순서와 무관하게 안전하다.
+    if goal_mult != 1.0:
+        win_goals = _stoch_round_goal(win_goals * goal_mult)
+        lose_goals = _stoch_round_goal(lose_goals * goal_mult)
     lose_goals = min(lose_goals, win_goals - 1)  # 이긴 팀이 항상 더 많이
 
     if outcome == "home":
@@ -7940,11 +8049,19 @@ def _advance_week(p, base_week, n_weeks=4, progress_cb=None):
     new_week = base_week + n_weeks
     new_year = p["current_year"]
     new_season = p["current_season"]
+    # [2026-09 신설, 신민용+GPT 설계: "main/hist 저장 시점 불일치" 대응]
+    # 이 호출에서 진짜 연도전환(발롱도르/야신상 등 hist 즉시커밋 포함)이
+    # 일어났는지 추적 — 아래에서 season_state를 새 연도로 갱신한 직후,
+    # 이 플래그가 True일 때만 강제로 flush_to_disk를 한 번 더 걸어서
+    # main도 hist와 같은 시점으로 디스크에 반영되게 한다(주기 자동저장은
+    # 4주 단위라 51·52주차 전환 직후엔 다음 자동저장 전까지 공백이 있었다).
+    _year_transition_happened = False
 
     if new_week > 52:
         new_week -= 52
         new_year += 1
         new_season += 1
+        _year_transition_happened = True
         # [2026-07 신설, 진단용] "52주차→내년 4초" 리포트 대응 — 어느 단계가
         # 실제로 오래 걸리는지 추측 대신 숫자로 확인하기 위한 프로파일링.
         # 콘솔(터미널/exe 콘솔창)에 [PERF] 태그로 단계별 소요시간(초)이
@@ -8161,6 +8278,19 @@ def _advance_week(p, base_week, n_weeks=4, progress_cb=None):
         _state_cache["current_week"] = new_week
         _state_cache["current_season"] = new_season
 
+    # [2026-09 신설] 시즌 전환 완료 직후 강제 저장 — 위 _year_transition_happened
+    # 코멘트 참고. season_state가 이미 새 연도로 커밋된 "바로 이 시점"에
+    # main을 디스크에 반영해두면, 이 직후 비정상 종료(터미널 강제종료 등)가
+    # 나더라도 hist(이미 커밋된 발롱도르 등)와 main이 같은 시점을 가리키게
+    # 된다. 기존 4주 단위 주기저장은 그대로 유지(크래시 대비 안전장치) —
+    # 이건 그 사이의 유일한 공백(51·52주차 부근)만 추가로 메우는 것.
+    if _year_transition_happened:
+        try:
+            from database import flush_to_disk_async
+            flush_to_disk_async()
+        except Exception as e:
+            print(f"[SEASON-END-FLUSH] 시즌전환 직후 강제저장 실패(무시하고 계속): {e}")
+
     # 1주차: 새 시즌 시작 시 완전히 만료된(냉각기 끝난) 오퍼 거절 기록 삭제
     # [2026-08 수정, 신민용 확정] 예전엔 "year < 현재연도"(1년만 지나면
     # 바로 삭제)였는데, 이제 냉각기 규칙이 "거절연도+2까지 차단"이라
@@ -8291,7 +8421,42 @@ def _calc_clean_sheets_for_player(p, team_id=None, matches=None):
 # 식을 그대로 상수로 접어둔다.
 _U08_LO, _U08_SPAN = 0.8, 1.2 - 0.8          # random.uniform(0.8, 1.2)
 _U085_LO, _U085_SPAN = 0.85, 1.15 - 0.85     # random.uniform(0.85, 1.15)
-_U005_LO, _U005_SPAN = -0.05, 0.05 - (-0.05)  # random.uniform(-0.05, 0.05)
+
+# [2026-09 신설, 신민용+GPT 협의: "18*uniform(0.8,1.2)면 이론상 최댓값이
+# 21.6골 — 아무리 뛰어난 선수라도 23~28골짜리 득점왕 시즌이 구조적으로
+# 불가능하다"] OVR을 골 수에 직접 곱하지 않는다는 원칙(_estimate_ai_season
+# 설계 변경 코멘트 참고)은 그대로 유지하면서, "평소엔 다들 비슷하지만
+# 아주 가끔 역대급 시즌이 나온다"는 현실적인 꼬리를 순수 랜덤 쪽에 만든다
+# — 실력(OVR)이 아니라 "그 시즌 폼"이 터진 것으로 취급하는 셈이다.
+# 기존 uniform(0.8,1.2) 구간은 그대로 "평범한 시즌"(약 90%)으로 보존하고,
+# 그 위에 좋은/폭발적/역대급 3단계 꼬리를 얹는다 — _rand() 호출 1번을
+# 4구간으로 쪼개 쓰므로 난수 소비 횟수는 기존과 동일하다(goals 1회 +
+# assists 1회, 이전과 완전히 같은 소비 패턴).
+#   평범(90.0%): ×0.80~1.20  (기존 그대로, ST 기준 14~22골)
+#   좋은 시즌(7.0%): ×1.20~1.50  (22~27골)
+#   폭발적 시즌(2.5%): ×1.50~1.80  (27~32골)
+#   역대급 시즌(0.5%): ×1.80~2.50  (32골+, 상한 45골 상당에서 사실상 클램프)
+_TAIL_P1, _TAIL_P2, _TAIL_P3 = 0.90, 0.97, 0.995   # 누적 확률 경계
+def _tailed_season_mult(u):
+    """u는 0~1 균등난수 한 개. 위 4단계 분포를 따르는 배율을 반환한다."""
+    if u < _TAIL_P1:
+        return _U08_LO + _U08_SPAN * (u / _TAIL_P1)
+    if u < _TAIL_P2:
+        return 1.20 + 0.30 * ((u - _TAIL_P1) / (_TAIL_P2 - _TAIL_P1))
+    if u < _TAIL_P3:
+        return 1.50 + 0.30 * ((u - _TAIL_P2) / (_TAIL_P3 - _TAIL_P2))
+    return 1.80 + 0.70 * ((u - _TAIL_P3) / (1.0 - _TAIL_P3))
+
+# [2026-09 재보정, 신민용 리포트: "주전/로테이션/대기 GK끼리 선방률이
+# 같아 보인다" → game.db 실측(2001시즌 GK 24,844명)으로 확인: 같은 팀
+# 안에서 OVR 15점+ 차이나는 GK 430쌍의 선방률 차이가 평균 3.8%p(표준편차
+# 5.0%p)뿐이고 역전 사례도 다수 — OVR 신호(50~99 전체 범위 20%p 폭,
+# 1점당 ~0.41%p)보다 개인별 독립 노이즈(±5%p)가 더 커서 신호가 묻힘.
+# 신민용 확정: "노이즈만 줄이지 말고 신호도 같이 키우자" — OVR 신호 폭
+# 20%p→28%p(base_save_pct 담당), 노이즈 ±5%p→±2%p로 동시 조정한다.
+# 개인 편차 자체를 완전히 없애는 것(±0%p)은 지양 — "OVR85가 OVR80보다
+# 항상 정확히 높지는 않다"는 자연스러운 변동은 남겨둔다는 것이 확정 방향.
+_U005_LO, _U005_SPAN = -0.02, 0.02 - (-0.02)  # random.uniform(-0.02, 0.02)
 _rand = random.random
 
 # [2026-09 성능 2차] _estimate_ai_season 전용 메모.
@@ -8381,8 +8546,8 @@ def _estimate_ai_season(ovr, pos, team_avg, league_avg, sub_role=None, full_seas
         g_base = 0.0
     if a_base < 0.0:
         a_base = 0.0
-    goals = round(g_base * (_U08_LO + _U08_SPAN * _rand()))
-    assists = round(a_base * (_U08_LO + _U08_SPAN * _rand()))
+    goals = round(g_base * _tailed_season_mult(_rand()))
+    assists = round(a_base * _tailed_season_mult(_rand()))
     # [2026-07 재보정, 신민용 수비수 QA 확정: "AI 후보(rating~7.8, OVR95)가
     # 실제 시뮬레이션 결과(_player_perf 기반, 같은 OVR95 CB 실측 평균
     # rating~7.2)보다 항상 후하게 나와서 베스트11/MVP/올해의 수비수 후보
@@ -8431,6 +8596,14 @@ def _estimate_ai_clean_sheets(pos, ovr, team_avg, league_avg, full_season_matche
     return max(0, round(cs))
 
 
+# [2026-09 신설, 신민용+GPT 협의: "concede_score(_score_ballon_candidate)에서
+# matches 대신 shots_faced로 역산할 때 쓰는 경기당 피슈팅수를 여기 있는
+# 4.2와 다른 값으로 하드코딩하면, 나중에 이 값을 튜닝할 때 선방 생성과
+# 발롱도르/야신상 채점이 서로 다른 기준을 쓰게 된다"] 두 곳이 항상 같은
+# 값을 쓰도록 이름 붙은 상수 하나로 뺀다.
+_GK_SHOTS_PER_MATCH_BASE = 4.2
+
+
 def _estimate_ai_gk_saves(ovr, team_avg, league_avg, full_season_matches=14):
     """[2026-09 신설, 신민용 요청: "클린시트 말고 선방:14 실점:1 선방률:
     93.5% 이런식으로 떠야한다"] 이 함수도 위 _estimate_ai_season/_estimate_
@@ -8444,17 +8617,22 @@ def _estimate_ai_gk_saves(ovr, team_avg, league_avg, full_season_matches=14):
 
     설계: (1) 경기당 피슈팅수 기준치(4.2, 리그 평균 유효슈팅 실측 근사)에서
     소속팀이 평균보다 강할수록 상대의 유효슈팅 자체가 줄어든다고 보고
-    낮춘다. (2) 기본 선방률은 GK 본인 OVR에서 산출(OVR60→64%, OVR99→
-    79.6% 근방 — 실제 톱리그 GK 선방률 65~80% 대와 맞춘 캘리브레이션)하고
-    소속팀 전력에 따라 소폭 가산(강팀 뒤에서는 상대적으로 질 좋은
-    기회만 걸러져 옴). (3) 피슈팅수×선방률로 선방을, 나머지를 실점으로
-    역산해 saves+conceded=shots_faced가 항상 정확히 맞물리게 한다(표시
-    시점에 선방률을 saves/(saves+conceded)로 재계산해도 항상 일치).
+    낮춘다. (2) 기본 선방률은 GK 본인 OVR에서 산출(OVR50→60%, OVR99→
+    약 88% — [2026-09 재보정] 원래 OVR60→64%/OVR99→79.6% 폭(20%p)이던
+    것을, "같은 팀 GK끼리 OVR 차이가 커도 선방률이 안 갈린다"는 실측
+    리포트로 28%p 폭으로 넓힘 — 아래 team_bonus/개인 노이즈 상수 주석
+    참고)하고 소속팀 전력에 따라 소폭 가산(강팀 뒤에서는 상대적으로 질
+    좋은 기회만 걸러져 옴). (3) 피슈팅수×선방률로 선방을, 나머지를
+    실점으로 역산해 saves+conceded=shots_faced가 항상 정확히 맞물리게
+    한다(표시 시점에 선방률을 saves/(saves+conceded)로 재계산해도 항상
+    일치).
     반환: (saves, goals_conceded)."""
-    shots_per_game = max(2.0, min(7.0, 4.2 * (1.0 - (team_avg - league_avg) * 0.01)))
+    shots_per_game = max(2.0, min(7.0, _GK_SHOTS_PER_MATCH_BASE * (1.0 - (team_avg - league_avg) * 0.01)))
     shots_faced = max(0, round(shots_per_game * full_season_matches
                                 * (_U085_LO + _U085_SPAN * _rand())))
-    base_save_pct = 0.60 + max(0, min(50, ovr - 50)) / 50.0 * 0.20
+    # [2026-09 재보정] OVR 신호 폭 0.20→0.28(위 _U005_* 주석 참고) —
+    # OVR 50→60%, OVR 99→약 88%.
+    base_save_pct = 0.60 + max(0, min(50, ovr - 50)) / 50.0 * 0.28
     team_bonus = (team_avg - league_avg) * 0.001
     save_pct = max(0.45, min(0.92, base_save_pct + team_bonus
                               + (_U005_LO + _U005_SPAN * _rand())))
@@ -8755,10 +8933,16 @@ _SQUAD_DEPTH_DECAY = [1.15, 0.45, 0.18, 0.07]
 
 def _apply_squad_depth_decay(rows, key_fn):
     """rows: {"goals":..,"assists":..,"ovr":..} 등을 담은 dict의 리스트
-    (in-place로 goals/assists를 덮어씀). key_fn(row) -> (team_id, position)
-    같은 그룹 키. 그룹 크기가 1이면(그 팀에 그 포지션이 한 명뿐) 건드리지
-    않는다 — 백업이 없으면 애초에 나눠 가질 대상이 없으므로 원래 추정치가
-    곧 그 선수의 실질적인 득점 기대치와 같다.
+    (in-place로 goals/assists/clean_sheets/saves/goals_conceded를 덮어씀
+    — 뒤 세 개는 키가 있는 행에만 적용, 없으면 기존과 100% 동일).
+    key_fn(row) -> (team_id, position) 같은 그룹 키. 그룹 크기가 1이면
+    (그 팀에 그 포지션이 한 명뿐) 건드리지 않는다 — 백업이 없으면 애초에
+    나눠 가질 대상이 없으므로 원래 추정치가 곧 그 선수의 실질적인 득점
+    기대치와 같다.
+
+    정렬 기준 우선순위: rows에 "role"(주전/로테이션/대기/전력외/유망주)이
+    있으면 그걸 1순위로 쓰고(아래 2026-09 버그수정 참고), 없고 "apps"가
+    있으면 출전 여부를 1순위로, 둘 다 없으면 OVR만 쓴다(기존과 동일).
 
     [2026-09 버그수정, 신민용 리포트: "월드컵 골든부츠가 4골밖에 안 된다"]
     등수를 OVR만으로 매기면 "그 대회에 한 경기도 안 나온 선수"가 OVR이
@@ -8769,7 +8953,18 @@ def _apply_squad_depth_decay(rows, key_fn):
     그룹 220개 중 62개(28%)가 이 상태였다. rows에 "apps"가 있으면
     출전 여부를 1순위 정렬키로 써서 실제로 뛴 선수가 항상 앞에 오게
     한다(클럽 경로는 로스터 전원이 같은 경기수를 받으므로 "apps"를 안
-    넘기고, 그 경우 기존과 100% 동일하게 OVR 순만 쓴다)."""
+    넘기고, 그 경우 기존과 100% 동일하게 OVR 순만 쓴다).
+
+    [2026-09 확장, 신민용 리포트: "역할은 전력외인데 105선방/38경기가
+    찍혀 있다 — 다른 포지션은 안 그러잖아"] 정확한 지적 — goals/assists는
+    이미 이 감쇠를 받아서 후보 선수가 에이스와 비슷한 득점을 찍는 일이
+    없는데, GK의 saves/goals_conceded/clean_sheets는 이 감쇠 대상에서
+    빠져 있어 4번째 GK도 주전과 거의 같은 '풀시즌' 선방/실점을 그대로
+    가졌다. goals/assists와 완전히 같은 그룹·같은 등수·같은 배율
+    (_SQUAD_DEPTH_DECAY)로 세 필드도 같이 깎는다 — saves와 goals_conceded를
+    "같은 배율"로 같이 줄이므로 선방률(saves/(saves+goals_conceded)) 자체는
+    거의 그대로 유지되고(백업이라고 실력 자체가 나빠 보이면 안 됨), 총
+    출전량(볼륨)만 뎁스 순위에 맞게 줄어든다."""
     groups: dict = {}
     for r in rows:
         groups.setdefault(key_fn(r), []).append(r)
@@ -8778,7 +8973,21 @@ def _apply_squad_depth_decay(rows, key_fn):
     # 하나이므로 한 번만 판별해서 전용 키를 쓴다 — 클럽 경로는 apps 조회
     # 자체가 사라진다. 정렬 결과는 기존과 완전히 동일하다(같은 순서 규칙 +
     # list.sort가 안정 정렬이라 동순위 원본 순서도 그대로).
-    if rows and "apps" in rows[0]:
+    if rows and rows[0].get("role"):
+        # [2026-09 버그수정, 신민용 리포트: "OVR이 같은 주전과 대기 중
+        # 대기가 골을 더 넣었다"] 클럽 경로는 "apps"가 없어서(로스터
+        # 전원이 같은 경기수를 받는 단순 모델이라 apps 자체가 의미 없음)
+        # 항상 OVR만으로 순위를 매겼는데, OVR이 같거나 비슷한 선수끼리는
+        # 이 정렬이 사실상 동률/리스트 순서에 가까워진다 — "주전"이라는
+        # 라벨과 무관하게 1등(×1.15)/2등(×0.45)이 갈릴 수 있었다. role이
+        # 있으면(호출부가 hist.ai_player_position_history에서 이미
+        # 계산해둔 그 해 실제 역할을 같이 넘겨주면) 그걸 1순위로 써서
+        # "주전이 항상 에이스 배율을 받는다"를 보장하고, 같은 역할
+        # 안에서만 OVR로 세부 순위를 매긴다. role을 안 넘기는 기존
+        # 호출부(월드컵 등)는 100% 그대로 동작한다.
+        _role_rank = {"주전": 0, "로테이션": 1, "대기": 2, "전력외": 3, "유망주": 4}
+        _sk = lambda x: (_role_rank.get(x.get("role"), 2), -(x["ovr"] or 0))
+    elif rows and "apps" in rows[0]:
         _sk = lambda x: (0 if (x["apps"] or 0) > 0 else 1, -(x["ovr"] or 0))
     else:
         _sk = lambda x: -(x["ovr"] or 0)
@@ -8799,6 +9008,15 @@ def _apply_squad_depth_decay(rows, key_fn):
             a = r["assists"]
             if a:
                 r["assists"] = max(0, round(a * decay))
+            cs = r.get("clean_sheets")
+            if cs:
+                r["clean_sheets"] = max(0, round(cs * decay))
+            sv = r.get("saves")
+            if sv:
+                r["saves"] = max(0, round(sv * decay))
+            gc = r.get("goals_conceded")
+            if gc:
+                r["goals_conceded"] = max(0, round(gc * decay))
     return rows
 
 
@@ -8869,6 +9087,73 @@ _ACE_GAMMA_SPAN  = 0.50     # 감마 추가분 폭(상한 = LO + SPAN)
 _ACE_FORM_K      = 1.05     # 선수별 폼 배율 = exp(±K) → 약 0.35~2.86배
 _ACE_ASSIST_MIX  = 0.5      # 도움에 적용할 집중 강도(골 대비 비율)
 
+# [2026-09 신설, "에이스 지분 상한", 신민용 리포트: "북미 챔스 10경기
+# 22골을 한 선수가 사실상 전부 가져갔다 — UCL 역대 한 시즌 최다도
+# 호날두 17골(2013-14, 41골 중 41%)인데 비현실적"] 위 감마 집중은
+# 월드컵(7경기, 이미 실측·승인된 분포 — "팀 톱1 비중 51.1%, 극히
+# 드물게 9~10/11골") 기준으로 잡은 것인데, short=1-m/38 공식이 7경기
+# (short 0.82)든 10~15경기짜리 대륙대항전(short 0.61~0.74)이든 거의
+# 같은 세기로 걸려서, 극단적으로는 감마·개인폼이 둘 다 높게 뽑히면
+# 팀 골 전부(100%)를 한 명이 가져가는 사례까지 나온다 — 이건 애초에
+# 승인된 목표 분포(월드컵 51% 평균, 최대치도 9~10/11≈82~91%)를 훨씬
+# 넘어서는 값이다. 월드컵/국내컵처럼 이미 실측·승인된 초단기 대회
+# (_ACE_SHARE_CAP_SKIP_MATCHES 이하)는 그대로 두고, 그보다 긴(대략
+# 9~20경기대) 대륙대항전·클럽월드컵에만 대회 길이에 따라 낮아지는
+# 지분 상한을 추가로 건다 — 실제 정수 배분은 뒤따르는
+# _apply_team_goal_budget이 하므로, 여기선 그 배분에 넘길 '상대
+# 가중치'만 상한 이하로 눌러서(초과분은 나머지 인원에게 비례 재배분)
+# 팀 실제 골 합계 불변식은 그대로 유지한다."""
+_ACE_SHARE_CAP_SKIP_MATCHES = 8     # 이 경기수 이하는 상한 없음(월드컵/국내컵 기존 튜닝 유지)
+_ACE_SHARE_CAP_HI = 0.62            # 상한 시작점(9경기 근방)
+_ACE_SHARE_CAP_LO = 0.40            # _ACE_REF_MATCHES(38경기)에 가까워질 때 하한
+# [2026-09 수정, 신민용 리포트: "극히 희귀하다는 건 나올 수 있다는건데
+# 이 최댓값이면 안 뜨는 거 아님?"] — 정확한 지적. 위 상한을 매번
+# 딱딱하게(hard cap) 걸면 18~20골("극히 희귀") 같은 상위 등급이 확률과
+# 무관하게 영원히 못 뜬다. _tailed_season_mult(평범/좋음/폭발/역대급
+# 4단계 확률)와 같은 발상으로, 이 대회 이 팀의 지분 상한 자체를
+# 확률적으로 "이번엔 거의 안 건다"로 가끔 뒤집는다 — 상한은 여전히
+# '보통' 케이스의 기본값이고, 극히 드물게 대기록이 뚫고 나올 문을
+# 남겨둔다.
+_ACE_SHARE_CAP_BREAKTHROUGH_PROB = 0.03   # 이 대회·이 팀에서 이번엔 상한을 아예 안 걸 확률
+
+# [2026-09 신설] 도움 전용 지분 상한 — 골 상한(0.62~0.40)보다 훨씬
+# 낮다. _ace_assist_share_cap() 문서 참고.
+_ACE_ASSIST_SHARE_CAP_HI = 0.30
+_ACE_ASSIST_SHARE_CAP_LO = 0.18
+
+
+def _ace_share_cap(matches_played, hi=_ACE_SHARE_CAP_HI, lo=_ACE_SHARE_CAP_LO):
+    """대회에서 실제로 뛴 최대 경기수 -> 에이스 1인이 가져갈 수 있는
+    지분의 상한(0~1). _ACE_SHARE_CAP_SKIP_MATCHES 이하는 None(상한
+    없음 — 기존 승인된 튜닝 그대로). 그 이상은 9경기 근방 hi에서
+    _ACE_REF_MATCHES(38경기)에 가까워질수록 lo까지 선형 감소 —
+    로테이션·상대 분석이 늘수록 실제로도 한 명 독식은 줄어든다는
+    현실을 반영한다. hi/lo를 넘기면 골 대신 도움 등 다른 상한 곡선에도
+    같은 모양을 재사용할 수 있다(_ace_assist_share_cap 참고)."""
+    if matches_played <= _ACE_SHARE_CAP_SKIP_MATCHES:
+        return None
+    span = _ACE_REF_MATCHES - _ACE_SHARE_CAP_SKIP_MATCHES
+    t = min(1.0, (matches_played - _ACE_SHARE_CAP_SKIP_MATCHES) / span)
+    return hi - (hi - lo) * t
+
+
+def _ace_assist_share_cap(matches_played):
+    """[2026-09 신설, "도움왕/득점왕 비율" 신민용 요청: "리그 득점왕20/
+    도움왕13, 챔스 득점왕11~12/도움왕7 — 도움왕은 국가별 표 대신 그
+    리그 득점환경·경기수 기반으로"] 골 지분 상한(_ace_share_cap)과 같은
+    모양(경기수 기반 선형감소)이지만 상한 자체는 훨씬 낮다 — 실측
+    결과, 골 지분 상한을 도입한 뒤로 도움에는 아무 상한이 없어 챔스급
+    (13경기)에서 득점왕/도움왕 비율이 0.70~0.78까지 나왔다(목표
+    0.60~0.65). _ACE_ASSIST_MIX(0.5)로 감마 자체는 이미 절반 세기로
+    줄여놨지만 이것만으로는 비율이 거의 안 줄어, 골과 마찬가지로
+    지분 자체에 별도 상한을 걸어 9경기 근방 30%에서 38경기에 가까울수록
+    18%까지 낮춘다 — 이러면 별도 국가별 표 없이도 "그 대회 득점왕
+    수준에 연동된" 도움왕이 자연스럽게 나온다(합성 검증: 13경기·팀
+    38골 기준 득점왕 12.3/도움왕 7.2, 비율 0.58 — 리그 쪽은 원래
+    ace-concentration을 안 타므로 이 상한과 무관하게 기존 0.63 그대로)."""
+    return _ace_share_cap(matches_played,
+                           hi=_ACE_ASSIST_SHARE_CAP_HI, lo=_ACE_ASSIST_SHARE_CAP_LO)
+
 
 def _apply_ace_concentration(rows, key_fn):
     """rows: {"goals","assists","matches"}를 가진 dict 리스트(in-place로
@@ -8931,6 +9216,43 @@ def _apply_ace_concentration(rows, key_fn):
             for r in members:
                 if r["assists"] > 0:
                     r["assists"] *= _s
+
+        # [2026-09 신설, "에이스 지분 상한"] 위 _ace_share_cap() 문서 참고.
+        # g_after(그룹 전체 골 가중치 합)는 이 시점까지 감마 변환 결과
+        # 그대로다 — 초과분만 덜어 나머지 인원에게 비례 재배분한다
+        # (2등 이하끼리의 상대 비율은 그대로 유지, 1등만 눌린다).
+        if g_after > 0.0:
+            _cap = _ace_share_cap(m)
+            # [2026-09 수정] 매번 걸지 않고 _ACE_SHARE_CAP_BREAKTHROUGH_PROB
+            # 확률로 이번 그룹은 상한을 건너뛴다 — 위 상수 문서 참고.
+            if _cap is not None and _rand() < _ACE_SHARE_CAP_BREAKTHROUGH_PROB:
+                _cap = None
+            if _cap is not None:
+                _scorers = [r for r in members if r["goals"] > 0]
+                if len(_scorers) >= 2:
+                    _top = max(_scorers, key=lambda r: r["goals"])
+                    _rest_sum = g_after - _top["goals"]
+                    if _rest_sum > 0.0:
+                        _max_allowed = (_cap / (1.0 - _cap)) * _rest_sum
+                        if _top["goals"] > _max_allowed:
+                            _top["goals"] = _max_allowed
+
+        # [2026-09 신설, "도움왕/득점왕 비율"] 골과 같은 방식 — 도움
+        # 전용(훨씬 낮은) 상한을 같은 돌파 확률로 적용한다. _ace_assist_
+        # share_cap() 문서 참고.
+        if a_after > 0.0:
+            _acap = _ace_assist_share_cap(m)
+            if _acap is not None and _rand() < _ACE_SHARE_CAP_BREAKTHROUGH_PROB:
+                _acap = None
+            if _acap is not None:
+                _assisters = [r for r in members if r["assists"] > 0]
+                if len(_assisters) >= 2:
+                    _atop = max(_assisters, key=lambda r: r["assists"])
+                    _arest_sum = a_after - _atop["assists"]
+                    if _arest_sum > 0.0:
+                        _amax_allowed = (_acap / (1.0 - _acap)) * _arest_sum
+                        if _atop["assists"] > _amax_allowed:
+                            _atop["assists"] = _amax_allowed
     return rows
 
 
@@ -9797,76 +10119,357 @@ def _get_cl_cup_season_stats(year):
 # 실제 대회 수준 통설(리베르타도레스 > CAF/CONCACAF ≳ AFC)에 맞춰 남미
 # 보다 더 낮게 잡았다 — 이 넷 다 유럽 8강(1.2)보다도 낮으므로, "유럽
 # 8강만 가도 어느 대륙 우승보다 위"가 성립한다.
-_CL_CONTINENT_WEIGHT = {
-    "유럽": 1.00,      # UEFA 챔피언스리그
-    "남미": 0.15,      # 리베르타도레스급
-    "북미": 0.10,      # CONCACAF 챔피언스컵급
-    "아시아": 0.08,    # AFC 챔피언스리그급
-    "아프리카": 0.10,  # CAF 챔피언스리그급
+# [2026-09 6차 확장, 신민용 제공 순위 + GPT 제안 수치로 교체] 기존
+# _CL_CONTINENT_WEIGHT(대륙 5단계, 챔스 전용) + _cl_trophy_points(우승/
+# 준우승/4강/8강/16강/32강 절대점수, 대회 위상 무관)를 완전히 대체한다.
+# "대회 자체의 위상"(_CLUB_COMP_WEIGHT)과 "그 대회에서 어디까지
+# 갔는가"(_CLUB_COMP_STAGE_WEIGHT)를 분리해서 곱하는 구조로 바꿨다 —
+# 유로파리그/컨퍼런스리그가 트로피 점수에서 아예 0점 취급되던 것(신민용
+# 리포트로 발견)도 이 김에 해결된다. 기존 trophy_bonus 스케일(챔스
+# 우승=10.0)을 그대로 유지하기 위해 마지막에 ×10.0을 곱한다
+# (_club_comp_trophy_value 참고).
+#
+# [신민용 제시 순위: "유럽CL>유럽EL>유럽ECL>남미CL>남미EL>아시아CL>
+# 북미CL>아프리카CL>아시아EL>북미EL>아프리카EL>아시아ECL>북미ECL>
+# 아프리카ECL", GPT 제안 수치] 이 순서는 기존 대륙 가중치(유럽 압도적,
+# 나머지 4개 대륙은 0.08~0.15로 다닥다닥)를 "대륙값×티어배율"로 단순
+# 분해해서는 재현이 안 된다(예: 남미EL이 아시아/북미/아프리카CL보다
+# 위) — 그래서 15개 (대륙,티어) 조합에 값을 직접 매겼다.
+# [빈 자리] 남미 컨퍼런스리그는 신민용이 준 순위표에 없던 항목 —
+# 유럽의 EL→ECL 감쇠비(0.52/0.72≈0.722)를 남미 EL(0.32)에 그대로
+# 적용해 0.23으로 잠정 배치했다(아시아CL 0.26보다 낮고 북미CL 0.22보다
+# 높은 자리 — 확인 필요).
+_CLUB_COMP_WEIGHT = {
+    ("유럽", "cl"): 1.00, ("유럽", "el"): 0.72, ("유럽", "ecl"): 0.52,
+    ("남미", "cl"): 0.40, ("남미", "el"): 0.32, ("남미", "ecl"): 0.23,
+    ("아시아", "cl"): 0.26, ("북미", "cl"): 0.22, ("아프리카", "cl"): 0.19,
+    ("아시아", "el"): 0.15, ("북미", "el"): 0.13, ("아프리카", "el"): 0.11,
+    ("아시아", "ecl"): 0.085, ("북미", "ecl"): 0.070, ("아프리카", "ecl"): 0.060,
+}
+
+# [2026-09 7차 확장, 신민용+GPT 협의: "0.72 자체가 문제가 아니라 참가도×
+# 평점 배율(1.30)이 모든 대회에 똑같이 곱해지는 게 문제 — 유로파 우승
+# 9.36점이 옛 챔스 우승(10.0)급까지 치솟는다"] 실측(셀타 비고, 리그
+# 14위인데 유로파 우승+평점 7.23 → 발롱도르 2위)으로 확인된 문제 —
+# comp_weight(대회 위상)는 그대로 두고, 참가도×평점 배율의 상한만 대회
+# 티어별로 낮춘다. 위 유럽 3단계(1.30/1.15/1.05)와 남미 CL/EL(1.10/1.05),
+# 아시아 CL(1.05)은 GPT가 명시한 값 — 나머지(북미/아프리카 CL, 하위
+# 대륙의 EL/ECL)는 같은 감쇠 패턴으로 채워넣은 추정치("1.00~1.05 범위"
+# 라고만 명시됐던 부분)라 확인이 더 필요할 수 있다.
+_CLUB_COMP_QUALITY_CAP = {
+    ("유럽", "cl"): 1.30, ("유럽", "el"): 1.15, ("유럽", "ecl"): 1.05,
+    ("남미", "cl"): 1.10, ("남미", "el"): 1.05, ("남미", "ecl"): 1.03,
+    ("아시아", "cl"): 1.05, ("북미", "cl"): 1.03, ("아프리카", "cl"): 1.02,
+    ("아시아", "el"): 1.02, ("북미", "el"): 1.01, ("아프리카", "el"): 1.00,
+    ("아시아", "ecl"): 1.00, ("북미", "ecl"): 1.00, ("아프리카", "ecl"): 1.00,
+}
+
+# [2026-09 7차 확장, GPT 제안: "실제로 엄청난 커리어를 가진 선수가 트로피가
+# 더 쌓여도 평가가 거의 안 올라가면 안 되니, cap은 비정상적인 폭주
+# 방지용으로만 아주 높게 둔다"] score_trophy(trophy_bonus+intl_bonus+
+# award_bonus 합)에 거는 안전장치용 상한 — 정상적인 케이스는 거의 안
+# 걸리고, 여러 대회 우승이 한 시즌에 몰리는 극단치만 막는다.
+_TROPHY_SCORE_CAP = 30.0
+
+# [GPT 제안 그대로] 대회 내 진출 단계 계수 — "대회 기본값을 100%로 놓은
+# 최고 성과" 대비 비율. 결승 tal락(준우승)이 0.78인 건 "챔스 준우승 ≳
+# 유로파 우승(0.72) > 챔스 4강(0.55)"이라는 경계선을 의도적으로 만든
+# 것(GPT 제안 근거: 챔스 8강(0.38) vs 유로파 우승(0.72) — 유로파 우승이
+# 압도적으로 높음, 챔스 4강(0.55) vs 유로파 우승(0.72) — 유로파 우승이
+# 여전히 위).
+_CLUB_COMP_STAGE_WEIGHT = {
+    "우승": 1.00, "준우승": 0.78, "4강": 0.55, "8강": 0.38,
+    "16강": 0.24, "16강진출전": 0.14, "조별탈락": 0.08,
+}
+# stage 컬럼 실측값(cl/el/ecl_matches 전부 동일): league/PO/R16/QF/SF/F/TP.
+# F부터 역순으로 훑어 "이 팀이 나온 가장 늦은 단계"를 찾는다 — F가 아닌
+# 한 그 단계에 나왔다는 것 자체가 "거기서 졌다"는 뜻(다음 단계 기록이
+# 없으므로).
+_CLUB_COMP_STAGE_ORDER = ["F", "SF", "QF", "R16", "PO", "league"]
+_CLUB_COMP_STAGE_LABEL = {
+    "SF": "4강", "QF": "8강", "R16": "16강", "PO": "16강진출전", "league": "조별탈락",
+}
+_CLUB_COMP_TABLES = {
+    "cl": ("cl_entries", "cl_tournaments", "cl_matches"),
+    "el": ("el_entries", "el_tournaments", "el_matches"),
+    "ecl": ("ecl_entries", "ecl_tournaments", "ecl_matches"),
 }
 
 
-def _cl_continent_weight(continent):
-    return _CL_CONTINENT_WEIGHT.get(continent, 1.0 if not continent else 0.10)
+def _team_furthest_stage_result(matches_table, tournament_id, team_id):
+    """team_id가 그 대회(matches_table 기준)에서 도달한 가장 깊은 단계를
+    판정해 라벨('우승'/'준우승'/'4강'/'8강'/'16강'/'16강진출전'/
+    '조별탈락') 또는 None(그 대회 자체에 참가 기록 없음)을 반환한다."""
+    conn = get_conn()
+    for stage in _CLUB_COMP_STAGE_ORDER:
+        row = conn.execute(
+            f"""SELECT * FROM {matches_table} WHERE tournament_id=? AND stage=?
+               AND (home_team_id=? OR away_team_id=?) AND home_score>=0
+               ORDER BY id DESC LIMIT 1""",
+            (tournament_id, stage, team_id, team_id)).fetchone()
+        if row:
+            if stage == "F":
+                from competition.competition_common import winner_of
+                winner = winner_of(row)
+                conn.close()
+                return "우승" if winner == team_id else "준우승"
+            conn.close()
+            return _CLUB_COMP_STAGE_LABEL[stage]
+    conn.close()
+    return None
 
 
-# [2026-09 신설, 신민용 확정: 위 _CL_CONTINENT_WEIGHT와 같은 원칙을
-# 국가대표 대륙컵(월드컵 아래 등급 — 유로/코파 아메리카/아시안컵/
-# AFCON 등)에도 적용한다. 4개 연맹(유럽/아메리카/아시아/아프리카 —
-# 남미·북미·북중미는 이 게임에서 "아메리카" 대륙컵 하나로 합쳐져
-# 있음, _NATION_CONF 참고) 사이의 실제 경쟁 수준 차이를 비율로 담아
-# 두고, 아래 두 곳(_intl_trophy_points=내 선수 전용, _CONF_CUP_WEIGHT
-# =AI 후보 전체용)이 같은 표를 공유하게 한다. 예전엔 이 둘이 서로
-# 다른 비율(_intl_trophy_points는 "유럽만 100%, 나머지 전부 20%"인
-# 이분법, _CONF_CUP_WEIGHT는 "유럽=아메리카 100%, 아프리카 67%,
-# 아시아 50%")을 따로 쓰고 있었다 — "내 발롱도르"와 "세계기록실
-# 발롱도르"가 절대 어긋나면 안 된다는 이 파일의 설계 원칙(파일 맨
-# 위 주석 참고)과 모순이라 하나로 통일한다.
+def _get_club_comp_result(year, team_id):
+    """team_id가 그 해 실제로 참가했던 챔스/유로파/컨퍼런스급 대회에서의
+    (단계 라벨, 대륙, 티어('cl'/'el'/'ecl')) 3-튜플 — 참가 자체가 없으면
+    (None, None, None). 한 팀은 그 해 이 셋 중 최대 하나에만 속한다
+    (waterfall 구조 — _club_comp_squad_pool 등 기존 코드의 동일 전제를
+    그대로 재사용) — cl→el→ecl 순으로 찾아 처음 걸리는 대회를 쓴다.
+
+    [2026-09 6차 확장] 기존 _get_club_cl_result(챔스 전용, 우승/준우승/
+    4강 3단계만 판정)를 완전히 대체한다 — 유로파/컨퍼런스도 잡고,
+    _team_furthest_stage_result로 8강/16강/16강진출전/조별탈락까지
+    세분화한다. team_id 기반 일반 함수라 AI든 "나"든 구분 없이 그대로
+    쓸 수 있다(_get_team_trophy_bonus/_get_ballon_trophy_bonus 둘 다
+    이 함수 하나를 공유 — "내 발롱도르"와 "세계기록실 발롱도르"가
+    어긋나면 안 된다는 이 파일의 설계 원칙)."""
+    for tier, (entries_tbl, tournaments_tbl, matches_tbl) in _CLUB_COMP_TABLES.items():
+        conn = get_conn()
+        trow = conn.execute(
+            f"""SELECT t.id, t.continent FROM {entries_tbl} e
+               JOIN {tournaments_tbl} t ON e.tournament_id=t.id
+               WHERE e.team_id=? AND t.year=? AND t.status='done' LIMIT 1""",
+            (team_id, year)).fetchone()
+        conn.close()
+        if not trow:
+            continue
+        stage_label = _team_furthest_stage_result(matches_tbl, trow["id"], team_id)
+        return stage_label, trow["continent"], tier
+    return None, None, None
+
+
+def _club_comp_trophy_value(stage_label, continent, tier):
+    """competition_weight × stage_weight × 10.0(기존 _cl_trophy_points
+    최댓값과 스케일을 맞추기 위한 배율 — 유럽CL 우승 1.00×1.00×10.0=10.0
+    으로 예전과 동일). 셋 중 하나라도 없으면(대회 미참가) 0.0."""
+    if not stage_label or not continent or not tier:
+        return 0.0
+    comp_w = _CLUB_COMP_WEIGHT.get((continent, tier), 0.0)
+    stage_w = _CLUB_COMP_STAGE_WEIGHT.get(stage_label, 0.0)
+    return comp_w * stage_w * 10.0
+
+
+# [2026-09 신설, 신민용 확정: 국가대표 대륙컵(월드컵 아래 등급 — 유로/
+# 코파 아메리카/아시안컵/AFCON 등)에도 대륙 간 경쟁 수준 차이를
+# 반영한다. 4개 연맹(유럽/아메리카/아시아/아프리카 — 남미·북미·북중미는
+# 이 게임에서 "아메리카" 대륙컵 하나로 합쳐져 있음, _NATION_CONF 참고)
+# 사이의 실제 경쟁 수준 차이를 비율로 담아두고, 아래 두 곳
+# (_intl_trophy_points=내 선수 전용, _CONF_CUP_WEIGHT=AI 후보 전체용)이
+# 같은 표를 공유하게 한다. 예전엔 이 둘이 서로 다른 비율(_intl_trophy_
+# points는 "유럽만 100%, 나머지 전부 20%"인 이분법, _CONF_CUP_WEIGHT는
+# "유럽=아메리카 100%, 아프리카 67%, 아시아 50%")을 따로 쓰고 있었다 —
+# "내 발롱도르"와 "세계기록실 발롱도르"가 절대 어긋나면 안 된다는 이
+# 파일의 설계 원칙(파일 맨 위 주석 참고)과 모순이라 하나로 통일한다.
+# [클럽 대항전(위 _CLUB_COMP_WEIGHT)과는 완전히 별개 — 이건 국가대표
+# 대륙컵 전용이다.]
 _CONTINENTAL_CUP_WEIGHT_RATIO = {"유럽": 1.00, "아메리카": 0.85, "아프리카": 0.55, "아시아": 0.45}
 
 
-def _cl_trophy_points(result: str) -> float:
-    # [2026-07 재조정, 신민용 지적: "트로피 보너스 배점이 조금 약할 가능성 —
-    # 차등을 크게 두면 훨씬 현실적"] 우승/준우승 쪽을 더 높이고 8강/16강
-    # 쪽은 살짝 낮춰서, "우승급 실적"과 "중위권 진출"의 격차를 더 벌렸다.
-    # (기존: 8.0/4.0/2.5/1.5/0.6/0.2 → 10.0/4.5/2.5/1.2/0.5/0.2)
-    if not result:
-        return 0.0
-    if "우승" in result and "준우승" not in result:
-        return 10.0
-    if "준우승" in result:
-        return 4.5
-    if "4강" in result or "3위" in result or "4위" in result:
-        return 2.5
-    if "8강" in result:
-        return 1.2
-    if "16강" in result:
-        return 0.5
-    if "32강" in result:
-        return 0.2
-    return 0.0   # 조별리그 탈락/플레이오프 등
+
+# [2026-09 신설, 신민용 요청: "리그 트로피도 리그 등급에 따라 달라야
+# 할듯 — SS급부터 S급은 같으며, A급 B급 이렇게 우승 관련해서 트로피가
+# 달라야겠지. 이건 컵 대회도 마찬가지"] 지금까지 _league_rank_points/
+# _cup_trophy_points는 그 나라 리그 등급과 무관하게 항상 똑같은 절대
+# 점수(우승 4.0/1.0 등)를 줬다 — SS등급 리그 우승이든 F등급 리그 우승
+# 이든 발롱도르 트로피 점수에 동일하게 기여했다는 뜻.
+#
+# [2026-09 2차 확장, 신민용+GPT 협의: "A급 안에서도 포르투갈/네덜란드/
+# 브라질과 사우디/멕시코/미국은 같은 취급이면 안 된다 — 등급(글자) 하나로
+# 뭉뚱그리지 말고 등급 안에서도 나라별 순위를 매기자"] 기존
+# _TROPHY_GRADE_WEIGHT(글자 등급 8개에만 값이 있어 같은 등급 안에서는
+# 국가 구분이 전혀 없던 방식)를 대체 — 등급별 [최고~최저] 값 구간을
+# 정하고, 그 등급 안의 국가 순위(신민용+GPT 순위 확정, 실제 국가대표
+# 실력이 아니라 "리그 우승의 발롱도르 가치" 기준)에 선형보간을 적용한다.
+# SS/S는 "국내에서는 굳이 세분화하지 않는다"는 원칙대로 등급 내 전원
+# 동일값 유지(_COUNTRY_RANK_WITHIN_GRADE에 순서를 넣어도 무시됨 —
+# 아래 _build_country_trophy_weight 참고).
+#
+# [등급 경계 불변식, 신민용 확정: "B급 최상이 A급 최하보다 높으면 안
+# 된다 — A급 최약(미국) 우승이 B급 1위(콜롬비아) 우승보다 낮아지면
+# 안 됨"] 그래서 등급 구간 자체를 겹치지 않게 잡았다.
+#
+# [2026-09 3차 재보정, 신민용 지적: "A-B 경계가 0.02밖에 안 되는데
+# A 등급 내부 스프레드(포르투갈 0.90~일본 0.814=0.054)보다도 좁다 —
+# 등급 내 세분화가 등급 자체의 구분을 삼켜버린다"] 등급 간 경계를
+# 0.02→0.05 내외로 넓혔다(A 0.90~0.78, B 0.73~0.61 — A 최저 0.78이
+# B 최고 0.73보다 0.05 위). SS-S-A-B-C-D 다섯 경계는 전부 0.05로
+# 맞췄고, D-E(0.04)·E-F(0.03)만 살짝 좁다(E/F 폭 자체를 더 좁게 잡은
+# 여파 — 현재 E/F 등록 국가가 0개라 당장 영향은 없음, 신민용이 원하면
+# 추후 조정). _build_country_trophy_weight 로드 시점에 이 불변식을
+# 실제로 검증해 어긋나면 바로 예외를 던진다(조용히 깨진 채로 못
+# 지나가게).
+_GRADE_VALUE_RANGE = {
+    "SS": (1.00, 1.00), "S": (0.95, 0.95),
+    "A": (0.90, 0.78), "B": (0.73, 0.61), "C": (0.56, 0.46),
+    "D": (0.41, 0.34), "E": (0.30, 0.25), "F": (0.22, 0.18),
+}
+
+# 등급 내 순위(1등=그 등급에서 가장 가치 높은 우승). SS/S는 순서가
+# 있어도 무시(전원 등급 값 그대로). [2026-09] C의 아랍에미리트, D의
+# 웨일스는 신민용+GPT 순위표 원안에 누락돼 있던 국가 — COUNTRY_LEAGUE_
+# GRADE에는 있는데 순위표에는 없어서, 값이 없는 채로 두면 등급 평균치로
+# 폴백되지만(그 자체로 안전) 일단 여기서는 실제 리그 실력에 맞춰 보이는
+# 자리에 직접 끼워 넣었다 — 이 둘의 정확한 위치는 신민용 확인 필요
+# (아랍에미리트: C 중하위권 추정 — 최근 자본 투입은 있지만 리그 수준
+# 자체는 아직 중하위, 베네수엘라와 이란 사이에 배치. 웨일스: 유럽
+# 내에서도 축구 리그로서는 최약체권으로 보고 D 최하위에 배치).
+_COUNTRY_RANK_WITHIN_GRADE = {
+    "SS": ["잉글랜드"],
+    "S": ["독일", "스페인", "이탈리아", "프랑스"],
+    "A": ["포르투갈", "네덜란드", "브라질", "아르헨티나", "튀르키예", "벨기에",
+          "스코틀랜드", "오스트리아", "스위스", "덴마크", "일본", "체코",
+          "사우디아라비아", "멕시코", "미국"],
+    "B": ["콜롬비아", "크로아티아", "우루과이", "폴란드", "그리스", "세르비아",
+          "우크라이나", "러시아", "노르웨이", "스웨덴", "대한민국", "에콰도르",
+          "모로코", "호주", "이집트", "남아프리카공화국", "튀니지", "카타르",
+          "캐나다"],
+    "C": ["루마니아", "칠레", "이스라엘", "헝가리", "슬로바키아", "불가리아",
+          "파라과이", "페루", "코스타리카", "우즈베키스탄", "조지아", "핀란드",
+          "아이슬란드", "세네갈", "나이지리아", "가나", "카메룬", "코트디부아르",
+          "알제리", "베네수엘라", "아랍에미리트", "이란", "중국", "이라크",
+          "키프로스", "아제르바이잔", "벨라루스", "태국", "말레이시아",
+          "인도네시아", "베트남", "룩셈부르크", "파나마"],
+    "D": ["보스니아 헤르체고비나", "북아일랜드", "몬테네그로", "북마케도니아",
+          "코소보", "뉴질랜드", "자메이카", "온두라스", "볼리비아", "엘살바도르",
+          "과테말라", "앙골라", "잠비아", "우간다", "말리", "부르키나 파소",
+          "기니", "카보베르데", "콩고 민주 공화국", "요르단", "오만", "바레인",
+          "시리아", "가봉", "웨일스"],
+    "E": [],
+    "F": [],
+}
 
 
-def _cup_trophy_points(result: str) -> float:
-    if not result:
-        return 0.0
-    if "우승" in result and "준우승" not in result:
+def _build_country_trophy_weight():
+    """_COUNTRY_RANK_WITHIN_GRADE + _GRADE_VALUE_RANGE로 국가명→트로피
+    가중치 딕셔너리를 만든다. 등급 내 순위 i(0=최고)에 선형보간:
+    value = hi - i/(n-1)*(hi-lo) (n=1이면 hi 그대로 — SS/S가 이 경로).
+    모듈 로드 시 1회 계산 — 게임 진행 중 안 바뀌는 정적 데이터라 매번
+    다시 계산할 필요 없음. 마지막에 등급 경계가 실제로 안 겹치는지
+    (예: A 최저값 > B 최고값) 검증해서, 나중에 누군가 _GRADE_VALUE_RANGE
+    구간을 실수로 겹치게 고쳐도 조용히 넘어가지 않고 바로 걸리게 한다."""
+    weight = {}
+    grade_order = ("SS", "S", "A", "B", "C", "D", "E", "F")
+    for grade in grade_order:
+        names = _COUNTRY_RANK_WITHIN_GRADE.get(grade, [])
+        hi, lo = _GRADE_VALUE_RANGE[grade]
+        n = len(names)
+        for i, name in enumerate(names):
+            v = hi if n <= 1 else hi - (i / (n - 1)) * (hi - lo)
+            weight[name] = round(v, 4)
+    # 등급 경계 불변식 검증(신민용 확정: "B급 최상이 A급 최하보다 높으면
+    # 안 된다") — 인접 등급끼리 min(상위등급) > max(하위등급)인지 확인.
+    for hi_grade, lo_grade in zip(grade_order, grade_order[1:]):
+        hi_min = _GRADE_VALUE_RANGE[hi_grade][1]
+        lo_max = _GRADE_VALUE_RANGE[lo_grade][0]
+        assert hi_min > lo_max, (
+            f"등급 경계 겹침: {hi_grade} 최저({hi_min}) <= {lo_grade} 최고({lo_max})")
+    return weight
+
+
+_COUNTRY_TROPHY_WEIGHT = _build_country_trophy_weight()
+
+
+def _country_trophy_weight(country_name):
+    """국가명 → 트로피 가중치. _COUNTRY_RANK_WITHIN_GRADE에 명시된
+    국가는 정확한 보간값을, 그 밖의 국가(COUNTRY_LEAGUE_GRADE 미등록
+    → 국대 등급 폴백, 또는 등급표엔 있지만 순위표에 아직 안 올라간
+    국가)는 그 등급 구간의 중간값을 쓴다 — 순위를 모르니 최고/최저
+    어느 쪽으로도 치우치지 않게.
+
+    [2026-09 4차 확장, 신민용+GPT 협의: "이걸 '트로피 전용 가중치'가
+    아니라 그 리그의 경쟁 수준을 나타내는 리그 강도 축으로 보는 게
+    맞다"] 원래 트로피 점수(_get_team_trophy_grade_weight 경유)에만
+    쓰던 이 값을 이제 score_rating/score_goals_assists 보정에도 그대로
+    재사용한다(_score_ballon_candidate 참고) — 새 국가 순위표를 또
+    만들지 않고 이미 만든 것 하나를 공유. 아래 _league_strength_weight는
+    이 함수의 별칭일 뿐 완전히 동일하다 — 호출부 맥락(트로피 vs
+    평점/생산성)에 따라 더 읽기 좋은 이름을 쓰기 위함."""
+    w = _COUNTRY_TROPHY_WEIGHT.get(country_name)
+    if w is not None:
+        return w
+    grade = get_country_league_grade(country_name)
+    hi, lo = _GRADE_VALUE_RANGE.get(grade, (1.0, 1.0))
+    return round((lo + hi) / 2.0, 4)
+
+
+_league_strength_weight = _country_trophy_weight  # 읽기용 별칭, 본체와 완전 동일
+
+
+# team_id -> 그 팀 리그 국가의 트로피 등급 배율 캐시. teams.league_id/
+# leagues.country_id는 세션 중 팀이 이적·승강 등으로 바뀔 수 있으므로
+# _invalidate_team_ovr_cache가 같이 비운다(위 _league_goal_mult_cache와
+# 동일 관례 — 다만 이건 "팀 단위"라 리그 단위보다 항목 수가 많아 전역
+# 1회 대신 팀별 지연 조회로 채운다).
+_team_trophy_grade_weight_cache: dict = {}
+
+
+def _get_team_trophy_grade_weight(team_id):
+    """team_id -> _country_trophy_weight(국가명). team_id가 없거나 조회
+    실패 시 안전하게 1.00(무보정, 기존 동작과 동일)을 반환한다."""
+    if not team_id:
         return 1.0
-    if "준우승" in result:
-        return 0.3
-    return 0.0
+    w = _team_trophy_grade_weight_cache.get(team_id)
+    if w is not None:
+        return w
+    conn = get_conn()
+    row = conn.execute(
+        """SELECT cn.name AS country FROM teams t
+           JOIN leagues l ON t.league_id = l.id
+           JOIN countries cn ON l.country_id = cn.id
+           WHERE t.id=?""", (team_id,)).fetchone()
+    w = _country_trophy_weight(row["country"]) if row else 1.0
+    _team_trophy_grade_weight_cache[team_id] = w
+    return w
+
+
+def _cup_trophy_points(result: str, team_id=None) -> float:
+    if not result:
+        return 0.0
+    if "우승" in result and "준우승" not in result:
+        base = 1.0
+    elif "준우승" in result:
+        base = 0.3
+    else:
+        return 0.0
+    return base * _get_team_trophy_grade_weight(team_id)
 
 
 def _sc_trophy_points(result: str) -> float:
     """[2026-08 신설, 10순위 슈퍼컵 시스템 구축 이후, 신민용 확정: "챔스가
     발롱에 1의 영향을 주면 슈퍼컵은 0.2의 영향을 주는 것"] 슈퍼컵은 이제
     실제로 구현됐으므로(super_cup_engine.py), 위 주석에서 "가중치를 매길
-    대상 자체가 없다"고 적어뒀던 한계가 해소됐다 — _cl_trophy_points와
+    대상 자체가 없다"고 적어뒀던 한계가 해소됐다 — 옛 _cl_trophy_points와
     완전히 같은 결과 판정 기준(우승/준우승/4강급)에 0.2를 곱해, 챔스
-    대비 정확히 1/5 무게로 반영한다. 슈퍼컵은 연 1회·4팀뿐인 단기
-    대회라 챔스만큼 심사에 크게 반영되면 안 된다는 원래 설계 의도
-    (위 별점 표: "슈퍼컵/클럽월드컵 ⭐☆☆☆☆~⭐⭐☆☆☆")를 그대로 따른다."""
-    return _cl_trophy_points(result) * 0.2
+    우승(10.0 스케일) 대비 정확히 1/5 무게로 반영한다. 슈퍼컵은 연
+    1회·4팀뿐인 단기 대회라 챔스만큼 심사에 크게 반영되면 안 된다는
+    원래 설계 의도(위 별점 표: "슈퍼컵/클럽월드컵 ⭐☆☆☆☆~⭐⭐☆☆☆")를
+    그대로 따른다.
+    [2026-09 6차 확장] 클럽 대항전 쪽(_club_comp_trophy_value)은 대륙/
+    티어/단계로 세분화됐지만, 슈퍼컵은 대륙·티어 구분이 없는 단일
+    대회라 이 자체 판정 기준(우승/준우승/4강급)을 그대로 유지한다 —
+    새 체계와 억지로 통합할 이유가 없다."""
+    if not result:
+        return 0.0
+    if "우승" in result and "준우승" not in result:
+        base = 10.0
+    elif "준우승" in result:
+        base = 4.5
+    elif "4강" in result or "3위" in result or "4위" in result:
+        base = 2.5
+    else:
+        base = 0.0
+    return base * 0.2
+
 
 
 def _intl_trophy_points(result: str, kind: str = "world", continent: str = "") -> float:
@@ -9931,7 +10534,10 @@ def _intl_trophy_points(result: str, kind: str = "world", continent: str = "") -
 
 
 def _league_rank_points(team_id: int) -> float:
-    """리그 최종 순위 기반 점수 (1위=리그 우승 4.0, 2위 1.5, 3위 0.5)."""
+    """리그 최종 순위 기반 점수 (1위=리그 우승 4.0, 2위 1.5, 3위 0.5) —
+    _get_team_trophy_grade_weight로 그 나라 리그의 국가별 세부 가중치를
+    적용(SS/S=1.00, A 0.90~0.78 국가별 세분화 등, 위 _country_trophy_
+    weight 문서 참고)."""
     try:
         rows = get_league_standings_by_team(team_id)
     except Exception:
@@ -9939,12 +10545,14 @@ def _league_rank_points(team_id: int) -> float:
     for i, r in enumerate(rows):
         if r.get("id") == team_id:
             if i == 0:
-                return 4.0
-            if i == 1:
-                return 1.5
-            if i == 2:
-                return 0.5
-            return 0.0
+                base = 4.0
+            elif i == 1:
+                base = 1.5
+            elif i == 2:
+                base = 0.5
+            else:
+                return 0.0
+            return base * _get_team_trophy_grade_weight(team_id)
     return 0.0
 
 
@@ -9955,8 +10563,6 @@ def _get_ballon_trophy_bonus(year: int, team_id: int) -> float:
     배점을 올려 상한이 기존 19.5→25.5로 늘었지만, 그 해 챔스+월드컵+
     리그+자국컵을 전부 우승해야 나오는 극단치라 실질 영향은 제한적."""
     conn = get_conn()
-    cl_t = conn.execute(
-        "SELECT continent, my_result FROM cl_tournaments WHERE year=? AND my_in=1", (year,)).fetchone()
     cup_t = conn.execute(
         "SELECT my_result FROM cup_tournaments WHERE year=? AND my_in=1", (year,)).fetchone()
     sc_t = conn.execute(
@@ -9966,13 +10572,15 @@ def _get_ballon_trophy_bonus(year: int, team_id: int) -> float:
         (year,)).fetchone()
     conn.close()
     bonus = 0.0
-    # [2026-09 수정, 신민용 확정: "유럽 챔스가 실제로 더 높은 경쟁 수준의
-    # 대회라서 우승 가치가 더 커야 한다"] AI 후보(_get_team_trophy_bonus)
-    # 와 동일하게 _CL_CONTINENT_WEIGHT를 곱한다 — 안 그러면 "내 발롱도르"
-    # 판정이 AI 세계기록실 계산과 어긋난다(이 함수 전체의 설계 원칙).
-    bonus += _cl_trophy_points(cl_t["my_result"] if cl_t else None) * \
-        _cl_continent_weight(cl_t["continent"] if cl_t else None)
-    bonus += _cup_trophy_points(cup_t["my_result"] if cup_t else None)
+    # [2026-09 6차 확장, 신민용 확정: "유로파/컨퍼런스리그도 대륙별
+    # 위상·진출 단계로 트로피 가치가 나야 한다"] AI 후보(_get_team_
+    # trophy_bonus)와 완전히 동일한 _get_club_comp_result/_club_comp_
+    # trophy_value를 그대로 쓴다 — team_id 기반 일반 함수라 "나"/AI
+    # 구분 없이 재사용 가능, "내 발롱도르"와 "세계기록실 발롱도르"가
+    # 어긋나면 안 된다는 이 함수의 설계 원칙 그대로 유지.
+    cl_stage, cl_continent, cl_tier = _get_club_comp_result(year, team_id)
+    bonus += _club_comp_trophy_value(cl_stage, cl_continent, cl_tier)
+    bonus += _cup_trophy_points(cup_t["my_result"] if cup_t else None, team_id=team_id)
     bonus += _sc_trophy_points(sc_t["my_result"] if sc_t else None)
     bonus += _intl_trophy_points(
         intl_t["my_result"] if intl_t else None,
@@ -10010,15 +10618,19 @@ def _major_stage_carry(year: int, team_id: int) -> bool:
     result와 동일 기준)."""
     conn = get_conn()
     intl_t = conn.execute(
-        "SELECT kind, continent, my_result FROM intl_tournaments WHERE year=? AND my_selected=1",
-        (year,)).fetchone()
-    cl_t = conn.execute(
-        "SELECT continent, my_result FROM cl_tournaments WHERE year=? AND my_in=1",
+        "SELECT id, kind, continent, my_result FROM intl_tournaments WHERE year=? AND my_selected=1",
         (year,)).fetchone()
     conn.close()
+    # [2026-09 재보정, 신민용 리포트: "국가대표도 주전/로테/대기가 나뉘는데
+    # 0경기 뛴 대기 선수도 우승 값을 받는다"] my_selected=1은 "스쿼드에
+    # 뽑혔는가"일 뿐 "실제로 뛰었는가"가 아니다 — _player_appeared_in_
+    # tournament로 최소 출전(appearances>0) 조건을 추가한다. AI 쪽
+    # _has_major_stage_proof도 동일하게 고쳐서 "나"와 "AI" 기준이 계속
+    # 일관되게 유지된다(v2 피드백 #3 원칙 그대로 준수).
     if intl_t:
         result = intl_t["my_result"] or ""
-        if intl_t["kind"] == "world" and ("우승" in result or "준우승" in result):
+        _played = _player_appeared_in_tournament(intl_t["id"], _SIA_MY_PLAYER_ID)
+        if intl_t["kind"] == "world" and ("우승" in result or "준우승" in result) and _played:
             return True
         # [2026-09 수정, 신민용 확정: "아시안컵 우승도 인정해야 한다 —
         # 유로만 인정하는 건 유럽 편향"] my_selected=1은 이미 "내 국적이
@@ -10026,15 +10638,15 @@ def _major_stage_carry(year: int, team_id: int) -> bool:
         # 1개뿐), continent=='유럽' 제약을 없애면 곧바로 "내 대륙컵
         # 우승이면 통과"가 된다 — 4개 연맹(유럽/아메리카/아시아/아프리카)
         # 전부 동등 취급.
-        if intl_t["kind"] == "continent" and "우승" in result:
+        if intl_t["kind"] == "continent" and "우승" in result and _played:
             return True
-    if cl_t:
-        # [2026-09 수정, 같은 이유] 유럽 CL만 인정하던 것도 없앤다 —
-        # AI 경로(_get_club_cl_result)가 이미 대륙 무관하게 우승만
-        # 보므로, 여기도 맞춘다.
-        result = cl_t["my_result"] or ""
-        if "우승" in result:
-            return True
+    # [2026-09 6차 확장] AI 경로(_has_major_stage_proof)와 완전히 동일한
+    # _get_club_comp_result를 쓴다 — 유로파/컨퍼런스리그 우승도 이제
+    # 인정한다(예전엔 cl_tournaments만 봐서 유로파/컨퍼런스 우승이면
+    # 그냥 통과 못 했다).
+    cl_stage, _cl_continent, cl_tier = _get_club_comp_result(year, team_id)
+    if cl_stage == "우승" and _player_appeared_in_club_cl(year, _SIA_MY_PLAYER_ID, tier=cl_tier or "cl"):
+        return True
     return False
 
 
@@ -10076,16 +10688,57 @@ def _get_historical_league_rank_points(year, team_id):
     """_league_rank_points(team_id)는 '지금 시즌' 실시간 순위표만 보므로
     과거 연도를 훑는 이 계산엔 못 쓴다(v2 피드백에서 확인된 문제) —
     hist.league_season_standings에서 그 해 승점을 다시 계산해 순위를
-    매기는 버전. 배점은 _league_rank_points와 동일(1위 4.0/2위 1.5/3위 0.5)."""
+    매기는 버전. 배점은 _league_rank_points와 동일(1위 4.0/2위 1.5/3위 0.5).
+
+    [2026-09 버그수정, 신민용+GPT 리포트: "발롱도르 저장값에 리그 순위
+    점수가 통째로 빠져 있다(재계산하면 값이 다르다)"] 원인: _advance_week
+    안에서 발롱도르 계산(_end_of_season)이 그 해 최종 순위를 hist.
+    league_season_standings에 채우는 archive_old_seasons()/_summarize_
+    and_prune_archive()(_generate_all_league_schedules 안에서 호출)보다
+    먼저 실행된다 — 즉 발롱도르가 계산되는 바로 그 순간엔 이 표에 방금
+    끝난 시즌 행이 아직 없다. 정식 수정(호출 순서 자체를 바꾸는 것)은
+    파워랭킹 등 다른 로직과의 상호작용을 더 확인해야 해서, 대신 여기서
+    self-healing 폴백을 넣는다: hist 표에 없으면 그 시점에 아직 archive
+    되지 않고 남아있는 main.match_results에서 즉석으로 같은 승점/순위
+    계산을 한다(로직은 완전히 동일, 데이터 소스만 다름). 나중에 hist
+    표가 채워진 뒤 다시 조회하면 그때는 정상적으로 hist 경로를 탄다."""
     conn = get_conn()
     trow = conn.execute("SELECT league_id FROM teams WHERE id=?", (team_id,)).fetchone()
     if not trow or not trow["league_id"]:
         conn.close()
         return 0.0
+    league_id = trow["league_id"]
     rows = conn.execute(
         """SELECT team_id, wins, draws, losses, goals_for, goals_against
            FROM hist.league_season_standings WHERE league_id=? AND year=?""",
-        (trow["league_id"], year)).fetchall()
+        (league_id, year)).fetchall()
+    if not rows:
+        # [2026-09 신설] 폴백 — 위 코멘트 참고. match_results는 이 시점엔
+        # 아직 archive_old_seasons()가 지우지 않은 상태라 그 해 경기가
+        # 그대로 남아있다(완료된 경기만: 스코어 NULL이 아닌 것).
+        rows = conn.execute(
+            """SELECT team_id,
+                      SUM(win) AS wins, SUM(draw) AS draws, SUM(loss) AS losses,
+                      SUM(gf) AS goals_for, SUM(ga) AS goals_against
+               FROM (
+                   SELECT home_team_id AS team_id,
+                          CASE WHEN home_score>away_score THEN 1 ELSE 0 END AS win,
+                          CASE WHEN home_score=away_score THEN 1 ELSE 0 END AS draw,
+                          CASE WHEN home_score<away_score THEN 1 ELSE 0 END AS loss,
+                          home_score AS gf, away_score AS ga
+                   FROM match_results
+                   WHERE league_id=? AND year=? AND home_score IS NOT NULL AND away_score IS NOT NULL
+                   UNION ALL
+                   SELECT away_team_id AS team_id,
+                          CASE WHEN away_score>home_score THEN 1 ELSE 0 END AS win,
+                          CASE WHEN away_score=home_score THEN 1 ELSE 0 END AS draw,
+                          CASE WHEN away_score<home_score THEN 1 ELSE 0 END AS loss,
+                          away_score AS gf, home_score AS ga
+                   FROM match_results
+                   WHERE league_id=? AND year=? AND home_score IS NOT NULL AND away_score IS NOT NULL
+               )
+               GROUP BY team_id""",
+            (league_id, year, league_id, year)).fetchall()
     conn.close()
     if not rows:
         return 0.0
@@ -10098,55 +10751,76 @@ def _get_historical_league_rank_points(year, team_id):
     return 0.0
 
 
-def _get_club_cl_result(year, team_id):
-    """team_id가 그 해 실제로 참가했던 챔피언스리그급 대회(cl_tournaments)
-    에서의 (결과 문자열, 대륙) 튜플 — 결과는 '우승'/'준우승'/'4강'/
-    None(참가 안 함 또는 4강 밖 탈락). my_in=1 같은 '내 팀 전용' 플래그
-    대신 cl_entries로 실제 참가 여부를 직접 조회한다.
-
-    [2026-09 확장, 신민용 확정: "유럽 챔스가 실제로 더 높은 경쟁 수준의
-    대회라서 우승 가치가 더 커야 한다"] 호출부(_get_team_trophy_bonus)
-    가 _CL_CONTINENT_WEIGHT로 대회 가중치를 곱하려면 어느 대륙 대회
-    였는지가 필요하므로, 반환값에 continent를 같이 얹는다(기존엔 결과
-    문자열만 반환했음 — 콜사이트 2곳 모두 튜플 언패킹으로 이미 맞춰둠)."""
+def _get_award_role(year, player_id):
+    """개인상 참가도 계산용 — 그 해 이 선수의 역할 라벨(주전/로테이션/
+    대기/전력외/유망주, compute_squad_roles가 매긴 것)을 그대로 가져온다.
+    [2026-09 신설] _get_player_comp_contribution이 cl/cup/sc 세 번
+    호출되는데 역할은 대회와 무관하게 하나뿐이라, 호출부(_get_team_
+    trophy_bonus)가 이 함수로 한 번만 조회해 세 곳에 똑같이 넘긴다."""
     conn = get_conn()
-    trow = conn.execute(
-        """SELECT t.id, t.continent FROM cl_entries e JOIN cl_tournaments t ON e.tournament_id=t.id
-           WHERE e.team_id=? AND t.year=? AND t.status='done' LIMIT 1""",
-        (team_id, year)).fetchone()
-    if not trow:
-        conn.close()
-        return None, None
-    from world_browser import _batch_cl_placements
-    pl = _batch_cl_placements([trow["id"]], conn, match_table="cl_matches").get(trow["id"]) or {}
+    if player_id == _SIA_MY_PLAYER_ID:
+        row = conn.execute(
+            "SELECT role FROM my_player_position_history WHERE year=?", (year,)).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT role FROM hist.ai_player_position_history WHERE player_id=? AND year=?",
+            (player_id, year)).fetchone()
     conn.close()
-    continent = trow["continent"]
-    if pl.get("winner") == team_id:
-        return "우승", continent
-    if pl.get("runner_up") == team_id:
-        return "준우승", continent
-    if team_id in (pl.get("third"), pl.get("fourth")):
-        return "4강", continent
-    return None, continent
+    return row["role"] if row else None
 
 
-def _get_player_comp_contribution(year, player_id, competition, team_id=None):
+# [2026-09 신설, 신민용+GPT 확정: "_get_player_comp_contribution의 참가도가
+# matches/3.0인데, matches가 로스터 전원에게 똑같이 부여되는 '팀이 그
+# 대회에서 뛴 총 경기수'라 사실상 항상 1.0으로 꽉 찬다 — 위 _SQUAD_DEPTH_
+# DECAY와 같은 철학(역할 기반)으로 통일하자"] 생산 스탯(saves/goals/
+# clean_sheets)에 이미 쓰는 뎁스 감쇠 배율을 에이스(1.15) 기준으로
+# 정규화해 그대로 참가도로 재사용한다 — matches 기반 계산과 섞지 않고
+# 완전히 교체한다(사용자 확정: "matches를 완전히 없애는 게 현재 DB
+# 구조에서는 더 정직하다" — matches는 팀이 그 대회에 참가했는지 여부
+# 확인 용도로만 남긴다). role이 없으면(이 기능 신설 이전 과거 시즌 등)
+# 기존과 동일하게 풀 참가도(1.0)로 폴백한다.
+_ROLE_PARTICIPATION = {
+    "주전": round(_SQUAD_DEPTH_DECAY[0] / _SQUAD_DEPTH_DECAY[0], 4),
+    "로테이션": round(_SQUAD_DEPTH_DECAY[1] / _SQUAD_DEPTH_DECAY[0], 4),
+    "대기": round(_SQUAD_DEPTH_DECAY[2] / _SQUAD_DEPTH_DECAY[0], 4),
+    "전력외": round(_SQUAD_DEPTH_DECAY[3] / _SQUAD_DEPTH_DECAY[0], 4),
+    "유망주": round(_SQUAD_DEPTH_DECAY[3] / _SQUAD_DEPTH_DECAY[0], 4),
+}
+
+
+def _get_player_comp_contribution(year, player_id, competition, team_id=None, role=None,
+                                   quality_cap=1.3):
     """[2026-09 신설, 신민용 지적: "슈퍼컵 이런 것도 우승만 중요한 게
     아니라 그 과정에서 평점도 중요하다 — 평점이 낮거나 벤치였으면 우승해도
-    의미가 없다"] competition('cl'/'cup'/'sc')에서 이 선수의 참가도(경기수)
-    ×평점 품질을 0~1.3 배율로 환산 — 팀이 우승해도 안 뛰었거나(0경기)
-    형편없었으면(평점 낮음) 트로피 보너스가 거의 안 붙게 만든다.
-    matches>=3이면 참가도는 만점(대회마다 '풀 시즌' 경기수가 크게 달라
-    정확한 분모 대신 단순 하한을 씀 — 필요해지면 나중에 대회별 정밀
-    분모로 교체 가능). AI는 hist.ai_player_season_stats_by_comp,
-    나는 cl_matches/cup_matches/sc_matches의 my_played/my_rating을
-    직접 집계한다(내 쪽엔 이런 대회별 요약 표가 따로 없어서).
+    의미가 없다"] competition('cl'/'cup'/'sc')에서 이 선수의 참가도×평점
+    품질을 0~quality_cap 배율로 환산 — 팀이 우승해도 안 뛰었거나 형편없었으면
+    (평점 낮음) 트로피 보너스가 거의 안 붙게 만든다. AI는 hist.ai_player_
+    season_stats_by_comp, 나는 cl_matches/cup_matches/sc_matches의
+    my_played/my_rating을 직접 집계한다(내 쪽엔 이런 대회별 요약 표가
+    따로 없어서).
+
+    [2026-09 6차 확장, 신민용+GPT 협의: "0.72(유로파 대회 기본값) 자체가
+    문제가 아니라 1.30 배율이 모든 대회에 똑같이 곱해지는 게 문제 —
+    유로파 우승 9.36점이 옛 챔스 우승(10.0)급까지 올라간 원인"] 배율
+    상한을 고정 1.3이 아니라 호출부가 대회 티어별로 넘기는 quality_cap
+    으로 바꾼다(기본값 1.3은 cup/sc처럼 티어 구분이 없는 대회의 기존
+    동작을 그대로 유지) — _CLUB_COMP_QUALITY_CAP 참고.
+
+    [2026-09 버그수정, 신민용+GPT 리포트: "로스터 전원이 팀 경기수를
+    공유해서(matches가 개인별 실제 출전이 아님) 참가도가 사실상 항상
+    1.0이 된다 — 로테이션 GK가 CL 우승 트로피를 주전과 똑같이 다 먹는다"]
+    참가도를 matches 기반(min(1.0, matches/3.0))에서 역할 기반
+    (_ROLE_PARTICIPATION)으로 완전히 교체한다. matches는 이제 "이 팀이
+    그 대회에 참가했는가"(행 존재 여부) 확인 용도로만 남는다 — 그 값
+    자체를 참가도 계산에 쓰지 않는다. role은 호출부(_get_team_trophy_
+    bonus)가 _get_award_role로 한 번만 조회해 넘겨준다(cl/cup/sc 세 번
+    호출이 매번 다시 조회하지 않도록).
 
     [2026-09 버그수정, 신민용 리포트: "아시아 챔스 뛰고 시즌 중 아스날로
     이적했는데 내가 가기 전 아스날이 딴 유럽 챔스 우승이 발롱도르 점수로
     들어온다"] team_id 없이 그 해 아무 {competition}나 뛰었는지만 보면,
     한 해 안에 대륙/나라를 옮긴 선수는 "전혀 다른 팀의 전혀 다른 대회"에서
-    쌓은 참가도가 엉뚱한 트로피(_get_club_cl_result가 찾아준 team_id의
+    쌓은 참가도가 엉뚱한 트로피(_get_club_comp_result가 찾아준 team_id의
     우승)에 곱해져 버린다 — 실제로는 그 우승에 단 한 경기도 기여하지
     않았는데도 참가도가 0보다 커서 게이트를 통과하는 것. team_id를 받으면
     "그 팀이 뛴 경기"로 좁혀서, 트로피의 주인(team_id)과 내가 실제로
@@ -10183,8 +10857,8 @@ def _get_player_comp_contribution(year, player_id, competition, team_id=None):
         rating = row["rating"] if row and row["rating"] is not None else 0.0
     if not matches:
         return 0.0
-    participation = min(1.0, matches / 3.0)
-    quality = max(0.2, min(1.3, 1.0 + (rating - 6.0) / 1.5))
+    participation = _ROLE_PARTICIPATION.get(role, 1.0)
+    quality = max(0.2, min(quality_cap, 1.0 + (rating - 6.0) / 1.5))
     return participation * quality
 
 
@@ -10240,15 +10914,20 @@ def _get_team_trophy_bonus(year, team_id, player_id, cache=None):
     반영되므로 중복 적용 방지)."""
     if not team_id:
         return 0.0
-    cl_result, cl_continent = _cached(cache, ("cl", year, team_id),
-                                       _get_club_cl_result, year, team_id)
+    # [2026-09 신설] cl/cup/sc 세 호출 모두 같은 역할을 쓰므로 한 번만
+    # 조회해서 넘긴다 — _get_player_comp_contribution 문서 참고.
+    role = _cached(cache, ("award_role", year, player_id), _get_award_role, year, player_id)
+    cl_stage, cl_continent, cl_tier = _cached(cache, ("cl", year, team_id),
+                                               _get_club_comp_result, year, team_id)
     # [2026-09 버그수정] 아래 세 _get_player_comp_contribution 호출에
     # team_id를 넘긴다 — 안 그러면 "이 team_id가 우승했는가"와 "내가
     # 그 해 아무 대회나 뛰었는가"가 서로 다른 질문인데 뒤섞여서, 시즌
     # 중 대륙/나라를 옮긴 선수가 전혀 안 뛴 팀의 우승에도 참가도가
     # 붙어버린다(위 함수 docstring 참고).
-    bonus = _cl_trophy_points(cl_result) * _cl_continent_weight(cl_continent) * \
-        _get_player_comp_contribution(year, player_id, "cl", team_id=team_id)
+    bonus = _club_comp_trophy_value(cl_stage, cl_continent, cl_tier) * \
+        _get_player_comp_contribution(
+            year, player_id, "cl", team_id=team_id, role=role,
+            quality_cap=_CLUB_COMP_QUALITY_CAP.get((cl_continent, cl_tier), 1.3))
     conn = get_conn()
     cup_won = conn.execute(
         """SELECT 1 FROM cup_entries e JOIN cup_tournaments t ON e.tournament_id=t.id
@@ -10260,11 +10939,11 @@ def _get_team_trophy_bonus(year, team_id, player_id, cache=None):
         (team_id, year, team_id)).fetchone()
     conn.close()
     if cup_won:
-        bonus += _cup_trophy_points("우승") * _get_player_comp_contribution(
-            year, player_id, "cup", team_id=team_id)
+        bonus += _cup_trophy_points("우승", team_id=team_id) * _get_player_comp_contribution(
+            year, player_id, "cup", team_id=team_id, role=role)
     if sc_won:
         bonus += _sc_trophy_points("우승") * _get_player_comp_contribution(
-            year, player_id, "sc", team_id=team_id)
+            year, player_id, "sc", team_id=team_id, role=role)
     bonus += _cached(cache, ("lrank", year, team_id),
                       _get_historical_league_rank_points, year, team_id)
     return bonus
@@ -10296,20 +10975,27 @@ _NATION_CONF = {
 
 def _get_nationality_major_stage_result(year, nationality):
     """그 해 월드컵 + 이 국적이 속한 연맹의 대륙컵에서 거둔 결과 —
-    (월드컵 결과문자열 또는 None, 대륙컵 결과문자열 또는 None) 튜플.
+    (월드컵 결과문자열 또는 None, 월드컵 대회id, 대륙컵 결과문자열 또는
+    None, 대륙컵 대회id) 4-튜플.
 
     [2026-09 수정, 신민용 지적: "유로만 인정하고 아시안컵/남북미
     대륙컵/아프리카 네이션스컵은 인정 안 하면 유럽 편향이다"] 예전엔
     continent='유럽' 대륙컵만 조회했다 — 이제 이 국적의 대륙컵(연맹키는
-    _NATION_CONF로 변환)을 그대로 조회해 4개 연맹을 동등하게 다룬다."""
+    _NATION_CONF로 변환)을 그대로 조회해 4개 연맹을 동등하게 다룬다.
+
+    [2026-09 확장] 대회 id도 같이 반환한다 — 호출부(_has_major_stage_
+    proof)가 "이 선수가 그 대회에 실제로 출전했는가"를 확인하려면
+    tournament_id가 필요하기 때문(아래 _player_appeared_in_tournament
+    참고)."""
     if not nationality:
-        return None, None
+        return None, None, None, None
     from world_browser import _batch_placements
     conn = get_conn()
     wc = conn.execute(
         "SELECT id FROM intl_tournaments WHERE year=? AND kind='world' AND status='done'",
         (year,)).fetchone()
     wc_result = None
+    wc_id = wc["id"] if wc else None
     if wc:
         pl = _batch_placements([wc["id"]], conn).get(wc["id"]) or {}
         if pl.get("winner") == nationality:
@@ -10323,40 +11009,119 @@ def _get_nationality_major_stage_result(year, nationality):
         "SELECT continent FROM countries WHERE name=?", (nationality,)).fetchone()
     conf_key = _NATION_CONF.get(nat_row["continent"], "") if nat_row else ""
     conf_result = None
+    conf_id = None
     if conf_key:
         ct = conn.execute(
             """SELECT id FROM intl_tournaments WHERE year=? AND kind='continent'
                AND continent=? AND status='done'""", (year, conf_key)).fetchone()
         if ct:
+            conf_id = ct["id"]
             pl = _batch_placements([ct["id"]], conn).get(ct["id"]) or {}
             if pl.get("winner") == nationality:
                 conf_result = "우승"
             elif pl.get("runner_up") == nationality:
                 conf_result = "준우승"
     conn.close()
-    return wc_result, conf_result
+    return wc_result, wc_id, conf_result, conf_id
+
+
+def _player_appeared_in_club_cl(year, player_id, tier="cl"):
+    """이 선수가 그 시즌 챔스/유로파/컨퍼런스급 대회에 실제로
+    출전(matches>0)했는지 확인 — _player_appeared_in_tournament의 클럽
+    대항전 버전.
+
+    [2026-09 신설, 신민용 확정: "국가대표 쪽 고친 김에 클럽 챔스 우승
+    경로도 같이 고치자"] _has_major_stage_proof/_major_stage_carry의
+    클럽 대항전 우승 경로(_get_club_comp_result)는 팀이 우승했는지만
+    보고 그 선수가 실제로 그 대회에 뛰었는지는 안 봤다 — 스쿼드엔
+    있었지만 한 번도 안 뛴 선수도 팀 우승만으로 게이트를 통과하던
+    구멍(국가대표 경로와 완전히 같은 종류의 문제).
+
+    [2026-09 6차 확장] tier('cl'/'el'/'ecl' — _get_club_comp_result가
+    실제로 찾아준 대회 종류) 매개변수 추가. 나(_SIA_MY_PLAYER_ID)는
+    그 tier에 맞는 매치 테이블(cl_matches/el_matches/ecl_matches)의
+    my_played=1을 본다 — 안 그러면 내가 실제로는 유로파리그에 있었는데
+    cl_matches만 조회해서 0으로 나오는 문제가 생긴다. AI는
+    hist.ai_player_season_stats_by_comp(competition='cl')의 matches를
+    그대로 본다 — CL/EL/ECL이 waterfall 구조로 이미 'cl' 버킷 하나에
+    합쳐 저장되므로(실측 확인) tier 무관하게 이 쿼리 그대로 재사용
+    가능."""
+    conn = get_conn()
+    if player_id == _SIA_MY_PLAYER_ID:
+        _entries_tbl, _tournaments_tbl2, _matches_tbl2 = _CLUB_COMP_TABLES.get(tier, _CLUB_COMP_TABLES["cl"])
+        row = conn.execute(
+            f"""SELECT COUNT(*) AS n FROM {_matches_tbl2} m
+               JOIN {_tournaments_tbl2} t ON m.tournament_id=t.id
+               WHERE t.year=? AND m.my_played=1""",
+            (year,)).fetchone()
+    else:
+        row = conn.execute(
+            """SELECT matches AS n FROM hist.ai_player_season_stats_by_comp
+               WHERE player_id=? AND year=? AND competition='cl'""",
+            (player_id, year)).fetchone()
+    conn.close()
+    return bool(row and (row["n"] or 0) > 0)
+
+
+def _player_appeared_in_tournament(tournament_id, player_id):
+    """이 선수가 그 국제대회에 실제로 출전(appearances>0)했는지 확인.
+    [2026-09 신설, 신민용 리포트: "국가대표도 주전/로테/대기가 나뉘어
+    있는데, 대기라서 0경기 뛴 선수도 그 나라가 우승했다는 이유만으로
+    발롱도르 '국제무대 증명' 게이트를 통과한다"] 기존 _has_major_stage_
+    proof/_major_stage_carry는 "그 나라가 우승했는가"만 보고 "이 선수가
+    실제로 그 대회에서 뛰었는가"는 전혀 안 봤다 — _get_player_intl_bonus
+    (가산점 쪽)는 이미 _intl_participation_factor로 참가도를 반영하고
+    있었는데 게이트 쪽만 빠져 있던 셈. 나(_SIA_MY_PLAYER_ID)는
+    intl_matches.my_played, AI는 intl_squad.appearances를 본다 —
+    _get_player_intl_bonus의 _contribution()이 쓰는 것과 동일한 출처."""
+    if not tournament_id:
+        return False
+    conn = get_conn()
+    if player_id == _SIA_MY_PLAYER_ID:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM intl_matches WHERE tournament_id=? AND my_played=1",
+            (tournament_id,)).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT appearances AS n FROM intl_squad WHERE tournament_id=? AND player_id=?",
+            (tournament_id, player_id)).fetchone()
+    conn.close()
+    return bool(row and (row["n"] or 0) > 0)
 
 
 def _has_major_stage_proof(year, team_id, player_id, nationality=None, cache=None):
     """A급 리그 선수의 발롱도르 후보 예외 게이트. 기존 _major_stage_carry
     와 정확히 같은 조건(월드컵 우승/준우승, 대륙컵 우승, CL 우승)을
     쓰되 my_in/my_selected 플래그 대신 임의 team_id/player_id로 동작한다.
-    개인 평점/출전 비중 조건은 원래 없음(v2 피드백 #3에서 실제 코드로
-    확인) — 새로 추가하지 않는다. 추가하면 통합(9번) 이후 '내 발롱도르'
-    판정 기준까지 이번에 몰래 빡빡해지는 셈이라 일관성 원칙에 어긋남.
+
+    [2026-09 재보정, 신민용 리포트: "국가대표도 주전/로테/대기가 나뉘는데
+    0경기 뛴 대기 선수도 그 나라가 우승했다는 이유만으로 통과한다"] 원래
+    "개인 평점/출전 비중 조건은 없음"이었다(v2 피드백 #3, "내 발롱도르"
+    판정 기준까지 몰래 빡빡해지면 안 된다는 일관성 원칙 때문에 추가 안
+    했었음) — 이번엔 그 일관성 원칙을 지키면서(아래 _major_stage_carry도
+    동일하게 같이 고침, AI/나 양쪽 다 똑같이 "실제로 뛰었는가"를 본다)
+    _player_appeared_in_tournament로 최소 출전(appearances>0) 조건만
+    추가한다. 완전히 새 조건이 아니라 _get_player_intl_bonus(가산점
+    쪽)가 이미 쓰던 참가도 체크를 게이트 쪽에도 맞춰 넣는 것 — 두 경로가
+    서로 다른 기준을 쓰던 게 원래 버그였다는 뜻.
+    [2026-09 확장, 신민용 확정: "클럽 챔스 우승 경로도 같이 고치자"]
+    아래 클럽 CL 우승 경로(cl_result)도 같은 문제(팀 단위 우승 여부만
+    보고 개인 출전은 안 봄)가 있어서 _player_appeared_in_club_cl로
+    동일하게 막았다.
     [2026-09 수정] 대륙컵/CL 모두 유럽 전용이던 것을 대륙 무관으로
     넓혔다(_major_stage_carry와 동일 수정, 위 참고)."""
     if player_id == _SIA_MY_PLAYER_ID:
         return _major_stage_carry(year, team_id)   # 기존 검증된 로직 그대로 재사용
-    wc_result, conf_result = _cached(cache, ("natstage", year, nationality),
-                                      _get_nationality_major_stage_result, year, nationality)
-    if wc_result in ("우승", "준우승"):
+    wc_result, wc_id, conf_result, conf_id = _cached(
+        cache, ("natstage", year, nationality),
+        _get_nationality_major_stage_result, year, nationality)
+    if wc_result in ("우승", "준우승") and _player_appeared_in_tournament(wc_id, player_id):
         return True
-    if conf_result == "우승":
+    if conf_result == "우승" and _player_appeared_in_tournament(conf_id, player_id):
         return True
-    cl_result, _cl_continent = _cached(cache, ("cl", year, team_id),
-                                        _get_club_cl_result, year, team_id)
-    return cl_result == "우승"
+    cl_stage, _cl_continent, cl_tier = _cached(cache, ("cl", year, team_id),
+                                                _get_club_comp_result, year, team_id)
+    return cl_stage == "우승" and _player_appeared_in_club_cl(year, player_id, tier=cl_tier or "cl")
 
 
 def _intl_participation_factor(appearances: int, total_matches: int) -> float:
@@ -10456,6 +11221,17 @@ def _get_player_intl_bonus(year, player_id, nationality):
                 total += weight * _contribution(ct["id"])
             elif pl.get("runner_up") == nationality:
                 total += weight * 0.5 * _contribution(ct["id"])
+            # [2026-09 신설, 신민용 리포트: "월드컵은 우승>준우승>4강인데
+            # 대륙컵은 우승>준우승>없음이다 — 대회 위상에 비해 이상한
+            # 비대칭이 생긴다. 월드컵과 동일한 티어 구조를 가져가는 게
+            # 맞다"] 대륙컵도 3/4위전(TP, "continental" 스케줄에 항상
+            # 포함 — constants.TOURNAMENT_SCHEDULE_RULES 참고)까지 반영해
+            # 4강(3·4위전 진출) 팀에도 가점을 준다. 비율은 새로 만들지
+            # 않고 위 월드컵 _INTL_TROPHY_POINTS의 기존 내부 비율(우승10:
+            # 준우승5:4강2 = 1:0.5:0.2)을 그대로 이어받는다 — 준우승이
+            # 이미 winner의 0.5배이므로, 4강도 같은 비율로 0.2배.
+            elif nationality in (pl.get("third"), pl.get("fourth")):
+                total += weight * 0.2 * _contribution(ct["id"])
 
     conn.close()
     return total
@@ -10475,62 +11251,450 @@ def _is_ballon_candidate(league_grade, year, team_id, player_id, nationality=Non
 # (공격 포지션만 정의됨)에 없는 포지션(GK/수비/CDM)은 여기서 낮은 고정
 # 기대치를 준다. 목적은 "0점"이 아니라 "그 포지션 기준 정상 범위" —
 # v2 피드백 #3(생산성 점수가 사실상 탈락 효과가 되면 안 됨)을 반영.
-_BALLON_POS_GOAL_FALLBACK = {"CDM": 2, "CB": 1, "LB": 1, "RB": 1, "LWB": 2, "RWB": 2}
-_BALLON_POS_ASSIST_FALLBACK = {"CDM": 3, "CB": 1, "LB": 3, "RB": 3, "LWB": 4, "RWB": 4}
-# [2026-09 수정, 신민용 지적: "현실은 윙/스트라이커가 가장 많이 받고
-# 그다음 미드필더, 그다음 키퍼, 그다음이 수비수"] 예전엔 GK(3.0)가
-# 제일 높고 공격수/미드필더는 0(보정 없음)이라 실제 수상 경향과 정반대
-# 였다 — 포지션보정 자체를 이 순서(FW/WG > MF > GK > DF)로 다시 배점.
-# GK는 여기 낮은 고정치만 받고, 클린시트 비중은 그 아래서 별도로 더한다
-# (그래도 골키퍼가 통째로 후보에서 밀려나진 않게 — 노이어 2014 같은
-# 예외적 시즌은 클린시트 가점으로 여전히 상위권 진입 가능).
+_BALLON_POS_GOAL_FALLBACK = {"CDM": 3, "CB": 1, "LB": 1, "RB": 1, "LWB": 2, "RWB": 2}
+_BALLON_POS_ASSIST_FALLBACK = {"CDM": 5, "CB": 1, "LB": 1, "RB": 1, "LWB": 4, "RWB": 4}
+# [2026-09 신설, 77차 CL 검증 도중 자체발견, 78차 수정: "LM/RM이 이
+# 표에도 AWARD_POS_GOAL/ASSIST에도 아예 없어서 안쪽 .get(pos,3) 기본값
+# (3+3=6)으로 조용히 떨어지고 있었다"] 실제 세이브(2000년)에서 챔스
+# 기록이 아예 없는 RM 한 명이 리그에서만 11골15도움을 기록해 26/6=4.33
+# (3배 상한 초과)로 순수 리그 성적만으로 발롱도르 생산성 만점(15.0)을
+# 받는 사례를 발견 — 오늘 손댄 챔스 보정과 무관하게 원래부터 있던
+# 표 공백. _BALLON_POSITION_BONUS(RM/LM=1.0, CAM 1.1과 CM 0.9 사이)가
+# 이미 이 게임 내 RM/LM 서열을 "CM보다 살짝 위, CAM보다는 아래"로
+# 매겨두고 있었으므로 그 서열을 기대치에도 그대로 옮긴다 — 득점은
+# CM(4)과 LW/RW(9) 사이인 6, 도움은 CM·LW/RW가 이미 둘 다 8로 같으니
+# 그대로 8(합 14, CM 12와 CAM/LW/RW 17~18 사이). AWARD_POS_GOAL/ASSIST
+# (constants.py)는 발롱도르뿐 아니라 _estimate_ai_season(AI 실제 시즌
+# 골/도움 생성)에도 쓰는 공용 상수이고 2026-07에 신민용이 "이미 밸런싱
+# 끝난 값이니 건드리지 않는다"고 확정해둔 값이라, CDM/CB/LB/RB와 같은
+# 방식으로 발롱도르 전용인 이 fallback 표에만 추가한다(_estimate_ai_
+# season 쪽 LM/RM 생성치는 그쪽 자체 기본값(1)을 그대로 유지, 이번
+# 범위 밖).
+_BALLON_POS_GOAL_FALLBACK["LM"] = _BALLON_POS_GOAL_FALLBACK["RM"] = 6
+_BALLON_POS_ASSIST_FALLBACK["LM"] = _BALLON_POS_ASSIST_FALLBACK["RM"] = 8
+# [2026-09 재재보정, 신민용 리포트: "발롱도르 Top30이 갑자기 CDM으로
+# 뒤덮였다"] 실제 세이브(game.db+game_history.db) 재분석 결과: 아래
+# CDM=1+1 보정은 당시(그때 세이브) "CDM 1위조차 G=1/A=0"이었던 시점
+# 기준이었는데, 그 이후 여러 세션에 걸친 스탯 생성 개선(role 기반 뎁스
+# 감쇠, 시즌별 실제 슬롯 포지션 사용, _tailed_season_mult 등)으로 CDM의
+# 실제 G+A 생산량 자체가 크게 늘어(이번 세이브 실측: 중앙값 2, p90=8,
+# 최댓값 19 — CB는 여전히 중앙값 0, p90=2) CB와 같은 낮은 기준(1+1=2)이
+# 더 이상 안 맞게 됐다. ga_ratio=ga/(exp합)가 3.0(캡)에 걸리는 지점이
+# G+A=6이라, CDM 후보의 상위 10%+가 사실상 전부 만점(15.00)으로 뭉쳐
+# Top30의 70~80%를 CDM이 차지하는 결과로 이어졌다(이번 세이브 실측).
+# 이 세이브의 실제 후보 풀(연도=2000, 3,602명)로 재보정: CDM 합계를
+# 2(1+1)→8(3+5, LWB/RWB처럼 골보다 도움 비중 높은 딥라잉 플레이메이커
+# 성향 반영)로 올려 재검증한 결과 Top10/20/30/50 CDM 비중이
+# 10%/10%/13.3%/10%로 후보 풀 점유율(9.66%)에 근접 — 위 GK v2 재보정
+# 때 나온 숫자(10/10/13.3/10, 그때 목표 12.2%)와 공교롭게 동일한
+# 패턴. LB/RB는 이번 재분석에서 과소·과대 어느 쪽 문제도 안 보여
+# (실제 중앙값 1, p90=2 — 기존 1+1 기준과 이미 잘 맞음) 그대로 둔다.
+# 이 재보정은 "포지션별 실제 성과가 이렇게 바뀌었다"는 재측정이지,
+# 위 2026-09 최초 CDM/LB/RB 보정 자체가 틀렸었다는 뜻은 아니다 — 그
+# 당시 데이터 기준으로는 CB와 동일하게 맞추는 게 맞았고, 이후 다른
+# 시스템 개선이 그 전제를 깬 것. 발롱도르 캘리브레이션은 스탯 생성
+# 로직이 바뀔 때마다 최신 세이브로 재검증이 필요하다는 걸 보여주는
+# 사례로 남겨둔다.
+# [2026-09 재보정, 신민용+GPT 실측 확정: "CDM/LB/RB가 발롱도르 Top30에서
+# 후보 풀 대비 0.31~0.36배로 심하게 과소표집된다"] 2000시즌 후보 풀
+# 3,512명을 코드로 재현해 CDM/LB/RB/CB 각각 상위 10명의 원본 골+도움을
+# 직접 대조한 결과, 네 포지션 모두 G+A가 사실상 0~2 사이에 몰려 있음을
+# 확인(CDM 1위조차 G=1/A=0) — "좋은 시즌과 평범한 시즌의 실제 격차"가
+# 애초에 이 게임의 스탯 생성 구조상 CB와 다르지 않았다. 그런데 기존
+# 기대치(CDM 2+3=5, LB/RB 1+3=4)가 CB(1+1=2)보다 훨씬 높게 잡혀 있어서,
+# 같은 G+A=2를 받아도 CB는 production=5.00인데 CDM은 2.00, LB/RB는 2.50
+# 밖에 못 받았다 — 즉 지금까지의 차이는 포지션별 실제 성과 차이가 아니라
+# fallback 숫자 차이에서 나온 것. CDM/LB/RB를 CB와 같은 1+1로 맞춰 재검증
+# 한 결과 Top30 배율이 CDM 0.31x→1.25x, LB 0.36x→0.71x, RB 0.35x→0.70x로
+# 개선됨을 실측 확인. "네 포지션을 동일하게 취급"하는 게 목적이 아니라
+# 이 게임의 시즌 스탯 생성 구조상 네 포지션의 실제 G+A 분포가 이미 같은
+# 범위에 있어서 기준선만 맞춘 것 — LWB/RWB는 아직 게임 POSITIONS 목록에
+# 없는 미사용 자리라 이번 재보정 대상에서 제외했다(기존 값 유지).
+# [2026-09 재설계, 신민용+GPT 협의 확정: "공격수/미드필더/수비수처럼 크게
+# 묶지 말고 세부 포지션별로, 그리고 계단식으로 완만하게"] 예전엔 ST/CF가
+# 나란히 3.0, LW/RW가 나란히 2.5처럼 큰 폭(0.5~1.0 단위)으로 묶여 있어서,
+# 다른 점수 항목이 비슷할 때 포지션 하나가 순위를 통째로 뒤집을 수 있었다.
+# 실제 발롱도르 역사(1956년 이후 공격수 76.8%·미드필더 16%·수비수 5.7%·
+# GK 1.4%)의 대략적인 경향은 유지하되, 포지션 간 격차는 1.5~0.3 사이를
+# 0.1~0.2 단위로 촘촘히 나눠 "포지션 때문에 뒤집힘"이 아니라 "포지션에 따른
+# 미세한 우선순위"로만 작동하게 한다. RW/LW를 ST보다도 살짝 높게 둔 것은
+# 최근 발롱도르 실제 수상 시즌의 등록 포지션이 윙어 계열(RW/LW)로 잡히는
+# 경우가 많다는 점을 반영(신민용 확정). CB보다 낮은 계열(SS/RM/LM/RWB/
+# LWB)은 이 게임의 현재 POSITIONS 목록(constants.POSITIONS)에는 아직 없는
+# 포지션이지만, 나중에 포지션이 추가될 걸 대비해 값만 미리 채워둔다 —
+# 지금은 그 키로 조회될 일이 없으니 회귀 위험 없음.
 _BALLON_POSITION_BONUS = {
-    "ST": 3.0, "CF": 3.0, "LW": 2.5, "RW": 2.5,
-    "CAM": 2.0, "CM": 1.5, "CDM": 1.0,
-    "GK": 0.5,
-    "CB": 0.3, "LB": 0.3, "RB": 0.3, "LWB": 0.3, "RWB": 0.3,
+    "RW": 1.5, "LW": 1.5,
+    "ST": 1.4,
+    "CF": 1.3,
+    "SS": 1.2,
+    "CAM": 1.1,
+    "RM": 1.0, "LM": 1.0,
+    "CM": 0.9,
+    "CDM": 0.7, "RWB": 0.7, "LWB": 0.7,
+    "CB": 0.5,
+    "RB": 0.4, "LB": 0.4,
+    "GK": 0.3,
 }
+
+# [2026-09 신설, 75차, 신민용 확정: "챔스 개인 기록을 발롱도르 점수에
+# 반영"] hist.ai_player_season_stats_by_comp(competition='cl' — CL/EL/
+# ECL 워터폴 통합 버킷, _club_comp_pool_by_team 주석 참고)에는 이미
+# 대회별 개인 골/도움/평점이 쌓이고 있는데, 발롱도르 채점은 지금까지
+# 리그 전용 표(hist.ai_player_season_stats)만 봐서 챔스 활약이 전혀
+# 반영 안 됐다.
+#
+# [2026-09 재설계, 76차, 신민용+GPT 협의: "수비 포지션 챔스 생산성
+# 폭발"] 75차 최초 설계("챔스 골+도움을 리그 원자료에 합산한 뒤 같은
+# 분모로 나누는" 방식)는 실제 2000년 game.db 재현 검증에서 결함이
+# 드러났다 — 이 가중치(_BALLON_CL_GA_WEIGHT) 자체의 크기 문제가 아니라
+# "포지션 기대치라는 분모를 챔스 보너스에도 그대로 재사용"하는 구조
+# 자체의 문제였다(자세한 진단·실측 수치는 아래 score_goals_assists
+# 계산부의 76차 코멘트 참고). 그래서 이 가중치의 "역할"이 바뀌었다 —
+# 예전엔 "리그 원자료에 곱해지는 챔스 원자료의 배율"이었고, 지금은
+# "챔스 원자료에 곱한 뒤 고정 기준값(_BALLON_CL_PRODUCTIVITY_REFERENCE)
+# 으로 나누는 챔스 보너스 배율"이다. 값(1.5)은 75차 때 5인 테스트
+# 케이스로 1.3/1.4/1.5 중 검증해 정한 그대로 유지 — 신민용+GPT 공통
+# 결론: "지금 좋은 결과가 나왔으니 여러 상수를 한 번에 바꾸지 말고
+# 문제가 보일 때만 하나씩 조정".
+_BALLON_CL_GA_WEIGHT = 1.5
+
+# [2026-09 신설, 76차] 챔스 보너스의 분모를 그 선수의 포지션 기대치가
+# 아니라 전 포지션 공통의 고정 기준값으로 쓴다 — ST 자신의 기대치
+# (AWARD_POS_GOAL["ST"]+AWARD_POS_ASSIST["ST"]=18+5=23)를 그대로
+# 가져다 썼다. "최상위 공격수에게 요구되는 한 시즌 공격생산량"을
+# 챔스 활약의 절대 기준으로 삼는 셈 — 포지션별 형평성은 이미
+# score_position_adj가 담당하므로, 챔스 보너스 계산에서까지 포지션별로
+# 다시 차등을 둘 필요가 없다는 것이 신민용+GPT 공통 결론. 상수로
+# 분리해둔 이유(신민용 요청): 나중에 21/23/25 등으로 "챔스 영향 강도"만
+# 따로 실측 비교하기 쉽게 하기 위함 — 지금은 23으로 고정, 문제가 보일
+# 때만 조정.
+_BALLON_CL_PRODUCTIVITY_REFERENCE = 23.0
+
+# [2026-09 신설, 같은 합의] 평점(score_rating)에 챔스 평점을 "경기수
+# 가중 평균"으로 섞는다 — 신민용 지정대로 리그 38경기 vs 챔스 10경기
+# 같은 표본 크기 차이를 그대로 반영하되, 챔스 쪽 표본에 이 배율을 한 번
+# 더 곱해 표본 크기 차이가 곧바로 "거의 무시됨"으로 이어지지 않게 한다
+# (신민용 지정 범위 1.2~1.3의 중간값에서 시작). 위 GA 보너스와 달리
+# 평점은 "가중 평균"이라 분모(포지션 기대치) 자체가 없어 76차의 수비
+# 포지션 폭발 문제와 무관 — 이 값은 그대로 유지한다. 5인 테스트
+# 케이스에 챔스 평점 자체가 없어(총점 breakdown에 트로피/평점/생산성/
+# 포지션만 있고 "챔스 평점"은 별도로 안 줌) 코드로 재검증하지 못했다
+# — 실제 game.db 업로드 후 챔스 평점이 리그 평점과 실제로 다른 표본으로
+# 재검증 필요(사용자에게 투명 보고, 75차와 동일).
+_BALLON_CL_RATING_WEIGHT = 1.25
+
+
+# [2026-09 신설, 신민용 확정: "ST의 팀 내 트로피 1위 독식 문제 — raw rating
+# 대신 포지션 보정 생산성으로 팀 내 랭킹을 매긴다"] _score_ballon_candidate의
+# score_goals_assists 계산 로직(GK는 세이브/실점/클린시트 3요소, 필드는
+# 포지션별 기대 골+도움 대비 비율)을 그대로 떼어내 별도 함수로 만든다 —
+# _apply_ballon_team_trophy_decay/_apply_ballon_intl_bonus_decay가 "팀/국적
+# 내 누가 1위인가"를 정할 때 이 값을 쓰기 위함(원인 진단: AI 시즌 평점 생성식
+# rating=6.0+(ovr-60)/35+goals*0.02+assists*0.015이 골을 도움보다 33% 더
+# 쳐줘서, 총 G+A가 비슷해도 골 비중이 높은 ST의 rating이 LW/RW/CAM보다 살짝
+# 높게 나온다 — 실측 2000시즌: ST 평균 rating 7.044 vs LW 6.959/RW 6.914/
+# CAM 6.916. 이 미세한 차이가 팀 내 rating 랭킹에서 ST를 74.1% 확률로 1위로
+# 만들고, 1위만 trophy_bonus/intl_bonus를 100% 유지(2위 50%/3위 20%/4위+
+# 8%)하다 보니 ST가 트로피 보너스를 구조적으로 독식했다 — 후보 풀 비중은
+# 11.52%에 불과한데 Top30의 70%를 ST가 차지한 근본 원인). rating을 아예
+# 배제하고 이 생산성 지표만으로 순위를 매기면 골/도움 가중치 편향이 팀 내
+# 랭킹에 전혀 영향을 못 준다. score_goals_assists 자체(최종 채점)는 원래도
+# 이 비율 방식이라 편향이 없었음(실측: ST 평균 3.48점으로 LW 3.97점보다
+# 오히려 낮음) — 이번 수정 대상은 어디까지나 트로피 감쇠의 랭킹 기준.
+def _ballon_productivity(cand):
+    """포지션 기대치 대비 생산성 점수 — _score_ballon_candidate의
+    score_goals_assists와 완전히 동일한 공식(그 함수가 이 값을 그대로
+    가져다 쓴다, 중복 구현 아님). rating을 전혀 참조하지 않으므로 골/도움
+    가중치 차이에서 자유로운 "팀/국적 내 순위" 기준으로도 쓸 수 있다."""
+    pos = cand.get("position") or ""
+    if pos == "GK":
+        # [2026-09 전면 재설계, 신민용 리포트: "GK가 발롱도르 상위권을
+        # 다 차지한다"(구버전 버그) → "골/도움 0점 고정은 '공격 기여가
+        # 없어서 감점'처럼 보인다 — GK는 아예 다른 지표(선방·실점·선방률·
+        # 클린시트·평점)로 평가해야 한다"(재검토)] 필드플레이어의 "생산성"
+        # 자리를 GK 전용 지표로 완전히 대체한다 — 골/도움을 0으로 두는
+        # 게 아니라 그 항목 자체를 GK에게 적용하지 않고, 대신 선방
+        # 효율(save_rate)·실점 억제(gc_per_match)·클린시트 비율(cs_ratio)
+        # 세 요소를 합산한다.
+        #
+        # [신민용 지적: "선방 횟수만 넣으면 약팀 GK가 슈팅을 많이 맞아서
+        # 선방을 많이 한 경우가 과대평가된다 — 10개 막고 3실점한 GK와
+        # 3개 막고 무실점한 GK가 단순 선방 숫자로 역전되면 안 된다"] 그래서
+        # "선방 횟수"가 아니라 "선방률"(saves/(saves+conceded), 이 게임
+        # 전체에서 쓰는 선방률 정의와 동일 — game_engine._estimate_ai_gk_
+        # saves 참고)을 쓴다 — 막은 슈팅 대비 비율이라 받은 슈팅 수와
+        # 무관하게 "실점과 함께" 평가된다.
+        saves = cand.get("saves") or 0
+        conceded = cand.get("goals_conceded") or 0
+        shots_faced = saves + conceded
+        if shots_faced <= 0:
+            # 데이터 없음(내 선수는 my_player_season_stats에 saves/
+            # goals_conceded 자체를 안 남김 — _get_ballon_candidates가
+            # None으로 채워둠) — "0/0=무실점"으로 오인해 만점을 주지
+            # 않도록 보수적으로 0점 처리한다.
+            return 0.0
+        save_rate = saves / shots_faced
+        # [2026-09 버그수정, concede_score와 같은 뿌리] clean_sheets도
+        # 오늘 뎁스 감쇠 대상에 들어갔는데 분모를 여전히 matches(로스터
+        # 전원 동일값)로 나누면 반대 방향 왜곡이 생긴다 — 적게 뛴
+        # 선수일수록 분자만 깎여서 cs_ratio가 실제보다 낮게 나옴(대기/
+        # 전력외가 부당하게 불리해지는 건 아니지만, matches 자체가
+        # "그 선수의 실제 출전"을 반영 못 하는 값이라는 문제는 동일).
+        # concede_score와 같은 방식으로 shots_faced를 경기수로 역산해
+        # 일관되게 맞춘다.
+        effective_matches = max(1.0, shots_faced / _GK_SHOTS_PER_MATCH_BASE)
+        cs_ratio = (cand.get("clean_sheets", 0) or 0) / effective_matches
+        # [2026-09 재보정 v2, 신민용+GPT 실측 확정: "GK가 발롱도르 Top30의
+        # 43%(구버전 stale 기록 기준)/20%(실제 코드 재계산 기준)를 차지한다"]
+        # 실제 2000시즌 발롱도르 후보 풀 3,512명을 코드로 그대로 재현해
+        # 확인한 결과, save_score/concede_score/cs_score 세 항목은 개별
+        # 로는 하나도 상한(각 5.0)에 안 걸렸는데도(실측 최댓값 4.61/3.07/
+        # 1.98), 세 항목을 단순 합산하는 구조 자체 때문에 "후보 풀 안에서
+        # 평범한" GK조차 중앙값 6.02점을 받아 ST/CM의 최댓값(6.5~7.1)에
+        # 근접했다 — 필드플레이어는 ga_ratio 하나뿐인데 GK만 세 축을
+        # 더하니 기대값 스케일 자체가 달라진 것(개별 항목이 관대해서가
+        # 아니라 "적당한 세 개를 더하는" 구조가 문제).
+        # 아래 세 상수(기준선 0.65→0.78, 1.3→0.90 / 상한 5.0→2.5, 2.5)는
+        # 후보 풀 실측 분포(save_rate p25=0.772 부근, gc_per_match_equiv
+        # p75 부근, cs_ratio p90=0.285 부근)를 기준으로 잡았다. 이 상수로
+        # 3,512명 전체를 재정렬해 검증한 결과: GK 생산성 중앙값 6.02→2.73,
+        # p90 7.66→4.21, 최댓값 9.05→5.56으로 ST/CM과 같은 눈금대에 들어
+        # 오고, Top10/20/30/50 GK 비중이 10%/10%/13.3%/10%로 후보 풀
+        # 점유율(12.2%)에 근접(기존 실측 기준선은 20%). 실사례(리그
+        # 162세이브/22실점/클린시트12, 발롱도르 archive 10위 GK)의 생산성도
+        # 9.05→5.56으로 "역사적인 시즌"급에 맞게 정상화됨을 확인.
+        # _BALLON_POSITION_BONUS(GK=0.3)와 후보 게이트(_get_ballon_
+        # candidates)는 이번 수정과 무관 — 실측으로 뗀 채 검증해 GK
+        # 과대표집이 그대로임을 확인했으므로 건드리지 않는다.
+        save_score = max(0.0, save_rate - 0.78) * 20.0
+        # [2026-09 버그수정, 신민용+GPT 리포트: "AI0E9A(로테이션, 실점4)가
+        # AI0IRI(주전, 실점20)보다 concede_score가 더 높게 나온다"] 원인:
+        # goals_conceded는 오늘(뎁스 감쇠 확장) 역할별로 줄어드는데 분모
+        # matches는 로스터 전원에게 똑같이 부여되는 "팀 시즌 전체 경기수"라
+        # 줄지 않는다 — 감쇠된 분자를 감쇠 안 된 가짜 분모로 나누면 적게
+        # 뛴(뎁스 감쇠가 강하게 걸린) 선수일수록 "경기당 실점"이 인위적으로
+        # 낮아 보인다(실측: E9A 4/38=0.105 vs IRI 20/38=0.526 — 선방률은
+        # IRI가 더 높은데 concede_score는 E9A가 더 높게 나옴). shots_faced
+        # (=saves+goals_conceded, 분자·분모 둘 다 같은 배율로 줄어들어
+        # 서로 짝이 맞음) 기준으로 "경기당 실점"을 역산한다 —
+        # _estimate_ai_gk_saves가 선방을 만들 때 쓰는 것과 동일한 상수
+        # (_GK_SHOTS_PER_MATCH_BASE)를 공유해, 이후 이 기준치를 튜닝해도
+        # 선방 생성과 채점이 항상 같은 기준을 쓰게 한다.
+        gc_per_match = (conceded / shots_faced) * _GK_SHOTS_PER_MATCH_BASE
+        # [2026-09 재보정 v2] 기준선 1.3→0.90, 상한 5.0→2.5 — 위 v2 코멘트
+        # 참고. 세 항목 중 이 항목 하나만 완화해도 되는 게 아니라(실측상
+        # 셋 다 개별로는 정상), 세 항목의 상한 합 자체를 필드플레이어의
+        # 실측 생산성 상한(6.5~7)과 맞추기 위해 셋을 함께 낮췄다.
+        concede_score = max(0.0, (0.90 - gc_per_match) / 0.90) * 2.5
+        cs_score = min(1.0, cs_ratio / 0.28) * 2.5
+        return round(min(save_score + concede_score + cs_score, 15.0), 2)
+    exp_goal = AWARD_POS_GOAL.get(pos, _BALLON_POS_GOAL_FALLBACK.get(pos, 3))
+    exp_assist = AWARD_POS_ASSIST.get(pos, _BALLON_POS_ASSIST_FALLBACK.get(pos, 3))
+    league_ga = (cand.get("goals", 0) or 0) + (cand.get("assists", 0) or 0)
+    league_ratio = league_ga / max(1, exp_goal + exp_assist)
+    # 기존 채점식 그대로 — 챔스 기록이 없으면(cl_ga=0) 이 값이 그대로
+    # 최종 생산성 점수가 된다(하위호환, 75차와 동일 원칙 유지).
+    league_score = min(league_ratio, 3.0) * 5.0
+
+    # [2026-09 재설계, 76차, 신민용+GPT 협의: "수비 포지션 챔스
+    # 생산성 폭발" 실측 수정] 75차 최초 설계("챔스 골+도움을 리그
+    # 원자료에 합산한 뒤 같은 분모(exp_goal+exp_assist)로 나누는"
+    # 방식)를 실제 2000년 game.db로 재현 검증한 결과, CB/LB/CDM처럼
+    # 포지션 자체 기대치가 원래 아주 작은(예: LB는 _BALLON_POS_*_
+    # FALLBACK 기준 1+1=2) 포지션에서 챔스 딱 1골+1도움만 추가돼도
+    # 분모가 워낙 작아 비율이 폭발했다 — 실측: 리그+챔스 12경기
+    # 1골1도움뿐인 LB가 생산성 5.0→12.5(순위 41위→2위), 다른 LB는
+    # 13경기 1골2도움만으로 5.0→15.0 만점(101위→12위)까지 뛰었다.
+    # 같은 절대량(1~2점)인데 CM(기대치 12)·ST(기대치 23)는 거의
+    # 안 움직이는 것과 대조적 — 원인은 "챔스 표본이 작아서"가 아니라
+    # "포지션 기대치라는 분모를 챔스 보너스에도 그대로 재사용"하는
+    # 구조 자체였다.
+    #
+    # 그래서 챔스 기여분은 그 선수의 (만만할 수 있는) 포지션 기대치가
+    # 아니라, 전 포지션 공통의 고정 기준값(_BALLON_CL_PRODUCTIVITY_
+    # REFERENCE=23, ST 자신의 기대치 — "최상위 공격수에게 요구되는
+    # 한 시즌 공격생산량")으로 따로 나눈 뒤 리그 점수에 "가산"한다
+    # (75차 때 "별도 가산점으로 더하지 말 것"이라 정했던 방침을
+    # 이번 건에 한해 뒤집음 — 실측상 분모 재사용 구조 자체가 문제의
+    # 근본원인이라 가산 방식 전환 없이는 못 고친다는 결론). 포지션별
+    # 형평성은 이미 score_position_adj가 담당하므로 여기서 다시
+    # 포지션별로 차등을 둘 필요는 없다(신민용+GPT 공통 결론).
+    #
+    # 실측 검증(2000년 실제 후보 3,373명 전체 재계산): 폭발했던 LB
+    # 두 사례 생산성 12.5→5.65, 15.0→5.98로 정상화. 정당한 사례
+    # (CM, 챔스 10경기 2골9도움)는 11.88→8.59로 여전히 확실한
+    # 보너스 유지. Top30 중 수비 포지션(CB/LB/RB/CDM 등) 인원
+    # 11명→8명으로 줄고 ST가 6명→8명으로 늘어 공격/수비 균형이
+    # 의도한 방향으로 교정됨. 75차 5인 검증 케이스(야꺼비/몰루비치/
+    # 띠돈/돈까스/벨룽) 구도는 야꺼비-몰루비치 격차 -0.09/띠돈-
+    # 돈까스 격차 0.77로 거의 그대로 재현됨 — ST/CM처럼 원래
+    # 기대치가 23에 가까운 공격진은 이 방식이 75차(합산) 방식과
+    # 수학적으로 거의 동일하게 작동하고, 기대치가 훨씬 작은 수비진만
+    # 교정되기 때문(의도된 비대칭, 신민용 확인 완료).
+    cl_bonus = _ballon_cl_bonus(cand)
+    return round(min(league_score + cl_bonus, 15.0), 2)
+
+
+def _ballon_cl_bonus(cand):
+    """포지션 무관 챔스 골+도움 가산점 — _ballon_productivity가 필드
+    선수 최종값에 더하는 것과 완전히 동일한 조각을 별도 함수로 뽑아뒀다
+    (공식 변화 없음, 숫자 동일).
+
+    [2026-09 5차 확장, 신민용 지적: "챔스 우승 가치는 포르투갈이든
+    잉글랜드든 같아야 하잖아"] score_rating/score_goals_assists에 거는
+    국내 리그 강도 할인(_score_ballon_candidate의 _rp_mult)을 챔스
+    성분에는 적용하지 않기 위해 이 조각을 따로 뽑을 필요가 생겼다 —
+    "챔스 가치는 대륙 단위로만 정해지고 국내 리그 등급과는 무관해야
+    한다"는 원칙이 트로피 점수(_cl_continent_weight로 이미 보장됨)뿐
+    아니라 개인 기록(평점/생산성)에도 지켜져야 하는데, 4차 확장 때는
+    리그+챔스를 이미 합친 score_goals_assists 전체에 국내 리그 가중치를
+    곱해버려서 챔스로 번 실적까지 덩달아 깎이고 있었다(포르투갈 클럽
+    으로 챔스 우승한 선수의 챔스 활약상이 잉글랜드 클럽이었다면 안
+    깎였을 할인을 맞는 모순 — 신민용이 실측 없이도 원칙만으로 바로
+    잡아낸 케이스)."""
+    cl_ga = (cand.get("cl_goals", 0) or 0) + (cand.get("cl_assists", 0) or 0)
+    # [2026-09 8차 확장, 신민용 리포트: "북미 챔스(0.22)에서 18골 넣은
+    # MLS 선수가 생산성 점수를 유럽 챔스급으로 그대로 다 받아서 발롱도르
+    # 10위까지 올라온다"] 위 5차 확장은 "포르투갈 vs 잉글랜드"(같은
+    # 대륙, 다른 국내 리그 등급) 문제만 잡았지, "유럽 챔스 vs 북미
+    # 챔스"(다른 대륙, 대회 자체의 경쟁 수준 차이) 문제는 그대로 남아
+    # 있었다 — cl_ga가 어느 대륙 대회에서 나온 기록이든 완전히 동일한
+    # 가중치로 셈해지고 있었다. 이제 _CLUB_COMP_WEIGHT(트로피 점수에
+    # 이미 쓰는 대륙×티어 가중치, 유럽CL=1.00~아프리카ECL=0.06)를 여기도
+    # 그대로 곱한다 — "포르투갈 CL 우승=잉글랜드 CL 우승"은 그대로
+    # 유지되면서(같은 대륙·같은 티어라 comp_weight가 같으므로), "유럽
+    # CL 골=북미 CL 골"이라는 잘못된 전제만 사라진다.
+    _comp_w = _CLUB_COMP_WEIGHT.get((cand.get("cl_continent"), cand.get("cl_tier")), 1.0)
+    return (cl_ga * _BALLON_CL_GA_WEIGHT) / _BALLON_CL_PRODUCTIVITY_REFERENCE * 5.0 * _comp_w
 
 
 def _score_ballon_candidate(cand):
     """cand: {player_id, team_id, position, rating, goals, assists,
-    matches, clean_sheets, year, trophy_bonus}. 점수 breakdown 4개 +
-    total을 dict로 반환. 후보 게이트(자격 여부)는 이 함수 호출 전에
-    이미 끝나 있어야 한다(v2 피드백 #3 — 게이트와 점수를 섞지 않음)."""
+    matches, clean_sheets, saves, goals_conceded, year, trophy_bonus,
+    cl_matches, cl_goals, cl_assists, cl_rating, award_bonus}. cl_* 4개는
+    그 해 챔스/유로파/컨퍼런스(hist.ai_player_season_stats_by_comp,
+    competition='cl') 개인 기록 — 해당 대회에 안 나갔으면 전부
+    None/0(_get_ballon_candidates가 채움). award_bonus는 그 해 리그/
+    클럽대항전/국제대회 MVP·베스트11 가산점 합계(_get_award_recognition_
+    bonus_map, 79차). 점수 breakdown 4개 + total을 dict로 반환. 후보
+    게이트(자격 여부)는 이 함수 호출 전에 이미 끝나 있어야 한다(v2
+    피드백 #3 — 게이트와 점수를 섞지 않음)."""
     pos = cand.get("position") or ""
-    matches = max(1, cand.get("matches", 0))
+    # [2026-09 재사용, 위 "제거" 코멘트 철회] concede_score/cs_ratio는
+    # 여전히 matches를 안 쓰지만(그쪽은 개인 실제 출전량이 필요해서
+    # shots_faced로 역산 — 그 이유는 그대로 유효), 아래 score_rating의
+    # 리그-챔스 평점 가중평균은 "이 선수 개인이 몇 경기 뛰었는가"가
+    # 아니라 "리그/챔스 각각의 시즌 길이(표본 크기)가 얼마나 다른가"를
+    # 반영하려는 목적이라 matches(팀 시즌 전체 경기수)를 다시 쓴다 —
+    # 로스터 전원이 같은 값을 공유해도, 그 값 자체가 "그 대회가 몇 경기
+    # 짜리였는가"를 나타내는 용도로는 여전히 유효하다(신민용 지정
+    # "리그 38경기 vs 챔스 10경기").
 
     # [2026-09 확장, 신민용 확정: "국제대회 성과도 가산점으로"]
     # 국제대회 가산점(intl_bonus)을 클럽 트로피 점수와 같은 버킷(트로피)
     # 에 더한다 — 새 DB 컬럼/UI 컬럼을 늘리지 않고 기존 "트로피" 항목을
     # "팀·국가 단위 성과 전체"로 의미를 넓히는 쪽을 택함(둘 다 팀/국가
     # 결과 기반 가산점이라 성격이 같음).
-    score_trophy = round(cand.get("trophy_bonus", 0.0) + cand.get("intl_bonus", 0.0), 2)
-    score_rating = round(max(0.0, (cand.get("rating") or 6.0) - 6.0) * 6.0, 2)
+    # [2026-09 확장, 79차] MVP/베스트11 가산점(award_bonus)도 같은
+    # 버킷에 더한다 — ①②(75~78차)로 개인 기록이 이미 반영된 뒤에
+    # 넣는 것이라 소액만(국내컵 우승보다도 작게) 가산, 이중보상 방지.
+    score_trophy = round(min(
+        cand.get("trophy_bonus", 0.0) + cand.get("intl_bonus", 0.0)
+        + cand.get("award_bonus", 0.0), _TROPHY_SCORE_CAP), 2)
+    # [2026-09 7차 확장, GPT 제안: "cap은 비정상적인 폭주 방지용 안전장치로만
+    # 아주 높게 둔다 — 여러 시즌 CL+EL+ECL+리그+컵을 다 쌓은 진짜 대단한
+    # 커리어가 트로피 더 쌓여도 평가가 거의 안 올라가면 안 된다"] 정상
+    # 케이스는 거의 안 걸리고(위 참가도×평점 티어별 상한 수정이 1차
+    # 해법), 여러 대회 우승이 한 시즌에 몰리는 극단치만 여기서 막는다.
+    # [2026-09 5차 확장] score_rating/score_goals_assists에 국내 리그
+    # 강도 할인을 걸기 전에 _league_w부터 먼저 구한다 — 아래 두 계산
+    # (평점 블렌딩·생산성) 모두 "리그 성분만 할인하고 챔스 성분은 그대로
+    # 둔다"는 원칙을 지켜야 해서, 할인 배율을 먼저 알아야 한다.
+    # [신민용 지적: "챔스 우승 가치는 포르투갈이든 잉글랜드든 같아야
+    # 하잖아"] 트로피 점수는 _cl_continent_weight(대륙 단위)로 이미
+    # 이 원칙을 지키고 있었는데, 4차 확장(아래 옛 코멘트 참고) 때
+    # score_rating/score_goals_assists를 통째로 할인하면서 챔스로 번
+    # 실적까지 국내 리그 등급만큼 깎이는 모순이 생겼다 — 예를 들어
+    # 포르투갈 클럽 소속 선수가 챔스에서 잉글랜드 클럽 소속 선수와
+    # 똑같이 활약해도, 포르투갈 쪽만 A급 리그 할인을 맞아 챔스 활약상
+    # 평가가 달라지는 게 문제였다. 아래에서 "리그 성분만" 할인하도록
+    # 고친다(_ballon_cl_bonus로 챔스 성분을 따로 떼어 원상 복구).
+    _league_w = _get_team_trophy_grade_weight(cand.get("team_id"))
+    _rp_mult = 1.0 if _league_w >= 0.95 else (0.5 + 0.5 * _league_w)
 
-    if pos == "GK":
-        # [2026-09 버그수정, 신민용 리포트: "GK가 발롱도르 상위권을 다
-        # 차지한다"] GK는 기대 골/도움이 0이라 max(1, exp_goal+exp_assist)
-        # =1로 떨어져서, 골/도움 2~3개만 우연히 찍혀도(추정치 잡음 포함)
-        # ga_ratio가 즉시 3.0(상한)을 넘어 생산성 점수가 만점(15.0)까지
-        # 치솟았다 — 공격수는 69골+도움을 합쳐야 겨우 만점인 것과 비교하면
-        # GK가 압도적으로 유리해지는 구조적 결함이었다. GK는 애초에 골/
-        # 도움으로 평가하는 지표가 아니므로 이 항목 자체를 0으로 고정하고,
-        # 골키퍼의 기여는 전부 아래 클린시트 가점(포지션보정)으로만 반영한다.
-        score_goals_assists = 0.0
+    # [2026-09 확장] 리그 평점 + 챔스 평점을 "표본 크기(경기수) 가중
+    # 평균"으로 합친다. 챔스 기록이 없으면(cl_matches 0 또는 cl_rating
+    # 없음) 예전과 100% 동일하게 리그 평점만 쓴다(하위호환).
+    #
+    # [2026-09 5차 확장] 리그 평점의 "6.0 기준선 초과분"에만 _rp_mult를
+    # 걸고(_league_rating_adj), 챔스 평점(_cl_rating)은 원래 값 그대로
+    # 블렌딩한다 — 리그가 약할수록 리그 평점 자체를 6.0쪽으로 당기되,
+    # 챔스에서 잘한 건 국내 리그 등급과 무관하게 그대로 인정한다는 뜻.
+    # SS/S(_rp_mult=1.0)면 _league_rating_adj가 _league_rating과
+    # 완전히 같아서 예전과 100% 동일하게 동작한다(하위호환).
+    _league_rating = cand.get("rating") or 6.0
+    _league_matches = cand.get("matches") or 0
+    _cl_matches = cand.get("cl_matches") or 0
+    _cl_rating = cand.get("cl_rating")
+    _league_rating_adj = 6.0 + (_league_rating - 6.0) * _rp_mult
+    if _cl_matches > 0 and _cl_rating is not None:
+        # [2026-09 8차 확장, 신민용 리포트: "북미 챔스에서 딴 평점도
+        # 유럽 챔스 평점과 똑같이 반영된다"] _ballon_cl_bonus와 동일한
+        # 이유로, 챔스 평점의 "6.0 초과분"에도 _CLUB_COMP_WEIGHT(대륙×
+        # 티어)를 곱한다 — 북미/아시아/아프리카 챔스급 대회에서 딴 높은
+        # 평점이 유럽 챔스급 평점과 동일하게 최종 점수에 반영되지 않게.
+        _comp_w = _CLUB_COMP_WEIGHT.get((cand.get("cl_continent"), cand.get("cl_tier")), 1.0)
+        _cl_rating_adj = 6.0 + (_cl_rating - 6.0) * _comp_w
+        _cl_weight = _cl_matches * _BALLON_CL_RATING_WEIGHT
+        _combined_rating = ((_league_rating_adj * _league_matches + _cl_rating_adj * _cl_weight)
+                             / (_league_matches + _cl_weight))
     else:
-        exp_goal = AWARD_POS_GOAL.get(pos, _BALLON_POS_GOAL_FALLBACK.get(pos, 3))
-        exp_assist = AWARD_POS_ASSIST.get(pos, _BALLON_POS_ASSIST_FALLBACK.get(pos, 3))
-        ga = (cand.get("goals", 0) or 0) + (cand.get("assists", 0) or 0)
-        ga_ratio = ga / max(1, exp_goal + exp_assist)
-        score_goals_assists = round(min(ga_ratio, 3.0) * 5.0, 2)   # 기대치의 3배에서 상한
+        _combined_rating = _league_rating_adj
+    score_rating = round(max(0.0, _combined_rating - 6.0) * 6.0, 2)
 
+    # [2026-09 리팩터] 아래 GK 3요소 / 필드 리그+챔스 비율 계산은
+    # _ballon_productivity(cand)로 그대로 옮겨졌다(공식 100% 동일, 숫자
+    # 변화 없음) — _apply_ballon_team_trophy_decay/_apply_ballon_intl_
+    # bonus_decay가 "팀/국적 내 순위"를 매길 때도 같은 값을 재사용하기
+    # 위해 함수로 분리했을 뿐, 이 자리에서 하던 일은 그대로다. 아래 각
+    # 재보정 이력 코멘트(GK v2, 챔스 76차 등)는 전부 _ballon_productivity
+    # 정의부로 그대로 이동해뒀다.
+    #
+    # [2026-09 4차 확장, 신민용+GPT 협의: "주빌로 이와타(일본 A리그)가
+    # 트로피 1.8·평점 4.8로 평범한데 생산성 12.5 하나로 21위까지
+    # 올라온다 — 트로피만 리그 강도로 깎이고 rating/production은 전혀
+    # 안 깎이니 약한 리그의 좋은 시즌이 톱리그 좋은 시즌과 거의 동급
+    # 취급된다"는 실측 지적] score_goals_assists에도 _league_strength_
+    # weight(=_country_trophy_weight, 국가별 세분화 리그 강도)를
+    # 적용한다. 트로피처럼 100% 그대로 곱하면 "약한 리그의 역대급
+    # 시즌"까지 과하게 깎일 수 있어(신민용+GPT 합의) 완만한 블렌딩
+    # 0.5+0.5×league_weight를 쓴다 — 리그가 아무리 약해도 최종 배율이
+    # 0.5 밑으로는 안 내려간다(완전 무효화 방지). SS/S(가중치 0.95
+    # 이상)는 "개인 기록은 그대로 인정" 원칙대로 이 보정을 아예
+    # 건너뛴다(_rp_mult=1.0). trophy_bonus는 원래도 _get_team_trophy_
+    # grade_weight를 거쳐 이미 이 가중치가 들어가 있으므로 손 안 댐.
+    #
+    # [2026-09 5차 확장] GK가 아니면 _ballon_cl_bonus로 챔스 성분만 뗀
+    # 뒤, 리그 성분(score_goals_assists - cl_bonus)에만 _rp_mult를
+    # 걸고 챔스 성분은 원상 복구한다 — 위 score_rating과 동일한 원칙
+    # (챔스로 번 실적은 국내 리그 등급과 무관). GK는 애초에 챔스 전용
+    # 세이브 스탯이 따로 없어 전부 "리그 성분"으로 취급(_ballon_
+    # productivity GK 분기와 동일 전제) — 그대로 전체 할인한다.
+    score_goals_assists = _ballon_productivity(cand)
+    if (cand.get("position") or "") == "GK":
+        score_goals_assists = round(score_goals_assists * _rp_mult, 2)
+    else:
+        _cl_bonus_raw = _ballon_cl_bonus(cand)
+        _league_part = max(0.0, score_goals_assists - _cl_bonus_raw)
+        score_goals_assists = round(
+            min(_league_part * _rp_mult + _cl_bonus_raw, 15.0), 2)
+
+    # [2026-09 수정] 클린시트 가점은 위 GK 전용 생산성 점수(cs_score)로
+    # 옮겼다 — 여기(포지션보정)에 남겨두면 클린시트가 두 항목에 중복
+    # 반영된다. 이제 포지션보정은 다른 포지션과 동일하게 순수 포지션
+    # 가중치(_BALLON_POSITION_BONUS)만 담당한다.
     score_position_adj = _BALLON_POSITION_BONUS.get(pos, 0.5)
-    if pos == "GK":
-        # 클린시트 비중 반영(선방률 등 세부 지표는 Phase 1 범위 밖 —
-        # world_browser_window.py가 이미 GK 화면에서 쓰는 clean_sheets만).
-        cs_ratio = (cand.get("clean_sheets", 0) or 0) / matches
-        score_position_adj += round(cs_ratio * 8.0, 2)
 
     total = score_trophy + score_rating + score_goals_assists + score_position_adj
     return {
@@ -10540,6 +11704,107 @@ def _score_ballon_candidate(cand):
         "score_goals_assists": score_goals_assists,
         "score_position_adj": round(score_position_adj, 2),
     }
+
+
+def _effective_award_position(reg_position, season_position, season_role, half_position, half_role):
+    """[2026-09 신설, 신민용 요청: "역대 개인상 포지션은 주포지션이 아니라
+    그 당시(그 시즌) 실제 뛴 포지션으로 — 상/하반기가 다르면 더 잘한
+    쪽으로"] season_position(hist.ai_player_position_history — 겨울
+    이적시장 이후/시즌 종료 시점 스냅샷이라 사실상 "하반기" 기준)을
+    기본으로 쓰고, half_position(hist.ai_player_position_history_half,
+    "상반기")이 따로 있고 서로 다르면 역할 가중치(_ROLE_PARTICIPATION —
+    주전>로테이션>대기≈유망주>전력외)가 더 높은 반기의 포지션을 "더
+    잘한 포지션"으로 택한다.
+
+    [한계, 사용자에게 투명 보고 필요] AI 선수는 반기별 개인 평점이 따로
+    저장되지 않는다(64차에서 만든 세계기록실 표시용 반기 골/도움/평점
+    분배는 그때그때 화면 호출 시 즉석 계산될 뿐 DB에 저장 안 됨) — 그래서
+    "그 반기 실제 활약"이 아니라 "그 반기 스쿼드 서열(역할)"을 활약의
+    대리 지표로 쓴다. 역할이 같거나 둘 중 하나만 있으면 있는 쪽(연도
+    스냅샷 season_position 우선)을 쓴다. 둘 다 없으면(이 기능 신설 이전
+    과거 시즌, 혹은 "나" — 반기 스냅샷 자체가 없음) 등록 포지션
+    (reg_position, ai_players.position/my_player.position)으로 폴백한다
+    — 기존 표시 방식과 동일하게 유지되므로 과거 세이브도 깨지지 않는다."""
+    if season_position and half_position and season_position != half_position:
+        season_w = _ROLE_PARTICIPATION.get(season_role, 1.0)
+        half_w = _ROLE_PARTICIPATION.get(half_role, 1.0)
+        return half_position if half_w > season_w else season_position
+    return season_position or half_position or reg_position
+
+
+# [2026-09 신설, 79차, 신민용+GPT 협의: "MVP/베스트11도 발롱도르 트로피
+# 축에 소액 가산"] ①②(75~78차)로 개인 기록(골/도움/평점)이 이미
+# 충분히 반영된 뒤에 넣는 것이라, 이건 "그 활약에 대한 세계/리그의
+# 공식적 인정"이라는 별도 신호를 소액만 더하는 용도다(이중보상 방지 —
+# MVP/베스트11도 결국 좋은 평점·생산성이 뽑히는 이유이므로 그 자체를
+# 다시 크게 얹으면 같은 활약을 두 번 세는 셈). 국내컵(cup/lower_cup)
+# 개인상은 신민용이 준 기준표에 없어 이번 범위에서 제외(리그 우승
+# 4.0 대비 국내컵 우승 자체가 1.0으로 이미 훨씬 작은 트로피라, 필요
+# 하면 나중에 별도로 추가).
+#
+# 값 산출 근거: 기존 트로피 배점(CL 우승 10.0/국내컵 우승 1.0×등급/
+# 리그 1위 4.0/월드컵 우승 10.0)과 비교해 "국내컵 우승(가장 작은 기존
+# 트로피 항목)보다도 작게"라는 신민용 확정 원칙 — 리그 MVP 0.30/
+# 베스트11 0.15, 클럽대항전(CL/EL/ECL/CWC/슈퍼컵) MVP 0.80/베스트11
+# 0.40, 국제대회 MVP 1.00×대회가중치/베스트11 0.50×대회가중치.
+# 대회가중치는 트로피 쪽에서 이미 쓰는 _CONTINENTAL_CUP_WEIGHT_RATIO를
+# 그대로 재사용(월드컵=1.0, 대륙컵은 유럽100%/아메리카85%/아프리카
+# 55%/아시아45%) — "내 발롱도르"와 "세계기록실 발롱도르"가 같은
+# 국제대회 가치 기준을 쓴다는 이 파일의 기존 설계 원칙과 동일하게 맞춤.
+# 신민용 확정: 한 선수가 여러 상을 동시에 받아도(리그 MVP+CL MVP,
+# 혹은 같은 대회 MVP+베스트11 동시 수상 등) 전부 합산한다 — "MVP는
+# 최고의 개인, 베스트11은 포지션별 최고 선수로 선정"이라는 서로 다른
+# 인정이라 둘 다 받았다는 사실 자체가 강한 시즌이라는 의미가 있다는
+# 판단(감액/상한 없음).
+_BALLON_AWARD_BONUS = {
+    ("league", "MVP"): 0.30, ("league", "베스트11"): 0.15,
+    ("club", "MVP"): 0.80, ("club", "베스트11"): 0.40,
+    ("intl", "MVP"): 1.00, ("intl", "베스트11"): 0.50,
+}
+
+
+def _get_award_recognition_bonus_map(c, year):
+    """그 해 리그/클럽대항전/국제대회 MVP·베스트11 수상자 전원의
+    {player_id: 가산점 합계} 딕셔너리를 한 번에 만든다(_get_ballon_
+    candidates 호출당 1회 — 후보 수천 명마다 재조회하지 않음).
+    발롱도르/야신상/푸스카스 자기 자신(category='world')은 당연히
+    제외한다.
+
+    [전제, 79차 재배치] season_individual_awards에 그 해 리그/클럽
+    대항전/국제대회 개인상이 "이미 저장돼 있어야" 한다 —
+    _compute_season_individual_awards가 이 함수를 호출하는
+    _get_ballon_candidates보다 그 셋을 먼저 계산·커밋하도록 순서를
+    옮겨뒀다(위 _compute_season_individual_awards 79차 코멘트 참고).
+    이 전제가 깨지면(예: 이 함수를 다른 경로에서 단독 호출) 그냥
+    빈 딕셔너리를 반환할 뿐 에러는 안 난다 — 있는 그대로 조회.
+
+    [2026-09] 월드컵만 award_kind가 "MVP"가 아니라 "골든볼"로 저장
+    되므로(_WC_AWARD_KIND_RENAME, 베스트11은 안 바뀜) 그것도 같이
+    잡는다. intl_tournaments를 이름으로 조인해 kind(world/continent)·
+    continent를 복원해 대회가중치를 정한다 — season_individual_awards
+    자체엔 kind가 없어(competition 컬럼은 대회 "이름"만 저장) 이 조인이
+    필요하다."""
+    out = {}
+    rows = c.execute(
+        """SELECT sia.player_id AS player_id, sia.category AS category,
+                  sia.award_kind AS award_kind,
+                  it.kind AS tour_kind, it.continent AS tour_continent
+           FROM season_individual_awards sia
+           LEFT JOIN intl_tournaments it
+             ON sia.category='intl' AND it.year = sia.year AND it.name = sia.competition
+           WHERE sia.year=? AND sia.category IN ('league', 'club', 'intl')
+             AND sia.award_kind IN ('MVP', '베스트11', '골든볼')""",
+        (year,)).fetchall()
+    for r in rows:
+        kind = "MVP" if r["award_kind"] == "골든볼" else r["award_kind"]
+        base = _BALLON_AWARD_BONUS.get((r["category"], kind), 0.0)
+        if r["category"] == "intl" and base:
+            weight = 1.0 if r["tour_kind"] == "world" else \
+                _CONTINENTAL_CUP_WEIGHT_RATIO.get(r["tour_continent"], 1.0)
+            base *= weight
+        if base:
+            out[r["player_id"]] = round(out.get(r["player_id"], 0.0) + base, 4)
+    return out
 
 
 def _get_ballon_candidates(c, year):
@@ -10562,6 +11827,10 @@ def _get_ballon_candidates(c, year):
     # 지역 변수라 이 함수가 리턴하면 같이 사라지므로, 다음 연도 계산에
     # 작년 값이 남는 일이 구조적으로 불가능하다.
     _cache = {}
+    # [2026-09 신설, 79차] MVP/베스트11 가산점 — 후보 전원에 공통으로
+    # 적용되는 연도 단위 조회라 한 번만 만들어 아래 두 분기(AI/나)가
+    # 공유한다.
+    _award_bonus_map = _get_award_recognition_bonus_map(c, year)
 
     # [2026-09 성능수정] _collect_all_league_candidates와 같은 이유 —
     # "FROM hist... WHERE s.year=?"는 PK가 (player_id, year)라 SCAN s
@@ -10573,31 +11842,91 @@ def _get_ballon_candidates(c, year):
     # WHERE의 s.matches>=10만 ON으로 옮겼고(INNER JOIN이라 동치),
     # 행 집합이 완전히 같음을 실측 확인했다(211ms → 144ms, 그리고 새
     # 형태는 시즌이 쌓여도 비용이 늘지 않는다).
+    # [2026-09 신설, 신민용+GPT 확정: "대기/전력외는 개인상 후보에서 제외,
+    # 주전/로테이션은 허용 — 감점이 아니라 자격 게이트로"] 오늘 뎁스 감쇠를
+    # saves/goals_conceded/clean_sheets까지 확장하면서 역할이 이미 통계
+    # 볼륨에 간접 반영되고 있어(대기·전력외는 ×0.18/×0.07로 깎임), 여기에
+    # 또 역할별 점수 감점을 얹으면 이중 페널티가 된다 — 그래서 점수가
+    # 아니라 후보 "자격" 쪽에만 건다. 이 게이트는 포지션을 안 가리고
+    # _get_ballon_candidates 하나에만 걸려 있으므로 발롱도르(전 포지션)와
+    # 야신상(이 후보군을 GK로만 거르는 것뿐) 양쪽에 자동으로 같이 적용된다
+    # — 두 상이 서로 다른 자격 기준을 갖지 않는다.
+    # role이 없는 행(이 기능 신설 이전 과거 시즌 등)은 걸러내지 않는다
+    # (데이터 공백을 자격 박탈로 오인하면 안 됨).
+    _EXCLUDED_ROLES = ("대기", "전력외", "유망주")
+    # [2026-09 확장, 신민용 확정: "챔스 개인 기록을 발롱도르 점수에 반영"]
+    # hist.ai_player_season_stats_by_comp(competition='cl')를 LEFT JOIN
+    # 으로 같이 끌어온다 — PK가 (player_id, year, competition)이라 한
+    # 선수당 최대 1행만 붙고(그 해 CL/EL/ECL 중 하나만 뛸 수 있으므로),
+    # 안 뛴 선수는 bc.* 전부 NULL로 자연스럽게 빠진다(하위호환 — 이
+    # LEFT JOIN을 추가하기 전 행 집합과 정확히 동일한 행 수를 유지).
+    # [2026-09 확장, 신민용 요청: "포지션은 주포가 아니라 그 당시 뛴
+    # 포지션으로"] ph(하반기/시즌종료 스냅샷)에 phh(상반기 스냅샷)를
+    # 추가로 LEFT JOIN해 ph.position/phh.position 둘 다 끌어온다 —
+    # _effective_award_position이 최종 포지션을 고른다.
     ai_rows = c.execute(
         """SELECT s.player_id AS player_id, s.team_id AS team_id, s.matches AS matches,
                   s.goals AS goals, s.assists AS assists, s.rating AS rating,
-                  s.clean_sheets AS clean_sheets,
-                  ap.position AS position, ap.nationality AS nationality,
-                  cn.grade AS grade
+                  s.clean_sheets AS clean_sheets, s.saves AS saves, s.goals_conceded AS goals_conceded,
+                  ap.position AS reg_position, ap.nationality AS nationality,
+                  cn.name AS cname, cn.grade AS national_grade,
+                  ph.position AS season_position, ph.role AS season_role,
+                  phh.position AS half_position, phh.role AS half_role,
+                  bc.matches AS cl_matches, bc.goals AS cl_goals,
+                  bc.assists AS cl_assists, bc.rating AS cl_rating
            FROM ai_players ap
            CROSS JOIN hist.ai_player_season_stats s
              ON s.player_id = ap.id AND s.year=? AND s.matches>=10
            JOIN teams t ON t.id = s.team_id
            JOIN leagues l ON l.id = t.league_id
            JOIN countries cn ON cn.id = l.country_id
-           WHERE l.tier=1 AND cn.grade IN ('SS','S','A')""",
-        (year,)).fetchall()
+           LEFT JOIN hist.ai_player_position_history ph
+             ON ph.player_id = ap.id AND ph.year = ?
+           LEFT JOIN hist.ai_player_position_history_half phh
+             ON phh.player_id = ap.id AND phh.year = ?
+           LEFT JOIN hist.ai_player_season_stats_by_comp bc
+             ON bc.player_id = s.player_id AND bc.year = ? AND bc.competition = 'cl'
+           WHERE l.tier=1
+             AND (ph.role IS NULL OR ph.role NOT IN (?, ?, ?))""",
+        (year, year, year, year, *_EXCLUDED_ROLES)).fetchall()
 
     for r in ai_rows:
-        if not _is_ballon_candidate(r["grade"], year, r["team_id"], r["player_id"],
+        # [2026-09 버그수정, 신민용 리포트: "발롱도르 Top30에 비5대리그
+        # 소속 선수가 너무 많다(실측 30명 중 8명=26.7%, 실제 역사 기준
+        # 3~5%와 크게 어긋남)"] 원인: cn.grade(countries 테이블 컬럼)는
+        # "국가대표 등급"(constants.py 주석: "countries.grade = 국대
+        # 강도(월드컵 예선/대진 기준)")이지 클럽 리그 등급이 아니다 —
+        # world_browser.py에 이미 같은 실수에 대한 경고 주석("grade는
+        # 국가대표 등급이지 클럽 리그 등급이 아니다")이 있었는데, 발롱도르
+        # 게이트는 그 경고를 놓치고 cn.grade를 곧바로 리그 등급인 것처럼
+        # 썼다. 그 결과 국가대표팀은 강해도(모로코/크로아티아/일본 등)
+        # 클럽 리그는 훨씬 약한 나라 소속 선수가 리그 등급 게이트를
+        # 통과해버렸다(실측: 가시마 앤틀러스/리버 플레이트 등). "모든
+        # 호출부가 이 함수 하나만 써야 한다"고 명시된 get_country_league_
+        # grade(클럽 리그 전용 등급, constants.py)로 바꾼다 — 국대 등급
+        # (national_grade)은 그 함수의 3순위 폴백에서만 참고용으로 쓰인다.
+        league_grade = get_country_league_grade(r["cname"], r["national_grade"])
+        if league_grade not in ("SS", "S", "A"):
+            continue
+        if not _is_ballon_candidate(league_grade, year, r["team_id"], r["player_id"],
                                      r["nationality"], cache=_cache):
             continue
+        eff_position = _effective_award_position(
+            r["reg_position"], r["season_position"], r["season_role"],
+            r["half_position"], r["half_role"])
+        _trophy_bonus_val = _get_team_trophy_bonus(year, r["team_id"], r["player_id"], cache=_cache)
+        _cl_stage, _cl_continent, _cl_tier = _cache.get(("cl", year, r["team_id"]), (None, None, None))
         candidates.append({
-            "player_id": r["player_id"], "team_id": r["team_id"], "position": r["position"],
+            "player_id": r["player_id"], "team_id": r["team_id"], "position": eff_position,
             "matches": r["matches"], "goals": r["goals"], "assists": r["assists"],
             "rating": r["rating"], "clean_sheets": r["clean_sheets"],
+            "saves": r["saves"], "goals_conceded": r["goals_conceded"],
             "nationality": r["nationality"],
-            "trophy_bonus": _get_team_trophy_bonus(year, r["team_id"], r["player_id"], cache=_cache),
+            "cl_matches": r["cl_matches"], "cl_goals": r["cl_goals"],
+            "cl_assists": r["cl_assists"], "cl_rating": r["cl_rating"],
+            "cl_continent": _cl_continent, "cl_tier": _cl_tier,
+            "award_bonus": _award_bonus_map.get(r["player_id"], 0.0),
+            "trophy_bonus": _trophy_bonus_val,
             "intl_bonus": _get_player_intl_bonus(year, r["player_id"], r["nationality"]),
         })
 
@@ -10608,23 +11937,65 @@ def _get_ballon_candidates(c, year):
         (year,)).fetchone()
     if my_row and my_row["team_id"]:
         my_team = c.execute(
-            """SELECT cn.grade AS grade FROM teams t JOIN leagues l ON l.id=t.league_id
+            """SELECT cn.name AS cname, cn.grade AS national_grade FROM teams t
+               JOIN leagues l ON l.id=t.league_id
                JOIN countries cn ON cn.id=l.country_id WHERE t.id=?""",
             (my_row["team_id"],)).fetchone()
-        my_grade = my_team["grade"] if my_team else None
+        # [2026-09 버그수정] 위 AI 경로와 동일한 이유로 get_country_league_
+        # grade를 쓴다 — cn.grade(국가대표 등급)를 그대로 쓰면 안 됨.
+        my_grade = get_country_league_grade(my_team["cname"], my_team["national_grade"]) \
+            if my_team else None
         my_p = c.execute("SELECT position, nationality FROM my_player WHERE id=1").fetchone()
-        my_position = my_p["position"] if my_p else None
+        my_reg_position = my_p["position"] if my_p else None
         my_nat = my_p["nationality"] if my_p else None
+        # [2026-09 신설] 위 AI 경로와 같은 역할 게이트 — 내 선수도 예외 없이
+        # 똑같이 적용한다(없으면 자격이 있는 걸로 둠, AI 쪽과 동일 원칙).
+        my_role_row = c.execute(
+            "SELECT position, role FROM my_player_position_history WHERE year=?", (year,)).fetchone()
+        my_role = my_role_row["role"] if my_role_row else None
+        # [2026-09 확장, 신민용 요청] "나"는 상/하반기 스냅샷이 따로 없어서
+        # (my_player_position_history_half 자체가 없음) half 인자는 항상
+        # None — _effective_award_position이 자연히 season_position(그
+        # 해 스냅샷)만 쓰고, 그마저 없으면 등록 포지션으로 폴백한다.
+        my_position = _effective_award_position(
+            my_reg_position, my_role_row["position"] if my_role_row else None, my_role, None, None)
         if (my_grade and my_row["matches"] and my_row["matches"] >= 10 and
+                my_role not in _EXCLUDED_ROLES and
                 _is_ballon_candidate(my_grade, year, my_row["team_id"], _SIA_MY_PLAYER_ID,
                                       my_nat, cache=_cache)):
+            # [2026-09 확장, AI 경로와 동일한 취지] 내 챔스 개인 기록은
+            # cl_matches/cl_tournaments의 my_played=1 행에서 직접 집계한다
+            # — my_player_season_stats_by_comp 같은 요약 표가 나한테는
+            # 없어서(_get_player_comp_contribution의 my-player 분기와
+            # 동일한 방식). EL/ECL 진출 시즌은 여기서 안 잡힌다 — 이는
+            # _get_player_comp_contribution도 갖고 있던 기존 한계를 그대로
+            # 이어받은 것(cl_matches 전용, table_map에 el/ecl 없음).
+            my_cl = c.execute(
+                """SELECT COUNT(*) AS matches, SUM(m.my_goals) AS goals,
+                          SUM(m.my_assists) AS assists, AVG(m.my_rating) AS rating
+                   FROM cl_matches m JOIN cl_tournaments t ON m.tournament_id=t.id
+                   WHERE t.year=? AND m.my_played=1""", (year,)).fetchone()
+            my_cl_matches = my_cl["matches"] if my_cl else 0
             candidates.append({
                 "player_id": _SIA_MY_PLAYER_ID, "team_id": my_row["team_id"], "position": my_position,
                 "matches": my_row["matches"], "goals": my_row["goals"], "assists": my_row["assists"],
                 "rating": my_row["rating"], "clean_sheets": 0,
+                # [2026-09] my_player_season_stats는 saves/goals_conceded를
+                # 아예 안 남긴다(스키마에 컬럼 자체가 없음) — None으로 둬서
+                # _score_ballon_candidate의 GK 분기가 "데이터 없음"으로
+                # 인식해 0점 처리하게 한다(0/0을 "무실점"으로 오인해 만점을
+                # 주는 것을 방지).
+                "saves": None, "goals_conceded": None,
+                "cl_matches": my_cl_matches,
+                "cl_goals": (my_cl["goals"] or 0) if my_cl_matches else 0,
+                "cl_assists": (my_cl["assists"] or 0) if my_cl_matches else 0,
+                "cl_rating": (my_cl["rating"] if my_cl and my_cl["rating"] is not None else None),
                 "nationality": my_nat,
+                "award_bonus": _award_bonus_map.get(_SIA_MY_PLAYER_ID, 0.0),
                 "trophy_bonus": _get_team_trophy_bonus(year, my_row["team_id"], _SIA_MY_PLAYER_ID,
                                                         cache=_cache),
+                "cl_continent": _cache.get(("cl", year, my_row["team_id"]), (None, None, None))[1],
+                "cl_tier": _cache.get(("cl", year, my_row["team_id"]), (None, None, None))[2],
                 "intl_bonus": _get_player_intl_bonus(year, _SIA_MY_PLAYER_ID, my_nat),
             })
 
@@ -10842,7 +12213,83 @@ _BALLON_MAX_PER_TEAM = 3   # [2026-09 신설, 신민용 지적: "실제 발롱�
 # 아니다 — 실제 발롱도르처럼 "각 매체·감독·주장이 투표"하는 구조
 # 자체를 재현하려면 후보 선정/채점 방식부터 다시 설계해야 하는 별도
 # 작업(사용자도 "세부적으로 가야 할 듯"이라고 동의함).
-_BALLON_TEAM_TROPHY_DECAY = [1.0, 0.5, 0.2, 0.08]   # 팀 내 순위 1/2/3/4위+
+_BALLON_TEAM_TROPHY_DECAY = [1.0, 0.7, 0.5, 0.35]   # 팀 내 순위 1/2/3/4위+
+# [2026-09 3차 재보정, 신민용 리포트: "수비수(CB/LB/RB) 과대표집이 실제
+# 역사(1956~2025 시대별 평균) 대비 여전히 2~3배" — 원인은 위 _ballon_
+# rating_percentile_map으로 "팀 내 1위"를 아무리 공정하게 골라도, 이
+# 감쇠 곡선 자체가 1위에게 트로피를 몰아주는 승자독식 구조라 1위가
+# 누구든 과대 보상을 받는 근본 문제가 남아있었기 때문] 기존
+# [1.0, 0.5, 0.2, 0.08](1위 100%/2위 50%/3위 20%/4위+ 8%)을
+# [1.0, 0.7, 0.5, 0.35](1위 100%/2위 70%/3위 50%/4위+ 35%)로 완화한다 —
+# "팀이 잘한 것과 선수가 잘한 것을 분리한다"는 원래 설계 의도는 유지하되
+# (1위와 4위+ 사이 격차는 여전히 존재), 1위가 아니라는 이유만으로
+# 2위 이하가 지나치게 깎이는 폭을 줄인다. 실측 재검증(2000시즌,
+# 3549명 후보): Top30 대분류 분포가 공격 63.3%→66.7% / 미드 13.3%→
+# 13.3%(불변) / 수비 20.0%→16.7% / GK 3.3%→3.3%(불변)로 이동 — 개선은
+# 됐으나 실제 역사(1956~2025 시대별 평균, 수비 5.7~10%) 기준에는
+# 아직 못 미친다. 회전(팀 내 1위가 누구인가) 자체는 이 상수와 무관해
+# 그대로였고(_ballon_rating_percentile_map 기준 CB13.73%/LB10.73%/
+# RB6.44%), 이 상수는 "1위가 얼마나 더 가져가는가"의 폭만 조정한다.
+# [가설 기각] "베스트11/MVP 개인수상(award_bonus)이 수비수에게 중복
+# 반영되는 것 아니냐"는 가설을 실측으로 확인해본 결과 기각됨 —
+# award_bonus 평균은 모든 포지션에서 0.01~0.07 수준으로 작고, 오히려
+# ST(0.0655)가 CB(0.0247)보다 높다. 실제 Top30 수비수들의 score_trophy는
+# award_bonus(0.55~1.45)가 아니라 trophy_bonus/intl_bonus(1.5~15.6,
+# 팀·국가대표 트로피 감쇠분)가 대부분을 차지한다 — 즉 남은 격차는
+# "그 시즌 우승을 많이 쓸어담은 팀에서 rating이 제일 높았던 사람이
+# 우연히 수비수인 경우"의 자연스러운 변동성에 가깝다.
+
+
+def _ballon_rating_percentile_map(candidates):
+    """포지션별로 그 해 전체 후보군 안에서 rating 값을 백분위(0.0~1.0,
+    1.0이 그 포지션 내 최고)로 환산해 player_id→백분위 딕셔너리로
+    반환한다 — 트로피 감쇠의 "팀/국적 내 1위" 판정 전용.
+
+    [2026-09 2차 재보정, 신민용 리포트: "수비수가 너무 후해진 것 같다"]
+    1차 수정(_ballon_productivity의 raw 값을 랭킹 기준으로 쓴 것) 이후
+    재검증 결과, 팀 내 1위(=트로피 100% 유지) 비율이 CB 23.18%/LB
+    18.03%/RB 12.88%로 각 포지션 후보풀 비중(18.15%/6.68%/6.85%)보다
+    여전히 과했다 — 원인은 _ballon_productivity의 "포지션 기대치 대비
+    비율"이 포지션마다 통계적 난이도가 달라서(CB/LB/RB는 기대치가 2라
+    G+A=4만 찍어도 비율 2.0인데, 이 "기대치 2배"를 ST/LW/RW/CAM/CDM은
+    그 해 후보 전원 중 단 한 명도 못 넘음 — 0.0%, CM만 0.2%).
+
+    [2026-09 2차-1차 시도, 실측 후 폐기] "포지션 기대치 대비 비율"
+    대신 "그 포지션 내 백분위"(_ballon_productivity 기준)로 바꿔보면
+    해결될 걸로 예상했으나, 실측 결과 CB 팀 내 1위 비율이 오히려
+    23.18%→34.76%로 악화됐다. 원인: G+A 자체가 포지션별로 분포 모양이
+    완전히 다르다 — CB는 그 해 후보 644명 중 65.1%가 G+A=0(중앙값도
+    0)인 반면 ST는 0%가 0(중앙값 12)이다. 이런 "0에 쏠린" 분포에서는
+    아주 적은 G+A(1~2개)만 있어도 곧바로 자기 포지션 내 최상위 백분위에
+    도달해버려서(대부분이 0이니까), "CB로서 상위 1%"가 "ST로서 상위
+    1%"보다 훨씬 쉽게 달성된다 — 포지션 기대치 문제와 형태만 다를 뿐
+    본질은 같은 "값이 0/저변에 쏠린 지표를 그대로 랭킹에 쓰면 안 된다"는
+    문제.
+
+    [2026-09 2차 최종] G+A 대신 rating(경기 평점)을 백분위 기준으로
+    쓴다 — rating은 모든 포지션에서 연속적으로 고르게 분포한다(실측:
+    ST/CM/CB/LB/RB 전부 최소값 5.8~6.1, 중앙값 6.7~7.1, 최댓값 7.1~7.9로
+    포지션 간 폭이 좁고 어느 포지션도 0에 쏠리지 않음 — "G+A=0인 선수가
+    수두룩한" 문제 자체가 없다). rating 자체가 골(0.02)/도움(0.015)
+    가중치 차이로 ST에게 근소하게 유리했던 게 애초 1차 수정의 출발점인데,
+    "포지션 내 백분위"로 정규화하면 이 근소한 시스템적 편향은 제거되면서
+    (ST로서 상위 X%와 CB로서 상위 X%가 같은 rating 분포 폭 안에서 비교됨)
+    G+A 기반 지표들이 가진 "0-쏠림" 함정도 피해간다. 실측 재검증(2000
+    시즌): 팀 내 1위 분포가 CB 13.73%(풀비중 18.15%, 오히려 풀비중보다
+    낮음)/LB 10.73%(풀비중 6.68%)/RB 6.44%(풀비중 6.85%)로 극단적 쏠림이
+    사라짐 — GK가 19.74%(풀비중 12.14%)로 다소 높게 나오지만 이는 GK
+    고유 채점 경로(야신상)와 분리돼 있어 발롱도르 Top30 실제 구성에는
+    영향이 제한적임을 확인."""
+    by_pos = {}
+    for cand in candidates:
+        by_pos.setdefault(cand.get("position") or "", []).append(cand)
+    percentile_map = {}
+    for members in by_pos.values():
+        ranked = sorted(members, key=lambda c: (c.get("rating") or 0.0))
+        n = len(ranked)
+        for i, cand in enumerate(ranked):
+            percentile_map[cand["player_id"]] = (i / (n - 1)) if n > 1 else 1.0
+    return percentile_map
 
 
 def _apply_ballon_team_trophy_decay(candidates):
@@ -10867,7 +12314,31 @@ def _apply_ballon_team_trophy_decay(candidates):
     같이 걸어도 안전).
     score_rating/score_goals_assists 같은 순수 개인 성적 점수는
     전혀 건드리지 않는다 — "개인 활약 > 팀 성과"라는 우선순위를
-    지키기 위해, 이 감쇠는 오직 팀 성과 항목 안에서만 작동한다."""
+    지키기 위해, 이 감쇠는 오직 팀 성과 항목 안에서만 작동한다.
+
+    [2026-09 재보정, 신민용 리포트: "발롱도르 30명 중 절반 이상이 ST"]
+    "팀 내 1위"를 raw rating으로 정하던 게 원인이었다 — AI 시즌 평점
+    생성식(_estimate_ai_season)이 rating=6.0+(ovr-60)/35+goals*0.02+
+    assists*0.015로 골을 도움보다 33% 더 쳐줘서, 총 G+A가 비슷해도
+    골 비중이 높은 ST의 rating이 LW/RW/CAM보다 근소하게 높게 나온다
+    (실측 2000시즌: ST 평균 7.044 vs LW 6.959/RW 6.914/CAM 6.916).
+    이 미세한 차이가 팀 내 rating 랭킹에서 ST를 74.1% 확률로 1위로
+    올려세웠고, 1위만 trophy_bonus를 100% 유지(2위 50%/3위 20%/4위+
+    8%)하다 보니 ST가 트로피 보너스를 구조적으로 독식했다(후보 풀
+    비중 11.52%인데 Top30의 70%를 ST가 차지한 근본 원인 중 하나).
+    rating을 완전히 배제하고 _ballon_productivity(포지션 기대치 대비
+    골+도움 생산성, GK는 세이브/실점/클린시트 3요소 — score_goals_
+    assists와 동일 공식)의 raw 값을 1차 기준으로 썼었으나, 실측 결과
+    CB/LB/RB처럼 포지션 기대치가 작은 쪽이 새로 유리해지는 문제로
+    이어졌다(자세한 진단은 _ballon_rating_percentile_map 코멘트 참고).
+    최종적으로는 rating을 "포지션 내 백분위"로 정규화한 값
+    (_ballon_rating_percentile_map)을 1차 기준으로 쓴다 — "이 팀에서
+    자기 포지션 기준으로 가장 뛰어난 시즌을 보낸 사람이 누구인가"라는
+    원래 질문 의도는 그대로 유지하면서, rating의 근소한 골/도움 가중치
+    편향과 G+A 지표의 포지션별 분포 왜곡(0-쏠림) 양쪽을 모두 피한다.
+    _ballon_productivity는 완전 동점일 때만 걸리는 2차 타이브레이커로
+    남긴다."""
+    percentile_map = _ballon_rating_percentile_map(candidates)
     by_team = {}
     for cand in candidates:
         tid = cand.get("team_id")
@@ -10877,7 +12348,7 @@ def _apply_ballon_team_trophy_decay(candidates):
         if len(members) < 2:
             continue
         members.sort(key=lambda x: (
-            -(x.get("rating") or 0), -((x.get("goals") or 0) + (x.get("assists") or 0)),
+            -percentile_map.get(x["player_id"], 0.0), -_ballon_productivity(x),
             x["player_id"]))
         for i, cand in enumerate(members):
             decay = _BALLON_TEAM_TROPHY_DECAY[min(i, len(_BALLON_TEAM_TROPHY_DECAY) - 1)]
@@ -10913,7 +12384,22 @@ def _apply_ballon_intl_bonus_decay(candidates):
     같은 국적끼리 묶는다 — 그 나라 대표팀 스쿼드 전체가 아니라 "발롱도르
     후보 자격이 있는 사람들끼리의 국내 순위"라는 뜻이므로, 어차피
     intl_bonus가 0인 비후보(리그 게이트 자체를 못 넘은 선수 등)는 여기
-    들어오지도 않는다."""
+    들어오지도 않는다.
+
+    [2026-09 재보정] _apply_ballon_team_trophy_decay와 완전히 같은 이유로
+    같은 수정을 적용한다 — "국가대표팀 내 1위"도 raw rating 기준이면
+    골 비중이 높은 ST가 구조적으로 유리해지므로(위 함수 코멘트 참고),
+    처음엔 _ballon_productivity(포지션 기대치 대비 생산성)의 raw 값을
+    1차 기준으로 썼지만, 이 역시 CB/LB/RB처럼 기대치가 작은 포지션이
+    새로 유리해지는 문제로 이어졌다(_ballon_rating_percentile_map
+    코멘트 참고).
+
+    [2026-09 2차 재보정] _apply_ballon_team_trophy_decay와 동일하게
+    rating을 "포지션 내 백분위"로 정규화한 값(_ballon_rating_percentile_
+    map)을 1차 기준으로 쓴다 — 전 세계 후보 기준으로 한 번 계산해
+    국적 단위 랭킹에도 그대로 재사용. _ballon_productivity는 동점
+    타이브레이커로만 남긴다."""
+    percentile_map = _ballon_rating_percentile_map(candidates)
     by_nat = {}
     for cand in candidates:
         nat = cand.get("nationality")
@@ -10923,7 +12409,7 @@ def _apply_ballon_intl_bonus_decay(candidates):
         if len(members) < 2:
             continue
         members.sort(key=lambda x: (
-            -(x.get("rating") or 0), -((x.get("goals") or 0) + (x.get("assists") or 0)),
+            -percentile_map.get(x["player_id"], 0.0), -_ballon_productivity(x),
             x["player_id"]))
         for i, cand in enumerate(members):
             decay = _BALLON_TEAM_TROPHY_DECAY[min(i, len(_BALLON_TEAM_TROPHY_DECAY) - 1)]
@@ -10979,6 +12465,94 @@ def _save_ballon_dor_top30(c, year, candidates):
     _save_individual_award_rows(c, year, "world", None, entries)
 
 
+_YASHIN_MAX_PER_TEAM = 2   # [2026-09 신설, 신민용 요청: "발롱도르 키퍼용
+# (트로피 야신)을 만들고 싶다 — 30명 아니라 10명 표시"] 위 _BALLON_MAX_
+# PER_TEAM(3)과 같은 목적의 안전장치를 GK 전용 명단에도 둔다 — 다만 팀당
+# GK는 보통 1명뿐이라 실제로 이 상한에 걸릴 일은 드물다(임대·이적으로
+# 같은 시즌 두 명이 뛴 경우 정도).
+_YASHIN_TOP_N = 10
+
+
+def _save_yashin_trophy_top10(c, year):
+    """트로피 야신(2019년 실제로 신설된, 발롱도르와 함께 시상되는 골키퍼
+    전용 상) 대응. [2026-09 신설, 신민용 확정: "발롱도르 키퍼용을 만드는
+    거며, 30명 중 1명이 아니라 10명 표시(푸스카스처럼)"] — 선정 방식
+    자체는 발롱도르와 동일(순수 점수 내림차순 deterministic, 푸스카스처럼
+    확률 추첨을 하지 않는다)하게 두고, 대상만 GK로 좁히고 명단 길이만
+    10으로 줄인 버전이다.
+
+    _get_ballon_candidates/_score_ballon_candidate가 이미 GK를 전용
+    채점(골/도움 대신 클린시트 비율, _score_ballon_candidate의 pos==
+    "GK" 분기)으로 계산해두고 있으므로 그 로직을 그대로 재사용한다 —
+    새 채점 공식을 만들지 않는다. 다만 발롱도르 파이프라인의 상태를
+    공유하지 않도록(둘 다 in-place로 trophy_bonus/intl_bonus를 감쇠시키는
+    함수들이라) _get_ballon_candidates를 여기서 독립적으로 다시 호출해
+    이 함수만의 새 후보 리스트(새 dict 객체들)를 받는다 — 발롱도르 쪽
+    top30 선정에는 전혀 영향을 주지 않는다. 감쇠(_apply_ballon_team_
+    trophy_decay/_apply_ballon_intl_bonus_decay)는 GK만 걸러내기 전,
+    그 팀/그 국적의 발롱도르 후보 전체를 기준으로 먼저 적용한다 —
+    "이 골키퍼가 소속팀·국가대표팀에서 다른 후보들에 비해 얼마나
+    두드러졌는가"라는 맥락이 발롱도르와 같아야 순위가 왜곡되지 않는다."""
+    candidates = _get_ballon_candidates(c, year)
+    if not candidates:
+        return
+    candidates = _apply_ballon_team_trophy_decay(candidates)
+    candidates = _apply_ballon_intl_bonus_decay(candidates)
+    gk_candidates = [cand for cand in candidates if cand.get("position") == "GK"]
+    if not gk_candidates:
+        return
+    scored = []
+    for cand in gk_candidates:
+        s = _score_ballon_candidate(cand)
+        scored.append({**cand, **s})
+    scored.sort(key=lambda x: (
+        -x["total_score"], -(x.get("rating") or 0),
+        -((x.get("goals") or 0) + (x.get("assists") or 0)), x["player_id"]))
+    top10 = []
+    _team_counts = {}
+    for x in scored:
+        tid = x.get("team_id")
+        cnt = _team_counts.get(tid, 0) if tid is not None else 0
+        if tid is not None and cnt >= _YASHIN_MAX_PER_TEAM:
+            continue
+        top10.append(x)
+        if tid is not None:
+            _team_counts[tid] = cnt + 1
+        if len(top10) >= _YASHIN_TOP_N:
+            break
+    entries = [("야신상", i + 1, {
+        "player_id": x["player_id"], "team_id": x["team_id"], "position": x.get("position"),
+        "total_score": x["total_score"], "score_trophy": x["score_trophy"],
+        "score_rating": x["score_rating"], "score_goals_assists": x["score_goals_assists"],
+        "score_position_adj": x["score_position_adj"],
+        "stat_goals": x.get("goals") or 0, "stat_assists": x.get("assists") or 0,
+    }) for i, x in enumerate(top10)]
+    _save_individual_award_rows(c, year, "world", None, entries)
+
+
+def _country_ids_by_league_grade(c, grades):
+    """countries 테이블 전체를 훑어 get_country_league_grade() 기준으로
+    "클럽 리그 등급"이 grades(예: ('SS','S'))에 속하는 country id 집합을
+    반환한다.
+
+    [2026-09 버그수정, 신민용 확정: "SS랑 S는 동급으로 봐야한다"는 원칙
+    아래, 발롱도르 게이트에서 발견된 것과 동일한 버그(cn.grade — countries
+    테이블 컬럼 — 를 클럽 리그 등급인 것처럼 SQL에서 직접 필터링하던 것)가
+    푸스카스상 후보 리그/라이벌 풀, 월드클래스 라이벌 OVR 비교, 월드
+    베스트11 후보 풀까지 총 4곳에 더 있었다. cn.grade는 constants.py
+    주석대로 "국대 강도(월드컵 예선/대진 기준)"이지 클럽 리그 등급이
+    아니다(_get_ballon_candidates 코멘트에 상세 진단 있음) — 이 헬퍼로
+    네 곳 모두 get_country_league_grade(클럽 리그 전용 등급) 기준으로
+    통일한다. countries 테이블 전체(211개국)를 한 번 훑는 가벼운 연산이라
+    호출부마다 새로 계산해도 비용은 미미하다."""
+    rows = c.execute("SELECT id, name, grade FROM countries").fetchall()
+    ids = set()
+    for r in rows:
+        if get_country_league_grade(r["name"], r["grade"]) in grades:
+            ids.add(r["id"])
+    return ids
+
+
 def _get_puskas_candidates(c, year):
     """[2026-09 재설계, 신민용 확정: "이건 확률적인게 맞아 — 점수로 뽑으면
     안 돼"] SS/S급 리그 전체를 훑어서 리그마다 "올해의 골" 수상자를 뽑되,
@@ -10990,10 +12564,12 @@ def _get_puskas_candidates(c, year):
     [{player_id, team_id, goal_event_id, final_score}, ...] — 다음 단계
     (_save_puskas_top10)에서 이 목록 자체를 세계급 후보 풀로 다시 확률
     선정한다."""
+    _five_ids = _country_ids_by_league_grade(c, ("SS", "S"))
+    _five_ph = ",".join(str(i) for i in _five_ids) or "-1"
     leagues = c.execute(
-        """SELECT l.id AS league_id, l.name AS league_name, cn.grade AS grade
+        f"""SELECT l.id AS league_id, l.name AS league_name, cn.name AS cname, cn.grade AS national_grade
            FROM leagues l JOIN countries cn ON cn.id=l.country_id
-           WHERE l.tier=1 AND cn.grade IN ('SS','S')""").fetchall()
+           WHERE l.tier=1 AND l.country_id IN ({_five_ph})""").fetchall()
 
     my_row = c.execute("SELECT current_team_id FROM my_player WHERE id=1").fetchone()
     my_team_id = my_row["current_team_id"] if my_row else None
@@ -11046,7 +12622,13 @@ def _get_puskas_candidates(c, year):
 
     league_winners = []
     for lg in leagues:
-        league_id, lname, grade = lg["league_id"], lg["league_name"], lg["grade"]
+        league_id, lname = lg["league_id"], lg["league_name"]
+        # [2026-09 버그수정] _country_ids_by_league_grade 코멘트 참고 —
+        # lg["national_grade"](cn.grade, 국가대표 등급)를 그대로 골 품질
+        # 가중치(goal_gen.LEAGUE_GRADE_WEIGHT)에 넘기면 안 된다. 이 리그는
+        # 이미 위에서 클럽 리그 등급 기준으로 걸러졌으니, 대표골 생성에도
+        # 같은 올바른 등급을 넘긴다.
+        grade = get_country_league_grade(lg["cname"], lg["national_grade"])
         scorer_rows = sorted(_pool_by_league.get(league_id, []),
                              key=lambda x: -x["goals"])[:_GOAL_POOL_SIZE]
 
@@ -11852,6 +13434,12 @@ def _compute_season_individual_awards(year, my_ctx=None):
         need_ballon = not c.execute(
             "SELECT 1 FROM season_individual_awards WHERE year=? AND award_type='발롱도르' LIMIT 1",
             (year,)).fetchone()
+        # [2026-09 신설, 신민용 요청: "발롱도르 키퍼용(트로피 야신)"]
+        # 발롱도르와 완료 체크를 똑같은 패턴으로 별도 관리 — award_type이
+        # 달라 발롱도르 저장 여부와 독립적으로 다시 계산될 수 있다.
+        need_yashin = not c.execute(
+            "SELECT 1 FROM season_individual_awards WHERE year=? AND award_type='야신상' LIMIT 1",
+            (year,)).fetchone()
         need_puskas = not c.execute(
             "SELECT 1 FROM season_individual_awards WHERE year=? AND award_type='FIFA 푸스카스상' LIMIT 1",
             (year,)).fetchone()
@@ -11876,7 +13464,7 @@ def _compute_season_individual_awards(year, my_ctx=None):
         need_cup = not c.execute(
             "SELECT 1 FROM season_individual_awards WHERE year=? AND category IN ('cup','lower_cup') LIMIT 1",
             (year,)).fetchone()
-        if (not need_ballon and not need_puskas and not need_club_comp
+        if (not need_ballon and not need_yashin and not need_puskas and not need_club_comp
                 and not need_league and not need_cup):
             return
         # [2026-09 계측] 이 함수가 시즌전환의 두 번째로 큰 덩어리이고
@@ -11888,29 +13476,23 @@ def _compute_season_individual_awards(year, my_ctx=None):
         _aw0 = _t_aw.perf_counter()
         _aw_ballon = _aw_puskas = _aw_club = _aw_intl = _aw_league = 0.0
         _n_ballon = 0
-        if need_ballon:
-            candidates = _get_ballon_candidates(c, year)
-            _n_ballon = len(candidates) if candidates else 0
-            _aw1 = _t_aw.perf_counter()
-            _save_ballon_dor_top30(c, year, candidates)
-            _aw_ballon = _t_aw.perf_counter() - _aw0
-            _aw_cand = _aw1 - _aw0
-        else:
-            _aw_cand = 0.0
-        _awA = _t_aw.perf_counter()
-        if need_puskas:
-            winners = _get_puskas_candidates(c, year)
-            _save_puskas_top10(c, year, winners)
-        _aw_puskas = _t_aw.perf_counter() - _awA
-        conn.commit()
+        # [2026-09 재배치, 79차, 신민용 확정: "MVP/베스트11을 발롱도르
+        # 트로피 가산점으로 반영"] 발롱도르가 그 해 리그/클럽대항전/
+        # 국제대회 MVP·베스트11을 읽어야 하므로(_get_award_recognition_
+        # bonus_map), 그 정보가 season_individual_awards에 먼저 저장돼
+        # 있어야 한다. 예전엔 이 셋(클럽대항전/국제대회/리그)이 발롱도르
+        # 보다 "뒤에" 계산됐다 — 그때는 셋 다 발롱도르와 무관한 독립
+        # 계산이라 순서가 상관없었지만, 이제 발롱도르가 그 결과를 읽는
+        # 의존관계가 생겨 먼저 계산·커밋하도록 옮긴다. 셋 다 random을
+        # 안 쓰고(AST로 확인 — 그 안에서 부르는 _pick_club_comp_mvp_and_
+        # scorer/_pick_comp_extra_winners도 순수 정렬 기반) 서로/발롱도르
+        # 와 데이터 의존관계가 없어(각자 hist 시즌스탯/by_comp/스쿼드풀만
+        # 읽고 자체 커밋) 순서를 옮겨도 유일한 랜덤 추첨상인 푸스카스
+        # 등 다른 상의 결과에 영향이 없다(위 계측 코멘트의 "순서만
+        # 바뀌어도 수상자가 달라짐" 경고는 발롱도르/베스트11 "후보
+        # 정렬" 내부 순서에 대한 것이지, 이 세 함수를 발롱도르보다
+        # 앞에서 부르는 것과는 무관 — 그쪽 로직은 그대로 안 건드림).
         if need_club_comp:
-            # 독립 트랜잭션 — _compute_club_comp_individual_awards/
-            # _compute_intl_individual_awards가 각자 자체 커넥션/커밋을
-            # 쓰므로 여기서는 그냥 호출만 한다. 국제대회는 별도 완료
-            # 체크 없이 클럽 대항전과 같이 묶어서 매번 부른다 — 둘 다
-            # INSERT OR IGNORE라 중복 호출돼도 안전하고(멱등), 정상
-            # 흐름에서는 이 함수 자체가 연도당 한 번만 불리므로 실제
-            # 낭비도 없다(발롱도르/푸스카스와 동일한 트레이드오프).
             _awB = _t_aw.perf_counter()
             _compute_club_comp_individual_awards(year)
             _awC = _t_aw.perf_counter()
@@ -11918,12 +13500,27 @@ def _compute_season_individual_awards(year, my_ctx=None):
             _compute_intl_individual_awards(year)
             _aw_intl = _t_aw.perf_counter() - _awC
         if need_league:
-            # 마찬가지로 독립 트랜잭션(자체 커넥션/커밋) — my_ctx는 호출부
-            # (_end_of_season)가 "내가 이번 시즌 뛴 리그" 컨텍스트를 미리
-            # 구성해 넘겨준다(없으면 세계 계산만, 내 상 병합은 스킵).
             _awD = _t_aw.perf_counter()
             _compute_league_individual_awards(year, my_ctx=my_ctx)
             _aw_league = _t_aw.perf_counter() - _awD
+        _awF = _t_aw.perf_counter()
+        if need_ballon:
+            candidates = _get_ballon_candidates(c, year)
+            _n_ballon = len(candidates) if candidates else 0
+            _aw1 = _t_aw.perf_counter()
+            _save_ballon_dor_top30(c, year, candidates)
+            _aw_ballon = _t_aw.perf_counter() - _awF
+            _aw_cand = _aw1 - _awF
+        else:
+            _aw_cand = 0.0
+        if need_yashin:
+            _save_yashin_trophy_top10(c, year)
+        _awA = _t_aw.perf_counter()
+        if need_puskas:
+            winners = _get_puskas_candidates(c, year)
+            _save_puskas_top10(c, year, winners)
+        _aw_puskas = _t_aw.perf_counter() - _awA
+        conn.commit()
         _aw_cup = 0.0
         if need_cup:
             _awE = _t_aw.perf_counter()
@@ -12375,13 +13972,13 @@ def _process_goal_awards(c, p, year, tid, league_id, lname, grade, tier, cands, 
     #    경쟁 풀을 만들고, 위와 동일하게 상위 후보 + 확률적 선정을 적용한다.
     _PUSKAS_GRADES = ("SS", "S")
     if won_league_goal and grade in _PUSKAS_GRADES and tier == 1:
+        _five_ph = ",".join(str(i) for i in _country_ids_by_league_grade(c, ("SS", "S"))) or "-1"
         rivals = c.execute("""SELECT a.id, a.ovr, a.team_id FROM ai_players a
             JOIN teams t ON a.team_id=t.id
             JOIN leagues l ON t.league_id=l.id
-            JOIN countries cn ON l.country_id=cn.id
-            WHERE cn.grade IN ('SS','S') AND l.tier=1 AND a.position IN ({})
+            WHERE l.country_id IN ({}) AND l.tier=1 AND a.position IN ({})
             ORDER BY a.ovr DESC LIMIT ?
-            """.format(",".join("'%s'" % pp for pp in ATTACK_POS)),
+            """.format(_five_ph, ",".join("'%s'" % pp for pp in ATTACK_POS)),
             (_PUSKAS_RIVAL_COUNT,)).fetchall()
         rival_scores = []
         for i, rival in enumerate(rivals):
@@ -12786,9 +14383,9 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
             other = c.execute("""SELECT MAX(a.ovr) as mo FROM ai_players a
                 JOIN teams t ON a.team_id=t.id
                 JOIN leagues l ON t.league_id=l.id
-                JOIN countries cn ON l.country_id=cn.id
-                WHERE cn.grade IN ('SS','S') AND l.tier=1 AND a.position IN ({})
-                """.format(",".join("'%s'" % pp for pp in _rival_pos_group))).fetchone()
+                WHERE l.country_id IN ({}) AND l.tier=1 AND a.position IN ({})
+                """.format(",".join(str(i) for i in _country_ids_by_league_grade(c, ("SS", "S"))) or "-1",
+                           ",".join("'%s'" % pp for pp in _rival_pos_group))).fetchone()
             rival_ovr = other["mo"] if other and other["mo"] else 90
             _cc = _get_cl_cup_season_stats(year)
             _combined_ga = season_goals + season_assists + _cc["goals"] + _cc["assists"]
@@ -12993,10 +14590,11 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
                           "ovr": p.get("ovr", 60), "cs": season_cs, "is_mine": True, "team_id": tid}]
             _w11_ALL_POS = GK_POS + DF_POS + MF_POS + FW_POS
             _w11_ph = ",".join("'%s'" % pp for pp in _w11_ALL_POS)
+            _five_ph = ",".join(str(i) for i in _country_ids_by_league_grade(c, ("SS", "S"))) or "-1"
             _w11_rows = c.execute(f"""SELECT a.ovr, a.position, a.sub_role, t2.id as team_id
                 FROM ai_players a JOIN teams t2 ON a.team_id=t2.id
-                JOIN leagues l2 ON t2.league_id=l2.id JOIN countries cn2 ON l2.country_id=cn2.id
-                WHERE cn2.grade IN ('SS','S') AND l2.tier=1 AND a.position IN ({_w11_ph})""").fetchall()
+                JOIN leagues l2 ON t2.league_id=l2.id
+                WHERE l2.country_id IN ({_five_ph}) AND l2.tier=1 AND a.position IN ({_w11_ph})""").fetchall()
             for _r in _w11_rows:
                 _g, _a, _rt = _estimate_ai_season(_r["ovr"], _r["position"], 85, 85, _r["sub_role"],
                                                    full_season_matches=_W11_FULL_SEASON)

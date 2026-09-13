@@ -3813,6 +3813,27 @@ class WorldBrowserWindow(QDialog):
         self.player_team_career_btn.toggled.connect(_debounced_refresh)
         club_filter_lay.addWidget(self.player_team_career_btn)
 
+        # [2026-09 신설, 신민용 요청: "국가(소속리그) 상자 안에 외국인
+        # 표시 on/off를 만들어달라 — 켜면 그 국적이 아니면서 그 리그에서
+        # 뛰는 애들을 표시할 수 있게"] "팀 기준: 경력 포함"과 같은 토글
+        # 스타일(_STATUS_BTN_STYLE — 켜지면 초록, 꺼지면 원래 버튼 색)을
+        # 그대로 재사용한다. 국가(소속리그) 콤보가 "대한민국"이면, 이걸
+        # 켰을 때 국적이 대한민국이 아니면서 대한민국 리그(K리그 등)에서
+        # 뛰는 선수만 남는다 — 국가(소속리그)를 "전체"로 두고 이것만
+        # 켜면 "자국 리그가 아닌 곳에서 뛰는 선수 전원"이 된다.
+        self.player_foreign_btn = QPushButton("외국인 표시")
+        self.player_foreign_btn.setCheckable(True)
+        self.player_foreign_btn.setChecked(False)
+        self.player_foreign_btn.setAutoDefault(False)
+        self.player_foreign_btn.setStyleSheet(_STATUS_BTN_STYLE)
+        self.player_foreign_btn.setToolTip(
+            "꺼짐(기본): 필터 없음 — 국적과 무관하게 전부 보임.\n"
+            "켜짐: 국적이 소속팀 리그의 국가와 다른 선수만 표시(외국인 용병) —\n"
+            "국가(소속리그)를 특정 나라로 좁히면 '그 나라 리그의 외국인'이 되고,\n"
+            "전체로 두면 '자국 리그가 아닌 곳에서 뛰는 선수 전원'이 됩니다.")
+        self.player_foreign_btn.toggled.connect(_debounced_refresh)
+        club_filter_lay.addWidget(self.player_foreign_btn)
+
         filt.addWidget(club_filter_box)
 
         # [2026-08 신설, 신민용 요청: "국가(소속리그)랑 상태(현역/은퇴)
@@ -4777,6 +4798,7 @@ class WorldBrowserWindow(QDialog):
         if self.player_team_direct_edit.text().strip() and _direct_match:
             team_id = _direct_match["team_id"]
         team_mode = "career" if self.player_team_career_btn.isChecked() else "current"
+        foreign_only = self.player_foreign_btn.isChecked()
         players = wb.search_ai_players(name_query=q, continent=cont, country_id=club_cid,
                                         nat_country_id=nat_cid, grade=grade, tier=tier,
                                         position=pos, min_age=min_age, max_age=max_age,
@@ -4786,7 +4808,8 @@ class WorldBrowserWindow(QDialog):
                                         league_id=league_id, name_mode=name_mode,
                                         custom_named_only=custom_named_only,
                                         min_career_years=min_career_years,
-                                        max_career_years=max_career_years)
+                                        max_career_years=max_career_years,
+                                        foreign_only=foreign_only)
 
         self.player_list.clear()
         for pl in players:
@@ -8652,6 +8675,41 @@ class WorldBrowserWindow(QDialog):
         _enable_plain_copy(self.ia_ballon_tbl)
         right_lay.addWidget(self.ia_ballon_tbl, 3)
 
+        # [2026-09 신설, 신민용 요청: "발롱 아래에 야신상/푸스카스상 버튼을
+        # 만들어서, 누르면 그 상 표가 발롱 아래에 뜨게"] 야신상 표는
+        # 발롱도르와 컬럼 구성이 완전히 같은(10열) 넓은 표라, 푸스카스
+        # (6열)와 좌우로 나란히 두면 야신상 쪽 "선수"/"팀"/점수 breakdown
+        # 열이 절반 폭에 눌려 읽기 어려워진다 — 그래서 좌우 배치 대신
+        # 세로 토글(같은 자리에서 표만 바뀌는 방식, "클럽 대항전" 탭의
+        # 챔피언스/유로파/컨퍼런스 토글과 동일한 언어)을 택했다. 두 표
+        # 데이터는 연도 선택 시 항상 같이 채워두고(_on_ia_year_selected)
+        # 토글은 순수하게 "어느 쪽을 보여줄지"만 담당해, 전환 시 추가
+        # 조회 없이 즉시 바뀐다.
+        self._ia_secondary = "야신상"   # 기본 선택 — 연도를 바꿔도 유지됨
+        toggle_row = QHBoxLayout()
+        toggle_row.addWidget(QLabel("👇"))
+        _IA_SECONDARY_TOGGLE_STYLE = (
+            "QPushButton{background:#2a2a2a;color:#888;border:1px solid #3a3a3a;"
+            "border-radius:4px;padding:4px 10px;font-size:11px;}"
+            "QPushButton:checked{background:#0d3d1a;color:#00cc44;border-color:#00cc44;}")
+        ia_secondary_group = QButtonGroup(right)
+        ia_secondary_group.setExclusive(True)
+        self._ia_secondary_buttons = {}
+        for key, label in (("야신상", "🥅 야신상"), ("푸스카스상", "⚽ 푸스카스상")):
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setAutoDefault(False)
+            btn.setDefault(False)
+            btn.setStyleSheet(_IA_SECONDARY_TOGGLE_STYLE)
+            btn.clicked.connect(lambda _checked, k=key: self._on_ia_secondary_toggle(k))
+            ia_secondary_group.addButton(btn)
+            toggle_row.addWidget(btn)
+            self._ia_secondary_buttons[key] = btn
+        self._ia_secondary_buttons[self._ia_secondary].setChecked(True)
+        self._ia_secondary_group = ia_secondary_group  # GC 방지용 참조 보관
+        toggle_row.addStretch()
+        right_lay.addLayout(toggle_row)
+
         self.ia_puskas_title = QLabel("⚽ FIFA 푸스카스상 Top 10")
         self.ia_puskas_title.setStyleSheet(
             "color:#ffcc00;font-size:13px;font-weight:bold;margin-top:8px;")
@@ -8667,11 +8725,51 @@ class WorldBrowserWindow(QDialog):
         _enable_plain_copy(self.ia_puskas_tbl)
         right_lay.addWidget(self.ia_puskas_tbl, 2)
 
+        # [2026-09 신설, 신민용 요청: "발롱도르 키퍼용(트로피 야신) — 30명
+        # 아니라 10명 표시"] 채점 컬럼 구성은 발롱도르와 완전히 같으므로
+        # (game_engine._save_yashin_trophy_top10 주석 참고) 표 레이아웃도
+        # 발롱도르 표와 동일하게 두고, 제목·크기·데이터만 야신상 전용으로
+        # 분리한다.
+        self.ia_yashin_title = QLabel("🥅 야신상 Top 10")
+        self.ia_yashin_title.setStyleSheet(
+            "color:#ffcc00;font-size:13px;font-weight:bold;margin-top:8px;")
+        self.ia_yashin_title.setVisible(False)
+        right_lay.addWidget(self.ia_yashin_title)
+
+        self.ia_yashin_tbl = QTableWidget(0, 0)
+        self.ia_yashin_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.ia_yashin_tbl.verticalHeader().setVisible(False)
+        self.ia_yashin_tbl.cellDoubleClicked.connect(
+            lambda row, col: self._on_ia_player_row_clicked(self.ia_yashin_tbl, row))
+        self.ia_yashin_tbl.setVisible(False)
+        _enable_plain_copy(self.ia_yashin_tbl)
+        right_lay.addWidget(self.ia_yashin_tbl, 2)
+
         row.addWidget(right, 1)
         lay.addLayout(row, 1)
 
         self._refresh_ia_year_list()
         return w
+
+    def _on_ia_secondary_toggle(self, key):
+        """야신상/푸스카스상 토글 버튼 클릭 — 두 표는 연도 선택 시 이미
+        둘 다 채워져 있으므로(재조회 없음), 어느 쪽을 보여줄지만 바꾼다."""
+        if key == self._ia_secondary:
+            return
+        self._ia_secondary = key
+        self._apply_ia_secondary_visibility()
+
+    def _apply_ia_secondary_visibility(self):
+        """현재 self._ia_secondary 선택에 맞춰 야신상/푸스카스상 중 하나만
+        보이게 한다. 두 표 다 아직 데이터가 없는 초기 상태(연도 미선택)
+        에서는 ia_puskas_tbl/ia_yashin_tbl 자체가 아직 setVisible(False)
+        상태라 아무 것도 안 뜨는 게 맞으므로, 이 함수는 연도가 선택된
+        뒤(_on_ia_year_selected)에만 호출된다."""
+        show_yashin = self._ia_secondary == "야신상"
+        self.ia_yashin_title.setVisible(show_yashin)
+        self.ia_yashin_tbl.setVisible(show_yashin)
+        self.ia_puskas_title.setVisible(not show_yashin)
+        self.ia_puskas_tbl.setVisible(not show_yashin)
 
     def _refresh_ia_year_list(self):
         self.ia_year_list.clear()
@@ -8711,10 +8809,17 @@ class WorldBrowserWindow(QDialog):
         self.ia_ballon_tbl.setVisible(True)
         self._fill_ballon_table(ballon_rows)
 
+        # [2026-09 수정, 신민용 요청: "발롱 아래에 야신상/푸스카스상
+        # 토글 버튼"] 둘 다 데이터는 항상 채워두고(토글 전환 시 재조회
+        # 없이 즉시 바뀌도록), 어느 쪽을 보여줄지는 _apply_ia_secondary_
+        # visibility가 현재 토글 선택에 맞춰 결정한다.
         puskas_rows = wb.get_season_individual_awards(year, "FIFA 푸스카스상")
-        self.ia_puskas_title.setVisible(True)
-        self.ia_puskas_tbl.setVisible(True)
         self._fill_puskas_table(puskas_rows)
+
+        yashin_rows = wb.get_season_individual_awards(year, "야신상")
+        self._fill_yashin_table(yashin_rows)
+
+        self._apply_ia_secondary_visibility()
 
     def _fill_ballon_table(self, rows):
         tbl = self.ia_ballon_tbl
@@ -8779,6 +8884,38 @@ class WorldBrowserWindow(QDialog):
                     cell.setForeground(Qt.GlobalColor.green)
                 tbl.setItem(i, j, cell)
         self._show_empty_state(tbl, rows, "이 해는 세계 푸스카스 수상자가 없습니다", len(cols))
+        self._grow_to_fit(tbl, stretch_col=1)
+
+    def _fill_yashin_table(self, rows):
+        # [2026-09 신설] 야신상은 발롱도르와 채점 컬럼 구성이 완전히 같다
+        # (game_engine._save_yashin_trophy_top10 참고 — GK 전용 채점을
+        # 재사용할 뿐 breakdown 필드 자체는 동일) — _fill_ballon_table과
+        # 같은 컬럼 레이아웃을 그대로 쓰되 대상 표만 ia_yashin_tbl로 분리.
+        tbl = self.ia_yashin_tbl
+        cols = ["순위", "선수", "국적", "팀", "포지션", "트로피", "평점", "생산성", "포지션보정", "총점"]
+        tbl.clear()
+        tbl.setRowCount(len(rows))
+        tbl.setColumnCount(len(cols))
+        tbl.setHorizontalHeaderLabels(cols)
+        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for i, r in enumerate(rows):
+            name = r["name"]
+            nat = r.get("nationality") or ""
+            team = r.get("team_name") or ""
+            vals = [str(r["rank"]), name, nat, team, r.get("position") or "",
+                     f"{r.get('score_trophy') or 0:.1f}", f"{r.get('score_rating') or 0:.1f}",
+                     f"{r.get('score_goals_assists') or 0:.1f}", f"{r.get('score_position_adj') or 0:.1f}",
+                     f"{r.get('total_score') or 0:.1f}"]
+            for j, v in enumerate(vals):
+                cell = QTableWidgetItem(v)
+                cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if j == 0:
+                    cell.setData(Qt.ItemDataRole.UserRole, r["player_id"])
+                if r["player_id"] == wb.MY_PLAYER_ID:
+                    cell.setForeground(Qt.GlobalColor.green)
+                tbl.setItem(i, j, cell)
+        self._show_empty_state(tbl, rows, "이 해는 야신상 후보가 없습니다", len(cols))
         self._grow_to_fit(tbl, stretch_col=1)
 
     def _on_ia_player_row_clicked(self, tbl, row):

@@ -95,7 +95,7 @@ def _absence_override(m, ncols, rating_col_idx):
 
 # 개인 수상으로 분류할 키워드 (trophy_log에 섞여 들어온 발롱도르·MVP 행 식별)
 _PERSONAL_AWARD_KEYWORDS = (
-    "발롱도르", "MVP", "득점왕", "도움왕", "베스트11",
+    "발롱도르", "야신상", "MVP", "득점왕", "도움왕", "베스트11",
     "골든글러브", "영플레이어", "푸스카스", "사모라",
     "올해의 수비수", "구단 올해의 선수",
 )
@@ -1086,7 +1086,7 @@ class CareerWindow(QDialog):
         from collections import Counter
         from constants import normalize_award_bucket, award_icon
         cnt = Counter(normalize_award_bucket(a.get("award_type","")) for a in awards)
-        order = ["발롱도르","MVP","득점왕","도움왕","베스트11","골든글러브","영플레이어",
+        order = ["발롱도르","야신상","MVP","득점왕","도움왕","베스트11","골든글러브","영플레이어",
                  "올해의 수비수","구단 올해의 선수",
                  "FIFA 푸스카스상","대회 최고의 골","리그 올해의 골"]
         summary_parts = []
@@ -1101,13 +1101,13 @@ class CareerWindow(QDialog):
         cols = ["연도","수상","리그","상세"]
         tbl  = self._make_table(len(awards), cols)
         icon = {"득점왕":"⚽","도움왕":"🎯","베스트11":"⭐","MVP":"🏅",
-                "발롱도르":"🏆","영플레이어":"🌟","골든글러브":"🧤",
+                "발롱도르":"🏆","야신상":"🥅","영플레이어":"🌟","골든글러브":"🧤",
                 "올해의 수비수":"🛡️","구단 올해의 선수":"🎖️"}
         for i, a in enumerate(awards):
             atype = a.get("award_type","")
             label = f"{award_icon(atype, icon)} {atype}"
-            # 발롱도르/MVP/득점왕은 강조색
-            color = "#ffcc00" if atype in ("발롱도르","MVP") else (
+            # 발롱도르/야신상/MVP/득점왕은 강조색
+            color = "#ffcc00" if atype in ("발롱도르","야신상","MVP") else (
                     "#00cc44" if atype in ("득점왕","도움왕") else None)
             vals = [str(a.get("year","")), label, a.get("league_name",""), a.get("detail","")]
             for j, v in enumerate(vals):

@@ -127,31 +127,83 @@ def _fetch_roster(team_id):
         return []
 
 
+# [2026-09 신설, 신민용 리포트: "17살 91 OVR 유망주가 빅클럽 주전으로
+# 뜬다"] 헤드리스 96팀 실측(빅5리그 1부 전체) 결과 93%(89/96)팀이 스쿼드
+# top11 평균보다 5점 이상 낮은 선수를 실제 선발로 썼고, 56%(54/96)팀은
+# 19세 이하를 선발에 포함했다 — 원인은 옛 _rank가 (포지션적합도, -OVR)
+# 튜플로 완전 사전식 정렬돼 있어서, 포지션 적합도가 1순위 절대 기준이고
+# OVR은 "같은 적합도 등급 안에서만" 타이브레이커였기 때문. 그 슬롯에 꼭
+# 맞는 포지션이 어린 유망주 한 명뿐이면, 인접 포지션에 OVR 97짜리
+# 베테랑이 있어도 절대 안 쓰였다(적합도 등급을 건너뛰는 트레이드오프 자체가
+# 없었음). 아래 두 상수로 "포지션 적합도 + OVR + 나이"를 하나의 점수로
+# 합쳐서, OVR 격차가 충분히 크면 적합도 열세를 뒤집을 수 있게 한다.
+#
+# [기존 POSITION_MISMATCH_PENALTY(0.05~0.15)를 재사용하지 않는 이유]
+# 그 상수는 my_player의 경기당 실질 OVR을 아주 살짝만 깎는 용도로 튜닝된
+# 값(주석상 "-0.5~-5.0의 작은 절대 차감")이라, 여기서처럼 "포지션 적합도
+# vs 실제 실력"을 맞먹는 저울에 올리기엔 너무 작다(그대로 쓰면 사실상
+# 무의미). 실제 OVR 스케일(점 단위)로 새로 잡는다.
+_LINEUP_POSITION_PENALTY = [0, 5, 9, 13, 13]  # idx 0(완벽)~4(카테고리 폴백/완전 불일치)
+
+
+def _lineup_age_penalty(age):
+    """어린 유망주가 '포지션이 정확하다'는 이유 하나로 베테랑보다 과도하게
+    선발되는 문제 대응 — OVR 자체를 깎는 게 아니라 "이 선수를 선발로 쓸 때의
+    실질 경쟁력"만 낮춘다(연봉/훈련/성장 등 다른 계산엔 전혀 영향 없음,
+    age 컬럼도 그대로). 18세 이하 -5 / 20세 이하 -3 / 22세 이하 -1 / 그 외 0."""
+    if age is None:
+        return 0
+    if age <= 18:
+        return 5
+    if age <= 20:
+        return 3
+    if age <= 22:
+        return 1
+    return 0
+
+
 def _select_lineup(team_id, formation):
     """그 팀 로스터에서 포메이션 슬롯 순서대로 11명을 뽑는다.
-    POSITION_COMPAT(선수 등록 포지션 → 배치 가능 슬롯 우선순위)을 그대로
-    재사용해서, "이 슬롯에 이 포지션 선수가 얼마나 자연스러운지"를 판단
-    한다 — 실제 게임 성과 계산 로직과 같은 기준이라 일관성이 있다."""
+    POSITION_COMPAT(선수 등록 포지션 → 배치 가능 슬롯 우선순위)을 "포지션
+    적합도 절대 1순위" 규칙이 아니라, 적합도·OVR·나이를 하나의 실질
+    경쟁력 점수로 합쳐서 판단한다 — 적합도가 살짝 밀려도 실력 격차가
+    충분히 크면(또는 상대가 너무 어리면) 뒤집힐 수 있다.
+
+    [GK는 별도 처리] 위 점수제를 GK에도 그대로 적용하면 '포지션 폴백
+    페널티가 primary position의 compat 리스트 길이에 좌우되던 옛 버그'
+    (GK는 compat 길이가 1이라 폴백 idx가 낮게 나와, 벤치 GK가 엉뚱하게
+    RM 같은 필드 슬롯에 배정되는 사례가 실측에서 확인됨)와는 무관하게도,
+    골키퍼는 필드 플레이어와 아예 다른 스탯 체계라 실제 축구에서 절대
+    바꿔 쓰지 않는 포지션이다 — GK 슬롯은 GK 등록 선수만, 필드 슬롯은
+    GK 등록 선수를 제외하고 고른다(둘 다 후보가 없을 때만 예외적으로
+    전체 풀로 폴백해 빈 자리를 막는다)."""
     from constants import FORMATION_SLOTS, POSITION_COMPAT
     slots = FORMATION_SLOTS.get(formation, FORMATION_SLOTS["4-4-2"])
     roster = _fetch_roster(team_id)
     used_ids = set()
     lineup = []
     for slot in slots:
-        pool = [p for p in roster if p.get("id") not in used_ids]
+        if slot == "GK":
+            pool = [p for p in roster if p.get("id") not in used_ids and p.get("position") == "GK"]
+        else:
+            pool = [p for p in roster if p.get("id") not in used_ids and p.get("position") != "GK"]
+        if not pool:
+            pool = [p for p in roster if p.get("id") not in used_ids]
         if not pool:
             lineup.append(None)
             continue
 
-        def _rank(p):
+        def _score(p):
             compat = POSITION_COMPAT.get(p.get("position"), [p.get("position")])
             try:
                 idx = compat.index(slot)
             except ValueError:
-                idx = len(compat) + 1
-            return (idx, -(p.get("ovr") or 50))
+                idx = len(_LINEUP_POSITION_PENALTY) - 1
+            idx = min(idx, len(_LINEUP_POSITION_PENALTY) - 1)
+            eff = (p.get("ovr") or 50) - _LINEUP_POSITION_PENALTY[idx] - _lineup_age_penalty(p.get("age"))
+            return -eff  # 오름차순 정렬 → 실질 경쟁력이 높은 순
 
-        pool.sort(key=_rank)
+        pool.sort(key=_score)
         best = pool[0]
         used_ids.add(best.get("id"))
         lineup.append(best)
