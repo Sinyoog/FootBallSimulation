@@ -450,9 +450,15 @@ _IA_YEAR_LIST_STYLE = (
 # 어긋난다. 근본적으로 스크롤바 자체가 하나뿐이면 어긋날 수가 없으므로,
 # _build_ia_world_panel에서 두 QListWidget 대신 2열짜리 QTableWidget
 # 하나(연도열+발롱도르 우승자열)로 합친다 — 이 스타일은 그 표 전용.
+# [2026-09 확장, 신민용 요청: "좌측을 년도 | 발롱도르1등 | 야신상1등으로,
+# 맨 위에 년도 | 발롱 | 야신 속성을 고정 표시"] 열 사이 "|" 구분은 칸마다
+# 오른쪽 세로선으로 그리고(가로 격자선은 안 그림 — 기존 목록 느낌 유지),
+# 헤더도 같은 세로선을 써서 아래 칸들과 줄이 맞게 한다.
 _IA_YEAR_TABLE_STYLE = (
     "QTableWidget{font-size:15px;}"
-    "QTableWidget::item{padding:7px 5px;}"
+    "QTableWidget::item{padding:7px 5px;border-right:1px solid #3a3a3a;}"
+    "QHeaderView::section{background:#252525;color:#aaa;font-size:13px;font-weight:bold;"
+    "border:none;border-right:1px solid #3a3a3a;border-bottom:1px solid #3a3a3a;padding:5px;}"
 )
 
 # [2026-09 신설, 신민용 요청: "세계 축구 기록실에 골든볼 외에 실버볼
@@ -864,6 +870,11 @@ class WorldBrowserWindow(QDialog):
             # 죽었다. 라벨 문자열로 비교하면 이 문제가 없다.
             if label == "🔎 선수 검색":
                 self._player_search_tab_idx = idx
+        # [2026-09 신설, 신민용 리포트: "20년 쌓이면 탭 이동이 0.2초 묵직"]
+        # 탭 전환 계측(ui/wb_perf_probe.py) — 반드시 _lazy_show_wb_tab보다
+        # 먼저 연결해야 지연 탭 빌드 시간까지 측정 창 안에 들어온다(Qt는
+        # 같은 시그널의 슬롯을 연결한 순서대로 호출한다).
+        tabs.currentChanged.connect(self._perf_probe_tab_switch)
         tabs.currentChanged.connect(self._lazy_show_wb_tab)
         _wb_marks.append(("(나머지 10개 지연 배치)", _time_wb.perf_counter()))
 
@@ -946,6 +957,20 @@ class WorldBrowserWindow(QDialog):
             return
 
         super().keyPressEvent(event)
+
+    def _perf_probe_tab_switch(self, idx):
+        """[2026-09 신설, 진단 전용] 탭 전환 한 번을 [PERF-WB-TAB] 한 줄로
+        찍는다 — 총 시간을 데이터 함수/SQL/그 외(Qt 배치·그리기)로 나눈다.
+        화면에 안 띄운 헤드리스 인스턴스(스쿼드 전원 기록 복사 등)는 사람이
+        체감하는 렉이 아니므로 계측하지 않는다. 끝 시점은 이벤트 루프를
+        두 번 돈 뒤(새 탭 배치·그리기 이벤트까지 포함하는 근사치)."""
+        if not self.isVisible():
+            return
+        from ui import wb_perf_probe
+        label = self.tabs.tabText(idx)
+        first_build = idx in self._wb_lazy_builders
+        if wb_perf_probe.PROBE.begin(label, first_build):
+            QTimer.singleShot(0, lambda: QTimer.singleShot(0, wb_perf_probe.PROBE.end))
 
     def _lazy_show_wb_tab(self, idx):
         """[2026-08 v3.5 신설] 지연 배치해둔 탭을 처음 클릭하는 순간에만
@@ -8777,20 +8802,33 @@ class WorldBrowserWindow(QDialog):
         # 방식이라 스크롤이 쌓일수록 두 목록이 어긋났다 — 2열짜리
         # QTableWidget 하나(0열=연도, 1열=발롱도르 우승자)로 합쳐
         # 스크롤바 자체를 하나로 만든다(원천적으로 어긋날 수 없는 구조).
-        self.ia_year_tbl = QTableWidget(0, 2)
+        # [2026-09 확장, 신민용 요청: "년도 발롱도르1등 | 야신상1등 이렇게
+        # 뜨며 맨 위에 속성으로 년도 | 발롱 | 야신 — 년도가 많이 차서 아래로
+        # 내리더라도 맨 위에는 고정"] 3열(0=연도, 1=발롱도르 1위, 2=야신상
+        # 1위)로 넓히고 가로 헤더를 켠다. QTableWidget의 가로 헤더는 스크롤
+        # 영역 밖(뷰포트 위)에 붙어 있어 행을 아무리 내려도 항상 맨 위에
+        # 고정된다 — 따로 고정 라벨을 두지 않고 이 표 자체가 처리한다
+        # (예전 "두 목록이 따로 스크롤돼 어긋나던" 버그와 같은 이유로, 표
+        # 바깥에 별도 위젯을 두면 열 폭이 어긋날 수 있음).
+        self.ia_year_tbl = QTableWidget(0, 3)
         self.ia_year_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.ia_year_tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.ia_year_tbl.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.ia_year_tbl.horizontalHeader().setVisible(False)
+        self.ia_year_tbl.setHorizontalHeaderLabels(["년도", "발롱", "야신"])
+        self.ia_year_tbl.horizontalHeader().setVisible(True)
+        self.ia_year_tbl.horizontalHeader().setHighlightSections(False)
+        self.ia_year_tbl.horizontalHeader().setSectionsClickable(False)
         self.ia_year_tbl.verticalHeader().setVisible(False)
         self.ia_year_tbl.setShowGrid(False)
-        self.ia_year_tbl.setMaximumWidth(220)
-        self.ia_year_tbl.setColumnWidth(0, 90)
-        self.ia_year_tbl.setColumnWidth(1, 130)
-        self.ia_year_tbl.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Fixed)
-        self.ia_year_tbl.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.Fixed)
+        self.ia_year_tbl.setColumnWidth(0, 70)
+        self.ia_year_tbl.setColumnWidth(1, 125)
+        self.ia_year_tbl.setColumnWidth(2, 125)
+        # 세 열 폭 합 + 세로 스크롤바 + 테두리 여유 — 연도가 적어 스크롤바가
+        # 없을 때도 같은 폭을 유지해 오른쪽 순위표가 들썩이지 않게 고정폭.
+        self.ia_year_tbl.setFixedWidth(70 + 125 + 125 + 22)
+        for _c in range(3):
+            self.ia_year_tbl.horizontalHeader().setSectionResizeMode(
+                _c, QHeaderView.ResizeMode.Fixed)
         self.ia_year_tbl.setStyleSheet(_IA_YEAR_TABLE_STYLE)
         # [2026-09 신설, 신민용 요청: "발롱도르는 년도 옆에 칸을 하나 더
         # 만들어서 그 당시 발롱도르를 누가 탔는지 표시를 해줘"] 1열이
@@ -8798,6 +8836,7 @@ class WorldBrowserWindow(QDialog):
         # (행 선택이므로) 연도 선택과 동일하게 처리되고, 우승자 칸을
         # 더블클릭하면 다른 개인상 표의 행과 동일하게 그 선수 상세로
         # 이동한다(아래 _on_ia_year_tbl_double_clicked).
+        # [2026-09 확장] 2열(야신상 1위)도 똑같이 더블클릭 시 선수 상세로.
         self.ia_year_tbl.cellClicked.connect(self._on_ia_year_selected)
         self.ia_year_tbl.cellDoubleClicked.connect(self._on_ia_year_tbl_double_clicked)
         row.addWidget(self.ia_year_tbl)
@@ -8926,30 +8965,43 @@ class WorldBrowserWindow(QDialog):
         # QListWidget을 각각 clear/addItem했는데, 이제 2열 QTableWidget
         # 하나(ia_year_tbl)에 0열=연도, 1열=발롱도르 우승자를 같은 행에
         # 같이 채운다 — 같은 표의 같은 행이라 애초에 어긋날 수 없다.
+        # [2026-09 확장, 신민용 요청: "발롱에 뜨는 선수 이름은 빨간색, 야신은
+        # #00A86B — 지금은 금색"] 2열(야신상 1위) 추가 + 색을 선수검색 연도
+        # 펼침과 같은 단일 소스(wb.WORLD_AWARD_STYLE: 발롱 빨강/야신
+        # #00A86B)에서 가져온다. 수상자 조회는 연도마다 get_ballon_dor_
+        # winner(쿼리+무거운 상세조인)를 부르던 걸 배치판(get_world_award_
+        # winners_by_year, 상별 1회 조회)으로 바꿨다 — 열이 둘로 늘어도
+        # 연도 수만큼 쿼리가 늘지 않는다(표시 이름 규칙은 동일).
         years = wb.get_individual_award_years()
         tbl = self.ia_year_tbl
         tbl.setRowCount(len(years))
+        _col_specs = (
+            (1, "발롱도르", wb.get_world_award_winners_by_year("발롱도르")),
+            (2, "야신상", wb.get_world_award_winners_by_year("야신상")),
+        )
         for i, year in enumerate(years):
             item = QTableWidgetItem(str(year))
             item.setData(Qt.ItemDataRole.UserRole, year)
             tbl.setItem(i, 0, item)
-            winner = wb.get_ballon_dor_winner(year)
-            witem = QTableWidgetItem(winner["name"] if winner else "—")
-            witem.setForeground(QColor("#ffcc00"))
-            if winner:
-                witem.setData(Qt.ItemDataRole.UserRole, winner["player_id"])
-                witem.setToolTip(f"{year}년 발롱도르: {winner['name']}")
-            else:
-                witem.setToolTip(f"{year}년 발롱도르 수상자 없음")
-            tbl.setItem(i, 1, witem)
+            for col, award, winners in _col_specs:
+                winner = winners.get(year)
+                witem = QTableWidgetItem(winner["name"] if winner else "—")
+                # 수상자 없음("—")은 색 강조 없이 회색 — 빨강/초록은 실제 수상자에만.
+                witem.setForeground(QColor(wb.WORLD_AWARD_STYLE[award][1] if winner else "#666666"))
+                if winner:
+                    witem.setData(Qt.ItemDataRole.UserRole, winner["player_id"])
+                    witem.setToolTip(f"{year}년 {award}: {winner['name']}")
+                else:
+                    witem.setToolTip(f"{year}년 {award} 수상자 없음")
+                tbl.setItem(i, col, witem)
 
     def _on_ia_year_tbl_double_clicked(self, row, column):
         # 1열(발롱도르 우승자 칸)을 더블클릭했을 때만 다른 개인상 표의
         # 행과 동일하게 그 선수 상세로 이동 — 0열(연도 칸) 더블클릭은
         # 단일클릭과 동일하게 그냥 그 해를 선택한 상태로 둔다.
-        if column != 1:
+        if column not in (1, 2):
             return
-        item = self.ia_year_tbl.item(row, 1)
+        item = self.ia_year_tbl.item(row, column)
         pid = item.data(Qt.ItemDataRole.UserRole) if item else None
         if pid is None:
             return

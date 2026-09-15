@@ -1237,11 +1237,17 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
 
     ceiling = (retirement_year + 1) if retirement_year else ((get_current_game_year() or 9999) + 1)
 
+    # [2026-09 성능, get_team_history 위 캐시 주석 참고] 예전엔 팀마다 그 팀
+    # 전체 역사를 계산했다 — 이제 (팀, 연도구간)별로 필요한 연도만 계산한다.
+    # 구간 필터 조건은 아래 병합 루프의 `seg_start <= y < seg_end`와 정확히
+    # 같아서 병합 결과는 예전과 동일하다.
     _hist_cache = {}
-    def _hist_for(tid_):
-        if tid_ not in _hist_cache:
-            _hist_cache[tid_] = get_team_history(tid_) if tid_ else {"awards": {}, "years": []}
-        return _hist_cache[tid_]
+    def _hist_for(tid_, lo=None, hi=None):
+        _k = (tid_, lo, hi)
+        if _k not in _hist_cache:
+            _hist_cache[_k] = (get_team_history(tid_, year_range=(lo, hi)) if tid_
+                               else {"awards": {}, "years": []})
+        return _hist_cache[_k]
 
     merged_by_year = {}
     for seg in timeline:
@@ -1251,7 +1257,7 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
             seg_start = earliest_debut_year if seg_start is None else max(seg_start, earliest_debut_year)
         if seg_start is None:
             seg_start = -1  # 출생년도를 모르면(현역이면서 age 정보 자체가 없는 예외) 자르지 않는다
-        team_hist = _hist_for(seg["team_id"])
+        team_hist = _hist_for(seg["team_id"], None if seg_start == -1 else seg_start, seg_end)
         for entry in team_hist["years"]:
             y = entry["year"]
             if seg_start <= y < seg_end:
@@ -1611,7 +1617,7 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
                 # 국내컵)은 원래도 하반기에 진행되므로 그대로 두고, 일반
                 # 국내컵(cup 필드)도 이번 수정 대상에서 제외한다(시즌
                 # 내내 진행돼 한쪽 반기로 깔끔하게 못 자름 — 신민용 확인).
-                _half_team_hist = _hist_for(from_tid)
+                _half_team_hist = _hist_for(from_tid, y, y + 1)
                 _half_src = next((h for h in _half_team_hist["years"] if h["year"] == y), None)
                 if _half_src and _half_src.get("cl_kind") in ("champions", "europa", "conference"):
                     for _k in ("cl", "cl_record", "cl_champion", "cl_kind"):
@@ -3716,7 +3722,17 @@ def get_ballon_dor_winner(year):
 
 
 def get_ballon_dor_winners_by_year():
-    """[2026-09 성능수정] get_ballon_dor_winner(year)의 배치판 —
+    """발롱도르 전용 래퍼 — 실제 구현은 get_world_award_winners_by_year."""
+    return get_world_award_winners_by_year("발롱도르")
+
+
+def get_world_award_winners_by_year(award_type):
+    """[2026-09 일반화, 신민용 요청: "세계상 좌측을 년도 | 발롱 | 야신으로"]
+    예전 get_ballon_dor_winners_by_year 본문을 award_type 인자로 일반화
+    했다(발롱도르/야신상 등 rank=1이 한 명인 세계상 전부 같은 방식).
+    아래 원래 설명은 발롱도르 기준 그대로 유효하다.
+
+    [2026-09 성능수정] get_ballon_dor_winner(year)의 배치판 —
     {year: {"player_id": ..., "name": ...}}.
 
     "역대 개인상" 탭을 열 때 _refresh_ia_year_list가 연도마다
@@ -3737,7 +3753,7 @@ def get_ballon_dor_winners_by_year():
     conn = get_conn()
     rows = conn.execute(
         """SELECT year, player_id FROM hist.season_individual_awards
-           WHERE award_type='발롱도르' AND rank=1""").fetchall()
+           WHERE award_type=? AND rank=1""", (award_type,)).fetchall()
     if not rows:
         conn.close()
         return {}
@@ -5696,8 +5712,44 @@ def get_po_results(league_id, year, direction="relegation"):
     return out
 
 
-def get_team_history(team_id: int):
+# [2026-09 신설, 신민용 리포트: "20년 정도 쌓이면 세계기록실이 묵직하다 /
+# 팀·국가 요약 복사도 선수 커리어가 길어질수록 느려진다"] [PERF-WB-TAB] 실측:
+# 선수 검색 한 번에 get_ai_player_career_history가 0.13~0.35s, SQL 1,674~3,032회
+# — 그 대부분이 get_team_history의 "연도마다 리그/승강/컵/CL·EL·ECL/하부컵/
+# 슈퍼컵/클럽월드컵을 각각 조회"하는 연도×대회 N+1이었다. 게다가 선수 커리어는
+# 거쳐간 팀마다 그 팀의 "전체 역사"(선수가 오기 전·떠난 뒤 연도까지)를 매번
+# 새로 계산했고, 요약 복사는 같은 팀 선수 수십 명에 대해 그걸 반복했다.
+#
+# 연도별 팀 기록 한 줄(entry)은 그 해(year, season, league_id)와 team_id만으로
+# 정해지고, "이미 끝난 해"(현재 게임 연도보다 과거)는 이후 절대 바뀌지 않는다
+# (승강·컵·대항전 결과가 전부 확정됨). 그래서 과거 연도 entry만 메모리에
+# 캐시한다 — 진행 중인 올해는 매번 새로 계산하므로 경기가 진행돼도 항상 최신.
+# 새 게임(reset_game_data)·DB 초기화(init_db) 때는 database.py가 이 캐시를
+# 비운다(같은 team_id·연도가 새 게임에서 재사용되므로 필수 — 메모리 교훈 1순위
+# "새 게임에 이전 판 데이터가 남는" 패턴과 같은 위험).
+# 캐시에서 꺼낼 때는 항상 복사본을 돌려줘서, 호출부가 받은 dict를 고쳐도
+# 캐시가 오염되지 않는다.
+_TEAM_YEAR_ENTRY_CACHE: dict = {}   # (team_id, year, season, league_id) -> entry dict
+# 메모리 상한 — 전 세계 팀×연도를 전부 둘러보는 극단적인 경우에도 캐시가
+# 끝없이 커지지 않게, 이 개수를 넘으면 통째로 비우고 다시 쌓는다(한 줄이
+# 문자열 몇 개짜리 작은 dict라 5만 개여도 수십 MB 수준).
+_TEAM_YEAR_ENTRY_CACHE_MAX = 50000
+
+
+def clear_team_history_cache():
+    """새 게임/DB 초기화 시 database.py가 호출 — 위 캐시 주석 참고."""
+    _TEAM_YEAR_ENTRY_CACHE.clear()
+
+
+def get_team_history(team_id: int, year_range=None):
     """[2026-07 신설] "팀 검색" → 팀 클릭 시 보여줄 연도별 기록.
+
+    [2026-09 성능, 위 _TEAM_YEAR_ENTRY_CACHE 주석 참고] year_range=(lo, hi)를
+    넘기면 lo <= year < hi인 연도만 계산한다(lo/hi가 None이면 그쪽은 제한
+    없음) — 선수 커리어가 "그 팀에 실제로 있었던 연도"만 필요할 때 쓴다.
+    각 연도 entry는 다른 연도와 무관하게 계산되므로, 걸러낸 결과는 전체를
+    계산한 뒤 같은 연도만 고른 것과 완전히 같다(awards도 걸러낸 연도 기준).
+    생략하면 예전과 똑같이 전체 연도.
     리그 성적(순위+승격/강등 여부), 국내컵 도달 라운드, 챔피언스리그
     도달 스테이지를 연도 내림차순으로 묶어 반환한다.
 
@@ -5735,6 +5787,13 @@ def get_team_history(team_id: int):
     by_year = {}
     for r in yr_rows:
         by_year[(r["year"], r["season"])] = r["league_id"]
+    if year_range is not None:
+        _lo, _hi = year_range
+        by_year = {k: v for k, v in by_year.items()
+                   if (_lo is None or k[0] >= _lo) and (_hi is None or k[0] < _hi)}
+    # 이미 끝난 해(현재 게임 연도 미만)만 캐시 대상 — 위 캐시 주석 참고.
+    _cur_row = conn.execute("SELECT current_year FROM my_player WHERE id=1").fetchone()
+    _cache_before_year = _cur_row["current_year"] if _cur_row and _cur_row["current_year"] else None
 
     _CL_STAGE_KO = {"league": "리그 스테이지", "PO": "플레이오프",
                     "R32": "32강", "R16": "16강", "QF": "8강", "SF": "4강",
@@ -5783,6 +5842,13 @@ def get_team_history(team_id: int):
 
     out = []
     for (year, season), league_id in sorted(by_year.items(), key=lambda x: -x[0][0]):
+        _ck = (team_id, year, season, league_id)
+        _cacheable = _cache_before_year is not None and year < _cache_before_year
+        if _cacheable and _ck in _TEAM_YEAR_ENTRY_CACHE:
+            _cached = _TEAM_YEAR_ENTRY_CACHE[_ck]
+            if _cached is not None:          # None = "그 해 표시할 기록 없음"도 캐시
+                out.append(dict(_cached))
+            continue
         entry = {"year": year, "league": None, "cup": None, "cl": None, "cwc": None, "sc": None,
                   "league_record": None, "cup_record": None, "cl_record": None, "cwc_record": None,
                   "sc_record": None,
@@ -6027,6 +6093,12 @@ def get_team_history(team_id: int):
 
         if entry["league"] or entry["cup"] or entry["cl"] or entry["cwc"] or entry["sc"]:
             out.append(entry)
+        if _cacheable:
+            if len(_TEAM_YEAR_ENTRY_CACHE) >= _TEAM_YEAR_ENTRY_CACHE_MAX:
+                _TEAM_YEAR_ENTRY_CACHE.clear()
+            _TEAM_YEAR_ENTRY_CACHE[_ck] = (
+                dict(entry) if (entry["league"] or entry["cup"] or entry["cl"]
+                                or entry["cwc"] or entry["sc"]) else None)
 
     conn.close()
 

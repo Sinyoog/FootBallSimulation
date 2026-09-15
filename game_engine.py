@@ -20786,16 +20786,23 @@ def _enforce_foreign_quota_on_join(team_id, team_country, my_nationality):
     if my_nationality == team_country:
         conn.close()
         return   # 내가 자국 선수라 쿼터에 안 걸림
+    # [2026-09 수정, database.ai_players.quota_local_country 컬럼 주석 참고]
+    # 예전엔 초과분의 nationality 자체를 자국으로 덮어써서, 그 선수가 화면·
+    # 기록에선 자국인인데 국가대표는 진짜 조국으로 나가는 모순이 생겼다.
+    # 이제 진짜 국적은 그대로 두고 "이 나라 리그에선 자국 선수로 등록"
+    # 표시(quota_local_country)만 건다 — 이미 이 나라에 등록된 선수는
+    # 애초에 외국인으로 안 센다.
     foreigners = conn.execute(
         """SELECT id, ovr FROM ai_players WHERE team_id=? AND nationality!=? AND nationality!=''
-           ORDER BY ovr ASC""", (team_id, team_country)).fetchall()
+             AND COALESCE(quota_local_country, '')!=?
+           ORDER BY ovr ASC""", (team_id, team_country, team_country)).fetchall()
     # 나(외국인)까지 합쳐서 쿼터 초과인지 확인 — AI 외국인 수 + 나(1) > quota
     if len(foreigners) + 1 > quota:
         swap_n = len(foreigners) + 1 - quota
         for r in foreigners[:swap_n]:
-            conn.execute("UPDATE ai_players SET nationality=? WHERE id=?", (team_country, r["id"]))
+            conn.execute("UPDATE ai_players SET quota_local_country=? WHERE id=?", (team_country, r["id"]))
         conn.commit()
-        add_log(f"📋 외국인 쿼터 조정 — AI 선수 {swap_n}명 국적을 {team_country}로 전환", "event")
+        add_log(f"📋 외국인 쿼터 조정 — AI 선수 {swap_n}명을 {team_country} 자국 선수로 등록", "event")
     conn.close()
 
 

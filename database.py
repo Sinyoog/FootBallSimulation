@@ -1177,8 +1177,20 @@ def history_backlog():
 
 
 # ─── 스키마 ───────────────────────────────────────────────────
+def _clear_world_browser_caches():
+    """[2026-09 신설, world_browser._TEAM_YEAR_ENTRY_CACHE 주석 참고] 세계기록실
+    데이터 계층이 들고 있는 "끝난 해 팀 기록" 메모리 캐시를 비운다. 새 게임은
+    team_id·연도를 그대로 재사용하므로 안 비우면 이전 판 기록이 보인다.
+    world_browser를 아직 한 번도 import하지 않았으면(캐시 자체가 없음) 아무것도
+    안 한다 — 여기서 새로 import하지 않아 순환 import·로딩 비용이 없다."""
+    _wb = sys.modules.get("world_browser")
+    if _wb is not None and hasattr(_wb, "clear_team_history_cache"):
+        _wb.clear_team_history_cache()
+
+
 def init_db():
     from constants import GAME_START_YEAR, PLAYER_START_AGE
+    _clear_world_browser_caches()
     # [최적화] 인메모리 모드: 기존 세이브(game.db)가 있으면 먼저 인메모리로
     # 통째로 복사해온다. 그 뒤 CREATE TABLE IF NOT EXISTS들은 전부 멱등이라
     # 이미 로드된 데이터를 건드리지 않고 안전하게 지나간다.
@@ -3087,6 +3099,21 @@ def init_db():
         # 보존한다 — nationality는 클럽 쿼터 전환용으로 계속 바뀔 수 있지만,
         # 국가대표 선발/평균OVR 계산은 이제 true_nationality만 본다.
         "ALTER TABLE ai_players ADD COLUMN true_nationality TEXT DEFAULT ''",
+        # [2026-09 신설, 신민용 리포트: "국적이랑 나가는 국가랑 다를 때가
+        # 있어 — 아르헨티나 사람이 가나(콩고)로 나간다"] true_nationality
+        # 도입(위)은 국가대표 선발만 진짜 국적으로 옮긴 땜질이었고, 화면·
+        # 기록·발롱도르 국가 가산점 등 나머지 전부는 여전히 쿼터 전환으로
+        # 덮어써진 nationality를 봤다 — 그래서 "국적: 🇦🇷 아르헨티나"로
+        # 뜨는 선수가 콩고 민주 공화국 대표로 출전하는 모순이 생겼다.
+        # 구조 자체를 뒤집는다: nationality는 이제 "절대 안 바뀌는 진짜
+        # 국적"(= true_nationality와 항상 같은 값)이고, 클럽 외국인 쿼터를
+        # 맞추기 위한 "이 나라 리그에선 자국 선수로 등록" 표시는 이
+        # 컬럼(나라 이름, 기본 '')에 따로 둔다. 쿼터 외국인 판정은
+        # is_quota_foreign(nationality, quota_local_country, 리그 나라) —
+        # 다른 나라로 이적하면 그 나라 기준으론 자연히 다시 외국인이고,
+        # 원래 등록된 나라로 돌아오면 다시 자국 선수 취급이다(플래그를
+        # 이적마다 지웠다 켰다 할 필요가 없다).
+        "ALTER TABLE ai_players ADD COLUMN quota_local_country TEXT DEFAULT ''",
         "CREATE INDEX IF NOT EXISTS hist.idx_sia_league_country ON season_individual_awards(category, year, league_country, league_tier)",
         "CREATE INDEX IF NOT EXISTS hist.idx_sia_category_year ON season_individual_awards(category, year)",
         # [2026-09 신설, 신민용 요청: "국가대표 출전 기록에 대회/국가/출전/
@@ -3147,6 +3174,45 @@ def init_db():
         c.execute(
             "UPDATE ai_players SET true_nationality = nationality "
             "WHERE (true_nationality IS NULL OR true_nationality = '') AND nationality != ''")
+    except sqlite3.OperationalError:
+        pass
+
+    # [2026-09 신설, 위 quota_local_country 컬럼 주석 참고] 기존 세이브에서
+    # 쿼터 전환으로 nationality가 덮어써진 선수(= nationality와 true_
+    # nationality가 어긋난 선수)는, 덮어써졌던 값(그 리그 나라)을
+    # quota_local_country로 옮기고 nationality는 진짜 국적으로 되돌린다.
+    # SQLite UPDATE의 SET 우변은 전부 "갱신 전" 행 값으로 계산되므로 한
+    # 문장에서 두 컬럼을 맞바꿔도 안전하다. 한 번 돌고 나면 두 컬럼이
+    # 같아져 WHERE에 더는 안 걸린다 — 멱등, 매번 실행해도 안전.
+    # (한계: true_nationality 컬럼이 생기기 "전"에 이미 전환됐던 선수는
+    # 그 컬럼 자체가 전환된 값으로 백필돼 있어 소급 복구가 불가능하다.)
+    try:
+        c.execute(
+            "UPDATE ai_players SET quota_local_country = nationality, nationality = true_nationality "
+            "WHERE true_nationality IS NOT NULL AND true_nationality != '' "
+            "AND nationality != true_nationality")
+    except sqlite3.OperationalError:
+        pass
+    # 개인상 기록(hist.season_individual_awards)은 수상 시점 국적을
+    # 스냅샷으로 들고 있어서, 쿼터 전환된 국적으로 찍힌 과거 수상도
+    # 같이 되돌린다. "스냅샷 국적 == 그 선수의 quota_local_country이고
+    # 지금 진짜 국적과 다른" 행만 — 즉 정확히 쿼터 전환 흔적만 고친다
+    # (사용자가 쉬움 난이도에서 국적을 직접 바꾼 경우의 옛 스냅샷은 이
+    # 조건에 안 걸려 그대로 남는다). 멱등.
+    try:
+        c.execute(
+            """UPDATE hist.season_individual_awards
+               SET nationality = (SELECT ap.nationality FROM ai_players ap
+                                  WHERE ap.id = season_individual_awards.player_id),
+                   nat_flag = COALESCE((SELECT cn.flag FROM ai_players ap
+                                        JOIN countries cn ON cn.name = ap.nationality
+                                        WHERE ap.id = season_individual_awards.player_id), nat_flag)
+               WHERE player_id > 0 AND EXISTS (
+                   SELECT 1 FROM ai_players ap
+                   WHERE ap.id = season_individual_awards.player_id
+                     AND ap.quota_local_country != ''
+                     AND season_individual_awards.nationality = ap.quota_local_country
+                     AND ap.nationality != ap.quota_local_country)""")
     except sqlite3.OperationalError:
         pass
 
@@ -3427,6 +3493,16 @@ def init_db():
         # 매년 +약 10,700행씩 계속 커지는 표라(정리 없음) 풀스캔 비용도
         # 매년 늘어난다 — 위 두 항목과 함께 팀A값/팀B값 증가의 핵심 원인.
         "CREATE INDEX IF NOT EXISTS hist.idx_lss_year ON league_season_standings(year)",
+        # [2026-09 신설, 신민용 리포트: "20년 쌓이면 세계기록실 선수 검색이 묵직"]
+        # world_browser.get_team_history가 팀 기록을 계산할 때마다 맨 먼저
+        # "이 팀이 뛴 (연도, 시즌, 리그)"를 match_results/archive와 이 표의
+        # UNION으로 찾는데, 이 표만 team_id 선두 인덱스가 없어 호출마다
+        # 풀스캔했다(EXPLAIN: SCAN USING INDEX idx_lss_unique — 기존 두
+        # 인덱스는 league_id 선두). 매년 약 10,700행씩 영구히 쌓이는 표라
+        # 20년이면 20만 행대 — 선수 한 명 커리어가 거쳐간 팀 수만큼 이
+        # 스캔을 반복했다. match_results 쪽은 이미 home/away 인덱스로
+        # MULTI-INDEX OR를 탄다(같은 EXPLAIN으로 확인).
+        "CREATE INDEX IF NOT EXISTS hist.idx_lss_team ON league_season_standings(team_id)",
     ]:
         try: c.execute(idx)
         except sqlite3.OperationalError: pass
@@ -5021,6 +5097,7 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
     삭제는 그대로 다 수행). 실제 선수단 재생성은 그 다음 사용자가
     "새 게임"→"생성"/"랜덤 생성"을 눌러 reset_game_data()가 (skip 없이)
     다시 호출되는 시점에 진행률 창과 함께 정식으로 일어난다."""
+    _clear_world_browser_caches()   # [2026-09] 이전 판 팀 기록 캐시 제거
     # [2026-09 신설, 신민용 리포트: "새 선수 생성할 때 이렇게 멈추는데?"]
     # 새 게임(세계 생성) 경로는 단계가 10개가 넘는데 여태 구간 계측이
     # 하나도 없어서, 멈춘 것처럼 보일 때 어디가 범인인지 알 방법이 없었다
@@ -5484,7 +5561,10 @@ def set_ai_player_nationality(player_id: int, nationality: str, conn=None) -> bo
         valid = conn.execute("SELECT 1 FROM countries WHERE name=?", (nationality,)).fetchone()
         if not valid:
             return False
-        conn.execute("UPDATE ai_players SET nationality=?, true_nationality=? WHERE id=?",
+        # [2026-09 수정, quota_local_country 컬럼 주석 참고] 사용자가 국적을
+        # 직접 지정하면 예전 쿼터 등록 표시도 지운다 — 새 국적 기준으로
+        # 다음 시즌 _enforce_foreign_quota_worldwide가 필요하면 다시 건다.
+        conn.execute("UPDATE ai_players SET nationality=?, true_nationality=?, quota_local_country='' WHERE id=?",
                      (nationality, nationality, player_id))
         conn.commit()
         return True
@@ -6392,6 +6472,19 @@ def get_foreign_quota_range(country, continent=None, tier=None):
     _, base_hi = base
     target = max(1, base_hi - (tier - 1))
     return (target, target)
+
+
+def is_quota_foreign(nationality, quota_local_country, team_country):
+    """[2026-09 신설, ai_players.quota_local_country 컬럼 주석 참고] 클럽
+    외국인 쿼터 기준으로 이 선수가 team_country 리그에서 "외국인 한 자리"를
+    차지하는지. 진짜 국적이 리그 나라와 같거나, 그 나라에 자국 선수로
+    등록(quota_local_country)돼 있으면 외국인이 아니다. 국적 정보가 비어
+    있거나 리그 나라를 모르면 예전 판정들과 똑같이 외국인으로 안 센다."""
+    if not nationality or not team_country:
+        return False
+    if nationality == team_country:
+        return False
+    return (quota_local_country or "") != team_country
 # [2026-07 리팩터] 예전엔 스타 슬롯 해외파 국가를 이 고정 목록에서만
 # 뽑았는데, 그러면 목록 밖 나라(한국 등 대부분)는 빅클럽 스타 해외파가
 # 사실상 나올 수 없었다. 이제 _pick_nationality()는 전세계 국가를 피파

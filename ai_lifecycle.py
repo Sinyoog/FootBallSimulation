@@ -670,8 +670,10 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
     # [2026-09 신설] potential_ovr 추가 — _build_buy_pools가 이제 시장구매
     # 후보의 잠재력을 가중치에 반영한다(위 _build_buy_pools 정의부 주석
     # 참고). 이 한 줄만 넓혀서 둘 다(retire/transfer) 별도 쿼리 없이 쓴다.
+    # [2026-09 신설] quota_local_country 추가 — 클럽 외국인 쿼터 판정
+    # (database.is_quota_foreign)에 필요. database.py 해당 컬럼 주석 참고.
     shared_ai_rows = c.execute(
-        "SELECT id, team_id, position, age, name, ovr, nationality, "
+        "SELECT id, team_id, position, age, name, ovr, nationality, quota_local_country, "
         "contract_end_year, last_transfer_year, potential_ovr FROM ai_players ORDER BY id").fetchall()
     _t_shared = _time_perf.perf_counter()
 
@@ -794,7 +796,7 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
     # 통째로 누락된다. 은퇴 처리 직후 한 번 다시 조회해서 최신 상태로
     # 맞춘다.
     shared_ai_rows = c.execute(
-        "SELECT id, team_id, position, age, name, ovr, nationality, "
+        "SELECT id, team_id, position, age, name, ovr, nationality, quota_local_country, "
         "contract_end_year, last_transfer_year FROM ai_players ORDER BY id").fetchall()
 
     _report(2, "전세계 이적시장 처리 중")
@@ -983,7 +985,7 @@ def run_ai_mid_season_transfer(year, verbose_log=None, my_team_id=None):
     conn = get_conn()
     c = conn.cursor()
     ai_rows = c.execute(
-        "SELECT id, team_id, position, age, name, ovr, nationality, "
+        "SELECT id, team_id, position, age, name, ovr, nationality, quota_local_country, "
         "contract_end_year, last_transfer_year FROM ai_players ORDER BY id").fetchall()
     # [2026-09 최적화] 이적시장 루프가 도는 동안은 경기가 단 한 경기도
     # 치러지지 않아 리그 순위표가 절대 안 바뀐다 — 그 구간에서만
@@ -2789,17 +2791,24 @@ def _retire_and_replace(c, year, ai_rows=None):
     #   이제 그 SELECT 자체도 호출부에서 넘겨받은 ai_rows로 재사용해
     #   _transfer_market과의 중복 스캔까지 없앤다(3회 → 2회).
     _src_rows = ai_rows if ai_rows is not None else c.execute(
-        "SELECT id, team_id, position, age, name, ovr, nationality, potential_ovr FROM ai_players").fetchall()
+        "SELECT id, team_id, position, age, name, ovr, nationality, quota_local_country, "
+        "potential_ovr FROM ai_players").fetchall()
     team_used_names: dict = {}
     rows = []
     # [2026-07 신설] 팀별 현재 외국인 수 카운터 — 신인 국적 재배정 시
     # 쿼터(FOREIGN_QUOTA_CAP)를 그대로 지키기 위해 필요.
+    # [2026-09 수정] 외국인 판정은 database.is_quota_foreign — 진짜 국적이
+    # 달라도 그 나라에 자국 선수로 등록(quota_local_country)됐으면 안 센다.
+    # 호출부가 넘긴 행에 그 컬럼이 없으면(구버전 호출/툴) ''로 본다.
+    from database import is_quota_foreign
+    _src_has_qlc = bool(_src_rows) and "quota_local_country" in _src_rows[0].keys()
     foreign_count_by_team: dict = {}
     for r in _src_rows:
         team_used_names.setdefault(r["team_id"], set()).add(r["name"])
         rows.append(r)
         tinfo = team_info.get(r["team_id"])
-        if tinfo and r["nationality"] and r["nationality"] != tinfo[3]:
+        if tinfo and is_quota_foreign(r["nationality"],
+                                      r["quota_local_country"] if _src_has_qlc else "", tinfo[3]):
             foreign_count_by_team[r["team_id"]] = foreign_count_by_team.get(r["team_id"], 0) + 1
     retire_deletes = []  # 은퇴자 DELETE용
     retire_archives = []  # [2026-08 신설] 은퇴자 ai_players_retired 아카이브용
@@ -3071,11 +3080,13 @@ def _retire_and_replace(c, year, ai_rows=None):
                 # 반영해둔다 — 안 하면 같은 팀의 다른 은퇴자리가 (자체
                 # 생성으로 이어질 경우) 외국인 쿼터를 실제보다 여유있게
                 # 계산하거나, 이름이 겹치는 신인을 만들 수 있다.
-                _bought_nat = _bought["nationality"] if "nationality" in _bought.keys() else ""
-                if _bought_nat and _bought_nat != cname:
+                _bought_keys = _bought.keys()
+                _bought_nat = _bought["nationality"] if "nationality" in _bought_keys else ""
+                _bought_qlc = _bought["quota_local_country"] if "quota_local_country" in _bought_keys else ""
+                if is_quota_foreign(_bought_nat, _bought_qlc, cname):
                     foreign_count_by_team[r["team_id"]] = foreign_count_by_team.get(r["team_id"], 0) + 1
                 _src_cname = _src_tinfo[3] if _src_tinfo else ""
-                if _bought_nat and _bought_nat != _src_cname:
+                if is_quota_foreign(_bought_nat, _bought_qlc, _src_cname):
                     foreign_count_by_team[_bought["team_id"]] = max(
                         0, foreign_count_by_team.get(_bought["team_id"], 0) - 1)
                 team_used_names.setdefault(r["team_id"], set()).add(_bought["name"])
@@ -3153,9 +3164,11 @@ def _retire_and_replace(c, year, ai_rows=None):
         # 새로 뽑아야지, 안 그러면 은퇴자 국적을 그대로 물려받는다"] 은퇴자가
         # 외국인이었으면 먼저 카운터에서 빼고, 새 국적을 다시 뽑는다.
         tid = r["team_id"]
-        old_nat = r["nationality"] if "nationality" in r.keys() else ""
+        _r_keys = r.keys()
+        old_nat = r["nationality"] if "nationality" in _r_keys else ""
+        _old_qlc = r["quota_local_country"] if "quota_local_country" in _r_keys else ""
         cur_foreign = foreign_count_by_team.get(tid, 0)
-        if old_nat and old_nat != cname:
+        if is_quota_foreign(old_nat, _old_qlc, cname):
             cur_foreign = max(0, cur_foreign - 1)
         _q_lo, quota = get_foreign_quota_range(cname, continent, tier=tier)
         new_nat, cur_foreign = _pick_nationality(cname, continent, grade, r["position"],
@@ -3508,7 +3521,7 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
     # 여기서 한 번만 조회해둔다 — _do_one_transfer_cached가 목적지 후보를
     # 고를 때 이 상한을 넘는 팀은 제외한다(아래 dst_quota_hi_by_tid 전달부
     # 참고).
-    from database import get_foreign_quota_range
+    from database import get_foreign_quota_range, is_quota_foreign
     dst_quota_hi_by_tid = {
         t["tid"]: get_foreign_quota_range(t["cname"], t.get("continent"), tier=t["tier"])[1]
         for t in teams}
@@ -3753,6 +3766,7 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
         _has_cend = "contract_end_year" in _cols
         _has_lty = "last_transfer_year" in _cols
         _has_nat = "nationality" in _cols
+        _has_qlc = "quota_local_country" in _cols
         for r in all_players_rows:
             _age = (r["age"] if _has_age else None) or 25
             _ovr = r["ovr"]
@@ -3766,6 +3780,10 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
                 # [2026-09 신설] 조국 귀환 가산 가중치용 — 아래
                 # _do_one_transfer_cached에서 mover["nationality"]로 참조.
                 "nationality": r["nationality"] if _has_nat else "",
+                # [2026-09 신설] 클럽 쿼터용 자국 선수 등록 나라(database.
+                # quota_local_country 컬럼 주석 참고) — 외국인 카운터와
+                # 목적지 쿼터 필터가 함께 본다.
+                "quota_local_country": (r["quota_local_country"] or "") if _has_qlc else "",
             })
     # [2026-08 2차 최적화] 팀별 "인원 가중치" 표를 미리 만들어둔다.
     # size_w = exp(-(인원 - _SQUAD_TARGET)/0.15)는 인원(정수)만의 함수라,
@@ -3781,7 +3799,8 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
     foreign_count_by_tid = {}
     for tid, plist in team_players.items():
         _cn = dst_country_by_tid.get(tid)
-        foreign_count_by_tid[tid] = sum(1 for p in plist if p.get("nationality") and p["nationality"] != _cn)
+        foreign_count_by_tid[tid] = sum(
+            1 for p in plist if is_quota_foreign(p.get("nationality"), p.get("quota_local_country"), _cn))
     # [2026-09 성능실험, cProfile 실측: dict.get 984만 회 중 foreign_count_by_tid.
     # get(t, 0)이 단독 최대 기여자(샘플 추정 약 164만 회)] 위 루프는 team_players에
     # 선수가 있는 팀만 채운다 — 선수단이 텅 빈 팀(드묾)은 여기 없어서, 아래
@@ -4040,8 +4059,8 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
                             _sw_by_tid[old_tid] = _size_weight(len(_old_list))
                             # [2026-09 신설, 외국인 쿼터 예방] 나가는 선수가
                             # 원 소속팀 기준 외국인이었으면 그 팀 카운터를 뺀다.
-                            if (p_entry.get("nationality")
-                                    and p_entry["nationality"] != dst_country_by_tid.get(old_tid)):
+                            if is_quota_foreign(p_entry.get("nationality"), p_entry.get("quota_local_country"),
+                                                dst_country_by_tid.get(old_tid)):
                                 foreign_count_by_tid[old_tid] = foreign_count_by_tid.get(old_tid, 0) - 1
                         if p_entry:
                             # [2026-08 신설, 이적 로그] p_entry는 아직 이적 전 값(포지션/
@@ -4140,8 +4159,8 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
                             # 뺐지만, 스왑 딜(같은 건에서 두 선수가 동시에
                             # 오가는 경우)처럼 같은 이적 건 안에서 두 번째
                             # 선수가 반영될 때를 위해 항상 실측값으로 갱신한다.
-                            if (p_entry.get("nationality")
-                                    and p_entry["nationality"] != dst_country_by_tid.get(new_tid)):
+                            if is_quota_foreign(p_entry.get("nationality"), p_entry.get("quota_local_country"),
+                                                dst_country_by_tid.get(new_tid)):
                                 foreign_count_by_tid[new_tid] = foreign_count_by_tid.get(new_tid, 0) + 1
                             # [2026-09 최적화, 신민용 "이적시장 7.4s" 2차]
                             # _estimate_ai_transfer_fee_display는 이적 건마다
@@ -4593,6 +4612,10 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
     # 여전히 뽑힐 수 있음 — 배제가 아니라 가산일 뿐).
     _HOME_RETURN_BONUS = 1.5
     _mover_nat = mover.get("nationality") or None
+    # [2026-09 신설] 목적지가 이 선수가 자국 선수로 등록된 나라면 쿼터
+    # 외국인이 아니다(database.is_quota_foreign과 같은 판정) — 아래 두
+    # 목적지 필터 루프가 `_cty != _mover_qlc`로 함께 본다.
+    _mover_qlc = mover.get("quota_local_country") or ""
     _home_bonus_on = bool(_mover_nat) and mover["age"] >= 30 and dst_country_by_tid is not None
     # 가우시안 가중치: 목적지 팀 평균OVR이 이 선수 수준과 비슷할수록(약간
     # 위쪽 포함) 가중치가 크다. sigma=15 → 격차 15면 가중치 약 0.61배,
@@ -4752,7 +4775,7 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
             # 도달했으면 후보에서 아예 뺀다 — 자국 선수 영입이나 쿼터
             # 여유가 있는 팀은 전혀 영향 없다.
             if (_quota_check_on and _qhi is not None and _cty and _cty != _mover_nat
-                    and foreign_count_by_tid[t] >= _qhi):
+                    and _cty != _mover_qlc and foreign_count_by_tid[t] >= _qhi):
                 continue
             gap = _avg - mover_ovr
             w = _exp(-(gap * gap) / _den) * _sw_by_tid[t]
@@ -4775,7 +4798,7 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
             if _ceil is not None and (mover_ovr - _ceil) > _DST_CEIL_HARD_EXCLUDE:
                 continue
             if (_quota_check_on and _qhi is not None and _cty and _cty != _mover_nat
-                    and foreign_count_by_tid[t] >= _qhi):
+                    and _cty != _mover_qlc and foreign_count_by_tid[t] >= _qhi):
                 continue
             gap = _avg - mover_ovr
             w = _exp(-(gap * gap) / _den) * _sw_by_tid[t]
@@ -6461,18 +6484,26 @@ def _enforce_foreign_quota_worldwide(c, year):
         team_quota_hi[r["tid"]] = _hi
 
     player_rows = c.execute(
-        "SELECT id, team_id, nationality, ovr FROM ai_players WHERE nationality!=''").fetchall()
+        "SELECT id, team_id, nationality, quota_local_country, ovr FROM ai_players "
+        "WHERE nationality!=''").fetchall()
     by_team: dict = {}
     for r in player_rows:
-        by_team.setdefault(r["team_id"], []).append((r["id"], r["nationality"], r["ovr"] or 0))
+        by_team.setdefault(r["team_id"], []).append(
+            (r["id"], r["nationality"], r["quota_local_country"] or "", r["ovr"] or 0))
 
-    updates = []   # (new_nationality, player_id)
+    # [2026-09 수정, 신민용 리포트: "아르헨티나 사람이 콩고로 나간다"] 예전엔
+    # 초과분의 nationality 자체를 리그 나라로 덮어썼다 — 화면/기록/개인상은
+    # 그 덮어쓴 국적을, 국가대표 선발은 true_nationality를 봐서 둘이 어긋났다.
+    # 이제 진짜 국적은 절대 안 건드리고 quota_local_country(이 나라 리그에선
+    # 자국 선수로 등록)만 건다. database.quota_local_country 컬럼 주석 참고.
+    from database import is_quota_foreign
+    updates = []   # (quota_local_country, player_id)
     for tid, plist in by_team.items():
         cname = team_country.get(tid)
         quota_hi = team_quota_hi.get(tid)
         if cname is None or quota_hi is None:
             continue
-        foreigners = [(pid, ovr) for pid, nat, ovr in plist if nat != cname]
+        foreigners = [(pid, ovr) for pid, nat, qlc, ovr in plist if is_quota_foreign(nat, qlc, cname)]
         if len(foreigners) <= quota_hi:
             continue
         # [2026-09 신설] 낮은 OVR부터 초과분만큼 자국으로 전환 — 에이스급
@@ -6482,7 +6513,7 @@ def _enforce_foreign_quota_worldwide(c, year):
         for pid, _ovr in foreigners[:swap_n]:
             updates.append((cname, pid))
     if updates:
-        c.executemany("UPDATE ai_players SET nationality=? WHERE id=?", updates)
+        c.executemany("UPDATE ai_players SET quota_local_country=? WHERE id=?", updates)
     return len(updates)
 
 
