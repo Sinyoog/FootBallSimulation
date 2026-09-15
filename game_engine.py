@@ -8196,19 +8196,45 @@ def _advance_week(p, base_week, n_weeks=4, progress_cb=None):
                         goals_for, goals_against)
                        VALUES (?,?,?,?,?,?,?,?,?)""", _half_rows)
                 _conn_half.commit()
+            # [2026-09 신설, 진단용] "스냅샷INSERT" 버킷(아래 _hf2-_hf1c)이
+            # 15년 실측에서 +125% 늘었는데 원인을 못 찾아, standings_half
+            # INSERT/그 commit/_snapshot_team_lineup_half(내부는 자체
+            # [PERF-SNAPSHOT]으로 더 쪼갬)/그 commit/close()를 전부
+            # 따로 잰다. 로직은 그대로.
+            _hfx1 = _time_half.perf_counter()   # standings_half INSERT+commit 끝
             # [2026-09 신설, 신민용 요청: "상반기/하반기 포메이션을 따로
             # 보여달라"] 위 상반기 순위 스냅샷과 완전히 같은 시점(겨울
             # 이적시장이 열리기 직전, ap.team_id가 아직 상반기 로스터인
             # 순간)에 팀별 상반기 포메이션도 같이 찍어둔다 — 아래
             # ai_lifecycle.run_ai_mid_season_transfer가 이 team_id들을
             # 바꾸기 전에 반드시 먼저 실행돼야 한다.
+            # [2026-09, hist 비동기 writer 검증 완료 후 제거] 이 블록을
+            # 감싸고 있던 VDBE 스텝 계측/페이지·freelist 카운트/WAL 크기
+            # diff/PASSIVE·TRUNCATE 체크포인트(별도 커넥션) 진단 코드는
+            # "스냅샷INSERT 버킷의 그 commit이 15년간 0.1s→1.6s로 자란
+            # 원인"을 찾기 위한 것이었다 — 원인(hist.db 동기 커밋 자체의
+            # 비용)이 확인되고 비동기 writer로 해결된 뒤, 실제 19시즌
+            # 세이브로 재검증한 결과 "그 commit"은 0.000~0.001s로 평탄화된
+            # 반면, 이 진단 코드 자체(특히 매년 강제로 돌리던 TRUNCATE
+            # 체크포인트)가 hist.db 파일 크기에 비례해 0.36s→1.9s로 자라는
+            # "진단 도구가 새로 만든 부하"로 남아있음을 실측으로 확인(신민용
+            # 확인) — 역할이 끝났으므로 제거한다. 로직·데이터는 무관, 순수
+            # 계측 코드만 삭제.
             try:
                 from ai_lifecycle import _snapshot_team_lineup_half
                 _snapshot_team_lineup_half(_conn_half, new_year)
-                _conn_half.commit()
             except Exception as _e:
                 add_log(f"⚠ 상반기 포메이션 스냅샷 오류: {_e}", "event", new_year, new_week)
-            _conn_half.close()
+            _hfx2 = _time_half.perf_counter()   # snapshot 함수 자체 끝
+            try:
+                _snap_msg = (f"[PERF-SNAPSHOT] {new_year}년 스냅샷INSERT 버킷 세부: "
+                             f"standings_half INSERT+commit {_hfx1-_hf1c:.3f}s "
+                             f"({len(_half_rows)}건) | "
+                             f"_snapshot_team_lineup_half {_hfx2-_hfx1:.3f}s")
+                print(_snap_msg, flush=True)
+                _live_debug(_snap_msg)
+            except Exception:
+                pass
         except Exception as _e:
             _hf1b = _hf1c = _time_half.perf_counter()
             add_log(f"⚠ 상반기 순위 스냅샷 오류: {_e}", "event", new_year, new_week)
@@ -11402,12 +11428,134 @@ _BALLON_CL_RATING_WEIGHT = 1.25
 # 랭킹에 전혀 영향을 못 준다. score_goals_assists 자체(최종 채점)는 원래도
 # 이 비율 방식이라 편향이 없었음(실측: ST 평균 3.48점으로 LW 3.97점보다
 # 오히려 낮음) — 이번 수정 대상은 어디까지나 트로피 감쇠의 랭킹 기준.
+
+# [2026-09 신설, 신민용+GPT 협의: "CB/LB/RB 발롱도르 생산성 재설계"]
+# 실측(2000시즌 game.db 세이브 + 3시즌 헤드리스, tools/defender_calib_
+# probe.py): CB/LB/RB는 포지션 기대 G+A(_BALLON_POS_*_FALLBACK 기준
+# CB/LB/RB=1+1=2)가 워낙 작아서, 리그+챔스 G+A 6~7개만으로 생산성 캡
+# (15.0)을 찍는다 — RB 평균 G+A 5.33에 생산성 12.61 > ST 평균 G+A
+# 25.36에 생산성 8.20. 3시즌 헤드리스 Top30 90명에서도 LB 평균 G+A
+# 4.86에 생산성 11.93으로 동일하게 재현(단발성 아님). 그래서 CB/LB/RB만
+# "포지션 기대치 대비 G+A 비율" 방식을 폐기하고, 팀 실점 억제(팀 단위,
+# 개인 뎁스감쇠 영향 없음) × 참가도(기존 _ROLE_PARTICIPATION 재사용) +
+# G/A 소량 보너스로 바꾼다. ST/W/CAM/CM/CDM 등 나머지 포지션은 기존
+# 79차 공식(_ballon_productivity 본문)을 그대로 유지 — 이번 변경 범위는
+# CB/LB/RB로만 국한한다(신민용+GPT 확정).
+def _get_team_gc_per_match(year, team_id, cache=None):
+    """그 시즌 팀의 경기당 실점 — 수비수 생산성의 핵심 원재료.
+    _get_historical_league_rank_points와 같은 self-healing 폴백 패턴을
+    그대로 재사용한다: 발롱도르 계산 시점엔 hist.league_season_
+    standings에 그 해 행이 아직 없을 수 있어서(archive_old_seasons가
+    이후에 채움 — 위 함수 주석 참고), 없으면 그 시점까지 아직 안 지워진
+    main.match_results에서 즉석으로 같은 값을 계산한다. 팀이 그 시즌
+    한 경기도 못 찾으면(신생/데이터 공백) None을 반환 — 호출부가 "팀
+    수비 정보 없음"으로 처리해 0점 처리하게 한다(GK의 saves=None과
+    같은 원칙)."""
+    if cache is not None:
+        key = ("team_gc", year, team_id)
+        if key in cache:
+            return cache[key]
+    conn = get_conn()
+    row = conn.execute(
+        """SELECT wins, draws, losses, goals_against
+           FROM hist.league_season_standings WHERE year=? AND team_id=?""",
+        (year, team_id)).fetchone()
+    if row:
+        m = (row["wins"] or 0) + (row["draws"] or 0) + (row["losses"] or 0)
+        result = (row["goals_against"] / m) if m > 0 else None
+    else:
+        result = None
+        trow = conn.execute("SELECT league_id FROM teams WHERE id=?", (team_id,)).fetchone()
+        if trow and trow["league_id"]:
+            mrow = conn.execute(
+                """SELECT COUNT(*) AS m, SUM(ga) AS goals_against FROM (
+                       SELECT away_score AS ga FROM match_results
+                       WHERE league_id=? AND year=? AND home_team_id=?
+                         AND home_score IS NOT NULL AND away_score IS NOT NULL
+                       UNION ALL
+                       SELECT home_score AS ga FROM match_results
+                       WHERE league_id=? AND year=? AND away_team_id=?
+                         AND home_score IS NOT NULL AND away_score IS NOT NULL
+                   )""",
+                (trow["league_id"], year, team_id, trow["league_id"], year, team_id)).fetchone()
+            if mrow and mrow["m"]:
+                result = (mrow["goals_against"] or 0) / mrow["m"]
+    conn.close()
+    if cache is not None:
+        cache[key] = result
+    return result
+
+
+# 실측 근거(tools/defender_calib_probe.py, 3시즌 헤드리스 34,179팀·시즌
+# 표본): 팀 경기당 실점 P10=0.932 / P25=1.059 / 중앙값=1.214 /
+# P75=1.391 / P90=1.568. 신민용+GPT 확정 방향대로 "중앙값보다 나쁜 팀은
+# 0점 시작, 상위 10% 수준(P10)에서 만점, 그 밑으로 더 내려가도 무한정
+# 안 올라가게 상한"을 그대로 상수화한다 — P75(중앙값보다 한 단계
+# 넉넉하게 나쁜 지점)를 0점 기준선으로 잡아 "평범~약간 나쁜 수비"까지는
+# 아주 작은 점수만, "중앙값보다 뚜렷하게 좋은 수비"부터 본격적으로
+# 점수가 붙게 했다.
+_DEF_GC_BASELINE = 1.391     # 0점 시작선 (팀 실점/경기 P75)
+_DEF_GC_ELITE = 0.932        # 만점 도달선 (팀 실점/경기 P10) — 이보다 낮아도 더 안 오름
+_DEF_TEAM_SCORE_MAX = 9.5    # 팀 수비 성과 만점
+# G/A 보너스 — "0→0, 2→소폭, 4→조금 더, 8→확실히, 15→상당히"(신민용+GPT
+# 확정 형태)를 포화곡선(ga/(ga+K))으로 구현. CB G+A 6개가 과거처럼 15.0
+# 캡을 찍는 일이 없도록, 최댓값 자체를 낮게 잡는다.
+_DEF_GA_BONUS_MAX = 3.0
+_DEF_GA_BONUS_K = 5.0
+
+
+def _defender_productivity(cand):
+    """CB/LB/RB 전용 생산성 = 팀 수비 성과 × 참가도 + G/A 소량 보너스
+    (+ 챔스 보너스, _ballon_cl_bonus — 다른 포지션과 동일하게 별도
+    가산). _ballon_productivity(cand)가 pos in ('CB','LB','RB')일 때
+    이 함수로 그대로 위임한다.
+
+    [주의, 신민용+GPT 합의] 팀 수비 성과는 반드시 "감쇠 안 된 팀 레벨"
+    값(_get_team_gc_per_match, league_season_standings 집계)을 쓴다 —
+    선수 개인의 clean_sheets/goals_conceded 추정치(_estimate_ai_clean_
+    sheets 등)는 이미 _apply_squad_depth_decay로 역할별 감쇠가 적용된
+    값이라, 그걸 감쇠 안 된 공용 분모로 나누면 GK의 concede_score가
+    겪었던 것과 같은 왜곡(로테이션 선수가 오히려 유리해 보이는 버그)이
+    똑같이 재현된다. 참가도는 그 자리에서 감쇠된 통계치를 재활용하는 게
+    아니라 role 라벨 기반의 _ROLE_PARTICIPATION을 별도로 곱해서 반영한다
+    — 팀 지표는 순수하게 팀 단위로, 개인 기여도는 역할로, 서로 다른
+    축을 곱하는 구조라 이 왜곡에서 자유롭다.
+
+    [주의] CB/LB/RB별로 참가도 계수를 따로 두지 않는다 — 실측상 CB
+    주전비중(63.2%)이 LB/RB(약 37%)보다 훨씬 높지만, 이는 "포지션별
+    슬롯 구조가 다르다"는 증거일 뿐 "평가 기준 자체를 다르게 해야
+    한다"는 증거가 아니라는 게 신민용+GPT 공통 결론 — 같은 역할이면
+    포지션 무관하게 같은 참가도 규칙을 쓰고, 결과를 보고 조정한다."""
+    year = cand.get("year")
+    team_id = cand.get("team_id")
+    gc_per_match = _get_team_gc_per_match(year, team_id) if year and team_id else None
+    if gc_per_match is None:
+        team_score = 0.0
+    else:
+        span = _DEF_GC_BASELINE - _DEF_GC_ELITE
+        ratio = (_DEF_GC_BASELINE - gc_per_match) / span if span > 0 else 0.0
+        ratio = max(0.0, min(ratio, 1.0))
+        team_score = ratio * _DEF_TEAM_SCORE_MAX
+    participation = _ROLE_PARTICIPATION.get(cand.get("role"), 1.0)
+    ga = (cand.get("goals") or 0) + (cand.get("assists") or 0)
+    ga_bonus = _DEF_GA_BONUS_MAX * ga / (ga + _DEF_GA_BONUS_K)
+    cl_bonus = _ballon_cl_bonus(cand)
+    return round(min(team_score * participation + ga_bonus + cl_bonus, 15.0), 2)
+
+
 def _ballon_productivity(cand):
     """포지션 기대치 대비 생산성 점수 — _score_ballon_candidate의
     score_goals_assists와 완전히 동일한 공식(그 함수가 이 값을 그대로
     가져다 쓴다, 중복 구현 아님). rating을 전혀 참조하지 않으므로 골/도움
     가중치 차이에서 자유로운 "팀/국적 내 순위" 기준으로도 쓸 수 있다."""
     pos = cand.get("position") or ""
+    if pos in ("CB", "LB", "RB"):
+        # [2026-09 신설] 포지션 기대 G+A 비율 방식 폐기 — 위
+        # _defender_productivity 정의부 주석 참고. CDM/LWB/RWB는 기대
+        # G+A가 CB/LB/RB보다 훨씬 커서(3+5, 2+4) 같은 폭발이 실측되지
+        # 않았으므로 이번 변경 범위에서 제외하고 아래 기존 공식을 그대로
+        # 탄다(신민용+GPT 확정, 범위를 CB/LB/RB로만 국한).
+        return _defender_productivity(cand)
     if pos == "GK":
         # [2026-09 전면 재설계, 신민용 리포트: "GK가 발롱도르 상위권을
         # 다 차지한다"(구버전 버그) → "골/도움 0점 고정은 '공격 기여가
@@ -11732,6 +11880,19 @@ def _effective_award_position(reg_position, season_position, season_role, half_p
     return season_position or half_position or reg_position
 
 
+def _effective_award_role(season_position, season_role, half_position, half_role):
+    """[2026-09 신설, CB/LB/RB 생산성 재설계용] _effective_award_position과
+    완전히 같은 반기 비교 로직으로, 그 함수가 최종 포지션을 고를 때 택한
+    바로 그쪽의 role을 그대로 반환한다 — _defender_productivity의 참가도
+    (_ROLE_PARTICIPATION) 계산이 "채택된 포지션"과 "채택된 role"이 서로
+    다른 반기에서 온 것끼리 섞이지 않게 한다."""
+    if season_position and half_position and season_position != half_position:
+        season_w = _ROLE_PARTICIPATION.get(season_role, 1.0)
+        half_w = _ROLE_PARTICIPATION.get(half_role, 1.0)
+        return half_role if half_w > season_w else season_role
+    return season_role or half_role
+
+
 # [2026-09 신설, 79차, 신민용+GPT 협의: "MVP/베스트11도 발롱도르 트로피
 # 축에 소액 가산"] ①②(75~78차)로 개인 기록(골/도움/평점)이 이미
 # 충분히 반영된 뒤에 넣는 것이라, 이건 "그 활약에 대한 세계/리그의
@@ -11864,8 +12025,28 @@ def _get_ballon_candidates(c, year):
     # 포지션으로"] ph(하반기/시즌종료 스냅샷)에 phh(상반기 스냅샷)를
     # 추가로 LEFT JOIN해 ph.position/phh.position 둘 다 끌어온다 —
     # _effective_award_position이 최종 포지션을 고른다.
+    # [2026-09 성능실험, cProfile 실측: _get_ballon_candidates 후보수집이
+    # 3초대까지 걸림] 아래 쿼리는 원래 l.tier=1(1부)만 걸고, SS/S/A가
+    # 아닌 나라는 밑에서(파이썬 루프의 league_grade 체크) 걸렀다 — 그런데
+    # 그 전에 211개국 전체의 1부 선수를 상대로 이 무거운 JOIN(포지션
+    # 이력·상반기 스냅샷·CL 개인기록까지 LEFT JOIN 4개)을 이미 다 돌린
+    # 뒤였다. get_country_league_grade는 순수 함수(DB/난수 전혀 안 씀,
+    # constants.py 확인)이므로 미리 어느 나라가 SS/S/A인지부터 구해서
+    # SQL WHERE에 country_id 필터로 얹으면, 어차피 나중에 버려질 나라의
+    # JOIN 자체를 안 하게 된다 — 푸스카스 후보 수집(_get_puskas_candidates)
+    # 이 이미 같은 헬퍼(_country_ids_by_league_grade)로 SS/S를 이렇게
+    # 거르고 있어서, 그 패턴을 등급 조합만 SS/S/A로 넓혀 그대로 재사용한다.
+    # [주의, 신민용 지적] 아래 파이썬 루프의 기존 league_grade 체크
+    # (get_country_league_grade(r["cname"], r["national_grade"]) not in
+    # ("SS","S","A"))는 일부러 그대로 둔다 — 이 SQL 사전 필터가 혹시
+    # 잘못되더라도 기존 체크가 최종 안전망 역할을 하도록, 둘 다 같은
+    # 등급 조합("SS","S","A")을 쓰는 한 결과는 항상 동일하다(뒤 체크가
+    # 사실상 항상 통과하는 형태가 될 뿐). 결과 diff로 후보 집합이 정말
+    # 똑같은지 확인한 뒤에만 파이썬 체크 제거를 고려한다.
+    _top_ids = _country_ids_by_league_grade(c, ("SS", "S", "A"))
+    _top_ph = ",".join(str(i) for i in _top_ids) or "-1"
     ai_rows = c.execute(
-        """SELECT s.player_id AS player_id, s.team_id AS team_id, s.matches AS matches,
+        f"""SELECT s.player_id AS player_id, s.team_id AS team_id, s.matches AS matches,
                   s.goals AS goals, s.assists AS assists, s.rating AS rating,
                   s.clean_sheets AS clean_sheets, s.saves AS saves, s.goals_conceded AS goals_conceded,
                   ap.position AS reg_position, ap.nationality AS nationality,
@@ -11887,6 +12068,7 @@ def _get_ballon_candidates(c, year):
            LEFT JOIN hist.ai_player_season_stats_by_comp bc
              ON bc.player_id = s.player_id AND bc.year = ? AND bc.competition = 'cl'
            WHERE l.tier=1
+             AND l.country_id IN ({_top_ph})
              AND (ph.role IS NULL OR ph.role NOT IN (?, ?, ?))""",
         (year, year, year, year, *_EXCLUDED_ROLES)).fetchall()
 
@@ -11914,6 +12096,12 @@ def _get_ballon_candidates(c, year):
         eff_position = _effective_award_position(
             r["reg_position"], r["season_position"], r["season_role"],
             r["half_position"], r["half_role"])
+        # [2026-09 신설, CB/LB/RB 생산성 재설계용] _defender_productivity가
+        # 팀 실점(연도+팀 필요)과 참가도(role 필요)를 쓰므로 후보 dict에
+        # 추가한다 — 다른 포지션/채점 경로는 이 두 필드를 쓰지 않으므로
+        # 영향 없음(하위호환).
+        eff_role = _effective_award_role(
+            r["season_position"], r["season_role"], r["half_position"], r["half_role"])
         _trophy_bonus_val = _get_team_trophy_bonus(year, r["team_id"], r["player_id"], cache=_cache)
         _cl_stage, _cl_continent, _cl_tier = _cache.get(("cl", year, r["team_id"]), (None, None, None))
         candidates.append({
@@ -11921,7 +12109,7 @@ def _get_ballon_candidates(c, year):
             "matches": r["matches"], "goals": r["goals"], "assists": r["assists"],
             "rating": r["rating"], "clean_sheets": r["clean_sheets"],
             "saves": r["saves"], "goals_conceded": r["goals_conceded"],
-            "nationality": r["nationality"],
+            "nationality": r["nationality"], "year": year, "role": eff_role,
             "cl_matches": r["cl_matches"], "cl_goals": r["cl_goals"],
             "cl_assists": r["cl_assists"], "cl_rating": r["cl_rating"],
             "cl_continent": _cl_continent, "cl_tier": _cl_tier,
@@ -11990,7 +12178,7 @@ def _get_ballon_candidates(c, year):
                 "cl_goals": (my_cl["goals"] or 0) if my_cl_matches else 0,
                 "cl_assists": (my_cl["assists"] or 0) if my_cl_matches else 0,
                 "cl_rating": (my_cl["rating"] if my_cl and my_cl["rating"] is not None else None),
-                "nationality": my_nat,
+                "nationality": my_nat, "year": year, "role": my_role,
                 "award_bonus": _award_bonus_map.get(_SIA_MY_PLAYER_ID, 0.0),
                 "trophy_bonus": _get_team_trophy_bonus(year, my_row["team_id"], _SIA_MY_PLAYER_ID,
                                                         cache=_cache),
@@ -12130,7 +12318,14 @@ def _save_individual_award_rows(c, year, category, competition, entries,
     if sink is not None:
         sink.extend(rows)
     elif rows:
-        c.executemany(_SIA_INSERT_SQL, rows)
+        # [2026-09 신설, 히스토리 비동기 writer] 이전엔 즉시 커밋했다 —
+        # 이제 큐에 넘기기만 한다. kind="season_individual_awards"의 실제
+        # SQL(INSERT OR IGNORE, 여기 위 _SIA_INSERT_SQL과 완전히 동일한
+        # 문자열)은 database._HISTORY_TASK_SQL에 그대로 박아뒀다 — "먼저
+        # 들어온 행이 이긴다"는 순서의존 의미론이므로 워커가 FIFO로만
+        # 처리하는 게 특히 중요하다(위 docstring 참고).
+        from database import history_enqueue
+        history_enqueue("season_individual_awards", rows)
 
 
 def _award_entry_from_pool(x, total_score=None):
@@ -12530,6 +12725,20 @@ def _save_yashin_trophy_top10(c, year):
     _save_individual_award_rows(c, year, "world", None, entries)
 
 
+_COUNTRY_IDS_BY_LEAGUE_GRADE_CACHE: dict = {}
+# [2026-09 신설, cProfile 실측: 이 함수 자체가 "가벼운 연산"이라는 위
+# docstring과 달리 호출 1회당 약 0.6s(211개국 순회 × get_country_league_grade)
+# — 그런데 발롱도르/푸스카스 등 여러 호출부가 같은 시즌 안에서 같은
+# grades 조합을 반복 계산하고 있었다(실측 3회, 합계 1.851s). get_country_
+# league_grade는 DB/난수를 전혀 안 쓰는 순수 함수이고 리그 등급 규칙
+# (constants.py)은 게임 진행 중 안 바뀌므로, 같은 grades 조합이면 프로세스
+# 생존 기간 내내 결과가 항상 같다 — economy._TOP_SALARY_CACHE와 동일한
+# 근거로 캐싱한다. 키는 set()으로 바꾸지 않고 호출부가 넘긴 순서 그대로
+# tuple화한다 — ("SS","S")와 ("SS","S","A")는 별개 항목으로 남는다(계산
+# 내용·호출 순서·RNG는 전혀 안 건드림, 순수 재사용 최적화).
+_country_ids_cache_stats = {"hit": 0, "miss": 0}
+
+
 def _country_ids_by_league_grade(c, grades):
     """countries 테이블 전체를 훑어 get_country_league_grade() 기준으로
     "클럽 리그 등급"이 grades(예: ('SS','S'))에 속하는 country id 집합을
@@ -12543,14 +12752,33 @@ def _country_ids_by_league_grade(c, grades):
     주석대로 "국대 강도(월드컵 예선/대진 기준)"이지 클럽 리그 등급이
     아니다(_get_ballon_candidates 코멘트에 상세 진단 있음) — 이 헬퍼로
     네 곳 모두 get_country_league_grade(클럽 리그 전용 등급) 기준으로
-    통일한다. countries 테이블 전체(211개국)를 한 번 훑는 가벼운 연산이라
-    호출부마다 새로 계산해도 비용은 미미하다."""
+    통일한다.
+
+    [2026-09 캐싱 추가] 위 모듈 상단 _COUNTRY_IDS_BY_LEAGUE_GRADE_CACHE
+    주석 참고 — 같은 grades 조합이면 재계산하지 않고 그대로 재사용한다.
+    반환값(set)은 호출부에서 전부 읽기 전용(SQL IN절 문자열 생성용)으로만
+    쓰이므로 캐시된 객체를 그대로 돌려줘도 안전하다."""
+    key = tuple(grades)
+    cached = _COUNTRY_IDS_BY_LEAGUE_GRADE_CACHE.get(key)
+    if cached is not None:
+        _country_ids_cache_stats["hit"] += 1
+        return cached
+    _country_ids_cache_stats["miss"] += 1
     rows = c.execute("SELECT id, name, grade FROM countries").fetchall()
     ids = set()
     for r in rows:
         if get_country_league_grade(r["name"], r["grade"]) in grades:
             ids.add(r["id"])
+    _COUNTRY_IDS_BY_LEAGUE_GRADE_CACHE[key] = ids
     return ids
+
+
+# [2026-09 신설] _get_puskas_candidates → _save_puskas_top10 사이에서만 쓰는
+# 차순위 골 버퍼 {year: [pool 항목...]}. 두 함수의 기존 시그니처(호출부
+# 13600번대, 헤드리스 도구)를 안 바꾸기 위해 모듈 전역으로 넘기고, 저장
+# 함수가 읽는 즉시 pop한다(연도 키라 같은 해 재계산 시에도 섞이지 않게
+# _get_puskas_candidates 시작 시 해당 연도를 먼저 비운다).
+_PUSKAS_RUNNER_UPS_BY_YEAR: dict = {}
 
 
 def _get_puskas_candidates(c, year):
@@ -12564,6 +12792,7 @@ def _get_puskas_candidates(c, year):
     [{player_id, team_id, goal_event_id, final_score}, ...] — 다음 단계
     (_save_puskas_top10)에서 이 목록 자체를 세계급 후보 풀로 다시 확률
     선정한다."""
+    _PUSKAS_RUNNER_UPS_BY_YEAR.pop(year, None)
     _five_ids = _country_ids_by_league_grade(c, ("SS", "S"))
     _five_ph = ",".join(str(i) for i in _five_ids) or "-1"
     leagues = c.execute(
@@ -12679,6 +12908,13 @@ def _get_puskas_candidates(c, year):
         rng = _make_goal_seed(year, league_id, league_id, "world_league_goal_winner")
         winner = rng.choices(pool, weights=weights, k=1)[0]
         league_winners.append(winner)
+        # [2026-09 신설, _PUSKAS_NOMINEE_COUNT 주석 참고] 이 리그에서 올해의
+        # 골을 못 받은 나머지 골(이미 final_score 계산 끝남 — 추가 골 생성·
+        # 난수 소모 없음)은 세계 명단 빈칸 채우기용 차순위 후보로만 넘긴다.
+        # 수상자 추첨 자격은 없다(_save_puskas_top10 참고).
+        for p in pool:
+            if p is not winner:
+                _PUSKAS_RUNNER_UPS_BY_YEAR.setdefault(year, []).append(p)
 
     return league_winners
 
@@ -12724,7 +12960,20 @@ def _save_puskas_top10(c, year, league_winners):
     rng = _make_goal_seed(year, top_candidates[0]["team_id"] or 0, 0, "world_puskas_winner")
     winner = rng.choices(top_candidates, weights=weights, k=1)[0]
 
-    rest = [w for w in ranked if w is not winner][:9]
+    # [2026-09 수정, _PUSKAS_NOMINEE_COUNT 주석 참고] 명단 2위~11위 =
+    # 나머지 리그 올해의 골 수상자 + 각 리그 차순위 골을 합쳐 점수순. 같은
+    # 선수가 여러 골로 중복되지 않게 선수 단위로 한 번만 넣는다.
+    _runner_ups = _PUSKAS_RUNNER_UPS_BY_YEAR.pop(year, [])
+    _seen_pids = {winner["player_id"]}
+    rest = []
+    for w in sorted([w for w in ranked if w is not winner] + _runner_ups,
+                    key=lambda w: (-w["final_score"], w["player_id"] if w["player_id"] is not None else 10**9)):
+        if w["player_id"] in _seen_pids:
+            continue
+        _seen_pids.add(w["player_id"])
+        rest.append(w)
+        if len(rest) >= _PUSKAS_NOMINEE_COUNT - 1:
+            break
     ordered = [winner] + rest
     entries = [("FIFA 푸스카스상", i + 1, {
         "player_id": w["player_id"], "team_id": w["team_id"],
@@ -13113,7 +13362,10 @@ def _compute_cup_individual_awards(year):
                 _save_club_comp_award_rows(c, year, t["name"], mvp, scorer, category=category,
                                             extra=extra, league_country=country_name, sink=_sink)
             if _sink:
-                c.executemany(_SIA_INSERT_SQL, _sink)
+                # [2026-09 신설, 히스토리 비동기 writer] 즉시 커밋 대신 큐에만
+                # 넘긴다 — sink 누적 순서(=최종 삽입 순서)는 그대로 보존된다.
+                from database import history_enqueue
+                history_enqueue("season_individual_awards", _sink)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -13390,7 +13642,10 @@ def _compute_league_individual_awards(year, my_ctx=None):
                 c, year, "league", lname, entries, league_country=country, league_tier=tier,
                 sink=_sink)
         if _sink:
-            c.executemany(_SIA_INSERT_SQL, _sink)
+            # [2026-09 신설, 히스토리 비동기 writer] 즉시 커밋 대신 큐에만
+            # 넘긴다 — sink 누적 순서(=최종 삽입 순서)는 그대로 보존된다.
+            from database import history_enqueue
+            history_enqueue("season_individual_awards", _sink)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -13426,6 +13681,13 @@ def _compute_season_individual_awards(year, my_ctx=None):
     인자 — _end_of_season이 award_* 누적값으로 미리 구성해 넘긴다."""
     conn = get_conn()
     c = conn.cursor()
+    from database import history_drain
+    # [2026-09 신설] 이번 시즌 개인상 계산 동안의 국가ID 캐시 hit/miss만
+    # 따로 보려고 시즌 시작 시점에 카운터를 리셋한다 — 캐시 자체(_COUNTRY_
+    # IDS_BY_LEAGUE_GRADE_CACHE)는 프로세스 생존 기간 내내 그대로 유지되고
+    # 카운터만 초기화하므로, 이후 호출은 대부분 hit로 잡힌다(의도된 동작).
+    _country_ids_cache_stats["hit"] = 0
+    _country_ids_cache_stats["miss"] = 0
     # [2026-09 성능] 이번 산정 동안만 쓰는 신원 스냅샷 캐시를 비우고 시작한다
     # (_award_identity_snapshot 주석 참고 — 연도가 바뀌거나 그 사이 이적이
     # 일어났을 수 있으므로 반드시 매 산정 시작 시점에 비운다).
@@ -13504,6 +13766,17 @@ def _compute_season_individual_awards(year, my_ctx=None):
             _compute_league_individual_awards(year, my_ctx=my_ctx)
             _aw_league = _t_aw.perf_counter() - _awD
         _awF = _t_aw.perf_counter()
+        # [2026-09 신설, 히스토리 비동기 writer] 바로 위 세 함수(클럽대항전/
+        # 국제대회/리그전)의 season_individual_awards 쓰기가 이제 비동기
+        # 큐를 거친다 — 그런데 바로 아래 _get_ballon_candidates가 그 결과를
+        # (_get_award_recognition_bonus_map을 통해) 곧바로 다시 읽는다.
+        # 이 함수 자체의 79차 재배치 코멘트("그 정보가 season_individual_
+        # awards에 먼저 저장돼 있어야 한다")가 이미 이 순서 의존성을
+        # 명시하고 있으므로, 여기서 drain해 실제로 저장돼 있음을 보장한다
+        # — 이 셋은 award 후보 수 규모라 26만행 스냅샷과 달리 drain 비용이
+        # 작다.
+        if need_club_comp or need_league:
+            history_drain()
         if need_ballon:
             candidates = _get_ballon_candidates(c, year)
             _n_ballon = len(candidates) if candidates else 0
@@ -13531,6 +13804,10 @@ def _compute_season_individual_awards(year, my_ctx=None):
             f"발롱도르 {_aw_ballon:.2f}s (└후보수집 {_aw_cand:.2f}s · 후보 {_n_ballon}명) | "
             f"푸스카스 {_aw_puskas:.2f}s | 클럽대항전 {_aw_club:.2f}s | "
             f"국제대회 {_aw_intl:.2f}s | 리그전 {_aw_league:.2f}s | 국내컵 {_aw_cup:.2f}s")
+        _live_debug(
+            f"[COUNTRY-GRADE-CACHE] {year}년: hit={_country_ids_cache_stats['hit']} "
+            f"miss={_country_ids_cache_stats['miss']} "
+            f"(캐시 총 {len(_COUNTRY_IDS_BY_LEAGUE_GRADE_CACHE)}종 보유)")
     except Exception:
         conn.rollback()
         raise
@@ -13873,6 +14150,18 @@ _GOAL_WIN_PROB_BY_RANK = {1: 0.55, 2: 0.30, 3: 0.15}
 _GOAL_WIN_PROB_TAIL = 0.05
 _PUSKAS_RIVAL_COUNT = 8
 _PUSKAS_TOP_CANDIDATES = 3
+# [2026-09 신설, 신민용 요청: "푸스카스 전에 10명이던데 수정 과정에서 5명으로
+# 줄었다 — 11명으로 늘려줘"] 세계 푸스카스상 후보 명단(수상자 포함) 인원.
+# 5명으로 줄어든 원인: _get_puskas_candidates의 후보 리그 필터가 cn.grade
+# (국대 등급, SS/S 10개국)에서 get_country_league_grade(클럽 리그 등급)로
+# 바로잡히면서 SS/S가 5개국(잉글랜드/프랑스/스페인/독일/이탈리아)만 남았고,
+# 후보는 "리그당 올해의 골 수상자 1명"이라 명단도 최대 5명이 됐다.
+# 수상 자격(SS/S 리그 올해의 골 수상자 중 상위 _PUSKAS_TOP_CANDIDATES명
+# 가중추첨)은 그대로 두고, 명단의 나머지 칸만 같은 SS/S 리그 후보 풀에서
+# 올해의 골을 못 받은 차순위 골들까지 점수순으로 채운다 — 후보 리그를 A까지
+# 넓히는 안은 헤드리스 실측에서 상위 3명이 전부 A리그(오스트리아/일본/체코)
+# 골로 바뀌어 수상자 분포 자체가 달라져서 기각했다.
+_PUSKAS_NOMINEE_COUNT = 11
 # [2026-08 재조정, 신민용+검토 확정: "35%를 그냥 10%로 확 낮추는 것보다
 # 수상 이력 감쇠를 넣는 게 낫다 — 문제는 확률 자체보다 같은 선수가 매년
 # 동일 확률로 재수상할 수 있는 구조다"] 기본 확률은 너무 극단적으로
@@ -14998,7 +15287,24 @@ def _end_of_season(p, year, progress_cb=None):
     #      "내 순위"를 조회할 결과가 이 시점에 이미 저장돼 있어야 하기
     #      때문(design_ballon_dor.md 6번/9번 참고, 자체 커넥션/트랜잭션으로
     #      독립 실행).
+    # [2026-09 신설, 히스토리 비동기 writer] 발롱도르 등 개인상 계산은
+    # hist.ai_player_season_stats/_by_comp(리그/컵/CL/SC/CWC 전부)를 직접
+    # 읽는다 — 그런데 그 데이터의 실제 쓰기가 이제 비동기 큐를 거친다.
+    # 43주차 분(리그 등)은 보통 그 사이 최소 한 번의 오토세이브(그 안에서
+    # 이미 drain)를 거쳐 이 시점엔 이미 커밋돼 있지만, 바로 위(15196)에서
+    # 방금 넣은 CWC분은 아직 큐에 있을 수 있다 — 여기서 drain해 발롱도르가
+    # 항상 이번 시즌 전체 기록을 빠짐없이 보고 계산하게 한다(read-after-
+    # write 의존성 — CWC분은 소수 팀만 대상이라 이 시점의 drain 비용은
+    # 작다).
+    from database import history_drain
+    history_drain()
     _compute_season_individual_awards(year, my_ctx=_my_ctx)
+    # [2026-09 신설, 히스토리 비동기 writer] _process_awards(바로 아래)는
+    # "이 결과를 조회만 함"(위 _compute_season_individual_awards docstring
+    # 참고) — 즉 방금 함수가 enqueue만 해둔 발롱도르/야신/푸스카스/
+    # 리그전/국내컵/클럽대항전/국제대회 개인상 결과를 곧바로 다시 읽는다.
+    # 한 번 더 drain해 그 사이 워커가 전부 커밋했음을 보장한다.
+    history_drain()
     _te3 = _time_eos.perf_counter()
 
     # 1.5 개인 수상 산정 (통계 리셋 이전에 실행). 최소 출전 기준은 위
@@ -17200,9 +17506,17 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
     # 스쿼드 개편·은퇴·오프시즌 이적으로 새로 생기는 선수는 run_ai_offseason
     # 쪽 only_missing=True 2차 패스가 그대로 커버한다(team_season_lineup은
     # 그쪽에서 안 건드리도록 이미 되어 있어 이 스냅샷을 덮어쓰지 않는다).
+    # [2026-09 신설, 히스토리 비동기 writer] _snapshot_season_positions의
+    # 실제 hist 쓰기가 이제 비동기 큐를 거치므로, 바로 아래 _snapshot_
+    # season_ratings가 이 값을 hist에서 다시 읽으면(둘이 거의 곧바로
+    # 연달아 호출됨) 아직 커밋 전인 26만행을 그 자리에서 기다리게 돼
+    # 비동기화한 의미가 없어진다 — 반환값을 그대로 다음 호출에 넘겨서
+    # DB 왕복 자체를 없앤다(ai_lifecycle._snapshot_season_positions/
+    # _snapshot_season_ratings 주석 참고).
+    _pos_role_by_pid_w43 = None
     try:
         from ai_lifecycle import _snapshot_season_positions
-        _snapshot_season_positions(c, year)
+        _pos_role_by_pid_w43 = _snapshot_season_positions(c, year)
     except Exception as _e:
         add_log(f"[하반기 포메이션 스냅샷 오류] {_e}", "normal", year, 52)
     _pr_t6b = _time_pr.perf_counter()
@@ -17224,7 +17538,8 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
         _team_goals_for_w43 = {
             r[0]: r[1] for r in c.execute("SELECT id, goals_for FROM teams").fetchall()}
         _snapshot_season_ratings(c, year, team_goals_for=_team_goals_for_w43,
-                                  competitions=("cup", "cl", "sc", "lower_cup"))
+                                  competitions=("cup", "cl", "sc", "lower_cup"),
+                                  pos_role_by_pid=_pos_role_by_pid_w43)
     except Exception as _e:
         add_log(f"[하반기 평점 스냅샷 오류] {_e}", "normal", year, 52)
     _pr_t6c = _time_pr.perf_counter()

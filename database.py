@@ -308,7 +308,23 @@ def _new_raw_conn():
     # 비중이 늘어나 디스크 I/O가 계속 증가했다(연도전환 로그의 "아카이브이동"/
     # "완비판정조회" 단계가 해마다 조금씩 느려지던 원인 중 하나). 캐시/mmap을
     # 4배로 늘려 더 오래 캐시에 남아있게 한다.
-    conn.execute("PRAGMA cache_size=-65536")   # 약 64MB 페이지 캐시
+    # [2026-09 신설, 진단용] 15년 장기실측(time_probe_longrun.py)에서
+    # cl_matches/el_matches/ecl_matches/sc_matches/cup_matches/cwc_matches/
+    # lower_cup_matches — 리그의 match_results와 달리 이 7개는 정리(prune)가
+    # 없어 매년 계속 쌓이기만 함 — 를 읽는 "WHERE tournament_id=?" 쿼리
+    # (인덱스 있음, 격리된 벤치마크로는 인덱스를 잘 타는 것도 확인함)가
+    # 대상 토너먼트/경기 수는 15년 내내 그대로인데도 조회시간만 0.047s→
+    # 0.466s(약 10배)로 늘었다. 같은 함수 안의 순수 파이썬 루프는 15년
+    # 내내 평평했다(0.186~0.202s) — 즉 계산량이 아니라 "그 인덱스 페이지가
+    # 캐시에 있느냐"의 문제일 가능성이 가장 높다. 바로 위 2026-07 주석과
+    # 똑같은 병이지만 그때는 match_results_archive 하나였고 지금은 hist.db
+    # (15년새 512MB→1,621MB)까지 커진 상태에서 이 7개 표가 정리 없이
+    # 추가로 계속 쌓이는 중이라, 그때 늘려둔 64MB로도 다시 부족해진
+    # 것으로 보인다. 순수 실험— 이 한 줄만 바꾸는 거라 로직/데이터는
+    # 전혀 안 건드리며, time_probe_longrun.py로 재실측해서 SQL조회 성장
+    # 곡선이 완만해지는지 확인한 뒤에만 유지/추가 조정한다(안 통하면
+    # 그냥 되돌리면 그만).
+    conn.execute("PRAGMA cache_size=-262144")   # 실험: 64MB → 256MB
     conn.execute("PRAGMA temp_store=MEMORY")   # 정렬/임시 테이블을 메모리에서 처리
     # [2026-09 수정, 성능 감사: "mmap 캡이 곧 넘친다"] 예전엔 여기 512MB
     # 고정값(PRAGMA mmap_size=536870912)이 박혀 있었다. 그런데 실측 세이브
@@ -362,7 +378,12 @@ def _new_raw_conn():
     # 적용 중인 것과 같은 값(WAL+NORMAL은 SQLite 공식 권장 조합)을 hist에도
     # 똑같이 걸어줄 뿐이다. 저장되는 기록의 내용은 전혀 달라지지 않는다.
     try:
-        conn.execute("PRAGMA hist.cache_size=-65536")   # 약 64MB
+        conn.execute("PRAGMA hist.cache_size=-262144")   # [2026-09 실험, 위 main과
+        # 같은 이유] 256MB — hist.db가 main보다 훨씬 크고(15년 실측
+        # 512MB→1,621MB) 더 빨리 자라는 쪽이라, _collect_all_league_
+        # candidates의 hist SCAN(개인수상산정, 기존에 이미 "25~30시즌
+        # 넘으면 역전" 예측해둔 그 문제)에도 같은 방향으로 도움이 될
+        # 가능성이 있어 함께 올려서 실험한다.
         conn.execute("PRAGMA hist.synchronous=NORMAL")
     except sqlite3.OperationalError:
         pass
@@ -920,9 +941,20 @@ def flush_to_disk_async():
             return  # 이미 진행 중 — 건너뜀
         def _worker():
             try:
+                # [2026-09 신설, 히스토리 writer 불변식 5] main을 디스크에
+                # 쓰기 "전"에 반드시 먼저 hist 큐를 비운다 — "main.db의
+                # 이번 저장 시점엔 그 시점에 필요한 hist도 반드시 이미
+                # 있다"를 지키기 위함. drain이 실패하면(워커 오류) 이번
+                # 자동저장은 통째로 건너뛴다 — main만 먼저 저장해버리면
+                # main이 hist보다 앞서가는, 원래 막으려던 그 상태가
+                # 그대로 재현되기 때문이다. 다음 자동저장 주기(4주 뒤)에
+                # 다시 시도된다 — 이 스레드는 main 백업 스레드와 별개라
+                # 서로를 기다리는 순환 의존 없이 한 방향(hist→main)으로만
+                # 기다린다.
+                history_drain()
                 flush_to_disk()
-            except Exception:
-                pass
+            except Exception as _e:
+                _history_log(f"[AUTOSAVE] 이번 자동저장을 건너뜁니다: {_e!r}")
         _flush_thread = threading.Thread(target=_worker, daemon=True,
                                          name="flush_to_disk_async")
         _flush_thread.start()
@@ -937,6 +969,212 @@ def wait_for_pending_flush(timeout=10):
     t = _flush_thread
     if t is not None and t.is_alive():
         t.join(timeout=timeout)
+
+
+# ─── 히스토리 비동기 writer ──────────────────────────────────────
+# [2026-09 신설, 84차+이번 세션에서 진단한 "스냅샷INSERT" commit 지연
+#  (15년 세이브 기준 0.1s→1.5~1.6s, 계속 성장하는 구조) 해결책 — 신민용+GPT
+#  합의 설계]
+#
+# 반드시 지켜야 하는 불변식:
+#  1. hist.db에 "게임 진행 중" INSERT/UPDATE/DELETE/COMMIT하는 코드는 이
+#     워커(_history_worker_loop) 하나뿐이다. 다른 곳에서 hist.<표>에 직접
+#     execute()하지 않는다 — 그래야 hist.db(WAL)의 동시 writer가 항상
+#     1개로 고정되어 락 경합 자체가 생기지 않는다(로드 시 1회성 마이그레이션/
+#     _repair_future_hist_data는 게임 진행 중이 아니라 로드 시점 전용이라
+#     예외 — 워커 시작 전에 끝나므로 겹치지 않는다).
+#  2. 각 호출부는 "그 순간(메인 스레드) 이미 완성된 행 목록"만 넘긴다.
+#     워커는 절대 현재 DB 상태를 다시 읽어 과거 스냅샷을 재구성하지 않는다
+#     — 순수하게 넘겨받은 kind(=SQL)+행을 그대로 재생만 한다.
+#  3. FIFO 순서를 절대 보존한다. season_individual_awards는 INSERT OR
+#     IGNORE라 "먼저 들어온 행이 이긴다"는 순서의존 로직이 이미 있다
+#     (game_engine._save_individual_award_rows 주석 참고) — 워커가 임의로
+#     재정렬하거나 종류별로 묶어 처리하지 않는다.
+#  4. 표별 기존 SQL(REPLACE/IGNORE)을 그대로 유지한다 — 호출부는 kind
+#     문자열만 넘기고 실제 SQL은 아래 _HISTORY_TASK_SQL에서만 고른다.
+#     임의 SQL이 큐를 통해 실행될 길은 없다.
+#  5. 오토세이브/종료 직전엔 반드시 먼저 history_drain()한다 — "main.db의
+#     특정 저장 시점엔 그 시점에 필요한 hist도 반드시 이미 있다"는
+#     불변식을 지키기 위함(flush_to_disk_async/ui.main_window.closeEvent
+#     참고). drain이 실패하면 그 저장 자체를 건너뛴다.
+#  6. 워커 예외는 절대 삼키지 않는다 — history_drain()이 그대로 재전파해서
+#     호출부(오토세이브/종료)가 "이번 저장은 건너뛴다"로 판단하게 한다.
+#  7. _repair_future_hist_data는 수정 없이 그대로 안전망으로 둔다.
+#
+# task 경계는 함수 단위가 아니라 "기존 코드가 실제로 hist에 쓰던 그 순간"
+# 단위다 — 예를 들어 위치 스냅샷 하나가 team_season_lineup과 ai_player_
+# position_history 두 종류를 만들면, 그 두 executemany가 각각 별개 task로
+# (그 순서 그대로) 큐에 들어간다.
+import queue as _queue
+
+_HISTORY_TASK_SQL = {
+    "ai_player_ovr_history":
+        "INSERT OR REPLACE INTO ai_player_ovr_history(player_id, year, ovr) VALUES (?,?,?)",
+    "ai_player_position_history":
+        "INSERT OR REPLACE INTO ai_player_position_history(player_id, year, position, role) VALUES (?,?,?,?)",
+    "team_season_lineup":
+        "INSERT OR REPLACE INTO team_season_lineup"
+        "(team_id, year, formation, slots_json, bench_json) VALUES (?,?,?,?,?)",
+    "ai_player_position_history_half":
+        "INSERT OR REPLACE INTO ai_player_position_history_half(player_id, year, position, role) VALUES (?,?,?,?)",
+    "team_season_lineup_half":
+        "INSERT OR REPLACE INTO team_season_lineup_half"
+        "(team_id, year, formation, slots_json, bench_json) VALUES (?,?,?,?,?)",
+    "ai_player_season_stats":
+        "INSERT OR REPLACE INTO ai_player_season_stats"
+        "(player_id, year, team_id, matches, goals, assists, rating, clean_sheets, saves, goals_conceded) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+    "ai_player_season_stats_by_comp":
+        "INSERT OR REPLACE INTO ai_player_season_stats_by_comp"
+        "(player_id, year, competition, matches, goals, assists, rating, clean_sheets, saves, goals_conceded) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+    "season_individual_awards":
+        """INSERT OR IGNORE INTO season_individual_awards(
+                year, award_type, rank, player_id, team_id, position, total_score,
+                score_trophy, score_rating, score_goals_assists, score_position_adj, goal_event_id,
+                category, team_name, nationality, nat_flag, award_kind, competition,
+                league_country, league_tier, stat_goals, stat_assists, stat_saves, stat_goals_conceded)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+}
+# [주의] 위 SQL은 워커 전용 커넥션이 hist.db 파일을 'main' 스키마로 직접
+# 여는 것이므로 "hist." 접두어가 없다 — 메인 커넥션의 hist.<표>(ATTACH된
+# 이름)와 워커 커넥션의 <표>(그 파일을 직접 연 이름)는 물리적으로 완전히
+# 같은 파일·같은 표를 가리킨다.
+
+
+class HistoryTask:
+    __slots__ = ("seq", "kind", "rows")
+    def __init__(self, seq, kind, rows):
+        self.seq = seq
+        self.kind = kind
+        self.rows = rows
+
+
+_history_queue: "_queue.Queue" = _queue.Queue()
+_history_seq_lock = threading.Lock()
+_history_seq_counter = 0
+_history_worker_thread: "threading.Thread | None" = None
+_history_worker_start_lock = threading.Lock()
+_history_worker_error: "Exception | None" = None
+_history_worker_dead = False
+_history_metrics_lock = threading.Lock()
+_history_pending = 0            # 큐에 남아있는(아직 커밋 안 된) task 수
+_history_max_pending_seen = 0   # 지금까지 관측된 최대 backlog — 워커가
+                                 # 게임 진행 속도를 따라가는지 진단용
+_history_last_completed_seq = 0
+
+
+def _history_log(msg):
+    """ai_lifecycle._perf_log와 동일한 목적(콘솔+live_sim.log) — database.py는
+    game_engine을 최상단에서 import할 수 없어(순환 import) 지연 import로
+    같은 패턴을 재사용한다."""
+    print(msg)
+    try:
+        from game_engine import _live_debug
+        _live_debug(msg)
+    except Exception:
+        pass
+
+
+def _history_worker_loop():
+    global _history_worker_error, _history_worker_dead, _history_last_completed_seq, _history_pending
+    conn = sqlite3.connect(_history_db_path(), timeout=30)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        while True:
+            task = _history_queue.get()
+            try:
+                if task is None:   # shutdown 신호(현재 미사용, 확장 대비)
+                    break
+                if _history_worker_dead:
+                    # 이미 죽은 상태에서 들어온 task — 순서를 보존할 수
+                    # 없으므로 실행하지 않고 그대로 흘려보낸다(다음
+                    # history_drain()이 이 상태를 알려준다 — 불변식 6).
+                    continue
+                try:
+                    sql = _HISTORY_TASK_SQL[task.kind]
+                    if task.rows:
+                        conn.executemany(sql, task.rows)
+                    conn.commit()
+                    with _history_metrics_lock:
+                        _history_last_completed_seq = task.seq
+                except Exception as e:
+                    _history_log(f"[HIST-WORKER] seq={task.seq} kind={task.kind} 실패: {e!r}")
+                    _history_worker_error = e
+                    _history_worker_dead = True
+            finally:
+                with _history_metrics_lock:
+                    _history_pending = max(0, _history_pending - 1)
+                _history_queue.task_done()
+    finally:
+        conn.close()
+
+
+def _ensure_history_worker_started():
+    global _history_worker_thread
+    with _history_worker_start_lock:
+        if _history_worker_thread is not None and _history_worker_thread.is_alive():
+            return
+        _history_worker_thread = threading.Thread(
+            target=_history_worker_loop, daemon=True, name="history_writer")
+        _history_worker_thread.start()
+
+
+def history_enqueue(kind, rows):
+    """게임 진행 중 hist 표에 쓸, 이미 완성된 행 목록을 큐에 넘긴다 —
+    여기서는 DB에 아무것도 쓰지 않고 즉시 반환한다(불변식 2). 실제 커밋은
+    단일 워커 스레드가 FIFO 순서 그대로 담당한다(불변식 1, 3).
+    kind는 반드시 _HISTORY_TASK_SQL에 등록된 문자열이어야 한다."""
+    if kind not in _HISTORY_TASK_SQL:
+        raise ValueError(f"알 수 없는 history task kind: {kind!r}")
+    if _history_worker_dead:
+        # 이전 실패가 아직 history_drain()으로 확인되지 않은 상태 — 여기서
+        # 조용히 계속 쌓이게 두면 순서 보장이 깨진 채로 게임만 진행되므로
+        # 즉시 알린다(불변식 6).
+        raise RuntimeError(
+            "history writer가 이전 오류로 중단된 상태입니다 — history_drain()으로 "
+            "먼저 오류를 확인해야 합니다") from _history_worker_error
+    rows = tuple(rows)   # 호출부가 이후 원본 리스트를 재사용/변경해도
+                          # 안전하도록 이 시점 내용으로 스냅샷 고정(불변식 2)
+    global _history_seq_counter, _history_pending, _history_max_pending_seen
+    with _history_seq_lock:
+        _history_seq_counter += 1
+        seq = _history_seq_counter
+    with _history_metrics_lock:
+        _history_pending += 1
+        _history_max_pending_seen = max(_history_max_pending_seen, _history_pending)
+    _ensure_history_worker_started()
+    _history_queue.put(HistoryTask(seq, kind, rows))
+
+
+def history_drain():
+    """지금까지 enqueue된 모든 history task가 실제로 hist.db에 커밋될
+    때까지 기다린다(큐가 비어 있으면 즉시 반환). 워커가 그 사이 실패했다면
+    (불변식 6) 그 예외를 그대로 다시 던진다 — 호출부(오토세이브/종료)는
+    이걸 받아 "이번 저장은 건너뛴다"로 처리해야 한다.
+    두 곳에서 필수로 호출한다: (1) main을 디스크에 쓰기 직전(flush_to_disk_
+    async/종료) — main이 hist보다 앞서지 않게(불변식 5), (2) 게임 로직이
+    "방금 큐에 넣은 hist 데이터"를 같은 시즌 안에서 다시 읽어야 할 때
+    (예: 발롱도르 계산 직전 — hist read-after-write 의존성)."""
+    _history_queue.join()
+    if _history_worker_dead:
+        raise RuntimeError("history writer 실패 — hist.db 저장이 중단됐습니다") from _history_worker_error
+
+
+def history_backlog():
+    """진단용 — 현재 큐에 남은 task 수, 지금까지 관측된 최대 backlog, 마지막
+    완료 task의 seq. 평소엔 0~1을 오가는 게 정상이고, 시즌이 지날수록
+    꾸준히 늘어난다면(예: 10주차 4 → 20주차 37 → 30주차 152) 워커가 게임
+    진행 속도를 못 따라가고 있다는 뜻 — [PERF-HIST-Q] 등으로 로그에 찍어
+    확인한다."""
+    with _history_metrics_lock:
+        return {"pending": _history_pending,
+                "max_pending": _history_max_pending_seen,
+                "last_completed_seq": _history_last_completed_seq}
+
 
 # ─── 스키마 ───────────────────────────────────────────────────
 def init_db():
@@ -2648,6 +2886,19 @@ def init_db():
         # 임대 이력도 계속 표시할 수 있다(_prune_ai_transfer_log가 이관할 때
         # 같이 옮김).
         "ALTER TABLE ai_transfer_log_archive ADD COLUMN is_loan INTEGER DEFAULT 0",
+        # [2026-09 버그수정, 신민용 리포트 "임대 기간이랑 실제 임대
+        # 기간이랑 달라"를 고치던 중 헤드리스 검증에서 자체 발견]
+        # loan_return_year는 바로 위 ai_transfer_log에만 추가되고 이
+        # archive 짝이 빠져 있었다 — is_loan/salary/transfer_type/fee/
+        # contract_end_year는 전부 위아래로 쌍을 이뤄 추가됐는데
+        # loan_return_year만 짝 없이 혼자 추가된 것(반복되어온 "새 컬럼
+        # 추가시 archive 짝 깜빡함" 패턴과 동일 유형). 이 상태에서
+        # world_browser.get_ai_player_salary_history가 두 표를 UNION
+        # ALL로 합쳐 loan_return_year까지 같이 읽게 되면, archive
+        # 테이블엔 그 컬럼 자체가 없어 "5시즌 지나 이관된 로그가 하나라도
+        # 있는 모든 선수"(임대 여부 무관)에서 SQL 자체가 에러난다 —
+        # 실제 게임에 매우 큰 영향을 주는 회귀라 여기서 같이 막는다.
+        "ALTER TABLE ai_transfer_log_archive ADD COLUMN loan_return_year INTEGER DEFAULT 0",
         # [2026-09 신설, 신민용 요청: "이적이면 연봉이 써지는거고... 4년
         # 계약이면 2000~2003년까진 같은 거니 2000년만 기록하면 되는거니"]
         # 연도별 스냅샷이 아니라(계약은 갱신/이적 시점에만 바뀌므로 그럴
@@ -2824,8 +3075,33 @@ def init_db():
         # ai_lifecycle._age_and_progress(potential_ovr<=0이면 team_cap을
         # 그대로 쓰는 하위호환 분기)가 이 상태를 처리한다.
         "ALTER TABLE ai_players ADD COLUMN potential_ovr INTEGER DEFAULT 0",
+        # [2026-09 신설, 신민용 리포트: "외국인 용병 쿼터 초과시 국적을
+        # 강제로 자국으로 바꾸는 로직(_enforce_foreign_quota_worldwide/
+        # _enforce_foreign_quota_on_join)이 국가대표 선발에도 영향을 줘서
+        # 독일 대표팀에 스페인 선수가 나온다"] 저 두 함수는 "선수를 지우지
+        # 않고 국적만 자국으로 전환"해 클럽 쿼터를 맞추는데, 국가대표
+        # 선발(get_country_squad_players 등)이 그 결과(nationality)를
+        # 그대로 믿다 보니 클럽 쿼터용 편법 전환이 국대 자격까지 오염시켰다.
+        # 선수 생성 시점(4개 경로: 월드시드+은퇴대체+보충2곳)에 한 번만
+        # 정해지고 이후 절대 안 바뀌는 "진짜 국적"을 이 컬럼에 따로
+        # 보존한다 — nationality는 클럽 쿼터 전환용으로 계속 바뀔 수 있지만,
+        # 국가대표 선발/평균OVR 계산은 이제 true_nationality만 본다.
+        "ALTER TABLE ai_players ADD COLUMN true_nationality TEXT DEFAULT ''",
         "CREATE INDEX IF NOT EXISTS hist.idx_sia_league_country ON season_individual_awards(category, year, league_country, league_tier)",
         "CREATE INDEX IF NOT EXISTS hist.idx_sia_category_year ON season_individual_awards(category, year)",
+        # [2026-09 신설, 신민용 요청: "국가대표 출전 기록에 대회/국가/출전/
+        # 결과/성적만 뜨는데 여기에 이 당시 얘 포지션이 뭐였는지도 표시해야
+        # 해 — 국대에서 뛰는 포지션이 있잖아"] intl_squad는 지금까지 그
+        # 선수가 이 대회 26인에 뽑혔었다는 사실과 출전 횟수만 담고 있어서,
+        # 화면에 포지션을 보여주려면 매번 ai_players.position(선수의 "지금"
+        # 포지션 — 커리어 내내 CM→CAM→CF처럼 바뀔 수 있음)을 다시 조회할
+        # 수밖에 없었다 — 그러면 2010년 당시 CM으로 뛰었던 대표팀 기록이,
+        # 지금 그 선수가 CF로 바뀌었다는 이유로 "2010년에도 CF였다"처럼
+        # 잘못 보였을 것이다. 26인이 이번 대회에서 "처음" 확정되는 시점
+        # (get_or_create_intl_squad)에 그때의 ap.position을 그대로 스냅샷
+        # 찍어 저장해둔다 — 선수 커리어가 이후 어떻게 바뀌든 이 대회 기록의
+        # 포지션은 그때 그대로 남는다.
+        "ALTER TABLE intl_squad ADD COLUMN position TEXT DEFAULT ''",
     ]:
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,
@@ -2857,6 +3133,20 @@ def init_db():
     try:
         c.execute(
             "UPDATE ai_players SET peak_ovr = ovr WHERE (peak_ovr IS NULL OR peak_ovr = 0) AND age > 29")
+    except sqlite3.OperationalError:
+        pass
+
+    # [2026-09 신설, 위 true_nationality 컬럼 주석 참고] 기존 세이브는
+    # true_nationality가 방금 ''(기본값)로 추가됐다 — 지금 시점의 nationality
+    # 값을 "진짜 국적"의 최선의 근사치로 한 번만 복사해둔다(이 컬럼 자체가
+    # 이미 클럽 쿼터 전환으로 오염돼 있었을 수 있지만, 소급 복구할 방법이
+    # 없으므로 이 시점 이후로는 더 이상 오염되지 않는다는 것만 보장한다).
+    # true_nationality가 이미 채워진 행(이 마이그레이션 이후 새로 생성된
+    # 선수)은 건드리지 않음 — 멱등, 매번 실행해도 안전.
+    try:
+        c.execute(
+            "UPDATE ai_players SET true_nationality = nationality "
+            "WHERE (true_nationality IS NULL OR true_nationality = '') AND nationality != ''")
     except sqlite3.OperationalError:
         pass
 
@@ -2949,6 +3239,12 @@ def init_db():
         # 몰려 10초 이상 걸리는 게 확인됨. 이 인덱스로 조건에 맞는 행만
         # 바로 찾아 정렬 없이(ovr DESC를 인덱스 순서로 커버) 가져온다.
         "CREATE INDEX IF NOT EXISTS idx_aiplayers_nat_pos_ovr ON ai_players(nationality, position, ovr DESC)",
+        # [2026-09 신설, 위 true_nationality 컬럼 주석 참고] get_country_
+        # squad_players._fill()/get_country_avg_squad_ovr._fill() 1단계가
+        # 이제 nationality 대신 true_nationality로 필터한다 — 위
+        # idx_aiplayers_nat_pos_ovr과 동일한 이유(조합 인덱스 없으면 매번
+        # 전체 스캔)로 짝이 되는 인덱스도 그대로 필요하다.
+        "CREATE INDEX IF NOT EXISTS idx_aiplayers_truenat_pos_ovr ON ai_players(true_nationality, position, ovr DESC)",
         # [2026-08 신설, 신민용 요청: "세계 축구 기록실 선수 검색이 느리다"]
         # world_browser.search_ai_players()는 어떤 필터 조합이든 마지막에
         # 항상 "ORDER BY p.ovr DESC LIMIT N"으로 끝난다. ovr 단독 인덱스가
@@ -3107,6 +3403,30 @@ def init_db():
         #     약 55배.
         "CREATE INDEX IF NOT EXISTS idx_cup_matches_home ON cup_matches(home_team_id)",
         "CREATE INDEX IF NOT EXISTS idx_cup_matches_away ON cup_matches(away_team_id)",
+        # [2026-09 신설, time_probe_longrun.py 15년 장기실측으로 발견] 위
+        # idx_cup_tournaments_year_country/idx_cwc_tournaments_year 추가
+        # 당시("월드컵/대륙컵 등 열릴 때 렉이 심하다") cup_tournaments/
+        # intl_tournaments/cwc_tournaments 3개는 고쳤는데, 같은 구조의
+        # 형제 표들(cl_tournaments·el_tournaments·ecl_tournaments·
+        # sc_tournaments·lower_cup_tournaments — 나중에 추가되거나
+        # 다른 파일(lower_cup_engine.py)에서 만들어져 그때 같이 안
+        # 잡혔던 것으로 보임)은 그대로 남아 있었다. power_ranking.
+        # update_team_ratings_for_year/update_team_b_for_year가 둘 다
+        # _CLUB_COMP_TABLES 루프로 이 5개 표를 연 2회씩 "WHERE year=?"로
+        # 훑는데, year 인덱스가 없어 매번 풀스캔 — 15년 실측에서 파워랭킹
+        # 팀A값 +92%/팀B값 +148%로 유난히 크게 자란 원인.
+        "CREATE INDEX IF NOT EXISTS idx_cl_tournaments_year ON cl_tournaments(year)",
+        "CREATE INDEX IF NOT EXISTS idx_el_tournaments_year ON el_tournaments(year)",
+        "CREATE INDEX IF NOT EXISTS idx_ecl_tournaments_year ON ecl_tournaments(year)",
+        "CREATE INDEX IF NOT EXISTS idx_sc_tournaments_year ON sc_tournaments(year)",
+        "CREATE INDEX IF NOT EXISTS idx_lower_cup_tournaments_year ON lower_cup_tournaments(year)",
+        # [2026-09 신설, 같은 실측] hist.league_season_standings도 같은 병 —
+        # 기존 idx_lss_league_season은 (league_id,season) 선두라 power_
+        # ranking._update_team_a_from_league/update_team_b_for_year의
+        # "WHERE s.year=?"(연 2회)엔 못 쓰인다. 이 표는 코드 주석대로
+        # 매년 +약 10,700행씩 계속 커지는 표라(정리 없음) 풀스캔 비용도
+        # 매년 늘어난다 — 위 두 항목과 함께 팀A값/팀B값 증가의 핵심 원인.
+        "CREATE INDEX IF NOT EXISTS hist.idx_lss_year ON league_season_standings(year)",
     ]:
         try: c.execute(idx)
         except sqlite3.OperationalError: pass
@@ -3449,10 +3769,10 @@ def _prune_ai_transfer_log(conn, current_season) -> float:
             """INSERT OR IGNORE INTO ai_transfer_log_archive(
                 id, season, year, player_id, from_team_id, to_team_id,
                 player_position, player_role, is_mid_season, is_loan, salary, transfer_type, fee,
-                contract_end_year)
+                contract_end_year, loan_return_year)
                SELECT id, season, year, player_id, from_team_id, to_team_id,
                       player_position, player_role, is_mid_season, is_loan, salary, transfer_type, fee,
-                      contract_end_year
+                      contract_end_year, loan_return_year
                FROM ai_transfer_log WHERE season<?""", (_cutoff,))
         c.execute("DELETE FROM ai_transfer_log WHERE season<?", (_cutoff,))
         conn.commit()
@@ -4918,7 +5238,23 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
               "my_player_position_history",
               # [2026-08 신설] my_player 전용 연도별 평점/골/도움 아카이브도
               # 같은 이유로 비운다.
-              "my_player_season_stats"]:
+              "my_player_season_stats",
+              # [2026-09 버그수정, 신민용 리포트: "은퇴 후 새 시작 하면 완전히
+              # 처음 게임을 깔고 시작하는 거랑 같이 깨끗해야 하는데 뭐가
+              # 남는 거 같다"] 전체 테이블 81개를 이 목록과 전수 대조하고 임시
+              # DB에서 reset을 실제로 돌려 확인한 결과 아래 2개가 빠져 있었다.
+              # (1) ai_transfer_log_archive — 5시즌 지난 이적 기록이 옮겨가는
+              #     표(_prune_ai_transfer_log). world_browser.get_ai_player_team_
+              #     timeline/_team_ever_player_ids가 player_id로 UNION 조회하는데
+              #     ai_players.id가 새 게임에서 재사용되므로, 이전 판을 6년 이상
+              #     했다면 이전 판 이적 기록이 새 판 선수의 "연도별 기록" 소속팀과
+              #     팀 검색 "거쳐간 선수"에 섞여 나왔다. 바로 위 ai_transfer_log는
+              #     있는데 그 아카이브 쌍둥이만 빠진, 이 목록의 반복 누락 패턴.
+              # (2) ai_player_realstat_season — 내 경기 실측 골/도움 누적표.
+              #     player_id가 역시 ai_players.id라 이전 판 행이 새 판 선수에
+              #     붙는다(현재는 읽는 곳이 없어 화면 영향은 없지만 무한 누적).
+              "ai_transfer_log_archive",
+              "ai_player_realstat_season"]:
         c.execute(f"DELETE FROM {t}")
     # [2026-09 DB 분리 2차] hist로 옮긴 표들이 (마이그레이션이 아직 안
     # 끝났거나 한 번 실패한 세이브에서) main에 그대로 남아있을 수 있다 —
@@ -4948,6 +5284,14 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
     c.execute("DELETE FROM meta WHERE key LIKE 'recent_search_%'")
     _rst_mark("표 비우기(DELETE)")
     c.execute("UPDATE teams SET wins=0,draws=0,losses=0,goals_for=0,goals_against=0")
+    # [2026-09 버그수정, 위 삭제 목록 주석과 같은 조사] 팀의 "흐름" 컬럼
+    # 4개(모멘텀 종류/남은 시즌, 연속 강등 횟수, 중위권 정체 횟수)는 시즌
+    # 전환마다 game_engine이 갱신하는데 새 게임에서 초기화되지 않았다 —
+    # 이전 판 흐름이 새 판 첫 시즌들의 club_strength 변화와 승강 판정에
+    # 그대로 이어졌다. 스키마 기본값(ALTER TABLE ... DEFAULT ''/0)과 같은
+    # "완전 새 설치" 상태로 되돌린다.
+    c.execute("UPDATE teams SET momentum_type='', momentum_seasons_left=0, "
+              "relegation_streak=0, stagnation_streak=0")
     _reset_teams_to_league_data(c)
     _rst_mark("팀/리그 원본 복원")
     _regenerate_ai_players(c, progress_cb=progress_cb, skip_generation=skip_ai_regen)
@@ -4962,6 +5306,19 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
     try:
         import game_engine
         game_engine._invalidate_state_cache()
+    except Exception:
+        pass
+    # [2026-09 신설, 위 삭제 목록 주석과 같은 조사] "은퇴 → 새 게임"은 앱을
+    # 새로 켜는 것과 달리 같은 파이썬 프로세스 안에서 이어지므로, DB를
+    # 비워도 모듈 전역 캐시는 이전 판 값을 그대로 들고 있다. 대부분은 대회
+    # 생성/시즌 전환 때 스스로 비워지지만 game_engine._week_intl_cl_day_cache
+    # ((주차, 내 팀, 시즌) → 국제대회·챔스 경기일)는 어디서도 안 비워져서,
+    # 같은 팀으로 다시 시작하면 이전 판 일정 기준 날짜가 쓰일 수 있었다.
+    # 이 캐시와, 팀 OVR/포메이션 등 팀 단위 캐시 묶음을 같이 비운다.
+    try:
+        import game_engine
+        game_engine._week_intl_cl_day_cache.clear()
+        game_engine._invalidate_team_ovr_cache()
     except Exception:
         pass
 
@@ -5110,7 +5467,14 @@ def set_ai_player_nationality(player_id: int, nationality: str, conn=None) -> bo
     들어가면 화면상 국기가 안 붙거나 존재하지 않는 나라가 될 수 있다 —
     countries 테이블에 실제 존재하는 이름인지 검증한 뒤에만 반영한다.
     선수가 없거나(retired 등 ai_players에 없는 id 포함) 국가명이 유효하지
-    않으면 아무것도 바꾸지 않고 False."""
+    않으면 아무것도 바꾸지 않고 False.
+
+    [2026-09 수정, 위 true_nationality 컬럼 주석 참고] 이건 클럽 쿼터
+    전환(_enforce_foreign_quota_worldwide 등)과 달리 사용자가 그 선수의
+    진짜 정체성을 직접 다시 지정하는 행위이므로, nationality와
+    true_nationality를 함께 갱신한다 — 이렇게 편집한 선수는 곧바로 그
+    나라 대표팀 자격도 갖게 된다(클럽 쿼터용 임시 전환과 달리 의도된
+    변경)."""
     _own = conn is None
     conn = conn or get_conn()
     try:
@@ -5120,7 +5484,8 @@ def set_ai_player_nationality(player_id: int, nationality: str, conn=None) -> bo
         valid = conn.execute("SELECT 1 FROM countries WHERE name=?", (nationality,)).fetchone()
         if not valid:
             return False
-        conn.execute("UPDATE ai_players SET nationality=? WHERE id=?", (nationality, player_id))
+        conn.execute("UPDATE ai_players SET nationality=?, true_nationality=? WHERE id=?",
+                     (nationality, nationality, player_id))
         conn.commit()
         return True
     finally:
@@ -6084,7 +6449,11 @@ def get_country_avg_squad_ovr(country, positions=None, min_count=8, top_n=3):
                 slot_groups[i] = [r["ovr"] for r in rows]
                 used_ids.update(r["id"] for r in rows)
 
-    _fill("ap.nationality=?", (country,))
+    # [2026-09 수정, 위 true_nationality 컬럼 주석 참고] 1단계(진짜 국적
+    # 태그)는 nationality 대신 true_nationality로 필터한다 — nationality는
+    # 클럽 외국인 쿼터 전환(_enforce_foreign_quota_worldwide 등)으로 바뀔
+    # 수 있어 "그 나라 실제 대표팀 수준"과 무관한 값이 섞일 수 있었다.
+    _fill("ap.true_nationality=?", (country,))
     if sum(1 for s in slot_groups if s) < min_count:
         _fill("cn.name=?", (country,))
     if sum(1 for s in slot_groups if s) < min_count:
@@ -6165,8 +6534,24 @@ def get_country_squad_players(country, positions=None, min_count=8, target_ovr=N
     _stat_cols = ",".join(f"ap.{s}" for s in ALL_STATS)
     _OVR_CAP_MARGIN = 18
     _ovr_cap = round(target_ovr) + _OVR_CAP_MARGIN if target_ovr is not None else None
+    # [2026-09 버그수정, 신민용 리포트: "국대를 어떻게 뽑는지 모르겠는데
+    # 상위권이여도 안뽑히는 애들이 있던데 — 97을 거르고 85를 데려갈 때도
+    # 있고, S/A급 국가인데 국대로 2부 팀에서 뛰는 선수를 데리고 가기도
+    # 하더라"] 아래 _fill이 그동안 ap.position=?로 슬롯 포지션과 정확히
+    # 글자가 같은 선수만 찾았다 — 같은 카테고리(공격/미드/수비)의 호환
+    # 포지션(예: CAM 슬롯에 CM/LW/RW도 뛸 수 있음)은 아예 후보 취급을
+    # 안 했다. 그러다 보니 예를 들어 CAM 태그 국가대표급 선수가 그
+    # 나라에 부족하면, CM/LW/RW에 아무리 강한 선수가 넘쳐도 그 슬롯은
+    # 그냥 빈 채로 남거나(아래 min_count 게이트 버그, 다음 주석 참고)
+    # 곧장 해외 2부 대타로 건너뛰었다 — 신민용이 보고한 두 증상(고
+    # OVR 스킵 / S·A급 국가에 2부 외국인) 둘 다 이 경로로 설명된다.
+    # constants.POSITION_COMPAT(클럽 포메이션 배치·_pick_intl_starters가
+    # 이미 쓰고 있는 그 호환표, 새로 만들지 않고 그대로 재사용)을 이용해
+    # "정확 포지션" 단계 다음에 "호환 포지션" 단계를 추가한다 — 국적/
+    # 리그 우선순위(아래 4단계 순서)는 그대로 두고 포지션 폭만 넓힌다.
+    from constants import POSITION_COMPAT
 
-    def _fill(where_sql, params, randomize=False, match_ovr=False, cap=True):
+    def _fill(where_sql, params, randomize=False, match_ovr=False, cap=True, compat=False):
         for i, pos in enumerate(positions):
             if slots[i] is not None:
                 continue
@@ -6174,6 +6559,19 @@ def get_country_squad_players(country, positions=None, min_count=8, target_ovr=N
             _cap = _ovr_cap if cap else None
             cap_sql = " AND ap.ovr<=?" if _cap is not None else ""
             cap_params = (_cap,) if _cap is not None else ()
+            if compat:
+                # 정확 포지션 단계에서 이미 못 찾은 슬롯만 여기 도달하므로,
+                # 호환표에 그 슬롯 자신(예: "CAM")이 포함돼 있어도 중복
+                # 걱정 없이 그대로 IN절에 넣는다(POSITION_COMPAT은 고정
+                # 상수 목록이라 SQL 인젝션 위험 없음 — _check_selection의
+                # group_members 조립과 동일한 기존 패턴).
+                _compat_list = POSITION_COMPAT.get(pos, [pos])
+                pos_ph = ",".join("'%s'" % pp for pp in _compat_list)
+                pos_sql = f"ap.position IN ({pos_ph})"
+                pos_params = ()
+            else:
+                pos_sql = "ap.position=?"
+                pos_params = (pos,)
             if match_ovr and target_ovr is not None:
                 order_by = "ABS(ap.ovr - ?) ASC"
                 order_params = (target_ovr,)
@@ -6198,9 +6596,9 @@ def get_country_squad_players(country, positions=None, min_count=8, target_ovr=N
                                t.name AS club, t.current_tier AS club_tier, cn.name AS club_country
                         FROM ai_players ap JOIN teams t ON ap.team_id=t.id
                         JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
-                        WHERE {where_sql} AND ap.position=? AND ap.id NOT IN ({ph}){cap_sql}
+                        WHERE {where_sql} AND {pos_sql} AND ap.id NOT IN ({ph}){cap_sql}
                         ORDER BY {order_by} LIMIT 1""",
-                    (*params, pos, *cap_params, *order_params)).fetchone()
+                    (*params, *pos_params, *cap_params, *order_params)).fetchone()
             except sqlite3.OperationalError:
                 # [방어] intl_score 커스텀 함수 등록이 어떤 이유로든 실패한
                 # 아주 예외적인 환경 — 예전 27세 대칭 공식으로 폴백해 선발
@@ -6211,9 +6609,9 @@ def get_country_squad_players(country, positions=None, min_count=8, target_ovr=N
                                t.name AS club, t.current_tier AS club_tier, cn.name AS club_country
                         FROM ai_players ap JOIN teams t ON ap.team_id=t.id
                         JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
-                        WHERE {where_sql} AND ap.position=? AND ap.id NOT IN ({ph}){cap_sql}
+                        WHERE {where_sql} AND {pos_sql} AND ap.id NOT IN ({ph}){cap_sql}
                         ORDER BY {_fallback_order} LIMIT 1""",
-                    (*params, pos, *cap_params, *order_params)).fetchone()
+                    (*params, *pos_params, *cap_params, *order_params)).fetchone()
             if row:
                 slots[i] = dict(row)
                 used_ids.add(row["id"])
@@ -6243,17 +6641,108 @@ def get_country_squad_players(country, positions=None, min_count=8, target_ovr=N
     # target_ovr+18 상한을 유지한다 — 국적과 무관한 필러에 우연히 세계
     # 최정상급이 꽂히는 것까지 허용하면 그건 그 나라의 실제 실력과
     # 무관한 순수 난수 왜곡이라 막는 게 맞다.
-    _fill("ap.nationality=?", (country,), cap=False)
-    if sum(1 for s in slots if s) < min_count:
+    # [2026-09 버그수정, 신민용 리포트: "독일 대표팀에 스페인 사람이
+    # 나온다"] 1단계(진짜 국적 태그된 선수)를 nationality 대신
+    # true_nationality로 필터하도록 수정 — nationality는 클럽 외국인
+    # 쿼터 초과시 강제 전환될 수 있어(_enforce_foreign_quota_worldwide/
+    # _enforce_foreign_quota_on_join, 선수를 지우지 않고 국적만 자국으로
+    # 바꾸는 방식) 그 흔적이 국가대표 선발에까지 그대로 흘러들어왔다.
+    # true_nationality는 선수 생성 시점에 한 번만 정해지고 이후 절대
+    # 안 바뀌므로(database.py true_nationality 컬럼 마이그레이션 주석
+    # 참고), 이제 국가대표는 항상 "진짜" 그 나라 국적 선수만 1단계에서
+    # 뽑힌다.
+    # [2026-09 버그수정, 신민용 리포트: "상위권이여도 안뽑히는 애들이
+    # 있던데" — 근본원인 조사] 예전엔 각 단계 진입 조건이 "지금까지
+    # 채운 슬롯 합계가 min_count(8) 미만이면 다음 단계 실행"이었다 —
+    # 슬롯 26개를 합쳐서 하나의 기준으로 본 것. 그런데 GK/CB/CM/ST처럼
+    # 슬롯이 여러 개인 포지션이 먼저 다 채워져 합계가 금방 8을 넘어가
+    # 버리면, 정작 그 나라에 CAM 태그 선수가 하나도 없어서 못 채운
+    # 슬롯 하나만 남아있어도 다음 단계(자국리그/호환포지션/해외)가
+    # 아예 실행되지 않고 그 슬롯만 영구히 빈 채로 남았다 — "상위권
+    # 선수가 있는데도 그 나라 대표팀이 그 자리만 비어 보이거나, 다른
+    # 나라에서 뽑아온 대타가 들어간" 원인. 이제 "아직 안 채워진 슬롯이
+    # 하나라도 있으면" 다음 단계를 실행한다(이미 채운 슬롯은 _fill
+    # 내부에서 곧바로 건너뛰므로 비용 증가는 미미하다) — 신민용 테스트
+    # 케이스 "자국 1부에 적합 선수가 없지만 자국 2부에 있으면 그쪽을
+    # 먼저 쓴다"도 이 수정으로 자연히 만족된다(2단계 cn.name=?은 원래
+    # 그 나라 리그 전체·부수 무관이었는데, 예전엔 애초에 이 단계까지
+    # 못 왔을 뿐).
+    #
+    # 순서(신민용 확정): ①정확 포지션·진짜 국적 → ②호환 포지션(POSITION_
+    # COMPAT)·진짜 국적 → ③정확 포지션·자국 리그(부수 무관) → ④호환
+    # 포지션·자국 리그 → ⑤그래도 부족할 때만 해외 대타(대륙 우선 →
+    # 전체, target_ovr±상한 유지, 호환 포지션까지 포함해 더 잘 맞는
+    # 대타를 찾는다).
+    _fill("ap.true_nationality=?", (country,), cap=False)
+    if any(s is None for s in slots):
+        _fill("ap.true_nationality=?", (country,), cap=False, compat=True)
+    if any(s is None for s in slots):
         _fill("cn.name=?", (country,), cap=False)
-    if sum(1 for s in slots if s) < min_count:
+    if any(s is None for s in slots):
+        _fill("cn.name=?", (country,), cap=False, compat=True)
+    if any(s is None for s in slots):
         _init_nationality_tables()
         cont = _COUNTRY_CONTINENT.get(country, "")
-        _fill("t.current_tier>=2 AND cn.continent=? AND cn.name!=?", (cont, country), match_ovr=True)
-    if sum(1 for s in slots if s) < min_count:
-        _fill("t.current_tier>=2 AND cn.name!=?", (country,), match_ovr=True)
+        _fill("t.current_tier>=2 AND cn.continent=? AND cn.name!=?", (cont, country),
+              match_ovr=True, compat=True)
+    if any(s is None for s in slots):
+        _fill("t.current_tier>=2 AND cn.name!=?", (country,), match_ovr=True, compat=True)
     conn.close()
     return [s for s in slots if s]
+
+
+# [2026-09 신설 → 같은 세션에서 바로 재설계, 신민용+advisor 확정] 이
+# 자리에 있던 get_country_squad_by_group(포지션 그룹별 intl_score 상위
+# LIMIT)는 "①번 선발점수 다요소화" 단계에서 intl_engine._build_intl_
+# squad_by_group으로 완전히 대체됐다(그룹별 목표 인원 자체는 그대로,
+# 순위 기준만 순수 OVR-나이에서 OVR+폼+경험 다요소로 교체 — 폼 추정에
+# 필요한 함수들이 intl_engine.py에 있어 그쪽에 두는 게 맞다). 이 자리엔
+# 이제 그 다요소 함수가 쓰는 순수 데이터 조회 함수 두 개만 남는다.
+
+
+# [2026-09 신설, 신민용+advisor 확정 — "①번 선발점수를 다요소화하되
+# OVR/폼/경험은 데이터 접근(SQL)이고 실제 점수 계산·정규화는 game_engine/
+# intl_engine의 폼 추정 함수들을 재사용해야 한다"] 다요소 선발점수 계산
+# 자체는 intl_engine.py(_check_selection과 같은 위치)에 두는 게 맞다 —
+# 거기 있는 _intl_form_raw/_normalize_form/_intl_tier_penalty를 그대로
+# 재사용해야 "내 선수"와 "AI 선수"가 항상 같은 기준으로 경쟁한다.
+# database.py는 아래 두 개의 순수 데이터 조회 함수만 제공하고, 점수
+# 계산·정렬은 intl_engine._build_intl_squad_by_group(신설)이 담당한다.
+def get_country_nationals_for_positions(country, positions):
+    """positions(포지션 문자열 목록)에 해당하는 이 나라(true_nationality)
+    선수 전원을 제한 없이 반환 — 순위/필터링은 호출부(intl_engine) 담당.
+    get_country_nationals_for_positions/get_country_squad_players와 같은 스탯 컬럼 구성."""
+    if not positions:
+        return []
+    conn = get_conn()
+    pos_ph = ",".join("'%s'" % p for p in positions)
+    _stat_cols = ",".join(f"ap.{s}" for s in ALL_STATS)
+    rows = conn.execute(
+        f"""SELECT ap.id, ap.name, ap.position, ap.ovr, ap.age, ap.peak_ovr, ap.sub_role,
+                   {_stat_cols},
+                   t.name AS club, t.current_tier AS club_tier, cn.name AS club_country
+            FROM ai_players ap JOIN teams t ON ap.team_id=t.id
+            JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
+            WHERE ap.true_nationality=? AND ap.position IN ({pos_ph})""",
+        (country,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_player_total_intl_appearances(player_ids):
+    """player_ids 각각의 역대(전 대회 합산) 국가대표 통산 출전 횟수 —
+    intl_squad.appearances를 player_id로 묶어 합산한다. 다요소 선발점수의
+    "대표팀 경험" 항목용(intl_engine._intl_experience_score가 이 값을
+    포화함수에 넣는다)."""
+    if not player_ids:
+        return {}
+    conn = get_conn()
+    ph = ",".join("?" * len(player_ids))
+    rows = conn.execute(
+        f"SELECT player_id, SUM(appearances) AS total FROM intl_squad "
+        f"WHERE player_id IN ({ph}) GROUP BY player_id", player_ids).fetchall()
+    conn.close()
+    return {r["player_id"]: (r["total"] or 0) for r in rows}
 
 
 def _my_player_intl_slot(tournament_id, country):
@@ -6393,8 +6882,10 @@ def _apply_intl_breakout(country, picked):
     max_count = _INTL_BREAKOUT_MAX_COUNT.get(grade, 0)
     floor = _INTL_BREAKOUT_FLOOR.get(grade, 90)
     conn = get_conn()
+    # [2026-09 수정, 위 true_nationality 컬럼 주석 참고] "이 나라의 지금
+    # 실제 재능 풀"은 진짜 국적 기준이어야 하므로 true_nationality로 센다.
     row = conn.execute(
-        "SELECT COUNT(*) AS n FROM ai_players WHERE nationality=? AND ovr>=?",
+        "SELECT COUNT(*) AS n FROM ai_players WHERE true_nationality=? AND ovr>=?",
         (country, floor)).fetchone()
     conn.close()
     cur_count = row["n"] if row else 0
@@ -6441,10 +6932,18 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
     가는거야 — 지금은 경기할 때마다 국대 26명이 매번 새로 뽑힌다, 이러면
     안돼"] 이 대회(tournament_id)에서 이 나라(country)가 이미 26인을
     뽑아둔 적이 있으면(intl_squad 테이블) 그 명단을 그대로 재사용하고,
-    없으면 이번에 처음 get_country_squad_players로 뽑아서 고정 저장한다
+    없으면 이번에 처음 intl_engine._build_intl_squad_by_group으로 뽑아서
+    고정 저장한다
     — 조별리그에서 만났든 결승에서 다시 만났든, 같은 대회 안에서는
     항상 같은 26명이다. tournament_id 기반이라 월드컵뿐 아니라 유로/
     AFCON/지역컵 등 모든 국제대회에 동일하게 적용된다.
+    [2026-09 수정] positions 인자는 하위호환을 위해 계속 받지만 더는
+    쓰이지 않는다(예전엔 고정 포지션 슬롯 리스트였으나, 이제 26인 선발
+    자체는 constants.INTL_SQUAD_GROUP_QUOTA 기준 — get_country_squad_
+    by_group 주석 참고). 호출부(intl_engine._pick_intl_starters 등)는
+    여전히 _INTL_MATCHDAY_FULL_POS를 넘기고 있으며, 그건 그대로 두 번째
+    용도(_pick_intl_starters가 26인 풀에서 실제 포메이션 슬롯에 주전을
+    배치할 때)에 계속 쓰인다 — 이 함수 자체의 26인 "선발"과는 이제 무관.
 
     반환: get_country_squad_players와 동일한 필드 구성 + "appearances"
     (이 대회에서 실제 라인업에 포함된 횟수, 처음 뽑히면 전부 0).
@@ -6499,7 +6998,8 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
         # 절대 건드리지 않는다(뺄 사람이 없으면 그냥 둔다).
         _my_pos = _my_player_intl_slot(tournament_id, country)
         if _my_pos:
-            _target = len(positions) - 1
+            from constants import INTL_SQUAD_TOTAL
+            _target = INTL_SQUAD_TOTAL - 1
             _cut = [r for r in result if not r["appearances"]]
             _cut.sort(key=lambda r: ((r["ovr"] or 0), -(r["age"] or 0)))
             _drop_ids = set()
@@ -6553,25 +7053,40 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
                 # 아직 이 대회 출전 기록(appearances)이 없으므로 그것만
                 # 기준으로 삼는다.
                 _my_pos_inh = _my_player_intl_slot(tournament_id, country)
-                if _my_pos_inh and len(picked) > len(positions) - 1:
+                from constants import INTL_SQUAD_TOTAL
+                if _my_pos_inh and len(picked) > INTL_SQUAD_TOTAL - 1:
                     picked.sort(key=lambda r: ((r["ovr"] or 0), -(r["age"] or 0)))
-                    picked = picked[len(picked) - (len(positions) - 1):]
+                    picked = picked[len(picked) - (INTL_SQUAD_TOTAL - 1):]
 
     if picked is None:
-        # [2026-08 신설] 내가 이 대표팀에 발탁됐으면 내가 엔트리 한 자리를
-        # 차지하므로, AI는 25명만 뽑는다. 빼는 자리는 "내 포지션과 같은
-        # 자리 하나" — 내가 ST면 ST 한 자리를 내가 메우는 셈이라 포지션
-        # 구성이 자연스럽게 유지된다(같은 포지션 자리가 없으면 맨 끝
-        # 자리를 하나 줄인다).
+        # [2026-09 재설계, 신민용 리포트: "RW 90/83/82가 있어도 최대 1명만
+        # 뽑힌다" — get_country_squad_players(고정 포지션 슬롯) 대신
+        # 포지션 그룹별 목표 인원으로 교체. [2026-09 추가 재설계, 신민용+
+        # advisor 확정] 그룹 안의 순위도 더 이상 순수 OVR(intl_score)이
+        # 아니라 다요소 선발점수(OVR+폼+경험, 나이별 가중치) — intl_engine.
+        # _build_intl_squad_by_group이 담당(database.py는 데이터 조회만,
+        # 점수 계산은 폼 추정 함수들이 있는 intl_engine.py 쪽에 둔다 —
+        # get_country_nationals_for_positions/get_player_total_intl_
+        # appearances 주석 참고). intl_engine.py가 이 함수(database.py)를
+        # 이미 임포트하고 있어 반대 방향 임포트는 지연 임포트로 순환을
+        # 피한다(intl_engine._pick_intl_starters의 "from database import
+        # get_or_create_intl_squad"와 정확히 같은 패턴, 방향만 반대).
+        # "내가 발탁되면 AI는 25명만" 원칙은 그대로 유지하되, 예전처럼
+        # 고정 리스트에서 항목 하나를 빼는 대신 내 포지션이 속한 그룹의
+        # 목표 인원을 1 줄인다(그룹 자체가 이미 0이면 — 있을 수 없는
+        # 조합이지만 방어적으로 — 가장 인원이 많은 그룹에서 하나 뺀다).
+        from constants import INTL_SQUAD_GROUP_QUOTA, INTL_POSITION_TO_GROUP
+        from intl_engine import _build_intl_squad_by_group
         _my_pos = _my_player_intl_slot(tournament_id, country)
-        _positions = list(positions)
-        if _my_pos and len(_positions) > 1:
-            if _my_pos in _positions:
-                _positions.remove(_my_pos)
-            else:
-                _positions.pop()
-        picked = get_country_squad_players(country, positions=_positions, min_count=8,
-                                            target_ovr=round(avg_ovr) if avg_ovr is not None else None)
+        _quota = dict(INTL_SQUAD_GROUP_QUOTA)
+        if _my_pos:
+            _my_grp = INTL_POSITION_TO_GROUP.get(_my_pos)
+            if _my_grp and _quota.get(_my_grp, 0) > 0:
+                _quota[_my_grp] -= 1
+            elif _quota:
+                _biggest = max(_quota, key=_quota.get)
+                _quota[_biggest] = max(0, _quota[_biggest] - 1)
+        picked = _build_intl_squad_by_group(country, quota_by_group=_quota)
     if not picked:
         return []
     # [2026-09 신설, 신민용 요청: "국가 등급은 90+ 선수를 얼마나 자주
@@ -6585,10 +7100,14 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
     # 조건과 맞아떨어진다.
     _apply_intl_breakout(country, picked)
     conn3 = get_conn()
+    # [2026-09 신설] 이 대회에서 처음 26인이 확정되는 "바로 이 시점"의
+    # ap.position을 함께 스냅샷 저장 — 위 ALTER TABLE 주석 참고. picked의
+    # 각 행은 get_country_squad_players/예선 승계 경로 둘 다 이미
+    # ap.position을 "position" 키로 담고 있으므로 재조회 없이 그대로 쓴다.
     conn3.executemany(
-        "INSERT OR IGNORE INTO intl_squad(tournament_id, country, player_id, appearances) "
-        "VALUES (?,?,?,0)",
-        [(tournament_id, country, r["id"]) for r in picked])
+        "INSERT OR IGNORE INTO intl_squad(tournament_id, country, player_id, appearances, position) "
+        "VALUES (?,?,?,0,?)",
+        [(tournament_id, country, r["id"], r.get("position") or "") for r in picked])
     conn3.commit()
     conn3.close()
     for r in picked:
@@ -8041,12 +8560,17 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
         _rows, star_kind_by_slot, team.get("cname", ""), continent,
         _quota_lo, _foreign_count, starter_floor=_starter_floor)
 
+    # [2026-09 신설, 위 true_nationality 컬럼 주석 참고] 월드시드 시점에
+    # 정해진 국적(_topup_foreign_floor까지 전부 반영된 최종값)을 그대로
+    # true_nationality에도 복사해 넣는다 — 이 시점 이후로 nationality가
+    # 클럽 쿼터 때문에 바뀌어도 true_nationality는 절대 안 바뀐다.
+    _rows_ins = [r[:22] + (r[21],) + r[22:] for r in _rows]
     c.executemany("""INSERT INTO ai_players
         (team_id,name,position,stamina,speed,jump,strength,shooting,passing,
          dribbling,tackling,heading,positioning,setpiece,
          mental,confidence,leadership,concentration,ovr,age,sub_role,nationality,
-         potential_ovr)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", _rows)
+         true_nationality,potential_ovr)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", _rows_ins)
     # [2026-09 버그수정, 신민용 리포트: "첫 입단인데 계약년도만 뜨고
     # 계약기간이 안 뜬다 — 84억(계약년도:2000) 말고 84억(계약:5년)로
     # 떠야지"] ai_lifecycle.py의 신인생성 3곳(은퇴대체/스쿼드보충 등)은

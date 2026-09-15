@@ -16,6 +16,7 @@ intl_engine.py ─ 국제대회(월드컵/대륙컵) 엔진
 """
 
 import random
+import math
 
 from database import get_conn
 
@@ -1982,6 +1983,224 @@ def _intl_tier_penalty(tier):
     return {2: -4.0, 3: -9.0, 4: -15.0}.get(t, -18.0)
 
 
+# [2026-09 재설계, 신민용 확정: "나이 가중치를 넣을 이유가 거의 없다 —
+# 국대 선발 점수는 OVR + 폼 보정 + 경험 보너스 + 리그 보정으로 끝내고,
+# 모르는 정보는 0으로 두고 있는 정보만 가산한다"]
+# 예전 구조는 (OVR, 폼, 경험)을 나이별 가중치(합계 1.0, 18세 OVR 80% →
+# 33세 OVR 42%)로 섞었다. 그런데 경험 점수는 대표팀 출전이 없으면 0이라,
+# 나이가 많을수록 경험 비중만큼 점수가 그대로 날아갔다 — 게임 시작
+# 시점(전원 출전 0)엔 사실상 "나이 벌점"이었다(실측: 폼 동일일 때 21세
+# OVR92=83.0점, 19세 OVR85=79.2점, 27세 OVR98=75.5점, 29세 OVR95=69.5점
+# — 신민용 리포트 "프랑스 RB 98/95를 두고 92를 뽑는다"의 원인). 뽑힌 어린
+# 선수만 출전이 쌓이니 해가 갈수록 굳어지는 구조이기도 했다.
+# 이제 나이는 선발 점수에 전혀 안 들어간다(노화에 따른 OVR 하락은 이미
+# peak_ovr 노화 곡선이 OVR 자체에 반영하므로 따로 넣을 필요가 없다).
+# OVR이 기본 서열이고, 아래 두 보정은 OVR 차이가 몇 점 이내일 때만
+# 순위를 뒤집을 수 있는 크기로 제한한다.
+_INTL_FORM_ADJ_MAX = 3.0        # 폼 보정 ±3
+_INTL_FORM_ADJ_PER_SD = 1.5     # 포지션 평균 대비 1표준편차당 +1.5 (2SD에서 상한)
+_INTL_FORM_MIN_POOL = 8         # 같은 포지션 비교 표본이 이보다 적으면 폼 보정 0
+_INTL_FORM_SD_FLOOR = 0.03      # 표본 분산이 비정상적으로 작을 때 z 폭주 방지
+_INTL_EXP_BONUS_MAX = 2.0       # 경험 보너스 0 ~ +2
+
+
+def _intl_experience_score(appearances, cap=50):
+    """대표팀 통산 출전(appearances, 전 대회 합산)을 sqrt 포화곡선으로
+    0~100 정규화 — [2026-09 신설, 신민용 리포트: "34세 국대 110경기와
+    25세 국대 12경기를 그대로 점수화하면 노장에게 너무 강한 보너스가
+    붙는다 / 100회는 60회와 거의 차이 없어야 한다"] cap(기본 50경기)
+    이상은 전부 sqrt(cap)로 동일 취급 — cap을 넘는 순간 60경기든
+    100경기든 정확히 같은 점수가 되어 "그 이상은 더 안 유리해지는"
+    요구를 그대로 만족한다."""
+    capped = min(max(appearances or 0, 0), cap)
+    return 100.0 * math.sqrt(capped) / math.sqrt(cap)
+
+
+def intl_squad_selection_score(ovr, tier, form_adj, appearances):
+    """[2026-09 재설계, 위 _INTL_FORM_ADJ_MAX 주석 참고] 국가대표 26인 선발
+    최종 점수 = OVR + 폼 보정(±3) + 경험 보너스(0~+2) + 리그 보정
+    (_intl_tier_penalty, 기존 함수·값 그대로). 나이는 인자로도 안 받는다.
+    form_adj는 호출부(_intl_form_adjustments)가 이미 ±3으로 계산해 넘기며,
+    정보가 없으면 0(또는 None)이다. 경험은 벌점이 아니라 보너스라 출전
+    0회면 정확히 +0이다. 포지션 적합도는 여기 안 섞는다(호출부가 곱한다)."""
+    exp_bonus = _intl_experience_score(appearances) / 100.0 * _INTL_EXP_BONUS_MAX
+    return (ovr or 0) + (form_adj or 0.0) + exp_bonus + _intl_tier_penalty(tier)
+
+
+def _intl_form_adjustments(candidates):
+    """[2026-09 신설, 신민용 확정: "폼도 _estimate_ai_season의 랜덤 추정값을
+    쓰지 말고, 직전 시즌 실제 기록이 있으면 쓰고 없으면 0"] candidates
+    (get_country_nationals_for_positions 행 목록)의 폼 보정값(±3)을
+    {player_id: adj}로 돌려준다 — 기록이 없는 선수는 dict에 아예 없다(=0).
+
+    데이터: hist.ai_player_season_stats(세계기록실 "연도별 기록"의 평균평점과
+    같은 원본)에서 각 선수의 가장 최근 확정 시즌(올해 또는 작년)을 쓴다.
+    [주의 — 헤드리스 실측으로 확인한 사실] AI 평점은 개별 경기 결과가 아니라
+    `6.0 + (그 시즌 OVR-60)/35 + 골×0.02 + 도움×0.015`로 기록된다. 평점을
+    그대로 비교하면 OVR을 한 번 더 세는 셈이 되므로, 그 시즌 OVR
+    (hist.ai_player_ovr_history, 같은 year)로 기대 평점을 빼서 "OVR로
+    설명되지 않는 몫"(=그 시즌 골·도움 성과)만 남긴다. 이 잔차는 포지션마다
+    크기가 전혀 달라서(실측 평균: CB/RB/GK 약 0.03, CM 0.12, 윙어 0.16,
+    ST 0.24) 같은 포지션 후보끼리 평균·표준편차로 z점수화한 뒤 1SD당 1.5점,
+    ±3점에서 자른다. 같은 포지션 표본이 _INTL_FORM_MIN_POOL(8) 미만이면
+    평균 자체를 신뢰할 수 없으므로 그 포지션은 전원 0이다(작은 나라).
+    예전 방식(min-max 40~100 정규화 × 가중치)은 극단치 하나가 전체 스케일을
+    결정해 난수만으로 8~17점이 흔들렸다 — z점수+상한은 그 폭을 ±3으로 묶는다.
+    역할(주전/로테이션/대기)은 AI 평점 기록에 반영돼 있지 않다(실측: 역할별
+    잔차 평균이 0.090~0.099로 동일) — 여기서도 쓰지 않는다."""
+    if not candidates:
+        return {}
+    from game_engine import get_state
+    import statistics as _stats
+    ids = [c["id"] for c in candidates]
+    try:
+        cur_year = (get_state() or {}).get("current_year")
+    except Exception:
+        cur_year = None
+    if not cur_year:
+        return {}
+    try:
+        from database import history_drain
+        history_drain()   # 방금 큐에 들어간 43주차 스냅샷까지 읽기 위함(read-after-write)
+    except Exception:
+        pass
+    conn = get_conn()
+    latest = {}   # pid -> (year, rating, season_ovr)
+    try:
+        for i in range(0, len(ids), 500):   # SQLite IN(...) 500개씩 청크(프로젝트 관례)
+            chunk = ids[i:i + 500]
+            ph = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"""SELECT s.player_id AS pid, s.year AS year, s.rating AS rating, h.ovr AS ovr
+                    FROM hist.ai_player_season_stats s
+                    JOIN hist.ai_player_ovr_history h ON h.player_id = s.player_id AND h.year = s.year
+                    WHERE s.player_id IN ({ph}) AND s.year IN (?, ?) AND s.matches > 0""",
+                (*chunk, cur_year, cur_year - 1)).fetchall()
+            for r in rows:
+                if r["rating"] is None or r["ovr"] is None:
+                    continue
+                prev = latest.get(r["pid"])
+                if prev is None or r["year"] > prev[0]:
+                    latest[r["pid"]] = (r["year"], r["rating"], r["ovr"])
+    except Exception:
+        latest = {}
+    finally:
+        conn.close()
+    if not latest:
+        return {}
+    resid_by_pos: dict = {}
+    for c in candidates:
+        rec = latest.get(c["id"])
+        if rec is None:
+            continue
+        _y, rating, season_ovr = rec
+        resid = rating - (6.0 + (season_ovr - 60) / 35.0)
+        resid_by_pos.setdefault(c["position"], []).append((c["id"], resid))
+    out = {}
+    for pos, lst in resid_by_pos.items():
+        if len(lst) < _INTL_FORM_MIN_POOL:
+            continue
+        vals = [v for _, v in lst]
+        mean = _stats.fmean(vals)
+        sd = max(_stats.pstdev(vals), _INTL_FORM_SD_FLOOR)
+        for pid, v in lst:
+            adj = (v - mean) / sd * _INTL_FORM_ADJ_PER_SD
+            out[pid] = max(-_INTL_FORM_ADJ_MAX, min(_INTL_FORM_ADJ_MAX, adj))
+    return out
+
+
+def _intl_group_fit(position, group):
+    """[2026-09 신설, 신민용+advisor 확정 — "포지션 적합도는 최종 점수와
+    분리, 곱연산으로"] position이 group에 얼마나 어울리는지(0~1) —
+    constants.INTL_GROUP_FIT(기존 POSITION_COMPAT의 "존재 여부"를 숫자
+    등급으로 확장한 표) 조회. 그룹 핵심 포지션(정확히 그 그룹 소속)은
+    항상 1.00, 표에 없는 조합은 0(그 그룹 후보 자격 자체가 없음)."""
+    from constants import INTL_POSITION_GROUPS, INTL_GROUP_FIT
+    if position in INTL_POSITION_GROUPS.get(group, []):
+        return 1.00
+    return INTL_GROUP_FIT.get(group, {}).get(position, 0.0)
+
+
+def _build_intl_squad_by_group(country, quota_by_group=None):
+    """[2026-09 신설, 신민용+advisor 확정] database.get_country_squad_
+    by_group이 하던 "그룹별 SQL ORDER BY(순수 OVR-나이 intl_score) LIMIT"을
+    대체 — 그룹별 진짜 국적자 후보 전원을 가져와(database.
+    get_country_nationals_for_positions), intl_squad_selection_score
+    (OVR + 폼 보정 ±3 + 경험 보너스 0~+2 + 리그 보정, 나이 미반영)로 최종
+    순위를 매겨 그룹 목표 인원만큼 뽑는다.
+    [2026-09 재설계] 예전엔 폼을 _estimate_ai_season 난수 추정 + min-max
+    정규화로 만들고 나이별 가중치로 섞었다 — intl_squad_selection_score/
+    _intl_form_adjustments 주석 참고. (주의: _check_selection(내 선수 발탁
+    판정)은 아직 예전 OVR×0.45+정규화폼×0.55 공식 그대로라 이 함수와
+    기준이 같지 않다 — 별도 과제.)
+    [2026-09 확장, 신민용+advisor 확정 — "②포지션 적합도"] 후보 풀을
+    그룹 핵심 포지션만이 아니라 _intl_group_fit>0인 인접 포지션까지
+    넓히고, 최종 점수에 적합도를 곱한다(선발점수 자체에는 안 섞음 —
+    advisor 확정: "포지션 점수는 최종 점수와 분리"). 곱연산이라 격차가
+    아주 크지 않은 한 핵심 포지션 후보가 자연히 이긴다 — 예: ST 95
+    (적합도 0.45)가 RW 88(적합도 1.00) 자리를 차지하려면 기본 선발점수
+    차이가 적합도 격차(0.55배)를 뒤집을 만큼 압도적이어야 한다(기본값은
+    반대 — 핵심 포지션이 이긴다)."""
+    from constants import INTL_POSITION_GROUPS, INTL_GROUP_FIT, INTL_SQUAD_GROUP_QUOTA
+    from database import get_country_nationals_for_positions, get_player_total_intl_appearances
+
+    quota_by_group = quota_by_group or INTL_SQUAD_GROUP_QUOTA
+
+    picked = []
+    used_ids: set = set()
+    for grp, n in quota_by_group.items():
+        if n <= 0:
+            continue
+        core_positions = INTL_POSITION_GROUPS.get(grp, [])
+        if not core_positions:
+            continue
+        # 핵심 포지션 + 적합도>0인 인접 포지션까지 후보 풀을 넓힌다.
+        candidate_positions = list(core_positions) + list(INTL_GROUP_FIT.get(grp, {}).keys())
+        all_candidates = [c for c in get_country_nationals_for_positions(country, candidate_positions)
+                           if c["id"] not in used_ids]
+        if not all_candidates:
+            continue
+        # [2026-09 버그수정 2차, 신민용 리포트: "프랑스 국대에 98~96 다
+        # 안뽑히고 95가 뽑히는데?" — 1차 수정(그룹 전체가 아니라 정확히
+        # 같은 포지션끼리만 정규화)으로는 부족했다] 인구가 많은 나라는
+        # "정확히 같은 포지션" 하나만 해도 수백~수천 명이 된다(실측:
+        # 프랑스 CB만 600명대) — 그 정도 규모에서도 _estimate_ai_season의
+        # 무작위 성분(_tailed_season_mult) 극단치 하나가 40~100 정규화
+        # 범위의 "최댓값"을 차지해 다른 후보 전원의 폼 점수를 짓눌렀다.
+        # 실제로 26인 안에 들 가능성이 있는 건 애초에 OVR 상위권뿐이므로,
+        # 포지션별로 OVR 상위 일부(그룹 목표 인원의 6배, 최소 20명)만
+        # 폼 추정 대상으로 좁힌다 — 표본이 작아지면 극단치 하나가 전체
+        # 스케일을 왜곡하는 효과도 같이 줄어들고(정말 26인 근처 경쟁만
+        # 남으므로), _estimate_ai_season 호출 수도 크게 줄어 성능도 낫다.
+        _shortlist_n = max(n * 6, 20)
+        by_pos_all: dict = {}
+        for c in all_candidates:
+            by_pos_all.setdefault(c["position"], []).append(c)
+        candidates = []
+        for pos, lst in by_pos_all.items():
+            lst.sort(key=lambda c: -(c["ovr"] or 0))
+            candidates.extend(lst[:_shortlist_n])
+        # [2026-09 재설계, intl_squad_selection_score 주석 참고] 폼은 더 이상
+        # _estimate_ai_season 난수 추정 + min-max 정규화가 아니라, 직전 확정
+        # 시즌의 실제 기록(hist)에서 ±3으로 계산한다(기록 없으면 0). 숏리스트
+        # (포지션별 OVR 상위)는 그대로 유지 — 폼 ±3·경험 +2로는 OVR 상위권
+        # 밖 선수가 뒤집을 수 없어 결과는 같고, 기록 조회 대상만 줄여준다.
+        apps_by_id = get_player_total_intl_appearances([c["id"] for c in candidates])
+        form_adj_by_id = _intl_form_adjustments(candidates)
+        scored = []
+        for c in candidates:
+            base_score = intl_squad_selection_score(
+                c["ovr"], c.get("club_tier"), form_adj_by_id.get(c["id"], 0.0),
+                apps_by_id.get(c["id"], 0))
+            fit = _intl_group_fit(c["position"], grp)
+            scored.append((base_score * fit, c))
+        scored.sort(key=lambda t: -t[0])
+        for _score, c in scored[:n]:
+            picked.append(c)
+            used_ids.add(c["id"])
+    return picked
+
+
 def _intl_ovr_gap_penalty(ovr, real_squad_ovr):
     """[2026-07 재설계, 신민용 지적: "OVR 컷은 좋은 아이디어지만 하드컷
     보다는 평균과의 격차에 따라 단계적으로 문턱이 낮아지는 게 현실적이다
@@ -2074,12 +2293,17 @@ def _check_selection(p, my_grade, country="", continent=""):
     # 각 AI 후보의 OVR 기준으로 적용한다(경쟁 자체에서 자연스럽게 밀림).
     conn = get_conn()
     ph = ",".join("'%s'" % pp for pp in group_members)
+    # [2026-09 수정, database.py true_nationality 컬럼 주석 참고] 내
+    # 선수와 경쟁하는 "동포 AI 후보 풀"도 nationality 대신 true_nationality로
+    # 걸러야 한다 — 그렇지 않으면 클럽 쿼터 전환으로 "국적만 바뀐" AI가
+    # 경쟁 풀에 섞여 들어와(또는 원래 그 나라 선수인데 빠져서) 내 선수의
+    # 국대 발탁 여부가 실제와 다르게 판정될 수 있다.
     rows = conn.execute(
         f"""SELECT ap.id, ap.ovr, ap.position, ap.sub_role, ap.age, l.tier AS tier
             FROM ai_players ap
             LEFT JOIN teams t ON ap.team_id = t.id
             LEFT JOIN leagues l ON t.league_id = l.id
-            WHERE ap.nationality=? AND ap.position IN ({ph})""", (nat,)).fetchall()
+            WHERE ap.true_nationality=? AND ap.position IN ({ph})""", (nat,)).fetchall()
     conn.close()
     from game_engine import _estimate_ai_season, _estimate_ai_clean_sheets, _calc_clean_sheets_for_player
     raw_by_id, ovr_by_id, tier_by_id = {}, {}, {}
@@ -3378,6 +3602,93 @@ def _pick_intl_starters(tournament_id, country, avg_ovr):
     return starters
 
 
+# [2026-09 신설, 신민용 리포트: "지금은 월드컵 기준 주전들만 7/7 이렇게
+# 뜨고 그 외에는 다 0/7 이렇게 뜨거든? 근데 알다시피 교체되는 카드들도
+# 있고 그러잖아"] _pick_intl_starters가 뽑는 11명은 대회 내내 완전히
+# 고정되고(의도된 설계 — 매 경기 다시 경쟁시키면 실제 대표팀과 다르게
+# 너무 자주 바뀜), bump_intl_squad_appearances는 그 고정 11명한테만
+# 출전 카운트를 올려서 벤치 15명은 영원히 0으로 남았다 — 실제로는
+# 교체 투입되는 선수가 있는데 그게 전혀 반영이 안 된 것.
+#
+# [위험 회피] 26인 전체에 매번 출전을 올려버리면 "전원 N/N"이 되는
+# 정반대 버그가 생긴다(신민용이 명시적으로 우려한 지점) — 그래서 이
+# 함수는 "이번 한 경기에 한정해" 벤치에서 소수만 무작위로 골라 반환할
+# 뿐, intl_squad에 아무것도 직접 쓰지 않는다(저장은 호출부가
+# bump_intl_squad_appearances로 starters와 합쳐서 한 번에 처리).
+#
+# [2026-09 재설계, 신민용+advisor 확정 — "④교체, 몇 명 vs 누가를
+# 분리하라"] "몇 명 교체할지"는 더 이상 이 함수가 정하지 않는다 — 그건
+# 아래 _get_intl_substitution_count(경기 결과+전력차 기반 사후 근사)의
+# 몫이고, 이 함수는 "그 인원만큼 누구를 넣을지"만 담당한다(호출부가
+# n_subs를 명시적으로 넘긴다). 후보 선정 로직 자체(GK 제외, OVR 가중
+# 무작위)는 신민용 요청대로 그대로 재사용 — "완전히 버릴 필요는 없다,
+# 앞단의 인원수 결정 부분만 결과 기반으로 바꾸면 된다".
+def _pick_intl_substitutes(starters, pool, n_subs):
+    """이번 경기에 한해 벤치에서 교체 투입되는 선수 n_subs명을 뽑는다
+    (매 경기 다시 추첨 — 고정되는 starters와 다름). GK는 제외, OVR이
+    높을수록 더 자주 뽑히는 가중치(에이스급 백업이 더 자주 교체 투입).
+    intl_squad에 아무것도 쓰지 않는 순수 함수: 호출부가 반환값을
+    starters와 합쳐 bump_intl_squad_appearances에 넘긴다."""
+    if n_subs <= 0:
+        return []
+    starter_ids = {r["id"] for r in starters}
+    bench = [r for r in pool if r["id"] not in starter_ids and r.get("position") != "GK"]
+    if not bench:
+        return []
+    n_subs = min(n_subs, len(bench))
+    bench_sorted = sorted(bench, key=lambda r: -(r.get("ovr") or 0))
+    candidates = list(bench_sorted)
+    weights = [1.0 / (idx + 1) for idx in range(len(candidates))]
+    chosen = []
+    for _ in range(n_subs):
+        if not candidates:
+            break
+        pick = random.choices(candidates, weights=weights, k=1)[0]
+        idx = candidates.index(pick)
+        candidates.pop(idx)
+        weights.pop(idx)
+        chosen.append(pick)
+    return chosen
+
+
+# [2026-09 신설, 신민용+advisor 확정 — "④교체 인원 수는 경기 결과+전력차
+# 기반 사후 근사로"] 현재 국제 AI 매치(_sim_ai_match)는 승/무/패 판정 →
+# 최종 스코어 생성이 전부라 "몇 분에 몇 대 몇" 같은 경기 중 상태 자체가
+# 없다(이벤트 단위 시뮬레이션 없음) — 그래서 "지는 중이라 공격수 투입"
+# 같은 실시간 교체 AI는 지금 구조로는 못 만든다(advisor 확인). 대신
+# "경기가 끝난 뒤, 그 결과가 어땠는지"만으로 이번 경기에 교체가 몇 명
+# 있었을지 근사한다 — 대승/대패처럼 결과가 뚜렷할수록 교체가 많고,
+# 접전일수록 적다는 게 기본 축. 여기에 "그 결과가 전력차 대비 얼마나
+# 뜻밖이었는지"(surprise)를 얹어 감쇠시킨다 — 강팀이 예상대로 크게
+# 이기면 안심하고 로테이션을 돌리지만, 약팀이 뜻밖에 크게 이기거나
+# 강팀이 뜻밖에 졌을 때는 그 결과가 불안정해 보여서 오히려 손을 덜
+# 댄다(신민용 예시: "3:0 + 전력차-5(의외의 대승) → 약간의 로테이션만").
+def _get_intl_substitution_count(my_score, opp_score, my_strength_diff, max_subs=5):
+    """이 팀 관점 최종 스코어(my_score/opp_score)와 전력차(my_strength_
+    diff, 양수=내가 우세)로 이번 경기의 교체 인원(0~max_subs)을 근사한다.
+    확률적 요소가 있어 같은 입력이어도 매 경기 조금씩 다를 수 있다."""
+    margin = my_score - opp_score
+    # 전력차 10점당 대략 골 1개 차이가 "예상되는 결과"라는 거친 환산 —
+    # 정밀한 모델이 아니라 사후 근사이므로 이 정도 선형 근사면 충분하다.
+    expected_margin = my_strength_diff / 10.0
+    surprise = abs(margin - expected_margin)
+
+    # 결과 자체의 "결정적임" 정도 — 대승이든 대패든 큰 점수차일수록
+    # 로테이션/교체 유인이 커진다(0골차 접전은 거의 안 건드림).
+    decisiveness = min(abs(margin), 4)
+    base = decisiveness * 0.9
+
+    # 결과가 전력차 대비 뜻밖일수록(예상 밖 대승/예상 밖 대패 모두) 감쇠
+    # — 최소 0.3배는 유지해 "그래도 아예 안 바꾸진 않는다"를 보장.
+    surprise_damp = max(0.3, 1.0 - surprise * 0.12)
+
+    raw = base * surprise_damp
+    n = int(raw)
+    if random.random() < (raw - n):
+        n += 1
+    return max(0, min(n, max_subs))
+
+
 def _intl_tactical_lineup(tournament_id, country, avg_ovr):
     """[2026-08 신설, 신민용 요청: "챔피언스리그처럼 다른 국가 팀이랑 하면
     라인업 평점이 안 뜬다"] 국가대표는 클럽(ai_players.team_id)과 달리
@@ -3457,14 +3768,38 @@ def _sim_ai_match(t, m, my_played=False, conn=None, reason="injury", batch=None)
     # 매번 다시 올라가 버려서 여기로 옮겨야만 했다. 실패해도(예: 아직 26인
     # 풀이 없어 새로 뽑는 중 예외 등) 출전 카운트는 부가 기능일 뿐 경기
     # 결과 자체엔 영향이 없어야 하므로 조용히 넘어간다.
+    # [2026-09 확장, 신민용 리포트: "주전들만 7/7 이렇게 뜨고 그 외에는
+    # 다 0/7 이렇게 뜨거든? 교체되는 카드들도 있고 그러잖아"] 예전엔
+    # 여기서 고정된 starters만 올렸다 — 이번 경기 한정으로 벤치에서
+    # 소수를 추첨하는 _pick_intl_substitutes를 추가해 starters와 합쳐
+    # 올린다. 26인 전체를 매번 다 올리면 "전원 N/N"이 되는 정반대 버그가
+    # 생기므로(신민용이 명시적으로 경계한 지점), 반드시 이 소수의 교체
+    # 인원만 추가한다 — _pick_intl_substitutes 자체가 intl_squad에
+    # 아무것도 쓰지 않는 순수 함수라 여기서 최종적으로 합쳐 한 번에
+    # 반영하는 구조.
+    # [2026-09 재설계, 신민용+advisor 확정 — "④교체 인원은 경기 결과+
+    # 전력차 기반 사후 근사로"] 몇 명 교체할지를 더 이상 고정 랜덤(0~3)이
+    # 아니라 _get_intl_substitution_count(이 경기의 최종 스코어+전력차)로
+    # 정한다 — 대승/대패일수록 많고, 그 결과가 전력차 대비 뜻밖일수록
+    # (예상 밖 대승/예상 밖 패배 모두) 적게 나온다. he["ovr"]-ae["ovr"]가
+    # 이미 홈 관점 전력차이므로 원정팀은 부호만 뒤집어 쓴다.
     try:
-        from database import bump_intl_squad_appearances
+        from database import bump_intl_squad_appearances, get_or_create_intl_squad
         home_starters = _pick_intl_starters(t["id"], m["home"], he["ovr"])
         away_starters = _pick_intl_starters(t["id"], m["away"], ae["ovr"])
+        _strength_diff_home = he["ovr"] - ae["ovr"]
         if home_starters:
-            bump_intl_squad_appearances(t["id"], m["home"], [r["id"] for r in home_starters])
+            home_pool = get_or_create_intl_squad(t["id"], m["home"], he["ovr"], _INTL_MATCHDAY_FULL_POS)
+            home_n_subs = _get_intl_substitution_count(hs, as_, _strength_diff_home)
+            home_subs = _pick_intl_substitutes(home_starters, home_pool, home_n_subs)
+            bump_intl_squad_appearances(
+                t["id"], m["home"], [r["id"] for r in home_starters] + [r["id"] for r in home_subs])
         if away_starters:
-            bump_intl_squad_appearances(t["id"], m["away"], [r["id"] for r in away_starters])
+            away_pool = get_or_create_intl_squad(t["id"], m["away"], ae["ovr"], _INTL_MATCHDAY_FULL_POS)
+            away_n_subs = _get_intl_substitution_count(as_, hs, -_strength_diff_home)
+            away_subs = _pick_intl_substitutes(away_starters, away_pool, away_n_subs)
+            bump_intl_squad_appearances(
+                t["id"], m["away"], [r["id"] for r in away_starters] + [r["id"] for r in away_subs])
     except Exception:
         pass
 

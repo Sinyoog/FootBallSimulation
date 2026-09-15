@@ -498,9 +498,19 @@ class MainWindow(QMainWindow):
         # 끝났을 수 있다 — 같은 임시파일(game.db.tmp)에 두 저장이 동시에
         # 접근하는 걸 막기 위해, 먼저 진행 중인 백업을 기다린 뒤 마지막
         # 동기 저장을 한 번 더 실행해 최신 상태를 확실히 남긴다.
+        # [2026-09 신설, 히스토리 writer 불변식 5] 진행 중이던 자동저장
+        # (이미 그 안에서 history_drain을 먼저 함)을 기다린 뒤, 그 사이
+        # 새로 쌓였을 수 있는 history task까지 한 번 더 마저 비우고, 그
+        # 다음에야 마지막 동기 main 저장을 한다 — main이 hist보다 앞서지
+        # 않는다는 불변식을 종료 시점에도 그대로 지킨다. drain이 실패하면
+        # (히스토리 워커 오류) 이번 종료 시 최종 저장은 건너뛴다 — main만
+        # 먼저 저장해버리면 main이 hist보다 앞서가는 상태가 되므로, 최후의
+        # 자동저장 시점 그대로 남기는 쪽이 더 안전하다(앱 종료 자체는
+        # 막지 않는다).
         try:
-            from database import flush_to_disk, wait_for_pending_flush
+            from database import flush_to_disk, wait_for_pending_flush, history_drain
             wait_for_pending_flush()
+            history_drain()
             flush_to_disk()
         except Exception:
             pass

@@ -1026,23 +1026,33 @@ def get_ai_player_salary_history(player_id):
     겨울 이적보다 먼저인 것처럼 뒤섞일 수 있었다. 여기서도 똑같이
     effective year로 정렬해서 get_ai_player_team_timeline과 항상 같은
     순서가 나오게 맞춘다.
-    반환: [(effective_year, salary, transfer_type, is_loan, fee, contract_end_year), ...] 오름차순."""
+    [2026-09 버그수정, 신민용 리포트: "임대는 보통 1~2년인데 3년으로
+    뜨고, 실제 임대 기간이랑 달라"] contract_end_year는 임대를 보낸
+    "원 소속팀과 맺은 계약"의 만료 연도라 임대 기간과 무관하다 —
+    실제 임대 복귀 예정 연도는 ai_transfer_log.loan_return_year(임대
+    발효 시점에 함께 기록됨, ai_lifecycle._loan_return2 등)이므로
+    같이 실어서 반환하고, 호출부(get_ai_player_career_history)가
+    임대 건은 이 값으로 기간을 계산하게 한다.
+    반환: [(effective_year, salary, transfer_type, is_loan, fee,
+            contract_end_year, loan_return_year), ...] 오름차순."""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT year, is_mid_season, salary, transfer_type, is_loan, fee, contract_end_year "
+        "SELECT year, is_mid_season, salary, transfer_type, is_loan, fee, contract_end_year, "
+        "loan_return_year "
         "FROM ai_transfer_log "
         "WHERE player_id=? AND salary>0 "
         "UNION ALL "
-        "SELECT year, is_mid_season, salary, transfer_type, is_loan, fee, contract_end_year "
+        "SELECT year, is_mid_season, salary, transfer_type, is_loan, fee, contract_end_year, "
+        "loan_return_year "
         "FROM ai_transfer_log_archive "
         "WHERE player_id=? AND salary>0", (player_id, player_id)).fetchall()
     conn.close()
     out = [(r["year"] if r["is_mid_season"] else r["year"] + 1,
             r["salary"], r["transfer_type"], bool(r["is_loan"]), r["fee"],
-            r["contract_end_year"], r["is_mid_season"])
+            r["contract_end_year"], r["is_mid_season"], r["loan_return_year"])
            for r in rows]
     out.sort(key=lambda t: (t[0], t[6]))
-    return [(y, s, tt, il, fe, ce) for (y, s, tt, il, fe, ce, _ms) in out]
+    return [(y, s, tt, il, fe, ce, lry) for (y, s, tt, il, fe, ce, _ms, lry) in out]
 
 
 def get_ai_player_team_timeline(player_id, current_team_id):
@@ -1379,13 +1389,28 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
             # 동일한 원칙으로 span_start와 비교).
             e["salary_is_first_year"] = (y_ == _latest[0])
             _cend = _latest[5]
-            # [2026-09 수정, 신민용 요청: "계약을 언제부터 했냐가 아니라
-            # 몇년치 했냐인건데"] 계약 "체결 연도"가 아니라 "기간"(몇
-            # 년짜리 계약)을 보여줘야 한다 — contract_end_year(그 시점에
-            # 함께 기록해둔 만료 연도)에서 체결 연도(_latest[0])를 뺀
-            # 값을 기간으로 넘긴다. contract_end_year 자체가 없는(이
-            # 기능 신설 이전) 옛 기록은 기간을 알 수 없으니 None.
-            e["salary_contract_years"] = (_cend - _latest[0]) if _cend else None
+            # [2026-09 버그수정, 신민용 리포트: "임대는 보통 1~2년으로
+            # 가야하는데 3년으로 되어있고 임대 과정에서 갑자기 복귀를
+            # 해 — 임대 기간 (계약:3년) 이거랑 실제 임대 기간이랑
+            # 달라"] contract_end_year는 원 소속팀과 맺은 진짜 계약의
+            # 만료 연도라, 임대로 나간 선수도 이 값을 그대로 쓰면
+            # "임대처에서 뛰는 기간"이 아니라 "원 소속팀 계약 전체
+            # 기간"이 표시돼버린다(그래서 실제로는 1~2년 만에 복귀하는데
+            # 화면엔 3년 등으로 더 길게 뜸) — 게임 로직(실제 임대 기간)
+            # 자체는 항상 맞았고 표시만 잘못됐던 것. 임대 건(_latest[3]
+            # =is_loan)은 대신 loan_return_year(임대 발효 시점에 함께
+            # 기록해둔 실제 복귀 예정 연도, _latest[6])에서 체결
+            # 연도(_latest[0])를 뺀 값을 기간으로 쓴다 — 이게 곧 실제
+            # 임대 기간(AI_LOAN_DURATION_YEARS=1~2년)과 항상 일치한다.
+            # loan_return_year가 없는 옛 기록(이 컬럼 신설 이전 로그)은
+            # 정확한 기간을 알 수 없으니 억지로 잘못된 숫자를 보여주지
+            # 않도록 None으로 둔다(완전 이적 건은 기존 그대로
+            # contract_end_year 기준).
+            _lry = _latest[6] if len(_latest) > 6 else None
+            if _latest[3]:  # is_loan
+                e["salary_contract_years"] = (_lry - _latest[0]) if _lry else None
+            else:
+                e["salary_contract_years"] = (_cend - _latest[0]) if _cend else None
             return
         # [2026-09 재수정] 이 연도 이전엔 로그된 계약이 하나도 없다 —
         # 그 해 실제 소속팀·그 해 OVR(없으면 현재 OVR)로 즉석 추정하되,
@@ -3763,6 +3788,82 @@ def get_ballon_dor_winners_by_year():
 # 가져다 쓴다 — 하나만 고치면 두 곳 다 항상 일치.
 WC_BALL_RANK_LABEL = {1: "골든볼", 2: "실버볼", 3: "브론즈볼"}
 
+# [2026-09 신설, 신민용 요청: "발롱 30인/야신 10인/푸스카스 10인 안에 들기만
+# 해도 상 이름을 각 색으로, 그 해 연도색도 발롱 > 야신 > 푸스카스 우선순위로
+# 바꿔줘 — 발롱 빨강, 야신 #00A86B 에메랄드 그린, 푸스카스 #2196F3 선명한
+# 블루, 평소 연도는 금색"] 세계상 3종의 award_kind → (우선순위, 표시색).
+# 우선순위 숫자가 작을수록 먼저 표시되고 연도색도 이긴다. 2009년 이전
+# 푸스카스상은 "올해의 최고의 골"로 저장되므로 같은 등급으로 묶는다.
+# 색 상수를 여기(데이터 레이어) 한 곳에만 두고 UI는 참조만 한다 —
+# WC_BALL_RANK_LABEL과 같은 "단일 소스" 원칙.
+WORLD_AWARD_STYLE = {
+    "발롱도르": (0, "#ff5555"),
+    "야신상": (1, "#00A86B"),
+    "FIFA 푸스카스상": (2, "#2196F3"),
+    "올해의 최고의 골": (2, "#2196F3"),
+}
+# [2026-09 신설, 신민용 요청: "상을 여러 개 받았을 때 발롱-야신-푸스카스
+# 이후 국제대회 상들 - 클럽 대항전 상들 - 컵 대회 상들 - 리그 상들 순서로"]
+# season_individual_awards.category → 표시 순서. cup(1부 국내컵) 다음에
+# lower_cup(하부리그 컵)을 둔다(둘 다 "컵 대회"). 표에 없는 카테고리가
+# 새로 생기면 맨 뒤로 보낸다(표시가 사라지진 않게).
+AWARD_CATEGORY_ORDER = {"world": 0, "intl": 1, "club": 2, "cup": 3, "lower_cup": 4, "league": 5}
+
+
+def get_player_awards_with_year_highlight(player_id):
+    """[2026-09 신설] get_player_awards_by_year와 같은 {year: [라벨...]}에
+    더해, {year: 표시색} — 그 해 세계상 3종(WORLD_AWARD_STYLE) 중 순위권에
+    든 가장 높은 우선순위 상의 색 — 을 함께 돌려준다. 선수 검색 연도 목록이
+    한 번의 쿼리로 상 목록과 연도색을 같이 쓰도록(상 목록 함수가 이미 이
+    선수 전체 수상 이력을 한 번에 읽으므로 같은 행에서 계산한다).
+    반환: (awards_by_year, highlight_color_by_year) — 세계상이 없는 해는
+    두 번째 dict에 키가 없다(호출부가 기본 금색으로 폴백)."""
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT year, award_type, award_kind, rank, position, team_name, competition, category
+           FROM hist.season_individual_awards WHERE player_id=? ORDER BY year, rank""",
+        (player_id,)).fetchall()
+    conn.close()
+    by_year = {}
+    best_world = {}   # year -> (우선순위, 색)
+    _last_cat = len(AWARD_CATEGORY_ORDER)
+    for r in rows:
+        kind = r["award_kind"] or r["award_type"]
+        if kind in ("발롱도르", "야신상", "FIFA 푸스카스상", "올해의 최고의 골"):
+            label = f"{r['award_type']} {r['rank']}위"
+        elif kind == "베스트11":
+            label = f"{r['award_type']}" + (f" ({r['position']})" if r["position"] else "")
+        elif kind == "골든볼":
+            ball_name = WC_BALL_RANK_LABEL.get(r["rank"], kind)
+            label = f"{(r['competition'] or '').strip()} {ball_name}".strip()
+        else:
+            label = r["award_type"]
+        _style = WORLD_AWARD_STYLE.get(kind)
+        if _style is not None:
+            # 세계상은 카테고리 맨 앞(0) 안에서 다시 발롱→야신→푸스카스.
+            sort_key = (0, _style[0])
+            _prev = best_world.get(r["year"])
+            if _prev is None or _style[0] < _prev[0]:
+                best_world[r["year"]] = _style
+        else:
+            sort_key = (AWARD_CATEGORY_ORDER.get(r["category"] or "", _last_cat) + 1, 0)
+        by_year.setdefault(r["year"], []).append((sort_key, label))
+    # list.sort는 안정정렬 — 같은 카테고리 안에서는 기존 SQL 순서(rank순) 유지.
+    awards = {y: [label for _k, label in sorted(entries, key=lambda e: e[0])]
+              for y, entries in by_year.items()}
+    return awards, {y: st[1] for y, st in best_world.items()}
+
+
+def award_label_color(label, default="#ffd700"):
+    """상 라벨(get_player_awards_with_year_highlight가 만든 문자열)의 표시색 —
+    세계상 3종이면 그 색, 아니면 default(금색). 라벨이 "{award_type} N위"
+    형식이고 세계상 award_type은 award_kind와 같은 문자열로 저장되므로
+    (game_engine._save_ballon_dor_top30 등) 접두어로 판정한다."""
+    for kind, (_prio, color) in WORLD_AWARD_STYLE.items():
+        if label.startswith(kind + " "):
+            return color
+    return default
+
 
 def get_player_awards_by_year(player_id):
     """{year: [표시용 문자열, ...]} — 그 선수가 받은 모든 개인상을 연도별로
@@ -3789,30 +3890,26 @@ def get_player_awards_by_year(player_id):
         보여준다 — 안 그러면 실버볼·브론즈볼 수상자도 그냥 "월드컵
         골든볼"로 표시돼 버린다.
       - 나머지(MVP/득점왕/도움왕/영플레이어/올해의 수비수/골든글러브/
-        구단 올해의 선수 등)는 award_type 그대로 보여준다."""
-    conn = get_conn()
-    rows = conn.execute(
-        """SELECT year, award_type, award_kind, rank, position, team_name, competition
-           FROM hist.season_individual_awards WHERE player_id=? ORDER BY year, rank""",
-        (player_id,)).fetchall()
-    conn.close()
-    by_year = {}
-    for r in rows:
-        kind = r["award_kind"] or r["award_type"]
-        # [주의] 실제 저장되는 award_kind는 "발롱도르"와 "FIFA 푸스카스상"
-        # (2009년 이전은 "올해의 최고의 골") — game_engine._save_ballon_
-        # dor_top30/_process_goal_awards가 쓰는 문자열과 정확히 맞춘다.
-        if kind in ("발롱도르", "야신상", "FIFA 푸스카스상", "올해의 최고의 골"):
-            label = f"{r['award_type']} {r['rank']}위"
-        elif kind == "베스트11":
-            label = f"{r['award_type']}" + (f" ({r['position']})" if r["position"] else "")
-        elif kind == "골든볼":
-            ball_name = WC_BALL_RANK_LABEL.get(r["rank"], kind)
-            label = f"{(r['competition'] or '').strip()} {ball_name}".strip()
-        else:
-            label = r["award_type"]
-        by_year.setdefault(r["year"], []).append(label)
-    return by_year
+        구단 올해의 선수 등)는 award_type 그대로 보여준다.
+      - [2026-09 버그수정, 신민용 요청: "발롱도르는 빨간색 글자로 뜨며
+        맨 앞에 뜨게 해줘"] 예전엔 SQL의 ORDER BY year, rank 순서를
+        그대로 append만 했는데, rank는 상마다 별개 채점(예: 리그 MVP
+        rank=1, 발롱도르 rank=5)이라 발롱도르가 더 낮은 순위여도 다른
+        상보다 먼저 나올 수 있었다 — 한 해에 여러 상을 받았으면
+        발롱도르(있다면)를 항상 그 해 목록 맨 앞으로 오도록 별도
+        정렬한다(그 외 상들끼리의 상대 순서는 기존 SQL 순서 그대로
+        유지 — Python list.sort는 안정정렬이라 동순위 내 순서가
+        보존된다). 실제 빨간 글씨 렌더링은 이 함수의 유일한 호출부인
+        ui/world_browser_window.py가 담당(라벨이 "발롱도르"로 시작하는
+        항목만 색을 입힘 — award_type이 정확히 "발롱도르" 문자열로
+        저장되는 건 위 kind 분기와 game_engine._save_ballon_dor_top30이
+        보장)."""
+    # [2026-09 수정, 위 AWARD_CATEGORY_ORDER/WORLD_AWARD_STYLE 주석 참고]
+    # 정렬이 "발롱 → 야신 → 푸스카스 → 국제대회 → 클럽대항전 → 컵 → 리그"로
+    # 확장되면서 실제 조회·라벨·정렬은 get_player_awards_with_year_highlight
+    # 한 곳에서 한다(선수 검색 복사 텍스트 등 기존 호출부와 화면 순서가
+    # 항상 같도록). 이 함수는 하위호환 래퍼로 상 목록만 돌려준다.
+    return get_player_awards_with_year_highlight(player_id)[0]
 
 
 # [2026-09 신설] 클럽 대항전(챔스/유로파/컨퍼런스/클럽월드컵/슈퍼컵) +
@@ -4706,10 +4803,19 @@ def get_player_intl_records(player_id, limit=100):
     이전에 이미 끝났거나 그 시점에 진행 중이던 대회는 이 선수가 그때
     명단에 뽑혔었는지 자체가 기록에 없다 — 그 이후 그 나라 포메이션
     화면을 한 번이라도 열었거나 실제 경기가 시뮬레이션된 대회부터만
-    정확하다(호출부 UI가 이 한계를 안내 문구로 같이 보여준다)."""
+    정확하다(호출부 UI가 이 한계를 안내 문구로 같이 보여준다). position도
+    같은 이유로 2026-09 신설 이전 대회는 빈 값("-"로 표시) — rating/
+    goals/assists와 동일하게 소급 backfill 없음(그 시점 실제 포지션이
+    뭐였는지 지금 와서 정확히 복원할 방법이 없어, 지금 포지션으로
+    거꾸로 채우면 오히려 틀린 값을 보여줄 위험이 있다)."""
     conn = get_conn(); c = conn.cursor()
+    # [2026-09 신설, 신민용 요청: "국가대표 출전 기록에 이 당시 얘 포지션이
+    # 뭐였는지도 표시해야 해"] s.position은 이 대회 26인이 처음 확정된
+    # 시점의 스냅샷(database.get_or_create_intl_squad 참고) — 선수의
+    # "지금" 포지션(ai_players.position, 커리어 내내 바뀔 수 있음) 대신
+    # 이걸 쓰므로 옛 대회 기록의 포지션이 나중에 안 바뀐다.
     squad_rows = [dict(r) for r in c.execute(
-        """SELECT s.tournament_id, s.country, s.appearances,
+        """SELECT s.tournament_id, s.country, s.appearances, s.position,
                   s.rating, s.goals, s.assists, s.clean_sheets, s.saves, s.goals_conceded,
                   t.year, t.kind, t.name
            FROM intl_squad s JOIN intl_tournaments t ON t.id = s.tournament_id
@@ -4748,9 +4854,11 @@ def get_player_intl_records(player_id, limit=100):
         _stat = {"rating": r.get("rating") or 0, "goals": r.get("goals") or 0,
                  "assists": r.get("assists") or 0, "clean_sheets": r.get("clean_sheets") or 0,
                  "saves": r.get("saves") or 0, "goals_conceded": r.get("goals_conceded") or 0}
+        _position = r.get("position") or None
         res = results_by_key.get((r["tournament_id"], r["country"]))
         if res:
             out.append({**res, "country": r["country"], "appearances": r["appearances"],
+                        "position": _position,
                         "total_games": res.get("games", 0), **_stat})
         else:
             # get_country_tournament_results는 완료된(status='done') 대회만
@@ -4762,7 +4870,7 @@ def get_player_intl_records(player_id, limit=100):
             out.append({"id": r["tournament_id"], "year": r["year"],
                         "kind": r["kind"] or "?", "name": r["name"] or "?",
                         "country": r["country"], "result": "진행 중",
-                        "record": "", "appearances": r["appearances"],
+                        "record": "", "appearances": r["appearances"], "position": _position,
                         "total_games": n_games, **_stat})
     conn2.close()
     out.sort(key=lambda x: (x["year"], x["id"]), reverse=True)

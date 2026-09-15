@@ -438,6 +438,23 @@ _IA_YEAR_LIST_STYLE = (
     "QListWidget::item{padding:7px 5px;}"
 )
 
+# [2026-09 버그수정, 신민용 리포트: "개인상에서 세계상(발롱도르) — 맨
+# 좌측에 년도 그 옆에 그 년도의 선수가 표시되잖아 근데 년도가 늘어나서
+# 위아래 휠이 생기면 둘이 알맞게 배정되는게 아니라 좀 깨져 있어"]
+# "세계상" 패널은 원래 독립된 두 QListWidget(연도/발롱도르 우승자)의
+# 스크롤바 값을 valueChanged 시그널로 서로 밀어주는 방식이었다 — 두
+# 스크롤바는 서로 다른 위젯의 독립된 상태라 한쪽이 바뀌면 다른 쪽에
+# "따라오라"고 값만 복사할 뿐, 실제로는 매 스크롤 이벤트마다 값 갱신
+# 순서·반올림 오차가 조금씩 누적돼(둘 다 정수 픽셀 단위 스크롤바라
+# 매끄럽게 안 맞음) 연도가 늘어나 스크롤 가능해지면 두 목록이 서서히
+# 어긋난다. 근본적으로 스크롤바 자체가 하나뿐이면 어긋날 수가 없으므로,
+# _build_ia_world_panel에서 두 QListWidget 대신 2열짜리 QTableWidget
+# 하나(연도열+발롱도르 우승자열)로 합친다 — 이 스타일은 그 표 전용.
+_IA_YEAR_TABLE_STYLE = (
+    "QTableWidget{font-size:15px;}"
+    "QTableWidget::item{padding:7px 5px;}"
+)
+
 # [2026-09 신설, 신민용 요청: "세계 축구 기록실에 골든볼 외에 실버볼
 # 브론즈볼도 떠야지 / 대회 월드컵 부문 골든볼로 되어있는거 볼로 수정하고
 # 이걸 치면 골든볼 실버볼 브론즈볼이 3개 뜨게 해줘"] game_engine._save_
@@ -2606,6 +2623,39 @@ class WorldBrowserWindow(QDialog):
             lay.addWidget(rec_lbl)
         return w
 
+    def _awards_summary_cell(self, awards):
+        """[2026-09 버그수정, 신민용 리포트: "선수 검색 이후 년도 클릭하면
+        아래에 상들 뜨잖아 근데 발롱도르는 빨간색 글자로 뜨며 맨 앞에
+        뜨게 해줘"] 연도 상세의 "🏆 상" 요약 줄 전용 셀. get_player_
+        awards_by_year가 이미 발롱도르를 목록 맨 앞으로 정렬해서 넘겨
+        주므로(순서는 그대로 따르기만 하면 됨), 여기서는 색만 입힌다 —
+        "발롱도르"로 시작하는 라벨만 빨간색(#ff5555), 나머지는 기존
+        금색(#ffd700) 그대로 " · "로 이어붙여 하나의 리치 텍스트(HTML)로
+        렌더링한다. _two_line_cell의 "[우승]"/"[1등]" 부분강조와 같은
+        원리(라벨 단위로 다른 색의 span)지만, 그쪽은 대회 실적 칸
+        전반에 쓰이는 범용 셀이라 고정 토큰만 찾고, 여기는 상 목록
+        전용이라 상 라벨 단위로 나눠 판단한다는 점이 다르다."""
+        import html as _html
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(6, 4, 6, 4)
+        lay.setSpacing(1)
+        main_lbl = QLabel()
+        main_lbl.setWordWrap(True)
+        _parts = []
+        # [2026-09 수정, 신민용 요청] 발롱도르(빨강)에 더해 야신상(#00A86B)·
+        # 푸스카스상(#2196F3)도 순위권 라벨을 각 색으로 — 색 판정은
+        # world_browser.award_label_color(색 상수 단일 소스)에 맡긴다.
+        for a in awards:
+            _color = wb.award_label_color(a, "#ffd700")
+            _parts.append(f'<span style="color:{_color};">{_html.escape(a)}</span>')
+        _sep = '<span style="color:#ffd700;"> · </span>'
+        _rich = '<span style="color:#ffd700;">🏆 </span>' + _sep.join(_parts)
+        main_lbl.setStyleSheet("font-weight:bold;font-size:12px;")
+        main_lbl.setText(_rich)
+        lay.addWidget(main_lbl)
+        return w
+
     def _simple_transfer_label(self, transfer_type, is_loan):
         """[2026-09 신설, 신민용 요청: "이적 오퍼 입단 방출 이걸로
         나누는게 깔끔한데 왜 리그내 이런식으로 표시하는거야"] ai_
@@ -3156,6 +3206,18 @@ class WorldBrowserWindow(QDialog):
                     self._build_team_year_summary_copy_text(tid, year),
                     summary_copy_btn, "📋 요약 복사"))
             header_row.addWidget(summary_copy_btn)
+            # [2026-09 신설, 신민용 요청: "요약 복사에서 주전들만 뜨는
+            # 버전도 만들어달라 — 상반기 주전들, 그리고 하반기의 이적/
+            # 역할변화 같은 중요 장면만"] 같은 함수를 starters_only=True로
+            # 호출하는 것만 다르다(_build_team_year_summary_copy_text
+            # 문서 참고) — 새 포맷을 따로 만들지 않는다.
+            starter_summary_copy_btn = QPushButton("📋 주전 요약 복사")
+            starter_summary_copy_btn.setStyleSheet(_btn_qss)
+            starter_summary_copy_btn.clicked.connect(
+                lambda: self._copy_text_with_feedback(
+                    self._build_team_year_summary_copy_text(tid, year, starters_only=True),
+                    starter_summary_copy_btn, "📋 주전 요약 복사"))
+            header_row.addWidget(starter_summary_copy_btn)
         lay.addLayout(header_row)
 
         if not starters:
@@ -3498,7 +3560,18 @@ class WorldBrowserWindow(QDialog):
 
         omit_if_empty=True면 기록이 없을 때 "[국가대표 기록]" 제목 줄과
         "(국가대표 출전 기록 없음)" 자리표시자를 통째로 생략한다(기존
-        호출은 항상 False라 동작이 전혀 안 바뀐다)."""
+        호출은 항상 False라 동작이 전혀 안 바뀐다).
+
+        [2026-09 확장, 신민용 요청: "국가대표 기록 복사에도 화면 표
+        (player_intl_tbl/_populate_player_intl_box)랑 똑같이 포지션·성적을
+        넣어달라 — 요약 복사/기록 복사/주전 기록 복사/스쿼드 기록 복사
+        전부 다 똑같이"] 한 줄 포맷을 "연도 | 대회 | 국가 | 포지션 | 출전 |
+        결과 | 성적" 7칸으로 바꾼다 — _populate_player_intl_box가 화면
+        표에 쓰는 것과 완전히 같은 rec["position"]/성적 문자열 조합을
+        그대로 재사용(새 계산 없음, 표시만 텍스트로). include_stats는
+        이제 이 블록에서 안 쓴다(포지션·성적을 요약 복사에서도 항상
+        보여달라는 요청이라 더 이상 가르지 않음) — 시그니처는 호출부
+        호환을 위해 그대로 남겨둔다."""
         if not intl_records and omit_if_empty:
             return []
         lines = ["[국가대표 기록]"]
@@ -3510,20 +3583,22 @@ class WorldBrowserWindow(QDialog):
             apps = rec.get("appearances", 0)
             total = rec.get("total_games", 0)
             apps_text = f"{apps}/{total}" if total else str(apps)
-            lines.append(
-                f"{rec.get('year')}년 | {rec.get('name') or '?'} ({rec.get('country') or '?'}) | "
-                f"출전 {apps_text} | 결과: {rec.get('result') or '?'}")
-            if include_stats and rec.get("rating"):
+            rating = rec.get("rating") or 0
+            if rating:
                 if _is_gk:
-                    _sv = rec.get("saves", 0) or 0
-                    _gc = rec.get("goals_conceded", 0) or 0
-                    _shots = _sv + _gc
-                    _pct = f"{(_sv / _shots * 100):.1f}%" if _shots else "-"
-                    lines.append(
-                        f"  🧤 평균평점 {rec['rating']:.2f}  선방{_sv} 실점{_gc} 선방률{_pct}")
+                    sv = rec.get("saves", 0) or 0
+                    gc = rec.get("goals_conceded", 0) or 0
+                    shots = sv + gc
+                    pct = f"{(sv / shots * 100):.1f}%" if shots else "-"
+                    stat_text = f"⭐{rating:.2f}  🧤선방{sv}실점{gc}({pct})"
                 else:
-                    lines.append(
-                        f"  ⚽ 평균평점 {rec['rating']:.2f}  {rec.get('goals', 0)}골 {rec.get('assists', 0)}A")
+                    stat_text = f"⭐{rating:.2f}  ⚽{rec.get('goals', 0)}골 🅰{rec.get('assists', 0)}A"
+            else:
+                stat_text = "-"
+            lines.append(
+                f"{rec.get('year')}년 | {rec.get('name') or '?'} | {rec.get('country') or '?'} | "
+                f"{rec.get('position') or '-'} | 출전 {apps_text} | 결과: {rec.get('result') or '?'} | "
+                f"{stat_text}")
         return lines
 
     def _format_year_row_lines(self, row, d, include_stats=False,
@@ -4299,22 +4374,34 @@ class WorldBrowserWindow(QDialog):
         intl_box_title = QLabel("🌍 국가대표 출전 기록")
         intl_box_title.setStyleSheet("color:#eee;font-size:13px;font-weight:bold;")
         scroll_lay.addWidget(intl_box_title)
-        self.player_intl_tbl = self._make_self_sizing_table(6, no_scroll=True)
+        # [2026-09 신설, 신민용 요청: "국가대표 출전 기록에 이 당시 얘
+        # 포지션이 뭐였는지도 표시해야 해 — 국대에서 뛰는 포지션이
+        # 있잖아"] "포지션" 열 추가(연도/대회/국가 다음, 출전 앞) —
+        # world_browser.get_player_intl_records가 이미 intl_squad.position
+        # 스냅샷을 "position" 키로 얹어서 주므로, 여기선 새로 계산하지
+        # 않고 그 값을 그대로 표시만 한다(_populate_player_intl_box 참고).
+        self.player_intl_tbl = self._make_self_sizing_table(7, no_scroll=True)
         self.player_intl_tbl.setHorizontalHeaderLabels(
-            ["연도", "대회", "국가", "출전", "결과", "성적"])
+            ["연도", "대회", "국가", "포지션", "출전", "결과", "성적"])
         # [2026-08 신설] "대회" 칸은 "2000 유럽 네이션스컵 예선"처럼 길게
         # 나올 수 있어 Interactive 기본폭(130)으로는 좁을 수 있다 — 넓힌다.
         self.player_intl_tbl.setColumnWidth(1, 210)
+        # [2026-09 신설] "포지션" 칸(3번)도 "출전"(이제 4번, 예전엔 3번)과
+        # 마찬가지로 짧은 고정폭이 어울린다 — 같은 폭 상수 재사용.
         self.player_intl_tbl.horizontalHeader().setSectionResizeMode(
             3, QHeaderView.ResizeMode.Fixed)
         self.player_intl_tbl.setColumnWidth(3, self._OVR_COL_W)
+        self.player_intl_tbl.horizontalHeader().setSectionResizeMode(
+            4, QHeaderView.ResizeMode.Fixed)
+        self.player_intl_tbl.setColumnWidth(4, self._OVR_COL_W)
         # [2026-09 신설, 신민용 리포트: "국제대회 성적 저거 글 잘리는데
-        # 글자 다 보이게 칸을 맞춰"] "성적" 칸(5번, ⭐평점 ⚽N골 🅰NA 또는
-        # ⭐평점 🧤N회)이 Interactive 기본폭에 잘려 보였다 — "대회" 칸(1번)
-        # 처럼 이 칸도 내용 길이에 맞춰 명시적으로 넓힌다.
+        # 글자 다 보이게 칸을 맞춰"] "성적" 칸(예전 5번 → 포지션 열 추가로
+        # 6번, ⭐평점 ⚽N골 🅰NA 또는 ⭐평점 🧤N회)이 Interactive 기본폭에
+        # 잘려 보였다 — "대회" 칸(1번)처럼 이 칸도 내용 길이에 맞춰
+        # 명시적으로 넓힌다.
         # [2026-09 재수정] GK 텍스트가 "⭐7.15 🧤선방14실점1(93.5%)"로
         # 더 길어져 170px로도 잘릴 수 있어 220px로 재조정.
-        self.player_intl_tbl.setColumnWidth(5, 220)
+        self.player_intl_tbl.setColumnWidth(6, 220)
         scroll_lay.addWidget(self.player_intl_tbl)
 
         # [2026-08 신설] intl_squad는 2026-08부터 생긴 테이블이라 그 전에
@@ -5042,13 +5129,17 @@ class WorldBrowserWindow(QDialog):
     def _populate_player_intl_box(self, player_id, position=None):
         """[2026-08 신설, 신민용 요청: "'예선전 탈락' 같은 개인 기록도
         표시해줘"] wb.get_player_intl_records로 이 선수가 실제로 대회
-        명단(intl_squad)에 뽑혔던 대회만 가져와 연도/대회/국가/출전/결과
-        표로 채운다. player_team_tbl과 같은 톤 — 기록이 없으면(intl_squad
-        도입 이전 대회뿐이거나, 애초에 대표팀에 뽑힌 적이 없으면) 안내
-        문구 한 줄만 표시한다.
+        명단(intl_squad)에 뽑혔던 대회만 가져와 연도/대회/국가/포지션/
+        출전/결과/성적 표로 채운다. player_team_tbl과 같은 톤 — 기록이
+        없으면(intl_squad 도입 이전 대회뿐이거나, 애초에 대표팀에 뽑힌
+        적이 없으면) 안내 문구 한 줄만 표시한다.
         [2026-09 확장, 신민용 요청: "국가대표에도 평점이랑 골 어시 이런걸
         넣고 싶어"] "성적" 칸을 추가 — GK는 클럽 기록과 동일하게 골/도움
-        대신 클린시트를 보여준다(position으로 판정)."""
+        대신 클린시트를 보여준다(position으로 판정).
+        [2026-09 신설, 신민용 요청: "국가대표 출전 기록에 이 당시 얘
+        포지션이 뭐였는지도 표시해야 해"] "포지션" 칸 추가 — 새로 계산
+        하지 않고 rec["position"](wb.get_player_intl_records가 이미
+        intl_squad.position 스냅샷을 실어 보내줌)을 그대로 표시만 한다."""
         tbl = self.player_intl_tbl
         tbl.setRowCount(0)
         tbl.clearSpans()
@@ -5060,7 +5151,7 @@ class WorldBrowserWindow(QDialog):
             empty = QTableWidgetItem("국가대표 출전 기록 없음")
             empty.setForeground(QColor("#666"))
             tbl.setItem(0, 0, empty)
-            tbl.setSpan(0, 0, 1, 6)
+            tbl.setSpan(0, 0, 1, 7)
             self._resize_self_sizing_table(tbl)
             return
         _is_gk = (position == "GK")
@@ -5086,10 +5177,10 @@ class WorldBrowserWindow(QDialog):
             else:
                 _stat_text = "-"
             cells = [str(rec["year"]), rec.get("name") or "?", rec.get("country") or "?",
-                     _apps_text, rec.get("result") or "?", _stat_text]
+                     rec.get("position") or "-", _apps_text, rec.get("result") or "?", _stat_text]
             for col, text in enumerate(cells):
                 item = QTableWidgetItem(text)
-                if col in (0, 3, 5):
+                if col in (0, 3, 4, 6):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 tbl.setItem(row, col, item)
         self._resize_self_sizing_table(tbl)
@@ -5604,7 +5695,11 @@ class WorldBrowserWindow(QDialog):
         # (발롱도르/리그·클럽대항전·국제대회 MVP 등)도 연도가 펼쳐졌을
         # 때 comp_stats/salary 요약 행처럼 별도의 한 줄로 보여준다 — 행수
         # 사전계산에도 똑같이 반영해야 한다(안 그러면 표 행이 부족해짐).
-        _awards_by_year = wb.get_player_awards_by_year(player_id)
+        # [2026-09 수정, 신민용 요청: "발롱 30인/야신 10인/푸스카스 10인에
+        # 든 연도는 연도색을 발롱(빨강) > 야신(에메랄드) > 푸스카스(블루)
+        # 우선순위로"] 상 목록과 그 해 연도색을 한 번의 조회로 같이 받는다
+        # (world_browser.get_player_awards_with_year_highlight 주석 참고).
+        _awards_by_year, _year_highlight = wb.get_player_awards_with_year_highlight(player_id)
         _expanded_years = self._player_team_expanded_years(player_id)
         # [2026-09 버그수정, 신민용 리포트: "이적/입단 정보를 매년 반복
         # 표시하지 말고 팀이 바뀐 첫 해에만 보여줘"] salary_is_first_year가
@@ -5663,7 +5758,11 @@ class WorldBrowserWindow(QDialog):
             _arrow = "▼ " if entry["year"] in _expanded else "▶ "
             year_text = f"{_arrow}{entry['year']} ({age}세)" if age is not None else f"{_arrow}{entry['year']}"
             year_item = QTableWidgetItem(year_text)
-            year_item.setForeground(QColor("#ffcc00"))
+            # [2026-09 수정, 위 _year_highlight 주석 참고] 그 해 세계상 순위권
+            # 이면 그 색, 아니면 기존 금색. 상 목록은 상반기 줄에 안 붙지만
+            # 연도색은 "그 해" 자체의 표시라 같은 연도의 상/하반기 두 줄
+            # 모두 같은 색으로 칠한다.
+            year_item.setForeground(QColor(_year_highlight.get(entry["year"], "#ffcc00")))
             f = year_item.font(); f.setBold(True); year_item.setFont(f)
             year_item.setData(Qt.ItemDataRole.UserRole, entry["year"])
             year_item.setToolTip("클릭하면 이 연도의 상세 기록(평점·연봉·이적종류)을 펼치거나 접습니다")
@@ -5942,8 +6041,14 @@ class WorldBrowserWindow(QDialog):
             # 이미 조회해 self._player_copy_rows에도 실어뒀다 — 여기선
             # 재사용만.)
             if _year_awards and _year_expanded:
-                _award_cell = self._two_line_cell(
-                    f"🏆 {' · '.join(_year_awards)}", "#ffd700", None, bold=True)
+                # [2026-09 버그수정, 신민용 리포트: "발롱도르는 빨간색
+                # 글자로 뜨며 맨 앞에 뜨게 해줘"] 예전엔 _two_line_cell로
+                # 상 목록 전체를 금색 한 색으로만 이어붙였다 — 발롱도르
+                # 항목만 빨갛게 구분해서 보여주는 전용 셀(_awards_
+                # summary_cell)로 교체(정렬 자체는 world_browser.
+                # get_player_awards_by_year가 이미 발롱도르를 맨 앞으로
+                # 해뒀으므로 여기선 순서를 그대로 따르기만 하면 된다).
+                _award_cell = self._awards_summary_cell(_year_awards)
                 tbl.setCellWidget(row_idx, 0, _award_cell)
                 tbl.setSpan(row_idx, 0, 1, 10)
                 row_idx += 1
@@ -6921,6 +7026,24 @@ class WorldBrowserWindow(QDialog):
                         include_stats=False,
                         prefix_text=self._build_country_tournament_summary_text(tid, country)))
                 header_row.addWidget(summary_copy_btn)
+                # [2026-09 신설, 신민용 요청: "국가도 주전 요약 복사를
+                # 만들어야 하는데, 요약 복사는 전 포지션 다 포함하고
+                # 주전 요약 복사가 0경기 제외인 것"] "요약 복사"는 위처럼
+                # 26인 전체(_ids)를 그대로 두고 건드리지 않는다 — 대신
+                # 별도 버튼을 새로 만들어 거기서만 필터링한다(팀 검색의
+                # "요약 복사"/"주전 요약 복사" 버튼 쌍과 같은 구조).
+                # intl_squad.appearances(get_country_tournament_squad가
+                # 이미 채워둔 값, 새 계산 없음)가 0인 선수만 제외한다.
+                starter_summary_copy_btn = QPushButton("📋 주전 요약 복사")
+                starter_summary_copy_btn.setStyleSheet(_btn_qss)
+                _starter_summary_ids = [r.get("id") for r in (starters + bench)
+                                         if (r.get("appearances") or 0) >= 1]
+                starter_summary_copy_btn.clicked.connect(
+                    lambda: self._copy_squad_player_records(
+                        _starter_summary_ids, starter_summary_copy_btn, "📋 주전 요약 복사",
+                        target_years=_summary_years, include_stats=False,
+                        prefix_text=self._build_country_tournament_summary_text(tid, country)))
+                header_row.addWidget(starter_summary_copy_btn)
         lay.addLayout(header_row)
 
         if not starters and not bench:
@@ -7104,7 +7227,7 @@ class WorldBrowserWindow(QDialog):
                 pass
         QTimer.singleShot(1200, _reset_copy_btn_label)
 
-    def _build_team_year_summary_copy_text(self, tid, year):
+    def _build_team_year_summary_copy_text(self, tid, year, starters_only=False):
         """[2026-09 신설, 신민용 요청: "팀 검색 요약 복사가 선수마다 팀
         성적(리그/국내컵/...)을 그대로 반복해서 너무 길다 — 팀 기록은
         상반기/하반기 딱 한 번씩만 맨 위에 쓰고, 그 아래에 선수는 주전
@@ -7139,10 +7262,19 @@ class WorldBrowserWindow(QDialog):
             들어가며 떠남)은 "언제 이 팀 소속이었나"가 기준이지 이적료
             유무가 기준이 아니다.
 
-        팀 검색에서 연도를 눌렀을 때 쓰는 "요약 복사" 버튼 전용 새 포맷 —
-        다른 복사 버튼(주전/스쿼드 기록 복사, 선수 검색 자체 복사, 국가
-        검색 복사)은 이 함수와 무관하게 기존 그대로("_format_player_history_
-        text"/"_copy_squad_player_records") 동작한다.
+        [2026-09 3차 확장, 신민용 요청: "요약 복사에서 주전들만 뜨는
+        버전도 만들어달라 — 상반기 주전들, 그리고 하반기의 이적/역할
+        변화 같은 중요 장면만"] starters_only=True면 unchanged(시즌
+        내내 그대로인 선수) 중 역할이 "주전"이 아닌 사람만 걸러낸다 —
+        아래 4분류 루프 참고. left/joined/changed는 원래도 "중요
+        장면"이라 필터와 무관하게 그대로 나간다. 기본값 False는 기존
+        "요약 복사" 버튼 동작과 100% 동일(하위호환).
+
+        팀 검색에서 연도를 눌렀을 때 쓰는 "요약 복사"/"주전 요약 복사"
+        버튼 전용 새 포맷 — 다른 복사 버튼(주전/스쿼드 기록 복사, 선수
+        검색 자체 복사, 국가 검색 복사)은 이 함수와 무관하게 기존
+        그대로("_format_player_history_text"/"_copy_squad_player_records")
+        동작한다.
 
         [설계] hist.team_season_lineup(_half)의 그 해 실제 스냅샷(이 팀
         로스터 자체의 ai_lifecycle 스냅샷 — "그 반기에 실제로 이 팀
@@ -7319,6 +7451,17 @@ class WorldBrowserWindow(QDialog):
                 if half_on_us and info["half_row"] != info["main_row"]:
                     changed.append((pid, info))
                 elif info["main_row"] and info["main_row"]["team_name"] == team_name:
+                    # [2026-09 신설, 신민용 요청: "요약 복사에서 주전들만
+                    # 뜨는 버전(주전 요약 복사)도 만들어달라 — 상반기
+                    # 주전들 + 하반기의 이적/역할변화 같은 '중요 장면'만"]
+                    # starters_only=True면 시즌 내내 변화 없던(unchanged)
+                    # 선수 중 역할이 "주전"이 아닌 사람만 걸러낸다 —
+                    # left/joined/changed(나간/들어온/역할변화)는 그
+                    # 자체가 이미 "중요 장면"이라 역할과 무관하게 그대로
+                    # 둔다(로테이션 선수가 주전으로 승격한 "역할변화"도
+                    # 당연히 보여야 하므로).
+                    if starters_only and info["main_row"].get("role") != "주전":
+                        continue
                     unchanged.append((pid, info))
 
         for pid in h2_order:
@@ -8166,16 +8309,21 @@ class WorldBrowserWindow(QDialog):
     # 유지한다. "역대 개인상" 탭을 한 번도 연 적 없는 창(위젯 자체가
     # 없음)이면 조용히 스킵.
     def _refresh_individual_awards_tables(self):
-        if getattr(self, "ia_year_list", None) is not None:
-            _cur_item = self.ia_year_list.currentItem()
+        # [2026-09 리팩터] "세계상" 패널이 두 QListWidget에서 2열
+        # QTableWidget(ia_year_tbl) 하나로 합쳐지면서, 여기서도 currentItem/
+        # setCurrentRow 대신 표의 현재 선택 행·아이템 API를 쓴다 — 동작
+        # 자체(선택된 연도 유지하며 다시 그리기)는 그대로.
+        if getattr(self, "ia_year_tbl", None) is not None:
+            _cur_row = self.ia_year_tbl.currentRow()
+            _cur_item = self.ia_year_tbl.item(_cur_row, 0) if _cur_row >= 0 else None
             _cur_year = _cur_item.data(Qt.ItemDataRole.UserRole) if _cur_item else None
             self._refresh_ia_year_list()
             if _cur_year is not None:
-                for i in range(self.ia_year_list.count()):
-                    it = self.ia_year_list.item(i)
+                for i in range(self.ia_year_tbl.rowCount()):
+                    it = self.ia_year_tbl.item(i, 0)
                     if it.data(Qt.ItemDataRole.UserRole) == _cur_year:
-                        self.ia_year_list.setCurrentRow(i)
-                        self._on_ia_year_selected(it)
+                        self.ia_year_tbl.setCurrentCell(i, 0)
+                        self._on_ia_year_selected(i, 0)
                         break
         for prefix in getattr(self, "_ia_filter_specs", {}):
             if self._ia_filterable_current_year(prefix) is not None:
@@ -8622,36 +8770,37 @@ class WorldBrowserWindow(QDialog):
         row = QHBoxLayout()
         row.setSpacing(0)
 
-        self.ia_year_list = QListWidget()
-        self.ia_year_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.ia_year_list.itemClicked.connect(self._on_ia_year_selected)
-        self.ia_year_list.currentRowChanged.connect(self._on_ia_year_row_changed)
-        self.ia_year_list.setMaximumWidth(90)
-        self.ia_year_list.setStyleSheet(_IA_YEAR_LIST_STYLE)
-        row.addWidget(self.ia_year_list)
-
+        # [2026-09 버그수정, 신민용 리포트: "년도가 늘어나서 위아래 휠이
+        # 생기면 둘이 알맞게 배정되는게 아니라 좀 깨져 있어"] 예전엔
+        # 연도 목록과 "그 해 발롱도르 우승자" 목록이 독립된 두
+        # QListWidget이었고, 스크롤바 값을 valueChanged로 서로 밀어주는
+        # 방식이라 스크롤이 쌓일수록 두 목록이 어긋났다 — 2열짜리
+        # QTableWidget 하나(0열=연도, 1열=발롱도르 우승자)로 합쳐
+        # 스크롤바 자체를 하나로 만든다(원천적으로 어긋날 수 없는 구조).
+        self.ia_year_tbl = QTableWidget(0, 2)
+        self.ia_year_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.ia_year_tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.ia_year_tbl.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.ia_year_tbl.horizontalHeader().setVisible(False)
+        self.ia_year_tbl.verticalHeader().setVisible(False)
+        self.ia_year_tbl.setShowGrid(False)
+        self.ia_year_tbl.setMaximumWidth(220)
+        self.ia_year_tbl.setColumnWidth(0, 90)
+        self.ia_year_tbl.setColumnWidth(1, 130)
+        self.ia_year_tbl.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Fixed)
+        self.ia_year_tbl.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Fixed)
+        self.ia_year_tbl.setStyleSheet(_IA_YEAR_TABLE_STYLE)
         # [2026-09 신설, 신민용 요청: "발롱도르는 년도 옆에 칸을 하나 더
-        # 만들어서 그 당시 발롱도르를 누가 탔는지 표시를 해줘 — 2000년도
-        # 적힌 크기만큼 순위를 나타내는 곳과 사이에 이름이 들어갈 정도의
-        # 칸을 만들고 이름을 넣는거"] 연도 목록과 순위표 사이에, 연도
-        # 행과 정확히 같은 줄 높이·폰트(같은 스타일시트+같은 행 수)로
-        # "그 해 발롱도르 우승자 이름"만 보여주는 좁은 목록을 끼워
-        # 넣는다. 클릭 선택은 안 되게(NoSelection) 하되, 스크롤은 연도
-        # 목록과 항상 같이 움직이도록 스크롤바를 서로 연결해 행이 어긋나
-        # 보이지 않게 한다. 더블클릭하면 다른 개인상 표의 행과 동일하게
-        # 그 선수 상세로 이동한다.
-        self.ia_ballon_winner_list = QListWidget()
-        self.ia_ballon_winner_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        self.ia_ballon_winner_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.ia_ballon_winner_list.setMaximumWidth(130)
-        self.ia_ballon_winner_list.setStyleSheet(
-            _IA_YEAR_LIST_STYLE + "QListWidget::item{color:#ffcc00;}")
-        self.ia_ballon_winner_list.itemDoubleClicked.connect(self._on_ia_ballon_winner_double_clicked)
-        self.ia_year_list.verticalScrollBar().valueChanged.connect(
-            self.ia_ballon_winner_list.verticalScrollBar().setValue)
-        self.ia_ballon_winner_list.verticalScrollBar().valueChanged.connect(
-            self.ia_year_list.verticalScrollBar().setValue)
-        row.addWidget(self.ia_ballon_winner_list)
+        # 만들어서 그 당시 발롱도르를 누가 탔는지 표시를 해줘"] 1열이
+        # "그 해 발롱도르 우승자 이름"칸 — 아무 칸이나 한 번 클릭하면
+        # (행 선택이므로) 연도 선택과 동일하게 처리되고, 우승자 칸을
+        # 더블클릭하면 다른 개인상 표의 행과 동일하게 그 선수 상세로
+        # 이동한다(아래 _on_ia_year_tbl_double_clicked).
+        self.ia_year_tbl.cellClicked.connect(self._on_ia_year_selected)
+        self.ia_year_tbl.cellDoubleClicked.connect(self._on_ia_year_tbl_double_clicked)
+        row.addWidget(self.ia_year_tbl)
 
         right = QWidget()
         right_lay = QVBoxLayout(right)
@@ -8710,7 +8859,7 @@ class WorldBrowserWindow(QDialog):
         toggle_row.addStretch()
         right_lay.addLayout(toggle_row)
 
-        self.ia_puskas_title = QLabel("⚽ FIFA 푸스카스상 Top 10")
+        self.ia_puskas_title = QLabel("⚽ FIFA 푸스카스상 Top 11")
         self.ia_puskas_title.setStyleSheet(
             "color:#ffcc00;font-size:13px;font-weight:bold;margin-top:8px;")
         self.ia_puskas_title.setVisible(False)
@@ -8772,36 +8921,45 @@ class WorldBrowserWindow(QDialog):
         self.ia_puskas_tbl.setVisible(not show_yashin)
 
     def _refresh_ia_year_list(self):
-        self.ia_year_list.clear()
-        self.ia_ballon_winner_list.clear()
-        for year in wb.get_individual_award_years():
-            item = QListWidgetItem(str(year))
+        # [2026-09 리팩터, 신민용 리포트: "년도가 늘어나서 위아래 휠이
+        # 생기면 둘이 알맞게 배정되는게 아니라 좀 깨져 있어"] 예전엔 두
+        # QListWidget을 각각 clear/addItem했는데, 이제 2열 QTableWidget
+        # 하나(ia_year_tbl)에 0열=연도, 1열=발롱도르 우승자를 같은 행에
+        # 같이 채운다 — 같은 표의 같은 행이라 애초에 어긋날 수 없다.
+        years = wb.get_individual_award_years()
+        tbl = self.ia_year_tbl
+        tbl.setRowCount(len(years))
+        for i, year in enumerate(years):
+            item = QTableWidgetItem(str(year))
             item.setData(Qt.ItemDataRole.UserRole, year)
-            self.ia_year_list.addItem(item)
+            tbl.setItem(i, 0, item)
             winner = wb.get_ballon_dor_winner(year)
-            witem = QListWidgetItem(winner["name"] if winner else "—")
+            witem = QTableWidgetItem(winner["name"] if winner else "—")
+            witem.setForeground(QColor("#ffcc00"))
             if winner:
                 witem.setData(Qt.ItemDataRole.UserRole, winner["player_id"])
                 witem.setToolTip(f"{year}년 발롱도르: {winner['name']}")
             else:
                 witem.setToolTip(f"{year}년 발롱도르 수상자 없음")
-            self.ia_ballon_winner_list.addItem(witem)
+            tbl.setItem(i, 1, witem)
 
-    def _on_ia_year_row_changed(self, row_idx):
-        # ia_year_list와 ia_ballon_winner_list는 항상 같은 순서·같은
-        # 행 수로 채워지므로(_refresh_ia_year_list), 인덱스를 그대로
-        # 옮기기만 하면 두 목록이 절대 어긋나지 않는다.
-        if 0 <= row_idx < self.ia_ballon_winner_list.count():
-            self.ia_ballon_winner_list.setCurrentRow(row_idx)
-
-    def _on_ia_ballon_winner_double_clicked(self, item):
-        pid = item.data(Qt.ItemDataRole.UserRole)
+    def _on_ia_year_tbl_double_clicked(self, row, column):
+        # 1열(발롱도르 우승자 칸)을 더블클릭했을 때만 다른 개인상 표의
+        # 행과 동일하게 그 선수 상세로 이동 — 0열(연도 칸) 더블클릭은
+        # 단일클릭과 동일하게 그냥 그 해를 선택한 상태로 둔다.
+        if column != 1:
+            return
+        item = self.ia_year_tbl.item(row, 1)
+        pid = item.data(Qt.ItemDataRole.UserRole) if item else None
         if pid is None:
             return
         self.open_to_player(pid)
 
-    def _on_ia_year_selected(self, item):
-        year = item.data(Qt.ItemDataRole.UserRole)
+    def _on_ia_year_selected(self, row, column):
+        item = self.ia_year_tbl.item(row, 0)
+        year = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if year is None:
+            return
         self.ia_placeholder.setVisible(False)
 
         ballon_rows = wb.get_season_individual_awards(year, "발롱도르")

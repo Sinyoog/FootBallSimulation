@@ -680,6 +680,8 @@ def ensure_power_ranking_tables(conn):
 # 하지 않기 위함"이다. run_year_end_power_ranking_update 시작 시 매번
 # 비워서(다음 시즌엔 무조건 새로 읽음) 시즌 간 데이터가 섞일 일이 없다.
 _team_ab_cache: dict = {}
+_EQP_LOGGED: set = set()   # [2026-09 신설, 진단용] _update_team_a_from_matches의
+                            # 실행계획 로그를 (표,연도) 조합당 한 번만 찍기 위한 중복방지 집합
 # [2026-09 신설, 부진 스트릭] 위 _team_ab_cache와 완전히 같은 패턴/이유
 # (연 1회 배치 동안만 유효, run_year_end_power_ranking_update 시작 시
 # 매번 비움) — a_rating/b_rating과 별개 축이라 별도 캐시로 둔다.
@@ -1068,11 +1070,33 @@ def _team_continent_for_champions(conn, team_id: int) -> Optional[str]:
 def _update_team_a_from_matches(conn, matches_table: str, tournament_id: int, year: int,
                                  comp_weight: float, use_stage_col: bool = True,
                                  discount_same_league: bool = False, source: str = ""):
+    # [2026-09 신설, 진단용] SQL조회 시간이 계산량(경기수) 불변인데도
+    # 15년간 10배 늘었고, cache_size를 64MB→256MB로 올려도 전혀 개선이
+    # 없었다(=단순 캐시압박이 아니다) — 추측을 그만하고 실제 실행계획을
+    # 표별·연도별로 한 번씩 직접 찍어서 SEARCH인지 SCAN인지 확정한다.
+    global _EQP_LOGGED
+    _eqp_key = (matches_table, year)
+    if _eqp_key not in _EQP_LOGGED:
+        _EQP_LOGGED.add(_eqp_key)
+        try:
+            _plan = conn.execute(
+                f"EXPLAIN QUERY PLAN SELECT home_team_id, away_team_id, home_score, "
+                f"away_score, pso_winner, {'stage' if use_stage_col else 'round_idx'} "
+                f"FROM {matches_table} WHERE tournament_id=? ORDER BY id ASC",
+                (tournament_id,)).fetchall()
+            _cnt = conn.execute(f"SELECT COUNT(*) FROM {matches_table}").fetchone()[0]
+            _perf_log(f"[PERF-EQP] {year}년 {matches_table}(전체{_cnt}행) 실행계획: "
+                      f"{' / '.join(r[-1] for r in _plan)}")
+        except Exception as _e:
+            _perf_log(f"[PERF-EQP] {year}년 {matches_table} 실행계획 조회 실패: {_e}")
+    import time as _t_uam
+    _m0 = _t_uam.perf_counter()
     stage_col = "stage" if use_stage_col else "round_idx"
     rows = conn.execute(
         f"""SELECT home_team_id, away_team_id, home_score, away_score, pso_winner, {stage_col}
             FROM {matches_table} WHERE tournament_id=? ORDER BY id ASC""",
         (tournament_id,)).fetchall()
+    _m1 = _t_uam.perf_counter()
     for home_id, away_id, hs, as_, pso, stage in rows:
         if not home_id or not away_id:
             continue
@@ -1094,6 +1118,8 @@ def _update_team_a_from_matches(conn, matches_table: str, tournament_id: int, ye
                                       streak_home=sh, streak_away=sa)
         _add_team_a(conn, home_id, d_home, year, source=source or f"match:{matches_table}#{tournament_id}")
         _add_team_a(conn, away_id, d_away, year, source=source or f"match:{matches_table}#{tournament_id}")
+    _m2 = _t_uam.perf_counter()
+    return len(rows), _m1 - _m0, _m2 - _m1   # [진단용] 경기수, SQL조회시간, 파이썬루프시간
 
 
 def get_team_ps_map(conn, team_ids) -> dict:
@@ -1194,6 +1220,12 @@ def _update_team_a_from_league(conn, evaluation_year: int):
     차이가 사라졌다(신민용+GPT 합의). team_season_opp_strength가 그
     시즌 매주 실시간으로 쌓아둔 값을 쓰고, 정상적으로는 나오면 안 되는
     예외(0경기)만 조용히 league_avg로 폴백하지 않고 경고 로그를 남긴다."""
+    # [2026-09 신설, 진단용] 아래 쿼리(idx_lss_year 추가 대상)와 그 뒤
+    # 팀별 루프 중 실제로 어느 쪽이 무거운지 구분 — 합성 벤치마크로는
+    # 쿼리 자체가 빨라짐을 확인했는데 실측 총시간은 안 줄어서, 나머지
+    # (팀별 루프)를 의심 중이다.
+    import time as _t_utfl
+    _l0 = _t_utfl.perf_counter()
     rows = conn.execute(
         """SELECT s.team_id, s.wins, s.draws, s.losses, l.tier, s.season
            FROM league_season_standings s JOIN leagues l ON s.league_id = l.id
@@ -1209,6 +1241,7 @@ def _update_team_a_from_league(conn, evaluation_year: int):
                   loss_opp_ps_sum, loss_n
            FROM team_season_opp_strength WHERE season=?""", (season,)).fetchall()
     opp_by_team = {r[0]: r[1:] for r in opp_rows}
+    _l1 = _t_utfl.perf_counter()
     base_w = TEAM_COMPETITION_WEIGHT["league"]
     for team_id, wins, draws, losses, tier, _season in rows:
         rating = ratings[team_id]
@@ -1250,11 +1283,29 @@ def _update_team_a_from_league(conn, evaluation_year: int):
         # 문제)을 구분할 수 있다.
         _power_debug_log(conn, team_id, "A", f"league_raw(actual={actual_points:.1f},expected={expected_points:.1f})", raw)
         _add_team_a(conn, team_id, delta, evaluation_year, source="A:league")
+    _l2 = _t_utfl.perf_counter()
+    _perf_log(f"[PERF-POWER-A]   _update_team_a_from_league 세부: "
+              f"조회(standings+opp_strength) {_l1-_l0:.3f}s | "
+              f"팀별루프({len(rows)}팀) {_l2-_l1:.3f}s")
 
 
 def update_team_ratings_for_year(conn, evaluation_year: int):
+    # [2026-09 신설, 진단용] 15년 장기실측에서 이 함수(팀A값) 총시간이
+    # +92~105% 늘었는데, league_season_standings에 year 인덱스를 추가해도
+    # 개선이 거의 안 보였다(합성 벤치마크로 그 쿼리 자체는 실제로 빨라짐을
+    # 확인함 — 즉 이 함수 총시간의 대부분이 그 쿼리가 아니라는 뜻). 아래
+    # 두 구간(국내리그 처리 vs 대회 처리)과 대회/경기 건수를 같이 찍어서
+    # 다음 실측에서 어느 쪽이 실제로 자라는지 숫자로 가른다 — 로직은
+    # 전혀 안 건드림.
+    import time as _t_ptr
+    _tr0 = _t_ptr.perf_counter()
     ensure_power_ranking_tables(conn)
     _update_team_a_from_league(conn, evaluation_year)
+    _tr1 = _t_ptr.perf_counter()
+    _n_tournaments = 0
+    _n_matches = 0
+    _sql_total = 0.0
+    _loop_total = 0.0
     for category, (tournaments_table, matches_table) in _CLUB_COMP_TABLES.items():
         # [2026-09 정정] 유로파/컨퍼런스도 챔스처럼 continent별로 가중치가
         # 갈리므로(대륙 서열: 유럽>남미>아프리카>아시아>북미) 이 셋 다
@@ -1266,13 +1317,22 @@ def update_team_ratings_for_year(conn, evaluation_year: int):
             f"SELECT id, NULL FROM {tournaments_table} WHERE year=?",
             (evaluation_year,)).fetchall()
         for tid, continent in tids_rows:
+            _n_tournaments += 1
             weight = _club_comp_weight(category, continent)
-            _update_team_a_from_matches(
+            _n_m, _sql_t, _loop_t = _update_team_a_from_matches(
                 conn, matches_table, tid, evaluation_year, weight,
                 use_stage_col=(category not in ("domestic_cup", "lower_cup")),
                 discount_same_league=(category in ("champions", "europa", "conference")),
                 source=f"A:{category}")
+            _n_matches += _n_m
+            _sql_total += _sql_t
+            _loop_total += _loop_t
+    _tr2 = _t_ptr.perf_counter()
     conn.commit()
+    _perf_log(f"[PERF-POWER-A] {evaluation_year}년 팀A값 세부: "
+              f"국내리그처리 {_tr1-_tr0:.3f}s | "
+              f"대회처리 {_tr2-_tr1:.3f}s ({_n_tournaments}개 토너먼트·{_n_matches}경기, "
+              f"└SQL조회 {_sql_total:.3f}s · 파이썬루프 {_loop_total:.3f}s)")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1369,11 +1429,17 @@ def _apply_team_league_streak(conn, league_id: int, champion_team_id: int) -> fl
 
 
 def update_team_b_for_year(conn, evaluation_year: int):
+    # [2026-09 신설, 진단용] update_team_ratings_for_year의 [PERF-POWER-A]와
+    # 짝을 이루는 계측 — 팀B값도 같은 15년 장기실측에서 +148~155% 늘었는데
+    # 원인이 아직 안 갈려서 같은 방식으로 3구간을 나눠 찍는다.
+    import time as _t_utby
+    _b0 = _t_utby.perf_counter()
     # 1) 국내리그 순위 보너스(백분위 기반, 리그 부(tier)로 가중치 조정) + 연속우승 감쇠
     rows = conn.execute(
         """SELECT l.id, l.tier, s.team_id, s.wins, s.draws, s.losses
            FROM league_season_standings s JOIN leagues l ON s.league_id = l.id
            WHERE s.year=?""", (evaluation_year,)).fetchall()
+    _n_teams_layer1 = len(rows)
     by_league = {}
     tier_of_league = {}
     for league_id, tier, team_id, wins, draws, losses in rows:
@@ -1422,6 +1488,7 @@ def update_team_b_for_year(conn, evaluation_year: int):
                 # 대비해 델타 0으로 안전하게 존재를 보장).
                 _add_team_a(conn, team_id, 0.0, evaluation_year, source="streak-touch")
             _set_team_streak(conn, team_id, new_streak)
+    _b1 = _t_utby.perf_counter()
 
     # 1b) [2026-08 신설, 신민용 버그 리포트: "우승 보정만 있고 강등(패배)
     # 보정이 없다"] 강등은 그 자체로 레이어B 페널티 — 강등 단계 수 ×
@@ -1437,20 +1504,28 @@ def update_team_b_for_year(conn, evaluation_year: int):
         levels = max(1, (to_tier or 0) - (from_tier or 0))
         penalty = RELEGATION_BASE_PENALTY * levels * league_tier_weight(from_tier)
         _add_team_b(conn, team_id, penalty, evaluation_year, source="B:relegation_penalty")
+    _b2 = _t_utby.perf_counter()
 
     # 2) 국제/국내컵 계열 대회 성적 보너스 (deepest-stage 판정)
+    _n_tournaments = 0
     for category, (tournaments_table, matches_table) in _CLUB_COMP_TABLES.items():
         _has_continent = category in _CLUB_CONTINENT_WEIGHT_TABLE
         rows = conn.execute(
             f"SELECT id, {'continent' if _has_continent else 'NULL'} "
             f"FROM {tournaments_table} WHERE year=?", (evaluation_year,)).fetchall()
         for tid, continent in rows:
+            _n_tournaments += 1
             weight = _club_comp_weight(category, continent)
             placements = _deepest_stage_participants(
                 conn, matches_table, tid, use_stage_col=(category not in ("domestic_cup", "lower_cup")))
             for team_id, tier in placements.items():
                 base = PLACEMENT_BASE_SCORE[tier]
                 _add_team_b(conn, team_id, base * weight, evaluation_year, source=f"B:{category}")
+    _b3 = _t_utby.perf_counter()
+    _perf_log(f"[PERF-POWER-B] {evaluation_year}년 팀B값 세부: "
+              f"국내리그순위보너스({_n_teams_layer1}팀) {_b1-_b0:.3f}s | "
+              f"강등페널티 {_b2-_b1:.3f}s | "
+              f"대회보너스({_n_tournaments}개 토너먼트) {_b3-_b2:.3f}s")
 
 
 # ══════════════════════════════════════════════════════════════

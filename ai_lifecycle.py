@@ -681,9 +681,14 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
     # 그대로 재사용해서(추가 쿼리 없음) 전 선수 OVR을 한 번에 아카이브
     # 한다 — 은퇴 예정자도 이 시점엔 아직 ai_players에 남아있으므로
     # "은퇴하는 그 해"까지 정상적으로 기록된다.
-    c.executemany(
-        "INSERT OR REPLACE INTO hist.ai_player_ovr_history(player_id, year, ovr) VALUES (?,?,?)",
-        [(r["id"], year, r["ovr"]) for r in shared_ai_rows])
+    # [2026-09 신설, 히스토리 비동기 writer] 이전엔 여기서 c.executemany로
+    # hist에 즉시 커밋했다 — 이제 "이 순간 완성된 행 목록"만 큐에 넘기고
+    # 실제 커밋은 단일 워커가 담당한다(database.py 상단 히스토리 writer
+    # 설계 불변식 참고). 이 아래 conn.commit()은 main 스키마 변경분만
+    # 커밋한다 — hist는 더 이상 이 트랜잭션에 안 묶인다.
+    from database import history_enqueue
+    history_enqueue("ai_player_ovr_history",
+                     [(r["id"], year, r["ovr"]) for r in shared_ai_rows])
 
     # [2026-08 신설, 신민용 리포트: "1년씩 진행하면 기록되는데 10년을
     # 한번에 진행하면 기록이 안 되는 경우가 있다"] 원인 추정: 이 함수
@@ -914,9 +919,9 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
     _final_ids_rows = c.execute("SELECT id, ovr FROM ai_players").fetchall()
     _new_this_season = [r for r in _final_ids_rows if r["id"] not in _season_start_ids]
     if _new_this_season:
-        c.executemany(
-            "INSERT OR REPLACE INTO hist.ai_player_ovr_history(player_id, year, ovr) VALUES (?,?,?)",
-            [(r["id"], year, r["ovr"]) for r in _new_this_season])
+        from database import history_enqueue
+        history_enqueue("ai_player_ovr_history",
+                         [(r["id"], year, r["ovr"]) for r in _new_this_season])
 
     # [2026-09 신설, 성능 감사 5위 — 선수 검색 "경력(년)" 필터 상관 서브쿼리
     # 제거] 이 시즌의 OVR 이력 기록(위 두 executemany)과 은퇴 처리
@@ -3184,7 +3189,7 @@ def _retire_and_replace(c, year, ai_rows=None):
                                  team_info.get(r["team_id"], (None,) * 6)[5], year))
         new_rows.append((
             r["team_id"], name, r["position"],
-            *[stats[s] for s in ALL_STATS], new_ovr, new_age, new_sub_role, new_nat,
+            *[stats[s] for s in ALL_STATS], new_ovr, new_age, new_sub_role, new_nat, new_nat,
             year + random.randint(3, 5), 0, year,
             _calc_ai_salary(grade, tier, new_ovr, cname, _tname, r["team_id"], year),
             _new_potential_ovr))
@@ -3203,11 +3208,17 @@ def _retire_and_replace(c, year, ai_rows=None):
         c.executemany("DELETE FROM ai_players WHERE id=?", retire_deletes)
     _rt6 = _time_rt.perf_counter()   # ai_players 은퇴자 DELETE
     if new_rows:
+        # [2026-09 신설, 위 은퇴대체 국적 재배정 주석 참고] new_nat를
+        # nationality/true_nationality 둘 다에 넣는다 — 은퇴대체로 새로
+        # 태어나는 신인의 "진짜 국적"은 이 시점에 딱 한 번 정해지고, 이후
+        # 클럽 쿼터 전환으로 nationality만 바뀌어도 true_nationality는
+        # 그대로 남는다(database.true_nationality 컬럼 주석 참고).
         c.executemany(
             f"""INSERT INTO ai_players
                 (team_id,name,position,{_STAT_COLS},ovr,age,sub_role,nationality,
-                 contract_end_year,last_transfer_year,created_year,salary,potential_ovr)
-                VALUES(?,?,?,{','.join('?' for _ in ALL_STATS)},?,?,?,?,?,?,?,?,?)""",
+                 true_nationality,contract_end_year,last_transfer_year,created_year,
+                 salary,potential_ovr)
+                VALUES(?,?,?,{','.join('?' for _ in ALL_STATS)},?,?,?,?,?,?,?,?,?,?)""",
             new_rows)
     _rt7 = _time_rt.perf_counter()   # ai_players 신인 INSERT
     # [2026-09 신설] 위 "명문팀 은퇴대체 영입" 건 — 신인 INSERT(new_rows)와
@@ -3771,6 +3782,21 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
     for tid, plist in team_players.items():
         _cn = dst_country_by_tid.get(tid)
         foreign_count_by_tid[tid] = sum(1 for p in plist if p.get("nationality") and p["nationality"] != _cn)
+    # [2026-09 성능실험, cProfile 실측: dict.get 984만 회 중 foreign_count_by_tid.
+    # get(t, 0)이 단독 최대 기여자(샘플 추정 약 164만 회)] 위 루프는 team_players에
+    # 선수가 있는 팀만 채운다 — 선수단이 텅 빈 팀(드묾)은 여기 없어서, 아래
+    # _do_one_transfer_cached의 목적지 후보 루프가 매 후보마다 어쩔 수 없이
+    # .get(t, 0)을 불러야 했다. 여기서 teams의 모든 팀ID에 대해 딱 한 번만
+    # 기본값 0을 채워두면(이미 있는 값은 안 건드림) 그 이후엔 항상 키가
+    # 존재하므로 직접 인덱싱 foreign_count_by_tid[t]로 바꿀 수 있다 — 값은
+    # .get(t, 0)이 주던 것과 완전히 동일(선수 없는 팀=외국인 0명), _sw_by_tid도
+    # 이미 같은 이유로 동일 패턴(빈 팀은 0으로 채움)을 쓰고 있다(위 pool_cache
+    # 빌드부의 "if _t not in sw_by_tid" 참고) — 이번 실험이 그 패턴을 그대로
+    # 따르는 것뿐이다. 이적이 성사될 때마다의 증감(old_tid/new_tid 처리부)은
+    # 이미 대상 팀이 team_players에 있던 팀이라 키가 항상 있었으므로 안 건드림.
+    for _t in teams:
+        if _t["tid"] not in foreign_count_by_tid:
+            foreign_count_by_tid[_t["tid"]] = 0
     _tm3 = _time_tm.perf_counter()
 
     # 이적 결과 누적 후 executemany
@@ -4726,7 +4752,7 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
             # 도달했으면 후보에서 아예 뺀다 — 자국 선수 영입이나 쿼터
             # 여유가 있는 팀은 전혀 영향 없다.
             if (_quota_check_on and _qhi is not None and _cty and _cty != _mover_nat
-                    and foreign_count_by_tid.get(t, 0) >= _qhi):
+                    and foreign_count_by_tid[t] >= _qhi):
                 continue
             gap = _avg - mover_ovr
             w = _exp(-(gap * gap) / _den) * _sw_by_tid[t]
@@ -4749,7 +4775,7 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
             if _ceil is not None and (mover_ovr - _ceil) > _DST_CEIL_HARD_EXCLUDE:
                 continue
             if (_quota_check_on and _qhi is not None and _cty and _cty != _mover_nat
-                    and foreign_count_by_tid.get(t, 0) >= _qhi):
+                    and foreign_count_by_tid[t] >= _qhi):
                 continue
             gap = _avg - mover_ovr
             w = _exp(-(gap * gap) / _den) * _sw_by_tid[t]
@@ -5046,7 +5072,8 @@ def _rebalance_squad_sizes(c, year):
                     stats["shooting"], stats["passing"], stats["dribbling"],
                     stats["tackling"], stats["heading"], stats["positioning"],
                     stats["setpiece"], stats["mental"], stats["confidence"],
-                    stats["leadership"], stats["concentration"], ovr, age, sub_role, nat,
+                    stats["leadership"], stats["concentration"], ovr, age, sub_role,
+                    nat, nat,
                     year + random.randint(2, 4), 0, year,
                     max(ovr, roll_potential_ovr(_topup_growth_cap, _topup_kind))))
                 topped_up += 1
@@ -5161,19 +5188,23 @@ def _rebalance_squad_sizes(c, year):
                             _stats["shooting"], _stats["passing"], _stats["dribbling"],
                             _stats["tackling"], _stats["heading"], _stats["positioning"],
                             _stats["setpiece"], _stats["mental"], _stats["confidence"],
-                            _stats["leadership"], _stats["concentration"], _ovr, _age, _sub_role, _nat,
+                            _stats["leadership"], _stats["concentration"], _ovr, _age, _sub_role,
+                            _nat, _nat,
                             year + random.randint(2, 4), 0, year,
                             max(_ovr, roll_potential_ovr(_swap_growth_cap, _swap_kind))))
                         topped_up += 1
                         forced_out += 1
 
     if new_rows:
+        # [2026-09 신설, database.true_nationality 컬럼 주석 참고] 포지션
+        # 뎁스 보충으로 새로 태어나는 선수도 은퇴대체와 동일하게 nationality/
+        # true_nationality를 함께 채운다.
         c.executemany("""INSERT INTO ai_players
             (team_id,name,position,stamina,speed,jump,strength,shooting,passing,
              dribbling,tackling,heading,positioning,setpiece,
              mental,confidence,leadership,concentration,ovr,age,sub_role,nationality,
-             contract_end_year,last_transfer_year,created_year,potential_ovr)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", new_rows)
+             true_nationality,contract_end_year,last_transfer_year,created_year,potential_ovr)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", new_rows)
     if delete_ids:
         _archive_forced_out_players(c, delete_ids, year)
         c.executemany("DELETE FROM ai_players WHERE id=?", [(i,) for i in delete_ids])
@@ -5247,6 +5278,19 @@ def _snapshot_season_positions(c, year, only_missing=False, rows=None):
     # 선수 행뿐이라 이미 1)에서 기록된 값은 절대 덮어쓰지 않는다.
     _missing_ids = None
     if only_missing:
+        # [2026-09 신설, 히스토리 비동기 writer] 이 NOT EXISTS 체크는 "이
+        # 해 hist.ai_player_position_history에 아직 행이 없는 선수"를
+        # 찾는다 — 그런데 그 표의 실제 쓰기가 이제 비동기 큐를 거치므로,
+        # 이 시점(같은 시즌의 1차 전체패스가 끝난 지 몇 주 뒤, only_missing
+        # 2차 패스)에 워커가 아직 그 1차 패스를 커밋 안 했다면 전원이
+        # "없는 것"으로 잘못 잡혀 26만 행이 통째로 다시 계산·저장된다
+        # (read-after-write 의존성 — 3+8이 5로 보이는 바로 그 종류의
+        # 버그). 여기서 drain해 hist.db가 지금까지 큐에 들어간 내용과
+        # 확실히 같은 상태임을 보장한 뒤 읽는다 — 1차 패스와 이 시점
+        # 사이엔 보통 최소 한 번의 오토세이브(그 안에서 이미 drain)가
+        # 끼어 있어 실제로는 거의 항상 즉시 반환된다.
+        from database import history_drain
+        history_drain()
         _missing = c.execute(
             """SELECT ap.id, ap.team_id FROM ai_players ap
                WHERE ap.team_id IS NOT NULL
@@ -5410,11 +5454,14 @@ def _snapshot_season_positions(c, year, only_missing=False, rows=None):
         # 이 해 행이 없던 선수(이번 오프시즌 신규 생성)뿐이다.
         inserts = [t for t in inserts if t[0] in _missing_ids]
 
+    # [2026-09 신설, 히스토리 비동기 writer] 이전엔 여기서 c.executemany로
+    # hist에 즉시 커밋했다 — 이제 큐에 넘기기만 한다(database.py 상단
+    # 설계 불변식 참고). 정렬 등 "행 내용을 확정하는" 처리는 전부 이
+    # 함수(메인 스레드) 안에서 이미 끝난 뒤이므로, 큐에 들어가는 건 완성된
+    # 불변(immutable) 스냅샷이다.
+    from database import history_enqueue
     if team_inserts:
-        c.executemany(
-            "INSERT OR REPLACE INTO hist.team_season_lineup"
-            "(team_id, year, formation, slots_json, bench_json) "
-            "VALUES (?,?,?,?,?)", team_inserts)
+        history_enqueue("team_season_lineup", team_inserts)
 
     if inserts:
         # [2026-08 최적화] player_id 순으로 정렬해서 넣는다. 이 표의 기본키는
@@ -5425,9 +5472,23 @@ def _snapshot_season_positions(c, year, only_missing=False, rows=None):
         # 붙기만 하면 된다. 정렬은 안정 정렬이고 (player_id, year)가 이 목록
         # 안에서 유일하므로(선수 한 명당 이 해에 한 행) 저장 결과는 완전히 동일.
         inserts.sort(key=_ins_key)
-        c.executemany(
-            "INSERT OR REPLACE INTO hist.ai_player_position_history(player_id, year, position, role) "
-            "VALUES (?,?,?,?)", inserts)
+        history_enqueue("ai_player_position_history", inserts)
+
+    # [2026-09 신설, 히스토리 비동기 writer] _snapshot_season_ratings가
+    # 바로 이어서(같은 호출 시퀀스 안에서) 이 해의 role/실질포지션을
+    # 다시 읽어가는데, 방금 큐에 넣은 hist 쓰기가 아직 워커에 의해
+    # 커밋되기 전일 수 있다(이 둘은 game_engine._process_promotion_
+    # relegation에서 거의 곧바로 연달아 호출됨 — history_drain()으로
+    # 기다리면 26만행 커밋을 그 자리에서 그대로 기다리는 꼴이라 애초에
+    # 비동기화한 의미가 없어진다). 대신 이 함수가 이미 메모리에 들고
+    # 있는 값을 그대로 반환해서, 호출부가 DB 왕복 없이 직접 넘겨줄 수
+    # 있게 한다 — game_engine._process_promotion_relegation의 호출부
+    # 수정 참고.
+    return {t[0]: (t[2], t[3]) for t in inserts}
+
+
+_SNAPSHOT_EQP_LOGGED: set = set()   # [2026-09 신설, 진단용] _snapshot_team_lineup_half의
+                                      # 실행계획 로그를 연도당 한 번만 찍기 위한 중복방지 집합
 
 
 def _snapshot_team_lineup_half(c, year):
@@ -5467,12 +5528,41 @@ def _snapshot_team_lineup_half(c, year):
     from formation_logic import _greedy_fill_slots, compute_squad_roles
     from constants import FORMATION_SLOTS
     import json
+    import time as _t_snap
+
+    # [2026-09 신설, 진단용] "스냅샷INSERT" 버킷이 15년간 +125%(1.5s→3.4s)
+    # 늘었는데 원인을 못 찾았다 — lower_cup_matches 때처럼 SELECT/파이썬
+    # 처리/INSERT 2종을 각각 갈라서 재고, growing table(WITHOUT ROWID,
+    # (entity_id, year) PK)인 hist.team_season_lineup_half/hist.ai_player_
+    # position_history_half의 실행계획도 연도당 한 번씩 확인한다. 로직은
+    # 전혀 안 바꾼다 — 계측만 추가.
+    _sn0 = _t_snap.perf_counter()
+    if year not in _SNAPSHOT_EQP_LOGGED:
+        _SNAPSHOT_EQP_LOGGED.add(year)
+        try:
+            _plan = c.execute(
+                """EXPLAIN QUERY PLAN SELECT ap.id AS id, ap.team_id AS team_id,
+                       ap.position AS position, ap.ovr AS ovr, ap.age AS age,
+                       t.formation AS formation
+                   FROM ai_players ap JOIN teams t ON ap.team_id = t.id
+                   WHERE ap.team_id IS NOT NULL""").fetchall()
+            _cnt_lineup = c.execute(
+                "SELECT COUNT(*) FROM hist.team_season_lineup_half").fetchone()[0]
+            _cnt_role = c.execute(
+                "SELECT COUNT(*) FROM hist.ai_player_position_history_half").fetchone()[0]
+            _perf_log(f"[PERF-SNAPSHOT-EQP] {year}년 ai_players/teams 조회: "
+                      f"{' / '.join(r[-1] for r in _plan)} | "
+                      f"team_season_lineup_half(전체{_cnt_lineup}행) | "
+                      f"ai_player_position_history_half(전체{_cnt_role}행)")
+        except Exception as _e:
+            _perf_log(f"[PERF-SNAPSHOT-EQP] {year}년 실행계획 조회 실패: {_e}")
 
     rows = c.execute(
         """SELECT ap.id AS id, ap.team_id AS team_id, ap.position AS position,
                   ap.ovr AS ovr, ap.age AS age, t.formation AS formation
            FROM ai_players ap JOIN teams t ON ap.team_id = t.id
            WHERE ap.team_id IS NOT NULL""").fetchall()
+    _sn1 = _t_snap.perf_counter()   # [진단용] ai_players SELECT 끝
     if not rows:
         return
 
@@ -5527,23 +5617,40 @@ def _snapshot_team_lineup_half(c, year):
         team_inserts.append((_team_id, year, formation,
                               json.dumps(slots_payload), json.dumps(bench_payload)))
 
+    _sn2 = _t_snap.perf_counter()   # [진단용] 파이썬 처리(팀별 슬롯배정+역할계산) 끝
+
+    # [2026-09 신설, 히스토리 비동기 writer] 이전엔 c.executemany로 즉시
+    # 커밋했다 — 이제 큐에 넘기기만 한다. 이 표들(team_season_lineup_half/
+    # ai_player_position_history_half)은 이후 같은 시즌 안에서 다른
+    # 게임로직이 다시 읽어가는 지점이 없음을 확인했으므로(월드 브라우저
+    # UI만 읽음 — 그쪽은 약간의 지연 반영이어도 무방) drain 없이 그대로
+    # 큐에만 넣는다.
+    from database import history_enqueue
     if team_inserts:
-        c.executemany(
-            "INSERT OR REPLACE INTO hist.team_season_lineup_half"
-            "(team_id, year, formation, slots_json, bench_json) "
-            "VALUES (?,?,?,?,?)", team_inserts)
+        history_enqueue("team_season_lineup_half", team_inserts)
+    _sn3 = _t_snap.perf_counter()   # [진단용] team_season_lineup_half INSERT 끝
 
     if role_inserts:
         # [2026-08 최적화] _snapshot_season_positions와 동일한 이유 —
         # (player_id, year) WITHOUT ROWID 기본키라 player_id 순으로
         # 넣어야 B-tree 페이지 분할이 안 생긴다.
         role_inserts.sort(key=_ins_key)
-        c.executemany(
-            "INSERT OR REPLACE INTO hist.ai_player_position_history_half"
-            "(player_id, year, position, role) VALUES (?,?,?,?)", role_inserts)
+        _sn3b = _t_snap.perf_counter()   # [진단용] 정렬 끝 / INSERT 시작
+        history_enqueue("ai_player_position_history_half", role_inserts)
+    else:
+        _sn3b = _sn3
+    _sn4 = _t_snap.perf_counter()   # [진단용] ai_player_position_history_half INSERT 끝
+
+    _perf_log(f"[PERF-SNAPSHOT] {year}년 _snapshot_team_lineup_half 세부: "
+              f"ai_players SELECT {_sn1-_sn0:.3f}s({len(rows)}행) | "
+              f"파이썬처리 {_sn2-_sn1:.3f}s({len(by_team)}팀) | "
+              f"lineup_half INSERT {_sn3-_sn2:.3f}s({len(team_inserts)}건) | "
+              f"position_history_half 정렬 {_sn3b-_sn3:.3f}s + INSERT {_sn4-_sn3b:.3f}s"
+              f"({len(role_inserts)}건)")
 
 
-def _snapshot_season_ratings(c, year, team_goals_for=None, include_league=True, competitions=None):
+def _snapshot_season_ratings(c, year, team_goals_for=None, include_league=True, competitions=None,
+                              pos_role_by_pid=None):
     """[2026-08 신설, 신민용 요청: "세계 축구 기록실 연도별 기록 밑에
     그 해 평균 평점/골/도움 요약을 얇은 행으로 하나 더 보여달라"]
 
@@ -5632,9 +5739,28 @@ def _snapshot_season_ratings(c, year, team_goals_for=None, include_league=True, 
     # "실질 포지션"으로 재사용한다 — role과 완전히 같은 출처라 항상 서로
     # 맞아떨어진다. 스냅샷이 없는 선수(과거 세이브 등)는 기존처럼
     # ap.position(고정 등록값) 그대로 폴백한다.
-    _pos_role_by_pid = {r["player_id"]: (r["position"], r["role"]) for r in c.execute(
-        "SELECT player_id, position, role FROM hist.ai_player_position_history WHERE year=?",
-        (year,)).fetchall()}
+    #
+    # [2026-09 신설, 히스토리 비동기 writer] 이 값은 원래 여기서 hist.
+    # ai_player_position_history를 직접 SELECT해서 구했다 — 그런데
+    # _snapshot_season_positions의 실제 hist 쓰기가 이제 비동기 큐를
+    # 거치고, 이 함수는 보통 그 직후(같은 호출 시퀀스 안, game_engine.
+    # _process_promotion_relegation) 바로 불린다. 여기서 drain해 기다리면
+    # 방금 넣은 26만행 커밋을 그 자리에서 그대로 기다리는 꼴이라 애초에
+    # 비동기화한 의미가 없어진다 — 그래서 hist를 다시 읽는 대신, 호출부가
+    # _snapshot_season_positions의 반환값을 pos_role_by_pid로 그대로
+    # 넘겨받아 쓴다(DB 왕복 자체가 없어지므로 오히려 더 빠르다). 이
+    # 인자가 없을 때만(예: skip_season_snapshot=False 경로로 이 함수가
+    # 단독 호출되는 예전 방식, 또는 하위호환) 기존처럼 hist에서 직접
+    # 읽는다 — 이 경우엔 그 값이 이미 충분히 오래 전(과거 시즌 등)에
+    # 커밋됐다고 보는 게 합리적이므로 drain 후 조회한다.
+    if pos_role_by_pid is not None:
+        _pos_role_by_pid = pos_role_by_pid
+    else:
+        from database import history_drain
+        history_drain()
+        _pos_role_by_pid = {r["player_id"]: (r["position"], r["role"]) for r in c.execute(
+            "SELECT player_id, position, role FROM hist.ai_player_position_history WHERE year=?",
+            (year,)).fetchall()}
     # [2026-09 성능] sqlite3.Row를 문자열 키로 인덱싱하는 건 컬럼 이름
     # 목록을 매번 훑는 C 레벨 선형탐색이다. 이 함수는 26만 행을 리그 1회 +
     # 대회 5회로 반복해서 도므로 그 조회만 수백만 회가 된다 — 조회 직후
@@ -5761,10 +5887,10 @@ def _snapshot_season_ratings(c, year, team_goals_for=None, include_league=True, 
 
         inserts = [tuple(row) for row in raw]
         inserts.sort(key=lambda t: (t[0], t[1]))
-        c.executemany(
-            "INSERT OR REPLACE INTO hist.ai_player_season_stats"
-            "(player_id, year, team_id, matches, goals, assists, rating, clean_sheets, saves, goals_conceded) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)", inserts)
+        # [2026-09 신설, 히스토리 비동기 writer] 이전엔 여기서 즉시 커밋했다
+        # — 이제 큐에 넘기기만 한다(database.py 상단 설계 불변식 참고).
+        from database import history_enqueue
+        history_enqueue("ai_player_season_stats", inserts)
 
     # [2026-09 신설] 대회별(국내컵/클럽대항전/슈퍼컵/클럽월드컵) 추정치 —
     # 위 리그와 완전히 같은 공식·team_avg/league_avg를 재사용하되, 이번
@@ -5927,10 +6053,8 @@ def _snapshot_season_ratings(c, year, team_goals_for=None, include_league=True, 
 
     if by_comp_inserts:
         by_comp_inserts.sort(key=lambda t: (t[0], t[1], t[2]))
-        c.executemany(
-            "INSERT OR REPLACE INTO hist.ai_player_season_stats_by_comp"
-            "(player_id, year, competition, matches, goals, assists, rating, clean_sheets, saves, goals_conceded) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)", by_comp_inserts)
+        from database import history_enqueue
+        history_enqueue("ai_player_season_stats_by_comp", by_comp_inserts)
 
 
 def _snapshot_intl_ratings_rows(c, rows):
@@ -6600,7 +6724,7 @@ def apply_squad_turnover_after_movement(rescale_jobs, year, turnover_frac=0.25,
                                                 False, foreign_ct, quota)
             name = _random_name(c, team_id, name_cache, used_in_team=used)
             new_rows.append((team_id, name, pos, *[stats[s] for s in ALL_STATS], ovr, age,
-                              sub_role, nat, year + random.randint(2, 4), 0, year,
+                              sub_role, nat, nat, year + random.randint(2, 4), 0, year,
                               max(ovr, roll_potential_ovr(_turnover_growth_cap))))
             replaced += 1
 
@@ -6608,11 +6732,13 @@ def apply_squad_turnover_after_movement(rescale_jobs, year, turnover_frac=0.25,
         _archive_forced_out_players(c, del_ids, year)
         c.executemany("DELETE FROM ai_players WHERE id=?", [(i,) for i in del_ids])
     if new_rows:
+        # [2026-09 신설, database.true_nationality 컬럼 주석 참고] 승강
+        # 직후 스쿼드 교체로 새로 태어나는 선수도 동일하게 채운다.
         c.executemany(
             f"""INSERT INTO ai_players
                 (team_id,name,position,{_STAT_COLS},ovr,age,sub_role,nationality,
-                 contract_end_year,last_transfer_year,created_year,potential_ovr)
-                VALUES(?,?,?,{','.join('?' for _ in ALL_STATS)},?,?,?,?,?,?,?,?)""",
+                 true_nationality,contract_end_year,last_transfer_year,created_year,potential_ovr)
+                VALUES(?,?,?,{','.join('?' for _ in ALL_STATS)},?,?,?,?,?,?,?,?,?)""",
             new_rows)
     conn.commit()
     return replaced, released

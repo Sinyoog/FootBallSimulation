@@ -212,6 +212,17 @@ def init_lower_cup_tables(c):
         c.execute("ALTER TABLE lower_cup_matches ADD COLUMN my_team_id INTEGER DEFAULT 0")
     except Exception:
         pass   # 이미 있음
+    # [2026-09 신설, 15년 장기실측 진단으로 발견] cl_matches/el_matches/
+    # ecl_matches/sc_matches/cup_matches/cwc_matches는 전부 database.py에
+    # idx_XX_matches_tid_week(tournament_id, week) 인덱스가 있는데, 이 표
+    # (다른 파일에서 만들어짐)만 빠져 있었다. power_ranking._update_team_a_
+    # from_matches/_deepest_stage_participants의 "WHERE tournament_id=?"가
+    # 이 표만 매번 SCAN을 탔고, 이 표가 하필 7개 중 가장 빨리 커져서
+    # (15년간 6,376행→95,640행, 매년 정리 없이 누적) 연도전환의 "대회처리"
+    # SQL조회 시간이 15년간 약 10배로 늘어난 핵심 원인이었다(EXPLAIN QUERY
+    # PLAN으로 실측 확인 — 나머지 6개 표는 전부 정상적으로 SEARCH를 탐).
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_lower_cup_matches_tid_week
+                 ON lower_cup_matches(tournament_id, week)""")
     c.execute("""CREATE TABLE IF NOT EXISTS lower_cup_history(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         year INTEGER, country_id INTEGER, team_name TEXT, result TEXT,
