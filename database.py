@@ -3129,6 +3129,16 @@ def init_db():
         # 찍어 저장해둔다 — 선수 커리어가 이후 어떻게 바뀌든 이 대회 기록의
         # 포지션은 그때 그대로 남는다.
         "ALTER TABLE intl_squad ADD COLUMN position TEXT DEFAULT ''",
+        # [2026-09 신설, 신민용 리포트: "선수 검색에 뜨는 국가대표 출전
+        # 포지션이 무조건 주포로 뜬다 — 국가 검색 대회 포메이션에선 LW에
+        # 있는데 선수 검색에선 CM으로 뜬다"] 바로 위 position 컬럼은 26인이
+        # 확정되던 시점의 ap.position(= 그 선수의 "주포지션") 스냅샷이라,
+        # "대표팀에서 실제로 어느 자리를 맡았는가"와는 다른 값이다(주포 CM인
+        # 선수가 대표팀에선 LW로 뛰는 건 흔하다). 주전 11명이 확정되는
+        # 시점(intl_engine._pick_intl_starters)에 그 선수가 배정된 포메이션
+        # 슬롯을 여기 따로 남긴다 — 벤치는 배정 자체가 없으므로 빈 값이고,
+        # 그 경우 화면은 예전처럼 position(주포) 스냅샷으로 폴백한다.
+        "ALTER TABLE intl_squad ADD COLUMN slot TEXT DEFAULT ''",
     ]:
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,
@@ -7209,7 +7219,7 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
     return picked
 
 
-def set_intl_squad_starters(tournament_id, country, player_ids):
+def set_intl_squad_starters(tournament_id, country, player_ids, slots=None):
     """[2026-08 버그수정, 신민용 리포트: "월드컵 출전기록이 이상하게
     흩어진다 — 주전 골키퍼도 3연속 못 뛰고 출전이 나뉜다"] 이 대회에서
     이 나라가 처음 소집됐을 때 딱 한 번 뽑은 주전 11명(player_ids)을
@@ -7230,16 +7240,27 @@ def set_intl_squad_starters(tournament_id, country, player_ids):
     있던 표시는 그대로 남아 결과적으로 11명보다 많은 선수가 starter=1로
     뒤섞이는 문제가 있었다. 그래서 항상 "이 대회·이 나라의 starter 표시를
     통째로 지우고 새로 켜는" 방식(완전 교체)으로 바꿔 몇 번을 다시
-    불러도 항상 정확히 player_ids만 starter=1이 되게 한다."""
+    불러도 항상 정확히 player_ids만 starter=1이 되게 한다.
+
+    [2026-09 확장, 신민용 리포트: "국가대표 출전 포지션이 무조건 주포로
+    뜬다"] slots({player_id: 포메이션 슬롯})를 같이 넘기면 intl_squad.slot에
+    함께 저장한다 — "이 선수가 이 대회에서 실제로 맡은 자리"라서, 나중에
+    주포지션이 바뀌어도 이 대회 기록의 자리는 그대로 남는다. 안 넘기면
+    빈 값으로 저장되고 화면은 예전처럼 position(주포) 스냅샷으로 폴백한다.
+    """
     if not player_ids:
         return
+    slots = slots or {}
     conn = get_conn()
+    # starter와 slot은 항상 짝으로 움직인다 — 통째로 지우고 새로 켜는
+    # 기존 원칙(위 docstring)을 slot에도 그대로 적용해, 몇 번을 다시
+    # 불러도 "지금 주전인 11명만 slot을 갖는" 상태가 보장된다.
     conn.execute(
-        "UPDATE intl_squad SET starter=0 WHERE tournament_id=? AND country=?",
+        "UPDATE intl_squad SET starter=0, slot='' WHERE tournament_id=? AND country=?",
         (tournament_id, country))
     conn.executemany(
-        "UPDATE intl_squad SET starter=1 WHERE tournament_id=? AND country=? AND player_id=?",
-        [(tournament_id, country, pid) for pid in player_ids])
+        "UPDATE intl_squad SET starter=1, slot=? WHERE tournament_id=? AND country=? AND player_id=?",
+        [(slots.get(pid, ""), tournament_id, country, pid) for pid in player_ids])
     conn.commit()
     conn.close()
 

@@ -255,8 +255,38 @@ class _StaticPitchView(QWidget):
                 sp = self.slot_players[slot_idx] if slot_idx < len(self.slot_players) else None
                 pid = sp[2] if sp else None
                 if pid is not None:
-                    self._on_click(pid)
+                    # [2026-09 확장] 두 번째 인자는 "이 카드에서 이 선수가
+                    # 맡고 있던 포지션"(그 원에 찍힌 슬롯 라벨) — 간단 변경
+                    # 창이 주포지션과 나란히 보여준다.
+                    self._on_click(pid, _pos)
                 return
+
+    def apply_custom_name(self, player_id, new_name):
+        """[2026-09 신설, 신민용 요청: "간단 변경 창에서 이름을 바꾸면
+        바로 반영되어야겠지"] 이 피치에 그려진 선수 중 player_id가 같은
+        칸의 표시 이름만 갈아끼우고 다시 그린다 — 이 카드를 통째로 다시
+        만들면(_build_team_year_lineup_widget) wb.get_team_season_lineup을
+        다시 조회해야 하는데, 이름 하나 바꾸자고 낼 비용이 아니다
+        (_apply_rename_to_player_list가 "목록 줄 하나만 다시 그리기"로
+        같은 문제를 푼 것과 완전히 같은 취지). 바뀐 게 있으면 True."""
+        changed = False
+        for i, sp in enumerate(self.slot_players):
+            if sp and len(sp) > 2 and sp[2] == player_id:
+                _lst = list(sp)
+                _lst[1] = new_name
+                self.slot_players[i] = tuple(_lst)
+                changed = True
+        if changed:
+            self.update()
+        return changed
+
+
+# [2026-09 신설] _build_squad_roster_panel이 만드는 선수 줄(QLabel)에
+# 어떤 선수인지/어떤 포지션 글자를 앞에 붙였는지 심어두는 동적 프로퍼티 —
+# "간단 변경" 창에서 이름을 바꿨을 때 그 줄 하나만 새 이름으로 다시
+# 쓰기 위한 것(_StaticPitchView.apply_custom_name과 같은 목적).
+_SQUAD_LABEL_PID_PROP = "wb_squad_pid"
+_SQUAD_LABEL_POS_PROP = "wb_squad_pos"
 
 
 def _build_squad_roster_panel(starters, bench, on_click=None, height=460):
@@ -313,9 +343,16 @@ def _build_squad_roster_panel(starters, bench, on_click=None, height=460):
         if p.get("is_foreign"):
             style += "border:1px solid #FF7F00;"
         lbl.setStyleSheet(style)
+        if pid is not None:
+            # [2026-09 신설] 위 _SQUAD_LABEL_*_PROP 주석 참고 — "간단 변경"
+            # 창에서 이름을 바꿨을 때 이 줄만 찾아 다시 쓰기 위한 표식.
+            lbl.setProperty(_SQUAD_LABEL_PID_PROP, pid)
+            lbl.setProperty(_SQUAD_LABEL_POS_PROP, pos)
         if pid is not None and on_click:
             lbl.setCursor(Qt.CursorShape.PointingHandCursor)
-            lbl.mousePressEvent = lambda _e, _pid=pid: on_click(_pid)
+            # [2026-09 확장] 화면에 찍힌 포지션 글자(pos)를 그대로 같이
+            # 넘긴다 — "이 당시 맡은 포지션"은 결국 이 줄에 보이는 그 값이다.
+            lbl.mousePressEvent = lambda _e, _pid=pid, _p=pos: on_click(_pid, _p)
         return lbl
 
     def _build_column(items, is_starter, label):
@@ -671,6 +708,329 @@ def refresh_ai_player_detail_in_browsers(player_id: int):
             pass  # 선수 검색 탭 미생성 / 창이 이미 닫혀 C++ 객체가 삭제된 경우
 
 
+# ── [2026-09 신설] "간단 변경" 팝업 ────────────────────────────────
+# 신민용 요청: "팀 검색/국가 검색에서 선수를 클릭하면 지금은 '선수 검색'
+# 탭으로 화면이 통째로 넘어가는데, 이름 하나 바꾸려고 왔다갔다 하는 게
+# 불편하다 — 포메이션 화면에서 선수를 누르면 뜨는 작은 상세 창처럼,
+# 이름/포지션/OVR/나이/국적만 뜨는 가벼운 창이 뜨고 거기서 바로 바꾸고
+# 싶다. 어느 쪽으로 동작할지는 창 우측 위 버튼(바로 이동 / 간단 변경)
+# 으로 고르고, 기본은 간단 변경."
+#
+# [성능 원칙 — 이 기능을 만든 이유 자체와 직결] 기존 경로(open_to_player)는
+# "선수 검색" 탭을 (아직 안 지어졌으면) 빌드하고 wb.get_ai_player_detail
+# 로 그 선수의 전 커리어(연도별 기록·국제대회·소속팀 이력·파워랭킹)를
+# 통째로 조회한다 — 세이브가 20~30년 쌓이면 여기가 바로 그동안 걷어낸
+# 그 딜레이다. "간단 변경"은 그 경로를 아예 타지 않고 ai_players 단건
+# SELECT 하나(_fetch_quick_player)만 쓴다. 이 원칙을 깨는 호출(상세
+# 조회·목록 전체 재조회)을 이 팝업 경로에 새로 넣지 말 것.
+_QUICK_MODE_BTN_STYLE = (
+    "QPushButton{background:#2a2a2a;color:#888;border:1px solid #3a3a3a;"
+    "border-radius:4px;padding:4px 12px;font-size:11px;}"
+    "QPushButton:checked{background:#0d3d1a;color:#00cc44;border-color:#00cc44;"
+    "font-weight:bold;}")
+
+
+def _fetch_quick_player(player_id):
+    """[2026-09 신설] "간단 변경" 팝업이 쓰는 단건 조회 — 이름/주포지션/
+    국적 3개 값만 가져온다(ai_players 1행 SELECT + 지정 이름 조회).
+    wb.get_ai_player_detail과 달리 커리어·대회·파워랭킹 조인이 전혀
+    없어서 세이브가 아무리 쌓여도 비용이 안 늘어난다.
+
+    [2026-09 수정, 신민용 요청: "이름 국적 포지션(주포) 포지션(이 당시
+    맡은 포지션) 이렇게 4개로 나눠줘, 나이랑 OVR은 안 떠도 돼"] ovr/age는
+    더 이상 화면에 안 쓰므로 SELECT에서도 뺐다. 네 번째 값(그 당시
+    포지션)은 DB가 아니라 클릭한 카드에서 넘어오므로 여기서 안 다룬다
+    (_on_player_click의 ctx_position 참고).
+
+    ai_players에 없으면 ai_players_retired(은퇴 아카이브)를 한 번 더
+    본다 — 은퇴 선수도 이름은 바꿀 수 있어야 하므로(선수 검색 상세의
+    _player_detail_pid/_player_detail_stat_pid 구분과 동일한 원칙:
+    이름은 은퇴자도 OK, OVR·국적은 현역 전용). 둘 다 없으면(본인
+    MY_PLAYER_ID, 국제대회 가상 선수 등 id<0) None — 호출부가 기존
+    "바로 이동" 경로로 폴백한다.
+    """
+    if player_id is None or player_id < 0:
+        return None
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT position, nationality FROM ai_players WHERE id=?",
+        (player_id,)).fetchone()
+    is_retired = False
+    if row is None:
+        row = conn.execute(
+            "SELECT position, nationality FROM ai_players_retired WHERE id=?",
+            (player_id,)).fetchone()
+        is_retired = row is not None
+    conn.close()
+    if row is None:
+        return None
+    return {
+        "id": player_id,
+        # world_browser.get_team_season_lineup 등 목록 쪽 표시 이름과
+        # 완전히 같은 규칙(지정 이름 없으면 식별코드).
+        "name": get_ai_player_custom_name(player_id) or ai_player_code(player_id),
+        "position": row["position"] or "",
+        "nationality": row["nationality"] or "",
+        "is_retired": is_retired,
+    }
+
+
+def open_ai_rename_dialog(parent, player_id):
+    """[2026-09 분리] 원래 WorldBrowserWindow._open_ai_rename_dialog 안에
+    통째로 들어 있던 "선수 이름 변경" 창을, 호출부와 무관하게 쓸 수 있는
+    공용 함수로 뽑아낸 것 — open_ovr_edit_dialog/open_nationality_edit_
+    dialog(ui/formation_widget.py)와 정확히 같은 공유 방식이다. 창 띄우기
+    + DB 저장 + 지금 열려 있는 모든 포메이션 화면 반영까지 여기서 하고,
+    호출부는 반환값으로 자기 화면만 갱신하면 된다.
+
+    "간단 변경" 팝업(QuickPlayerEditPopup)은 "선수 검색" 탭 위젯이 아직
+    없을 수도 있는 상태에서 열리므로, 기존 메서드처럼 _show_player_detail/
+    _refresh_player_list까지 묶여 있으면 쓸 수가 없다 — 그 갱신 부분을
+    호출부로 넘긴 게 이 분리의 목적.
+
+    반환: 저장했으면 새 표시 이름(지정 이름을 지웠으면 식별코드),
+    취소했으면 None.
+    """
+    current = get_ai_player_custom_name(player_id)
+    code = ai_player_code(player_id)
+
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("선수 이름 변경")
+    dlg.setStyleSheet("QDialog{background:#1e1e1e;color:#ccc;}")
+    dlg.setMinimumWidth(300)
+    v = QVBoxLayout(dlg)
+
+    info_lbl = QLabel(f"식별코드: {code}\n이 선수에게 부를 이름을 지어주세요.")
+    info_lbl.setStyleSheet("color:#888;font-size:11px;")
+    v.addWidget(info_lbl)
+
+    edit = QLineEdit(current or "")
+    edit.setPlaceholderText(f"비워두면 다시 \"{code}\"로 표시됩니다")
+    edit.setStyleSheet(
+        "QLineEdit{background:#161616;color:#eee;font-size:13px;"
+        "border:1px solid #333;border-radius:4px;padding:6px 8px;}"
+        "QLineEdit:focus{border:1px solid #4da6ff;}")
+    edit.selectAll()
+    v.addWidget(edit)
+
+    btn_row = QHBoxLayout()
+    save_btn = QPushButton("저장")
+    save_btn.setStyleSheet(
+        "background:#2d4a6b;color:#eee;border:1px solid #4a7ab0;"
+        "border-radius:4px;padding:6px 14px;")
+    cancel_btn = QPushButton("취소")
+    cancel_btn.setStyleSheet(
+        "background:#2a2a2a;color:#ccc;border:1px solid #444;"
+        "border-radius:4px;padding:6px 14px;")
+    btn_row.addStretch(1)
+    btn_row.addWidget(cancel_btn)
+    btn_row.addWidget(save_btn)
+    v.addLayout(btn_row)
+
+    save_btn.clicked.connect(dlg.accept)
+    cancel_btn.clicked.connect(dlg.reject)
+    edit.returnPressed.connect(dlg.accept)
+
+    _accepted = dlg.exec() == QDialog.DialogCode.Accepted
+    _new_text = edit.text()
+    # [2026-08 최적화/누수수정] QDialog는 부모가 있으면 파이썬 참조가
+    # 사라져도 C++ 객체가 부모에 매달린 채 계속 살아남는다 — 이름을 100명
+    # 넘게 바꾸면 그만큼의 숨은 다이얼로그가 쌓이고, 앱 전체 위젯을 훑는
+    # 코드(apply_custom_name_live 등)가 그만큼 계속 느려진다. 다 쓴 즉시
+    # 삭제 예약.
+    dlg.deleteLater()
+    if not _accepted:
+        return None
+    set_ai_player_custom_name(player_id, _new_text)
+    _new_display = get_ai_player_custom_name(player_id) or ai_player_code(player_id)
+    # [2026-08 버그수정, 신민용 리포트: "이름 수정했는데 포메이션에는 예전
+    # 코드가 그대로 뜬다 — 나갔다 들어와야 바뀐다"] 지금 열려 있는 모든
+    # 포메이션 화면을 그 자리에서 바로 갱신하고, _ovr_cache_invalidated는
+    # 이후 어떤 경로로 캐시가 다시 로드돼도 새 이름이 반영되도록 안전장치로
+    # 같이 세운다.
+    try:
+        import ui.formation_widget as _fw
+        _fw._ovr_cache_invalidated = True
+        _fw.apply_custom_name_live(player_id, _new_display)
+    except Exception:
+        pass
+    return _new_display
+
+
+class QuickPlayerEditPopup(QDialog):
+    """[2026-09 신설] "간단 변경" 모드에서 팀 검색/국가 검색의 선수를
+    클릭했을 때 뜨는 작은 창 — ui/formation_widget.py의 PlayerStatPopup
+    상단 표와 같은 모양(항목|값 2열 그리드, 편집 가능한 항목은 라벨이
+    파란색)이지만 아래 15개 스탯 표는 아예 없다.
+
+    [2026-09 수정, 신민용 요청: "이름 국적 포지션(주포) 포지션(이 당시
+    맡은 포지션) 이렇게 4개로 나눠줘, 나이랑 OVR은 안 떠도 돼"] 처음엔
+    이름/포지션/OVR/나이/국적 5줄이었는데, 이 창을 쓰는 실제 용도가
+    "이름·국적을 그 자리에서 고치는 것"이라 나이·OVR은 뺐다. 대신
+    포지션을 둘로 나눈다:
+      - 포지션(주포): ai_players.position — 지금 이 선수의 주포지션
+      - 포지션(당시): 클릭한 카드에 찍혀 있던 자리(팀 검색 주전이면 그
+        시즌 배치 슬롯) — 주포지션과 다를 수 있다. 이 값만 DB가 아니라
+        호출부에서 넘어온다(_on_player_click의 ctx_position).
+    OVR 조정은 이 창에서 빠졌으므로 "선수 검색" 상세나 포메이션 화면의
+    PlayerStatPopup에서 하면 된다(두 경로 다 그대로 살아 있다).
+
+    PlayerStatPopup과의 차이:
+      - WASD 이동이 없다(신민용 확정: "닫은 후 다른 선수를 클릭하면 뜨는
+        원리"). 그래서 내부 표의 포커스를 뺏을 필요가 없어 Ctrl+C 복사가
+        그냥 동작한다(PlayerStatPopup이 NoFocus 때문에 따로 우회해야
+        했던 부분).
+      - 창은 세계 축구 기록실 창당 하나만 존재한다 —
+        WorldBrowserWindow._open_quick_player_popup이 같은 인스턴스에
+        load_player()로 내용만 갈아끼운다(창을 매번 새로 만들면 OS 창
+        관리자까지 왕복해 연타 시 눈에 띄게 끊긴다는, PlayerStatPopup
+        에서 이미 확인된 이유와 동일).
+    """
+
+    def __init__(self, owner):
+        super().__init__(owner)
+        self._owner = owner
+        self.setWindowModality(Qt.WindowModality.NonModal)
+        self.setStyleSheet("QDialog{background:#1e1e1e;color:#ccc;}")
+        self.setMinimumWidth(260)
+        self._lay = QVBoxLayout(self)
+        self._lay.setContentsMargins(10, 10, 10, 10)
+        self._lay.setSpacing(0)
+        self._pl = {}
+        self._pid = None
+        self._rename_pid = None
+        self._stat_pid = None
+        self._info_tbl = None
+        self._name_row_idx = self._nat_row_idx = None
+        self._name_value_item = self._nat_value_item = None
+
+    def load_player(self, pl):
+        """이 팝업이 보여줄 선수를 교체한다(창 자체는 재사용)."""
+        self._pl = dict(pl)
+        self._pid = pl.get("id")
+        _name = pl.get("name", "") or ""
+        _pos = pl.get("position", "") or ""
+        self.setWindowTitle(f"{_name}  [{_pos}]")
+
+        if self._info_tbl is not None:
+            # setParent(None)은 그 찰나 위젯을 최상위 창으로 만들어 흰 빈
+            # 창이 깜빡이는 원인이 되므로(PlayerStatPopup._clear_layout과
+            # 같은 이유) 부모를 떼지 않고 숨긴 뒤 삭제만 예약한다.
+            self._info_tbl.hide()
+            self._info_tbl.deleteLater()
+            self._info_tbl = None
+        self._name_row_idx = self._nat_row_idx = None
+        self._name_value_item = self._nat_value_item = None
+
+        # 편집 대상 판정 — "선수 검색" 상세 헤더(_on_player_detail_header_
+        # clicked)와 완전히 같은 규칙이다: 이름은 은퇴 선수도 바꿀 수
+        # 있고, 국적은 현역 + 쉬움 난이도 전용(set_ai_player_nationality가
+        # ai_players 테이블만 건드리는 조작이라 은퇴 아카이브엔 못 쓴다).
+        _pid_ok = isinstance(self._pid, int) and self._pid >= 0
+        _retired = bool(pl.get("is_retired"))
+        self._rename_pid = self._pid if _pid_ok else None
+        self._stat_pid = self._pid if (_pid_ok and not _retired and is_easy_mode()) else None
+
+        # 국적은 값이 비어 있어도(드묾) 행을 넣는다 — 이 창의 존재 이유가
+        # "여기서 바로 바꾸는 것"이라, 비었다고 행을 빼버리면 채워 넣을
+        # 방법 자체가 없어진다. 두 포지션 줄은 항상 나란히 보여준다
+        # (값이 같아도 숨기지 않는다 — 같다는 사실 자체가 정보다).
+        info_rows = [
+            ("이름", _name),
+            ("국적", pl.get("nationality", "") or "-"),
+            ("포지션(주포)", _pos or "-"),
+            ("포지션(당시)", (pl.get("ctx_position", "") or "").strip() or "-"),
+        ]
+
+        tbl = QTableWidget(len(info_rows), 2)
+        tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        tbl.horizontalHeader().setVisible(False)
+        tbl.verticalHeader().setVisible(False)
+        tbl.verticalHeader().setDefaultSectionSize(22)
+        tbl.setStyleSheet(
+            "QTableWidget{background:#1e1e1e;color:#ccc;gridline-color:#2a2a2a;border:none;}")
+        for i, (label, value) in enumerate(info_rows):
+            label_item = QTableWidgetItem(label)
+            value_item = QTableWidgetItem(value)
+            if label == "이름":
+                self._name_row_idx = i
+                self._name_value_item = value_item
+                f = value_item.font(); f.setBold(True); value_item.setFont(f)
+                value_item.setForeground(QColor("#00cc44"))
+                if self._rename_pid is not None:
+                    lf = label_item.font(); lf.setBold(True); label_item.setFont(lf)
+                    label_item.setForeground(QColor("#4da6ff"))
+                    label_item.setToolTip("클릭하면 이 선수의 이름을 직접 지을 수 있습니다")
+                else:
+                    label_item.setForeground(QColor("#888"))
+            elif label == "국적":
+                self._nat_row_idx = i
+                self._nat_value_item = value_item
+                value_item.setForeground(QColor("#ccc"))
+                if self._stat_pid is not None:
+                    lf = label_item.font(); lf.setBold(True); label_item.setFont(lf)
+                    label_item.setForeground(QColor("#4da6ff"))
+                    label_item.setToolTip(
+                        "클릭하면 이 선수의 국적을 직접 지정할 수 있습니다 (쉬움 난이도 전용)")
+                else:
+                    label_item.setForeground(QColor("#888"))
+            else:
+                label_item.setForeground(QColor("#888"))
+                value_item.setForeground(QColor("#ccc"))
+                if label == "포지션(주포)":
+                    label_item.setToolTip("지금 이 선수의 주포지션(ai_players.position)")
+                elif label == "포지션(당시)":
+                    label_item.setToolTip(
+                        "방금 클릭한 화면에서 이 선수가 맡고 있던 자리 — "
+                        "그 시즌 배치에 따라 주포지션과 다를 수 있습니다")
+            tbl.setItem(i, 0, label_item)
+            tbl.setItem(i, 1, value_item)
+        tbl.horizontalHeader().setStretchLastSection(True)
+        tbl.setFixedHeight(22 * len(info_rows) + 4)
+        if self._rename_pid is not None or self._stat_pid is not None:
+            tbl.setCursor(Qt.CursorShape.PointingHandCursor)
+            tbl.cellClicked.connect(self._on_info_cell_clicked)
+        _enable_plain_copy(tbl)
+        self._lay.addWidget(tbl)
+        self._info_tbl = tbl
+        self.adjustSize()
+
+    def _on_info_cell_clicked(self, row, col):
+        if col != 0:
+            return
+        if row == self._name_row_idx and self._rename_pid is not None:
+            self._do_rename()
+            return
+        if row == self._nat_row_idx and self._stat_pid is not None:
+            self._do_nationality_edit()
+
+    def _do_rename(self):
+        pid = self._rename_pid
+        new_display = open_ai_rename_dialog(self, pid)
+        if new_display is None:
+            return
+        self._pl["name"] = new_display
+        self.setWindowTitle(f"{new_display}  [{self._pl.get('position','')}]")
+        if self._name_value_item is not None:
+            self._name_value_item.setText(new_display)
+        owner = self._owner
+        if owner is not None:
+            try:
+                owner.apply_quick_name_change(pid, new_display)
+            except RuntimeError:
+                pass   # 기록실 창이 이미 닫혀 C++ 객체가 사라진 경우
+
+    def _do_nationality_edit(self):
+        pid = self._stat_pid
+        cur_nat = self._pl.get("nationality", "") or ""
+        new_nat = open_nationality_edit_dialog(self, pid, cur_nat)
+        if new_nat is None:
+            return
+        self._pl["nationality"] = new_nat
+        if self._nat_value_item is not None:
+            self._nat_value_item.setText(new_nat or "-")
+
+
 class _EditableFieldHeader(QHeaderView):
     """[2026-09 신설, 신민용 요청: "OVR도 이름처럼 선수 검색에서 바꿀 수
     있게, 국적도 직접 입력으로 바꿀 수 있게"] player_detail_tbl 헤더
@@ -796,9 +1156,48 @@ class WorldBrowserWindow(QDialog):
         lay.setContentsMargins(14, 12, 14, 12)
         lay.setSpacing(10)
 
+        # [2026-09 신설, 신민용 요청: "선수 클릭할 때 바로 선수 검색으로
+        # 이동하는 거랑 상세 표시가 뜨는 건 우측 위에 버튼을 하나 만들고
+        # 바로 이동 / 간단 변경으로 나눠서 ... 기본 상태는 간단 변경"]
+        # 제목 줄 오른쪽 끝에 2지선다 토글을 둔다 — 이 모드는 팀 검색/
+        # 국가 검색의 포메이션·명단에서 선수를 클릭했을 때만 갈린다
+        # (_on_player_click). 포메이션 화면에서 창을 열며 넘어오는
+        # open_to_player 등 외부 진입점은 이 토글과 무관하게 예전 그대로
+        # "선수 검색" 상세로 간다.
+        self._player_click_mode = "quick"   # "quick"(간단 변경) | "goto"(바로 이동)
+        self._quick_popup = None            # 창당 하나만 유지되는 간단 변경 팝업
+
+        hdr_row = QHBoxLayout()
+        hdr_row.setSpacing(6)
         hdr = QLabel("🌍 세계 축구 기록실")
         hdr.setStyleSheet("color:#00cc44;font-size:16px;font-weight:bold;")
-        lay.addWidget(hdr)
+        hdr_row.addWidget(hdr)
+        hdr_row.addStretch(1)
+        _click_lbl = QLabel("선수 클릭")
+        _click_lbl.setStyleSheet("color:#888;font-size:11px;")
+        hdr_row.addWidget(_click_lbl)
+        self._player_click_mode_group = QButtonGroup(self)
+        self._player_click_mode_group.setExclusive(True)
+        self._player_click_mode_buttons = {}
+        for _key, _label, _tip in (
+            ("goto", "바로 이동",
+             "선수를 클릭하면 \"선수 검색\" 탭으로 이동해 전체 기록을 보여줍니다"),
+            ("quick", "간단 변경",
+             "선수를 클릭하면 이름·포지션·OVR·나이·국적만 담긴 작은 창이 떠서 "
+             "그 자리에서 바로 고칠 수 있습니다"),
+        ):
+            _btn = QPushButton(_label)
+            _btn.setCheckable(True)
+            _btn.setAutoDefault(False)
+            _btn.setDefault(False)
+            _btn.setToolTip(_tip)
+            _btn.setStyleSheet(_QUICK_MODE_BTN_STYLE)
+            _btn.clicked.connect(lambda _c, k=_key: self._set_player_click_mode(k))
+            self._player_click_mode_group.addButton(_btn)
+            hdr_row.addWidget(_btn)
+            self._player_click_mode_buttons[_key] = _btn
+        self._player_click_mode_buttons[self._player_click_mode].setChecked(True)
+        lay.addLayout(hdr_row)
         sub = QLabel("다른 나라 리그를 살펴보거나, 역대 대회 기록을 확인하세요.")
         sub.setStyleSheet("color:#888;font-size:11px;")
         lay.addWidget(sub)
@@ -910,6 +1309,90 @@ class WorldBrowserWindow(QDialog):
         self._show_player_detail(player_id)
         self._fm_player_id = player_id   # [2026-08 신설] keyPressEvent의 W/S 기준값
 
+    # ── [2026-09 신설] 선수 클릭 라우팅 (바로 이동 / 간단 변경) ──────
+    def _set_player_click_mode(self, mode):
+        """제목 줄 우측 토글 핸들러. 모드만 바꾸고 화면은 손대지 않는다
+        — 이미 떠 있는 간단 변경 팝업은 "바로 이동"으로 바꿔도 그대로
+        두고(사용자가 직접 닫으면 된다), 다음 클릭부터 새 모드가 적용."""
+        self._player_click_mode = mode if mode in ("quick", "goto") else "quick"
+
+    def _on_player_click(self, player_id, ctx_position=None):
+        """팀 검색/국가 검색의 포메이션 피치·주전/후보 명단에서 선수를
+        클릭했을 때의 단일 진입점 — 토글 상태에 따라 갈린다.
+
+          - "goto"(바로 이동): 예전 동작 그대로 open_to_player
+            ("선수 검색" 탭 전환 + 전체 상세).
+          - "quick"(간단 변경, 기본값): 가벼운 팝업만 띄운다.
+
+        ctx_position: 클릭한 카드에서 이 선수 앞에 찍혀 있던 포지션 글자
+        (피치면 그 원의 슬롯, 명단이면 줄 앞 글자) — 간단 변경 창이
+        "이 당시 맡은 포지션"으로 그대로 보여준다. 넘기지 않으면 "-".
+
+        [성능] 이 함수 자체는 DB를 전혀 안 건드린다 — "quick"일 때 도는
+        조회는 _fetch_quick_player의 단건 SELECT 하나뿐이라, 기존 경로
+        (wb.get_ai_player_detail: 커리어·대회·파워랭킹 조인)와 달리
+        세이브 연차가 쌓여도 비용이 그대로다."""
+        if player_id is None:
+            return
+        if getattr(self, "_player_click_mode", "quick") == "goto":
+            self.open_to_player(player_id)   # ctx_position은 이 경로에선 안 쓴다
+        else:
+            self._open_quick_player_popup(player_id, ctx_position)
+
+    def _open_quick_player_popup(self, player_id, ctx_position=None):
+        """간단 변경 팝업을 띄운다 — 이 창당 항상 최대 1개(신민용 확정:
+        "저건 여러 개 뜰 수 없게 해야 돼"). 이미 만들어둔 팝업이 있으면
+        내용만 갈아끼워 재사용한다(창을 매번 새로 만들면 OS 창 관리자까지
+        왕복해 연속 클릭 시 눈에 띄게 끊긴다 — PlayerStatPopup이 같은
+        이유로 이미 재사용 방식이다)."""
+        pl = _fetch_quick_player(player_id)
+        if pl is not None:
+            # [2026-09] 클릭한 카드에 찍혀 있던 포지션 — 팀 검색 주전은
+            # 그 시즌 배치 슬롯이라 주포지션과 다를 수 있다.
+            pl["ctx_position"] = (ctx_position or "").strip()
+        if pl is None:
+            # ai_players/ai_players_retired 어디에도 없는 id — 본인
+            # (MY_PLAYER_ID)이나 국제대회 가상 선수. 이런 선수는 애초에
+            # 이름·OVR·국적 편집 대상이 아니므로 예전 동작으로 폴백한다.
+            self.open_to_player(player_id)
+            return
+        popup = getattr(self, "_quick_popup", None)
+        if popup is not None:
+            try:
+                popup.load_player(pl)
+            except RuntimeError:
+                popup = None   # 이미 파괴된 C++ 객체 — 새로 만든다
+        if popup is None:
+            popup = QuickPlayerEditPopup(self)
+            popup.load_player(pl)
+            self._quick_popup = popup
+        popup.show()
+        popup.raise_()
+        popup.activateWindow()
+
+    def apply_quick_name_change(self, player_id, new_name):
+        """[2026-09 신설] 간단 변경 팝업에서 이름을 바꾼 직후, 지금 화면에
+        펼쳐져 있는 포메이션 피치·주전/후보 명단의 그 선수 칸만 새 이름으로
+        다시 쓴다 — 카드를 통째로 다시 만들면(_build_team_year_lineup_widget
+        → wb.get_team_season_lineup) 이름 하나 바꿀 때마다 그 해 라인업을
+        다시 조회하게 되고, 그게 바로 이 기능을 만든 이유(왔다갔다 하는
+        비용)를 다른 형태로 되살리는 셈이 된다.
+
+        findChildren은 이 창 전체를 훑지만 실제로 도는 건 "사용자가 이름을
+        저장한 그 순간" 한 번뿐이라(클릭·스크롤 같은 상시 경로가 아니다)
+        체감 비용이 없다."""
+        for _pitch in self.findChildren(_StaticPitchView):
+            _pitch.apply_custom_name(player_id, new_name)
+        for _lbl in self.findChildren(QLabel):
+            if _lbl.property(_SQUAD_LABEL_PID_PROP) != player_id:
+                continue
+            _pos = _lbl.property(_SQUAD_LABEL_POS_PROP) or "-"
+            _lbl.setText(f"{_pos}  {new_name}")
+        # 이미 열려 있는 다른 기록실 창(및 이 창의 "선수 검색"/"역대
+        # 개인상" 탭이 이미 지어져 있다면 그쪽)도 같이 맞춘다 — 탭이 아직
+        # 안 지어졌으면 이 함수 안에서 조용히 넘어가므로 비용이 없다.
+        apply_custom_name_live_to_browser(player_id)
+
     def keyPressEvent(self, event):
         """[2026-08 신설, 신민용 요청: "포메이션 화면 선수 클릭 시 세계
         기록실이 뜨는 건 유지하되, WASD로 옆 선수/반대팀으로 빠르게
@@ -966,11 +1449,34 @@ class WorldBrowserWindow(QDialog):
         두 번 돈 뒤(새 탭 배치·그리기 이벤트까지 포함하는 근사치)."""
         if not self.isVisible():
             return
-        from ui import wb_perf_probe
-        label = self.tabs.tabText(idx)
-        first_build = idx in self._wb_lazy_builders
-        if wb_perf_probe.PROBE.begin(label, first_build):
-            QTimer.singleShot(0, lambda: QTimer.singleShot(0, wb_perf_probe.PROBE.end))
+        # [2026-09 버그수정, 신민용 리포트: "ImportError: cannot import name
+        # 'wb_perf_probe' from 'ui'"] ui/wb_perf_probe.py는 "딜레이 개선"
+        # 작업 때만 쓰던 진단 전용 모듈이라 저장소에 커밋된 적이 없다
+        # (git log 확인: 이 파일이 들어간 커밋 0건) — 그 작업이 끝나고
+        # 로컬에서 사라지자, 여기 무방비 import가 탭을 누를 때마다
+        # 예외를 던졌다. PyQt6는 시그널 슬롯 안에서 처리되지 않은 파이썬
+        # 예외가 나면 그대로 프로세스를 죽이기 때문에(qFatal), 이 진단용
+        # 한 줄 때문에 세계 축구 기록실에서 탭을 전환하는 순간 게임 전체가
+        # 종료됐다. 계측은 어디까지나 부가 기능이므로, 모듈이 없으면
+        # 조용히 꺼지고 게임은 그대로 돌아가야 한다 — 한 번 실패하면
+        # 플래그를 세워 다음 탭 전환부터는 import 시도조차 안 한다
+        # (탭을 누를 때마다 실패하는 import를 반복하지 않도록).
+        if getattr(self, "_perf_probe_off", False):
+            return
+        try:
+            from ui import wb_perf_probe
+        except ImportError:
+            self._perf_probe_off = True
+            return
+        try:
+            label = self.tabs.tabText(idx)
+            first_build = idx in self._wb_lazy_builders
+            if wb_perf_probe.PROBE.begin(label, first_build):
+                QTimer.singleShot(0, lambda: QTimer.singleShot(0, wb_perf_probe.PROBE.end))
+        except Exception:
+            # 진단 모듈 자체가 바뀌어 API가 안 맞는 경우(PROBE 없음 등)도
+            # 게임 진행을 막으면 안 된다 — 같은 원칙으로 꺼버린다.
+            self._perf_probe_off = True
 
     def _lazy_show_wb_tab(self, idx):
         """[2026-08 v3.5 신설] 지연 배치해둔 탭을 처음 클릭하는 순간에만
@@ -3263,7 +3769,7 @@ class WorldBrowserWindow(QDialog):
         slot_players = [(s.get("slot") or "", s.get("display_name"), s.get("id"),
                          s.get("is_foreign", False)) for s in starters]
         pitch = _StaticPitchView(formation=formation, slot_players=slot_players,
-                                  on_click=self.open_to_player)
+                                  on_click=self._on_player_click)
 
         # [2026-08 재작업, 신민용 리포트: "좌측에 포메이션을 저렇게 박으면
         # 우측에 후보 선수들의 이름을 나열해야지 — 주전들은 초록색으로,
@@ -3274,7 +3780,7 @@ class WorldBrowserWindow(QDialog):
         content_row.setSpacing(14)
         content_row.addWidget(pitch)
         _real_starters = [s for s in starters if s.get("id") is not None]
-        roster = _build_squad_roster_panel(_real_starters, bench, on_click=self.open_to_player)
+        roster = _build_squad_roster_panel(_real_starters, bench, on_click=self._on_player_click)
         content_row.addWidget(roster, 1)
         lay.addLayout(content_row)
         return box
@@ -3347,7 +3853,9 @@ class WorldBrowserWindow(QDialog):
         pid = starters[row].get("id")
         if pid is None:
             return
-        self.open_to_player(pid)
+        # [2026-09] 제목 줄 토글에 따라 "선수 검색" 이동 / 간단 변경 팝업.
+        # slot = 그 시즌 이 선수가 배치됐던 자리(= 이 당시 맡은 포지션).
+        self._on_player_click(pid, starters[row].get("slot"))
 
     # [2026-08 신설, 신민용 요청: "팀 검색에 복사하기 버튼을 만들어서
     # 누르면 이 팀의 연도별 기록을 텍스트로 뽑고 싶다 — 지피티나 제미나이가
@@ -5270,85 +5778,18 @@ class WorldBrowserWindow(QDialog):
         self._refresh_player_list()
 
     def _open_ai_rename_dialog(self, player_id):
-        """AI 선수 이름 변경 창. 현재 지정된 이름(없으면 빈칸 — placeholder에
-        지금 표시 중인 식별코드를 보여줘서 "비워두면 이 코드로 돌아간다"는
-        걸 알 수 있게 한다)을 입력칸에 채워서 띄운다. 저장을 누르면
-        set_ai_player_custom_name으로 저장하고, 화면(상세 표 + 좌측
-        검색 목록)을 즉시 다시 그려 새 이름이 바로 반영되게 한다."""
-        current = get_ai_player_custom_name(player_id)
-        code = ai_player_code(player_id)
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle("선수 이름 변경")
-        dlg.setStyleSheet("QDialog{background:#1e1e1e;color:#ccc;}")
-        dlg.setMinimumWidth(300)
-        v = QVBoxLayout(dlg)
-
-        info_lbl = QLabel(f"식별코드: {code}\n이 선수에게 부를 이름을 지어주세요.")
-        info_lbl.setStyleSheet("color:#888;font-size:11px;")
-        v.addWidget(info_lbl)
-
-        edit = QLineEdit(current)
-        edit.setPlaceholderText(f"비워두면 다시 \"{code}\"로 표시됩니다")
-        edit.setStyleSheet(
-            "QLineEdit{background:#161616;color:#eee;font-size:13px;"
-            "border:1px solid #333;border-radius:4px;padding:6px 8px;}"
-            "QLineEdit:focus{border:1px solid #4da6ff;}")
-        edit.selectAll()
-        v.addWidget(edit)
-
-        btn_row = QHBoxLayout()
-        save_btn = QPushButton("저장")
-        save_btn.setStyleSheet(
-            "background:#2d4a6b;color:#eee;border:1px solid #4a7ab0;"
-            "border-radius:4px;padding:6px 14px;")
-        cancel_btn = QPushButton("취소")
-        cancel_btn.setStyleSheet(
-            "background:#2a2a2a;color:#ccc;border:1px solid #444;"
-            "border-radius:4px;padding:6px 14px;")
-        btn_row.addStretch(1)
-        btn_row.addWidget(cancel_btn)
-        btn_row.addWidget(save_btn)
-        v.addLayout(btn_row)
-
-        save_btn.clicked.connect(dlg.accept)
-        cancel_btn.clicked.connect(dlg.reject)
-        edit.returnPressed.connect(dlg.accept)
-
-        _accepted = dlg.exec() == QDialog.DialogCode.Accepted
-        _new_text = edit.text()
-        # [2026-08 최적화/누수수정] QDialog는 부모(self=이 창)가 있으면
-        # 파이썬 참조가 사라져도 C++ 객체가 부모에 매달린 채 계속
-        # 살아남는다 — 이름을 100명 넘게 바꾸면 그만큼의 숨은
-        # 다이얼로그(각각 입력칸·버튼 여러 개)가 이 창 밑에 쌓이고,
-        # 앱 전체 위젯을 훑는 코드(apply_custom_name_live 등)가 그만큼
-        # 계속 느려진다. 다 쓴 즉시 삭제 예약.
-        dlg.deleteLater()
-        if not _accepted:
+        """AI 선수 이름 변경 — 창 자체와 DB 저장, 열려 있는 포메이션 화면
+        반영은 공용 함수 open_ai_rename_dialog()가 전부 처리한다.
+        [2026-09 분리] 예전엔 이 메서드 안에 창 구성부터 저장까지 전부
+        들어 있었는데, "간단 변경" 팝업(QuickPlayerEditPopup)이 같은 창을
+        써야 해서 공용 함수로 뽑았다 — 그 팝업은 "선수 검색" 탭 위젯이
+        아직 없는 상태에서도 열리므로, 아래 _show_player_detail/
+        _refresh_player_list 같은 이 탭 전용 갱신은 호출부(여기)에 남겼다.
+        표시되는 창·저장 결과는 예전과 100% 동일하다."""
+        if open_ai_rename_dialog(self, player_id) is None:
             return
-        set_ai_player_custom_name(player_id, _new_text)
-        # [2026-08 버그수정, 신민용 리포트: "이름 수정했는데 포메이션에는
-        # AIAXS2로 예전 코드가 그대로 뜬다" → 후속: "나갔다 들어와야
-        # 바뀐다, 실시간으로 안 되나? 어차피 한 번에 하나씩만 바꾸는데"]
-        # _ovr_cache_invalidated 플래그는 "다음에 이 팀이 다시 로드될
-        # 때"만 적용되는 예약이라, 지금 이미 화면에 떠 있는 포메이션은
-        # 그때까지(주 진행, 팀 재선택 등) 안 바뀐다 — 그래서 나갔다
-        # 들어와야만 반영됐다. apply_custom_name_live가 지금 열려 있는
-        # 모든 포메이션 화면(내 팀/상대팀 둘 다)을 뒤져 이 선수 id를
-        # 찾아 그 자리에서 바로 이름을 바꾸고 다시 그린다 — 한 명만
-        # 바꾸는 가벼운 작업이라 이 정도 즉시 패치로 충분하다.
-        # _ovr_cache_invalidated는 그래도 안전장치로 같이 세워둔다(이후
-        # 어떤 경로로든 캐시가 다시 로드될 때도 새 이름이 확실히 반영
-        # 되도록).
-        try:
-            import ui.formation_widget as _fw
-            _fw._ovr_cache_invalidated = True
-            _new_display = get_ai_player_custom_name(player_id) or ai_player_code(player_id)
-            _fw.apply_custom_name_live(player_id, _new_display)
-        except Exception:
-            pass
         # 저장 직후 상세 표를 새로 그려 새 이름을 바로 반영하고, 좌측
-        # 검색 목록도 다시 조회해 목록에 뜬 이름도 같이 갱신한다.
+        # 검색 목록도 갱신한다.
         self._show_player_detail(player_id)
         # [2026-08 최적화] 목록 전체 재조회 대신 그 줄만 갱신(불가능한
         # 필터 상황이면 _apply_rename_to_player_list가 False를 돌려주고
@@ -7089,19 +7530,45 @@ class WorldBrowserWindow(QDialog):
         # 패널(우, 주전 초록/후보 무채색)을 가로로 나란히 배치.
         content_row = QHBoxLayout()
         content_row.setSpacing(14)
+        # [2026-09 수정, 신민용 리포트: "국가 검색 대회 포메이션에선 LW에
+        # 있는데 선수 검색에선 CM으로 뜬다"] 예전엔 이 화면이 매번
+        # _greedy_fill_slots로 배치를 "다시 계산"했다 — 현재 OVR·현재
+        # 포지션을 재료로 쓰다 보니 선수 검색(intl_squad에 저장된 값)과
+        # 근거가 달랐고, 시간이 지나 선수가 성장하거나 포지션이 바뀌면
+        # 같은 옛 대회의 배치가 조용히 달라지기도 했다. 이제 두 화면 다
+        # world_browser가 넘겨주는 slot(= intl_squad.slot, 주전 11명이
+        # 확정되던 그 시점의 실제 배정) 하나만 본다.
+        _starters_disp = []
+        for r in starters:
+            d = dict(r)
+            # 명단 줄·간단 변경 창의 "포지션(당시)"도 같은 값을 쓰도록
+            # 표시용 position을 slot으로 덮어쓴다(원본 dict은 안 건드림).
+            if d.get("slot"):
+                d["position"] = d["slot"]
+            _starters_disp.append(d)
         if starters:
-            cands = [dict(r) for r in starters]
-            placed = _greedy_fill_slots(cands, _INTL_MATCHDAY_STARTER_POS)
-            slot_players = [
-                (_INTL_MATCHDAY_STARTER_POS[i],
-                 (p.get("display_name") if p else None),
-                 (p.get("id") if p else None))
-                for i, p in enumerate(placed)]
+            _slots = [(d.get("slot") or d.get("position") or "CM") for d in _starters_disp]
+            if all(d.get("slot") for d in _starters_disp):
+                # 저장된 배치가 있다 — 그대로 그린다.
+                slot_players = [(_slots[i], d.get("display_name"), d.get("id"))
+                                 for i, d in enumerate(_starters_disp)]
+                pitch_slots = _slots
+            else:
+                # 포지션 스냅샷조차 없어 복원이 안 되는 아주 오래된 대회 —
+                # 예전처럼 고정 11자리에 임시로 배치해 보여준다(근사).
+                cands = [dict(r) for r in starters]
+                placed = _greedy_fill_slots(cands, _INTL_MATCHDAY_STARTER_POS)
+                slot_players = [
+                    (_INTL_MATCHDAY_STARTER_POS[i],
+                     (p.get("display_name") if p else None),
+                     (p.get("id") if p else None))
+                    for i, p in enumerate(placed)]
+                pitch_slots = _INTL_MATCHDAY_STARTER_POS
             pitch = _StaticPitchView(
-                formation="", slot_players=slot_players, slots=_INTL_MATCHDAY_STARTER_POS,
-                on_click=self.open_to_player)
+                formation="", slot_players=slot_players, slots=pitch_slots,
+                on_click=self._on_player_click)
             content_row.addWidget(pitch)
-        roster = _build_squad_roster_panel(starters, bench, on_click=self.open_to_player)
+        roster = _build_squad_roster_panel(_starters_disp, bench, on_click=self._on_player_click)
         content_row.addWidget(roster, 1)
         lay.addLayout(content_row)
         return box
@@ -7142,7 +7609,8 @@ class WorldBrowserWindow(QDialog):
         pid = players[row].get("id")
         if pid is None:
             return
-        self.open_to_player(pid)
+        # [2026-09] 제목 줄 토글에 따라 "선수 검색" 이동 / 간단 변경 팝업.
+        self._on_player_click(pid, players[row].get("position"))
 
     def _copy_squad_player_records(self, ids, btn, reset_label="📋 스쿼드 기록 복사", target_years=None,
                                     include_stats=True, prefix_text=""):

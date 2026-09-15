@@ -3574,6 +3574,13 @@ def _pick_intl_starters(tournament_id, country, avg_ovr):
     already = [r for r in pool if r.get("starter")]
     target_n = min(11, len(pool))
     if len(already) >= target_n:
+        # [2026-09 신설, 신민용 리포트: "선수 검색의 국가대표 출전 포지션이
+        # 무조건 주포로 뜬다"] 주전 구성은 그대로 두되(대회 내내 고정이
+        # 원칙), slot 컬럼이 아직 안 채워진 옛 세이브면 여기서 한 번만
+        # 채워준다 — 지금 이 시점의 배정은 아래 새로 뽑는 경로와 똑같은
+        # 재료·규칙으로 계산되므로 결과가 갈리지 않는다.
+        if not any((r.get("slot") or "") for r in already):
+            _fill_intl_starter_slots(tournament_id, country, pool, already)
         return already
 
     def _score(r):
@@ -3598,8 +3605,75 @@ def _pick_intl_starters(tournament_id, country, avg_ovr):
     id_to_row = {r["id"]: r for r in pool}
     placed = _greedy_fill_slots(scored_pool, slot_order)
     starters = [id_to_row[p["id"]] for p in placed if p is not None]
-    set_intl_squad_starters(tournament_id, country, [r["id"] for r in starters])
+    # [2026-09 신설] placed는 slot_order와 같은 길이·순서라, i번째 자리에
+    # 놓인 선수가 곧 slot_order[i]를 맡는다 — 그 대응을 그대로 저장한다.
+    _slots = {p["id"]: slot_order[i] for i, p in enumerate(placed) if p is not None}
+    for r in starters:
+        r["slot"] = _slots.get(r["id"], "")
+    set_intl_squad_starters(tournament_id, country, [r["id"] for r in starters],
+                             slots=_slots)
     return starters
+
+
+def _fill_intl_starter_slots(tournament_id, country, pool, starters):
+    """[2026-09 신설] 주전 11명은 이미 확정돼 있는데 intl_squad.slot만
+    비어 있는 경우(그 컬럼이 생기기 전에 확정된 대회), 그 11명이 각각
+    어느 자리였는지를 채워 넣는다.
+
+    배정 규칙은 _pick_intl_starters가 처음 뽑을 때 쓰는 것과 완전히 동일
+    (_intl_formation_for로 그 나라 포메이션을 고르고 _greedy_fill_slots로
+    배치) — 다만 후보를 26인 풀 전체가 아니라 "이미 주전으로 확정된 11명"
+    으로 한정한다. 주전 구성 자체는 절대 안 건드린다는 뜻이다(대회 내내
+    같은 주전 유지 원칙).
+
+    한 번 저장되면 그 뒤로는 이 함수를 다시 타지 않으므로, 나중에 선수의
+    OVR·주포지션이 바뀌어도 이 대회의 자리는 그대로 남는다(화면에 보이는
+    값이 시간이 지나며 조용히 바뀌던 문제가 여기서 끝난다).
+    """
+    from database import set_intl_squad_starters
+    from formation_logic import _greedy_fill_slots
+    from constants import FORMATION_SLOTS
+    if not starters:
+        return {}
+    formation = _intl_formation_for(tournament_id, country, pool)
+    slot_order = FORMATION_SLOTS.get(formation, _INTL_MATCHDAY_STARTER_POS)
+    placed = _greedy_fill_slots([dict(r) for r in starters], slot_order)
+    slots = {p["id"]: slot_order[i] for i, p in enumerate(placed) if p is not None}
+    for r in starters:
+        r["slot"] = slots.get(r["id"], "")
+    set_intl_squad_starters(tournament_id, country, [r["id"] for r in starters],
+                             slots=slots)
+    return slots
+
+
+def resolve_intl_starter_slots(tournament_id, country, squad_rows):
+    """[2026-09 신설, 신민용 리포트: "국가대표 출전 포지션도 그 당시 애가
+    맡은 포지션이 떠야 한다"] 이 대회·이 나라 주전들이 맡았던 자리를
+    {player_id: 슬롯}으로 돌려준다 — 이미 저장돼 있으면 그대로,
+    아직 비어 있는 옛 대회면 _fill_intl_starter_slots로 한 번 채우고
+    그 결과를 돌려준다(그 뒤로는 저장된 값을 그대로 읽는다).
+
+    squad_rows: intl_squad 한 대회·한 나라의 행들(각 dict에 최소
+    id/position/starter/slot). 호출부가 이미 조회해둔 걸 그대로 넘기므로
+    이 함수는 추가 조회를 하지 않는다 — 화면에 뜨는 대회 수만큼 쿼리가
+    늘어나면 안 되는 경로(선수 검색 상세)에서 불리기 때문이다.
+
+    포지션 스냅샷(intl_squad.position)조차 없는 아주 오래된 대회는 배치
+    자체를 복원할 근거가 없으므로 빈 dict을 돌려준다 — 호출부는 그 경우
+    기존대로 position(주포) 스냅샷이나 "-"로 폴백한다.
+    """
+    if not squad_rows:
+        return {}
+    existing = {r["id"]: (r.get("slot") or "")
+                for r in squad_rows if (r.get("slot") or "")}
+    if existing:
+        return existing
+    starters = [r for r in squad_rows if r.get("starter")]
+    if not starters:
+        return {}
+    if not all((r.get("position") or "") for r in squad_rows):
+        return {}   # 포지션 스냅샷 이전 대회 — 소급 복원 불가
+    return _fill_intl_starter_slots(tournament_id, country, squad_rows, starters)
 
 
 # [2026-09 신설, 신민용 리포트: "지금은 월드컵 기준 주전들만 7/7 이렇게

@@ -4831,7 +4831,7 @@ def get_player_intl_records(player_id, limit=100):
     # "지금" 포지션(ai_players.position, 커리어 내내 바뀔 수 있음) 대신
     # 이걸 쓰므로 옛 대회 기록의 포지션이 나중에 안 바뀐다.
     squad_rows = [dict(r) for r in c.execute(
-        """SELECT s.tournament_id, s.country, s.appearances, s.position,
+        """SELECT s.tournament_id, s.country, s.appearances, s.position, s.slot, s.starter,
                   s.rating, s.goals, s.assists, s.clean_sheets, s.saves, s.goals_conceded,
                   t.year, t.kind, t.name
            FROM intl_squad s JOIN intl_tournaments t ON t.id = s.tournament_id
@@ -4841,6 +4841,34 @@ def get_player_intl_records(player_id, limit=100):
     conn.close()
     if not squad_rows:
         return []
+
+    # [2026-09 신설, 신민용 리포트: "국가 검색 대회 포메이션에선 LW에 있는데
+    # 선수 검색에선 CM으로 뜬다"] s.slot(그 대회에서 실제로 맡은 자리)이
+    # 아직 안 채워진 옛 대회만 골라 한 번 복원한다 — 대회 하나당 쿼리가
+    # 늘어나지 않도록, 필요한 대회 전부를 IN 한 방으로 읽어 나라별로
+    # 묶은 뒤 intl_engine에 넘긴다(복원 결과는 그 안에서 저장되므로 이
+    # 경로는 선수당·대회당 딱 한 번만 돈다).
+    _slot_by_key = {}   # (tournament_id, country) -> {player_id: slot}
+    _need = sorted({(r["tournament_id"], r["country"]) for r in squad_rows
+                    if r.get("starter") and not (r.get("slot") or "")})
+    if _need:
+        from intl_engine import resolve_intl_starter_slots
+        _tids = sorted({tid for tid, _cn in _need})
+        _cn2 = get_conn()
+        _ph = ",".join("?" * len(_tids))
+        _all = [dict(r) for r in _cn2.execute(
+            f"""SELECT tournament_id, country, player_id AS id, position, starter, slot
+                FROM intl_squad WHERE tournament_id IN ({_ph})""", _tids).fetchall()]
+        _cn2.close()
+        _by_key = {}
+        for r in _all:
+            _by_key.setdefault((r["tournament_id"], r["country"]), []).append(r)
+        for key in _need:
+            try:
+                _slot_by_key[key] = resolve_intl_starter_slots(
+                    key[0], key[1], _by_key.get(key, []))
+            except Exception:
+                _slot_by_key[key] = {}   # 복원 실패해도 표는 떠야 한다
 
     # 국가별로 모아 get_country_tournament_results를 국가당 한 번만 호출
     # (한 선수가 복수 국적으로 서로 다른 나라 대표팀에 뽑힌 적이 있을 수
@@ -4870,7 +4898,14 @@ def get_player_intl_records(player_id, limit=100):
         _stat = {"rating": r.get("rating") or 0, "goals": r.get("goals") or 0,
                  "assists": r.get("assists") or 0, "clean_sheets": r.get("clean_sheets") or 0,
                  "saves": r.get("saves") or 0, "goals_conceded": r.get("goals_conceded") or 0}
-        _position = r.get("position") or None
+        # [2026-09 수정] "이 당시 맡은 포지션"은 주포지션 스냅샷(position)이
+        # 아니라 그 대회에서 실제로 배정된 자리(slot)다 — 주포 CM인 선수가
+        # 대표팀에선 LW로 뛰는 건 흔하고, 국가 검색의 대회 포메이션 화면도
+        # 그 자리를 보여준다. 벤치(배정 자체가 없음)와 복원 불가한 옛
+        # 대회만 예전처럼 주포지션 스냅샷으로 폴백한다.
+        _slot = (r.get("slot") or "") or _slot_by_key.get(
+            (r["tournament_id"], r["country"]), {}).get(player_id, "")
+        _position = _slot or r.get("position") or None
         res = results_by_key.get((r["tournament_id"], r["country"]))
         if res:
             out.append({**res, "country": r["country"], "appearances": r["appearances"],
@@ -5278,7 +5313,7 @@ def get_country_tournament_squad(tournament_id, country_name):
 
     conn = get_conn(); c = conn.cursor()
     rows = c.execute(
-        "SELECT player_id, appearances, starter FROM intl_squad "
+        "SELECT player_id, appearances, starter, position, slot FROM intl_squad "
         "WHERE tournament_id=? AND country=?",
         (tournament_id, country_name)).fetchall()
     if not rows:
@@ -5288,6 +5323,20 @@ def get_country_tournament_squad(tournament_id, country_name):
     ids = [r["player_id"] for r in rows]
     appear_by_id = {r["player_id"]: r["appearances"] for r in rows}
     starter_by_id = {r["player_id"]: r["starter"] for r in rows}
+    # [2026-09 신설, 신민용 리포트: "선수 검색의 국가대표 출전 포지션이
+    # 무조건 주포로 뜬다"] 이 화면(대회 포메이션)과 선수 검색이 같은
+    # 값을 보여줘야 하므로, 둘 다 intl_squad.slot 하나만 본다 —
+    # 예전엔 이 화면만 매번 현재 OVR·현재 포지션으로 다시 배치를
+    # 계산해서(그래서 시간이 지나면 같은 옛 대회의 배치가 조용히
+    # 바뀌기도 했다) 선수 검색 쪽과 근거 자체가 달랐다.
+    try:
+        from intl_engine import resolve_intl_starter_slots
+        slot_by_id = resolve_intl_starter_slots(
+            tournament_id, country_name,
+            [{"id": r["player_id"], "position": r["position"],
+              "starter": r["starter"], "slot": r["slot"]} for r in rows])
+    except Exception:
+        slot_by_id = {}
     placeholders = ",".join("?" * len(ids))
     prows = c.execute(
         f"""SELECT ap.id, ap.name, ap.position, ap.ovr, ap.age,
@@ -5325,6 +5374,9 @@ def get_country_tournament_squad(tournament_id, country_name):
         r["appearances"] = appear_by_id.get(r["id"], 0)
         r["starter"] = bool(starter_by_id.get(r["id"], 0))
         r["display_name"] = custom_names.get(r["id"]) or ai_player_code(r["id"])
+        # slot = 이 대회에서 실제로 맡은 자리(주전만 있음). 벤치와 복원
+        # 불가한 옛 대회는 빈 값 — 호출부가 position(주포)으로 폴백한다.
+        r["slot"] = slot_by_id.get(r["id"], "")
 
     # [2026-09 신설] 내가 이 나라로 뽑힌 대회면 나도 스쿼드에 합류시킨다
     # (_my_intl_squad_entry 주석 참고). conn은 위에서 이미 닫혔으므로
