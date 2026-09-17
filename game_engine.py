@@ -12,6 +12,7 @@ from competition import cup_engine
 from competition import lower_cup_engine
 from competition import club_world_cup_engine
 from competition import super_cup_engine
+from competition import domestic_super_cup_engine
 import promotion_playoff_engine
 from match_sim import match_flow
 from match_sim import tactical_engine
@@ -100,6 +101,13 @@ def _invalidate_team_ovr_cache():
     # import하고 있어 순환 임포트 걱정 없이 바로 호출 가능(cup_engine 쪽은
     # 반대 방향이라 함수 내부에서 game_engine을 지연 임포트하는 것과 대칭).
     cup_engine._invalidate_cup_engine_caches()
+
+    # [2026-09 신설] 국가대표 실제 스쿼드 평균 OVR 캐시(intl_engine.
+    # _real_squad_ovr_cache)도 같은 타이밍(시즌전환·리맵)에 비운다 —
+    # club_engine 계열과 동일 원칙(위 cup_engine 호출과 대칭). 이 모듈이
+    # 파일 최상단에서 이미 intl_engine을 import하고 있어 순환 임포트
+    # 걱정 없이 바로 호출 가능.
+    intl_engine._invalidate_real_squad_ovr_cache()
 
     # 포메이션 위젯 선수 목록 캐시 무효화
     # FormationWidget 인스턴스를 직접 참조하지 않고, 모듈 속성으로 플래그 세팅.
@@ -1027,6 +1035,21 @@ def create_player(name: str, position: str, sub_role: str,
     _generate_all_league_schedules(1, _start_year)
     _cp_mark("전세계 일정 편성")
 
+    # [2026-09 버그수정, 신민용 리포트: "시작 연도 국내슈퍼컵 대회 자체가
+    # 1년 돌려도 아예 안 뜬다"] 국내 슈퍼컵 생성 훅을 "새 연도로 넘어가는
+    # 시점"(_advance_week의 연도 전환 블록)에만 심어놔서, 바로 위 리그
+    # 일정 생성과 똑같은 문제가 있었다 — 시즌 1(게임 시작 연도)은 애초에
+    # "연도 전환"을 한 번도 거치지 않고 시작하므로 그 훅이 전혀 안 걸림.
+    # 리그 일정과 같은 이유로 여기서 한 번 더 호출한다(이미 있으면
+    # _build_domestic_sc가 조용히 건너뛰므로 이후 연도 전환 시 중복 생성
+    # 걱정은 없음). 시즌 1은 전년도 데이터가 아예 없어 OVR 1·2위 폴백이
+    # 항상 걸린다.
+    try:
+        from competition import domestic_super_cup_engine
+        domestic_super_cup_engine.start_all_domestic_super_cups(_start_year, 1)
+    except Exception as e:
+        print("국내 슈퍼컵 생성 오류(건너뜀):", e)
+
     add_log(f"⭐ {_start_year}년  —  {name} {_start_age}세", "event")
     add_log("─"*44, "sep")
     _cp_total = _t_cp.perf_counter() - _cp_t0
@@ -1678,6 +1701,8 @@ def advance_4weeks(schedule: list):
                     super_cup_engine.simulate_my_super_cup_match(week, p)
                 else:
                     champions_engine.simulate_my_cl_match(week, p)
+            elif isinstance(detail, dict) and detail.get("domestic_sc"):
+                domestic_super_cup_engine.simulate_my_domestic_sc_match(week, p)
             else:
                 _simulate_match(p, week, detail)
         else:
@@ -1686,6 +1711,7 @@ def advance_4weeks(schedule: list):
             elm = europa_engine.get_my_el_match(week)
             eclm = conference_engine.get_my_ecl_match(week)
             scm = super_cup_engine.get_my_super_cup_match(week)
+            dscm = domestic_super_cup_engine.get_my_domestic_sc_match(week)
             if im:
                 _had_match = True
                 intl_engine.simulate_my_match(week, p)
@@ -1701,6 +1727,9 @@ def advance_4weeks(schedule: list):
             elif scm:
                 _had_match = True
                 super_cup_engine.simulate_my_super_cup_match(week, p)
+            elif dscm:
+                _had_match = True
+                domestic_super_cup_engine.simulate_my_domestic_sc_match(week, p)
             else:
                 _process_training(p, week, stype, detail)
                 _sim_my_unscheduled_match(week, p, cur_season)
@@ -1877,6 +1906,8 @@ def _advance_days_impl(schedule: list, progress_cb=None):
                     champions_engine.sim_my_cl_match_as_ai(week, p, reason="injury", day=day)
             elif isinstance(detail, dict) and detail.get("cup"):
                 cup_engine.sim_my_cup_match_as_ai(week, p, reason="injury", day=day)
+            elif isinstance(detail, dict) and detail.get("domestic_sc"):
+                domestic_super_cup_engine.sim_my_domestic_sc_match_as_ai(week, p, reason="injury", day=day)
             elif isinstance(detail, dict) and detail.get("lower_cup"):
                 lower_cup_engine.sim_my_lower_cup_match_as_ai(week, p, reason="injury", day=day)
             elif isinstance(detail, dict) and detail.get("cwc"):
@@ -1902,6 +1933,8 @@ def _advance_days_impl(schedule: list, progress_cb=None):
                     conference_engine.sim_my_ecl_match_as_ai(week, p, reason="injury", day=day)
                 elif super_cup_engine.get_my_super_cup_match(week, day=day, p=p):
                     super_cup_engine.sim_my_super_cup_match_as_ai(week, p, reason="injury", day=day)
+                elif domestic_super_cup_engine.get_my_domestic_sc_match(week, day=day, p=p):
+                    domestic_super_cup_engine.sim_my_domestic_sc_match_as_ai(week, p, reason="injury", day=day)
                 elif day == _intl_cl_day and cup_engine.get_my_cup_match(week, day=day, p=p):
                     cup_engine.sim_my_cup_match_as_ai(week, p, reason="injury", day=day)
                 elif lower_cup_engine.get_my_lower_cup_match(week, day=day, p=p):
@@ -1928,6 +1961,8 @@ def _advance_days_impl(schedule: list, progress_cb=None):
                     champions_engine.simulate_my_cl_match(week, p, day=day)
             elif isinstance(detail, dict) and detail.get("cup"):
                 cup_engine.simulate_my_cup_match(week, p, day=day)
+            elif isinstance(detail, dict) and detail.get("domestic_sc"):
+                domestic_super_cup_engine.simulate_my_domestic_sc_match(week, p, day=day)
             elif isinstance(detail, dict) and detail.get("lower_cup"):
                 lower_cup_engine.simulate_my_lower_cup_match(week, p, day=day)
             elif isinstance(detail, dict) and detail.get("cwc"):
@@ -1950,6 +1985,7 @@ def _advance_days_impl(schedule: list, progress_cb=None):
             elm = europa_engine.get_my_el_match(week, day=day, p=p) if day == _intl_cl_day else None
             eclm = conference_engine.get_my_ecl_match(week, day=day, p=p) if day == _intl_cl_day else None
             scm = super_cup_engine.get_my_super_cup_match(week, day=day, p=p)
+            dscm = domestic_super_cup_engine.get_my_domestic_sc_match(week, day=day, p=p)
             cu = cup_engine.get_my_cup_match(week, day=day, p=p) if day == _intl_cl_day else None
             lc = lower_cup_engine.get_my_lower_cup_match(week, day=day, p=p)
             cw = club_world_cup_engine.get_my_cwc_match(week, day=day, p=p)
@@ -1969,6 +2005,9 @@ def _advance_days_impl(schedule: list, progress_cb=None):
             elif scm:
                 _had_match = True
                 super_cup_engine.simulate_my_super_cup_match(week, p, day=day)
+            elif dscm:
+                _had_match = True
+                domestic_super_cup_engine.simulate_my_domestic_sc_match(week, p, day=day)
             elif cu:
                 _had_match = True
                 cup_engine.simulate_my_cup_match(week, p, day=day)
@@ -2117,6 +2156,12 @@ def _advance_days_impl(schedule: list, progress_cb=None):
             _pw_t3 = _time_mod.perf_counter()
             cup_engine.process_cup_week(week)
             lower_cup_engine.process_lower_cup_week(week)
+            # [2026-09 신설] 국내 슈퍼컵 — cup_engine/lower_cup_engine과 동일한
+            # 이유로 그 주 마지막 날에만 부른다(day 자체는 스케줄 표시용,
+            # 실제 시뮬레이션은 "그 주까지 온 미완료 경기"를 주 단위로
+            # 처리해도 이미 지나간 날짜라 항상 안전 — process_cup_week와
+            # 동일한 전례).
+            domestic_super_cup_engine.process_domestic_sc_week(week)
             _pw_t4 = _time_mod.perf_counter()
             _sim_all_ai_matches(week, p.get("current_league_id", 0), cur_season)
             _pw_t5 = _time_mod.perf_counter()
@@ -4574,6 +4619,22 @@ _GEN_SCORE_WHI  = [8, 24, 34, 24, 10]    # 승리팀, t=1(박빙 최대 격차)
 _GEN_SCORE_LWLO = [42, 42, 16]           # 패배팀, t=0
 _GEN_SCORE_LWHI = [55, 35, 10]           # 패배팀, t=1
 
+# [2026-09 신설, 신민용 리포트: "오스트레일리아 31-0 아메리칸사모아,
+# 대한민국 16-0 네팔처럼 실제 A매치/컵대회 역사에 있는 극단적 대량득점이
+# 지금 구조로는 불가능한 거 아니냐"] 기존 최고 구간(adv>=58, "초압도")도
+# win_goals 상한이 9(그나마 1% 확률)라, adv가 58이든 98이든 똑같은
+# 분포를 타서 진짜 압도적인 격차(국가등급 S~F 사이 등)에서도 두 자릿수
+# 대승이 구조적으로 나올 수 없었다. allow_extreme=True(국가대표·국내컵
+# 호출부에서만 켬 — 아래 _gen_score 정의부 참고)일 때만, adv>=80의 더
+# 위 구간을 하나 더 얹는다 — 낮은 쪽(3~9골)이 여전히 대부분이고, 그
+# 위로 갈수록 급격히 희박해지는 긴 꼬리로 20골까지 열어둔다(16골+
+# 확률 합쳐 약 1%). 리그·클럽대항전은 allow_extreme 기본값(False)이라
+# 이 구간 자체를 안 타므로 기존 동작 그대로.
+_GEN_SCORE_EXTREME_WIN    = [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+_GEN_SCORE_EXTREME_WEIGHT = [8, 12, 14, 14, 12, 10, 8, 6, 4, 3, 2, 1.5, 1, 0.7, 0.5, 0.3, 0.2, 0.1]
+_GEN_SCORE_EXTREME_LOSE   = [0, 1]
+_GEN_SCORE_EXTREME_LOSE_W = [92, 8]
+
 
 def _stoch_round_goal(v):
     """[2026-09 신설, "국가별 득점환경" 1단계 보정] 확률적 반올림 —
@@ -4622,16 +4683,22 @@ def _get_league_goal_mult(c, league_id):
     return _league_goal_mult_cache.get(league_id, 1.0)
 
 
-def _gen_score(outcome, diff=0.0, goal_mult=1.0):
+def _gen_score(outcome, diff=0.0, goal_mult=1.0, allow_extreme=False):
     """경기 스코어 생성. diff(홈-원정 전력차)가 클수록 이긴 쪽이 크게 이긴다.
     diff는 _simulate_match 에서 계산된 home_ovr-away_ovr (홈 보정 포함).
       - |diff| 0~15   → 박빙/우세: 이겨도 1~2골차가 흔함
       - |diff| 28~42  → 강한 우세/압도: 3~4골차 흔함, 대량득점은 여전히 소수
       - |diff| 58+    → 초압도: 대량득점(5골+)이 뚜렷하게 늘어남
+      - |diff| 80+ (allow_extreme=True 한정) → 극초압도: 두 자릿수 대승까지 열림
     [2026-07 재조정, 신민용 리포트] 예전 임계값(12/22/35/50)에서는 adv=25
     (그리 크지 않은 격차)만 돼도 5골차가 약 5% 나올 정도로 대량득점이
     너무 잦았다 — 임계값을 전체적으로 올리고 대량득점 가중치를 낮췄다.
     승자/패자는 outcome 으로 이미 정해졌고, 여기선 '몇 대 몇'만 정한다.
+
+    allow_extreme: [2026-09 신설] True면 adv>=80에서 _GEN_SCORE_EXTREME_*
+    구간(위 정의부 주석 참고)을 추가로 연다 — 국가대표(intl_engine)·
+    국내컵(cup_engine/lower_cup_engine) 호출부에서만 True로 넘긴다.
+    기본값 False라 리그·클럽대항전은 기존 동작 그대로(호출부 안 고쳐도 됨).
     """
     # 전력차 → 이긴 팀의 기대 득점 가중(우세할수록 큰 점수 쪽으로 분포 이동).
     adv = abs(diff)
@@ -4690,7 +4757,10 @@ def _gen_score(outcome, diff=0.0, goal_mult=1.0):
     # t를 adv/11처럼 이 리그의 실측 최댓값에 맞춰 강제 정규화하지
     # 않는다 — 다른 리그는 스프레드가 다를 수 있어 diff=11의 의미가
     # 리그마다 달라지면 안 되므로, 보편적으로 15를 기준으로 고정한다.
-    if adv >= 58:        # 초압도 — 드물게 7~9골 이변
+    if allow_extreme and adv >= 80:   # 극초압도 — 역사적 대량득점 재현용(위 정의부 주석 참고)
+        win_goals = random.choices(_GEN_SCORE_EXTREME_WIN, _GEN_SCORE_EXTREME_WEIGHT)[0]
+        lose_goals = random.choices(_GEN_SCORE_EXTREME_LOSE, _GEN_SCORE_EXTREME_LOSE_W)[0]
+    elif adv >= 58:      # 초압도 — 드물게 7~9골 이변
         win_goals = random.choices([3, 4, 5, 6, 7, 8, 9],
                                    [18, 28, 24, 16, 9, 4, 1])[0]
         lose_goals = random.choices([0, 1],         [85, 15])[0]
@@ -8070,7 +8140,13 @@ def _advance_week(p, base_week, n_weeks=4, progress_cb=None):
         # 생애주기 vs 승강제 vs 일정 재생성)을 정확히 짚어서 거기만
         # 추가로 최적화할 수 있다.
         import time as _time_perf
+        try:
+            from database import perf_wait_snapshot as _pws
+            _pws(reset=True)
+        except Exception:
+            _pws = None
         _t0 = _time_perf.perf_counter()
+        _tc0 = _time_perf.thread_time()
         # 연도 넘어갈 때 현재 팀 커리어 항목 닫기 (연도별 분리)
         if p.get("current_team_id"):
             _close_career_entry(p, new_year - 1, 52)
@@ -8097,6 +8173,18 @@ def _advance_week(p, base_week, n_weeks=4, progress_cb=None):
             power_ranking.run_year_end_power_ranking_update(get_conn(), new_year - 1)
         except Exception as e:
             print("파워랭킹 갱신 오류(건너뜀):", e)
+        _t3p = _time_perf.perf_counter()
+        # [2026-09 신설] 국내 슈퍼컵(domestic_super_cup_engine) — Y년 대회가
+        # (Y-1)년 리그/컵 결과를 쓰므로, 그 (Y-1)년 최종 순위(방금 위
+        # archive_old_seasons가 이미 league_season_standings에 확정해둠)가
+        # 갖춰지는 바로 이 시점에 전 세계 나라를 한 번에 만든다. 실제 경기
+        # 배정 요일(_pick_dsc_day)이 4주차 국내리그 일정을 조회하는데, 그
+        # 일정은 바로 위 _generate_all_league_schedules에서 이미 생성돼
+        # 있어 여기서 만들어도 안전하다.
+        try:
+            domestic_super_cup_engine.start_all_domestic_super_cups(new_year, new_season)
+        except Exception as e:
+            print("국내 슈퍼컵 생성 오류(건너뜀):", e)
         _t3c = _time_perf.perf_counter()
         # [2026-07 추가, 신민용 리포트: "연도전환이 갈수록 느려진다"] SQLite는
         # ANALYZE로 모은 테이블 통계를 바탕으로 실행계획(어느 인덱스를 쓸지)을
@@ -8115,8 +8203,14 @@ def _advance_week(p, base_week, n_weeks=4, progress_cb=None):
         _t3b = _time_perf.perf_counter()
         _live_debug(f"[PERF] 연도전환 총 {_t3b-_t0:.2f}s "
               f"(커리어정리 {_t1-_t0:.2f}s | _end_of_season {_t2-_t1:.2f}s | "
-              f"일정생성 {_t3-_t2:.2f}s | 파워랭킹 {_t3c-_t3:.2f}s | "
+              f"일정생성 {_t3-_t2:.2f}s | 파워랭킹 {_t3p-_t3:.2f}s | 국내슈퍼컵생성 {_t3c-_t3p:.2f}s | "
               f"PRAGMA optimize {_t3b-_t3c:.2f}s)")
+        if _pws is not None:
+            _w = _pws(reset=True)
+            _tc = _time_perf.thread_time() - _tc0
+            _live_debug(f"[PERF-WAIT] 연도전환 중 대기: 벽시계 {_t3b-_t0:.2f}s / 이 스레드 CPU {_tc:.2f}s "
+                        f"(차이 {max(0.0, (_t3b-_t0) - _tc):.2f}s = 대기) | 풀커넥션 락(다른 스레드) "
+                        f"{_w['s']:.2f}s({_w['n']}회) | hist writer 대기 {_w['drain_s']:.2f}s")
     else:
         # 리그 시즌 종료 주(신규 캘린더: 43주) 다음 주 진입 시: 커리어 스탯
         # 중간 업데이트만 (항목은 닫지 않음 - 연도 변경 시 _close_career_entry가 닫음)
@@ -10742,29 +10836,64 @@ def _get_historical_league_rank_points(year, team_id):
         # [2026-09 신설] 폴백 — 위 코멘트 참고. match_results는 이 시점엔
         # 아직 archive_old_seasons()가 지우지 않은 상태라 그 해 경기가
         # 그대로 남아있다(완료된 경기만: 스코어 NULL이 아닌 것).
-        rows = conn.execute(
-            """SELECT team_id,
-                      SUM(win) AS wins, SUM(draw) AS draws, SUM(loss) AS losses,
-                      SUM(gf) AS goals_for, SUM(ga) AS goals_against
-               FROM (
-                   SELECT home_team_id AS team_id,
-                          CASE WHEN home_score>away_score THEN 1 ELSE 0 END AS win,
-                          CASE WHEN home_score=away_score THEN 1 ELSE 0 END AS draw,
-                          CASE WHEN home_score<away_score THEN 1 ELSE 0 END AS loss,
-                          home_score AS gf, away_score AS ga
-                   FROM match_results
-                   WHERE league_id=? AND year=? AND home_score IS NOT NULL AND away_score IS NOT NULL
-                   UNION ALL
-                   SELECT away_team_id AS team_id,
-                          CASE WHEN away_score>home_score THEN 1 ELSE 0 END AS win,
-                          CASE WHEN away_score=home_score THEN 1 ELSE 0 END AS draw,
-                          CASE WHEN away_score<home_score THEN 1 ELSE 0 END AS loss,
-                          away_score AS gf, home_score AS ga
-                   FROM match_results
-                   WHERE league_id=? AND year=? AND home_score IS NOT NULL AND away_score IS NOT NULL
-               )
-               GROUP BY team_id""",
-            (league_id, year, league_id, year)).fetchall()
+        # [2026-09 성능, 첫해 52→1주차 지연의 두 번째 원인 — 실측] 아래
+        # 리그 단위 GROUP BY는 통계(sqlite_stat1)가 낡으면 idx_mr_year(연도)로
+        # 계획이 떨어져 그 해 전체 경기를 훑는다(통계 없음: 710리그 23.1s,
+        # 정상 통계: 0.26s). 정상 통계일 때 이미 쓰는 idx_mr_league_season을
+        # 명시해 통계와 무관하게 같은 계획을 쓴다. GROUP BY team_id는 어느
+        # 인덱스로 읽든 임시 B-트리 정렬을 거쳐 team_id 순으로 나오고 합계는
+        # 순서와 무관하므로 결과 행·순서가 같다(710개 리그 × 두 통계 상태에서
+        # 원래 SQL과 전수 대조 동일). 인덱스가 잠깐 없는 순간(대량 갱신용
+        # 인덱스 끄기 등)엔 원래 SQL로 그대로 계산한다.
+        _rank_args = (league_id, year, league_id, year)
+        try:
+            rows = conn.execute(
+                """SELECT team_id,
+                          SUM(win) AS wins, SUM(draw) AS draws, SUM(loss) AS losses,
+                          SUM(gf) AS goals_for, SUM(ga) AS goals_against
+                   FROM (
+                       SELECT home_team_id AS team_id,
+                              CASE WHEN home_score>away_score THEN 1 ELSE 0 END AS win,
+                              CASE WHEN home_score=away_score THEN 1 ELSE 0 END AS draw,
+                              CASE WHEN home_score<away_score THEN 1 ELSE 0 END AS loss,
+                              home_score AS gf, away_score AS ga
+                       FROM match_results INDEXED BY idx_mr_league_season
+                       WHERE league_id=? AND year=? AND home_score IS NOT NULL AND away_score IS NOT NULL
+                       UNION ALL
+                       SELECT away_team_id AS team_id,
+                              CASE WHEN away_score>home_score THEN 1 ELSE 0 END AS win,
+                              CASE WHEN away_score=home_score THEN 1 ELSE 0 END AS draw,
+                              CASE WHEN away_score<home_score THEN 1 ELSE 0 END AS loss,
+                              away_score AS gf, home_score AS ga
+                       FROM match_results INDEXED BY idx_mr_league_season
+                       WHERE league_id=? AND year=? AND home_score IS NOT NULL AND away_score IS NOT NULL
+                   )
+                   GROUP BY team_id""",
+                _rank_args).fetchall()
+        except sqlite3.OperationalError:
+            rows = conn.execute(
+                """SELECT team_id,
+                          SUM(win) AS wins, SUM(draw) AS draws, SUM(loss) AS losses,
+                          SUM(gf) AS goals_for, SUM(ga) AS goals_against
+                   FROM (
+                       SELECT home_team_id AS team_id,
+                              CASE WHEN home_score>away_score THEN 1 ELSE 0 END AS win,
+                              CASE WHEN home_score=away_score THEN 1 ELSE 0 END AS draw,
+                              CASE WHEN home_score<away_score THEN 1 ELSE 0 END AS loss,
+                              home_score AS gf, away_score AS ga
+                       FROM match_results
+                       WHERE league_id=? AND year=? AND home_score IS NOT NULL AND away_score IS NOT NULL
+                       UNION ALL
+                       SELECT away_team_id AS team_id,
+                              CASE WHEN away_score>home_score THEN 1 ELSE 0 END AS win,
+                              CASE WHEN away_score=home_score THEN 1 ELSE 0 END AS draw,
+                              CASE WHEN away_score<home_score THEN 1 ELSE 0 END AS loss,
+                              away_score AS gf, home_score AS ga
+                       FROM match_results
+                       WHERE league_id=? AND year=? AND home_score IS NOT NULL AND away_score IS NOT NULL
+                   )
+                   GROUP BY team_id""",
+                _rank_args).fetchall()
     conn.close()
     if not rows:
         return 0.0
@@ -11441,6 +11570,71 @@ _BALLON_CL_RATING_WEIGHT = 1.25
 # G/A 소량 보너스로 바꾼다. ST/W/CAM/CM/CDM 등 나머지 포지션은 기존
 # 79차 공식(_ballon_productivity 본문)을 그대로 유지 — 이번 변경 범위는
 # CB/LB/RB로만 국한한다(신민용+GPT 확정).
+# [2026-09 버그수정/성능, 신민용 리포트: 새 게임 첫해 52→1주차 87초 —
+# [AWARD-WAIT] 실측으로 발롱도르 저장 35.2s·야신 23.0s가 "대기 0, 전부 이
+# 스레드 CPU"로 확정] _get_team_gc_per_match는 CB/LB/RB 후보의 생산성 점수마다
+# (팀 감쇠 정렬 키·국적 감쇠 정렬 키·채점 → 발롱도르/야신 두 번) 캐시 없이
+# 불렸다. 시상 시점엔 그 해 hist.league_season_standings가 아직 없어서(연도
+# 전환 뒤에 아카이브됨) 매번 match_results UNION 조회로 떨어지는데, 그 조회는
+# 실행계획이 통계(sqlite_stat1)에 따라 0.02ms(팀 인덱스) ↔ 12~32ms(전체 SCAN
+# 또는 idx_mr_year — 첫해엔 모든 행이 같은 연도라 사실상 전체 스캔)로 바뀐다
+# (실측). 새 게임 첫해는 이전 판에서 남은 통계로 돌다가 첫 연도전환 끝의
+# PRAGMA optimize 이후에야 통계가 맞춰지므로 그 해만 수천 회 × 수십 ms가 됐다.
+# 해결: 발롱도르/야신 계산 동안만 켜지는 캐시. 그 해 match_results를
+# (리그, 홈팀)/(리그, 원정팀)으로 한 번씩 GROUP BY해 두고 같은 정수
+# COUNT/SUM으로 같은 나눗셈을 하므로 결과가 비트 단위로 같고, 통계·실행계획과
+# 무관하게 항상 빠르다. 시상 계산은 match_results와 순위표를 쓰지 않으므로
+# 계산 도중 값이 바뀔 수 없다. 판정이 애매한 경우(그 해 순위표에 같은 팀 행이
+# 2개 이상)만 예전 개별 조회 그대로 계산한다.
+_TEAM_GC_RUN_CACHE = None
+
+
+def _begin_team_gc_run_cache(year):
+    global _TEAM_GC_RUN_CACHE
+    _TEAM_GC_RUN_CACHE = {"year": year, "built": False, "memo": {}, "calls": 0, "build_s": 0.0}
+
+
+def _end_team_gc_run_cache():
+    global _TEAM_GC_RUN_CACHE
+    info = _TEAM_GC_RUN_CACHE
+    _TEAM_GC_RUN_CACHE = None
+    return info
+
+
+def _build_team_gc_run_tables(rc):
+    import time as _t_gc
+    _t0 = _t_gc.perf_counter()
+    year = rc["year"]
+    conn = get_conn()
+    lss = {}
+    for r in conn.execute(
+            """SELECT team_id, wins, draws, losses, goals_against
+               FROM hist.league_season_standings WHERE year=?""", (year,)).fetchall():
+        tid = r["team_id"]
+        lss[tid] = "DUP" if tid in lss else (r["wins"], r["draws"], r["losses"], r["goals_against"])
+    team_league = {r[0]: r[1] for r in conn.execute("SELECT id, league_id FROM teams").fetchall()}
+    agg = {}
+    for side_sql in (
+            """SELECT league_id, home_team_id AS tid, COUNT(*) AS m, SUM(away_score) AS ga
+               FROM match_results WHERE year=? AND home_score IS NOT NULL AND away_score IS NOT NULL
+               GROUP BY league_id, home_team_id""",
+            """SELECT league_id, away_team_id AS tid, COUNT(*) AS m, SUM(home_score) AS ga
+               FROM match_results WHERE year=? AND home_score IS NOT NULL AND away_score IS NOT NULL
+               GROUP BY league_id, away_team_id"""):
+        for r in conn.execute(side_sql, (year,)).fetchall():
+            k = (r["league_id"], r["tid"])
+            a = agg.get(k)
+            if a is None:
+                agg[k] = [r["m"], r["ga"]]
+            else:
+                a[0] += r["m"]
+                a[1] += r["ga"]
+    conn.close()
+    rc["lss"], rc["team_league"], rc["agg"] = lss, team_league, agg
+    rc["built"] = True
+    rc["build_s"] = _t_gc.perf_counter() - _t0
+
+
 def _get_team_gc_per_match(year, team_id, cache=None):
     """그 시즌 팀의 경기당 실점 — 수비수 생산성의 핵심 원재료.
     _get_historical_league_rank_points와 같은 self-healing 폴백 패턴을
@@ -11455,6 +11649,30 @@ def _get_team_gc_per_match(year, team_id, cache=None):
         key = ("team_gc", year, team_id)
         if key in cache:
             return cache[key]
+    rc = _TEAM_GC_RUN_CACHE
+    if cache is None and rc is not None and rc["year"] == year:
+        rc["calls"] += 1
+        memo = rc["memo"]
+        if team_id in memo:
+            return memo[team_id]
+        if not rc["built"]:
+            _build_team_gc_run_tables(rc)
+        srow = rc["lss"].get(team_id)
+        if srow != "DUP":
+            if srow is not None:
+                w, d, l, ga = srow
+                m = (w or 0) + (d or 0) + (l or 0)
+                result = (ga / m) if m > 0 else None
+            else:
+                result = None
+                lid = rc["team_league"].get(team_id)
+                if lid:
+                    a = rc["agg"].get((lid, team_id))
+                    if a and a[0]:
+                        result = (a[1] or 0) / a[0]
+            memo[team_id] = result
+            return result
+        # 같은 팀 순위표 행이 여럿 — 아래 예전 개별 조회(fetchone 첫 행)로 그대로 계산
     conn = get_conn()
     row = conn.execute(
         """SELECT wins, draws, losses, goals_against
@@ -12668,7 +12886,7 @@ _YASHIN_MAX_PER_TEAM = 2   # [2026-09 신설, 신민용 요청: "발롱도르 �
 _YASHIN_TOP_N = 10
 
 
-def _save_yashin_trophy_top10(c, year):
+def _save_yashin_trophy_top10(c, year, candidates=None):
     """트로피 야신(2019년 실제로 신설된, 발롱도르와 함께 시상되는 골키퍼
     전용 상) 대응. [2026-09 신설, 신민용 확정: "발롱도르 키퍼용을 만드는
     거며, 30명 중 1명이 아니라 10명 표시(푸스카스처럼)"] — 선정 방식
@@ -12688,7 +12906,14 @@ def _save_yashin_trophy_top10(c, year):
     그 팀/그 국적의 발롱도르 후보 전체를 기준으로 먼저 적용한다 —
     "이 골키퍼가 소속팀·국가대표팀에서 다른 후보들에 비해 얼마나
     두드러졌는가"라는 맥락이 발롱도르와 같아야 순위가 왜곡되지 않는다."""
-    candidates = _get_ballon_candidates(c, year)
+    # [2026-09 성능] candidates를 넘기면 후보 수집을 다시 하지 않는다 —
+    # _compute_season_individual_awards가 발롱도르용으로 방금 모은 후보를
+    # 감쇠(in-place) 전에 깊은 복사해서 넘긴다. _get_ballon_candidates는
+    # 난수를 안 쓰고, 두 호출 사이에 바뀌는 데이터는 발롱도르 자신의 행
+    # (category='world', 보너스맵이 읽지 않음)뿐이라 다시 모은 것과 완전히
+    # 같은 리스트다 — 후보 수집(시즌당 0.8~3.4s)을 한 번 아낀다.
+    if candidates is None:
+        candidates = _get_ballon_candidates(c, year)
     if not candidates:
         return
     candidates = _apply_ballon_team_trophy_decay(candidates)
@@ -13736,6 +13961,17 @@ def _compute_season_individual_awards(year, my_ctx=None):
         # 어느 하위 단계가 무거운지만 먼저 나눠 찍는다.
         import time as _t_aw
         _aw0 = _t_aw.perf_counter()
+        # [2026-09 계측, 신민용 리포트: 첫해 발롱도르 저장 32s·야신 25s] 벽시계
+        # 시간과 "이 스레드가 실제로 쓴 CPU 시간"(thread_time)을 같이 잰다 —
+        # 벽시계 ≫ CPU면 그 구간은 계산이 아니라 대기(다른 스레드의 GIL 점유,
+        # 락, 디스크 I/O 등)였다는 뜻이라 SQL/로직 문제로 오판하지 않게 한다.
+        _cc0 = _t_aw.thread_time()
+        try:
+            from database import perf_wait_snapshot as _pws_aw
+        except Exception:
+            _pws_aw = lambda reset=False: {"s": 0.0, "n": 0, "drain_s": 0.0}
+        _plw0 = _pws_aw(reset=False)
+        _cc1 = _ccb = _ccY = _ccA = _cc0
         _aw_ballon = _aw_puskas = _aw_club = _aw_intl = _aw_league = 0.0
         _n_ballon = 0
         # [2026-09 재배치, 79차, 신민용 확정: "MVP/베스트11을 발롱도르
@@ -13777,18 +14013,33 @@ def _compute_season_individual_awards(year, my_ctx=None):
         # 작다.
         if need_club_comp or need_league:
             history_drain()
+        _aw_drain = _t_aw.perf_counter() - _awF   # [2026-09 계측] hist 쓰기 대기만 따로
+        _yashin_cands = None
+        _begin_team_gc_run_cache(year)
         if need_ballon:
             candidates = _get_ballon_candidates(c, year)
             _n_ballon = len(candidates) if candidates else 0
             _aw1 = _t_aw.perf_counter()
+            _cc1 = _t_aw.thread_time()
+            if need_yashin and candidates:
+                import copy as _copy_aw
+                _yashin_cands = _copy_aw.deepcopy(candidates)   # 감쇠(in-place) 전 원본
             _save_ballon_dor_top30(c, year, candidates)
             _aw_ballon = _t_aw.perf_counter() - _awF
             _aw_cand = _aw1 - _awF
+            _ccb = _t_aw.thread_time()
         else:
             _aw_cand = 0.0
+            _aw1 = _t_aw.perf_counter()
+        _aw_bsave = _t_aw.perf_counter() - _aw1
+        _awY = _t_aw.perf_counter()
+        _ccY = _t_aw.thread_time()
         if need_yashin:
-            _save_yashin_trophy_top10(c, year)
+            _save_yashin_trophy_top10(c, year, candidates=_yashin_cands)
+        _gc_info = _end_team_gc_run_cache()
         _awA = _t_aw.perf_counter()
+        _ccA = _t_aw.thread_time()
+        _aw_yashin = _awA - _awY
         if need_puskas:
             winners = _get_puskas_candidates(c, year)
             _save_puskas_top10(c, year, winners)
@@ -13801,9 +14052,21 @@ def _compute_season_individual_awards(year, my_ctx=None):
             _aw_cup = _t_aw.perf_counter() - _awE
         _live_debug(
             f"[AWARD-PERF] {year}년 개인수상산정 {_t_aw.perf_counter()-_aw0:.2f}s 세부: "
-            f"발롱도르 {_aw_ballon:.2f}s (└후보수집 {_aw_cand:.2f}s · 후보 {_n_ballon}명) | "
+            f"발롱도르 {_aw_ballon:.2f}s (└hist대기 {_aw_drain:.2f}s · 후보수집 {_aw_cand - _aw_drain:.2f}s · 후보 {_n_ballon}명) | "
+            f"야신 {_aw_yashin:.2f}s | "
             f"푸스카스 {_aw_puskas:.2f}s | 클럽대항전 {_aw_club:.2f}s | "
             f"국제대회 {_aw_intl:.2f}s | 리그전 {_aw_league:.2f}s | 국내컵 {_aw_cup:.2f}s")
+        _aw_total_wall = _t_aw.perf_counter() - _aw0
+        _plw_aw = _pws_aw(reset=False)
+        _aw_total_cpu = _t_aw.thread_time() - _cc0
+        _live_debug(
+            f"[AWARD-WAIT] {year}년 벽시계 vs 이 스레드 CPU(차이=대기): "
+            f"전체 {_aw_total_wall:.2f}s/CPU {_aw_total_cpu:.2f}s(대기 {max(0.0, _aw_total_wall - _aw_total_cpu):.2f}s) | "
+            f"발롱저장 {_aw_bsave:.2f}s/CPU {_ccb - _cc1:.2f}s | "
+            f"야신 {_aw_yashin:.2f}s/CPU {_ccA - _ccY:.2f}s | "
+            f"수비수 팀실점 조회 {(_gc_info or {}).get('calls', 0)}회(캐시구축 {(_gc_info or {}).get('build_s', 0.0):.2f}s) | "
+            f"풀커넥션락대기 {_plw_aw['s'] - _plw0['s']:.2f}s({_plw_aw['n'] - _plw0['n']}회) | "
+            f"hist writer대기 {_plw_aw['drain_s'] - _plw0['drain_s']:.2f}s")
         _live_debug(
             f"[COUNTRY-GRADE-CACHE] {year}년: hit={_country_ids_cache_stats['hit']} "
             f"miss={_country_ids_cache_stats['miss']} "
@@ -13812,6 +14075,7 @@ def _compute_season_individual_awards(year, my_ctx=None):
         conn.rollback()
         raise
     finally:
+        _end_team_gc_run_cache()   # 예외로 빠져나가도 다음 호출에 남지 않게
         conn.close()
 
 
@@ -17538,7 +17802,7 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
         _team_goals_for_w43 = {
             r[0]: r[1] for r in c.execute("SELECT id, goals_for FROM teams").fetchall()}
         _snapshot_season_ratings(c, year, team_goals_for=_team_goals_for_w43,
-                                  competitions=("cup", "cl", "sc", "lower_cup"),
+                                  competitions=("cup", "cl", "sc", "lower_cup", "dsc"),
                                   pos_role_by_pid=_pos_role_by_pid_w43)
     except Exception as _e:
         add_log(f"[하반기 평점 스냅샷 오류] {_e}", "normal", year, 52)

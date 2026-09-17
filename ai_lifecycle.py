@@ -5739,7 +5739,7 @@ def _snapshot_season_ratings(c, year, team_goals_for=None, include_league=True, 
     from constants import get_goal_env_mult
 
     if competitions is None:
-        competitions = ("cup", "cl", "sc", "cwc", "lower_cup")
+        competitions = ("cup", "cl", "sc", "cwc", "lower_cup", "dsc")
 
     _raw_rows = c.execute(
         """SELECT ap.id AS id, ap.position AS position, ap.ovr AS ovr,
@@ -5955,6 +5955,13 @@ def _snapshot_season_ratings(c, year, team_goals_for=None, include_league=True, 
         "sc":  lambda: _team_comp_match_counts("sc_matches", "sc_tournaments"),
         "cwc": lambda: _team_comp_match_counts("cwc_matches", "cwc_tournaments"),
         "lower_cup": lambda: _team_comp_match_counts("lower_cup_matches", "lower_cup_tournaments"),
+        # [2026-09 신설, 신민용 리포트: "국내슈퍼컵도 평점/골/어시 단판
+        # 기록이 있어야 하는데 아예 없다"] lower_cup을 5번째 키로 추가한
+        # 것과 완전히 같은 이유·같은 패턴 — domestic_sc_matches/
+        # domestic_sc_tournaments도 다른 대회들과 컬럼 구성이 100% 같아서
+        # (home_team_id/away_team_id/home_score/away_score/tournament_id,
+        # tournaments.year) 헬퍼 함수 수정 없이 표 이름만 바꿔 끼우면 된다.
+        "dsc": lambda: _team_comp_match_counts("domestic_sc_matches", "domestic_sc_tournaments"),
     }
     comp_match_counts = {comp: fn() for comp, fn in _all_comp_match_counts.items() if comp in competitions}
 
@@ -5996,6 +6003,7 @@ def _snapshot_season_ratings(c, year, team_goals_for=None, include_league=True, 
         "sc":  lambda: _team_comp_goals_for("sc_matches", "sc_tournaments"),
         "cwc": lambda: _team_comp_goals_for("cwc_matches", "cwc_tournaments"),
         "lower_cup": lambda: _team_comp_goals_for("lower_cup_matches", "lower_cup_tournaments"),
+        "dsc": lambda: _team_comp_goals_for("domestic_sc_matches", "domestic_sc_tournaments"),
     }
     comp_goals_for = {comp: fn() for comp, fn in _all_comp_goals_for.items() if comp in competitions}
 

@@ -1487,7 +1487,7 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
     _rank1_re = _re.compile(r"\[1등(?:/\d+팀)?\]")
     awards = {"league": 0, "cup": 0, "cl": 0, "cwc": 0,
               "cl_champions": 0, "el_champions": 0, "ecl_champions": 0, "sc_champions": 0,
-              "lower_cup_champions": 0}
+              "dsc_champions": 0, "lower_cup_champions": 0}
     for e in out:
         if e.get("league") and _rank1_re.search(e["league"]):
             awards["league"] += 1
@@ -1515,6 +1515,11 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
             awards["cwc"] += 1
         if e.get("sc") and "[우승]" in e["sc"]:
             awards["sc_champions"] += 1
+
+    # [2026-09 신설] 국내 슈퍼컵도 같은 판정 기준으로 별도 카운트.
+    for e in out:
+        if e.get("dsc") and "[우승]" in e["dsc"]:
+            awards["dsc_champions"] += 1
 
     # [2026-08 신설, 상반기/하반기 이적 기록 분리 기능, 신민용 요청:
     # "상반기 20경기를 했을 때 기록이며... 아래엔 상반기, 위엔 하반기가
@@ -1691,9 +1696,11 @@ def _half_season_league_entry(conn, team_id, year, half_position=None, half_role
     _DEFAULT_ROLE_WEIGHT = _ROLE_WEIGHT.get("대기", 25)  # 역할 정보가 없을 때(과거 데이터 공백 등) 중간값 폴백
     trow = conn.execute("SELECT name FROM teams WHERE id=?", (team_id,)).fetchone()
     entry = {"year": year, "league": None, "cup": None, "cl": None, "cwc": None, "sc": None,
+             "dsc": None,
              "league_record": None, "cup_record": None, "cl_record": None, "cwc_record": None,
-             "sc_record": None, "league_champion": False, "cup_champion": False,
+             "sc_record": None, "dsc_record": None, "league_champion": False, "cup_champion": False,
              "cwc_champion": False, "cl_champion": False, "cl_kind": None, "sc_champion": False,
+             "dsc_champion": False,
              # [2026-08 신설] 이 두 키는 UI(_populate_player_team_box)가
              # "이 줄은 반기 스냅샷이니 _team_name_for_year(해당 연도의
              # 최종/하반기 소속팀)를 쓰지 말고 여기 적힌 원래(상반기) 팀
@@ -2090,7 +2097,7 @@ def get_my_player_career_history():
 
     _empty_awards = {"league": 0, "cup": 0, "cl": 0, "cwc": 0,
                       "cl_champions": 0, "el_champions": 0, "ecl_champions": 0, "sc_champions": 0,
-                      "lower_cup_champions": 0}
+                      "dsc_champions": 0, "lower_cup_champions": 0}
     if not stints:
         return {"awards": dict(_empty_awards), "years": []}
 
@@ -2156,12 +2163,16 @@ def get_my_player_career_history():
         _sc = conn_.execute(
             "SELECT my_team_id FROM sc_tournaments WHERE year=? AND my_in=1 LIMIT 1",
             (year_,)).fetchone()
+        _dsc = conn_.execute(
+            "SELECT my_team_id FROM domestic_sc_tournaments WHERE year=? AND my_in=1 LIMIT 1",
+            (year_,)).fetchone()
         _cwc = conn_.execute(
             "SELECT my_team_id FROM cwc_tournaments WHERE year=? AND my_in=1 LIMIT 1",
             (year_,)).fetchone()
         conn_.close()
         return {"cl": cl_team, "cup": cup_teams,
                 "sc": (_sc["my_team_id"] if _sc and _sc["my_team_id"] else None),
+                "dsc": (_dsc["my_team_id"] if _dsc and _dsc["my_team_id"] else None),
                 "cwc": (_cwc["my_team_id"] if _cwc and _cwc["my_team_id"] else None)}
 
     def _club_fields_from(team_id_, year_):
@@ -2175,11 +2186,13 @@ def get_my_player_career_history():
             "cup", "cup_record", "cup_champion",
             "cl", "cl_record", "cl_champion", "cl_kind",
             "sc", "sc_record", "sc_champion",
+            "dsc", "dsc_record", "dsc_champion",
             "cwc", "cwc_record", "cwc_champion")}
 
     _CLUB_FIELD_GROUPS = {
         "cl": ("cl", "cl_record", "cl_champion", "cl_kind"),
         "sc": ("sc", "sc_record", "sc_champion"),
+        "dsc": ("dsc", "dsc_record", "dsc_champion"),
         "cwc": ("cwc", "cwc_record", "cwc_champion"),
         "cup": ("cup", "cup_record", "cup_champion"),
     }
@@ -2211,6 +2224,8 @@ def get_my_player_career_history():
             awards_["cwc"] += 1
         if e.get("sc") and "[우승]" in e["sc"]:
             awards_["sc_champions"] += 1
+        if e.get("dsc") and "[우승]" in e["dsc"]:
+            awards_["dsc_champions"] += 1
 
     awards = dict(_empty_awards)
     out = []
@@ -2220,7 +2235,7 @@ def get_my_player_career_history():
         team_hist = _hist_for(main_st["team_id"])
         src = next((e for e in team_hist["years"] if e["year"] == y), None)
         entry = dict(src) if src else {"year": y, "league": None, "cup": None,
-                                        "cl": None, "cwc": None, "sc": None, "cl_kind": None}
+                                        "cl": None, "cwc": None, "sc": None, "dsc": None, "cl_kind": None}
         entry["_main_team_name"] = main_st["team_name"]
         # [2026-09 신설] 상/하반기 이적이 있었던 해만 등록 여부를 대조한다
         # (이적 없는 해는 main_st가 곧 등록팀이므로 항상 일치 — 굳이
@@ -2233,6 +2248,8 @@ def get_my_player_career_history():
                 _clear_club_field(entry, "cup")
             if entry.get("sc") and _reg["sc"] != main_st["team_id"]:
                 _clear_club_field(entry, "sc")
+            if entry.get("dsc") and _reg["dsc"] != main_st["team_id"]:
+                _clear_club_field(entry, "dsc")
             if entry.get("cwc") and _reg["cwc"] != main_st["team_id"]:
                 _clear_club_field(entry, "cwc")
         # [2026-08 신설, 신민용 요청: "소속팀일 때 포지션이 뭐였는지도"]
@@ -3186,6 +3203,112 @@ def has_cup_data_bulk():
     conn = get_conn()
     ids = {r["country_id"] for r in conn.execute(
         "SELECT DISTINCT country_id FROM cup_tournaments").fetchall()}
+    conn.close()
+    return ids
+
+
+# ─────────────────────────────────────────
+# 3.55. 역대 국내 슈퍼컵 기록 (domestic_super_cup_engine 연동, 2026-09 신설)
+# get_cup_history/get_cup_rank_leaders/get_cup_tournament_detail/
+# has_cup_data_bulk과 같은 패턴이지만, 이 대회는 라운드가 없는 단판(연 1회,
+# 참가 2팀뿐)이라 훨씬 단순하다 — 우승/준우승 2개 순위만 있고(3·4위 없음),
+# 대진 상세는 "결승"만 있는 1경기짜리 knockout 리스트다.
+# ─────────────────────────────────────────
+def _format_dsc_result(home_score, away_score, home_team_id, winner_team_id, pso_winner, pso_score):
+    """[2026-09 신설, 신민용 요청: "국내 슈퍼컵은 어차피 2팀뿐인데 클릭해서
+    보지 말고 우승|몇대몇|준우승으로 바로 표시하고, 승부차기했으면
+    승부차기(5:3) 이런식으로"] 단판이라 결승 상세 다이얼로그를 열 필요
+    없이 이 한 줄이 곧 전체 결과다 — 승부차기면 그 결과만, 아니면
+    우승팀 관점 스코어(우승팀 골 먼저)만 보여준다."""
+    if pso_winner:
+        pso = (pso_score or "").replace("-", ":")
+        return f"승부차기({pso})" if pso else "승부차기"
+    if home_score is None or away_score is None or home_score < 0 or away_score < 0:
+        return "-"
+    if winner_team_id == home_team_id:
+        return f"{home_score}:{away_score}"
+    return f"{away_score}:{home_score}"
+
+
+def get_domestic_sc_history(country_id, limit=999):
+    conn = get_conn()
+    rows = [dict(r) for r in conn.execute(
+        """SELECT t.id, t.year, t.name, t.home_team_id, t.away_team_id, t.winner_team_id,
+                  m.home_score, m.away_score, m.pso_winner, m.pso_score
+           FROM domestic_sc_tournaments t
+           LEFT JOIN domestic_sc_matches m ON m.id = (
+               SELECT id FROM domestic_sc_matches
+               WHERE tournament_id=t.id AND home_score>=0
+               ORDER BY id DESC LIMIT 1)
+           WHERE t.country_id=? AND t.status='done'
+           ORDER BY t.year DESC LIMIT ?""", (country_id, limit)).fetchall()]
+
+    all_tids = {tid for r in rows for tid in (r["home_team_id"], r["away_team_id"]) if tid}
+    name_cache = {}
+    if all_tids:
+        ph = ",".join("?" * len(all_tids))
+        for e in conn.execute(
+                f"SELECT id, name FROM teams WHERE id IN ({ph})", list(all_tids)).fetchall():
+            name_cache[e["id"]] = e["name"]
+    conn.close()
+
+    def _nm(team_id_):
+        return name_cache.get(team_id_, "?") if team_id_ else "-"
+
+    out = []
+    for r in rows:
+        winner = r["winner_team_id"]
+        if not winner:
+            continue
+        runner = r["away_team_id"] if winner == r["home_team_id"] else r["home_team_id"]
+        out.append({
+            "id": r["id"], "year": r["year"], "name": r["name"],
+            "winner": _nm(winner), "runner_up": _nm(runner),
+            "result": _format_dsc_result(r["home_score"], r["away_score"], r["home_team_id"],
+                                          winner, r["pso_winner"], r["pso_score"]),
+        })
+    return out
+
+
+def get_domestic_sc_rank_leaders(country_id):
+    rows = get_domestic_sc_history(country_id, limit=999999)
+    return _rank_leaders_from_rows(rows, ("winner", "runner_up"), "{key}")
+
+
+def get_domestic_sc_tournament_detail(tournament_id):
+    """단판이라 라운드가 하나(결승)뿐 — TournamentDetailDialog가 이미
+    그려줄 수 있는 형식(team_based=True, groups는 항상 빈 dict)을 그대로
+    재사용한다."""
+    conn = get_conn(); c = conn.cursor()
+    m = c.execute(
+        """SELECT home_team_id, away_team_id, home_score, away_score, pso_winner
+           FROM domestic_sc_matches WHERE tournament_id=? AND home_score>=0
+           ORDER BY id DESC LIMIT 1""", (tournament_id,)).fetchone()
+    conn.close()
+    if not m:
+        return {"groups": {}, "knockout": []}
+    ids = [m["home_team_id"], m["away_team_id"]]
+    conn = get_conn()
+    ph = ",".join("?" * len(ids))
+    name_by_id = {r["id"]: r["name"] for r in conn.execute(
+        f"SELECT id, name FROM teams WHERE id IN ({ph})", ids).fetchall()}
+    conn.close()
+    match = {
+        "home_info": {"team_name": name_by_id.get(m["home_team_id"], "?"), "tier": None,
+                      "flag": "", "team_id": m["home_team_id"]},
+        "away_info": {"team_name": name_by_id.get(m["away_team_id"], "?"), "tier": None,
+                      "flag": "", "team_id": m["away_team_id"]},
+        "home_score": m["home_score"], "away_score": m["away_score"],
+        "pso_winner": m["pso_winner"],
+    }
+    return {"groups": {}, "knockout": [{"stage": "결승", "stage_ko": "결승", "matches": [match]}]}
+
+
+def has_domestic_sc_data_bulk():
+    """has_cup_data_bulk과 동일한 이유·동일한 패턴."""
+    conn = get_conn()
+    ids = {r["country_id"] for r in conn.execute(
+        "SELECT DISTINCT country_id FROM domestic_sc_tournaments").fetchall()}
     conn.close()
     return ids
 
@@ -5823,7 +5946,7 @@ def get_team_history(team_id: int, year_range=None):
         conn.close()
         return {"awards": {"league": 0, "cup": 0, "cl": 0, "cwc": 0,
                             "cl_champions": 0, "el_champions": 0, "ecl_champions": 0,
-                            "sc_champions": 0, "lower_cup_champions": 0}, "years": []}
+                            "sc_champions": 0, "dsc_champions": 0, "lower_cup_champions": 0}, "years": []}
     team_name = trow["name"]
 
     yr_rows = conn.execute(
@@ -5902,13 +6025,14 @@ def get_team_history(team_id: int, year_range=None):
                 out.append(dict(_cached))
             continue
         entry = {"year": year, "league": None, "cup": None, "cl": None, "cwc": None, "sc": None,
+                  "dsc": None,
                   "league_record": None, "cup_record": None, "cl_record": None, "cwc_record": None,
-                  "sc_record": None,
+                  "sc_record": None, "dsc_record": None,
                   # [2026-08 신설, 신민용 요청: "우승했으면 원래 챔스 표시색(금색)으로
                   # 하이라이트"] UI가 텍스트("[1등]"/"[우승]")를 다시 파싱하지
                   # 않도록, 여기서 판정한 결과를 명시적 bool로 같이 내려준다.
                   "league_champion": False, "cup_champion": False, "cwc_champion": False,
-                  "cl_champion": False, "cl_kind": None, "sc_champion": False}
+                  "cl_champion": False, "cl_kind": None, "sc_champion": False, "dsc_champion": False}
 
         # ── 리그 성적 ──────────────────────────────────────
         lg = conn.execute("SELECT name, tier FROM leagues WHERE id=?", (league_id,)).fetchone()
@@ -6106,6 +6230,27 @@ def get_team_history(team_id: int, year_range=None):
                     entry["sc"] = f"{sc_t['name']} [4강 탈락]"
                 entry["sc_record"] = _wdl_record(sc_matches, team_id)
 
+        # ── 국내 슈퍼컵 (2026-09 신설) ────────────────────────
+        # 단판(3/4위전 없음)이라 위 슈퍼컵/클럽월드컵 블록보다 훨씬 단순 —
+        # 그 해 그 팀이 참가팀(home/away)이었는지만 확인하면 된다.
+        dsc_t = conn.execute(
+            """SELECT id, name, home_team_id, away_team_id, winner_team_id
+               FROM domestic_sc_tournaments
+               WHERE year=? AND (home_team_id=? OR away_team_id=?)""",
+            (year, team_id, team_id)).fetchone()
+        if dsc_t:
+            dsc_m = conn.execute(
+                """SELECT home_team_id, away_team_id, home_score, away_score, pso_winner
+                   FROM domestic_sc_matches WHERE tournament_id=? AND home_score!=-1""",
+                (dsc_t["id"],)).fetchone()
+            if dsc_m:
+                if dsc_t["winner_team_id"] == team_id:
+                    entry["dsc"] = f"{dsc_t['name']} [우승]"
+                    entry["dsc_champion"] = True
+                else:
+                    entry["dsc"] = f"{dsc_t['name']} [준우승]"
+                entry["dsc_record"] = _wdl_record([dsc_m], team_id)
+
         # ── 클럽 월드컵 도달 스테이지 ─────────────────────────
         # [2026-08 신설, 신민용 리포트: "팀 검색 이후 기록에 클럽 월드컵
         # 기록이 없다"] 챔피언스리그 블록과 완전히 같은 패턴(entries로
@@ -6143,14 +6288,14 @@ def get_team_history(team_id: int, year_range=None):
                     entry["cwc"] = f"{cwc_t['name']} [{stage_ko} 탈락]"
                 entry["cwc_record"] = _wdl_record(cwc_matches, team_id)
 
-        if entry["league"] or entry["cup"] or entry["cl"] or entry["cwc"] or entry["sc"]:
+        if entry["league"] or entry["cup"] or entry["cl"] or entry["cwc"] or entry["sc"] or entry["dsc"]:
             out.append(entry)
         if _cacheable:
             if len(_TEAM_YEAR_ENTRY_CACHE) >= _TEAM_YEAR_ENTRY_CACHE_MAX:
                 _TEAM_YEAR_ENTRY_CACHE.clear()
             _TEAM_YEAR_ENTRY_CACHE[_ck] = (
                 dict(entry) if (entry["league"] or entry["cup"] or entry["cl"]
-                                or entry["cwc"] or entry["sc"]) else None)
+                                or entry["cwc"] or entry["sc"] or entry["dsc"]) else None)
 
     conn.close()
 
@@ -6167,7 +6312,7 @@ def get_team_history(team_id: int, year_range=None):
     # (cl_champions/el_champions/ecl_champions)를 우선 쓴다.
     awards = {"league": 0, "cup": 0, "cl": 0, "cwc": 0,
               "cl_champions": 0, "el_champions": 0, "ecl_champions": 0, "sc_champions": 0,
-              "lower_cup_champions": 0}
+              "dsc_champions": 0, "lower_cup_champions": 0}
     # [2026-08 신설, 신민용 요청: "[1등] 뒤에 팀 수도 붙게 해달라"] 위에서
     # entry["league"]가 "[1등]" → "[1등/N팀]"으로 바뀌면서, 고정 문자열
     # 매칭으로는 더 이상 못 찾는다 — 정규식으로 "[1등"으로 시작하는 걸
@@ -6206,6 +6351,8 @@ def get_team_history(team_id: int, year_range=None):
             awards["cwc"] += 1
         if e["sc"] and "[우승]" in e["sc"]:
             awards["sc_champions"] += 1
+        if e["dsc"] and "[우승]" in e["dsc"]:
+            awards["dsc_champions"] += 1
     return {"awards": awards, "years": out}
 
 

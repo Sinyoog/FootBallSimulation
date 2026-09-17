@@ -1768,6 +1768,18 @@ def open_ovr_edit_dialog(parent, player_id: int, cur_ovr: int):
     delta, before_ovr, after_ovr = rescale_ai_player_to_target_ovr(
         player_id, _target, user_initiated=True)
 
+    # [2026-09 신설, 신민용 요청: "쉬움모드 OVR 편집이 국가대표/클럽
+    # 경기 시뮬레이션에 즉시 반영되게 해달라"] rescale_ai_player_to_target_ovr는
+    # ai_players.ovr을 DB에 바로 반영하지만, 실제 매치 시뮬레이션이 쓰는
+    # game_engine._team_ovr_cache·intl_engine._real_squad_ovr_cache는
+    # 세션 캐시라(원래 "ai_players.ovr은 시즌 중 안 바뀐다"는 전제 —
+    # 시즌전환에서만 무효화) 이 편집 직후엔 여전히 옛 값을 돌려줬다.
+    # 아래 한 줄은 게임 정상 진행 중에도 매 시즌전환마다 호출되는
+    # 캐시함수라 여기서 한 번 더 불러도 안전하다(클럽 OVR 캐시·리그
+    # 캐시·intl 국가대표 캐시·cup_engine 캐시까지 한 번에 비움).
+    from game_engine import _invalidate_team_ovr_cache
+    _invalidate_team_ovr_cache()
+
     global _ovr_cache_invalidated
     _ovr_cache_invalidated = True
     apply_ovr_edit_live(player_id)

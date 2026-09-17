@@ -60,6 +60,12 @@ class CompetitionConfig:
     # 기본값은 기존 그대로 "cl_suspension"(챔스/유로파/컨퍼런스 공유) —
     # 슈퍼컵만 별도 그룹(super_cup_suspension)이라 SC_CFG가 오버라이드한다.
     suspension_field: str = "cl_suspension"
+    # [2026-09 신설, 신민용 확정: "챔스/유로파/컨퍼런스/클럽월드컵은 결승과
+    # 3/4위전, 대륙 슈퍼컵은 4강부터 전부 원정 vs 원정"] 이 튜플에 담긴
+    # stage 코드의 경기는 sim_ai_match/simulate_my_match가 자동으로
+    # match_outcome/resolve_pso를 neutral=True로 호출한다. 기본값은 빈
+    # 튜플(아무 stage도 중립 처리 안 함 — 기존 대회 전부 동작 그대로).
+    neutral_stages: tuple = ()
 
 
 # ─────────────────────────────────────────────
@@ -102,16 +108,32 @@ def _tournament_effective_ovr(ovr: float) -> float:
     return ovr
 
 
-def match_outcome(h_ovr, a_ovr):
-    """중립 구장 가정. 'home'/'draw'/'away' (KO 무승부 → 승부차기).
+def match_outcome(h_ovr, a_ovr, neutral=False):
+    """'home'/'draw'/'away' (KO 무승부 → 승부차기).
     champions_engine._match_outcome과 완전히 동일 — 단, 위 비선형 곡선으로
-    변환한 effective OVR을 쓴다(원본 공식/계수는 그대로)."""
+    변환한 effective OVR을 쓴다(원본 공식/계수는 그대로).
+
+    [2026-09 확장, 신민용 확정: "챔스/유로파/컨퍼런스/클럽월드컵은 결승과
+    3/4위전, 대륙 슈퍼컵은 4강부터 전부 원정 vs 원정(홈 어드밴티지 없음)"]
+    기존 공식은 문서화된 이름과 달리 diff=0이어도 홈 46%/원정 30%로
+    비대칭이다(국내 슈퍼컵을 만들 때 이미 확인된 특성) — neutral=True면
+    diff=0에서 정확히 hw==aw가 되는 진짜 대칭 공식을 쓴다(기울기 0.022·
+    무승부 폭 감소 계수 0.009는 그대로 유지해 이변 확률 감각만 보존).
+    호출부는 CompetitionConfig.neutral_stages에 그 경기의 stage가
+    들어있는지로 이 플래그를 결정한다(sim_ai_match/simulate_my_match가
+    자동으로 계산해서 넘긴다 — 호출자가 매번 판단할 필요 없음)."""
     h_eff = _tournament_effective_ovr(h_ovr)
     a_eff = _tournament_effective_ovr(a_ovr)
     diff = h_eff - a_eff
-    hw = max(0.04, min(0.95, 0.46 + diff * 0.022))
-    dw = max(0.05, 0.24 - abs(diff) * 0.009)
-    aw = max(0.02, 1.0 - hw - dw)
+    if neutral:
+        dw = max(0.05, 0.24 - abs(diff) * 0.009)
+        half = max(0.0, 1.0 - dw) / 2.0
+        hw = max(0.04, min(0.95, half + diff * 0.022))
+        aw = max(0.02, min(0.95, half - diff * 0.022))
+    else:
+        hw = max(0.04, min(0.95, 0.46 + diff * 0.022))
+        dw = max(0.05, 0.24 - abs(diff) * 0.009)
+        aw = max(0.02, 1.0 - hw - dw)
     tot = hw + dw + aw
     hw, dw, aw = hw / tot, dw / tot, aw / tot
     roll = random.random()
@@ -122,7 +144,7 @@ def match_outcome(h_ovr, a_ovr):
     return "away"
 
 
-def resolve_pso(h_ovr, a_ovr):
+def resolve_pso(h_ovr, a_ovr, neutral=False):
     """champions_engine._resolve_pso와 완전히 동일.
     [2026-08 신설, 신민용 요청: "PSO에서 OVR 차이가 승부차기 결과에 지나치게
     약하게 반영된다 — 챔스 이변이 실제보다 너무 잦은 원인 중 하나"] 계수를
@@ -136,6 +158,10 @@ def resolve_pso(h_ovr, a_ovr):
     [2026-08 추가] 위 match_outcome과 동일하게, 여기서도 원본 OVR이 아니라
     비선형 변환한 effective OVR로 계산한다(강팀이 PSO에서도 그 우위를
     일관되게 유지하도록).
+    [2026-09 확장] neutral=True(결승/3·4위전 등 원정 vs 원정)여도 PSO
+    자체는 애초에 홈/원정 구분 없이 순수 OVR 차이만 반영하는 공식이라
+    (p_home이 "홈팀이 이길 확률"이라는 이름일 뿐 편향은 없음) 그대로 써도
+    되지만, 시그니처는 match_outcome과 맞춰 호출부를 단순하게 둔다.
     """
     h_eff = _tournament_effective_ovr(h_ovr)
     a_eff = _tournament_effective_ovr(a_ovr)
@@ -304,11 +330,11 @@ def sim_ai_match(cfg, t, m, my_played=False, conn=None, reason="injury", batch=N
     he = entry(cfg, t["id"], m["home_team_id"])
     ae = entry(cfg, t["id"], m["away_team_id"])
 
-    outcome = match_outcome(he["ovr"], ae["ovr"])
+    outcome = match_outcome(he["ovr"], ae["ovr"], neutral=(m["stage"] in cfg.neutral_stages))
     pso_winner, pso_score = 0, ""
     is_ko = (m["stage"] != "league")
     if outcome == "draw" and is_ko:
-        win_home, pso_score = resolve_pso(he["ovr"], ae["ovr"])
+        win_home, pso_score = resolve_pso(he["ovr"], ae["ovr"], neutral=(m["stage"] in cfg.neutral_stages))
         pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
     hs, as_ = _gen_score(outcome, he["ovr"] - ae["ovr"])
 
@@ -997,8 +1023,16 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
     # [2026-08 신설, 신민용 요청: "챔피언스리그처럼 다른 국가 팀이랑 하면
     # 라인업 평점이 안 뜬다"] champions_engine.simulate_my_cl_match와 완전히
     # 동일한 패턴 — 유로파/컨퍼런스/슈퍼컵이 이 함수 하나를 공유하므로
-    # 여기 한 번만 고치면 세 대회 전부 적용된다. 중립 구장 가정이라
-    # home_adv=0.0.
+    # 여기 한 번만 고치면 세 대회 전부 적용된다.
+    # [2026-09 버그수정, 신민용 리포트: "그럼 플레이어가 뛰는 16강은 이제
+    # 홈 어드벤티지가 생겼다는거지?"] 예전엔 스테이지 상관없이 항상
+    # home_adv=0.0이었다 — "결승/3·4위전만 중립"이라는 이번 설계와 달리
+    # 16강 같은 초반 라운드까지 전부 홈 어드벤티지가 없던 상태였던 것
+    # (내가 직접 뛰는 경기에 한해서만 — AI끼리는 원래도 match_outcome이
+    # 라운드별로 정상 적용됐음). neutral_stages에 없는 라운드는 리그와
+    # 똑같이 _home_advantage()(1.5~4.5 랜덤)를 쓰게 고친다.
+    from game_engine import _home_advantage
+    _neutral_stage = m["stage"] in cfg.neutral_stages
     my_position = p.get("position", "")
     engine_stats = None
     engine_plog = None
@@ -1017,7 +1051,7 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
             away_boost=(bonus if not is_home else 0.0),
             home_boost_position=(my_position if is_home else None),
             away_boost_position=(my_position if not is_home else None),
-            home_adv=0.0)
+            home_adv=(0.0 if _neutral_stage else _home_advantage()))
         hs, as_ = sim["home_score"], sim["away_score"]
         engine_stats = {"home": sim["home_stats"], "away": sim["away_stats"]}
         engine_plog = sim["possession_log"]
@@ -1025,13 +1059,13 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
                           "away": sim.get("away_player_ratings") or []}
         outcome = "draw" if hs == as_ else ("home" if hs > as_ else "away")
     except Exception:
-        outcome = match_outcome(h_ovr, a_ovr)
+        outcome = match_outcome(h_ovr, a_ovr, neutral=_neutral_stage)
         hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
 
     pso_winner, pso_score = 0, ""
     is_ko = (m["stage"] != "league")
     if outcome == "draw" and is_ko:
-        win_home, pso_score = resolve_pso(h_ovr, a_ovr)
+        win_home, pso_score = resolve_pso(h_ovr, a_ovr, neutral=_neutral_stage)
         pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
 
     if _suspended or _benched:

@@ -144,6 +144,10 @@ SC_CFG = CompetitionConfig(
     # simulate_my_match의 기본값(cl_suspension)을 그대로 물려받아 셋과
     # 같은 카운터를 썼는데(버그), 이제 전용 필드로 분리한다.
     suspension_field="super_cup_suspension",
+    # [2026-09 신설, 신민용 확정: "대륙 슈퍼컵은 4강부터 원정 vs 원정"]
+    # 슈퍼컵은 애초에 4강(SF)에서 시작하는 작은 토너먼트라 "4강부터"가
+    # 곧 "이 대회 전 경기"다 — SF/F/TP 전부 중립.
+    neutral_stages=("SF", "F", "TP"),
 )
 
 _CONTINENTS = ("유럽", "아시아", "아프리카", "남미", "북미")

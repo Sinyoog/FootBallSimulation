@@ -17,6 +17,7 @@ from constants import format_result_with_absence
 # (#800020) — 두 파일이 서로 import하지 않는 기존 원칙(_fmt_loan_months
 # 주석과 동일한 이유, 순환 참조 방지)에 따라 여기도 값만 그대로 복제한다.
 BURGUNDY = "#800020"
+BROWN = "#8B5A2B"   # 국내 슈퍼컵 전용색
 
 
 def _fmt_loan_months(total_weeks):
@@ -294,6 +295,11 @@ class CareerWindow(QDialog):
         from competition import super_cup_engine
         self._sc_ms = super_cup_engine.get_my_sc_matches()
 
+        # [2026-09 신설] 국내 슈퍼컵 — 위 슈퍼컵과 이름 패턴만 다르고 완전히
+        # 같은 방식(get_my_matches(cfg) 재사용, _champions_tab 그대로).
+        from competition import domestic_super_cup_engine
+        self._dsc_ms = domestic_super_cup_engine.get_my_domestic_sc_matches()
+
         from competition import cup_engine
         self._cup_ms = cup_engine.get_my_cup_matches()
         from competition import lower_cup_engine
@@ -385,7 +391,8 @@ class CareerWindow(QDialog):
             (self._trophies, "year"), (self._awards, "year"), (self._promos, "year"),
             (self._intl_ms, "year"), (self._qual_ms, "year"), (self._po_ms, "year"),
             (self._cl_ms, "t_year"), (self._el_ms, "t_year"), (self._ecl_ms, "t_year"),
-            (self._sc_ms, "t_year"), (self._cup_ms, "t_year"), (self._lc_ms, "t_year"),
+            (self._sc_ms, "t_year"), (self._dsc_ms, "t_year"),
+            (self._cup_ms, "t_year"), (self._lc_ms, "t_year"),
             (self._cwc_ms, "t_year"),
         ):
             for r in rows:
@@ -462,6 +469,13 @@ class CareerWindow(QDialog):
                                                label="슈퍼컵", icon="🏵", color=BURGUNDY,
                                                year=year),
                            f"슈퍼컵 ({len(sc_ms)})")
+
+        # [2026-09 신설] 국내 슈퍼컵 — 위 슈퍼컵과 완전히 같은 패턴(색만 BROWN).
+        dsc_ms = _filter_by_year(self._dsc_ms, year, key="t_year")
+        self._tabs.addTab(self._champions_tab(dsc_ms, p, history_table="domestic_sc_history",
+                                               label="국내 슈퍼컵", icon="🟤", color=BROWN,
+                                               year=year),
+                           f"국내슈퍼컵 ({len(dsc_ms)})")
 
         cup_ms = _filter_by_year(self._cup_ms, year, key="t_year")
         self._tabs.addTab(self._cup_tab(cup_ms, year=year), f"컵대회 ({len(cup_ms)})")

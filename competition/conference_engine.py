@@ -39,6 +39,7 @@ CONFERENCE_CFG = CompetitionConfig(
     league_weeks=ECL_LEAGUE_WEEKS,
     end_week=ECL_END_WEEK,
     stage_order=_cl._STAGE_ORDER,
+    neutral_stages=("F", "TP"),
 )
 
 

@@ -223,6 +223,17 @@ def init_lower_cup_tables(c):
     # PLAN으로 실측 확인 — 나머지 6개 표는 전부 정상적으로 SEARCH를 탐).
     c.execute("""CREATE INDEX IF NOT EXISTS idx_lower_cup_matches_tid_week
                  ON lower_cup_matches(tournament_id, week)""")
+    # [2026-09 신설, 신민용 리포트: "해가 갈수록 국내컵 주차가 느려진다"
+    # (32주차 국내컵 0.51s→0.96→1.33→1.72→2.14s, 매년 +0.4s)] 위
+    # lower_cup_matches와 똑같은 누락이 짝 표 lower_cup_entries에도 있었다 —
+    # 인덱스가 하나도 없어서 매 경기 패자 처리("UPDATE ... SET alive=0 WHERE
+    # tournament_id=? AND team_id=?", 한 라운드 주차에 2천여 회)와 생존팀
+    # 조회가 전부 풀스캔(EXPLAIN: SCAN lower_cup_entries)이었다. 이 표는 매년
+    # 약 6,400행씩 영구히 쌓인다. 단일 컬럼(tournament_id)으로만 거는 이유:
+    # 같은 키 안에서는 SQLite가 rowid 순서를 유지하므로 ORDER BY 없는
+    # 조회의 결과 순서가 풀스캔 때와 완전히 같다(결과·난수 소비 순서 불변).
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_lower_cup_entries_tid
+                 ON lower_cup_entries(tournament_id)""")
     c.execute("""CREATE TABLE IF NOT EXISTS lower_cup_history(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         year INTEGER, country_id INTEGER, team_name TEXT, result TEXT,
@@ -541,8 +552,21 @@ def process_lower_cup_week(week):
     _my_tid_now = _p.get("current_team_id", 0) if _p else 0
 
     conn = get_conn(); c = conn.cursor()
-    matches = c.execute(
-        "SELECT * FROM lower_cup_matches WHERE week=? AND home_score=-1", (week,)).fetchall()
+    # [2026-09 성능] cup_engine.process_cup_week와 같은 이유 — "WHERE week=?"만
+    # 걸면 지난 모든 해의 같은 주차 행까지 훑는다. 미완료(home_score=-1)
+    # 경기는 active 대회에만 있으므로 그 대회 id로 좁힌다. 순서는 예전
+    # 풀스캔과 같은 id(=rowid) 순으로 맞춰 대회 처리 순서(=난수 소비 순서)를
+    # 유지한다.
+    _active_tids = [r[0] for r in c.execute(
+        "SELECT id FROM lower_cup_tournaments WHERE status='active'").fetchall()]
+    matches = []
+    for _i in range(0, len(_active_tids), 500):
+        _chunk = _active_tids[_i:_i + 500]
+        _ph = ",".join("?" * len(_chunk))
+        matches.extend(c.execute(
+            f"SELECT * FROM lower_cup_matches WHERE tournament_id IN ({_ph}) AND week=? AND home_score=-1",
+            (*_chunk, week)).fetchall())
+    matches.sort(key=lambda r: r[0])   # id 순(= 예전 풀스캔 rowid 순)
     cols = [d[0] for d in c.description] if matches else []
     by_tournament = {}
     for row in matches:
@@ -989,7 +1013,7 @@ def simulate_my_lower_cup_match(week, p, day=None):
         outcome = "draw" if hs == as_ else ("home" if hs > as_ else "away")
     except Exception:
         outcome = _match_outcome(h_ovr, a_ovr)
-        hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
+        hs, as_ = _gen_score(outcome, h_ovr - a_ovr, allow_extreme=True)
 
     pso_winner, pso_score = 0, ""
     if outcome == "draw":

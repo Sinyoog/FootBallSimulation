@@ -235,6 +235,7 @@ class RetireWindow(QDialog):
             from competition import europa_engine
             from competition import conference_engine
             from competition import super_cup_engine
+            from competition import domestic_super_cup_engine
             self._career_match_cache = {
                 "intl_ms": intl_engine.get_my_intl_matches(),
                 "qual_ms": intl_engine.get_my_qual_matches(),
@@ -242,6 +243,7 @@ class RetireWindow(QDialog):
                 "el_ms": europa_engine.get_my_el_matches(),
                 "ecl_ms": conference_engine.get_my_ecl_matches(),
                 "sc_ms": super_cup_engine.get_my_sc_matches(),
+                "dsc_ms": domestic_super_cup_engine.get_my_domestic_sc_matches(),
                 "cup_ms": cup_engine.get_my_cup_matches(),
                 "lower_cup_ms": lower_cup_engine.get_my_lower_cup_matches(),
                 "cwc_ms": club_world_cup_engine.get_my_cwc_matches(),
@@ -519,6 +521,13 @@ class RetireWindow(QDialog):
         t36s.setObjectName("secTitle")
         lay.addWidget(t36s)
         lay.addWidget(self._champions_table(sc_ms, p, label="슈퍼컵"))
+
+        # ── 국내 슈퍼컵 기록 (2026-09 신설) ───────────
+        dsc_ms = _cm["dsc_ms"]
+        t36d = QLabel(f"🟤 국내 슈퍼컵 기록  ({len(dsc_ms)})")
+        t36d.setObjectName("secTitle")
+        lay.addWidget(t36d)
+        lay.addWidget(self._champions_table(dsc_ms, p, label="국내 슈퍼컵"))
 
         # ── 컵대회 기록 ──────────────────────────────
         cup_ms = _cm["cup_ms"]
@@ -1846,6 +1855,32 @@ class RetireWindow(QDialog):
             lines.append("  없음")
         lines.append("")
 
+        # 국내 슈퍼컵 경력 (tier=-4, 대회별 결과 + 활약) — 2026-09 신설
+        dsc_trophies = [t for t in trophies if t.get('tier', 0) == -4]
+        lines.append(f"▶ 국내 슈퍼컵 경력  ({len(dsc_trophies)}건)")
+        if dsc_trophies:
+            conn_d = get_conn()
+            try:
+                dschist = {(r["year"], r["team_name"]): dict(r) for r in conn_d.execute(
+                    "SELECT * FROM domestic_sc_history").fetchall()}
+            except Exception:
+                dschist = {}
+            conn_d.close()
+            for t in dsc_trophies:
+                yr, comp = t.get('year', 0), t.get('competition', '')
+                result   = t.get('league_name', '')   # league_name 자리에 결과 저장됨
+                team     = t.get('team_name', '')
+                _ic = "🏆" if result == "우승" else "🥈"
+                line = f"  {_ic} {yr}년  {comp}  →  {result}  ({team})"
+                ch = dschist.get((yr, team))
+                if ch and ch.get("caps", 0) > 0:
+                    line += (f"  | {ch['caps']}경기 {ch.get('goals',0)}골 "
+                             f"{ch.get('assists',0)}어시, 평점 {ch.get('rating', 0)}")
+                lines.append(line)
+        else:
+            lines.append("  없음")
+        lines.append("")
+
         # 개인 영예 (득점왕/베스트11/발롱도르 등)
         lines.append(f"▶ 개인 영예  ({len(awards)}건)")
         if awards:
@@ -1984,6 +2019,18 @@ class RetireWindow(QDialog):
                 lines.append(f"  • {sm['date']}  "
                              f"{sm['comp']} {sm['stage']}  ({sm['team']}) vs {sm['opp']}  ─  "
                              f"{_match_line_str(sm)}  ({sm['score']} {format_result_with_absence(sm)})")
+        else:
+            lines.append("  없음")
+        lines.append("")
+
+        # 국내 슈퍼컵 기록 (2026-09 신설)
+        dsc_ms2 = _cm2["dsc_ms"]
+        lines.append(f"▶ 국내 슈퍼컵 기록  ({len(dsc_ms2)}경기)  ※ 클럽 대항전 (A매치 아님)")
+        if dsc_ms2:
+            for dm in dsc_ms2:
+                lines.append(f"  • {dm['date']}  "
+                             f"{dm['comp']} {dm['stage']}  ({dm['team']}) vs {dm['opp']}  ─  "
+                             f"{_match_line_str(dm)}  ({dm['score']} {format_result_with_absence(dm)})")
         else:
             lines.append("  없음")
         lines.append("")

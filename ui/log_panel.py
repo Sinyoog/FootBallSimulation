@@ -65,6 +65,12 @@ _COMP_COLORS = {
     "lower_cup":  "#00A6A6",  # 3부·4부 국내컵 (청록, 신설)
     "intl":       "#e91e63",  # 국가대표 A매치 (신설)
     "po":         "#78909c",  # 승강 플레이오프 (신설)
+    # [2026-09 신설, 신민용 리포트: "국내 슈퍼컵도 로그에 뜨나?"] 클릭
+    # 자체는 match_id만 있으면 kind와 무관하게 항상 되지만(아래 120번째
+    # 줄 .get() 폴백), 상자 색은 이 표에 없으면 기본 회색(_DEFAULT_BOX_
+    # COLOR)으로 떨어진다 — world_browser_window.py의 BROWN(#8B5A2B)과
+    # 맞춰서 여기도 등록해둔다.
+    "domestic_sc": "#8B5A2B",
 }
 _DEFAULT_BOX_COLOR = "#3d7a99"  # kind 정보 없는 구버전 로그용 폴백(예전 고정색)
 

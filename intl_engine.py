@@ -99,6 +99,22 @@ def _tournament_start_years():
 
 
 
+# [2026-09 신설, 신민용 지적: "국제대회도 리그/챔스처럼 전부 선수 OVR
+# 기반이어야 한다"] _get_real_squad_ovr는 이제 예선~지역컵까지 포함해
+# 대회 생성 시점마다(대륙당 최대 수십~200개국) 매번 불린다 — game_engine.
+# _team_ovr_cache(클럽 팀 평균 OVR 세션 캐시)와 동일한 원칙으로 국가별
+# 결과를 메모이즈한다. ai_players.ovr/소속은 세션 내내(시즌 중) 안 바뀌고
+# 시즌전환·리맵 시점에만 바뀌므로(_team_ovr_cache 상단 주석과 동일 근거),
+# game_engine._invalidate_team_ovr_cache()가 그 타이밍에 이 캐시도 함께
+# 비운다(_invalidate_real_squad_ovr_cache 참고).
+_real_squad_ovr_cache: dict = {}
+
+
+def _invalidate_real_squad_ovr_cache():
+    """game_engine._invalidate_team_ovr_cache()가 시즌전환/리맵 시점에 호출."""
+    _real_squad_ovr_cache.clear()
+
+
 def _get_real_squad_ovr(country):
     """[2026-07 신설, 신민용 확정: "국적 배정했으니 스쿼드도 실제 선수로
     뽑아야"] database.get_country_avg_squad_ovr()의 3단계 폴백(국적태그→
@@ -109,9 +125,19 @@ def _get_real_squad_ovr(country):
     넘어선다"] 원래는 get_country_squad_players(포지션당 1등 픽)를 썼는데,
     단일 이상치(707명 중 우연히 EPL 소속인 1명 때문에 평균이 88.6까지
     치솟은 실측 사례)에 취약했다 — get_country_avg_squad_ovr(포지션당
-    상위 3명 평균)로 교체해서 안정성을 높였다."""
+    상위 3명 평균)로 교체해서 안정성을 높였다.
+
+    [2026-09 캐시 추가] 위 주석 참고 — country당 세션 1회만 실제 쿼리하고
+    이후엔 캐시를 반환한다(min_count=8 고정 호출만 캐시 대상 — 이 함수의
+    유일한 호출 형태)."""
+    if not country:
+        return None
+    if country in _real_squad_ovr_cache:
+        return _real_squad_ovr_cache[country]
     from database import get_country_avg_squad_ovr
-    return get_country_avg_squad_ovr(country, min_count=8)
+    val = get_country_avg_squad_ovr(country, min_count=8)
+    _real_squad_ovr_cache[country] = val
+    return val
 
 
 _grade_rank_cache = {}   # {grade: [(country_name, fifa_rank), ...] 오름차순} — 등급별 1회만 조회
@@ -213,7 +239,7 @@ def _get_generation_coef(name, year):
     return coef
 
 
-def _nat_team_ovr(grade, name="", continent="", fast=False, year=None):
+def _nat_team_ovr(grade, name="", continent="", year=None):
     """[2026-07 전면 재설계, 신민용+GPT 검토: "OVR가 100에 몰린다/등급이
     역전된다"] 예전 방식(등급 base + 대륙보정 + 국가별 조정치 + 노이즈를
     따로따로 더하고 빼는 방식)은 최종 합산값이 어디 떨어지는지 검증할
@@ -222,7 +248,8 @@ def _nat_team_ovr(grade, name="", continent="", fast=False, year=None):
     나왔다. 이제 나라마다 (하한, 중간값, 상한) 밴드를 직접 지정하고
     (get_nat_ovr_band), random.triangular(하, 상, 중)으로 뽑는다 — 값
     자체가 이미 1~100 안에서 확정되므로 클램프에 쏠리는 문제가 구조적
-    으로 없다.
+    으로 없다. 이 공식값은 실제 스쿼드 데이터가 없는 나라(아래 참고)에
+    대한 폴백 전용이다.
 
     [세대 계수] 밴드 안에서 매년 완전 독립적으로 뽑으면 "올해 하한,
     내년 바로 상한" 롤러코스터가 나오므로, 8~12년 주기로 서서히 움직이는
@@ -236,32 +263,24 @@ def _nat_team_ovr(grade, name="", continent="", fast=False, year=None):
     아래 밴드 기반 공식값을 섞었는데, 그러면 실제 선수 개개인 OVR이 아무리
     높아도 그 30%만큼 낮게 나올 수 있었다 — get_nat_ovr_band 정의부 아래
     수정 사유 주석 참고). 스쿼드가 min_count(8명/포지션) 미만이라 실제
-    평균 자체를 못 구하는 나라만 아래 공식값을 그대로 쓴다. fast=True면
-    이 실제 평균 조회 자체를 건너뛰고 무조건 공식값만 쓴다(월드컵 예선처럼
-    200여 개국을 한 번에 순회하는 대량 호출 지점 전용 — 나라마다 실제
-    스쿼드 조회까지 다 태우면 체감될 만큼 느려진다)."""
-    lo, mid, hi = get_nat_ovr_band(name, grade)
-    gen_coef = _get_generation_coef(name, year) if (name and year) else 1.0
-    formula_val = min(100.0, max(1.0, random.triangular(lo, hi, mid) * gen_coef))
-    if fast:
-        return formula_val
+    평균 자체를 못 구하는 나라만 아래 공식값을 그대로 쓴다.
+
+    [2026-09 fast 파라미터 폐지, 신민용 리포트: "월드컵 같은 국가대항전은
+    선수 OVR 올려도 의미가 없다" → 원인규명: 예선(_create_qual_tournament)/
+    지역컵(_qualify_region)/유럽 외 대륙컵(_qualify_continental 폴백)이
+    전부 fast=True로 이 실제 스쿼드 조회 자체를 건너뛰고 있었다 — 그
+    결과 어느 나라가 본선에 가는지, 그리고(유럽 외 대륙컵·지역컵은) 본선
+    경기 결과 자체까지 실제 선수 OVR과 완전히 무관했다(리그/챔스는 이미
+    실제 스쿼드 기반이라 이 문제가 없었음). fast 자체를 없애고 항상 실제
+    평균을 먼저 시도하도록 통일한다 — 성능 부담(원래 fast=True를 도입한
+    이유)은 _get_real_squad_ovr에 추가한 세션 캐시(_real_squad_ovr_cache,
+    game_engine._team_ovr_cache와 동일 원칙)로 해소한다."""
     real_val = _get_real_squad_ovr(name) if name else None
-    # [2026-09 수정, 신민용 리포트: "선수 개개인 OVR이 높아도 국가대표
-    # 전체 OVR은 낮게 뜬다 — 그 평균치가 실제로 맞아야 하는 것 아니냐"]
-    # 예전엔 여기서 real_val 70% + formula_val(밴드 기반, 실제 선수 없이
-    # FIFA랭크만으로 뽑는 절차적 값) 30%를 블렌딩했다 — 위 주석(2026-07,
-    # "프랑스가 88 정도로 뜬다")이 이미 같은 증상을 한 번 지적했었고, 그때
-    # fast=True(포뮬러만)를 fast=False(블렌딩)로만 바꿨는데도 여전히
-    # formula_val 몫(30%)만큼 실제 스쿼드 평균보다 낮게 나올 수 있었다
-    # (실측 예시로 재현: 실제 베스트11 평균 97.5여도 블렌딩 결과 89 정도).
-    # 이제 실제 스쿼드 데이터를 구할 수 있으면(포지션별 8명 이상) 그
-    # 평균을 그대로 쓴다 — "에이스 한 명이 95여도 나머지가 68~80대면
-    # 평균은 78 정도가 맞다"는 사용자 설계 의도와 일치. 스쿼드가 너무
-    # 얇아 real_val 자체가 없는 나라(min_count=8 미달)만 기존처럼
-    # formula_val(밴드 기반)로 대체한다.
     if real_val is not None:
         return round(min(100.0, max(1.0, real_val)), 2)
-    return formula_val
+    lo, mid, hi = get_nat_ovr_band(name, grade)
+    gen_coef = _get_generation_coef(name, year) if (name and year) else 1.0
+    return min(100.0, max(1.0, random.triangular(lo, hi, mid) * gen_coef))
 
 STAGE_KO = {"group": "조별리그", "R32": "32강", "R16": "16강", "QF": "8강", "SF": "4강", "F": "결승", "TP": "3/4위전",
             "qual_group": "조별리그", "qual_group2": "조별리그2", "qual_po": "플레이오프"}
@@ -1480,7 +1499,7 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
     group_sizes = None  # [2026-08 신설] region 모드에서만 씀(들쭉날쭉한 조 인원)
     if is_wc:
         kind, name = "world", "월드컵"
-        entries = _qualify_world(year)
+        entries = _qualify_world(year, p=p, my_nats=my_nats, nat_info=nat_info)
         n_groups = WC_GROUPS_BY_TIER[wc_tier(year)]
         # 월드컵은 대륙 무관 → 내 국적 전부가 후보 대상
         cont_nats = [n for n in my_nats if n]
@@ -1488,7 +1507,7 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
         from constants import REGION_CUP_NAME, COUNTRY_REGION, regional_cup_format
         kind = "region"
         name = REGION_CUP_NAME.get(my_region, f"{my_region} 지역컵")
-        entries = _qualify_region(my_region)
+        entries = _qualify_region(my_region, p=p, my_nats=my_nats, nat_info=nat_info)
         _fmt = regional_cup_format(len(entries))
         n_groups = _fmt["n_groups"]
         group_sizes = _fmt["group_sizes"]
@@ -1497,7 +1516,7 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
     else:
         kind = "continent"
         name = name_override or CONF_CUP_NAME.get(my_continent, "대륙컵")
-        entries = _qualify_continental(my_continent)
+        entries = _qualify_continental(my_continent, p=p, my_nats=my_nats, nat_info=nat_info)
         n_groups = CONT_GROUPS
         # 이 대륙컵 후보 = 그 대륙(연맹) 소속 보유 국적만
         confs = set(CONFEDERATIONS.get(my_continent, [my_continent]))
@@ -2392,14 +2411,26 @@ def _check_selection(p, my_grade, country="", continent=""):
         return False
 
 
-def _qualify_world(year=0):
+def _qualify_world(year=0, p=None, my_nats=None, nat_info=None):
     """5개 대륙 연맹(2026-09부터 남미/북미 분리)의 예선 결과(qual_results)를
     조합해 본선 진출국 확정.
 
     - 예선 결과가 있는 연맹: qual_results에서 읽어 그대로 사용
     - 예선 결과가 없는 연맹(이전 세이브 호환 등): 등급 기반 랜덤 선발
     - 쿼터 합산이 본선 팀 수(32 or 48)와 맞지 않으면 부족분을 랜덤으로 보충
-    """
+
+    [2026-09 정리, 신민용 리포트 조사 중 발견] 예전엔 여기서 전세계
+    countries(약 200개국) 전체에 대해 _nat_team_ovr(fast=True)로 OVR/qual
+    점수를 미리 계산해뒀었다 — "예선 결과 없는 연맹은 이 값으로 랜덤
+    보충"하던 구식 폴백용이었는데, 그 폴백 자체가 "예선 결과 누락은
+    오류(RuntimeError)"로 바뀐 뒤에도 이 계산 루프만 남아 매번 전세계를
+    돌면서 결과를 그냥 버리고 있었다(아래 어디서도 all_countries를 다시
+    안 씀) — 완전한 데드 코드라 제거.
+
+    [2026-09 수정] p/my_nats/nat_info를 받아 _apply_my_ovr_to_qual_rows를
+    적용한다 — _save_qual_results가 qual_results를 최종 확정할 때(fast=False
+    accurate 재계산)는 예선 단계의 "내 OVR 반영분"이 다시 빠지므로, 본선
+    진출국 목록(entries의 기준값)을 만드는 여기서 한 번 더 걸어준다."""
     _tier = wc_tier(year)
     quota_map = WC_QUOTA_BY_TIER[_tier]
     n_teams   = WC_TEAMS_BY_TIER[_tier]
@@ -2409,18 +2440,8 @@ def _qualify_world(year=0):
     qual_rows = [dict(r) for r in conn.execute(
         "SELECT country, flag, grade, ovr, continent FROM qual_results WHERE target_year=? AND kind='world'",
         (year,)).fetchall()]
-    all_countries = [dict(r) for r in conn.execute(
-        "SELECT name, flag, continent, grade FROM countries").fetchall()]
     conn.close()
 
-    # 오세아니아 → 아시아 정규화(남미/북미는 2026-09부터 각자 독립 연맹)
-    import time
-    _t0 = time.perf_counter()
-    for r in all_countries:
-        r["conf"] = _conf_key(r["continent"])
-        r["ovr"]  = _nat_team_ovr(r["grade"], r["name"], r["continent"], fast=True, year=year)
-        r["qual"] = GRADE_QUAL_BASE.get(r["grade"], 0.2) + random.uniform(-QUAL_NOISE, QUAL_NOISE)
-    print(f"[PERF] 월드컵 예선 전세계 {len(all_countries)}개국 OVR계산 {time.perf_counter()-_t0:.2f}s")
     # [버그 수정 — 근본 원인] qual_results에 같은 나라가 중복으로 들어있으면
     # (과거 _save_qual_results의 중복 저장 버그, 지금은 수정됨) 아래
     # "[:quota]" 자르기에서 중복 항목이 자리를 차지해 실제로 예선을
@@ -2482,12 +2503,25 @@ def _qualify_world(year=0):
             add_log(msg, "event")
             raise RuntimeError(msg)
 
+    if p is not None:
+        _apply_my_ovr_to_qual_rows(picked, p, my_nats or [], nat_info or {})
     return picked[:n_teams]
 
 
-def _qualify_continental(my_continent):
+def _qualify_continental(my_continent, p=None, my_nats=None, nat_info=None):
     """내 대륙 연맹의 대륙컵 24개국 선발 (남북미 통합, 오세아니아→아시아).
-    작년 예선 결과(qual_results)가 있으면 우선 사용, 없으면 랜덤 계산."""
+    작년 예선 결과(qual_results)가 있으면 우선 사용, 없으면 랜덤 계산.
+
+    [2026-09 수정, 신민용 리포트: "월드컵 같은 국가대항전은 선수 OVR
+    올려도 의미가 없다"] 폴백 경로(유럽 외 대륙컵 — 아시안컵/코파아메리카/
+    AFCON)는 fast=True라 실제 스쿼드를 전혀 안 보고 있었다 — 제거(아래
+    _nat_team_ovr가 이제 항상 실제 스쿼드를 먼저 시도). p/my_nats/nat_info를
+    받아 _apply_my_ovr_to_qual_rows도 적용 — wc_qual/cont_qual(유럽)
+    예선과 동일하게, 내가 그 나라 대표팀에 낄 실력이면 그 나라 OVR에도
+    반영되게 한다(기존엔 이 갈래에서 전혀 반영 안 됐음). 예선 결과 사용
+    경로(qual_rows 있음, 유럽)도 동일하게 적용 — _save_qual_results가
+    qual_results를 최종 확정할 때는 내 OVR 반영분이 다시 빠지므로, 본선
+    진출국 목록을 쓰는 여기서 한 번 더 걸어준다."""
     from game_engine import get_state
     st = get_state() or {}
     year = st.get("current_year", 0)
@@ -2511,6 +2545,8 @@ def _qualify_continental(my_continent):
             seen.add(q["country"])
             result.append({"name": q["country"], "flag": q["flag"], "grade": q["grade"],
                             "ovr": q["ovr"]})
+        if p is not None:
+            _apply_my_ovr_to_qual_rows(result, p, my_nats or [], nat_info or {})
         return result[:CONT_TEAMS]
 
     # 폴백: 기존 랜덤 방식
@@ -2522,13 +2558,14 @@ def _qualify_continental(my_continent):
     conn.close()
     for r in rows:
         r["qual"] = GRADE_QUAL_BASE.get(r["grade"], 0.2) + random.uniform(-QUAL_NOISE, QUAL_NOISE)
-        r["ovr"] = _nat_team_ovr(r["grade"], r["name"], r["continent"], fast=True, year=year)
-    print(f"[PERF] 대륙컵 예선 폴백 {len(rows)}개국 OVR계산 완료")
+        r["ovr"] = _nat_team_ovr(r["grade"], r["name"], r["continent"], year=year)
+    if p is not None:
+        _apply_my_ovr_to_qual_rows(rows, p, my_nats or [], nat_info or {})
     rows.sort(key=lambda r: r["qual"], reverse=True)
     return rows[:CONT_TEAMS]
 
 
-def _qualify_region(my_region):
+def _qualify_region(my_region, p=None, my_nats=None, nat_info=None):
     """[2026-08 재설계 v2] 지역컵 참가국 = 그 지역 소속 국가 풀에서 목표
     본선 규모(REGION_TARGET_SIZE)만큼, 그 해 국가 OVR 상위 순으로 뽑는다.
     풀이 목표보다 크면(예: WAFF 12개국 풀 → 12개국 목표는 그대로, CECAFA
@@ -2541,7 +2578,15 @@ def _qualify_region(my_region):
     그 통과국을 여기서 읽어왔지만, 그 예선은 진출국이 예선 참가국과
     항상 똑같아서(전원 통과) 의미가 없다는 것이 확인돼 폐지됐다 —
     이제 북미도 다른 모든 지역컵과 완전히 동일하게 이 함수의 OVR
-    상위컷 하나로만 결정된다(start_qualifying_if_needed 주석 참고)."""
+    상위컷 하나로만 결정된다(start_qualifying_if_needed 주석 참고).
+
+    [2026-09 수정, 신민용 리포트: "월드컵 같은 국가대항전은 선수 OVR
+    올려도 의미가 없다"] fast=True 제거(_nat_team_ovr가 이제 항상 실제
+    스쿼드를 먼저 시도) + _apply_my_ovr_to_qual_rows 적용 — 이 대회들은
+    wc_qual/cont_qual 같은 별도 예선 단계가 아예 없어서, 기존엔 내가
+    그 나라 대표팀에 뽑힐 실력이어도 이 함수가 반환하는 OVR엔 전혀
+    반영이 안 됐다(모든 참가국 컷·조 편성·경기 결과가 전부 이 OVR
+    기준)."""
     from game_engine import get_state
     from constants import COUNTRY_REGION, REGION_TARGET_SIZE
     st = get_state() or {}
@@ -2555,7 +2600,9 @@ def _qualify_region(my_region):
         names).fetchall()]
     conn.close()
     for r in rows:
-        r["ovr"] = _nat_team_ovr(r["grade"], r["name"], r["continent"], fast=True, year=year)
+        r["ovr"] = _nat_team_ovr(r["grade"], r["name"], r["continent"], year=year)
+    if p is not None:
+        _apply_my_ovr_to_qual_rows(rows, p, my_nats or [], nat_info or {})
     target = REGION_TARGET_SIZE.get(my_region, len(rows))
     if len(rows) > target:
         rows.sort(key=lambda r: r["ovr"], reverse=True)
@@ -2593,7 +2640,7 @@ def _enrich_countries(rows, year=None):
     import time
     _t0 = time.perf_counter()
     for r in rows:
-        r["ovr"]  = _nat_team_ovr(r["grade"], r.get("name", ""), r.get("continent", ""), fast=True, year=year)
+        r["ovr"]  = _nat_team_ovr(r["grade"], r.get("name", ""), r.get("continent", ""), year=year)
         r["qual"] = GRADE_QUAL_BASE.get(r["grade"], 0.2) + random.uniform(-QUAL_NOISE, QUAL_NOISE)
     if len(rows) >= 20:   # 소규모 호출까지 매번 찍으면 로그 스팸이라 큰 호출만
         print(f"[PERF] _enrich_countries {len(rows)}개국 OVR계산 {time.perf_counter()-_t0:.2f}s")
@@ -3441,8 +3488,8 @@ def _entry(tid, country):
     return val
 
 
-def _match_outcome(h_ovr, a_ovr, knockout):
-    """중립 구장 가정. 'home'/'draw'/'away' 반환 (KO는 무승부 → 승부차기).
+def _match_outcome(h_ovr, a_ovr, knockout, neutral=False):
+    """'home'/'draw'/'away' 반환 (KO는 무승부 → 승부차기).
     [수정] 무승부 확률을 전력차에 반비례하도록 개선 (기존 dw=0.22 고정 →
     전력차 무관하게 항상 22% 무승부였음. 국내리그 _match_win_probs와 같은 취지).
 
@@ -3451,11 +3498,25 @@ def _match_outcome(h_ovr, a_ovr, knockout):
     너무 잦았다] game_engine._match_win_probs와 동일한 취지로 diff 반영폭을
     올렸다 — diff=0(균형)은 기존과 동일하게 유지, 격차가 클수록(diff 20~
     이상) 훨씬 더 확실하게 강팀 쪽으로 쏠리도록 기울기만 가파르게 했다.
-    """
+
+    [2026-09 확장, 신민용 확정: "아시안컵/월드컵/동아시안컵/유로/코파 등
+    국가끼리 붙는 국제대회는 홈 어드벤티지 없이 둘 다 원정"] 이 함수는
+    docstring과 달리 diff=0이어도 홈 46%/원정 30%로 비대칭이었다(클럽
+    대항전 결승 작업 때 이미 확인된 것과 같은 특성) — neutral=True면
+    diff=0에서 정확히 hw==aw인 진짜 대칭 공식을 쓴다. 호출부는 그 대회의
+    kind가 예선(wc_qual/cont_qual)이 아닐 때만 이 플래그를 켠다 — 월드컵
+    예선처럼 실제 각국 홈/원정 2연전으로 치르는 대회는 그대로 편향을
+    유지한다(이번 요청 범위 밖)."""
     diff = h_ovr - a_ovr
-    hw = max(0.04, min(0.95, 0.46 + diff * 0.022))
-    dw = max(0.05, 0.24 - abs(diff) * 0.009)
-    aw = max(0.02, 1.0 - hw - dw)
+    if neutral:
+        dw = max(0.05, 0.24 - abs(diff) * 0.009)
+        half = max(0.0, 1.0 - dw) / 2.0
+        hw = max(0.04, min(0.95, half + diff * 0.022))
+        aw = max(0.02, min(0.95, half - diff * 0.022))
+    else:
+        hw = max(0.04, min(0.95, 0.46 + diff * 0.022))
+        dw = max(0.05, 0.24 - abs(diff) * 0.009)
+        aw = max(0.02, 1.0 - hw - dw)
     tot = hw + dw + aw
     hw, dw, aw = hw / tot, dw / tot, aw / tot
     roll = random.random()
@@ -3467,12 +3528,19 @@ def _match_outcome(h_ovr, a_ovr, knockout):
 
 
 def _gen_intl_score(outcome, diff=0.0):
+    """[2026-09 수정, 신민용 요청: "오스트레일리아 31-0 아메리칸사모아,
+    대한민국 16-0 네팔 같은 A매치 역사적 대승이 재현 가능해야 한다"]
+    allow_extreme=True로 넘겨 game_engine._gen_score의 극초압도 구간
+    (adv>=80, 정의부 주석 참고)을 국가대표 경기에 한해 열어준다."""
     from game_engine import _gen_score
-    return _gen_score(outcome, diff)
+    return _gen_score(outcome, diff, allow_extreme=True)
 
 
-def _resolve_pso(h_ovr, a_ovr):
-    """승부차기: 전력이 살짝 유리하게."""
+def _resolve_pso(h_ovr, a_ovr, neutral=False):
+    """승부차기: 전력이 살짝 유리하게.
+    [2026-09 확장] PSO 자체는 애초에 홈/원정 구분 없는 순수 OVR차 공식이라
+    neutral 유무로 결과가 달라지진 않는다 — 시그니처만 _match_outcome과
+    맞춰 호출부를 단순하게 둔다."""
     p_home = 0.5 + max(-0.1, min(0.1, (h_ovr - a_ovr) * 0.006))
     winner_home = random.random() < p_home
     score = random.choice(["5-4", "4-3", "4-2", "3-2", "5-3"])
@@ -3820,11 +3888,14 @@ def _sim_ai_match(t, m, my_played=False, conn=None, reason="injury", batch=None)
     he = _entry(t["id"], m["home"])
     ae = _entry(t["id"], m["away"])
     knockout = m["stage"] not in ("group", "qual_group", "qual_group2")  # [2026-09] 2단계 예선 2차도 무승부 허용
+    # [2026-09 신설, 신민용 확정] 예선(wc_qual/cont_qual)이 아닌 대회(월드컵
+    # 본선/대륙컵/지역컵)는 홈 어드벤티지 없이 원정 vs 원정.
+    _neutral = t.get("kind") not in ("wc_qual", "cont_qual")
 
-    outcome = _match_outcome(he["ovr"], ae["ovr"], knockout)
+    outcome = _match_outcome(he["ovr"], ae["ovr"], knockout, neutral=_neutral)
     pso_winner, pso_score = "", ""
     if knockout and outcome == "draw":
-        win_home, pso_score = _resolve_pso(he["ovr"], ae["ovr"])
+        win_home, pso_score = _resolve_pso(he["ovr"], ae["ovr"], neutral=_neutral)
         pso_winner = m["home"] if win_home else m["away"]
     # [버그수정 2026-07] diff 누락 — 예전엔 항상 diff=0(박빙 취급)이라 강팀이
     # 약팀을 만나도 승패(outcome)만 전력차를 반영하고 스코어차는 전력차와
@@ -4094,12 +4165,12 @@ def simulate_my_match(week, p, day=None):
                           "away": sim.get("away_player_ratings") or []}
         outcome = "draw" if hs == as_ else ("home" if hs > as_ else "away")
     except Exception:
-        outcome = _match_outcome(h_ovr, a_ovr, knockout)
-        hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
+        outcome = _match_outcome(h_ovr, a_ovr, knockout, neutral=(not _is_qual))
+        hs, as_ = _gen_score(outcome, h_ovr - a_ovr, allow_extreme=True)
 
     pso_winner, pso_score = "", ""
     if knockout and outcome == "draw":
-        win_home, pso_score = _resolve_pso(h_ovr, a_ovr)
+        win_home, pso_score = _resolve_pso(h_ovr, a_ovr, neutral=(not _is_qual))
         pso_winner = m["home"] if win_home else m["away"]
 
     if _suspended or _benched:
@@ -4878,19 +4949,13 @@ def _save_qual_results(t, continent, qualified_list, set_done=True):
     # set_done=False(직행팀 중간 저장): _finalize_qual_po가 나중에
     #   직행팀+PO승자를 합쳐 set_done=True로 한 번에 덮어씀.
     for q in qualified_list:
-        # [2026-07 버그수정, 신민용 리포트: "국제대회 OVR가 너무 낮다 —
-        # 프랑스가 88 정도로 뜬다"] 예선 단계(_qualify_world/_enrich_countries
-        # 등)는 전세계 200여 개국을 한 번에 훑어야 해서 fast=True(공식값만,
-        # 실제 스쿼드 미반영)로 OVR을 계산했다 — 그 값이 그대로 여기
-        # qual_results에 저장돼 이후 조 추첨·순위표 등 화면에 계속
-        # 노출됐다. 문제는 fast=True 공식값의 난수 폭(삼각분포 -10~+4)이
-        # 꽤 넓어서, 프랑스처럼 실제 태그된 선수가 최정상급(직접 계산
-        # 결과 베스트11 평균 97.5)이어도 운 나쁘면 88 같은 값이 그대로
-        # 굳어버릴 수 있었다. 여기서는 예선 통과국(최종 32~48개국 정도로
-        # 이미 추려진 소규모 목록)에 한해 fast=False로 다시 계산해서
-        # 실제 스쿼드 반영값(70%)+공식값(30%) 블렌딩을 정확히 적용한다 —
-        # 대상이 작아서 성능 문제도 없다.
-        _accurate_ovr = _nat_team_ovr(q.get("grade", "F"), q["country"], continent, fast=False, year=target_year)
+        # [2026-07 신설, 이후 2026-09 갱신] 예선 통과국(최종 32~48개국
+        # 정도의 소규모 목록) 확정 시점에 실제 스쿼드 기준 OVR을 다시
+        # 계산해 qual_results에 저장한다 — _nat_team_ovr가 이제 항상
+        # 실제 스쿼드를 먼저 시도하므로(캐시 적용) 이 재계산은 사실상
+        # 그룹 편성 시점 값과 같아야 정상이지만, 그 사이 스쿼드가 조금이라도
+        # 바뀌었을 가능성에 대비해 그대로 유지한다.
+        _accurate_ovr = _nat_team_ovr(q.get("grade", "F"), q["country"], continent, year=target_year)
         # DELETE로 이미 저장돼 있으면(재호출로 인한 중복 삽입
         # 방지) 먼저 지운 뒤 다시 넣는다 — set_done=False라 위에서 전체
         # DELETE를 안 했어도 국가 단위로는 항상 유일하게 유지된다.

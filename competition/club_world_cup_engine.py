@@ -259,9 +259,10 @@ def _sim_one(conn, m):
     a_ovr = conn.execute("SELECT ovr FROM cwc_entries WHERE tournament_id=? AND team_id=?",
                           (m["tournament_id"], m["away_team_id"])).fetchone()["ovr"]
     from game_engine import _gen_score
-    outcome = _match_outcome(h_ovr, a_ovr)
+    _neutral = m["stage"] in ("F", "TP")
+    outcome = _match_outcome(h_ovr, a_ovr, neutral=_neutral)
     if outcome == "draw" and m["stage"] != "group":
-        winner_home, pso = _resolve_pso(h_ovr, a_ovr)
+        winner_home, pso = _resolve_pso(h_ovr, a_ovr, neutral=_neutral)
         hs, as_ = (1, 1)   # 스코어는 동점으로 표기, 승자는 pso_winner로 별도 기록
         conn.execute(
             """UPDATE cwc_matches SET home_score=?, away_score=?,
@@ -1193,7 +1194,13 @@ def simulate_my_cwc_match(week, p, day=None):
 
     # [2026-08 신설, 신민용 요청: "챔피언스리그처럼 다른 국가 팀이랑 하면
     # 라인업 평점이 안 뜬다"] champions_engine.simulate_my_cl_match와 완전히
-    # 동일한 패턴. 중립 구장 가정이라 home_adv=0.0.
+    # 동일한 패턴.
+    # [2026-09 버그수정, 신민용 리포트: "그럼 플레이어가 뛰는 16강은 이제
+    # 홈 어드벤티지가 생겼다는거지?"] champions_engine과 동일한 이유로,
+    # F/TP가 아닌 라운드(조별리그~4강)는 리그와 같은 _home_advantage()를
+    # 쓰게 고친다(예전엔 스테이지 상관없이 항상 0.0이었음).
+    from game_engine import _home_advantage
+    _neutral_stage = m["stage"] in ("F", "TP")
     my_position = p.get("position", "")
     engine_stats = None
     engine_plog = None
@@ -1212,7 +1219,7 @@ def simulate_my_cwc_match(week, p, day=None):
             away_boost=(bonus if not is_home else 0.0),
             home_boost_position=(my_position if is_home else None),
             away_boost_position=(my_position if not is_home else None),
-            home_adv=0.0)
+            home_adv=(0.0 if _neutral_stage else _home_advantage()))
         hs, as_ = sim["home_score"], sim["away_score"]
         engine_stats = {"home": sim["home_stats"], "away": sim["away_stats"]}
         engine_plog = sim["possession_log"]
@@ -1220,13 +1227,13 @@ def simulate_my_cwc_match(week, p, day=None):
                           "away": sim.get("away_player_ratings") or []}
         outcome = "draw" if hs == as_ else ("home" if hs > as_ else "away")
     except Exception:
-        outcome = _match_outcome(h_ovr, a_ovr)
+        outcome = _match_outcome(h_ovr, a_ovr, neutral=_neutral_stage)
         hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
 
     pso_winner, pso_score = 0, ""
     is_ko = (m["stage"] != "group")
     if outcome == "draw" and is_ko:
-        win_home, pso_score = _resolve_pso(h_ovr, a_ovr)
+        win_home, pso_score = _resolve_pso(h_ovr, a_ovr, neutral=_neutral_stage)
         pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
 
     if _suspended or _benched:

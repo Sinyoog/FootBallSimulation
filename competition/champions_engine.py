@@ -367,6 +367,11 @@ CHAMPIONS_CFG = CompetitionConfig(
     league_weeks=CL_LEAGUE_WEEKS,
     end_week=CL_END_WEEK,
     stage_order=_STAGE_ORDER,
+    # [2026-09 신설, 신민용 확정: "챔스/유로파/컨퍼런스/클럽월드컵은 결승과
+    # 3/4위전을 홈 어드밴티지 없이 원정 vs 원정으로"] EUROPA_CFG/
+    # CONFERENCE_CFG도 이 값을 그대로 물려받는다(둘 다 STAGE_KO/
+    # _STAGE_ORDER처럼 이 모듈 값을 재사용).
+    neutral_stages=("F", "TP"),
 )
 
 # 결과별 보상 (명성, 인기, 행복도) - 클럽 대회는 국가대표보다 약간 낮게
@@ -864,18 +869,18 @@ def _entry(tid, team_id):
     return entry(CHAMPIONS_CFG, tid, team_id)
 
 
-def _match_outcome(h_ovr, a_ovr):
+def _match_outcome(h_ovr, a_ovr, neutral=False):
     """[2026-08 리팩터링] competition_common.match_outcome으로 이동
     (완전 동일 로직) — 위임만."""
     from competition.competition_common import match_outcome
-    return match_outcome(h_ovr, a_ovr)
+    return match_outcome(h_ovr, a_ovr, neutral=neutral)
 
 
-def _resolve_pso(h_ovr, a_ovr):
+def _resolve_pso(h_ovr, a_ovr, neutral=False):
     """[2026-08 리팩터링] competition_common.resolve_pso로 이동
     (완전 동일 로직) — 위임만."""
     from competition.competition_common import resolve_pso
-    return resolve_pso(h_ovr, a_ovr)
+    return resolve_pso(h_ovr, a_ovr, neutral=neutral)
 
 
 def _sim_ai_match(t, m, my_played=False, conn=None, reason="injury", batch=None):
@@ -985,9 +990,16 @@ def simulate_my_cl_match(week, p, day=None):
     # tactical_engine)으로 정교하게 돌리고, 실패하면 예전 방식(팀 OVR
     # 차이 확률표)으로 조용히 폴백한다. 챔스 상대는 실제 다른 나라
     # ai_players 로스터라(entry()가 진짜 teams 행에서 뽑음) 리그와 완전히
-    # 같은 방식으로 로스터/포메이션을 가져올 수 있다. 챔스는 "중립 구장
-    # 가정"(위 competition_common.match_outcome 주석 참고)이라 리그와
-    # 달리 home_adv=0.0으로 넘긴다.
+    # 같은 방식으로 로스터/포메이션을 가져올 수 있다.
+    # [2026-09 버그수정, 신민용 리포트: "그럼 플레이어가 뛰는 16강은 이제
+    # 홈 어드벤티지가 생겼다는거지?"] 예전엔 스테이지 상관없이 항상
+    # home_adv=0.0이었다 — "결승/3·4위전만 중립"이라는 이번 설계와 달리
+    # 16강 등 초반 라운드까지 내가 직접 뛰는 경기는 전부 홈 어드벤티지가
+    # 없던 상태였다(AI끼리는 원래도 라운드별로 정상 적용됐음). neutral_
+    # stages(F/TP)에 없는 라운드는 리그와 동일하게 _home_advantage()
+    # (1.5~4.5 랜덤)를 쓰게 고친다.
+    from game_engine import _home_advantage
+    _neutral_stage = m["stage"] in CHAMPIONS_CFG.neutral_stages
     my_position = p.get("position", "")
     engine_stats = None
     engine_plog = None
@@ -1006,7 +1018,7 @@ def simulate_my_cl_match(week, p, day=None):
             away_boost=(bonus if not is_home else 0.0),
             home_boost_position=(my_position if is_home else None),
             away_boost_position=(my_position if not is_home else None),
-            home_adv=0.0)
+            home_adv=(0.0 if _neutral_stage else _home_advantage()))
         hs, as_ = sim["home_score"], sim["away_score"]
         engine_stats = {"home": sim["home_stats"], "away": sim["away_stats"]}
         engine_plog = sim["possession_log"]
@@ -1014,13 +1026,13 @@ def simulate_my_cl_match(week, p, day=None):
                           "away": sim.get("away_player_ratings") or []}
         outcome = "draw" if hs == as_ else ("home" if hs > as_ else "away")
     except Exception:
-        outcome = _match_outcome(h_ovr, a_ovr)
+        outcome = _match_outcome(h_ovr, a_ovr, neutral=_neutral_stage)
         hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
 
     pso_winner, pso_score = 0, ""
     is_ko = (m["stage"] != "league")  # [2026-07 버그 수정] 조별리그->리그 스테이지 개편 후 남아있던 옛 스테이지명 비교
     if outcome == "draw" and is_ko:
-        win_home, pso_score = _resolve_pso(h_ovr, a_ovr)
+        win_home, pso_score = _resolve_pso(h_ovr, a_ovr, neutral=_neutral_stage)
         pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
 
     if _suspended or _benched:

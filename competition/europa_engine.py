@@ -44,6 +44,7 @@ EUROPA_CFG = CompetitionConfig(
     league_weeks=EL_LEAGUE_WEEKS,
     end_week=EL_END_WEEK,
     stage_order=_cl._STAGE_ORDER,
+    neutral_stages=("F", "TP"),
 )
 
 

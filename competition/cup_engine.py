@@ -1042,7 +1042,11 @@ def _sim_ai_match(t, m, conn=None, reason="injury", batch=None):
     if outcome == "draw":
         win_home, pso_score = _resolve_pso(he["ovr"], ae["ovr"])
         pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
-    hs, as_ = _gen_score(outcome, he["ovr"] - ae["ovr"])
+    # [2026-09 수정, 신민용 요청: "국내컵 하위리그 vs 명문팀 이변매치업도
+    # 역사적 대량득점(예: FA컵 이변경기 대참사)이 가능해야 한다"]
+    # allow_extreme=True로 game_engine._gen_score의 극초압도 구간(adv>=80)을
+    # 이 컵대회에 한해 열어준다 — 리그는 기본값(False)이라 그대로.
+    hs, as_ = _gen_score(outcome, he["ovr"] - ae["ovr"], allow_extreme=True)
 
     # [2026-07 신설] 실제 진행 날짜 저장 (커리어/은퇴창 표시용).
     # [2026-07 성능 수정] 이 값은 get_my_cup_matches()가 my_played=1인
@@ -1205,7 +1209,7 @@ def simulate_my_cup_match(week, p, day=None):
         outcome = "draw" if hs == as_ else ("home" if hs > as_ else "away")
     except Exception:
         outcome = _match_outcome(h_ovr, a_ovr)
-        hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
+        hs, as_ = _gen_score(outcome, h_ovr - a_ovr, allow_extreme=True)
 
     pso_winner, pso_score = 0, ""
     if outcome == "draw":
@@ -1382,11 +1386,25 @@ def process_cup_week(week):
     if not ts:
         return
 
+    # [2026-09 성능, 신민용 리포트: "해가 갈수록 국내컵 주차가 느려진다"]
+    # 아래 두 조회는 예전에 "WHERE week=?"만 걸어서, 지난 모든 해의 같은
+    # 주차 경기(매년 1만 행씩 영구히 쌓임)까지 통째로 훑었다. 실제로 쓰이는
+    # 건 지금 active인 대회(ts)의 행뿐이라 그 대회 id로 범위를 좁힌다 —
+    # (tournament_id, week) 인덱스를 그대로 탄다. 대회별 라운드명은 id(=rowid)
+    # 순서로 "처음 나온 순서"를 유지해 예전 DISTINCT 결과와 같은 순서가
+    # 되게 한다(_advance_round 호출 순서 = 난수 소비 순서 불변).
+    _active_tids = [t["id"] for t in ts]
     round_names_by_tid: dict = {}
-    for r in conn.execute(
-            "SELECT DISTINCT tournament_id, round_name FROM cup_matches WHERE week=?",
-            (week,)):
-        round_names_by_tid.setdefault(r["tournament_id"], []).append(r["round_name"])
+    for _i in range(0, len(_active_tids), 500):
+        _chunk = _active_tids[_i:_i + 500]
+        _ph = ",".join("?" * len(_chunk))
+        for r in conn.execute(
+                f"""SELECT tournament_id, round_name FROM cup_matches
+                    WHERE tournament_id IN ({_ph}) AND week=? ORDER BY id""",
+                (*_chunk, week)).fetchall():
+            _lst = round_names_by_tid.setdefault(r["tournament_id"], [])
+            if r["round_name"] not in _lst:
+                _lst.append(r["round_name"])
 
     # [2026-09 안전망, 신민용 확정 "C안"] 예전엔 SQL에서 is_my=0만 뽑아
     # AI로 돌렸다. 그런데 is_my=1인데 이 대회의 "내 팀"(my_team_id)도,
@@ -1403,9 +1421,15 @@ def process_cup_week(week):
     _reg_by_tid = {t["id"]: (t.get("my_team_id") or 0) for t in ts}
     _my_tid_now = p.get("current_team_id", 0) if p else 0
     pending_by_tid: dict = {}
-    for r in conn.execute(
-            """SELECT * FROM cup_matches WHERE week=? AND home_score=-1
-               ORDER BY tournament_id, id""", (week,)):
+    _pending_rows = []
+    for _i in range(0, len(_active_tids), 500):
+        _chunk = _active_tids[_i:_i + 500]
+        _ph = ",".join("?" * len(_chunk))
+        _pending_rows.extend(conn.execute(
+            f"""SELECT * FROM cup_matches WHERE tournament_id IN ({_ph})
+                AND week=? AND home_score=-1""", (*_chunk, week)).fetchall())
+    _pending_rows.sort(key=lambda r: (r["tournament_id"], r["id"]))   # 예전 ORDER BY tournament_id, id
+    for r in _pending_rows:
         if r["is_my"]:
             _h, _a = r["home_team_id"], r["away_team_id"]
             _reg = _reg_by_tid.get(r["tournament_id"], 0)

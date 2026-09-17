@@ -137,12 +137,51 @@ _TRANSIENT_SQLITE_ERRORS = ("not an error", "no transaction is active",
 # 진짜 예외적인 상황에서만 쓰이는 마지막 안전망으로 남는다 — 그대로 유지).
 _pool_lock = threading.RLock()
 
+# [2026-09 신설, 진단용 — 신민용 리포트: 첫해 52→1주차 87초 중 발롱도르
+# 저장(SQL 거의 없음)이 32초로 찍힘] 연산 자체로는 설명이 안 되는 시간이라,
+# "다른 스레드(UI 타이머 등)가 풀 커넥션 락을 쥐고 있어서 기다린 시간"과
+# "hist 비동기 writer를 기다린 시간"을 따로 누적한다. 락이 비어 있으면
+# (정상 경로) 비차단 획득 한 번으로 끝나 추가 비용이 사실상 없다.
+# 누적값은 game_engine의 [PERF] 연도전환 로그가 읽고 0으로 되돌린다.
+# 스레드별로 따로 센다 — 전역 하나로 세면 UI 스레드가 "게임 진행 스레드를
+# 기다린 시간"까지 섞여 들어가 게임 진행 쪽 대기가 부풀려진다(헤드리스
+# 경합 재현 테스트에서 실제로 그렇게 나와 수정).
+_perf_lock_wait_by_thread = {}
+
+
+def _perf_wait_slot():
+    _k = threading.get_ident()
+    d = _perf_lock_wait_by_thread.get(_k)
+    if d is None:
+        d = _perf_lock_wait_by_thread[_k] = {"s": 0.0, "n": 0, "drain_s": 0.0}
+    return d
+
+
+def perf_wait_snapshot(reset=True):
+    """호출한 스레드 자신의 누적 대기(풀커넥션 락/hist writer)."""
+    d = _perf_wait_slot()
+    snap = dict(d)
+    if reset:
+        d["s"] = 0.0
+        d["n"] = 0
+        d["drain_s"] = 0.0
+    return snap
+
+
 def _retry_sqlite_op(fn, *args, **kwargs):
     last_err = None
     for attempt in range(4):
         try:
-            with _pool_lock:
+            if not _pool_lock.acquire(blocking=False):
+                _tw = time.perf_counter()
+                _pool_lock.acquire()
+                _d = _perf_wait_slot()
+                _d["s"] += time.perf_counter() - _tw
+                _d["n"] += 1
+            try:
                 return fn(*args, **kwargs)
+            finally:
+                _pool_lock.release()
         except sqlite3.OperationalError as e:
             # [2026-08 버그수정, 신민용 리포트: "abort due to ROLLBACK로 크래시
             # 났다"] _TRANSIENT_SQLITE_ERRORS의 "abort due to rollback"이 전부
@@ -540,23 +579,40 @@ def refresh_career_years(conn=None, retirement_year=None) -> float:
         # 훑어 선수별 개수를 만든 뒤 그대로 써 넣는다. 스캔이 선수 수만큼이
         # 아니라 딱 한 번이므로 PK 순서와 통계 유무에 전혀 영향받지 않고,
         # 예전 스키마에서도 이쪽이 더 빠르다.
+        # [2026-09 버그수정, 96차] OVR 이력은 이제 비동기 writer 큐로 쓰인다
+        # (run_ai_offseason이 바로 직전에 "이번 시즌 신규 선수 데뷔연도" 행을
+        # history_enqueue하고 곧장 이 함수를 부른다). 여기서 기다리지 않으면
+        # 워커가 아직 못 쓴 행이 COUNT에서 빠져, 타이밍에 따라 신인 경력이
+        # 0년으로 남는 경합이 있었다(멀티코어일수록 잘 드러남). 읽기 전에 큐를
+        # 비워 항상 같은 결과가 나오게 한다.
+        try:
+            history_drain()
+        except Exception as _e:
+            print(f"[PERF] refresh_career_years: history_drain 실패(계속 진행): {_e}")
         counts = c.execute(
             "SELECT player_id, COUNT(*) FROM hist.ai_player_ovr_history "
             "GROUP BY player_id").fetchall()
-        c.execute("UPDATE ai_players SET career_years = 0")
-        c.executemany("UPDATE ai_players SET career_years=? WHERE id=?",
-                       [(r[1], r[0]) for r in counts])
+        count_by_pid = {r[0]: r[1] for r in counts}
+        # [2026-09 성능, 96차] 예전엔 (1) 전원을 0으로 한 번 쓰고 (2) 전원을
+        # 다시 실제 값으로 썼다 — career_years에 인덱스가 걸려 있어 26만 행을
+        # 두 번씩 인덱스까지 고쳐 쓰는 셈이었다. 은퇴 선수 쪽은 "올해 은퇴자만"
+        # 갱신한다면서 역대 전 선수 수(매년 +1.5만)만큼 executemany를 돌렸다.
+        # 최종 값의 정의(= 이력 행 수, 없으면 0)는 그대로 두고, 현재 값과
+        # 다른 행만, 대상 행만 쓴다 — 결과 테이블 상태는 예전과 완전히 같다.
+        _upd = [(count_by_pid.get(r[0], 0), r[0]) for r in c.execute(
+            "SELECT id, career_years FROM ai_players").fetchall()
+            if (r[1] or 0) != count_by_pid.get(r[0], 0) or r[1] is None]
+        if _upd:
+            c.executemany("UPDATE ai_players SET career_years=? WHERE id=?", _upd)
         if retirement_year is None:
-            c.execute("UPDATE ai_players_retired SET career_years = 0")
-            c.executemany("UPDATE ai_players_retired SET career_years=? WHERE id=?",
-                           [(r[1], r[0]) for r in counts])
+            _rq = c.execute("SELECT id, career_years FROM ai_players_retired").fetchall()
         else:
-            c.execute("UPDATE ai_players_retired SET career_years = 0 "
-                      "WHERE retirement_year = ?", (retirement_year,))
-            c.executemany(
-                "UPDATE ai_players_retired SET career_years=? "
-                "WHERE id=? AND retirement_year=?",
-                [(r[1], r[0], retirement_year) for r in counts])
+            _rq = c.execute("SELECT id, career_years FROM ai_players_retired "
+                            "WHERE retirement_year = ?", (retirement_year,)).fetchall()
+        _upd_r = [(count_by_pid.get(r[0], 0), r[0]) for r in _rq
+                  if (r[1] or 0) != count_by_pid.get(r[0], 0) or r[1] is None]
+        if _upd_r:
+            c.executemany("UPDATE ai_players_retired SET career_years=? WHERE id=?", _upd_r)
         conn.commit()
     except sqlite3.OperationalError as e:
         # 컬럼이 아직 없는 아주 오래된 세이브 등 — 검색 필터 쪽에 폴백이
@@ -802,6 +858,30 @@ _HIST_YEAR_TABLES_FOR_REPAIR = (
 )
 
 
+# 현재 연도 행이 그 해 도중에 정상적으로 기록되는 표 → (기록되는 날, 그 날을
+# 처리한 직후의 current_week 최소값). main의 season_state가 "그 날을 이미
+# 처리했다"고 말할 때만 현재 연도 행이 정당하다. 여기 없는 표는 연도전환
+# 때만 그 해(=직전 연도) 행이 생기므로 예전 규칙(year >= current_year 삭제)
+# 그대로 둔다.
+#   - 196일(28주차 마지막 날): _advance_week가 28→29주로 넘어가며 하반기
+#     진입 스냅샷을 찍는다 → 처리 후 current_day=197, current_week=29.
+#   - 300일(CLUB_SEASON_END_DAY, 43주차 안): 시즌 스탯·하반기 포메이션/
+#     포지션 스냅샷 → 처리 후 current_day=301, current_week=43.
+# 주차까지 같이 보는 이유: 연도전환 직후 강제저장(_advance_week 안의
+# flush_to_disk_async)은 season_state가 이미 새 연도·1주차로 바뀐 뒤,
+# current_day는 아직 옛 값(364)인 순간을 저장할 수 있다. 날짜만 보면 그
+# 세이브에서 "새 연도의 미래 스냅샷"을 정당하다고 오판해 남기게 된다.
+_HIST_CURRENT_YEAR_SNAPSHOT_DAY = {
+    "league_season_standings_half": (196, 29),
+    "team_season_lineup_half": (196, 29),
+    "ai_player_position_history_half": (196, 29),
+    "ai_player_season_stats": (300, 43),
+    "ai_player_season_stats_by_comp": (300, 43),
+    "team_season_lineup": (300, 43),
+    "ai_player_position_history": (300, 43),
+}
+
+
 def _repair_future_hist_data(conn):
     """load_from_disk() 직후(=main이 막 복원된 시점) 매번 호출된다. main의
     season_state.current_year보다 같거나 큰 연도의 hist 기록은 main 기준
@@ -810,20 +890,66 @@ def _repair_future_hist_data(conn):
     시점으로 되맞춘다(위 load_from_disk() 주석의 시나리오 참고).
     season_state가 아직 없는 완전 신규 세이브(첫 실행)에서는 조용히 스킵."""
     try:
-        row = conn.execute("SELECT current_year FROM season_state WHERE id=1").fetchone()
+        row = conn.execute("SELECT current_year, current_day, current_week FROM season_state WHERE id=1").fetchone()
     except sqlite3.OperationalError:
         return
     if not row or row["current_year"] is None:
         return
     cutoff_year = row["current_year"]
+    cur_day = row["current_day"] or 1
+    cur_week = row["current_week"] or 1
     removed_any = False
     for tbl in _HIST_YEAR_TABLES_FOR_REPAIR:
+        # [2026-09 버그수정, 96차 — 헤드리스 세이브를 불러오다 발견] 이 복구는
+        # "hist의 현재 연도 행 = 아직 안 끝난 해의 미래 기록"이라는 전제로
+        # 만들어졌는데, 그 뒤 스냅샷 타이밍이 현재 연도 도중으로 옮겨졌다
+        # (상반기 포메이션/순위 = 28주차 196일, 시즌 스탯·하반기 포메이션·
+        # 포지션 = 43주차 300일 — 63~65차). 그래서 29주차 이후에 저장하고 다시
+        # 불러오면 이미 정상적으로 찍힌 그 해 상반기 스냅샷이, 44주차 이후면
+        # 그 해 시즌 스탯까지 통째로 지워졌다(그 해 발롱도르 후보 0명 등 —
+        # 스냅샷 시점은 이미 지나서 다시 찍히지도 않는다). 표마다 "현재 연도
+        # 행이 정당하게 존재할 수 있는 날짜"를 두고, main이 그 날을 이미
+        # 처리했으면(current_day는 '다음에 처리할 날' — 처리 후 +1) 현재 연도
+        # 행은 남긴다. 미래 연도(year > current_year)는 예전처럼 항상 지운다.
+        _legit = _HIST_CURRENT_YEAR_SNAPSHOT_DAY.get(tbl)
         try:
-            cur = conn.execute(f"DELETE FROM hist.{tbl} WHERE year >= ?", (cutoff_year,))
+            if _legit is not None and cur_day > _legit[0] and cur_week >= _legit[1]:
+                _op = ">"
+            else:
+                _op = ">="
+            cur = conn.execute(f"DELETE FROM hist.{tbl} WHERE year {_op} ?", (cutoff_year,))
             if cur.rowcount:
                 removed_any = True
-                print(f"[HIST-REPAIR] hist.{tbl}: year>={cutoff_year} {cur.rowcount}행 삭제"
+                print(f"[HIST-REPAIR] hist.{tbl}: year{_op}{cutoff_year} {cur.rowcount}행 삭제"
                       f"(main/hist 시점 불일치 복구 — load_from_disk 참고)")
+            if _op == ">":
+                # 현재 연도 행을 남기는 표라도, 그중 "연도전환 때만" 추가로 쓰이는
+                # 행은 43주차 스냅샷이 아니라 main보다 미래(전환 도중 종료된 판)의
+                # 기록이다 — 정확히 그 행만 지운다(나머지 43주차 행은 보존).
+                #   - ai_player_position_history: 전환 때 _snapshot_season_positions
+                #     (only_missing=True)가 "신규 선수"분을 보충한다. 43주차 스냅샷은
+                #     같은 순간 시즌 스탯도 같이 쓰므로, 같은 해 시즌 스탯 행이 없는
+                #     포지션 행 = 전환 때 쓰인 행이다(실측: 정상 세이브 0행, 전환 후
+                #     세이브 23,499행 — 이 조건과 정확히 일치).
+                #   - ai_player_season_stats_by_comp의 'cwc': 클럽월드컵만 연도전환
+                #     시점(_end_of_season)에 스냅샷한다(43주차 호출은 cwc 제외).
+                _extra = None
+                if tbl == "ai_player_position_history":
+                    _extra = conn.execute(
+                        """DELETE FROM hist.ai_player_position_history
+                           WHERE year = ? AND NOT EXISTS (
+                               SELECT 1 FROM hist.ai_player_season_stats s
+                               WHERE s.year = hist.ai_player_position_history.year
+                                 AND s.player_id = hist.ai_player_position_history.player_id)""",
+                        (cutoff_year,))
+                elif tbl == "ai_player_season_stats_by_comp":
+                    _extra = conn.execute(
+                        "DELETE FROM hist.ai_player_season_stats_by_comp WHERE year = ? AND competition = 'cwc'",
+                        (cutoff_year,))
+                if _extra is not None and _extra.rowcount:
+                    removed_any = True
+                    print(f"[HIST-REPAIR] hist.{tbl}: {cutoff_year}년 연도전환분 {_extra.rowcount}행 삭제"
+                          f"(전환 도중 종료된 판의 기록 — 43주차 스냅샷분은 보존)")
         except sqlite3.OperationalError:
             continue  # 이 세이브 버전엔 없는 표/컬럼일 수 있음 — 안전하게 건너뜀
     if removed_any:
@@ -1159,7 +1285,9 @@ def history_drain():
     async/종료) — main이 hist보다 앞서지 않게(불변식 5), (2) 게임 로직이
     "방금 큐에 넣은 hist 데이터"를 같은 시즌 안에서 다시 읽어야 할 때
     (예: 발롱도르 계산 직전 — hist read-after-write 의존성)."""
+    _td = time.perf_counter()
     _history_queue.join()
+    _perf_wait_slot()["drain_s"] += time.perf_counter() - _td
     if _history_worker_dead:
         raise RuntimeError("history writer 실패 — hist.db 저장이 중단됐습니다") from _history_worker_error
 
@@ -2058,6 +2186,46 @@ def init_db():
     # cup_entries/cup_matches/cup_history와 완전히 같은 원칙, 테이블만 분리.
     from competition.lower_cup_engine import init_lower_cup_tables
     init_lower_cup_tables(c)
+    # [2026-09 신설] 국내 슈퍼컵(domestic_super_cup_engine) — 대륙 슈퍼컵
+    # (sc_*)과 별개로, 그 나라 1부 리그 우승팀 vs 국내컵 우승팀(단판,
+    # 4주차)이 붙는 대회. 토너먼트가 아니라 매년 1경기뿐이라 sc_*보다
+    # 훨씬 단순한 구조지만, career_window/retire_window·world_browser가
+    # 이미 쓰는 competition_common.get_my_matches/save_trophy류 공용
+    # 함수를 그대로 재사용할 수 있도록 cl_matches/sc_matches와 같은
+    # 컬럼 구성(my_goals/my_shots 등)을 그대로 맞춘다("stage" 컬럼은
+    # 실제로는 항상 'F' 하나뿐이지만 같은 이유로 남겨둔다).
+    c.execute("""CREATE TABLE IF NOT EXISTS domestic_sc_tournaments(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        year INTEGER, country_id INTEGER, name TEXT,
+        status TEXT DEFAULT 'active',
+        home_team_id INTEGER DEFAULT 0, away_team_id INTEGER DEFAULT 0,
+        winner_team_id INTEGER DEFAULT 0,
+        my_in INTEGER DEFAULT 0, my_result TEXT DEFAULT '',
+        my_team_id INTEGER DEFAULT 0)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS domestic_sc_entries(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tournament_id INTEGER, team_id INTEGER, team_name TEXT,
+        flag TEXT, country TEXT, grade TEXT, ovr REAL)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS domestic_sc_matches(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tournament_id INTEGER, stage TEXT DEFAULT 'F', week INTEGER, day INTEGER DEFAULT 0,
+        home_team_id INTEGER, away_team_id INTEGER,
+        home_score INTEGER DEFAULT -1, away_score INTEGER DEFAULT -1,
+        pso_winner INTEGER DEFAULT 0, pso_score TEXT DEFAULT '',
+        is_my INTEGER DEFAULT 0, my_team_id INTEGER DEFAULT 0,
+        my_played INTEGER DEFAULT 0, my_position TEXT DEFAULT '',
+        my_saves INTEGER DEFAULT 0, my_goals INTEGER DEFAULT 0,
+        my_assists INTEGER DEFAULT 0, my_rating REAL DEFAULT 0,
+        my_shots INTEGER DEFAULT 0, my_shots_on INTEGER DEFAULT 0,
+        my_key_passes INTEGER DEFAULT 0, my_dribbles INTEGER DEFAULT 0,
+        my_blocks INTEGER DEFAULT 0, my_pass_acc REAL DEFAULT 0,
+        my_conceded INTEGER DEFAULT 0, my_yellow_cards INTEGER DEFAULT 0,
+        my_absence_reason TEXT DEFAULT NULL)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS domestic_sc_history(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        year INTEGER, competition TEXT, team_name TEXT, result TEXT,
+        goals INTEGER DEFAULT 0, assists INTEGER DEFAULT 0,
+        caps INTEGER DEFAULT 0, rating REAL DEFAULT 0)""")
     # ── 승강 플레이오프 (promotion_playoff_engine) ──────────────────
     # [2026-07 신설] _process_promotion_relegation이 43주에 순위를 확정할 때,
     # PO 대상(po_count 자리)에 걸린 팀은 즉시 이동시키지 않고 여기에
@@ -2814,6 +2982,10 @@ def init_db():
         # 이어지는" 버그가 있었다 — 둘 다 분리.
         "ALTER TABLE my_player ADD COLUMN super_cup_suspension INTEGER DEFAULT 0",
         "ALTER TABLE my_player ADD COLUMN wc_qual_suspension INTEGER DEFAULT 0",
+        # [2026-09 신설] 국내 슈퍼컵 전용 출전정지 카운터 — cl_suspension을
+        # 챔스/유로파/컨퍼런스가 같이 쓰다 슈퍼컵만 따로 뺀 것과 동일한
+        # 이유(super_cup_suspension 위 주석 참고)로 처음부터 전용 필드.
+        "ALTER TABLE my_player ADD COLUMN domestic_sc_suspension INTEGER DEFAULT 0",
         # 대회 그룹별 "시즌(또는 대회 사이클) 누적 경고" — 5장 도달 시
         # 위 결장 카운터 필드를 1로 세팅하고 0으로 리셋한다. 클럽 계열
         # (league/cup/europe/super_cup/cwc/po)은 매 시즌 리셋, 국가대표
@@ -3496,6 +3668,11 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_ecl_tournaments_year ON ecl_tournaments(year)",
         "CREATE INDEX IF NOT EXISTS idx_sc_tournaments_year ON sc_tournaments(year)",
         "CREATE INDEX IF NOT EXISTS idx_lower_cup_tournaments_year ON lower_cup_tournaments(year)",
+        # [2026-09 신설] 국내 슈퍼컵 — cup_tournaments/sc_tournaments와 동일한
+        # 이유(매 시즌 나라 수만큼 쌓이는 표를 year+country_id로 자주 조회).
+        "CREATE INDEX IF NOT EXISTS idx_dsc_tournaments_year_country ON domestic_sc_tournaments(year, country_id)",
+        "CREATE INDEX IF NOT EXISTS idx_dsc_matches_tid ON domestic_sc_matches(tournament_id)",
+        "CREATE INDEX IF NOT EXISTS idx_dsc_entries_tid ON domestic_sc_entries(tournament_id)",
         # [2026-09 신설, 같은 실측] hist.league_season_standings도 같은 병 —
         # 기존 idx_lss_league_season은 (league_id,season) 선두라 power_
         # ranking._update_team_a_from_league/update_team_b_for_year의
@@ -3513,6 +3690,19 @@ def init_db():
         # 스캔을 반복했다. match_results 쪽은 이미 home/away 인덱스로
         # MULTI-INDEX OR를 탄다(같은 EXPLAIN으로 확인).
         "CREATE INDEX IF NOT EXISTS hist.idx_lss_team ON league_season_standings(team_id)",
+        # [2026-09 96차 — 인덱스를 추가할 때의 주의(실측으로 확인된 함정)]
+        # ORDER BY 없는 JOIN은 인덱스 하나만 새로 생겨도 SQLite가 조인 순서를
+        # 바꿔 "행이 나오는 순서"가 달라질 수 있다. 이 게임은 그 순서대로
+        # 난수를 소비하는 곳이 많아서 결과 자체가 바뀐다. 실제로
+        # countries(name) 인덱스를 넣었더니 _compute_league_individual_awards의
+        # "leagues JOIN countries"(ORDER BY 없음)가 SCAN l → SCAN cn(이름순)으로
+        # 뒤집혀 리그 개인상 처리 순서·결과가 달라졌다(345일 장기 비교에서 발견).
+        # 그래서 그 인덱스는 넣지 않고, 중간 버전을 한 번이라도 돌린 DB에서도
+        # 원래 실행계획으로 돌아가도록 아래에서 명시적으로 지운다.
+        "DROP INDEX IF EXISTS idx_countries_name",
+        #   - lower_cup_entries(tournament_id): lower_cup_engine._ensure_tables에도
+        #     같이 둔다(표가 그쪽에서 만들어져 이 목록 시점엔 없을 수 있음).
+        "CREATE INDEX IF NOT EXISTS idx_lower_cup_entries_tid ON lower_cup_entries(tournament_id)",
     ]:
         try: c.execute(idx)
         except sqlite3.OperationalError: pass
@@ -5205,6 +5395,11 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
               # 재사용되는 구조라, 안 지우면 이전 판의 3부/4부 컵 대진과
               # 우승 기록이 새 게임의 엉뚱한 팀 것으로 그대로 남는다.
               "lower_cup_tournaments","lower_cup_entries","lower_cup_matches","lower_cup_history",
+              # [2026-09 신설] 국내 슈퍼컵(domestic_super_cup_engine) — 위
+              # lower_cup_*에서 이미 한 번 재발했던 "새 대회 표를 이 목록에
+              # 추가하는 걸 깜빡함" 패턴의 다섯 번째 재발을 막기 위해,
+              # 테이블을 만드는 바로 이 커밋에서 처음부터 같이 추가한다.
+              "domestic_sc_tournaments","domestic_sc_entries","domestic_sc_matches","domestic_sc_history",
               "po_pending_slots","po_tournaments","po_matches","po_history",
               # [2026-08 버그수정, 신민용 리포트: "새 게임(2000년) 시작했는데
               # 2001년 파워랭킹이 남아있다"] power_ranking.py의 8개 테이블

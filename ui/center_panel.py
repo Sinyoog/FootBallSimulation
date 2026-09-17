@@ -1521,6 +1521,20 @@ class CenterPanel(QWidget):
                 })
         except Exception:
             pass
+        # [2026-09 신설] 국내 슈퍼컵 — 연 1회, 4주차뿐이라 사실상 그 해
+        # 결승에 오른(=리그 우승 또는 컵 우승/준우승) 팀만 이 분기를 탄다.
+        try:
+            from competition import domestic_super_cup_engine
+            dsc_m = domestic_super_cup_engine.get_my_domestic_sc_match(week, p=p)
+            if dsc_m:
+                _consider("국내슈퍼컵", {
+                    "domestic_sc": True,
+                    "tournament_id": dsc_m["tournament_id"],
+                    "league_name": dsc_m.get("league_name", "국내슈퍼컵"),
+                    "week": week,
+                })
+        except Exception:
+            pass
 
         # 리그는 팀이 있으면 항상 후보(필터로 언제든 돌아갈 수 있게).
         options.append(("리그", None))
@@ -1556,6 +1570,9 @@ class CenterPanel(QWidget):
             return True
         from competition import super_cup_engine
         if super_cup_engine.has_my_super_cup_match_between(week, week):
+            return True
+        from competition import domestic_super_cup_engine
+        if domestic_super_cup_engine.has_my_domestic_sc_match_between(week, week):
             return True
         from competition import cup_engine
         if cup_engine.has_my_cup_match_between(week, week):
@@ -2852,6 +2869,15 @@ class CenterPanel(QWidget):
         if scm:
             scm["cl_kind"] = "super_cup"
             return scm
+
+        # [2026-09 신설] 국내 슈퍼컵도 super_cup과 동일한 부류다 — domestic_
+        # sc_matches.day에 실제 날짜(_pick_dsc_day, 4주차 안에서 국내리그
+        # 경기일과 안 겹치는 요일)가 채워지므로 _week_intl_cl_day 게이트
+        # (아직 day가 없는 챔스/컵 전용) 이전에 확인한다.
+        from competition import domestic_super_cup_engine
+        dscm = domestic_super_cup_engine.get_my_domestic_sc_match(week, day=day, p=p, st=st)
+        if dscm:
+            return dscm
 
         from game_engine import _week_intl_cl_day
         if day != _week_intl_cl_day(week, p, st=st):
