@@ -5221,6 +5221,141 @@ def get_intl_tournament_detail(tournament_id):
             "knockout": knockout, "qualified": qualified}
 
 
+def _intl_match_winner_loser(m):
+    """토너먼트 경기 dict(home/away/home_score/away_score/pso_winner)에서
+    (승자, 패자) 국가명을 돌려준다 — 무승부(연장까지 갔는데도 pso_winner가
+    없는 비정상 데이터 등)면 (None, None)."""
+    hs, aw = m.get("home_score"), m.get("away_score")
+    if hs is None or aw is None:
+        return None, None
+    if hs > aw:
+        return m.get("home"), m.get("away")
+    if aw > hs:
+        return m.get("away"), m.get("home")
+    pso = m.get("pso_winner")
+    if pso:
+        return pso, (m.get("away") if pso == m.get("home") else m.get("home"))
+    return None, None
+
+
+def get_wc_country_placements(tournament_id):
+    """[2026-09 신설, 신민용 요청: "역대 월드컵 창에 참여한 국가들을
+    순위별로 위에서 아래로 표시해달라"] get_intl_tournament_detail이 이미
+    계산해둔 조별리그/토너먼트 결과를 재료로, 이 대회에 참가한 모든
+    국가를 최종 성적 순으로 묶어 반환한다.
+
+    실제 FIFA처럼 1~32위를 전부 딱 갈라내진 않는다(그러려면 이 게임엔
+    없는 순위결정전들이 더 필요함) — 대신 실제로 순위를 가르는 경기가
+    있는 단계(결승/3·4위전)는 정확히 승자/패자를 가르고, 그 밖의 탈락
+    단계(8강/16강/32강/조별리그)는 "공동 N위" 구간으로 묶어 보여준다
+    (game_engine.get_team_rank가 이미 쓰는 "공동 N위" 관례와 동일).
+    같은 구간 안에서는 조 순위(승점→득실→득점)로 정렬해 보여줄 뿐,
+    실제 순위 숫자를 세분해서 매기지 않는다. 조별리그 탈락은 어느
+    조였는지("A조 조별리그 탈락" 등)까지 라벨에 남긴다.
+
+    반환: [{"country", "flag", "continent", "placement"(표시용 라벨),
+    "rank_order"(정렬 전용, 작을수록 상위)}, ...] — rank_order/country
+    순으로 정렬돼 있다. 참가 기록 자체가 없으면 빈 리스트."""
+    detail = get_intl_tournament_detail(tournament_id)
+    groups = detail.get("groups") or {}
+    groups2 = detail.get("groups2") or {}
+    knockout = detail.get("knockout") or []
+    ko_by_stage = {st["stage"]: st["matches"] for st in knockout}
+
+    flag_by_country = {}
+    all_countries = set()
+    for grp in list(groups.values()) + list(groups2.values()):
+        for t in grp:
+            all_countries.add(t["country"])
+            if t.get("flag"):
+                flag_by_country[t["country"]] = t["flag"]
+    for st in knockout:
+        for m in st["matches"]:
+            for side in ("home", "away"):
+                nm = m.get(side)
+                if nm:
+                    all_countries.add(nm)
+
+    # [2026-09 버그수정, 신민용 리포트: "대륙명은 왜 표시를 안 하는지
+    # 모르겠는데 애초에 데이터가 다 있잖아"] intl_entries에는 애초에
+    # continent 컬럼이 없어(_build_groups가 country/flag/grade만 골라
+    # 담음) t.get("continent")가 항상 빈 값이었다 — 대륙 정보는 countries
+    # 테이블(국가명→대륙)에 이미 있으므로 거기서 직접 찾는다.
+    continent_by_country = {}
+    if all_countries:
+        conn = get_conn()
+        ph = ",".join("?" * len(all_countries))
+        for r in conn.execute(
+                f"SELECT name, continent FROM countries WHERE name IN ({ph})",
+                list(all_countries)).fetchall():
+            continent_by_country[r["name"]] = r["continent"]
+
+    placed = {}   # country -> (rank_order, placement_label)
+
+    def _set(country, order, label):
+        if country and country not in placed:
+            placed[country] = (order, label)
+
+    final_matches = ko_by_stage.get("F") or []
+    if final_matches:
+        w, l = _intl_match_winner_loser(final_matches[0])
+        _set(w, 1, "🥇 우승")
+        _set(l, 2, "🥈 준우승")
+
+    tp_matches = ko_by_stage.get("TP") or []
+    if tp_matches:
+        w, l = _intl_match_winner_loser(tp_matches[0])
+        _set(w, 3, "🥉 3위")
+        _set(l, 4, "4위")
+    else:
+        # 3·4위전이 따로 없으면(대회 룰상 생략 등) 준결승 패자 둘을
+        # 공동 3위로 묶는다.
+        for m in (ko_by_stage.get("SF") or []):
+            _, l = _intl_match_winner_loser(m)
+            _set(l, 3, "공동 3위")
+
+    # 나머지 라운드는 깊은 라운드부터 처리한다 — 이미 더 깊은 라운드(F/TP/SF)
+    # 에서 자리가 정해진 나라는 _set이 조용히 무시하므로, 예를 들어 8강에서
+    # 이겨 4강까지 갔다가 거기서 진 나라가 여기서 "8강 탈락"으로 잘못
+    # 덮이는 일이 없다.
+    _round_rank = [("QF", 5, "8강 탈락"), ("R16", 9, "16강 탈락"),
+                   ("R32", 17, "32강 탈락"), ("qual_po", 33, "플레이오프 탈락")]
+    for stage, order, label in _round_rank:
+        for m in (ko_by_stage.get(stage) or []):
+            w, l = _intl_match_winner_loser(m)
+            _set(w, order, label)
+            _set(l, order, label)
+
+    # 토너먼트에 아예 등장하지 않은(=조별리그 탈락) 나라들 — 조 순위로만
+    # 표시 순서를 정한다(2단계 예선이면 2차 조가 최신 성적이므로 우선).
+    group_stage_source = groups2 if groups2 else groups
+    group_stage_teams = []
+    for g, grp in group_stage_source.items():
+        for t in grp:
+            if t["country"] not in placed:
+                group_stage_teams.append((g, t))
+    group_stage_teams.sort(key=lambda gt: (-gt[1].get("pts", 0), -gt[1].get("gd", 0), -gt[1].get("gf", 0)))
+    # [2026-09 수정, 신민용 요청: "조별리그 탈락도 어떤 조별인지 표시해줘"]
+    # 예전엔 표시 라벨이 전부 "조별리그 탈락"으로 같아 몇 조였는지 알 수
+    # 없었다 — 그룹 딕셔너리의 키(g, 예: "A")를 같이 들고 있다가
+    # "A조 조별리그 탈락"처럼 붙인다(_build_groups_grid가 조 제목에 쓰는
+    # f"{g}조"와 같은 표기). 정렬용 rank_order는 여전히 41부터 하나씩
+    # 늘려가며 매긴다 — 맨 아래 최종 정렬이 (rank_order, country) 기준
+    # 이라 같은 order를 주면 국가명 알파벳 순으로 섞여 위에서 계산한 조
+    # 순위(승점 순)가 무의미해지기 때문이다.
+    for i, (g, t) in enumerate(group_stage_teams):
+        _set(t["country"], 41 + i, f"{g}조 조별리그 탈락")
+
+    result = []
+    for country in all_countries:
+        order, label = placed.get(country, (99, "-"))
+        result.append({"country": country, "flag": flag_by_country.get(country, ""),
+                        "continent": continent_by_country.get(country, ""),
+                        "placement": label, "rank_order": order})
+    result.sort(key=lambda r: (r["rank_order"], r["country"]))
+    return result
+
+
 def get_country_intl_match_log(tournament_id, country_name):
     """[2026-08 신설, 신민용 요청: "국가 검색에서 연도를 클릭하면 그 대회의
     실제 경기 기록(조별리그 몇 대 몇, 16강 상대는 누구였는지 등)이 바로

@@ -4448,6 +4448,8 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
     if not src_players:
         return None
 
+    # [2026-09 성능] 예전엔 src_players를 두 번(자격자 추림 / 포지션군 카운트)
+    # 돌았다. 한 번만 돌면서 둘 다 만든다 — 값·순서·이후 로직은 그대로다.
     # 최소 잔류기간: 작년(또는 그 이후)에 이미 이적한 선수는 이번엔 후보 제외
     # [2026-08 최적화] team_players의 각 항목은 _transfer_market이 만들 때
     # 6개 키를 항상 전부 채우고(빠지는 경우가 구조적으로 없음), 이적으로
@@ -4456,10 +4458,6 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
     # 실측상 이 함수 하나가 dict.get을 2,421만 회 호출하고 있었는데(시즌당
     # 이적 7.4만 건 × 후보 선수 수 × 키 6개), 결과는 완전히 동일하면서
     # 호출당 오버헤드만 사라진다.
-    eligible = [p for p in src_players if (year - p["last_transfer_year"]) >= 1]
-    if not eligible:
-        return None
-
     # [2026-08 신설, 신민용 요청: "마지막 GK/마지막 CB 같은 선수가 정상
     # 판매 후보로 들어가면 안 된다 — 그 선수를 팔면 팀에 해당 포지션
     # 그룹이 0명이 되는가만 검사해서 막아야 한다"] 원인: 위 eligible은
@@ -4492,8 +4490,14 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
     _pg = _POS_GROUP
     _gi = _POS_GROUP_IDX
     _cnt = [0, 0, 0, 0]
+    eligible = []
+    _elig_append = eligible.append
     for _p in src_players:
         _cnt[_gi.get(_p["position"], 3)] += 1
+        if (year - _p["last_transfer_year"]) >= 1:
+            _elig_append(_p)
+    if not eligible:
+        return None
     if _cnt[0] <= 1 or _cnt[1] <= 1 or _cnt[2] <= 1 or _cnt[3] <= 1:
         _thin = {_GROUP_ORDER[_i] for _i in range(4) if _cnt[_i] <= 1}
         _protected_ids = {p["id"] for p in eligible
@@ -4551,9 +4555,10 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
             # 성향을 살짝 높인다. dst_pool_tids가 src 포함 같은 리그 그대로면
             # (=87% 케이스) 이 보정은 사실상 의미 없이 상쇄되므로 안전하다.
             _age = _e["age"]
+            _eovr = _e["ovr"]   # [2026-09 성능] 아래에서 두 번 하던 dict 조회를 한 번으로
             if _age <= 22:
                 w *= 1.3
-            if _e["ovr"] >= 80:
+            if _eovr >= 80:
                 w *= 1.5
             if _cend and (_cend - year) <= 1:
                 w *= 1.4
@@ -4582,7 +4587,7 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
             # gap<=0(아웃라이어 아님)이거나 SS/S급이면 배수가 정확히 1.0
             # 이라 그런 선수들에게는 기존 동작과 100% 동일하게 유지된다.
             # (위 _oim_ms 주석 참고 — _outlier_intl_multiplier 인라인)
-            _oim_gap = (_e["ovr"] or 0) - _oim_base
+            _oim_gap = (_eovr or 0) - _oim_base
             if _oim_gap > 0.0:
                 w *= 1.0 + min(_oim_cap, _oim_gap / _oim_div) * _oim_ms
             weights[i] = w
@@ -5015,6 +5020,20 @@ def _rebalance_squad_sizes(c, year):
         bonus = round(CONTINENT_OVR_BONUS.get(continent, 0) + COUNTRY_OVR_ADJ.get(cname, 0))
         is_override = cname in COUNTRY_LEAGUE_OVR_OVERRIDE
         _lo_size, _hi_size = _squad_min_max(grade)
+        # [2026-09 신설, 신민용 요청: "A급 이상 1부 리그 팀은 26명을
+        # 맞춰서 가지고 있어야 한다 — 이적 과정에서 후보가 13~14명까지
+        # 남기도 하는데 그만큼 영입을 해야지"] 등급별 범위(_SQUAD_SIZE_
+        # BY_GRADE)는 A등급이 24~27이라, 24~25명이어도 "정상"으로 보고
+        # 이 함수가 아무 조치를 안 했다 — 범위가 아니라 26명 고정으로
+        # 못박는다(모자라면 즉시 영입, 넘치면 조기은퇴로 26을 맞춤).
+        # [2026-09 확장, 신민용 요청: "S급 SS급은 2부도 포함해줘 — 3부로
+        # 가면 26이 될 수도 있지만 26 미만으로 내려가도 괜찮다"] A등급은
+        # 1부만 고정 대상이고, S/SS등급은 2부까지 고정 대상에 포함한다
+        # (최상위 리그는 2부도 스쿼드가 두꺼운 게 자연스러우므로). 3부
+        # 이하는 등급 불문 기존 범위 로직 그대로 둬서 자연스럽게 26
+        # 미만으로 내려갈 수 있게 둔다.
+        if (tier == 1 and grade in ("A", "S", "SS")) or (tier == 2 and grade in ("S", "SS")):
+            _lo_size = _hi_size = 26
 
         if n < _lo_size:
             need = _lo_size - n
@@ -5857,6 +5876,10 @@ def _snapshot_season_ratings(c, year, team_goals_for=None, include_league=True, 
         # 팀당 한 벌뿐이다 — 팀별로 한 번만 묶어두고 행당 조회를 1번으로
         # 줄인다(팀 수 약 1만 개). 값도 순서도 그대로다.
         _team_ctx = {}
+        # [2026-09 성능] 위 대회별 루프와 같은 이유로 묶음 계산으로 바꿨다.
+        # 아래는 원래 루프에 있던 설명 주석이다.
+        from game_engine import estimate_ai_season_batch
+        _fsm_l = []; _ta_l = []; _la_l = []; _gm_l = []
         for _pid, _pos, _ovr, _sub, tid, lid in rows:
             _cx = _team_ctx.get(tid)
             if _cx is None:
@@ -5864,25 +5887,23 @@ def _snapshot_season_ratings(c, year, team_goals_for=None, include_league=True, 
                                          team_avg.get(tid, 50.0),
                                          league_avg.get(lid, 50.0),
                                          league_goal_mult.get(lid, 1.0))
-            fsm, _ta, _la, _gm = _cx
-            g, a, rt = _estimate_ai_season(
-                _ovr, _pos, _ta, _la, _sub, full_season_matches=fsm,
-                goal_env_mult=_gm)
+            _fsm_l.append(_cx[0]); _ta_l.append(_cx[1])
+            _la_l.append(_cx[2]); _gm_l.append(_cx[3])
+        _gs, _as, _rts, _css, _svs, _gcs = estimate_ai_season_batch(
+            [r[2] or 0 for r in rows], [r[1] for r in rows], [r[3] for r in rows],
+            _ta_l, _la_l, _fsm_l, _gm_l)
             # [2026-09 신설, 신민용 요청: "GK들은 골 어시보단 선방률 이런걸로
             # 표시해야 하잖아"] 골/도움과 별개로 클린시트(무실점 경기 수)도
             # 같이 추정한다 — GK가 아닌 포지션도 값 자체는 계산·저장해두지만
             # (계산 비용이 적어 굳이 분기할 필요 없음), 화면에서 GK만 이
             # 값을 골/도움 대신 보여준다(world_browser_window.py).
-            cs = _estimate_ai_clean_sheets(_pos, _ovr, _ta, _la, full_season_matches=fsm)
             # [2026-09 재수정, 신민용 요청: "클린시트 말고 선방:14 실점:1
             # 선방률:93.5%로 떠야한다"] game_engine._estimate_ai_gk_saves
             # 정의부 주석 참고 — GK만 의미 있는 값이라 GK일 때만 계산한다
             # (그 외 포지션은 컬럼 기본값 0 그대로).
-            saves = goals_conceded = 0
-            if _pos == "GK":
-                saves, goals_conceded = _estimate_ai_gk_saves(
-                    _ovr, _ta, _la, full_season_matches=fsm)
-            _raw_append([_pid, year, tid, fsm, g, a, rt, cs, saves, goals_conceded])
+        for _i2, (_pid, _pos, _ovr, _sub, tid, lid) in enumerate(rows):
+            _raw_append([_pid, year, tid, _fsm_l[_i2], _gs[_i2], _as[_i2], _rts[_i2],
+                         _css[_i2], _svs[_i2], _gcs[_i2]])
 
         # [2026-09 신설, 신민용 리포트: "팀 골이 30개면 애들이 골고루 나눠
         # 갖는 것 같다 — 득점왕이 10골 정도밖에 안 된다"] 스쿼드 뎁스 감쇠 —
@@ -6030,25 +6051,28 @@ def _snapshot_season_ratings(c, year, team_goals_for=None, include_league=True, 
         # [2026-09 성능 2차] 리그 루프와 같은 이유로 팀 단위 컨텍스트를 한
         # 번만 만든다(대회별 블록은 40만 행이라 효과가 더 크다).
         _cctx = {}
-        for _i in idxs:
-            _pid, _pos, _ovr, _sub, tid, lid = rows[_i]
+        # [2026-09 성능] 선수 한 명씩 돌며 난수를 뽑던 것을 묶음 계산으로 바꿨다
+        # (game_engine.estimate_ai_season_batch — 계산식·계수·상하한은 그대로,
+        # 난수를 뽑는 순서만 다르다). 아래는 원래 루프에 있던 설명 주석이다.
+        from game_engine import estimate_ai_season_batch
+        _sel = [rows[_i] for _i in idxs]
+        _fsm_c = []; _ta_c = []; _la_c = []; _gm_c = []
+        for _pid, _pos, _ovr, _sub, tid, lid in _sel:
             _cx = _cctx.get(tid)
             if _cx is None:
                 _cx = _cctx[tid] = (counts[tid], team_avg.get(tid, 50.0),
                                      league_avg.get(lid, 50.0),
                                      league_goal_mult.get(lid, 1.0))
-            fsm, _ta, _la, _gm = _cx
-            g, a, rt = _estimate_ai_season(
-                _ovr, _pos, _ta, _la, _sub, full_season_matches=fsm,
-                goal_env_mult=_gm)
-            cs = _estimate_ai_clean_sheets(_pos, _ovr, _ta, _la, full_season_matches=fsm)
-            saves = goals_conceded = 0
-            if _pos == "GK":
-                saves, goals_conceded = _estimate_ai_gk_saves(
-                    _ovr, _ta, _la, full_season_matches=fsm)
+            _fsm_c.append(_cx[0]); _ta_c.append(_cx[1])
+            _la_c.append(_cx[2]); _gm_c.append(_cx[3])
+        _gs, _as, _rts, _css, _svs, _gcs = estimate_ai_season_batch(
+            [r[2] or 0 for r in _sel], [r[1] for r in _sel], [r[3] for r in _sel],
+            _ta_c, _la_c, _fsm_c, _gm_c)
             # tid를 맨 뒤에 임시로 붙여둔다 — 아래 스케일링에서 팀별로
             # goals(index 4)를 찾아 덮어쓴 뒤, insert 직전에 다시 잘라낸다.
-            comp_raw.append([_pid, year, comp, fsm, g, a, rt, cs, saves, goals_conceded, tid])
+        for _i2, (_pid, _pos, _ovr, _sub, tid, lid) in enumerate(_sel):
+            comp_raw.append([_pid, year, comp, _fsm_c[_i2], _gs[_i2], _as[_i2], _rts[_i2],
+                             _css[_i2], _svs[_i2], _gcs[_i2], tid])
             comp_meta.append((_pos, _ovr))
 
         # [2026-09 신설, 신민용 확정: "모든 대회가 그렇게 되어야 한다"]

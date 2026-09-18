@@ -25,7 +25,22 @@ game_engine.py는 이 모듈에서 필요한 함수를 import해서 그대로 �
 GOD_TIER_SALARY_MULT = 1.6
 
 
+# [2026-09 성능, 신민용 50년 로그 후속: 이적시장 6.1초 최적화] economy_index는
+# 연도만 받는 순수 함수인데(상수 앵커 사이 선형 보간) 이적시장 한 번에
+# 9.4만 회 호출된다. 연도별로 결과가 고정이라 그대로 캐시한다 — 같은 float을
+# 돌려주므로 계산 결과는 비트 단위로 같다.
+_ECONOMY_INDEX_MEMO = {}
+
+
 def economy_index(year: int) -> float:
+    _v = _ECONOMY_INDEX_MEMO.get(year)
+    if _v is not None:
+        return _v
+    _v = _ECONOMY_INDEX_MEMO[year] = _economy_index_uncached(year)
+    return _v
+
+
+def _economy_index_uncached(year: int) -> float:
     """[2026-07 신설, 신민용+GPT 다회 검토 확정, v4] 시대별 경제 배율.
     지금까지 연봉·시장가치 앵커는 전부 "2026년 축구 경제" 기준으로 잡혀
     있었는데, 게임은 2001년부터 시작해서 2040년대까지 진행된다 — 즉
@@ -617,12 +632,23 @@ def estimate_transfer_fee(grade, tier, ovr, country=None, team_name=None,
     # 영향 없음). 참고용 연봉은 같은 조건으로 _calc_salary를 내부에서
     # 한 번 더 불러 구한다 — 두 축의 "독립적 계산" 설계 원칙은 그대로
     # 유지하면서, 결과가 비상식적으로 벌어질 때만 안전망으로 개입한다.
-    _MIN_FEE_RATIO_OF_SALARY = {"C": 0.40, "D": 0.25}
-    if grade in _MIN_FEE_RATIO_OF_SALARY:
-        ref_salary = _calc_salary(grade, tier, ovr, country, team_name, year=year)
-        fee_floor = int(ref_salary * _MIN_FEE_RATIO_OF_SALARY[grade])
-        if final < fee_floor:
-            final = fee_floor
+    #
+    # [2026-09 재확장, 신민용 리포트: "연봉이 3천만원인 선수가 자국 선수일
+    # 때 이적료가 100만원 이런 수준까지도 나오던데 이건 말이 안 된다 —
+    # 연봉의 1~10배로 나와야 할텐데"] C/D급 하한(25~40%)조차 못 미치는
+    # 사례(연봉의 3%)가 나왔다 — C/D 이외 등급(특히 E/F, 향후 등록될
+    # 하위권)엔 이 안전망 자체가 아예 없었기 때문. "등급마다 다른 낮은
+    # 비율"을 등급별로 하나씩 늘려가는 대신, 모든 등급에 공통으로 "이적료
+    # 최저선 = 연봉의 1배"를 건다 — 신민용이 말한 1~10배 범위의 하한과
+    # 정확히 일치시킨 것. 위쪽(고배율)은 원래 배율 공식(리그·명문·나이·
+    # 잠재력 등)이 자연스럽게 몇 배~수십 배까지 그대로 만들어내므로 별도
+    # 상한은 두지 않는다 — 이 안전망은 어디까지나 "비정상적으로 낮게
+    # 떨어지는" 하단만 막는다.
+    _MIN_FEE_RATIO_OF_SALARY = 1.0
+    ref_salary = _calc_salary(grade, tier, ovr, country, team_name, year=year)
+    fee_floor = int(ref_salary * _MIN_FEE_RATIO_OF_SALARY)
+    if final < fee_floor:
+        final = fee_floor
 
     if debug:
         return {"fee": final, "debug": {

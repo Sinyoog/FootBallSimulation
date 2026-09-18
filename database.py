@@ -168,6 +168,48 @@ def perf_wait_snapshot(reset=True):
     return snap
 
 
+# [2026-09 성능, 신민용 50년 로그: "25·26주차와 46주차 국제대회 처리가 해마다
+# 늘어난다"(1.4s→17.8s, 0.5s→16.4s)] 대표팀 선발이 후보들의 통산 A매치
+# 출전수를 나라·포지션군마다 물어서(한 해 생성에 1,477회 실측) 매번
+# intl_squad 전체를 훑는다 — PK가 (tournament_id, country, player_id)라
+# player_id만으로는 스킵스캔/전체 SCAN이 되고, (대회,나라) 프리픽스가 대회마다
+# 211개씩 영구히 쌓여 비용이 연수에 비례한다(50년 규모 실측: 한 번 73.9ms →
+# 1,477회면 100초대). player_id 인덱스를 추가하면 다른 조회의 계획까지
+# 뒤집혀 결과가 바뀌었으므로(위 인덱스 목록 주석), 계획은 그대로 두고
+# "선발이 몰리는 구간 동안만" 전체 합계를 한 번 읽어 재사용한다.
+# intl_squad에 쓰기(INSERT/UPDATE/DELETE)가 한 번이라도 들어오면 즉시
+# 버리므로(아래 _maybe_invalidate_sql_caches) 출전수가 늘어난 뒤에는 다시
+# 읽는다. 캐시가 비어 있는 평소에는 검사 자체가 첫 줄에서 끝난다.
+_INTL_APPS_TOTAL_CACHE = None
+# 쓰기가 "합계를 바꾸지 않는다"는 걸 호출부가 아는 구간에서만 켠다
+# (set_intl_squad의 INSERT는 appearances=0으로만 넣으므로 합계 불변).
+_INTL_APPS_SUPPRESS = False
+_SQL_WRITE_HEADS = ("I", "U", "D", "R", "i", "u", "d", "r")
+
+
+def invalidate_intl_apps_cache():
+    global _INTL_APPS_TOTAL_CACHE
+    _INTL_APPS_TOTAL_CACHE = None
+
+
+def _maybe_invalidate_sql_caches(sql):
+    if _INTL_APPS_TOTAL_CACHE is None or _INTL_APPS_SUPPRESS:
+        return                      # 이미 무효(또는 호출부가 직접 갱신) — 핫패스는 여기서 끝
+    if not isinstance(sql, str):
+        return
+    head = sql[:1]
+    if head in (" ", "\n", "\t", "\r"):
+        sql = sql.lstrip()
+        head = sql[:1]
+    if head in _SQL_WRITE_HEADS and "intl_squad" in sql:
+        # 합계를 바꿀 수 있는 쓰기만 캐시를 버린다 — 선발/슬롯 표시
+        # (UPDATE ... SET starter=, slot=)처럼 appearances를 안 건드리는
+        # 쓰기는 나라마다 돌기 때문에, 이것까지 버리면 다음 나라가 다시
+        # 전체를 훑게 된다. DELETE는 행이 사라지므로 항상 버린다.
+        if head in ("D", "d") or "appearances" in sql:
+            invalidate_intl_apps_cache()
+
+
 def _retry_sqlite_op(fn, *args, **kwargs):
     last_err = None
     for attempt in range(4):
@@ -209,12 +251,17 @@ class _PooledCursor:
     def __init__(self, real):
         object.__setattr__(self, "_real", real)
     def execute(self, *a, **kw):
+        if a:
+            _maybe_invalidate_sql_caches(a[0])
         _retry_sqlite_op(object.__getattribute__(self, "_real").execute, *a, **kw)
         return self
     def executemany(self, *a, **kw):
+        if a:
+            _maybe_invalidate_sql_caches(a[0])
         _retry_sqlite_op(object.__getattribute__(self, "_real").executemany, *a, **kw)
         return self
     def executescript(self, *a, **kw):
+        invalidate_intl_apps_cache()
         _retry_sqlite_op(object.__getattribute__(self, "_real").executescript, *a, **kw)
         return self
     # [2026-07 4차 수정] execute()는 락을 걸어도, 그 뒤에 이어지는
@@ -263,10 +310,14 @@ class _PooledConn:
         return _PooledCursor(real_c)
     def execute(self, *a, **kw):
         real = object.__getattribute__(self, "_real")
+        if a:
+            _maybe_invalidate_sql_caches(a[0])
         real_c = _retry_sqlite_op(real.execute, *a, **kw)
         return _PooledCursor(real_c)
     def executemany(self, *a, **kw):
         real = object.__getattribute__(self, "_real")
+        if a:
+            _maybe_invalidate_sql_caches(a[0])
         real_c = _retry_sqlite_op(real.executemany, *a, **kw)
         return _PooledCursor(real_c)
     def commit(self):
@@ -808,6 +859,7 @@ def load_from_disk() -> bool:
     세이브 파일이 없으면(첫 실행) 아무 것도 안 하고 False를 반환 —
     이 경우 init_db()가 빈 인메모리 DB에 새 스키마를 만든다.
     디스크 직결 모드(USE_MEMORY_DB=False)에서는 항상 False(불필요)."""
+    invalidate_intl_apps_cache()   # [2026-09] intl_squad 합계 캐시(새 DB/초기화 시 반드시 버린다)
     if not USE_MEMORY_DB or not os.path.exists(DB_PATH):
         return False
     _ensure_mem_anchor()
@@ -980,11 +1032,30 @@ def _retry_on_windows_lock(func, *args, attempts=8, base_delay=0.2):
             delay = min(delay * 1.6, 2.0)
 
 
-def flush_to_disk():
+def flush_to_disk(final=False):
     """라이브 인메모리 DB 내용을 game.db 파일로 백업한다(자동저장·종료 시 호출).
     임시파일에 먼저 백업한 뒤 os.replace로 원자적 치환 — 백업 도중 앱이
     죽어도 기존 세이브 파일은 손상되지 않는다.
     디스크 직결 모드에서는 이미 매 commit이 곧 저장이므로 아무 것도 안 함.
+
+    [2026-09 신설, 신민용 리포트: "들어갈 때랑 끌 때 데이터가 많으면 시간이
+    걸린다(30년 vs 5년)"] final=True(앱 종료 시 마지막 저장 전용)면 아래
+    pages=1000/sleep=0.005 청크 백업 대신 한 번에 통째로 backup한다. 그
+    청크+sleep은 "게임 진행용 풀 커넥션(_pool_conn)과 동시에 공유 캐시
+    DB에 접근하는 상황"(주기적 자동저장 중에도 화면이 계속 움직이는 경우)
+    에만 의미가 있는 설계인데, closeEvent의 마지막 flush_to_disk()는
+    wait_for_pending_flush()로 진행 중이던 비동기 자동저장까지 이미 다
+    끝낸 뒤 호출되고, 그 시점 이후로는 앱이 닫히는 중이라 game_engine이
+    같은 DB에 새로 쓰기/읽기를 걸 일이 없다 — 즉 잠금을 짧게 풀어줘야 할
+    "동시 접근자"가 이 순간엔 존재하지 않는다. 그런데도 기존 코드는 종료
+    시에도 항상 청크 경로를 탔고, sleep=0.005는 청크 하나당 고정
+    오버헤드라 총 시간이 (전체 페이지수/1000)×0.005초만큼 세이브 크기에
+    비례해 누적된다 — 30년치 대용량 세이브에서 5년치보다 종료가 눈에
+    띄게 느린 원인 중 하나. final=True일 때 pages=-1(기본값, 한 번의
+    step)로 이 누적 sleep을 없앤다 — 백업 결과물(tmp_path 최종 내용)은
+    청크 경로와 완전히 동일하고, 원자적 치환(os.replace)도 그대로다.
+    자동저장(flush_to_disk_async)은 지금처럼 계속 청크 경로를 쓴다(거긴
+    실제로 게임이 계속 진행 중이라 잠금 분할이 여전히 필요하다).
 
     [2026-07 버그 수정, 2차] "cannot commit - no transaction is active" /
     "not an error" 크래시가 반복됐다.
@@ -1032,7 +1103,10 @@ def flush_to_disk():
         # 전체 스냅샷이고, 그 다음의 os.replace() 원자적 치환도 그대로다 —
         # 바뀌는 건 "복사가 스레드 하나를 얼마나 오래 막느냐"뿐, 세이브
         # 내용이나 게임 로직에는 전혀 영향이 없다.
-        src_snapshot.backup(dst, pages=1000, sleep=0.005)
+        if final:
+            src_snapshot.backup(dst)
+        else:
+            src_snapshot.backup(dst, pages=1000, sleep=0.005)
     finally:
         dst.close()
         src_snapshot.close()
@@ -3690,6 +3764,28 @@ def init_db():
         # 스캔을 반복했다. match_results 쪽은 이미 home/away 인덱스로
         # MULTI-INDEX OR를 탄다(같은 EXPLAIN으로 확인).
         "CREATE INDEX IF NOT EXISTS hist.idx_lss_team ON league_season_standings(team_id)",
+        # [2026-09 신설, 신민용 리포트: "들어갈 때랑 끌 때 데이터가 많으면
+        # 시간이 걸린다(30년 vs 5년)"] load_from_disk() 직후 매번 도는
+        # _repair_future_hist_data()가 _HIST_YEAR_TABLES_FOR_REPAIR 11개
+        # 표 전부에 "DELETE FROM hist.{표} WHERE year > ?"를 돌리는데,
+        # league_season_standings_half는 바로 위 league_season_standings
+        # (idx_lss_year 추가 완료)와 완전히 같은 구조·같은 용도(하반기
+        # 스냅샷 쌍둥이 표)인데 이 year 인덱스만 그때 같이 안 들어가 있었다
+        # (기존 idx_lssh_league_season/idx_lssh_unique는 둘 다 league_id
+        # 선두라 "WHERE year>?"엔 못 쓰임). 매년 +약 10,700행씩 쌓이는
+        # 표라 이 풀스캔 비용도 세이브 연차에 비례해 커진다 — 정확히 이
+        # 리포트의 증상(연차가 쌓일수록 로딩이 느려짐)과 일치.
+        "CREATE INDEX IF NOT EXISTS hist.idx_lssh_year ON league_season_standings_half(year)",
+        # [2026-09 신설, 같은 리포트] team_b_history(power_ranking.py에서
+        # 생성, PRIMARY KEY(team_id, year) — team_id 선두)도 위와 같은
+        # _repair_future_hist_data 대상 표인데 애초에 인덱스가 하나도 없어서
+        # "WHERE year>?" 삭제가 매 로드마다 표 전체를 풀스캔했다(매년
+        # +11,393행). team_b_history는 파워랭킹 화면을 한 번도 연 적 없는
+        # 완전 신규 세이브에는 아직 표 자체가 없을 수 있어(지연 생성) 그런
+        # 경우 이 CREATE INDEX는 "no such table"로 조용히 스킵되고(아래
+        # try/except), 그 표가 실제로 생기는 다음 로드부터 정상적으로
+        # 걸린다 — 다른 지연 생성 표들과 동일한 패턴.
+        "CREATE INDEX IF NOT EXISTS hist.idx_team_b_history_year ON team_b_history(year)",
         # [2026-09 96차 — 인덱스를 추가할 때의 주의(실측으로 확인된 함정)]
         # ORDER BY 없는 JOIN은 인덱스 하나만 새로 생겨도 SQLite가 조인 순서를
         # 바꿔 "행이 나오는 순서"가 달라질 수 있다. 이 게임은 그 순서대로
@@ -3703,6 +3799,24 @@ def init_db():
         #   - lower_cup_entries(tournament_id): lower_cup_engine._ensure_tables에도
         #     같이 둔다(표가 그쪽에서 만들어져 이 목록 시점엔 없을 수 있음).
         "CREATE INDEX IF NOT EXISTS idx_lower_cup_entries_tid ON lower_cup_entries(tournament_id)",
+        # [2026-09 신설, 신민용 50년 로그: "25·26주차와 46주차 국제대회 처리가
+        # 해마다 늘어난다"(1.4s → 17.8s / 0.5s → 16.4s)] 대표팀 선발이 후보
+        # 수백 명의 통산 A매치 출전수를 묻는 쿼리
+        #   SELECT player_id, SUM(appearances) FROM intl_squad WHERE player_id IN (...)
+        # 를 나라·포지션군마다 부른다. intl_squad의 PK는 (tournament_id,
+        # country, player_id)라서 player_id만으로 찾으면 스킵스캔이 되고,
+        # (대회,나라) 프리픽스가 대회마다 211개씩 영구히 쌓이므로 비용이
+        # 연수에 비례해 커진다. 50년 규모(71.9만 행·프리픽스 2.77만)로
+        # 실측하니 한 번에 73.9ms(전체 SCAN)였고, 이 인덱스를 넣으면
+        # 5.2ms(커버링 인덱스)로 떨어졌다(결과 동일 확인).
+        # 그런데 이 인덱스를 넣으면 "WHERE tournament_id=? AND player_id=?"
+        # 조회 두 곳의 계획까지 (player_id=?)로 뒤집혀서, 345일 장기 대조에서
+        # 결과가 달라졌다(다국적 선수가 같은 대회에서 두 나라 명단에 들 수
+        # 있어 fetchone()이 다른 행을 잡을 수 있다). 그래서 인덱스는 넣지 않고
+        # get_player_total_intl_appearances 쪽에 "한 번만 읽어두는 캐시"로
+        # 해결한다(실행계획을 전혀 바꾸지 않는다 — 아래 함수 주석 참고).
+        # 중간 버전을 돌려 이 인덱스가 생긴 DB는 원래 계획으로 되돌린다.
+        "DROP INDEX IF EXISTS idx_intl_squad_player",
     ]:
         try: c.execute(idx)
         except sqlite3.OperationalError: pass
@@ -4093,12 +4207,36 @@ def _maybe_periodic_vacuum(conn) -> float:
                   (str(n),))
         conn.commit()
         return 0.0
+    # [2026-09 성능, 신민용 50년 로그: 2018년 주기VACUUM 13.0s, 2048년 61.3s
+    # — 연도전환 총 99.4초의 대부분] VACUUM 비용은 파일 크기에 비례해서
+    # 커지는데, 정작 회수할 공간(프리리스트)이 거의 없으면 통째로 다시 쓰고
+    # 끝나는 셈이다. 스키마별로 "회수 가능 비율"을 먼저 보고, 눈에 띄게
+    # 쌓였을 때만 돈다(쌓였으면 예전과 똑같이 돈다). 판단 근거를 남기려고
+    # 비율을 로그에 같이 찍는다 — 장기 세이브에서 이 수치를 보고 임계값을
+    # 다시 조정할 수 있다.
+    _VAC_MIN_FREE_RATIO = 0.05
+    def _free_ratio(schema):
+        try:
+            pc = conn.execute(f"PRAGMA {schema}.page_count").fetchone()[0] or 0
+            fl = conn.execute(f"PRAGMA {schema}.freelist_count").fetchone()[0] or 0
+        except sqlite3.OperationalError:
+            return None, 0, 0
+        return (fl / pc if pc else 0.0), pc, fl
     _tv0 = time.perf_counter()
-    conn.execute("VACUUM")
-    try:
-        conn.execute("VACUUM hist")
-    except sqlite3.OperationalError:
-        pass
+    _vac_note = []
+    for _schema in ("main", "hist"):
+        _ratio, _pc, _fl = _free_ratio(_schema)
+        if _ratio is None:
+            continue
+        if _ratio < _VAC_MIN_FREE_RATIO:
+            _vac_note.append(f"{_schema} 건너뜀(회수가능 {_ratio*100:.1f}%)")
+            continue
+        try:
+            conn.execute("VACUUM" if _schema == "main" else "VACUUM hist")
+            _vac_note.append(f"{_schema} 실행(회수가능 {_ratio*100:.1f}%)")
+        except sqlite3.OperationalError:
+            _vac_note.append(f"{_schema} 실패(건너뜀)")
+    _history_log(f"[PERF]   주기VACUUM 판정: {' | '.join(_vac_note) if _vac_note else '대상 없음'}")
     _tv1 = time.perf_counter()
     c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('seasons_since_vacuum', '0')")
     conn.commit()
@@ -4369,9 +4507,26 @@ def _migrate_history_tables():
 
 def _migrate_history_pk_year_first():
     """[2026-09 신설, 신민용 승인: "history.db가 성장할수록 계속 악화되는
-    구조를 평탄화하는 구조적 최적화"] hist의 선수 이력 4표를
-    PRIMARY KEY(player_id, year, ...) → PRIMARY KEY(year, player_id, ...)로
-    재구축한다. meta 플래그로 세이브당 딱 1회만 돈다.
+    구조를 평탄화하는 구조적 최적화"] hist의 선수/팀 이력 7표를
+    PRIMARY KEY(player_id/team_id, year, ...) → PRIMARY KEY(year,
+    player_id/team_id, ...)로 재구축한다. meta 플래그로 세이브당 딱 1회만 돈다.
+
+    [2026-09 v2, 신민용 리포트: "들어갈 때랑 끌 때 데이터가 많으면 시간이
+    걸린다(30년 vs 5년)"] 최초 버전(v1)은 아래 이유로 4표(선수 단위 아카이브)
+    만 다뤘는데, load_from_disk() 직후 매번 도는 _repair_future_hist_data()가
+    "DELETE FROM hist.{표} WHERE year > ?"를 돌리는 11개 표 목록
+    (_HIST_YEAR_TABLES_FOR_REPAIR) 안에 이 4표와 완전히 같은 구조(WITHOUT
+    ROWID, PRIMARY KEY(id, year), 시즌마다 한 번씩만 INSERT되는 순수
+    아카이브)인 team_season_lineup/team_season_lineup_half/ai_player_
+    position_history_half 3표가 더 있었다 — 이 3표는 여태 year 선두 PK도,
+    보조 인덱스도 전혀 없어서 그 DELETE가 매 로드마다 표 전체를 풀스캔했다
+    (세이브 연차에 비례해 느려지는, 바로 그 리포트의 증상). v1과 완전히
+    같은 이유·같은 검증 절차(백업 + 행수/양방향 EXCEPT 대조)로 그대로
+    확장한다 — 새 표라 로직 자체는 바꿀 필요가 없었다. 플래그를
+    history_pk_year_first_v1 → _v2로 올려서, v1을 이미 끝낸 기존 세이브도
+    이 3표만 다시 검사해 마저 재구축하게 한다(todo 판정은 표별 실제 스키마
+    ("PRIMARY KEY(YEAR,"인지)를 직접 보고 정하므로, 이미 v1으로 끝난 4표는
+    조용히 건너뛰고 새로 추가된 3표만 처리된다 — 중복 작업 없음).
 
     ── 왜 ────────────────────────────────────────────────────
     4표 전부 WITHOUT ROWID라 PK 순서가 곧 디스크 저장 순서다. player_id가
@@ -4422,13 +4577,13 @@ def _migrate_history_pk_year_first():
     c = conn.cursor()
     try:
         done = c.execute(
-            "SELECT value FROM meta WHERE key='history_pk_year_first_v1'").fetchone()
+            "SELECT value FROM meta WHERE key='history_pk_year_first_v2'").fetchone()
     except sqlite3.OperationalError:
         return
     if done and done["value"] == "1":
         return
 
-    # (year, player_id, ...) 순으로 바꿀 4표 — (표이름, 새 PK 컬럼들, 컬럼 정의)
+    # (year, player_id/team_id, ...) 순으로 바꿀 7표 — (표이름, 새 PK 컬럼들, 컬럼 정의)
     TARGETS = (
         ("ai_player_season_stats", "year, player_id",
          "player_id INTEGER, year INTEGER, team_id INTEGER, matches INTEGER, "
@@ -4442,6 +4597,17 @@ def _migrate_history_pk_year_first():
          "player_id INTEGER, year INTEGER, ovr INTEGER"),
         ("ai_player_position_history", "year, player_id",
          "player_id INTEGER, year INTEGER, position TEXT, role TEXT DEFAULT ''"),
+        # [2026-09 v2 신설] 아래 3표는 위 4표와 완전히 같은 구조(WITHOUT
+        # ROWID, PK(id, year), 시즌마다 한 번씩만 INSERT)라 같은 이유로
+        # 같이 재구축한다 — _repair_future_hist_data()의 풀스캔 대상이었다.
+        ("ai_player_position_history_half", "year, player_id",
+         "player_id INTEGER, year INTEGER, position TEXT, role TEXT DEFAULT ''"),
+        ("team_season_lineup", "year, team_id",
+         "team_id INTEGER, year INTEGER, formation TEXT DEFAULT '', "
+         "slots_json TEXT DEFAULT '[]', bench_json TEXT DEFAULT '[]'"),
+        ("team_season_lineup_half", "year, team_id",
+         "team_id INTEGER, year INTEGER, formation TEXT DEFAULT '', "
+         "slots_json TEXT DEFAULT '[]', bench_json TEXT DEFAULT '[]'"),
     )
 
     # 이미 전부 (year, ...) 선행이면(신규 세이브 등) 조용히 플래그만 세운다.
@@ -4457,7 +4623,7 @@ def _migrate_history_pk_year_first():
         todo.append((tbl, newpk, coldef))
     if not todo:
         c.execute("INSERT OR REPLACE INTO meta(key, value) "
-                  "VALUES('history_pk_year_first_v1','1')")
+                  "VALUES('history_pk_year_first_v2','1')")
         conn.commit()
         return
 
@@ -4549,7 +4715,7 @@ def _migrate_history_pk_year_first():
         print(f"[MIGRATE-PK] 경고: ANALYZE 실패({_e}) — 연도 명시 쿼리로 동작은 유지된다")
 
     c.execute("INSERT OR REPLACE INTO meta(key, value) "
-              "VALUES('history_pk_year_first_v1','1')")
+              "VALUES('history_pk_year_first_v2','1')")
     conn.commit()
     try:
         conn.execute("VACUUM hist")
@@ -5297,6 +5463,7 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
     삭제는 그대로 다 수행). 실제 선수단 재생성은 그 다음 사용자가
     "새 게임"→"생성"/"랜덤 생성"을 눌러 reset_game_data()가 (skip 없이)
     다시 호출되는 시점에 진행률 창과 함께 정식으로 일어난다."""
+    invalidate_intl_apps_cache()   # [2026-09] intl_squad 합계 캐시(새 DB/초기화 시 반드시 버린다)
     _clear_world_browser_caches()   # [2026-09] 이전 판 팀 기록 캐시 제거
     # [2026-09 신설, 신민용 리포트: "새 선수 생성할 때 이렇게 멈추는데?"]
     # 새 게임(세계 생성) 경로는 단계가 10개가 넘는데 여태 구간 계측이
@@ -5951,7 +6118,17 @@ def rescale_team_to_target_ovr(team_id, target_ovr, conn=None):
             # 위 docstring 참고 — delta가 +인데 노쇠기 선수면 이 선수만
             # 델타 0(변경 없음) 처리하고, 그 외(delta가 - 이거나 아직
             # 노쇠기가 아님)엔 팀 델타를 그대로 적용.
-            player_delta = 0 if (delta > 0 and age is not None and age > _AI_PEAK_END) else delta
+            # [2026-09 버그수정, 신민용 리포트: "OVR을 100으로 편집한
+            # 선수가 22~23세부터 서서히 줄어든다"] rescale_ai_player_
+            # to_target_ovr(user_initiated=True)로 사용자가 직접 맞춘
+            # 선수(ovr_user_locked=1)는 이 승격/강등 리스케일에서 통째로
+            # 제외한다 — 다른 자동 조정 경로(_apply_intl_breakout,
+            # ai_lifecycle의 growth_mask/peak_mask)는 이미 이 플래그를
+            # 보고 있는데, 팀 단위 리스케일만 빠져 있었다. 방향(+/-)
+            # 무관하게 항상 제외 — "사용자가 명시적으로 맞춘 값을
+            # 시스템이 조용히 되돌리면 안 된다"는 원칙 그대로.
+            player_delta = 0 if (r["ovr_user_locked"]
+                                  or (delta > 0 and age is not None and age > _AI_PEAK_END)) else delta
             if player_delta == 0:
                 ovr_sum += r["ovr"]
                 continue
@@ -6126,15 +6303,38 @@ def rescale_ai_player_to_target_ovr(player_id, target_ovr, conn=None, user_initi
             new_peak_ovr = target_ovr
             _effective_target = _aging_target_ovr(target_ovr, _age, player_id)
 
+        # [2026-09 신설, 신민용 리포트: "OVR 재능 높은 애들이 쉽게 해외로
+        # 못 간다 — 내가 입력한 한계치랑 선수 실제 한계치랑 달라서 충돌나는
+        # 것 같다. 18살 애 OVR을 100으로 올리면 한계 OVR도 100이 되어야
+        # 하는데 22~23세부터 서서히 줄어든다"] 이 함수는 원래 ovr·스탯·
+        # (노화기면) peak_ovr만 갱신하고, ai_lifecycle이 "이 선수가 어디까지
+        # 클 수 있는가"의 진짜 기준으로 쓰는 potential_ovr(개인별 전성기
+        # 도달 가능 상한 — database.roll_potential_ovr 정의부 참고)은 전혀
+        # 안 건드렸다. 그 결과 (1) 해외 진출/발굴 스카우팅
+        # (ai_lifecycle._scout_and_promote_talent류, potential_ovr 기준으로
+        # "재목"을 판정)이 여전히 편집 전의 낮은 potential_ovr을 보고
+        # 이 선수를 재능 있다고 인식하지 못했고, (2) 성장기(25세 이하)
+        # 터치풀 계산의 상한(cap_by_row = min(team_cap, potential_ovr))도
+        # 낮은 값에 눌려 있었다. 이제 "입력값이 기존 potential_ovr보다
+        # 낮으면 그대로 두고, 높으면 입력값으로 끌어올린다"(신민용 확정
+        # 규칙)를 적용 — potential_ovr을 낮추는 일은 절대 없다.
+        new_potential_ovr = None
+        _old_potential = row["potential_ovr"] if "potential_ovr" in row.keys() else 0
+        if user_initiated and target_ovr > (_old_potential or 0):
+            new_potential_ovr = target_ovr
+
         if _effective_target == before_ovr:
             if user_initiated:
+                _set_sql = "ovr_user_locked=1"
+                _params = []
                 if new_peak_ovr is not None:
-                    conn.execute(
-                        "UPDATE ai_players SET ovr_user_locked=1, peak_ovr=? WHERE id=?",
-                        (new_peak_ovr, player_id))
-                else:
-                    conn.execute(
-                        "UPDATE ai_players SET ovr_user_locked=1 WHERE id=?", (player_id,))
+                    _set_sql += ", peak_ovr=?"
+                    _params.append(new_peak_ovr)
+                if new_potential_ovr is not None:
+                    _set_sql += ", potential_ovr=?"
+                    _params.append(new_potential_ovr)
+                _params.append(player_id)
+                conn.execute(f"UPDATE ai_players SET {_set_sql} WHERE id=?", _params)
                 if own:
                     conn.commit()
             return (0, before_ovr, before_ovr)
@@ -6150,18 +6350,20 @@ def rescale_ai_player_to_target_ovr(player_id, target_ovr, conn=None, user_initi
         _lock_sql = ", ovr_user_locked=1" if user_initiated else ""
         _peak_sql = ", peak_ovr=?" if new_peak_ovr is not None else ""
         _peak_params = (new_peak_ovr,) if new_peak_ovr is not None else ()
+        _potential_sql = ", potential_ovr=?" if new_potential_ovr is not None else ""
+        _potential_params = (new_potential_ovr,) if new_potential_ovr is not None else ()
         conn.execute(
             f"""UPDATE ai_players SET
                stamina=?,speed=?,jump=?,strength=?,shooting=?,passing=?,
                dribbling=?,tackling=?,heading=?,positioning=?,setpiece=?,
-               mental=?,confidence=?,leadership=?,concentration=?,ovr=?{_lock_sql}{_peak_sql}
+               mental=?,confidence=?,leadership=?,concentration=?,ovr=?{_lock_sql}{_peak_sql}{_potential_sql}
                WHERE id=?""",
             (new_stats["stamina"], new_stats["speed"], new_stats["jump"],
              new_stats["strength"], new_stats["shooting"], new_stats["passing"],
              new_stats["dribbling"], new_stats["tackling"], new_stats["heading"],
              new_stats["positioning"], new_stats["setpiece"], new_stats["mental"],
              new_stats["confidence"], new_stats["leadership"],
-             new_stats["concentration"], new_ovr) + _peak_params + (player_id,))
+             new_stats["concentration"], new_ovr) + _peak_params + _potential_params + (player_id,))
         if own:
             conn.commit()
         return (delta, before_ovr, new_ovr)
@@ -6240,7 +6442,11 @@ def rescale_teams_to_target_ovr_batch(jobs, conn=None):
             ovr_sum = 0
             for r in team_rows:
                 age = r["age"]
-                player_delta = 0 if (delta > 0 and age is not None and age > _AI_PEAK_END) else delta
+                # [2026-09 버그수정] rescale_team_to_target_ovr과 동일한
+                # 이유로 ovr_user_locked=1(사용자가 직접 맞춘 선수)은
+                # 방향 무관하게 이 배치 리스케일에서도 제외한다.
+                player_delta = 0 if (r["ovr_user_locked"]
+                                      or (delta > 0 and age is not None and age > _AI_PEAK_END)) else delta
                 if player_delta == 0:
                     ovr_sum += r["ovr"]
                     continue
@@ -7034,13 +7240,20 @@ def get_player_total_intl_appearances(player_ids):
     포화함수에 넣는다)."""
     if not player_ids:
         return {}
-    conn = get_conn()
-    ph = ",".join("?" * len(player_ids))
-    rows = conn.execute(
-        f"SELECT player_id, SUM(appearances) AS total FROM intl_squad "
-        f"WHERE player_id IN ({ph}) GROUP BY player_id", player_ids).fetchall()
-    conn.close()
-    return {r["player_id"]: (r["total"] or 0) for r in rows}
+    global _INTL_APPS_TOTAL_CACHE
+    if _INTL_APPS_TOTAL_CACHE is None:
+        # 전체를 한 번만 훑어 player_id별 합계를 만들어 둔다 — 예전 쿼리와
+        # 같은 행을 같은 정수 합으로 더하므로 값이 완전히 같다(SUM은 순서
+        # 무관). intl_squad에 쓰기가 들어오면 즉시 무효화된다.
+        conn = get_conn()
+        rows = conn.execute(
+            "SELECT player_id, SUM(appearances) AS total FROM intl_squad "
+            "GROUP BY player_id").fetchall()
+        conn.close()
+        _INTL_APPS_TOTAL_CACHE = {r["player_id"]: (r["total"] or 0) for r in rows}
+    _m = _INTL_APPS_TOTAL_CACHE
+    # 예전 반환값과 동일: intl_squad에 행이 있는 선수만 키로 들어간다.
+    return {pid: _m[pid] for pid in dict.fromkeys(player_ids) if pid in _m}
 
 
 def _my_player_intl_slot(tournament_id, country):
@@ -7402,11 +7615,25 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
     # ap.position을 함께 스냅샷 저장 — 위 ALTER TABLE 주석 참고. picked의
     # 각 행은 get_country_squad_players/예선 승계 경로 둘 다 이미
     # ap.position을 "position" 키로 담고 있으므로 재조회 없이 그대로 쓴다.
-    conn3.executemany(
-        "INSERT OR IGNORE INTO intl_squad(tournament_id, country, player_id, appearances, position) "
-        "VALUES (?,?,?,0,?)",
-        [(tournament_id, country, r["id"], r.get("position") or "") for r in picked])
-    conn3.commit()
+    # [2026-09 성능] 이 INSERT는 appearances=0으로만 넣으므로 "통산 출전수
+    # 합계"가 바뀌지 않는다. 그런데 일반 무효화 훅이 intl_squad 쓰기를 보고
+    # 캐시를 버리면 나라마다 명단을 넣을 때마다 다음 나라가 69만 행을 다시
+    # 훑는다(50년 규모 실측: 그 주차 83.8s 중 71.8s가 이 재구축이었다).
+    # 여기서는 무효화를 막고, 새로 들어간 선수만 합계 0으로 채워 "행이 있으면
+    # 키가 있다"는 예전 쿼리의 반환 규칙을 그대로 맞춘다.
+    global _INTL_APPS_SUPPRESS
+    _INTL_APPS_SUPPRESS = True
+    try:
+        conn3.executemany(
+            "INSERT OR IGNORE INTO intl_squad(tournament_id, country, player_id, appearances, position) "
+            "VALUES (?,?,?,0,?)",
+            [(tournament_id, country, r["id"], r.get("position") or "") for r in picked])
+        conn3.commit()
+    finally:
+        _INTL_APPS_SUPPRESS = False
+    if _INTL_APPS_TOTAL_CACHE is not None:
+        for r in picked:
+            _INTL_APPS_TOTAL_CACHE.setdefault(r["id"], 0)
     conn3.close()
     for r in picked:
         r["appearances"] = 0
@@ -7469,11 +7696,29 @@ def bump_intl_squad_appearances(tournament_id, country, player_ids):
     if not player_ids:
         return
     conn = get_conn()
-    conn.executemany(
-        "UPDATE intl_squad SET appearances = appearances + 1 "
-        "WHERE tournament_id=? AND country=? AND player_id=?",
-        [(tournament_id, country, pid) for pid in player_ids])
-    conn.commit()
+    # [2026-09 성능] 이 쓰기는 통산 출전수 합계를 실제로 바꾸므로 예전에는
+    # 캐시를 통째로 버렸는데, 경기마다 불려서(50년 규모 실측: 그 주차에 105회)
+    # 매번 69만 행을 다시 훑게 만들었다. 얼마나 바뀌는지 여기서 정확히 알
+    # 수 있으니(실제로 갱신된 선수만 +1) 캐시를 그만큼만 고친다 — 값은
+    # 다시 훑은 것과 같다.
+    global _INTL_APPS_SUPPRESS
+    _INTL_APPS_SUPPRESS = True
+    try:
+        conn.executemany(
+            "UPDATE intl_squad SET appearances = appearances + 1 "
+            "WHERE tournament_id=? AND country=? AND player_id=?",
+            [(tournament_id, country, pid) for pid in player_ids])
+        conn.commit()
+    finally:
+        _INTL_APPS_SUPPRESS = False
+    if _INTL_APPS_TOTAL_CACHE is not None:
+        # UPDATE가 실제로 건드린 행 = 그 대회·그 나라 명단에 있는 선수뿐
+        _present = {r[0] for r in conn.execute(
+            "SELECT player_id FROM intl_squad WHERE tournament_id=? AND country=?",
+            (tournament_id, country)).fetchall()}
+        for pid in player_ids:
+            if pid in _present:
+                _INTL_APPS_TOTAL_CACHE[pid] = _INTL_APPS_TOTAL_CACHE.get(pid, 0) + 1
     conn.close()
 
 

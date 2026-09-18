@@ -1228,6 +1228,48 @@ def _team_wdl_from_results(c, tid, league_id, season):
     return tw, td, tl
 
 
+def _refresh_my_open_career_rank(p):
+    """[2026-09 신설, 신민용 리포트: "리그 순위표랑 좌측 player_panel엔
+    2위/14팀인데 커리어에는 1위/14팀이라 뜬다"] career_entries.team_rank는
+    _update_career_stats가 "내 경기가 있었던 그 날" 스냅샷으로 찍는다.
+    그런데 같은 라운드의 나머지 AI 경기(_sim_all_ai_matches)는 week
+    단위로만 걸려 있고 실제로는 그 주의 진짜 마지막 날(day % DAYS_PER_WEEK
+    == 0)에야 한꺼번에 처리된다 — 내 경기 날짜가 그 주 마지막 날보다
+    이르면(실측: 내 경기 day=88, 같은 week의 AI 배치는 day=91), 스냅샷
+    시점엔 나만 이번 라운드 승점이 반영되고 아직 경기를 안 뛴 다른 팀들은
+    지난 라운드 그대로라 일시적으로 순위가 실제보다 좋게(2위인데 1위로)
+    나온다. 그 뒤로 내가 다시 경기를 뛰기 전까지는 _update_career_stats가
+    안 불려서 이 값이 그대로 굳어버리는 반면, 리그 순위표/player_panel은
+    get_team_rank를 매번 그 자리에서 새로 계산하므로 항상 맞는 값을 보여줘
+    둘이 어긋나 보였다.
+
+    그래서 그 라운드(_sim_all_ai_matches)가 실제로 끝나는 시점 — 그날 내
+    경기가 없었더라도 — 열린 커리어 항목의 team_rank만 가볍게 다시
+    계산해서 맞춘다. 다른 필드(경기수/골/평점 등)는 그 사이 안 바뀌므로
+    건드리지 않는다(전체 _update_career_stats를 다시 도는 것보다 훨씬
+    저렴)."""
+    tid = p.get("current_team_id", 0)
+    if not tid:
+        return
+    conn = get_conn()
+    c = conn.cursor()
+    team_row = c.execute("SELECT name FROM teams WHERE id=?", (tid,)).fetchone()
+    if not team_row:
+        conn.close(); return
+    existing = _find_open_entry(c, tid, team_row["name"])
+    if not existing:
+        conn.close(); return
+    season = p.get("current_season", 1)
+    rank_str = get_team_rank(tid, conn=conn, season=season)
+    try:
+        rn = int(rank_str.split("위")[0].replace("공동", "").strip())
+    except (ValueError, AttributeError, IndexError):
+        conn.close(); return
+    c.execute("UPDATE career_entries SET team_rank=? WHERE id=?", (rn, existing["id"]))
+    conn.commit()
+    conn.close()
+
+
 def _update_career_stats(p, year, week):
     """열린 커리어 항목의 스탯만 갱신. end_year는 건드리지 않음."""
     tid = p.get("current_team_id", 0)
@@ -1743,6 +1785,10 @@ def advance_4weeks(schedule: list):
         club_world_cup_engine.process_cwc_week(week)
         super_cup_engine.process_super_cup_week(week)
         _sim_all_ai_matches(week, p.get("current_league_id", 0), cur_season)
+        # [2026-09 신설] 이 라운드가 방금 끝났으니, 내 경기가 이번 주에
+        # 없었더라도 열린 커리어 항목의 순위 스냅샷을 다시 맞춘다 —
+        # _refresh_my_open_career_rank 주석 참고.
+        _refresh_my_open_career_rank(p)
 
         # ── 정확히 1주 전진 (경계 트리거 매주 검사) ──
         # [최적화] _simulate_match/_process_training이 season_matches 등을 갱신하므로
@@ -2164,6 +2210,15 @@ def _advance_days_impl(schedule: list, progress_cb=None):
             domestic_super_cup_engine.process_domestic_sc_week(week)
             _pw_t4 = _time_mod.perf_counter()
             _sim_all_ai_matches(week, p.get("current_league_id", 0), cur_season)
+            # [2026-09 신설, 신민용 리포트: "리그 순위표/player_panel엔
+            # 2위인데 커리어에는 1위로 뜬다"] 원인: 내 경기 날짜(day)가 이
+            # 라운드의 실제 마지막 날(day % DAYS_PER_WEEK==0)보다 이르면,
+            # 내 경기 직후 찍히는 career_entries.team_rank 스냅샷엔 나만
+            # 이번 라운드 승점이 반영되고 다른 팀은 아직 반영되기 전이라
+            # 일시적으로 순위가 실제보다 좋게 나온다(_refresh_my_open_
+            # career_rank 주석 참고). 이 라운드(_sim_all_ai_matches)가 방금
+            # 끝난 지금, 그날 내 경기가 있었든 없었든 순위만 다시 맞춘다.
+            _refresh_my_open_career_rank(p)
             _pw_t5 = _time_mod.perf_counter()
             _pw_total = _pw_t5 - _pw_t0
             if _pw_total >= 0.05:
@@ -8697,6 +8752,85 @@ def _estimate_ai_season(ovr, pos, team_avg, league_avg, sub_role=None, full_seas
     return goals, assists, rating
 
 
+def estimate_ai_season_batch(ovr, pos, sub_role, team_avg, league_avg, fsm, goal_env_mult):
+    """_estimate_ai_season + _estimate_ai_clean_sheets + _estimate_ai_gk_saves를
+    선수 묶음 단위로 한 번에 계산한다(numpy). 입력은 모두 길이 n의 시퀀스.
+    반환: (goals, assists, rating, clean_sheets, saves, goals_conceded) — 전부
+    길이 n의 파이썬 리스트(sqlite에 그대로 넣을 수 있는 int/float).
+
+    [2026-09 신설, 신민용 확정: "기존 세이브는 신경쓸 필요 없어"] 계산식은
+    한 줄도 바꾸지 않고(같은 계수·같은 분포·같은 상·하한·같은 반올림 규칙),
+    "한 명씩 파이썬으로 도는 것"만 배열 연산으로 바꾼다. 난수는 선수마다
+    같은 개수·같은 용도로 뽑되 뽑는 순서(random 모듈 → numpy)가 달라지므로
+    개별 선수의 성적은 예전 실행과 달라진다 — 분포는 같다(시즌평점/득점
+    분포로 검증). 43주차 스냅샷에서만 69만 회 호출되던 구간이다.
+    """
+    import numpy as _np
+    n = len(ovr)
+    if n == 0:
+        return [], [], [], [], [], []
+    ovr_a = _np.asarray(ovr, dtype=_np.float64)
+    ta = _np.asarray(team_avg, dtype=_np.float64)
+    la = _np.asarray(league_avg, dtype=_np.float64)
+    fsm_a = _np.asarray(fsm, dtype=_np.float64)
+    gem = _np.asarray(goal_env_mult, dtype=_np.float64)
+    # 포지션·서브롤별 상수(_POS_SUB_MEMO와 같은 값) — 종류가 수십 개뿐이라
+    # 고유 조합만 계산해서 인덱스로 펼친다.
+    gp = _np.empty(n); ap = _np.empty(n); gm = _np.empty(n); am = _np.empty(n)
+    _seen = {}
+    for i in range(n):
+        key = (pos[i], sub_role[i] or "")
+        v = _seen.get(key)
+        if v is None:
+            _ps = _POS_SUB_MEMO.get(key)
+            if _ps is None:
+                _m = _SUB_ROLE_MATCH_MOD.get(key)
+                _ps = _POS_SUB_MEMO[key] = (
+                    AWARD_POS_GOAL.get(key[0], 1), AWARD_POS_ASSIST.get(key[0], 1),
+                    _m.get("g_mult", 1.0) if _m else 1.0,
+                    _m.get("a_mult", 1.0) if _m else 1.0)
+            v = _seen[key] = _ps
+        gp[i], ap[i], gm[i], am[i] = v
+    scale = (fsm_a / 38.0) ** 0.35
+    d = ta - la
+    g_base = _np.maximum((gp + d * 0.2) * scale * gem * gm, 0.0)
+    a_base = _np.maximum((ap + d * 0.1) * scale * gem * am, 0.0)
+
+    def _tailed(u):      # _tailed_season_mult의 배열판(구간·계수 동일)
+        return _np.select(
+            [u < _TAIL_P1, u < _TAIL_P2, u < _TAIL_P3],
+            [_U08_LO + _U08_SPAN * (u / _TAIL_P1),
+             1.20 + 0.30 * ((u - _TAIL_P1) / (_TAIL_P2 - _TAIL_P1)),
+             1.50 + 0.30 * ((u - _TAIL_P2) / (_TAIL_P3 - _TAIL_P2))],
+            1.80 + 0.70 * ((u - _TAIL_P3) / (1.0 - _TAIL_P3)))
+
+    goals = _np.round(g_base * _tailed(_np.random.random(n)))
+    assists = _np.round(a_base * _tailed(_np.random.random(n)))
+    rating = _np.clip(_np.round(6.0 + (ovr_a - 60.0) / 35.0
+                                + goals * 0.02 + assists * 0.015, 2), 3.0, 9.5)
+    # 클린시트(_estimate_ai_clean_sheets와 동일 식)
+    cs = _np.maximum(_np.round(
+        7.5 * (1.0 + d * 0.03) * (1.0 + _np.maximum(ovr_a - 70.0, 0.0) * 0.01)
+        * (fsm_a / 38.0) * (_U08_LO + _U08_SPAN * _np.random.random(n))), 0.0)
+    # GK 세이브/실점(_estimate_ai_gk_saves와 동일 식) — GK만 계산
+    saves = _np.zeros(n); conceded = _np.zeros(n)
+    gk = _np.fromiter((p == "GK" for p in pos), dtype=bool, count=n)
+    if gk.any():
+        k = _np.flatnonzero(gk)
+        spg = _np.clip(_GK_SHOTS_PER_MATCH_BASE * (1.0 - d[k] * 0.01), 2.0, 7.0)
+        shots = _np.maximum(_np.round(
+            spg * fsm_a[k] * (_U085_LO + _U085_SPAN * _np.random.random(k.size))), 0.0)
+        base_pct = 0.60 + _np.clip(ovr_a[k] - 50.0, 0.0, 50.0) / 50.0 * 0.28
+        save_pct = _np.clip(base_pct + d[k] * 0.001
+                            + (_U005_LO + _U005_SPAN * _np.random.random(k.size)), 0.45, 0.92)
+        sv = _np.round(shots * save_pct)
+        saves[k] = sv
+        conceded[k] = _np.maximum(shots - sv, 0.0)
+    return ([int(x) for x in goals], [int(x) for x in assists],
+            [float(x) for x in rating], [int(x) for x in cs],
+            [int(x) for x in saves], [int(x) for x in conceded])
+
+
 def _estimate_ai_clean_sheets(pos, ovr, team_avg, league_avg, full_season_matches=14):
     """[2026-07 신설] GK AI 후보의 시즌 클린시트 추정 — 팀 평균 대비
     소속팀 전력(team_avg-league_avg)과 GK 본인 OVR을 같이 반영한다.
@@ -10260,7 +10394,15 @@ def _get_cl_cup_season_stats(year):
 # 적용해 0.23으로 잠정 배치했다(아시아CL 0.26보다 낮고 북미CL 0.22보다
 # 높은 자리 — 확인 필요).
 _CLUB_COMP_WEIGHT = {
-    ("유럽", "cl"): 1.00, ("유럽", "el"): 0.72, ("유럽", "ecl"): 0.52,
+    # [2026-09 8차 재조정, 신민용 리포트: "유로파 위상이 너무 높은듯 —
+    # 유로파 우승으로 발롱도르 순위 안에 드는 건 맞지만 생각보다 위상이
+    # 높아진 것 같다"] 7차(품질 상한 _CLUB_COMP_QUALITY_CAP 도입)로
+    # "유로파 우승이 옛 챔스 우승급까지 치솟는" 문제는 잡았지만, 대회
+    # 자체의 위상값(comp_weight)은 그대로 0.72였다 — 유럽CL(1.00) 다음
+    # 위상 정의 가중치 자체를 0.72→0.62로 한 단계 낮춘다. 유럽ECL(0.52)
+    # 보다는 여전히 위, 남미CL(0.40)보다도 확실히 위라 "유럽CL>유럽EL>
+    # 유럽ECL>남미CL>..." 순서(신민용 확정 순위)는 그대로 유지된다.
+    ("유럽", "cl"): 1.00, ("유럽", "el"): 0.62, ("유럽", "ecl"): 0.52,
     ("남미", "cl"): 0.40, ("남미", "el"): 0.32, ("남미", "ecl"): 0.23,
     ("아시아", "cl"): 0.26, ("북미", "cl"): 0.22, ("아프리카", "cl"): 0.19,
     ("아시아", "el"): 0.15, ("북미", "el"): 0.13, ("아프리카", "el"): 0.11,
@@ -11714,7 +11856,16 @@ def _get_team_gc_per_match(year, team_id, cache=None):
 # 점수가 붙게 했다.
 _DEF_GC_BASELINE = 1.391     # 0점 시작선 (팀 실점/경기 P75)
 _DEF_GC_ELITE = 0.932        # 만점 도달선 (팀 실점/경기 P10) — 이보다 낮아도 더 안 오름
-_DEF_TEAM_SCORE_MAX = 9.5    # 팀 수비 성과 만점
+# [2026-09 재조정, 신민용 리포트: "수비수가 발롱도르 1등으로 너무 잘
+# 뽑히는듯 — 순위 안에 들 수는 있는데 생산성을 좀 더 낮춰야 할듯"]
+# CB/LB/RB 재설계(위 _DEF_GC_BASELINE 도입 코멘트 참고) 이후에도 최상위
+# 수비팀 소속 수비수는 개인 기여(G/A) 없이 팀 실점 억제만으로 9.5점
+# (+ga_bonus 최대 3.0)까지 나와, 실제 골/도움을 내야 점수가 쌓이는
+# 공격진 평균 생산성(ST 평균 3.48/LW 평균 3.97, 위 코멘트 실측치)보다도
+# 쉽게 앞섰다 — 팀 수비력만으로 확보되는 상한 자체를 낮춘다(9.5→7.5).
+# 참가도(_ROLE_PARTICIPATION)·G/A 소량 보너스 구조는 그대로 유지하고
+# 이 만점값 하나만 조정 — 더 낮춰야 하면 여기만 다시 건드리면 된다.
+_DEF_TEAM_SCORE_MAX = 7.5    # 팀 수비 성과 만점
 # G/A 보너스 — "0→0, 2→소폭, 4→조금 더, 8→확실히, 15→상당히"(신민용+GPT
 # 확정 형태)를 포화곡선(ga/(ga+K))으로 구현. CB G+A 6개가 과거처럼 15.0
 # 캡을 찍는 일이 없도록, 최댓값 자체를 낮게 잡는다.

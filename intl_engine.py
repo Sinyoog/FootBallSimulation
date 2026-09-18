@@ -2160,7 +2160,8 @@ def _build_intl_squad_by_group(country, quota_by_group=None):
     (적합도 0.45)가 RW 88(적합도 1.00) 자리를 차지하려면 기본 선발점수
     차이가 적합도 격차(0.55배)를 뒤집을 만큼 압도적이어야 한다(기본값은
     반대 — 핵심 포지션이 이긴다)."""
-    from constants import INTL_POSITION_GROUPS, INTL_GROUP_FIT, INTL_SQUAD_GROUP_QUOTA
+    from constants import (INTL_POSITION_GROUPS, INTL_GROUP_FIT, INTL_SQUAD_GROUP_QUOTA,
+                           INTL_POSITION_TO_GROUP)
     from database import get_country_nationals_for_positions, get_player_total_intl_appearances
 
     quota_by_group = quota_by_group or INTL_SQUAD_GROUP_QUOTA
@@ -2217,6 +2218,35 @@ def _build_intl_squad_by_group(country, quota_by_group=None):
         for _score, c in scored[:n]:
             picked.append(c)
             used_ids.add(c["id"])
+
+    # [2026-09 버그수정, 신민용 리포트: "국대는 무조건 26명 뽑는데 24명
+    # 뽑힌 곳도 있다"] 위 루프는 그룹별로 딱 quota_by_group[grp]명씩만
+    # 뽑고 끝난다 — 그 나라에 그 그룹 국적자가 목표 인원보다 적으면(예:
+    # CB 국적자가 5명 목표에 3명뿐인 소국) 그만큼 모자란 채로 그냥
+    # 넘어가고, 다른 그룹에 남는 후보가 있어도 그쪽으로 채워주지
+    # 않았다 — 그래서 총원이 26 밑(24명 등)으로 떨어지는 나라가 나왔다.
+    # 전체 목표(quota_by_group 합계)에 못 미치면, 포지션 그룹 구분 없이
+    # 아직 안 뽑힌 국적자 전원(포지션 무관, 모든 포지션)을 같은 선발
+    # 점수(intl_squad_selection_score)로 다시 채점해 부족한 만큼 상위
+    # 점수부터 채운다 — 이 시점엔 이미 그룹별 1순위 후보들이 소진된
+    # 뒤라 포지션 적합도 배율은 적용하지 않는다(포지션이 조금 겹치더라도
+    # 26명을 채우는 쪽이 우선). 그래도 그 나라 전체 국적자가 26명이 안
+    # 되면(극단적으로 작은 나라) 있는 만큼만 뽑힌다 — 그 경우는 정상.
+    target_total = sum(quota_by_group.values())
+    shortfall = target_total - len(picked)
+    if shortfall > 0:
+        all_positions = list(INTL_POSITION_TO_GROUP.keys())
+        backfill_pool = [c for c in get_country_nationals_for_positions(country, all_positions)
+                         if c["id"] not in used_ids]
+        if backfill_pool:
+            apps_by_id = get_player_total_intl_appearances([c["id"] for c in backfill_pool])
+            form_adj_by_id = _intl_form_adjustments(backfill_pool)
+            backfill_pool.sort(key=lambda c: -intl_squad_selection_score(
+                c["ovr"], c.get("club_tier"), form_adj_by_id.get(c["id"], 0.0),
+                apps_by_id.get(c["id"], 0)))
+            for c in backfill_pool[:shortfall]:
+                picked.append(c)
+                used_ids.add(c["id"])
     return picked
 
 
@@ -3506,15 +3536,31 @@ def _match_outcome(h_ovr, a_ovr, knockout, neutral=False):
     diff=0에서 정확히 hw==aw인 진짜 대칭 공식을 쓴다. 호출부는 그 대회의
     kind가 예선(wc_qual/cont_qual)이 아닐 때만 이 플래그를 켠다 — 월드컵
     예선처럼 실제 각국 홈/원정 2연전으로 치르는 대회는 그대로 편향을
-    유지한다(이번 요청 범위 밖)."""
+    유지한다(이번 요청 범위 밖).
+
+    [2026-09 재조정, 신민용 리포트: "96·97로 거의 도배된 국대가 89~91에
+    96·94 한둘 섞인 팀한테 월드컵에서 지기도 하던데 밸 잘못 잡은 거
+    아니냐"] he_ovr/a_ovr(intl_engine._nat_team_ovr → 실제 스쿼드가 있으면
+    database.get_country_avg_squad_ovr, 포지션당 상위 3명 평균의 포지션간
+    평균)로 두 팀을 계산해보면, "스타 한둘"은 그 포지션 하나의 top_n=3
+    평균에만 살짝 반영될 뿐 나머지 9개 포지션엔 전혀 영향을 못 줘서,
+    실제 diff는 보이는 인상(96~97 vs 89~91)보다 작게(대략 5~8점) 잡힌다.
+    그런데 이 diff*0.022 기울기로는 diff=6.5에서도 favorite 승률이 겨우
+    55%(언더독 27%)라 "거의 도배한" 팀이 4번에 1번꼴로 지는 셈이었다 —
+    diff=33처럼 이미 포화(0.95 클램프)되는 극단적 격차는 그대로 두고,
+    중간 격차(diff 5~15)에서만 훨씬 더 확실하게 강팀 쪽으로 쏠리도록
+    기울기를 0.022 → 0.0325로 올린다(diff=33은 0.0325로도 어차피 그대로
+    0.95 클램프라 기존 재조정 사례엔 영향 없음 — diff=6.5 기준 favorite
+    승률 약 55%→65%, 언더독 약 27%→18%로 변화)."""
     diff = h_ovr - a_ovr
+    _DIFF_COEF = 0.0325
     if neutral:
         dw = max(0.05, 0.24 - abs(diff) * 0.009)
         half = max(0.0, 1.0 - dw) / 2.0
-        hw = max(0.04, min(0.95, half + diff * 0.022))
-        aw = max(0.02, min(0.95, half - diff * 0.022))
+        hw = max(0.04, min(0.95, half + diff * _DIFF_COEF))
+        aw = max(0.02, min(0.95, half - diff * _DIFF_COEF))
     else:
-        hw = max(0.04, min(0.95, 0.46 + diff * 0.022))
+        hw = max(0.04, min(0.95, 0.46 + diff * _DIFF_COEF))
         dw = max(0.05, 0.24 - abs(diff) * 0.009)
         aw = max(0.02, 1.0 - hw - dw)
     tot = hw + dw + aw

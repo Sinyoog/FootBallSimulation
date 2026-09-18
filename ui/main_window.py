@@ -511,7 +511,13 @@ class MainWindow(QMainWindow):
             from database import flush_to_disk, wait_for_pending_flush, history_drain
             wait_for_pending_flush()
             history_drain()
-            flush_to_disk()
+            # [2026-09 신설, 신민용 리포트: "끌 때 데이터가 많으면 시간이
+            # 걸린다"] 여기 도달한 시점엔 위 wait_for_pending_flush()로
+            # 진행 중이던 자동저장까지 이미 다 끝났고, 앱이 닫히는 중이라
+            # 더 이상 게임 진행 스레드가 같은 DB를 건드리지 않는다 —
+            # final=True로 자동저장용 청크(sleep 누적) 백업을 건너뛰고
+            # 한 번에 저장한다(database.flush_to_disk 참고).
+            flush_to_disk(final=True)
         except Exception:
             pass
         event.accept()
