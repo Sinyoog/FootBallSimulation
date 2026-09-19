@@ -1245,7 +1245,7 @@ def simulate_my_cwc_match(week, p, day=None):
     else:
         _opp_ovr = (ae["ovr"] if is_home else he["ovr"])
         goals, assists, saves, rating, events, detail = _player_perf(
-            p, outcome, is_home, hs, as_, opp_ovr=_opp_ovr)
+            p, outcome, is_home, hs, as_, opp_ovr=_opp_ovr, is_big_match=True)
         _absence_reason = None
         _dismissed, _card_reason, _yellow_ev, _yellow_cnt = _roll_card_events(p, "cwc_suspension")
         if _dismissed:

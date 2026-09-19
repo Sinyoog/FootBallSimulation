@@ -55,6 +55,7 @@ from database import get_conn
 from constants import week_to_day, FIRST_HALF_START
 from competition.competition_common import (
     CompetitionConfig, entry, clear_entry_cache, winner_of,
+    league_day_map, pick_free_day,
 )
 
 DOMESTIC_SC_WEEK = FIRST_HALF_START   # 4주차 — 국내리그가 시작하는 그 주
@@ -460,31 +461,21 @@ def _get_domestic_sc_participants(year, country_id):
 # 일정 배정 — 4주차, 내 팀 기준으로 그 주 리그 경기일과 안 겹치게
 # ─────────────────────────────────────────────
 
-def _pick_dsc_day(my_tid, cur_season):
-    """super_cup_engine._pick_sc_days와 동일한 원리(그 주 내 리그
-    경기일과 하루 이내로는 안 겹치게) — 다만 이 대회는 하루짜리
-    단판이라 후보를 그 주 7일 전부 순서대로 시도하면 된다. 내 팀이
-    이 대회와 무관하면(my_tid=0) 조회할 필요가 없어 기본값(그 주
-    첫날)을 그대로 쓴다."""
+def _pick_dsc_day(team_ids, year, conn=None):
+    """그 주 리그 경기일과 하루 이내로는 안 겹치는 요일을 고른다.
+
+    [2026-09 버그수정, 신민용 확정: "컵 대회랑 리그 일정은 절대 겹치면
+    안돼"] 예전 시그니처는 _pick_dsc_day(my_tid, cur_season)이었고, 내
+    팀이 이 대회와 무관하면(my_tid=0) 조회 자체를 건너뛰고 그 주 첫날을
+    그대로 썼다 — 그 결과 211개 대회가 전부 같은 날에 몰렸고, 그중 23팀은
+    같은 날 리그 경기도 갖고 있었다(2005시즌 실측). 이제 참가 두 팀
+    모두를 기준으로 고른다. 후보가 전부 막히면 기존과 동일하게 그 주
+    첫날로 폴백한다(신민용 확정: 다음 주로 미루지 않는다)."""
     week_start = week_to_day(DOMESTIC_SC_WEEK)
-    if not my_tid:
-        return week_start
-    conn = get_conn()
-    rows = conn.execute(
-        """SELECT day FROM match_results WHERE week=? AND season=?
-           AND day IS NOT NULL AND (home_team_id=? OR away_team_id=?)""",
-        (DOMESTIC_SC_WEEK, cur_season, my_tid, my_tid)).fetchall()
-    conn.close()
-    dom_days = [r["day"] for r in rows if r["day"] is not None]
-
-    def _conflicts(cand):
-        return any(abs(cand - dd) <= 1 for dd in dom_days if dd is not None)
-
-    for offset in range(7):
-        cand = week_start + offset
-        if not _conflicts(cand):
-            return cand
-    return week_start   # 극히 드문 경우(모든 요일이 다 걸림) 기본값
+    _c = conn or get_conn()
+    day_map = league_day_map(_c, year, DOMESTIC_SC_WEEK, team_ids)
+    return pick_free_day(week_start, day_map, team_ids, week_start,
+                         offsets=tuple(range(7)))
 
 
 # ─────────────────────────────────────────────
@@ -514,7 +505,7 @@ def _build_domestic_sc(year, country_id):
     my_in = 1 if my_tid in (home_id, away_id) else 0
     st = get_state()
     cur_season = st["current_season"] if st else 1
-    day = _pick_dsc_day(my_tid if my_in else 0, cur_season)
+    day = _pick_dsc_day((home_id, away_id), year)
 
     conn = get_conn(); c = conn.cursor()
     c.execute("""INSERT INTO domestic_sc_tournaments
@@ -652,7 +643,7 @@ def start_all_domestic_super_cups(year, season):
                 continue
             name = _domestic_sc_name(cname)
             my_in = 1 if my_tid in (home_id, away_id) else 0
-            day = _pick_dsc_day(my_tid if my_in else 0, cur_season)
+            day = _pick_dsc_day((home_id, away_id), year, conn=c)
 
             c.execute("""INSERT INTO domestic_sc_tournaments
                             (year, country_id, name, status, home_team_id, away_team_id,
@@ -965,8 +956,10 @@ def simulate_my_domestic_sc_match(week, p, day=None):
         _yellow_cnt = 0
     else:
         _opp_ovr = (ae["ovr"] if is_home else he["ovr"])
+        # [2026-09 신설] 국내 슈퍼컵은 매 시즌 단판 결승 자체(round_name이
+        # 항상 '결승')라 챔스/국대와 동일하게 전 경기를 빅매치로 취급한다.
         goals, assists, saves, rating, events, detail = _player_perf(
-            p, outcome, is_home, hs, as_, opp_ovr=_opp_ovr)
+            p, outcome, is_home, hs, as_, opp_ovr=_opp_ovr, is_big_match=True)
         _absence_reason = None
         _dismissed, _card_reason, _yellow_ev, _yellow_cnt = _roll_card_events(
             p, "domestic_sc_suspension")

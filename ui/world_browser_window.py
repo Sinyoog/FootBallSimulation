@@ -343,7 +343,14 @@ _SQUAD_LABEL_POS_PROP = "wb_squad_pos"
 #   - 국가대표(A매치) 기록([국가대표 기록])은 cutoff_year 그 해 것 자체를
 #     통째로 제외한다(그 해 국제대회 — 월드컵 본선 포함 — 가 열리기
 #     "전" 시점을 보는 것이므로) — cutoff_year-1년까지만 포함한다.
-_YEAR_END_WORLD_AWARD_KINDS = ("발롱도르", "야신상", "FIFA 푸스카스상", "올해의 최고의 골")
+# [2026-09 확장] FIFA 올해의 선수·대륙별 올해의 선수도 같은 타이밍에
+# 확정된다 — game_engine._save_world_poty_awards가 _save_ballon_dor_top30
+# 안에서 발롱도르와 함께 저장하므로, cutoff_year 스냅샷에서 빠져야 하는
+# 조건이 발롱도르와 완전히 동일하다.
+_YEAR_END_WORLD_AWARD_KINDS = ("발롱도르", "야신상", "FIFA 푸스카스상", "올해의 최고의 골",
+                               "FIFA 올해의 선수", "UEFA 올해의 선수", "코메볼 올해의 선수",
+                               "AFC 올해의 선수", "CAF 올해의 선수", "콩카카프 올해의 선수",
+                               "OFC 올해의 선수")
 
 
 def _strip_year_end_world_awards(award_labels):
@@ -477,6 +484,161 @@ def _build_squad_roster_panel(starters, bench, on_click=None, height=460):
     scroll.setFrameShape(QFrame.Shape.NoFrame)
     scroll.setStyleSheet("QScrollArea{background:transparent;} QWidget{background:transparent;}")
     return scroll
+
+
+# [2026-09 신설, 신민용 요청: "팀 검색 -> 연도 -> 포메이션 우측 빈 공간에
+# 그 당시 구단에서 사용한 금액을 1열로, 1줄에 1칸씩 표시"] 금액 계산은
+# 전부 world_browser.get_team_season_finance가 하고(반기 매핑·집계 규칙은
+# 그 함수 주석 참고), 여기서는 그 결과를 그리기만 한다.
+_FIN_TABLE_STYLE = (
+    "QTableWidget{background:#1e1e1e;color:#ddd;gridline-color:#333;"
+    "border:1px solid #3a3a3a;border-radius:4px;font-size:12px;}"
+    "QTableWidget::item{padding:4px 6px;}"
+    "QHeaderView::section{background:#252525;color:#aaa;font-size:11px;"
+    "font-weight:bold;border:none;border-right:1px solid #3a3a3a;"
+    "border-bottom:1px solid #3a3a3a;padding:4px;}"
+)
+
+
+def _build_team_finance_panel(fin, mode, width=260, on_click=None):
+    """재정 패널 — 신민용 요청대로 "그리드 형태의 테이블"(QTableWidget).
+    3컬럼: 항목 | 금액 | 건수.
+      - 합계 줄: [총 영입][3286.46억][9건]
+      - 선수 줄: [최고 영입][663.00억][  ] 다음에 선수 이름이 한 줄을
+        통째로 쓰는 행(setSpan으로 3컬럼 병합)이 이어진다.
+    """
+    # [2026-09 수정, 신민용 리포트: "좌측에서 이름 변경할 때 우측에 있는
+    # 구단 사용 금액도 표시 변하게 해줘"] 예전엔 모듈 레벨 dict에 이름을
+    # 캐시했는데, 일괄변경으로 이름이 "제거"되면 update()로는 그 항목이
+    # 안 지워져 옛 이름이 계속 남았다. 대표 선수 6명분뿐이라 캐시할 이유가
+    # 없어서 매번 새로 조회한다 — 이름 변경 후 위젯을 다시 그리면 항상
+    # 최신 이름이 나온다.
+    _ids = []
+    for _n in wb.FINANCE_ROW_ORDER:
+        _r = (fin.get(_n) or {}).get("row")
+        if _r and not _r.get("is_me") and _r.get("player_id") != wb.MY_PLAYER_ID:
+            _p = _r.get("player_id")
+            if isinstance(_p, int) and _p >= 0:
+                _ids.append(_p)
+    try:
+        _names = get_ai_player_custom_names(_ids) if _ids else {}
+    except Exception:
+        _names = {}
+    # [2026-09 버그수정, 신민용 리포트: "플레이어는 구단 사용 금액에서
+    # 이름이 떠야 하는데 AI0000 이렇게 뜬다"] my_player는 ai_player_code로
+    # 만들면 안 되고 실제 이름을 써야 한다 — 포메이션/명단(world_browser.
+    # get_team_season_lineup의 my_name)과 같은 출처를 그대로 쓴다.
+    _my_name = "나"
+    try:
+        _mr = get_conn().execute(
+            "SELECT name FROM my_player WHERE id=1").fetchone()
+        if _mr and _mr["name"]:
+            _my_name = _mr["name"]
+    except Exception:
+        pass
+
+    box = QFrame()
+    box.setFixedWidth(width)
+    box.setStyleSheet("background:transparent;border:none;")
+    lay = QVBoxLayout(box)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(4)
+
+    _mode_word = {"first": "상반기", "second": "하반기", "both": "전체"}.get(mode, "")
+    head = QLabel(f"💰 구단 사용 금액 ({_mode_word})")
+    head.setStyleSheet("color:#ffc14d;font-size:12px;font-weight:bold;")
+    lay.addWidget(head)
+
+    # 행 수 = 합계줄 + (선수줄 x 2: 금액행 + 이름행)
+    rows = []
+    _row_meta = {}      # 표의 행 번호 -> (player_id, 그 당시 포지션)
+    for name in wb.FINANCE_ROW_ORDER:
+        cell = fin.get(name) or {}
+        if "value" in cell:
+            rows.append(("agg", name,
+                         wb.format_finance_money(cell["value"]),
+                         (f"{cell['n']}건" if cell.get("n") is not None else "")))
+        else:
+            row = cell.get("row")
+            if not row:
+                rows.append(("agg", name, "-", ""))
+                rows.append(("name", "기록 없음", "", ""))
+            else:
+                rows.append(("agg", name,
+                             wb.format_finance_money(row.get(cell.get("key") or "fee")), ""))
+                _pid = row.get("player_id")
+                if row.get("is_me") or _pid == wb.MY_PLAYER_ID:
+                    _who = _my_name
+                else:
+                    _who = _names.get(_pid) or ai_player_code(_pid)
+                _row_meta[len(rows)] = (_pid, row.get("player_position") or "")
+                rows.append(("name", _who, "", ""))
+
+    tbl = QTableWidget(len(rows), 3)
+    tbl.setStyleSheet(_FIN_TABLE_STYLE)
+    tbl.setHorizontalHeaderLabels(["항목", "금액", "건수"])
+    tbl.verticalHeader().setVisible(False)
+    tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+    tbl.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+    tbl.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+    tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+    tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+    tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+
+    for r, (kind, c0, c1, c2) in enumerate(rows):
+        if kind == "name":
+            # 선수 이름은 한 줄을 통째로 쓴다(3컬럼 병합).
+            tbl.setSpan(r, 0, 1, 3)
+            it = QTableWidgetItem(c0)
+            it.setForeground(QColor("#7fb2e5") if c0 != "기록 없음" else QColor("#666"))
+            f = it.font(); f.setPointSize(9); it.setFont(f)
+            it.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            tbl.setItem(r, 0, it)
+            tbl.setRowHeight(r, 18)
+            continue
+        a = QTableWidgetItem(c0)
+        a.setForeground(QColor("#9a9a9a"))
+        tbl.setItem(r, 0, a)
+        b = QTableWidgetItem(c1)
+        b.setForeground(QColor("#e8e8e8"))
+        bf = b.font(); bf.setBold(True); b.setFont(bf)
+        b.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        tbl.setItem(r, 1, b)
+        cc = QTableWidgetItem(c2)
+        cc.setForeground(QColor("#777"))
+        cc.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        tbl.setItem(r, 2, cc)
+        tbl.setRowHeight(r, 24)
+
+    # [2026-09 신설, 신민용 요청: "우측 구단 사용 금액 창에서 선수들 클릭도
+    # 좌측 포메이션처럼 가능하며, 간단 변경이 되어있을 때는 변경 창이 뜨고
+    # 바로 이동이 되어있으면 선수 검색으로 이동"] 피치/명단과 완전히 같은
+    # 단일 진입점(_on_player_click)을 그대로 쓴다 — 토글 분기는 그쪽이
+    # 이미 하고 있으므로 여기서 다시 판단하지 않는다. ctx_position에는
+    # 그 당시 포지션(이적 로그의 player_position / 스냅샷의 slot)을 넘겨
+    # 간단 변경 창이 포메이션에서 눌렀을 때와 같은 값을 보여주게 한다.
+    if on_click is not None and _row_meta:
+        for _r in _row_meta:
+            for _c in range(3):
+                _it = tbl.item(_r, _c)
+                if _it is not None:
+                    _it.setToolTip("클릭: 선수 보기")
+        tbl.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        def _on_cell(r, _c, _meta=_row_meta, _cb=on_click):
+            hit = _meta.get(r)
+            if hit and hit[0] is not None:
+                _cb(hit[0], hit[1] or None)
+        tbl.cellClicked.connect(_on_cell)
+
+    _h = tbl.horizontalHeader().height() + sum(
+        tbl.rowHeight(r) for r in range(tbl.rowCount())) + 4
+    tbl.setFixedHeight(_h)
+    tbl.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    lay.addWidget(tbl)
+    lay.addStretch(1)
+    return box
 
 
 def _attach_label_copy(label, clean_text):
@@ -2467,7 +2629,12 @@ class WorldBrowserWindow(QDialog):
     # 검색과 같은 값을 그대로 재사용하고, 선수 고유 항목(포지션/국적/OVR)만
     # 새로 정의한다.
     _POS_COL_W = 46
-    _NAT_COL_W = 110
+    # [2026-09 축소, 신민용 요청: "앞에 🇦🇷 이런거 줄어든 만큼 좌측
+    # 공간을 좀 줄여서 우측을 더 활용할 수 있게 해줘"] 국기 이모지
+    # (+뒤 공백)가 빠지면서 이 칸에 필요한 폭이 그만큼 줄었다 —
+    # 110 → 88. 좌측 패널 폭(아래 _player_split setSizes)도 같은 22px
+    # 만큼 줄여 우측 상세 박스에 넘긴다.
+    _NAT_COL_W = 88
     # [2026-09 버그수정, 신민용 리포트: "년도별 OVR 표시 칸 크기를 100까지
     # 들어갈 수 있게"] calc_ovr의 상한(database.calc_ovr cap=100)이 실제로
     # 100이라 3자리("100")까지 나올 수 있는데, 44px는 2자리("99") 기준
@@ -2494,7 +2661,28 @@ class WorldBrowserWindow(QDialog):
     # 클럽 월드컵/국내슈퍼컵처럼 대부분 "-"만 뜨는(드물게만 값이 있는)
     # 칸 — 위 _CL_COL_W_WIDE로 넓힌 만큼을 여기서 좁혀 표 전체 폭은
     # 거의 그대로 유지한다.
-    _RARE_COMP_COL_W = 85
+    # [2026-09 재조정, 신민용 리포트: "FA 커뮤니티에서 우승인지 준우승인지
+    # 이런게 안 뜨잖아"] 위 _CL_COL_W_WIDE(7번)를 넓히려고 9·10번에서
+    # 폭을 빼왔던 게(105 → 85) 이번엔 9·10번의 "[우승]" 줄을 밀어냈다 —
+    # 칸끼리 폭을 주고받는 제로섬이라 한 칸을 살리면 다른 칸이 죽는다.
+    # 이제 다른 칸에서 빼오지 않고 표 전체 폭을 늘린다(가로 스크롤이
+    # 이미 AsNeeded라 좁은 화면에서는 잘리는 대신 옆으로 밀린다).
+    #
+    # 칸마다 들어갈 최장 문자열이 달라서 폭도 따로 잡는다(실측: 7시즌
+    # 월드 전수):
+    #   9번 클럽월드컵  대회명 1종, "클럽 월드컵 [우승]" 11자
+    #   10번 국내슈퍼컵 대회명 210종, 최장 "수페르타사 칸디두 드
+    #                  올리베이라 [우승]" 22자 — 한 줄에 담으려면
+    #                  270px 넘게 필요해 애초에 불가능하다. 2~3줄로
+    #                  감기되 [우승]이 안 잘리는 게 목표이고, 그건
+    #                  아래 _resize_self_sizing_table의 높이 계산이
+    #                  맡는다(폭은 줄 수를 줄여줄 뿐).
+    _RARE_COMP_COL_W = 100
+    # 8번 슈퍼컵 — 대회명 5종, 최장 "콩카카프 그랜드 슈퍼컵 [우승]" 17자.
+    # 기본폭 105로는 이름만 2줄을 다 써서 [우승]이 밀려났다.
+    _SC_COL_W = 140
+    # 10번 국내슈퍼컵 — 위 설명대로 종류가 가장 많고 이름도 가장 길다.
+    _DSC_COL_W = 150
 
     def _league_row_widget(self, lg):
         """리그 목록 한 줄 — 왼쪽부터 [리그명(고정폭)] [등급] [국가] [부수]
@@ -3373,7 +3561,7 @@ class WorldBrowserWindow(QDialog):
             lay.addWidget(rec_lbl)
         return w
 
-    def _awards_summary_cell(self, awards):
+    def _awards_summary_cell(self, awards, groups=None):
         """[2026-09 버그수정, 신민용 리포트: "선수 검색 이후 년도 클릭하면
         아래에 상들 뜨잖아 근데 발롱도르는 빨간색 글자로 뜨며 맨 앞에
         뜨게 해줘"] 연도 상세의 "🏆 상" 요약 줄 전용 셀. get_player_
@@ -3396,9 +3584,27 @@ class WorldBrowserWindow(QDialog):
         # [2026-09 수정, 신민용 요청] 발롱도르(빨강)에 더해 야신상(#00A86B)·
         # 푸스카스상(#2196F3)도 순위권 라벨을 각 색으로 — 색 판정은
         # world_browser.award_label_color(색 상수 단일 소스)에 맡긴다.
-        for a in awards:
-            _color = wb.award_label_color(a, "#ffd700")
-            _parts.append(f'<span style="color:{_color};">{_html.escape(a)}</span>')
+        #
+        # [2026-09 확장, 신민용 리포트: "상 적힌 창이 너무 길어"] groups가
+        # 오면 대회명을 한 번만 쓰고 그 대회 상들을 이어붙인다 — 예전엔
+        # "프리미어리그 MVP · 프리미어리그 영플레이어 · 프리미어리그
+        # 베스트11 (RW)"처럼 대회명이 그대로 반복됐다. 대회명은 조금 흐린
+        # 색(#c9a227)으로 둬서 상 이름(금색)과 시각적으로 구분한다.
+        # groups가 없으면(하위호환) 예전처럼 평면으로 렌더한다.
+        if groups:
+            for prefix, kinds in groups:
+                _inner = " · ".join(
+                    f'<span style="color:{wb.award_label_color(k, "#ffd700")};">'
+                    f'{_html.escape(k)}</span>' for k in kinds)
+                if prefix:
+                    _parts.append(
+                        f'<span style="color:#c9a227;">{_html.escape(prefix)} </span>{_inner}')
+                else:
+                    _parts.append(_inner)
+        else:
+            for a in awards:
+                _color = wb.award_label_color(a, "#ffd700")
+                _parts.append(f'<span style="color:{_color};">{_html.escape(a)}</span>')
         _sep = '<span style="color:#ffd700;"> · </span>'
         _rich = '<span style="color:#ffd700;">🏆 </span>' + _sep.join(_parts)
         main_lbl.setStyleSheet("font-weight:bold;font-size:12px;")
@@ -3588,7 +3794,11 @@ class WorldBrowserWindow(QDialog):
             empty = QTableWidgetItem("기록 없음")
             empty.setForeground(QColor("#666"))
             tbl.setItem(0, 0, empty)
-            tbl.setSpan(0, 0, 1, 7)
+            # [2026-09 버그수정] team_detail_tbl은 8컬럼인데 7만 덮고 있어서
+            # "기록 없음" 행의 마지막 칸(국내슈퍼컵)이 빈 채로 남았다 —
+            # 연도 상세 스팬(setSpan(detail_row,0,1,8))과 같은 원인이다.
+            # (바로 아래 player_intl_tbl 쪽 7은 그 표가 실제로 7컬럼이라 정상)
+            tbl.setSpan(0, 0, 1, 8)
             return
         self.team_copy_btn.setEnabled(True)
 
@@ -3698,7 +3908,12 @@ class WorldBrowserWindow(QDialog):
             # 라서 이 표의 연도(entry["year"]=실제 뛴 시즌)와 다르다 —
             # 발표 시점 기준으로 보이는 게 자연스러우므로 evaluation_year+1로
             # 조회한다.
-            rp = rank_by_year.get(entry["year"] + 1)
+            # [2026-09 신설] entry["is_preview"](get_team_history가 만든,
+            # 아직 시작만 한 진행 중인 올해 미리보기 행)는 이 해 자체가
+            # 안 끝나 "그 해 성적 발표"가 없다 — 대신 "이 해로 들어서는
+            # 시점(=작년 성적이 막 발표된 시점)"의 순위를 보여줘야 하므로
+            # +1 오프셋 없이 entry["year"] 그 값 그대로 조회한다.
+            rp = rank_by_year.get(entry["year"] if entry.get("is_preview") else entry["year"] + 1)
             if rp:
                 # [2026-09 수정, 신민용 요청: "전체 순위: 123"이 아니라
                 # "전체: 123"처럼 '순위' 글자를 빼고 라벨만 짧게 표시,
@@ -3866,18 +4081,27 @@ class WorldBrowserWindow(QDialog):
 
         detail_row = target_row + 1
         tbl.insertRow(detail_row)
-        tbl.setSpan(detail_row, 0, 1, 7)
+        # [2026-09 수정, 신민용 리포트: "보면 옆에 칸이 더 있잖아 —
+        # 국내슈퍼컵 아래 저기에 표시하는거야"] 이 표는 8컬럼인데
+        # (연도/순위/리그/국내컵/클럽대항전/슈퍼컵/클럽월드컵/국내슈퍼컵)
+        # 스팬이 7이라 마지막 "국내슈퍼컵" 컬럼만큼이 카드 밖에 남아
+        # 그대로 빈 공간이 됐다 — 8번째 컬럼이 추가될 때 같이 안 늘어난
+        # 값이다. 8로 맞춰 카드가 행 전체를 덮게 하고, 그렇게 생긴
+        # 오른쪽 공간에 재정 패널이 들어간다.
+        tbl.setSpan(detail_row, 0, 1, 8)
         tbl.setCellWidget(detail_row, 0, widget)
         tbl.resizeRowToContents(detail_row)
         h = widget.sizeHint().height()
         if h > tbl.rowHeight(detail_row):
             tbl.setRowHeight(detail_row, h + 8)
-        self._team_expanded = {"year": year, "detail_row": detail_row, "half": False}
+        self._team_expanded = {"year": year, "detail_row": detail_row,
+                                "half": False, "fin_mode": None}
         year_item = tbl.item(target_row, 0)
         if year_item:
             tbl.scrollToItem(year_item)
 
-    def _build_team_year_lineup_widget(self, tid, year, header_title, half=False):
+    def _build_team_year_lineup_widget(self, tid, year, header_title, half=False,
+                                        fin_mode=None):
         """[2026-08 신설] wb.get_team_season_lineup()이 돌려주는 그 해
         슬롯별 선수(이름만, 신민용 요청대로 OVR 없음)를 국가 검색 스쿼드
         카드(_build_country_squad_detail_widget)와 같은 스타일로 그린다.
@@ -3904,10 +4128,22 @@ class WorldBrowserWindow(QDialog):
         starters/bench를 그대로 참조하므로 자동으로 "지금 보고 있는
         반기" 기준으로 복사된다."""
         data = wb.get_team_season_lineup(tid, year, half=half)
+        # [2026-09 신설] 우측 재정 패널 — fin_mode가 None이면 지금 보고 있는
+        # 반기를 그대로 따라간다(신민용: "상반기 포메이션이 뜨면 우측에
+        # 상반기 관련 정보들이 뜨는거지"). "총합" 버튼만 both로 바꾼다.
+        _fin_avail = wb.finance_availability(get_conn(), year)
+        _fin_mode = fin_mode or ("first" if half else "second")
+        if not _fin_avail.get(_fin_mode):
+            # 아직 진행되지 않은 반기(예: 2001년 3주차의 하반기)는 안 띄운다.
+            _fin_mode = None
+        _fin = (wb.get_team_season_finance(tid, year, _fin_mode)
+                if _fin_mode else None)
         box = QFrame()
         box.setStyleSheet(
             "background:#262626;border:1px solid #3a3a3a;border-left:3px solid #4da6ff;"
             "border-radius:6px;")
+        # [2026-09] 셀 폭을 꽉 채워야 오른쪽 끝 재정 패널이 제자리에 간다.
+        box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         lay = QVBoxLayout(box)
         lay.setContentsMargins(16, 12, 16, 14)
         lay.setSpacing(10)
@@ -4014,19 +4250,66 @@ class WorldBrowserWindow(QDialog):
         lay.addLayout(header_row)
 
         if not starters:
-            _half_word = "상반기" if half else "하반기"
-            empty = QLabel(
-                f"이 연도의 {_half_word} 포메이션 기록이 없습니다 — 이 기능이 생기기 전 과거 시즌은 소급 조회가 안 됩니다.")
+            # [2026-09 신설, 신민용 리포트: "막 시작한 해엔 선수가 하나도
+            # 없다"] world_browser.get_team_season_lineup이 진행 중인 올해는
+            # 이제 라이브 로스터로 즉석 구성해 돌려주므로(live=True), 그런데도
+            # starters가 비었다면 "스냅샷이 아직 없어서"가 아니라 "지금 이
+            # 팀에 등록된 선수 자체가 없어서"인 경우다 — 과거 시즌(라이브
+            # 아님)의 진짜 "기록 없음"과는 다른 안내를 보여준다.
+            if data.get("live"):
+                empty = QLabel("아직 이 팀에 등록된 선수가 없습니다.")
+            else:
+                _half_word = "상반기" if half else "하반기"
+                empty = QLabel(
+                    f"이 연도의 {_half_word} 포메이션 기록이 없습니다 — 이 기능이 생기기 전 과거 시즌은 소급 조회가 안 됩니다.")
             empty.setStyleSheet("color:#666;font-size:11px;")
             empty.setWordWrap(True)
             lay.addWidget(empty)
             return box
 
+        # [2026-09 신설] live=True(시즌이 아직 스냅샷 시점에 도달하지 못해
+        # "지금 이 순간"의 실제 로스터로 즉석 구성한 경우) — 포메이션 확정
+        # 기록이 아니라 진행 중인 시즌의 미리보기임을 분명히 알려준다.
+        if data.get("live"):
+            live_note = QLabel("ℹ️ 이 시즌은 아직 진행 전/초반이라 확정 기록 대신 현재 로스터 기준으로 보여줍니다.")
+            live_note.setStyleSheet("color:#4da6ff;font-size:11px;")
+            live_note.setWordWrap(True)
+            lay.addWidget(live_note)
+
         formation = data.get("formation") or "4-4-2"
+        # [2026-09 수정, 신민용 요청: "총합 버튼은 구단 사용 금액 위에
+        # 크게 만들고 싶어 — 위치는 포메이션 표시하는 줄 우측 끝이야"]
+        # 포메이션 라벨 줄을 가로 행으로 바꿔 왼쪽엔 라벨, 오른쪽 끝엔
+        # 총합 버튼을 둔다(그 아래 우측에 오는 재정 패널 바로 위가 된다).
+        _form_row = QHBoxLayout()
+        _form_row.setContentsMargins(0, 0, 0, 0)
         if data.get("formation"):
             flabel = QLabel(f"포메이션: {data['formation']}")
             flabel.setStyleSheet("color:#888;font-size:11px;")
-            lay.addWidget(flabel)
+            _form_row.addWidget(flabel)
+        _form_row.addStretch(1)
+        # 총합은 그 해가 끝나야 성립하므로(상반기+하반기 전체) 진행 중인
+        # 연도에서는 버튼 자체를 만들지 않는다.
+        if _fin_avail.get("both"):
+            _total_btn = QPushButton("📊 총합")
+            _total_btn.setMinimumHeight(32)
+            _total_btn.setMinimumWidth(110)
+            _total_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            _total_btn.setStyleSheet(
+                ("QPushButton{background:#ffc14d;color:#1a1a1a;border:none;"
+                 "border-radius:5px;padding:5px 16px;font-size:13px;"
+                 "font-weight:bold;}")
+                if _fin_mode == "both" else
+                ("QPushButton{background:#333;color:#ffc14d;"
+                 "border:1px solid #ffc14d;border-radius:5px;padding:5px 16px;"
+                 "font-size:13px;font-weight:bold;}"
+                 "QPushButton:hover{background:#3d3d3d;}"))
+            _total_btn.clicked.connect(
+                lambda: self._switch_team_finance_mode(
+                    tid, year, header_title,
+                    None if _fin_mode == "both" else "both"))
+            _form_row.addWidget(_total_btn)
+        lay.addLayout(_form_row)
 
         slot_players = [(s.get("slot") or "", s.get("display_name"), s.get("id"),
                          s.get("is_foreign", False)) for s in starters]
@@ -4044,6 +4327,14 @@ class WorldBrowserWindow(QDialog):
         _real_starters = [s for s in starters if s.get("id") is not None]
         roster = _build_squad_roster_panel(_real_starters, bench, on_click=self._on_player_click)
         content_row.addWidget(roster, 1)
+        # [2026-09 신설] 피치(좌)/명단(중) 오른쪽 끝(표의 마지막 컬럼
+        # "국내슈퍼컵" 아래)에 재정 패널을 붙인다. 명단이 stretch=1로
+        # 남는 폭을 먹으므로 패널은 자연히 오른쪽 끝에 정렬된다.
+        if _fin:
+            content_row.addWidget(
+                _build_team_finance_panel(_fin, _fin_mode,
+                                           on_click=self._on_player_click),
+                0, Qt.AlignmentFlag.AlignTop)
         lay.addLayout(content_row)
         return box
 
@@ -4098,13 +4389,41 @@ class WorldBrowserWindow(QDialog):
         detail_row = exp.get("detail_row")
         if detail_row is None or not (0 <= detail_row < tbl.rowCount()):
             return
-        new_widget = self._build_team_year_lineup_widget(tid, year, header_title, half=half)
+        # [2026-09] 반기를 바꾸면 재정 패널도 그 반기를 따라가야 하므로
+        # "총합" 고정을 푼다(fin_mode=None → 지금 보는 반기를 따름).
+        new_widget = self._build_team_year_lineup_widget(
+            tid, year, header_title, half=half, fin_mode=None)
         tbl.setCellWidget(detail_row, 0, new_widget)
         tbl.resizeRowToContents(detail_row)
         h = new_widget.sizeHint().height()
         if h > tbl.rowHeight(detail_row):
             tbl.setRowHeight(detail_row, h + 8)
         exp["half"] = bool(half)
+        exp["fin_mode"] = None
+
+    def _switch_team_finance_mode(self, tid, year, header_title, fin_mode):
+        """[2026-09 신설, 신민용 요청: "맨 위에 총합 버튼"] 우측 재정
+        패널만 상반기/하반기 -> 총합으로 바꾼다. 포메이션은 "상반기"나
+        "하반기" 둘 중 하나일 수밖에 없어서(합쳐진 포메이션이라는 건
+        없다) 총합은 금액 패널에만 적용된다 — 같은 버튼을 다시 누르면
+        fin_mode=None으로 돌아가 지금 보고 있는 반기를 다시 따른다.
+        위젯 교체 방식은 _switch_team_lineup_half와 완전히 동일하다."""
+        exp = getattr(self, "_team_expanded", None)
+        if not exp or exp.get("year") != year:
+            return
+        tbl = self.team_detail_tbl
+        detail_row = exp.get("detail_row")
+        if detail_row is None or not (0 <= detail_row < tbl.rowCount()):
+            return
+        new_widget = self._build_team_year_lineup_widget(
+            tid, year, header_title, half=bool(exp.get("half")),
+            fin_mode=fin_mode)
+        tbl.setCellWidget(detail_row, 0, new_widget)
+        tbl.resizeRowToContents(detail_row)
+        h = new_widget.sizeHint().height()
+        if h > tbl.rowHeight(detail_row):
+            tbl.setRowHeight(detail_row, h + 8)
+        exp["fin_mode"] = fin_mode
 
     def _open_world_browser_from_team_lineup(self, starters, row):
         """[2026-08 신설] 팀 검색의 그 해 포메이션 표에서 이름을 클릭하면
@@ -4284,7 +4603,12 @@ class WorldBrowserWindow(QDialog):
         lines = [f"[{name} 선수 기록]"]
 
         # ── 기본 정보 한 줄 (player_detail_tbl 맨 위 요약 행과 동일 로직) ──
-        nat_text = f"{d.get('nat_flag') or ''} {d.get('nationality') or ''}".strip() or "국적 미상"
+        # [2026-09 수정, 신민용 요청: "국적이 🇦🇷 아르헨티나 이런식으로
+        # 뜨는데 아르헨티나 이렇게 글자만 뜨게 해줘"] 국기 이모지를 뺀다
+        # — "역대 개인상" 표가 이미 같은 이유로 nat_flag 대신 nationality만
+        # 쓰고 있어(아래 국적 칸 주석 참고) 화면 간 표기도 이걸로 통일된다.
+        # 이모지가 빠진 만큼 좌측 국적 칸(_NAT_COL_W)도 같이 좁혔다.
+        nat_text = (d.get('nationality') or '').strip() or "국적 미상"
         if d.get("is_retired"):
             team_text = f"은퇴함 ({d.get('retirement_year', '-')}년 은퇴, 당시 {d.get('age', '-')}세)"
             if d.get("last_team_name"):
@@ -5141,8 +5465,9 @@ class WorldBrowserWindow(QDialog):
         # 1줄 = 여전히 3줄, 클리핑 없음), 9·10은 좁혀서 그만큼을 댄다
         # (표 전체 폭은 거의 그대로 유지).
         self.player_team_award_tbl.setColumnWidth(7, self._CL_COL_W_WIDE)
+        self.player_team_award_tbl.setColumnWidth(8, self._SC_COL_W)
         self.player_team_award_tbl.setColumnWidth(9, self._RARE_COMP_COL_W)
-        self.player_team_award_tbl.setColumnWidth(10, self._RARE_COMP_COL_W)
+        self.player_team_award_tbl.setColumnWidth(10, self._DSC_COL_W)
         scroll_lay.addWidget(self.player_team_award_tbl)
         self.player_team_tbl = self._make_self_sizing_table(11, no_scroll=True)
         self.player_team_tbl.setHorizontalHeaderLabels(
@@ -5170,8 +5495,9 @@ class WorldBrowserWindow(QDialog):
         # sectionResized 연결이 이 값을 award_tbl에도 그대로 전파하지만,
         # 다른 고정폭 칸(1~4)처럼 이 표에도 명시적으로 같이 맞춰둔다.
         self.player_team_tbl.setColumnWidth(7, self._CL_COL_W_WIDE)
+        self.player_team_tbl.setColumnWidth(8, self._SC_COL_W)
         self.player_team_tbl.setColumnWidth(9, self._RARE_COMP_COL_W)
-        self.player_team_tbl.setColumnWidth(10, self._RARE_COMP_COL_W)
+        self.player_team_tbl.setColumnWidth(10, self._DSC_COL_W)
         # [2026-08 버그수정] 창 크기 변화 등으로 Stretch 폭이 다시 계산될
         # 때 두 표가 계속 같은 값으로 맞춰지도록, team_detail_tbl/
         # team_award_tbl 쌍과 동일하게 sectionResized를 따라가게 연결
@@ -5258,11 +5584,15 @@ class WorldBrowserWindow(QDialog):
         scroll_lay.addWidget(future_note)
         scroll_lay.addStretch(1)
 
+        # [2026-09 조정, 신민용 요청: "저 창을 넓혀달라"] 국기 이모지가
+        # 빠지며 좁아진 국적 칸(_NAT_COL_W 110→88, -22)만큼 좌측을 줄이고
+        # 그만큼 우측 상세 박스에 넘긴다 — 우측 표는 대회 칸이 늘어나
+        # 폭이 더 필요해졌다(위 _SC_COL_W / _DSC_COL_W 주석 참고).
         scroll.setWidget(scroll_body)
         right_lay.addWidget(scroll, 1)
 
         split.addWidget(right)
-        split.setSizes([440, 900])
+        split.setSizes([418, 922])
         split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 1)
         lay.addWidget(split, 1)
@@ -5324,7 +5654,34 @@ class WorldBrowserWindow(QDialog):
             tbl.resizeRowsToContents()
             total = tbl.horizontalHeader().height() + 2
             for r in range(tbl.rowCount()):
-                tbl.setRowHeight(r, tbl.rowHeight(r) + _PAD)
+                # [2026-09 버그수정, 신민용 리포트: "FA 커뮤니티에서 우승인지
+                # 준우승인지 이런게 안 뜬다"] resizeRowsToContents는
+                # QTableWidgetItem 델리게이트의 sizeHint만 본다 —
+                # setCellWidget으로 박아넣은 위젯은 계산에 안 들어간다
+                # (같은 Qt 한계를 컬럼 폭 쪽에서 겪은 기록이 위
+                # team_detail_tbl 1번 컬럼 주석에 있다). 대회 칸 6개
+                # (5~10)가 전부 _two_line_cell(setCellWidget)이라,
+                # 대회명이 길어 WordWrap으로 3줄이 되면 행 높이는 1줄
+                # 기준 그대로 잡히고 "[우승]"이 붙은 마지막 줄이 통째로
+                # 잘려 나갔다 — 폭을 넓혀 줄 수를 줄이는 건 증상 회피일
+                # 뿐이고(국내슈퍼컵은 이름이 210종·최장 22자라 폭으로는
+                # 해결 불가), 여기서 위젯 높이를 직접 재는 게 근본 수정이다.
+                # QVBoxLayout+WordWrap QLabel은 heightForWidth를 지원하므로
+                # 그 칸의 실제 폭을 넣어 필요한 높이를 얻고, 지원 안 하면
+                # sizeHint로 떨어진다.
+                _h = tbl.rowHeight(r)
+                for _c in range(tbl.columnCount()):
+                    _cw = tbl.cellWidget(r, _c)
+                    if _cw is None:
+                        continue
+                    _lay = _cw.layout()
+                    if _lay is not None and _lay.hasHeightForWidth():
+                        _need = _lay.heightForWidth(tbl.columnWidth(_c))
+                    else:
+                        _need = _cw.sizeHint().height()
+                    if _need > _h:
+                        _h = _need
+                tbl.setRowHeight(r, _h + _PAD)
                 total += tbl.rowHeight(r)
             tbl.setFixedHeight(max(total, tbl.horizontalHeader().height() + 24))
 
@@ -5807,7 +6164,8 @@ class WorldBrowserWindow(QDialog):
         # 이상 표시하지 않고, 포메이션/이적 로그와 완전히 같은 규칙
         # (constants.ai_player_code)으로 만든 코드를 그대로 쓴다 — 같은
         # 선수는 화면이 달라도 항상 같은 코드로 보인다.
-        nat_text = f"{pl.get('nat_flag') or ''} {pl.get('nationality') or ''}".strip()
+        # [2026-09 수정, 신민용 요청] 국기 이모지 제거 — 위 상세 헤더와 동일.
+        nat_text = (pl.get('nationality') or '').strip()
         # [2026-08 신설, 신민용 요청: "은퇴한 선수도 검색할 수 있어야 해"]
         # 은퇴 선수는 소속팀/등급이 전부 None이라 "None급"/"None · None"처럼
         # 깨져 보이지 않게 별도로 처리 — 목록에서부터 "은퇴"로 바로 티나게.
@@ -6124,7 +6482,12 @@ class WorldBrowserWindow(QDialog):
         우클릭 "복사"로 복사된다(_enable_plain_copy, 이 파일 상단 참고).
         소속팀 파워랭킹은 표시하지 않는다(신민용 요청으로 제외)."""
         tbl = self.player_detail_tbl
-        nat_text = f"{d.get('nat_flag') or ''} {d.get('nationality') or ''}".strip() or "국적 미상"
+        # [2026-09 수정, 신민용 요청: "국적이 🇦🇷 아르헨티나 이런식으로
+        # 뜨는데 아르헨티나 이렇게 글자만 뜨게 해줘"] 국기 이모지를 뺀다
+        # — "역대 개인상" 표가 이미 같은 이유로 nat_flag 대신 nationality만
+        # 쓰고 있어(아래 국적 칸 주석 참고) 화면 간 표기도 이걸로 통일된다.
+        # 이모지가 빠진 만큼 좌측 국적 칸(_NAT_COL_W)도 같이 좁혔다.
+        nat_text = (d.get('nationality') or '').strip() or "국적 미상"
         if d.get("is_retired"):
             # [2026-08 신설, 신민용 요청: "은퇴하면 소속팀에 '은퇴했습니다'
             # 라고 뜨고 이때 나이가 몇살인지 써줘"] — 이 상단 요약줄에서는
@@ -6485,6 +6848,11 @@ class WorldBrowserWindow(QDialog):
         # 우선순위로"] 상 목록과 그 해 연도색을 한 번의 조회로 같이 받는다
         # (world_browser.get_player_awards_with_year_highlight 주석 참고).
         _awards_by_year, _year_highlight = wb.get_player_awards_with_year_highlight(player_id)
+        # [2026-09 신설, 신민용 리포트: "상 적힌 창이 너무 길어"] 같은 상들을
+        # 대회 단위로 묶은 형태 — 표시(🏆 요약 줄)에만 쓴다. 복사용
+        # self._player_copy_rows는 기존 평면 목록을 그대로 유지한다(텍스트로
+        # 붙여넣을 땐 대회명이 상마다 붙어 있는 편이 낫다).
+        _award_groups_by_year = wb.get_player_award_groups_by_year(player_id)
         _expanded_years = self._player_team_expanded_years(player_id)
         # [2026-09 버그수정, 신민용 리포트: "이적/입단 정보를 매년 반복
         # 표시하지 말고 팀이 바뀐 첫 해에만 보여줘"] salary_is_first_year가
@@ -6614,7 +6982,11 @@ class WorldBrowserWindow(QDialog):
                 tbl.setItem(row_idx, 2, self._dim_dash_item())
                 tbl.setItem(row_idx, 3, self._dim_dash_item())
                 tbl.setItem(row_idx, 4, self._dim_dash_item())
-                for col in (5, 6, 7, 8, 9):
+                # [2026-09 버그수정] 10번(국내슈퍼컵)이 빠져 있어 은퇴 이후
+                # 행에서 이 칸만 "-"가 아니라 빈 칸으로 남았다 — 팀 검색 표에서
+                # 이미 같은 누락을 한 번 고친 적이 있다("기록 없음" 행의
+                # 마지막 칸이 빈 채로 남았다).
+                for col in (5, 6, 7, 8, 9, 10):
                     tbl.setCellWidget(row_idx, col, self._two_line_cell("-", "#555", None))
                 self._player_copy_rows.append({
                     "year": entry["year"], "age": age, "is_retired_row": True,
@@ -6844,9 +7216,13 @@ class WorldBrowserWindow(QDialog):
                 # summary_cell)로 교체(정렬 자체는 world_browser.
                 # get_player_awards_by_year가 이미 발롱도르를 맨 앞으로
                 # 해뒀으므로 여기선 순서를 그대로 따르기만 하면 된다).
-                _award_cell = self._awards_summary_cell(_year_awards)
+                _award_cell = self._awards_summary_cell(
+                    _year_awards, _award_groups_by_year.get(entry["year"]))
                 tbl.setCellWidget(row_idx, 0, _award_cell)
-                tbl.setSpan(row_idx, 0, 1, 10)
+                # [2026-09 버그수정] player_team_tbl은 11컬럼(마지막이
+                # 국내슈퍼컵)인데 10만 덮고 있어 수상 요약 행의 마지막
+                # 칸이 안 덮였다 — 위 team_detail_tbl 건과 같은 원인.
+                tbl.setSpan(row_idx, 0, 1, 11)
                 row_idx += 1
         self._resize_self_sizing_table(tbl)
 
@@ -8382,8 +8758,9 @@ class WorldBrowserWindow(QDialog):
 
         def _emit_player(info, row, tag=None, show_intl=True):
             out = ["", f"[{info['name']} 선수 기록]"]
-            nat_text = (f"{info['d'].get('nat_flag') or ''} {info['d'].get('nationality') or ''}"
-                        .strip() or "국적 미상")
+            # [2026-09 수정, 신민용 요청] 국기 이모지 제거 — 선수 검색
+            # 상세/기록 복사와 같은 표기로 맞춘다.
+            nat_text = (info['d'].get('nationality') or '').strip() or "국적 미상"
             out.append(f"국적: {nat_text} | 포지션: {info['d'].get('position') or '-'}")
             row_lines = self._format_year_row_lines(
                 row, info["d"], include_stats=True, skip_team_competition_line=True)
@@ -9837,7 +10214,12 @@ class WorldBrowserWindow(QDialog):
         ia_secondary_group = QButtonGroup(right)
         ia_secondary_group.setExclusive(True)
         self._ia_secondary_buttons = {}
-        for key, label in (("야신상", "🥅 야신상"), ("푸스카스상", "⚽ 푸스카스상")):
+        # [2026-09 확장, 신민용 요청: "올해의 선수 이런건 야신상 푸스카스상
+        # 옆에 피파상 추가해서 주는걸로 — 피파상을 클릭하면 각 상별로 누가
+        # 받았는지 표시되는거지"] 세 번째 토글. FIFA 올해의 선수 + 대륙별
+        # 올해의 선수(UEFA/코메볼/AFC/CAF/콩카카프/OFC)를 한 표에 모아 보여준다.
+        for key, label in (("야신상", "🥅 야신상"), ("푸스카스상", "⚽ 푸스카스상"),
+                           ("피파상", "🏆 피파상")):
             btn = QPushButton(label)
             btn.setCheckable(True)
             btn.setAutoDefault(False)
@@ -9887,6 +10269,23 @@ class WorldBrowserWindow(QDialog):
         _enable_plain_copy(self.ia_yashin_tbl)
         right_lay.addWidget(self.ia_yashin_tbl, 2)
 
+        # [2026-09 신설] 피파상 — 위 두 표와 달리 "한 상의 순위표"가 아니라
+        # "여러 상의 수상자 목록"이라 첫 컬럼이 순위가 아니라 상 이름이다.
+        self.ia_fifa_title = QLabel("🏆 FIFA 올해의 선수 · 대륙별 올해의 선수")
+        self.ia_fifa_title.setStyleSheet(
+            "color:#ffcc00;font-size:13px;font-weight:bold;margin-top:8px;")
+        self.ia_fifa_title.setVisible(False)
+        right_lay.addWidget(self.ia_fifa_title)
+
+        self.ia_fifa_tbl = QTableWidget(0, 0)
+        self.ia_fifa_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.ia_fifa_tbl.verticalHeader().setVisible(False)
+        self.ia_fifa_tbl.cellDoubleClicked.connect(
+            lambda row, col: self._on_ia_player_row_clicked(self.ia_fifa_tbl, row))
+        self.ia_fifa_tbl.setVisible(False)
+        _enable_plain_copy(self.ia_fifa_tbl)
+        right_lay.addWidget(self.ia_fifa_tbl, 2)
+
         row.addWidget(right, 1)
         lay.addLayout(row, 1)
 
@@ -9907,11 +10306,18 @@ class WorldBrowserWindow(QDialog):
         에서는 ia_puskas_tbl/ia_yashin_tbl 자체가 아직 setVisible(False)
         상태라 아무 것도 안 뜨는 게 맞으므로, 이 함수는 연도가 선택된
         뒤(_on_ia_year_selected)에만 호출된다."""
-        show_yashin = self._ia_secondary == "야신상"
-        self.ia_yashin_title.setVisible(show_yashin)
-        self.ia_yashin_tbl.setVisible(show_yashin)
-        self.ia_puskas_title.setVisible(not show_yashin)
-        self.ia_puskas_tbl.setVisible(not show_yashin)
+        # [2026-09 확장] 토글이 셋(야신상/푸스카스상/피파상)으로 늘면서
+        # "야신이냐 아니냐" 이분법으로는 안 된다 — 선택된 하나만 켜고
+        # 나머지는 전부 끈다.
+        _panels = {
+            "야신상": (self.ia_yashin_title, self.ia_yashin_tbl),
+            "푸스카스상": (self.ia_puskas_title, self.ia_puskas_tbl),
+            "피파상": (self.ia_fifa_title, self.ia_fifa_tbl),
+        }
+        for key, (title, tbl) in _panels.items():
+            on = (key == self._ia_secondary)
+            title.setVisible(on)
+            tbl.setVisible(on)
 
     def _refresh_ia_year_list(self):
         # [2026-09 리팩터, 신민용 리포트: "년도가 늘어나서 위아래 휠이
@@ -9982,6 +10388,10 @@ class WorldBrowserWindow(QDialog):
 
         yashin_rows = wb.get_season_individual_awards(year, "야신상")
         self._fill_yashin_table(yashin_rows)
+
+        # [2026-09 신설] 피파상(FIFA 올해의 선수 + 대륙별 올해의 선수)도
+        # 같은 원칙으로 미리 채워둔다 — 토글 전환 시 재조회 없음.
+        self._fill_fifa_table(wb.get_world_poty_awards(year))
 
         self._apply_ia_secondary_visibility()
 
@@ -10080,6 +10490,35 @@ class WorldBrowserWindow(QDialog):
                     cell.setForeground(Qt.GlobalColor.green)
                 tbl.setItem(i, j, cell)
         self._show_empty_state(tbl, rows, "이 해는 야신상 후보가 없습니다", len(cols))
+        self._grow_to_fit(tbl, stretch_col=1)
+
+    def _fill_fifa_table(self, rows):
+        """[2026-09 신설, 신민용 요청: "피파상을 클릭하면 각 상별로 누가
+        받았는지 표시되는거지"] 발롱도르/야신상 표는 상 하나의 Top N
+        순위표라 1열이 "순위"지만, 이 표는 서로 다른 상 7개의 수상자를
+        한 번에 모아 보여주는 것이라 1열이 "상"이다. 행 더블클릭 →
+        선수 상세 이동은 다른 표와 같은 관례(0열 UserRole에 player_id)."""
+        tbl = self.ia_fifa_tbl
+        cols = ["상", "선수", "국적", "팀", "포지션", "총점"]
+        tbl.clear()
+        tbl.setRowCount(len(rows))
+        tbl.setColumnCount(len(cols))
+        tbl.setHorizontalHeaderLabels(cols)
+        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for i, r in enumerate(rows):
+            vals = [r.get("award_type") or "", r["name"], r.get("nationality") or "",
+                     r.get("team_name") or "", r.get("position") or "",
+                     f"{r.get('total_score') or 0:.1f}"]
+            for j, v in enumerate(vals):
+                cell = QTableWidgetItem(v)
+                cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if j == 0:
+                    cell.setData(Qt.ItemDataRole.UserRole, r["player_id"])
+                if r["player_id"] == wb.MY_PLAYER_ID:
+                    cell.setForeground(Qt.GlobalColor.green)
+                tbl.setItem(i, j, cell)
+        self._show_empty_state(tbl, rows, "이 해는 피파상 수상자가 없습니다", len(cols))
         self._grow_to_fit(tbl, stretch_col=1)
 
     def _on_ia_player_row_clicked(self, tbl, row):
@@ -11371,7 +11810,12 @@ class TournamentDetailDialog(QDialog):
         # 패널이 495px 정도밖에 안 남아 피치 하나조차 빠듯했다(스크롤도
         # 가로는 꺼져 있어 그대로 잘려 보임). 창 폭을 늘리고 좌:우 비율도
         # 1:1로 맞춰 우측에 피치+명단이 여유 있게 들어가게 한다.
-        _clamp_and_resize(self, *((1560, 840) if self._wc_mode else (760, 560)))
+        # [2026-09 수정] 1560 → 1700: 좌측 최대폭을 720 → 760으로 올린 만큼
+        # (조별리그 국가명 잘림 수정, 아래 setMaximumWidth 주석 참고) 창도
+        # 같이 넓혀야 우측 참가국 패널의 최소 폭(820)에 밀리지 않는다 —
+        # 좌 760 + 우 884 + 여백 56. _clamp_and_resize가 화면 밖으로는
+        # 절대 안 나가게 잘라준다.
+        _clamp_and_resize(self, *((1700, 840) if self._wc_mode else (760, 560)))
         # [2026-08 신설, 신민용 요청: "국가 검색으로 들어와서 대회 전체
         # 팝업을 열면 지금 보고 있는 국가 이름이 금색으로 표시돼야 한다"]
         # 국가 검색(country_detail_tbl)에서 열었을 때만 채워지고, 월드컵/
@@ -11408,10 +11852,29 @@ class TournamentDetailDialog(QDialog):
             # setMinimumWidth(820)을 그대로 둬서 창을 좁혀도 v1에서
             # 고쳤던 가로 스크롤 문제(우측이 최소 폭 밑으로 안 밀림)는
             # 그대로 유지된다.
-            left_widget.setMaximumWidth(720)
+            # [2026-09 수정, 신민용 요청: "국가명이 딱 보일 정도로 좌측
+            # 창을 조절해서 고정해달라"] 720px은 좌우 2열 카드로 나누면
+            # 카드당 350px라, 위 조별 표의 팀 이름 칸에 돌아가는 폭이
+            # 빠듯했다(그래서 긴 국가명이 잘렸다). 760px로만 올린다 —
+            # 아래 창 폭(1640)도 같이 올려서 우측 패널의 최소 폭(820)에
+            # 밀려 좌측이 실제로는 760을 못 받는 일이 없게 했다. "창을
+            # 넓혀도 좌측은 더 안 커지고 여유 폭은 전부 우측이 흡수한다"는
+            # 위 v2 설계는 그대로다.
+            left_widget.setMaximumWidth(760)
             right_panel = self._build_wc_country_panel()
             right_panel.setMinimumWidth(820)
-            body_row.addWidget(left_widget, 0)
+            # [2026-09 버그수정 v3, 신민용 리포트: "창 고쳤다며 왜 아직도
+            # 국가명이 잘려 있냐"] 위에서 최대 폭만 760으로 올렸는데 좌측은
+            # stretch=0이라 애초에 '최대'가 아니라 '권장 크기(sizeHint)'대로
+            # 잡힌다 — 안이 QScrollArea라 sizeHint가 570px 남짓밖에 안 돼서,
+            # 최대 폭을 720으로 두든 760으로 두든 화면에 전혀 반영이 안 됐다
+            # (실측: 창 1640px에서 좌측 570 / 우측 1014). stretch를 1로 돌려
+            # 좌측이 여유 공간을 받아 최대 폭까지 채우게 한다. 위 v2가 막고
+            # 싶었던 동작("창을 넓힐수록 좌측도 같이 늘어남")은 여기선 안
+            # 생긴다 — 760에서 max에 걸려 더 못 커지고, 남는 폭은 전부
+            # 우측이 가져간다. 우측은 최소 폭 820이 그대로 보장된다
+            # (창 1700 기준 좌 760 / 우 884).
+            body_row.addWidget(left_widget, 1)
             body_row.addWidget(right_panel, 1)
             outer.addLayout(body_row, 1)
         else:
@@ -11994,6 +12457,17 @@ class TournamentDetailDialog(QDialog):
             tbl.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
             tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            # [2026-09 버그수정, 신민용 리포트: "조별리그에서 국가명이 가려진다
+            # — 세네갈 같은 국가명이 보여야 한다"] 팀 칸만 Stretch(카드에서
+            # 남는 폭을 받는 칸)인데, 숫자 칸 6개(순위/승/무/패/득실/승점)가
+            # 실제 글자는 한두 자뿐인데도 QHeaderView의 기본 최소 섹션 폭
+            # (스타일/글꼴에 따라 37px 안팎)까지 차지하면서 칸마다 10~20px씩
+            # 을 그냥 비워두고 있었다 — 카드 한 장에 60~90px, 좌우 2장이면
+            # 팀 이름 칸에서 그만큼이 통째로 빠져나가 이름이 "세네..."로
+            # 잘렸다. 최소 섹션 폭을 낮춰 그 여백을 전부 팀 이름 칸으로
+            # 돌린다. ResizeToContents는 헤더 글자("순위"/"득실"/"승점")의
+            # 폭도 함께 보고 칸을 잡으므로, 낮춰도 머리글이 잘리지는 않는다.
+            tbl.horizontalHeader().setMinimumSectionSize(20)
             tbl.setStyleSheet(
                 "QTableWidget{background:#1e1e1e;color:#ccc;gridline-color:#2a2a2a;border:none;font-size:11px;}"
                 "QTableWidget::item:hover{background:#2a3a2a;}"

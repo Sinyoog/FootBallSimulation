@@ -85,7 +85,7 @@ from constants import week_to_day, day_to_week, SECOND_HALF_START
 from competition.competition_common import (
     CompetitionConfig, entry, sim_ai_match, winner_of,
     start_knockout, advance_round, finish_tournament,
-    get_tournament, clear_entry_cache,
+    get_tournament, clear_entry_cache, league_day_map, pick_free_day,
 )
 from competition.champions_engine import CHAMPIONS_CFG
 from competition.europa_engine import EUROPA_CFG
@@ -155,7 +155,7 @@ _SF_DAY = week_to_day(SC_START_WEEK)          # Day1 — 준결승 2경기
 _FINAL_DAY = _SF_DAY + 5                       # Day6 — 3·4위전 + 결승
 
 
-def _pick_sc_days(my_tid, cur_season):
+def _pick_sc_days(team_ids, year, conn=None):
     """[2026-08 버그수정, 신민용 리포트: "슈퍼컵이 경기가 진행됐다고는
     뜨는데 일정엔 안 보인다 — 리그랑 겹치면서 그러는 것 같다"] 원래
     SF/결승 요일(_SF_DAY=그 주 1일차="일요일", _FINAL_DAY=+5일="금요일")은
@@ -178,19 +178,25 @@ def _pick_sc_days(my_tid, cur_season):
     AI끼리만 진행되는 나머지 3개 대륙) 국내 일정을 조회할 필요가 아예
     없어 기본값을 그대로 쓴다 — AI 팀끼리는 겹쳐도 화면에 보이는 문제가
     없고, 매번 이 조회를 하면 성능만 낭비된다."""
-    if not my_tid:
-        return _SF_DAY, _FINAL_DAY
-    conn = get_conn()
-    rows = conn.execute(
-        """SELECT day FROM match_results WHERE week IN (?,?,?) AND season=?
-           AND day IS NOT NULL AND (home_team_id=? OR away_team_id=?)""",
-        (SC_START_WEEK - 1, SC_START_WEEK, SC_START_WEEK + 1, cur_season,
-         my_tid, my_tid)).fetchall()
-    conn.close()
-    dom_days = [r["day"] for r in rows if r["day"] is not None]
+    # [2026-09 버그수정, 신민용 확정: "컵 대회랑 리그 일정은 절대 겹치면
+    # 안돼"] 예전엔 my_tid(내 팀) 하나만 기준으로 봤고, 내 팀이 이 대회에
+    # 없으면 조회 자체를 건너뛰어 AI 대회는 항상 기본 요일에 고정됐다 —
+    # 위 docstring이 "같은 팀이 같은 날 두 경기를 갖는 데이터 자체가
+    # 잘못"이라고 적어둔 그 문제가 AI 팀에는 그대로 남아 있었다.
+    # 이제 참가 팀 전원을 기준으로 본다. 판정 규칙(하루 이내 회피)과
+    # 후보 조합((0,5)/(1,6)), 폴백(둘 다 겹치면 기본값)은 그대로다.
+    #
+    # [결정성] 이 함수는 SF 생성 때와 결승 요일 재계산 때 두 번 불리는데,
+    # 두 호출에 같은 team_ids(그 대회 sc_entries 전원)를 넘겨야 같은 날이
+    # 다시 나온다 — 호출부가 그렇게 맞춰서 넘긴다.
+    _c = conn or get_conn()
+    day_map = league_day_map(_c, year, SC_START_WEEK, team_ids)
+    busy = set()
+    for _t in team_ids:
+        busy |= day_map.get(_t, set())
 
     def _conflicts(cand):
-        return any(abs(cand - dd) <= 1 for dd in dom_days if dd is not None)
+        return any(abs(cand - dd) <= 1 for dd in busy)
 
     week_start = _SF_DAY
     for sf_off, f_off in ((0, 5), (1, 6)):
@@ -307,7 +313,7 @@ def _build_super_cup(year, continent):
     my_in = 1 if any(s["team_id"] == my_tid for s in seeds) else 0
     _st = get_state()
     _cur_season = _st["current_season"] if _st else 1
-    sf_day, final_day = _pick_sc_days(my_tid if my_in else 0, _cur_season)
+    sf_day, final_day = _pick_sc_days([s["team_id"] for s in seeds], year)
 
     conn = get_conn(); c = conn.cursor()
     c.execute("""INSERT INTO sc_tournaments(year, continent, name, status,
@@ -485,8 +491,14 @@ def process_super_cup_week(week, day=None):
             # 결승 요일이 나온다 — 별도로 저장해둘 필요 없이 매번 다시
             # 계산해도 안전하다(주변 주차 국내 경기일은 시즌 시작 때
             # 이미 확정되어 이후 안 바뀜).
-            _, f_day = _pick_sc_days(t["my_team_id"] if t.get("my_in") else 0,
-                                      st["current_season"])
+            # [2026-09] SF 생성 때와 같은 team_ids(sc_entries 전원)를 넘겨야
+            # 같은 결승 요일이 다시 나온다 — 위 _pick_sc_days 결정성 주석 참고.
+            _sc_conn = get_conn()
+            _sc_ids = [r[0] for r in _sc_conn.execute(
+                "SELECT team_id FROM sc_entries WHERE tournament_id=? ORDER BY team_id",
+                (t["id"],)).fetchall()]
+            _sc_conn.close()
+            _, f_day = _pick_sc_days(_sc_ids, t["year"])
             _set_match_days(t["id"], "F", f_day)
             _set_match_days(t["id"], "TP", f_day)
             _invalidate_sc_active_cache()   # 새로 생긴 경기가 있으니 캐시 갱신

@@ -42,6 +42,7 @@ from competition.cup_engine import (
     _match_outcome, _resolve_pso, _winner_of,
 )
 from constants import day_to_week, week_to_day, SECOND_HALF_START
+from competition.competition_common import league_day_map, pick_free_day
 
 LOWER_CUP_BRACKET_CAP = 64
 
@@ -426,11 +427,11 @@ def start_lower_cup(year, season):
 
         if po_pool_size:
             _create_po_round(c, tid, pool, po_pool_size, week=LOWER_CUP_ROUND_WEEKS_POOL[0],
-                              my_team_id=my_team_id if is_my else None)
+                              my_team_id=my_team_id if is_my else None, year=year)
         else:
             _create_ko_round(c, tid, [team[0] for team in pool], round_idx=0,
                               week=LOWER_CUP_ROUND_WEEKS_POOL[0],
-                              my_team_id=my_team_id if is_my else None)
+                              my_team_id=my_team_id if is_my else None, year=year)
         created += 1
         if is_my and add_log:
             add_log(f"🏆 {tname} 개막 — {n}개 팀 참가"
@@ -439,18 +440,29 @@ def start_lower_cup(year, season):
     return created
 
 
-def _create_po_round(c, tid, pool, po_pool_size, week, my_team_id=None):
+def _create_po_round(c, tid, pool, po_pool_size, week, my_team_id=None, year=None):
     """최하위 po_pool_size명을 뽑아 "최상위 vs 최하위" 시딩으로 PO 대진을 짠다.
     나머지 상위(부전승) 팀은 alive=1 그대로 두고 다음 라운드에 바로 합류한다
     (별도 매치 없이 통과)."""
     n = len(pool)
     po_group = pool[n - po_pool_size:]   # 순위 하위 po_pool_size명(약한 팀들)
     half = po_pool_size // 2
-    day = week_to_day(week) + _ROUND_DAY_OFFSET
+    # [2026-09 버그수정, 신민용 확정: "컵 대회랑 리그 일정은 절대 겹치면
+    # 안돼"] 예전엔 이 라운드 전체가 week_to_day(week)+_ROUND_DAY_OFFSET
+    # 한 날에 몰려 있었다 — 리그 경기는 주 7일에 고르게 퍼져 있어서 그
+    # 요일에 리그가 잡힌 팀은 반드시 하루 2경기가 됐다(2005시즌 실측
+    # 2,760건). 이제 경기마다 양 팀 리그 일정을 보고 비어 있는 요일을
+    # 고르고, 후보가 전부 막히면 기존 기본 날짜로 폴백한다
+    # (competition_common.pick_free_day 주석 참고). year를 안 넘기면
+    # 조회 자체를 건너뛰어 기존과 100% 동일하게 동작한다.
+    day_default = week_to_day(week) + _ROUND_DAY_OFFSET
+    week_start = week_to_day(week)
+    day_map = league_day_map(c, year, week, [t[0] for t in po_group]) if year else {}
     slot = 0
     for i in range(half):
         top = po_group[i]          # PO 참가자 중 상대적으로 강한 쪽
         bottom = po_group[po_pool_size - 1 - i]   # 상대적으로 약한 쪽
+        day = pick_free_day(week_start, day_map, (top[0], bottom[0]), day_default)
         is_my = 1 if my_team_id in (top[0], bottom[0]) else 0
         c.execute("""INSERT INTO lower_cup_matches
             (tournament_id, round_name, round_idx, week, day,
@@ -461,18 +473,23 @@ def _create_po_round(c, tid, pool, po_pool_size, week, my_team_id=None):
         slot += 1
 
 
-def _create_ko_round(c, tid, team_ids, round_idx, week, my_team_id=None, round_name=None):
+def _create_ko_round(c, tid, team_ids, round_idx, week, my_team_id=None, round_name=None,
+                      year=None):
     """순수 토너먼트 라운드(부전승 없이 딱 떨어지는 인원) 대진 생성.
     시딩은 seed_rank 순으로 이미 정렬된 team_ids를 그대로 절반씩 짝짓는다
     (1번-마지막, 2번-마지막에서 2번째 ... 식 브래킷 시딩)."""
     n = len(team_ids)
     rname = round_name or _round_name(n, round_idx, is_pure_ko=True)
-    day = week_to_day(week) + _ROUND_DAY_OFFSET
+    # [2026-09 버그수정] _create_po_round와 같은 이유 — 경기별로 리그 일정을 피한다.
+    day_default = week_to_day(week) + _ROUND_DAY_OFFSET
+    week_start = week_to_day(week)
+    day_map = league_day_map(c, year, week, team_ids) if year else {}
     half = n // 2
     slot = 0
     for i in range(half):
         home = team_ids[i]
         away = team_ids[n - 1 - i]
+        day = pick_free_day(week_start, day_map, (home, away), day_default)
         is_my = 1 if my_team_id in (home, away) else 0
         c.execute("""INSERT INTO lower_cup_matches
             (tournament_id, round_name, round_idx, week, day,
@@ -691,7 +708,11 @@ def _advance_lower_cup_round(c, tid, week):
                 w = _winner_of(m)
                 losers.append(m["away_team_id"] if w == m["home_team_id"] else m["home_team_id"])
             if len(losers) == 2:
-                tp_day = week_to_day(next_week) + _ROUND_DAY_OFFSET
+                # [2026-09 버그수정] 3·4위전도 라운드와 같은 규칙으로 리그 일정을 피한다.
+                tp_day = pick_free_day(
+                    week_to_day(next_week),
+                    league_day_map(c, t["year"], next_week, losers),
+                    losers, week_to_day(next_week) + _ROUND_DAY_OFFSET)
                 is_my_tp = 1 if (t["my_in"] and t["my_team_id"] in losers) else 0
                 c.execute("""INSERT INTO lower_cup_matches
                              (tournament_id, round_name, round_idx, week, day,
@@ -715,7 +736,8 @@ def _advance_lower_cup_round(c, tid, week):
            WHERE tournament_id=? AND alive=1 ORDER BY seed_rank""", (tid,)).fetchall()
     ids = [r[0] for r in rows]
     _create_ko_round(c, tid, ids, round_idx=next_round_idx, week=next_week,
-                      my_team_id=(t["my_team_id"] if t["my_in"] else None))
+                      my_team_id=(t["my_team_id"] if t["my_in"] else None),
+                      year=t["year"])
     c.execute("UPDATE lower_cup_tournaments SET round_counter=? WHERE id=?",
                (next_round_idx, tid))
 
@@ -1029,7 +1051,8 @@ def simulate_my_lower_cup_match(week, p, day=None):
     else:
         _opp_ovr = (ae["ovr"] if is_home else he["ovr"])
         goals, assists, saves, rating, events, detail = _player_perf(
-            p, outcome, is_home, hs, as_, opp_ovr=_opp_ovr)
+            p, outcome, is_home, hs, as_, opp_ovr=_opp_ovr,
+            is_big_match=(m.get("round_name") == "결승"))
         _absence_reason = None
         _dismissed, _card_reason, _yellow_ev, _yellow_cnt = _roll_card_events(p, "cup_suspension")
         if _dismissed:

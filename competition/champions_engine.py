@@ -1044,7 +1044,7 @@ def simulate_my_cl_match(week, p, day=None):
     else:
         _opp_ovr = (ae["ovr"] if is_home else he["ovr"])
         goals, assists, saves, rating, events, detail = _player_perf(
-            p, outcome, is_home, hs, as_, opp_ovr=_opp_ovr)
+            p, outcome, is_home, hs, as_, opp_ovr=_opp_ovr, is_big_match=True)
         _absence_reason = None
         _yellow_cnt = 0
         # [2026-07 신설 → 2026-08 확장(옐로카드)] 카드 판정.

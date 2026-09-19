@@ -43,7 +43,10 @@ ui/formation_widget.py와 ai_lifecycle.py 둘 다 여기서 import해서 쓴다
 핵심 루프 2.68s → 0.74s(×3.6).
 ═══════════════════════════════════════════════════════════════
 """
-from constants import POSITION_COMPAT, POSITION_MISMATCH_PENALTY
+from constants import (POSITION_COMPAT, POSITION_MISMATCH_PENALTY,
+                        FOOT_SIDED_SLOTS, FOOT_INVERTED_SLOTS, FOOT_BOTH,
+                        FOOT_MISMATCH_PENALTY, FOOT_INVERTED_BONUS,
+                        FOOT_BENCH_SWAP)
 
 
 # [2026-08 최적화] 아래 _pos_category는 시즌 전환 한 번에 350만 회 넘게
@@ -254,6 +257,11 @@ def _greedy_fill_slots(candidates, slots_only):
         # 없으면(로스터에 GK가 아예 없는 극단적 예외) 그 슬롯은 빈 채로
         # 남긴다. 어느 쪽도 GK 경계를 넘어서까지 "일단 채우고 본다"는
         # 대상이 아니다.
+
+    # [2026-09 신설] 주발 보정 — 배정이 끝난 뒤 좌우 슬롯의 반대발만
+    # "포지션 rank 합을 나쁘게 만들지 않는" 교환으로 바로잡는다.
+    # 파라미터가 0이면 즉시 반환해 완전 무동작(_foot_swap_pass 주석 참고).
+    _foot_swap_pass(slot_filled, slots_only, candidates)
 
     return slot_filled
 
@@ -518,6 +526,171 @@ def _mismatch_penalty(player_pos, slot_pos):
         v = POSITION_MISMATCH_PENALTY[rank if rank < _PENALTY_LAST_IDX else _PENALTY_LAST_IDX]
         _MISMATCH_PENALTY_CACHE[key] = v
     return v
+
+
+# ── 주발 적합도 ─────────────────────────────────────────────
+# [2026-09 신설, 신민용 확정] 포지션 미스매치와 "완전히 별개의 축"이다.
+#   유효 적합도 = OVR × (1 - 포지션 미스매치) × 주발 배율
+# 두 축을 합치지 않는 이유: "LB 슬롯에 RB 선수"와 "LB 슬롯에 오른발 LB"는
+# 서로 다른 현상이고, 신체특징 '다재다능'(mismatch_immune)은 앞쪽만
+# 면역이다. 주발 축의 면역은 '양발'이 맡는다.
+#
+# 규칙(constants.FOOT_SIDED_SLOTS / FOOT_INVERTED_SLOTS):
+#   LB·LWB 슬롯 + 오른발 / RB·RWB 슬롯 + 왼발  → 페널티
+#   양발, 또는 foot='' (구세이브)               → 항상 1.0 (면제)
+#   LW·RW·LM·RM 슬롯 + 반대발                  → 페널티 없음(정상)
+#     └ 그중 sub_role이 "인버티드"면            → 소폭 보너스
+#   중앙/GK 슬롯                                → 주발 무관
+_FOOT_FIT_CACHE: dict = {}
+
+
+def foot_fit_mult(slot_pos, foot, sub_role=""):
+    """(슬롯 포지션, 주발, 세부역할) → 유효 적합도에 곱할 배율.
+    조합 수가 유한해서 한 번 구하면 끝난다(_mismatch_penalty와 같은 방식)."""
+    key = (slot_pos, foot, sub_role)
+    v = _FOOT_FIT_CACHE.get(key)
+    if v is None:
+        v = _calc_foot_fit(slot_pos, foot, sub_role)
+        _FOOT_FIT_CACHE[key] = v
+    return v
+
+
+def _calc_foot_fit(slot_pos, foot, sub_role):
+    if not foot or foot == FOOT_BOTH:
+        return 1.0                      # 양발 / 미배정 → 면제
+    want = FOOT_SIDED_SLOTS.get(slot_pos)
+    if want is not None:
+        return 1.0 if foot == want else (1.0 - FOOT_MISMATCH_PENALTY)
+    inv = FOOT_INVERTED_SLOTS.get(slot_pos)
+    if inv is not None and foot != inv and sub_role == "인버티드":
+        return 1.0 + FOOT_INVERTED_BONUS
+    return 1.0
+
+
+def _slot_value(pl, slot_pos):
+    """그 선수를 그 슬롯에 뒀을 때의 유효 적합도."""
+    pos = pl.get("position") or "CM"
+    return ((pl.get("ovr") or 0)
+            * (1.0 - _mismatch_penalty(pos, slot_pos))
+            * foot_fit_mult(slot_pos, pl.get("foot") or "",
+                            pl.get("sub_role") or ""))
+
+
+def _foot_bench_swap(slot_filled, slots_only, candidates):
+    """[2026-09 신설, D단계 실험 — constants.FOOT_BENCH_SWAP] 좌우 슬롯의
+    선발을 벤치 후보와 교체한다. 위 _foot_swap_pass가 이미 뽑힌 11명
+    안에서만 자리를 바꾸는 것과 달리, 여기서는 선발 11명 자체가
+    재구성된다 — "OVR 90 오른발 LB를 빼고 OVR 60 왼발 LB를 넣을
+    것인가"라는 실력과 주발의 트레이드오프가 여기서 처음 생긴다.
+
+    교체 조건은 두 가지뿐이다:
+      - 포지션 적합도(rank)가 나빠지지 않을 것
+      - 그 슬롯의 유효 적합도가 실제로 좋아질 것
+    유효 적합도가 OVR x (1-포지션미스매치) x 주발배율이므로, 얼마나
+    큰 OVR 차이까지 뒤집히는지는 FOOT_MISMATCH_PENALTY가 정한다."""
+    placed = {id(p) for p in slot_filled if p is not None}
+    pool = [c for c in candidates if id(c) not in placed]
+    if not pool:
+        return 0
+    swaps = 0
+    for i in range(len(slots_only)):
+        si = slots_only[i]
+        if si not in FOOT_SIDED_SLOTS and si not in FOOT_INVERTED_SLOTS:
+            continue
+        a = slot_filled[i]
+        if a is None:
+            continue
+        if _POS_CATEGORY_GET(si, "ATK") == "GK":
+            continue
+        pa = a.get("position") or "CM"
+        base_rank = _mismatch_rank(pa, si)
+        best, best_v = None, _slot_value(a, si)
+        for q in pool:
+            pq = q.get("position") or "CM"
+            if _POS_CATEGORY_GET(pq, "ATK") == "GK":
+                continue
+            if _mismatch_rank(pq, si) > base_rank:
+                continue        # 포지션 적합도를 깎으면서까지 발을 맞추지 않는다
+            v = _slot_value(q, si)
+            if v > best_v + 1e-9:
+                best, best_v = q, v
+        if best is not None:
+            slot_filled[i] = best
+            best["_slot_idx"] = i
+            a.pop("_slot_idx", None)
+            pool.remove(best)
+            pool.append(a)
+            swaps += 1
+    return swaps
+
+
+def _foot_swap_pass(slot_filled, slots_only, candidates=None):
+    """[2026-09 신설] _greedy_fill_slots의 배정이 끝난 뒤, 좌우 슬롯의
+    반대발 배정만 교환으로 바로잡는다.
+
+    [왜 배정 단계가 아니라 사후 교환인가] 실측 결과 좌우 슬롯 반대발
+    배정 5,362건 중 절반 이상이 "같은 포지션에 발 맞는 대체자가 팀에
+    있는데 OVR 내림차순 그리디가 반대발 쪽을 먼저 집은" 경우였다.
+    그런데 이건 항상 발 맞는 쪽으로 고정하면 안 된다 — OVR 90 오른발
+    LB와 OVR 60 왼발 LB라면 90이 맞다. 즉 이 선택은 페널티 크기를
+    알아야만 판단할 수 있어서, 유효 적합도 비교로만 풀린다.
+    한편 _greedy_fill_slots의 3단계 구조 자체는 예전 실제 버그들
+    (GK가 ST 슬롯을 가로채는 연쇄 오배치 등)을 고치며 만들어진 것이라
+    건드리지 않는다 — 그래서 3단계는 그대로 두고, 그 결과에 대고
+    "포지션 rank 합을 나쁘게 만들지 않는 교환"만 얹는다.
+
+    파라미터가 둘 다 0이면 즉시 반환하므로 완전 무동작이 된다
+    (같은 월드 A/B의 OFF 기준선이 이 조기 반환 하나로 만들어진다)."""
+    if FOOT_MISMATCH_PENALTY <= 0 and FOOT_INVERTED_BONUS <= 0:
+        return
+    n = len(slots_only)
+    sided = [i for i in range(n)
+             if slots_only[i] in FOOT_SIDED_SLOTS or slots_only[i] in FOOT_INVERTED_SLOTS]
+    if not sided:
+        return
+    _rank = _mismatch_rank
+    for _round in range(3):             # 연쇄 개선용 소수 반복(보통 1회로 끝)
+        moved = False
+        for i in sided:
+            a = slot_filled[i]
+            if a is None:
+                continue
+            si = slots_only[i]
+            for j in range(n):
+                if j == i:
+                    continue
+                b = slot_filled[j]
+                if b is None:
+                    continue
+                sj = slots_only[j]
+                # GK 경계는 어떤 경우에도 넘지 않는다(_greedy_fill_slots의
+                # 3단계 마지막 수단이 지키는 것과 같은 불변식).
+                if (_POS_CATEGORY_GET(si, "ATK") == "GK"
+                        or _POS_CATEGORY_GET(sj, "ATK") == "GK"
+                        or _POS_CATEGORY_GET(a.get("position") or "CM", "ATK") == "GK"
+                        or _POS_CATEGORY_GET(b.get("position") or "CM", "ATK") == "GK"):
+                    continue
+                pa = a.get("position") or "CM"
+                pb = b.get("position") or "CM"
+                # 포지션 적합도(rank) 합이 나빠지는 교환은 금지 —
+                # 주발이 포지션 판정 구조를 뒤집지 않는다는 원칙.
+                if (_rank(pa, sj) + _rank(pb, si)) > (_rank(pa, si) + _rank(pb, sj)):
+                    continue
+                if (_slot_value(a, sj) + _slot_value(b, si)
+                        > _slot_value(a, si) + _slot_value(b, sj) + 1e-9):
+                    slot_filled[i], slot_filled[j] = b, a
+                    a["_slot_idx"], b["_slot_idx"] = j, i
+                    moved = True
+                    a = slot_filled[i]
+                    if a is None:
+                        break
+                    si = slots_only[i]
+        if not moved:
+            break
+    if FOOT_BENCH_SWAP and candidates:
+        # [D단계 실험] 벤치까지 열면 선발 11명 자체가 재구성된다.
+        if _foot_bench_swap(slot_filled, slots_only, candidates):
+            _foot_swap_pass(slot_filled, slots_only, None)   # 자리 재정렬만 1회
 
 
 def prep_roster(roster):

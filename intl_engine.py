@@ -1205,7 +1205,12 @@ def start_qualifying_if_needed(year):
     # 만들지 않고, 다른 지역컵과 동일하게 44주차(INTL_CALLUP_WEEK) 본선
     # 생성 시점에 _qualify_region("북미")의 OVR 상위컷으로 24개국을
     # 정한다. 예선이 실제로 의미를 갖는 유럽(54개국→24개국)만 남긴다.
-    cont_qual_confs = ["유럽"]
+    # [2026-09 확장] 대륙컵 주기(2004,08..)면 4개 대륙 전부 예선을 돌린다.
+    # 유로 주기(2001,05..)의 cont_qual은 유로(EURO) 전용이고 유로는 유럽
+    # 단독 대회이므로 그 해엔 유럽만 만든다 — 안 그러면 유로 해에 아시안컵
+    # 예선까지 같이 생성된다(본선이 없는 예선이 떠버림).
+    cont_qual_confs = (["유럽", "아메리카", "아시아", "아프리카"]
+                       if is_cont else ["유럽"])
     for _cq_cont in cont_qual_confs:
         try:
             _create_qual_tournament(year, "cont_qual", _cq_cont,
@@ -1356,9 +1361,32 @@ def _close_other_pending_when_committed(year):
 
 
 def _conf_key(continent):
-    """대륙명 → 5개 통합 연맹 대표키(2026-09부터 남미/북미 분리).
-    유럽/남미/북미/아시아/아프리카로 정규화."""
+    """대륙명 → 5개 통합 '연맹'(confederation) 대표키.
+    유럽/남미/북미/아시아/아프리카로 정규화.
+
+    [계층 주의 — 2026-09 명시] 이 프로젝트에는 서로 다른 두 계층이 있고
+    둘을 한 필드로 합치면 안 된다:
+      · 연맹(이 함수, 5키)  — 월드컵 예선 단위. 쿼터가 연맹별로 다르기
+        때문에 남미(5장)와 북미(3장)를 반드시 나눠야 한다.
+      · 대륙(_cont_key, 4키) — 대륙컵 단위. 남미 12개국만으로는 24개국
+        본선이 성립하지 않아 남북미를 "아메리카" 하나로 묶는다.
+    같은 나라가 두 계층에서 다른 키를 갖는 게 정상이다(브라질: 연맹
+    "남미" / 대륙 "아메리카")."""
     return CONTINENT_TO_CONF.get(continent, continent)
+
+
+def _cont_key(continent):
+    """대륙명 → 4개 '대륙'(continent) 대표키 — 유럽/아메리카/아시아/
+    아프리카. 대륙컵(kind='continent')과 그 예선(cont_qual), 그리고
+    constants.EURO_QUAL / CONF_CUP_NAME이 쓰는 계층이다.
+
+    예전엔 이 자리에 _conf_key를 그대로 썼는데, CONTINENT_TO_CONF에
+    "아메리카" 항목이 없어서 .get(x, x) 폴백 덕분에 우연히 통과하고
+    있었을 뿐이다(남미/북미를 넘기면 조용히 연맹 키로 갈라져 45개국
+    풀이 12개국/33개국으로 쪼개진다). 위 _conf_key 주석의 계층 구분을
+    코드에서도 분리해 둔다."""
+    c = CONTINENT_TO_CONF.get(continent, continent)
+    return {"남미": "아메리카", "북미": "아메리카", "북중미": "아메리카"}.get(c, c)
 
 
 def _precreate_ko_shell(conn, c, tid, tournament_type, tournament_start_day):
@@ -2081,8 +2109,14 @@ def _intl_form_adjustments(candidates):
     try:
         from database import history_drain
         history_drain()   # 방금 큐에 들어간 43주차 스냅샷까지 읽기 위함(read-after-write)
-    except Exception:
-        pass
+    except Exception as _e:
+        # [2026-09 버그수정, 정적감사] 여기만 read-after-write drain 실패를
+        # 통째로 삼키고 있었다(다른 호출부는 전부 전파하거나 최소한 출력함)
+        # — drain이 실패하면 아래 조회가 "아직 안 써진 43주차 스냅샷"을 못
+        # 보고 낡은 값으로 대표팀 선발이 돌아가는데, 그 사실이 아무 데도
+        # 안 남아 원인 추적이 불가능했다. 동작(계속 진행)은 그대로 두고
+        # database.refresh_career_years의 같은 패턴과 동일하게 출력만 남긴다.
+        print(f"[INTL] history_drain 실패(낡은 스냅샷으로 계속 진행): {_e}")
     conn = get_conn()
     latest = {}   # pid -> (year, rating, season_ovr)
     try:
@@ -2161,7 +2195,7 @@ def _build_intl_squad_by_group(country, quota_by_group=None):
     차이가 적합도 격차(0.55배)를 뒤집을 만큼 압도적이어야 한다(기본값은
     반대 — 핵심 포지션이 이긴다)."""
     from constants import (INTL_POSITION_GROUPS, INTL_GROUP_FIT, INTL_SQUAD_GROUP_QUOTA,
-                           INTL_POSITION_TO_GROUP)
+                           INTL_POSITION_TO_GROUP, INTL_GROUP_SIDES)
     from database import get_country_nationals_for_positions, get_player_total_intl_appearances
 
     quota_by_group = quota_by_group or INTL_SQUAD_GROUP_QUOTA
@@ -2215,7 +2249,32 @@ def _build_intl_squad_by_group(country, quota_by_group=None):
             fit = _intl_group_fit(c["position"], grp)
             scored.append((base_score * fit, c))
         scored.sort(key=lambda t: -t[0])
-        for _score, c in scored[:n]:
+
+        # [2026-09 신설, 신민용 확정] 좌우가 한 그룹으로 묶인 그룹
+        # (FB=LB/RB, WG=LW/RW)은 각 방향 최소 1명을 먼저 확보한 뒤
+        # 나머지를 점수순으로 채운다 — constants.INTL_GROUP_SIDES 주석
+        # 참고. 확보는 "그 방향 후보가 실제로 있을 때만" 한다. 정확히
+        # 그 포지션인 후보만 세며(인접 포지션은 그 방향을 대신하지
+        # 못한다), 순서는 scored가 이미 점수 내림차순이라 각 방향의
+        # 최고점 1명이 잡힌다.
+        _sides = INTL_GROUP_SIDES.get(grp)
+        _take = []
+        _take_ids = set()
+        if _sides and n >= len(_sides):
+            for _side_pos in _sides:
+                for _sc, _c in scored:
+                    if _c["position"] == _side_pos and _c["id"] not in _take_ids:
+                        _take.append(_c)
+                        _take_ids.add(_c["id"])
+                        break
+        for _score, c in scored:
+            if len(_take) >= n:
+                break
+            if c["id"] in _take_ids:
+                continue
+            _take.append(c)
+            _take_ids.add(c["id"])
+        for c in _take[:n]:
             picked.append(c)
             used_ids.add(c["id"])
 
@@ -2555,7 +2614,10 @@ def _qualify_continental(my_continent, p=None, my_nats=None, nat_info=None):
     from game_engine import get_state
     st = get_state() or {}
     year = st.get("current_year", 0)
-    cont_key = _conf_key(my_continent)
+    # [2026-09] 대륙컵 계층이므로 _conf_key(연맹 5키)가 아니라 _cont_key.
+    # 지금 호출부는 항상 4개 대륙 키를 넘기므로 값은 동일하다 —
+    # 남미/북미가 실수로 들어와도 아메리카로 정규화되게만 바꾼다.
+    cont_key = _cont_key(my_continent)
 
     conn = get_conn()
     qual_rows = [dict(r) for r in conn.execute(
@@ -4232,7 +4294,7 @@ def simulate_my_match(week, p, day=None):
         # 상대 국가 강함 반영.
         _opp_ovr = (ae["ovr"] if is_home else he["ovr"])
         goals, assists, saves, rating, events, detail = _player_perf(
-            p, outcome, is_home, hs, as_, opp_ovr=_opp_ovr)
+            p, outcome, is_home, hs, as_, opp_ovr=_opp_ovr, is_big_match=True)
         _absence_reason = None
         _yellow_cnt = 0
         # [2026-07 신설 → 2026-08 확장(옐로카드)] 카드 판정.
@@ -4555,8 +4617,13 @@ def get_qual_advance_status(t):
             wildcard = qual_cfg.get("wildcard", 0)
 
             winners, runners = [], []
+            # [2026-09 신설] 위 _finalize_qual_single과 같은 랭크별 풀 —
+            # 화면 표시(po_bubble)가 실제 확정 로직과 어긋나지 않게 한다.
+            by_rank: dict = {}
             for g in grps:
                 rows = _qual_group_standings(tid, g)
+                for _ri, _rrow in enumerate(rows):
+                    by_rank.setdefault(_ri + 1, []).append(_rrow)
                 if len(rows) >= 1: winners.append(rows[0])
                 if len(rows) >= 2: runners.append(rows[1])
 
@@ -4567,8 +4634,18 @@ def get_qual_advance_status(t):
 
             runners_sorted = sorted(runners, key=lambda r: (r["pts"], r["gf"]-r["ga"], r["gf"], r["ovr"]),
                                      reverse=True)
+            # [2026-09 신설] po_pool_rank(조 3위 등)를 쓰는 설정이면 그
+            # 풀에서 뽑는다 — 확정 로직(_finalize_qual_single)과 동일한 규칙.
+            _po_rank = qual_cfg.get("po_pool_rank", 0)
             if wildcard > 0:
                 direct_set |= {r["country"] for r in runners_sorted[:wildcard]}
+            if _po_rank and po_teams > 0:
+                _po_sorted = sorted(by_rank.get(_po_rank, []),
+                                     key=lambda r: (r["pts"], r["gf"]-r["ga"], r["gf"], r["ovr"]),
+                                     reverse=True)
+                _po_skip = wildcard if (_po_rank == 2 and wildcard > 0) else 0
+                po_pool = _po_sorted[_po_skip:_po_skip + po_teams]
+            elif wildcard > 0:
                 po_pool = runners_sorted[wildcard:wildcard + po_teams]
             elif direct_n == 0 and po_teams > 0:
                 po_pool = winners[:po_teams]
@@ -4715,10 +4792,17 @@ def _finalize_qual(t):
         # ── 기존 로직 100% 그대로 (EURO_QUAL 전용, 절대 안 건드림) ──
         winners = []
         runners = []
+        # [2026-09 신설, 상류 예선 4대륙 확장] 조 3위 이하 풀도 쓸 수 있게
+        # 랭크별로 전부 모아둔다 — wc_qual 쪽 _finalize_qual이 이미 쓰는
+        # by_rank와 완전히 같은 구조다(거기서 그대로 가져온 방식). 아래
+        # winners/runners는 기존 경로가 그대로 쓰므로 같이 유지한다.
+        by_rank: dict = {}
         for g in grps:
             standings = _qual_standings_for(_entries_by_grp.get(g, []), _matches_by_grp.get(g, []))
             if not standings:
                 continue
+            for _ri, _rrow in enumerate(standings):
+                by_rank.setdefault(_ri + 1, []).append(_rrow)
             if len(standings) >= 1: winners.append(standings[0])
             if len(standings) >= 2: runners.append(standings[1])
 
@@ -4738,7 +4822,21 @@ def _finalize_qual(t):
         if po_teams > 0:
             if direct_teams:
                 _save_qual_results(t, continent, direct_teams, set_done=False)
-            if direct_n == 0:
+            # [2026-09 신설, 신민용 확정: "아메리카는 조 3위 중 가장 점수
+            # 높은 애들끼리 단판 토너먼트를 통해 가면 된다"] po_pool_rank가
+            # 있으면 그 순위 풀에서 뽑는다(3위 풀 등). 없으면 기존 경로
+            # (direct_n==0이면 조 1위, 아니면 조 2위) 그대로다 — 값·순서·
+            # 정렬키가 한 글자도 안 바뀐다.
+            _po_rank = qual_cfg.get("po_pool_rank", 0)
+            if _po_rank:
+                _po_sorted = sorted(by_rank.get(_po_rank, []),
+                                     key=lambda r: (r["pts"], r["gf"]-r["ga"], r["gf"], r["ovr"]),
+                                     reverse=True)
+                # 그 순위가 이미 와일드카드로 직행한 풀이면(기본 2위) 직행분을
+                # 건너뛰고 그 다음부터 — _qual_progress_status의 동작과 동일.
+                _po_skip = wildcard if (_po_rank == 2 and wildcard > 0) else 0
+                po_pool = _po_sorted[_po_skip:_po_skip + po_teams]
+            elif direct_n == 0:
                 po_pool = winners[:po_teams]
             else:
                 runners.sort(key=lambda r: (r["pts"], r["gf"]-r["ga"], r["gf"], r["ovr"]), reverse=True)

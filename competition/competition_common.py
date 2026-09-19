@@ -90,6 +90,100 @@ class CompetitionConfig:
 _TOURNAMENT_OVR_CURVE_PTS = [(70, 70), (80, 80), (85, 85), (90, 93), (95, 100), (100, 108)]
 
 
+# ══════════════════════════════════════════════════════════════
+# 대회 경기일 배정 — 리그 일정과 안 겹치는 요일 고르기 (2026-09 신설)
+# ══════════════════════════════════════════════════════════════
+# [신민용 확정: "컵 대회랑 리그 일정은 절대 겹치면 안돼"] 지금까지
+# game_engine._week_intl_cl_day / super_cup_engine._pick_sc_days /
+# domestic_super_cup_engine._pick_dsc_day 셋 다 "내 팀(my_tid)이 낀
+# 경기만" 리그 일정을 피했다 — 주석에 그 이유("AI 팀끼리는 겹쳐도 화면에
+# 보이는 문제가 없고, 매번 이 조회를 하면 성능만 낭비된다")까지 명시돼
+# 있었는데, 세계 기록실에서 AI 팀 일정도 그대로 보이므로 그 전제가
+# 틀렸다. 3·4부컵은 아예 회피 로직 자체가 없어 전 세계가
+# week_to_day(week)+3 한 날에 몰려 있었다.
+#
+# 실측(6시즌 세이브, 2005시즌, 같은 팀이 같은 날 2경기):
+#     3·4부컵 + 리그  2,760건 (영향 팀 2,141)
+#     국내슈퍼컵 + 리그   23건
+#     대륙슈퍼컵 + 리그    2건
+# (국내컵/챔스/유로파/컨퍼런스는 AI 경기에 day를 안 쓰고 주차 단위로만
+#  돌아 애초에 "같은 날" 개념이 없다 — 내 팀이 낀 경기만 날짜가 잡히고
+#  그쪽은 이미 _week_intl_cl_day가 회피 중이라 대상 밖.)
+#
+# [gap 규칙의 의미 — 구현 전 확인 완료] 게임의 강제 휴식 규칙은
+# ui/center_panel.py 주석대로 "어제 경기 있었으면 오늘 무조건 휴식"
+# (경기 다음날 기준, 비대칭)이다. 그런데 경기 두 개(A일·B일, A<B)에
+# 이 규칙을 적용하면 B가 A+1일 수 없다는 제약 하나로 귀결되므로,
+# "두 경기는 최소 2일 떨어져 있어야 한다"(|A-B| >= 2)와 정확히 같다 —
+# 즉 기존 세 함수가 쓰던 대칭 조건(abs(diff) <= 1 회피)이 이미 그
+# 규칙의 올바른 표현이고, 여기서도 같은 의미로 gap=2를 쓴다.
+#
+# [폴백 — 신민용 확정] 조건을 만족하는 날이 하나도 없으면 다음 주로
+# 미루지 않고 기존 기본 날짜를 그대로 쓴다. 이 로직의 목적은 "완벽한
+# 일정 재편성"이 아니라 "가능한 한 안 겹치게"이고, 주차 경계를 넘기면
+# week 기반 일정 생성 구조 자체와 충돌하기 때문이다.
+#
+# [기존 세이브] 이미 생성된 경기의 day는 건드리지 않는다 — 새로 만드는
+# 라운드부터 이 로직이 적용된다.
+DEFAULT_MATCH_DAY_GAP = 2
+
+
+def league_day_map(conn, year, week, team_ids, span=1):
+    """team_ids가 week 주변(week-span ~ week+span)에 갖고 있는 리그 경기일을
+    {team_id: set(day)}로 한 번에 읽어온다.
+
+    라운드 하나당 1회만 호출하면 되므로(경기마다 조회하는 게 아니라),
+    3·4부컵 193개 대회 규모에서도 비용이 라운드당 쿼리 1~n개로 끝난다.
+    SQLite IN(...)은 프로젝트 관례대로 500개씩 청크한다."""
+    out: dict = {}
+    ids = sorted({t for t in team_ids if t})
+    if not ids:
+        return out
+    weeks = [week + d for d in range(-span, span + 1)]
+    wph = ",".join("?" * len(weeks))
+    for i in range(0, len(ids), 500):
+        part = ids[i:i + 500]
+        tph = ",".join("?" * len(part))
+        rows = conn.execute(
+            f"""SELECT home_team_id, away_team_id, day FROM match_results
+                 WHERE year=? AND week IN ({wph}) AND day IS NOT NULL AND day>0
+                   AND (home_team_id IN ({tph}) OR away_team_id IN ({tph}))""",
+            (year, *weeks, *part, *part)).fetchall()
+        want = set(part)
+        for r in rows:
+            h, a, d = r[0], r[1], r[2]
+            if h in want:
+                out.setdefault(h, set()).add(d)
+            if a in want:
+                out.setdefault(a, set()).add(d)
+    return out
+
+
+def pick_free_day(week_start, day_map, team_ids, default_day,
+                  offsets=(3, 2, 4, 1, 5, 0, 6), gap=DEFAULT_MATCH_DAY_GAP):
+    """week_start(그 주 첫날)부터 offsets 순서로 후보 요일을 시도해,
+    team_ids 전원이 기존 리그 경기와 gap일 이상 떨어지는 첫 날을 돌려준다.
+    하나도 없으면 default_day(기존 동작과 동일한 기본 날짜)로 폴백한다.
+
+    offsets 기본값은 3(기존 3·4부컵 요일)을 1순위로 두어, 겹치지 않는
+    경우에는 지금까지와 같은 날이 그대로 선택되게 한다."""
+    busy = set()
+    for tid in team_ids:
+        if tid:
+            # [2026-09 버그수정] `busy |= day_map.get(tid, ())`은
+            # day_map에 tid가 없을 때 기본값 ()(튜플)이 들어와 TypeError로
+            # 죽는다 — set의 |=는 set만 받고 튜플은 안 받는다.
+            # (week±span에 리그경기가 없는 팀 / day_map이 {}인 `if year else {}`
+            #  경로 둘 다 실제로 터짐) set.update()는 임의 iterable을 받으므로
+            # 값이 set이든 튜플이든 동일하게 동작한다(결과 불변).
+            busy.update(day_map.get(tid, ()))
+    for off in offsets:
+        cand = week_start + off
+        if all(abs(cand - d) >= gap for d in busy):
+            return cand
+    return default_day
+
+
 def _tournament_effective_ovr(ovr: float) -> float:
     """UEFA/대륙 클럽대항전 매치 확률 계산 전용 OVR 변환("중" 곡선).
     _TOURNAMENT_OVR_CURVE_PTS 구간을 선형 보간하고, 표 밖(70 미만/100 초과)은
@@ -1081,7 +1175,7 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
     else:
         _opp_ovr = (ae["ovr"] if is_home else he["ovr"])
         goals, assists, saves, rating, events, detail = _player_perf(
-            p, outcome, is_home, hs, as_, opp_ovr=_opp_ovr)
+            p, outcome, is_home, hs, as_, opp_ovr=_opp_ovr, is_big_match=True)
         _absence_reason = None
         _dismissed, _card_reason, _yellow_ev, _yellow_cnt = _roll_card_events(p, _susp_field)
         if _dismissed:

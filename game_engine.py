@@ -624,7 +624,8 @@ def _position_mismatch_rank(primary_pos: str, field_pos: str) -> int:
     return min(rank, len(POSITION_MISMATCH_PENALTY) - 1)
 
 
-def calc_positional_ovr(primary_pos: str, stats: dict, field_pos: str, cap: int = 100) -> float:
+def calc_positional_ovr(primary_pos: str, stats: dict, field_pos: str, cap: int = 100,
+                         physical_trait: str = None) -> float:
     """[2026-08 신설, 신민용 확정] 특정 포지션(field_pos)에 배치됐을 때의
     '실질 OVR' — calc_ovr(field_pos, stats)로 그 포지션 가중치 기준 OVR을
     먼저 구하고(포지션 적합도의 1차 반영, WEIGHTS 차이에서 이미 발생),
@@ -632,8 +633,15 @@ def calc_positional_ovr(primary_pos: str, stats: dict, field_pos: str, cap: int 
     작은 절대 OVR 보정 — 그 포지션이 '전문 분야가 아니다'라는 추가 감점)를
     뺀다. 두 페널티의 역할을 겹치지 않게 분리하는 게 핵심이라, 여기 절대
     차감폭은 -0.5~-5.0으로 작게 유지한다(그 이상은 이중 페널티가 된다).
-    field_pos == primary_pos면 당연히 차감 없음(주 포지션 그대로)."""
+    field_pos == primary_pos면 당연히 차감 없음(주 포지션 그대로).
+
+    [2026-09 신설, 신민용 확정] 신체특징 "다재다능"(mismatch_immune)을
+    가진 선수는 이 미스매치 차감 자체가 0이 된다 — 어떤 자리에 세워도
+    "전문 분야가 아니다" 페널티 없이 calc_ovr(field_pos, stats) 그대로."""
     base = calc_ovr(field_pos, stats, cap=cap)
+    _trait_fx = PHYSICAL_TRAIT_EFFECTS.get(physical_trait or "", {})
+    if _trait_fx.get("mismatch_immune"):
+        return round(base, 1)
     rank = _position_mismatch_rank(primary_pos, field_pos)
     penalty = POSITION_MISMATCH_PENALTY[rank]
     return round(base - penalty, 1)
@@ -886,6 +894,21 @@ def create_player(name: str, position: str, sub_role: str,
     _ovr_cap = talent_cap if talent_tier == "god" else 100
     ovr = calc_ovr(position, stat_vals, cap=_ovr_cap)
 
+    # [2026-09 신설, 신민용 확정] 내 선수 주발. AI와 완전히 같은 분포
+    # (constants.FOOT_DIST_BY_POS)를 쓰고, AI와 같은 이유로 random을
+    # 소비하지 않는다(database.assign_missing_feet 주석 참고). AI는
+    # player_id로 뽑지만 내 선수는 id가 항상 1이라 그것만으로는 같은
+    # 월드에서 캐릭터를 다시 만들어도 늘 같은 발이 나온다 — 이름/출생
+    # 연도/국적까지 해시 입력에 넣어 캐릭터마다 갈리게 한다.
+    try:
+        from database import roll_foot, get_foot_salt
+        _my_foot = roll_foot(
+            position, f"me:{name}:{_start_year - _start_age}:{nationality}",
+            get_foot_salt())
+    except Exception as _e:
+        print(f"[FOOT] 내 선수 주발 배정 실패(빈 값으로 진행): {_e}")
+        _my_foot = ""
+
     conn.execute("""
     INSERT INTO my_player(
         id, name, nationality, flag, age, birth_year,
@@ -897,14 +920,14 @@ def create_player(name: str, position: str, sub_role: str,
         leadership,leadership_max, concentration,concentration_max,
         ovr, current_year, current_week, current_season,
         stress, happiness, agent_grade, language,
-        talent_cap, talent_tier, physical_trait, body_type
+        talent_cap, talent_tier, physical_trait, body_type, foot
     ) VALUES (
         1,?,?,?,?,?,
         ?,?,?,?,?,?,
         ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
         ?,?,?,?,
         15,50,'없음','ko',
-        ?,?,?,?
+        ?,?,?,?,?
     )""", (
         name, nationality, flag, _start_age, _start_year - _start_age,
         position, sub_role, personality, height, weight, peak_age,
@@ -924,7 +947,7 @@ def create_player(name: str, position: str, sub_role: str,
         stat_vals["leadership"], stat_vals["leadership_max"],
         stat_vals["concentration"],stat_vals["concentration_max"],
         ovr, _start_year, 1, 1,
-        talent_cap, talent_tier, physical_trait, body_type,
+        talent_cap, talent_tier, physical_trait, body_type, _my_foot,
     ))
 
     # [복수국적] 추가 국적/국기 저장 (단일국적이면 빈 값)
@@ -3316,6 +3339,12 @@ def _apply_injury(p, week, day=None, stress=None, injury_load=None,
     detail_name = entry["name"]
     lo, hi = entry["recovery_days"]
     days = random.randint(lo, hi)
+    # [2026-09 신설, 신민용 확정] 신체특징 "회복력" — 복귀 기간(일수)에
+    # injury_recovery_mult를 곱해 단축한다(최소 1일 보장). 부상이 어떤
+    # 등급/부위로 뽑히는지 자체는 안 건드리고 회복 소요 기간만 줄인다.
+    _trait_fx_rec = PHYSICAL_TRAIT_EFFECTS.get(p.get("physical_trait", ""), {})
+    if "injury_recovery_mult" in _trait_fx_rec:
+        days = max(1, round(days * _trait_fx_rec["injury_recovery_mult"]))
     body_part = entry["body_part"]
     if entry["sided"]:
         # [재발] 취약 부위와 같은 계열(예: 'knee')이 뽑혔고 그 취약 부위에
@@ -5126,11 +5155,18 @@ _GK_SUB_ROLE_SR_MOD = {
 }
 
 
-def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None, opp_sot=None):
+def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None, opp_sot=None,
+                  is_big_match=False):
     """경기 퍼포먼스 계산 v3.
     포지션별 Base 차등 + 활약 가산 구조.
     수비수는 실점 관여 확률 트리거 감점.
+
+    [2026-09 신설, 신민용 확정] is_big_match — 호출부(각 대회 엔진)가
+    이미 big_match_rating(소심함/겁쟁이 등) 적용 여부를 판단하던 것과
+    동일한 "이 경기가 중요경기인가"를 여기로도 넘긴다. 성격 "승부사"의
+    슈팅 시도↑/정확도↓ 하이리스크 효과가 이 플래그에 게이트된다.
     """
+    _pe = PERSONALITY_EFFECTS.get(p.get("personality", ""), {})
     pos       = get_field_pos(p)
     # [2026-08 신설, 신민용 확정: "일단 내 선수만"] 배치 포지션(pos)이 주
     # 포지션과 다르면 POSITION_MISMATCH_PENALTY만큼 실질 OVR을 깎는다.
@@ -5141,7 +5177,8 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None, opp_sot=Non
     # my_player만 이 함수를 거치므로 자동으로 범위가 제한된다.
     _stats_for_ovr = {s: p.get(s, 40) for s in ALL_STATS}
     _ovr_cap = p.get("talent_cap", 100) if p.get("talent_tier") == "god" else 100
-    _my_ovr   = calc_positional_ovr(p.get("position", "CM"), _stats_for_ovr, pos, cap=_ovr_cap)
+    _my_ovr   = calc_positional_ovr(p.get("position", "CM"), _stats_for_ovr, pos, cap=_ovr_cap,
+                                     physical_trait=p.get("physical_trait"))
     my_score  = hs if is_home else as_
     opp_score = as_ if is_home else hs
     goals = assists = saves = 0
@@ -5438,6 +5475,11 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None, opp_sot=Non
         # gprob: GOAL_PROB_CAP 고정 (월클 폭발은 xg 멀티골로 반영)
         _gprob_cap = GOAL_PROB_CAP
         gprob = min(_gprob_cap, (g_base + sh*g_sh + dr*g_dr)*_gdom + _weak_bonus)
+        # [2026-09 신설, 신민용 확정] 성격 "승부사": 중요경기(is_big_match)
+        # 에서만 하이리스크·하이리턴 — 슈팅 시도(아래 shots)는 늘리는 대신
+        # 골 결정력(gprob)은 낮춘다("시도는 많지만 정확도는 낮음").
+        if is_big_match and "clutch_goal_mult" in _pe:
+            gprob = min(_gprob_cap, gprob * _pe["clutch_goal_mult"])
 
         aprob = min(ASSIST_PROB_CAP, (a_base + pa*a_pa + dr*a_dr)*_adom + 0.4*_weak_bonus)
         # ── 골 판정 ──────────────────────────────────────────
@@ -5588,8 +5630,10 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None, opp_sot=Non
             shot_w, key_w, drb_w, blk_w = 0.5, 1.3, 1.2, 1.00
         else:  # CB
             shot_w, key_w, drb_w, blk_w = 0.3, 0.5, 0.4, 1.22
+        _clutch_shot_mult = _pe.get("clutch_shot_mult", 1.0) if is_big_match else 1.0
         shots = int(round(shot_w * 0.72 * (0.4+0.6*sh) * _att_dom
-                           * (_mod.get("shot_mult", 1.0) if _mod else 1.0) + random.uniform(0,0.7)))
+                           * (_mod.get("shot_mult", 1.0) if _mod else 1.0)
+                           * _clutch_shot_mult + random.uniform(0,0.7)))
         shots = max(goals, shots)
         on_ratio = 0.28 + 0.16*sh
         shots_on = int(round(shots * on_ratio + random.uniform(0,0.4)))
@@ -5716,9 +5760,15 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None, opp_sot=Non
     # 분발)을 여기서 반영한다 — GK/필드플레이어 공통 경로라 한 곳만 고치면
     # 포지션 상관없이 다 적용된다. OVR 기반 base 위에 얹는 아주 작은
     # 가산이라 OVR의 절대적 비중은 그대로 유지된다.
-    _pe = PERSONALITY_EFFECTS.get(p.get("personality", ""), {})
     if my_score < opp_score and "losing_rating" in _pe:
         base += _pe["losing_rating"]
+    # [2026-09 신설, 신민용 확정] "홈보이": 홈경기 레이팅 보너스 / 원정경기
+    # 페널티 — 위 losing_rating과 같은 자리(GK/필드플레이어 공통 경로)에서
+    # is_home 여부로 분기 적용.
+    if is_home and "home_rating" in _pe:
+        base += _pe["home_rating"]
+    elif not is_home and "away_rating" in _pe:
+        base += _pe["away_rating"]
 
     _raw_rating = base + random.uniform(-0.15, 0.15)
     # [2026-07 버그수정, 신민용 리포트: "챔스 평점이 9.5/10.0이 너무
@@ -6079,6 +6129,11 @@ def _calc_pop(p, goals, assists, rating, grade=None) -> int:
     안 주어지면(호출부 미상/구버전 호환) 배수 1.0(중립)로 처리."""
     from constants import LEAGUE_POP_MULT
     mult = LEAGUE_POP_MULT.get(grade, 1.0)
+    # [2026-09 신설, 신민용 확정] 성격 "은둔형" — 인기도 상승 속도만
+    # 느리게(popularity_gain_mult). 부진 페널티(-1)는 화제성과 무관한
+    # 감점이라 건드리지 않는다.
+    _pe_pop = PERSONALITY_EFFECTS.get(p.get("personality", ""), {})
+    mult *= _pe_pop.get("popularity_gain_mult", 1.0)
     pop = p.get("popularity", 0)
     if goals > 0: pop = min(100, pop + goals*2*mult)
     if assists > 0: pop = min(100, pop + 1*mult)
@@ -8291,6 +8346,19 @@ def _advance_week(p, base_week, n_weeks=4, progress_cb=None):
         if _p_pending:
             _execute_pending_join_transfer(_p_pending, new_year, new_week)
 
+    # [2026-09 신설, 신민용+GPT 협업 확정: "강팀 오퍼가 너무 잦다"] 프리시즌
+    # 오퍼 구간(1~3주차)에 열어뒀던 "강팀 오퍼 빈자리"의 마감 기한 — 4주차
+    # (정규시즌 시작)가 되는 이 순간, 바로 위에서 예약 입단(내가 그 팀에
+    # 들어갔는지)을 이미 반영한 뒤이므로, 그래도 여전히 안 채워진 자리만
+    # AI 유망주로 강제 보충해 26명을 맞춘다. ai_lifecycle._roll_offer_
+    # vacancy_teams/_fill_offer_vacancies 참고.
+    if new_week == FIRST_HALF_START:
+        try:
+            from ai_lifecycle import _fill_offer_vacancies
+            _fill_offer_vacancies(new_year)
+        except Exception as _e:
+            add_log(f"⚠ 강팀 오퍼 빈자리 마감 보충 오류: {_e}", "event", new_year, new_week)
+
     # [2026-08 신설, 상반기/하반기 이적 기록 분리 기능, 신민용 요청:
     # "1993 기록이 2개로 나뉘며 상반기는 이팀 하반기는 2팀... 상황에
     # 따라 중간에도 AI 선수들 이적이 가능하긴 하나 이때는 0~2명 정도만"]
@@ -8643,6 +8711,24 @@ _rand = random.random
 _SCALE_MEMO = {}
 _POS_SUB_MEMO = {}
 
+# [2026-09 신설, 신민용 리포트: "GK도 득점은 가능하지, 무조건 하는게 문제인거지"]
+# 실측(2005시즌 GK 25,670명): 0골 83.4% / 1골 13.3% / 2골 3.0% / 3골 0.2% /
+# 4골 0.03% — 전 세계 GK의 1/6이 매 시즌 득점하는 상태였다. 원인은 두 가지가
+# 겹친 것이다:
+#   (1) AWARD_POS_GOAL/ASSIST(constants.py)에 GK 항목이 아예 없어서
+#       .get(pos, 1) 기본값 1로 떨어졌다 — CB와 완전히 같은 기대치.
+#   (2) 그 위에 팀 강도항(_d*0.2)이 포지션과 무관하게 그대로 더해졌다.
+#       실측 d 분포는 p99에서 +8.16(=+1.63골), 최대 +12.41(=+2.48골)이라,
+#       (1)을 고쳐 기준치를 0에 가깝게 낮춰도 강팀 GK는 여전히 2~3골을
+#       "확정으로" 받는다 — GK 득점은 소속팀이 강하다고 늘어나는 성질의
+#       기록이 아니므로 GK만 이 항의 계수를 0으로 둔다.
+# 세트피스 담당 같은 새 능력치는 만들지 않는다(신민용 확정) — 기준치만
+# 낮추고 기존 _tailed_season_mult의 꼬리(상위 0.5%에서 1.8~2.5배)로 "아주
+# 드물게 2~3골 넣는 GK"를 그대로 남긴다.
+#   pos -> (골 팀강도계수, 도움 팀강도계수).  미등록 포지션은 기존 (0.2, 0.1).
+_POS_TEAM_STRENGTH_COEF = {"GK": (0.0, 0.0)}
+_DEFAULT_TEAM_STRENGTH_COEF = (0.2, 0.1)
+
 
 def _estimate_ai_season(ovr, pos, team_avg, league_avg, sub_role=None, full_season_matches=14,
                          goal_env_mult=1.0):
@@ -8709,14 +8795,16 @@ def _estimate_ai_season(ovr, pos, team_avg, league_avg, sub_role=None, full_seas
     _ps = _POS_SUB_MEMO.get(_pskey)
     if _ps is None:
         _m = _SUB_ROLE_MATCH_MOD.get(_pskey)
+        _gd0, _ad0 = _POS_TEAM_STRENGTH_COEF.get(pos, _DEFAULT_TEAM_STRENGTH_COEF)
         _ps = _POS_SUB_MEMO[_pskey] = (
             AWARD_POS_GOAL.get(pos, 1), AWARD_POS_ASSIST.get(pos, 1),
             _m.get("g_mult", 1.0) if _m else 1.0,
-            _m.get("a_mult", 1.0) if _m else 1.0)
-    _gp, _ap, _gm, _am = _ps
+            _m.get("a_mult", 1.0) if _m else 1.0,
+            _gd0, _ad0)
+    _gp, _ap, _gm, _am, _gd, _ad = _ps
     _d = team_avg - league_avg
-    g_base = (_gp + _d*0.2) * scale * goal_env_mult * _gm
-    a_base = (_ap + _d*0.1) * scale * goal_env_mult * _am
+    g_base = (_gp + _d*_gd) * scale * goal_env_mult * _gm
+    a_base = (_ap + _d*_ad) * scale * goal_env_mult * _am
     if g_base < 0.0:
         g_base = 0.0
     if a_base < 0.0:
@@ -8752,7 +8840,40 @@ def _estimate_ai_season(ovr, pos, team_avg, league_avg, sub_role=None, full_seas
     return goals, assists, rating
 
 
-def estimate_ai_season_batch(ovr, pos, sub_role, team_avg, league_avg, fsm, goal_env_mult):
+def _make_season_estimate_rng(scope: str, year, salt=None):
+    """[2026-09 신설, NumPy 난수 결정화] estimate_ai_season_batch 전용 numpy
+    Generator를 (월드 salt, 연도, scope)에서 결정론적으로 만든다.
+
+    왜 이게 필요한가: 이 함수가 생기기 전 estimate_ai_season_batch는
+    np.random.random(전역 legacy RandomState)을 썼는데, 그 스트림엔 아무도
+    시드를 주지 않는다 — 파이썬 random 모듈을 고정 시드로 돌려도 이 추정치만은
+    실행마다 달라졌고, 그 차이가 _apply_ace_concentration의 분기(골/도움)를
+    가르면서 파이썬 난수 소비 횟수까지 바꿔 세계 전체가 갈라졌다(같은 세이브·
+    같은 시드로 400일 2회 실측: 파이썬 rng_calls 3,057,664 vs 3,059,368,
+    선수 122명·이적 279건 차이). 2026-08에 _age_and_progress에서 고친 것과
+    같은 병이다.
+
+    [설계] _age_and_progress처럼 random.getrandbits()로 시드를 뽑지 않는다 —
+    그러면 파이썬 전역 스트림을 호출마다 1회씩 소비해서, 나중에 파이썬 쪽
+    난수 순서를 바꾸는 최적화를 할 때마다 무관해야 할 시즌 스탯 추정치까지
+    통째로 흔들린다. 대신 _make_goal_seed과 완전히 같은 철학으로, 결정적인
+    입력(salt/연도/scope)을 crc32로 접어 시드를 만든다 — 파이썬 스트림을 한
+    번도 건드리지 않으므로 두 난수 스트림이 완전히 분리된다.
+
+    scope는 호출부가 리그/대회별로 반드시 다르게 준다(league, comp:cup,
+    comp:cl, ...). 같은 scope를 쓰면 두 대회가 같은 난수열을 받는다."""
+    import zlib
+    if salt is None:
+        from database import get_world_salt
+        salt = get_world_salt()
+    key = f"{salt}:{year}:{scope}:season_stat_estimate"
+    seed = zlib.crc32(key.encode("utf-8")) & 0xFFFFFFFF
+    import numpy as _np
+    return _np.random.default_rng(seed)
+
+
+def estimate_ai_season_batch(ovr, pos, sub_role, team_avg, league_avg, fsm, goal_env_mult,
+                              rng=None):
     """_estimate_ai_season + _estimate_ai_clean_sheets + _estimate_ai_gk_saves를
     선수 묶음 단위로 한 번에 계산한다(numpy). 입력은 모두 길이 n의 시퀀스.
     반환: (goals, assists, rating, clean_sheets, saves, goals_conceded) — 전부
@@ -8766,6 +8887,10 @@ def estimate_ai_season_batch(ovr, pos, sub_role, team_avg, league_avg, fsm, goal
     분포로 검증). 43주차 스냅샷에서만 69만 회 호출되던 구간이다.
     """
     import numpy as _np
+    # [2026-09 신설, NumPy 난수 결정화] rng는 _make_season_estimate_rng이
+    # 만들어 넘기는 결정론적 Generator다. 안 넘어오면(옛 호출부·테스트) 예전
+    # 그대로 시드 없는 전역 난수를 쓴다 — 계산은 100% 같지만 재현은 안 된다.
+    _rr = rng if rng is not None else _np.random
     n = len(ovr)
     if n == 0:
         return [], [], [], [], [], []
@@ -8777,6 +8902,7 @@ def estimate_ai_season_batch(ovr, pos, sub_role, team_avg, league_avg, fsm, goal
     # 포지션·서브롤별 상수(_POS_SUB_MEMO와 같은 값) — 종류가 수십 개뿐이라
     # 고유 조합만 계산해서 인덱스로 펼친다.
     gp = _np.empty(n); ap = _np.empty(n); gm = _np.empty(n); am = _np.empty(n)
+    gd = _np.empty(n); ad = _np.empty(n)
     _seen = {}
     for i in range(n):
         key = (pos[i], sub_role[i] or "")
@@ -8785,16 +8911,18 @@ def estimate_ai_season_batch(ovr, pos, sub_role, team_avg, league_avg, fsm, goal
             _ps = _POS_SUB_MEMO.get(key)
             if _ps is None:
                 _m = _SUB_ROLE_MATCH_MOD.get(key)
+                _gd0, _ad0 = _POS_TEAM_STRENGTH_COEF.get(key[0], _DEFAULT_TEAM_STRENGTH_COEF)
                 _ps = _POS_SUB_MEMO[key] = (
                     AWARD_POS_GOAL.get(key[0], 1), AWARD_POS_ASSIST.get(key[0], 1),
                     _m.get("g_mult", 1.0) if _m else 1.0,
-                    _m.get("a_mult", 1.0) if _m else 1.0)
+                    _m.get("a_mult", 1.0) if _m else 1.0,
+                    _gd0, _ad0)
             v = _seen[key] = _ps
-        gp[i], ap[i], gm[i], am[i] = v
+        gp[i], ap[i], gm[i], am[i], gd[i], ad[i] = v
     scale = (fsm_a / 38.0) ** 0.35
     d = ta - la
-    g_base = _np.maximum((gp + d * 0.2) * scale * gem * gm, 0.0)
-    a_base = _np.maximum((ap + d * 0.1) * scale * gem * am, 0.0)
+    g_base = _np.maximum((gp + d * gd) * scale * gem * gm, 0.0)
+    a_base = _np.maximum((ap + d * ad) * scale * gem * am, 0.0)
 
     def _tailed(u):      # _tailed_season_mult의 배열판(구간·계수 동일)
         return _np.select(
@@ -8804,14 +8932,14 @@ def estimate_ai_season_batch(ovr, pos, sub_role, team_avg, league_avg, fsm, goal
              1.50 + 0.30 * ((u - _TAIL_P2) / (_TAIL_P3 - _TAIL_P2))],
             1.80 + 0.70 * ((u - _TAIL_P3) / (1.0 - _TAIL_P3)))
 
-    goals = _np.round(g_base * _tailed(_np.random.random(n)))
-    assists = _np.round(a_base * _tailed(_np.random.random(n)))
+    goals = _np.round(g_base * _tailed(_rr.random(n)))
+    assists = _np.round(a_base * _tailed(_rr.random(n)))
     rating = _np.clip(_np.round(6.0 + (ovr_a - 60.0) / 35.0
                                 + goals * 0.02 + assists * 0.015, 2), 3.0, 9.5)
     # 클린시트(_estimate_ai_clean_sheets와 동일 식)
     cs = _np.maximum(_np.round(
         7.5 * (1.0 + d * 0.03) * (1.0 + _np.maximum(ovr_a - 70.0, 0.0) * 0.01)
-        * (fsm_a / 38.0) * (_U08_LO + _U08_SPAN * _np.random.random(n))), 0.0)
+        * (fsm_a / 38.0) * (_U08_LO + _U08_SPAN * _rr.random(n))), 0.0)
     # GK 세이브/실점(_estimate_ai_gk_saves와 동일 식) — GK만 계산
     saves = _np.zeros(n); conceded = _np.zeros(n)
     gk = _np.fromiter((p == "GK" for p in pos), dtype=bool, count=n)
@@ -8819,10 +8947,10 @@ def estimate_ai_season_batch(ovr, pos, sub_role, team_avg, league_avg, fsm, goal
         k = _np.flatnonzero(gk)
         spg = _np.clip(_GK_SHOTS_PER_MATCH_BASE * (1.0 - d[k] * 0.01), 2.0, 7.0)
         shots = _np.maximum(_np.round(
-            spg * fsm_a[k] * (_U085_LO + _U085_SPAN * _np.random.random(k.size))), 0.0)
+            spg * fsm_a[k] * (_U085_LO + _U085_SPAN * _rr.random(k.size))), 0.0)
         base_pct = 0.60 + _np.clip(ovr_a[k] - 50.0, 0.0, 50.0) / 50.0 * 0.28
         save_pct = _np.clip(base_pct + d[k] * 0.001
-                            + (_U005_LO + _U005_SPAN * _np.random.random(k.size)), 0.45, 0.92)
+                            + (_U005_LO + _U005_SPAN * _rr.random(k.size)), 0.45, 0.92)
         sv = _np.round(shots * save_pct)
         saves[k] = sv
         conceded[k] = _np.maximum(shots - sv, 0.0)
@@ -9018,6 +9146,69 @@ def _rank_among_ai(my_val, ai_vals_desc):
 _BEST11_GROUP_SLOTS = {"GK": 1, "DF": 4, "MF": 3, "FW": 3}
 
 
+# [2026-09 신설, 신민용 확정: "주전은 출전 70% 이상, 로테는 40~70%,
+# 대기는 40% 미만 — 이 %를 코드에 넣을 필요는 없고 역할 자체가 그
+# 요약이니 이걸 토대로 수상을 설계하면 된다"] 수상 후보 자격에서
+# 제외되는 역할. 원래 _get_ballon_candidates 안에 지역 상수
+# (_EXCLUDED_ROLES)로만 있어서 발롱도르/야신상에만 걸렸는데, 평점 기반
+# 상(베스트11/영플레이어/올해의 수비수/리그 MVP)에는 전혀 안 걸려 있었다
+# — "38경기 중 14경기만 뛴 고평점 선수가 베스트11에 뽑힌다"는 문제가
+# 정확히 그 구멍이다. 모듈 레벨로 올려 양쪽이 같은 자격 기준을 쓰게 한다.
+#
+# [설계 확정, 왜 계수가 아니라 게이트인가] 역할별 점수 계수(주전 1.0 /
+# 로테 0.9 ...)를 평점에 곱하는 안을 검토했으나 두 가지 이유로 기각했다.
+#   (1) 이중 페널티 — _apply_squad_depth_decay가 이미 역할을 보고 골·
+#       도움·클린시트·선방을 깎고 있다(대기 ×0.18 / 전력외 ×0.07).
+#       _get_ballon_candidates 주석이 같은 이유로 "점수가 아니라 후보
+#       자격 쪽에만 건다"고 명시해뒀다 — 그 판단을 그대로 따른다.
+#   (2) 스케일 붕괴 — AI 평점은 6.0 + (ovr-60)/35 + ... 라서 실질 편차가
+#       1.0 남짓인데, 여기 0.9를 곱하면 7.0이 6.3이 되어 역할 하나가
+#       다른 모든 항을 압도한다(깎이는 0.7이 전체 편차의 70%).
+# 게이트로 가면 계수값을 정할 필요 자체가 없고, "주전/로테는 후보,
+# 대기/전력외/유망주는 제외"라는 원안이 그대로 규칙이 된다.
+_AWARD_EXCLUDED_ROLES = ("대기", "전력외", "유망주")
+
+
+def _role_award_eligible(role) -> bool:
+    """그 시즌 역할(hist.ai_player_position_history.role)이 수상 후보
+    자격을 갖는가. role이 비어 있으면(이 기능 신설 이전 과거 시즌,
+    아직 역할 스냅샷이 없는 경로, 애초에 role을 안 싣는 국제대회 풀)
+    무조건 통과시킨다 — _get_ballon_candidates가 이미 쓰고 있는 원칙
+    그대로다: "데이터 공백을 자격 박탈로 오인하면 안 됨".
+
+    이 관용 규칙 덕분에 게이트를 공용 픽 함수(_pick_comp_extra_winners)에
+    걸어도 role을 싣지 않는 풀에서는 자동으로 무효가 된다 — 국제대회는
+    클럽 역할이 아니라 실제 출전수(intl_squad.appearances)를 쓰는 것이
+    맞으므로, 그쪽 동작은 이 게이트 도입 전과 100% 동일하게 유지된다."""
+    return not role or role not in _AWARD_EXCLUDED_ROLES
+
+
+def _role_from_play_ratio(matches, full_season_matches) -> str:
+    """내 선수 전용 — 실제 출전수를 AI와 같은 역할 라벨로 환산한다.
+
+    [왜 내 선수만 따로 환산하나] AI의 역할은 스쿼드 내 OVR 순위로 근사한
+    값이지만(formation_logic.compute_squad_roles), 내 선수는 진짜 출전
+    기록이 있다. 같은 게이트를 걸려면 둘을 같은 축으로 올려놔야 하는데,
+    내 선수를 OVR 순위로 근사하는 건 있는 실측값을 버리는 짓이다 —
+    반대로 실측값을 역할 라벨로 올리면 AI와 같은 기준으로 비교된다.
+
+    구간은 신민용이 확정한 값 그대로다(주전 70%+ / 로테이션 40~70% /
+    대기 40% 미만). 이 비율이 게임 규칙으로 코드 여기저기 퍼지면 안 되므로
+    쓰는 곳은 이 함수 하나뿐이고, 나머지는 전부 역할 라벨로만 이야기한다.
+    "전력외"는 내보내지 않는다 — AI 쪽에서 그 라벨은 마지막 구간의 성인
+    선수라는 뜻(나이로 유망주와 갈린 결과)이지 출전 0을 뜻하지 않아서,
+    출전 비율만 보고 같은 라벨을 붙이면 의미가 어긋난다. 게이트 기준으로는
+    "대기"와 어차피 동일하게 탈락 처리된다."""
+    if not full_season_matches or full_season_matches <= 0:
+        return "주전"      # 분모를 모르면 자격을 박탈하지 않는다(위와 같은 원칙)
+    ratio = (matches or 0) / full_season_matches
+    if ratio >= 0.70:
+        return "주전"
+    if ratio >= 0.40:
+        return "로테이션"
+    return "대기"
+
+
 def _evaluate_extra_awards(pool, my_pos, my_age=25, weight_fn=None, young_age_cutoff=21):
     """[2026-09 재설계, 신민용 확정: "베스트11은 포지션별로 평점 최상위
     (포메이션 정원만큼)가 받고, 영플레이어는 어린 선수 중 평점 1위가
@@ -9036,6 +9227,10 @@ def _evaluate_extra_awards(pool, my_pos, my_age=25, weight_fn=None, young_age_cu
     def _w(x):
         return weight_fn(x) if weight_fn else 1.0
     won = []
+    # [2026-09 신설] "내가 받았는가" 판정도 세계 수상자 산출(_pick_comp_
+    # extra_winners)과 같은 역할 게이트를 써야 둘이 안 어긋난다 — role을
+    # 안 싣는 풀에서는 _role_award_eligible이 전부 True라 무효가 된다.
+    pool = [x for x in pool if _role_award_eligible(x.get("role"))] or pool
     _grp_pos = {"GK": GK_POS, "DF": DF_POS, "MF": MF_POS, "FW": FW_POS}
     for gname, poslist in _grp_pos.items():
         if my_pos not in poslist:
@@ -9114,7 +9309,14 @@ def _alloc_int_by_weights(weights, total):
     base = [int(x) for x in raw]
     rem = total - sum(base)
     if rem > 0:
-        order = sorted(range(n), key=lambda i: (-(raw[i] - base[i]), i))
+        # [2026-09 성능, 43주차 스냅샷] 정렬 키를 파이썬 람다(호출당 튜플
+        # 1개 생성 + raw/base 인덱싱 2번)에서 미리 계산한 리스트의 C 레벨
+        # __getitem__으로 바꾼다. 잔여가 같을 때의 순서는 sorted가 안정
+        # 정렬이라 range(n)의 오름차순 인덱스가 그대로 유지되므로, 예전
+        # (-(잔여), i) 튜플 키와 결과가 비트 단위로 같다(동점 케이스만
+        # 6천 건 포함한 12,000 케이스 대조: 전부 일치).
+        _negfrac = [b - x for x, b in zip(raw, base)]
+        order = sorted(range(n), key=_negfrac.__getitem__)
         for i in order[:rem]:
             base[i] += 1
     return base
@@ -9148,8 +9350,17 @@ def _apply_team_goal_budget(rows, key_fn, team_goals_for, allow_zero=False):
     if not team_goals_for:
         return
     groups: dict = {}
+    # [2026-09 성능, 43주차 스냅샷] setdefault는 이미 있는 키에도 빈 리스트를
+    # 매번 새로 만들어 넘긴다(56만 행이면 56만 개). get으로 먼저 보고 없을
+    # 때만 만든다 — 그룹 구성도 그룹 안의 순서도 예전과 완전히 같다.
+    _gget = groups.get
     for r in rows:
-        groups.setdefault(key_fn(r), []).append(r)
+        _k = key_fn(r)
+        _members = _gget(_k)
+        if _members is None:
+            groups[_k] = [r]
+        else:
+            _members.append(r)
     for k, members in groups.items():
         real = team_goals_for.get(k)
         if real is None:
@@ -9157,8 +9368,23 @@ def _apply_team_goal_budget(rows, key_fn, team_goals_for, allow_zero=False):
         real = int(real)
         if real < 0 or (real == 0 and not allow_zero):
             continue
-        gw = [max(0.0, float(m.get("goals") or 0)) for m in members]
-        aw = [max(0.0, float(m.get("assists") or 0)) for m in members]
+        # [2026-09 성능, 43주차 스냅샷] 예전엔 행마다 float()과 max()를
+        # 각각 불렀다(56만 행 × 2필드 = 224만 회의 파이썬 호출). 값이
+        # 양수면 float()만, 아니면 0.0 — None/0/음수/NaN 전부 예전
+        # max(0.0, float(v or 0))과 같은 값이 나온다.
+        gw = []
+        aw = []
+        _gwa = gw.append
+        _awa = aw.append
+        for m in members:
+            _v = m.get("goals")
+            _gwa(float(_v) if _v and _v > 0 else 0.0)
+            _v = m.get("assists")
+            _awa(float(_v) if _v and _v > 0 else 0.0)
+        # [주의] 이 합계는 반드시 내장 sum()이어야 한다 — 파이썬 3.12의
+        # sum()은 float에 보정합(Neumaier)을 쓰므로, 직접 루프로 더하면
+        # 마지막 자리가 달라져 도움 예산과 배분 결과가 바뀐다(에이스
+        # 집중 뒤의 대회 경로는 값이 float이라 실제로 해시가 깨졌다).
         g_sum, a_sum = sum(gw), sum(aw)
         g_alloc = _alloc_int_by_weights(gw, real)
         a_budget = 0
@@ -9610,9 +9836,11 @@ def _collect_league_candidates(c, league_id, exclude_my_team=None, full_season_m
             f"""SELECT ap.id AS player_id, ap.team_id AS tid, ap.name, ap.position, ap.ovr,
                       ap.age AS age, h.goals AS goals, h.assists AS assists, h.rating AS rating,
                       h.clean_sheets AS cs, h.saves AS saves, h.goals_conceded AS goals_conceded,
-                      h.matches AS matches
+                      h.matches AS matches, ph.role AS role
                FROM hist.ai_player_season_stats h
                JOIN ai_players ap ON ap.id = h.player_id
+               LEFT JOIN hist.ai_player_position_history ph
+                 ON ph.player_id = ap.id AND ph.year = h.year
                WHERE h.year=? AND ap.team_id IN ({_tid_ph}) AND ap.position IN ({placeholders})""",
             (year, *_team_ids, *ALL_AWARD_POS)).fetchall()
         # [2026-09 신설, "리그전 개인상" 세계 계산용] player_id를 추가했다 —
@@ -9626,6 +9854,7 @@ def _collect_league_candidates(c, league_id, exclude_my_team=None, full_season_m
             "is_mine": False, "cs": r["cs"] or 0,
             "saves": r["saves"] or 0, "goals_conceded": r["goals_conceded"] or 0,
             "matches": r["matches"] or full_season_matches, "team_id": r["tid"],
+            "role": r["role"],
         } for r in hist_rows]
         return cands, league_avg
 
@@ -9661,6 +9890,11 @@ def _collect_league_candidates(c, league_id, exclude_my_team=None, full_season_m
             "goals": g, "assists": a, "rating": rt, "is_mine": False, "cs": cs,
             "saves": sv, "goals_conceded": gc,
             "matches": full_season_matches, "team_id": r["tid"],
+            # [2026-09] 이 분기(year 없음 = 시즌 중 은퇴, 그 해 아카이브가
+            # 아직 없는 경로)는 역할 스냅샷도 아직 없다 — None으로 두면
+            # _role_award_eligible이 전원 통과시켜 이 경로의 동작은 역할
+            # 게이트 도입 전과 100% 동일하게 유지된다.
+            "role": None,
         })
 
     # [2026-09 신설] 스쿼드 뎁스 감쇠 — team_goals_for 스케일링 전에 적용해야
@@ -9733,12 +9967,20 @@ def _collect_all_league_candidates(c, year, fsm_by_league, team_league_map=None)
     # 시즌이 더 쌓이면(대략 25~30시즌 부근) 역전될 수 있으니, 그때 다시
     # 재보고 바꾸는 게 맞다(바꾸는 방법은 _get_ballon_candidates 주석 참고).
     rows = c.execute(
+        # [2026-09 확장, 신민용 확정: "역할이 곧 얼마나 뛰었는지의 요약"]
+        # ph.role(그 시즌 주전/로테이션/대기/전력외/유망주)을 같이 끌어온다 —
+        # 평점 기반 상(베스트11/영플레이어/올해의 수비수/MVP)의 후보 자격
+        # 게이트(_role_award_eligible)에 쓴다. LEFT JOIN이라 역할 스냅샷이
+        # 없는 과거 시즌도 행 수는 그대로 유지된다(role만 NULL → 자격 통과).
+        # 컬럼은 맨 뒤에 붙여서 아래 위치 인덱스(r[0]~r[11])를 안 건드린다.
         """SELECT t.league_id, ap.id, ap.team_id, ap.position, ap.age,
                   h.goals, h.assists, h.rating, h.clean_sheets, h.saves,
-                  h.goals_conceded, h.matches
+                  h.goals_conceded, h.matches, ph.role
            FROM hist.ai_player_season_stats h
            JOIN ai_players ap ON ap.id = h.player_id
            JOIN teams t ON ap.team_id = t.id
+           LEFT JOIN hist.ai_player_position_history ph
+             ON ph.player_id = ap.id AND ph.year = h.year
            WHERE h.year=? AND ap.position IN ({})""".format(placeholders),
         (year, *ALL_AWARD_POS)).fetchall()
     out = {}
@@ -9753,6 +9995,7 @@ def _collect_all_league_candidates(c, year, fsm_by_league, team_league_map=None)
             "goals": r[5], "assists": r[6], "rating": r[7], "cs": r[8] or 0,
             "saves": r[9] or 0, "goals_conceded": r[10] or 0,
             "matches": r[11] or fsm_by_league.get(lid, 14), "is_mine": False,
+            "role": r[12],
         })
     return out
 
@@ -12383,7 +12626,12 @@ def _get_ballon_candidates(c, year):
     # — 두 상이 서로 다른 자격 기준을 갖지 않는다.
     # role이 없는 행(이 기능 신설 이전 과거 시즌 등)은 걸러내지 않는다
     # (데이터 공백을 자격 박탈로 오인하면 안 됨).
-    _EXCLUDED_ROLES = ("대기", "전력외", "유망주")
+    # [2026-09 공용화] 이 지역 상수를 모듈 레벨 _AWARD_EXCLUDED_ROLES로
+    # 올려서 평점 기반 상(베스트11/영플레이어/올해의 수비수/리그 MVP)도
+    # 같은 자격 기준을 쓰게 했다 — 여기서는 이름만 별칭으로 남겨
+    # 아래 쿼리 파라미터 전개(*_EXCLUDED_ROLES)를 그대로 둔다(값·동작
+    # 완전 동일, 발롱도르/야신상 결과는 1비트도 안 바뀐다).
+    _EXCLUDED_ROLES = _AWARD_EXCLUDED_ROLES
     # [2026-09 확장, 신민용 확정: "챔스 개인 기록을 발롱도르 점수에 반영"]
     # hist.ai_player_season_stats_by_comp(competition='cl')를 LEFT JOIN
     # 으로 같이 끌어온다 — PK가 (player_id, year, competition)이라 한
@@ -12737,17 +12985,30 @@ def _pick_comp_extra_winners(pool, young_age_cutoff=23):
     assisters = [x for x in pool if (x.get("assists") or 0) > 0]
     if assisters:
         result["assist"] = max(assisters, key=lambda x: (x["assists"], -x["player_id"]))
+    # [2026-09 신설, 신민용 확정] 평점 기반 상(베스트11/영플레이어/올해의
+    # 수비수)에만 역할 자격 게이트를 건다 — 도움왕과 골든글러브는 기록형
+    # 상이라 그대로 둔다(신민용 확정: "득점왕까지 팀 성적을 강하게 넣으면
+    # 안 되고, 도움왕도 마찬가지고, 골든글러브도 단순 팀 순위 때문에
+    # 왜곡하면 안 된다" — 같은 이유로 출전 역할도 안 건드린다).
+    #
+    # role 키가 없는 풀(국제대회 — 클럽 역할이 아니라 실제 appearances를
+    # 쓰는 게 맞는 쪽)에서는 _role_award_eligible이 전부 True라 이 필터가
+    # 자동으로 무효가 된다 — 그쪽 결과는 1비트도 안 바뀐다.
+    #
+    # 전원이 걸러지는 극단적 경우(후보가 몇 명뿐인 짧은 대회 등)에만
+    # 원래 풀로 되돌린다 — 게이트 때문에 상이 통째로 사라지는 게 더 나쁘다.
+    _rated_pool = [x for x in pool if _role_award_eligible(x.get("role"))] or pool
     _grp_pos = {"GK": GK_POS, "DF": DF_POS, "MF": MF_POS, "FW": FW_POS}
     for gname, poslist in _grp_pos.items():
-        group = [x for x in pool if x["position"] in poslist]
+        group = [x for x in _rated_pool if x["position"] in poslist]
         if not group:
             continue
         ranked = sorted(group, key=lambda x: (-(x.get("rating") or 0), x["player_id"]))
         result["best11"].extend(ranked[:_BEST11_GROUP_SLOTS[gname]])
-    young_cands = [x for x in pool if (x.get("age") or 30) <= young_age_cutoff]
+    young_cands = [x for x in _rated_pool if (x.get("age") or 30) <= young_age_cutoff]
     if young_cands:
         result["young"] = max(young_cands, key=lambda x: ((x.get("rating") or 0), -x["player_id"]))
-    df_group = [x for x in pool if x["position"] in DF_POS]
+    df_group = [x for x in _rated_pool if x["position"] in DF_POS]
     if df_group:
         result["defender"] = max(df_group, key=lambda x: ((x.get("rating") or 0), -x["player_id"]))
     gk_group = [x for x in pool if x["position"] in GK_POS]
@@ -13025,7 +13286,126 @@ def _save_ballon_dor_top30(c, year, candidates):
         "score_rating": x["score_rating"], "score_goals_assists": x["score_goals_assists"],
         "score_position_adj": x["score_position_adj"],
         "stat_goals": x.get("goals") or 0, "stat_assists": x.get("assists") or 0,
+        # [2026-09 버그수정, 신민용 리포트: "발롱도르/야신상/푸스카스만
+        # stat_saves·stat_goals_conceded가 100% NULL"] 리그/클럽대항전/
+        # 국제대회 경로는 _award_entry_from_pool이 네 stat을 전부 채우는데,
+        # 세계 3대상만 entry dict를 인라인으로 직접 조립하면서 GK 지표
+        # 두 개를 빠뜨렸다. 값은 이미 후보 dict에 들어있다
+        # (_get_ballon_candidates가 s.saves/s.goals_conceded를 SELECT해
+        # "saves"/"goals_conceded" 키로 담아둔다) — 그대로 넘기기만 하면
+        # 된다. my_player 후보는 원래 None이므로 기존과 동일하게 NULL.
+        "stat_saves": x.get("saves"), "stat_goals_conceded": x.get("goals_conceded"),
     }) for i, x in enumerate(top30)]
+    _save_individual_award_rows(c, year, "world", None, entries)
+    # [2026-09 신설] FIFA 올해의 선수 + 대륙별 올해의 선수 — 발롱도르와
+    # 완전히 같은 채점 결과(scored)를 재사용한다(아래 함수 주석 참고).
+    _save_world_poty_awards(c, year, scored)
+
+
+# [2026-09 신설, 신민용 확정: "피파상을 야신상·푸스카스상 옆에 버튼으로
+# 붙이고, 누르면 각 상을 누가 받았는지 뜨게"] 대륙 → 그 대륙 올해의
+# 선수 상 이름. 원래 _process_my_awards 안에 지역 상수(_CONTINENT_POY)로만
+# 있어서 "내가 받았는가" 판정에만 쓰였고, AI 수상자를 산출·저장하는
+# 경로가 아예 없었다 — season_individual_awards에 행이 0건이라 세계
+# 기록실에서 조회할 것 자체가 없는 상태였다. 모듈 레벨로 올려 양쪽이
+# 같은 이름표를 쓰게 한다.
+#
+# [변경점, 신민용 확정] 예전 _CONTINENT_POY는 오세아니아를 "AFC 올해의
+# 선수"에 합쳐 넣었는데, 확정된 설계 트리(UEFA/CONMEBOL/CONCACAF/AFC/
+# CAF/OFC 각 1위)에 맞춰 OFC를 분리한다.
+# countries.continent 원값에 "북미"와 "북중미"가 섞여 들어올 수 있어
+# (constants.CONTINENT_OVR_BONUS/CONTINENT_SALARY_MULT에 둘 다 키로
+# 등록돼 있음) 둘 다 콩카카프로 받는다.
+_CONTINENT_POY = {
+    "유럽": "UEFA 올해의 선수",
+    "남미": "코메볼 올해의 선수",
+    "북미": "콩카카프 올해의 선수",
+    "북중미": "콩카카프 올해의 선수",
+    "아시아": "AFC 올해의 선수",
+    "아프리카": "CAF 올해의 선수",
+    "오세아니아": "OFC 올해의 선수",
+}
+_FIFA_POY_AWARD = "FIFA 올해의 선수"
+
+
+def _nationality_continent_map(c) -> dict:
+    """{국가명: 대륙} — ai_players.nationality/my_player.nationality가
+    countries.name과 같은 문자열이므로 그대로 키로 쓴다. 전세계 211개국
+    한 번만 조회한다(시즌당 1회 호출)."""
+    return {r["name"]: r["continent"] for r in c.execute(
+        "SELECT name, continent FROM countries").fetchall()}
+
+
+def _save_world_poty_awards(c, year, scored):
+    """[2026-09 신설] FIFA 올해의 선수 + 대륙별 올해의 선수의 '실제
+    세계 수상자'를 산출해 저장한다.
+
+    scored: _save_ballon_dor_top30이 방금 채점·정렬해둔 발롱도르 후보
+    전원(total_score 내림차순, AI + 나). 팀당 상한(_BALLON_MAX_PER_TEAM)을
+    적용하기 '전' 목록을 그대로 받는다 — 그 상한은 "Top30 명단이 한 팀으로
+    도배되는 걸 막는" 발롱도르 표시 전용 규칙이지, "그 대륙에서 가장
+    좋았던 선수가 누구인가"와는 무관하기 때문이다.
+
+    [설계, 신민용 확정] 내 선수 쪽 대륙상 판정 로직(_process_my_awards의
+    OVR 문턱 + 생산성 문턱 조합)을 AI에 그대로 복사하지 않는다. 두 가지
+    이유다.
+      (1) 그 로직은 순위가 아니라 통과/탈락 게이트라, AI 전체에 걸면
+          한 대륙에서 수십 명이 동시에 통과한다 — 상은 한 명인데.
+      (2) 그 식이 쓰는 trophy_bonus/_other_bonus는 AI에 대해 계산 자체가
+          안 된다(AI는 개별 수상 이력을 추적하지 않음 — _process_my_awards
+          주석에 명시).
+    대신 "발롱도르와 동일한 점수 → 대륙별로 후보를 좁힘 → 그 안에서
+    1위"로 간다. 별도의 대륙상 전용 점수식을 새로 만들 필요가 없고,
+    "그 대륙에서 가장 좋은 선수"라는 상의 의미와도 정확히 맞는다.
+
+    [설계, 신민용 확정: "대륙상이 현실에선 그 대륙에서 뛰는 선수야?
+    아님 이 대륙 선수 중 고르는거?"] 소속 리그의 대륙이 아니라 **국적의
+    대륙**으로 묶는다. 현실의 CAF 올해의 선수가 하키미(PSG)·살라(리버풀)·
+    오시멘(갈라타사라이)처럼 해외파를 그대로 포함하기 때문이다. 예전
+    _process_my_awards는 teams→leagues→countries.continent(소속 리그
+    기준)로 판정했는데, 이러면 이집트 국적 리버풀 선수가 유럽으로 잡힌다.
+    게다가 발롱도르 후보 풀 자체가 1부 + 리그등급 SS/S/A 20개국으로
+    좁혀져 있고 그 안에 아프리카·오세아니아 국가가 하나도 없어서,
+    소속 리그 기준으로는 CAF/OFC 수상자가 영원히 안 나왔다.
+
+    역할 게이트는 여기서 따로 걸지 않는다 — scored는 이미 _get_ballon_
+    candidates가 _AWARD_EXCLUDED_ROLES로 거른 뒤의 목록이다."""
+    if not scored:
+        return
+    entries = []
+    # FIFA 올해의 선수 — 발롱도르 1위 자동 연동(신민용 확정: "이 상을
+    # 가르는 실제 기준(기자/감독/주장/팬 투표)을 재현할 데이터가 없으므로
+    # 별도 판정 로직 없이 발롱도르 수상과 그대로 묶는다"). scored는 이미
+    # 최종 정렬 상태이고 팀 상한은 건너뛰기만 할 뿐 순서를 바꾸지 않으므로
+    # scored[0]은 항상 발롱도르 1위와 같은 선수다.
+    _best = scored[0]
+    entries.append((_FIFA_POY_AWARD, 1, {
+        "player_id": _best["player_id"], "team_id": _best.get("team_id"),
+        "position": _best.get("position"), "total_score": _best["total_score"],
+        "score_trophy": _best.get("score_trophy"), "score_rating": _best.get("score_rating"),
+        "score_goals_assists": _best.get("score_goals_assists"),
+        "score_position_adj": _best.get("score_position_adj"),
+        "stat_goals": _best.get("goals") or 0, "stat_assists": _best.get("assists") or 0,
+        "stat_saves": _best.get("saves"), "stat_goals_conceded": _best.get("goals_conceded"),
+    }))
+
+    nat_cont = _nationality_continent_map(c)
+    _best_by_cont = {}
+    for x in scored:      # 이미 total_score 내림차순 — 대륙별 첫 등장이 곧 1위
+        cont = nat_cont.get(x.get("nationality"))
+        award = _CONTINENT_POY.get(cont)
+        if award and award not in _best_by_cont:
+            _best_by_cont[award] = x
+    for award, x in _best_by_cont.items():
+        entries.append((award, 1, {
+            "player_id": x["player_id"], "team_id": x.get("team_id"),
+            "position": x.get("position"), "total_score": x["total_score"],
+            "score_trophy": x.get("score_trophy"), "score_rating": x.get("score_rating"),
+            "score_goals_assists": x.get("score_goals_assists"),
+            "score_position_adj": x.get("score_position_adj"),
+            "stat_goals": x.get("goals") or 0, "stat_assists": x.get("assists") or 0,
+            "stat_saves": x.get("saves"), "stat_goals_conceded": x.get("goals_conceded"),
+        }))
     _save_individual_award_rows(c, year, "world", None, entries)
 
 
@@ -13097,6 +13477,9 @@ def _save_yashin_trophy_top10(c, year, candidates=None):
         "score_rating": x["score_rating"], "score_goals_assists": x["score_goals_assists"],
         "score_position_adj": x["score_position_adj"],
         "stat_goals": x.get("goals") or 0, "stat_assists": x.get("assists") or 0,
+        # [2026-09 버그수정, 위 발롱도르와 같은 원인] 야신상은 GK 전용
+        # 상이라 선방/실점이야말로 핵심 지표인데 그 둘만 NULL이었다.
+        "stat_saves": x.get("saves"), "stat_goals_conceded": x.get("goals_conceded"),
     }) for i, x in enumerate(top10)]
     _save_individual_award_rows(c, year, "world", None, entries)
 
@@ -13351,9 +13734,50 @@ def _save_puskas_top10(c, year, league_winners):
         if len(rest) >= _PUSKAS_NOMINEE_COUNT - 1:
             break
     ordered = [winner] + rest
+    # [2026-09 버그수정, 위 발롱도르/야신상과 같은 원인] 푸스카스만은
+    # 네 stat이 전부 NULL이었다. 발롱도르/야신상과 달리 후보 dict
+    # (_pool_by_league 원소)가 goals/matches/position/ovr만 갖고 있어
+    # 그대로는 채울 수 없고, my_player 경로 원소는 그마저도 없다
+    # (player_id/team_id/goal_event_id/final_score뿐) — 풀 원소 모양이
+    # 경로마다 달라서다. 그래서 최종 명단(최대 _PUSKAS_NOMINEE_COUNT명,
+    # 실측 11명)만 시즌 스탯에서 한 번에 조회해 균일하게 채운다.
+    # 쿼리 1회 x 연 1회이고 난수를 전혀 쓰지 않으므로 월드 진행에
+    # 영향이 없다(수상자 추첨은 이미 위에서 끝났다).
+    _pk_ids = [w["player_id"] for w in ordered
+               if isinstance(w.get("player_id"), int) and w["player_id"] >= 0]
+    _pk_stats = {}
+    if _pk_ids:
+        _pk_ph = ",".join("?" * len(_pk_ids))
+        try:
+            for _r in c.execute(
+                    f"""SELECT s.player_id AS player_id, s.goals AS goals,
+                               s.assists AS assists, s.saves AS saves,
+                               s.goals_conceded AS goals_conceded,
+                               ph.position AS position
+                        FROM hist.ai_player_season_stats s
+                        LEFT JOIN hist.ai_player_position_history ph
+                          ON ph.player_id = s.player_id AND ph.year = s.year
+                        WHERE s.year=? AND s.player_id IN ({_pk_ph})""",
+                    (year, *_pk_ids)):
+                _pk_stats[_r["player_id"]] = _r
+        except Exception as _e:
+            # 조회 실패해도 수상 자체는 기존과 동일하게 저장돼야 한다
+            # — stat만 예전처럼 NULL로 남는다.
+            add_log(f"⚠ 푸스카스 stat 조회 실패: {_e}", "event", year)
+    def _pk_stat(w, key):
+        _s = _pk_stats.get(w.get("player_id"))
+        return _s[key] if _s is not None else None
     entries = [("FIFA 푸스카스상", i + 1, {
         "player_id": w["player_id"], "team_id": w["team_id"],
         "total_score": w["final_score"], "goal_event_id": w["goal_event_id"],
+        # position도 여태 100% NULL이었다(발롱도르/야신상은 0%) — 후보
+        # dict에 있으면 그걸 쓰고, 없으면 위 조회의 연도별 포지션
+        # 스냅샷(ai_player_position_history)에서 채운다.
+        "position": w.get("position") or _pk_stat(w, "position"),
+        "stat_goals": _pk_stat(w, "goals"),
+        "stat_assists": _pk_stat(w, "assists"),
+        "stat_saves": _pk_stat(w, "saves"),
+        "stat_goals_conceded": _pk_stat(w, "goals_conceded"),
     }) for i, w in enumerate(ordered)]
     _save_individual_award_rows(c, year, "world", None, entries)
 
@@ -13391,11 +13815,19 @@ def _club_comp_pool_by_team(c, year, competition):
     추가한다면 반드시 복사해서 써야 한다."""
     out = {}
     for r in c.execute(
+            # [2026-09 확장] prh.role — 클럽 대항전 평점 기반 상(베스트11/
+            # 영플레이어/올해의 수비수)의 후보 자격 게이트용. 리그 쪽과
+            # 같은 시즌 역할 스냅샷을 쓴다(신민용 확정: "클럽 대항전들은
+            # 팀 내 역할로 가면 되는 거고"). 컬럼은 맨 뒤에 붙여 아래
+            # 위치 인덱스를 안 건드린다.
             """SELECT ap.id, ap.team_id, ap.position, ap.age, s.matches, s.goals,
-                      s.assists, s.rating, s.clean_sheets, s.saves, s.goals_conceded
+                      s.assists, s.rating, s.clean_sheets, s.saves, s.goals_conceded,
+                      prh.role
                FROM ai_players ap
                JOIN hist.ai_player_season_stats_by_comp s
-                 ON s.player_id = ap.id AND s.year=? AND s.competition=?""",
+                 ON s.player_id = ap.id AND s.year=? AND s.competition=?
+               LEFT JOIN hist.ai_player_position_history prh
+                 ON prh.player_id = ap.id AND prh.year = s.year""",
             (year, competition)).fetchall():
         tid = r[1]
         bucket = out.get(tid)
@@ -13404,7 +13836,9 @@ def _club_comp_pool_by_team(c, year, competition):
         bucket.append({
             "player_id": r[0], "team_id": tid, "position": r[2], "age": r[3],
             "matches": r[4], "goals": r[5], "assists": r[6], "rating": r[7],
-            "cs": r[8], "saves": r[9], "goals_conceded": r[10],
+            "cs": r[8], "saves": r[9], "goals_conceded": r[10], "role": r[11],
+            # [2026-09] 진출 단계 계수 조회 키 — 클럽 대회는 팀 단위다.
+            "stage_key": tid,
         })
     return out
 
@@ -13438,10 +13872,13 @@ def _club_comp_squad_pool(c, team_ids, year, competition, my_team_id, my_tournam
             f"""SELECT ap.id AS player_id, ap.team_id AS team_id, ap.position AS position,
                        ap.age AS age, s.matches AS matches, s.goals AS goals, s.assists AS assists,
                        s.rating AS rating, s.clean_sheets AS cs, s.saves AS saves,
-                       s.goals_conceded AS goals_conceded
+                       s.goals_conceded AS goals_conceded, prh.role AS role,
+                       ap.team_id AS stage_key
                 FROM ai_players ap
                 JOIN hist.ai_player_season_stats_by_comp s
                   ON s.player_id = ap.id AND s.year=? AND s.competition=?
+                LEFT JOIN hist.ai_player_position_history prh
+                  ON prh.player_id = ap.id AND prh.year = s.year
                 WHERE ap.team_id IN ({ph})""",
             (year, competition, *team_ids)).fetchall()]
     # [2026-09 버그수정, 신민용 리포트: "2001 아시아 챔피언스리그에서 내가
@@ -13485,17 +13922,227 @@ def _club_comp_squad_pool(c, team_ids, year, competition, my_team_id, my_tournam
                 # 자체는 위에서 이미 출전 기록으로 확정됐다).
                 _cur = c.execute("SELECT current_team_id FROM my_player WHERE id=1").fetchone()
                 my_tid = _cur["current_team_id"] if _cur else None
+            # [2026-09] 내 역할 환산 — 이 대회에서 우리 팀이 치른 경기 수를
+            # 분모로 쓴다. AI 쪽 matches는 "그 팀이 그 대회에서 실제로 치른
+            # 경기 수"라 같은 팀 선수끼리는 전부 같은 값이므로(ai_lifecycle.
+            # _snapshot_season_ratings의 comp 블록), 우리 팀 AI 후보 아무
+            # 값이나 그대로 team-level 분모로 쓸 수 있다. 팀 동료가 풀에
+            # 하나도 없는 예외에서만 내 출전수를 분모로 써서 ratio=1.0
+            # (=주전)이 되게 한다 — 분모를 모를 때 자격을 박탈하지 않는다는
+            # _role_from_play_ratio의 원칙과 같다.
+            _team_comp_matches = max(
+                [(x.get("matches") or 0) for x in pool if x.get("team_id") == my_tid]
+                or [my_row["matches"]])
             pool.append({"player_id": _SIA_MY_PLAYER_ID, "team_id": my_tid,
                          "position": my_p["position"] if my_p else None,
                          "age": my_p["age"] if my_p else 25,
                          "matches": my_row["matches"], "goals": my_row["goals"],
                          "assists": my_row["assists"], "rating": my_row["rating"],
                          "cs": my_row["cs"], "saves": my_row["saves"],
-                         "goals_conceded": my_row["goals_conceded"]})
+                         "goals_conceded": my_row["goals_conceded"],
+                         "stage_key": my_tid,
+                         "role": _role_from_play_ratio(my_row["matches"], _team_comp_matches)})
     return pool
 
 
-def _mvp_contribution(r):
+# ─────────────────────────────────────────────────────────────
+# [2026-09 신설, 신민용 확정] 토너먼트 진출 단계 계수
+#
+# 문제: _mvp_contribution의 참가도가 min(1, matches/3)이라 3경기에서
+# 포화된다 — 16강 탈락(4경기)과 우승(7경기)이 완전히 동일 취급됐다.
+# "조별리그 → 16강 → 8강 → 4강 → 결승을 끝까지 수행했다"는 정보가
+# 애초에 점수식의 입력값에 없었다.
+#
+# 설계 원칙(신민용 확정):
+#   - 경기 수 = 출전량/표본, 진출 단계 = 대회 성과. 둘의 역할을 분리한다.
+#     min(1, matches/3)은 그대로 두고 단계 계수를 따로 곱한다.
+#   - 대회명이나 "16강" 같은 문자열을 하드코딩하지 않는다. 대회마다
+#     사다리 칸 수가 다르기 때문이다 — 같은 챔피언스리그도 대륙에 따라
+#     32강부터 시작하거나(북미/남미) 16강부터 시작하고(그 외,
+#     competition_common.first_stage_for), 월드컵도 16강제/32강제가
+#     둘 다 가능하며, 국내컵은 나라 팀 수에 따라 라운드 수가 제각각이다.
+#   - 그래서 "그 대회에 실제로 존재하는 칸"만 모아 그 안에서 정규화한다.
+#     32강부터 시작하는 대회는 32강이 최하단, 16강부터 시작하는 대회는
+#     16강이 최하단으로 같은 값을 받는다.
+#
+# 공통 축은 "그 라운드에 들어온 팀 수"다. 이게 대회 종류와 무관하게
+# 존재하는 유일한 값이라서 기호형 스테이지(cl/el/ecl/cwc/sc/intl의
+# matches.stage)와 숫자형 라운드(국내컵 cup_matches.round_idx/
+# pool_entering) 양쪽을 하나의 사다리로 환산할 수 있다.
+_KO_STAGE_POOL = {"R128": 128, "R64": 64, "R32": 32, "R16": 16,
+                   "QF": 8, "SF": 4, "TP": 4, "F": 2}
+# TP(3·4위전)는 4강에서 진 두 팀이 치르므로 SF와 같은 칸이다.
+_KO_STAGE_PLAYOFF = "PO"     # 리그 스테이지 '다음'의 녹아웃 플레이오프
+                              # (champions_engine.STAGE_KO/_STAGE_ORDER 확인:
+                              #  리그 스테이지 → PO → R32/R16 → ... → F).
+                              #  본선 진출 자체를 가리는 예선은 cl_matches에
+                              #  행으로 남지 않으므로 여기서 다룰 대상이 아니다.
+
+# 계수 앵커(신민용 확정: "바닥값은 0.60"). 중간 칸은 그 대회에 실제로
+# 있는 칸 수에 맞춰 아래 _build_tournament_stage_factor가 자동 보간한다.
+_TSF_GROUP = 0.60        # 조별/리그 스테이지에서 탈락 — 사다리에 못 올라감
+_TSF_KO_LOW = 0.68       # 그 대회의 첫 녹아웃 칸에서 탈락
+_TSF_KO_HIGH = 0.90      # 결승 직전 칸(보통 4강)에서 탈락
+_TSF_RUNNER_UP = 0.95    # 준우승
+_TSF_WINNER = 1.00       # 우승
+
+
+def _build_tournament_stage_factor(rows, winner_key=None):
+    """대회 경기 행들로부터 "이 팀/국가의 진출 단계 계수" 함수를 만든다.
+
+    rows: (stage_token, pool_hint, key_a, key_b) 튜플의 반복 가능 객체.
+      - stage_token: 'R16'/'QF'/'F'/'TP'/'PO' 등. 조별·리그 스테이지 행은
+        None으로 넘긴다(사다리에 포함되지 않음).
+      - pool_hint: 그 라운드에 들어온 팀 수를 호출부가 이미 알고 있으면
+        그 값(국내컵 cup_matches.pool_entering). 모르면 None —
+        stage_token으로 환산한다.
+      - key_a/key_b: 그 경기 양쪽 식별자. 클럽 대회는 team_id, 국가대표
+        대회는 국가명 — 이 함수는 키의 종류를 신경 쓰지 않는다.
+    winner_key: 우승 팀/국가 식별자(없으면 결승 승자 구분 없이 둘 다 준우승
+      취급 — 아직 대회가 안 끝난 경우 등).
+
+    반환: factor(key) -> float. 그 대회에 녹아웃이 아예 없으면(리그전)
+      **None을 반환**한다 — 호출부는 None이면 계수를 곱하지 않는다.
+
+    [왜 "가장 깊이 간 칸"이 곧 탈락 지점인가] 어떤 팀이 8강 경기 행에는
+    있는데 4강 행에 없다면 8강에서 떨어진 것이다. 그래서 각 키가 등장한
+    행 중 pool이 가장 작은(=가장 깊은) 칸 하나만 기억하면 된다."""
+    deepest = {}          # key -> 가장 깊이 간 칸의 pool
+    playoff_sides = set()
+    pools = set()
+    finalists = []
+    for stage, pool_hint, key_a, key_b in rows:
+        if stage is None and pool_hint is None:
+            continue                      # 조별/리그 스테이지 — 사다리 밖
+        if stage == _KO_STAGE_PLAYOFF:
+            playoff_sides.update((key_a, key_b))
+            continue
+        pool = pool_hint if pool_hint else _KO_STAGE_POOL.get(stage)
+        if not pool:
+            continue
+        pools.add(pool)
+        if pool == 2:
+            finalists.extend((key_a, key_b))
+        for key in (key_a, key_b):
+            cur = deepest.get(key)
+            if cur is None or pool < cur:
+                deepest[key] = pool
+    if not pools and not playoff_sides:
+        return None                       # 녹아웃이 없는 대회(리그전)
+
+    # 플레이오프는 본선 사다리의 첫 칸보다 한 칸 아래다. 실제 첫 칸이
+    # 32강이든 16강이든 그 두 배로 두면 아래 정렬에서 자연스럽게 맨 밑에
+    # 붙는다 — "PO는 0.68" 같은 고정값을 박지 않기 위한 처리다.
+    if playoff_sides:
+        po_pool = (max(pools) * 2) if pools else 4
+        pools.add(po_pool)
+        for key in playoff_sides:
+            if key not in deepest:
+                deepest[key] = po_pool
+
+    # 탈락 가능 칸 = 결승(pool 2)을 뺀 나머지. 팀 수가 많은 칸(=이른
+    # 라운드)부터 순서대로 늘어놓는다.
+    elim_rungs = sorted((p for p in pools if p != 2), reverse=True)
+    n = len(elim_rungs)
+    rung_factor = {}
+    for i, pool in enumerate(elim_rungs):
+        if n == 1:
+            rung_factor[pool] = _TSF_KO_HIGH
+        else:
+            rung_factor[pool] = (_TSF_KO_LOW
+                                 + (_TSF_KO_HIGH - _TSF_KO_LOW) * i / (n - 1))
+
+    def _factor(key):
+        pool = deepest.get(key)
+        if pool is None:
+            return _TSF_GROUP             # 녹아웃에 못 올라간 팀
+        if pool == 2:
+            if winner_key is not None and key == winner_key:
+                return _TSF_WINNER
+            return _TSF_RUNNER_UP
+        return rung_factor.get(pool, _TSF_GROUP)
+    return _factor
+
+
+_TSF_NON_KO_STAGES = ("league", "group")    # 사다리에 포함되지 않는 단계
+_TSF_TABLE_SHAPE_CACHE: dict = {}
+
+
+def _tsf_table_shape(c, matches_table):
+    """{matches_table: (사다리표현, 홈컬럼, 원정컬럼)} — 실제 컬럼을 보고
+    판정한다. 프로세스 생존 기간 내내 스키마는 안 바뀌므로 캐싱한다.
+
+    [2026-09 버그수정, 신민용 리포트: "no such column: stage"] 원래는
+    테이블 '이름'으로 분기했다(cup_matches면 숫자형, 아니면 기호형) —
+    그런데 컵 계열은 cup_matches 하나가 아니라 lower_cup_matches(3·4부컵)도
+    있고, 그쪽은 stage도 pool_entering도 없이 round_idx만 있다. 이름으로
+    분기하니 lower_cup_matches가 기호형으로 새서 stage를 조회하다 터졌다
+    (숫자형으로 보냈어도 pool_entering이 없어 똑같이 터졌을 것).
+    대회 이름·테이블 이름을 하드코딩하지 않는다는 이 모듈의 원칙을
+    어댑터에도 적용해서, 실제로 어떤 컬럼이 있는지만 보고 고른다 —
+    앞으로 새 대회 테이블이 생겨도 이 함수를 고칠 필요가 없다."""
+    shape = _TSF_TABLE_SHAPE_CACHE.get(matches_table)
+    if shape is None:
+        cols = {r[1] for r in c.execute(f"PRAGMA table_info({matches_table})").fetchall()}
+        if "stage" in cols:
+            kind = "stage"
+        elif "round_idx" in cols:
+            kind = "pool" if "pool_entering" in cols else "round_idx"
+        else:
+            kind = None          # 사다리 정보가 아예 없는 표(po_matches 등)
+        # 국가대표 대회는 team_id가 아니라 국가명(TEXT)으로 양쪽을 식별한다.
+        home, away = (("home_team_id", "away_team_id")
+                      if "home_team_id" in cols else ("home", "away"))
+        shape = _TSF_TABLE_SHAPE_CACHE[matches_table] = (kind, home, away)
+    return shape
+
+
+def _tournament_stage_factor_for(c, matches_table, tournament_id, winner_key=None):
+    """대회 하나의 진출 단계 계수 함수를 만든다 — 위 _build_tournament_
+    stage_factor의 DB 어댑터. 반환: factor(key) 또는 None(사다리 없음).
+
+    표가 사다리를 표현하는 방식은 셋 중 하나이고, 어느 것인지는 테이블
+    이름이 아니라 실제 컬럼으로 판정한다(_tsf_table_shape):
+      - 'stage'     : 기호형(cl/el/ecl/cwc/sc/domestic_sc/intl_matches)
+      - 'pool'      : round_idx + pool_entering(cup_matches)
+      - 'round_idx' : round_idx만(lower_cup_matches) — 라운드 번호로 역산
+    """
+    kind, _home, _away = _tsf_table_shape(c, matches_table)
+    if kind is None:
+        return None
+
+    if kind in ("pool", "round_idx"):
+        _cols = "round_idx, pool_entering" if kind == "pool" else "round_idx, NULL AS pool_entering"
+        rows = c.execute(
+            f"SELECT {_cols}, {_home} AS ka, {_away} AS kb "
+            f"FROM {matches_table} WHERE tournament_id=? AND home_score>=0",
+            (tournament_id,)).fetchall()
+        if not rows:
+            return None
+        _max_idx = max((r["round_idx"] or 0) for r in rows)
+        _adapted = []
+        for r in rows:
+            pool = r["pool_entering"] or 0
+            if pool <= 0:
+                # round_idx로 역산 — 마지막 라운드(결승)가 2팀이고 한 라운드
+                # 거슬러 올라갈 때마다 두 배다. pool_entering 컬럼이 아예
+                # 없는 표(lower_cup_matches)와, 있지만 값이 빈 예외 행
+                # (3·4위전은 결승 행에서 round_idx/week만 복사해 넣는다)을
+                # 같은 방식으로 처리한다.
+                pool = 2 ** (_max_idx - (r["round_idx"] or 0) + 1)
+            _adapted.append(("KO", pool, r["ka"], r["kb"]))
+        return _build_tournament_stage_factor(_adapted, winner_key)
+
+    rows = c.execute(
+        f"SELECT stage, {_home} AS ka, {_away} AS kb "
+        f"FROM {matches_table} WHERE tournament_id=? AND home_score>=0",
+        (tournament_id,)).fetchall()
+    _adapted = [((None if (r["stage"] in _TSF_NON_KO_STAGES) else r["stage"]),
+                  None, r["ka"], r["kb"]) for r in rows]
+    return _build_tournament_stage_factor(_adapted, winner_key)
+
+
+def _mvp_contribution(r, stage_factor=None):
     """MVP 산정 기준 점수(참가도×평점, _get_player_comp_contribution과
     동일한 0.2~1.3배 공식) — _pick_club_comp_mvp_and_scorer와
     _pick_top_n_mvp가 공유한다. [2026-09 분리, 신민용 요청: "월드컵 골든볼
@@ -13504,16 +14151,27 @@ def _mvp_contribution(r):
     "2등·3등"을 따로 뽑을 방법이 없었다 — 모듈 레벨로 빼서 두 함수가
     완전히 동일한 기준으로 순위를 매기게 한다(그래야 n=1일 때
     _pick_top_n_mvp의 1위가 _pick_club_comp_mvp_and_scorer의 mvp와
-    항상 일치)."""
+    항상 일치).
+
+    [2026-09 확장, 신민용 확정] stage_factor(_build_tournament_stage_factor가
+    돌려준 함수)를 주면 그 대회 진출 단계 계수를 곱한다. 참가도
+    (min(1, matches/3))는 손대지 않는다 — "경기 수 = 출전량/표본,
+    진출 단계 = 대회 성과"로 역할을 분리한다는 원칙 그대로다. 경기 수
+    자체를 키우는 쪽으로 풀면 조별리그를 많이 치르는 대회가 구조적으로
+    유리해지기 때문이다. stage_factor가 None이면(녹아웃이 없는 리그전,
+    또는 호출부가 안 넘긴 경우) 예전 값과 1비트도 다르지 않다."""
     matches = r.get("matches") or 0
     if not matches:
         return -1.0
     participation = min(1.0, matches / 3.0)
     quality = max(0.2, min(1.3, 1.0 + ((r.get("rating") or 6.0) - 6.0) / 1.5))
-    return participation * quality
+    score = participation * quality
+    if stage_factor is not None:
+        score *= stage_factor(r.get("stage_key"))
+    return score
 
 
-def _pick_top_n_mvp(pool, n):
+def _pick_top_n_mvp(pool, n, stage_factor=None):
     """[2026-09 신설, 신민용 확정: "월드컵은 골든볼(1위)만 있는 게 아니라
     실버볼(2위)·브론즈볼(3위)도 있어야 한다 — 국가/우승팀/준우승팀 제한
     없이 순수 참가도×평점 순위로만"] pool을 _mvp_contribution 기준
@@ -13526,25 +14184,28 @@ def _pick_top_n_mvp(pool, n):
     if not pool:
         return []
     ranked = sorted(
-        pool, key=lambda r: (-_mvp_contribution(r), -(r.get("rating") or 0), r["player_id"]))
+        pool, key=lambda r: (-_mvp_contribution(r, stage_factor),
+                              -(r.get("rating") or 0), r["player_id"]))
     return ranked[:n]
 
 
-def _pick_club_comp_mvp_and_scorer(pool):
+def _pick_club_comp_mvp_and_scorer(pool, stage_factor=None):
     """pool(_club_comp_squad_pool 반환값)에서 MVP(참가도×평점 최고,
     _get_player_comp_contribution과 동일한 0.2~1.3배 공식)와 득점왕
     (최다골, 0골이면 없음)을 뽑는다. 동점이면 player_id 오름차순(me=-1이
     가장 먼저)으로 결정론적 tie-break."""
     if not pool:
         return None, None
-    mvp = max(pool, key=lambda r: (_mvp_contribution(r), r.get("rating") or 0, -r["player_id"]))
+    mvp = max(pool, key=lambda r: (_mvp_contribution(r, stage_factor),
+                                   r.get("rating") or 0, -r["player_id"]))
     scorers = [r for r in pool if (r.get("goals") or 0) > 0]
     scorer = max(scorers, key=lambda r: (r["goals"], -r["player_id"])) if scorers else None
     return mvp, scorer
 
 
 def _save_club_comp_award_rows(c, year, award_prefix, mvp, scorer, category="club", extra=None,
-                                kind_rename=None, mvp_extra=None, league_country=None, sink=None):
+                                kind_rename=None, mvp_extra=None, league_country=None, sink=None,
+                                stage_factor=None):
     """클럽 대항전과 국제대회 둘 다 이 함수를 공유한다(MVP/득점왕/도움왕/
     베스트11/영플레이어/올해의 수비수/골든글러브 선정 기준 자체가 대회
     종류와 무관하므로) — category로 두 카테고리를 구분해 저장한다(기본값
@@ -13573,14 +14234,22 @@ def _save_club_comp_award_rows(c, year, award_prefix, mvp, scorer, category="clu
     def _kn(base):
         return (kind_rename or {}).get(base, base)
     entries = []
+    # [2026-09] 아래 표시 점수(total_score)는 선정 기준과 반드시 같은 식이어야
+    # 한다 — 선정에 진출 단계 계수가 들어갔는데 저장은 안 들어가면 "왜 점수가
+    # 더 낮은 선수가 MVP냐"는 불일치가 화면에 그대로 보인다.
+    def _stage_mult(cand):
+        return stage_factor(cand.get("stage_key")) if stage_factor is not None else 1.0
     if mvp:
-        contribution_score = round((mvp.get("rating") or 0) * min(1.0, (mvp.get("matches") or 0) / 3.0), 2)
+        contribution_score = round((mvp.get("rating") or 0)
+                                   * min(1.0, (mvp.get("matches") or 0) / 3.0)
+                                   * _stage_mult(mvp), 2)
         entries.append((_kn("MVP"), 1, _award_entry_from_pool(mvp, total_score=contribution_score)))
     if mvp_extra:
         for i, cand in enumerate(mvp_extra):
             rank = i + 2
             contribution_score = round(
-                (cand.get("rating") or 0) * min(1.0, (cand.get("matches") or 0) / 3.0), 2)
+                (cand.get("rating") or 0) * min(1.0, (cand.get("matches") or 0) / 3.0)
+                * _stage_mult(cand), 2)
             entries.append((_kn("MVP"), rank, _award_entry_from_pool(cand, total_score=contribution_score)))
     if scorer:
         entries.append((_kn("득점왕"), 1, _award_entry_from_pool(scorer, total_score=float(scorer["goals"]))))
@@ -13626,40 +14295,51 @@ def _compute_club_comp_individual_awards(year):
         for prefix, label in _CLUB_COMP_TIER_LABEL.items():
             t_table, e_table, m_table = f"{prefix}_tournaments", f"{prefix}_entries", f"{prefix}_matches"
             tournaments = c.execute(
-                f"SELECT id, continent, my_team_id FROM {t_table} WHERE year=? AND status='done'",
+                f"SELECT id, continent, my_team_id, winner_team_id FROM {t_table} "
+                "WHERE year=? AND status='done'",
                 (year,)).fetchall()
             for t in tournaments:
                 team_ids = [r["team_id"] for r in c.execute(
                     f"SELECT team_id FROM {e_table} WHERE tournament_id=?", (t["id"],)).fetchall()]
                 pool = _club_comp_squad_pool(c, team_ids, year, "cl", t["my_team_id"], t["id"], m_table)
-                mvp, scorer = _pick_club_comp_mvp_and_scorer(pool)
+                # [2026-09 신설] 진출 단계 계수 — 그 대회에 실제로 존재하는
+                # 녹아웃 칸만으로 정규화한다(_build_tournament_stage_factor).
+                _stage_f = _tournament_stage_factor_for(c, m_table, t["id"], t["winner_team_id"])
+                mvp, scorer = _pick_club_comp_mvp_and_scorer(pool, _stage_f)
                 extra = _pick_comp_extra_winners(pool)
                 award_prefix = f"{t['continent']} {label}" if t["continent"] else label
-                _save_club_comp_award_rows(c, year, award_prefix, mvp, scorer, extra=extra)
+                _save_club_comp_award_rows(c, year, award_prefix, mvp, scorer, extra=extra,
+                                            stage_factor=_stage_f)
 
         # 클럽월드컵 — 대륙 구분 없는 단일 대회.
         cwc_tournaments = c.execute(
-            "SELECT id, my_team_id FROM cwc_tournaments WHERE year=? AND status='done'", (year,)).fetchall()
+            "SELECT id, my_team_id, winner_team_id FROM cwc_tournaments "
+            "WHERE year=? AND status='done'", (year,)).fetchall()
         for t in cwc_tournaments:
             team_ids = [r["team_id"] for r in c.execute(
                 "SELECT team_id FROM cwc_entries WHERE tournament_id=?", (t["id"],)).fetchall()]
             pool = _club_comp_squad_pool(c, team_ids, year, "cwc", t["my_team_id"], t["id"], "cwc_matches")
-            mvp, scorer = _pick_club_comp_mvp_and_scorer(pool)
+            _stage_f = _tournament_stage_factor_for(c, "cwc_matches", t["id"], t["winner_team_id"])
+            mvp, scorer = _pick_club_comp_mvp_and_scorer(pool, _stage_f)
             extra = _pick_comp_extra_winners(pool)
-            _save_club_comp_award_rows(c, year, "클럽월드컵", mvp, scorer, extra=extra)
+            _save_club_comp_award_rows(c, year, "클럽월드컵", mvp, scorer, extra=extra,
+                                        stage_factor=_stage_f)
 
         # 슈퍼컵 — CL/EL/ECL과 동일하게 대륙별로 동시에 여러 개 열림.
         sc_tournaments = c.execute(
-            "SELECT id, continent, my_team_id FROM sc_tournaments WHERE year=? AND status='done'",
+            "SELECT id, continent, my_team_id, winner_team_id FROM sc_tournaments "
+            "WHERE year=? AND status='done'",
             (year,)).fetchall()
         for t in sc_tournaments:
             team_ids = [r["team_id"] for r in c.execute(
                 "SELECT team_id FROM sc_entries WHERE tournament_id=?", (t["id"],)).fetchall()]
             pool = _club_comp_squad_pool(c, team_ids, year, "sc", t["my_team_id"], t["id"], "sc_matches")
-            mvp, scorer = _pick_club_comp_mvp_and_scorer(pool)
+            _stage_f = _tournament_stage_factor_for(c, "sc_matches", t["id"], t["winner_team_id"])
+            mvp, scorer = _pick_club_comp_mvp_and_scorer(pool, _stage_f)
             extra = _pick_comp_extra_winners(pool)
             award_prefix = f"{t['continent']} 슈퍼컵" if t["continent"] else "슈퍼컵"
-            _save_club_comp_award_rows(c, year, award_prefix, mvp, scorer, extra=extra)
+            _save_club_comp_award_rows(c, year, award_prefix, mvp, scorer, extra=extra,
+                                        stage_factor=_stage_f)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -13698,7 +14378,8 @@ def _compute_cup_individual_awards(year):
                 ("lower_cup", "lower_cup_tournaments", "lower_cup_entries",
                  "lower_cup_matches", "lower_cup")):
             tournaments = c.execute(
-                f"SELECT id, name, country_id, my_team_id FROM {t_table} WHERE year=? AND status='done'",
+                f"SELECT id, name, country_id, my_team_id, winner_team_id FROM {t_table} "
+                "WHERE year=? AND status='done'",
                 (year,)).fetchall()
             if not tournaments:
                 continue
@@ -13724,7 +14405,10 @@ def _compute_cup_individual_awards(year):
                 team_ids = _entries_by_t.get(t["id"], [])
                 pool = _club_comp_squad_pool(c, team_ids, year, comp_key, t["my_team_id"], t["id"],
                                               m_table, pool_by_team=_pool_by_team)
-                mvp, scorer = _pick_club_comp_mvp_and_scorer(pool)
+                # [2026-09 신설] 국내컵은 stage 컬럼이 없고 round_idx/
+                # pool_entering로 사다리를 표현한다 — 어댑터가 흡수한다.
+                _stage_f = _tournament_stage_factor_for(c, m_table, t["id"], t["winner_team_id"])
+                mvp, scorer = _pick_club_comp_mvp_and_scorer(pool, _stage_f)
                 extra = _pick_comp_extra_winners(pool)
                 # [2026-09 신설] 국가명을 league_country 컬럼에 그대로
                 # 실어둔다(컬럼명은 리그 전용으로 지어졌지만 실제로는
@@ -13736,7 +14420,8 @@ def _compute_cup_individual_awards(year):
                 # 필요하다는 게 신민용 요청이었다).
                 country_name = _country_names.get(t["country_id"])
                 _save_club_comp_award_rows(c, year, t["name"], mvp, scorer, category=category,
-                                            extra=extra, league_country=country_name, sink=_sink)
+                                            extra=extra, league_country=country_name, sink=_sink,
+                                            stage_factor=_stage_f)
             if _sink:
                 # [2026-09 신설, 히스토리 비동기 writer] 즉시 커밋 대신 큐에만
                 # 넘긴다 — sink 누적 순서(=최종 삽입 순서)는 그대로 보존된다.
@@ -13769,6 +14454,7 @@ def _intl_award_pool(c, tournament_id):
     my_rating 등을 직접 집계한다(club 쪽과 동일한 me/AI 분기 패턴)."""
     pool = [dict(r) for r in c.execute(
         """SELECT s.player_id AS player_id, ap.position AS position, ap.age AS age,
+                  s.country AS stage_key,
                   s.appearances AS matches, s.goals AS goals, s.assists AS assists,
                   s.rating AS rating, s.clean_sheets AS cs, s.saves AS saves,
                   s.goals_conceded AS goals_conceded
@@ -13790,13 +14476,15 @@ def _intl_award_pool(c, tournament_id):
         my_nat_row = c.execute(
             "SELECT country FROM intl_entries WHERE tournament_id=? AND is_my=1", (tournament_id,)).fetchone()
         my_cs = 0
+        my_nat = my_nat_row["country"] if my_nat_row else None
         if my_nat_row:
-            my_nat = my_nat_row["country"]
             my_cs = c.execute(
                 """SELECT COUNT(*) AS c FROM intl_matches WHERE tournament_id=? AND my_played=1
                    AND ((home=? AND away_score=0) OR (away=? AND home_score=0))""",
                 (tournament_id, my_nat, my_nat)).fetchone()["c"]
         pool.append({"player_id": _SIA_MY_PLAYER_ID, "team_id": None,
+                     # [2026-09] 국가대표 대회의 진출 단계 키는 국가명이다.
+                     "stage_key": my_nat,
                      "position": my_p["position"] if my_p else None,
                      "age": my_p["age"] if my_p else 25,
                      "matches": my_row["matches"], "goals": my_row["goals"],
@@ -13838,18 +14526,24 @@ def _compute_intl_individual_awards(year):
     conn = get_conn(); c = conn.cursor()
     try:
         tournaments = c.execute(
-            """SELECT id, name, kind FROM intl_tournaments
+            """SELECT id, name, kind, winner FROM intl_tournaments
                WHERE year=? AND status='done' AND kind IN ('world','continent','region')""",
             (year,)).fetchall()
         for t in tournaments:
             pool = _intl_award_pool(c, t["id"])
-            mvp, scorer = _pick_club_comp_mvp_and_scorer(pool)
+            # [2026-09 신설] 월드컵/대륙컵도 같은 함수를 쓴다 — 키만
+            # team_id가 아니라 국가명이다. 16강제/32강제가 둘 다 가능한데,
+            # 그 대회에 실제로 있는 칸만으로 정규화하므로 둘 다 자연스럽게
+            # 처리된다(16강제면 16강이 최하단).
+            _stage_f = _tournament_stage_factor_for(c, "intl_matches", t["id"], t["winner"])
+            mvp, scorer = _pick_club_comp_mvp_and_scorer(pool, _stage_f)
             extra = _pick_comp_extra_winners(pool)
             kind_rename = _WC_AWARD_KIND_RENAME if t["kind"] == "world" else None
-            mvp_extra = _pick_top_n_mvp(pool, 3)[1:] if (t["kind"] == "world" and pool) else None
+            mvp_extra = (_pick_top_n_mvp(pool, 3, _stage_f)[1:]
+                         if (t["kind"] == "world" and pool) else None)
             _save_club_comp_award_rows(
                 c, year, t["name"], mvp, scorer, category="intl", extra=extra, kind_rename=kind_rename,
-                mvp_extra=mvp_extra)
+                mvp_extra=mvp_extra, stage_factor=_stage_f)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -13957,6 +14651,12 @@ def _compute_league_individual_awards(year, my_ctx=None):
                     "goals": _mc.get("goals", 0), "assists": _mc.get("assists", 0),
                     "rating": _mc.get("rating", 6.0), "cs": _mc.get("cs", 0),
                     "matches": _mc.get("matches", full_season_matches),
+                    # [2026-09] 내 실제 출전수를 AI와 같은 역할 라벨로 환산해
+                    # 같은 자격 게이트(_role_award_eligible)를 태운다 —
+                    # 예전엔 출전 게이트가 내 선수에게만(그것도 65%로) 걸려
+                    # 있어 AI와 기준이 서로 달랐다.
+                    "role": _role_from_play_ratio(
+                        _mc.get("matches", full_season_matches), full_season_matches),
                 }
                 if rating_pool is pool:
                     rating_pool, gated_pool = list(pool), list(pool)
@@ -13988,7 +14688,11 @@ def _compute_league_individual_awards(year, my_ctx=None):
             extra_rt = extra if rating_pool is pool else _pick_comp_extra_winners(rating_pool)
             extra_gt = (extra_rt if gated_pool is rating_pool or len(gated_pool) == len(rating_pool)
                         else _pick_comp_extra_winners(gated_pool))
-            mvp = max(gated_pool, key=lambda x: ((x.get("rating") or 0), -x["player_id"]))
+            # [2026-09 신설] MVP·구단 올해의 선수도 평점 기반 상이므로 같은
+            # 역할 게이트를 태운다 — 예전엔 gated_pool의 "게이트"가 내
+            # 선수 출전율 65%뿐이라 AI에는 아무 출전 조건도 없었다.
+            _role_pool = [x for x in gated_pool if _role_award_eligible(x.get("role"))] or gated_pool
+            mvp = max(_role_pool, key=lambda x: ((x.get("rating") or 0), -x["player_id"]))
             entries.append(("MVP", 1, _award_entry_from_pool(mvp)))
             if extra["assist"]:
                 a = extra["assist"]
@@ -14003,7 +14707,7 @@ def _compute_league_individual_awards(year, my_ctx=None):
                 entries.append(("골든글러브", 1, _award_entry_from_pool(extra["goalkeeper"])))
 
             by_team = {}
-            for x in gated_pool:
+            for x in _role_pool:
                 by_team.setdefault(x.get("team_id"), []).append(x)
             poty_rank = 0
             for _tid in _league_team_ids:      # 이미 id 오름차순
@@ -14758,6 +15462,15 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
         tid, _ = _primary_club_this_season(p)
     if not tid:
         return  # 무소속이면 수상 없음
+    # [2026-09 버그수정, 정적감사: "이 함수의 95%(728줄)가 print() 하나에
+    # 삼켜진다"] 아래 try는 발롱도르/야신/푸스카스/베스트11/리그·컵 개인상
+    # 산정 전체를 감싸는데, 예전 핸들러는 콘솔 print만 했다 — 배포판은
+    # --windowed로 빌드돼 콘솔 자체가 없으므로, 그 해 개인상이 통째로
+    # 비어도 사용자에게 아무 단서가 남지 않았다(게임 로그에도 안 남음).
+    # 정상 경로 동작은 그대로 두고(예외를 위로 던지지 않는다) 실패했을
+    # 때만 traceback + 게임 로그 경고를 남긴다. add_log는 위 15590번대
+    # 주석과 같은 이유로 conn을 닫은 뒤(= finally 이후)에 호출한다.
+    _award_err = None
     conn = get_conn(); c = conn.cursor()
     try:
         # [2026-09 버그수정, 신민용 리포트: "승격 시즌 리그 개인상이 승격
@@ -15245,20 +15958,38 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
         # continent에는 그 값 자체가 존재한 적이 없어(항상 "남미"/"북미"/
         # "오세아니아") 남미·북미·오세아니아 선수는 대륙상 후보 판정 자체가
         # 조용히 항상 거짓이었다 — 원값 그대로 남미/북미/오세아니아 키로 고친다.
-        _CONTINENT_POY = {"유럽": "UEFA 올해의 선수", "아시아": "AFC 올해의 선수",
-                          "오세아니아": "AFC 올해의 선수",
-                          "남미": "코메볼 올해의 선수", "북미": "콩카카프 올해의 선수",
-                          "아프리카": "CAF 올해의 선수"}
-        _my_cont_row = c.execute("""SELECT cn.continent FROM teams t
-            JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
-            WHERE t.id=?""", (tid,)).fetchone()
-        _my_continent = _my_cont_row["continent"] if _my_cont_row else ""
-        if _my_continent in _CONTINENT_POY and tier == 1 and p.get("ovr", 0) >= 85:
+        # [2026-09 재설계, 신민용 확정: "대륙상은 그 대륙에서 뛰는 선수가
+        # 아니라 그 대륙 국적 선수 중에서 고르는 것 — 해외파 포함"] 두
+        # 가지를 같이 바꾼다.
+        #   (1) 판정 기준을 소속 리그 대륙 → **국적의 대륙**으로. 현실의
+        #       CAF 올해의 선수가 하키미(PSG)/살라(리버풀)처럼 해외파를
+        #       그대로 포함하기 때문. 기존 teams→leagues→countries 조인은
+        #       이집트 국적 리버풀 선수를 유럽으로 잡았다.
+        #   (2) 판정 주체를 이 지역 게이트 → 세계 통합 계산 결과 조회로.
+        #       바로 위 발롱도르(_get_my_season_award_rank)와 완전히 같은
+        #       패턴이다 — 이 지역 게이트는 "내가 자격이 되나?"만 보고
+        #       "그 대륙 1위가 누구인가"는 모르기 때문에, AI 수상자를
+        #       산출하기 시작한 지금은 그대로 두면 "세계기록실엔 AI가
+        #       받았는데 내 커리어에도 내가 받았다"가 나올 수 있다.
+        # use_archived_ai_stats=False(시즌 중 은퇴 — finalize_season_for_
+        # retire)는 그 해 세계 통합 계산 자체가 없으므로 기존 즉석 게이트를
+        # 그대로 쓴다(발롱도르와 동일한 폴백 원칙).
+        _my_cont_award = None
+        _my_nat_row = c.execute("SELECT nationality FROM my_player WHERE id=1").fetchone()
+        _my_nat = _my_nat_row["nationality"] if _my_nat_row else None
+        _my_nat_cont_row = c.execute(
+            "SELECT continent FROM countries WHERE name=?", (_my_nat,)).fetchone() if _my_nat else None
+        _my_continent = _my_nat_cont_row["continent"] if _my_nat_cont_row else ""
+        _cname = _CONTINENT_POY.get(_my_continent)
+        if use_archived_ai_stats:
+            if _cname and _get_my_season_award_rank(year, _cname) == 1:
+                _my_cont_award = _cname
+        elif _cname and tier == 1 and p.get("ovr", 0) >= 85:
+            # 폴백 경로 — 라이벌 풀도 국적 기준으로 맞춘다(위 (1)과 동일한
+            # 이유로, 소속 리그가 아니라 그 대륙 국적 선수끼리 비교해야 함).
             _cont_rival = c.execute("""SELECT MAX(a.ovr) as mo FROM ai_players a
-                JOIN teams t2 ON a.team_id=t2.id
-                JOIN leagues l2 ON t2.league_id=l2.id
-                JOIN countries cn2 ON l2.country_id=cn2.id
-                WHERE cn2.continent=? AND l2.tier=1 AND a.position IN ({})
+                JOIN countries cn2 ON cn2.name = a.nationality
+                WHERE cn2.continent=? AND a.position IN ({})
                 """.format(",".join("'%s'" % pp for pp in ATTACK_POS)), (_my_continent,)).fetchone()
             _cont_rival_ovr = _cont_rival["mo"] if _cont_rival and _cont_rival["mo"] else 80
             _cont_world_class = p.get("ovr", 0) >= _cont_rival_ovr - 2
@@ -15266,8 +15997,9 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
             if _cont_world_class and high_rating and (
                     (_combined_ga + trophy_bonus + _other_bonus) >= min_ga_for_ballon * 0.7
                     or mvp["is_mine"] or _cc["cl_won"]):
-                _cname = _CONTINENT_POY[_my_continent]
-                my_awards.append((_cname, f"{year} {_cname}"))
+                _my_cont_award = _cname
+        if _my_cont_award:
+            my_awards.append((_my_cont_award, f"{year} {_my_cont_award}"))
 
         # [2026-07 신설, 신민용 확정] FIFPro 월드11 — "세계 톱리그 포지션별
         # 베스트 11". GPT 지적대로 새 점수식을 만들지 않고 리그/CL에서 이미
@@ -15482,10 +16214,19 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
             add_log(f"{icon} {atype} 수상!{_log_where} ({detail})  {year}년", "event", year, 52)
         return
     except Exception as e:
+        import traceback as _tb
         print("_process_awards 오류:", e)
+        _tb.print_exc()
+        _award_err = e
     finally:
         try:
             conn.close()
+        except Exception:
+            pass
+    if _award_err is not None:
+        try:
+            add_log(f"⚠ {year}년 개인 수상 산정 중 오류가 발생했습니다 — 이 해 개인상 "
+                    f"일부 또는 전부가 누락됐을 수 있습니다: {_award_err}", "event", year, 52)
         except Exception:
             pass
 
@@ -15808,6 +16549,13 @@ def _end_of_season(p, year, progress_cb=None):
         # 자동으로 커버됨 — 나중에 또 상한을 깜빡 잊어도 안전).
         if annual_drop <= 0 and decline_tbl and new_age > decline_tbl[-1][1]:
             annual_drop = decline_tbl[-1][2]
+
+        # [2026-09 신설, 신민용 확정] 신체특징 "동안/노화저항" —
+        # aging_decline_mult만큼 연간 낙폭 자체를 완화한다(talent_cap/스탯
+        # 낙폭 둘 다 이 annual_drop을 그대로 쓰므로 한 곳만 고치면 충분).
+        _trait_fx_aging = PHYSICAL_TRAIT_EFFECTS.get(p.get("physical_trait", ""), {})
+        if annual_drop > 0 and "aging_decline_mult" in _trait_fx_aging:
+            annual_drop = round(annual_drop * _trait_fx_aging["aging_decline_mult"], 2)
 
         if annual_drop > 0:
             # [2026-09 신설, 신민용 지적: "노화는 숨겨진 한계 스탯(재능
@@ -18770,13 +19518,18 @@ def generate_offers(count=5, force=False) -> list:
     force_max_tier = (age <= 17 and avg_stat < 50)
 
     # [최적화] 전체 팀 평균 OVR을 1회 SELECT → dict 캐시 (기존: 루프마다 SELECT 최대 120회)
-    _team_avg_cache_offers: dict = {
-        r["team_id"]: r["avg_ovr"]
-        for r in c.execute(
-            "SELECT team_id, AVG(ovr) as avg_ovr FROM ai_players GROUP BY team_id"
-        ).fetchall()
-        if r["avg_ovr"] is not None
-    }
+    # [2026-09 신설, 신민용+GPT 협업 확정: "강팀 오퍼가 너무 잦다"] 같은
+    # 쿼리·같은 테이블 스캔에 COUNT(*)만 더 얹어서 팀별 현재 AI 인원수도
+    # 같이 캐시한다 — 아래 _team_fits_me()가 "SS/S(1·2부)·A(1부) 26명
+    # 고정 팀인데 이미 26명 꽉 찼는지"를 추가 쿼리 없이 바로 판정한다.
+    _team_avg_cache_offers: dict = {}
+    _team_headcount_cache_offers: dict = {}
+    for r in c.execute(
+            "SELECT team_id, AVG(ovr) as avg_ovr, COUNT(*) as n FROM ai_players GROUP BY team_id"
+    ).fetchall():
+        _team_headcount_cache_offers[r["team_id"]] = r["n"]
+        if r["avg_ovr"] is not None:
+            _team_avg_cache_offers[r["team_id"]] = r["avg_ovr"]
 
     # [밸런스 조정 2026-07, 현실성 검토 반영] 마진 기준을 "그 나라 등급"에서
     #   "그 팀이 자기 리그 안에서 몇 등급이냐(상대적 위치)"로 변경.
@@ -18827,7 +19580,21 @@ def generate_offers(count=5, force=False) -> list:
            [2026-08 신설, 15-6 사전조치] 소속팀에서 실전 경기를 거의
            안 뛴 신인은 OVR/effective_ovr과 무관하게 마진 자체를 좁게
            캡(_unproven_margin_cap)한다 — 자세한 이유는 위 계산부 주석
-           참고."""
+           참고.
+           [2026-09 신설, 신민용+GPT 협업 확정: "강팀 오퍼가 너무 잦다"]
+           SS/S(1·2부)·A(1부) 26명 고정 팀은 이미 26명 꽉 찼으면(=이번
+           시즌 오퍼 빈자리 로또에 안 뽑혔거나 이미 다른 경로로 채워짐)
+           OVR 마진과 무관하게 오퍼 후보에서 제외한다 — ai_lifecycle.
+           _roll_offer_vacancy_teams가 리그마다 일부 팀만 1자리 비워두므로,
+           이 체크 하나로 "정원 다 찬 강팀은 오퍼 안 옴"이 자동으로
+           성립한다(4주차 지나면 빈자리도 강제로 채워지므로 그 뒤엔 이
+           등급 전체가 패시브 오퍼 후보에서 빠지는 게 정상)."""
+        from ai_lifecycle import _is_fixed26
+        _fixed_grade = get_country_league_grade(team_row["country"], team_row["grade"])
+        if _is_fixed26(_fixed_grade, team_row["tier"]):
+            _n_ai = _team_headcount_cache_offers.get(team_row["id"], 0)
+            if _n_ai >= 26:
+                return False
         team_avg = _team_avg_cache_offers.get(team_row["id"])
         if team_avg is None:
             return True
@@ -20525,32 +21292,44 @@ def _get_team_rank_info(c, team_id, ss=None) -> str:
         prev_season = cur_season - 1
         if prev_season < 1:
             return "(첫 시즌)"
-        # 이전 시즌에 실제 경기 기록이 있는지 확인
         # [2026-07 버그수정, 신민용 리포트: "입단 창에선 작년 순위가 안
         # 뜨더라"] 시즌이 끝나면 match_results가 match_results_archive로
         # 옮겨지는데(성능상 아카이빙), 이 함수는 여태 match_results만
         # 보고 있었다 — 그래서 아카이빙된 지 오래된 리그(주로 내가 소속돼
         # 있던 리그, 승강 처리 때 같이 정리됨)의 작년 성적이 안 떴다.
         # 이제 두 테이블을 합쳐서 본다.
-        c.execute("""SELECT COUNT(*) as cnt FROM (
-                        SELECT home_score FROM match_results
-                            WHERE league_id=? AND season=? AND home_score>=0
-                        UNION ALL
-                        SELECT home_score FROM match_results_archive
-                            WHERE league_id=? AND season=? AND home_score>=0
-                     )""",
-                  (league_id, prev_season, league_id, prev_season))
-        if c.fetchone()["cnt"] == 0:
-            return ""
+        #
+        # [2026-09 버그수정, 신민용 리포트: "2001년 1주차에 입단 들어가면
+        # 작년(2000) 성적이 안 뜬다"] 여기서 예전엔 "작년 시즌에 지금
+        # league_id로 기록된 경기가 있는지" 를 미리 확인해서 없으면
+        # 곧바로 return "" 했다. 그런데 승격/강등으로 팀의 league_id가
+        # 바뀐 경우, 작년 경기는 "예전" league_id로 기록돼 있어서 이
+        # 확인이 항상 0건으로 나와 여기서 그냥 "" 를 반환해버렸다 —
+        # 그 결과 아래(team_ids가 비었을 때)의 정상적인 promotion_log
+        # 기반 승강 표시 로직까지 아예 도달하지 못했다. 그 폴백이
+        # 이미 team_name 기준으로 정확하게 동작하므로, 이 사전 검사는
+        # 제거하고 season/week 범위만 정해서 그대로 진행한다.
         season   = prev_season
         week_min = FIRST_HALF_START
         week_max = league_end_week
         label    = "작년 성적"
     elif cur_week < SECOND_HALF_START:
-        # 상반기 진행 중: 이번 시즌 상반기까지
+        # [2026-09 버그수정, 신민용 리포트: "오퍼 카드 순위가 가끔 안 뜬다 —
+        # 상반기 끝나고 하반기 시작 전 중간 비시즌엔 상반기 전체 순위가
+        # 떠야 하는 거 아니냐"] 예전엔 week_max가 FIRST_HALF_START+6(=10)로
+        # 고정돼 있었다 — 캘린더가 재설계되면서 상반기가 4~24주로 늘어난
+        # 뒤에도 이 값이 안 따라가서, 11~28주(중간 휴식기 25~28주 포함)
+        # 내내 "딱 4~10주 성적"이라는 옛날 스냅샷만 보여주고 있었다(그
+        # 좁은 구간에 우연히 기록된 경기가 하나도 없으면 team_ids가 비어
+        # rank_info 자체가 "" 로 안 뜨는 사고까지 났다). 이제 "지금까지"를
+        # 상반기 실제 끝 주(SEASON_PHASES["first_half"][1]=24)로 클램프해서
+        # 상반기 진행 중엔 진행 중까지, 상반기가 끝난 중간 휴식기엔 상반기
+        # 전체(4~24주)가 뜨도록 한다 — 아래 "하반기 이후" 분기와 동일한
+        # 클램프 패턴.
         season   = cur_season
         week_min = FIRST_HALF_START
-        week_max = FIRST_HALF_START + 6
+        _first_half_end = SEASON_PHASES["first_half"][1]
+        week_max = min(max(cur_week - 1, FIRST_HALF_START), _first_half_end)
         label    = "상반기 성적"
     else:
         # 하반기 이후: 이번 시즌 지금까지(진행 중이면 부분, 다 끝났으면 전체)
@@ -21221,6 +22000,49 @@ def _enforce_foreign_quota_on_join(team_id, team_country, my_nationality):
     conn.close()
 
 
+def _make_room_on_join(team_id, team_country, tier, year):
+    """[2026-09 신설, 신민용 지적: "내가 이미 26명 꽉 찬 팀에 들어가면
+    27명이 되는 거 아니냐 — 그럼 원래 있던 애는 어떻게 되는건데? 자리가
+    빌 때 오퍼가 오는 거고, 내보내는 경우엔 또 자리가 나는 거지, 현실도
+    그렇잖아"] 정확한 지적이다 — ai_lifecycle._rebalance_squad_sizes는
+    매 시즌 한 번(연도전환 직후)만 도는 정기 보정이라, 그 전까지는(최대
+    한 시즌 내내) 정원 초과 상태가 그대로 방치됐다. 현실처럼 "내가
+    합류하는 그 순간" 정원이 넘치면 즉시 누군가 방출돼 자리를 내주게
+    한다 — ai_lifecycle._squad_min_max(같은 등급별 26명 고정 기준)로
+    이 팀의 정원을 구하고, 내가 합류한 뒤(AI+나) 그 정원을 넘기면 자리를
+    못 구한(=OVR이 가장 낮은) AI 선수부터 필요한 인원만 방출한다. 방출된
+    선수는 ai_lifecycle._archive_forced_out_players와 완전히 같은 방식
+    으로 은퇴 아카이브에 먼저 남긴 뒤 지운다(이름을 지어준 선수가
+    조회 화면에서 자취를 감추는 예전 버그와 같은 문제를 여기서도 피하기
+    위함) — _rebalance_squad_sizes의 "정원 초과 시 최저 OVR부터 조기
+    은퇴"와 동일한 원칙이다."""
+    from constants import get_country_league_grade
+    from ai_lifecycle import _squad_min_max, _archive_forced_out_players
+    conn = get_conn()
+    c = conn.cursor()
+    grade = get_country_league_grade(team_country)
+    _, ceiling = _squad_min_max(grade, tier)
+    # 내가 합류한 뒤 AI 목표치는 "정원 - 나 1명" — 그걸 넘는 만큼만 방출.
+    _ai_target = max(0, ceiling - 1)
+    rows = c.execute(
+        "SELECT id, ovr FROM ai_players WHERE team_id=? ORDER BY ovr ASC", (team_id,)).fetchall()
+    excess = len(rows) - _ai_target
+    if excess <= 0:
+        conn.close()
+        return
+    out_ids = [r["id"] for r in rows[:excess]]
+    from database import get_ai_player_custom_names
+    from constants import ai_player_code
+    _custom = get_ai_player_custom_names(out_ids)
+    _names = [(_custom.get(i) or ai_player_code(i)) for i in out_ids]
+    _archive_forced_out_players(c, out_ids, year)
+    c.executemany("DELETE FROM ai_players WHERE id=?", [(i,) for i in out_ids])
+    conn.commit()
+    conn.close()
+    _who = ", ".join(_names[:5]) + (f" 외 {len(_names)-5}명" if len(_names) > 5 else "")
+    add_log(f"😡 로스터 정원({ceiling}명) 초과로 {_who} 방출 — 내 합류로 자리를 마련했습니다.", "event")
+
+
 def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None):
     p = get_player()
 
@@ -21456,6 +22278,11 @@ def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None
     # 쿼터를 맞춘다 (예: 4명 제한인데 AI 4명이 이미 꽉 차 있고 나까지
     # 외국인이면 → AI 중 1명을 자국으로 전환해 4명 유지).
     _enforce_foreign_quota_on_join(team_id, row["country"], p.get("nationality", "") if p else "")
+    # [2026-09 신설, 신민용 지적: "내가 이미 26명 꽉 찬 팀에 들어가면
+    # 27명이 되는 거 아니냐"] 위 외국인 쿼터 조정과 같은 자리(입단 확정
+    # 직후) — 로스터 정원이 이미 꽉 찬 팀이면 내가 합류하는 이 순간
+    # 최저 OVR의 AI 선수를 즉시 방출해 자리를 마련한다.
+    _make_room_on_join(team_id, row["country"], row["tier"], cur_year)
     icon = {"입단":"⭐","오퍼":"✈","방출":"😡"}.get(transfer_type,"⭐")
     add_log(f"{icon} {row['name']} {transfer_type}!  {row['lname']}({row['tier']}부)"
             f"  |  {c_yrs}년 계약  |  월 {fmt_money(salary//12)}", "event")
@@ -21489,12 +22316,21 @@ def request_transfer() -> dict:
         return {"ok": False, "msg": "이미 이적을 요청한 상태입니다.",
                 "manager_relation": p.get("manager_relation", 50)}
 
-    rel = max(0, p.get("manager_relation", 50) - TRANSFER_REQUEST_REL_PENALTY)
+    # [2026-09 신설, 신민용 확정] 성격 "은둔형" — 이적 요청은 플레이어가
+    # 직접 누르는 행동이라 원래 설계("이적요청 확률도 낮음")의 '확률'을
+    # 낮출 대상이 없다. 대신 "잡음 없이 조용히"라는 취지를 살려, 실제로
+    # 요청했을 때 감독관계 악화폭을 transfer_rel_penalty_mult만큼
+    # 줄여준다(저마찰로 처리).
+    _pe_req = PERSONALITY_EFFECTS.get(p.get("personality", ""), {})
+    _req_penalty = TRANSFER_REQUEST_REL_PENALTY
+    if "transfer_rel_penalty_mult" in _pe_req:
+        _req_penalty = round(_req_penalty * _pe_req["transfer_rel_penalty_mult"])
+    rel = max(0, p.get("manager_relation", 50) - _req_penalty)
     update_player(manager_relation=rel, transfer_requested=1)
     add_log(f"📣 이적 요청! 감독과의 관계가 악화됐다. (관계 {rel})", "event")
     return {"ok": True,
             "msg": f"이적을 요청했습니다. 다음 이적시장에서 더 많은 오퍼가 들어옵니다.\n"
-                   f"감독 관계가 {TRANSFER_REQUEST_REL_PENALTY} 하락했습니다.",
+                   f"감독 관계가 {_req_penalty} 하락했습니다.",
             "manager_relation": rel}
 
 

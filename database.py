@@ -328,6 +328,29 @@ class _PooledConn:
             if "no transaction is active" in str(e):
                 return  # 이미 커밋된 것과 같은 상태 — 조용히 통과(데이터 손실 아님)
             raise
+    # [2026-09 버그수정, 정적감사: "rollback/executescript만 래핑에서 빠져
+    # 있었다"] 이 클래스는 execute/executemany/commit/cursor만 감싸고 있어서,
+    # 정의되지 않은 rollback()은 __getattr__를 타고 생 커넥션으로 그대로
+    # 흘러가 _pool_lock 밖에서 실행됐다 — 그런데 롤백은 그 커넥션의 pending
+    # statement를 전부 리셋해버리므로, 다른 스레드가 execute~fetch 사이에
+    # 있을 때 끼어들면 정확히 예전에 두 번 고쳤던 "abort due to ROLLBACK"
+    # 크래시 시그니처가 된다(호출부: game_engine 개인수상 오류경로 5곳,
+    # main.py 1곳). 가장 위험한 연산이 유일하게 무방비였던 셈이라 execute류와
+    # 동일하게 락+재시도를 씌운다. executescript도 커서 래퍼에는 있는데
+    # 커넥션 래퍼에만 빠져 있어 같이 맞춘다(캐시 무효화 포함).
+    def rollback(self):
+        real = object.__getattribute__(self, "_real")
+        try:
+            _retry_sqlite_op(real.rollback)
+        except sqlite3.OperationalError as e:
+            if "no transaction is active" in str(e):
+                return  # 되돌릴 트랜잭션이 없음 — 이미 정리된 상태와 동일
+            raise
+    def executescript(self, *a, **kw):
+        real = object.__getattribute__(self, "_real")
+        invalidate_intl_apps_cache()
+        real_c = _retry_sqlite_op(real.executescript, *a, **kw)
+        return _PooledCursor(real_c)
     def __getattr__(self, name):
         return getattr(object.__getattribute__(self, "_real"), name)
     def __setattr__(self, name, value):
@@ -540,6 +563,70 @@ def set_game_start_year(year: int):
                  (str(year),))
     conn.commit()
     _game_start_year_cache = year
+
+
+_world_salt_cache = None
+
+
+def get_world_salt():
+    """[2026-09 신설, NumPy 난수 결정화] 이 세이브(월드) 고유의 32비트 salt.
+
+    game_engine._make_season_estimate_rng이 파생 시드를 만들 때 섞어 쓴다 —
+    salt가 없으면 서로 다른 세이브가 같은 연도·같은 대회에서 똑같은 난수열을
+    받게 되므로, 월드마다 한 번 정해서 meta에 박아둔다. meta는 이미 key/value
+    표라 새 행 하나면 되고 스키마 변경이 없다(get_game_start_year과 같은 패턴).
+
+    [중요] 이 값은 반드시 '세이브 내용의 순수 함수'여야 한다. os 엔트로피나
+    시각으로 만들면 같은 세이브를 두 번 돌릴 때마다 값이 달라져서, 이 수정이
+    없애려는 비결정성을 그대로 되살린다. 그래서 아래 _derive_world_salt는
+    DB에 이미 있는 값만 읽어 crc32로 접는다 — 같은 세이브 사본이면 몇 번을
+    계산해도 같은 값이 나온다. 한 번 계산하면 meta에 저장되므로 그 뒤로는
+    로스터가 바뀌어도 값이 고정된다(언제 처음 계산했는지가 이후에 영향을
+    주지 않는다).
+
+    구세이브(이 키가 없는 세이브)도 같은 경로로 처음 읽힐 때 확정된다.
+    월드 간 유일성은 초기 로스터(무작위 생성)에서 나온다."""
+    global _world_salt_cache
+    if _world_salt_cache is not None:
+        return _world_salt_cache
+    conn = get_conn()
+    row = conn.execute("SELECT value FROM meta WHERE key='world_salt'").fetchone()
+    if row and row["value"]:
+        try:
+            _world_salt_cache = int(row["value"]) & 0xFFFFFFFF
+            return _world_salt_cache
+        except (TypeError, ValueError):
+            pass
+    salt = _derive_world_salt(conn)
+    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('world_salt', ?)",
+                 (str(salt),))
+    conn.commit()
+    _world_salt_cache = salt
+    return salt
+
+
+def _derive_world_salt(conn):
+    """세이브 내용만으로 32비트 salt를 만든다(엔트로피·시각 사용 금지 —
+    get_world_salt 주석 참고). 시작 연도 + 내 선수 신원 + ai_players 앞
+    500명의 (id, 이름, OVR)을 이어붙여 crc32로 접는다. 선수 생성은 월드마다
+    무작위라 이 지문이 월드를 가른다. game_engine._make_goal_seed이 내장
+    hash() 대신 crc32를 쓰는 것과 같은 이유로(PYTHONHASHSEED 무관) crc32다."""
+    import zlib
+    parts = [f"start={get_game_start_year()}"]
+    try:
+        r = conn.execute(
+            "SELECT name, birth_year, nationality FROM my_player LIMIT 1").fetchone()
+        if r:
+            parts.append(f"me={r['name']}|{r['birth_year']}|{r['nationality']}")
+    except Exception:
+        pass
+    try:
+        for r in conn.execute(
+                "SELECT id, name, ovr FROM ai_players ORDER BY id LIMIT 500"):
+            parts.append(f"{r['id']}|{r['name']}|{r['ovr']}")
+    except Exception:
+        pass
+    return zlib.crc32("\x1f".join(parts).encode("utf-8")) & 0xFFFFFFFF
 
 
 def seed_initial_ovr_history(year):
@@ -3384,6 +3471,16 @@ def init_db():
         # 시점(intl_engine._pick_intl_starters)에 그 선수가 배정된 포메이션
         # 슬롯을 여기 따로 남긴다 — 벤치는 배정 자체가 없으므로 빈 값이고,
         # 그 경우 화면은 예전처럼 position(주포) 스냅샷으로 폴백한다.
+        # [2026-09 신설, 신민용 확정: "주발을 설계해둘려고 — 이 주발에 따라
+        # 월드컵이나 팀에서 포지션 배정될 때 되는거야"] 선수 주발.
+        # '왼발'/'오른발'/'양발' 중 하나. 빈 문자열은 아직 배정되지 않은
+        # 상태로, 구세이브 호환을 위해 이 경우 주발 관련 보정을 전부 0으로
+        # 처리한다(constants.FOOT_* / formation_logic 참고).
+        # salary와 달리 시간이 지나도 변하지 않는 값이라 시즌 스냅샷
+        # 테이블(team_season_lineup 등)에 따로 보존하지 않는다.
+        # ai_players_seed는 아래 컬럼 동기화 루프가 자동으로 따라온다.
+        "ALTER TABLE ai_players ADD COLUMN foot TEXT DEFAULT ''",
+        "ALTER TABLE my_player ADD COLUMN foot TEXT DEFAULT ''",
         "ALTER TABLE intl_squad ADD COLUMN slot TEXT DEFAULT ''",
     ]:
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
@@ -7096,7 +7193,7 @@ def get_country_squad_players(country, positions=None, min_count=8, target_ovr=N
                 order_params = ()
             try:
                 row = conn.execute(
-                    f"""SELECT ap.id, ap.name, ap.position, ap.ovr, ap.age, {_stat_cols},
+                    f"""SELECT ap.id, ap.name, ap.position, ap.ovr, ap.age, ap.foot, ap.sub_role, {_stat_cols},
                                t.name AS club, t.current_tier AS club_tier, cn.name AS club_country
                         FROM ai_players ap JOIN teams t ON ap.team_id=t.id
                         JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
@@ -7109,7 +7206,7 @@ def get_country_squad_players(country, positions=None, min_count=8, target_ovr=N
                 # 자체는 끊기지 않게 한다.
                 _fallback_order = "(ap.ovr - ABS(ap.age - 27) * 0.3) DESC" if order_by.startswith("intl_score") else order_by
                 row = conn.execute(
-                    f"""SELECT ap.id, ap.name, ap.position, ap.ovr, ap.age, {_stat_cols},
+                    f"""SELECT ap.id, ap.name, ap.position, ap.ovr, ap.age, ap.foot, ap.sub_role, {_stat_cols},
                                t.name AS club, t.current_tier AS club_tier, cn.name AS club_country
                         FROM ai_players ap JOIN teams t ON ap.team_id=t.id
                         JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
@@ -7223,6 +7320,7 @@ def get_country_nationals_for_positions(country, positions):
     _stat_cols = ",".join(f"ap.{s}" for s in ALL_STATS)
     rows = conn.execute(
         f"""SELECT ap.id, ap.name, ap.position, ap.ovr, ap.age, ap.peak_ovr, ap.sub_role,
+               ap.foot,
                    {_stat_cols},
                    t.name AS club, t.current_tier AS club_tier, cn.name AS club_country
             FROM ai_players ap JOIN teams t ON ap.team_id=t.id
@@ -7488,7 +7586,7 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
         # 확인 — 그런 선수는 그냥 명단에서 조용히 빠진다(재선발 안 함,
         # 실제로도 대회 도중 대표팀이 26인 미만으로 남는 일은 흔하다).
         prows = conn.execute(
-            f"""SELECT ap.id, ap.name, ap.position, ap.ovr, ap.age, {_stat_cols},
+            f"""SELECT ap.id, ap.name, ap.position, ap.ovr, ap.age, ap.foot, ap.sub_role, {_stat_cols},
                        t.name AS club, t.current_tier AS club_tier, cn.name AS club_country
                 FROM ai_players ap JOIN teams t ON ap.team_id=t.id
                 JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
@@ -7549,7 +7647,7 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
             _stat_cols = ",".join(f"ap.{s}" for s in ALL_STATS)
             placeholders = ",".join("?" * len(source_ids))
             prows = conn2.execute(
-                f"""SELECT ap.id, ap.name, ap.position, ap.ovr, ap.age, {_stat_cols},
+                f"""SELECT ap.id, ap.name, ap.position, ap.ovr, ap.age, ap.foot, ap.sub_role, {_stat_cols},
                            t.name AS club, t.current_tier AS club_tier, cn.name AS club_country
                     FROM ai_players ap JOIN teams t ON ap.team_id=t.id
                     JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
@@ -8000,14 +8098,151 @@ def roll_bench_position():
     return random.choice(_BENCH_GROUP_POOLS[grp])
 
 
-def _build_squad_positions():
-    """팀 하나의 포지션 목록(주전 11 + 벤치 11~14)을 새로 만든다. 주전은
-    기존 4-4-2 기준 그대로(스타 슬롯/역할 배정 로직이 이 순서에 의존),
-    벤치는 매 자리 roll_bench_position()으로 독립 추첨한다(11~14명).
-    백업 골키퍼가 한 명도 없는 팀이 나오지 않도록(주전 GK가 다치거나
-    이적하면 대체 불가) 최소 1명은 강제로 보장한다."""
+# ── 주발(foot) ──────────────────────────────────────────────
+# [2026-09 신설, 신민용 확정] 주발은 메인 random 스트림을 "한 번도"
+# 소비하지 않는다 — player_id와 월드 salt만으로 결정된다.
+#
+# 이유가 기능이 아니라 실험 설계다. 생성 시점에 random을 한 번 더
+# 굴리면 그 뒤 모든 난수가 밀려서, 같은 시드로 돌려도 월드 자체가
+# 달라진다. 그러면 나중에 "반대발 풀백 페널티를 0.08로 할까 0.12로
+# 할까"를 실측으로 고를 때 페널티 효과와 월드 변화가 섞여서 비교가
+# 성립하지 않는다. 결정적 해시로 뽑으면:
+#     같은 월드 ├─ 주발 OFF → 기존 월드 그대로
+#               └─ 주발 ON  → 같은 선수/같은 세계 + 주발만 추가
+# 라는 A/B가 가능하다. game_engine._make_season_estimate_rng이
+# random.getrandbits() 대신 crc32 시드를 쓰는 것과 완전히 같은 철학.
+#
+# [salt를 world_salt와 분리한 이유] get_world_salt()는
+# _make_season_estimate_rng이 쓰는 값이고, 최초 계산 시점의 세이브
+# 내용(특히 my_player 신원)으로 값이 확정된다. 주발을 월드 생성
+# 직후(= 아직 내 선수가 없는 시점)에 채우면서 get_world_salt()를
+# 부르면 그 값이 예전보다 이르게, 내 선수 없이 확정돼 버린다 —
+# 주발과 아무 상관 없는 시즌 스탯 추정치가 통째로 달라진다.
+# 그래서 주발은 같은 방식으로 뽑되 meta 키만 다른 별도 salt를 쓴다.
+_foot_salt_cache = None
+_FOOT_NS = "player_foot"      # 다른 결정적 추첨과 섞이지 않게 하는 네임스페이스
+
+
+def _derive_foot_salt(conn):
+    """주발 전용 32비트 salt. _derive_world_salt와 같은 방식이되 내
+    선수 신원은 쓰지 않는다(월드 생성 직후에도 값이 확정되어야 하므로).
+    월드 간 유일성은 초기 로스터(무작위 생성)에서 나온다."""
+    import zlib
+    parts = [f"foot_start={get_game_start_year()}"]
+    try:
+        for r in conn.execute(
+                "SELECT id, name, ovr FROM ai_players ORDER BY id LIMIT 500"):
+            parts.append(f"{r['id']}|{r['name']}|{r['ovr']}")
+    except Exception:
+        pass
+    return zlib.crc32("\x1f".join(parts).encode("utf-8")) & 0xFFFFFFFF
+
+
+def get_foot_salt(conn=None):
+    """meta.foot_salt를 읽거나 없으면 만들어 저장한다(한 번 정해지면
+    로스터가 바뀌어도 고정)."""
+    global _foot_salt_cache
+    if _foot_salt_cache is not None:
+        return _foot_salt_cache
+    own = conn is None
+    if own:
+        conn = get_conn()
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key='foot_salt'").fetchone()
+        if row and row["value"]:
+            try:
+                _foot_salt_cache = int(row["value"]) & 0xFFFFFFFF
+                return _foot_salt_cache
+            except (TypeError, ValueError):
+                pass
+        salt = _derive_foot_salt(conn)
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('foot_salt', ?)",
+                     (str(salt),))
+        _foot_salt_cache = salt
+        return salt
+    finally:
+        if own:
+            conn.commit()
+            conn.close()
+
+
+def roll_foot(position, player_id, salt):
+    """(포지션, player_id, salt) → '왼발'/'오른발'/'양발'. 순수 함수이며
+    random을 쓰지 않는다. 같은 입력이면 언제 불러도 같은 값."""
+    import zlib
+    from constants import (FOOT_DIST_BY_POS, FOOT_DIST_DEFAULT,
+                           FOOT_LEFT, FOOT_RIGHT, FOOT_BOTH)
+    left, right, both = FOOT_DIST_BY_POS.get(position or "", FOOT_DIST_DEFAULT)
+    total = left + right + both
+    if total <= 0:
+        return FOOT_RIGHT
+    h = zlib.crc32(f"{_FOOT_NS}\x1f{salt}\x1f{player_id}".encode("utf-8")) & 0xFFFFFFFF
+    v = h % total
+    if v < left:
+        return FOOT_LEFT
+    if v < left + right:
+        return FOOT_RIGHT
+    return FOOT_BOTH
+
+
+def assign_missing_feet(c=None):
+    """foot이 아직 빈 ai_players 행에 결정적 주발을 채운다. 멱등이라
+    몇 번을 불러도 결과가 같고, 이미 값이 있는 행은 건드리지 않는다.
+
+    [왜 INSERT 지점마다 안 넣고 이 함수 하나로 모으나] ai_players의
+    id가 AUTOINCREMENT라 INSERT를 만드는 시점엔 player_id를 알 수 없다
+    — 결정적 해시의 입력이 없다. database._generate_team_players가
+    contract_end_year를 "INSERT 직후 MAX(id)부터 역산"으로 채우는
+    것과 같은 상황이라, 같은 방식(사후 백필)으로 통일한다. 생성
+    지점이 5곳(은퇴교체/빈자리충원/스쿼드보충/물갈이/월드시드)이라
+    지점마다 넣으면 하나 빠뜨렸을 때 조용히 빈 값이 남는데, 이
+    함수 하나면 앞으로 생길 새 INSERT 경로까지 자동으로 덮는다.
+    반환: 이번에 채운 인원 수."""
+    own = c is None
+    conn = None
+    if own:
+        conn = get_conn()
+        c = conn.cursor()
+    try:
+        rows = c.execute(
+            "SELECT id, position FROM ai_players "
+            "WHERE foot IS NULL OR foot=''").fetchall()
+        if not rows:
+            return 0
+        salt = get_foot_salt(c if not own else conn)
+        payload = [(roll_foot(r["position"], r["id"], salt), r["id"]) for r in rows]
+        c.executemany("UPDATE ai_players SET foot=? WHERE id=?", payload)
+        return len(payload)
+    finally:
+        if own:
+            conn.commit()
+            conn.close()
+
+
+def _build_squad_positions(grade=None, tier=None):
+    """팀 하나의 포지션 목록(주전 11 + 벤치)을 새로 만든다. 주전은 기존
+    4-4-2 기준 그대로(스타 슬롯/역할 배정 로직이 이 순서에 의존), 벤치는
+    매 자리 roll_bench_position()으로 독립 추첨한다. 백업 골키퍼가 한
+    명도 없는 팀이 나오지 않도록(주전 GK가 다치거나 이적하면 대체 불가)
+    최소 1명은 강제로 보장한다.
+
+    [2026-09 신설, 신민용 리포트: "SS/S 1부는 2부까지, A는 1부만 26명
+    고정이라고 했는데 새 게임을 막 시작하면 그게 안 지켜져 있다(분데스
+    리가 1부팀이 후보 11명뿐)"] ai_lifecycle._rebalance_squad_sizes가
+    시즌 이적시장 이후에만 그 등급/부수 조합을 26명으로 강제하는데,
+    이 함수(월드 최초 생성)는 grade/tier와 무관하게 항상 벤치 11~14명
+    (=총 22~25명)만 뽑아서, 새 게임 첫 시즌(연도전환 전, 이 함수가 26명을
+    맞춰줄 기회가 아직 한 번도 없었던 시점)엔 SS/S/A 최상위팀도 얇은
+    스쿼드로 시작했다. ai_lifecycle._rebalance_squad_sizes와 완전히 같은
+    등급/부수 조건을 여기서도 그대로 적용해, 최초 생성 시점부터 이미
+    26명(벤치 15명)으로 채워지게 한다 — 조건에 안 걸리는 나머지 등급/
+    부수는 기존처럼 11~14명 랜덤 그대로 둔다(이번 변경 범위 밖)."""
     starters = ["GK", "CB", "CB", "LB", "RB", "CDM", "CM", "CAM", "LW", "RW", "ST"]
-    bench = [roll_bench_position() for _ in range(random.randint(11, 14))]
+    if (tier == 1 and grade in ("A", "S", "SS")) or (tier == 2 and grade in ("S", "SS")):
+        bench_n = 15   # 11(주전) + 15 = 26명 고정
+    else:
+        bench_n = random.randint(11, 14)
+    bench = [roll_bench_position() for _ in range(bench_n)]
     if "GK" not in bench:
         bench[random.randrange(len(bench))] = "GK"
     return starters + bench
@@ -8618,6 +8853,15 @@ def _generate_all_ai_players(c, progress_cb=None):
     from ai_lifecycle import _enforce_intl_breakout_caps
     _enforce_intl_breakout_caps(c, get_game_start_year())
 
+    # [2026-09 신설] 방금 만든 전 세계 선수단의 주발을 여기서 채운다.
+    # 이 함수가 "새 게임"(_regenerate_ai_players)과 최초 설치
+    # (seed_initial_data) 두 경로의 공통 생성 지점이라, 여기 한 곳이면
+    # 두 경로가 모두 덮인다 — seed_initial_data 쪽은 이 호출 직후에
+    # ai_players_seed 스냅샷을 뜨므로 그 스냅샷에도 주발이 들어간다.
+    # id가 AUTOINCREMENT라 INSERT 시점엔 결정적 해시의 입력이 없어서
+    # 사후 백필로 채운다(assign_missing_feet 주석 참고).
+    assign_missing_feet(c)
+
 
 def _topup_foreign_floor(_rows, star_kind_by_slot, team_country, team_continent,
                           quota_lo, foreign_count, starter_floor=None):
@@ -8678,6 +8922,43 @@ def _topup_foreign_floor(_rows, star_kind_by_slot, team_country, team_continent,
         _rows[i] = tuple(row)
         foreign_count += 1
     return foreign_count
+
+
+# [2026-09 신설] 월드시드 신인에게도 연봉을 매긴다 — 예전엔 아래 INSERT가
+# salary 컬럼을 아예 안 써서 최초 생성된 전 세계 26.9만 명이 전부 salary=0
+# 이었다(이적한 선수만 연봉이 생겨, 실측 66.9%가 0). contract_end_year/
+# created_year가 바로 이 INSERT에서 똑같은 이유로 빠져 있다가 고쳐진 적이
+# 있는데(아래 주석 참고) salary가 그때 같이 안 고쳐진 잔여분이다.
+#
+# [성능] _calc_ai_salary(=economy._calc_salary)는 1회 약 11µs라 26.9만 번
+# 부르면 실측 3.94초가 그대로 새 게임 생성 시간에 얹힌다. 그래서 메모한다.
+# 키에서 팀명을 빼고 명문등급(prestige_level)을 쓰는 게 핵심인데, 이건
+# 근거가 있다 — _calc_salary가 team_name을 쓰는 경로는 prestige_salary_mult
+# 하나뿐이고 그 함수는 team_name을 곧바로 prestige_level(country, team_name)
+# 으로 바꿔서만 쓴다. 즉 명문등급이 같으면 결과가 반드시 같다.
+# 실측 검증: 실제 월드 26.9만 명 전수 대조에서 캐시 결과와 직접 계산
+# 결과의 불일치 0건, 3.94s -> 0.55s(86% 절감, 호출 15,288회로 감소).
+# 순수함수 메모라 난수를 소비하지 않으며(getstate 전후 동일 확인) 월드
+# 분기를 일으키지 않는다.
+_AI_SEED_SALARY_MEMO: dict = {}
+
+
+def _seed_salary(grade, tier, ovr, cname, tname, plevel, year):
+    """월드시드 신인 1명의 연봉. 위 메모 주석 참고 — 같은 (등급, 부수,
+    OVR, 국가, 명문등급, 연도)면 항상 같은 값이므로 캐시가 안전하다."""
+    key = (grade, tier, ovr, cname, plevel, year)
+    val = _AI_SEED_SALARY_MEMO.get(key)
+    if val is None:
+        try:
+            from economy import _calc_salary
+            val = _calc_salary(grade, tier, ovr, country=cname,
+                               team_name=tname, year=year)
+        except Exception:
+            # ai_lifecycle._calc_ai_salary와 동일한 정책 — 연봉 계산 실패가
+            # 세계 생성 전체를 멈추면 안 되므로 조용히 0으로 흡수한다.
+            val = 0
+        _AI_SEED_SALARY_MEMO[key] = val
+    return val
 
 
 def _generate_team_players(c, team, team_strength, league_used: set = None, name_pool_cache: dict = None):
@@ -8748,18 +9029,20 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
         _star_prestige_bonus += GLOBAL_PRESTIGE_STAR_CFG.get(
             team.get("cname", ""), {}).get("extra_bonus", 0.0)
 
-    # 해당 국가 이름풀 전체를 가져온다 (리그 8팀 × 11명 = 최대 88개 필요)
-    # [2026-08 최적화] 국가당 한 번만 SELECT, 이후 팀들은 캐시 재사용.
-    _cid = team["cid"]
-    if name_pool_cache is not None and _cid in name_pool_cache:
-        name_pool = name_pool_cache[_cid]
-    else:
-        c.execute("SELECT name FROM player_names WHERE country_id=?", (_cid,))
-        name_pool = [r["name"] for r in c.fetchall()]
-        if not name_pool:
-            name_pool = [f"선수{i}" for i in range(100)]
-        if name_pool_cache is not None:
-            name_pool_cache[_cid] = name_pool
+    # [2026-09 제거, 신민용 확정: "names.py는 플레이어가 국적 선택 후 이름
+    # 고를 때 쓰는 용도고, AI 선수 이름으로 들어가면 그걸 제거해야 해"]
+    # 예전엔 여기서 player_names 풀을 읽어 선수마다 실명을 뽑아
+    # ai_players.name에 저장했다. 그런데 그 값은 화면에 단 한 번도 안
+    # 나온다 — 모든 표시 경로가 custom_name or ai_player_code(id)로
+    # 덮어쓴다(world_browser 3811/4146/4345/5634, ui/formation_widget.
+    # _mask_ai_names, match_sim/tactical_engine._display_name — 그 함수
+    # 주석 자체가 "ai_players.name은 data/names.py에서 뽑은 내부 시드값일
+    # 뿐, 화면에는 항상 마스킹된 표시명"이라고 적어두고 있다).
+    # 읽는 곳이 없는 값을 만들기 위해 국가별 풀 조회 + 선수당 random.choice
+    # 를 돌리고 있었으므로 통째로 제거한다. name_pool_cache/league_used
+    # 파라미터는 호출부 호환을 위해 시그니처에만 남겨둔다(미사용).
+    # data/names.py와 player_names 표 자체는 그대로 유지한다 —
+    # ui/start_screen.py의 "내 선수 이름 추천"이 계속 쓴다.
 
     # [2026-07 신설] 스타 슬롯(월드클래스/엘리트) 명시적 배정 — 완만한 곡선
     # (_target_ovr)만으로는 "이 팀에 월클이 몇 명"이 보장되지 않아서, 소수
@@ -8880,17 +9163,19 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
     # 나이)와 통일 — 예전엔 22로 따로 하드코딩돼 있어 표(25세=98%)와
     # 어긋났었다.
     _AGE_MATURE = AGE_OVR_FRACTION_MATURE_AGE
-    for idx, pos in enumerate(_build_squad_positions()):
-        # [AI 생애] 초기 나이: 16~34 삼각분포(25 봉우리). 시즌마다 +1 되며
+    for idx, pos in enumerate(_build_squad_positions(grade, tier)):
+        # [AI 생애] 초기 나이: 17~34 삼각분포(25 봉우리). 시즌마다 +1 되며
         # 성장/노화(ai_lifecycle.py) — target 스케일링에 쓰기 위해 여기서
         # (예전엔 루프 맨 끝에서) 미리 뽑는다.
-        age = int(round(random.triangular(16, 34, 25)))
-        # 리그 전체에서 아직 안 쓴 이름 우선 사용
-        available = [n for n in name_pool if n not in league_used]
-        if not available:
-            available = name_pool
-        name = random.choice(available)
-        league_used.add(name)
+        # [2026-09 신설, 신민용 리포트: "AI가 16세를 생성하자마자 1군으로
+        # 등록하고 실제 경기/은퇴 사이클에 바로 넣는 구조라 비현실적이다 —
+        # 유저 선수 생성 나이(PLAYER_START_AGE=16, 유저가 직접 고르는
+        # 값)와는 분리해서, AI 월드 생성 쪽만 하한을 17세로 올려야 한다"]
+        # 하한만 16→17로 올리고 봉우리(25)·상한(34)은 그대로 유지.
+        age = int(round(random.triangular(17, 34, 25)))
+        # [2026-09 제거] AI 선수 실명 배정 폐지 — 위 주석 참고. 화면 표시는
+        # 항상 ai_player_code(id)/커스텀 이름이므로 빈 문자열로 둔다.
+        name = ""
         # [2026-09 재배치, 신민용 리포트: "용병은 어지간하면 주전에 속할
         # OVR을 가지고 있는 게 맞다"] 국적을 target OVR 계산보다 먼저
         # 정한다 — 외국인이면 아래에서 target을 _starter_floor 밑으로는
@@ -9118,13 +9403,21 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
     # 정해진 국적(_topup_foreign_floor까지 전부 반영된 최종값)을 그대로
     # true_nationality에도 복사해 넣는다 — 이 시점 이후로 nationality가
     # 클럽 쿼터 때문에 바뀌어도 true_nationality는 절대 안 바뀐다.
-    _rows_ins = [r[:22] + (r[21],) + r[22:] for r in _rows]
+    # [2026-09 신설] salary를 여기서 한 번에 붙인다 — _rows.append 분기가
+    # 여러 곳이라 각 분기를 고치는 대신 INSERT 직전 한 지점에서만 계산한다.
+    # r[18]=ovr (팀id,이름,포지션 + 스탯 14개 다음). grade/tier/cname/tname/
+    # _plevel은 이 함수가 팀 하나를 처리하는 동안 전부 고정이다.
+    _sal_year = get_game_start_year()
+    _rows_ins = [r[:22] + (r[21],) + r[22:] +
+                 (_seed_salary(grade, tier, r[18], team.get("cname", ""),
+                               team.get("tname", ""), _plevel, _sal_year),)
+                 for r in _rows]
     c.executemany("""INSERT INTO ai_players
         (team_id,name,position,stamina,speed,jump,strength,shooting,passing,
          dribbling,tackling,heading,positioning,setpiece,
          mental,confidence,leadership,concentration,ovr,age,sub_role,nationality,
-         true_nationality,potential_ovr)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", _rows_ins)
+         true_nationality,potential_ovr,salary)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", _rows_ins)
     # [2026-09 버그수정, 신민용 리포트: "첫 입단인데 계약년도만 뜨고
     # 계약기간이 안 뜬다 — 84억(계약년도:2000) 말고 84억(계약:5년)로
     # 떠야지"] ai_lifecycle.py의 신인생성 3곳(은퇴대체/스쿼드보충 등)은

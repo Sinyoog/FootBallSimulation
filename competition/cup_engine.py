@@ -1228,7 +1228,8 @@ def simulate_my_cup_match(week, p, day=None):
         # 골·평점이 폭발하도록. he/ae는 보너스 반영 전 원본 팀 OVR이다.
         _opp_ovr = (ae["ovr"] if is_home else he["ovr"])
         goals, assists, saves, rating, events, detail = _player_perf(
-            p, outcome, is_home, hs, as_, opp_ovr=_opp_ovr)
+            p, outcome, is_home, hs, as_, opp_ovr=_opp_ovr,
+            is_big_match=(m.get("round_name") == "결승"))
         _absence_reason = None
         _yellow_cnt = 0
         _dismissed, _card_reason, _yellow_ev, _yellow_cnt = _roll_card_events(p, "cup_suspension")

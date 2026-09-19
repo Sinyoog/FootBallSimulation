@@ -3820,6 +3820,38 @@ def get_season_individual_awards(year, award_type):
     return rows
 
 
+# [2026-09 신설, 신민용 확정: "피파상을 야신상·푸스카스상 옆에 버튼으로
+# 붙이고, 누르면 각 상을 누가 받았는지 뜨게"] 세계상 패널 "피파상" 토글이
+# 한 번에 보여줄 상 목록 — game_engine._FIFA_POY_AWARD/_CONTINENT_POY와
+# 같은 문자열이어야 한다(저장 시 쓰는 award_type 그대로 조회하므로).
+# 표시 순서는 FIFA(세계) → 대륙별이며, 대륙은 후보 풀 규모가 큰 순으로 둔다.
+WORLD_POTY_AWARD_TYPES = (
+    "FIFA 올해의 선수",
+    "UEFA 올해의 선수",
+    "코메볼 올해의 선수",
+    "AFC 올해의 선수",
+    "CAF 올해의 선수",
+    "콩카카프 올해의 선수",
+    "OFC 올해의 선수",
+)
+
+
+def get_world_poty_awards(year):
+    """그 해 FIFA 올해의 선수 + 대륙별 올해의 선수 수상자를 한 목록으로
+    반환한다 — 각 행에 어느 상인지(award_type)를 같이 담는다.
+
+    상마다 수상자가 1명(rank=1)뿐이라 상별 조회를 그대로 이어붙이면 된다 —
+    이름/팀명/국적 보강은 get_season_individual_awards가 이미 하고 있으므로
+    그 로직을 그대로 재사용한다(중복 구현 없음). 그 해 아직 계산되지 않은
+    상(예: 후보가 아예 없던 대륙)은 자연스럽게 빠진다."""
+    out = []
+    for award_type in WORLD_POTY_AWARD_TYPES:
+        for r in get_season_individual_awards(year, award_type):
+            r["award_type"] = award_type
+            out.append(r)
+    return out
+
+
 def get_ballon_dor_winner(year):
     """그 해 발롱도르 1위(rank=1) 수상자의 {player_id, name} — "역대
     개인상" 세계상 패널의 연도 목록 옆에 붙는 보조 칸(2026-09 신설,
@@ -3949,6 +3981,74 @@ WORLD_AWARD_STYLE = {
 AWARD_CATEGORY_ORDER = {"world": 0, "intl": 1, "club": 2, "cup": 3, "lower_cup": 4, "league": 5}
 
 
+def _award_row_label(r):
+    """season_individual_awards 한 행 → 화면 표시용 라벨.
+    [2026-09 분리] get_player_awards_with_year_highlight와 get_player_award_
+    groups_by_year가 같은 라벨을 쓰도록 공용화했다 — 한쪽만 고쳐서 두 화면의
+    상 이름이 갈라지는 일을 막는다. 분리 전 로직 그대로다."""
+    kind = r["award_kind"] or r["award_type"]
+    if kind in ("발롱도르", "야신상", "FIFA 푸스카스상", "올해의 최고의 골"):
+        return f"{r['award_type']} {r['rank']}위"
+    if kind == "베스트11":
+        return f"{r['award_type']}" + (f" ({r['position']})" if r["position"] else "")
+    if kind == "골든볼":
+        ball_name = WC_BALL_RANK_LABEL.get(r["rank"], kind)
+        return f"{(r['competition'] or '').strip()} {ball_name}".strip()
+    return r["award_type"]
+
+
+def get_player_award_groups_by_year(player_id):
+    """{year: [(대회명 or None, [상 이름, ...]), ...]} — 연도 상세의 "🏆 상"
+    줄을 대회 단위로 묶어 보여주기 위한 형태.
+
+    [2026-09 신설, 신민용 리포트: "상 적힌 창이 너무 길어"] 한 해에 여러
+    상을 받으면 "프리미어리그 MVP · 프리미어리그 영플레이어 · 프리미어리그
+    베스트11 (RW)"처럼 대회명이 그대로 반복돼 줄이 계속 길어진다(FIFA
+    올해의 선수·대륙상이 추가되면서 더 심해졌다). 대회명을 한 번만 쓰고
+    그 대회에서 받은 상들만 이어붙이면 같은 정보를 훨씬 짧게 담을 수 있다.
+
+    접두어 판정은 문자열 추측이 아니라 저장된 competition 값으로 한다 —
+    award_type이 실제로 "{competition} {상 이름}" 형태일 때만 잘라낸다.
+    구단 올해의 선수처럼 접두어가 팀명인 상(competition은 리그명)은 자연히
+    안 잘리고 단독 항목으로 남는다. 정렬 순서는 get_player_awards_with_
+    year_highlight와 완전히 동일하다."""
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT year, award_type, award_kind, rank, position, team_name, competition, category
+           FROM hist.season_individual_awards WHERE player_id=? ORDER BY year, rank""",
+        (player_id,)).fetchall()
+    conn.close()
+    by_year = {}
+    _last_cat = len(AWARD_CATEGORY_ORDER)
+    for r in rows:
+        kind = r["award_kind"] or r["award_type"]
+        label = _award_row_label(r)
+        _style = WORLD_AWARD_STYLE.get(kind)
+        sort_key = ((0, _style[0]) if _style is not None
+                    else (AWARD_CATEGORY_ORDER.get(r["category"] or "", _last_cat) + 1, 0))
+        comp = (r["competition"] or "").strip()
+        if comp and label.startswith(comp + " "):
+            prefix, suffix = comp, label[len(comp) + 1:]
+        else:
+            prefix, suffix = None, label
+        by_year.setdefault(r["year"], []).append((sort_key, prefix, suffix))
+    out = {}
+    for year, entries in by_year.items():
+        groups, index = [], {}
+        for _k, prefix, suffix in sorted(entries, key=lambda e: e[0]):
+            if prefix is None:            # 묶지 않는 상(세계상/구단상 등)
+                groups.append((None, [suffix]))
+                continue
+            pos = index.get(prefix)
+            if pos is None:
+                index[prefix] = len(groups)
+                groups.append((prefix, [suffix]))
+            else:
+                groups[pos][1].append(suffix)
+        out[year] = groups
+    return out
+
+
 def get_player_awards_with_year_highlight(player_id):
     """[2026-09 신설] get_player_awards_by_year와 같은 {year: [라벨...]}에
     더해, {year: 표시색} — 그 해 세계상 3종(WORLD_AWARD_STYLE) 중 순위권에
@@ -3968,15 +4068,7 @@ def get_player_awards_with_year_highlight(player_id):
     _last_cat = len(AWARD_CATEGORY_ORDER)
     for r in rows:
         kind = r["award_kind"] or r["award_type"]
-        if kind in ("발롱도르", "야신상", "FIFA 푸스카스상", "올해의 최고의 골"):
-            label = f"{r['award_type']} {r['rank']}위"
-        elif kind == "베스트11":
-            label = f"{r['award_type']}" + (f" ({r['position']})" if r["position"] else "")
-        elif kind == "골든볼":
-            ball_name = WC_BALL_RANK_LABEL.get(r["rank"], kind)
-            label = f"{(r['competition'] or '').strip()} {ball_name}".strip()
-        else:
-            label = r["award_type"]
+        label = _award_row_label(r)
         _style = WORLD_AWARD_STYLE.get(kind)
         if _style is not None:
             # 세계상은 카테고리 맨 앞(0) 안에서 다시 발롱→야신→푸스카스.
@@ -4484,7 +4576,20 @@ def _is_euro_cycle_year(year):
             and (year - _regional_start) % REGIONAL_CUP_INTERVAL == 0)
 
 
-def _effective_kind(kind, name, year=None):
+# [2026-09 신설, 예선 4대륙 확장] intl_tournaments.continent 값 →
+# 표시용 유효종류. 남미/북미/북중미/오세아니아가 컬럼에 직접 들어오는
+# 레거시 행도 같은 대륙으로 떨어지게 함께 적어둔다(연맹 키와 대륙 키의
+# 차이는 intl_engine._conf_key / _cont_key 주석 참고).
+_CONT_QUAL_EK = {
+    "유럽": "cont_qual_eu",
+    "아메리카": "cont_qual_am", "남미": "cont_qual_am",
+    "북미": "cont_qual_am", "북중미": "cont_qual_am",
+    "아시아": "cont_qual_as", "오세아니아": "cont_qual_as",
+    "아프리카": "cont_qual_af",
+}
+
+
+def _effective_kind(kind, name, year=None, continent=None):
     """[2026-08 신설, 신민용 요청: "우승 기록에 유로/대륙컵 필터를 따로
     만들어달라"] DB상 유로(EURO)는 일반 대륙컵과 똑같이 kind='continent'로
     저장된다(intl_engine._create_one_tournament — 이름만 EURO_NAME으로
@@ -4517,6 +4622,19 @@ def _effective_kind(kind, name, year=None):
     if kind == "cont_qual":
         if name and any(rn and rn in name for rn in REGION_CUP_NAME.values()):
             return "region_qual"
+        # [2026-09 신설, 예선 4대륙 확장] continent 컬럼이 있으면 그걸
+        # 그대로 기준으로 삼는다 — 대회명 추측(위 REGION_CUP_NAME 검사
+        # 같은 substring 매칭)은 이름을 바꾸는 순간 조용히 틀어지므로,
+        # 새로 늘어난 세 대륙은 컬럼으로만 판정한다. 유럽은 같은 대륙에서
+        # 주기에 따라 유로 예선 / 유럽 네이션스컵 예선 둘로 갈리므로
+        # 기존 _is_euro_cycle_year 판정을 그대로 유지한다.
+        _c = _CONT_QUAL_EK.get((continent or "").strip())
+        if _c:
+            if _c == "cont_qual_eu" and year is not None and _is_euro_cycle_year(year):
+                return "euro_qual"
+            return _c
+        # continent를 모르는 호출부(레거시 행, GROUP BY 집계 등)는
+        # 예전 판정 그대로 — 회귀 없음.
         if year is not None and _is_euro_cycle_year(year):
             return "euro_qual"
     return kind
@@ -4903,7 +5021,8 @@ def get_country_tournament_results(country_name, limit=200):
         # 보장한다 — 데이터 자체가 비정상인 레거시 행이라도 화면은 안 깨지게.
         out.append({"id": t["id"], "year": t["year"],
                      "kind": t["kind"] or "?",
-                     "effective_kind": _effective_kind(t["kind"] or "", t["name"] or "", t.get("year")),
+                     "effective_kind": _effective_kind(t["kind"] or "", t["name"] or "", t.get("year"),
+                                                      t.get("continent")),
                      "name": _country_result_name(t),
                      "result": result, "tier": tier, "rank": rank,
                      "record": record_str,
@@ -6432,6 +6551,53 @@ def get_team_history(team_id: int, year_range=None):
                 dict(entry) if (entry["league"] or entry["cup"] or entry["cl"]
                                 or entry["cwc"] or entry["sc"] or entry["dsc"]) else None)
 
+    # [2026-09 신설, 신민용 리포트: "시즌 막 시작했을 때 팀 검색 들어가면
+    # 리그/승강 정보가 바로 떠야 하는데 그 해 행 자체가 없다"] 위 루프는
+    # 실제 경기 기록(또는 완비된 스냅샷)이 있는 연도만 담으므로, 방금
+    # 시즌이 시작돼 아직 첫 경기(리그 개막전·국내 슈퍼컵 등)조차 안 열린
+    # "진행 중인 올해"는 연도 목록에 아예 안 잡혔다 — 그 결과
+    # world_browser_window._show_team_detail이 이 해를 클릭할 방법이 없어서,
+    # get_team_season_lineup에 새로 넣은 라이브 로스터 폴백도 실제 화면에선
+    # 닿을 길이 없었다. year_range 없이(=팀 검색 화면의 기본 호출) 부를
+    # 때만, 진행 중인 올해가 아직 목록에 없으면 리그 이름 + (있다면) 승격/
+    # 강등 배지만 담은 "미리보기" 행을 맨 앞에 추가한다 — 순위·전적·컵 등
+    # 나머지는 실제로 아무것도 열리지 않았으므로 전부 비워둔다(작년 최종
+    # 성적은 이미 그 해 자체 행에 붙어 있으므로 여기서 또 보여줄 필요
+    # 없음). year_range가 있는 호출(특정 선수가 실제로 몸담았던 연도만
+    # 걸러 쓰는 용도)에는 끼워 넣지 않는다 — 그 용도와 무관한 가짜 연도를
+    # 섞으면 안 되므로. 이 행은 캐시에도 안 넣는다(진행 중인 시즌 정보라
+    # 매주 바뀔 수 있음).
+    if year_range is None and _cache_before_year is not None and \
+            not any(e["year"] == _cache_before_year for e in out):
+        _cur_team_row = conn.execute(
+            """SELECT l.name as lname, l.tier as tier FROM teams t
+               JOIN leagues l ON t.league_id=l.id WHERE t.id=?""", (team_id,)).fetchone()
+        if _cur_team_row:
+            move_txt = ""
+            _mv = conn.execute(
+                """SELECT from_tier, to_tier, league_name FROM promotion_log
+                   WHERE team_name=? AND year=? ORDER BY id DESC LIMIT 1""",
+                (team_name, _cache_before_year - 1)).fetchone()
+            if _mv:
+                kind = "승격" if _mv["to_tier"] < _mv["from_tier"] else "강등"
+                move_txt = f"  [{_mv['league_name']}({_mv['from_tier']}부)에서 {kind}]"
+            out.insert(0, {
+                "year": _cache_before_year,
+                "league": f"{_cur_team_row['lname']}({_cur_team_row['tier']}부){move_txt}",
+                "cup": None, "cl": None, "cwc": None, "sc": None, "dsc": None,
+                "league_record": None, "cup_record": None, "cl_record": None,
+                "cwc_record": None, "sc_record": None, "dsc_record": None,
+                "league_champion": False, "cup_champion": False, "cwc_champion": False,
+                "cl_champion": False, "cl_kind": None, "sc_champion": False,
+                "dsc_champion": False,
+                # [2026-09 신설] world_browser_window._show_team_detail이 순위
+                # 칸을 그릴 때 이 값을 보고 "발표 연도" 오프셋(+1)을 건너뛴다 —
+                # 이 해는 아직 안 끝나 "그 해 성적 발표" 자체가 없고, 대신
+                # "이 해로 들어서는 시점(=작년 성적 기준)"의 순위를 그대로
+                # 보여줘야 하므로 entry["year"] 그 값 자체로 조회해야 한다.
+                "is_preview": True,
+            })
+
     conn.close()
 
     # [2026-08 신설, 신민용 요청: "팀 검색 우측 기록 맨 위에 '수상' 칸을
@@ -6533,17 +6699,67 @@ def get_team_season_lineup(team_id: int, year: int, half: bool = False):
     row = conn.execute(
         f"SELECT formation, slots_json, bench_json FROM {_table} "
         "WHERE team_id=? AND year=?", (team_id, year)).fetchone()
-    if not row:
-        conn.close()
-        return {"formation": "", "starters": [], "bench": []}
 
     import json
-    slots = json.loads(row["slots_json"] or "[]")
-    # [2026-08 신설, 신민용 리포트: "팀도 주전 후보가 있는데 왜 안떠?"]
-    # ai_lifecycle._snapshot_season_positions가 이제 bench_json도 같이
-    # 저장해둔다 — 기존 세이브라 이 컬럼이 비어있는(과거 스냅샷) 행은
-    # '[]'로 남아 bench가 그냥 빈 리스트로 온다(starters와 동일한 한계).
-    bench_slots = json.loads(row["bench_json"] or "[]")
+    _live = False
+    if not row:
+        # [2026-09 신설, 신민용 리포트: "2001년 1주차처럼 막 시작한 해는
+        # 팀 검색에 리그/국내컵 이름은 뜨는데 선수는 하나도 안 보인다 —
+        # 이건 시즌 시작 전에 로스터를 미리 보기 위한 기능 아니냐"]
+        # 스냅샷(ai_lifecycle._snapshot_season_positions/
+        # _snapshot_team_lineup_half)은 그 해 중반(28주차)/끝(연도전환)에만
+        # 찍히므로, 방금 시작해 아직 그 시점에 도달 못한 "진행 중인 올해"는
+        # 이 함수가 늘 빈 값을 돌려줬다 — 호출부는 그걸 "이 기능이 생기기
+        # 전 과거 시즌이라 소급 조회가 안 된다"는, 사실과 정반대(과거가
+        # 아니라 오히려 미래/현재라서 없는 것)인 안내로 보여주고 있었다.
+        # year가 지금 한창 진행 중인 게임 연도라면, 스냅샷이 없다고 그냥
+        # 포기하는 대신 팀의 "지금 이 순간" 실제 로스터로 같은 모양의
+        # 포메이션을 즉석에서 구성해 보여준다(ai_lifecycle의 스냅샷 생성과
+        # 동일한 _greedy_fill_slots 배정 로직 재사용) — half(상반기/하반기)
+        # 구분은 아직 존재하지 않는 시즌이라 의미가 없으므로 어느 쪽을
+        # 눌러도 이 라이브 뷰로 통일한다. live=True를 같이 돌려줘서 호출부가
+        # "지금 로스터 기준(시즌 진행 중)" 안내문을 따로 띄울 수 있게 한다.
+        cur_year_row = conn.execute(
+            "SELECT current_year FROM season_state WHERE id=1").fetchone()
+        cur_year = cur_year_row["current_year"] if cur_year_row else None
+        if cur_year is None or year < cur_year:
+            conn.close()
+            return {"formation": "", "starters": [], "bench": []}
+        _live = True
+
+    if _live:
+        from formation_logic import _greedy_fill_slots
+        from constants import FORMATION_SLOTS
+        _trow = conn.execute("SELECT formation FROM teams WHERE id=?", (team_id,)).fetchone()
+        formation_name = (_trow["formation"] if _trow and _trow["formation"] else "4-4-2")
+        if formation_name not in FORMATION_SLOTS:
+            formation_name = "4-4-2"
+        slot_names = FORMATION_SLOTS[formation_name]
+        squad_rows = conn.execute(
+            "SELECT id, position, ovr FROM ai_players WHERE team_id=?", (team_id,)).fetchall()
+        candidates = [{"id": r["id"], "position": r["position"] or "CM", "ovr": r["ovr"] or 0}
+                      for r in squad_rows]
+        _me_row = conn.execute(
+            "SELECT current_team_id, position, ovr FROM my_player WHERE id=1").fetchone()
+        if _me_row and _me_row["current_team_id"] == team_id:
+            candidates.append({"id": MY_PLAYER_ID, "position": _me_row["position"] or "CM",
+                                "ovr": _me_row["ovr"] or 0})
+        placed = _greedy_fill_slots(candidates, slot_names)
+        started_ids = {pl["id"] for pl in placed if pl is not None}
+        slots = [{"slot": slot_names[i], "id": (pl["id"] if pl else None)}
+                 for i, pl in enumerate(placed)]
+        bench_slots = [{"id": p["id"], "position": p["position"]}
+                       for p in sorted((p for p in candidates if p["id"] not in started_ids),
+                                       key=lambda p: -(p["ovr"] or 0))]
+        _formation_out = formation_name
+    else:
+        slots = json.loads(row["slots_json"] or "[]")
+        # [2026-08 신설, 신민용 리포트: "팀도 주전 후보가 있는데 왜 안떠?"]
+        # ai_lifecycle._snapshot_season_positions가 이제 bench_json도 같이
+        # 저장해둔다 — 기존 세이브라 이 컬럼이 비어있는(과거 스냅샷) 행은
+        # '[]'로 남아 bench가 그냥 빈 리스트로 온다(starters와 동일한 한계).
+        bench_slots = json.loads(row["bench_json"] or "[]")
+        _formation_out = row["formation"] or ""
     ids = [s["id"] for s in slots if s.get("id") is not None]
     ids += [b["id"] for b in bench_slots if b.get("id") is not None]
     # [2026-09 버그수정, 신민용 리포트: "팀 검색에서 연도를 누르면 내 팀이
@@ -6656,4 +6872,391 @@ def get_team_season_lineup(team_id: int, year: int, half: bool = False):
         bench.append({"position": b.get("position", ""), "id": pid, "display_name": display_name,
                        "is_foreign": _is_foreign(pid)})
 
-    return {"formation": row["formation"] or "", "starters": starters, "bench": bench}
+    return {"formation": _formation_out, "starters": starters, "bench": bench, "live": _live}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 팀 연도별 "그 당시 구단이 쓴 금액" 패널 (2026-09 신설, 신민용 요청:
+# "팀 검색 -> 연도 -> 포메이션 우측 빈 공간에 그 당시 구단에서 사용한
+# 금액을 1열로 표시")
+# ═══════════════════════════════════════════════════════════════════
+# [반기 매핑 — 실측으로 확정] 헷갈리기 쉬운 지점이라 근거를 남긴다.
+# 상반기 스쿼드를 만드는 건 "그 해"가 아니라 "전년도 연말 오프시즌"이고,
+# 하반기 스쿼드를 바꾸는 건 "그 해 겨울 창구"다. 실측(2002년 team_id=1):
+# 상반기 로스터 22명은 전부 year=2001 is_mid_season=0으로 들어왔고,
+# 하반기에만 있는 1명은 year=2002 is_mid_season=1이었다. 그래서
+#   상반기(Y) <- ai_transfer_log.year = Y-1 AND is_mid_season = 0
+#   하반기(Y) <- ai_transfer_log.year = Y   AND is_mid_season = 1
+# my_player(career_entries)는 is_mid_season이 없는 대신 start_week가
+# 있어 더 정확하다 — SECOND_HALF_START(32주)를 경계로 같게 가른다.
+#
+# [새 표를 만들지 않는다] 집계 결과를 캐시 표로 남기면 새 게임 시작 시
+# 삭제 목록(database.reset_game_data)에 추가하는 걸 깜빡하는 순간
+# 이전 판의 금액이 남는다 — el_*/ecl_*/sc_*/lower_cup_*/domestic_sc_*
+# 에서 이미 다섯 번 재발한 패턴이다. 여기서 읽는 ai_transfer_log /
+# ai_transfer_log_archive / career_entries / hist.team_season_lineup(_half)
+# 은 전부 이미 그 목록에 있으므로, 즉석 계산이면 요건이 구조적으로
+# 충족된다.
+_FINANCE_EXCLUDED_TYPES = ("은퇴대체 영입",)   # 시스템 자동 생성 — 이적시장 지출 아님
+
+
+def _finance_windows(year, mode):
+    """(ai 조회창구 목록, my_player 주차범위 목록). 위 반기 매핑 주석 참고."""
+    from constants import SECOND_HALF_START
+    if mode == "first":
+        return [(year - 1, 0)], [(year, 0, SECOND_HALF_START)]
+    if mode == "second":
+        return [(year, 1)], [(year, SECOND_HALF_START, 10 ** 9)]
+    return [(year - 1, 0), (year, 1)], [(year, 0, 10 ** 9)]
+
+
+def finance_availability(conn, year):
+    """어느 반기를 보여줄 수 있는지(신민용 확정: "2001년 3주차면 상반기만
+    뜨고 하반기는 아직 진행이 안 되었으니 안 뜬다" / "총합은 2001년 1주차
+    기준이면 2000년 확인에만 뜬다")."""
+    from constants import SECOND_HALF_START
+    row = conn.execute(
+        "SELECT current_year, current_week FROM season_state WHERE id=1").fetchone()
+    if not row:
+        return {"first": False, "second": False, "both": False}
+    cy, cw = row["current_year"], row["current_week"] or 1
+    return {"first": cy >= year,
+            "second": cy > year or (cy == year and cw >= SECOND_HALF_START),
+            "both": cy > year}
+
+
+def _finance_ai_rows(conn, team_id, wins):
+    """그 창구의 이 팀 관련 AI 이적 행(본표 + 5시즌 초과 아카이브).
+    아카이브는 슬림 컬럼이라 player_ovr/player_age가 없다 — 동점 2·3순위가
+    비는 것뿐이고 최종 player_id 정렬이 결정성을 보장한다."""
+    if not wins:
+        return []
+    cond = " OR ".join("(year=? AND is_mid_season=?)" for _ in wins)
+    params = []
+    for y, m in wins:
+        params += [y, m]
+    cols = ("player_id, fee, salary, transfer_type, is_loan,"
+            " from_team_id, to_team_id, year, player_position")
+    out = [dict(r) for r in conn.execute(
+        f"SELECT {cols}, player_ovr, player_age FROM ai_transfer_log"
+        f" WHERE ({cond}) AND (to_team_id=? OR from_team_id=?)",
+        (*params, team_id, team_id))]
+    try:
+        out += [dict(r) for r in conn.execute(
+            f"SELECT {cols}, NULL AS player_ovr, NULL AS player_age"
+            f" FROM ai_transfer_log_archive"
+            f" WHERE ({cond}) AND (to_team_id=? OR from_team_id=?)",
+            (*params, team_id, team_id))]
+    except Exception:
+        pass       # 아직 아카이브가 없는 세이브
+    return out
+
+
+def _finance_my_rows(conn, team_id, year, wranges):
+    """my_player의 이 팀 관련 거래(신민용 확정: "이적뿐만 아니라 판매 구매
+    최고연봉 최저연봉 등 모든 수치에 플레이어가 들어가야 한다").
+
+    career_entries 한 행은 두 팀에 잡힌다 — transfer_fee는 '그 팀에 들어갈
+    때 낸 돈'이므로 들어간 팀에는 영입, 직전 소속팀에는 판매로 기록된다."""
+    try:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id, team_id, salary, transfer_fee, start_year, start_week,"
+            " transfer_type, position FROM career_entries"
+            " ORDER BY start_year, start_week, id")]
+    except Exception:
+        return []
+    if not rows:
+        return []
+    me = conn.execute(
+        "SELECT ovr, age, current_year FROM my_player WHERE id=1").fetchone()
+    my_ovr = me["ovr"] if me else None
+    my_age = me["age"] if me else None
+    cur_y = me["current_year"] if me else year
+    out = []
+    for i, r in enumerate(rows):
+        if not any(r["start_year"] == wy and wlo <= (r["start_week"] or 0) < whi
+                   for wy, wlo, whi in wranges):
+            continue
+        prev_tid = rows[i - 1]["team_id"] if i > 0 else None
+        base = {"player_id": MY_PLAYER_ID, "player_ovr": my_ovr,
+                "player_position": r.get("position") or "",
+                "player_age": ((my_age - (cur_y - r["start_year"]))
+                               if my_age is not None else None),
+                "fee": r["transfer_fee"] or 0, "salary": r["salary"] or 0,
+                "is_loan": 0, "transfer_type": r["transfer_type"] or "",
+                "is_me": True}
+        if r["team_id"] == team_id:
+            out.append({**base, "side": "in"})
+        if prev_tid == team_id:
+            out.append({**base, "side": "out"})
+    return out
+
+
+def _finance_pick(rows, key, lowest):
+    """동점 규칙(신민용 확정): 금액 -> OVR 높은순 -> 나이 어린순 ->
+    player_id 오름차순. 최저를 고를 때도 2~4순위 방향은 그대로다.
+    OVR/나이가 없는 행은 뒤로 밀리고, 최종 player_id 정렬 덕에 결과는
+    항상 결정적이다."""
+    if not rows:
+        return None
+    BIG = 10 ** 15
+    def _sk(r):
+        amt = r.get(key) or 0
+        ovr, age = r.get("player_ovr"), r.get("player_age")
+        pid = r.get("player_id")
+        return ((amt if lowest else -amt),
+                (-ovr if ovr is not None else BIG),
+                (age if age is not None else BIG),
+                (pid if pid is not None else BIG))
+    return sorted(rows, key=_sk)[0]
+
+
+def _finance_attach_market_value(conn, team_id, year, entries):
+    """[2026-09 신설, 신민용 확정 B안] 각 선수의 그 해 추정 몸값
+    (economy.estimate_transfer_fee)을 entries에 붙인다.
+
+    왜 별도 줄인가 — 게임을 막 시작한 시점에는 ai_transfer_log가 0행이라
+    "최고 영입/판매"가 실제로 존재하지 않는다(실측: 시작 직후
+    ai_transfer_log 0행 / career_entries 0행 / last_transfer_year 전원 0).
+    그렇다고 몸값을 "최고 이적료" 칸에 대신 넣으면 같은 칸이 연도마다
+    다른 것(실제 지불액 vs 추정 시장가)을 뜻하게 된다. 그래서 신민용
+    확정대로 "최고/최저 몸값"을 별도 줄로 두고, 이적료 통계에는 절대
+    섞지 않는다.
+
+    estimate_transfer_fee는 난수를 전혀 쓰지 않고(getstate 전후 동일 확인)
+    DB도 안 타는 순수 계산이라 월드 진행에 영향이 없다. 팀 단위 상수
+    (등급/부수/국가/팀명)는 여기서 한 번만 조회해 전원이 공유한다."""
+    if not entries:
+        return
+    try:
+        from economy import estimate_transfer_fee
+        from constants import get_country_league_grade
+    except Exception:
+        return
+    # 몸값은 부가 정보다 — 여기서 실패해도 패널의 나머지(영입/판매/연봉)는
+    # 그대로 떠야 하므로 조회 실패를 삼키고 조용히 빠진다.
+    try:
+        row = conn.execute(
+            """SELECT t.name AS tname, cn.name AS cname, cn.grade AS ngrade,
+                      l.tier AS tier
+               FROM teams t JOIN leagues l ON t.league_id = l.id
+               JOIN countries cn ON l.country_id = cn.id
+               WHERE t.id=?""", (team_id,)).fetchone()
+    except Exception:
+        return
+    if not row:
+        return
+    try:
+        grade = get_country_league_grade(row["cname"], row["ngrade"])
+    except Exception:
+        grade = row["ngrade"]
+    tier, cname, tname = row["tier"] or 1, row["cname"], row["tname"]
+    for e in entries:
+        ovr = e.get("player_ovr")
+        if not ovr:
+            continue
+        try:
+            e["market_value"] = estimate_transfer_fee(
+                grade, tier, ovr, country=cname, team_name=tname,
+                position=e.get("player_position") or None,
+                age=e.get("player_age"), year=year)
+        except Exception:
+            continue
+
+
+def _finance_squad_salaries(conn, team_id, year, mode):
+    """그 반기 스쿼드 전원의 연봉. 반드시 그 시점 스냅샷(slots_json/
+    bench_json의 salary)에서 읽는다 — ai_players.salary는 현재값이라
+    과거 연도엔 틀린 값이고, 은퇴한 선수는 애초에 조회조차 안 된다."""
+    tables = []
+    if mode in ("first", "both"):
+        tables.append("hist.team_season_lineup_half")
+    if mode in ("second", "both"):
+        tables.append("hist.team_season_lineup")
+    entries = []
+    for t in tables:
+        row = conn.execute(
+            f"SELECT slots_json, bench_json FROM {t} WHERE team_id=? AND year=?",
+            (team_id, year)).fetchone()
+        if not row:
+            continue
+        for k in ("slots_json", "bench_json"):
+            try:
+                for x in json.loads(row[k] or "[]"):
+                    pid = x.get("id")
+                    if pid is not None:
+                        entries.append({
+                            "player_id": pid, "salary": x.get("salary"),
+                            # [2026-09 버그수정, 신민용 리포트: "플레이어는
+                            # 구단 사용 금액에서 이름이 떠야 하는데 AI0000
+                            # 이렇게 뜬다"] is_me를 이적 행(_finance_my_rows)
+                            # 에만 달고 연봉 행에는 안 달아서, 최고/최저 연봉이
+                            # my_player일 때 화면이 ai_player_code(-1)로
+                            # 떨어졌다.
+                            "is_me": (pid == MY_PLAYER_ID),
+                            # 주전은 slot(그 자리), 후보는 position — 간단 변경
+                            # 창이 "이 당시 맡은 포지션"으로 그대로 쓴다.
+                            "player_position": x.get("slot") or x.get("position") or ""})
+            except Exception:
+                continue
+    if not entries:
+        # [2026-09 버그수정, 신민용 리포트: "처음 게임 시작할 때 최고 연봉은
+        # 있을 텐데 그거 안 뜨는 거 같은데 — 최고랑 최저"] 스냅샷은 그 해
+        # 중반(28주차)/끝(연도전환)에만 찍히므로, 막 시작한 연도는 아직
+        # 아무 행도 없다 — get_team_season_lineup이 같은 상황에서 live=True로
+        # "지금 이 순간 로스터"를 즉석 구성해 보여주는 것과 똑같이, 여기서도
+        # 현재 로스터의 연봉으로 폴백한다(그 시점이 곧 '지금'이라 현재값이
+        # 정확한 값이다). 과거 연도인데 스냅샷이 없는 경우(이 기능 이전
+        # 세이브)는 애초에 그 해 로스터를 알 수 없으므로 빈 값 그대로 둔다.
+        _cur = conn.execute(
+            "SELECT current_year FROM season_state WHERE id=1").fetchone()
+        if not _cur or _cur["current_year"] != year:
+            return []
+        entries = [{"player_id": r["id"], "salary": r["salary"],
+                    "player_ovr": r["ovr"], "player_age": r["age"],
+                    "player_position": r["position"] or "", "is_me": False}
+                   for r in conn.execute(
+                       "SELECT id, salary, ovr, age, position FROM ai_players"
+                       " WHERE team_id=?", (team_id,))]
+        try:
+            _me = conn.execute(
+                "SELECT ovr, age, salary, current_team_id, position"
+                " FROM my_player WHERE id=1").fetchone()
+            if _me and _me["current_team_id"] == team_id:
+                entries.append({"player_id": MY_PLAYER_ID, "salary": _me["salary"],
+                                "player_ovr": _me["ovr"], "player_age": _me["age"],
+                                "player_position": _me["position"] or "",
+                                "is_me": True})
+        except Exception:
+            pass
+        _finance_attach_market_value(conn, team_id, year, entries)
+        return entries
+    ovr_by, age_by = {}, {}
+    _cur = conn.execute(
+        "SELECT current_year FROM season_state WHERE id=1").fetchone()
+    cur_y = _cur["current_year"] if _cur else year
+    ai_ids = sorted({e["player_id"] for e in entries if e["player_id"] >= 0})
+    for i in range(0, len(ai_ids), 500):        # IN절 500 청크(프로젝트 관례)
+        part = ai_ids[i:i + 500]
+        ph = ",".join("?" * len(part))
+        for r in conn.execute(
+                f"SELECT player_id, ovr FROM hist.ai_player_ovr_history"
+                f" WHERE year=? AND player_id IN ({ph})", (year, *part)):
+            ovr_by[r["player_id"]] = r["ovr"]
+        # 나이는 연도별 스냅샷이 없으므로 현재 나이에서 역산한다.
+        for r in conn.execute(
+                f"SELECT id, age FROM ai_players WHERE id IN ({ph})", part):
+            age_by[r["id"]] = r["age"] - (cur_y - year)
+        try:
+            # 시즌 중 방출된 선수는 ai_players에도 없고 ovr_history도 지워진다
+            # (database.py의 history 정리 참고) — 은퇴 스냅샷에 남아 있으면
+            # 그 값이라도 쓴다.
+            for r in conn.execute(
+                    f"SELECT id, age, ovr, retirement_year FROM ai_players_retired"
+                    f" WHERE id IN ({ph})", part):
+                if r["id"] not in age_by:
+                    age_by[r["id"]] = r["age"] - ((r["retirement_year"] or year) - year)
+                if r["id"] not in ovr_by:
+                    ovr_by[r["id"]] = r["ovr"]
+        except Exception:
+            pass
+    me = conn.execute(
+        "SELECT ovr, age, current_year FROM my_player WHERE id=1").fetchone()
+    if me:
+        ovr_by.setdefault(MY_PLAYER_ID, me["ovr"])
+        try:
+            _r = conn.execute(
+                "SELECT ovr FROM my_player_ovr_history WHERE year=?", (year,)).fetchone()
+            if _r:
+                ovr_by[MY_PLAYER_ID] = _r["ovr"]
+        except Exception:
+            pass
+        age_by.setdefault(MY_PLAYER_ID, me["age"] - (me["current_year"] - year))
+    for e in entries:
+        e["player_ovr"] = ovr_by.get(e["player_id"])
+        e["player_age"] = age_by.get(e["player_id"])
+    _finance_attach_market_value(conn, team_id, year, entries)
+    return entries
+
+
+def format_finance_money(v):
+    """만원 / 억 / 조, 소수점 2자리(신민용 확정: "1.42 이렇게 0.01F로").
+    내부 저장 단위는 천원이다(economy._calc_salary 주석 참고)."""
+    if v is None:
+        return "-"
+    neg = v < 0
+    v = abs(v)
+    if v >= 10 ** 9:            # 1조 = 1,000,000,000천원
+        s = f"{v / 10 ** 9:.2f}조"
+    elif v >= 10 ** 5:          # 1억 = 100,000천원
+        s = f"{v / 10 ** 5:.2f}억"
+    else:
+        s = f"{v / 10:.2f}만원"
+    return ("-" + s) if neg else s
+
+
+def get_team_season_finance(team_id, year, mode="second", conn=None):
+    """그 해 그 팀이 쓴 금액. mode: first(상반기)/second(하반기)/both(총합).
+
+    [집계 규칙 — 신민용 확정]
+      - 임대(is_loan=1)는 완전이적과 섞지 않고 "임대 영입료/방출료" 별도 2줄
+      - 이적료 0원(자유이적)은 총액엔 포함, 최고/최저 비교에선 제외
+        ("최저 영입"이 거의 항상 0원으로 고정돼 정보가 없어지므로)
+      - "은퇴대체 영입"은 시스템이 은퇴자 자리에 자동 생성하는 신인이라
+        실제 이적시장 활동으로 보지 않는다 — 금액 집계에서만 빼고,
+        스쿼드/연봉에는 그대로 포함된다(그쪽은 스냅샷이 담당)
+      - my_player도 모든 수치에 포함된다(_finance_my_rows 참고)
+      - 동점: 금액 -> OVR 높은순 -> 나이 어린순 -> player_id 오름차순
+    반환: {줄이름: {"value": 금액} 또는 {"row": 대표행}} + "available".
+    """
+    if conn is None:
+        conn = get_conn()
+    ai_wins, my_wins = _finance_windows(year, mode)
+    rows = []
+    for r in _finance_ai_rows(conn, team_id, ai_wins):
+        rows.append({**r, "is_me": False,
+                     "side": ("in" if r["to_team_id"] == team_id else "out")})
+    rows += _finance_my_rows(conn, team_id, year, my_wins)
+
+    def _sel(side, loan):
+        return [r for r in rows
+                if r["side"] == side and bool(r.get("is_loan")) == loan
+                and (r.get("transfer_type") or "") not in _FINANCE_EXCLUDED_TYPES]
+
+    buys, sells = _sel("in", False), _sel("out", False)
+    loan_in, loan_out = _sel("in", True), _sel("out", True)
+    paid = [r for r in buys if (r.get("fee") or 0) > 0]
+    got = [r for r in sells if (r.get("fee") or 0) > 0]
+    _squad = _finance_squad_salaries(conn, team_id, year, mode)
+    sal = [e for e in _squad if (e.get("salary") or 0) > 0]
+    mkt = [e for e in _squad if (e.get("market_value") or 0) > 0]
+
+    total_in = sum(r.get("fee") or 0 for r in buys)
+    total_out = sum(r.get("fee") or 0 for r in sells)
+    return {
+        "year": year, "mode": mode,
+        "available": finance_availability(conn, year),
+        "총 영입": {"value": total_in, "n": len(buys)},
+        "총 판매": {"value": total_out, "n": len(sells)},
+        "순이익": {"value": total_out - total_in},
+        "최고 영입": {"row": _finance_pick(paid, "fee", False), "key": "fee"},
+        "최고 판매": {"row": _finance_pick(got, "fee", False), "key": "fee"},
+        "최고 연봉": {"row": _finance_pick(sal, "salary", False), "key": "salary"},
+        "최저 영입": {"row": _finance_pick(paid, "fee", True), "key": "fee"},
+        "최저 판매": {"row": _finance_pick(got, "fee", True), "key": "fee"},
+        "최저 연봉": {"row": _finance_pick(sal, "salary", True), "key": "salary"},
+        # [2026-09 신설 B안] 실제 거래(이적료)와 추정 시장가(몸값)를
+        # 구분하기 위한 별도 줄 — 위 영입/판매 집계에는 섞이지 않는다.
+        "최고 몸값": {"row": _finance_pick(mkt, "market_value", False),
+                      "key": "market_value"},
+        "최저 몸값": {"row": _finance_pick(mkt, "market_value", True),
+                      "key": "market_value"},
+        "임대 영입료": {"value": sum(r.get("fee") or 0 for r in loan_in), "n": len(loan_in)},
+        "임대 방출료": {"value": sum(r.get("fee") or 0 for r in loan_out), "n": len(loan_out)},
+    }
+
+
+FINANCE_ROW_ORDER = ("총 영입", "총 판매", "순이익",
+                     "최고 영입", "최고 판매", "최고 연봉", "최고 몸값",
+                     "최저 영입", "최저 판매", "최저 연봉", "최저 몸값",
+                     "임대 영입료", "임대 방출료")
