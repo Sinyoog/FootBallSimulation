@@ -2,6 +2,8 @@
 database.py - 전체 SQLite 기반. JSON 없음.
 """
 import sqlite3, os, sys, random, time, threading, math
+import contextlib as _contextlib
+import gc as _gc
 from data.countries import COUNTRY_DATA
 from data.leagues import LEAGUE_DATA
 from data.names import NAME_DATA
@@ -192,7 +194,67 @@ def invalidate_intl_apps_cache():
     _INTL_APPS_TOTAL_CACHE = None
 
 
+# [2026-09 성능, 신민용 리포트: "28·43·52주차 딜레이가 심하다"]
+# ── 대량 생성 구간 동안 순환 GC 일시 정지 ────────────────────
+# 시즌 전환/스냅샷 구간은 전세계 선수 26만 명 × 여러 패스를 파이썬 객체로
+# 만들었다 지운다 — 한 번 호출에 수백만 개의 임시 튜플/딕셔너리가 생긴다.
+# 그런데 이 게임은 진행 중 상시로 붙들고 있는 객체(팀/선수 캐시, 대회 표,
+# 순위 캐시 등)가 이미 수백만 개라, CPython의 세대별 GC가 "새 객체가 일정
+# 개수 쌓일 때마다" 자동 수집을 돌 때마다 **그 거대한 상주 힙 전체**를
+# 훑는다. 즉 임시 객체를 많이 만들수록 GC가 자주 돌고, 한 번 돌 때마다
+# 게임 전체 힙 크기에 비례한 비용이 붙는 구조다(실측: _snapshot_season_
+# ratings 한 번에 9.25s → GC만 멈춰도 7.01s).
+#
+# 이 임시 객체들은 거의 전부 참조 카운트만으로 즉시 회수되는 것들(리스트·
+# 튜플·딕셔너리, 순환 참조 없음)이라, 이 구간에서 순환 GC를 멈춰도 메모리가
+# 새지 않는다 — 구간이 끝나면 원래 상태로 되돌리고, 그 뒤 첫 자동 수집이
+# 남은 순환 쓰레기를 평소대로 정리한다. 예외가 나도 finally로 반드시 복구한다.
+#
+# [주의] 결과에는 아무 영향이 없다(GC는 계산에 관여하지 않음) — 순수하게
+# "언제 메모리를 훑느냐"만 바뀐다.
+@_contextlib.contextmanager
+def bulk_phase():
+    """대량 객체 생성 구간을 감싼다 — 그 동안 순환 GC를 멈춘다."""
+    _was = _gc.isenabled()
+    if _was:
+        _gc.disable()
+    try:
+        yield
+    finally:
+        if _was:
+            _gc.enable()
+
+
+# [2026-09 성능, 신민용 리포트: "32~40주차(국내컵)·28주차에 딜레이가 심하다"]
+# competition_common.league_day_map이 "이 주차에 이 팀들이 리그 경기를 언제
+# 갖고 있나"를 match_results에서 읽는데, 3·4부컵은 나라마다(193개) 라운드마다
+# 이 함수를 따로 불러서 같은 주차 같은 조회가 한 주에 수백 번 반복됐다
+# (실측 프로파일링: 한 시즌 league_day_map 1,223회 · 누적 27.5초 — 32~40주차
+# 국내컵 버킷과 28주차 3·4부컵 생성 시간의 거의 전부). 그 결과는 "그 주
+# 리그 일정"이라 한 주 안에서는 어느 나라가 물어도 같은 값이므로,
+# competition_common이 (연도, 주차) 단위로 한 번만 읽어 캐시한다.
+# 그 캐시는 match_results에 쓰기가 들어오면 즉시 버려야 하므로(일정 생성/
+# 재편성 등) 여기서 훅으로 알려준다 — 훅은 캐시가 실제로 차 있는 동안에만
+# 등록돼 있어(competition_common이 직접 등록/해제) 평소 핫패스 비용은 0이다.
+_MR_WRITE_HOOK = None
+
+
+def set_match_results_write_hook(fn):
+    """match_results에 쓰기가 감지되면 호출할 콜백 등록(None이면 해제)."""
+    global _MR_WRITE_HOOK
+    _MR_WRITE_HOOK = fn
+
+
 def _maybe_invalidate_sql_caches(sql):
+    if _MR_WRITE_HOOK is not None and isinstance(sql, str):
+        _h = sql[:1]
+        if _h in (" ", "\n", "\t", "\r"):
+            _h = sql.lstrip()[:1]
+        if _h in _SQL_WRITE_HEADS and "match_results" in sql:
+            try:
+                _MR_WRITE_HOOK()
+            except Exception:
+                pass
     if _INTL_APPS_TOTAL_CACHE is None or _INTL_APPS_SUPPRESS:
         return                      # 이미 무효(또는 호출부가 직접 갱신) — 핫패스는 여기서 끝
     if not isinstance(sql, str):
@@ -262,6 +324,13 @@ class _PooledCursor:
         return self
     def executescript(self, *a, **kw):
         invalidate_intl_apps_cache()
+        # [2026-09] 스크립트는 통째로 실행돼 내용을 개별 판정할 수 없으니
+        # match_results 쪽 캐시(league_day_map)도 무조건 버린다.
+        if _MR_WRITE_HOOK is not None:
+            try:
+                _MR_WRITE_HOOK()
+            except Exception:
+                pass
         _retry_sqlite_op(object.__getattribute__(self, "_real").executescript, *a, **kw)
         return self
     # [2026-07 4차 수정] execute()는 락을 걸어도, 그 뒤에 이어지는
@@ -7329,6 +7398,44 @@ def get_country_nationals_for_positions(country, positions):
         (country,)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def get_country_nationals_by_position(country):
+    """[2026-09 성능, 신민용 리포트: "25·26주차(국제대회) 딜레이가 심하다"]
+    위 get_country_nationals_for_positions를 "포지션별로 미리 나눠놓은" 형태로
+    한 번에 돌려준다 — {position: [선수dict, ...]}.
+
+    [왜] intl_engine._build_intl_squad_by_group은 한 나라 대표팀을 짤 때
+    포지션 그룹(GK/CB/FB/DM/CM/WG/ST…)마다 위 함수를 따로 부른다. 그룹마다
+    "핵심 포지션 + 적합도>0인 인접 포지션"을 후보로 넣기 때문에 같은 포지션이
+    여러 그룹에 중복으로 들어가고, 그래서 한 나라 국적자 전체가 2~3번씩 거듭
+    조회된다(4중 조인 + 30여 컬럼 dict화). 대표팀이 처음 꾸려지는 주차에
+    211개국을 한꺼번에 도는데, 실측 프로파일링에서 이 조회만 한 시즌에
+    1,316회 5.2초였다(25주차 첫 호출 5.9초의 대부분).
+
+    [결과 불변] 쿼리는 position IN (...) 조건만 빠진 완전히 같은 문장이고,
+    실행계획도 같은 인덱스(idx_aiplayers_truenat_pos_ovr)의 한 단계 짧은
+    프리픽스를 탄다 — 즉 행 순서가 (position, ovr DESC, rowid)로 동일하다.
+    호출부가 포지션별로 꺼내 쓰기만 하면 예전에 받던 목록과 순서까지
+    완전히 같다(게임 내 직접 비교로 확인).
+    """
+    conn = get_conn()
+    _stat_cols = ",".join(f"ap.{s}" for s in ALL_STATS)
+    rows = conn.execute(
+        f"""SELECT ap.id, ap.name, ap.position, ap.ovr, ap.age, ap.peak_ovr, ap.sub_role,
+               ap.foot,
+                   {_stat_cols},
+                   t.name AS club, t.current_tier AS club_tier, cn.name AS club_country
+            FROM ai_players ap JOIN teams t ON ap.team_id=t.id
+            JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
+            WHERE ap.true_nationality=?""",
+        (country,)).fetchall()
+    conn.close()
+    out: dict = {}
+    for r in rows:
+        d = dict(r)
+        out.setdefault(d["position"], []).append(d)
+    return out
 
 
 def get_player_total_intl_appearances(player_ids):

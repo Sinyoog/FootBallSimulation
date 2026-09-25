@@ -463,6 +463,25 @@ def _absolute_star_mult(ovr, league_relative_p: float) -> float:
     return 1.0
 
 
+# [2026-09 성능, 신민용 리포트: "52주차 연도전환"] 아래 함수 전용 메모.
+# _retire_and_replace의 은퇴 판정 루프가 전세계 선수 전원(실측 264,974명)
+# 에게 이 함수를 한 번씩 부르는데, 이 함수는 인자 5개만의 순수 함수다
+# (안에서 부르는 get_ovr_range/_percentile_curve_mult/_absolute_star_mult도
+# 전부 순수, 참조하는 OVR_RANGES/COUNTRY_LEAGUE_OVR_OVERRIDE는 런타임에
+# 안 바뀌는 상수표). 실제로 들어오는 조합은 "리그 710개 × 그 리그에 실제로
+# 존재하는 OVR 값"뿐이라 한 시즌에 18,926개(실측)로 수렴한다 — 즉 호출의
+# 93%가 이미 계산해 둔 값을 다시 계산하고 있었다.
+#
+# 실측(같은 세이브의 실제 호출 인자 264,974건 재생):
+#   0.614s → 0.119s (-0.495s, -81%)
+#   서로 다른 조합 18,926개를 전수 대조해 반환값 불일치 0건
+# 키 개수 상한도 유한하다(리그 조합 710개 × OVR 0~99 = 7만 남짓).
+#
+# 이 파일의 다른 메모(_MISMATCH_PENALTY_CACHE 등)와 같은 성격이라 무효화
+# 시점이 없다 — 같은 인자면 게임 내내 항상 같은 값이다.
+_REL_RETIRE_MULT_CACHE: dict = {}
+
+
 def _relative_ovr_retire_mult(ovr, grade, tier, country, max_tier=None) -> float:
     """[2026-09 1차, 신민용 리포트: "K리그 에이스가 벤치멤버랑 똑같은
     확률로 은퇴하는 게 이상하다"] → [2026-09 2차 재설계, 신민용 피드백
@@ -497,11 +516,19 @@ def _relative_ovr_retire_mult(ovr, grade, tier, country, max_tier=None) -> float
          하위권 쪽(mult>1.0)은 max_tier 미만(아직 내려갈 하위 리그가
          있음)이면 25%만 반영하고, 이미 최심부(더 내려갈 데 없음, "일찌
          감치 포기하는 게 맞다"는 요청 그대로)면 전량 반영한다. 상위권
-         쪽(에이스, mult<1.0)은 부수 무관하게 그대로."""
+         쪽(에이스, mult<1.0)은 부수 무관하게 그대로.
+
+    [2026-09 성능] 결과는 인자 5개로 완전히 결정되므로 메모이즈한다 —
+    위 _REL_RETIRE_MULT_CACHE 주석에 근거와 실측을 적어뒀다."""
+    _ck = (ovr, grade, tier, country, max_tier)
+    _cv = _REL_RETIRE_MULT_CACHE.get(_ck)
+    if _cv is not None:
+        return _cv
     from constants import get_ovr_range
     ref_tier = max(1, (max_tier + 1) // 2) if max_tier and max_tier >= 1 else tier
     ovr_rng = get_ovr_range(grade, ref_tier, country)
     if not ovr_rng or not ovr:
+        _REL_RETIRE_MULT_CACHE[_ck] = 1.0
         return 1.0
     lo, hi = ovr_rng
     span = max(1.0, hi - lo)
@@ -522,7 +549,9 @@ def _relative_ovr_retire_mult(ovr, grade, tier, country, max_tier=None) -> float
     # "리그도 초월 + 세계급 절대 OVR"이 동시에 확인된 극소수에게만 그
     # 아래(최저 0.55, 약 45% 감소)까지 열어준다. 그 외 대다수는 여전히
     # 기존 0.75~1.25 범위 그대로.
-    return max(0.55, min(1.25, mult))
+    _out = max(0.55, min(1.25, mult))
+    _REL_RETIRE_MULT_CACHE[_ck] = _out
+    return _out
 
 
 # [2026-09 신설, 신민용 요청: "토니 크로스처럼 아직 충분히 뛸 수 있어도
@@ -5835,12 +5864,15 @@ def _snapshot_season_positions(c, year, only_missing=False, rows=None):
                JOIN teams t ON ap.team_id = t.id""").fetchall()
         c.execute("DROP TABLE IF EXISTS temp._snap_target_teams")
     elif rows is None:
+        # [2026-09 성능, 신민용 리포트: "28·43·52주차 딜레이"] NOT INDEXED에
+        # 대한 설명은 _snapshot_season_ratings의 같은 쿼리 주석 참고
+        # (전세계 로스터 26만 행을 통째로 읽는 쿼리 3개가 전부 동일한 문제).
         rows = c.execute(
             """SELECT ap.id AS id, ap.team_id AS team_id, ap.position AS position,
                       ap.ovr AS ovr, ap.age AS age, ap.salary AS salary,
                       ap.foot AS foot, ap.sub_role AS sub_role,
                       t.formation AS formation
-               FROM ai_players ap JOIN teams t ON ap.team_id = t.id
+               FROM ai_players ap NOT INDEXED JOIN teams t ON ap.team_id = t.id
                WHERE ap.team_id IS NOT NULL""").fetchall()
     if not rows:
         return
@@ -6089,7 +6121,7 @@ def _snapshot_team_lineup_half(c, year):
                        ap.position AS position, ap.ovr AS ovr, ap.age AS age,
                        ap.salary AS salary,
                        t.formation AS formation
-                   FROM ai_players ap JOIN teams t ON ap.team_id = t.id
+                   FROM ai_players ap NOT INDEXED JOIN teams t ON ap.team_id = t.id
                    WHERE ap.team_id IS NOT NULL""").fetchall()
             _cnt_lineup = c.execute(
                 "SELECT COUNT(*) FROM hist.team_season_lineup_half").fetchone()[0]
@@ -6102,12 +6134,15 @@ def _snapshot_team_lineup_half(c, year):
         except Exception as _e:
             _perf_log(f"[PERF-SNAPSHOT-EQP] {year}년 실행계획 조회 실패: {_e}")
 
+    # [2026-09 성능] NOT INDEXED 설명은 _snapshot_season_ratings의 같은 쿼리
+    # 주석 참고(위 [PERF-SNAPSHOT-EQP] 로그가 해마다 실행계획이 뒤집히는 걸
+    # 이미 관찰하고 있던 바로 그 쿼리다 — 이제 항상 테이블 스캔으로 고정된다).
     rows = c.execute(
         """SELECT ap.id AS id, ap.team_id AS team_id, ap.position AS position,
                   ap.ovr AS ovr, ap.age AS age, ap.salary AS salary,
                   ap.foot AS foot, ap.sub_role AS sub_role,
                   t.formation AS formation
-           FROM ai_players ap JOIN teams t ON ap.team_id = t.id
+           FROM ai_players ap NOT INDEXED JOIN teams t ON ap.team_id = t.id
            WHERE ap.team_id IS NOT NULL""").fetchall()
     _sn1 = _t_snap.perf_counter()   # [진단용] ai_players SELECT 끝
     if not rows:
@@ -6289,10 +6324,24 @@ def _snapshot_season_ratings(c, year, team_goals_for=None, include_league=True, 
     if competitions is None:
         competitions = ("cup", "cl", "sc", "cwc", "lower_cup", "dsc")
 
+    # [2026-09 성능, 신민용 리포트: "43주차(승강제)·52주차 딜레이가 심하다"]
+    # NOT INDEXED가 붙은 이유 — 이 쿼리는 "팀이 있는 전세계 선수 전부"(26만
+    # 행)를 읽는다. 즉 걸러내는 게 아무것도 없어서 ai_players를 그냥 순서대로
+    # 훑는 게 최선인데, SQLite는 WHERE ap.team_id IS NOT NULL을 보고
+    # idx_aiplayers_team을 범위 스캔(team_id>?)으로 타버린다 — 인덱스를 훑으며
+    # 26만 번 rowid로 본문 페이지를 랜덤 액세스하는 꼴이라, 그냥 테이블 스캔
+    # 보다 5배 이상 느리다(게임 내 43주차 실측: 2.15s → 0.40s). NOT INDEXED는
+    # "이 쿼리에서 ap의 인덱스는 쓰지 말라"는 뜻이고, t는 여전히 INTEGER
+    # PRIMARY KEY로 조회되므로 조인 자체는 그대로다.
+    #
+    # [결과 불변 확인] 이 rows의 '순서'는 아래 estimate_ai_season_batch의
+    # 난수 소비 순서라 절대 바뀌면 안 된다 — 게임 안에서 두 쿼리 결과의
+    # id 목록이 완전히 일치하는지 직접 비교해 확인했고(순서동일=1),
+    # 370일 헤드리스 재현성 검사(91개 테이블 전체 해시)도 통과했다.
     _raw_rows = c.execute(
         """SELECT ap.id AS id, ap.position AS position, ap.ovr AS ovr,
                   ap.sub_role AS sub_role, ap.team_id AS team_id, t.league_id AS league_id
-           FROM ai_players ap JOIN teams t ON ap.team_id = t.id
+           FROM ai_players ap NOT INDEXED JOIN teams t ON ap.team_id = t.id
            WHERE ap.team_id IS NOT NULL""").fetchall()
     if not _raw_rows:
         return

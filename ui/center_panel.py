@@ -2766,8 +2766,25 @@ class CenterPanel(QWidget):
                     st = get_state()
                 cur_season = st["current_season"] if st else 1
                 _played_clause = "" if include_played else "AND home_score=-1 "
+                # [2026-09 성능, 신민용 리포트: "플레이어가 직접 하면 딜레이가
+                # 더 생긴다"] INDEXED BY가 붙은 이유 — 이 조회는 화면의 하루
+                # 셀마다(한 주 7칸 + 각 칸의 "어제 경기" 확인까지 최대 14회)
+                # 불린다. 그런데 통계(sqlite_stat1)가 아직 없는 세이브에서는
+                # SQLite가 idx_mr_season_score(season, home_score)를 골라버린다
+                # — home_score=-1은 "그 시즌 아직 안 치른 경기 전부"(시즌 초에는
+                # 10만 행 규모)라 선택도가 사실상 없어서, 한 칸 조회에 24ms가
+                # 걸렸다(실측). 주 단위로 보면 버튼 한 번에 0.2~0.3초가 순전히
+                # 이 조회로만 나간다.
+                #
+                # league_id로 좁히면 그 리그 경기(수백 행)만 보므로 24ms →
+                # 0.04ms(600배)가 된다. 통계가 생긴 뒤(첫 연도전환의 PRAGMA
+                # optimize)에는 SQLite도 알아서 좋은 계획을 고르지만, 그때까지
+                # (=새 게임 첫 해 내내) 이 비용을 그대로 물었다. INDEXED BY는
+                # 이 쿼리 하나에만 적용되므로 다른 조회의 실행계획은 안 바뀐다.
+                # 한 팀은 하루에 한 경기뿐이라 결과 행도 항상 같다.
                 row = conn.execute(
-                    "SELECT * FROM match_results WHERE league_id=? AND week=? AND day=? "
+                    "SELECT * FROM match_results INDEXED BY idx_mr_league_season "
+                    "WHERE league_id=? AND week=? AND day=? "
                     f"AND (home_team_id=? OR away_team_id=?) {_played_clause}AND season=?",
                     (lid, week, day, tid, tid, cur_season)).fetchone()
                 conn.close()

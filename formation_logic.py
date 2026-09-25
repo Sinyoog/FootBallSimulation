@@ -502,16 +502,33 @@ def compute_squad_roles(pool, started_ids=None):
 # 쓴다 — Qt 의존성 없는 이 파일에 두는 이유는 파일 맨 위 docstring과
 # 동일(헤드리스 환경에서도 import 가능해야 함).
 # ─────────────────────────────────────────────
+_MISMATCH_RANK_CACHE: dict = {}
+
+
 def _mismatch_rank(player_pos, slot_pos):
     """_best_slot_for_player와 동일한 우선순위 규칙으로 (선수 주포지션,
     배정된 슬롯) 한 쌍의 미스매치 등급을 구한다. 0=완벽 매치, 값이
-    클수록 어색한 배치 — POSITION_MISMATCH_PENALTY 인덱스로 그대로 쓴다."""
-    compat = POSITION_COMPAT.get(player_pos, [player_pos])
-    if slot_pos in compat:
-        return compat.index(slot_pos)
-    if _pos_category(player_pos) == _pos_category(slot_pos):
-        return 4   # 카테고리만 일치 — _best_slot_for_player의 카테고리 폴백과 동일 등급
-    return 4        # 완전 폴백도 동일 등급(POSITION_MISMATCH_PENALTY 마지막 값 재사용)
+    클수록 어색한 배치 — POSITION_MISMATCH_PENALTY 인덱스로 그대로 쓴다.
+
+    [2026-09 성능, 신민용 리포트: "28주차/43주차 스냅샷이 오래 걸린다"]
+    포지션 문자열 두 개만의 순수 함수인데(조합 수는 20×20 남짓으로 유한),
+    팀 스쿼드 역할 계산(_greedy_fill_slots/_foot_swap_pass)이 전세계 1만
+    1천 팀을 돌 때마다 호출된다 — 한 번의 스냅샷에서만 254만 회 호출됐다
+    (실측 프로파일링). 아래 _mismatch_penalty/foot_fit_mult와 완전히 같은
+    방식으로 메모이즈한다(POSITION_COMPAT는 상수라 값이 변할 일이 없어
+    결과는 항상 동일)."""
+    key = (player_pos, slot_pos)
+    v = _MISMATCH_RANK_CACHE.get(key)
+    if v is None:
+        compat = POSITION_COMPAT.get(player_pos, [player_pos])
+        if slot_pos in compat:
+            v = compat.index(slot_pos)
+        elif _pos_category(player_pos) == _pos_category(slot_pos):
+            v = 4   # 카테고리만 일치 — _best_slot_for_player의 카테고리 폴백과 동일 등급
+        else:
+            v = 4   # 완전 폴백도 동일 등급(POSITION_MISMATCH_PENALTY 마지막 값 재사용)
+        _MISMATCH_RANK_CACHE[key] = v
+    return v
 
 
 def _mismatch_penalty(player_pos, slot_pos):

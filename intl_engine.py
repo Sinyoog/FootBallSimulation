@@ -2196,9 +2196,16 @@ def _build_intl_squad_by_group(country, quota_by_group=None):
     반대 — 핵심 포지션이 이긴다)."""
     from constants import (INTL_POSITION_GROUPS, INTL_GROUP_FIT, INTL_SQUAD_GROUP_QUOTA,
                            INTL_POSITION_TO_GROUP, INTL_GROUP_SIDES)
-    from database import get_country_nationals_for_positions, get_player_total_intl_appearances
+    from database import get_country_nationals_by_position, get_player_total_intl_appearances
 
     quota_by_group = quota_by_group or INTL_SQUAD_GROUP_QUOTA
+
+    # [2026-09 성능] 그룹마다 get_country_nationals_for_positions를 따로 부르면
+    # 같은 나라 국적자를 (그룹별 후보 포지션이 겹치므로) 2~3번씩 다시 조회하게
+    # 된다 — 이 나라 국적자를 딱 한 번만 읽어 포지션별로 나눠두고 그룹별로
+    # 꺼내 쓴다. 목록도 순서도 예전과 완전히 같다(database.
+    # get_country_nationals_by_position 주석의 "결과 불변" 항목 참고).
+    _nat_by_pos = get_country_nationals_by_position(country)
 
     picked = []
     used_ids: set = set()
@@ -2210,8 +2217,13 @@ def _build_intl_squad_by_group(country, quota_by_group=None):
             continue
         # 핵심 포지션 + 적합도>0인 인접 포지션까지 후보 풀을 넓힌다.
         candidate_positions = list(core_positions) + list(INTL_GROUP_FIT.get(grp, {}).keys())
-        all_candidates = [c for c in get_country_nationals_for_positions(country, candidate_positions)
-                           if c["id"] not in used_ids]
+        # 예전 SQL은 "WHERE position IN (...)"을 인덱스(true_nationality,
+        # position, ovr DESC)로 풀었으므로 결과가 (포지션 오름차순, OVR
+        # 내림차순) 순서로 나왔다 — sorted(set(...))로 같은 순서를 재현한다
+        # (IN 목록의 중복도 SQL과 동일하게 한 번씩만 반영).
+        all_candidates = [c for _pos in sorted(set(candidate_positions))
+                          for c in _nat_by_pos.get(_pos, ())
+                          if c["id"] not in used_ids]
         if not all_candidates:
             continue
         # [2026-09 버그수정 2차, 신민용 리포트: "프랑스 국대에 98~96 다
@@ -2295,7 +2307,9 @@ def _build_intl_squad_by_group(country, quota_by_group=None):
     shortfall = target_total - len(picked)
     if shortfall > 0:
         all_positions = list(INTL_POSITION_TO_GROUP.keys())
-        backfill_pool = [c for c in get_country_nationals_for_positions(country, all_positions)
+        # 위 그룹 루프와 같은 이유·같은 순서 재현(이미 읽어둔 _nat_by_pos 재사용).
+        backfill_pool = [c for _pos in sorted(set(all_positions))
+                         for c in _nat_by_pos.get(_pos, ())
                          if c["id"] not in used_ids]
         if backfill_pool:
             apps_by_id = get_player_total_intl_appearances([c["id"] for c in backfill_pool])

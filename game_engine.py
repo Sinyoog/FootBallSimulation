@@ -2170,7 +2170,11 @@ def _advance_days_impl(schedule: list, progress_cb=None):
             # 전혀 없었다 — 원인 확정 전이므로 로직은 그대로 두고 타이머만 추가.
             import time as _time_43
             _t43_0 = _time_43.perf_counter()
-            _finalize_club_season(p, st["current_year"])
+            # [2026-09 성능] 52주 연도전환과 같은 이유의 bulk_phase — 여기도
+            # 하반기 포메이션/평점 스냅샷이 26만 행을 통째로 객체화한다.
+            from database import bulk_phase as _bulk_phase43
+            with _bulk_phase43():
+                _finalize_club_season(p, st["current_year"])
             _t43_1 = _time_43.perf_counter()
             promotion_playoff_engine.start_promotion_playoffs(st["current_year"])
             _t43_2 = _time_43.perf_counter()
@@ -8263,7 +8267,12 @@ def _advance_week(p, base_week, n_weeks=4, progress_cb=None):
         _t1 = _time_perf.perf_counter()
         # [귀화] 거주 연수 갱신 + 자격 체크는 _end_of_season 안에서 처리
         #   (그 시점에 current_team_id가 아직 살아있어 소속국가를 읽을 수 있음)
-        _end_of_season(p, new_year-1, progress_cb=progress_cb)
+        # [2026-09 성능] bulk_phase — 이 구간이 전세계 26만 선수를 여러 패스로
+        # 파이썬 객체화하는 최대 구간이라, 그동안만 순환 GC를 멈춘다
+        # (database.bulk_phase 정의부 주석에 이유와 안전성 근거를 적어뒀다).
+        from database import bulk_phase as _bulk_phase
+        with _bulk_phase():
+            _end_of_season(p, new_year-1, progress_cb=progress_cb)
         _t2 = _time_perf.perf_counter()
         # [실시간 전환] 승강제 결과가 반영된 뒤(= teams.league_id 확정 후) 전 세계
         # 모든 리그의 새 시즌 일정을 미리 깔아 둔다. 이후 매주 _sim_all_ai_matches가
@@ -8439,7 +8448,11 @@ def _advance_week(p, base_week, n_weeks=4, progress_cb=None):
             # 계측 코드만 삭제.
             try:
                 from ai_lifecycle import _snapshot_team_lineup_half
-                _snapshot_team_lineup_half(_conn_half, new_year)
+                # [2026-09 성능] 43·52주차와 같은 이유의 bulk_phase
+                # (database.bulk_phase 주석 참고) — 이 스냅샷도 26만 행이다.
+                from database import bulk_phase as _bulk_phase28
+                with _bulk_phase28():
+                    _snapshot_team_lineup_half(_conn_half, new_year)
             except Exception as _e:
                 add_log(f"⚠ 상반기 포메이션 스냅샷 오류: {_e}", "event", new_year, new_week)
             _hfx2 = _time_half.perf_counter()   # snapshot 함수 자체 끝
@@ -8459,7 +8472,12 @@ def _advance_week(p, base_week, n_weeks=4, progress_cb=None):
         _hf2 = _time_half.perf_counter()
         try:
             from ai_lifecycle import run_ai_mid_season_transfer
-            run_ai_mid_season_transfer(new_year, verbose_log=add_log, my_team_id=p.get("current_team_id"))
+            # [2026-09 성능] 위 스냅샷과 같은 이유의 bulk_phase — 겨울
+            # 이적시장도 전세계 로스터를 통째로 파이썬 객체로 들고 돈다.
+            from database import bulk_phase as _bulk_phase28b
+            with _bulk_phase28b():
+                run_ai_mid_season_transfer(new_year, verbose_log=add_log,
+                                            my_team_id=p.get("current_team_id"))
         except Exception as _e:
             add_log(f"⚠ 겨울 이적시장 처리 중 오류: {_e}", "event", new_year, new_week)
         _hf3 = _time_half.perf_counter()

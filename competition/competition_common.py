@@ -128,34 +128,114 @@ _TOURNAMENT_OVR_CURVE_PTS = [(70, 70), (80, 80), (85, 85), (90, 93), (95, 100), 
 DEFAULT_MATCH_DAY_GAP = 2
 
 
+# ── league_day_map (연도, 주차) 캐시 ───────────────────────────
+# [2026-09 성능, 신민용 리포트: "32~40주차·28주차 딜레이가 심하다"]
+# 이 함수가 읽어오는 건 "그 주차 전세계 리그 일정"이고, 그건 누가 물어도
+# 같은 값이다. 그런데 호출부(3·4부컵)는 나라마다(193개 대회) 라운드를
+# 만들 때마다 따로 불러서, 한 주 안에 같은 (연도, 주차) 조회가 수백 번
+# 반복됐다 — 그리고 그 쿼리 하나하나가 match_results를 idx_mr_year로
+# 훑는(그 해 20만 행 전부가 year=? 조건을 만족하므로 사실상 풀스캔)
+# 30ms짜리였다. 한 시즌 실측 프로파일링: league_day_map 1,223회 누적
+# 27.5초 = 32~40주차 국내컵 버킷(주당 4.5~6.8s)과 28주차 3·4부컵 생성
+# (4.7s)의 거의 전부.
+#
+# 고치는 방법은 두 가지를 같이 쓴다:
+#   (1) (연도, 주차범위) 단위로 "팀 필터 없이 그 주 전체"를 한 번만 읽어
+#       캐시한다 — 두 번째 호출부터는 DB 왕복이 아예 없다. 반환값은
+#       예전과 똑같이 "요청한 team_ids만 들어있는 dict"로 잘라서 준다
+#       (호출부가 dict 전체를 훑는 경우에도 동작이 100% 동일하게).
+#   (2) 그 한 번의 조회도 INDEXED BY로 idx_mr_week_season(week 선두)을
+#       쓰게 한다 — 기본 플래너는 선택도가 전혀 없는 idx_mr_year를 고른다
+#       (실측 32ms → 12ms). INDEXED BY는 이 쿼리 하나에만 영향을 주므로
+#       다른 쿼리의 실행계획·행 순서는 전혀 안 바뀐다(새 인덱스를 추가해
+#       플래너 전체를 흔드는 방식은 그래서 일부러 피했다). 연도전환의
+#       벌크 구간에는 이 인덱스가 잠깐 DROP되므로(database.
+#       MATCH_RESULTS_INDEXES) 그때는 조용히 평소 쿼리로 폴백한다.
+#
+# 캐시는 match_results에 쓰기가 한 번이라도 들어오면 통째로 버린다
+# (database.set_match_results_write_hook) — 일정 생성/재편성으로 day가
+# 바뀌면 바로 다시 읽으므로 값이 낡을 수 없다. 캐시가 비어 있는 동안은
+# 훅 자체를 해제해 두어 평소 SQL 핫패스에 비용이 붙지 않는다.
+_DAY_MAP_CACHE: dict = {}
+_DAY_MAP_HOOK_ON = False
+
+
+def invalidate_league_day_map_cache():
+    """match_results 쓰기 감지 시 호출 — 캐시를 비우고 훅도 해제한다."""
+    global _DAY_MAP_HOOK_ON
+    _DAY_MAP_CACHE.clear()
+    if _DAY_MAP_HOOK_ON:
+        _DAY_MAP_HOOK_ON = False
+        try:
+            from database import set_match_results_write_hook
+            set_match_results_write_hook(None)
+        except Exception:
+            pass
+
+
+def _load_week_day_map(conn, year, weeks):
+    """(year, weeks)에 걸린 리그 경기를 팀 필터 없이 통째로 읽어
+    {team_id: set(day)}로 만든다. 캐시 미스일 때만 불린다."""
+    wph = ",".join("?" * len(weeks))
+    tail = (f"""FROM match_results
+                WHERE year=? AND week IN ({wph}) AND day IS NOT NULL AND day>0""")
+    sql_fast = f"""SELECT home_team_id, away_team_id, day
+                   FROM match_results INDEXED BY idx_mr_week_season
+                   WHERE year=? AND week IN ({wph}) AND day IS NOT NULL AND day>0"""
+    try:
+        rows = conn.execute(sql_fast, (year, *weeks)).fetchall()
+    except Exception:
+        # 인덱스가 없는 구간(연도전환 벌크)/구형 세이브 — 평소 쿼리로 폴백.
+        rows = conn.execute(
+            f"SELECT home_team_id, away_team_id, day {tail}", (year, *weeks)).fetchall()
+    full: dict = {}
+    _get = full.get
+    for r in rows:
+        h, a, d = r[0], r[1], r[2]
+        s = _get(h)
+        if s is None:
+            s = full[h] = set()
+        s.add(d)
+        s = _get(a)
+        if s is None:
+            s = full[a] = set()
+        s.add(d)
+    return full
+
+
 def league_day_map(conn, year, week, team_ids, span=1):
     """team_ids가 week 주변(week-span ~ week+span)에 갖고 있는 리그 경기일을
     {team_id: set(day)}로 한 번에 읽어온다.
 
-    라운드 하나당 1회만 호출하면 되므로(경기마다 조회하는 게 아니라),
-    3·4부컵 193개 대회 규모에서도 비용이 라운드당 쿼리 1~n개로 끝난다.
-    SQLite IN(...)은 프로젝트 관례대로 500개씩 청크한다."""
+    같은 (year, week, span)에 대한 반복 호출은 캐시로 처리한다(위 주석 참고)
+    — 반환하는 dict의 내용은 예전 구현과 완전히 동일하다."""
+    global _DAY_MAP_HOOK_ON
     out: dict = {}
-    ids = sorted({t for t in team_ids if t})
+    ids = {t for t in team_ids if t}
     if not ids:
         return out
-    weeks = [week + d for d in range(-span, span + 1)]
-    wph = ",".join("?" * len(weeks))
-    for i in range(0, len(ids), 500):
-        part = ids[i:i + 500]
-        tph = ",".join("?" * len(part))
-        rows = conn.execute(
-            f"""SELECT home_team_id, away_team_id, day FROM match_results
-                 WHERE year=? AND week IN ({wph}) AND day IS NOT NULL AND day>0
-                   AND (home_team_id IN ({tph}) OR away_team_id IN ({tph}))""",
-            (year, *weeks, *part, *part)).fetchall()
-        want = set(part)
-        for r in rows:
-            h, a, d = r[0], r[1], r[2]
-            if h in want:
-                out.setdefault(h, set()).add(d)
-            if a in want:
-                out.setdefault(a, set()).add(d)
+    weeks = tuple(week + d for d in range(-span, span + 1))
+    key = (year, weeks)
+    full = _DAY_MAP_CACHE.get(key)
+    if full is None:
+        full = _load_week_day_map(conn, year, weeks)
+        # 캐시는 최근 몇 주치만 들고 있으면 충분하다(호출은 항상 "지금
+        # 처리 중인 주차"에 몰린다) — 무한히 쌓이지 않게 상한을 둔다.
+        if len(_DAY_MAP_CACHE) >= 4:
+            _DAY_MAP_CACHE.clear()
+        _DAY_MAP_CACHE[key] = full
+        if not _DAY_MAP_HOOK_ON:
+            try:
+                from database import set_match_results_write_hook
+                set_match_results_write_hook(invalidate_league_day_map_cache)
+                _DAY_MAP_HOOK_ON = True
+            except Exception:
+                pass
+    _fget = full.get
+    for tid in ids:
+        s = _fget(tid)
+        if s is not None:
+            out[tid] = s
     return out
 
 
