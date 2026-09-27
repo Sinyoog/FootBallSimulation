@@ -159,6 +159,33 @@ DEFAULT_MATCH_DAY_GAP = 2
 _DAY_MAP_CACHE: dict = {}
 _DAY_MAP_HOOK_ON = False
 
+# ── 대회 경기일 세대 카운터 (2026-09 신설) ──────────────────────
+# [신민용 리포트 20번] game_engine._week_intl_cl_day는 (주차, 내 팀, 시즌)
+# 으로 메모이즈되는데, 이제 리그 일정뿐 아니라 "그 팀의 다른 대회 경기일"
+# (3·4부컵/슈퍼컵/클럽월드컵/승강PO/국가대표)까지 피해서 날짜를 고른다 —
+# 그 경기일들은 시즌 중에 라운드가 생성될 때마다 새로 생기므로, 시즌 내내
+# 고정이던 예전 캐시 키로는 "그 대회 라운드가 아직 없던 시점에 계산된 날"이
+# 그대로 굳어버린다(일정창으로 몇 주 앞을 미리 보면 실제로 그렇게 된다).
+# 라운드를 만들 때마다 이 카운터를 올리고 캐시 키에 함께 넣어서, 새 경기일이
+# 생기면 자동으로 다시 계산되게 한다.
+_MATCH_DAY_GEN = [0]
+
+
+def match_day_generation() -> int:
+    """대회 경기일이 새로 쓰인 횟수 — _week_intl_cl_day 캐시 키용."""
+    return _MATCH_DAY_GEN[0]
+
+
+def bump_match_day_generation() -> None:
+    """대회 라운드를 생성해 day를 쓴 직후 호출. 세대가 올라가면 예전 키는
+    두 번 다시 안 쓰이므로 캐시도 같이 비운다(키가 무한히 쌓이는 것 방지)."""
+    _MATCH_DAY_GEN[0] += 1
+    try:
+        import game_engine
+        game_engine._week_intl_cl_day_cache.clear()
+    except Exception:
+        pass
+
 
 def invalidate_league_day_map_cache():
     """match_results 쓰기 감지 시 호출 — 캐시를 비우고 훅도 해제한다."""
@@ -246,7 +273,23 @@ def pick_free_day(week_start, day_map, team_ids, default_day,
     하나도 없으면 default_day(기존 동작과 동일한 기본 날짜)로 폴백한다.
 
     offsets 기본값은 3(기존 3·4부컵 요일)을 1순위로 두어, 겹치지 않는
-    경우에는 지금까지와 같은 날이 그대로 선택되게 한다."""
+    경우에는 지금까지와 같은 날이 그대로 선택되게 한다.
+
+    [2026-09 버그수정, 신민용 리포트 20번 실측] 폴백(default_day)이
+    실제로는 "가장 나쁜 선택"이었다. 시즌 중 실측(3·4부컵 5,332경기):
+        - gap을 만족하는 날이 아예 없는 경기 668건(12.5%) — 10~12팀
+          리그는 다전제(4전)라 한 주에 리그 경기가 2~3개씩 들어가서,
+          양 팀 리그 일정을 동시에 피할 수 있는 요일이 실제로 없다.
+        - 그 668건이 전부 default_day 하루로 몰렸고, 그 하루가 마침
+          어느 한 팀의 리그 경기일이면 **같은 날 2경기**가 됐다
+          (실측 346건이 Δ0 = 완전 동일 날짜).
+        - 반대로 "gap을 만족하는 날이 있는데도 못 고른" 경기는 0건이었다
+          — 즉 위 루프 자체는 이미 최적이고 문제는 폴백뿐이다.
+    이제 폴백에서도 남은 후보 중 **가장 멀리 떨어진 날**을 고른다. 같은
+    날 2경기(Δ0)는 구조적으로 사라지고(실측 후보 중 Δ>=1인 날이 없는
+    경기는 0건), 한 라운드가 특정 하루에 몰리는 현상도 함께 사라진다.
+    gap을 만족하는 날이 하나라도 있으면 기존과 100% 동일하게 동작한다
+    (offsets 순서대로 첫 번째 날을 그대로 반환)."""
     busy = set()
     for tid in team_ids:
         if tid:
@@ -257,11 +300,369 @@ def pick_free_day(week_start, day_map, team_ids, default_day,
             #  경로 둘 다 실제로 터짐) set.update()는 임의 iterable을 받으므로
             # 값이 set이든 튜플이든 동일하게 동작한다(결과 불변).
             busy.update(day_map.get(tid, ()))
+    best_dist, best_day = -1, None
     for off in offsets:
         cand = week_start + off
-        if all(abs(cand - d) >= gap for d in busy):
+        dist = min((abs(cand - d) for d in busy), default=99)
+        if dist >= gap:
             return cand
+        if dist > best_dist:
+            best_dist, best_day = dist, cand
+    # gap은 못 맞추지만 최소한 '같은 날'은 아닌 날이 있으면 그 날을 쓴다.
+    if best_day is not None and best_dist >= 1:
+        return best_day
     return default_day
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [2026-09 신설] "나" 슬롯 치환 + 골/어시 합계 정합성 복원
+#
+# 신민용 리포트: "지금 2대0인데 우측 보면 골이 3개 어시가 3개로 뜨는데?
+# 저거 플레이어랑 겹치면 저렇게 되는거 같아" — 정확한 진단이었다.
+#
+# [원인] tactical_engine은 AI 11명에게 팀 득점(hs)을 정확히 hs개로 쪼개
+# 배분한다(_finish_attack에서 골 1개마다 shooter 1명 +1). 그런데 그 22명
+# 평점표엔 "나"가 없으므로, 각 엔진은 내 포지션과 같은 슬롯 하나를 찾아
+# 내 실제 기록(_player_perf 결과)으로 통째로 덮어써 왔다. 이때 그 자리에
+# 있던 AI의 골(g0)은 사라지고 내 골(g1)이 들어오므로,
+#     화면 합계 = hs - g0 + g1
+# 이 되어 g0 != g1이면 항상 스코어와 안 맞는다. 양방향으로 틀린다 —
+#   · 내가 g0보다 많이 넣었으면 합계 > 스코어 (2-0인데 골 3개 ← 리포트 케이스)
+#   · 내가 g0보다 적게 넣었으면 합계 < 스코어 (실측: OVR92 ST는 49.5%가 이 쪽)
+#
+# [수정 방침] 내 기록(g1/a1)은 이미 my_player/시즌 통계에 그대로 들어간
+# "공식 기록"이라 여기서 절대 안 건드린다. 대신 나머지 AI 슬롯을 조정해서
+# 팀 합계를 실제 스코어에 맞춘다. 불변식 3개를 모두 지킨다:
+#   (1) sum(goals[side]) == 그 팀 득점
+#   (2) sum(assists[side]) <= 그 팀 득점      (골 1개에 어시 최대 1개)
+#   (3) 선수별 assists <= 득점 - 본인 goals   (자기 골에 자기 어시 금지)
+# 조정된 슬롯은 평점도 같이 보정한다(tactical_engine._build_player_ratings의
+# 실제 계수: 골 0.75 / 어시 0.4 — 골만 줄이고 평점을 그대로 두면 "골 0인데
+# 평점 8.5"가 남는다).
+#
+# [결정론] 이 함수들은 random을 전혀 안 쓴다 — 같은 시드 → 같은 결과가
+# 유지돼야 하므로(competition_common 모듈 상단 리팩터링 원칙) 조정 대상
+# 선택은 전부 결정적인 정렬로만 한다.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 공격 가담도 순위 — 골을 되돌려줄 때 "누가 넣었을 법한가" 순서.
+_ATTACK_RANK = {
+    "ST": 0, "CF": 0, "SS": 0, "LW": 1, "RW": 1, "CAM": 2,
+    "LM": 3, "RM": 3, "CM": 4, "CDM": 5,
+    "LWB": 6, "RWB": 6, "LB": 7, "RB": 7, "CB": 8, "SW": 8, "GK": 9,
+}
+
+_RATING_PER_GOAL = 0.75    # tactical_engine._build_player_ratings와 동일
+_RATING_PER_ASSIST = 0.4
+
+
+def _slot_rank(entry):
+    if not entry:
+        return 99
+    if entry.get("is_gk"):
+        return 9
+    return _ATTACK_RANK.get(entry.get("position") or "", 4)
+
+
+def _bump_rating(entry, d_goals=0, d_assists=0):
+    if not entry or (not d_goals and not d_assists):
+        return
+    try:
+        r = float(entry.get("rating") or 6.3)
+    except (TypeError, ValueError):
+        r = 6.3
+    r += d_goals * _RATING_PER_GOAL + d_assists * _RATING_PER_ASSIST
+    entry["rating"] = round(max(3.0, min(10.0, r)), 1)
+
+
+def reconcile_side_stats(lst, my_idx, team_score):
+    """한 팀 11명 평점 리스트의 골/어시 합계를 team_score에 맞춘다.
+
+    lst      : player_ratings["home"] 또는 ["away"] (빈 슬롯은 None)
+    my_idx   : "나"로 치환된 슬롯 인덱스(없으면 None) — 이 슬롯은 안 건드린다
+    team_score: 그 팀의 실제 득점
+
+    제자리(in-place) 수정이며 반환값은 없다.
+    """
+    if not lst:
+        return
+    try:
+        team_score = max(0, int(team_score or 0))
+    except (TypeError, ValueError):
+        return
+    idxs = [i for i, r in enumerate(lst) if r]
+    others = [i for i in idxs if i != my_idx]
+    if not others:
+        return
+
+    def _g(i):
+        try:
+            return max(0, int(lst[i].get("goals", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _a(i):
+        try:
+            return max(0, int(lst[i].get("assists", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    # ── (1) 골 합계를 스코어에 정확히 맞춘다
+    d = sum(_g(i) for i in idxs) - team_score
+    if d > 0:
+        # 내가 그 슬롯 AI보다 많이 넣었다 → 그만큼 나머지에서 회수.
+        # 많이 넣은 슬롯 → 공격 가담도 낮은 슬롯 순으로 1골씩 깎는다.
+        order = sorted(others, key=lambda i: (-_g(i), -_slot_rank(lst[i]), i))
+        while d > 0:
+            moved = False
+            for i in order:
+                if d <= 0:
+                    break
+                if _g(i) > 0:
+                    lst[i]["goals"] = _g(i) - 1
+                    _bump_rating(lst[i], d_goals=-1)
+                    d -= 1
+                    moved = True
+            if not moved:
+                break   # 더 깎을 골이 없다(내 골만으로 스코어 초과 — 이론상 불가)
+    elif d < 0:
+        # 내가 그 슬롯 AI보다 적게 넣었다 → 남은 골의 주인을 다시 찾아준다.
+        # 선발 → 이미 득점한 슬롯 → 공격 가담도 높은 슬롯 → 오래 뛴 선수
+        # → OVR 높은 순.
+        #
+        # [2026-09 수정, 신민용 리포트: "왜 오른쪽엔 AI00RL이 2골 넣었다고
+        # 표시돼?"] 예전엔 "이미 득점한 슬롯"이 1순위라, 68분에 교체 투입돼
+        # 72분에 한 골 넣은 선수가 17분 골까지 받아 2골이 되곤 했다 — 그
+        # 선수는 17분엔 그라운드에 있지도 않았다. 선발과 출전시간을 앞세워
+        # "그 시간에 뛰고 있었을 가능성이 높은 선수"에게 먼저 돌린다.
+        # (merge_my_slot이 1순위로 '골/어시가 나와 같은 슬롯'을 고르게 된
+        #  뒤로는 이 재분배 자체가 잘 일어나지 않는다 — 그래도 남는 경우의
+        #  결과를 덜 이상하게 만드는 안전망이다.)
+        order = sorted(
+            others,
+            key=lambda i: (0 if lst[i].get("started", True) else 1,
+                           0 if _g(i) > 0 else 1, _slot_rank(lst[i]),
+                           -float(lst[i].get("minutes", 90) or 0),
+                           -float(lst[i].get("ovr", 50) or 50), i))
+        k = 0
+        while d < 0:
+            i = order[k % len(order)]
+            lst[i]["goals"] = _g(i) + 1
+            # 골이 슈팅/유효슈팅보다 많아지면 안 되므로 같이 올린다.
+            _sh_on = max(int(lst[i].get("shots_on", 0) or 0), _g(i))
+            lst[i]["shots_on"] = _sh_on
+            lst[i]["shots"] = max(int(lst[i].get("shots", 0) or 0), _sh_on)
+            _bump_rating(lst[i], d_goals=1)
+            d += 1
+            k += 1
+
+    # ── (2)(3) 어시: 골 1개에 최대 1개, 득점자 자신은 그 골의 어시 불가
+    for i in others:
+        cap = max(0, team_score - _g(i))
+        if _a(i) > cap:
+            _old = _a(i)
+            lst[i]["assists"] = cap
+            _bump_rating(lst[i], d_assists=cap - _old)
+    d = sum(_a(i) for i in idxs) - team_score
+    if d > 0:
+        order = sorted(others, key=lambda i: (-_a(i), -_slot_rank(lst[i]), i))
+        while d > 0:
+            moved = False
+            for i in order:
+                if d <= 0:
+                    break
+                if _a(i) > 0:
+                    lst[i]["assists"] = _a(i) - 1
+                    _bump_rating(lst[i], d_assists=-1)
+                    d -= 1
+                    moved = True
+            if not moved:
+                break
+
+
+def find_my_slot(labels, my_position, starters=None, eligible=None):
+    """내 포지션과 같은 슬롯 인덱스(정확 일치 → POSITION_COMPAT 호환 →
+    GK 아닌 아무 자리 순). 예전에 각 엔진에 그대로 복붙돼 있던 로직을
+    한 곳으로 모은 것 — 동작은 완전히 동일하다.
+
+    [2026-09 교체 시스템 대응] 평점표에 교체 투입 선수까지 들어오면서
+    리스트에 같은 라벨이 둘 이상 있을 수 있다. starters(각 항목이 선발인지
+    여부)를 받으면 선발 슬롯만 후보로 본다 — "나"는 항상 선발로 뛰므로.
+
+    eligible: starters에 더해 걸 추가 조건(같은 길이의 bool 리스트).
+        merge_my_slot이 "교체로 빠지지 않은 선발"을 1순위로 찾을 때 쓴다 —
+        자세한 이유는 merge_my_slot 주석 참고.
+    """
+    def _ok(i):
+        if starters is not None and not starters[i]:
+            return False
+        if eligible is not None and not eligible[i]:
+            return False
+        return True
+
+    for i, lab in enumerate(labels):
+        if lab == my_position and _ok(i):
+            return i
+    from constants import POSITION_COMPAT
+    for want in POSITION_COMPAT.get(my_position, [my_position]):
+        for i, lab in enumerate(labels):
+            if lab == want and _ok(i):
+                return i
+    for i, lab in enumerate(labels):
+        if lab is not None and lab != "GK" and _ok(i):
+            return i
+    return None
+
+
+def augment_team_goal_events(p, is_home, hs, as_, goals, assists, played,
+                             events, engine_plog, player_ratings):
+    """[2026-09 신설, 신민용 리포트: "경기 상세에서 나만 뜨는 것 같은데
+    다른 선수들이 골 넣어도 다 뜨게 해줘"]
+
+    경기 상세의 타임라인에 "내가 골도 어시도 아닌 우리 팀 나머지 득점"을
+    실제 득점자 이름과 함께 채워 넣는다.
+
+    이 처리는 원래 game_engine._augment_events_with_names가 하는데, 그
+    함수는 _write_match_log(리그 경기 전용) 안에서만 불렸다 — 대회 엔진
+    (컵/챔스/유로파/컨퍼런스/클럽월드컵/국내컵/국내슈퍼컵/국제대회/승강
+    PO)은 _save_match_detail을 직접 호출하므로 이 단계를 통째로 건너뛰었고,
+    그래서 대회 경기 상세 타임라인에는 내 이벤트만 떴다. 여기서 같은
+    함수를 재사용해 대회 쪽도 리그와 동일하게 만든다.
+
+    [호출 위치 주의] 반드시 merge_my_slot **이전에** 부를 것.
+    득점자 이름은 possession_log의 scorer_id를 player_ratings로 뒤집어
+    찾는데, merge_my_slot이 내 슬롯을 덮어쓰고 나면 "내가 맡은 포지션의
+    AI"가 리스트에서 사라져 그 선수가 넣은 골의 이름을 못 찾게 된다
+    (game_engine이 scorer_ratings라는 치환 전 스냅샷을 따로 두는 것과
+    같은 이유 — 여기서는 호출 순서로 같은 효과를 낸다).
+
+    실패해도 경기 저장 자체는 절대 막으면 안 되므로 전부 삼키고 원래
+    events를 그대로 돌려준다(리그 쪽과 동일한 방어).
+    """
+    try:
+        if not played or not engine_plog or not player_ratings:
+            return events
+        from game_engine import _augment_events_with_names
+        # c/hid/aid/live_record는 그 함수가 실제로 안 쓰는 레거시 인자다.
+        return _augment_events_with_names(
+            None, p, is_home, 0, 0, hs, as_, goals, assists, played, events,
+            engine_plog=engine_plog, player_ratings=player_ratings)
+    except Exception:
+        return events
+
+
+def merge_my_slot(player_ratings, is_home, my_position, my_entry, hs, as_):
+    """player_ratings에서 내 슬롯을 my_entry로 치환하고 양 팀 합계를 복원한다.
+
+    my_entry의 "position"은 치환된 슬롯의 라벨로 덮어쓴다(호출부가 뭘 넣든).
+    반환: (side_key, idx) — 치환할 자리를 못 찾았으면 (None, None).
+
+    [주의] 치환이 일어나지 않은 팀(상대팀)도 reconcile을 한 번 통과시킨다 —
+    전술엔진 원본은 이미 정합하므로 아무것도 안 바뀌지만, 혹시 엔진 쪽에
+    회귀가 생기면 화면에 안 틀린 값이 나가도록 하는 안전망이다.
+
+    ── [2026-09 버그수정, 신민용 리포트: "왜 교체는 2번 되었는데 위에
+    교체되었다는건 1명만 표시되어 있어?"] ──────────────────────────
+    원인이 바로 이 치환이었다. 예전엔 포지션만 맞으면 아무 선발 슬롯이나
+    골랐는데, 하필 **경기 도중 교체로 빠진 선발**의 자리를 고르면 그
+    선수의 subbed_out/off_min 키가 my_entry로 통째로 덮어써져 사라졌다.
+    그러면 라인업 목록에서 그 선수의 "↓62'" 표시가 증발해, 🔁 교체 섹션엔
+    교체가 2건인데 라인업엔 ↓가 1개만 보이는 불일치가 생긴다. 게다가
+    교체 섹션은 여전히 그 선수 이름을 부르는데 라인업엔 그 이름이 아예
+    없어서 더 이상해 보인다.
+
+    수정: **풀타임을 뛴 선발**을 1순위로 고른다("나"는 교체로 안 빠지므로
+    의미상으로도 이쪽이 맞다). 같은 포지션 선발이 전부 교체로 빠진 드문
+    경우에만 예전처럼 그 자리를 쓰되, 그때는 그 슬롯의 교체 정보를
+    my_entry에 그대로 물려줘서 ↓ 개수만은 어긋나지 않게 한다.
+
+    [트레이드오프 — 실측] 이 우선순위(풀타임 + 득점 무관여) 때문에 "내
+    포지션과 정확히 같은 슬롯"을 못 고르는 경우가 생긴다. 우리 팀 득점이
+    있는 65건 표본 기준:
+        · 득점/어시한 선수를 덮어쓴 경우: 22건 → 0건  (타임라인 불일치 제거)
+        · 내 포지션과 정확히 일치한 슬롯: 36건 → 27건 (9건이 호환 포지션으로)
+    즉 "화면상 내가 서 있는 칸의 라벨"을 일부 포기하고 "득점 기록의
+    정합성"을 얻는 교환이다. 그럼에도 이쪽을 택한 이유:
+      · 반대로 하면(정확 포지션 우선) 그 슬롯의 교체 정보를 물려받게 돼
+        "나 ↓62'" — 즉 내가 62분에 교체된 것처럼 표시된다. 내 선수는
+        실제로 풀타임을 뛰었으므로(_player_perf는 교체를 모델링하지 않음)
+        이건 내 기록에 대한 명백한 거짓 표시다.
+      · 슬롯 라벨이 호환 포지션으로 바뀌는 건 "팀 라인업 화면에서 내가
+        어느 칸에 그려지는가"의 문제일 뿐, 내 개인 기록(my_position 등)은
+        _get_field_pos(p)로 따로 저장되므로 영향을 받지 않는다.
+      · 반대로 하면(정확 포지션 우선) 신민용이 실제로 본 그 화면이 그대로
+        재현된다 — 스트라이커인 내가 득점한 스트라이커 자리를 덮어써서,
+        그 골이 68분 교체 투입 선수에게 얹히는 형태.
+    정확 포지션 표시를 더 중시한다면 아래 1·2순위 호출의 eligible 인자를
+    빼면 예전 동작으로 돌아간다(대신 위 두 버그가 함께 돌아온다).
+    """
+    if player_ratings is None:
+        return None, None
+    side_key = "home" if is_home else "away"
+    my_list = player_ratings.get(side_key)
+    idx = None
+    if my_list:
+        labels = [r.get("position") if r else None for r in my_list]
+        starters = [bool(r.get("started", True)) if r else False for r in my_list]
+        # 교체로 빠지지 않은(=풀타임) 선발만 2순위 후보.
+        full_match = [(not bool(r.get("subbed_out"))) if r else False for r in my_list]
+
+        # ── 1순위: 풀타임 + 공격포인트가 내 기록과 정확히 같은 슬롯 ──
+        # [2026-09 버그수정, 신민용 리포트: "좌측엔 AI00QI랑 AI00RL가
+        # 넣었다고 뜨는데 왜 오른쪽엔 AI00RL이 2골 넣었다고 표시돼?"]
+        # 원인: 하필 **득점한 선수**의 자리를 내가 덮어쓰면(내 골은 0),
+        # 그 팀 표시 골 합계가 스코어보다 모자라진다. 그러면
+        # reconcile_side_stats가 "남은 골의 주인"을 다시 찾아주는데, 그
+        # 우선순위가 "이미 득점한 슬롯"이라 68분에 교체 투입된 AI00RL에게
+        # 2번째 골이 얹혔다 — 정작 타임라인은(전술엔진 원본 기준) 17분
+        # AI00QI, 72분 AI00RL이라 양쪽이 어긋난다. 게다가 17분 골을 68분에
+        # 들어온 선수가 넣었다는 말이 되어 시간상으로도 불가능해진다.
+        #
+        # 애초에 "골/어시가 내 기록과 같은 슬롯"을 고르면 재분배 자체가
+        # 일어나지 않는다(d == 0) — 그러면 타임라인과 라인업이 저절로
+        # 일치한다. 내가 0골 0어시인 보통의 경우엔 "득점에 관여 안 한
+        # 풀타임 선발"을 고르는 것과 같은 뜻이다.
+        try:
+            _my_g = max(0, int(my_entry.get("goals", 0) or 0))
+            _my_a = max(0, int(my_entry.get("assists", 0) or 0))
+        except (TypeError, ValueError):
+            _my_g = _my_a = 0
+
+        def _same_points(r):
+            if not r:
+                return False
+            try:
+                return (int(r.get("goals", 0) or 0) == _my_g
+                        and int(r.get("assists", 0) or 0) == _my_a)
+            except (TypeError, ValueError):
+                return False
+
+        clean = [full_match[i] and _same_points(r) for i, r in enumerate(my_list)]
+        idx = find_my_slot(labels, my_position, starters=starters, eligible=clean)
+        if idx is None:
+            # 2순위 — 같은 골/어시 슬롯이 없으면 풀타임만이라도 지킨다
+            # (교체 표시 보존. 이때는 reconcile이 차이를 메운다).
+            idx = find_my_slot(labels, my_position, starters=starters, eligible=full_match)
+        if idx is None:
+            # 3순위 폴백 — 같은 포지션 선발이 전부 교체로 빠진 경우.
+            idx = find_my_slot(labels, my_position, starters=starters)
+        if idx is not None:
+            _old = my_list[idx] or {}
+            my_entry = dict(my_entry)
+            my_entry["position"] = labels[idx]
+            # 폴백으로 "교체된 선발" 자리를 쓰게 됐다면 그 슬롯의 교체
+            # 표시(↓분)를 물려받는다 — 안 그러면 위에 적은 개수 불일치가
+            # 그대로 남는다. 1순위(풀타임)로 잡혔으면 이 키들은 애초에
+            # 없거나 False라 아무것도 안 붙는다.
+            for _k in ("started", "subbed_in", "subbed_out", "on_min", "off_min", "minutes"):
+                if _k in _old and _k not in my_entry:
+                    my_entry[_k] = _old[_k]
+            my_list[idx] = my_entry
+    reconcile_side_stats(player_ratings.get("home"),
+                         idx if is_home else None, hs)
+    reconcile_side_stats(player_ratings.get("away"),
+                         None if is_home else idx, as_)
+    return (side_key, idx) if idx is not None else (None, None)
 
 
 def _tournament_effective_ovr(ovr: float) -> float:
@@ -1211,6 +1612,12 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
     engine_stats = None
     engine_plog = None
     player_ratings = None
+    # [2026-09 신설] 정규시간 스코어(연장 결과로 덮어쓰지 않는다) / 연장 진입
+    # 여부 / 교체 기록. 전술엔진이 예외로 폴백하면 그대로 None/False로 남고
+    # 경기 상세는 예전과 똑같이 동작한다.
+    hs90 = as90 = None
+    went_et = False
+    _subs = {"home": [], "away": []}
     try:
         from match_sim.tactical_engine import simulate_my_match as _sim_tactical
         from game_engine import _team_formation
@@ -1225,8 +1632,12 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
             away_boost=(bonus if not is_home else 0.0),
             home_boost_position=(my_position if is_home else None),
             away_boost_position=(my_position if not is_home else None),
-            home_adv=(0.0 if _neutral_stage else _home_advantage()))
+            home_adv=(0.0 if _neutral_stage else _home_advantage()),
+            extra_time=(m["stage"] != "league"))
         hs, as_ = sim["home_score"], sim["away_score"]
+        hs90, as90 = sim.get("home_score_90", hs), sim.get("away_score_90", as_)
+        went_et = bool(sim.get("went_extra_time"))
+        _subs = {"home": sim.get("home_subs") or [], "away": sim.get("away_subs") or []}
         engine_stats = {"home": sim["home_stats"], "away": sim["away_stats"]}
         engine_plog = sim["possession_log"]
         player_ratings = {"home": sim.get("home_player_ratings") or [],
@@ -1270,37 +1681,26 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
     # [2026-08 신설, 신민용 요청] champions_engine과 동일한 "나" 슬롯
     # 바꿔치기 — 전술엔진 로스터엔 "나"가 없으므로 포지션이 같은 슬롯을
     # 찾아 방금 계산된 내 실제 기록으로 덮어쓴다.
-    if player_ratings is not None:
-        _side_key = "home" if is_home else "away"
-        _my_list = player_ratings.get(_side_key)
-        if _my_list:
-            _labels = [r.get("position") if r else None for r in _my_list]
-            _idx = None
-            for _i, _lab in enumerate(_labels):
-                if _lab == my_position:
-                    _idx = _i; break
-            if _idx is None:
-                from constants import POSITION_COMPAT
-                for _want in POSITION_COMPAT.get(my_position, [my_position]):
-                    for _i, _lab in enumerate(_labels):
-                        if _lab == _want:
-                            _idx = _i; break
-                    if _idx is not None:
-                        break
-            if _idx is None:
-                for _i, _lab in enumerate(_labels):
-                    if _lab is not None and _lab != "GK":
-                        _idx = _i; break
-            if _idx is not None:
-                _my_list[_idx] = {
-                    "id": None, "name": p.get("name") or "나",
-                    "position": _labels[_idx], "ovr": p.get("ovr", 40),
-                    "goals": goals, "assists": assists,
-                    "shots": detail.get("shots", 0),
-                    "shots_on": detail.get("shots_on", 0),
-                    "saves": saves, "is_gk": (my_position == "GK"),
-                    "rating": rating, "is_me": True,
-                }
+    # [2026-09 버그수정, 신민용 리포트: "2대0인데 골이 3개 어시가 3개"]
+    # 이제 슬롯 치환 직후 "팀 골 합계 == 실제 스코어"를 복원하는 공용
+    # 헬퍼(competition_common.merge_my_slot)로 전 대회를 통일했다 — 자세한
+    # 원인/불변식은 그 함수 주석 참고.
+    # [2026-09 신설, 신민용 리포트: "다른 선수들이 골 넣어도 다 뜨게 해줘"]
+    # 내가 관여 안 한 우리 팀 득점을 실제 득점자 이름과 함께 타임라인에
+    # 채운다. 반드시 merge_my_slot 이전 — augment_team_goal_events 주석 참고.
+    events = augment_team_goal_events(
+        p, is_home, hs, as_, goals, assists, not (_suspended or _benched),
+        events, engine_plog, player_ratings)
+    _side_key, _idx = merge_my_slot(
+        player_ratings, is_home, my_position,
+        {"id": None, "name": p.get("name") or "나",
+         "position": None, "ovr": p.get("ovr", 40),
+         "goals": goals, "assists": assists,
+         "shots": detail.get("shots", 0),
+         "shots_on": detail.get("shots_on", 0),
+         "saves": saves, "is_gk": (my_position == "GK"),
+         "rating": rating, "is_me": True},
+        hs, as_)
 
     my_result = _my_result(outcome, is_home)
     my_conceded = (as_ if is_home else hs)
@@ -1308,7 +1708,12 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
     day_val = _week_intl_cl_day(m["week"], p)
 
     conn = get_conn()
+    # [2026-09 신설] 기록실용 90분 스코어 — 이 함수는 유로파/컨퍼런스/슈퍼컵
+    # 3개 대회(el_matches/ecl_matches/sc_matches)가 공유하므로 여기 한 번
+    # 넣으면 셋 다 따라온다. 컬럼/값 정의는 database.py _ET_SCORE_COLS 참고.
+    from database import ET_SCORE_SET_SQL, et_score_values
     conn.execute(f"""UPDATE {cfg.match_table} SET home_score=?, away_score=?,
+                    {ET_SCORE_SET_SQL},
                     pso_winner=?, pso_score=?,
                     my_played=?, my_position=?,
                     my_saves=?, my_goals=?, my_assists=?, my_rating=?,
@@ -1316,7 +1721,8 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
                     my_dribbles=?, my_blocks=?, my_pass_acc=?, my_conceded=?,
                     day=?, my_absence_reason=?, my_yellow_cards=?
                     WHERE id=?""",
-                 (hs, as_, pso_winner, pso_score,
+                 (hs, as_, *et_score_values(hs90, as90, went_et),
+                  pso_winner, pso_score,
                   0 if (_suspended or _benched) else 1, _get_field_pos(p),
                   saves, goals, assists, rating,
                   detail["shots"], detail["shots_on"], detail["key_passes"],
@@ -1359,7 +1765,9 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
         p, week, comp_name, is_home, home_disp, away_disp,
         hs, as_, my_result, goals, assists, saves, rating,
         events, not (_suspended or _benched), _benched, detail, pso=pso,
-        engine_stats=engine_stats, engine_plog=engine_plog, player_ratings=player_ratings)
+        engine_stats=engine_stats, engine_plog=engine_plog, player_ratings=player_ratings,
+        match_extra={"score_90": ([hs90, as90] if hs90 is not None else [hs, as_]),
+                     "went_extra_time": went_et, "subs": _subs})
     # [2026-08 신설] 이 함수는 유로파/컨퍼런스/슈퍼컵 3개 대회가 공유하므로
     # (europa_engine.py/conference_engine.py/super_cup_engine.py) 헤더
     # 마커의 kind는 고정 리터럴이 아니라 cfg.award_prefix로 구분한다 —

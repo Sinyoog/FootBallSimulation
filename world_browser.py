@@ -531,9 +531,25 @@ def search_retired_ai_players(name_query=None, continent=None, nat_country_id=No
                     q += " AND cust.custom_name LIKE ?"
                     params += [like]
                 else:
-                    q += (" AND (r.name LIKE ? OR r.nationality LIKE ? OR r.last_team_name LIKE ? "
-                          "OR cust.custom_name LIKE ?)")
-                    params += [like, like, like, like]
+                    # [2026-09 성능수정, 위 search_ai_players의 같은 자리
+                    # 주석 참고 — 신민용 리포트 "은퇴 검색도 마찬가지"]
+                    # cust.custom_name만 조인된 표의 컬럼이라, 이것 때문에
+                    # 은퇴 아카이브 전수를 ai_player_custom_names와 조인한
+                    # 뒤에야 LIKE를 평가할 수 있었다. 커스텀 이름은 내가
+                    # 직접 지어준 것만 있는 아주 작은 표이므로 먼저 id
+                    # 목록으로 뽑아두고, 본 쿼리는 r 자신의 컬럼만 본다
+                    # (r.name/r.nationality/r.last_team_name은 원래부터
+                    # 같은 표의 컬럼이라 그대로 둔다). 결과는 동일하다.
+                    _like_custom = [rr["player_id"] for rr in conn.execute(
+                        "SELECT player_id FROM ai_player_custom_names WHERE custom_name LIKE ?",
+                        (like,)).fetchall()]
+                    _or = ["r.name LIKE ?", "r.nationality LIKE ?", "r.last_team_name LIKE ?"]
+                    _op = [like, like, like]
+                    if _like_custom:
+                        _or.append("r.id IN (%s)" % ",".join("?" * len(_like_custom)))
+                        _op += _like_custom
+                    q += " AND (" + " OR ".join(_or) + ")"
+                    params += _op
         _nt_sql, _nt_params = _natteam_filter_sql(natteam, natteam_year)
         if _nt_sql:
             q += _nt_sql.format(alias="r"); params += _nt_params
@@ -588,15 +604,20 @@ def search_retired_ai_players(name_query=None, continent=None, nat_country_id=No
 
 def _decode_ai_code(text):
     """[2026-08 신설] constants.ai_player_code(id)의 정확한 역함수 —
-    "AI0001"이나 접두 없는 "0001"(대소문자 무관, 정확히 4자)을 원래
-    player_id로 되돌린다. 4자가 아니거나 36진수 알파벳(0-9,A-Z) 밖의
-    문자가 섞여 있으면 코드가 아니라고 보고 None을 반환한다(팀명/국적
-    검색어와 혼동 방지)."""
+    "AI0001"이나 접두 없는 "0001"(대소문자 무관)을 원래 player_id로
+    되돌린다. 36진수 알파벳(0-9,A-Z) 밖의 문자가 섞여 있거나 길이가
+    범위를 벗어나면 코드가 아니라고 보고 None을 반환한다(팀명/국적
+    검색어와 혼동 방지).
+
+    [2026-09 수정] constants.ai_player_code가 36^4를 넘는 id에 대해
+    5자리 이상으로 늘어나게 바뀌었다(그 함수 정의부의 코드 중복 버그
+    주석 참고) — 여기도 4자 고정 검사를 4~7자 범위로 넓힌다. 4자리
+    코드의 해석은 예전과 완전히 동일하다."""
     from constants import _AI_CODE_DIGITS
     s = text.strip().upper()
     if s.startswith("AI"):
         s = s[2:]
-    if len(s) != 4 or any(ch not in _AI_CODE_DIGITS for ch in s):
+    if not (4 <= len(s) <= 7) or any(ch not in _AI_CODE_DIGITS for ch in s):
         return None
     n = 0
     for ch in s:
@@ -841,9 +862,47 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
                 q += " AND cust.custom_name LIKE ?"
                 params += [like]
             else:
-                q += (" AND (t.name LIKE ? OR l.name LIKE ? OR cn.name LIKE ? "
-                      "OR p.nationality LIKE ? OR p.name LIKE ? OR cust.custom_name LIKE ?)")
-                params += [like, like, like, like, like, like]
+                # [2026-09 성능수정, 신민용 리포트: "60년을 돌린 후 선수
+                # 검색에도 딜레이가 있다 — 바로바로 되어야지"] 예전엔 이
+                # 6개 LIKE를 그대로 OR로 묶었는데, 그중 4개(t.name/l.name/
+                # cn.name/cust.custom_name)가 조인된 표의 컬럼이라 SQLite가
+                # "26만 행 전부를 5개 표와 조인한 뒤에야" LIKE를 평가할 수
+                # 있었다(실행계획: SCAN p USING idx_aiplayers_ovr_id +
+                # SEARCH t/l/cn/nc/cust). 필터 없는 검색이 10ms인데 이름
+                # 검색만 611ms였던 이유가 이것이다.
+                #
+                # 팀/리그/국가/커스텀이름은 전부 "작은 표"다(팀 1.1만,
+                # 리그 710, 국가 211, 커스텀이름은 내가 지어준 것만) —
+                # 먼저 이 작은 표들에서 일치하는 id 목록을 뽑아두고,
+                # 본 쿼리에서는 ai_players 자신의 컬럼(p.team_id/
+                # p.nationality/p.id/p.name)으로만 비교한다. 조인 전에
+                # 걸러지므로 훨씬 싸다. 결과 집합은 완전히 동일하다
+                # (실측 3개 검색어 전부 결과 id 집합 일치 확인).
+                #   실측(10시즌 세이브, 현역 26.5만): '김' 611→175ms,
+                #   '마드리드' 596→165ms, 'FC'(팀 3,275개 매칭) 8→6ms
+                _like_teams = [r["id"] for r in conn.execute(
+                    "SELECT t.id FROM teams t JOIN leagues l ON t.league_id=l.id "
+                    "JOIN countries cn ON l.country_id=cn.id "
+                    "WHERE t.name LIKE ? OR l.name LIKE ? OR cn.name LIKE ?",
+                    (like, like, like)).fetchall()]
+                _like_nats = [r["name"] for r in conn.execute(
+                    "SELECT name FROM countries WHERE name LIKE ?", (like,)).fetchall()]
+                _like_custom = [r["player_id"] for r in conn.execute(
+                    "SELECT player_id FROM ai_player_custom_names WHERE custom_name LIKE ?",
+                    (like,)).fetchall()]
+                _or = ["p.name LIKE ?", "p.nationality LIKE ?"]
+                _op = [like, like]
+                if _like_teams:
+                    _or.append("p.team_id IN (%s)" % ",".join("?" * len(_like_teams)))
+                    _op += _like_teams
+                if _like_nats:
+                    _or.append("p.nationality IN (%s)" % ",".join("?" * len(_like_nats)))
+                    _op += _like_nats
+                if _like_custom:
+                    _or.append("p.id IN (%s)" % ",".join("?" * len(_like_custom)))
+                    _op += _like_custom
+                q += " AND (" + " OR ".join(_or) + ")"
+                params += _op
     # [2026-08 최적화, 동점 처리 명시화] 정렬 기준은 예전 그대로 "OVR
     # 내림차순 상위 N"이지만, 동점(같은 OVR) 선수들 사이의 순서는 여태
     # SQL이 정해주지 않았다 — 실제로는 그때그때 SQLite가 고른 조인 순서에
@@ -5037,6 +5096,59 @@ def get_country_tournament_results(country_name, limit=200):
     return out
 
 
+def _my_intl_record_rows(c, limit=100):
+    """[2026-09 신설, 신민용 리포트 21번] my_player의 국가대표 기록을
+    intl_squad 행과 **완전히 같은 키 구성**으로 만들어 돌려준다.
+
+    my_player는 intl_squad에 안 들어가므로(그 표는 AI 전용 — 위 호출부
+    주석 참고) 별도 경로에서 모은다:
+      · 어떤 대회에 뽑혔나 → intl_tournaments.my_selected=1 + my_nat
+      · 몇 경기 뛰었나·무슨 포지션이었나·골/도움/평점/선방/실점
+        → intl_matches(is_my=1)의 my_* 컬럼 합계
+    평점은 "실제로 뛴 경기"만의 평균이다(안 뛴 경기의 0이 섞이면 평균이
+    부당하게 내려간다). clean_sheets는 GK로 뛰어 실점 0이었던 경기 수로
+    센다 — AI 쪽 intl_squad.clean_sheets와 같은 의미다.
+    slot에 그 대회에서 실제로 맡은 포지션을 채워서, 호출부의 "옛 대회 slot
+    복원" 경로(resolve_intl_starter_slots, intl_squad의 player_id를 찾는다)를
+    타지 않게 한다 — 내 선수는 그 표에 없으므로 그 경로로는 복원이 안 된다.
+    """
+    rows = []
+    for t in c.execute(
+            """SELECT id, year, kind, name, my_nat FROM intl_tournaments
+               WHERE my_selected=1 AND my_nat IS NOT NULL AND my_nat!=''
+               ORDER BY year DESC, id DESC LIMIT ?""", (limit,)).fetchall():
+        ms = c.execute(
+            """SELECT my_played, my_position, my_goals, my_assists, my_rating,
+                      my_saves, my_conceded
+               FROM intl_matches WHERE tournament_id=? AND is_my=1
+               ORDER BY id""", (t["id"],)).fetchall()
+        played = [m for m in ms if m["my_played"]]
+        apps = len(played)
+        ratings = [m["my_rating"] for m in played if (m["my_rating"] or 0) > 0]
+        # 그 대회에서 마지막으로 실제 배정된 포지션(없으면 그 해 아카이브/현재값)
+        pos = next((m["my_position"] for m in reversed(played) if m["my_position"]), "")
+        if not pos:
+            _ph = c.execute(
+                "SELECT position FROM my_player_position_history WHERE year=?",
+                (t["year"],)).fetchone()
+            _me = c.execute("SELECT position FROM my_player WHERE id=1").fetchone()
+            pos = (_ph["position"] if _ph else "") or (_me["position"] if _me else "") or ""
+        rows.append({
+            "tournament_id": t["id"], "country": t["my_nat"],
+            "appearances": apps, "position": pos, "slot": pos,
+            "starter": 1 if apps > 0 else 0,
+            "rating": (sum(ratings) / len(ratings)) if ratings else 0,
+            "goals": sum((m["my_goals"] or 0) for m in played),
+            "assists": sum((m["my_assists"] or 0) for m in played),
+            "clean_sheets": sum(1 for m in played if (m["my_conceded"] or 0) == 0
+                                and (m["my_saves"] or 0) > 0),
+            "saves": sum((m["my_saves"] or 0) for m in played),
+            "goals_conceded": sum((m["my_conceded"] or 0) for m in played),
+            "year": t["year"], "kind": t["kind"], "name": t["name"],
+        })
+    return rows
+
+
 def get_player_intl_records(player_id, limit=100):
     """[2026-08 신설, 신민용 요청: "선수 검색에 '예선전 탈락' 같은 개인
     기록도 표시해줘"] intl_squad(대회 내내 고정되는 26인 명단 — 2026-08
@@ -5072,14 +5184,27 @@ def get_player_intl_records(player_id, limit=100):
     # 시점의 스냅샷(database.get_or_create_intl_squad 참고) — 선수의
     # "지금" 포지션(ai_players.position, 커리어 내내 바뀔 수 있음) 대신
     # 이걸 쓰므로 옛 대회 기록의 포지션이 나중에 안 바뀐다.
-    squad_rows = [dict(r) for r in c.execute(
-        """SELECT s.tournament_id, s.country, s.appearances, s.position, s.slot, s.starter,
-                  s.rating, s.goals, s.assists, s.clean_sheets, s.saves, s.goals_conceded,
-                  t.year, t.kind, t.name
-           FROM intl_squad s JOIN intl_tournaments t ON t.id = s.tournament_id
-           WHERE s.player_id=?
-           ORDER BY t.year DESC, t.id DESC LIMIT ?""",
-        (player_id, limit)).fetchall()]
+    # [2026-09 버그수정, 신민용 리포트 21번: "플레이어 리그는 선수 검색에서
+    # 기록되는데 국제기록이 기록이 안 돼"] 원인: intl_squad는 **AI 선수만**
+    # 담는다 — my_player는 그 표에 아예 안 들어가고 별도 경로
+    # (intl_tournaments.my_nat/my_selected + intl_matches.my_played)로
+    # 관리된다(_my_intl_squad_entry 주석 참고 — 국가 검색 대회 스쿼드 화면에서
+    # 정작 본인만 빠져 있던 것과 완전히 같은 원인이다). 그래서 내 선수
+    # (MY_PLAYER_ID)로 이 함수를 부르면 squad_rows가 항상 비어서 "국가대표
+    # 출전 기록 없음"만 떴다. intl_squad 행과 키 구성이 똑같은 dict를 그
+    # 별도 경로에서 만들어 끼워주면, 아래 로직(대회 성적 조회·분모 계산·
+    # 진행 중 대회 폴백·화면 렌더링)은 한 줄도 안 바꾸고 그대로 쓰인다.
+    if player_id == MY_PLAYER_ID:
+        squad_rows = _my_intl_record_rows(c, limit)
+    else:
+        squad_rows = [dict(r) for r in c.execute(
+            """SELECT s.tournament_id, s.country, s.appearances, s.position, s.slot, s.starter,
+                      s.rating, s.goals, s.assists, s.clean_sheets, s.saves, s.goals_conceded,
+                      t.year, t.kind, t.name
+               FROM intl_squad s JOIN intl_tournaments t ON t.id = s.tournament_id
+               WHERE s.player_id=?
+               ORDER BY t.year DESC, t.id DESC LIMIT ?""",
+            (player_id, limit)).fetchall()]
     conn.close()
     if not squad_rows:
         return []
@@ -7233,12 +7358,68 @@ def get_team_season_finance(team_id, year, mode="second", conn=None):
 
     total_in = sum(r.get("fee") or 0 for r in buys)
     total_out = sum(r.get("fee") or 0 for r in sells)
+    _loan_in_fee = sum(r.get("fee") or 0 for r in loan_in)
+    _loan_out_fee = sum(r.get("fee") or 0 for r in loan_out)
+
+    # [2026-09 신설, 신민용 요청: "지금 총 영입·각 연봉 등이 있는데 전체
+    # 사용 금액도 계산이 가능할 것 같은데? [선수들 연봉 + 이적료(임대 포함)
+    # - 팔았을 때 가격(임대 포함)] 근데 이건 지출 | 수입 | 순수익 이렇게
+    # 나누는 게 좋을 듯"]
+    #   총지출 = 그 해 연봉 총액 + 영입 이적료 + 임대 영입료
+    #   총수입 = 판매 이적료 + 임대 방출료
+    #   순수익 = 총수입 - 총지출  (음수면 그만큼 순지출)
+    # 기존 "순이익"(총 판매 - 총 영입)은 이적시장만 본 값이라 그대로 두고,
+    # 연봉까지 포함한 이 세 줄을 따로 맨 위에 둔다.
+    #
+    # [연봉을 어떻게 세나 — 2026-09 재수정, 신민용 리포트: "총합을 누르면
+    # ... 상반기 표시로 뜨는 것 같은데"] 1차 구현은 "선수당 한 번(최고
+    # 연봉)"으로 셌는데, 그러면 상반기 로스터의 연봉이 더 높을 때
+    # 총합 = 상반기가 돼서 총합 버튼을 눌러도 숫자가 안 바뀌는 것처럼
+    # 보였다(실측 2001년 맨체스터 시티: 상반기 총지출 3478.05억,
+    # 총합도 3478.05억).
+    #
+    # 연봉은 "그 반기 동안 실제로 나간 인건비"로 센다:
+    #   상반기 = 상반기 로스터 연봉합 × 0.5
+    #   하반기 = 하반기 로스터 연봉합 × 0.5
+    #   총합   = 상반기 + 하반기 (= 그 해 실제 인건비)
+    # 이러면 총합이 두 반기의 정확한 합이 되어 "총합 = 상반기 + 하반기"
+    # 라는 이 패널의 다른 모든 줄(영입/판매/임대)과 규칙이 같아진다.
+    # 선수 한 명이 두 반기에 다 있어도 각 반기 0.5씩이라 두 배가 되지
+    # 않고, 겨울에 들어온 선수는 하반기 0.5만 잡히는 것도 실제와 맞는다.
+    # (개인 연봉 자체를 보여주는 "최고/최저 연봉" 줄은 연봉 액수 그대로
+    #  두는 게 맞으므로 이 반기 환산을 적용하지 않는다.)
+    def _half_salary_sum(_m):
+        return sum(e.get("salary") or 0
+                   for e in _finance_squad_salaries(conn, team_id, year, _m)
+                   if (e.get("salary") or 0) > 0)
+
+    if mode == "both":
+        _f_sum, _s_sum = _half_salary_sum("first"), _half_salary_sum("second")
+        # 한쪽 반기 스냅샷 자체가 없는 해(기능 도입 이전 세이브 등)는
+        # 있는 쪽을 1년치로 본다 — 없는 데이터 때문에 절반으로 깎이지
+        # 않게 하기 위함.
+        if _f_sum and _s_sum:
+            total_salary = int(round((_f_sum + _s_sum) * 0.5))
+        else:
+            total_salary = _f_sum or _s_sum
+    else:
+        _one = sum(e.get("salary") or 0 for e in sal)
+        total_salary = int(round(_one * 0.5))
+    _spend = total_salary + total_in + _loan_in_fee
+    _income = total_out + _loan_out_fee
     return {
         "year": year, "mode": mode,
         "available": finance_availability(conn, year),
+        "총지출": {"value": _spend},
+        "총수입": {"value": _income},
+        "구단 순수익": {"value": _income - _spend},
+        # 건수는 "그 기간에 연봉을 받은 선수 수" — mode="both"는 두 반기
+        # 스냅샷을 합쳐 읽으므로 같은 선수가 두 번 세지지 않게 id로 묶는다.
+        "연봉 지출": {"value": total_salary,
+                      "n": len({e.get("player_id") for e in sal})},
         "총 영입": {"value": total_in, "n": len(buys)},
         "총 판매": {"value": total_out, "n": len(sells)},
-        "순이익": {"value": total_out - total_in},
+        "이적 순수익": {"value": total_out - total_in},
         "최고 영입": {"row": _finance_pick(paid, "fee", False), "key": "fee"},
         "최고 판매": {"row": _finance_pick(got, "fee", False), "key": "fee"},
         "최고 연봉": {"row": _finance_pick(sal, "salary", False), "key": "salary"},
@@ -7251,12 +7432,56 @@ def get_team_season_finance(team_id, year, mode="second", conn=None):
                       "key": "market_value"},
         "최저 몸값": {"row": _finance_pick(mkt, "market_value", True),
                       "key": "market_value"},
-        "임대 영입료": {"value": sum(r.get("fee") or 0 for r in loan_in), "n": len(loan_in)},
-        "임대 방출료": {"value": sum(r.get("fee") or 0 for r in loan_out), "n": len(loan_out)},
+        "임대 영입료": {"value": _loan_in_fee, "n": len(loan_in)},
+        "임대 방출료": {"value": _loan_out_fee, "n": len(loan_out)},
     }
 
 
-FINANCE_ROW_ORDER = ("총 영입", "총 판매", "순이익",
-                     "최고 영입", "최고 판매", "최고 연봉", "최고 몸값",
+# ══════════════════════════════════════════════════════════════
+# 재정 표시 구성 (2026-09 재설계, 신민용 확정)
+#
+# "총지출/총수입/구단 순수익/연봉 지출/총 영입/총 판매/이적 순수익"은
+# 더 이상 우측 패널에 같이 두지 않고, 포메이션 라벨과 선수 그림 사이의
+# 가로 요약 줄(FINANCE_SUMMARY_SECTIONS)로 옮긴다 — 상위 개념(구단 전체
+# 재정)과 하위 개념(선수 거래·연봉)을 시각적으로 분리해서 인과관계가
+# 한눈에 보이게 한다는 신민용 확정 설계:
+#     구단 전체 재정        총지출 = 연봉 + 영입 이적료 + 임대 영입료
+#                           총수입 = 판매 이적료 + 임대 방출료
+#                           구단 순수익 = 총수입 - 총지출
+#     이적 시장 및 선수 운영 연봉 지출 / 총 영입 / 총 판매
+#                           이적 순수익 = 총 판매 - 총 영입
+# (경기장 수익·스폰서십 같은 기타 수입은 이 게임이 아직 집계하지 않으므로
+#  총수입은 선수 거래분만으로 이뤄진다.)
+#
+# 우측 패널(FINANCE_ROW_ORDER)에는 대표 선수 줄과 임대료 내역만 남는다.
+FINANCE_SUMMARY_SECTIONS = (
+    ("구단 전체 재정", ("총지출", "총수입", "구단 순수익")),
+    ("이적 시장 및 선수 운영", ("연봉 지출", "총 영입", "총 판매", "이적 순수익")),
+)
+
+# 부호 표기 규칙(신민용 확정): 지출은 항상 "-", 수입은 부호 없이,
+# 순수익류는 음수일 때만 "-"(양수에 "+"를 붙이지 않는다).
+#   "minus"=항상 음수로 표기 / "plain"=부호 없음 / "auto"=값의 부호를 따름
+FINANCE_SIGN = {
+    "총지출": "minus", "연봉 지출": "minus", "총 영입": "minus",
+    "임대 영입료": "minus",
+    "총수입": "plain", "총 판매": "plain", "임대 방출료": "plain",
+    "구단 순수익": "auto", "이적 순수익": "auto",
+}
+
+FINANCE_ROW_ORDER = ("최고 영입", "최고 판매", "최고 연봉", "최고 몸값",
                      "최저 영입", "최저 판매", "최저 연봉", "최저 몸값",
                      "임대 영입료", "임대 방출료")
+
+
+def format_finance_signed(name, value):
+    """FINANCE_SIGN 규칙에 맞춰 금액 문자열을 만든다. 값 자체는 전부
+    양수 크기로 저장돼 있고(순수익류만 부호 있는 값), 표기만 여기서 정한다."""
+    if value is None:
+        return "-"
+    rule = FINANCE_SIGN.get(name, "plain")
+    if rule == "minus":
+        return ("-" + format_finance_money(abs(value))) if value else format_finance_money(0)
+    if rule == "auto":
+        return format_finance_money(value)        # 음수면 함수가 "-"를 붙인다
+    return format_finance_money(abs(value))

@@ -1205,6 +1205,12 @@ def simulate_my_cwc_match(week, p, day=None):
     engine_stats = None
     engine_plog = None
     player_ratings = None
+    # [2026-09 신설] 정규시간 스코어(연장 결과로 덮어쓰지 않는다) / 연장 진입
+    # 여부 / 교체 기록. 전술엔진이 예외로 폴백하면 그대로 None/False로 남고
+    # 경기 상세는 예전과 똑같이 동작한다.
+    hs90 = as90 = None
+    went_et = False
+    _subs = {"home": [], "away": []}
     try:
         from match_sim.tactical_engine import simulate_my_match
         from game_engine import _team_formation
@@ -1219,8 +1225,12 @@ def simulate_my_cwc_match(week, p, day=None):
             away_boost=(bonus if not is_home else 0.0),
             home_boost_position=(my_position if is_home else None),
             away_boost_position=(my_position if not is_home else None),
-            home_adv=(0.0 if _neutral_stage else _home_advantage()))
+            home_adv=(0.0 if _neutral_stage else _home_advantage()),
+            extra_time=(m["stage"] != "group"))
         hs, as_ = sim["home_score"], sim["away_score"]
+        hs90, as90 = sim.get("home_score_90", hs), sim.get("away_score_90", as_)
+        went_et = bool(sim.get("went_extra_time"))
+        _subs = {"home": sim.get("home_subs") or [], "away": sim.get("away_subs") or []}
         engine_stats = {"home": sim["home_stats"], "away": sim["away_stats"]}
         engine_plog = sim["possession_log"]
         player_ratings = {"home": sim.get("home_player_ratings") or [],
@@ -1258,43 +1268,38 @@ def simulate_my_cwc_match(week, p, day=None):
         rating = max(3.0, min(10.0, round(rating + _pe["big_match_rating"], 1)))
 
     # [2026-08 신설, 신민용 요청] champions_engine과 동일한 "나" 슬롯 바꿔치기.
-    if player_ratings is not None:
-        _side_key = "home" if is_home else "away"
-        _my_list = player_ratings.get(_side_key)
-        if _my_list:
-            _labels = [r.get("position") if r else None for r in _my_list]
-            _idx = None
-            for _i, _lab in enumerate(_labels):
-                if _lab == my_position:
-                    _idx = _i; break
-            if _idx is None:
-                from constants import POSITION_COMPAT
-                for _want in POSITION_COMPAT.get(my_position, [my_position]):
-                    for _i, _lab in enumerate(_labels):
-                        if _lab == _want:
-                            _idx = _i; break
-                    if _idx is not None:
-                        break
-            if _idx is None:
-                for _i, _lab in enumerate(_labels):
-                    if _lab is not None and _lab != "GK":
-                        _idx = _i; break
-            if _idx is not None:
-                _my_list[_idx] = {
-                    "id": None, "name": p.get("name") or "나",
-                    "position": _labels[_idx], "ovr": p.get("ovr", 40),
-                    "goals": goals, "assists": assists,
-                    "shots": detail.get("shots", 0),
-                    "shots_on": detail.get("shots_on", 0),
-                    "saves": saves, "is_gk": (my_position == "GK"),
-                    "rating": rating, "is_me": True,
-                }
+    # [2026-09 버그수정, 신민용 리포트: "2대0인데 골이 3개 어시가 3개"]
+    # 이제 슬롯 치환 직후 "팀 골 합계 == 실제 스코어"를 복원하는 공용
+    # 헬퍼(competition_common.merge_my_slot)로 전 대회를 통일했다 — 자세한
+    # 원인/불변식은 그 함수 주석 참고.
+    # [2026-09 신설, 신민용 리포트: "경기 상세에서 나만 뜨는 것 같은데
+    # 다른 선수들이 골 넣어도 다 뜨게 해줘"] 내가 관여 안 한 우리 팀 득점을
+    # 실제 득점자 이름과 함께 타임라인에 채운다. 반드시 merge_my_slot
+    # **이전에** 불러야 한다 — 이유는 augment_team_goal_events 주석 참고.
+    from competition.competition_common import (merge_my_slot,
+                                                augment_team_goal_events)
+    events = augment_team_goal_events(
+        p, is_home, hs, as_, goals, assists, not (_suspended or _benched),
+        events, engine_plog, player_ratings)
+    _side_key, _idx = merge_my_slot(
+        player_ratings, is_home, my_position,
+        {"id": None, "name": p.get("name") or "나",
+         "position": None, "ovr": p.get("ovr", 40),
+         "goals": goals, "assists": assists,
+         "shots": detail.get("shots", 0),
+         "shots_on": detail.get("shots_on", 0),
+         "saves": saves, "is_gk": (my_position == "GK"),
+         "rating": rating, "is_me": True},
+        hs, as_)
 
     my_result = _my_result(outcome, is_home)
     my_conceded = (as_ if is_home else hs)
 
     conn = get_conn()
-    conn.execute("""UPDATE cwc_matches SET home_score=?, away_score=?,
+    # [2026-09 신설] 기록실용 90분 스코어 — database.py _ET_SCORE_COLS 참고.
+    from database import ET_SCORE_SET_SQL, et_score_values
+    conn.execute(f"""UPDATE cwc_matches SET home_score=?, away_score=?,
+                    {ET_SCORE_SET_SQL},
                     pso_winner=?, pso_score=?,
                     my_played=?, my_position=?,
                     my_saves=?, my_goals=?, my_assists=?, my_rating=?,
@@ -1302,7 +1307,8 @@ def simulate_my_cwc_match(week, p, day=None):
                     my_dribbles=?, my_blocks=?, my_pass_acc=?,
                     my_absence_reason=?, my_yellow_cards=?
                     WHERE id=?""",
-                 (hs, as_, pso_winner, pso_score,
+                 (hs, as_, *et_score_values(hs90, as90, went_et),
+                  pso_winner, pso_score,
                   0 if (_suspended or _benched) else 1, _get_field_pos_safe(p),
                   saves, goals, assists, rating,
                   detail["shots"], detail["shots_on"], detail["key_passes"],
@@ -1345,7 +1351,9 @@ def simulate_my_cwc_match(week, p, day=None):
         p, week, comp_name, is_home, home_disp, away_disp,
         hs, as_, my_result, goals, assists, saves, rating,
         events, not (_suspended or _benched), _benched, detail, pso=pso,
-        engine_stats=engine_stats, engine_plog=engine_plog, player_ratings=player_ratings)
+        engine_stats=engine_stats, engine_plog=engine_plog, player_ratings=player_ratings,
+        match_extra={"score_90": ([hs90, as90] if hs90 is not None else [hs, as_]),
+                     "went_extra_time": went_et, "subs": _subs})
     marker = f" [match:{detail_id}:cwc]" if detail_id else ""
 
     add_log("─" * 44, "sep")

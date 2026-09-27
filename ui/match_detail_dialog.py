@@ -22,12 +22,46 @@ from PyQt6.QtGui import QPainter, QColor, QBrush, QPen, QFont
 from game_engine import is_hard_mode
 
 
+# [2026-09 신설] 연장 이벤트 분 코드 — 정의와 이유는
+# match_sim/tactical_engine.timeline_minute 주석 참고(유일한 원본).
+from match_sim.tactical_engine import TIMELINE_ET1_BASE, TIMELINE_ET2_BASE
+
+# 타임라인 구간 식별자 — _event_phase가 돌려주고, 아래 add_half가 쓴다.
+PHASE_FIRST, PHASE_SECOND, PHASE_ET1, PHASE_ET2 = "1H", "2H", "ET1", "ET2"
+
+
+def _event_phase(m):
+    """이벤트 분 코드 → 어느 구간인가.
+
+    [2026-09 신설, 신민용 리포트: "전반 후반 여기서 연장이 뜨면 연장 전반
+    연장 후반 이렇게도 떠야 하는데 안 떠"] 예전엔 _is_first_half 하나로
+    전반/후반 둘로만 갈랐다. 연장 이벤트는 TIMELINE_ET*_BASE가 얹힌
+    코드로 오므로 그것부터 먼저 걸러낸다(기존 기록은 전부 1000 미만이라
+    예전과 100% 동일하게 전반/후반으로만 갈린다)."""
+    try:
+        m = int(m)
+    except (ValueError, TypeError):
+        return PHASE_SECOND
+    if m >= TIMELINE_ET2_BASE:
+        return PHASE_ET2
+    if m >= TIMELINE_ET1_BASE:
+        return PHASE_ET1
+    if m <= 45 or (146 <= m <= 155):
+        return PHASE_FIRST
+    return PHASE_SECOND
+
+
 def _fmt_min(m):
-    """정렬용 분(정수) → 표시 문자열. 전반 추가시간 146~155=45+1~10, 후반 91~100=90+1~10."""
+    """정렬용 분(정수) → 표시 문자열. 전반 추가시간 146~155=45+1~10,
+    후반 91~100=90+1~10, 연장은 베이스를 걷어낸 실제 표시 분(91~122)."""
     try:
         m = int(m)
     except (ValueError, TypeError):
         return str(m)
+    if m >= TIMELINE_ET2_BASE:
+        return str(m - TIMELINE_ET2_BASE)
+    if m >= TIMELINE_ET1_BASE:
+        return str(m - TIMELINE_ET1_BASE)
     if 146 <= m <= 155:
         return f"45+{m-145}"
     if 91 <= m <= 100:
@@ -36,11 +70,16 @@ def _fmt_min(m):
 
 
 def _min_sortkey(m):
-    """실제 경기 시간 정렬 키. 전반 추가시간→45.x, 후반 추가시간→90.x."""
+    """실제 경기 시간 정렬 키. 전반 추가시간→45.x, 후반 추가시간→90.x,
+    연장은 베이스를 걷어낸 표시 분(91~122) 그대로."""
     try:
         m = int(m)
     except (ValueError, TypeError):
         return 0.0
+    if m >= TIMELINE_ET2_BASE:
+        return float(m - TIMELINE_ET2_BASE)
+    if m >= TIMELINE_ET1_BASE:
+        return float(m - TIMELINE_ET1_BASE)
     if 146 <= m <= 155:
         return 45 + (m - 145) / 100.0
     if 91 <= m <= 100:
@@ -49,8 +88,10 @@ def _min_sortkey(m):
 
 
 def _is_first_half(m):
-    """전반 여부. 1~45 + 전반 추가시간(146~155)."""
-    return m <= 45 or (146 <= m <= 155)
+    """전반 여부. 1~45 + 전반 추가시간(146~155).
+    [호환용] 새 코드는 _event_phase를 쓴다 — 이 함수는 연장을 구분하지
+    못하므로(연장이 전부 '후반'으로 떨어짐) 새로 쓰지 말 것."""
+    return _event_phase(m) == PHASE_FIRST
 
 
 def _row(label, value, vcolor="#ffffff"):
@@ -184,9 +225,20 @@ class MatchStatsPanel(QWidget):
         root.addStretch()
 
 
-def _rating_color(rating):
-    """평점 배지 색 — FotMob류 매치센터와 같은 관례(초록=잘함, 노랑/주황=
-    평범, 빨강=부진)를 그대로 따른다."""
+def _rating_badge_color(rating):
+    """평점 **배지 배경** 색 — FotMob류 매치센터와 같은 관례(초록=잘함,
+    노랑/주황=평범, 빨강=부진)를 그대로 따른다. 배지 글자는 항상 흰색이라
+    네 색 모두 흰 글자가 읽히는 어두운 톤으로 고른다.
+
+    [2026-09 버그수정, 신민용 리포트: "경기 상세 보기에서 평점 무난하면
+    흰색으로 뜨던데 이거 시각적으로 잘 안 보여 숫자가"] 이 함수는 원래
+    _rating_color라는 이름이었는데, 나중에 교체 줄의 **글자색**용으로
+    같은 이름의 함수가 아래에 하나 더 정의되면서 통째로 가려져 있었다
+    (파이썬은 뒤에 정의된 쪽이 이긴다). 그래서 배지가 글자색 팔레트를
+    쓰게 됐고, 평범한 구간(6.0~6.8)이 #c0c0c0(밝은 회색) 배경 + 흰
+    글자가 되어 숫자가 안 보였다. 두 함수는 쓰임이 다르므로 이름을
+    갈라놓는다 — 배지 배경은 이 함수, 글자색은 _rating_text_color.
+    """
     if rating >= 7.5:
         return "#2e9e4f"
     if rating >= 6.6:
@@ -211,6 +263,118 @@ class _ClickableLabel(QLabel):
             self._on_click(self._player_id)
             return
         super().mousePressEvent(ev)
+
+
+def _badge_fg(bg_hex):
+    """배지 배경색 위에서 더 잘 읽히는 글자색(흰색/짙은 회색)을 고른다.
+
+    [2026-09 신설, 신민용 리포트: "평점 무난하면 흰색으로 뜨던데 이거
+    시각적으로 잘 안 보여 숫자가"] 배지 글자를 항상 #fff로 고정하고
+    있었는데, "무난" 구간의 주황(#c99a2e)은 흰 글자와의 명암비가 2.58밖에
+    안 된다(작은 굵은 글씨 권장 최소 3.0 미달). 배경 밝기를 보고 글자색을
+    뒤집으면 같은 색 감각(초록/주황/빨강)을 유지한 채 대비만 올릴 수 있다
+    — 주황 배지는 짙은 글자가 되어 6.6까지 올라간다.
+
+    상대휘도는 WCAG 공식 그대로다(sRGB 역감마 → 가중합)."""
+    try:
+        h = str(bg_hex).lstrip("#")
+        r, g, b = (int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+    except (ValueError, IndexError):
+        return "#ffffff"
+
+    def _lin(c):
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+    lum = 0.2126 * _lin(r) + 0.7152 * _lin(g) + 0.0722 * _lin(b)
+    # 흰 글자 대비 vs 짙은 글자 대비를 직접 비교해 큰 쪽을 쓴다.
+    _DARK_LUM = 0.0103   # #1a1a1a의 상대휘도
+    white = (1.05) / (lum + 0.05)
+    dark = (lum + 0.05) / (_DARK_LUM + 0.05)
+    return "#ffffff" if white >= dark else "#1a1a1a"
+
+
+def _rating_text_color(val):
+    """평점 **글자** 색 — 어두운 배경 위에 그대로 얹는 용도(교체 줄).
+    배지 배경색(_rating_badge_color)과는 쓰임이 다르므로 팔레트도 다르다
+    — 이쪽은 밝은 톤이어야 어두운 배경에서 읽힌다."""
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return "#888"
+    if v >= 7.5:
+        return "#4caf50"
+    if v >= 6.8:
+        return "#8bc34a"
+    if v >= 6.0:
+        return "#c0c0c0"
+    return "#e57373"
+
+
+def _sub_row_widget(s, accent, on_player_click=None):
+    """[2026-09 신설] 교체 한 건을 한 줄로 그린다.
+
+        63'  ↓ 김민수 6.8   ↑ 이준호 7.1
+
+    분(disp)은 화면 표시 분 — 연장은 91~120으로 환산된 값이다
+    (tactical_engine.display_minute 참고). 교체 이유(지침/전술)와 연장
+    여부는 툴팁으로만 붙인다.
+
+    [2026-09 확장, 신민용 요청: "교체에서 선수들도 클릭하면 위에 선수
+    클릭했을 때처럼 선수 검색 창 들어가지는 것처럼 하게 해야 돼"]
+    교체 레코드는 out_id/in_id를 들고 있으므로(tactical_engine의 subs
+    레코드), 라인업 목록(_lineup_player_row)과 완전히 같은 방식으로
+    이름을 클릭 가능하게 만든다 — 클릭 판정 기준(id >= -1)도 동일하다."""
+    w = QWidget()
+    w.setStyleSheet("background:#1d1d1d;border-radius:4px;")
+    h = QHBoxLayout(w)
+    h.setContentsMargins(6, 4, 6, 4)
+    h.setSpacing(6)
+
+    mn = QLabel(f"{int(s.get('disp') or s.get('min') or 0)}'")
+    mn.setStyleSheet(f"color:{accent};font-size:11px;font-weight:bold;")
+    mn.setFixedWidth(30)
+    h.addWidget(mn)
+
+    inner = QVBoxLayout()
+    inner.setContentsMargins(0, 0, 0, 0)
+    inner.setSpacing(1)
+    for arrow, nm, rt, col, pid in (
+            ("↓", s.get("out_name") or "?", s.get("out_rating"), "#e57373", s.get("out_id")),
+            ("↑", s.get("in_name") or "?", s.get("in_rating"), "#4caf50", s.get("in_id"))):
+        row = QHBoxLayout(); row.setContentsMargins(0, 0, 0, 0); row.setSpacing(4)
+        a = QLabel(arrow)
+        a.setStyleSheet(f"color:{col};font-size:11px;font-weight:bold;")
+        row.addWidget(a)
+        # 클릭 가능 조건은 _lineup_player_row와 동일하게 맞춘다 — 실제
+        # ai_players 레코드가 있는 선수(id >= -1, 나 자신 포함)만. 예전
+        # 기록에는 out_id/in_id 키 자체가 없어서 자동으로 비활성이 된다.
+        if on_player_click is not None and pid is not None and pid >= -1:
+            n = _ClickableLabel(str(nm), pid, on_player_click)
+            n.setStyleSheet("color:#ddd;font-size:11px;text-decoration:underline;")
+        else:
+            n = QLabel(str(nm))
+            n.setStyleSheet("color:#ddd;font-size:11px;")
+        row.addWidget(n, 1)
+        if rt is not None:
+            r = QLabel(f"{float(rt):.1f}")
+            r.setStyleSheet(f"color:{_rating_text_color(rt)};font-size:11px;font-weight:bold;")
+            row.addWidget(r)
+        inner.addLayout(row)
+    h.addLayout(inner, 1)
+
+    _reason = {"tired": "체력 저하", "attack": "공격 강화",
+               "defend": "수비 강화", "quality": "전력 보강"}.get(s.get("reason"), "")
+    _tip = f"{int(s.get('disp') or 0)}분 교체"
+    if s.get("slot"):
+        _tip += f" · {s['slot']}"
+    if _reason:
+        _tip += f" · {_reason}"
+    if s.get("extra_time"):
+        _tip += " · 연장전"
+    if s.get("out_stamina") is not None:
+        _tip += f" · 교체 시 체력 {s['out_stamina']}"
+    w.setToolTip(_tip)
+    return w
 
 
 def _lineup_player_row(entry, accent, on_player_click=None, hard_mode=False):
@@ -246,6 +410,16 @@ def _lineup_player_row(entry, accent, on_player_click=None, hard_mode=False):
             extra.append(f"⚽{g}")
         if a:
             extra.append(f"🅰{a}")
+    # [2026-09 신설 — 교체 시스템] 교체로 빠진 선발은 몇 분에 나갔는지,
+    # 교체로 들어온 선수는 몇 분에 들어왔는지 이름 옆에 작게 붙인다.
+    # 예전 기록(키 없음)이나 풀타임 출전은 아무것도 안 붙는다.
+    # [2026-09 수정] 예전엔 elif라 "교체로 들어왔다가 다시 교체된 선수"의
+    # ↑와 ↓ 중 하나만 떴다(전술 변경·연장에서 실제로 생긴다 — 40경기
+    # 표본에서 13명). 둘 다 붙여서 "↑62' ↓80'"처럼 보이게 한다.
+    if entry.get("subbed_in") and entry.get("on_min"):
+        extra.append(f"↑{int(entry['on_min'])}'")
+    if entry.get("subbed_out") and entry.get("off_min"):
+        extra.append(f"↓{int(entry['off_min'])}'")
     extra_txt = ("  " + " ".join(extra)) if extra else ""
     ovr_txt = "" if hard_mode else f" ({entry.get('ovr', 0)})"
     name_full = f"{'⭐ ' if is_me else ''}{name_txt}{ovr_txt}{extra_txt}"
@@ -270,8 +444,9 @@ def _lineup_player_row(entry, accent, on_player_click=None, hard_mode=False):
     rating_lbl = QLabel(f"{entry.get('rating', 0):.1f}")
     rating_lbl.setFixedWidth(34)
     rating_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    _bg = _rating_badge_color(entry.get('rating', 0))
     rating_lbl.setStyleSheet(
-        f"background:{_rating_color(entry.get('rating', 0))};color:#fff;"
+        f"background:{_bg};color:{_badge_fg(_bg)};"
         "font-size:11px;font-weight:bold;border-radius:4px;padding:2px 0;")
 
     h.addWidget(pos_lbl)
@@ -540,8 +715,29 @@ class LineupRatingsPanel(QWidget):
         self.setStyleSheet("background:#161616;")
         payload = data.get("payload", {}) or {}
         pr = payload.get("player_ratings") or {}
-        home_list = pr.get("home") or []
-        away_list = pr.get("away") or []
+        home_all = pr.get("home") or []
+        away_all = pr.get("away") or []
+        # [2026-09 신설 — 교체 시스템] 평점표에 교체 투입 선수까지 들어오므로
+        # "선발 11명"과 "교체 투입"을 나눈다. started 키가 아예 없는 예전
+        # 기록은 전부 선발로 취급 → 예전 화면과 100% 동일하게 보인다.
+        home_list = [r for r in home_all if not (r and r.get("started") is False)]
+        away_list = [r for r in away_all if not (r and r.get("started") is False)]
+        # [2026-09 신설, 신민용 리포트: "AI00QF도 AI2SO9로 교체했는데 위에
+        # 보면 AI00QF도 없고 AI2SO9도 없잖아"] 교체로 들어온 선수(started=
+        # False)는 위 목록에서 빠지므로 여태 라인업 어디에도 안 나왔다 —
+        # 🔁 교체 섹션에서 이름을 부르는데 정작 그 선수가 라인업엔 없어서
+        # "교체는 2번인데 위엔 하나만" 처럼 보이는 원인 중 하나였다.
+        # 포메이션 그림(_MatchFormationPitch)은 선발 11명 배치가 전제라
+        # 그대로 두고, 아래 좌우 목록에만 "교체 투입" 구간으로 덧붙인다.
+        # 이렇게 하면 교체 투입 선수가 나중에 또 교체된 경우(전술 변경·
+        # 연장)의 ↓ 표시도 자동으로 같이 보인다.
+        home_bench = [r for r in home_all if r and r.get("started") is False]
+        away_bench = [r for r in away_all if r and r.get("started") is False]
+        subs = payload.get("subs") or {}
+        home_subs = subs.get("home") or []
+        away_subs = subs.get("away") or []
+        score_90 = payload.get("score_90")
+        went_et = bool(payload.get("went_extra_time"))
 
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 14, 14, 14)
@@ -550,6 +746,14 @@ class LineupRatingsPanel(QWidget):
         hdr = QLabel("⭐ 라인업 평점")
         hdr.setStyleSheet("color:#fff;font-size:14px;font-weight:bold;")
         root.addWidget(hdr)
+
+        # 연장까지 간 경기는 정규시간 스코어를 같이 보여준다(신민용 확정
+        # 설계: 90분 스코어를 연장 결과로 덮어쓰지 않는다).
+        if went_et and isinstance(score_90, (list, tuple)) and len(score_90) == 2:
+            et_lbl = QLabel(f"⏱ 정규시간 {score_90[0]}-{score_90[1]} · "
+                            f"연장 종료 {data.get('home_score', '')}-{data.get('away_score', '')}")
+            et_lbl.setStyleSheet("color:#ffd700;font-size:11px;")
+            root.addWidget(et_lbl)
 
         if not home_list and not away_list:
             note = QLabel("이 경기는 선수별 평점 데이터가 없습니다\n"
@@ -585,9 +789,9 @@ class LineupRatingsPanel(QWidget):
         # — 루프마다 DB를 다시 조회하지 않도록 한 번만 계산해서 넘긴다.
         _hard = is_hard_mode()
         cols = QHBoxLayout(); cols.setSpacing(12)
-        for name_key, side_list, accent in (
-                ("home_name", home_list, _HOME_COLOR),
-                ("away_name", away_list, _AWAY_COLOR)):
+        for name_key, side_list, side_bench, accent in (
+                ("home_name", home_list, home_bench, _HOME_COLOR),
+                ("away_name", away_list, away_bench, _AWAY_COLOR)):
             col = QWidget()
             cv = QVBoxLayout(col); cv.setContentsMargins(0, 0, 0, 0); cv.setSpacing(3)
             side_hdr = QLabel(data.get(name_key, ""))
@@ -597,9 +801,52 @@ class LineupRatingsPanel(QWidget):
             for entry in side_list:
                 cv.addWidget(_lineup_player_row(entry, accent, on_player_click=on_player_click,
                                                  hard_mode=_hard))
+            # 교체로 들어온 선수 — 선발과 구분되도록 작은 구분선 아래에 둔다.
+            if side_bench:
+                bench_hdr = QLabel("교체 투입")
+                bench_hdr.setStyleSheet("color:#666;font-size:10px;padding-top:4px;")
+                bench_hdr.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                cv.addWidget(bench_hdr)
+                for entry in side_bench:
+                    cv.addWidget(_lineup_player_row(entry, accent,
+                                                     on_player_click=on_player_click,
+                                                     hard_mode=_hard))
             cv.addStretch()
             cols.addWidget(col, 1)
         iv.addLayout(cols)
+
+        # ── [2026-09 신설, 신민용 요청: "라인업 평점에서 더 아래로 내리면
+        #    누가 들어왔고 누가 나갔는지 뜨는거지. 그 선수들도 평점이 있어야
+        #    하고, 나가고 들어온 시기가 위에 써져 있어야 돼. 좌측에 팀
+        #    우측에 팀"] 교체 이력 — 좌=홈, 우=원정.
+        if home_subs or away_subs:
+            line2 = QFrame(); line2.setFrameShape(QFrame.Shape.HLine)
+            line2.setStyleSheet("color:#2a2a2a;")
+            iv.addWidget(line2)
+            sub_hdr = QLabel("🔁 교체")
+            sub_hdr.setStyleSheet("color:#fff;font-size:13px;font-weight:bold;")
+            iv.addWidget(sub_hdr)
+            scols = QHBoxLayout(); scols.setSpacing(12)
+            for name_key, side_subs, accent in (
+                    ("home_name", home_subs, _HOME_COLOR),
+                    ("away_name", away_subs, _AWAY_COLOR)):
+                col = QWidget()
+                cv = QVBoxLayout(col); cv.setContentsMargins(0, 0, 0, 0); cv.setSpacing(4)
+                sh = QLabel(data.get(name_key, ""))
+                sh.setStyleSheet(f"color:{accent};font-size:12px;font-weight:bold;")
+                sh.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                cv.addWidget(sh)
+                if not side_subs:
+                    none_lbl = QLabel("교체 없음")
+                    none_lbl.setStyleSheet("color:#555;font-size:11px;")
+                    none_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    cv.addWidget(none_lbl)
+                for s in side_subs:
+                    cv.addWidget(_sub_row_widget(s, accent,
+                                                 on_player_click=on_player_click))
+                cv.addStretch()
+                scols.addWidget(col, 1)
+            iv.addLayout(scols)
         iv.addStretch()
 
         scroll.setWidget(inner)
@@ -756,13 +1003,23 @@ class MatchDetailDialog(QDialog):
         inner = QWidget(); iv = QVBoxLayout(inner)
         iv.setContentsMargins(10, 8, 10, 8); iv.setSpacing(3)
 
-        # 전반 = 1~45 + 전반 추가시간(146~155). 그 외는 후반. 각 반은 시간순 정렬.
-        fh = sorted([(m, t) for m, t in events if _is_first_half(m)],
-                    key=lambda x: _min_sortkey(x[0]))
-        sh = sorted([(m, t) for m, t in events if not _is_first_half(m)],
-                    key=lambda x: _min_sortkey(x[0]))
+        # 구간별로 나눠 각각 시간순 정렬 — 전반 / 후반 / 연장 전반 / 연장 후반.
+        # (연장 판정은 _event_phase 주석 참고. 연장이 없는 경기는 ET 목록이
+        #  비므로 아래에서 그 구간 자체를 안 그린다 → 예전 화면과 동일.)
+        def _phase_items(phase):
+            return sorted([(m, t) for m, t in events if _event_phase(m) == phase],
+                          key=lambda x: _min_sortkey(x[0]))
 
-        def add_half(title, items):
+        fh = _phase_items(PHASE_FIRST)
+        sh = _phase_items(PHASE_SECOND)
+        et1 = _phase_items(PHASE_ET1)
+        et2 = _phase_items(PHASE_ET2)
+
+        def add_half(title, items, skip_if_empty=False):
+            # skip_if_empty: 연장 구간 전용 — 연장에 안 간 경기(대부분)에서
+            # "연장 전반 / 특별한 장면 없음"이 늘 붙어 있으면 오히려 헷갈린다.
+            if skip_if_empty and not items:
+                return
             hdr = QLabel(title)
             hdr.setStyleSheet("color:#66aaff;font-size:11px;font-weight:bold;"
                               "padding-top:4px;")
@@ -787,6 +1044,11 @@ class MatchDetailDialog(QDialog):
 
         add_half("⏱ 전반", fh)
         add_half("⏱ 후반", sh)
+        # 연장 구간 — went_extra_time이 켜진 경기면 이벤트가 없어도 구간
+        # 자체는 보여준다("연장까지 갔다"는 사실이 화면에 남아야 하므로).
+        _went_et = bool(payload.get("went_extra_time"))
+        add_half("⏱ 연장 전반", et1, skip_if_empty=not _went_et)
+        add_half("⏱ 연장 후반", et2, skip_if_empty=not _went_et)
         iv.addStretch()
         scroll.setWidget(inner)
         root.addWidget(scroll, 1)

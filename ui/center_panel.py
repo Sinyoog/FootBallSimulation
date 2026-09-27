@@ -1779,7 +1779,10 @@ class CenterPanel(QWidget):
         lay.addWidget(hdr)
 
         spin = QSpinBox(); spin.setObjectName("dlgSpin")
-        spin.setRange(1, 50)
+        # [2026-09 확장, 신민용 요청: "년도 기록해서 돌리는 거 최대가
+        # 50년인데 99년까지 가능하게 범위 넓혀줘"] 진행 경로 자체는
+        # 52주×N번 반복이라 N이 커져도 구조적으로 달라지는 건 없다.
+        spin.setRange(1, 99)
         spin.setValue(getattr(self, "_year_target_years", 1) or 1)
         spin.setSuffix("년")
         lay.addWidget(spin)

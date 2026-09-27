@@ -86,6 +86,7 @@ from competition.competition_common import (
     CompetitionConfig, entry, sim_ai_match, winner_of,
     start_knockout, advance_round, finish_tournament,
     get_tournament, clear_entry_cache, league_day_map, pick_free_day,
+    bump_match_day_generation,
 )
 from competition.champions_engine import CHAMPIONS_CFG
 from competition.europa_engine import EUROPA_CFG
@@ -189,20 +190,35 @@ def _pick_sc_days(team_ids, year, conn=None):
     # [결정성] 이 함수는 SF 생성 때와 결승 요일 재계산 때 두 번 불리는데,
     # 두 호출에 같은 team_ids(그 대회 sc_entries 전원)를 넘겨야 같은 날이
     # 다시 나온다 — 호출부가 그렇게 맞춰서 넘긴다.
+    # [2026-09 버그수정, 신민용 리포트 20번 실측] 후보 조합 2개가 둘 다
+    # 걸리면 예전엔 기본값(_SF_DAY, _FINAL_DAY)으로 폴백했는데, 그 기본값이
+    # 애초에 "국내리그가 가장 자주 놓이는 요일"이라 폴백이 곧 충돌이었다 —
+    # 실측(3시즌 헤드리스): 대륙슈퍼컵 48경기 중 8건이 리그와 하루 이내로
+    # 붙고 그중 4건이 **같은 날**이었다. 이제 두 조합 중 "리그 경기와 가장
+    # 멀리 떨어진 쪽"을 고른다(competition_common.pick_free_day와 동일한
+    # 원칙). 조건을 만족하는 조합이 있으면 기존과 100% 동일하게 동작한다.
+    from constants import MIN_MATCH_DAY_GAP
     _c = conn or get_conn()
     day_map = league_day_map(_c, year, SC_START_WEEK, team_ids)
     busy = set()
     for _t in team_ids:
         busy |= day_map.get(_t, set())
 
-    def _conflicts(cand):
-        return any(abs(cand - dd) <= 1 for dd in busy)
+    def _dist(cand):
+        return min((abs(cand - dd) for dd in busy), default=99)
 
     week_start = _SF_DAY
+    _best, _best_pair = -1, None
     for sf_off, f_off in ((0, 5), (1, 6)):
         sf_cand, f_cand = week_start + sf_off, week_start + f_off
-        if not _conflicts(sf_cand) and not _conflicts(f_cand):
+        score = min(_dist(sf_cand), _dist(f_cand))
+        if score >= MIN_MATCH_DAY_GAP:
             return sf_cand, f_cand
+        if score > _best:
+            _best, _best_pair = score, (sf_cand, f_cand)
+    # 둘 다 gap을 못 맞추면 최소한 '같은 날'이 아닌 조합을 고른다.
+    if _best_pair is not None and _best >= 1:
+        return _best_pair
     return _SF_DAY, _FINAL_DAY
 
 # [2026-08 최적화, club_world_cup_engine.py와 동일한 이유] 이 주차 이하로
@@ -242,6 +258,96 @@ def _set_match_days(tid, stage, day):
     conn = get_conn()
     conn.execute("UPDATE sc_matches SET day=? WHERE tournament_id=? AND stage=?",
                  (day, tid, stage))
+    conn.commit()
+    conn.close()
+
+
+# ── [2026-09 신설] 경기별 날짜 배정 ────────────────────────────
+# [신민용 리포트 20번] "7/20에 리그 경기가 있고 7/21에 슈퍼컵 결승이 잡힌다"
+# — 실측으로 정확히 재현됐다(201일=7/20 리그 → 202일=7/21 대륙슈퍼컵, 2002
+# 시즌 5개 팀). _pick_sc_days는 (a) 후보 조합이 (0,5)/(1,6) 둘뿐이고 (b)
+# 참가 4팀의 리그 경기일을 **합집합**으로 봐서, 네 팀 중 누구라도 그 요일에
+# 리그가 있으면 그 조합이 막힌다. 실측(2002년 4개 대륙): 4팀 합집합 기준으로
+# 조합을 6개까지 늘려봐도 유럽은 gap 1조차 가능한 조합이 하나도 없었다.
+#
+# 그런데 준결승 2경기는 서로 다른 팀끼리 하는 경기다 — 같은 날일 이유가
+# 전혀 없다. 경기마다 **그 경기 두 팀만** 기준으로 날짜를 고르면 실측상
+# 모든 경기가 최소 gap 1, 대부분 gap 2 이상을 확보할 수 있다(2002년
+# 유럽 SF1 offset0 거리4 / SF2 offset0 거리5 등).
+# 그래서 스테이지 일괄 배정을 경기별 배정으로 바꾼다:
+#   준결승 : 주 앞쪽(offset 0~2)에서 그 경기 두 팀 기준 최선의 날
+#   결승/3·4위전 : 두 준결승 중 늦은 날로부터 _SC_SF_TO_FINAL_MIN일 이후
+#     범위에서, 그 경기 두 팀 기준 최선의 날(기존 기본값 offset 5를 1순위로
+#     둬서 안 겹치는 경우엔 지금까지와 같은 날이 그대로 선택된다)
+# 폴백도 pick_free_day와 같은 원칙 — gap을 못 맞추면 '가장 먼 날'을 쓴다
+# (같은 날 2경기는 구조적으로 사라진다).
+from constants import MIN_MATCH_DAY_GAP as _SC_MIN_GAP
+
+_SC_SF_TO_FINAL_MIN = _SC_MIN_GAP   # 준결승 → 결승 최소 간격
+# [2026-09 재조정, 신민용 리포트 20번: "7/16 슈퍼컵 → 7/20 리그 → 7/21 슈퍼컵
+# 결승. 7/18일에 슈퍼컵 결승을 해도 되는 거고 7/19 휴식한 후 20일에 리그를
+# 하니"] 이 값이 3이었는데, 그게 곧 문제였다 — 준결승이 그 주 첫날(197일=
+# 7/16)에 열리면 결승 후보가 200일(7/19) 이후로만 제한돼서, 실측상 휴식일이
+# 확보되는 199~201일(offset 2~4) 후보가 통째로 잘려나갔다. 실측(2002시즌
+# 아프리카): 결승의 요일별 확보 거리가 [0,0,1,2,2,1,0]인데 offset 3·4(200·
+# 201일)가 유일하게 거리 2를 주는 날인데도 _min_off=5에 걸려 202일(거리 1,
+# =리그 다음날)로 떨어졌다. 신민용님이 직접 짚어주신 대로 "준결승 다음
+# 이틀 뒤 결승"도 휴식일이 하루 확보되므로 문제가 없다 — 그래서 최소
+# 간격을 게임 공통 휴식 기준(MIN_MATCH_DAY_GAP=2)과 같게 맞춘다.
+
+
+def _pick_one_sc_day(conn, year, team_ids, offsets):
+    """그 경기 두 팀만 기준으로 offsets 순서대로 날짜를 고른다."""
+    from constants import MIN_MATCH_DAY_GAP
+    day_map = league_day_map(conn, year, SC_START_WEEK, team_ids)
+    busy = set()
+    for t in team_ids:
+        if t:
+            busy.update(day_map.get(t, ()))
+    best, best_day = -1, None
+    for off in offsets:
+        cand = _SF_DAY + off
+        dist = min((abs(cand - d) for d in busy), default=99)
+        if dist >= MIN_MATCH_DAY_GAP:
+            return cand
+        if dist > best:
+            best, best_day = dist, cand
+    return best_day if best_day is not None else _SF_DAY + offsets[0]
+
+
+def _assign_sc_sf_days(tid, year):
+    """준결승 2경기의 날짜를 경기별로 배정."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT id, home_team_id, away_team_id FROM sc_matches "
+        "WHERE tournament_id=? AND stage='SF'", (tid,)).fetchall()
+    for r in rows:
+        day = _pick_one_sc_day(conn, year, (r["home_team_id"], r["away_team_id"]),
+                               (0, 1, 2))
+        conn.execute("UPDATE sc_matches SET day=? WHERE id=?", (day, r["id"]))
+    conn.commit()
+    conn.close()
+
+
+def _assign_sc_final_days(tid, year):
+    """결승·3·4위전 날짜를 경기별로 배정(준결승 이후 최소 간격 보장)."""
+    conn = get_conn()
+    sf_max = conn.execute(
+        "SELECT MAX(day) FROM sc_matches WHERE tournament_id=? AND stage='SF'",
+        (tid,)).fetchone()[0] or _SF_DAY
+    _min_off = max(_SC_SF_TO_FINAL_MIN, (sf_max - _SF_DAY) + _SC_SF_TO_FINAL_MIN)
+    # 기존 기본값(offset 5 = _FINAL_DAY)을 1순위로 두고 늦은 쪽 → 이른 쪽.
+    # 기존 기본값(offset 5 = _FINAL_DAY)을 1순위로 두고, 그다음 늦은 쪽 →
+    # 이른 쪽. offset 2까지 열어야 "준결승 197 + 결승 199(7/18)" 같은
+    # 조합이 후보에 들어온다(위 _SC_SF_TO_FINAL_MIN 주석 참고).
+    offsets = [o for o in (5, 6, 4, 3, 2) if o >= _min_off] or [6]
+    for stage in ("F", "TP"):
+        for r in conn.execute(
+                "SELECT id, home_team_id, away_team_id FROM sc_matches "
+                "WHERE tournament_id=? AND stage=?", (tid, stage)).fetchall():
+            day = _pick_one_sc_day(conn, year, (r["home_team_id"], r["away_team_id"]),
+                                   offsets)
+            conn.execute("UPDATE sc_matches SET day=? WHERE id=?", (day, r["id"]))
     conn.commit()
     conn.close()
 
@@ -313,7 +419,6 @@ def _build_super_cup(year, continent):
     my_in = 1 if any(s["team_id"] == my_tid for s in seeds) else 0
     _st = get_state()
     _cur_season = _st["current_season"] if _st else 1
-    sf_day, final_day = _pick_sc_days([s["team_id"] for s in seeds], year)
 
     conn = get_conn(); c = conn.cursor()
     c.execute("""INSERT INTO sc_tournaments(year, continent, name, status,
@@ -336,7 +441,11 @@ def _build_super_cup(year, continent):
     # OVR 기준으로 1v4/2v3으로 짝짓는다.
     t = get_tournament(SC_CFG, year, continent)
     start_knockout(SC_CFG, t, [s["team_id"] for s in seeds], SC_ROUND_WEEKS)
-    _set_match_days(tid, "SF", sf_day)
+    # [2026-09] 준결승 2경기를 경기별로 날짜 배정(_assign_sc_sf_days 주석 참고).
+    _assign_sc_sf_days(tid, year)
+    # 경기일이 새로 생겼으니 _week_intl_cl_day 캐시 무효화
+    # (competition_common.match_day_generation 주석 참고).
+    bump_match_day_generation()
     # [2026-08 버그수정, 신민용 리포트: "챔스는 기록이 남는데 슈퍼컵은
     # 1년 다 돌려도 대회만 생기고 경기가 하나도 시뮬 안 된다"] 대회를
     # 실제로 만들 때마다 캐시를 무효화해서, 다음 호출이 다시 DB를
@@ -486,21 +595,14 @@ def process_super_cup_week(week, day=None):
 
         if sf and all(m["home_score"] >= 0 for m in sf) and not f_exists:
             advance_round(SC_CFG, t, "SF", "F", SC_ROUND_WEEKS)
-            # [2026-08 버그수정] SF와 같은 (my_tid, season) 조합으로 다시
-            # 고르면 _pick_sc_days가 결정적이라 SF 생성 때와 정확히 같은
-            # 결승 요일이 나온다 — 별도로 저장해둘 필요 없이 매번 다시
-            # 계산해도 안전하다(주변 주차 국내 경기일은 시즌 시작 때
-            # 이미 확정되어 이후 안 바뀜).
-            # [2026-09] SF 생성 때와 같은 team_ids(sc_entries 전원)를 넘겨야
-            # 같은 결승 요일이 다시 나온다 — 위 _pick_sc_days 결정성 주석 참고.
-            _sc_conn = get_conn()
-            _sc_ids = [r[0] for r in _sc_conn.execute(
-                "SELECT team_id FROM sc_entries WHERE tournament_id=? ORDER BY team_id",
-                (t["id"],)).fetchall()]
-            _sc_conn.close()
-            _, f_day = _pick_sc_days(_sc_ids, t["year"])
-            _set_match_days(t["id"], "F", f_day)
-            _set_match_days(t["id"], "TP", f_day)
+            # [2026-09 재설계] 결승·3·4위전 날짜를 경기별로 배정한다 — 이
+            # 시점엔 결승 진출 두 팀이 확정돼 있으므로, 참가 4팀 합집합이
+            # 아니라 실제 그 경기 두 팀의 리그 일정만 피하면 된다
+            # (_assign_sc_final_days 주석 참고). 배정 결과는 sc_matches.day에
+            # 그대로 저장되므로, 예전처럼 "매번 다시 계산해도 같은 값이
+            # 나와야 한다"는 결정성 제약 자체가 필요 없어졌다.
+            _assign_sc_final_days(t["id"], t["year"])
+            bump_match_day_generation()   # [2026-09] 위와 동일
             _invalidate_sc_active_cache()   # 새로 생긴 경기가 있으니 캐시 갱신
             continue
 

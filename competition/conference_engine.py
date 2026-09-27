@@ -48,7 +48,26 @@ CONFERENCE_CFG = CompetitionConfig(
 # 이유 — team_cap/direct_cut/playoff_pool을 챔스 전용 대륙별 상수에서
 # 떼어내 대륙 무관 고정값(36팀/8경기/8직행/16풀)으로 통일한다.
 def _ecl_team_cap(continent):
-    return 36
+    # [2026-09 3차 수정, 신민용 확정: "ECL은 참가팀이 리그 순위에 맞춰 뽑혀
+    # 나가는 36팀 대회다 — 아시아 모든 팀이 참가하는 대회가 아니다. 정원
+    # 36은 고정이고, 그 36자리를 어느 나라 몇 위 팀에게 주느냐만 배분
+    # 규칙이 정한다"] 2차 수정에서 "3위~최하위 전원 최소 1장"을 만족시키려고
+    # 정원 자체를 국가 수에 맞춰 52(유럽/아프리카)/56(아시아)까지 늘렸던 건
+    # 대회 규격을 깬 잘못된 수정이었다 — 정원은 다시 고정값으로 돌렸고,
+    # 36자리 배분은 continental_qualification._conference_plan이 우선순위
+    # 밴드로 처리한다.
+    # 정원 값 자체는 계속 배분 쪽(continental_qualification.conference_team_cap)
+    # 에서 가져온다 — 두 파일에 서로 다른 숫자가 박히는 일이 없게 하려는
+    # 기존 의도는 그대로 유지(예전엔 여기 36, QUALIFICATION_TEAM_CAP에 36이
+    # 따로 있어서 어긋날 수 있었다).
+    # 실측: 유럽 36 · 아시아 36 · 아프리카 36 · 북미 32 · 남미 0
+    # (남미는 컨퍼런스를 열지 않는다 — CONFERENCE_TEAM_CAP 주석 참고. 참가팀이
+    #  4팀 미만이면 대회를 안 만드는 기존 가드가 있어 자동으로 안 열린다).
+    try:
+        from competition.continental_qualification import conference_team_cap
+        return conference_team_cap(continent)
+    except Exception:
+        return 36   # 어떤 이유로든 실패하면 예전 동작 그대로
 
 
 def _ecl_league_games(continent):

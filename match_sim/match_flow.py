@@ -210,6 +210,39 @@ def _select_lineup(team_id, formation):
     return lineup
 
 
+BENCH_SIZE = 7          # 실제 축구의 교체 명단 규모(GK 1명 포함)
+
+
+def select_bench(team_id, lineup, size=BENCH_SIZE):
+    """[2026-09 신설] 선발 11명을 뺀 로스터에서 교체 명단을 뽑는다.
+
+    tactical_engine의 교체 AI가 쓰는 후보 풀. 실제 축구처럼 GK를 최소 1명
+    포함시키고(지금 엔진이 GK를 교체하지는 않지만, 나중에 부상 교체를
+    넣을 때 바로 쓸 수 있도록) 나머지는 OVR 순으로 채운다. 로스터 조회가
+    실패하거나 여유 인원이 없으면 빈 리스트 — 그 경우 교체 없이 예전과
+    똑같이 동작한다.
+    """
+    try:
+        roster = _fetch_roster(team_id)
+    except Exception:
+        return []
+    if not roster:
+        return []
+    used = {p.get("id") for p in (lineup or []) if p and p.get("id") is not None}
+    rest = [p for p in roster if p.get("id") not in used]
+    if not rest:
+        return []
+    gks = sorted((p for p in rest if p.get("position") == "GK"),
+                 key=lambda p: -(p.get("ovr") or 0))
+    others = sorted((p for p in rest if p.get("position") != "GK"),
+                    key=lambda p: -(p.get("ovr") or 0))
+    bench = []
+    if gks:
+        bench.append(gks[0])
+    bench.extend(others[:max(0, size - len(bench))])
+    return bench
+
+
 def generate_lineup_stats(home_name, away_name):
     """홈/원정팀 로스터에서 포메이션에 맞는 11명을 선발하고, 움직임에 바로
     쓸 최소 스탯만 뽑아 반환한다.

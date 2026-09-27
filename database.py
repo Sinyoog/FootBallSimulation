@@ -41,6 +41,203 @@ else:
 DB_PATH = os.path.join(_APP_DIR, "game.db")
 
 
+# ══════════════════════════════════════════════════════════════════
+# [2026-09 신설] 연장 스코어 분리 — 기록실이 읽는 대회 경기 테이블
+#
+# 신민용 확정: "match_details.detail_json에는 이미 score_90 /
+# went_extra_time / subs가 들어갔으니 이건 유지. 하지만 기록실이 직접
+# 읽는 10개 테이블에는 아직 연장 관련 컬럼이 없어서 기록실에서는 최종
+# 스코어만 보이는 상태. 각 테이블에 90분 종료 스코어와 최종 스코어를
+# 구분할 수 있는 구조를 넣는 게 맞음. 그리고 ALTER TABLE 마이그레이션과
+# 각 엔진의 CREATE TABLE IF NOT EXISTS를 같은 작업에서 맞춘다."
+#
+# ── 왜 상수 하나로 묶었는가 ──────────────────────────────────────
+# 이 프로젝트에서 hist.* PK 불일치로 한 번 겪은 함정이 정확히 이것이다:
+# 새 DB를 만드는 CREATE TABLE과 기존 DB를 따라잡는 ALTER TABLE이 서로
+# 다른 곳에 손으로 적혀 있으면, 한쪽만 고친 채 몇 달이 지나고 나서야
+# "새 게임에서는 되는데 기존 세이브에서는 안 된다"(혹은 그 반대)로
+# 터진다. 그래서 컬럼 정의를 여기 한 곳에만 두고,
+#   · CREATE TABLE  → _ET_SCORE_DDL을 f-string으로 끼워넣고
+#   · ALTER TABLE   → 같은 정의에서 자동 생성하고
+#   · verify_et_score_columns() → 두 경로가 실제로 같은 결과를 냈는지
+#     init_db 끝에서 매번 검사한다
+# 이렇게 "두 곳"을 애초에 만들지 않는다. 테이블을 새로 추가할 때도
+# 아래 튜플에 이름만 넣으면 마이그레이션·검증이 자동으로 따라온다.
+#
+# ── 컬럼 의미와 하위호환 ────────────────────────────────────────
+#   home_score_90 / away_score_90 : 90분 종료 시점 스코어. 연장 득점으로
+#       절대 덮어쓰지 않는다. -1 = 미기록.
+#   went_extra_time : 연장에 실제로 들어갔는지(0/1).
+#
+# -1/0 기본값이 곧 하위호환 장치다. 아래 세 경우가 모두 "최종 스코어만
+# 보여주면 되는" 같은 상태로 자연스럽게 수렴한다:
+#   (a) 이 컬럼이 생기기 전에 치른 기존 세이브의 과거 경기
+#   (b) 연장이 없는 경기(리그, 조별리그, 무승부가 아닌 단판 KO)
+#   (c) AI끼리 경기 — _gen_score 확률표로 결과만 뽑으므로 "연장 30분"에
+#       대응하는 시뮬레이션 구간이 없다. 지금은 무승부 → 바로 승부차기
+#       (기존 동작 유지)이고 정의상 score_90 == 최종 스코어다. 여기에
+#       연장을 넣으려면 "연장에서 골이 더 날 확률"을 정규시간과 다른
+#       별도 모델로 만들어야 해서, 설계가 필요한 항목으로 분리했다.
+# 따라서 화면 쪽 판정은 항상 "went_extra_time이 1이고 home_score_90이
+# 0 이상일 때만 정규시간 스코어를 따로 보여준다"로 통일한다.
+# ══════════════════════════════════════════════════════════════════
+_ET_SCORE_COLS = (
+    ("home_score_90",   "INTEGER DEFAULT -1"),
+    ("away_score_90",   "INTEGER DEFAULT -1"),
+    ("went_extra_time", "INTEGER DEFAULT 0"),
+)
+# CREATE TABLE 안에 그대로 끼워넣는 DDL 조각(끝에 쉼표 없음 — 항상 맨 뒤).
+_ET_SCORE_DDL = ",\n        ".join(f"{_n} {_t}" for _n, _t in _ET_SCORE_COLS)
+
+# 기록실이 직접 읽는 대회 경기 테이블 10개. 신민용이 지정한 목록
+# (cup / cl / el / ecl / cwc / lower_cup / sc / domestic_sc / intl / po)
+# 그대로다. lower_cup_matches만 CREATE가 competition/lower_cup_engine.py에
+# 있지만(그 파일이 자기 테이블을 만든다), 마이그레이션과 검증은 여기서
+# 같이 책임진다 — 빠뜨리기 쉬운 바로 그 한 개라서 더욱 그렇다.
+ET_SCORE_MATCH_TABLES = (
+    "intl_matches",
+    "cl_matches",
+    "el_matches",
+    "ecl_matches",
+    "cwc_matches",
+    "sc_matches",
+    "cup_matches",
+    "domestic_sc_matches",
+    "lower_cup_matches",
+    "po_matches",
+)
+
+
+# 각 엔진의 UPDATE에 그대로 끼워 쓰는 SET 조각. et_score_values()가 돌려주는
+# 3-튜플과 컬럼 순서가 항상 같아야 하므로 둘을 붙여 둔다.
+ET_SCORE_SET_SQL = "home_score_90=?, away_score_90=?, went_extra_time=?"
+
+
+def et_score_values(hs90, as90, went_et):
+    """ET_SCORE_SET_SQL에 바인딩할 3-튜플.
+
+    전술엔진이 예외로 폴백하면 호출부의 hs90/as90는 None으로 남는다 —
+    그 경우 -1(미기록)로 떨어뜨려서, 화면 쪽이 "구 데이터 / 연장 없음 /
+    AI 경기"와 완전히 같은 경로로 처리되게 한다(파일 상단 하위호환 규칙).
+    연장에 들어갔는데 90분 스코어가 없는 상태는 만들지 않는다."""
+    if hs90 is None or as90 is None:
+        return (-1, -1, 0)
+    return (int(hs90), int(as90), 1 if went_et else 0)
+
+
+def et_score_migrations():
+    """ET 스코어 컬럼 ALTER TABLE 문 목록 — CREATE TABLE과 같은 정의
+    (_ET_SCORE_COLS)에서 생성하므로 둘이 어긋날 수 없다."""
+    return [f"ALTER TABLE {_tbl} ADD COLUMN {_n} {_t}"
+            for _tbl in ET_SCORE_MATCH_TABLES
+            for _n, _t in _ET_SCORE_COLS]
+
+
+# ════════════════════════════════════════════════════════════════
+# [2026-09 신설 — 감독 시스템 ③-c] 감독 실적/명성 컬럼
+#
+# 신민용 확정: "career_best_level을 없애기보다는 그 값을 기본적인 '경력
+# 최고점'으로 유지하고, 그 위에 실제 실적을 추가하는 방식이 안전해 보여."
+# 그대로 따른다 — career_best_level(③-b)은 손대지 않고 위에 얹는다.
+#
+# [왜 누적인가] 사후에 다시 계산할 수가 없다. AI 클럽의 경기 행은
+# _summarize_and_prune_archive가 아카이빙 때 지우고(그 팀이 career_entries에
+# 없으면), 리그 우승은 애초에 어디에도 기록되지 않는다(trophy_log는
+# 플레이어 소속팀만 넣는다). 그래서 실적은 **발생한 시즌에 감독 행에
+# 누적**하는 것이 유일한 방법이다.
+#
+#   reputation      : 0~100 종합 명성. 시장의 상한을 끌어올리는 값.
+#   recent_level    : 가장 최근에 맡은 자리의 수준. 하한의 기준이다 —
+#                     "과거 최고점"과 "최근 수준"은 따로 봐야 한다
+#                     (신민용: 2010~18 EPL → 2019~22 챔피언십 → 무직인
+#                     감독을 지금도 EPL 감독과 같이 취급하면 안 됨).
+#   career_floor    : 현실적으로 떨어질 수 있는 최저 수준. 잉글랜드 1부
+#                     감독이 7부로 순간이동하는 걸 막는다.
+#   best_level_year : career_best_level을 찍은 연도. 지금과의 격차가
+#                     명성을 깎는다(time_since_high_level).
+#   seasons_managed / level_sum : 맡은 시즌 수와 자리 수준 합 →
+#                     평균 팀 수준(level_sum/seasons_managed).
+#   titles_league/cup/cont/intl : 우승 횟수를 종류별로. cont는 대륙대회
+#                     (챔스/유로파/컨퍼런스/슈퍼컵/클럽월드컵), intl은
+#                     대표팀 대회.
+#   target_hit / target_miss : 구단 목표 달성/미달 횟수 → 목표 달성률.
+#   recent_perf     : 최근 성적 EWMA(-1~+1, 목표 대비). 단일 시즌
+#                     운에 흔들리지 않게 지수이동평균으로 둔다.
+_MANAGER_REP_COLS = (
+    ("reputation",      "REAL DEFAULT 0"),
+    ("recent_level",    "REAL DEFAULT 0"),
+    ("career_floor",    "REAL DEFAULT 0"),
+    ("best_level_year", "INTEGER DEFAULT 0"),
+    ("seasons_managed", "INTEGER DEFAULT 0"),
+    ("level_sum",       "REAL DEFAULT 0"),
+    ("titles_league",   "INTEGER DEFAULT 0"),
+    ("titles_cup",      "INTEGER DEFAULT 0"),
+    ("titles_cont",     "INTEGER DEFAULT 0"),
+    ("titles_intl",     "INTEGER DEFAULT 0"),
+    ("target_hit",      "INTEGER DEFAULT 0"),
+    ("target_miss",     "INTEGER DEFAULT 0"),
+    ("recent_perf",     "REAL DEFAULT 0"),
+)
+# 재임 1건(team_managers)에도 그 임기의 결과를 남긴다 — 감독 커리어 화면이
+# "어느 팀에서 몇 위 했고 무엇을 우승했나"를 보여줄 수 있어야 이력이
+# 이야기가 된다(신민용: "team_managers가 진짜 감독 커리어 이력으로 기능함").
+_TENURE_RESULT_COLS = (
+    ("job_level",  "REAL DEFAULT 0"),      # 부임 당시 자리 수준
+    ("titles",     "INTEGER DEFAULT 0"),   # 이 임기에 딴 우승 수
+    ("best_rank",  "INTEGER DEFAULT 0"),   # 이 임기 최고 리그 순위
+)
+
+
+def manager_rep_migrations():
+    """③-c 감독 실적/명성 컬럼 ALTER 목록 — 정의(_MANAGER_REP_COLS /
+    _TENURE_RESULT_COLS) 한 곳에서 생성하므로 손으로 적은 목록과 달리
+    "여기 넣고 저기 빠뜨림"이 구조적으로 불가능하다."""
+    return ([f"ALTER TABLE managers ADD COLUMN {_n} {_t}"
+             for _n, _t in _MANAGER_REP_COLS]
+            + [f"ALTER TABLE team_managers ADD COLUMN {_n} {_t}"
+               for _n, _t in _TENURE_RESULT_COLS])
+
+
+def verify_manager_rep_columns(conn):
+    """③-c 컬럼이 실제로 다 붙었는지 검사 — 누락 (테이블, 컬럼) 목록을
+    돌려준다. 표 자체가 없으면 검사 대상이 아니다(감독 표가 없는 구세이브)."""
+    missing = []
+    for _tbl, _cols in (("managers", _MANAGER_REP_COLS),
+                        ("team_managers", _TENURE_RESULT_COLS)):
+        try:
+            rows = conn.execute(f"PRAGMA table_info({_tbl})").fetchall()
+        except sqlite3.OperationalError:
+            continue
+        if not rows:
+            continue
+        have = {r[1] for r in rows}
+        for _n, _t in _cols:
+            if _n not in have:
+                missing.append((_tbl, _n))
+    return missing
+
+
+def verify_et_score_columns(conn):
+    """CREATE 경로(새 DB)와 ALTER 경로(기존 DB)가 실제로 같은 결과를
+    냈는지 검사한다. 누락된 (테이블, 컬럼) 목록을 돌려준다 — 정상이면
+    빈 리스트. init_db 끝에서 호출해 조용히 어긋난 상태로 굴러가는 걸
+    막는다(테이블 자체가 아직 없는 경우는 누락이 아니다 — 국내컵처럼
+    나라별로 지연 생성되는 표가 있기 때문)."""
+    missing = []
+    for _tbl in ET_SCORE_MATCH_TABLES:
+        try:
+            rows = conn.execute(f"PRAGMA table_info({_tbl})").fetchall()
+        except sqlite3.OperationalError:
+            continue
+        if not rows:
+            continue   # 테이블 미생성 — 검사 대상 아님
+        have = {r[1] for r in rows}
+        for _n, _t in _ET_SCORE_COLS:
+            if _n not in have:
+                missing.append((_tbl, _n))
+    return missing
+
+
 def _history_db_path():
     """[2026-08 신설, DB 분리] ai_player_ovr_history/ai_player_position_history
     (선수 전원 × 매 시즌, 세이브에서 가장 큰 두 표 — 실측 22년 세이브
@@ -832,6 +1029,230 @@ def refresh_career_years(conn=None, retirement_year=None) -> float:
 # 컬럼만 생기면 전부 0이라, 그대로 두면 "경력 0~99년" 기본 필터가 갑자기
 # 아무도 안 걸리는 것처럼 보인다. init_db()에서 세이브당 딱 한 번 전수
 # 재계산해 채운다(그 뒤엔 매 시즌 전환의 refresh_career_years가 유지).
+def _migrate_managers():
+    """[2026-09 신설 — 감독 시스템 ①단계] 감독이 아직 없는 팀마다 현재
+    감독을 하나씩 만들어 team_managers로 연결하고, teams.tactic_tendency를
+    그 감독의 style_attack으로 이관한다.
+
+    ── 멱등성 ────────────────────────────────────────────────────
+    "현재 감독(end_year IS NULL)이 없는 팀"만 처리한다. 매 init_db마다
+    호출되지만 두 번째부터는 대상이 0건이라 사실상 공짜다. 새로 승격/
+    창단되어 나중에 들어온 팀도 자동으로 다음 실행 때 감독을 갖는다.
+
+    ── 결정성: 전역 random을 절대 건드리지 않는다 ────────────────
+    이 게임은 "같은 세이브 + 같은 시드 → 같은 결과"를 QA로 검증한다
+    (tools/verify_determinism.py). 마이그레이션이 전역 random을 한 번이라도
+    소비하면 그 뒤 모든 경기의 난수열이 통째로 밀려서, ①단계의 절대 조건인
+    "경기 결과 불변"이 즉시 깨진다. 그래서 여기서는 random 모듈을 쓰지 않고
+    random.Random 인스턴스를 팀마다 새로 만들어 쓴다 — 전역 상태와 완전히
+    분리되고, 시드가 (월드 salt, team_id)의 순수 함수라 같은 세이브를 몇 번
+    돌려도 같은 감독이 나온다.
+
+    ── 이관 규칙 ────────────────────────────────────────────────
+      style_attack  ← teams.tactic_tendency 를 **그대로** 복사(척도 동일).
+                      tactic_tendency가 비어있는 구세이브 행만 BALANCED.
+      style_buildup ← 새 축이라 원본이 없다. 가중 랜덤(상수 참고).
+      style_press   ← 같음.
+      manager_type  ← 내 소속팀이면 my_player.manager_type을 그대로 써서
+                      기존 감독과 동일 인물이 되게 한다(안 그러면 ②에서
+                      읽는 쪽을 옮기는 순간 내 팀 감독 성향이 바뀐다).
+                      그 외 팀은 MANAGER_TYPE_WEIGHTS 가중 랜덤.
+      start_year    ← 현재 시즌. 실제 부임 시점을 알 방법이 없으므로
+                      "이 세이브에서 감독 이력이 시작된 해"로 잡는다.
+    """
+    from constants import (TACTIC_TENDENCIES, MANAGER_TYPE_LIST,
+                           MANAGER_CONTRACT_YEARS_MAX, get_country_league_grade,
+                           manager_job_level, manager_career_floor)
+    from data.prestige_clubs import prestige_level
+    import zlib
+
+    def _job_level(country, tier, tname):
+        """constants.manager_job_level에 그대로 위임한다. 예전엔 같은 식을
+        여기 복사해 뒀는데(ai_lifecycle을 import하면 순환), 그 복제 때문에
+        SS 등급 누락 버그를 두 곳에 똑같이 고쳐야 했다."""
+        return manager_job_level(
+            get_country_league_grade(country or ""), tier,
+            prestige_level(country, tname) if country else 0)
+
+    conn = get_conn()
+    try:
+        todo = conn.execute(
+            """SELECT t.id, t.name, t.tactic_tendency, c.name AS country,
+                      lg.tier AS tier
+               FROM teams t
+               LEFT JOIN countries c ON c.id = t.country_id
+               LEFT JOIN leagues lg ON lg.id = t.league_id
+               WHERE NOT EXISTS (SELECT 1 FROM team_managers tm
+                                 WHERE tm.team_id = t.id AND tm.end_year IS NULL)
+               ORDER BY t.id""").fetchall()
+        if not todo:
+            return 0
+
+        _t0 = time.time()
+        # [2026-09 버그수정] season_state가 비어 있는 경로가 실제로 있다 —
+        # 새 게임 생성(reset_game_data → init_db)은 월드(teams)는 남긴 채
+        # season_state를 비운 상태로 여기를 지나간다. 그때 이 줄이 처음
+        # 평가되면서 예전 코드는 GAME_START_YEAR를 모듈 스코프에서 찾다가
+        # NameError로 죽었다(이 파일은 그 상수를 함수 안에서 지역 import
+        # 한다). 같은 파일의 정식 접근자를 쓴다 — 세이브가 고른 시작 연도를
+        # 존중하고, 없으면 constants 기본값으로 폴백하므로 예외가 안 난다.
+        row = conn.execute("SELECT current_year FROM season_state WHERE id=1").fetchone()
+        if row and row["current_year"]:
+            year = int(row["current_year"])
+        else:
+            year = get_game_start_year()
+        salt = get_world_salt()
+
+        # 내 팀 감독은 기존 my_player.manager_type을 그대로 승계한다.
+        my_tid, my_mtype = 0, ""
+        try:
+            mp = conn.execute(
+                "SELECT current_team_id, manager_type FROM my_player LIMIT 1").fetchone()
+            if mp:
+                my_tid = int(mp["current_team_id"] or 0)
+                my_mtype = (mp["manager_type"] or "").strip()
+        except sqlite3.OperationalError:
+            pass
+
+        _valid_attack = set(TACTIC_TENDENCIES)
+        mgr_rows, link_rows, init_extras = [], [], []
+        for r in todo:
+            tid = int(r["id"])
+            # 팀마다 독립된 RNG — 전역 random은 건드리지 않는다.
+            rng = random.Random(zlib.crc32(f"mgr:{salt}:{tid}".encode("utf-8")))
+
+            # ①의 핵심: 기존 팀 전술 성향을 그대로 감독에게 옮긴다.
+            attack = (r["tactic_tendency"] or "").strip()
+            if attack not in _valid_attack:
+                attack = "BALANCED"
+            # 내 팀이면 기존 my_player.manager_type을 승계.
+            mtype = my_mtype if (tid == my_tid and my_mtype in MANAGER_TYPE_LIST) else None
+            mgr_rows.append(build_manager_row(
+                rng, r["country"], year, style_attack=attack, manager_type=mtype))
+            # [2026-09 — ③-b] 계약·경력 초기값. 계약 만료 연도를 흩어두지
+            # 않으면 첫 시즌 전환에 **전원이 동시에 계약 만료**가 되어 감독
+            # 시장이 한 해에 통째로 뒤집힌다.
+            init_extras.append((year + rng.randint(1, MANAGER_CONTRACT_YEARS_MAX),
+                                _job_level(r["country"], r["tier"], r["name"])))
+            link_rows.append(tid)
+
+        cur = conn.cursor()
+        # executemany는 lastrowid를 보장하지 않는다(파이썬 버전에 따라 None).
+        # 그래서 배치 직전의 MAX(id)를 기억해뒀다가, 삽입 후 "그보다 큰 id"를
+        # 순서대로 다시 읽어 팀과 짝짓는다 — 역산보다 확실하고, 중간에 다른
+        # INSERT가 끼어들었더라도 실제 값으로 맞춰진다.
+        base_id = cur.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM managers").fetchone()[0]
+        cur.executemany(MANAGER_INSERT_SQL, mgr_rows)
+        new_ids = [r[0] for r in cur.execute(
+            "SELECT id FROM managers WHERE id > ? ORDER BY id", (base_id,)).fetchall()]
+        if len(new_ids) != len(link_rows):
+            conn.rollback()
+            print(f"[MIGRATE] 감독 이관 중단 — 생성 {len(new_ids)}명 vs 팀 "
+                  f"{len(link_rows)}개 불일치")
+            return 0
+        cur.executemany(
+            """INSERT INTO team_managers(team_id, manager_id, start_year, end_year,
+                                          job_kind, country_id, job_level)
+               VALUES(?,?,?,NULL,'club',NULL,?)""",
+            [(tid, new_ids[i], year, init_extras[i][1])
+             for i, tid in enumerate(link_rows)])
+        # [2026-09 — ③-c] recent_level/best_level_year도 같이 심는다. 안 심으면
+        # 세계 최초 시즌에 전원이 recent_level=0이라 하한이 0이 되고, 첫
+        # 시장에서 5대 리그 감독이 하부 리그로 떨어지는 게 허용돼버린다.
+        # reputation은 0에서 시작해 실적으로 쌓는다(가짜 실적을 심지 않는다).
+        cur.executemany(
+            "UPDATE managers SET contract_until=?, status='club', "
+            "career_best_level=?, clubs_managed=1, recent_level=?, "
+            "best_level_year=?, career_floor=? WHERE id=?",
+            [(init_extras[i][0], init_extras[i][1], init_extras[i][1],
+              year, manager_career_floor(init_extras[i][1], 0.0, 0),
+              new_ids[i])
+             for i in range(len(new_ids))])
+        conn.commit()
+        print(f"[MIGRATE] 감독 생성 {len(mgr_rows)}명 / 팀 연결 완료 "
+              f"{time.time() - _t0:.2f}s")
+        return len(mgr_rows)
+    except sqlite3.OperationalError as e:
+        # 구세이브에 countries/season_state가 아직 없는 등 예외적 상황 —
+        # 감독은 ①단계에서 아무도 안 읽으므로 실패해도 게임은 그대로 돈다.
+        print(f"[MIGRATE] 감독 이관 건너뜀: {e}")
+        return 0
+    finally:
+        conn.close()
+
+
+def build_manager_row(rng, country, year, style_attack=None, manager_type=None,
+                      age_range=None):
+    """감독 한 명의 속성을 만들어 (name, nationality, birth_year, retired,
+    from_player_id, style_attack, style_buildup, style_press, manager_type)
+    9-튜플로 돌려준다 — managers INSERT 컬럼 순서 그대로.
+
+    [2026-09 — ①과 ③이 같은 함수를 쓴다] ①의 이관과 ③의 신규 부임이
+    각자 감독을 만들면 두 경로의 분포가 슬금슬금 갈라진다. 생성 규칙은
+    여기 한 곳에만 둔다.
+
+    rng: **반드시 random.Random 인스턴스**를 넘길 것. 전역 random을 쓰면
+        이 게임의 결정성 보장(같은 세이브+같은 시드 → 같은 결과)이 깨진다
+        — 자세한 이유는 _migrate_managers 주석 참고.
+    style_attack: 지정하면 그 값을 쓴다(①의 tactic_tendency 이관). None이면
+        새로 뽑는다(③의 신규 부임 — 감독이 바뀌면 팀 전술 철학도 바뀐다).
+    manager_type: 지정하면 그 값을 쓴다(내 팀 감독 승계). None이면 새로 뽑는다.
+    age_range: (최소, 최대) 나이. None이면 세계 최초 생성용 넓은 범위
+        (MANAGER_AGE_MIN~MAX). 게임 도중 **데뷔하는** 신인은 ③-b의
+        MANAGER_ROOKIE_AGE_MIN~MAX를 넘긴다 — 안 그러면 62세 신인이
+        태어나 바로 은퇴하는 회전문이 생긴다(constants 쪽 주석 참고).
+        rng 소비량은 범위와 무관하게 randint 1회로 같으므로, 기존 호출부
+        (①의 이관·마이그레이션)의 결정성은 그대로다.
+    """
+    from constants import (TACTIC_TENDENCIES, TACTIC_TENDENCY_WEIGHTS,
+                           MANAGER_TYPE_LIST, MANAGER_TYPE_WEIGHTS,
+                           MANAGER_BUILDUP_STYLES, MANAGER_BUILDUP_WEIGHTS,
+                           MANAGER_PRESS_STYLES, MANAGER_PRESS_WEIGHTS,
+                           MANAGER_AGE_MIN, MANAGER_AGE_MAX)
+    country = (country or "").strip()
+    if style_attack not in set(TACTIC_TENDENCIES):
+        style_attack = rng.choices(TACTIC_TENDENCIES, weights=TACTIC_TENDENCY_WEIGHTS)[0]
+    buildup = rng.choices(MANAGER_BUILDUP_STYLES, weights=MANAGER_BUILDUP_WEIGHTS)[0]
+    press = rng.choices(MANAGER_PRESS_STYLES, weights=MANAGER_PRESS_WEIGHTS)[0]
+    if manager_type not in set(MANAGER_TYPE_LIST):
+        manager_type = rng.choices(MANAGER_TYPE_LIST, weights=MANAGER_TYPE_WEIGHTS)[0]
+    pool = NAME_DATA.get(country) or []
+    name = rng.choice(pool) if pool else "무명 감독"
+    a_lo, a_hi = age_range or (MANAGER_AGE_MIN, MANAGER_AGE_MAX)
+    birth = int(year) - rng.randint(int(a_lo), int(a_hi))
+    return (name, country, birth, 0, None, style_attack, buildup, press, manager_type)
+
+
+MANAGER_INSERT_SQL = """INSERT INTO managers(name, nationality, birth_year, retired,
+                                              from_player_id, style_attack, style_buildup,
+                                              style_press, manager_type)
+                        VALUES(?,?,?,?,?,?,?,?,?)"""
+
+
+def get_team_manager(team_id, conn=None):
+    """그 팀의 현재 감독 행(dict) 또는 None.
+
+    ①단계에서는 UI/디버그 조회용이다 — 경기 로직은 아직 이 함수를 쓰지
+    않는다(쓰는 순간 ①의 "결과 불변" 조건이 깨진다). ②단계에서 전술엔진이
+    teams.tactic_tendency 대신 이쪽을 읽게 된다."""
+    _own = conn is None
+    if _own:
+        conn = get_conn()
+    try:
+        row = conn.execute(
+            """SELECT m.*, tm.start_year
+               FROM team_managers tm JOIN managers m ON m.id = tm.manager_id
+               WHERE tm.team_id = ? AND tm.end_year IS NULL
+               ORDER BY tm.start_year DESC LIMIT 1""", (team_id,)).fetchone()
+        return dict(row) if row else None
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        if _own:
+            conn.close()
+
+
 def _migrate_backfill_career_years():
     conn = get_conn(); c = conn.cursor()
     try:
@@ -1721,10 +2142,21 @@ def init_db():
     # 시즌만 정확하고, 그 이전 과거 시즌은 소급 적용이 안 된다(그 해
     # 이 팀 로스터가 누구였는지 자체를 지금 어떤 데이터로도 재구성할
     # 방법이 없음 — ai_transfer_log도 이 기능들 신설 이후 이적만 기록).
+    # [2026-09 스키마 변경, _migrate_lineup_tables_rowid 주석 참고]
+    # WITHOUT ROWID + PRIMARY KEY(team_id, year)였다 — 한 행이 평균 1,090
+    # 바이트라 인덱스 B-tree의 지역 페이로드 한계(≈1,002바이트)를 살짝
+    # 넘어서, 행마다 오버플로 페이지 하나(4,096바이트)를 통째로 더 쓰며
+    # 실데이터 대비 약 4배로 비대해졌다(실측: 12.9MB 데이터 → 50.3MB).
+    # rowid 표로 두면 같은 행이 리프 페이지에 그대로 들어가고(max_local
+    # 4,061바이트), PK가 하던 조회·INSERT OR REPLACE 충돌 판정은 아래
+    # UNIQUE INDEX(year, team_id)가 그대로 대신한다. year를 앞에 둔 이유는
+    # _repair_future_hist_data()의 "WHERE year > ?" 삭제까지 인덱스를
+    # 타게 하려는 것(_migrate_history_pk_year_first와 같은 목적).
     c.execute("""CREATE TABLE IF NOT EXISTS hist.team_season_lineup(
         team_id INTEGER, year INTEGER, formation TEXT DEFAULT '',
-        slots_json TEXT DEFAULT '[]', bench_json TEXT DEFAULT '[]',
-        PRIMARY KEY(team_id, year)) WITHOUT ROWID""")
+        slots_json TEXT DEFAULT '[]', bench_json TEXT DEFAULT '[]')""")
+    c.execute("""CREATE UNIQUE INDEX IF NOT EXISTS hist.idx_team_season_lineup_year_team
+        ON team_season_lineup(year, team_id)""")
 
     # [2026-09 신설, 신민용 요청: "시즌 중간에 이적한 경우 상반기엔 있었지만
     # 하반기엔 없는 선수가 팀 검색 포메이션에서 아예 안 보인다 — 팀 검색을
@@ -1738,10 +2170,12 @@ def init_db():
     # 저장한다 — team_season_lineup(사실상 하반기)과 별도 표라 기존
     # 화면·로직엔 전혀 영향이 없다. 스키마·한계는 team_season_lineup과
     # 동일(이 기능 신설 이전 과거 시즌은 소급 불가).
+    # 스키마·이유는 바로 위 team_season_lineup과 완전히 동일.
     c.execute("""CREATE TABLE IF NOT EXISTS hist.team_season_lineup_half(
         team_id INTEGER, year INTEGER, formation TEXT DEFAULT '',
-        slots_json TEXT DEFAULT '[]', bench_json TEXT DEFAULT '[]',
-        PRIMARY KEY(team_id, year)) WITHOUT ROWID""")
+        slots_json TEXT DEFAULT '[]', bench_json TEXT DEFAULT '[]')""")
+    c.execute("""CREATE UNIQUE INDEX IF NOT EXISTS hist.idx_team_season_lineup_half_year_team
+        ON team_season_lineup_half(year, team_id)""")
 
     # [2026-09 신설, 신민용 요청: "세계 선수 검색에서 상반기/하반기를 다
     # 나눠야 한다 — 상반기엔 주전이었다가 하반기엔 로테이션으로 가는
@@ -2191,7 +2625,7 @@ def init_db():
         tournament_id INTEGER, country TEXT, flag TEXT, grade TEXT,
         ovr REAL, grp TEXT, pot INTEGER, alive INTEGER DEFAULT 1,
         is_my INTEGER DEFAULT 0, continent TEXT DEFAULT '')""")
-    c.execute("""CREATE TABLE IF NOT EXISTS intl_matches(
+    c.execute(f"""CREATE TABLE IF NOT EXISTS intl_matches(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tournament_id INTEGER, stage TEXT, grp TEXT DEFAULT '',
         week INTEGER, home TEXT, away TEXT,
@@ -2201,7 +2635,10 @@ def init_db():
         my_played INTEGER DEFAULT 0, my_nat TEXT DEFAULT '',
         my_position TEXT DEFAULT '', my_saves INTEGER DEFAULT 0,
         my_goals INTEGER DEFAULT 0, my_assists INTEGER DEFAULT 0,
-        my_rating REAL DEFAULT 0)""")
+        my_rating REAL DEFAULT 0,
+        -- [2026-09 신설] 연장 스코어 분리 — 정의/이유는 파일 상단
+        -- _ET_SCORE_COLS 주석 참고(여기 직접 적지 않는다).
+        {_ET_SCORE_DDL})""")
     # [2026-08 신설, 신민용 요청: "예선전 때 뽑은 애들 그대로 본선까지
     # 가는거야 — 지금은 경기할 때마다 국대 26명이 매번 새로 뽑힌다"]
     # 그 대회(tournament_id)에서 그 나라(country)가 한 번 선발한 26인을
@@ -2236,7 +2673,7 @@ def init_db():
         tournament_id INTEGER, team_id INTEGER, team_name TEXT,
         flag TEXT, country TEXT, grade TEXT, ovr REAL,
         alive INTEGER DEFAULT 1)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS cl_matches(
+    c.execute(f"""CREATE TABLE IF NOT EXISTS cl_matches(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tournament_id INTEGER, stage TEXT, week INTEGER,
         home_team_id INTEGER, away_team_id INTEGER,
@@ -2248,7 +2685,9 @@ def init_db():
         my_assists INTEGER DEFAULT 0, my_rating REAL DEFAULT 0,
         -- [2026-09 신설] "그 경기 당시 내 팀" — 위 cup_matches.my_team_id
         -- 주석과 같은 이유. 대회 단위 my_team_id는 이적 시 갱신된다.
-        my_team_id INTEGER DEFAULT 0)""")
+        my_team_id INTEGER DEFAULT 0,
+        -- [2026-09 신설] 연장 스코어 분리 — 파일 상단 _ET_SCORE_COLS 참고.
+        {_ET_SCORE_DDL})""")
     # 챔스 대회별 내 성적 (월드컵 intl_history와 동일 구조: 몇강/우승/탈락 + 활약)
     c.execute("""CREATE TABLE IF NOT EXISTS cl_history(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2290,7 +2729,9 @@ def init_db():
             my_conceded INTEGER DEFAULT 0, grp TEXT DEFAULT '',
             day INTEGER DEFAULT 0, my_absence_reason TEXT DEFAULT NULL,
             -- [2026-09 신설] "그 경기 당시 내 팀" — cl_matches와 동일.
-            my_team_id INTEGER DEFAULT 0)""")
+            my_team_id INTEGER DEFAULT 0,
+            -- [2026-09 신설] 연장 스코어 분리 — 파일 상단 _ET_SCORE_COLS 참고.
+            {_ET_SCORE_DDL})""")
         c.execute(f"""CREATE TABLE IF NOT EXISTS {_prefix}_history(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             year INTEGER, competition TEXT, team_name TEXT, result TEXT,
@@ -2311,7 +2752,7 @@ def init_db():
         tournament_id INTEGER, team_id INTEGER, team_name TEXT,
         flag TEXT, country TEXT, continent TEXT, grp TEXT DEFAULT '',
         grade TEXT, ovr REAL, alive INTEGER DEFAULT 1)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS cwc_matches(
+    c.execute(f"""CREATE TABLE IF NOT EXISTS cwc_matches(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tournament_id INTEGER, stage TEXT, week INTEGER,
         home_team_id INTEGER, away_team_id INTEGER,
@@ -2321,7 +2762,9 @@ def init_db():
         my_played INTEGER DEFAULT 0, my_position TEXT DEFAULT '',
         my_saves INTEGER DEFAULT 0, my_goals INTEGER DEFAULT 0,
         my_assists INTEGER DEFAULT 0, my_rating REAL DEFAULT 0,
-        my_absence_reason TEXT DEFAULT NULL)""")
+        my_absence_reason TEXT DEFAULT NULL,
+        -- [2026-09 신설] 연장 스코어 분리 — 파일 상단 _ET_SCORE_COLS 참고.
+        {_ET_SCORE_DDL})""")
     # ── 슈퍼컵 (super_cup_engine, 2026-08 신설) ──
     # [10순위] 대륙별 연 1회, 참가 4팀(챔스 우승/준우승 + 유로파급 우승 +
     # 컨퍼런스급 우승) → 준결승 2경기 + 결승 1경기(3/4위전 없음, 총 3경기).
@@ -2345,7 +2788,7 @@ def init_db():
         tournament_id INTEGER, team_id INTEGER, team_name TEXT,
         flag TEXT, country TEXT, grade TEXT, ovr REAL,
         alive INTEGER DEFAULT 1, seed_role TEXT DEFAULT '')""")
-    c.execute("""CREATE TABLE IF NOT EXISTS sc_matches(
+    c.execute(f"""CREATE TABLE IF NOT EXISTS sc_matches(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tournament_id INTEGER, stage TEXT, week INTEGER,
         home_team_id INTEGER, away_team_id INTEGER,
@@ -2363,7 +2806,9 @@ def init_db():
         -- [2026-09 신설] "그 경기 당시 내 팀" — cl_matches와 동일.
         -- sc_matches도 competition_common의 공용 INSERT 경로를 쓰므로
         -- 컬럼 구성이 cl_*와 정확히 같아야 한다.
-        my_team_id INTEGER DEFAULT 0)""")
+        my_team_id INTEGER DEFAULT 0,
+        -- [2026-09 신설] 연장 스코어 분리 — 파일 상단 _ET_SCORE_COLS 참고.
+        {_ET_SCORE_DDL})""")
     c.execute("""CREATE TABLE IF NOT EXISTS sc_history(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         year INTEGER, competition TEXT, team_name TEXT, result TEXT,
@@ -2388,7 +2833,7 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tournament_id INTEGER, team_id INTEGER, team_name TEXT,
         tier INTEGER, ovr REAL, alive INTEGER DEFAULT 1)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS cup_matches(
+    c.execute(f"""CREATE TABLE IF NOT EXISTS cup_matches(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tournament_id INTEGER, round_name TEXT, round_idx INTEGER, week INTEGER,
         home_team_id INTEGER, away_team_id INTEGER,
@@ -2406,7 +2851,9 @@ def init_db():
         -- 치른 경기까지 새 팀 기준으로 홈/원정이 뒤바뀌어 표시되는
         -- (2026-07에 한 번 고쳤던) 버그가 되살아난다. 경기 행 자체에
         -- "그때 내 팀"을 박아두면 과거 기록은 영원히 안 흔들린다.
-        my_team_id INTEGER DEFAULT 0)""")
+        my_team_id INTEGER DEFAULT 0,
+        -- [2026-09 신설] 연장 스코어 분리 — 파일 상단 _ET_SCORE_COLS 참고.
+        {_ET_SCORE_DDL})""")
     c.execute("""CREATE TABLE IF NOT EXISTS cup_history(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         year INTEGER, team_name TEXT, result TEXT,
@@ -2436,7 +2883,7 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tournament_id INTEGER, team_id INTEGER, team_name TEXT,
         flag TEXT, country TEXT, grade TEXT, ovr REAL)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS domestic_sc_matches(
+    c.execute(f"""CREATE TABLE IF NOT EXISTS domestic_sc_matches(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tournament_id INTEGER, stage TEXT DEFAULT 'F', week INTEGER, day INTEGER DEFAULT 0,
         home_team_id INTEGER, away_team_id INTEGER,
@@ -2450,7 +2897,9 @@ def init_db():
         my_key_passes INTEGER DEFAULT 0, my_dribbles INTEGER DEFAULT 0,
         my_blocks INTEGER DEFAULT 0, my_pass_acc REAL DEFAULT 0,
         my_conceded INTEGER DEFAULT 0, my_yellow_cards INTEGER DEFAULT 0,
-        my_absence_reason TEXT DEFAULT NULL)""")
+        my_absence_reason TEXT DEFAULT NULL,
+        -- [2026-09 신설] 연장 스코어 분리 — 파일 상단 _ET_SCORE_COLS 참고.
+        {_ET_SCORE_DDL})""")
     c.execute("""CREATE TABLE IF NOT EXISTS domestic_sc_history(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         year INTEGER, competition TEXT, team_name TEXT, result TEXT,
@@ -2475,7 +2924,7 @@ def init_db():
         year INTEGER, upper_league_id INTEGER, lower_league_id INTEGER,
         rule_id TEXT, status TEXT DEFAULT 'pending',
         my_in INTEGER DEFAULT 0, my_team_id INTEGER DEFAULT 0)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS po_matches(
+    c.execute(f"""CREATE TABLE IF NOT EXISTS po_matches(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tournament_id INTEGER, match_key TEXT, day INTEGER,
         home_team_id INTEGER DEFAULT 0, away_team_id INTEGER DEFAULT 0,
@@ -2485,7 +2934,9 @@ def init_db():
         is_my INTEGER DEFAULT 0, my_played INTEGER DEFAULT 0,
         my_position TEXT DEFAULT '', my_saves INTEGER DEFAULT 0,
         my_goals INTEGER DEFAULT 0, my_assists INTEGER DEFAULT 0,
-        my_rating REAL DEFAULT 0)""")
+        my_rating REAL DEFAULT 0,
+        -- [2026-09 신설] 연장 스코어 분리 — 파일 상단 _ET_SCORE_COLS 참고.
+        {_ET_SCORE_DDL})""")
     # 커리어/은퇴창에서 "국제전"과 같은 톤으로 개인 PO 경기 기록을 보여주기
     # 위한 요약 테이블(get_my_intl_matches와 동일한 목적 — po_matches는
     # 대회 데이터라 지워질 수 있지만 이 표는 커리어 기록으로 영구 보존).
@@ -2495,6 +2946,72 @@ def init_db():
         goals INTEGER DEFAULT 0, assists INTEGER DEFAULT 0,
         rating REAL DEFAULT 0)""")
     # 오퍼 거절 기록 (기존 코드가 참조하나 생성 누락되어 있던 테이블)
+    # ══════════════════════════════════════════════════════════════
+    # [2026-09 신설 — 감독 시스템 ①단계] managers / team_managers
+    #
+    # 신민용 확정 순서: ① 테이블 + 기존 값 이관(경기 결과 불변) →
+    # ② 스타일을 전술엔진에 연결 + 포메이션 자동 선택 → ③ 부임/경질.
+    # 여기는 ①만 한다.
+    #
+    # ── 왜 감독을 별도 표로 빼는가 ────────────────────────────────
+    # 지금까지 감독은 my_player.manager_type 한 칸이 전부였다 — 즉 "내
+    # 팀의 현재 감독 성향"이라는 값 하나만 있고, 팀에 귀속된 감독이라는
+    # 개념 자체가 없었다. 그래서 (a) AI 팀은 감독이 없고, (b) 감독이
+    # 바뀌어도 팀 전술(teams.tactic_tendency)은 그대로였다. 실제로
+    # tactic_tendency 주석에도 "감독 시스템이 따로 생기기 전까지는 시즌마다
+    # 안 바뀜"이라고 적혀 있다 — 그 '따로 생기는' 시점이 지금이다.
+    #
+    # ── ①단계의 절대 조건: 경기 결과가 바뀌지 않는다 ─────────────
+    # 신민용 확정: "①에서는 경기 결과가 바뀌면 안 된다. 기존 감독 시스템이
+    # 없는 상태에서 갑자기 전술이 바뀌면 테스트 범위가 너무 커져."
+    # 그래서 이 단계에서 이 두 표는 **쓰기만 하고 아무도 읽지 않는다**.
+    # teams.tactic_tendency / teams.formation은 그대로 남아 계속 쓰이며,
+    # managers.style_attack은 그 값의 복사본일 뿐이다. ②에서 읽는 쪽을
+    # 감독으로 옮길 때 비로소 teams 쪽이 파생값이 된다.
+    #
+    # 그 조건을 지키려면 이관이 **전역 random 상태를 건드리면 안 된다** —
+    # 이 게임은 같은 시드에서 같은 결과가 나오는 것을 QA로 검증하고 있어서
+    # (tools/verify_determinism.py), 마이그레이션이 random을 한 번이라도
+    # 소비하면 그 뒤 모든 경기의 난수열이 밀린다. _migrate_managers는
+    # random.Random 인스턴스를 따로 만들어 쓴다(아래 참고).
+    #
+    # ── preferred_formations를 컬럼으로 두지 않는 이유 ────────────
+    # 신민용 판단: "DB에 preferred_formations를 JSON 같은 형태로 저장하기
+    # 보다는 감독의 성향으로부터 후보 포메이션을 계산하는 방식이 더
+    # 자연스러워." 동의한다 — 저장해두면 성향을 바꿔도 후보가 안 따라오고,
+    # 후보 목록을 조정할 때마다 11,000여 행을 전부 다시 써야 한다. ②에서
+    # (style_attack, style_buildup, style_press) → 후보 포메이션을 계산하는
+    # 순수 함수를 두고, 실제 선택은 거기에 선수단 구성·formation_fit_bonus·
+    # 상황을 더해 결정한다.
+    #
+    # ── from_player_id ────────────────────────────────────────────
+    # 지금은 항상 NULL이다. 먼 미래에 "선수 은퇴 → 감독 커리어" 기능을
+    # 만들 때 그 선수 id를 넣으면 선수 경력·국적·은퇴 시점·선수 시절
+    # 소속팀과 감독 경력이 그대로 이어진다. 지금 컬럼 한 칸만 잡아두면
+    # 그때 표를 다시 뜯을 일이 없다(신민용 찬성).
+    # ══════════════════════════════════════════════════════════════
+    c.execute("""CREATE TABLE IF NOT EXISTS managers(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT, nationality TEXT, birth_year INTEGER,
+        retired INTEGER DEFAULT 0,
+        -- 먼 미래의 "은퇴 선수 → 감독" 전환용. ①단계에선 항상 NULL.
+        from_player_id INTEGER DEFAULT NULL,
+        -- 전술 3축. style_attack은 TACTIC_TENDENCIES와 같은 척도를 쓴다
+        -- (teams.tactic_tendency를 그대로 옮겨 담는 값이라 반드시 동일 척도).
+        style_attack TEXT DEFAULT 'BALANCED',
+        style_buildup TEXT DEFAULT 'MIXED',
+        style_press TEXT DEFAULT 'MID_BLOCK',
+        -- 선수 관리 성향(기존 MANAGER_TYPES 6종) — 전술 축과 독립이다.
+        manager_type TEXT DEFAULT '뚝심형')""")
+    c.execute("""CREATE TABLE IF NOT EXISTS team_managers(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        team_id INTEGER, manager_id INTEGER,
+        start_year INTEGER, end_year INTEGER DEFAULT NULL)""")
+    # 현재 감독 조회(end_year IS NULL)가 가장 잦은 질의라 그 형태로 건다.
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_team_managers_current
+                 ON team_managers(team_id, end_year)""")
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_team_managers_manager
+                 ON team_managers(manager_id, start_year)""")
     c.execute("""CREATE TABLE IF NOT EXISTS offer_refused(
         team_id INTEGER, year INTEGER)""")
     # 마이그레이션: 컬럼 추가
@@ -2629,12 +3146,34 @@ def init_db():
         "ALTER TABLE my_player ADD COLUMN nationality4 TEXT DEFAULT ''",
         "ALTER TABLE my_player ADD COLUMN flag4 TEXT DEFAULT ''",
         "ALTER TABLE my_player ADD COLUMN intl_committed TEXT DEFAULT ''",
-        # [귀화] 같은 나라(리그)에서 누적 거주 연수 추적. 3년 채우면 그 나라
-        #  귀화 국적 획득 자격(21세 이전 + 본선 미경험 조건과 함께).
+        # [귀화] 같은 나라에서 누적 거주 연수 추적. constants.
+        #  NATURALIZE_MIN_TIER1_YEARS(기본 2)시즌을 채우면 그 나라 귀화
+        #  국적 획득 자격(21세 이전 + 본선 미경험 조건과 함께).
+        #  [2026-09 수정] 이 주석은 "3년"이라고 적혀 있었지만 실제 코드는
+        #  줄곧 2년을 봤다 — 상수로 뽑으면서 실제 값에 맞춰 바로잡았다.
         #  residency_country: 현재 거주 중인 리그의 소속 국가
-        #  residency_years:   그 나라에서 연속 채운 연수 (나라 바뀌면 리셋)
+        #  residency_years:   그 나라 **1부**에서 채운 시즌 수
+        #    (2026-09, 요청 32번 — 2부 이하 시즌은 안 세고 값을 유지하며,
+        #     나라가 바뀌면 리셋. 자세한 규칙은 game_engine.
+        #     _update_residency_and_naturalization 주석 참고)
         "ALTER TABLE my_player ADD COLUMN residency_country TEXT DEFAULT ''",
         "ALTER TABLE my_player ADD COLUMN residency_years INTEGER DEFAULT 0",
+        # [귀화 2026-09, 신민용 요청 32번: "국적 기준을 그 나라 1부 리그로
+        #  하는 게 맞다. 다만 1부 2부 팀이 왔다갔다 하니까, 팀이 2부로
+        #  강등당한 후 뛰면 그건 카운터를 안 치는 거야"]
+        #  season_played_tier: "직전 시즌에 실제로 뛴 리그의 부수".
+        #  왜 별도 컬럼이 필요한가 — 귀화 판정(_update_residency_and_
+        #  naturalization)은 연도 전환(52→1주) 때 도는데, 승강 확정
+        #  (_process_promotion_relegation)은 그보다 한참 앞선 43주차
+        #  (CLUB_SEASON_END_DAY)에 이미 끝나서 teams.league_id/current_tier와
+        #  my_player.current_tier를 **다음 시즌 값**으로 바꿔놓는다. 그래서
+        #  판정 시점에 현재 부수를 읽으면 "1부에서 한 시즌 다 뛰고 강등된
+        #  선수"가 2부로 보이고(카운트 누락), 반대로 "2부에서 뛰고 승격한
+        #  선수"는 1부로 보인다(부당 카운트). 승강이 값을 덮어쓰기 직전에
+        #  _snapshot_player_season_tier()가 여기에 찍어둔 값을 쓴다.
+        #  0 = 알 수 없음(구버전 세이브의 첫 연도 전환 / 무소속) →
+        #  그 해는 예전처럼 현재 부수로 폴백해 판정한다.
+        "ALTER TABLE my_player ADD COLUMN season_played_tier INTEGER DEFAULT 0",
         # [귀화] 이미 귀화로 획득한 국적 목록(쉼표구분) — 중복 획득 방지용
         "ALTER TABLE my_player ADD COLUMN naturalized_nats TEXT DEFAULT ''",
         # [cap-tie] A대표 '본선' 무대를 밟았는지. 본선 출전 시 1 → 국적 영구고정.
@@ -3551,7 +4090,52 @@ def init_db():
         "ALTER TABLE ai_players ADD COLUMN foot TEXT DEFAULT ''",
         "ALTER TABLE my_player ADD COLUMN foot TEXT DEFAULT ''",
         "ALTER TABLE intl_squad ADD COLUMN slot TEXT DEFAULT ''",
-    ]:
+        # [2026-09 신설 — 감독 시스템 ③단계] 구단 목표를 팀에 저장한다.
+        # 여태 my_player.club_ambition 한 칸뿐이라 "내 팀의 목표"만 존재했고,
+        # AI 팀은 목표가 없어서 경질 판정의 기준을 세울 수 없었다(같은 10위도
+        # 우승이 목표면 경질감, 잔류가 목표면 대성공이다). 매 시즌 전환 때
+        # ai_lifecycle._manager_turnover가 리그 순위로 다시 계산해 채운다.
+        "ALTER TABLE teams ADD COLUMN club_ambition TEXT DEFAULT ''",
+        # ── [2026-09 신설 — 감독 시스템 ③-b] 감독 직업 시장 ──────────
+        # 신민용 확정: "경질은 감독 이동의 한 종류일 뿐이어야 해." ③까지는
+        # 이동 사유가 경질 하나뿐이라 감독이 계속 잘리기만 하고 아무도
+        # 다른 팀으로 못 갔다(실측: 6시즌 뒤 13,320명 전원이 재임 이력 1건,
+        # 즉 두 번째 팀을 맡은 감독이 0명). 계약·상태·경력을 갖춰서
+        # 계약 종료 / 경질 / 자발적 이직 / 재계약 네 갈래로 나눈다.
+        #
+        #   contract_until : 계약 만료 연도. 이 해가 지나면 재계약 협상.
+        #   status         : 'club'(재직) / 'free'(무직) / 'retired'(은퇴).
+        #                    대표팀 감독을 넣을 때 'nation'이 여기 붙는다.
+        #   jobless_since  : 무직이 된 연도 — 장기 실직 은퇴 판정에 쓴다.
+        #   career_best_level : 지금까지 맡아본 자리 중 가장 높은 직장
+        #                    수준(0~100). "실적 점수"가 아니라 **경력**이다 —
+        #                    우승/승률 기반 명성 시스템은 ③-c로 미뤘다
+        #                    (신민용 확정: "감독 실적 시스템은 일단 뒤로").
+        #   clubs_managed  : 거쳐간 팀 수. 경력의 폭을 나타낸다.
+        "ALTER TABLE managers ADD COLUMN contract_until INTEGER DEFAULT 0",
+        "ALTER TABLE managers ADD COLUMN status TEXT DEFAULT 'club'",
+        "ALTER TABLE managers ADD COLUMN jobless_since INTEGER DEFAULT NULL",
+        "ALTER TABLE managers ADD COLUMN career_best_level REAL DEFAULT 0",
+        "ALTER TABLE managers ADD COLUMN clubs_managed INTEGER DEFAULT 0",
+        # 이탈 사유 — 커리어 화면에서 "경질/계약 만료/이적"을 구분해 보여줄
+        # 수 있어야 감독 커리어가 이야기가 된다.
+        "ALTER TABLE team_managers ADD COLUMN end_reason TEXT DEFAULT ''",
+        # [대표팀 확장 훅] 지금은 전부 'club'이다. 대표팀 감독을 넣을 때
+        # job_kind='nation' + country_id로 같은 표를 그대로 쓰면 되므로,
+        # 그때 마이그레이션을 다시 돌릴 필요가 없다(신민용 확정: "처음부터
+        # 클럽/대표팀 감독을 모두 포함하는 감독 직업 시장의 기반으로 설계").
+        "ALTER TABLE team_managers ADD COLUMN job_kind TEXT DEFAULT 'club'",
+        "ALTER TABLE team_managers ADD COLUMN country_id INTEGER DEFAULT NULL",
+    # [2026-09 신설 — ③-c] 감독 실적/명성. 정의는 파일 상단
+    # _MANAGER_REP_COLS / _TENURE_RESULT_COLS 한 곳에만 있다.
+    ] + manager_rep_migrations() + [
+    # [2026-09 신설] 연장 스코어 컬럼 10개 테이블 × 3컬럼. 위 CREATE TABLE들과
+    # 같은 정의(_ET_SCORE_COLS)에서 생성되므로 손으로 적은 ALTER와 달리
+    # "CREATE엔 넣었는데 ALTER엔 안 넣었다"가 구조적으로 불가능하다 —
+    # 파일 상단 주석 참고. lower_cup_matches도 이 목록에 포함된다(CREATE만
+    # competition/lower_cup_engine.py에 있고, 그 표는 이 루프보다 먼저
+    # init_lower_cup_tables로 만들어져 있어 ALTER가 정상 적용된다).
+    ] + et_score_migrations():
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,
         #  그 외 진짜 버그로 인한 예외는 숨기지 않는다. 동작은 기존과 동일.)
@@ -3987,6 +4571,21 @@ def init_db():
         try: c.execute(idx)
         except sqlite3.OperationalError: pass
 
+    # [2026-09 신설] 연장 스코어 컬럼이 CREATE 경로(새 DB)와 ALTER 경로(기존
+    # 세이브) 양쪽에서 실제로 같은 결과를 냈는지 확인한다. hist.* PK 불일치
+    # 때처럼 "한쪽만 반영된 상태로 몇 달 굴러가다가 터지는" 걸 막는 안전장치다
+    # — 정상이면 아무 일도 없고, 어긋났으면 그 자리에서 눈에 띈다(게임 진행을
+    # 막을 정도의 문제는 아니므로 예외가 아니라 경고 로그로 남긴다).
+    _et_missing = verify_et_score_columns(conn)
+    if _et_missing:
+        print("[WARN] 연장 스코어 컬럼 누락 — CREATE/ALTER 경로 불일치: "
+              + ", ".join(f"{_t}.{_c}" for _t, _c in _et_missing))
+    # 같은 이유로 ③-c 감독 실적/명성 컬럼도 확인한다.
+    _rep_missing = verify_manager_rep_columns(conn)
+    if _rep_missing:
+        print("[WARN] 감독 실적/명성 컬럼 누락: "
+              + ", ".join(f"{_t}.{_c}" for _t, _c in _rep_missing))
+
     conn.commit()
     if not USE_MEMORY_DB:
         # WAL 모드는 DB 파일에 영구 저장되는 설정(디스크 직결 모드에서만 의미 있음).
@@ -4008,7 +4607,13 @@ def init_db():
     # 반드시 위 두 마이그레이션 뒤에 온다 — 고아행 정리·hist 이전이 끝난
     # 뒤의 깨끗한 데이터만 옮기기 위해서다.
     _migrate_history_pk_year_first()
+    # [2026-09] hist 라인업 2표를 rowid 표 + UNIQUE(year,team_id)로 재구축
+    # (1회성) — WITHOUT ROWID 오버플로로 실데이터 대비 4배 비대해지던 문제.
+    # 반드시 위 PK 마이그레이션 뒤에 온다(그쪽이 먼저 스키마를 정리한 뒤의
+    # 상태에서 판정해야 하므로).
+    _migrate_lineup_tables_rowid()
     _migrate_history_db_split_v2()  # 파워랭킹/시즌순위 4표 main→history.db 이전 (1회성)
+    _migrate_managers()   # [2026-09] 감독 표 생성 + tactic_tendency 이관 (①단계)
     _migrate_backfill_career_years()  # career_years 컬럼 1회성 백필 (아래 참고)
     _migrate_backfill_award_kind_competition()  # 개인상 award_kind/competition 1회성 백필 (아래 참고)
     _migrate_backfill_intl_continent()   # 대륙컵 continent 컬럼 1회성 백필 (1회성, 아래 참고)
@@ -4768,12 +5373,12 @@ def _migrate_history_pk_year_first():
         # 같이 재구축한다 — _repair_future_hist_data()의 풀스캔 대상이었다.
         ("ai_player_position_history_half", "year, player_id",
          "player_id INTEGER, year INTEGER, position TEXT, role TEXT DEFAULT ''"),
-        ("team_season_lineup", "year, team_id",
-         "team_id INTEGER, year INTEGER, formation TEXT DEFAULT '', "
-         "slots_json TEXT DEFAULT '[]', bench_json TEXT DEFAULT '[]'"),
-        ("team_season_lineup_half", "year, team_id",
-         "team_id INTEGER, year INTEGER, formation TEXT DEFAULT '', "
-         "slots_json TEXT DEFAULT '[]', bench_json TEXT DEFAULT '[]'"),
+        # [2026-09 제외] team_season_lineup / team_season_lineup_half는 여기서
+        # 빼고 _migrate_lineup_tables_rowid()가 담당한다 — 이 두 표는 한 행이
+        # 1KB가 넘어서 WITHOUT ROWID로는 PK 순서를 어떻게 잡든 오버플로
+        # 페이지 때문에 파일이 4배로 비대해진다(실측 50.3MB/12.9MB). rowid
+        # 표 + UNIQUE INDEX(year, team_id)로 가면 "year 선두 인덱스"라는 이
+        # 함수의 목적도 그대로 달성된다(자세한 근거는 그 함수 주석).
     )
 
     # 이미 전부 (year, ...) 선행이면(신규 세이브 등) 조용히 플래그만 세운다.
@@ -4889,6 +5494,159 @@ def _migrate_history_pk_year_first():
         pass
     print(f"[MIGRATE-PK] 선수 이력 PK 재설계 완료 {_t_mig.perf_counter()-_t0:.2f}s "
           f"(백업 보존: {_os.path.basename(bak)} — 첫 연도전환 확인 후 삭제해도 된다)")
+
+
+def _migrate_lineup_tables_rowid():
+    """[2026-09 신설, 신민용 리포트: "game.history.db가 실제 데이터량 대비
+    4배 가까이 커진다 — hist.team_season_lineup이 WITHOUT ROWID인데 행이
+    오버플로 페이지로 넘어가서"] 실측으로 원인과 배수까지 그대로 확인됐다.
+
+    ── 실측 (신민용 실제 세이브 game.history.db, 63.9MB) ──────
+        team_season_lineup   11,397행 · 실데이터 12.9MB · 디스크 50.3MB → 3.9배
+        (이 표 하나가 history.db 전체 63.9MB의 79%를 차지)
+
+    ── 왜 4배가 되나 ─────────────────────────────────────────
+    이 표는 WITHOUT ROWID라 행이 PK 인덱스 B-tree에 직접 저장된다.
+    인덱스 B-tree의 페이지 내 최대 지역 페이로드(max_local)는
+        ((page_size-12) * 64 / 255) - 23  ≈ 1,002바이트 (4KB 페이지)
+    인데, 이 표의 한 행은 슬롯 18개 × {"slot","id","salary"} JSON이라
+    평균 1,090바이트로 그 한계를 **아주 살짝** 넘는다. 넘는 순간 SQLite는
+    지역에 min_local(≈489바이트)만 남기고 나머지 약 600바이트를 별도
+    오버플로 페이지 하나에 담는데, 그 페이지는 4,096바이트 전체를
+    차지한다(600바이트만 쓰고 3,500바이트를 버림).
+        행당 실제 점유 = 489(지역) + 4,096(오버플로 1페이지) ≈ 4.5KB
+        행당 데이터    = 1.09KB
+        → 약 4배. 정확히 리포트된 배수다.
+    일반 rowid 표(table B-tree)는 max_local이 usable-35 = 4,061바이트라
+    같은 1,090바이트 행이 오버플로 없이 리프 페이지에 그대로 들어간다.
+
+    ── 무엇을 하나 ───────────────────────────────────────────
+    team_season_lineup / team_season_lineup_half 두 표를 rowid 표로
+    재구축하고, PK가 하던 역할(조회 + INSERT OR REPLACE의 충돌 판정)을
+    UNIQUE INDEX(year, team_id)로 옮긴다.
+      - 조회는 전부 "WHERE team_id=? AND year=?" 형태라 이 인덱스를 그대로
+        탄다(실측 EXPLAIN QUERY PLAN: SEARCH ... USING INDEX (year=? AND
+        team_id=?)). 읽기 코드는 한 줄도 안 바뀐다.
+      - INSERT OR REPLACE는 UNIQUE 제약 위반으로 동작하므로 의미가 동일하다.
+      - 인덱스를 (year, team_id) 순으로 잡아서 _repair_future_hist_data()의
+        "DELETE ... WHERE year > ?"도 풀스캔이 아니게 된다(_migrate_history_
+        pk_year_first가 WITHOUT ROWID PK로 얻으려던 것과 같은 효과 —
+        그래서 그 함수의 TARGETS에서는 이 두 표를 뺐다).
+      - rowid 표는 삽입이 항상 트리 꼬리(rowid 최댓값 뒤)에 붙으므로
+        연도별 삽입 지역성도 PK(year, team_id)와 동등하거나 더 좋다.
+      - 인덱스 비용은 정수 2개짜리 35,000행 수준이라 실측 0.15MB뿐이다
+        (그 함수 주석이 "보조 인덱스는 파일을 50% 키운다"고 한 건 26만 행
+        선수 표 얘기이고, 이 표는 행 수가 두 자릿수 배 적다).
+
+    ── 실측 결과 ─────────────────────────────────────────────
+        team_season_lineup   50.3MB → 14.87MB (실데이터 12.9MB 대비 +15%)
+        history.db 전체      63.9MB → 25.6MB  (60% 감소)
+        재구축 0.8s + VACUUM 0.2s (63.9MB 파일 기준)
+    행수·양방향 EXCEPT 대조로 전 행 동일함을 확인한 뒤에만 원본을 지운다
+    (_migrate_history_pk_year_first와 같은 안전장치 + 사전 백업).
+    meta 플래그로 세이브당 1회만 돈다.
+    """
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        done = c.execute(
+            "SELECT value FROM meta WHERE key='lineup_rowid_v1'").fetchone()
+    except sqlite3.OperationalError:
+        return
+    if done and done["value"] == "1":
+        return
+
+    TABLES = ("team_season_lineup", "team_season_lineup_half")
+    COLDEF = ("team_id INTEGER, year INTEGER, formation TEXT DEFAULT '', "
+              "slots_json TEXT DEFAULT '[]', bench_json TEXT DEFAULT '[]'")
+
+    todo = []
+    for tbl in TABLES:
+        row = c.execute(
+            "SELECT sql FROM hist.sqlite_master WHERE type='table' AND name=?",
+            (tbl,)).fetchone()
+        if not row or not row["sql"]:
+            continue                      # 표 자체가 없는 세이브
+        if "WITHOUT ROWID" not in " ".join((row["sql"] or "").split()).upper():
+            continue                      # 이미 rowid 표
+        todo.append(tbl)
+    if not todo:
+        c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('lineup_rowid_v1','1')")
+        conn.commit()
+        return
+
+    import os as _os
+    import time as _t_mig
+    _t0 = _t_mig.perf_counter()
+    hist_path = _history_db_path()
+    _size0 = _os.path.getsize(hist_path) if _os.path.exists(hist_path) else 0
+
+    # ── 1. 백업 (WAL 내용까지 반영된 깨끗한 사본) ─────────────
+    bak = hist_path + ".pre_lineup_rowid.bak"
+    if _os.path.exists(bak):
+        _n = 2
+        while _os.path.exists(f"{bak}{_n}"):
+            _n += 1
+        bak = f"{bak}{_n}"
+    try:
+        c.execute("VACUUM hist INTO ?", (bak,))
+        _bak_conn = sqlite3.connect(f"file:{bak}?mode=ro", uri=True)
+        try:
+            for tbl in todo:
+                n_src = c.execute(f"SELECT COUNT(*) FROM hist.{tbl}").fetchone()[0]
+                n_bak = _bak_conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+                if n_src != n_bak:
+                    raise RuntimeError(
+                        f"백업 검증 실패: {tbl} 원본 {n_src}행 vs 백업 {n_bak}행")
+        finally:
+            _bak_conn.close()
+    except Exception as _e:
+        print(f"[MIGRATE-LINEUP] 백업 실패({_e}) — 마이그레이션을 건너뛴다"
+              f"(다음 실행에서 다시 시도)")
+        return
+
+    # ── 2. 표별 재구축 + 전 행 대조 ───────────────────────────
+    try:
+        for tbl in todo:
+            tmp = f"_lrmig_{tbl}"
+            c.execute(f"DROP TABLE IF EXISTS hist.{tmp}")
+            c.execute(f"CREATE TABLE hist.{tmp}({COLDEF})")
+            c.execute(
+                f"INSERT INTO hist.{tmp}(team_id, year, formation, slots_json, bench_json) "
+                f"SELECT team_id, year, formation, slots_json, bench_json "
+                f"FROM hist.{tbl} ORDER BY year, team_id")
+            n0 = c.execute(f"SELECT COUNT(*) FROM hist.{tbl}").fetchone()[0]
+            n1 = c.execute(f"SELECT COUNT(*) FROM hist.{tmp}").fetchone()[0]
+            d1 = c.execute(f"SELECT COUNT(*) FROM (SELECT * FROM hist.{tbl} "
+                           f"EXCEPT SELECT * FROM hist.{tmp})").fetchone()[0]
+            d2 = c.execute(f"SELECT COUNT(*) FROM (SELECT * FROM hist.{tmp} "
+                           f"EXCEPT SELECT * FROM hist.{tbl})").fetchone()[0]
+            if n0 != n1 or d1 or d2:
+                raise RuntimeError(
+                    f"{tbl} 대조 실패: {n0}행 vs {n1}행, 누락 {d1} / 추가 {d2}")
+            c.execute(f"DROP TABLE hist.{tbl}")
+            c.execute(f"ALTER TABLE hist.{tmp} RENAME TO {tbl}")
+            c.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS hist.idx_{tbl}_year_team "
+                      f"ON {tbl}(year, team_id)")
+            print(f"[MIGRATE-LINEUP] {tbl} rowid 표로 재구축 완료 ({n0:,}행, 대조 0건)")
+        conn.commit()
+    except Exception as _e:
+        conn.rollback()
+        print(f"[MIGRATE-LINEUP] 실패({_e}) — 원본 그대로 두고 중단했다"
+              f"(백업: {_os.path.basename(bak)})")
+        return
+
+    c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('lineup_rowid_v1','1')")
+    conn.commit()
+    # 오버플로 페이지가 비면서 생긴 빈 공간은 VACUUM으로만 파일에서 회수된다.
+    try:
+        conn.execute("VACUUM hist")
+    except sqlite3.OperationalError:
+        pass
+    _size1 = _os.path.getsize(hist_path) if _os.path.exists(hist_path) else 0
+    print(f"[MIGRATE-LINEUP] 완료 {_t_mig.perf_counter()-_t0:.2f}s · "
+          f"history.db {_size0/1e6:.1f}MB → {_size1/1e6:.1f}MB "
+          f"(백업 보존: {_os.path.basename(bak)} — 확인 후 삭제해도 된다)")
 
 
 def _migrate_history_db_split():
@@ -5734,6 +6492,16 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
               # 테이블을 만드는 바로 이 커밋에서 처음부터 같이 추가한다.
               "domestic_sc_tournaments","domestic_sc_entries","domestic_sc_matches","domestic_sc_history",
               "po_pending_slots","po_tournaments","po_matches","po_history",
+              # [2026-09 신설 — 감독 시스템] managers/team_managers도 반드시
+              # 같이 비운다. 위 lower_cup_*·domestic_sc_* 주석이 말하는 바로
+              # 그 패턴의 여섯 번째 재발을 막는 것 — team_id가 새 게임에서도
+              # 재사용되므로, 안 지우면 이전 세계관의 감독이 새 게임의 같은
+              # id 팀에 그대로 붙어 있는다. 더 나쁜 건 그 감독의 style_attack이
+              # 이전 월드의 tactic_tendency 사본이라, 새로 생성된 팀 성향과
+              # 어긋난 채로 경기·포메이션에 영향을 준다는 점이다(②단계부터
+              # 경기 로직이 감독을 읽는다). 비워두면 같은 init_db 안의
+              # _migrate_managers가 새 월드 기준으로 전부 다시 만든다.
+              "team_managers","managers",
               # [2026-08 버그수정, 신민용 리포트: "새 게임(2000년) 시작했는데
               # 2001년 파워랭킹이 남아있다"] power_ranking.py의 8개 테이블
               # (레이팅 원본 2개 + 연도별 스냅샷 2개 + 연속우승 카운터 2개 +
@@ -5907,6 +6675,11 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
     # "완전 새 설치" 상태로 되돌린다.
     c.execute("UPDATE teams SET momentum_type='', momentum_seasons_left=0, "
               "relegation_streak=0, stagnation_streak=0")
+    # [2026-09 신설 — 감독 시스템 ③단계] 구단 목표도 같은 이유로 되돌린다.
+    # teams row는 DELETE가 아니라 UPDATE로 재사용되므로, 안 비우면 이전
+    # 판에서 계산된 목표("우승 도전" 등)가 새 게임 첫 시즌의 감독 경질
+    # 판정 기준으로 그대로 쓰인다.
+    c.execute("UPDATE teams SET club_ambition=''")
     _reset_teams_to_league_data(c)
     _rst_mark("팀/리그 원본 복원")
     _regenerate_ai_players(c, progress_cb=progress_cb, skip_generation=skip_ai_regen)
@@ -5915,6 +6688,18 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
     _reset_club_strength(c)
     conn.commit()
     _rst_mark("포메이션/클럽전력 + commit")
+    # [2026-09 신설 — 감독 시스템] 감독을 새 월드 기준으로 다시 만든다.
+    # [순서가 중요] reset_game_data는 맨 앞에서 init_db()를 부르고 **그
+    # 뒤에** 표를 비우므로, init_db 안의 _migrate_managers는 아직 옛 감독이
+    # 남아있는 상태에서 이미 지나갔다 — 여기서 다시 부르지 않으면 새 게임이
+    # 감독 0명으로 시작해서, 다음 앱 실행 전까지 경질·포메이션 파생이 전부
+    # 폴백 경로로만 돈다. _reset_teams_to_league_data로 tactic_tendency가
+    # 새로 정해진 뒤에 불러야 그 값이 감독의 style_attack으로 옮겨간다.
+    try:
+        _migrate_managers()
+    except Exception as _e:
+        print(f"[RESET] 감독 재생성 실패(계속 진행): {_e}")
+    _rst_mark("감독 재생성")
     # season_state가 방금 통째로 지워졌으므로 get_state() 캐시도 반드시
     # 비워야 한다 — 안 그러면 새 게임 시작 직후에도 이전 플레이의 연도/
     # 주차가 캐시에 남아 화면에 계속 보이는 버그가 생긴다.
@@ -7051,6 +7836,42 @@ def get_foreign_quota_range(country, continent=None, tier=None):
     return (target, target)
 
 
+# [2026-09 신설, 신민용 리포트: "K리그는 외국인 제한이 있는데 시간을
+# 오래 돌리다 보면 외국인이 팀에 10명 넘게 있을 때도 있다"] 한 팀이
+# 보유할 수 있는 "자국 등록 전환"(quota_local_country) 인원 상한.
+#
+# ── 왜 필요한가(실측) ──────────────────────────────────────
+# 쿼터 초과분을 quota_local_country로 돌려 자국 선수로 등록하는 방식은
+# 진짜 국적을 안 건드린다는 점에서 옳았지만, 전환된 선수는 그 뒤로
+# 영원히 "외국인이 아닌" 것으로 세어진다. 그런데 이적시장의 예방 필터도
+# 같은 기준(is_quota_foreign)으로 세고 있어서, 전환이 쌓인 팀일수록
+# 외국인 칸이 계속 비어 보였고 그만큼 새 외국인을 또 받았다 — 전환과
+# 영입이 서로를 부추기는 되먹임이다. 4시즌 헤드리스 실측:
+#     쿼터 기준 초과 팀        0 / 11,397
+#     진짜 국적 기준 초과 팀   4,850 / 11,397 (42.6%)
+#     자국 등록 전환 누적      12,248명
+#     예) K리그 아미타이거 FC  외국인 10명(상한 5) — 전환 5명
+# 리포트의 "10명 넘게"가 정확히 이 경로다.
+#
+# ── 고친 방식 ─────────────────────────────────────────────
+# (1) 이적시장 예방 필터와 시즌말 사후 보정을 전부 "진짜 국적" 기준
+#     (is_roster_foreign)으로 세게 바꿔서 전환이 외국인 칸을 비워주지
+#     않게 하고, (2) 전환 자체도 팀당 이 상한까지만 허용한다. 귀화 선수가
+#     한둘 있는 건 현실적이지만 열 명은 아니다.
+FOREIGN_NATURALIZE_MAX_PER_TEAM = 2
+
+
+def is_roster_foreign(nationality, team_country):
+    """[2026-09 신설] 로스터 인원 제한용 "진짜 국적" 기준 외국인 판정 —
+    quota_local_country(자국 등록 전환)를 일부러 보지 않는다. 화면에
+    보이는 국적이 리그 나라와 다르면 외국인으로 센다(= 사용자가 스쿼드를
+    볼 때 세는 것과 같은 기준). 등록 기준 판정은 is_quota_foreign이 그대로
+    담당한다 — 둘은 용도가 다르다."""
+    if not nationality or not team_country:
+        return False
+    return nationality != team_country
+
+
 def is_quota_foreign(nationality, quota_local_country, team_country):
     """[2026-09 신설, ai_players.quota_local_country 컬럼 주석 참고] 클럽
     외국인 쿼터 기준으로 이 선수가 team_country 리그에서 "외국인 한 자리"를
@@ -7139,6 +7960,55 @@ def get_country_avg_squad_ovr(country, positions=None, min_count=8, top_n=3):
         return None
     # 포지션별 상위 top_n 평균 → 그 값들을 다시 포지션 간 평균.
     return sum(sum(g) / len(g) for g in filled) / len(filled)
+
+
+def get_country_best_xi_ovr(country, n=11, min_count=8):
+    """[2026-09 신설, 신민용 확정: "월드컵 등 국제대회도 리그처럼 선수 OVR
+    평균으로 둬야 한다고 했었는데 안 되어 있는 것 같다"] 국가대표 전력값을
+    클럽(리그)과 **완전히 같은 규칙**으로 계산한다 — game_engine._team_avg_ovr
+    이 쓰는 "이 팀 선수 중 OVR 상위 11명의 단순 평균"을 그대로 국가 단위로
+    옮긴 것이다(ORDER BY ovr DESC LIMIT 11 → AVG).
+
+    ── 왜 바꾸나 ─────────────────────────────────────────────
+    기존 get_country_avg_squad_ovr은 "포지션 11칸 × 칸마다 상위 3명 평균 →
+    칸끼리 다시 평균"이라는 완전히 다른 규칙이었다. 그래서 같은 세계 안에서
+    클럽 경기와 국가대표 경기가 서로 다른 잣대로 돌아갔고, 화면에 보이는
+    실제 소집 26인·선발 11인(get_or_create_intl_squad → intl_engine.
+    _pick_intl_starters)과 경기 계산에 쓰이는 숫자가 크게 어긋났다.
+    실측(신규 세계 시딩 직후, 실제 선발 11인 평균 vs 기존 공식값):
+        호주 93.18 vs 86.30 | 이란 92.73 vs 86.67 | 대한민국 85.73 vs 81.09
+        아르헨티나 96.00 vs 95.03 | 산마리노 58.73 vs 48.94
+    강팀일수록 오차가 작고 약팀일수록 크게 저평가돼서, "선수 OVR을 올려도
+    국가대표 경기에 반영이 안 된다"는 체감으로 이어졌다.
+
+    ── 이상치 문제는? ────────────────────────────────────────
+    2026-07에 get_country_squad_players(포지션당 1등 픽)를 평균 계산에
+    재사용했다가 "대한민국 CB 707명 중 EPL 소속 1명(OVR97) 때문에 국대
+    평균이 88.6"이 나온 적이 있는데, 그건 (1) 국적 태그가 nationality
+    (외국인 쿼터 전환으로 오염되는 컬럼)였고 (2) 포지션 11칸에 각각 1명씩만
+    반영돼 한 명의 비중이 1/11이나 됐기 때문이다. 여기서는 true_nationality
+    (진짜 국적)로만 뽑고 상위 11명 전체를 평균하므로, 특출난 1명의 비중이
+    정확히 1/11로 제한된다 — 이건 "손흥민 한 명이 국대 평균을 조금 끌어올린다"
+    는 자연스러운 결과이지 이상치 사고가 아니다(실측 재확인: 대한민국 86.27,
+    실제 선발 11인 85.73과 거의 일치).
+
+    min_count: 국적자가 이보다 적으면 None을 반환한다 — 호출부(intl_engine.
+    _get_real_squad_ovr)가 기존 3단계 폴백(get_country_avg_squad_ovr) →
+    등급 밴드 공식값 순으로 내려간다. 실측상 211개국 전부 국적자가 190명
+    이상이라 정상 세이브에서는 이 폴백이 걸리지 않는다(구세이브 안전망).
+    """
+    if not country:
+        return None
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT ovr FROM ai_players
+           WHERE true_nationality=? AND ovr IS NOT NULL
+           ORDER BY ovr DESC LIMIT ?""", (country, n)).fetchall()
+    conn.close()
+    vals = [r["ovr"] for r in rows]
+    if len(vals) < min_count:
+        return None
+    return sum(vals) / len(vals)
 
 
 def get_country_squad_players(country, positions=None, min_count=8, target_ovr=None):
@@ -7938,6 +8808,54 @@ def _init_nationality_tables():
     for cont, lst in by_cont.items():
         lst.sort(key=lambda x: x[1])   # fifa_rank 낮을수록(=강할수록) 앞
         _CONTINENT_COUNTRIES[cont] = lst
+    # [2026-09 신설, _nat_ovr_ceiling 정의부 주석 참고] 국적별 "이 나라
+    # 국적으로 이 OVR을 달고 있어도 되는가"의 기준선을 미리 표로 펼쳐둔다
+    # — 슬롯마다 get_country_grade()를 200번씩 다시 부르지 않기 위함.
+    from constants import get_country_grade
+    for name, _r in _ALL_COUNTRIES_BY_RANK:
+        _fl = _INTL_BREAKOUT_FLOOR.get(get_country_grade(name))
+        if _fl is not None:
+            _NAT_OVR_FLOOR[name] = _fl
+
+
+# [2026-09 신설, 신민용 리포트: "레알 마드리드 후보로 OVR 70 이런 애들이
+# 들어온다 / 20살이면 너무 낮다 — 유망주도 80 중반 이상이어야 명문팀에
+# 들어갈 수 있다"] 실측으로 잡은 원인은 생성 곡선이 아니라 국적이었다.
+# 새 게임 생성 직후 DB에서 명문3 빅5 팀의 90 미만 선수를 전수 조사한
+# 결과가 전부 이 패턴이었다:
+#     유벤투스 25세 CAM OVR 66 ← 통가(F등급)
+#     파리 생제르맹 25세 LB OVR 72 ← 짐바브웨(E등급)
+#     파리 생제르맹 20세 RW OVR 80 ← 우즈베키스탄(C등급)
+#     아스널 24세 RB OVR 80 ← 보스니아 헤르체고비나(C등급)
+# _generate_team_players의 생성 곡선/유스 하한은 정상적으로 88~90을
+# 지키고 있었다 — 생성이 다 끝난 직후 ai_lifecycle._enforce_intl_breakout_
+# caps(국가별 90+ 인원 상한, 신민용 요청으로 만든 장치)가 "소속 클럽은
+# 전혀 안 보고 국적만 보고" 초과분을 그 등급 기준선 아래(F면 65~69)로
+# 되돌리면서, 그 선수가 유벤투스 주전 자리에 그대로 남는 구조였다.
+#
+# 인원 상한 자체는 신민용이 확정한 설계라 그대로 둔다 — 대신 애초에
+# 그런 조합이 만들어지지 않게 "국적 배정" 단계에서 막는다. 이 슬롯이
+# 결국 도달할 성인 기준 목표 OVR이 그 나라 등급의 기준선(_INTL_BREAKOUT_
+# FLOOR: B=90 C=85 D=80 E=75 F=70) 이상이면, 그 나라는 이 슬롯의 국적
+# 후보에서 아예 빠진다. 상한이 없는 S/A 등급 국가는 어떤 슬롯에도
+# 그대로 들어갈 수 있고, 기준선보다 낮은 슬롯(하부리그 대부분 — 세계
+# 절대다수)은 필터가 통째로 무효라 기존과 100% 동일하게 동작한다.
+_NAT_OVR_FLOOR: dict = {}
+
+
+# 기준선을 넘기는 국적에 곱하는 가중치. 0(완전 배제)이 아니라 아주 작은
+# 값인 이유 — 상한은 "0명"이 아니라 "B는 5명까지, C는 3명까지"이고, 그
+# 소수의 예외(한국 국적 프리미어리그 주전 같은 경우)는 오히려 있어야 맞다.
+# 완전히 빼버리면 B~F 등급 국가는 5대리그에 단 한 명도 못 들어가게 된다.
+_NAT_OVER_CEIL_WEIGHT = 0.02
+
+
+def _nat_ceiling_penalty(nat, slot_ovr):
+    """이 국적이 이 슬롯 OVR을 감당할 수 있는지에 따른 가중치 배율."""
+    if slot_ovr is None:
+        return 1.0
+    _fl = _NAT_OVR_FLOOR.get(nat)
+    return _NAT_OVER_CEIL_WEIGHT if (_fl is not None and slot_ovr >= _fl) else 1.0
 
 
 _GRADE_TIER = {"F": 0, "E": 1, "D": 2, "C": 3, "B": 4, "A": 5, "S": 6, "SS": 7}
@@ -8037,7 +8955,7 @@ MIGRATION_TIE_BONUS = {
     ("스페인", "대한민국"): 1.3,
 }
 
-def _weighted_country_pick(candidates, dest_grade=None, dest_country=None):
+def _weighted_country_pick(candidates, dest_grade=None, dest_country=None, slot_ovr=None):
     """[(나라, fifa_rank), ...] 중 랭크가 좋을수록(숫자가 작을수록) 더 잘
     뽑히게 가중 추첨. 후보가 비어있으면 None.
 
@@ -8071,9 +8989,11 @@ def _weighted_country_pick(candidates, dest_grade=None, dest_country=None):
             gap = abs(dest_tier - cand_tier)
             level_fit = max(0.10, math.exp(-gap / 2.5))
             tie = MIGRATION_TIE_BONUS.get((dest_country, n), 1.0)
-            weights.append((1.0 / (rank + 5)) * level_fit * EXPORTER_STRENGTH.get(n, 1.0) * tie)
+            weights.append((1.0 / (rank + 5)) * level_fit * EXPORTER_STRENGTH.get(n, 1.0) * tie
+                           * _nat_ceiling_penalty(n, slot_ovr))
     else:
-        weights = [(1.0 / (rank + 5)) * EXPORTER_STRENGTH.get(n, 1.0) for n, rank in candidates]
+        weights = [(1.0 / (rank + 5)) * EXPORTER_STRENGTH.get(n, 1.0)
+                   * _nat_ceiling_penalty(n, slot_ovr) for n, rank in candidates]
     return random.choices([n for n, _ in candidates], weights=weights, k=1)[0]
 
 
@@ -8099,7 +9019,7 @@ STAR_PROB_BY_DEST_GRADE = {
 }
 
 def _pick_nationality(team_country, team_continent, grade, pos, is_star, foreign_count, quota,
-                       rank_frac=None):
+                       rank_frac=None, slot_ovr=None):
     """이 슬롯의 국적을 정한다. 반환: (nationality, new_foreign_count).
 
     [2026-09 신설] rank_frac: 이 슬롯이 스쿼드 내에서 얼마나 상위권인지
@@ -8136,7 +9056,11 @@ def _pick_nationality(team_country, team_continent, grade, pos, is_star, foreign
     # 차지하지만, 그 외 나라도 실력(랭크)에 비례한 실질적 확률을 갖는다.
     if is_star and random.random() < STAR_PROB_BY_DEST_GRADE.get(grade, 0.6):
         cand = [(n, r) for n, r in _ALL_COUNTRIES_BY_RANK if n != team_country]
-        nat = _weighted_country_pick(cand) or team_country
+        # [2026-09 신설, _nat_ceiling_penalty 정의부 주석 참고] 스타 슬롯이
+        # 특히 문제였다 — 이 분기는 dest_grade조차 안 넘기고 전세계를
+        # 순수 랭크 가중으로 뽑아서, 통가(F등급) 국적이 유벤투스 주전
+        # 자리에 배정되는 경로가 여기였다.
+        nat = _weighted_country_pick(cand, slot_ovr=slot_ovr) or team_country
         return nat, foreign_count + 1
 
     same_prob = CONTINENT_SAME_PROB.get(team_continent, 0.7)
@@ -8148,7 +9072,8 @@ def _pick_nationality(team_country, team_continent, grade, pos, is_star, foreign
         # 위주로 자연스럽게 쏠리되 목적지 등급과 너무 동떨어진 나라는 배제)
         pool = [(n, r) for cont, lst in _CONTINENT_COUNTRIES.items() if cont != team_continent
                 for n, r in lst]
-    nat = _weighted_country_pick(pool, dest_grade=grade, dest_country=team_country) or team_country
+    nat = _weighted_country_pick(pool, dest_grade=grade, dest_country=team_country,
+                                  slot_ovr=slot_ovr) or team_country
     return nat, foreign_count + 1
 
 
@@ -8468,8 +9393,33 @@ GLOBAL_PRESTIGE_STAR_CFG = {
     # _generate_team_players의 "_is_gp_star_here" 분기 참고). 헤드리스
     # 재현(각 250회 평균): 알 힐랄(레벨3) 84.0~85.9, 알 나스르/알아흘리/
     # 알 이티하드(레벨2) 82.7~84.8 — 전 구간 84~88 목표 안에 들어옴.
-    "사우디아라비아": {"wc_base": 1, "wc_bonus": 1, "el_base": 10, "el_bonus": 3,
-                    "min_level": 2, "el_offset": (1, 4), "extra_bonus": 18,
+    # [2026-09 재조정, 신민용 리포트: "28세 CAM OVR 99가 알 이티하드에서
+    # 시작한다 — OVR 최상위는 무조건 5대리그여야 하고, 97 이상은 명문3
+    # 보정을 받은 팀으로 가야 한다. 사우디는 딱 80 중후반이 맞다"]
+    # extra_bonus 18은 사우디 상한(tier_top=79)에 그대로 얹혀서
+    # 스타 슬롯 목표를 79-uniform(0,4)+(3.0|2.0+18) = 95~100으로 만들고
+    # 있었다 — 유저가 본 99가 정확히 이 식에서 나온 값이다. 그런데 팀
+    # '평균'은 84~85로 목표 안에 들어와 있었는데, 그건 _MAX_ELITE_PER_TEAM
+    # (5) 때문에 스타 슬롯이 7자리에서 끊기고 남은 주전 4자리가 일반
+    # 곡선(68~79)으로 떨어져 70대가 섞인 결과였다(실측 주전최저 69~72).
+    # 그래서 "슬롯 수를 11자리 전부로 늘리고(max_elite=10) extra_bonus를
+    # 18→7로 대폭 낮춘다"로 바꾼다 — 같은 평균을 기형 분포가 아니라
+    # 균일 분포로 재현하는 쪽이다. el_offset도 슬롯이 늘어난 만큼
+    # (1,4)→(0,3)으로 좁혀 엘리트 자리끼리의 편차를 줄였다.
+    # 헤드리스 재현(각 200회, 실제 생성 함수 그대로):
+    #   알 힐랄(레벨3, ts=1.0)  주전11평균 87.1 / 최고 90.5 / 주전최저 83.6
+    #   레벨2 빅3(ts 0.6~0.9)   주전11평균 84.5~85.4 / 최고 88.1~89.2
+    # → 기존 확정 목표(빅4 84~88) 안에 그대로 들어오면서, 최고 OVR이
+    #   96~97 → 88~90으로 내려와 "97+는 전부 5대리그"가 성립한다.
+    # wc_base/wc_bonus를 0으로 — 월드클래스 슬롯은 "리그 상한 바로 밑"
+    # (tier_top - uniform(0,4))이라 엘리트보다 편차가 크고, 사우디처럼
+    # 상한이 보너스로 끌어올려진 나라에서는 이 한 자리가 혼자 90~91까지
+    # 튀어서 "사우디는 80 중후반" 원칙을 깬다(실측: 알 힐랄 최고 91).
+    # 11자리 전부 엘리트(el_offset (0,3), 폭 3점)로 채워 균일하게 만들고,
+    # 빠진 상단만큼 extra_bonus를 7→8로 1점 보정한다.
+    "사우디아라비아": {"wc_base": 0, "wc_bonus": 0, "el_base": 11, "el_bonus": 0,
+                    "min_level": 2, "el_offset": (0, 3), "extra_bonus": 8,
+                    "max_elite": 11, "young_gap": {3: 2, 2: 3, 1: 4},
                     # decoupled_young_floor: 아래 _generate_team_players의
                     # 어린 스타 슬롯 하한 계산에서, country override의 lo
                     # 대신 이 팀 자체 상한(tier_top+prestige_bonus) 기반
@@ -8547,8 +9497,20 @@ def _star_counts(grade, team_strength, continent_bonus=0, n_slots=11, tier=1,
         if tier == 1 and prestige_level >= gp.get("min_level", 2):
             n_world = min(gp.get("wc_base", 0) + round(gp.get("wc_bonus", 0) * team_strength),
                           _MAX_WORLDCLASS_PER_TEAM)
+            # [2026-09 신설, 신민용 리포트: "97 이상이 사우디에서 시작한다 —
+            # 사우디는 딱 80 중후반이 맞다"] 엘리트 슬롯 상한을 이 표에서
+            # 나라별로 올릴 수 있게 한다(max_elite). 전역 _MAX_ELITE_PER_TEAM
+            # (=5)에 묶여 있으면 주전 11자리 중 나머지 4자리가 일반 곡선
+            # (사우디 기준 68~79)으로 떨어져서, "스타 6~7명은 90~97인데
+            # 같은 주전에 70대가 4명" 하는 기형 스쿼드가 된다 — 실제로
+            # 사우디 빅4가 정확히 그 상태였다(주전최저 실측 69~72). 슬롯
+            # 수를 11자리 전부로 늘리는 대신 extra_bonus를 크게 낮춰서,
+            # 같은 팀 평균(84~88)을 "전원 83~89"의 균일한 분포로 재현한다.
+            # 이 키가 없는 이집트/모로코/남아공/튀니지/캐나다는 종전대로
+            # _MAX_ELITE_PER_TEAM(5)이 그대로 적용돼 실측치가 안 바뀐다.
             n_elite = min(gp.get("el_base", 0) + round(gp.get("el_bonus", 0) * team_strength),
-                          _MAX_ELITE_PER_TEAM, max(0, n_slots - n_world))
+                          gp.get("max_elite", _MAX_ELITE_PER_TEAM),
+                          max(0, n_slots - n_world))
             return n_world, n_elite
         return 0, 0
     cfg = STAR_COUNT_BY_GRADE.get(grade)
@@ -9005,7 +9967,10 @@ def _topup_foreign_floor(_rows, star_kind_by_slot, team_country, team_continent,
     for i in domestic_idx[:deficit]:
         pool = [(n, r) for n, r in _CONTINENT_COUNTRIES.get(team_continent, [])
                 if n != team_country]
-        nat = _weighted_country_pick(pool) or team_country
+        # [2026-09] _nat_ceiling_penalty 정의부 주석 참고 — 이 경로로
+        # 외국인이 된 벤치 슬롯도 아래에서 target이 starter_floor까지
+        # 올라가므로, 국적 추첨도 그 OVR 기준으로 걸러야 한다.
+        nat = _weighted_country_pick(pool, slot_ovr=starter_floor) or team_country
         if nat == team_country:
             continue
         row = list(_rows[i])
@@ -9295,9 +10260,44 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
             _rank_frac = 0.0
         else:
             _rank_frac = role_indices[idx] / 10.0
+        # [2026-09 신설, database._nat_ceiling_penalty 정의부 주석 참고] 이
+        # 슬롯이 결국 도달할 "성인 기준" 목표 OVR의 하한 추정치를 국적
+        # 추첨에 같이 넘긴다 — 그 나라 등급의 브레이크아웃 기준선을
+        # 넘기는 국적은 이 슬롯 후보에서 빠진다. 추정치는 반드시 실제
+        # target의 하한이어야 한다(과하게 잡으면 멀쩡한 국적까지 배제됨):
+        #   - 스타 슬롯: _star_target_ovr가 random.uniform을 쓰므로 여기서
+        #     미리 부를 수 없다(난수 순서가 어긋남) — 그 식에서 난수/감쇠가
+        #     최대로 깎인 경우(uniform=상한, team_strength 감쇠 포함)를
+        #     그대로 계산해 하한으로 쓴다.
+        #   - 그 외: _target_ovr/_bench_target_ovr는 난수를 쓰지 않는
+        #     순수 함수라 실제 값을 그대로 쓴다.
+        # 기준선(최저 70)보다 낮은 슬롯 — 즉 세계 팀의 절대다수 — 은 어떤
+        # 나라도 걸러지지 않아 기존 동작과 완전히 동일하다.
+        if idx in star_kind_by_slot:
+            _pen = (1.0 - team_strength) * STAR_STRENGTH_PENALTY_MAX_BY_GRADE.get(
+                grade, STAR_STRENGTH_PENALTY_MAX)
+            _slot_ovr = (tier_top - (4 if star_kind_by_slot[idx] == "worldclass"
+                                      else _el_offset[1]) - _pen + _star_prestige_bonus)
+            if _elite_floor is not None:
+                _slot_ovr = max(_slot_ovr, _elite_floor)
+        elif idx >= TEAM_STARTER_COUNT:
+            _slot_ovr = _bench_target_ovr(grade, tier, team_strength,
+                                           idx - TEAM_STARTER_COUNT, continent_bonus,
+                                           prestige_bonus, team.get("cname", ""))
+        else:
+            _slot_ovr = _target_ovr(grade, tier, team_strength, role_indices[idx],
+                                     continent_bonus, prestige_bonus, team.get("cname", ""))
+            if _elite_floor is not None and tier == 1:
+                _slot_ovr = max(_slot_ovr, _elite_floor)
+        # 이 필터는 "외국인으로 뽑힐 때" 후보를 좁히는 용도뿐인데, 외국인
+        # 슬롯은 아래에서 target이 _starter_floor(이 리그 주전 최저선)
+        # 밑으로 안 내려가게 보정된다 — 그러니 외국인 기준 하한은
+        # _starter_floor다(벤치 슬롯이 특히 여기 걸린다).
+        _slot_ovr = max(_slot_ovr, _starter_floor)
         nationality, _foreign_count = _pick_nationality(
             team.get("cname", ""), continent, grade, pos,
-            idx in star_kind_by_slot, _foreign_count, _quota, rank_frac=_rank_frac)
+            idx in star_kind_by_slot, _foreign_count, _quota, rank_frac=_rank_frac,
+            slot_ovr=_slot_ovr)
         _is_foreign_slot = nationality != team.get("cname", "")
         if idx >= TEAM_STARTER_COUNT:
             # [2026-08 신설, 벤치 인원 확장] 후보(벤치) 자리 — 스타 슬롯
@@ -9396,7 +10396,15 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
                                  and _gp_here.get("decoupled_young_floor")
                                  and _plevel >= _gp_here.get("min_level", 2))
             if _is_gp_star_here:
-                _yg = {3: 6, 2: 8, 1: 10}.get(_plevel, 12)
+                # [2026-09 재조정] 이 하락폭(_yg)은 extra_bonus=18 시절에
+                # 맞춰진 값이다 — 그때는 tier_top+bonus가 97~99라 8점을
+                # 빼도 89~91이라 문제가 없었다. extra_bonus를 18→7로
+                # 낮추면서 같은 8점을 빼면 어린 스타 슬롯이 성인 목표보다
+                # 6점 아래(80)로 주저앉아 팀 평균을 4~5점 끌어내린다
+                # (실측: 빅4 주전11평균이 84~86 목표 대비 80.0~82.5).
+                # 폭 자체를 cfg에서 나라별로 지정할 수 있게 하고, 사우디는
+                # young_gap을 좁게 준다 — 표에 없는 나라는 기존 값 그대로.
+                _yg = (_gp_here.get("young_gap") or {3: 6, 2: 8, 1: 10}).get(_plevel, 12)
                 target = max(target, tier_top + _star_prestige_bonus - _yg)
                 stats = _gen_ai_stats(pos, target)
                 ovr = calc_ovr(pos, stats)
@@ -9410,7 +10418,24 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
                 # 태어날 수 있다(특히 이 분기처럼 ovr 자체가 높게 잡히는
                 # 스타 슬롯에서 흔함) — "잠재력이 지금 실력보다 낮다"는
                 # 모순이므로, 최소한 지금 ovr만큼은 항상 보장한다.
-                potential_ovr = max(ovr, roll_potential_ovr(_team_growth_cap, star_kind_by_slot[idx]))
+                # [2026-09 신설, 신민용 리포트 23번: "S급 리그 1부 평균
+                # OVR가 진행될수록 88대까지 내려간다"] 헤드리스 6시즌
+                # 실측으로 잡은 원인 중 하나 — 이 슬롯의 성인 기준 목표
+                # (_adult_target_ovr)보다 potential_ovr이 낮게 뽑히면,
+                # 그 선수는 "설계상 도달해야 할 수준"에조차 영원히 못
+                # 간다. 스타가 아닌 슬롯(벤치 7자리 + 비스타 주전)은
+                # roll_potential_ovr(kind=None)이 team_cap-randint(12,25)
+                # 라, 레알(team_cap 99) 유스는 74~87이 뽑히고 max(ovr,...)
+                # 로 결국 "태어난 OVR 그대로"에 고정된다 — 즉 명문팀
+                # 유스 파이프라인이 통째로 죽어 있었다(실측: 빅5 1부
+                # 18~22세 평균 OVR 87, 평균 잠재 89로 2점 차 — 사실상
+                # 성장 여지 없음). 세계 생성 당시의 스타(96~99)가 은퇴한
+                # 자리를 90짜리가 영구히 채우니 96+ 인구가 168명 → 69명
+                # 으로 무너진다. 적어도 자기 설계 목표까지는 클 수 있게
+                # 바닥을 걸어준다 — 성인(26세 이상)은 _adult_target_ovr이
+                # 곧 지금 target이라 기존과 사실상 동일하다.
+                potential_ovr = max(ovr, int(round(_adult_target_ovr)),
+                                    roll_potential_ovr(_team_growth_cap, star_kind_by_slot[idx]))
                 # [2026-09 재배치] nationality는 이제 루프 맨 위에서 이미
                 # 정해져 있다(_is_foreign_slot 정의부 주석 참고) — 여기서
                 # 다시 뽑으면 같은 슬롯에 난수를 두 번 소비하고 결과가
@@ -9476,7 +10501,9 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
         # 이유로 max(ovr, ...) 클램프 — "잠재력이 지금 실력보다 낮다"는
         # 모순을 막는다(어린 선수는 나이 스케일링으로 ovr이 이미 낮아서
         # 이 클램프가 거의 안 걸린다 — 주로 성인 선수에서만 의미 있음).
-        potential_ovr = max(ovr, roll_potential_ovr(_team_growth_cap, star_kind_by_slot.get(idx)))
+        # [2026-09] 위 스타 슬롯 분기와 동일 — _adult_target_ovr 바닥.
+        potential_ovr = max(ovr, int(round(_adult_target_ovr)),
+                            roll_potential_ovr(_team_growth_cap, star_kind_by_slot.get(idx)))
         # [2026-09 재배치] nationality는 루프 맨 위에서 이미 정해져 있다
         # (_is_foreign_slot 정의부 주석 참고) — 그대로 재사용.
         _rows.append((team["tid"],name,pos,

@@ -129,13 +129,24 @@ def _get_real_squad_ovr(country):
 
     [2026-09 캐시 추가] 위 주석 참고 — country당 세션 1회만 실제 쿼리하고
     이후엔 캐시를 반환한다(min_count=8 고정 호출만 캐시 대상 — 이 함수의
-    유일한 호출 형태)."""
+    유일한 호출 형태).
+
+    [2026-09 재설계, 신민용 확정: "월드컵 등 국제대회도 리그처럼 선수 OVR
+    평균으로 둬야 한다"] 1순위를 database.get_country_best_xi_ovr(클럽
+    _team_avg_ovr과 완전히 같은 "OVR 상위 11명 단순 평균" 규칙)로 바꾼다 —
+    그 함수 정의부 주석에 바꾼 이유와 실측 비교표가 있다. 기존
+    get_country_avg_squad_ovr(포지션당 상위 3명 평균)은 국적자가 11명도
+    안 되는 극단적인 경우(구세이브 등)에만 쓰이는 2순위 폴백으로 내린다 —
+    그 함수의 3단계 폴백(자국리그/해외 하위리그)이 필요한 상황이 정확히
+    그 경우이기 때문이다."""
     if not country:
         return None
     if country in _real_squad_ovr_cache:
         return _real_squad_ovr_cache[country]
-    from database import get_country_avg_squad_ovr
-    val = get_country_avg_squad_ovr(country, min_count=8)
+    from database import get_country_best_xi_ovr, get_country_avg_squad_ovr
+    val = get_country_best_xi_ovr(country, min_count=8)
+    if val is None:
+        val = get_country_avg_squad_ovr(country, min_count=8)
     _real_squad_ovr_cache[country] = val
     return val
 
@@ -396,12 +407,21 @@ def _my_continent_key(p):
     return _conf_key(row["continent"])
 
 
-def get_my_tournament(year=None, qual=None):
+def get_my_tournament(year=None, qual=None, kinds=None):
     """[복수대륙컵] '내가 실제로 출전 중/표시 대상'인 대회 1개를 선별 반환.
 
     qual=None  : 본선/예선 구분 없이 (기존 호환)
     qual=False : 본선 대회만 (world/continent)
     qual=True  : 예선 대회만 (wc_qual)
+
+    kinds: [2026-09 신설, 신민용 리포트: "랭킹 평가전은 경기 일정에 안
+        뜬다"] 대회 kind를 직접 지정하면 qual 분기 대신 이 목록으로만
+        거른다. 아래 두 화이트리스트(qual=True/False)는 kind가 하나씩
+        늘 때마다 빠뜨려서 탭이 통째로 사라지는 사고가 이미 세 번
+        반복됐다(cont_qual 누락 → 유로 예선 안 뜸, region 누락 → 국제대회
+        탭 자체가 안 뜸, 그리고 이번 power_eval 누락 → 랭킹 평가전 안 뜸).
+        호출부가 "이 대회 종류를 보여달라"고 직접 말할 수 있게 해서, 새
+        대회를 추가할 때 이 함수를 고치지 않아도 되게 한다.
 
     우선순위:
       1) my_selected==1 (출전 확정) 대회
@@ -425,7 +445,9 @@ def get_my_tournament(year=None, qual=None):
     # 함수를 거쳐 "국제대회(예선)" 탭을 만드는데, 유로 예선이 있는
     # 해(2001, 2005, 2009...)엔 이 필터가 빈 리스트를 반환해서 None이
     # 되고 탭 자체가 생성되지 않았다.
-    if qual is True:
+    if kinds is not None:
+        ts = [t for t in ts if t.get("kind") in kinds]
+    elif qual is True:
         ts = [t for t in ts if t.get("kind") in ("wc_qual", "cont_qual")]
     elif qual is False:
         # [2026-08 버그수정, 신민용 리포트: "경기 일정 창에 국제대회 탭
@@ -3627,9 +3649,25 @@ def _match_outcome(h_ovr, a_ovr, knockout, neutral=False):
     중간 격차(diff 5~15)에서만 훨씬 더 확실하게 강팀 쪽으로 쏠리도록
     기울기를 0.022 → 0.0325로 올린다(diff=33은 0.0325로도 어차피 그대로
     0.95 클램프라 기존 재조정 사례엔 영향 없음 — diff=6.5 기준 favorite
-    승률 약 55%→65%, 언더독 약 27%→18%로 변화)."""
+    승률 약 55%→65%, 언더독 약 27%→18%로 변화).
+
+    [2026-09 재보정, 국가대표 OVR을 "리그와 같은 규칙"(OVR 상위 11명 평균,
+    database.get_country_best_xi_ovr)으로 바꾼 데 따른 후속 조정] 전력값의
+    스케일 자체가 바뀌면 같은 계수라도 승률이 달라진다 — 기존 공식(포지션당
+    상위 3명 평균)은 약팀을 더 크게 저평가해서 강팀-약팀 격차가 실제보다
+    부풀려져 있었다. 신규 세계 실측으로 두 스케일의 격차를 회귀한 결과,
+    월드컵 본선급 32개국 496쌍 기준 평균 격차가 5.12 → 3.72(기울기 0.7197)로
+    줄었다(전 세계 211개국 22,155쌍 기준으로는 18.52 → 16.68, 기울기 0.8886
+    — 예선처럼 격차가 큰 매치업은 어차피 0.95 클램프라 계수 영향이 없다).
+    그래서 본선급 기울기로 나눠 0.0325 / 0.7197 ≈ 0.0452로 올려, 이 재설계
+    전에 신민용이 맞춰둔 승률(예: 브라질 vs 대한민국 강팀승 약 86%)을 그대로
+    유지한다. 실측 대조는 아래 확인:
+        브라질 vs 대한민국  기존 diff +13.18 → 신규 +10.00
+        아르헨티나 vs 파나마 기존 +11.24 → 신규 +8.73
+        대한민국 vs 괌      기존 +37.03 → 신규 +33.45 (양쪽 다 클램프 구간)
+    """
     diff = h_ovr - a_ovr
-    _DIFF_COEF = 0.0325
+    _DIFF_COEF = 0.0452
     if neutral:
         dw = max(0.05, 0.24 - abs(diff) * 0.009)
         half = max(0.0, 1.0 - dw) / 2.0
@@ -3993,6 +4031,30 @@ def _intl_tactical_lineup(tournament_id, country, avg_ovr):
     return lineup, formation
 
 
+def _intl_bench(lineup, tournament_id, country, avg_ovr=50, size=10):
+    """[2026-09 신설] 국가대표 교체 후보 — 26인 소집 명단에서 선발 11명을
+    뺀 나머지를 OVR 순으로. 클럽의 match_flow.select_bench와 같은 역할이며,
+    국가대표는 명단 자체가 이미 "그 경기 소집 인원"이므로 벤치 크기를 좀
+    더 넉넉히 둔다(실제 A매치 벤치도 12명 수준). 명단 조회가 실패하면 빈
+    리스트 → 교체 없이 예전과 동일하게 동작한다."""
+    try:
+        from database import get_or_create_intl_squad
+        pool = get_or_create_intl_squad(tournament_id, country, avg_ovr,
+                                        _INTL_MATCHDAY_FULL_POS)
+    except Exception:
+        return []
+    if not pool:
+        return []
+    used = {p.get("id") for p in (lineup or []) if p and p.get("id") is not None}
+    rest = [dict(r) for r in pool if r["id"] not in used]
+    gks = sorted((p for p in rest if p.get("position") == "GK"),
+                 key=lambda p: -(p.get("ovr") or 0))
+    others = sorted((p for p in rest if p.get("position") != "GK"),
+                    key=lambda p: -(p.get("ovr") or 0))
+    bench = gks[:1] + others[:max(0, size - 1)]
+    return bench
+
+
 def _sim_ai_match(t, m, my_played=False, conn=None, reason="injury", batch=None):
     """AI끼리(또는 내가 결장한 내 경기) 시뮬.
 
@@ -4262,6 +4324,10 @@ def simulate_my_match(week, p, day=None):
     engine_stats = None
     engine_plog = None
     player_ratings = None
+    # [2026-09 신설] 정규시간 스코어 / 연장 진입 여부 / 교체 기록.
+    hs90 = as90 = None
+    went_et = False
+    _subs = {"home": [], "away": []}
     try:
         from match_sim.tactical_engine import simulate_tactical_match
         home_lineup, home_formation = _intl_tactical_lineup(t["id"], m["home"], he["ovr"])
@@ -4279,8 +4345,17 @@ def simulate_my_match(week, p, day=None):
             home_boost_position=(my_position if is_home else None),
             away_boost_position=(my_position if not is_home else None),
             home_adv=0.0,
-            home_formation=home_formation, away_formation=away_formation)
+            home_formation=home_formation, away_formation=away_formation,
+            # [2026-09] 국가대표는 26인 소집 명단이 그대로 벤치 풀이다 —
+            # 선발 11명을 뺀 나머지를 교체 후보로 넘긴다. 연장은 녹아웃
+            # 단계에서만(조별리그/예선 조별리그는 무승부 허용).
+            home_bench=_intl_bench(home_lineup, t["id"], m["home"], he["ovr"]),
+            away_bench=_intl_bench(away_lineup, t["id"], m["away"], ae["ovr"]),
+            extra_time=bool(knockout))
         hs, as_ = sim["home_score"], sim["away_score"]
+        hs90, as90 = sim.get("home_score_90", hs), sim.get("away_score_90", as_)
+        went_et = bool(sim.get("went_extra_time"))
+        _subs = {"home": sim.get("home_subs") or [], "away": sim.get("away_subs") or []}
         engine_stats = {"home": sim["home_stats"], "away": sim["away_stats"]}
         engine_plog = sim["possession_log"]
         player_ratings = {"home": sim.get("home_player_ratings") or [],
@@ -4327,37 +4402,29 @@ def simulate_my_match(week, p, day=None):
     # [2026-08 신설, 신민용 요청] champions_engine과 동일한 "나" 슬롯
     # 바꿔치기 — 26인 소집 명단엔 "나"가 없으므로(따로 my_player 관리)
     # 포지션이 같은 슬롯을 찾아 방금 계산된 내 실제 기록으로 덮어쓴다.
-    if player_ratings is not None:
-        _side_key = "home" if is_home else "away"
-        _my_list = player_ratings.get(_side_key)
-        if _my_list:
-            _labels = [r.get("position") if r else None for r in _my_list]
-            _idx = None
-            for _i, _lab in enumerate(_labels):
-                if _lab == my_position:
-                    _idx = _i; break
-            if _idx is None:
-                from constants import POSITION_COMPAT
-                for _want in POSITION_COMPAT.get(my_position, [my_position]):
-                    for _i, _lab in enumerate(_labels):
-                        if _lab == _want:
-                            _idx = _i; break
-                    if _idx is not None:
-                        break
-            if _idx is None:
-                for _i, _lab in enumerate(_labels):
-                    if _lab is not None and _lab != "GK":
-                        _idx = _i; break
-            if _idx is not None:
-                _my_list[_idx] = {
-                    "id": None, "name": p.get("name") or "나",
-                    "position": _labels[_idx], "ovr": p.get("ovr", 40),
-                    "goals": goals, "assists": assists,
-                    "shots": detail.get("shots", 0),
-                    "shots_on": detail.get("shots_on", 0),
-                    "saves": saves, "is_gk": (my_position == "GK"),
-                    "rating": rating, "is_me": True,
-                }
+    # [2026-09 버그수정, 신민용 리포트: "2대0인데 골이 3개 어시가 3개"]
+    # 이제 슬롯 치환 직후 "팀 골 합계 == 실제 스코어"를 복원하는 공용
+    # 헬퍼(competition_common.merge_my_slot)로 전 대회를 통일했다 — 자세한
+    # 원인/불변식은 그 함수 주석 참고.
+    # [2026-09 신설, 신민용 리포트: "경기 상세에서 나만 뜨는 것 같은데
+    # 다른 선수들이 골 넣어도 다 뜨게 해줘"] 내가 관여 안 한 우리 팀 득점을
+    # 실제 득점자 이름과 함께 타임라인에 채운다. 반드시 merge_my_slot
+    # **이전에** 불러야 한다 — 이유는 augment_team_goal_events 주석 참고.
+    from competition.competition_common import (merge_my_slot,
+                                                augment_team_goal_events)
+    events = augment_team_goal_events(
+        p, is_home, hs, as_, goals, assists, not (_suspended or _benched),
+        events, engine_plog, player_ratings)
+    _side_key, _idx = merge_my_slot(
+        player_ratings, is_home, my_position,
+        {"id": None, "name": p.get("name") or "나",
+         "position": None, "ovr": p.get("ovr", 40),
+         "goals": goals, "assists": assists,
+         "shots": detail.get("shots", 0),
+         "shots_on": detail.get("shots_on", 0),
+         "saves": saves, "is_gk": (my_position == "GK"),
+         "rating": rating, "is_me": True},
+        hs, as_)
 
     my_result = _my_result(outcome, is_home)
     my_conceded = (as_ if is_home else hs)
@@ -4369,7 +4436,12 @@ def simulate_my_match(week, p, day=None):
     day = m.get("day")
 
     conn = get_conn()
-    conn.execute("""UPDATE intl_matches SET home_score=?, away_score=?,
+    # [2026-09 신설] 기록실용 90분 스코어 — database.py _ET_SCORE_COLS 참고.
+    # 국제대회는 녹아웃에서만 연장이 있으므로(extra_time=bool(knockout)),
+    # 조별리그·예선은 자연스럽게 went_extra_time=0으로 남는다.
+    from database import ET_SCORE_SET_SQL, et_score_values
+    conn.execute(f"""UPDATE intl_matches SET home_score=?, away_score=?,
+                    {ET_SCORE_SET_SQL},
                     pso_winner=?, pso_score=?,
                     my_played=?, my_nat=?, my_position=?,
                     my_saves=?, my_goals=?, my_assists=?, my_rating=?,
@@ -4377,7 +4449,8 @@ def simulate_my_match(week, p, day=None):
                     my_dribbles=?, my_blocks=?, my_pass_acc=?, my_conceded=?,
                     day=?, my_absence_reason=?, my_yellow_cards=?
                     WHERE id=?""",
-                 (hs, as_, pso_winner, pso_score,
+                 (hs, as_, *et_score_values(hs90, as90, went_et),
+                  pso_winner, pso_score,
                   0 if (_suspended or _benched) else 1, nat, _get_field_pos(p),
                   saves, goals, assists, rating,
                   detail["shots"], detail["shots_on"], detail["key_passes"],
@@ -4444,7 +4517,9 @@ def simulate_my_match(week, p, day=None):
         p, week, comp_name, is_home, home_disp, away_disp,
         hs, as_, my_result, goals, assists, saves, rating,
         events, not (_suspended or _benched), _benched, detail, pso=pso,
-        engine_stats=engine_stats, engine_plog=engine_plog, player_ratings=player_ratings)
+        engine_stats=engine_stats, engine_plog=engine_plog, player_ratings=player_ratings,
+        match_extra={"score_90": ([hs90, as90] if hs90 is not None else [hs, as_]),
+                     "went_extra_time": went_et, "subs": _subs})
     marker = f" [match:{detail_id}:intl]" if detail_id else ""
 
     add_log("─" * 44, "sep")

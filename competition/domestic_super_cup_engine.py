@@ -55,7 +55,7 @@ from database import get_conn
 from constants import week_to_day, FIRST_HALF_START
 from competition.competition_common import (
     CompetitionConfig, entry, clear_entry_cache, winner_of,
-    league_day_map, pick_free_day,
+    league_day_map, pick_free_day, bump_match_day_generation,
 )
 
 DOMESTIC_SC_WEEK = FIRST_HALF_START   # 4주차 — 국내리그가 시작하는 그 주
@@ -530,6 +530,9 @@ def _build_domestic_sc(year, country_id):
                  VALUES(?,'F',?,?,?,?,?,?)""",
               (tid, DOMESTIC_SC_WEEK, day, home_id, away_id,
                my_in, my_tid if my_in else 0))
+    # [2026-09 신설] 경기일이 새로 생겼으니 _week_intl_cl_day 캐시 무효화
+    # (competition_common.match_day_generation 주석 참고).
+    bump_match_day_generation()
     conn.commit()
     conn.close()
     clear_entry_cache()
@@ -669,6 +672,7 @@ def start_all_domestic_super_cups(year, season):
                 created_logs.append((tid, name, home_id, away_id))
         except Exception as e:
             print(f"국내 슈퍼컵 생성 오류(country_id={cid}, 건너뜀):", e)
+    bump_match_day_generation()   # [2026-09] 위와 동일
     conn.commit()
     conn.close()
     clear_entry_cache()
@@ -941,8 +945,63 @@ def simulate_my_domestic_sc_match(week, p, day=None):
     h_ovr = he["ovr"] + (bonus if is_home else 0)
     a_ovr = ae["ovr"] + (0 if is_home else bonus)
 
-    outcome = _neutral_match_outcome(h_ovr, a_ovr)
-    hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
+    # ══════════════════════════════════════════════════════════════
+    # [2026-09 재설계, 신민용 지적: "국내슈퍼컵 → player_ratings 없음.
+    # 다른 대회와 동일하게 경기 선수 평점 데이터를 생성하도록 맞춘다"]
+    #
+    # 이 함수는 원래 위 docstring대로 "전술엔진 시도 없이 _player_perf
+    # 폴백 경로만" 썼다 — 그래서 22명 평점·교체·연장이 전부 없었고,
+    # match_detail_dialog가 라인업+평점 섹션을 자동 생략했다(국내 슈퍼컵만
+    # 경기 상세가 비어 보이는 원인). 이제 cup_engine.simulate_my_cup_match와
+    # 완전히 같은 구조(전술엔진 시도 → 예외 시 기존 폴백)로 맞춘다.
+    #
+    # 국내 슈퍼컵 고유 조건 두 가지만 다르다:
+    #   · 중립 구장 — _neutral_match_outcome/_neutral_resolve_pso를 쓰는
+    #     대회이므로 전술엔진에도 home_adv=0.0을 넘긴다.
+    #   · 매년 단판 결승 하나뿐 — 무승부면 연장(extra_time=True) 후에도
+    #     동점이면 승부차기. 기존 동작(무승부 → 즉시 승부차기)에 연장
+    #     15+15가 끼어드는 셈이라, 이건 단판 KO 대회(국내컵/챔스 KO)와
+    #     같은 규칙으로 통일되는 방향이다.
+    # ══════════════════════════════════════════════════════════════
+    my_position = p.get("position", "")
+    engine_stats = None
+    engine_plog = None
+    player_ratings = None
+    # 정규시간 스코어(연장 결과로 덮어쓰지 않는다) / 연장 진입 여부 / 교체 기록.
+    # 전술엔진이 예외로 폴백하면 그대로 None/False로 남고, 경기 상세·기록실은
+    # 예전과 똑같이 최종 스코어만 보여준다(database.py _ET_SCORE_COLS 참고).
+    hs90 = as90 = None
+    went_et = False
+    _subs = {"home": [], "away": []}
+    try:
+        from match_sim.tactical_engine import simulate_my_match as _sim_tactical
+        from game_engine import _team_formation
+        _fconn = get_conn()
+        _c = _fconn.cursor()
+        home_formation = _team_formation(_c, m["home_team_id"])
+        away_formation = _team_formation(_c, m["away_team_id"])
+        _fconn.close()
+        sim = _sim_tactical(
+            m["home_team_id"], m["away_team_id"], home_formation, away_formation,
+            home_boost=(bonus if is_home else 0.0),
+            away_boost=(bonus if not is_home else 0.0),
+            home_boost_position=(my_position if is_home else None),
+            away_boost_position=(my_position if not is_home else None),
+            home_adv=0.0,
+            extra_time=True)
+        hs, as_ = sim["home_score"], sim["away_score"]
+        hs90, as90 = sim.get("home_score_90", hs), sim.get("away_score_90", as_)
+        went_et = bool(sim.get("went_extra_time"))
+        _subs = {"home": sim.get("home_subs") or [], "away": sim.get("away_subs") or []}
+        engine_stats = {"home": sim["home_stats"], "away": sim["away_stats"]}
+        engine_plog = sim["possession_log"]
+        player_ratings = {"home": sim.get("home_player_ratings") or [],
+                          "away": sim.get("away_player_ratings") or []}
+        outcome = "draw" if hs == as_ else ("home" if hs > as_ else "away")
+    except Exception:
+        outcome = _neutral_match_outcome(h_ovr, a_ovr)
+        hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
+
     pso_winner, pso_score = 0, ""
     if outcome == "draw":
         win_home, pso_score = _neutral_resolve_pso(h_ovr, a_ovr)
@@ -970,6 +1029,31 @@ def simulate_my_domestic_sc_match(week, p, day=None):
         elif _yellow_ev:
             events = list(events) + _yellow_ev
 
+    # [2026-09 신설] "나" 슬롯 바꿔치기 — 전술엔진 로스터엔 "나"가 없으므로
+    # 포지션이 같은 슬롯을 방금 계산된 내 실제 기록으로 덮어쓴다. 치환 직후
+    # "팀 골 합계 == 실제 스코어"를 복원하는 것까지 공용 헬퍼가 담당한다
+    # (신민용 리포트 "2대0인데 골이 3개 어시가 3개"의 재발 방지 — 자세한
+    # 불변식은 competition_common.merge_my_slot 주석 참고). player_ratings가
+    # None인 폴백 경로에서는 헬퍼가 그대로 no-op이라 예전 동작과 같다.
+    # [2026-09 신설, 신민용 리포트: "다른 선수들이 골 넣어도 다 뜨게 해줘"]
+    # 내가 관여 안 한 우리 팀 득점을 실제 득점자 이름과 함께 타임라인에
+    # 채운다. 반드시 merge_my_slot 이전 — augment_team_goal_events 주석 참고.
+    from competition.competition_common import (merge_my_slot,
+                                                augment_team_goal_events)
+    events = augment_team_goal_events(
+        p, is_home, hs, as_, goals, assists, not (_suspended or _benched),
+        events, engine_plog, player_ratings)
+    merge_my_slot(
+        player_ratings, is_home, my_position,
+        {"id": None, "name": p.get("name") or "나",
+         "position": None, "ovr": p.get("ovr", 40),
+         "goals": goals, "assists": assists,
+         "shots": detail.get("shots", 0),
+         "shots_on": detail.get("shots_on", 0),
+         "saves": saves, "is_gk": (my_position == "GK"),
+         "rating": rating, "is_me": True},
+        hs, as_)
+
     my_result = _my_result(outcome, is_home)
     my_conceded = (as_ if is_home else hs)
 
@@ -977,14 +1061,18 @@ def simulate_my_domestic_sc_match(week, p, day=None):
         day = _week_intl_cl_day(week, p)
 
     conn = get_conn()
-    conn.execute("""UPDATE domestic_sc_matches SET home_score=?, away_score=?,
+    # [2026-09 신설] 기록실용 90분 스코어 — database.py _ET_SCORE_COLS 참고.
+    from database import ET_SCORE_SET_SQL, et_score_values
+    conn.execute(f"""UPDATE domestic_sc_matches SET home_score=?, away_score=?,
+                    {ET_SCORE_SET_SQL},
                     pso_winner=?, pso_score=?, my_played=?,
                     my_saves=?, my_goals=?, my_assists=?, my_rating=?,
                     my_shots=?, my_shots_on=?, my_key_passes=?,
                     my_dribbles=?, my_blocks=?, my_pass_acc=?, my_conceded=?,
                     my_absence_reason=?, my_yellow_cards=?
                     WHERE id=?""",
-                 (hs, as_, pso_winner, pso_score, 0 if (_suspended or _benched) else 1,
+                 (hs, as_, *et_score_values(hs90, as90, went_et),
+                  pso_winner, pso_score, 0 if (_suspended or _benched) else 1,
                   saves, goals, assists, rating,
                   detail["shots"], detail["shots_on"], detail["key_passes"],
                   detail["dribbles"], detail["blocks"], detail["pass_acc"], my_conceded,
@@ -1013,10 +1101,16 @@ def simulate_my_domestic_sc_match(week, p, day=None):
     home_disp = he["team_name"]
     away_disp = ae["team_name"]
     pso = {"won": pso_winner == my_tid, "score": pso_score} if pso_winner else None
+    # [2026-09 신설] 22명 라인업/평점·포제션·교체·정규시간 스코어를 경기
+    # 상세에 같이 넘긴다 — 여태 이 4개를 안 넘겨서 국내 슈퍼컵만 경기
+    # 상세에 라인업+평점 섹션이 통째로 안 떴다(다른 대회는 전부 넘긴다).
     detail_id = _save_match_detail(
         p, week, comp_name, is_home, home_disp, away_disp,
         hs, as_, my_result, goals, assists, saves, rating,
-        events, not (_suspended or _benched), _benched, detail, pso=pso)
+        events, not (_suspended or _benched), _benched, detail, pso=pso,
+        engine_stats=engine_stats, engine_plog=engine_plog, player_ratings=player_ratings,
+        match_extra={"score_90": ([hs90, as90] if hs90 is not None else [hs, as_]),
+                     "went_extra_time": went_et, "subs": _subs})
     marker = f" [match:{detail_id}:domestic_sc]" if detail_id else ""
 
     add_log("─" * 44, "sep")

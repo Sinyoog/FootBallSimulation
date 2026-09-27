@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
     QHeaderView, QPushButton, QTabWidget, QWidget, QSplitter, QFrame,
     QAbstractItemView, QScrollArea, QGridLayout, QSizePolicy,
     QStyledItemDelegate, QStyle, QMenu, QMessageBox, QSpinBox, QCompleter,
-    QButtonGroup, QStackedWidget
+    QButtonGroup, QStackedWidget, QLayout
 )
 from PyQt6.QtCore import Qt, QTimer, QRect, QSize
 from PyQt6.QtGui import (QColor, QFont, QFontMetrics, QGuiApplication, QPainter,
@@ -40,6 +40,10 @@ import power_ranking as pr
 from ui.formation_widget import (
     _row_key, _row_priority, _pos_x_order, _pos_color, open_bulk_rename_dialog,
     open_ovr_edit_dialog, open_nationality_edit_dialog)
+# [2026-09 신설, 신민용 리포트 26번] 피치 행(밴드) 계산은 포메이션 이름에서
+# 파생돼야 하므로(라벨 기준으론 4-2-3-1과 4-3-3의 LW/RW를 구분할 수 없다)
+# Qt 의존성 없는 공용 모듈의 함수를 쓴다 — formation_row_bands 주석 참고.
+from formation_logic import formation_row_bands
 
 # [2026-08 신설, 신민용 리포트: "복사하면 국기/국가/부수까지 같이 복사된다,
 # 팀명만 복사되게 해달라"] 셀 화면 텍스트("🇺🇸 토론토 FC (미국)", "보루시아
@@ -47,6 +51,13 @@ from ui.formation_widget import (
 # 저장하기 위한 전용 데이터 롤. 기존에 이미 UserRole(연도/시즌, team_id 등)을
 # 여러 곳에서 쓰고 있어서 충돌을 피하려고 +50 오프셋을 둔다.
 _CLEAN_TEXT_ROLE = Qt.ItemDataRole.UserRole + 50
+# [2026-09 신설, 신민용 리포트 1번: "팀 검색에서 선수 변경하면 우측에 구단
+# 사용 금액에 표시된 선수도 바로 변경되어야 하는데 이것도 안 되어 있고"]
+# 재정 패널(_build_team_finance_panel)의 "선수 이름" 행에 그 선수 id를
+# 심어두는 롤 — 이름을 바꿨을 때 패널을 통째로 다시 만들지 않고(그러면
+# 그 팀 재정 집계를 다시 조회하게 된다) 그 셀 하나만 새 이름으로 고쳐
+# 쓰기 위한 것이다. 기존 롤들과 겹치지 않게 +51을 쓴다.
+_FIN_NAME_PID_ROLE = Qt.ItemDataRole.UserRole + 51
 # [2026-08 신설, 최적화] 선수 검색 목록의 각 줄이 어떤 검색 결과
 # (dict)에서 만들어졌는지 그대로 보관하는 롤 — 이름만 바뀐 경우
 # 목록 전체를 다시 조회하지 않고 그 줄만 다시 그리기 위해 쓴다.
@@ -119,7 +130,42 @@ def _enable_plain_copy(tbl):
     return _copy_selected
 
 
-def _calc_static_pitch_positions(slots, w, h):
+def _make_filter_reset_button(on_click, parent=None):
+    """[2026-09 신설, 신민용 요청 43번: "선수 검색 우측에 있는 필터 초기화
+    버튼을 팀 검색·국가 검색·리그 검색 등에도 만들려고 해"] 선수 검색의
+    player_filter_reset_btn과 **완전히 같은 모양**(문구/스타일/포커스 정책)을
+    쓰도록 버튼 생성을 한 곳으로 모은다 — 탭마다 스타일 문자열을 복붙하면
+    나중에 한쪽만 바뀌어 톤이 어긋나기 쉽다.
+
+    setAutoDefault/setDefault(False)는 원본 그대로 유지한다: 이 창엔
+    QLineEdit가 있어서, 기본 버튼으로 잡히면 검색창에서 엔터를 칠 때마다
+    필터가 초기화돼버린다."""
+    btn = QPushButton("🔄 필터 초기화", parent)
+    btn.setAutoDefault(False)
+    btn.setDefault(False)
+    btn.setStyleSheet(
+        "QPushButton{background:#2a2a2a;color:#888;border:1px solid #3a3a3a;"
+        "border-radius:4px;padding:4px 10px;font-size:11px;}"
+        "QPushButton:hover{color:#cc4444;border-color:#cc4444;}")
+    btn.clicked.connect(on_click)
+    return btn
+
+
+def _is_champion_result(result) -> bool:
+    """[2026-09 신설, 신민용 요청 42번] 국제대회 성적 문자열이 '우승'인가.
+
+    world_browser.get_player_intl_records가 돌려주는 실제 값은 이모지가 붙은
+    형태다(실측 분포: '🥇 우승' / '🥈 준우승' / '🥉 3위' / '4위' /
+    '8강 탈락' / '16강 탈락' / '조별리그 탈락' / '🎫 본선 진출').
+    '준우승'에도 '우승'이 들어있으므로 단순 포함 검사로는 준우승까지
+    금색이 된다 — 반드시 먼저 걸러낸다."""
+    r = (result or "").strip()
+    if not r or "준우승" in r:
+        return False
+    return ("우승" in r) or ("🥇" in r)
+
+
+def _calc_static_pitch_positions(slots, w, h, formation=None):
     """[2026-08 신설] ui/formation_widget.py의 _FormationCanvas._calc_positions와
     완전히 동일한 배치 알고리즘을 그대로 복제한 것 — 라이브 포메이션 화면과
     똑같이 위(공격)→아래(GK) 세로 행으로 쌓는다.
@@ -135,25 +181,122 @@ def _calc_static_pitch_positions(slots, w, h):
     정적 위젯이라 (positions, circle_d) 튜플로 함께 반환한다. 반환 튜플의
     4번째 값(slot_idx)은 원본 slots 리스트에서의 인덱스 — 화면 표시용으로
     행(GK/DEF/MID/MID2/ATK)별로 재정렬된 순서와는 다르므로, 선수 매칭은
-    항상 이 slot_idx로 해야 한다."""
-    rows = {}; row_order = []
-    for idx, pos in enumerate(slots):
-        k = _row_key(pos)
-        if k not in rows: rows[k] = []; row_order.append(k)
-        rows[k].append((idx, pos))
-    sorted_rows = sorted(row_order, key=lambda x: _row_priority(x))
-    total = len(sorted_rows); result = []
-    max_row_cnt = max((len(v) for v in rows.values()), default=1)
+    항상 이 slot_idx로 해야 한다.
+
+    [2026-09 버그수정, 신민용 리포트 26번] formation(포메이션 이름)을 받아
+    행 분류를 formation_logic.formation_row_bands에 맡긴다 — 신민용님이 본
+    화면이 바로 이 정적 피치다(팀 검색). 라벨 기준 분류로는 4-4-1-1이
+    4-2-3-1 모양으로, 4-2-3-1이 4-2-1-3 모양으로 그려졌다. formation을
+    안 넘기면(국제대회 스쿼드처럼 임의 슬롯 리스트) 예전 라벨 기반 분류로
+    그대로 폴백한다. 자세한 근거는 formation_row_bands 주석 참고."""
+    bands = formation_row_bands(formation, slots)
+    total = len(bands); result = []
+    max_row_cnt = max((len(b) for b in bands), default=1)
     row_h = (h - 32) / max(1, total)
     col_w = w / (max_row_cnt + 1)
     circle_d = int(max(16, min(48, row_h * 0.82, col_w * 0.78)))
-    for ri, rk in enumerate(sorted_rows):
-        poss = sorted(rows[rk], key=lambda t: _pos_x_order(t[1]))
+    # 뒤(GK)→앞(공격) 순서로 오므로 화면(위=공격)에는 역순으로 그린다.
+    for ri, band in enumerate(reversed(bands)):
+        poss = sorted(band, key=lambda t: _pos_x_order(t[1]))
         cnt = len(poss)
         ry = 16 + int((ri + 0.5) * (h - 32) / total)
         for ci, (idx, pos) in enumerate(poss):
             result.append((int((ci + 1) * w / (cnt + 1)), ry, pos, idx))
     return result, circle_d
+
+
+class _FlowLayout(QLayout):
+    """[2026-09 신설, 신민용 리포트: "우승한 대회 성적이든 우승하지 못한
+    대회 성적이든 연도가 너무 늘어나면 잘리잖아 — '월드컵 16강 탈락 2회
+    [2050, 2066, ...]' 이런 식으로. 잘릴 것 같으면 2번째 줄로 넘어가며,
+    이때 넘어가는 건 대회명까지 함께 넘어가는 거지"]
+
+    요약 칩들을 담던 QHBoxLayout은 구조적으로 줄바꿈을 못 한다 — 칩을
+    계속 오른쪽으로 붙이기만 하므로, 우승 연도가 쌓여 칩이 길어지면
+    화면 폭을 넘어가 통째로 잘렸다. 이 레이아웃은 주어진 폭을 넘으면
+    다음 줄로 내려가는 흐름 배치(flow layout)로, **칩 하나를 쪼개지 않고
+    칩 단위로** 줄을 넘긴다 — 칩 하나가 "대회명 + 성적 + 횟수 + 연도
+    목록" 전체를 담은 QLabel이라, 연도 목록 중간에서 잘리는 대신 그
+    대회 기록 전체가 다음 줄로 함께 내려간다(요청사항 그대로).
+
+    heightForWidth를 구현해두므로 위젯이 세로로 필요한 만큼 자동으로
+    늘어난다(칩이 2줄이면 그만큼 높아진다). Qt 공식 Flow Layout 예제와
+    같은 구조이며, 여기서는 이 화면의 칩 간격(가로 14 / 세로 6)만
+    기본값으로 잡아뒀다.
+    """
+
+    def __init__(self, parent=None, margin=0, h_spacing=14, v_spacing=6):
+        super().__init__(parent)
+        self._items = []
+        self._h_spacing = h_spacing
+        self._v_spacing = v_spacing
+        self.setContentsMargins(margin, margin, margin, margin)
+
+    # ── QLayout 필수 구현 ────────────────────────────────
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index):
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def addStretch(self, _stretch=0):
+        """QHBoxLayout에서 옮겨올 때 호출부를 안 고치기 위한 무동작 메서드.
+        흐름 배치는 칩을 왼쪽부터 채우고 남는 공간을 그대로 두므로 stretch
+        항목이 필요 없다(빈 항목을 넣으면 줄바꿈 계산만 흐트러진다)."""
+        return None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        m = self.contentsMargins()
+        return size + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    # ── 실제 흐름 배치 ──────────────────────────────────
+    def _do_layout(self, rect, test_only):
+        m = self.contentsMargins()
+        x = rect.x() + m.left()
+        y = rect.y() + m.top()
+        right = rect.right() - m.right()
+        line_height = 0
+        for item in self._items:
+            hint = item.sizeHint()
+            next_x = x + hint.width()
+            if next_x - 1 > right and line_height > 0:
+                # 이 칩을 그대로 다음 줄로 내린다(칩을 쪼개지 않는다).
+                x = rect.x() + m.left()
+                y = y + line_height + self._v_spacing
+                next_x = x + hint.width()
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(x, y, hint.width(), hint.height()))
+            x = next_x + self._h_spacing
+            line_height = max(line_height, hint.height())
+        return y + line_height - rect.y() + m.bottom()
 
 
 class _StaticPitchView(QWidget):
@@ -224,7 +367,11 @@ class _StaticPitchView(QWidget):
         painter.drawEllipse(w // 2 - cc_d // 2, h // 2 - cc_d // 2, cc_d, cc_d)
 
         slots = self._explicit_slots or FORMATION_SLOTS.get(self.formation, FORMATION_SLOTS["4-4-2"])
-        positions_xy, circle_d = _calc_static_pitch_positions(slots, w, h)
+        # [2026-09] slots를 직접 받은 경우(국제대회 스쿼드)엔 포메이션 이름이
+        # 배치 기준이 아니므로(위 docstring 참고) 이름을 넘기지 않는다 —
+        # _calc_static_pitch_positions가 예전 라벨 기반 분류로 폴백한다.
+        _fm_for_rows = None if self._explicit_slots else self.formation
+        positions_xy, circle_d = _calc_static_pitch_positions(slots, w, h, _fm_for_rows)
         self._positions_xy = positions_xy
         self._circle_d = circle_d
 
@@ -500,6 +647,82 @@ _FIN_TABLE_STYLE = (
 )
 
 
+def _build_team_finance_summary(fin, mode):
+    """[2026-09 신설, 신민용 확정: "총지출 총수입 순수익 연봉지출 총 영입
+    총 판매 순이익 이건 우측에 같이 두는 게 아니라 포메이션 표시와 선수들
+    그림 사이에 넣으며, 항목|금액|건수 이걸 항목/금액/건수 이렇게 행열
+    전환을 해서 표시"]
+
+    우측 패널(_build_team_finance_panel)은 세로로 긴 3컬럼 표라 항목이
+    늘어날수록 아래로만 길어졌다 — 집계 7줄은 성격이 다르므로(대표 선수
+    줄처럼 선수 하나를 가리키는 게 아니라 그 해 전체를 요약하는 숫자)
+    포메이션 위쪽 가로 공간으로 옮기고, 표를 90도 돌려 **항목명을 헤더로
+    올리고 그 아래 금액·건수를 쌓는다**.
+
+    두 구역으로 나눈다(신민용 확정 — 상위 개념과 하위 개념 분리):
+      구단 전체 재정        : 총지출 / 총수입 / 구단 순수익
+      이적 시장 및 선수 운영 : 연봉 지출 / 총 영입 / 총 판매 / 이적 순수익
+    부호는 world_browser.FINANCE_SIGN 규칙을 그대로 따른다(지출은 항상
+    "-", 수입은 부호 없이, 순수익류는 음수일 때만 "-").
+    """
+    box = QFrame()
+    box.setStyleSheet("background:transparent;border:none;")
+    outer = QVBoxLayout(box)
+    outer.setContentsMargins(0, 2, 0, 6)
+    outer.setSpacing(6)
+
+    _mode_word = {"first": "상반기", "second": "하반기", "both": "전체"}.get(mode, "")
+    head = QLabel(f"💰 구단 재정 ({_mode_word})")
+    head.setStyleSheet("color:#ffc14d;font-size:12px;font-weight:bold;")
+    outer.addWidget(head)
+
+    for sec_title, keys in wb.FINANCE_SUMMARY_SECTIONS:
+        cells = [(k, fin.get(k) or {}) for k in keys]
+        cells = [(k, c) for k, c in cells if "value" in c]
+        if not cells:
+            continue
+        sec = QLabel(f"· {sec_title}")
+        sec.setStyleSheet("color:#8a8a8a;font-size:11px;font-weight:bold;")
+        outer.addWidget(sec)
+
+        has_count = any(c.get("n") is not None for _k, c in cells)
+        tbl = QTableWidget(2 if has_count else 1, len(cells))
+        tbl.setStyleSheet(_FIN_TABLE_STYLE)
+        tbl.setHorizontalHeaderLabels([k for k, _c in cells])
+        tbl.verticalHeader().setVisible(False)
+        tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        tbl.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        tbl.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        for col, (name, cell) in enumerate(cells):
+            _v = cell.get("value")
+            _txt = wb.format_finance_signed(name, _v)
+            it = QTableWidgetItem(_txt)
+            it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            # 지출(빨강)/수입(초록)/순수익(부호 따라)을 색으로도 구분 —
+            # 부호 규칙과 같은 기준이라 글자와 색이 어긋나지 않는다.
+            if _txt.startswith("-"):
+                it.setForeground(QColor("#ff7b7b"))
+            elif _v:
+                it.setForeground(QColor("#6fcf8b"))
+            else:
+                it.setForeground(QColor("#999"))
+            _f = it.font(); _f.setBold(True); it.setFont(_f)
+            tbl.setItem(0, col, it)
+            if has_count:
+                _n = cell.get("n")
+                cit = QTableWidgetItem(f"{_n}건" if _n is not None else "")
+                cit.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                cit.setForeground(QColor("#777"))
+                tbl.setItem(1, col, cit)
+        for r in range(tbl.rowCount()):
+            tbl.setRowHeight(r, 24 if r == 0 else 20)
+        tbl.setFixedHeight(tbl.horizontalHeader().height()
+                           + sum(tbl.rowHeight(r) for r in range(tbl.rowCount())) + 4)
+        outer.addWidget(tbl)
+    return box
+
+
 def _build_team_finance_panel(fin, mode, width=260, on_click=None):
     """재정 패널 — 신민용 요청대로 "그리드 형태의 테이블"(QTableWidget).
     3컬럼: 항목 | 금액 | 건수.
@@ -545,7 +768,10 @@ def _build_team_finance_panel(fin, mode, width=260, on_click=None):
     lay.setSpacing(4)
 
     _mode_word = {"first": "상반기", "second": "하반기", "both": "전체"}.get(mode, "")
-    head = QLabel(f"💰 구단 사용 금액 ({_mode_word})")
+    # [2026-09] 집계 7줄이 위쪽 요약 줄로 빠지면서 이 패널에는 대표 선수
+    # (최고/최저 영입·판매·연봉·몸값)와 임대료만 남았다 — 위 요약과 제목이
+    # 겹치지 않게 이름을 내용에 맞춰 바꾼다.
+    head = QLabel(f"💰 선수 거래 세부 ({_mode_word})")
     head.setStyleSheet("color:#ffc14d;font-size:12px;font-weight:bold;")
     lay.addWidget(head)
 
@@ -555,8 +781,10 @@ def _build_team_finance_panel(fin, mode, width=260, on_click=None):
     for name in wb.FINANCE_ROW_ORDER:
         cell = fin.get(name) or {}
         if "value" in cell:
+            # [2026-09] 부호 규칙을 요약 줄과 통일(임대 영입료는 "-",
+            # 임대 방출료는 부호 없이) — wb.FINANCE_SIGN 참고.
             rows.append(("agg", name,
-                         wb.format_finance_money(cell["value"]),
+                         wb.format_finance_signed(name, cell["value"]),
                          (f"{cell['n']}건" if cell.get("n") is not None else "")))
         else:
             row = cell.get("row")
@@ -593,6 +821,13 @@ def _build_team_finance_panel(fin, mode, width=260, on_click=None):
             it.setForeground(QColor("#7fb2e5") if c0 != "기록 없음" else QColor("#666"))
             f = it.font(); f.setPointSize(9); it.setFont(f)
             it.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            # [2026-09 신설, 신민용 리포트 1번] 이름 변경 즉시 반영용으로
+            # 이 셀이 어느 선수인지 심어둔다(_FIN_NAME_PID_ROLE 주석 참고).
+            # my_player(MY_PLAYER_ID)와 "기록 없음" 줄은 AI 이름 변경 대상이
+            # 아니므로 심지 않는다 — 실수로 덮어써지지 않게 하는 안전장치.
+            _meta_pid = (_row_meta.get(r) or (None, ""))[0]
+            if isinstance(_meta_pid, int) and _meta_pid >= 0:
+                it.setData(_FIN_NAME_PID_ROLE, _meta_pid)
             tbl.setItem(r, 0, it)
             tbl.setRowHeight(r, 18)
             continue
@@ -909,6 +1144,34 @@ class _GridRowDelegate(QStyledItemDelegate):
         return QSize(total_w, max_h + self._V_MARGIN * 2)
 
 
+def _apply_rename_to_finance_panels(win, player_id: int):
+    """[2026-09 신설, 신민용 리포트 1번] 이 창에 펼쳐져 있는 재정 패널
+    ("💰 선수 거래 세부" = 구단 사용 금액)의 그 선수 이름 셀만 새 이름으로
+    다시 쓴다.
+
+    apply_quick_name_change가 포메이션 피치·명단 라벨만 갱신하고 이 표는
+    건드리지 않아서, 팀 검색에서 이름을 바꿔도 우측 금액 표에는 옛 이름
+    (보통 AI 식별코드)이 그대로 남아 있었다. 패널을 다시 만드는 대신
+    (그러면 그 팀 재정 집계를 다시 조회한다 — apply_quick_name_change가
+    카드 재생성을 피한 것과 같은 이유) 셀 텍스트만 고친다.
+
+    _FIN_NAME_PID_ROLE이 심겨 있는 셀만 대상이라, my_player 이름 줄이나
+    "기록 없음" 줄을 실수로 덮어쓸 일이 없다."""
+    from database import get_ai_player_custom_name
+    from constants import ai_player_code
+    new_name = get_ai_player_custom_name(player_id) or ai_player_code(player_id)
+    for tbl in win.findChildren(QTableWidget):
+        try:
+            for r in range(tbl.rowCount()):
+                it = tbl.item(r, 0)
+                if it is None:
+                    continue
+                if it.data(_FIN_NAME_PID_ROLE) == player_id:
+                    it.setText(new_name)
+        except RuntimeError:
+            continue   # 표가 이미 파괴된 경우
+
+
 def apply_custom_name_live_to_browser(player_id: int):
     """[2026-08 신설, 신민용 요청: "포메이션에서 선수 이름을 바꾸면
     선수 검색에도 바로 반영되게"] _open_ai_rename_dialog가 "선수
@@ -925,24 +1188,53 @@ def apply_custom_name_live_to_browser(player_id: int):
     for w in app.allWidgets():
         if not isinstance(w, WorldBrowserWindow):
             continue
-        try:
-            # [2026-08 최적화] 예전엔 무조건 _refresh_player_list()로 최대
-            # 300명을 다시 검색했다 — 선수 검색 탭을 아직 열어본 적도
-            # 없는 창에서까지 그랬다. 그 줄 하나만 갱신하고, 이름 관련
-            # 필터가 걸려 있어 목록 구성 자체가 바뀔 수 있을 때만 예전
-            # 방식으로 전체를 다시 조회한다.
+        # [2026-09 버그수정, 신민용 리포트 1번: "역대 월드컵 → 참가국 →
+        # 이름 변경 후 나가면 개인 수상에서 이름이 안 뜨고 나갔다 들어와야
+        # 변해 있어. 근데 이게 괜찮을 때가 있고 아닐 때가 있어"]
+        # 원인: 아래 갱신 4개가 **하나의 try 블록**에 묶여 있어서, 앞쪽에서
+        # AttributeError가 한 번 나면 뒤쪽 갱신이 통째로 건너뛰어졌다.
+        # 구체적으로 "선수 검색" 탭은 지연 생성(처음 그 탭을 열 때 만들어짐)
+        # 이라, 그 탭을 한 번도 안 열어본 상태에서 이름을 바꾸면
+        #   _apply_rename_to_player_list → (자체 try에서) False 반환
+        #   → _refresh_player_list() → self.player_list 없음 → AttributeError
+        #   → except로 빠져 _refresh_individual_awards_tables()가 **실행 안 됨**
+        # 이 된다. 역대 월드컵에서 바로 이름을 바꾸는 경로가 정확히 이 경우고,
+        # 선수 검색 탭을 먼저 열어둔 세션에서는 예외가 안 나서 정상 반영된다
+        # — "괜찮을 때가 있고 아닐 때가 있다"의 정체가 이것이다.
+        # 단계별로 따로 감싸서 한 곳이 실패해도 나머지는 반드시 돌게 한다.
+        def _safe(fn):
+            try:
+                fn()
+            except (AttributeError, RuntimeError):
+                pass   # 해당 탭 미생성 / 창이 닫혀 C++ 객체가 삭제된 경우
+
+        # [2026-08 최적화] 예전엔 무조건 _refresh_player_list()로 최대
+        # 300명을 다시 검색했다 — 선수 검색 탭을 아직 열어본 적도
+        # 없는 창에서까지 그랬다. 그 줄 하나만 갱신하고, 이름 관련
+        # 필터가 걸려 있어 목록 구성 자체가 바뀔 수 있을 때만 예전
+        # 방식으로 전체를 다시 조회한다.
+        def _step_list():
             if not w._apply_rename_to_player_list(player_id):
                 w._refresh_player_list()
+
+        def _step_detail():
             if getattr(w, "_player_detail_pid", None) == player_id:
                 w._show_player_detail(player_id)
+
+        def _step_recent():
             _rr = getattr(w, "_player_recent_row", None)
             if _rr is not None:
                 _rr.refresh()   # [2026-08 신설] 최근 검색 버튼 글자도 새 이름으로
-            # [2026-09 신설, 신민용 리포트: "역대 개인상으로 가면 이름이
-            # 안 바뀌어 있다"] 포메이션 화면에서 바꿔도 마찬가지로 반영.
-            w._refresh_individual_awards_tables()
-        except (AttributeError, RuntimeError):
-            pass  # 선수 검색 탭 미생성 / 창이 이미 닫혀 C++ 객체가 삭제된 경우
+
+        _safe(_step_list)
+        _safe(_step_detail)
+        _safe(_step_recent)
+        # [2026-09 신설, 신민용 리포트: "역대 개인상으로 가면 이름이
+        # 안 바뀌어 있다"] 포메이션 화면에서 바꿔도 마찬가지로 반영.
+        _safe(w._refresh_individual_awards_tables)
+        # [2026-09 신설, 신민용 리포트 1번 후반: "팀 검색에서 선수 변경하면
+        # 우측에 구단 사용 금액에 표시된 선수도 바로 변경되어야 하는데"]
+        _safe(lambda: _apply_rename_to_finance_panels(w, player_id))
 
 
 def refresh_ai_player_detail_in_browsers(player_id: int):
@@ -2218,6 +2510,10 @@ class WorldBrowserWindow(QDialog):
         self._search_debounce.timeout.connect(self._refresh_league_list)
         self.search_box.textChanged.connect(lambda _text: self._search_debounce.start())
         filt.addWidget(self.search_box, 1)
+        # [2026-09 신설, 신민용 요청 43번]
+        self.league_filter_reset_btn = _make_filter_reset_button(
+            self._on_league_filter_reset)
+        filt.addWidget(self.league_filter_reset_btn)
         lay.addLayout(filt)
 
         # 좌: 리그 목록 / 우: 순위표
@@ -3220,6 +3516,10 @@ class WorldBrowserWindow(QDialog):
         self._team_search_debounce.timeout.connect(self._refresh_team_list)
         self.team_search_box.textChanged.connect(lambda _text: self._team_search_debounce.start())
         filt.addWidget(self.team_search_box, 1)
+        # [2026-09 신설, 신민용 요청 43번]
+        self.team_filter_reset_btn = _make_filter_reset_button(
+            self._on_team_filter_reset)
+        filt.addWidget(self.team_filter_reset_btn)
         lay.addLayout(filt)
 
         split = QSplitter(Qt.Orientation.Horizontal)
@@ -3580,6 +3880,25 @@ class WorldBrowserWindow(QDialog):
         lay.setSpacing(1)
         main_lbl = QLabel()
         main_lbl.setWordWrap(True)
+        # [2026-09 버그수정, 신민용 리포트: "상이 많으면 많을수록 가로가
+        # 길어진다"] WordWrap QLabel은 줄바꿈을 하더라도 sizeHint의 "폭"은
+        # 여전히 내용 길이만큼 요구한다(실측: 상 12개 → 290px 요구). 이
+        # 셀은 표의 11칸을 합친 자리에 들어가므로 폭을 스스로 요구할
+        # 이유가 전혀 없다 — 가로 정책을 Ignored로, 최소폭을 1로 둬서
+        # "주어진 폭에 맞춰 줄바꿈만 한다"로 못박는다. 이렇게 하면 바깥
+        # 스크롤영역/스플리터가 이 줄 때문에 넓어지는 일도 없다. 높이는
+        # _resize_self_sizing_table이 스팬 폭 기준으로 다시 계산한다(그쪽
+        # 스팬 버그 수정 주석 참고).
+        main_lbl.setMinimumWidth(1)
+        main_lbl.setSizePolicy(QSizePolicy.Policy.Ignored,
+                               QSizePolicy.Policy.Preferred)
+        w.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        # [2026-09 추가, 신민용 리포트: "수상 경력 펼쳤을 때 위 아래 불필요한
+        # 빈 공간이 너무 많다"] 행 높이 계산은 _resize_self_sizing_table의
+        # 스팬 폭 수정이 담당하지만, 혹시라도 행이 필요보다 크게 잡히는
+        # 경우(다른 셀 때문에 그 행이 높아지는 등)에도 글자가 한가운데
+        # 붕 떠서 위아래가 비어 보이지 않도록 위쪽 정렬로 고정한다.
+        main_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         _parts = []
         # [2026-09 수정, 신민용 요청] 발롱도르(빨강)에 더해 야신상(#00A86B)·
         # 푸스카스상(#2196F3)도 순위권 라벨을 각 색으로 — 색 판정은
@@ -4310,6 +4629,12 @@ class WorldBrowserWindow(QDialog):
                     None if _fin_mode == "both" else "both"))
             _form_row.addWidget(_total_btn)
         lay.addLayout(_form_row)
+
+        # [2026-09 신설, 신민용 확정] 집계 7줄은 포메이션 라벨 바로 아래,
+        # 선수 그림 위에 가로로 눕혀서 보여준다(_build_team_finance_summary
+        # 정의부 주석 참고). 우측 패널에는 대표 선수 줄과 임대료만 남는다.
+        if _fin:
+            lay.addWidget(_build_team_finance_summary(_fin, _fin_mode))
 
         slot_players = [(s.get("slot") or "", s.get("display_name"), s.get("id"),
                          s.get("is_foreign", False)) for s in starters]
@@ -5235,14 +5560,11 @@ class WorldBrowserWindow(QDialog):
         # [2026-08 신설, 신민용 요청: "우측 끝에 필터 초기화 버튼 — 누르면
         # 필터 전체가 초기화"] 최근 검색 초기화 버튼(_build_recent_search_row)
         # 과 동일한 톤으로 통일.
-        self.player_filter_reset_btn = QPushButton("🔄 필터 초기화")
-        self.player_filter_reset_btn.setAutoDefault(False)
-        self.player_filter_reset_btn.setDefault(False)
-        self.player_filter_reset_btn.setStyleSheet(
-            "QPushButton{background:#2a2a2a;color:#888;border:1px solid #3a3a3a;"
-            "border-radius:4px;padding:4px 10px;font-size:11px;}"
-            "QPushButton:hover{color:#cc4444;border-color:#cc4444;}")
-        self.player_filter_reset_btn.clicked.connect(self._on_player_filter_reset)
+        # [2026-09 리팩터, 43번] 같은 버튼을 리그/팀/국가/컵대회 탭에도
+        # 달게 되면서 생성 코드를 _make_filter_reset_button으로 모았다
+        # (모양·동작은 예전과 100% 동일).
+        self.player_filter_reset_btn = _make_filter_reset_button(
+            self._on_player_filter_reset)
         filt2.addWidget(self.player_filter_reset_btn)
         lay.addLayout(filt2)
 
@@ -5670,17 +5992,55 @@ class WorldBrowserWindow(QDialog):
                 # 그 칸의 실제 폭을 넣어 필요한 높이를 얻고, 지원 안 하면
                 # sizeHint로 떨어진다.
                 _h = tbl.rowHeight(r)
+                # [2026-09 재수정, 신민용 리포트: "여전히 수상 경력 펼쳤을
+                # 때 위 아래 불필요한 빈 공간이 너무 많다"] 스팬 폭 기준으로
+                # 정확한 높이를 구해놔도 아래 `if _need > _h`에서 무시되고
+                # 있었다 — 바로 위 resizeRowsToContents()가 (이 파일의 옛
+                # 주석과 달리) 셀 위젯의 sizeHint까지 반영해서 그 행을
+                # 이미 크게 잡아버리기 때문이다. 그 sizeHint는 "폭을 최소로
+                # 줬을 때 필요한 높이"라 실제 표시 폭(스팬 1,150px)과 전혀
+                # 무관하게 부풀어 있다(실측: 수상 9개 행 sizeHint 570px vs
+                # 실제 필요 40px → 행이 577px, 글자는 그 한가운데에 떠서
+                # 위아래가 텅 빈 채로 보였다).
+                #
+                # 행 전체를 덮는 스팬 셀(수상 요약 줄, 시즌 스탯/연봉 요약
+                # 줄)은 그 행에 다른 내용이 있을 수 없으므로, 거기서 구한
+                # 값이 곧 그 행의 정답이다 — 기존 rowHeight와 max하지 않고
+                # 그대로 확정한다(_span_auth). 스팬이 없는 보통 행은 기존
+                # 동작(여러 칸 중 가장 큰 필요 높이)을 그대로 유지한다.
+                _span_auth = None
                 for _c in range(tbl.columnCount()):
                     _cw = tbl.cellWidget(r, _c)
                     if _cw is None:
                         continue
                     _lay = _cw.layout()
+                    # [2026-09 버그수정, 신민용 리포트: "선수 검색에서 상을
+                    # 클릭할 때 상이 많으면 많을수록 가로가 길어진다 — 1줄로
+                    # 보이지만 상의 숫자에 따라 길이가 길어지는 것 같다"]
+                    # 여기서 쓰던 tbl.columnWidth(_c)는 "그 칸 하나의 폭"이라,
+                    # setSpan으로 여러 칸을 합친 셀(수상 요약 줄은 11칸 전체를
+                    # 합친다)에서는 실제 표시 폭이 아니라 0번 칸(연도, 64px)
+                    # 폭을 넣고 있었다. 그래서 필요한 높이를 "64px 폭에서
+                    # 줄바꿈했을 때"로 계산했는데(실측: 상 12개 → 764px),
+                    # 위젯은 실제로는 합쳐진 폭(약 1,114px)에서 줄바꿈해
+                    # 2줄(56px)만 필요했다 — 높이 계산과 실제 렌더 폭이
+                    # 어긋나 있었다. 이제 스팬 범위를 실제로 읽어 합쳐진
+                    # 폭으로 계산한다(스팬이 없으면 columnSpan==1이라
+                    # 예전과 완전히 동일한 값).
+                    _span = tbl.columnSpan(r, _c)
+                    _w_avail = sum(tbl.columnWidth(_c + _i)
+                                   for _i in range(max(1, _span)))
                     if _lay is not None and _lay.hasHeightForWidth():
-                        _need = _lay.heightForWidth(tbl.columnWidth(_c))
+                        _need = _lay.heightForWidth(_w_avail)
                     else:
                         _need = _cw.sizeHint().height()
-                    if _need > _h:
+                    if _span >= tbl.columnCount():
+                        # 행 전체를 덮는 셀 — 이 값이 곧 행 높이(위 주석).
+                        _span_auth = max(_span_auth or 0, _need)
+                    elif _need > _h:
                         _h = _need
+                if _span_auth is not None:
+                    _h = _span_auth
                 tbl.setRowHeight(r, _h + _PAD)
                 total += tbl.rowHeight(r)
             tbl.setFixedHeight(max(total, tbl.horizontalHeader().height() + 24))
@@ -5833,6 +6193,72 @@ class WorldBrowserWindow(QDialog):
         # 이전 대륙 선택으로 좁혀진 채 남아있음).
         self._refresh_player_nat_combo()
         self._refresh_player_list()
+
+    # ── [2026-09 신설, 신민용 요청 43번] 나머지 검색 탭의 필터 초기화 ──
+    # 선수 검색의 _on_player_filter_reset과 완전히 같은 원칙:
+    #   · 위젯마다 blockSignals로 신호를 막은 채 값만 기본값으로 되돌리고
+    #   · 마지막에 딱 한 번만 목록을 다시 그린다(리셋 위젯 수만큼 조회가
+    #     연쇄로 터지는 걸 막는다).
+    #   · 대륙 콤보가 좁혀놓은 "국가" 콤보는 setCurrentIndex(0)만으로는
+    #     목록 자체가 안 돌아오므로, 각 탭의 국가 콤보 재구성 함수를
+    #     명시적으로 다시 부른다.
+    # 디바운스 타이머도 같이 멈춘다 — 검색창을 비우면서 예약된 새로고침이
+    # 초기화 직후에 한 번 더 도는 걸 막기 위해서다.
+
+    def _on_league_filter_reset(self):
+        for combo in (self.cont_combo, self.country_combo,
+                      self.grade_combo, self.tier_combo):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+        self.search_box.blockSignals(True)
+        self.search_box.clear()
+        self.search_box.blockSignals(False)
+        self._search_debounce.stop()
+        # 대륙이 "전체"로 돌아갔으니 국가 목록도 전 세계로 다시 채운다.
+        self._refresh_country_list()
+        self._refresh_league_list()
+
+    def _on_team_filter_reset(self):
+        for combo in (self.team_cont_combo, self.team_country_combo,
+                      self.team_grade_combo, self.team_tier_combo):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+        self.team_search_box.blockSignals(True)
+        self.team_search_box.clear()
+        self.team_search_box.blockSignals(False)
+        self._team_search_debounce.stop()
+        self._refresh_team_country_combo()
+        self._refresh_team_list()
+
+    def _on_country_filter_reset(self):
+        # country_result_kind_combo(우측 상세표의 "종류" 필터)는 좌측 목록을
+        # 좁히는 필터가 아니라 선택된 국가 한 곳의 기록표만 거르는 것이라
+        # 여기서 건드리지 않는다 — 이 버튼은 선수 검색과 동일하게 "목록
+        # 필터"만 되돌린다.
+        for combo in (self.country_cont_combo, self.country_grade_combo,
+                      self.country_trophy_combo, self.country_trophy_kind_combo,
+                      self.country_rank_combo):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+        self.country_search_box.blockSignals(True)
+        self.country_search_box.clear()
+        self.country_search_box.blockSignals(False)
+        self._country_search_debounce.stop()
+        self._refresh_country_search_list()
+
+    def _on_cup_filter_reset(self):
+        for combo in (self.cup_kind_combo, self.cup_cont_combo,
+                      self.cup_grade_combo):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+        self.cup_search_box.blockSignals(True)
+        self.cup_search_box.clear()
+        self.cup_search_box.blockSignals(False)
+        self._refresh_cup_country_list()
 
     def _on_player_nat_continent_changed(self, *_a):
         self._refresh_player_nat_combo()
@@ -6380,10 +6806,17 @@ class WorldBrowserWindow(QDialog):
                 _stat_text = "-"
             cells = [str(rec["year"]), rec.get("name") or "?", rec.get("country") or "?",
                      rec.get("position") or "-", _apps_text, rec.get("result") or "?", _stat_text]
+            # [2026-09 신설, 신민용 요청 42번: "선수 검색 아래 국제대회 기록에서
+            # 우승한 연도는 연도가 금색으로 써져 있어줘"] 이 화면의 다른 우승
+            # 강조와 같은 금색(#ffd700)을 쓴다(_cell_with_record 주석 참고).
+            _champ = _is_champion_result(rec.get("result"))
             for col, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 if col in (0, 3, 4, 6):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if col == 0 and _champ:
+                    item.setForeground(QColor("#ffd700"))
+                    _f = item.font(); _f.setBold(True); item.setFont(_f)
                 tbl.setItem(row, col, item)
         self._resize_self_sizing_table(tbl)
 
@@ -7323,6 +7756,10 @@ class WorldBrowserWindow(QDialog):
         self._country_search_debounce.timeout.connect(self._refresh_country_search_list)
         self.country_search_box.textChanged.connect(lambda _text: self._country_search_debounce.start())
         filt.addWidget(self.country_search_box, 1)
+        # [2026-09 신설, 신민용 요청 43번]
+        self.country_filter_reset_btn = _make_filter_reset_button(
+            self._on_country_filter_reset)
+        filt.addWidget(self.country_filter_reset_btn)
         lay.addLayout(filt)
 
         split = QSplitter(Qt.Orientation.Horizontal)
@@ -7365,8 +7802,11 @@ class WorldBrowserWindow(QDialog):
 
         # kind별 우승 횟수 요약 칩(예: 🌐 월드컵 2회  🎖 대륙컵 3회) — 대회
         # 종류가 몇 개든(현재 2종, 앞으로 늘어나도) 가로로 쭉 붙여서 보여준다.
-        self.country_summary_row = QHBoxLayout()
-        self.country_summary_row.setSpacing(14)
+        # [2026-09 수정, 신민용 리포트: "연도가 너무 늘어나면 잘린다 —
+        # 잘릴 것 같으면 2번째 줄로 넘어가며 대회명까지 함께 넘어가게"]
+        # QHBoxLayout → _FlowLayout(정의부 주석 참고). 칩 단위로 줄을
+        # 넘기므로 연도 목록 중간에서 잘리는 일이 없다.
+        self.country_summary_row = _FlowLayout(h_spacing=14, v_spacing=6)
         summary_wrap = QWidget()
         summary_wrap.setLayout(self.country_summary_row)
         right_lay.addWidget(summary_wrap)
@@ -7379,8 +7819,8 @@ class WorldBrowserWindow(QDialog):
         self.country_best_others_label.setStyleSheet("color:#888;font-size:11px;")
         self.country_best_others_label.setVisible(False)
         right_lay.addWidget(self.country_best_others_label)
-        self.country_best_others_row = QHBoxLayout()
-        self.country_best_others_row.setSpacing(14)
+        # [2026-09 수정, 위 country_summary_row와 같은 이유로 _FlowLayout]
+        self.country_best_others_row = _FlowLayout(h_spacing=14, v_spacing=6)
         best_others_wrap = QWidget()
         best_others_wrap.setLayout(self.country_best_others_row)
         right_lay.addWidget(best_others_wrap)
@@ -8887,6 +9327,10 @@ class WorldBrowserWindow(QDialog):
         self.cup_search_box.setPlaceholderText("🔎 나라명 검색 (예: 대한민국)")
         self.cup_search_box.textChanged.connect(self._refresh_cup_country_list)
         filt.addWidget(self.cup_search_box, 1)
+        # [2026-09 신설, 신민용 요청 43번]
+        self.cup_filter_reset_btn = _make_filter_reset_button(
+            self._on_cup_filter_reset)
+        filt.addWidget(self.cup_filter_reset_btn)
         lay.addLayout(filt)
 
         split = QSplitter(Qt.Orientation.Horizontal)
@@ -11161,9 +11605,30 @@ class WorldBrowserWindow(QDialog):
         left = QWidget()
         left_lay = QVBoxLayout(left)
         left_lay.setContentsMargins(0, 0, 0, 0)
-        left_title = QLabel("🏟 팀 파워랭킹")
-        left_title.setStyleSheet("color:#eee;font-size:13px;font-weight:bold;")
-        left_lay.addWidget(left_title)
+        # [2026-09 신설, 신민용 요청: "좌측에 팀 파워 랭킹 옆에 버튼을
+        # 만들고 리그 파워 랭킹 버튼을 누르면 이게 활성화 되어 팀 파워
+        # 랭킹 글이 리그 파워 랭킹으로 변화하며"] 제목 라벨 옆에 모드
+        # 토글 버튼 2개(팀/리그). 누르면 제목 글자가 바뀌고 아래 표가
+        # 통째로 교체된다(QStackedWidget). 대륙 탭 버튼과 연도 스핀박스는
+        # 두 모드가 그대로 공유한다 — 리그 랭킹도 "그 대륙 리그들 안에서의
+        # 순위"를 볼 수 있어야 하므로.
+        left_title_row = QHBoxLayout()
+        self.pr_left_title = QLabel("🏟 팀 파워랭킹")
+        self.pr_left_title.setStyleSheet("color:#eee;font-size:13px;font-weight:bold;")
+        left_title_row.addWidget(self.pr_left_title)
+        left_title_row.addSpacing(10)
+        self._pr_left_mode = "team"
+        self.pr_mode_team_btn = QPushButton("🏟 팀")
+        self.pr_mode_league_btn = QPushButton("🏆 리그")
+        for _b, _m in ((self.pr_mode_team_btn, "team"), (self.pr_mode_league_btn, "league")):
+            _b.setCheckable(True)
+            _b.setChecked(_m == "team")
+            _b.setMinimumWidth(72)
+            _b.setToolTip("팀 파워랭킹 / 리그 파워랭킹 전환")
+            _b.clicked.connect(lambda _c, m=_m: self._on_pr_left_mode_clicked(m))
+            left_title_row.addWidget(_b)
+        left_title_row.addStretch(1)
+        left_lay.addLayout(left_title_row)
 
         tab_row = QHBoxLayout()
         self.pr_team_tab_group = []
@@ -11215,7 +11680,13 @@ class WorldBrowserWindow(QDialog):
         self._make_combo_typable(self.pr_team_country_combo)
         self.pr_team_country_combo.currentTextChanged.connect(self._on_pr_team_search_changed)
         team_search_row.addWidget(self.pr_team_country_combo)
-        left_lay.addLayout(team_search_row)
+        # [2026-09] 팀/리그 모드가 각자 자기 검색줄+표를 갖도록 스택으로
+        # 감싼다 — 검색 대상(팀명 vs 리그명)과 표 컬럼이 서로 다르다.
+        self.pr_left_stack = QStackedWidget()
+        _team_page = QWidget()
+        _team_page_lay = QVBoxLayout(_team_page)
+        _team_page_lay.setContentsMargins(0, 0, 0, 0)
+        _team_page_lay.addLayout(team_search_row)
 
         # [2026-08 신설] 팀 명과 대륙 사이에 '부'(현재 소속 리그 등급)를
         # 넣어 분류를 한 단계 더 세분화(신민용 요청) —
@@ -11227,7 +11698,46 @@ class WorldBrowserWindow(QDialog):
         self.pr_team_tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.pr_team_tbl.cellDoubleClicked.connect(self._on_pr_team_row_double_clicked)
         _enable_plain_copy(self.pr_team_tbl)
-        left_lay.addWidget(self.pr_team_tbl, 1)
+        _team_page_lay.addWidget(self.pr_team_tbl, 1)
+        self.pr_left_stack.addWidget(_team_page)
+
+        # ── 리그 파워랭킹 페이지 (2026-09 신설) ──
+        # 산식은 power_ranking.get_league_power_ranking 참고 — (그 리그 팀들의
+        # 전체 순위 합)/(팀 수). 값이 작을수록 강한 리그라서, "평균순위" 칸을
+        # 점수 칸 자리에 두고 그 옆에 "팀수"(무엇으로 나눴는지)를 같이 보여준다.
+        _league_page = QWidget()
+        _league_page_lay = QVBoxLayout(_league_page)
+        _league_page_lay.setContentsMargins(0, 0, 0, 0)
+        league_search_row = QHBoxLayout()
+        self.pr_league_search_box = QLineEdit()
+        self.pr_league_search_box.setPlaceholderText("🔎 리그명 검색")
+        self.pr_league_search_box.textChanged.connect(self._on_pr_league_search_changed)
+        league_search_row.addWidget(self.pr_league_search_box, 1)
+        self.pr_league_country_combo = QComboBox()
+        self.pr_league_country_combo.addItem("전체 국가")
+        self._make_combo_typable(self.pr_league_country_combo)
+        self.pr_league_country_combo.currentTextChanged.connect(self._on_pr_league_search_changed)
+        league_search_row.addWidget(self.pr_league_country_combo)
+        self.pr_league_tier_combo = QComboBox()
+        self.pr_league_tier_combo.addItem("전체 부수")
+        for _t in range(1, 5):
+            self.pr_league_tier_combo.addItem(f"{_t}부")
+        self.pr_league_tier_combo.currentTextChanged.connect(self._on_pr_league_search_changed)
+        league_search_row.addWidget(self.pr_league_tier_combo)
+        _league_page_lay.addLayout(league_search_row)
+        self.pr_league_tbl = QTableWidget(0, 8)
+        self.pr_league_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.pr_league_tbl.verticalHeader().setVisible(False)
+        self.pr_league_tbl.setHorizontalHeaderLabels(
+            ["순위", "전년", "리그", "부", "대륙", "국가", "평균순위", "팀수"])
+        self.pr_league_tbl.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Stretch)
+        self.pr_league_tbl.cellDoubleClicked.connect(self._on_pr_league_row_double_clicked)
+        _enable_plain_copy(self.pr_league_tbl)
+        _league_page_lay.addWidget(self.pr_league_tbl, 1)
+        self.pr_left_stack.addWidget(_league_page)
+
+        left_lay.addWidget(self.pr_left_stack, 1)
         split.addWidget(left)
 
         # ── 오른쪽: 국가 파워랭킹 (211개국 전체) ──
@@ -11339,6 +11849,71 @@ class WorldBrowserWindow(QDialog):
         self._pr_refresh_team_country_filter_options()
         self._refresh_power_ranking_tables()
 
+    # ── [2026-09 신설] 좌측 팀/리그 파워랭킹 모드 전환 ────────────────
+    def _on_pr_left_mode_clicked(self, mode):
+        """신민용 요청: "리그 파워 랭킹 버튼을 누르면 이게 활성화 되어
+        팀 파워 랭킹 글이 리그 파워 랭킹으로 변화하며" — 제목 글자와
+        아래 표(스택 페이지)를 같이 바꾼다. 대륙 탭/연도는 공유하므로
+        그대로 두고, 그 범위로 새 모드의 목록만 다시 불러온다."""
+        self._pr_left_mode = mode
+        self.pr_mode_team_btn.setChecked(mode == "team")
+        self.pr_mode_league_btn.setChecked(mode == "league")
+        self.pr_left_title.setText("🏟 팀 파워랭킹" if mode == "team" else "🏆 리그 파워랭킹")
+        self.pr_left_stack.setCurrentIndex(0 if mode == "team" else 1)
+        self._refresh_power_ranking_tables()
+
+    def _on_pr_league_search_changed(self, _text=None):
+        self._apply_pr_league_search()
+
+    def _apply_pr_league_search(self):
+        """리그명/국가/부수 필터. 팀·국가 쪽과 같은 원칙 — 필터링해도 순위
+        숫자는 '지금 선택된 대륙 범위 안에서의 실제 순위'(캐시에 확정된
+        e.rank)를 그대로 쓰고, 검색 결과 안에서 다시 매기지 않는다."""
+        entries = getattr(self, "_pr_league_entries_cache", [])
+        query = self.pr_league_search_box.text().strip()
+        country = self.pr_league_country_combo.currentText()
+        tier_txt = self.pr_league_tier_combo.currentText()
+        if country and country != "전체 국가":
+            entries = [e for e in entries if e.country == country]
+        if tier_txt and tier_txt != "전체 부수":
+            _t = int(tier_txt.replace("부", ""))
+            entries = [e for e in entries if e.tier == _t]
+        if query:
+            entries = [e for e in entries if query in e.league_name]
+        self._render_league_power_table(entries)
+
+    def _render_league_power_table(self, entries):
+        self._fill_power_ranking_table(
+            self.pr_league_tbl, entries,
+            name_fn=lambda e: e.league_name, group_fn=lambda e: e.country,
+            continent_fn=lambda e: e.continent, tier_fn=lambda e: e.tier,
+            id_role_fn=lambda e: e.league_id, local_rank=False,
+            value_cols_fn=lambda e: [f"{e.avg_rank:.1f}", f"{e.n_teams}팀"])
+
+    def _pr_refresh_league_country_filter_options(self):
+        """대륙 탭에 맞춰 리그 쪽 국가 필터 선택지를 다시 채운다
+        (팀 쪽 _pr_refresh_team_country_filter_options와 같은 방식)."""
+        combo = self.pr_league_country_combo
+        prev = combo.currentText()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("전체 국가")
+        for name in pr.get_countries_in_tab_group(get_conn(), self._pr_current_team_tab):
+            combo.addItem(name)
+        idx = combo.findText(prev)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _on_pr_league_row_double_clicked(self, row, _col):
+        item = self.pr_league_tbl.item(row, 0)
+        league_id = item.data(Qt.ItemDataRole.UserRole) if item else None
+        name_item = self.pr_league_tbl.item(row, 2)
+        if league_id is None:
+            return
+        history = pr.get_league_power_history(get_conn(), league_id)
+        self._show_power_history_dialog(name_item.text() if name_item else "리그", history,
+                                         columns=["연도", "전체 순위", "대륙 순위"])
+
     def _refresh_power_ranking_tables(self, *_a):
         ranking_year = self.pr_year_spin.value()
         conn = get_conn()
@@ -11363,6 +11938,16 @@ class WorldBrowserWindow(QDialog):
             e.rank = i + 1
         self._pr_team_entries_cache = team_entries
         self._apply_pr_team_search()
+
+        # [2026-09 신설] 리그 파워랭킹 — 좌측이 리그 모드일 때만 집계한다
+        # (전체 팀 순위를 리그별로 합산하는 계산이라 팀 모드에서 미리
+        # 돌려둘 이유가 없다). 순위는 get_league_power_ranking이 이미
+        # 선택된 대륙 범위 안에서 확정해서 준다.
+        if getattr(self, "_pr_left_mode", "team") == "league":
+            self._pr_league_entries_cache = pr.get_league_power_ranking(
+                conn, ranking_year, tab=self._pr_current_team_tab, limit=100000)
+            self._pr_refresh_league_country_filter_options()
+            self._apply_pr_league_search()
 
         # 211개국 전체 — get_country_power_ranking의 limit 기본값(250)이
         # 이미 다 커버하므로 별도 조정 불필요.
@@ -11452,14 +12037,20 @@ class WorldBrowserWindow(QDialog):
             id_role_fn=lambda e: e.country, local_rank=False)
 
     def _fill_power_ranking_table(self, tbl, entries, name_fn, group_fn, id_role_fn,
-                                   local_rank, continent_fn=None, tier_fn=None):
+                                   local_rank, continent_fn=None, tier_fn=None,
+                                   value_cols_fn=None):
         # continent_fn이 있으면(팀 표) 팀명과 국가 사이에 대륙 칸을 하나 더
         # 넣는다(신민용 요청: "국가와 팀명 사이에 대륙명도 넣어서 분류를
         # 좀 더 세부적으로"). 국가 표는 이미 group_fn 자체가 대륙이라
         # continent_fn 없이 기존 5열 그대로 쓴다. tier_fn이 있으면(팀 표만)
         # 팀명과 대륙 사이에 '부'(현재 소속 리그 등급) 칸을 하나 더
         # 넣는다(신민용 요청: "팀이랑 대륙 사이에 부란 단어 넣고").
-        n_cols = 5 + (1 if continent_fn else 0) + (1 if tier_fn else 0)
+        # [2026-09 확장, 리그 파워랭킹 신설] 맨 뒤 "값" 칸은 원래 항상
+        # rating 하나(점수)였는데, 리그 표는 "평균순위"와 "팀수" 두 칸을
+        # 쓴다 — value_cols_fn을 주면 그 함수가 돌려주는 문자열 목록이
+        # 그대로 마지막 칸들이 된다(안 주면 예전과 동일하게 rating 1칸).
+        _n_value_cols = 1 if value_cols_fn is None else len(value_cols_fn(entries[0])) if entries else 1
+        n_cols = 4 + _n_value_cols + (1 if continent_fn else 0) + (1 if tier_fn else 0)
         tbl.setRowCount(len(entries))
         for i, e in enumerate(entries):
             # local_rank=True인 팀 탭은 대륙별로 걸러진 목록이라, 저장된
@@ -11485,7 +12076,10 @@ class WorldBrowserWindow(QDialog):
             if continent_fn:
                 vals.append(continent_fn(e))
             vals.append(group_fn(e))
-            vals.append(f"{e.rating:.1f}")
+            if value_cols_fn is None:
+                vals.append(f"{e.rating:.1f}")
+            else:
+                vals.extend(value_cols_fn(e))
             for j, v in enumerate(vals):
                 cell = QTableWidgetItem(v)
                 cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -11525,9 +12119,12 @@ class WorldBrowserWindow(QDialog):
         name_item = self.pr_country_tbl.item(row, 2)
         if country is None:
             return
-        history = pr.get_country_power_history(get_conn(), country)
+        # [2026-09 확장, 신민용 요청: "국가에도 대륙순위 추가하고 싶고"]
+        # 팀 쪽(연도/전체/대륙/국가)과 같은 방식으로 국가도 대륙 순위를
+        # 함께 보여준다 — 3-튜플이라 이 표는 자동으로 3열이 된다.
+        history = pr.get_country_power_history_with_continent(get_conn(), country)
         self._show_power_history_dialog(name_item.text() if name_item else "국가", history,
-                                         columns=["연도", "순위"])
+                                         columns=["연도", "전체 순위", "대륙 순위"])
 
     def _show_power_history_dialog(self, title, history, columns):
         """이전 순위 조회 창 — 신민용 mockup 그대로 "2002 | 5등\n2001 | 9등..."
@@ -11546,7 +12143,8 @@ class WorldBrowserWindow(QDialog):
         dlg.setWindowTitle(f"{title} — 이전 순위")
         # [2026-08 확장] 팀용 열이 3개→4개로 늘어난 만큼 창 폭도 넓힌다 —
         # 국가용(2열)은 기존 그대로, 팀용은 열 개수에 비례해 계산.
-        dlg.resize(280 + 80 * max(n_cols - 2, 0), 360)
+        # [2026-09] 위에 최고/최저 요약 두 줄이 생겨 그만큼 세로를 늘린다.
+        dlg.resize(300 + 80 * max(n_cols - 2, 0), 420)
         v = QVBoxLayout(dlg)
         tbl = QTableWidget(0, n_cols)
         tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -11554,6 +12152,38 @@ class WorldBrowserWindow(QDialog):
         tbl.setHorizontalHeaderLabels(columns)
         tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         tbl.setRowCount(len(history))
+
+        # [2026-09 신설, 신민용 확정안 — "최고/최저 순위 + 횟수 + 최근
+        # 연도"] 같은 최고·최저 순위가 여러 시즌 반복될 때 그 시즌을 전부
+        # 색칠하면 표가 도배된다(20년 연속 꼴찌인 팀이면 전부 빨강). 반복
+        # 횟수는 위쪽 요약 줄에 숫자로 남기고, 표에서는 그 순위가 나온
+        # **가장 최근 시즌 한 줄만** 색칠한다 — 🟦 최고 / 🟥 최저.
+        # 기준 열은 첫 순위 열(전체 순위) 하나다. 대륙·국가 순위까지 각각
+        # 칠하면 같은 이유로 다시 지저분해지므로 색은 대표 열에만 쓴다.
+        _best_year = _worst_year = None
+        if history:
+            _primary = [(r[0], r[1]) for r in history if len(r) > 1 and r[1] is not None]
+            if _primary:
+                _best = min(v for _y, v in _primary)
+                _worst = max(v for _y, v in _primary)
+                _best_years = [y for y, v in _primary if v == _best]
+                _worst_years = [y for y, v in _primary if v == _worst]
+                _best_year = max(_best_years)
+                _worst_year = max(_worst_years)
+                _sum_rows = [("🟦", "최고", _best, len(_best_years), _best_year, "#4da6ff")]
+                if _worst != _best:
+                    _sum_rows.append(
+                        ("🟥", "최저", _worst, len(_worst_years), _worst_year, "#ff5555"))
+                else:
+                    # 이력이 한 해뿐이거나 매년 같은 순위 — 최저 줄을 따로
+                    # 띄우면 같은 말을 두 번 하는 셈이라 최고 줄만 둔다.
+                    _worst_year = None
+                for _icon, _word, _val, _cnt, _recent, _color in _sum_rows:
+                    _l = QLabel(f"{_icon} {_word} 순위 {_val}위 · {_cnt}회 · 최근 {_recent}년")
+                    _l.setStyleSheet(
+                        f"color:{_color};font-size:12px;font-weight:bold;padding:2px 4px;")
+                    v.addWidget(_l)
+
         for i, row_vals in enumerate(history):
             year = row_vals[0]
             ranks = row_vals[1:]
@@ -11562,6 +12192,14 @@ class WorldBrowserWindow(QDialog):
                 it = QTableWidgetItem(text)
                 it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 it.setForeground(Qt.GlobalColor.white if i == 0 else QColor("#ccc"))
+                # 대표 시즌 한 줄만 강조 — 연도 칸과 첫 순위 칸에만 색을
+                # 입혀 "이 해가 그 기록"이라는 게 한눈에 보이게 한다.
+                if j <= 1 and year == _best_year:
+                    it.setForeground(QColor("#4da6ff"))
+                    _f = it.font(); _f.setBold(True); it.setFont(_f)
+                elif j <= 1 and year == _worst_year:
+                    it.setForeground(QColor("#ff5555"))
+                    _f = it.font(); _f.setBold(True); it.setFont(_f)
                 tbl.setItem(i, j, it)
         self._show_empty_state(tbl, history, "이력이 없습니다", n_cols)
         v.addWidget(tbl)

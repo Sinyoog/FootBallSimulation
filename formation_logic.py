@@ -828,25 +828,72 @@ def formation_fit_bonus(avg_penalty):
                min(SQUAD_FORMATION_FIT_MAX, raw * SQUAD_FORMATION_FIT_MAX))
 
 
-def choose_formation_prepped(prepped, current_formation, tendency, rng=None):
+def manager_style_fit(formation_name, style_attack=None, style_buildup=None,
+                      style_press=None, tendency=None):
+    """[2026-09 신설 — 감독 시스템 ②단계] 감독 성향과 이 포메이션의 궁합
+    (0.0~1.0). 신민용 확정 방식대로 후보 목록을 DB에 저장하지 않고 매번
+    성향에서 계산한다.
+
+    세 축을 각각 "성향 목표 위치"와 "포메이션 위치"의 거리로 재고,
+    MANAGER_STYLE_FIT_WEIGHTS로 가중 평균한다. 축별 척도가 다르므로
+    정규화 분모도 다르다 — 공격 축은 FORMATION_STYLE이 ±1.5, 성향
+    (TACTIC_TENDENCY_LEAN)도 ±1.5라 최대 거리 3.0이고, 빌드업/압박 축은
+    양쪽 다 ±1.0이라 최대 거리 2.0이다.
+
+    style_attack이 None이면 tendency(기존 TACTIC_TENDENCIES 문자열)로
+    폴백한다 — 감독이 아직 없는 팀·구세이브를 위한 하위호환 경로이며,
+    이 경우 빌드업/압박 축은 중립(MIXED/MID_BLOCK)으로 본다. 그러면
+    결과가 기존 tendency_fit과 같아지도록 가중치가 맞춰져 있지는 않지만,
+    중립 축은 모든 포메이션에서 비슷한 값을 주므로 순위에 거의 영향이
+    없다(아래 호환성 주석 참고)."""
+    from constants import (FORMATION_STYLE, FORMATION_BUILDUP, FORMATION_PRESS,
+                           TACTIC_TENDENCY_LEAN, MANAGER_BUILDUP_LEAN,
+                           MANAGER_PRESS_LEAN, MANAGER_STYLE_FIT_WEIGHTS)
+    atk_key = style_attack or tendency or "BALANCED"
+    lean_atk = TACTIC_TENDENCY_LEAN.get(atk_key, 0.0)
+    lean_bld = MANAGER_BUILDUP_LEAN.get(style_buildup or "MIXED", 0.0)
+    lean_prs = MANAGER_PRESS_LEAN.get(style_press or "MID_BLOCK", 0.0)
+
+    fit_atk = max(0.0, 1.0 - abs(lean_atk - FORMATION_STYLE.get(formation_name, 0.0)) / 3.0)
+    fit_bld = max(0.0, 1.0 - abs(lean_bld - FORMATION_BUILDUP.get(formation_name, 0.0)) / 2.0)
+    fit_prs = max(0.0, 1.0 - abs(lean_prs - FORMATION_PRESS.get(formation_name, 0.0)) / 2.0)
+    w = MANAGER_STYLE_FIT_WEIGHTS
+    return w["attack"] * fit_atk + w["buildup"] * fit_bld + w["press"] * fit_prs
+
+
+def choose_formation_prepped(prepped, current_formation, tendency, rng=None,
+                             style=None):
     """prep_roster() 결과를 받는 choose_formation. 점수 계산·정렬·후보
     선정·랜덤 소비 순서가 choose_formation과 완전히 동일하다 — 포메이션
     하나당 _rng.random()을 정확히 한 번씩, FORMATION_SLOTS 순서대로
-    소비하고 마지막에 _rng.choices를 한 번 부른다."""
+    소비하고 마지막에 _rng.choices를 한 번 부른다.
+
+    [2026-09 확장 — 감독 시스템 ②단계] style을 넘기면 성향 점수를 감독
+    3축(manager_style_fit)으로 계산한다. 안 넘기면 예전처럼 tendency 한
+    축만 본다 — **난수 소비 패턴은 양쪽이 완전히 동일**하다(점수 값만
+    달라진다). 이건 의도적이다: 이 게임은 같은 시드에서 같은 결과가
+    나오는 것을 QA로 검증하는데, 난수 호출 횟수가 경로마다 달라지면
+    그 뒤 모든 것이 밀린다.
+
+    style: {"style_attack":..., "style_buildup":..., "style_press":...}
+           (database.get_team_manager()가 돌려주는 행을 그대로 넣어도 된다)
+    """
     import random as _random
-    from constants import (FORMATION_SLOTS, FORMATION_STYLE, TACTIC_TENDENCY_LEAN,
-                           FORMATION_SCORE_WEIGHTS, FORMATION_CANDIDATE_TOP_N)
+    from constants import (FORMATION_SLOTS, FORMATION_SCORE_WEIGHTS,
+                           FORMATION_CANDIDATE_TOP_N)
     _rng = rng or _random
-    lean = TACTIC_TENDENCY_LEAN.get(tendency, 0.0)
     w = FORMATION_SCORE_WEIGHTS
     _w_squad, _w_tend, _w_rand = w["squad_fit"], w["tendency_fit"], w["random"]
-    _style = FORMATION_STYLE.get
+    _sa = (style or {}).get("style_attack")
+    _sb = (style or {}).get("style_buildup")
+    _sp = (style or {}).get("style_press")
     _rand = _rng.random
     scored = []
     for name, slots in FORMATION_SLOTS.items():
         penalty = formation_fit_penalty_prepped(prepped, name, slots)
         squad_fit = formation_fit_norm(penalty)
-        tendency_fit = max(0.0, 1.0 - abs(lean - _style(name, 0.0)) / 3.0)
+        tendency_fit = manager_style_fit(name, style_attack=_sa, style_buildup=_sb,
+                                         style_press=_sp, tendency=tendency)
         score = (_w_squad * squad_fit + _w_tend * tendency_fit
                  + _w_rand * _rand())
         scored.append((score, name, penalty))
@@ -857,7 +904,7 @@ def choose_formation_prepped(prepped, current_formation, tendency, rng=None):
     return chosen_name, chosen_penalty
 
 
-def choose_formation(roster, current_formation, tendency, rng=None):
+def choose_formation(roster, current_formation, tendency, rng=None, style=None):
     """[2026-08 신설, 신민용 확정: "score = squad_fit(60%) + tendency_fit(30%)
     + random(10%), 상위 몇 개 후보 중 가중 랜덤"] 시즌 전환 시 포메이션을
     재검토하는 팀에 대해 호출한다(재검토 여부 자체는 constants.
@@ -869,4 +916,104 @@ def choose_formation(roster, current_formation, tendency, rng=None):
     tendency: constants.TACTIC_TENDENCIES 중 하나.
     반환: (선택된 포메이션 이름, 그 포메이션의 formation_fit_penalty 값)
     — 후자는 호출부가 formation_fit_bonus() 캐싱에 바로 재사용한다."""
-    return choose_formation_prepped(prep_roster(roster), current_formation, tendency, rng=rng)
+    return choose_formation_prepped(prep_roster(roster), current_formation, tendency,
+                                     rng=rng, style=style)
+
+# ─────────────────────────────────────────────
+# 화면 배치용 행(밴드) 계산 (2026-09 신설)
+# ─────────────────────────────────────────────
+# [신민용 리포트 26번: "팀 검색 좌측엔 포메이션이 4-4-1-1이라 뜨는데 그림은
+# 4-2-3-1 모양이다 — CAM 1명이 앞에 있고 뒤에 중앙 2명이 좌우로 있고 공격
+# 3명. 포메이션 표시가 오류가 있네"]
+#
+# 원인: 피치에 원을 그릴 때 행을 "포지션 라벨"만 보고 나눴다
+# (ui/formation_widget.py의 _row_key — CDM/CM→MID, CAM/LM/RM→MID2,
+#  나머지(LW/RW/ST)→ATK). 그런데 같은 포지션 라벨이 포메이션에 따라 다른
+# 밴드에 속한다:
+#   4-3-3   : LW·RW는 ST와 함께 최전방 3명  → ATK가 맞다
+#   4-2-3-1 : LW·RW는 CAM과 같은 "3" 밴드   → ATK가 틀리다(ST만 최전방)
+# 라벨만으로는 이 둘을 구분할 수 없으므로, 라벨 기반 분류로는 어떤 값을
+# 넣어도 항상 일부 포메이션이 틀린다.
+#
+# 실측(20개 포메이션 전수 대조): 13개가 자기 이름과 다른 모양으로 그려졌다.
+#   4-4-1-1 → [4,2,3,1] (신민용님이 본 화면)   4-2-3-1 → [4,2,1,3]
+#   4-4-2   → [4,2,2,2]                        3-5-2   → [5,3,2]
+#   4-5-1   → [4,3,2,1]                        5-4-1   → [5,2,2,1]
+#   3-4-3 · 3-4-1-2 · 3-4-2-1 · 3-5-1-1 · 4-1-2-1-2 · 4-1-4-1 · 4-3-3-ATT
+#
+# 해결: 포메이션 "이름"이 이미 밴드 구성을 정확히 담고 있으므로(4-2-3-1 =
+# 4명/2명/3명/1명), 이름의 숫자로 슬롯 리스트를 순서대로 잘라 밴드를
+# 만든다. FORMATION_SLOTS의 모든 값은 이미 뒤(수비)→앞(공격) 순서로
+# 밴드별로 모여 있고 숫자 합이 정확히 10(=GK 제외)임을 20개 전부 확인했다.
+#   4-2-3-1 → CB+CB+LB+RB | CDM+CDM | LW+CAM+RW | ST
+#   3-5-2   → CB+CB+CB | LWB+CDM+CM+CM+RWB | ST+ST
+# 이러면 "이름과 그림이 다를" 가능성이 구조적으로 사라진다(그림이 이름에서
+# 파생되므로).
+#
+# 이름을 신뢰할 수 없는 경우(FORMATION_SLOTS에 없는 이름, 국제대회 스쿼드
+# 처럼 slots를 직접 넘기는 경로, 숫자 합이 슬롯 수와 안 맞는 경우)엔 예전
+# 라벨 기반 분류로 그대로 폴백한다 — 동작이 나빠지지 않는다.
+
+_FALLBACK_ROW_DEF = ("DEF", ("CB", "LB", "RB", "LWB", "RWB", "SW"))
+_FALLBACK_ROW_MID = ("MID", ("CDM", "CM", "DM"))
+_FALLBACK_ROW_MID2 = ("MID2", ("CAM", "LM", "RM"))
+
+
+def _fallback_row_key(pos):
+    """예전(2026-09 이전) 라벨 기반 행 분류 — 폴백 전용."""
+    if pos == "GK":
+        return "GK"
+    if pos in _FALLBACK_ROW_DEF[1]:
+        return "DEF"
+    if pos in _FALLBACK_ROW_MID[1]:
+        return "MID"
+    if pos in _FALLBACK_ROW_MID2[1]:
+        return "MID2"
+    return "ATK"
+
+
+_FALLBACK_ROW_PRIORITY = {"ATK": 0, "MID2": 1, "MID": 2, "DEF": 3, "GK": 4}
+
+
+def formation_row_bands(formation, slots):
+    """슬롯을 화면 행(밴드)으로 묶어 **뒤(GK)→앞(공격)** 순서로 돌려준다.
+
+    반환: [[(slot_idx, pos), ...], ...]  — 첫 행이 GK, 마지막 행이 최전방.
+    slot_idx는 원본 slots 리스트에서의 인덱스(선수 매칭에 반드시 이 값을
+    써야 한다 — 화면 순서와 원본 순서는 다르다).
+
+    formation이 FORMATION_SLOTS의 이름이고 slots가 그 포메이션의 슬롯
+    리스트와 정확히 같으면 이름의 숫자로 밴드를 나눈다(위 주석 참고).
+    그 외에는 예전 라벨 기반 분류로 폴백한다.
+    """
+    from constants import FORMATION_SLOTS
+    slots = list(slots or [])
+    if not slots:
+        return []
+
+    canon = FORMATION_SLOTS.get(formation)
+    if canon is not None and list(canon) == slots:
+        import re as _re
+        nums = [int(x) for x in _re.findall(r"\d+", str(formation))]
+        gk = [(i, p) for i, p in enumerate(slots) if p == "GK"]
+        rest = [(i, p) for i, p in enumerate(slots) if p != "GK"]
+        if nums and sum(nums) == len(rest):
+            bands = ([gk] if gk else [])
+            cur = 0
+            for n in nums:
+                bands.append(rest[cur:cur + n])
+                cur += n
+            return [b for b in bands if b]
+
+    # ── 폴백: 예전 라벨 기반 분류 ──
+    rows, order = {}, []
+    for idx, pos in enumerate(slots):
+        k = _fallback_row_key(pos)
+        if k not in rows:
+            rows[k] = []
+            order.append(k)
+        rows[k].append((idx, pos))
+    # 예전 코드는 ATK가 먼저(위)였다 — 여기는 GK부터(뒤) 순서로 통일해서
+    # 돌려주므로 우선순위를 역순으로 정렬한다(호출부가 뒤집을 필요 없음).
+    order.sort(key=lambda k: -_FALLBACK_ROW_PRIORITY.get(k, 2))
+    return [rows[k] for k in order]

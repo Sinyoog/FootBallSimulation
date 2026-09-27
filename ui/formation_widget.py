@@ -1213,21 +1213,26 @@ class _FormationCanvas(QWidget):
         겹칠 수 있다 — 세로/가로 두 제약 중 더 빡빡한 쪽에 맞춰 지름을
         동적으로 정하고(self._circle_d), paintEvent/마우스 히트박스가
         전부 이 값을 그대로 따라간다. 원래 크기(축소 전)에서는 여전히
-        48px 그대로 나오도록 상한을 48로 고정 — 기존 화면은 완전히 동일."""
-        rows = {}; row_order = []
-        for idx, pos in enumerate(slots):
-            k = _row_key(pos)
-            if k not in rows: rows[k] = []; row_order.append(k)
-            rows[k].append((idx, pos))
-        sorted_rows = sorted(row_order, key=lambda x: _row_priority(x))
-        total = len(sorted_rows); result = []
-        max_row_cnt = max((len(v) for v in rows.values()), default=1)
+        48px 그대로 나오도록 상한을 48로 고정 — 기존 화면은 완전히 동일.
+
+        [2026-09 버그수정, 신민용 리포트 26번: "포메이션이 4-4-1-1이라 뜨는데
+        그림은 4-2-3-1 모양이다 — 포메이션 표시가 오류가 있네"] 행 분류를
+        포지션 라벨 기준(_row_key)에서 포메이션 이름 기준
+        (formation_logic.formation_row_bands)으로 바꿨다 — 같은 LW/RW가
+        4-3-3에서는 최전방 3명이고 4-2-3-1에서는 CAM과 같은 "3" 밴드라
+        라벨만으로는 구분이 불가능하다(20개 포메이션 중 13개가 자기 이름과
+        다른 모양으로 그려지고 있었다). 자세한 근거는 그 함수 주석 참고."""
+        bands = formation_row_bands(getattr(self, "formation", None), slots)
+        total = len(bands); result = []
+        max_row_cnt = max((len(b) for b in bands), default=1)
         row_h = (h - 32) / max(1, total)
         col_w = w / (max_row_cnt + 1)
         self._circle_d = int(max(16, min(48, row_h * 0.82, col_w * 0.78)))
-        for ri, rk in enumerate(sorted_rows):
+        # formation_row_bands는 뒤(GK)→앞(공격) 순서로 주는데 화면은
+        # 위=공격이므로 역순으로 그린다(기존 _row_priority와 동일한 결과).
+        for ri, band in enumerate(reversed(bands)):
             # 같은 행 안에서 _pos_x_order 기준 좌→우 정렬 (원본 인덱스는 유지)
-            poss = sorted(rows[rk], key=lambda t: _pos_x_order(t[1]))
+            poss = sorted(band, key=lambda t: _pos_x_order(t[1]))
             cnt = len(poss)
             ry = 16 + int((ri + 0.5) * (h - 32) / total)
             for ci, (idx, pos) in enumerate(poss):
@@ -2842,7 +2847,7 @@ def _row_key(pos):
 # 통째로 딸려 들어와 PyQt6 없는 헤드리스 환경(headless_runner.py 등)을
 # 깨뜨린다 — 그래서 Qt 의존성 없는 formation_logic.py로 옮기고 여기서는
 # 그걸 import해서 쓴다(로직/동작 완전히 동일, 위치만 이동).
-from formation_logic import _pos_category, _best_slot_for_player, _greedy_fill_slots
+from formation_logic import _pos_category, _best_slot_for_player, _greedy_fill_slots, formation_row_bands
 
 # [2026-08 신설, 신민용 요청: "W/S로 우측 포메이션 기준 위/아래 선수로
 # 이동"] _RosterPanel.set_roster가 "주전(N)" 목록을 그릴 때 쓰는 정렬

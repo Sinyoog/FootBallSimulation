@@ -47,7 +47,14 @@ _PROB_BANDS = [
 ]
 
 
-def _prob_label(prob: float, blocked: bool):
+def _prob_label(prob: float, blocked):
+    """[2026-09 확장, 신민용 리포트 17번] blocked가 이제 사유 문자열이다
+    (game_engine.calc_apply_prob_with_context 참고) — "full"은 로스터 정원
+    마감, 그 외 참(예전 True / "talent")은 재능 미달. 둘은 플레이어가
+    취할 행동이 완전히 달라서(정원은 기다리면 열리고, 재능은 성장해야
+    한다) 라벨을 구분해줘야 한다."""
+    if blocked == "full":
+        return "⛔ 정원 마감 (불가)", "#888888"
     if blocked:
         return "⛔ 재능 부족 (불가)", "#888888"
     for th, label, color in _PROB_BANDS:

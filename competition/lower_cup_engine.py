@@ -42,7 +42,8 @@ from competition.cup_engine import (
     _match_outcome, _resolve_pso, _winner_of,
 )
 from constants import day_to_week, week_to_day, SECOND_HALF_START
-from competition.competition_common import league_day_map, pick_free_day
+from competition.competition_common import (league_day_map, pick_free_day,
+                                            bump_match_day_generation)
 
 LOWER_CUP_BRACKET_CAP = 64
 
@@ -192,7 +193,13 @@ def init_lower_cup_tables(c):
         tournament_id INTEGER, team_id INTEGER, team_name TEXT,
         tier INTEGER, ovr REAL, seed_rank INTEGER DEFAULT 0,
         alive INTEGER DEFAULT 1)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS lower_cup_matches(
+    # [2026-09 신설] 연장 스코어 컬럼(_ET_SCORE_DDL)은 database.py 한 곳에만
+    # 정의돼 있다 — 이 표는 CREATE만 여기 있고 ALTER/검증은 database.py가
+    # 책임지므로, 정의를 복사해오면 바로 "두 곳" 문제가 생긴다. 함수 안에서
+    # import하는 이유는 database.py가 init_db 안에서 이 파일을 import하기
+    # 때문(모듈 레벨이면 순환 import).
+    from database import _ET_SCORE_DDL
+    c.execute(f"""CREATE TABLE IF NOT EXISTS lower_cup_matches(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tournament_id INTEGER, round_name TEXT, round_idx INTEGER, week INTEGER, day INTEGER,
         home_team_id INTEGER, away_team_id INTEGER,
@@ -206,7 +213,9 @@ def init_lower_cup_tables(c):
         -- 완전히 같은 원칙(database.py 주석 참고). 대회 단위 my_team_id는
         -- 이적 시점에 갱신되므로(resync_my_lower_cup_registration) 과거
         -- 경기의 홈/원정 판정 기준으로 쓸 수 없다.
-        my_team_id INTEGER DEFAULT 0)""")
+        my_team_id INTEGER DEFAULT 0,
+        -- [2026-09 신설] 연장 스코어 분리 — database.py _ET_SCORE_COLS 참고.
+        {_ET_SCORE_DDL})""")
     # [2026-09 신설] 기존 세이브 마이그레이션 — 이 테이블들은 database.py의
     # _MIGRATIONS가 아니라 여기서 CREATE되므로 ALTER도 같이 둔다.
     try:
@@ -471,6 +480,9 @@ def _create_po_round(c, tid, pool, po_pool_size, week, my_team_id=None, year=Non
             (tid, "예선 플레이오프", 0, week, day, top[0], bottom[0], is_my, slot,
              my_team_id if is_my else 0))
         slot += 1
+    # [2026-09 신설] 경기일이 새로 생겼으니 _week_intl_cl_day 캐시를 무효화
+    # (competition_common.match_day_generation 주석 참고).
+    bump_match_day_generation()
 
 
 def _create_ko_round(c, tid, team_ids, round_idx, week, my_team_id=None, round_name=None,
@@ -498,6 +510,7 @@ def _create_ko_round(c, tid, team_ids, round_idx, week, my_team_id=None, round_n
             (tid, rname, round_idx, week, day, home, away, is_my, slot,
              my_team_id if is_my else 0))
         slot += 1
+    bump_match_day_generation()   # [2026-09] 위와 동일
 
 
 # ── 주간 처리 (game_engine.py 주간 루프에서 cup_engine.process_cup_week(week)
@@ -720,6 +733,7 @@ def _advance_lower_cup_round(c, tid, week):
                              VALUES (?,?,?,?,?,?,?,?,999)""",
                           (tid, "3·4위전", next_round_idx, next_week, tp_day,
                            losers[0], losers[1], is_my_tp))
+                bump_match_day_generation()   # [2026-09] 위와 동일
                 if t["my_in"]:
                     from competition.cup_engine import _my_country_id
                     from game_engine import add_log, get_player
@@ -1012,6 +1026,12 @@ def simulate_my_lower_cup_match(week, p, day=None):
     engine_stats = None
     engine_plog = None
     player_ratings = None
+    # [2026-09 신설] 정규시간 스코어(연장 결과로 덮어쓰지 않는다) / 연장 진입
+    # 여부 / 교체 기록. 전술엔진이 예외로 폴백하면 그대로 None/False로 남고
+    # 경기 상세는 예전과 똑같이 동작한다.
+    hs90 = as90 = None
+    went_et = False
+    _subs = {"home": [], "away": []}
     try:
         from match_sim.tactical_engine import simulate_my_match
         from game_engine import _team_formation
@@ -1026,8 +1046,12 @@ def simulate_my_lower_cup_match(week, p, day=None):
             away_boost=(bonus if not is_home else 0.0),
             home_boost_position=(my_position if is_home else None),
             away_boost_position=(my_position if not is_home else None),
-            home_adv=0.0)
+            home_adv=0.0,
+            extra_time=True)
         hs, as_ = sim["home_score"], sim["away_score"]
+        hs90, as90 = sim.get("home_score_90", hs), sim.get("away_score_90", as_)
+        went_et = bool(sim.get("went_extra_time"))
+        _subs = {"home": sim.get("home_subs") or [], "away": sim.get("away_subs") or []}
         engine_stats = {"home": sim["home_stats"], "away": sim["away_stats"]}
         engine_plog = sim["possession_log"]
         player_ratings = {"home": sim.get("home_player_ratings") or [],
@@ -1066,37 +1090,29 @@ def simulate_my_lower_cup_match(week, p, day=None):
     if m.get("round_name") == "결승" and not (_suspended or _benched) and "big_match_rating" in _pe:
         rating = max(3.0, min(10.0, round(rating + _pe["big_match_rating"], 1)))
 
-    if player_ratings is not None:
-        _side_key = "home" if is_home else "away"
-        _my_list = player_ratings.get(_side_key)
-        if _my_list:
-            _labels = [r.get("position") if r else None for r in _my_list]
-            _idx = None
-            for _i, _lab in enumerate(_labels):
-                if _lab == my_position:
-                    _idx = _i; break
-            if _idx is None:
-                from constants import POSITION_COMPAT
-                for _want in POSITION_COMPAT.get(my_position, [my_position]):
-                    for _i, _lab in enumerate(_labels):
-                        if _lab == _want:
-                            _idx = _i; break
-                    if _idx is not None:
-                        break
-            if _idx is None:
-                for _i, _lab in enumerate(_labels):
-                    if _lab is not None and _lab != "GK":
-                        _idx = _i; break
-            if _idx is not None:
-                _my_list[_idx] = {
-                    "id": None, "name": p.get("name") or "나",
-                    "position": _labels[_idx], "ovr": p.get("ovr", 40),
-                    "goals": goals, "assists": assists,
-                    "shots": detail.get("shots", 0),
-                    "shots_on": detail.get("shots_on", 0),
-                    "saves": saves, "is_gk": (my_position == "GK"),
-                    "rating": rating, "is_me": True,
-                }
+    # [2026-09 버그수정, 신민용 리포트: "2대0인데 골이 3개 어시가 3개"]
+    # 이제 슬롯 치환 직후 "팀 골 합계 == 실제 스코어"를 복원하는 공용
+    # 헬퍼(competition_common.merge_my_slot)로 전 대회를 통일했다 — 자세한
+    # 원인/불변식은 그 함수 주석 참고.
+    # [2026-09 신설, 신민용 리포트: "경기 상세에서 나만 뜨는 것 같은데
+    # 다른 선수들이 골 넣어도 다 뜨게 해줘"] 내가 관여 안 한 우리 팀 득점을
+    # 실제 득점자 이름과 함께 타임라인에 채운다. 반드시 merge_my_slot
+    # **이전에** 불러야 한다 — 이유는 augment_team_goal_events 주석 참고.
+    from competition.competition_common import (merge_my_slot,
+                                                augment_team_goal_events)
+    events = augment_team_goal_events(
+        p, is_home, hs, as_, goals, assists, not (_suspended or _benched),
+        events, engine_plog, player_ratings)
+    _side_key, _idx = merge_my_slot(
+        player_ratings, is_home, my_position,
+        {"id": None, "name": p.get("name") or "나",
+         "position": None, "ovr": p.get("ovr", 40),
+         "goals": goals, "assists": assists,
+         "shots": detail.get("shots", 0),
+         "shots_on": detail.get("shots_on", 0),
+         "saves": saves, "is_gk": (my_position == "GK"),
+         "rating": rating, "is_me": True},
+        hs, as_)
 
     my_result = _my_result(outcome, is_home)
 
@@ -1105,11 +1121,15 @@ def simulate_my_lower_cup_match(week, p, day=None):
         day = _week_intl_cl_day(week, p)
 
     conn = get_conn()
-    conn.execute("""UPDATE lower_cup_matches SET home_score=?, away_score=?,
+    # [2026-09 신설] 기록실용 90분 스코어 — database.py _ET_SCORE_COLS 참고.
+    from database import ET_SCORE_SET_SQL, et_score_values
+    conn.execute(f"""UPDATE lower_cup_matches SET home_score=?, away_score=?,
+                    {ET_SCORE_SET_SQL},
                     pso_winner=?, pso_score=?, my_played=?,
                     my_saves=?, my_goals=?, my_assists=?, my_rating=?, day=?
                     WHERE id=?""",
-                 (hs, as_, pso_winner, pso_score, 0 if (_suspended or _benched) else 1,
+                 (hs, as_, *et_score_values(hs90, as90, went_et),
+                  pso_winner, pso_score, 0 if (_suspended or _benched) else 1,
                   saves, goals, assists, rating, day, m["id"]))
     # [버그수정, 테스트 중 발견] _sim_ai_lower_cup_match는 패자를 alive=0으로
     # 표시하는데, 이 함수(내 팀 경기)는 그걸 빼먹어서 내가 진 경기 이후에도
@@ -1146,7 +1166,9 @@ def simulate_my_lower_cup_match(week, p, day=None):
         p, week, comp_name, is_home, home_disp, away_disp,
         hs, as_, my_result, goals, assists, saves, rating,
         events, not (_suspended or _benched), _benched, detail, pso=pso,
-        engine_stats=engine_stats, engine_plog=engine_plog, player_ratings=player_ratings)
+        engine_stats=engine_stats, engine_plog=engine_plog, player_ratings=player_ratings,
+        match_extra={"score_90": ([hs90, as90] if hs90 is not None else [hs, as_]),
+                     "went_extra_time": went_et, "subs": _subs})
     marker = f" [match:{detail_id}:lower_cup]" if detail_id else ""
 
     add_log("─" * 44, "sep")

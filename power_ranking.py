@@ -567,6 +567,32 @@ class CountryPowerEntry:
     evaluation_year: int = 0
 
 
+@dataclass
+class LeaguePowerEntry:
+    """[2026-09 신설, 신민용 확정: "지금 파워 랭킹은 있는데 리그 랭킹은
+    없더라. 이 랭킹 계산은 (팀 전체 순위 합)/(그 리그 팀 합), 이 값이
+    적을수록 높은 걸로 하는 게 나은 것 같은데 — 프리미어리그를 예시로
+    두면 20개 팀의 순위 합 / 20을 하는 거지"]
+
+    avg_rank가 그 "평균 전체 순위"이고(작을수록 강한 리그), rank는 그
+    avg_rank를 오름차순으로 매긴 리그 순위다. n_teams는 그 해 실제로
+    집계에 들어간 팀 수(= 나눈 값)로, 화면에 그대로 보여준다 — 리그마다
+    팀 수가 다르고(18/20/22팀 등) 승강으로 해마다 바뀔 수도 있어서
+    "무엇으로 나눴는지"가 보이는 게 맞다.
+    """
+    league_id: int
+    league_name: str
+    tier: Optional[int]
+    country: str
+    continent: str
+    avg_rank: float
+    n_teams: int
+    rank: int = 0
+    prev_rank: Optional[int] = None
+    ranking_year: int = 0
+    evaluation_year: int = 0
+
+
 # ══════════════════════════════════════════════════════════════
 # 7. DB 스키마
 # ══════════════════════════════════════════════════════════════
@@ -621,6 +647,35 @@ def ensure_power_ranking_tables(conn):
     # 그 나라 팀들(보통 수십 개)만 범위 스캔한다.
     c.execute("""CREATE INDEX IF NOT EXISTS hist.idx_tpr_year_country
         ON team_power_rankings(ranking_year, country, rank)""")
+    # [2026-09 신설, 성능] 리그 파워랭킹 집계(_aggregate_league_ranks)가 쓰는
+    # (ranking_year → team_id/rank/evaluation_year) 조회를 인덱스만으로
+    # 끝내는 커버링 인덱스. PK(ranking_year, team_id)는 rank/evaluation_year를
+    # 안 담아서 행마다 테이블을 한 번 더 찾아야 했다 — 그 해 행이 11,397개라
+    # 호출당 2만 번 이상(올해+작년) 랜덤 페이지 접근이 발생했다.
+    c.execute("""CREATE INDEX IF NOT EXISTS hist.idx_tpr_year_team_rank
+        ON team_power_rankings(ranking_year, team_id, rank, evaluation_year)""")
+    # [2026-09 신설, 신민용 리포트: "팀이랑 국가는 클릭하면 바로 이전순위가
+    # 뜨는데 리그는 클릭하면 딜레이가 2초정도 있고 켜져"] 리그 순위를
+    # 팀/국가와 **같은 방식으로 저장**한다. 여태 리그 순위만 저장 테이블이
+    # 없어서, 표를 열 때마다(그리고 이력창은 연도마다 한 번씩) "그 리그
+    # 팀들의 전체순위 평균"을 다시 집계했다 — 팀/국가는 rank가 이미
+    # 저장돼 있어 인덱스로 읽으면 끝이라 즉시 떴고, 리그만 느렸다.
+    # 실측(60년 규모, team_power_rankings 683,820행): 이력창 1,860ms.
+    # ensure_league_power_rankings()가 team_power_rankings에는 있는데
+    # 여기 없는 연도를 찾아 한 번에 채운다(기존 세이브도 최초 1회만 비용).
+    c.execute("""CREATE TABLE IF NOT EXISTS hist.league_power_rankings(
+        ranking_year INTEGER, league_id INTEGER, evaluation_year INTEGER,
+        avg_rank REAL, n_teams INTEGER, rank INTEGER, continent_rank INTEGER,
+        PRIMARY KEY(ranking_year, league_id))""")
+    c.execute("""CREATE INDEX IF NOT EXISTS hist.idx_lpr_year_rank
+        ON league_power_rankings(ranking_year, rank)""")
+    c.execute("""CREATE INDEX IF NOT EXISTS hist.idx_lpr_league
+        ON league_power_rankings(league_id, ranking_year)""")
+    # [2026-09 신설] 위 all-years 집계가 쓰는 (team_id, year) 그룹화를
+    # 인덱스만으로 끝내기 위한 인덱스 — 기존 idx_lss_team은 team_id
+    # 하나뿐이라 연도별 묶기에 정렬이 필요했다.
+    c.execute("""CREATE INDEX IF NOT EXISTS hist.idx_lss_team_year
+        ON league_season_standings(team_id, year, league_id)""")
     c.execute("""CREATE TABLE IF NOT EXISTS country_power_rankings(
         ranking_year INTEGER, evaluation_year INTEGER,
         country TEXT, continent TEXT,
@@ -1902,6 +1957,15 @@ def compute_team_power_rankings(conn, evaluation_year: int) -> list:
             (e.ranking_year, e.evaluation_year, e.team_id, e.team_name,
              e.continent, e.country, e.rating, e.rank, e.prev_rank))
     conn.commit()
+    # [2026-09 신설] 리그 순위는 "그 리그 팀들의 전체순위 평균"이라 팀 순위가
+    # 확정된 직후가 유일하게 정확한 계산 시점이다 — 여기서 그 해분만 저장해
+    # 두면 화면 쪽은 저장된 값을 읽기만 한다(ensure_league_power_rankings /
+    # hist.league_power_rankings 정의부 주석 참고). 실패해도 시즌 전환 자체를
+    #막지는 않는다(다음 조회 때 ensure_league_power_rankings가 다시 시도).
+    try:
+        ensure_league_power_rankings(conn)
+    except Exception as _e:
+        print(f"[LPR] 리그 파워랭킹 저장 실패(계속 진행): {_e}")
     return entries
 
 
@@ -2246,6 +2310,345 @@ def _continent_group_for(continent: str) -> list:
         if continent in continents:
             return continents
     return [continent]
+
+
+# ══════════════════════════════════════════════════════════════
+# 리그 파워랭킹 (2026-09 신설)
+#
+# 신민용 확정 산식: (그 리그 팀들의 '전체 순위' 합) / (그 리그 팀 수).
+# 값이 작을수록 강한 리그 — 프리미어리그면 20개 팀의 전체 순위를 더해
+# 20으로 나눈다. 팀/국가 파워랭킹처럼 별도 테이블에 적립하지 않고,
+# 이미 저장된 team_power_rankings(연도별 전체 순위)에서 그때그때 집계한다
+# — 산식이 순위의 평균일 뿐이라 따로 저장할 상태가 없고, 저장해두면
+# 오히려 team_power_rankings와 어긋날 위험만 생긴다.
+#
+# [그 해 어느 리그였나] 팀은 승강으로 리그를 옮기므로 "현재 소속 리그"
+# (teams.league_id)로 과거 연도를 집계하면 틀린다. 그 시즌 순위표
+# 스냅샷(hist.league_season_standings: league_id·year·team_id)이 정확한
+# 근거라 그것을 1순위로 쓰고, 그 해 스냅샷이 없는 팀만 현재 소속으로
+# 폴백한다(최신 연도는 대개 폴백 경로이고, 그 경우엔 현재 소속이 곧
+# 정답이다).
+# ══════════════════════════════════════════════════════════════
+
+# [2026-09 성능, 신민용 리포트: "팀이랑 국가는 클릭하면 바로 이전순위가
+# 뜨는데 리그는 딜레이가 2초정도 있고 켜져"] 실측(4시즌 세이브, team_power_
+# rankings 45,588행): 팀 파워랭킹 8ms vs 리그 파워랭킹 90ms — 11배 차이.
+# 원인은 팀/국가 랭킹은 저장 테이블을 rank 순으로 그냥 읽으면 끝인데,
+# 리그 순위는 "그 리그 팀들의 전체순위 평균"이라 매번 집계를 다시 하고,
+# 그것도 올해분과 작년분(prev_rank용) 두 번 한다는 것이었다. 한 번 집계에
+# team_power_rankings 그 해 전체(11,397행) + 팀→리그 소속표(hist 스냅샷
+# 11,397행 + teams 11,397행)를 파이썬으로 훑는다. 60년 세이브면 그 해
+# 행 수는 그대로여도 테이블이 68만 행이 되어 인덱스 없이는 스캔 비용이
+# 그대로 커진다 — 실제로 사용자가 본 2초가 그 구간이다.
+#
+# 두 가지로 고친다:
+#   1) 아래 두 집계 함수에 세션 캐시를 건다. 지난 연도의 집계 결과는
+#      한 번 확정되면 절대 안 바뀌고, 올해분도 그 해 행 수가 그대로면
+#      안 바뀐다 — 그래서 캐시 키에 "그 해 행 수"를 넣어 새 랭킹이
+#      기록되면 자동으로 무효화된다(수동 무효화 호출이 필요 없다).
+#   2) team_power_rankings에 (ranking_year, team_id, rank, evaluation_year)
+#      커버링 인덱스를 추가한다(ensure_power_ranking_tables 참고) — 기존
+#      PK(ranking_year, team_id)는 rank/evaluation_year를 안 담고 있어
+#      행마다 테이블을 한 번 더 찾아야 했다.
+_LEAGUE_AGG_CACHE: dict = {}
+_LEAGUE_MEMBERSHIP_CACHE: dict = {}
+_LEAGUE_AGG_CACHE_MAX = 80   # 연도 수만큼 쌓이므로 상한을 둔다(60년+여유)
+
+
+def _league_cache_put(cache: dict, key, value):
+    if len(cache) >= _LEAGUE_AGG_CACHE_MAX:
+        cache.clear()
+    cache[key] = value
+    return value
+
+
+def clear_league_power_cache():
+    """[2026-09 신설] 세션 캐시 비우기 — 세이브 로드/새 게임처럼 DB 자체가
+    바뀌는 시점에 부르면 안전하다(부르지 않아도 캐시 키의 행 수가 달라져
+    자동 무효화되지만, 다른 세이브가 우연히 같은 행 수를 가질 수 있으므로
+    명시적으로 비울 수 있는 통로를 남긴다)."""
+    _LEAGUE_AGG_CACHE.clear()
+    _LEAGUE_MEMBERSHIP_CACHE.clear()
+
+
+def _league_membership_for_year(conn, evaluation_year: int) -> dict:
+    """{team_id: league_id} — evaluation_year 시즌에 그 팀이 뛴 리그.
+    hist 스냅샷 우선, 없으면 teams.league_id 폴백.
+    [2026-09 성능] 결과를 세션 캐시에 담는다 — 위 캐시 주석 참고. 키에
+    "그 해 스냅샷 행 수 + 현재 teams 행 수"를 넣어, 스냅샷이 새로 쓰이거나
+    팀이 생기면 자동으로 다시 계산된다."""
+    try:
+        _sig = (
+            conn.execute("SELECT COUNT(*) FROM hist.league_season_standings WHERE year=?",
+                         (evaluation_year,)).fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM teams WHERE league_id IS NOT NULL").fetchone()[0],
+        )
+    except Exception:
+        _sig = None
+    if _sig is not None:
+        _hit = _LEAGUE_MEMBERSHIP_CACHE.get((evaluation_year, _sig))
+        if _hit is not None:
+            return _hit
+    membership = {}
+    try:
+        for tid, lid in conn.execute(
+                "SELECT team_id, league_id FROM hist.league_season_standings WHERE year=?",
+                (evaluation_year,)).fetchall():
+            if lid:
+                membership[tid] = lid
+    except Exception:
+        pass   # hist가 아직 없는 새 세이브 등 — 아래 폴백만 쓴다
+    for tid, lid in conn.execute(
+            "SELECT id, league_id FROM teams WHERE league_id IS NOT NULL").fetchall():
+        membership.setdefault(tid, lid)
+    if _sig is not None:
+        _league_cache_put(_LEAGUE_MEMBERSHIP_CACHE, (evaluation_year, _sig), membership)
+    return membership
+
+
+def _aggregate_league_ranks(conn, ranking_year: int) -> dict:
+    """{league_id: (avg_rank, n_teams, evaluation_year)} — 위 산식 그대로.
+    team_power_rankings에 그 해 행이 없으면 빈 dict.
+    [2026-09 성능] 결과를 세션 캐시에 담는다 — 위 캐시 주석 참고. 키의
+    "그 해 행 수"가 달라지면(새 시즌 랭킹이 기록되면) 자동 무효화된다."""
+    try:
+        _n_rows = conn.execute(
+            "SELECT COUNT(*) FROM team_power_rankings WHERE ranking_year=?",
+            (ranking_year,)).fetchone()[0]
+    except Exception:
+        _n_rows = None
+    if _n_rows == 0:
+        return {}
+    if _n_rows is not None:
+        _hit = _LEAGUE_AGG_CACHE.get((ranking_year, _n_rows))
+        if _hit is not None:
+            return _hit
+    rows = conn.execute(
+        """SELECT team_id, rank, evaluation_year FROM team_power_rankings
+           WHERE ranking_year=?""", (ranking_year,)).fetchall()
+    if not rows:
+        return {}
+    evaluation_year = rows[0][2]
+    membership = _league_membership_for_year(conn, evaluation_year)
+    acc = {}
+    for tid, rank, _ev in rows:
+        lid = membership.get(tid)
+        if not lid or rank is None:
+            continue
+        s, n = acc.get(lid, (0, 0))
+        acc[lid] = (s + rank, n + 1)
+    _out = {lid: (s / n, n, evaluation_year) for lid, (s, n) in acc.items() if n}
+    if _n_rows is not None:
+        _league_cache_put(_LEAGUE_AGG_CACHE, (ranking_year, _n_rows), _out)
+    return _out
+
+
+def _league_meta(conn) -> dict:
+    """{league_id: (league_name, tier, country_name, continent)}."""
+    return {r[0]: (r[1], r[2], r[3], r[4]) for r in conn.execute(
+        """SELECT l.id, l.name, l.tier, cn.name, cn.continent
+           FROM leagues l JOIN countries cn ON l.country_id = cn.id""").fetchall()}
+
+
+LEAGUE_POWER_RANKING_TABS = TEAM_POWER_RANKING_TABS
+
+
+def ensure_league_power_rankings(conn, force: bool = False) -> int:
+    """[2026-09 신설] hist.league_power_rankings를 team_power_rankings와
+    같은 연도까지 채운다(팀/국가 랭킹이 저장 테이블을 쓰는 것과 같은 구조로
+    맞춘 것 — 위 테이블 정의부 주석 참고).
+
+    team_power_rankings에는 있는데 이 표엔 없는 ranking_year만 계산하므로,
+    새 시즌이 기록될 때는 그 한 해만 채우고, 기존 세이브는 최초 1회에만
+    전 연도를 채운다(60년 규모 실측 1초 남짓, 그 뒤로는 영구히 즉시 조회).
+    force=True면 전 연도를 다시 계산한다(산식이 바뀐 경우용).
+    반환: 새로 채운 (연도 × 리그) 행 수."""
+    ensure_power_ranking_tables(conn)
+    have = set()
+    if not force:
+        have = {r[0] for r in conn.execute(
+            "SELECT DISTINCT ranking_year FROM league_power_rankings").fetchall()}
+    want = {r[0] for r in conn.execute(
+        "SELECT DISTINCT ranking_year FROM team_power_rankings").fetchall()}
+    todo = sorted(want - have)
+    if not todo:
+        return 0
+    meta = _league_meta(conn)
+    # 빠진 해가 하나면 그 해만, 여러 해면 한 번의 전체 집계가 훨씬 싸다.
+    if len(todo) == 1:
+        by_year = {todo[0]: _aggregate_league_ranks(conn, todo[0])}
+    else:
+        by_year = _aggregate_league_ranks_all_years(conn)
+    rows = []
+    for y in todo:
+        agg = by_year.get(y) or {}
+        items = [(avg, meta[lid][0], lid, n, ev)
+                 for lid, (avg, n, ev) in agg.items() if lid in meta]
+        items.sort(key=lambda x: (x[0], x[1]))   # 평균 오름차순, 동률은 이름순
+        # 대륙 순위: 같은 해, 같은 대륙 그룹 안에서 다시 센다(팀 쪽
+        # get_team_power_history의 대륙순위와 같은 방식).
+        cont_ct: dict = {}
+        for i, (avg, _nm, lid, n, ev) in enumerate(items, start=1):
+            grp = tuple(_continent_group_for(meta[lid][3]))
+            cont_ct[grp] = cont_ct.get(grp, 0) + 1
+            rows.append((y, lid, ev, avg, n, i, cont_ct[grp]))
+    if rows:
+        conn.executemany(
+            """INSERT INTO league_power_rankings
+                 (ranking_year, league_id, evaluation_year, avg_rank, n_teams,
+                  rank, continent_rank)
+               VALUES(?,?,?,?,?,?,?)
+               ON CONFLICT(ranking_year, league_id) DO UPDATE SET
+                 evaluation_year=excluded.evaluation_year, avg_rank=excluded.avg_rank,
+                 n_teams=excluded.n_teams, rank=excluded.rank,
+                 continent_rank=excluded.continent_rank""", rows)
+        conn.commit()
+    return len(rows)
+
+
+def get_league_power_ranking(conn, ranking_year: int, tab: str = "전체",
+                             limit: int = 400) -> list:
+    """리그 파워랭킹 한 해분. tab이 대륙이면 그 대륙 리그만 남기고 그 안에서
+    순위를 다시 매긴다(팀 쪽 get_team_power_ranking_grouped와 같은 원칙 —
+    평균값 자체는 항상 '전체 순위' 기준이고, 순번만 선택된 범위 안에서
+    다시 센다). prev_rank도 같은 범위에서 작년 순번으로 계산한다."""
+    ensure_power_ranking_tables(conn)
+    ensure_initial_team_power_ranking(conn)
+    # [2026-09 성능] 매번 집계하던 것을 저장 테이블 조회로 바꾼다 —
+    # ensure_league_power_rankings/테이블 정의부 주석 참고. 팀/국가 랭킹과
+    # 완전히 같은 구조(저장된 rank를 인덱스로 읽기)가 됐다.
+    ensure_league_power_rankings(conn)
+    meta = _league_meta(conn)
+    conts = _TAB_TO_CONTINENTS.get(tab)
+
+    def _ranked(year):
+        """[(avg, n, ev, lid, meta), ...] — 저장된 rank 순. tab이 대륙이면
+        그 대륙만 남긴다(순번은 아래에서 이 범위 안에서 다시 센다 — 팀 쪽
+        get_team_power_ranking_grouped와 같은 원칙)."""
+        items = []
+        for lid, avg, n, ev in conn.execute(
+                """SELECT league_id, avg_rank, n_teams, evaluation_year
+                     FROM league_power_rankings WHERE ranking_year=?
+                    ORDER BY rank""", (year,)).fetchall():
+            m = meta.get(lid)
+            if not m:
+                continue
+            if conts and m[3] not in conts:
+                continue
+            items.append((avg, n, ev, lid, m))
+        return items
+
+    prev_rank_by_lid = {lid: i + 1 for i, (_a, _n, _e, lid, _m)
+                        in enumerate(_ranked(ranking_year - 1))}
+    out = []
+    for i, (avg, n, ev, lid, m) in enumerate(_ranked(ranking_year)):
+        if i >= limit:
+            break
+        out.append(LeaguePowerEntry(
+            league_id=lid, league_name=m[0], tier=m[1], country=m[2], continent=m[3],
+            avg_rank=avg, n_teams=n, rank=i + 1,
+            prev_rank=prev_rank_by_lid.get(lid),
+            ranking_year=ranking_year, evaluation_year=ev))
+    return out
+
+
+def _aggregate_league_ranks_all_years(conn) -> dict:
+    """[2026-09 신설, 신민용 리포트: "팀이랑 국가는 클릭하면 바로 이전순위가
+    뜨는데 리그는 딜레이가 2초정도 있고 켜져"] 모든 연도분 리그 평균순위를
+    **쿼리 한 번**으로 집계한다 — {ranking_year: {league_id: (avg, n, ev)}}.
+
+    get_league_power_history가 예전엔 연도마다 _aggregate_league_ranks를
+    한 번씩 불렀다(60년이면 60번, 매번 그 해 11,397행 + 소속표 전체를
+    파이썬으로 훑음). 실측(60년 규모로 부풀린 세이브, team_power_rankings
+    683,820행): 리그 이력창 1,860ms — 사용자가 본 2초가 정확히 이 구간이다.
+    팀/국가 이력창은 저장 테이블을 GROUP BY로 한 번 세는 것뿐이라 즉시
+    떴으므로(그쪽은 예전에 같은 N+1을 이미 고쳐놨다) 리그만 느렸다.
+
+    팀→리그 소속 판정은 _aggregate_league_ranks와 같다: 그 해(evaluation_
+    year) hist 스냅샷 우선, 없으면 teams.league_id 폴백. 스냅샷에 같은 팀이
+    한 해에 두 줄 있으면(승강 등 이례적 경우) id가 큰 쪽을 쓰는데, 이는
+    파이썬 판본이 "나중에 읽은 행이 덮어쓴다"로 동작했던 것과 같은 결과다.
+    """
+    rows = conn.execute(
+        """SELECT t.ranking_year AS ry,
+                  COALESCE(m.league_id, tm.league_id) AS lid,
+                  SUM(t.rank) AS s, COUNT(*) AS n, MIN(t.evaluation_year) AS ev
+           FROM team_power_rankings t
+           LEFT JOIN (SELECT team_id, year, MAX(id) AS _mx, league_id
+                        FROM hist.league_season_standings
+                       GROUP BY team_id, year) m
+                  ON m.team_id = t.team_id AND m.year = t.evaluation_year
+           LEFT JOIN teams tm ON tm.id = t.team_id
+          WHERE t.rank IS NOT NULL AND COALESCE(m.league_id, tm.league_id) IS NOT NULL
+          GROUP BY ry, lid""").fetchall()
+    out: dict = {}
+    for ry, lid, ssum, n, ev in rows:
+        if not n:
+            continue
+        out.setdefault(ry, {})[lid] = (ssum / n, n, ev)
+    # 연도별 행 수를 같이 구해 단일연도 캐시(_LEAGUE_AGG_CACHE)에도 심어둔다
+    # — 이력창을 한 번 열면 그 뒤의 파워랭킹 표 조회가 전부 캐시에 걸린다.
+    try:
+        for ry, n_rows in conn.execute(
+                "SELECT ranking_year, COUNT(*) FROM team_power_rankings "
+                "GROUP BY ranking_year").fetchall():
+            if ry in out:
+                _league_cache_put(_LEAGUE_AGG_CACHE, (ry, n_rows), out[ry])
+    except Exception:
+        pass
+    return out
+
+
+def get_league_power_history(conn, league_id: int) -> list:
+    """[2026-09 신설, 신민용 요청: "새롭게 만들 리그도 연도 | 전체 순위 |
+    대륙 순위 이렇게 표시되게"] (ranking_year, 전체순위, 대륙순위) 최신
+    연도부터. 리그 순위는 저장 테이블이 아니라 집계값이라 연도마다 한 번씩
+    집계해야 한다 — 연도 수만큼 반복되지만 team_power_rankings 조회 한 번 +
+    파이썬 합산이고, 이력 창은 더블클릭할 때 한 번만 열린다."""
+    ensure_power_ranking_tables(conn)
+    meta = _league_meta(conn)
+    m = meta.get(league_id)
+    if not m:
+        return []
+    my_conts = _continent_group_for(m[3])
+    # [2026-09 성능] 연도마다 전세계 집계를 다시 하던 N+1(실측 60년 규모
+    # 1,860ms)을 저장 테이블 조회 한 번으로 바꾼다 — 팀/국가 이력창과
+    # 완전히 같은 구조가 됐다(ensure_league_power_rankings 주석 참고).
+    ensure_league_power_rankings(conn)
+    return [(y, rk, crk) for y, rk, crk in conn.execute(
+        """SELECT ranking_year, rank, continent_rank FROM league_power_rankings
+            WHERE league_id=? ORDER BY ranking_year DESC""", (league_id,)).fetchall()]
+
+
+def get_country_power_history_with_continent(conn, country: str) -> list:
+    """[2026-09 신설, 신민용 요청: "국가에도 대륙순위 추가"]
+    (ranking_year, 전체순위, 대륙순위) 최신 연도부터 — 대륙 순위는 팀 쪽
+    get_team_power_history과 완전히 같은 방식(같은 해, 같은 대륙 범위에서
+    rank <= 내 rank인 국가 수)으로 세며, 연도 수와 무관하게 쿼리 2번으로
+    끝낸다(그쪽의 N+1 수정과 같은 GROUP BY 집계)."""
+    ensure_power_ranking_tables(conn)
+    ensure_initial_country_power_ranking(conn)
+    rows = conn.execute(
+        """SELECT ranking_year, rank, continent FROM country_power_rankings
+           WHERE country=? ORDER BY ranking_year DESC""", (country,)).fetchall()
+    if not rows:
+        return []
+    years_by_group = {}
+    for r in rows:
+        years_by_group.setdefault(tuple(_continent_group_for(r[2])), []).append(r[0])
+    cont_rank = {}
+    for group in years_by_group:
+        placeholders = ",".join("?" * len(group))
+        for y, cnt in conn.execute(
+                f"""SELECT p.ranking_year, COUNT(*)
+                    FROM country_power_rankings p
+                    JOIN country_power_rankings me
+                      ON me.country=? AND me.ranking_year=p.ranking_year
+                    WHERE p.continent IN ({placeholders}) AND p.rank<=me.rank
+                    GROUP BY p.ranking_year""",
+                (country, *group)).fetchall():
+            cont_rank[y] = cnt
+    return [(r[0], r[1], cont_rank.get(r[0], 1)) for r in rows]
 
 
 def get_team_power_history(conn, team_id: int) -> list:

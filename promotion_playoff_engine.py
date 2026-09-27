@@ -143,6 +143,15 @@ def _sim_one(conn, m) -> None:
     if outcome == "draw":
         # PO는 전부 단판(KO) 성격이라 무승부는 항상 승부차기로 간다 —
         # intl_engine/club_world_cup_engine의 KO 스테이지와 동일한 처리.
+        #
+        # [2026-09] 내가 뛰는 PO 경기(simulate_my_po_match)는 이제 연장
+        # 15+15를 거친 뒤 승부차기로 가지만, AI끼리는 여기 그대로 즉시
+        # 승부차기다 — 신민용 확정대로 "AI 경기 연장"은 별도 설계 항목이다.
+        # 이 경로는 _gen_score 확률표라 91~120분에 대응하는 시뮬레이션 구간이
+        # 없고, 연장 득점률을 정규시간과 다르게 잡는 별도 모델이 필요하다.
+        # 그래서 이 경기들의 home_score_90/away_score_90은 -1(미기록)로
+        # 남고, 정의상 90분 스코어 == 최종 스코어다(database.py
+        # _ET_SCORE_COLS의 하위호환 규칙 (c) 항목).
         winner_home, pso = _resolve_pso(h_ovr, a_ovr)
         conn.execute(
             """UPDATE po_matches SET home_score=?, away_score=?,
@@ -563,7 +572,7 @@ def simulate_my_po_match(week, p, day=None):
                              _save_match_detail, _soft_cap,
                              _check_suspended, _check_bench, _roll_red_card,
                              _apply_red_card_dismissal,
-                             _roll_card_events)
+                             _roll_card_events, _home_advantage)
     from database import get_conn
     info = get_my_po_match(week, day=day, p=p)
     if not info:
@@ -609,13 +618,86 @@ def simulate_my_po_match(week, p, day=None):
     else:
         h_ovr, a_ovr = opp_ovr_team, my_ovr_team + bonus
 
-    outcome = _match_outcome(h_ovr, a_ovr)
+    # ══════════════════════════════════════════════════════════════
+    # [2026-09 재설계, 신민용 확정: "승격 PO도 이제 연장 가야 돼, 단판전이라"]
+    #
+    # 승강 PO는 전부 단판(KO)이다 — PLAYOFF_RULES의 Q1/SF1/SF2/LF/F가 모두
+    # 1경기씩이고, 44주 한 주(PLAYOFF_MATCH_DAYS 4슬롯)에 다 들어가야 해서
+    # 2차전 합산 구조는 애초에 캘린더가 허용하지 않는다. 단판이면 정규시간
+    # 무승부를 연장으로 푸는 게 다른 단판 KO 대회(국내컵/챔스 KO/클럽월드컵
+    # KO/국내슈퍼컵)와 같은 규칙이다 — 그래서 합산 스코어(agg_home/agg_away)는
+    # 넣지 않는다. 필요한 건 연장뿐이다.
+    #
+    # 예전에는 _match_outcome → 무승부면 즉시 _resolve_pso → _gen_score로
+    # 스코어만 따로 뽑았다(전술엔진 미사용). 그래서 PO만 22명 평점·교체
+    # 기록·연장이 전부 없었고, 경기 상세에 라인업+평점 섹션이 안 떴다.
+    # 이제 cup_engine.simulate_my_cup_match와 같은 구조로 통일한다:
+    #   전술엔진(extra_time=True) → 90분 동점이면 연장 15+15
+    #                             → 그래도 동점이면 승부차기
+    #   예외 발생 시에만 기존 _match_outcome/_gen_score 폴백(동작 동일)
+    #
+    # AI끼리의 PO 경기(_sim_one)는 그대로 둔다 — 그쪽은 분 단위 루프가 아니라
+    # _gen_score 확률표라 "연장 30분"에 대응하는 구간이 없고, 연장 득점 확률을
+    # 별도 모델로 만들어야 하는 설계 항목이라 신민용 확정대로 분리했다.
+    # ══════════════════════════════════════════════════════════════
+    my_position = p.get("position", "")
+    engine_stats = None
+    engine_plog = None
+    player_ratings = None
+    # 정규시간 스코어(연장 결과로 덮어쓰지 않는다) / 연장 진입 여부 / 교체 기록.
+    # 폴백 경로에서는 None/False로 남고, 기록실·경기 상세는 예전처럼 최종
+    # 스코어만 보여준다(database.py _ET_SCORE_COLS 참고).
+    hs90 = as90 = None
+    went_et = False
+    _subs = {"home": [], "away": []}
+    try:
+        from match_sim.tactical_engine import simulate_my_match as _sim_tactical
+        from game_engine import _team_formation
+        _fconn = get_conn()
+        _c = _fconn.cursor()
+        home_formation = _team_formation(_c, m["home_team_id"])
+        away_formation = _team_formation(_c, m["away_team_id"])
+        _fconn.close()
+        sim = _sim_tactical(
+            m["home_team_id"], m["away_team_id"], home_formation, away_formation,
+            home_boost=(bonus if is_home else 0.0),
+            away_boost=(bonus if not is_home else 0.0),
+            home_boost_position=(my_position if is_home else None),
+            away_boost_position=(my_position if not is_home else None),
+            # [밸런스 판단 지점] 승강 PO는 중립 구장이 아니라 실제 홈/원정이
+            # 있다(po_matches의 home_team_id/away_team_id가 대진 생성 시점에
+            # 확정된다). 그래서 champions_engine/competition_common의 비중립
+            # 스테이지와 같은 규칙으로 _home_advantage()를 넘긴다.
+            #
+            # 참고: 예전 경로(_match_outcome, neutral=False)는 홈 어드밴티지를
+            # 별도 항이 아니라 승패 확률 곡선 자체의 비대칭(diff=0에서 홈 46%
+            # /원정 30%)으로 갖고 있었다. 전술엔진은 그 곡선을 안 쓰고 분 단위로
+            # 시뮬레이션하므로, 여기서 0.0을 넘기면 홈 이점이 통째로 사라진다 —
+            # 승강이 결정되는 경기라서 그게 더 위험하다고 보고 넘기는 쪽을 택했다.
+            # (국내컵/3·4부컵은 반대로 0.0을 넘긴다 — 그쪽은 "기존 수치를 그대로
+            # 보존"을 우선한 선택이다. 완전한 이전 동작 재현을 원하면 0.0으로.)
+            home_adv=_home_advantage(),
+            extra_time=True)
+        hs, as_ = sim["home_score"], sim["away_score"]
+        hs90, as90 = sim.get("home_score_90", hs), sim.get("away_score_90", as_)
+        went_et = bool(sim.get("went_extra_time"))
+        _subs = {"home": sim.get("home_subs") or [], "away": sim.get("away_subs") or []}
+        engine_stats = {"home": sim["home_stats"], "away": sim["away_stats"]}
+        engine_plog = sim["possession_log"]
+        player_ratings = {"home": sim.get("home_player_ratings") or [],
+                          "away": sim.get("away_player_ratings") or []}
+        outcome = "draw" if hs == as_ else ("home" if hs > as_ else "away")
+    except Exception:
+        outcome = _match_outcome(h_ovr, a_ovr)
+        hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
+
     pso_winner, pso_score = 0, ""
     if outcome == "draw":
-        # PO는 전부 단판(KO)이라 무승부는 항상 승부차기.
+        # 연장까지 갔는데도 동점이면 승부차기 — 위 전술엔진 경로에서는 이미
+        # 연장 15+15를 치른 뒤의 동점이고, 폴백 경로에서는 예전처럼 정규시간
+        # 무승부 즉시 승부차기다.
         win_home, pso_score = _resolve_pso(h_ovr, a_ovr)
         pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
-    hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
 
     if _suspended or _benched:
         goals, assists, saves, rating = 0, 0, 0, 0.0
@@ -637,15 +719,45 @@ def simulate_my_po_match(week, p, day=None):
             events = list(events) + _yellow_ev
     if not (_suspended or _benched) and "big_match_rating" in _pe:
         rating = max(3.0, min(10.0, round(rating + _pe["big_match_rating"], 1)))
+
+    # [2026-09 신설] "나" 슬롯 바꿔치기 — 전술엔진 로스터엔 "나"가 없으므로
+    # 포지션이 같은 슬롯을 방금 계산된 내 실제 기록으로 덮어쓰고, 그 직후
+    # "팀 골 합계 == 실제 스코어"를 복원한다(신민용 리포트 "2대0인데 골이
+    # 3개 어시가 3개"의 재발 방지 — 불변식은 merge_my_slot 주석 참고).
+    # 폴백 경로(player_ratings=None)에서는 헬퍼가 그대로 no-op이다.
+    # [2026-09 신설, 신민용 리포트: "다른 선수들이 골 넣어도 다 뜨게 해줘"]
+    # 내가 관여 안 한 우리 팀 득점을 실제 득점자 이름과 함께 타임라인에
+    # 채운다. 반드시 merge_my_slot 이전 — augment_team_goal_events 주석 참고.
+    from competition.competition_common import (merge_my_slot,
+                                                augment_team_goal_events)
+    events = augment_team_goal_events(
+        p, is_home, hs, as_, goals, assists, not (_suspended or _benched),
+        events, engine_plog, player_ratings)
+    merge_my_slot(
+        player_ratings, is_home, my_position,
+        {"id": None, "name": p.get("name") or "나",
+         "position": None, "ovr": p.get("ovr", 40),
+         "goals": goals, "assists": assists,
+         "shots": detail.get("shots", 0),
+         "shots_on": detail.get("shots_on", 0),
+         "saves": saves, "is_gk": (my_position == "GK"),
+         "rating": rating, "is_me": True},
+        hs, as_)
+
     my_result = _my_result(outcome, is_home)
 
     conn = get_conn()
+    # [2026-09 신설] 기록실용 90분 스코어 — database.py _ET_SCORE_COLS 참고.
+    from database import ET_SCORE_SET_SQL, et_score_values
     conn.execute(
-        """UPDATE po_matches SET home_score=?, away_score=?, pso_winner=?, pso_score=?,
+        f"""UPDATE po_matches SET home_score=?, away_score=?,
+           {ET_SCORE_SET_SQL},
+           pso_winner=?, pso_score=?,
            is_my=1, my_played=?, my_position=?, my_saves=?, my_goals=?, my_assists=?, my_rating=?,
            my_absence_reason=?, my_yellow_cards=?
            WHERE id=?""",
-        (hs, as_, pso_winner, pso_score,
+        (hs, as_, *et_score_values(hs90, as90, went_et),
+         pso_winner, pso_score,
          0 if (_suspended or _benched) else 1, _get_field_pos_safe(p) if not _benched else "",
          saves, goals, assists, rating, _absence_reason, _yellow_cnt, m["id"]))
     conn.commit()
@@ -672,10 +784,16 @@ def simulate_my_po_match(week, p, day=None):
     home_disp = my_team_name if is_home else opp_name
     away_disp = opp_name if is_home else my_team_name
     pso = {"won": pso_winner == my_tid, "score": pso_score} if pso_winner else None
+    # [2026-09 신설] 22명 라인업/평점·포제션·교체·정규시간 스코어를 경기
+    # 상세에 같이 넘긴다 — 여태 이 4개를 안 넘겨서 승강 PO만 경기 상세에
+    # 라인업+평점 섹션이 통째로 안 떴다(다른 대회는 전부 넘긴다).
     detail_id = _save_match_detail(
         p, week, "승강 플레이오프", is_home, home_disp, away_disp,
         hs, as_, my_result, goals, assists, saves, rating,
-        events, not (_suspended or _benched), _benched, detail, pso=pso)
+        events, not (_suspended or _benched), _benched, detail, pso=pso,
+        engine_stats=engine_stats, engine_plog=engine_plog, player_ratings=player_ratings,
+        match_extra={"score_90": ([hs90, as90] if hs90 is not None else [hs, as_]),
+                     "went_extra_time": went_et, "subs": _subs})
     marker = f" [match:{detail_id}:po]" if detail_id else ""
 
     add_log("─" * 44, "sep")

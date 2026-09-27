@@ -598,6 +598,19 @@ class PlayerPanel(QWidget):
                 _rel_txt, _mt_txt = "-", "-"
             self.info_lay.addWidget(_info_row_2val(
                 "감독관계", _rel_txt, _mt_txt))
+        # [2026-09 신설, 신민용 요청: "감독 관계와 구단 목표 사이에 감독
+        # 전술이란 새로운 창을 넣고 거기엔 감독이 어떤 전술을 쓰는지 간단
+        # 하게 표시"] 감독관계(성향=선수 관리 축)와 구단 목표 사이에, 감독의
+        # **전술 축**을 한 줄로 넣는다. 두 축은 서로 독립이다 — "성과주의 +
+        # 점유 빌드업"과 "성과주의 + 롱볼"이 둘 다 성립한다(감독 시스템
+        # ②단계 참고). 값은 한 번만 조회해 기본/시즌 두 탭에서 같이 쓴다.
+        _tac_txt, _tac_tip = _manager_tactic_texts(
+            p.get("current_team_id") if _has_team else 0)
+        if not _hard:
+            _tac_row = _info_row("감독 전술", _tac_txt)
+            if _tac_tip:
+                _tac_row.setToolTip(_tac_tip)
+            self.info_lay.addWidget(_tac_row)
         # [2026-08 신설, 신민용 요청: "감독관계 아래에 구단 목표도
         # 표시해달라 — 구단 목표: 중위권 안정 이런 식으로"] club_ambition은
         # 이미 "중위권 안정"/"우승 도전" 같은 한글 문구 그대로 저장돼
@@ -624,6 +637,13 @@ class PlayerPanel(QWidget):
                 _rel2_txt, _mt2_txt = "-", "-"
             self.season_top_lay.addWidget(_info_row_2val(
                 "감독관계", _rel2_txt, _mt2_txt))
+        # 기본 탭과 동일하게 시즌 탭에도 감독관계 바로 아래 / 구단 목표 위에
+        # 같은 줄을 넣는다(위 기본 탭 주석 참고 — 조회 결과를 재사용한다).
+        if not _hard:
+            _tac_row2 = _info_row("감독 전술", _tac_txt)
+            if _tac_tip:
+                _tac_row2.setToolTip(_tac_tip)
+            self.season_top_lay.addWidget(_tac_row2)
         # [2026-08 신설, 신민용 요청] 기본 탭과 동일하게 시즌 탭 요약에도
         # 감독관계 바로 아래에 구단 목표를 추가 — season_top_frame이
         # lbl_rank(순위, "공동 10위/14팀") 바로 위에 배치돼 있으므로
@@ -789,6 +809,48 @@ class PlayerPanel(QWidget):
             self._order.remove("스탯")
             self._sync_tab_buttons()
             self._rebuild_content()
+
+
+def _manager_tactic_texts(team_id):
+    """[2026-09 신설, 신민용 요청: "감독 관계와 구단 목표 사이에 감독 전술
+    이란 새로운 창을 넣고 거기엔 감독이 어떤 전술을 쓰는지 간단하게 표시"]
+
+    그 팀 현재 감독의 전술 3축을 (한 줄 축약, 툴팁 전체) 두 벌로 돌려준다.
+    감독이 없거나(구세이브·무소속) 조회에 실패하면 ("-", "") — 호출부는
+    감독관계/구단 목표와 똑같이 "-"로 표시한다.
+
+    3축의 의미는 constants.MANAGER_BUILDUP_STYLES 주석 참고:
+      공격 성향(style_attack) / 빌드업(style_buildup) / 압박(style_press).
+    좁은 한 줄에 다 넣어야 해서 본문은 축약 표기(*_SHORT_KO)를 쓰고,
+    전체 표기는 툴팁으로 붙인다.
+    """
+    if not team_id:
+        return "-", ""
+    try:
+        from database import get_team_manager
+        m = get_team_manager(team_id)
+    except Exception:
+        m = None
+    if not m:
+        return "-", ""
+    from constants import (TACTIC_TENDENCY_KO, MANAGER_BUILDUP_KO, MANAGER_PRESS_KO,
+                           MANAGER_BUILDUP_SHORT_KO, MANAGER_PRESS_SHORT_KO)
+    atk = TACTIC_TENDENCY_KO.get(m.get("style_attack"), "")
+    bld_s = MANAGER_BUILDUP_SHORT_KO.get(m.get("style_buildup"), "")
+    prs_s = MANAGER_PRESS_SHORT_KO.get(m.get("style_press"), "")
+    short = " · ".join(x for x in (atk, bld_s, prs_s) if x) or "-"
+
+    bld = MANAGER_BUILDUP_KO.get(m.get("style_buildup"), "")
+    prs = MANAGER_PRESS_KO.get(m.get("style_press"), "")
+    _name = (m.get("name") or "").strip()
+    _tip_lines = [f"{_name} 감독" if _name else "현재 감독"]
+    if atk:
+        _tip_lines.append(f"공격 성향: {atk}")
+    if bld:
+        _tip_lines.append(f"빌드업: {bld}")
+    if prs:
+        _tip_lines.append(f"수비 라인: {prs}")
+    return short, "\n".join(_tip_lines)
 
 
 def _info_row(key, val):

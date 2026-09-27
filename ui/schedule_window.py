@@ -338,14 +338,168 @@ class ScheduleWindow(QDialog):
         self._fill_tabs()
         self._last_sig = self._compute_sig()
 
+    # ══════════════════════════════════════════════════════════════
+    # [2026-09 재설계, 신민용 요청: "경기 일정도 좀 더 깔끔하게 만들려고
+    # 하는데, 지금은 위에 전체 줄에 '챔피언스리그 | 챔피언스리그(본선) |
+    # 컵대회(내 경기) | 컵대회(전체일정)' 이렇게 뜨는데, 맨 위 대분류에는
+    # '국제대회 | 챔피언스리그 | 컵대회' 이렇게 뜨고 그걸 클릭하면 화면
+    # 맨 위에 챔피언스리그 기준으로 말하면 '리그스테이지 | 본선' 이런 식
+    # 으로 나눠서 화면을 볼 수 있게 하고 싶어. 월드컵 같은 경우는 월드컵
+    # 클릭하면 '예선전 | 조별리그 | 본선' 이렇게 뜨며"]
+    #
+    # 예전에는 QTabWidget 하나에 최대 20개 탭(대회 × 단계)을 평면으로
+    # 전부 붙였다 — 탭 바가 스크롤될 만큼 길어지고, 같은 대회의 리그
+    # 스테이지와 본선이 멀리 떨어져 붙는 일도 있었다. 이제 2단이다:
+    #   1단(대분류) = 대회. 창 맨 위 버튼 줄(_cat_bar).
+    #   2단(단계)   = 그 대회의 예선/조별리그/본선/내 경기/전체 일정.
+    #                 기존 QTabWidget(self._tab)을 그대로 재사용한다 —
+    #                 스크롤 위치 복원·지연 로딩(_sched_lazy_builders)
+    #                 같은 기존 장치가 전부 그대로 살아있다.
+    #
+    # 부수 효과로 성능도 좋아진다: 지금 보고 있는 대회 하나의 단계 탭만
+    # 만들므로, 창을 열 때 세우는 위젯 수가 20개대에서 2~4개로 줄어든다
+    # (기존 [PERF-SCHED] 계측의 "탭 렌더링 고정비용"이 곧 이 개수였다).
+    #
+    # "내가 예선에서 탈락하면 조별리그·본선이 떠도 내 팀은 안 뜬다"는
+    # 요청사항은 각 _make_*_tab이 이미 '내가 참가한 대회만 내 경기로
+    # 표시'하는 구조라 이 재편으로 달라지는 것이 없다(대분류가 보이는
+    # 것과 그 안에 내 경기가 있는 것은 별개).
+    # ══════════════════════════════════════════════════════════════
+    _SCHED_EMPTY_LABEL = "일정 없음"
+
+    def _sched_category_defs(self):
+        """[(대분류 라벨, [(단계 라벨, 빌더, 지연여부), ...]), ...].
+
+        빌더는 위젯을 만들거나 내용이 없으면 None을 돌려주는 콜러블이다
+        (기존 _make_*_tab들의 계약 그대로). 지연여부=True면 그 탭을 실제로
+        클릭할 때까지 안 만든다 — 행이 수백 개까지 가는 '전체 일정' 계열만
+        해당하며, 이건 예전 구조에서 쓰던 기준을 그대로 옮긴 것이다.
+        """
+        from competition import europa_engine, conference_engine, super_cup_engine
+
+        def _league_data():
+            if getattr(self, "_sched_data_cache", None) is None:
+                _all = get_schedule(self.league_id, self.season)
+                _mine = [r for r in _all
+                         if r["home_team_id"] == self.my_team_id
+                         or r["away_team_id"] == self.my_team_id]
+                self._sched_data_cache = (_all, _mine)
+            return self._sched_data_cache
+
+        defs = [
+            ("📅 리그", [
+                ("내 경기", lambda: self._make_table(_league_data()[1], my_view=True), False),
+                ("전체 일정", lambda: self._make_table(_league_data()[0], my_view=False), True),
+            ]),
+            # 월드컵·대륙컵·지역컵 — 신민용 요청의 "예선전 | 조별리그 | 본선".
+            # 예선 플레이오프는 그 체제(아시아/북미/아프리카 등)에서만 경기가
+            # 생기므로 빌더가 None을 돌려주면 자동으로 빠진다.
+            # [2026-09 확장, 신민용 리포트 19번] 2단계 예선(아시아/북미/
+            # 아프리카 월드컵 예선)은 1차·2차를 각각 자기 탭으로 둔다 —
+            # 예전엔 탭 하나를 갈아끼워서 2차가 시작되면 1차가 사라졌다.
+            # 단일 예선 대회는 "예선 2차" 빌더가 None을 돌려줘 자동으로
+            # 탭이 안 생긴다. 랭킹 평가전(power_eval)은 예선이 아니라
+            # 별도 대회라 자기 탭을 갖는다(예전엔 get_my_tournament의
+            # kind 화이트리스트에 없어 어디에도 안 떴다).
+            ("🌍 국제대회", [
+                ("예선 1차", lambda: self._make_intl_tab("groups", qual=True, stage=1), False),
+                ("예선 2차", lambda: self._make_intl_tab("groups", qual=True, stage=2), False),
+                ("예선 플레이오프", lambda: self._make_intl_tab("qual_po", qual=True), False),
+                ("조별리그", lambda: self._make_intl_tab("groups", qual=False), False),
+                ("본선", lambda: self._make_intl_tab("ko", qual=False), False),
+                ("랭킹 평가전", lambda: self._make_intl_tab(
+                    "groups", kinds=("power_eval", "power_eval_extra")), False),
+                ("랭킹 평가전 본선", lambda: self._make_intl_tab(
+                    "ko", kinds=("power_eval",)), False),
+            ]),
+            ("🏆 챔피언스리그", [
+                ("리그 스테이지", lambda: self._make_champions_tab("groups"), False),
+                ("본선", lambda: self._make_champions_tab("ko"), False),
+            ]),
+            ("🥈 유로파리그", [
+                ("리그 스테이지", lambda: self._make_champions_tab(
+                    "groups", engine=europa_engine, comp_title="유로파리그",
+                    header_color="#F28C28"), False),
+                ("본선", lambda: self._make_champions_tab(
+                    "ko", engine=europa_engine, comp_title="유로파리그",
+                    header_color="#F28C28"), False),
+            ]),
+            ("🥉 컨퍼런스리그", [
+                ("리그 스테이지", lambda: self._make_champions_tab(
+                    "groups", engine=conference_engine, comp_title="컨퍼런스리그",
+                    header_color="#20A464"), False),
+                ("본선", lambda: self._make_champions_tab(
+                    "ko", engine=conference_engine, comp_title="컨퍼런스리그",
+                    header_color="#20A464"), False),
+            ]),
+            # 슈퍼컵은 리그 스테이지가 없는 4팀 다이렉트 토너먼트 —
+            # 예전과 같이 대진표 한 장뿐이다(색상도 기존 버건디 유지).
+            ("🏵 슈퍼컵", [
+                ("대진표", lambda: self._make_champions_tab(
+                    "ko", engine=super_cup_engine, comp_title="슈퍼컵",
+                    header_color="#800020"), False),
+            ]),
+            ("🌎 클럽 월드컵", [
+                ("조별리그", lambda: self._make_cwc_tab(), False),
+                ("본선", lambda: self._make_cwc_bracket_tab(), False),
+            ]),
+            ("🎖️ 컵대회", [
+                ("내 경기", lambda: self._make_cup_tab(my_view=True), False),
+                ("전체 일정", lambda: self._make_cup_tab(my_view=False), True),
+                ("본선", lambda: self._make_cup_bracket_tab(), False),
+            ]),
+            ("🏅 3부·4부컵", [
+                ("내 경기", lambda: self._make_lower_cup_tab(my_view=True), False),
+                ("전체 일정", lambda: self._make_lower_cup_tab(my_view=False), True),
+            ]),
+            ("⚖ 승강 플레이오프", [
+                ("대진표", lambda: self._make_po_tab(), False),
+            ]),
+        ]
+        return defs
+
+    def _sched_lazy_tab_exists(self, cat_label, sub_label):
+        """지연 로딩 탭은 만들어보지 않고 존재 여부를 판단해야 한다 —
+        예전 구조가 쓰던 싼 COUNT 프로브(_cup_all_exists / _lower_cup_all_
+        exists)를 그대로 재사용한다. 리그 '전체 일정'은 이미 조회해둔
+        데이터라 행이 있는지만 본다."""
+        if cat_label == "🎖️ 컵대회":
+            return self._cup_all_exists()
+        if cat_label == "🏅 3부·4부컵":
+            return self._lower_cup_all_exists()
+        return True
+
+    def _build_category_bar(self, cat_labels):
+        """대분류 버튼 줄. 목록(대회 종류)은 세이브 진행과 무관하게 고정이라
+        한 번만 만들고, 이후 _fill_tabs에서는 선택 표시만 갱신한다."""
+        self._cat_buttons = {}
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        for label in cat_labels:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setMinimumWidth(96)
+            btn.setStyleSheet(
+                "QPushButton{background:#242424;color:#bbb;border:1px solid #3a3a3a;"
+                "border-radius:4px;padding:5px 10px;font-size:12px;}"
+                "QPushButton:hover{background:#2e2e2e;color:#eee;}"
+                "QPushButton:checked{background:#00cc44;color:#111;font-weight:bold;"
+                "border:1px solid #00cc44;}")
+            btn.clicked.connect(lambda _c, l=label: self._on_sched_category_clicked(l))
+            row.addWidget(btn)
+            self._cat_buttons[label] = btn
+        row.addStretch(1)
+        return row
+
+    def _on_sched_category_clicked(self, cat_label):
+        self._sched_current_cat = cat_label
+        self._fill_tabs()
+
     def _fill_tabs(self):
         # [2026-08 계측 추가, 신민용 리포트: "경기 일정 클릭할 때 약간
-        # 렉이 있거든"] 경기일정 버튼 클릭 → ScheduleWindow.__init__ →
-        # _build() → _fill_tabs()가 탭 13개(내경기/전체일정/국제대회
-        # 본선·예선·예선PO/챔스 그룹·본선/CWC 그룹·본선/승강PO/컵대회
-        # 내경기·전체·브래킷)를 전부 동기적으로 그린 뒤에야 창이 보인다 —
-        # 어느 탭이 실제로 무거운지 원인 확정 전이므로 로직은 그대로 두고
-        # 구간별 시간만 찍는다.
+        # 렉이 있거든"] 구간별 시간을 찍어 어느 단계가 무거운지 본다.
+        # [2026-09] 2단 구조로 바뀐 뒤로는 "지금 고른 대분류 하나"만
+        # 세우므로 계측 대상도 그만큼 줄었다.
         import time as _time_sw
         _sw_t0 = _time_sw.perf_counter()
         _sw_marks = []
@@ -353,6 +507,7 @@ class ScheduleWindow(QDialog):
         # _make_champions_tab의 groups/ko 중복 호출 제거용. 자세한 설명은
         # _make_champions_tab 내부 주석 참고.
         self._champ_fetch_cache = {}
+        self._sched_data_cache = None
 
         cur = self._tab.currentIndex()
         cur_label = self._tab.tabText(cur) if 0 <= cur < self._tab.count() else None
@@ -377,168 +532,76 @@ class ScheduleWindow(QDialog):
             if w: w.deleteLater()
         self._sched_lazy_builders = {}
 
-        all_data = get_schedule(self.league_id, self.season)
-        my_data  = [r for r in all_data
-                    if r["home_team_id"]==self.my_team_id or r["away_team_id"]==self.my_team_id]
-        _sw_marks.append(("get_schedule", _time_sw.perf_counter()))
+        defs = self._sched_category_defs()
+        cat_labels = [c[0] for c in defs]
+        if not getattr(self, "_cat_buttons", None):
+            self._root.insertLayout(1, self._build_category_bar(cat_labels))
+        cat = getattr(self, "_sched_current_cat", None)
+        if cat not in cat_labels:
+            cat = cat_labels[0]
+        self._sched_current_cat = cat
+        for _label, _btn in self._cat_buttons.items():
+            _btn.setChecked(_label == cat)
 
-        self._tab.addTab(self._make_table(my_data, my_view=True),  "내 경기")
-        if cur_label == "전체 일정":
-            self._tab.addTab(self._make_table(all_data, my_view=False), "전체 일정")
-        else:
-            _idx = self._tab.addTab(QWidget(), "전체 일정")
-            self._sched_lazy_builders[_idx] = \
-                lambda ad=all_data: self._make_table(ad, my_view=False)
-        _sw_marks.append(("내경기+전체일정 테이블", _time_sw.perf_counter()))
+        subs = dict(defs)[cat]
+        for sub_label, builder, lazy in subs:
+            if lazy:
+                if not self._sched_lazy_tab_exists(cat, sub_label):
+                    continue
+                if cur_label == sub_label:
+                    # 지금 보고 있던 단계면 지연시키지 않고 바로 만든다
+                    # (탭을 다시 눌러야 내용이 나오는 어색함 방지).
+                    _w = builder()
+                    if _w:
+                        self._tab.addTab(_w, sub_label)
+                    continue
+                _idx = self._tab.addTab(QWidget(), sub_label)
+                self._sched_lazy_builders[_idx] = builder
+            else:
+                _w = builder()
+                if _w:
+                    self._tab.addTab(_w, sub_label)
+            _sw_marks.append((f"{cat}/{sub_label}", _time_sw.perf_counter()))
 
-        # 국제대회(본선) 탭
-        intl_w = self._make_intl_tab("groups", qual=False)
-        if intl_w:
-            self._tab.addTab(intl_w, "🌍 국제대회")
-        intl_ko = self._make_intl_tab("ko", qual=False)
-        if intl_ko:
-            self._tab.addTab(intl_ko, "🌍 국제대회(본선)")
-        _sw_marks.append(("국제대회 본선", _time_sw.perf_counter()))
-
-        # 국제대회(예선) 탭
-        qual_w = self._make_intl_tab("groups", qual=True)
-        if qual_w:
-            self._tab.addTab(qual_w, "🌏 국제대회(예선)")
-        _sw_marks.append(("국제대회 예선", _time_sw.perf_counter()))
-
-        # 국제대회(예선 플레이오프) 탭 — PO 경기가 생성된 시점부터 표시
-        qual_po_w = self._make_intl_tab("qual_po", qual=True)
-        if qual_po_w:
-            self._tab.addTab(qual_po_w, "🌏 국제대회(예선 플레이오프)")
-        _sw_marks.append(("국제대회 예선PO", _time_sw.perf_counter()))
-
-        # 챔피언스리그 탭
-        champs_w = self._make_champions_tab("groups")
-        if champs_w:
-            self._tab.addTab(champs_w, "🏆 챔피언스리그")
-        champs_ko = self._make_champions_tab("ko")
-        if champs_ko:
-            self._tab.addTab(champs_ko, "🏆 챔피언스리그(본선)")
-        _sw_marks.append(("챔피언스리그", _time_sw.perf_counter()))
-
-        # 유로파리그 탭 (2026-08 신설)
-        from competition import europa_engine
-        el_w = self._make_champions_tab("groups", engine=europa_engine,
-                                         comp_title="유로파리그", header_color="#F28C28")
-        if el_w:
-            self._tab.addTab(el_w, "🥈 유로파리그")
-        el_ko = self._make_champions_tab("ko", engine=europa_engine,
-                                          comp_title="유로파리그", header_color="#F28C28")
-        if el_ko:
-            self._tab.addTab(el_ko, "🥈 유로파리그(본선)")
-
-        # 컨퍼런스리그 탭 (2026-08 신설)
-        from competition import conference_engine
-        ecl_w = self._make_champions_tab("groups", engine=conference_engine,
-                                          comp_title="컨퍼런스리그", header_color="#20A464")
-        if ecl_w:
-            self._tab.addTab(ecl_w, "🥉 컨퍼런스리그")
-        ecl_ko = self._make_champions_tab("ko", engine=conference_engine,
-                                           comp_title="컨퍼런스리그", header_color="#20A464")
-        if ecl_ko:
-            self._tab.addTab(ecl_ko, "🥉 컨퍼런스리그(본선)")
-        _sw_marks.append(("클럽대항전(유로파/컨퍼런스)", _time_sw.perf_counter()))
-
-        # 슈퍼컵 탭 (2026-08 신설, 11순위) — [2026-08, 신민용 요청: "경기
-        # 일정에 슈퍼컵이 버건디 색상으로 표시되어야 한다"] world_browser_
-        # window.py의 BURGUNDY 상수와 같은 색(#800020) — 두 파일이 서로
-        # import하지 않는 기존 원칙(_CLEAN_TEXT_ROLE과 동일한 이유, 순환
-        # 참조 방지)에 따라 여기도 같은 값을 그대로 복제해서 쓴다. 슈퍼컵은
-        # 리그 스테이지가 아예 없는 4팀 다이렉트 토너먼트라 "groups" 탭은
-        # 만들지 않고(_make_champions_tab이 league_info=None이면 자동으로
-        # 순위표 섹션을 건너뛰므로) "ko"(대진표) 탭 하나만 둔다.
-        from competition import super_cup_engine
-        sc_ko = self._make_champions_tab("ko", engine=super_cup_engine,
-                                          comp_title="슈퍼컵", header_color="#800020")
-        if sc_ko:
-            self._tab.addTab(sc_ko, "🏵 슈퍼컵")
-        _sw_marks.append(("슈퍼컵", _time_sw.perf_counter()))
-
-        # [2026-07 신설, 신민용 리포트: "클럽월드컵이 경기 일정에 안 뜬다"]
-        cwc_w = self._make_cwc_tab()
-        if cwc_w:
-            self._tab.addTab(cwc_w, "🌍 클럽 월드컵")
-        cwc_bracket_w = self._make_cwc_bracket_tab()
-        if cwc_bracket_w:
-            self._tab.addTab(cwc_bracket_w, "🌍 클럽 월드컵(본선)")
-        _sw_marks.append(("클럽월드컵", _time_sw.perf_counter()))
-
-        # [2026-07 신설, 신민용 리포트: "경기 일정 창에 승강전 탭이 안 뜬다"]
-        po_w = self._make_po_tab()
-        if po_w:
-            self._tab.addTab(po_w, "⚖ 승강 플레이오프")
-        _sw_marks.append(("승강PO", _time_sw.perf_counter()))
-
-        # [2026-07 신설] 국내 컵대회 탭 — 예전엔 이 탭 자체가 없어서 컵
-        # 경기가 로그에만 남고 일정 화면 어디에도 안 보였다.
-        # [2026-07 수정, 신민용 리포트: "컵대회도 내 경기/전체일정처럼
-        # 나누는 게 시각적으로 더 좋지 않아?"] 리그 일정 탭과 동일하게
-        # '내 경기' 탭을 먼저, '전체 일정' 탭을 뒤에 둔다.
-        cup_my_w = self._make_cup_tab(my_view=True)
-        if cup_my_w:
-            self._tab.addTab(cup_my_w, "🎖️ 컵대회(내 경기)")
-        # [2026-08 신설] "컵대회(전체 일정)"도 "전체 일정"과 같은 이유로
-        # 지연 로딩 대상 — 다만 이 탭은 존재 여부 자체가 조건부(그 시즌에
-        # 컵대회가 없거나 아직 경기가 없으면 탭을 안 보여줘야 함)라서,
-        # 지금 안 보고 있을 땐 무거운 전체 빌드(_make_cup_tab) 대신 가벼운
-        # COUNT 쿼리로만 존재 여부를 확인한다.
-        if cur_label == "🎖️ 컵대회(전체 일정)":
-            cup_all_w = self._make_cup_tab(my_view=False)
-            if cup_all_w:
-                self._tab.addTab(cup_all_w, "🎖️ 컵대회(전체 일정)")
-        elif self._cup_all_exists():
-            _idx = self._tab.addTab(QWidget(), "🎖️ 컵대회(전체 일정)")
-            self._sched_lazy_builders[_idx] = lambda: self._make_cup_tab(my_view=False)
-        _sw_marks.append(("컵대회", _time_sw.perf_counter()))
-
-        # [2026-09 신설] 3부·4부 국내컵 탭 — 국내 컵대회 탭과 완전히 같은
-        # 패턴(내 경기/전체 일정 분리 + 전체 일정 지연 로딩).
-        lc_my_w = self._make_lower_cup_tab(my_view=True)
-        if lc_my_w:
-            self._tab.addTab(lc_my_w, "🏅 3부·4부컵(내 경기)")
-        if cur_label == "🏅 3부·4부컵(전체 일정)":
-            lc_all_w = self._make_lower_cup_tab(my_view=False)
-            if lc_all_w:
-                self._tab.addTab(lc_all_w, "🏅 3부·4부컵(전체 일정)")
-        elif self._lower_cup_all_exists():
-            _idx2 = self._tab.addTab(QWidget(), "🏅 3부·4부컵(전체 일정)")
-            self._sched_lazy_builders[_idx2] = lambda: self._make_lower_cup_tab(my_view=False)
-        _sw_marks.append(("3부·4부컵", _time_sw.perf_counter()))
-        # [2026-07 신설] 챔피언스리그·국제대회처럼 컵대회도 토너먼트
-        # 대진표(브래킷)로 보여주는 탭 — 4강 이후 결승/3·4위전이 생기면서
-        # 다른 대회들과 같은 방식으로 표시할 수 있게 됐다.
-        cup_bracket_w = self._make_cup_bracket_tab()
-        if cup_bracket_w:
-            self._tab.addTab(cup_bracket_w, "🎖️ 컵대회(본선)")
-        _sw_marks.append(("컵대회 브래킷", _time_sw.perf_counter()))
+        if self._tab.count() == 0:
+            # 그 대회가 아직 시작 전이거나 내 팀과 무관한 시즌 — 대분류
+            # 버튼은 항상 같은 자리에 있어야 하므로(버튼이 나타났다 사라지면
+            # 위치가 계속 바뀐다) 탭을 없애는 대신 안내 한 장을 둔다.
+            _empty = QWidget()
+            _elay = QVBoxLayout(_empty)
+            _msg = QLabel("아직 이 대회의 일정이 없습니다.")
+            _msg.setStyleSheet("color:#777;font-size:12px;")
+            _msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            _elay.addWidget(_msg)
+            self._tab.addTab(_empty, self._SCHED_EMPTY_LABEL)
+        if not _sw_marks:
+            _sw_marks.append((f"{cat}(빈 대회)", _time_sw.perf_counter()))
 
         _sw_total = _sw_marks[-1][1] - _sw_t0
-        # [2026-08 재계측, 신민용 리포트: "경기 일정 창 켜놓고 진행하면
-        # 렉, 팀 많을수록 심해짐"] 이전 계측(위 주석)은 "탭 렌더링 고정비용"
-        # 결론까지만 냈고, 팀 수 증가에 비례해서 어느 탭이 커지는지는 아직
-        # 실측하지 않았다 — 국내 컵대회 '전체 일정' 탭은 대회 참가팀 수(=
-        # 사실상 그 나라 전체 팀 수)만큼 행이 생기는 유일한 탭이라 유력한
-        # 용의자지만, 감으로 고치지 않고 여기서 행 수까지 같이 찍어서
-        # 확인한다. 0.03초 이상일 때만 찍어 평소엔 조용하다.
         if _sw_total >= 0.03:
             _prev = _sw_t0
             _parts = []
             for _name, _t in _sw_marks:
                 _parts.append(f"{_name} {_t-_prev:.3f}s")
                 _prev = _t
-            _extra = f" | 내경기={len(my_data)}행 전체일정={len(all_data)}행"
+            _extra = ""
+            if self._sched_data_cache:
+                _extra = (f" | 내경기={len(self._sched_data_cache[1])}행"
+                          f" 전체일정={len(self._sched_data_cache[0])}행")
             if getattr(self, "_last_cup_all_rows", None) is not None:
                 _extra += f" 컵대회(전체)={self._last_cup_all_rows}행"
-            print(f"[PERF-SCHED] _fill_tabs 총 {_sw_total:.3f}s — "
+            print(f"[PERF-SCHED] _fill_tabs({cat}) 총 {_sw_total:.3f}s — "
                   + " | ".join(_parts) + _extra)
 
-        if 0 <= cur < self._tab.count():
-            self._tab.setCurrentIndex(cur)
+        # 같은 단계 라벨이 그대로 있으면 그 자리로 돌아간다(주 진행 중
+        # 자동 갱신에서 보고 있던 화면이 튀지 않게).
+        _restore_idx = 0
+        if cur_label:
+            for i in range(self._tab.count()):
+                if self._tab.tabText(i) == cur_label:
+                    _restore_idx = i
+                    break
+        self._tab.setCurrentIndex(_restore_idx)
         self._tab.blockSignals(False)
 
         if scroll_pos:
@@ -614,13 +677,25 @@ class ScheduleWindow(QDialog):
 
     # ── 국제대회 탭 ──────────────────────────────
 
-    def _make_intl_tab(self, mode="groups", qual=False):
+    def _make_intl_tab(self, mode="groups", qual=False, kinds=None, stage=None):
+        """[2026-09 확장, 신민용 리포트 19번: "랭킹 평가전은 경기 일정에
+        안 뜨며, 월드컵같이 2중으로 예선전 하는 거에서 처음 예선전만 뜬다"]
+
+        kinds: 대회 종류를 직접 지정(예: 랭킹 평가전 전용 탭). None이면
+            기존대로 qual 플래그로 고른다.
+        stage: 2단계 예선(아시아/북미/아프리카 월드컵 예선)에서 어느 차수를
+            볼지 — 1=1차 조별리그, 2=2차 조별리그. 예전엔 이 함수가 "2차가
+            이미 생겼으면 2차만 보여준다"로 하나의 탭에서 갈아끼워서, 2차가
+            시작되는 순간 1차 조별리그·순위표가 화면에서 통째로 사라졌다
+            (반대로 2차 시작 전에는 2차를 볼 방법이 없었다). 이제 차수별로
+            탭을 따로 두고 각자 자기 차수만 그린다. None이면 기존 동작
+            (2차가 있으면 2차, 없으면 1차)."""
         import intl_engine
         from game_engine import get_state, get_player
         st = get_state()
         if not st:
             return None
-        t = intl_engine.get_my_tournament(st["current_year"], qual=qual)
+        t = intl_engine.get_my_tournament(st["current_year"], qual=qual, kinds=kinds)
         if not t:
             return None
         if qual and mode == "ko":
@@ -692,10 +767,25 @@ class ScheduleWindow(QDialog):
         # 대회 안에 1차 조("A".."L")와 2차 조("S2-A"..)가 함께 있다 —
         # 2차가 이미 생겼으면(1차가 끝났다는 뜻) 2차 조만 "지금의"
         # 조별리그로 보여주고, 아직 1차뿐이면 1차 그대로 보여준다.
+        # [2026-09 재설계, 위 stage 인자 주석 참고] 차수를 지정해 부르면
+        # 그 차수만 그린다 — 지정된 차수의 조가 아직 없으면 탭 자체를
+        # 만들지 않는다(None 반환). stage=None이면 예전 동작 그대로.
         _has_stage2 = any(g.startswith("S2-") for g in groups)
-        if _has_stage2:
+        if _is_qual and stage == 2:
+            if not _has_stage2:
+                return None
             groups = [g for g in groups if g.startswith("S2-")]
-        _grp_stage = ("qual_group2" if _has_stage2 else "qual_group") if _is_qual else "group"
+            _use_stage2 = True
+        elif _is_qual and stage == 1:
+            groups = [g for g in groups if not g.startswith("S2-")]
+            if not groups:
+                return None
+            _use_stage2 = False
+        else:
+            if _has_stage2:
+                groups = [g for g in groups if g.startswith("S2-")]
+            _use_stage2 = _has_stage2
+        _grp_stage = ("qual_group2" if _use_stage2 else "qual_group") if _is_qual else "group"
         if _is_qual and mode == "qual_po":
             ko_rows = [dict(r) for r in conn.execute(
                 """SELECT * FROM intl_matches WHERE tournament_id=? AND stage='qual_po'
