@@ -6564,6 +6564,124 @@ MANAGER_KIND_SWITCH_MULT = 0.45
 MANAGER_NAT_PREF_BONUS = 4.0
 
 
+# ════════════════════════════════════════════════════════════════
+# [2026-09 신설 — 감독 시스템 ③-d] 대표팀 감독 시장
+#
+# 신민용 확정 파이프라인 — 한 번 계산한 값을 아래 단계가 공유한다:
+#   national_power_snapshot → national_objective → tournament_result
+#   → objective_overachievement → manager_reputation → next-job market
+#
+# [성능] 이 순서가 중요한 이유는 성능이다. "211개국 × 감독 후보 × 선수
+# 계산" 같은 중첩을 피하려면 전력·목표를 대회 시작 시점에 **한 번** 굳혀
+# 두고 이후 단계는 읽기만 해야 한다. 실측: 211개국 best-XI OVR 계산 22ms,
+# 반면 클럽 감독 시장은 매 시즌 508ms다 — 굳혀두면 사실상 공짜다.
+#
+# [목표의 근거는 스쿼드 OVR이다, FIFA 등급이 아니다]
+# 신민용: "국가의 선수 ovr등을 비교로 해서 정하면 될듯. 한국의 ovr가 전체
+# 중 낮은 편이면 16강도 못가는게 당연할 수 있잖아." 이게 맞는 근거인 이유는
+# 경기 시뮬(intl_engine._match_outcome)이 쓰는 숫자가 바로 그 스쿼드
+# OVR이기 때문이다. 목표를 FIFA 등급 같은 다른 지표로 잡으면 **구조적으로
+# 달성 불가능한 목표**가 생기고, 감독은 스쿼드가 약한 죄로 매번 경질된다
+# (③에서 자기실현적 목표로 한 번 겪은 함정과 같은 계열).
+#
+# ── 성적 단계 rank (world_browser와 같은 눈금) ──────────────────
+# world_browser._PLACEMENT_RANK / _STAGE_RANK를 그대로 쓴다. 새 눈금을
+# 만들면 커리어 화면과 감독 평가가 서로 다른 말을 한다.
+MANAGER_NAT_STAGE_RANK = {
+    "우승": 100, "준우승": 90, "3위": 80, "4위": 70,
+    "4강": 60, "8강": 50, "16강": 40, "32강": 30,
+    "조별리그": 20,        # 본선 조별리그 탈락
+    "예선탈락": 10,        # 본선 진출 실패
+}
+# ── 목표 밴드 — 스쿼드 OVR 세계 백분위(0.0=최강) ────────────────
+# 실측 기준점(이 세이브): 독일 0.019 · 브라질 0.066 · 일본 0.071 ·
+# 나이지리아 0.085 · 사우디 0.185 · 대한민국 0.213 · 태국 0.422 · 중국 0.559.
+# 신민용이 든 기준("한국은 16강")에 맞춰 밴드를 잡았다 — 한국 0.213 → 16강.
+# 황금세대가 와서 스쿼드 OVR이 올라가면 백분위가 내려가 목표도 올라간다.
+MANAGER_NAT_OBJECTIVE_BANDS = (
+    (0.03, "우승", 100),        # 세계 상위 3% (~6개국)
+    (0.08, "4강", 60),          # ~17위
+    (0.15, "8강", 50),          # ~32위
+    (0.30, "16강", 40),         # ~63위  ← 대한민국
+    (0.55, "본선 진출", 20),     # ~116위 — 본선에 오는 것 자체가 목표
+    (1.01, "예선 경쟁력", 10),   # 그 아래 — 예선에서 경쟁하면 된다
+)
+# ── 대표팀 성적 → 명성 ──────────────────────────────────────────
+# intl_engine._REWARD(우승 25 / 준우승 15 / 3위 12 / 4위 9 / 4강 10 /
+# 8강 6 / 16강 3 / 32강 2 / 조별탈락 1, 월드컵 아니면 ×0.6)와 눈금을
+# 맞춘다. 다만 _REWARD를 직접 키로 쓰지는 않는다 — 그 표의 "4강"·"8강"·
+# "16강"·"32강"·"조별리그 탈락" 항목은 호출부가 없는 죽은 키라
+# (_record_my_exit에는 우승/준우승/3위/4위만 전달된다) 신뢰할 수 없다.
+MANAGER_NAT_RESULT_REP = {
+    "우승": 25.0, "준우승": 15.0, "3위": 12.0, "4위": 9.0,
+    "4강": 10.0, "8강": 6.0, "16강": 3.0, "32강": 2.0,
+    "조별리그": 1.0, "예선탈락": 0.0,
+}
+MANAGER_NAT_NON_WC_MULT = 0.6        # 월드컵이 아닌 대회는 60%
+# 목표 대비 초과/미달 — rank 차 1점당 명성 가감.
+MANAGER_NAT_OVER_W = 0.30
+MANAGER_NAT_UNDER_W = 0.22
+# [약팀 초과 달성 보정] 신민용: "한국(세계 25위) → 4강 같은 성과는 단순히
+# '4강 = +X'로 끝내지 말고 예상보다 얼마나 많이 초과했는가를 반영."
+# 백분위가 클수록(약팀일수록) 초과분 가중치가 커진다. 한국 0.213이면 ×1.32.
+MANAGER_NAT_WEAK_GAIN = 1.5
+# 반대로 강팀이 초과 달성해봐야 얻는 게 적다(이미 우승 목표라 초과분이
+# 거의 없음) — 별도 상수 없이 구조적으로 그렇게 된다.
+
+# ── 대표팀 계약 ─────────────────────────────────────────────────
+# 신민용: "대표팀은 시즌마다 공석 판정하면 안 될 것 같아. 대회 주기 중심."
+# 그래서 계약은 시즌이 아니라 **대회 주기**로 센다(월드컵 4년 주기).
+# [주기와 맞춰야 한다] 2~4년으로 뒀다가 실측에서 **경질이 0건**이 됐다:
+# 대회가 4년 주기라 다음 평가 시점엔 계약이 항상 만료돼 있어서 전원이
+# 재계약 협상 경로로 빠지고, 계약 중 경질 경로에 아무도 안 들어왔다.
+# 신민용이 든 경질 사례("월드컵 예선 탈락 → 계약기간 남음 → 중도 경질")가
+# 구조적으로 불가능해진 것. 대회 주기보다 길게 잡아야 "계약이 남았는데
+# 못했다"가 존재한다.
+MANAGER_NAT_CONTRACT_YEARS_MIN = 4
+MANAGER_NAT_CONTRACT_YEARS_MAX = 7
+# 계약 만료 시 재계약 확률 — 목표 대비 성적이 좋을수록 오른다.
+# 계약 만료는 경질이 아니다(신민용 강조): 월드컵 8강 후 계약 만료로
+# 물러나는 건 실패가 아니라 정상적인 커리어다.
+# [0.55에서 올린 이유] 실측에서 월드컵 한 번에 계약종료 89 + 경질 5가
+# 나와 이탈이 211개국 중 94명 = 이탈 상한(0.45)에 딱 붙었다. 상한이
+# 붙으면 그건 확률을 재는 게 아니라 상한을 재는 것이다. 자연 이탈률을
+# 상한 아래로 내려서 확률이 실제로 작동하게 한다(0.68 → 약 32% 이탈).
+MANAGER_NAT_RENEW_BASE = 0.68
+MANAGER_NAT_RENEW_SLOPE = 0.010      # rank 차 1점당
+MANAGER_NAT_RENEW_MIN = 0.05
+MANAGER_NAT_RENEW_MAX = 0.95
+
+# ── 경질 압력 ───────────────────────────────────────────────────
+# 신민용 확정: "국가 목표는 감독 개인의 경질 여부와 1:1로 연결하면 안 돼.
+# 목표 미달은 경질 압력을 올리는 요소로 두고, 계약 상태·최근 성적·목표
+# 미달 정도·감독 reputation을 종합해서 실제 경질을 결정."
+# 그래야 강팀이 한 번 8강에서 떨어졌다고 바로 잘리는 시장이 안 생긴다.
+MANAGER_NAT_SACK_BASE = 0.05         # 목표를 채웠어도 남는 기본 확률
+MANAGER_NAT_SACK_MISS_SLOPE = 0.009  # 미달 rank 1점당
+MANAGER_NAT_SACK_REP_RELIEF = 0.25   # 명성 100이면 확률을 이 비율만큼 낮춘다
+MANAGER_NAT_SACK_HONEYMOON_YEARS = 1
+MANAGER_NAT_SACK_HONEYMOON_MULT = 0.35
+MANAGER_NAT_SACK_MIN = 0.01
+MANAGER_NAT_SACK_MAX = 0.60
+
+# ── 임시 감독 ───────────────────────────────────────────────────
+# 신민용: "새로운 감독을 하나 생성하는 게 아니라 기존 무직 감독을 임시로
+# 배정하는 게 좋음. 그리고 임시 감독도 성적을 낼 수 있게."
+# 정식 감독을 못 구했을 때만 세우고, 다음 대회 주기에 정식 선임을 다시
+# 시도한다. 임시 재임도 national_team_managers에 role='caretaker'로 남아
+# 커리어 이력이 된다.
+MANAGER_NAT_CARETAKER_CONTRACT = 1   # 임시 감독 계약 기간(년)
+# 임시 감독이 성과를 내면 정식 감독 후보 평가에서 가산점을 받는다.
+MANAGER_NAT_CARETAKER_PROMOTE_BONUS = 6.0
+
+# 한 대회에 대표팀 감독이 **물러날** 수 있는 국가 비율 상한 — 안 걸면
+# 대회가 끝날 때 전 세계 대표팀이 동시에 물갈이된다.
+# [주의] 이 상한은 '이탈'에만 걸고 '부임'에는 걸지 않는다. 예전엔 부임
+# 쪽에 걸었더니 상한을 넘은 공석이 그대로 방치돼 **감독 없는 대표팀이
+# 9개국** 생겼다(대표팀은 언제나 감독이 있어야 한다).
+MANAGER_NAT_CHANGE_MAX_SHARE = 0.45
+
+
 # ── ③-c 순수 함수 ───────────────────────────────────────────────
 # database.py(마이그레이션)와 ai_lifecycle.py(시장) 양쪽이 쓴다. 순환
 # import를 피하려고 여기 둔다 — 상수와 같은 파일에 있어야 값을 바꿀 때
@@ -6665,6 +6783,83 @@ def manager_step_down_mult(recent_level, job_level):
     if steps < len(MANAGER_STEP_DOWN_MULT):
         return MANAGER_STEP_DOWN_MULT[steps]
     return MANAGER_STEP_DOWN_TAIL
+
+
+def national_objective_for(world_pct):
+    """스쿼드 OVR 세계 백분위(0.0=최강 ~ 1.0=최약) → (목표 이름, 목표 rank).
+
+    ③-d의 출발점. 절대 등급이 아니라 **전력 대비 상대 목표**다 — 신민용:
+    "한국의 선수 OVR이 세계 20위 수준이면 16강 목표가 자연스럽고, 황금세대가
+    와서 10위권으로 올라가면 목표도 올라갈 수 있음." 백분위를 쓰면 그게
+    자동으로 된다."""
+    try:
+        p = float(world_pct)
+    except (TypeError, ValueError):
+        p = 1.0
+    p = max(0.0, min(1.0, p))
+    for edge, name, rank in MANAGER_NAT_OBJECTIVE_BANDS:
+        if p <= edge:
+            return (name, rank)
+    return MANAGER_NAT_OBJECTIVE_BANDS[-1][1], MANAGER_NAT_OBJECTIVE_BANDS[-1][2]
+
+
+def national_result_rep(result_key, objective_rank, result_rank, world_pct,
+                        is_world_cup=True):
+    """대표팀 대회 한 번의 성적 → 명성 증감.
+
+    세 갈래를 더한다:
+      1) 성적 자체의 값 (MANAGER_NAT_RESULT_REP, 월드컵 아니면 ×0.6)
+      2) 목표 대비 초과분 × 약팀 보정 — 약팀의 초과 달성이 더 크게 평가된다
+      3) 목표 대비 미달분 (감점, 약팀 보정 없음 — 약팀이라 덜 깎이는 건
+         이미 목표 자체가 낮게 잡혀서 반영돼 있다)
+
+    신민용: "브라질로 월드컵 우승과 대한민국으로 월드컵 4강은 둘 다 엄청난
+    성과지만 감독 시장에서의 의미는 다르게 계산할 수 있어. 특히 후자는
+    감독의 시장 가치가 크게 상승하는 사건." 2)번 항이 그거다."""
+    total = MANAGER_NAT_RESULT_REP.get(result_key, 0.0)
+    try:
+        diff = float(result_rank) - float(objective_rank)
+    except (TypeError, ValueError):
+        diff = 0.0
+    p = max(0.0, min(1.0, float(world_pct or 0.0)))
+    if diff >= 0:
+        total += diff * MANAGER_NAT_OVER_W * (1.0 + MANAGER_NAT_WEAK_GAIN * p)
+    else:
+        total += diff * MANAGER_NAT_UNDER_W     # diff<0 이므로 감점
+    # [버그수정] 0.6 배율은 **전체**에 걸어야 한다. 예전엔 base에만 걸어서
+    # 대륙컵 실패가 월드컵 실패보다 더 아팠다(독일 목표우승→조별탈락이
+    # 월드컵 -16.6 vs 대륙컵 -17.0). 대회 비중은 상·하 양방향에 같이
+    # 적용되는 게 맞다 — intl_engine._REWARD도 세 항목 전부에 곱한다.
+    if not is_world_cup:
+        total *= MANAGER_NAT_NON_WC_MULT
+    return total
+
+
+def national_sack_pressure(objective_rank, result_rank, reputation, tenure_years):
+    """목표 미달 → **경질 압력**. 이 값이 곧 경질은 아니다.
+
+    신민용 확정: "목표 미달은 경질 압력을 올리는 요소로 두고, 계약 상태·
+    최근 성적·목표 미달 정도·감독 reputation 등을 종합해서 실제 경질을
+    결정하는 게 좋아. 그래야 강팀이 한 번 8강에서 떨어졌다고 바로 감독이
+    잘리는 식의 불안정한 시장이 안 생겨."
+
+    그래서 여기서는 확률만 돌려주고, 계약이 남았는지(계약 만료면 경질이
+    아니라 재계약 협상)는 부르는 쪽이 판단한다."""
+    try:
+        miss = max(0.0, float(objective_rank) - float(result_rank))
+    except (TypeError, ValueError):
+        miss = 0.0
+    prob = MANAGER_NAT_SACK_BASE + miss * MANAGER_NAT_SACK_MISS_SLOPE
+    rep = max(0.0, min(MANAGER_REP_MAX, float(reputation or 0.0)))
+    prob *= (1.0 - MANAGER_NAT_SACK_REP_RELIEF * (rep / MANAGER_REP_MAX))
+    prob = max(MANAGER_NAT_SACK_MIN, min(MANAGER_NAT_SACK_MAX, prob))
+    try:
+        ty = max(0, int(tenure_years or 0))
+    except (TypeError, ValueError):
+        ty = 0
+    if ty <= MANAGER_NAT_SACK_HONEYMOON_YEARS:
+        prob *= MANAGER_NAT_SACK_HONEYMOON_MULT
+    return max(MANAGER_NAT_SACK_MIN, min(MANAGER_NAT_SACK_MAX, prob))
 
 
 def manager_reputation(titles_league=0, titles_cup=0, titles_cont=0, titles_intl=0,

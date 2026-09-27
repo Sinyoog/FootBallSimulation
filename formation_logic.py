@@ -186,7 +186,13 @@ def _greedy_fill_slots(candidates, slots_only):
     """
     n = len(slots_only)
     slot_filled = [None] * n
-    remaining = sorted(candidates, key=lambda x: -(x.get("ovr", 0) or 0))
+    # [2026-09] 후보 dict에 "role_age"가 실려 있을 때만 나이 보정을
+    # 적용한다(role_age_penalty 주석 참고). 이 키를 안 싣는 기존 호출부
+    # (UI 포메이션 화면, intl_engine의 국가대표 소집 — 그쪽은 이미 자체
+    # 나이 보정을 ovr에 녹여 넣는다)는 예전과 100% 동일하게 동작한다.
+    remaining = sorted(
+        candidates,
+        key=lambda x: -((x.get("ovr", 0) or 0) - role_age_penalty(x.get("role_age"))))
     pref, catslots = _slot_tables(tuple(slots_only), slots_only)
 
     # 1) 정확한 포지션 호환(POSITION_COMPAT) 매치
@@ -419,6 +425,40 @@ _ROLE_TIER_WEIGHTS = [("주전", 40), ("로테이션", 30), ("대기", 25), ("�
 _ROLE_YOUNG_MAX_AGE = 19
 
 
+# ─────────────────────────────────────────────
+# [2026-09 신설, 신민용 확정: "39세 OVR78보다 24세 OVR76을 아주 조금
+# 우선하게 하면 39세는 자연스럽게 로테이션으로 내려가고, 출전 감소 →
+# 생산량 감소 → 다음 시즌 가치 감소 → 이적/방출/은퇴로 연결된다"]
+# 역할·뎁스 산정 **전용** 나이 보정.
+#
+# [왜 여기에 두는가] 경기 엔진(match_sim.match_flow._select_lineup)에는
+# 이미 _lineup_age_penalty가 있지만 그건 22세 이하만 깎는 단방향이고,
+# 무엇보다 전세계 AI 경기는 선수 단위로 시뮬레이션되지 않는다
+# (game_engine._sim_all_ai_matches는 팀 평균 OVR로 스코어만 만든다).
+# 그래서 노장 보정은 경기 쪽이 아니라 "시즌 역할을 정하는" 이 쪽에
+# 들어가야 실제로 효과가 있다 — 신민용 확정 사항.
+#
+# 곡선은 의도적으로 완만하다. OVR 78/39세(→70)가 OVR 76/24세(→76)에게
+# 밀리는 정도이지, 노장을 스쿼드에서 지워버리는 크기가 아니다 —
+# 진짜 월드클래스 노장(OVR 90대)은 여전히 주전으로 남는다.
+_ROLE_AGE_PENALTY = {
+    16: 5, 17: 5, 18: 4, 19: 3, 20: 2, 21: 1,
+    32: 1, 33: 2, 34: 3, 35: 4, 36: 5, 37: 6, 38: 7, 39: 8,
+}
+_ROLE_AGE_PENALTY_OLD_MAX = 10   # 40세 이상 상한
+
+
+def role_age_penalty(age):
+    """역할/뎁스 산정에서 이 나이가 깎이는 "실질 경쟁력" 점수.
+    None(나이 모름)이면 0 — 보정 없이 기존과 100% 동일하게 동작한다.
+    22~31세는 0(전성기 구간)."""
+    if age is None:
+        return 0
+    if age >= 40:
+        return _ROLE_AGE_PENALTY_OLD_MAX
+    return _ROLE_AGE_PENALTY.get(age, 0)
+
+
 # [2026-09 재설계, 신민용 리포트: "인테르 밀란이 GK 96/89 둘 다 있는데
 # 공격/미드필더에 90대가 몰려서 스쿼드 전체 OVR 등수로는 GK가 '주전'
 # 컷(상위 ~36.4%=40/110)에 아예 못 든다"] 예전 compute_squad_roles는
@@ -445,11 +485,34 @@ _ROLE_YOUNG_MAX_AGE = 19
 # percentile(기존 전체 비중 40/30/25/15)로 추정하는 폴백을 유지한다 —
 # 이 폴백도 최소한 카테고리 간 OVR 크로스 오염(스쿼드 전체 대비 GK 등수)은
 # 없앤다.
+# [2026-09 신설, 신민용 확정: "핵심은 별도 역할이 아니라 주전 안에서
+# 상위 핵심층 — 팀의 핵심 축 2~4명 정도가 자연스럽고 3명이 가장 적당,
+# 4명부터는 핵심이라는 의미가 희석된다"] 주전(베스트11) 안에서 몇 명을
+# "핵심"으로 세분할지. 주전 수가 적은 팀(스쿼드가 얇거나 포메이션 슬롯을
+# 다 못 채운 팀)까지 3명을 고정하면 핵심 비중이 과해지므로 단계를 둔다.
+_CORE_COUNT_BY_STARTERS = ((11, 3), (8, 2))   # (주전 수 하한, 핵심 인원)
+_CORE_COUNT_MIN = 1                            # 7명 이하 → 1명
+
+
+def _core_count(n_starters):
+    for _lo, _n in _CORE_COUNT_BY_STARTERS:
+        if n_starters >= _lo:
+            return _n
+    return _CORE_COUNT_MIN if n_starters >= 1 else 0
+
+
 def compute_squad_roles(pool, started_ids=None):
     """pool: [(id, position, ovr, age), ...] — 한 팀 로스터 전체(주전+후보
     다 포함, 보통 22~25명). started_ids: 그 팀 베스트11 실제 슬롯 배정
     결과(_greedy_fill_slots)에서 뽑은 선수 id 집합 — 있으면 그 안의
-    선수는 무조건 "주전"으로 확정한다. 반환: {id: role_label}."""
+    선수는 "주전"으로 확정하고, 그중 상위 몇 명은 "핵심"으로 세분한다.
+    반환: {id: role_label}.
+
+    [2026-09 신설] "핵심"은 주전의 상위 티어가 아니라 **주전 내부의 세부
+    역할**이다(신민용 확정). 포지션군과 무관하게 베스트11 전체에서
+    OVR − role_age_penalty(나이) 상위 N명을 뽑는다 — "반드시 포지션별로
+    1명씩일 필요는 없다"는 원안 그대로다. GK를 미리 제외하거나 제한하는
+    규칙은 일부러 넣지 않았다: 먼저 실제 포지션 분포를 측정하고 판단한다."""
     if not pool:
         return {}
     by_cat = {}
@@ -460,10 +523,22 @@ def compute_squad_roles(pool, started_ids=None):
     if started_ids:
         for pid in started_ids:
             result[pid] = "주전"
+        # 핵심 선정 — 위 docstring 참고. 나이 보정은 티어 정렬(_assign)과
+        # 완전히 같은 축을 쓴다.
+        _n_core = _core_count(len(started_ids))
+        if _n_core > 0:
+            _starters = [(pid, ovr, age) for pid, pos, ovr, age in pool
+                         if pid in started_ids]
+            _starters.sort(key=lambda t: (-((t[1] or 0) - role_age_penalty(t[2])), t[0]))
+            for _pid_c, _o_c, _a_c in _starters[:_n_core]:
+                result[_pid_c] = "핵심"
 
     def _assign(members, weights):
         total_w = sum(w for _label, w in weights)
-        ordered = sorted(members, key=lambda t: -(t[1] or 0))
+        # [2026-09] members = (pid, ovr, age) — 위 _greedy_fill_slots와
+        # 같은 나이 보정을 써야 "XI에 든 사람 = 주전"과 "그 아래 티어
+        # 순서"가 같은 축에서 매겨진다.
+        ordered = sorted(members, key=lambda t: -((t[1] or 0) - role_age_penalty(t[2])))
         n = len(ordered)
         for idx, (pid, _ovr, age) in enumerate(ordered):
             if n <= len(weights):

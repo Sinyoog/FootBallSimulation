@@ -26,15 +26,70 @@ from collections import defaultdict
 _DEFAULT_JSONL_PATH = os.path.join(os.path.dirname(__file__), "data", "affiliate_raw.jsonl")
 
 
-def _load_jsonl_blocks(path: str):
+def _load_jsonl_blocks(path: str, verbose: bool = True):
+    """affiliate_raw.jsonl을 읽어 국가별 레코드(dict) 리스트로 돌려준다.
+
+    [2026-09 버그수정, 신민용 리포트: "블록 96/97/98 파싱 실패가 뭐고
+    중요하냐"] 예전 구현은 파일을 **빈 줄 기준으로 잘라서**(raw.split("\n\n"))
+    각 조각이 완전한 JSON 객체 하나라고 가정했다. 그런데 이 파일은 사람이
+    읽기 좋게 들여쓴 pretty-print JSON이 이어붙은 형태라, 객체 **안에**
+    빈 줄이 들어가는 순간 그 국가 하나가 여러 조각으로 찢어지고 조각마다
+    JSON이 깨져 전부 버려졌다 — 실제로 벨라루스 레코드가 그렇게 3조각
+    (로그의 블록 96/97/98)으로 갈라져 통째로 누락됐고, 산하팀 16개가
+    분류되지 않은 채 일반 팀으로 남아 있었다(210개국/816팀 → 정상은
+    211개국/832팀).
+
+    데이터의 빈 줄만 지우면 당장은 고쳐지지만, 이 파일을 다시 편집하다
+    빈 줄이 하나 들어가는 순간 그 나라가 또 조용히 사라진다 — 구분자를
+    공백에 의존하는 것 자체가 원인이므로 파서를 고친다. json.JSONDecoder.
+    raw_decode로 "객체 하나를 읽고, 끝난 위치부터 이어서 다음 객체를 읽는"
+    방식이라 객체 사이/안에 공백·줄바꿈이 몇 개 있든 상관이 없다. 진짜
+    JSON 문법 오류일 때만 경고를 내고, 그 경우에도 다음 줄머리 '{'를
+    찾아 재동기화해서 나머지 국가까지 통째로 잃지 않는다.
+    (한 줄에 객체 하나인 정통 JSONL 형식도 그대로 읽힌다 — 하위호환.)"""
     raw = open(path, encoding="utf-8").read()
-    blocks = [b for b in raw.split("\n\n") if b.strip()]
+    dec = json.JSONDecoder()
     records = []
-    for i, b in enumerate(blocks, 1):
+    idx, n = 0, len(raw)
+    n_bad = 0
+    while idx < n:
+        while idx < n and raw[idx] in " \t\r\n":
+            idx += 1
+        if idx >= n:
+            break
         try:
-            records.append(json.loads(b))
-        except Exception as e:
-            print(f"[affiliate_classify] 경고: 블록 {i} 파싱 실패, 건너뜀: {e}")
+            obj, end = dec.raw_decode(raw, idx)
+        except ValueError as e:
+            n_bad += 1
+            if verbose:
+                line_no = raw.count("\n", 0, idx) + 1
+                print(f"[affiliate_classify] 경고: {line_no}번째 줄 부근 JSON 오류 "
+                      f"— 이 레코드만 건너뜀: {e}")
+            # 다음 줄머리 '{'로 재동기화 (없으면 종료)
+            nxt = raw.find("\n{", idx)
+            if nxt < 0:
+                break
+            idx = nxt + 1
+            continue
+        records.append(obj)
+        idx = end
+
+    if verbose:
+        # [2026-09 신설] 같은 나라가 두 번 들어 있으면 뒤엣것이 앞엣것의
+        # 분류를 덮어써도 조용히 지나간다 — 데이터 실수를 잡기 위한 경고.
+        seen, dup = set(), []
+        for r in records:
+            cn = r.get("country_name")
+            if cn in seen:
+                dup.append(cn)
+            seen.add(cn)
+        if dup:
+            print(f"[affiliate_classify] 경고: 중복 국가 레코드 {sorted(set(dup))}")
+        _aff = sum(len(r.get("affiliates") or []) for r in records)
+        _rev = sum(len(r.get("review") or []) for r in records)
+        print(f"[affiliate_classify] 로드: 국가 {len(records)}개 / "
+              f"산하팀 {_aff}건 / review {_rev}건"
+              + (f" / 파싱 실패 {n_bad}건" if n_bad else ""))
     return records
 
 
@@ -70,7 +125,7 @@ def apply_classification(c, jsonl_path: str = None, verbose: bool = True):
     c.execute("SELECT id, name FROM countries")
     country_name_to_id = {name: cid for cid, name in c.fetchall()}
 
-    records = _load_jsonl_blocks(jsonl_path)
+    records = _load_jsonl_blocks(jsonl_path, verbose=verbose)
 
     stats = defaultdict(int)
     problems = []

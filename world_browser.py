@@ -1752,6 +1752,13 @@ def _half_season_league_entry(conn, team_id, year, half_position=None, half_role
     from formation_logic import _ROLE_TIER_WEIGHTS
     _ROLE_WEIGHT = dict(_ROLE_TIER_WEIGHTS)
     _ROLE_WEIGHT["전력외"] = _ROLE_WEIGHT.get("유망주", 15)  # 유망주와 같은 통계적 구간(나이만 다름)
+    # [2026-09 신설] "핵심"은 _ROLE_TIER_WEIGHTS(인원 비율 표)에 없다 —
+    # 주전 안에서 따로 뽑히는 세부 역할이라 그 표에 넣으면 티어 경계가
+    # 틀어지기 때문이다(formation_logic.compute_squad_roles 참고). 여기에
+    # 안 채워두면 아래 _DEFAULT_ROLE_WEIGHT(25, "대기" 수준)로 떨어져서
+    # 핵심 선수의 반기 배분이 오히려 가장 불리해진다. 실제 출전률 비
+    # (핵심 0.90 : 주전 0.80)를 주전 가중치에 곱한 값으로 둔다.
+    _ROLE_WEIGHT["핵심"] = round(_ROLE_WEIGHT.get("주전", 40) * 0.90 / 0.80)
     _DEFAULT_ROLE_WEIGHT = _ROLE_WEIGHT.get("대기", 25)  # 역할 정보가 없을 때(과거 데이터 공백 등) 중간값 폴백
     trow = conn.execute("SELECT name FROM teams WHERE id=?", (team_id,)).fetchone()
     entry = {"year": year, "league": None, "cup": None, "cl": None, "cwc": None, "sc": None,

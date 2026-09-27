@@ -9586,7 +9586,16 @@ def _apply_team_goal_budget(rows, key_fn, team_goals_for, allow_zero=False):
 # 감쇠 배율을 곱한다. 1등(그 포지션의 사실상 주전)은 오히려 소폭
 # 가산(1.15배 — 실제로 에이스가 평균보다 더 넣는 효과)하고, 2등부터는
 # 급격히 낮춘다.
-_SQUAD_DEPTH_DECAY = [1.15, 0.45, 0.18, 0.07]
+# [2026-09 재조정, 신민용 확정 2차] 이 배열은 "역할에 따라 골/도움을
+# 얼마나 몰아주는가"인데, 이번에 ai_lifecycle 쪽에서 **출전수 자체를**
+# 역할로 배분하기 시작했다(_ROLE_PLAY_RATIO). 그대로 두면 이중 적용이
+# 된다 — 대기 선수가 출전 28% × 생산 0.18배 = 주전의 약 5% 수준까지
+# 떨어진다. 출전수가 이미 역할을 반영하므로 여기는 "경기당 생산성이
+# 역할에 따라 약간 다르다" 정도의 보조 보정만 남긴다.
+#   이전: [1.15, 0.45, 0.18, 0.07]  (출전 배분이 없던 시절의 값)
+#   [2026-09 확장] 맨 앞에 "핵심" 한 칸 추가 — 출전수가 이미 역할을
+#   반영하므로 여기서도 주전과 큰 차이를 두지 않는다.
+_SQUAD_DEPTH_DECAY = [1.10, 1.05, 0.95, 0.85, 0.70]
 
 
 def _apply_squad_depth_decay(rows, key_fn):
@@ -9643,7 +9652,8 @@ def _apply_squad_depth_decay(rows, key_fn):
         # "주전이 항상 에이스 배율을 받는다"를 보장하고, 같은 역할
         # 안에서만 OVR로 세부 순위를 매긴다. role을 안 넘기는 기존
         # 호출부(월드컵 등)는 100% 그대로 동작한다.
-        _role_rank = {"주전": 0, "로테이션": 1, "대기": 2, "전력외": 3, "유망주": 4}
+        _role_rank = {"핵심": 0, "주전": 1, "로테이션": 2, "대기": 3,
+                      "전력외": 4, "유망주": 5}
         _sk = lambda x: (_role_rank.get(x.get("role"), 2), -(x["ovr"] or 0))
     elif rows and "apps" in rows[0]:
         _sk = lambda x: (0 if (x["apps"] or 0) > 0 else 1, -(x["ovr"] or 0))
@@ -11497,12 +11507,21 @@ def _get_award_role(year, player_id):
 # 구조에서는 더 정직하다" — matches는 팀이 그 대회에 참가했는지 여부
 # 확인 용도로만 남긴다). role이 없으면(이 기능 신설 이전 과거 시즌 등)
 # 기존과 동일하게 풀 참가도(1.0)로 폴백한다.
+# [2026-09 분리, 신민용 확정 2차] 예전엔 위 _SQUAD_DEPTH_DECAY를
+# 에이스 기준으로 정규화해 그대로 썼는데, 그 배열이 "출전 배분 도입"에
+# 맞춰 크게 완화되면서(1.15/0.45/... → 1.05/0.95/...) 그 파생값을 그냥
+# 두면 로테이션 참가도가 0.39 → 0.90으로 튀어 트로피 보너스(발롱도르
+# 판정)가 의도치 않게 크게 바뀐다. 참가도는 "생산성"이 아니라 "얼마나
+# 관여했나"라 성격이 다르므로, 종전 수치를 그대로 고정값으로 떼어낸다.
+# (나중에 대회별 실제 출전수 대비 비율로 바꾸는 게 더 정확하지만, 그건
+#  발롱도르 판정을 다시 튜닝해야 하는 별도 작업이다.)
 _ROLE_PARTICIPATION = {
-    "주전": round(_SQUAD_DEPTH_DECAY[0] / _SQUAD_DEPTH_DECAY[0], 4),
-    "로테이션": round(_SQUAD_DEPTH_DECAY[1] / _SQUAD_DEPTH_DECAY[0], 4),
-    "대기": round(_SQUAD_DEPTH_DECAY[2] / _SQUAD_DEPTH_DECAY[0], 4),
-    "전력외": round(_SQUAD_DEPTH_DECAY[3] / _SQUAD_DEPTH_DECAY[0], 4),
-    "유망주": round(_SQUAD_DEPTH_DECAY[3] / _SQUAD_DEPTH_DECAY[0], 4),
+    "핵심": 1.0,
+    "주전": 1.0,
+    "로테이션": 0.3913,
+    "대기": 0.1565,
+    "전력외": 0.0609,
+    "유망주": 0.0609,
 }
 
 
@@ -18949,7 +18968,14 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
     _pos_role_by_pid_w43 = None
     try:
         from ai_lifecycle import _snapshot_season_positions
-        _pos_role_by_pid_w43 = _snapshot_season_positions(c, year)
+        # [2026-09 수정, 신민용 확정: "역할은 시즌 시작에 정해져야 한다"]
+        # 이 43주차 스냅샷은 "하반기에 실제로 뛴 스쿼드 모양"을
+        # team_season_lineup에 남기는 게 목적이므로 그대로 둔다 — 다만
+        # 역할까지 여기서 다시 계산하면 직전 오프시즌 끝에 확정해둔
+        # 그 시즌 역할을 덮어써서 "역할이 원인"이라는 구조가 무너진다.
+        # preserve_role=True로 역할만 보존한다(ai_lifecycle.
+        # _snapshot_season_positions의 해당 인자 주석 참고).
+        _pos_role_by_pid_w43 = _snapshot_season_positions(c, year, preserve_role=True)
     except Exception as _e:
         add_log(f"[하반기 포메이션 스냅샷 오류] {_e}", "normal", year, 52)
     _pr_t6b = _time_pr.perf_counter()

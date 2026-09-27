@@ -1944,6 +1944,17 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
     conn.commit()
     conn.close()
 
+    # [2026-09 신설 — 감독 시스템 ③-d] 참가국의 전력·목표를 여기서 굳힌다.
+    # 이 지점이어야 하는 이유: intl_entries가 전부 들어갔고 경기는 하나도
+    # 치르지 않은 시점이다(모든 match가 home_score=-1). 신민용 강조:
+    # "목표는 대회 시작 전에 고정. 대회 도중 선수 OVR이 변했다고 목표까지
+    # 바뀌면 이상해짐." fix_national_objectives는 멱등이라 재호출해도 안전.
+    try:
+        import national_manager as _natmgr
+        _natmgr.fix_national_objectives(tid)
+    except Exception as _e:      # 대표팀 감독 표가 없는 구세이브 등
+        add_log(f"[경고] 대표팀 목표 산정 건너뜀({_e})", "sep")
+
     # ── 로그 ──
     add_log("─" * 44, "sep")
     add_log(f"🌍 {year}년 {name} 개막!  본선 {len(entries)}개국", "event", year, INTL_CALLUP_WEEK)
@@ -5822,6 +5833,17 @@ def _finish_tournament(t, final_week):
 
     # [2026-07 신설] 조기탈락해도 골든볼/골든부트는 별개로 판정
     _award_intl_awards(t)
+
+    # [2026-09 신설 — 감독 시스템 ③-d] 대표팀 감독 평가. 여기가 대회
+    # 생명주기의 마지막이고(_process_one_tournament_week의 dispatch 끝),
+    # status='done'과 winner가 이미 쓰여 있어 국가별 도달 단계를 다 읽을 수
+    # 있다. 클럽 감독 시장(_manager_turnover)은 주 52→1 전환에서 도니까
+    # 여기서 무직이 된 감독은 같은 해 클럽 시장에 곧바로 후보로 들어간다.
+    try:
+        import national_manager as _natmgr
+        _natmgr.evaluate_national_tournament(tid)
+    except Exception as _e:
+        add_log(f"[경고] 대표팀 감독 평가 건너뜀({_e})", "sep")
 
 
 # ─────────────────────────────────────────────

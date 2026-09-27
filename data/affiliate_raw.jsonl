@@ -3471,83 +3471,83 @@
   "affiliates": [
 
     {
-      "team_name": "FC BATE 보리소프 B",
+      "team_name": "FC BATE 보리소프 2",
       "tier": 2,
       "parent_team_name": "FC BATE 보리소프"
     },
     {
-      "team_name": "FC 디나모 민스크 B",
+      "team_name": "FC 디나모 민스크 2",
       "tier": 2,
       "parent_team_name": "FC 디나모 민스크"
     },
     {
-      "team_name": "FC 고멜 B",
+      "team_name": "FC 고멜 2",
       "tier": 2,
       "parent_team_name": "FC 고멜"
     },
     {
-      "team_name": "FC 민스크 B",
+      "team_name": "FC 민스크 2",
       "tier": 2,
       "parent_team_name": "FC 민스크"
     },
 
     {
-      "team_name": "FC 비텝스크 B",
-      "tier": 3,
-      "parent_team_name": "FC 비텝스크"
-    },
-    {
-      "team_name": "FC 나프탄 노보폴로츠크 B",
-      "tier": 3,
-      "parent_team_name": "FC 나프탄 노보폴로츠크"
-    },
-    {
-      "team_name": "FC 토르페도-벨AZ 조디노 B",
-      "tier": 3,
-      "parent_team_name": "FC 토르페도-벨AZ 조디노"
-    },
-    {
-      "team_name": "FC ML 비텝스크 B",
+      "team_name": "FC ML 비텝스크 2",
       "tier": 3,
       "parent_team_name": "FC ML 비텝스크"
     },
     {
-      "team_name": "FC 네만 그로드노 B",
+      "team_name": "FC 나프탄 노보폴로츠크 2",
+      "tier": 3,
+      "parent_team_name": "FC 나프탄 노보폴로츠크"
+    },
+    {
+      "team_name": "FC 토르페도-벨AZ 조디노 2",
+      "tier": 3,
+      "parent_team_name": "FC 토르페도-벨AZ 조디노"
+    },
+    {
+      "team_name": "FC ML 비텝스크 2",
+      "tier": 3,
+      "parent_team_name": "FC ML 비텝스크"
+    },
+    {
+      "team_name": "FC 네만 그로드노 2",
       "tier": 3,
       "parent_team_name": "FC 네만 그로드노"
     },
     {
-      "team_name": "FC 바라노비치 B",
+      "team_name": "FC 바라노비치 2",
       "tier": 3,
       "parent_team_name": "FC 바라노비치"
     },
     {
-      "team_name": "FC 디나모 브레스트 B",
+      "team_name": "FC 디나모 브레스트 2",
       "tier": 3,
       "parent_team_name": "FC 디나모 브레스트"
     },
     {
-      "team_name": "FC 아르세날 드제르진스크 B",
+      "team_name": "FC 아르세날 드제르진스크 2",
       "tier": 3,
       "parent_team_name": "FC 아르세날 드제르진스크"
     },
     {
-      "team_name": "FC 이슬로치 민스크 B",
+      "team_name": "FC 이슬로치 민스크 2",
       "tier": 3,
       "parent_team_name": "FC 이슬로치 민스크"
     },
     {
-      "team_name": "FC 벨시나 보브루이스크 B",
+      "team_name": "FC 벨시나 보브루이스크 2",
       "tier": 3,
       "parent_team_name": "FC 벨시나 보브루이스크"
     },
     {
-      "team_name": "FC 드네프르 모길레프 B",
+      "team_name": "FC 드네프르 모길레프 2",
       "tier": 3,
       "parent_team_name": "FC 드네프르 모길레프"
     },
     {
-      "team_name": "FC 슬라비아 모지르 B",
+      "team_name": "FC 슬라비아 모지르 2",
       "tier": 3,
       "parent_team_name": "FC 슬라비아 모지르"
     }

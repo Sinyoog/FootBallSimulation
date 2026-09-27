@@ -7461,7 +7461,10 @@ class WorldBrowserWindow(QDialog):
             # 나가기 직전 상반기 팀 로스터 기준으로 이미 계산해둔 값 —
             # world_browser.get_ai_player_career_history/_half_season_
             # league_entry 참고)을 써야 한다.
-            _ROLE_COLORS = {"주전": "#4da6ff", "로테이션": "#88ddaa",
+            # [2026-09 확장] "핵심"(주전 내부 상위층) 추가 — 색이 없으면
+            # 기본 회색으로 떨어져 버그처럼 보인다. 주전(파랑)보다 한 단계
+            # 눈에 띄는 금색 계열로 둔다.
+            _ROLE_COLORS = {"핵심": "#ffcc44", "주전": "#4da6ff", "로테이션": "#88ddaa",
                             "대기": "#cccc66", "유망주": "#cc88ff", "전력외": "#999999"}
             role_at_year = (entry.get("_half_role") if entry.get("_is_half")
                              else role_checkpoints.get(entry["year"]))

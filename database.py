@@ -188,6 +188,91 @@ _TENURE_RESULT_COLS = (
 )
 
 
+# ════════════════════════════════════════════════════════════════
+# [2026-09 신설 — 감독 시스템 ③-d] 대표팀 감독
+#
+# 신민용 확정: "teams를 가짜로 만들어 감독 시장을 억지로 통합하는 것보다
+# 대표팀 감독 재임 이력을 별도로 두고 managers의 동일 인물이 양쪽 경력을
+# 공유하도록 하는 게 장기적으로 훨씬 깔끔해."
+#
+# 그래서 대표팀은 teams에 행을 만들지 않는다. 대표팀은 애초에 country
+# TEXT로만 존재하고(intl_matches.home/away가 국가명 문자열이다) 상시
+# 스쿼드도 없어서(intl_squad는 tournament_id 키) 클럽과 데이터 구조가
+# 다르다. 감독 **풀**은 managers 하나를 공유하고, 재임 이력만 갈라둔다.
+#
+#   national_team_managers : 대표팀 재임 이력. team_managers와 같은 모양
+#       (start_year/end_year/end_reason)에 role(정식/임시)과 계약을 더한다.
+#   national_objectives   : 대회 시작 시점에 굳힌 국가 전력·목표 스냅샷.
+#       대회 도중 선수 OVR이 변해도 목표는 안 바뀐다(신민용 강조).
+#       대회가 끝나면 같은 행에 결과를 채운다 — 목표와 결과가 한 행에
+#       있어야 "무엇을 기대했고 무엇을 했나"가 나중에도 검증 가능하다.
+#
+# [team_managers.job_kind / country_id] ③-b에서 대표팀 확장용으로 넣어둔
+# 컬럼이다. 신민용이 별도 표를 택했으므로 지금은 쓰지 않는다 — 기본값
+# 'club'/NULL로 남아 클럽 시장에만 쓰인다. 지우지 않는 이유는 (1) SQLite
+# 컬럼 삭제가 구버전에서 번거롭고 (2) 기본값이라 무해하며 (3) 클럽 시장의
+# 조회가 이미 job_kind='club'으로 필터하고 있어서다.
+_NAT_MGR_COLS = (
+    ("id",             "INTEGER PRIMARY KEY AUTOINCREMENT"),
+    ("country_id",     "INTEGER"),
+    ("manager_id",     "INTEGER"),
+    ("start_year",     "INTEGER"),
+    ("end_year",       "INTEGER DEFAULT NULL"),   # NULL = 현직
+    # contract_end / sacked / resigned / caretaker_end / retired
+    ("end_reason",     "TEXT DEFAULT ''"),
+    ("role",           "TEXT DEFAULT 'full'"),    # full / caretaker
+    ("contract_until", "INTEGER DEFAULT 0"),
+    ("job_level",      "REAL DEFAULT 0"),         # 부임 당시 대표팀 자리 수준
+    ("tournaments",    "INTEGER DEFAULT 0"),      # 치른 메이저 대회 수
+    ("best_rank",      "INTEGER DEFAULT 0"),      # 이 임기 최고 성적 rank
+)
+_NAT_OBJ_COLS = (
+    ("id",             "INTEGER PRIMARY KEY AUTOINCREMENT"),
+    ("tournament_id",  "INTEGER"),
+    ("year",           "INTEGER"),
+    ("country",        "TEXT"),
+    ("country_id",     "INTEGER DEFAULT 0"),
+    ("squad_ovr",      "REAL DEFAULT 0"),
+    ("world_pct",      "REAL DEFAULT 1"),         # 0.0=최강 ~ 1.0=최약
+    ("objective",      "TEXT DEFAULT ''"),
+    ("objective_rank", "INTEGER DEFAULT 0"),
+    ("result",         "TEXT DEFAULT ''"),
+    ("result_rank",    "INTEGER DEFAULT -1"),     # -1 = 아직 미평가
+    ("manager_id",     "INTEGER DEFAULT 0"),
+)
+
+
+def _ddl(cols):
+    return ",\n        ".join(f"{_n} {_t}" for _n, _t in cols)
+
+
+def national_manager_migrations():
+    """③-d 표는 CREATE만으로 충분하지만(신규 표라 기존 세이브에도 CREATE
+    IF NOT EXISTS가 그대로 듣는다), 나중에 컬럼을 더할 때 이 목록에만
+    추가하면 되도록 함수를 둔다. 지금은 빈 목록."""
+    return []
+
+
+def verify_national_manager_tables(conn):
+    """③-d 표/컬럼이 다 생겼는지 확인 — 누락 (표, 컬럼) 목록을 돌려준다."""
+    missing = []
+    for _tbl, _cols in (("national_team_managers", _NAT_MGR_COLS),
+                        ("national_objectives", _NAT_OBJ_COLS)):
+        try:
+            rows = conn.execute(f"PRAGMA table_info({_tbl})").fetchall()
+        except sqlite3.OperationalError:
+            missing.append((_tbl, "*"))
+            continue
+        if not rows:
+            missing.append((_tbl, "*"))
+            continue
+        have = {r[1] for r in rows}
+        for _n, _t in _cols:
+            if _n not in have:
+                missing.append((_tbl, _n))
+    return missing
+
+
 def manager_rep_migrations():
     """③-c 감독 실적/명성 컬럼 ALTER 목록 — 정의(_MANAGER_REP_COLS /
     _TENURE_RESULT_COLS) 한 곳에서 생성하므로 손으로 적은 목록과 달리
@@ -1180,6 +1265,19 @@ def _migrate_managers():
         return 0
     finally:
         conn.close()
+
+
+def _migrate_national_managers():
+    """[2026-09 신설 — ③-d] 대표팀 감독이 없는 나라에 초기 감독을 심는다.
+    실제 로직은 national_manager.seed_national_managers에 있고, 여기서는
+    init_db 순서에 끼워 넣기만 한다(클럽 쪽 _migrate_managers와 같은 위치).
+    감독 표가 없는 구세이브에서도 조용히 넘어간다."""
+    try:
+        import national_manager
+        return national_manager.seed_national_managers()
+    except Exception as e:
+        print(f"[MIGRATE] 대표팀 감독 시드 건너뜀: {e}")
+        return 0
 
 
 def build_manager_row(rng, country, year, style_attack=None, manager_type=None,
@@ -3012,6 +3110,20 @@ def init_db():
                  ON team_managers(team_id, end_year)""")
     c.execute("""CREATE INDEX IF NOT EXISTS idx_team_managers_manager
                  ON team_managers(manager_id, start_year)""")
+    # [2026-09 신설 — ③-d] 대표팀 감독 재임 이력 + 목표 스냅샷.
+    # 정의는 파일 상단 _NAT_MGR_COLS / _NAT_OBJ_COLS 한 곳에만 있다.
+    c.execute(f"""CREATE TABLE IF NOT EXISTS national_team_managers(
+        {_ddl(_NAT_MGR_COLS)})""")
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_nat_mgr_current
+                 ON national_team_managers(country_id, end_year)""")
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_nat_mgr_manager
+                 ON national_team_managers(manager_id, start_year)""")
+    c.execute(f"""CREATE TABLE IF NOT EXISTS national_objectives(
+        {_ddl(_NAT_OBJ_COLS)})""")
+    c.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_nat_obj_unique
+                 ON national_objectives(tournament_id, country)""")
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_nat_obj_year
+                 ON national_objectives(year, country)""")
     c.execute("""CREATE TABLE IF NOT EXISTS offer_refused(
         team_id INTEGER, year INTEGER)""")
     # 마이그레이션: 컬럼 추가
@@ -4585,6 +4697,10 @@ def init_db():
     if _rep_missing:
         print("[WARN] 감독 실적/명성 컬럼 누락: "
               + ", ".join(f"{_t}.{_c}" for _t, _c in _rep_missing))
+    _nat_missing = verify_national_manager_tables(conn)
+    if _nat_missing:
+        print("[WARN] 대표팀 감독 표/컬럼 누락: "
+              + ", ".join(f"{_t}.{_c}" for _t, _c in _nat_missing))
 
     conn.commit()
     if not USE_MEMORY_DB:
@@ -4614,6 +4730,7 @@ def init_db():
     _migrate_lineup_tables_rowid()
     _migrate_history_db_split_v2()  # 파워랭킹/시즌순위 4표 main→history.db 이전 (1회성)
     _migrate_managers()   # [2026-09] 감독 표 생성 + tactic_tendency 이관 (①단계)
+    _migrate_national_managers()   # [2026-09] 대표팀 감독 시드 (③-d)
     _migrate_backfill_career_years()  # career_years 컬럼 1회성 백필 (아래 참고)
     _migrate_backfill_award_kind_competition()  # 개인상 award_kind/competition 1회성 백필 (아래 참고)
     _migrate_backfill_intl_continent()   # 대륙컵 continent 컬럼 1회성 백필 (1회성, 아래 참고)
@@ -6502,6 +6619,11 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
               # 경기 로직이 감독을 읽는다). 비워두면 같은 init_db 안의
               # _migrate_managers가 새 월드 기준으로 전부 다시 만든다.
               "team_managers","managers",
+              # [2026-09 — ③-d] 대표팀 감독 재임 이력과 목표 스냅샷도 같은
+              # 이유로 지운다. country_id/tournament_id 역시 새 게임에서
+              # 재사용되므로, 안 지우면 이전 세계관의 대표팀 감독과 목표가
+              # 새 게임에 그대로 남는다(위 team_managers와 똑같은 함정).
+              "national_team_managers","national_objectives",
               # [2026-08 버그수정, 신민용 리포트: "새 게임(2000년) 시작했는데
               # 2001년 파워랭킹이 남아있다"] power_ranking.py의 8개 테이블
               # (레이팅 원본 2개 + 연도별 스냅샷 2개 + 연속우승 카운터 2개 +
@@ -6699,6 +6821,13 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
         _migrate_managers()
     except Exception as _e:
         print(f"[RESET] 감독 재생성 실패(계속 진행): {_e}")
+    # [2026-09 — ③-d] 대표팀 감독도 같은 이유로 여기서 다시 심는다. 위
+    # DELETE 목록이 national_team_managers를 비웠으므로, 안 부르면 새 게임이
+    # 대표팀 감독 0명으로 시작한다.
+    try:
+        _migrate_national_managers()
+    except Exception as _e:
+        print(f"[RESET] 대표팀 감독 재생성 실패(계속 진행): {_e}")
     _rst_mark("감독 재생성")
     # season_state가 방금 통째로 지워졌으므로 get_state() 캐시도 반드시
     # 비워야 한다 — 안 그러면 새 게임 시작 직후에도 이전 플레이의 연도/
