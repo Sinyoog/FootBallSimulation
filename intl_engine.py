@@ -2097,14 +2097,608 @@ def _intl_experience_score(appearances, cap=50):
 
 
 def intl_squad_selection_score(ovr, tier, form_adj, appearances):
-    """[2026-09 재설계, 위 _INTL_FORM_ADJ_MAX 주석 참고] 국가대표 26인 선발
-    최종 점수 = OVR + 폼 보정(±3) + 경험 보너스(0~+2) + 리그 보정
-    (_intl_tier_penalty, 기존 함수·값 그대로). 나이는 인자로도 안 받는다.
-    form_adj는 호출부(_intl_form_adjustments)가 이미 ±3으로 계산해 넘기며,
-    정보가 없으면 0(또는 None)이다. 경험은 벌점이 아니라 보너스라 출전
-    0회면 정확히 +0이다. 포지션 적합도는 여기 안 섞는다(호출부가 곱한다)."""
+    """[구버전 — v3 이전 호환용] OVR + 폼 보정(±3) + 경험 보너스(0~+2) +
+    리그 보정. 실제 선발은 이제 intl_selection_score_v3가 담당한다(아래
+    "국가대표 선발 v3" 섹션 참고) — 이 함수는 v3가 필요한 기록 데이터가
+    아예 없는 경로(구세이브 등)의 폴백으로만 남는다."""
     exp_bonus = _intl_experience_score(appearances) / 100.0 * _INTL_EXP_BONUS_MAX
     return (ovr or 0) + (form_adj or 0.0) + exp_bonus + _intl_tier_penalty(tier)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 국가대표 선발 v3 — 다요소 선발점수
+# ═══════════════════════════════════════════════════════════════════
+# [2026-09 재설계, 신민용 확정 요구사항 원문]
+#   "하위팀 에이스 vs 상위팀 괜찮은 선수 — 소속팀 순위보다 선수 개인
+#    경기력을 우선 평가.
+#    개인 경기력(가장 중요): 출전시간 / 선발 비율 / 공격·수비 기록 /
+#      경기 평점 / 최근 폼
+#    팀 내 역할: 에이스·핵심주전·일반주전·로테이션
+#    소속팀 수준: 리그 수준 / 팀 전력 / 팀 순위 — 단, 가산점·보정 요소로만
+#    상대 수준: 강팀 상대 경기력까지 고려, 약팀에서 스탯만 쌓은 선수의
+#      과대평가 방지
+#    국대 적합성: 포지션 필요성 / 전술 적합성 / 멀티 포지션 능력"
+#
+# ── v2(직전)가 왜 이 요구를 못 만족했나: 실측 ────────────────────
+# v2 점수 = OVR + 폼(±3) + 경험(0~+2) + 부수페널티. 즉 사실상 OVR 순위다.
+# 2시즌 진행한 실제 세계(26.9만 명)에서 대한민국 후보 상위를 뽑아보면:
+#     OVR 79 CM  역할 대기   9경기  1골 1도움 → 선발점수 80.35 (뽑힘)
+#     OVR 76 CM  역할 전력외 6경기  0골 0도움 → 77.82 (뽑힘)
+#     OVR 74 ST  역할 핵심  40경기 15골 3도움 → 76.88 (탈락권)
+#     OVR 75 CM  역할 핵심  41경기  3골 9도움 → 76.44 (탈락권)
+# 브라질도 같다(OVR 92 RW 대기 9경기 94.36 > OVR 91 ST 주전 31경기 16골
+# 94.00). 즉 "상위팀 벤치"가 "하위팀 에이스"를 항상 이기는 구조였다 —
+# 신민용이 지적한 바로 그 증상이다.
+#
+# ── 이 엔진에 실제로 존재하는 데이터(설계 전 확인) ────────────────
+# AI 선수의 시즌 기록은 hist.ai_player_season_stats(matches/goals/assists/
+# rating/clean_sheets/saves/goals_conceded) + hist.ai_player_position_
+# history(position, role)에 남는다. 2026-09에 역할 기반 출전 배분
+# (ai_lifecycle._ROLE_PLAY_RATIO)이 들어가면서 **출전수라는 축이 처음으로
+# 실제로 생겼다** — 2시즌 실측 평균 출전: 핵심 31.8 / 주전 28.3 /
+# 로테이션 19.1 / 대기 9.9 / 유망주 5.0 / 전력외 3.2경기. 그 전까지는
+# 전원이 팀 경기수를 그대로 받아서(26~49경기, 0경기 0명) 출전 기반
+# 판정이 아무 일도 못 했다(ai_lifecycle의 같은 주석 참고).
+#
+# 반면 **"경기 평점"은 독립적인 축이 아니다**: AI 평점은 실제 경기 결과가
+# 아니라 `6.0 + (시즌OVR-60)/35 + 골×0.02 + 도움×0.015`로 만들어진다
+# (_intl_form_adjustments 주석의 실측). 그래서 평점을 따로 한 축으로
+# 더하면 OVR과 골·도움을 두 번 세는 것이 된다 — v3는 평점을 직접 쓰지
+# 않고, 그 대신 평점의 원재료인 골·도움을 "출전당 생산성"으로 쓴다
+# (요구사항의 "공격/수비 기록"·"경기 평점" 두 항목이 이 엔진에서는 같은
+# 정보라는 뜻).
+#
+# ── v3 점수 구조 ────────────────────────────────────────────────
+# 기준선은 그대로 OVR이다(신민용 리포트 "프랑스 국대에 98~96 다 안 뽑히고
+# 95가 뽑힌다"의 재발 방지 — 기본 기량 서열은 유지돼야 한다). 그 위에
+# "개인 경기력" 계열 보정을 v2의 ±3보다 훨씬 크게(최대 −17 ~ +8) 얹어서,
+# 거의 안 뛰는 선수는 실제로 밀려나고 하위팀 에이스는 실제로 올라오게
+# 한다. 소속팀 수준 계열은 신민용 지시대로 **가산(양수) 전용**이다 —
+# 하위팀 소속이라는 이유로 깎지 않는다(부수 페널티만 예외적으로 유지:
+# 2부 이하는 "무대 검증 자체가 안 된 것"이라는 기존 합의).
+#
+#   점수 = OVR                             ← 기준선(리그 수준이 이미 내장돼 있음)
+#        + 출전 보정      (−12.0 ~ +1.5)   출전률(=출전수/팀 최다출전)
+#        + 역할 보정      ( −2.0 ~ +1.0)   핵심/주전/로테이션/대기/전력외
+#        + 생산성 보정    ( −2.0 ~ +2.0)   출전당 골·도움(GK는 무실점·선방),
+#                                          포지션 내 z점수, 리그 순위로 할인
+#        + 최근 폼 보정   ( −1.5 ~ +1.5)   직전 시즌 대비 생산성 변화
+#        + 강한상대 보정  (  0.0 ~ +2.5)   대륙대항전(챔스/유로파/컨퍼런스)
+#        + 경험 보너스    (  0.0 ~ +2.0)   대표팀 통산 출전(기존 그대로)
+#        + 멀티포지션     (  0.0 ~ +0.8)   여러 포지션군 소화 가능
+#        + 부수 보정      (−18.0 ~  0.0)   _intl_tier_penalty(기존 그대로)
+#   ※ 리그 수준은 가산 항목이 아니다 — 아래 "리그 수준을 어떻게 쓸 것인가"
+#     주석 참고(OVR 이중계산 방지).
+#   × 포지션 적합도(INTL_GROUP_FIT) — 호출부가 곱한다(기존 구조 유지)
+#
+# 데이터가 없는 항목은 정확히 0이다 — 기록이 아직 없는 신인·구세이브·
+# 게임 첫 시즌은 v2(=OVR 서열)와 거의 같게 동작한다.
+# [2026-09 3차 조정, 신민용 지적: "전력외라도 EPL 리그에서 뛴다는 건
+# 경쟁력이 최소한 있다는 건데, 베트남 리그 영웅은 EPL 2부도 못 밟는다 —
+# 무조건 베트남 리그 에이스가 EPL보다 약하다"] 출전 감점이 너무 강해서
+# 리그·OVR의 기본 서열을 비정상적으로 뒤집고 있었다.
+# 실측(상위 60개국 전수, "더 높은 OVR + 더 강한 리그인데 탈락"한 역전 사례):
+#     이전(-12/-2): 378건, 중앙 3점, p90 7점, 최대 15점, 10점+ 역전 17건
+#       최악 사례 — 헝가리 CB: OVR73 국내핵심 뽑힘 ← OVR88 독일1부 전력외 탈락
+#     이후(아래 값): 335건, 중앙 2점, p90 6점, 최대 12점, 10점+ 역전 4건
+# 감점 폭을 0.8배로 줄이고(역할 감점은 0.9배), 아래 _INTL_SEL_BENCH_RELIEF로
+# "강한 리그에서 못 뛰는 것"을 "약한 리그에서 못 뛰는 것"보다 덜 깎는다.
+# 원래 이 시스템을 만든 계기(대한민국 OVR79 대기 9경기 > OVR74 핵심 40경기
+# 15골)는 그대로 해결된 상태로 유지된다(실측 마진 +4.06).
+_INTL_SEL_PLAY_ANCHORS = [   # (출전률, 보정) — 사이는 선형보간
+    (0.00, -9.6), (0.25, -5.6), (0.45, -2.4), (0.60, 0.0), (0.80, 1.0), (1.00, 1.5),
+]
+# 출전·역할 감점(음수일 때만)을 리그 강도로 완화하는 비율.
+# 감점 배수 = 1 - _INTL_SEL_BENCH_RELIEF × 리그강도
+#   잉글랜드 1부(1.000) → 0.65배 / K리그(0.663) → 0.77배 / 베트남(0.466) → 0.84배
+# 근거(신민용): 강한 리그 스쿼드에 들어가 있다는 것 자체가 최소한의 경쟁력
+# 증거다 — 같은 "전력외"라도 그 의미가 리그마다 다르다. 가산(양수) 쪽에는
+# 적용하지 않는다 — 그건 "실제로 뛰었다"는 사실이라 리그와 무관하게 같은
+# 값이어야 하고, 완화를 양쪽에 걸면 강한 리그 주전만 유리해져 "EPL이라는
+# 이유만으로 선발"이라는 반대쪽 함정에 빠진다.
+_INTL_SEL_BENCH_RELIEF = 0.35
+# 역할 — formation_logic.compute_squad_roles가 내는 다섯 값 + 핵심.
+# 요구사항의 "에이스/핵심주전/일반주전/로테이션"에 그대로 대응한다.
+_INTL_SEL_ROLE_ADJ = {
+    "핵심": 1.0, "주전": 0.5, "로테이션": 0.0,
+    "대기": -0.9, "전력외": -1.8,
+    # 유망주는 10대 육성 대상이라 출전이 적은 게 정상 — 출전 보정에서
+    # 이미 크게 깎이므로 역할로 또 깎지 않는다(이중 감점 방지).
+    "유망주": -0.45,
+}
+# [2026-09 2차 조정, 신민용 확정] 생산성·폼 상한을 ±3/±2에서 ±2/±1.5로
+# 좁혔다. 둘 다 꾸준히 뛰는 선수끼리는 이 두 항목이 사실상 유일한 변별
+# 수단이라, ±3+±2(합계 스윙 10점)면 "기록만으로 OVR 8점을 뒤집는" 일이
+# 생긴다 — 그러면 OVR이 기준선이라는 원칙(그리고 그 안에 들어 있는 리그
+# 수준)이 무너진다. 실측: 잉글1부 로테이션 OVR88 vs K리그 MVP OVR80의
+# 점수차가 ±3/±2에서 1.07점(거의 동률)이었는데, ±2/±1.5에서는 2.26점으로
+# 벌어진다. 대신 "거의 안 뛰는 선수"를 걸러내는 일은 출전 보정(−12)이
+# 계속 담당하므로, EPL 대기 OVR88이 K리그 MVP OVR80에 밀리는 관계는
+# 그대로다(그게 바로 의도한 동작).
+_INTL_SEL_PROD_MAX = 2.0        # 생산성 보정 ±2
+_INTL_SEL_PROD_PER_SD = 1.0     # 포지션 평균 대비 1표준편차당
+_INTL_SEL_PROD_MIN_MATCHES = 5  # 이보다 적게 뛰면 생산성 판정 불가(0)
+_INTL_SEL_PROD_MIN_POOL = 8     # 같은 포지션 표본이 이보다 적으면 전원 0
+_INTL_SEL_PROD_SD_FLOOR = 0.02  # 표본 분산이 비정상적으로 작을 때 z 폭주 방지
+_INTL_SEL_FORM_MAX = 1.5        # 최근 폼 보정 ±1.5
+_INTL_SEL_BIGGAME_MAX = 2.5     # 강한 상대(대륙대항전) 0 ~ +2.5
+_INTL_SEL_STAGE_MAX = 2.0       # 무대(리그 등급) 0 ~ +2
+_INTL_SEL_MULTIPOS_MAX = 0.8    # 멀티포지션 0 ~ +0.8
+_INTL_SEL_ASSIST_W = 0.7        # 생산성에서 도움의 가중치(골=1.0 기준)
+# 포지션별 숏리스트 인원 — 이 나라 그 포지션 OVR 상위 몇 명까지를 선발
+# 경쟁(과 지표 조회·z점수 표본)에 넣는가. v2는 (그룹 정원×6, 최소 20)
+# 이었는데, v3는 출전 보정이 −12까지 가므로 "OVR은 조금 낮지만 매 경기
+# 뛰는 하위팀 에이스"가 실제로 역전할 수 있어야 해서 넓혔다. 그룹 정원과
+# 무관한 고정값이어야 하는 이유는 _build_intl_squad_by_group의 성능 주석
+# 참고(지표를 나라당 한 번만 계산하려면 대상 목록이 그룹마다 달라지면
+# 안 된다). 상한이 있는 이유는 v2와 같다 — 포지션당 수백~수천 명 전원을
+# z점수 표본에 넣으면 극단치 하나가 전체 스케일을 왜곡한다.
+_INTL_SEL_SHORTLIST_PER_POS = 40
+# _intl_candidate_metrics 결과에 포지션별 (생산성 평균, 표준편차)를 함께
+# 실어 보낼 때 쓰는 예약 키 — 내 선수를 AI와 같은 척도로 z점수화하려면
+# 그 표본 통계가 필요하다(_check_selection 참고).
+_INTL_POS_STAT_KEY = "__pos_stat__"
+
+# ── 리그 수준을 어떻게 쓸 것인가 ─────────────────────────────────
+# [2026-09 재설계 2차, 신민용 확정] 두 가지를 분리한다.
+#
+# (1) 리그 수준을 **선발점수에 가산**하지 않는다(무대 가산 폐지).
+#     이 엔진에서는 OVR 자체가 이미 리그 수준을 내장하고 있기 때문이다 —
+#     실측(26.9만 명 세계, 리그등급별 1부 선수 평균 OVR):
+#         SS 91.0 / S 88.7 / A 80.4 / B 71.3 / C 60.0 / D 52.3 / E 42.2 / F 33.2
+#     대한민국 국적자만 봐도 A등급 리그 1부 소속은 평균 75.7, B등급(K리그)
+#     1부는 61.2다. 즉 "잉글랜드에서 1인분 하는 선수 > K리그 MVP"라는
+#     기준선은 이미 OVR 숫자 그 자체에 10~17점 차이로 박혀 있다. 여기에
+#     리그 가산점을 또 얹으면 같은 정보를 두 번 세는 것이다.
+#
+# (2) 반면 리그 수준으로 **기록을 해석하는 배율**은 유지한다 — "22골을
+#     넣었다"가 어느 수준의 리그에서 나온 기록인지는 OVR과 별개 정보이고,
+#     "약한 리그에서 스탯만 쌓은 선수의 과대평가 방지"(신민용 요구사항)가
+#     정확히 이 축이다. 골·도움 원값에 (0.5 + 0.5×가중)을 곱한다.
+#
+# 그 가중치는 새로 만들지 않고 **이미 있는 리그 순위표를 그대로 쓴다** —
+# game_engine._league_strength_weight(= _country_trophy_weight)는
+# _COUNTRY_RANK_WITHIN_GRADE(등급 내 국가 순위)와 _GRADE_VALUE_RANGE를
+# 선형보간해 만든 국가별 리그 강도이고, 발롱도르의 평점·생산성 보정이
+# 이미 같은 값을 쓰고 있다. 등급 8단계보다 훨씬 촘촘하다(같은 B등급
+# 안에서도 콜롬비아 0.73 ↔ 캐나다 0.61).
+#
+# 부수(tier)도 리그 수준의 일부다 — 같은 잉글랜드라도 2부는 1부와 경쟁
+# 수준이 다르다. 순위표는 그 나라 1부 기준이므로 부수별 배율을 곱한다
+# (_intl_tier_penalty의 −4/−9/−15/−18과 같은 서열, 배율로 환산).
+_INTL_SEL_TIER_WEIGHT = {1: 1.00, 2: 0.75, 3: 0.55, 4: 0.45}
+# game_engine을 못 부르는 예외 경로용 폴백(등급 8단계 평균값).
+_INTL_SEL_LEAGUE_GRADE_FALLBACK = {
+    "SS": 1.00, "S": 0.95, "A": 0.84, "B": 0.67,
+    "C": 0.51, "D": 0.375, "E": 0.275, "F": 0.20,
+}
+_intl_league_weight_cache: dict = {}
+
+
+def _intl_sel_play_adj(play_frac):
+    """출전률(0~1) -> 출전 보정. _INTL_SEL_PLAY_ANCHORS 선형보간.
+    play_frac이 None(기록 없음)이면 0 — 데이터 없음은 감점하지 않는다."""
+    if play_frac is None:
+        return 0.0
+    f = max(0.0, min(1.0, play_frac))
+    lo_f, lo_v = _INTL_SEL_PLAY_ANCHORS[0]
+    if f <= lo_f:
+        return lo_v
+    for hi_f, hi_v in _INTL_SEL_PLAY_ANCHORS[1:]:
+        if f <= hi_f:
+            t = (f - lo_f) / (hi_f - lo_f)
+            return lo_v + t * (hi_v - lo_v)
+        lo_f, lo_v = hi_f, hi_v
+    return lo_v
+
+
+def _intl_sel_role_adj(role):
+    return _INTL_SEL_ROLE_ADJ.get(role or "", 0.0)
+
+
+def _intl_sel_league_weight(club_country, club_tier=1):
+    """소속 리그(국가 + 부수) -> 생산성 해석 가중(0~1). 위 "리그 수준을
+    어떻게 쓸 것인가" 주석 참고 — 선발점수 가산이 아니라 **기록을
+    할인하는 배율**로만 쓴다.
+
+    국가별 값은 game_engine._league_strength_weight(리그 순위표 기반)를
+    그대로 쓴다. 클럽 리그 등급을 직접 판정해야 하는 폴백 경로에서는
+    반드시 constants.get_country_league_grade를 쓴다 —
+    countries.grade(국가대표 등급)를 리그 등급처럼 쓰던 버그가 과거에
+    4곳 있었다(world_browser.py 경고 주석 참고)."""
+    if not club_country:
+        return 0.55
+    key = (club_country, club_tier or 1)
+    cached = _intl_league_weight_cache.get(key)
+    if cached is not None:
+        return cached
+    try:
+        from game_engine import _league_strength_weight
+        base = _league_strength_weight(club_country)
+    except Exception:
+        from constants import get_country_league_grade
+        base = _INTL_SEL_LEAGUE_GRADE_FALLBACK.get(
+            get_country_league_grade(club_country), 0.4)
+    t = _INTL_SEL_TIER_WEIGHT.get(club_tier or 1, 0.40)
+    val = max(0.05, min(1.0, base * t))
+    _intl_league_weight_cache[key] = val
+    return val
+
+
+def _intl_sel_multipos_adj(position):
+    """멀티포지션 보정 — 그 포지션이 INTL_GROUP_FIT상 몇 개의 다른
+    포지션군까지 커버할 수 있는지로 0~+0.8. "국대 적합성 — 멀티 포지션
+    능력"(신민용 요구사항) 항목이다. 스페셜리스트 스타를 뒤집을 만큼
+    크면 안 되므로 상한을 작게 둔다."""
+    from constants import INTL_GROUP_FIT, INTL_POSITION_TO_GROUP
+    if not position:
+        return 0.0
+    own = INTL_POSITION_TO_GROUP.get(position)
+    n = sum(1 for grp, table in INTL_GROUP_FIT.items()
+            if grp != own and position in table)
+    return min(_INTL_SEL_MULTIPOS_MAX, 0.4 * n)
+
+
+def _intl_sel_prod_raw(pos, matches, goals, assists, clean_sheets, saves, conceded,
+                       league_w):
+    """출전당 생산성 원값. 필드 플레이어는 (골 + 0.7×도움)/출전,
+    GK는 무실점률 + 선방률로 만든다(요구사항의 "공격/수비 기록").
+    리그 강도 가중(league_w)으로 할인해 "약한 리그에서 스탯만 쌓은
+    선수"의 과대평가를 막는다 — z점수화 **전에** 곱해야 실제로 순위가
+    내려간다."""
+    m = matches or 0
+    if m < _INTL_SEL_PROD_MIN_MATCHES:
+        return None
+    if pos in GK_POS:
+        sv, gc = (saves or 0), (conceded or 0)
+        save_ratio = sv / (sv + gc) if (sv + gc) > 0 else 0.0
+        raw = (clean_sheets or 0) / m + 0.6 * save_ratio
+    else:
+        raw = ((goals or 0) + _INTL_SEL_ASSIST_W * (assists or 0)) / m
+    return raw * (0.5 + 0.5 * league_w)
+
+
+def _intl_candidate_metrics(candidates, year=None):
+    """[2026-09 신설, 국가대표 선발 v3] 후보 전원의 선발 판정용 지표를
+    **배치 조회 한 번**으로 만들어 {player_id: metrics dict}로 돌려준다.
+    metrics 키: play_frac / role / prod_adj / form_adj / big_adj.
+
+    이 함수가 v2의 _intl_form_adjustments를 대체한다(그 함수는 평점 잔차
+    ±3 하나만 만들었다). 조회 대상은 예전과 같은 hist 표들이고, 연도만
+    최근 3시즌(올해·작년·재작년)으로 넓혔다 — 최근 폼(직전 시즌 대비
+    변화)을 계산하려면 두 시즌이 필요하기 때문이다.
+
+    성능: 후보 수(한 나라 국적자 중 포지션별 숏리스트)는 수백 명 규모이고
+    조회는 IN(...) 500개 청크 4건(시즌기록 / 역할 / 팀 최다출전 / 대회별
+    기록)이다 — 예전(_intl_form_adjustments) 2건에서 2건 늘었다. 대표팀이
+    처음 꾸려지는 주차에 211개국을 도는 경로이므로, 후보 목록을 그대로
+    받아 추가 조회를 나라마다 1세트로 묶는 기존 구조를 유지한다.
+    """
+    if not candidates:
+        return {}
+    import statistics as _stats
+    from game_engine import get_state
+    if year is None:
+        try:
+            year = (get_state() or {}).get("current_year")
+        except Exception:
+            year = None
+    if not year:
+        return {}
+    try:
+        from database import history_drain
+        history_drain()   # read-after-write: 43주차 스냅샷이 큐에 남아 있을 수 있다
+    except Exception as _e:
+        print(f"[INTL] history_drain 실패(낡은 스냅샷으로 계속 진행): {_e}")
+
+    ids = [c["id"] for c in candidates]
+    years = (year, year - 1, year - 2)
+    stats_by_id: dict = {}      # pid -> {year: row dict}
+    role_by_id: dict = {}       # pid -> role (가장 최근 연도)
+    comp_by_id: dict = {}       # pid -> {"matches":, "ga":}  (대륙대항전, 최근 연도)
+    team_year_max: dict = {}    # (team_id, year) -> 그 팀 최다 출전수
+    conn = get_conn()
+    try:
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            ph = ",".join("?" * len(chunk))
+            for r in conn.execute(
+                    f"""SELECT player_id, year, team_id, matches, goals, assists,
+                               clean_sheets, saves, goals_conceded
+                        FROM hist.ai_player_season_stats
+                        WHERE player_id IN ({ph}) AND year IN (?,?,?)""",
+                    (*chunk, *years)):
+                stats_by_id.setdefault(r["player_id"], {})[r["year"]] = dict(r)
+            for r in conn.execute(
+                    f"""SELECT player_id, year, role FROM hist.ai_player_position_history
+                        WHERE player_id IN ({ph}) AND year IN (?,?,?)""",
+                    (*chunk, *years)):
+                prev = role_by_id.get(r["player_id"])
+                if prev is None or r["year"] > prev[0]:
+                    role_by_id[r["player_id"]] = (r["year"], r["role"] or "")
+            # 대륙대항전(챔스/유로파/컨퍼런스) — _snapshot_season_ratings가
+            # 셋을 'cl' 하나로 합쳐 저장한다(그 함수의 워터폴 주석 참고).
+            for r in conn.execute(
+                    f"""SELECT player_id, SUM(matches) AS m,
+                               SUM(goals) AS g, SUM(assists) AS a
+                        FROM hist.ai_player_season_stats_by_comp
+                        WHERE player_id IN ({ph}) AND year IN (?,?) AND competition='cl'
+                        GROUP BY player_id""",
+                    (*chunk, year, year - 1)):
+                comp_by_id[r["player_id"]] = {"matches": r["m"] or 0,
+                                              "ga": (r["g"] or 0) + (r["a"] or 0)}
+        # 출전률 분모 — "그 팀 그 시즌 최다 출전수". 팀 경기수 자체를
+        # 따로 세지 않고 이 값을 쓰는 이유: 리그 규모(경기수)가 나라마다
+        # 다르고 컵/대륙대항전 출전도 섞이는데, 같은 팀 동료와의 상대
+        # 비교면 그 차이가 자동으로 상쇄되기 때문이다(핵심 역할의 실측
+        # 출전률이 0.90 근방이라 분모가 팀 경기수와 거의 같다).
+        team_years = {(v["team_id"], y) for m in stats_by_id.values()
+                      for y, v in m.items() if v.get("team_id")}
+        tids = sorted({t for t, _y in team_years})
+        for i in range(0, len(tids), 500):
+            chunk = tids[i:i + 500]
+            ph = ",".join("?" * len(chunk))
+            for r in conn.execute(
+                    f"""SELECT team_id, year, MAX(matches) AS mx
+                        FROM hist.ai_player_season_stats
+                        WHERE team_id IN ({ph}) AND year IN (?,?,?)
+                        GROUP BY team_id, year""", (*chunk, *years)):
+                team_year_max[(r["team_id"], r["year"])] = r["mx"] or 0
+    except Exception as _e:
+        print(f"[INTL] 선발 지표 조회 실패(OVR 기준으로 진행): {_e}")
+        stats_by_id = {}
+    finally:
+        conn.close()
+
+    # 1차 패스 — 후보별 원시 생산성(리그 강도 할인 포함)과 출전률.
+    base: dict = {}
+    prod_by_pos: dict = {}
+    for cand in candidates:
+        pid = cand["id"]
+        per_year = stats_by_id.get(pid) or {}
+        if not per_year:
+            continue
+        latest_y = max(per_year)
+        s = per_year[latest_y]
+        league_w = _intl_sel_league_weight(cand.get("club_country"), cand.get("club_tier"))
+        mx = team_year_max.get((s.get("team_id"), latest_y)) or 0
+        play_frac = (s["matches"] / mx) if mx > 0 else None
+        prod = _intl_sel_prod_raw(cand["position"], s["matches"], s["goals"], s["assists"],
+                                  s["clean_sheets"], s["saves"], s["goals_conceded"], league_w)
+        prev = per_year.get(latest_y - 1)
+        prod_prev = None
+        if prev:
+            prod_prev = _intl_sel_prod_raw(cand["position"], prev["matches"], prev["goals"],
+                                           prev["assists"], prev["clean_sheets"], prev["saves"],
+                                           prev["goals_conceded"], league_w)
+        base[pid] = {"play_frac": play_frac,
+                     "role": (role_by_id.get(pid) or (0, ""))[1],
+                     "_prod": prod, "_prod_prev": prod_prev}
+        if prod is not None:
+            prod_by_pos.setdefault(cand["position"], []).append(prod)
+
+    # 2차 패스 — 생산성을 같은 포지션 안에서 z점수화(포지션별 기대치
+    # 차이를 표본으로 흡수한다. v2의 평점 잔차 z점수와 같은 방식이고,
+    # 원재료만 "평점 잔차"에서 "출전당 골·도움"으로 바뀌었다).
+    pos_stat = {}
+    for pos, vals in prod_by_pos.items():
+        if len(vals) < _INTL_SEL_PROD_MIN_POOL:
+            continue
+        mean = _stats.fmean(vals)
+        sd = _stats.pstdev(vals) if len(vals) > 1 else 0.0
+        pos_stat[pos] = (mean, max(sd, _INTL_SEL_PROD_SD_FLOOR))
+
+    # [2026-09] 포지션별 (평균, 표준편차)를 결과 dict에 함께 실어 보낸다 —
+    # 내 선수 발탁 판정(_check_selection)이 "AI 후보와 **같은 척도**"로
+    # 자기 생산성을 z점수화해야 하기 때문이다(그 함수 주석 참고). 키는
+    # 문자열이라 player_id(정수)와 절대 충돌하지 않는다.
+    out = {_INTL_POS_STAT_KEY: pos_stat}
+    for cand in candidates:
+        pid = cand["id"]
+        b = base.get(pid)
+        if not b:
+            continue
+        pos = cand["position"]
+        prod_adj = 0.0
+        form_adj = 0.0
+        if pos in pos_stat and b["_prod"] is not None:
+            mean, sd = pos_stat[pos]
+            z = (b["_prod"] - mean) / sd
+            prod_adj = max(-_INTL_SEL_PROD_MAX,
+                           min(_INTL_SEL_PROD_MAX, z * _INTL_SEL_PROD_PER_SD))
+            if b["_prod_prev"] is not None:
+                dz = (b["_prod"] - b["_prod_prev"]) / sd
+                form_adj = max(-_INTL_SEL_FORM_MAX, min(_INTL_SEL_FORM_MAX, dz))
+        cm = comp_by_id.get(pid)
+        big_adj = 0.0
+        if cm:
+            if pos in GK_POS:
+                big_adj = min(_INTL_SEL_BIGGAME_MAX, cm["matches"] * 0.10)
+            else:
+                big_adj = min(_INTL_SEL_BIGGAME_MAX,
+                              cm["matches"] * 0.06 + cm["ga"] * 0.25)
+        out[pid] = {"play_frac": b["play_frac"], "role": b["role"],
+                    "prod_adj": prod_adj, "form_adj": form_adj, "big_adj": big_adj}
+    return out
+
+
+_intl_metrics_cache: dict = {}   # (country, year) -> {pid: metrics}
+
+
+def _invalidate_intl_metrics_cache():
+    """시즌전환/리맵 시점에 game_engine._invalidate_team_ovr_cache가 호출
+    (_invalidate_real_squad_ovr_cache와 같은 타이밍·같은 이유)."""
+    _intl_metrics_cache.clear()
+
+
+def _intl_metrics_for_country(country, nat_by_pos=None, year=None):
+    """그 나라 선발 후보(포지션별 OVR 상위 _INTL_SEL_SHORTLIST_PER_POS명)의
+    선발 지표를 만들어 {pid: metrics}로 돌려준다 — 나라·연도당 1회만
+    계산하고 캐시한다.
+
+    한 나라는 같은 해에 예선·본선·지역컵 등 여러 대회에서 각각 26인을
+    꾸리는데(get_or_create_intl_squad는 tournament_id 단위), 후보 지표는
+    그 대회와 무관하게 같은 값이므로 매번 다시 조회할 이유가 없다.
+    hist 기록은 시즌전환 시점에만 바뀌므로 캐시 무효화도 그 타이밍
+    하나로 충분하다(_invalidate_intl_metrics_cache)."""
+    from game_engine import get_state
+    if year is None:
+        try:
+            year = (get_state() or {}).get("current_year")
+        except Exception:
+            year = None
+    key = (country, year)
+    if key in _intl_metrics_cache:
+        return _intl_metrics_cache[key]
+    if nat_by_pos is None:
+        from database import get_country_nationals_by_position
+        nat_by_pos = get_country_nationals_by_position(country)
+    shortlist = []
+    for _pos, lst in nat_by_pos.items():
+        ranked = sorted(lst, key=lambda c: -(c["ovr"] or 0))
+        shortlist.extend(ranked[:_INTL_SEL_SHORTLIST_PER_POS])
+    val = _intl_candidate_metrics(shortlist, year=year)
+    _intl_metrics_cache[key] = val
+    return val
+
+
+def intl_selection_score_v3(cand, metrics=None, appearances=0, national_grade=None):
+    """국가대표 선발점수 v3 — 위 섹션 주석의 구조 그대로.
+    cand: 후보 dict(ovr/position/club_tier/club_country 필요 —
+          database.get_country_nationals_by_position의 행 형식).
+    metrics: _intl_candidate_metrics가 만든 그 선수의 지표(없으면 기록
+          데이터가 없는 것으로 보고 개인 경기력 계열 전부 0).
+    반환은 OVR과 같은 단위라 그대로 비교·정렬할 수 있다(포지션 적합도
+    배율은 호출부가 곱한다 — 기존 구조 유지)."""
+    m = metrics or {}
+    exp_bonus = _intl_experience_score(appearances) / 100.0 * _INTL_EXP_BONUS_MAX
+    play_adj = _intl_sel_play_adj(m.get("play_frac"))
+    role_adj = _intl_sel_role_adj(m.get("role"))
+    # 감점일 때만 리그 강도로 완화 — _INTL_SEL_BENCH_RELIEF 주석 참고.
+    if (play_adj + role_adj) < 0:
+        _relief = 1.0 - _INTL_SEL_BENCH_RELIEF * _intl_sel_league_weight(
+            cand.get("club_country"), cand.get("club_tier"))
+        play_adj *= _relief
+        role_adj *= _relief
+    return ((cand.get("ovr") or 0)
+            + play_adj
+            + role_adj
+            + (m.get("prod_adj") or 0.0)
+            + (m.get("form_adj") or 0.0)
+            + (m.get("big_adj") or 0.0)
+            + exp_bonus
+            + _intl_sel_multipos_adj(cand.get("position"))
+            + _intl_tier_penalty(cand.get("club_tier")))
+
+
+def _my_selection_metrics(p, pos_stat=None, year=None):
+    """[2026-09 신설, 국가대표 선발 v3] 내 선수의 선발 지표를 AI 후보와
+    **완전히 같은 형식**(_intl_candidate_metrics의 metrics dict)으로 만든다.
+    _check_selection이 나와 AI를 한 점수 척도에서 비교할 수 있게 하는 어댑터다.
+
+    ── AI와 다른 점(불가피한 비대칭, 전부 의도적) ──────────────────
+    · 출전률: AI는 "직전 확정 시즌 출전수 / 그 팀 최다출전"이고, 나는
+      "이번 시즌 지금까지 출전수 / 내 팀이 지금까지 치른 경기수"다. 월드컵
+      예선은 시즌 중간(클럽 시즌 약 60% 지점)에 열리므로 내 누적치는
+      아직 풀시즌이 아니다 — 둘 다 **비율**이라 이 시점 차이가 상쇄된다
+      (예전 v2가 38경기 페이스로 환산하던 보정이 더 이상 필요 없어졌다).
+    · 역할: 내 선수에게는 role 컬럼이 없다(AI는 formation_logic.
+      compute_squad_roles 결과가 hist에 남는다). 출전률에서 역할을
+      역산한다 — 역할별 실측 출전률(ai_lifecycle._ROLE_PLAY_RATIO:
+      핵심 0.90 / 주전 0.80 / 로테이션 0.54 / 대기 0.28)의 경계로 자른다.
+    · 강한상대: 대륙대항전 골·도움은 내 선수 쪽에 스냅샷이 없어서
+      출전수만 쓴다(cl/el/ecl_matches의 my_played=1 집계 — AI의 GK 계산과
+      같은 계수 0.10). 골·도움까지 세는 AI 필드플레이어보다 약간 불리할
+      수 있는데, 없는 데이터를 추정해 넣는 것보다 낫다고 판단했다.
+    """
+    from game_engine import get_state
+    st = get_state() or {}
+    if year is None:
+        year = st.get("current_year")
+    pos = p.get("position", "ST")
+    matches = p.get("season_matches", 0) or 0
+    # 출전률 분모 — 내 선수 자신의 기록으로 만든다: 뛴 경기 + 결장한
+    # 경기(부상/출전정지/벤치). teams.wins+draws+losses("팀이 치른 경기수")를
+    # 쓰면 시즌전환 직후 0으로 리셋되고 컵/대항전 경기가 안 세져서
+    # 시점에 따라 분모가 무의미해진다 — 이 세 결장 카운터는 정확히
+    # "내가 뛸 수 있었던 경기 중 못 뛴 수"라 시점과 무관하게 항상 맞다.
+    missed = ((p.get("season_injury_matches_missed", 0) or 0)
+              + (p.get("season_suspension_matches_missed", 0) or 0)
+              + (p.get("season_bench_matches_missed", 0) or 0))
+    team_played = matches + missed
+    conn = get_conn()
+    try:
+        prev = conn.execute(
+            """SELECT matches, goals, assists FROM my_player_season_stats
+               WHERE year < ? ORDER BY year DESC LIMIT 1""", (year or 0,)).fetchone()
+        my_cl_matches = 0
+        for _pfx in ("cl", "el", "ecl"):
+            try:
+                r = conn.execute(
+                    f"""SELECT COUNT(*) AS n FROM {_pfx}_matches m
+                        JOIN {_pfx}_tournaments t ON m.tournament_id=t.id
+                        WHERE t.year=? AND m.my_played=1""", (year or 0,)).fetchone()
+                my_cl_matches += (r["n"] if r else 0) or 0
+            except Exception:
+                pass
+    finally:
+        conn.close()
+
+    play_frac = (matches / team_played) if team_played > 0 else None
+    if play_frac is not None:
+        play_frac = min(1.0, play_frac)
+    # 출전률 -> 역할 역산(위 docstring 참고).
+    role = ""
+    if play_frac is not None:
+        role = ("핵심" if play_frac >= 0.85 else
+                "주전" if play_frac >= 0.68 else
+                "로테이션" if play_frac >= 0.42 else
+                "대기" if play_frac >= 0.20 else "전력외")
+
+    league_w = _intl_sel_league_weight(_my_club_country(p), p.get("current_tier", 1))
+    if pos in GK_POS:
+        from game_engine import _calc_clean_sheets_for_player
+        cs = _calc_clean_sheets_for_player(p) or 0
+        # 실점은 my_player.season_goals_against(컬럼명이 AI 쪽
+        # goals_conceded와 다르다)를 쓴다.
+        prod = _intl_sel_prod_raw(pos, matches, 0, 0, cs, p.get("season_saves", 0),
+                                  p.get("season_goals_against", 0), league_w)
+    else:
+        prod = _intl_sel_prod_raw(pos, matches, p.get("season_goals", 0),
+                                  p.get("season_assists", 0), 0, 0, 0, league_w)
+    prod_prev = None
+    if prev:
+        prod_prev = _intl_sel_prod_raw(pos, prev["matches"], prev["goals"], prev["assists"],
+                                       0, 0, 0, league_w)
+
+    prod_adj = form_adj = 0.0
+    _ps = (pos_stat or {}).get(pos)
+    if _ps and prod is not None:
+        mean, sd = _ps
+        z = (prod - mean) / sd
+        prod_adj = max(-_INTL_SEL_PROD_MAX, min(_INTL_SEL_PROD_MAX, z * _INTL_SEL_PROD_PER_SD))
+        if prod_prev is not None:
+            dz = (prod - prod_prev) / sd
+            form_adj = max(-_INTL_SEL_FORM_MAX, min(_INTL_SEL_FORM_MAX, dz))
+    big_adj = min(_INTL_SEL_BIGGAME_MAX, my_cl_matches * 0.10)
+    return {"play_frac": play_frac, "role": role, "prod_adj": prod_adj,
+            "form_adj": form_adj, "big_adj": big_adj}
+
+
+def _my_club_country(p):
+    """내 소속 클럽이 있는 나라 이름(리그 등급 판정용). 팀/리그 정보가
+    없으면 빈 문자열."""
+    lid = p.get("current_league_id", 0)
+    if not lid:
+        return ""
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            """SELECT cn.name AS country FROM leagues l
+               JOIN countries cn ON l.country_id=cn.id WHERE l.id=?""", (lid,)).fetchone()
+    finally:
+        conn.close()
+    return (row["country"] if row else "") or ""
 
 
 def _intl_form_adjustments(candidates):
@@ -2240,6 +2834,13 @@ def _build_intl_squad_by_group(country, quota_by_group=None):
     # get_country_nationals_by_position 주석의 "결과 불변" 항목 참고).
     _nat_by_pos = get_country_nationals_by_position(country)
 
+    # [2026-09 성능, v3] 선발 지표(_intl_candidate_metrics)는 그룹과 무관
+    # 하므로 나라당 딱 한 번만 계산한다 — 그룹 루프 안에서 부르면 7번
+    # 반복되고, 조회 고정비(history_drain + 4쿼리)가 후보 수보다 크기
+    # 때문에 그것만으로 나라당 0.27초(211개국이면 한 주에 60초)가 됐다.
+    # 실측: 나라당 0.27s → 0.06s.
+    _metrics = _intl_metrics_for_country(country, _nat_by_pos)
+
     picked = []
     used_ids: set = set()
     for grp, n in quota_by_group.items():
@@ -2271,7 +2872,13 @@ def _build_intl_squad_by_group(country, quota_by_group=None):
         # 폼 추정 대상으로 좁힌다 — 표본이 작아지면 극단치 하나가 전체
         # 스케일을 왜곡하는 효과도 같이 줄어들고(정말 26인 근처 경쟁만
         # 남으므로), _estimate_ai_season 호출 수도 크게 줄어 성능도 낫다.
-        _shortlist_n = max(n * 6, 20)
+        # [2026-09 재설계 v3] 숏리스트 크기는 이제 그룹 정원과 무관한
+        # 포지션별 고정값(_INTL_SEL_SHORTLIST_PER_POS)이다 — 지표를 나라당
+        # 한 번만 계산하려면(위 _intl_metrics_for_country) 지표 대상 목록이
+        # 그룹마다 달라지면 안 되기 때문이고, v3는 출전 보정이 −12까지
+        # 가므로 "OVR은 조금 낮지만 매 경기 뛰는 하위팀 에이스"가 실제로
+        # 역전할 수 있어야 해서 v2의 (정원×6, 최소 20)보다 넓혀야 한다.
+        _shortlist_n = _INTL_SEL_SHORTLIST_PER_POS
         by_pos_all: dict = {}
         for c in all_candidates:
             by_pos_all.setdefault(c["position"], []).append(c)
@@ -2279,18 +2886,14 @@ def _build_intl_squad_by_group(country, quota_by_group=None):
         for pos, lst in by_pos_all.items():
             lst.sort(key=lambda c: -(c["ovr"] or 0))
             candidates.extend(lst[:_shortlist_n])
-        # [2026-09 재설계, intl_squad_selection_score 주석 참고] 폼은 더 이상
-        # _estimate_ai_season 난수 추정 + min-max 정규화가 아니라, 직전 확정
-        # 시즌의 실제 기록(hist)에서 ±3으로 계산한다(기록 없으면 0). 숏리스트
-        # (포지션별 OVR 상위)는 그대로 유지 — 폼 ±3·경험 +2로는 OVR 상위권
-        # 밖 선수가 뒤집을 수 없어 결과는 같고, 기록 조회 대상만 줄여준다.
+        # [2026-09 재설계 v3, "국가대표 선발 v3" 섹션 주석 참고] 선발점수를
+        # OVR+폼(±3)에서 다요소 점수(출전·역할·생산성·최근폼·강한상대·무대·
+        # 경험·멀티포지션)로 교체한다.
         apps_by_id = get_player_total_intl_appearances([c["id"] for c in candidates])
-        form_adj_by_id = _intl_form_adjustments(candidates)
         scored = []
         for c in candidates:
-            base_score = intl_squad_selection_score(
-                c["ovr"], c.get("club_tier"), form_adj_by_id.get(c["id"], 0.0),
-                apps_by_id.get(c["id"], 0))
+            base_score = intl_selection_score_v3(
+                c, _metrics.get(c["id"]), apps_by_id.get(c["id"], 0))
             fit = _intl_group_fit(c["position"], grp)
             scored.append((base_score * fit, c))
         scored.sort(key=lambda t: -t[0])
@@ -2346,10 +2949,12 @@ def _build_intl_squad_by_group(country, quota_by_group=None):
                          if c["id"] not in used_ids]
         if backfill_pool:
             apps_by_id = get_player_total_intl_appearances([c["id"] for c in backfill_pool])
-            form_adj_by_id = _intl_form_adjustments(backfill_pool)
-            backfill_pool.sort(key=lambda c: -intl_squad_selection_score(
-                c["ovr"], c.get("club_tier"), form_adj_by_id.get(c["id"], 0.0),
-                apps_by_id.get(c["id"], 0)))
+            # 지표는 위에서 나라당 한 번 계산한 것을 그대로 쓴다 — 숏리스트
+            # (포지션별 OVR 상위) 밖 선수는 지표가 없어 OVR 기준으로만
+            # 채점된다(여기까지 내려온 건 그 나라 국적자가 26명도 안 되는
+            # 소국이라, 어차피 있는 대로 다 뽑히는 경로다).
+            backfill_pool.sort(key=lambda c: -intl_selection_score_v3(
+                c, _metrics.get(c["id"]), apps_by_id.get(c["id"], 0)))
             for c in backfill_pool[:shortfall]:
                 picked.append(c)
                 used_ids.add(c["id"])
@@ -2393,20 +2998,150 @@ def _check_selection(p, my_grade, country="", continent=""):
     선수가 이미 정원만큼 있으면, 내 OVR이 웬만큼 높아도 밀릴 수 있다
     (실제로 그렇듯이).
 
-    선발점수 = OVR×45% + 정규화폼×55% − 페널티 − 부수페널티(_intl_tier_penalty)
-      - 폼은 _intl_form_raw()(개인상 포지션 가중치에서 ovr 항만 뺀 것)를
-        그 나라 동포지션 후보군 안에서 상대 정규화(최고100/최저40)한 값.
-        "지금 잘하는 선수"가 커리어 내내 OVR만 높은 선수보다 유리해지는
-        핵심 장치.
-      - 페널티는 예전처럼 임계값을 올리는 게 아니라 선발점수를 직접 깎는다
-        (장기부상 -15, 감독불화 -8, 출장시간부족 -6, 하위리그 소속 -4~-18).
-        하위리그 페널티는 나(내 선수)와 AI 동포 후보 전원에게 동일한
-        기준으로 적용된다(그 나라 CM AI가 하위리그에 있어도 똑같이 깎임).
-    포지션 그룹(GK/DF/MF/FW) 안에서 AI 동포 선수 전원(_estimate_ai_season
-    으로 폼 추정) + 나를 한 풀에 놓고 점수 순으로 정렬 → 정원 안에 들면
-    선발. 정원 경계(마지노선, INTL_SELECTION_MARGIN=3점 이내 차이)에서는
-    25% 확률로 순위가 뒤집힐 수 있다 — 격차가 크면(3점 초과) 뒤집히지
-    않는다."""
+    [2026-09 재설계 v3] 선발점수는 이제 AI 26인 선발
+    (_build_intl_squad_by_group)과 **완전히 같은** intl_selection_score_v3
+    (OVR + 출전·역할·생산성·최근폼·강한상대·무대·경험·멀티포지션 + 부수
+    보정)이다 — 예전의 독자 공식(OVR×45% + 정규화폼×55%)과 AI 폼 난수
+    추정(_estimate_ai_season)은 _check_selection_legacy_v2에 원본 그대로
+    보존만 해두고 더 이상 쓰지 않는다. 자세한 설계 근거는 "국가대표 선발
+    v3" 섹션 주석, 나/AI 지표의 불가피한 비대칭은 _my_selection_metrics
+    주석 참고.
+
+    그 외 구조는 그대로다:
+      - 포지션 그룹(GK/DF/MF/FW)별 정원(INTL_SQUAD_QUOTA) 안에서 동포지션
+        AI 후보 전원과 점수 경쟁 → 정원 안에 들면 선발.
+      - 기록에 안 남는 정보(장기부상 −15, 감독불화 −3~−8)는 여전히
+        선발점수에서 직접 깎는다. "출장시간 부족 −6"만 제거했다 — v3의
+        출전 보정이 같은 정보를 더 정교하게 반영해 이중 감점이 되므로.
+      - 정원 경계(마지노선, INTL_SELECTION_MARGIN=3점 이내 차이)에서는
+        25% 확률로 순위가 뒤집힐 수 있다.
+
+    [2026-09 v3 추가 수정 — 정원 분류도 AI와 통일] 예전엔 내 선수만
+    4분류(INTL_SQUAD_QUOTA: GK3/DF8/MF8/FW4 = 23인)로 경쟁했는데, 실제
+    26인 선발은 7분류(INTL_SQUAD_GROUP_QUOTA: GK3/CB5/FB4/CM6/AM2/WG4/ST2
+    = 26인)를 쓴다. 예를 들어 내가 ST면 나는 "FW 4자리"를 놓고 LW/RW까지
+    포함한 후보 전원과 싸우는데, 정작 AI는 그 선수들을 WG 4 + ST 2 = 6
+    자리에 나눠 뽑고 있었다 — 내 선수만 자리가 좁은 구조적 불이익이다.
+    이제 내 포지션이 속한 그룹(INTL_POSITION_TO_GROUP)의 정원으로,
+    그 그룹의 후보 풀·포지션 적합도 배율까지 AI와 똑같이 적용해 겨룬다."""
+    from constants import (MIN_INTL_CALLUP_AGE, INTL_POSITION_GROUPS, INTL_GROUP_FIT,
+                           INTL_SQUAD_GROUP_QUOTA, INTL_POSITION_TO_GROUP)
+    if p.get("age", 0) < MIN_INTL_CALLUP_AGE:
+        return False
+
+    my_pos = p.get("position", "ST")
+    my_grp = INTL_POSITION_TO_GROUP.get(my_pos)
+    if not my_grp:
+        # 포메이션 전용 슬롯(LM/RM 등)으로 등록된 예외 — 가장 가까운
+        # 그룹으로 폴백한다(적합도 표에 그 포지션이 있는 첫 그룹).
+        my_grp = next((g for g, tbl in INTL_GROUP_FIT.items() if my_pos in tbl), "CM")
+    group_members = list(INTL_POSITION_GROUPS.get(my_grp, [])) + \
+        list(INTL_GROUP_FIT.get(my_grp, {}).keys())
+
+    nat = country or p.get("nationality", "")
+
+    quota = INTL_SQUAD_GROUP_QUOTA.get(my_grp, 4)
+
+    # ── [2026-09 재설계 v3] AI 26인 선발과 같은 기준으로 통일 ──────────
+    # 예전 구조는 여기만 독자 공식(OVR×0.45 + 정규화폼×0.55)을 썼고, AI
+    # 후보의 폼도 _estimate_ai_season 난수 추정으로 즉석 생성했다 —
+    # _build_intl_squad_by_group(실제 26인을 뽑는 함수)이 v2로 바뀐 뒤에도
+    # 이 함수만 예전 공식으로 남아 있었고(그 함수 주석에 "별도 과제"로
+    # 명시돼 있었다), 그래서 "AI는 이 기준으로 뽑히는데 나는 저 기준으로
+    # 판정된다"는 이중 기준이 계속 남아 있었다. 이제 둘 다
+    # intl_selection_score_v3(OVR + 출전·역할·생산성·최근폼·강한상대·무대·
+    # 경험·멀티포지션 + 부수 보정) 하나만 쓴다.
+    #
+    # 포지션 정원(INTL_SQUAD_QUOTA: GK/DF/MF/FW 4분류)과 마지노선 25%
+    # 뒤집기는 기존 구조를 그대로 유지한다 — 바뀐 건 "점수를 어떻게
+    # 매기는가"뿐이다.
+    from database import get_country_nationals_by_position, get_player_total_intl_appearances
+    _nat_by_pos = get_country_nationals_by_position(nat) if nat else {}
+    _metrics = _intl_metrics_for_country(nat, _nat_by_pos) if nat else {}
+    _pos_stat = _metrics.get(_INTL_POS_STAT_KEY) or {}
+    ai_cands = [c for _pos in group_members for c in _nat_by_pos.get(_pos, ())]
+    _apps = get_player_total_intl_appearances([c["id"] for c in ai_cands])
+
+    my_ovr = p.get("ovr", 0)
+
+    # [2026-09 v3] _intl_ovr_gap_penalty(그 나라 평균 대비 격차 5단계
+    # 감점)는 이 경로에서 제거했다.
+    #   · 애초에 이 함수는 v2 시절 _check_selection에만 있었고, 실제 26인을
+    #     뽑는 _build_intl_squad_by_group은 한 번도 쓰지 않는다 — 즉 나한테만
+    #     걸리는 잣대였다.
+    #   · 감점 폭이 −30까지라 v3 보정(−17~+8) 전체를 압도한다. 실측: 대한민국
+    #     (국대평균 86.64) ST 후보 점수가 OVR84 → 74.2, OVR82 → 72.4,
+    #     OVR80 → 53.8로 "평균−5"에서 절벽이 생겼다. 그러면 v3의 핵심
+    #     목표(OVR은 낮아도 매 경기 뛰며 생산하는 하위팀 에이스가 올라온다)가
+    #     그 절벽 아래에서 통째로 무력화된다 — 실제로 AI 26인에는 OVR74
+    #     핵심(40경기 15골)이 뽑히는데, 같은 프로필의 내 선수는 −30을 맞는
+    #     비대칭이 생긴다.
+    #   · 대체 장치는 이미 있다 — 경쟁 자체다. 그 나라 그 그룹 정원이 이미
+    #     더 좋은 후보로 차 있으면 점수 비교에서 그냥 밀린다(인위적 절벽 없이).
+    # 페널티(선발점수 직접 감점) — 기존 항목 중 "출장시간 부족 −6"만
+    # 제거했다. v3의 출전 보정(−12 ~ +1.5)이 같은 정보를 이미, 더 정교하게
+    # 반영하므로 이중 감점이 된다. 부상·감독불화는 기록에 안 남는 정보라
+    # 그대로 유지한다.
+    penalty = 0.0
+    if p.get("injured"):
+        penalty += 15.0
+    rel = p.get("manager_relation", 50)
+    if rel < 30:
+        penalty += 8.0
+    elif rel < 50:
+        penalty += 3.0
+    my_cand = {"ovr": my_ovr, "position": my_pos,
+               "club_tier": p.get("current_tier", 1),
+               "club_country": _my_club_country(p)}
+    # 포지션 적합도 배율도 AI 선발과 같은 방식으로 곱한다(_build_intl_squad_
+    # by_group과 동일) — 내가 그 그룹의 핵심 포지션이면 1.00.
+    my_score = (intl_selection_score_v3(
+        my_cand, _my_selection_metrics(p, _pos_stat),
+        appearances=_my_total_intl_appearances(),
+    ) - penalty) * _intl_group_fit(my_pos, my_grp)
+
+    ai_scores = sorted(
+        (intl_selection_score_v3(c, _metrics.get(c["id"]), _apps.get(c["id"], 0))
+         * _intl_group_fit(c["position"], my_grp)
+         for c in ai_cands), reverse=True)
+
+    if len(ai_scores) < quota:
+        return True  # 그 포지션에 나 포함해도 정원이 안 찬 나라 — 자동 선발
+
+    boundary_top = ai_scores[quota - 1] if quota - 1 < len(ai_scores) else -999
+    boundary_bottom = ai_scores[quota] if quota < len(ai_scores) else -999
+    my_rank = 1 + sum(1 for s in ai_scores if s > my_score)
+
+    if my_rank <= quota:
+        if my_rank == quota and (boundary_top - boundary_bottom) <= INTL_SELECTION_MARGIN:
+            return random.random() < 0.75   # 마지노선 접전 — 25% 확률로 밀려남
+        return True
+    else:
+        if my_rank == quota + 1 and (boundary_top - boundary_bottom) <= INTL_SELECTION_MARGIN:
+            return random.random() < 0.25   # 마지노선 접전 — 25% 확률로 발탁
+        return False
+
+
+def _my_total_intl_appearances():
+    """내 선수의 대표팀 통산 출전 — AI의 get_player_total_intl_appearances와
+    같은 의미의 값을 intl_history에서 센다(내 기록은 intl_squad가 아니라
+    이쪽에 남는다). 조회가 실패하면 0(경험 보너스 없음)."""
+    try:
+        conn = get_conn()
+        try:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(caps), 0) AS n FROM intl_history").fetchone()
+        finally:
+            conn.close()
+        return (row["n"] if row else 0) or 0
+    except Exception:
+        return 0
+
+
+def _check_selection_legacy_v2(p, my_grade, country="", continent=""):
+    """[2026-09 보존] v3 이전(OVR×0.45 + 정규화폼×0.55) 판정 로직 — 지금은
+    호출되지 않는다. v3 결과가 이상할 때 같은 세이브로 즉시 대조해볼 수
+    있도록 원본 그대로 남겨둔다(삭제하면 비교 기준이 사라진다)."""
     from constants import MIN_INTL_CALLUP_AGE
     if p.get("age", 0) < MIN_INTL_CALLUP_AGE:
         return False
@@ -2422,19 +3157,7 @@ def _check_selection(p, my_grade, country="", continent=""):
         pos_group, group_members = "FW", FW_POS
 
     nat = country or p.get("nationality", "")
-
-    # [2026-07 재설계, 신민용 지적: "그래도 K3리그에서 뛰는 선수가 국대
-    # 발탁은 아니지" → "OVR는 그 나라 평균은 되어야 뽑히게" → "근데 딱
-    # 잘리는 하드컷보다는 평균과의 격차에 따라 단계적으로 낮아지는 게
-    # 현실적이다"] _get_real_squad_ovr(그 나라 실제 스쿼드 평균 OVR —
-    # get_country_ovr에 이미 70% 가중치로 블렌딩되는 것과 같은 값)를
-    # "후보 자격을 아예 박탈하는 하드컷"이 아니라 "선발점수에서 깎는
-    # 정도를 정하는 기준"으로 쓴다(_intl_ovr_gap_penalty, 5단계 그라데이션)
-    # — 최종 판정은 여전히 아래 포지션 경쟁·폼 반영 점수 비교가 담당한다.
-    # 그 나라 실제 스쿼드 표본이 너무 적어(8명 미만) real_val이 없으면
-    # (신생/희귀 국적 등) 감점 없이(0.0) 기존 폼 경쟁으로만 판정한다.
     _real_squad_ovr = _get_real_squad_ovr(nat) if nat else None
-
     quota = INTL_SQUAD_QUOTA.get(pos_group, 4)
 
     _league_grade_team = get_league_grade(country, my_grade)
@@ -3627,6 +4350,44 @@ def _entry(tid, country):
     return val
 
 
+# [2026-09 신설] 국가대표 경기 전력차 계수 — 아래 _match_outcome의
+# docstring에 이 값의 실측 유도 과정이 있다(예전엔 그 함수 안의 지역변수
+# 리터럴이었다). 클럽(game_engine._match_win_probs)의 diff 계수 0.020과
+# 쌍을 이루는 값이며, 둘의 비(_INTL_DIFF_TO_CLUB_SCALE)가 "국가대표 OVR
+# 1점 = 클럽 OVR 몇 점에 해당하는가"다 — _gen_intl_score가 스코어
+# 생성에 쓴다(그 함수 주석 참고).
+_INTL_DIFF_COEF = 0.0452
+_CLUB_DIFF_COEF = 0.020          # game_engine._match_win_probs의 diff 계수
+_INTL_DIFF_TO_CLUB_SCALE = _INTL_DIFF_COEF / _CLUB_DIFF_COEF   # ≈ 2.26
+
+# 스코어(몇 대 몇) 생성에 쓰는 전력차 환산비 — _gen_intl_score 참고.
+# 이론적으로는 위 _INTL_DIFF_TO_CLUB_SCALE(2.26, 승패 판정과 완전히 같은
+# 스케일)이 맞지만, 실측하면 국제대회 득점환경이 너무 뜨거워진다. 실제
+# 세이브 2시즌치 국제경기 1,256건의 전력차·승패를 그대로 재사용하고
+# 스코어만 배율별로 25회씩 재생성한 결과:
+#     배율   경기당총골(예선/본선)   강팀 4골차+ (전력차 0~5 / 10~15 / 25+)
+#     1.00      3.40 / 3.13          4.5% / 17.1% / 41.5%
+#     1.20      3.50 / 3.19          4.8% / 20.0% / 48.7%
+#     1.60      3.70 / 3.31          5.3% / 24.7% / 62.3%
+#     1.80      3.82 / 3.37          5.6% / 28.5% / 66.8%
+#     2.26      4.15 / 3.52          6.2% / 34.7% / 77.7%
+#   (수정 전 원본: 예선 3.02 / 본선 2.97 — 다만 그 값은 전력차 15~42
+#    구간이 통째로 죽어 있던 상태의 값이다. _gen_score 톱니 주석 참고.)
+# 실제 국제축구는 월드컵 본선 약 2.6~2.8골, 대륙별 예선 약 3.0~3.3골이다.
+# 1.60을 고른 이유:
+#   · 예선 3.70 / 본선 3.31 — 톱니 수정으로 불가피하게 오르는 폭(1.00에서
+#     이미 3.40/3.13) 위에서 가장 현실값에 가까운 구간.
+#   · 전 세계 최대 격차(상위국 97 vs 최약체 47.7 ≈ 49점)가 ×1.6 = 78로
+#     _GEN_SCORE_ANCHORS의 극초압도 앵커(80) 바로 앞에 닿는다 — "오스트레일리아
+#     31-0 아메리칸사모아"(역사상 단 한 번, FIFA 75위 vs 203위)가 정확히
+#     그 정도 극단에서만 가능해진다. 원본(배율 1.0)에서는 이 구간이 도달
+#     불가능한 죽은 코드였다.
+#   · 이변 완화(_GEN_SCORE_UPSET_FADE=20)가 국가대표 전력차 12.5점에서
+#     완전히 걸린다(원본은 20점 — 월드컵 본선에서는 사실상 도달 불가).
+# 득점이 많다/적다고 느끼면 이 값 하나만 위 표대로 조정하면 된다.
+_INTL_MARGIN_DIFF_SCALE = 1.6
+
+
 def _match_outcome(h_ovr, a_ovr, knockout, neutral=False):
     """'home'/'draw'/'away' 반환 (KO는 무승부 → 승부차기).
     [수정] 무승부 확률을 전력차에 반비례하도록 개선 (기존 dw=0.22 고정 →
@@ -3678,7 +4439,7 @@ def _match_outcome(h_ovr, a_ovr, knockout, neutral=False):
         대한민국 vs 괌      기존 +37.03 → 신규 +33.45 (양쪽 다 클램프 구간)
     """
     diff = h_ovr - a_ovr
-    _DIFF_COEF = 0.0452
+    _DIFF_COEF = _INTL_DIFF_COEF
     if neutral:
         dw = max(0.05, 0.24 - abs(diff) * 0.009)
         half = max(0.0, 1.0 - dw) / 2.0
@@ -3702,9 +4463,48 @@ def _gen_intl_score(outcome, diff=0.0):
     """[2026-09 수정, 신민용 요청: "오스트레일리아 31-0 아메리칸사모아,
     대한민국 16-0 네팔 같은 A매치 역사적 대승이 재현 가능해야 한다"]
     allow_extreme=True로 넘겨 game_engine._gen_score의 극초압도 구간
-    (adv>=80, 정의부 주석 참고)을 국가대표 경기에 한해 열어준다."""
+    (adv>=80, 정의부 주석 참고)을 국가대표 경기에 한해 열어준다.
+
+    [2026-09 재수정, 신민용 리포트: "약팀이 강팀을 5대0으로 이기는 경우도
+    있던데 이건 이상한데 / 무언가 과하게 가중치를 주는 거 같기도 하고"]
+    원인은 한 경기를 정하는 두 단계가 서로 다른 전력차 스케일을 쓰고
+    있었던 것이다:
+      · 승/무/패는 _match_outcome이 국가대표 전용 계수(_INTL_DIFF_COEF
+        =0.0452)로 정한다 — 클럽(_match_win_probs, 0.020)의 2.26배다.
+        국가대표 OVR(상위 11명 평균)은 클럽보다 격차가 압축돼 있어서
+        (월드컵 본선급 평균 3.7점) 같은 계수로는 이변이 너무 잦았기
+        때문에 신민용이 직접 맞춰둔 값이다(그 함수 주석의 회귀 실측표).
+      · 그런데 '몇 대 몇'은 _gen_score에 **원본 diff를 그대로** 넘겼다.
+        _gen_score의 구간 임계값(15/30/58/80)과 언더독 완화 폭
+        (_GEN_SCORE_UPSET_FADE=20)은 전부 **클럽 OVR 단위**로 잡힌
+        값이라, 국가대표 경기는 전력차가 아무리 커도 거의 전부 "박빙"
+        구간에 들어가고 언더독 완화(u=adv/20)도 사실상 안 걸렸다.
+        예: 잉글랜드(97.4) vs 대한민국(85.9)은 승패 쪽에서는 강팀승
+        86%(=확실한 우세)로 계산되는데, 스코어 쪽에서는 u=0.57·
+        t=0.76(박빙)이라 약팀이 이기면 3~4골차도 나올 수 있었다.
+    이제 국가대표 전력차를 클럽 스케일로 환산한 diff를 넘긴다
+    (_INTL_MARGIN_DIFF_SCALE=1.6). 이론적으로 맞는 환산비는 두 계수의
+    비(0.0452/0.020 = 2.26)인데, 그 값으로는 국제대회 득점환경이 실제보다
+    뜨거워지는 게 실측으로 확인돼(예선 4.15골/경기) 득점환경 목표로
+    따로 캘리브레이션했다 — 배율별 실측표는 _INTL_MARGIN_DIFF_SCALE
+    정의부에 있다.
+
+    부수효과(의도된 것):
+      · 강팀은 전력차만큼 확실하게 크게 이긴다(월드컵 예선 대량득점).
+      · 언더독 승리는 근소승으로 수렴한다(_GEN_SCORE_UPSET_FADE가 이제
+        국가대표 diff 12.5점에서 완전히 걸린다 — 20/1.6. 원본은 20점이라
+        월드컵 본선 전력차로는 사실상 도달 불가였다).
+      · 다만 남은 "약팀의 대승"은 대부분 전력차 0~5 구간에서 나오고, 그
+        구간은 이 엔진 입장에서 진짜 호각이다 — 신민용이 "약팀"이라고
+        보는 매치업이 실제로는 전력차 몇 점밖에 안 되는 경우(상위 10개국이
+        전부 95.2~97.4에 몰려 있는 국가대표 OVR 압축)가 근본 원인이고,
+        그건 이 함수가 아니라 국가등급↔선수재능 분리 쪽 과제다.
+      · adv>=80(극초압도, 31-0류) 구간이 처음으로 실제로 열린다. 원본
+        diff로는 전 세계 최대 격차(약 50점)로도 80에 도달할 수 없어서
+        이 구간이 여태 도달 불가능한 죽은 코드였다."""
     from game_engine import _gen_score
-    return _gen_score(outcome, diff, allow_extreme=True)
+    return _gen_score(outcome, (diff or 0.0) * _INTL_MARGIN_DIFF_SCALE,
+                      allow_extreme=True)
 
 
 def _resolve_pso(h_ovr, a_ovr, neutral=False):
@@ -4374,7 +5174,11 @@ def simulate_my_match(week, p, day=None):
         outcome = "draw" if hs == as_ else ("home" if hs > as_ else "away")
     except Exception:
         outcome = _match_outcome(h_ovr, a_ovr, knockout, neutral=(not _is_qual))
-        hs, as_ = _gen_score(outcome, h_ovr - a_ovr, allow_extreme=True)
+        # [2026-09 수정] 전술엔진 폴백도 AI 경기와 같은 스코어 생성기를
+        # 타야 한다 — _gen_score를 직접 부르면 국가대표 전력차 스케일
+        # 환산(_gen_intl_score 주석 참고)이 빠져 같은 매치업인데도
+        # 경로에 따라 스코어 분포가 달라진다.
+        hs, as_ = _gen_intl_score(outcome, h_ovr - a_ovr)
 
     pso_winner, pso_score = "", ""
     if knockout and outcome == "draw":

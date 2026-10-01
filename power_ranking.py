@@ -297,7 +297,14 @@ def match_result_r(home_score: int, away_score: int, pso_winner=None, home_id=No
 
 TEAM_COMPETITION_WEIGHT = {
     "league": 1.0, "domestic_cup": 0.6, "super_cup": 0.5,
-    "club_world_cup": 1.8,
+    # [2026-09 하향, 신민용 리포트: "클럽 월드컵 우승했다고 62위 팀이 세계
+    # 1위가 되는 건 이상하다"] 1.8(유럽 챔스와 동률)에서 내린다. 실측으로
+    # 확인된 우승 시 상승폭은 B 72.0 + A 약 131.7 = 약 204 PS였고, 이는
+    # 팀평균 OVR 6.8점어치(EPL 전체 팀 OVR 스프레드가 7.56점)다.
+    # 1.2는 "유로파(1.3)와 비슷하고 유럽 챔스(1.8)보다 확실히 낮다"는
+    # 자리다 — 4년마다 열리는 단일 대회이고 전 대륙이 참가해 유럽 최상위
+    # 비중이 압도적이지도 않으므로, 중요한 성과이되 챔스 우승급은 아니다.
+    "club_world_cup": 1.2,
     # [2026-09 신설, 신민용 요청: "3부/4부 팀들은 서로 안 붙으니 이 대회로
     # 상대전적이 생기는 거니까 파워랭킹에도 반영해야 한다"] 국내컵(0.6)
     # 보다 격은 낮지만(3/4부 한정, 결승까지 가도 국내컵 우승만큼의 무게는
@@ -316,15 +323,32 @@ TEAM_COMPETITION_WEIGHT = {
 # 그대로 따르되, 대회 자체의 격차(챔스 1.4~1.8 > 유로파 0.9~1.3 >
 # 컨퍼런스 0.6~1.0)는 유지한다 — 즉 "북미 챔스"가 "유럽 컨퍼런스"보다
 # 낮아지는 일은 없다(각 티어 내에서만 대륙 서열이 갈림).
-TEAM_CHAMPIONS_WEIGHT_BY_CONTINENT = {
-    "유럽": 1.8, "남미": 1.7, "아프리카": 1.6, "아시아": 1.5, "북미": 1.4,
+# [2026-09 재조정, 신민용 확정: "챔스는 유럽 2.0 남미 1.5 아프리카 1.3
+# 아시아 1.1 북미 1.0 이렇게 가는 게 좋은 것 같고, 이건 컨퍼런스 유로파도
+# 마찬가지로 이 정도의 비율로 간다"] 예전 표(1.8/1.7/1.6/1.5/1.4)는 대륙
+# 사이가 6%씩밖에 안 벌어져서, 남미 챔스 우승이 유럽 챔스 우승의 94%
+# 가치를 가졌다 — 서열은 지켜졌지만 간격이 사실상 없었다.
+#
+# 유로파/컨퍼런스는 각 티어의 유럽 기준값(1.3 / 1.0)을 그대로 두고 챔스와
+# 같은 대륙 비율([1.00, 0.75, 0.65, 0.55, 0.50])을 적용한다.
+#
+# [알려진 변화] 예전 주석은 "북미 챔스가 유럽 컨퍼런스보다 낮아지는 일은
+# 없다"는 불변식을 명시했는데, 새 값에서는 둘이 정확히 1.00으로 동률이
+# 된다(낮아지지는 않음). 대륙 간 간격을 벌리라는 지시를 그대로 따른 결과다.
+_CLUB_CONTINENT_RATIO = {
+    "유럽": 1.00, "남미": 0.75, "아프리카": 0.65, "아시아": 0.55, "북미": 0.50,
 }
-TEAM_EUROPA_WEIGHT_BY_CONTINENT = {
-    "유럽": 1.3, "남미": 1.2, "아프리카": 1.1, "아시아": 1.0, "북미": 0.9,
-}
-TEAM_CONFERENCE_WEIGHT_BY_CONTINENT = {
-    "유럽": 1.0, "남미": 0.9, "아프리카": 0.8, "아시아": 0.7, "북미": 0.6,
-}
+
+
+def _by_continent(europe_anchor: float) -> dict:
+    """유럽 기준값 하나로 대륙별 표를 만든다 — 세 티어가 같은 대륙 비율을
+    쓰게 해서, 표를 따로 손대다 서열이 어긋나는 일을 막는다."""
+    return {k: round(europe_anchor * r, 3) for k, r in _CLUB_CONTINENT_RATIO.items()}
+
+
+TEAM_CHAMPIONS_WEIGHT_BY_CONTINENT = _by_continent(2.0)
+TEAM_EUROPA_WEIGHT_BY_CONTINENT = _by_continent(1.3)
+TEAM_CONFERENCE_WEIGHT_BY_CONTINENT = _by_continent(1.0)
 _CLUB_CONTINENT_WEIGHT_TABLE = {
     "champions": TEAM_CHAMPIONS_WEIGHT_BY_CONTINENT,
     "europa": TEAM_EUROPA_WEIGHT_BY_CONTINENT,
@@ -332,16 +356,41 @@ _CLUB_CONTINENT_WEIGHT_TABLE = {
 }
 
 
-def _club_comp_weight(category: str, continent) -> float:
+# [2026-09 신설, 신민용+GPT 확정: "B레이어 배점과 A레이어 경기 결과
+# 상승폭을 각각 분리해서 조정해야 한다"] 같은 대회가 A(실력 재추정)와
+# B(업적)에서 서로 다른 가중치를 가질 수 있게 한다. 여기 없는 대회는
+# TEAM_COMPETITION_WEIGHT / 대륙별 표의 값을 A에도 그대로 쓴다(기존 동작).
+#
+# 클럽월드컵만 A를 B보다 더 낮춘 이유: A레이어는 "이 팀의 진짜 실력이
+# 얼마인가"를 다시 추정하는 층인데, 클럽월드컵은 (1) 7경기 남짓의 작은
+# 표본이고 (2) 서로 거의 만나지 않는 대륙 간 대결이라 PS 격차 자체가
+# 가장 검증이 덜 된 축이다. 그래서 업셋 한 번이 만드는 |실제-기대| 오차가
+# 구조적으로 가장 크다(실측: 62위권 팀이 최상위권을 이길 때 경기당
+# 13.9~34.6). 업적(B)으로는 충분히 보상하되, 그 7경기로 실력 자체를
+# 크게 재평가하지는 않는다.
+#
+# [제로섬 보존] 이 값은 match_delta에 comp_weight로 들어가 양쪽 팀에
+# 똑같이 곱해지므로, "한쪽이 얻은 만큼 반대쪽이 잃는다"(설계 원칙 7)는
+# 그대로 유지된다 — 누적값에 상한을 걸어 제로섬을 깨는 방식은 쓰지 않았다.
+TEAM_COMPETITION_A_WEIGHT = {
+    "club_world_cup": 0.9,
+}
+
+
+def _club_comp_weight(category: str, continent, layer: str = "B") -> float:
     """category(champions/europa/conference/domestic_cup/super_cup/...)와
     continent(챔스/유로파/컨퍼런스만 의미 있음, 그 외는 무시)로 팀 대회
     가중치를 돌려준다. 대륙별 표가 있는 3개 대회는 그 표에서, 없으면
     TEAM_COMPETITION_WEIGHT의 고정값을 쓴다."""
+    if layer == "A":
+        _a = TEAM_COMPETITION_A_WEIGHT.get(category)
+        if _a is not None:
+            return _a
     table = _CLUB_CONTINENT_WEIGHT_TABLE.get(category)
     if table is not None:
         # champions 기본값 1.6 유지(과거 세이브의 미분류/구표기 continent
         # 대비 안전한 중간값), europa/conference도 각 표의 중간값을 기본값으로.
-        default = {"champions": 1.6, "europa": 1.1, "conference": 0.8}[category]
+        default = {"champions": 1.3, "europa": 0.85, "conference": 0.65}[category]
         return table.get(continent, default)
     return TEAM_COMPETITION_WEIGHT[category]
 
@@ -367,9 +416,29 @@ def stage_weight_for(stage: str) -> float:
 # ══════════════════════════════════════════════════════════════
 
 PLACEMENT_BASE_SCORE = {
+    # [2026-09 수정] group_exit 1 -> 0. 신민용 리포트: "잘한 건 전부
+    # 더해지는데 못한 건 거의 안 빠진다 — 국내컵에서 4라운드 탈락했는데도
+    # +0.6~1.8이 붙는다." 조별/본선 이전 탈락에 가점을 주지 않는다.
+    # 다만 모든 탈락을 똑같이 감점하지도 않는다 — "그 등급치고 못했다"는
+    # 신호만 아래 TEAM_EXPECTED_TIER_FLOOR로 따로 감점한다(약체 팀의
+    # 조별 탈락은 기대치대로이므로 0점 그대로).
     "champion": 40, "runner_up": 24, "semifinal": 12,
-    "quarterfinal": 6, "round16": 3, "group_exit": 1,
+    "quarterfinal": 6, "round16": 3, "group_exit": 0,
 }
+# [2026-09 신설, 신민용+GPT 확정: "좋은 결과는 가점 / 나쁜 결과는 감점이라는
+# 대칭성이 중요하다. 다만 모든 탈락을 똑같이 감점하면 안 되고 대회 중요도 x
+# 기대치 x 실제 성적을 같이 봐야 한다"] 국가 쪽에는 이미 같은 장치가 있었다
+# (COUNTRY_EXPECTED_TIER_FLOOR / COUNTRY_UNDERPERFORM_BASE_PENALTY) — 팀에는
+# 리그 순위 기대치(EXPECTED_PERCENTILE_CEILING)만 있고 대회 기대치가 전무해서,
+# SS등급 팀이 챔스·국내컵에서 조기 탈락해도 감점이 하나도 없었다.
+# 값은 _STAGE_TIER_ORDINAL 기준(group_exit 0 ~ champion 5).
+TEAM_EXPECTED_TIER_FLOOR = {
+    "SS": 3,   # 4강 이상은 가야 정상
+    "S": 2,    # 8강
+    "A": 1,    # 16강
+    "B": 0, "C": 0, "D": 0, "E": 0, "F": 0,
+}
+TEAM_UNDERPERFORM_BASE_PENALTY = -4.0   # 미달 1단계당, 대회가중치를 곱해서 적용
 # [2026-08 신설, 신민용 확정: "국가 파워랭킹이 대회 성적 하나로 너무
 # 쉽게 뒤집힌다"] 예전엔 국가도 위 PLACEMENT_BASE_SCORE(클럽과 공용, 우승
 # 40)를 그대로 쓰고 COUNTRY_TIER_WEIGHT(월드컵 2.6)만 곱했다 — 그 결과
@@ -406,6 +475,66 @@ COUNTRY_PLACEMENT_BASE_SCORE = {
 LEAGUE_TIER_WEIGHT = {1: 1.0, 2: 0.65, 3: 0.45, 4: 0.30}
 LEAGUE_TIER_WEIGHT_FLOOR = 0.20
 
+# [2026-09 신설, 진단으로 발견한 누락] 리그/국내컵 B 보너스가 부(tier)만
+# 보고 국가 리그 등급은 전혀 안 봤다 — 그래서 EPL 우승과 K리그1 우승이
+# B레이어에서 완전히 동점이었다. 국내 대회에만 적용한다.
+#
+# 대륙 대항전(챔스/유로파/컨퍼런스/클럽월드컵)에는 적용하지 않는다:
+# "챔스 우승 가치는 포르투갈이든 잉글랜드든 같아야 한다"는 확정 원칙이
+# 있고(game_engine 트로피 가중치 주석), 그쪽은 이미 대륙별 표로 갈린다.
+#
+# 값은 game_engine._GRADE_VALUE_RANGE(발롱도르 리그 강도) 각 등급 구간의
+# 중앙값을 그대로 옮긴 것이다 — 두 시스템이 같은 서열 감각을 쓰게 하려는
+# 것이고, game_engine을 import하지 않는 이유는 power_ranking을 독립적으로
+# 유지하기 위해서다(등급 판정은 constants.get_country_league_grade 하나만 씀).
+COUNTRY_LEAGUE_STRENGTH_WEIGHT = {
+    "SS": 1.00, "S": 0.95, "A": 0.84, "B": 0.67,
+    "C": 0.51, "D": 0.375, "E": 0.275, "F": 0.20,
+}
+COUNTRY_LEAGUE_STRENGTH_DEFAULT = 0.51   # 등급 판정 실패 시 중간값(C)
+
+# [2026-09 재설계, 신민용 확정: "리그 우승을 단일 28로 고정하는 것 자체를
+# 다시 봐야 해 — 같은 리그 우승이라도 S급 리그 우승과 A급 리그 우승의
+# 가치가 달라야 함"] 전역 상수 하나(34냐 28이냐)로 모든 리그를 처리하는
+# 대신, 리그 등급별로 우승 기본점을 직접 정의한다. 그러면 "인데펜디엔테가
+# 28을 받는 게 이상한 것"이 아니라 "아르헨티나 리그가 A급이라서 28"이라고
+# 정의되고, 대륙대항전 서열(위 _CLUB_CONTINENT_RATIO)과는 완전히 독립적인
+# 축이 된다.
+#   SS 36 / S 34 / A 28 / B 22 / C 16 / D 10   (E·F는 같은 기울기로 이어감)
+# 우승 외 순위(2위·상위10%·하위권)는 league_placement_bonus의 밴드 모양을
+# 그대로 두고 이 기본점 비율(base / 34)만 곱해 스케일한다 — 이미 튜닝된
+# 밴드 사이 비율을 건드리지 않는다.
+LEAGUE_TITLE_BASE_BY_GRADE = {
+    "SS": 36.0, "S": 34.0, "A": 28.0, "B": 22.0,
+    "C": 16.0, "D": 10.0, "E": 6.0, "F": 4.0,
+}
+_LEAGUE_BAND_REFERENCE = 34.0   # league_placement_bonus가 쓰는 기준 기본점
+
+
+def league_title_scale(country_name, national_grade=None) -> float:
+    """국가명 -> league_placement_bonus에 곱할 배율(기본점 / 34)."""
+    grade = None
+    if country_name:
+        try:
+            from constants import get_country_league_grade
+            grade = get_country_league_grade(country_name, national_grade)
+        except Exception:
+            grade = None
+    base = LEAGUE_TITLE_BASE_BY_GRADE.get(grade, LEAGUE_TITLE_BASE_BY_GRADE["C"])
+    return base / _LEAGUE_BAND_REFERENCE
+
+
+def country_league_strength(country_name, national_grade=None) -> float:
+    """국가명 -> 국내 대회 B 보너스에 곱할 리그 강도(0.20~1.00)."""
+    if not country_name:
+        return COUNTRY_LEAGUE_STRENGTH_DEFAULT
+    try:
+        from constants import get_country_league_grade
+        grade = get_country_league_grade(country_name, national_grade)
+    except Exception:
+        return COUNTRY_LEAGUE_STRENGTH_DEFAULT
+    return COUNTRY_LEAGUE_STRENGTH_WEIGHT.get(grade, COUNTRY_LEAGUE_STRENGTH_DEFAULT)
+
 
 def league_tier_weight(tier: Optional[int]) -> float:
     if not tier or tier <= 0:
@@ -436,20 +565,28 @@ def league_placement_bonus(final_rank: int, n_teams: int) -> float:
     값에만 추가로 곱해진다(상승 쪽엔 그 배율을 절대 적용 안 함)."""
     if n_teams <= 0:
         return 0.0
+    # [2026-09 리스케일 x3.4, 신민용 확정 중요도: 챔스 > 리그 > 국내컵 >
+    # 슈퍼컵] 예전 값(1위 +10)은 B레이어에서 리그 우승을 국내컵 우승(24)
+    # 은 물론 3·4부컵 우승(16)보다도 낮게 만들어, 확정된 중요도 서열과
+    # 정면으로 어긋났다. 밴드 사이의 비율(1위:꼴찌 = 10:-9)은 이미 여러
+    # 세션에 걸쳐 튜닝된 모양이므로 그대로 두고 전체를 x3.4 배만 한다
+    # (새 비율 34:-30 = -0.88, 기존 -0.90과 거의 동일) — "상승은 느리게,
+    # 하락은 부진이 쌓일수록 빠르게"라는 구조도 그대로다(가속은 이 함수가
+    # 아니라 호출부의 STREAK_PENALTY_MULTIPLIER가 마이너스에만 곱한다).
     if final_rank == 1:
-        return 10.0   # mutually exclusive — 아래 상위10% 밴드와 안 겹침
+        return 34.0   # mutually exclusive — 아래 상위10% 밴드와 안 겹침
     if final_rank == n_teams:
-        return -9.0   # 리터럴 꼴찌 — 아래 하위10% 밴드보다 한 단계 더
+        return -30.0  # 리터럴 꼴찌 — 아래 하위10% 밴드보다 한 단계 더
     percentile = final_rank / n_teams
     if percentile <= 0.10:
-        return 5.0
+        return 17.0
     if percentile <= 0.25:
-        return 2.0
+        return 7.0
     if percentile <= 0.75:
         return 0.0
     if percentile <= 0.90:
-        return -3.0
-    return -6.0   # 91~99% (리터럴 꼴찌는 위에서 이미 처리됨) — 강등팀도
+        return -10.0
+    return -20.0  # 91~99% (리터럴 꼴찌는 위에서 이미 처리됨) — 강등팀도
                   # 이 밴드에 자연히 포함(별도 행 없음, 실제 강등 이벤트
                   # 페널티는 RELEGATION_BASE_PENALTY로 별개 처리)
 
@@ -1090,6 +1227,9 @@ def _seed_country_ab(conn, country: str) -> tuple:
 # 10. 팀 레이어 A — 매치 결과 반영
 # ══════════════════════════════════════════════════════════════
 
+# [2026-09 신설] 국가 리그 강도를 곱할 "국내" 대회 집합.
+_DOMESTIC_B_CATEGORIES = frozenset(("domestic_cup", "lower_cup"))
+
 _CLUB_COMP_TABLES = {
     "champions": ("cl_tournaments", "cl_matches"),
     "europa": ("el_tournaments", "el_matches"),
@@ -1373,7 +1513,7 @@ def update_team_ratings_for_year(conn, evaluation_year: int):
             (evaluation_year,)).fetchall()
         for tid, continent in tids_rows:
             _n_tournaments += 1
-            weight = _club_comp_weight(category, continent)
+            weight = _club_comp_weight(category, continent, layer="A")
             _n_m, _sql_t, _loop_t = _update_team_a_from_matches(
                 conn, matches_table, tid, evaluation_year, weight,
                 use_stage_col=(category not in ("domestic_cup", "lower_cup")),
@@ -1490,23 +1630,35 @@ def update_team_b_for_year(conn, evaluation_year: int):
     import time as _t_utby
     _b0 = _t_utby.perf_counter()
     # 1) 국내리그 순위 보너스(백분위 기반, 리그 부(tier)로 가중치 조정) + 연속우승 감쇠
+    # [2026-09 확장] 국가명/국대등급을 같이 읽어 국가 리그 강도
+    # (country_league_strength)를 리그 순위 보너스에 곱한다 — 예전엔
+    # 부(tier)만 봐서 EPL 우승과 K리그1 우승이 B에서 동점이었다.
     rows = conn.execute(
-        """SELECT l.id, l.tier, s.team_id, s.wins, s.draws, s.losses
+        """SELECT l.id, l.tier, s.team_id, s.wins, s.draws, s.losses,
+                  cn.name AS cname, cn.grade AS cgrade
            FROM league_season_standings s JOIN leagues l ON s.league_id = l.id
+           JOIN countries cn ON l.country_id = cn.id
            WHERE s.year=?""", (evaluation_year,)).fetchall()
     _n_teams_layer1 = len(rows)
     by_league = {}
     tier_of_league = {}
-    for league_id, tier, team_id, wins, draws, losses in rows:
+    strength_of_league = {}
+    for league_id, tier, team_id, wins, draws, losses, _cname, _cgrade in rows:
         pts = (wins or 0) * 3 + (draws or 0)
         by_league.setdefault(league_id, []).append((team_id, pts))
         tier_of_league[league_id] = tier
+        if league_id not in strength_of_league:
+            # [2026-09 재설계] 리그 순위 보너스는 연속 배율(country_league_
+            # strength)이 아니라 등급별 우승 기본점(league_title_scale)으로
+            # 스케일한다 — 국내컵 쪽은 그대로 country_league_strength를 쓴다.
+            strength_of_league[league_id] = league_title_scale(_cname, _cgrade)
     for league_id, standings in by_league.items():
         standings.sort(key=lambda x: x[1], reverse=True)
         n = len(standings)
         champion_id = standings[0][0] if standings else None
         decay = _apply_team_league_streak(conn, league_id, champion_id) if champion_id else 1.0
-        tier_w = league_tier_weight(tier_of_league.get(league_id))
+        tier_w = (league_tier_weight(tier_of_league.get(league_id))
+                   * strength_of_league.get(league_id, COUNTRY_LEAGUE_STRENGTH_DEFAULT))
         for rank, (team_id, _pts) in enumerate(standings, start=1):
             bonus = league_placement_bonus(rank, n)
             # [2026-09 신설, 부진 스트릭] "이 등급이면 이 순위까지는 정상"
@@ -1563,8 +1715,17 @@ def update_team_b_for_year(conn, evaluation_year: int):
 
     # 2) 국제/국내컵 계열 대회 성적 보너스 (deepest-stage 판정)
     _n_tournaments = 0
+    # [2026-09 신설] 국내 대회는 국가 리그 강도를 곱한다(리그와 같은 이유).
+    # 대륙 대항전은 대륙별 표로 이미 갈리므로 제외 — "챔스 우승 가치는
+    # 포르투갈이든 잉글랜드든 같아야 한다"는 확정 원칙.
+    _team_country = None
     for category, (tournaments_table, matches_table) in _CLUB_COMP_TABLES.items():
         _has_continent = category in _CLUB_CONTINENT_WEIGHT_TABLE
+        _is_domestic = category in _DOMESTIC_B_CATEGORIES
+        if _is_domestic and _team_country is None:
+            _team_country = {r[0]: (r[1], r[2]) for r in conn.execute(
+                """SELECT t.id, cn.name, cn.grade FROM teams t
+                   JOIN countries cn ON t.country_id = cn.id""").fetchall()}
         rows = conn.execute(
             f"SELECT id, {'continent' if _has_continent else 'NULL'} "
             f"FROM {tournaments_table} WHERE year=?", (evaluation_year,)).fetchall()
@@ -1575,7 +1736,22 @@ def update_team_b_for_year(conn, evaluation_year: int):
                 conn, matches_table, tid, use_stage_col=(category not in ("domestic_cup", "lower_cup")))
             for team_id, tier in placements.items():
                 base = PLACEMENT_BASE_SCORE[tier]
-                _add_team_b(conn, team_id, base * weight, evaluation_year, source=f"B:{category}")
+                w = weight
+                if _is_domestic:
+                    _cn, _cg = (_team_country or {}).get(team_id, (None, None))
+                    w *= country_league_strength(_cn, _cg)
+                if base:
+                    _add_team_b(conn, team_id, base * w, evaluation_year, source=f"B:{category}")
+                # [2026-09 신설] "그 등급치고 못했다"는 신호만 감점한다 —
+                # 약체 팀의 조별 탈락은 기대치대로이므로 0점 그대로 두고,
+                # 기대 단계(TEAM_EXPECTED_TIER_FLOOR)에 미달한 만큼만
+                # 대회 중요도를 곱해서 깎는다(국가 레이어와 동일한 설계).
+                _floor = TEAM_EXPECTED_TIER_FLOOR.get(_get_team_grade(conn, team_id), 0)
+                _short = _floor - _STAGE_TIER_ORDINAL.get(tier, 0)
+                if _short > 0:
+                    _add_team_b(conn, team_id,
+                                 TEAM_UNDERPERFORM_BASE_PENALTY * _short * w,
+                                 evaluation_year, source=f"B:{category}_underperform")
     _b3 = _t_utby.perf_counter()
     _perf_log(f"[PERF-POWER-B] {evaluation_year}년 팀B값 세부: "
               f"국내리그순위보너스({_n_teams_layer1}팀) {_b1-_b0:.3f}s | "

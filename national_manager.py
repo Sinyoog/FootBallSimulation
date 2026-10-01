@@ -572,6 +572,8 @@ def _fill_vacancy(conn, country_id, year, salt, stats):
                                        MANAGER_ROOKIE_AGE_MAX + 8))
     base = conn.execute("SELECT COALESCE(MAX(id),0) FROM managers").fetchone()[0]
     conn.execute(MANAGER_INSERT_SQL, row)
+    from database import assign_manager_codes
+    assign_manager_codes(conn)   # [2026-09] 감독 코드(MG…) 백필
     new = conn.execute("SELECT id FROM managers WHERE id > ? ORDER BY id LIMIT 1",
                        (base,)).fetchone()
     if not new:
@@ -656,6 +658,8 @@ def seed_national_managers(conn=None, verbose=True):
         cur = conn.cursor()
         base = cur.execute("SELECT COALESCE(MAX(id),0) FROM managers").fetchone()[0]
         cur.executemany(MANAGER_INSERT_SQL, mgr_rows)
+        from database import assign_manager_codes
+        assign_manager_codes(cur)   # [2026-09] 감독 코드(MG…) 백필
         new_ids = [r[0] for r in cur.execute(
             "SELECT id FROM managers WHERE id > ? ORDER BY id", (base,)).fetchall()]
         if len(new_ids) != len(extras):

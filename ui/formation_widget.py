@@ -259,6 +259,19 @@ def _make_intl_real_players(country: str, avg_ovr: float):
     return _intl_players_from_rows(picked)
 
 
+def _intl_starters_avg(players):
+    """[2026-09 신설, 신민용 확정: "OVR은 선수들 합으로 떠야 한다"] 국가대표
+    상대팀 헤더/콤보의 OVR을 intl_entries.ovr(대회 등록값) 대신, 상대
+    캔버스(load_opp_team)가 실제로 필드에 올리는 선발 11명 — 같은
+    4-4-2 그리디 배정(_greedy_fill_slots) 결과 — 의 평균으로 계산한다.
+    배정 함수는 결정적이라 load_opp_team이 다시 돌려도 같은 11명이 나온다.
+    선수가 없으면 0(호출부가 등록값으로 폴백)."""
+    if not players:
+        return 0
+    filled = [pl for pl in _greedy_fill_slots(list(players), FORMATION_SLOTS["4-4-2"]) if pl]
+    return _avg_ovr(filled)
+
+
 def _fetch_intl_opponents(tournament_id, my_nat, grp=None):
     """국제대회 상대팀 목록.
     grp 지정 시 내 조(grp) 팀만 반환 (조별리그).
@@ -282,6 +295,7 @@ def _fetch_intl_opponents(tournament_id, my_nat, grp=None):
     for r in rows:
         avg = r["ovr"] or 50
         players = _make_intl_persistent_players(tournament_id, r["country"], avg) or _make_intl_virtual_players(avg)
+        avg = _intl_starters_avg(players) or avg
         # [2026-08 재수정, 신민용 명확화: "국대는 합을 맞춰본 선수들이
         # 아니니 팀 전체 OVR은 계산치(포메이션/케미 반영)로 가는 게
         # 맞고, 대신 실제 11명은 각자 소속팀에서 잘하는 진짜 선수여야
@@ -328,9 +342,10 @@ def _fetch_intl_ko_opp(tournament_id, my_nat, week):
     # (_make_intl_virtual_players, 정확히 11명만·후보 없음·전 스탯이
     # OVR과 동일)로 직행하고 있었다 — 같은 패턴으로 통일한다.
     players = _make_intl_persistent_players(tournament_id, opp, avg) or _make_intl_virtual_players(avg)
+    avg = _intl_starters_avg(players) or avg
     return [{"team_id": None, "name": opp,
              "flag": fr["flag"] if fr else "",
-             "avg_ovr": round(avg),
+             "avg_ovr": round(avg, 1),
              "formation": "4-4-2",
              "players": players}]
 
@@ -653,9 +668,22 @@ class _FormationCanvas(QWidget):
             import random
 
             conn = get_conn()
-            entry = conn.execute(
-                "SELECT ovr FROM intl_entries WHERE country=? LIMIT 1",
-                (intl_nat,)).fetchone()
+            # [2026-09 버그수정] 예전엔 tournament_id 없이 "WHERE country=?
+            # LIMIT 1"이라, intl_entries가 대회마다 계속 쌓이는 구조에서
+            # 정렬 없이 아무 행(보통 게임 초반의 옛 대회)이나 집혔다 — 몇
+            # 년 전 전력값이 명단 선발 기준(target_ovr)으로 쓰이고 있었다.
+            # 이번 대회 행을 쓰고, 문맥이 없으면 가장 최근 대회 행을 쓴다.
+            if tournament_id:
+                entry = conn.execute(
+                    "SELECT ovr FROM intl_entries WHERE tournament_id=? AND country=?",
+                    (tournament_id, intl_nat)).fetchone()
+            else:
+                entry = None
+            if not entry:
+                entry = conn.execute(
+                    "SELECT ovr FROM intl_entries WHERE country=? "
+                    "ORDER BY tournament_id DESC LIMIT 1",
+                    (intl_nat,)).fetchone()
             conn.close()
             avg_ovr = round(entry["ovr"]) if entry and entry["ovr"] else (p.get("ovr", 50) if p else 50)
             # [2026-08 신설, 신민용 요청: "국대 팀 전체 OVR은 합을 맞춰본
@@ -1807,7 +1835,21 @@ def open_nationality_edit_dialog(parent, player_id: int, current_nationality: st
     없는 임의 문자열은 저장되지 않는다).
     반환: 실제로 저장했으면 새 국적 문자열, 취소/변경없음/저장실패면 None."""
     import world_browser as wb
-    from database import set_ai_player_nationality
+    from database import set_ai_player_nationality, get_ai_player_intl_caps
+
+    # [2026-10 신설, 신민용 확정: "국대를 나가면 국적 변경 불가, 안 나갔으면
+    # 변경 가능"] 포메이션 팝업·선수 검색·간단 변경 팝업이 모두 이 함수를
+    # 거치므로 여기 한 곳에서 막는다 — 창을 열기 전에 안내만 하고 끝낸다.
+    _caps = get_ai_player_intl_caps(player_id)
+    if _caps:
+        from PyQt6.QtWidgets import QMessageBox
+        _desc = ", ".join(f"{_c} {_n}경기" for _c, _n in
+                          sorted(_caps.items(), key=lambda kv: -kv[1]))
+        QMessageBox.information(
+            parent, "국적 변경 불가",
+            f"국가대표 출전 기록이 있는 선수는 국적을 바꿀 수 없습니다.\n"
+            f"(출전 기록: {_desc})")
+        return None
 
     dlg = QDialog(parent)
     dlg.setWindowTitle("국적 변경 — 쉬움 난이도")
@@ -2394,10 +2436,14 @@ class FormationWidget(QWidget):
         # 반영)로 가고 실제 명단은 진짜 잘하는 선수들로"] 국제전이면
         # load_my_team이 채워둔 _intl_formula_ovr(계산치)을 쓰고, club
         # 매치면 기존대로 실제 로스터 평균(_calc_avg_ovr)을 쓴다.
-        if is_intl and self._my_canvas._intl_formula_ovr is not None:
-            my_avg = self._my_canvas._intl_formula_ovr
-        else:
-            my_avg = self._my_canvas._calc_avg_ovr(ndigits=1)
+        # [2026-09 재수정, 신민용 확정: "메인 화면 아래 OVR도 이제 선수들
+        # 합으로 떠야 한다 — 저런 식으로 정하면 안 된다"] 위 2026-08
+        # "계산치(케미)" 방침을 되돌린다. 국대 전력값 자체가 이미 선수
+        # OVR 기반(database.get_country_best_xi_ovr)으로 바뀌어 별도
+        # 계산치를 둘 이유가 없어졌고, 화면에 그려진 선발 11명과 헤더
+        # 숫자가 달라 보이는 게 오히려 혼란이었다 — 클럽과 똑같이 지금
+        # 캔버스에 올라간 선발(나 포함) 평균을 쓴다.
+        my_avg = self._my_canvas._calc_avg_ovr(ndigits=1)
         _ovr_suffix = "" if is_hard_mode() else f"  |  평균 OVR {my_avg:.1f}"
         if is_intl:
             # 국가 flag + 국가명 표시
@@ -3063,6 +3109,13 @@ class PlayerStatPopup(QDialog):
         # [2026-09 신설, 신민용 요청: "국적도 내가 입력하면 변하게"] OVR과
         # 완전히 동일한 대상 판정·난이도 조건(쉬움 난이도 전용).
         self._nat_edit_pid = _rename_pid if is_easy_mode() else None
+        # [2026-10 신설, 신민용 요청: "국적 변경 불가능한 애들은 흰색으로"]
+        # 국대 출전 기록이 있으면 편집 불가 — 라벨을 파란색 대신 다른 일반
+        # 라벨과 같은 색으로 두고 클릭도 무시한다.
+        if self._nat_edit_pid is not None:
+            from database import get_ai_player_intl_caps
+            if get_ai_player_intl_caps(self._nat_edit_pid):
+                self._nat_edit_pid = None
 
         info_tbl = QTableWidget(len(info_rows), 2)
         info_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)

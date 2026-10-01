@@ -14,6 +14,8 @@ from data.names import NAME_DATA
 # 생성되는 버그로 이어졌다. constants.py를 유일한 원본으로 삼아 여기서는
 # 그대로 가져다 쓴다 — 더 이상 두 곳을 따로 수정할 필요가 없다.
 from constants import OVR_RANGES, get_ovr_range
+from constants import (COUNTRY_LEAGUE_OVR_HARD_MIN, PRESTIGE_OVR_HARD_MIN,
+                       PRESTIGE_HARD_MIN_COUNTRIES)
 from constants import AGE_OVR_FRACTION_MATURE_AGE, roll_age_ovr_fraction
 # [2026-08 최적화] 아래 심볼들은 원래 _generate_team_players / _gen_ai_stats /
 # _generate_all_ai_players 안에서 매 팀·매 선수마다(최대 11만+회) 함수 내부
@@ -1229,6 +1231,7 @@ def _migrate_managers():
         base_id = cur.execute(
             "SELECT COALESCE(MAX(id), 0) FROM managers").fetchone()[0]
         cur.executemany(MANAGER_INSERT_SQL, mgr_rows)
+        assign_manager_codes(cur)   # [2026-09] 감독 코드(MG…) 백필
         new_ids = [r[0] for r in cur.execute(
             "SELECT id FROM managers WHERE id > ? ORDER BY id", (base_id,)).fetchall()]
         if len(new_ids) != len(link_rows):
@@ -1315,11 +1318,38 @@ def build_manager_row(rng, country, year, style_attack=None, manager_type=None,
     press = rng.choices(MANAGER_PRESS_STYLES, weights=MANAGER_PRESS_WEIGHTS)[0]
     if manager_type not in set(MANAGER_TYPE_LIST):
         manager_type = rng.choices(MANAGER_TYPE_LIST, weights=MANAGER_TYPE_WEIGHTS)[0]
-    pool = NAME_DATA.get(country) or []
-    name = rng.choice(pool) if pool else "무명 감독"
+    # [2026-09 변경, 신민용 확정: "감독은 코드로 저장"] 국적별 이름 풀에서
+    # 이름을 뽑던 것을 없앴다 — 이름 칸은 비워 INSERT하고, 각 생성 지점이
+    # 삽입 직후 assign_manager_codes로 "MG"+36진수 코드(id 기반)를 채운다.
+    # id가 AUTOINCREMENT라 INSERT 전에는 코드를 알 수 없다(주발 백필과 같은 구조).
+    name = ""
     a_lo, a_hi = age_range or (MANAGER_AGE_MIN, MANAGER_AGE_MAX)
     birth = int(year) - rng.randint(int(a_lo), int(a_hi))
     return (name, country, birth, 0, None, style_attack, buildup, press, manager_type)
+
+
+def assign_manager_codes(c, only_blank=True) -> int:
+    """[2026-09 신설, 신민용 확정: "감독은 코드로 저장해야 한다"]
+    managers.name을 constants.ai_manager_code(id)로 채운다. 반환: 바꾼 행 수.
+
+    only_blank=True(기본): 이름이 빈 행만 — 생성 지점 4곳(database 이관,
+        national_manager 2곳, ai_lifecycle 신규 부임)이 INSERT 직후 부른다.
+    only_blank=False: 코드와 다른 이름은 전부 — init_db가 매 실행 부르며
+        예전 세이브의 실명 감독을 코드로 옮긴다(이미 코드면 쓰기 0건).
+    감독 이름에 기대는 로직은 없다(표시·툴팁 전용, 조회는 전부 id)."""
+    from constants import ai_manager_code
+    if only_blank:
+        rows = c.execute("SELECT id, name FROM managers WHERE name IS NULL OR name=''").fetchall()
+    else:
+        rows = c.execute("SELECT id, name FROM managers").fetchall()
+    ups = []
+    for r in rows:
+        _code = ai_manager_code(r[0])
+        if r[1] != _code:
+            ups.append((_code, r[0]))
+    if ups:
+        c.executemany("UPDATE managers SET name=? WHERE id=?", ups)
+    return len(ups)
 
 
 MANAGER_INSERT_SQL = """INSERT INTO managers(name, nationality, birth_year, retired,
@@ -1908,8 +1938,9 @@ _HISTORY_TASK_SQL = {
                 year, award_type, rank, player_id, team_id, position, total_score,
                 score_trophy, score_rating, score_goals_assists, score_position_adj, goal_event_id,
                 category, team_name, nationality, nat_flag, award_kind, competition,
-                league_country, league_tier, stat_goals, stat_assists, stat_saves, stat_goals_conceded)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                league_country, league_tier, stat_goals, stat_assists, stat_saves, stat_goals_conceded,
+                team_trophy, national_trophy, individual_trophy)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
 }
 # [주의] 위 SQL은 워커 전용 커넥션이 hist.db 파일을 'main' 스키마로 직접
 # 여는 것이므로 "hist." 접두어가 없다 — 메인 커넥션의 hist.<표>(ATTACH된
@@ -2126,6 +2157,7 @@ def init_db():
         leadership INTEGER DEFAULT 50, concentration INTEGER DEFAULT 50,
         ovr INTEGER DEFAULT 50, nationality TEXT DEFAULT '',
         career_years INTEGER DEFAULT 0,
+        creation_source TEXT DEFAULT '',
         FOREIGN KEY(team_id) REFERENCES teams(id))""")
     # [2026-08 신설, "명문팀 lifecycle 조사" 요청] AI끼리의 이적을 기록하는
     # 로그 — 지금까지는 ai_players.last_transfer_year만 남아서 "언제"는
@@ -2358,6 +2390,9 @@ def init_db():
         position TEXT,
         total_score REAL,
         score_trophy REAL,
+        team_trophy REAL,
+        national_trophy REAL,
+        individual_trophy REAL,
         score_rating REAL,
         score_goals_assists REAL,
         score_position_adj REAL,
@@ -3101,6 +3136,9 @@ def init_db():
         style_press TEXT DEFAULT 'MID_BLOCK',
         -- 선수 관리 성향(기존 MANAGER_TYPES 6종) — 전술 축과 독립이다.
         manager_type TEXT DEFAULT '뚝심형')""")
+    # [2026-09 신설] 예전 세이브의 실명 감독을 코드(MG…)로 — 이미 전부
+    # 코드면 SELECT 한 번(감독 수만 행)으로 끝나고 쓰기는 0건이다.
+    assign_manager_codes(c, only_blank=False)
     c.execute("""CREATE TABLE IF NOT EXISTS team_managers(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         team_id INTEGER, manager_id INTEGER,
@@ -3421,6 +3459,15 @@ def init_db():
         # 컬럼 자체가 없어 그 INSERT부터 예외였을 자리라 사실상 죽은 코드였고,
         # world_browser가 그 컬럼을 SELECT하는 순간에야 드러난 것.
         "ALTER TABLE ai_players ADD COLUMN created_year INTEGER DEFAULT 0",
+        # [2026-09 신설, 신민용 요청 — "생성 함수 하나하나에 출처 태그를 박아서
+        # 추적하는 게 제일 빠름"] 이 선수가 **왜** 태어났는지를 남긴다.
+        # created_year는 "언제"만 알려줘서, 시즌 중 신규 생성 선수가 리그
+        # 하한 미달일 때 어느 경로에서 나온 건지 추측밖에 할 수 없었다.
+        # 값은 database.CREATION_SOURCES 참고(seed/retire_repl/offer_vacancy/
+        # squad_topup/pos_swap/promo_rebuild). 빈 문자열 = 이 컬럼이 생기기
+        # 전에 만들어진 기존 세이브의 선수(=출처 불명, 추적 대상 아님).
+        "ALTER TABLE ai_players ADD COLUMN creation_source TEXT DEFAULT ''",
+        "ALTER TABLE ai_players_retired ADD COLUMN creation_source TEXT DEFAULT ''",
         # 위와 같은 이유 — world_browser.get_ai_player_career_history가
         # ai_players에 없으면(이미 은퇴) ai_players_retired에서 같은 컬럼을
         # 폴백 조회하는데, 이 테이블엔 애초에 이 컬럼 자체가 없었다.
@@ -4121,6 +4168,22 @@ def init_db():
         # 골든글러브(GK 최다 클린시트) 등 키퍼 전용 개인상 표시용.
         "ALTER TABLE hist.season_individual_awards ADD COLUMN stat_saves INTEGER",
         "ALTER TABLE hist.season_individual_awards ADD COLUMN stat_goals_conceded INTEGER",
+        # [2026-09 신설, 신민용 리포트: "아시아 슈퍼컵 올해의 수비수 + ACL
+        # 베스트11 + 킹컵 베스트11 정도로 발롱도르 30위에 드는 건 이상하다"]
+        # 기존 score_trophy 한 칸에 (클럽 트로피 + 국가대표 성과 + 개인상
+        # 가산점) 세 가지가 합쳐져 있어서, 화면만 보고는 어느 쪽이 점수를
+        # 부풀렸는지 가릴 수 없었다. 원인을 추측하지 않고 숫자로 보려면
+        # 분해가 필요하다.
+        #
+        # score_trophy(기존 컬럼)는 값과 의미를 그대로 보존한다 — 과거
+        # 시즌 행과 기존 조회 코드가 하나도 안 깨진다. 아래 세 컬럼은
+        # 신규 시즌부터만 채워지고 과거 시즌은 NULL로 남는다.
+        # 신규 시즌 불변식: score_trophy = team + national + individual
+        # (반올림 오차 ±0.01 이내. 상한(_TROPHY_SCORE_CAP)에 걸린 경우
+        #  세 성분을 비례 축소해 이 항등식을 유지한다.)
+        "ALTER TABLE hist.season_individual_awards ADD COLUMN team_trophy REAL",
+        "ALTER TABLE hist.season_individual_awards ADD COLUMN national_trophy REAL",
+        "ALTER TABLE hist.season_individual_awards ADD COLUMN individual_trophy REAL",
         # [2026-09 신설, 신민용 리포트: "OVR 한도에 사용자가 변경한 경우는
         # 예외처리 했나?"] "쉬움 난이도 — 한계 스탯(OVR) 조정" 창(ui/
         # formation_widget.py.open_ovr_edit_dialog)으로 사용자가 직접
@@ -6987,6 +7050,29 @@ def set_ai_player_custom_name(player_id: int, custom_name: str, conn=None):
         conn.close()
 
 
+def get_ai_player_intl_caps(player_id: int, conn=None) -> dict:
+    """[2026-10 신설, 신민용 확정: "국대를 나가면 국적 변경 불가, 안 나갔으면
+    변경 가능"] 이 AI 선수가 국가대표로 실제 출전한 기록 — {국가명: 출전 수}.
+    intl_squad.appearances(선발·교체 출전 모두 bump_intl_squad_appearances가
+    올림)가 1 이상인 대회만 센다. 명단에만 들었다가 한 경기도 안 뛴 대회는
+    포함하지 않는다(실제 축구의 "공식 경기 출전 시 대표팀 귀속"과 같은
+    기준). 출전 기록이 있는 행은 명단 정리(get_or_create_intl_squad의
+    appearances=0 행 DELETE) 대상도 아니라 시즌이 지나도 그대로 남는다.
+    내 선수(my_player)는 intl_squad에 안 들어가므로 해당 없음(국적 편집
+    자체가 AI 선수 전용)."""
+    _own = conn is None
+    conn = conn or get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT country, SUM(appearances) FROM intl_squad "
+            "WHERE player_id=? AND appearances>0 GROUP BY country",
+            (player_id,)).fetchall()
+        return {r[0]: int(r[1] or 0) for r in rows if r[0]}
+    finally:
+        if _own:
+            conn.close()
+
+
 def set_ai_player_nationality(player_id: int, nationality: str, conn=None) -> bool:
     """[2026-09 신설, 신민용 요청: "국적도 내가 입력하면 변하게"] 이름/OVR
     편집과 같은 방식(쉬움 난이도 전용 조작, UI 쪽 게이트는 호출부 책임)으로
@@ -7012,6 +7098,11 @@ def set_ai_player_nationality(player_id: int, nationality: str, conn=None) -> bo
             return False
         valid = conn.execute("SELECT 1 FROM countries WHERE name=?", (nationality,)).fetchone()
         if not valid:
+            return False
+        # [2026-10 신설] 국가대표 출전 기록이 있으면 국적 변경 불가 — 위
+        # get_ai_player_intl_caps 참고. UI(open_nationality_edit_dialog)가
+        # 먼저 막고 안내하지만, 다른 호출 경로가 생겨도 뚫리지 않게 여기서도 막는다.
+        if get_ai_player_intl_caps(player_id, conn):
             return False
         # [2026-09 수정, quota_local_country 컬럼 주석 참고] 사용자가 국적을
         # 직접 지정하면 예전 쿼터 등록 표시도 지운다 — 새 국적 기준으로
@@ -7674,12 +7765,14 @@ def seed_club_strength_from_prestige(conn=None):
 
 # ─── 국가 데이터 (등급 자동 산정: fifa_rank 기준) ─────────────
 def _grade_from_rank(rank):
-    if rank <= 10: return "S"
-    if rank <= 25: return "A"
-    if rank <= 50: return "B"
+    # [2026-10 재조정] constants._grade_from_rank와 같은 경계(S≤9/A≤23/
+    # B≤49/C≤80/D≤117/E≤158) — 국대 서열 재배열(data/countries.py)과 짝.
+    if rank <= 9: return "S"
+    if rank <= 23: return "A"
+    if rank <= 49: return "B"
     if rank <= 80: return "C"
-    if rank <= 120: return "D"
-    if rank <= 160: return "E"
+    if rank <= 117: return "D"
+    if rank <= 158: return "E"
     return "F"
 
 
@@ -7891,6 +7984,16 @@ FOREIGN_STAR_PREFERENCE_BY_CONTINENT = {
 # _topup_foreign_floor 참고) — 이적/은퇴교체 등 세이브 진행 중에는 하한을
 # 강제하지 않는다(실제 축구단도 시즌마다 외국인 비율이 자연스럽게
 # 오르내리므로, 상한 위반만 계속 막고 하한은 그대로 흘러가게 둔다).
+# [2026-10 조정, 신민용 확정 — 헤드리스 실험으로 검증] 5대 리그 중 4곳의
+# 상한(최대 인원)을 2014년 현실 수준으로 올렸다: 잉글랜드 13→16, 이탈리아
+# 12→14, 독일 11→13, 프랑스 10→12. 스페인은 현실에서도 비EU 제한 때문에
+# 외국인 구성이 다른 리그와 달라 10 그대로 둔다. 최소 인원은 전부 그대로.
+#   원인(2000→2014 기준선 실측): 팀당 외국인이 상한 바로 밑에 붙어 있어서
+#   (선수단 약 25명 기준 상한이 허용하는 최대 40~50%) 국제 이적이 들어올
+#   자리가 없었다 — 국제 이동 비중을 2배로 올려도(실험 K) 거의 안 늘었던
+#   이유. 같은 시드 14시즌 비교에서 전체 외국인 비율 잉글랜드 45→55%,
+#   이탈리아 42→49%, 독일 40→47%, 프랑스 37→44%(스페인 36→37%, 대조군),
+#   주전급 외국인도 함께 상승, 국가 등급별 국대 베스트11은 변화 없음.
 FOREIGN_QUOTA_RANGE = {
     "사우디아라비아": (6, 9), "카타르": (6, 9), "아랍에미리트": (5, 7),
     "일본": (4, 7), "태국": (5, 8), "호주": (4, 6),
@@ -7900,9 +8003,9 @@ FOREIGN_QUOTA_RANGE = {
     "이집트": (3, 5), "알제리": (1, 3), "튀니지": (2, 4),
     "남아프리카공화국": (3, 5), "나이지리아": (0, 2), "가나": (0, 2),
     "세네갈": (0, 2),
-    "잉글랜드": (9, 13), "포르투갈": (8, 12), "벨기에": (7, 11),
-    "네덜란드": (6, 10), "독일": (7, 11), "이탈리아": (8, 12),
-    "스페인": (6, 10), "프랑스": (6, 10), "튀르키예": (7, 11),
+    "잉글랜드": (9, 16), "포르투갈": (8, 12), "벨기에": (7, 11),
+    "네덜란드": (6, 10), "독일": (7, 13), "이탈리아": (8, 14),
+    "스페인": (6, 10), "프랑스": (6, 12), "튀르키예": (7, 11),
     "그리스": (5, 9), "스위스": (6, 10), "오스트리아": (5, 9),
     "체코": (4, 7), "폴란드": (4, 7), "세르비아": (3, 5),
     "크로아티아": (3, 6), "루마니아": (3, 5),
@@ -9183,8 +9286,19 @@ def _pick_nationality(team_country, team_continent, grade, pos, is_star, foreign
     # 고정 목록 대신 전세계 국가를 피파랭킹 가중 추첨한다 — 강국(랭크
     # 1~9위)은 가중치가 압도적으로 높아 여전히 대부분의 스타 해외파를
     # 차지하지만, 그 외 나라도 실력(랭크)에 비례한 실질적 확률을 갖는다.
+    # [2026-09 신설, 신민용 확정: "브라질 용병이 전체 용병의 10% — S급 리그는
+    # 이대로, A급 리그부터 아래까지"] 외국인으로 정해진 자리에서 정해진
+    # 확률로 곧장 브라질을 고르고, 나머지 자리의 추첨(스타/대륙 풀)에서는
+    # 브라질을 뺀다 — 기존 추첨이 우연히 뽑는 브라질까지 더해져 목표를
+    # 넘지 않게. 브라질 리그(브라질 국적 = 자국)와 면제 등급(SS/S)은 이
+    # 블록을 아예 안 타서 예전과 똑같다.
+    from constants import BRAZIL_FOREIGN_SHARE, BRAZIL_FOREIGN_EXEMPT_GRADES
+    _bra_rule = (team_country != "브라질" and grade not in BRAZIL_FOREIGN_EXEMPT_GRADES)
+    if _bra_rule and random.random() < BRAZIL_FOREIGN_SHARE:
+        return "브라질", foreign_count + 1
+    _skip = {team_country, "브라질"} if _bra_rule else {team_country}
     if is_star and random.random() < STAR_PROB_BY_DEST_GRADE.get(grade, 0.6):
-        cand = [(n, r) for n, r in _ALL_COUNTRIES_BY_RANK if n != team_country]
+        cand = [(n, r) for n, r in _ALL_COUNTRIES_BY_RANK if n not in _skip]
         # [2026-09 신설, _nat_ceiling_penalty 정의부 주석 참고] 스타 슬롯이
         # 특히 문제였다 — 이 분기는 dest_grade조차 안 넘기고 전세계를
         # 순수 랭크 가중으로 뽑아서, 통가(F등급) 국적이 유벤투스 주전
@@ -9195,12 +9309,12 @@ def _pick_nationality(team_country, team_continent, grade, pos, is_star, foreign
     same_prob = CONTINENT_SAME_PROB.get(team_continent, 0.7)
     if random.random() < same_prob:
         # 같은 대륙 다른 나라 (FIFA랭크 가중 + 목적지 등급 근접 가중)
-        pool = [(n, r) for n, r in _CONTINENT_COUNTRIES.get(team_continent, []) if n != team_country]
+        pool = [(n, r) for n, r in _CONTINENT_COUNTRIES.get(team_continent, []) if n not in _skip]
     else:
         # 다른 대륙 (FIFA랭크 가중 + 목적지 등급 근접 가중, "축구 수출국"
         # 위주로 자연스럽게 쏠리되 목적지 등급과 너무 동떨어진 나라는 배제)
         pool = [(n, r) for cont, lst in _CONTINENT_COUNTRIES.items() if cont != team_continent
-                for n, r in lst]
+                for n, r in lst if n not in _skip]
     nat = _weighted_country_pick(pool, dest_grade=grade, dest_country=team_country,
                                   slot_ovr=slot_ovr) or team_country
     return nat, foreign_count + 1
@@ -9547,7 +9661,12 @@ GLOBAL_PRESTIGE_STAR_CFG = {
     # 11자리 전부 엘리트(el_offset (0,3), 폭 3점)로 채워 균일하게 만들고,
     # 빠진 상단만큼 extra_bonus를 7→8로 1점 보정한다.
     "사우디아라비아": {"wc_base": 0, "wc_bonus": 0, "el_base": 11, "el_bonus": 0,
-                    "min_level": 2, "el_offset": (0, 3), "extra_bonus": 8,
+                    # [2026-09 재조정 3차, 신민용 확정: "사우디 명문팀은 85까지
+                    # 갈 수 있는 느낌"] 국가 범위를 68~79→76~83으로 올린 만큼
+                    # (tier_top 79→83) extra_bonus를 8→2로 내린다 — 알 힐랄
+                    # 목표가 tier_top+extra ≈ 85~86(헤드리스: extra 2일 때 빅4 82.4~84.0
+                    # → 1점 올려 3), 레벨2 빅3는 그보다 1~2점 아래.
+                    "min_level": 2, "el_offset": (0, 3), "extra_bonus": 3,
                     "max_elite": 11, "young_gap": {3: 2, 2: 3, 1: 4},
                     # decoupled_young_floor: 아래 _generate_team_players의
                     # 어린 스타 슬롯 하한 계산에서, country override의 lo
@@ -9568,6 +9687,89 @@ _MAX_ELITE_PER_TEAM = 5
 # 생기면 이 바닥 밑으로는 절대 안 내려가게 한다(TALENT_TIERS elite 하한과
 # 동일한 88).
 ELITE_FLOOR_BY_GRADE = {"SS": 88.0, "S": 88.0}
+
+
+# [2026-09 신설, 신민용 요청] ai_players.creation_source에 들어가는 값.
+# "어디에서 생성됐는가를 추측하면 안 되고 생성 함수 하나하나에 출처 태그를
+# 박아서 추적하는 게 제일 빠름" — 실제 INSERT 지점은 6곳뿐이고, 각 지점의
+# 사유는 정적으로 확정돼 있어서 INSERT 자리에 상수를 그대로 박는다
+# (사후 백필 방식은 assign_missing_feet이 apply_squad_turnover_after_movement
+# 뒤에서 호출되지 않아 한 경로를 놓쳤던 전례가 있어 쓰지 않는다).
+CREATION_SOURCES = {
+    "seed":          "월드 최초 생성(_generate_team_players)",
+    "retire_repl":   "은퇴 대체(_retire_and_replace)",
+    "offer_vacancy": "오퍼 공석 마감 충원(_fill_offer_vacancies)",
+    "squad_topup":   "스쿼드 최소인원 미달 보충(_rebalance_squad_sizes)",
+    "pos_swap":      "포지션 뎁스 교체(_rebalance_squad_sizes)",
+    "promo_rebuild": "승강 직후 스쿼드 물갈이(apply_squad_turnover_after_movement)",
+}
+
+
+def _squad_ovr_hard_min(country, tier, team_name):
+    """[2026-09 신설, 신민용 요청] (리그 하한, 명문 하한) 두 값을 돌려준다.
+    둘의 적용 규칙이 다르기 때문에 합치지 않는다:
+
+      · 리그 하한(COUNTRY_LEAGUE_OVR_HARD_MIN) — **나이 무관** 적용.
+        신민용 지정: "분데스 실제 최저 선수 너무 낮아 86정도는 높여줘,
+        프랑스가 아무리 낮아도 85, 스페인과 이탈리아는 87." 즉 화면에
+        보이는 그 리그의 최저 선수 자체를 올리라는 요구이므로 유망주도
+        포함한다.
+      · 명문 하한(PRESTIGE_OVR_HARD_MIN) — **나이 비율로 스케일**해 적용.
+        신민용 지정: "명문팀 대기들도 OVR가 90 이상은 되어야지." 대기(벤치)는
+        대부분 성인이고, 이걸 나이 무관으로 걸면 명문3의 17세 유스가
+        92가 되어버린다("아직 다 크지 않은 유망주"라는 기존 설계가 무너짐).
+
+    해당 없으면 (None, None) — 기존 동작 그대로.
+    적용 범위를 등록된 나라로 좁힌 이유: 이 값은 "리그 평균"을 정하는
+    COUNTRY_LEAGUE_OVR_OVERRIDE와 독립된 축이라, 전 세계에 일괄 적용하면
+    평균 위계까지 흔들 수 있다. 명시적으로 등록한 나라만 적용한다.
+
+    [2026-09 확장, 신민용 지정] 부수별 지정을 지원한다 — 표의 값이 int면
+    그 나라 1부에만, {tier: int} 딕셔너리면 그 부수에만 적용된다("EFL
+    챔십은 최저는 82로" = 잉글랜드 {1: 88, 2: 82}).
+    명문 하한은 PRESTIGE_HARD_MIN_COUNTRIES(5대 리그) 1부에서만 붙는다 —
+    새로 등록된 A급 나라(포르투갈·네덜란드·벨기에·스코틀랜드)의 간판
+    클럽에까지 90+ 하한을 걸면 그 리그 평균(80~83)이 무너진다."""
+    if not country:
+        return None, None
+    _ent = COUNTRY_LEAGUE_OVR_HARD_MIN.get(country)
+    if isinstance(_ent, dict):
+        _lg = _ent.get(tier)
+    elif _ent is None:
+        _lg = None
+    else:
+        _lg = _ent if tier == 1 else None
+    if _lg is None:
+        return None, None
+    if tier != 1 or country not in PRESTIGE_HARD_MIN_COUNTRIES:
+        return _lg, None
+    try:
+        from data.prestige_clubs import prestige_level as _plv
+        _pl = _plv(country, team_name or "")
+    except Exception:
+        _pl = 0
+    return _lg, PRESTIGE_OVR_HARD_MIN.get(_pl)
+
+
+def _lift_stats_to_ovr(pos, stats, ovr, floor):
+    """최종 OVR이 floor 미만이면 전 스탯에 같은 값을 더해 floor 이상으로
+    끌어올린다(스탯 간 상대적 개성은 유지 — rescale_team_to_target_ovr과
+    동일 원리). calc_ovr은 포지션별 가중합이라 "+1 스탯 = +1 OVR"이 아니고
+    99 상한에도 걸리므로, 한 번에 계산하지 않고 수렴할 때까지 소폭씩
+    올린다(최대 12회 — 그 이상 필요한 경우는 전 스탯이 이미 99에 닿은
+    극단이라 더 올릴 여지가 없다). (변경된 stats, 새 ovr) 반환."""
+    if floor is None or ovr >= floor:
+        return stats, ovr
+    for _ in range(12):
+        _step = max(1, int(round(floor - ovr)))
+        for _s in ALL_STATS:
+            stats[_s] = min(99, max(1, stats[_s] + _step))
+        ovr = calc_ovr(pos, stats)
+        if ovr >= floor:
+            break
+        if all(stats[_s] >= 99 for _s in ALL_STATS):
+            break
+    return stats, ovr
 
 
 def _star_counts(grade, team_strength, continent_bonus=0, n_slots=11, tier=1,
@@ -9834,6 +10036,125 @@ def _roll_global_wildcard_abs():
     return random.randint(lo, hi)
 
 
+# ══════════════════════════════════════════════════════════════
+# 97~99 등장 포지션 가중치 적용 — 2026-09 신설
+# (constants.STAR_POSITION_WEIGHT 정의부 주석 참고)
+# ══════════════════════════════════════════════════════════════
+def star_slot_weights(positions):
+    """슬롯 포지션 목록 -> 슬롯별 월드클래스 추첨 가중치.
+
+    같은 포지션이 여러 칸이면 그 포지션 몫을 칸 수로 나눈다 — 표의 12%가
+    "CB 전체 몫"이라는 뜻이므로, 칸마다 12를 주면 CB가 24% 몫을 가져간다.
+    """
+    from constants import star_position_weight
+    counts: dict = {}
+    for p in positions:
+        counts[p] = counts.get(p, 0) + 1
+    return [star_position_weight(p) / counts[p] for p in positions]
+
+
+def _weighted_sample_no_replacement(indices, weights, k):
+    """가중치 기반 비복원 추출 — random.choices를 k번 돌리되 뽑힌 항목을
+    빼면서 진행한다. k가 1~3 수준이라 이 단순한 방식으로 충분하다."""
+    pool = list(indices)
+    w = list(weights)
+    out = []
+    for _ in range(min(k, len(pool))):
+        if sum(w) <= 0:
+            out.append(pool.pop(0)); w.pop(0); continue
+        pick = random.choices(range(len(pool)), weights=w, k=1)[0]
+        out.append(pool.pop(pick)); w.pop(pick)
+    return out
+
+
+# 주전 고정 배열(_build_squad_positions)과 벤치 추첨 분포(roll_bench_position)
+# 각각에 대해 "가중치 평균"을 미리 구해둔다. 교체 생성 경로(은퇴 대체/
+# 스쿼드 보충/스왑)는 포지션이 이미 정해진 상태에서 확률만 조정하므로,
+# 이 평균으로 나눠 정규화해야 월드클래스 총원이 드리프트하지 않는다
+# (메모리: 97+ 인원을 36~58명으로 안정화하는 데 여러 세션이 들었다).
+_STARTER_POSITIONS_FOR_STAR = ["GK", "CB", "CB", "LB", "RB", "CDM", "CM", "CAM", "LW", "RW", "ST"]
+
+
+# 문맥별 "그 포지션 한 자리의 가중치". 주전 배열에는 CB가 두 칸이라
+# 포지션 몫(12)을 칸 수로 나눠야 한다 — 나누지 않으면 CB가 두 배로
+# 계산돼 평균이 1.0을 넘고(실측 1.12) 월드클래스 총원이 늘어난다.
+# 벤치는 칸마다 포지션을 독립 추첨하므로 나눌 필요가 없다.
+_STAR_SLOT_WEIGHT_BY_CONTEXT: dict = {}
+
+
+def _starter_slot_weight_map() -> dict:
+    counts: dict = {}
+    for p in _STARTER_POSITIONS_FOR_STAR:
+        counts[p] = counts.get(p, 0) + 1
+    from constants import star_position_weight
+    return {p: star_position_weight(p) / counts[p] for p in counts}
+
+
+def _star_slot_weight(pos, context) -> float:
+    """그 문맥에서 포지션 한 자리가 갖는 가중치."""
+    from constants import star_position_weight
+    if context != "starter":
+        return star_position_weight(pos)
+    m = _STAR_SLOT_WEIGHT_BY_CONTEXT.get("starter")
+    if m is None:
+        m = _STAR_SLOT_WEIGHT_BY_CONTEXT["starter"] = _starter_slot_weight_map()
+    # 주전 배열에 없는 포지션(이적/전환으로 생긴 변형)은 나눌 칸이 없으므로
+    # 포지션 몫을 그대로 쓴다.
+    return m.get(pos, star_position_weight(pos))
+
+
+def _bench_position_probs() -> dict:
+    probs: dict = {}
+    total_w = sum(w for _g, w in _BENCH_GROUP_WEIGHTS)
+    for grp, gw in _BENCH_GROUP_WEIGHTS:
+        pool = _BENCH_GROUP_POOLS[grp]
+        for pos in pool:
+            probs[pos] = probs.get(pos, 0.0) + (gw / total_w) / len(pool)
+    return probs
+
+
+_STAR_POS_MULT_MEAN = {}
+
+
+def star_position_multiplier(pos, context="starter") -> float:
+    """포지션 -> 월드클래스 확률에 곱할 배율(평균 1.0으로 정규화).
+
+    context: 'starter'(주전 자리를 메우는 경우) / 'bench'(벤치 보충).
+    평균이 정확히 1.0이라 총 월드클래스 기대 인원은 그대로 유지되고,
+    포지션 사이의 배분만 바뀐다 — 메모리에 남은 "97+ 인원 36~58명 안정화"
+    튜닝을 흔들지 않는 것이 이 정규화의 목적이다.
+    """
+    mean = _STAR_POS_MULT_MEAN.get(context)
+    if mean is None:
+        if context == "starter":
+            n = len(_STARTER_POSITIONS_FOR_STAR)
+            mean = sum(_star_slot_weight(p, "starter")
+                        for p in _STARTER_POSITIONS_FOR_STAR) / n
+        else:
+            mean = sum(p * _star_slot_weight(pos_, "bench")
+                        for pos_, p in _bench_position_probs().items())
+        _STAR_POS_MULT_MEAN[context] = mean
+    if not mean:
+        return 1.0
+    return _star_slot_weight(pos, context) / mean
+
+
+def split_star_prob_by_position(p_world, p_elite, pos, context="starter"):
+    """(p_world, p_elite) -> 포지션 가중치를 반영한 (p_world', p_elite').
+
+    총 스타 확률(p_world + p_elite)은 건드리지 않고 월드클래스/엘리트
+    사이 배분만 옮긴다 — GK는 월드클래스 몫이 줄고 그만큼 엘리트로 가고,
+    ST는 반대다. 그래서 "스타 슬롯 자체가 몇 개인가"를 튜닝해둔 기존
+    밸런스(_star_counts/_prestige_star_prob)는 전혀 흔들리지 않는다.
+    """
+    total = (p_world or 0.0) + (p_elite or 0.0)
+    if total <= 0:
+        return p_world, p_elite
+    new_world = min(total, max(0.0, (p_world or 0.0)
+                                * star_position_multiplier(pos, context)))
+    return new_world, total - new_world
+
+
 def roll_potential_ovr(team_cap, kind=None):
     """kind: 'worldclass' | 'elite' | None(일반 — 벤치 포함 나머지 전부)."""
     if kind == "worldclass":
@@ -10062,7 +10383,7 @@ def _generate_all_ai_players(c, progress_cb=None):
 
 
 def _topup_foreign_floor(_rows, star_kind_by_slot, team_country, team_continent,
-                          quota_lo, foreign_count, starter_floor=None):
+                          quota_lo, foreign_count, starter_floor=None, grade=None):
     """[2026-08 신설] 팀 생성 직후 실제 외국인 수가 국가별 목표 범위
     하한(quota_lo)에 못 미치면, 벤치(후보) 자리부터 우선해서 자국 선수
     일부를 외국인으로 바꿔 하한을 맞춘다. 스타 슬롯(star_kind_by_slot)은
@@ -10093,13 +10414,22 @@ def _topup_foreign_floor(_rows, star_kind_by_slot, team_country, team_continent,
     # 벤치(TEAM_STARTER_COUNT 이상)부터 우선 — bool 정렬(False가 먼저)로
     # "벤치인가(i>=TEAM_STARTER_COUNT)"가 True인 항목을 앞으로 보낸다.
     domestic_idx.sort(key=lambda i: i < TEAM_STARTER_COUNT)
+    # [2026-09 신설, 신민용 확정: "브라질 용병 10% — A급 리그부터 아래까지"]
+    # _pick_nationality와 같은 규칙. 이 경로는 같은 대륙에서만 뽑아서 남미
+    # 밖 하위 리그(아시아·오세아니아 등)는 브라질이 사실상 0이었다 — 1시즌
+    # 헤드리스 실측 F급 리그 3.2%가 이 때문. grade를 안 넘기면 예전과 동일.
+    from constants import BRAZIL_FOREIGN_SHARE, BRAZIL_FOREIGN_EXEMPT_GRADES
+    _bra_rule = (grade is not None and team_country != "브라질"
+                 and grade not in BRAZIL_FOREIGN_EXEMPT_GRADES)
     for i in domestic_idx[:deficit]:
+        _force_bra = _bra_rule and random.random() < BRAZIL_FOREIGN_SHARE
         pool = [(n, r) for n, r in _CONTINENT_COUNTRIES.get(team_continent, [])
-                if n != team_country]
+                if n != team_country and not (_bra_rule and n == "브라질")]
         # [2026-09] _nat_ceiling_penalty 정의부 주석 참고 — 이 경로로
         # 외국인이 된 벤치 슬롯도 아래에서 target이 starter_floor까지
         # 올라가므로, 국적 추첨도 그 OVR 기준으로 걸러야 한다.
-        nat = _weighted_country_pick(pool, slot_ovr=starter_floor) or team_country
+        nat = ("브라질" if _force_bra
+               else _weighted_country_pick(pool, slot_ovr=starter_floor) or team_country)
         if nat == team_country:
             continue
         row = list(_rows[i])
@@ -10257,12 +10587,20 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
     _team_growth_cap = compute_ai_growth_cap(grade, tier, team.get("cname", ""), continent)
     # [2026-08 수정, 벤치 인원 확장] 스타 슬롯은 후보(벤치) 자리엔 절대
     # 배정하지 않는다 — 주전 11자리(TEAM_STARTER_COUNT) 안에서만 추첨.
-    star_slot_idx = list(range(TEAM_STARTER_COUNT))
-    random.shuffle(star_slot_idx)
+    # [2026-09 재설계, constants.STAR_POSITION_WEIGHT 정의부 주석 참고]
+    # 월드클래스 슬롯은 포지션 가중치로 뽑는다(예전엔 균등 shuffle이라
+    # GK 9.1% / CB 18.2%였다). 엘리트 슬롯은 남은 자리에서 종전처럼
+    # 균등 추첨한다 — 이번 지시는 97~99(월드클래스)에 대한 것이다.
+    # 뽑는 개수(n_world/n_elite)는 그대로라 스타 총원은 안 변한다.
+    _starter_pos = _STARTER_POSITIONS_FOR_STAR
     star_kind_by_slot = {}
-    for i in star_slot_idx[:n_world]:
+    _world_idx = _weighted_sample_no_replacement(
+        range(TEAM_STARTER_COUNT), star_slot_weights(_starter_pos), n_world)
+    for i in _world_idx:
         star_kind_by_slot[i] = "worldclass"
-    for i in star_slot_idx[n_world:n_world + n_elite]:
+    _rest = [i for i in range(TEAM_STARTER_COUNT) if i not in star_kind_by_slot]
+    random.shuffle(_rest)
+    for i in _rest[:n_elite]:
         star_kind_by_slot[i] = "elite"
 
     # [2026-07 신설, 버그수정] 역할 순번(role_idx) 랜덤화 — 어느 팀은
@@ -10336,6 +10674,11 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
     # 스쿼드 뎁스 경쟁에서 밀려 로테이션/대기일 수는 있다)"는 취지.
     _starter_floor = _target_ovr(grade, tier, team_strength, 10, continent_bonus,
                                   prestige_bonus, team.get("cname", ""))
+    # [2026-09 신설] 이 팀 성인 선수의 절대 최저 OVR(_squad_ovr_hard_min
+    # 주석 참고). 5대리그 1부만 값이 잡히고 그 외에는 None이라 기존 동작
+    # 그대로다. 팀당 1회만 조회한다(슬롯 루프 안에서 부르면 26배 반복).
+    _league_hard_min, _prestige_hard_min = _squad_ovr_hard_min(
+        team.get("cname", ""), tier, team.get("tname", ""))
     # [2026-08 최적화] 선수 11명치 INSERT를 한 명씩 execute()하는 대신 모아뒀다가
     # 팀 끝에서 executemany() 한 번으로 묶는다. 매 execute() 호출마다 발생하는
     # 파이썬↔SQLite 오가는 고정비용(재시도 래퍼/락 진입 등 포함)을 11번 대신 1번만
@@ -10473,7 +10816,14 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
         # [2026-09 신설] peak_ovr 프리셋용 — 나이 스케일링 적용 "전"의
         # 성인 기준 목표치를 남겨둔다(아래에서 자격 판정 후에만 사용).
         _adult_target_ovr = target
-        target = target * roll_age_ovr_fraction(age)
+        # [2026-09 신설] 이 선수에게 실제로 적용된 나이 비율 — 절대 최저선
+        # (_squad_hard_min)을 같은 비율로 깎아서 쓴다. 성인(26세↑)은 1.0이라
+        # 하한이 그대로 걸리고, 성장기는 "아직 다 크지 않은 유망주"라는 기존
+        # 설계대로 그만큼 낮은 하한을 갖는다(예: 하한 92 × 25세 0.98 = 90.2).
+        # 예전처럼 age >= _AGE_MATURE로 잘라내면 22~25세가 통째로 하한
+        # 바깥에 남는다(실측: 파리 생제르맹·바이에른의 86이 정확히 이 구간).
+        _age_frac = roll_age_ovr_fraction(age)
+        target = target * _age_frac
         # [2026-08 신설, 신민용 리포트: "OVR81따리가 레알 마드리드나
         # 바르셀로나에 있을 수 있냐"] 위 나이별 성장곡선은 일반 팀
         # 기준으로 설계된 것이라, 이걸 그대로 진짜 명문팀(레알/바르사급,
@@ -10537,6 +10887,16 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
                 target = max(target, tier_top + _star_prestige_bonus - _yg)
                 stats = _gen_ai_stats(pos, target)
                 ovr = calc_ovr(pos, stats)
+                # [2026-09 신설] 리그/명문등급 절대 최저 OVR 보장 —
+                # _squad_ovr_hard_min 주석 참고. 이 분기(스타 슬롯)는
+                # 아래 일반 분기의 _abs_rng 보정을 continue로 건너뛰므로
+                # 여기에도 같이 걸어야 한다(SS/S 1부는 주전 전원이 이
+                # 분기를 탄다).
+                if _league_hard_min is not None:
+                    stats, ovr = _lift_stats_to_ovr(
+                        pos, stats, ovr,
+                        max(_league_hard_min,
+                            (_prestige_hard_min or 0) * _age_frac))
                 sub_role = random.choice(SUB_ROLES.get(pos, ["기본"]))
                 # [2026-09 신설] roll_potential_ovr 정의부 주석 참고 — 이
                 # 분기는 항상 star_kind_by_slot[idx]가 정의된 스타 슬롯이다.
@@ -10622,6 +10982,15 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
             for _s in ALL_STATS:
                 stats[_s] = min(99, max(1, int(round(stats[_s] + _deficit))))
             ovr = calc_ovr(pos, stats)
+        # [2026-09 신설] 위 보정은 "리그 평균"에 대응하는 lo를 하한으로 쓰는데,
+        # 실측하면 그 값에 도달하지 못하는 경우가 많다(전 스탯에 같은 값을
+        # 한 번만 더하는 방식이라 calc_ovr의 포지션 가중합·99 상한에 막힌다 —
+        # 잉글랜드 lo 92인데 성인 최저 87). 신민용이 지정한 절대 최저선은
+        # 수렴 루프(_lift_stats_to_ovr)로 확실히 보장한다.
+        if _league_hard_min is not None:
+            stats, ovr = _lift_stats_to_ovr(
+                pos, stats, ovr,
+                max(_league_hard_min, (_prestige_hard_min or 0) * _age_frac))
         # [세부역할 2026-07] 포지션에 맞는 SUB_ROLES 중 하나를 무작위 배정.
         sub_role = random.choice(SUB_ROLES.get(pos, ["기본"]))
         # [2026-09 신설] roll_potential_ovr 정의부 주석 참고 — 스타 슬롯이면
@@ -10660,7 +11029,7 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
     # 적용, 이후 이적/은퇴교체는 자연스러운 변동을 그대로 둔다.
     _foreign_count = _topup_foreign_floor(
         _rows, star_kind_by_slot, team.get("cname", ""), continent,
-        _quota_lo, _foreign_count, starter_floor=_starter_floor)
+        _quota_lo, _foreign_count, starter_floor=_starter_floor, grade=grade)
 
     # [2026-09 신설, 위 true_nationality 컬럼 주석 참고] 월드시드 시점에
     # 정해진 국적(_topup_foreign_floor까지 전부 반영된 최종값)을 그대로
@@ -10679,8 +11048,8 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
         (team_id,name,position,stamina,speed,jump,strength,shooting,passing,
          dribbling,tackling,heading,positioning,setpiece,
          mental,confidence,leadership,concentration,ovr,age,sub_role,nationality,
-         true_nationality,potential_ovr,salary)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", _rows_ins)
+         true_nationality,potential_ovr,salary,creation_source)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'seed')""", _rows_ins)
     # [2026-09 버그수정, 신민용 리포트: "첫 입단인데 계약년도만 뜨고
     # 계약기간이 안 뜬다 — 84억(계약년도:2000) 말고 84억(계약:5년)로
     # 떠야지"] ai_lifecycle.py의 신인생성 3곳(은퇴대체/스쿼드보충 등)은
