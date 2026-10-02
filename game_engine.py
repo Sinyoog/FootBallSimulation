@@ -765,7 +765,12 @@ def create_player(name: str, position: str, sub_role: str,
     c = conn.cursor()
 
     if not nationality:
-        c.execute("SELECT name,flag FROM countries ORDER BY RANDOM() LIMIT 1")
+        # [2026-10 병역 시스템] 가상 국가 "군대"는 국적으로 뽑히면 안 된다.
+        # 군대가 월드에 없으면 쿼리 문자열이 원본과 같다.
+        from military_service import get_military_country_id as _mil_cid
+        _mc = _mil_cid(c)
+        c.execute("SELECT name,flag FROM countries" + (f" WHERE id != {int(_mc)}" if _mc else "")
+                  + " ORDER BY RANDOM() LIMIT 1")
         row = c.fetchone()
         nationality, flag = row["name"], row["flag"]
 
@@ -7369,7 +7374,7 @@ def _build_league_schedule_rows(league_id, tids, season, year, existing_matches,
 
     rounds = generate_round_robin(n)
     n_rounds = len(rounds)
-    legs = 2 if first_half_only else legs_for_team_count(n)
+    legs = 2 if first_half_only else _league_legs(league_id, n)   # [2026-10] 군 리그는 부수별 고정
 
     # [2026-08 신설, 신민용 확정: "팀 수가 아주 많은 리그(25팀 이상)는
     # 왕복이 아니라 단판(전 팀이 서로 딱 1번씩만)으로"] legs==1은 기존
@@ -7484,7 +7489,7 @@ def generate_season_schedule(league_id, season, year, force=False):
     # 건너뛰는 사고로 이어졌다(_generate_all_league_schedules의 동일 버그와
     # 세트). 실수 나눗셈으로 바꾸면 기존(legs 짝수) 리그는 결과가 완전히
     # 동일하고, legs=1만 올바르게 0.5로 계산된다.
-    legs = legs_for_team_count(len(tids))
+    legs = _league_legs(league_id, len(tids))   # [2026-10] 군 리그는 부수별 고정
     expected_matches = len(tids) * (len(tids) - 1) * (legs / 2)
 
     # [중복 생성 방지] 그 시즌 일정이 이미 충분히 생성돼 있으면(상·하반기분)
@@ -8415,6 +8420,10 @@ def _execute_pending_sale_transfer(p, year):
         return
 
     update_player(pending_sale_transfer_json="")
+    # [2026-10 병역 버그수정] 예약 이적이 남은 채 입대했으면 실행하지 않는다(복무 중 이적 불가).
+    if _my_is_serving(p):
+        add_log(f"🪖 복무 중이라 {proposal.get('team_name', '')} 예약 이적이 취소됐습니다.", "event", year, 52)
+        return
     offer = {"transfer_fee": proposal.get("transfer_fee", 0),
              "contract_years": proposal.get("contract_years")}
     join_team(proposal["team_id"], proposal.get("salary", 0),
@@ -8464,6 +8473,10 @@ def _execute_pending_join_transfer(p, year, week):
         return
 
     update_player(pending_join_transfer_json="")
+    # [2026-10 병역 버그수정] 오퍼를 수락해 예약해둔 뒤 입대했으면 실행하지 않는다.
+    if _my_is_serving(p):
+        add_log(f"🪖 복무 중이라 {proposal.get('team_name', '')} 예약 이적이 취소됐습니다.", "event", year, week)
+        return
     join_team(proposal["team_id"], proposal.get("salary", 0),
               transfer_type=proposal.get("transfer_type", "오퍼"),
               offer=proposal.get("offer") or None)
@@ -8748,7 +8761,8 @@ def _advance_week(p, base_week, n_weeks=4, progress_cb=None):
     # 매주(정확히는 _advance_week가 호출될 때마다) 5개 조건 점수를
     # 재계산 — 오퍼가 매주 뜨는 기존 구조와 맞추기 위해 연말 1회가 아니라
     # 주 단위로 판정한다.
-    if p.get("current_team_id"):
+    # [2026-10 병역 버그수정] 복무 중엔 군팀이 판매를 추진할 수 없다(강제 판매 포함).
+    if p.get("current_team_id") and not _my_is_serving():
         try:
             _weekly_sale_push_check(p, new_year, new_week)
         except Exception as e:
@@ -10346,7 +10360,12 @@ def _league_full_season_matches(p, team_id=None) -> int:
            WHERE league_id = (SELECT league_id FROM teams WHERE id=?)""", (tid,)).fetchone()
     conn.close()
     n_teams = row["n"] if row and row["n"] else 20
-    legs = legs_for_team_count(n_teams)
+    _lc = get_conn()
+    try:
+        _lid_row = _lc.execute("SELECT league_id FROM teams WHERE id=?", (tid,)).fetchone()
+    finally:
+        _lc.close()
+    legs = _league_legs(_lid_row[0] if _lid_row else 0, n_teams)   # [2026-10] 군 리그는 부수별 고정
     return max(1, (n_teams - 1) * legs)
 
 
@@ -10473,7 +10492,7 @@ def league_total_games_by_name(league_name: str):
     conn.close()
     if n_teams < 2:
         return None
-    legs = legs_for_team_count(n_teams)
+    legs = _league_legs(row["id"], n_teams)   # [2026-10] 군 리그는 부수별 고정(1부 40·2부 36)
     return max(1, (n_teams - 1) * legs)
 
 
@@ -14094,6 +14113,8 @@ def _country_ids_by_league_grade(c, grades):
         return cached
     _country_ids_cache_stats["miss"] += 1
     rows = c.execute("SELECT id, name, grade FROM countries").fetchall()
+    from military_service import drop_military_countries as _drop_mil_ctry
+    rows = _drop_mil_ctry(rows, "name")   # [2026-10] 군대(B등급 등록)는 등급별 국가 목록에서 제외
     ids = set()
     for r in rows:
         if get_country_league_grade(r["name"], r["grade"]) in grades:
@@ -15393,7 +15414,7 @@ def _compute_league_individual_awards(year, my_ctx=None):
         _fsm_by_league = {}
         for _lid, _tids in _teams_by_league.items():
             _n = len(_tids) or 20
-            _fsm_by_league[_lid] = max(1, (_n - 1) * legs_for_team_count(_n))
+            _fsm_by_league[_lid] = max(1, (_n - 1) * _league_legs(_lid, _n))
         _cands_by_league = _collect_all_league_candidates(
             c, year, _fsm_by_league, team_league_map=_team_league_map)
         _sink = []
@@ -17593,7 +17614,16 @@ def _end_of_season(p, year, progress_cb=None):
     _recalc_field_pos_after_offseason(p)
 
     # [2026-07 신설] 임대 기간이 끝났으면 원소속팀 복귀부터 처리.
-    _return_from_loan_if_due(p, year)
+    # [2026-10 병역 7단계] 제대 → 예약 입대 → 31세 강제 입대(일반 임대 복귀보다 먼저 —
+    # 복무 중 임대 필드는 군 복무용이라 일반 임대 복귀가 건드리면 안 된다).
+    try:
+        _my_military_year_end(p, year)
+    except Exception as _me:
+        add_log(f"[병역] 처리 오류(계속 진행): {_me}", "event", year, 52)
+    p = get_player() or p
+    from constants import MILITARY_STATUS_SERVING as _MSS
+    if (p.get("military_status") or "") != _MSS:
+        _return_from_loan_if_due(p, year)
     p = get_player() or p   # 복귀로 소속이 바뀌었을 수 있으니 다시 최신화
 
     # [2026-08 신설, 3단계] 판매추진 제안을 수락해 예약해둔 이적이 있으면
@@ -17958,6 +17988,18 @@ def _check_forced_release(p, year, prior_season_matches=None,
         return
     if p.get("loan_from_team_id", 0):
         return   # [2026-07 신설] 임대 중엔 임대처가 소유권이 없으므로 방출/팔림 평가 자체를 건너뜀
+    # [2026-10 병역 버그수정] 복무 중(FA로 입대해 원소속 임대 필드가 비어 있는 경우 포함)엔
+    # 군팀 기준으로 방출·임대 평가를 하면 안 된다 — 예전엔 52주에 입대한 출전 부족
+    # 21세가 그 시즌 끝에 바로 민간 팀으로 "임대"되거나, 군팀에서 "방출"될 수 있었다.
+    # 제대한 그 해도 건너뛴다: 이번 시즌 기록은 전부 군팀 것이라 원소속팀 기준
+    # 평가 근거가 없다(제대 직후 평가는 military_devalue가 따로 맡는다).
+    from constants import MILITARY_STATUS_SERVING as _MSS_R, MILITARY_STATUS_SERVED as _MSD_R
+    _ms_r = p.get("military_status") or ""
+    if _ms_r == _MSS_R:
+        return
+    if _ms_r == _MSD_R and (p.get("military_enlist_year") or 0) and \
+            (p.get("military_enlist_year") or 0) + 1 == year:
+        return
 
     # ── 막 합류한 선수 보호 ───────────────────────────────
     try:
@@ -18191,6 +18233,444 @@ def _try_loan_player(p, year, cur_ovr):
     return True
 
 
+# ══════════════════════════════════════════════════════════════════
+# [2026-10 병역 시스템 7단계] 내 선수 병역 — 확정 규칙(military_service 모듈 설명 참고)
+# ══════════════════════════════════════════════════════════════════
+def _my_mil_status(p):
+    from military_service import is_service_target, my_player_nationalities
+    from constants import MILITARY_STATUS_UNSERVED
+    if not is_service_target(my_player_nationalities(p)):
+        return ""
+    st = p.get("military_status") or ""
+    if st:
+        return st
+    # 처음 판정(생성 직후, 또는 국적 슬롯에 한국이 새로 생김 = "원래 한국인" 취급):
+    # 31세 이상이면 군필, 아니면 미필 — 단 미필 상태로 한국 국적을 떠난 적이 있으면 미필.
+    from constants import MILITARY_FORCED_AGE, MILITARY_STATUS_SERVED
+    if (p.get("age") or 0) >= MILITARY_FORCED_AGE and not p.get("military_left_unserved"):
+        return MILITARY_STATUS_SERVED
+    return MILITARY_STATUS_UNSERVED
+
+
+def _my_is_serving(p=None):
+    """[2026-10] 내 선수가 지금 복무 중인가(이적·임대·방출·판매 경로 차단용)."""
+    from constants import MILITARY_STATUS_SERVING
+    p = p or get_player()
+    return bool(p) and (p.get("military_status") or "") == MILITARY_STATUS_SERVING
+
+
+_military_notices = []   # [7단계] UI가 시즌 전환 뒤 꺼내 보여줄 병역 안내(종류, 내용)
+
+
+def pop_military_notices():
+    """[7단계] 쌓인 병역 안내를 꺼낸다(main_window.refresh_all이 팝업으로 표시)."""
+    try:
+        _repair_underage_enlistment()
+    except Exception:
+        pass
+    # [2026-10] 복무 중 예약한 은퇴 — 제대 처리가 끝났으면(pending=2) 은퇴 창을 띄울 차례.
+    try:
+        _pr = get_player()
+        if _pr and int(_pr.get("military_retire_pending") or 0) == 2:
+            update_player(military_retire_pending=0)
+            _military_notices.append(("retire", "복무를 모두 마쳤습니다.\n예약한 대로 선수 생활을 마칩니다."))
+    except Exception:
+        pass
+    out = list(_military_notices)
+    _military_notices.clear()
+    return out
+
+
+def _repair_underage_enlistment():
+    """[2026-10 버그수정] 위 예약 버그로 20세 미만에 입대한 내 선수를 되돌린다(1회성 성격,
+    조건이 맞을 때만 동작). 원소속 계약이 유지된 경우 원소속팀으로, 아니면 FA로."""
+    global _pending_transfer_type
+    from constants import MILITARY_STATUS_SERVING, MILITARY_STATUS_UNSERVED, MILITARY_PLAYER_OFFER_MIN_AGE
+    p = get_player()
+    if not p or (p.get("military_status") or "") != MILITARY_STATUS_SERVING:
+        return
+    if (p.get("military_enlist_age") or 99) >= MILITARY_PLAYER_OFFER_MIN_AGE:
+        return
+    st = get_state()
+    year, week = st.get("current_year"), st.get("current_week", 1)
+    back = p.get("loan_from_team_id") or 0
+    _save_career_entry(p, year, week, allow_insert=False, exit_type="입대 취소")
+    _pending_transfer_type = "입대 취소"
+    base = dict(military_status=MILITARY_STATUS_UNSERVED, military_enlist_year=0, military_enlist_age=0,
+                loan_from_team_id=0, loan_from_league_id=0, loan_from_tier=0, loan_end_year=0)
+    if back:
+        update_player(current_team_id=back, current_league_id=p.get("loan_from_league_id") or 0,
+                      current_tier=p.get("loan_from_tier") or 1, salary=p.get("military_pre_salary") or 0, **base)
+    else:
+        update_player(current_team_id=0, current_league_id=0, salary=0, contract_years=0, contract_end_year=0, **base)
+    _military_notices.append(("forced", "20세 미만인데 잘못 처리된 입대를 되돌렸습니다.\n"
+                                        + ("원소속팀으로 복귀합니다." if back else "소속 팀이 없어 FA 상태입니다.")))
+
+
+def my_military_retire_info(p=None):
+    """[2026-10] 은퇴 버튼용 — 복무 중이면 (예약 여부, 제대하는 해), 아니면 None."""
+    p = p or get_player()
+    if not _my_is_serving(p):
+        return None
+    return (int(p.get("military_retire_pending") or 0) == 1, (p.get("military_enlist_year") or 0) + 1)
+
+
+def set_my_military_retire_reservation(on: bool) -> bool:
+    """[2026-10 신민용 확정: "복무 중 은퇴는 복무 끝날 때까지 하고 은퇴"] 복무 중 은퇴 버튼은
+    즉시 은퇴가 아니라 '제대하면 은퇴' 예약/취소다. 복무 중이 아니면 False."""
+    p = get_player()
+    if not _my_is_serving(p):
+        return False
+    update_player(military_retire_pending=1 if on else 0)
+    st = get_state() or {}
+    end_y = (p.get("military_enlist_year") or 0) + 1
+    add_log(f"🏁 은퇴 예약 — {end_y}년 시즌을 마치고 제대하면 은퇴합니다." if on
+            else "🏁 은퇴 예약을 취소했습니다. 제대 후에도 선수 생활을 이어갑니다.",
+            "event", st.get("current_year"), st.get("current_week"))
+    return True
+
+
+def military_choice_week_open():
+    """[7단계, 신민용 확정] 군팀 입대 카드는 1주차(1월 1일)와 12월 마지막 주(52주차)
+    오퍼 창 맨 아래에만 뜬다."""
+    try:
+        w = get_state().get("current_week", 1)
+    except Exception:
+        return False
+    return w in (1, 52)
+
+
+def enlist_my_player_now(team_id):
+    """[7단계, 신민용 확정] 입대 버튼을 누르는 즉시 입대. 1주차에 고르면 그 해가 복무
+    1년차(2주차에 들어가도 1년으로 친다), 12월 마지막 주에 고르면 다음 해가 1년차.
+    반환: 입대한 팀 이름(실패하면 None)."""
+    p = get_player()
+    if not p or my_player_military_offer_teams(p, n=99) == []:
+        return None
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT t.id, t.name, t.league_id, l.tier FROM teams t JOIN leagues l "
+                           "ON l.id=t.league_id WHERE t.id=?", (team_id,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    st = get_state()
+    year, week = st.get("current_year"), st.get("current_week", 1)
+    enlist_year = year + 1 if week >= 27 else year
+    # _my_military_enlist는 "그 해 시즌 종료 시점" 기준(입대 연도 = year+1)으로 짜여 있어
+    # 입대 연도 - 1을 넘긴다(1주차 입대는 직전 시즌 종료 직후와 같은 순간).
+    _my_military_enlist(p, enlist_year - 1, tuple(row), forced=False)
+    return row[1]
+
+
+def reserve_my_player_enlistment(team_id):
+    """[7단계] 오퍼 창에서 군팀을 고르면 호출 — 다음 새해(시즌 전환)에 그 팀으로 입대.
+    0을 넘기면 예약 취소."""
+    conn = get_conn()
+    try:
+        if team_id:
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('my_military_reserved_team', ?)",
+                         (str(int(team_id)),))
+        else:
+            conn.execute("DELETE FROM meta WHERE key='my_military_reserved_team'")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def my_player_military_offer_teams(p=None, n=None):
+    """[7단계] 20세부터 오퍼 창 아래에 보여줄 군팀(기본 2곳). K1 이상 수준이면 1부부터,
+    아니면 2부부터, 각 부에서 인원이 적은 팀 순. 미필 한국 국적이 아니면 []."""
+    from constants import (MILITARY_PLAYER_OFFER_MIN_AGE, MILITARY_PLAYER_OFFER_TEAMS,
+                           MILITARY_STATUS_UNSERVED, MILITARY_ROSTER_RANGE, MILITARY_LEVEL_MARGIN)
+    from military_service import (military_enabled, get_military_team_ids, compute_league_levels,
+                                  korea_reference_levels)
+    p = p or get_player()
+    if not p or not military_enabled() or _my_mil_status(p) != MILITARY_STATUS_UNSERVED:
+        return []
+    if (p.get("age") or 0) < MILITARY_PLAYER_OFFER_MIN_AGE:
+        return []
+    conn = get_conn()
+    try:
+        tids = get_military_team_ids(conn)
+        if not tids:
+            return []
+        rows = conn.execute(
+            f"SELECT t.id, t.name, t.league_id, l.tier, l.name, "
+            f"(SELECT COUNT(*) FROM ai_players a WHERE a.team_id=t.id) FROM teams t JOIN leagues l ON l.id=t.league_id "
+            f"WHERE t.id IN ({','.join(map(str, tids))})").fetchall()
+        levels = compute_league_levels(conn)
+        refs = korea_reference_levels(conn, levels)
+    finally:
+        conn.close()
+    k1 = (levels.get(p.get("current_league_id")) or 0) >= refs[1] - MILITARY_LEVEL_MARGIN
+    # [2026-10 신민용 확정] 1부 수준(K1 이상)이면 1부 팀만, 아니면 2부 팀만 보여준다 —
+    # 1부 갈 선수가 진급 보너스를 노리고 일부러 2부를 고르는 걸 막는다. 해당 부가
+    # 전부 정원이 찬 경우에만 다른 부로 넘어간다.
+    rows = [r for r in rows if r[5] < MILITARY_ROSTER_RANGE[1]] or rows
+    _same = [r for r in rows if (r[3] == 1) == k1]
+    rows = _same or rows
+    rows.sort(key=lambda r: ((r[3] != 1) if k1 else (r[3] == 1), r[5], r[0]))
+    out = []
+    for tid, tname, lid, tier, lname, cnt in rows[:(n or MILITARY_PLAYER_OFFER_TEAMS)]:
+        out.append(dict(team_id=tid, team_name=tname, league_id=lid, league_name=lname, tier=tier,
+                        salary=0, military=True, flag="🪖", country="군대"))
+    return out
+
+
+def _my_military_enlist(p, year, team_row, forced=False):
+    """내 선수 입대 실행(시즌 종료 = 새해 직전). 남은 계약이 2시즌 이상이면 원 소속팀
+    임대, 아니면 계약 해지 후 입대(제대하면 FA). 연봉 0원."""
+    global _pending_transfer_type
+    from constants import MILITARY_STATUS_SERVING, MILITARY_SERVICE_YEARS, MILITARY_PLAYER_OFFER_MIN_AGE
+    # 마지막 안전장치: 강제 입대(31세)가 아니면 20세 미만은 절대 입대시키지 않는다.
+    if not forced and (p.get("age") or 0) < MILITARY_PLAYER_OFFER_MIN_AGE:
+        return
+    tid, tname, lid, tier = team_row
+    cur_tid = p.get("loan_from_team_id") or p.get("current_team_id") or 0
+    cur_lid = p.get("loan_from_league_id") or p.get("current_league_id") or 0
+    cur_tier = p.get("loan_from_tier") or p.get("current_tier") or 1
+    keep = bool(cur_tid) and (p.get("contract_end_year") or 0) >= year + MILITARY_SERVICE_YEARS
+    _save_career_entry(p, year, 52, allow_insert=False, exit_type="입대", loan_partner_team=tname)
+    _pending_transfer_type = "입대"
+    kw = dict(current_team_id=tid, current_league_id=lid, current_tier=tier, manager_relation=50,
+              salary=0, military_status=MILITARY_STATUS_SERVING, military_enlist_year=year + 1,
+              military_enlist_age=(p.get("age") or 0) + 1, military_pre_team_id=cur_tid,
+              military_pre_league_id=cur_lid, military_pre_salary=p.get("salary") or 0,
+              military_devalue=1.0, military_post_matches=0)
+    if keep:
+        kw.update(loan_from_team_id=cur_tid, loan_from_league_id=cur_lid, loan_from_tier=cur_tier,
+                  loan_end_year=year + MILITARY_SERVICE_YEARS)
+    else:
+        kw.update(loan_from_team_id=0, loan_from_league_id=0, loan_from_tier=0, loan_end_year=0,
+                  contract_years=MILITARY_SERVICE_YEARS, contract_end_year=year + MILITARY_SERVICE_YEARS)
+    # [2026-10 병역 버그수정] 입대 전에 걸려 있던 이적 예약(오퍼 수락·판매 수락), 판매 추진,
+    # 대기 중인 재계약 제안을 전부 정리한다 — 예전엔 45주에 오퍼를 수락해두고 52주에
+    # 입대하면 다음 시즌 4주에 그 예약 이적이 실행돼 복무 중인 채 민간 팀으로 갔다.
+    _cancel = []
+    for _k in ("pending_join_transfer_json", "pending_sale_transfer_json"):
+        _raw = p.get(_k) or ""
+        if _raw:
+            try:
+                _cancel.append(json.loads(_raw).get("team_name") or "")
+            except Exception:
+                _cancel.append("")
+    kw.update(pending_join_transfer_json="", pending_sale_transfer_json="", sale_push_proposal_json="",
+              sale_push_active=0, transfer_requested=0, _contract_renew_offer=0, _contract_renew_years=0)
+    update_player(**kw)
+    # 입대 전에 이미 잡혀 있던 올해 이후 대회 발탁(출전 확정·동의 대기)도 취소 — 군인은 국대에 안 뽑힌다.
+    _ic = get_conn()
+    try:
+        _ic.execute("UPDATE intl_tournaments SET my_selected=2 WHERE year>=? AND my_selected IN (1,3) "
+                    "AND status NOT IN ('done','finished')", (year,))
+        _ic.commit()
+    except Exception:
+        pass
+    finally:
+        _ic.close()
+    add_log(f"🪖 {'강제 ' if forced else ''}입대! {tname} ({'1부' if tier == 1 else '2부'})  |  복무 2년 · 연봉 0원"
+            f"  |  {'원소속팀 계약 유지(제대 후 복귀)' if keep else '계약 해지 — 제대 후 FA'}", "event", year, 52)
+    for _tn in _cancel:
+        add_log(f"🪖 입대로 {_tn + ' ' if _tn else ''}예약 이적이 취소됐습니다.", "event", year, 52)
+
+
+def _my_military_discharge(p, year):
+    """복무 2시즌을 마친 해 시즌 종료 때 제대. 원 소속 계약이 남아 있으면 복귀, 아니면 FA.
+    평가절하 배율: 복무 중 출전 비율 30% 미만이면 0.7, 아니면 0.8(제대 후 10경기에 걸쳐 회복)."""
+    global _pending_transfer_type
+    from constants import (MILITARY_STATUS_SERVED, MILITARY_DEVALUE, MILITARY_DEVALUE_LOW_PLAY,
+                           MILITARY_LOW_PLAY_RATIO, MILITARY_LEAGUE_MATCHES)
+    ey = p.get("military_enlist_year") or year
+    conn = get_conn()
+    try:
+        arch = {r[0]: r[1] or 0 for r in conn.execute(
+            "SELECT year, matches FROM my_player_season_stats WHERE year BETWEEN ? AND ?", (ey, year)).fetchall()}
+    finally:
+        conn.close()
+    played = sum(arch.values()) + (0 if year in arch else (p.get("season_matches") or 0))
+    expected = 2 * MILITARY_LEAGUE_MATCHES.get(p.get("current_tier") or 2, 36)
+    # [2026-10 신민용 확정] 출전 비율 평가절하는 폐지 — 복무 중 진급/강등 때 기록된 배율
+    # (military_devalue, 입대 때 1.0으로 시작)을 그대로 쓴다.
+    devalue = float(p.get("military_devalue") or 1.0)
+    _save_career_entry(p, year, 52, allow_insert=False, exit_type="제대")
+    _pending_transfer_type = "제대"
+    back = p.get("loan_from_team_id") or 0
+    base = dict(military_status=MILITARY_STATUS_SERVED, military_devalue=devalue, military_post_matches=0,
+                manager_relation=50, loan_from_team_id=0, loan_from_league_id=0, loan_from_tier=0, loan_end_year=0)
+    # [2026-10 신민용 확정: "복무 중 은퇴가 되더라도 복무는 다 하고 은퇴"] 복무 중 은퇴를
+    # 예약했으면 원소속팀으로 돌아가지 않고 소속 없이 제대한 뒤 은퇴 창으로 넘어간다
+    # (pending=2 — pop_military_notices가 UI에 은퇴 차례를 알린다, 앱을 껐다 켜도 유지).
+    if int(p.get("military_retire_pending") or 0) == 1:
+        update_player(current_team_id=0, current_league_id=0, salary=0, contract_years=0,
+                      contract_end_year=0, military_retire_pending=2, **base)
+        add_log(f"🎖️ 제대! 복무를 모두 마쳤습니다. 예약한 대로 은퇴합니다. (복무 중 {played}경기)",
+                "event", year, 52)
+        return
+    # [2026-10 병역 버그수정] 원소속 계약이 제대하는 해에 딱 끝나는 경우(입대 때 "남은 계약
+    # 2시즌" — 입대 안내엔 "제대 후 복귀"로 떴다)도 원소속팀으로 복귀시킨다. 예전엔 > 비교라
+    # 이 경우 재계약 판단 없이 바로 FA가 됐다. 복귀 뒤엔 같은 시즌 종료 처리의 "계약 만료
+    # 체크"가 원소속팀 기준으로 재계약 제안/만료를 정상적으로 결정한다.
+    # 원소속팀이 복무 2년 사이 승강했을 수 있으니 리그/부는 입대 때 값이 아니라 지금 값으로
+    # 다시 읽는다(일반 임대 복귀 _return_from_loan_if_due와 같은 방식).
+    _back_row = None
+    if back:
+        _bc = get_conn()
+        try:
+            _back_row = _bc.execute("SELECT t.league_id, l.tier FROM teams t JOIN leagues l ON l.id=t.league_id "
+                                    "WHERE t.id=?", (back,)).fetchone()
+        finally:
+            _bc.close()
+        if not _back_row:
+            back = 0
+    if back and (p.get("contract_end_year") or 0) >= year:
+        update_player(current_team_id=back, current_league_id=_back_row[0],
+                      current_tier=_back_row[1], salary=p.get("military_pre_salary") or 0, **base)
+        _make_room_on_return(back, year, "내 제대 복귀로 자리를 마련했습니다.")
+        add_log(f"🎖️ 제대! 원소속팀으로 복귀합니다. (복무 중 {played}경기 · 제대 직후 평가 {int(devalue * 100)}%)"
+                + ("  |  계약이 올해로 끝나 원소속팀이 재계약 여부를 결정합니다."
+                   if (p.get("contract_end_year") or 0) == year else ""),
+                "event", year, 52)
+    else:
+        update_player(current_team_id=0, current_league_id=0, salary=0, contract_years=0,
+                      contract_end_year=0, **base)
+        add_log(f"🎖️ 제대! 계약이 없어 FA로 새 팀을 찾아야 합니다. (복무 중 {played}경기 · 제대 직후 평가 "
+                f"{int(devalue * 100)}%)", "event", year, 52)
+
+
+def _my_military_year_end(p, year):
+    """[7단계] 시즌 종료(새해 직전) 때 한 번 — 제대 → 예약 입대 → 31세 강제 입대.
+    기능이 꺼져 있거나 한국 국적이 아니면 아무것도 안 한다."""
+    from constants import (MILITARY_STATUS_SERVING, MILITARY_STATUS_UNSERVED, MILITARY_FORCED_AGE)
+    from military_service import military_enabled, get_military_team_ids
+    if not p or not military_enabled():
+        return
+    st = _my_mil_status(p)
+    if not st:
+        return
+    if st != (p.get("military_status") or ""):
+        update_player(military_status=st)
+        p = get_player() or p
+    if st == MILITARY_STATUS_SERVING:
+        if (p.get("military_enlist_year") or year) + 1 <= year:
+            _my_military_discharge(p, year)
+        elif (p.get("military_enlist_year") or 0) <= year:
+            # [2026-10 병역 버그수정] 진급/강등은 "이번 시즌을 군팀에서 뛴 1년차"만.
+            # 12월 마지막 주에 입대한 선수(입대 연도 = 다음 해)는 AI 신병처럼 맞교환
+            # 대상이 아니다 — 예전엔 입대 직후 그 팀이 승강전에서 지면 같이 강등됐다.
+            _my_military_po_swap(p, year)
+        return
+    if st != MILITARY_STATUS_UNSERVED:
+        return
+    conn = get_conn()
+    try:
+        # [2026-10 버그수정, 신민용 리포트: "17세인데 강제로 입단했다"] 예전 방식(다음 새해
+        # 입대 예약)의 meta 키가 새 게임에도 남아 나이 확인 없이 입대시켰다. 이제 입대는
+        # 버튼을 누르는 즉시 처리하므로 예약은 쓰지 않는다 — 남은 키는 지우기만 한다.
+        reserved = 0
+        conn.execute("DELETE FROM meta WHERE key='my_military_reserved_team'")
+        conn.commit()
+        tids = get_military_team_ids(conn)
+        row = None
+        if reserved and reserved in tids:
+            row = conn.execute("SELECT t.id, t.name, t.league_id, l.tier FROM teams t JOIN leagues l "
+                               "ON l.id=t.league_id WHERE t.id=?", (reserved,)).fetchone()
+    finally:
+        conn.close()
+    forced = (p.get("age") or 0) + 1 >= MILITARY_FORCED_AGE
+    if not row and forced:
+        # 강제 입대 — 창을 닫아도 입단(신민용 확정). 배정 규칙은 AI와 같다(K1 이상 1부 우선).
+        cands = my_player_military_offer_teams(p, n=1) or []
+        if not cands:
+            # 오퍼 창 노출 나이 조건과 무관하게 강제 입대는 해야 하므로 직접 고른다
+            conn = get_conn()
+            try:
+                tids = sorted(get_military_team_ids(conn))
+                rr = conn.execute(
+                    f"SELECT t.id, t.name, t.league_id, l.tier FROM teams t JOIN leagues l ON l.id=t.league_id "
+                    f"WHERE t.id IN ({','.join(map(str, tids)) or '0'}) ORDER BY l.tier DESC, "
+                    f"(SELECT COUNT(*) FROM ai_players a WHERE a.team_id=t.id), t.id LIMIT 1").fetchone()
+            finally:
+                conn.close()
+            row = tuple(rr) if rr else None
+        else:
+            c0 = cands[0]
+            row = (c0["team_id"], c0["team_name"], c0["league_id"], c0["tier"])
+    if row:
+        _my_military_enlist(p, year, tuple(row), forced=forced and not reserved)
+        if forced and not reserved:
+            _military_notices.append(("forced", f"31세가 되어 병역 의무로 {row[1]}에 강제 입대합니다.\n"
+                                                "복무 2년 · 연봉 0원 · 이적/임대 불가"))
+    elif (p.get("age") or 0) + 1 == 20:
+        # 20세가 되는 새 시즌 시작에 1초 안내(신민용 확정 문구).
+        _military_notices.append(("toast", "20살부터 남자는 군대에 가야합니다. "
+                                            "(30세까지 안간 경우 31세 1주차에 강제로 입대를 합니다.)"))
+
+
+def _my_military_po_swap(p, year):
+    """[7단계] 승강전에서 2부 승자가 이겨 선수단이 맞바뀐 해, 내 선수가 그 두 팀 중
+    한 곳의 1년차 복무자면 같이 옮긴다(진급/강등). 팀 자체는 그대로."""
+    global _pending_transfer_type
+    conn = get_conn()
+    try:
+        r = conn.execute("SELECT home_team_id, away_team_id, winner_team_id FROM military_po "
+                         "WHERE year=? AND stage='승강 플레이오프' ORDER BY id DESC LIMIT 1", (year,)).fetchone()
+        if not r or r[2] != r[1]:
+            return
+        me = p.get("current_team_id")
+        if me not in (r[0], r[1]):
+            return
+        dest = r[1] if me == r[0] else r[0]
+        d = conn.execute("SELECT t.name, t.league_id, l.tier FROM teams t JOIN leagues l ON l.id=t.league_id "
+                         "WHERE t.id=?", (dest,)).fetchone()
+    finally:
+        conn.close()
+    if not d:
+        return
+    label = "강등" if me == r[0] else "진급"
+    # 제대 후 배율(신민용 확정 표): 승강전이 걸린 이 시즌의 역할 기준. 대기/전력외 0.9.
+    from constants import MILITARY_SWAP_FACTOR, MILITARY_SWAP_BENCH_FACTOR, MILITARY_LEAGUE_MATCHES
+    _c2 = get_conn()
+    try:
+        _ar = _c2.execute("SELECT matches FROM my_player_season_stats WHERE year=?", (year,)).fetchone()
+    finally:
+        _c2.close()
+    _played = (_ar[0] or 0) if _ar else (p.get("season_matches") or 0)
+    _role = _role_from_play_ratio(_played, MILITARY_LEAGUE_MATCHES.get(p.get("current_tier") or 2, 36))
+    _factor = MILITARY_SWAP_FACTOR[label].get(_role, MILITARY_SWAP_BENCH_FACTOR)
+    update_player(military_devalue=_factor)
+    _save_career_entry(p, year, 52, allow_insert=False, exit_type=label, loan_partner_team=d[0])
+    _pending_transfer_type = label
+    update_player(current_team_id=dest, current_league_id=d[1], current_tier=d[2])
+    add_log(f"🪖 승강전 결과로 {label}! {d[0]} ({'1부' if d[2] == 1 else '2부'})에서 남은 복무를 이어갑니다.",
+            "event", year, 52)
+
+
+def my_military_devalue_factor(p=None):
+    """[7단계] 제대 후 평가절하 배율(오퍼 수·제안 연봉·이적료). 제대 후 공식 경기를
+    10경기 뛸 때까지 선형으로 1.0까지 회복."""
+    from constants import MILITARY_DEVALUE_RECOVERY_MATCHES as RM
+    p = p or get_player()
+    d = float((p or {}).get("military_devalue") or 1.0)
+    if d == 1.0 or (p.get("military_status") or "") != "served":
+        return 1.0
+    back_year = (p.get("military_enlist_year") or 0) + 2
+    conn = get_conn()
+    try:
+        arch = {r[0]: r[1] or 0 for r in conn.execute(
+            "SELECT year, matches FROM my_player_season_stats WHERE year >= ?", (back_year,)).fetchall()}
+    finally:
+        conn.close()
+    cur_y = p.get("current_year") or 0
+    # 이번 시즌 경기 수는 제대 후 시즌일 때만 센다(제대 직후 같은 연말엔 복무 시즌 기록이 남아 있음)
+    post = sum(arch.values()) + (0 if (cur_y in arch or cur_y < back_year) else (p.get("season_matches") or 0))
+    f = d + (1.0 - d) * min(1.0, post / float(RM))   # 0.8→1.0 회복, 1.2→1.0 소멸 모두 같은 식
+    if post >= RM:
+        update_player(military_devalue=1.0)
+        return 1.0
+    return f
+
+
 def _return_from_loan_if_due(p, year):
     """[2026-07 신설] 임대 기간(loan_end_year)이 끝났으면 원소속팀으로
     자동 복귀시킨다. 원소속팀이 그사이 승강했을 수 있으니 현재 소속
@@ -18227,6 +18707,7 @@ def _return_from_loan_if_due(p, year):
                   current_tier=new_tier,
                   loan_from_team_id=0, loan_from_league_id=0,
                   loan_from_tier=0, loan_end_year=0)
+    _make_room_on_return(team_row["id"], year, "내 임대 복귀로 자리를 마련했습니다.")
     add_log(f"🔄 임대 종료 → {team_row['name']}로 복귀!  "
             f"({league_row['name'] if league_row else ''} {new_tier}부)", "event", year, 52)
 
@@ -18717,6 +19198,10 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
     # [최적화] 전체 리그 맵을 1회 SELECT로 미리 빌드 (기존: cids×tier 개별 SELECT 275회)
     all_leagues_rows = c.execute(
         "SELECT id, country_id, tier FROM leagues ORDER BY id").fetchall()
+    # [2026-10 병역 시스템] 군데스리가는 팀 단위 승강이 없다(팀은 고정, 승강 PO
+    # 결과로 선수단만 맞교환 — 5단계에서 별도 처리). 일반 승강/승강PO 대상에서 제외.
+    from military_service import drop_military_leagues as _drop_mil_lg
+    all_leagues_rows = _drop_mil_lg(conn, all_leagues_rows, "id")
     # {(country_id, tier): league_id}
     _league_map: dict = {(r["country_id"], r["tier"]): r["id"] for r in all_leagues_rows}
     # {country_id: {tier: league_id}}
@@ -19566,6 +20051,14 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
             """INSERT INTO promotion_log(year,team_name,from_tier,to_tier,league_name,
                                           from_league_id,to_league_id,team_id) VALUES(?,?,?,?,?,?,?,?)""",
             _promotion_log_inserts)
+    # [2026-10 병역 시스템] 군데스리가 승강 PO도 일반 리그와 같은 엔진·같은 시기(44주~)에
+    # 실제 경기로 치른다(내 선수도 출전). 2부 1~4위 bracket4 → 결승 승자 vs 1부 최하위(6위).
+    # 팀 이동은 없고 결과로 선수단만 맞바뀐다(_finalize_boundary_match가 군 리그는 건너뜀).
+    try:
+        from military_service import military_po_pending_slots
+        _po_pending_inserts = list(_po_pending_inserts or []) + military_po_pending_slots(conn, year)
+    except Exception as _mpe:
+        _live_debug(f"[MILITARY] PO 대진 생성 실패(계속 진행): {_mpe}")
     if _po_pending_inserts:
         c.executemany(
             """INSERT INTO po_pending_slots(year,upper_league_id,lower_league_id,rule_id,side,
@@ -19792,6 +20285,14 @@ def _finish_incomplete_matches_for_season(season: int):
 # 미리 깔아 두는 가벼운 INSERT 작업만 여기서 하고, 실제 결과 계산(OVR 조회 +
 # 승패 굴림)은 52주에 걸쳐 자연 분산된다.
 # [성능] 단일 커넥션 + 소수의 배치 쿼리(리그별 SELECT/커밋 반복 없음)로 처리.
+def _league_legs(league_id, n):
+    """[2026-10 병역 시스템 5단계] 리그 맞대결 횟수. 군데스리가는 부수별 고정
+    (1부 4전=20경기, 2부 2전=14경기), 그 외는 기존 팀 수 기준 그대로."""
+    from military_service import military_legs_for_league
+    v = military_legs_for_league(league_id)
+    return v if v else legs_for_team_count(n)
+
+
 def _generate_all_league_schedules(season: int, year: int):
     """시즌 시작 시 전 세계 모든 리그의 이번 시즌 일정(-1,-1 스코어)을 생성한다.
     이미 일정이 있는 리그(80% 이상 채워짐)는 건드리지 않는다(멱등)."""
@@ -19873,7 +20374,7 @@ def _generate_all_league_schedules(season: int, year: int):
         need_league_ids = [
             lid for lid, tids in teams_by_league.items()
             if len(tids) >= 2
-            and sched_counts.get(lid, 0) < len(tids) * (len(tids) - 1) * (legs_for_team_count(len(tids)) / 2) * 0.8
+            and sched_counts.get(lid, 0) < len(tids) * (len(tids) - 1) * (_league_legs(lid, len(tids)) / 2) * 0.8
         ]
         if not need_league_ids:
             conn.commit()
@@ -20234,6 +20735,11 @@ def generate_offers(count=5, force=False) -> list:
     되면, 강제 입단 창(_do_join)조차 자동 오퍼가 0개로 떠서 "직접 지원"
     슬롯 4개만 덩그러니 보이는 문제가 있었다. force=True면(강제 입단
     호출 전용) offers_enabled 뮤트를 무시하고 항상 생성한다."""
+    # [2026-10 병역 7단계] 복무 중엔 오퍼가 오지 않는다(이적·임대 불가).
+    from constants import MILITARY_STATUS_SERVING as _MSS
+    _gp = get_player()
+    if _gp and (_gp.get("military_status") or "") == _MSS:
+        return []
     p = get_player()
     if not p: return []
 
@@ -21140,6 +21646,19 @@ def generate_offers(count=5, force=False) -> list:
     if len(offers) > 1:
         offers.sort(key=_offer_priority_score, reverse=True)
 
+    # [2026-10 병역 7단계] 제대 후 평가절하: 오퍼 수·제안 연봉·이적료에 배율(0.8/0.7 →
+    # 제대 후 10경기에 걸쳐 1.0). 배율만큼만 오퍼를 남기고 금액도 같은 비율로 낮춘다.
+    try:
+        _f = my_military_devalue_factor()
+        if _f != 1.0 and offers:
+            _keep = max(1, min(len(offers), int(round(len(offers) * _f))))
+            offers = offers[:_keep]
+            for _o in offers:
+                for _k in ("salary", "fee", "transfer_fee"):
+                    if isinstance(_o.get(_k), (int, float)) and _o.get(_k):
+                        _o[_k] = int(_o[_k] * _f)
+    except Exception:
+        pass
     return offers
 
 
@@ -22962,7 +23481,7 @@ def _enforce_foreign_quota_on_join(team_id, team_country, my_nationality):
     conn.close()
 
 
-def _make_room_on_join(team_id, team_country, tier, year):
+def _make_room_on_join(team_id, team_country, tier, year, reason="내 합류로 자리를 마련했습니다.", log_week=None):
     """[2026-09 신설, 신민용 지적: "내가 이미 26명 꽉 찬 팀에 들어가면
     27명이 되는 거 아니냐 — 그럼 원래 있던 애는 어떻게 되는건데? 자리가
     빌 때 오퍼가 오는 거고, 내보내는 경우엔 또 자리가 나는 거지, 현실도
@@ -23002,7 +23521,26 @@ def _make_room_on_join(team_id, team_country, tier, year):
     conn.commit()
     conn.close()
     _who = ", ".join(_names[:5]) + (f" 외 {len(_names)-5}명" if len(_names) > 5 else "")
-    add_log(f"😡 로스터 정원({ceiling}명) 초과로 {_who} 방출 — 내 합류로 자리를 마련했습니다.", "event")
+    if log_week is None:
+        add_log(f"😡 로스터 정원({ceiling}명) 초과로 {_who} 방출 — {reason}", "event")
+    else:
+        add_log(f"😡 로스터 정원({ceiling}명) 초과로 {_who} 방출 — {reason}", "event", year, log_week)
+
+
+def _make_room_on_return(team_id, year, reason):
+    """[2026-10 신민용 확정] 내 선수가 제대·임대를 마치고 원소속팀으로 돌아갈 때도 입단과
+    똑같이 정원을 맞춘다. AI 정원 보정(_rebalance_squad_sizes)은 내 팀 몫으로 1자리를
+    비워두지만, 그 보정은 run_ai_offseason 안에서 돌고 그때 내 소속은 아직 군팀/임대처라
+    원소속팀은 AI로 정원을 꽉 채운다 — 그 뒤에 내가 복귀하면 AI 26 + 나 = 27이 됐다.
+    내 선수 본인은 정리 대상이 아니다(최저 OVR AI부터, 포지션 보호 없이 입단과 동일)."""
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT cn.name, l.tier FROM teams t JOIN leagues l ON l.id=t.league_id "
+                           "JOIN countries cn ON cn.id=l.country_id WHERE t.id=?", (team_id,)).fetchone()
+    finally:
+        conn.close()
+    if row:
+        _make_room_on_join(team_id, row[0], row[1], year, reason=reason, log_week=52)
 
 
 def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None):

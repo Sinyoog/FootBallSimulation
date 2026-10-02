@@ -209,6 +209,26 @@ class StandingsWindow(QDialog):
         colors: dict = {}
         if not self._tier or not self._country_id:
             return colors
+        # [2026-10 병역 시스템 6단계] 군데스리가: 클럽대항전 없음, 자동 승강 없음 —
+        # 승강 표시만 뜬다. 2부 1~4위 = 승격 플레이오프권, 1부 6위(최하위) = 승강전권(옐로).
+        try:
+            from military_service import get_military_country_id
+            from constants import MILITARY_PLAYOFF_TEAMS
+            _mc = get_conn()
+            try:
+                _is_mil = get_military_country_id(_mc) == self._country_id
+            finally:
+                _mc.close()
+        except Exception:
+            _is_mil = False
+        if _is_mil:
+            if self._tier == 1:
+                if rows:
+                    colors[rows[-1]["id"]] = "#ffee55"
+            else:
+                for r in rows[:MILITARY_PLAYOFF_TEAMS]:
+                    colors[r["id"]] = "#ffee55"
+            return colors
         conn = get_conn()
         c = conn.cursor()
 

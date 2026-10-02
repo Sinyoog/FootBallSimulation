@@ -4813,6 +4813,12 @@ COUNTRY_LEAGUE_GRADE = {
     # 등급(품질) 기준으로만 조정 — 연봉은 COUNTRY_SALARY_MULT에서 그대로
     # 실측 목표치를 유지하도록 별도 재계산했다(등급 base가 바뀌므로).
     "대한민국": "B", "세르비아": "B", "폴란드": "B",
+    # [2026-10 신설, 신민용 확정] 군데스리가(가상 국가 "군대")는 B등급 —
+    # 로스터 범위 23~26명(K리그와 동일)을 맞추기 위한 등록이다. 등급을 보고
+    # 돌아가는 다른 로직(연봉/오퍼/파워랭킹 등)에서 군대를 빼는 건 등급이
+    # 아니라 military_service.is_military_* 판정이 담당한다(등급을 지워도
+    # get_country_league_grade가 국대 등급 F로 폴백할 뿐 격리가 안 됨).
+    "군대": "B",
     # [2026-08 신설, 신민용 요청: "캐나다도 평균 OVR 82쯤으로, 등급도 B로"]
     # 포지 FC(캐나다 프리미어리그, 레벨3 명문)를 GLOBAL_PRESTIGE_STAR_CFG
     # (database.py)와 함께 처리.
@@ -7407,3 +7413,100 @@ def intl_selection_score(ovr, age, position, peak_ovr):
     mult = INTL_AGE_GROUP_MULT.get(grp, 1.0)
     penalty = intl_age_band_penalty(age) * mult * intl_peak_relief(peak_ovr, age)
     return ovr - penalty
+
+# ─── 병역 시스템 / 군데스리가 (2026-10 신설, 신민용 확정) ─────────────
+# 설계 요약(상세는 military_service.py 모듈 docstring):
+#  - 대상: 국적이 대한민국인 선수(내 선수는 국적 슬롯 중 하나라도 한국).
+#  - 매년 새해(1주차)에만 입대, 복무 2년, 평생 1번. 31세가 되는 새해까지
+#    안 갔으면 강제 입대.
+#  - 군팀은 연봉 0원, 다른 이적/임대/방출 없음 — 팀이 바뀌는 건 승강
+#    플레이오프 결과에 따른 진급/강등(선수단 맞교환)뿐.
+#  - 파워랭킹/클럽대항전/국대 선발/발롱도르에 반영 안 됨.
+#
+# [기능 스위치] False면 월드에 "군대" 국가·리그·팀이 생성되지 않고 병역
+# 로직도 전혀 돌지 않는다 — 단계별 구현 중 기존 결과를 100% 그대로
+# 유지하기 위한 장치. 격리(2단계)·초기 입대(3단계)·새해 처리(4단계)가
+# 다 들어간 뒤에 켠다.
+# [2026-10] 1~6단계(격리·초기 입대·새해 처리·리그/승강·화면) 검증 완료 후 켬.
+# 내 선수 병역(7단계)은 아직 — 켜져 있어도 내 선수는 입대 대상에서 빠진 상태로 진행된다.
+MILITARY_ENABLED = True
+
+MILITARY_COUNTRY = "군대"          # LEAGUE_DATA/countries에서 쓰는 가상 국가명
+# countries 표에 들어가는 "군대" 행. 대륙은 실제 대륙 이름과 겹치지 않는 값으로
+# 둬서 대륙별 로직(대륙컵·대륙 클럽대항전·국적 추첨)에 우연히라도 안 걸리게
+# 한다. fifa_rank는 NULL이면 SQLite ASC 정렬에서 맨 앞(=최강국)으로 올라오므로
+# 반드시 큰 값. 그래도 격리는 이 값들이 아니라 is_military_* 판정이 책임진다.
+MILITARY_COUNTRY_FLAG = "🪖"
+MILITARY_COUNTRY_CONTINENT = "군대"
+MILITARY_COUNTRY_LANGUAGE = "한국어"
+MILITARY_COUNTRY_FIFA_RANK = 999
+MILITARY_TARGET_NATIONALITY = "대한민국"
+MILITARY_SERVICE_YEARS = 2         # 복무 기간(=계약 2년, 시즌 2개)
+MILITARY_FORCED_AGE = 31           # 이 나이가 되는 새해까지 미필이면 강제 입대
+MILITARY_PLAYER_OFFER_MIN_AGE = 20 # 내 선수: 이 나이부터 오퍼 창에 군팀 2곳 표시
+MILITARY_PLAYER_OFFER_TEAMS = 2
+MILITARY_ROSTER_RANGE = (23, 26)   # 군팀 로스터(최소=K리그 최소). 모자라도 보충 생성 안 함
+MILITARY_INITIAL_CLUB_CAP = 4      # 게임 시작 시 한 구단에서 동시에 입대시키는 최대 인원
+# [2026-10 실측 반영] 2부 8팀 → 10팀(9사단 백마·15사단 승리 추가): 14팀×26=364명(연 182명)으로는
+# 12시즌 실측 입대 수요(연 200~230명)를 못 받아 연기가 5→193명까지 쌓였다 → 16팀×26=416명(연 208명).
+# [2026-10 신민용 확정] 상반기·하반기에 각각 리그 한 바퀴 이상: 1부 6팀은 반기마다 20경기(총 40),
+# 2부 10팀은 반기마다 18경기(총 36). 일정 엔진의 1사이클(=2전)은 "1다리 상반기·2다리 하반기"라
+# 1부 8전(4사이클), 2부 4전(2사이클)이 된다.
+MILITARY_LEAGUE_MATCHES = {1: 40, 2: 36}
+# 일정 엔진의 "맞대결 횟수(legs)" — 일반 리그는 팀 수로 정해지지만(6팀→6전, 10팀→4전)
+# 군데스리가는 부수별로 고정한다: 1부 8전(6팀→40경기), 2부 4전(10팀→36경기).
+MILITARY_LEGS_BY_TIER = {1: 8, 2: 4}
+MILITARY_PLAYOFF_TEAMS = 4         # 2부 상위 4팀 단판 토너먼트(1v4, 2v3 → 결승) → 1부 6위와 단판 승강전
+MILITARY_CUP_NAME = "국군컵"
+
+# 병역 상태 코드(DB 저장값) → 화면 표시. "" = 병역 대상 아님(한국 국적 아님).
+MILITARY_STATUS_NONE = ""
+MILITARY_STATUS_UNSERVED = "unserved"
+MILITARY_STATUS_SERVING = "serving"
+MILITARY_STATUS_SERVED = "served"
+MILITARY_STATUS_EXEMPT = "exempt"
+MILITARY_STATUS_LABELS = {
+    MILITARY_STATUS_UNSERVED: "미필",
+    MILITARY_STATUS_SERVING: "복무중",
+    MILITARY_STATUS_SERVED: "군필",
+    MILITARY_STATUS_EXEMPT: "면제",
+}
+
+# 선수 유형별 입대 연령 범위(포함). 매년 현재 소속 리그·역할로 유형을 다시
+# 판정하고, 가상 입대 나이를 이 범위(가운데 쪽에 몰리게)에서 뽑는다.
+MILITARY_TYPE_AGE_RANGE = {
+    "바닥": (20, 22),   # [2026-10 신민용 확정] 군대는 AI·내 선수 모두 20세부터 (19→20)
+    "세미": (20, 24),
+    "평범": (23, 26),
+    "애매함": (24, 28),
+    "엘리트": (27, 30),
+}
+MILITARY_TYPE_ORDER = ("바닥", "세미", "평범", "애매함", "엘리트")
+MILITARY_MIN_AGE = 20   # 입대 가능 최소 나이(유형 범위와 별개로 마지막 안전장치)
+# 유형 판정: 리그 수준 = 그 리그 소속 선수 평균 OVR(매번 실측). K리그1/2/3 평균을
+# 기준선으로 삼아 해외 리그도 같은 잣대로 본다. MARGIN = "그 기준선 수준" 허용폭,
+# TOP_GAP = K1보다 이만큼 높으면 "상위 리그(유럽 A급 이상 등)".
+#   상위 리그 : 주전·핵심 → 엘리트 / 로테이션 → 애매함 / 그 외 → 평범
+#   K1 수준   : 핵심 → 엘리트 / 주전 → 애매함 / 그 외 → 평범
+#   K2 수준   : 주전·핵심 → 평범 / 그 외 → 세미
+#   K3 수준   : 주전·핵심 → 세미 / 그 외 → 바닥
+#   그 아래   : 바닥.   국대 단골은 유형과 무관하게 엘리트 + 30세까지 연기.
+MILITARY_LEVEL_MARGIN = 1.0
+MILITARY_TOP_LEAGUE_GAP = 4.0
+# 국대 단골(최근 N년 안에 본선 대회 최종 명단 1회 이상)은 유형과 무관하게
+# 입대를 이 나이까지 미룬다(면제 대회 우승을 노리는 현실 패턴).
+MILITARY_NATIONAL_REGULAR_AGE = 30
+MILITARY_NATIONAL_REGULAR_WINDOW_YEARS = 2
+
+# 면제: 대회 kind → 한국의 최소 성적. 최종 명단(26인)에 들었으면 출전
+# 0경기여도 면제. 친선전(power_eval)은 면제 없음.
+#   world=월드컵(준우승 이상) / continent=아시안컵(준우승 이상) / region=동아시안컵(우승)
+MILITARY_EXEMPT_RESULT = {"world": "runner_up", "continent": "runner_up", "region": "winner"}
+
+# 내 선수 제대 후 평가절하: 오퍼 수·제안 연봉·이적료 평가에 곱한다.
+# 복무 중 출전 비율이 LOW_PLAY 미만이면 더 낮은 배율. 제대 후 공식 경기를
+# RECOVERY_MATCHES만큼 뛰면 선형으로 1.0까지 회복. 팀 수준 하향은 따로 안 건다.
+MILITARY_DEVALUE = 0.8
+MILITARY_DEVALUE_LOW_PLAY = 0.7
+MILITARY_LOW_PLAY_RATIO = 0.30
+MILITARY_DEVALUE_RECOVERY_MATCHES = 10

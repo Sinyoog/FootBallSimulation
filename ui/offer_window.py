@@ -274,21 +274,68 @@ class OfferWindow(QDialog):
             item = self.cards_lay.takeAt(0)
             if item.widget(): item.widget().deleteLater()
         empty_slots = max(0, self.apply_slots - self._applied_count)
+        # [2026-10 병역 7단계, 신민용 요청] 군팀 입대 카드는 팀 입단·오퍼 창 모두 맨 위에.
+        mil = self._military_offers()
         if self.grid:
+            for k, mo in enumerate(mil):
+                row, col = divmod(k, 2)
+                self.cards_lay.addWidget(self._make_military_card(mo), row, col)
+            start = len(mil) + (len(mil) % 2)   # 군팀 줄은 따로 한 줄 차지
             for i, offer in enumerate(self.offers):
-                row, col = divmod(i, 2)
+                row, col = divmod(start + i, 2)
                 self.cards_lay.addWidget(self._make_card(i, offer), row, col)
-            base = len(self.offers)
+            base = start + len(self.offers)
             for j in range(empty_slots):
                 row, col = divmod(base + j, 2)
                 self.cards_lay.addWidget(self._make_apply_slot_card(), row, col)
             self.cards_lay.setRowStretch(self.cards_lay.rowCount(), 1)
         else:
+            for mo in mil:
+                self.cards_lay.addWidget(self._make_military_card(mo))
             for i, offer in enumerate(self.offers):
                 self.cards_lay.addWidget(self._make_card(i, offer))
             for j in range(empty_slots):
                 self.cards_lay.addWidget(self._make_apply_slot_card())
             self.cards_lay.addStretch()
+
+    # ── [2026-10 병역 시스템 7단계] 20세부터 오퍼 아래에 군팀 2곳 ──────────────
+    def _military_offers(self):
+        """미필 한국 국적 + 20세 이상일 때만 군팀 2곳(K1 이상 수준이면 1부 우선)."""
+        try:
+            from game_engine import my_player_military_offer_teams, military_choice_week_open
+            if not military_choice_week_open():   # 1주차·12월 마지막 주에만
+                return []
+            return my_player_military_offer_teams()
+        except Exception:
+            return []
+
+    def _make_military_card(self, mo):
+        from PyQt6.QtWidgets import QFrame, QLabel, QVBoxLayout, QPushButton, QMessageBox
+        card = QFrame()
+        card.setStyleSheet("QFrame{border:1px solid #6b8e23;border-radius:8px;background:#1f2a1a;}")
+        lay = QVBoxLayout(card)
+        div = "1부" if mo.get("tier") == 1 else "2부"
+        title = QLabel(f"🪖 {mo['team_name']}")
+        title.setStyleSheet("color:#c5e17a;font-weight:bold;font-size:14px;border:none;")
+        info = QLabel(f"군대 · {mo.get('league_name', '')} ({div})\n"
+                      "복무 2년 · 연봉 0원 · 복무 중 이적/임대 불가\n"
+                      "원소속 계약이 복무 기간보다 길면 제대 후 원소속팀 복귀,\n"
+                      "짧으면 계약 해지 → 제대 후 FA\n"
+                      "※ 누르면 바로 입대합니다")
+        info.setStyleSheet("color:#cccccc;border:none;")
+        info.setWordWrap(True)
+        lay.addWidget(title)
+        lay.addWidget(info)
+        btn = QPushButton("🪖 입대")
+
+        def _go(_=None, mo=mo):
+            from game_engine import enlist_my_player_now
+            if enlist_my_player_now(mo["team_id"]):   # 안내 팝업 없이 바로 입대(신민용 요청)
+                self.chosen = None
+                self.reject()
+        btn.clicked.connect(_go)
+        lay.addWidget(btn)
+        return card
 
     def _make_apply_slot_card(self):
         """[2026-07 신설] 빈 '직접 지원' 슬롯 카드 — 원하는 팀을 검색해서

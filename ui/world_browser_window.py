@@ -3187,9 +3187,25 @@ class WorldBrowserWindow(QDialog):
             if pr.get("home"): po_names.add(pr["home"])
             if pr.get("away"): po_names.add(pr["away"])
 
+        # [2026-10 병역 시스템] 군데스리가: 팀이 실제로 승강하진 않지만(선수단 맞교환)
+        # 승강전 결과를 일반 리그와 같은 색으로 — 이긴 2부 팀 파랑, 진 1부 팀 빨강.
+        _mo = None
+        try:
+            from military_service import get_military_po_outcome
+            from database import get_conn as _gc
+            _mc = _gc()
+            try:
+                _mo = get_military_po_outcome(_mc, lid, year)
+            finally:
+                _mc.close()
+            if _mo:
+                promoted_names = set(promoted_names) | _mo[0]
+                relegated_names = set(relegated_names) | _mo[1]
+        except Exception:
+            pass
         _legend = []
         if promoted_names or relegated_names:
-            _legend.append("🔵 파란색 = 승격  ·  🔴 빨간색 = 강등")
+            _legend.append(f"🔵 파란색 = {'진급' if _mo is not None else '승격'}  ·  🔴 빨간색 = 강등")
         if po_names:
             _legend.append("🟠 주황색 = 승강 플레이오프 진출(잔류)")
         self.standing_sub.setText("  ·  ".join(_legend))
@@ -3404,10 +3420,21 @@ class WorldBrowserWindow(QDialog):
         max_relegated_in = max([len(r.get("relegated_in") or []) for r in rows], default=0)
         max_promoted_in = max([len(r.get("promoted_in") or []) for r in rows], default=0)
 
+        # [2026-10 병역 시스템] 군데스리가는 팀이 아니라 선수단이 올라가므로 "진급".
+        try:
+            from military_service import is_military_league
+            from database import get_conn as _gc
+            _mc = _gc()
+            try:
+                _up_word = "진급" if is_military_league(_mc, getattr(self, "_current_league_id", None)) else "승격"
+            finally:
+                _mc.close()
+        except Exception:
+            _up_word = "승격"
         cols = (["연도", "🥇 1위", "🥈 2위", "🥉 3위", "🏅 4위"]
                 + [f"{rank}위(강등)" for rank in releg_ranks]
                 + [f"⬇ 강등팀{'' if max_relegated_in <= 1 else i+1}" for i in range(max_relegated_in)]
-                + [f"⬆ 승격팀{'' if max_promoted_in <= 1 else i+1}" for i in range(max_promoted_in)])
+                + [f"⬆ {_up_word}팀{'' if max_promoted_in <= 1 else i+1}" for i in range(max_promoted_in)])
         FIXED_COLS = 5  # 연도 + 1~4위 (강등 컬럼이 시작되는 인덱스 기준)
         RELEG_COLS = len(releg_ranks)
         RELEG_IN_COLS = max_relegated_in
@@ -5152,10 +5179,12 @@ class WorldBrowserWindow(QDialog):
                                 f"  ⚽ {_label}: 평균평점 {_cs['rating']:.2f}  "
                                 f"{_cs.get('goals', 0)}골 {_cs.get('assists', 0)}A")
             _sal = entry.get("salary")
-            if _sal and entry.get("salary_is_first_year", True):
+            # [2026-10 병역] 입대/진급/강등은 연봉 0원이어도 줄을 보여준다("연봉 0원 (계약: 2년) [입대]").
+            _mil_tt = entry.get("salary_transfer_type") in ("입대", "진급", "강등")
+            if (_sal or _mil_tt) and entry.get("salary_is_first_year", True):
                 _type_label = self._simple_transfer_label(
                     entry.get("salary_transfer_type"), entry.get("salary_is_loan"))
-                _sal_line = f"  💰 연봉 {fmt_money(_sal)}"
+                _sal_line = f"  💰 연봉 {fmt_money(_sal) if _sal else '0원'}"
                 _cyrs = entry.get("salary_contract_years")
                 if _cyrs:
                     _sal_line += f" (계약: {_cyrs}년)"
@@ -5382,8 +5411,28 @@ class WorldBrowserWindow(QDialog):
             "꺼짐(기본): 현역은 '현재 소속', 은퇴는 '마지막 소속팀(은퇴 직전 팀)'만 검색.\n"
             "켜짐: 과거에 그 팀(국가(소속리그)/리그로 좁혔다면 그 범위의 팀들)에서\n"
             "뛴 적이 있으면 포함 — 현역/은퇴 모두 동일하게 적용.")
-        self.player_team_career_btn.toggled.connect(_debounced_refresh)
         club_filter_lay.addWidget(self.player_team_career_btn)
+        # [2026-10 신설, 신민용 요청: "팀 기준 경력 포함에 국가대표 연도 입력하는
+        # 것처럼 하나 만들어줘"] 경력 포함이 켜졌을 때만 쓸 수 있는 연도 칸 —
+        # 비우면 그 팀에서 한 번이라도 뛴 선수 전체, 입력하면 그 해 그 팀 소속이었던
+        # 선수만(시즌 기록 기준). 경력 포함을 끄면 지워지고 전체로 돌아간다.
+        self.player_team_year_edit = QLineEdit()
+        self.player_team_year_edit.setPlaceholderText("전체")
+        self.player_team_year_edit.setMaximumWidth(56)
+        self.player_team_year_edit.setValidator(QIntValidator(1900, 2200, self))
+        self.player_team_year_edit.setEnabled(False)
+        self.player_team_year_edit.setToolTip(
+            "비워두면 그 팀에서 한 번이라도 뛴 선수 전체.\n"
+            "연도를 입력하면(예: 2005) 그 해에 그 팀 소속이었던 선수만.")
+
+        def _on_team_career_toggled(checked):
+            self.player_team_year_edit.setEnabled(checked)
+            if not checked:
+                self.player_team_year_edit.clear()
+            _debounced_refresh()
+        self.player_team_career_btn.toggled.connect(_on_team_career_toggled)
+        self.player_team_year_edit.textChanged.connect(_debounced_refresh)
+        club_filter_lay.addWidget(self.player_team_year_edit)
 
         # [2026-09 신설, 신민용 요청: "국가(소속리그) 상자 안에 외국인
         # 표시 on/off를 만들어달라 — 켜면 그 국적이 아니면서 그 리그에서
@@ -5686,7 +5735,7 @@ class WorldBrowserWindow(QDialog):
         # 주발(4번)이 끼면서 OVR 5번·소속팀 6번·소속팀 국가 7번으로 밀린다
         # — 아래 헤더 클릭(국적 1/OVR 5)·파란 헤더·소속팀 복사 칸 인덱스도
         # 같이 옮겼다.
-        self.player_detail_tbl = QTableWidget(0, 8)
+        self.player_detail_tbl = QTableWidget(0, 9)   # [2026-10] 9번째 "군대" 칸(한국 선수만 보임)
         self.player_detail_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         # [2026-09 신설, 신민용 요청: "OVR도 이름처럼 바꿀 수 있게, 국적도
         # 직접 입력으로 바꿀 수 있게"] "국적"(1번)·"OVR"(4번) 헤더도
@@ -5729,7 +5778,7 @@ class WorldBrowserWindow(QDialog):
         # 대신 QTableWidgetItem을 직접 넣어야 "이름" 칸에 클릭 툴팁을
         # 붙일 수 있다(색 자체는 위 ::section:first QSS가 담당 — 아이템
         # foreground는 QSS에 가려 무시되므로 굳이 다시 안 건다).
-        _detail_headers = ["이름", "국적", "나이", "포지션", "주발", "OVR", "소속팀", "소속팀 국가"]
+        _detail_headers = ["이름", "국적", "나이", "포지션", "주발", "OVR", "소속팀", "소속팀 국가", "군대"]
         for _col, _label in enumerate(_detail_headers):
             _hitem = QTableWidgetItem(_label)
             if _col == 0:
@@ -6545,6 +6594,8 @@ class WorldBrowserWindow(QDialog):
         if self.player_team_direct_edit.text().strip() and _direct_match:
             team_id = _direct_match["team_id"]
         team_mode = "career" if self.player_team_career_btn.isChecked() else "current"
+        _ty_txt = self.player_team_year_edit.text().strip() if team_mode == "career" else ""
+        team_year = int(_ty_txt) if _ty_txt else None
         foreign_only = self.player_foreign_btn.isChecked()
         players = wb.search_ai_players(name_query=q, continent=cont, country_id=club_cid,
                                         nat_country_id=nat_cid, grade=grade, tier=tier,
@@ -6556,7 +6607,7 @@ class WorldBrowserWindow(QDialog):
                                         custom_named_only=custom_named_only,
                                         min_career_years=min_career_years,
                                         max_career_years=max_career_years,
-                                        foreign_only=foreign_only)
+                                        foreign_only=foreign_only, team_year=team_year)
 
         self.player_list.clear()
         for pl in players:
@@ -6880,6 +6931,53 @@ class WorldBrowserWindow(QDialog):
                 tbl.setItem(row, col, item)
         self._resize_self_sizing_table(tbl)
 
+    def _military_label_for(self, d):
+        """[2026-10 병역 시스템] 선수검색 상세 표 9번째 칸 문자열. 병역 대상(한국
+        국적)이 아니면 "" — 그러면 칸 자체를 숨긴다."""
+        try:
+            from database import get_conn
+            from military_service import (is_service_target, military_status_label,
+                                          my_player_nationalities)
+            conn = get_conn()
+            try:
+                # 호출부(선수 상세 표시)가 직전에 _player_detail_pid를 세팅한다 —
+                # 내 선수면 None(wb.MY_PLAYER_ID 경로), AI 선수면 그 id.
+                pid = getattr(self, "_player_detail_pid", None) or d.get("id") or d.get("player_id")
+                if not pid:
+                    row = conn.execute("SELECT * FROM my_player LIMIT 1").fetchone()
+                    if not row or not is_service_target(my_player_nationalities(row)):
+                        return ""
+                    status = row["military_status"] if "military_status" in row.keys() else ""
+                else:
+                    row = conn.execute("SELECT nationality, military_status FROM ai_players WHERE id=?",
+                                       (pid,)).fetchone() if pid else None
+                    if not row:
+                        # [2026-10 신민용 요청: "현역에서 은퇴로 가면 한국 선수 면제·군필이 안
+                        # 뜬다"] 은퇴자는 ai_players_retired에 은퇴 시점 병역 상태가 남는다.
+                        # 그 칸이 비어 있는 건 이 기능 전에 은퇴한 선수 — 제대 기록도 없으면
+                        # 은퇴 나이로 추정한다(31세 이상이면 군필, 아니면 미필).
+                        try:
+                            rr = conn.execute("SELECT nationality, military_status, age FROM ai_players_retired "
+                                              "WHERE id=?", (pid,)).fetchone()
+                        except Exception:
+                            rr = None
+                        if not rr or not is_service_target(rr["nationality"]):
+                            return ""
+                        status = rr["military_status"] or ""
+                        if not status:
+                            from constants import MILITARY_FORCED_AGE, MILITARY_STATUS_SERVED
+                            if (rr["age"] or 0) >= MILITARY_FORCED_AGE:
+                                status = MILITARY_STATUS_SERVED
+                        return military_status_label(status) or "미필"
+                    if not is_service_target(row["nationality"]):
+                        return ""
+                    status = row["military_status"]
+            finally:
+                conn.close()
+            return military_status_label(status) or "미필"
+        except Exception:
+            return ""
+
     def _on_player_detail_header_clicked(self, section):
         """[2026-08 신설, 신민용 요청: "'이름' 헤더를 클릭하면 이 선수의
         이름을 변경할 수 있는 창이 뜨게"] 0번 칸("이름")을 눌렀을 때만
@@ -7016,6 +7114,13 @@ class WorldBrowserWindow(QDialog):
             (team_text, "#88ddaa", False),
             (team_country_text, "#aaddff", False),
         ]
+        # [2026-10 병역 시스템 6단계] 9번째 "군대" 칸 — 한국 국적(내 선수는 국적
+        # 슬롯 중 하나라도 한국)일 때만 보이고, 어떤 난이도에서도 편집 불가(헤더
+        # 클릭 편집 대상이 아님). 면제/미필/복무중/군필. 아직 판정 전(시즌 중
+        # 새로 생긴 선수)은 미필로 보인다.
+        _mil_label = self._military_label_for(d)
+        cells.append((_mil_label or "", {"면제": "#ffcc00", "복무중": "#88ddaa", "군필": "#aaaaaa"}.get(_mil_label, "#ff8844"), False))
+        tbl.setColumnHidden(8, not _mil_label)
         tbl.setRowCount(1)
         for col, (text, color, bold) in enumerate(cells):
             item = QTableWidgetItem(text)
@@ -7376,7 +7481,8 @@ class WorldBrowserWindow(QDialog):
         # 반복이 아니다.
         _extra_stat_rows = sum(1 for e in years
                                 if (e.get("_comp_stats")
-                                    or (e.get("salary") and e.get("salary_is_first_year", True)))
+                                    or ((e.get("salary") or e.get("salary_transfer_type") in ("입대", "진급", "강등"))
+                                        and e.get("salary_is_first_year", True)))
                                 and e["year"] in _expanded_years)
         # [2026-09 버그수정] 아래 실제 렌더링 루프가 상반기 줄(_is_half)엔
         # 상 목록을 아예 안 붙이도록 바뀌었으므로, 행수 사전계산도 같은
@@ -7631,7 +7737,11 @@ class WorldBrowserWindow(QDialog):
             # 반복 표시하지 말고 팀이 바뀐 첫 해에만"] 위 _extra_stat_rows
             # 사전계산과 정확히 같은 조건이어야 한다(주석 참고).
             _sal = entry.get("salary") if entry.get("salary_is_first_year", True) else None
-            if (_comp_stats or _sal) and _year_expanded:
+            # [2026-10 병역] 입대·진급·강등은 연봉 0원이어도 그 해 아래에 라벨 줄을 보여준다
+            # (위 _extra_stat_rows 사전계산과 같은 조건 — 줄 수가 어긋나면 표가 밀린다).
+            _mil_row = (entry.get("salary_transfer_type") in ("입대", "진급", "강등")
+                        and entry.get("salary_is_first_year", True))
+            if (_comp_stats or _sal or _mil_row) and _year_expanded:
                 # [2026-09 신설] "클럽 대항전" 칸(7번)은 cl_kind로 이미
                 # champions/europa/conference/lower_cup 중 하나의 색으로
                 # 정해져 있으므로(cl_color), lower_cup도 같은 칸·같은
@@ -7663,7 +7773,7 @@ class WorldBrowserWindow(QDialog):
                 # 대체/스카우팅을 안 겪은 선수)는 이 세 칸을 아예 안
                 # 그린다(0원처럼 잘못된 값을 정확한 척 보여주지 않기
                 # 위함, 다른 "기록 없는 연도" 처리와 동일 원칙).
-                if _sal:
+                if _sal or _mil_row:
                     # [2026-09 재작업, 신민용 요청: "이적 오퍼 입단 방출
                     # 이걸로 나누는게 깔끔한데... 년도는 2016에 묶여
                     # 있으니 보여줄 필요가 없잖아"] 내부 구분(리그내/국내
@@ -7701,7 +7811,7 @@ class WorldBrowserWindow(QDialog):
                     else:
                         _record = None
                     tbl.setCellWidget(row_idx, 1, self._two_line_cell(
-                        f"💰 {fmt_money(_sal)}", "#ffd166", _record))
+                        f"💰 {fmt_money(_sal) if _sal else '0원'}", "#ffd166", _record))
 
                     tbl.setSpan(row_idx, 2, 1, 3)
                     _fee = entry.get("salary_fee") or 0

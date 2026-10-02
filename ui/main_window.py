@@ -204,6 +204,38 @@ class MainWindow(QMainWindow):
         # 그대로 두되(성능 이슈로 이미 세심하게 조율된 구간), 여기 진입
         # 시점의 processEvents() 자체는 대기 이벤트가 없으면 사실상 즉시
         # 반환되어 그 경로 성능에 미치는 영향은 미미하다.
+        # [2026-10 병역 시스템 7단계] 시즌 전환 뒤 병역 안내: 강제 입대 알림(X로 닫아도 이미
+        # 입대 처리됨), 그리고 미필 20세 이상이면 새 시즌마다 입대 여부를 묻는다(오퍼 0건이어도).
+        try:
+            from game_engine import pop_military_notices, reserve_my_player_enlistment
+            from PyQt6.QtWidgets import QMessageBox
+            for _kind, _payload in pop_military_notices():
+                if _kind == "forced":
+                    QMessageBox.information(self, "🪖 강제 입대", _payload)
+                elif _kind == "retire":
+                    # [2026-10] 복무 중 예약한 은퇴 — 제대 처리 뒤 은퇴 창으로(확인 창 생략)
+                    QMessageBox.information(self, "🏁 은퇴", _payload)
+                    self.center_panel._open_retire_window()
+                elif _kind == "toast":
+                    from ui.center_panel import show_toast
+                    show_toast(self, _payload, color="#556b2f", duration=1000)
+                elif _kind == "choice":
+                    _box = QMessageBox(self)
+                    _box.setWindowTitle("🪖 입대 안내")
+                    _box.setText("이번 시즌이 끝나면 입대할 수 있습니다. 입대할 부대를 고르세요.\n"
+                                 "(복무 2년 · 연봉 0원 · 31세가 되는 해에는 강제 입대)")
+                    _btns = {}
+                    for _t in _payload:
+                        _b = _box.addButton(f"🪖 {_t['team_name']} ({'1부' if _t.get('tier') == 1 else '2부'})",
+                                            QMessageBox.ButtonRole.AcceptRole)
+                        _btns[_b] = _t["team_id"]
+                    _box.addButton("이번엔 안 감", QMessageBox.ButtonRole.RejectRole)
+                    _box.exec()
+                    _sel = _btns.get(_box.clickedButton())
+                    if _sel:
+                        reserve_my_player_enlistment(_sel)
+        except Exception:
+            pass
         from PyQt6.QtWidgets import QApplication
         import time as _time_dbg
         _t0 = _time_dbg.perf_counter()

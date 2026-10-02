@@ -6,6 +6,7 @@ import contextlib as _contextlib
 import gc as _gc
 from data.countries import COUNTRY_DATA
 from data.leagues import LEAGUE_DATA
+from military_service import military_migrations, invalidate_military_cache, military_enabled   # [2026-10] 병역 시스템 1단계(컬럼 정의·군팀 판정 캐시)
 from data.names import NAME_DATA
 # [버그수정 2026-07] OVR_RANGES가 database.py와 constants.py에 각각 따로
 # 정의돼 있었고 값도 서로 어긋나 있었다(예: S등급 tier1이 database=88~95,
@@ -1214,8 +1215,9 @@ def _migrate_managers():
                 attack = "BALANCED"
             # 내 팀이면 기존 my_player.manager_type을 승계.
             mtype = my_mtype if (tid == my_tid and my_mtype in MANAGER_TYPE_LIST) else None
+            # [2026-10] 군팀 감독은 국적을 "군대"가 아니라 대한민국으로.
             mgr_rows.append(build_manager_row(
-                rng, r["country"], year, style_attack=attack, manager_type=mtype))
+                rng, _mil_mgr_nat(r["country"]), year, style_attack=attack, manager_type=mtype))
             # [2026-09 — ③-b] 계약·경력 초기값. 계약 만료 연도를 흩어두지
             # 않으면 첫 시즌 전환에 **전원이 동시에 계약 만료**가 되어 감독
             # 시장이 한 해에 통째로 뒤집힌다.
@@ -1350,6 +1352,11 @@ def assign_manager_codes(c, only_blank=True) -> int:
     if ups:
         c.executemany("UPDATE managers SET name=? WHERE id=?", ups)
     return len(ups)
+
+
+def _mil_mgr_nat(country):
+    from military_service import manager_nationality_for
+    return manager_nationality_for(country)
 
 
 MANAGER_INSERT_SQL = """INSERT INTO managers(name, nationality, birth_year, retired,
@@ -1565,6 +1572,7 @@ def load_from_disk() -> bool:
     이 경우 init_db()가 빈 인메모리 DB에 새 스키마를 만든다.
     디스크 직결 모드(USE_MEMORY_DB=False)에서는 항상 False(불필요)."""
     invalidate_intl_apps_cache()   # [2026-09] intl_squad 합계 캐시(새 DB/초기화 시 반드시 버린다)
+    invalidate_military_cache()    # [2026-10] 군팀 id 캐시(team_id가 새 판에서 재사용되므로 반드시 버린다)
     if not USE_MEMORY_DB or not os.path.exists(DB_PATH):
         return False
     _ensure_mem_anchor()
@@ -3472,6 +3480,12 @@ def init_db():
         # ai_players에 없으면(이미 은퇴) ai_players_retired에서 같은 컬럼을
         # 폴백 조회하는데, 이 테이블엔 애초에 이 컬럼 자체가 없었다.
         "ALTER TABLE ai_players_retired ADD COLUMN created_year INTEGER DEFAULT 0",
+        # [2026-10 신설, 신민용 요청: "은퇴 선수는 좌측에 최고점 OVR로" / "은퇴하면 한국
+        # 선수 면제·군필이 안 뜬다"] 은퇴 순간 ai_players 행이 지워지면서 전성기 OVR과
+        # 병역 상태가 같이 사라졌다 — 아카이브 시점에 두 값을 같이 남긴다
+        # (fill_retired_extra_fields 참고, 기존 은퇴자는 _migrate_backfill_retired_peak_military).
+        "ALTER TABLE ai_players_retired ADD COLUMN peak_ovr INTEGER DEFAULT 0",
+        "ALTER TABLE ai_players_retired ADD COLUMN military_status TEXT DEFAULT ''",
         # [세부역할 2026-07] AI 선수도 세부역할(SUB_ROLES)을 갖도록 컬럼 추가.
         #  기존엔 이 컬럼 자체가 없어서 sub_role은 내 선수(my_player)에만
         #  있었다 — 세부역할별 매치 가중치(_SUB_ROLE_MATCH_MOD)를 AI 시즌
@@ -4310,7 +4324,9 @@ def init_db():
     # 파일 상단 주석 참고. lower_cup_matches도 이 목록에 포함된다(CREATE만
     # competition/lower_cup_engine.py에 있고, 그 표는 이 루프보다 먼저
     # init_lower_cup_tables로 만들어져 있어 ALTER가 정상 적용된다).
-    ] + et_score_migrations():
+    # [2026-10 신설] 병역 시스템 컬럼(ai_players 6개 + my_player 8개). 정의는
+    # military_service.MILITARY_*_COLS 한 곳에만 있다.
+    ] + et_score_migrations() + military_migrations():
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,
         #  그 외 진짜 버그로 인한 예외는 숨기지 않는다. 동작은 기존과 동일.)
@@ -4512,6 +4528,11 @@ def init_db():
         # 은퇴 선수 검색(search_retired_ai_players)도 같은 형태로
         # "ORDER BY r.ovr DESC, r.id LIMIT ?"로 끝나므로 같은 인덱스를 준다.
         "CREATE INDEX IF NOT EXISTS idx_ai_players_retired_ovr_id ON ai_players_retired(ovr DESC, id)",
+        # [2026-10] 은퇴 선수 목록은 최고 OVR(peak_ovr) 순 — 위와 같은 이유로 id까지.
+        "CREATE INDEX IF NOT EXISTS idx_ai_players_retired_peak_id ON ai_players_retired(peak_ovr DESC, id)",
+        # [2026-10 성능] 선수 검색의 "LEFT JOIN countries nc ON nc.name = p.nationality"가
+        # 은퇴/국가대표 조합에서 행마다 국가 표를 훑었다(자동 인덱스를 못 만드는 계획일 때).
+        "CREATE INDEX IF NOT EXISTS idx_countries_name ON countries(name)",
         # [2026-09 신설, 성능 감사 5위] career_years 필터용. 이 필터를 단독
         # 으로 걸었을 때 전수 스캔 대신 범위 스캔으로 끝나게 한다.
         "CREATE INDEX IF NOT EXISTS idx_ai_players_career_years ON ai_players(career_years)",
@@ -4800,6 +4821,9 @@ def init_db():
     _migrate_phantom_career_entries()   # 유령 재직기록(길이0·0경기) 정리 (1회성, 아래 참고)
     _migrate_orphaned_ai_players()   # 이름 지어놓고 통째로 사라진 고아 ai_players 복구 (1회성, 아래 참고)
     compact_existing_match_archive()   # 기존 세이브 match_results_archive 요약+정리 (1회성, 아래 참고)
+    _migrate_ensure_military_world()   # [2026-10] 병역 시스템: 기존 세이브에 군데스리가 국가·리그·팀 추가 (기능 켜졌을 때만)
+    _migrate_fix_military_log_years()  # [2026-10] 1년 밀려 적힌 군 이동 기록(입대/제대/진급/강등) 1회 보정
+    _migrate_backfill_retired_peak_military()  # [2026-10] 기존 은퇴자 최고 OVR·병역 상태 1회 백필
     # [2026-08 신설] init_db()는 QA/AB테스트 스크립트 등이 DB_PATH를 바꿔가며
     # 같은 프로세스 안에서 여러 번 호출하기도 한다 — 그때마다 get_state()
     # 캐시가 이전 DB의 season_state를 그대로 들고 있으면 안 되므로 비운다.
@@ -6147,6 +6171,73 @@ def _migrate_orphaned_ai_players():
         print(f"[MIGRATE] 고아 ai_players 복구 건너뜀: {e}")
 
 
+def fill_retired_extra_fields(c, ids):
+    """[2026-10 신설] ai_players_retired에 방금 넣은 은퇴자들의 최고 OVR(peak_ovr)과 병역
+    상태(military_status)를 채운다. 반드시 ai_players에서 지우기 *전에* 불러야 한다.
+    최고 OVR = max(은퇴 시 OVR, ai_players.peak_ovr). peak_ovr은 노화가 시작되는
+    시즌(29→30)에 그때 OVR로 확정되고 그 뒤로는 떨어지기만 하며, 그 전에 은퇴하는
+    선수는 아직 성장 구간이라 현재 OVR이 곧 최고점이다.
+    [2026-10 성능 수정, 신민용 리포트: "50년 세이브가 켜다가 멈춘다"] 처음엔 시즌별 OVR
+    기록(hist)까지 선수별로 조회했는데, 그 표는 PK가 (year, player_id)로 재구축돼 있어
+    선수 단위 조회가 연도 수만큼 느려진다 — 위 두 값만으로 충분하므로 hist는 안 본다."""
+    ids = [i for i in ids if i]
+    for i in range(0, len(ids), 500):
+        part = ids[i:i + 500]
+        ph = ",".join("?" * len(part))
+        upd = [(max(ovr or 0, peak or 0), mst, pid) for pid, ovr, peak, mst in c.execute(
+            f"SELECT id, ovr, COALESCE(peak_ovr,0), COALESCE(military_status,'') FROM ai_players "
+            f"WHERE id IN ({ph})", part).fetchall()]
+        if upd:
+            c.executemany("UPDATE ai_players_retired SET peak_ovr=?, military_status=? WHERE id=?", upd)
+
+
+def _migrate_backfill_retired_peak_military():
+    """[2026-10 1회성] 이 기능 이전에 은퇴한 선수: 최고 OVR = max(은퇴 시 OVR, 시즌별 OVR
+    기록 최댓값). 병역은 한국 국적만 — 제대 기록이 있으면 군필, 없으면 비워둔다(화면에서
+    은퇴 나이로 추정: 31세+ 군필, 그 외 미필. 면제 여부는 기록이 없어 알 수 없음).
+    [2026-10 성능 수정, 신민용 리포트: "50년 세이브가 켜다가 멈춘다"] 처음 버전은 은퇴자
+    한 명마다 hist를 선수 단위로 조회했다 — hist PK가 (year, player_id)라 50년 세이브(은퇴자
+    100만+)에선 사실상 멈춘 것처럼 보였다(합성 50년 130만 명: 약 75초, 통계 없으면 그 이상).
+    이제 hist를 한 번만 훑어 선수별 최댓값을 만든 뒤 한 번에 갱신한다(같은 합성 세이브 8초)."""
+    import time as _t
+    conn = get_conn(); c = conn.cursor()
+    try:
+        if c.execute("SELECT value FROM meta WHERE key='retired_peak_military_v1'").fetchone():
+            return
+        _t0 = _t.perf_counter()
+        print("[MIGRATE] 은퇴 선수 최고 OVR·병역 기록 채우는 중(최초 1회)...", flush=True)
+        try:
+            c.execute("UPDATE ai_players_retired SET peak_ovr = MAX(COALESCE(ai_players_retired.ovr,0), h.m) "
+                      "FROM (SELECT player_id, MAX(ovr) AS m FROM hist.ai_player_ovr_history GROUP BY player_id) AS h "
+                      "WHERE h.player_id = ai_players_retired.id AND COALESCE(ai_players_retired.peak_ovr,0)=0")
+        except sqlite3.OperationalError:
+            # UPDATE ... FROM이 없는 옛 SQLite(3.33 미만) — 파이썬으로 한 번 훑는다(같은 결과).
+            best = {}
+            for pid, o in c.execute("SELECT player_id, ovr FROM hist.ai_player_ovr_history"):
+                if o is not None and o > best.get(pid, 0):
+                    best[pid] = o
+            todo = [r[0] for r in c.execute("SELECT id FROM ai_players_retired WHERE COALESCE(peak_ovr,0)=0")]
+            c.executemany("UPDATE ai_players_retired SET peak_ovr=MAX(COALESCE(ovr,0),?) WHERE id=?",
+                          [(best.get(p, 0), p) for p in todo])
+        c.execute("UPDATE ai_players_retired SET peak_ovr=COALESCE(ovr,0) WHERE COALESCE(peak_ovr,0)=0")
+        try:
+            from constants import MILITARY_TARGET_NATIONALITY as _K, MILITARY_STATUS_SERVED as _SV
+            for tbl in ("ai_transfer_log", "ai_transfer_log_archive"):
+                try:
+                    c.execute(f"UPDATE ai_players_retired SET military_status=? WHERE nationality=? AND "
+                              f"COALESCE(military_status,'')='' AND id IN (SELECT player_id FROM {tbl} "
+                              f"WHERE transfer_type='제대')", (_SV, _K))
+                except sqlite3.OperationalError:
+                    pass
+        except Exception:
+            pass
+        c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('retired_peak_military_v1','1')")
+        conn.commit()
+        print(f"[MIGRATE] 은퇴 선수 최고 OVR·병역 기록 완료 {_t.perf_counter() - _t0:.1f}s", flush=True)
+    except sqlite3.OperationalError as e:
+        print(f"[MIGRATE] 은퇴자 최고 OVR·병역 백필 건너뜀: {e}")
+
+
 def repair_cwc_match_groups():
     """[2026-07 버그 수정, 신민용 리포트: "클럽월드컵 경기 일정 여니
     'no such column: grp' 에러"] cwc_matches 테이블에 애초에 grp 컬럼이
@@ -6568,6 +6659,7 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
     "새 게임"→"생성"/"랜덤 생성"을 눌러 reset_game_data()가 (skip 없이)
     다시 호출되는 시점에 진행률 창과 함께 정식으로 일어난다."""
     invalidate_intl_apps_cache()   # [2026-09] intl_squad 합계 캐시(새 DB/초기화 시 반드시 버린다)
+    invalidate_military_cache()    # [2026-10] 군팀 id 캐시(team_id가 새 판에서 재사용되므로 반드시 버린다)
     _clear_world_browser_caches()   # [2026-09] 이전 판 팀 기록 캐시 제거
     # [2026-09 신설, 신민용 리포트: "새 선수 생성할 때 이렇게 멈추는데?"]
     # 새 게임(세계 생성) 경로는 단계가 10개가 넘는데 여태 구간 계측이
@@ -6622,7 +6714,8 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
     # 목록에서 빠져 있었다 — 그래서 이전 캐릭터의 과거 부상 이력이 새로
     # 시작한 캐릭터의 player_id=1과 그대로 매칭돼 커리어/은퇴 창에 이전
     # 플레이의 부상 기록이 섞여 나왔다.
-    for t in ["my_player","injury_history","career_entries","promotion_log","trophy_log","awards",
+    for t in ["military_po",   # [2026-10] 군데스리가 승강 플레이오프 기록
+              "my_player","injury_history","career_entries","promotion_log","trophy_log","awards",
               "nat_retirement_log",
               "game_log","match_results","match_results_archive","match_details",
               "season_state","qual_results","offer_refused",
@@ -6850,6 +6943,9 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
     # 국가 검색창 밑 "최근 검색" 버튼에 이전 판에서 찾아봤던 항목이
     # 그대로 남아있었다.
     c.execute("DELETE FROM meta WHERE key LIKE 'recent_search_%'")
+    # [2026-10 버그수정] 내 선수 입대 예약 키는 판(세이브)마다 달라야 한다 — 새 게임에 남으면
+    # 17세 선수가 시즌 끝에 입대해버렸다(신민용 리포트).
+    c.execute("DELETE FROM meta WHERE key='my_military_reserved_team'")
     _rst_mark("표 비우기(DELETE)")
     c.execute("UPDATE teams SET wins=0,draws=0,losses=0,goals_for=0,goals_against=0")
     # [2026-09 버그수정, 위 삭제 목록 주석과 같은 조사] 팀의 "흐름" 컬럼
@@ -6871,6 +6967,15 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
     _rst_mark("선수단 재생성" + (" (건너뜀)" if skip_ai_regen else ""))
     _reset_formations_from_seed(c)
     _reset_club_strength(c)
+    # [2026-10 병역 시스템 3단계] 월드를 평소대로 다 만든 뒤 "이미 군데스리가가
+    # 돌아가고 있던 세계"로 초기 입대를 한 번 돌린다(기능 켜졌을 때만). 감독
+    # 재생성(_migrate_managers)보다 앞이어야 군팀도 감독을 받는다 — 군팀 자체는
+    # 이미 있으므로 순서상 문제는 없고, 선수 이동만 여기서 끝내 둔다.
+    if military_enabled() and not skip_ai_regen:
+        from military_service import run_initial_enlistment
+        run_initial_enlistment(c, get_game_start_year())
+        c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('military_init_year', ?)", (str(get_game_start_year()),))
+        c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('military_log_year_v2', '1')")   # 새 게임은 고친 규약으로 기록됨
     conn.commit()
     _rst_mark("포메이션/클럽전력 + commit")
     # [2026-09 신설 — 감독 시스템] 감독을 새 월드 기준으로 다시 만든다.
@@ -7104,9 +7209,26 @@ def set_ai_player_nationality(player_id: int, nationality: str, conn=None) -> bo
         # 먼저 막고 안내하지만, 다른 호출 경로가 생겨도 뚫리지 않게 여기서도 막는다.
         if get_ai_player_intl_caps(player_id, conn):
             return False
+        # [2026-10 병역 시스템, 신민용 확정] 한국→타국은 미필만 가능(복무중·군필·면제 불가),
+        # 바꾸면 "미필 이탈" 표시를 남긴다. 타국→한국은 귀화가 아니라 "원래 한국인" 취급:
+        # 30세 이하 미필, 31세 이상 군필 — 단 미필 이탈 표시가 있으면 미필(다음 새해 강제 입대).
+        from constants import MILITARY_TARGET_NATIONALITY as _MK, MILITARY_FORCED_AGE as _MFA
+        _m = conn.execute("SELECT nationality, age, military_status, military_left_unserved "
+                          "FROM ai_players WHERE id=?", (player_id,)).fetchone()
+        _mil_upd = None
+        if _m and _m[0] == _MK and nationality != _MK:
+            if (_m[2] or "") in ("serving", "served", "exempt"):
+                return False
+            _mil_upd = ("", 0, 1)
+        elif _m and _m[0] != _MK and nationality == _MK:
+            _left = _m[3] or 0
+            _mil_upd = (("served" if (_m[1] or 0) >= _MFA and not _left else "unserved"), 0, _left)
         # [2026-09 수정, quota_local_country 컬럼 주석 참고] 사용자가 국적을
         # 직접 지정하면 예전 쿼터 등록 표시도 지운다 — 새 국적 기준으로
         # 다음 시즌 _enforce_foreign_quota_worldwide가 필요하면 다시 건다.
+        if _mil_upd is not None:
+            conn.execute("UPDATE ai_players SET military_status=?, military_enlist_age=?, "
+                         "military_left_unserved=? WHERE id=?", (*_mil_upd, player_id))
         conn.execute("UPDATE ai_players SET nationality=?, true_nationality=?, quota_local_country='' WHERE id=?",
                      (nationality, nationality, player_id))
         conn.commit()
@@ -7784,6 +7906,96 @@ def _insert_countries(c):
     c.executemany(
         "INSERT INTO countries(name,flag,continent,language,fifa_rank,grade) VALUES(?,?,?,?,?,?)",
         rows)
+    # [2026-10 신설] 병역 시스템이 켜져 있으면 가상 국가 "군대"를 맨 마지막에
+    # 추가한다 — 그래야 _insert_leagues_and_teams가 LEAGUE_DATA['군대']로
+    # 군데스리가 리그·팀을 만들고, 실제 나라들의 id는 하나도 안 바뀐다.
+    if military_enabled():
+        c.execute(
+            "INSERT INTO countries(name,flag,continent,language,fifa_rank,grade) VALUES(?,?,?,?,?,?)",
+            _military_country_row())
+
+
+def _military_country_row():
+    from constants import (MILITARY_COUNTRY, MILITARY_COUNTRY_FLAG, MILITARY_COUNTRY_CONTINENT,
+                           MILITARY_COUNTRY_LANGUAGE, MILITARY_COUNTRY_FIFA_RANK)
+    return (MILITARY_COUNTRY, MILITARY_COUNTRY_FLAG, MILITARY_COUNTRY_CONTINENT,
+            MILITARY_COUNTRY_LANGUAGE, MILITARY_COUNTRY_FIFA_RANK, "")
+
+
+def _migrate_ensure_military_world():
+    """[2026-10 신설, 병역 시스템] 기능이 켜졌는데 이미 시딩된 세이브(기존
+    세이브, 또는 main.py 부트스트랩이 만든 game.db)에 "군대"가 없으면 국가·
+    리그·팀을 덧붙인다. seed_initial_data()는 seeded 표시가 있으면 바로
+    return하므로 기존 세이브는 이 경로로만 군데스리가가 생긴다. 멱등 —
+    이미 있는 국가/리그/팀은 건너뛴다. 팀 포메이션·성향은 전역 random을
+    소비하지 않도록 팀 이름 기반 고정 시드로 고른다(기존 세이브의 이후
+    난수 흐름을 이 1회성 작업이 흔들지 않게).
+    새 게임은 _insert_countries가 "군대" 행을 넣고 _insert_leagues_and_teams가
+    LEAGUE_DATA 순서대로 만들므로 여기서 할 일이 없다(seeded 없음 → return).
+    기능이 꺼져 있으면 아무 것도 안 한다(이미 생긴 군대 데이터도 그대로 둠)."""
+    if not military_enabled():
+        return
+    from constants import MILITARY_COUNTRY
+    conn = get_conn(); c = conn.cursor()
+    try:
+        if not c.execute("SELECT value FROM meta WHERE key='seeded'").fetchone():
+            return
+        tiers = LEAGUE_DATA.get(MILITARY_COUNTRY) or {}
+        if not tiers:
+            return
+        row = c.execute("SELECT id FROM countries WHERE name=?", (MILITARY_COUNTRY,)).fetchone()
+        if row:
+            cid = row[0]
+        else:
+            c.execute("INSERT INTO countries(name,flag,continent,language,fifa_rank,grade) VALUES(?,?,?,?,?,?)",
+                      _military_country_row())
+            cid = c.execute("SELECT id FROM countries WHERE name=?", (MILITARY_COUNTRY,)).fetchone()[0]
+        changed = False
+        for tier_key, (league_name, team_names) in tiers.items():
+            tier = _tier_to_int(tier_key)
+            lr = c.execute("SELECT id FROM leagues WHERE country_id=? AND tier=?", (cid, tier)).fetchone()
+            if lr:
+                lid = lr[0]
+            else:
+                c.execute("INSERT INTO leagues(country_id,tier,name) VALUES(?,?,?)", (cid, tier, league_name))
+                lid = c.execute("SELECT id FROM leagues WHERE country_id=? AND tier=?", (cid, tier)).fetchone()[0]
+                changed = True
+            have = {r[0] for r in c.execute("SELECT name FROM teams WHERE country_id=?", (cid,)).fetchall()}
+            for team_name in team_names:
+                if team_name in have:
+                    continue
+                _rng = random.Random(f"military:{team_name}")
+                tendency = _rng.choices(TACTIC_TENDENCIES, TACTIC_TENDENCY_WEIGHTS)[0]
+                lean = TACTIC_TENDENCY_LEAN[tendency]
+                _f_names = list(FORMATIONS)
+                _f_weights = [max(0.05, 1.5 - abs(lean - FORMATION_STYLE[f])) for f in _f_names]
+                formation = _rng.choices(_f_names, _f_weights)[0]
+                c.execute("""INSERT INTO teams(league_id,country_id,name,formation,current_tier,tactic_tendency)
+                             VALUES(?,?,?,?,?,?)""", (lid, cid, team_name, formation, tier, tendency))
+                tid = c.execute("SELECT MAX(id) FROM teams").fetchone()[0]
+                c.execute("INSERT OR REPLACE INTO team_formation_seed(team_id, formation) VALUES(?,?)",
+                          (tid, formation))
+                changed = True
+        if changed or not row:
+            conn.commit()
+            invalidate_military_cache()
+    finally:
+        conn.close()
+
+
+def _migrate_fix_military_log_years():
+    """[2026-10] military_service.fix_military_log_years를 1회 적용(meta로 멱등)."""
+    conn = get_conn()
+    try:
+        from military_service import fix_military_log_years
+        n = fix_military_log_years(conn)
+        conn.commit()
+        if n:
+            print(f"[MIGRATE] 군 이동 기록 연도 보정 {n}건 (1년 앞으로)")
+    except Exception as _e:
+        print(f"[MIGRATE] 군 이동 기록 연도 보정 실패(계속 진행): {_e}")
+    finally:
+        conn.close()
 
 
 def sync_countries():
@@ -8165,7 +8377,7 @@ def get_country_avg_squad_ovr(country, positions=None, min_count=8, top_n=3):
                 f"""SELECT ap.id, ap.ovr
                     FROM ai_players ap JOIN teams t ON ap.team_id=t.id
                     JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
-                    WHERE {where_sql} AND ap.position=? AND ap.id NOT IN ({ph})
+                    WHERE {where_sql} AND ap.position=? AND ap.id NOT IN ({ph}){_mil_excl_sql(conn)}
                     ORDER BY {order_by} LIMIT ?""",
                 (*params, pos, top_n)).fetchall()
             if rows:
@@ -8234,13 +8446,32 @@ def get_country_best_xi_ovr(country, n=11, min_count=8):
     conn = get_conn()
     rows = conn.execute(
         """SELECT ovr FROM ai_players
-           WHERE true_nationality=? AND ovr IS NOT NULL
+           WHERE true_nationality=? AND ovr IS NOT NULL"""
+        + _mil_excl_team_sql(conn) +   # [2026-10] 군인(복무 중)은 국대 OVR에서도 제외 — 군대 없으면 문자열 동일
+        """
            ORDER BY ovr DESC LIMIT ?""", (country, n)).fetchall()
     conn.close()
     vals = [r["ovr"] for r in rows]
     if len(vals) < min_count:
         return None
     return sum(vals) / len(vals)
+
+
+def _mil_excl_team_sql(conn, col="team_id") -> str:
+    """[2026-10 병역 시스템] teams 조인이 없는 ai_players 쿼리용 "군팀 소속 제외" 조건.
+    군대가 월드에 없으면 빈 문자열(쿼리 문자열 원본과 동일)."""
+    from military_service import get_military_team_ids
+    _t = get_military_team_ids(conn)
+    return (f" AND COALESCE({col},0) NOT IN ({','.join(str(x) for x in sorted(_t))})") if _t else ""
+
+
+def _mil_excl_sql(conn) -> str:
+    """[2026-10 병역 시스템] 국대 선발 쿼리에 붙이는 "군팀 소속(복무 중) 제외" 조건.
+    군대가 월드에 없으면 빈 문자열 — 쿼리 문자열이 원본과 완전히 같아서
+    실행계획·결과가 하나도 안 바뀐다. 군인은 국가대표에 뽑히지 않는다(확정)."""
+    from military_service import get_military_country_id
+    _cid = get_military_country_id(conn)
+    return f" AND t.country_id != {int(_cid)}" if _cid else ""
 
 
 def get_country_squad_players(country, positions=None, min_count=8, target_ovr=None):
@@ -8368,7 +8599,7 @@ def get_country_squad_players(country, positions=None, min_count=8, target_ovr=N
                                t.name AS club, t.current_tier AS club_tier, cn.name AS club_country
                         FROM ai_players ap JOIN teams t ON ap.team_id=t.id
                         JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
-                        WHERE {where_sql} AND {pos_sql} AND ap.id NOT IN ({ph}){cap_sql}
+                        WHERE {where_sql} AND {pos_sql} AND ap.id NOT IN ({ph}){cap_sql}{_mil_excl_sql(conn)}
                         ORDER BY {order_by} LIMIT 1""",
                     (*params, *pos_params, *cap_params, *order_params)).fetchone()
             except sqlite3.OperationalError:
@@ -8381,7 +8612,7 @@ def get_country_squad_players(country, positions=None, min_count=8, target_ovr=N
                                t.name AS club, t.current_tier AS club_tier, cn.name AS club_country
                         FROM ai_players ap JOIN teams t ON ap.team_id=t.id
                         JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
-                        WHERE {where_sql} AND {pos_sql} AND ap.id NOT IN ({ph}){cap_sql}
+                        WHERE {where_sql} AND {pos_sql} AND ap.id NOT IN ({ph}){cap_sql}{_mil_excl_sql(conn)}
                         ORDER BY {_fallback_order} LIMIT 1""",
                     (*params, *pos_params, *cap_params, *order_params)).fetchone()
             if row:
@@ -8498,6 +8729,8 @@ def get_country_nationals_for_positions(country, positions):
             JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
             WHERE ap.true_nationality=? AND ap.position IN ({pos_ph})""",
         (country,)).fetchall()
+    from military_service import drop_military_countries   # [2026-10] 복무 중인 선수는 국대 제외
+    rows = drop_military_countries(rows, "club_country")
     conn.close()
     return [dict(r) for r in rows]
 
@@ -8532,6 +8765,9 @@ def get_country_nationals_by_position(country):
             JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
             WHERE ap.true_nationality=?""",
         (country,)).fetchall()
+    # [2026-10 병역 시스템] 복무 중(군팀 소속)인 선수는 국가대표에 안 뽑힌다.
+    from military_service import drop_military_countries
+    rows = drop_military_countries(rows, "club_country")
     conn.close()
     out: dict = {}
     for r in rows:
@@ -10303,6 +10539,10 @@ def _generate_all_ai_players(c, progress_cb=None):
                  JOIN countries cn ON l.country_id=cn.id
                  ORDER BY t.league_id, t.id""")
     rows = [dict(r) for r in c.fetchall()]
+    # [2026-10 병역 시스템] 군팀은 선수를 생성하지 않는다 — 군팀 선수는 입대한
+    # 한국 선수뿐(보충 생성 금지 원칙과 동일). 군대가 없으면 rows 그대로.
+    from military_service import drop_military_teams as _drop_mil_teams
+    rows = _drop_mil_teams(c, rows, "tid")
 
     # 리그별 그룹핑
     leagues: dict = {}

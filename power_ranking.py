@@ -59,6 +59,11 @@ from dataclasses import dataclass
 from typing import Optional
 
 from database import get_conn, get_game_start_year
+# [2026-10 병역 시스템 2단계] 군데스리가는 팀·리그·국가 파워랭킹에 전혀 반영하지 않는다.
+from military_service import (is_military_team as _is_mil_team, is_military_league as _is_mil_league,
+                              is_military_country as _is_mil_country, drop_military_teams as _drop_mil_teams,
+                              drop_military_leagues as _drop_mil_leagues,
+                              drop_military_countries as _drop_mil_countries)
 from constants import (
     REGION_CUP_NAME, REGION_TO_CONTINENT, CONFEDERATIONS,
     CONTINENT_TO_CONF, CONF_CUP_NAME, EURO_NAME,
@@ -1013,12 +1018,16 @@ def _set_team_streak(conn, team_id: int, streak: int):
     """update_team_b_for_year가 이번 시즌 판정을 끝낸 뒤 1회 호출 —
     team_power_rating 행은 이 시점엔 이미 레이어A(update_team_ratings_
     for_year)에서 그 팀의 a_rating이 갱신되며 존재가 보장된다."""
+    if _is_mil_team(conn, team_id):   # [2026-10] 군팀은 파워랭킹 제외
+        return
     conn.execute("UPDATE team_power_rating SET underperform_streak=? WHERE team_id=?",
                  (streak, team_id))
     _team_streak_cache[team_id] = streak
 
 
 def _add_team_a(conn, team_id: int, delta: float, year: int, source: str = ""):
+    if _is_mil_team(conn, team_id):   # [2026-10] 군팀은 파워랭킹 제외
+        return
     a, b = _get_team_ab(conn, team_id)
     conn.execute("""INSERT INTO team_power_rating(team_id, a_rating, b_rating, last_updated_year)
                      VALUES(?,?,?,?)
@@ -1030,6 +1039,8 @@ def _add_team_a(conn, team_id: int, delta: float, year: int, source: str = ""):
 
 
 def _add_team_b(conn, team_id: int, delta: float, year: int, source: str = ""):
+    if _is_mil_team(conn, team_id):   # [2026-10] 군팀은 파워랭킹 제외
+        return
     a, b = _get_team_ab(conn, team_id)
     conn.execute("""INSERT INTO team_power_rating(team_id, a_rating, b_rating, last_updated_year)
                      VALUES(?,?,?,?)
@@ -1074,12 +1085,16 @@ def _get_country_streak(conn, country: str) -> int:
 
 
 def _set_country_streak(conn, country: str, streak: int):
+    if _is_mil_country(country):   # [2026-10] 군대는 국가 파워랭킹 제외
+        return
     conn.execute("UPDATE country_power_rating SET underperform_streak=? WHERE country=?",
                  (streak, country))
     _country_streak_cache[country] = streak
 
 
 def _add_country_a(conn, country: str, delta: float, year: int):
+    if _is_mil_country(country):   # [2026-10] 군대는 국가 파워랭킹 제외
+        return
     a, b = _get_country_ab(conn, country)
     conn.execute("""INSERT INTO country_power_rating(country, a_rating, b_rating, last_updated_year)
                      VALUES(?,?,?,?)
@@ -1094,6 +1109,8 @@ def _add_country_b(conn, country: str, delta: float, year: int):
     (예선탈락 페널티(QUALIFIER_FAIL_BASE_PENALTY)가 그 해 b_rating을
     일시적으로 마이너스로 만들 수는 있게 두고, 0 바닥은 다음 해
     apply_country_season_regression의 _decay_b가 처리)."""
+    if _is_mil_country(country):   # [2026-10] 군대는 국가 파워랭킹 제외
+        return
     from constants import COUNTRY_B_MAX
     a, b = _get_country_ab(conn, country)
     new_b = min(COUNTRY_B_MAX, b + delta)
@@ -1130,6 +1147,7 @@ def compute_league_power(conn, year: int) -> dict:
     league_id → 리그등급보정 값을 돌려주고 league_power에 캐시한다.
     "같은 부(tier)끼리만" 기준평균을 비교한다(1부는 1부끼리)."""
     leagues = conn.execute("SELECT id, tier FROM leagues").fetchall()
+    leagues = _drop_mil_leagues(conn, leagues)   # [2026-10] 군 리그는 리그 파워 계산 제외
     if not leagues:
         return {}
     # ① 리그별 OVR지표
@@ -1608,6 +1626,8 @@ def _deepest_stage_participants(conn, matches_table: str, tournament_id: int, us
 
 def _apply_team_league_streak(conn, league_id: int, champion_team_id: int) -> float:
     """3.7 — 리그 우승 연속 감쇠율을 돌려주고 카운터를 갱신한다."""
+    if _is_mil_league(conn, league_id):   # [2026-10] 군 리그는 연속우승 감쇠 대상 아님
+        return 1.0
     row = conn.execute(
         "SELECT winner_team_id, streak FROM team_league_streak WHERE league_id=?",
         (league_id,)).fetchone()
@@ -2029,6 +2049,7 @@ def _decay_b(b: float, decay_rate: float) -> float:
 def apply_team_season_regression(conn, evaluation_year: int, league_power_cache: dict):
     from constants import CLUB_B_DECAY_RATE
     teams = conn.execute("SELECT id FROM teams").fetchall()
+    teams = _drop_mil_teams(conn, teams)   # [2026-10] 군팀 제외
     for (team_id,) in teams:
         a, b = _get_team_ab(conn, team_id)
         ps = a + b
@@ -2070,6 +2091,7 @@ def _country_last_intl_year(conn, country: str, upto_year: int) -> Optional[int]
 def apply_country_season_regression(conn, evaluation_year: int):
     from constants import COUNTRY_B_DECAY_RATE
     countries = conn.execute("SELECT name FROM countries").fetchall()
+    countries = _drop_mil_countries(countries)   # [2026-10] 군대 제외
     for (country,) in countries:
         a, b = _get_country_ab(conn, country)
         seed_ps, _ = _seed_country_ab(conn, country)
@@ -2110,6 +2132,7 @@ def compute_team_power_rankings(conn, evaluation_year: int) -> list:
     teams = conn.execute(
         """SELECT t.id, t.name, c.continent, c.name
            FROM teams t JOIN countries c ON t.country_id = c.id""").fetchall()
+    teams = _drop_mil_teams(conn, teams)   # [2026-10] 군팀 제외
     entries = []
     for team_id, team_name, continent, country in teams:
         rating = _get_team_rating(conn, team_id)
@@ -2149,6 +2172,7 @@ def compute_country_power_rankings(conn, evaluation_year: int) -> list:
     ranking_year = evaluation_year + 1
     ensure_power_ranking_tables(conn)
     countries = conn.execute("SELECT name, continent FROM countries").fetchall()
+    countries = _drop_mil_countries(countries)   # [2026-10] 군대 제외
     entries = []
     for country, continent in countries:
         rating = _get_country_rating(conn, country)
@@ -2266,6 +2290,7 @@ def run_year_end_power_ranking_update(conn, evaluation_year: int):
 def _country_seed_entries(conn) -> list:
     _gsy = get_game_start_year()
     countries = conn.execute("SELECT name, continent FROM countries").fetchall()
+    countries = _drop_mil_countries(countries)   # [2026-10] 군대 제외
     entries = []
     for name, continent in countries:
         ps, _ = _seed_country_ab(conn, name)
@@ -2318,6 +2343,7 @@ def _team_seed_entries(conn) -> list:
     rows = conn.execute(
         """SELECT t.id, t.name, cn.continent, cn.name, t.current_tier
            FROM teams t JOIN countries cn ON t.country_id = cn.id""").fetchall()
+    rows = _drop_mil_teams(conn, rows)   # [2026-10] 군팀 제외
     entries = []
     for team_id, name, continent, country, tier in rows:
         ps, _ = _team_seed_ab(conn, team_id, league_power_cache)

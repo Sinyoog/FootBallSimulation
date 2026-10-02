@@ -428,6 +428,11 @@ def get_my_tournament(year=None, qual=None, kinds=None):
       2) my_selected==3 (선택 대기) 대회
       3) 그 외 — 표시용 대표 대회
     """
+    # [2026-10 병역 시스템, 신민용 리포트: "군대에 있는데 동아시안컵 발탁이 뜬다"] 복무 중이면
+    # 발탁 창/출전 대회를 절대 내주지 않는다. 대회가 만들어질 때 막는 장치(_mil_block_sel)만으론
+    # 입대 전·패치 전에 이미 만들어진 발탁(1/3)이 남아 있었다 — 여기서 미선발(2)로 닫는다.
+    if _mil_close_callups():
+        return None
     from game_engine import get_state, get_player
     if year is None:
         st = get_state()
@@ -499,6 +504,39 @@ def get_my_tournament(year=None, qual=None, kinds=None):
     return None
 
 
+def _mil_close_callups():
+    """복무 중이면 아직 안 끝난 내 발탁(출전 확정 1·발탁 대기 3)을 전부 미선발(2)로 닫고 True."""
+    try:
+        from game_engine import get_player
+        _p = get_player()
+        if not _p or (_p.get("military_status") or "") != "serving":
+            return False
+        _c = get_conn()
+        try:
+            _c.execute("UPDATE intl_tournaments SET my_selected=2 WHERE my_selected IN (1,3) AND status != 'done'")
+            _c.commit()
+        finally:
+            _c.close()
+        return True
+    except Exception:
+        return False
+
+
+def _mil_block_sel(my_sel):
+    """[2026-10 병역 7단계, 신민용 확정] 복무 중이면 대회 발탁(1=출전 확정, 3=발탁 동의 대기)을
+    아예 만들지 않는다 — 예선 통과로 본선이 자동 확정되는 경로, 친선전처럼 재판정 없이
+    뽑히는 경로까지 전부 여기서 막는다. 대표팀(국적) 선택 자체는 이 값과 무관하게 그대로."""
+    if my_sel in (1, 3):
+        try:
+            from game_engine import get_player
+            _p = get_player()
+            if _p and (_p.get("military_status") or "") == "serving":
+                return 2   # 2 = 미선발(나이 탈락 등과 같은 값) — 대회 자체는 내 나라 대회로 그대로 보인다
+        except Exception:
+            pass
+    return my_sel
+
+
 def get_pending_choice():
     """[복수국적·복수대륙컵] 대표팀 선택/동의가 필요한 대회들을 하나로 묶어 반환.
 
@@ -510,6 +548,11 @@ def get_pending_choice():
     [선택 우선 원칙] 후보는 cand_nats(선발 통과국)에서 가져온다. 선택해서
     출전(choose_national_team)하면 그제서야 예선 통과/탈락이 드러나고,
     본선에 출전하면 그 나라로 영구 고정(cap-tie)된다."""
+    # [2026-10 병역 시스템, 신민용 리포트: "군대에 있는데 동아시안컵 발탁이 뜬다"] 복무 중이면
+    # 발탁 창/출전 대회를 절대 내주지 않는다. 대회가 만들어질 때 막는 장치(_mil_block_sel)만으론
+    # 입대 전·패치 전에 이미 만들어진 발탁(1/3)이 남아 있었다 — 여기서 미선발(2)로 닫는다.
+    if _mil_close_callups():
+        return None
     from game_engine import get_state, get_player
     st = get_state(); p = get_player()
     if not st or not p:
@@ -1833,7 +1876,7 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
     # kind='region'은 애초에 저 두 함수가 조회 대상으로 삼지 않아 무해함).
     c.execute("""INSERT INTO intl_tournaments(year, kind, name, status, my_selected, my_nat, cand_nats, continent)
                  VALUES(?,?,?,?,?,?,?,?)""",
-              (year, kind, name, "group", my_sel, my_nat, ",".join(cand_nats), my_continent))
+              (year, kind, name, "group", _mil_block_sel(my_sel), my_nat, ",".join(cand_nats), my_continent))
     tid = c.lastrowid
 
     # 포트 추첨: 전력순 4개 포트 → 조마다 포트별 1팀
@@ -3024,6 +3067,9 @@ def _check_selection(p, my_grade, country="", continent=""):
     자리에 나눠 뽑고 있었다 — 내 선수만 자리가 좁은 구조적 불이익이다.
     이제 내 포지션이 속한 그룹(INTL_POSITION_TO_GROUP)의 정원으로,
     그 그룹의 후보 풀·포지션 적합도 배율까지 AI와 똑같이 적용해 겨룬다."""
+    # [2026-10 병역 7단계] 군인은 국가대표에 뽑히지 않는다.
+    if p and (p.get("military_status") or "") == "serving":
+        return []
     from constants import (MIN_INTL_CALLUP_AGE, INTL_POSITION_GROUPS, INTL_GROUP_FIT,
                            INTL_SQUAD_GROUP_QUOTA, INTL_POSITION_TO_GROUP)
     if p.get("age", 0) < MIN_INTL_CALLUP_AGE:
@@ -3740,7 +3786,7 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
     conn = get_conn(); c = conn.cursor()
     c.execute("""INSERT INTO intl_tournaments(year, kind, name, status, my_selected, my_nat, cand_nats, continent)
                  VALUES(?,?,?,?,?,?,?,?)""",
-              (year, qual_kind, name, status0, my_sel, my_nat,
+              (year, qual_kind, name, status0, _mil_block_sel(my_sel), my_nat,
                ",".join(cand_nats_final), continent))
     tid = c.lastrowid
 
@@ -6971,7 +7017,7 @@ def _create_power_eval_tournament(year, band, p, my_nats):
     c = conn.cursor()
     c.execute("""INSERT INTO intl_tournaments(year, kind, name, status, my_selected, my_nat, cand_nats)
                  VALUES(?,?,?,?,?,?,?)""",
-              (year, kind, name, "group", my_sel, "", ",".join(cand_nats)))
+              (year, kind, name, "group", _mil_block_sel(my_sel), "", ",".join(cand_nats)))
     tid = c.lastrowid
 
     for idx, cname in enumerate(countries):

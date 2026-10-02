@@ -393,14 +393,21 @@ def _team_ever_player_ids(conn, team_ids):
     # 있으므로(database._prune_ai_transfer_log), 이 필터도 원본 테이블만
     # 보면 "5시즌 넘게 이 팀 소속이 없었던" 선수를 놓친다 — 두 테이블을
     # 함께 조회한다.
-    rows = conn.execute(
-        f"SELECT DISTINCT player_id FROM ai_transfer_log "
-        f"WHERE from_team_id IN ({ph}) OR to_team_id IN ({ph}) "
-        f"UNION "
-        f"SELECT DISTINCT player_id FROM ai_transfer_log_archive "
-        f"WHERE from_team_id IN ({ph}) OR to_team_id IN ({ph})",
-        team_ids + team_ids + team_ids + team_ids).fetchall()
-    return {r["player_id"] for r in rows}
+    # [2026-10 성능, 신민용 리포트: "세계 기록실 필터 쓸 때 렉"] 예전 "from IN (...) OR
+    # to IN (...)"은 인덱스가 (from_team_id, to_team_id) 하나뿐이라 to 쪽을 못 타고
+    # 보관 표를 통째로 훑었다(22시즌 세이브 1.6초). to 쪽은 "from_team_id IN (모든 팀 id
+    # + 0) AND to_team_id IN (...)"로 바꿔 같은 인덱스를 그대로 타게 한다(hist 연도 IN
+    # 목록과 같은 기법, 19ms). from이 NULL인 행도 따로 챙긴다 — 결과는 동일.
+    _all_from = "SELECT id FROM teams UNION ALL SELECT 0"
+    out = set()
+    for tbl in ("ai_transfer_log", "ai_transfer_log_archive"):
+        rows = conn.execute(
+            f"SELECT player_id FROM {tbl} WHERE from_team_id IN ({ph}) "
+            f"UNION SELECT player_id FROM {tbl} WHERE from_team_id IN ({_all_from}) AND to_team_id IN ({ph}) "
+            f"UNION SELECT player_id FROM {tbl} WHERE from_team_id IS NULL AND to_team_id IN ({ph})",
+            team_ids * 3).fetchall()
+        out.update(r["player_id"] for r in rows)
+    return out
 
 
 def _scope_team_ids(conn, country_id=None, league_id=None, team_id=None):
@@ -463,7 +470,10 @@ def search_retired_ai_players(name_query=None, continent=None, nat_country_id=No
     conn = get_conn()
 
     decoded_pid = _decode_ai_code(name_query) if name_query else None
-    q = ("SELECT r.id as player_id, r.name, r.position, r.ovr, r.age, "
+    # [2026-10 신민용 요청: "은퇴한 선수 OVR은 좌측에 최고점 OVR로"] 목록의 OVR은 전성기
+    # OVR(peak_ovr, 없으면 은퇴 시 OVR), 정렬도 그 기준. 은퇴 시 OVR은 final_ovr로 남긴다.
+    q = ("SELECT r.id as player_id, r.name, r.position, "
+         "MAX(COALESCE(r.peak_ovr,0), COALESCE(r.ovr,0)) as ovr, r.ovr as final_ovr, r.age, "
          "r.nationality as nationality, nc.flag as nat_flag, "
          "r.last_team_id, r.last_team_name, r.retirement_year, "
          "cust.custom_name as custom_name "
@@ -583,7 +593,12 @@ def search_retired_ai_players(name_query=None, continent=None, nat_country_id=No
             else:
                 q += f" AND r.last_team_id IN ({ph})"; params += list(_scope_ids)
     # [2026-08] 위 search_ai_players와 같은 이유로 동점자 순서를 id로 고정.
-    q += " ORDER BY r.ovr DESC, r.id LIMIT ?"
+    # [2026-10 성능] 정렬은 peak_ovr 인덱스(idx_ai_players_retired_peak_id)를 타게 컬럼
+    # 그대로 쓴다 — 은퇴 기록 시점과 최초 백필에서 peak_ovr은 항상 max(peak, ovr)로 채워진다.
+    # 단, 팀/리그/국가 범위 필터가 있으면 대상이 적어 인덱스 순회보다 바로 정렬이 빠르다
+    # (실측 401ms → 60ms) — "+r.peak_ovr"로 정렬 인덱스만 끈다(순서는 동일).
+    q += (" ORDER BY +r.peak_ovr DESC, r.id LIMIT ?" if (decoded_pid is None and _scope_ids is not None)
+          else " ORDER BY r.peak_ovr DESC, r.id LIMIT ?")
     params.append(limit)
     rows = [dict(row) for row in conn.execute(q, params).fetchall()]
     conn.close()
@@ -631,7 +646,7 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
                        status="active", limit=200, natteam=False, natteam_year=None,
                        team_id=None, team_mode="current", league_id=None, name_mode="all",
                        custom_named_only=False, min_career_years=None, max_career_years=None,
-                       foreign_only=False):
+                       foreign_only=False, team_year=None):
     """[2026-08 수정, 신민용 요청: "국가와 국적을 나눠야 한다, 대륙은
     국적과 연관되어 있게"] 대륙(continent)/국적(nat_country_id)은 이제
     선수의 실제 국적(ai_players.nationality) 기준이고, 국가(country_id)는
@@ -694,6 +709,12 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
     from constants import get_league_grade, ai_player_code
     conn = get_conn()
 
+    # [2026-10 신설] 팀 기준 경력 포함 + 연도: 그 해 그 팀 시즌 기록이 있는 선수만.
+    _ty_ids = None
+    if team_id and team_mode == "career" and team_year:
+        _ty_ids = {r[0] for r in conn.execute(
+            "SELECT DISTINCT player_id FROM ai_player_season_stats WHERE team_id=? AND year=?",
+            (team_id, team_year)).fetchall()}
     if status == "retired":
         rows = search_retired_ai_players(
             name_query=name_query, continent=continent, nat_country_id=nat_country_id,
@@ -704,6 +725,8 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
             min_career_years=min_career_years, max_career_years=max_career_years,
             foreign_only=foreign_only)
         conn.close()
+        if _ty_ids is not None:
+            rows = [r for r in rows if (r.get("id") if isinstance(r, dict) else r["id"]) in _ty_ids]
         return rows
 
     grade_country_ids = None
@@ -782,7 +805,13 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
         else:
             conn.close()
             return []
-    if country_id:
+    # [2026-10 버그수정, 신민용 리포트: "팀 기준 경력 포함이 군대에서 안 된다"]
+    # 팀을 고르면 국가→리그→팀 드롭다운이 국가·리그도 같이 넘기는데, 그 둘은
+    # "현재 소속" 조건이라 경력 포함 모드에서 과거 소속 선수(제대한 군인,
+    # 다른 리그로 떠난 선수)를 다시 잘라냈다. 경력 모드에서 팀이 정해졌으면
+    # 그 팀 자체가 범위이므로 국가/리그/부수 조건은 걸지 않는다.
+    _career_team = bool(team_id) and team_mode == "career"
+    if country_id and not _career_team:
         q += " AND cn.id=?"; params.append(country_id)
     # [2026-09 신설, 신민용 요청: "국가(소속리그) 상자에 외국인 표시
     # on/off"] 국적(p.nationality)이 지금 뛰는 리그의 국가명(cn.name)과
@@ -798,9 +827,9 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
     # 리그)/리그 필터가 아예 무시됨) 수정과 함께 여기도 맞춰 리그 자체도
     # 걸리게 한다. team_id처럼 '현재 소속' 기준(l.id=?)이며, country_id와
     # 동일하게 team_mode(경력 포함)와는 무관하다.
-    if league_id:
+    if league_id and not _career_team:
         q += " AND l.id=?"; params.append(league_id)
-    if tier:
+    if tier and not _career_team:
         q += " AND l.tier=?"; params.append(tier)
     if position:
         q += " AND p.position=?"; params.append(position)
@@ -833,16 +862,21 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
     # 선수만, "career"면 현재 소속이거나(과거) ai_transfer_log에 그
     # team_id가 한 번이라도 등장한 선수까지 포함.
     if team_id:
+        # [2026-10 성능] t.id=?로 걸면 플래너가 "OVR 순 정렬 인덱스로 26만 명 훑기"를
+        # 골랐다(팀 1개 필터에 250ms). p.team_id(인덱스 있음)로 걸고, 경력 포함이면 지금
+        # 소속 선수 id까지 합친 id 목록 하나로 PK 조회하게 한다 — 결과는 동일.
         if team_mode == "career":
-            _ever_ids = _team_ever_player_ids(conn, team_id)
-            if _ever_ids:
-                ph = ",".join("?" * len(_ever_ids))
-                q += f" AND (t.id=? OR p.id IN ({ph}))"
-                params += [team_id] + list(_ever_ids)
-            else:
-                q += " AND t.id=?"; params.append(team_id)
+            _ever_ids = set(_team_ever_player_ids(conn, team_id))
+            _ever_ids.update(r[0] for r in conn.execute(
+                "SELECT id FROM ai_players WHERE team_id=?", (team_id,)).fetchall())
+            if not _ever_ids:
+                conn.close()
+                return []
+            ph = ",".join("?" * len(_ever_ids))
+            q += f" AND p.id IN ({ph})"
+            params += list(_ever_ids)
         else:
-            q += " AND t.id=?"; params.append(team_id)
+            q += " AND p.team_id=?"; params.append(team_id)
     _nt_sql, _nt_params = _natteam_filter_sql(natteam, natteam_year)
     if _nt_sql:
         q += _nt_sql.format(alias="p"); params += _nt_params
@@ -914,7 +948,15 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
     # 선수 우선). ai_players.id는 rowid라 idx_aiplayers_ovr(ovr DESC)가
     # 이미 "OVR 내림차순 → id 오름차순" 순서로 저장돼 있어, 이 2차 기준을
     # 붙여도 인덱스만으로 정렬이 끝난다(추가 비용 0).
-    q += " ORDER BY p.ovr DESC, p.id LIMIT ?"
+    if _ty_ids is not None:
+        if not _ty_ids:
+            conn.close()
+            return []
+        q += f" AND p.id IN ({','.join(str(int(x)) for x in _ty_ids)})"
+    # [2026-10 성능] 팀 필터가 걸리면 대상이 수십 명뿐이라 OVR 순 인덱스로 26만 명을 훑는
+    # 것보다 그 수십 명을 바로 정렬하는 게 훨씬 빠르다(실측 243ms → 0ms). "+p.ovr"은
+    # 정렬 순서는 같고 SQLite가 그 인덱스를 정렬용으로 쓰지 않게만 한다.
+    q += (" ORDER BY +p.ovr DESC, p.id LIMIT ?" if team_id else " ORDER BY p.ovr DESC, p.id LIMIT ?")
     params.append(limit if not name_query else max(limit, 500))
     rows = [dict(r) for r in conn.execute(q, params).fetchall()]
     conn.close()
@@ -1120,12 +1162,12 @@ def get_ai_player_salary_history(player_id):
         "SELECT year, is_mid_season, salary, transfer_type, is_loan, fee, contract_end_year, "
         "loan_return_year "
         "FROM ai_transfer_log "
-        "WHERE player_id=? AND salary>0 "
+        "WHERE player_id=? AND (salary>0 OR transfer_type IN ('입대','진급','강등')) "
         "UNION ALL "
         "SELECT year, is_mid_season, salary, transfer_type, is_loan, fee, contract_end_year, "
         "loan_return_year "
         "FROM ai_transfer_log_archive "
-        "WHERE player_id=? AND salary>0", (player_id, player_id)).fetchall()
+        "WHERE player_id=? AND (salary>0 OR transfer_type IN ('입대','진급','강등'))", (player_id, player_id)).fetchall()
     conn.close()
     out = [(r["year"] if r["is_mid_season"] else r["year"] + 1,
             r["salary"], r["transfer_type"], bool(r["is_loan"]), r["fee"],
@@ -1506,7 +1548,13 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
             # 2011·2012 → 만료 2012 → "2년" = 2년 6개월, 신민용 정의 그대로).
             _lry = _latest[6] if len(_latest) > 6 else None
             _sign_y = _latest[0] - (0 if (len(_latest) > 7 and _latest[7]) else 1)
-            if _latest[3]:  # is_loan
+            if _latest[2] == "입대":   # [2026-10 병역] 입대는 계약 기간이 아니라 복무 2년
+                from constants import MILITARY_SERVICE_YEARS
+                e["salary_contract_years"] = MILITARY_SERVICE_YEARS
+            elif _latest[2] in ("진급", "강등"):   # 입대 때의 2년이 그대로 이어짐 → 계약 표시 없음
+                e["salary_contract_years"] = None
+                e["salary_debut_year"] = None
+            elif _latest[3]:  # is_loan
                 e["salary_contract_years"] = (_lry - _sign_y) if _lry else None
             else:
                 e["salary_contract_years"] = (_cend - _sign_y) if _cend else None
@@ -3018,6 +3066,25 @@ def get_league_champions(league_id, limit=999):
         promoted_in.sort(key=lambda x: (x["from_rank"] == 0, x["from_rank"]))
         relegated_in.sort(key=lambda x: (x["from_rank"] == 0, x["from_rank"]))
 
+        # [2026-10 병역 시스템] 군데스리가는 promotion_log가 없다(팀은 고정, 선수단만
+        # 맞교환) — 승강전에서 2부 승자가 이긴 해만 military_po로 채운다. 표시 라벨은
+        # 화면에서 "진급"으로 바뀐다.
+        try:
+            from military_service import get_military_po_rows, get_military_country_id
+            _ml = get_military_po_rows(conn, league_id, sr["year"], "promotion") or \
+                get_military_po_rows(conn, league_id, sr["year"], "relegation") or []
+            _final = next((x for x in _ml if x["stage"] == "승강 플레이오프" and not x["home_won"]), None)
+            if _final:
+                _rank = {s["name"]: k + 1 for k, s in enumerate(standings)}
+                _tier = conn.execute("SELECT tier FROM leagues WHERE id=?", (league_id,)).fetchone()[0]
+                if _tier == 1:
+                    relegated = [{"rank": _rank.get(_final["home"], n), "name": _final["home"]}]
+                    promoted_in = [{"name": _final["away"], "from_rank": 0, "from_league": "사단 군데스리가"}]
+                else:
+                    promoted = [{"rank": _rank.get(_final["away"], 0), "name": _final["away"]}]
+                    relegated_in = [{"name": _final["home"], "from_rank": 0, "from_league": "군데스리가"}]
+        except Exception:
+            pass
         out.append({
             "season": sr["season"], "year": sr["year"],
             "first":  standings[0]["name"] if n > 0 else "-",
@@ -6318,6 +6385,22 @@ def get_cwc_tournament_detail(tournament_id):
     return {"groups": groups, "league_standings": [], "knockout": knockout}
 
 def get_po_results(league_id, year, direction="relegation"):
+    # [2026-10 병역 시스템] 군데스리가는 별도 표(military_po)에서 읽는다.
+    try:
+        from military_service import get_military_po_rows
+        _mc = get_conn()
+        try:
+            _mil_rows = get_military_po_rows(_mc, league_id, year, direction)
+        finally:
+            _mc.close()
+        if _mil_rows is not None:
+            return _mil_rows
+    except Exception:
+        pass
+    return _get_po_results_regular(league_id, year, direction)
+
+
+def _get_po_results_regular(league_id, year, direction="relegation"):
     """[2026-07 신설, 확장] 이 리그가 관련된 승강 플레이오프 결과를 그 해
     기준으로 반환한다. direction으로 어느 쪽 경계를 볼지 고른다:
       - "relegation": 이 리그가 위(upper)인 경계 — 강등 플레이오프

@@ -78,6 +78,9 @@ def world_squad_percentiles(conn=None):
         conn = get_conn()
     try:
         names = [r["name"] for r in conn.execute("SELECT name FROM countries")]
+        from military_service import MILITARY_COUNTRY as _MILC   # [2026-10] 가상 국가 제외
+        if _MILC in names:
+            names = [n for n in names if n != _MILC]
     finally:
         if close:
             conn.close()
@@ -642,6 +645,9 @@ def seed_national_managers(conn=None, verbose=True):
             """SELECT c.id, c.name FROM countries c
                WHERE NOT EXISTS (SELECT 1 FROM national_team_managers n
                                  WHERE n.country_id = c.id AND n.end_year IS NULL)""")]
+        # [2026-10 병역 시스템] 가상 국가 "군대"는 대표팀이 없다 — 대표팀 감독도 없음.
+        from military_service import drop_military_countries
+        todo = drop_military_countries(todo, "name")
         if not todo:
             return 0
         salt = get_world_salt()

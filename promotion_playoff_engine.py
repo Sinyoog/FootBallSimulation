@@ -184,6 +184,15 @@ def _finalize_boundary_match(conn, t, m, year: int, p=None) -> None:
     _update_career_stats에 넘기는 get_player()는 방금 바뀐 리그를 반영한
     "최신" 상태가 반드시 필요하므로 그건 그대로 재조회한다(캐시 재사용
     금지)."""
+    # [2026-10 병역 시스템] 군데스리가 승강전은 팀이 이동하지 않는다 — 결과(po_matches)만
+    # 남기고, 실제 선수단 맞교환은 새해 처리(military_service.process_military_new_year)가
+    # 제대 → 맞교환 → 입대 순서로 한다(신민용 확정).
+    try:
+        from military_service import is_military_league
+        if is_military_league(conn, t["upper_league_id"]):
+            return
+    except Exception:
+        pass
     from game_engine import get_player, update_player, add_log, _invalidate_team_ovr_cache
     if p is None:
         p = get_player()

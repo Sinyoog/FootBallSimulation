@@ -567,6 +567,11 @@ def start_all_domestic_super_cups(year, season):
     c = conn.cursor()
     country_ids = [r["country_id"] for r in c.execute(
         "SELECT DISTINCT country_id FROM leagues WHERE tier=1").fetchall()]
+    # [2026-10 병역 시스템] 군데스리가는 국내 슈퍼컵이 없다.
+    from military_service import get_military_country_id as _mil_cid
+    _mc = _mil_cid(conn)
+    if _mc and _mc in country_ids:
+        country_ids = [x for x in country_ids if x != _mc]
     if not country_ids:
         conn.close()
         return

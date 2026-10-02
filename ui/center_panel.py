@@ -1224,6 +1224,10 @@ class CenterPanel(QWidget):
         # 항상 활성화한다. 트로피/수상 누락 위험은 여전히 존재할 수 있으니 참고.
         can_retire = True
         self.btn_retire.setEnabled(can_retire)
+        # [2026-10] 복무 중 은퇴 예약 상태를 버튼에 표시
+        self.btn_retire.setText("🚪 은퇴(예약됨)" if (p.get("military_status") == "serving"
+                                                    and int(p.get("military_retire_pending") or 0) == 1)
+                                else "🚪 은퇴")
         has_team = bool(p.get("current_team_id"))
         self.btn_standing.setEnabled(has_team)
         self.btn_schedule.setEnabled(has_team)
@@ -3791,7 +3795,14 @@ class CenterPanel(QWidget):
                 return  # 이번 구간 오퍼 없음
 
             offers = generate_offers()
-            if not offers: return
+            if not offers:
+                # [2026-10 병역 7단계] 오퍼가 0건이어도 미필 20세 이상이면 군팀 카드만 있는 창을 띄운다.
+                try:
+                    from game_engine import my_player_military_offer_teams, military_choice_week_open
+                    if not (military_choice_week_open() and my_player_military_offer_teams()):
+                        return
+                except Exception:
+                    return
 
         self._auto_offer_shown = True
         from ui.offer_window import OfferWindow
@@ -3987,6 +3998,33 @@ class CenterPanel(QWidget):
         if self.main_win: self.main_win.refresh_all()
 
     def _do_retire(self):
+        # [2026-10 병역, 신민용 확정: "복무 중 은퇴는 복무 끝날 때까지 하고 은퇴"] 복무 중엔
+        # 바로 은퇴하지 않고 "제대하면 은퇴"를 예약/취소한다.
+        try:
+            from game_engine import my_military_retire_info, set_my_military_retire_reservation
+            _mil_rt = my_military_retire_info()
+        except Exception:
+            _mil_rt = None
+        if _mil_rt is not None:
+            from PyQt6.QtWidgets import QMessageBox
+            _reserved, _end_y = _mil_rt
+            if _reserved:
+                _ans = QMessageBox.question(
+                    self, "🏁 은퇴 예약",
+                    f"은퇴가 예약돼 있습니다.\n{_end_y}년 시즌을 마치고 제대하면 은퇴합니다.\n\n"
+                    "예약을 취소할까요?")
+                if _ans == QMessageBox.StandardButton.Yes:
+                    set_my_military_retire_reservation(False)
+            else:
+                _ans = QMessageBox.question(
+                    self, "🏁 은퇴 예약",
+                    "복무 중에는 바로 은퇴할 수 없습니다.\n"
+                    f"{_end_y}년 시즌을 마치고 제대하면 바로 은퇴합니다(원소속팀으로 돌아가지 않음).\n\n"
+                    "은퇴를 예약할까요?")
+                if _ans == QMessageBox.StandardButton.Yes:
+                    set_my_military_retire_reservation(True)
+            if self.main_win: self.main_win.refresh_all()
+            return
         st = get_state()
         week = st["current_week"]
         from constants import SEASON_PHASES as _SP5
@@ -4050,22 +4088,27 @@ class CenterPanel(QWidget):
         _retire_confirm = dlg.exec()
         dlg.deleteLater()
         if _retire_confirm == QDialog.DialogCode.Accepted:
-            # [2026-08 신설, 신민용 요청: "같은 종류의 창은 하나만"]
-            if getattr(self, "_retire_win", None) is not None:
-                self._retire_win.raise_(); self._retire_win.activateWindow()
-                return
-            # 리그가 끝난 시즌의 우승·개인수상을 trophy_log/awards에 먼저 확정한 뒤
-            #   은퇴 창을 띄운다. (시즌전환 부작용 없이 성과만 기록)
-            from game_engine import finalize_season_for_retire
-            finalize_season_for_retire()
-            from ui.retire_window import RetireWindow
-            main_win = self.window()
-            self._retire_win = RetireWindow(get_player().get("language", "ko"), main_win)
+            self._open_retire_window()
 
-            def _clear_retire(*_a):
-                self._retire_win = None
-            self._retire_win.finished.connect(_clear_retire)
-            self._retire_win.show()
+    def _open_retire_window(self):
+        """은퇴 확정 후 은퇴 창을 연다. [2026-10] 복무 중 예약한 은퇴가 제대 때 실행될 때도
+        (main_window 병역 안내 "retire") 같은 경로를 쓰려고 _do_retire에서 분리했다."""
+        # [2026-08 신설, 신민용 요청: "같은 종류의 창은 하나만"]
+        if getattr(self, "_retire_win", None) is not None:
+            self._retire_win.raise_(); self._retire_win.activateWindow()
+            return
+        # 리그가 끝난 시즌의 우승·개인수상을 trophy_log/awards에 먼저 확정한 뒤
+        #   은퇴 창을 띄운다. (시즌전환 부작용 없이 성과만 기록)
+        from game_engine import finalize_season_for_retire
+        finalize_season_for_retire()
+        from ui.retire_window import RetireWindow
+        main_win = self.window()
+        self._retire_win = RetireWindow(get_player().get("language", "ko"), main_win)
+
+        def _clear_retire(*_a):
+            self._retire_win = None
+        self._retire_win.finished.connect(_clear_retire)
+        self._retire_win.show()
 
 
 # ── 헬퍼 ──────────────────────────────────────────────────────

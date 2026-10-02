@@ -22,6 +22,9 @@ import bisect   # [2026-09 신설] _find_buy_replacement의 OVR 구간 탐색용
 import contextlib   # [2026-08 최적화] _indexes_off_for_mass_update용
 import economy as _economy   # [2026-09 최적화] 이적료 산정 배치 캐시 begin/end용
 from database import _squad_ovr_hard_min, _lift_stats_to_ovr
+# [2026-10 병역 시스템 2단계] 군팀·복무 중인 선수는 이적/임대/재계약/스카우팅/
+# 보충 생성/외국인 쿼터 조정/은퇴 대상에서 전부 빠진다(팀이 바뀌는 건 진급·강등뿐).
+from military_service import drop_military_teams as _drop_mil_teams
 from database import (get_conn, calc_ovr, ALL_STATS, KEY_STATS_BY_POS,
                       roll_bench_position)
 # [2026-08 신설, 포메이션 20개 확장 + 스쿼드 적합도 시스템] 모듈 레벨에서
@@ -838,10 +841,16 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
     # [2026-09 신설] on_loan_from_team_id 추가 — 임대 중인 선수는 임대처가
     # 다른 팀으로 넘길 수 없다(FIFA 재임대·재이적 금지, _build_buy_pools/
     # _transfer_market 주석 참고).
+    # [2026-10 병역 시스템 4단계] 나이 +1 직후, 이적시장보다 먼저: 제대 → 면제 →
+    # 유형 재판정 → 새해 입대. 제대자는 아래 공유 목록에 들어가 이적시장에 참여하고,
+    # 입대자는 빠진다. 기능이 꺼져 있으면 즉시 return(아무것도 안 함).
+    from military_service import process_military_new_year as _mil_new_year
+    _mil_new_year(c, year)
     shared_ai_rows = c.execute(
         "SELECT id, team_id, position, age, name, ovr, nationality, quota_local_country, "
         "contract_end_year, last_transfer_year, potential_ovr, on_loan_from_team_id "
         "FROM ai_players ORDER BY id").fetchall()
+    shared_ai_rows = _drop_mil_teams(c, shared_ai_rows, "team_id")   # [2026-10] 복무 중인 선수 제외
     _t_shared = _time_perf.perf_counter()
 
     # [2026-08 신설, 신민용 요청: "선수 검색에서 OVR이 이적 순간에만
@@ -979,6 +988,7 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
         "SELECT id, team_id, position, age, name, ovr, nationality, quota_local_country, "
         "contract_end_year, last_transfer_year, salary, on_loan_from_team_id "
         "FROM ai_players ORDER BY id").fetchall()
+    shared_ai_rows = _drop_mil_teams(c, shared_ai_rows, "team_id")   # [2026-10] 복무 중인 선수 제외
 
     _report(2, "전세계 이적시장 처리 중")
     # [2026-09 최적화] 이적시장 루프가 도는 동안은 경기가 단 한 경기도
@@ -1225,6 +1235,7 @@ def run_ai_mid_season_transfer(year, verbose_log=None, my_team_id=None):
         "SELECT id, team_id, position, age, name, ovr, nationality, quota_local_country, "
         "contract_end_year, last_transfer_year, salary, on_loan_from_team_id "
         "FROM ai_players ORDER BY id").fetchall()
+    ai_rows = _drop_mil_teams(c, ai_rows, "team_id")   # [2026-10] 복무 중인 선수 제외
     # [2026-09 최적화] 이적시장 루프가 도는 동안은 경기가 단 한 경기도
     # 치러지지 않아 리그 순위표가 절대 안 바뀐다 — 그 구간에서만
     # economy._team_rank_status_mult(팀 순위 조회) 결과 재사용을 허용한다.
@@ -1365,6 +1376,12 @@ def _age_and_progress(c):
         if grade == "SS":
             bonus = min(bonus, 0)
         team_cap[r["tid"]] = min(99, top + bonus + 3)
+    # [2026-10 병역 시스템] 군팀은 "환경 상한"이 없다 — 복무 중에도 평소처럼
+    # 개인 잠재력(potential_ovr)까지만 성장/노화한다(신민용 확정: 군대라서
+    # 오르거나 깎이는 개념 없음). 군대가 없으면 빈 집합이라 아무 변화 없음.
+    from military_service import get_military_team_ids as _get_mil_tids_cap
+    for _mt in _get_mil_tids_cap(c):
+        team_cap[_mt] = 99
     _ap_t1 = _time_ap.perf_counter()
 
     # JOIN에 안 잡힌 팀(league_id/country_id 연결 누락 등)의 폴백 상한.
@@ -1913,6 +1930,7 @@ def _process_loan_returns(c, year):
         "SELECT id, name, position, age, ovr, salary, team_id, on_loan_from_team_id, "
         "contract_end_year, nationality FROM ai_players "
         "WHERE on_loan_from_team_id != 0 AND loan_return_year <= ?", (year,)).fetchall()
+    rows = _drop_mil_teams(c, rows, "team_id")   # [2026-10] 복무자는 일반 임대 복귀가 아니라 제대 처리
     if not rows:
         return 0
     # [2026-09 버그수정, 신민용 리포트: "5명 한계인데 8명으로 뚫었잖아"]
@@ -2125,6 +2143,7 @@ def _process_contract_renewals(c, year):
     team_rows = c.execute(
         """SELECT t.id, t.name, t.current_tier AS tier, cn.name AS cname FROM teams t
            JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id""").fetchall()
+    team_rows = _drop_mil_teams(c, team_rows, "id")   # [2026-10] 군팀 제외
     tinfo_by_tid = {t["id"]: (t["cname"], t["name"], t["tier"]) for t in team_rows}
     _grade_cache: dict = {}
 
@@ -2797,11 +2816,13 @@ def _prestige_scouting(c, year):
     rows = c.execute(
         "SELECT id, team_id, position, age, ovr, name, nationality, on_loan_from_team_id "
         "FROM ai_players").fetchall()
+    rows = _drop_mil_teams(c, rows, "team_id")   # [2026-10] 복무 중인 선수는 스카우팅 대상 아님
     pools = _build_buy_pools(rows)
 
     team_rows = c.execute(
         """SELECT t.id, t.name, t.current_tier AS tier, cn.name AS cname FROM teams t
            JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id""").fetchall()
+    team_rows = _drop_mil_teams(c, team_rows, "id")   # [2026-10] 군팀 제외
     tid_by_name = {(t["cname"], t["name"]): t["id"] for t in team_rows}
     tinfo_by_tid = {t["id"]: (t["cname"], t["name"], t["tier"]) for t in team_rows}
     # [2026-09 버그수정, 신민용 리포트: "5명 한계인데 8명으로 뚫었잖아"]
@@ -3069,6 +3090,7 @@ def _prestige_potential_scouting(c, year):
         # [2026-09 신설] 임대 중인 원석은 임대처 소속이 아니다(원 소속팀만 권리)
         "AND on_loan_from_team_id = 0",
         (_min_potential_floor, POTENTIAL_SCOUT_MAX_AGE)).fetchall()
+    rows = _drop_mil_teams(c, rows, "team_id")   # [2026-10] 복무 중인 선수는 원석 발굴 대상 아님
     if not rows:
         return 0
 
@@ -3077,6 +3099,7 @@ def _prestige_potential_scouting(c, year):
                   cn.continent AS continent
            FROM teams t JOIN leagues l ON t.league_id=l.id
            JOIN countries cn ON l.country_id=cn.id""").fetchall()
+    team_rows = _drop_mil_teams(c, team_rows, "id")   # [2026-10] 군팀 제외
     tinfo_by_tid = {t["id"]: t for t in team_rows}
     tid_by_name = {(t["cname"], t["name"]): t["id"] for t in team_rows}
 
@@ -3400,6 +3423,8 @@ def _retire_and_replace(c, year, ai_rows=None):
         "SELECT country_id AS cid, MAX(tier) AS mt FROM leagues GROUP BY country_id").fetchall()}
 
     team_info = {}  # {team_id: (grade, tier, bonus, cname, continent, tname, club_strength, retire_cat, max_tier, momentum_type, momentum_seasons_left)}
+    from military_service import get_military_team_ids as _get_mil_tids
+    _mil_tids_rr = _get_mil_tids(c)
     for r in c.execute(
             """SELECT t.id AS tid, t.name AS tname, t.current_tier AS tier,
                       t.club_strength AS club_strength,
@@ -3409,6 +3434,8 @@ def _retire_and_replace(c, year, ai_rows=None):
                FROM teams t
                JOIN leagues l ON t.league_id = l.id
                JOIN countries cn ON l.country_id = cn.id""").fetchall():
+        if r["tid"] in _mil_tids_rr:   # [2026-10] 군팀 제외
+            continue
         grade = get_country_league_grade(r["cname"])
         # [버그수정 2026-07, 신민용 리포트: "이적시장 처리 중 오류: 'float'
         # object cannot be interpreted as an integer"] COUNTRY_OVR_ADJ의
@@ -3547,9 +3574,49 @@ def _retire_and_replace(c, year, ai_rows=None):
     # 캐싱한다 — roll_potential_ovr 호출부(아래 루프) 참고.
     _replacement_growth_cap_cache: dict = {}
 
+    # [2026-10 병역, 신민용 확정: "복무 중 은퇴가 되더라도 복무는 다 하고 은퇴"]
+    # (1) 지금 복무 중인 선수(군팀 소속이라 위 rows엔 없음)도 은퇴 판정은 한다 — 단
+    #     확률은 일반 × MILITARY_RETIRE_PROB_MULT(0.5), 걸려도 바로 은퇴하지 않고
+    #     예약(military_retire_pending=1)만 한다. 리그 수준·상대 OVR은 군팀이 아니라
+    #     입대 전 소속팀 기준(커리어 판단의 기준점이 그쪽이므로).
+    # (2) 예약된 채 이번 오프시즌에 제대한 선수(process_military_new_year가 이 함수보다
+    #     먼저 돌아 이미 원소속팀/FA 행선지로 옮겨져 rows에 들어 있음)는 아래 루프에서
+    #     확률 1로 은퇴시킨다 — 일반 은퇴와 같은 경로라 아카이브·대체 신인도 같다.
+    _mil_retire_now: set = set()
+    try:
+        from constants import MILITARY_STATUS_SERVING as _MSS_RT
+        from military_service import MILITARY_RETIRE_PROB_MULT as _MIL_RT_MULT
+        _mil_retire_now = {row[0] for row in c.execute(
+            "SELECT id FROM ai_players WHERE military_retire_pending=1 AND military_status!=?",
+            (_MSS_RT,)).fetchall()}
+        _mil_flag = []
+        for row in c.execute(
+                "SELECT id, age, ovr, position, military_pre_team_id FROM ai_players "
+                "WHERE military_status=? AND COALESCE(military_retire_pending,0)=0", (_MSS_RT,)).fetchall():
+            _sa = row[1] or 25
+            if _sa < _AI_RETIRE_AGE:
+                continue
+            _ti = team_info.get(row[4])
+            _p_mil = _ai_retirement_probability(
+                _sa, row[2], row[3], category=(_ti[7] if _ti else "mid"), intl_factor=1.0,
+                relative_mult=(_relative_ovr_retire_mult(row[2], _ti[0], _ti[1], _ti[3], _ti[8])
+                               if _ti else 1.0)) * _MIL_RT_MULT
+            if _p_mil > 0 and random.random() < _p_mil:
+                _mil_flag.append((row[0],))
+        if _mil_flag:
+            c.executemany("UPDATE ai_players SET military_retire_pending=1 WHERE id=?", _mil_flag)
+        if _mil_flag or _mil_retire_now:
+            print(f"[MILITARY] {year} 복무 중 은퇴 예약 {len(_mil_flag)}명 | 제대 후 예약 은퇴 "
+                  f"{len(_mil_retire_now)}명", flush=True)
+    except Exception as _e_mrt:
+        print(f"[MILITARY] 복무 중 은퇴 처리 건너뜀: {_e_mrt}", flush=True)
+        _mil_retire_now = set()
+
     for r in rows:
         age = r["age"] or 25
-        if age < _AI_RETIRE_AGE:
+        if r["id"] in _mil_retire_now:
+            pass   # 예약 은퇴 — 아래에서 확률 1로 처리(나이 하한도 무시)
+        elif age < _AI_RETIRE_AGE:
             continue
         _tinfo_r = team_info.get(r["team_id"])
         _cat_r = _tinfo_r[7] if _tinfo_r else "mid"
@@ -3577,6 +3644,8 @@ def _retire_and_replace(c, year, ai_rows=None):
             _rsf2 = _league_shortfall(r["ovr"], _tinfo_r[0], _tinfo_r[1], _tinfo_r[3])
             if _rsf2 > 0.0:
                 p_retire = min(1.0, p_retire * _interp_pts(_SHORTFALL_RETIRE_PTS, _rsf2))
+        if r["id"] in _mil_retire_now:
+            p_retire = 1.0
         if p_retire <= 0 or random.random() >= p_retire:
             continue
 
@@ -3964,6 +4033,9 @@ def _retire_and_replace(c, year, ai_rows=None):
                (id, name, position, ovr, age, nationality, last_team_id,
                 last_team_name, retirement_year)
                VALUES(?,?,?,?,?,?,?,?,?)""", retire_archives)
+        # [2026-10] 최고 OVR·병역 상태도 같이 남긴다(아래 DELETE 전이어야 함).
+        from database import fill_retired_extra_fields
+        fill_retired_extra_fields(c, [a[0] for a in retire_archives])
     _rt5 = _time_rt.perf_counter()   # ai_players_retired 아카이브 적재
     if retire_deletes:
         c.executemany("DELETE FROM ai_players WHERE id=?", retire_deletes)
@@ -4674,6 +4746,7 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
            JOIN leagues l ON t.league_id = l.id
            JOIN countries cn ON l.country_id = cn.id
            ORDER BY t.id""").fetchall()]
+    teams = _drop_mil_teams(c, teams, "tid")   # [2026-10] 군팀 제외
     team_avg = {t["tid"]: (t["avg_ovr"] or 50) for t in teams}
     # [2026-09 신설, "중위권 정체 탈출" momentum] 이 momentum이 활성 상태인
     # 팀은 방출 쪽(_team_category)에서 "낮은 OVR 선수 정리 우선순위 ↑"를
@@ -5918,6 +5991,7 @@ def _upward_transfer_pull(c, year):
            FROM teams t JOIN leagues l ON t.league_id=l.id
            JOIN countries cn ON l.country_id=cn.id
            ORDER BY t.id""").fetchall()
+    team_rows = _drop_mil_teams(c, team_rows, "tid")   # [2026-10] 군팀 제외
     if not team_rows:
         return 0
 
@@ -7304,6 +7378,9 @@ def _archive_forced_out_players(c, ids, year):
            (id, name, position, ovr, age, nationality, last_team_id,
             last_team_name, retirement_year)
            VALUES(?,?,?,?,?,?,?,?,?)""", archive_rows)
+    # [2026-10] 최고 OVR·병역 상태도 같이(호출부가 DELETE 직전에 부르므로 행이 아직 있음).
+    from database import fill_retired_extra_fields
+    fill_retired_extra_fields(c, [a[0] for a in archive_rows])
 
 
 def _gen_topup_rows(c, tid, tier, cname, continent, tname, grade, need,
@@ -7432,6 +7509,7 @@ def _roll_offer_vacancy_teams(c, year) -> set:
                   t.club_strength AS cs, cn.name AS cname
            FROM teams t JOIN leagues l ON t.league_id=l.id
                         JOIN countries cn ON l.country_id=cn.id""").fetchall()
+    team_rows = _drop_mil_teams(c, team_rows, "tid")   # [2026-10] 군팀 제외
 
     by_league: dict = {}
     for r in team_rows:
@@ -7519,6 +7597,7 @@ def _fill_offer_vacancies(year):
                   cn.name AS cname, cn.continent AS continent
            FROM teams t JOIN leagues l ON t.league_id=l.id
                         JOIN countries cn ON l.country_id=cn.id""").fetchall()
+    team_rows = _drop_mil_teams(c, team_rows, "tid")   # [2026-10] 군팀 제외
     counts: dict = {}
     for r in c.execute("SELECT team_id, COUNT(*) n FROM ai_players GROUP BY team_id").fetchall():
         counts[r["team_id"]] = r["n"]
@@ -7623,6 +7702,7 @@ def _rebalance_squad_sizes(c, year):
                   cn.name AS cname, cn.continent AS continent
            FROM teams t JOIN leagues l ON t.league_id=l.id
                         JOIN countries cn ON l.country_id=cn.id""").fetchall()
+    team_rows = _drop_mil_teams(c, team_rows, "tid")   # [2026-10] 군팀 제외
     team_info = {r["tid"]: (r["tier"] or 1, r["cname"], r["continent"] or "유럽", r["tname"])
                  for r in team_rows}
 
@@ -9540,6 +9620,7 @@ def _enforce_foreign_quota_worldwide(c, year):
                   cn.continent AS continent, t.name AS tname
            FROM teams t JOIN leagues l ON t.league_id=l.id
                         JOIN countries cn ON l.country_id=cn.id""").fetchall()
+    team_rows = _drop_mil_teams(c, team_rows, "tid")   # [2026-10] 군팀 제외
     team_country = {}
     team_quota_hi = {}
     # [2026-09 신설] 팀별 (등급, tier, 팀명, 설계 OVR 상한) — 맞교환 가드와
@@ -10289,6 +10370,14 @@ def _manager_turnover(c, year, season=None):
                     return out
         return out
 
+    # [2026-10 병역 시스템] 군팀 감독은 일반 감독 시장과 분리한다(신민용 확정:
+    # 군대 감독은 무조건 한국인). 군팀 공석은 무직인 한국인 감독만 후보(현직
+    # 이직 불가), 일반 클럽 공석은 군팀 현직 감독을 빼 간다. 후보가 없으면
+    # 아래 신인 생성으로 가고, 그 국적은 manager_nationality_for로 대한민국.
+    # 군대가 없으면 빈 집합이라 아래 필터가 아예 안 돈다(결과 불변).
+    from military_service import get_military_team_ids as _get_mil_tids_mgr
+    from constants import MILITARY_TARGET_NATIONALITY as _MIL_NAT
+    _mil_tids_mgr = _get_mil_tids_mgr(c)
     queue = list(dict.fromkeys(vacancies))     # 중복 제거, 순서 유지
     queue.sort(key=lambda t: -teams.get(t, {}).get("level", 0.0))
     guard = 0
@@ -10345,6 +10434,13 @@ def _manager_turnover(c, year, season=None):
                             cands.append((mid, True))
                 for mid in _pick_from(free_bins, lo, hi, limit=24):
                     cands.append((mid, False))
+                if _mil_tids_mgr:
+                    if tid in _mil_tids_mgr:
+                        cands = [(m_, mv_) for (m_, mv_) in cands
+                                 if not mv_ and (mgrs[m_].get("nationality") or "") == _MIL_NAT]
+                    else:
+                        cands = [(m_, mv_) for (m_, mv_) in cands
+                                 if not (mv_ and busy.get(m_) in _mil_tids_mgr)]
                 # ══ ③-c 상한/하한 검사 ══════════════════════════
                 # 신민용 도식: 후보 전체 → 상한 검사(너무 높은가) +
                 # 하한 검사(너무 낮은가) → 적합 후보 → 확률.
@@ -10436,7 +10532,9 @@ def _manager_turnover(c, year, season=None):
             hires.append((chosen, tid, cu, lv))
         else:
             # 신인 — 새 감독을 만든다.
-            row = build_manager_row(vr, t["country"], year,
+            # [2026-10] 군팀 감독은 국적을 "군대"가 아니라 대한민국으로.
+            from military_service import manager_nationality_for as _mil_mgr_nat
+            row = build_manager_row(vr, _mil_mgr_nat(t["country"]), year,
                                     age_range=(MANAGER_ROOKIE_AGE_MIN,
                                                MANAGER_ROOKIE_AGE_MAX))
             new_rows.append(row)
