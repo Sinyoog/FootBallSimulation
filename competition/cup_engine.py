@@ -285,8 +285,11 @@ def resync_my_cup_registration(p=None, year=None):
 
     conn = get_conn()
     rows = [dict(r) for r in conn.execute(
-        "SELECT id, country_id, my_in, my_team_id FROM cup_tournaments WHERE year=?",
+        "SELECT id, country_id, my_in, my_team_id, status FROM cup_tournaments WHERE year=?",
         (year,)).fetchall()]
+    # [2026-10] 끝난 대회는 등록팀을 바꾸지 않는다 — competition_common.
+    # resync_my_registration의 같은 주석 참고(챔스와 같은 결함·같은 수정).
+    rows = [t for t in rows if t["status"] != "done"]
     changed = False
     c = conn.cursor()
     for t in rows:
@@ -1004,9 +1007,21 @@ def _match_outcome(h_ovr, a_ovr):
     거꾸로 컵대회 쪽이 리그보다 더 완만한(이변이 잦은) 공식을 쓰고
     있었으니, 몇 경기 안 되는 토너먼트에서 실제 순위와 동떨어진 결과가
     누적되기 쉬웠다. 리그/국제대회와 동일한 기울기로 통일한다."""
-    diff = h_ovr - a_ovr
-    hw = max(0.04, min(0.95, 0.46 + diff * 0.022))
+    # [2026-10 재조정, 신민용 확정: 리그 "C안"과 같은 원칙을 국내컵에도]
+    # ① 두 팀 전력에 OVR 수준 곡선(리그와 같은 리그·국내컵 전용 곡선)을 씌운 뒤
+    #    차이를 낸다 — 같은 원시 차이라도 고OVR 구간일수록 크게 반영.
+    # ② 홈 이점은 곡선 밖에서 따로 더한다(리그와 같은 1.5~4.5점). 예전엔
+    #    diff=0에서도 홈 46%/원정 30%가 되도록 공식 자체를 비대칭으로 만들어
+    #    홈 이점을 넣었다 — 이제 대칭 공식 + 명시적 홈 이점이라 동급 매치는
+    #    예전과 거의 같다(홈 47/무 21/원정 32).
+    # ③ 기울기 0.022→0.025(리그와 동일). 무승부(→승부차기) 폭은 컵 고유값
+    #    (0.24, 0.009)을 그대로 둔다 — 단판 토너먼트의 변동성은 이 무승부·
+    #    승부차기 구간이 남겨준다.
+    # 3·4부 국내컵(lower_cup_engine)도 이 함수를 그대로 쓴다.
+    diff = _cup_effective_diff(h_ovr, a_ovr, random.uniform(1.5, 4.5))
     dw = max(0.05, 0.24 - abs(diff) * 0.009)
+    half = (1.0 - dw) / 2.0
+    hw = max(0.04, min(0.95, half + diff * 0.025))
     aw = max(0.02, 1.0 - hw - dw)
     tot = hw + dw + aw
     hw, dw, aw = hw / tot, dw / tot, aw / tot
@@ -1016,6 +1031,21 @@ def _match_outcome(h_ovr, a_ovr):
     elif roll < hw + dw:
         return "draw"
     return "away"
+
+
+_CUP_OVR_CURVE = None
+
+
+def _cup_effective_diff(h_ovr, a_ovr, home_adv):
+    """[2026-10 신설] 국내컵 실질 전력차 = 곡선(홈 전력) − 곡선(원정 전력) +
+    홈 이점. 리그와 같은 리그·국내컵 전용 곡선(game_engine.
+    _league_cup_effective_ovr — 85 이하 그대로, 구간 배율 1.5/1.6/2.0배)을
+    쓴다. 챔스·유로파 곡선과는 별개다."""
+    global _CUP_OVR_CURVE
+    if _CUP_OVR_CURVE is None:
+        from game_engine import _league_cup_effective_ovr
+        _CUP_OVR_CURVE = _league_cup_effective_ovr
+    return _CUP_OVR_CURVE(h_ovr) - _CUP_OVR_CURVE(a_ovr) + home_adv
 
 
 def _resolve_pso(h_ovr, a_ovr):

@@ -353,6 +353,10 @@ class CenterPanel(QWidget):
         p = get_player()
         if p and p.get("sale_push_proposal_json"):
             self._show_sale_push_proposal(p)
+        # [2026-10 신설] 임대처 완전 영입 제안도 결정 전에 껐으면 다시 띄운다.
+        p = get_player()
+        if p and p.get("loan_buy_proposal_json"):
+            self._show_loan_buy_proposal(p)
 
     # ── 빌드 ─────────────────────────────────────
 
@@ -2227,6 +2231,10 @@ class CenterPanel(QWidget):
         if p2.get("sale_push_proposal_json"):
             self._show_sale_push_proposal(p2)
 
+        # [2026-10 신설] 임대처 완전 영입 제안 — 판매추진 팝업과 같은 시점.
+        if p2.get("loan_buy_proposal_json"):
+            self._show_loan_buy_proposal(p2)
+
         # 자동 오퍼 팝업은 1주 묶음이 완료됐을 때만
         # (1주씩 본다고 매주 오퍼가 뜨지 않음)
         if bundle_done:
@@ -3230,6 +3238,86 @@ class CenterPanel(QWidget):
 
         def _reject():
             reject_sale_push_proposal()
+            dlg.accept()
+            if self.main_win:
+                self.main_win.refresh_all()
+
+        btn_accept.clicked.connect(_accept)
+        btn_reject.clicked.connect(_reject)
+        dlg.exec()
+        dlg.deleteLater()
+
+    def _show_loan_buy_proposal(self, p):
+        """[2026-10 신설, 신민용 확정] 임대처가 임대 성과를 보고 완전 영입을
+        제안한다. 판매추진 창과 같은 형식(조건 협상 없음, 수락/거절만) —
+        수락하면 시즌 종료 때 원 소속팀 복귀 대신 이 팀과 새 계약을 맺는다."""
+        raw = p.get("loan_buy_proposal_json") or ""
+        if not raw:
+            return
+        import json as _json
+        try:
+            proposal = _json.loads(raw)
+        except Exception:
+            return
+
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame
+        from game_engine import accept_loan_buy_proposal, reject_loan_buy_proposal
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("🔄 완전 이적 제안")
+        dlg.setMinimumWidth(420)
+        dlg.setStyleSheet(_DIALOG_STYLE)
+        root = QVBoxLayout(dlg)
+        root.setContentsMargins(18, 16, 18, 16); root.setSpacing(10)
+
+        hdr = QLabel("🔄 임대처가 완전 영입을 원합니다")
+        hdr.setObjectName("dlgHeader")
+        root.addWidget(hdr)
+
+        card = QFrame(); card.setObjectName("dlgCard")
+        cl = QVBoxLayout(card); cl.setContentsMargins(14, 12, 14, 12); cl.setSpacing(5)
+        cl.addWidget(QLabel(
+            f"<b style='color:#fff;font-size:14px'>{proposal.get('flag', '')} {proposal['team_name']}</b>"))
+        cl.addWidget(QLabel(
+            f"<span style='color:#bbb'>{proposal['league_name']} ({proposal['country']}, "
+            f"{proposal['tier']}부)</span>"))
+        cl.addWidget(QLabel(
+            f"<span style='color:#888;font-size:11px'>이번 임대 시즌: 평균평점 "
+            f"{proposal.get('rating', 0):.2f} · 출전 {int(round(proposal.get('play_ratio', 0)*100))}%</span>"))
+        cl.addWidget(QLabel(""))
+        cl.addWidget(QLabel(
+            f"<span style='color:#bbb'>제시 연봉</span>  "
+            f"<b style='color:#00cc66'>{fmt_money(proposal['salary'])} / 년</b>"))
+        _fee = proposal.get("transfer_fee", 0)
+        cl.addWidget(QLabel(
+            f"<span style='color:#bbb'>이적료</span>  "
+            f"<b style='color:#ffcc33'>{fmt_money(_fee) if _fee else '없음(계약 만료)'}</b>  "
+            f"<span style='color:#888;font-size:11px'>→ {proposal.get('parent_name', '')}</span>"))
+        cl.addWidget(QLabel(
+            f"<span style='color:#bbb'>계약 기간</span>  "
+            f"<b style='color:#fff'>{proposal['contract_years']}년</b>"))
+        root.addWidget(card)
+
+        note = QLabel("※ 수락하면 시즌이 끝난 뒤 원 소속팀으로 복귀하지 않고 이 팀으로 "
+                      "완전 이적합니다. 거절하면 예정대로 복귀합니다.")
+        note.setStyleSheet("color:#666;font-size:11px;")
+        note.setWordWrap(True)
+        root.addWidget(note)
+
+        btn_row = QHBoxLayout(); btn_row.setSpacing(8)
+        btn_accept = QPushButton("✅ 수락"); btn_accept.setObjectName("dlgOk")
+        btn_reject = QPushButton("❌ 거절 (복귀)"); btn_reject.setObjectName("dlgNo")
+        btn_row.addWidget(btn_accept, 1); btn_row.addWidget(btn_reject, 1)
+        root.addLayout(btn_row)
+
+        def _accept():
+            accept_loan_buy_proposal()
+            dlg.accept()
+            if self.main_win:
+                self.main_win.refresh_all()
+
+        def _reject():
+            reject_loan_buy_proposal()
             dlg.accept()
             if self.main_win:
                 self.main_win.refresh_all()

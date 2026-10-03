@@ -541,8 +541,11 @@ def resync_my_lower_cup_registration(p=None, year=None):
 
     conn = get_conn()
     rows = [dict(r) for r in conn.execute(
-        "SELECT id, my_in, my_team_id FROM lower_cup_tournaments WHERE year=?",
+        "SELECT id, my_in, my_team_id, status FROM lower_cup_tournaments WHERE year=?",
         (year,)).fetchall()]
+    # [2026-10] 끝난 대회는 등록팀을 바꾸지 않는다 — competition_common.
+    # resync_my_registration의 같은 주석 참고.
+    rows = [t for t in rows if t["status"] != "done"]
     if not rows:
         conn.close()
         return False

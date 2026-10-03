@@ -1892,8 +1892,23 @@ def resync_my_registration(cfg, year, p=None):
 
     conn = get_conn()
     rows = [dict(r) for r in conn.execute(
-        f"SELECT id, my_in, my_team_id FROM {cfg.tournament_table} WHERE year=?",
+        f"SELECT id, my_in, my_team_id, status FROM {cfg.tournament_table} WHERE year=?",
         (year,)).fetchall()]
+        # [2026-10 버그수정, 신민용 리포트 9번: "상반기에 A팀으로 챔스
+        # 우승 → 겨울 휴식기 이적 → 하반기 B팀이면, 커리어에 B팀 챔스가
+        # 들어가거나 A팀 우승이 빠지면 안 된다"] 이미 끝난 대회(status
+        # 'done')는 등록팀을 바꾸지 않는다 — 그 대회의 my_team_id/my_in은
+        # "대회가 끝났을 때 내가 등록돼 있던 팀"이라는 기록이다. 주간 훅이
+        # 매주(대회가 끝난 뒤에도) 이 함수를 부르기 때문에, 예전엔 챔스가
+        # 끝난(23주) 뒤 겨울(25~28주)에 이적하면 끝난 챔스의 등록이 새
+        # 팀으로 넘어갔다. 헤드리스 재현: 모나코(8강)에서 뛰다 겨울에 밀란
+        # 으로 가자 선수 검색 2000년 줄이 밀란의 "4강 탈락"으로 바뀌고
+        # 모나코 줄은 비었으며, 반대로 챔스를 안 뛰고 우승팀 모나코에 겨울
+        # 합류하면 "챔스 우승 1회"가 생겼다. 내 트로피 기록(trophy_log)은
+        # 결승 시점에 이미 맞게 남아 있었지만, 선수 검색 커리어와 발롱도르
+        # 트로피 점수가 이 등록값을 읽어서 틀어졌다. 진행 중인 대회는
+        # 예전처럼 이적 즉시 새 팀으로 등록을 옮긴다.
+    rows = [t for t in rows if t["status"] != "done"]
     if not rows:
         conn.close()
         return False

@@ -4029,6 +4029,7 @@ class WorldBrowserWindow(QDialog):
             "은퇴대체 영입": "입단",
             "명문팀 스카우팅(반대급부)": "자유이적",
             "임대 복귀": "복귀",
+            "완전 이적": "완전 이적",   # [2026-10] 임대처가 그대로 완전 영입
             "연장": "연장",
         }
         return _MAP.get(transfer_type, transfer_type or "기록")

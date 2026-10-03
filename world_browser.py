@@ -1159,21 +1159,32 @@ def get_ai_player_salary_history(player_id):
             contract_end_year, loan_return_year), ...] 오름차순."""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT year, is_mid_season, salary, transfer_type, is_loan, fee, contract_end_year, "
+        "SELECT id, year, is_mid_season, salary, transfer_type, is_loan, fee, contract_end_year, "
         "loan_return_year "
         "FROM ai_transfer_log "
         "WHERE player_id=? AND (salary>0 OR transfer_type IN ('입대','진급','강등')) "
         "UNION ALL "
-        "SELECT year, is_mid_season, salary, transfer_type, is_loan, fee, contract_end_year, "
+        "SELECT id, year, is_mid_season, salary, transfer_type, is_loan, fee, contract_end_year, "
         "loan_return_year "
         "FROM ai_transfer_log_archive "
         "WHERE player_id=? AND (salary>0 OR transfer_type IN ('입대','진급','강등'))", (player_id, player_id)).fetchall()
     conn.close()
+    # [2026-10 버그수정, 신민용 리포트: "B팀·II·U21 선수가 1군으로 올라갈 때
+    # 소속이 틀리게 보인다"] 같은 해·같은 시점(같은 오프시즌 등) 기록끼리의
+    # 순서를 명시한다 — 예전엔 정렬 키가 연도/겨울여부뿐이라 동점 기록의
+    # 순서가 DB가 돌려주는 순서에 맡겨져 있었다. 산하팀 1군 콜업(43~52주)은
+    # 언제나 같은 오프시즌의 이적시장(연도전환)보다 먼저 일어나므로 맨 앞에
+    # 두고, 나머지는 기록된 순서(id)대로 둔다 — "시즌 끝에 콜업 → 같은
+    # 오프시즌에 1군에서 다시 팔림"인 선수가 1군 소속으로 끝나 보이던 경우를
+    # 막는다(기존 세이브 보정 기록은 나중에 추가돼 id가 더 크기 때문).
+    rows = sorted(rows, key=lambda r: (r["year"] if r["is_mid_season"] else r["year"] + 1,
+                                       r["is_mid_season"],
+                                       0 if r["transfer_type"] == "1군 콜업" else 1,
+                                       r["id"]))
     out = [(r["year"] if r["is_mid_season"] else r["year"] + 1,
             r["salary"], r["transfer_type"], bool(r["is_loan"]), r["fee"],
             r["contract_end_year"], r["is_mid_season"], r["loan_return_year"])
            for r in rows]
-    out.sort(key=lambda t: (t[0], t[6]))
     # [2026-09] 8번째 값으로 is_mid_season(0/1)을 덧붙인다 — 계약 기간 표시가
     # 오프시즌 계약(발효=체결연도+1)과 겨울 계약(발효=체결연도)을 구분해야
     # 해서. 기존 7개 값의 순서/의미는 그대로(인덱스 6 = loan_return_year).
@@ -1207,13 +1218,24 @@ def get_ai_player_team_timeline(player_id, current_team_id):
     # 합쳐야 오래된 이적까지 포함한 전체 커리어가 재구성된다 — 한쪽만
     # 보면 최근 5시즌 안에 이적하지 않은 선수(사실상 은퇴자 전원)는
     # "이적을 한 번도 안 한 선수"로 오판된다.
+    # [2026-10 버그수정, 신민용 리포트: "B팀·II·U21 선수가 1군으로 올라갈 때
+    # 소속이 틀리게 보인다"] 같은 해·같은 시점(같은 오프시즌 등) 기록끼리의
+    # 순서를 명시한다 — 예전엔 정렬 키가 연도/겨울여부뿐이라 동점 기록의
+    # 순서가 DB가 돌려주는 순서에 맡겨져 있었다. 산하팀 1군 콜업(43~52주)은
+    # 언제나 같은 오프시즌의 이적시장(연도전환)보다 먼저 일어나므로 맨 앞에
+    # 두고, 나머지는 기록된 순서(id)대로 둔다 — "시즌 끝에 콜업 → 같은
+    # 오프시즌에 1군에서 다시 팔림"인 선수가 1군 소속으로 끝나 보이던 경우를
+    # 막는다(기존 세이브 보정 기록은 나중에 추가돼 id가 더 크기 때문).
     rows = conn.execute(
-        "SELECT year, from_team_id, to_team_id, player_position, is_mid_season, is_loan FROM ai_transfer_log "
-        "WHERE player_id=? "
+        "SELECT id, year, from_team_id, to_team_id, player_position, is_mid_season, is_loan, "
+        "(transfer_type = '1군 콜업') AS is_callup "
+        "FROM ai_transfer_log WHERE player_id=? "
         "UNION ALL "
-        "SELECT year, from_team_id, to_team_id, player_position, is_mid_season, is_loan FROM ai_transfer_log_archive "
-        "WHERE player_id=? "
-        "ORDER BY year ASC, is_mid_season DESC", (player_id, player_id)).fetchall()
+        "SELECT id, year, from_team_id, to_team_id, player_position, is_mid_season, is_loan, "
+        "(transfer_type = '1군 콜업') AS is_callup "
+        "FROM ai_transfer_log_archive WHERE player_id=? "
+        "ORDER BY year ASC, is_mid_season DESC, is_callup DESC, id ASC",
+        (player_id, player_id)).fetchall()
     if not rows:
         name_row = conn.execute("SELECT name FROM teams WHERE id=?", (current_team_id,)).fetchone()
         conn.close()
@@ -2348,30 +2370,46 @@ def get_my_player_career_history():
     # 그대로 붙어버렸다(내가 뛴 건 아시아 챔스인데). cl/el/ecl/cup/sc/
     # cwc 각 대회 테이블의 my_in=1 행이 정확히 "내가 등록됐던 팀"이므로,
     # 그 team_id와 지금 붙이려는 스틴트의 team_id가 같을 때만 인정한다.
+    # [2026-10 버그수정, 신민용 리포트 9번] "등록팀"만으로는 부족했다 —
+    # 대회가 내가 떠난 뒤에 열리면 등록은 옛 팀에 남아 있는데 나는 그
+    # 경기에 없었다(헤드리스 재현: 도르트문트가 챔스 준우승으로 유럽
+    # 슈퍼컵에 나가고 23~24주에 대진이 짜여 등록이 도르트문트로 남았는데,
+    # 나는 25주에 밀란으로 떠났고 슈퍼컵은 29주에 열려 도르트문트가 우승
+    # → 내 trophy_log엔 없는데 선수 검색엔 "슈퍼컵 우승 1회"). my_result는
+    # 각 엔진이 "내 팀의 그 대회 여정이 끝난 순간"(탈락/결승)에, 내가 그
+    # 팀에 등록된 채로 그 자리에 있을 때만 적는 값이라(record_my_exit 등),
+    # 이게 비어 있지 않은 등록만 "그 대회 결과가 내 것"으로 본다. 3·4부
+    # 국내컵은 대회 단위 my_result를 적지 않으므로 등록팀으로만 본다
+    # ("lower" — 하반기에만 열려 겨울 이적과 겹치지 않는다).
+    _MYRES = "AND COALESCE(my_result,'')!=''"
+
     def _my_registered_club_comp_teams(year_):
         conn_ = get_conn()
         cl_team = None
         for _tbl in ("cl_tournaments", "el_tournaments", "ecl_tournaments"):
             _r = conn_.execute(
-                f"SELECT my_team_id FROM {_tbl} WHERE year=? AND my_in=1 LIMIT 1",
+                f"SELECT my_team_id FROM {_tbl} WHERE year=? AND my_in=1 {_MYRES} LIMIT 1",
                 (year_,)).fetchone()
             if _r and _r["my_team_id"]:
                 cl_team = _r["my_team_id"]
                 break
         cup_teams = {_r["my_team_id"] for _r in conn_.execute(
-            "SELECT my_team_id FROM cup_tournaments WHERE year=? AND my_in=1",
+            f"SELECT my_team_id FROM cup_tournaments WHERE year=? AND my_in=1 {_MYRES}",
             (year_,)).fetchall() if _r["my_team_id"]}
         _sc = conn_.execute(
-            "SELECT my_team_id FROM sc_tournaments WHERE year=? AND my_in=1 LIMIT 1",
+            f"SELECT my_team_id FROM sc_tournaments WHERE year=? AND my_in=1 {_MYRES} LIMIT 1",
             (year_,)).fetchone()
         _dsc = conn_.execute(
-            "SELECT my_team_id FROM domestic_sc_tournaments WHERE year=? AND my_in=1 LIMIT 1",
+            f"SELECT my_team_id FROM domestic_sc_tournaments WHERE year=? AND my_in=1 {_MYRES} LIMIT 1",
             (year_,)).fetchone()
         _cwc = conn_.execute(
-            "SELECT my_team_id FROM cwc_tournaments WHERE year=? AND my_in=1 LIMIT 1",
+            f"SELECT my_team_id FROM cwc_tournaments WHERE year=? AND my_in=1 {_MYRES} LIMIT 1",
             (year_,)).fetchone()
+        lower_teams = {_r["my_team_id"] for _r in conn_.execute(
+            "SELECT my_team_id FROM lower_cup_tournaments WHERE year=? AND my_in=1",
+            (year_,)).fetchall() if _r["my_team_id"]}
         conn_.close()
-        return {"cl": cl_team, "cup": cup_teams,
+        return {"cl": cl_team, "cup": cup_teams, "lower": lower_teams,
                 "sc": (_sc["my_team_id"] if _sc and _sc["my_team_id"] else None),
                 "dsc": (_dsc["my_team_id"] if _dsc and _dsc["my_team_id"] else None),
                 "cwc": (_cwc["my_team_id"] if _cwc and _cwc["my_team_id"] else None)}
@@ -2441,9 +2479,28 @@ def get_my_player_career_history():
         # [2026-09 신설] 상/하반기 이적이 있었던 해만 등록 여부를 대조한다
         # (이적 없는 해는 main_st가 곧 등록팀이므로 항상 일치 — 굳이
         # 매 연도 추가 쿼리를 돌릴 필요가 없다).
-        _reg = _my_registered_club_comp_teams(y) if len(sts) > 1 else None
+        # [2026-10 버그수정, 신민용 리포트 9번] "재직 기록이 2개 이상인 해"
+        # 만으로는 부족했다 — 무소속이다가 시즌 중(예: 겨울 휴식기)에 처음
+        # 입단하거나, 시즌 중 방출돼 그 해를 무소속으로 끝내면 그 해 재직
+        # 기록은 1개뿐인데도 한 해를 다 걸치지 않는다. 그러면 그 팀의 그 해
+        # 기록 전체(내가 오기 전에 끝난 챔스 우승 포함)가 그대로 붙었다
+        # (헤드리스 재현: 무소속으로 있다가 25주차에 챔스 우승팀 모나코에
+        # 입단 → 선수 검색에 "챔스 우승 1회"). 재직 기록이 그 해 중간에
+        # 시작되거나 중간에 끝난 해도 등록 여부를 대조한다.
+        _ms0 = main_st
+        _partial_year = (
+            len(sts) > 1
+            or (_ms0["start_year"] == y and (_ms0.get("start_week") or 1) > 1)
+            or (_ms0["end_year"] == y and 0 < (_ms0.get("end_week") or 0) < 52))
+        _reg = _my_registered_club_comp_teams(y) if _partial_year else None
         if _reg is not None:
-            if entry.get("cl") and _reg["cl"] != main_st["team_id"]:
+            # [2026-10] 3·4부 국내컵(cl_kind "lower_cup")은 "cl" 칸을 빌려
+            # 쓸 뿐 챔스가 아니다 — 챔스 등록팀과 비교하면 챔스에 안 나간
+            # 해마다 하반기 3·4부 컵 기록이 지워졌다. 자기 등록팀과 비교한다.
+            if entry.get("cl") and entry.get("cl_kind") == "lower_cup":
+                if main_st["team_id"] not in _reg["lower"]:
+                    _clear_club_field(entry, "cl")
+            elif entry.get("cl") and _reg["cl"] != main_st["team_id"]:
                 _clear_club_field(entry, "cl")
             if entry.get("cup") and main_st["team_id"] not in _reg["cup"]:
                 _clear_club_field(entry, "cup")
@@ -2568,6 +2625,14 @@ def get_my_player_career_history():
                         _half_entry[k] = _pf[k]
             if _reg["sc"] == prev_st["team_id"]:
                 for k in _CLUB_FIELD_GROUPS["sc"]:
+                    if _pf.get(k) is not None:
+                        _half_entry[k] = _pf[k]
+            # [2026-10 버그수정] 국내 슈퍼컵(4주차)은 상반기에 끝나는데 이
+            # 상반기 줄에 붙이는 목록에서 빠져 있었다 — 하반기 줄에선 등록팀이
+            # 달라 지워지므로, A팀으로 국내 슈퍼컵을 들고 겨울에 떠나면 그
+            # 우승이 선수 검색 어디에도 안 남았다.
+            if _reg["dsc"] == prev_st["team_id"]:
+                for k in _CLUB_FIELD_GROUPS["dsc"]:
                     if _pf.get(k) is not None:
                         _half_entry[k] = _pf[k]
             if _reg["cwc"] == prev_st["team_id"]:

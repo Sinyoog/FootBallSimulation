@@ -843,7 +843,7 @@ class RetireWindow(QDialog):
                 # 팀이 바뀌었거나 첫 행(임대 아닌 정상 이적/입단) → 계약년수 표시
                 c_str = f"{c_yrs}년" if c_yrs else "—"
                 prev_team = cur_team
-            elif in_type == "연장" or t_type == "연장":
+            elif in_type in ("연장", "완전 이적") or t_type == "연장":  # [2026-10] 임대 후 완전 이적 = 같은 팀 새 계약
                 # 같은 팀에서 연장 (연장 년수 표시)
                 c_str = f"{c_yrs}년" if c_yrs else "—"
             else:
@@ -1685,7 +1685,7 @@ class RetireWindow(QDialog):
                     c_str = _loan_in_duration_str(entries, idx)
                 elif idx == 0 or e.get("team_name") != entries[idx-1].get("team_name"):
                     c_str = f"{c_yrs}년" if c_yrs else "—"
-                elif in_type == "연장" or t_type == "연장":
+                elif in_type in ("연장", "완전 이적") or t_type == "연장":  # [2026-10] 임대 후 완전 이적 = 같은 팀 새 계약
                     c_str = f"{c_yrs}년" if c_yrs else "—"
                 else:
                     c_str = "—"

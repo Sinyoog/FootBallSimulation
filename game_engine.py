@@ -23,6 +23,10 @@ from database import (get_conn, calc_ovr, ALL_STATS,
 from constants import *  # PHYSICAL_STATS, TECHNICAL_STATS, MENTAL_STATS 포함
 
 _pending_transfer_type: str = ""  # join_team → _save_career_entry 전달용. ''=대기(잔류 시즌)
+# [2026-10 신설] 임대 후 완전 이적처럼 "합의된 이적료"가 따로 있는 이벤트용 —
+# _ensure_career_entry가 새 커리어 행을 만들 때 시장가 재계산 대신 이 값을 쓰고
+# 바로 비운다(None=평소처럼 자동 계산).
+_pending_transfer_fee = None
 
 # [2026-07 신설, 신민용+GPT 검토: "강등 프리미엄이 이적시장/노쇠화로
 # 상쇄되는지 확인하고 싶다 — 근데 상시 DB 저장은 과하다"] 평소엔 완전히
@@ -1617,7 +1621,7 @@ def finalize_season_for_retire():
 
 def _ensure_career_entry(p, st):
     """팀이 있는데 열린 커리어 항목(end_year=0)이 없으면 지금 생성."""
-    global _pending_transfer_type
+    global _pending_transfer_type, _pending_transfer_fee
     tid = p.get("current_team_id", 0)
     if not tid: return
 
@@ -1733,7 +1737,11 @@ def _ensure_career_entry(p, st):
     # 이름일 뿐인데, 이 조건에서 빠져 있어서 팔림 이벤트엔 이적료가 항상
     # 0으로 저장되고 있었다 — "이적"/"오퍼"와 동일하게 취급한다.
     _transfer_fee_e = 0
-    if tt_e in ("이적", "오퍼", "팔림"):
+    # [2026-10 신설] 임대 후 완전 이적 — 제안 때 합의된 이적료를 그대로 쓴다.
+    if tt_e == "완전 이적":
+        _transfer_fee_e = int(_pending_transfer_fee or 0)
+        _pending_transfer_fee = None
+    elif tt_e in ("이적", "오퍼", "팔림"):
         _country_e = c.execute(
             "SELECT cn.name FROM leagues l JOIN countries cn ON l.country_id=cn.id WHERE l.id=?",
             (team_row["lid"],)).fetchone()
@@ -2493,11 +2501,70 @@ def _match_win_probs(diff):
       diff 20 → hw 85% (기존 69%)
       diff 25+ → hw 94% 캡 근접 (기존은 diff 39 근처에서야 캡)
     """
-    hw = max(0.04, min(0.94, 0.45 + diff * 0.020))
-    dw = max(0.05, 0.28 - abs(diff) * 0.010)
+    # [2026-10 재조정, 신민용 확정 "C안": 리그 7번/8번] 기울기 0.020→0.025,
+    # 무승부 감소폭 0.010→0.011. diff는 이제 _league_match_diff가 만든 값
+    # (팀 전력에 OVR 수준 곡선을 씌운 차이 + 홈 이점)이다 — 그쪽 주석 참고.
+    hw = max(0.04, min(0.94, 0.45 + diff * 0.025))
+    dw = max(0.05, 0.28 - abs(diff) * 0.011)
     aw = max(0.02, 1.0 - hw - dw)
     tot = hw + dw + aw
     return hw / tot, dw / tot, aw / tot
+
+
+# [2026-10 신설, 신민용 확정: "같은 5점 차이라도 90 vs 85보다 100 vs 95가 더 큰
+# 실질 차이"] 리그·국내컵 전용 OVR 수준 곡선. 클럽 대항전 곡선(competition_
+# common._TOURNAMENT_OVR_CURVE_PTS)은 85를 넘으면 약 1.4~1.6배로 평평해서
+# (90 vs 85 → 8.0, 100 vs 95 → 8.0) 레벨이 오를수록 계속 커지지는 않았다.
+# 이 곡선은 구간 배율이 레벨과 함께 커진다: 85 이하 1.0배 / 85~90 1.5배 /
+# 90~95 1.6배 / 95~100 2.0배 / 100 초과는 2.0배 그대로 연장.
+#   원시 5점 차이의 실질 차이: 80 vs 75 → 5.0, 90 vs 85 → 7.5,
+#   95 vs 90 → 8.0, 100 vs 95 → 10.0
+# (1차 시도 1.3/1.6/2.0배는 A급 리그(전력 85~92 위주)의 전력 반영이 기존보다
+#  약해져서 — 순위-전력 상관 0.61→0.56, 상위 6팀 강등 증가 — 85~90 구간을
+#  1.5배로 올렸다. 2시드 10시즌 검증 결과는 이 변경을 전달한 대화 기록 참고.)
+# 챔스·유로파·컨퍼런스는 기존 곡선을 그대로 쓴다(신민용 확정 — 그쪽은 이미
+# 고OVR 차이를 반영하고 있고 이번 변경 범위가 아니다).
+_LEAGUE_CUP_OVR_CURVE_PTS = [(85.0, 85.0), (90.0, 92.5), (95.0, 100.5), (100.0, 110.5)]
+_LEAGUE_CUP_TOP_SLOPE = 2.0
+
+
+def _league_cup_effective_ovr(ovr):
+    """리그·국내컵 전용 OVR 수준 곡선(위 _LEAGUE_CUP_OVR_CURVE_PTS)."""
+    pts = _LEAGUE_CUP_OVR_CURVE_PTS
+    if ovr <= pts[0][0]:
+        return ovr
+    if ovr >= pts[-1][0]:
+        return pts[-1][1] + (ovr - pts[-1][0]) * _LEAGUE_CUP_TOP_SLOPE
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if x0 <= ovr <= x1:
+            return y0 + (ovr - x0) * (y1 - y0) / (x1 - x0)
+    return ovr
+
+
+_LEAGUE_OVR_CURVE = None
+
+
+def _league_match_diff(home_strength, away_strength, home_adv):
+    """[2026-10 신설, 신민용 리포트 7번/8번, "C안" 확정] 리그 경기 전력차.
+
+    예전엔 diff = (홈 전력 + 홈 이점) − (원정 전력)을 그대로 직선 공식에
+    넣었다 — OVR의 절대 수준을 전혀 안 봐서 90 vs 85와 98 vs 93이 완전히
+    같은 매치업이었고, 기울기도 완만해(1점당 2%p) 5점 차이면 수준과 무관하게
+    약팀이 30%를 이겼다(10점 차이도 22%). 그 결과 리그 순위가 전력을 잘
+    못 따라가서(EPL 순위-전력 상관 0.55), 대륙 대항전 결승까지 간 팀이 같은
+    해 리그에서 강등되는 일이 10시즌에 16~25건 나왔다.
+
+    이제 두 팀 전력에 OVR 수준 곡선(리그·국내컵 전용 _league_cup_effective_ovr
+    — 85 이하 그대로, 구간 배율 1.5/1.6/2.0배)을 씌운 뒤 차이를 낸다. 같은
+    5점 차이도 고OVR 구간일수록 크게 반영된다.
+    홈 이점은 곡선 밖에서 더한다 — 홈 이점은 리그 수준과 무관하게 예전과
+    같은 크기(1.5~4.5점)로 유지한다(곡선 안에 넣으면 상위 리그일수록 홈
+    이점까지 1.5배 가까이 커진다). home_strength/away_strength에는 팀 OVR과
+    포메이션 보정까지 포함해서 넘긴다."""
+    # [2026-10 변경] 곡선을 리그·국내컵 전용 _league_cup_effective_ovr로 바꿨다
+    # (위 _LEAGUE_CUP_OVR_CURVE_PTS 주석 참고). 홈 이점은 그대로 곡선 밖.
+    return (_league_cup_effective_ovr(home_strength) - _league_cup_effective_ovr(away_strength)
+            + home_adv)
 
 
 def _roll_outcome(diff):
@@ -2531,9 +2598,10 @@ def _sim_my_team_match_as_ai(week, p, season):
     m = c.fetchone()
     if m:
         hid, aid = m["home_team_id"], m["away_team_id"]
-        ho = _team_avg_ovr(c, hid) + _home_advantage() + _formation_bias(c, hid)
+        _ha = _home_advantage()
+        ho = _team_avg_ovr(c, hid) + _formation_bias(c, hid)
         ao = _team_avg_ovr(c, aid) + _formation_bias(c, aid)
-        diff = ho - ao
+        diff = _league_match_diff(ho, ao, _ha)   # [2026-10] C안 — _league_match_diff 참고
         outcome = _roll_outcome(diff)
         # [버그수정] diff를 _gen_score에 전달 — 이전엔 인자 누락으로 항상 박빙 취급됐음
         # [2026-09 신설, "국가별 득점환경" 1단계]
@@ -2589,9 +2657,10 @@ def _sim_my_unscheduled_match(week: int, p, season: int, day=None):
             (lid, season, week, tid, tid)).fetchone()
     if row:
         c = conn.cursor()
-        ho = _team_avg_ovr_with_me(c, row["home_team_id"], p) + _home_advantage() + _formation_bias(c, row["home_team_id"])
+        _ha = _home_advantage()
+        ho = _team_avg_ovr_with_me(c, row["home_team_id"], p) + _formation_bias(c, row["home_team_id"])
         ao = _team_avg_ovr_with_me(c, row["away_team_id"], p) + _formation_bias(c, row["away_team_id"])
-        diff = ho - ao
+        diff = _league_match_diff(ho, ao, _ha)   # [2026-10] C안 — _league_match_diff 참고
         outcome = _roll_outcome(diff)
         # [버그수정] diff를 _gen_score에 전달
         # [2026-09 신설, "국가별 득점환경" 1단계]
@@ -2661,15 +2730,16 @@ def _sim_all_ai_matches(week, my_league_id, season):
         is_my_match = (m["home_team_id"] == my_tid or m["away_team_id"] == my_tid)
         if is_my_match and not is_offseason:
             continue
+        _ha = _home_advantage()
         if is_my_match:
             # [2026-07 신설] 비시즌 예외로 내 팀 경기가 이 일괄처리에 걸리는
             # 경우, 내가 부상/정지가 아니면 merit-based로 나를 반영한다.
-            ho = _team_avg_ovr_with_me(c, m["home_team_id"], _my_p) + _home_advantage() + _formation_bias(c, m["home_team_id"])
+            ho = _team_avg_ovr_with_me(c, m["home_team_id"], _my_p) + _formation_bias(c, m["home_team_id"])
             ao = _team_avg_ovr_with_me(c, m["away_team_id"], _my_p) + _formation_bias(c, m["away_team_id"])
         else:
-            ho = _team_avg_ovr(c, m["home_team_id"]) + _home_advantage() + _formation_bias(c, m["home_team_id"])
+            ho = _team_avg_ovr(c, m["home_team_id"]) + _formation_bias(c, m["home_team_id"])
             ao = _team_avg_ovr(c, m["away_team_id"]) + _formation_bias(c, m["away_team_id"])
-        diff = ho - ao
+        diff = _league_match_diff(ho, ao, _ha)   # [2026-10] C안 — _league_match_diff 참고
         outcome = _roll_outcome(diff)
         # [버그수정] diff를 _gen_score에 전달 — 전체 리그 경기의 90%+가 여길 거침
         # [2026-09 신설, "국가별 득점환경" 1단계] 이 경기가 속한 리그의
@@ -3821,9 +3891,10 @@ def _simulate_match(p, week, info: dict, day=None):
     except Exception:
         home_ovr2 = home_ovr + (bonus if is_home else 0.0)
         away_ovr2 = away_ovr + (bonus if not is_home else 0.0)
-        home_ovr2 += _home_advantage() + _formation_bias(c, home_id)
+        _ha = _home_advantage()
+        home_ovr2 += _formation_bias(c, home_id)
         away_ovr2 += _formation_bias(c, away_id)
-        diff = home_ovr2 - away_ovr2
+        diff = _league_match_diff(home_ovr2, away_ovr2, _ha)   # [2026-10] C안
         outcome = _roll_outcome(diff)
         hs, as_ = _gen_score(outcome, diff)
 
@@ -8770,6 +8841,11 @@ def _advance_week(p, base_week, n_weeks=4, progress_cb=None):
         _p_after_push = get_player()
         if _p_after_push and _p_after_push.get("current_team_id"):
             _check_sale_push_forced_sale(_p_after_push, new_year, new_week)
+        # [2026-10 신설] 임대 마지막 시즌 — 임대처의 완전 영입 제안 판정(시즌 1회).
+        try:
+            _weekly_loan_buy_check(new_year, new_week)
+        except Exception as e:
+            print("_weekly_loan_buy_check 오류(건너뜀):", e)
 
     # [최적화] my_player + season_state 갱신을 하나의 커넥션으로 묶어 커밋 2회→1회
     conn_adv = get_conn()
@@ -11350,6 +11426,26 @@ def _league_rank_points(team_id: int) -> float:
     return 0.0
 
 
+def _my_club_comp_team(year):
+    """[2026-10 신설, 신민용 리포트 9번] 그 해 내가 실제로 등록돼 있던
+    클럽 대항전(챔스/유로파/컨퍼런스) 팀 — 대회가 끝난 시점의 등록팀이다
+    (competition_common.resync_my_registration이 이제 끝난 대회의 등록을
+    바꾸지 않는다). 그 해 어느 클럽 대항전에도 등록된 적이 없으면 None.
+    시즌 중 이적한 해에 "연말 소속팀"의 클럽 대항전 성적을 내 것으로 세던
+    문제를 막는다 — AI 쪽이 상반기 팀(cl_team_id)을 쓰는 것과 같은 원칙."""
+    conn = get_conn()
+    try:
+        for _tbl in ("cl_tournaments", "el_tournaments", "ecl_tournaments"):
+            r = conn.execute(
+                f"SELECT my_team_id FROM {_tbl} WHERE year=? AND my_in=1 "
+                f"AND my_team_id>0 LIMIT 1", (year,)).fetchone()
+            if r:
+                return r["my_team_id"]
+    finally:
+        conn.close()
+    return None
+
+
 def _get_ballon_trophy_bonus(year: int, team_id: int) -> float:
     """그 해 챔스+리그순위+자국컵+국가대표 메이저대회 성적을 합산한
     발롱도르용 트로피 보너스 점수 (0~약 25.5점 범위, 개인 성적 대비
@@ -11372,7 +11468,14 @@ def _get_ballon_trophy_bonus(year: int, team_id: int) -> float:
     # trophy_value를 그대로 쓴다 — team_id 기반 일반 함수라 "나"/AI
     # 구분 없이 재사용 가능, "내 발롱도르"와 "세계기록실 발롱도르"가
     # 어긋나면 안 된다는 이 함수의 설계 원칙 그대로 유지.
-    cl_stage, cl_continent, cl_tier = _get_club_comp_result(year, team_id)
+    # [2026-10 버그수정, 신민용 리포트 9번] 클럽 대항전은 연말 소속팀
+    # (team_id)이 아니라 그 해 내가 실제로 등록돼 있던 팀 기준이다 — 예전엔
+    # 챔스가 끝난 뒤 겨울에 우승팀으로 옮기기만 해도 그 팀의 챔스 우승
+    # 점수(+10)가 붙었고, 반대로 내가 뛴 팀의 성적은 빠졌다(헤드리스 재현).
+    # 어느 클럽 대항전에도 등록된 적이 없으면 이 항목은 0이다.
+    _cl_tid = _my_club_comp_team(year)
+    cl_stage, cl_continent, cl_tier = (_get_club_comp_result(year, _cl_tid) if _cl_tid
+                                       else (None, None, None))
     bonus += _club_comp_trophy_value(cl_stage, cl_continent, cl_tier)
     bonus += _cup_trophy_points(cup_t["my_result"] if cup_t else None, team_id=team_id)
     bonus += _sc_trophy_points(sc_t["my_result"] if sc_t else None)
@@ -12172,6 +12275,13 @@ _BALLON_POS_ASSIST_FALLBACK["LM"] = _BALLON_POS_ASSIST_FALLBACK["RM"] = 8
 # LWB)은 이 게임의 현재 POSITIONS 목록(constants.POSITIONS)에는 아직 없는
 # 포지션이지만, 나중에 포지션이 추가될 걸 대비해 값만 미리 채워둔다 —
 # 지금은 그 키로 조회될 일이 없으니 회귀 위험 없음.
+# [2026-10 신민용 확정 A안, 14시즌 같은 후보 비교 실측] 1위 DF+GK 6/14 → 4/14, Top3 DF 21→12% /
+# GK 12→5%, Top30 DF 15→11% / GK 6→6%(유지). 포지션 보정 확대(DF-2/GK-3)나 감쇠 곡선 완화는
+# 1위를 거의 못 바꿨고, 팀 내 1위 기준 변경은 GK의 Top30 진입 경로를 없앴다(Top30 GK 2%).
+_BALLON_DF_POS = {"CB", "LB", "RB", "LWB", "RWB"}
+_BALLON_DF_PRODUCTIVITY_MULT = 0.8
+_BALLON_TROPHY_IND_CAP_MULT = 1.2
+
 _BALLON_POSITION_BONUS = {
     "RW": 1.5, "LW": 1.5,
     "ST": 1.4,
@@ -12776,6 +12886,23 @@ def _score_ballon_candidate(cand):
     # 반영된다. 이제 포지션보정은 다른 포지션과 동일하게 순수 포지션
     # 가중치(_BALLON_POSITION_BONUS)만 담당한다.
     score_position_adj = _BALLON_POSITION_BONUS.get(pos, 0.5)
+    # [2026-10 신민용 확정 A안] ① 수비수 생산성 ×0.8 — 팀 실점 기반 생산성이 최상위에서
+    # 공격수의 골·도움 생산성과 같은 체급으로 나와(예: 2골 3도움 CB 9.0 vs 18골 8도움
+    # CAM 8.8), 평점이 2점 낮아도 1위를 가져갔다.
+    if pos in _BALLON_DF_POS:
+        score_goals_assists = round(score_goals_assists * _BALLON_DF_PRODUCTIVITY_MULT, 2)
+    # ② 트로피 상한 — 트로피 점수는 자기 개인 점수(평점+생산성+포지션 보정)의 1.2배까지만
+    # 인정. 팀이 우승했다고 개인 시즌이 평범한 선수가 트로피만으로 순위를 뒤집지 못하게
+    # (예: 평점·생산성 평범한 GK가 팀 트로피 19.6으로 1위). 개인 점수가 높은 선수는 거의
+    # 안 걸린다. 팀/국대/개인상 내역은 같은 비율로 줄여 합이 그대로 맞게 한다.
+    _ind = score_rating + score_goals_assists + score_position_adj
+    _cap = round(max(0.0, _ind * _BALLON_TROPHY_IND_CAP_MULT), 2)
+    if score_trophy > _cap:
+        _k2 = (_cap / score_trophy) if score_trophy > 0 else 0.0
+        team_trophy = round(team_trophy * _k2, 2)
+        national_trophy = round(national_trophy * _k2, 2)
+        individual_trophy = round(individual_trophy * _k2, 2)
+        score_trophy = _cap
 
     total = score_trophy + score_rating + score_goals_assists + score_position_adj
     return {
@@ -13105,10 +13232,19 @@ def _get_ballon_candidates(c, year):
         # 해 스냅샷)만 쓰고, 그마저 없으면 등록 포지션으로 폴백한다.
         my_position = _effective_award_position(
             my_reg_position, my_role_row["position"] if my_role_row else None, my_role, None, None)
+        # [2026-10 버그수정, 신민용 리포트 9번] AI 후보가 시즌 중 이적자에게
+        # 상반기 팀(cl_team_id)의 클럽 대항전 성적을 쓰는 것과 같이, 나도
+        # 그 해 실제 등록팀(_my_club_comp_team) 기준으로 본다 — 예전엔
+        # 연말 소속팀(my_row["team_id"])의 챔스 성적이 내 트로피 점수와
+        # 큰 무대 자격에 들어갔다. 등록팀이 연말 팀과 같거나 없으면 None
+        # (= 예전과 완전히 같은 계산).
+        _my_cl_team = _my_club_comp_team(year)
+        if _my_cl_team == my_row["team_id"]:
+            _my_cl_team = None
         if (my_grade and my_row["matches"] and my_row["matches"] >= 10 and
                 my_role not in _EXCLUDED_ROLES and
                 _is_ballon_candidate(my_grade, year, my_row["team_id"], _SIA_MY_PLAYER_ID,
-                                      my_nat, cache=_cache)):
+                                      my_nat, cache=_cache, cl_team_id=_my_cl_team)):
             # [2026-09 확장, AI 경로와 동일한 취지] 내 챔스 개인 기록은
             # cl_matches/cl_tournaments의 my_played=1 행에서 직접 집계한다
             # — my_player_season_stats_by_comp 같은 요약 표가 나한테는
@@ -13139,9 +13275,11 @@ def _get_ballon_candidates(c, year):
                 "nationality": my_nat, "year": year, "role": my_role,
                 "award_bonus": _award_bonus_map.get(_SIA_MY_PLAYER_ID, 0.0),
                 "trophy_bonus": _get_team_trophy_bonus(year, my_row["team_id"], _SIA_MY_PLAYER_ID,
-                                                        cache=_cache),
-                "cl_continent": _cache.get(("cl", year, my_row["team_id"]), (None, None, None))[1],
-                "cl_tier": _cache.get(("cl", year, my_row["team_id"]), (None, None, None))[2],
+                                                        cache=_cache, cl_team_id=_my_cl_team),
+                "cl_continent": _cache.get(("cl", year, _my_cl_team or my_row["team_id"]),
+                                           (None, None, None))[1],
+                "cl_tier": _cache.get(("cl", year, _my_cl_team or my_row["team_id"]),
+                                      (None, None, None))[2],
                 "intl_bonus": _get_player_intl_bonus(year, _SIA_MY_PLAYER_ID, my_nat),
             })
 
@@ -17623,7 +17761,9 @@ def _end_of_season(p, year, progress_cb=None):
     p = get_player() or p
     from constants import MILITARY_STATUS_SERVING as _MSS
     if (p.get("military_status") or "") != _MSS:
-        _return_from_loan_if_due(p, year)
+        # [2026-10 신설] 임대처의 완전 영입 제안을 수락해 둔 경우 복귀 대신 이적.
+        if not _execute_loan_buy(p, year):
+            _return_from_loan_if_due(p, year)
     p = get_player() or p   # 복귀로 소속이 바뀌었을 수 있으니 다시 최신화
 
     # [2026-08 신설, 3단계] 판매추진 제안을 수락해 예약해둔 이적이 있으면
@@ -18671,6 +18811,189 @@ def my_military_devalue_factor(p=None):
     return f
 
 
+# ══════════════════════════════════════════════════════════════════
+# [2026-10 신설, 신민용 확정] 임대 후 완전 이적 — 내 선수
+# ══════════════════════════════════════════════════════════════════
+# AI(ai_lifecycle._loan_buy_roll)와 같은 표(constants.loan_buy_probability)를
+# 쓰되, 내 선수는 실제 개인 기록이 있으므로 구간 안 위치를 역할 라벨 대신
+# 실제 출전비율로 정한다(40%→하단, 100%→상단, 40% 미만은 대기 구간 0~5%).
+# 사전 조건도 AI와 같다: 31세 이하, 원 소속팀 비주전(원 소속팀 로스터 OVR
+# 11번째보다 낮음), 23세 이하는 재능 상한(talent_cap)도 그보다 낮아야 함.
+# 임대 마지막 시즌 MY_LOAN_BUY_CHECK_WEEK(리그 종료 뒤)부터 시즌당 1회 판정하고,
+# 성사되면 판매추진처럼 수락/거절 창을 띄운다. 수락하면 예약해 뒀다가
+# 시즌 종료(_end_of_season) 때 복귀 대신 임대처와 새 계약을 맺는다.
+def _my_loan_buy_ratio(p):
+    full = _league_full_season_matches(p)
+    if not full:
+        return 0.0
+    return min(1.0, (p.get("season_matches") or 0) / float(full))
+
+
+def _weekly_loan_buy_check(cur_year, cur_week):
+    from constants import (MY_LOAN_BUY_CHECK_WEEK, LOAN_BUY_MAX_AGE,
+                           LOAN_BUY_YOUNG_MAX_AGE, LOAN_BUY_MIN_PLAY_RATIO,
+                           loan_buy_probability, get_league_grade)
+    p = get_player()
+    if not p or _my_is_serving(p):
+        return
+    loan_from = p.get("loan_from_team_id") or 0
+    host = p.get("current_team_id") or 0
+    if not loan_from or not host:
+        return
+    if (p.get("loan_end_year") or 0) != cur_year or cur_week < MY_LOAN_BUY_CHECK_WEEK:
+        return   # 임대 마지막 시즌, 리그가 끝난 뒤에만
+    if (p.get("loan_buy_checked_year") or 0) == cur_year:
+        return
+    if p.get("loan_buy_proposal_json") or p.get("pending_loan_buy_json"):
+        return
+    update_player(loan_buy_checked_year=cur_year)
+
+    age = p.get("age") or 25
+    ovr = p.get("ovr") or 0
+    if age > LOAN_BUY_MAX_AGE:
+        return
+    conn = get_conn()
+    try:
+        _ovrs = [r[0] or 0 for r in conn.execute(
+            "SELECT ovr FROM ai_players WHERE team_id=? ORDER BY ovr DESC", (loan_from,)).fetchall()]
+        row = conn.execute("""SELECT t.id, t.name, l.name AS lname, l.tier,
+                                     cn.name AS country, cn.flag, cn.grade
+                              FROM teams t JOIN leagues l ON t.league_id=l.id
+                              JOIN countries cn ON l.country_id=cn.id
+                              WHERE t.id=?""", (host,)).fetchone()
+        parent = conn.execute("SELECT name FROM teams WHERE id=?", (loan_from,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return
+    cut = _ovrs[10] if len(_ovrs) >= 11 else 0
+    if ovr >= cut:
+        return   # 원 소속팀에서 주전감 → 원 소속팀이 다시 부른다
+    if age <= LOAN_BUY_YOUNG_MAX_AGE and (p.get("talent_cap") or 0) >= cut:
+        return   # 잘 클 유망주 → 원 소속팀이 다시 부른다
+    rc = p.get("season_rating_cnt") or 0
+    if not rc or not (p.get("season_matches") or 0):
+        return
+    rating = (p.get("season_rating_sum") or 0.0) / rc
+    ratio = _my_loan_buy_ratio(p)
+    if ratio < LOAN_BUY_MIN_PLAY_RATIO:
+        prob = loan_buy_probability(rating, ratio / LOAN_BUY_MIN_PLAY_RATIO, age, bench=True)
+    else:
+        prob = loan_buy_probability(
+            rating, (ratio - LOAN_BUY_MIN_PLAY_RATIO) / (1.0 - LOAN_BUY_MIN_PLAY_RATIO), age)
+    print(f"[LOAN-BUY] 내 선수 {cur_year}년 {cur_week}주: 평점 {rating:.2f} · 출전 {ratio*100:.0f}% "
+          f"· {age}세 → 확률 {prob*100:.1f}%", flush=True)
+    if prob <= 0 or random.random() >= prob:
+        return
+
+    grade = get_league_grade(row["country"], row["grade"])
+    tier = row["tier"]
+    salary = _calc_offer_salary(p, grade, tier, ovr, row["country"], row["name"],
+                                year=cur_year, team_id=host)
+    _cend = p.get("contract_end_year") or 0
+    if _cend and _cend <= cur_year:
+        fee = 0   # 원 소속팀 계약이 이번 시즌으로 끝남 → 이적료 없이 계약
+    else:
+        fee = estimate_transfer_fee(
+            grade, tier, ovr, country=row["country"], team_name=row["name"],
+            position=get_field_pos(p), age=age, talent_cap=p.get("talent_cap"),
+            contract_remaining_years=(max(0, _cend - cur_year) if _cend else None),
+            year=cur_year, team_id=host,
+            effective_ovr=calc_effective_ovr(p, ovr=ovr)) or 0
+    proposal = {
+        "team_id": host, "team_name": row["name"], "league_name": row["lname"],
+        "tier": tier, "country": row["country"], "flag": row["flag"] or "",
+        "parent_name": parent["name"] if parent else "",
+        "salary": int(salary or 0), "transfer_fee": int(fee),
+        "contract_years": _calc_contract_years(age, tier, row["country"]),
+        "rating": round(rating, 2), "play_ratio": round(ratio, 3),
+    }
+    update_player(loan_buy_proposal_json=json.dumps(proposal, ensure_ascii=False))
+    add_log(f"📨 {row['name']}이(가) 임대 성과를 보고 완전 영입을 제안했습니다.",
+            "event", cur_year, cur_week)
+
+
+def accept_loan_buy_proposal():
+    """[2026-10] 임대처 완전 영입 제안 수락 — 시즌 종료 때 실행되도록 예약."""
+    p = get_player()
+    raw = (p or {}).get("loan_buy_proposal_json") or ""
+    if not raw:
+        return False
+    try:
+        proposal = json.loads(raw)
+    except Exception:
+        update_player(loan_buy_proposal_json="")
+        return False
+    update_player(loan_buy_proposal_json="", pending_loan_buy_json=raw)
+    add_log(f"✅ {proposal['team_name']} 완전 이적 제안을 수락했습니다 — "
+            f"시즌이 끝나면 원 소속팀 복귀 대신 이적합니다.", "event")
+    return True
+
+
+def reject_loan_buy_proposal():
+    """[2026-10] 임대처 완전 영입 제안 거절 — 예정대로 시즌 종료 때 복귀."""
+    p = get_player()
+    raw = (p or {}).get("loan_buy_proposal_json") or ""
+    if not raw:
+        return False
+    try:
+        _name = json.loads(raw).get("team_name", "")
+    except Exception:
+        _name = ""
+    update_player(loan_buy_proposal_json="")
+    add_log(f"🚫 {_name} 완전 이적 제안을 거절했습니다 — 시즌이 끝나면 원 소속팀으로 복귀합니다.",
+            "event")
+    return True
+
+
+def _execute_loan_buy(p, year) -> bool:
+    """[2026-10] _end_of_season에서 임대 복귀 직전에 호출. 예약된 완전 이적이
+    있으면 임대처와 새 계약을 맺고 True(→ 복귀 처리 생략). 임대처 커리어 행은
+    연도 전환 때 이미 닫혀 있으므로(그 행은 "임대"로 남는다) 새 시즌 첫
+    _ensure_career_entry가 "완전 이적"(합의 이적료·새 계약년수) 행을 연다."""
+    global _pending_transfer_type, _pending_transfer_fee
+    # 결정하지 않은 제안은 시즌이 끝나면 소멸(거절과 같음)
+    if p.get("loan_buy_proposal_json"):
+        update_player(loan_buy_proposal_json="")
+    raw = p.get("pending_loan_buy_json") or ""
+    if not raw:
+        return False
+    update_player(pending_loan_buy_json="")
+    try:
+        proposal = json.loads(raw)
+    except Exception:
+        return False
+    if (_my_is_serving(p) or not p.get("loan_from_team_id")
+            or p.get("current_team_id") != proposal.get("team_id")):
+        add_log(f"⚠️ {proposal.get('team_name', '')} 완전 이적 예약이 취소됐습니다(소속 변경).",
+                "event", year, 52)
+        return False
+    conn = get_conn()
+    try:
+        team_row = conn.execute(
+            "SELECT t.name, t.league_id, l.name AS lname, l.tier FROM teams t "
+            "JOIN leagues l ON t.league_id=l.id WHERE t.id=?", (proposal["team_id"],)).fetchone()
+    finally:
+        conn.close()
+    if not team_row:
+        return False
+    c_yrs = int(proposal.get("contract_years") or 1)
+    fee = int(proposal.get("transfer_fee") or 0)
+    _pending_transfer_type = "완전 이적"
+    _pending_transfer_fee = fee
+    # N년 계약 = N시즌: 다음 시즌(year+1)부터 year+N까지(신민용 확정 규칙)
+    update_player(salary=int(proposal.get("salary") or p.get("salary") or 0),
+                  contract_years=c_yrs, contract_end_year=year + c_yrs,
+                  current_league_id=team_row["league_id"], current_tier=team_row["tier"],
+                  loan_from_team_id=0, loan_from_league_id=0,
+                  loan_from_tier=0, loan_end_year=0,
+                  transfer_requested=0, club_tenure_seasons=1)
+    add_log(f"✍ {team_row['name']} 완전 이적 확정!  {team_row['lname']}({team_row['tier']}부)  "
+            f"|  이적료 {fmt_money(fee)}  |  {c_yrs}년 계약  |  "
+            f"월 {fmt_money(int(proposal.get('salary') or 0)//12)}", "event", year, 52)
+    return True
+
+
 def _return_from_loan_if_due(p, year):
     """[2026-07 신설] 임대 기간(loan_end_year)이 끝났으면 원소속팀으로
     자동 복귀시킨다. 원소속팀이 그사이 승강했을 수 있으니 현재 소속
@@ -18949,7 +19272,7 @@ def enforce_affiliate_children_tier(parent_team_id: int, year: int) -> None:
             # 선수를 콜업해 산하팀 전력만 낮춘다 — 산하팀은 같은 리그에
             # 남아 정상적으로 경쟁한다. tier가 안 바뀌므로 그 밑의 손자팀
             # 으로 재귀 전파할 것도 없다(기존의 queue.append 제거).
-            picked_ids = _affiliate_callup_from_child(conn, pid, child["id"])
+            picked_ids = _affiliate_callup_from_child(conn, pid, child["id"], year=year)
             if picked_ids:
                 # [2026-08 정리, 신민용 확정] 기능 검증용 콘솔 print 제거
                 # (동작 자체는 그대로 — 콜업 로직/any_change 갱신만 유지).
@@ -18962,7 +19285,7 @@ def enforce_affiliate_children_tier(parent_team_id: int, year: int) -> None:
 
 def _affiliate_callup_from_child(conn, parent_id, child_id,
                                   max_players=3, min_child_remaining=11,
-                                  max_pct=0.25):
+                                  max_pct=0.25, year=None):
     """[2026-08 재설계, 신민용 확정: "강등 자체를 막으면 안 된다"] 1군(parent_id)이
     강등(정규 시즌 종료 또는 승강 플레이오프)으로 산하팀(child_id)과 같은
     tier가 됐을 때, 예전처럼 산하팀을 강제로 한 티어 더 밀어내리는 대신
@@ -19061,6 +19384,43 @@ def _affiliate_callup_from_child(conn, parent_id, child_id,
     placeholders = ",".join("?" * len(picked_ids))
     c.execute(f"UPDATE ai_players SET team_id=? WHERE id IN ({placeholders})",
               (parent_id, *picked_ids))
+    # [2026-10 버그수정, 신민용 리포트: "B팀·II·U21 선수가 1군으로 올라갈 때
+    # 이적 기록이 안 남아 선수 검색에서 그 해 소속이 틀리게 보인다"] 이
+    # 콜업은 소속(team_id)만 바꾸고 ai_transfer_log에 아무것도 안 남겼다 —
+    # 선수 검색의 연도별 소속(world_browser.get_ai_player_team_timeline)은
+    # 이적 기록으로만 재구성되므로, 콜업된 선수는 1군에서 몇 시즌을 뛰어도
+    # 계속 산하팀 소속으로 표시됐다(10시즌 헤드리스 실측 813건, 전부
+    # "산하팀 → 자기 모팀"). 다른 이동 통로와 같은 형식으로 남긴다 —
+    # 시즌 종료(43주) 이후의 이동이므로 오프시즌 이동(is_mid_season=0,
+    # year=그 시즌 → 다음 해부터 1군 소속)이다. 계약·연봉은 그대로 이어지는
+    # 이동이라 현재 값을 그대로 적는다. 이 기록은 겨울 이적/임대만 보는
+    # 게임 판단 로직(역할 재산정·임대 한도 등)에는 걸리지 않는다.
+    if year is not None:
+        try:
+            _cs = c.execute("SELECT current_season FROM season_state WHERE id=1").fetchone()
+            _cur_season_cu = _cs["current_season"] if _cs else 1
+            _info = {r["id"]: r for r in c.execute(
+                f"SELECT id, name, position, age, ovr, salary, contract_end_year "
+                f"FROM ai_players WHERE id IN ({placeholders})", picked_ids).fetchall()}
+            _rows = []
+            for _pid in picked_ids:
+                _r = _info.get(_pid)
+                if _r is None:
+                    continue
+                _rows.append((_cur_season_cu, year, _pid, _r["name"] or "", _r["position"] or "",
+                              _r["age"] or 0, _r["ovr"] or 0, child_id, parent_id,
+                              0, 0, 0.0, 0.0, "1군 콜업", 0, "", 0, 0, 0,
+                              _r["salary"] or 0, _r["contract_end_year"] or 0))
+            if _rows:
+                c.executemany(
+                    """INSERT INTO ai_transfer_log(
+                        season, year, player_id, player_name, player_position, player_age, player_ovr,
+                        from_team_id, to_team_id, from_team_prestige, to_team_prestige,
+                        from_team_avg_ovr, to_team_avg_ovr, transfer_type, is_mid_season, player_role,
+                        fee, is_loan, loan_return_year, salary, contract_end_year)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", _rows)
+        except Exception as _e_cu:
+            print(f"[산하팀 콜업] 이적 기록 저장 실패(계속 진행): {_e_cu}")
     return picked_ids
 
 
@@ -19506,6 +19866,7 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
     _country_name_by_id: dict = {r["id"]: r["name"] for r in c.execute(
         "SELECT id, name FROM countries").fetchall()}
     _rescale_jobs: list = []
+    _deferred_callups: list = []   # [2026-10] (모팀, 산하팀) — 시즌 종료 스냅샷 뒤에 콜업
     _momentum_reset_updates: list = []  # [2026-08 신설] (momentum_type, seasons_left, team_id) — 이벤트 발생 시 리셋
     # [2026-07 최적화, 신민용 리포트: "연도전환 최적화 더 해봐"] 승격/강등
     # 팀마다 UPDATE teams + INSERT promotion_log를 개별 실행했는데(실측
@@ -19969,21 +20330,18 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
                     #   경쟁한다. tier가 안 바뀌므로 "이미 최하위라 더 못
                     #   내려간다"는 구조적 예외 자체가 더 이상 필요 없다.
                     _tname = _team_info_cache.get(_tid, ("", ""))[0]
-                    _picked_ids = _affiliate_callup_from_child(conn, _pid_cur, _tid)
-                    if _picked_ids:
-                        # [2026-08 정리, 신민용 확정] 기능 검증용 콘솔 print 제거
-                        # (아래 _audit()의 tier_audit.jsonl 기록은 그대로 유지 —
-                        # 콘솔 출력만 없앤다).
-                        _audit({**_audit_base, "correction_action": "CALLUP",
-                                "skip_reason": "CORRECTED", "result_tier": _cur_tier,
-                                "callup_player_count": len(_picked_ids)})
-                    else:
-                        # 콜업할 대상이 없어도(산하팀 스쿼드가 이미 얇거나
-                        # 부족 포지션이 없는 경우) tier는 그대로 둔다 —
-                        # 억지로 리그를 조작하지 않는다는 원칙은 유지.
-                        _audit({**_audit_base, "correction_action": "CALLUP",
-                                "skip_reason": "NO_ELIGIBLE_PLAYERS", "result_tier": _cur_tier,
-                                "callup_player_count": 0})
+                    # [2026-10 버그수정, 신민용 리포트: "B팀·II·U21 선수가 1군으로
+                    # 올라갈 때 소속이 틀리게 보인다"] 콜업 자체를 여기서 바로
+                    # 하지 않고 아래 시즌 종료 스냅샷(포메이션·역할·시즌 평점)
+                    # 뒤로 미룬다 — 예전엔 이 시점에 소속을 먼저 바꿔서, 그
+                    # 시즌을 산하팀에서 다 뛴 선수의 그 해 기록(평점·골·포메
+                    # 이션·역할)이 전부 1군 소속으로 찍혔다(10시즌 실측 134건).
+                    # 이 아래부터 스냅샷까지는 선수단을 보는 로직이 없고,
+                    # 미룬 콜업은 리스케일·스쿼드 개편보다 먼저 실행되므로
+                    # 그 둘이 보는 선수단은 예전과 같다.
+                    _deferred_callups.append((_pid_cur, _tid))
+                    _audit({**_audit_base, "correction_action": "CALLUP",
+                            "skip_reason": "DEFERRED_AFTER_SNAPSHOT", "result_tier": _cur_tier})
                     # 이번 시즌엔 이 (자식,모팀) 쌍을 다시 위반으로 잡지
                     # 않는다 — tier가 그대로라 재판정하면 매 패스마다 또
                     # 콜업이 반복된다.
@@ -20123,6 +20481,14 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
                                   pos_role_by_pid=_pos_role_by_pid_w43)
     except Exception as _e:
         add_log(f"[하반기 평점 스냅샷 오류] {_e}", "normal", year, 52)
+    # [2026-10] 위 산하팀 tier 보정에서 미뤄둔 1군 콜업 — 이번 시즌 기록이
+    # 산하팀 소속으로 다 찍힌 뒤에 실행한다(그쪽 주석 참고). 리스케일·
+    # 스쿼드 개편(바로 아래)보다는 먼저라 그 둘의 입력은 예전과 같다.
+    for _cu_pid, _cu_tid in _deferred_callups:
+        try:
+            _affiliate_callup_from_child(conn, _cu_pid, _cu_tid, year=year)
+        except Exception as _e_cu:
+            add_log(f"[산하팀 콜업 오류] {_e_cu}", "normal", year, 52)
     _pr_t6c = _time_pr.perf_counter()
 
     # 승강팀 OVR 평형 일괄 적용
@@ -20263,9 +20629,10 @@ def _finish_incomplete_matches_for_season(season: int):
     if stale:
         batch = []
         for m in stale:
-            ho = _team_avg_ovr(c, m["home_team_id"]) + _home_advantage() + _formation_bias(c, m["home_team_id"])
+            _ha = _home_advantage()
+            ho = _team_avg_ovr(c, m["home_team_id"]) + _formation_bias(c, m["home_team_id"])
             ao = _team_avg_ovr(c, m["away_team_id"]) + _formation_bias(c, m["away_team_id"])
-            diff = ho - ao
+            diff = _league_match_diff(ho, ao, _ha)   # [2026-10] C안 — _league_match_diff 참고
             outcome = _roll_outcome(diff)
             hs, as_ = _gen_score(outcome, diff)
             batch.append((hs, as_, m["id"]))
@@ -24034,9 +24401,10 @@ def _sim_league_full(league_id, season, c=None, st=None, exclude_team_id=None):
     for m in matches:
         hid = m["home_team_id"]
         aid = m["away_team_id"]
-        ho = _team_avg_ovr(c, hid) + _home_advantage() + _formation_bias(c, hid)
+        _ha = _home_advantage()
+        ho = _team_avg_ovr(c, hid) + _formation_bias(c, hid)
         ao = _team_avg_ovr(c, aid) + _formation_bias(c, aid)
-        diff = ho - ao
+        diff = _league_match_diff(ho, ao, _ha)   # [2026-10] C안 — _league_match_diff 참고
         outcome = _roll_outcome(diff)
         hs, as_ = _gen_score(outcome, diff)  # [버그수정] diff 전달
         # teams 테이블 업데이트 없이 match_results에만 저장 (배치 처리)
@@ -24072,9 +24440,10 @@ def _backfill_past_matches(league_id, season, current_week, my_team_id):
         hid = m["home_team_id"]
         aid = m["away_team_id"]
         # 내 팀이 포함된 과거 경기도 랜덤으로 처리 (입단 전이니 AI끼리 뛴 것)
-        ho = _team_avg_ovr(c, hid) + _home_advantage() + _formation_bias(c, hid)
+        _ha = _home_advantage()
+        ho = _team_avg_ovr(c, hid) + _formation_bias(c, hid)
         ao = _team_avg_ovr(c, aid) + _formation_bias(c, aid)
-        diff = ho - ao
+        diff = _league_match_diff(ho, ao, _ha)   # [2026-10] C안 — _league_match_diff 참고
         outcome = _roll_outcome(diff)
         hs, as_ = _gen_score(outcome, diff)  # [버그수정] diff 전달
         _accum_team_rec(team_deltas, hid, aid, outcome, hs, as_)

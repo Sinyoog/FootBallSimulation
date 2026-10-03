@@ -46,7 +46,7 @@ ui/formation_widget.py와 ai_lifecycle.py 둘 다 여기서 import해서 쓴다
 from constants import (POSITION_COMPAT, POSITION_MISMATCH_PENALTY,
                         FOOT_SIDED_SLOTS, FOOT_INVERTED_SLOTS, FOOT_BOTH,
                         FOOT_MISMATCH_PENALTY, FOOT_INVERTED_BONUS,
-                        FOOT_BENCH_SWAP)
+                        FOOT_BENCH_SWAP, FOOT_LEFT, FOOT_RIGHT)
 
 
 # [2026-08 최적화] 아래 _pos_category는 시즌 전환 한 번에 350만 회 넘게
@@ -268,6 +268,7 @@ def _greedy_fill_slots(candidates, slots_only):
     # "포지션 rank 합을 나쁘게 만들지 않는" 교환으로 바로잡는다.
     # 파라미터가 0이면 즉시 반환해 완전 무동작(_foot_swap_pass 주석 참고).
     _foot_swap_pass(slot_filled, slots_only, candidates)
+    _order_cb_by_foot(slot_filled, slots_only)
 
     return slot_filled
 
@@ -783,6 +784,34 @@ def _foot_swap_pass(slot_filled, slots_only, candidates=None):
         # [D단계 실험] 벤치까지 열면 선발 11명 자체가 재구성된다.
         if _foot_bench_swap(slot_filled, slots_only, candidates):
             _foot_swap_pass(slot_filled, slots_only, None)   # 자리 재정렬만 1회
+
+
+# [2026-10 신설, 신민용 확정 표: "LCB 왼발 / RCB 오른발"] 게임 포지션엔
+# LCB/RCB 구분 없이 CB 하나뿐이고, 포메이션 화면은 같은 줄의 CB 슬롯을
+# 슬롯 순서(=slots_only 인덱스 오름차순)대로 왼쪽부터 그린다
+# (ui/formation_widget._pos_x_order가 CB끼리는 같은 값이라 안정 정렬).
+# 그래서 CB 슬롯에 들어간 선수끼리만 왼발 → 양발/미배정 → 오른발 순으로
+# 자리를 바꿔, 왼발 CB가 왼쪽 CB 자리에 서게 한다. 같은 "CB" 슬롯끼리의
+# 교환이라 포지션 적합도·유효 적합도·선발 명단은 전혀 바뀌지 않는다.
+# 주발 보정이 꺼진 기준선(두 파라미터 0)에서는 _foot_swap_pass와 똑같이
+# 무동작이다.
+_CB_FOOT_ORDER = {FOOT_LEFT: 0, FOOT_RIGHT: 2}
+
+
+def _order_cb_by_foot(slot_filled, slots_only):
+    if FOOT_MISMATCH_PENALTY <= 0 and FOOT_INVERTED_BONUS <= 0:
+        return
+    idxs = [i for i in range(len(slots_only))
+            if slots_only[i] == "CB" and slot_filled[i] is not None]
+    if len(idxs) < 2:
+        return
+    players = [slot_filled[i] for i in idxs]
+    ordered = sorted(players, key=lambda pl: _CB_FOOT_ORDER.get(pl.get("foot") or "", 1))
+    if ordered == players:
+        return
+    for i, pl in zip(idxs, ordered):
+        slot_filled[i] = pl
+        pl["_slot_idx"] = i
 
 
 def prep_roster(roster):

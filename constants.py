@@ -2223,12 +2223,31 @@ FEET = (FOOT_LEFT, FOOT_RIGHT, FOOT_BOTH)
 
 # {생성 포지션: (왼발, 오른발, 양발)} — 가중치(합 100 기준이지만 합이
 # 달라도 비율로 정규화된다). 여기 없는 포지션은 FOOT_DIST_DEFAULT.
+#
+# [2026-10 개정, 신민용 확정: "주발이 포지션이랑 안 맞는다 — LB인데 오른발이
+# 뜨기도 한다"] 처음 분포는 LB/RB만 70/25로 기울이고 나머지(GK·CB·중앙·
+# 윙어)는 전부 기본값 20/75/5를 써서, 오른발 LB가 25%나 되고 RW는 75%가
+# 오른발(표의 "왼발 또는 오른발"과 반대), 중앙 자원은 왼발 20%에 양발 5%뿐
+# 이었다. 신민용 확정 표로 포지션별 분포를 전부 명시한다:
+#   GK 양발 가능/오른발 우세 · CB 왼쪽(LCB)=왼발/오른쪽(RCB)=오른발 —
+#   게임엔 CB 하나뿐이라 풀 자체에 왼발 CB를 충분히 두고 슬롯 배치에서
+#   왼쪽 CB 자리로 보낸다(formation_logic._order_cb_by_foot) · LB 왼발 ·
+#   RB 오른발 · 중앙(CDM/CM/CAM/ST/CF) 오른발/양발 · LW 오른발 또는 왼발 ·
+#   RW 왼발 또는 오른발(인버티드 우세, 양쪽 다 정상).
+# 기존 세이브는 database._migrate_foot_distribution_v2가 1회 다시 뽑는다
+# (내 선수는 제외 — 사용자가 키우는 캐릭터라 건드리지 않음).
 FOOT_DIST_BY_POS = {
-    "LB": (70, 25, 5),
-    "RB": (25, 70, 5),
+    "GK":  (10, 70, 20),
+    "CB":  (40, 55, 5),
+    "LB":  (90, 5, 5),  "LWB": (90, 5, 5),
+    "RB":  (5, 90, 5),  "RWB": (5, 90, 5),
+    "CDM": (10, 75, 15), "CM": (10, 75, 15), "CAM": (10, 75, 15),
+    "ST":  (10, 75, 15), "CF": (10, 75, 15),
+    "LW":  (35, 60, 5),  "LM": (35, 60, 5),
+    "RW":  (60, 35, 5),  "RM": (60, 35, 5),
 }
-# CB/CDM/CM/CAM/ST/CF/GK + 윙어(LW/RW) 전부 이 분포.
-FOOT_DIST_DEFAULT = (20, 75, 5)
+# 위 표에 없는 포지션(예외적인 값) 폴백 — 중앙 자원과 같은 분포.
+FOOT_DIST_DEFAULT = (10, 75, 15)
 
 # 슬롯이 "그 쪽 발"을 요구하는지. 풀백 계열만 요구하고, 윙어는 요구하지
 # 않는다(인버티드가 정상이라서). 중앙/GK는 애초에 좌우 개념이 없다.
@@ -3788,6 +3807,78 @@ AI_LOAN_MAX_TOTAL_YEARS = 2
 AI_LOAN_MAX_OUT_PER_SEASON = 6
 AI_LOAN_MAX_IN_PER_SEASON = 6
 AI_LOAN_MAX_PER_CLUB_PAIR = 3
+
+# [2026-10 신설, 신민용 확정: "임대 갔다가 거기 계약하는 경우도 있는데 AI든
+# 플레이어든 안 되어 있다" + "임대 가서 잘하는 거에 따라 달라지게"] 임대
+# 만기 때 임대처가 선수를 완전 영입하는 확률. 사전 조건(원 소속팀 비주전,
+# 31세 이하, 23세 이하는 잠재력도 비주전급)을 통과한 선수에게만 적용한다.
+#   1) 임대 마지막 시즌 평균평점 구간이 확률 범위를 정한다(경계 안 겹침).
+#   2) 범위 안 위치는 AI=임대처 역할(로테이션→하단, 주전→중간, 핵심→상단),
+#      내 선수=실제 출전비율(40%→하단, 100%→상단)로 정한다.
+#   3) 대기/전력외/유망주(내 선수는 출전 40% 미만)는 평점과 무관하게 0~5%.
+#   4) 마지막에 나이 보정을 곱하고 0~60%로 자른다.
+# 잠정값 — 헤드리스로 평점 분포·발생률을 본 뒤 조정한다(확률 상향 금지).
+LOAN_BUY_RATING_BANDS = (       # (평점 하한, 확률 하단, 확률 상단) — 위에서부터 판정
+    (7.50, 0.50, 0.60),
+    (7.00, 0.40, 0.50),
+    (6.50, 0.25, 0.35),
+    (6.00, 0.10, 0.20),
+    (0.00, 0.00, 0.05),
+)
+LOAN_BUY_BENCH_RANGE = (0.00, 0.05)   # 대기/전력외 — 평점 무관
+# AI 역할 → 구간 안 위치(0=하단, 1=상단). 없는 역할은 대기 취급.
+LOAN_BUY_ROLE_POS = {"핵심": 1.0, "주전": 0.5, "로테이션": 0.0}
+LOAN_BUY_MIN_PLAY_RATIO = 0.40        # 내 선수: 이 미만이면 대기 취급
+LOAN_BUY_AGE_MULT = ((21, 0.8), (26, 1.0), (30, 1.1), (31, 0.9))   # (나이 상한, 배율)
+LOAN_BUY_MAX_AGE = 31
+LOAN_BUY_YOUNG_MAX_AGE = 23           # 이하면 잠재력도 원 소속팀 비주전급이어야 함
+LOAN_BUY_PROB_CAP = 0.60
+MY_LOAN_BUY_CHECK_WEEK = 44           # 내 선수: 임대 마지막 시즌 이 주차부터 1회 판정
+
+# [2026-10 개정, 신민용 확정: "AI 쪽만 평점 분포에 맞춰 재해석"] AI 평점은
+# 개인 경기기록이 아니라 추정치라 척도가 다르다 — 10시즌 헤드리스 실측(약
+# 238만 행) 분위수가 50% 5.60 / 75% 6.00 / 90% 6.40 / 97% 6.75로 연도별로도
+# 거의 고정이었고, 위 LOAN_BUY_RATING_BANDS(6.0/6.5/7.0/7.5)를 그대로 쓰면
+# AI의 74%가 최저 구간에 몰렸다. 그래서 AI는 같은 확률 범위를 이 분위수
+# 경계에 건다(내 선수는 위 표 그대로 — 실제 경기 평점이라 척도가 다름).
+AI_LOAN_BUY_RATING_BANDS = (
+    (6.75, 0.50, 0.60),
+    (6.40, 0.40, 0.50),
+    (6.00, 0.25, 0.35),
+    (5.60, 0.10, 0.20),
+    (0.00, 0.00, 0.05),
+)
+# AI 대기/유망주 — 평점 구간이 높을수록 0~1% 안에서 위로. 전력외는 0%.
+# (10시즌 계측: 예전 0~5%에선 완전 이적의 48%가 대기/전력외였다.)
+AI_LOAN_BUY_BENCH_RANGE = (0.00, 0.01)
+AI_LOAN_BUY_ZERO_ROLES = ("전력외",)
+
+
+def loan_buy_probability(rating, pos_in_band, age, bench=False,
+                         bands=None, bench_range=None):
+    """임대 성과 → 완전 이적 확률(0~LOAN_BUY_PROB_CAP). pos_in_band는
+    0~1(AI 역할 또는 내 선수 출전비율에서 환산), bench=True면 대기/전력외
+    구간(평점 무관, pos_in_band로 그 범위 안 위치). bands/bench_range를
+    안 주면 내 선수 기준표(LOAN_BUY_RATING_BANDS/LOAN_BUY_BENCH_RANGE),
+    AI는 AI_LOAN_BUY_RATING_BANDS/AI_LOAN_BUY_BENCH_RANGE를 넘긴다."""
+    bands = bands or LOAN_BUY_RATING_BANDS
+    if bench:
+        lo, hi = bench_range or LOAN_BUY_BENCH_RANGE
+    else:
+        lo, hi = bands[-1][1:]
+        r = rating or 0.0
+        for _min, _lo, _hi in bands:
+            if r >= _min:
+                lo, hi = _lo, _hi
+                break
+    t = max(0.0, min(1.0, pos_in_band or 0.0))
+    prob = lo + (hi - lo) * t
+    mult = LOAN_BUY_AGE_MULT[-1][1]
+    for _max_age, _m in LOAN_BUY_AGE_MULT:
+        if (age or 25) <= _max_age:
+            mult = _m
+            break
+    return max(0.0, min(LOAN_BUY_PROB_CAP, prob * mult))
 
 # [2026-09 신설, 신민용 요청: "계약을 언제부터 했냐가 아니라 몇년치
 # 했냐인건데... 기간이 늘어나면 연장 이런식으로 하고 연봉 수치도

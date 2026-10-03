@@ -820,6 +820,10 @@ def resync_my_domestic_sc_registration(p=None, year=None):
     t = get_domestic_sc_tournament(year, cid)
     if not t:
         return False
+    # [2026-10] 끝난 대회(4주차에 대개 끝남)는 등록팀을 바꾸지 않는다 —
+    # competition_common.resync_my_registration의 같은 주석 참고.
+    if t.get("status") == "done":
+        return False
     entered = bool(my_tid) and my_tid in (t["home_team_id"], t["away_team_id"])
     want = my_tid if entered else 0
     if (t.get("my_team_id") or 0) == want:

@@ -4434,6 +4434,52 @@ _INTL_DIFF_TO_CLUB_SCALE = _INTL_DIFF_COEF / _CLUB_DIFF_COEF   # ≈ 2.26
 _INTL_MARGIN_DIFF_SCALE = 1.6
 
 
+# [2026-10 신설, 신민용 확정 "F2": 국가대표 전용 OVR 수준 곡선]
+# 리그·국내컵(game_engine._LEAGUE_CUP_OVR_CURVE_PTS, 1.3/1.6/2.0배)과 같은
+# 원칙 — "같은 5점 차이라도 90 vs 85보다 100 vs 95가 더 큰 실질 차이" —
+# 이지만 국가대표는 따로, 더 완만하게 잡는다:
+#   85 이하 1.0배 / 85~90 1.2배 / 90~95 1.3배 / 95~100 1.4배 / 100 초과 1.4배 연장
+#   원시 5점 차이의 실질 차이: 80 vs 75 → 5.0, 90 vs 85 → 6.0,
+#   95 vs 90 → 6.5, 100 vs 95 → 7.0
+# 기울기 _INTL_DIFF_COEF(0.0452)는 그대로 둔다(신민용 확정). 곡선에 맞춰
+# 기울기를 다시 낮추면(브라질-한국 승률 유지 목적) 85 이하 구간 — 예선의
+# 80 vs 72 같은 경기 — 이변률이 6% → 17~21%로 뛰는 게 사전 비교에서
+# 확인됐다. 기울기 고정이면 85 이하 경기(대부분의 예선)는 예전과 완전히
+# 같고, 상위권(88+)끼리의 차이만 조금 더 크게 반영된다.
+# 사전 비교(공식 기준, 강팀 승/무/패 %):
+#   브라질(96.7)-대한민국(86.0) 중립  현재 85/13/2 → F2 87/11/2
+#   대한민국(86.0)-필리핀(60.0) 예선  현재 92/5/3  → F2 92/5/3
+#   브라질(96.7)-프랑스(96.0) 중립    현재 41/23/35 → F2 43/23/34
+#   브라질(96.7)-아르헨티나(94.4) 중립 현재 49/22/29 → F2 54/21/25
+# 챔스·유로파 곡선(competition_common), 리그·국내컵 곡선(game_engine)과는
+# 별개다 — 국가대표 OVR(상위 11명 평균)은 클럽보다 격차가 압축돼 있어서
+# 같은 곡선을 그대로 쓰면 과하다.
+_INTL_OVR_CURVE_PTS = [(85.0, 85.0), (90.0, 91.0), (95.0, 97.5), (100.0, 104.5)]
+_INTL_OVR_TOP_SLOPE = 1.4
+
+
+def _intl_effective_ovr(ovr):
+    """국가대표 전용 OVR 수준 곡선(위 _INTL_OVR_CURVE_PTS)."""
+    pts = _INTL_OVR_CURVE_PTS
+    if ovr <= pts[0][0]:
+        return ovr
+    if ovr >= pts[-1][0]:
+        return pts[-1][1] + (ovr - pts[-1][0]) * _INTL_OVR_TOP_SLOPE
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if x0 <= ovr <= x1:
+            return y0 + (ovr - x0) * (y1 - y0) / (x1 - x0)
+    return ovr
+
+
+def _intl_effective_diff(h_ovr, a_ovr):
+    """[2026-10 신설] 국가대표 실질 전력차 = 곡선(홈) − 곡선(원정).
+    승/무/패(_match_outcome)와 스코어(_gen_intl_score 호출부)가 같은 값을
+    쓴다 — 리그·국내컵도 곡선 적용 diff를 _gen_score에 그대로 넘긴다.
+    승부차기(_resolve_pso)는 원래 전력 영향을 ±10%로 작게 묶어둔 공식이라
+    원시 OVR차를 그대로 쓴다."""
+    return _intl_effective_ovr(h_ovr) - _intl_effective_ovr(a_ovr)
+
+
 def _match_outcome(h_ovr, a_ovr, knockout, neutral=False):
     """'home'/'draw'/'away' 반환 (KO는 무승부 → 승부차기).
     [수정] 무승부 확률을 전력차에 반비례하도록 개선 (기존 dw=0.22 고정 →
@@ -4483,8 +4529,13 @@ def _match_outcome(h_ovr, a_ovr, knockout, neutral=False):
         브라질 vs 대한민국  기존 diff +13.18 → 신규 +10.00
         아르헨티나 vs 파나마 기존 +11.24 → 신규 +8.73
         대한민국 vs 괌      기존 +37.03 → 신규 +33.45 (양쪽 다 클램프 구간)
+
+    [2026-10 F2, 신민용 확정] diff를 원시 OVR차 대신 국가대표 전용 곡선
+    적용 차이(_intl_effective_diff)로 낸다 — 중립(본선)·비중립(예선)
+    양쪽 모두. 기울기(_INTL_DIFF_COEF)·무승부식·클램프는 그대로다.
+    85 이하끼리의 경기는 곡선이 항등이라 예전과 완전히 같다.
     """
-    diff = h_ovr - a_ovr
+    diff = _intl_effective_diff(h_ovr, a_ovr)
     _DIFF_COEF = _INTL_DIFF_COEF
     if neutral:
         dw = max(0.05, 0.24 - abs(diff) * 0.009)
@@ -4943,7 +4994,8 @@ def _sim_ai_match(t, m, my_played=False, conn=None, reason="injury", batch=None)
     # 무관하게 항상 근소하게(최대 4골차)만 나왔다. game_engine/champions_engine/
     # cup_engine은 이미 diff를 넘기고 있었는데 국제대회 조별/예선 AI 매치만
     # 빠져 있었음.
-    hs, as_ = _gen_intl_score(outcome, he["ovr"] - ae["ovr"])
+    # [2026-10 F2] 스코어도 승패와 같은 곡선 적용 전력차를 쓴다.
+    hs, as_ = _gen_intl_score(outcome, _intl_effective_diff(he["ovr"], ae["ovr"]))
 
     # [2026-08 신설, 신민용 요청: "출전을 몇 번 했는지만 표시해줘"] 이 경기의
     # 실제 스타팅 11(양 팀 각각)을 정하고 그 선수들만 intl_squad.appearances를
@@ -5224,7 +5276,7 @@ def simulate_my_match(week, p, day=None):
         # 타야 한다 — _gen_score를 직접 부르면 국가대표 전력차 스케일
         # 환산(_gen_intl_score 주석 참고)이 빠져 같은 매치업인데도
         # 경로에 따라 스코어 분포가 달라진다.
-        hs, as_ = _gen_intl_score(outcome, h_ovr - a_ovr)
+        hs, as_ = _gen_intl_score(outcome, _intl_effective_diff(h_ovr, a_ovr))   # [2026-10 F2]
 
     pso_winner, pso_score = "", ""
     if knockout and outcome == "draw":
@@ -5947,7 +5999,7 @@ def _finalize_qual_po(t):
                 _hs, _as = 1, 1
                 _pso_w = home["country"] if _win_home else away["country"]
             else:
-                _hs, _as = _gen_intl_score(_outcome, home["ovr"] - away["ovr"])
+                _hs, _as = _gen_intl_score(_outcome, _intl_effective_diff(home["ovr"], away["ovr"]))   # [2026-10 F2]
             _conn_fix = get_conn()
             _conn_fix.execute(
                 """UPDATE intl_matches SET home_score=?, away_score=?,

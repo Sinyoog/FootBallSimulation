@@ -1004,6 +1004,7 @@ def seed_initial_ovr_history(year):
         conn.executemany(
             "INSERT OR REPLACE INTO hist.ai_player_ovr_history(player_id, year, ovr) VALUES (?,?,?)",
             [(r["id"], year, r["ovr"]) for r in rows])
+        update_ai_best_ovr(conn)
         conn.commit()
         # [2026-09 신설] 시작 연도 이력을 방금 깔았으므로 career_years도
         # 같이 맞춰둔다(전원 1년) — 안 하면 새 세이브 첫 해 동안만 경력
@@ -4120,6 +4121,13 @@ def init_db():
         # 항상 이 값 기준으로 계산한다(ai_lifecycle._AGING_DECLINE_SCHEDULE
         # 참고).
         "ALTER TABLE ai_players ADD COLUMN peak_ovr INTEGER DEFAULT 0",
+        # [2026-10 신설, 신민용 리포트: "은퇴 목록 OVR이 100 넘게 뜬다 — 이 선수 최대치는
+        # 97인데"] peak_ovr은 이름과 달리 "실제로 찍은 최고 OVR"이 아니라 노화 곡선의
+        # 기준점이다 — 시드 생성 때 목표치로 미리 심어두거나(101까지 나옴), 국대
+        # 브레이크아웃·편집으로 30세+ 선수의 목표치(현재 OVR보다 높음)가 들어간다.
+        # 은퇴 목록의 "최고 OVR"은 경력표(hist.ai_player_ovr_history)와 같은 기준이어야
+        # 하므로 매 시즌 OVR 기록 시점에 실제 OVR의 최댓값을 이 컬럼에 따로 쌓는다.
+        "ALTER TABLE ai_players ADD COLUMN best_ovr INTEGER DEFAULT 0",
         # [2026-09 신설, 신민용 요청: "국가대표에도 평점이랑 골 어시 이런걸
         # 넣고 싶어"] intl_squad는 지금까지 appearances(출전 횟수)만
         # 있었다 — 클럽 시즌기록(hist.ai_player_season_stats)과 같은
@@ -4278,6 +4286,12 @@ def init_db():
         # ai_players_seed는 아래 컬럼 동기화 루프가 자동으로 따라온다.
         "ALTER TABLE ai_players ADD COLUMN foot TEXT DEFAULT ''",
         "ALTER TABLE my_player ADD COLUMN foot TEXT DEFAULT ''",
+        # [2026-10 신설, 신민용 확정] 임대 후 완전 이적(내 선수) — 임대처 제안
+        # (수락/거절 대기), 수락해 둔 예약(시즌 종료 때 실행), 그 시즌에 이미
+        # 판정했는지(시즌당 1회). 판매추진(sale_push_*)과 같은 독립 필드 패턴.
+        "ALTER TABLE my_player ADD COLUMN loan_buy_proposal_json TEXT DEFAULT ''",
+        "ALTER TABLE my_player ADD COLUMN pending_loan_buy_json TEXT DEFAULT ''",
+        "ALTER TABLE my_player ADD COLUMN loan_buy_checked_year INTEGER DEFAULT 0",
         "ALTER TABLE intl_squad ADD COLUMN slot TEXT DEFAULT ''",
         # [2026-09 신설 — 감독 시스템 ③단계] 구단 목표를 팀에 저장한다.
         # 여태 my_player.club_ambition 한 칸뿐이라 "내 팀의 목표"만 존재했고,
@@ -4824,6 +4838,9 @@ def init_db():
     _migrate_ensure_military_world()   # [2026-10] 병역 시스템: 기존 세이브에 군데스리가 국가·리그·팀 추가 (기능 켜졌을 때만)
     _migrate_fix_military_log_years()  # [2026-10] 1년 밀려 적힌 군 이동 기록(입대/제대/진급/강등) 1회 보정
     _migrate_backfill_retired_peak_military()  # [2026-10] 기존 은퇴자 최고 OVR·병역 상태 1회 백필
+    _migrate_best_ovr_v1()  # [2026-10] 은퇴 목록 최고 OVR을 실제 기록 기준으로 재계산(1회)
+    _migrate_foot_distribution_v2()  # [2026-10] 주발 분포 개정(포지션별 표) — AI 주발 1회 재추첨
+    _backfill_affiliate_callup_logs_v1()  # [2026-10] 산하팀→모팀 1군 콜업 누락 이적기록 1회 보정
     # [2026-08 신설] init_db()는 QA/AB테스트 스크립트 등이 DB_PATH를 바꿔가며
     # 같은 프로세스 안에서 여러 번 호출하기도 한다 — 그때마다 get_state()
     # 캐시가 이전 DB의 season_state를 그대로 들고 있으면 안 되므로 비운다.
@@ -5119,6 +5136,259 @@ def archive_old_seasons(current_season):
 # _team_ever_player_ids)은 두 테이블을 UNION ALL로 함께 조회하도록
 # 맞춰 고쳤다.
 AI_TRANSFER_LOG_RETENTION_SEASONS = 5
+
+
+def _backfill_affiliate_callup_logs_v1():
+    """[2026-10 신설, 신민용 리포트: "B팀·II·U21 선수가 1군으로 올라갈 때
+    이적 기록이 안 남아 선수 검색에서 그 해 소속이 틀리게 보인다"] 기존
+    세이브 1회 보정. game_engine._affiliate_callup_from_child(모팀이 산하팀과
+    같은 tier가 되면 산하팀 선수를 1군으로 올림)가 예전엔 소속만 바꾸고
+    이적 기록을 안 남겼다 — 선수 검색의 연도별 소속은 이적 기록으로만
+    재구성되므로, 그 선수들은 1군에서 뛴 해에도 계속 산하팀으로 보였다.
+
+    찾는 방법: hist.ai_player_season_stats에서 "Y년엔 산하팀 → Y+1년엔 그
+    산하팀의 모팀"인데, 그 경계(Y 오프시즌 또는 Y/Y+1 겨울)에 팀이 바뀌는
+    이적 기록이 하나도 없는 경우. 이 패턴은 콜업 말고는 만들어지지 않는다
+    (10시즌 헤드리스 실측 813건 전부 이 경우).
+    기록 연도: 콜업이 Y 시즌 종료 뒤였다면 year=Y(오프시즌 이동). 다만 예전
+    코드는 43주 콜업을 시즌 종료 스냅샷보다 먼저 해서, Y+1 시즌을 산하팀
+    에서 다 뛰고도 Y+1 시즌 기록이 1군으로 찍힌 경우가 있다 — 그 해 상반기
+    포메이션 스냅샷(team_season_lineup_half, 콜업보다 앞)에 산하팀 소속으로
+    남아 있으면 그 경우로 보고 year=Y+1로 적는다(그 해 소속은 산하팀으로
+    바로잡힌다. 그 해 평점 추정치 자체는 이미 저장된 값이라 그대로다).
+    연봉·계약은 당시 값을 알 수 없어 0으로 둔다 — 선수 검색 연봉 줄은
+    salary>0 기록만 보므로 직전 계약 표시가 그대로 이어진다."""
+    conn = get_conn()
+    c = conn.cursor()
+    if c.execute("SELECT value FROM meta WHERE key='affiliate_callup_log_backfill_v1'").fetchone():
+        conn.close()
+        return
+    _t0 = time.perf_counter()
+    n_ins = 0
+    try:
+        st = c.execute("SELECT current_season, current_year FROM season_state WHERE id=1").fetchone()
+        cands = []
+        if st:
+            # 산하팀 소속 행을 한 번만 훑고(CROSS JOIN = 바깥 루프 고정),
+            # 다음 해 행은 기본키(player_id, year)로 바로 찾는다.
+            cands = c.execute(
+                """SELECT a.player_id AS pid, a.year AS y0, a.team_id AS child,
+                          t.parent_team_id AS parent
+                   FROM hist.ai_player_season_stats a
+                   CROSS JOIN teams t ON t.id = a.team_id
+                   JOIN hist.ai_player_season_stats b
+                     ON b.player_id = a.player_id AND b.year = a.year + 1
+                    AND b.team_id = t.parent_team_id
+                   WHERE t.parent_team_id IS NOT NULL""").fetchall()
+        if cands:
+            import json as _json_bf
+            _half_cache = {}
+
+            def _in_half(team_id, year):
+                k = (team_id, year)
+                if k not in _half_cache:
+                    r = c.execute("SELECT slots_json, bench_json FROM hist.team_season_lineup_half "
+                                  "WHERE team_id=? AND year=?", k).fetchone()
+                    ids = set()
+                    if r:
+                        for x in _json_bf.loads(r[0] or "[]") + _json_bf.loads(r[1] or "[]"):
+                            if x.get("id") is not None:
+                                ids.add(x["id"])
+                    _half_cache[k] = ids
+                return _half_cache[k]
+
+            rows = []
+            for cd in cands:
+                pid, y0 = cd["pid"], cd["y0"]
+                # 이미 "그 경계에서 모팀으로 들어온" 기록(정식 이적·임대 복귀 등)이
+                # 있으면 콜업이 아니다. 다음 시즌 끝(y0+1 오프시즌)의 기록은 그
+                # 다음 해 이동이라 여기 해당하지 않는다 — 그걸 설명으로 치면
+                # "콜업 후 1군에서 다시 팔린" 선수가 빠져서, 콜업 전 해들까지
+                # 1군 소속으로 보이게 된다.
+                expl = c.execute(
+                    """SELECT 1 FROM (
+                         SELECT year, is_mid_season, from_team_id, to_team_id FROM ai_transfer_log WHERE player_id=?
+                         UNION ALL
+                         SELECT year, is_mid_season, from_team_id, to_team_id FROM ai_transfer_log_archive WHERE player_id=?)
+                       WHERE to_team_id=? AND from_team_id != to_team_id
+                         AND ((is_mid_season=0 AND year=?) OR (is_mid_season=1 AND year IN (?, ?)))
+                       LIMIT 1""", (pid, pid, cd["parent"], y0, y0, y0 + 1)).fetchone()
+                if expl:
+                    continue
+                log_year = y0 + 1 if pid in _in_half(cd["child"], y0 + 1) else y0
+                p = c.execute("SELECT name, position FROM ai_players WHERE id=?", (pid,)).fetchone() or \
+                    c.execute("SELECT name, position FROM ai_players_retired WHERE id=?", (pid,)).fetchone()
+                season = st["current_season"] - (st["current_year"] - log_year)
+                rows.append((season, log_year, pid, (p["name"] if p else "") or "",
+                             (p["position"] if p else "") or "", 0, 0, cd["child"], cd["parent"],
+                             0, 0, 0.0, 0.0, "1군 콜업", 0, "", 0, 0, 0, 0, 0))
+            # ── 2번째 패턴: 시즌 끝에 콜업되자마자 같은 오프시즌(또는 다음
+            # 겨울)에 1군에서 다시 팔린 경우 — 시즌 기록상 1군에 있던 해가
+            # 없어서 위 조회로는 안 잡힌다. "Y년 산하팀 → 그 다음 첫 이동
+            # 기록이 모팀에서 출발"이면 그 사이에 콜업이 있었던 것이다.
+            #  (world_browser의 이적기록 정렬이 같은 오프시즌 안에서 1군
+            #   콜업을 맨 앞에 두므로, 나중에 추가되는 이 기록도 판매보다
+            #   먼저 적용된다.)
+            _done = {(r[2], r[1]) for r in rows}   # (player_id, log_year)
+            # 모팀에서 "나가는" 이동 기록에서 출발한다(산하팀 시즌 행 전체를
+            # 훑는 것보다 훨씬 적다 — from_team_id 인덱스 사용). 그 이동이
+            # 적용되는 해(E)의 직전 시즌(E-1)에 그 선수가 이 모팀의 산하팀
+            # 소속이었고, 같은 경계(E)에 모팀으로 들어온 기록이 없으면 그 사이
+            # 콜업이 있었던 것이다.
+            _child_parent = {r[0]: r[1] for r in c.execute(
+                "SELECT id, parent_team_id FROM teams WHERE parent_team_id IS NOT NULL")}
+            _parents = sorted(set(_child_parent.values()))
+            outs = []
+            for _i in range(0, len(_parents), 500):
+                _ch = _parents[_i:_i + 500]
+                _ph = ",".join("?" * len(_ch))
+                for _tbl in ("ai_transfer_log", "ai_transfer_log_archive"):
+                    outs += c.execute(
+                        f"SELECT player_id, year, is_mid_season, from_team_id, to_team_id "
+                        f"FROM {_tbl} WHERE from_team_id IN ({_ph}) AND to_team_id != from_team_id",
+                        _ch).fetchall()
+            for o in outs:
+                pid, par_ = o["player_id"], o["from_team_id"]
+                E = o["year"] if o["is_mid_season"] else o["year"] + 1
+                y0 = E - 1
+                if (pid, y0) in _done:
+                    continue
+                sr = c.execute("SELECT team_id FROM hist.ai_player_season_stats "
+                               "WHERE player_id=? AND year=?", (pid, y0)).fetchone()
+                if not sr or _child_parent.get(sr["team_id"]) != par_:
+                    continue
+                into = c.execute(
+                    """SELECT 1 FROM (
+                         SELECT year, is_mid_season, from_team_id, to_team_id FROM ai_transfer_log WHERE player_id=?
+                         UNION ALL
+                         SELECT year, is_mid_season, from_team_id, to_team_id FROM ai_transfer_log_archive WHERE player_id=?)
+                       WHERE to_team_id=? AND from_team_id != to_team_id
+                         AND ((is_mid_season=0 AND year=?) OR (is_mid_season=1 AND year=?))
+                       LIMIT 1""", (pid, pid, par_, y0, E)).fetchone()
+                if into:
+                    continue
+                p = c.execute("SELECT name, position FROM ai_players WHERE id=?", (pid,)).fetchone() or \
+                    c.execute("SELECT name, position FROM ai_players_retired WHERE id=?", (pid,)).fetchone()
+                season = st["current_season"] - (st["current_year"] - y0)
+                rows.append((season, y0, pid, (p["name"] if p else "") or "",
+                             (p["position"] if p else "") or "", 0, 0, sr["team_id"], par_,
+                             0, 0, 0.0, 0.0, "1군 콜업", 0, "", 0, 0, 0, 0, 0))
+                _done.add((pid, y0))
+            # ── 3번째 패턴: 시즌 끝에 콜업된 뒤 더 이동이 없는 경우(그대로
+            # 1군에 있거나 그 오프시즌에 은퇴) — 이동 기록이 아예 없으면
+            # 선수 검색은 현재(은퇴 시 마지막) 팀으로 모든 해를 채워서,
+            # 산하팀에서 뛴 해들까지 1군으로 보였다. "마지막 시즌 기록은
+            # 산하팀인데 지금(마지막) 팀은 그 모팀"이고 그 시즌 뒤의 이동
+            # 기록이 없으면 그 시즌 끝에 콜업된 것이다.
+            _now_team = dict(c.execute("SELECT id, team_id FROM ai_players").fetchall())
+            for _k, _v in c.execute("SELECT id, last_team_id FROM ai_players_retired").fetchall():
+                _now_team.setdefault(_k, _v)
+            _par_ids = set(_child_parent.values())
+            for pid, tnow in _now_team.items():
+                if tnow not in _par_ids:
+                    continue
+                last = c.execute("SELECT year, team_id FROM hist.ai_player_season_stats "
+                                 "WHERE player_id=? ORDER BY year DESC LIMIT 1", (pid,)).fetchone()
+                if not last or _child_parent.get(last["team_id"]) != tnow:
+                    continue
+                y0 = last["year"]
+                if (pid, y0) in _done:
+                    continue
+                after = c.execute(
+                    """SELECT 1 FROM (
+                         SELECT year, is_mid_season, from_team_id, to_team_id FROM ai_transfer_log WHERE player_id=?
+                         UNION ALL
+                         SELECT year, is_mid_season, from_team_id, to_team_id FROM ai_transfer_log_archive WHERE player_id=?)
+                       WHERE from_team_id != to_team_id
+                         AND ((is_mid_season=0 AND year>=?) OR (is_mid_season=1 AND year>?))
+                       LIMIT 1""", (pid, pid, y0, y0)).fetchone()
+                if after:
+                    continue
+                p = c.execute("SELECT name, position FROM ai_players WHERE id=?", (pid,)).fetchone() or \
+                    c.execute("SELECT name, position FROM ai_players_retired WHERE id=?", (pid,)).fetchone()
+                season = st["current_season"] - (st["current_year"] - y0)
+                rows.append((season, y0, pid, (p["name"] if p else "") or "",
+                             (p["position"] if p else "") or "", 0, 0, last["team_id"], tnow,
+                             0, 0, 0.0, 0.0, "1군 콜업", 0, "", 0, 0, 0, 0, 0))
+                _done.add((pid, y0))
+            # ── 4번째 패턴: 이적(또는 임대)으로 산하팀에 들어온 뒤 콜업된 경우 —
+            # 위 1번은 "산하팀 시즌 → 다음 시즌 모팀"만 보므로, 산하팀에 들어온
+            # 바로 그 시즌 끝에 콜업돼(옛 코드는 스냅샷보다 먼저 콜업) 시즌
+            # 기록상 산하팀 시즌이 하나도 없으면 안 잡혔다. "산하팀으로 들어온
+            # 기록 → 다음 이동 기록 전까지의 시즌 중 모팀 소속 시즌"이 있으면
+            # 그 사이 콜업이 있었던 것이다. 콜업 연도는 1번과 같은 규칙(그 해
+            # 상반기 명단에 산하팀으로 있으면 그 해 끝, 아니면 그 전 해 끝 —
+            # 단 산하팀에 들어온 오프시즌보다 앞설 수는 없다).
+            _child_ids = sorted(_child_parent)
+            _into = set()
+            for _i in range(0, len(_child_ids), 500):
+                _ch = _child_ids[_i:_i + 500]
+                _ph = ",".join("?" * len(_ch))
+                for _tbl in ("ai_transfer_log", "ai_transfer_log_archive"):
+                    for r in c.execute(
+                            f"SELECT player_id FROM {_tbl} WHERE to_team_id IN ({_ph}) "
+                            f"AND from_team_id != to_team_id", _ch).fetchall():
+                        _into.add(r["player_id"])
+            for pid in _into:
+                lg = c.execute(
+                    """SELECT id, year, is_mid_season, from_team_id, to_team_id, transfer_type
+                       FROM ai_transfer_log WHERE player_id=?
+                       UNION ALL
+                       SELECT id, year, is_mid_season, from_team_id, to_team_id, transfer_type
+                       FROM ai_transfer_log_archive WHERE player_id=?""", (pid, pid)).fetchall()
+                lg = sorted(lg, key=lambda r: ((r["year"] if r["is_mid_season"] else r["year"] + 1),
+                                               r["is_mid_season"],
+                                               0 if r["transfer_type"] == "1군 콜업" else 1, r["id"]))
+                lg = [r for r in lg if r["from_team_id"] != r["to_team_id"]]
+                stats_p = dict(c.execute("SELECT year, team_id FROM hist.ai_player_season_stats "
+                                         "WHERE player_id=?", (pid,)).fetchall())
+                if not stats_p:
+                    continue
+                for _j, L in enumerate(lg):
+                    C = L["to_team_id"]
+                    P = _child_parent.get(C)
+                    if not P:
+                        continue
+                    E = L["year"] if L["is_mid_season"] else L["year"] + 1
+                    _nx = lg[_j + 1] if _j + 1 < len(lg) else None
+                    _y_end = ((_nx["year"] if _nx["is_mid_season"] else _nx["year"] + 1) - 1
+                              if _nx else max(stats_p))
+                    if _nx is not None and _nx["is_mid_season"]:
+                        _y_end = _nx["year"] - 1   # 겨울 이동이 있는 해는 다음 구간 소속
+                    for y in range(E, _y_end + 1):
+                        if stats_p.get(y) != P:
+                            continue
+                        # 콜업은 산하팀에 들어온 시즌(E) 이후의 시즌 끝에만 있을 수 있다.
+                        log_year = y if (pid in _in_half(C, y) or y - 1 < E) else y - 1
+                        if (pid, log_year) not in _done:
+                            p = c.execute("SELECT name, position FROM ai_players WHERE id=?", (pid,)).fetchone() or \
+                                c.execute("SELECT name, position FROM ai_players_retired WHERE id=?", (pid,)).fetchone()
+                            season = st["current_season"] - (st["current_year"] - log_year)
+                            rows.append((season, log_year, pid, (p["name"] if p else "") or "",
+                                         (p["position"] if p else "") or "", 0, 0, C, P,
+                                         0, 0, 0.0, 0.0, "1군 콜업", 0, "", 0, 0, 0, 0, 0))
+                            _done.add((pid, log_year))
+                        break
+            if rows:
+                # 오래된 시즌 행도 일단 원본 표에 넣는다 — 다음 연도전환의
+                # _prune_ai_transfer_log가 다른 행과 똑같이 archive로 옮긴다
+                # (archive에 직접 넣으면 id 충돌 처리를 따로 해야 한다).
+                c.executemany(
+                    """INSERT INTO ai_transfer_log(
+                        season, year, player_id, player_name, player_position, player_age, player_ovr,
+                        from_team_id, to_team_id, from_team_prestige, to_team_prestige,
+                        from_team_avg_ovr, to_team_avg_ovr, transfer_type, is_mid_season, player_role,
+                        fee, is_loan, loan_return_year, salary, contract_end_year)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", rows)
+                n_ins = len(rows)
+        c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('affiliate_callup_log_backfill_v1', '1')")
+        conn.commit()
+        print(f"[MIGRATE] 산하팀 1군 콜업 이적기록 보정 {n_ins}건 "
+              f"({time.perf_counter() - _t0:.2f}s)")
+    except Exception as _e:
+        conn.rollback()
+        print(f"[MIGRATE] 산하팀 1군 콜업 이적기록 보정 실패(다음 실행 때 재시도): {_e}")
+    conn.close()
 
 
 def _prune_ai_transfer_log(conn, current_season) -> float:
@@ -6171,12 +6441,20 @@ def _migrate_orphaned_ai_players():
         print(f"[MIGRATE] 고아 ai_players 복구 건너뜀: {e}")
 
 
+def update_ai_best_ovr(c):
+    """[2026-10 신설] 시즌 OVR 기록(hist.ai_player_ovr_history)을 남기는 순간마다 같이
+    불러 ai_players.best_ovr(실제로 찍은 최고 OVR)을 갱신한다 — ALTER 목록의 best_ovr
+    주석 참고. 전체 표 UPDATE 한 번(오른 선수만 쓰기)."""
+    c.execute("UPDATE ai_players SET best_ovr = ovr WHERE ovr > COALESCE(best_ovr, 0)")
+
+
 def fill_retired_extra_fields(c, ids):
     """[2026-10 신설] ai_players_retired에 방금 넣은 은퇴자들의 최고 OVR(peak_ovr)과 병역
     상태(military_status)를 채운다. 반드시 ai_players에서 지우기 *전에* 불러야 한다.
-    최고 OVR = max(은퇴 시 OVR, ai_players.peak_ovr). peak_ovr은 노화가 시작되는
-    시즌(29→30)에 그때 OVR로 확정되고 그 뒤로는 떨어지기만 하며, 그 전에 은퇴하는
-    선수는 아직 성장 구간이라 현재 OVR이 곧 최고점이다.
+    최고 OVR = max(은퇴 시 OVR, ai_players.best_ovr = 매 시즌 기록된 실제 OVR의 최댓값).
+    [2026-10 버그수정, 신민용 리포트: "은퇴 목록 OVR이 100 넘게 뜬다 — 최대치 97인데"]
+    처음엔 peak_ovr을 썼는데, 그건 노화 곡선의 기준점(시드 목표치·브레이크아웃 목표치가
+    들어가 실제 OVR보다 높을 수 있음)이라 경력표에 없는 숫자가 떴다.
     [2026-10 성능 수정, 신민용 리포트: "50년 세이브가 켜다가 멈춘다"] 처음엔 시즌별 OVR
     기록(hist)까지 선수별로 조회했는데, 그 표는 PK가 (year, player_id)로 재구축돼 있어
     선수 단위 조회가 연도 수만큼 느려진다 — 위 두 값만으로 충분하므로 hist는 안 본다."""
@@ -6184,8 +6462,8 @@ def fill_retired_extra_fields(c, ids):
     for i in range(0, len(ids), 500):
         part = ids[i:i + 500]
         ph = ",".join("?" * len(part))
-        upd = [(max(ovr or 0, peak or 0), mst, pid) for pid, ovr, peak, mst in c.execute(
-            f"SELECT id, ovr, COALESCE(peak_ovr,0), COALESCE(military_status,'') FROM ai_players "
+        upd = [(max(ovr or 0, best or 0), mst, pid) for pid, ovr, best, mst in c.execute(
+            f"SELECT id, ovr, COALESCE(best_ovr,0), COALESCE(military_status,'') FROM ai_players "
             f"WHERE id IN ({ph})", part).fetchall()]
         if upd:
             c.executemany("UPDATE ai_players_retired SET peak_ovr=?, military_status=? WHERE id=?", upd)
@@ -6236,6 +6514,77 @@ def _migrate_backfill_retired_peak_military():
         print(f"[MIGRATE] 은퇴 선수 최고 OVR·병역 기록 완료 {_t.perf_counter() - _t0:.1f}s", flush=True)
     except sqlite3.OperationalError as e:
         print(f"[MIGRATE] 은퇴자 최고 OVR·병역 백필 건너뜀: {e}")
+
+
+def _migrate_foot_distribution_v2():
+    """[2026-10 1회성, 신민용 확정: "주발이 포지션이랑 안 맞는다"] constants.
+    FOOT_DIST_BY_POS를 포지션별 표로 개정했다. 주발은 (생성 포지션, player_id,
+    foot_salt) 결정적 해시라 같은 함수(roll_foot)로 다시 뽑기만 하면 새 분포가
+    된다 — 해시값은 그대로고 구간 경계만 바뀌므로, 예전 왼발 LB처럼 새 표에서도
+    맞는 발이던 선수는 대부분 그대로 남는다. 현역(ai_players)과 새 게임 복원용
+    시드(ai_players_seed)를 같이 고친다. 은퇴자(ai_players_retired)는 foot
+    컬럼이 없고 화면에서 roll_foot로 즉석 계산하므로 자동으로 맞춰진다.
+    내 선수(my_player)는 사용자가 키우는 캐릭터라 제외(신민용 확정).
+    ai_players가 비어 있으면(월드 생성 전) salt를 확정하지 않고 플래그만 남긴다
+    — 이후 생성되는 선수는 처음부터 새 분포로 뽑힌다."""
+    conn = get_conn(); c = conn.cursor()
+    try:
+        if c.execute("SELECT value FROM meta WHERE key='foot_dist_v2'").fetchone():
+            return
+        n_active = c.execute("SELECT COUNT(*) FROM ai_players").fetchone()[0]
+        changed = 0
+        if n_active:
+            salt = get_foot_salt(conn)
+            for tbl in ("ai_players", "ai_players_seed"):
+                try:
+                    rows = c.execute(f"SELECT id, position, foot FROM {tbl} "
+                                     f"WHERE position IS NOT NULL AND position!=''").fetchall()
+                except sqlite3.OperationalError:
+                    continue
+                payload = []
+                for r in rows:
+                    nf = roll_foot(r["position"], r["id"], salt)
+                    if nf != (r["foot"] or ""):
+                        payload.append((nf, r["id"]))
+                if payload:
+                    c.executemany(f"UPDATE {tbl} SET foot=? WHERE id=?", payload)
+                    if tbl == "ai_players":
+                        changed = len(payload)
+        c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('foot_dist_v2','1')")
+        conn.commit()
+        if n_active:
+            print(f"[MIGRATE] 주발 분포 개정 — 현역 {n_active}명 중 {changed}명 주발 변경", flush=True)
+    except sqlite3.OperationalError as e:
+        print(f"[MIGRATE] 주발 분포 개정 건너뜀: {e}")
+
+
+def _migrate_best_ovr_v1():
+    """[2026-10 1회성, 신민용 리포트: "은퇴 목록 OVR이 100 넘게 뜬다"] (1) 현역
+    ai_players.best_ovr을 시즌 OVR 기록 최댓값으로 채우고, (2) 이미 은퇴 목록에 들어간
+    선수의 peak_ovr을 같은 기준(max(은퇴 시 OVR, 기록 최댓값))으로 전부 다시 계산한다 —
+    fill_retired_extra_fields가 peak_ovr(노화 기준점)을 쓰던 동안 들어간 부풀려진 값을
+    바로잡는다. hist는 한 번만 훑는다(_migrate_backfill_retired_peak_military와 같은 방식)."""
+    import time as _t
+    conn = get_conn(); c = conn.cursor()
+    try:
+        if c.execute("SELECT value FROM meta WHERE key='best_ovr_v1'").fetchone():
+            return
+        _t0 = _t.perf_counter()
+        print("[MIGRATE] 선수 최고 OVR 기준 정리 중(최초 1회)...", flush=True)
+        c.execute("DROP TABLE IF EXISTS temp._hist_best")
+        c.execute("CREATE TEMP TABLE _hist_best AS SELECT player_id AS pid, MAX(ovr) AS m "
+                  "FROM hist.ai_player_ovr_history GROUP BY player_id")
+        c.execute("CREATE INDEX temp._hist_best_pid ON _hist_best(pid)")
+        c.execute("UPDATE ai_players SET best_ovr = MAX(COALESCE(ovr,0), "
+                  "COALESCE((SELECT m FROM temp._hist_best WHERE pid = ai_players.id), 0))")
+        c.execute("UPDATE ai_players_retired SET peak_ovr = MAX(COALESCE(ovr,0), "
+                  "COALESCE((SELECT m FROM temp._hist_best WHERE pid = ai_players_retired.id), 0))")
+        c.execute("DROP TABLE IF EXISTS temp._hist_best")
+        c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('best_ovr_v1','1')")
+        conn.commit()
+        print(f"[MIGRATE] 선수 최고 OVR 기준 정리 완료 {_t.perf_counter() - _t0:.1f}s", flush=True)
+    except sqlite3.OperationalError as e:
+        print(f"[MIGRATE] 최고 OVR 기준 정리 건너뜀: {e}")
 
 
 def repair_cwc_match_groups():
@@ -8871,8 +9220,16 @@ _INTL_BREAKOUT_STEP_PROB = {
 # 상단 시작 전까지)가 나머지 확률을 균등하게 나눠 갖는 2밴드 구조 —
 # weights는 합이 1일 필요 없이 상대 비율이므로 그대로 튜플에 넣는다.
 _INTL_BREAKOUT_FLOOR = {"B": 90, "C": 85, "D": 80, "E": 75, "F": 70}
+# [2026-10 개정, 신민용 확정] B만 "일반 92~96 / 천재 97~99"로 올린다.
+# 예전 B(90~94 97% / 95~99 3%)는 브레이크아웃 1회당 95+가 약 3%뿐이라,
+# 한국처럼 클럽 성장 경로(K리그1 팀 상한 82)가 막힌 B국가는 95+가 사실상
+# 100년에 1번 꼴이었다(60년간 0명 리포트와 일치). 목적은 97~99를 늘리는 게
+# 아니라 95~96을 B에서도 현실적으로 만드는 것 — 천재 구간 3%는 그대로,
+# 발생 확률(_INTL_BREAKOUT_STEP_PROB)·90+ 최대 인원(5명)·기준선(90)·
+# 감쇠비(0.90)도 그대로다. 변경 후 브레이크아웃 1회당 95+ 약 36%.
+# C~F는 변경 없음. 10시즌 헤드리스로 B 26개국 95+ 분포를 보고 재판단.
 _INTL_BREAKOUT_BAND_WEIGHTS = {
-    "B": ((90, 94, 0.97), (95, 99, 0.03)),
+    "B": ((92, 96, 0.97), (97, 99, 0.03)),
     "C": ((85, 92, 0.999), (93, 97, 0.001)),
     "D": ((80, 90, 0.9999), (91, 95, 0.0001)),
     "E": ((75, 85, 0.99995), (86, 90, 0.00005)),
@@ -9423,7 +9780,7 @@ MIGRATION_TIE_BONUS = {
     ("스페인", "대한민국"): 1.3,
 }
 
-def _weighted_country_pick(candidates, dest_grade=None, dest_country=None, slot_ovr=None):
+def _weighted_country_pick(candidates, dest_grade=None, dest_country=None, slot_ovr=None, youth=False):
     """[(나라, fifa_rank), ...] 중 랭크가 좋을수록(숫자가 작을수록) 더 잘
     뽑히게 가중 추첨. 후보가 비어있으면 None.
 
@@ -9451,16 +9808,19 @@ def _weighted_country_pick(candidates, dest_grade=None, dest_country=None, slot_
         return None
     if dest_grade is not None:
         dest_tier = _GRADE_TIER.get(dest_grade, 3)
+        _youth_dest = (youth and dest_grade in _YOUTH_PATH_DEST_GRADES
+                       and (slot_ovr is None or slot_ovr < STAR_EXPORT_SLOT_OVR))
         weights = []
         for n, rank in candidates:
             cand_tier = _GRADE_TIER.get(_grade_from_rank(rank), 3)
             gap = abs(dest_tier - cand_tier)
             level_fit = max(0.10, math.exp(-gap / 2.5))
             tie = MIGRATION_TIE_BONUS.get((dest_country, n), 1.0)
-            weights.append((1.0 / (rank + 5)) * level_fit * EXPORTER_STRENGTH.get(n, 1.0) * tie
+            _yp = YOUTH_PATH_BONUS.get(n, 1.0) if _youth_dest else 1.0
+            weights.append((1.0 / (rank + 5)) * level_fit * _exporter_weight(n, slot_ovr) * tie * _yp
                            * _nat_ceiling_penalty(n, slot_ovr))
     else:
-        weights = [(1.0 / (rank + 5)) * EXPORTER_STRENGTH.get(n, 1.0)
+        weights = [(1.0 / (rank + 5)) * _exporter_weight(n, slot_ovr)
                    * _nat_ceiling_penalty(n, slot_ovr) for n, rank in candidates]
     return random.choices([n for n, _ in candidates], weights=weights, k=1)[0]
 
@@ -9471,6 +9831,36 @@ def _weighted_country_pick(candidates, dest_grade=None, dest_country=None, slot_
 # 기본값을 준다. 실측 통계로 정밀 검증한 값은 아니고(CIES 자료 기반
 # 방향성만 참고한 시작점), 나중에 더 다듬을 여지가 있다는 전제로 우선
 # 반영한다 — 표에 없는 대륙은 기존 70%로 폴백.
+# [2026-10 신민용 확정] EXPORTER_STRENGTH는 "해외 진출 인원"을 표현한다(일본 2.0 = 실제
+# 해외파가 한국보다 훨씬 많음). 그런데 그 값이 90+ 스타 자리에도 그대로 쓰여 "해외파가
+# 많다"가 "월드클래스가 많다"로 번역됐다 — 실측: 일본은 게임 시작 직후 90+ 21명·95+ 4~5명·
+# 97 2명, 대부분 EPL 스타 자리(웨스트햄·레스터·맨유). 슬롯 OVR이 STAR_EXPORT_SLOT_OVR 이상인
+# 자리에서만 STAR_EXPORTER_STRENGTH(등록국만)를 대신 쓴다 — 그 아래 자리(일반 해외 진출)는
+# EXPORTER_STRENGTH 그대로.
+STAR_EXPORT_SLOT_OVR = 90
+STAR_EXPORTER_STRENGTH = {"일본": 1.0}
+
+
+def _exporter_weight(n, slot_ovr):
+    if slot_ovr is not None and slot_ovr >= STAR_EXPORT_SLOT_OVR and n in STAR_EXPORTER_STRENGTH:
+        return STAR_EXPORTER_STRENGTH[n]
+    return EXPORTER_STRENGTH.get(n, 1.0)
+
+
+# [2026-10 신민용 확정] 한국은 "해외파를 늘리는" 게 아니라 "어린 나이에 유럽 상위 클럽에
+# 들어가는 극소수 유망주 경로"만 넓힌다. 실측(22시즌): 게임 중 생긴 97+ 118명 전원이
+# S·SS·A 클럽에서 데뷔했고, 유럽 B국 95+(세르비아 99·노르웨이 97·폴란드 98)도 전부 16~17세에
+# 이미 그 클럽 소속이었다. 한국은 S·SS 데뷔가 22년간 38명(시즌당 약 2명, 노르웨이 6·세르비아
+# 5)이라 95+가 0명 — 늦게(21~24세) 유럽에 간 잠재 97~98 선수는 남은 성장기 1~3년이라 93에서
+# 멈췄다. 목적지가 SS/S 리그(전 부수, ai_lifecycle.YOUTH_PATH_MAX_TIER 참고)이고 슬롯 OVR이 90 미만인 자리(시즌 중 은퇴대체·보충 유망주가 97%)에서만
+# 이 배율을 곱한다(시즌 중 생성 유망주만 — 게임 시작 시 월드 생성은 제외) — EXPORTER(전체 해외 진출)·아시아 진출·K리그 상한·B등급 표는 그대로.
+# 단계적으로 올리며 장기 실측(10년당 S·SS 데뷔 수 → 95+ 도달 수 → 도달 간격)으로 맞춘다.
+_YOUTH_PATH_DEST_GRADES = {"SS", "S"}
+# 2.0 → 4.0(신민용 확정): 쿼터까지 반영한 실제 추첨 재생 실측 — SS/S 하위 부수 한국 유망주
+# 0.95 → 3.08/시즌, 해외 데뷔 한국인 전체 11.5 → 13.8/시즌(+20%, 증가분은 전부 유럽), 아시아 진출 불변.
+YOUTH_PATH_BONUS = {"대한민국": 4.0}
+
+
 CONTINENT_SAME_PROB = {
     "유럽": 0.80, "남미": 0.75, "아시아": 0.65,
     "아프리카": 0.45, "북미": 0.65, "오세아니아": 0.40,
@@ -9487,7 +9877,7 @@ STAR_PROB_BY_DEST_GRADE = {
 }
 
 def _pick_nationality(team_country, team_continent, grade, pos, is_star, foreign_count, quota,
-                       rank_frac=None, slot_ovr=None):
+                       rank_frac=None, slot_ovr=None, youth=False):
     """이 슬롯의 국적을 정한다. 반환: (nationality, new_foreign_count).
 
     [2026-09 신설] rank_frac: 이 슬롯이 스쿼드 내에서 얼마나 상위권인지
@@ -9551,8 +9941,10 @@ def _pick_nationality(team_country, team_continent, grade, pos, is_star, foreign
         # 위주로 자연스럽게 쏠리되 목적지 등급과 너무 동떨어진 나라는 배제)
         pool = [(n, r) for cont, lst in _CONTINENT_COUNTRIES.items() if cont != team_continent
                 for n, r in lst if n not in _skip]
+    # youth=True: 시즌 중 생성되는 유망주(은퇴대체·스쿼드 보충 등, ai_lifecycle 호출부)만 —
+    # 게임 시작 시 월드 생성(성인 포함)에는 YOUTH_PATH_BONUS를 안 건다.
     nat = _weighted_country_pick(pool, dest_grade=grade, dest_country=team_country,
-                                  slot_ovr=slot_ovr) or team_country
+                                  slot_ovr=slot_ovr, youth=youth) or team_country
     return nat, foreign_count + 1
 
 
