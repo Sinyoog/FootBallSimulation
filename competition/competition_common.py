@@ -66,6 +66,9 @@ class CompetitionConfig:
     # match_outcome/resolve_pso를 neutral=True로 호출한다. 기본값은 빈
     # 튜플(아무 stage도 중립 처리 안 함 — 기존 대회 전부 동작 그대로).
     neutral_stages: tuple = ()
+    # [2026-10 6번 ③-1 확장] 감독 능력 경기 보정을 이 대회 AI 경기에 넣을지 —
+    # 챔스·유로파·컨퍼런스만 True(대륙 슈퍼컵 등은 아직 범위 밖).
+    manager_bonus: bool = False
 
 
 # ─────────────────────────────────────────────
@@ -551,7 +554,7 @@ def augment_team_goal_events(p, is_home, hs, as_, goals, assists, played,
         return events
 
 
-def merge_my_slot(player_ratings, is_home, my_position, my_entry, hs, as_):
+def merge_my_slot(player_ratings, is_home, my_position, my_entry, hs, as_, played=True):
     """player_ratings에서 내 슬롯을 my_entry로 치환하고 양 팀 합계를 복원한다.
 
     my_entry의 "position"은 치환된 슬롯의 라벨로 덮어쓴다(호출부가 뭘 넣든).
@@ -599,7 +602,10 @@ def merge_my_slot(player_ratings, is_home, my_position, my_entry, hs, as_):
     if player_ratings is None:
         return None, None
     side_key = "home" if is_home else "away"
-    my_list = player_ratings.get(side_key)
+    # [2026-10 버그수정, 신민용 요청: "레드카드 받아도 그 경기 내역은 볼 수 있어야 해 — 다만 플레이어가
+    # 없을 뿐"] 내가 결장(출전정지·부상·벤치)한 경기는 아무 자리도 나로 바꾸지 않는다 — 그 자리는 실제로
+    # 그 AI 선수가 뛰었다. 예전엔 결장해도 평점 0인 "나"가 AI 한 명 자리를 덮어썼다.
+    my_list = player_ratings.get(side_key) if played else None
     idx = None
     if my_list:
         labels = [r.get("position") if r else None for r in my_list]
@@ -683,7 +689,7 @@ def _tournament_effective_ovr(ovr: float) -> float:
     return ovr
 
 
-def match_outcome(h_ovr, a_ovr, neutral=False):
+def match_outcome(h_ovr, a_ovr, neutral=False, h_mgr=0.0, a_mgr=0.0):
     """'home'/'draw'/'away' (KO 무승부 → 승부차기).
     champions_engine._match_outcome과 완전히 동일 — 단, 위 비선형 곡선으로
     변환한 effective OVR을 쓴다(원본 공식/계수는 그대로).
@@ -699,7 +705,9 @@ def match_outcome(h_ovr, a_ovr, neutral=False):
     자동으로 계산해서 넘긴다 — 호출자가 매번 판단할 필요 없음)."""
     h_eff = _tournament_effective_ovr(h_ovr)
     a_eff = _tournament_effective_ovr(a_ovr)
-    diff = h_eff - a_eff
+    # [2026-10 6번 ③-1 확장] 감독 능력 보정은 대회 곡선 **뒤에** 더한다(리그·국내컵과
+    # 같은 원칙·같은 식). 기본 0이라 다른 호출부는 예전과 비트 단위로 같다.
+    diff = h_eff - a_eff + (h_mgr - a_mgr)
     if neutral:
         dw = max(0.05, 0.24 - abs(diff) * 0.009)
         half = max(0.0, 1.0 - dw) / 2.0
@@ -905,7 +913,14 @@ def sim_ai_match(cfg, t, m, my_played=False, conn=None, reason="injury", batch=N
     he = entry(cfg, t["id"], m["home_team_id"])
     ae = entry(cfg, t["id"], m["away_team_id"])
 
-    outcome = match_outcome(he["ovr"], ae["ovr"], neutral=(m["stage"] in cfg.neutral_stages))
+    # [2026-10 6번 ③-1 확장] 챔스·유로파·컨퍼런스 AI 경기에 감독 능력 보정
+    # (리그와 같은 constants.manager_match_bonus, 내 팀 경기는 0). 승부차기는 그대로.
+    _hm = _am = 0.0
+    if getattr(cfg, "manager_bonus", False):
+        from game_engine import _mgr_match_bonus_pair
+        _hm, _am = _mgr_match_bonus_pair(None, m["home_team_id"], m["away_team_id"])
+    outcome = match_outcome(he["ovr"], ae["ovr"], neutral=(m["stage"] in cfg.neutral_stages),
+                            h_mgr=_hm, a_mgr=_am)
     pso_winner, pso_score = 0, ""
     is_ko = (m["stage"] != "league")
     if outcome == "draw" and is_ko:
@@ -913,7 +928,11 @@ def sim_ai_match(cfg, t, m, my_played=False, conn=None, reason="injury", batch=N
         pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
     hs, as_ = _gen_score(outcome, he["ovr"] - ae["ovr"])
 
-    day = _week_intl_cl_day(m["week"], p or {}) if m["is_my"] else m.get("day")
+    # [2026-10 버그수정] 경기마다 날짜가 미리 정해진 대회(슈퍼컵 sc_matches.day)는 그 날을 그대로 둔다 —
+    # 예전엔 내 경기를 "그 주 대회 요일"(_week_intl_cl_day)로 덮어써서, 준결승이 끝나면 준결승 날짜가
+    # 바뀌고 그 바뀐 날을 기준으로 결승·3·4위전 날짜가 다시 계산돼 미리 보여준 "(미정)" 날과 어긋났다.
+    # day가 0/NULL인 대회(유로파·컨퍼런스)는 예전과 같다.
+    day = (m.get("day") or _week_intl_cl_day(m["week"], p or {})) if m["is_my"] else m.get("day")
 
     _absence = reason if m["is_my"] else None
     _row = (hs, as_, pso_winner, pso_score, day, _absence, m["id"])
@@ -1700,12 +1719,12 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
          "shots_on": detail.get("shots_on", 0),
          "saves": saves, "is_gk": (my_position == "GK"),
          "rating": rating, "is_me": True},
-        hs, as_)
+        hs, as_, played=not (_suspended or _benched))
 
     my_result = _my_result(outcome, is_home)
     my_conceded = (as_ if is_home else hs)
 
-    day_val = _week_intl_cl_day(m["week"], p)
+    day_val = m.get("day") or _week_intl_cl_day(m["week"], p)   # [2026-10] 위 sim_ai_match와 같은 이유
 
     conn = get_conn()
     # [2026-09 신설] 기록실용 90분 스코어 — 이 함수는 유로파/컨퍼런스/슈퍼컵

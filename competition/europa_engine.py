@@ -45,6 +45,7 @@ EUROPA_CFG = CompetitionConfig(
     end_week=EL_END_WEEK,
     stage_order=_cl._STAGE_ORDER,
     neutral_stages=("F", "TP"),
+    manager_bonus=True,   # [2026-10 6번 ③-1 확장] 감독 능력 경기 보정
 )
 
 

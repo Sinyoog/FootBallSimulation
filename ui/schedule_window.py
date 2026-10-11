@@ -335,6 +335,7 @@ class ScheduleWindow(QDialog):
             conn.close()
             self.my_team_id = p["current_team_id"]
         if st: self.season = st["current_season"]
+        self._drop_cat_widget_cache()
         self._fill_tabs()
         self._last_sig = self._compute_sig()
 
@@ -469,6 +470,104 @@ class ScheduleWindow(QDialog):
             return self._lower_cup_all_exists()
         return True
 
+    # [2026-10 신설, 신민용 요청: "일정이 있는 대회는 위 상자 색이 칠해지게 — 선택 표시(녹색)와
+    # 안 겹치게"] 일정이 있는 대분류 버튼은 남색으로 칠한다. 선택된 버튼(checked)은 예전처럼
+    # 녹색이 우선한다.
+    _CAT_QSS_BASE = (
+        "QPushButton{background:#242424;color:#bbb;border:1px solid #3a3a3a;"
+        "border-radius:4px;padding:5px 10px;font-size:12px;}"
+        "QPushButton:hover{background:#2e2e2e;color:#eee;}"
+        "QPushButton:checked{background:#00cc44;color:#111;font-weight:bold;"
+        "border:1px solid #00cc44;}")
+    _CAT_QSS_HAS = (
+        "QPushButton{background:#1f3b5c;color:#d6e9ff;border:1px solid #3f6f9f;"
+        "border-radius:4px;padding:5px 10px;font-size:12px;}"
+        "QPushButton:hover{background:#28507a;color:#ffffff;}"
+        "QPushButton:checked{background:#00cc44;color:#111;font-weight:bold;"
+        "border:1px solid #00cc44;}")
+
+    def _sched_category_has_data(self, cat_label):
+        """대분류에 보여줄 일정이 있는지 싸게 확인한다(탭 위젯은 안 만든다). 각 단계 빌더가
+        None을 돌려주는 첫 조건(내 팀이 그 대회에 있는가)과 같은 조회만 한다 — 빌더 안쪽의 드문
+        예외로 어긋나면, 그 대분류를 실제로 열었을 때 결과로 바로잡는다(_fill_tabs 참고)."""
+        st = get_state(); p = get_player()
+        if not st or not p:
+            return False
+        year = st["current_year"]
+        my_tid = p.get("current_team_id") or 0
+        try:
+            if cat_label == "📅 리그":
+                if not self.my_team_id or not self.league_id:
+                    return False
+                if getattr(self, "_sched_data_cache", None) is None:
+                    _all = get_schedule(self.league_id, self.season)
+                    _mine = [r for r in _all
+                             if r["home_team_id"] == self.my_team_id
+                             or r["away_team_id"] == self.my_team_id]
+                    self._sched_data_cache = (_all, _mine)
+                return bool(self._sched_data_cache[1])
+            if cat_label == "🌍 국제대회":
+                import intl_engine
+                return any(intl_engine.get_my_tournament(year, qual=q, kinds=k) for q, k in (
+                    (True, None), (False, None), (None, ("power_eval", "power_eval_extra"))))
+            if not my_tid:
+                return False
+            if cat_label in ("🏆 챔피언스리그", "🥈 유로파리그", "🥉 컨퍼런스리그", "🏵 슈퍼컵"):
+                from competition import champions_engine, europa_engine, conference_engine, super_cup_engine
+                engine = {"🏆 챔피언스리그": champions_engine, "🥈 유로파리그": europa_engine,
+                          "🥉 컨퍼런스리그": conference_engine, "🏵 슈퍼컵": super_cup_engine}[cat_label]
+                _key = (id(engine), year)
+                _cache = getattr(self, "_champ_fetch_cache", None)
+                if _cache is not None and _key in _cache:
+                    return bool(_cache[_key])
+                fn = (getattr(engine, "get_my_champions_matches", None)
+                      or getattr(engine, "get_my_europa_matches", None)
+                      or getattr(engine, "get_my_conference_matches", None)
+                      or getattr(engine, "get_my_super_cup_matches", None))
+                matches = fn(year)
+                if _cache is not None:
+                    _cache[_key] = matches
+                return bool(matches)
+            if cat_label == "🌎 클럽 월드컵":
+                conn = get_conn()
+                try:
+                    return bool(conn.execute("SELECT 1 FROM cwc_tournaments WHERE year=? AND my_in=1 LIMIT 1",
+                                             (year,)).fetchone())
+                finally:
+                    conn.close()
+            if cat_label == "🎖️ 컵대회":
+                from competition import cup_engine
+                return bool(cup_engine._my_cup_tournament(p, year)) or bool(self._cup_all_exists())
+            if cat_label == "🏅 3부·4부컵":
+                from competition import lower_cup_engine
+                _lt = lower_cup_engine._my_lower_cup_tournament(p, year)
+                return bool(_lt) and self._my_team_in_lower_cup(_lt["id"], my_tid)
+            if cat_label == "⚖ 승강 플레이오프":
+                import promotion_playoff_engine as ppe
+                t = ppe.get_my_po_tournament(my_tid, year)
+                return bool(t) and bool(ppe.get_po_bracket_matches(t["id"]))
+        except Exception:
+            return False
+        return False
+
+    def _update_category_colors(self, cur_cat, cur_has):
+        """대분류 버튼 색 갱신. 확인 결과는 날짜(시그니처)가 바뀔 때까지 재사용하고, 지금 연
+        대분류는 실제로 그린 결과(cur_has)로 덮어쓴다."""
+        sig = self._compute_sig()
+        cache = getattr(self, "_cat_has_cache", None)
+        if not cache or cache[0] != sig:
+            cache = (sig, {})
+            self._cat_has_cache = cache
+        has = cache[1]
+        has[cur_cat] = cur_has
+        for label, btn in self._cat_buttons.items():
+            if label not in has:
+                has[label] = self._sched_category_has_data(label)
+            qss = self._CAT_QSS_HAS if has[label] else self._CAT_QSS_BASE
+            if btn.property("_qss_kind") != has[label]:
+                btn.setStyleSheet(qss)
+                btn.setProperty("_qss_kind", has[label])
+
     def _build_category_bar(self, cat_labels):
         """대분류 버튼 줄. 목록(대회 종류)은 세이브 진행과 무관하게 고정이라
         한 번만 만들고, 이후 _fill_tabs에서는 선택 표시만 갱신한다."""
@@ -479,12 +578,8 @@ class ScheduleWindow(QDialog):
             btn = QPushButton(label)
             btn.setCheckable(True)
             btn.setMinimumWidth(96)
-            btn.setStyleSheet(
-                "QPushButton{background:#242424;color:#bbb;border:1px solid #3a3a3a;"
-                "border-radius:4px;padding:5px 10px;font-size:12px;}"
-                "QPushButton:hover{background:#2e2e2e;color:#eee;}"
-                "QPushButton:checked{background:#00cc44;color:#111;font-weight:bold;"
-                "border:1px solid #00cc44;}")
+            btn.setStyleSheet(self._CAT_QSS_BASE)
+            btn.setProperty("_qss_kind", False)
             btn.clicked.connect(lambda _c, l=label: self._on_sched_category_clicked(l))
             row.addWidget(btn)
             self._cat_buttons[label] = btn
@@ -493,9 +588,24 @@ class ScheduleWindow(QDialog):
 
     def _on_sched_category_clicked(self, cat_label):
         self._sched_current_cat = cat_label
-        self._fill_tabs()
+        self._fill_tabs(use_cache=True)
 
-    def _fill_tabs(self):
+    # [2026-10 최적화, 신민용 리포트 20번: "경기 일정에서 클릭할 때 렉이 있다"] 대분류 버튼을 누를
+    # 때마다 보고 있던 대분류의 탭 위젯을 전부 지우고 새 대분류 탭을 처음부터 다시 그렸다 — 같은
+    # 날 안에서 대분류를 오가도 매번 같은 내용을 다시 만든 셈이다. 이제 대분류를 떠날 때 그 탭
+    # 위젯들을 지우지 않고 보관했다가, 날짜(시그니처)가 같은 동안 다시 누르면 그대로 붙인다. 날짜가
+    # 바뀌거나 refresh()(진행·이적 등 명시적 갱신)가 불리면 보관분을 전부 버리고 새로 그린다 —
+    # 화면에 보이는 내용은 예전과 같다.
+    def _drop_cat_widget_cache(self):
+        cache = getattr(self, "_cat_widget_cache", None)
+        cache = cache if isinstance(cache, dict) else {}
+        for _v in cache.values():
+            for _label, w, _lazy in _v[1]:
+                if w is not None:
+                    w.deleteLater()
+        self._cat_widget_cache = {}
+
+    def _fill_tabs(self, use_cache=False):
         # [2026-08 계측 추가, 신민용 리포트: "경기 일정 클릭할 때 약간
         # 렉이 있거든"] 구간별 시간을 찍어 어느 단계가 무거운지 본다.
         # [2026-09] 2단 구조로 바뀐 뒤로는 "지금 고른 대분류 하나"만
@@ -526,10 +636,30 @@ class ScheduleWindow(QDialog):
         # 않은) 인덱스를 붙잡고 오작동할 수 있다 — 재구성이 끝날 때까지
         # 시그널을 막아둔다.
         self._tab.blockSignals(True)
+        _prev_cat = getattr(self, "_sched_displayed_cat", None)
+        _prev_cat = _prev_cat if isinstance(_prev_cat, str) else None
+        _prev_sig = getattr(self, "_sched_displayed_sig", None)   # 지금 떠 있는 탭들을 그린 날짜
+        _sig_now = self._compute_sig()
+        if not isinstance(getattr(self, "_cat_widget_cache", None), dict):
+            self._cat_widget_cache = {}
+        # 날짜가 바뀐 보관분은 버린다(진행 중 5초 폴링은 refresh()를 거치지만 안전하게 한 번 더).
+        for _k in [k for k, v in self._cat_widget_cache.items() if v[0] != _sig_now]:
+            for _l, _w, _lz in self._cat_widget_cache.pop(_k)[1]:
+                if _w is not None:
+                    _w.deleteLater()
+        _stash = []
+        _idx0 = 0
         while self._tab.count():
             w = self._tab.widget(0)
+            label = self._tab.tabText(0)
             self._tab.removeTab(0)
-            if w: w.deleteLater()
+            if use_cache and _prev_cat and _prev_sig == _sig_now:
+                _stash.append((label, w, self._sched_lazy_builders.get(_idx0)))
+            elif w:
+                w.deleteLater()
+            _idx0 += 1
+        if use_cache and _prev_cat and _prev_sig == _sig_now and _stash:
+            self._cat_widget_cache[_prev_cat] = (_sig_now, _stash, cur)
         self._sched_lazy_builders = {}
 
         defs = self._sched_category_defs()
@@ -544,6 +674,20 @@ class ScheduleWindow(QDialog):
             _btn.setChecked(_label == cat)
 
         subs = dict(defs)[cat]
+        _hit = self._cat_widget_cache.pop(cat, None) if use_cache else None
+        _hit_idx = None
+        if _hit is not None and _hit[0] == _sig_now:
+            for _label, _w, _lazy in _hit[1]:
+                _idx = self._tab.addTab(_w, _label)
+                if _lazy is not None:
+                    self._sched_lazy_builders[_idx] = _lazy
+            _hit_idx = _hit[2]
+            _sw_marks.append((f"{cat}(보관분 재사용)", _time_sw.perf_counter()))
+            subs = []
+        elif _hit is not None:
+            for _l, _w, _lz in _hit[1]:
+                if _w is not None:
+                    _w.deleteLater()
         for sub_label, builder, lazy in subs:
             if lazy:
                 if not self._sched_lazy_tab_exists(cat, sub_label):
@@ -576,6 +720,12 @@ class ScheduleWindow(QDialog):
             self._tab.addTab(_empty, self._SCHED_EMPTY_LABEL)
         if not _sw_marks:
             _sw_marks.append((f"{cat}(빈 대회)", _time_sw.perf_counter()))
+        try:
+            _cur_has = not (self._tab.count() == 1
+                            and self._tab.tabText(0) == self._SCHED_EMPTY_LABEL)
+            self._update_category_colors(cat, _cur_has)
+        except Exception as _e:
+            print(f"[SCHED] 대분류 색 갱신 실패: {_e}")
 
         _sw_total = _sw_marks[-1][1] - _sw_t0
         if _sw_total >= 0.03:
@@ -596,15 +746,23 @@ class ScheduleWindow(QDialog):
         # 같은 단계 라벨이 그대로 있으면 그 자리로 돌아간다(주 진행 중
         # 자동 갱신에서 보고 있던 화면이 튀지 않게).
         _restore_idx = 0
-        if cur_label:
+        if _hit_idx is not None and 0 <= _hit_idx < self._tab.count():
+            _restore_idx = _hit_idx          # 보관분: 그 대분류에서 보던 단계 탭으로
+        elif cur_label:
             for i in range(self._tab.count()):
                 if self._tab.tabText(i) == cur_label:
                     _restore_idx = i
                     break
         self._tab.setCurrentIndex(_restore_idx)
         self._tab.blockSignals(False)
+        self._sched_displayed_cat = cat
+        self._sched_displayed_sig = _sig_now
+        # 보던 탭의 지연 빌더가 남아 있으면(보관분의 '전체 일정' 자리 등) 바로 채운다.
+        if self._sched_lazy_builders.get(_restore_idx) is not None:
+            self._lazy_show_sched_tab(_restore_idx)
 
-        if scroll_pos:
+        # 스크롤 위치 복원은 같은 대분류를 다시 그렸을 때만(다른 대분류의 탭 번호에 대입하지 않게).
+        if scroll_pos and cat == _prev_cat and _hit_idx is None:
             def _restore():
                 for i, v in scroll_pos.items():
                     if i >= self._tab.count():
@@ -657,6 +815,25 @@ class ScheduleWindow(QDialog):
         conn.close()
         return n > 0
 
+    @staticmethod
+    def _my_team_in_lower_cup(tournament_id, my_tid):
+        """[2026-10 버그수정, 신민용 리포트: "1부 팀이라 3부/4부컵에 안 나가는데 3·4부컵 일정이
+        뜬다"] _my_lower_cup_tournament는 "내 나라의 그 해 3·4부컵"을 돌려줄 뿐, 내 팀이 참가
+        팀인지는 보지 않는다. 내 팀이 참가팀(lower_cup_entries)이거나 경기에 한 번이라도 들어
+        있을 때만 이 대회 일정을 보여준다."""
+        if not tournament_id or not my_tid:
+            return False
+        conn = get_conn()
+        try:
+            if conn.execute("SELECT 1 FROM lower_cup_entries WHERE tournament_id=? AND team_id=? LIMIT 1",
+                            (tournament_id, my_tid)).fetchone():
+                return True
+            return bool(conn.execute(
+                "SELECT 1 FROM lower_cup_matches WHERE tournament_id=? AND (home_team_id=? OR away_team_id=?) "
+                "LIMIT 1", (tournament_id, my_tid, my_tid)).fetchone())
+        finally:
+            conn.close()
+
     def _lower_cup_all_exists(self):
         """3부·4부컵 버전 — _cup_all_exists와 완전히 같은 패턴, 대상
         테이블만 lower_cup_tournaments/lower_cup_matches로 교체."""
@@ -666,7 +843,7 @@ class ScheduleWindow(QDialog):
         if not st or not p or not p.get("current_team_id"):
             return False
         t = lower_cup_engine._my_lower_cup_tournament(p, st["current_year"])
-        if not t:
+        if not t or not self._my_team_in_lower_cup(t["id"], p["current_team_id"]):
             return False
         conn = get_conn()
         n = conn.execute(
@@ -836,7 +1013,11 @@ class ScheduleWindow(QDialog):
             # 2위도 전원 직행하거나, 2위 중 성적순 와일드카드/플레이오프가
             # 있는 대회도 있다. intl_engine.get_qual_advance_status가
             # 실제 대회 설정을 그대로 재현해 국가별 상태를 계산해준다.
-            _qual_status = intl_engine.get_qual_advance_status(t) if _is_qual else {}
+            # [2026-10 버그수정] 2단계 예선의 1차 탭은 "2차 진출" 기준으로 색칠한다
+            # (get_qual_advance_status의 stage=1 주석 참고). 2차 탭·단일단계는 예전 그대로.
+            _qual_status = (intl_engine.get_qual_advance_status(
+                t, stage=(1 if (_has_stage2 and not _use_stage2) else None))
+                if _is_qual else {})
 
             lbl_g = QLabel("◼ 조별리그")
             lbl_g.setStyleSheet("color:#00cc44;font-weight:bold;font-size:12px;")
@@ -962,7 +1143,9 @@ class ScheduleWindow(QDialog):
                     # 직행/와일드카드/PO 개념 자체가 없으니 이 표를 스킵.
                     _root_cfg = WC_QUAL_BY_TIER[wc_tier(t.get("year", 0))].get(_qcontinent, {})
                     _two_stage = "stage2" in _root_cfg
-                    if not (_two_stage and not _has_stage2):
+                    # [2026-10] 1차 탭(2차 조가 이미 생긴 뒤 1차를 다시 볼 때 포함)도 스킵 —
+                    # 1차는 조 상위권 전원이 2차로 가므로 2차 규칙의 직행/PO 경쟁표가 맞지 않는다.
+                    if not (_two_stage and (not _has_stage2 or not _use_stage2)):
                         _active_cfg = _root_cfg.get("stage2") if _two_stage else _root_cfg
                         _rr = _active_cfg.get("wildcard_rank") or _active_cfg.get("po_pool_rank")
                         if _rr:
@@ -2055,7 +2238,7 @@ class ScheduleWindow(QDialog):
             return None
 
         t = lower_cup_engine._my_lower_cup_tournament(p, st["current_year"])
-        if not t:
+        if not t or not self._my_team_in_lower_cup(t["id"], p["current_team_id"]):
             return None
 
         conn = get_conn()

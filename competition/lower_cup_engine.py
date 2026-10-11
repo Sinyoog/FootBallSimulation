@@ -643,7 +643,10 @@ def _team_ovr(c, team_id):
 def _sim_ai_lower_cup_match(c, m):
     h_ovr = _team_ovr(c, m["home_team_id"])
     a_ovr = _team_ovr(c, m["away_team_id"])
-    outcome = _match_outcome(h_ovr, a_ovr)
+    # [2026-10 6번 ③-1] 감독 능력 보정(내 팀 경기는 0)
+    from game_engine import _mgr_match_bonus_pair
+    _hm, _am = _mgr_match_bonus_pair(c, m["home_team_id"], m["away_team_id"])
+    outcome = _match_outcome(h_ovr, a_ovr, _hm, _am)
     if outcome == "home":
         hs, as_ = random.choice([1, 2, 2, 3]), random.randint(0, 1)
     elif outcome == "away":
@@ -1115,7 +1118,7 @@ def simulate_my_lower_cup_match(week, p, day=None):
          "shots_on": detail.get("shots_on", 0),
          "saves": saves, "is_gk": (my_position == "GK"),
          "rating": rating, "is_me": True},
-        hs, as_)
+        hs, as_, played=not (_suspended or _benched))
 
     my_result = _my_result(outcome, is_home)
 

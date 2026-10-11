@@ -751,7 +751,7 @@ def simulate_my_po_match(week, p, day=None):
          "shots_on": detail.get("shots_on", 0),
          "saves": saves, "is_gk": (my_position == "GK"),
          "rating": rating, "is_me": True},
-        hs, as_)
+        hs, as_, played=not (_suspended or _benched))
 
     my_result = _my_result(outcome, is_home)
 

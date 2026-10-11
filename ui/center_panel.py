@@ -1016,7 +1016,8 @@ class CenterPanel(QWidget):
                     stage = match_info.get("stage_ko", "")
                     hl.setText("")
                     if ml:
-                        ml.setText(f"🌍 {match_info['league_name']} {stage}\n(미정)")
+                        # [2026-10] 대회별 아이콘(슈퍼컵 🏆) — 없으면 예전처럼 🌍
+                        ml.setText(f"{match_info.get('icon') or '🌍'} {match_info['league_name']} {stage}\n(미정)")
                         ml.setStyleSheet("color:#999999;font-weight:bold;font-size:12px;"
                                          "background:#2a2a2a;border-radius:4px;padding:4px;")
                         ml.show()
@@ -1876,6 +1877,14 @@ class CenterPanel(QWidget):
                 win.pause_refresh() if pause else win.resume_refresh()
             except RuntimeError:
                 pass  # 창이 이미 닫혀 C++ 객체가 삭제된 경우
+        # [2026-10 신설, 신민용 요청] 진행이 끝나 워커가 DB를 놓은 뒤 — 열린 세계축구기록실
+        # 창들의 상단 인구(선수·감독 수)를 다시 센다.
+        if not pause:
+            try:
+                from ui.world_browser_window import refresh_population_in_open_browsers
+                refresh_population_in_open_browsers()
+            except Exception:
+                pass
 
     def _show_processing_overlay(self, text):
         target = self.main_win if self.main_win else self
@@ -2451,6 +2460,13 @@ class CenterPanel(QWidget):
     def _on_year_step_finished(self):
         from PyQt6.QtWidgets import QApplication
         self._year_weeks_done += 1
+        # [2026-10] 1년 진행 중에도 주마다(워커가 끝난 직후 — DB를 아무도 안 쓰는 순간)
+        # 세계축구기록실 상단 인구를 갱신한다 — 시즌 전환 직후 바로 바뀐 숫자가 보인다.
+        try:
+            from ui.world_browser_window import refresh_population_in_open_browsers
+            refresh_population_in_open_browsers()
+        except Exception:
+            pass
         if self._proc_overlay is not None:
             self._proc_overlay.show_progress(f"🗓 {getattr(self, '_year_target_years', 1) or 1}년 진행 중...", self._year_weeks_done, self._year_weeks_total)
 
@@ -2901,6 +2917,12 @@ class CenterPanel(QWidget):
         if scm:
             scm["cl_kind"] = "super_cup"
             return scm
+        # [2026-10 버그수정, 신민용 리포트: "슈퍼컵 결승 일정이 안 보이다가 4강이 끝나면 갑자기 생긴다 —
+        # 월드컵 8강(미정)처럼 미리 일정에 있어야 한다"] 결승·3·4위전이 만들어지기 전에도 내 다음 경기
+        # 날을 "(미정)"으로 보여준다(super_cup_engine.get_my_pending_stage — 실제 경기와 같은 날).
+        sc_pend = super_cup_engine.get_my_pending_stage(week, day=day, p=p, st=st)
+        if sc_pend:
+            return sc_pend
 
         # [2026-09 신설] 국내 슈퍼컵도 super_cup과 동일한 부류다 — domestic_
         # sc_matches.day에 실제 날짜(_pick_dsc_day, 4주차 안에서 국내리그

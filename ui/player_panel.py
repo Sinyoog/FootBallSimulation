@@ -88,6 +88,8 @@ QWidget { background-color: #1e1e1e; color: #cccccc; font-size: 12px; }
 #talentBadge { color: white; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; }
 #injBadge { background-color: #8b0000; color: white;
             padding: 2px 6px; border-radius: 4px; font-size: 11px; }
+#milBadge { background-color: #3a4a2a; color: #e8f0c8;
+            padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; }
 #slumpBadge { background-color: #555500; color: #ffff00;
               padding: 2px 6px; border-radius: 4px; font-size: 11px; }
 #rankLabel  { color: #00cc44; font-size: 13px; font-weight: bold; }
@@ -145,6 +147,19 @@ class PlayerPanel(QWidget):
     #   쌓인다(예: 신체→기본 순으로 누르면 신체 섹션이 기본보다 위).
     DEFAULT_ORDER = ["기본", "시즌", "신체", "스탯"]
 
+    @staticmethod
+    def _military_badge_text(p):
+        """병역 대상(한국 국적 보유)이면 "면제"/"군필"/"미필"/"복무중", 아니면 "".
+        세계 축구 기록실 선수 상세의 "군대" 칸과 같은 규칙(판정 전 = 미필)."""
+        try:
+            from military_service import (military_enabled, is_service_target,
+                                          military_status_label, my_player_nationalities)
+            if not military_enabled() or not is_service_target(my_player_nationalities(p)):
+                return ""
+            return military_status_label(p.get("military_status") or "") or "미필"
+        except Exception:
+            return ""
+
     def _build(self):
         self.lay = QVBoxLayout(self)
         self.lay.setContentsMargins(8,8,8,8)
@@ -156,6 +171,10 @@ class PlayerPanel(QWidget):
         self.lbl_name.setWordWrap(True)          # 긴 이름 자동 줄바꿈
         self.lbl_ovr   = QLabel("OVR 0"); self.lbl_ovr.setObjectName("ovrBadge")
         self.lbl_talent = QLabel(""); self.lbl_talent.setObjectName("talentBadge")
+        # [2026-10 신설, 신민용 요청: "플레이어가 한국인일 때 메인 화면에도 OVR 상자 옆에 군필·
+        # 미필·면제가 표시되게 — 어려움 모드일 때는 여기에 군필·미필·면제만"] 병역 대상(국적 슬롯
+        # 중 하나라도 한국)일 때만 보인다. 어려움 모드는 OVR 뱃지가 숨으므로 이 뱃지만 남는다.
+        self.lbl_mil = QLabel(""); self.lbl_mil.setObjectName("milBadge"); self.lbl_mil.hide()
         self.lbl_state = QLabel(""); self.lbl_state.setObjectName("injBadge")
         self.lbl_state.setWordWrap(True)         # 부상 상세 텍스트가 길어도 잘리지 않고 줄바꿈
 
@@ -187,6 +206,7 @@ class PlayerPanel(QWidget):
         badge_row = QHBoxLayout()
         badge_row.setContentsMargins(0, 2, 0, 0)
         badge_row.addWidget(self.lbl_ovr, 0)
+        badge_row.addWidget(self.lbl_mil, 0)
         badge_row.addWidget(self.lbl_state, 1)   # 부상 텍스트가 길면 이 라벨이 줄바꿈되며 늘어남
         self.lay.addLayout(badge_row)
         self._div()
@@ -480,6 +500,12 @@ class PlayerPanel(QWidget):
             self.lbl_talent.setText(f"★ {_tname}")
             self.lbl_talent.setStyleSheet(f"background-color: {_tcolor};")
 
+        _mil = self._military_badge_text(p)
+        if _mil:
+            self.lbl_mil.setText(_mil); self.lbl_mil.show()
+        else:
+            self.lbl_mil.hide()
+
         # [2026-08 수정, 신민용 요청: "OVR 옆 빨간 부상 표시는 없애자,
         # 어차피 신체 탭에 뜨니까"] 부상 상세는 이제 신체 탭 전용 — 여기
         # 배지는 슬럼프 상태만 계속 담당한다.
@@ -560,6 +586,14 @@ class PlayerPanel(QWidget):
             ("주요 포지션", p["position"]),
             ("현 포지션",   _cur_field_pos),
         ]
+        # [2026-10 주포·부포] 내 부포가 있으면 "부 포지션" 줄을 주요 포지션 바로 아래에 넣는다.
+        try:
+            import sub_positions as _subp
+            _my_sub = _subp.my_sub()
+        except Exception:
+            _my_sub = None
+        if _my_sub:
+            rows.insert(5, ("부 포지션", _my_sub))
         # [2026-08 신설, 난이도 시스템] 성격/신체특징(부상·성장 관련 숨겨진
         # 특성)/감독관계는 어려움 난이도에서 비표시 — 키/몸무게/체형처럼
         # 겉으로 관찰 가능한 정보가 아니라 원래 내부 수치이기 때문에
@@ -843,6 +877,13 @@ def _manager_tactic_texts(team_id):
     bld = MANAGER_BUILDUP_KO.get(m.get("style_buildup"), "")
     prs = MANAGER_PRESS_KO.get(m.get("style_press"), "")
     _name = (m.get("name") or "").strip()
+    # [2026-10] 지은 이름·선수 출신(선수 이름이 원본)까지 — 감독 이름 해석은 한 곳에서.
+    try:
+        from database import get_manager_name_info
+        _ni = get_manager_name_info([m.get("id")]).get(m.get("id")) or {}
+        _name = _ni.get("custom") or _ni.get("fallback") or _name
+    except Exception:
+        pass
     _tip_lines = [f"{_name} 감독" if _name else "현재 감독"]
     if atk:
         _tip_lines.append(f"공격 성향: {atk}")

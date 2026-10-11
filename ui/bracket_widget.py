@@ -72,6 +72,7 @@ class BracketWidget(QWidget):
             return
 
         n_rounds = len(self._rounds)
+        self._reorder_rounds_by_tree()
         first_n  = max(1, len(self._rounds[0]["matches"]))
 
         # 1라운드 경기들을 일정 간격으로 배치 → 이후 라운드는
@@ -171,6 +172,18 @@ class BracketWidget(QWidget):
                 else:
                     raw[j] = top + j * unit + self.MATCH_H / 2
 
+            # 2.5) [2026-10 버그수정, 신민용 리포트: "유로파처럼 플레이오프 이후 16강이 뜨면 UI적으로
+            # 아래로 뜬다"] 이 라운드 경기들을 부모 경기 높이 순으로 다시 세운다. 16강 대진은 직행팀과
+            # 플레이오프 승자를 OVR로 짝지어 만들어져 목록 순서가 플레이오프 순서와 무관한데, 예전엔
+            # 목록 순서 그대로 아래 3)의 "겹치면 아래로 밀기"를 해서 순서가 어긋난 만큼 계속 밀려
+            # 내려갔다(실측: 플레이오프 열 맨 아래 770 → 16강 열 맨 아래 1260). 부모 높이 순으로
+            # 세우면 각 경기가 자기 부모 옆에 붙고 열 길이도 부모 열과 비슷해진다. 그리기·연결선은
+            # 경기 목록과 좌표 목록을 같은 순서로 쓰므로 둘을 함께 재정렬한다.
+            order = sorted(range(n_cur), key=lambda j: raw[j])
+            if order != list(range(n_cur)):
+                self._rounds[ri]["matches"] = [self._rounds[ri]["matches"][j] for j in order]
+                raw = [raw[j] for j in order]
+
             # 3) 최소 간격 강제 — 위에서부터 훑으며 겹치면 아래로 밀어낸다.
             min_gap = self.MATCH_H + self.V_GAP_MIN
             for j in range(1, n_cur):
@@ -189,6 +202,42 @@ class BracketWidget(QWidget):
         self._h = int(max_cy + self.MATCH_H / 2 + self.PAD)
         self._w = int(self._w)
         self._layout_done = True
+
+    @staticmethod
+    def _is_third_place(stage):
+        st = stage or ""
+        return "3/4" in st or "3·4" in st or "3위" in st
+
+    def _reorder_rounds_by_tree(self):
+        """[2026-10 버그수정, 신민용 리포트: "챔스·유로파 토너먼트에서 16강 → 8강 선이 이상하다"]
+        클럽 대항전은 8강 대진을 16강 순서와 무관하게 새로 짠다(인접한 두 16강 승자끼리 붙는 고정
+        대진표가 아님). 그런데 그리기는 목록 순서대로 위에서부터 놓아서, 8강 한 경기의 부모 두
+        16강이 멀리 떨어져 있으면 여러 8강의 세로 연결선이 같은 자리에 겹쳐 어느 선이 어디로
+        가는지 알 수 없었다. 마지막 라운드부터 거꾸로 내려오며, 각 경기의 부모 경기들(팀 이름이
+        겹치는 직전 라운드 경기)을 그 경기 순서대로 붙여 직전 라운드 목록을 다시 세운다 — 그러면
+        부모 두 경기가 항상 위아래로 붙어 있어 선이 겹치지 않는다. 부모를 못 찾은 경기(아직
+        미정인 라운드, 부전승 등)는 원래 순서대로 뒤에 둔다. 3/4위전은 결승과 부모(4강)를 나눠
+        가지므로 기준에서 뺀다. 월드컵처럼 이미 인접 대진인 경우엔 순서가 그대로다."""
+        idxs = [i for i, r in enumerate(self._rounds) if not self._is_third_place(r.get("stage"))]
+        for pos in range(len(idxs) - 1, 0, -1):
+            cur = self._rounds[idxs[pos]]["matches"]
+            prev_r = self._rounds[idxs[pos - 1]]
+            prev = prev_r["matches"]
+            used, order = set(), []
+            for m in cur:
+                for team in (m.get("home"), m.get("away")):
+                    if not team or team == "미정":
+                        continue
+                    for k, pm in enumerate(prev):
+                        if k not in used and team in (pm.get("home"), pm.get("away")):
+                            used.add(k)
+                            order.append(k)
+                            break
+            if not order:
+                continue
+            order += [k for k in range(len(prev)) if k not in used]
+            if order != list(range(len(prev))):
+                prev_r["matches"] = [prev[k] for k in order]
 
     def _col_x(self, round_idx):
         return self.PAD + round_idx * (self.BOX_W + self.COL_GAP)

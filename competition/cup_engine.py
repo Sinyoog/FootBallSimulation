@@ -997,7 +997,7 @@ def _entry(tid, team_id):
     return result
 
 
-def _match_outcome(h_ovr, a_ovr):
+def _match_outcome(h_ovr, a_ovr, h_mgr=0.0, a_mgr=0.0):
     """[2026-07 재조정, 신민용 지적: "컵대회 우승팀이 리그에서는 10등,
     챔스 우승팀이 리그 하위권인 게 이상하다"] 이 함수가 리그(_match_win_probs)/
     국제대회(intl_engine._match_outcome)와 똑같은 예전 완만한 공식(계수
@@ -1019,6 +1019,8 @@ def _match_outcome(h_ovr, a_ovr):
     #    승부차기 구간이 남겨준다.
     # 3·4부 국내컵(lower_cup_engine)도 이 함수를 그대로 쓴다.
     diff = _cup_effective_diff(h_ovr, a_ovr, random.uniform(1.5, 4.5))
+    # [2026-10 6번 ③-1] 감독 능력 보정 — 곡선 뒤에 더한다(기본 0 = 예전과 같음).
+    diff = diff + (h_mgr - a_mgr)
     dw = max(0.05, 0.24 - abs(diff) * 0.009)
     half = (1.0 - dw) / 2.0
     hw = max(0.04, min(0.95, half + diff * 0.025))
@@ -1068,7 +1070,10 @@ def _sim_ai_match(t, m, conn=None, reason="injury", batch=None):
     from game_engine import add_log, get_player, _gen_score, _week_intl_cl_day
     he = _entry(t["id"], m["home_team_id"])
     ae = _entry(t["id"], m["away_team_id"])
-    outcome = _match_outcome(he["ovr"], ae["ovr"])
+    # [2026-10 6번 ③-1] 감독 능력 보정(내 팀 경기는 0)
+    from game_engine import _mgr_match_bonus_pair
+    _hm, _am = _mgr_match_bonus_pair(None, m["home_team_id"], m["away_team_id"])
+    outcome = _match_outcome(he["ovr"], ae["ovr"], _hm, _am)
     pso_winner, pso_score = 0, ""
     if outcome == "draw":
         win_home, pso_score = _resolve_pso(he["ovr"], ae["ovr"])
@@ -1311,7 +1316,7 @@ def simulate_my_cup_match(week, p, day=None):
          "shots_on": detail.get("shots_on", 0),
          "saves": saves, "is_gk": (my_position == "GK"),
          "rating": rating, "is_me": True},
-        hs, as_)
+        hs, as_, played=not (_suspended or _benched))
 
     my_result = _my_result(outcome, is_home)
 

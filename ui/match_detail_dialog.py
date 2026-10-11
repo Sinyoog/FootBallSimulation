@@ -498,6 +498,23 @@ def _fp_row_priority(k):
     return {"ATK": 0, "MID2": 1, "MID": 2, "DEF": 3, "GK": 4}.get(k, 2)
 
 
+def _match_formation_of(entries):
+    """[2026-10 신설, 신민용 리포트: "감독은 4-1-4-1인데 경기 상세는 4-3-2-1로 뜬다"]
+    선발 11명의 저장된 자리 라벨(tactical_engine이 그 경기 포메이션의 FORMATION_SLOTS
+    순서 그대로 붙인 값)과 정확히 같은 포메이션 이름을 찾는다 — 이 경기에서 실제로 쓴
+    포메이션이다. 라벨이 빠졌거나(예전 기록) 어느 포메이션과도 안 맞으면 ""."""
+    from constants import FORMATION_SLOTS
+    if not entries or len(entries) != 11:
+        return ""
+    labels = [(e.get("position") if e else None) for e in entries]
+    if not all(labels):
+        return ""
+    for name, slots in FORMATION_SLOTS.items():
+        if list(slots) == labels:
+            return name
+    return ""
+
+
 class _MatchFormationPitch(QWidget):
     """양 팀 11명을 하프라인 기준 위(top)/아래(bottom)에 실제 포진처럼
     그리는 캔버스. 선수는 원으로, 원 안엔 평점, 원 아래엔 이름을 표시한다.
@@ -531,8 +548,11 @@ class _MatchFormationPitch(QWidget):
         super().__init__(parent)
         self._top = top_list or []
         self._bottom = bottom_list or []
-        self._top_name = top_name or ""
-        self._bottom_name = bottom_name or ""
+        # [2026-10 신설, 신민용 요청: "라인업 평점 위아래 팀 이름 우측에 이 경기 포메이션"]
+        self._top_formation = _match_formation_of(self._top)
+        self._bottom_formation = _match_formation_of(self._bottom)
+        self._top_name = (top_name or "") + (f"   {self._top_formation}" if self._top_formation else "")
+        self._bottom_name = (bottom_name or "") + (f"   {self._bottom_formation}" if self._bottom_formation else "")
         self._top_accent = top_accent
         self._bottom_accent = bottom_accent
         # [2026-09 신설, 신민용 요청: "경기 상세 이름 클릭하면 세계
@@ -551,10 +571,27 @@ class _MatchFormationPitch(QWidget):
         self.setMinimumHeight(680)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
 
-    def _group_rows(self, entries):
+    def _group_rows(self, entries, formation=""):
         """entries(11개, 빈 슬롯은 None) → (rows, sorted_rows, max_row_cnt).
         rows: {행키: [(idx,label,entry), ...]}, sorted_rows: 하프라인에
-        가까운 행(ATK)부터 먼 행(GK) 순."""
+        가까운 행(ATK)부터 먼 행(GK) 순.
+
+        [2026-10 버그수정, 신민용 리포트: "감독은 4-1-4-1인데 경기 상세는 4-3-2-1로 뜬다"]
+        예전엔 자리 라벨만 보고 줄을 나눠서 LM/RM이 늘 CAM과 같은 줄(MID2)로 갔다 —
+        4-1-4-1(CDM | LM CM CM RM | ST)이 4-3-2-1처럼, 4-4-2가 4-2-2-2처럼 그려졌다.
+        이 경기 포메이션을 알면 포메이션 화면·세계 기록실과 같은 formation_row_bands
+        (포메이션 이름의 숫자대로 줄을 나눔)로 줄을 만든다. 모르면 예전 방식 그대로."""
+        if formation:
+            from formation_logic import formation_row_bands
+            labels = [e.get("position") for e in entries]
+            bands = formation_row_bands(formation, labels)
+            if bands and sum(len(b) for b in bands) == len(entries):
+                rows = {}
+                for bi, band in enumerate(bands):        # bands: 뒤(GK) → 앞(공격)
+                    rows[f"B{bi}"] = [(idx, pos, entries[idx]) for idx, pos in band]
+                sorted_rows = [f"B{bi}" for bi in reversed(range(len(bands)))]   # 앞 → 뒤
+                max_row_cnt = max((len(v) for v in rows.values()), default=1)
+                return rows, sorted_rows, max_row_cnt
         rows = {}
         row_order = []
         for idx, entry in enumerate(entries):
@@ -605,8 +642,8 @@ class _MatchFormationPitch(QWidget):
         # 많은 쪽 기준으로 "공통 한 줄 높이"를 하나 정해서 양쪽 다
         # 그대로 쓴다 — 줄이 적은 팀은 그만큼 하프라인 쪽/가장자리 쪽에
         # 살짝 여유 공간이 남을 뿐, 원 크기 자체는 항상 두 팀이 동일.
-        top_rows, top_sorted, top_maxcnt = self._group_rows(self._top)
-        bot_rows, bot_sorted, bot_maxcnt = self._group_rows(self._bottom)
+        top_rows, top_sorted, top_maxcnt = self._group_rows(self._top, self._top_formation)
+        bot_rows, bot_sorted, bot_maxcnt = self._group_rows(self._bottom, self._bottom_formation)
         rows_top = len(top_sorted) or 1
         rows_bot = len(bot_sorted) or 1
         max_rows = max(rows_top, rows_bot, 1)
@@ -924,6 +961,11 @@ class MatchDetailDialog(QDialog):
         played  = payload.get("played", True)
         benched = payload.get("benched", False)
         pos     = payload.get("position", "")
+        # [2026-10 버그수정, 신민용 요청: "레드카드 받아도 그 경기 내역은 볼 수 있어야 해 — 다만 플레이어가
+        # 없을 뿐"] 결장 경기도 팀 단위 기록(통계·라인업·우리 팀 득점 장면)이 저장돼 있으면 그대로 보여준다.
+        # 예전 저장분(결장 경기는 팀 기록 자체가 없음)은 예전처럼 결장 문구만 보여준다.
+        _absent_team_view = (not played) and bool(
+            payload.get("team_stats") or payload.get("player_ratings") or events)
 
         is_home = bool(data.get("is_home"))
         loc = "홈" if is_home else "원정"
@@ -943,7 +985,7 @@ class MatchDetailDialog(QDialog):
         score.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(score)
 
-        if played:
+        if played or _absent_team_view:
             btn_row = QWidget()
             bh = QHBoxLayout(btn_row); bh.setContentsMargins(0, 0, 0, 0); bh.setSpacing(6)
 
@@ -976,23 +1018,38 @@ class MatchDetailDialog(QDialog):
 
         # ── 출전하지 않은 경기 ────────────────────────────────
         if not played:
-            msg = QLabel("🪑 벤치 대기" if benched else "🚑 부상 결장")
+            # [2026-10 버그수정] 출전정지 결장이 "부상 결장"으로 뜨던 문제 — 저장된 사유로 구분한다.
+            # 사유가 없는 예전 저장분은 부상인지 정지인지 알 수 없어 "결장"으로만 쓴다.
+            _reason = payload.get("absence_reason")
+            if _reason == "suspension":
+                _txt = "🟥 출전정지로 결장"
+            elif _reason == "injury":
+                _txt = "🚑 부상 결장"
+            elif benched or _reason == "bench":
+                _txt = "🪑 벤치 대기"
+            else:
+                _txt = "결장"
+            msg = QLabel(_txt)
             msg.setStyleSheet("color:#888;font-size:14px;")
             msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
             root.addWidget(msg)
-            root.addStretch()
-            self._add_close(root)
-            return
+            if not _absent_team_view:
+                root.addStretch()
+                self._add_close(root)
+                return
 
         # ── 내 기록 요약 ──────────────────────────────────────
-        if pos == "GK":
+        if not played:
+            pass        # 결장 — 내 기록 요약 없음(아래 타임라인은 팀 장면만)
+        elif pos == "GK":
             summary = QLabel(f"평점 {data.get('rating',0)}   선방 {data.get('saves',0)}")
         else:
             summary = QLabel(f"평점 {data.get('rating',0)}   "
                              f"골 {data.get('goals',0)}   어시 {data.get('assists',0)}")
-        summary.setStyleSheet("color:#ffcc00;font-size:14px;font-weight:bold;")
-        summary.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        root.addWidget(summary)
+        if played:
+            summary.setStyleSheet("color:#ffcc00;font-size:14px;font-weight:bold;")
+            summary.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            root.addWidget(summary)
 
         # ── 타임라인 (스크롤) ─────────────────────────────────
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
@@ -1052,6 +1109,11 @@ class MatchDetailDialog(QDialog):
         iv.addStretch()
         scroll.setWidget(inner)
         root.addWidget(scroll, 1)
+
+        if not played:
+            # 결장 — 내 세부 지표·총평은 없다(팀 통계·라인업은 위 버튼으로 본다).
+            self._add_close(root)
+            return
 
         # ── 세부 지표 ─────────────────────────────────────────
         stat_box = QWidget()

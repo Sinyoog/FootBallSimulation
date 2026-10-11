@@ -243,7 +243,7 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
         print(f"[GHOST-DEBUG] processEvents() 완료, 소요 {(_time_dbg.perf_counter()-_t0)*1000:.1f}ms")
         _t1 = _time_dbg.perf_counter()
-        self.refresh_light()
+        self.refresh_light(_sched=False)
         print(f"[GHOST-DEBUG] refresh_light() 완료, 소요 {(_time_dbg.perf_counter()-_t1)*1000:.1f}ms")
         # 진행(NEXT DAY) 직후 열려 있는 보조 창들을 함께 갱신한다.
         #   - 순위표 창은 이미 refresh_light()에서 매일 갱신되므로 여기선
@@ -255,7 +255,7 @@ class MainWindow(QMainWindow):
         print(f"[GHOST-DEBUG] _refresh_aux_window(일정창) 완료, 소요 {(_time_dbg.perf_counter()-_t2)*1000:.1f}ms")
         print(f"[GHOST-DEBUG] refresh_all() 전체 종료, 총 소요 {(_time_dbg.perf_counter()-_t0)*1000:.1f}ms")
 
-    def refresh_light(self):
+    def refresh_light(self, _sched=True):
         """[2026-08 신설, 신민용 리포트: "하루씩 진행이 1주씩보다 더 렉걸린다"]
         [2026-08 수정, 신민용 리포트: "순위표가 하루씩 모드에서 실시간
         반영이 안 됨"] 하루씩(스텝) 모드에서 묶음(7일) 도중 매일 부르기
@@ -287,8 +287,18 @@ class MainWindow(QMainWindow):
         # 닫혀있으면 알아서 스킵하므로(비용 0), 열려있을 때만 실제로
         # get_league_standings()가 매일 다시 도는 구조다(1.5~4.5ms 수준).
         self._refresh_aux_window("_standings_win")
+        # [2026-10 버그수정, 신민용 리포트: "1일 진행으로 했을 때 16강 진행하고 8강이 일정에
+        # 뜨는데, 경기 일정에 16강 결과가 안 보이고 나중에 다 끝나야 적용돼 — 승강 플레이오프 등
+        # 다른 토너먼트도 그렇고, 나갔다 들어오면 적용된다"] 원인: 하루씩 모드에선 일정 창을
+        # 묶음 끝(refresh_all)에만 갱신했고, 창의 5초 폴링 타이머는 매일 진행 때마다 멈췄다가
+        # 다시 시작(start=카운트 처음부터)되므로 5초 안에 다음 날을 누르면 한 번도 돌지 않았다.
+        # 일정 창은 2026-09 2단 구조 개편 이후 "지금 고른 대분류 하나"의 탭(2~4개)만 다시 그려
+        # 매일 갱신해도 가볍다 — 날짜가 실제로 바뀌었을 때만(_poll_refresh의 시그니처 비교)
+        # 다시 그린다. refresh_all()은 바로 뒤에 일정 창을 무조건 refresh()하므로 여기선 건너뛴다.
+        if _sched:
+            self._refresh_aux_window("_schedule_win", poll=True)
 
-    def _refresh_aux_window(self, attr):
+    def _refresh_aux_window(self, attr, poll=False):
         """center_panel 에 보관된 보조 창(attr) 이 열려 있으면 refresh() 한다.
         닫힘/파괴된 창이면 핸들을 비워 둔다."""
         win = getattr(self.center_panel, attr, None)
@@ -296,7 +306,10 @@ class MainWindow(QMainWindow):
             return
         try:
             if win.isVisible():
-                win.refresh()
+                if poll and hasattr(win, "_poll_refresh"):
+                    win._poll_refresh()
+                else:
+                    win.refresh()
         except RuntimeError:
             # 닫기/파괴된 QDialog 접근 → 핸들 정리
             setattr(self.center_panel, attr, None)

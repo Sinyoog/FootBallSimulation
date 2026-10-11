@@ -115,6 +115,113 @@ def _pref_for(pref, slots, pos):
     return order
 
 
+# ── [2026-10 신설 — 주포·부포, sub_positions.py 참고] ─────────────────────
+# 부포(선수 dict의 "sub_pos", prep 묶음의 세 번째 값)가 있는 선수만 아래 경로를 탄다. 부포가 없으면
+# 모든 함수가 예전 값을 그대로 돌려준다 — 스위치 OFF·부포 0명이면 기존 경로 100%.
+_PREF_SUB_CACHE: dict = {}
+
+
+def _pref_sub(slots_key, slots, pos, sub):
+    """부포 보유자의 슬롯 선호 순서 — 부포 슬롯을 순위 0으로 넣은 (순위, 인덱스) 오름차순.
+    주포 슬롯도 순위 0이라 동점이면 슬롯 순서를 따른다(주포 우선 없음)."""
+    key = (slots_key, pos, sub)
+    order = _PREF_SUB_CACHE.get(key)
+    if order is None:
+        compat = POSITION_COMPAT.get(pos, [pos])
+        tmp = []
+        for i, sp in enumerate(slots):
+            if sp == sub:
+                tmp.append((0, i))
+            elif sp in compat:
+                tmp.append((compat.index(sp), i))
+        tmp.sort()
+        order = [i for _r, i in tmp]
+        _PREF_SUB_CACHE[key] = order
+    return order
+
+
+def slot_rank(pl, slot_pos):
+    """선수 dict 기준 미스매치 순위 — 부포 슬롯이면 0, 아니면 기존 _mismatch_rank(주포, 슬롯)."""
+    sub = pl.get("sub_pos")
+    if sub and sub == slot_pos:
+        return 0
+    return _mismatch_rank(pl.get("position") or "CM", slot_pos)
+
+
+def _value_swap_pass(slot_filled, slots_only, value_fn, pos_of, has_sub, cap_fn=None):
+    """[2026-10 신설 — 주포·부포 ③ 맞교환 보정] 순차 배정이 끝난 뒤, 배치된 두 선수의 슬롯을 맞바꿔
+    유효값 합이 **엄격히** 커질 때만 바꾼다(주포·부포 여부로는 가산하지 않는다).
+      · 대상 쌍: 두 선수 중 적어도 한 명이 부포 보유자(has_sub)인 쌍만 — 이 보정은 "부포 선수가
+        순차 배정 때문에 전문 선수 자리를 먼저 차지해 생긴 손해"를 바로잡는 용도다. 부포가 없는
+        선수끼리의 배치는 예전 순차 배정 그대로 둔다(그 경로는 이 기능 범위 밖).
+      · 한 라운드 안에서 여러 교환을 허용한다 — 슬롯 쌍 (i, j), i < j를 인덱스 순으로 훑으며 교환할
+        때마다 합이 즉시 엄격히 오르므로, 같은 쌍을 되돌리거나 순환하는 일은 생길 수 없다(되돌리면
+        합이 줄어든다).
+      · GK 슬롯·GK 선수는 교환 대상이 아니다(GK↔필드 경계 불변).
+      · 교환이 없는 라운드가 나오거나 3라운드에 닿으면 끝난다(주발 맞교환과 같은 상한).
+    value_fn(선수, 슬롯) → 유효값, pos_of(선수) → 등록 포지션, has_sub(선수) → 부포 보유 여부.
+    cap_fn(선수) → 그 선수가 어떤 슬롯에서든 낼 수 있는 유효값 상한(선택). 주면 두 선수가 모두 이미
+    상한에 있는 쌍은 건너뛴다 — 교환해도 합이 오를 수 없으므로 결과는 같고 계산만 준다(포메이션
+    적합도 경로: 유효값 = OVR × (1 − 미스매치) ≤ OVR).
+    교환 횟수를 돌려준다(테스트용)."""
+    n = len(slots_only)
+    idx = [i for i in range(n)
+           if slot_filled[i] is not None
+           and _POS_CATEGORY_GET(slots_only[i], "ATK") != "GK"
+           and _POS_CATEGORY_GET(pos_of(slot_filled[i]), "ATK") != "GK"]
+    m = len(idx)
+    P = [slot_filled[i] for i in idx]          # k번째 대상 슬롯의 선수(교환 때 같이 바뀐다)
+    S = [slots_only[i] for i in idx]           # k번째 대상 슬롯 이름(고정)
+    H = [bool(has_sub(p)) for p in P]          # 그 선수의 부포 보유 여부(선수와 같이 움직인다)
+    if not any(H):
+        return 0
+    C = [cap_fn(p) for p in P] if cap_fn is not None else None
+    _vc = {}
+
+    def _v(p, s):
+        k = (id(p), s)
+        r = _vc.get(k)
+        if r is None:
+            r = value_fn(p, s)
+            _vc[k] = r
+        return r
+
+    V = [_v(P[k], S[k]) for k in range(m)]    # 현재 자리의 유효값(교환 때 갱신)
+    # 상한에 닿은 선수(C가 있을 때만) — 두 선수가 모두 상한이면 교환해도 합이 오를 수 없다.
+    T = [V[k] >= C[k] - 1e-12 for k in range(m)] if C is not None else [False] * m
+    swaps = 0
+    for _round in range(3):
+        if all(T):
+            break                               # 전원이 상한 — 어떤 교환도 합을 못 올린다
+        moved = False
+        for a in range(m):
+            for b in range(a + 1, m):
+                if not (H[a] or H[b]) or (T[a] and T[b]) or S[a] == S[b]:
+                    continue
+                pa, pb = P[a], P[b]
+                na, nb = _v(pa, S[b]), _v(pb, S[a])
+                if na + nb > V[a] + V[b] + 1e-9:
+                    P[a], P[b] = pb, pa
+                    H[a], H[b] = H[b], H[a]
+                    V[a], V[b] = nb, na
+                    if C is not None:
+                        C[a], C[b] = C[b], C[a]
+                        T[a], T[b] = V[a] >= C[a] - 1e-12, V[b] >= C[b] - 1e-12
+                    slot_filled[idx[a]], slot_filled[idx[b]] = pb, pa
+                    swaps += 1
+                    moved = True
+        if not moved:
+            break
+    return swaps
+
+
+def _any_sub_dict(slot_filled):
+    for p in slot_filled:
+        if p is not None and p.get("sub_pos"):
+            return True
+    return False
+
+
 # (선수 주포지션, 슬롯 포지션) → POSITION_MISMATCH_PENALTY 값.
 # 조합 수가 유한(포지션 종류 × 슬롯 포지션 종류)이라 한 번 구하면 끝난다.
 _MISMATCH_PENALTY_CACHE: dict = {}
@@ -196,10 +303,14 @@ def _greedy_fill_slots(candidates, slots_only):
     pref, catslots = _slot_tables(tuple(slots_only), slots_only)
 
     # 1) 정확한 포지션 호환(POSITION_COMPAT) 매치
+    # [2026-10 주포·부포] 부포 보유자만 부포 슬롯을 순위 0으로 넣은 개인 선호 순서를 쓴다.
+    _slots_key = tuple(slots_only)
     still_left = []
     for pl in remaining:
         got = -1
-        for i in _pref_for(pref, slots_only, pl.get("position", "CM")):
+        _sub = pl.get("sub_pos")
+        for i in (_pref_sub(_slots_key, slots_only, pl.get("position", "CM"), _sub) if _sub
+                  else _pref_for(pref, slots_only, pl.get("position", "CM"))):
             if slot_filled[i] is None:
                 got = i
                 break
@@ -263,6 +374,15 @@ def _greedy_fill_slots(candidates, slots_only):
         # 없으면(로스터에 GK가 아예 없는 극단적 예외) 그 슬롯은 빈 채로
         # 남긴다. 어느 쪽도 GK 경계를 넘어서까지 "일단 채우고 본다"는
         # 대상이 아니다.
+
+    # [2026-10 주포·부포 ③ 맞교환 보정] 부포 보유자가 배치돼 있을 때만 — 순차 배정 때문에 부포 선수가
+    # 전문 선수 자리를 먼저 차지해 생긴 손해를, 유효값 합이 엄격히 오르는 맞교환으로만 바로잡는다.
+    if _any_sub_dict(slot_filled):
+        _value_swap_pass(slot_filled, slots_only, _slot_value,
+                         lambda p: p.get("position") or "CM", lambda p: bool(p.get("sub_pos")))
+        for _i, _p in enumerate(slot_filled):
+            if _p is not None:
+                _p["_slot_idx"] = _i
 
     # [2026-09 신설] 주발 보정 — 배정이 끝난 뒤 좌우 슬롯의 반대발만
     # "포지션 rank 합을 나쁘게 만들지 않는" 교환으로 바로잡는다.
@@ -661,10 +781,12 @@ def _calc_foot_fit(slot_pos, foot, sub_role):
 
 
 def _slot_value(pl, slot_pos):
-    """그 선수를 그 슬롯에 뒀을 때의 유효 적합도."""
+    """그 선수를 그 슬롯에 뒀을 때의 유효 적합도.
+    [2026-10 주포·부포] 부포 슬롯이면 미스매치 0(주발 배율은 그대로)."""
     pos = pl.get("position") or "CM"
+    _sub = pl.get("sub_pos")
     return ((pl.get("ovr") or 0)
-            * (1.0 - _mismatch_penalty(pos, slot_pos))
+            * (1.0 - (0.0 if (_sub and _sub == slot_pos) else _mismatch_penalty(pos, slot_pos)))
             * foot_fit_mult(slot_pos, pl.get("foot") or "",
                             pl.get("sub_role") or ""))
 
@@ -695,14 +817,13 @@ def _foot_bench_swap(slot_filled, slots_only, candidates):
             continue
         if _POS_CATEGORY_GET(si, "ATK") == "GK":
             continue
-        pa = a.get("position") or "CM"
-        base_rank = _mismatch_rank(pa, si)
+        base_rank = slot_rank(a, si)          # [2026-10 주포·부포] 부포 슬롯이면 0
         best, best_v = None, _slot_value(a, si)
         for q in pool:
             pq = q.get("position") or "CM"
             if _POS_CATEGORY_GET(pq, "ATK") == "GK":
                 continue
-            if _mismatch_rank(pq, si) > base_rank:
+            if slot_rank(q, si) > base_rank:
                 continue        # 포지션 적합도를 깎으면서까지 발을 맞추지 않는다
             v = _slot_value(q, si)
             if v > best_v + 1e-9:
@@ -741,7 +862,7 @@ def _foot_swap_pass(slot_filled, slots_only, candidates=None):
              if slots_only[i] in FOOT_SIDED_SLOTS or slots_only[i] in FOOT_INVERTED_SLOTS]
     if not sided:
         return
-    _rank = _mismatch_rank
+    _rank = slot_rank                   # [2026-10 주포·부포] 선수 dict 기준(부포 슬롯 0) — 부포 없으면 예전과 같음
     for _round in range(3):             # 연쇄 개선용 소수 반복(보통 1회로 끝)
         moved = False
         for i in sided:
@@ -763,11 +884,9 @@ def _foot_swap_pass(slot_filled, slots_only, candidates=None):
                         or _POS_CATEGORY_GET(a.get("position") or "CM", "ATK") == "GK"
                         or _POS_CATEGORY_GET(b.get("position") or "CM", "ATK") == "GK"):
                     continue
-                pa = a.get("position") or "CM"
-                pb = b.get("position") or "CM"
                 # 포지션 적합도(rank) 합이 나빠지는 교환은 금지 —
                 # 주발이 포지션 판정 구조를 뒤집지 않는다는 원칙.
-                if (_rank(pa, sj) + _rank(pb, si)) > (_rank(pa, si) + _rank(pb, sj)):
+                if (_rank(a, sj) + _rank(b, si)) > (_rank(a, si) + _rank(b, sj)):
                     continue
                 if (_slot_value(a, sj) + _slot_value(b, si)
                         > _slot_value(a, si) + _slot_value(b, sj) + 1e-9):
@@ -826,7 +945,8 @@ def prep_roster(roster):
     그대로 넘긴다. 정렬 키(-ovr)와 안정 정렬 성질이 _greedy_fill_slots의
     것과 같으므로 배정 순서도 동일하다."""
     ordered = sorted(roster, key=lambda x: -(x.get("ovr", 0) or 0))
-    return [(p.get("position", "CM"), (p.get("ovr", 0) or 0)) for p in ordered]
+    # [2026-10 주포·부포] 세 번째 값 = 부포(없으면 None). 앞 두 값과 정렬은 예전 그대로다.
+    return [(p.get("position", "CM"), (p.get("ovr", 0) or 0), p.get("sub_pos")) for p in ordered]
 
 
 def formation_fit_penalty_prepped(prepped, slots_key, slots):
@@ -840,10 +960,16 @@ def formation_fit_penalty_prepped(prepped, slots_key, slots):
     filled = [None] * n
 
     # 1) 정확한 포지션 호환 매치
+    # [2026-10 주포·부포] 부포 보유자(묶음 세 번째 값)만 개인 선호 순서. 예전 2개짜리 묶음도 그대로 받는다.
+    _has_sub = False
     left = []
     for pl in prepped:
         got = -1
-        for i in _pref_for(pref, slots, pl[0]):
+        _sub = pl[2] if len(pl) > 2 else None
+        if _sub:
+            _has_sub = True
+        for i in (_pref_sub(slots_key, slots, pl[0], _sub) if _sub
+                  else _pref_for(pref, slots, pl[0])):
             if filled[i] is None:
                 got = i
                 break
@@ -878,11 +1004,21 @@ def formation_fit_penalty_prepped(prepped, slots_key, slots):
     total_ovr = 0.0
     weighted_penalty = 0.0
     _mp = _mismatch_penalty
+    if _has_sub:
+        # [2026-10 주포·부포] 부포 슬롯은 미스매치 0. 맞교환 보정은 이 경로의 목적함수
+        # (OVR × (1 − 미스매치), 주발 없음)로 따로 돈다 — 실제 경기 배치(_slot_value)와 독립.
+        def _pen(pl, slot_pos):
+            _s = pl[2] if len(pl) > 2 else None
+            return 0.0 if (_s and _s == slot_pos) else _mp(pl[0], slot_pos)
+        _value_swap_pass(filled, slots, lambda pl, s: pl[1] * (1.0 - _pen(pl, s)), lambda pl: pl[0],
+                         lambda pl: len(pl) > 2 and bool(pl[2]), cap_fn=lambda pl: pl[1])
+    else:
+        _pen = None
     for slot_pos, pl in zip(slots, filled):
         if pl is None:
             continue
         ovr = pl[1]
-        weighted_penalty += ovr * _mp(pl[0], slot_pos)
+        weighted_penalty += ovr * (_pen(pl, slot_pos) if _pen is not None else _mp(pl[0], slot_pos))
         total_ovr += ovr
     if total_ovr <= 0:
         return 0.0
@@ -965,8 +1101,15 @@ def manager_style_fit(formation_name, style_attack=None, style_buildup=None,
     return w["attack"] * fit_atk + w["buildup"] * fit_bld + w["press"] * fit_prs
 
 
+def formation_back_family(name):
+    """[2026-10 확정] 포메이션 계열 — CB 슬롯 2개면 "back4", 3개면 "back3"(3백·5백)."""
+    from constants import FORMATION_SLOTS
+    slots = FORMATION_SLOTS.get(name) or []
+    return "back3" if slots.count("CB") >= 3 else "back4"
+
+
 def choose_formation_prepped(prepped, current_formation, tendency, rng=None,
-                             style=None):
+                             style=None, family=None, family_bonus=0.0):
     """prep_roster() 결과를 받는 choose_formation. 점수 계산·정렬·후보
     선정·랜덤 소비 순서가 choose_formation과 완전히 동일하다 — 포메이션
     하나당 _rng.random()을 정확히 한 번씩, FORMATION_SLOTS 순서대로
@@ -981,6 +1124,9 @@ def choose_formation_prepped(prepped, current_formation, tendency, rng=None,
 
     style: {"style_attack":..., "style_buildup":..., "style_press":...}
            (database.get_team_manager()가 돌려주는 행을 그대로 넣어도 된다)
+    family/family_bonus: [2026-10 확정] 감독 포메이션 계열("back4"/"back3")과
+           그 계열 포메이션에 더할 점수. None이면 가산 없음(대표팀).
+           점수 값만 바뀌고 난수 소비 패턴은 그대로다.
     """
     import random as _random
     from constants import (FORMATION_SLOTS, FORMATION_SCORE_WEIGHTS,
@@ -1000,6 +1146,8 @@ def choose_formation_prepped(prepped, current_formation, tendency, rng=None,
                                          style_press=_sp, tendency=tendency)
         score = (_w_squad * squad_fit + _w_tend * tendency_fit
                  + _w_rand * _rand())
+        if family is not None and formation_back_family(name) == family:
+            score += family_bonus
         scored.append((score, name, penalty))
     scored.sort(key=lambda t: -t[0])
     top = scored[:FORMATION_CANDIDATE_TOP_N] or scored

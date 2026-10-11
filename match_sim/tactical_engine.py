@@ -293,6 +293,14 @@ def _style_edges(my_style, opp_style):
             + MANAGER_PRESS_OPP_POSS_EDGE.get(_op, 0.0))
     qual = (MANAGER_BUILDUP_CHANCE_EDGE.get(_b, 0.0)
             + MANAGER_PRESS_OPP_CHANCE_EDGE.get(_op, 0.0))
+    # [2026-10 — 감독 모드 대비, 자리만] 공격 성향 축. 내 공격 성향 → 내 기회 품질,
+    # 상대 공격 성향 → 내 기회 품질(상대가 라인을 올리면 뒷공간). 표가 전부 0이라
+    # 지금은 결과가 그대로다 — 수치는 전술/관리 성향 효과 실험에서 정한다.
+    from constants import MANAGER_ATTACK_CHANCE_EDGE, MANAGER_ATTACK_OPP_CHANCE_EDGE
+    _a = (my_style or {}).get("style_attack") or "BALANCED"
+    _oa = (opp_style or {}).get("style_attack") or "BALANCED"
+    qual += (MANAGER_ATTACK_CHANCE_EDGE.get(_a, 0.0)
+             + MANAGER_ATTACK_OPP_CHANCE_EDGE.get(_oa, 0.0))
     return poss, qual
 
 
@@ -1155,7 +1163,8 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
         from constants import POSITION_COMPAT
         compat = POSITION_COMPAT.get(p.get("position"), [p.get("position")])
         try:
-            idx = compat.index(slot)
+            # [2026-10 주포·부포] 부포 슬롯은 적합도 감점 0(로스터에 sub_pos가 붙은 클럽 선수만)
+            idx = 0 if (p.get("sub_pos") and p.get("sub_pos") == slot) else compat.index(slot)
         except ValueError:
             idx = len(_SLOT_PEN) - 1
         return (p.get("ovr") or 50) - _SLOT_PEN[min(idx, len(_SLOT_PEN) - 1)]
@@ -1594,22 +1603,21 @@ def simulate_my_match(home_team_id, away_team_id, home_formation, away_formation
     [2026-09] 벤치(교체 후보)도 여기서 같이 뽑아 넘긴다 — 리그 경기는
     extra_time=False 그대로, 단판 KO를 돌리는 대회 엔진은 extra_time=True
     (2차전 합산이면 agg_home/agg_away까지) 넘기면 연장까지 처리된다."""
-    from match_sim.match_flow import _select_lineup, select_bench
-
-    home_lineup = _select_lineup(home_team_id, home_formation)
-    away_lineup = _select_lineup(away_team_id, away_formation)
+    # [2026-10 — 감독 모드 대비] 포메이션·선발·벤치·감독 성향을 team_plan 한 곳에서
+    # 받는다. AI 팀은 예전에 여기서 직접 하던 호출(_select_lineup → select_bench,
+    # get_team_manager)을 같은 인자로 그대로 한다 — 난수를 안 쓰는 함수들이라 결과
+    # 동일. 사용자 감독 팀이면 사용자가 저장한 포메이션(teams.formation — 호출부가
+    # 넘김)·선발 11명·벤치·전술이 들어간다.
+    from team_plan import build_team_plan
+    hp = build_team_plan(home_team_id, home_formation)
+    ap = build_team_plan(away_team_id, away_formation)
+    home_lineup, away_lineup = hp["lineup"], ap["lineup"]
     # [2026-09 — 감독 시스템 ②단계] 두 팀의 현재 감독 성향을 실어 보낸다.
     # 감독이 없거나 조회에 실패하면 None → 전술엔진이 예전과 똑같이 돈다.
     # 이 편의 함수를 쓰는 경로(리그·컵·챔스·클럽월드컵·국내슈퍼컵·승강PO)
     # 만 감독 보정을 받는다 — 국가대표 경기는 simulate_tactical_match를
     # 직접 호출하므로 자연히 제외된다(대표팀엔 클럽 감독이 없다).
-    _hs = _as = None
-    try:
-        from database import get_team_manager
-        _hs = get_team_manager(home_team_id)
-        _as = get_team_manager(away_team_id)
-    except Exception:
-        pass
+    _hs, _as = hp["style"], ap["style"]
     return simulate_tactical_match(home_lineup, away_lineup, home_boost=home_boost,
                                     away_boost=away_boost,
                                     home_boost_position=home_boost_position,
@@ -1617,8 +1625,8 @@ def simulate_my_match(home_team_id, away_team_id, home_formation, away_formation
                                     home_adv=home_adv, seed=seed,
                                     home_formation=home_formation,
                                     away_formation=away_formation,
-                                    home_bench=select_bench(home_team_id, home_lineup),
-                                    away_bench=select_bench(away_team_id, away_lineup),
+                                    home_bench=hp["bench"],
+                                    away_bench=ap["bench"],
                                     extra_time=extra_time,
                                     agg_home=agg_home, agg_away=agg_away,
                                     home_style=_hs, away_style=_as)

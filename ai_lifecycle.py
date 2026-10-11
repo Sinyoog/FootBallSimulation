@@ -40,6 +40,9 @@ from constants import POSITION_SELL_STRENGTH, POSITION_DEMAND_STRENGTH
 from formation_logic import (_SLOT_TARGET_MAP,
                              position_sell_weight as _fl_position_sell_weight,
                              position_demand_weight as _fl_position_demand_weight)
+# [2026-10 주포·부포] 부포 공용 모듈(sub_positions.py) — 스위치 OFF·부포 0명이면 전부 무동작.
+from sub_positions import (attach as _subp_attach, my_sub as _subp_my_sub,
+                           active as _subp_active, acquire as _subp_acquire)
 
 try:
     import numpy as np
@@ -985,6 +988,14 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
     # 시점이므로 은퇴 처리 직후, 아래 shared_ai_rows 재조회 "전"에 복귀를
     # 끝낸다 — 그래야 이적시장이 복귀한 선수를 원 소속팀 선수로 본다.
     loan_returned = _process_loan_returns(c, year)
+    # [2026-10 주포·부포] 부포 획득(2시즌 연속 같은 비주포 슬롯 선발) — 이적시장·보충 목표표·다음 시즌
+    # 역할 계산이 새 부포를 보도록 여기서. 스위치 OFF면 아무것도 읽거나 쓰지 않는다. 난수 미사용.
+    try:
+        _sub_new = _subp_acquire(c, year)
+        if _sub_new:
+            _perf_log(f"[SUB-POS] {year}년 부포 신규 획득 {_sub_new}명")
+    except Exception as _e_sub:
+        print(f"[SUB-POS] 부포 획득 처리 실패(계속 진행): {_e_sub}")
     _ta2 = _time_perf.perf_counter()
     # [2026-08 버그수정] _retire_and_replace가 이제 은퇴자 행을 UPDATE가
     # 아니라 DELETE+INSERT로 처리하므로(위 함수 docstring 참고), 여기
@@ -1474,6 +1485,24 @@ def _indexes_off_for_mass_update(c):
                 pass   # 인덱스는 성능용이라 재생성에 실패해도 게임은 정상 동작
 
 
+def _growth_gain_guard_np(rows_vals, wv, wsum, chosen, cur, cap, gain):
+    """[2026-10 버그수정, 신민용 확정: "브레이크아웃 선수를 따로 보호하는 예외가 아니라, 성장
+    로직 자체가 잠재력보다 높은 현재 능력치를 부당하게 깎지 않도록"] 성장기 한 번의 터치에서
+    실제로 더할 양. 원칙: 성장 상한 cap(= min(팀 상한, 잠재력))은 "더 오르지 못하게"만 막는다.
+      1) 스탯 단위 — 이미 cap 이상인 스탯은 0(예전엔 cap까지 깎였다), 아래면 cap까지만.
+      2) OVR 단위 — 이번 터치 후 OVR(반올림)이 cap을 넘지 않게 자른다. 상한 위 스탯을 남겨
+         두면 나머지 스탯이 cap까지 자라는 동안 OVR이 잠재력을 넘을 수 있어서다(실측 94/94 →
+         95). 이미 OVR이 cap 위인 선수(브레이크아웃, 약팀 이적/임대 등)는 0 — 유지.
+    모든 스탯이 cap 이하인 보통 선수는 1)·2) 어느 쪽에도 안 걸려 예전 결과와 완전히 같다
+    (난수 사용 순서도 같다)."""
+    gain = np.minimum(gain, np.maximum(0, cap - cur))
+    total = rows_vals @ wv / wsum
+    w = wv[chosen]
+    room = (cap + 0.49 - total) * wsum
+    allowed = np.where(w > 0, np.floor(room / np.where(w > 0, w, 1.0)), gain)
+    return np.clip(np.minimum(gain, allowed), 0, None).astype(np.int64)
+
+
 def _age_and_progress_np(c, rows, team_cap, orphan_fallback):
     """벡터화 버전 — 선수 5.9만 명(+향후 확장분)을 파이썬 for문 없이 numpy로 처리.
     로직(확률/증감폭/키스탯 가중치)은 순수 파이썬 버전과 동일하게 유지했다."""
@@ -1593,6 +1622,8 @@ def _age_and_progress_np(c, rows, team_cap, orphan_fallback):
             continue
         key_idx = _KEY_IDX_BY_POS_NP.get(pos, _DEFAULT_KEY_IDX_NP)
         nonkey_idx = _NONKEY_IDX_BY_POS_NP.get(pos, _DEFAULT_NONKEY_IDX_NP)
+        wv_g = _WEIGHT_VEC_NP.get(pos, _WEIGHT_VEC_NP["CM"])
+        wsum_g = _WEIGHT_SUMS.get(pos, _WEIGHT_SUMS["CM"])
         n_up = rng.integers(_AI_GROWTH_TOUCHES[0], _AI_GROWTH_TOUCHES[1] + 1, size=Ng)
         for rnd in range(_AI_GROWTH_TOUCHES[1]):
             active = n_up > rnd
@@ -1604,7 +1635,11 @@ def _age_and_progress_np(c, rows, team_cap, orphan_fallback):
             cur = vals_arr[act_idx, chosen]
             cap = cap_by_row[act_idx]
             gain = np.maximum(1, np.round((cap - cur) * _AI_GROWTH_CATCHUP_FRAC)).astype(np.int64)
-            vals_arr[act_idx, chosen] = np.minimum(cap, cur + gain)
+            # [2026-10 버그수정, 신민용 확정] 예전: min(cap, cur+gain) — 상한 위 스탯은
+            # gain=1이어도 cap으로 깎였다(실측 2000년 세이브: 성장 단계 40%가 매 시즌 OVR
+            # 하락, 브레이크아웃 94 → 다음 시즌 92~93). _growth_gain_guard_np 참고.
+            gain = _growth_gain_guard_np(vals_arr[act_idx], wv_g, wsum_g, chosen, cur, cap, gain)
+            vals_arr[act_idx, chosen] = cur + gain
         n_up2 = rng.integers(_AI_GROWTH_TOUCHES_NONKEY[0], _AI_GROWTH_TOUCHES_NONKEY[1] + 1, size=Ng)
         for rnd in range(_AI_GROWTH_TOUCHES_NONKEY[1]):
             active = n_up2 > rnd
@@ -1616,7 +1651,8 @@ def _age_and_progress_np(c, rows, team_cap, orphan_fallback):
             cur = vals_arr[act_idx, chosen]
             cap = cap_by_row[act_idx]
             gain = np.maximum(1, np.round((cap - cur) * _AI_GROWTH_CATCHUP_FRAC)).astype(np.int64)
-            vals_arr[act_idx, chosen] = np.minimum(cap, cur + gain)
+            gain = _growth_gain_guard_np(vals_arr[act_idx], wv_g, wsum_g, chosen, cur, cap, gain)  # 위와 동일
+            vals_arr[act_idx, chosen] = cur + gain
 
     # ── 피크기: 30% 확률로 전체스탯 중 1개 ±1 (승격/강등과 무관한 절대
     #    상한) ──
@@ -1651,7 +1687,22 @@ def _age_and_progress_np(c, rows, team_cap, orphan_fallback):
             # 원래 의도(피크기가 팀 사정과 무관해야 한다)를 전혀 해치지
             # 않는다.
             _peak_cap = np.minimum(99, np.where(potential_arr > 0, potential_arr, 99))[act_idx]
-            vals_arr[act_idx, chosen] = np.clip(cur + delta, 15, _peak_cap)
+            # [2026-10 버그수정, 신민용 확정] 성장기와 같은 원칙 — 예전 clip(cur±1, 15, 잠재력)은
+            # 잠재력 위 스탯을 잠재력까지 끌어내렸다. 이제 −1은 그냥 −1, +1은 그 스탯이
+            # 잠재력 미만이고 +1 후에도 OVR(반올림)이 잠재력을 넘지 않을 때만 허용한다.
+            # 모든 스탯이 잠재력 이하인 보통 선수는 예전과 결과가 완전히 같다.
+            _tot = np.empty(m)
+            _wch = np.empty(m)
+            _pos_act = pos_arr[act_idx]
+            for _p in np.unique(_pos_act):
+                _sel = _pos_act == _p
+                _wv = _WEIGHT_VEC_NP.get(_p, _WEIGHT_VEC_NP["CM"])
+                _ws = _WEIGHT_SUMS.get(_p, _WEIGHT_SUMS["CM"])
+                _tot[_sel] = vals_arr[act_idx[_sel]] @ _wv / _ws
+                _wch[_sel] = _wv[chosen[_sel]] / _ws
+            _up_ok = (cur < _peak_cap) & (_tot + _wch <= _peak_cap + 0.49)
+            vals_arr[act_idx, chosen] = np.where(delta > 0, np.where(_up_ok, cur + 1, cur),
+                                                 np.maximum(15, cur - 1))
 
     # ── 노화기: 목표OVR까지 반복 하락(전성기 대비 나이별 목표% + 개인
     #    자기관리 등급 보정) ──
@@ -1762,6 +1813,18 @@ def _age_and_progress_np(c, rows, team_cap, orphan_fallback):
 _NONKEY_STATS_BY_POS: dict = {}
 
 
+def _grow_stat_guarded(pos, vals, i, gain, cap):
+    """_growth_gain_guard_np의 파이썬 폴백 — 스탯 i에 gain을 더하되 cap 이상 스탯은 그대로,
+    더한 뒤 OVR이 cap을 넘으면 넘지 않을 때까지 되돌린다(이미 cap 위면 사실상 0)."""
+    from database import calc_ovr_from_list
+    if vals[i] >= cap:
+        return
+    old = vals[i]
+    vals[i] = min(cap, old + gain)
+    while vals[i] > old and calc_ovr_from_list(pos, vals) > cap:
+        vals[i] -= 1
+
+
 def _age_and_progress_py(c, rows, team_cap, orphan_fallback):
     """순수 파이썬 폴백 버전 (numpy 미설치 환경용). 로직은 numpy 버전과 동일."""
     from database import STAT_IDX, calc_ovr_from_list
@@ -1821,14 +1884,14 @@ def _age_and_progress_py(c, rows, team_cap, orphan_fallback):
                 i = STAT_IDX[s]
                 gap = _cap - vals[i]
                 gain = max(1, round(gap * _AI_GROWTH_CATCHUP_FRAC))
-                vals[i] = min(_cap, vals[i] + gain)
+                _grow_stat_guarded(pos, vals, i, gain, _cap)   # [2026-10] _growth_gain_guard_np와 동일 원칙
             n_up2 = _randint(*_AI_GROWTH_TOUCHES_NONKEY)
             for _ in range(n_up2):
                 s = _choice(nonkeys)
                 i = STAT_IDX[s]
                 gap = _cap - vals[i]
                 gain = max(1, round(gap * _AI_GROWTH_CATCHUP_FRAC))
-                vals[i] = min(_cap, vals[i] + gain)
+                _grow_stat_guarded(pos, vals, i, gain, _cap)   # [2026-10] _growth_gain_guard_np와 동일 원칙
             grew += 1
         elif new_age <= _AI_PEAK_END:
             # [2026-08 수정, 신민용 요청: "승격/강등과 무관하게, 전성기
@@ -1842,7 +1905,14 @@ def _age_and_progress_py(c, rows, team_cap, orphan_fallback):
             if _random() < 0.3:
                 s = _choice(ALL_STATS)
                 i = STAT_IDX[s]
-                vals[i] = min(_peak_cap, max(15, vals[i] + _choice([-1, 1, 1])))
+                # [2026-10 버그수정] numpy 버전과 동일 — 잠재력 위 스탯을 끌어내리지 않고,
+                # +1은 그 스탯이 잠재력 미만이고 OVR이 잠재력을 넘지 않을 때만.
+                if _choice([-1, 1, 1]) < 0:
+                    vals[i] = max(15, vals[i] - 1)
+                elif vals[i] < _peak_cap:
+                    vals[i] += 1
+                    if calc_ovr_from_list(pos, vals) > _peak_cap:
+                        vals[i] -= 1
         else:
             # [2026-09 재설계] 위 _age_and_progress_np와 동일 — 목표OVR
             # 기반 노화(_AGING_DECLINE_SCHEDULE/_MGMT_TIERS 정의부 주석
@@ -4233,7 +4303,8 @@ def _retire_and_replace(c, year, ai_rows=None):
         # 명문팀 주전을 65~69로 깎아내리는 일이 안 생긴다.
         new_nat, cur_foreign = _pick_nationality(cname, continent, grade, r["position"],
                                                   False, cur_foreign, quota,
-                                                  slot_ovr=target, youth=(tier or 1) <= YOUTH_PATH_MAX_TIER)
+                                                  slot_ovr=target, youth=(tier or 1) <= YOUTH_PATH_MAX_TIER,
+                                                  youth_top=(tier or 1) == 1)   # [2026-10 A-2]
         foreign_count_by_team[tid] = cur_foreign
         name = ""      # [2026-09] AI 실명 폐지 — _build_name_cache 주석 참고
         # [2026-08 버그수정, 신민용 리포트: "AI5가 은퇴하면 AI5가 다시
@@ -7654,7 +7725,8 @@ def _archive_forced_out_players(c, ids, year):
 
 def _gen_topup_rows(c, tid, tier, cname, continent, tname, grade, need,
                      roster_by_team, name_cache, year, is_override,
-                     foreign_ct0=0, src_tag="squad_topup"):
+                     foreign_ct0=0, src_tag="squad_topup",
+                     formation=None, held_positions=None):
     """[2026-09 신설, _rebalance_squad_sizes에서 분리] 특정 팀에 유망주
     `need`명을 새로 만들어 ai_players INSERT용 row 튜플 리스트로 돌려준다
     — 로직은 원래 _rebalance_squad_sizes의 "n < _lo_size" 분기와 완전히
@@ -7665,7 +7737,6 @@ def _gen_topup_rows(c, tid, tier, cname, continent, tname, grade, need,
     선수 질/포지션 분포가 미묘하게 달라짐) 공용 함수로 뺐다."""
     from constants import get_ovr_range, CONTINENT_OVR_BONUS, COUNTRY_OVR_ADJ, SUB_ROLES
     from data.prestige_clubs import prestige_level as _rebal_prestige_level
-    from formation_logic import compute_slot_deficiencies
     from database import _pick_nationality, get_foreign_quota_range, compute_ai_growth_cap, roll_potential_ovr
 
     rows = []
@@ -7687,13 +7758,44 @@ def _gen_topup_rows(c, tid, tier, cname, continent, tname, grade, need,
     # 그 팀의 현재 외국인 수(진짜 국적 기준)를 foreign_ct0로 넘긴다.
     foreign_ct = max(0, int(foreign_ct0 or 0))
     _topup_growth_cap = compute_ai_growth_cap(grade, tier, cname, continent)
-    _pos_queue = []
-    for _def_pos, _def_n in compute_slot_deficiencies(
-            [p for _pid, p, _povr in roster_by_team.get(tid, [])]):
-        _pos_queue.extend([_def_pos] * _def_n)
-    _pos_queue = _pos_queue[:need]
+    # [2026-10 확정 — AI 스쿼드 포지션 목표] 신인 포지션은 그 팀 실제 포메이션의 목표 인원표
+    # (squad_targets.py)로 고른다: 부족량 85% / 목표표 비율 15% / 부족이 없으면 여유 자리 순서표.
+    # 부족량은 장기 보유 포지션(호출부가 넘김 — 임대 보낸 선수 포함, 임대 온 선수 제외) 기준.
+    # (예전의 _SLOT_TARGETS 결핍 큐 → roll_bench_position 방식은 MID 과잉의 주원인이라 걷어냈다.
+    #  roll_bench_position은 목표표가 아무것도 못 고를 때의 예비로만 남는다.)
+    import constants as _sq_c
+    from squad_targets import held_counter as _sq_held, choose_target_position as _sq_pick
+    if held_positions is None:     # 방어: 호출부가 안 넘기면 현재 명단을 장기 보유로 본다
+        held_positions = [p for _pid, p, _povr in roster_by_team.get(tid, [])]
+    _sq_goal = len(held_positions) + need      # 보충 후 장기 보유 인원(28명에서 자름)
+    if held_positions and isinstance(held_positions[0], tuple):
+        # [2026-10 주포·부포] (등록, 부포) 쌍 — 선수 1명이 주포 또는 부포 칸 하나만 차지하도록 배정
+        # (squad_targets.held_assign). 목표표는 choose_target_position이 쓰는 것과 같은 (포메이션, N).
+        from squad_targets import held_assign as _sq_assign, position_targets as _sq_tg
+        from squad_targets import _formation as _sq_fm
+        _sq_have = _sq_assign(held_positions, _sq_tg(_sq_fm(formation), _sq_goal))
+    else:
+        _sq_have = _sq_held(held_positions)
+    # GK 최소 보장: 현재 가용 GK(이 팀 명단에 지금 있는 GK — 임대 보낸 선수 제외,
+    # 임대 온 선수 포함)가 기준 미만이면 85/15 추첨 전에 GK로 확정(난수 미소비).
+    # GK는 다른 포지션·부포로 대신 설 수 없어서 확률 추첨에 맡기지 않는다.
+    _sq_gk_now = sum(1 for _pid, p, _povr in roster_by_team.get(tid, []) if p == "GK")
     for _i in range(need):
-        pos = _pos_queue[_i] if _i < len(_pos_queue) else roll_bench_position()
+        if _sq_gk_now < _sq_c.SQUAD_TARGET_MIN_AVAILABLE_GK:
+            _tp = "GK"                             # 확정 보충(난수 미소비)
+        else:
+            _tp = _sq_pick(formation, _sq_goal, _sq_have, random,
+                           _sq_c.SQUAD_TARGET_EXCEPTION_PROB)
+        if _tp == "GK":
+            _sq_gk_now += 1
+        if _tp is None:
+            pos = roll_bench_position()
+        elif _tp == "FW":
+            pos = "CF" if random.random() < _sq_c.SQUAD_TARGET_CF_SHARE else "ST"
+        else:
+            pos = _tp
+        if _tp is not None:
+            _sq_have[_tp] += 1
         target = random.randint(lo, max(lo, (lo + hi) // 2))
         age = random.randint(*_AI_NEWBIE_AGE)
         _scaled = _youth_target_scale(target, age)
@@ -7717,7 +7819,8 @@ def _gen_topup_rows(c, tid, tier, cname, continent, tname, grade, need,
         sub_role = random.choice(SUB_ROLES.get(pos, ["기본"]))
         # [2026-09] database._nat_ceiling_penalty 정의부 주석 참고.
         nat, foreign_ct = _pick_nationality(cname, continent, grade, pos,
-                                            False, foreign_ct, quota, slot_ovr=target, youth=(tier or 1) <= YOUTH_PATH_MAX_TIER)
+                                            False, foreign_ct, quota, slot_ovr=target, youth=(tier or 1) <= YOUTH_PATH_MAX_TIER,
+                                                  youth_top=(tier or 1) == 1)   # [2026-10 A-2]
         name = ""      # [2026-09] AI 실명 폐지
         _p_world, _p_elite = _prestige_star_prob(grade, _plvl)
         # [2026-09] 스쿼드 보충은 벤치 자리라 context='bench'.
@@ -7750,6 +7853,134 @@ def _gen_topup_rows(c, tid, tier, cname, continent, tname, grade, need,
             # 함수가 아니라 호출자가 안다(database.CREATION_SOURCES 참고).
             src_tag))
     return rows
+
+
+# [2026-10 확정] 포지션 맞바꾸기 GK 최소 보장 기록(이번 _rebalance_squad_sizes 호출 1회분).
+# done: GK 맞바꾸기 수행 팀 수 / no_donor: GK가 부족한데 내보낼 선수를 못 찾아 건너뛴 팀
+# (사례는 no_donor_cases에 (팀 id, 가용 GK, 로스터 인원, 포메이션)으로 남긴다).
+_SQ_GK_SWAP_LOG: dict = {"done": 0, "no_donor": 0, "no_donor_cases": [],
+                         "excess_done": 0, "excess_no_donor": 0, "excess_over_max": 0}
+
+
+def _sq_gk_swap_donor(roster, formation):
+    """GK가 부족한 팀에서 내보낼 필드 선수 1명 — 그 팀 포메이션 목표(현재 로스터 인원 기준)
+    대비 가장 많이 초과한 필드 포지션(FW = ST+CF)에서 OVR이 가장 낮은 선수.
+    마지막 1명 보호: 등록 포지션이 그 팀에 1명뿐인 선수는 후보에서 뺀다(기존 스왑과 같은 규칙).
+    초과(1명 이상)한 포지션이 없거나 보호 때문에 후보가 없으면 None. 반환: (pid, ovr, 등록 포지션)."""
+    from squad_targets import position_targets, REGISTERED_TO_TARGET, TARGET_POSITIONS
+    tgt = position_targets(formation, len(roster))
+    have: dict = {}
+    reg_cnt: dict = {}
+    for _pid, _pos, _ovr in roster:
+        reg_cnt[_pos] = reg_cnt.get(_pos, 0) + 1
+        _tp = REGISTERED_TO_TARGET.get(_pos)
+        if _tp:
+            have[_tp] = have.get(_tp, 0) + 1
+    best = None
+    for _tp in TARGET_POSITIONS:
+        if _tp == "GK":
+            continue
+        ex = have.get(_tp, 0) - tgt[_tp]
+        if ex < 1:
+            continue
+        cands = [(pid, ovr, pos) for pid, pos, ovr in roster
+                 if REGISTERED_TO_TARGET.get(pos) == _tp and reg_cnt.get(pos, 0) > 1]
+        if not cands:
+            continue
+        if best is None or ex > best[0]:
+            best = (ex, min(cands, key=lambda t: t[1]))
+    return best[1] if best else None
+
+
+def _sq_gen_swap_row(tid, _pos, grade, tier, cname, continent, tname, year,
+                     ovr_rng, _lo, _hi, _plvl, _foreign_ct, _quota):
+    """[2026-10 확정, 리팩터] _rebalance_squad_sizes 포지션 맞바꾸기의 신인 1명 생성 —
+    원래 그 함수 안에 인라인으로 있던 코드를 글자 그대로 옮겼다(난수 소비 순서·값 동일).
+    인원 초과 팀 조기은퇴 뒤 GK 맞바꾸기도 같은 생성을 써야 해서 공용으로 뺐다.
+    반환: (INSERT용 row 튜플, 갱신된 외국인 수)."""
+    from constants import SUB_ROLES
+    from database import _pick_nationality, compute_ai_growth_cap, roll_potential_ovr
+    _target = random.randint(_lo, max(_lo, (_lo + _hi) // 2))
+    _age = random.randint(*_AI_NEWBIE_AGE)
+    _scaled = _youth_target_scale(_target, _age)
+    if ovr_rng:
+        _prestige_base = {3: 1, 2: 2, 1: 3}.get(_plvl, 4)
+        _grade_adj = {"SS": 0, "S": 0, "A": 0, "B": 1, "C": 1,
+                     "D": 2, "E": 2, "F": 3}.get(grade, 2)
+        _young_floor_off = _prestige_base + _grade_adj
+        _scaled = max(_scaled, ovr_rng[0] - _young_floor_off)
+    _stats = _gen_stats(_pos, _scaled)
+    _ovr = calc_ovr(_pos, _stats)
+    # [2026-09 신설] 위 _retire_and_replace의 같은 보정과
+    # 동일 — 이 경로(스쿼드 인원 보충)도 5대리그 1부
+    # 절대 최저선을 지킨다.
+    _lhm2, _phm2 = _squad_ovr_hard_min(cname, tier, tname)
+    if _lhm2 is not None:
+        _af2 = (_scaled / _target) if _target else 1.0
+        _stats, _ovr = _lift_stats_to_ovr(
+            _pos, _stats, _ovr, max(_lhm2, (_phm2 or 0) * _af2))
+    _sub_role = random.choice(SUB_ROLES.get(_pos, ["기본"]))
+    # [2026-09] database._nat_ceiling_penalty 참고.
+    _nat, _foreign_ct = _pick_nationality(cname, continent, grade, _pos,
+                                          False, _foreign_ct, _quota,
+                                          slot_ovr=_target, youth=(tier or 1) <= YOUTH_PATH_MAX_TIER,
+                              youth_top=(tier or 1) == 1)   # [2026-10 A-2]
+    _name = ""      # [2026-09] AI 실명 폐지
+    # [2026-09 신설, database.roll_potential_ovr 정의부
+    # 주석 참고] 이 자리도 같은 확률표로 잠재력을 정한다.
+    _swap_growth_cap = compute_ai_growth_cap(grade, tier, cname, continent)
+    _p_world, _p_elite = _prestige_star_prob(grade, _plvl)
+    # [2026-09] 97~99 포지션 가중치.
+    from database import split_star_prob_by_position as _split_star
+    _p_world, _p_elite = _split_star(_p_world, _p_elite, _pos, "starter")
+    _star_roll = random.random()
+    if _star_roll < _p_world:
+        _swap_kind = "worldclass"
+    elif _star_roll < _p_world + _p_elite:
+        _swap_kind = "elite"
+    else:
+        _swap_kind = None
+    _row = (tid, _name, _pos,
+        _stats["stamina"], _stats["speed"], _stats["jump"], _stats["strength"],
+        _stats["shooting"], _stats["passing"], _stats["dribbling"],
+        _stats["tackling"], _stats["heading"], _stats["positioning"],
+        _stats["setpiece"], _stats["mental"], _stats["confidence"],
+        _stats["leadership"], _stats["concentration"], _ovr, _age, _sub_role,
+        _nat, _nat,
+        year + random.randint(2, 4), 0, year,
+        # [2026-09] 위와 동일 — 자기 목표 바닥.
+        max(_ovr, int(round(_target)),
+            roll_potential_ovr(_swap_growth_cap, _swap_kind)),
+        # [2026-09 신설] 위 _gen_topup_rows와 같은 이유 —
+        # 이 경로(포지션 뎁스 보충 직접 생성)도 같은 INSERT를
+        # 쓰므로 반드시 같은 컬럼 수여야 한다.
+        _calc_ai_salary(grade, tier, _ovr, cname, tname, tid, year),
+        # [2026-09 신설] 같은 INSERT를 쓰는 _gen_topup_rows와
+        # 컬럼 수를 맞춘다. 다만 사유는 "최소인원 미달 보충"이
+        # 아니라 "포지션 뎁스 교체"라 태그를 구분한다.
+        "pos_swap")
+    return _row, _foreign_ct
+
+
+def _squad_target_inputs(c):
+    """[2026-10 확정] 포메이션 목표표 보충용 입력 — (팀별 현재 포메이션, 팀별 장기 보유
+    등록 포지션 목록). 장기 보유 = 자기 선수(임대 온 선수 제외) + 임대 보낸 선수."""
+    formation_by_team = {r[0]: r[1] for r in c.execute("SELECT id, formation FROM teams")}
+    owned: dict = {}
+    if _subp_active():
+        # [2026-10 주포·부포] 부포 보유자가 있을 때만 (등록 포지션, 부포) 쌍 — _gen_topup_rows가
+        # squad_targets.held_assign으로 선수 1명을 정확히 1칸에 배정한다. 부포가 없으면 아래 예전 경로.
+        from sub_positions import get as _subp_get
+        for r in c.execute("""SELECT team_id, COALESCE(on_loan_from_team_id, 0), position, id
+                              FROM ai_players"""):
+            owner = r[1] or r[0]
+            owned.setdefault(owner, []).append((r[2], _subp_get(r[3])))
+        return formation_by_team, owned
+    for r in c.execute("""SELECT team_id, COALESCE(on_loan_from_team_id, 0), position
+                          FROM ai_players"""):
+        owner = r[1] or r[0]
+        owned.setdefault(owner, []).append(r[2])
+    return formation_by_team, owned
 
 
 def _roll_offer_vacancy_teams(c, year) -> set:
@@ -7850,7 +8081,32 @@ def _roll_offer_vacancy_teams(c, year) -> set:
     return chosen
 
 
-def _fill_offer_vacancies(year):
+def _pending_dest_team_ids(c) -> set:
+    """[2026-10 버그수정, 신민용 확정 — 새 팀 자리 예약] 연도 전환 시점에 걸려 있는 내 선수의 예약
+    입단(pending_join_transfer_json — 다음 4주차 실행)·판매 예약(pending_sale_transfer_json — 이
+    연도 전환 직후 실행)의 목적지 팀 id. 예약 자리는 따로 저장하지 않고 이 예약 값에서 매번 계산하므로,
+    예약이 실행·취소되면 다음 시즌까지 남는 예약 자리가 생기지 않는다."""
+    out = set()
+    try:
+        r = c.execute("SELECT pending_join_transfer_json, pending_sale_transfer_json FROM my_player WHERE id=1").fetchone()
+    except Exception:
+        return out
+    if not r:
+        return out
+    import json as _json
+    for raw in (r[0], r[1]):
+        if not raw:
+            continue
+        try:
+            _tid = (_json.loads(raw) or {}).get("team_id")
+        except Exception:
+            _tid = None
+        if _tid:
+            out.add(int(_tid))
+    return out
+
+
+def _fill_offer_vacancies(year, team_ids=None, mode="vacancy"):
     """[2026-09 신설] 4주차(FIRST_HALF_START, 프리시즌 오퍼 구간이 끝나고
     정규시즌이 시작되는 시점) 진입 시 game_engine에서 호출. _roll_offer_
     vacancy_teams가 만들어둔 "강팀 오퍼용 빈자리"가 이 시점까지도 안
@@ -7889,15 +8145,35 @@ def _fill_offer_vacancies(year):
                GROUP BY ap.team_id""").fetchall():
         foreign_now[r["tid"]] = r["n"]
     name_cache = _build_name_cache(c)
-
+    _sq_form, _sq_owned = _squad_target_inputs(c)     # [2026-10 확정] 포메이션·장기 보유 포지션
+    # [2026-10 버그수정, 신민용 리포트: "최대 26명이어야 하는데 플레이어가 들어가면서 27명이 될
+    # 때가 있다"] 이 보충은 ai_players만 세서, 내가 이 팀에 입단해 1자리를 차지한 경우(입단 때
+    # _make_room_on_join이 AI를 25명으로 맞춰 둠)에도 "AI 25 < 26"으로 보고 AI를 1명 더 채웠다
+    # — AI 26 + 나 = 27. 내 소속팀이면 나도 정원 1자리로 센다(_rebalance_squad_sizes와 같은 원칙).
+    _my_tid = None
+    try:
+        _mr = c.execute("SELECT current_team_id FROM my_player WHERE id=1").fetchone()
+        _my_tid = _mr[0] if _mr and _mr[0] else None
+    except Exception:
+        _my_tid = None
     new_rows = []
     filled = 0
     for r in team_rows:
-        grade = get_country_league_grade(r["cname"])
-        if not _is_fixed26(grade, r["tier"]):
+        # [2026-10 새 팀 자리 예약] mode="leave_min": 내 선수가 예약 이동(4주차 입단·판매 예약)으로
+        # 떠난 팀(team_ids)을 그 등급 **최소 인원**까지만 채운다. 26명 고정 팀은 제외 — 4주차
+        # 기존 빈자리 마감 보충(mode="vacancy")이 그대로 26명을 맞춘다.
+        if team_ids is not None and r["tid"] not in team_ids:
             continue
-        _, ceiling = _squad_min_max(grade, r["tier"])
-        n = counts.get(r["tid"], 0)
+        grade = get_country_league_grade(r["cname"])
+        if mode == "vacancy":
+            if not _is_fixed26(grade, r["tier"]):
+                continue
+            _, ceiling = _squad_min_max(grade, r["tier"])
+        else:
+            if _is_fixed26(grade, r["tier"]):
+                continue
+            ceiling, _ = _squad_min_max(grade, r["tier"])
+        n = counts.get(r["tid"], 0) + (1 if (_my_tid and r["tid"] == _my_tid) else 0)
         if n >= ceiling:
             continue
         need = ceiling - n
@@ -7905,7 +8181,9 @@ def _fill_offer_vacancies(year):
                                          r["tname"], grade, need, roster_by_team, name_cache,
                                          year, r["cname"] in COUNTRY_LEAGUE_OVR_OVERRIDE,
                                          foreign_ct0=foreign_now.get(r["tid"], 0),
-                                         src_tag="offer_vacancy"))
+                                         src_tag=("offer_vacancy" if mode == "vacancy" else "squad_topup"),
+                                         formation=_sq_form.get(r["tid"]),
+                                         held_positions=_sq_owned.get(r["tid"], [])))
         filled += 1
 
     if new_rows:
@@ -8002,6 +8280,10 @@ def _rebalance_squad_sizes(c, year):
         foreign_now[r["tid"]] = r["n"]
 
     name_cache = _build_name_cache(c)
+    _sq_form, _sq_owned = _squad_target_inputs(c)     # [2026-10 확정] 포메이션·장기 보유 포지션
+    import constants as _sq_cc
+    _SQ_GK_SWAP_LOG.update({"done": 0, "no_donor": 0, "no_donor_cases": [],
+                            "excess_done": 0, "excess_no_donor": 0, "excess_over_max": 0})
     topped_up = 0
     forced_out = 0
     new_rows = []       # INSERT용
@@ -8027,6 +8309,11 @@ def _rebalance_squad_sizes(c, year):
     # teams 참고). 4주차가 되면 game_engine이 _fill_offer_vacancies를 불러
     # 이 시점까지 안 채워진 자리를 강제로 26까지 채운다.
     _vacancy_team_ids = _roll_offer_vacancy_teams(c, year)
+    # [2026-10 버그수정, 신민용 확정 — 새 팀 자리 예약] 예전엔 지금 소속팀(곧 떠날 팀)에만 내 자리를
+    # 비워 두고, 예약해 둔 새 팀은 꽉 채웠다 — 4주차 입단 때 새 팀 최저 OVR 선수가 방출됐다. 이제
+    # 예약 목적지도 정원을 1 줄여 둔다(떠날 팀 몫은 실제로 떠날 때까지 그대로 유지 — 1~3주차 27명
+    # 방지). 목적지가 이미 강팀 오퍼 빈자리(_vacancy_team_ids)면 그 빈자리가 곧 내 자리라 한 번만 줄인다.
+    _my_dest_ids = _pending_dest_team_ids(c) - ({_my_team_id} if _my_team_id else set())
 
     for tid, (tier, cname, continent, tname) in team_info.items():
         n = counts.get(tid, 0)
@@ -8055,13 +8342,18 @@ def _rebalance_squad_sizes(c, year):
         if tid in _vacancy_team_ids:
             _lo_size -= 1
             _hi_size -= 1
+        elif tid in _my_dest_ids:
+            _lo_size -= 1
+            _hi_size -= 1
 
         if n < _lo_size:
             need = _lo_size - n
             new_rows.extend(_gen_topup_rows(c, tid, tier, cname, continent, tname, grade,
                                              need, roster_by_team, name_cache, year,
                                              is_override,
-                                             foreign_ct0=foreign_now.get(tid, 0)))
+                                             foreign_ct0=foreign_now.get(tid, 0),
+                                             formation=_sq_form.get(tid),
+                                             held_positions=_sq_owned.get(tid, [])))
             topped_up += need
 
         elif n > _hi_size:
@@ -8082,6 +8374,11 @@ def _rebalance_squad_sizes(c, year):
                 _grp_count_max[_g] = _grp_count_max.get(_g, 0) + 1
             _protected_max = {_pid for _pid, _ppos, _povr in roster
                               if _grp_count_max.get(_GROUP_KEY.get(_pos_category(_ppos), "MF"), 0) <= 1}
+            # [2026-10 확정] GK 보호: 가용 GK가 2명 이하인 팀은 조기은퇴
+            # 후보에서 GK를 뺀다(계측: 조기은퇴가 GK 2명 팀의 GK를 내보내 1명이 되는 사례).
+            _sq_gk_ids = {_pid for _pid, _ppos, _povr in roster if _ppos == "GK"}
+            if len(_sq_gk_ids) <= 2:
+                _protected_max = _protected_max | _sq_gk_ids
             _candidates = sorted(roster, key=lambda t: t[2])  # 기존과 동일: OVR 오름차순
             picks = [_pid for _pid, _ppos, _povr in _candidates if _pid not in _protected_max][:excess]
             # (극단적 예외) 보호 대상을 뺀 후보만으론 목표 감축분을 못
@@ -8092,9 +8389,45 @@ def _rebalance_squad_sizes(c, year):
             if len(picks) < excess:
                 _picked = set(picks)
                 _rest = [_pid for _pid, _ppos, _povr in _candidates if _pid not in _picked]
+                # 보호 대상에서도 채워야 하는 극단 예외 — GK는 맨 뒤로(인원 상한은 지킨다)
+                _rest = ([x for x in _rest if x not in _sq_gk_ids]
+                         + [x for x in _rest if x in _sq_gk_ids])
                 picks.extend(_rest[:excess - len(picks)])
             delete_ids.extend(picks)
             forced_out += len(picks)
+            # [2026-10 확정] 조기은퇴 뒤에도 가용 GK가 기준 미만이면
+            # 맞바꾸기 단계와 같은 규칙으로 1:1 맞바꾼다 — 포메이션 목표 대비 가장 초과한
+            # 필드 포지션의 최저 OVR 선수를 내보내고 GK를 같은 생성 함수로 만든다.
+            # 내보낼 선수가 없으면 아무도 빼지 않고 기록만.
+            _sq_picked = set(picks)
+            _sq_left = [r for r in roster if r[0] not in _sq_picked]
+            if n - len(picks) > _hi_size:
+                _SQ_GK_SWAP_LOG["excess_over_max"] += 1
+            if sum(1 for r in _sq_left if r[1] == "GK") < _sq_cc.SQUAD_TARGET_MIN_AVAILABLE_GK:
+                _sq_donor = _sq_gk_swap_donor(_sq_left, _sq_form.get(tid))
+                if _sq_donor is None:
+                    _SQ_GK_SWAP_LOG["excess_no_donor"] += 1
+                    _SQ_GK_SWAP_LOG["no_donor_cases"].append(
+                        (tid, sum(1 for r in _sq_left if r[1] == "GK"), len(_sq_left),
+                         _sq_form.get(tid), "excess"))
+                else:
+                    delete_ids.append(_sq_donor[0])
+                    _sq_ovr_rng = get_ovr_range(grade, tier, cname)
+                    if _sq_ovr_rng:
+                        _sq_lo, _sq_hi = _sq_ovr_rng
+                        if not is_override:
+                            _sq_lo, _sq_hi = _sq_lo + bonus, _sq_hi + bonus
+                    else:
+                        _sq_lo, _sq_hi = 40, 55
+                    _sq_q_lo, _sq_quota = get_foreign_quota_range(cname, continent, tier=tier)
+                    _sq_row, _sq_fc = _sq_gen_swap_row(
+                        tid, "GK", grade, tier, cname, continent, tname, year,
+                        _sq_ovr_rng, _sq_lo, _sq_hi, _rebal_prestige_level(cname, tname),
+                        foreign_now.get(tid, 0), _sq_quota)
+                    new_rows.append(_sq_row)
+                    topped_up += 1
+                    forced_out += 1
+                    _SQ_GK_SWAP_LOG["excess_done"] += 1
 
         else:
             # [2026-08 신설] 총원은 22~25 정상범위라서 위 두 분기 다
@@ -8189,6 +8522,24 @@ def _rebalance_squad_sizes(c, year):
                         if _don:
                             deficient = [(g, x) for g, x in deficient if g in _zero_grps]
                             surplus = [(_don, 99, None)]
+                # [2026-10 확정] GK 최소 보장: 이적·은퇴로 GK가 1명이
+                # 된 꽉 찬 팀은 보충이 돌지 않는다(계측: GK 2→1 경로의 약 70%가 이적시장).
+                # 현재 가용 GK(이 팀 명단 — 임대 보낸 선수 제외)가 기준 미만이면 GK를
+                # 부족 포지션으로 지정하고, 포메이션 목표 대비 가장 초과한 필드 포지션의
+                # 최저 OVR 선수와 1:1로 맞바꾼다. 내보낼 선수가 없으면 아무도 빼지 않고 기록만.
+                # 그룹 판정이 이미 GK를 부족으로 잡은 경우(GK 0명 등)는 기존 경로 그대로.
+                if (len(group_players["GK"]) < _sq_cc.SQUAD_TARGET_MIN_AVAILABLE_GK
+                        and not any(g == "GK" for g, _x in deficient)):
+                    _sq_donor = _sq_gk_swap_donor(roster, _sq_form.get(tid))
+                    if _sq_donor is None:
+                        _SQ_GK_SWAP_LOG["no_donor"] += 1
+                        _SQ_GK_SWAP_LOG["no_donor_cases"].append(
+                            (tid, len(group_players["GK"]), len(roster), _sq_form.get(tid)))
+                    else:
+                        _SQ_GK_SWAP_LOG["done"] += 1
+                        deficient = [("GK", "GK")] + deficient
+                        surplus = [(_GROUP_KEY.get(_pos_category(_sq_donor[2]), "MF"), 10 ** 6,
+                                    _sq_donor[2])] + surplus
                 if deficient and surplus:
                     surplus.sort(key=lambda x: -x[1])
                     ovr_rng = get_ovr_range(grade, tier, cname)
@@ -8235,64 +8586,10 @@ def _rebalance_squad_sizes(c, year):
                         delete_ids.append(weakest[0])
                         group_players[sgrp].remove(weakest)
                         _pos = _need_exact or random.choice(_BENCH_GROUP_POOLS[grp])
-                        _target = random.randint(_lo, max(_lo, (_lo + _hi) // 2))
-                        _age = random.randint(*_AI_NEWBIE_AGE)
-                        _scaled = _youth_target_scale(_target, _age)
-                        if ovr_rng:
-                            _prestige_base = {3: 1, 2: 2, 1: 3}.get(_plvl, 4)
-                            _grade_adj = {"SS": 0, "S": 0, "A": 0, "B": 1, "C": 1,
-                                         "D": 2, "E": 2, "F": 3}.get(grade, 2)
-                            _young_floor_off = _prestige_base + _grade_adj
-                            _scaled = max(_scaled, ovr_rng[0] - _young_floor_off)
-                        _stats = _gen_stats(_pos, _scaled)
-                        _ovr = calc_ovr(_pos, _stats)
-                        # [2026-09 신설] 위 _retire_and_replace의 같은 보정과
-                        # 동일 — 이 경로(스쿼드 인원 보충)도 5대리그 1부
-                        # 절대 최저선을 지킨다.
-                        _lhm2, _phm2 = _squad_ovr_hard_min(cname, tier, tname)
-                        if _lhm2 is not None:
-                            _af2 = (_scaled / _target) if _target else 1.0
-                            _stats, _ovr = _lift_stats_to_ovr(
-                                _pos, _stats, _ovr, max(_lhm2, (_phm2 or 0) * _af2))
-                        _sub_role = random.choice(SUB_ROLES.get(_pos, ["기본"]))
-                        # [2026-09] database._nat_ceiling_penalty 참고.
-                        _nat, _foreign_ct = _pick_nationality(cname, continent, grade, _pos,
-                                                              False, _foreign_ct, _quota,
-                                                              slot_ovr=_target, youth=(tier or 1) <= YOUTH_PATH_MAX_TIER)
-                        _name = ""      # [2026-09] AI 실명 폐지
-                        # [2026-09 신설, database.roll_potential_ovr 정의부
-                        # 주석 참고] 이 자리도 같은 확률표로 잠재력을 정한다.
-                        _swap_growth_cap = compute_ai_growth_cap(grade, tier, cname, continent)
-                        _p_world, _p_elite = _prestige_star_prob(grade, _plvl)
-                        # [2026-09] 97~99 포지션 가중치.
-                        from database import split_star_prob_by_position as _split_star
-                        _p_world, _p_elite = _split_star(_p_world, _p_elite, _pos, "starter")
-                        _star_roll = random.random()
-                        if _star_roll < _p_world:
-                            _swap_kind = "worldclass"
-                        elif _star_roll < _p_world + _p_elite:
-                            _swap_kind = "elite"
-                        else:
-                            _swap_kind = None
-                        new_rows.append((tid, _name, _pos,
-                            _stats["stamina"], _stats["speed"], _stats["jump"], _stats["strength"],
-                            _stats["shooting"], _stats["passing"], _stats["dribbling"],
-                            _stats["tackling"], _stats["heading"], _stats["positioning"],
-                            _stats["setpiece"], _stats["mental"], _stats["confidence"],
-                            _stats["leadership"], _stats["concentration"], _ovr, _age, _sub_role,
-                            _nat, _nat,
-                            year + random.randint(2, 4), 0, year,
-                            # [2026-09] 위와 동일 — 자기 목표 바닥.
-                            max(_ovr, int(round(_target)),
-                                roll_potential_ovr(_swap_growth_cap, _swap_kind)),
-                            # [2026-09 신설] 위 _gen_topup_rows와 같은 이유 —
-                            # 이 경로(포지션 뎁스 보충 직접 생성)도 같은 INSERT를
-                            # 쓰므로 반드시 같은 컬럼 수여야 한다.
-                            _calc_ai_salary(grade, tier, _ovr, cname, tname, tid, year),
-                            # [2026-09 신설] 같은 INSERT를 쓰는 _gen_topup_rows와
-                            # 컬럼 수를 맞춘다. 다만 사유는 "최소인원 미달 보충"이
-                            # 아니라 "포지션 뎁스 교체"라 태그를 구분한다.
-                            "pos_swap"))
+                        _row, _foreign_ct = _sq_gen_swap_row(
+                            tid, _pos, grade, tier, cname, continent, tname, year,
+                            ovr_rng, _lo, _hi, _plvl, _foreign_ct, _quota)
+                        new_rows.append(_row)
                         topped_up += 1
                         forced_out += 1
 
@@ -8352,6 +8649,7 @@ def _snapshot_season_positions(c, year, only_missing=False, rows=None,
     [한계] 이 기능 신설 이전 과거 시즌엔 소급 적용이 안 된다 — 그 이전
     연도는 세계 브라우저 쪽에서 이적 시점 등록 포지션으로 대체 표시한다."""
     from formation_logic import _greedy_fill_slots, compute_squad_roles
+    from team_plan import club_fill_slots as _club_fill   # [⑦-c] 스위치 꺼짐이면 _greedy_fill_slots 그대로
     from constants import FORMATION_SLOTS
     import json
 
@@ -8597,7 +8895,9 @@ def _snapshot_season_positions(c, year, only_missing=False, rows=None,
                                "sub_role": (_me["sub_role"] if "sub_role" in _me.keys() else ""),
                                "role_age": _me["age"]})
             role_pool.append((_MY_LINEUP_ID, _me["position"], _me["ovr"], _me["age"]))
-        placed = _greedy_fill_slots(candidates, slots)
+        # [2026-10 주포·부포] 부포 보유자만 "sub_pos"를 붙인다(내 선수는 id -1). 부포가 없으면 무동작.
+        _subp_attach(candidates)
+        placed = _club_fill(candidates, slots)
         started_ids = {pl["id"] for pl in placed if pl is not None}
         # [2026-09 재설계] roles는 이제 실제 슬롯 배정(started_ids)을 그대로
         # "주전" 판정에 쓴다 — formation_logic.compute_squad_roles 주석 참고.
@@ -8715,6 +9015,7 @@ def _snapshot_team_lineup_half(c, year):
     [한계] 이 기능 신설 이전 과거 시즌은 소급 적용 안 됨 — 그 해는
     화면에서 "상반기 기록 없음"으로 처리한다."""
     from formation_logic import _greedy_fill_slots, compute_squad_roles
+    from team_plan import club_fill_slots as _club_fill   # [⑦-c] 스위치 꺼짐이면 _greedy_fill_slots 그대로
     from constants import FORMATION_SLOTS
     import json
     import time as _t_snap
@@ -8819,7 +9120,9 @@ def _snapshot_team_lineup_half(c, year):
                                "sub_role": (_me["sub_role"] if "sub_role" in _me.keys() else ""),
                                "role_age": _me["age"]})
             role_pool.append((_MY_LINEUP_ID, _me["position"], _me["ovr"], _me["age"]))
-        placed = _greedy_fill_slots(candidates, slots)
+        # [2026-10 주포·부포] 부포 보유자만 "sub_pos"를 붙인다(내 선수는 id -1). 부포가 없으면 무동작.
+        _subp_attach(candidates)
+        placed = _club_fill(candidates, slots)
         started_ids = {pl["id"] for pl in placed if pl is not None}
         # [2026-09 재설계] roles는 이제 실제 슬롯 배정(started_ids)을 그대로
         # "주전" 판정에 쓴다 — formation_logic.compute_squad_roles 주석 참고.
@@ -9681,13 +9984,15 @@ def snapshot_my_player_position(year):
     한 해 team_id가 없으면 그 해 role_checkpoints에 값이 없는 것과
     동일한 동작."""
     from formation_logic import _greedy_fill_slots, compute_squad_roles
+    from team_plan import club_fill_slots as _club_fill   # [⑦-c] 스위치 꺼짐이면 _greedy_fill_slots 그대로
     from constants import FORMATION_SLOTS
 
     conn = get_conn()
     c = conn.cursor()
     try:
         me = c.execute(
-            "SELECT current_team_id, position, ovr, age FROM my_player WHERE id=1").fetchone()
+            "SELECT current_team_id, position, ovr, age, foot, sub_role FROM my_player WHERE id=1"
+        ).fetchone()
         if not me or not me["current_team_id"]:
             return
         team_id = me["current_team_id"]
@@ -9696,7 +10001,8 @@ def snapshot_my_player_position(year):
             return
         formation = team_row["formation"] or "4-4-2"
         teammates = c.execute(
-            "SELECT id, position, ovr, age FROM ai_players WHERE team_id=?", (team_id,)).fetchall()
+            "SELECT id, position, ovr, age, foot, sub_role FROM ai_players WHERE team_id=?",
+            (team_id,)).fetchall()
 
         ME = "__ME__"
         candidates = [{"id": r["id"], "position": r["position"], "ovr": r["ovr"] or 0,
@@ -9704,11 +10010,23 @@ def snapshot_my_player_position(year):
                       for r in teammates]
         candidates.append({"id": ME, "position": me["position"], "ovr": me["ovr"] or 0,
                            "role_age": me["age"]})
+        # [⑦-c] 통일 스위치가 켜졌을 때만 주발을 싣는다 — 경기 전력 최적 배치(유효 적합도)와 같은
+        # 입력. 꺼져 있으면 예전처럼 주발 없이(그리디의 주발 교환 패스도 예전과 같이 무동작).
+        from constants import LINEUP_UNIFY_ENABLED as _lu_on
+        if _lu_on:
+            for _cd, _src in zip(candidates, list(teammates) + [me]):
+                _cd["foot"] = _src["foot"] or ""
+                _cd["sub_role"] = _src["sub_role"] or ""
         pool = [(r["id"], r["position"], r["ovr"], r["age"]) for r in teammates]
         pool.append((ME, me["position"], me["ovr"], me["age"]))
 
         slots = FORMATION_SLOTS.get(formation, FORMATION_SLOTS["4-4-2"])
-        placed = _greedy_fill_slots(candidates, slots)
+        # [2026-10 주포·부포] AI 동료는 id로, 나("__ME__")는 player_id -1의 부포를 붙인다.
+        _subp_attach(candidates[:-1])
+        _my_sub_now = _subp_my_sub() if _subp_active() else None
+        if _my_sub_now:
+            candidates[-1]["sub_pos"] = _my_sub_now
+        placed = _club_fill(candidates, slots)
         started_ids = {pl["id"] for pl in placed if pl is not None}
         # [2026-09 재설계] roles는 이제 실제 슬롯 배정(started_ids)을 그대로
         # "주전" 판정에 쓴다 — formation_logic.compute_squad_roles 주석 참고.
@@ -9778,17 +10096,23 @@ def _enforce_intl_breakout_caps(c, year):
     등급을 말하는거고"] database._apply_intl_breakout과 동일한 이유로
     get_country_league_grade가 아니라 get_country_grade(FIFA 랭킹 기반
     국대 등급)를 써야 한다 — 이 체계엔 SS가 없다(S/A/B/C/D/E/F 7단계)."""
-    from database import _INTL_BREAKOUT_MAX_COUNT, _INTL_BREAKOUT_FLOOR, rescale_ai_player_to_target_ovr
+    from database import (_INTL_BREAKOUT_MAX_COUNT, _INTL_BREAKOUT_FLOOR, rescale_ai_player_to_target_ovr,
+                          cap_count_ovr)
     from constants import get_country_grade
     _lowest_floor = min(_INTL_BREAKOUT_FLOOR.values())
     rows = c.execute(
-        "SELECT id, nationality, ovr, ovr_user_locked FROM ai_players "
+        "SELECT id, nationality, ovr, ovr_user_locked, edited_original_ovr FROM ai_players "
         "WHERE ovr>=? AND nationality!=''", (_lowest_floor,)).fetchall()
     if not rows:
         return
     by_nat: dict = {}
     for r in rows:
-        by_nat.setdefault(r["nationality"], []).append((r["id"], r["ovr"], bool(r["ovr_user_locked"])))
+        # [2026-10, 신민용 확정] 편집 선수는 database.cap_count_ovr(= min(편집 전, 현재))로 센다 —
+        # 아래 ovr 자리에 그 값을 넣으므로 기준선 비교·정원 계산 모두 같은 기준이 된다.
+        # (편집 선수는 어차피 트리밍 대상이 아니라 정렬용 OVR이 바뀌어도 영향 없음)
+        _lk = bool(r["ovr_user_locked"])
+        _ov = cap_count_ovr(r["ovr"], _lk, r["edited_original_ovr"]) if _lk else r["ovr"]
+        by_nat.setdefault(r["nationality"], []).append((r["id"], _ov, _lk))
     for nat, lst in by_nat.items():
         grade = get_country_grade(nat)
         cap = _INTL_BREAKOUT_MAX_COUNT.get(grade)
@@ -9836,9 +10160,11 @@ def _ensure_top_grade_star_floor(c, year):
     targets = [n for n in names if get_country_grade(n) in ("S", "A")]
     if not targets:
         return 0
+    from database import CAP_COUNT_OVR_SQL
+    # [2026-10, 신민용 확정] 편집으로 만든 95+는 "최소 1명"으로 인정하지 않는다 — min(편집 전, 현재).
     have = {r["n"] for r in c.execute(
-        "SELECT DISTINCT true_nationality AS n FROM ai_players WHERE ovr>=?",
-        (_TOP_GRADE_STAR_FLOOR,)).fetchall()}
+        f"SELECT DISTINCT true_nationality AS n FROM ai_players WHERE ovr>=? AND {CAP_COUNT_OVR_SQL}>=?",
+        (_TOP_GRADE_STAR_FLOOR, _TOP_GRADE_STAR_FLOOR)).fetchall()}
     promoted = 0
     for nat in targets:
         if nat in have:
@@ -10059,6 +10385,12 @@ def _enforce_foreign_quota_worldwide(c, year):
         for out_p in _movable:
             if left <= 0:
                 break
+            if out_p["id"] in _taken:
+                # [2026-10 버그수정, 신민용 확정] 이미 다른 팀 맞교환에서 "해외파 자국 선수"로
+                # 뽑혀 이 팀을 떠난 외국인 — 다시 내보내면 같은 선수가 두 번 옮겨진다. 이미 떠났으니
+                # 이 팀 초과분도 그만큼 줄어든 것으로 센다(추가 교환 없음).
+                left -= 1
+                continue
             picked = None
             _grp = _POS_GROUP.get(out_p["position"], "FW")
             # [2026-09 신설] 이번 out_p 기준으로만 부적합한(=목적지 수준
@@ -10108,6 +10440,11 @@ def _enforce_foreign_quota_worldwide(c, year):
             if picked is None:
                 continue
             _taken.add(picked[0])
+            # [2026-10 버그수정, 신민용 확정] 내보내는 외국인도 중복 이동 방지 목록에 넣는다 — 예전엔
+            # 받는 선수만 넣어서, 여기서 내보내기로 정한 외국인이 뒤에서 다른 초과팀의 "해외파 자국
+            # 선수"로 또 뽑혔다(같은 처리에서 두 번 이동 → 마지막 이동만 남아 한 팀 +1·다른 팀 −1,
+            # 실측 시즌당 13~23명). 맞교환은 그대로 1:1.
+            _taken.add(out_p["id"])
             cur_foreign[tid] = max(0, cur_foreign.get(tid, 0) - 1)
             in_pid, in_tid = picked
             moves.append((tid, in_pid))          # 자국 선수 → 초과팀
@@ -10191,6 +10528,40 @@ def _enforce_foreign_quota_worldwide(c, year):
     return n_swap, len(naturalize)
 
 
+_LAST_LEAGUE_OF = {}
+
+
+def _expected_ranks(c, ranks, year):
+    """[2026-10 6번 ③-2] {team_id: 예상 순위} — 시즌 시작 때 기록한 경기 전력
+    (teams.exp_strength, 그 연도 값)의 리그 내 순서. 기록이 없는 팀(구세이브의 첫
+    시즌 등)만 지금 전력으로 대신한다. 동률은 team_id 순(결정성)."""
+    snap = {}
+    try:
+        for r in c.execute("SELECT id, exp_strength, exp_strength_year FROM teams"):
+            if r[1] is not None and r[2] == int(year):
+                snap[r[0]] = float(r[1])
+    except Exception:
+        snap = {}
+    fallback = None
+    by_league = {}
+    for tid in ranks:
+        by_league.setdefault(_LAST_LEAGUE_OF.get(tid), []).append(tid)
+    out = {}
+    for _lid, tids in by_league.items():
+        vals = {}
+        for t in tids:
+            v = snap.get(t)
+            if v is None:
+                if fallback is None:
+                    from game_engine import _team_avg_ovr, _formation_bias
+                    fallback = lambda tt: _team_avg_ovr(c, tt) + _formation_bias(c, tt)
+                v = fallback(t)
+            vals[t] = v
+        for i, t in enumerate(sorted(tids, key=lambda t: (-vals[t], t))):
+            out[t] = i + 1
+    return out
+
+
 def _league_standings(c, season):
     """방금 끝난 시즌의 리그별 순위를 한 번에 계산한다 — {team_id: (rank, total)}.
 
@@ -10223,6 +10594,8 @@ def _league_standings(c, season):
     for tid, lid in league_of.items():
         by_league.setdefault(lid, []).append(tid)
 
+    global _LAST_LEAGUE_OF
+    _LAST_LEAGUE_OF = league_of      # [2026-10 6번 ③-2] 전력 대비 순위 계산이 같은 리그 묶음을 쓴다
     out = {}
     for lid, tids in by_league.items():
         if len(tids) < 4:
@@ -10300,6 +10673,71 @@ def _manager_job_fit(job_level, job_kind, mgr, year, country=None,
     if job_kind == "nation" and country and (mgr.get("nationality") or "") == country:
         bonus = MANAGER_NAT_PREF_BONUS    # 자국 선호 — 약한 가산점
     return (True, mult, bonus)
+
+
+def _explayer_pool(c, year):
+    """[2026-10 선출 감독 전환] 감독으로 데뷔할 수 있는 은퇴 선수 →
+    {국적: [(선수 id, 출생 연도), ...]} (id 오름차순).
+
+    조건: 은퇴 후 MANAGER_EXPLAYER_MIN_GAP_YEARS 이상 지났고, 지금 나이가 신인
+    감독 나이 범위(MANAGER_ROOKIE_AGE_MIN~MAX) 안이며, 아직 감독이 아닌 선수.
+    ai_players_retired.age는 은퇴 당시 나이라 출생 연도 = 은퇴 연도 − 그 나이.
+    은퇴 연도로 범위를 잘라 읽는다(나이 상한 때문에 오래전 은퇴자는 어차피 탈락)."""
+    from constants import (MANAGER_EXPLAYER_MIN_GAP_YEARS, MANAGER_ROOKIE_AGE_MIN,
+                           MANAGER_ROOKIE_AGE_MAX)
+    year = int(year)
+    try:
+        used = {int(r[0]) for r in c.execute(
+            "SELECT from_player_id FROM managers WHERE from_player_id IS NOT NULL")}
+        rows = c.execute(
+            """SELECT id, nationality, age, retirement_year, COALESCE(peak_ovr, ovr, 0) FROM ai_players_retired
+               WHERE retirement_year BETWEEN ? AND ? ORDER BY id""",
+            (year - (MANAGER_ROOKIE_AGE_MAX - 25), year - MANAGER_EXPLAYER_MIN_GAP_YEARS)
+        ).fetchall()
+    except Exception:
+        return {}
+    pool = {}
+    for r in rows:
+        pid, nat, age, ry, pk = int(r[0]), (r[1] or ""), r[2], r[3], int(r[4] or 0)
+        if pid in used or not nat or age is None or ry is None:
+            continue
+        birth = int(ry) - int(age)
+        if MANAGER_ROOKIE_AGE_MIN <= year - birth <= MANAGER_ROOKIE_AGE_MAX:
+            pool.setdefault(nat, []).append((pid, birth, pk))   # pk = 선수 시절 최고 OVR(⑥)
+    return pool
+
+
+def _take_explayer(pool, nationality, rng, target=None):
+    """pool에서 그 국적 은퇴 선수 하나를 확률(MANAGER_EXPLAYER_SHARE)로 꺼낸다 —
+    (선수 id, 출생 연도, 선수 시절 최고 OVR) 또는 None. 꺼낸 선수는 pool에서 빠진다
+    (한 시장에서 중복 부임 방지). 난수: random() 1회 + 뽑을 때 1회(target이 있으면
+    가중 선택용 random(), 없으면 randrange). 호출 횟수는 같아도 두 방식의 내부 난수
+    소비량은 달라서, 가중을 켜면 그 뒤 난수 흐름은 예전 코드와 달라진다."""
+    from constants import MANAGER_EXPLAYER_SHARE
+    if not pool:
+        return None
+    if rng.random() >= MANAGER_EXPLAYER_SHARE:
+        return None
+    lst = pool.get(nationality or "")
+    if not lst:
+        return None
+    # [2026-10 ⑥] target(그 자리 팀 전력)이 있으면 선수 시절 최고 OVR이 가까울수록 잘 뽑힌다
+    # (constants.MANAGER_EXPLAYER_PEAK_SIGMA 주석). 난수는 어느 쪽이든 1회.
+    from constants import MANAGER_EXPLAYER_PEAK_SIGMA as _sig, MANAGER_EXPLAYER_PEAK_FLOOR as _flo
+    if _sig and target is not None:
+        import math
+        ws = [max(_flo, math.exp(-0.5 * ((x[2] - float(target)) / float(_sig)) ** 2)) for x in lst]
+        u = rng.random() * sum(ws)
+        i = len(lst) - 1
+        for j, w in enumerate(ws):
+            u -= w
+            if u <= 0:
+                i = j
+                break
+    else:
+        i = rng.randrange(len(lst))
+    lst[i], lst[-1] = lst[-1], lst[i]
+    return lst.pop()
 
 
 def _manager_season_honours(c, year):
@@ -10389,7 +10827,7 @@ def _manager_turnover(c, year, season=None):
                            MANAGER_ROOKIE_AGE_MAX,
                            MANAGER_RETIRE_AGE_START, MANAGER_RETIRE_AGE_SLOPE,
                            MANAGER_RETIRE_AGE_HARD, MANAGER_RETIRE_JOBLESS_YEARS,
-                           MANAGER_RETIRE_JOBLESS_SLOPE,
+                           MANAGER_RETIRE_JOBLESS_SLOPE, manager_retire_prob,
                            get_country_league_grade,
                            # ③-c 실적/명성 + 상한/하한
                            MANAGER_CAND_WINDOW, MANAGER_REP_RECENT_ALPHA,
@@ -10410,6 +10848,10 @@ def _manager_turnover(c, year, season=None):
             return set()
 
     ranks = _league_standings(c, season)
+    # [2026-10 6번 ③-2] 감독 평판 "최근 성적"의 기준 — 시즌 시작 전력 대비 순위.
+    import constants as _Crep
+    _rep_basis = getattr(_Crep, "MANAGER_REP_PERF_BASIS", "target")
+    _exp_rank = _expected_ranks(c, ranks, year) if _rep_basis == "strength" else {}
     if not ranks:
         return set()
 
@@ -10434,7 +10876,9 @@ def _manager_turnover(c, year, season=None):
         lvl = _manager_job_level(get_country_league_grade(country), r["tier"],
                                  prestige_level(country, r["name"]) if country else 0)
         teams[r["id"]] = {"id": r["id"], "name": r["name"], "country": country,
-                          "amb": (r["club_ambition"] or "").strip(), "level": lvl}
+                          "amb": (r["club_ambition"] or "").strip(), "level": lvl,
+                          "tier": r["tier"],
+                          "prestige": (prestige_level(country, r["name"]) or 0) if country else 0}
 
     cur_mgr = {r["team_id"]: dict(r) for r in c.execute(
         """SELECT tm.id AS link_id, tm.team_id, tm.manager_id, tm.start_year
@@ -10444,8 +10888,21 @@ def _manager_turnover(c, year, season=None):
                   career_best_level, clubs_managed, retired, nationality,
                   reputation, recent_level, career_floor, best_level_year,
                   seasons_managed, level_sum, titles_league, titles_cup,
-                  titles_cont, titles_intl, target_hit, target_miss, recent_perf
+                  titles_cont, titles_intl, target_hit, target_miss, recent_perf,
+                  COALESCE(manager_ability, 0) AS manager_ability
            FROM managers WHERE retired=0""")}
+    # [2026-10 — 감독 모드 대비] 사용자 감독과 그 팀은 AI 시장에서 통째로 뺀다 —
+    # 평가(경질·재계약·계약 종료)·은퇴·이직·후보 풀 어디에도 안 들어간다. 팀은 현직
+    # 재임 행이 남아 있으므로 공석도 아니다. 사용자 감독의 경질·제의·계약 만료는
+    # 감독 모드에서 따로 만든다(team_plan.appoint_user_manager 주석). 지금은 빈 집합이라
+    # 아래 dict들이 그대로다.
+    import team_plan as _tplan
+    _u_tids = _tplan.user_team_ids()
+    _u_mids = _tplan.user_manager_ids()
+    if _u_tids or _u_mids:
+        ranks = {k: v for k, v in ranks.items() if k not in _u_tids}
+        cur_mgr = {k: v for k, v in cur_mgr.items() if k not in _u_tids}
+        mgrs = {k: v for k, v in mgrs.items() if k not in _u_mids}
     honours = _manager_season_honours(c, year)
 
     salt = get_world_salt()
@@ -10459,6 +10916,7 @@ def _manager_turnover(c, year, season=None):
     stats = {"sacked": 0, "contract_end": 0, "renewed": 0, "moved": 0,
              "rehired": 0, "rookie": 0, "retired_age": 0, "retired_jobless": 0,
              "stretched": 0, "rookie_forced": 0}
+    _club_season = {}       # [6번 ④] 감독 id -> (그 시즌 팀, 그 시즌 성적 −1~+1)
 
     # ══ ①~④ 현직 평가: 재계약 / 계약 종료 / 경질 / 잔류 ══════════
     for tid, (rank, total) in ranks.items():
@@ -10504,11 +10962,22 @@ def _manager_turnover(c, year, season=None):
             m["target_hit"] = int(m.get("target_hit") or 0) + 1
         else:
             m["target_miss"] = int(m.get("target_miss") or 0) + 1
-        # 최근 성적 EWMA — 목표 대비 초과 달성이 +, 미달이 −(−1~+1).
-        perf = max(-1.0, min(1.0, (target - pct) / max(0.15, target)))
+        # 최근 성적 EWMA(−1~+1).
+        # [2026-10 6번 ③-2 교체형] 기준 = 시즌 시작 전력 대비 순위(구단 목표는 위
+        # target_hit/miss와 아래 경질 판정에만 쓴다). "target"이면 예전 식.
+        if _rep_basis == "strength" and tid in _exp_rank and total > 1:
+            _over = (_exp_rank[tid] - rank) / float(total - 1)
+            perf = max(-1.0, min(1.0, _over / _Crep.MANAGER_REP_PERF_OVER_REF))
+        else:
+            perf = max(-1.0, min(1.0, (target - pct) / max(0.15, target)))
         m["recent_perf"] = ((1.0 - MANAGER_REP_RECENT_ALPHA)
                             * float(m.get("recent_perf") or 0.0)
                             + MANAGER_REP_RECENT_ALPHA * perf)
+        # [6번 ④] 능력 성장/하락의 성적 항 — 기본은 누적 최근 성적(방금 갱신한 EWMA),
+        # "season"이면 이번 시즌 한 해 성적(constants.MANAGER_GROWTH_PERF_BASIS).
+        _club_season[link["manager_id"]] = (
+            tid, perf if getattr(_Crep, "MANAGER_GROWTH_PERF_BASIS", "recent") == "season"
+            else m["recent_perf"])
         # 우승 — 리그는 순위로, 컵/대륙은 _manager_season_honours로.
         t_titles = 0
         if rank == 1:
@@ -10544,8 +11013,20 @@ def _manager_turnover(c, year, season=None):
         if contract_until and contract_until > year:
             # ── 계약 중 → 경질 판정만 ────────────────────────────
             miss = max(0.0, pct - target)
-            prob = MANAGER_SACK_BASE.get(judge_amb, 0.06) + miss * MANAGER_SACK_MISS_SLOPE
-            prob = max(MANAGER_SACK_MIN, min(MANAGER_SACK_MAX, prob))
+            # [2026-10 클럽 경질 확정 — constants.MANAGER_SACK_CHAMPION_MULT 주석] 경질 판정에서만
+            # 승격·리그 우승을 목표 달성으로 본다(위 target_hit/miss 실적 집계는 그대로).
+            # 우승이 승격보다 먼저(우승 배율), 최소 2%는 목표 미달일 때만.
+            _met_mult = _Crep.MANAGER_SACK_TARGET_MET_MULT
+            if rank == 1:
+                miss = 0.0
+                _met_mult = _Crep.MANAGER_SACK_CHAMPION_MULT
+            elif _Crep.MANAGER_SACK_PROMOTION_COUNTS_AS_TARGET and pl and pl[1] < pl[0]:
+                miss = 0.0
+            prob = (MANAGER_SACK_BASE.get(judge_amb, 0.06)
+                    * (_met_mult if miss <= 0 else 1.0)
+                    + miss * MANAGER_SACK_MISS_SLOPE)
+            prob = max(_Crep.MANAGER_SACK_MET_FLOOR if miss <= 0 else MANAGER_SACK_MIN,
+                       min(MANAGER_SACK_MAX, prob))
             tenure = max(0, year - int(link["start_year"] or year))
             if tenure <= MANAGER_SACK_HONEYMOON_YEARS:
                 prob *= MANAGER_SACK_HONEYMOON_MULT
@@ -10576,6 +11057,18 @@ def _manager_turnover(c, year, season=None):
             stats["contract_end"] += 1
             m["_left"] = True
 
+    # ══ [2026-10 6번 ④] 능력 성장/하락 — 그 시즌 자리·성적 기준 ══════
+    # 거취 판정 뒤·은퇴/시장 앞. 시장 후보 점수(능력 적합도)가 새 능력을 본다.
+    # 스위치(MANAGER_GROWTH_ENABLED)가 꺼져 있으면 아무것도 안 한다.
+    try:
+        import manager_ability as _mab4
+        _prog = _mab4.apply_yearly_progression(c, year, club_season=_club_season,
+                                               mgr_rows=mgrs)
+        if _prog:
+            stats["ability_prog"] = _prog
+    except Exception as _e:
+        print(f"[MANAGER] 능력 성장/하락 실패(계속 진행): {_e}")
+
     # ══ 은퇴 — 고령 / 장기 실직 ═══════════════════════════════════
     retire_ids = []
     for mid, m in mgrs.items():
@@ -10590,11 +11083,8 @@ def _manager_turnover(c, year, season=None):
         in_job = (m.get("status") == "club" and not m.get("_left"))
         age = year - int(m.get("birth_year") or year)
         rr = random.Random(zlib.crc32(f"ret:{salt}:{mid}:{year}".encode("utf-8")))
-        p_age = 0.0
-        if age >= MANAGER_RETIRE_AGE_HARD:
-            p_age = 1.0
-        elif age > MANAGER_RETIRE_AGE_START:
-            p_age = (age - MANAGER_RETIRE_AGE_START) * MANAGER_RETIRE_AGE_SLOPE
+        # [2026-10 6번 ④] 나이 은퇴 확률은 클럽·대표팀 공통 함수(constants 주석).
+        p_age = manager_retire_prob(age)
         p_ret = p_age
         js = m.get("jobless_since")
         if js and not in_job:
@@ -10638,20 +11128,26 @@ def _manager_turnover(c, year, season=None):
                 if not m.get("_retired") and mid not in busy
                 and (m.get("status") or "") != "nation"]
     # 경력 수준으로 버킷 — 공석마다 전체 풀을 훑으면 11,000×수천이라 느리다.
+    # [2026-10 감독 국적 시장] 버킷을 국적별로 나눈다 — 자리마다 "자국/외국"을
+    # 먼저 정하고(constants.manager_domestic_prob), 정해진 국적들의 버킷만 훑는다.
+    # 예전엔 국적 구분 없는 버킷을 id 순으로 24명까지만 봐서, 국적이 사실상
+    # 감독 번호(=세계 생성 순서)로 정해졌다(EPL ← 케이맨 제도, K리그 ← 몰디브).
     BIN = 5.0
-    free_bins = {}
+    free_bins = {}      # nationality -> {bin: [mid]}
     for mid in free_ids:
         b = int((mgrs[mid].get("career_best_level") or 0.0) // BIN)
-        free_bins.setdefault(b, []).append(mid)
-    for b in free_bins:
-        free_bins[b].sort()
+        free_bins.setdefault(mgrs[mid].get("nationality") or "", {}).setdefault(b, []).append(mid)
     # 현직 이직 후보도 같은 방식으로 버킷(현재 자리 수준 기준).
     move_bins = {}
     for mid, tid in busy.items():
         lv = teams.get(tid, {}).get("level", 0.0)
-        move_bins.setdefault(int(lv // BIN), []).append(mid)
-    for b in move_bins:
-        move_bins[b].sort()
+        move_bins.setdefault(mgrs[mid].get("nationality") or "", {}).setdefault(
+            int(lv // BIN), []).append(mid)
+    for _bins in (free_bins, move_bins):
+        for _nb in _bins.values():
+            for b in _nb:
+                _nb[b].sort()
+    _nat_present = sorted(n for n in set(free_bins) | set(move_bins) if n)
 
     move_budget = int(len(busy) * MANAGER_MOVE_MAX_SHARE)
     taken = set()
@@ -10660,15 +11156,134 @@ def _manager_turnover(c, year, season=None):
     changed = set()
     tend_updates = []
 
-    def _pick_from(bins, lo_bin, hi_bin, limit=24):
+    import constants as _Cpool
+    _pool_order = getattr(_Cpool, "MANAGER_POOL_ORDER", "legacy")
+    _pull_key = ("recent_perf" if getattr(_Cpool, "MANAGER_POOL_PULL_KEY", "reputation")
+                 == "recent_perf" else "reputation")
+    # [③-3-2'] 후보 점수의 최근 성적 항 계수(0이면 예전과 같음).
+    _hire_perf_w = float(getattr(_Cpool, "MANAGER_HIRE_PERF_W", 0.0) or 0.0)
+    # [2026-10] 같은 팀 재부임 금지 — (팀, 감독) 집합. 경질 5년 / 계약 만료 2년
+    # (constants.MANAGER_REHIRE_BAN_YEARS). 이번 시장에서 방금 끝난 재임(ends)도 포함.
+    _ban_years = getattr(_Cpool, "MANAGER_REHIRE_BAN_YEARS", {}) or {}
+    _rehire_ban = set()
+    if _ban_years:
+        _maxb = max(_ban_years.values())
+        for r in c.execute(
+                """SELECT team_id, manager_id, end_year, end_reason FROM team_managers
+                   WHERE job_kind='club' AND end_year IS NOT NULL AND end_year > ?""",
+                (year - _maxb,)).fetchall():
+            _b = _ban_years.get(r[3] or "")
+            if _b and year - int(r[2]) < _b:
+                _rehire_ban.add((int(r[0]), int(r[1])))
+        _link_team = {lk["link_id"]: (tid_, lk["manager_id"]) for tid_, lk in cur_mgr.items()}
+        for (_ey, _er, _lid) in ends:
+            if _ban_years.get(_er) and _lid in _link_team:
+                _rehire_ban.add(_link_team[_lid])
+
+    def _pick_from(bins, nats, lo_bin, hi_bin, limit=24, job_bin=None, ok=None,
+                   above_k=0, job_lv=None):
+        """nats 순서대로(앞 국적 우선) 그 국적 버킷에서 후보를 모은다.
+
+        [2026-10 ⑤-4 실험] above_k > 0("mixed"에서만): 정원 안에서 최대 above_k칸을
+        "위에서 내려오기" — career_best_level ≥ job_lv인 후보 중 평판 높은 순(그다음 번호
+        순) — 로 먼저 예약한다. 끌어올리기 칸(정원의 1/4)은 그대로, 근접 칸이 그만큼 준다.
+        국적 순서·창·정원 합계는 그대로(모자라면 근접으로 채운다). 공석 하나(호출 한 번)
+        전체에서 예약은 above_k칸까지.
+
+        [2026-10 ③-3-1] "near"면 한 국적 안에서 자리 칸(job_bin)에 가까운 칸부터,
+        같은 거리끼리는 평판 높은 순 → 번호 순으로 정원까지(constants
+        .MANAGER_POOL_ORDER 주석). "legacy"는 예전처럼 낮은 칸부터 번호 순."""
         out = []
-        for b in range(lo_bin, hi_bin + 1):
-            for mid in bins.get(b, ()):
-                if mid in taken:
-                    continue
-                out.append(mid)
+        _above_used = []
+        for nat in nats:
+            nb = bins.get(nat)
+            if not nb:
+                continue
+            if _pool_order == "near" and job_bin is not None:
+                cand = [(abs(b - job_bin), -float(mgrs[mid].get("reputation") or 0.0), mid)
+                        for b in range(lo_bin, hi_bin + 1)
+                        for mid in nb.get(b, ()) if mid not in taken
+                        and (ok is None or ok(mid))]
+                cand.sort()
+                for _d, _r, mid in cand:
+                    out.append(mid)
+                    if len(out) >= limit:
+                        return out
+                continue
+            if _pool_order == "mixed" and job_bin is not None:
+                # [③-3-1 혼합형] 정원의 3/4는 near(가까운 칸 → 평판), 1/4은 "아래에서
+                # 끌어올리기": 자리 칸보다 낮은 칸의 남은 후보를 평판 높은 순으로.
+                # 아래 후보가 모자라면 near로 마저 채운다(정원 합계 불변).
+                room = limit - len(out)
+                n_below = room // 4
+                near_c = sorted((abs(b - job_bin), -float(mgrs[mid].get("reputation") or 0.0), mid)
+                                for b in range(lo_bin, hi_bin + 1)
+                                for mid in nb.get(b, ()) if mid not in taken
+                                and (ok is None or ok(mid)))
+                near_ids = [m_ for _d, _r, m_ in near_c]
+                # [⑤-4 실험] 위에서 내려오기 예약 칸 — above_k가 0이면 아무것도 안 한다.
+                above = []
+                if above_k > len(_above_used) and job_lv is not None:
+                    _n_ab = min(above_k - len(_above_used), room - n_below)
+                    above = [m_ for _r, m_ in sorted(
+                        (-float(mgrs[m_].get("reputation") or 0.0), m_) for m_ in near_ids
+                        if float(mgrs[m_].get("career_best_level") or 0.0) >= job_lv)][:_n_ab]
+                    _above_used.extend(above)
+                if above:
+                    _ab_set = set(above)
+                    first = above + [m_ for m_ in near_ids if m_ not in _ab_set][:room - n_below - len(above)]
+                else:
+                    first = near_ids[:room - n_below]
+                chosen_set = set(first)
+                below = sorted((-float(mgrs[mid].get(_pull_key) or 0.0), mid)
+                               for b in range(lo_bin, min(hi_bin, job_bin - 1) + 1)
+                               for mid in nb.get(b, ()) if mid not in taken
+                               and (ok is None or ok(mid))
+                               and mid not in chosen_set)
+                pulled = [m_ for _r, m_ in below[:n_below]]
+                chosen_set.update(pulled)
+                # (예약 칸이 없으면 near_ids[room - n_below:] 중 남은 것과 같다)
+                rest = [m_ for m_ in near_ids if m_ not in chosen_set]
+                out.extend(first + pulled + rest[:room - len(first) - len(pulled)])
                 if len(out) >= limit:
-                    return out
+                    return out[:limit]
+                continue
+            for b in range(lo_bin, hi_bin + 1):
+                for mid in nb.get(b, ()):
+                    if mid in taken or (ok is not None and not ok(mid)):
+                        continue
+                    out.append(mid)
+                    if len(out) >= limit:
+                        return out
+        return out
+
+    # 외국인 국적 가중치(④수출력 × ⑤연결 × ⑥수준 적합도)는 (나라, 자리 수준 10단위)
+    # 마다 한 번만 계산한다.
+    from constants import (manager_domestic_prob, manager_foreign_nat_weight,
+                           manager_export_strength)
+    _fw_cache = {}
+
+    def _foreign_nats(country, home, lv_, rng_, k=8):
+        key = (country, int(lv_ // 10))
+        wl = _fw_cache.get(key)
+        if wl is None:
+            wl = [(n, manager_foreign_nat_weight(country, n, lv_))
+                  for n in _nat_present if n != home and n != country]
+            wl = [(n, w) for n, w in wl if w > 0]
+            _fw_cache[key] = wl
+        pool = list(wl)
+        out = []
+        while pool and len(out) < k:
+            tot = sum(w for _n, w in pool)
+            x = rng_.random() * tot
+            for i, (n, w) in enumerate(pool):
+                x -= w
+                if x <= 0:
+                    out.append(n)
+                    pool.pop(i)
+                    break
+            else:
+                out.append(pool.pop()[0])
         return out
 
     # [2026-10 병역 시스템] 군팀 감독은 일반 감독 시장과 분리한다(신민용 확정:
@@ -10677,10 +11292,158 @@ def _manager_turnover(c, year, season=None):
     # 아래 신인 생성으로 가고, 그 국적은 manager_nationality_for로 대한민국.
     # 군대가 없으면 빈 집합이라 아래 필터가 아예 안 돈다(결과 불변).
     from military_service import get_military_team_ids as _get_mil_tids_mgr
+    from military_service import manager_nationality_for as _mil_mgr_nat
     from constants import MILITARY_TARGET_NATIONALITY as _MIL_NAT
     _mil_tids_mgr = _get_mil_tids_mgr(c)
     queue = list(dict.fromkeys(vacancies))     # 중복 제거, 순서 유지
     queue.sort(key=lambda t: -teams.get(t, {}).get("level", 0.0))
+    # [2026-10 6번 ① 감독 시장] 자리 요구 능력(팀 OVR) — 공석이 있을 때만 집계.
+    # 능력 적합도는 후보 점수의 보조축이다(상한/하한·하향 폭·이직 수락은 그대로).
+    import manager_ability as _mab
+    _job_ab = _mab.JobAbility(c) if queue else None
+    # [2026-10 선출 감독 전환] 신인 감독 후보가 될 은퇴 선수 풀 — 공석이 있을 때
+    # 시즌당 한 번만 읽어 국적별로 묶는다(id 순, 결정성). 이미 감독인 선수는 뺀다.
+    _xp_pool = _explayer_pool(c, year) if queue else {}
+    # [2026-10 ⑤ 계측 — 순수 관찰, 난수·상태 불변] 51~200위(팀 OVR 순위) 클럽에 있는
+    # 능력 90+ 현직 감독이 상위 50 공석에서 어느 단계에서 멈추는지 센다.
+    # constants.MANAGER_MOVE_TRACE가 True일 때만(기본 False). 결과는 stats["mtrace"].
+    _tr_on = bool(getattr(_Cpool, "MANAGER_MOVE_TRACE", False)) and _job_ab is not None
+    if _tr_on:
+        _tr_rank = {t_: i + 1 for i, t_ in enumerate(
+            sorted(_job_ab.tovr, key=lambda x_: -_job_ab.tovr[x_]))}
+        _tr_T = {m_: t_ for m_, t_ in busy.items()
+                 if float(mgrs[m_].get("manager_ability") or 0.0) >= 90.0
+                 and 51 <= _tr_rank.get(t_, 99999) <= 200}
+        _tr = {"targets": len(_tr_T), "top50_vac": 0, "pairs": {}, "best": {},
+               "fill": {}, "fill_ab": [], "gain_gap": [],
+               # [⑤ Step 0] 사유 병렬 기록 — 한 쌍마다 조건을 전부 따로 판정한다.
+               "pre_fail": {}, "stage2": {}, "fill_detail": []}
+        _TR_STAGE = ("not_in_pool", "ceiling", "outscored", "declined", "moved")
+
+    # ══ [2026-10 ⑤-1, 신민용 확정] 상위 자리 "국적 무관 추가 칸" ════════════
+    # 자리 수준이 MANAGER_EXTRA_SLOT_MIN_LEVEL 이상인 공석에서만, 국적 계획과 별개로
+    # 평판 높은 순(시장에 공개된 신호 — 숨은 능력은 안 읽는다) 후보
+    # MANAGER_EXTRA_SLOT_N명을 더 넣는다. 후보 창(칸 범위)·현직 이득 8·이직 예산·
+    # 재부임 금지·군팀 규칙·상한/하한·점수·수락은 전부 기존 그대로 — 들어올 기회만
+    # 생긴다. 스위치(MANAGER_EXTRA_SLOT_ENABLED)가 꺼져 있으면 아무것도 안 한다.
+    _xs_on = bool(getattr(_Cpool, "MANAGER_EXTRA_SLOT_ENABLED", False))
+    _xs_n = int(getattr(_Cpool, "MANAGER_EXTRA_SLOT_N", 4))
+    _xs_min = float(getattr(_Cpool, "MANAGER_EXTRA_SLOT_MIN_LEVEL", 100.0))
+    # [2026-10 ⑤-1 변형, 신민용 확정] "foreign" = 공석이 이미 외국인 감독 쪽으로 정해진
+    # 경우에만, 그 공석이 뽑은 국적들(최대 8) + 자국 밖에서 추가 칸을 채운다 — 자국/외국
+    # 결정은 그대로. "all" = 원안(국적 계획 무관, 기본 꺼짐으로 보류된 방식).
+    _xs_mode = str(getattr(_Cpool, "MANAGER_EXTRA_SLOT_MODE", "all"))
+    _xs_free, _xs_move = {}, {}
+    _xs_stats = {"vac": 0, "added": 0, "hires": []}
+    if _xs_on:
+        for _src, _dst in ((free_bins, _xs_free), (move_bins, _xs_move)):
+            for _nb in _src.values():
+                for _b, _lst in _nb.items():
+                    _dst.setdefault(_b, []).extend(_lst)
+            for _b in _dst:
+                _dst[_b].sort(key=lambda m_: (-float(mgrs[m_].get("reputation") or 0.0), m_))
+
+    def _extra_pick(lo_, hi_, hi_mv_, have_, lv_, can_move_, excl_nats=None, to_tid_x=None):
+        out_ = []
+        for _b in range(lo_, hi_ + 1):
+            k_ = 0
+            for m_ in _xs_free.get(_b, ()):
+                if m_ in taken or m_ in have_ or m_ in busy:
+                    continue
+                if excl_nats and (mgrs[m_].get("nationality") or "") in excl_nats:
+                    continue
+                out_.append((-float(mgrs[m_].get("reputation") or 0.0), m_, False))
+                k_ += 1
+                if k_ >= _xs_n:
+                    break
+        if can_move_:
+            for _b in range(lo_, hi_mv_ + 1):
+                k_ = 0
+                for m_ in _xs_move.get(_b, ()):
+                    if m_ in taken or m_ in have_ or m_ not in busy:
+                        continue
+                    if excl_nats and (mgrs[m_].get("nationality") or "") in excl_nats:
+                        continue
+                    if _move_gain(m_, to_tid_x, lv_) < MANAGER_MOVE_MIN_GAIN:
+                        continue
+                    out_.append((-float(mgrs[m_].get("reputation") or 0.0), m_, True))
+                    k_ += 1
+                    if k_ >= _xs_n:
+                        break
+        out_.sort()
+        return [(m_, mv_) for _r, m_, mv_ in out_[:_xs_n]]
+
+    # ══ [2026-10 ⑤-3 실험, 신민용 확정] 실질 이득 ═══════════════════════════
+    # 현직 이직 이득 = max(자리 수준 이득, k × (새 팀 OVR − 지금 팀 OVR)).
+    # 같은 리그·같은 명문 등급이면 자리 수준 이득이 0이라 60위 → 10위 같은 실제 승진이
+    # 막혔다(⑤ 계측: 이득 미달 쌍 중 이득 0이 최다). 문턱(MANAGER_MOVE_MIN_GAIN)은
+    # 그대로, 현직 후보 칸 범위도 이 기준으로 넓힌다(자리 수준 칸으로 자르지 않고
+    # 실질 이득으로 거른다). 수락 확률·상한·하한·점수는 기존 그대로(수락 확률은
+    # 예전처럼 자리 수준 이득으로 계산). 스위치가 꺼져 있으면 예전과 같다.
+    _eg_on = bool(getattr(_Cpool, "MANAGER_EFFECTIVE_GAIN_ENABLED", False)) and _job_ab is not None
+    _eg_k = float(getattr(_Cpool, "MANAGER_EFFECTIVE_GAIN_K", 2.0))
+    # [2026-10 ⑤-3 보완 ①, 신민용 확정] 실질 이득은 자리 수준이 이 값 이상인 공석에만
+    # (전체 적용은 하위 리그 연쇄 이직 ×3.2로 폐기). 그 아래 자리는 예전 이득 그대로.
+    _eg_min = float(getattr(_Cpool, "MANAGER_EFFECTIVE_GAIN_MIN_LEVEL", 0.0) or 0.0)
+
+    def _move_gain(mid_, to_tid_, to_lv_):
+        """현직 mid_가 to_tid_(자리 수준 to_lv_)로 옮길 때의 이득(⑤-3 스위치 반영)."""
+        cur_t = busy.get(mid_)
+        g = to_lv_ - teams.get(cur_t, {}).get("level", 0.0)
+        if _eg_on and cur_t is not None and to_lv_ >= _eg_min:
+            o_new = _job_ab.tovr.get(to_tid_)
+            o_cur = _job_ab.tovr.get(cur_t)
+            if o_new is not None and o_cur is not None:
+                g = max(g, _eg_k * (o_new - o_cur))
+        return g
+
+    # ══ [2026-10 ⑤-2 실험] 무직/현직 후보 정원 비대칭 ════════════════════════
+    # 자리 수준 _ps_min 이상 공석에서만 정원을 무직 24/현직 12 → _ps_free/_ps_move로.
+    # 스위치가 꺼져 있으면 예전 정원(24/12) 그대로라 결과가 비트 단위로 같다.
+    _ps_on = bool(getattr(_Cpool, "MANAGER_POOL_SPLIT_ENABLED", False))
+    _ps_min = float(getattr(_Cpool, "MANAGER_POOL_SPLIT_MIN_LEVEL", 100.0))
+    _ps_free = int(getattr(_Cpool, "MANAGER_POOL_SPLIT_FREE", 24))
+    _ps_move = int(getattr(_Cpool, "MANAGER_POOL_SPLIT_MOVE", 12))
+    # [⑤-2 계측 — 순수 관찰] 자리 수준 _ps_min 이상 공석마다 후보 풀·점수·수락 단계를
+    # 기록한다(MANAGER_MOVE_TRACE가 켜졌을 때만). 난수·상태를 건드리지 않는다.
+    _ps_log = []
+    # ══ [2026-10 ⑤-4 1차 실험, 신민용 확정] 무직 기간에 따른 후보 창 완화 ══════════
+    # 무직 후보는 career_best_level 칸으로 묶여 "최고 경력 ≤ 공석 + 25"일 때만 후보가 된다.
+    # 켜지면 허용 거리를 무직 기간에 따라 25/30/35/40으로 넓힌다 — 넓힌 칸에서는 그 무직의
+    # 허용 거리 안에 드는 감독만 들어온다. 하한·하향 폭·수락·정원·점수·국적은 그대로.
+    # 꺼져 있으면 예전과 비트 단위로 같다.
+    _jw_on = bool(getattr(_Cpool, "MANAGER_JOBLESS_WINDOW_ENABLED", False))
+    _jw_base = float(getattr(_Cpool, "MANAGER_JOBLESS_WINDOW_BASE", 25.0))
+    _jw_step = float(getattr(_Cpool, "MANAGER_JOBLESS_WINDOW_STEP", 5.0))
+    _jw_every = max(1, int(getattr(_Cpool, "MANAGER_JOBLESS_WINDOW_EVERY", 2)))
+    _jw_maxs = int(getattr(_Cpool, "MANAGER_JOBLESS_WINDOW_MAX_STEPS", 3))
+    _jw_max = _jw_base + _jw_step * _jw_maxs
+
+    def _jw_allow(m_):
+        js_ = mgrs[m_].get("jobless_since")
+        jl_ = max(0, year - int(js_)) if js_ else 0
+        return _jw_base + _jw_step * min(_jw_maxs, jl_ // _jw_every)
+    _jw_stats = {"wide_pool": 0, "wide_hired": 0, "wide_hires": []}
+    # ══ [2026-10 ⑤-4 실험, 신민용 확정] 무직 풀 "위에서 내려오기" 예약 칸 ══════════════
+    # 무직 후보 정원(24) 안에서 MANAGER_ABOVE_SLOT_N칸을 career_best_level ≥ 공석 수준인 무직
+    # (평판 순)에게 먼저 준다. 능력 조건 없음. 국적 계획·창·점수·수락·정원 합계는 그대로.
+    # 꺼져 있으면 예전과 비트 단위로 같다. 켜지면 "원래 풀이었으면 빠졌을 후보"를 따로 센다.
+    _ab_on = bool(getattr(_Cpool, "MANAGER_ABOVE_SLOT_ENABLED", False)) and _pool_order == "mixed"
+    _ab_k = int(getattr(_Cpool, "MANAGER_ABOVE_SLOT_N", 4)) if _ab_on else 0
+    _ab_stats = {"vac_added": 0, "added": 0, "added_rows": [], "hired": []}
+    # ══ [2026-10 ⑤-4 계측 — 순수 관찰, 난수·상태 불변] 85+ 무직 감독이 공석마다 어디서 멈추나 ══
+    # MANAGER_MOVE_TRACE가 켜졌을 때만. 대상 = 시장 시작 시점 무직 & 능력 85+. 공석마다 대상
+    # 감독이 그 자리에 "적합"(상한·하한 통과)한지 먼저 보고, 적합한 자리에서 막힌 첫 단계를
+    # 센다: 재부임 금지 → 신인 자리 → 국적 계획 → 후보 창 → 풀 정원 → (패스 적합 탈락) →
+    # 하향 굴림 → 점수에서 밀림 → 부임. 결과는 stats["jtrace"].
+    _jt_on = _tr_on
+    if _jt_on:
+        from constants import manager_max_level as _jt_maxlv, manager_career_floor as _jt_floor
+        _jt_T = sorted(m_ for m_ in free_ids
+                       if float(mgrs[m_].get("manager_ability") or 0.0) >= 85.0)
+        _jt = {"T": len(_jt_T), "stage": {}, "unfit": {"ceil": 0, "floor": 0},
+               "combo": {}, "per_mgr": {}, "lost_to": [], "cut": []}
+    _mv_log = []            # [⑤ 계측] 현직 이동 [from, to, 자리 이득, OVR 차, 실질 이득으로만 통과, 능력]
     guard = 0
     while queue and guard < len(teams) * 2:
         guard += 1
@@ -10690,6 +11453,31 @@ def _manager_turnover(c, year, season=None):
             continue
         lv = t["level"]
         vr = random.Random(zlib.crc32(f"hire:{salt}:{tid}:{year}".encode("utf-8")))
+        _req_ab = _job_ab.club(tid, lv)
+        _tr_vac = _tr_on and _tr_rank.get(tid, 99999) <= 50
+        # [⑤-2] 이 공석의 후보 정원(현직, 무직).
+        _lim_mv, _lim_fr = ((_ps_move, _ps_free) if (_ps_on and lv >= _ps_min) else (12, 24))
+        _ps_tr = None
+        if _tr_on and lv >= _ps_min:
+            # p0_* = 첫 패스(정해진 국적·정상 창). decl/skip/passes = 전체 패스 누적.
+            _ps_tr = {"p0_mv_pool": None, "p0_fr_pool": None, "p0_mv_fit": None,
+                      "p0_fr_fit": None, "p0_top": None, "p0_first_mv": None,
+                      "decl": 0, "skip": 0, "pass": -1, "passes": 0}
+        if _tr_vac:
+            _tr_pre = {m_: (busy[m_], move_budget) for m_ in _tr_T
+                       if m_ in busy and m_ not in taken}
+            _tr_stage = {m_: 0 for m_ in _tr_pre}
+            _tr_nats = set()
+            _tr_kind = None
+        _xs_ids = set()         # [⑤-1] 이 공석에서 추가 칸으로 들어온 후보
+        _ab_added = set()       # [⑤-4] 이 공석에서 예약 칸 때문에 새로 풀에 든 무직
+        if _jt_on:
+            _jt_pool, _jt_scored, _jt_skip = set(), set(), set()
+            _jt_win = None          # (최소 lo, 최대 hi) — 실제로 돈 패스들의 무직 후보 창
+            _jt_searched = False
+            _jt_nats_run = []       # 실제로 돈 패스의 국적 계획(순서 유지, 중복 제거)
+        _ch_base, _ch_move = None, False
+        _xs_here = False        # 이 공석에 추가 칸을 쓰는가(모드·자리 수준·자국/외국 결정)
 
         # 신인을 데뷔시킬 수 있는 자리인가 — 하위 자리는 자유롭고, 높은
         # 자리는 경력자만 간다. 이 게이트가 없으면 5대 리그 공석이 신인으로
@@ -10703,8 +11491,32 @@ def _manager_turnover(c, year, season=None):
                 (MANAGER_ROOKIE_MAX_LEVEL - lv)
                 / (MANAGER_ROOKIE_MAX_LEVEL - MANAGER_ROOKIE_FULL_LEVEL))
 
+        # [2026-10 감독 국적 시장] ①②③ 이 자리가 자국 감독을 뽑을지 먼저 정하고,
+        # 외국인이면 ④⑤⑥ 가중치로 국적 후보를 뽑는다. 정해진 쪽에 맞는 감독이
+        # 없으면 반대쪽으로 한 번 더 찾는다(외국 → 자국, 자국 → 외국은 신인을
+        # 데뷔시킬 수 없는 높은 자리만). 군팀은 지금처럼 한국인만.
+        _home = _mil_mgr_nat(t["country"])
+        if tid in _mil_tids_mgr:
+            _p_dom = 1.0
+        else:
+            _p_dom = manager_domestic_prob(t["country"], t.get("tier"), t.get("prestige"))
+        _side_dom = _p_dom >= 1.0 or vr.random() < _p_dom
+        if _side_dom:
+            _nat_plans = [[_home]]
+            if lv >= MANAGER_ROOKIE_MAX_LEVEL and _p_dom < 1.0:
+                _nat_plans.append(_foreign_nats(t["country"], _home, lv, vr))
+        else:
+            _nat_plans = [_foreign_nats(t["country"], _home, lv, vr), [_home]]
+
+        if _xs_on and lv >= _xs_min and (_xs_mode != "foreign" or not _side_dom):
+            _xs_here = True
+            _xs_stats["vac"] += 1
+        # [⑤-1 변형] 외국인 쪽 공석이면 이미 뽑힌 국적 + 자국은 추가 칸에서 뺀다.
+        _xs_excl = (set(_nat_plans[0]) | {_home}) if (_xs_here and _xs_mode == "foreign") else None
         chosen = None
         if vr.random() >= rookie_p:
+            if _jt_on:
+                _jt_searched = True
             # 후보 창은 상한과 같다. 한 바퀴에서 아무도 못 구하면(후보가
             # 없거나 전원이 이직을 거절) 상한을 STRETCH만큼 넓혀 다시 훑는다
             # — "한 단계 아래에서 끌어올리기".
@@ -10718,7 +11530,21 @@ def _manager_turnover(c, year, season=None):
                      MANAGER_CAND_WINDOW + MANAGER_HIRE_STRETCH_EXTRA]
             if lv >= MANAGER_ROOKIE_MAX_LEVEL:
                 _caps.append(None)          # None = 상한 검사 생략
-            for cap in _caps:
+            # 순서: 정해진 쪽(정상 → 끌어올리기) → 반대쪽(정상 → 끌어올리기) →
+            # 상한 무시(정해진 쪽 → 반대쪽). 반대쪽의 '자격 있는' 감독이 정해진
+            # 쪽의 '상한 무시' 감독보다 먼저다.
+            _passes = [(n_, c_) for n_ in _nat_plans for c_ in _caps if c_ is not None]
+            if None in _caps:
+                _passes += [(n_, None) for n_ in _nat_plans]
+            _ps_pi = -1
+            for _nats, cap in _passes:
+                _ps_pi += 1
+                if _tr_vac:
+                    _tr_nats.update(_nats)
+                # 넓혀도 의미가 없는 자리(신인이 가도 되는 낮은 자리)면 두 번째
+                # 패스를 돌지 않는다 — 국적 계획(외국 → 자국)마다 첫 패스만.
+                if lv < MANAGER_ROOKIE_MAX_LEVEL and cap != _caps[0]:
+                    continue
                 no_ceiling = cap is None
                 if no_ceiling:
                     cap = MANAGER_CAND_WINDOW + MANAGER_HIRE_STRETCH_EXTRA
@@ -10729,12 +11555,73 @@ def _manager_turnover(c, year, season=None):
                 cands = []
                 # 현직 이직 후보 — 지금 자리보다 충분히 좋은 자리일 때만.
                 if move_budget > 0:
-                    for mid in _pick_from(move_bins, lo, hi, limit=12):
-                        cur_lv = teams.get(busy.get(mid), {}).get("level", 0.0)
-                        if lv - cur_lv >= MANAGER_MOVE_MIN_GAIN:
+                    # [③-3-1] "near"에선 이직 이득(MOVE_MIN_GAIN)이 안 되는 칸은
+                    # 애초에 안 본다 — 가까운 칸부터 채우면 곧바로 아래 이득
+                    # 검사에서 탈락할 후보로 정원 12가 차 버린다.
+                    _hi_m = (min(hi, int((lv - MANAGER_MOVE_MIN_GAIN) // BIN))
+                             if _pool_order in ("near", "mixed") else hi)
+                    if _eg_on and lv >= _eg_min:
+                        # [⑤-3] 칸 범위는 자리 수준이 아니라 실질 이득으로 거른다 —
+                        # 같은 수준 칸의 현직도 팀 OVR 차가 충분하면 후보가 된다.
+                        _ok_mv = (lambda m_, _t=tid, _l=lv:
+                                  _move_gain(m_, _t, _l) >= MANAGER_MOVE_MIN_GAIN)
+                        _picked_mv = _pick_from(move_bins, _nats, lo, hi, limit=_lim_mv,
+                                                job_bin=int(lv // BIN), ok=_ok_mv)
+                    else:
+                        _picked_mv = _pick_from(move_bins, _nats, lo, _hi_m, limit=_lim_mv,
+                                                job_bin=int(lv // BIN))
+                    for mid in _picked_mv:
+                        if _move_gain(mid, tid, lv) >= MANAGER_MOVE_MIN_GAIN:
                             cands.append((mid, True))
-                for mid in _pick_from(free_bins, lo, hi, limit=24):
+                if _ab_on:
+                    _picked_fr = _pick_from(free_bins, _nats, lo, hi, limit=_lim_fr,
+                                            job_bin=int(lv // BIN), above_k=_ab_k, job_lv=lv)
+                    # 관찰: 예약 칸이 없었다면 풀에 없었을 후보(같은 함수, 난수 없음).
+                    _orig_fr = set(_pick_from(free_bins, _nats, lo, hi, limit=_lim_fr,
+                                              job_bin=int(lv // BIN)))
+                    _new_ab = [m_ for m_ in _picked_fr if m_ not in _orig_fr]
+                    if _new_ab and not _ab_added:
+                        _ab_stats["vac_added"] += 1
+                    for m_ in _new_ab:
+                        if m_ not in _ab_added:
+                            _ab_added.add(m_)
+                            _ab_stats["added"] += 1
+                            if len(_ab_stats["added_rows"]) < 3000:
+                                _mma = mgrs[m_]
+                                _ab_stats["added_rows"].append([
+                                    int(_mma.get("manager_ability") or 0),
+                                    round(float(_mma.get("career_best_level") or 0.0), 1),
+                                    round(float(lv), 1),
+                                    round(float(_mma.get("reputation") or 0.0), 1)])
+                elif _jw_on:
+                    # [⑤-4 1차] 예전 창 위(hi 초과) 칸은 무직 기간별 허용 거리 안인 감독만.
+                    _hi_w = int((lv + _jw_max) // BIN)
+                    _ok_fr = (lambda m_, _h=hi, _l=lv:
+                              int((mgrs[m_].get("career_best_level") or 0.0) // BIN) <= _h
+                              or int((mgrs[m_].get("career_best_level") or 0.0) // BIN)
+                              <= int((_l + _jw_allow(m_)) // BIN))
+                    _picked_fr = _pick_from(free_bins, _nats, lo, max(hi, _hi_w), limit=_lim_fr,
+                                            job_bin=int(lv // BIN), ok=_ok_fr)
+                else:
+                    _picked_fr = _pick_from(free_bins, _nats, lo, hi, limit=_lim_fr,
+                                            job_bin=int(lv // BIN))
+                for mid in _picked_fr:
                     cands.append((mid, False))
+                    if _jw_on and int((mgrs[mid].get("career_best_level") or 0.0) // BIN) > hi:
+                        _jw_stats["wide_pool"] += 1
+                if _xs_here:
+                    # [⑤-1] 국적 무관 추가 칸 — 이미 후보인 감독은 빼고 평판 순.
+                    _hi_mv = (hi if (_eg_on and lv >= _eg_min)
+                              else min(hi, int((lv - MANAGER_MOVE_MIN_GAIN) // BIN)))
+                    for m_, mv_ in _extra_pick(lo, hi, _hi_mv, {m__ for m__, _x in cands},
+                                               lv, move_budget > 0, excl_nats=_xs_excl,
+                                               to_tid_x=tid):
+                        cands.append((m_, mv_))
+                        if m_ not in _xs_ids:
+                            _xs_ids.add(m_)
+                            _xs_stats["added"] += 1
+                if _rehire_ban:
+                    cands = [(m_, mv_) for (m_, mv_) in cands if (tid, m_) not in _rehire_ban]
                 if _mil_tids_mgr:
                     if tid in _mil_tids_mgr:
                         cands = [(m_, mv_) for (m_, mv_) in cands
@@ -10742,6 +11629,22 @@ def _manager_turnover(c, year, season=None):
                     else:
                         cands = [(m_, mv_) for (m_, mv_) in cands
                                  if not (mv_ and busy.get(m_) in _mil_tids_mgr)]
+                if _tr_vac:
+                    for m_, _mv in cands:
+                        if m_ in _tr_stage:
+                            _tr_stage[m_] = max(_tr_stage[m_], 1)
+                if _jt_on:
+                    for n_ in _nats:
+                        if n_ not in _jt_nats_run:
+                            _jt_nats_run.append(n_)
+                    _jt_win = ((lo, hi) if _jt_win is None
+                               else (min(_jt_win[0], lo), max(_jt_win[1], hi)))
+                    _jt_pool.update(m_ for m_, _v in cands if not _v)
+                if _ps_tr is not None:
+                    _ps_tr["passes"] += 1
+                    if _ps_tr["p0_mv_pool"] is None:
+                        _ps_tr["p0_mv_pool"] = sum(1 for _m, _v in cands if _v)
+                        _ps_tr["p0_fr_pool"] = sum(1 for _m, _v in cands if not _v)
                 # ══ ③-c 상한/하한 검사 ══════════════════════════
                 # 신민용 도식: 후보 전체 → 상한 검사(너무 높은가) +
                 # 하한 검사(너무 낮은가) → 적합 후보 → 확률.
@@ -10772,9 +11675,14 @@ def _manager_turnover(c, year, season=None):
                     rep = float(mm.get("reputation") or 0.0)
                     cbl = float(mm.get("career_best_level") or 0.0)
                     rlv = float(mm.get("recent_level") or 0.0)
+                    # [6번 ①] 능력 적합도 — 보조축(스위치 off면 0.0이라 예전과 같다).
                     score = (-abs(max(cbl, rlv) - lv) + rep * 0.12 + bonus
+                             + _mab.ability_fit_bonus(mm.get("manager_ability"), _req_ab)
+                             + _hire_perf_w * float(mm.get("recent_perf") or 0.0)
                              + vr.uniform(0, MANAGER_HIRE_NOISE))
                     scored.append((score, mid, is_move, base_lv))
+                    if _tr_vac and mid in _tr_stage:
+                        _tr_stage[mid] = max(_tr_stage[mid], 2)
 
                 # 점수 순으로 **차례대로** 시도한다. 1순위만 보고 끝내면 그
                 # 후보가 현직이고 이직을 거절했을 때 곧바로 신인 생성으로
@@ -10782,6 +11690,13 @@ def _manager_turnover(c, year, season=None):
                 # 상한 초과 31명, 그 시즌 끌어올림 0건. 후보가 없어서가 아니라
                 # 거절당해서였다).
                 scored.sort(key=lambda x: -x[0])
+                if _jt_on:
+                    _jt_scored.update(x_[1] for x_ in scored if not x_[2])
+                if _ps_tr is not None and _ps_tr["p0_mv_fit"] is None:
+                    _ps_tr["p0_mv_fit"] = sum(1 for x_ in scored if x_[2])
+                    _ps_tr["p0_fr_fit"] = sum(1 for x_ in scored if not x_[2])
+                    _ps_tr["p0_top"] = (None if not scored else ("move" if scored[0][2] else "free"))
+                    _ps_tr["p0_first_mv"] = next((i_ for i_, x_ in enumerate(scored) if x_[2]), None)
                 for _s, mid, is_move, base_lv in scored:
                     # ③-c 하향 폭 계수 — 하한 안쪽이라도 많이 내려가는
                     # 자리는 잘 안 간다(같은 수준 1.0 / 1단계 0.85 /
@@ -10791,16 +11706,54 @@ def _manager_turnover(c, year, season=None):
                         # 무직의 재취업 — 하향 폭만 본다(무직은 이미
                         # 실직 기간만큼 하한이 내려가 있다).
                         if step < 1.0 and vr.random() >= step:
+                            if _ps_tr is not None:
+                                _ps_tr["skip"] += 1
+                            if _jt_on:
+                                _jt_skip.add(mid)
                             continue
                         chosen = mid
+                        _ch_base, _ch_move = base_lv, False
                         stats["rehired"] += 1
+                        if _ab_on and mid in _ab_added:
+                            _mmh = mgrs[mid]
+                            _ab_stats["hired"].append([
+                                int(mid), int(tid), round(float(lv), 1),
+                                round(float(_mmh.get("career_best_level") or 0.0), 1),
+                                int(_mmh.get("manager_ability") or 0),
+                                round(float(_mmh.get("reputation") or 0.0), 1),
+                                bool((_mmh.get("nationality") or "") == _home),
+                                (int(_tr_rank.get(tid, 99999)) if _tr_on else None)])
+                        if _jw_on:
+                            _cb_w = float(mgrs[mid].get("career_best_level") or 0.0)
+                            if int(_cb_w // BIN) > hi:
+                                _js_w = mgrs[mid].get("jobless_since")
+                                _jw_stats["wide_hired"] += 1
+                                _jw_stats["wide_hires"].append([
+                                    int(mid), int(tid), round(float(lv), 1), round(_cb_w, 1),
+                                    round(float(base_lv), 1),
+                                    int(mgrs[mid].get("manager_ability") or 0),
+                                    (max(0, year - int(_js_w)) if _js_w else 0)])
                         break
                     cur_lv = teams.get(busy[mid], {}).get("level", 0.0)
                     acc = min(MANAGER_MOVE_ACCEPT_MAX,
                               MANAGER_MOVE_ACCEPT_BASE
                               + (lv - cur_lv) * MANAGER_MOVE_ACCEPT_SLOPE) * step
                     if vr.random() >= acc:
+                        if _tr_vac and mid in _tr_stage:
+                            _tr_stage[mid] = max(_tr_stage[mid], 3)
+                        if _ps_tr is not None:
+                            _ps_tr["decl"] += 1
                         continue               # 거절 — 다음 후보로
+                    if _tr_on:
+                        _o_new = _job_ab.tovr.get(tid)
+                        _o_cur = _job_ab.tovr.get(busy[mid])
+                        _raw_g = lv - cur_lv
+                        _mv_log.append([int(busy[mid]), int(tid), round(_raw_g, 1),
+                                        (round(_o_new - _o_cur, 2) if (_o_new is not None and
+                                         _o_cur is not None) else None),
+                                        bool(_raw_g < MANAGER_MOVE_MIN_GAIN),
+                                        int(mgrs[mid].get("manager_ability") or 0),
+                                        round(float(lv), 1)])
                     old_tid = busy.pop(mid)
                     old_link = cur_mgr.get(old_tid)
                     if old_link:
@@ -10810,22 +11763,228 @@ def _manager_turnover(c, year, season=None):
                     move_budget -= 1
                     stats["moved"] += 1
                     chosen = mid
+                    _ch_base, _ch_move = base_lv, True
+                    if _tr_vac:
+                        _tr_kind = "move"
                     break
 
                 if chosen is not None:
+                    if _ps_tr is not None:
+                        _ps_tr["pass"] = _ps_pi
                     if cap_slack > 0:
                         stats["stretched"] += 1
-                    break
-                # 넓혀도 의미가 없는 자리(신인이 가도 되는 낮은 자리)면
-                # 두 번째 패스를 돌지 않는다.
-                if lv < MANAGER_ROOKIE_MAX_LEVEL:
                     break
 
         if chosen is None and lv >= MANAGER_ROOKIE_MAX_LEVEL:
             stats["rookie_forced"] += 1
 
+        if _jt_on and _jt_T:
+            _nat_all = {n_ for pl_ in _nat_plans for n_ in pl_}
+            for m_ in _jt_T:
+                if m_ in taken and m_ != chosen:
+                    continue
+                mm_ = mgrs[m_]
+                pm_ = _jt["per_mgr"].setdefault(str(m_), {
+                    "ab": int(mm_.get("manager_ability") or 0),
+                    "cb": float(mm_.get("career_best_level") or 0.0),
+                    "nation": mm_.get("nationality") or "", "elig": 0, "hired": 0})
+                if m_ == chosen:
+                    st_ = "hired"
+                else:
+                    js_ = mm_.get("jobless_since")
+                    jl_ = max(0, year - int(js_)) if js_ else 0
+                    rlv_ = float(mm_.get("recent_level") or 0.0)
+                    bly_ = int(mm_.get("best_level_year") or 0)
+                    if lv > _jt_maxlv(float(mm_.get("career_best_level") or 0.0), rlv_,
+                                      float(mm_.get("reputation") or 0.0),
+                                      max(0, year - bly_) if bly_ else 0,
+                                      float(mm_.get("recent_perf") or 0.0)):
+                        _jt["unfit"]["ceil"] += 1
+                        continue
+                    if lv < _jt_floor(rlv_, float(mm_.get("reputation") or 0.0), jl_):
+                        _jt["unfit"]["floor"] += 1
+                        continue
+                    _cbb = int(float(mm_.get("career_best_level") or 0.0) // BIN)
+                    # 병렬 판정(관찰): 국적·창·금지를 각각 따로.
+                    _cf = []
+                    if (mm_.get("nationality") or "") not in _nat_all:
+                        _cf.append("nat")
+                    _hi0 = int((lv + 25.0) // BIN)
+                    _lo0 = int((lv - MANAGER_CAND_WINDOW - MANAGER_HIRE_STRETCH_EXTRA) // BIN)
+                    if not (_lo0 <= _cbb <= _hi0):
+                        _cf.append("window")
+                    if (tid, m_) in _rehire_ban:
+                        _cf.append("ban")
+                    _ck_ = "+".join(_cf) or "none"
+                    _jt["combo"][_ck_] = _jt["combo"].get(_ck_, 0) + 1
+                    if (tid, m_) in _rehire_ban:
+                        st_ = "ban"
+                    elif not _jt_searched:
+                        st_ = "rookie_slot"
+                    elif (mm_.get("nationality") or "") not in _nat_all:
+                        st_ = "nat"
+                    elif (mm_.get("nationality") or "") not in _jt_nats_run:
+                        # 반대쪽(대체) 국적 계획에만 있는데, 앞 계획에서 이미 뽑혀 그 계획은 안 돌았다.
+                        st_ = "nat_fallback"
+                    elif _jt_win is None or not (_jt_win[0] <= _cbb <= _jt_win[1]):
+                        st_ = "window"
+                    elif m_ not in _jt_pool and sum(
+                            len([m2 for b2 in range(_jt_win[0], _jt_win[1] + 1)
+                                 for m2 in (free_bins.get(n__) or {}).get(b2, ())
+                                 if m2 not in taken])
+                            for n__ in _jt_nats_run[:_jt_nats_run.index(mm_.get("nationality") or "")]
+                    ) >= _lim_fr:
+                        # 같은 계획의 앞 국적들(창 안 무직)만으로 정원이 이미 찬다.
+                        st_ = "nat_order"
+                    elif m_ not in _jt_pool:
+                        st_ = "pool_cut"
+                        # [관찰] 왜 잘렸나 — 국적 계획 안 순번(몇 번째 계획·그 안 몇 번째 국적),
+                        # 그 국적 칸에서의 근접 순위·"위에서" 평판 순위, 앞 국적들의 창 안 후보 수.
+                        if len(_jt["cut"]) < 3000:
+                            _nm = mm_.get("nationality") or ""
+                            _pi = next((i_ for i_, pl_ in enumerate(_nat_plans) if _nm in pl_), -1)
+                            _pl = _nat_plans[_pi] if _pi >= 0 else []
+                            _ni = _pl.index(_nm) if _nm in _pl else -1
+                            _lo1, _hi1 = (_jt_win if _jt_win is not None else (0, 0))
+                            _jb = int(lv // BIN)
+
+                            def _inwin(n__):
+                                nb__ = free_bins.get(n__) or {}
+                                return [m2 for b2 in range(_lo1, _hi1 + 1)
+                                        for m2 in nb__.get(b2, ()) if m2 not in taken or m2 == m_]
+                            _own = _inwin(_nm)
+                            _near = sorted(_own, key=lambda m2: (
+                                abs(int(float(mgrs[m2].get("career_best_level") or 0.0) // BIN) - _jb),
+                                -float(mgrs[m2].get("reputation") or 0.0), m2))
+                            _abv = sorted((m2 for m2 in _own
+                                           if float(mgrs[m2].get("career_best_level") or 0.0) >= lv),
+                                          key=lambda m2: (-float(mgrs[m2].get("reputation") or 0.0), m2))
+                            _before = sum(len(_inwin(n__)) for n__ in _pl[:max(0, _ni)])
+                            _jt["cut"].append([
+                                _pi, _ni, len(_pl), bool(_nm == _home), _before, len(_own),
+                                (_near.index(m_) if m_ in _near else None),
+                                (_abv.index(m_) if m_ in _abv else None),
+                                round(float(mm_.get("reputation") or 0.0), 1),
+                                round(float(mm_.get("career_best_level") or 0.0) - float(lv), 1),
+                                int(mm_.get("manager_ability") or 0)])
+                    elif m_ not in _jt_scored:
+                        st_ = "unfit_in_pass"
+                    elif m_ in _jt_skip:
+                        st_ = "step_skip"
+                    else:
+                        st_ = "outscored"
+                        if chosen is not None and len(_jt["lost_to"]) < 400:
+                            _jt["lost_to"].append([
+                                int(mm_.get("manager_ability") or 0),
+                                int(mgrs[chosen].get("manager_ability") or 0),
+                                ("move" if _ch_move else "free"), round(float(lv), 1),
+                                round(float(mm_.get("career_best_level") or 0.0), 1),
+                                round(float(mgrs[chosen].get("career_best_level") or 0.0), 1)])
+                pm_["elig"] += 1
+                if st_ == "hired":
+                    pm_["hired"] = 1
+                else:
+                    pm_[st_] = pm_.get(st_, 0) + 1
+                _jt["stage"][st_] = _jt["stage"].get(st_, 0) + 1
+
+        if _ps_tr is not None:
+            # [⑤-2 계측] [팀, 팀 OVR 순위, 자리 수준, 팀 OVR, 요구 능력, 부임 종류,
+            #  부임자 능력, 평판, 국적이 자국인가, 부임 패스, 첫 패스 현직/무직 풀·적합·
+            #  1순위 종류·첫 현직 순번, 거절 수, 하향 건너뜀 수, 패스 수]
+            _ck = ("rookie" if chosen is None else ("move" if _ch_move else "free"))
+            _cmm = mgrs.get(chosen) if chosen is not None else None
+            _ps_log.append([
+                int(tid), int(_tr_rank.get(tid, 99999)), round(float(lv), 1),
+                (round(float(_job_ab.tovr[tid]), 2) if tid in _job_ab.tovr else None),
+                (round(float(_req_ab), 2) if _req_ab is not None else None), _ck,
+                (int(_cmm.get("manager_ability") or 0) if _cmm else None),
+                (round(float(_cmm.get("reputation") or 0.0), 1) if _cmm else None),
+                (bool((_cmm.get("nationality") or "") == _home) if _cmm else None),
+                _ps_tr["pass"], _ps_tr["p0_mv_pool"], _ps_tr["p0_fr_pool"],
+                _ps_tr["p0_mv_fit"], _ps_tr["p0_fr_fit"], _ps_tr["p0_top"],
+                _ps_tr["p0_first_mv"], _ps_tr["decl"], _ps_tr["skip"], _ps_tr["passes"]])
+
+        if _xs_on and chosen is not None and chosen in _xs_ids:
+            _cm = mgrs[chosen]
+            _xs_stats["hires"].append([
+                int(chosen), int(tid), bool(_ch_move), round(float(_ch_base or 0.0), 1),
+                round(float(lv), 1), int(_cm.get("manager_ability") or 0),
+                round(float(_cm.get("reputation") or 0.0), 1), _cm.get("nationality") or "",
+                t.get("country") or ""])
+        if _tr_vac:
+            _tr["top50_vac"] += 1
+            _fk = ("rookie" if chosen is None else (_tr_kind or "rehire_free"))
+            _tr["fill"][_fk] = _tr["fill"].get(_fk, 0) + 1
+            if chosen is not None:
+                _tr["fill_ab"].append(int(mgrs[chosen].get("manager_ability") or 0))
+                _cm = mgrs[chosen]
+                _tr["fill_detail"].append([
+                    _fk, bool(chosen in _xs_ids), int(_cm.get("manager_ability") or 0),
+                    round(float(_cm.get("reputation") or 0.0), 1),
+                    round(float(_ch_base or 0.0), 1), round(float(lv), 1),
+                    _cm.get("nationality") or "", t.get("country") or "",
+                    bool(chosen in _tr_T)])
+            for m_, (ctid_, mb_) in _tr_pre.items():
+                st_ = _tr_stage[m_]
+                if chosen == m_:
+                    st_ = 4
+                # [⑤ Step 0] 조건 병렬 판정(관찰 전용 — 순수 함수만 호출, 난수 없음).
+                _mm = mgrs[m_]
+                _clv = teams.get(ctid_, {}).get("level", 0.0)
+                _bly = int(_mm.get("best_level_year") or 0)
+                _fails = []
+                if (_mm.get("nationality") or "") not in _tr_nats:
+                    _fails.append("nat")
+                _eff_g = lv - _clv
+                if _eg_on and lv >= _eg_min:
+                    _on_, _oc_ = _job_ab.tovr.get(tid), _job_ab.tovr.get(ctid_)
+                    if _on_ is not None and _oc_ is not None:
+                        _eff_g = max(_eff_g, _eg_k * (_on_ - _oc_))
+                if _eff_g < MANAGER_MOVE_MIN_GAIN:
+                    _fails.append("gain")
+                elif lv - _clv < MANAGER_MOVE_MIN_GAIN:
+                    _tr["eff_gain_rescued"] = _tr.get("eff_gain_rescued", 0) + 1
+                if mb_ <= 0:
+                    _fails.append("budget")
+                if (tid, m_) in _rehire_ban:
+                    _fails.append("ban")
+                if lv > manager_max_level(float(_mm.get("career_best_level") or 0.0),
+                                          float(_mm.get("recent_level") or 0.0),
+                                          float(_mm.get("reputation") or 0.0),
+                                          max(0, year - _bly) if _bly else 0,
+                                          float(_mm.get("recent_perf") or 0.0)):
+                    _fails.append("ceil")
+                if lv < manager_career_floor(_clv, float(_mm.get("reputation") or 0.0), 0):
+                    _fails.append("floor")
+                _fk2 = "+".join(_fails) or "none"
+                _tr["pre_fail"][_fk2] = _tr["pre_fail"].get(_fk2, 0) + 1
+                _sk2 = ("extra:" if m_ in _xs_ids else "") + _TR_STAGE[st_]
+                if st_ == 0:
+                    _sk2 += ":" + _fk2
+                _tr["stage2"][_sk2] = _tr["stage2"].get(_sk2, 0) + 1
+                if st_ == 0:
+                    cur_lv_ = teams.get(ctid_, {}).get("level", 0.0)
+                    if mb_ <= 0:
+                        why = "budget"
+                    elif (mgrs[m_].get("nationality") or "") not in _tr_nats:
+                        why = "nat_side"
+                    elif _move_gain(m_, tid, lv) < MANAGER_MOVE_MIN_GAIN:
+                        why = "gain"
+                        _tr["gain_gap"].append(round(lv - cur_lv_, 1))
+                    elif (tid, m_) in _rehire_ban:
+                        why = "ban"
+                    else:
+                        why = "pool"
+                    key = "not_in_pool:" + why
+                else:
+                    key = _TR_STAGE[st_]
+                _tr["pairs"][key] = _tr["pairs"].get(key, 0) + 1
+                _tr["best"][m_] = max(_tr["best"].get(m_, 0), st_)
+
         if chosen is not None:
             taken.add(chosen)
+            if (mgrs[chosen].get("nationality") or "") != _home:
+                stats["hire_foreign"] = stats.get("hire_foreign", 0) + 1
             cu = year + vr.randint(MANAGER_CONTRACT_YEARS_MIN, MANAGER_CONTRACT_YEARS_MAX)
             # 4번째는 **그 자리의 수준 그대로**다(예전엔 career_best와의 max를
             # 넣었다). career_best는 아래 SQL이 MAX로 올리고, recent_level과
@@ -10834,10 +11993,24 @@ def _manager_turnover(c, year, season=None):
         else:
             # 신인 — 새 감독을 만든다.
             # [2026-10] 군팀 감독은 국적을 "군대"가 아니라 대한민국으로.
-            from military_service import manager_nationality_for as _mil_mgr_nat
-            row = build_manager_row(vr, _mil_mgr_nat(t["country"]), year,
+            # [2026-10 감독 국적 시장] 신인은 대부분 자국에서 첫 직장을 잡는다 —
+            # 외국인 쪽으로 정해진 자리라도 감독 수출 강국(수출력 1.5 이상) 출신만
+            # 외국인 신인으로 데뷔하고, 나머지는 자국 신인이다.
+            _rk_nat = _home
+            if not _side_dom and _nat_plans and _nat_plans[0]:
+                _f0 = _nat_plans[0][0]
+                if manager_export_strength(_f0) >= 1.5:
+                    _rk_nat = _f0
+                    stats["rookie_foreign"] = stats.get("rookie_foreign", 0) + 1
+            row = build_manager_row(vr, _rk_nat, year,
                                     age_range=(MANAGER_ROOKIE_AGE_MIN,
                                                MANAGER_ROOKIE_AGE_MAX))
+            # [2026-10 선출 감독 전환] 이 확률로 같은 국적의 은퇴 선수를 감독으로
+            # 데려온다 — 나이(출생 연도)·선수 id만 바꾸고 스타일 등은 그대로.
+            _xp = _take_explayer(_xp_pool, _rk_nat, vr, target=_req_ab)
+            if _xp is not None:
+                row = (row[0], row[1], _xp[1], row[3], _xp[0]) + tuple(row[5:])
+                stats["rookie_explayer"] = stats.get("rookie_explayer", 0) + 1
             new_rows.append(row)
             new_links.append((tid, year + vr.randint(MANAGER_CONTRACT_YEARS_MIN,
                                                      MANAGER_CONTRACT_YEARS_MAX), lv))
@@ -10878,9 +12051,15 @@ def _manager_turnover(c, year, season=None):
         c.executemany(
             "UPDATE managers SET contract_until=?, status='club', jobless_since=NULL "
             "WHERE id=?", renews)
+        # [2026-10] 재계약도 그 임기의 계약 기록에 남긴다("재계약 (N년)" 표시용).
+        c.executemany(
+            "UPDATE team_managers SET contract_log = COALESCE(contract_log,'') || ? "
+            "WHERE manager_id=? AND end_year IS NULL AND job_kind='club'",
+            [(f";{year}:{int(cu)}", mid) for (cu, mid) in renews])
     if retire_ids:
-        c.executemany("UPDATE managers SET retired=1, status='retired' WHERE id=?",
-                      [(i,) for i in retire_ids])
+        # [2026-10] retired_year — 은퇴 감독 나이 동결용(database.py 컬럼 주석 참고)
+        c.executemany("UPDATE managers SET retired=1, status='retired', retired_year=? WHERE id=?",
+                      [(year, i) for i in retire_ids])
     # 떠났는데 새 자리를 못 구한 감독 → 무직 처리
     hired_ids = {h[0] for h in hires}
     # [2026-09 — ③-d] 현직 대표팀 감독을 여기서 'free'로 덮으면 안 된다.
@@ -10899,9 +12078,9 @@ def _manager_turnover(c, year, season=None):
     if hires:
         c.executemany(
             """INSERT INTO team_managers(team_id, manager_id, start_year, end_year,
-                                          job_kind, country_id, job_level)
-               VALUES(?,?,?,NULL,'club',NULL,?)""",
-            [(tid, mid, year, lv) for (mid, tid, _cu, lv) in hires])
+                                          job_kind, country_id, job_level, contract_log)
+               VALUES(?,?,?,NULL,'club',NULL,?,?)""",
+            [(tid, mid, year, lv, f"{year}:{int(_cu)}") for (mid, tid, _cu, lv) in hires])
         # [③-c] recent_level과 best_level_year도 같이 갱신한다. CASE는 SET의
         # 다른 항목에 영향받지 않고 **갱신 전** career_best_level을 본다.
         c.executemany(
@@ -10927,22 +12106,60 @@ def _manager_turnover(c, year, season=None):
         new_ids = [r[0] for r in c.execute(
             "SELECT id FROM managers WHERE id > ? ORDER BY id", (base_id,)).fetchall()]
         if len(new_ids) == len(new_links):
+            # [2026-10 기록 보완] 신인 첫 재임에도 job_level(그 자리 수준)을 남긴다 — 이직·재취업
+            # 경로(위 hires INSERT)와 같다. 예전엔 빠져서 NULL이었다(⑥ 첫 자리 수준 분석용).
+            # 기록 전용: 시장·경질·성장 로직은 이 값을 읽지 않는다(database.py의 1회성 눈금
+            # 마이그레이션만 읽는데, 그건 기존 세이브에서 이미 끝난 단계다).
             c.executemany(
                 """INSERT INTO team_managers(team_id, manager_id, start_year, end_year,
-                                              job_kind, country_id)
-                   VALUES(?,?,?,NULL,'club',NULL)""",
-                [(tid, new_ids[i], year) for i, (tid, _cu, _lv) in enumerate(new_links)])
-            c.executemany(
-                "UPDATE managers SET contract_until=?, status='club', "
-                "career_best_level=?, clubs_managed=1 WHERE id=?",
-                [(cu, lv, new_ids[i]) for i, (_tid, cu, lv) in enumerate(new_links)])
+                                              job_kind, country_id, job_level, contract_log)
+                   VALUES(?,?,?,NULL,'club',NULL,?,?)""",
+                [(tid, new_ids[i], year, _lv, f"{year}:{int(_cu)}")
+                 for i, (tid, _cu, _lv) in enumerate(new_links)])
+            # [2026-10 실험 B] 첫 자리 연도를 best_level_year로 — constants 주석 참고.
+            # 끄면(기준선) 예전처럼 0으로 남는다. recent_level은 그대로 안 건드린다.
+            from constants import MANAGER_ROOKIE_SET_BEST_YEAR as _rk_bly
+            if _rk_bly:
+                c.executemany(
+                    "UPDATE managers SET contract_until=?, status='club', "
+                    "career_best_level=?, best_level_year=?, clubs_managed=1 WHERE id=?",
+                    [(cu, lv, year, new_ids[i]) for i, (_tid, cu, lv) in enumerate(new_links)])
+            else:
+                c.executemany(
+                    "UPDATE managers SET contract_until=?, status='club', "
+                    "career_best_level=?, clubs_managed=1 WHERE id=?",
+                    [(cu, lv, new_ids[i]) for i, (_tid, cu, lv) in enumerate(new_links)])
         else:
             changed = set()
     if tend_updates:
         c.executemany("UPDATE teams SET tactic_tendency=? WHERE id=?", tend_updates)
 
     stats["vacancies"] = len(set(vacancies))
+    if _xs_on:
+        stats["extra"] = _xs_stats
+    if _tr_on:
+        stats["moves_log"] = _mv_log
+        stats["ps_log"] = _ps_log
+    if _jw_on:
+        stats["jobless_window"] = _jw_stats
+    if _jt_on:
+        stats["jtrace"] = _jt
+    if _ab_on:
+        stats["above_slot"] = _ab_stats
+    if _tr_on:
+        _b = {}
+        for _st in _tr["best"].values():
+            _b[_TR_STAGE[_st]] = _b.get(_TR_STAGE[_st], 0) + 1
+        _tr["best"] = _b
+        stats["mtrace"] = _tr
     stats["free_pool"] = len(became_free)
+    # [2026-10 6번 1단계] 이번 시장에서 새로 데뷔한 신인 감독의 능력치·숨은 상한.
+    try:
+        import manager_ability
+        stats["ability_filled"] = manager_ability.assign_missing_manager_abilities(
+            c, year=year, mode="rookie")
+    except Exception as _e:
+        print(f"[MANAGER] 능력치 채움 실패(계속 진행): {_e}")
     _LAST_MANAGER_MARKET = stats
     return changed
 
@@ -10987,15 +12204,43 @@ def _shuffle_formations(c, forced_teams=None):
                    WHERE tm.end_year IS NULL""")}
     except Exception:
         style_by_team = {}   # 감독 표가 아직 없는 세이브 — 폴백 경로
-    ai_rows = c.execute("SELECT team_id, position, ovr FROM ai_players").fetchall()
+    # [2026-10 확정] 감독 포메이션 계열 — 감독 id + 월드 salt 해시(난수 미소비)로
+    # 4백 75% / 3백·5백 25%, 계열 안 포메이션 선택 점수 +0.10.
+    import constants as _sq_c
+    family_by_team: dict = {}
+    import zlib as _zlib
+    from database import get_world_salt as _gws
+    _fam_salt = _gws()
+    try:
+        for r in c.execute("""SELECT team_id, manager_id FROM team_managers
+                              WHERE end_year IS NULL"""):
+            _h = _zlib.crc32(f"mgrfam:{_fam_salt}:{int(r[1])}".encode("utf-8")) % 100
+            family_by_team[r[0]] = "back3" if _h < _sq_c.MANAGER_FAMILY_BACK3_PCT else "back4"
+    except Exception:
+        family_by_team = {}
+    # [2026-10 주포·부포] 부포 보유자가 있을 때만 id까지 읽어 부포를 붙인다(sub_positions.attach).
+    # 부포가 없으면(스위치 OFF 포함) 예전 SQL·예전 dict 그대로다.
+    import sub_positions as _subp
+    _sub_on = _subp.active()
+    ai_rows = c.execute("SELECT id, team_id, position, ovr FROM ai_players" if _sub_on
+                        else "SELECT team_id, position, ovr FROM ai_players").fetchall()
     roster_by_team: dict = {}
     for r in ai_rows:
         roster_by_team.setdefault(r["team_id"], []).append(
             {"position": r["position"], "ovr": r["ovr"]})
+        if _sub_on:
+            roster_by_team[r["team_id"]][-1]["id"] = r["id"]
+    if _sub_on:
+        for _lst in roster_by_team.values():
+            _subp.attach(_lst)
 
     changed = 0
     formation_updates = []   # (formation, team_id)
     fit_updates = []         # (fit_bonus, team_id)
+    # [2026-10 — 감독 모드 대비] 사용자 감독 팀의 포메이션은 사용자가 정한다 — AI
+    # 재검토(감독 교체 강제 포함)를 건너뛰고 적합도만 갱신한다. 지금은 빈 집합.
+    import team_plan as _tplan
+    _user_tids = _tplan.user_team_ids()
     for t in teams:
         roster = roster_by_team.get(t["id"])
         if not roster:
@@ -11015,10 +12260,16 @@ def _shuffle_formations(c, forced_teams=None):
         # 항상 먼저 소비한다 — 순서를 건너뛰면 그 뒤 난수열이 팀마다 다르게
         # 밀려서 같은 세이브를 다시 돌렸을 때 재현이 안 된다.
         _roll = random.random()
-        if _roll < FORMATION_REEVAL_PROB or (forced_teams and t["id"] in forced_teams):
+        if t["id"] in _user_tids:
+            _fname = cur_formation if cur_formation in FORMATION_SLOTS else "4-4-2"
+            penalty = _flogic.formation_fit_penalty_prepped(
+                prepped, _fname, FORMATION_SLOTS[_fname])
+        elif _roll < FORMATION_REEVAL_PROB or (forced_teams and t["id"] in forced_teams):
             new_formation, penalty = _flogic.choose_formation_prepped(
                 prepped, cur_formation, tendency,
-                style=style_by_team.get(t["id"]))
+                style=style_by_team.get(t["id"]),
+                family=family_by_team.get(t["id"]),
+                family_bonus=_sq_c.MANAGER_FAMILY_SCORE_BONUS)
             if new_formation != cur_formation:
                 changed += 1
                 formation_updates.append((new_formation, t["id"]))
@@ -11228,7 +12479,8 @@ def apply_squad_turnover_after_movement(rescale_jobs, year, turnover_frac=0.25,
             sub_role = random.choice(SUB_ROLES.get(pos, ["기본"]))
             # [2026-09] database._nat_ceiling_penalty 정의부 주석 참고.
             nat, foreign_ct = _pick_nationality(cname, continent, grade, pos,
-                                                False, foreign_ct, quota, slot_ovr=target, youth=(tier or 1) <= YOUTH_PATH_MAX_TIER)
+                                                False, foreign_ct, quota, slot_ovr=target, youth=(tier or 1) <= YOUTH_PATH_MAX_TIER,
+                                                  youth_top=(tier or 1) == 1)   # [2026-10 A-2]
             name = ""      # [2026-09] AI 실명 폐지
             new_rows.append((team_id, name, pos, *[stats[s] for s in ALL_STATS], ovr, age,
                               sub_role, nat, nat, year + random.randint(2, 4), 0, year,

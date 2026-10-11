@@ -122,7 +122,9 @@ def _fetch_roster(team_id):
         conn = get_conn()
         rows = conn.execute("SELECT * FROM ai_players WHERE team_id=?", (team_id,)).fetchall()
         conn.close()
-        return [dict(r) for r in rows]
+        out = [dict(r) for r in rows]
+        import sub_positions as _subp
+        return _subp.attach(out)    # [2026-10 주포·부포] 클럽 로스터만 — 부포가 없으면 무동작
     except Exception:
         return []
 
@@ -162,7 +164,7 @@ def _lineup_age_penalty(age):
     return 0
 
 
-def _select_lineup(team_id, formation):
+def _select_lineup(team_id, formation, fixed=None):
     """그 팀 로스터에서 포메이션 슬롯 순서대로 11명을 뽑는다.
     POSITION_COMPAT(선수 등록 포지션 → 배치 가능 슬롯 우선순위)을 "포지션
     적합도 절대 1순위" 규칙이 아니라, 적합도·OVR·나이를 하나의 실질
@@ -176,13 +178,23 @@ def _select_lineup(team_id, formation):
     골키퍼는 필드 플레이어와 아예 다른 스탯 체계라 실제 축구에서 절대
     바꿔 쓰지 않는 포지션이다 — GK 슬롯은 GK 등록 선수만, 필드 슬롯은
     GK 등록 선수를 제외하고 고른다(둘 다 후보가 없을 때만 예외적으로
-    전체 풀로 폴백해 빈 자리를 막는다)."""
+    전체 풀로 폴백해 빈 자리를 막는다).
+
+    [2026-10 신설 — 감독 모드 대비] fixed: 슬롯 순서의 선수 dict 목록(None = 비어
+    있음). 사용자 감독이 직접 고른 자리는 그대로 쓰고, 빈 자리만 아래 규칙으로
+    남은 선수 중에서 채운다(team_plan._resolve_lineup). None이면(모든 AI 경로)
+    예전과 완전히 같다."""
     from constants import FORMATION_SLOTS, POSITION_COMPAT
     slots = FORMATION_SLOTS.get(formation, FORMATION_SLOTS["4-4-2"])
     roster = _fetch_roster(team_id)
     used_ids = set()
     lineup = []
-    for slot in slots:
+    if fixed:
+        used_ids = {p.get("id") for p in fixed if p}
+    for _si, slot in enumerate(slots):
+        if fixed and _si < len(fixed) and fixed[_si] is not None:
+            lineup.append(fixed[_si])
+            continue
         if slot == "GK":
             pool = [p for p in roster if p.get("id") not in used_ids and p.get("position") == "GK"]
         else:
@@ -196,7 +208,8 @@ def _select_lineup(team_id, formation):
         def _score(p):
             compat = POSITION_COMPAT.get(p.get("position"), [p.get("position")])
             try:
-                idx = compat.index(slot)
+                # [2026-10 주포·부포] 부포 슬롯은 적합도 감점 0
+                idx = 0 if (p.get("sub_pos") and p.get("sub_pos") == slot) else compat.index(slot)
             except ValueError:
                 idx = len(_LINEUP_POSITION_PENALTY) - 1
             idx = min(idx, len(_LINEUP_POSITION_PENALTY) - 1)

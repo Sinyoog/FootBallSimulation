@@ -61,6 +61,11 @@ def _get_field_pos(p):
         conn.close()
         formation = (row["formation"] if row else None) or "4-4-2"
         slots = FORMATION_SLOTS.get(formation, FORMATION_SLOTS["4-4-2"])
+        # [2026-10 주포·부포] 내 부포 슬롯은 순위 0(클럽 대항전 = 클럽 범위)
+        import sub_positions as _subp
+        _my_sub = _subp.my_sub()
+        if _my_sub:
+            return _subp.best_slot(primary, _my_sub, slots)
         compat = POSITION_COMPAT.get(primary, [primary])
         best, best_rank = primary, 999
         for slot in slots:
@@ -372,6 +377,7 @@ CHAMPIONS_CFG = CompetitionConfig(
     # CONFERENCE_CFG도 이 값을 그대로 물려받는다(둘 다 STAGE_KO/
     # _STAGE_ORDER처럼 이 모듈 값을 재사용).
     neutral_stages=("F", "TP"),
+    manager_bonus=True,   # [2026-10 6번 ③-1 확장] 감독 능력 경기 보정
 )
 
 # 결과별 보상 (명성, 인기, 행복도) - 클럽 대회는 국가대표보다 약간 낮게
@@ -1098,7 +1104,7 @@ def simulate_my_cl_match(week, p, day=None):
          "shots_on": detail.get("shots_on", 0),
          "saves": saves, "is_gk": (my_position == "GK"),
          "rating": rating, "is_me": True},
-        hs, as_)
+        hs, as_, played=not (_suspended or _benched))
 
     my_result = _my_result(outcome, is_home)
     my_conceded = (as_ if is_home else hs)

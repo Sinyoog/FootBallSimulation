@@ -329,24 +329,47 @@ def _assign_sc_sf_days(tid, year):
     conn.close()
 
 
-def _assign_sc_final_days(tid, year):
-    """결승·3·4위전 날짜를 경기별로 배정(준결승 이후 최소 간격 보장)."""
-    conn = get_conn()
+def _final_offsets(conn, tid):
+    """결승·3·4위전 후보 offset(준결승 이후 최소 간격 보장) — _assign_sc_final_days와
+    _my_reserved_next_day가 같은 후보를 쓰도록 한 곳에 둔다."""
     sf_max = conn.execute(
         "SELECT MAX(day) FROM sc_matches WHERE tournament_id=? AND stage='SF'",
         (tid,)).fetchone()[0] or _SF_DAY
     _min_off = max(_SC_SF_TO_FINAL_MIN, (sf_max - _SF_DAY) + _SC_SF_TO_FINAL_MIN)
-    # 기존 기본값(offset 5 = _FINAL_DAY)을 1순위로 두고 늦은 쪽 → 이른 쪽.
     # 기존 기본값(offset 5 = _FINAL_DAY)을 1순위로 두고, 그다음 늦은 쪽 →
     # 이른 쪽. offset 2까지 열어야 "준결승 197 + 결승 199(7/18)" 같은
     # 조합이 후보에 들어온다(위 _SC_SF_TO_FINAL_MIN 주석 참고).
-    offsets = [o for o in (5, 6, 4, 3, 2) if o >= _min_off] or [6]
+    return [o for o in (5, 6, 4, 3, 2) if o >= _min_off] or [6]
+
+
+def _my_reserved_next_day(conn, tid, year, my_tid):
+    """[2026-10 버그수정, 신민용 리포트: "슈퍼컵 결승 일정이 표시가 안 되어 있다가 4강이 끝나면 갑자기
+    생긴다 — 월드컵 8강(미정)처럼 미리 일정표에 있어야 하고, 리그 경기·리그 경기 다음 휴식과 겹치면
+    안 된다"] 내 팀의 다음 경기(결승 또는 3·4위전 — 준결승 결과에 따라 둘 중 하나)를 대회가 만들어질
+    때부터 고정해 둔 날. 상대가 아직 정해지지 않았으므로 내 팀의 리그 일정만 기준으로 고른다(리그
+    경기일과 MIN_MATCH_DAY_GAP 이상 = 같은 날도, 리그 다음날 휴식도 아님). 리그 일정과 준결승 날짜는
+    대회 중에 바뀌지 않으므로 몇 번을 다시 불러도 같은 날이 나온다 — 미리 보여준 "(미정)" 날짜와 실제
+    결승/3·4위전 날짜가 항상 같다."""
+    return _pick_one_sc_day(conn, year, (my_tid,), _final_offsets(conn, tid))
+
+
+def _assign_sc_final_days(tid, year):
+    """결승·3·4위전 날짜를 경기별로 배정(준결승 이후 최소 간격 보장).
+    [2026-10] 내 팀이 낀 경기는 _my_reserved_next_day(대회 시작부터 "(미정)"으로 보여준 날)를 그대로 쓴다."""
+    conn = get_conn()
+    offsets = _final_offsets(conn, tid)
+    _t = conn.execute("SELECT my_in, my_team_id FROM sc_tournaments WHERE id=?", (tid,)).fetchone()
+    my_tid = (_t["my_team_id"] or 0) if (_t and _t["my_in"]) else 0
+    reserved = _my_reserved_next_day(conn, tid, year, my_tid) if my_tid else None
     for stage in ("F", "TP"):
         for r in conn.execute(
                 "SELECT id, home_team_id, away_team_id FROM sc_matches "
                 "WHERE tournament_id=? AND stage=?", (tid, stage)).fetchall():
-            day = _pick_one_sc_day(conn, year, (r["home_team_id"], r["away_team_id"]),
-                                   offsets)
+            if reserved is not None and my_tid in (r["home_team_id"], r["away_team_id"]):
+                day = reserved
+            else:
+                day = _pick_one_sc_day(conn, year, (r["home_team_id"], r["away_team_id"]),
+                                       offsets)
             conn.execute("UPDATE sc_matches SET day=? WHERE id=?", (day, r["id"]))
     conn.commit()
     conn.close()
@@ -464,9 +487,62 @@ def get_my_super_cup_matches(year):
     공용 함수 — CL/EL/ECL의 get_my_champions_matches/get_my_europa_matches/
     get_my_conference_matches와 이름 패턴만 다르고 완전히 같은 방식으로
     competition_common.get_my_matches_for_schedule(SC_CFG, year)를 그대로
-    부른다."""
+    부른다.
+    [2026-10] 결승·3·4위전이 아직 만들어지기 전(준결승 진행 중)엔 두 경기를 "미정"으로 미리 보여준다
+    (월드컵 토너먼트가 미래 라운드를 미정으로 보여주는 것과 같은 모양)."""
     from competition.competition_common import get_my_matches_for_schedule
-    return get_my_matches_for_schedule(SC_CFG, year)
+    out = get_my_matches_for_schedule(SC_CFG, year)
+    if out and not any(m.get("stage_raw") in ("F", "TP") for m in out):
+        wk = out[0].get("week")
+        for stg in ("F", "TP"):
+            out.append({"home_id": 0, "away_id": 0, "home_name": "미정", "away_name": "미정",
+                        "home_league": "", "away_league": "", "home_score": -1, "away_score": -1,
+                        "pso_winner": "", "pso_score": "", "stage": SC_STAGE_KO[stg], "week": wk,
+                        "stage_raw": stg, "grp": "", "pending": True})
+    return out
+
+
+def get_my_pending_stage(week, day=None, p=None, st=None):
+    """[2026-10 신설 — 버그수정, 신민용 리포트] 내 팀이 이 해 슈퍼컵에 나가 있고 결승·3·4위전이 아직
+    만들어지기 전이면, 내 다음 경기 날(_my_reserved_next_day)에 "(미정)" 표시용 정보를 돌려준다
+    (intl_engine/club_world_cup_engine.get_my_pending_stage와 같은 형식 — "pending": True는 화면
+    표시 전용이라 경기 진행 로직은 이 값을 경기로 쓰지 않는다). 준결승에서 지면 3·4위전, 이기면
+    결승이라 이 슈퍼컵에선 준결승 뒤에도 내 경기가 하나 더 있다 — 실제 경기가 만들어지면
+    get_my_super_cup_match가 그 경기를 같은 날로 돌려준다."""
+    from game_engine import get_player, get_state
+    if p is None:
+        p = get_player()
+    if st is None:
+        st = get_state()
+    if not p or not st or day is None:
+        return None
+    my_tid = p.get("current_team_id", 0)
+    if not my_tid:
+        return None
+    conn = get_conn()
+    try:
+        t = conn.execute(
+            "SELECT * FROM sc_tournaments WHERE year=? AND my_in=1 AND my_team_id=? AND status!='done'",
+            (st["current_year"], my_tid)).fetchone()
+        if not t:
+            return None
+        if conn.execute("SELECT 1 FROM sc_matches WHERE tournament_id=? AND stage IN ('F','TP') LIMIT 1",
+                        (t["id"],)).fetchone():
+            return None          # 이미 실제 결승·3·4위전이 있다 — get_my_super_cup_match가 보여준다
+        if _my_reserved_next_day(conn, t["id"], st["current_year"], my_tid) != day:
+            return None
+    finally:
+        conn.close()
+    return {
+        "pending": True,
+        "cl_kind": "super_cup",
+        "icon": "🏆",
+        "tournament_id": t["id"],
+        "league_name": t["name"],
+        "stage": "F",
+        "stage_ko": "결승·3/4위전",
+        "week": week,
+    }
 
 
 def get_my_super_cup_match(week, day=None, p=None, st=None):
@@ -607,11 +683,26 @@ def process_super_cup_week(week, day=None):
             continue
 
         if f_exists:
+            # [2026-10 버그수정, 신민용 리포트: "슈퍼컵이 3/4위전을 안 할 때가
+            # 있다 — 2000 AFC 그랜드 슈퍼컵/UEFA 슈퍼컵 플러스 3·4위 '-'"]
+            # 예전엔 "결승이 끝났으면" 바로 대회를 닫았다. 결승과 3·4위전이
+            # 같은 날(Day6)이던 시절엔 둘이 같은 호출에서 함께 끝나 문제가
+            # 없었는데, 2026-09에 리그 일정과 안 겹치게 **경기마다** 날짜를
+            # 따로 고르도록(_assign_sc_final_days) 바꾸면서 3·4위전이 결승보다
+            # 늦은 날로 잡히는 경우가 생겼다 — 그러면 결승 날 status='done'이
+            # 되고, 위 tours 조회(status!='done')에서 빠져 3·4위전은 영영
+            # 시뮬되지 않았다(3시즌 실측: 12개 대회 중 5개, 5개 전부 "3·4위전
+            # 날짜 > 결승 날짜"). 챔스(champions_engine)·클럽월드컵과 같은
+            # 조건으로 맞춘다 — 결승과 3·4위전이 **둘 다** 끝나야 닫는다
+            # (3·4위전이 아예 없으면 결승만으로 닫는다).
             conn = get_conn()
             f_done = conn.execute(
                 "SELECT 1 FROM sc_matches WHERE tournament_id=? AND stage='F' "
                 "AND home_score>=0 LIMIT 1", (t["id"],)).fetchone()
+            tp_pending = conn.execute(
+                "SELECT 1 FROM sc_matches WHERE tournament_id=? AND stage='TP' "
+                "AND home_score<0 LIMIT 1", (t["id"],)).fetchone()
             conn.close()
-            if f_done:
+            if f_done and not tp_pending:
                 finish_tournament(SC_CFG, t, award_fn=None)
                 _invalidate_sc_active_cache()

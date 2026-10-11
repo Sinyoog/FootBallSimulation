@@ -899,7 +899,21 @@ class _FormationCanvas(QWidget):
                 # 담당한다 — 포지션이 몰린 스쿼드(예: GK 2명)에서도 진짜
                 # 맞는 선수가 먼저 자기 자리를 차지하고, 잉여만 마지막에
                 # 남는 자리로 밀리게 한다(자세한 설명은 그 함수 주석 참고).
-                slot_filled = _greedy_fill_slots(all_ai, slots_only)
+                # [⑦-c 2026-10, 신민용 확정 A안] 통일 스위치가 켜지면 나도 다른 선수와 똑같이
+                # 후보로 넣어 경기 전력과 같은 최적 배치(team_plan.club_fill_slots)로 고른다 —
+                # 시즌 주전 기록(_snapshot_season_positions)과 같은 기준. 꺼져 있으면 예전 그대로.
+                from constants import LINEUP_UNIFY_ENABLED as _lu_on
+                _me_slot = None
+                if _lu_on:
+                    from team_plan import club_fill_slots as _club_fill
+                    _me_cand = {"id": -1, "position": p.get("position", "MF"),
+                                "ovr": p.get("ovr", 40), "foot": p.get("foot", "") or "",
+                                "sub_role": p.get("sub_role", "") or ""}
+                    _placed_all = _club_fill(all_ai + [_me_cand], slots_only)
+                    _me_slot = next((i for i, x in enumerate(_placed_all) if x is _me_cand), None)
+                    slot_filled = [None if x is _me_cand else x for x in _placed_all]
+                else:
+                    slot_filled = _greedy_fill_slots(all_ai, slots_only)
                 # [2026-08 버그수정, 신민용 리포트: "주전 명단에 GK가 2명
                 # 뜬다"] _greedy_fill_slots는 각 선수에 _slot_idx만 태깅하고
                 # 등록 포지션(position)은 그대로 둔다 — 명단 패널(_make_
@@ -913,6 +927,9 @@ class _FormationCanvas(QWidget):
                 # 2) 내 포지션에 맞는 슬롯을 찾아, 그 자리의 기존 선수와 OVR 비교
                 my_slot_idx, field_pos, mismatch_rank = _best_slot_for_player(
                     p.get("position", "MF"), slots_only)
+                if _me_slot is not None:
+                    # [⑦-c] 최적 배치가 나를 골랐다 — 그 자리가 내 자리(그 칸은 비워 뒀다).
+                    my_slot_idx, field_pos = _me_slot, slots_only[_me_slot]
                 rival = slot_filled[my_slot_idx] if my_slot_idx < len(slot_filled) else None
 
                 me = {"id": -1, "name": p.get("name", "나"),
@@ -947,7 +964,10 @@ class _FormationCanvas(QWidget):
                              + p.get("season_suspension_matches_missed", 0))
                 _actual_starter = _total_sn >= 5 and (_played / _total_sn) >= 0.5
 
-                if rival is None or me["ovr"] > rival["ovr"] or _actual_starter:
+                # [⑦-c] 통일 스위치가 켜지면 "그 자리 선수와 OVR 비교"는 쓰지 않는다 — 최적 배치가
+                # 나를 고르지 않았으면 벤치(이번 시즌 실제 출전율 과반 규칙은 그대로 우선).
+                _beats_rival = (not _lu_on) and rival is not None and me["ovr"] > rival["ovr"]
+                if rival is None or _beats_rival or _actual_starter:
                     # 내가 그 자리 주전보다 낫다 (또는 빈 자리, 또는 실제로
                     # 이번 시즌 주전급으로 뛰어왔다) → 선발 출전
                     rest = [pl for pl in slot_filled if pl is not None and pl is not rival]
@@ -1061,7 +1081,13 @@ class _FormationCanvas(QWidget):
         _fill_candidates = full_squad if full_squad else raw_players
         # [2026-08 버그수정] 배정은 _greedy_fill_slots가 담당 — 자세한 설명은
         # 그 함수 주석 참고(포지션 몰린 스쿼드에서의 연쇄 오배치 수정).
-        slot_filled = _greedy_fill_slots(_fill_candidates, slots_only)
+        if full_squad:
+            # [⑦-c] 실제 클럽팀 — 통일 스위치가 켜지면 경기 전력과 같은 최적 배치(꺼져 있으면
+            # club_fill_slots가 예전 _greedy_fill_slots를 그대로 부른다).
+            from team_plan import club_fill_slots as _club_fill_o
+            slot_filled = _club_fill_o(_fill_candidates, slots_only)
+        else:
+            slot_filled = _greedy_fill_slots(_fill_candidates, slots_only)
         # [2026-08 버그수정, 신민용 리포트: "주전 명단에 GK가 2명 뜬다"]
         # load_my_team과 동일한 이유 — 슬롯 배정 직후 실제 배정 자리를
         # field_pos로 태깅해서 명단 패널이 등록 포지션 대신 이걸 쓰게 한다.
@@ -1381,6 +1407,68 @@ class _RosterPanel(QScrollArea):
         # [2026-09 신설] set_roster가 채운다 — _make_player_button의
         # is_foreign 판정 기준(_FormationCanvas._team_country와 동일 개념).
         self._team_country = ""
+        # [2026-10 신설 — 감독 표시 ③단계] 명단 맨 위 감독 줄(없으면 None).
+        self._mgr_btn = None
+        self._manager = None
+
+    def _make_manager_button(self, mgr: dict) -> QPushButton:
+        """[2026-10 신설 — 감독 표시 ③단계, 신민용 요청: "메인 화면 팀 명단도
+        감독 → 주전 → 후보 순"] 세계 기록실 팀/국가 스쿼드의 감독 줄과 같은 모양
+        (보라색, 외국인 감독이면 주황 테두리, 글자 "이름 · 국적"). 누르면
+        FormationWidget.open_manager_popup — 기록실과 같은 간단 변경 팝업(이름 |
+        국적 | 스타일)을 연다."""
+        from ui.world_browser_window import _MGR_ROW_QSS, _manager_row_text
+        btn = QPushButton(_manager_row_text(mgr))
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        btn.setMinimumHeight(29)
+        style = _MGR_ROW_QSS.replace("font-size:11px", "font-size:10px")
+        if mgr.get("is_foreign"):
+            style += "border:1px solid #FF7F00;"
+        btn.setStyleSheet(style + "text-align:left;")
+        btn._base_qss = style
+        from ui.world_browser_window import _manager_style_line
+        btn.setToolTip(_manager_style_line(mgr))
+
+        def _open(_=False):
+            nav = getattr(getattr(self, "team_panel", None), "nav", None)
+            if nav is not None and hasattr(nav, "open_manager_popup"):
+                nav.open_manager_popup(self._manager or mgr, self.team_panel)
+        btn.clicked.connect(_open)
+        return btn
+
+    def set_manager_highlight(self, on: bool):
+        btn = self._mgr_btn
+        if btn is None:
+            return
+        try:
+            btn.setStyleSheet(btn._base_qss + "text-align:left;" + (
+                "border:3px solid #2ec2ff;background:#173a5e;color:#eaf6ff;" if on else ""))
+            if on:
+                self.ensureWidgetVisible(btn)
+        except RuntimeError:
+            self._mgr_btn = None
+
+    def update_manager(self, mgr: dict) -> bool:
+        """감독 이름/국적을 바꾼 직후 그 줄 글자·테두리만 다시 쓴다."""
+        btn = self._mgr_btn
+        if btn is None or not self._manager or self._manager.get("id") != (mgr or {}).get("id"):
+            return False
+        from ui.world_browser_window import _MGR_ROW_QSS, _manager_row_text
+        self._manager.update({k: mgr[k] for k in ("display_name", "custom_name",
+                                                  "nationality", "is_foreign", "ability")
+                              if k in mgr})
+        try:
+            btn.setText(_manager_row_text(self._manager))
+            style = _MGR_ROW_QSS.replace("font-size:11px", "font-size:10px")
+            if self._manager.get("is_foreign"):
+                style += "border:1px solid #FF7F00;"
+            btn._base_qss = style
+            btn.setStyleSheet(style + "text-align:left;")
+        except RuntimeError:
+            self._mgr_btn = None
+            return False
+        return True
 
     def _make_group_header(self, text: str, count: int) -> QLabel:
         """[2026-08 신설, 신민용 요청: "이름 표시하는 곳을 파란색으로"]
@@ -1493,7 +1581,8 @@ class _RosterPanel(QScrollArea):
         btn.clicked.connect(_open_popup)
         return btn
 
-    def set_roster(self, players: list, starter_ids: set, team_country: str = ""):
+    def set_roster(self, players: list, starter_ids: set, team_country: str = "",
+                   manager: dict = None):
         # [2026-09 신설] 이후 _make_player_button 호출들이 참조할 수
         # 있도록 인스턴스에 보관해둔다 — update_player_name처럼 버튼을
         # 새로 만들지 않고 재사용하는 경로에서도 값이 남아있어야 하므로.
@@ -1504,6 +1593,8 @@ class _RosterPanel(QScrollArea):
         self._btn_by_id = {}
         self._pl_by_id = {}   # [2026-08 신설] 이름만 바뀐 경우 버튼 하나만 다시 그리기 위한 역참조
         self._selected_id = None
+        self._mgr_btn = None
+        self._manager = dict(manager) if manager else None
         _hard = is_hard_mode()   # [2026-08 최적화] 버튼마다 DB 재조회하지 않도록 한 번만
         # 기존 버튼/라벨 정리
         while self._grid.count():
@@ -1531,6 +1622,16 @@ class _RosterPanel(QScrollArea):
         bench = sorted((pl for pl in players if pl.get("id") not in starter_ids), key=_starter_sort_key)
 
         row = 0
+        if self._manager:
+            # [2026-10 ③단계] 감독 → 주전 → 후보. 감독은 W/S 이동 대상이 아니다
+            # (get_full_roster_ordered는 선수만 — 이름 일괄변경도 선수만).
+            _mh = QLabel("감독")
+            _mh.setStyleSheet(
+                "color:#5aa9ff;font-size:13px;font-weight:bold;"
+                "padding:4px 2px 2px 2px;border-bottom:1px solid #2a2a2a;")
+            self._grid.addWidget(_mh, row, 0); row += 1
+            self._mgr_btn = self._make_manager_button(self._manager)
+            self._grid.addWidget(self._mgr_btn, row, 0); row += 1
         if starters:
             self._grid.addWidget(self._make_group_header("주전", len(starters)), row, 0); row += 1
             for pl in starters:
@@ -1608,6 +1709,7 @@ class _TeamPanel(QWidget):
         # 만들어진 뒤에야 서로를 가리킬 수 있어서 여기서 미리 못 넣음).
         self.is_opponent = is_opponent
         self.nav = None
+        self.manager = None   # [2026-10 ③단계] FormationWidget이 팀을 불러올 때 채운다
         _LIVE_TEAM_PANELS.add(self)   # [2026-08 신설] apply_custom_name_live용 등록
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -1628,7 +1730,8 @@ class _TeamPanel(QWidget):
         # 넘긴다 — 명단 패널 쪽 테두리 강조가 캔버스와 항상 같은 기준을
         # 쓰게 하기 위함(둘이 각자 조회하면 어긋날 위험이 있음).
         self.roster.set_roster(self.canvas._roster, self.canvas._starter_ids,
-                                team_country=self.canvas._team_country)
+                                team_country=self.canvas._team_country,
+                                manager=self.manager)
 
     def get_starters_ordered(self) -> list:
         """[2026-08 신설, 신민용 요청: "W/S로 우측 포메이션 기준 위/아래
@@ -2427,6 +2530,9 @@ class FormationWidget(QWidget):
         # load_my_team이 나를 뺀 25명도 대회 내내 고정된 명단을 쓰게 한다.
         _tid = context.get("tournament_id") if is_intl and context else None
         self._my_canvas.load_my_team(team_id, intl_nat=my_nat, tournament_id=_tid)
+        self._ctx_tournament_id = _tid
+        self._my_panel.manager = (self._resolve_manager(country=my_nat, tournament_id=_tid)
+                                  if is_intl else self._resolve_manager(team_id=team_id))
         self._my_panel.refresh_roster()
 
         # ── 좌측 레이블: 국제전 → 국가명+OVR / 리그 → 팀명+OVR
@@ -2653,7 +2759,124 @@ class FormationWidget(QWidget):
             return
         t = self._opp_teams[idx]
         self._opp_canvas.load_opp_team(t)
+        if t.get("team_id"):
+            self._opp_panel.manager = self._resolve_manager(team_id=t["team_id"])
+        else:
+            # 국제대회 상대(나라) — team_id 없이 나라 이름만 온다.
+            self._opp_panel.manager = self._resolve_manager(
+                country=t.get("name") or "",
+                tournament_id=getattr(self, "_ctx_tournament_id", None))
         self._opp_panel.refresh_roster()
+
+    # ── [2026-10 신설 — 감독 표시 ③단계] ─────────────────────────────
+    def _resolve_manager(self, team_id=None, country="", tournament_id=None):
+        """지금 이 화면 팀의 감독 요약(world_browser.get_manager_brief 계열) 또는
+        None. 클럽은 올해 지휘 감독(기록실 팀 연도 포메이션과 같은 연도 규칙),
+        대표팀은 이 대회를 맡은 감독(대회 문맥이 없으면 현재 재임 감독)."""
+        try:
+            import world_browser as wb
+            if team_id:
+                return wb.get_team_manager_for_year(team_id, wb.get_current_game_year())
+            if not country:
+                return None
+            if tournament_id:
+                m = wb.get_national_manager_for_tournament(tournament_id, country)
+                if m:
+                    return m
+            conn = get_conn()
+            try:
+                r = conn.execute(
+                    """SELECT n.manager_id FROM national_team_managers n
+                       JOIN countries c ON c.id = n.country_id
+                       WHERE c.name = ? AND n.end_year IS NULL
+                       ORDER BY n.id DESC LIMIT 1""", (country,)).fetchone()
+            finally:
+                conn.close()
+            b = wb.get_manager_brief(r[0], country) if r else None
+            if b:
+                b["job_kind"] = "nation"
+            return b
+        except Exception:
+            return None   # 감독 표가 없는 구세이브 등 — 감독 줄 없이 예전 모양
+
+    def open_manager_popup(self, manager: dict, panel: "_TeamPanel" = None):
+        """명단 감독 줄 클릭 — 기록실과 같은 간단 변경 팝업(QuickManagerEditPopup).
+        창은 하나만 두고 내용만 갈아끼운다(선수 팝업과 같은 원칙)."""
+        if not manager or not manager.get("id"):
+            return
+        import world_browser as wb
+        from ui.world_browser_window import QuickManagerEditPopup
+        fresh = wb.get_manager_brief(manager["id"], manager.get("ctx_country") or None,
+                                     manager.get("ctx_year"))
+        if fresh:
+            # 직책 문맥(클럽/대표팀)은 유지 — 대표팀이면 관리 성향을 대표팀 이름으로 보여준다.
+            for _k in ("tenure_start", "tenure_end", "end_reason", "job_kind"):
+                if _k in manager:
+                    fresh[_k] = manager[_k]
+            manager = fresh
+        popup = getattr(self, "_quick_mgr_popup", None)
+        if popup is not None:
+            try:
+                popup.load_manager(manager)
+            except RuntimeError:
+                popup = None
+        if popup is None:
+            popup = QuickManagerEditPopup(self)
+            popup.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            popup.destroyed.connect(lambda *_a: setattr(self, "_quick_mgr_popup", None))
+            self._quick_mgr_popup = popup
+            popup.load_manager(manager)
+        self._set_quick_manager_highlight(manager["id"])
+        popup.show()
+        popup.raise_()
+        popup.activateWindow()
+
+    # QuickManagerEditPopup이 owner에게 부르는 4개 — 기록실 창과 같은 이름.
+    def _set_quick_manager_highlight(self, manager_id):
+        for _p in (self._my_panel, self._opp_panel):
+            _m = _p.roster._manager
+            _p.roster.set_manager_highlight(
+                manager_id is not None and bool(_m) and _m.get("id") == manager_id)
+
+    def apply_quick_manager_change(self, manager):
+        for _p in (self._my_panel, self._opp_panel):
+            if _p.roster.update_manager(manager):
+                _p.manager = dict(_p.roster._manager)
+        win = self._world_browser_win
+        if win is not None:
+            try:
+                win.apply_quick_manager_change(manager)
+            except (RuntimeError, AttributeError):
+                pass
+
+    def _refresh_manager_views_after_edit(self, manager_id):
+        win = self._world_browser_win
+        if win is not None:
+            try:
+                win._refresh_manager_views_after_edit(manager_id)
+            except (RuntimeError, AttributeError):
+                pass
+
+    def open_to_manager(self, manager_id):
+        """팝업의 "감독 검색에서 보기" — 세계 기록실 창(이 화면에서 연 창이
+        있으면 그 창)을 띄워 감독 검색 탭의 그 감독 상세로 간다."""
+        win = self._world_browser_win
+        if win is not None:
+            try:
+                win.isVisible()
+            except RuntimeError:
+                win = None
+                self._world_browser_win = None
+        if win is None:
+            from ui.world_browser_window import WorldBrowserWindow
+            win = WorldBrowserWindow(self)
+            win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            win.finished.connect(self._on_world_browser_closed)
+            self._world_browser_win = win
+            win.show()
+        win.open_to_manager(manager_id)
+        win.raise_()
+        win.activateWindow()
 
     def _open_bulk_rename_for_panel(self, panel: "_TeamPanel"):
         """[2026-08 신설, 신민용 요청] 리그명 줄 좌/우 버튼이 부르는
@@ -2817,6 +3040,16 @@ class FormationWidget(QWidget):
         harvester = WorldBrowserWindow(self)
         texts = []
         try:
+            # [2026-10 ③단계, 신민용 확정: "복사에 감독 포함"] 감독 → 주전 → 후보.
+            _mgr = self._my_panel.manager
+            if _mgr and _mgr.get("id"):
+                try:
+                    import world_browser as wb
+                    _mdata = wb.get_manager_career(_mgr["id"])
+                    if _mdata.get("brief"):
+                        texts.append(harvester._format_manager_history_text(_mdata, True))
+                except Exception:
+                    pass
             for pid in ids:
                 try:
                     harvester.open_to_player(pid)
@@ -3051,6 +3284,16 @@ class PlayerStatPopup(QDialog):
             ("이름", pl.get('name', '')),
             ("포지션", pl.get('position', '')),
         ]
+        # [2026-10 주포·부포] 부포가 있으면 "부포" 줄(내 선수는 id -1 또는 is_me로 조회).
+        try:
+            import sub_positions as _subp
+            _pid = pl.get("id")
+            _sub = pl.get("sub_pos") or (_subp.my_sub() if (pl.get("is_me") or _pid == _subp.MY_ID)
+                                         else (_subp.get(_pid) if isinstance(_pid, int) else None))
+        except Exception:
+            _sub = None
+        if _sub:
+            info_rows.append(("부포", _sub))
         if not _hard:
             info_rows.append(("OVR", str(pl.get('ovr', 0))))
         age = pl.get("age")

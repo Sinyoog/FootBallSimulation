@@ -934,6 +934,19 @@ class NewPlayerDialog(QDialog):
         "injury_immune": ("부상 면역", "flag"),
         "stamina_train": ("체력 훈련 효과", "x"), "phys_growth_mult": ("신체 스탯 성장 속도", "x"),
         "phys_stat": ("집중 성장 스탯", "raw"), "phys_start_bonus": ("초기 신체 스탯 보너스", "addpt"),
+        # [2026-10 13번, 신민용 요청: "회복력 등 우측 설명이 영어로 뜬다"] 2026-09에 추가된
+        # 성격(폭력적 경고·홈보이·승부사·은둔형)·신체 특징(다재다능·동안·회복력) 효과 키가
+        # 이 표에 없어서 키 이름(영문)이 그대로 표시됐다. constants의 두 효과 표에 새 키를
+        # 넣으면 여기에도 같이 넣어야 한다.
+        "yellow_card_chance": ("경고 확률", "addpct"),
+        "home_rating": ("홈 경기 평점 보정", "pt"), "away_rating": ("원정 경기 평점 보정", "pt"),
+        "clutch_shot_mult": ("중요 경기 슈팅 시도", "x"),
+        "clutch_goal_mult": ("중요 경기 슈팅 정확도", "x"),
+        "popularity_gain_mult": ("인기도 상승 속도", "x"),
+        "transfer_rel_penalty_mult": ("이적 요청 시 감독 관계 하락폭", "x"),
+        "mismatch_immune": ("포지션 미스매치 페널티 면역", "flag"),
+        "aging_decline_mult": ("30대 이후 능력 하락폭", "x"),
+        "injury_recovery_mult": ("부상 복귀 기간", "x"),
     }
 
     def _fmt_effect(self, key, value):

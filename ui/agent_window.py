@@ -156,14 +156,49 @@ def _make_variant(grade, ovr_tier):
     return cost, fee, label
 
 
-def _gen_one_offer(cur_grade: str, ovr_tier: str, my_cont: str) -> dict:
+def _gen_one_offer(cur_grade: str, ovr_tier: str, my_cont: str, taken=None) -> dict:
     """오퍼 풀 한 칸(하나의 에이전트 후보)을 새로 뽑는다. 초기 풀 생성과
     슬롯 교체(계약 체결 시/등급 상승으로 하위 등급 슬롯 정리 시) 양쪽에서
-    재사용한다."""
-    g = _gen_agent_offers(cur_grade, count=1)[0]
-    cont = _pick_agent_continent(my_cont)
+    재사용한다.
+
+    [2026-10 버그수정, 신민용 리포트 16번: "슈퍼 에이전트 아프리카 소속만 3개 떠 있다 — 같은
+    등급+같은 대륙은 1개만"] taken(이미 풀에 있는 (등급, 대륙) 집합)을 주면 겹치지 않는 조합만
+    뽑는다. 같은 등급·대륙은 협상 스타일(실속형/표준형/거물형)만 다를 뿐 사실상 같은 에이전트라
+    여러 개 떠도 선택지가 늘지 않는다. 등급·대륙 확률은 그대로 두고 겹치면 다시 뽑으며, 계속
+    겹치면(후보 조합이 거의 다 찬 경우) 남은 조합 중에서 고른다."""
+    taken = taken if taken is not None else set()
+    g = cont = None
+    for _ in range(60):
+        g = _gen_agent_offers(cur_grade, count=1)[0]
+        cont = _pick_agent_continent(my_cont)
+        if (g, cont) not in taken:
+            break
+    else:
+        cur_idx = -1 if cur_grade == AGENT_NONE else AGENT_GRADES.index(cur_grade)
+        grades = [x for x in AGENT_GRADES if 0 <= AGENT_GRADES.index(x) - cur_idx <= 2] or [g]
+        free = [(x, c) for x in grades for c in AGENT_CONTINENTS if (x, c) not in taken]
+        if free:
+            g, cont = random.choice(free)
+    taken.add((g, cont))
     cost, fee, label = _make_variant(g, ovr_tier)
     return {"grade": g, "continent": cont, "cost": cost, "fee": fee, "label": label}
+
+
+def _dedupe_offer_pool(pool, cur_grade, ovr_tier, my_cont):
+    """저장된 풀에서 (등급, 대륙)이 겹치는 두 번째 이후 칸만 새 후보로 바꾼다. 바뀐 게 있으면
+    (새 풀, True), 없으면 (원래 풀, False). 첫 번째 칸들은 그대로 둔다."""
+    taken, out, changed = set(), [], False
+    for o in pool:
+        key = (o.get("grade"), o.get("continent"))
+        if key in taken:
+            out.append(None)
+            changed = True
+        else:
+            taken.add(key)
+            out.append(o)
+    if not changed:
+        return pool, False
+    return [o if o is not None else _gen_one_offer(cur_grade, ovr_tier, my_cont, taken) for o in out], True
 
 
 def _load_or_generate_offer_pool(p) -> list:
@@ -181,6 +216,11 @@ def _load_or_generate_offer_pool(p) -> list:
         try:
             data = json.loads(pool_json)
             if isinstance(data, list) and data:
+                # [2026-10] 이 수정 전에 저장된 풀에 같은 등급·대륙이 겹쳐 있으면 겹친 칸만 바꿔 저장.
+                data, _chg = _dedupe_offer_pool(data, p.get("agent_grade", AGENT_NONE),
+                                                _ovr_tier(p.get("ovr", 40)), _my_continent(p))
+                if _chg:
+                    update_player(agent_offer_pool_json=json.dumps(data))
                 return data
         except Exception:
             pass
@@ -188,7 +228,8 @@ def _load_or_generate_offer_pool(p) -> list:
     cur_grade = p.get("agent_grade", AGENT_NONE)
     ovr_tier = _ovr_tier(p.get("ovr", 40))
     my_cont = _my_continent(p)
-    data = [_gen_one_offer(cur_grade, ovr_tier, my_cont) for _ in range(_MIN_AGENT_OFFERS)]
+    _taken = set()
+    data = [_gen_one_offer(cur_grade, ovr_tier, my_cont, _taken) for _ in range(_MIN_AGENT_OFFERS)]
 
     if cur_year:
         update_player(agent_offer_pool_json=json.dumps(data),
@@ -336,11 +377,16 @@ class AgentWindow(QDialog):
         ovr_tier = self.ovr_tier
         my_cont = _my_continent(p)
         new_pool = list(self.offer_pool)
+        _replace = set()
         for i, o in enumerate(new_pool):
             og = o.get("grade")
             og_idx = AGENT_GRADES.index(og) if og in AGENT_GRADES else -1
             if i == idx or og_idx < new_grade_idx:
-                new_pool[i] = _gen_one_offer(grade, ovr_tier, my_cont)
+                _replace.add(i)
+        # 그대로 남는 칸들의 (등급, 대륙)과 겹치지 않게 새로 뽑는다(16번).
+        _taken = {(o.get("grade"), o.get("continent")) for i, o in enumerate(new_pool) if i not in _replace}
+        for i in sorted(_replace):
+            new_pool[i] = _gen_one_offer(grade, ovr_tier, my_cont, _taken)
         update_player(agent_offer_pool_json=json.dumps(new_pool))
 
         self.accept()

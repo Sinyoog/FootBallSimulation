@@ -210,6 +210,8 @@ def search_teams(name_query=None, continent=None, country_id=None, grade=None, t
 # 아카이브 테이블이 없어 못 보여준다 — 지금은 "현재 소속팀 + 그 팀의
 # 최신 파워랭킹(전체/대륙)"까지만 제공하고, 아카이브 테이블이 생기면
 # get_ai_player_detail()에 시즌별 기록을 추가하는 식으로 확장한다.
+# [2026-10 주포·부포] 부포 조회(sub_positions.py) — 스위치 OFF면 get()은 항상 None.
+from sub_positions import get as _subp_get, enabled as _subp_enabled
 MY_PLAYER_ID = -1  # [2026-08 신설] "선수 검색" 결과에서 my_player(사용자
 # 본인 캐릭터)를 가리키는 예약 id. 실제 ai_players.id는 항상 1 이상의
 # 양수 autoincrement라 절대 충돌하지 않는다.
@@ -268,7 +270,8 @@ def _my_player_matches_filters(d, continent, nat_country_name, country_id, tier,
         return False
     if tier and d.get("tier") != tier:
         return False
-    if position and d.get("position") != position:
+    if position and d.get("position") != position and not (
+            _subp_enabled() and _subp_get(MY_PLAYER_ID) == position):   # [2026-10 주포·부포]
         return False
     if min_age is not None and (d.get("age") is None or d["age"] < min_age):
         return False
@@ -433,14 +436,99 @@ def _scope_team_ids(conn, country_id=None, league_id=None, team_id=None):
     return None
 
 
+# ── [2026-10 성능, 신민용 리포트: "AI 인물 100만 명 넘으니 세계 기록실 딜레이"] ──
+# 선수 검색 이름 입력. 예전 조건 "p.name LIKE ? OR p.nationality LIKE ? OR (팀/국가/지정
+# 이름 id 목록)"은 앞의 두 LIKE 때문에 인덱스를 못 타 글자마다 표 전체(현역 26만·은퇴
+# 27만+)를 읽었다(실측 한 글자 120~165ms, "AI1"처럼 거의 안 걸리는 글자일수록 끝까지 읽음).
+# 두 LIKE를 같은 뜻의 "값 목록"으로 바꾼다:
+#   · 이름 — 실명 폐지 뒤 이름이 있는 선수는 수백 명뿐이라 빈 이름을 뺀 부분 인덱스만
+#     훑어 id를 모은다(database.idx_*_name_nonempty).
+#   · 국적 — 국적 값은 국가 이름이라 "국가 표에서 LIKE로 고른 이름 IN (…)"과 같다. 혹시
+#     국가 표에 없는 값이 섞여 있으면 그 값들도 따로 LIKE로 걸러 목록에 넣는다(아래 캐시).
+#   · (은퇴) 마지막 팀명 — 팀 표의 이름 + 팀 표에 없는 옛 이름(캐시)에서 LIKE로 고른다.
+# 결과 집합은 완전히 같고, 각 조건이 인덱스를 탄다. 걸리는 선수가 아주 많으면(예: "FC")
+# 예전처럼 OVR 순 인덱스로 위에서부터 읽는 게 빠르므로 개수를 세어 정렬 방식을 고른다.
+_NAME_SEARCH_DENSE = 20000
+_EXTRA_VALUE_CACHE: dict = {}
+
+
+def _state_sig(conn):
+    try:
+        r = conn.execute("SELECT current_year, current_day FROM season_state WHERE id=1").fetchone()
+        return (r[0], r[1]) if r else None
+    except Exception:
+        return None
+
+
+def _values_outside(conn, table, col, ref_sql):
+    """table.col에 있는데 ref_sql(값 목록 SELECT)에는 없는 값들 — 하루(게임 날짜) 단위 캐시.
+    값이 바뀌는 건 시즌 진행(새 선수·은퇴)과 국적 편집(국가 이름만 허용)뿐이다."""
+    key = (table, col, _state_sig(conn))
+    hit = _EXTRA_VALUE_CACHE.get(key)
+    if hit is None:
+        hit = [r[0] for r in conn.execute(
+            f"SELECT DISTINCT {col} FROM {table} WHERE {col} IS NOT NULL AND {col} != '' "
+            f"AND {col} NOT IN ({ref_sql})").fetchall()]
+        for k in [k for k in _EXTRA_VALUE_CACHE if k[:2] == key[:2]]:
+            _EXTRA_VALUE_CACHE.pop(k, None)
+        _EXTRA_VALUE_CACHE[key] = hit
+    return hit
+
+
+def _like_filter_py(values, needle):
+    """SQLite LIKE '%needle%'와 같은 판정(ASCII만 대소문자 무시)을 파이썬에서."""
+    def _fold(x):
+        return "".join(ch.lower() if ch.isascii() else ch for ch in x)
+    n = _fold(needle)
+    return [v for v in values if n in _fold(v)]
+
+
+def _name_hit_terms(conn, table, alias, needle, team_ids=None, last_team=False):
+    """이름 입력 조건을 인덱스를 타는 OR 조건 목록으로 — (조건 문자열 목록, 파라미터)."""
+    like = f"%{needle}%"
+    terms, params = [], []
+    named = [r[0] for r in conn.execute(
+        f"SELECT id FROM {table} WHERE name != '' AND name LIKE ?", (like,)).fetchall()]
+    nats = [r[0] for r in conn.execute(
+        "SELECT name FROM countries WHERE name LIKE ?", (like,)).fetchall()]
+    nats += _like_filter_py(_values_outside(conn, table, "nationality", "SELECT name FROM countries"), needle)
+    if last_team:
+        lts = [r[0] for r in conn.execute(
+            "SELECT DISTINCT name FROM teams WHERE name LIKE ?", (like,)).fetchall()]
+        lts += _like_filter_py(_values_outside(conn, table, "last_team_name", "SELECT name FROM teams"), needle)
+        if lts:
+            terms.append(f"{alias}.last_team_name IN (%s)" % ",".join("?" * len(lts))); params += lts
+    if team_ids:
+        terms.append(f"{alias}.team_id IN (%s)" % ",".join("?" * len(team_ids))); params += list(team_ids)
+    if nats:
+        terms.append(f"{alias}.nationality IN (%s)" % ",".join("?" * len(nats))); params += nats
+    if named:
+        terms.append(f"{alias}.id IN (%s)" % ",".join("?" * len(named))); params += named
+    return terms, params
+
+
+def _name_hits_dense(conn, table, alias, terms, params):
+    """OR 조건에 걸리는 행이 _NAME_SEARCH_DENSE 이상인가(정렬 방식 선택용)."""
+    if not terms:
+        return False
+    n = conn.execute(
+        f"SELECT COUNT(*) FROM (SELECT 1 FROM {table} {alias} WHERE " + " OR ".join(terms)
+        + f" LIMIT {_NAME_SEARCH_DENSE})", params).fetchone()[0]
+    return n >= _NAME_SEARCH_DENSE
+
+
 def search_retired_ai_players(name_query=None, continent=None, nat_country_id=None,
                                 position=None, min_age=None, max_age=None, limit=200,
                                 natteam=False, natteam_year=None, team_id=None,
                                 country_id=None, league_id=None, team_mode="current",
                                 name_mode="all", custom_named_only=False,
                                 min_career_years=None, max_career_years=None,
-                                foreign_only=False):
-    """[2026-08 신설/수정, 신민용 요청: "은퇴한 선수도 차후 검색할 수
+                                foreign_only=False, managing_only=False):
+    """[2026-10 신설, 신민용 요청] managing_only=True면 지금 감독으로 일하는(클럽 또는
+    대표팀 현직 — managers.status 'club'/'nation', 은퇴 안 함) 은퇴 선수만 남긴다.
+    상세 화면의 "소속팀: 🧑‍💼 감독 — …" 표시와 같은 기준이다.
+
+    [2026-08 신설/수정, 신민용 요청: "은퇴한 선수도 차후 검색할 수
     있어야 해" / "필터에 현역·은퇴 버튼"] ai_players_retired(은퇴 스냅샷
     아카이브)에서 검색한다. 등급/부수 필터는 은퇴 선수엔 저장돼 있지 않아
     여전히 적용 대상이 아니다. search_ai_players(status="active")가 club
@@ -468,6 +556,8 @@ def search_retired_ai_players(name_query=None, continent=None, nat_country_id=No
     은퇴 검색이 team_id 필터에 한해 무조건 "career" 취급이었는데, 이제
     현역과 똑같이 이 토글을 따른다."""
     conn = get_conn()
+    _name_sparse = False    # [2026-10 성능] 이름 입력에 걸린 선수가 적은가(정렬 방식 선택)
+    _scope_ids = None
 
     decoded_pid = _decode_ai_code(name_query) if name_query else None
     # [2026-10 신민용 요청: "은퇴한 선수 OVR은 좌측에 최고점 OVR로"] 목록의 OVR은 전성기
@@ -504,7 +594,11 @@ def search_retired_ai_players(name_query=None, continent=None, nat_country_id=No
                 return []
             q += " AND r.nationality=?"; params.append(nat_row["name"])
         if position:
-            q += " AND r.position=?"; params.append(position)
+            if _subp_enabled():   # [2026-10 주포·부포] 부포로도 검색(스위치 OFF면 예전 SQL 그대로)
+                q += (" AND (r.position=? OR r.id IN (SELECT player_id FROM ai_player_sub_positions"
+                      " WHERE position=?))"); params.extend([position, position])
+            else:
+                q += " AND r.position=?"; params.append(position)
         if min_age is not None:
             q += " AND r.age>=?"; params.append(min_age)
         if max_age is not None:
@@ -530,6 +624,10 @@ def search_retired_ai_players(name_query=None, continent=None, nat_country_id=No
             params.append(max_career_years)
         if custom_named_only:
             q += " AND cust.custom_name IS NOT NULL AND cust.custom_name != ''"
+        if managing_only:
+            q += (" AND r.id IN (SELECT from_player_id FROM managers"
+                  " WHERE from_player_id IS NOT NULL AND retired=0"
+                  " AND status IN ('club','nation'))")
         if name_query:
             needle = name_query.strip()
             if needle:
@@ -539,8 +637,13 @@ def search_retired_ai_players(name_query=None, continent=None, nat_country_id=No
                 # 때)면 이 선수 자신의 식별용 필드(내가 지어준 이름)만
                 # 매칭하고, 국적/마지막 소속팀명은 아예 제외한다.
                 if name_mode == "code":
-                    q += " AND cust.custom_name LIKE ?"
-                    params += [like]
+                    # [2026-10 성능] 지정 이름 표(작음)에서 먼저 id를 뽑는다 — 결과는 같다.
+                    _ids_c = [rr[0] for rr in conn.execute(
+                        "SELECT player_id FROM ai_player_custom_names WHERE custom_name LIKE ?",
+                        (like,)).fetchall()]
+                    q += (" AND r.id IN (%s)" % ",".join("?" * len(_ids_c))) if _ids_c else " AND 0"
+                    params += _ids_c
+                    _name_sparse = True
                 else:
                     # [2026-09 성능수정, 위 search_ai_players의 같은 자리
                     # 주석 참고 — 신민용 리포트 "은퇴 검색도 마찬가지"]
@@ -554,12 +657,14 @@ def search_retired_ai_players(name_query=None, continent=None, nat_country_id=No
                     _like_custom = [rr["player_id"] for rr in conn.execute(
                         "SELECT player_id FROM ai_player_custom_names WHERE custom_name LIKE ?",
                         (like,)).fetchall()]
-                    _or = ["r.name LIKE ?", "r.nationality LIKE ?", "r.last_team_name LIKE ?"]
-                    _op = [like, like, like]
+                    # [2026-10 성능] r.name / r.nationality / r.last_team_name LIKE → 같은 뜻의
+                    # 값 목록(인덱스) — _name_hit_terms 주석 참고. 결과는 같다.
+                    _or, _op = _name_hit_terms(conn, "ai_players_retired", "r", needle, last_team=True)
                     if _like_custom:
                         _or.append("r.id IN (%s)" % ",".join("?" * len(_like_custom)))
                         _op += _like_custom
-                    q += " AND (" + " OR ".join(_or) + ")"
+                    _name_sparse = not _name_hits_dense(conn, "ai_players_retired", "r", _or, _op)
+                    q += (" AND (" + " OR ".join(_or) + ")") if _or else " AND 0"
                     params += _op
         _nt_sql, _nt_params = _natteam_filter_sql(natteam, natteam_year)
         if _nt_sql:
@@ -597,13 +702,18 @@ def search_retired_ai_players(name_query=None, continent=None, nat_country_id=No
     # 그대로 쓴다 — 은퇴 기록 시점과 최초 백필에서 peak_ovr은 항상 max(peak, ovr)로 채워진다.
     # 단, 팀/리그/국가 범위 필터가 있으면 대상이 적어 인덱스 순회보다 바로 정렬이 빠르다
     # (실측 401ms → 60ms) — "+r.peak_ovr"로 정렬 인덱스만 끈다(순서는 동일).
-    q += (" ORDER BY +r.peak_ovr DESC, r.id LIMIT ?" if (decoded_pid is None and _scope_ids is not None)
+    # [2026-10 성능] 이름 입력으로 걸린 선수가 적을 때도 같은 이유로 바로 정렬(_name_hits_dense).
+    q += (" ORDER BY +r.peak_ovr DESC, r.id LIMIT ?"
+          if (decoded_pid is None and (_scope_ids is not None or _name_sparse))
           else " ORDER BY r.peak_ovr DESC, r.id LIMIT ?")
     params.append(limit)
     rows = [dict(row) for row in conn.execute(q, params).fetchall()]
     conn.close()
     _annotate_natteam(rows)
     _annotate_career_span(rows)
+    # [2026-10 선출 감독] 감독이 된 은퇴 선수 — 목록에 "감독 전향" 표시용(일괄 조회).
+    from database import get_player_manager_ids
+    _became = get_player_manager_ids([r.get("player_id") or r.get("id") for r in rows])
     for r in rows:
         r["team_id"] = None
         r["team_name"] = None
@@ -615,6 +725,7 @@ def search_retired_ai_players(name_query=None, continent=None, nat_country_id=No
         r["flag"] = None
         r["grade"] = None
         r["is_retired"] = True
+        r["manager_id"] = _became.get(r.get("player_id") or r.get("id"))
     return rows
 
 
@@ -646,8 +757,10 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
                        status="active", limit=200, natteam=False, natteam_year=None,
                        team_id=None, team_mode="current", league_id=None, name_mode="all",
                        custom_named_only=False, min_career_years=None, max_career_years=None,
-                       foreign_only=False, team_year=None):
-    """[2026-08 수정, 신민용 요청: "국가와 국적을 나눠야 한다, 대륙은
+                       foreign_only=False, team_year=None, managing_only=False):
+    """[2026-10] managing_only: status="retired"일 때만 쓰인다 — search_retired_ai_players 참고.
+
+    [2026-08 수정, 신민용 요청: "국가와 국적을 나눠야 한다, 대륙은
     국적과 연관되어 있게"] 대륙(continent)/국적(nat_country_id)은 이제
     선수의 실제 국적(ai_players.nationality) 기준이고, 국가(country_id)는
     기존처럼 '현재 소속팀이 뛰는 나라'(클럽 리그 기준, search_teams와
@@ -723,7 +836,7 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
             country_id=country_id, league_id=league_id, team_mode=team_mode,
             name_mode=name_mode, custom_named_only=custom_named_only,
             min_career_years=min_career_years, max_career_years=max_career_years,
-            foreign_only=foreign_only)
+            foreign_only=foreign_only, managing_only=managing_only)
         conn.close()
         if _ty_ids is not None:
             rows = [r for r in rows if (r.get("id") if isinstance(r, dict) else r["id"]) in _ty_ids]
@@ -787,6 +900,7 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
          "LEFT JOIN ai_player_custom_names cust ON cust.player_id = p.id "
          "WHERE 1=1")
     params = []
+    _name_sparse = False    # [2026-10 성능] 이름 입력에 걸린 선수가 적은가(정렬 방식 선택)
     if continent:
         q += " AND nc.continent=?"; params.append(continent)
     nat_country_name = None
@@ -832,7 +946,11 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
     if tier and not _career_team:
         q += " AND l.tier=?"; params.append(tier)
     if position:
-        q += " AND p.position=?"; params.append(position)
+        if _subp_enabled():   # [2026-10 주포·부포] 부포로도 검색(스위치 OFF면 예전 SQL 그대로)
+            q += (" AND (p.position=? OR p.id IN (SELECT player_id FROM ai_player_sub_positions"
+                  " WHERE position=?))"); params.extend([position, position])
+        else:
+            q += " AND p.position=?"; params.append(position)
     if min_age is not None:
         q += " AND p.age>=?"; params.append(min_age)
     if max_age is not None:
@@ -894,8 +1012,13 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
                 # "이름" 필터는 화면에 실제로 보이는 식별용 필드(내가
                 # 지어준 커스텀 이름 + 식별코드)만 매칭해야 하므로 p.name
                 # 은 아예 뺀다.
-                q += " AND cust.custom_name LIKE ?"
-                params += [like]
+                # [2026-10 성능] 지정 이름 표(작음)에서 먼저 id를 뽑는다 — 결과는 같다.
+                _ids_c = [r[0] for r in conn.execute(
+                    "SELECT player_id FROM ai_player_custom_names WHERE custom_name LIKE ?",
+                    (like,)).fetchall()]
+                q += (" AND p.id IN (%s)" % ",".join("?" * len(_ids_c))) if _ids_c else " AND 0"
+                params += _ids_c
+                _name_sparse = True
             else:
                 # [2026-09 성능수정, 신민용 리포트: "60년을 돌린 후 선수
                 # 검색에도 딜레이가 있다 — 바로바로 되어야지"] 예전엔 이
@@ -925,18 +1048,14 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
                 _like_custom = [r["player_id"] for r in conn.execute(
                     "SELECT player_id FROM ai_player_custom_names WHERE custom_name LIKE ?",
                     (like,)).fetchall()]
-                _or = ["p.name LIKE ?", "p.nationality LIKE ?"]
-                _op = [like, like]
-                if _like_teams:
-                    _or.append("p.team_id IN (%s)" % ",".join("?" * len(_like_teams)))
-                    _op += _like_teams
-                if _like_nats:
-                    _or.append("p.nationality IN (%s)" % ",".join("?" * len(_like_nats)))
-                    _op += _like_nats
+                # [2026-10 성능] p.name / p.nationality LIKE → 같은 뜻의 값 목록(인덱스) —
+                # _name_hit_terms 주석 참고. 국가 표 LIKE(_like_nats)는 그 함수가 같이 넣는다.
+                _or, _op = _name_hit_terms(conn, "ai_players", "p", needle, team_ids=_like_teams)
                 if _like_custom:
                     _or.append("p.id IN (%s)" % ",".join("?" * len(_like_custom)))
                     _op += _like_custom
-                q += " AND (" + " OR ".join(_or) + ")"
+                _name_sparse = not _name_hits_dense(conn, "ai_players", "p", _or, _op)
+                q += (" AND (" + " OR ".join(_or) + ")") if _or else " AND 0"
                 params += _op
     # [2026-08 최적화, 동점 처리 명시화] 정렬 기준은 예전 그대로 "OVR
     # 내림차순 상위 N"이지만, 동점(같은 OVR) 선수들 사이의 순서는 여태
@@ -956,7 +1075,9 @@ def search_ai_players(name_query=None, continent=None, country_id=None, nat_coun
     # [2026-10 성능] 팀 필터가 걸리면 대상이 수십 명뿐이라 OVR 순 인덱스로 26만 명을 훑는
     # 것보다 그 수십 명을 바로 정렬하는 게 훨씬 빠르다(실측 243ms → 0ms). "+p.ovr"은
     # 정렬 순서는 같고 SQLite가 그 인덱스를 정렬용으로 쓰지 않게만 한다.
-    q += (" ORDER BY +p.ovr DESC, p.id LIMIT ?" if team_id else " ORDER BY p.ovr DESC, p.id LIMIT ?")
+    # [2026-10 성능] 이름 입력으로 걸린 선수가 적을 때도 같은 이유로 바로 정렬(_name_hits_dense).
+    q += (" ORDER BY +p.ovr DESC, p.id LIMIT ?" if (team_id or _name_sparse)
+          else " ORDER BY p.ovr DESC, p.id LIMIT ?")
     params.append(limit if not name_query else max(limit, 500))
     rows = [dict(r) for r in conn.execute(q, params).fetchall()]
     conn.close()
@@ -1107,6 +1228,22 @@ def get_ai_player_detail(player_id):
                       league_id=None, league_name=None, tier=None,
                       country_id=None, country=None, flag=None, grade=None, is_retired=True)
             d["foot"] = _derive_player_foot(conn, player_id, d.get("position"), None)
+            # [2026-10 선출 감독] 감독이 된 선수면 그 감독 id와 표시 문구.
+            from database import get_player_manager_ids
+            d["manager_id"] = get_player_manager_ids([player_id], conn).get(player_id)
+            d["manager_job"] = ""
+            if d["manager_id"]:
+                try:
+                    _mr = conn.execute("SELECT retired FROM managers WHERE id=?",
+                                       (d["manager_id"],)).fetchone()
+                    _mj = _manager_current_job(conn, d["manager_id"], bool(_mr and _mr[0]))
+                    # [2026-10 1번] 은퇴 감독은 "은퇴 · 13년 (2000~2012)"(소속 칸 글자만으로는
+                    # 은퇴인지 안 보이므로).
+                    d["manager_job"] = (_mj["current_job"] if _mj.get("current_kind") == "retired"
+                                        else _mj["current_team"])
+                except Exception:
+                    d["manager_job"] = ""
+            d["sub_position"] = _subp_get(player_id)   # [2026-10 주포·부포] 은퇴 선수도 부포 표시
             conn.close()
             return d
         d = dict(row)
@@ -1125,6 +1262,7 @@ def get_ai_player_detail(player_id):
             d["power_rank"] = rank
             d["power_rank_continent"] = crank
             d["power_rank_country"] = ctry_rank
+    d["sub_position"] = _subp_get(player_id)   # [2026-10 주포·부포] 없으면 None
     conn.close()
     return d
 
@@ -1282,6 +1420,21 @@ def get_ai_player_team_timeline(player_id, current_team_id):
                           "position": r["player_position"] or None,
                           "is_loan": bool(r["is_loan"])})
     return segments
+
+
+def is_ai_player_retired(player_id):
+    """[2026-10 8번] AI 선수가 은퇴했는가(ai_players_retired에 있고 ai_players엔 없음)."""
+    conn = get_conn()
+    try:
+        if conn.execute("SELECT 1 FROM ai_players WHERE id=?", (int(player_id),)).fetchone():
+            return False
+        try:
+            return bool(conn.execute("SELECT 1 FROM ai_players_retired WHERE id=?",
+                                     (int(player_id),)).fetchone())
+        except Exception:
+            return False
+    finally:
+        conn.close()
 
 
 def get_current_game_year():
@@ -1451,8 +1604,20 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
         f"SELECT year, ovr FROM hist.ai_player_ovr_history WHERE {_yc_o} AND player_id=?",
         (*_yp_o, player_id)).fetchall()}
     _cur_row = conn_ovrh.execute(
-        "SELECT ovr, created_year, contract_end_year FROM ai_players WHERE id=?",
+        "SELECT ovr, created_year, contract_end_year, "
+        "COALESCE(debut_contract_end_year, 0) AS debut_cend FROM ai_players WHERE id=?",
         (player_id,)).fetchone()
+    # [2026-10 신설] 첫 계약 만료연도(database ALTER 목록의 debut_contract_end_year
+    # 주석 참고). 은퇴 선수는 ai_players에 행이 없으므로 아카이브에서 읽는다.
+    _debut_cend = (_cur_row["debut_cend"] if _cur_row else 0) or 0
+    if not _cur_row:
+        try:
+            _rr = conn_ovrh.execute(
+                "SELECT COALESCE(debut_contract_end_year, 0) FROM ai_players_retired "
+                "WHERE id=?", (player_id,)).fetchone()
+            _debut_cend = (_rr[0] if _rr else 0) or 0
+        except Exception:   # 구 세이브(컬럼 없음) 등
+            _debut_cend = 0
     conn_ovrh.close()
     _cur_ovr_fallback = (_cur_row["ovr"] if _cur_row else None) or None
     # [2026-09 신설, 신민용 리포트: "첫 입단인데 계약년도만 뜨고 계약
@@ -1612,8 +1777,26 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
         # 입단 계약은 그 로그가 찍힌 오프시즌(발효연도-1)에 끝난 것이므로
         # 그 해를 만료연도로 쓴다. 뒤 로그가 없을 때만(그 계약이 아직
         # 이어지는 중) 지금 contract_end_year를 쓴다.
-        _next_logs = [h[0] for h in _salary_hist if h[0] > _span_start]
-        _span_cend = (min(_next_logs) - 1) if _next_logs else _cur_contract_end
+        # [2026-10 버그수정, 신민용 리포트: "상파울루랑 계약 1년(2000~2000)인데
+        # 보카가 이적료 166억을 주고 4년 계약으로 데려갔다"] 위 "다음 로그
+        # 직전 해 = 만료" 추정은 다음 로그가 **재계약(연장)**일 때만 맞다 —
+        # 재계약은 계약이 끝난 해에만 일어나기 때문. 다음 로그가 이적·임대·
+        # 입대면 계약은 도중에 끊긴 것이라 원래 만료연도와 무관한데도 그 해를
+        # 만료로 써서, 계약이 3년 남은 채 팔린 시드 선수가 "(계약: 1년)"으로
+        # 보였다(실제 시드 계약은 시작연도+3~5년). 이제 첫 계약 만료연도
+        # (debut_contract_end_year)가 기록돼 있으면 그 값을 그대로 쓴다 —
+        # 계약 기간은 "몇 년짜리 계약을 맺었나"이지 "그 팀에 몇 년 있었나"가
+        # 아니다(로그 분기의 "(계약: N년)"과 같은 정의).
+        # 기록이 없는 경우(구 세이브)만 예전 추정을 쓰되, 다음 로그가 연장이
+        # 아니면 기간을 알 수 없으므로 지어내지 않고 "(계약년도: N년)"으로 둔다.
+        _next_logs = [h for h in _salary_hist if h[0] > _span_start]
+        if _debut_cend > 0:   # -1 = 알 수 없음(구 세이브, database._migrate_debut_contract_v1)
+            _span_cend = _debut_cend
+        elif not _next_logs:
+            _span_cend = _cur_contract_end
+        else:
+            _first_next = min(_next_logs, key=lambda h: h[0])
+            _span_cend = (_first_next[0] - 1) if _first_next[2] == "연장" else None
         # 위 로그 분기와 같은 정의 — 기간 = 만료연도 - (첫 시즌 - 1).
         if _span_cend and _span_cend >= _span_start:
             e["salary_contract_years"] = _span_cend - _span_start + 1
@@ -2135,10 +2318,12 @@ def _hist_year_clause(conn, col="year"):
     if hit is None:
         lo = hi = None
         try:
-            row = conn.execute(
-                "SELECT MIN(year), MAX(year) FROM hist.ai_player_ovr_history").fetchone()
-            if row:
-                lo, hi = row[0], row[1]
+            # [2026-10 성능] MIN과 MAX를 한 쿼리로 물으면 SQLite가 인덱스 끝값 최적화를 못
+            # 해서 이력 표 전체를 읽는다(54만 명 세이브 1회 약 80ms, 해마다 커짐). 따로 물으면
+            # 각각 인덱스 한쪽 끝만 본다 — 값은 같다.
+            _lo = conn.execute("SELECT MIN(year) FROM hist.ai_player_ovr_history").fetchone()
+            _hi = conn.execute("SELECT MAX(year) FROM hist.ai_player_ovr_history").fetchone()
+            lo, hi = (_lo[0] if _lo else None), (_hi[0] if _hi else None)
         except Exception:
             pass
         if lo is None or hi is None:
@@ -4082,6 +4267,7 @@ def get_season_individual_awards(year, award_type):
         for grow in conn.execute(
                 f"SELECT * FROM goal_events WHERE id IN ({qmarks})", goal_ids).fetchall():
             goal_map[grow["id"]] = grow
+    _ctx_map = _goal_desc_map(conn, goal_ids)   # [2026-10] 주차·슛·상대
     conn.close()
 
     for r in rows:
@@ -4105,6 +4291,8 @@ def get_season_individual_awards(year, award_type):
         r["nationality"] = r.get("nationality") or d.get("nationality") or ""
         gid = r.get("goal_event_id")
         r["shot_desc"] = _goal_shot_desc(goal_map.get(gid)) if gid is not None else ""
+        if gid is not None and _ctx_map.get(gid):
+            r["shot_desc"] = _ctx_map[gid]
     return rows
 
 
@@ -4130,7 +4318,16 @@ WORLD_POTY_AWARD_TYPES = (
 )
 
 
-def get_world_poty_awards(year):
+# [2026-10 신설, 신민용 요청: "세계상 아래 토글을 야신상 | 푸스카스상 | 올해의 선수 | 골든보이 |
+# 베스트 11로 — 올해의 선수 탭엔 FIFA·UEFA·코메볼·AFC·CAF·콩카카프 올해의 선수만"]
+# FIFA 베스트 11은 이제 자기 탭(포메이션 그림)으로 옮겨 이 목록에서 뺀다.
+WORLD_POTY_ONLY_AWARD_TYPES = (
+    "FIFA 올해의 선수", "UEFA 올해의 선수", "코메볼 올해의 선수",
+    "AFC 올해의 선수", "CAF 올해의 선수", "콩카카프 올해의 선수",
+)
+
+
+def get_world_poty_awards(year, award_types=None):
     """그 해 FIFA 올해의 선수 + 대륙별 올해의 선수 수상자를 한 목록으로
     반환한다 — 각 행에 어느 상인지(award_type)를 같이 담는다.
 
@@ -4139,7 +4336,7 @@ def get_world_poty_awards(year):
     그 로직을 그대로 재사용한다(중복 구현 없음). 그 해 아직 계산되지 않은
     상(예: 후보가 아예 없던 대륙)은 자연스럽게 빠진다."""
     out = []
-    for award_type in WORLD_POTY_AWARD_TYPES:
+    for award_type in (award_types or WORLD_POTY_AWARD_TYPES):
         for r in get_season_individual_awards(year, award_type):
             r["award_type"] = award_type
             out.append(r)
@@ -4275,13 +4472,52 @@ WORLD_AWARD_STYLE = {
 AWARD_CATEGORY_ORDER = {"world": 0, "intl": 1, "club": 2, "cup": 3, "lower_cup": 4, "league": 5}
 
 
+def _goal_desc_map(conn, gids, with_shot=True):
+    """[2026-10 신설, 신민용 요청: "푸스카스상·올해의 골이 내 선수와 달리 간단하게만 뜬다 — 어떤
+    팀이랑 했을 때인지, 리그 올해의 골은 어떤 골인지도 떠야 한다"] goal_event_id → "12주차 ·
+    오버헤드킥, 초장거리 · vs 아스널" 형태의 설명. 내 선수 상세(game_engine._goal_detail_text)와
+    같은 정보(언제·어떤 슛·상대)를 짧게 담는다. 주차·상대가 없는 옛 AI 대표골은 있는 정보만.
+    with_shot=False면 슛 설명을 빼고 주차·상대만(표에 슛 설명 칸이 따로 있을 때)."""
+    out = {}
+    gids = [g for g in dict.fromkeys(gids) if g is not None]
+    if not gids:
+        return out
+    from game_engine import _goal_shot_desc
+    for i in range(0, len(gids), 500):
+        part = gids[i:i + 500]
+        for g in conn.execute(
+                f"""SELECT ge.id, ge.week, ge.shot_type, ge.goal_features, ge.opponent_team_id,
+                           ot.name AS opp_name
+                    FROM goal_events ge LEFT JOIN teams ot ON ot.id = ge.opponent_team_id
+                    WHERE ge.id IN ({','.join('?' * len(part))})""", part).fetchall():
+            bits = []
+            if g["week"]:
+                bits.append(f"{g['week']}주차")
+            if with_shot:
+                sd = _goal_shot_desc(g)
+                if sd:
+                    bits.append(sd)
+            if g["opp_name"]:
+                bits.append(f"vs {g['opp_name']}")
+            out[g["id"]] = " · ".join(bits)
+    return out
+
+
+def _award_label_with_goal(r, goal_map):
+    """_award_row_label + 골 상(올해의 골·푸스카스)이면 "(주차 · 슛 · vs 상대)"를 덧붙인다."""
+    label = _award_row_label(r)
+    gid = r["goal_event_id"] if "goal_event_id" in r.keys() else None
+    desc = goal_map.get(gid) if gid is not None else None
+    return f"{label} ({desc})" if desc else label
+
+
 def _award_row_label(r):
     """season_individual_awards 한 행 → 화면 표시용 라벨.
     [2026-09 분리] get_player_awards_with_year_highlight와 get_player_award_
     groups_by_year가 같은 라벨을 쓰도록 공용화했다 — 한쪽만 고쳐서 두 화면의
     상 이름이 갈라지는 일을 막는다. 분리 전 로직 그대로다."""
     kind = r["award_kind"] or r["award_type"]
-    if kind in ("발롱도르", "야신상", "FIFA 푸스카스상", "올해의 최고의 골"):
+    if kind in ("발롱도르", "야신상", "FIFA 푸스카스상", "올해의 최고의 골", "골든보이"):
         return f"{r['award_type']} {r['rank']}위"
     if kind == "베스트11":
         return f"{r['award_type']}" + (f" ({r['position']})" if r["position"] else "")
@@ -4308,15 +4544,17 @@ def get_player_award_groups_by_year(player_id):
     year_highlight와 완전히 동일하다."""
     conn = get_conn()
     rows = conn.execute(
-        """SELECT year, award_type, award_kind, rank, position, team_name, competition, category
+        """SELECT year, award_type, award_kind, rank, position, team_name, competition, category,
+                  goal_event_id
            FROM hist.season_individual_awards WHERE player_id=? ORDER BY year, rank""",
         (player_id,)).fetchall()
+    _gmap = _goal_desc_map(conn, [r["goal_event_id"] for r in rows])
     conn.close()
     by_year = {}
     _last_cat = len(AWARD_CATEGORY_ORDER)
     for r in rows:
         kind = r["award_kind"] or r["award_type"]
-        label = _award_row_label(r)
+        label = _award_label_with_goal(r, _gmap)
         _style = WORLD_AWARD_STYLE.get(kind)
         sort_key = ((0, _style[0]) if _style is not None
                     else (AWARD_CATEGORY_ORDER.get(r["category"] or "", _last_cat) + 1, 0))
@@ -4353,16 +4591,18 @@ def get_player_awards_with_year_highlight(player_id):
     두 번째 dict에 키가 없다(호출부가 기본 금색으로 폴백)."""
     conn = get_conn()
     rows = conn.execute(
-        """SELECT year, award_type, award_kind, rank, position, team_name, competition, category
+        """SELECT year, award_type, award_kind, rank, position, team_name, competition, category,
+                  goal_event_id
            FROM hist.season_individual_awards WHERE player_id=? ORDER BY year, rank""",
         (player_id,)).fetchall()
+    _gmap = _goal_desc_map(conn, [r["goal_event_id"] for r in rows])
     conn.close()
     by_year = {}
     best_world = {}   # year -> (우선순위, 색)
     _last_cat = len(AWARD_CATEGORY_ORDER)
     for r in rows:
         kind = r["award_kind"] or r["award_type"]
-        label = _award_row_label(r)
+        label = _award_label_with_goal(r, _gmap)
         _style = WORLD_AWARD_STYLE.get(kind)
         if _style is not None:
             # 세계상은 카테고리 맨 앞(0) 안에서 다시 발롱→야신→푸스카스.
@@ -4388,6 +4628,36 @@ def award_label_color(label, default="#ffd700"):
         if label.startswith(kind + " "):
             return color
     return default
+
+
+# [2026-10 21번, 신민용 요청: "2002 월드컵 상세에서 복사하면 2002년 월드컵에서
+# 받은 상은 안 떠야 한다 — 월드컵 시즌 전에 끝나는 대회(챔스·리그·컵 등) 상만"]
+# 그 해 클럽 시즌(43주차) 이후에 확정되는 상 = cutoff_year 스냅샷에서 빼야 하는 상:
+#   · category='intl'  — 국가대항전(월드컵/유로/코파/네이션스컵/지역컵 …), 44~52주차
+#   · competition='클럽월드컵' — category는 'club'이지만 국제대회와 같은 44~52주차
+#   · category='world' — 발롱도르/야신상/올해의 선수 등, 연도 전환 시점
+# 챔스/유로파/컨퍼런스(23주차), 슈퍼컵(29주차), 리그·국내컵은 그대로 둔다.
+LATE_SEASON_AWARD_CATEGORIES = ("intl", "world")
+LATE_SEASON_AWARD_COMPETITIONS = ("클럽월드컵",)
+
+
+def get_player_late_award_labels(player_id):
+    """{year: set(라벨)} — 위 기준의 "시즌 뒤에 확정되는 상" 라벨만.
+    라벨은 get_player_awards_with_year_highlight와 같은 _award_row_label로
+    만들어 그쪽 목록에서 그대로 빼낼 수 있다."""
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT year, award_type, award_kind, rank, position, team_name, competition, category,
+                  goal_event_id
+           FROM hist.season_individual_awards
+           WHERE player_id=? AND (category IN (?, ?) OR competition IN (?))""",
+        (player_id, *LATE_SEASON_AWARD_CATEGORIES, *LATE_SEASON_AWARD_COMPETITIONS)).fetchall()
+    _gmap = _goal_desc_map(conn, [r["goal_event_id"] for r in rows])   # 라벨이 위 두 함수와 같아야 뺄 수 있다
+    conn.close()
+    out = {}
+    for r in rows:
+        out.setdefault(r["year"], set()).add(_award_label_with_goal(r, _gmap))
+    return out
 
 
 def get_player_awards_by_year(player_id):
@@ -4545,9 +4815,12 @@ def _get_category_awards(year, category, competition=None, award_kind=None,
         _qm = ",".join("?" * len(_gids))
         _gmap = {g["id"]: g for g in conn.execute(
             f"SELECT * FROM goal_events WHERE id IN ({_qm})", _gids).fetchall()}
+        _ctx = _goal_desc_map(conn, _gids)   # [2026-10] 주차·슛·상대
         for r in rows:
             _gid = r.get("goal_event_id")
             r["shot_desc"] = _goal_shot_desc(_gmap.get(_gid)) if _gid is not None else ""
+            if _gid is not None and _ctx.get(_gid):
+                r["shot_desc"] = _ctx[_gid]
     return rows
 
 
@@ -4781,10 +5054,14 @@ def list_continental_cup_names():
     (intl_engine.start_intl_tournament), 대회가 열릴 시기(4년 주기)가 아직
     안 됐을 때만 이 목록이 비어있다.
     """
+    # [2026-10 A매치 탭 개편, 신민용 요청: "유로는 지역컵에서 보이게, 위치만"] 유로(EURO)는
+    # 데이터상 kind='continent' 그대로지만 세계기록실에서는 '지역컵' 목록에 표시한다 —
+    # 네이션스컵 목록·이력·최다 순위에서는 뺀다(대회 종류·트로피 집계 등 다른 곳은 그대로).
+    from constants import EURO_NAME
     conn = get_conn()
     rows = conn.execute(
-        "SELECT DISTINCT name FROM intl_tournaments WHERE kind='continent' "
-        "ORDER BY name").fetchall()
+        "SELECT DISTINCT name FROM intl_tournaments WHERE kind='continent' AND name<>? "
+        "ORDER BY name", (EURO_NAME,)).fetchall()
     conn.close()
     return [r["name"] for r in rows]
 
@@ -4792,11 +5069,14 @@ def list_continental_cup_names():
 def get_continental_cup_history(name=None, limit=100):
     """완료된 대륙컵(kind='continent') 대회의 연도별 1~4위 목록.
     name을 주면 그 대회(예: '아시안컵')만, 없으면 전체(여러 대륙 섞여서) 반환.
+    [2026-10] 유로(EURO)는 세계기록실에서 지역컵 쪽에 표시하므로 여기서는 제외한다
+    (list_continental_cup_names 주석 참고).
     """
+    from constants import EURO_NAME
     conn = get_conn(); c = conn.cursor()
     q = ("SELECT id, year, name FROM intl_tournaments "
-         "WHERE kind='continent' AND status='done' AND winner != ''")
-    params = []
+         "WHERE kind='continent' AND status='done' AND winner != '' AND name<>?")
+    params = [EURO_NAME]
     if name:
         q += " AND name=?"; params.append(name)
     q += " ORDER BY year DESC, id DESC LIMIT ?"
@@ -4825,21 +5105,29 @@ def get_continental_cup_rank_leaders(name=None):
 def list_region_cup_names():
     """지금까지 이 세이브에서 실제로 열린 적 있는 지역컵 이름 목록
     (대회명, 예: 'EAFF E-1 챔피언십') — 왼쪽 목록에 쓴다."""
+    # [2026-10] 유로(EURO)도 지역컵 목록에 함께 보여준다(데이터는 kind='continent' 그대로 —
+    # list_continental_cup_names 주석 참고). 이름순 정렬은 예전과 같다.
+    # [2026-10, 신민용 요청: "좌측에 유로를 맨 위, 바로 아래 코파 아메리카, 나머지는 나열"]
+    from constants import EURO_NAME
     conn = get_conn()
     rows = conn.execute(
         "SELECT DISTINCT name FROM intl_tournaments WHERE kind='region' "
-        "ORDER BY name").fetchall()
+        "OR (kind='continent' AND name=?) ORDER BY name", (EURO_NAME,)).fetchall()
     conn.close()
-    return [r["name"] for r in rows]
+    _top = {EURO_NAME: 0, "코파 아메리카": 1}
+    return sorted((r["name"] for r in rows), key=lambda n: (_top.get(n, 2), n))
 
 
 def get_region_cup_history(name=None, limit=100):
     """완료된 지역컵(kind='region') 대회의 연도별 1~4위 목록.
-    name을 주면 그 대회(예: 'EAFF E-1 챔피언십')만."""
+    name을 주면 그 대회(예: 'EAFF E-1 챔피언십')만.
+    [2026-10] 유로(EURO, kind='continent')도 지역컵 쪽에 함께 표시한다."""
+    from constants import EURO_NAME
     conn = get_conn(); c = conn.cursor()
     q = ("SELECT id, year, name FROM intl_tournaments "
-         "WHERE kind='region' AND status='done' AND winner != ''")
-    params = []
+         "WHERE (kind='region' OR (kind='continent' AND name=?)) "
+         "AND status='done' AND winner != ''")
+    params = [EURO_NAME]
     if name:
         q += " AND name=?"; params.append(name)
     q += " ORDER BY year DESC, id DESC LIMIT ?"
@@ -4855,6 +5143,105 @@ def get_region_cup_history(name=None, limit=100):
 # 이유·구조 — 지역컵도 참가자가 국가 자체다.
 def get_region_cup_rank_leaders(name=None):
     rows = get_region_cup_history(name=name, limit=999999)
+    return _rank_leaders_from_rows(rows, ("winner", "runner_up", "third", "fourth"), "{key}")
+
+
+# ─────────────────────────────────────────
+# 5.5 역대 친선전(랭킹 평가전) — [2026-10 신설, 신민용 요청: "친선전도 세계 축구 기록실에
+# 뜨게, A매치 탭 안에서"]
+# ─────────────────────────────────────────
+# 랭킹 평가전은 해마다 밴드별 대회(kind='power_eval', 16개국 조별리그 → 8강~결승·3/4위전)
+# 여러 개와, 16개국이 안 되는 나머지 밴드 하나(kind='power_eval_extra', 단일 조 리그전 —
+# 결승이 없음)로 열린다. 결승이 있는 대회는 다른 탭과 같은 _attach_placements_and_flags로,
+# 리그전만 있는 '나머지'는 조별 순위(승점→득실차→다득점→국가명)로 1~4위를 채운다.
+_FRIENDLY_KINDS = ("power_eval", "power_eval_extra")
+
+
+def _friendly_sort_key(name):
+    """'랭킹 평가전 - 10밴드'가 '2밴드'보다 앞에 오지 않게 밴드 번호순, '나머지'는 맨 뒤."""
+    import re
+    m = re.search(r"(\d+)\s*밴드", name or "")
+    return (0, int(m.group(1)), name) if m else (1, 0, name or "")
+
+
+def list_friendly_names():
+    """지금까지 열린 랭킹 평가전 대회명(밴드) 목록 — 밴드 번호순."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT DISTINCT name FROM intl_tournaments WHERE kind IN (?,?)", _FRIENDLY_KINDS).fetchall()
+    conn.close()
+    return sorted((r["name"] for r in rows), key=_friendly_sort_key)
+
+
+def _round_robin_top4(conn, tournament_id):
+    """리그전만 있는 대회의 1~4위 — 승점(승3·무1)→득실차→다득점→국가명 순."""
+    tab = {}
+    for m in conn.execute(
+            "SELECT home, away, home_score, away_score FROM intl_matches "
+            "WHERE tournament_id=? AND home_score>=0", (tournament_id,)).fetchall():
+        for side, gf, ga in ((m["home"], m["home_score"], m["away_score"]),
+                             (m["away"], m["away_score"], m["home_score"])):
+            if not side:
+                continue
+            t = tab.setdefault(side, [0, 0, 0])
+            t[0] += 3 if gf > ga else (1 if gf == ga else 0)
+            t[1] += gf - ga
+            t[2] += gf
+    order = sorted(tab, key=lambda n: (-tab[n][0], -tab[n][1], -tab[n][2], n))
+    keys = ("winner", "runner_up", "third", "fourth")
+    return {k: (order[i] if i < len(order) else "") for i, k in enumerate(keys)}
+
+
+def list_friendly_years():
+    """[2026-10, 신민용 요청: "밴드로 펼치면 너무 넓어진다 — '2003년 평가전'처럼 연도로 뜨고,
+    클릭하면 1밴드~나머지가 뜨게"] 랭킹 평가전이 열린(완료된 대회가 있는) 연도 — 최신순.
+    반환: [{"year":, "count": 그 해 대회(밴드) 수}]"""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT year, COUNT(*) AS n FROM intl_tournaments WHERE kind IN (?,?) AND status='done' "
+        "GROUP BY year ORDER BY year DESC", _FRIENDLY_KINDS).fetchall()
+    conn.close()
+    return [{"year": r["year"], "count": r["n"]} for r in rows]
+
+
+def get_friendly_history(name=None, limit=100, year=None):
+    """완료된 랭킹 평가전의 연도별 1~4위 목록(다른 역대 탭과 같은 행 형식).
+    name을 주면 그 밴드만, year를 주면 그 해만."""
+    conn = get_conn(); c = conn.cursor()
+    q = ("SELECT id, year, name, kind FROM intl_tournaments "
+         "WHERE kind IN (?,?) AND status='done'")
+    params = list(_FRIENDLY_KINDS)
+    if name:
+        q += " AND name=?"; params.append(name)
+    if year is not None:
+        q += " AND year=?"; params.append(int(year))
+    q += " ORDER BY year DESC, id DESC LIMIT ?"
+    params.append(limit)
+    rows = [dict(r) for r in c.execute(q, params).fetchall()]
+    rows = _attach_placements_and_flags(rows, conn)
+    rr = [r for r in rows if r.get("kind") == "power_eval_extra"]
+    if rr:
+        fill = {r["id"]: _round_robin_top4(conn, r["id"]) for r in rr}
+        names = {n for pl in fill.values() for n in pl.values() if n}
+        flags = {}
+        if names:
+            ph = ",".join("?" * len(names))
+            flags = {f["name"]: f["flag"] for f in conn.execute(
+                f"SELECT name, flag FROM countries WHERE name IN ({ph})", list(names)).fetchall()}
+        for r in rr:
+            for k, nat in fill[r["id"]].items():
+                r[k] = nat
+                r[f"{k}_flag"] = flags.get(nat, "")
+    conn.close()
+    for r in rows:
+        r.pop("kind", None)
+    # 같은 해 안에서는 1밴드 → … → 나머지 순으로 보이게 한다(id 역순이면 나머지가 맨 위).
+    rows.sort(key=lambda r: (-int(r["year"] or 0), _friendly_sort_key(r["name"])))
+    return rows
+
+
+def get_friendly_rank_leaders(name=None):
+    rows = get_friendly_history(name=name, limit=999999)
     return _rank_leaders_from_rows(rows, ("winner", "runner_up", "third", "fourth"), "{key}")
 
 
@@ -5455,8 +5842,25 @@ def get_player_intl_records(player_id, limit=100):
                WHERE s.player_id=?
                ORDER BY t.year DESC, t.id DESC LIMIT ?""",
             (player_id, limit)).fetchall()]
+    # [2026-10 신설, 신민용 확정 — "대표팀 후보군"] 소집 경쟁(후보군)에 들었지만
+    # 최종 26인에서 빠진 대회 — 국가대표 기록에 "후보탈락" 줄로 같이 보여준다
+    # (출전·성적은 "-"). 이미 그 대회 명단에 있으면(정상적으로는 없음) 넣지 않는다.
+    cut_rows = []
+    if player_id != MY_PLAYER_ID:
+        try:
+            _in_squad = {(r["tournament_id"], r["country"]) for r in squad_rows}
+            cut_rows = [dict(r) for r in c.execute(
+                """SELECT p.tournament_id, p.country, p.position, p.bucket, p.rank, p.score,
+                          t.year, t.kind, t.name, t.continent
+                   FROM intl_callup_pool p JOIN intl_tournaments t ON t.id = p.tournament_id
+                   WHERE p.player_id=?
+                   ORDER BY t.year DESC, t.id DESC LIMIT ?""",
+                (player_id, limit)).fetchall()
+                        if (r["tournament_id"], r["country"]) not in _in_squad]
+        except Exception:
+            cut_rows = []
     conn.close()
-    if not squad_rows:
+    if not squad_rows and not cut_rows:
         return []
 
     # [2026-09 신설, 신민용 리포트: "국가 검색 대회 포메이션에선 LW에 있는데
@@ -5490,7 +5894,7 @@ def get_player_intl_records(player_id, limit=100):
     # 국가별로 모아 get_country_tournament_results를 국가당 한 번만 호출
     # (한 선수가 복수 국적으로 서로 다른 나라 대표팀에 뽑힌 적이 있을 수
     # 있음 — 국가별로 결과 목록이 다르므로 따로 조회).
-    countries = {r["country"] for r in squad_rows}
+    countries = {r["country"] for r in squad_rows} | {r["country"] for r in cut_rows}
     results_by_key = {}
     for country in countries:
         for res in get_country_tournament_results(country, limit=limit):
@@ -5541,8 +5945,82 @@ def get_player_intl_records(player_id, limit=100):
                         "record": "", "appearances": r["appearances"], "position": _position,
                         "total_games": n_games, **_stat})
     conn2.close()
+    for r in cut_rows:
+        res = results_by_key.get((r["tournament_id"], r["country"]))
+        _nm = (res.get("name") if res else None) or _country_result_name(r)
+        out.append({"id": r["tournament_id"], "year": r["year"], "kind": r["kind"] or "?",
+                    "name": _nm, "country": r["country"], "result": "후보탈락",
+                    "record": "", "appearances": None, "position": r.get("position") or None,
+                    "total_games": 0, "callup_cut": True,
+                    "callup_bucket": r.get("bucket"), "callup_rank": r.get("rank"),
+                    "rating": 0, "goals": 0, "assists": 0, "clean_sheets": 0,
+                    "saves": 0, "goals_conceded": 0})
     out.sort(key=lambda x: (x["year"], x["id"]), reverse=True)
     return out
+
+
+def get_intl_callup_pool(tournament_id, country_name):
+    """[2026-10 신설, 신민용 확정 — "대표팀 후보군"] 이 대회 선발 당시 실제 소집
+    경쟁에 들어왔지만 최종 명단에서 빠진 선수(database.intl_callup_pool, 선발 시점
+    저장 — 현재 기준 재계산이 아니다). 반환: [(그룹, [선수 dict, ...]), ...] —
+    그룹 순서 GK/CB/LB/RB/DM/CM/AM/LW/RW/ST, 그룹 안은 그때 점수 순위.
+    선수 dict: id, display_name, position(당시), score, rank, ovr/club(지금, 은퇴면
+    마지막 소속), retired."""
+    from constants import ai_player_code
+    from database import get_ai_player_custom_names
+    from intl_engine import INTL_CALLUP_BUCKETS
+    conn = get_conn(); c = conn.cursor()
+    try:
+        rows = [dict(r) for r in c.execute(
+            "SELECT bucket, rank, player_id, score, position FROM intl_callup_pool "
+            "WHERE tournament_id=? AND country=? ORDER BY bucket, rank",
+            (tournament_id, country_name)).fetchall()]
+    except Exception:
+        rows = []
+    if not rows:
+        conn.close()
+        return []
+    ids = [r["player_id"] for r in rows]
+    ph = ",".join("?" * len(ids))
+    info = {r["id"]: dict(r) for r in c.execute(
+        f"""SELECT ap.id, ap.ovr, t.name AS club FROM ai_players ap
+            LEFT JOIN teams t ON t.id = ap.team_id WHERE ap.id IN ({ph})""", ids)}
+    _miss = [i for i in ids if i not in info]
+    if _miss:
+        ph2 = ",".join("?" * len(_miss))
+        for r in c.execute(f"SELECT id, ovr, last_team_name AS club FROM ai_players_retired "
+                           f"WHERE id IN ({ph2})", _miss):
+            d = dict(r); d["retired"] = True
+            info[r["id"]] = d
+    # [2026-10] 그 대회 최종 명단에 든 선수(이름 금색 표시용 — 화면에 글자로는 안 쓴다).
+    _picked = {r[0] for r in conn.execute(
+        "SELECT player_id FROM intl_squad WHERE tournament_id=? AND country=?",
+        (tournament_id, country_name))}
+    conn.close()
+    names = get_ai_player_custom_names(ids)
+    by_b = {}
+    for r in rows:
+        inf = info.get(r["player_id"], {})
+        by_b.setdefault(r["bucket"], []).append({
+            "id": r["player_id"], "picked": r["player_id"] in _picked,
+            "display_name": names.get(r["player_id"]) or ai_player_code(r["player_id"]),
+            "position": r["position"] or "", "score": r["score"] or 0.0, "rank": r["rank"],
+            "ovr": inf.get("ovr"), "club": inf.get("club") or "", "retired": bool(inf.get("retired"))})
+    return [(b, sorted(by_b[b], key=lambda x: x["rank"])) for b in INTL_CALLUP_BUCKETS if b in by_b]
+
+
+def get_country_year_callup_tournaments(country_name, year):
+    """[2026-10 신설] 그 해 이 나라가 26인을 소집한 대회 목록 [(tournament_id, 표시명)] —
+    감독 검색 대표팀 줄의 "후보 라인 / 최종 국대 인원" 버튼용(대회 순서 = id 순)."""
+    conn = get_conn()
+    try:
+        rows = [dict(r) for r in conn.execute(
+            """SELECT DISTINCT t.id, t.year, t.kind, t.name, t.continent
+               FROM intl_squad s JOIN intl_tournaments t ON t.id = s.tournament_id
+               WHERE s.country=? AND t.year=? ORDER BY t.id""", (country_name, year)).fetchall()]
+    finally:
+        conn.close()
+    return [(r["id"], _country_result_name(r)) for r in rows]
 
 
 def _country_result_name(t):
@@ -5631,6 +6109,11 @@ def get_intl_tournament_detail(tournament_id):
     # 안에 1차 조("A".."L")와 2차 조("S2-A"..) 엔트리가 함께 들어있다.
     _has_stage2 = any(e["grp"].startswith("S2-") for e in entries)
 
+    # [2026-10 6번, 신민용 요청: "조 이름을 누르면 그 조 경기들이 몇 대 몇이었는지"] 조별 경기
+    # 결과 목록 — {조: [{home, away, home_score, away_score}, ...]}(치른 순서). 순위 계산에
+    # 이미 읽는 같은 경기들이라 질의를 더 하지 않는다.
+    group_matches = {}
+
     def _build_groups(stage_entries, stage_names):
         groups = {}
         for e in stage_entries:
@@ -5641,11 +6124,15 @@ def get_intl_tournament_detail(tournament_id):
         placeholders = ",".join("?" * len(stage_names))
         for m in c.execute(
                 f"SELECT grp, home, away, home_score, away_score FROM intl_matches "
-                f"WHERE tournament_id=? AND stage IN ({placeholders}) AND home_score>=0",
+                f"WHERE tournament_id=? AND stage IN ({placeholders}) AND home_score>=0 "
+                f"ORDER BY id",
                 (tournament_id, *stage_names)).fetchall():
             h, a = idx.get((m["grp"], m["home"])), idx.get((m["grp"], m["away"]))
             if not h or not a:
                 continue
+            group_matches.setdefault(m["grp"], []).append(
+                {"home": m["home"], "away": m["away"],
+                 "home_score": m["home_score"], "away_score": m["away_score"]})
             h["gf"] += m["home_score"]; h["ga"] += m["away_score"]
             a["gf"] += m["away_score"]; a["ga"] += m["home_score"]
             if m["home_score"] > m["away_score"]:   h["wins"] += 1;  a["losses"] += 1
@@ -5712,7 +6199,7 @@ def get_intl_tournament_detail(tournament_id):
                 qualified.add(m["away"])
 
     return {"groups": groups, "groups2": groups2, "advanced_from_stage1": advanced_from_stage1,
-            "knockout": knockout, "qualified": qualified}
+            "knockout": knockout, "qualified": qualified, "group_matches": group_matches}
 
 
 def _intl_match_winner_loser(m):
@@ -6044,6 +6531,34 @@ def _my_intl_squad_entry(c, tournament_id, country_name):
             "starter": apps > 0, "display_name": me["name"] or "나"}
 
 
+def get_intl_formation(tournament_id, country_name, conn=None):
+    """[2026-10 신설] 그 대회에서 그 나라 대표팀이 쓴 포메이션 이름(없으면 "").
+    intl_formations(그 대회 감독 성향으로 고른 값)를 먼저 보고, 그 표가 생기기
+    전 대회는 저장된 주전 자리(intl_squad.slot) 구성과 같은 포메이션을 찾는다."""
+    _own = conn is None
+    conn = conn or get_conn()
+    try:
+        try:
+            r = conn.execute("SELECT formation FROM intl_formations "
+                             "WHERE tournament_id=? AND country=?",
+                             (tournament_id, country_name)).fetchone()
+        except Exception:
+            r = None
+        if r and r[0]:
+            return r[0]
+        try:
+            slots = [x[0] for x in conn.execute(
+                "SELECT slot FROM intl_squad WHERE tournament_id=? AND country=? "
+                "AND starter=1 AND COALESCE(slot,'')<>''", (tournament_id, country_name))]
+        except Exception:
+            slots = []
+        from intl_engine import _formation_from_slots
+        return _formation_from_slots(slots) or ""
+    finally:
+        if _own:
+            conn.close()
+
+
 def get_country_tournament_squad(tournament_id, country_name):
     """[2026-08 신설, 신민용 요청: "국가 검색에서 대회를 클릭하면 그 대회
     당시 이 나라 주전들과 후보들이 떠야 한다"] intl_squad에 이미 저장돼
@@ -6149,9 +6664,15 @@ def get_country_tournament_squad(tournament_id, country_name):
     if _me_entry is not None:
         squad.append(_me_entry)
 
-    approx = not any(r["starter"] for r in squad)
+    # [2026-10 버그수정, 신민용 리포트: "플레이어가 들어가니 국가대표 선수 다 사라진다"]
+    # 주전 기록 유무는 AI 행만 보고 판단한다. 예전엔 나(starter = 한 경기라도 뛰었으면 True)까지
+    # 같이 봐서, AI 주전이 기록되지 않은 대회(내가 전 경기를 뛴 대회 — 내 경기 경로가 주전을 안
+    # 남기던 버그, intl_engine._record_my_intl_squad로 수정)에서 "주전 기록 있음"으로 오판해
+    # 나 혼자만 주전, AI 25명은 전부 후보로 떨어졌다. 이제 그런 대회는 예전 근사 표시와 같이
+    # 출전 많은 순(같으면 OVR 높은 순) 11명을 주전으로 본다.
+    approx = not any(r["starter"] for r in squad if r.get("id") != MY_PLAYER_ID)
     if approx:
-        squad.sort(key=lambda r: -(r["appearances"] or 0))
+        squad.sort(key=lambda r: (-(r["appearances"] or 0), -(r["ovr"] or 0)))
         starters, bench = squad[:11], squad[11:]
     else:
         starters = [r for r in squad if r["starter"]]
@@ -6192,6 +6713,150 @@ def get_wc_qualifier_summary(wc_year):
     for r in rows:
         by_conf.setdefault(r["continent"] or "기타", []).append(r)
     return by_conf
+
+
+# [2026-10 신설, 신민용 요청: "예선전도 우측(참가국 순위)에 뜨게 — 예선 통과 국가, 그다음
+# 예선 탈락 국가. 플레이오프가 있으면 PO로 통과한 나라는 예선 통과 맨 마지막, PO에서 떨어진
+# 나라는 예선 탈락 맨 위"] 본선 대회(월드컵·유로 등) 하나에 딸린 예선 대회들(같은 해 wc_qual /
+# 같은 대륙 cont_qual)을 모아 예선 순위를 만든다. 예선이 없는 대회(대륙 네이션스컵·지역컵·친선전)는
+# 빈 리스트 — 화면은 이때 예선 순위 버튼 자체를 안 띄운다.
+#   순서: 예선 통과(직행) → 예선 통과(PO) → 예선 탈락(PO) → 예선 탈락(2차 조별) →
+#         예선 탈락(조별) → 예선 탈락(컷오프 — 하위 랭킹이라 예선 경기 없이 탈락)
+#   같은 구간 안: 연맹 순 → 예선 승점 → 득실차 → 다득점 → 국가명.
+_QUAL_CONF_ORDER = {"유럽": 0, "남미": 1, "북미": 2, "아시아": 3, "아프리카": 4}
+
+
+def get_intl_tournament_kind(tid):
+    """[2026-10] 국제대회 id → kind(없으면 '')."""
+    if not tid:
+        return ""
+    conn = get_conn()
+    try:
+        r = conn.execute("SELECT kind FROM intl_tournaments WHERE id=?", (tid,)).fetchone()
+        return (r["kind"] if r else "") or ""
+    finally:
+        conn.close()
+
+
+def get_intl_main_for_qualifier(qual_tid):
+    """[2026-10] 예선 대회 id → 그 예선이 가리키는 본선 대회 id(아직 본선이 없으면 None).
+    wc_qual → 같은 해 월드컵, cont_qual → 같은 해·같은 대륙 대륙컵(유로/유럽 네이션스컵).
+    예선이 아닌 대회면 None."""
+    conn = get_conn()
+    try:
+        q = conn.execute("SELECT year, kind, continent FROM intl_tournaments WHERE id=?",
+                         (qual_tid,)).fetchone()
+        if not q or q["kind"] not in ("wc_qual", "cont_qual"):
+            return None
+        if q["kind"] == "wc_qual":
+            r = conn.execute("SELECT id FROM intl_tournaments WHERE year=? AND kind='world' "
+                             "ORDER BY id LIMIT 1", (q["year"],)).fetchone()
+        else:
+            r = conn.execute("SELECT id FROM intl_tournaments WHERE year=? AND kind IN "
+                             "('continent','region') AND continent=? ORDER BY id LIMIT 1",
+                             (q["year"], q["continent"])).fetchone()
+        return r["id"] if r else None
+    finally:
+        conn.close()
+
+
+def get_intl_qualifier_placements(tournament_id):
+    """반환: [{"country", "flag", "continent"(국가 대륙), "placement"(표시 라벨),
+    "rank_order", "tid"(그 나라가 뛴 예선 대회 id — 라인업 조회용, 컷오프는 None),
+    "confederation"(그 예선의 연맹 — 유럽/아시아/아프리카/남미/북미)}]
+
+    [2026-10 확장, 신민용 리포트: "국가 검색에서 예선전을 열면 우측에 예선 순위가 안 뜬다"]
+    tournament_id에 예선 대회(wc_qual/cont_qual)를 넘겨도 된다 — 그때는 그 예선 하나(그 연맹)만
+    순위를 만든다. 통과 여부는 본선이 있으면 본선 참가국으로, 본선이 아직 없으면(예선 직후)
+    qual_results(예선 통과 기록)로 판정한다."""
+    from constants import CONFEDERATIONS
+    conn = get_conn()
+    try:
+        t = conn.execute("SELECT year, kind, continent FROM intl_tournaments WHERE id=?",
+                         (tournament_id,)).fetchone()
+        if not t:
+            return []
+        main_override = None
+        if t["kind"] in ("wc_qual", "cont_qual"):
+            quals = [{"id": tournament_id, "continent": t["continent"]}]
+            _main_tid = get_intl_main_for_qualifier(tournament_id)
+            if _main_tid:
+                tournament_id = _main_tid
+            else:
+                _qk = "world" if t["kind"] == "wc_qual" else "continent"
+                main_override = {r["country"] for r in conn.execute(
+                    "SELECT country FROM qual_results WHERE target_year=? AND kind=?",
+                    (t["year"], _qk))}
+        elif t["kind"] == "world":
+            quals = conn.execute(
+                "SELECT id, continent FROM intl_tournaments WHERE year=? AND kind='wc_qual' "
+                "ORDER BY id", (t["year"],)).fetchall()
+        elif t["kind"] in ("continent", "region") and t["continent"]:
+            quals = conn.execute(
+                "SELECT id, continent FROM intl_tournaments WHERE year=? AND kind='cont_qual' "
+                "AND continent=? ORDER BY id", (t["year"], t["continent"])).fetchall()
+        else:
+            quals = []
+        if not quals:
+            return []
+        if main_override is not None:
+            main = main_override
+            if not main:
+                return []    # 예선이 아직 진행 중이라 통과국이 정해지지 않았다
+        else:
+            main = {r["country"] for r in conn.execute(
+                "SELECT DISTINCT country FROM intl_entries WHERE tournament_id=?", (tournament_id,))}
+        info = {r["name"]: (r["flag"] or "", r["continent"] or "") for r in conn.execute(
+            "SELECT name, flag, continent FROM countries")}
+        out = {}
+        for q in quals:
+            qid, conf = q["id"], (q["continent"] or "")
+            entrants = {r["country"] for r in conn.execute(
+                "SELECT DISTINCT country FROM intl_entries WHERE tournament_id=?", (qid,))}
+            rec = {c: [0, 0, 0] for c in entrants}      # 승점, 득실차, 다득점(조별 1·2차 합산)
+            stage2, po_teams = set(), set()
+            for m in conn.execute(
+                    "SELECT stage, home, away, home_score, away_score FROM intl_matches "
+                    "WHERE tournament_id=? AND home_score>=0", (qid,)):
+                if m["stage"] == "qual_po":
+                    po_teams.update(x for x in (m["home"], m["away"]) if x)
+                    continue
+                if m["stage"] == "qual_group2":
+                    stage2.update(x for x in (m["home"], m["away"]) if x)
+                for side, gf, ga in ((m["home"], m["home_score"], m["away_score"]),
+                                     (m["away"], m["away_score"], m["home_score"])):
+                    if side in rec:
+                        rec[side][0] += 3 if gf > ga else (1 if gf == ga else 0)
+                        rec[side][1] += gf - ga
+                        rec[side][2] += gf
+            for c in entrants:
+                if c in main:
+                    order, label = (1, "예선 통과(PO)") if c in po_teams else (0, "예선 통과")
+                elif c in po_teams:
+                    order, label = 2, "예선 탈락(PO)"
+                elif stage2 and c in stage2:
+                    order, label = 3, "예선 탈락(2차 조별)"
+                else:
+                    order, label = 4, "예선 탈락(조별)"
+                out.setdefault(c, (order, label, conf, rec.get(c, [0, 0, 0]), qid))
+            # 같은 연맹인데 예선 명단에 없는 나라 = 하위 컷오프(경기 없이 탈락)
+            conts = set(CONFEDERATIONS.get(conf, [conf]))
+            for name, (_flag, cont) in info.items():
+                if cont in conts and name not in entrants and name not in main:
+                    out.setdefault(name, (5, "예선 탈락(컷오프)", conf, [0, 0, 0], None))
+        rows = []
+        for c, (order, label, conf, r, qid) in out.items():
+            flag, cont = info.get(c, ("", ""))
+            rows.append({"country": c, "flag": flag, "continent": cont, "placement": label,
+                         "rank_order": order, "tid": qid,
+                         "confederation": conf,      # [2026-10] 그 나라가 치른 예선의 연맹(우측 대륙 버튼 필터용)
+                         "_k": (order, _QUAL_CONF_ORDER.get(conf, 9), -r[0], -r[1], -r[2], c)})
+        rows.sort(key=lambda x: x["_k"])
+        for x in rows:
+            x.pop("_k", None)
+        return rows
+    finally:
+        conn.close()
 
 
 # ─────────────────────────────────────────
@@ -6406,14 +7071,19 @@ def get_cwc_tournament_detail(tournament_id):
             "country": e["country"], "grade": e["grade"],
             "wins": 0, "draws": 0, "losses": 0, "gf": 0, "ga": 0}
 
+    group_matches = {}      # [2026-10 6번] 조별 경기 결과(get_intl_tournament_detail과 같은 형태)
     for m in c.execute(
             "SELECT home_team_id, away_team_id, home_score, away_score "
             "FROM cwc_matches WHERE tournament_id=? AND stage='group' "
-            "AND home_score>=0", (tournament_id,)).fetchall():
+            "AND home_score>=0 ORDER BY id", (tournament_id,)).fetchall():
         for g, tbl in groups_tbl.items():
             h, a = tbl.get(m["home_team_id"]), tbl.get(m["away_team_id"])
             if not h or not a:
                 continue
+            group_matches.setdefault(g, []).append(
+                {"home": h["name"], "away": a["name"],
+                 "home_country": h.get("country"), "away_country": a.get("country"),
+                 "home_score": m["home_score"], "away_score": m["away_score"]})
             h["gf"] += m["home_score"]; h["ga"] += m["away_score"]
             a["gf"] += m["away_score"]; a["ga"] += m["home_score"]
             if m["home_score"] > m["away_score"]:   h["wins"] += 1;  a["losses"] += 1
@@ -6447,7 +7117,8 @@ def get_cwc_tournament_detail(tournament_id):
     knockout = [{"stage": s, "stage_ko": _CWC_STAGE_KO.get(s, s), "matches": ko_by_stage[s]}
                 for s in _CWC_KO_STAGE_ORDER if s in ko_by_stage]
 
-    return {"groups": groups, "league_standings": [], "knockout": knockout}
+    return {"groups": groups, "league_standings": [], "knockout": knockout,
+            "group_matches": group_matches}
 
 def get_po_results(league_id, year, direction="relegation"):
     # [2026-10 병역 시스템] 군데스리가는 별도 표(military_po)에서 읽는다.
@@ -6559,6 +7230,57 @@ _TEAM_YEAR_ENTRY_CACHE_MAX = 50000
 def clear_team_history_cache():
     """새 게임/DB 초기화 시 database.py가 호출 — 위 캐시 주석 참고."""
     _TEAM_YEAR_ENTRY_CACHE.clear()
+    _PO_SIDE_CACHE.clear()
+
+
+# [2026-10 18번, 신민용 요청: "승격 플레이오프에 들어갔던 팀은 [승격 플레이오프 탈락](귤색),
+# 강등 플레이오프 참가팀은 [강등 플레이오프 생존]"] 연도 → {팀 id: {(위 리그 id, 아래 리그 id)}}.
+# 끝난 해의 PO 기록은 바뀌지 않으므로 올해 이전만 캐시한다(새 게임 때 위 함수가 비움).
+_PO_SIDE_CACHE: dict = {}
+
+PO_FAIL_TAG = "[승격 플레이오프 탈락]"
+PO_SURVIVE_TAG = "[강등 플레이오프 생존]"
+
+
+def _po_sides_for_year(conn, year):
+    year = int(year)
+    hit = _PO_SIDE_CACHE.get(year)
+    if hit is not None:
+        return hit
+    out = {}
+    try:
+        for r in conn.execute(
+                """SELECT m.home_team_id, m.away_team_id, t.upper_league_id, t.lower_league_id
+                   FROM po_matches m JOIN po_tournaments t ON t.id = m.tournament_id
+                   WHERE t.year = ? AND m.home_score != -1""", (year,)).fetchall():
+            for tid in (r[0], r[1]):
+                if tid:
+                    out.setdefault(int(tid), set()).add((r[2], r[3]))
+    except Exception:
+        return {}
+    if year < get_current_game_year():
+        _PO_SIDE_CACHE[year] = out
+    return out
+
+
+def league_text_color(text, champion=False):
+    """[2026-10 18번] 리그 칸 글자색 — 팀 검색·선수 커리어·감독 커리어가 같이 쓴다.
+    실제 승격(파랑) > 실제 강등(빨강) > 승격 PO 탈락(귤색) > 강등 PO 생존(연한 빨강) >
+    1부 우승(금색) > 그 외. 예전엔 글자에 "승격"/"강등"만 있으면 색을 칠해서, PO 표기가
+    생기면 "승격 플레이오프 탈락"이 승격(파랑)으로 잘못 칠해진다 — 실제 이동 표기
+    ("…로 승격]" / 진행 중인 올해 "…에서 승격]")로만 판정한다."""
+    t = text or ""
+    if "로 승격]" in t or "에서 승격]" in t:
+        return "#4da6ff"
+    if "로 강등]" in t or "에서 강등]" in t:
+        return "#ff5555"
+    if PO_FAIL_TAG in t:
+        return "#ffa040"
+    if PO_SURVIVE_TAG in t:
+        return "#ff9e9e"
+    if champion:
+        return "#ffd700"
+    return "#ddd"
 
 
 def get_team_history(team_id: int, year_range=None):
@@ -6715,6 +7437,14 @@ def get_team_history(team_id: int, year_range=None):
             if move:
                 kind = "승격" if move["to_tier"] < lg["tier"] else "강등"
                 move_txt = f"  [{move['dest_name']}({move['to_tier']}부)로 {kind}]"
+            else:
+                # [2026-10 18번] 승강 PO에 나갔지만 부수가 그대로인 팀 — 아래 리그 쪽(승격 도전)
+                # 이면 승격 PO 탈락, 위 리그 쪽(강등 위기)이면 강등 PO 생존.
+                _sides = _po_sides_for_year(conn, year).get(int(team_id)) or ()
+                if any(lo == league_id for _up, lo in _sides):
+                    move_txt = f"  {PO_FAIL_TAG}"
+                elif any(up == league_id for up, _lo in _sides):
+                    move_txt = f"  {PO_SURVIVE_TAG}"
             entry["league"] = f"{lg['name']}({lg['tier']}부) [{rank}등/{len(standings)}팀]{move_txt}"
             # [2026-08 신설] 1부 우승만 "리그 우승"으로 친다 — 하위 부수
             # 1등은 보통 승격이라 이미 승격색(파란색)이 우선 표시되고,
@@ -7048,6 +7778,1037 @@ def get_team_history(team_id: int, year_range=None):
     return {"awards": awards, "years": out}
 
 
+# ════════════════════════════════════════════════════════════════
+# [2026-10 신설 — 감독 표시 ①단계] 감독 조회
+#
+# 신민용 요청: "팀 검색 → 연도 포메이션에서 주전 위에 감독 칸, 클릭하면
+# 간단 변경(이름 | 국적 | 스타일)". 이 단계는 **조회/표시만** 한다 — 감독
+# 생성·이동·경기 로직은 하나도 건드리지 않는다.
+#
+# [연도 → 감독 해석 규칙] team_managers.start_year의 뜻이 두 가지로 섞여 있다:
+#   - 세계 최초 생성(database._migrate_managers) : start_year = 그 해를 지휘
+#   - 시즌 끝 감독 시장(ai_lifecycle._manager_turnover) : start_year = **끝난**
+#     해(그 다음 시즌부터 지휘) — _maybe_change_manager도 이 뜻으로 읽는다
+# 그래서 start_year로 단순 조회하면 교체가 있던 해에 두 명이 걸리고 후임이
+# 잘못 뜬다. 게임 로직을 바꾸지 않고 읽는 쪽에서 푼다:
+#   Y년 감독 = Y년에 재임 중이던 행 중 **Y년에 끝난 행**(그 해를 지휘하고
+#             떠남)이 있으면 그 행, 없으면 지금도 이어지는 행.
+# 대표팀 이동(moved_to_nation)은 시즌 도중 클럽 자리를 비우는데, 그 해는
+# 떠난 감독으로 표시한다(그 해 대부분을 지휘했으므로).
+# ════════════════════════════════════════════════════════════════
+def _pick_tenure_for_year(rows, year):
+    """rows: id/start_year/end_year를 가진 재임 행들. 위 규칙으로 Y년 재임 1개."""
+    y = int(year)
+    cands = [r for r in rows
+             if (r["start_year"] or 0) <= y and (r["end_year"] is None or r["end_year"] >= y)]
+    if not cands:
+        return None
+    ended = [r for r in cands if r["end_year"] == y]
+    if ended:
+        # 같은 해에 끝난 행이 둘이면(시즌 끝에 막 부임했다가 같은 오프시즌에
+        # 대표팀으로 떠난 경우 등) 먼저 시작한 쪽이 그 해를 실제로 지휘했다.
+        return min(ended, key=lambda r: r["id"])
+    return max(cands, key=lambda r: r["id"])
+
+
+def _manager_years_managed(conn, cur_year):
+    """[2026-10 신민용 요청] 감독별 "감독으로 일한 햇수" — {manager_id: 년 수}.
+
+    클럽(team_managers)과 대표팀(national_team_managers)을 **합쳐** 실제로 지휘한
+    연도의 합집합 크기다. 예전 "경력" 필터는 managers.seasons_managed(클럽 시장이
+    시즌마다 올리는 값)라 대표팀 재임은 하나도 안 셌다.
+
+    연도 판정은 _pick_tenure_for_year와 같은 규칙을 재임 행 단위로 푼 것이다:
+    재임 행은 start_year~end_year(재임 중이면 올해)를 지휘하되, 같은 자리(같은 팀 /
+    같은 나라 대표팀)의 다른 행이 그 시작 연도에 끝났으면 그 해는 전임자 몫이라
+    뺀다(시즌 끝 시장의 start_year는 "끝난 해" — 다음 시즌부터 지휘). 한 해에 클럽과
+    대표팀을 같이 걸쳐도(시즌 중 대표팀 이동) 합집합이라 한 번만 센다."""
+    return {mid: len(ys) for mid, ys in _manager_year_sets(conn, cur_year).items()}
+
+
+def _feed_tenure_years(rows, cur_year, years):
+    """재임 행 [(id, 자리 키, 감독 id, start_year, end_year)] → years{감독 id: 지휘 연도 set}에
+    더한다(_manager_years_managed docstring의 규칙). 자리 키: 클럽 = team_id, 대표팀 = −country_id."""
+    ended = {}                                   # (자리, 끝난 해) -> 그 행들의 id
+    for r in rows:
+        if r[4] is not None:
+            ended.setdefault((r[1], int(r[4])), []).append(int(r[0]))
+    for rid, slot, mid, sy, ey in rows:
+        if sy is None or mid is None:
+            continue
+        sy = int(sy)
+        last = int(ey) if ey is not None else cur_year
+        first = sy
+        # 같은 자리의 다른 행이 시작 연도에 끝났으면 그 해는 그쪽(먼저 시작한 쪽).
+        if any(o != rid and o < rid for o in ended.get((slot, sy), ())):
+            first = sy + 1
+        if first <= last:
+            years.setdefault(int(mid), set()).update(range(first, last + 1))
+
+
+def _manager_year_sets(conn, cur_year, manager_id=None):
+    """{감독 id: 실제로 지휘한 연도 set}(클럽+대표팀 합집합). manager_id를 주면 그 감독이
+    맡았던 자리의 재임 행만 읽는다(한 명 조회용 — 결과는 전체 조회와 같다)."""
+    cur_year = int(cur_year)
+    years = {}
+    if manager_id is None:
+        _club_sql = "SELECT id, team_id, manager_id, start_year, end_year FROM team_managers"
+        _nat_sql = ("SELECT id, -country_id, manager_id, start_year, end_year "
+                    "FROM national_team_managers")      # 음수 = 팀 id와 안 겹치는 자리 키
+        _args = ()
+    else:
+        _club_sql = ("SELECT id, team_id, manager_id, start_year, end_year FROM team_managers "
+                     "WHERE team_id IN (SELECT team_id FROM team_managers WHERE manager_id=?)")
+        _nat_sql = ("SELECT id, -country_id, manager_id, start_year, end_year "
+                    "FROM national_team_managers WHERE country_id IN "
+                    "(SELECT country_id FROM national_team_managers WHERE manager_id=?)")
+        _args = (int(manager_id),)
+    for _sql in (_club_sql, _nat_sql):
+        try:
+            _feed_tenure_years([tuple(r) for r in conn.execute(_sql, _args)], cur_year, years)
+        except Exception:
+            pass
+    if manager_id is not None:
+        return {int(manager_id): years.get(int(manager_id), set())}
+    return years
+
+
+def manager_career_span_text(years):
+    """[2026-10 1번, 신민용 요청 — 2차: "감독 기간: …은 잘리니 깔끔하게 13년 (2000~2012)"]
+    은퇴 감독 소속 칸 — "13년 (2000~2012)". 연수는 은퇴 선수 목록의 "(N년)"과 같은 정의
+    (실제로 지휘한 연도 수 — 무직 공백이 있으면 기간보다 짧다). 기록이 없으면 "은퇴"."""
+    ys = sorted(years or ())
+    if not ys:
+        return "은퇴"
+    span = f"{ys[0]}~{ys[-1]}" if ys[0] != ys[-1] else f"{ys[0]}"
+    return f"{len(ys)}년 ({span})"
+
+
+def _team_country_name(conn, team_id):
+    row = conn.execute(
+        """SELECT cn.name FROM teams t JOIN leagues l ON l.id = t.league_id
+           JOIN countries cn ON cn.id = l.country_id WHERE t.id = ?""",
+        (team_id,)).fetchone()
+    return row[0] if row else ""
+
+
+def _manager_age(birth_year, retired, retired_year, year):
+    """[2026-10 신설, 신민용 요청: "은퇴한 감독은 나이 동결"] 감독 나이 = 그 해 − 출생연도,
+    단 은퇴 감독은 은퇴한 해(managers.retired_year)에서 멈춘다. 출생연도가 없으면 None."""
+    if not birth_year:
+        return None
+    y = int(year)
+    if retired and retired_year:
+        y = min(y, int(retired_year))
+    return y - int(birth_year)
+
+
+def get_manager_brief(manager_id, ctx_country=None, year=None, conn=None):
+    """감독 한 명의 표시용 요약. 없으면 None.
+
+    display_name : 지정 이름(manager_custom_names) 또는 MG 코드
+    style_line   : "공격적 · 점유 · 전방압박 · 성과주의" (공격성향 · 빌드업 ·
+                   수비라인 · 관리성향 — 좁은 칸용 축약 표기)
+    age          : year(없으면 현재 연도) − 출생연도
+    is_foreign   : ctx_country(맡은 팀/대표팀의 나라)가 있으면, 그 나라
+                   기준 외국인 감독인가. 저장하지 않고 매번 계산한다(신민용
+                   확정: "조회 시 계산"). 군팀은 나라명이 '군대' 계열이라
+                   military_service.manager_nationality_for로 대한민국 기준으로
+                   바꿔서 비교한다(군팀 감독 생성 규칙과 같은 함수).
+    is_national_now : 현직 대표팀 감독인가 — 국적 변경 잠금에 쓴다."""
+    from constants import (TACTIC_TENDENCY_KO, MANAGER_BUILDUP_KO, MANAGER_PRESS_KO,
+                           MANAGER_BUILDUP_SHORT_KO, MANAGER_PRESS_SHORT_KO,
+                           ai_manager_code)
+    from database import (get_manager_name_info, is_current_national_manager,
+                          get_ai_player_intl_caps)
+    if not manager_id:
+        return None
+    _own = conn is None
+    conn = conn or get_conn()
+    try:
+        row = conn.execute(
+            """SELECT id, name, nationality, birth_year, retired, status,
+                      style_attack, style_buildup, style_press, manager_type,
+                      COALESCE(manager_ability, 0) AS ability,
+                      COALESCE(manager_potential, 0) AS potential,
+                      retired_year
+               FROM managers WHERE id = ?""", (manager_id,)).fetchone()
+        if not row:
+            return None
+        mid = row["id"]
+        code = row["name"] or ai_manager_code(mid)
+        # [2026-10 선출 감독] 이름은 database.get_manager_name_info 한 곳에서 —
+        # 선수 출신이면 선수 이름(지은 이름 또는 AI 코드)이 원본이다.
+        _ni = get_manager_name_info([mid], conn).get(mid) or {}
+        custom = _ni.get("custom") or ""
+        name_fallback = _ni.get("fallback") or code
+        from_pid = _ni.get("player_id")
+        y = int(year) if year else get_current_game_year()
+        by = row["birth_year"] or 0
+        nat = row["nationality"] or ""
+        is_foreign = False
+        if ctx_country:
+            try:
+                from military_service import manager_nationality_for
+                home = manager_nationality_for(ctx_country)
+            except Exception:
+                home = ctx_country
+            is_foreign = bool(nat) and nat != home
+        att, bld, prs, mtype = (row["style_attack"] or "", row["style_buildup"] or "",
+                                row["style_press"] or "", row["manager_type"] or "")
+        parts = [TACTIC_TENDENCY_KO.get(att, ""), MANAGER_BUILDUP_SHORT_KO.get(bld, ""),
+                 MANAGER_PRESS_SHORT_KO.get(prs, ""), mtype]
+        from constants import manager_type_label
+        mtype_nt = manager_type_label(mtype, national=True)
+        _is_nat_now = is_current_national_manager(mid, conn)
+        # 선수 출신은 국대 출전 기록이 있으면 국적 변경 불가(선수 규칙, 신민용 확정).
+        _caps = bool(from_pid) and bool(get_ai_player_intl_caps(from_pid, conn))
+        return {
+            "id": mid,
+            "code": code,
+            "display_name": custom or name_fallback,
+            "custom_name": custom or "",
+            # [2026-10 선출 감독] 지은 이름이 없을 때 보이는 코드(선출이면 AI…,
+            # 아니면 MG…) · 선수 id · 국적 잠금 사유("" / "national_now" / "intl_caps")
+            "name_fallback": name_fallback,
+            "from_player_id": from_pid,
+            "nat_lock_reason": ("national_now" if _is_nat_now else
+                                "intl_caps" if _caps else ""),
+            "nationality": nat,
+            "birth_year": by,
+            # [2026-10] 은퇴 감독은 은퇴한 해 나이에서 멈춘다(_manager_age)
+            "age": _manager_age(by, row["retired"], row["retired_year"], y),
+            "retired_year": row["retired_year"],
+            "status": row["status"] or "",
+            "retired": bool(row["retired"]),
+            "style_attack": att, "style_buildup": bld, "style_press": prs,
+            "manager_type": mtype,
+            "style_attack_ko": TACTIC_TENDENCY_KO.get(att, att),
+            "style_buildup_ko": MANAGER_BUILDUP_KO.get(bld, bld),
+            "style_press_ko": MANAGER_PRESS_KO.get(prs, prs),
+            "style_line": " · ".join(p for p in parts if p),
+            # [2026-10] 대표팀 직책일 때의 관리 성향 표시명(데이터는 같은 manager_type)
+            "manager_type_nt": mtype_nt,
+            "style_line_nt": " · ".join(p for p in (parts[:3] + [mtype_nt]) if p),
+            "ctx_country": ctx_country or "",
+            "ctx_year": y,
+            "is_foreign": is_foreign,
+            "is_national_now": _is_nat_now,
+            # [2026-10 6번 1단계] 감독 능력치(팀 OVR 눈금) · 숨은 상한(화면엔 안 보임)
+            "ability": int(row["ability"] or 0),
+            "potential": int(row["potential"] or 0),
+        }
+    finally:
+        if _own:
+            conn.close()
+
+
+def get_team_manager_for_year(team_id, year, conn=None):
+    """그 팀의 Y년 감독 요약(get_manager_brief + 재임 정보) 또는 None
+    (감독 표가 없는 구세이브, 공석 등). 연도 해석은 위 블록 주석 참고.
+    추가 키: tenure_start / tenure_end / end_reason / job_kind='club'."""
+    _own = conn is None
+    conn = conn or get_conn()
+    try:
+        try:
+            rows = conn.execute(
+                """SELECT id, manager_id, start_year, end_year, end_reason
+                   FROM team_managers WHERE team_id = ? AND start_year <= ?""",
+                (team_id, int(year))).fetchall()
+        except Exception:          # 감독 표가 없는 구세이브
+            return None
+        pick = _pick_tenure_for_year(rows, year)
+        if not pick:
+            return None
+        brief = get_manager_brief(pick["manager_id"], _team_country_name(conn, team_id),
+                                  year, conn)
+        if brief:
+            brief.update(tenure_start=pick["start_year"], tenure_end=pick["end_year"],
+                         end_reason=pick["end_reason"] or "", job_kind="club")
+        return brief
+    finally:
+        if _own:
+            conn.close()
+
+
+def get_national_manager_for_tournament(tournament_id, country_name, conn=None):
+    """국제대회 한 대회에서 그 나라 대표팀을 맡은 감독 요약 또는 None.
+
+    대표팀 감독은 **대회가 끝날 때마다** 평가·교체된다(national_manager.
+    evaluate_national_tournament) — 같은 해에 대회가 둘이면 연도만으로는 어느
+    쪽이 누구였는지 못 가른다. 본선은 대회 시작 때 national_objectives에
+    그 시점 감독(manager_id)이 이미 박혀 있으므로 그걸 먼저 쓴다(정확).
+    예선 등 그 기록이 없는 대회만 연도 규칙(_pick_tenure_for_year)으로 찾는다."""
+    _own = conn is None
+    conn = conn or get_conn()
+    try:
+        try:
+            t = conn.execute("SELECT year FROM intl_tournaments WHERE id = ?",
+                             (tournament_id,)).fetchone()
+            crow = conn.execute("SELECT id FROM countries WHERE name = ?",
+                                (country_name,)).fetchone()
+        except Exception:
+            return None
+        if not t or not crow:
+            return None
+        year, cid = int(t["year"]), crow["id"]
+        mid = None
+        try:
+            r = conn.execute(
+                "SELECT manager_id FROM national_objectives "
+                "WHERE tournament_id = ? AND country_id = ?", (tournament_id, cid)).fetchone()
+            mid = (r[0] if r else 0) or None
+        except Exception:
+            mid = None
+        tenure = None
+        try:
+            rows = conn.execute(
+                """SELECT id, manager_id, start_year, end_year, end_reason
+                   FROM national_team_managers WHERE country_id = ? AND start_year <= ?""",
+                (cid, year)).fetchall()
+        except Exception:
+            rows = []
+        if mid:
+            tenure = next((r for r in sorted(rows, key=lambda r: -r["id"])
+                           if r["manager_id"] == mid), None)
+        else:
+            tenure = _pick_tenure_for_year(rows, year)
+            mid = tenure["manager_id"] if tenure else None
+        if not mid:
+            return None
+        brief = get_manager_brief(mid, country_name, year, conn)
+        if brief:
+            brief.update(tenure_start=tenure["start_year"] if tenure else None,
+                         tenure_end=tenure["end_year"] if tenure else None,
+                         end_reason=(tenure["end_reason"] or "") if tenure else "",
+                         job_kind="nation")
+        return brief
+    finally:
+        if _own:
+            conn.close()
+
+
+# ════════════════════════════════════════════════════════════════
+# [2026-10 신설 — 감독 시스템 ②단계] 세계 기록실 "감독 검색" 탭
+#
+# 신민용 요청: "선수 검색 옆에 감독 검색을 만들어 감독들도 기록되게, 필터는
+# 선수 필터와 같은 기능으로. 위에는 이름·국적만, 아래엔 연도별로 어디
+# 감독이었고 그 당시 성적". 감독은 1만~수만 명 규모라(선수 26만 명 대비)
+# 전부 한 번 읽어 파이썬에서 거른다 — SQL을 필터 조합마다 따로 짜는 것보다
+# 단순하고, 연도 해석 규칙(_pick_tenure_for_year)을 SQL로 옮길 필요도 없다.
+# ════════════════════════════════════════════════════════════════
+MANAGER_END_REASON_KO = {
+    "sacked": "경질", "contract_end": "계약 만료", "moved": "이직",
+    "moved_to_nation": "대표팀 이동", "retired": "은퇴",
+}
+MANAGER_STATUS_KO = {"club": "클럽", "nation": "대표팀", "free": "무직", "retired": "은퇴"}
+
+
+def _mgr_home_country(country):
+    """외국인 판정 기준 나라 — 군팀 나라는 대한민국으로(get_manager_brief와 동일)."""
+    try:
+        from military_service import manager_nationality_for
+        return manager_nationality_for(country)
+    except Exception:
+        return country
+
+
+def search_managers(name_query=None, name_mode="all", continent=None, nat_country_id=None,
+                    club_country_id=None, league_id=None, team_id=None, team_mode="current",
+                    team_year=None, foreign="all", natteam=False, natteam_year=None,
+                    custom_named_only=False, status="active", grade=None,
+                    style_attack=None, style_buildup=None, style_press=None,
+                    manager_type=None, min_age=None, max_age=None,
+                    min_seasons=None, max_seasons=None, limit=300,
+                    natteam_country_id=None, player_career=None):
+    """감독 검색. 필터 의미는 선수 검색(search_ai_players)과 같게 맞췄다:
+
+      continent / nat_country_id : 감독 **국적** 기준
+      club_country_id / league_id / team_id : 감독이 맡은 **클럽** 기준
+          team_mode="current" — 지금 맡고 있는 클럽만
+          team_mode="career"  — 과거에 맡은 적이 있으면 포함. team_year를 주면
+                                그 해에 그 클럽을 실제로 지휘한 감독만(연도 해석
+                                규칙 _pick_tenure_for_year — 시즌 끝에 막 부임한
+                                후임은 그 해 감독이 아니다)
+          (리그 필터는 선수 검색과 같이 "지금 그 리그에 있는 팀" 기준)
+      foreign : "all" | "home"(자국 감독) | "foreign"(외국인 감독) — 신민용
+          확정: 저장하지 않고 조회 시 계산. 비교 대상 나라는 경력+연도 검색이면
+          그 해 맡은 팀의 나라, 아니면 지금 맡은 팀/대표팀의 나라. 맡은 곳이
+          없는(무직·은퇴) 감독은 판정 대상이 아니라 이 필터를 켜면 빠진다.
+      natteam / natteam_year : 대표팀 감독을 한 번이라도(그 해에) 맡은 감독
+      status : "active"(현직 — 클럽·대표팀) | "free"(무직) | "retired" | "all"
+      grade : 지금 맡은 클럽 리그의 등급(list_grades와 같은 리그 등급 기준)
+      style_* / manager_type : 스타일 4종 일치
+      min_age / max_age : 현재 연도 − 출생연도
+      min_seasons / max_seasons : 감독으로 일한 햇수(클럽+대표팀, _manager_years_managed)
+      name_query : name_mode="code"면 MG 코드·지정 이름만, "all"이면 국적·
+          현재 팀명·리그명·나라명까지
+
+    반환: dict 목록(id, display_name, code, nationality, age, status,
+    job_text, job_country, tier, grade, style_line, is_foreign, has_natteam)."""
+    from constants import (TACTIC_TENDENCY_KO, MANAGER_BUILDUP_SHORT_KO,
+                           MANAGER_PRESS_SHORT_KO, ai_manager_code, get_league_grade)
+    conn = get_conn()
+    try:
+        try:
+            conn.execute("SELECT 1 FROM managers LIMIT 1").fetchall()
+            # [2026-10 성능] 상태 필터는 아래 순회의 판정(st = 은퇴면 'retired', 아니면 status)과
+            # 같은 뜻으로 DB에서 먼저 거른다 — 결과는 같고 정렬·전달할 행만 준다.
+            _st_where = {
+                "active": "WHERE COALESCE(m.retired, 0) = 0 AND m.status IN ('club', 'nation')",
+                "free": "WHERE COALESCE(m.retired, 0) = 0 AND m.status = 'free'",
+                "retired": "WHERE (COALESCE(m.retired, 0) != 0 OR m.status = 'retired')",
+            }.get(status, "")
+            _mgr_sql = (
+                """SELECT m.id, m.name, m.nationality, m.birth_year, m.retired, m.status,
+                          m.style_attack, m.style_buildup, m.style_press, m.manager_type,
+                          COALESCE(m.seasons_managed, 0) AS seasons,
+                          COALESCE(m.reputation, 0) AS rep,
+                          COALESCE(m.career_best_level, 0) AS best,
+                          COALESCE(m.manager_ability, 0) AS ability,
+                          m.from_player_id AS fpid,
+                          m.retired_year,
+                          cn.custom_name
+                   FROM managers m
+                   LEFT JOIN manager_custom_names cn ON cn.manager_id = m.id
+                   """ + _st_where + """
+                   ORDER BY ability DESC, rep DESC, best DESC, m.id""")
+            # [2026-10 성능, 신민용 리포트: "100만 명 넘으니 딜레이"] 결과 정렬 기준
+            # (능력 → 명성 → 최고 레벨 → id, 아래 _sort와 같은 값·같은 방향)으로 미리 받아 두고,
+            # 조건을 통과한 감독이 limit명 차면 아래 순회를 멈춘다 — 예전엔 현직 1.2만 명 전원의
+            # 표시용 dict를 만든 뒤 정렬해 300명만 썼다. 반환 목록·순서는 같다.
+        except Exception:
+            return []       # 감독 표가 없는 구세이브
+        cur_year = get_current_game_year()
+        countries = {r["id"]: dict(r) for r in conn.execute(
+            "SELECT id, name, grade, continent FROM countries").fetchall()}
+        cid_by_name = {c["name"]: cid for cid, c in countries.items()}
+        # 지금 맡은 클럽
+        club_now = {}
+        for r in conn.execute(
+                """SELECT tm.manager_id, t.id AS tid, t.name AS tname, l.id AS lid,
+                          l.name AS lname, l.tier, l.country_id AS cid
+                   FROM team_managers tm JOIN teams t ON t.id = tm.team_id
+                   JOIN leagues l ON l.id = t.league_id
+                   WHERE tm.end_year IS NULL""").fetchall():
+            club_now[r["manager_id"]] = dict(r)
+        nat_now = {r["manager_id"]: r["country_id"] for r in conn.execute(
+            "SELECT manager_id, country_id FROM national_team_managers WHERE end_year IS NULL")}
+        nat_ever = {r[0] for r in conn.execute(
+            "SELECT DISTINCT manager_id FROM national_team_managers")}
+
+        # 경력 기준 클럽 필터 → {manager_id: 그때 맡은 팀의 나라 id}
+        career_hit = None
+        if team_mode == "career" and (team_id or league_id or club_country_id):
+            q = ("SELECT tm.id, tm.team_id, tm.manager_id, tm.start_year, tm.end_year, "
+                 "l.country_id AS cid FROM team_managers tm JOIN teams t ON t.id = tm.team_id "
+                 "JOIN leagues l ON l.id = t.league_id WHERE 1=1")
+            p = []
+            if team_id:
+                q += " AND tm.team_id = ?"; p.append(team_id)
+            elif league_id:
+                q += " AND t.league_id = ?"; p.append(league_id)
+            elif club_country_id:
+                q += " AND l.country_id = ?"; p.append(club_country_id)
+            rows = conn.execute(q, p).fetchall()
+            career_hit = {}
+            if team_year:
+                by_team = {}
+                for r in rows:
+                    by_team.setdefault(r["team_id"], []).append(r)
+                for tid_, trows in by_team.items():
+                    pick = _pick_tenure_for_year(trows, team_year)
+                    if pick:
+                        career_hit[pick["manager_id"]] = pick["cid"]
+            else:
+                for r in rows:
+                    career_hit.setdefault(r["manager_id"], r["cid"])
+
+        # 대표팀 필터
+        nat_hit = None
+        if natteam:
+            if natteam_year or natteam_country_id:
+                by_c = {}
+                for r in conn.execute(
+                        "SELECT id, country_id, manager_id, start_year, end_year "
+                        "FROM national_team_managers").fetchall():
+                    by_c.setdefault(r["country_id"], []).append(r)
+                nat_hit = set()
+                for _cid, crows in by_c.items():
+                    # [2026-10] 특정 나라 대표팀만(신민용 요청: "어느 국가 감독인지")
+                    if natteam_country_id and _cid != natteam_country_id:
+                        continue
+                    # 대표팀은 대회마다 교체될 수 있어 한 해에 둘일 수 있다 —
+                    # 그 해에 재임한 적이 있으면 모두 포함한다.
+                    for r in crows:
+                        if not natteam_year or (r["start_year"] <= natteam_year and (
+                                r["end_year"] is None or r["end_year"] >= natteam_year)):
+                            nat_hit.add(r["manager_id"])
+            else:
+                nat_hit = set(nat_ever)
+
+        nat_name = countries[nat_country_id]["name"] if nat_country_id in countries else None
+        cont_names = ({c["name"] for c in countries.values() if c["continent"] == continent}
+                      if continent else None)
+        needle = (name_query or "").strip().lower()
+        _grade_cache = {}
+        _yrs = (_manager_years_managed(conn, cur_year)
+                if (min_seasons is not None or max_seasons is not None) else None)
+        _ret_years = None          # [2026-10 1번] 은퇴 감독 감독 기간 — 처음 필요할 때 계산
+        # [2026-10 선출 감독] 선수 출신은 선수 이름이 원본 — 선수 지정 이름을 한 번에.
+        from constants import ai_player_code
+        # 지정 이름 표는 사용자가 이름을 지은 선수만 있어 작다 — 통째로 읽는다
+        # (선출 감독이 수천 명이 되면 IN(...)이 변수 한도를 넘는다).
+        # [2026-10] 선출 감독이 있는지 전원을 훑어 확인하지 않고 바로 읽는다(작은 표).
+        try:
+            _xp_names = {r[0]: r[1] for r in conn.execute(
+                "SELECT player_id, custom_name FROM ai_player_custom_names")}
+        except Exception:
+            _xp_names = {}
+
+        out = []
+
+        def _iter_mgrs():
+            # [2026-10 성능] 정렬된 결과를 한 번에 다 가져오지 않고 400줄씩 읽는다 — limit명이
+            # 차면 아래에서 멈추므로 나머지 수만 줄은 파이썬 객체로 만들지도 않는다.
+            _cur = conn.execute(_mgr_sql)
+            while True:
+                _chunk = _cur.fetchmany(400)
+                if not _chunk:
+                    return
+                yield from _chunk
+
+        for m in _iter_mgrs():
+            mid = m["id"]
+            st = "retired" if m["retired"] else (m["status"] or "")
+            if status == "active" and st not in ("club", "nation"):
+                continue
+            if status == "free" and st != "free":
+                continue
+            if status == "retired" and st != "retired":
+                continue
+            nat = m["nationality"] or ""
+            if nat_name and nat != nat_name:
+                continue
+            if cont_names is not None and nat not in cont_names:
+                continue
+            _fpid = m["fpid"]
+            _cust = (_xp_names.get(_fpid) or "") if _fpid else (m["custom_name"] or "")
+            if custom_named_only and not _cust:
+                continue
+            if style_attack and m["style_attack"] != style_attack:
+                continue
+            if style_buildup and m["style_buildup"] != style_buildup:
+                continue
+            if style_press and m["style_press"] != style_press:
+                continue
+            if manager_type and m["manager_type"] != manager_type:
+                continue
+            age = _manager_age(m["birth_year"], m["retired"], m["retired_year"], cur_year)   # [2026-10] 은퇴 시 동결
+            if min_age is not None and (age is None or age < min_age):
+                continue
+            if max_age is not None and (age is None or age > max_age):
+                continue
+            # [2026-10] 경력 = 감독으로 일한 햇수(클럽+대표팀). 필터를 쓸 때만 계산한다.
+            if _yrs is not None and min_seasons is not None and _yrs.get(mid, 0) < min_seasons:
+                continue
+            # [2026-10] 선수 출신(선출) 필터 — from_player_id가 있으면 선출.
+            if player_career == "player" and not m["fpid"]:
+                continue
+            if player_career == "nonplayer" and m["fpid"]:
+                continue
+            if _yrs is not None and max_seasons is not None and _yrs.get(mid, 0) > max_seasons:
+                continue
+            club = club_now.get(mid)
+            nat_cid_now = nat_now.get(mid)
+            # 클럽 필터
+            if career_hit is not None:
+                if mid not in career_hit:
+                    continue
+            elif team_mode != "career" or not (team_id or league_id or club_country_id):
+                if team_id and (not club or club["tid"] != team_id):
+                    continue
+                if league_id and (not club or club["lid"] != league_id):
+                    continue
+                if club_country_id and (not club or club["cid"] != club_country_id):
+                    continue
+            if nat_hit is not None and mid not in nat_hit:
+                continue
+            # 지금 맡은 곳
+            if club:
+                job_cname = countries.get(club["cid"], {}).get("name", "")
+                job_text = f"{club['tname']}({club['tier']}부)"
+                tier = club["tier"]
+            elif nat_cid_now:
+                job_cname = countries.get(nat_cid_now, {}).get("name", "")
+                job_text = f"🌍 {job_cname} 대표팀"
+                tier = None
+            else:
+                job_cname, tier = "", None
+                job_text = "은퇴" if st == "retired" else "무직"
+                if st == "retired":
+                    # [2026-10 1번] 은퇴 감독은 감독으로 일한 기간까지(연도 집합은 한 번만 계산).
+                    if _ret_years is None:
+                        _ret_years = _manager_year_sets(conn, cur_year)
+                    job_text = manager_career_span_text(_ret_years.get(mid))
+            # 등급(지금 맡은 클럽 리그)
+            g = None
+            if club:
+                cname_ = job_cname
+                if cname_ not in _grade_cache:
+                    _c = countries.get(club["cid"], {})
+                    _grade_cache[cname_] = get_league_grade(cname_, _c.get("grade"))
+                g = _grade_cache[cname_]
+            if grade and g != grade:
+                continue
+            # 외국인 판정
+            ctx_cname = job_cname
+            if career_hit is not None and team_year:
+                ctx_cname = countries.get(career_hit.get(mid), {}).get("name", "")
+            is_foreign = bool(ctx_cname) and nat != _mgr_home_country(ctx_cname)
+            if foreign == "home" and (not ctx_cname or is_foreign):
+                continue
+            if foreign == "foreign" and not is_foreign:
+                continue
+            code = m["name"] or ai_manager_code(mid)
+            _pcode = ai_player_code(_fpid) if _fpid else ""
+            disp = _cust or _pcode or code
+            if needle:
+                hay = [code.lower(), _cust.lower(), _pcode.lower()]
+                if name_mode != "code":
+                    hay += [nat.lower(), job_text.lower(),
+                            ((club or {}).get("lname") or "").lower(), job_cname.lower()]
+                if not any(needle in h for h in hay):
+                    continue
+            parts = [TACTIC_TENDENCY_KO.get(m["style_attack"], ""),
+                     MANAGER_BUILDUP_SHORT_KO.get(m["style_buildup"], ""),
+                     MANAGER_PRESS_SHORT_KO.get(m["style_press"], ""), m["manager_type"] or ""]
+            out.append({
+                "id": mid, "code": code, "display_name": disp,
+                "custom_name": _cust, "from_player_id": _fpid,
+                "nationality": nat, "age": age, "status": st,
+                "ability": int(m["ability"] or 0),
+                "status_ko": MANAGER_STATUS_KO.get(st, st),
+                "job_text": job_text, "job_country": job_cname, "tier": tier, "grade": g,
+                "style_line": " · ".join(x for x in parts if x),
+                "is_foreign": is_foreign, "has_natteam": mid in nat_ever,
+                # [2026-10, 신민용 요청: "선수 검색처럼 능력치 높은 게 맨 위로"]
+                "_sort": (-(m["ability"] or 0), -(m["rep"] or 0), -(m["best"] or 0), mid),
+            })
+            if limit and len(out) >= limit:
+                break       # [2026-10 성능] 이미 정렬 순서로 받으므로 limit명이면 끝
+        out.sort(key=lambda r: r["_sort"])   # 순서 보장용(이미 정렬돼 있어 사실상 무비용)
+        for r in out:
+            r.pop("_sort", None)
+        return out[:limit] if limit else out
+    finally:
+        conn.close()
+
+
+def _contract_notes(log, first_year):
+    """[2026-10 신민용 요청: "부임 (몇년)"] 재임 계약 기록("서명:만료;서명:만료…",
+    맨 앞 항목 = 부임 계약, ';' 뒤 = 재계약) → (부임 계약 N년 또는 None,
+    {재계약이 적용되는 첫 해: N년}).
+
+    서명은 시즌 끝 시장이라 계약은 보통 서명 다음 해부터 만료 해까지다. 다만
+    세계 최초 배정처럼 서명한 해부터 지휘한 임기는 그 해부터 센다 — 그래서 부임
+    계약은 "실제 첫 지휘 연도(first_year) ~ 만료"로 센다. 기록이 생기기 전의 예전
+    임기(앞 항목 없이 ';'로 시작)는 부임 계약을 모른다(None — "부임"만 표시)."""
+    parts = (log or "").split(";")
+    def _parse(p):
+        try:
+            s_, u_ = p.split(":")
+            return int(s_), int(u_)
+        except ValueError:
+            return None
+    first = _parse(parts[0]) if parts and parts[0] else None
+    first_n = (first[1] - int(first_year) + 1) if (first and first[1] >= int(first_year)) else None
+    renew = {}
+    for p in parts[1:]:
+        e = _parse(p)
+        if e and e[1] > e[0]:
+            renew[e[0] + 1] = e[1] - e[0]
+    return first_n, renew
+
+
+def _manager_current_job(conn, manager_id, retired):
+    """감독이 지금 맡은 곳 — get_manager_career(상세·복사)와 은퇴 선수 상세의
+    "감독 전향" 표시가 같이 쓴다. 반환 키: current_job(복사 머리말용, 나라 포함) /
+    current_team(표의 소속팀 칸) / current_team_name(복사용 팀명) /
+    current_team_country / current_kind(club·nation·free·retired)."""
+    current = "은퇴" if retired else "무직"
+    _span = None
+    if retired:
+        # [2026-10 1번, 신민용 요청] 은퇴 감독 — 상세 표 소속팀 칸은 "13년 (2000~2012)",
+        # 복사 머리말(현재:)은 "은퇴 · 13년 (2000~2012)".
+        try:
+            _span = manager_career_span_text(
+                _manager_year_sets(conn, get_current_game_year(), manager_id).get(int(manager_id)))
+        except Exception:
+            _span = None
+        if _span and _span != "은퇴":
+            current = f"은퇴 · {_span}"
+    # [2026-10 신민용 요청] 상세 위쪽 표를 선수처럼 "이름 | 국적 | 나이 | 능력 |
+    # 소속팀 | 소속팀 국가"로 — 소속팀 칸(표시/복사용 팀명)과 소속팀 국가 칸.
+    cur_team, cur_team_name, cur_team_country, cur_kind = (_span or current), "", "", (
+        "retired" if retired else "free")
+    if not retired:
+        try:
+            _js = conn.execute("SELECT jobless_since FROM managers WHERE id=?",
+                               (manager_id,)).fetchone()
+            if _js and _js[0]:
+                cur_team = f"무직 ({int(_js[0])}년~)"
+        except Exception:
+            pass
+    cur_club = conn.execute(
+        """SELECT t.name AS tname, l.name AS lname, l.tier, cn.name AS cname
+           FROM team_managers tm JOIN teams t ON t.id = tm.team_id
+           JOIN leagues l ON l.id = t.league_id JOIN countries cn ON cn.id = l.country_id
+           WHERE tm.manager_id = ? AND tm.end_year IS NULL
+           ORDER BY tm.id DESC LIMIT 1""", (manager_id,)).fetchone()
+    if cur_club:
+        current = (f"{cur_club['tname']} ({cur_club['lname']} {cur_club['tier']}부, "
+                   f"{cur_club['cname']})")
+        cur_team = f"{cur_club['tname']} ({cur_club['lname']} {cur_club['tier']}부)"
+        cur_team_name, cur_team_country, cur_kind = cur_club["tname"], cur_club["cname"], "club"
+    else:
+        try:
+            cur_nat = conn.execute(
+                """SELECT c.name FROM national_team_managers n JOIN countries c
+                   ON c.id = n.country_id WHERE n.manager_id = ? AND n.end_year IS NULL
+                   ORDER BY n.id DESC LIMIT 1""", (manager_id,)).fetchone()
+        except Exception:
+            cur_nat = None
+        if cur_nat:
+            current = f"🌍 {cur_nat[0]} 대표팀"
+            cur_team = f"🌍 {cur_nat[0]} 대표팀"
+            cur_team_name, cur_team_country, cur_kind = f"{cur_nat[0]} 대표팀", cur_nat[0], "nation"
+    return {"current_job": current, "current_team": cur_team,
+            "current_team_name": cur_team_name,
+            "current_team_country": cur_team_country,
+            "current_kind": cur_kind}
+
+
+def get_manager_career(manager_id):
+    """감독 상세 — 연도별로 어디를 맡았고 그 해 성적이 어땠는지.
+
+    반환: {"brief": get_manager_brief(지금 기준), "rows": [...], "summary": {...}}
+    rows는 연도 내림차순이고, 클럽 한 줄 = (그 감독이 실제로 지휘한) 한 해:
+        kind="club", year, team_id, team_name, team_country, league, league_record,
+        cup, cup_record, cl, cl_record, league_champion, cup_champion,
+        cl_champion, note(부임/재임 중/경질 등), is_foreign
+    대표팀은 신민용 확정대로 클럽과 한 줄로 합치지 않고 별도 줄:
+        kind="nation", year, country, tournament, objective, result, note
+        (본선 대회 단위 — national_objectives. 대회가 아직 없던 재임은
+        재임 시작 줄 하나만 남긴다)
+    "지휘한 해" 판정은 _pick_tenure_for_year와 같다 — 시즌 끝에 부임한
+    감독의 start_year(끝난 해)는 지휘 연도에 넣지 않는다."""
+    conn = get_conn()
+    try:
+        brief = get_manager_brief(manager_id, conn=conn)
+        if not brief:
+            return {"brief": None, "rows": [], "summary": {}}
+        cur_year = get_current_game_year()
+        tenures = conn.execute(
+            """SELECT tm.id, tm.team_id, tm.manager_id, tm.start_year, tm.end_year,
+                      tm.end_reason, t.name AS tname, cn.name AS cname,
+                      COALESCE(tm.contract_log, '') AS contract_log
+               FROM team_managers tm JOIN teams t ON t.id = tm.team_id
+               JOIN leagues l ON l.id = t.league_id JOIN countries cn ON cn.id = l.country_id
+               WHERE tm.manager_id = ? ORDER BY tm.start_year, tm.id""",
+            (manager_id,)).fetchall()
+        team_rows = {}
+        for tid_ in {t["team_id"] for t in tenures}:
+            team_rows[tid_] = conn.execute(
+                "SELECT id, manager_id, start_year, end_year FROM team_managers "
+                "WHERE team_id = ?", (tid_,)).fetchall()
+        rows = []
+        home_nat = brief["nationality"]
+        for t in tenures:
+            last = t["end_year"] if t["end_year"] is not None else cur_year
+            years = [y for y in range(t["start_year"], last + 1)
+                     if (_pick_tenure_for_year(team_rows[t["team_id"]], y) or {"id": None})["id"]
+                     == t["id"]]
+            if not years:
+                continue
+            hist = {e["year"]: e for e in get_team_history(
+                t["team_id"], year_range=(years[0], years[-1] + 1)).get("years", [])}
+            is_foreign = bool(t["cname"]) and home_nat != _mgr_home_country(t["cname"])
+            # [2026-10] 계약 기간 — 부임 줄에 "부임 (N년)", 재계약이 시작되는 해 줄에
+            # "재계약 (N년)". 기록이 없는 예전 재임은 예전처럼 "부임"만.
+            _first_n, _renew_at = _contract_notes(t["contract_log"], years[0])
+            for y in years:
+                e = hist.get(y, {})
+                notes = []
+                if y == years[0]:
+                    notes.append(f"부임 ({_first_n}년)" if _first_n else "부임")
+                elif y in _renew_at:
+                    notes.append(f"재계약 ({_renew_at[y]}년)")
+                if y == years[-1]:
+                    if t["end_year"] is None:
+                        notes.append("재임 중")
+                    else:
+                        notes.append(MANAGER_END_REASON_KO.get(t["end_reason"] or "",
+                                                               t["end_reason"] or "종료"))
+                rows.append({
+                    "kind": "club", "year": y, "team_id": t["team_id"],
+                    "team_name": t["tname"], "team_country": t["cname"],
+                    "league": e.get("league"), "league_record": e.get("league_record"),
+                    "cup": e.get("cup"), "cup_record": e.get("cup_record"),
+                    "cl": e.get("cl"), "cl_record": e.get("cl_record"),
+                    "cl_kind": e.get("cl_kind"),
+                    # [2026-10 12번, 신민용 요청] 클럽 월드컵 — get_team_history가 이미 만드는
+                    # 팀 기록(cwc / cwc_record / cwc_champion)을 그대로 싣는다.
+                    "cwc": e.get("cwc"), "cwc_record": e.get("cwc_record"),
+                    "cwc_champion": bool(e.get("cwc_champion")),
+                    "league_champion": bool(e.get("league_champion")),
+                    "cup_champion": bool(e.get("cup_champion")),
+                    "cl_champion": bool(e.get("cl_champion")),
+                    "note": " · ".join(notes), "is_foreign": is_foreign,
+                })
+        # 대표팀
+        # [2026-10 재설계, 신민용 확정: "연도별 기록 = 그 시즌에 실제로 지휘한 곳.
+        # 대표팀 감독일 때는 그 해에 다른 감독을 할 수 없고, 대표팀에서 경질되면
+        # 그 해엔 경질만 뜨고 새 팀은 다음 해부터"] 클럽 줄은 이미 그 규칙
+        # (_pick_tenure_for_year — 시즌 끝에 온 후임은 다음 해부터)인데 대표팀 줄만
+        # "부임 연도"에 찍혀서, 같은 해에 클럽과 대표팀이 같이 뜨는 꼬임이 생겼다
+        # (MG09RK 첼시/스위스, MG09EM 뮌헨/스위스 — 후자는 2001시즌 뒤 스위스에
+        # 부임했다가 한 경기도 지휘하기 전에 은퇴).
+        #
+        # 대표팀 감독 교체는 대회가 끝날 때만 일어나고(national_manager.
+        # evaluate_national_tournament), 평가 대상 대회는 전부 리그가 끝난 뒤
+        # 오프시즌(46~50주차)에 열린다 — 그래서 대표팀도 클럽과 같은 뜻으로 읽는다:
+        #   지휘 연도 = start_year+1 ~ end_year(진행 중이면 올해)
+        #   (세계 최초 생성 때 배정된 감독만 start_year부터 — 그해를 처음부터 맡는다)
+        # 줄은 대회 단위가 아니라 **지휘한 해마다 한 줄**(클럽 줄과 같은 단위)이고,
+        # 그 해 이 감독이 치른 본선 대회(national_objectives)를 그 줄에 모은다.
+        # 한 경기도 지휘하기 전에 끝난 재임(부임 직후 은퇴·이직 등)은 대표팀 줄을
+        # 만들지 않고, 직전 클럽 줄 비고에 "시즌 후 OO 대표팀 부임 → 지휘 전 은퇴"로 붙인다.
+        nat_ten, objs = [], []
+        try:
+            nat_ten = conn.execute(
+                """SELECT n.id, n.country_id, n.start_year, n.end_year, n.end_reason,
+                          c.name AS cname, COALESCE(n.contract_log, '') AS contract_log
+                   FROM national_team_managers n JOIN countries c ON c.id = n.country_id
+                   WHERE n.manager_id = ? ORDER BY n.start_year, n.id""",
+                (manager_id,)).fetchall()
+            objs = conn.execute(
+                """SELECT o.year, o.country, o.objective, o.result, t.name AS tname, t.id AS tid
+                   FROM national_objectives o JOIN intl_tournaments t ON t.id = o.tournament_id
+                   WHERE o.manager_id = ? ORDER BY t.year, t.id""", (manager_id,)).fetchall()
+        except Exception:
+            pass
+        try:
+            from database import get_game_start_year
+            _gsy = int(get_game_start_year())
+        except Exception:
+            _gsy = None
+        try:
+            _first_ids = {r[0]: r[1] for r in conn.execute(
+                "SELECT country_id, MIN(id) FROM national_team_managers GROUP BY country_id")}
+        except Exception:
+            _first_ids = {}
+        _tours = {}
+        _obj_tids = set()
+        for o in objs:
+            _tours.setdefault((o["country"], int(o["year"])), []).append(
+                (o["tname"], o["result"] or "진행 중", o["objective"] or ""))
+            _obj_tids.add(o["tid"])
+        # [2026-10 신설, 신민용 리포트: "네팔 2000년 아시안컵 예선 조별리그 탈락인데
+        # 감독 기록엔 '본선 대회 없음'으로 뜬다"] 위 national_objectives는 본선만
+        # 다룬다(예선은 목표 대상이 아니다). 예선 결과는 국가 검색과 같은 함수
+        # (get_country_tournament_results)에서 가져와 그 해 줄에 같이 넣는다 —
+        # 목표는 없으므로 결과만. 그 해 감독이 누구였는지는 줄을 만드는 쪽(지휘
+        # 연도 규칙)이 이미 정했으므로 여기선 나라·연도만 맞추면 된다.
+        _QUAL_KINDS = ("wc_qual", "cont_qual")
+        # [2026-10 신민용 리포트: "터크스 케이커스 제도 감독이 친선전 나머지를 하는데
+        # 대회 없음으로 뜬다"] 랭킹 평가전(친선전 — power_eval / 나머지 밴드
+        # power_eval_extra)도 그 해 줄에 넣는다. 목표가 없으므로 결과만.
+        _FRIENDLY_KINDS = ("power_eval", "power_eval_extra")
+        _MEDAL_STRIP = {"🥇 우승": "우승", "🥈 준우승": "준우승", "🥉 3위": "3위"}
+        _qual_cache = {}
+
+        def _quals_for(cn_, y_):
+            if cn_ not in _qual_cache:
+                try:
+                    _qual_cache[cn_] = [x for x in get_country_tournament_results(cn_)
+                                        if (x.get("kind") or "") in _QUAL_KINDS + _FRIENDLY_KINDS
+                                        and x.get("id") not in _obj_tids]
+                except Exception:
+                    _qual_cache[cn_] = []
+            # [2026-10] 본선에 나간 해는 본선 결과만 보여주면 된다 — 통과한 예선은
+            # 빼고, 예선에서 떨어진 경우에만 그 예선 결과를 남긴다(예선과 본선은
+            # 같은 해에 치러진다).
+            _qs = [(x.get("name") or "예선", x.get("result") or "-", "")
+                   for x in _qual_cache[cn_] if int(x.get("year") or 0) == y_
+                   and (x.get("kind") or "") in _QUAL_KINDS
+                   and "본선 진출" not in (x.get("result") or "")]
+            _fr = [(x.get("name") or "랭킹 평가전",
+                    _MEDAL_STRIP.get(x.get("result") or "", x.get("result") or "-"), "")
+                   for x in _qual_cache[cn_] if int(x.get("year") or 0) == y_
+                   and (x.get("kind") or "") in _FRIENDLY_KINDS]
+            return _qs + _fr
+        _used = set()
+        _uncoached = {}     # 부임 연도 → (나라, 종료 문구): 지휘 전에 끝난 재임
+        for n in nat_ten:
+            _initial = (_first_ids.get(n["country_id"]) == n["id"]
+                        and _gsy is not None and n["start_year"] == _gsy)
+            _first = n["start_year"] if _initial else n["start_year"] + 1
+            _last = n["end_year"] if n["end_year"] is not None else cur_year
+            _end_txt = ("재임 중" if n["end_year"] is None else
+                        MANAGER_END_REASON_KO.get(n["end_reason"] or "", n["end_reason"] or "종료"))
+            if _first > _last:
+                _uncoached[n["start_year"]] = (n["cname"], _end_txt)
+                continue
+            # 대표팀 재계약은 대회 평가 직후 — 그 해 안에 서명되므로 다음 해부터 적용.
+            _first_n, _renew_at = _contract_notes(n["contract_log"], _first)
+            for y in range(_first, _last + 1):
+                _notes = []
+                if y == _first:
+                    _notes.append(f"부임 ({_first_n}년)" if _first_n else "부임")
+                elif y in _renew_at:
+                    _notes.append(f"재계약 ({_renew_at[y]}년)")
+                if y == _last:
+                    _notes.append(_end_txt)
+                _t = _quals_for(n["cname"], y) + _tours.get((n["cname"], y), [])
+                _used.add((n["cname"], y))
+                rows.append({
+                    "kind": "nation", "year": y, "country": n["cname"],
+                    "tournaments": _t,
+                    "pending": not _t,
+                    "note": " · ".join(_notes),
+                    "is_foreign": home_nat != _mgr_home_country(n["cname"]),
+                })
+        # 재임 기록과 연도가 안 맞는 대회(정상 흐름에선 없음)도 버리지 않고 그 해 줄로.
+        for (cn_, y_), _t in _tours.items():
+            if (cn_, y_) in _used:
+                continue
+            rows.append({"kind": "nation", "year": y_, "country": cn_, "tournaments": _t,
+                         "pending": False, "note": "",
+                         "is_foreign": home_nat != _mgr_home_country(cn_)})
+        # 클럽 줄 "대표팀 이동" → 행선지(+ 지휘 전에 끝났으면 그 결말까지)
+        for r in rows:
+            if r["kind"] != "club" or "대표팀 이동" not in (r.get("note") or ""):
+                continue
+            _dest = next((n["cname"] for n in nat_ten if n["start_year"] == r["year"]), None)
+            if not _dest:
+                continue
+            _txt = f"시즌 후 {_dest} 대표팀 이동"
+            if r["year"] in _uncoached:
+                _txt = f"시즌 후 {_dest} 대표팀 부임 → 지휘 전 {_uncoached[r['year']][1]}"
+            r["note"] = r["note"].replace("대표팀 이동", _txt)
+        # 같은 해면 클럽 줄 먼저, 대표팀 줄 다음(신민용 예시 순서)
+        rows.sort(key=lambda r: (-r["year"], 0 if r["kind"] == "club" else 1))
+        # [2026-10 신민용 요청: "연도를 누르면 그 당시 전술과 주로 쓴 포메이션"]
+        # 클럽 줄마다 그 해 그 팀의 포메이션 — 시즌 스냅샷(hist.team_season_lineup,
+        # 은퇴·감독 교체보다 먼저 찍힘 = 그 해 감독의 포메이션) → 상반기 스냅샷 →
+        # 진행 중인 올해는 지금 팀 포메이션. 대표팀은 포메이션 기록이 없다.
+        _cy = get_current_game_year()
+        for r in rows:
+            r["formation"] = ""
+            if r["kind"] != "club":
+                # 대표팀 — 그 해 이 나라가 치른 대회(예선 포함)마다 포메이션.
+                r["formations"] = []
+                try:
+                    for _t in conn.execute(
+                            """SELECT DISTINCT t.id, t.name FROM intl_tournaments t
+                               JOIN intl_squad s ON s.tournament_id = t.id
+                               WHERE s.country = ? AND t.year = ? ORDER BY t.id""",
+                            (r["country"], r["year"])):
+                        _f = get_intl_formation(_t[0], r["country"], conn)
+                        if _f:
+                            r["formations"].append((_t[1], _f))
+                except Exception:
+                    pass
+                continue
+            for _tbl in ("hist.team_season_lineup", "hist.team_season_lineup_half"):
+                try:
+                    _fr = conn.execute(f"SELECT formation FROM {_tbl} WHERE team_id=? AND year=?",
+                                       (r["team_id"], r["year"])).fetchone()
+                except Exception:
+                    _fr = None
+                if _fr and _fr[0]:
+                    r["formation"] = _fr[0]
+                    break
+            if not r["formation"] and r["year"] >= _cy:
+                _fr = conn.execute("SELECT formation FROM teams WHERE id=?",
+                                   (r["team_id"],)).fetchone()
+                if _fr and _fr[0]:
+                    r["formation"] = _fr[0]
+                    r["formation_live"] = True
+        club_rows = [r for r in rows if r["kind"] == "club"]
+        # 지금 맡은 곳(복사 텍스트 머리말용) — search_managers의 job_text와 같은 기준.
+        # [2026-10] 상세 위쪽 표(소속팀 | 소속팀 국가)도 같이 — _manager_current_job.
+        brief.update(_manager_current_job(conn, manager_id, brief.get("retired")))
+        summary = {
+            "seasons": len(club_rows),
+            "clubs": len({r["team_id"] for r in club_rows}),
+            "league_titles": sum(1 for r in club_rows if r["league_champion"]),
+            "cup_titles": sum(1 for r in club_rows if r["cup_champion"]),
+            "cl_titles": sum(1 for r in club_rows if r["cl_champion"]),
+            "cwc_titles": sum(1 for r in club_rows if r.get("cwc_champion")),   # [12번]
+            # 본선만 센다(예선 줄은 목표가 비어 있다)
+            "nation_tournaments": sum(1 for r in rows if r["kind"] == "nation"
+                                      for _t in (r.get("tournaments") or []) if _t[2]),
+            "nation_seasons": sum(1 for r in rows if r["kind"] == "nation"),
+            # [2026-10 신민용 요청] 승격·강등 횟수 — 리그 칸(get_team_history)의
+            # "[○○(N부)로 승격/강등]" 표기를 그대로 센다(표 색과 같은 기준).
+            "promotions": sum(1 for r in club_rows if "로 승격]" in (r.get("league") or "")),
+            "relegations": sum(1 for r in club_rows if "로 강등]" in (r.get("league") or "")),
+        }
+        return {"brief": brief, "rows": rows, "summary": summary}
+    finally:
+        conn.close()
+
+
+def get_world_population_stats(conn=None):
+    """[2026-10 신설, 신민용 요청] 세계축구기록실 맨 위 가운데 인구 표시.
+    players : 전체 = 현역 + 은퇴. 현역 = ai_players(복무 중 포함) + 내 선수(my_player 1명),
+              은퇴 = ai_players_retired.
+    managers: 전체 = 현직(클럽·대표팀) + 무직 + 은퇴(retired=1).
+    population: 선수 전체 + 감독 전체 − 선수 출신 감독(from_player_id가 실제 선수 기록과
+              이어진 감독 — 같은 사람이라 한 번만 센다).
+    COUNT 몇 번뿐이라 가볍다(시즌 진행이 끝날 때마다 다시 부른다)."""
+    _own = conn is None
+    conn = conn or get_conn()
+    try:
+        q = lambda sql: (conn.execute(sql).fetchone() or [0])[0] or 0
+        p_active = q("SELECT COUNT(*) FROM ai_players")
+        try:
+            p_active += q("SELECT COUNT(*) FROM my_player")
+        except Exception:
+            pass
+        try:
+            p_retired = q("SELECT COUNT(*) FROM ai_players_retired")
+        except Exception:
+            p_retired = 0
+        m_total = m_active = m_free = m_retired = overlap = 0
+        try:
+            r = conn.execute(
+                """SELECT COUNT(*),
+                          SUM(CASE WHEN COALESCE(retired,0)=1 THEN 1 ELSE 0 END),
+                          SUM(CASE WHEN COALESCE(retired,0)=0 AND status='free' THEN 1 ELSE 0 END)
+                   FROM managers""").fetchone()
+            m_total, m_retired, m_free = (r[0] or 0), (r[1] or 0), (r[2] or 0)
+            m_active = m_total - m_retired - m_free
+            overlap = q("""SELECT COUNT(*) FROM managers m WHERE m.from_player_id IS NOT NULL
+                           AND (EXISTS (SELECT 1 FROM ai_players_retired r WHERE r.id = m.from_player_id)
+                                OR EXISTS (SELECT 1 FROM ai_players a WHERE a.id = m.from_player_id))""")
+        except Exception:
+            pass        # 감독 표가 없는 구세이브
+        return {
+            "players_total": p_active + p_retired, "players_active": p_active,
+            "players_retired": p_retired,
+            "managers_total": m_total, "managers_active": m_active,
+            "managers_free": m_free, "managers_retired": m_retired,
+            "player_managers": overlap,
+            "population": p_active + p_retired + m_total - overlap,
+        }
+    finally:
+        if _own:
+            conn.close()
+
+
 def get_team_season_lineup(team_id: int, year: int, half: bool = False):
     """[2026-08 신설, 신민용 요청: "팀 검색에서 연도를 클릭하면 그 해
     이 팀의 포메이션(이름만, OVR은 필요없음)이 떠야 한다"]
@@ -7127,15 +8888,25 @@ def get_team_season_lineup(team_id: int, year: int, half: bool = False):
             formation_name = "4-4-2"
         slot_names = FORMATION_SLOTS[formation_name]
         squad_rows = conn.execute(
-            "SELECT id, position, ovr FROM ai_players WHERE team_id=?", (team_id,)).fetchall()
+            "SELECT id, position, ovr, foot, sub_role FROM ai_players WHERE team_id=?",
+            (team_id,)).fetchall()
         candidates = [{"id": r["id"], "position": r["position"] or "CM", "ovr": r["ovr"] or 0}
                       for r in squad_rows]
         _me_row = conn.execute(
-            "SELECT current_team_id, position, ovr FROM my_player WHERE id=1").fetchone()
-        if _me_row and _me_row["current_team_id"] == team_id:
+            "SELECT current_team_id, position, ovr, foot, sub_role FROM my_player WHERE id=1"
+        ).fetchone()
+        _me_in = bool(_me_row and _me_row["current_team_id"] == team_id)
+        if _me_in:
             candidates.append({"id": MY_PLAYER_ID, "position": _me_row["position"] or "CM",
                                 "ovr": _me_row["ovr"] or 0})
-        placed = _greedy_fill_slots(candidates, slot_names)
+        # [⑦-c] 통일 스위치가 켜졌으면 경기 전력과 같은 최적 배치(주발 포함) — 꺼져 있으면 예전 그리디.
+        from constants import LINEUP_UNIFY_ENABLED as _lu_on
+        if _lu_on:
+            for _cd, _src in zip(candidates, list(squad_rows) + ([_me_row] if _me_in else [])):
+                _cd["foot"] = _src["foot"] or ""
+                _cd["sub_role"] = _src["sub_role"] or ""
+        from team_plan import club_fill_slots
+        placed = club_fill_slots(candidates, slot_names)
         started_ids = {pl["id"] for pl in placed if pl is not None}
         slots = [{"slot": slot_names[i], "id": (pl["id"] if pl else None)}
                  for i, pl in enumerate(placed)]
