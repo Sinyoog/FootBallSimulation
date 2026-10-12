@@ -954,6 +954,9 @@ def _start_next_round(t, p=None):
         if _t2:
             _start_next_round(_t2, p=p)
         return
+    # [2026-10, 3단계] 날짜는 여기서 정하지 않는다 — 비워 둔(대기) 경기를 주 처리가
+    # 끝난 뒤 competition_common.assign_pending_club_cup_days가 같은 주의 다른 컵
+    # 경기와 한꺼번에 배정한다(측정 C와 같은 방식).
     c.executemany("""INSERT INTO cup_matches
                      (tournament_id, round_name, round_idx, week,
                       home_team_id, away_team_id, is_my, slot, pool_entering,
@@ -1094,7 +1097,8 @@ def _sim_ai_match(t, m, conn=None, reason="injury", batch=None):
     # day가 채워진 경기의 값을 시뮬레이션 순간 지워버리는 회귀 버그가
     # 된다(intl_engine.py 예선/본선에서 실제로 재현·수정된 것과 동일한
     # 패턴) — 이제 기존 값을 보존한다.
-    day = _week_intl_cl_day(m["week"], get_player() or {}) if m["is_my"] else m.get("day")
+    # [2026-10] 3단계 이후엔 내 경기도 라운드 생성 때 날짜가 이미 확정돼 있다 — 그 값을 우선.
+    day = (m.get("day") or _week_intl_cl_day(m["week"], get_player() or {})) if m["is_my"] else m.get("day")
 
     _absence = reason if m["is_my"] else None
     _row = (hs, as_, pso_winner, pso_score, day, _absence, m["id"])

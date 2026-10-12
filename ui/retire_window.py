@@ -538,7 +538,7 @@ class RetireWindow(QDialog):
 
         # ── 3부·4부컵 기록 ──────────────────────────────
         lc_ms = _cm["lower_cup_ms"]
-        t37c = QLabel(f"🏅 3부·4부컵 기록  ({len(lc_ms)})")
+        t37c = QLabel(f"🎗️ 3부·4부컵 기록  ({len(lc_ms)})")
         t37c.setObjectName("secTitle")
         lay.addWidget(t37c)
         lay.addWidget(self._cup_table(lc_ms))
@@ -1101,7 +1101,9 @@ class RetireWindow(QDialog):
                 team_str = tname
                 comp_str = t.get('competition','')
                 result   = lname  # league_name 자리에 결과 저장됨
-                if "우승" in result:    color = "#00cc44"
+                from constants import OLYMPIC_MEDAL_COLOR as _OMC   # [2026-10 4단계] 올림픽 메달
+                if result in _OMC:         color = _OMC[result]
+                elif "우승" in result:    color = "#00cc44"
                 elif "준우승" in result: color = "#aaddff"
                 elif "3위" in result:   color = "#ffd700"
                 elif "4위" in result:   color = "#cc9944"
@@ -1921,7 +1923,13 @@ class RetireWindow(QDialog):
                 if result == "발탁 거절":
                     lines.append(f"  🚫 {yr}년  {comp}  →  발탁 거절  ({nation})")
                     continue
-                _ic_i = ("🏆" if result == "우승" else
+                from constants import OLYMPIC_MEDAL_ICON as _OMI   # [2026-10 4단계] 올림픽 메달
+                _ic_i = (_OMI[result] if result in _OMI else
+                         "4️⃣" if result == "4위" else
+                         "⚔️" if result == "8강 탈락" else
+                         "🔵" if result == "16강 탈락" else
+                         "🏅" if result == "조별리그 탈락" else
+                         "🏆" if result == "우승" else
                          "🥈" if result == "준우승" else
                          "🥉" if result == "3위" else
                          "4️⃣" if result == "4위" else

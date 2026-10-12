@@ -33,6 +33,9 @@ def _match_card_color(mi):
     if not mi:
         return "#333"
     if mi.get("intl"):
+        if mi.get("kind") in ("olympic", "oly_qual"):
+            from constants import OLYMPIC_UI_COLOR
+            return OLYMPIC_UI_COLOR          # [2026-10 4단계] U-23 올림픽 은색
         return "#ff3333" if mi.get("kind") in ("world", "continent") else "#ff66b2"
     if mi.get("cl"):
         _CL_KIND_COLOR = {
@@ -395,7 +398,7 @@ class CenterPanel(QWidget):
         # 실제 주간일정카드와 공유하는 판정 순서를 그대로 따른다.
         nwp_wrap.setToolTip("다음 주 일정 미리보기 (초록=리그, 보라=컵, 하늘=CWC, "
                             "노랑=승강PO, 블루=챔스/오렌지=유로파/그린=컨퍼런스/골드=슈퍼컵, "
-                            "레드=국대 본선/핑크=국대 예선·기타, 회색=경기 없음)")
+                            "레드=국대 본선/핑크=국대 예선·기타, 은색 테두리=U-23 올림픽, 회색=경기 없음)")
         phase_row.addWidget(nwp_wrap, 0)
         self.lay.addLayout(phase_row)
 
@@ -1033,13 +1036,23 @@ class CenterPanel(QWidget):
                     opp   = f"{match_info.get('opp_flag','')}{match_info.get('opp','')}"
                     hl.setText(f"스트레스 +{self._match_stress_preview(p, match_info.get('is_home', False))}")
                     if ml:
-                        _is_main = match_info.get("kind") in ("world", "continent")
-                        _txt_c = "#ff3333" if _is_main else "#ff66b2"
-                        _bg_c  = "#3a1a1a" if _is_main else "#3a1a2b"
-                        ml.setText(f"🌍 {match_info['league_name']} {stage}{grp}\nvs {opp}")
-                        ml.setStyleSheet(f"color:{_txt_c};font-weight:bold;font-size:12px;"
-                                         f"background:{_bg_c};border-radius:4px;padding:4px;")
-                        ml.show()
+                        if match_info.get("kind") in ("olympic", "oly_qual"):
+                            # [2026-10 4단계, 신민용 확정] U-23 올림픽 — 글자·테두리 은색,
+                            # 배경 #1f2533, 아이콘 🏅(예선·본선 공통).
+                            from constants import OLYMPIC_UI_COLOR, OLYMPIC_UI_CARD_BG, OLYMPIC_UI_ICON
+                            ml.setText(f"{OLYMPIC_UI_ICON} {match_info['league_name']} {stage}{grp}\nvs {opp}")
+                            ml.setStyleSheet(f"color:{OLYMPIC_UI_COLOR};font-weight:bold;font-size:12px;"
+                                             f"background:{OLYMPIC_UI_CARD_BG};border:1px solid {OLYMPIC_UI_COLOR};"
+                                             "border-radius:4px;padding:4px;")
+                            ml.show()
+                        else:
+                            _is_main = match_info.get("kind") in ("world", "continent")
+                            _txt_c = "#ff3333" if _is_main else "#ff66b2"
+                            _bg_c  = "#3a1a1a" if _is_main else "#3a1a2b"
+                            ml.setText(f"🌍 {match_info['league_name']} {stage}{grp}\nvs {opp}")
+                            ml.setStyleSheet(f"color:{_txt_c};font-weight:bold;font-size:12px;"
+                                             f"background:{_bg_c};border-radius:4px;padding:4px;")
+                            ml.show()
                 elif match_info.get("cl"):
                     # [2026-08 색상 개편, 신민용 최종 승인: "챔스/유로파/
                     # 컨퍼런스/슈퍼컵이 전부 같은 황금색이라 안 구분된다"]
@@ -2620,7 +2633,8 @@ class CenterPanel(QWidget):
             if not st:
                 return
             t = intl_engine.get_my_tournament(st["current_year"])
-            if not t or t.get("kind") not in ("world", "continent") or t.get("my_selected") != 1:
+            # [2026-10 4단계] 올림픽 본선도 다음 라운드를 미리 보여준다(은색 글자·테두리).
+            if not t or t.get("kind") not in ("world", "continent", "olympic") or t.get("my_selected") != 1:
                 return
             if t.get("status") not in ("group", "ko"):
                 return
@@ -2661,11 +2675,21 @@ class CenterPanel(QWidget):
             ref = mine or rows[0]
             stage_ko = intl_engine.STAGE_KO.get(ref["stage"], ref["stage"])
             date_str = day_to_date_str(next_day)
+            _oly = t.get("kind") == "olympic"
+            _ic = "🏅" if _oly else "🌍"
             if mine:
                 opp = mine["away"] if mine["home"] == nat else mine["home"]
-                txt = f"🌍 다음 일정: {t['name']} {stage_ko} ({date_str} 예정) vs {opp}"
+                txt = f"{_ic} 다음 일정: {t['name']} {stage_ko} ({date_str} 예정) vs {opp}"
             else:
-                txt = f"🌍 다음 일정: {t['name']} {stage_ko} ({date_str} 예정) · 상대 미정"
+                txt = f"{_ic} 다음 일정: {t['name']} {stage_ko} ({date_str} 예정) · 상대 미정"
+            if _oly:
+                from constants import OLYMPIC_UI_COLOR
+                self.lbl_next_intl.setStyleSheet(
+                    f"color:{OLYMPIC_UI_COLOR};font-weight:bold;font-size:12px;padding:2px 4px;"
+                    f"border:1px solid {OLYMPIC_UI_COLOR};border-radius:4px;")
+            else:
+                self.lbl_next_intl.setStyleSheet(
+                    "color:#ffaa33;font-weight:bold;font-size:12px;padding:2px 4px;")
             self.lbl_next_intl.setText(txt)
             self.lbl_next_intl.show()
         except Exception:
@@ -2746,7 +2770,11 @@ class CenterPanel(QWidget):
             d = next_start + i
             mi = self._get_match_for_day(d, p, st=st)
             color = _match_card_color(mi)
-            box.setStyleSheet(f"background:{color};border-radius:3px;")
+            if mi and mi.get("intl") and mi.get("kind") in ("olympic", "oly_qual"):
+                # [2026-10 4단계, 신민용 확정] 올림픽은 테두리만 은색 — 배경은 원래 빈 칸 배경 그대로.
+                box.setStyleSheet(f"background:#333;border:2px solid {color};border-radius:3px;")
+            else:
+                box.setStyleSheet(f"background:{color};border-radius:3px;")
 
     def _get_match_for_day(self, day, p, st=None, include_played=False):
         """그 날짜(day)에 내 경기가 있는지 확인.
@@ -3428,18 +3456,43 @@ class CenterPanel(QWidget):
 
         opts = pend.get("options", [])
         single = (len(opts) == 1)
+        # [2026-10 U-23 올림픽] 올림픽 발탁은 국적을 고정하지 않는다 — 안내 문구를 바꾼다.
+        _OLY_K = ("oly_qual", "olympic")
+        _oly_flags = [o.get("kind") in _OLY_K for o in opts]
+        _all_oly = bool(opts) and all(_oly_flags)
+        _any_oly = any(_oly_flags)
+        _OLY_NOTE = ("<b style='color:#C0C0C0'>🏅 U-23 올림픽 출전은 국적을 고정하지 않습니다.</b><br>"
+                     "성인 대표팀 국적 선택은 그대로 열려 있습니다.<br>"
+                     "<span style='color:#aaa'>다만 같은 올림픽 안에서는 예선에서 뛴 나라로 본선도 뜁니다.<br>"
+                     "이미 성인 A매치로 국적이 고정됐다면 그 나라 올림픽에만 나갈 수 있습니다.</span>")
 
         dlg = QDialog(self)
-        dlg.setWindowTitle("🌍 대표팀 발탁")
+        dlg.setWindowTitle("🏅 U-23 올림픽 대표팀 발탁" if _all_oly else "🌍 대표팀 발탁")
         dlg.setMinimumWidth(400)
         dlg.setStyleSheet(_DIALOG_STYLE)
         lay = QVBoxLayout(dlg)
         lay.setContentsMargins(18,16,18,16); lay.setSpacing(10)
 
-        hdr = QLabel(f"🌍 {pend['name']} 대표팀 발탁"); hdr.setObjectName("dlgHeader")
+        hdr = QLabel(f"{'🏅' if _all_oly else '🌍'} {pend['name']} 대표팀 발탁"); hdr.setObjectName("dlgHeader")
         lay.addWidget(hdr)
 
-        if single:
+        if single and _all_oly:
+            opt = opts[0]
+            info = QLabel(
+                f"<span style='color:#ddd; font-size:14px'>"
+                f"<b style='color:#C0C0C0; font-size:16px'>{opt.get('flag','')} {opt['nat']}</b> "
+                f"U-23 올림픽 대표팀에서 발탁을 제안합니다.<br><br>"
+                f"이 나라로 올림픽에 나가겠습니까?<br>{_OLY_NOTE}<br>"
+                f"<span style='color:#aaa'>선택하면 선발 결과가 공개됩니다.</span></span>")
+        elif _all_oly:
+            nat_list = " / ".join(f"{o.get('flag','')}{o['nat']}" for o in opts)
+            info = QLabel(
+                f"<span style='color:#ddd; font-size:14px'>"
+                f"여러 나라의 U-23 올림픽 대표팀이 당신을 원합니다.<br>"
+                f"<b style='color:#C0C0C0'>{nat_list}</b><br><br>"
+                f"어느 나라로 올림픽에 나갈지 선택하세요.<br>{_OLY_NOTE}<br>"
+                f"<span style='color:#aaa'>선택하면 선발 결과가 공개됩니다.</span></span>")
+        elif single:
             opt = opts[0]
             info = QLabel(
                 f"<span style='color:#ddd; font-size:14px'>"
@@ -3459,7 +3512,9 @@ class CenterPanel(QWidget):
                 f"어느 대표팀으로 뛸지 선택하세요.<br>"
                 f"<b style='color:#ff8866'>한 번 출전하면 그 나라로 영구 고정</b>됩니다.<br>"
                 f"<span style='color:#aaa'>선택하면 선발·예선 결과가 공개됩니다.</span>"
-                f"<br><span style='color:#88cc88'>※ 보유 국적 자체는 사라지지 않습니다.</span></span>")
+                f"<br><span style='color:#88cc88'>※ 보유 국적 자체는 사라지지 않습니다.</span>"
+                + (f"<br><br>{_OLY_NOTE}<br><span style='color:#aaa'>(🏅 표시 선택지)</span>" if _any_oly else "")
+                + "</span>")
         info.setWordWrap(True)
         card = QFrame(); card.setObjectName("dlgCard")
         cl = QVBoxLayout(card); cl.setContentsMargins(14,12,14,12)
@@ -3583,8 +3638,12 @@ class CenterPanel(QWidget):
                     _label += f" ({_comp})"
                 col = QFrame(); col_l = QVBoxLayout(col)
                 col_l.setContentsMargins(0,0,0,0); col_l.setSpacing(4)
+                _o_oly = opt.get("kind") in _OLY_K        # [2026-10] 올림픽 선택지는 🏅 + 은색
+                if _o_oly:
+                    _label = f"🏅 {_label}"
                 nat_lbl = QLabel(_label); nat_lbl.setWordWrap(True)
-                nat_lbl.setStyleSheet("color:#ffcc66; font-weight:bold;")
+                nat_lbl.setStyleSheet("color:#C0C0C0; font-weight:bold;" if _o_oly
+                                      else "color:#ffcc66; font-weight:bold;")
                 col_l.addWidget(nat_lbl)
                 pair = QHBoxLayout(); pair.setSpacing(4)
                 b_yes = QPushButton("✅ 예")
@@ -3616,10 +3675,11 @@ class CenterPanel(QWidget):
 
         _rs = res.get("result", "")
         _kind = res.get("kind", "")
+        _oly = _kind in ("oly_qual", "olympic")     # [2026-10 U-23 올림픽]
         # [2026-08 버그수정, 신민용 리포트: "유로 예선 관련 국제전 표시가
         # 이상하다"] 같은 wc_qual-only 필터 버그 — 유로 예선(cont_qual)으로
         # 선발됐을 때도 "본선 진출!"이 아니라 "예선 소집!"으로 떠야 한다.
-        _is_qual = (_kind in ("wc_qual", "cont_qual"))
+        _is_qual = (_kind in ("wc_qual", "cont_qual", "oly_qual"))
         # 각 단계 라인 구성 (결과에 따라 ②③ 색/내용 분기)
         # [버그 수정] line1이 "확정했습니다"라고 단독으로 뜨는 순간, 아직
         # 실제 선발 여부(line2)가 공개되기도 전인데 마치 대표팀 승선이
@@ -3643,15 +3703,33 @@ class CenterPanel(QWidget):
                 line3 = f"🌍 <span style='color:#66ccff'>{nat} 본선 진출!</span> — 조별리그에 소집됩니다."
         else:
             line2 = ""; line3 = ""
+        if _oly:
+            # [2026-10] 올림픽 — 은색·🏅, 후보 탈락 구분, 국적 고정 없음 안내.
+            line1 = f"🏳️ <b style='color:#C0C0C0'>{nat}</b> U-23 올림픽 대표팀에 도전합니다."
+            if _rs == "미선발":
+                line2 = ("📋 <span style='color:#ff8866'>U-23 올림픽 대표팀 후보 탈락</span> — 최종 18명에 들지 못했습니다."
+                         if res.get("reserve") else
+                         "📋 <span style='color:#ff8866'>U-23 올림픽 대표팀 미선발</span> — 이번엔 부름을 받지 못했습니다.")
+                line3 = ""
+            elif _rs == "예선진출실패":
+                line2 = f"📋 <span style='color:#ff8866'>{nat}은(는) 올림픽 예선 진출 실패</span> — 이번 올림픽 출전 없음."
+                line3 = ""
+            elif _rs == "선발":
+                line2 = "📣 <span style='color:#88cc88'>U-23 올림픽 대표팀 선발!</span>"
+                line3 = (f"🏅 <span style='color:#C0C0C0'>{nat} 올림픽 예선 소집!</span> — 예선 조별리그에 출전합니다."
+                         if _is_qual else
+                         f"🏅 <span style='color:#C0C0C0'>{nat} 올림픽 본선 출전!</span> — 조별리그에 소집됩니다.")
+            line3 = (line3 + "<br><br>" if line3 else "") + \
+                "<span style='color:#aaa'>※ 올림픽 출전은 국적을 고정하지 않습니다.</span>"
 
         dlg = QDialog(self)
-        dlg.setWindowTitle("🌍 대표팀 발탁 결과")
+        dlg.setWindowTitle("🏅 U-23 올림픽 대표팀 발탁 결과" if _oly else "🌍 대표팀 발탁 결과")
         dlg.setMinimumWidth(400)
         dlg.setStyleSheet(_DIALOG_STYLE)
         lay = QVBoxLayout(dlg)
         lay.setContentsMargins(18, 16, 18, 16); lay.setSpacing(10)
 
-        hdr = QLabel("🌍 대표팀 발탁 결과"); hdr.setObjectName("dlgHeader")
+        hdr = QLabel("🏅 U-23 올림픽 대표팀 발탁 결과" if _oly else "🌍 대표팀 발탁 결과"); hdr.setObjectName("dlgHeader")
         lay.addWidget(hdr)
 
         body = "<br><br>".join(x for x in (line1, line2, line3) if x)

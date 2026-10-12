@@ -688,6 +688,10 @@ def _apply_exemptions(conn, finished_year, stats):
             "(SELECT player_id FROM intl_squad WHERE tournament_id=? AND country=?)",
             (MILITARY_STATUS_EXEMPT, MILITARY_STATUS_UNSERVED, tid, K)).rowcount
         stats["exempt"] += max(0, n or 0)
+    # [2026-10 신설] U-23 올림픽 메달 — 한국 최종 18명(출전 0분 포함) 미필 → 병역 혜택(효과 = 면제,
+    # 화면 구분은 oly_military_benefit). 꺼져 있으면 아무것도 안 한다.
+    from competition.olympics import apply_ai_exemptions as _oly_exempt
+    _oly_exempt(conn, finished_year, stats)
 
 
 def _enlist_new_year(conn, new_year, stats):

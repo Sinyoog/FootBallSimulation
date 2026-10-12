@@ -2250,7 +2250,7 @@ _CTX_STYLE = {
     "super_cup": ("color:#ffd700;", "⭐"),
     "cwc":       ("color:#66d9ff;", "🌐"),
     "cup":       ("color:#c48aff;", "🎖️"),
-    "lower_cup": ("color:#00A6A6;", "🏅"),
+    "lower_cup": ("color:#00A6A6;", "🎗️"),
 }
 
 # actBtn과 동일한 다크 박스 스타일

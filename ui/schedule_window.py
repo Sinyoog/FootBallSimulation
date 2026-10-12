@@ -413,6 +413,9 @@ class ScheduleWindow(QDialog):
                 ("랭킹 평가전 본선", lambda: self._make_intl_tab(
                     "ko", kinds=("power_eval",)), False),
             ]),
+            # [2026-10 4단계] U-23 올림픽 — 예선(월드컵 예선 엔진)·본선(월드컵 본선 일정).
+            # 올림픽이 꺼져 있고 기록도 없으면 대분류 자체를 만들지 않는다(아래 _oly_defs).
+            *self._oly_sched_defs(),
             ("🏆 챔피언스리그", [
                 ("리그 스테이지", lambda: self._make_champions_tab("groups"), False),
                 ("본선", lambda: self._make_champions_tab("ko"), False),
@@ -449,7 +452,7 @@ class ScheduleWindow(QDialog):
                 ("전체 일정", lambda: self._make_cup_tab(my_view=False), True),
                 ("본선", lambda: self._make_cup_bracket_tab(), False),
             ]),
-            ("🏅 3부·4부컵", [
+            ("🎗️ 3부·4부컵", [
                 ("내 경기", lambda: self._make_lower_cup_tab(my_view=True), False),
                 ("전체 일정", lambda: self._make_lower_cup_tab(my_view=False), True),
             ]),
@@ -459,6 +462,24 @@ class ScheduleWindow(QDialog):
         ]
         return defs
 
+    _OLY_CAT = "🏅 U-23 올림픽"
+
+    def _oly_sched_defs(self):
+        try:
+            from competition import olympics as _O
+            if not (_O.enabled() or _O.olympic_tournament_ids()):
+                return []
+        except Exception:
+            return []
+        q, f = ("oly_qual",), ("olympic",)
+        return [(self._OLY_CAT, [
+            ("예선 1차", lambda: self._make_intl_tab("groups", qual=True, stage=1, kinds=q), False),
+            ("예선 2차", lambda: self._make_intl_tab("groups", qual=True, stage=2, kinds=q), False),
+            ("예선 플레이오프", lambda: self._make_intl_tab("qual_po", qual=True, kinds=q), False),
+            ("조별리그", lambda: self._make_intl_tab("groups", qual=False, kinds=f), False),
+            ("본선", lambda: self._make_intl_tab("ko", qual=False, kinds=f), False),
+        ])]
+
     def _sched_lazy_tab_exists(self, cat_label, sub_label):
         """지연 로딩 탭은 만들어보지 않고 존재 여부를 판단해야 한다 —
         예전 구조가 쓰던 싼 COUNT 프로브(_cup_all_exists / _lower_cup_all_
@@ -466,7 +487,7 @@ class ScheduleWindow(QDialog):
         데이터라 행이 있는지만 본다."""
         if cat_label == "🎖️ 컵대회":
             return self._cup_all_exists()
-        if cat_label == "🏅 3부·4부컵":
+        if cat_label == "🎗️ 3부·4부컵":
             return self._lower_cup_all_exists()
         return True
 
@@ -510,6 +531,10 @@ class ScheduleWindow(QDialog):
                 import intl_engine
                 return any(intl_engine.get_my_tournament(year, qual=q, kinds=k) for q, k in (
                     (True, None), (False, None), (None, ("power_eval", "power_eval_extra"))))
+            if cat_label == self._OLY_CAT:
+                import intl_engine
+                return any(intl_engine.get_my_tournament(year, kinds=k)
+                           for k in (("oly_qual",), ("olympic",)))
             if not my_tid:
                 return False
             if cat_label in ("🏆 챔피언스리그", "🥈 유로파리그", "🥉 컨퍼런스리그", "🏵 슈퍼컵"):
@@ -538,7 +563,7 @@ class ScheduleWindow(QDialog):
             if cat_label == "🎖️ 컵대회":
                 from competition import cup_engine
                 return bool(cup_engine._my_cup_tournament(p, year)) or bool(self._cup_all_exists())
-            if cat_label == "🏅 3부·4부컵":
+            if cat_label == "🎗️ 3부·4부컵":
                 from competition import lower_cup_engine
                 _lt = lower_cup_engine._my_lower_cup_tournament(p, year)
                 return bool(_lt) and self._my_team_in_lower_cup(_lt["id"], my_tid)
@@ -879,7 +904,8 @@ class ScheduleWindow(QDialog):
             return None
         if mode == "qual_po" and not qual:
             return None
-        _is_qual = t.get("kind") in ("wc_qual", "cont_qual")
+        _is_qual = t.get("kind") in ("wc_qual", "cont_qual", "oly_qual")
+        _is_oly_t = t.get("kind") in ("oly_qual", "olympic")      # [2026-10 4단계]
 
         from PyQt6.QtWidgets import QScrollArea, QFrame
         p   = get_player()
@@ -916,6 +942,10 @@ class ScheduleWindow(QDialog):
             if t["status"] == "done":
                 status_txt = f"종료  |  🏆 우승: {t['winner']}"
             icon = "🌍"
+        if _is_oly_t:
+            icon = "🏅"
+            if t["status"] == "done" and not _is_qual:
+                status_txt = f"종료  |  🥇 금메달: {t['winner']}"
         hdr = QLabel(f"{icon} {t['name']}  ─  {status_txt}")
         # [2026-07 색상 규칙 개편, 신민용 요청] 예전엔 국제대회 전부(월드컵/
         # 대륙컵/예선)가 파란색 하나로 뭉뚱그려 표시됐다. 이제 리그=초록,
@@ -923,6 +953,8 @@ class ScheduleWindow(QDialog):
         #   - 월드컵·대륙컵(본선, kind in world/continent) → 주황
         #   - 그 외 국가대표 대회(예선 wc_qual 등) → 빨강
         _hdr_color = "#ff9933" if t.get("kind") in ("world", "continent", "region") else "#ff5555"
+        if _is_oly_t:
+            _hdr_color = "#C0C0C0"
         hdr.setStyleSheet(f"color:{_hdr_color};font-size:14px;font-weight:bold;")
         lay.addWidget(hdr)
         if t["my_selected"] == 1:
@@ -2267,7 +2299,7 @@ class ScheduleWindow(QDialog):
         lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(6)
 
-        hdr = QLabel(f"🏅 {t['year']}년 {t['name']}" +
+        hdr = QLabel(f"🎗️ {t['year']}년 {t['name']}" +
                      (f"  —  현재 성적: {t['my_result']}" if t.get("my_result") else "") +
                      ("  (내 경기)" if my_view else "  (전체 일정)"))
         hdr.setStyleSheet("color:#00A6A6;font-size:14px;font-weight:bold;")

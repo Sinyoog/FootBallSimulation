@@ -1073,7 +1073,9 @@ class CareerWindow(QDialog):
                 team_str = tname
                 comp_str = t.get('competition','')
                 result   = lname  # league_name 자리에 결과 저장됨
-                if "우승" in result:     color = "#00cc44"
+                from constants import OLYMPIC_MEDAL_COLOR as _OMC   # [2026-10 4단계] 올림픽 메달
+                if result in _OMC:         color = _OMC[result]
+                elif "우승" in result:     color = "#00cc44"
                 elif "준우승" in result: color = "#aaddff"
                 elif "3위" in result:   color = "#ffd700"
                 elif "4위" in result:   color = "#cc9944"
@@ -1272,8 +1274,13 @@ class CareerWindow(QDialog):
                 for _k in range(7, 7 + len(extra_cols)):
                     vals[_k] = "—"
                 vals[7 + len(extra_cols)] = _reason_label
+            _is_oly_row = "U-23 올림픽" in (m.get("comp") or "")   # [2026-10 4단계]
+            if _is_oly_row:
+                vals = list(vals)
+                vals[3] = f"🏅 {vals[3]}"
             for j, v in enumerate(vals):
-                self._set(tbl, i, j, v, color if j == len(vals) - 1 else None)
+                self._set(tbl, i, j, v, color if j == len(vals) - 1 else
+                          ("#C0C0C0" if (_is_oly_row and j == 3) else None))
         lay.addWidget(tbl)
         return w
 
@@ -1426,7 +1433,7 @@ class CareerWindow(QDialog):
 
         if hist:
             parts = [f"{h['year']}년 {h['result']}" for h in hist]
-            hl = QLabel("🏅 " + "   ·   ".join(parts))
+            hl = QLabel("🎗️ " + "   ·   ".join(parts))
             hl.setStyleSheet("color:#00A6A6;font-size:12px;font-weight:bold;padding:4px;")
             hl.setWordWrap(True)
             lay.addWidget(hl)

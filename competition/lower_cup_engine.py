@@ -43,7 +43,8 @@ from competition.cup_engine import (
 )
 from constants import day_to_week, week_to_day, SECOND_HALF_START
 from competition.competition_common import (league_day_map, pick_free_day,
-                                            bump_match_day_generation)
+                                            bump_match_day_generation,
+                                            club_cup_day_assign_enabled)
 
 LOWER_CUP_BRACKET_CAP = 64
 
@@ -52,6 +53,28 @@ LOWER_CUP_BRACKET_CAP = 64
 # 라운드 수가 부족해지는 상황(64강 국가는 PO+6라운드=7라운드 필요)을 대비한다.
 LOWER_CUP_ROUND_WEEKS_POOL = [32, 34, 36, 38, 40, 42, 43]
 _ROUND_DAY_OFFSET = 3   # 그 주의 4일째(수요일 격) — cup_engine(offset 0)과 다른 요일
+
+
+# [2026-10 신설, 신민용 확정: "L1e"] 상·하반기 분할(constants.LOWER_CUP_SPLIT_ENABLED 주석 참고).
+# 설정은 호출 시점의 constants에서 읽는다(테스트에서 바꿔 끼울 수 있게).
+_SPLIT_STAGE = {16: 0, 8: 1, 4: 2, 2: 3}   # 라운드 참가 팀 수 → 하반기 칸
+
+
+def lower_cup_split_enabled() -> bool:
+    import constants as _C
+    return bool(getattr(_C, "LOWER_CUP_SPLIT_ENABLED", False))
+
+
+def _split_week(n_teams, prev_week=None, is_po=False):
+    """분할 모드에서 라운드 주차. n_teams = 그 라운드 참가 팀 수(KO, 2의 거듭제곱).
+    예선 PO와 16강보다 큰 라운드는 상반기 주를 차례로, 16강 이하는 하반기 정해진 칸."""
+    import constants as _C
+    first, second = _C.LOWER_CUP_FIRST_HALF_WEEKS, _C.LOWER_CUP_SECOND_HALF_WEEKS
+    if not is_po and n_teams <= 16:
+        return second[_SPLIT_STAGE[n_teams]]
+    if prev_week in first:
+        return first[first.index(prev_week) + 1]
+    return first[0]
 
 # ── 국가별 대회명 (사용자 지정 목록 그대로) ──────────────────────
 LOWER_CUP_NAME_BY_COUNTRY = {
@@ -357,6 +380,25 @@ def _build_all_season_rank_maps(c, season):
     return out
 
 
+def _prev_season_seed_keys(c, country_id, season):
+    """[2026-10 신설, L1e] 직전 시즌(season-1) 그 나라 모든 리그의 최종 순위 →
+    {team_id: (부수, 0-base 순위)}. 순위는 game_engine.get_league_standings(게임 순위표와
+    같은 기준·같은 동률 순서). 직전 시즌 기록이 없으면 빈 dict."""
+    from game_engine import get_league_standings
+    out = {}
+    for lid, tier in c.execute("SELECT id, tier FROM leagues WHERE country_id=?", (country_id,)).fetchall():
+        try:
+            rows = get_league_standings(lid, season=season - 1)
+        except Exception:
+            rows = []
+        # 그 시즌 일정이 없으면 get_league_standings는 '현재 소속 팀 0경기' 로스터를 돌려준다
+        # (첫 시즌의 season-1 등) — 경기를 하나도 안 치른 행은 기록 없음으로 본다.
+        rows = [r for r in rows if (r["wins"] + r["draws"] + r["losses"]) > 0]
+        for i, r in enumerate(rows):
+            out[r["id"]] = (tier, i)
+    return out
+
+
 def _build_seeded_pool(c, country_id, season, rank_maps=None):
     """(3,4)부 또는 (2,3)부 팀을 모아 "실력순"(낮은 티어 번호가 항상 위,
     같은 티어 안에서는 이번 시즌 진행 중 순위) 리스트를 반환.
@@ -367,15 +409,27 @@ def _build_seeded_pool(c, country_id, season, rank_maps=None):
         return None, None
     hi_tier, lo_tier = tiers  # hi_tier가 숫자는 더 작음(더 상위 리그)
     pool = []
+    # [2026-10 L1e] 분할 모드(상반기 개막)엔 이번 시즌 순위가 없으므로 직전 시즌 기준 시드.
+    _split = lower_cup_split_enabled()
+    _keys = _prev_season_seed_keys(c, country_id, season) if _split else None
     for tier in (hi_tier, lo_tier):
         lg = c.execute("SELECT id FROM leagues WHERE country_id=? AND tier=?",
                         (country_id, tier)).fetchone()
         if not lg:
             continue
         league_id = lg[0]
-        rank_map = (rank_maps.get(league_id, {}) if rank_maps is not None
+        rank_map = ({} if _split else
+                    rank_maps.get(league_id, {}) if rank_maps is not None
                     else _current_season_rank_within_tier(c, league_id, season))
         teams = c.execute("SELECT id, name FROM teams WHERE league_id=?", (league_id,)).fetchall()
+        if _split:
+            # 직전 시즌 (부수, 순위) 오름차순 = 강등팀 → 잔류팀 → 승격팀(각 그룹은 직전 순위순),
+            # 직전 시즌 기록 없는 팀은 맨 뒤(OVR 높은 순, 같으면 team_id).
+            _ovr = {tid: _team_avg_ovr(c, tid) for tid, _n in teams}
+            teams_sorted = sorted(teams, key=lambda t: (_keys.get(t[0], (99, 9999)), -_ovr[t[0]], t[0]))
+            for tid, tname in teams_sorted:
+                pool.append((tid, tname, tier, _ovr[tid]))
+            continue
         teams_sorted = sorted(teams, key=lambda t: rank_map.get(t[0], 999))
         for tid, tname in teams_sorted:
             pool.append((tid, tname, tier, _team_avg_ovr(c, tid)))
@@ -400,7 +454,9 @@ def start_lower_cup(year, season):
     # 다시 계산하면 match_results 전체 스캔이 리그 수만큼 반복된다
     # (_build_all_season_rank_maps 주석 참고). 전세계 순위를 여기서 한 번만
     # 만들어 넘긴다.
-    _rank_maps = _build_all_season_rank_maps(c, season)
+    _split = lower_cup_split_enabled()
+    # [2026-10 L1e] 분할 모드는 직전 시즌 기준 시드라 이번 시즌 순위표가 필요 없다.
+    _rank_maps = {} if _split else _build_all_season_rank_maps(c, season)
     country_rows = c.execute("SELECT DISTINCT country_id FROM leagues").fetchall()
     existing_cids = {r[0] for r in c.execute(
         "SELECT country_id FROM lower_cup_tournaments WHERE year=?", (year,)).fetchall()}
@@ -434,12 +490,15 @@ def start_lower_cup(year, season):
                 (tournament_id, team_id, team_name, tier, ovr, seed_rank, alive)
                 VALUES (?,?,?,?,?,?,1)""", (tid, pid, pname, tier, ovr, seed_rank))
 
+        # [2026-10 L1e] 분할 모드: 예선 PO·16강보다 큰 첫 라운드는 상반기, 아니면 하반기 칸.
+        _wk0 = (_split_week(n, is_po=bool(po_pool_size)) if _split
+                else LOWER_CUP_ROUND_WEEKS_POOL[0])
         if po_pool_size:
-            _create_po_round(c, tid, pool, po_pool_size, week=LOWER_CUP_ROUND_WEEKS_POOL[0],
+            _create_po_round(c, tid, pool, po_pool_size, week=_wk0,
                               my_team_id=my_team_id if is_my else None, year=year)
         else:
             _create_ko_round(c, tid, [team[0] for team in pool], round_idx=0,
-                              week=LOWER_CUP_ROUND_WEEKS_POOL[0],
+                              week=_wk0,
                               my_team_id=my_team_id if is_my else None, year=year)
         created += 1
         if is_my and add_log:
@@ -467,11 +526,16 @@ def _create_po_round(c, tid, pool, po_pool_size, week, my_team_id=None, year=Non
     day_default = week_to_day(week) + _ROUND_DAY_OFFSET
     week_start = week_to_day(week)
     day_map = league_day_map(c, year, week, [t[0] for t in po_group]) if year else {}
+    # [2026-10 신설, 3단계] 켜져 있으면 여기서 날짜를 정하지 않고 0(대기)으로 넣는다 —
+    # 주 처리가 끝난 뒤 competition_common.assign_pending_club_cup_days가 같은 주의
+    # 국내컵 경기와 한꺼번에, 양 팀의 모든 클럽 일정을 보고 배정한다.
+    _assigned = [0] * half if (year and club_cup_day_assign_enabled()) else None
     slot = 0
     for i in range(half):
         top = po_group[i]          # PO 참가자 중 상대적으로 강한 쪽
         bottom = po_group[po_pool_size - 1 - i]   # 상대적으로 약한 쪽
-        day = pick_free_day(week_start, day_map, (top[0], bottom[0]), day_default)
+        day = (_assigned[i] if _assigned is not None
+               else pick_free_day(week_start, day_map, (top[0], bottom[0]), day_default))
         is_my = 1 if my_team_id in (top[0], bottom[0]) else 0
         c.execute("""INSERT INTO lower_cup_matches
             (tournament_id, round_name, round_idx, week, day,
@@ -497,11 +561,14 @@ def _create_ko_round(c, tid, team_ids, round_idx, week, my_team_id=None, round_n
     week_start = week_to_day(week)
     day_map = league_day_map(c, year, week, team_ids) if year else {}
     half = n // 2
+    # [2026-10 신설, 3단계] 위 PO 라운드와 동일 — 켜져 있으면 0(대기)으로 넣는다.
+    _assigned = [0] * half if (year and club_cup_day_assign_enabled()) else None
     slot = 0
     for i in range(half):
         home = team_ids[i]
         away = team_ids[n - 1 - i]
-        day = pick_free_day(week_start, day_map, (home, away), day_default)
+        day = (_assigned[i] if _assigned is not None
+               else pick_free_day(week_start, day_map, (home, away), day_default))
         is_my = 1 if my_team_id in (home, away) else 0
         c.execute("""INSERT INTO lower_cup_matches
             (tournament_id, round_name, round_idx, week, day,
@@ -707,6 +774,8 @@ def _advance_lower_cup_round(c, tid, week):
     used_weeks = LOWER_CUP_ROUND_WEEKS_POOL
     idx_in_pool = used_weeks.index(week) + 1 if week in used_weeks else len(used_weeks)
     next_week = used_weeks[idx_in_pool] if idx_in_pool < len(used_weeks) else week + 2
+    if lower_cup_split_enabled():   # [2026-10 L1e] 다음 라운드 참가 팀 수로 상/하반기 칸을 정한다
+        next_week = _split_week(len(survivors), prev_week=week)
 
     # [3/4위전] 방금 끝난 라운드가 4강이었으면(생존자가 2명으로 줄었으면),
     # 그 라운드의 패자 2명으로 결승과 같은 주차에 3/4위전을 만든다. 이미
@@ -728,10 +797,13 @@ def _advance_lower_cup_round(c, tid, week):
                 losers.append(m["away_team_id"] if w == m["home_team_id"] else m["home_team_id"])
             if len(losers) == 2:
                 # [2026-09 버그수정] 3·4위전도 라운드와 같은 규칙으로 리그 일정을 피한다.
-                tp_day = pick_free_day(
-                    week_to_day(next_week),
-                    league_day_map(c, t["year"], next_week, losers),
-                    losers, week_to_day(next_week) + _ROUND_DAY_OFFSET)
+                if t["year"] and club_cup_day_assign_enabled():   # [2026-10 신설, 3단계] 0 = 대기
+                    tp_day = 0
+                else:
+                    tp_day = pick_free_day(
+                        week_to_day(next_week),
+                        league_day_map(c, t["year"], next_week, losers),
+                        losers, week_to_day(next_week) + _ROUND_DAY_OFFSET)
                 is_my_tp = 1 if (t["my_in"] and t["my_team_id"] in losers) else 0
                 c.execute("""INSERT INTO lower_cup_matches
                              (tournament_id, round_name, round_idx, week, day,
@@ -1178,7 +1250,7 @@ def simulate_my_lower_cup_match(week, p, day=None):
     marker = f" [match:{detail_id}:lower_cup]" if detail_id else ""
 
     add_log("─" * 44, "sep")
-    add_log(f"🏅 {comp_name}  {_day_label(week, day)}{marker}", "match")
+    add_log(f"🎗️ {comp_name}  {_day_label(week, day)}{marker}", "match")
     add_log(f"   {home_disp} {hs}-{as_} {away_disp}  ({rs}){pso_txt}", "match")
     if p.get("position") == "GK":
         add_log(f"   평점 {rating:.1f}  선방 {saves}", "match")

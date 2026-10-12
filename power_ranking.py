@@ -1815,6 +1815,8 @@ def update_country_ratings_for_year(conn, evaluation_year: int):
     rows = conn.execute(
         "SELECT id, kind, name FROM intl_tournaments WHERE year=?", (evaluation_year,)
     ).fetchall()
+    # [2026-10] U-23 올림픽(예선·본선)은 국가 파워랭킹에 반영하지 않는다.
+    rows = [r for r in rows if r[1] not in ("oly_qual", "olympic")]
     for tid, kind, name in rows:
         wk = _intl_tournament_weight_key(kind, name)
         if wk is None:
@@ -1852,6 +1854,8 @@ def update_country_b_for_year(conn, evaluation_year: int):
     rows = conn.execute(
         "SELECT id, kind, name FROM intl_tournaments WHERE year=?", (evaluation_year,)
     ).fetchall()
+    # [2026-10] U-23 올림픽(예선·본선)은 국가 파워랭킹에 반영하지 않는다.
+    rows = [r for r in rows if r[1] not in ("oly_qual", "olympic")]
     # 이 해에 열린 예선 목록(4.6 페널티 판정용) — kind가 *_qual인 것들
     qual_rows = [(tid, kind, name) for tid, kind, name in rows if kind and kind.endswith("_qual")]
     main_rows = [(tid, kind, name) for tid, kind, name in rows if not (kind and kind.endswith("_qual"))]
@@ -2084,7 +2088,8 @@ def apply_team_season_regression(conn, evaluation_year: int, league_power_cache:
 def _country_last_intl_year(conn, country: str, upto_year: int) -> Optional[int]:
     row = conn.execute(
         """SELECT MAX(t.year) FROM intl_entries e JOIN intl_tournaments t ON e.tournament_id=t.id
-           WHERE e.country=? AND t.year<=?""", (country, upto_year)).fetchone()
+           WHERE e.country=? AND t.year<=?
+             AND t.kind NOT IN ('oly_qual','olympic')""", (country, upto_year)).fetchone()   # [2026-10] 올림픽 제외
     return row[0] if row and row[0] else None
 
 

@@ -28,7 +28,8 @@ import random
 from dataclasses import dataclass
 
 from database import get_conn
-from constants import generate_round_robin
+import collections
+from constants import generate_round_robin, DAYS_PER_WEEK
 
 # [2026-08 신설] PSO(승부차기) 홈팀 승률에 OVR 차이가 반영되는 민감도.
 # p_home = 0.5 + clamp(diff * PSO_OVR_COEF, -0.1, 0.1) — resolve_pso 참고.
@@ -303,9 +304,15 @@ def pick_free_day(week_start, day_map, team_ids, default_day,
             #  경로 둘 다 실제로 터짐) set.update()는 임의 iterable을 받으므로
             # 값이 set이든 튜플이든 동일하게 동작한다(결과 불변).
             busy.update(day_map.get(tid, ()))
+    # [2026-10 신설] A매치 기간(constants.AMATCH_CLUB_BLACKOUTS)에 걸리는
+    # 후보일은 아예 제외한다 — 금지 구간이 없으면 아무것도 안 걸러져서
+    # 기존과 100% 동일하게 동작한다.
+    from constants import is_club_blackout_day
     best_dist, best_day = -1, None
     for off in offsets:
         cand = week_start + off
+        if is_club_blackout_day(cand):
+            continue
         dist = min((abs(cand - d) for d in busy), default=99)
         if dist >= gap:
             return cand
@@ -314,7 +321,226 @@ def pick_free_day(week_start, day_map, team_ids, default_day,
     # gap은 못 맞추지만 최소한 '같은 날'은 아닌 날이 있으면 그 날을 쓴다.
     if best_day is not None and best_dist >= 1:
         return best_day
+    if is_club_blackout_day(default_day) and best_day is not None:
+        return best_day
     return default_day
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [2026-10 신설, 신민용 확정: "B 방식 — 국내컵·대륙대항전 AI 경기에도 실제 날짜를
+# 확정하고 양 팀 일정을 함께 검증"] (3단계)
+#
+# 예전엔 국내컵·챔스·유로파·컨퍼런스 AI 경기는 주차만 있고 날짜가 없었다 — 날짜는
+# "내 팀"일 때만 game_engine._week_intl_cl_day가 내 팀 일정만 보고 골랐다. 그래서
+# 상대 팀의 리그 경기와 붙는 날이 그대로 생겼다(2026-10 실측: 날짜를 양 팀 기준으로
+# 고정하면 기존 일정에서도 '국내컵+리그 이틀 연속'이 약 1,000건). 이제 라운드가
+# 생길 때 경기마다 날짜를 하나 확정해 저장한다:
+#   - 양 팀의 '날짜가 있는 모든 클럽 경기'(리그·국내컵·3·4부컵·챔스·유로파·
+#     컨퍼런스·국내슈퍼컵·승강PO·클럽월드컵)와 A매치 금지일을 함께 피한다.
+#   - 같은 배치(한 라운드) 안에서는 '가능한 날이 적은 경기'부터 날짜를 준다.
+#   - 그 주 안에 양 팀 모두 MIN_MATCH_DAY_GAP을 지킬 날이 없으면 가장 덜 붙는 날
+#     (같은 날 2경기는 가능한 한 피함)을 쓰되, 반드시 CLUB_DAY_ASSIGN_LOG에 실패로
+#     남긴다 — reason="하한"(리그·슈퍼컵·승강PO 등 고정 일정만으로도 불가능) /
+#     "먼저정한컵"(앞선 배치에서 정해진 다른 컵 경기 때문에) / "동시배정"(같은
+#     배치 안에서 먼저 정한 경기 때문에).
+#   - 라운드를 만드는 쪽(cup_engine·lower_cup_engine·대륙대항전)은 날짜를 비워 두고,
+#     game_engine이 주 처리·주 전환 직후 assign_pending_club_cup_days를 불러 같은
+#     주의 모든 대회 경기를 한 배치로 배정한다.
+# 날짜 결정에 난수를 쓰지 않으므로 대진·경기 결과(난수 소비 순서)는 바뀌지 않는다.
+# 끄면(constants.CLUB_CUP_DAY_ASSIGN_ENABLED=False) 예전과 100% 동일하다.
+CLUB_DAY_ASSIGN_LOG = []
+
+_BUSY_TABLES = (
+    ("cup_matches", "cup_tournaments"),
+    ("lower_cup_matches", "lower_cup_tournaments"),
+    ("cl_matches", "cl_tournaments"),
+    ("el_matches", "el_tournaments"),
+    ("ecl_matches", "ecl_tournaments"),
+    ("domestic_sc_matches", "domestic_sc_tournaments"),
+    ("po_matches", "po_tournaments"),
+    ("cwc_matches", "cwc_tournaments"),
+    # [2026-10 추가, 3단계 점검] 대륙 슈퍼컵(29주) — 빠져 있어서 그 주변 컵 경기 배정이
+    # 슈퍼컵 경기일을 못 봤다. 날짜는 super_cup_engine이 정하므로 '고정' 일정으로 본다.
+    ("sc_matches", "sc_tournaments"),
+)
+
+
+def club_cup_day_assign_enabled() -> bool:
+    import constants as _C
+    return bool(getattr(_C, "CLUB_CUP_DAY_ASSIGN_ENABLED", False))
+
+
+def club_busy_days(conn, year, week, team_ids, span=1, only_fixed=False, exclude=()):
+    """team_ids가 week 주변(week-span ~ week+span 주)에 가진 '날짜가 있는 모든 클럽
+    경기일'을 {team_id: set(day)}로 돌려준다(리그 + 위 _BUSY_TABLES).
+    exclude: 빼고 볼 경기 표 이름(예: 대륙 슈퍼컵이 자기 경기일을 정할 때 "sc_matches")."""
+    ids = [t for t in {t for t in team_ids if t}]
+    out = {t: set(s) for t, s in league_day_map(conn, year, week, ids, span=span).items()}
+    if not ids or not year:
+        return out
+    idset = set(ids)
+    lo = (week - 1 - span) * DAYS_PER_WEEK + 1
+    hi = (week + span) * DAYS_PER_WEEK
+    for mt, tt in _BUSY_TABLES:
+        # only_fixed: 날짜 확정 대상 컵(국내컵·3·4부컵·대륙대항전)은 빼고 '고정' 일정만 —
+        # 실패 사유 '하한'(리그 등 고정 일정만으로도 불가능) 판정용.
+        if only_fixed and mt in ("cup_matches", "lower_cup_matches", "cl_matches", "el_matches", "ecl_matches"):
+            continue
+        if mt in exclude:
+            continue
+        for i in range(0, len(ids), 400):
+            chunk = ids[i:i + 400]
+            ph = ",".join("?" * len(chunk))
+            try:
+                rows = conn.execute(
+                    f"""SELECT m.home_team_id, m.away_team_id, m.day FROM {mt} m
+                        JOIN {tt} t ON t.id = m.tournament_id
+                        WHERE t.year=? AND m.day BETWEEN ? AND ?
+                          AND (m.home_team_id IN ({ph}) OR m.away_team_id IN ({ph}))""",
+                    (year, lo, hi, *chunk, *chunk)).fetchall()
+            except Exception:
+                rows = []   # 표가 없는 구형 세이브
+            for h, a, d in rows:
+                if not d:
+                    continue
+                if h in idset:
+                    out.setdefault(h, set()).add(d)
+                if a in idset:
+                    out.setdefault(a, set()).add(d)
+    return out
+
+
+def assign_club_match_days(conn, year, week, pairs, comp, offsets=(2, 5, 3, 4, 1, 6, 0),
+                           default_offset=2, comps=None):
+    """한 배치(같은 주차 라운드)의 경기 [(home, away), ...]에 날짜를 정해 같은
+    순서의 리스트로 돌려준다. 위 블록 주석 참고. offsets는 후보 요일 우선순위
+    (국내컵·대륙대항전은 _week_intl_cl_day와 같은 순서, 3·4부컵은 자기 순서)."""
+    from constants import MIN_MATCH_DAY_GAP, is_club_blackout_day, CLUB_SEASON_END_DAY
+    ws = (week - 1) * DAYS_PER_WEEK + 1
+    # 클럽 시즌 마지막 주(43주)의 301일은 시즌 종료일(300일) 뒤라 후보에서 뺀다 —
+    # 승강 PO(302일~)가 나중에 생겨도 하루 차이로 붙지 않게(2026-10 실측 1~2건/시즌).
+    _last_ok = CLUB_SEASON_END_DAY if week == (CLUB_SEASON_END_DAY - 1) // DAYS_PER_WEEK + 1 else None
+
+    def _unavailable(cand):
+        return is_club_blackout_day(cand) or (_last_ok is not None and cand > _last_ok)
+    teams = {t for p in pairs for t in p if t}
+    busy = club_busy_days(conn, year, week, teams)
+    before = {t: set(s) for t, s in busy.items()}          # 이 배치 전까지 정해진 모든 경기
+    base = club_busy_days(conn, year, week, teams, only_fixed=True)   # 고정 일정만
+
+    def _feasible(h, a, b):
+        res = []
+        for off in offsets:
+            cand = ws + off
+            if _unavailable(cand):
+                continue
+            ok = True
+            for t in (h, a):
+                if t and any(abs(cand - x) < MIN_MATCH_DAY_GAP for x in b.get(t, ())):
+                    ok = False
+                    break
+            if ok:
+                res.append(cand)
+        return res
+
+    order = sorted(range(len(pairs)), key=lambda i: (len(_feasible(*pairs[i], busy)), i))
+    days = [None] * len(pairs)
+    for i in order:
+        h, a = pairs[i]
+        f = _feasible(h, a, busy)
+        if f:
+            d = f[0]
+        else:
+            best_dist, d = -1, None
+            for off in offsets:
+                cand = ws + off
+                if _unavailable(cand):
+                    continue
+                dist = min((abs(cand - x) for t in (h, a) if t for x in busy.get(t, ())), default=99)
+                if dist > best_dist:
+                    best_dist, d = dist, cand
+            if d is None:
+                d = ws + default_offset
+            CLUB_DAY_ASSIGN_LOG.append(dict(
+                comp=(comps[i] if comps else comp), year=year, week=week, day=d, home=h, away=a,
+                dist=best_dist,
+                reason=("하한" if not _feasible(h, a, base)
+                        else ("먼저정한컵" if not _feasible(h, a, before) else "동시배정"))))
+        days[i] = d
+        for t in (h, a):
+            if t:
+                busy.setdefault(t, set()).add(d)
+    bump_match_day_generation()
+    return days
+
+
+_PENDING_TABLES = (
+    ("국내컵", "cup_matches", "cup_tournaments", "t.status='active'"),
+    ("3·4부컵", "lower_cup_matches", "lower_cup_tournaments", "t.status='active'"),
+    ("챔피언스", "cl_matches", "cl_tournaments", "t.status!='done'"),
+    ("유로파", "el_matches", "el_tournaments", "t.status!='done'"),
+    ("컨퍼런스", "ecl_matches", "ecl_tournaments", "t.status!='done'"),
+)
+
+
+def assign_pending_club_cup_days():
+    """[2026-10 신설, 3단계] 진행 중인 국내컵·3·4부컵·챔스·유로파·컨퍼런스에서
+    '날짜가 아직 없는(0/NULL) 미진행 경기'를 모아, 연도·주차별로 대회를 가리지 않고
+    한꺼번에 assign_club_match_days로 날짜를 확정·저장한다(측정 C와 같은 방식 —
+    같은 주에 국내컵과 3·4부컵을 둘 다 치르는 팀도 한 배치 안에서 '가능한 날이
+    적은 경기부터' 정해진다). 라운드를 만드는 쪽은 날짜를 비워 두기만 하고,
+    game_engine이 주 처리·주 전환이 끝날 때마다 이 함수를 부른다. 다음 라운드는
+    항상 이전 라운드가 끝난 주의 마지막 날에 생기므로(국내컵·3·4부컵 모두),
+    그 주 안의 모든 대회 경기가 같은 호출에서 함께 배정된다. 꺼져 있으면 아무것도
+    안 한다. 반환: 날짜를 정한 경기 수."""
+    if not club_cup_day_assign_enabled():
+        return 0
+    # 다음 주 경기까지만 확정한다 — 3·4부컵 첫 라운드처럼 몇 주 앞서 만들어진
+    # 경기도, 같은 주의 다른 대회 라운드(국내컵 등)가 다 생긴 뒤 한 배치로 묶이게.
+    # (모든 다음 라운드는 이전 라운드가 끝난 주의 마지막 날 = 경기 주 직전 주 끝에
+    # 생기므로, 주 전환 직후 '현재 주 + 1'까지면 그 주 경기가 전부 모여 있다.)
+    try:
+        from game_engine import get_state
+        _st = get_state() or {}
+        horizon = (_st.get("current_year") or 0, (_st.get("current_week") or 0) + 1)
+    except Exception:
+        horizon = None
+    conn = get_conn()
+    pending = []
+    for comp, mt, tt, active in _PENDING_TABLES:
+        try:
+            rows = conn.execute(
+                f"""SELECT m.id, t.year, m.week, m.home_team_id, m.away_team_id FROM {mt} m
+                    JOIN {tt} t ON t.id = m.tournament_id
+                    WHERE {active} AND (m.day IS NULL OR m.day=0) AND m.home_score<0
+                    ORDER BY m.id""").fetchall()
+        except Exception:
+            rows = []
+        pending.extend((r[1], r[2], comp, mt, r[0], r[3], r[4]) for r in rows)
+    if not pending:
+        conn.close()
+        return 0
+    groups = collections.OrderedDict()
+    for y, wk, comp, mt, mid, h, a in sorted(pending, key=lambda x: (x[0], x[1])):
+        if horizon and horizon[0] and (y, wk) > horizon:
+            continue                       # 아직 먼 주 — 다음 호출에서 같은 주 경기와 함께
+        groups.setdefault((y, wk), []).append((comp, mt, mid, h, a))
+    if not groups:
+        conn.close()
+        return 0
+    n = 0
+    for (y, wk), ms in groups.items():
+        days = assign_club_match_days(conn, y, wk, [(h, a) for _, _, _, h, a in ms], None,
+                                      comps=[comp for comp, _, _, _, _ in ms])
+        by_table = collections.defaultdict(list)
+        for d, (comp, mt, mid, _, _) in zip(days, ms):
+            by_table[mt].append((d, mid))
+        for mt, upd in by_table.items():
+            conn.executemany(f"UPDATE {mt} SET day=? WHERE id=?", upd)
+        n += len(ms)
+    conn.commit()
+    conn.close()
+    return n
 
 
 # ─────────────────────────────────────────────────────────────────────────────

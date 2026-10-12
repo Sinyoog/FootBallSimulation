@@ -2406,6 +2406,7 @@ def _clear_world_browser_caches():
 
 
 def init_db():
+    from competition.olympics import migrations as _oly_migrations   # [2026-10] U-23 올림픽
     from constants import GAME_START_YEAR, PLAYER_START_AGE
     _clear_world_browser_caches()
     # [최적화] 인메모리 모드: 기존 세이브(game.db)가 있으면 먼저 인메모리로
@@ -4717,7 +4718,9 @@ def init_db():
     # init_lower_cup_tables로 만들어져 있어 ALTER가 정상 적용된다).
     # [2026-10 신설] 병역 시스템 컬럼(ai_players 6개 + my_player 8개). 정의는
     # military_service.MILITARY_*_COLS 한 곳에만 있다.
-    ] + et_score_migrations() + military_migrations():
+    # [2026-10 신설] U-23 올림픽 표·컬럼(competition/olympics.py) — OLYMPICS_ENABLED가 꺼져 있으면
+    # 빈 목록이라 스키마가 하나도 안 바뀐다.
+    ] + et_score_migrations() + military_migrations() + _oly_migrations():
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,
         #  그 외 진짜 버그로 인한 예외는 숨기지 않는다. 동작은 기존과 동일.)
@@ -7774,6 +7777,14 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
               "ai_transfer_log_archive",
               "ai_player_realstat_season"]:
         c.execute(f"DELETE FROM {t}")
+    # [2026-10 신설] U-23 올림픽 전용 표 — tournament_id·player_id가 새 게임에서 재사용되므로
+    # 반드시 비운다(이 목록의 "새 표 추가를 깜빡함" 재발 방지). 꺼져 있으면 표 자체가 없다.
+    for _t in ("oly_reserve_cut", "oly_squad_meta", "oly_squad_roles", "oly_military_benefit",
+               "oly_team_managers", "oly_objectives"):   # [2026-10 2단계] U-23 감독 재임·목표
+        try:
+            c.execute(f"DELETE FROM {_t}")
+        except sqlite3.OperationalError:
+            pass
     # [2026-09 DB 분리 2차] hist로 옮긴 표들이 (마이그레이션이 아직 안
     # 끝났거나 한 번 실패한 세이브에서) main에 그대로 남아있을 수 있다 —
     # 그 경우 무자격 이름은 main을 먼저 가리키므로, 위 hist. DELETE만으론
@@ -8234,10 +8245,14 @@ def get_ai_player_intl_caps(player_id: int, conn=None) -> dict:
     _own = conn is None
     conn = conn or get_conn()
     try:
+        from competition.olympics import olympic_tournament_ids as _oly_tids
+        _oly = _oly_tids(conn)   # [2026-10] 올림픽 대회가 없으면 예전 문장 그대로
         rows = conn.execute(
-            "SELECT country, SUM(appearances) FROM intl_squad "
-            "WHERE player_id=? AND appearances>0 GROUP BY country",
-            (player_id,)).fetchall()
+            ("SELECT country, SUM(appearances) FROM intl_squad "
+            "WHERE player_id=? AND appearances>0 GROUP BY country" if not _oly else
+            "SELECT country, SUM(appearances) FROM intl_squad WHERE player_id=? AND appearances>0 "
+            f"AND tournament_id NOT IN ({','.join(str(int(i)) for i in sorted(_oly))}) GROUP BY country"
+            ), (player_id,)).fetchall()
         return {r[0]: int(r[1] or 0) for r in rows if r[0]}
     finally:
         if _own:
@@ -9877,8 +9892,13 @@ def get_player_total_intl_appearances(player_ids):
         # 같은 행을 같은 정수 합으로 더하므로 값이 완전히 같다(SUM은 순서
         # 무관). intl_squad에 쓰기가 들어오면 즉시 무효화된다.
         conn = get_conn()
+        from competition.olympics import olympic_tournament_ids as _oly_tids
+        _oly = _oly_tids(conn)   # [2026-10] U-23 올림픽 출전은 A매치 경험이 아니다
         rows = conn.execute(
             "SELECT player_id, SUM(appearances) AS total FROM intl_squad "
+            "GROUP BY player_id" if not _oly else
+            "SELECT player_id, SUM(appearances) AS total FROM intl_squad "
+            f"WHERE tournament_id NOT IN ({','.join(str(int(i)) for i in sorted(_oly))}) "
             "GROUP BY player_id").fetchall()
         conn.close()
         _INTL_APPS_TOTAL_CACHE = {r["player_id"]: (r["total"] or 0) for r in rows}
@@ -10213,6 +10233,16 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
     trow = conn.execute(
         "SELECT year, kind FROM intl_tournaments WHERE id=?", (tournament_id,)).fetchone()
     conn.close()
+    # [2026-10] U-23 올림픽 명단은 olympics가 대회 생성·발탁 때 미리 저장한다. 행이 없는 극단적인
+    # 경우에도 성인 26인 선발(예선 명단 승계·국대 브레이크아웃)로 새지 않고 올림픽 규칙으로 다시 짠다.
+    if trow and trow["kind"] in ("oly_qual", "olympic"):
+        from competition.olympics import store_squad as _oly_store
+        _oly_store(tournament_id, country)
+        _c_chk = get_conn()
+        _n_chk = _c_chk.execute("SELECT COUNT(*) FROM intl_squad WHERE tournament_id=? AND country=?",
+                                (tournament_id, country)).fetchone()[0]
+        _c_chk.close()
+        return get_or_create_intl_squad(tournament_id, country, avg_ovr, positions) if _n_chk else []
 
     picked = None
     _callup_src_tid = None      # [2026-10] 예선 명단을 물려받으면 그 예선의 후보군도 물려받는다
@@ -10417,7 +10447,11 @@ def bump_intl_squad_appearances(tournament_id, country, player_ids):
         conn.commit()
     finally:
         _INTL_APPS_SUPPRESS = False
+    _is_oly_t = False
     if _INTL_APPS_TOTAL_CACHE is not None:
+        from competition.olympics import is_oly_tid as _is_oly_tid
+        _is_oly_t = _is_oly_tid(tournament_id, conn)   # [2026-10] 올림픽 출전은 A매치 통산 밖
+    if _INTL_APPS_TOTAL_CACHE is not None and not _is_oly_t:
         # UPDATE가 실제로 건드린 행 = 그 대회·그 나라 명단에 있는 선수뿐
         _present = {r[0] for r in conn.execute(
             "SELECT player_id FROM intl_squad WHERE tournament_id=? AND country=?",

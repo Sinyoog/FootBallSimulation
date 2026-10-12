@@ -142,7 +142,12 @@ def _nat_eval_year(cont, yy):
     if (yy - WC_ANCHOR_YEAR) % WC_INTERVAL == 0:
         return True
     if cont in ("유럽", "남미", "북미", "북중미", "아시아", "오세아니아", "아프리카"):
-        if (yy - CONTINENTAL_ANCHOR_YEAR) % CONTINENTAL_INTERVAL == 0:
+        # [2026-10 4단계] 네이션스 2년 주기면 대륙컵(네이션스) 평가 연도 = 본선 해(홀수 해)
+        from constants import NATIONS_CYCLE_ENABLED, is_nations_finals_year
+        if NATIONS_CYCLE_ENABLED:
+            if is_nations_finals_year(yy):
+                return True
+        elif (yy - CONTINENTAL_ANCHOR_YEAR) % CONTINENTAL_INTERVAL == 0:
             return True
         if cont == "유럽" and (yy - REGIONAL_CUP_ANCHOR_YEAR) % REGIONAL_CUP_INTERVAL == 0:
             return True
@@ -196,7 +201,11 @@ def nat_contract_until(conn, country_id, year, rng):
     row = conn.execute("SELECT continent FROM countries WHERE id=?", (country_id,)).fetchone()
     cont = ((row[0] if row else "") or "")
     if cont in ("유럽", "남미", "북미", "북중미", "아시아", "오세아니아", "아프리카"):
-        cy = get_next_tournament_year(y1, CONTINENTAL_ANCHOR_YEAR, CONTINENTAL_INTERVAL)
+        from constants import NATIONS_CYCLE_ENABLED, is_nations_finals_year
+        if NATIONS_CYCLE_ENABLED:   # [2026-10 4단계] 다음 네이션스 본선 해(홀수 해)
+            cy = y1 if is_nations_finals_year(y1) else y1 + 1
+        else:
+            cy = get_next_tournament_year(y1, CONTINENTAL_ANCHOR_YEAR, CONTINENTAL_INTERVAL)
         if cont == "유럽":
             cy = min(cy, get_next_tournament_year(y1, REGIONAL_CUP_ANCHOR_YEAR,
                                                   REGIONAL_CUP_INTERVAL))
@@ -913,6 +922,15 @@ def _fill_vacancy(conn, country_id, year, salt, stats, job_ab=None):
     if _u_mids:
         _rows_free = [r for r in _rows_free if int(r["id"]) not in _u_mids]
         _rows_club = [r for r in _rows_club if int(r["id"]) not in _u_mids]
+    # [2026-10 U-23 올림픽 2단계] 올림픽 성과로 "승진 후보"가 된 U-23 감독 — 클럽 현직과 같은 2순위
+    # 후보로 넣는다(같은 하한·점수·국적 규칙을 그대로 통과해야 부임). 꺼져 있거나 없으면 빈 목록.
+    from competition.oly_manager import promo_candidate_rows as _u23_promo_rows
+    from constants import OLY_MGR_PROMO_MIN_GAIN as _u23_gain   # 지금 U-23 자리보다 확실히 높은 자리만
+    _u23_rows = [r for r in _u23_promo_rows(conn, year)
+                 if float(r.get("recent_level") or 0.0) >= _min_lv and int(r["id"]) not in _u_mids
+                 and lv >= float(r.get("recent_level") or 0.0) + _u23_gain]
+    if _u23_rows:
+        _rows_club = list(_rows_club) + _u23_rows
     free_c, club_c = [], []
     # [2026-10] 같은 나라 재부임 금지 — 경질 5년 / 계약 만료 2년(constants
     # .MANAGER_REHIRE_BAN_YEARS). 방금 이 평가에서 끝난 재임도 end_year=year라 걸린다.

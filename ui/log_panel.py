@@ -71,6 +71,8 @@ _COMP_COLORS = {
     # COLOR)으로 떨어진다 — world_browser_window.py의 BROWN(#8B5A2B)과
     # 맞춰서 여기도 등록해둔다.
     "domestic_sc": "#8B5A2B",
+    # [2026-10 4단계, 신민용 확정] U-23 올림픽 — 테두리·글자 은색, 배경은 로그 원래 배경 그대로.
+    "olympic":     "#C0C0C0",
 }
 _DEFAULT_BOX_COLOR = "#3d7a99"  # kind 정보 없는 구버전 로그용 폴백(예전 고정색)
 
@@ -124,6 +126,10 @@ def _colorize(line: str) -> str:
     # 감싸 한눈에 "누르는 곳"으로 보이게 한다.
     if match_id:
         box_color = _COMP_COLORS.get(match_kind, _DEFAULT_BOX_COLOR)
+        if match_kind == "olympic":
+            return (f'<a href="match:{match_id}" style="color:{box_color};'
+                    f'text-decoration:none; border:1px solid {box_color}; border-radius:4px;'
+                    f'padding:1px 7px;">🔎 {escaped}</a>')
         box_bg = _box_bg(box_color)
         return (f'<a href="match:{match_id}" style="color:{line_color};'
                 f'text-decoration:none; border:1px solid {box_color}; border-radius:4px;'

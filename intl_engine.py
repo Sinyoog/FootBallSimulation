@@ -99,6 +99,63 @@ def _tournament_start_years():
 
 
 
+# ── [2026-10 4단계 신설, 신민용 확정: "네이션스 2년 주기"] ─────────────────
+# constants.NATIONS_* 주석 참고. 짝수 해 후반기 A매치 기간에 예선(kind='cont_qual',
+# 4개 대륙) → 다음 홀수 해 같은 기간에 본선(kind='continent', 이름 CONF_CUP_NAME).
+# 같은 kind를 쓰는 유로(EURO)와는 연도·이름으로 구분한다:
+#   - 유로 예선(cont_qual)은 홀수 해(2001..) 겨울, 네이션스 예선은 짝수 해 → 연도로 구분
+#   - 유로 본선은 이름이 EURO_NAME, 네이션스 본선은 그 외 이름 → 이름으로 구분
+#   - 예선 통과국(qual_results): 유로 kind='continent'(같은 해), 네이션스 kind='nations'
+#     (target_year = 예선 해 + 1)
+def _nations_on():
+    import constants as _C
+    return bool(getattr(_C, "NATIONS_CYCLE_ENABLED", False))
+
+
+def _is_nations_qual_t(t):
+    """t(intl_tournaments 행)가 네이션스 예선인가."""
+    from constants import is_nations_qual_year
+    return bool(t) and t.get("kind") == "cont_qual" and is_nations_qual_year(t.get("year"))
+
+
+def _is_nations_finals_t(t):
+    """t가 네이션스 본선인가(유로 본선과 이름으로 구분)."""
+    from constants import is_nations_finals_year, EURO_NAME
+    return (bool(t) and t.get("kind") == "continent" and t.get("name") != EURO_NAME
+            and is_nations_finals_year(t.get("year")))
+
+
+def _wc_qual_cfg(t, continent):
+    """[2026-10 올림픽] 월드컵 예선 엔진을 쓰는 예선의 대륙 설정. 월드컵 예선은 그 해 체제
+    (32/48/64), U-23 올림픽 예선(kind='oly_qual')은 연도와 무관하게 항상 32팀 체제."""
+    if t.get("kind") == "oly_qual":
+        return WC_QUAL_32.get(continent, {})
+    return WC_QUAL_BY_TIER[wc_tier(t["year"])].get(continent, {})
+
+
+def _is_oly(t):
+    """[2026-10 올림픽] U-23 올림픽 대회(예선·본선)인가."""
+    return bool(t) and t.get("kind") in ("oly_qual", "olympic")
+
+
+def _comp_icon(t):
+    """[2026-10 4단계] 로그·화면 아이콘 — 올림픽 🏅, 그 밖의 국가대표 대회는 예전대로 🌍."""
+    if _is_oly(t):
+        from constants import OLYMPIC_UI_ICON
+        return OLYMPIC_UI_ICON
+    return "🌍"
+
+
+def _qual_round_day(year, qual_kind, idx):
+    """예선 라운드 idx(0~5 조별, 6 PO)의 경기일. 네이션스 예선이면 후반기 A매치 기간
+    (constants.NATIONS_QUAL_ROUND_DAYS / NATIONS_QUAL_PO_DAY), 그 외(월드컵·유로 예선)는
+    예전 그대로 겨울 휴식기(INTL_QUAL_START_DAY부터 INTL_QUAL_ROUND_GAP_DAYS 간격)."""
+    from constants import is_nations_qual_year, NATIONS_QUAL_ROUND_DAYS, NATIONS_QUAL_PO_DAY
+    if qual_kind == "cont_qual" and is_nations_qual_year(year):
+        return NATIONS_QUAL_ROUND_DAYS[idx] if idx < len(NATIONS_QUAL_ROUND_DAYS) else NATIONS_QUAL_PO_DAY
+    return INTL_QUAL_START_DAY + idx * INTL_QUAL_ROUND_GAP_DAYS
+
+
 # [2026-09 신설, 신민용 지적: "국제대회도 리그/챔스처럼 전부 선수 OVR
 # 기반이어야 한다"] _get_real_squad_ovr는 이제 예선~지역컵까지 포함해
 # 대회 생성 시점마다(대륙당 최대 수십~200개국) 매번 불린다 — game_engine.
@@ -671,7 +728,9 @@ def get_pending_choice():
                 fr = conn.execute("SELECT flag FROM countries WHERE name=?", (n,)).fetchone()
                 flag_cache[n] = fr["flag"] if fr else ""
             opts.append({"nat": n, "flag": flag_cache[n],
-                         "tournament_id": t["id"], "competition": t["name"]})
+                         "tournament_id": t["id"], "competition": t["name"],
+                         # [2026-10] 발탁창이 올림픽 안내(국적 고정 없음)를 띄우려고 대회 종류를 싣는다.
+                         "kind": t.get("kind", "")})
     conn.close()
     if len(opts) < 1:
         return None
@@ -696,6 +755,12 @@ def choose_national_team(tournament_id, nat):
     if not p:
         return None
     conn = get_conn()
+    # [2026-10] U-23 올림픽 발탁창 — 같은 창을 쓰되 판정(18명 선발·후보 탈락)은 olympics가 한다.
+    _k_oly = conn.execute("SELECT kind FROM intl_tournaments WHERE id=?", (tournament_id,)).fetchone()
+    if _k_oly and _k_oly["kind"] in ("oly_qual", "olympic"):
+        conn.close()
+        from competition import olympics as _oly
+        return _oly.choose_national_team(tournament_id, nat)
     grow = conn.execute("SELECT grade, continent FROM countries WHERE name=?", (nat,)).fetchone()
     grade = grow["grade"] if grow else "F"
     nat_continent = grow["continent"] if grow else ""
@@ -1229,6 +1294,7 @@ def get_my_pending_stage(week, day=None, p=None, st=None):
     return {
         "intl": True,
         "pending": True,   # 대진 미확정 placeholder임을 표시
+        "icon": ("🏅" if _is_oly(t) else None),   # [2026-10 4단계] 없으면 카드가 예전처럼 🌍
         "match_id": m["id"],
         "tournament_id": t["id"],
         "league_name": t["name"],
@@ -1295,6 +1361,10 @@ def start_qualifying_if_needed(year):
     is_wc = year >= _ty["wc"] and (year - _ty["wc"]) % WC_INTERVAL == 0
     is_cont = (not is_wc and year >= _ty["continental"]
                and (year - _ty["continental"]) % CONTINENTAL_INTERVAL == 0)
+    # [2026-10 4단계] 네이션스 2년 주기가 켜져 있으면 예전 대륙컵 해(2000·2004..) 겨울 예선은
+    # 없다 — 네이션스 예선은 start_nations_if_needed가 후반기 A매치 기간에 만든다.
+    if _nations_on():
+        is_cont = False
     # [2026-08 신설, 신민용 확정: "유로(EURO)는 기존 대륙컵('유럽
     # 네이션스컵', 2004년 주기)과는 완전히 별개로 지역컵과 같은 해
     # (2001,05,09..)에 새로 연다"] 지역컵 주기와 동일한 년도 판정을
@@ -1406,6 +1476,11 @@ def start_intl_tournament(year):
     is_wc = year >= _ty2["wc"] and (year - _ty2["wc"]) % WC_INTERVAL == 0
     is_cont = (not is_wc and year >= _ty2["continental"]
                and (year - _ty2["continental"]) % CONTINENTAL_INTERVAL == 0)
+    # [2026-10 4단계] 네이션스 2년 주기면 예전 대륙컵 해(2000·2004..) 연말 본선은 없다
+    # (그 자리는 비워 둔다 — 나중에 올림픽). 본선은 start_nations_if_needed가 홀수 해
+    # 후반기 A매치 기간에 만든다.
+    if _nations_on():
+        is_cont = False
     is_cwc = (not is_wc and not is_cont and year >= _ty2["cwc"]
               and (year - _ty2["cwc"]) % CWC_INTERVAL == 0)
 
@@ -1449,7 +1524,7 @@ def start_intl_tournament(year):
         # [2026-09] 골드컵(북미)은 위 REGION_LIST 루프에서 다른 지역컵과
         # 완전히 똑같이 kind='region'으로 생성된다 — 예선 특수분기는
         # 폐지됐다(start_qualifying_if_needed의 cont_qual_confs 주석 참고).
-        _close_other_pending_when_committed(year)
+        _close_other_pending_when_committed(year, slot="yearend")
         return
 
     if [t for t in get_tournaments(year) if t["kind"] in ("world", "continent")]:
@@ -1486,30 +1561,73 @@ def start_intl_tournament(year):
 
     # [본선 자동출전 정리] pledge/committed로 my_sel=1 확정된 본선이 있으면,
     #   같은 해 다른 '선택 대기(3)' 본선 대회는 닫는다(한 해 본선 출전 1개 보장).
-    _close_other_pending_when_committed(year)
+    _close_other_pending_when_committed(year, slot="yearend")
 
 
-def _close_other_pending_when_committed(year):
+def start_nations_if_needed(year):
+    """[2026-10 4단계 신설, 신민용 확정: "네이션스 2년 주기"] 첫 후반기 A매치 기간
+    바로 전 주(constants.NATIONS_CREATE_WEEK=30주) 진입 시 호출.
+      - 짝수 해: 4개 대륙 네이션스 예선(cont_qual) — 예선 형식·조 편성은 예전과 같고,
+        경기일만 A매치 기간(_qual_round_day). 통과국은 다음 해 본선용으로 저장된다.
+      - 홀수 해: 4개 대륙 네이션스 본선(continent) — 직전 짝수 해 예선 통과국 24개국,
+        일정은 TOURNAMENT_SCHEDULE_RULES["nations_finals"](212~268일).
+    발탁(내 선수 선택창)은 대회 생성과 함께 열린다(game_engine이 이 주를 넘기기 전에 멈춤)."""
+    if not _nations_on():
+        return
+    from game_engine import get_player, add_log
+    from constants import is_nations_qual_year, is_nations_finals_year, EURO_NAME
+    p = get_player()
+    if not p:
+        return
+    confs = ["유럽", "아메리카", "아시아", "아프리카"]
+    if is_nations_qual_year(year):
+        if [t for t in get_tournaments(year) if t["kind"] == "cont_qual"]:
+            return   # 이미 이 해 네이션스 예선이 생성됨 → 중복 방지
+        _clear_entry_cache()
+        my_nats, nat_info, committed = _gather_nat_context(p)
+        for cont in confs:
+            try:
+                _create_qual_tournament(year, "cont_qual", cont, p=p, my_nats=my_nats,
+                                        nat_info=nat_info, committed=committed)
+            except Exception as e:
+                add_log(f"⚠ {year}년 {cont} 네이션스 예선 생성 오류: {e}", "event")
+    elif is_nations_finals_year(year):
+        if [t for t in get_tournaments(year) if t["kind"] == "continent" and t["name"] != EURO_NAME]:
+            return   # 이미 이 해 네이션스 본선이 생성됨 → 중복 방지
+        _clear_entry_cache()
+        my_nats, nat_info, committed = _gather_nat_context(p)
+        for cont in confs:
+            try:
+                _create_one_tournament(year, is_wc=False, my_continent=cont, p=p, my_nats=my_nats,
+                                       nat_info=nat_info, committed=committed, nations=True)
+            except Exception as e:
+                add_log(f"⚠ {year}년 {cont} 네이션스 본선 생성 오류: {e}", "event")
+        _close_other_pending_when_committed(year, slot="nations")
+
+
+def _close_other_pending_when_committed(year, slot="yearend"):
     """그 해 본선 중 my_selected=1(자동/확정 출전)이 있으면,
     같은 해 나머지 본선 '선택 대기(3)'를 닫는다(my_selected=2).
-    예선 pledge로 본선 자동출전한 경우, 다른 대륙 본선 선택창이 또 뜨는 것 방지."""
+    예선 pledge로 본선 자동출전한 경우, 다른 대륙 본선 선택창이 또 뜨는 것 방지.
+
+    [2026-10 4단계] slot — 같은 해라도 시기가 다른 본선끼리는 서로 닫지 않는다.
+    "nations" = 후반기 A매치 기간의 네이션스 본선만, "yearend" = 연말 본선(월드컵·
+    유로·지역컵)만. 예: 2001년 네이션스 본선에 출전(1)했다고 연말 유로 발탁(3)이
+    닫히면 안 된다."""
     conn = get_conn()
-    has_committed = conn.execute(
-        """SELECT 1 FROM intl_tournaments
-           WHERE year=? AND my_selected=1
-             AND kind IN ('world','continent','region') LIMIT 1""", (year,)).fetchone()
+    rows = [dict(r) for r in conn.execute(
+        """SELECT id, year, kind, name, my_selected FROM intl_tournaments
+           WHERE year=? AND kind IN ('world','continent','region')""", (year,)).fetchall()]
+    rows = [r for r in rows if _is_nations_finals_t(r) == (slot == "nations")]
+    has_committed = any(r["my_selected"] == 1 for r in rows)
     if has_committed:
         # [2026-07 버그수정] choose_national_team의 동일 버그와 같은 이유로,
         # 여기서 닫히는 대회들의 intl_matches.is_my도 함께 초기화해야
         # "선택 안 한 나라 경기가 커리어에 같이 기록"되는 사고를 막는다.
-        _closed2 = [r["id"] for r in conn.execute(
-            """SELECT id FROM intl_tournaments
-               WHERE year=? AND my_selected=3 AND kind IN ('world','continent','region')""",
-            (year,)).fetchall()]
-        conn.execute(
-            """UPDATE intl_tournaments SET my_selected=2
-               WHERE year=? AND my_selected=3 AND kind IN ('world','continent','region')""",
-            (year,))
+        _closed2 = [r["id"] for r in rows if r["my_selected"] == 3]
+        if _closed2:
+            _ph0 = ",".join("?" * len(_closed2))
+            conn.execute(f"UPDATE intl_tournaments SET my_selected=2 WHERE id IN ({_ph0})", _closed2)
         if _closed2:
             _ph2 = ",".join("?" * len(_closed2))
             conn.execute(f"UPDATE intl_matches SET is_my=0 WHERE tournament_id IN ({_ph2})",
@@ -1664,7 +1782,7 @@ def _fill_ko_shell(conn, c, tid, stage, home_away_by_slot):
 
 
 def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, committed,
-                            my_region=None, name_override=None):
+                            my_region=None, name_override=None, nations=False):
     """대회 1개를 생성(조 추첨·일정 포함)하고 로그를 남긴다.
 
     - is_wc=True  : 월드컵(전 세계 단일). my_continent 무시.
@@ -1702,7 +1820,8 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
     else:
         kind = "continent"
         name = name_override or CONF_CUP_NAME.get(my_continent, "대륙컵")
-        entries = _qualify_continental(my_continent, p=p, my_nats=my_nats, nat_info=nat_info)
+        entries = _qualify_continental(my_continent, p=p, my_nats=my_nats, nat_info=nat_info,
+                                       nations=nations)
         n_groups = CONT_GROUPS
         # 이 대륙컵 후보 = 그 대륙(연맹) 소속 보유 국적만
         confs = set(CONFEDERATIONS.get(my_continent, [my_continent]))
@@ -1731,8 +1850,11 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
     # 항상 동일 — start_qualifying_if_needed 주석 참고) 북미도 다른 지역컵과
     # 똑같이 "예선 없는 대회"다 — 예전에 여기 있던 my_region=="북미" 예외를
     # 되돌린다.
-    has_qualifying = is_wc or bool(name_override)
+    has_qualifying = is_wc or bool(name_override) or nations
     qual_kind = "wc_qual" if is_wc else "cont_qual"
+    # [2026-10 4단계] 네이션스 본선(홀수 해)의 예선은 직전 짝수 해에 있었다. 월드컵·유로는
+    # 예전 그대로 같은 해 예선. 아래 예선 기록 조회 3곳이 이 연도를 쓴다.
+    _qual_year = year - 1 if nations else year
 
     # 출전국/선발 결정
     my_nat = ""
@@ -1780,12 +1902,14 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
                     # 빠졌다 — 사실상 유로는 예선을 봐놓고도 그 결과가 한 번도
                     # 안 쓰인 것. qual_kind로 월드컵/유로를 구분해 조회한다.
                     _committed_cont = nat_info.get(committed, {}).get("continent", "")
+                    if nations:   # 네이션스 예선은 대륙(4키, 예: 남미·북미 → 아메리카) 단위로 저장됨
+                        _committed_cont = _cont_key(_committed_cont)
                     _bqc = get_conn()
                     _bqr = _bqc.execute(
                         """SELECT my_selected, my_nat FROM intl_tournaments
                            WHERE year=? AND kind=? AND continent=?
                            LIMIT 1""",
-                        (year, qual_kind, _committed_cont)).fetchone()
+                        (_qual_year, qual_kind, _committed_cont)).fetchone()
                     _bqc.close()
                     if _bqr is not None:
                         _blocked_by_qual = not (_bqr["my_selected"] == 1
@@ -1894,7 +2018,7 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
                 _qr = _cc.execute(
                     """SELECT 1 FROM intl_tournaments
                        WHERE year=? AND kind=? LIMIT 1""",
-                    (year, qual_kind)).fetchone()
+                    (_qual_year, qual_kind)).fetchone()
                 _cc.close()
                 _had_qual = bool(_qr)
             except Exception:
@@ -1913,7 +2037,7 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
                 _qual_results = [dict(r) for r in _qc.execute(
                     "SELECT my_selected, my_nat FROM intl_tournaments"
                     " WHERE year=? AND kind=?",
-                    (year, qual_kind)).fetchall()]
+                    (_qual_year, qual_kind)).fetchall()]
                 _qc.close()
             except Exception:
                 pass
@@ -2021,6 +2145,12 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
     tournament_type = (WC_SCHEDULE_KEY_BY_TIER[wc_tier(year)]
                         if is_wc else ("region" if kind == "region" else "continental"))
     tournament_start_day = week_to_day(w0)
+    if nations:
+        # [2026-10 4단계] 네이션스 본선 — 후반기 A매치 기간 3번(212~268일)
+        from constants import NATIONS_QUAL_ROUND_DAYS
+        tournament_type = "nations_finals"
+        tournament_start_day = NATIONS_QUAL_ROUND_DAYS[0]
+        w0 = day_to_week(tournament_start_day)
     if my_nat:
         _my_match_nats = {my_nat}
     elif my_sel == 3:
@@ -2092,30 +2222,34 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
         add_log(f"[경고] 대표팀 목표 산정 건너뜀({_e})", "sep")
 
     # ── 로그 ──
+    # [2026-10 4단계] 네이션스 본선은 30주(생성 주)에 개막 로그를 남긴다.
+    from constants import NATIONS_CREATE_WEEK as _NCW
+    _lw = _NCW if nations else INTL_CALLUP_WEEK
     add_log("─" * 44, "sep")
-    add_log(f"🌍 {year}년 {name} 개막!  본선 {len(entries)}개국", "event", year, INTL_CALLUP_WEEK)
+    add_log(f"🌍 {year}년 {name} 개막!  본선 {len(entries)}개국", "event", year, _lw)
 
     if my_sel == 3:
         nat_list = " / ".join(cand_nats)
         if len(cand_nats) == 1:
             add_log(f"   🌍 {nat_list} 대표팀에서 발탁을 제안합니다! 출전 여부를 선택하세요",
-                    "event", year, INTL_CALLUP_WEEK)
+                    "event", year, _lw)
         else:
             add_log(f"   🌍 여러 나라가 당신을 원합니다! {nat_list} 중 대표팀을 선택하세요",
-                    "event", year, INTL_CALLUP_WEEK)
+                    "event", year, _lw)
     elif my_nat:
         _grow = _country_flag(my_nat)
         try:
             my_g = next(g for g, ms in groups.items() if any(m["name"] == my_nat for m in ms))
             mates = [f"{m['flag']}{m['name']}" for m in groups[my_g] if m["name"] != my_nat]
             add_log(f"   {_grow}{my_nat} {my_g}조 편성  (vs {', '.join(mates)})",
-                    "event", year, INTL_CALLUP_WEEK)
+                    "event", year, _lw)
         except StopIteration:
             pass
         if my_sel == 1:
-            add_log(f"   📣 국가대표 소집! 조별리그 {w0}~{w0+2}주차", "event", year, INTL_CALLUP_WEEK)
+            _grp_txt = (f"후반기 A매치 기간({w0}·{w0 + 4}·{w0 + 8}주)" if nations else f"조별리그 {w0}~{w0+2}주차")
+            add_log(f"   📣 국가대표 소집! {_grp_txt}", "event", year, _lw)
         else:
-            add_log("   📋 국가대표 미선발... 대표팀 경기를 지켜봅니다", "event", year, INTL_CALLUP_WEEK)
+            add_log("   📋 국가대표 미선발... 대표팀 경기를 지켜봅니다", "event", year, _lw)
             _save_trophy(year, my_nat, name, "국가대표 미선발")
     else:
         # my_sel==2
@@ -2128,10 +2262,10 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
         if committed and committed in cont_nats:
             if _age_dropped:
                 add_log(f"   📋 {committed} 대표팀 미선발 (기량 저하) — 이번 대회 출전 없음",
-                        "event", year, INTL_CALLUP_WEEK)
+                        "event", year, _lw)
                 _save_trophy(year, committed, name, "국가대표 미선발")
             else:
-                add_log(f"   📋 {committed} 예선 탈락 — 이번 대회 출전 없음", "event", year, INTL_CALLUP_WEEK)
+                add_log(f"   📋 {committed} 예선 탈락 — 이번 대회 출전 없음", "event", year, _lw)
                 _save_trophy(year, committed, name, "예선 탈락")
 
 def _country_flag(name):
@@ -3309,10 +3443,12 @@ def _my_total_intl_appearances():
         conn = get_conn()
         try:
             row = conn.execute(
-                "SELECT COALESCE(SUM(caps), 0) AS n FROM intl_history").fetchone()
+                "SELECT competition, caps FROM intl_history").fetchall()
         finally:
             conn.close()
-        return (row["n"] if row else 0) or 0
+        # [2026-10] U-23 올림픽 기록(대회 이름으로 판정)은 A매치 경험이 아니다.
+        from competition.olympics import is_olympic_name as _is_oly_name
+        return sum((r["caps"] or 0) for r in row if not _is_oly_name(r["competition"]))
     except Exception:
         return 0
 
@@ -3546,7 +3682,7 @@ def _qualify_world(year=0, p=None, my_nats=None, nat_info=None):
     return picked[:n_teams]
 
 
-def _qualify_continental(my_continent, p=None, my_nats=None, nat_info=None):
+def _qualify_continental(my_continent, p=None, my_nats=None, nat_info=None, nations=False):
     """내 대륙 연맹의 대륙컵 24개국 선발 (남북미 통합, 오세아니아→아시아).
     작년 예선 결과(qual_results)가 있으면 우선 사용, 없으면 랜덤 계산.
 
@@ -3569,10 +3705,12 @@ def _qualify_continental(my_continent, p=None, my_nats=None, nat_info=None):
     cont_key = _cont_key(my_continent)
 
     conn = get_conn()
+    # [2026-10 4단계] 네이션스 본선은 직전 해 네이션스 예선 통과국(kind='nations',
+    # target_year=올해). 유로는 예전 그대로 kind='continent'(같은 해 예선).
     qual_rows = [dict(r) for r in conn.execute(
         """SELECT country, flag, grade, ovr FROM qual_results
-           WHERE target_year=? AND kind='continent' AND continent=?""",
-        (year, cont_key)).fetchall()]
+           WHERE target_year=? AND kind=? AND continent=?""",
+        (year, "nations" if nations else "continent", cont_key)).fetchall()]
     conn.close()
 
     if qual_rows:
@@ -3783,7 +3921,10 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
     two_stage = ("stage2" in qual_cfg)
 
     # 예선 사이클 리셋 (pledge 해제)
-    if not committed:
+    # [2026-10 4단계] 네이션스 예선(짝수 해 후반기)은 같은 해 겨울 월드컵 예선의
+    # pledge(월드컵 본선 연계)를 지우면 안 된다 — 네이션스 예선이면 건너뛴다.
+    if not committed and not (qual_kind == "cont_qual" and _nations_on()
+                              and _is_nations_qual_t({"kind": qual_kind, "year": year})):
         try:
             from game_engine import update_player as _upd0
             _upd0(qual_pledged_nat="")
@@ -3979,7 +4120,7 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
             all_rounds = fwd_rounds
 
         for rnd_idx, rnd_pairs in enumerate(all_rounds):
-            day = INTL_QUAL_START_DAY + rnd_idx * INTL_QUAL_ROUND_GAP_DAYS
+            day = _qual_round_day(year, qual_kind, rnd_idx)
             wk = day_to_week(day)
             for home_nat, away_nat in rnd_pairs:
                 is_my_match = (
@@ -4083,7 +4224,7 @@ def _finalize_qual_stage1(t):
     from game_engine import add_log, get_player
     tid = t["id"]
     continent = _conf_key((t.get("continent") or "").strip() or "유럽")
-    qual_cfg = WC_QUAL_BY_TIER[wc_tier(t["year"])].get(continent, {})
+    qual_cfg = _wc_qual_cfg(t, continent)   # [2026-10] 올림픽 예선은 항상 32팀 체제
     stage2_cfg = qual_cfg.get("stage2") or {}
     advance_n = qual_cfg.get("advance_per_group1", 2)
 
@@ -4147,7 +4288,7 @@ def _finalize_qual_stage1(t):
         names = [row["country"] for _og, row in members]
         fwd_rounds = _round_robin_schedule(names)
         for rnd_idx, rnd_pairs in enumerate(fwd_rounds):
-            day = INTL_QUAL_START_DAY + (3 + rnd_idx) * INTL_QUAL_ROUND_GAP_DAYS
+            day = _qual_round_day(t["year"], t["kind"], 3 + rnd_idx)
             wk = day_to_week(day)
             for home_nat, away_nat in rnd_pairs:
                 is_my_match = 1 if (home_nat == my_nat or away_nat == my_nat or
@@ -4171,7 +4312,7 @@ def _finalize_qual_stage2(t):
     from game_engine import add_log, get_player
     tid = t["id"]
     continent = _conf_key((t.get("continent") or "").strip() or "유럽")
-    qual_cfg = WC_QUAL_BY_TIER[wc_tier(t["year"])].get(continent, {})
+    qual_cfg = _wc_qual_cfg(t, continent)   # [2026-10] 올림픽 예선은 항상 32팀 체제
     stage2_cfg = qual_cfg.get("stage2") or {}
 
     conn = get_conn()
@@ -4236,7 +4377,7 @@ def _finalize_qual_stage2(t):
         conn = get_conn(); c = conn.cursor()
         p = get_player()
         my_nat = _my_nat(t, p) if p else ""
-        po_day = INTL_QUAL_START_DAY + 6 * INTL_QUAL_ROUND_GAP_DAYS
+        po_day = _qual_round_day(t["year"], t["kind"], 6)
         po_week = day_to_week(po_day)
         for home, away in _pairs:
             is_my = 1 if my_nat and (home["country"] == my_nat or away["country"] == my_nat) else 0
@@ -4344,7 +4485,7 @@ def _process_one_tournament_week(t, week, day=None):
     # (kind='cont_qual')은 매주 이 처리 자체를 건너뛰고 있었다 — 조별리그
     # 경기는 생성됐지만 마감 판정(_finalize_qual 호출)이 한 번도 안 불려서
     # status가 'qual_group'에 영원히 머물렀다.
-    if t["kind"] in ("wc_qual", "cont_qual"):
+    if t["kind"] in ("wc_qual", "cont_qual", "oly_qual"):   # [2026-10] U-23 올림픽 예선도 같은 엔진
         # [버그수정] t는 루프 시작 시의 스냅샷이므로 status를 DB에서 재조회한다.
         # _finalize_qual 내부에서 status='qual_po' or 'done'으로 갱신되기 때문에
         # 스냅샷 값으로 판정하면 PO 체제에서 다음 주차 호출이 누락될 수 있다.
@@ -4359,14 +4500,14 @@ def _process_one_tournament_week(t, week, day=None):
         # 기준이라, 완료 판정도 그 앵커로 계산해야 한다 — 옛 오프시즌
         # 앵커(INTL_GROUP_WEEKS)를 그대로 쓰면 이 조건이 영영 안 걸려서
         # 예선이 조별리그에서 멈춰버린다(실제로 이 버그로 재현됨).
-        qual_group_last_day = INTL_QUAL_START_DAY + 5 * INTL_QUAL_ROUND_GAP_DAYS
-        qual_po_day = INTL_QUAL_START_DAY + 6 * INTL_QUAL_ROUND_GAP_DAYS
+        qual_group_last_day = _qual_round_day(t["year"], t["kind"], 5)
+        qual_po_day = _qual_round_day(t["year"], t["kind"], 6)
         # [2026-09 신설] 2단계 체제(북미/아시아/아프리카)의 1차/2차 조별리그
         # 마감일 — 1차는 편도 3라운드(인덱스 0~2, 마지막=177일), 2차도
         # 편도 3라운드지만 인덱스 3~5(마지막=189일, 기존 단일단계 6라운드
         # 마지막 날짜와 우연히 같음 — 같은 일정표를 재사용하기 때문).
-        qual_stage1_last_day = INTL_QUAL_START_DAY + 2 * INTL_QUAL_ROUND_GAP_DAYS
-        qual_stage2_last_day = INTL_QUAL_START_DAY + 5 * INTL_QUAL_ROUND_GAP_DAYS
+        qual_stage1_last_day = _qual_round_day(t["year"], t["kind"], 2)
+        qual_stage2_last_day = _qual_round_day(t["year"], t["kind"], 5)
         # [2026-07 버그수정, 신민용 리포트: "플레이오프가 31주차에 열린다면서
         # 대진표에 팀만 뜨고 스코어가 영원히 안 나온다"] 이 마감 판정이
         # week 단위였다 — PO 경기 실제 day(214)가 그 주(31주차=211~217일)
@@ -5198,12 +5339,17 @@ def _sim_ai_match(t, m, my_played=False, conn=None, reason="injury", batch=None)
     knockout = m["stage"] not in ("group", "qual_group", "qual_group2")  # [2026-09] 2단계 예선 2차도 무승부 허용
     # [2026-09 신설, 신민용 확정] 예선(wc_qual/cont_qual)이 아닌 대회(월드컵
     # 본선/대륙컵/지역컵)는 홈 어드벤티지 없이 원정 vs 원정.
-    _neutral = t.get("kind") not in ("wc_qual", "cont_qual")
+    _neutral = t.get("kind") not in ("wc_qual", "cont_qual", "oly_qual")
 
     # [2026-10 6번 ③-1 대표팀] 감독 능력 보정(내가 뛰는 대표팀 경기는 0 — 클럽과 같은 범위)
     _hm = _am = 0.0
-    if not (bool(m["is_my"]) and t.get("my_selected") == 1):   # 실제 내 경기만 제외(아래 _really_mine과 같은 판정)
+    # [2026-10] U-23 올림픽은 성인 대표팀 감독 보정 대신 U-23 감독 보정(같은 식, 기준 = 그 대회
+    # U-23 명단 전력 — competition/oly_manager.match_bonus).
+    if not (bool(m["is_my"]) and t.get("my_selected") == 1) and not _is_oly(t):   # 실제 내 경기만 제외(아래 _really_mine과 같은 판정)
         _hm, _am = _nat_mgr_bonus(m["home"]), _nat_mgr_bonus(m["away"])
+    elif not (bool(m["is_my"]) and t.get("my_selected") == 1):
+        from competition.oly_manager import match_bonus as _oly_mb
+        _hm, _am = _oly_mb(t["id"], m["home"], he["ovr"]), _oly_mb(t["id"], m["away"], ae["ovr"])
     outcome = _match_outcome(he["ovr"], ae["ovr"], knockout, neutral=_neutral,
                              h_mgr=_hm, a_mgr=_am)
     pso_winner, pso_score = "", ""
@@ -5319,7 +5465,7 @@ def _sim_ai_match(t, m, my_played=False, conn=None, reason="injury", batch=None)
         if nat in (m["home"], m["away"]):
             stage_ko = STAGE_KO.get(m["stage"], "")
             pso_txt = f"  (승부차기 {pso_score})" if pso_winner else ""
-            add_log(f"🌍 {t['name']} {stage_ko}  "
+            add_log(f"{_comp_icon(t)} {t['name']} {stage_ko}  "
                     f"{he['flag']}{m['home']} {hs}-{as_} {ae['flag']}{m['away']}{pso_txt}", "match")
             if t["my_selected"] == 1 and not my_played:
                 _reason_ko = {"injury": "부상", "suspension": "출전정지", "bench": "벤치"}.get(reason, reason)
@@ -5414,10 +5560,12 @@ def simulate_my_match(week, p, day=None):
 
     nat = _my_nat(t, p)
     # 예선(wc_qual)은 cap-tie 대상이 아니다 → 국적 고정 안 함.
-    _is_qual = t.get("kind") in ("wc_qual", "cont_qual")
+    _is_qual = t.get("kind") in ("wc_qual", "cont_qual", "oly_qual")
+    # [2026-10] U-23 올림픽은 A매치가 아니다 — 국적 고정(cap-tie)·캡·A매치 골 집계에서 뺀다.
+    _is_oly_t = _is_oly(t)
     # [복수국적] A매치 첫 출전 → 그 나라로 영구 고정(cap-tie). (본선만)
     # 이후 대회부터는 이 나라로만 차출된다.
-    if (not _is_qual) and nat and not (p.get("intl_committed", "") or ""):
+    if (not _is_qual) and (not _is_oly_t) and nat and not (p.get("intl_committed", "") or ""):
         from game_engine import update_player as _upd
         _upd(intl_committed=nat)
         # [국적 연혁] A매치 첫 출전으로 자동 고정된 경우도 commit 기록
@@ -5444,6 +5592,8 @@ def simulate_my_match(week, p, day=None):
     # 유지(신민용+GPT 협의 확정 — 국가대표 대회가 클럽만큼 빈번하지 않아
     # 더 세분화할 실익이 작음).
     _susp_field = "wc_qual_suspension" if t.get("kind") == "wc_qual" else "intl_suspension"
+    if _is_oly_t:
+        _susp_field = "oly_suspension"   # [2026-10] 성인 대표팀과 따로 센다(예선 퇴장 → 본선 이월)
 
     # [2026-07 신설] 출전정지 체크 — 퇴장 다음 경기는 강제 결장.
     _suspended, _new_susp = _check_suspended(p, field=_susp_field)
@@ -5640,7 +5790,9 @@ def simulate_my_match(week, p, day=None):
 
     # 국가대표 개인 기록 (클럽 시즌 통계와 분리)
     #  [cap-tie] 본선 무대를 밟으면 그 나라로 영구 고정. 단 예선은 고정 안 함.
-    if _is_qual:
+    if _is_oly_t:
+        pass   # [2026-10] 올림픽 — 캡·A매치 골/도움 미반영(기록은 intl_matches·intl_history에 남는다)
+    elif _is_qual:
         # 예선: caps/goals/assists 누적만, capped/committed 미설정 (국적 변경 자유)
         update_player(
             intl_caps=p.get("intl_caps", 0) + 1,
@@ -5699,7 +5851,8 @@ def simulate_my_match(week, p, day=None):
         engine_stats=engine_stats, engine_plog=engine_plog, player_ratings=player_ratings,
         match_extra={"score_90": ([hs90, as90] if hs90 is not None else [hs, as_]),
                      "went_extra_time": went_et, "subs": _subs})
-    marker = f" [match:{detail_id}:intl]" if detail_id else ""
+    # [2026-10 4단계] 올림픽 경기는 로그 상자를 은색으로(log_panel "olympic").
+    marker = f" [match:{detail_id}:{'olympic' if _is_oly(t) else 'intl'}]" if detail_id else ""
 
     add_log("─" * 44, "sep")
     # [2026-07 신설, 신민용 요청: "48주차가 아니라 11월 27일처럼 실제
@@ -5711,7 +5864,7 @@ def simulate_my_match(week, p, day=None):
         when_txt = day_to_date_str(day)
     else:
         when_txt = f"{week}주차"
-    add_log(f"🌍 {comp_name}  {when_txt}{marker}", "match")
+    add_log(f"{_comp_icon(t)} {comp_name}  {when_txt}{marker}", "match")
     add_log(f"   {home_disp} {hs}-{as_} {away_disp}  ({rs}){pso_txt}", "match")
     if p.get("position") == "GK":
         add_log(f"   평점 {rating:.1f}  선방 {saves}", "match")
@@ -5810,7 +5963,7 @@ def get_qual_advance_status(t, stage=None):
 
     continent = _conf_key((t.get("continent") or "").strip() or "유럽")
     is_wc = (t.get("kind") != "cont_qual")
-    qual_cfg = WC_QUAL_BY_TIER[wc_tier(t.get("year", 0))].get(continent, {}) if is_wc \
+    qual_cfg = _wc_qual_cfg(t, continent) if is_wc \
         else EURO_QUAL.get(continent, {})
     two_stage = is_wc and ("stage2" in qual_cfg)
     t_status = t.get("status", "")
@@ -6132,7 +6285,7 @@ def _finalize_qual(t):
             conn = get_conn(); c = conn.cursor()
             p = get_player()
             my_nat = _my_nat(t, p) if p else ""
-            po_day = INTL_QUAL_START_DAY + 6 * INTL_QUAL_ROUND_GAP_DAYS
+            po_day = _qual_round_day(t["year"], t["kind"], 6)
             po_week = day_to_week(po_day)
             _po_pairs = [(po_pool[i], po_pool[i+1]) for i in range(0, len(po_pool)-1, 2)]
             for home, away in _po_pairs:
@@ -6150,7 +6303,7 @@ def _finalize_qual(t):
         return
 
     # ── wc_qual 단일단계(유럽/남미) — 2026-09 신규 스키마 ──
-    qual_cfg = WC_QUAL_BY_TIER[wc_tier(t["year"])].get(continent, {})
+    qual_cfg = _wc_qual_cfg(t, continent)   # [2026-10] 올림픽 예선은 항상 32팀 체제
 
     # 조별 전체 순위(랭크별 리스트) 수집 — direct_top/wildcard_rank가
     # 몇 위까지 필요로 하든(예: 남미 64팀 direct_top=4) 대응한다.
@@ -6206,7 +6359,7 @@ def _finalize_qual(t):
         conn = get_conn(); c = conn.cursor()
         p = get_player()
         my_nat = _my_nat(t, p) if p else ""
-        po_day = INTL_QUAL_START_DAY + 6 * INTL_QUAL_ROUND_GAP_DAYS
+        po_day = _qual_round_day(t["year"], t["kind"], 6)
         po_week = day_to_week(po_day)
         for home, away in _po_pairs:
             is_my = 1 if my_nat and (home["country"] == my_nat or away["country"] == my_nat) else 0
@@ -6316,6 +6469,13 @@ def _finalize_qual_po(t):
     # 전체를 한 번에 저장한다.
     target_year = t["year"]
     target_kind = "world" if t["kind"] == "wc_qual" else "continent"
+    if t["kind"] == "oly_qual":   # [2026-10] U-23 올림픽 예선 → 같은 해 올림픽 본선
+        target_kind = "olympic"
+    # [2026-10 4단계] 네이션스 예선은 _save_qual_results와 같은 키(다음 해, kind='nations')로
+    # 저장돼 있다 — 같은 키로 직행팀을 읽어야 PO 승자와 합쳐진다(안 그러면 직행팀이 지워짐).
+    if _is_nations_qual_t(t):
+        target_year = t["year"] + 1
+        target_kind = "nations"
     conn_pre = get_conn()
     existing_rows = [dict(r) for r in conn_pre.execute(
         "SELECT country, flag, grade, ovr FROM qual_results"
@@ -6331,7 +6491,11 @@ def _finalize_qual_po(t):
     # 그 설정은 qual_cfg["stage2"] 안에 있다 — 지금 확정된 설계에서는
     # 전부 po_teams=0(PO 자체가 없음)이라 실제로는 안 타는 분기지만,
     # 나중에 stage2에도 PO를 추가할 경우를 대비해 안전하게 both를 본다.
-    qual_cfg = WC_QUAL_BY_TIER[wc_tier(t["year"])].get(continent, {})
+    # [2026-10 4단계] 대륙컵 예선(cont_qual — 네이션스·유로)은 EURO_QUAL 설정을 본다
+    # (예전엔 월드컵 예선 표를 봐서 "아메리카" 키가 없어 PO 승자 전원으로 폴백했다 —
+    # 아메리카 PO 승자 수가 설정값과 같아 결과는 같았지만, 설정을 따르게 바로잡는다).
+    qual_cfg = (EURO_QUAL.get(continent, {}) if t["kind"] == "cont_qual"
+                else _wc_qual_cfg(t, continent))
     po_cfg = qual_cfg.get("stage2") or qual_cfg
     po_winners_n = po_cfg.get("po_winners", len(winners))
     po_new = [w for w in winners if w["country"] not in existing_names][:po_winners_n]
@@ -6367,8 +6531,14 @@ def _save_qual_results(t, continent, qualified_list, set_done=True):
     # 읽던 _qualify_region의 북미 분기는 이미 폐지됐으므로 실제로 쓰이진
     # 않지만, 옛 데이터를 대륙컵 티어로 잘못 섞어 넣지는 않게 유지).
     target_kind = ("world" if t["kind"] == "wc_qual"
+                   else "olympic" if t["kind"] == "oly_qual"   # [2026-10] U-23 올림픽
                    else "region" if continent == "북미"
                    else "continent")
+    # [2026-10 4단계] 네이션스 예선(짝수 해) → 다음 해(홀수 해) 네이션스 본선용. 유로 예선
+    # 통과국(kind='continent', 같은 해)과 섞이지 않게 kind='nations'로 따로 저장한다.
+    if _is_nations_qual_t(t):
+        target_year = t["year"] + 1
+        target_kind = "nations"
     qualified_names = {q["country"] for q in qualified_list}
 
     conn = get_conn(); c = conn.cursor()
@@ -6386,7 +6556,10 @@ def _save_qual_results(t, continent, qualified_list, set_done=True):
         # 실제 스쿼드를 먼저 시도하므로(캐시 적용) 이 재계산은 사실상
         # 그룹 편성 시점 값과 같아야 정상이지만, 그 사이 스쿼드가 조금이라도
         # 바뀌었을 가능성에 대비해 그대로 유지한다.
-        _accurate_ovr = _nat_team_ovr(q.get("grade", "F"), q["country"], continent, year=target_year)
+        # [2026-10] 올림픽은 성인 대표팀 공식값이 아니라 U-23 명단 전력(예선 엔트리 값) 그대로
+        # — 본선 직전에 명단을 다시 뽑으며 다시 계산한다(성인 공식값·난수 불사용).
+        _accurate_ovr = (q.get("ovr", 0) if t["kind"] == "oly_qual" else
+                         _nat_team_ovr(q.get("grade", "F"), q["country"], continent, year=target_year))
         # DELETE로 이미 저장돼 있으면(재호출로 인한 중복 삽입
         # 방지) 먼저 지운 뒤 다시 넣는다 — set_done=False라 위에서 전체
         # DELETE를 안 했어도 국가 단위로는 항상 유일하게 유지된다.
@@ -6425,8 +6598,9 @@ def _save_qual_results(t, continent, qualified_list, set_done=True):
         add_log("─" * 44, "sep")
         add_log(f"{icon} {t['name']} 결과: {my_nat} {result}", "event")
         if passed:
-            add_log(f"   → {target_year}년 월드컵 본선 진출!", "event")
-        else:
+            add_log(f"   → {target_year}년 "
+                    f"{'U-23 올림픽' if t['kind'] == 'oly_qual' else '월드컵'} 본선 진출!", "event")
+        elif t["kind"] != "oly_qual":   # [2026-10] 올림픽 예선 탈락은 월드컵 pledge와 무관
             # [버그수정] 예선 탈락 시 pledge 초기화
             # qual_pledged_nat가 살아있으면 다음 해 본선 _create_one_tournament에서
             # pledged 경로로 진입해 오동작할 수 있음
@@ -6519,9 +6693,9 @@ def _finalize_groups(t, next_stage, next_week):
     from game_engine import add_log, get_player
     from constants import WC_BEST_THIRDS_BIG
     tid = t["id"]
-    is_wc = (t["kind"] == "world")
+    is_wc = (t["kind"] in ("world", "olympic"))   # [2026-10] 올림픽 본선 = 월드컵 32팀 형식
     is_region = (t["kind"] == "region")
-    is_big = is_wc and wc_tier(t["year"]) >= 48   # 48개국 이상(48/64) 시대
+    is_big = t["kind"] == "world" and wc_tier(t["year"]) >= 48   # 48개국 이상(48/64) 시대
 
     # [2026-07 최적화, 신민용 리포트: "국제대회 주간(47~51주)에 렉이 심하다"]
     # 원래 get_group_standings(tid, g)를 조 라벨마다 따로 호출했는데, 그
@@ -6543,7 +6717,7 @@ def _finalize_groups(t, next_stage, next_week):
     # regional_cup_format()을 다시 돌려 n_groups/best_thirds를 구한다 —
     # 조 편성 때 쓴 것과 완전히 같은 함수라 값도 항상 일치한다.
     if is_wc:
-        _wtier = wc_tier(t["year"])
+        _wtier = wc_tier(t["year"]) if t["kind"] == "world" else 32
         n_groups = WC_GROUPS_BY_TIER[_wtier]
         n_best = WC_BEST_THIRDS_BY_TIER[_wtier]
     elif is_region:
@@ -6674,7 +6848,7 @@ def _finalize_groups(t, next_stage, next_week):
     conn.commit()
     conn.close()
 
-    add_log(f"🌍 {t['name']} 조별리그 종료 → {STAGE_KO[next_stage]} 진출국 확정",
+    add_log(f"{_comp_icon(t)} {t['name']} 조별리그 종료 → {STAGE_KO[next_stage]} 진출국 확정",
             "event")
     # 내 국가가 조별 탈락했으면 결과 확정
     if nat and nat in eliminated:
@@ -6758,7 +6932,7 @@ def _advance_knockout(t, cur_stage, next_stage, next_week):
 
     conn.commit()
     conn.close()
-    add_log(f"🌍 {t['name']} {cur_stage_ko} 종료 → {STAGE_KO[next_stage]} 대진 확정", "event")
+    add_log(f"{_comp_icon(t)} {t['name']} {cur_stage_ko} 종료 → {STAGE_KO[next_stage]} 대진 확정", "event")
 
 
 def _intl_country_stage_weights(tid):
@@ -7027,6 +7201,13 @@ def _finish_tournament(t, final_week):
     conn2.commit()
 
     # [2026-07 신설] 조기탈락해도 골든볼/골든부트는 별개로 판정
+    if _is_oly(t):
+        # [2026-10] U-23 올림픽 — 성인 대표팀 감독 평가·시상 없음(올림픽 시상·U-23 감독은
+        # 다음 단계). 내 선수 병역 혜택(메달)만 판정한다.
+        from competition import olympics as _oly
+        _oly.on_finish(t)
+        return
+
     _award_intl_awards(t)
 
     # [2026-09 신설 — 감독 시스템 ③-d] 대표팀 감독 평가. 여기가 대회
@@ -7070,6 +7251,12 @@ def _record_my_exit(t, result):
     #  - my_result는 'XX 미선발'로만 표시(대회 화면 일관성용)
     #  - trophy_log / intl_history(개인기록) / 보상은 일절 기록하지 않는다.
     #    (선발 안 됐는데 대표팀이 우승했다고 내 우승 트로피로 박히던 버그 방지)
+    if _is_oly(t):
+        from competition.olympics import result_label as _oly_label
+        _raw_result, result = result, _oly_label(result)   # [2026-10] 금·은·동메달 / "8강 탈락" 식
+    else:
+        _raw_result = result
+
     if t["my_selected"] != 1:
         conn = get_conn()
         conn.execute("UPDATE intl_tournaments SET my_result=? WHERE id=?",
@@ -7085,7 +7272,7 @@ def _record_my_exit(t, result):
 
     _save_trophy(t["year"], nat, t["name"], result)
 
-    fame_g, pop_g, hap_g = _REWARD.get(result, (0, 0, 0))
+    fame_g, pop_g, hap_g = _REWARD.get(_raw_result, (0, 0, 0))
     if t["kind"] != "world":  # 대륙컵은 60% 스케일
         fame_g = round(fame_g * 0.6)
         pop_g = round(pop_g * 0.6)

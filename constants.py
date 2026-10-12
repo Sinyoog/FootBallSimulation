@@ -126,6 +126,135 @@ DAYS_PER_WEEK = 7
 # 박혀 있어서 한쪽만 고치면 어긋날 수 있었다.
 MIN_MATCH_DAY_GAP = 2
 
+# [2026-10 신설, 신민용 확정: "리그 중간(후반기)에 A매치 기간을 넣는다 —
+# 네이션스 2년 주기(예선/본선) 경기 위치 이동용"] 클럽 경기가 전혀 없는
+# 구간(모든 리그·국내컵·3·4부컵·슈퍼컵 공통 금지일). (시작일, 끝일) 포함
+# 범위 목록. 빈 목록이면 기존 동작과 100% 동일하다(가상일 = 실제일).
+#
+# 리그 일정은 "가상 달력"(금지일을 뺀 연속 날짜)에서 기존 공식 그대로
+# 짜고, 마지막에 club_day_from_virtual()로 실제 날짜로 펼친다 — 그래서
+# 라운드 스프레드·리그별 요일 오프셋·마지막 라운드 동시진행·다리 경계
+# 휴식(MIN_MATCH_DAY_GAP) 로직을 손대지 않고 그대로 재사용한다. 금지 구간
+# 앞뒤 경기는 실제 날짜로 펼치면 오히려 간격이 넓어지므로 휴식 규칙이
+# 깨질 수 없다. 컵대회 날짜 선택기(pick_free_day / _week_intl_cl_day)는
+# is_club_blackout_day()로 후보일을 걸러낸다.
+#
+# 금지 구간은 클럽 시즌 구간(전반기/후반기 풀) 시작일·끝일을 포함하면
+# 안 된다(풀 경계가 가상 달력에서 사라짐) — 모듈 로드 시 assert로 확인.
+# [2026-10 4단계, 신민용 확정: "1안 A — 후반기 A매치 기간 3번(31·35·39주, 각 1주)"]
+# 네이션스 예선(짝수 해)·본선(홀수 해)이 이 세 기간에만 열린다(NATIONS_* 참고).
+# 빈 리스트로 바꾸면 클럽 일정은 예전과 같아지지만 네이션스 경기와 겹친다.
+AMATCH_CLUB_BLACKOUTS = [(211, 217), (239, 245), (267, 273)]
+
+
+def _norm_blackouts():
+    return sorted((int(s), int(e)) for s, e in AMATCH_CLUB_BLACKOUTS if e >= s)
+
+
+def is_club_blackout_day(day) -> bool:
+    """day가 A매치 기간(클럽 경기 금지일)이면 True."""
+    if not AMATCH_CLUB_BLACKOUTS or day is None:
+        return False
+    return any(s <= day <= e for s, e in AMATCH_CLUB_BLACKOUTS)
+
+
+# [2026-10 신설, 신민용 확정: "1안 A — 리그별 컵 주 완화"] 금지 구간 때문에
+# 후반기 리그 일정이 촘촘해지면, 컵 라운드가 있는 주에 리그 경기가 몰려 양 팀
+# 모두 쉴 날이 없는 컵 경기가 생긴다(2026-10 실측). 그래서 리그 일정을 짤 때
+# "그 리그가 실제로 참가하는 컵의 라운드 주"를 가상 달력에서 하루 = 가중치만큼만
+# 세서(예: 0.5면 반나절), 리그 라운드가 그 주엔 덜 들어가고 나머지 주에 들어가게
+# 한다. 리그 경기 수·시즌 종료일(풀 끝날)·금지 구간은 그대로다.
+#   - 어느 주가 컵 주인지·어느 부수가 참가하는지: competition/cup_plan.py가
+#     시즌 시작 시점 정보만으로 계산(실제 컵과 212개국 전 항목 일치 실측).
+#   - 국내컵 주는 W_DOM, 3·4부컵 주는 W_LOW, 둘 다면 작은 값(중복 감산 없음).
+#   - 리그마다 목표값에서 STEP씩 올려 가며, 엔진과 같은 공식으로 계산한 실제
+#     경기일이 ①팀별 최소 날짜 차이 >= MIN_MATCH_DAY_GAP ②마지막 경기일 <=
+#     CLUB_SEASON_END_DAY ③한 팀 한 주 리그 경기 <= LEAGUE_MAX_MATCHES_PER_WEEK
+#     를 모두 만족하는 가장 낮은 값을 쓴다. 1.0까지 안 되면 1.0(완화 없음)으로
+#     두고 실패로 기록한다(game_engine.LEAGUE_CUP_RELIEF_LOG).
+# 꺼져 있으면(기본값) 기존과 100% 동일하다.
+LEAGUE_CUP_RELIEF_ENABLED = True    # [2026-10 4단계] A매치 기간과 함께 켠다(1안 A)
+LEAGUE_CUP_RELIEF_W_DOM = 0.5
+LEAGUE_CUP_RELIEF_W_LOW = 0.5
+LEAGUE_CUP_RELIEF_STEP = 0.05
+LEAGUE_MAX_MATCHES_PER_WEEK = 3
+# [2026-10 신설, 신민용 확정: "L1e"] 상반기 국내컵 라운드 주(5~7주)도 완화 대상에
+# 넣되, 그 주 국내컵에 실제로 참가하는(그때까지 합류한) 부수에만 적용한다 —
+# 그 주에 아직 합류하지 않은 부수(대부분 나라의 1부)는 완화하지 않는다.
+# 하반기 국내컵 주는 지금처럼 컵 참가 부수 전체에 적용한다. 완화
+# (LEAGUE_CUP_RELIEF_ENABLED)가 꺼져 있으면 아무 효과 없다.
+LEAGUE_CUP_RELIEF_FIRST_HALF_DOM = True    # [2026-10 4단계] L1e 채택
+
+# [2026-10 신설, 신민용 확정: "L1e — 3·4부컵 상·하반기 분할"] 켜면
+#   - 3·4부컵이 하반기 시작이 아니라 상반기 시작 주(FIRST_HALF_START=4주, 승강 직후)에
+#     개막한다(참가 부수·참가 팀·대진 규모는 같다).
+#   - 예선 PO·64강·32강(16강보다 큰 라운드)은 LOWER_CUP_FIRST_HALF_WEEKS를 차례로,
+#     16강·8강·4강·결승(3·4위전 포함)은 LOWER_CUP_SECOND_HALF_WEEKS의 정해진 칸을 쓴다
+#     (8강부터 시작하는 작은 대회는 8강이 38주).
+#   - 시드: 같은 부수 안에서 직전 시즌 (부수, 최종 순위) 순 — 강등팀 → 잔류팀 → 승격팀,
+#     각 그룹 안은 직전 시즌 최종 순위(동률은 게임 순위표 순서). 직전 시즌 기록이 없으면
+#     (첫 시즌 등) 맨 뒤에 OVR 높은 순. 상위 부수가 항상 위인 원칙은 그대로.
+# 끄면(기본값) 예전과 100% 동일(하반기 시작 개막, LOWER_CUP_ROUND_WEEKS_POOL, 상반기 순위 시드).
+LOWER_CUP_SPLIT_ENABLED = True    # [2026-10 4단계] L1e 채택
+LOWER_CUP_FIRST_HALF_WEEKS = [10, 14, 18]          # 예선 PO → 64강 → 32강 (있는 라운드만 차례로)
+LOWER_CUP_SECOND_HALF_WEEKS = [36, 38, 40, 42]     # 16강, 8강, 4강, 결승·3·4위전
+
+# [2026-10 신설, 신민용 확정: "B 방식 — 국내컵·대륙대항전 AI 경기에도 실제 날짜를
+# 확정하고 양 팀 일정을 함께 검증"] (3단계) 켜면 국내컵·3·4부컵·챔스·유로파·
+# 컨퍼런스 경기가 라운드 생성 시점에 양 팀의 모든 클럽 경기와 A매치 금지일을
+# 함께 피한 날짜로 확정·저장된다(competition_common.assign_club_match_days).
+# 그 주 안에 휴식 규칙을 지킬 날이 없으면 가장 덜 붙는 날을 쓰고
+# competition_common.CLUB_DAY_ASSIGN_LOG에 실패로 남긴다. 날짜 결정에 난수를
+# 쓰지 않아 대진·경기 결과는 끈 상태와 같다. 끄면 예전과 100% 동일.
+CLUB_CUP_DAY_ASSIGN_ENABLED = True
+
+_VCAL_CACHE = {}
+
+
+def _vcal(week_weights=None):
+    """가상 달력 표: V[d] = 1 + (d 이전 날짜들의 가중치 합). 금지일 0, 컵 주는
+    week_weights[주], 나머지 1. 전부 1이면 V[d] = d."""
+    key = (tuple(_norm_blackouts()), tuple(sorted((week_weights or {}).items())))
+    V = _VCAL_CACHE.get(key)
+    if V is None:
+        V = [0.0] * 366
+        acc = 1.0
+        for d in range(1, 366):
+            V[d] = acc
+            if is_club_blackout_day(d):
+                w = 0.0
+            elif week_weights and ((d - 1) // DAYS_PER_WEEK + 1) in week_weights:
+                w = float(week_weights[(d - 1) // DAYS_PER_WEEK + 1])
+            else:
+                w = 1.0
+            acc += w
+        _VCAL_CACHE[key] = V
+    return V
+
+
+def _vcal_identity(week_weights=None):
+    return not AMATCH_CLUB_BLACKOUTS and all(float(v) == 1.0 for v in (week_weights or {}).values())
+
+
+def club_virtual_day(day: int, week_weights=None):
+    """실제일 → 가상일. 금지 구간·주 가중치가 없으면 항등."""
+    if _vcal_identity(week_weights):
+        return day
+    return _vcal(week_weights)[day]
+
+
+def club_day_from_virtual(vday, week_weights=None) -> int:
+    """가상일 → 실제일: 가상값이 vday 이상인 가장 이른 '금지일 아닌' 날.
+    금지 구간·주 가중치가 없으면 항등. 가상일 차이가 2 이상이면 실제일 차이도
+    2 이상이 보장된다(가중치가 전부 1 이하이므로)."""
+    if _vcal_identity(week_weights):
+        return vday
+    V = _vcal(week_weights)
+    for d in range(1, 366):
+        if V[d] >= vday - 1e-9 and not is_club_blackout_day(d):
+            return d
+    return 364
+
 # [2026-09 신설, 신민용 요청 32번] 귀화(복수국적 획득)에 필요한 "그 나라
 # **1부 리그**에서 뛴 시즌 수". 예전엔 game_engine에 2가 그냥 박혀 있었고
 # (주석만 '3년'이라고 잘못 적혀 있었다 — 실제 동작은 2년), 부수 조건도
@@ -337,7 +466,7 @@ def legs_for_team_count(n: int, target: int = TARGET_ROUNDS_PER_LEG) -> int:
         return 2
     return 1
 
-def season_cycle_windows(n_cycles: int):
+def season_cycle_windows(n_cycles: int, week_weights=None):
     """[2026-07 재설계, 중간 휴식기 도입] 예전엔 CLUB_SEASON_START_DAY~
     END_DAY(22~300) 전체를 통짜로 n_cycles개로 나눴는데, 이러면 중간
     휴식기(WINTER_OFFER_START_DAY~END_DAY, 190~217)를 관통하는 라운드가
@@ -397,6 +526,18 @@ def season_cycle_windows(n_cycles: int):
             # 그 경우엔 최소 1일 구간으로 눌러서 방어한다.
             out.append((s, max(s, e)))
         return out
+
+    # [2026-10 신설] A매치 기간(AMATCH_CLUB_BLACKOUTS) — 풀 경계를 "가상
+    # 달력"(금지일 제거) 기준으로 바꾼다. 반환되는 창은 가상일이므로 호출부
+    # (game_engine._build_league_schedule_rows)가 최종 날짜를
+    # club_day_from_virtual()로 실제일로 펼쳐야 한다. 금지 구간이 없으면
+    # 가상일 = 실제일이라 기존과 완전히 같다. week_weights는 리그별 컵 주
+    # 완화(LEAGUE_CUP_RELIEF_*)용 {주: 가중치} — 없으면 기존과 같다.
+    for _bd in (pre_start, pre_end, post_start, post_end):
+        if is_club_blackout_day(_bd):
+            raise ValueError(f"AMATCH_CLUB_BLACKOUTS가 리그 풀 경계일({_bd})을 덮는다")
+    pre_start, pre_end = club_virtual_day(pre_start, week_weights), club_virtual_day(pre_end, week_weights)
+    post_start, post_end = club_virtual_day(post_start, week_weights), club_virtual_day(post_end, week_weights)
 
     h1_windows = _split_pool(pre_start, pre_end, n_cycles)
     h2_windows = _split_pool(post_start, post_end, n_cycles)
@@ -667,6 +808,9 @@ INTL_TOURNAMENT_KIND_LABELS = {
     # "친선전"이므로 같은 라벨을 쓴다.
     "power_eval":       "📊 친선전",
     "power_eval_extra": "📊 친선전",
+    # [2026-10 신설] U-23 올림픽 — 본선 🏅, 예선 🎫(다른 예선과 같은 표).
+    "olympic":   "🏅 U-23 올림픽",
+    "oly_qual":  "🎫 U-23 올림픽 예선",
 }
 INTL_TOURNAMENT_KIND_GLYPHS = {
     "world":     "🌐",
@@ -685,6 +829,9 @@ INTL_TOURNAMENT_KIND_GLYPHS = {
     # 미등록 종류로 취급돼 기본 트로피(🏆)로만 표시되던 문제 수정.
     "power_eval":       "📊",
     "power_eval_extra": "📊",
+    # [2026-10 신설] U-23 올림픽
+    "olympic":   "🏅",
+    "oly_qual":  "🎫",
 }
 INTL_TOURNAMENT_KIND_FALLBACK_LABEL = "🏆"
 
@@ -807,6 +954,20 @@ TOURNAMENT_SCHEDULE_RULES = {
     # 끝난 뒤"로 정확히 누적 계산하려면 필요해서 그대로 넣어둔다 —
     # 실제 조별리그 날짜(_create_power_eval_tournament의
     # POWER_EVAL_GROUP_START_DAY + rd*2, rd=0~2)와 맞춘 값.
+    # [2026-10 4단계 신설, 신민용 확정] 네이션스 본선(24개국, 6조) — 후반기 A매치 기간
+    # 3번(31·35·39주)에만 열린다: 조별 212·214·216일 | 16강 240·8강 242·4강 244일 |
+    # 3·4위전·결승 268일. tournament_start_day=212(NATIONS_QUAL_ROUND_DAYS[0])로 넘겨서
+    # days+rest_after 누적이 정확히 이 날짜들이 되게 맞춘 표다(같은 라운드는 하루에 전부).
+    "nations_finals": [
+        {"stage": "group", "round": 1, "match_count": 12, "days": 1, "rest_after": 1,  "cap": 12, "min_rest": 0},
+        {"stage": "group", "round": 2, "match_count": 12, "days": 1, "rest_after": 1,  "cap": 12, "min_rest": 1},
+        {"stage": "group", "round": 3, "match_count": 12, "days": 1, "rest_after": 23, "cap": 12, "min_rest": 1},
+        {"stage": "R16",   "round": 1, "match_count": 8,  "days": 1, "rest_after": 1,  "cap": 8,  "min_rest": 1},
+        {"stage": "QF",    "round": 1, "match_count": 4,  "days": 1, "rest_after": 1,  "cap": 4,  "min_rest": 1},
+        {"stage": "SF",    "round": 1, "match_count": 2,  "days": 1, "rest_after": 23, "cap": 2,  "min_rest": 1},
+        {"stage": "TP",    "round": 1, "match_count": 1,  "days": 0, "rest_after": 0,  "cap": 1,  "min_rest": 1},
+        {"stage": "F",     "round": 1, "match_count": 1,  "days": 1, "rest_after": 0,  "cap": 1,  "min_rest": 1},
+    ],
     "power_eval": [
         {"stage": "group", "round": 1, "match_count": 8, "days": 1, "rest_after": 1, "cap": 8, "min_rest": 0},
         {"stage": "group", "round": 2, "match_count": 8, "days": 1, "rest_after": 1, "cap": 8, "min_rest": 2},
@@ -2642,6 +2803,36 @@ CONTINENTAL_START_YEAR = get_next_tournament_year(GAME_START_YEAR, CONTINENTAL_A
 REGIONAL_CUP_INTERVAL   = 4
 REGIONAL_CUP_ANCHOR_YEAR = 2001   # 위상: WC앵커-1(=+3)
 REGIONAL_CUP_START_YEAR = get_next_tournament_year(GAME_START_YEAR, REGIONAL_CUP_ANCHOR_YEAR, REGIONAL_CUP_INTERVAL)
+
+# ══════════════════════════════════════════════════════════════
+# [2026-10 4단계 신설, 신민용 확정: "네이션스 2년 주기"]
+#   짝수 해(2000·2002·2004..) 후반기 A매치 기간: 네이션스 예선 → 다음 홀수 해 본선
+#   홀수 해(2001·2003·2005..) 후반기 A매치 기간: 네이션스 본선(직전 짝수 해 예선 통과국)
+# 형식은 예전과 같다 — 예선은 대륙마다 48팀 12조×4 홈·원정 6경기(아메리카는 44팀 11조
+# + 조 3위 PO), 본선은 24팀 6조 → 16강~결승(7경기). 바뀌는 건 "언제·어디서"뿐:
+#   - 예선 6라운드: 212·214·216 | 240·242·244일, 아메리카 PO: 268일
+#   - 본선: TOURNAMENT_SCHEDULE_RULES["nations_finals"] (212~268일)
+#   - 대회 생성(조 추첨·발탁)은 첫 A매치 기간 바로 전 주(30주) 진입 시
+# 예전 자리(2000·2004년 겨울 예선 → 연말 본선)는 비운다(나중에 올림픽 자리).
+# 겨울·연말 경기로 넘기지 않는다 — A매치 기간 밖 날짜는 쓰지 않는다.
+# 주기는 월드컵 앵커(WC_ANCHOR_YEAR=2002)와 같은 위상의 짝수 해가 예선 해다.
+# 끄면(False) 예전 4년 주기(대륙컵 해 겨울 예선 → 연말 본선) 그대로.
+NATIONS_CYCLE_ENABLED = True
+NATIONS_QUAL_ROUND_DAYS = (212, 214, 216, 240, 242, 244)
+NATIONS_QUAL_PO_DAY = 268
+NATIONS_CREATE_WEEK = day_to_week(NATIONS_QUAL_ROUND_DAYS[0]) - 1   # 30주
+
+
+def is_nations_qual_year(year) -> bool:
+    """네이션스 예선 해(짝수 해, 월드컵 앵커와 같은 위상). 주기가 꺼져 있으면 False."""
+    import constants as _C
+    return bool(_C.NATIONS_CYCLE_ENABLED) and year is not None and (int(year) - WC_ANCHOR_YEAR) % 2 == 0
+
+
+def is_nations_finals_year(year) -> bool:
+    """네이션스 본선 해(홀수 해). 주기가 꺼져 있으면 False."""
+    import constants as _C
+    return bool(_C.NATIONS_CYCLE_ENABLED) and year is not None and (int(year) - WC_ANCHOR_YEAR) % 2 == 1
 
 # [2026-08 신설, 신민용 확정] "유로(EURO)" — 기존 대륙컵 자리(2004년 주기,
 # "유럽 네이션스컵"으로 개명)와는 완전히 별개의 새 대회. 지역컵과 같은
@@ -8636,3 +8827,93 @@ MILITARY_DEVALUE_RECOVERY_MATCHES = 10
 # −1.5 → −0.3, B급 나라당 90+ 1.08/1.19 → 1.54/1.58(폭증 없음), 꺼짐 결과는 기존 기준선과 동일.
 # ════════════════════════════════════════════════════════════════
 INTL_BREAKOUT_PERSIST_ENABLED = True
+
+# ════════════════════════════════════════════════════════════════
+# [2026-10 신설, 신민용 확정] U-23 올림픽 (남자) — 로직은 competition/olympics.py
+#   - 2000·2004·2008…(4년 주기, 네이션스 예선 해) 개최. 개최국·자동 진출 없음.
+#   - 겨울 휴식기(25~28주): 대륙별 예선 — 월드컵 예선 엔진·날짜 규칙 그대로,
+#     대륙별 티켓은 항상 32팀 월드컵 체제(WC_QUAL_32 / WC_QUOTA) 비율.
+#   - 연말(45~52주): 본선 — 항상 32팀(8조×4 → 16강 → 8강 → 4강 → 결승·동메달 결정전),
+#     월드컵 본선과 같은 일정 규칙(TOURNAMENT_SCHEDULE_RULES["world_cup_32"]).
+#   - 자격: 그 해 게임 나이 23세 이하(최소 나이 없음), 복무 중 선수 불가, 와일드카드 없음.
+#     23세 이하로 18명·GK 2명을 못 채우면 모자란 자리만 24 → 25 → 26세… 순으로 보충.
+#   - 명단 18명(주전 11 + 교체 7, GK 2) + "후보 탈락" 4명. 본선 직전에 명단을 다시 뽑는다.
+#   - 기록: 국제대회 기록(국제전·AI 국제대회 기록·국가 기록)에는 남기고, A매치(캡·A매치 골·
+#     파워랭킹·국적 고정·감독 평가·발롱 국대 점수)에서는 뺀다.
+#   - 끄면(False) 올림픽 대회·표·컬럼 자체가 만들어지지 않아 기존과 결과가 완전히 같다.
+# ════════════════════════════════════════════════════════════════
+OLYMPICS_ENABLED = True
+OLYMPIC_ANCHOR_YEAR = 2000          # 4년 주기 위상(2000·2004·2008…). 시작 연도와 무관하게 이 위상으로 연다.
+OLYMPIC_INTERVAL = 4
+OLYMPIC_MAX_AGE = 23                # 그 해 게임 나이 상한(최소 나이 없음)
+OLYMPIC_NAME = "U-23 올림픽"          # 대회명: "2000 U-23 올림픽", 예선: "2000 U-23 올림픽 유럽 예선"
+OLYMPIC_SQUAD_SIZE = 18             # 주전 11 + 교체 7
+OLYMPIC_GK = 2
+OLYMPIC_RESERVE_CUT = 4             # 후보 탈락 표시 인원
+# 본선 성적 표시 — 메달권은 메달, 나머지는 "8강 탈락" 식(조별리그는 "조별리그 탈락").
+OLYMPIC_RESULT_LABEL = {"우승": "금메달", "준우승": "은메달", "3위": "동메달", "4위": "4위",
+                        "8강": "8강 탈락", "16강": "16강 탈락"}
+# [2026-10 3단계] 발롱도르 — 올림픽 대회 성적 점수 = 컨퍼런스리그(유럽 기준, 대륙 무관)의 절반,
+# 올림픽 개인상 점수 = 컨퍼런스리그 개인상(클럽 대항전 MVP·베스트11)의 절반.
+# 대회 성적은 국제대회 가산점 경로(국적 내 순위 감쇠 적용)로 들어가고 "국제무대 증명" 게이트엔 불인정.
+OLYMPIC_BALLON_REF = ("유럽", "ecl")
+OLYMPIC_BALLON_RATIO = 0.5
+# [2026-10 4단계] 화면 — 글자·테두리 은색, 메인 일정 카드 배경, 아이콘. 로그 상자·다음주 미리보기는
+# 테두리·글자만 은색이고 배경은 각 영역의 원래 배경 그대로.
+OLYMPIC_UI_COLOR = "#C0C0C0"
+OLYMPIC_UI_CARD_BG = "#1f2533"
+OLYMPIC_UI_ICON = "🏅"
+OLYMPIC_MEDAL_COLOR = {"금메달": "#FFD700", "은메달": "#C0C0C0", "동메달": "#CD7F32"}
+OLYMPIC_MEDAL_ICON = {"금메달": "🥇", "은메달": "🥈", "동메달": "🥉"}
+# 포메이션별 18명 구성(GK 2 별도). 약어: CB 센터백 / FB 풀백 / WB 윙백 / DM / CM / AM /
+# WM 측면 MF / W 윙어 / ST. 백4 기본 DF6·MF6·FW4(4-2-4만 DF6·MF5·FW5), 백3·백5 DF7(CB4 WB3)·MF5·FW4.
+# 20개 포메이션 모두 "주전 11 + 교체 7 = 이 표 합계"인지 olympics 모듈 로드(게임 시작) 때 자동 검사한다.
+OLYMPIC_SQUAD_TABLE = {
+    "4-4-2":     {"CB": 3, "FB": 3, "CM": 3, "WM": 2, "DM": 1, "ST": 3, "W": 1},
+    "4-4-1-1":   {"CB": 3, "FB": 3, "CM": 3, "WM": 2, "AM": 1, "ST": 2, "W": 2},
+    "4-3-3":     {"CB": 3, "FB": 3, "DM": 2, "CM": 3, "AM": 1, "ST": 2, "W": 2},
+    "4-3-3-ATT": {"CB": 3, "FB": 3, "CM": 3, "AM": 2, "DM": 1, "ST": 2, "W": 2},
+    "4-1-4-1":   {"CB": 3, "FB": 3, "DM": 1, "CM": 3, "WM": 2, "ST": 2, "W": 2},
+    "4-2-3-1":   {"CB": 3, "FB": 3, "DM": 2, "CM": 2, "AM": 2, "ST": 2, "W": 2},
+    "4-2-2-2":   {"CB": 3, "FB": 3, "DM": 2, "CM": 2, "AM": 2, "ST": 3, "W": 1},
+    "4-3-1-2":   {"CB": 3, "FB": 3, "DM": 2, "CM": 3, "AM": 1, "ST": 3, "W": 1},
+    "4-3-2-1":   {"CB": 3, "FB": 3, "DM": 1, "CM": 3, "AM": 2, "ST": 2, "W": 2},
+    "4-1-2-1-2": {"CB": 3, "FB": 3, "DM": 1, "CM": 2, "WM": 2, "AM": 1, "ST": 3, "W": 1},
+    "4-5-1":     {"CB": 3, "FB": 3, "DM": 1, "CM": 3, "WM": 2, "ST": 2, "W": 2},
+    "4-2-4":     {"CB": 3, "FB": 3, "DM": 1, "CM": 3, "AM": 1, "ST": 3, "W": 2},
+    "3-4-3":     {"CB": 4, "WB": 3, "DM": 1, "CM": 3, "AM": 1, "ST": 2, "W": 2},
+    "3-4-2-1":   {"CB": 4, "WB": 3, "CM": 3, "AM": 2, "ST": 2, "W": 2},
+    "3-4-1-2":   {"CB": 4, "WB": 3, "DM": 1, "CM": 3, "AM": 1, "ST": 3, "W": 1},
+    "3-5-2":     {"CB": 4, "WB": 3, "DM": 2, "CM": 3, "ST": 3, "W": 1},
+    "3-5-1-1":   {"CB": 4, "WB": 3, "DM": 1, "CM": 3, "AM": 1, "ST": 2, "W": 2},
+    "5-3-2":     {"CB": 4, "WB": 3, "DM": 2, "CM": 3, "ST": 3, "W": 1},
+    "5-4-1":     {"CB": 4, "WB": 3, "CM": 3, "WM": 2, "ST": 2, "W": 2},
+    "5-2-3":     {"CB": 4, "WB": 3, "DM": 2, "CM": 3, "ST": 2, "W": 2},
+}
+
+# ── [2026-10 신설 — U-23 올림픽 2단계] U-23 대표팀 감독 (competition/oly_manager.py) ──
+# 성인 대표팀 감독(national_team_managers)과 별개 직책 — 재임은 oly_team_managers에 따로 남고,
+# 감독 풀(managers)만 클럽·대표팀과 공유한다(한 감독은 한 자리만: managers.status='u23').
+#   · 자리 수준 = 그 나라 대표팀 자리 수준 × 3부 배수(MANAGER_JOB_TIER_MULT[2]) — "3·4부 리그
+#     감독과 비슷하거나 조금 위"(S급 나라 U-23 ≈ S급 리그 3부 ≈ 44, C급 나라 ≈ 28).
+#   · 자국 감독 확률: S 70% · A 80% · B 90% · C 이하 100%(자국 무직 감독이 없으면 자국 신인을 만든다).
+#   · 계약은 항상 다음 올림픽 해까지(2001~2003 부임 → 2004, 올림픽 해 연말 재계약 → 4년 뒤).
+#   · 선임·경질·은퇴는 시즌 전환(연말)에만 — 올림픽 해에는 대회가 끝난 연말에만 일어난다.
+#   · 올림픽 해 연말: 선수단(U-23) 예상 전력 대비 성과로 평가 → 재계약 또는 교체.
+#   · 비올림픽 해: 직전 올림픽에서 목표에 못 미치고도 재계약한 감독만 성적 부진 경질 가능
+#     (성인 대표팀 경질 압력 × 아래 배율 — 올림픽 다음 해 0.5, 그다음 0.25, 그다음 0.125).
+#   · 승진(성인 대표팀·클럽): 올림픽 평가에서 전력 대비 초과 성과일 때만 후보가 될 확률이 생긴다.
+#     목표를 그대로 채우면(우승 후보가 우승해도) 0.3%, 초과 성과 10단계당 +0.4%, 최대 2%.
+#     후보가 되면 다음 2년 동안 클럽·성인 대표팀 시장의 후보 명단에 들어가고, 실제 선임은 그
+#     시장의 기존 조건(자리 수준 상·하한, 국적 확률, 점수 경쟁)을 그대로 통과해야 하고, 지금 U-23 자리보다
+#     OLY_MGR_PROMO_MIN_GAIN 이상 높은 자리만 본다(같은 급·아래 클럽으로 옮기는 건 승진이 아니다).
+OLY_MGR_LEVEL_MULT = 0.42
+OLY_MGR_DOMESTIC_PROB = {"S": 0.70, "A": 0.80, "B": 0.90}     # 표에 없는 등급(C~F) = 1.0
+OLY_MGR_REP_MULT = 0.4                    # 올림픽 성적 → 명성 변화 = 성인 대표팀 식(월드컵 외 대회) × 이 값
+OLY_MGR_OFFYEAR_SACK_MULT = (0.5, 0.25, 0.125)
+OLY_MGR_PROMO_BASE = 0.003
+OLY_MGR_PROMO_PER10 = 0.004
+OLY_MGR_PROMO_MAX = 0.02
+OLY_MGR_PROMO_YEARS = 2
+OLY_MGR_PROMO_MIN_GAIN = 10.0             # 승진 = 지금 U-23 자리 수준보다 이만큼 이상 높은 자리(같은 급 이동은 승진 아님)
+OLY_MGR_ROOKIE_AGE = (38, 56)             # 자국 무직 감독이 없을 때 새로 만드는 U-23 감독 나이

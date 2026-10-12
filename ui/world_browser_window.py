@@ -623,6 +623,39 @@ def _apply_cutoff_year(rows, intl_records, cutoff_year):
     return new_rows, new_intl
 
 
+def _oly_military_label(status, pid):
+    """[2026-10 U-23 올림픽] 병역 칸 문자열 — "면제"인데 올림픽 메달 병역 혜택 기록이 있으면
+    "체육요원"(효과는 면제와 같다). pid None(내 선수) = 혜택 표의 player_id 0. 표가 없으면 예전 그대로."""
+    from military_service import military_status_label
+    label = military_status_label(status) or "미필"
+    if label == "면제":
+        try:
+            from competition.olympics import military_benefit_label
+            return military_benefit_label(pid or 0) or label
+        except Exception:
+            pass
+    return label
+
+
+def _olympic_reserve_cut_label(tournament_id, country):
+    """[2026-10 U-23 올림픽] 최종 18명 바로 아래 후보 탈락 4명을 한 줄로(올림픽 대회가 아니면 None).
+    후보 탈락은 출전·메달·병역 혜택이 없다 — 최종 명단과 섞이지 않게 흐린 색 별도 줄."""
+    try:
+        rows = wb.get_olympic_reserve_cut(tournament_id, country)
+    except Exception:
+        rows = []
+    if not rows:
+        return None
+    parts = []
+    for r in rows:
+        club = f" ({r['club']})" if r.get("club") else (" (은퇴)" if r.get("retired") else "")
+        parts.append(f"{r['rank']}. {r.get('position') or r.get('category') or '-'} {r['display_name']}{club}")
+    lbl = QLabel("🗒 후보 탈락 (" + str(len(rows)) + "명 — 출전·메달·병역 혜택 없음): " + "  ·  ".join(parts))
+    lbl.setWordWrap(True)
+    lbl.setStyleSheet("color:#999;font-size:11px;border:none;")
+    return lbl
+
+
 def _build_squad_roster_panel(starters, bench, on_click=None, height=460,
                               manager=None, on_manager_click=None):
     """[2026-08 재작업, 신민용 리포트: "좌측에 포메이션을 저렇게 박으면
@@ -2306,7 +2339,9 @@ class WorldBrowserWindow(QDialog):
             # A매치 칸으로 묶고, 들어가면 맨 위 버튼으로 고르게"] 예전 독립 탭 3개
             # (_build_wc_tab/_build_nc_tab/_build_region_tab)는 그대로 두고 A매치 탭 안의
             # 페이지로 들어간다 — _build_amatch_tab 참고. 친선전(랭킹 평가전)은 새 페이지.
-            (self._build_amatch_tab,       "⚽ A매치"),
+            # [2026-10 U-23 올림픽, 신민용 요청: "A매치 → 국제대회"] 올림픽은 A매치가 아니라서
+            # 올림픽 메뉴가 보일 때(스위치 ON 또는 올림픽 기록 있음)는 탭 이름을 "국제대회"로.
+            (self._build_amatch_tab,       "⚽ 국제대회" if wb.olympics_visible() else "⚽ A매치"),
             (self._build_country_tab,      "🌍 국가 검색"),
             (self._build_power_ranking_tab,"📊 파워랭킹"),
             (self._build_player_search_tab,"🔎 선수 검색"),
@@ -6719,7 +6754,7 @@ class WorldBrowserWindow(QDialog):
         nat_lay.setContentsMargins(8, 3, 8, 3)
         nat_lay.setSpacing(8)
         self.mgr_natteam_btn = _toggle("🌍 대표팀 감독",
-                                       "대표팀 감독을 맡은 적이 있는 감독만(오른쪽 연도 = 그 해 재임)")
+                                       "대표팀 감독(U-23 대표팀 포함)을 맡은 적이 있는 감독만(오른쪽 연도 = 그 해 재임)")
         nat_lay.addWidget(self.mgr_natteam_btn)
         self.mgr_natteam_year_edit = QLineEdit()
         self.mgr_natteam_year_edit.setPlaceholderText("전체")
@@ -7334,7 +7369,8 @@ class WorldBrowserWindow(QDialog):
                 if r.get("cwc"):      # [12번]
                     parts.append("클럽월드컵: " + _with_rec(r["cwc"], r.get("cwc_record")))
             else:
-                parts = [f"{y}년{age}", f"🌍 {r['country']} 대표팀"
+                parts = [f"{y}년{age}", (f"🏅 {r['country']} U-23 대표팀" if r["kind"] == "u23"
+                                         else f"🌍 {r['country']} 대표팀")
                          + (" (외국인 감독)" if r.get("is_foreign") else "")]
                 _tl = r.get("tournaments") or []
                 if r.get("results_hidden"):
@@ -7387,7 +7423,7 @@ class WorldBrowserWindow(QDialog):
                 y = r.get("year")
                 if y is None or y > cutoff_year or (lo is not None and y < lo):
                     continue
-                if r.get("kind") == "nation" and y == cutoff_year:
+                if r.get("kind") in ("nation", "u23") and y == cutoff_year:
                     r = dict(r, tournaments=[], results_hidden=True)
                 elif y == cutoff_year and r.get("cwc"):
                     # [2026-10 21번] 클럽월드컵은 국제대회와 같은 주간 — 그 해 줄에서 뺀다.
@@ -7577,7 +7613,10 @@ class WorldBrowserWindow(QDialog):
                 # 대회 결과는 기본 밝은 회색이고 우승한 대회만 금색. 여러 대회가 한 줄이면
                 # "[우승]" 부분만 금색(_two_line_cell 규칙), 전부 우승이면 줄 전체 금색.
                 _tc = "#FF7F00" if r.get("is_foreign") else "#7ec8ff"
-                yt.setCellWidget(i, 1, self._two_line_cell(f"🌍 {r['country']} 대표팀", _tc, None, bold=True))
+                # [2026-10 U-23 올림픽 2단계] U-23 대표팀 줄은 🏅 + "U-23 대표팀"
+                _tn = (f"🏅 {r['country']} U-23 대표팀" if r["kind"] == "u23"
+                       else f"🌍 {r['country']} 대표팀")
+                yt.setCellWidget(i, 1, self._two_line_cell(_tn, _tc, None, bold=True))
                 _tl = r.get("tournaments") or []
                 if _tl:
                     _all_won = all((res_ or "").strip() == "우승" for _t, res_, _o in _tl)
@@ -7609,7 +7648,7 @@ class WorldBrowserWindow(QDialog):
                 _wrap = QWidget()
                 _wl = QVBoxLayout(_wrap)
                 _wl.setContentsMargins(0, 0, 0, 0)
-                if r["kind"] != "club":
+                if r["kind"] == "nation":   # [2026-10] U-23 줄은 성인 소집 버튼이 없다
                     # [2026-10 신민용 요청] 대표팀 줄은 오른쪽에 대회별 "후보 라인 /
                     # 최종 국대 인원" 버튼, 누르면 아래에 그 명단이 펼쳐진다.
                     _wl.setSpacing(0)
@@ -7659,6 +7698,7 @@ class WorldBrowserWindow(QDialog):
         self.manager_year_title.setText(
             f"📅 연도별 경력  —  클럽 {s.get('seasons', 0)}시즌 · {s.get('clubs', 0)}팀 · "
             f"대표팀 {s.get('nation_seasons', 0)}시즌 · "
+            f"{('U-23 대표팀 ' + str(s['u23_seasons']) + '시즌 · ') if s.get('u23_seasons') else ''}"   # [2026-10]
             f"리그 우승 {s.get('league_titles', 0)} · 국내컵 우승 {s.get('cup_titles', 0)} · "
             f"대륙대회 우승 {s.get('cl_titles', 0)} · 클럽월드컵 우승 {s.get('cwc_titles', 0)} · "
             f"대표팀 본선 {s.get('nation_tournaments', 0)}회 · "
@@ -9129,7 +9169,11 @@ class WorldBrowserWindow(QDialog):
                     # 후보탈락 줄은 실제 소집 기록과 구분되게 흐린 색
                     item.setForeground(QColor("#888"))
                     if col == 5:
-                        item.setToolTip("소집 경쟁(대표팀 후보군)에 포함됐으나 최종 명단에서 탈락"
+                        item.setToolTip(
+                            (f"U-23 올림픽 최종 18명 바로 아래 후보 4명 — {rec.get('callup_rank')}순위"
+                             f"({rec.get('callup_bucket') or '-'}), 출전·메달·병역 혜택 없음")
+                            if rec.get("oly_reserve") else
+                            "소집 경쟁(대표팀 후보군)에 포함됐으나 최종 명단에서 탈락"
                                         + (f" — {rec.get('callup_bucket')} 후보 {rec.get('callup_rank')}순위"
                                            if rec.get("callup_bucket") else ""))
                 tbl.setItem(row, col, item)
@@ -9177,13 +9221,13 @@ class WorldBrowserWindow(QDialog):
                             from constants import MILITARY_FORCED_AGE, MILITARY_STATUS_SERVED
                             if (rr["age"] or 0) >= MILITARY_FORCED_AGE:
                                 status = MILITARY_STATUS_SERVED
-                        return military_status_label(status) or "미필"
+                        return _oly_military_label(status, pid)
                     if not is_service_target(row["nationality"]):
                         return ""
                     status = row["military_status"]
             finally:
                 conn.close()
-            return military_status_label(status) or "미필"
+            return _oly_military_label(status, pid)
         except Exception:
             return ""
 
@@ -10280,7 +10324,7 @@ class WorldBrowserWindow(QDialog):
         lbl4 = QLabel("대회"); lbl4.setStyleSheet("color:#888;font-size:11px;")
         self.country_trophy_kind_combo = QComboBox()
         self.country_trophy_kind_combo.addItem(_ALL)
-        for _label, _ek in wb.COUNTRY_TROPHY_KIND_OPTIONS:
+        for _label, _ek in wb.get_country_trophy_kind_options():   # [2026-10] 올림픽 포함
             self.country_trophy_kind_combo.addItem(_label)
         self.country_trophy_kind_combo.currentTextChanged.connect(self._refresh_country_search_list)
         filt.addWidget(lbl4)
@@ -10391,6 +10435,9 @@ class WorldBrowserWindow(QDialog):
         self.country_result_kind_combo.addItem(_ALL, None)
         self.country_result_kind_combo.addItem("지역컵", "region_group")
         self.country_result_kind_combo.addItem("월드컵", "world_group")
+        if wb.olympics_visible():
+            # [2026-10] U-23 올림픽(본선 + 예선 — 예선 진출 실패 줄 포함)
+            self.country_result_kind_combo.addItem("올림픽", "olympic_group")
         self.country_result_kind_combo.addItem("네이션스컵", "continent_group")
         # [2026-09 신설, 신민용 요청: "종류 필터에 랭킹전(친선전/power_eval)도
         # 포함해달라"] power_eval/power_eval_extra(랭킹 평가전) 행은 그동안
@@ -10477,7 +10524,7 @@ class WorldBrowserWindow(QDialog):
         #   수상=상 없음 + 대회=전체   → 어떤 국제대회도 우승한 적 없는
         #                                국가(기존 그대로)
         if kind_filter_label != _ALL:
-            _ek_by_label = dict(wb.COUNTRY_TROPHY_KIND_OPTIONS)
+            _ek_by_label = dict(wb.get_country_trophy_kind_options())
             want_ek = _ek_by_label.get(kind_filter_label)
             has_kind = lambda name: any(
                 g["effective_kind"] == want_ek for g in (trophy_counts.get(name) or []))
@@ -10628,6 +10675,7 @@ class WorldBrowserWindow(QDialog):
     _COUNTRY_RESULT_KIND_GROUPS = {
         "region_group": {"region", "euro", "euro_qual", "region_qual"},
         "world_group": {"world", "wc_qual"},
+        "olympic_group": {"olympic", "oly_qual"},     # [2026-10] U-23 올림픽
         "continent_group": {"continent", "cont_qual"},
         "ranking_group": {"power_eval", "power_eval_extra"},
     }
@@ -10855,7 +10903,7 @@ class WorldBrowserWindow(QDialog):
         year_rank = getattr(self, "_country_copy_year_rank", {})
         year = t.get("year")
 
-        _finals_to_qual = {"world": "wc_qual", "continent": "cont_qual"}
+        _finals_to_qual = {"world": "wc_qual", "continent": "cont_qual", "olympic": "oly_qual"}
         _qual_to_finals = {v: k for k, v in _finals_to_qual.items()}
 
         kind = t.get("kind")
@@ -10882,7 +10930,7 @@ class WorldBrowserWindow(QDialog):
         tid = item.data(Qt.ItemDataRole.UserRole) if item else None
         if tid is None:
             return
-        wc = item.data(Qt.ItemDataRole.UserRole + 1) == "world"
+        wc = item.data(Qt.ItemDataRole.UserRole + 1) in ("world", "olympic")   # [2026-10] 올림픽 본선도
         # [2026-08 신설, 신민용 요청: "국가 검색으로 들어와서 대회명을
         # 클릭해 전체 팝업을 열면, 그 안에서도 지금 보고 있는 국가 이름이
         # 금색으로 표시돼야 한다"] 지금 국가 검색에서 선택된 국가
@@ -10903,7 +10951,7 @@ class WorldBrowserWindow(QDialog):
         # (TournamentDetailDialog._build_wc_country_panel 참고).
         # [2026-10] 친선전(랭킹 평가전)도 참가국이 국가라 같은 패널을 붙인다.
         country_panel = _kind in ("world", "continent", "region", "wc_qual", "cont_qual",
-                                  "power_eval", "power_eval_extra")
+                                  "power_eval", "power_eval_extra", "olympic", "oly_qual")
         self._open_intl_detail(self.country_detail_tbl, row, wc=wc,
                                 highlight_country=country,
                                 country_panel=country_panel)
@@ -11326,6 +11374,9 @@ class WorldBrowserWindow(QDialog):
                                            manager=_mgr, on_manager_click=self._on_manager_click)
         content_row.addWidget(roster, 1)
         lay.addLayout(content_row)
+        _oly_cut_lbl = _olympic_reserve_cut_label(tid, country)   # [2026-10] U-23 올림픽 후보 탈락 4명
+        if _oly_cut_lbl is not None:
+            lay.addWidget(_oly_cut_lbl)
         return box
 
     def _on_bulk_rename_country_squad(self, tid, country, header_title, year_txt):
@@ -11369,7 +11420,8 @@ class WorldBrowserWindow(QDialog):
 
     def _copy_squad_player_records(self, ids, btn, reset_label="📋 스쿼드 기록 복사", target_years=None,
                                     include_stats=True, prefix_text="", cutoff_year=None,
-                                    cutoff_window=None, manager=None):
+                                    cutoff_window=None, manager=None, keep_late_awards=False,
+                                    max_year=None):
         """[2026-08 신설, 신민용 요청: "이 대회명 써진 줄 우측에 복사하기
         버튼을 놔줘 — 여기 들어간 선수들의 선수 기록을 한꺼번에 복사하는
         용도"] ui/formation_widget.py의 _on_copy_squad_clicked와 완전히
@@ -11464,9 +11516,18 @@ class WorldBrowserWindow(QDialog):
                     # 경로)는 cutoff_year 경로(_apply_cutoff_year)와 달리 그 해 상을 그대로 실었다.
                     # 대회 연도(가장 늦은 해) 줄의 상 목록에서만 같은 기준으로 뺀다 — 그 해 국가대표
                     # 기록을 남기는 이 경로의 기존 동작(2026-08 요청)은 그대로 둔다.
+                    # [2026-10] keep_late_awards=True(세계상 베스트 11 복사)면 빼지 않는다 —
+                    # 그 해 연말 기준 기록이라 발롱도르·국제대회 상까지 전부 실어야 한다.
                     _ty = max(target_years)
-                    rows = [dict(r, awards=_strip_year_end_world_awards(r["awards"], r.get("late_awards")))
-                            if (r.get("year") == _ty and r.get("awards")) else r for r in rows]
+                    if not keep_late_awards:
+                        rows = [dict(r, awards=_strip_year_end_world_awards(r["awards"], r.get("late_awards")))
+                                if (r.get("year") == _ty and r.get("awards")) else r for r in rows]
+                elif max_year is not None:
+                    # [2026-10] 세계상 베스트 11 "기록 복사": max_year까지 전부, 아무것도 빼지 않는다
+                    # (_apply_cutoff_year와 달리 그 해 세계상·국가대표 기록도 그대로).
+                    rows = [r for r in rows if r.get("year") is not None and r["year"] <= max_year]
+                    intl_records = [r for r in intl_records
+                                    if r.get("year") is not None and r["year"] <= max_year]
                 elif cutoff_year is not None:
                     if cutoff_window is not None:
                         _min_year = cutoff_year - cutoff_window + 1
@@ -12114,7 +12175,7 @@ class WorldBrowserWindow(QDialog):
         else:
             rows = wb.get_cup_history(cid)
         cname = item.data(Qt.ItemDataRole.UserRole + 1) or ""
-        icon = "🟤" if is_dsc else ("🏅" if is_lower else "🎖️")
+        icon = "🟤" if is_dsc else ("🎗️" if is_lower else "🎖️")
         color = BROWN if is_dsc else ("#00A6A6" if is_lower else "#c48aff")
         kind_label = "국내슈퍼컵" if is_dsc else ("3부·4부컵" if is_lower else "컵대회")
         self.cup_title.setText(f"{icon} {cname} 역대 {kind_label} 기록")
@@ -13377,8 +13438,47 @@ class WorldBrowserWindow(QDialog):
 
         # [2026-10 신설] FIFA 베스트 11 — 4-3-3 포메이션 그림 + 우측 명단. 선수 클릭은 다른
         # 포메이션 카드와 같은 라우팅(간단 변경이면 이름 변경 창, 바로 이동이면 선수 검색).
-        self.ia_xi_title = QLabel("📋 FIFA 베스트 11 (4-3-3)")
-        self.ia_xi_title.setStyleSheet("color:#ffcc00;font-size:13px;font-weight:bold;margin-top:8px;")
+        # [2026-10 신설, 신민용 요청: "베스트 11에 복사하기 버튼 — 누르면 그 선수들의 그 해
+        # 기록. 이번 해와 작년(작년이 없으면 이번 해만), 국제대회·개인상 포함, 발롱 등이
+        # 빠지는 거 없이"] 제목 줄 우측에 복사 버튼. ia_xi_title은 제목+버튼을 담은 줄
+        # 위젯이다(토글 표시/숨김은 예전처럼 이 위젯 하나로).
+        self.ia_xi_title = QWidget()
+        _xi_title_row = QHBoxLayout(self.ia_xi_title)
+        _xi_title_row.setContentsMargins(0, 0, 0, 0)
+        self.ia_xi_title_lbl = QLabel("📋 FIFA 베스트 11 (4-3-3)")
+        self.ia_xi_title_lbl.setStyleSheet("color:#ffcc00;font-size:13px;font-weight:bold;margin-top:8px;")
+        _xi_title_row.addWidget(self.ia_xi_title_lbl, 1)
+        _xi_btn_qss = ("QPushButton{background:#333;color:#ddd;border:1px solid #4a4a4a;"
+                       "border-radius:4px;padding:3px 10px;font-size:11px;margin-top:8px;}"
+                       "QPushButton:hover{background:#3d3d3d;}"
+                       "QPushButton:disabled{color:#666;}")
+        # [2026-10 신설, 신민용 요청: "베스트11 복사 버튼들 좌측에 이름 변경 — 11명의 닉을 한 번에"]
+        # 다른 화면의 "이름 일괄변경"과 같은 창(open_bulk_rename_dialog): 쉼표로 구분한 이름을 오른쪽
+        # 명단 위에서부터(GK → DF → MF → FW) 순서대로 배정한다. 내 선수는 대상이 아니다.
+        self.ia_xi_rename_btn = QPushButton("✏ 이름 변경")
+        self.ia_xi_rename_btn.setStyleSheet(_xi_btn_qss)
+        self.ia_xi_rename_btn.setToolTip("베스트 11 선수들의 이름을 한 번에 바꿉니다 — 쉼표(,)로 구분해 "
+                                         "오른쪽 명단 위에서부터 순서대로(내 선수 제외)")
+        self.ia_xi_rename_btn.setEnabled(False)
+        self.ia_xi_rename_btn.clicked.connect(self._on_rename_best_xi_clicked)
+        _xi_title_row.addWidget(self.ia_xi_rename_btn, 0)
+        # 요약 복사 = 그 해 + 작년(작년이 없으면 그 해만), 기록 복사 = 그 해까지 전부.
+        self.ia_xi_summary_copy_btn = QPushButton("📋 요약 복사")
+        self.ia_xi_summary_copy_btn.setStyleSheet(_xi_btn_qss)
+        self.ia_xi_summary_copy_btn.setToolTip("베스트 11 선수들의 그 해·작년 기록(클럽·국가대표·개인상)을 "
+                                               "텍스트로 복사합니다(GPT/제미나이 등에 붙여넣기용)")
+        self.ia_xi_summary_copy_btn.setEnabled(False)
+        self.ia_xi_summary_copy_btn.clicked.connect(lambda: self._on_copy_best_xi_clicked(summary=True))
+        _xi_title_row.addWidget(self.ia_xi_summary_copy_btn, 0)
+        self.ia_xi_copy_btn = QPushButton("📋 기록 복사")
+        self.ia_xi_copy_btn.setStyleSheet(_xi_btn_qss)
+        self.ia_xi_copy_btn.setToolTip("베스트 11 선수들의 그 해까지 전체 기록(클럽·국가대표·개인상)을 "
+                                       "텍스트로 복사합니다(GPT/제미나이 등에 붙여넣기용)")
+        self.ia_xi_copy_btn.setEnabled(False)
+        self.ia_xi_copy_btn.clicked.connect(lambda: self._on_copy_best_xi_clicked(summary=False))
+        _xi_title_row.addWidget(self.ia_xi_copy_btn, 0)
+        self._ia_xi_year = None
+        self._ia_xi_lineup = []      # [(슬롯 포지션, 이름, 팀명, player_id)] — 포메이션 순서
         self.ia_xi_title.setVisible(False)
         right_lay.addWidget(self.ia_xi_title)
         self.ia_xi_box = QWidget()
@@ -13499,11 +13599,60 @@ class WorldBrowserWindow(QDialog):
         # [2026-10 신설] 골든보이 Top 10 / FIFA 베스트 11(포메이션)
         self._fill_yashin_table(wb.get_season_individual_awards(year, "골든보이"),
                                 tbl=self.ia_gb_tbl, empty_msg="이 해는 골든보이 후보가 없습니다")
-        self._fill_best_xi_box(wb.get_season_individual_awards(year, "FIFA 베스트 11"))
+        self._fill_best_xi_box(wb.get_season_individual_awards(year, "FIFA 베스트 11"), year=year)
 
         self._apply_ia_secondary_visibility()
 
-    def _fill_best_xi_box(self, rows):
+    def _on_copy_best_xi_clicked(self, summary=True):
+        """[2026-10 신설, 신민용 요청] 베스트 11 선수 전원의 [선수 기록]을 한 번에 복사.
+          - 요약 복사(summary=True): 그 해와 작년 두 해(게임 시작 해라 작년이 없으면 그 해만).
+          - 기록 복사(summary=False): 그 해까지 전부(그 해보다 뒤 연도는 뺀다).
+        둘 다 클럽 연도별 기록·국가대표 기록·개인상 전부 — 다른 연도 한정 복사(국가 검색 요약
+        복사 등)와 달리 그 해 국제대회 뒤에 확정되는 상(발롱도르·FIFA 올해의 선수·야신상·
+        푸스카스상, 국제대회 개인상 등)과 그 해 국가대표 기록도 빼지 않는다 — 베스트 11 자체가
+        그 해 연말 기준 상이라서. 상세 수준은 다른 화면과 같다(요약 복사 = 대회별 세부 기록
+        없이, 기록 복사 = 대회별 평점·골·어시·연봉/계약까지)."""
+        y = self._ia_xi_year
+        lineup = self._ia_xi_lineup or []
+        ids = [pid for _pos, _n, _t, pid in lineup if pid is not None]
+        if y is None or not ids:
+            return
+        if summary:
+            try:
+                _gsy = get_game_start_year()
+            except Exception:
+                _gsy = None
+            years = {y} if (_gsy is not None and y - 1 < _gsy) else {y - 1, y}
+            span = f"{min(years)}~{y}년" if len(years) > 1 else f"{y}년"
+        else:
+            years = None
+            span = f"{y}년까지 전체"
+        head = [f"[{y}년 FIFA 베스트 11 (4-3-3)] — 선수 기록 범위: {span} (클럽·국가대표·개인상 전체)"]
+        _nat = getattr(self, "_ia_xi_nat", {}) or {}
+        for pos, name, team, _pid in lineup:
+            head.append(f"  {pos:<4}{name}  ({_nat.get(_pid) or '-'}) ({team or '-'})")
+        btn, label = ((self.ia_xi_summary_copy_btn, "📋 요약 복사") if summary
+                      else (self.ia_xi_copy_btn, "📋 기록 복사"))
+        self._copy_squad_player_records(ids, btn, label, target_years=years, include_stats=not summary,
+                                        prefix_text="\n".join(head), keep_late_awards=True,
+                                        max_year=None if summary else y)
+
+    def _on_rename_best_xi_clicked(self):
+        """[2026-10 신설] 베스트 11 이름 한 번에 변경 — 저장·다른 화면 즉시 반영은
+        open_bulk_rename_dialog가 한다(이 탭도 그 경로로 다시 그려진다). 마지막에 이 해 베스트 11을
+        한 번 더 그려 새 이름이 바로 보이게 한다."""
+        lineup = self._ia_xi_lineup or []
+        starters = [{"id": pid} for _pos, _n, _t, pid in lineup if pid is not None]
+        if not starters:
+            return
+        changed = open_bulk_rename_dialog(self, starters, [])
+        if not changed or self._ia_xi_year is None:
+            return
+        self._fill_best_xi_box(wb.get_season_individual_awards(self._ia_xi_year, "FIFA 베스트 11"),
+                               year=self._ia_xi_year)
+
+
+    def _fill_best_xi_box(self, rows, year=None):
         """[2026-10 신설, 신민용 요청: "베스트 11은 포메이션 그림처럼 보이고 우측에 선수 이름 —
         4-3-3으로"] FIFA 베스트 11(GK1·DF4·MF3·FW3)을 4-3-3 슬롯에 배치한다. 같은 포지션 그룹
         안에서 등록 위치가 같은 슬롯 → 호환 순위가 가까운 슬롯 순으로 채우고, 남으면 빈 슬롯에."""
@@ -13511,6 +13660,12 @@ class WorldBrowserWindow(QDialog):
             it = self._ia_xi_lay.takeAt(0)
             if it.widget():
                 it.widget().deleteLater()
+        # 복사 버튼 상태 — 기록이 없는 해는 끈다(아래에서 명단이 정해지면 다시 켠다).
+        self._ia_xi_year = year
+        self._ia_xi_lineup = []
+        self.ia_xi_copy_btn.setEnabled(False)
+        self.ia_xi_summary_copy_btn.setEnabled(False)
+        self.ia_xi_rename_btn.setEnabled(False)
         if not rows:
             msg = QLabel("이 해는 FIFA 베스트 11 기록이 없습니다")
             msg.setStyleSheet("color:#777;font-size:12px;")
@@ -13554,8 +13709,17 @@ class WorldBrowserWindow(QDialog):
         _click = getattr(self, "_on_player_click", None)
         pitch = _StaticPitchView("4-3-3", slot_players, on_click=_click, slots=slots)
         self._ia_xi_lay.addWidget(pitch, 0)
-        starters = [{"position": slots[i], "display_name": f"{r['name']}  ({r.get('team_name') or '-'})",
+        # [2026-10 신민용 요청: "이름 (국적) (팀명)"] 명단 줄에 국적도 같이.
+        starters = [{"position": slots[i],
+                     "display_name": f"{r['name']}  ({r.get('nationality') or '-'}) ({r.get('team_name') or '-'})",
                      "id": r["player_id"]} for i, r in enumerate(assigned) if r]
+        self._ia_xi_nat = {r.get("player_id"): (r.get("nationality") or "") for r in assigned if r}
+        self._ia_xi_lineup = [(slots[i], r["name"], r.get("team_name"), r.get("player_id"))
+                              for i, r in enumerate(assigned) if r]
+        self.ia_xi_copy_btn.setEnabled(year is not None and bool(self._ia_xi_lineup))
+        self.ia_xi_summary_copy_btn.setEnabled(year is not None and bool(self._ia_xi_lineup))
+        self.ia_xi_rename_btn.setEnabled(any(pid is not None and pid >= 0
+                                             for _p, _n, _t, pid in self._ia_xi_lineup))
         self._ia_xi_lay.addWidget(_build_squad_roster_panel(starters, [], on_click=_click), 1)
 
     def _trophy_breakdown_tip(self, r):
@@ -13916,6 +14080,8 @@ class WorldBrowserWindow(QDialog):
         self._amatch_pages = {}     # key -> [스택 인덱스, 아직 안 만든 빌더(만들면 None)]
         pages = [
             ("wc", "🌐 월드컵", self._build_wc_tab),
+            # [2026-10 신설] U-23 올림픽 — 월드컵 바로 뒤(올림픽이 안 보이는 세이브는 예전 그대로)
+            *([("olympic", "🏅 올림픽", self._build_olympic_tab)] if wb.olympics_visible() else []),
             ("nc", "🎖 네이션스컵", self._build_nc_tab),
             ("region", "🌏 지역컵", self._build_region_tab),
             ("friendly", "🤝 친선전", self._build_friendly_tab),
@@ -13938,6 +14104,46 @@ class WorldBrowserWindow(QDialog):
         lay.addWidget(stack, 1)
         self._amatch_show("wc")
         return w
+
+    # [2026-10 신설, 신민용 요청: "대회명은 버튼으로 하나 선택 / 본선 | 예선전 | 둘 다"]
+    _SEG_STYLE = (
+        "QPushButton{background:#2a2a2a;color:#888;border:1px solid #3a3a3a;"
+        "border-radius:4px;padding:3px 9px;font-size:11px;}"
+        "QPushButton:checked{background:#0d3d1a;color:#00cc44;border-color:#00cc44;}")
+    _STAGE_OPTIONS = [("본선", "main"), ("예선전", "qual"), ("둘 다", "both")]
+
+    def _seg_buttons(self, label, options, default, on_change):
+        """라벨 + 하나만 고르는 버튼 줄. 반환 (레이아웃, 현재값을 돌려주는 함수)."""
+        row = QHBoxLayout(); row.setSpacing(4)
+        if label:
+            lb = QLabel(label); lb.setStyleSheet("color:#888;font-size:11px;")
+            row.addWidget(lb)
+        grp = QButtonGroup(self)
+        grp.setExclusive(True)
+        state = {"v": default}
+        for text, val in options:
+            b = QPushButton(text)
+            b.setCheckable(True); b.setAutoDefault(False); b.setDefault(False)
+            b.setStyleSheet(self._SEG_STYLE)
+            b.setChecked(val == default)
+            def _clicked(_c=False, v=val):
+                state["v"] = v
+                on_change()
+            b.clicked.connect(_clicked)
+            grp.addButton(b)
+            row.addWidget(b)
+        if not hasattr(self, "_seg_groups"):
+            self._seg_groups = []
+        self._seg_groups.append(grp)     # GC 방지
+        return row, (lambda: state["v"])
+
+    def _open_intl_row(self, tbl, row, wc, country_panel=None):
+        """[2026-10] 표 더블클릭 — 예선 줄이면 예선 상세(예선 순위·라인업), 본선 줄이면 예전 그대로."""
+        item = tbl.item(row, 0)
+        if item is not None and item.data(Qt.ItemDataRole.UserRole + 1) == "qual":
+            self._open_intl_detail(tbl, row, wc=False, country_panel=True)
+            return
+        self._open_intl_detail(tbl, row, wc=wc, country_panel=country_panel)
 
     def _amatch_show(self, key):
         """A매치 탭 페이지 전환 — 처음이면 그 페이지를 만들어 자리표시와 바꾼다."""
@@ -14062,6 +14268,10 @@ class WorldBrowserWindow(QDialog):
         # 뜨게 해줘"] 월드컵은 대회명이 하나뿐이라(네이션스컵/지역컵과
         # 달리 여러 이름으로 안 갈림) 내부 필터 없이 버튼 하나로 바로 연다.
         tools = QHBoxLayout()
+        # [2026-10] 본선 | 예선전 | 둘 다 — 예선전은 대륙별 예선이 모두 뜬다.
+        _seg, self._wc_stage = self._seg_buttons("구분", self._STAGE_OPTIONS, "main",
+                                                 self._refresh_wc_table)
+        tools.addLayout(_seg)
         tools.addStretch()
         wc_rank_btn = QPushButton("🥇 최다 순위")
         wc_rank_btn.clicked.connect(self._on_wc_rank_leaders_clicked)
@@ -14072,16 +14282,23 @@ class WorldBrowserWindow(QDialog):
         self.wc_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.wc_tbl.verticalHeader().setVisible(False)
         self.wc_tbl.cellDoubleClicked.connect(
-            lambda r, c: self._open_intl_detail(self.wc_tbl, r, wc=True))
+            lambda r, c: self._open_intl_row(self.wc_tbl, r, wc=True))
         lay.addWidget(self.wc_tbl)
         hint = QLabel("💡 대회를 더블클릭하면 예선·조별리그·토너먼트 상세를 볼 수 있어요")
         hint.setStyleSheet("color:#666;font-size:10px;")
         lay.addWidget(hint)
 
-        rows = wb.get_wc_history()
-        self._fill_placement_table(self.wc_tbl, rows,
-                                    "아직 완료된 월드컵이 없습니다")
+        self._refresh_wc_table()
         return w
+
+    def _refresh_wc_table(self, *_a):
+        mode = self._wc_stage()
+        rows = wb.merge_finals_and_qualifiers(
+            wb.get_wc_history() if mode != "qual" else [],
+            wb.get_intl_qualifier_history("world") if mode != "main" else [], mode)
+        self._fill_placement_table(self.wc_tbl, rows,
+                                    "아직 완료된 월드컵이 없습니다" if mode == "main" else
+                                    "아직 월드컵 예선 기록이 없습니다")
 
     def _on_wc_rank_leaders_clicked(self):
         data = wb.get_wc_rank_leaders()
@@ -14089,6 +14306,62 @@ class WorldBrowserWindow(QDialog):
                                  keys=("winner", "runner_up", "third", "fourth"),
                                  key_labels=["🥇 1위", "🥈 2위", "🥉 3위", "4위"],
                                  empty_msg="아직 완료된 월드컵이 없습니다", parent=self)
+        dlg.show()
+
+    # ─────────────────────────────────────────
+    # 국제대회 페이지: 역대 U-23 올림픽 — [2026-10 신설, 신민용 확정] 월드컵 페이지와 같은 골격.
+    # 표 칸은 금·은·동메달·4위, 더블클릭하면 본선 상세(우측 본선/예선 순위·라인업, 좌측 예선 통과국).
+    # ─────────────────────────────────────────
+    _OLY_PLACEMENT_COLS = ["연도", "대회", "🥇 금메달", "🥈 은메달", "🥉 동메달", "4위"]
+
+    def _build_olympic_tab(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 8, 0, 0)
+        info = QLabel("ℹ️ U-23 올림픽은 4년마다 열려요. 겨울 휴식기에 대륙별 예선, 연말에 32개국 본선"
+                      "(조별리그 → 16강 → 8강 → 4강 → 결승·동메달 결정전)을 치릅니다. 명단은 23세 이하 18명"
+                      "(모자라면 24세 이상으로 보충)이며, A매치 기록·국적 고정에는 들어가지 않아요.")
+        info.setStyleSheet("color:#888;font-size:11px;")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+        tools = QHBoxLayout()
+        _seg, self._oly_stage = self._seg_buttons("구분", self._STAGE_OPTIONS, "main",
+                                                  self._refresh_oly_table)
+        tools.addLayout(_seg)
+        tools.addStretch()
+        oly_rank_btn = QPushButton("🥇 최다 메달")
+        oly_rank_btn.setAutoDefault(False)
+        oly_rank_btn.clicked.connect(self._on_olympic_rank_leaders_clicked)
+        tools.addWidget(oly_rank_btn)
+        lay.addLayout(tools)
+
+        self.oly_tbl = QTableWidget(0, 0)
+        self.oly_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.oly_tbl.verticalHeader().setVisible(False)
+        self.oly_tbl.cellDoubleClicked.connect(
+            lambda r, c: self._open_intl_row(self.oly_tbl, r, wc=True))
+        lay.addWidget(self.oly_tbl)
+        hint = QLabel("💡 대회를 더블클릭하면 예선·조별리그·토너먼트 상세를 볼 수 있어요")
+        hint.setStyleSheet("color:#666;font-size:10px;")
+        lay.addWidget(hint)
+        self._refresh_oly_table()
+        return w
+
+    def _refresh_oly_table(self, *_a):
+        mode = self._oly_stage()
+        rows = wb.merge_finals_and_qualifiers(
+            wb.get_olympic_history() if mode != "qual" else [],
+            wb.get_intl_qualifier_history("olympic") if mode != "main" else [], mode)
+        self._fill_placement_table(self.oly_tbl, rows,
+                                   "아직 완료된 U-23 올림픽이 없습니다" if mode == "main" else
+                                   "아직 U-23 올림픽 예선 기록이 없습니다",
+                                   col_labels=self._OLY_PLACEMENT_COLS)
+
+    def _on_olympic_rank_leaders_clicked(self):
+        dlg = RankLeadersDialog("U-23 올림픽", wb.get_olympic_rank_leaders(),
+                                 keys=("winner", "runner_up", "third", "fourth"),
+                                 key_labels=["🥇 금메달", "🥈 은메달", "🥉 동메달", "4위"],
+                                 empty_msg="아직 완료된 U-23 올림픽이 없습니다", parent=self)
         dlg.show()
 
     # ─────────────────────────────────────────
@@ -14106,19 +14379,21 @@ class WorldBrowserWindow(QDialog):
         lay.addWidget(info)
 
         filt = QHBoxLayout()
-        lbl = QLabel("대회"); lbl.setStyleSheet("color:#888;font-size:11px;")
-        self.nc_combo = QComboBox()
-        self.nc_combo.addItem(_ALL)
-        for name in wb.list_continental_cup_names():
-            self.nc_combo.addItem(name)
+        # [2026-10 신민용 요청] 대회명 콤보 → 대륙 버튼(전체 | 유럽 | 북남미 | 아시아 | 아프리카),
+        # 옆에 본선 | 예선전 | 둘 다.
+        _seg_c, self._nc_cont = self._seg_buttons(
+            "대회", [(_ALL, None), ("유럽", "유럽"), ("북남미", "아메리카"), ("아시아", "아시아"),
+                     ("아프리카", "아프리카")], None, self._refresh_nc_table)
+        _seg_s, self._nc_stage = self._seg_buttons("구분", self._STAGE_OPTIONS, "main",
+                                                   self._refresh_nc_table)
         # [2026-08 되돌림, 신민용 리포트: "나라끼리 붙는 국제대회(네이션스컵/
         # 지역컵)는 이 탭 필터 기본값이 전체가 맞다 — 유럽/코파를 기본으로
         # 하고 싶었던 건 '최다 순위' 팝업 안의 필터 얘기였다"] 탭 자체의
         # 기본 선택은 원래대로 전체(_ALL)로 되돌린다 — "유럽 기본" 요청은
         # 아래 _on_nc_rank_leaders_clicked이 여는 팝업 내부 필터로 옮겼다.
-        self.nc_combo.currentTextChanged.connect(self._refresh_nc_table)
-        filt.addWidget(lbl)
-        filt.addWidget(self.nc_combo)
+        filt.addLayout(_seg_c)
+        filt.addSpacing(14)
+        filt.addLayout(_seg_s)
         filt.addStretch()
         nc_rank_btn = QPushButton("🥇 최다 순위")
         nc_rank_btn.clicked.connect(self._on_nc_rank_leaders_clicked)
@@ -14129,7 +14404,7 @@ class WorldBrowserWindow(QDialog):
         self.nc_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.nc_tbl.verticalHeader().setVisible(False)
         self.nc_tbl.cellDoubleClicked.connect(
-            lambda r, c: self._open_intl_detail(self.nc_tbl, r, wc=False, country_panel=True))
+            lambda r, c: self._open_intl_row(self.nc_tbl, r, wc=False, country_panel=True))
         lay.addWidget(self.nc_tbl)
         hint = QLabel("💡 대회를 더블클릭하면 조별리그·토너먼트 상세를 볼 수 있어요")
         hint.setStyleSheet("color:#666;font-size:10px;")
@@ -14139,8 +14414,10 @@ class WorldBrowserWindow(QDialog):
         return w
 
     def _refresh_nc_table(self, *_a):
-        name = None if self.nc_combo.currentText() == _ALL else self.nc_combo.currentText()
-        rows = wb.get_continental_cup_history(name=name)
+        cont, mode = self._nc_cont(), self._nc_stage()
+        rows = wb.merge_finals_and_qualifiers(
+            wb.get_continental_cup_history(continent=cont) if mode != "qual" else [],
+            wb.get_intl_qualifier_history("nations", continent=cont) if mode != "main" else [], mode)
         self._fill_placement_table(self.nc_tbl, rows,
                                     "아직 완료된 대회가 없습니다\n(대회 발생 연도가 되어야 기록이 쌓입니다)")
 
@@ -14200,6 +14477,13 @@ class WorldBrowserWindow(QDialog):
         self.region_cont_combo.currentTextChanged.connect(self._refresh_region_list)
         filt.addWidget(lbl)
         filt.addWidget(self.region_cont_combo)
+        # [2026-10 신민용 요청: "지역컵도 유로(EURO)는 예선전도 뜨게"] 예선이 있는 대회(유로)만
+        # 예선 줄이 생긴다 — 다른 지역컵은 예선이 없어 본선과 같다.
+        filt.addSpacing(14)
+        _seg_s, self._region_stage = self._seg_buttons(
+            "구분", self._STAGE_OPTIONS, "main",
+            lambda: self._render_region_table(getattr(self, "_region_selected_name", None)))
+        filt.addLayout(_seg_s)
         filt.addStretch()
         # [2026-08 신설] '최다 순위' 버튼을 왼쪽 목록에서 뭘 선택했는지와
         # 무관한 위치(대륙 필터 옆)로 옮겼다 — 팝업 안에 자체 대회 필터가
@@ -14238,7 +14522,7 @@ class WorldBrowserWindow(QDialog):
         self.region_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.region_tbl.verticalHeader().setVisible(False)
         self.region_tbl.cellDoubleClicked.connect(
-            lambda r, c: self._open_intl_detail(self.region_tbl, r, wc=False, country_panel=True))
+            lambda r, c: self._open_intl_row(self.region_tbl, r, wc=False, country_panel=True))
         right_lay.addWidget(self.region_tbl)
         hint = QLabel("💡 연도를 더블클릭하면 조별리그·토너먼트 상세를 볼 수 있어요")
         hint.setStyleSheet("color:#666;font-size:10px;")
@@ -14314,10 +14598,23 @@ class WorldBrowserWindow(QDialog):
         # 순위가 떠야 한다"] 왼쪽에서 실제로 클릭한 대회명을 기억해뒀다가
         # _on_region_rank_leaders_clicked에서 기본값으로 쓴다.
         self._region_selected_name = name
+        self._render_region_table(name)
+
+    def _render_region_table(self, name):
+        if not name:
+            return
+        from constants import EURO_NAME
+        mode = self._region_stage()
         self.region_title.setText(f"🌏 {name}")
-        rows = wb.get_region_cup_history(name=name)
+        quals = []
+        if mode != "main":
+            quals = (wb.get_intl_qualifier_history("euro") if name == EURO_NAME else
+                     wb.get_intl_qualifier_history("region", cup_name=name))
+        rows = wb.merge_finals_and_qualifiers(
+            wb.get_region_cup_history(name=name) if mode != "qual" else [], quals, mode)
         self._fill_placement_table(self.region_tbl, rows,
-                                    "아직 완료된 대회가 없습니다\n(대회 발생 연도가 되어야 기록이 쌓입니다)")
+                                    "아직 완료된 대회가 없습니다\n(대회 발생 연도가 되어야 기록이 쌓입니다)"
+                                    if mode == "main" else "예선 기록이 없습니다(예선이 있는 대회는 유로뿐이에요)")
 
     def _on_region_rank_leaders_clicked(self):
         """[2026-08 수정, 신민용 리포트: "나라끼리 붙는 국제대회는 탭
@@ -14367,17 +14664,29 @@ class WorldBrowserWindow(QDialog):
     # ─────────────────────────────────────────
     # 공용 헬퍼
     # ─────────────────────────────────────────
-    def _fill_placement_table(self, tbl, rows, empty_msg):
+    def _fill_placement_table(self, tbl, rows, empty_msg, col_labels=None):
         """연도/대회명 + 1~4위(국기 포함) 공통 테이블 채우기.
         (역대 월드컵/네이션스컵/지역컵 탭이 동일한 형식이라 공용 헬퍼로 통합)"""
-        cols = ["연도", "대회", "🥇 우승", "🥈 준우승", "🥉 3위", "4위"]
+        cols = list(col_labels or ["연도", "대회", "🥇 우승", "🥈 준우승", "🥉 3위", "4위"])
         tbl.clear()
         tbl.setRowCount(len(rows))
         tbl.setColumnCount(len(cols))
         tbl.setHorizontalHeaderLabels(cols)
         tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        _qual_rows = []      # [2026-10] 예선 줄 — 1~4위 칸을 하나로 합쳐 본선 진출국을 쓴다
         for i, r in enumerate(rows):
+            if r.get("is_qual"):
+                for j, v in enumerate((str(r["year"]), r["name"])):
+                    cell = QTableWidgetItem(v)
+                    cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    cell.setForeground(QColor("#88aacc"))
+                    if j == 0:
+                        cell.setData(Qt.ItemDataRole.UserRole, r["id"])
+                        cell.setData(Qt.ItemDataRole.UserRole + 1, "qual")
+                    tbl.setItem(i, j, cell)
+                _qual_rows.append((i, r))
+                continue
             def _fmt(key):
                 nat = r.get(key) or ""
                 if not nat:
@@ -14406,6 +14715,21 @@ class WorldBrowserWindow(QDialog):
                 tbl.setItem(i, j, cell)
         self._show_empty_state(tbl, rows, empty_msg, len(cols))
         self._grow_to_fit(tbl, stretch_col=1)
+        # 예선 줄 요약은 폭을 잰 뒤에 넣는다(긴 진출국 목록이 1위 칸 폭을 늘리지 않게).
+        for i, r in _qual_rows:
+            if r.get("status") != "done":
+                txt, tip = "⏳ 예선 진행 중", ""
+            else:
+                names = [c for c, _f in r.get("passed") or []]
+                lead = (f"→ {r['target_year']} 본선 · " if r.get("target_year") != r["year"] else "")
+                txt = f"✅ {lead}본선 진출 {len(names)}개국: " + ", ".join(names) if names else "✅ 예선 종료"
+                tip = "\n".join(f"{f} {c}".strip() for c, f in r.get("passed") or [])
+            tbl.setSpan(i, 2, 1, max(1, len(cols) - 2))
+            cell = QTableWidgetItem(txt)
+            cell.setForeground(QColor("#88aacc"))
+            if tip:
+                cell.setToolTip(tip)
+            tbl.setItem(i, 2, cell)
         _enable_plain_copy(tbl)
 
     def _open_intl_detail(self, tbl, row, wc, highlight_country=None, country_panel=None):
@@ -14417,7 +14741,11 @@ class WorldBrowserWindow(QDialog):
         name_item = tbl.item(row, 1)
         title = f"{item.text()} {name_item.text() if name_item else ''}"
         detail = wb.get_intl_tournament_detail(tid)
-        qualifiers = wb.get_wc_qualifier_summary(year) if wc else None
+        qualifiers = None
+        if wc:
+            # [2026-10] U-23 올림픽 본선은 올림픽 예선 통과국(qual_results kind='olympic')
+            _qk = "olympic" if wb.get_intl_tournament_kind(tid) == "olympic" else "world"
+            qualifiers = wb.get_wc_qualifier_summary(year, kind=_qk)
         # [2026-09 신설, 신민용 요청: "역대 월드컵 창을 늘리고 우측에
         # 참가국 순위 + 클릭 시 라인업을 추가해달라"] → [2026-09 확장,
         # 신민용 요청: "네이션스컵이랑 지역컵도 같은거 만들어줘"] 참가국
@@ -15574,7 +15902,7 @@ class TournamentDetailDialog(QDialog):
         # [2026-10, 신민용 리포트: "국가 검색에서 예선전을 열면 우측에 예선 순위가 안 뜬다"]
         # 이 창이 예선 대회(wc_qual/cont_qual)로 열렸으면 처음부터 [예선 순위]를 보여주고,
         # [본선 순위]는 그 예선이 가리키는 본선 대회의 순위를 보여준다(라인업도 본선 대회 기준).
-        self._wc_is_qual = wb.get_intl_tournament_kind(self._wc_tid) in ("wc_qual", "cont_qual")
+        self._wc_is_qual = wb.get_intl_tournament_kind(self._wc_tid) in ("wc_qual", "cont_qual", "oly_qual")
         self._wc_main_tid = self._wc_tid
         if self._wc_is_qual:
             _main_tid = wb.get_intl_main_for_qualifier(self._wc_tid)
@@ -15709,7 +16037,7 @@ class TournamentDetailDialog(QDialog):
                 rank_item.setData(Qt.ItemDataRole.UserRole, row["country"])
                 rank_item.setData(self._WC_ROW_TID_ROLE, row.get("tid"))
                 rank_item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-                if str(row["placement"]).startswith("예선 탈락"):
+                if str(row["placement"]).startswith(("예선 탈락", "예선 진출 실패")):
                     rank_item.setForeground(QColor("#cc7777"))
                 name_item = QTableWidgetItem(f"{row['flag']} {row['country']}".strip())
                 name_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -15808,7 +16136,9 @@ class TournamentDetailDialog(QDialog):
         self._wc_view_tid = item.data(self._WC_ROW_TID_ROLE) if item else None
         if getattr(self, "_wc_rank_mode", "main") == "qual" and not self._wc_view_tid:
             # 컷오프 — 예선 경기를 한 번도 안 치렀으니 보여줄 라인업이 없다.
-            msg = QLabel(f"{country}: 하위 랭킹 컷오프로 예선 경기 없이 탈락해 라인업 기록이 없습니다.")
+            msg = QLabel(f"{country}: 하위 랭킹 컷오프로 예선 경기 없이 탈락해 라인업 기록이 없습니다."
+                         if item.text() != "예선 진출 실패" else   # [2026-10] U-23 올림픽
+                         f"{country}: 예선 진출 실패 — 하위 랭킹이라 예선 경기를 치르지 않아 라인업 기록이 없습니다.")
             msg.setStyleSheet("color:#888;font-size:11px;")
             msg.setWordWrap(True)
             self._wc_squad_scroll.setWidget(msg)
@@ -15857,7 +16187,7 @@ class TournamentDetailDialog(QDialog):
             "border-radius:4px;padding:3px 10px;font-size:11px;}"
             "QPushButton:hover{background:#3d3d3d;}")
         _lt = self._wc_lineup_tid()
-        _is_q = wb.get_intl_tournament_kind(_lt) in ("wc_qual", "cont_qual")
+        _is_q = wb.get_intl_tournament_kind(_lt) in ("wc_qual", "cont_qual", "oly_qual")
         title = QLabel(f"👥 {self._wc_year}년 {country}" + (" (예선)" if _is_q else ""))
         title.setStyleSheet("color:#ffcc00;font-size:13px;font-weight:bold;")
         header_row.addWidget(title)
@@ -15974,6 +16304,9 @@ class TournamentDetailDialog(QDialog):
                                            manager=_mgr, on_manager_click=_mgr_click)
         content_row.addWidget(roster, 1)
         lay.addLayout(content_row)
+        _oly_cut_lbl = _olympic_reserve_cut_label(self._wc_lineup_tid(), country)   # [2026-10] U-23 올림픽 후보 탈락 4명
+        if _oly_cut_lbl is not None:
+            lay.addWidget(_oly_cut_lbl)
         return box
 
     def _on_wc_bulk_rename(self, country):

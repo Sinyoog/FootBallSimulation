@@ -316,8 +316,13 @@ def _annotate_natteam(rows):
     ids = [r["player_id"] for r in rows]
     conn = get_conn()
     ph = ",".join("?" * len(ids))
+    # [2026-10] "국대 출신" 표시는 A매치 명단 기준 — U-23 올림픽 명단은 뺀다(올림픽이 없으면 예전 문장).
+    from competition.olympics import olympic_tournament_ids as _oly_tids
+    _oly = _oly_tids(conn)
+    _oly_x = (f" AND tournament_id NOT IN ({','.join(str(int(i)) for i in sorted(_oly))})"
+              if _oly else "")
     found = {r["player_id"] for r in conn.execute(
-        f"SELECT DISTINCT player_id FROM intl_squad WHERE player_id IN ({ph})", ids).fetchall()}
+        f"SELECT DISTINCT player_id FROM intl_squad WHERE player_id IN ({ph})" + _oly_x, ids).fetchall()}
     conn.close()
     for r in rows:
         r["has_natteam"] = r["player_id"] in found
@@ -366,6 +371,19 @@ def _natteam_filter_sql(natteam, natteam_year):
     연도, 없으면 '전체 — 어느 연도든 한 번이라도 뽑힌 적') 조합을 SQL
     조건 문자열 + 파라미터로 변환한다. natteam=False면 (조건 없음, [])를
     반환 — search_ai_players/search_retired_ai_players가 공유."""
+    if not natteam:
+        return "", []
+    # [2026-10] "국대만 보기"는 A매치 명단 기준 — U-23 올림픽 명단은 뺀다(올림픽이 없으면 예전 문장).
+    from competition.olympics import olympic_tournament_ids as _oly_tids
+    _oly = _oly_tids()
+    if _oly:
+        _x = ",".join(str(int(i)) for i in sorted(_oly))
+        if natteam_year:
+            return (" AND {alias}.id IN (SELECT s.player_id FROM intl_squad s "
+                    "JOIN intl_tournaments t ON t.id=s.tournament_id WHERE t.year=? "
+                    f"AND s.tournament_id NOT IN ({_x}))", [natteam_year])
+        return (" AND {alias}.id IN (SELECT player_id FROM intl_squad "
+                f"WHERE tournament_id NOT IN ({_x}))", [])
     if not natteam:
         return "", []
     if natteam_year:
@@ -5045,6 +5063,27 @@ def get_wc_rank_leaders():
     return _rank_leaders_from_rows(rows, ("winner", "runner_up", "third", "fourth"), "{key}")
 
 
+def get_olympic_history(limit=100):
+    """[2026-10 신설] 완료된 U-23 올림픽 본선(kind='olympic')의 연도별 금·은·동·4위.
+    대회 칸은 월드컵("월드컵")처럼 연도 없이 "U-23 올림픽" — 연도 칸과 합쳐 상세 창 제목이
+    "2000 U-23 올림픽"이 된다."""
+    conn = get_conn(); c = conn.cursor()
+    rows = [dict(r) for r in c.execute(
+        """SELECT id, year, name
+           FROM intl_tournaments
+           WHERE kind='olympic' AND status='done' AND winner != ''
+           ORDER BY year DESC, id DESC LIMIT ?""", (limit,)).fetchall()]
+    rows = _attach_placements_and_flags(rows, conn)
+    conn.close()
+    return rows
+
+
+def get_olympic_rank_leaders():
+    """[2026-10 신설] 역대 올림픽 금·은·동·4위를 가장 많이 차지한 나라 순위."""
+    rows = get_olympic_history(limit=999999)
+    return _rank_leaders_from_rows(rows, ("winner", "runner_up", "third", "fourth"), "{key}")
+
+
 # ─────────────────────────────────────────
 # 5. 역대 대륙컵(네이션스컵) 기록
 # ─────────────────────────────────────────
@@ -5066,7 +5105,7 @@ def list_continental_cup_names():
     return [r["name"] for r in rows]
 
 
-def get_continental_cup_history(name=None, limit=100):
+def get_continental_cup_history(name=None, limit=100, continent=None):
     """완료된 대륙컵(kind='continent') 대회의 연도별 1~4위 목록.
     name을 주면 그 대회(예: '아시안컵')만, 없으면 전체(여러 대륙 섞여서) 반환.
     [2026-10] 유로(EURO)는 세계기록실에서 지역컵 쪽에 표시하므로 여기서는 제외한다
@@ -5079,6 +5118,8 @@ def get_continental_cup_history(name=None, limit=100):
     params = [EURO_NAME]
     if name:
         q += " AND name=?"; params.append(name)
+    if continent:          # [2026-10] 대륙 버튼(유럽/아메리카/아시아/아프리카)
+        q += " AND continent=?"; params.append(continent)
     q += " ORDER BY year DESC, id DESC LIMIT ?"
     params.append(limit)
     rows = [dict(r) for r in c.execute(q, params).fetchall()]
@@ -5343,7 +5384,29 @@ COUNTRY_TROPHY_KIND_OPTIONS = [
     ("유로", "euro"),
     ("대륙컵", "continent"),
     ("지역컵", "region"),
+    # [2026-10] ("올림픽", "olympic")은 get_country_trophy_kind_options()가 월드컵 바로 뒤에 넣는다
+    # (OLYMPICS_ENABLED를 끄고 올림픽 기록도 없으면 예전 목록 그대로).
 ]
+
+
+def olympics_visible():
+    """[2026-10] 기록실에 올림픽 메뉴·필터를 보일지 — 스위치가 켜져 있거나, 꺼져 있어도 이미 치른
+    올림픽 기록이 남아 있으면 보인다(기록을 숨기지는 않는다). 꺼져 있고 기록도 없으면 예전 화면 그대로."""
+    try:
+        from competition import olympics as _O
+        if _O.enabled():
+            return True
+        return bool(_O.olympic_tournament_ids())
+    except Exception:
+        return False
+
+
+def get_country_trophy_kind_options():
+    """[2026-10] COUNTRY_TROPHY_KIND_OPTIONS + 올림픽(월드컵 바로 뒤)."""
+    opts = list(COUNTRY_TROPHY_KIND_OPTIONS)
+    if olympics_visible():
+        opts.insert(1, ("올림픽", "olympic"))
+    return opts
 
 
 # [2026-08 신설] 순위 필터(우승/준우승/3위/4위)에서 쓰는 표시 라벨.
@@ -5368,7 +5431,7 @@ def get_all_countries_placement_counts():
     tids = [r["id"] for r in conn.execute(
         """SELECT id FROM intl_tournaments
            WHERE status='done' AND winner != ''
-             AND kind IN ('world','continent','region')""").fetchall()]
+             AND kind IN ('world','continent','region','olympic')""").fetchall()]
     placements = _batch_placements(tids, conn)
     conn.close()
     out = {}
@@ -5468,7 +5531,7 @@ def get_country_best_non_winning_results(country_name):
 
     groups = {}
     for r in results:
-        if r["kind"] in ("wc_qual", "cont_qual"):
+        if r["kind"] in ("wc_qual", "cont_qual", "oly_qual"):
             continue   # 예선은 별개 트랙 — "본선 최고 성적" 비교 대상 아님
         if r.get("rank", 0) <= 0:
             continue   # "기록 없음" 등 비교 불가능한 성적은 제외
@@ -5539,9 +5602,13 @@ def get_country_tournament_results(country_name, limit=200):
     tids = [r["tournament_id"] for r in c.execute(
         "SELECT DISTINCT tournament_id FROM intl_entries WHERE country=?",
         (country_name,)).fetchall()]
+    # [2026-10 U-23 올림픽] 예선 명단에 들지 못한(하위 랭킹 컷오프 — 경기 없이 탈락) 올림픽 예선은
+    # intl_entries에 이 나라 행이 없다 — "예선 진출 실패" 줄을 따로 만들어 끼운다(예선에서 경기를
+    # 치르고 떨어진 "예선 탈락"과 구분). 올림픽 예선이 하나도 없으면 빈 리스트(예전과 같은 결과).
+    _oly_cut = _oly_qual_not_entered_rows(c, country_name, set(tids))
     if not tids:
         conn.close()
-        return []
+        return _oly_cut[:limit]
     ph = ",".join("?" * len(tids))
     tours = [dict(r) for r in c.execute(
         f"""SELECT id, year, kind, name, continent FROM intl_tournaments
@@ -5549,7 +5616,7 @@ def get_country_tournament_results(country_name, limit=200):
             ORDER BY year DESC, id DESC LIMIT ?""", tids + [limit]).fetchall()]
     if not tours:
         conn.close()
-        return []
+        return _oly_cut[:limit]
     t_ids = [t["id"] for t in tours]
     placements = _batch_placements(t_ids, conn)
 
@@ -5610,6 +5677,17 @@ def get_country_tournament_results(country_name, limit=200):
                 "AND continent=? AND country=? LIMIT 1",
                 (t["year"], _qk, _cont, country_name)).fetchone()
             cont_qualified_by_tid[t["id"]] = bool(qr)
+
+    # [2026-10 U-23 올림픽] 올림픽 예선(oly_qual) 통과 여부 — 월드컵 예선과 같은 방식으로
+    # qual_results(kind='olympic')를 본다.
+    oly_qualified_by_tid = {}
+    for t in tours:
+        if t["kind"] != "oly_qual":
+            continue
+        qr = c.execute(
+            "SELECT 1 FROM qual_results WHERE target_year=? AND kind='olympic' "
+            "AND country=? LIMIT 1", (t["year"], country_name)).fetchone()
+        oly_qualified_by_tid[t["id"]] = bool(qr)
 
     # [2026-09 신설, 신민용 리포트: "랭킹 평가전 나머지 밴드가 국가 검색에
     # 항상 '조별리그 탈락'으로만 뜬다"] power_eval_extra(라운드로빈만, KO
@@ -5680,6 +5758,18 @@ def get_country_tournament_results(country_name, limit=200):
                     result, tier = "조별리그 탈락", 1
                 else:
                     result, tier = "기록 없음", 0
+        elif t["kind"] == "oly_qual":
+            # [2026-10] U-23 올림픽 예선 — 경기를 치르고 떨어지면 "예선 탈락"(진출 실패와 구분).
+            if oly_qualified_by_tid.get(t["id"]):
+                result, tier = "🎫 본선 진출", 2
+            else:
+                stages = stages_by_tid.get(t["id"], set())
+                if "qual_po" in stages:
+                    result, tier = "예선 탈락(PO)", 1
+                elif "qual_group" in stages or "qual_group2" in stages:
+                    result, tier = "예선 탈락(조별)", 1
+                else:
+                    result, tier = "예선 탈락", 1
         elif t["kind"] == "power_eval_extra":
             # [2026-09 신설] 라운드로빈만 하는 나머지 밴드 — 승자 개념이
             # 없으므로 승점 순위를 그대로 결과로 보여준다.
@@ -5691,11 +5781,11 @@ def get_country_tournament_results(country_name, limit=200):
             else:
                 result, tier = "기록 없음", 0
         elif pl.get("winner") == country_name:
-            result, tier, rank = "🥇 우승", 5, _PLACEMENT_RANK[5]
+            result, tier, rank = ("🥇 금메달" if t["kind"] == "olympic" else "🥇 우승"), 5, _PLACEMENT_RANK[5]
         elif pl.get("runner_up") == country_name:
-            result, tier, rank = "🥈 준우승", 4, _PLACEMENT_RANK[4]
+            result, tier, rank = ("🥈 은메달" if t["kind"] == "olympic" else "🥈 준우승"), 4, _PLACEMENT_RANK[4]
         elif pl.get("third") == country_name:
-            result, tier, rank = "🥉 3위", 3, _PLACEMENT_RANK[3]
+            result, tier, rank = ("🥉 동메달" if t["kind"] == "olympic" else "🥉 3위"), 3, _PLACEMENT_RANK[3]
         elif pl.get("fourth") == country_name:
             result, tier, rank = "4위", 2, _PLACEMENT_RANK[2]
         else:
@@ -5730,6 +5820,36 @@ def get_country_tournament_results(country_name, limit=200):
                      # 아니라 "이 팀이 실제로 거기까지 가며 치른" 경기 수라,
                      # 조별탈락이면 3, 16강에서 탈락이면 3+1=4가 된다.
                      "games": rec["w"] + rec["d"] + rec["l"]})
+    if _oly_cut:
+        out = sorted(out + _oly_cut, key=lambda x: (x["year"], x["id"]), reverse=True)[:limit]
+    return out
+
+
+def _oly_qual_not_entered_rows(c, country_name, entered_tids):
+    """[2026-10 U-23 올림픽] 이 나라가 속한 연맹의 끝난 올림픽 예선 중 예선 명단에 없던(하위 랭킹
+    컷오프로 경기 없이 탈락) 대회 → "예선 진출 실패" 줄. 본선 직행은 없으므로(개최국·자동 진출
+    없음) 예선 명단에 없으면 곧 진출 실패다. 올림픽 예선이 없으면 빈 리스트."""
+    try:
+        quals = c.execute(
+            "SELECT id, year, kind, name, continent FROM intl_tournaments "
+            "WHERE kind='oly_qual' AND status='done'").fetchall()
+    except Exception:
+        return []
+    if not quals:
+        return []
+    from constants import CONFEDERATIONS
+    r = c.execute("SELECT continent FROM countries WHERE name=?", (country_name,)).fetchone()
+    cont = (r["continent"] if r else "") or ""
+    out = []
+    for q in quals:
+        if q["id"] in entered_tids:
+            continue
+        if cont not in CONFEDERATIONS.get(q["continent"] or "", [q["continent"]]):
+            continue
+        out.append({"id": q["id"], "year": q["year"], "kind": "oly_qual",
+                    "effective_kind": "oly_qual", "name": q["name"] or "",
+                    "result": "예선 진출 실패", "tier": 0, "rank": 0,
+                    "record": "-", "games": 0, "not_entered": True})
     return out
 
 
@@ -5859,6 +5979,24 @@ def get_player_intl_records(player_id, limit=100):
                         if (r["tournament_id"], r["country"]) not in _in_squad]
         except Exception:
             cut_rows = []
+    # [2026-10 U-23 올림픽] 최종 18명 바로 아래 후보 탈락 4명(oly_reserve_cut — 내 선수는
+    # player_id 0). 출전·메달·병역 혜택 없이 "후보탈락" 줄만 남긴다. 표가 없으면(꺼짐) 없음.
+    try:
+        _in_squad2 = {(r["tournament_id"], r["country"]) for r in squad_rows}
+        for r in c.execute(
+                """SELECT o.tournament_id, o.country, o.position, o.category, o.rank,
+                          t.year, t.kind, t.name, t.continent
+                   FROM oly_reserve_cut o JOIN intl_tournaments t ON t.id = o.tournament_id
+                   WHERE o.player_id=?
+                   ORDER BY t.year DESC, t.id DESC LIMIT ?""",
+                (0 if player_id == MY_PLAYER_ID else player_id, limit)).fetchall():
+            if (r["tournament_id"], r["country"]) in _in_squad2:
+                continue
+            d = dict(r)
+            d["bucket"], d["oly_reserve"] = d.pop("category"), True
+            cut_rows.append(d)
+    except Exception:
+        pass
     conn.close()
     if not squad_rows and not cut_rows:
         return []
@@ -5953,6 +6091,7 @@ def get_player_intl_records(player_id, limit=100):
                     "record": "", "appearances": None, "position": r.get("position") or None,
                     "total_games": 0, "callup_cut": True,
                     "callup_bucket": r.get("bucket"), "callup_rank": r.get("rank"),
+                    **({"oly_reserve": True} if r.get("oly_reserve") else {}),   # [2026-10] 올림픽 후보 탈락만 키를 단다
                     "rating": 0, "goals": 0, "assists": 0, "clean_sheets": 0,
                     "saves": 0, "goals_conceded": 0})
     out.sort(key=lambda x: (x["year"], x["id"]), reverse=True)
@@ -6020,7 +6159,8 @@ def get_country_year_callup_tournaments(country_name, year):
                WHERE s.country=? AND t.year=? ORDER BY t.id""", (country_name, year)).fetchall()]
     finally:
         conn.close()
-    return [(r["id"], _country_result_name(r)) for r in rows]
+    return [(r["id"], _country_result_name(r)) for r in rows
+            if r["kind"] not in ("oly_qual", "olympic")]   # [2026-10] 올림픽 명단은 성인 대표팀 소집이 아니다
 
 
 def _country_result_name(t):
@@ -6186,7 +6326,7 @@ def get_intl_tournament_detail(tournament_id):
     # tournament_results 등 호출부가 이미 done만 필터링) 'direct'/'po_ok'
     # 인 나라만 확정 진출로 본다.
     qualified = set()
-    if t_row and t_row["kind"] in ("wc_qual", "cont_qual"):
+    if t_row and t_row["kind"] in ("wc_qual", "cont_qual", "oly_qual"):
         from intl_engine import get_qual_advance_status
         status_map = get_qual_advance_status(dict(t_row))
         qualified = {nat for nat, s in status_map.items() if s in ("direct", "po_ok")}
@@ -6238,6 +6378,7 @@ def get_wc_country_placements(tournament_id):
     "rank_order"(정렬 전용, 작을수록 상위)}, ...] — rank_order/country
     순으로 정렬돼 있다. 참가 기록 자체가 없으면 빈 리스트."""
     detail = get_intl_tournament_detail(tournament_id)
+    _is_oly_main = get_intl_tournament_kind(tournament_id) == "olympic"   # [2026-10] U-23 올림픽
     groups = detail.get("groups") or {}
     groups2 = detail.get("groups2") or {}
     knockout = detail.get("knockout") or []
@@ -6280,13 +6421,13 @@ def get_wc_country_placements(tournament_id):
     final_matches = ko_by_stage.get("F") or []
     if final_matches:
         w, l = _intl_match_winner_loser(final_matches[0])
-        _set(w, 1, "🥇 우승")
-        _set(l, 2, "🥈 준우승")
+        _set(w, 1, "🥇 금메달" if _is_oly_main else "🥇 우승")
+        _set(l, 2, "🥈 은메달" if _is_oly_main else "🥈 준우승")
 
     tp_matches = ko_by_stage.get("TP") or []
     if tp_matches:
         w, l = _intl_match_winner_loser(tp_matches[0])
-        _set(w, 3, "🥉 3위")
+        _set(w, 3, "🥉 동메달" if _is_oly_main else "🥉 3위")
         _set(l, 4, "4위")
     else:
         # 3·4위전이 따로 없으면(대회 룰상 생략 등) 준결승 패자 둘을
@@ -6696,7 +6837,59 @@ def get_country_tournament_squad(tournament_id, country_name):
     return {"starters": starters, "bench": bench, "approx": approx}
 
 
-def get_wc_qualifier_summary(wc_year):
+def get_olympic_reserve_cut(tournament_id, country_name):
+    """[2026-10 U-23 올림픽] 그 대회·나라의 후보 탈락 4명(선발 당시 저장, 순위 순).
+    반환: [{"id", "display_name", "position", "category", "rank", "ovr", "club", "retired"}] —
+    내 선수(player_id 0)는 id=MY_PLAYER_ID. 올림픽 대회가 아니거나 기록이 없으면 []."""
+    from constants import ai_player_code
+    from database import get_ai_player_custom_names
+    conn = get_conn()
+    try:
+        try:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT rank, player_id, position, category FROM oly_reserve_cut "
+                "WHERE tournament_id=? AND country=? ORDER BY rank", (tournament_id, country_name))]
+        except Exception:
+            return []
+        if not rows:
+            return []
+        ids = [r["player_id"] for r in rows if r["player_id"]]
+        info = {}
+        if ids:
+            ph = ",".join("?" * len(ids))
+            for r in conn.execute(f"SELECT ap.id, ap.ovr, t.name AS club FROM ai_players ap "
+                                  f"LEFT JOIN teams t ON t.id = ap.team_id WHERE ap.id IN ({ph})", ids):
+                info[r["id"]] = dict(r)
+            _miss = [i for i in ids if i not in info]
+            if _miss:
+                ph2 = ",".join("?" * len(_miss))
+                for r in conn.execute(f"SELECT id, ovr, last_team_name AS club FROM ai_players_retired "
+                                      f"WHERE id IN ({ph2})", _miss):
+                    info[r["id"]] = dict(r, retired=True)
+        me = None
+        if any(not r["player_id"] for r in rows):
+            me = conn.execute("SELECT name, ovr FROM my_player WHERE id=1").fetchone()
+    finally:
+        conn.close()
+    names = get_ai_player_custom_names(ids) if ids else {}
+    out = []
+    for r in rows:
+        pid = r["player_id"]
+        if not pid:
+            out.append({"id": MY_PLAYER_ID, "display_name": (me["name"] if me else "") or "나",
+                        "position": r["position"] or "", "category": r["category"] or "",
+                        "rank": r["rank"], "ovr": me["ovr"] if me else None, "club": "",
+                        "retired": False})
+            continue
+        inf = info.get(pid, {})
+        out.append({"id": pid, "display_name": names.get(pid) or ai_player_code(pid),
+                    "position": r["position"] or "", "category": r["category"] or "",
+                    "rank": r["rank"], "ovr": inf.get("ovr"), "club": inf.get("club") or "",
+                    "retired": bool(inf.get("retired"))})
+    return out
+
+
+def get_wc_qualifier_summary(wc_year, kind="world"):
     """이 월드컵(연도)의 대륙별 예선 통과국 목록 (qual_results 기반 요약).
     [주의] 조별리그 단위 상세가 아니라 '최종 통과국 명단'까지만 제공한다.
     예선 자체도 intl_matches에 그룹별로 남아있긴 하지만, 본선처럼
@@ -6706,8 +6899,8 @@ def get_wc_qualifier_summary(wc_year):
     conn = get_conn(); c = conn.cursor()
     rows = [dict(r) for r in c.execute(
         "SELECT continent, country, flag, grade FROM qual_results "
-        "WHERE target_year=? AND kind='world' ORDER BY continent, country",
-        (wc_year,)).fetchall()]
+        "WHERE target_year=? AND kind=? ORDER BY continent, country",
+        (wc_year, kind)).fetchall()]   # [2026-10] kind='olympic'이면 U-23 올림픽 예선 통과국
     conn.close()
     by_conf = {}
     for r in rows:
@@ -6738,6 +6931,102 @@ def get_intl_tournament_kind(tid):
         conn.close()
 
 
+def _qual_passed(conn, year, kind, continent):
+    """[2026-10] 예선 대회(연도·종류·연맹) → 통과국 이름 목록(qual_results, 저장 순서).
+    wc_qual → 같은 해 월드컵, oly_qual → 같은 해 올림픽, 유로 예선 → 같은 해 유로,
+    네이션스 예선(짝수 해) → 다음 해 본선(구세이브의 같은 해 방식도 받는다)."""
+    cont = continent or ""
+    if kind == "wc_qual":
+        keys = [("world", year)]
+    elif kind == "oly_qual":
+        keys = [("olympic", year)]
+    else:
+        ek = _effective_kind(kind, None, year, continent)
+        keys = ([("continent", year)] if ek == "euro_qual" else
+                [("nations", year + 1), ("continent", year)])
+    for k, ty in keys:
+        rows = [r["country"] for r in conn.execute(
+            "SELECT country FROM qual_results WHERE target_year=? AND kind=? AND "
+            "COALESCE(continent,'')=? ORDER BY id", (ty, k, cont))]
+        if not rows and k in ("world", "olympic"):
+            continue
+        if rows:
+            return rows
+    return []
+
+
+_QUAL_GROUPS = {
+    # 화면 묶음 → (예선 kind, 유효 종류 조건)
+    "world": ("wc_qual", None),
+    "olympic": ("oly_qual", None),
+    "nations": ("cont_qual", ("cont_qual_eu", "cont_qual_am", "cont_qual_as", "cont_qual_af")),
+    "euro": ("cont_qual", ("euro_qual",)),
+    "region": ("cont_qual", ("region_qual",)),
+}
+_NATIONS_QUAL_CONT = {"cont_qual_eu": "유럽", "cont_qual_am": "아메리카",
+                      "cont_qual_as": "아시아", "cont_qual_af": "아프리카"}
+
+
+def get_intl_qualifier_history(group, continent=None, cup_name=None, limit=500):
+    """[2026-10 신설, 신민용 요청: "국제대회 기록실에 예선전도 표시 — 본선 | 예선전 | 둘 다"]
+    group: "world"(월드컵 예선, 대륙별) / "olympic" / "nations"(네이션스컵 예선) /
+    "euro"(유로 예선) / "region"(구세이브의 지역컵 예선 — cup_name으로 좁힌다).
+    continent: 네이션스 예선 대륙 버튼(유럽/아메리카/아시아/아프리카).
+    반환: [{id, year, name(표시용, 연도 뺀 이름), kind, continent, status, is_qual: True,
+            target_year, passed: [(나라, 국기)], conf_order}] — 최신 연도 먼저, 같은 해는 연맹 순."""
+    from constants import EURO_NAME
+    if group not in _QUAL_GROUPS:
+        return []
+    qkind, eks = _QUAL_GROUPS[group]
+    conn = get_conn()
+    try:
+        flags = {r["name"]: r["flag"] or "" for r in conn.execute("SELECT name, flag FROM countries")}
+        out = []
+        for r in conn.execute("SELECT id, year, name, kind, continent, status FROM intl_tournaments "
+                              "WHERE kind=? ORDER BY year DESC, id", (qkind,)).fetchall():
+            ek = _effective_kind(r["kind"], r["name"], r["year"], r["continent"])
+            if eks and ek not in eks:
+                continue
+            if group == "nations" and continent and _NATIONS_QUAL_CONT.get(ek) != continent:
+                continue
+            if group == "region" and cup_name and cup_name not in (r["name"] or ""):
+                continue
+            name = r["name"] or ""
+            if name.startswith(f"{r['year']} "):
+                name = name[len(f"{r['year']} "):]
+            target = r["year"]
+            if ek == "euro_qual":
+                name = f"{EURO_NAME} 예선"      # 저장 이름이 "유럽 네이션스컵 예선"인 세이브도 유로로
+            elif group == "nations":
+                main = get_intl_main_for_qualifier(r["id"])
+                if main:
+                    target = conn.execute("SELECT year FROM intl_tournaments WHERE id=?",
+                                          (main,)).fetchone()["year"]
+                else:
+                    target = r["year"] + 1
+            passed = (_qual_passed(conn, r["year"], r["kind"], r["continent"])
+                      if r["status"] == "done" else [])
+            out.append({"id": r["id"], "year": r["year"], "name": name, "kind": r["kind"],
+                        "continent": r["continent"] or "", "status": r["status"], "is_qual": True,
+                        "target_year": target, "passed": [(c, flags.get(c, "")) for c in passed],
+                        "conf_order": _QUAL_CONF_ORDER.get(r["continent"] or "", 9)})
+            if limit and len(out) >= limit:
+                break
+        return out
+    finally:
+        conn.close()
+
+
+def merge_finals_and_qualifiers(finals, quals, mode):
+    """[2026-10] 본선 | 예선전 | 둘 다 — mode: "main" / "qual" / "both". 최신 연도 먼저, 같은 해는
+    본선 → 예선(연맹 순)."""
+    rows = (list(finals) if mode in ("main", "both") else []) + \
+           (list(quals) if mode in ("qual", "both") else [])
+    rows.sort(key=lambda r: (-r["year"], 1 if r.get("is_qual") else 0, r.get("conf_order", 0),
+                             r.get("id", 0)))
+    return rows
+
+
 def get_intl_main_for_qualifier(qual_tid):
     """[2026-10] 예선 대회 id → 그 예선이 가리키는 본선 대회 id(아직 본선이 없으면 None).
     wc_qual → 같은 해 월드컵, cont_qual → 같은 해·같은 대륙 대륙컵(유로/유럽 네이션스컵).
@@ -6746,15 +7035,34 @@ def get_intl_main_for_qualifier(qual_tid):
     try:
         q = conn.execute("SELECT year, kind, continent FROM intl_tournaments WHERE id=?",
                          (qual_tid,)).fetchone()
-        if not q or q["kind"] not in ("wc_qual", "cont_qual"):
+        if not q or q["kind"] not in ("wc_qual", "cont_qual", "oly_qual"):
             return None
-        if q["kind"] == "wc_qual":
+        if q["kind"] == "oly_qual":   # [2026-10] U-23 올림픽 예선 → 같은 해 올림픽 본선
+            r = conn.execute("SELECT id FROM intl_tournaments WHERE year=? AND kind='olympic' "
+                             "ORDER BY id LIMIT 1", (q["year"],)).fetchone()
+        elif q["kind"] == "wc_qual":
             r = conn.execute("SELECT id FROM intl_tournaments WHERE year=? AND kind='world' "
                              "ORDER BY id LIMIT 1", (q["year"],)).fetchone()
         else:
-            r = conn.execute("SELECT id FROM intl_tournaments WHERE year=? AND kind IN "
-                             "('continent','region') AND continent=? ORDER BY id LIMIT 1",
-                             (q["year"], q["continent"])).fetchone()
+            # [2026-10 버그수정] 같은 해·같은 대륙 첫 대회를 그냥 집으면 유로 예선(유로 해)이
+            # 같은 해 유럽 네이션스컵 본선으로, 네이션스 예선(짝수 해)은 본선(다음 해)을 못 찾았다.
+            from constants import EURO_NAME
+            ek = _effective_kind(q["kind"], None, q["year"], q["continent"])
+            r = None
+            if ek == "euro_qual":
+                r = conn.execute("SELECT id FROM intl_tournaments WHERE year=? AND kind='continent' "
+                                 "AND name=? ORDER BY id LIMIT 1", (q["year"], EURO_NAME)).fetchone()
+            elif ek in ("cont_qual_eu", "cont_qual_am", "cont_qual_as", "cont_qual_af"):
+                for yy in (q["year"] + 1, q["year"]):
+                    r = conn.execute("SELECT id FROM intl_tournaments WHERE year=? AND kind='continent' "
+                                     "AND continent=? AND name<>? ORDER BY id LIMIT 1",
+                                     (yy, q["continent"], EURO_NAME)).fetchone()
+                    if r:
+                        break
+            if r is None:
+                r = conn.execute("SELECT id FROM intl_tournaments WHERE year=? AND kind IN "
+                                 "('continent','region') AND continent=? ORDER BY id LIMIT 1",
+                                 (q["year"], q["continent"])).fetchone()
         return r["id"] if r else None
     finally:
         conn.close()
@@ -6777,20 +7085,18 @@ def get_intl_qualifier_placements(tournament_id):
         if not t:
             return []
         main_override = None
-        if t["kind"] in ("wc_qual", "cont_qual"):
+        _oly = t["kind"] in ("oly_qual", "olympic")   # [2026-10] U-23 올림픽
+        if t["kind"] in ("wc_qual", "cont_qual", "oly_qual"):
             quals = [{"id": tournament_id, "continent": t["continent"]}]
             _main_tid = get_intl_main_for_qualifier(tournament_id)
             if _main_tid:
                 tournament_id = _main_tid
             else:
-                _qk = "world" if t["kind"] == "wc_qual" else "continent"
-                main_override = {r["country"] for r in conn.execute(
-                    "SELECT country FROM qual_results WHERE target_year=? AND kind=?",
-                    (t["year"], _qk))}
-        elif t["kind"] == "world":
+                main_override = set(_qual_passed(conn, t["year"], t["kind"], t["continent"]))
+        elif t["kind"] in ("world", "olympic"):
             quals = conn.execute(
-                "SELECT id, continent FROM intl_tournaments WHERE year=? AND kind='wc_qual' "
-                "ORDER BY id", (t["year"],)).fetchall()
+                "SELECT id, continent FROM intl_tournaments WHERE year=? AND kind=? "
+                "ORDER BY id", (t["year"], "oly_qual" if _oly else "wc_qual")).fetchall()
         elif t["kind"] in ("continent", "region") and t["continent"]:
             quals = conn.execute(
                 "SELECT id, continent FROM intl_tournaments WHERE year=? AND kind='cont_qual' "
@@ -6843,7 +7149,9 @@ def get_intl_qualifier_placements(tournament_id):
             conts = set(CONFEDERATIONS.get(conf, [conf]))
             for name, (_flag, cont) in info.items():
                 if cont in conts and name not in entrants and name not in main:
-                    out.setdefault(name, (5, "예선 탈락(컷오프)", conf, [0, 0, 0], None))
+                    # [2026-10] 올림픽은 "예선 진출 실패"(경기 없이 컷오프)와 "예선 탈락"을 구분해 적는다
+                    out.setdefault(name, (5, "예선 진출 실패" if _oly else "예선 탈락(컷오프)",
+                                          conf, [0, 0, 0], None))
         rows = []
         for c, (order, label, conf, r, qid) in out.items():
             flag, cont = info.get(c, ("", ""))
@@ -8031,6 +8339,32 @@ def get_team_manager_for_year(team_id, year, conn=None):
             conn.close()
 
 
+def _u23_manager_brief(conn, tournament_id, country_name, year, country_id):
+    """[2026-10 U-23 올림픽 2단계] 올림픽 대회에서 그 나라를 맡은 U-23 감독 요약(없으면 None)."""
+    try:
+        from competition.oly_manager import manager_for_tournament
+        mid = manager_for_tournament(tournament_id, country_name, conn)
+    except Exception:
+        mid = 0
+    if not mid:
+        return None
+    brief = get_manager_brief(mid, country_name, year, conn)
+    if brief:
+        try:
+            ten = conn.execute(
+                "SELECT start_year, end_year, end_reason FROM oly_team_managers "
+                "WHERE manager_id=? AND country_id=? AND start_year<=? ORDER BY id DESC LIMIT 1",
+                (mid, country_id, year)).fetchone()
+        except Exception:
+            ten = None
+        brief.update(tenure_start=ten["start_year"] if ten else None,
+                     tenure_end=ten["end_year"] if ten else None,
+                     end_reason=(ten["end_reason"] or "") if ten else "",
+                     job_kind="u23")
+    return brief
+
+
+
 def get_national_manager_for_tournament(tournament_id, country_name, conn=None):
     """국제대회 한 대회에서 그 나라 대표팀을 맡은 감독 요약 또는 None.
 
@@ -8043,7 +8377,7 @@ def get_national_manager_for_tournament(tournament_id, country_name, conn=None):
     conn = conn or get_conn()
     try:
         try:
-            t = conn.execute("SELECT year FROM intl_tournaments WHERE id = ?",
+            t = conn.execute("SELECT year, kind FROM intl_tournaments WHERE id = ?",
                              (tournament_id,)).fetchone()
             crow = conn.execute("SELECT id FROM countries WHERE name = ?",
                                 (country_name,)).fetchone()
@@ -8051,6 +8385,10 @@ def get_national_manager_for_tournament(tournament_id, country_name, conn=None):
             return None
         if not t or not crow:
             return None
+        if t["kind"] in ("oly_qual", "olympic"):
+            # [2026-10] U-23 올림픽은 성인 대표팀 감독이 아니라 U-23 감독(competition/oly_manager —
+            # 명단을 뽑을 때 intl_formations에 박아 둔 감독, 없으면 그 해 U-23 재임).
+            return _u23_manager_brief(conn, tournament_id, country_name, int(t["year"]), crow["id"])
         year, cid = int(t["year"]), crow["id"]
         mid = None
         try:
@@ -8100,8 +8438,10 @@ def get_national_manager_for_tournament(tournament_id, country_name, conn=None):
 MANAGER_END_REASON_KO = {
     "sacked": "경질", "contract_end": "계약 만료", "moved": "이직",
     "moved_to_nation": "대표팀 이동", "retired": "은퇴",
+    "promoted": "승진 이동",       # [2026-10] U-23 감독이 클럽·성인 대표팀으로 옮김
 }
-MANAGER_STATUS_KO = {"club": "클럽", "nation": "대표팀", "free": "무직", "retired": "은퇴"}
+MANAGER_STATUS_KO = {"club": "클럽", "nation": "대표팀", "free": "무직", "retired": "은퇴",
+                     "u23": "U-23 대표팀"}   # [2026-10] U-23 올림픽 감독
 
 
 def _mgr_home_country(country):
@@ -8135,7 +8475,7 @@ def search_managers(name_query=None, name_mode="all", continent=None, nat_countr
           확정: 저장하지 않고 조회 시 계산. 비교 대상 나라는 경력+연도 검색이면
           그 해 맡은 팀의 나라, 아니면 지금 맡은 팀/대표팀의 나라. 맡은 곳이
           없는(무직·은퇴) 감독은 판정 대상이 아니라 이 필터를 켜면 빠진다.
-      natteam / natteam_year : 대표팀 감독을 한 번이라도(그 해에) 맡은 감독
+      natteam / natteam_year : 대표팀 감독을 한 번이라도(그 해에) 맡은 감독 — U-23 대표팀 포함
       status : "active"(현직 — 클럽·대표팀) | "free"(무직) | "retired" | "all"
       grade : 지금 맡은 클럽 리그의 등급(list_grades와 같은 리그 등급 기준)
       style_* / manager_type : 스타일 4종 일치
@@ -8155,7 +8495,11 @@ def search_managers(name_query=None, name_mode="all", continent=None, nat_countr
             # [2026-10 성능] 상태 필터는 아래 순회의 판정(st = 은퇴면 'retired', 아니면 status)과
             # 같은 뜻으로 DB에서 먼저 거른다 — 결과는 같고 정렬·전달할 행만 준다.
             _st_where = {
-                "active": "WHERE COALESCE(m.retired, 0) = 0 AND m.status IN ('club', 'nation')",
+                # [2026-10] U-23 감독(status 'u23')도 현직 — 올림픽 기록이 있는 세이브에서만 조건에
+                # 넣는다(꺼져 있고 기록도 없으면 예전 SQL 그대로).
+                "active": ("WHERE COALESCE(m.retired, 0) = 0 AND m.status IN ('club', 'nation', 'u23')"
+                           if olympics_visible() else
+                           "WHERE COALESCE(m.retired, 0) = 0 AND m.status IN ('club', 'nation')"),
                 "free": "WHERE COALESCE(m.retired, 0) = 0 AND m.status = 'free'",
                 "retired": "WHERE (COALESCE(m.retired, 0) != 0 OR m.status = 'retired')",
             }.get(status, "")
@@ -8196,6 +8540,19 @@ def search_managers(name_query=None, name_mode="all", continent=None, nat_countr
             "SELECT manager_id, country_id FROM national_team_managers WHERE end_year IS NULL")}
         nat_ever = {r[0] for r in conn.execute(
             "SELECT DISTINCT manager_id FROM national_team_managers")}
+        u23_now = {}       # [2026-10] 현직 U-23 감독 → 나라 id(표가 없으면 빈 값)
+        u23_rows = []      # [2026-10 신민용 요청: "올림픽 감독도 대표팀 감독"] U-23 재임 전체
+        if olympics_visible():
+            try:
+                u23_now = {r[0]: r[1] for r in conn.execute(
+                    "SELECT manager_id, country_id FROM oly_team_managers WHERE end_year IS NULL")}
+                u23_rows = [dict(r) for r in conn.execute(
+                    "SELECT country_id, manager_id, start_year, end_year, contract_log "
+                    "FROM oly_team_managers").fetchall()]
+            except Exception:
+                u23_now, u23_rows = {}, []
+        # U-23 감독도 대표팀 감독이다 — "대표팀 감독" 필터·이름 색(has_natteam)에 같이 넣는다.
+        nat_ever |= {r["manager_id"] for r in u23_rows}
 
         # 경력 기준 클럽 필터 → {manager_id: 그때 맡은 팀의 나라 id}
         career_hit = None
@@ -8244,6 +8601,18 @@ def search_managers(name_query=None, name_mode="all", continent=None, nat_countr
                         if not natteam_year or (r["start_year"] <= natteam_year and (
                                 r["end_year"] is None or r["end_year"] >= natteam_year)):
                             nat_hit.add(r["manager_id"])
+                # [2026-10] U-23 대표팀 — 연도는 그 해 실제로 지휘했는지로 본다(연말에 막 부임한
+                # 감독은 다음 해부터, 처음 심은 올림픽 해 감독은 그 해부터 — oly_manager와 같은 규칙).
+                if u23_rows:
+                    from competition.oly_manager import _coached_this_year as _u23_coached
+                    for r in u23_rows:
+                        if natteam_country_id and r["country_id"] != natteam_country_id:
+                            continue
+                        if natteam_year and not (
+                                _u23_coached(r, natteam_year)
+                                and (r["end_year"] is None or r["end_year"] >= natteam_year)):
+                            continue
+                        nat_hit.add(r["manager_id"])
             else:
                 nat_hit = set(nat_ever)
 
@@ -8281,7 +8650,7 @@ def search_managers(name_query=None, name_mode="all", continent=None, nat_countr
         for m in _iter_mgrs():
             mid = m["id"]
             st = "retired" if m["retired"] else (m["status"] or "")
-            if status == "active" and st not in ("club", "nation"):
+            if status == "active" and st not in ("club", "nation", "u23"):
                 continue
             if status == "free" and st != "free":
                 continue
@@ -8342,6 +8711,10 @@ def search_managers(name_query=None, name_mode="all", continent=None, nat_countr
             elif nat_cid_now:
                 job_cname = countries.get(nat_cid_now, {}).get("name", "")
                 job_text = f"🌍 {job_cname} 대표팀"
+                tier = None
+            elif u23_now.get(mid):
+                job_cname = countries.get(u23_now[mid], {}).get("name", "")
+                job_text = f"🏅 {job_cname} U-23 대표팀"
                 tier = None
             else:
                 job_cname, tier = "", None
@@ -8483,10 +8856,85 @@ def _manager_current_job(conn, manager_id, retired):
             current = f"🌍 {cur_nat[0]} 대표팀"
             cur_team = f"🌍 {cur_nat[0]} 대표팀"
             cur_team_name, cur_team_country, cur_kind = f"{cur_nat[0]} 대표팀", cur_nat[0], "nation"
+        else:
+            # [2026-10 U-23 올림픽 2단계] U-23 대표팀 감독
+            try:
+                cur_u = conn.execute(
+                    """SELECT c.name FROM oly_team_managers o JOIN countries c
+                       ON c.id = o.country_id WHERE o.manager_id = ? AND o.end_year IS NULL
+                       ORDER BY o.id DESC LIMIT 1""", (manager_id,)).fetchone()
+            except Exception:
+                cur_u = None
+            if cur_u:
+                current = f"🏅 {cur_u[0]} U-23 대표팀"
+                cur_team = current
+                cur_team_name, cur_team_country, cur_kind = f"{cur_u[0]} U-23 대표팀", cur_u[0], "u23"
     return {"current_job": current, "current_team": cur_team,
             "current_team_name": cur_team_name,
             "current_team_country": cur_team_country,
             "current_kind": cur_kind}
+
+
+def _manager_u23_rows(conn, manager_id, home_nat, cur_year):
+    """[2026-10 U-23 올림픽 2단계] 감독 상세 U-23 대표팀 줄. tournaments = [(대회명, 결과, 목표)] —
+    올림픽 해에만 있다(본선에 나갔으면 본선만, 못 나갔으면 예선 결과·예선 진출 실패)."""
+    try:
+        tens = conn.execute(
+            """SELECT o.id, o.country_id, o.start_year, o.end_year, o.end_reason,
+                      c.name AS cname, COALESCE(o.contract_log, '') AS contract_log
+               FROM oly_team_managers o JOIN countries c ON c.id = o.country_id
+               WHERE o.manager_id = ? ORDER BY o.start_year, o.id""", (manager_id,)).fetchall()
+    except Exception:
+        return []
+    if not tens:
+        return []
+    try:
+        objs = {(r[0], int(r[1])): r[2] for r in conn.execute(
+            "SELECT country, year, objective FROM oly_objectives WHERE manager_id=?", (manager_id,))}
+    except Exception:
+        objs = {}
+    out, _res_cache = [], {}
+
+    def _tours(cn, y):
+        if cn not in _res_cache:
+            try:
+                _res_cache[cn] = [x for x in get_country_tournament_results(cn, limit=1000)
+                                  if (x.get("kind") or "") in ("oly_qual", "olympic")]
+            except Exception:
+                _res_cache[cn] = []
+        lst = [x for x in _res_cache[cn] if int(x.get("year") or 0) == y]
+        fin = [x for x in lst if x.get("kind") == "olympic"]
+        pick = fin or lst
+        obj = objs.get((cn, y), "")
+        return [(f"{y} {x['name']}" if x.get("kind") == "olympic" else (x.get("name") or "예선"),
+                 x.get("result") or "-", obj) for x in pick]
+    for n in tens:
+        first_cu = None
+        try:
+            first_cu = int((n["contract_log"] or "").split(";")[0].split(":")[1])
+        except Exception:
+            first_cu = None
+        _first = n["start_year"] if first_cu == n["start_year"] else n["start_year"] + 1
+        _last = n["end_year"] if n["end_year"] is not None else cur_year
+        if _first > _last:
+            continue
+        _end_txt = ("재임 중" if n["end_year"] is None else
+                    MANAGER_END_REASON_KO.get(n["end_reason"] or "", n["end_reason"] or "종료"))
+        _first_n, _renew_at = _contract_notes(n["contract_log"], _first)
+        for y in range(_first, _last + 1):
+            notes = []
+            if y == _first:
+                notes.append(f"부임 ({_first_n}년)" if _first_n else "부임")
+            elif y in _renew_at:
+                notes.append(f"재계약 ({_renew_at[y]}년)")
+            if y == _last:
+                notes.append(_end_txt)
+            t_ = _tours(n["cname"], y)
+            out.append({"kind": "u23", "year": y, "country": n["cname"], "tournaments": t_,
+                        "pending": not t_, "note": " · ".join(notes),
+                        "is_foreign": home_nat != _mgr_home_country(n["cname"])})
+    return out
+
 
 
 def get_manager_career(manager_id):
@@ -8679,6 +9127,10 @@ def get_manager_career(manager_id):
                     "note": " · ".join(_notes),
                     "is_foreign": home_nat != _mgr_home_country(n["cname"]),
                 })
+        # [2026-10 U-23 올림픽 2단계] U-23 대표팀 재임 — 성인 대표팀 줄과 같은 규칙(지휘한 해마다 한 줄,
+        # 시즌 끝(연말)에 부임하면 다음 해부터)으로 따로 줄을 만든다(kind="u23"). 예외: 처음 켰을 때
+        # 올림픽 해 대회 전에 심은 감독(첫 계약이 그 해까지)은 그 해부터 지휘한다.
+        rows += _manager_u23_rows(conn, manager_id, home_nat, cur_year)
         # 재임 기록과 연도가 안 맞는 대회(정상 흐름에선 없음)도 버리지 않고 그 해 줄로.
         for (cn_, y_), _t in _tours.items():
             if (cn_, y_) in _used:
@@ -8698,7 +9150,7 @@ def get_manager_career(manager_id):
                 _txt = f"시즌 후 {_dest} 대표팀 부임 → 지휘 전 {_uncoached[r['year']][1]}"
             r["note"] = r["note"].replace("대표팀 이동", _txt)
         # 같은 해면 클럽 줄 먼저, 대표팀 줄 다음(신민용 예시 순서)
-        rows.sort(key=lambda r: (-r["year"], 0 if r["kind"] == "club" else 1))
+        rows.sort(key=lambda r: (-r["year"], {"club": 0, "nation": 1}.get(r["kind"], 2)))
         # [2026-10 신민용 요청: "연도를 누르면 그 당시 전술과 주로 쓴 포메이션"]
         # 클럽 줄마다 그 해 그 팀의 포메이션 — 시즌 스냅샷(hist.team_season_lineup,
         # 은퇴·감독 교체보다 먼저 찍힘 = 그 해 감독의 포메이션) → 상반기 스냅샷 →
@@ -8711,10 +9163,13 @@ def get_manager_career(manager_id):
                 r["formations"] = []
                 try:
                     for _t in conn.execute(
-                            """SELECT DISTINCT t.id, t.name FROM intl_tournaments t
+                            """SELECT DISTINCT t.id, t.name, t.kind FROM intl_tournaments t
                                JOIN intl_squad s ON s.tournament_id = t.id
                                WHERE s.country = ? AND t.year = ? ORDER BY t.id""",
                             (r["country"], r["year"])):
+                        # [2026-10] 성인 대표팀 줄엔 올림픽 대회를, U-23 줄엔 올림픽 외 대회를 넣지 않는다.
+                        if (_t[2] in ("oly_qual", "olympic")) != (r["kind"] == "u23"):
+                            continue
                         _f = get_intl_formation(_t[0], r["country"], conn)
                         if _f:
                             r["formations"].append((_t[1], _f))
@@ -8751,6 +9206,7 @@ def get_manager_career(manager_id):
             "nation_tournaments": sum(1 for r in rows if r["kind"] == "nation"
                                       for _t in (r.get("tournaments") or []) if _t[2]),
             "nation_seasons": sum(1 for r in rows if r["kind"] == "nation"),
+            "u23_seasons": sum(1 for r in rows if r["kind"] == "u23"),   # [2026-10] U-23 대표팀
             # [2026-10 신민용 요청] 승격·강등 횟수 — 리그 칸(get_team_history)의
             # "[○○(N부)로 승격/강등]" 표기를 그대로 센다(표 색과 같은 기준).
             "promotions": sum(1 for r in club_rows if "로 승격]" in (r.get("league") or "")),

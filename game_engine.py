@@ -470,6 +470,32 @@ def _week_intl_cl_day(week: int, p: dict, st: dict = None) -> int:
         return cached
 
     week_start = (week - 1) * DAYS_PER_WEEK + 1
+    # [2026-10 신설, 3단계] 국내컵·대륙대항전도 라운드가 생길 때 양 팀 기준으로
+    # 날짜가 확정·저장된다(competition_common.assign_club_match_days). 이 팀의 이번
+    # 주 경기에 저장된 날짜가 있으면 그 날이 정답이다 — 화면 표시·내 경기 진행·
+    # 기록이 전부 같은 날을 가리키게 한다. 꺼져 있으면 예전과 동일하게 아래 계산.
+    if tid and cur_year:
+        from competition.competition_common import club_cup_day_assign_enabled
+        if club_cup_day_assign_enabled():
+            _conn_sd = get_conn()
+            _stored = None
+            for _mt, _tt in (("cup_matches", "cup_tournaments"), ("cl_matches", "cl_tournaments"),
+                             ("el_matches", "el_tournaments"), ("ecl_matches", "ecl_tournaments")):
+                try:
+                    _r = _conn_sd.execute(
+                        f"""SELECT m.day FROM {_mt} m JOIN {_tt} t ON t.id = m.tournament_id
+                            WHERE t.year=? AND m.week=? AND m.day>0
+                              AND (m.home_team_id=? OR m.away_team_id=?)
+                            ORDER BY m.id LIMIT 1""", (cur_year, week, tid, tid)).fetchone()
+                except Exception:
+                    _r = None
+                if _r and _r[0]:
+                    _stored = _r[0]
+                    break
+            _conn_sd.close()
+            if _stored:
+                _week_intl_cl_day_cache[cache_key] = _stored
+                return _stored
     dom_days = []  # 이번주/지난주/다음주 이 팀의 모든 경기일(있는 것만)
     if tid:
         conn = get_conn()
@@ -510,6 +536,10 @@ def _week_intl_cl_day(week: int, p: dict, st: dict = None) -> int:
     result = None
     for offset in (2, 5, 3, 4, 1, 6, 0):   # 화요일 우선 → 금요일 → 나머지
         cand = week_start + offset
+        # [2026-10 신설] A매치 기간(클럽 경기 금지일)은 후보에서 제외 —
+        # 금지 구간이 없으면 기존과 동일(competition_common.pick_free_day와 같은 원칙).
+        if is_club_blackout_day(cand):
+            continue
         _dist = min((abs(cand - dd) for dd in dom_days if dd is not None), default=99)
         if _dist >= MIN_MATCH_DAY_GAP:
             result = cand
@@ -1922,6 +1952,9 @@ def advance_4weeks(schedule: list):
                 pass
 
         _advance_week(p_latest, week, 1)
+        # [2026-10 신설, 3단계] 위 _advance_days_impl과 동일 — 날짜 없는 컵 경기 일괄 확정.
+        from competition.competition_common import assign_pending_club_cup_days
+        assign_pending_club_cup_days()
 
         # [국가대표 발탁 대기] 방금 INTL_CALLUP_WEEK 진입으로 국제대회(예선/본선)가
         #   생성되며 대표팀 선택 대기(my_selected=3)가 생겼다면, 발탁을 먼저 받아야
@@ -1930,8 +1963,9 @@ def advance_4weeks(schedule: list):
         # [최적화] get_pending_choice()는 INTL_CALLUP_WEEK 진입 직후에만 의미 있으므로
         #   새 주차(new_week)가 그 값일 때만 DB 조회, 그 외엔 스킵.
         try:
-            from constants import INTL_CALLUP_WEEK as _ICW
-            if week == _ICW - 1 and intl_engine.get_pending_choice():
+            from constants import INTL_CALLUP_WEEK as _ICW, NATIONS_CREATE_WEEK as _NCW
+            # [2026-10 4단계] 네이션스 발탁(30주 생성)도 같은 방식 — A매치 기간 전에 멈춘다.
+            if week in (_ICW - 1, _NCW) and intl_engine.get_pending_choice():
                 break
         except Exception:
             pass
@@ -2369,6 +2403,11 @@ def _advance_days_impl(schedule: list, progress_cb=None):
                 _do_flush = True
 
             _advance_week(p_latest, week, 1, progress_cb=progress_cb)   # current_week/year/season 갱신(검증된 로직)
+            # [2026-10 신설, 3단계] 이번 주 처리(다음 라운드 생성)와 주 전환(새 대회 개막)
+            # 에서 날짜 없이 만들어진 컵·대륙대항전 경기를 주차별로 한꺼번에 날짜 확정.
+            # 꺼져 있으면 아무것도 안 한다(competition_common 주석 참고).
+            from competition.competition_common import assign_pending_club_cup_days
+            assign_pending_club_cup_days()
             _pw2_t2 = _time_pw2.perf_counter()
             if _pw2_t2 - _pw2_t0 >= 0.1:
                 _live_debug(f"[PERF-WEEKTAIL] {week}주차: _pay_salary {_pw2_t1-_pw2_t0:.3f}s | "
@@ -2424,8 +2463,9 @@ def _advance_days_impl(schedule: list, progress_cb=None):
         #   (=_advance_week가 방금 그 주로 진입시켰을 수 있음), 발탁 대기가
         #   생겼는지 확인 후 있으면 멈춘다.
         try:
-            from constants import INTL_CALLUP_WEEK as _ICW2
-            if is_week_last_day and week == _ICW2 - 1 and intl_engine.get_pending_choice():
+            from constants import INTL_CALLUP_WEEK as _ICW2, NATIONS_CREATE_WEEK as _NCW2
+            # [2026-10 4단계] 네이션스 발탁(30주 생성)도 같은 방식으로 멈춘다.
+            if is_week_last_day and week in (_ICW2 - 1, _NCW2) and intl_engine.get_pending_choice():
                 print(f"[ADVANCE] EXIT reason=intl_pending_choice day={day} week={week} "
                       f"pending={intl_engine.get_pending_choice()}")
                 break
@@ -4893,6 +4933,7 @@ YELLOW_GROUP_FIELD = {
     "wc_qual_suspension":   "season_yellow_wc_qual",
     "intl_suspension":      "season_yellow_intl",
     "po_suspension":        "season_yellow_po",
+    "oly_suspension":       "season_yellow_oly",          # [2026-10] U-23 올림픽(예선·본선)
 }
 
 # [2026-08 버그수정, 신민용 리포트: "팀 이력에 옐로카드가 갑자기 0이
@@ -4912,6 +4953,7 @@ YELLOW_PROGRESS_FIELD = {
     "wc_qual_suspension":   "yellow_susp_progress_wc_qual",
     "intl_suspension":      "yellow_susp_progress_intl",
     "po_suspension":        "yellow_susp_progress_po",
+    "oly_suspension":       "yellow_susp_progress_oly",   # [2026-10] U-23 올림픽(예선·본선)
 }
 
 
@@ -7584,6 +7626,119 @@ def _is_dup_fixture(existing_matches: dict, pair_key: tuple, day: int) -> bool:
     return False
 
 
+# ── [2026-10 신설, 신민용 확정: "1안 A — 리그별 컵 주 완화"] ────────────────
+# constants.LEAGUE_CUP_RELIEF_* 주석 참고. 컵 계획(나라별 컵 라운드 주·참가
+# 부수)은 competition/cup_plan.py가 시즌 시작 시점 정보만으로 계산한다 — 나라별
+# 부수·팀 수가 같으면 결과도 같으므로 (DB, 연도, 시즌)마다 한 번만 계산한다.
+_CUP_PLAN_CACHE = {}
+# 리그별 선택 결과 기록(진단용): dict(league, year, n, legs, off, w=(국내컵, 3·4부컵),
+# gap, last, max_wk, ok, tier, cid, dom, low). ok=False면 1.0까지 올려도 조건을
+# 못 맞춰 완화 없이 짠 리그다.
+LEAGUE_CUP_RELIEF_LOG = []
+
+
+def _cup_plan_for(season, year):
+    import database as _db
+    key = (getattr(_db, "DB_PATH", None), year, season)
+    plan = _CUP_PLAN_CACHE.get(key)
+    if plan is None:
+        from competition.cup_plan import predict_cup_plan
+        plan = _CUP_PLAN_CACHE[key] = predict_cup_plan()
+    return plan
+
+
+def _league_schedule_day_check(n, legs, off, week_weights):
+    """_build_league_schedule_rows와 같은 공식으로 이 리그의 실제 경기일을 계산해
+    (팀별 최소 날짜 차이, 마지막 경기일, 한 팀 한 주 최대 리그 경기 수)를 돌려준다.
+    홈/원정 추첨과 무관한 날짜만 쓰므로 난수를 소비하지 않는다."""
+    import collections
+    rounds = generate_round_robin(n)
+    n_rounds = len(rounds)
+    single = (legs == 1)
+    n_cycles = max(1, legs // 2) if not single else 1
+    windows = season_cycle_windows(n_cycles, week_weights=week_weights)
+    days = collections.defaultdict(list)
+    for cyc, (h1s, h1e, h2s, h2e) in enumerate(windows):
+        is_last_cycle = (cyc == n_cycles - 1)
+        if single:
+            half = (n_rounds + 1) // 2
+            slices = [(0, half, (h1s, h1e)), (half, n_rounds, (h2s, h2e))]
+        else:
+            slices = [(0, n_rounds, (h1s, h1e)), (0, n_rounds, (h2s, h2e))]
+        for leg_idx, (rs, re_, (ws, we)) in enumerate(slices):
+            last_leg = is_last_cycle and leg_idx == len(slices) - 1
+            leg_rounds = list(enumerate(rounds))[rs:re_]
+            k = len(leg_rounds)
+            for li, (rd, matches) in enumerate(leg_rounds):
+                pairs = [(h, a) for h, a in matches if h < n and a < n]
+                if last_leg and li == k - 1 and k >= 2:
+                    prev = [(h, a) for h, a in leg_rounds[li - 1][1] if h < n and a < n]
+                    md = [final_round_day(li - 1, k, ws, we, len(prev), offset=off)] * len(pairs)
+                else:
+                    md = round_match_days(li, k, ws, we, len(pairs), offset=off)
+                for (h, a), d in zip(pairs, md):
+                    rd_ = club_day_from_virtual(d, week_weights)
+                    days[h].append(rd_)
+                    days[a].append(rd_)
+    min_gap, last, max_wk = 99, 0, 0
+    for ds in days.values():
+        ds.sort()
+        last = max(last, ds[-1])
+        for x, y in zip(ds, ds[1:]):
+            min_gap = min(min_gap, y - x)
+        wk = collections.Counter((d - 1) // DAYS_PER_WEEK + 1 for d in ds)
+        max_wk = max(max_wk, max(wk.values()))
+    return min_gap, last, max_wk
+
+
+def _league_cup_week_weights(league_id, n, legs, off, season, year):
+    """이 리그에 적용할 {주: 가중치}. 완화가 꺼져 있으면 None(기존과 동일).
+    설정값은 호출 시점의 constants 모듈에서 읽는다(테스트에서 바꿔 끼울 수 있게)."""
+    import constants as _C
+    if not _C.LEAGUE_CUP_RELIEF_ENABLED:
+        return None
+    conn = get_conn()
+    row = conn.execute("SELECT tier, country_id FROM leagues WHERE id=?", (league_id,)).fetchone()
+    conn.close()
+    tier, cid = (row[0], row[1]) if row else (None, None)
+    plan = _cup_plan_for(season, year).get(str(cid), {})
+    dom = tier in plan.get("dom_tiers", [])
+    low = tier in plan.get("low_tiers", [])
+    step, chosen, ok, res = 0, None, False, None
+    while True:
+        wd = min(1.0, round(_C.LEAGUE_CUP_RELIEF_W_DOM + _C.LEAGUE_CUP_RELIEF_STEP * step, 2))
+        wl = min(1.0, round(_C.LEAGUE_CUP_RELIEF_W_LOW + _C.LEAGUE_CUP_RELIEF_STEP * step, 2))
+        m = {}
+        if dom:
+            # [2026-10 L1e] 상반기 국내컵 주: 그 주 국내컵에 실제로 뛰는 부수만(1부 대부분 제외)
+            if getattr(_C, "LEAGUE_CUP_RELIEF_FIRST_HALF_DOM", False):
+                _wt = plan.get("dom_week_tiers", {})
+                for w in plan.get("dom_weeks_h1", []):
+                    if tier in _wt.get(str(w), []):
+                        m[w] = wd
+            for w in plan.get("dom_weeks", []):
+                m[w] = wd
+        if low:
+            for w in plan.get("low_weeks", []):
+                m[w] = min(m.get(w, 1.0), wl)
+        res = _league_schedule_day_check(n, legs, off, m)
+        if (res[0] >= MIN_MATCH_DAY_GAP and res[1] <= CLUB_SEASON_END_DAY
+                and res[2] <= _C.LEAGUE_MAX_MATCHES_PER_WEEK):
+            chosen, ok = m, True
+            break
+        if wd >= 1.0 and wl >= 1.0:
+            chosen = m
+            break
+        step += 1
+    LEAGUE_CUP_RELIEF_LOG.append(dict(league=league_id, year=year, n=n, legs=legs, off=off, w=(wd, wl),
+                                      gap=res[0], last=res[1], max_wk=res[2], ok=ok,
+                                      tier=tier, cid=cid, dom=dom, low=low))
+    if not ok:
+        print(f"[LEAGUE-RELIEF] 리그 {league_id}({n}팀) {year}: 완화 조건을 못 맞춰 완화 없이 생성 "
+              f"(최소 간격 {res[0]}, 마지막 {res[1]}일, 한 주 최대 {res[2]})", flush=True)
+    return chosen
+
+
 def _build_league_schedule_rows(league_id, tids, season, year, existing_matches, first_half_only=False):
     """리그 하나의 시즌 전체 경기 행을 만들어 반환한다(스코어 -1,-1로 예정).
 
@@ -7620,8 +7775,11 @@ def _build_league_schedule_rows(league_id, tids, season, year, existing_matches,
     # 매 라운드 독립적으로 홈/원정 추첨). 그 외(legs>=2)는 기존 로직 그대로.
     is_single_round = (legs == 1)
     n_cycles = max(1, legs // 2) if not is_single_round else 1
-    windows = season_cycle_windows(n_cycles)
     _lg_off = league_day_offset(league_id)
+    # [2026-10 신설] 리그별 컵 주 완화 — 꺼져 있거나 미리보기(first_half_only)면 None.
+    _week_weights = (None if first_half_only
+                     else _league_cup_week_weights(league_id, n, legs, _lg_off, season, year))
+    windows = season_cycle_windows(n_cycles, week_weights=_week_weights)
 
     new_rows = []
     leg_home = {}   # (cyc,rd,hi,ai) -> 그 사이클 1다리에서 실제 홈이었던 team_id
@@ -7655,6 +7813,9 @@ def _build_league_schedule_rows(league_id, tids, season, year, existing_matches,
                     match_days = round_match_days(local_idx, n_leg_rounds, w_start, w_end,
                                                    len(valid_pairs), offset=_lg_off)
                 for (hi, ai), day in zip(valid_pairs, match_days):
+                    # [2026-10 신설] A매치 기간·컵 주 완화 — 가상일 → 실제일.
+                    # 금지 구간·주 가중치가 없으면 항등(constants 주석 참고).
+                    day = club_day_from_virtual(day, _week_weights)
                     week = day_to_week(day)
                     if is_single_round:
                         # 단판 — 반전 개념 없음, 매 라운드 독립 추첨.
@@ -8882,6 +9043,13 @@ def _advance_week(p, base_week, n_weeks=4, progress_cb=None):
             _fill_offer_vacancies(new_year)
         except Exception as _e:
             add_log(f"⚠ 강팀 오퍼 빈자리 마감 보충 오류: {_e}", "event", new_year, new_week)
+        # [2026-10 신설, 신민용 확정: "L1e"] 3·4부컵 상·하반기 분할이면 승강 직후인 이 시점에
+        # 개막한다(참가 부수·팀 명단은 하반기 개막 때와 같다 — 승강은 시즌 끝에만 일어남).
+        if lower_cup_engine.lower_cup_split_enabled():
+            try:
+                lower_cup_engine.start_lower_cup(new_year, new_season)
+            except Exception as e:
+                add_log(f"⚠ 3부·4부컵 생성 오류: {e}", "event")
 
     # [2026-08 신설, 상반기/하반기 이적 기록 분리 기능, 신민용 요청:
     # "1993 기록이 2개로 나뉘며 상반기는 이팀 하반기는 2팀... 상황에
@@ -8911,7 +9079,9 @@ def _advance_week(p, base_week, n_weeks=4, progress_cb=None):
         # 뒤라는 점도 이 시점을 고르는 이유(요청: "이건 하반기 시즌에 들어갈
         # 대회야... 승강이 매 시즌 바뀌니까").
         try:
-            lower_cup_engine.start_lower_cup(new_year, new_season)
+            # [2026-10 L1e] 상·하반기 분할이 켜져 있으면 상반기 시작(아래 FIRST_HALF_START 블록)에 연다.
+            if not lower_cup_engine.lower_cup_split_enabled():
+                lower_cup_engine.start_lower_cup(new_year, new_season)
         except Exception as e:
             add_log(f"⚠ 3부·4부컵 생성 오류: {e}", "event")
         _hf1 = _time_half.perf_counter()
@@ -9113,6 +9283,22 @@ def _advance_week(p, base_week, n_weeks=4, progress_cb=None):
             intl_engine.start_qualifying_if_needed(new_year)
         except Exception as e:
             add_log(f"⚠ 월드컵 예선 생성 오류: {e}", "event")
+        # [2026-10 신설] U-23 올림픽 예선 — 월드컵 예선과 같은 시점·같은 엔진(올림픽 해에만).
+        try:
+            from competition import olympics as _oly
+            _oly.start_qual_if_needed(new_year)
+        except Exception as e:
+            add_log(f"⚠ 올림픽 예선 생성 오류: {e}", "event")
+
+    # [2026-10 4단계 신설, 신민용 확정: "네이션스 2년 주기"] 첫 후반기 A매치 기간(31주)
+    # 바로 전 주 진입 시 네이션스 예선(짝수 해)/본선(홀수 해)을 만든다 — 위 예선·아래 본선
+    # 훅과 같은 원칙으로 "경기 시작 전 주"에 미리 만들어 둔다(전날 휴식·발탁창).
+    from constants import NATIONS_CREATE_WEEK
+    if new_week == NATIONS_CREATE_WEEK:
+        try:
+            intl_engine.start_nations_if_needed(new_year)
+        except Exception as e:
+            add_log(f"⚠ 네이션스 생성 오류: {e}", "event")
 
     # [2026-07 버그수정, 신민용 리포트: "10월29일 클럽월드컵 첫 경기 바로
     # 전날(10월28일)이 강제 휴식이 아니라 그냥 훈련으로 뜬다"] 예선과
@@ -9130,6 +9316,12 @@ def _advance_week(p, base_week, n_weeks=4, progress_cb=None):
             intl_engine.start_intl_tournament(new_year)
         except Exception as e:
             add_log(f"⚠ 국제대회 생성 오류: {e}", "event")
+        # [2026-10 신설] U-23 올림픽 본선 — 월드컵 본선과 같은 시점(명단은 여기서 다시 뽑는다).
+        try:
+            from competition import olympics as _oly
+            _oly.start_finals_if_needed(new_year)
+        except Exception as e:
+            add_log(f"⚠ 올림픽 본선 생성 오류: {e}", "event")
 
     # [2026-09 신설] 랭킹 평가전(power_eval) — 클럽월드컵 해 25주(발탁/
     # 조추첨) 진입 시 생성. 첫 매치데이가 26주(day176)라 위 두 훅과
@@ -11082,11 +11274,15 @@ def _get_cl_cup_season_stats(year):
     # 있었지만, 그건 팀 성적일 뿐 "내가 개인적으로 얼마나 생산했는가"와는
     # 별개다 — 월드컵에서 8골을 넣어도 그 8골이 combined_ga에 안 잡히고
     # 있었다는 뜻. intl_matches를 추가로 합산한다.
+    # [2026-10] U-23 올림픽 경기는 A매치 쪽(발롱·개인수상 국대 생산성)에서 뺀다 — 그 해 올림픽이
+    # 없으면 예전과 똑같은 문장을 쓴다.
+    from competition.olympics import olympic_tournament_ids as _oly_tids
+    _oly_excl = " AND t.kind NOT IN ('oly_qual','olympic')" if _oly_tids(conn, year) else ""
     intl = conn.execute(
         """SELECT COALESCE(SUM(m.my_goals),0) g, COALESCE(SUM(m.my_assists),0) a,
                   COALESCE(SUM(m.my_rating),0) rs, COUNT(*) rc
            FROM intl_matches m JOIN intl_tournaments t ON m.tournament_id=t.id
-           WHERE t.year=? AND m.my_played=1""", (year,)).fetchone()
+           WHERE t.year=? AND m.my_played=1""" + _oly_excl, (year,)).fetchone()
     conn.close()
     cl_won = bool(cl_t and cl_t["my_result"] and "우승" in cl_t["my_result"])
     # [2026-08 신설] 슈퍼컵 우승 게이트 — cl_won과 같은 방식으로, FIFA
@@ -11648,7 +11844,11 @@ def _get_ballon_trophy_bonus(year: int, team_id: int) -> float:
         "SELECT my_result FROM sc_tournaments WHERE year=? AND my_in=1", (year,)).fetchone()
     intl_t = conn.execute(
         "SELECT kind, continent, my_result FROM intl_tournaments WHERE year=? AND my_selected=1",
-        (year,)).fetchone()
+        (year,)).fetchall()
+    # [2026-10] U-23 올림픽은 A매치 쪽(발롱 국대 점수)에서 뺀다 — 올림픽 행이 없으면 예전
+    # fetchone()과 같은 행이다(같은 SQL·같은 순서). 올림픽 성적 점수는 아래에서 따로 더한다(3단계).
+    from competition.olympics import first_non_olympic as _first_non_oly
+    intl_t = _first_non_oly(intl_t)
     conn.close()
     bonus = 0.0
     # [2026-09 6차 확장, 신민용 확정: "유로파/컨퍼런스리그도 대륙별
@@ -11674,6 +11874,9 @@ def _get_ballon_trophy_bonus(year: int, team_id: int) -> float:
         intl_t["continent"] if intl_t else "")
     if team_id:
         bonus += _league_rank_points(team_id)
+    # [2026-10 3단계] U-23 올림픽 성적 — 컨퍼런스리그 같은 단계 점수의 절반(올림픽 없으면 0.0).
+    from competition.olympics import my_ballon_trophy_points as _oly_pts
+    bonus += _oly_pts(year)
     return bonus
 
 
@@ -11705,7 +11908,11 @@ def _major_stage_carry(year: int, team_id: int) -> bool:
     conn = get_conn()
     intl_t = conn.execute(
         "SELECT id, kind, continent, my_result FROM intl_tournaments WHERE year=? AND my_selected=1",
-        (year,)).fetchone()
+        (year,)).fetchall()
+    # [2026-10] U-23 올림픽은 A매치 쪽(발롱 국대 점수)에서 뺀다 — 올림픽 행이 없으면 예전
+    # fetchone()과 같은 행이다(같은 SQL·같은 순서). 올림픽은 이 게이트에 인정하지 않는다(3단계 확정).
+    from competition.olympics import first_non_olympic as _first_non_oly
+    intl_t = _first_non_oly(intl_t)
     conn.close()
     # [2026-09 재보정, 신민용 리포트: "국가대표도 주전/로테/대기가 나뉘는데
     # 0경기 뛴 대기 선수도 우승 값을 받는다"] my_selected=1은 "스쿼드에
@@ -12372,6 +12579,10 @@ def _get_player_intl_bonus(year, player_id, nationality):
             elif nationality in (pl.get("third"), pl.get("fourth")):
                 total += weight * 0.2 * _contribution(ct["id"])
 
+    # [2026-10 3단계] U-23 올림픽 본선 — 컨퍼런스리그 같은 단계 점수의 절반 × 개인 기여
+    # (올림픽이 없거나 꺼져 있으면 0.0을 더해 예전 값 그대로).
+    from competition.olympics import ballon_intl_bonus as _oly_intl_bonus
+    total += _oly_intl_bonus(conn, year, player_id, _SIA_MY_PLAYER_ID)
     conn.close()
     return total
 
@@ -13180,6 +13391,10 @@ _BALLON_AWARD_BONUS = {
     ("club", "영플레이어"): 0.40,
     ("intl", "영플레이어"): 0.50,
 }
+# [2026-10 신민용 확정] 골든볼·실버볼·브론즈볼(월드컵·올림픽 MVP 1~3위, award_kind는 셋 다 "골든볼"이고
+# rank로 구분) — 예전엔 순위를 안 걸러 실버·브론즈볼도 골든볼과 같은 점수를 받았다. 국제대회 트로피 점수의
+# 기존 비율(우승 10 : 준우승 5 : 4강 2)과 같은 1 : 0.5 : 0.2로 준다.
+_BALLON_BALL_RANK_RATIO = {1: 1.0, 2: 0.5, 3: 0.2}
 # [2026-10 신설, 신민용 확정] 골든보이(유럽 1부 20세 이하 최고 유망주, 커리어 1회) 수상자 가산점 —
 # 발롱에 크게 영향을 주지 않는 상이라 리그 베스트11과 같은 소액. 발롱보다 먼저 계산·저장된다.
 _GOLDEN_BOY_AWARD = "골든보이"
@@ -13212,7 +13427,7 @@ def _get_award_recognition_bonus_map(c, year):
     out = {}
     rows = c.execute(
         """SELECT sia.player_id AS player_id, sia.category AS category,
-                  sia.award_kind AS award_kind,
+                  sia.award_kind AS award_kind, sia.rank AS rank,
                   it.kind AS tour_kind, it.continent AS tour_continent
            FROM season_individual_awards sia
            LEFT JOIN intl_tournaments it
@@ -13221,14 +13436,21 @@ def _get_award_recognition_bonus_map(c, year):
              AND sia.award_kind IN ('MVP', '베스트11', '골든볼', '영플레이어', '영플레이어상')""",
         (year,)).fetchall()
     for r in rows:
+        if r["tour_kind"] == "olympic":
+            continue        # [2026-10 3단계] 올림픽 개인상은 아래 전용 값(컨퍼런스리그 개인상의 절반)
         kind = {"골든볼": "MVP", "영플레이어상": "영플레이어"}.get(r["award_kind"], r["award_kind"])
         base = _BALLON_AWARD_BONUS.get((r["category"], kind), 0.0)
         if r["category"] == "intl" and base:
             weight = 1.0 if r["tour_kind"] == "world" else \
                 _CONTINENTAL_CUP_WEIGHT_RATIO.get(r["tour_continent"], 1.0)
             base *= weight
+        if r["award_kind"] == "골든볼":
+            base *= _BALLON_BALL_RANK_RATIO.get(r["rank"], 0.0)   # 실버볼 0.5 · 브론즈볼 0.2
         if base:
             out[r["player_id"]] = round(out.get(r["player_id"], 0.0) + base, 4)
+    from competition.olympics import ballon_award_bonus as _oly_award_bonus
+    for _pid, _b in _oly_award_bonus(c, year).items():
+        out[_pid] = round(out.get(_pid, 0.0) + _b, 4)
     # [2026-10] 골든보이 수상자(1위)
     for r in c.execute("SELECT player_id FROM season_individual_awards "
                        "WHERE year=? AND award_type=? AND rank=1", (year, _GOLDEN_BOY_AWARD)).fetchall():
@@ -17236,7 +17458,9 @@ def _process_awards(p, year, season_goals, season_assists, season_rating, season
             # 받고 있었다. 월드컵/유로 우승도 챔스 우승과 동일하게 대우한다.
             _intl_t_row = c.execute(
                 "SELECT kind, continent, my_result FROM intl_tournaments WHERE year=? AND my_selected=1",
-                (year,)).fetchone()
+                (year,)).fetchall()
+            from competition.olympics import first_non_olympic as _first_non_oly
+            _intl_t_row = _first_non_oly(_intl_t_row)   # [2026-10] 올림픽 제외(A매치 쪽)
             _intl_won = False
             if _intl_t_row and _intl_t_row["my_result"] and "우승" in _intl_t_row["my_result"]:
                 if _intl_t_row["kind"] == "world" or (
@@ -18078,6 +18302,14 @@ def _end_of_season(p, year, progress_cb=None):
         _tb.print_exc()
         add_log(f"⚠ 이적시장 처리 중 오류: {_e}", "event", year, 52)
 
+    # [2026-10 U-23 올림픽 2단계] U-23 감독 — 클럽 감독 시장(위 run_ai_offseason 안) 뒤에
+    # 정리·평가·선임(competition/oly_manager). 꺼져 있으면 아무것도 안 한다.
+    try:
+        from competition import olympics as _oly
+        _oly.on_season_end(year)
+    except Exception as _e:
+        print(f"[U23-MGR] 연말 처리 오류 {year}년: {_e}")
+
     # [2026-08 신설, 신민용 리포트: "선수 검색에서 나를 보면 OVR이 하나도
     # 안 찍혀있다"] AI는 바로 위 run_ai_offseason 안에서 매 시즌 이 시점에
     # ai_player_ovr_history를 아카이브하는데, my_player는 그 루틴을 안
@@ -18816,7 +19048,11 @@ def _my_military_check_exemption(p=None):
     finally:
         conn.close()
     if not hit:
-        return p
+        try:
+            from competition import olympics as _oly
+            return _oly.check_my_exemption(p)   # [2026-10] U-23 올림픽 메달 → 병역 혜택
+        except Exception:
+            return p
     update_player(military_status=MILITARY_STATUS_EXEMPT)
     try:
         st = get_state() or {}

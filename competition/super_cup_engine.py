@@ -87,6 +87,7 @@ from competition.competition_common import (
     start_knockout, advance_round, finish_tournament,
     get_tournament, clear_entry_cache, league_day_map, pick_free_day,
     bump_match_day_generation,
+    club_cup_day_assign_enabled, club_busy_days, CLUB_DAY_ASSIGN_LOG,
 )
 from competition.champions_engine import CHAMPIONS_CFG
 from competition.europa_engine import EUROPA_CFG
@@ -296,14 +297,47 @@ _SC_SF_TO_FINAL_MIN = _SC_MIN_GAP   # 준결승 → 결승 최소 간격
 # 간격을 게임 공통 휴식 기준(MIN_MATCH_DAY_GAP=2)과 같게 맞춘다.
 
 
-def _pick_one_sc_day(conn, year, team_ids, offsets):
-    """그 경기 두 팀만 기준으로 offsets 순서대로 날짜를 고른다."""
-    from constants import MIN_MATCH_DAY_GAP
-    day_map = league_day_map(conn, year, SC_START_WEEK, team_ids)
+def _sc_busy(conn, year, team_ids, only_fixed=False):
+    """[2026-10 3단계 점검] 슈퍼컵 경기일을 고를 때 피할 날. 클럽 컵 날짜 확정
+    (constants.CLUB_CUP_DAY_ASSIGN_ENABLED)이 켜져 있으면 리그뿐 아니라 이미 날짜가
+    정해진 모든 클럽 경기(국내컵·3·4부컵·대륙대항전·국내 슈퍼컵 등)를 본다 — 꺼져
+    있으면 예전 그대로 리그만 본다. 슈퍼컵 자기 경기(sc_matches)는 빼고 본다
+    (준결승→결승 간격은 _final_offsets가 따로 보장)."""
+    if club_cup_day_assign_enabled():
+        day_map = club_busy_days(conn, year, SC_START_WEEK, team_ids, only_fixed=only_fixed,
+                                 exclude=("sc_matches",))
+    else:
+        day_map = league_day_map(conn, year, SC_START_WEEK, team_ids)
     busy = set()
     for t in team_ids:
         if t:
             busy.update(day_map.get(t, ()))
+    return busy
+
+
+def _sc_log_if_short(conn, year, home, away, day, offsets):
+    """[2026-10 3단계 점검] 정해진 슈퍼컵 경기일이 양 팀 다른 클럽 경기와 2일 미만이면
+    competition_common.CLUB_DAY_ASSIGN_LOG에 실패로 남긴다(조용히 붙지 않게).
+    사유: 하한 = 후보 요일 전부가 고정 일정(리그·국내 슈퍼컵·승강PO·클럽월드컵)만으로도
+    막힘 / 먼저정한컵 = 이미 날짜가 정해진 컵·대륙대항전 경기 때문에 막힘."""
+    if not club_cup_day_assign_enabled():
+        return
+    from constants import MIN_MATCH_DAY_GAP
+    busy = _sc_busy(conn, year, (home, away))
+    dist = min((abs(day - d) for d in busy), default=99)
+    if dist >= MIN_MATCH_DAY_GAP:
+        return
+    fixed = _sc_busy(conn, year, (home, away), only_fixed=True)
+    lb = all(min((abs(_SF_DAY + o - d) for d in fixed), default=99) < MIN_MATCH_DAY_GAP for o in offsets)
+    CLUB_DAY_ASSIGN_LOG.append(dict(comp="대륙슈퍼컵", year=year, week=SC_START_WEEK, day=day,
+                                    home=home, away=away, dist=dist,
+                                    reason="하한" if lb else "먼저정한컵"))
+
+
+def _pick_one_sc_day(conn, year, team_ids, offsets):
+    """그 경기 두 팀만 기준으로 offsets 순서대로 날짜를 고른다."""
+    from constants import MIN_MATCH_DAY_GAP
+    busy = _sc_busy(conn, year, team_ids)
     best, best_day = -1, None
     for off in offsets:
         cand = _SF_DAY + off
@@ -324,6 +358,7 @@ def _assign_sc_sf_days(tid, year):
     for r in rows:
         day = _pick_one_sc_day(conn, year, (r["home_team_id"], r["away_team_id"]),
                                (0, 1, 2))
+        _sc_log_if_short(conn, year, r["home_team_id"], r["away_team_id"], day, (0, 1, 2))
         conn.execute("UPDATE sc_matches SET day=? WHERE id=?", (day, r["id"]))
     conn.commit()
     conn.close()
@@ -370,6 +405,7 @@ def _assign_sc_final_days(tid, year):
             else:
                 day = _pick_one_sc_day(conn, year, (r["home_team_id"], r["away_team_id"]),
                                        offsets)
+            _sc_log_if_short(conn, year, r["home_team_id"], r["away_team_id"], day, offsets)
             conn.execute("UPDATE sc_matches SET day=? WHERE id=?", (day, r["id"]))
     conn.commit()
     conn.close()

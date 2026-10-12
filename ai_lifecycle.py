@@ -3776,8 +3776,14 @@ def _retire_and_replace(c, year, ai_rows=None):
     # 은퇴나이 35.7 vs 국가대표만 33.6 — 이미 충분히 차이가 크고 자연
     # 스럽다는 판단)에 따라 하나로 합친다. intl_squad에 한 번이라도
     # 포함되면(월드컵 포함, 월드컵도 이 표에 똑같이 기록됨) 전부 0.5배.
+    # [2026-10] U-23 올림픽 명단은 "국가대표 경력"이 아니다(조기은퇴 억제 대상 밖) — 올림픽이
+    # 없으면 예전 문장 그대로.
+    from competition.olympics import olympic_tournament_ids as _oly_tids
+    _oly_t = _oly_tids(c)
     _natteam_ids = {r["player_id"] for r in c.execute(
-        "SELECT DISTINCT player_id FROM intl_squad").fetchall()}
+        "SELECT DISTINCT player_id FROM intl_squad" + (
+            f" WHERE tournament_id NOT IN ({','.join(str(int(i)) for i in sorted(_oly_t))})"
+            if _oly_t else "")).fetchall()}
 
     # [최적화] 이름풀 전체 1회 로드 (은퇴자마다 ORDER BY RANDOM() 방지)
     name_cache = _build_name_cache(c)
@@ -11078,7 +11084,9 @@ def _manager_turnover(c, year, season=None):
         # 된다(실측 45건). 대표팀 감독의 은퇴는 대회 평가 시점에
         # national_manager가 처리한다 — 거기서 재임을 닫고 같은 패스에서
         # 후임까지 세우므로 "감독 없는 대표팀"이 생기지 않는다.
-        if (m.get("status") or "") == "nation":
+        # [2026-10 U-23 올림픽 2단계] U-23 감독(status 'u23')도 같은 이유로 여기서 은퇴시키지 않는다 —
+        # competition/oly_manager가 연말에 재임을 닫으면서 처리한다.
+        if (m.get("status") or "") in ("nation", "u23"):
             continue
         in_job = (m.get("status") == "club" and not m.get("_left"))
         age = year - int(m.get("birth_year") or year)
@@ -11124,9 +11132,14 @@ def _manager_turnover(c, year, season=None):
     # team_managers에 현직 행이 없으므로 busy에 안 들어가고, 그대로 두면
     # **무직으로 오인되어 클럽에 부임한다**(그러면 한 감독이 대표팀과 클럽을
     # 동시에 맡는다). status로 걸러낸다.
+    # [2026-10 U-23 올림픽 2단계] 현직 U-23 감독도 후보가 아니다 — 올림픽 성과로 "승진 후보"가 된
+    # 감독만 예외로 넣는다(oly_manager.promo_candidate_ids — 꺼져 있거나 없으면 빈 집합이라 예전과 같다).
+    from competition.oly_manager import promo_candidate_ids as _u23_promo_ids
+    _u23_promo = _u23_promo_ids(c, year)
+    from constants import OLY_MGR_PROMO_MIN_GAIN as _u23_gain
     free_ids = [mid for mid, m in mgrs.items()
                 if not m.get("_retired") and mid not in busy
-                and (m.get("status") or "") != "nation"]
+                and ((m.get("status") or "") not in ("nation", "u23") or mid in _u23_promo)]
     # 경력 수준으로 버킷 — 공석마다 전체 풀을 훑으면 11,000×수천이라 느리다.
     # [2026-10 감독 국적 시장] 버킷을 국적별로 나눈다 — 자리마다 "자국/외국"을
     # 먼저 정하고(constants.manager_domestic_prob), 정해진 국적들의 버킷만 훑는다.
@@ -11664,6 +11677,10 @@ def _manager_turnover(c, year, season=None):
                         js = mm.get("jobless_since")
                         jl_years = max(0, year - int(js)) if js else 0
                         base_lv = float(mm.get("recent_level") or 0.0)
+                    # [2026-10 U-23 올림픽 2단계] U-23 승진 후보는 지금 U-23 자리보다 확실히 높은 자리만
+                    # (constants.OLY_MGR_PROMO_MIN_GAIN) — 같은 급·아래 클럽으로 옮기는 건 승진이 아니다.
+                    if mid in _u23_promo and lv < float(mm.get("recent_level") or 0.0) + _u23_gain:
+                        continue
                     ok, step, bonus = _manager_job_fit(
                         lv - cap_slack, "club", mm, year,
                         base_level=base_lv, jobless_years=jl_years,
@@ -12069,7 +12086,7 @@ def _manager_turnover(c, year, season=None):
     became_free = [mid for mid in mgrs
                    if mid not in busy and mid not in hired_ids
                    and not mgrs[mid].get("_retired")
-                   and (mgrs[mid].get("status") or "") != "nation"]
+                   and (mgrs[mid].get("status") or "") not in ("nation", "u23")]   # [2026-10] U-23 감독도
     if became_free:
         c.executemany(
             "UPDATE managers SET status='free', contract_until=0, "
