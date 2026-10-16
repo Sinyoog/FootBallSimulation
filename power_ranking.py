@@ -2389,10 +2389,27 @@ def ensure_initial_team_power_ranking(conn):
 # 17. UI 조회 헬퍼 (기존 시그니처 유지)
 # ══════════════════════════════════════════════════════════════
 
+def _team_tier_in_year(conn, year: int) -> dict:
+    """[2026-10 신설, 신민용 리포트: "시작 파워랭킹에 2부·3부 팀이 섞여 보인다"]
+    {team_id: 부} — 그 해(year) 시즌에 그 팀이 실제로 뛴 리그의 부.
+    예전 화면은 과거 연도 탭에도 teams.current_tier(지금 소속)를 붙여, 그 뒤에
+    강등된 팀이 옛 순위표에서 2부·3부로 보였다. 시즌 기록(hist.league_season_
+    standings)이 있는 해만 채우고, 없으면(진행 중인 올해 등) 호출부가 지금 소속을
+    그대로 쓴다. 표시 전용 — 순위·점수는 건드리지 않는다."""
+    try:
+        return {tid: tier for tid, tier in conn.execute(
+            """SELECT s.team_id, l.tier FROM hist.league_season_standings s
+               JOIN leagues l ON l.id = s.league_id WHERE s.year=?""", (year,)).fetchall()
+                if tier is not None}
+    except Exception:
+        return {}
+
+
 def get_team_power_ranking(conn, ranking_year: int, continent: Optional[str] = None,
                             limit: int = 100) -> list:
     ensure_power_ranking_tables(conn)
     ensure_initial_team_power_ranking(conn)
+    _tier_then = _team_tier_in_year(conn, ranking_year)
     if continent:
         rows = conn.execute(
             """SELECT p.ranking_year, p.evaluation_year, p.team_id, p.team_name, p.continent,
@@ -2409,7 +2426,8 @@ def get_team_power_ranking(conn, ranking_year: int, continent: Optional[str] = N
                ORDER BY p.rank ASC LIMIT ?""", (ranking_year, limit)).fetchall()
     return [TeamPowerEntry(team_id=r[2], team_name=r[3], continent=r[4], country=r[5],
                             rating=r[6], rank=r[7], prev_rank=r[8],
-                            ranking_year=r[0], evaluation_year=r[1], tier=r[9]) for r in rows]
+                            ranking_year=r[0], evaluation_year=r[1],
+                            tier=_tier_then.get(r[2], r[9])) for r in rows]
 
 
 TEAM_POWER_RANKING_TABS = ["전체", "아시아", "유럽", "아프리카", "오세아니아", "북미", "남미"]
@@ -2457,9 +2475,11 @@ def get_team_power_ranking_grouped(conn, ranking_year: int, tab: str = "전체",
             ORDER BY rating DESC""",
         (ranking_year - 1, *continents)).fetchall()
     prev_local_rank = {tid: i + 1 for i, (tid,) in enumerate(prev_rows)}
+    _tier_then = _team_tier_in_year(conn, ranking_year)   # 그 해 실제 소속 부(없으면 지금 소속)
     return [TeamPowerEntry(team_id=r[2], team_name=r[3], continent=r[4], country=r[5],
                             rating=r[6], rank=r[7], prev_rank=prev_local_rank.get(r[2]),
-                            ranking_year=r[0], evaluation_year=r[1], tier=r[8]) for r in rows]
+                            ranking_year=r[0], evaluation_year=r[1],
+                            tier=_tier_then.get(r[2], r[8])) for r in rows]
 
 
 def get_countries_in_tab_group(conn, tab: str) -> list:

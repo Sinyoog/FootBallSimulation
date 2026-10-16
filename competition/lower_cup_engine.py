@@ -51,7 +51,9 @@ LOWER_CUP_BRACKET_CAP = 64
 # 하반기(32~43주 근방) 안에서 기존 국내컵과 같은 주차를 쓰되 요일만
 # 다르게 잡는다. 필요하면 이 리스트 자체를 늘려서(예: 33,35,37...도 추가)
 # 라운드 수가 부족해지는 상황(64강 국가는 PO+6라운드=7라운드 필요)을 대비한다.
-LOWER_CUP_ROUND_WEEKS_POOL = [32, 34, 36, 38, 40, 42, 43]
+# [2026-10 개정] 32주는 네이션스 A매치 기간(31~32·31~33주)에 걸린다 — 비게 된 35주로(분할 모드를
+# 끌 때만 쓰는 풀이지만 같이 맞춘다).
+LOWER_CUP_ROUND_WEEKS_POOL = [34, 35, 36, 38, 40, 42, 43]
 _ROUND_DAY_OFFSET = 3   # 그 주의 4일째(수요일 격) — cup_engine(offset 0)과 다른 요일
 
 
@@ -707,14 +709,36 @@ def _team_ovr(c, team_id):
     return _team_avg_ovr(c, team_id)
 
 
-def _sim_ai_lower_cup_match(c, m):
+def _g2_cn(c, m):
+    """[G2] 관전 기록용 대회명(대회 이름 + 라운드)."""
+    try:
+        r = c.execute("SELECT name FROM lower_cup_tournaments WHERE id=?", (m["tournament_id"],)).fetchone()
+        return f"{r[0] if r else '하부컵'} {m.get('round_name') or ''}".strip()
+    except Exception:
+        return "하부컵"
+
+
+def _sim_ai_lower_cup_match(c, m, forced=None):
     h_ovr = _team_ovr(c, m["home_team_id"])
     a_ovr = _team_ovr(c, m["away_team_id"])
     # [2026-10 6번 ③-1] 감독 능력 보정(내 팀 경기는 0)
     from game_engine import _mgr_match_bonus_pair
     _hm, _am = _mgr_match_bonus_pair(c, m["home_team_id"], m["away_team_id"])
-    outcome = _match_outcome(h_ovr, a_ovr, _hm, _am)
-    if outcome == "home":
+    _g2 = None
+    if forced is None:
+        # [G2] 사용자 감독 팀·구단주 구단 경기 → 체인 엔진(controlled_matches). 대상이 아니면 None.
+        import controlled_matches as _cm
+        _g2_t = _cm.target_team_ids()
+        if _g2_t and (m["home_team_id"] in _g2_t or m["away_team_id"] in _g2_t):
+            _g2 = _cm.sim_target_match(m["home_team_id"], m["away_team_id"], home_adv=0.0, extra_time=True,
+                                       comp_name=_g2_cn(c, m), kind="lower_cup", week=m.get("week"), day=m.get("day"),
+                                       targets=_g2_t)
+        if _g2 is not None:
+            forced = (_g2["hs"], _g2["as"])
+    outcome = None if forced is not None else _match_outcome(h_ovr, a_ovr, _hm, _am)
+    if forced is not None:   # [G1] 내 팀 경기(내가 결장) — 체인 엔진 스코어(연장 포함)
+        hs, as_ = forced
+    elif outcome == "home":
         hs, as_ = random.choice([1, 2, 2, 3]), random.randint(0, 1)
     elif outcome == "away":
         hs, as_ = random.randint(0, 1), random.choice([1, 2, 2, 3])
@@ -725,6 +749,8 @@ def _sim_ai_lower_cup_match(c, m):
         winner_home, score = _resolve_pso(h_ovr, a_ovr)
         pso_winner = m["home_team_id"] if winner_home else m["away_team_id"]
         pso_score = score
+        if _g2 is not None:
+            _cm.note_pso(_g2, winner_home, score)
     c.execute("""UPDATE lower_cup_matches SET home_score=?, away_score=?,
                  pso_winner=?, pso_score=? WHERE id=?""",
               (hs, as_, pso_winner, pso_score, m["id"]))
@@ -1023,9 +1049,13 @@ def sim_my_lower_cup_match_as_ai(week, p, reason="injury", day=None):
     m = dict(conn.execute("SELECT * FROM lower_cup_matches WHERE id=?",
                           (info["match_id"],)).fetchone())
     conn.close()
+    # [G1] 내 팀 경기는 내가 결장해도 체인 엔진(나 없이)으로 결과를 낸다. 연장 후 동점이면 승부차기는 예전 공식.
     if m["home_score"] != -1:
         return  # 이미 처리됨(멱등)
-    _sim_ai_lower_cup_match(get_conn().cursor(), m)
+    from game_engine import _chain_team_score
+    _cs = _chain_team_score(m["home_team_id"], m["away_team_id"], 0.0, extra_time=True)
+    _sim_ai_lower_cup_match(get_conn().cursor(), m,
+                            forced=((_cs["home_score"], _cs["away_score"]) if _cs is not None else None))
     get_conn().commit()
     from game_engine import update_player, _calc_manager_rel
     update_player(manager_relation=_calc_manager_rel(p, 0, "", played=False, not_played_penalty=2))
@@ -1088,15 +1118,14 @@ def simulate_my_lower_cup_match(week, p, day=None):
     _gap = max(0.0, _my_ovr - _team_ovr)
     _benched = (not _suspended) and _check_bench(p, team_avg_ovr=_team_ovr)
     if _benched:
-        add_log("🪑 벤치 대기로 결장", "event")
+        add_log("🪑 교체 명단에서 시작", "event")
     _star = 1.0 + max(0.0, (_my_ovr - 60) / 40.0) ** 1.8 * 3.0
     bonus = _gap * 0.30 * _star + max(0.0, _my_ovr - 50) * 0.08
     bonus = _soft_cap(bonus, 30.0)
     _pe = PERSONALITY_EFFECTS.get(p.get("personality", ""), {})
     if "team_win_bonus" in _pe:
         bonus *= (1.0 + _pe["team_win_bonus"])
-    if _suspended or _benched:
-        bonus = 0.0
+    bonus = 0.0   # [G1] 캐리 보정 제거(신민용 확정 5) — 내 능력치가 체인 엔진 경합에 직접 들어간다
     h_ovr = he["ovr"] + (bonus if is_home else 0)
     a_ovr = ae["ovr"] + (0 if is_home else bonus)
 
@@ -1110,9 +1139,10 @@ def simulate_my_lower_cup_match(week, p, day=None):
     hs90 = as90 = None
     went_et = False
     _subs = {"home": [], "away": []}
+    _chain = None
     try:
         from match_sim.tactical_engine import simulate_my_match
-        from game_engine import _team_formation
+        from game_engine import _team_formation, _chain_me_spec
         _fconn = get_conn()
         _c = _fconn.cursor()
         home_formation = _team_formation(_c, m["home_team_id"])
@@ -1120,12 +1150,9 @@ def simulate_my_lower_cup_match(week, p, day=None):
         _fconn.close()
         sim = simulate_my_match(
             m["home_team_id"], m["away_team_id"], home_formation, away_formation,
-            home_boost=(bonus if is_home else 0.0),
-            away_boost=(bonus if not is_home else 0.0),
-            home_boost_position=(my_position if is_home else None),
-            away_boost_position=(my_position if not is_home else None),
             home_adv=0.0,
-            extra_time=True)
+            extra_time=True,
+            me=_chain_me_spec(p, is_home, "out" if _suspended else ("bench" if _benched else "start")))
         hs, as_ = sim["home_score"], sim["away_score"]
         hs90, as90 = sim.get("home_score_90", hs), sim.get("away_score_90", as_)
         went_et = bool(sim.get("went_extra_time"))
@@ -1135,7 +1162,12 @@ def simulate_my_lower_cup_match(week, p, day=None):
         player_ratings = {"home": sim.get("home_player_ratings") or [],
                           "away": sim.get("away_player_ratings") or []}
         outcome = "draw" if hs == as_ else ("home" if hs > as_ else "away")
-    except Exception:
+        _chain = sim
+    except Exception as _e_chain:
+        from game_engine import _chain_note_error
+        _chain_note_error(__name__, _e_chain)
+        _chain = None
+        engine_stats = engine_plog = player_ratings = None
         outcome = _match_outcome(h_ovr, a_ovr)
         hs, as_ = _gen_score(outcome, h_ovr - a_ovr, allow_extreme=True)
 
@@ -1144,7 +1176,24 @@ def simulate_my_lower_cup_match(week, p, day=None):
         win_home, pso_score = _resolve_pso(h_ovr, a_ovr)
         pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
 
-    if _suspended or _benched:
+    _chain_done = False
+    if _chain is not None and not _suspended:
+        # [G1] 내 기록은 체인 엔진이 실제로 기록한 사건 그대로(카드 카운터도 여기서 반영).
+        from game_engine import _chain_me_result
+        _cr = _chain_me_result(p, _chain, is_home, "cup_suspension")
+        if _cr["appeared"]:
+            _benched = False          # 벤치에서 교체로 들어갔으면 출전
+            goals, assists, saves, rating = _cr["goals"], _cr["assists"], _cr["saves"], _cr["rating"]
+            events, detail = _cr["events"], _cr["detail"]
+            _absence_reason = _cr["red_reason"]
+            _yellow_cnt = _cr["yellow"]
+            _chain_done = True
+        elif not _benched:
+            from game_engine import _chain_note_error
+            _chain_note_error(__name__, RuntimeError("선발인데 출전 기록 없음"))
+    if _chain_done:
+        pass
+    elif _suspended or _benched:
         goals, assists, saves, rating = 0, 0, 0, 0.0
         events, detail = [], {"shots": 0, "shots_on": 0, "key_passes": 0,
                               "dribbles": 0, "blocks": 0, "pass_acc": 0.0}
@@ -1181,16 +1230,18 @@ def simulate_my_lower_cup_match(week, p, day=None):
     events = augment_team_goal_events(
         p, is_home, hs, as_, goals, assists, not (_suspended or _benched),
         events, engine_plog, player_ratings)
-    _side_key, _idx = merge_my_slot(
-        player_ratings, is_home, my_position,
-        {"id": None, "name": p.get("name") or "나",
-         "position": None, "ovr": p.get("ovr", 40),
-         "goals": goals, "assists": assists,
-         "shots": detail.get("shots", 0),
-         "shots_on": detail.get("shots_on", 0),
-         "saves": saves, "is_gk": (my_position == "GK"),
-         "rating": rating, "is_me": True},
-        hs, as_, played=not (_suspended or _benched))
+    _side_key, _idx = None, None
+    if _chain is None:   # [G1] 체인 엔진 경기는 내가 이미 선수 기록줄에 있다
+        _side_key, _idx = merge_my_slot(
+            player_ratings, is_home, my_position,
+            {"id": None, "name": p.get("name") or "나",
+             "position": None, "ovr": p.get("ovr", 40),
+             "goals": goals, "assists": assists,
+             "shots": detail.get("shots", 0),
+             "shots_on": detail.get("shots_on", 0),
+             "saves": saves, "is_gk": (my_position == "GK"),
+             "rating": rating, "is_me": True},
+            hs, as_, played=not (_suspended or _benched))
 
     my_result = _my_result(outcome, is_home)
 

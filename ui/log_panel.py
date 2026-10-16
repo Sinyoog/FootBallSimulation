@@ -213,6 +213,95 @@ def _colorize_news(year, week, text: str) -> str:
     return f'<span style="color:#666;">[{year}년 {week}주차]</span> ' + _colorize(text)
 
 
+# [2026-10 신설, 신민용 요청: "경기를 선택한 후 경기들을 보면 각 경기별로 겉부분을 테두리 치는 게
+# 시각적으로 좋을 듯 — 전체·핵심·경기·뉴스 다 같은 날짜는 겉테두리로 감싸는 느낌으로", "테두리는
+# 대회마다 적용된 색상에 맞게 — 리그는 녹색, 챔피언스리그는 블루"] 같은 날짜 줄들을 한 상자로 묶는다.
+#   - 날짜: 줄 안의 "YYYY년 M월 D일"(_day_label)로 판별. 날짜가 없는 줄(경기 결과·평점·주급·시즌 종료
+#     이벤트 등)은 바로 앞 상자에 붙는다(신민용 확정 (a)).
+#   - 경기 헤더([match:...])는 새 상자를 연다 — 단, 같은 날짜 상자에 아직 경기가 없으면 그 상자에
+#     합친다(경기 전 불참·부상 줄이 같은 날 상자에 남게). 챔스 등 "N주차"로 찍히는 헤더도 새 상자.
+#   - 경기 앞 구분선(─)은 상자 테두리와 역할이 겹쳐 그리지 않는다(신민용 확정 (b)).
+#   - 테두리 색: 상자 안 경기의 대회 색(_COMP_COLORS), 경기 없는 날은 은은한 회색.
+#   - 뉴스 탭은 줄에 날짜가 없고 "[YYYY년 N주차]"만 있어 (연도, 주차) 단위로 묶는다.
+# QTextBrowser(Qt 리치 텍스트)는 div/span 테두리를 그리지 않아 한 칸짜리 표로 그린다(모서리는 직각).
+_DATE_RE = re.compile(r'(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일')
+_MATCH_KIND_RE = re.compile(r'\[match:\d+(?::([a-z_]+))?\]')
+_SEP_LINE_RE = re.compile(r'^─+$')
+_PLAIN_BOX_COLOR = "#3a3a3a"   # 경기 없는 날(훈련·휴식 등) 상자 테두리
+
+
+def _line_date(text: str):
+    m = _DATE_RE.search(text)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+
+def _group_day_lines(texts, last=None):
+    """texts: 필터를 통과한 원본 줄(표시 순서). last: 화면 맨 끝 상자의 상태
+    {"date", "match", "kind"} 또는 None.
+    반환: (groups, continues_last) — groups는 [{"date","match","kind","lines"}...],
+    continues_last는 앞쪽 줄이 화면 맨 끝 상자에 이어 붙어야 하는지(그러면 호출부가 통째로 다시 그린다)."""
+    groups = []
+    cur = None
+    if last is not None:
+        cur = {"date": last.get("date"), "match": last.get("match", False),
+               "kind": last.get("kind"), "lines": [], "_prev": True}
+    continues = False
+    for t in texts:
+        if _SEP_LINE_RE.match(t.strip()):
+            continue
+        d = _line_date(t)
+        mk = _MATCH_KIND_RE.search(t)
+        if mk:
+            same_day = (cur is not None and not cur["match"] and d is not None and cur["date"] == d)
+            if not same_day:
+                cur = {"date": d, "match": False, "kind": None, "lines": []}
+                groups.append(cur)
+            cur["match"] = True
+            cur["kind"] = mk.group(1)
+        elif d is not None and (cur is None or cur["date"] != d):
+            cur = {"date": d, "match": False, "kind": None, "lines": []}
+            groups.append(cur)
+        elif cur is None:
+            cur = {"date": None, "match": False, "kind": None, "lines": []}
+            groups.append(cur)
+        if cur.get("_prev"):
+            continues = True
+        cur["lines"].append(t)
+    return groups, continues
+
+
+def _group_news(entries, last_key=None):
+    """entries: [(year, week, text)]. 같은 (연도, 주차)끼리 묶는다. 반환: (groups, continues_last)."""
+    groups = []
+    continues = False
+    cur_key = last_key
+    for year, week, text in entries:
+        k = (year, week)
+        if not groups and k == last_key:
+            continues = True
+        if not groups or k != cur_key:
+            groups.append({"key": k, "lines": []})
+            cur_key = k
+        groups[-1]["lines"].append((year, week, text))
+    return groups, continues
+
+
+def _box_html(color: str, inner: str) -> str:
+    return (f'<table width="100%" cellspacing="0" cellpadding="5" border="1" '
+            f'style="border-collapse:collapse; border-style:solid; border-color:{color}; '
+            f'margin-top:2px; margin-bottom:4px;">'
+            f'<tr><td style="border-style:solid; border-color:{color};">{inner}</td></tr></table>')
+
+
+def _day_group_html(g) -> str:
+    color = (_COMP_COLORS.get(g["kind"], _DEFAULT_BOX_COLOR) if g["match"] else _PLAIN_BOX_COLOR)
+    return _box_html(color, "<br>".join(_colorize(t) for t in g["lines"]))
+
+
+def _news_group_html(g) -> str:
+    return _box_html(_PLAIN_BOX_COLOR, "<br>".join(_colorize_news(y, w, t) for y, w, t in g["lines"]))
+
+
 # 필터 버튼 3종의 공통 스타일 — "로그" 라벨 옆 작은 토글 버튼.
 _LOG_MODE_BTN_QSS = """
 QPushButton {
@@ -268,6 +357,10 @@ class LogPanel(QWidget):
         # 담는다(ai_lifecycle.py의 주요 이적/영입·방출/이적시장 마감 로그).
         # [2026-08 확장, 신민용 요청: 주차까지 표시] week도 같이 담는다.
         self._news_entries = []  # [(year, week, text), ...]
+        # [2026-10 신설] 화면 맨 끝 상자의 상태 — 다음 증분 갱신 때 새 줄이 그 상자에 이어
+        # 붙어야 하는지(같은 날짜·날짜 없는 줄) 판단용. 뉴스 탭은 (연도, 주차) 키.
+        self._last_group = None
+        self._last_news_key = None
 
         lay = QVBoxLayout(self); lay.setContentsMargins(8,8,8,8); lay.setSpacing(4)
 
@@ -397,12 +490,17 @@ class LogPanel(QWidget):
         대신 self._news_entries(세션 내내 누적, 연도 포함)를 쓰고, 각
         줄 앞에 연도를 붙인다(_colorize_news) — 그 외 모드는 기존과
         동일."""
+        # [2026-10] 같은 날짜(뉴스는 같은 주차) 줄을 대회 색 테두리 상자로 묶어 그린다.
         if self._filter_mode == "news":
-            html_lines = [_colorize_news(year, week, text) for year, week, text in self._news_entries]
+            groups, _ = _group_news(self._news_entries)
+            chunk_html = "".join(_news_group_html(g) for g in groups)
+            self._last_news_key = groups[-1]["key"] if groups else None
         else:
-            html_lines = [_colorize(text) for text, log_type in self._year_entries
-                          if _passes_filter(text, log_type, self._filter_mode)]
-        chunk_html = "<br>".join(html_lines)
+            texts = [text for text, log_type in self._year_entries
+                     if _passes_filter(text, log_type, self._filter_mode)]
+            groups, _ = _group_day_lines(texts)
+            chunk_html = "".join(_day_group_html(g) for g in groups)
+            self._last_group = groups[-1] if groups else None
         self.te.setHtml(f'<div style="font-family:\'Malgun Gothic\',monospace;'
                         f'font-size:12px;">{chunk_html}</div>')
         self._scroll_to_bottom()
@@ -490,14 +588,28 @@ class LogPanel(QWidget):
         # append(기존 내용은 다시 그리지 않는다 — 위 refresh() docstring의
         # "다음 날" 성능 원칙 유지).
         # [2026-08 신설] "뉴스" 모드는 연도 표시가 붙은 별도 포맷을 쓴다.
+        # [2026-10] 새 줄도 날짜별 상자로 묶는다. 첫 줄이 화면 맨 끝 상자에 이어 붙어야 하면
+        # (같은 날짜·날짜 없는 줄 — 이미 그려진 상자는 고칠 수 없으므로) 올해분을 통째로 다시 그린다.
+        # 하루치 로그는 보통 한 번의 갱신에 같이 들어와서 이 경로는 드물다.
         if self._filter_mode == "news":
-            html_lines = [_colorize_news(year, week, text) for text, year, week, log_type in visible_entries
-                          if log_type == "news"]
+            groups, continues = _group_news(
+                [(year, week, text) for text, year, week, log_type in visible_entries if log_type == "news"],
+                self._last_news_key)
         else:
-            html_lines = [_colorize(text) for text, _year, _week, log_type in visible_entries
-                          if _passes_filter(text, log_type, self._filter_mode)]
-        if html_lines:
-            chunk_html = "<br>".join(html_lines)
+            groups, continues = _group_day_lines(
+                [text for text, _year, _week, log_type in visible_entries
+                 if _passes_filter(text, log_type, self._filter_mode)],
+                self._last_group)
+        if continues:
+            self._render_full()
+            return
+        if groups:
+            if self._filter_mode == "news":
+                chunk_html = "".join(_news_group_html(g) for g in groups)
+                self._last_news_key = groups[-1]["key"]
+            else:
+                chunk_html = "".join(_day_group_html(g) for g in groups)
+                self._last_group = groups[-1]
             # QTextBrowser.append()은 기존 내용을 다시 파싱/렌더링하지 않고
             # 끝에 새 블록만 덧붙인다 — 여기가 "증분" 갱신의 핵심.
             self.te.append(chunk_html)

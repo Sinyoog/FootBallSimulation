@@ -533,6 +533,90 @@ def _pick_reserve(pool, formation, starters, subs):
     return out
 
 
+# [2026-10 신설, 신민용 확정: "포지션 정원은 유지하되, 포지션과 관계없이 점수가 높은 선수에게 예외 선발
+# 기회 — CDM은 CM 자리의 대체 후보로, 적합성이 낮은 선수를 무조건 주전으로 올리지는 않음"]
+# 정원표만으로 명단을 짜면 포메이션에 그 포지션 칸이 없을 때(예: 4-4-1-1·3-4-2-1·5-4-1은 CDM 칸도 DM
+# 정원도 0) 후보 전체 1위라도 18명에서 빠졌다(OVR 102 CDM이 U-23 후보 탈락한 리포트).
+# 비슷한 약어 순서 — 예외 선발 선수가 교체 명단의 어느 약어 선수와 바뀔지 고를 때 앞쪽부터 찾는다.
+_SIMILAR_CATS = {
+    "DM": ("DM", "CM"), "CM": ("CM", "DM", "AM"), "AM": ("AM", "CM", "W"),
+    "W": ("W", "WM", "ST"), "WM": ("WM", "W", "CM"), "ST": ("ST", "W", "AM"),
+    "CB": ("CB", "FB", "DM"), "FB": ("FB", "WB", "CB"), "WB": ("WB", "FB", "WM"),
+}
+
+
+def _cat_of_position(position):
+    """등록 포지션 → 약어(자연 포지션이 그 약어인 것 중 첫째)."""
+    for k in ("CB", "FB", "DM", "CM", "AM", "W", "ST"):
+        if position in CAT_NATURAL[k]:
+            return k
+    return _SLOT_CAT.get(position, "CM")
+
+
+def _apply_score_exceptions(pool, formation, starters, subs):
+    """[2026-10 신설, 신민용 확정 B안] 예외 선발 — 정원표 선발(주전 11·교체 7)이 끝난 뒤, 18명에 못 든
+    선수 중 후보 전체 선발 점수 상위 OLYMPIC_EXCEPTION_TOP(5)위 안인 선수(GK 제외)를 교체 명단 선수와
+    바꾼다 — 바꿀 상대보다 OLYMPIC_EXCEPTION_MIN_GAP(5)점 이상 높을 때만. 팀당 최대
+    OLYMPIC_EXCEPTION_MAX(2)명.
+      · 주전은 건드리지 않는다(교체 명단에만 들어간다).
+      · 바꿀 상대: 그 선수와 비슷한 약어(_SIMILAR_CATS 순서)의 교체 선수 중 점수 최하위부터, 없으면
+        나머지 교체 선수 중 점수 최하위. 예외 선수보다 점수가 높은 선수와는 바꾸지 않는다.
+      · GK 교체와, 18명 안에서 그 약어의 마지막 자연 포지션 선수는 바꿀 상대에서 뺀다.
+      · 바뀐 자리의 약어 표시는 그대로 두고 자연 포지션 여부만 다시 판정한다.
+    전역 난수 미사용(정렬 동점은 id로 끊는다). 예외가 하나도 없으면 입력을 그대로 돌려준다."""
+    top_n = getattr(C, "OLYMPIC_EXCEPTION_TOP", 5)
+    min_gap = getattr(C, "OLYMPIC_EXCEPTION_MIN_GAP", 5.0)
+    max_n = getattr(C, "OLYMPIC_EXCEPTION_MAX", 2)
+    if not pool or max_n <= 0:
+        return subs, []
+    ordered = sorted(pool, key=lambda c: (-c["_score"], c["id"]))
+    top_ids = {id(c) for c in ordered[:top_n]}
+    chosen = {id(c) for c in starters if c is not None} | {id(c) for c, _k, _n in subs}
+    outsiders = [c for c in ordered if id(c) in top_ids and id(c) not in chosen and c["position"] != "GK"]
+    if not outsiders:
+        return subs, []
+    cats = formation_categories(formation)
+    subs = list(subs)
+    done = []
+    for ex in outsiders[:max_n]:
+        # 18명 안 약어별 자연 포지션 선수 수(주전은 자리 약어, 교체는 표시 약어 기준)
+        nat_cnt = {}
+        for i, c in enumerate(starters):
+            if c is not None and c["position"] in CAT_NATURAL.get(cats[i], ()):
+                nat_cnt[cats[i]] = nat_cnt.get(cats[i], 0) + 1
+        for c, k, _n in subs:
+            if c["position"] in CAT_NATURAL.get(k, ()):
+                nat_cnt[k] = nat_cnt.get(k, 0) + 1
+
+        def _swappable(t):
+            c, k, _n = t
+            if c["position"] == "GK" or k == "GK" or c.get("_exception"):
+                return False
+            if ex["_score"] - c["_score"] < min_gap:
+                return False      # 바꿀 상대보다 min_gap점 이상 높아야 한다
+            if c["position"] in CAT_NATURAL.get(k, ()) and nat_cnt.get(k, 0) <= 1:
+                return False      # 그 약어의 마지막 자연 포지션 선수
+            return True
+        cand = [t for t in subs if _swappable(t)]
+        if not cand:
+            continue
+        ex_cat = _cat_of_position(ex["position"])
+        target = None
+        for k in _SIMILAR_CATS.get(ex_cat, (ex_cat,)):
+            same = [t for t in cand if t[1] == k]
+            if same:
+                target = min(same, key=lambda t: (t[0]["_score"], -t[0]["id"]))
+                break
+        if target is None:
+            target = min(cand, key=lambda t: (t[0]["_score"], -t[0]["id"]))
+        idx = subs.index(target)
+        k = target[1]
+        ex["_exception"] = True
+        subs[idx] = (ex, k, ex["position"] in CAT_NATURAL.get(k, ()))
+        done.append((ex, target[0], k))
+    return subs, done
+
+
 def _natural_cat_of(position, formation):
     tbl = C.OLYMPIC_SQUAD_TABLE.get(formation, {})
     if position == "GK":
@@ -575,6 +659,8 @@ def select_squad(country, year, kind, p=None, include_me=False, allow_flip=False
     subs = _pick_subs(pool, formation, starters)
     if allow_flip and include_me:
         starters, subs = _maybe_flip_me(pool, formation, starters, subs)
+    # [2026-10 신설] 예외 선발 — 정원표 때문에 빠진 최상위 점수 선수를 교체 명단에(_apply_score_exceptions).
+    subs, _exceptions = _apply_score_exceptions(pool, formation, starters, subs)
     reserve = _pick_reserve(pool, formation, starters, subs)
     slots = C.FORMATION_SLOTS[formation]
     plan["formation"] = formation
@@ -587,6 +673,7 @@ def select_squad(country, year, kind, p=None, include_me=False, allow_flip=False
     plan["me_in"] = any(c.get("is_me") for c in eighteen)
     plan["me_starter"] = any(c.get("is_me") for c, _s in plan["starters"])
     plan["me_reserve"] = any(c.get("is_me") for c, _k in reserve)
+    plan["exceptions"] = [(c, out, k) for c, out, k in _exceptions]   # (들어온 선수, 빠진 선수, 약어)
     return plan
 
 

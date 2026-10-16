@@ -144,18 +144,50 @@ MIN_MATCH_DAY_GAP = 2
 # [2026-10 4단계, 신민용 확정: "1안 A — 후반기 A매치 기간 3번(31·35·39주, 각 1주)"]
 # 네이션스 예선(짝수 해)·본선(홀수 해)이 이 세 기간에만 열린다(NATIONS_* 참고).
 # 빈 리스트로 바꾸면 클럽 일정은 예전과 같아지지만 네이션스 경기와 겹친다.
-AMATCH_CLUB_BLACKOUTS = [(211, 217), (239, 245), (267, 273)]
+# [2026-10 개정, 신민용 확정: "네이션스 예선은 2주, 본선은 3주에 다 끝내고 리그로 — 예선 해 31~32주,
+# 본선 해 31~33주 금지, 기존 35·39주 금지는 제거, 연도를 알 수 없는 경로는 31~33주 전부 금지"]
+# 금지 구간이 이제 연도마다 다르다(club_blackouts_for_year). AMATCH_CLUB_BLACKOUTS는 "연도를 모를 때"
+# 쓰는 안전한 합집합(두 해 금지 구간을 모두 덮는 31~33주)이다.
+NATIONS_QUAL_BLACKOUT = (211, 224)     # 예선 해(짝수 해) 31~32주
+NATIONS_FINALS_BLACKOUT = (211, 231)   # 본선 해(홀수 해) 31~33주
+AMATCH_CLUB_BLACKOUTS = [(211, 231)]   # 연도 미지정 폴백 = 위 두 구간의 합
 
 
-def _norm_blackouts():
-    return sorted((int(s), int(e)) for s, e in AMATCH_CLUB_BLACKOUTS if e >= s)
+def club_blackouts_for_year(year=None):
+    """그 해 A매치 기간(클럽 경기 금지일) 목록 [(시작일, 끝일)]. year=None이면 안전한 합집합
+    (AMATCH_CLUB_BLACKOUTS). 네이션스 2년 주기가 꺼져 있으면 금지 구간 없음."""
+    if year is None:
+        return list(AMATCH_CLUB_BLACKOUTS)
+    if not NATIONS_CYCLE_ENABLED:
+        return []
+    if is_nations_qual_year(year):
+        return [NATIONS_QUAL_BLACKOUT]
+    if is_nations_finals_year(year):
+        return [NATIONS_FINALS_BLACKOUT]
+    return []
 
 
-def is_club_blackout_day(day) -> bool:
-    """day가 A매치 기간(클럽 경기 금지일)이면 True."""
-    if not AMATCH_CLUB_BLACKOUTS or day is None:
+def first_open_club_day(day, year=None):
+    """[2026-10 신설, 신민용 요청: "컵 날짜 선택기가 금지일에 기본 날짜를 반환하지 않는지"] day가 그 해
+    A매치 금지일이면 그 금지 구간이 끝난 다음 날을, 아니면 day를 그대로 돌려준다. 그 주의 모든 후보일이
+    금지일일 때(지금 대회 주차 배치로는 생기지 않는 경우) 날짜 선택기의 마지막 안전장치로만 쓴다."""
+    if day is None:
+        return day
+    for s_, e_ in _norm_blackouts(year):
+        if s_ <= day <= e_:
+            return e_ + 1
+    return day
+
+
+def _norm_blackouts(year=None):
+    return sorted((int(s), int(e)) for s, e in club_blackouts_for_year(year) if e >= s)
+
+
+def is_club_blackout_day(day, year=None) -> bool:
+    """day가 그 해(year) A매치 기간(클럽 경기 금지일)이면 True. year를 모르면 31~33주 전부 금지로 본다."""
+    if day is None:
         return False
-    return any(s <= day <= e for s, e in AMATCH_CLUB_BLACKOUTS)
+    return any(s <= day <= e for s, e in club_blackouts_for_year(year))
 
 
 # [2026-10 신설, 신민용 확정: "1안 A — 리그별 컵 주 완화"] 금지 구간 때문에
@@ -211,17 +243,17 @@ CLUB_CUP_DAY_ASSIGN_ENABLED = True
 _VCAL_CACHE = {}
 
 
-def _vcal(week_weights=None):
+def _vcal(week_weights=None, year=None):
     """가상 달력 표: V[d] = 1 + (d 이전 날짜들의 가중치 합). 금지일 0, 컵 주는
-    week_weights[주], 나머지 1. 전부 1이면 V[d] = d."""
-    key = (tuple(_norm_blackouts()), tuple(sorted((week_weights or {}).items())))
+    week_weights[주], 나머지 1. 전부 1이면 V[d] = d. [2026-10] 금지일은 그 해(year) 기준."""
+    key = (tuple(_norm_blackouts(year)), tuple(sorted((week_weights or {}).items())))
     V = _VCAL_CACHE.get(key)
     if V is None:
         V = [0.0] * 366
         acc = 1.0
         for d in range(1, 366):
             V[d] = acc
-            if is_club_blackout_day(d):
+            if is_club_blackout_day(d, year):
                 w = 0.0
             elif week_weights and ((d - 1) // DAYS_PER_WEEK + 1) in week_weights:
                 w = float(week_weights[(d - 1) // DAYS_PER_WEEK + 1])
@@ -232,26 +264,26 @@ def _vcal(week_weights=None):
     return V
 
 
-def _vcal_identity(week_weights=None):
-    return not AMATCH_CLUB_BLACKOUTS and all(float(v) == 1.0 for v in (week_weights or {}).values())
+def _vcal_identity(week_weights=None, year=None):
+    return not club_blackouts_for_year(year) and all(float(v) == 1.0 for v in (week_weights or {}).values())
 
 
-def club_virtual_day(day: int, week_weights=None):
-    """실제일 → 가상일. 금지 구간·주 가중치가 없으면 항등."""
-    if _vcal_identity(week_weights):
+def club_virtual_day(day: int, week_weights=None, year=None):
+    """실제일 → 가상일. 금지 구간·주 가중치가 없으면 항등. [2026-10] 금지일은 그 해(year) 기준."""
+    if _vcal_identity(week_weights, year):
         return day
-    return _vcal(week_weights)[day]
+    return _vcal(week_weights, year)[day]
 
 
-def club_day_from_virtual(vday, week_weights=None) -> int:
+def club_day_from_virtual(vday, week_weights=None, year=None) -> int:
     """가상일 → 실제일: 가상값이 vday 이상인 가장 이른 '금지일 아닌' 날.
     금지 구간·주 가중치가 없으면 항등. 가상일 차이가 2 이상이면 실제일 차이도
     2 이상이 보장된다(가중치가 전부 1 이하이므로)."""
-    if _vcal_identity(week_weights):
+    if _vcal_identity(week_weights, year):
         return vday
-    V = _vcal(week_weights)
+    V = _vcal(week_weights, year)
     for d in range(1, 366):
-        if V[d] >= vday - 1e-9 and not is_club_blackout_day(d):
+        if V[d] >= vday - 1e-9 and not is_club_blackout_day(d, year):
             return d
     return 364
 
@@ -466,7 +498,7 @@ def legs_for_team_count(n: int, target: int = TARGET_ROUNDS_PER_LEG) -> int:
         return 2
     return 1
 
-def season_cycle_windows(n_cycles: int, week_weights=None):
+def season_cycle_windows(n_cycles: int, week_weights=None, year=None):
     """[2026-07 재설계, 중간 휴식기 도입] 예전엔 CLUB_SEASON_START_DAY~
     END_DAY(22~300) 전체를 통짜로 n_cycles개로 나눴는데, 이러면 중간
     휴식기(WINTER_OFFER_START_DAY~END_DAY, 190~217)를 관통하는 라운드가
@@ -534,10 +566,12 @@ def season_cycle_windows(n_cycles: int, week_weights=None):
     # 가상일 = 실제일이라 기존과 완전히 같다. week_weights는 리그별 컵 주
     # 완화(LEAGUE_CUP_RELIEF_*)용 {주: 가중치} — 없으면 기존과 같다.
     for _bd in (pre_start, pre_end, post_start, post_end):
-        if is_club_blackout_day(_bd):
-            raise ValueError(f"AMATCH_CLUB_BLACKOUTS가 리그 풀 경계일({_bd})을 덮는다")
-    pre_start, pre_end = club_virtual_day(pre_start, week_weights), club_virtual_day(pre_end, week_weights)
-    post_start, post_end = club_virtual_day(post_start, week_weights), club_virtual_day(post_end, week_weights)
+        if is_club_blackout_day(_bd, year):
+            raise ValueError(f"A매치 금지 구간이 리그 풀 경계일({_bd})을 덮는다")
+    pre_start, pre_end = (club_virtual_day(pre_start, week_weights, year),
+                          club_virtual_day(pre_end, week_weights, year))
+    post_start, post_end = (club_virtual_day(post_start, week_weights, year),
+                            club_virtual_day(post_end, week_weights, year))
 
     h1_windows = _split_pool(pre_start, pre_end, n_cycles)
     h2_windows = _split_pool(post_start, post_end, n_cycles)
@@ -954,17 +988,17 @@ TOURNAMENT_SCHEDULE_RULES = {
     # 끝난 뒤"로 정확히 누적 계산하려면 필요해서 그대로 넣어둔다 —
     # 실제 조별리그 날짜(_create_power_eval_tournament의
     # POWER_EVAL_GROUP_START_DAY + rd*2, rd=0~2)와 맞춘 값.
-    # [2026-10 4단계 신설, 신민용 확정] 네이션스 본선(24개국, 6조) — 후반기 A매치 기간
-    # 3번(31·35·39주)에만 열린다: 조별 212·214·216일 | 16강 240·8강 242·4강 244일 |
-    # 3·4위전·결승 268일. tournament_start_day=212(NATIONS_QUAL_ROUND_DAYS[0])로 넘겨서
+    # [2026-10 4단계 신설, 신민용 확정] 네이션스 본선(24개국, 6조) — [2026-10 개정] 31~33주 3주 연속:
+    # 조별 212·214·216일 → 16강 219 → 8강 222 → 4강 225 → 3·4위전·결승 228일
+    # (예전: 31·35·39주에 나눠 216 → 240 … 268일). tournament_start_day=212(NATIONS_QUAL_ROUND_DAYS[0])로 넘겨서
     # days+rest_after 누적이 정확히 이 날짜들이 되게 맞춘 표다(같은 라운드는 하루에 전부).
     "nations_finals": [
         {"stage": "group", "round": 1, "match_count": 12, "days": 1, "rest_after": 1,  "cap": 12, "min_rest": 0},
         {"stage": "group", "round": 2, "match_count": 12, "days": 1, "rest_after": 1,  "cap": 12, "min_rest": 1},
-        {"stage": "group", "round": 3, "match_count": 12, "days": 1, "rest_after": 23, "cap": 12, "min_rest": 1},
-        {"stage": "R16",   "round": 1, "match_count": 8,  "days": 1, "rest_after": 1,  "cap": 8,  "min_rest": 1},
-        {"stage": "QF",    "round": 1, "match_count": 4,  "days": 1, "rest_after": 1,  "cap": 4,  "min_rest": 1},
-        {"stage": "SF",    "round": 1, "match_count": 2,  "days": 1, "rest_after": 23, "cap": 2,  "min_rest": 1},
+        {"stage": "group", "round": 3, "match_count": 12, "days": 1, "rest_after": 2,  "cap": 12, "min_rest": 1},
+        {"stage": "R16",   "round": 1, "match_count": 8,  "days": 1, "rest_after": 2,  "cap": 8,  "min_rest": 1},
+        {"stage": "QF",    "round": 1, "match_count": 4,  "days": 1, "rest_after": 2,  "cap": 4,  "min_rest": 1},
+        {"stage": "SF",    "round": 1, "match_count": 2,  "days": 1, "rest_after": 2,  "cap": 2,  "min_rest": 1},
         {"stage": "TP",    "round": 1, "match_count": 1,  "days": 0, "rest_after": 0,  "cap": 1,  "min_rest": 1},
         {"stage": "F",     "round": 1, "match_count": 1,  "days": 1, "rest_after": 0,  "cap": 1,  "min_rest": 1},
     ],
@@ -2818,8 +2852,9 @@ REGIONAL_CUP_START_YEAR = get_next_tournament_year(GAME_START_YEAR, REGIONAL_CUP
 # 주기는 월드컵 앵커(WC_ANCHOR_YEAR=2002)와 같은 위상의 짝수 해가 예선 해다.
 # 끄면(False) 예전 4년 주기(대륙컵 해 겨울 예선 → 연말 본선) 그대로.
 NATIONS_CYCLE_ENABLED = True
-NATIONS_QUAL_ROUND_DAYS = (212, 214, 216, 240, 242, 244)
-NATIONS_QUAL_PO_DAY = 268
+# [2026-10 개정, 신민용 확정] 예선 6라운드 + 아메리카 PO를 31~32주 2주 안에(예전: 212·214·216 | 240·242·244 | PO 268).
+NATIONS_QUAL_ROUND_DAYS = (212, 214, 216, 218, 220, 222)
+NATIONS_QUAL_PO_DAY = 224
 NATIONS_CREATE_WEEK = day_to_week(NATIONS_QUAL_ROUND_DAYS[0]) - 1   # 30주
 
 
@@ -3278,7 +3313,7 @@ WC_QUAL_32 = {
 # ══════════════════════════════════════════════════════════════
 # 48팀 본선 대륙별 쿼터 (합 48)
 # ══════════════════════════════════════════════════════════════
-WC_EXPAND_YEAR     = 2022 # 월드컵 32강 날짜
+WC_EXPAND_YEAR     = 2026 # 월드컵 32강 날짜
 WC_TEAMS_BIG       = 48
 WC_GROUPS_BIG      = 12
 WC_BEST_THIRDS_BIG = 8
@@ -4432,6 +4467,26 @@ LEAGUE_RELATIVE_MARGIN_FALLBACK = 5   # 하위 20% = 최하위권 (그 이상 �
 #      여전히 어느 정도는 열려 있음. _AGENT_CONTINENT_BONUS(전문 에이전트
 #      보정)와 합산 적용되므로 대륙 전문 에이전트가 있으면 완화된다.
 FOREIGN_OFFER_MARGIN_PENALTY = 2
+
+# 4-1b) [2026-10 신설, 오퍼 생성 결함 수정] 패시브 오퍼 후보 팀의 "너무 약함"
+#      하한. 기존 마진은 "팀이 나보다 너무 강하면 제외"만 있고 반대쪽 하한이
+#      없어서, EPL OVR 90에게 바하마·리그투, 자국 1부 만석이면 2~4부 오퍼가
+#      그대로 채워졌다. 팀 평균 OVR이 (내 시장 평가 OVR - 하한) 미만이면 후보에서
+#      뺀다. 국내 = 내 보유 국적 나라의 팀, 해외 = 그 외.
+OFFER_TEAM_FLOOR_DOMESTIC = 12
+OFFER_TEAM_FLOOR_FOREIGN = 10
+
+# 4-1c) [2026-10 신설, 신민용 확정] 에이전트 등급별 해외 오퍼 성사 확률 배율.
+#      등급 확장(AGENT_UPPER_LEAGUE_BONUS)은 OVR 75 이상에서 D만으로도 SS에 닿아
+#      D와 S의 차이가 사라졌다 — 상위 에이전트의 이점을 "같은 시장 안에서 더 자주
+#      성사"로 준다. 해외 패시브 오퍼의 pass_fraction에만 곱하고 1.0 상한.
+#      [재시도 1회차, 신민용 확정] 1차(C 1.1/B 1.2/A 1.3/S 1.4)는 S/D 1.09배로 기준(1.10)
+#      미달 — 겨울엔 통과 비율이 이미 상한(1.0)이라 배율 효과가 없어 여름 쪽만 키운다.
+#      상한 1.0은 유지(배율로 확률이 1을 넘지 않는다).
+AGENT_FOREIGN_OFFER_MULT = {
+    "없음": 1.0, "F": 1.0, "E": 1.0, "D": 1.0,
+    "C": 1.15, "B": 1.3, "A": 1.45, "S": 1.6,
+}
 
 # 4-2) 해외 오퍼 성사 확률(pass_fraction)에 곱하는 나이 보정 — 나이가
 #      들수록 해외 이적 시장의 관심이 자연스럽게 줄어드는 효과. 이미
@@ -8850,6 +8905,13 @@ OLYMPIC_NAME = "U-23 올림픽"          # 대회명: "2000 U-23 올림픽", 예
 OLYMPIC_SQUAD_SIZE = 18             # 주전 11 + 교체 7
 OLYMPIC_GK = 2
 OLYMPIC_RESERVE_CUT = 4             # 후보 탈락 표시 인원
+# [2026-10 신설, 신민용 확정 B안] 예외 선발 — 정원표로 18명에서 빠진 선수가 후보 전체 선발 점수 상위
+# OLYMPIC_EXCEPTION_TOP위 안이고, 바꿀 교체 선수보다 OLYMPIC_EXCEPTION_MIN_GAP점 이상 높을 때만 교체
+# 명단에 넣는다(팀당 최대 OLYMPIC_EXCEPTION_MAX명, GK 제외, 주전은 그대로). 상위 11위·점수차 없음(1차
+# 시안)은 211개국 중 180개국에서 명단이 바뀌어 '예외'가 아니었다 — 압도적인 경우만 잡도록 좁혔다.
+OLYMPIC_EXCEPTION_TOP = 5
+OLYMPIC_EXCEPTION_MIN_GAP = 5.0
+OLYMPIC_EXCEPTION_MAX = 2
 # 본선 성적 표시 — 메달권은 메달, 나머지는 "8강 탈락" 식(조별리그는 "조별리그 탈락").
 OLYMPIC_RESULT_LABEL = {"우승": "금메달", "준우승": "은메달", "3위": "동메달", "4위": "4위",
                         "8강": "8강 탈락", "16강": "16강 탈락"}

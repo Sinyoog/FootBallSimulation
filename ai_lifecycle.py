@@ -1113,6 +1113,15 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
     # 그 결과가 다시 선수 기용(_select_lineup)까지 이어진다.
     try:
         _mgr_changed = _manager_turnover(c, year)
+        # [2026-10 구단 구매] 구단주가 예약한 감독 선임 — 기존 감독의 이번 시즌 평가가 끝난 직후 적용
+        # (club_owner 머리 주석). 예약이 없으면 빈 집합.
+        try:
+            import club_owner as _cowner
+            _own_changed = _cowner.apply_owner_appointments(c, year)
+            if _own_changed:     # 없으면 _mgr_changed를 그대로 둔다(순서까지 예전과 동일)
+                _mgr_changed = set(_mgr_changed or ()) | _own_changed
+        except Exception as _e:
+            print(f"[구단주] 감독 선임 적용 실패(계속 진행): {_e}")
         if _mgr_changed:
             _perf_log(f"[MANAGER] {year}년 감독 교체 {len(_mgr_changed)}팀")
     except Exception as _e:
@@ -10904,6 +10913,10 @@ def _manager_turnover(c, year, season=None):
     # 아래 dict들이 그대로다.
     import team_plan as _tplan
     _u_tids = _tplan.user_team_ids()
+    # [2026-10 구단 구매] 구단주 팀 — 경질·재계약은 구단주 몫이라 아래 거취 판정만 건너뛴다(실적·평판
+    # 누적, 은퇴·이직·공석 채우기는 그대로). 소유가 없으면 빈 집합 = 예전과 동일.
+    import club_owner as _cowner
+    _own_tids = _cowner.owned_team_ids(c)
     _u_mids = _tplan.user_manager_ids()
     if _u_tids or _u_mids:
         ranks = {k: v for k, v in ranks.items() if k not in _u_tids}
@@ -11016,6 +11029,13 @@ def _manager_turnover(c, year, season=None):
         tenure_updates.append((t_titles, rank, link["link_id"]))
 
         contract_until = int(m.get("contract_until") or 0)
+        if tid in _own_tids:
+            # 구단주 팀: AI 경질 없음, 계약 만료면 자동 재계약(club_owner.OWNER_AUTO_RENEW_YEARS).
+            # 팀별 rng를 쓰지 않고 넘어가지만 rng가 팀마다 따로라 다른 팀 판정에는 영향이 없다.
+            if not (contract_until and contract_until > year):
+                renews.append((year + _cowner.OWNER_AUTO_RENEW_YEARS, link["manager_id"]))
+                stats["renewed"] += 1
+            continue
         if contract_until and contract_until > year:
             # ── 계약 중 → 경질 판정만 ────────────────────────────
             miss = max(0.0, pct - target)

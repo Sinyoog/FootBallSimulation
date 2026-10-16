@@ -342,9 +342,9 @@
       "parent_team_name": "베르더 브레멘"
     },
     {
-      "team_name": "볼프스부르크 II",
+      "team_name": "VfL 볼프스부르크 II",
       "tier": 3,
-      "parent_team_name": "볼프스부르크"
+      "parent_team_name": "VfL 볼프스부르크"
     },
     {
       "team_name": "포르투나 뒤셀도르프 II",
@@ -384,7 +384,7 @@
     {
       "team_name": "마그데부르크 II",
       "tier": 6,
-      "parent_team_name": "마그데부르크"
+      "parent_team_name": "1. FC 마그데부르크"
     },
     {
       "team_name": "드레스덴 II",

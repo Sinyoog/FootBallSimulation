@@ -823,7 +823,13 @@ def choose_national_team(tournament_id, nat):
         return {"nat": nat, "selected": False, "qualified": False,
                 "result": "예선진출실패", "kind": _trow2["kind"]}
 
-    selected = _check_selection(p, grade, country=nat, continent=nat_continent)
+    selected = _check_selection(p, grade, country=nat, continent=nat_continent,
+                                tournament_id=tournament_id)
+    if not selected and p.get("injured") and _tournament_injury_eval(
+            tournament_id, nat, _my_injury_return_day(p))[0] == "exclude":
+        from game_engine import add_log as _add_log_inj
+        _add_log_inj(f"🚑 부상(회복까지 {p.get('injury_weeks')}일) — 대회 기간 안에 복귀할 수 없어 "
+                     f"발탁에서 제외됐습니다.", "event")
 
     conn = get_conn()
     trow = conn.execute("SELECT year, name, kind FROM intl_tournaments WHERE id=?",
@@ -2246,7 +2252,7 @@ def _create_one_tournament(year, is_wc, my_continent, p, my_nats, nat_info, comm
         except StopIteration:
             pass
         if my_sel == 1:
-            _grp_txt = (f"후반기 A매치 기간({w0}·{w0 + 4}·{w0 + 8}주)" if nations else f"조별리그 {w0}~{w0+2}주차")
+            _grp_txt = (f"후반기 A매치 기간({w0}~{w0 + 2}주)" if nations else f"조별리그 {w0}~{w0+2}주차")
             add_log(f"   📣 국가대표 소집! {_grp_txt}", "event", year, _lw)
         else:
             add_log("   📋 국가대표 미선발... 대표팀 경기를 지켜봅니다", "event", year, _lw)
@@ -3300,7 +3306,196 @@ def _intl_ovr_gap_penalty(ovr, real_squad_ovr):
         return 30.0
 
 
-def _check_selection(p, my_grade, country="", continent=""):
+# ── [2026-10 신설, 신민용 확정 — 국대 부상 소집 규칙] ─────────────────────────
+# 부상 판정은 "그 대회에서 실제로 뛸 수 있는가"를 일정으로 본다(예전: 부상이면 −15 고정).
+#   · 회복 처리일 = 오늘 + 남은 부상 일수(injury_weeks — 이름과 달리 '일' 단위). 그날
+#     경기는 이미 결장 처리되므로 출전 가능한 첫날은 그 다음 날 → "경기일 > 회복 처리일".
+#   · 대회 마지막 날까지 뛸 경기가 없으면(회복 처리일 ≥ 대회 마지막 경기일) 발탁 제외.
+#   · 첫 경기 전 회복이면 감점 0. 그 사이면 15 × (놓치는 내 조별·예선 경기 수 + 토너먼트
+#     첫 경기까지 놓치면 1) ÷ (내 조별·예선 경기 수 + 토너먼트가 있으면 1), 최대 15.
+#     토너먼트(조별·예선 외 단계)가 없는 대회는 그 항을 0으로 둔다.
+#   · 적용: 본선·대륙컵·예선(발탁창 수락 = 감점 경쟁, 자동 발탁 = 제외 여부만).
+#     친선전·U-23 올림픽은 이번 범위 밖. AI 선수는 개인 부상 상태가 없어 해당 없음.
+#   · 소집 후 부상: 대회 마지막 날 전 회복이면 유지(복귀 전 경기만 결장), 아니면 소집 해제.
+#     대회 시작 후 해제는 대체 발탁 없이 25명 유지(명단 생성 전이면 AI가 26명으로 자동 구성).
+INTL_INJURY_RELEASE_RESULT = "부상 소집 해제"
+INTL_INJURY_EXCLUDE_RESULT = "부상 제외"
+
+
+def _is_groupish_stage(stage):
+    """조별리그·예선 단계면 True(토너먼트 단계가 아님)."""
+    stage = stage or ""
+    return stage == "group" or stage.startswith("qual")
+
+
+def _my_injury_return_day(p):
+    """부상 중이면 회복 처리일(오늘 + 남은 일수), 아니면 None."""
+    if not p or not p.get("injured"):
+        return None
+    from game_engine import get_state
+    st = get_state() or {}
+    return (st.get("current_day") or 0) + int(p.get("injury_weeks") or 0)
+
+
+def _refresh_my_status(t):
+    """주 초에 읽어 둔 대회 dict의 my_selected·my_result를 DB 최신값으로 갱신한 사본."""
+    try:
+        conn = get_conn()
+        try:
+            r = conn.execute("SELECT my_selected, my_result FROM intl_tournaments WHERE id=?",
+                             (t["id"],)).fetchone()
+        finally:
+            conn.close()
+        if r:
+            t = dict(t)
+            t["my_selected"] = r["my_selected"]
+            t["my_result"] = r["my_result"]
+    except Exception:
+        pass
+    return t
+
+
+def _tournament_injury_eval(tournament_id, nat, return_day):
+    """→ ("ok", 0.0) / ("penalty", 감점) / ("exclude", None). 일정이 없으면 ("ok", 0.0)."""
+    if return_day is None or not tournament_id:
+        return ("ok", 0.0)
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT stage, day, week, home, away FROM intl_matches WHERE tournament_id=?",
+            (tournament_id,)).fetchall()
+    finally:
+        conn.close()
+    sched = []
+    for r in rows:
+        d = r["day"] or (week_to_day(r["week"]) if r["week"] else 0)
+        if d:
+            sched.append((r["stage"], d, r["home"], r["away"]))
+    if not sched:
+        return ("ok", 0.0)
+    last_day = max(d for _, d, _, _ in sched)
+    if return_day >= last_day:
+        return ("exclude", None)
+    my_group = sorted(d for st_, d, h, a in sched if _is_groupish_stage(st_) and nat in (h, a))
+    ko_days = [d for st_, d, _, _ in sched if not _is_groupish_stage(st_)]
+    first_day = my_group[0] if my_group else (min(ko_days) if ko_days else last_day)
+    if return_day < first_day:
+        return ("ok", 0.0)
+    missed = sum(1 for d in my_group if d <= return_day)
+    denom = len(my_group) + (1 if ko_days else 0)
+    if ko_days and return_day >= min(ko_days):
+        missed += 1
+    pen = 15.0 * missed / denom if denom else 15.0
+    return ("penalty", round(min(15.0, pen), 2))
+
+
+def enforce_injury_on_auto_callups(year):
+    """대회 생성 직후 호출 — 발탁창 없이 자동 발탁(my_selected=1)된 대회는 선발점수
+    경쟁을 다시 하지 않고(예선 통과로 이미 검증), 대회 마지막 날까지 회복 못 할 때만
+    제외한다(신민용 확정 3번)."""
+    from game_engine import get_player, add_log
+    p = get_player()
+    rd = _my_injury_return_day(p)
+    if rd is None:
+        return
+    conn = get_conn()
+    try:
+        ts = [dict(r) for r in conn.execute(
+            "SELECT * FROM intl_tournaments WHERE year=? AND my_selected=1 AND status!='done' "
+            "AND COALESCE(my_result,'')=''", (year,))]
+    finally:
+        conn.close()
+    for t in ts:
+        if t.get("kind") in ("oly_qual", "olympic"):
+            continue
+        nat = _my_nat(t, p)
+        if _tournament_injury_eval(t["id"], nat, rd)[0] != "exclude":
+            continue
+        conn = get_conn()
+        conn.execute("UPDATE intl_tournaments SET my_selected=2, my_result=? WHERE id=?",
+                     (INTL_INJURY_EXCLUDE_RESULT, t["id"]))
+        conn.commit(); conn.close()
+        add_log(f"🚑 부상(회복까지 {p.get('injury_weeks')}일) — {nat} {t['name']} 기간 안에 복귀할 수 없어 "
+                f"대표팀 발탁에서 제외됐습니다.", "event")
+
+
+def _injury_replacement_callup(conn, tournament_id, nat, my_position):
+    """[첫 경기 전 소집 해제] 이미 저장된 명단(나 때문에 AI 25명)에 한 자리를 채운다 —
+    26인 선발 때 같은 포지션 그룹에서 탈락한 후보(intl_callup_pool) 중 최상위, 없으면
+    전체 후보 최상위. 명단이 아직 없으면(첫 경기 때 생성) 아무것도 안 한다 — 그때는
+    my_selected가 1이 아니라 AI 26명으로 뽑힌다. 반환: 대체 선수 dict 또는 None."""
+    n = conn.execute("SELECT COUNT(*) FROM intl_squad WHERE tournament_id=? AND country=?",
+                     (tournament_id, nat)).fetchone()[0]
+    if not n:
+        return None
+    bucket = _INTL_CALLUP_BUCKET_OF.get(my_position or "")
+    cands = conn.execute(
+        """SELECT cp.player_id, cp.bucket, cp.rank, ap.name, ap.position, ap.ovr
+           FROM intl_callup_pool cp JOIN ai_players ap ON ap.id = cp.player_id
+           WHERE cp.tournament_id=? AND cp.country=?
+             AND cp.player_id NOT IN (SELECT player_id FROM intl_squad WHERE tournament_id=? AND country=?)
+           ORDER BY (cp.bucket = ?) DESC, cp.rank ASC, cp.score DESC""",
+        (tournament_id, nat, tournament_id, nat, bucket or "")).fetchall()
+    if not cands:
+        return None
+    r = dict(cands[0])
+    conn.execute("INSERT OR IGNORE INTO intl_squad(tournament_id, country, player_id, appearances, position) "
+                 "VALUES (?,?,?,0,?)", (tournament_id, nat, r["player_id"], r["position"] or ""))
+    # 후보군 표에서는 뺀다 — 이제 "후보 탈락"이 아니라 최종 명단이다.
+    conn.execute("DELETE FROM intl_callup_pool WHERE tournament_id=? AND country=? AND player_id=?",
+                 (tournament_id, nat, r["player_id"]))
+    return r
+
+
+def on_my_injury():
+    """[소집 후 부상] 내 선수가 부상당한 직후 호출(game_engine._apply_injury 등). 출전 확정
+    (my_selected=1)이고 아직 내 성적이 확정되지 않은 대회 중, 대회 마지막 날까지 회복할 수
+    없는 대회는 소집 해제한다. 대회 첫 경기 전이면 같은 포지션 후보로 한 자리를 채워 26명을
+    맞추고(명단이 아직 없으면 생성 때 AI 26명), 대회가 시작된 뒤면 대체 없이 25명으로 간다."""
+    from game_engine import get_player, add_log, get_state
+    p = get_player()
+    rd = _my_injury_return_day(p)
+    if rd is None:
+        return
+    year = (get_state() or {}).get("current_year")
+    conn = get_conn()
+    try:
+        ts = [dict(r) for r in conn.execute(
+            "SELECT * FROM intl_tournaments WHERE year=? AND my_selected=1 AND status!='done' "
+            "AND COALESCE(my_result,'')=''", (year,))]
+    finally:
+        conn.close()
+    for t in ts:
+        if t.get("kind") in ("oly_qual", "olympic"):
+            continue
+        nat = _my_nat(t, p)
+        if _tournament_injury_eval(t["id"], nat, rd)[0] != "exclude":
+            continue
+        conn = get_conn()
+        agg = conn.execute(
+            """SELECT COUNT(*) caps, COALESCE(SUM(my_goals),0) g, COALESCE(SUM(my_assists),0) a,
+                      COALESCE(AVG(my_rating),0) r
+               FROM intl_matches WHERE tournament_id=? AND my_played=1""", (t["id"],)).fetchone()
+        conn.execute("UPDATE intl_tournaments SET my_selected=2, my_result=? WHERE id=?",
+                     (INTL_INJURY_RELEASE_RESULT, t["id"]))
+        _started = conn.execute("SELECT COUNT(*) FROM intl_matches WHERE tournament_id=? AND home_score>=0",
+                                (t["id"],)).fetchone()[0]
+        _repl = None if _started else _injury_replacement_callup(conn, t["id"], nat, p.get("position"))
+        conn.execute("""INSERT INTO intl_history(year, competition, team_name, result,
+                                                 goals, assists, caps, rating)
+                        VALUES(?,?,?,?,?,?,?,?)""",
+                     (t["year"], t["name"], nat, INTL_INJURY_RELEASE_RESULT,
+                      agg["g"], agg["a"], agg["caps"], round(agg["r"], 2) if agg["caps"] else 0))
+        conn.commit(); conn.close()
+        add_log(f"🚑 부상(회복까지 {p.get('injury_weeks')}일)으로 {nat} {t['name']} 대표팀 소집이 "
+                f"해제됐습니다. (출전 {agg['caps']}경기)"
+                + (f" — 대체 발탁: {_repl['name']}({_repl['position']}, OVR {_repl['ovr']})" if _repl
+                   else (" — 대회가 이미 시작돼 대체 발탁 없음" if _started else "")), "event")
+        if _repl:
+            _invalidate_real_squad_ovr_cache()
+
+
+def _check_selection(p, my_grade, country="", continent="", tournament_id=None):
     """국가대표 선발 판정 — [2026-07 전면 재설계, 신민용 확정] "OVR이 그
     나라 평균과 비슷하면 무조건 뽑힌다"는 절대 문턱 방식에서, 실제
     국가대표처럼 포지션별 정원(23인 = GK3/DF8/MF8/FW4) 안에서 동포지션
@@ -3396,8 +3591,15 @@ def _check_selection(p, my_grade, country="", continent=""):
     # 반영하므로 이중 감점이 된다. 부상·감독불화는 기록에 안 남는 정보라
     # 그대로 유지한다.
     penalty = 0.0
-    if p.get("injured"):
-        penalty += 15.0
+    # [2026-10 국대 부상 소집 규칙] 고정 −15 대신 그 대회 일정 기준 판정(위 헬퍼 주석 참고).
+    # 대회를 모르는 호출(대회 생성 시점의 후보 거르기)에선 부상을 보지 않는다 — 발탁창 수락
+    # (choose_national_team)이 대회 일정으로 다시 판정하고, 자동 발탁은
+    # enforce_injury_on_auto_callups가 제외 여부만 본다.
+    if p.get("injured") and tournament_id:
+        _inj_st, _inj_pen = _tournament_injury_eval(tournament_id, nat, _my_injury_return_day(p))
+        if _inj_st == "exclude":
+            return False
+        penalty += _inj_pen
     rel = p.get("manager_relation", 50)
     if rel < 30:
         penalty += 8.0
@@ -4754,6 +4956,73 @@ def _intl_effective_diff(h_ovr, a_ovr):
     return _intl_effective_ovr(h_ovr) - _intl_effective_ovr(a_ovr)
 
 
+# [2026-10 A* 꼬리, 신민용 확정] 국가대표 AI 경기 승/무/패 꼬리 상수.
+# 예전 공식은 직선식에 고정 클램프(중립: 승 ≤ .95 / 무 ≥ .05 / 패 ≥ .02,
+# 예선: 홈 승 ≥ .04)를 씌워서, 실질 전력차 약 15 이상(예: 100 vs 80)부터는
+# 100 vs 60이든 100 vs 80이든 무 4.9% / 패 2.0%로 똑같이 포화됐다(예선
+# 원정에서는 약팀 홈 승률이 4%까지). 또 홈 하한(.04)과 원정 하한(.02)이
+# 달라 중립 경기도 극단 격차에서 대칭이 아니었다(약팀이 홈 칸이면 3.8%,
+# 원정 칸이면 2.0%).
+# 이제 클램프 없이:
+#   · 약팀 승: 실질차 _INTL_TAIL_LOSS_START까지(예선은 같은 확률 지점까지)
+#     예전 직선식 그대로, 그 뒤로는 _INTL_TAIL_LOSS_DECAY마다 1/e로 감소.
+#   · 무승부: 실질차 _INTL_TAIL_DRAW_START까지 예전 직선식(0.24 − 0.009×차),
+#     그 뒤로는 _INTL_TAIL_DRAW_DECAY마다 1/e로 감소(거의 평평 — 0.5% 안팎).
+#   · 강팀 승 = 1 − 무 − 약팀 승. 0이 되는 확률은 없다(작은 이변은 남는다).
+#   · 예선(비중립)은 예전 비대칭 머리(홈 0.46 + diff×계수)를 그대로 두고
+#     같은 꼬리만 붙인다 — 동전력 홈 46 / 24 / 30 유지.
+# 자동 탐색(S1)과 3시드 × 4시즌 대회 검증(S2) 결과(중립, 강팀 승/무/패 %):
+#   97 vs 94  58.4 / 20.3 / 21.3 (예전과 동일)
+#   100 vs 90 86.6 / 11.85 / 1.50 (예전 87.3 / 10.9 / 1.8)
+#   100 vs 80 97.6 / 1.95 / 0.43  (예전 93.1 / 4.9 / 2.0)
+#   100 vs 70 99.3 / 0.57 / 0.14  (예전 93.1 / 4.9 / 2.0 포화값)
+#   100 vs 60 99.4 / 0.54 / 0.044 (예전 93.1 / 4.9 / 2.0 포화값)
+#   하한이 안 걸리던 실질차 0~8 구간은 예전과 0.5%p 이내.
+#   예선 조에서 실질차 15+ 약팀 상대로 한 번이라도 못 이긴 강팀 35.2% → 16.4%.
+_INTL_TAIL_LOSS_START = 8.7
+_INTL_TAIL_LOSS_DECAY = 8.8
+_INTL_TAIL_DRAW_START = 26.0
+_INTL_TAIL_DRAW_DECAY = 178.0
+
+
+def _intl_outcome_probs(diff, neutral):
+    """[2026-10 A* 꼬리] 실질 전력차 diff(홈 − 원정, 곡선·감독 보정 포함)로
+    (홈 승, 무, 원정 승) 확률을 낸다. 합은 항상 1, 모든 값 > 0.
+    neutral=True면 diff 부호만 뒤집어 대칭, False면 예선용 비대칭(홈 우세)."""
+    c = _INTL_DIFF_COEF
+    x = abs(diff)
+    d_start, d_decay = _INTL_TAIL_DRAW_START, _INTL_TAIL_DRAW_DECAY
+    l_start, l_decay = _INTL_TAIL_LOSS_START, _INTL_TAIL_LOSS_DECAY
+    if x <= d_start:
+        dw = 0.24 - 0.009 * x
+    else:
+        dw = (0.24 - 0.009 * d_start) * math.exp(-(x - d_start) / d_decay)
+    # 꼬리가 시작되는 지점의 약팀 승률(중립 직선식 값, 약 2.6%)
+    l_sw = (1.0 - (0.24 - 0.009 * l_start)) / 2.0 - l_start * c
+    if neutral:
+        if x <= l_start:
+            under = (1.0 - (0.24 - 0.009 * x)) / 2.0 - x * c
+        else:
+            under = l_sw * math.exp(-(x - l_start) / l_decay)
+        fav = 1.0 - dw - under
+        return (fav, dw, under) if diff >= 0 else (under, dw, fav)
+    if diff >= 0:
+        # 홈이 강팀: 원정 약팀 승률 머리 = 1 − (0.46 + x·c) − (0.24 − 0.009x)
+        x_sw = (1.0 - 0.46 - 0.24 - l_sw) / (c - 0.009)
+        if x <= x_sw:
+            aw = 1.0 - (0.46 + x * c) - (0.24 - 0.009 * x)
+        else:
+            aw = l_sw * math.exp(-(x - x_sw) / l_decay)
+        return 1.0 - dw - aw, dw, aw
+    # 원정이 강팀: 홈 약팀 승률 머리 = 0.46 − x·c
+    x_sw = (0.46 - l_sw) / c
+    if x <= x_sw:
+        hw = 0.46 - x * c
+    else:
+        hw = l_sw * math.exp(-(x - x_sw) / l_decay)
+    return hw, dw, 1.0 - dw - hw
+
+
 def _match_outcome(h_ovr, a_ovr, knockout, neutral=False, h_mgr=0.0, a_mgr=0.0):
     """'home'/'draw'/'away' 반환 (KO는 무승부 → 승부차기).
     [수정] 무승부 확률을 전력차에 반비례하도록 개선 (기존 dw=0.22 고정 →
@@ -4808,22 +5077,16 @@ def _match_outcome(h_ovr, a_ovr, knockout, neutral=False, h_mgr=0.0, a_mgr=0.0):
     적용 차이(_intl_effective_diff)로 낸다 — 중립(본선)·비중립(예선)
     양쪽 모두. 기울기(_INTL_DIFF_COEF)·무승부식·클램프는 그대로다.
     85 이하끼리의 경기는 곡선이 항등이라 예전과 완전히 같다.
+
+    [2026-10 A* 꼬리, 신민용 확정] 고정 상한·하한(승 ≤ .95, 무 ≥ .05,
+    패 ≥ .02, 예선 홈 승 ≥ .04)을 없애고 이변 확률이 격차에 따라 계속
+    줄어드는 꼬리로 바꿨다 — 실제 계산은 _intl_outcome_probs. 감독 보정·
+    곡선·기울기·난수 소비(random.random() 1회)는 그대로다.
     """
     diff = _intl_effective_diff(h_ovr, a_ovr)
     # [2026-10 6번 ③-1 대표팀] 감독 능력 보정은 곡선 뒤(기본 0 = 예전과 같음).
     diff = diff + (h_mgr - a_mgr)
-    _DIFF_COEF = _INTL_DIFF_COEF
-    if neutral:
-        dw = max(0.05, 0.24 - abs(diff) * 0.009)
-        half = max(0.0, 1.0 - dw) / 2.0
-        hw = max(0.04, min(0.95, half + diff * _DIFF_COEF))
-        aw = max(0.02, min(0.95, half - diff * _DIFF_COEF))
-    else:
-        hw = max(0.04, min(0.95, 0.46 + diff * _DIFF_COEF))
-        dw = max(0.05, 0.24 - abs(diff) * 0.009)
-        aw = max(0.02, 1.0 - hw - dw)
-    tot = hw + dw + aw
-    hw, dw, aw = hw / tot, dw / tot, aw / tot
+    hw, dw, aw = _intl_outcome_probs(diff, neutral)
     roll = random.random()
     if roll < hw:
         return "home"
@@ -6523,6 +6786,7 @@ def _save_qual_results(t, continent, qualified_list, set_done=True):
     """
     from game_engine import add_log, get_player
 
+    t = _refresh_my_status(t)   # [2026-10] 예선 도중 부상 소집 해제가 있었을 수 있다
     tid = t["id"]
     target_year = t["year"]
     # [2026-09] 골드컵 예선 폐지 이후 cont_qual은 유럽 전용이라 항상
@@ -6609,7 +6873,7 @@ def _save_qual_results(t, continent, qualified_list, set_done=True):
                 _upd_pledged(qual_pledged_nat="")
             except Exception:
                 pass
-    else:
+    elif (t.get("my_result") or "") not in (INTL_INJURY_RELEASE_RESULT, INTL_INJURY_EXCLUDE_RESULT):
         conn = get_conn()
         conn.execute("UPDATE intl_tournaments SET my_result=? WHERE id=?", ("예선 미참가", tid))
         conn.commit(); conn.close()
@@ -7257,7 +7521,10 @@ def _record_my_exit(t, result):
     else:
         _raw_result = result
 
+    t = _refresh_my_status(t)   # [2026-10] 대회 도중 부상 소집 해제가 있었을 수 있다
     if t["my_selected"] != 1:
+        if (t.get("my_result") or "") in (INTL_INJURY_RELEASE_RESULT, INTL_INJURY_EXCLUDE_RESULT):
+            return   # [2026-10] 부상 소집 해제/제외 기록은 그대로 둔다
         conn = get_conn()
         conn.execute("UPDATE intl_tournaments SET my_result=? WHERE id=?",
                      (f"{result} (미선발)", t["id"]))
@@ -7369,7 +7636,9 @@ def get_my_intl_matches(only_qual=False):
         f"""SELECT m.*, t.year AS t_year, t.name AS comp
            FROM intl_matches m
            JOIN intl_tournaments t ON m.tournament_id = t.id
-           WHERE m.is_my = 1 AND t.my_selected = 1 AND m.home_score >= 0 AND {kind_filter}
+           WHERE m.is_my = 1 AND m.home_score >= 0 AND {kind_filter}
+             AND (t.my_selected = 1
+                  OR (t.my_result = '{INTL_INJURY_RELEASE_RESULT}' AND m.my_played = 1))
            ORDER BY t.year, m.week""").fetchall()]
     # [2026-08 성능 수정, 신민용 리포트: "재능 좋은 선수로 오래 뛰면
     # 은퇴/커리어창이 심하게 렉걸린다"] intl_entries 전체 대신 내 경기가

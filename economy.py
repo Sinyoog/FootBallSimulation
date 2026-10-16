@@ -1129,6 +1129,168 @@ def _calc_salary(grade, tier, ovr, country=None, team_name=None, year=None, team
 
 
 # ══════════════════════════════════════════════════════════════
+# [2026-10 신설, 신민용 확정] 내 선수 전용 연봉 곡선(B단계) + 실적 검증도
+# ══════════════════════════════════════════════════════════════
+# 문제(신민용 리포트): "커리어도 없는 17세가 OVR만 보고 연봉 390억·이적료 1,400억". 기존
+# _calc_salary는 OVR·리그·구단만 보고 나이·실적은 보지 않았다(+신급 ×1.6). 내 선수의 새 계약
+# 연봉만 아래 규칙으로 계산한다 — AI 연봉·이적료(_calc_salary/estimate_transfer_fee)와 이미
+# 맺은 계약은 그대로다.
+#
+# 계산 순서(고정):
+#   1) 리그 기준 연봉 B_L(OVR, V) — 나이·검증도·구단·경제지수 적용 전, 2026년 기준
+#      · 5대 리그 1부: 새 곡선(MY_SALARY_CURVE_EOK, 구간 사이 지수보간) × 리그 배율
+#      · 사용자 보정 리그 1부(SALARY_CURVE_OVERRIDE 중 5대 리그 제외 — 사우디·카타르·UAE·
+#        중국·K리그·홍콩): 기존 곡선 유지. 기존 곡선이 초봉 상한(MY_SALARY_ROOKIE_CAP_EOK)을
+#        넘는 칸만 초봉 상한 + (기존 − 초봉 상한) × min(V,1)² (V=1이면 기존 곡선 그대로)
+#      · 그 외 1부(미국 포함): 기존 곡선, 단 같은 OVR 리그1 수준(새 곡선 × 0.55) 상한
+#      · 2부 이하: 기존 곡선, 단 바로 위 부 B_L의 60% 상한
+#      "기존 곡선" = _calc_salary + _clamp_salary_to_cap(실제 오퍼 경로와 같은 국가·하위 부
+#      상한), 구단 정보·경제지수 없이.
+#   2) × 나이 배율(B안: 26세 이하는 배율 + (1−배율)×min(V,1)) × 검증 배율(0.20+0.80V)
+#      × 구단 배율(명문 × 체급) × 경제지수 × 폼 × 랜덤(호출부)
+#   3) 최종 상한 = B_L × 경제지수 × 1.16 × (그 나라 구단 배율 최대 — 축구 열기 반영)
+#   4) 2부 이하: 같은 선수의 위 부 기준 지급액(구단 1.0·랜덤 없음)의 60%
+#   5) 국가·하위 부 절대 상한(_clamp_salary_to_cap, 경제지수 반영) — 겹치면 낮은 쪽
+# 경제지수·구단 배율은 각각 정확히 한 번만 곱한다.
+MY_SALARY_CURVE_EOK = ((50, 3.0), (60, 6.0), (70, 12.0), (80, 24.0), (88, 48.0),
+                       (90, 96.0), (93, 352.0), (96, 500.0))
+MY_SALARY_TOP5_MULT = {"잉글랜드": 1.0, "스페인": 0.9, "독일": 0.8, "이탈리아": 0.75, "프랑스": 0.55}
+MY_SALARY_ROOKIE_CAP_EOK = ((80, 24.0), (90, 96.0), (95, 300.0), (96, 500.0))
+MY_SALARY_NON_TOP5_CAP_MULT = 0.55      # 5대 리그 밖 일반 1부: 같은 OVR 리그1 수준까지
+MY_SALARY_LOWER_TIER_RATIO = 0.6        # 2부 이하: 바로 위 부의 60%까지
+MY_SALARY_AGE_TABLE = ((20, 0.55), (23, 0.88), (26, 1.0), (30, 1.05), (33, 0.78), (36, 0.5))
+MY_SALARY_AGE_RELIEF_MAX_AGE = 26       # 이 나이까지만 나이 감액을 검증도만큼 풀어준다(B안)
+MY_VERIFICATION_MAX = 1.2
+MY_SALARY_STRENGTH_MAX = 1.10           # _club_strength_salary_mult 최대
+MY_FEE_VERIFY_FLOOR = 0.35              # 이적료 검증 배율 0.35+0.65×min(V,1)
+
+
+def _my_geo_interp(anchors, x):
+    """앵커(OVR, 억) 사이 지수보간 — 첫 앵커 아래는 OVR 10당 절반, 마지막 앵커 위는 평평."""
+    o0, v0 = anchors[0]
+    if x <= o0:
+        return v0 * 2 ** ((x - o0) / 10.0)
+    if x >= anchors[-1][0]:
+        return anchors[-1][1]
+    for (o1, v1), (o2, v2) in zip(anchors, anchors[1:]):
+        if o1 <= x <= o2:
+            return v1 * (v2 / v1) ** ((x - o1) / (o2 - o1))
+    return anchors[-1][1]
+
+
+def my_salary_curve_eok(ovr):
+    return _my_geo_interp(MY_SALARY_CURVE_EOK, ovr)
+
+
+def my_rookie_cap_eok(ovr):
+    return _my_geo_interp(MY_SALARY_ROOKIE_CAP_EOK, ovr)
+
+
+def _my_salary_calibrated_countries():
+    from constants import SALARY_CURVE_OVERRIDE
+    return {k for k in SALARY_CURVE_OVERRIDE if k not in MY_SALARY_TOP5_MULT}
+
+
+def _my_old_league_salary(wealth, tier, ovr, country):
+    """기존 리그 곡선(천원, 2026년 기준) — 실제 오퍼 경로와 같은 _calc_salary + 상한, 구단·경제지수 없이."""
+    v = _calc_salary(wealth, tier, ovr, country=country, year=None)
+    return _clamp_salary_to_cap(v, wealth, country, tier, ovr=ovr, year=None)
+
+
+def my_league_base_salary(wealth, tier, ovr, country, V=1.0):
+    """리그 기준 연봉 B_L(천원, 2026년 기준) — 나이·검증도·구단·경제지수 적용 전."""
+    m = max(0.0, min(1.0, V or 0.0))
+    if (tier or 1) <= 1:
+        if country in MY_SALARY_TOP5_MULT:
+            return int(my_salary_curve_eok(ovr) * 100_000 * MY_SALARY_TOP5_MULT[country])
+        v = _my_old_league_salary(wealth, 1, ovr, country)
+        if country in _my_salary_calibrated_countries():
+            r = int(my_rookie_cap_eok(ovr) * 100_000)
+            return int(r + (v - r) * m * m) if v > r else int(v)
+        return int(min(v, my_salary_curve_eok(ovr) * 100_000 * MY_SALARY_NON_TOP5_CAP_MULT))
+    up = my_league_base_salary(wealth, tier - 1, ovr, country, V)
+    return int(min(_my_old_league_salary(wealth, tier, ovr, country), up * MY_SALARY_LOWER_TIER_RATIO))
+
+
+def my_age_salary_mult(age, V):
+    a = age if age is not None else 26
+    t = MY_SALARY_AGE_TABLE
+    if a <= t[0][0]:
+        am = t[0][1]
+    elif a >= t[-1][0]:
+        am = t[-1][1]
+    else:
+        am = t[-1][1]
+        for (a1, m1), (a2, m2) in zip(t, t[1:]):
+            if a1 <= a <= a2:
+                am = m1 + (m2 - m1) * (a - a1) / (a2 - a1)
+                break
+    if a <= MY_SALARY_AGE_RELIEF_MAX_AGE and am < 1.0:
+        am = am + (1.0 - am) * max(0.0, min(1.0, V or 0.0))
+    return am
+
+
+def my_verification_salary_mult(V):
+    return 0.20 + 0.80 * max(0.0, min(MY_VERIFICATION_MAX, V or 0.0))
+
+
+def my_club_mult_cap(country):
+    """그 나라 구단 배율(명문 × 체급)의 최대값 — 축구 열기 반영. 열기 기본값 나라는 1.12×1.10=1.232."""
+    from data.prestige_clubs import (PRESTIGE_LEVEL_SALARY_MULT, COUNTRY_FOOTBALL_HEAT,
+                                     COUNTRY_FOOTBALL_HEAT_DEFAULT, COUNTRY_HEAT_SALARY_WEIGHT)
+    heat = COUNTRY_FOOTBALL_HEAT.get(country, COUNTRY_FOOTBALL_HEAT_DEFAULT)
+    return (max(PRESTIGE_LEVEL_SALARY_MULT.values()) * (1 + (heat - 1) * COUNTRY_HEAT_SALARY_WEIGHT)
+            * MY_SALARY_STRENGTH_MAX)
+
+
+def my_contract_salary(wealth, tier, ovr, country, team_name=None, team_id=None, year=None,
+                       age=None, V=0.0, eff_ovr=None, adj_mult=1.0):
+    """내 선수 새 계약 연봉(천원). adj_mult = 호출부의 랜덤 변동·평점 가감(상한 적용 전에 곱함)."""
+    if not country:
+        return _calc_salary(wealth, tier, ovr, year=year)
+    V = max(0.0, min(MY_VERIFICATION_MAX, V or 0.0))
+    b = my_league_base_salary(wealth, tier, ovr, country, V)
+    if b <= 0:
+        return 0
+    form = 1.0
+    if eff_ovr is not None and eff_ovr < ovr:
+        be = my_league_base_salary(wealth, tier, int(round(eff_ovr)) if not isinstance(eff_ovr, int) else eff_ovr,
+                                   country, V)
+        form = max(0.70, min(1.0, (be / b) ** 0.5))
+    am = my_age_salary_mult(age, V)
+    vm = my_verification_salary_mult(V)
+    club = 1.0
+    if team_name:
+        from data.prestige_clubs import prestige_salary_mult
+        club *= prestige_salary_mult(country, team_name)
+    if team_id:
+        club *= _club_strength_salary_mult(team_id)
+    eidx = economy_index(year) if year is not None else 1.0
+    sal = b * am * vm * club * eidx * form * adj_mult
+    sal = min(sal, b * eidx * my_verification_salary_mult(MY_VERIFICATION_MAX) * my_club_mult_cap(country))
+    if (tier or 1) >= 2:
+        up = my_league_base_salary(wealth, tier - 1, ovr, country, V)
+        sal = min(sal, up * am * vm * eidx * form * MY_SALARY_LOWER_TIER_RATIO)
+    sal = _clamp_salary_to_cap(int(sal), wealth, country, tier, ovr=ovr, year=year)
+    return max(0, int(sal))
+
+
+def my_transfer_fee(base_fee, age, V):
+    """내 선수 이적료 검증도 반영 — 나이 프리미엄(배율>1인 부분)은 min(V,1)만큼만 인정하고,
+    전체에 0.35+0.65×min(V,1)을 곱한다. 항상 현행 이적료 이하. 새 연봉 하한은 호출부가 건다
+    (최종 이적료 = max(이 값, 그 오퍼의 새 연봉))."""
+    if not base_fee:
+        return base_fee
+    m = max(0.0, min(1.0, V or 0.0))
+    am = _age_mult(age)
+    f = float(base_fee)
+    if am > 1.0:
+        f = f / am * (1.0 + (am - 1.0) * m)
+    f *= MY_FEE_VERIFY_FLOOR + (1.0 - MY_FEE_VERIFY_FLOOR) * m
+    return int(f)
+
+
+# ══════════════════════════════════════════════════════════════
 # 이적 협상 시스템 (2026-07 신설, 신민용+GPT 다회 설계 확정)
 # ══════════════════════════════════════════════════════════════
 # 오퍼가 뜨면 무조건 이적 가능했던 예전 구조 대신, 3단계 판단을 거친다:

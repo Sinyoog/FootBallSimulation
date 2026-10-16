@@ -26,6 +26,7 @@ _ovr_cache_invalidated: bool = False
 # 전수 스캔이 매번 반복된다. 패널은 화면당 2개뿐이므로 생성 시 여기 등록해
 # 두고 바로 꺼내 쓴다. 약한 참조라 창이 닫히면 알아서 빠진다.
 import weakref as _weakref
+import pitch_names as _pn   # [2026-10] 피치 이름 축약 표기(T. 몬테이루) + 폭 맞춤 그리기
 _LIVE_TEAM_PANELS: "_weakref.WeakSet" = _weakref.WeakSet()
 
 
@@ -534,6 +535,16 @@ def _is_player_foreign(pl: dict, team_country: str) -> bool:
     필요 없이 "그냥 지금 이 선수가 외국인인가"만 답하면 된다."""
     if not team_country or not pl:
         return False
+    # [2026-10 버그수정, 신민용 리포트: "군대 보면 선수들이 다 외국인으로 표시된다 — 군대는
+    # 포메이션이든 팀 검색이든 다 자국 선수"] 군팀 리그의 나라는 가상 국가 "군대"라 선수 국적
+    # (대한민국)과 늘 달랐다. 감독 국적 판정(military_service.manager_nationality_for)과 같은
+    # 규칙으로 "군대"를 대한민국으로 바꿔서 비교한다 — 이 함수 하나가 메인 포메이션 캔버스·
+    # 명단 패널·상대팀 표시 전부의 판정 지점이다.
+    try:
+        from military_service import manager_nationality_for as _home_of
+        team_country = _home_of(team_country)
+    except Exception:
+        pass
     if pl.get("is_me"):
         nats = {(pl.get(k) or "") for k in
                 ("nationality", "nationality2", "nationality3", "nationality4")}
@@ -1182,6 +1193,20 @@ class _FormationCanvas(QWidget):
                 player_at[i] = p
         self._player_at = player_at
 
+        # [2026-10 신설, 신민용 확정] 피치 원 아래 이름만 "이니셜. 성"으로 줄인다
+        # (오른쪽 명단·스탯 창은 원래 이름 그대로, 내 선수도 같은 규칙).
+        # 국적은 dict에 있으면 그대로, 없으면 id로 한 번에 조회해 위젯에 캐시.
+        if getattr(self, "_pn_nat_cache", None) is None:
+            self._pn_nat_cache = _pn.NationalityCache()
+        _pls = [player_at.get(k) for k in range(len(positions_xy))]
+        _nats = self._pn_nat_cache.get([p_.get("id") for p_ in _pls
+                                        if p_ and not p_.get("nationality")])
+        _short = _pn.short_names([
+            ((p_.get("name"), p_.get("nationality") or _nats.get(p_.get("id"), "")) if p_ else None)
+            for p_ in _pls])
+        _name_ws = _pn.row_name_widths([(x_, y_) for (x_, y_, _p, _si) in positions_xy],
+                                       default_w=max(48, self._circle_d + 16), min_w=40)
+
         for i, (px, py, pos, _slot_idx) in enumerate(positions_xy):
             pl = player_at.get(i)
             is_me = pl.get("is_me", False) if pl else False
@@ -1230,21 +1255,19 @@ class _FormationCanvas(QWidget):
                 painter.setPen(QPen(QColor("#2ec2ffff"), 5))
                 painter.drawEllipse(px-r-_sel_pad, py-r-_sel_pad, d+_sel_pad*2, d+_sel_pad*2)
             painter.setPen(QPen(QColor("#000" if is_me else "#fff")))
-            f = QFont(); f.setPointSize(max(6, min(10, d // 5))); f.setBold(True); painter.setFont(f)
             # 내 선수는 배치 포지션(field_pos) 표시, AI는 슬롯 포지션
             _disp_pos = pl.get("field_pos", pos) if (pl and is_me) else pos
-            painter.drawText(px-r, py-r, d, d, Qt.AlignmentFlag.AlignCenter, _disp_pos[:2])
+            # [2026-10 버그수정, 신민용 리포트] [:2](CAM→CA)·[:6](맥레오드→맥레오) 글자 수
+            # 자르기 대신 실제 폭에 맞춰 글씨를 줄인다(넘칠 때만 말줄임).
+            _pn.draw_fitted_text(painter, px - r + 2, py - r, d - 4, d, _disp_pos or "",
+                                 Qt.AlignmentFlag.AlignCenter, max(6, min(10, d // 5)), bold=True)
             if pl:
-                f2 = QFont(); f2.setPointSize(max(6, min(9, d // 6))); f2.setBold(is_me); painter.setFont(f2)
                 _name_color = "#ff6666" if is_injured_me else ("#ffff00" if is_me else "#ddd")
                 painter.setPen(QPen(QColor(_name_color)))
-                # [2026-08 수정] _mask_ai_names가 이제 항상 정확히 6자
-                # 코드("AI"+4자리 36진수)를 주므로 6자까지 그대로 보여줘도
-                # 잘릴 일이 없다 — 예전 [:4]는 두 자릿수 순번("AI 10")을
-                # "AI 1"로 잘라 다른 선수와 겹쳐 보이게 하던 버그의 원인.
-                _name_w = max(48, d + 16)
-                painter.drawText(px-_name_w//2, py+r+2, _name_w, 16,
-                                 Qt.AlignmentFlag.AlignCenter, pl["name"][:6])
+                _name_w = _name_ws[i]
+                _pn.draw_fitted_text(painter, px - _name_w // 2, py + r + 2, _name_w, 16,
+                                     _short[i] or pl.get("name") or "",
+                                     Qt.AlignmentFlag.AlignCenter, max(6, min(9, d // 6)), bold=is_me)
         painter.end()
 
     def _calc_positions(self, slots, w, h):
@@ -2153,6 +2176,66 @@ def open_bulk_rename_dialog(parent, starters: list, bench: list) -> list:
     edit.setFixedHeight(90)
     v.addWidget(edit)
 
+    # [2026-10 신설, 신민용 리포트: "플레이어가 위에 있으면 25명 이름을 넣어도 마지막 선수가 안 바뀐다"]
+    # 이름이 실제로 누구에게 들어가는지 저장 전에 보이게 — 화면 순서 그대로(플레이어 줄은 "건너뜀"으로
+    # 표시만 하고 이름을 쓰지 않는다), 입력 개수와 대상 인원이 다르면 맨 위에 경고.
+    _all_rows = list(starters) + list(bench)
+
+    def _row_name(p):
+        from constants import ai_player_code
+        _pid = p.get("id")
+        return (p.get("name") or p.get("display_name")
+                or (ai_player_code(_pid) if isinstance(_pid, int) and _pid >= 0 else "-"))
+
+    def _is_me_row(p):
+        _pid = p.get("id")
+        return bool(p.get("is_me")) or _pid == -1
+
+    preview_lbl = QLabel()
+    preview_lbl.setStyleSheet("color:#bbb;font-size:11px;")
+    preview_lbl.setTextFormat(Qt.TextFormat.RichText)
+    preview_lbl.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+    preview_scroll = QScrollArea()
+    preview_scroll.setWidgetResizable(True)
+    preview_scroll.setFixedHeight(220)
+    preview_scroll.setStyleSheet("QScrollArea{background:#161616;border:1px solid #333;border-radius:4px;}")
+    preview_scroll.setWidget(preview_lbl)
+    v.addWidget(preview_scroll)
+
+    def _refresh_preview(*_a):
+        import html as _h
+        _key = next((k for k, b in scope_btns.items() if b.isChecked()), "all")
+        _targets = {"all": all_targets, "starter": starter_targets,
+                    "bench": bench_targets, "unnamed": unnamed_targets}[_key]
+        _tid = [p.get("id") for p in _targets]
+        _names = [n.strip() for n in edit.toPlainText().split(",") if n.strip()]
+        _assign = dict(zip(_tid, _names))
+        _scope_rows = {"all": _all_rows, "starter": list(starters), "bench": list(bench),
+                       "unnamed": _all_rows}[_key]
+        lines = []
+        if _names and len(_names) != len(_targets):
+            lines.append(f"<span style='color:#ffb74d;'>⚠ 이름 {len(_names)}개 / 대상 {len(_targets)}명"
+                         + (f" — 뒤의 {len(_targets) - len(_names)}명은 그대로" if len(_names) < len(_targets)
+                            else f" — 남는 {len(_names) - len(_targets)}개는 버림") + "</span>")
+        n = 0
+        for p in _scope_rows:
+            if _is_me_row(p):
+                lines.append(f"<span style='color:#ffe27a;'>⭐ {_h.escape(str(_row_name(p)))} — 플레이어(건너뜀)</span>")
+                continue
+            if p.get("id") not in _assign and p.get("id") not in _tid:
+                continue          # 이 범위 대상이 아님(미변경 범위의 이미 지은 선수, 가상 선수 등)
+            n += 1
+            _new = _assign.get(p.get("id"))
+            _arrow = (f" → <b style='color:#8fd18f;'>{_h.escape(_new)}</b>" if _new
+                      else " <span style='color:#666;'>(그대로)</span>")
+            lines.append(f"{n}. {_h.escape(str(_row_name(p)))}{_arrow}")
+        preview_lbl.setText("<br>".join(lines) if lines else "<span style='color:#666;'>대상 없음</span>")
+
+    edit.textChanged.connect(_refresh_preview)
+    for _b in scope_btns.values():
+        _b.clicked.connect(_refresh_preview)
+    _refresh_preview()
+
     btn_row = QHBoxLayout()
     save_btn = QPushButton("저장")
     save_btn.setStyleSheet(
@@ -2600,6 +2683,20 @@ class FormationWidget(QWidget):
                 (team_id,)).fetchone()
             conn.close()
             lname = row["name"] if row else "리그"
+        # [2026-10 신설, 신민용 요청: "프리미어리그 (잉글랜드 1부) 이런 식으로"]
+        # 리그 경기 표시줄에만 국가·부를 덧붙인다(컵·대륙대회·국대는 그대로).
+        # 지금 내 팀이 속한 리그와 이름이 같을 때만 붙여 다른 대회 이름에
+        # 엉뚱한 국가·부가 붙지 않게 한다.
+        if kind == "league" and team_id:
+            conn = get_conn()
+            lrow = conn.execute(
+                "SELECT l.name AS lname, l.tier AS tier, c.name AS cname "
+                "FROM teams t JOIN leagues l ON t.league_id=l.id "
+                "JOIN countries c ON c.id=l.country_id WHERE t.id=?",
+                (team_id,)).fetchone()
+            conn.close()
+            if lrow and lrow["lname"] == lname and lrow["cname"] and lrow["tier"]:
+                lname = f"{lname} ({lrow['cname']} {lrow['tier']}부)"
         txt = f"{icon} {lname}"
         if stage: txt += f"  {stage}"
         self.lbl_ctx.setText(txt)

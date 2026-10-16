@@ -206,7 +206,14 @@ class ApplyWindow(QDialog):
         self.country_combo.blockSignals(True)
         self.country_combo.clear()
         self.country_combo.addItem("전체 국가", None)
+        try:
+            from military_service import is_military_country as _is_mil
+        except Exception:
+            _is_mil = lambda _n: False
         for c in wb.list_countries(grade=grade):
+            # [2026-10] 군대는 직접 지원 대상이 아니다(입대는 오퍼 창 맨 위 군팀 카드로만) — 국가 목록에서도 뺀다.
+            if _is_mil(c.get("name")):
+                continue
             self.country_combo.addItem(f"{c.get('flag','')} {c['name']}", c["id"])
         idx = self.country_combo.findData(prev_id)
         self.country_combo.setCurrentIndex(idx if idx >= 0 else 0)
@@ -255,8 +262,11 @@ class ApplyWindow(QDialog):
         country_id = self.country_combo.currentData()
         tier = self.tier_combo.currentData()
         sort = self.sort_combo.currentData()
+        # [2026-10 신민용 확정: "다른 나라 국민도 군대에 직접 지원이 된다 — 막아라. 군대는 대한민국
+        # 국민만, 오퍼든 입단이든 위에 뜨는 선택지로만 입단"] 직접 지원 목록에서 군팀을 아예 뺀다
+        # (대한민국 국민도 마찬가지 — 입대는 오퍼 창 맨 위 군팀 카드로만 한다).
         self._rows = wb.search_teams(name_query=name_query, grade=grade, country_id=country_id,
-                                      tier=tier, sort=sort, limit=30)
+                                      tier=tier, sort=sort, limit=30, exclude_military=True)
         self._populate_table()
 
     def _populate_table(self):

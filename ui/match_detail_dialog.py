@@ -20,6 +20,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPainter, QColor, QBrush, QPen, QFont
 
 from game_engine import is_hard_mode
+import pitch_names as _pn   # [2026-10] 피치 이름 축약 표기(T. 몬테이루) + 폭 맞춤 그리기
 
 
 # [2026-09 신설] 연장 이벤트 분 코드 — 정의와 이유는
@@ -310,7 +311,45 @@ def _rating_text_color(val):
     return "#e57373"
 
 
-def _sub_row_widget(s, accent, on_player_click=None):
+# [2026-10 신설, 신민용 요청: "옐로·레드 받은 선수는 포메이션 원 우측 아래, 아래 좌우 목록·교체 글
+# 이름 옆에 표시"] 카드 색은 화면 전체 공통.
+_YELLOW_CARD = "#f5d90a"
+_RED_CARD = "#e53935"
+
+
+def _cards_from_my_events(events):
+    """내 선수 카드 — game_engine._roll_card_events/_apply_red_card_dismissal이 남긴 내 이벤트
+    문구("🟨 경고", "🟥 퇴장! 경고 누적(2차 경고)", "🟥 퇴장! 조기 강판")로 판정. (옐로 장수, 레드 장수)."""
+    y = r = 0
+    for ev in events or []:
+        t = str(ev[1] if isinstance(ev, (list, tuple)) and len(ev) == 2 else ev)
+        if "🟨" in t:
+            y += 1
+        if "🟥" in t:
+            r = 1
+            if "2차 경고" in t or "경고 누적" in t:
+                y = max(y, 1)
+    return y, r
+
+
+def _card_icons_widget(cards):
+    """(옐로, 레드) → 이름 옆에 붙일 작은 카드 아이콘 묶음(없으면 None). 2차 경고 퇴장은 노랑+빨강."""
+    y, r = cards or (0, 0)
+    if not y and not r:
+        return None
+    w = QWidget()
+    w.setStyleSheet("background:transparent;")
+    h = QHBoxLayout(w); h.setContentsMargins(0, 0, 0, 0); h.setSpacing(2)
+    for col in ([_YELLOW_CARD] if y else []) + ([_RED_CARD] if r else []):
+        c = QLabel()
+        c.setFixedSize(8, 11)
+        c.setStyleSheet(f"background:{col};border-radius:1px;")
+        h.addWidget(c)
+    w.setToolTip("경고 누적 퇴장" if (y and r) else ("퇴장" if r else "경고"))
+    return w
+
+
+def _sub_row_widget(s, accent, on_player_click=None, short_by_id=None, cards_by_id=None):
     """[2026-09 신설] 교체 한 건을 한 줄로 그린다.
 
         63'  ↓ 김민수 6.8   ↑ 이준호 7.1
@@ -341,6 +380,9 @@ def _sub_row_widget(s, accent, on_player_click=None):
     for arrow, nm, rt, col, pid in (
             ("↓", s.get("out_name") or "?", s.get("out_rating"), "#e57373", s.get("out_id")),
             ("↑", s.get("in_name") or "?", s.get("in_rating"), "#4caf50", s.get("in_id"))):
+        # [2026-10] 이름은 피치와 같은 축약 표기(L. 뭐시기) — 원래 이름은 툴팁으로.
+        _full_nm = str(nm)
+        nm = ((short_by_id or {}).get(pid) or _full_nm) if pid is not None else _full_nm
         row = QHBoxLayout(); row.setContentsMargins(0, 0, 0, 0); row.setSpacing(4)
         a = QLabel(arrow)
         a.setStyleSheet(f"color:{col};font-size:11px;font-weight:bold;")
@@ -354,7 +396,13 @@ def _sub_row_widget(s, accent, on_player_click=None):
         else:
             n = QLabel(str(nm))
             n.setStyleSheet("color:#ddd;font-size:11px;")
-        row.addWidget(n, 1)
+        if nm != _full_nm:
+            n.setToolTip(_full_nm)
+        row.addWidget(n)
+        _cw = _card_icons_widget((cards_by_id or {}).get(pid)) if pid is not None else None
+        if _cw is not None:
+            row.addWidget(_cw)
+        row.addStretch(1)
         if rt is not None:
             r = QLabel(f"{float(rt):.1f}")
             r.setStyleSheet(f"color:{_rating_text_color(rt)};font-size:11px;font-weight:bold;")
@@ -382,48 +430,35 @@ def _lineup_player_row(entry, accent, on_player_click=None, hard_mode=False):
     비표시) | 평점 배지.
     entry가 None이면(그 슬롯에 실제 선수가 안 잡힌 경우) 빈 자리로 표시.
     on_player_click이 주어지고 entry에 유효한 id가 있으면 이름을 클릭
-    가능하게(밑줄+포인터 커서) 만든다."""
+    가능하게(포인터 커서) 만든다.
+
+    [2026-10 재디자인, 신민용 요청: 참고 이미지 "LB | AIB5L2 ↑↓74' | 6.9"] 한 줄을 어두운 카드로:
+    포지션 배지 · 이름(피치와 같은 축약 "L. 뭐시기" — 원래 이름은 툴팁) · ⚽/🅰 · 교체 화살표
+    (들어옴 ↑ 초록, 나감 ↓ 빨강)+분 · 옐로/레드 카드 · 평점 배지. OVR은 줄에서 빼고 툴팁으로
+    옮겼다(어려움 난이도면 툴팁에도 없음)."""
     w = QWidget()
-    h = QHBoxLayout(w); h.setContentsMargins(2, 2, 2, 2); h.setSpacing(6)
+    w.setObjectName("lineup_row")
+    w.setStyleSheet("QWidget#lineup_row{background:#1d1f22;border-radius:6px;}")
+    h = QHBoxLayout(w); h.setContentsMargins(6, 4, 6, 4); h.setSpacing(6)
+
+    pos_lbl = QLabel(entry.get("position", "") if entry else "-")
+    pos_lbl.setFixedWidth(36)
+    pos_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
     if entry is None:
-        pos_lbl = QLabel("-")
-        pos_lbl.setStyleSheet("color:#444;font-size:10px;")
-        pos_lbl.setFixedWidth(28)
+        pos_lbl.setStyleSheet("color:#444;font-size:10px;background:#262626;border-radius:4px;padding:2px 0;")
         name_lbl = QLabel("(공석)")
         name_lbl.setStyleSheet("color:#444;font-size:11px;")
         h.addWidget(pos_lbl); h.addWidget(name_lbl, 1)
         return w
+    pos_lbl.setStyleSheet(
+        f"color:{accent};font-size:10px;font-weight:bold;background:#262b33;"
+        "border:1px solid #343c48;border-radius:4px;padding:2px 0;")
 
     is_me = bool(entry.get("is_me"))
-    pos_lbl = QLabel(entry.get("position", ""))
-    pos_lbl.setStyleSheet(f"color:{accent};font-size:10px;font-weight:bold;")
-    pos_lbl.setFixedWidth(28)
-
-    name_txt = entry.get("name", "") or "-"
-    extra = []
-    g, a = entry.get("goals", 0), entry.get("assists", 0)
-    if entry.get("is_gk"):
-        if entry.get("saves", 0):
-            extra.append(f"선방{entry['saves']}")
-    else:
-        if g:
-            extra.append(f"⚽{g}")
-        if a:
-            extra.append(f"🅰{a}")
-    # [2026-09 신설 — 교체 시스템] 교체로 빠진 선발은 몇 분에 나갔는지,
-    # 교체로 들어온 선수는 몇 분에 들어왔는지 이름 옆에 작게 붙인다.
-    # 예전 기록(키 없음)이나 풀타임 출전은 아무것도 안 붙는다.
-    # [2026-09 수정] 예전엔 elif라 "교체로 들어왔다가 다시 교체된 선수"의
-    # ↑와 ↓ 중 하나만 떴다(전술 변경·연장에서 실제로 생긴다 — 40경기
-    # 표본에서 13명). 둘 다 붙여서 "↑62' ↓80'"처럼 보이게 한다.
-    if entry.get("subbed_in") and entry.get("on_min"):
-        extra.append(f"↑{int(entry['on_min'])}'")
-    if entry.get("subbed_out") and entry.get("off_min"):
-        extra.append(f"↓{int(entry['off_min'])}'")
-    extra_txt = ("  " + " ".join(extra)) if extra else ""
-    ovr_txt = "" if hard_mode else f" ({entry.get('ovr', 0)})"
-    name_full = f"{'⭐ ' if is_me else ''}{name_txt}{ovr_txt}{extra_txt}"
-    name_color = '#ffe27a' if is_me else '#ddd'
+    full_name = entry.get("name", "") or "-"
+    name_txt = entry.get("_short_name") or full_name
+    name_full = f"{'⭐ ' if is_me else ''}{name_txt}"
+    name_color = '#ffe27a' if is_me else '#e6e6e6'
     name_weight = 'font-weight:bold;' if is_me else ''
     player_id = entry.get("id")
     # [2026-09] 실제 ai_players 레코드가 있는 선수(id>=-1, 나 자신 포함 —
@@ -434,12 +469,33 @@ def _lineup_player_row(entry, accent, on_player_click=None, hard_mode=False):
                   and player_id >= -1)
     if _clickable:
         name_lbl = _ClickableLabel(name_full, player_id, on_player_click)
-        name_lbl.setStyleSheet(
-            f"color:{name_color};font-size:11px;{name_weight}text-decoration:underline;")
     else:
         name_lbl = QLabel(name_full)
-        name_lbl.setStyleSheet(f"color:{name_color};font-size:11px;{name_weight}")
+    name_lbl.setStyleSheet(f"color:{name_color};font-size:12px;{name_weight}")
     name_lbl.setWordWrap(False)
+    _tip = full_name
+    if not hard_mode and entry.get("ovr") is not None:
+        _tip += f" (OVR {entry.get('ovr', 0)})"
+    name_lbl.setToolTip(_tip)
+
+    extra = []
+    g, a = entry.get("goals", 0), entry.get("assists", 0)
+    if entry.get("is_gk"):
+        if entry.get("saves", 0):
+            extra.append(f"<span style='color:#9ad;'>선방{entry['saves']}</span>")
+    else:
+        if g:
+            extra.append(f"⚽{g if g > 1 else ''}")
+        if a:
+            extra.append(f"🅰{a if a > 1 else ''}")
+    # [2026-09 신설 — 교체 시스템] 교체로 들어오고/나간 분. 들어왔다가 다시 나간 선수(전술 변경·연장)는
+    # 둘 다 붙는다. 예전 기록(키 없음)이나 풀타임 출전은 아무것도 안 붙는다.
+    if entry.get("subbed_in") and entry.get("on_min"):
+        extra.append(f"<span style='color:#4caf50;font-weight:bold;'>↑</span>"
+                     f"<span style='color:#9a9a9a;'>{int(entry['on_min'])}'</span>")
+    if entry.get("subbed_out") and entry.get("off_min"):
+        extra.append(f"<span style='color:#e57373;font-weight:bold;'>↓</span>"
+                     f"<span style='color:#9a9a9a;'>{int(entry['off_min'])}'</span>")
 
     rating_lbl = QLabel(f"{entry.get('rating', 0):.1f}")
     rating_lbl.setFixedWidth(34)
@@ -450,7 +506,17 @@ def _lineup_player_row(entry, accent, on_player_click=None, hard_mode=False):
         "font-size:11px;font-weight:bold;border-radius:4px;padding:2px 0;")
 
     h.addWidget(pos_lbl)
-    h.addWidget(name_lbl, 1)
+    h.addWidget(name_lbl)
+    # [2026-10 신민용 확정 — 1순위] 카드는 이름 바로 오른쪽(골·교체 표시보다 앞).
+    _cw = _card_icons_widget(entry.get("_cards"))
+    if _cw is not None:
+        h.addWidget(_cw)
+    if extra:
+        ex = QLabel(" ".join(extra))
+        ex.setTextFormat(Qt.TextFormat.RichText)
+        ex.setStyleSheet("font-size:11px;background:transparent;")
+        h.addWidget(ex)
+    h.addStretch(1)
     h.addWidget(rating_lbl)
     return w
 
@@ -555,6 +621,28 @@ class _MatchFormationPitch(QWidget):
         self._bottom_name = (bottom_name or "") + (f"   {self._bottom_formation}" if self._bottom_formation else "")
         self._top_accent = top_accent
         self._bottom_accent = bottom_accent
+        # [2026-10 신설, 신민용 확정] 피치 원 아래 이름만 "이니셜. 성"으로 줄인다 — 아래
+        # 좌우 라인업 목록·교체 목록은 원래 이름 그대로. 겹침 판정은 팀(위/아래)별로.
+        self._short_by_obj = {}
+        _ents = [e for e in self._top + self._bottom if e]
+        if _ents and all("_short_name" in e for e in _ents):
+            # 라인업 평점 패널이 이미 팀 출전자 전원 기준으로 계산해 둠 — 목록과 같은 이름을 쓴다.
+            for e in _ents:
+                self._short_by_obj[id(e)] = e["_short_name"]
+            _sides_todo = ()
+        else:
+            try:
+                _nats = _pn.lookup_nationalities([e.get("id") for e in _ents])
+            except Exception as _e:
+                print(f"[PITCH-NAME] 국적 조회 실패(기본 규칙으로 표시): {_e}")
+                _nats = {}
+            _sides_todo = (self._top, self._bottom)
+        for _side in _sides_todo:
+            _outs = _pn.short_names([((e.get("name"), _nats.get(e.get("id"), "")) if e else None)
+                                     for e in _side])
+            for _e2, _o in zip(_side, _outs):
+                if _e2 is not None:
+                    self._short_by_obj[id(_e2)] = _o
         # [2026-09 신설, 신민용 요청: "경기 상세 이름 클릭하면 세계
         # 기록실에서 그 선수를 검색한 기능을 넣고 싶어"] 원을 클릭했을 때
         # 호출할 콜백(player_id를 인자로 받음). 히트테스트용으로 매
@@ -668,7 +756,9 @@ class _MatchFormationPitch(QWidget):
         # 클릭 히트테스트용으로 이번에 그린 원들의 좌표를 저장해둔다.
         self._placements = [(x, y, d // 2, entry) for x, y, entry, _accent in placements]
 
-        for x, y, entry, accent in placements:
+        _name_ws = _pn.row_name_widths([(x_, y_) for x_, y_, _e, _a in placements],
+                                       default_w=max(56, d + 28), min_w=44, max_w=130)
+        for _pi, (x, y, entry, accent) in enumerate(placements):
             r = d // 2
             is_me = bool(entry and entry.get("is_me"))
             painter.setBrush(QBrush(QColor("#ffcc00" if is_me else accent)))
@@ -681,13 +771,25 @@ class _MatchFormationPitch(QWidget):
             painter.setPen(QPen(QColor("#000" if is_me else "#fff")))
             painter.drawText(x - r, y - r, d, d, Qt.AlignmentFlag.AlignCenter, rating_txt)
 
-            name_txt = "(공석)" if not entry else (("⭐" if is_me else "") + (entry.get("name") or "-"))
-            f2 = QFont(); f2.setPointSize(max(7, min(11, d // 5))); f2.setBold(is_me)
-            painter.setFont(f2)
+            _nm = (self._short_by_obj.get(id(entry)) or entry.get("name") or "-") if entry else ""
+            name_txt = "(공석)" if not entry else (("⭐" if is_me else "") + _nm)
             painter.setPen(QPen(QColor("#666" if not entry else ("#ffe27a" if is_me else "#eee"))))
-            name_w = max(56, d + 28)
-            painter.drawText(x - name_w // 2, y + r + 2, name_w, 16,
-                             Qt.AlignmentFlag.AlignCenter, name_txt[:8])
+            # [2026-10 버그수정] [:8] 글자 수 자르기 → 실제 폭에 맞춰 글씨를 줄인다.
+            name_w = _name_ws[_pi]
+            _pn.draw_fitted_text(painter, x - name_w // 2, y + r + 2, name_w, 16, name_txt,
+                                 Qt.AlignmentFlag.AlignCenter, max(7, min(11, d // 5)), bold=is_me)
+
+            # [2026-10 신설, 신민용 확정] 옐로/레드 — 원 우측 위 작은 카드. 한 경기에 옐로와 레드를 다
+            # 받았으면(경고 누적 퇴장) 둘 다 나란히. 이 경기에서 받은 카드만 — 다음 경기 포메이션엔 안 남는다.
+            _yc, _rc = (entry.get("_cards") or (0, 0)) if entry else (0, 0)
+            _cols = ([_YELLOW_CARD] if _yc else []) + ([_RED_CARD] if _rc else [])
+            if _cols:
+                cw, ch = max(7, d // 7), max(10, d // 5)
+                cx, cy = x + int(r * 0.50), y - r - int(ch * 0.25)
+                for _ci, _col in enumerate(_cols):
+                    painter.setPen(QPen(QColor("#000"), 1))
+                    painter.setBrush(QBrush(QColor(_col)))
+                    painter.drawRect(cx + _ci * (cw + 2), cy, cw, ch)
 
         f3 = QFont(); f3.setPointSize(10); f3.setBold(True)
         painter.setFont(f3)
@@ -809,6 +911,31 @@ class LineupRatingsPanel(QWidget):
         inner = QWidget(); inner.setStyleSheet("background:transparent;")
         iv = QVBoxLayout(inner); iv.setContentsMargins(0, 0, 0, 0); iv.setSpacing(10)
 
+        # [2026-10 신설, 신민용 요청] 피치뿐 아니라 아래 좌우 목록·교체 글도 같은 축약 이름
+        # ("L. 뭐시기")과 옐로/레드 표시를 쓴다 — 팀(홈/원정)별로 한 번만 계산해 entry에 얹어 둔다
+        # (_short_name/_cards, 화면 전용 키 — 저장값은 안 바뀐다). 겹침 판정은 그 팀 출전자 전원 기준.
+        _all_entries = [e for e in (home_all + away_all) if e]
+        try:
+            _nats = _pn.lookup_nationalities([e.get("id") for e in _all_entries])
+        except Exception as _e:
+            print(f"[PITCH-NAME] 국적 조회 실패(기본 규칙으로 표시): {_e}")
+            _nats = {}
+        for _side_all in (home_all, away_all):
+            _outs = _pn.short_names([((e.get("name"), _nats.get(e.get("id"), "")) if e else None)
+                                     for e in _side_all])
+            for _e2, _o in zip(_side_all, _outs):
+                if _e2:
+                    _e2["_short_name"] = _o
+        # 카드: 엔진이 선수별 카드를 주면(yellow_cards/red_cards) 그 값, 내 선수는 내 경기 이벤트에서.
+        _my_cards = _cards_from_my_events(payload.get("events"))
+        for _e2 in _all_entries:
+            _y, _r = int(_e2.get("yellow_cards") or 0), int(_e2.get("red_cards") or 0)
+            if _e2.get("is_me"):
+                _y, _r = max(_y, _my_cards[0]), max(_r, _my_cards[1])
+            _e2["_cards"] = (_y, _r)
+        _short_by_id = {e.get("id"): e.get("_short_name") for e in _all_entries if e.get("id") is not None}
+        _cards_by_id = {e.get("id"): e.get("_cards") for e in _all_entries if e.get("id") is not None}
+
         # ── 위: 포메이션 시각화 (원=선수, 원 안=평점, 원 아래=이름) ──
         pitch = _MatchFormationPitch(
             top_list=away_list, top_name=data.get("away_name", ""), top_accent=_AWAY_COLOR,
@@ -880,7 +1007,9 @@ class LineupRatingsPanel(QWidget):
                     cv.addWidget(none_lbl)
                 for s in side_subs:
                     cv.addWidget(_sub_row_widget(s, accent,
-                                                 on_player_click=on_player_click))
+                                                 on_player_click=on_player_click,
+                                                 short_by_id=_short_by_id,
+                                                 cards_by_id=_cards_by_id))
                 cv.addStretch()
                 scols.addWidget(col, 1)
             iv.addLayout(scols)
@@ -1027,6 +1156,8 @@ class MatchDetailDialog(QDialog):
                 _txt = "🚑 부상 결장"
             elif benched or _reason == "bench":
                 _txt = "🪑 벤치 대기"
+            elif _reason == "spectator":       # [G2] 사용자 감독 팀·구단주 구단 경기 관전 기록
+                _txt = "👀 관전 경기"
             else:
                 _txt = "결장"
             msg = QLabel(_txt)

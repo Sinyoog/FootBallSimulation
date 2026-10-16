@@ -51,7 +51,9 @@ def migrations():
         "end_reason TEXT DEFAULT '', role TEXT DEFAULT 'full', contract_until INTEGER DEFAULT 0, "
         "job_level REAL DEFAULT 0, contract_log TEXT DEFAULT '', tournaments INTEGER DEFAULT 0, "
         "best_rank INTEGER DEFAULT 0, eval_year INTEGER DEFAULT 0, eval_orank INTEGER DEFAULT 0, "
-        "eval_rrank INTEGER DEFAULT 0, promo_until INTEGER DEFAULT 0)",
+        "eval_rrank INTEGER DEFAULT 0, promo_until INTEGER DEFAULT 0, salary_log TEXT DEFAULT '')",
+        # [2026-10 감독 연봉] 기존 세이브용 — contract_log와 같은 순서의 "서명연도:연봉(천원)"(manager_salary.py).
+        "ALTER TABLE oly_team_managers ADD COLUMN salary_log TEXT DEFAULT ''",
         # 목표·결과 — 본선은 본선 대회 id, 예선 탈락국은 그 나라가 치른 예선 대회 id로 남긴다.
         "CREATE TABLE IF NOT EXISTS oly_objectives(tournament_id INTEGER, year INTEGER, "
         "country TEXT, country_id INTEGER, squad_ovr REAL DEFAULT 0, field_rank INTEGER DEFAULT 0, "

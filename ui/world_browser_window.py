@@ -72,6 +72,7 @@ from ui.formation_widget import (
 # 파생돼야 하므로(라벨 기준으론 4-2-3-1과 4-3-3의 LW/RW를 구분할 수 없다)
 # Qt 의존성 없는 공용 모듈의 함수를 쓴다 — formation_row_bands 주석 참고.
 from formation_logic import formation_row_bands
+import pitch_names as _pn   # [2026-10] 피치 이름 축약 표기(T. 몬테이루) + 폭 맞춤 그리기
 
 # [2026-08 신설, 신민용 리포트: "복사하면 국기/국가/부수까지 같이 복사된다,
 # 팀명만 복사되게 해달라"] 셀 화면 텍스트("🇺🇸 토론토 FC (미국)", "보루시아
@@ -374,6 +375,7 @@ class _StaticPitchView(QWidget):
         # 표시는 WorldBrowserWindow._set_quick_pitch_highlight가 간단
         # 변경 팝업이 열리고 닫힐 때 밖에서 호출해 넣어준다.
         self._selected_id = None
+        self._nat_cache = _pn.NationalityCache()   # [2026-10] 피치 이름 축약용 국적
         # [2026-08 신설, 신민용 리포트: "비율을 1번(라이브 포메이션
         # 화면)처럼 만들어달라니까 왜 2번처럼 만든거?"] 이 위젯이 놓이는
         # 곳(국가/팀 검색의 펼침 카드)은 라이브 포메이션 화면과 달리 옆에
@@ -410,10 +412,20 @@ class _StaticPitchView(QWidget):
         self._positions_xy = positions_xy
         self._circle_d = circle_d
 
+        # [2026-10 신설, 신민용 확정] 피치 원 아래 이름만 "이니셜. 성"으로 줄인다
+        # (옆 명단은 원래 이름 그대로) — 규칙은 pitch_names 모듈 설명 참고.
+        _sps = [(self.slot_players[si] if si < len(self.slot_players) else None)
+                for (_x, _y, _p, si) in positions_xy]
+        _nats = self._nat_cache.get([sp_[2] for sp_ in _sps if sp_ and sp_[2] is not None])
+        _short = _pn.short_names([((sp_[1], _nats.get(sp_[2], "")) if (sp_ and sp_[1] and sp_[2] is not None)
+                                   else None) for sp_ in _sps])
+        _name_ws = _pn.row_name_widths([(x_, y_) for (x_, y_, _p, _si) in positions_xy],
+                                       default_w=max(48, circle_d + 16), min_w=40)
+
         for i, (px, py, pos, slot_idx) in enumerate(positions_xy):
             sp = self.slot_players[slot_idx] if slot_idx < len(self.slot_players) else None
             pid = sp[2] if sp else None
-            name = (sp[1] if sp else None) or "(공석)"
+            name = _short[i] or (sp[1] if sp else None) or "(공석)"
             # [2026-09 신설, 신민용 요청: "외국인 용병은 겉부분을 #FF7F00
             # 으로 강조해달라"] 4튜플(3번째 이후 is_foreign)로 넘어온
             # 경우에만 읽는다 — 3튜플 호출부(국가 스쿼드 등)는 항상 False.
@@ -435,15 +447,14 @@ class _StaticPitchView(QWidget):
                 painter.drawEllipse(px - r - 6, py - r - 6, d + 12, d + 12)
                 painter.setBrush(QBrush(QColor(_pos_color(pos))))
             painter.setPen(QPen(QColor("#fff")))
-            f = QFont(); f.setPointSize(max(6, min(10, d // 5))); f.setBold(True)
-            painter.setFont(f)
-            painter.drawText(px - r, py - r, d, d, Qt.AlignmentFlag.AlignCenter, pos[:2])
-            f2 = QFont(); f2.setPointSize(max(6, min(9, d // 6)))
-            painter.setFont(f2)
+            # [2026-10 버그수정, 신민용 리포트] 포지션은 [:2](CAM→CA, CDM→CD), 이름은
+            # [:6](맥레오드→맥레오)로 글자 수를 잘랐다 — 실제 폭에 맞춰 글씨만 줄인다.
+            _pn.draw_fitted_text(painter, px - r + 2, py - r, d - 4, d, pos,
+                                 Qt.AlignmentFlag.AlignCenter, max(6, min(10, d // 5)), bold=True)
             painter.setPen(QPen(QColor("#ddd" if pid is not None else "#666")))
-            name_w = max(48, d + 16)
-            painter.drawText(px - name_w // 2, py + r + 2, name_w, 16,
-                              Qt.AlignmentFlag.AlignCenter, name[:6])
+            name_w = _name_ws[i]
+            _pn.draw_fitted_text(painter, px - name_w // 2, py + r + 2, name_w, 16, name,
+                                 Qt.AlignmentFlag.AlignCenter, max(6, min(9, d // 6)))
         painter.end()
 
     def mousePressEvent(self, event):
@@ -561,6 +572,19 @@ def _manager_row_text(mgr):
 # 확정된다 — game_engine._save_world_poty_awards가 _save_ballon_dor_top30
 # 안에서 발롱도르와 함께 저장하므로, cutoff_year 스냅샷에서 빠져야 하는
 # 조건이 발롱도르와 완전히 동일하다.
+# [2026-10 신설, 신민용 요청: "베스트 11을 FIFA | 유럽 | 아프리카 | 남미 | 북미 | 아시아로 — 버튼은
+# 'FIFA 베스트 11 (4-3-3)' 글자 우측, 아시아를 누르면 '아시아 베스트 11 (4-3-3)'"] (버튼 글자, 저장된
+# award_type). 대륙 베스트 11은 game_engine._save_continent_best_xi가 국적의 대륙으로 뽑는다
+# (아시아는 오세아니아 포함, 북미는 북중미 포함). 발롱도르 점수와 무관.
+_BEST_XI_TABS = (
+    ("FIFA", "FIFA 베스트 11"),
+    ("유럽", "유럽 베스트 11"),
+    ("아프리카", "아프리카 베스트 11"),
+    ("남미", "남미 베스트 11"),
+    ("북미", "북미 베스트 11"),
+    ("아시아", "아시아 베스트 11"),
+)
+
 _YEAR_END_WORLD_AWARD_KINDS = ("발롱도르", "야신상", "FIFA 푸스카스상", "올해의 최고의 골", "골든보이",
                                "FIFA 올해의 선수", "UEFA 올해의 선수", "코메볼 올해의 선수",
                                "AFC 올해의 선수", "CAF 올해의 선수", "콩카카프 올해의 선수",
@@ -596,6 +620,42 @@ def _strip_cutoff_year_cwc(entry):
     if e.get("_comp_stats"):
         e["_comp_stats"] = {k: v for k, v in e["_comp_stats"].items() if k != "cwc"}
     return e
+
+
+import re as _re_rank
+_RANK1_RE = _re_rank.compile(r"\[1등(?:/\d+팀)?\]")
+
+
+def _awards_from_year_rows(rows):
+    """[2026-10] 연도별 기록 rows(그 해 소속팀 대회 성적 entry)로 "소속팀 기준 통산 수상"을 다시
+    센다 — world_browser.get_player_team_history의 집계와 같은 판정(리그 [1등], 컵·대항전·슈퍼컵·
+    클럽월드컵 [우승], 3·4부 컵은 따로). 그 해 기준 복사가 지금까지의 통산을 싣지 않게 쓴다."""
+    a = {"league": 0, "cup": 0, "cl": 0, "cwc": 0, "cl_champions": 0, "el_champions": 0,
+         "ecl_champions": 0, "sc_champions": 0, "dsc_champions": 0, "lower_cup_champions": 0}
+    for r in rows or []:
+        e = r.get("entry") or {}
+        if r.get("is_retired_row") or not e:
+            continue
+        if e.get("league") and _RANK1_RE.search(e["league"]):
+            a["league"] += 1
+        if e.get("cup") and "[우승]" in e["cup"]:
+            a["cup"] += 1
+        if e.get("cl") and "[우승]" in e["cl"]:
+            if e.get("cl_kind") == "lower_cup":
+                a["lower_cup_champions"] += 1
+            else:
+                a["cl"] += 1
+                _k = {"champions": "cl_champions", "europa": "el_champions",
+                      "conference": "ecl_champions"}.get(e.get("cl_kind"))
+                if _k:
+                    a[_k] += 1
+        if e.get("cwc") and "[우승]" in e["cwc"]:
+            a["cwc"] += 1
+        if e.get("sc") and "[우승]" in e["sc"]:
+            a["sc_champions"] += 1
+        if e.get("dsc") and "[우승]" in e["dsc"]:
+            a["dsc_champions"] += 1
+    return a
 
 
 def _apply_cutoff_year(rows, intl_records, cutoff_year):
@@ -648,7 +708,7 @@ def _olympic_reserve_cut_label(tournament_id, country):
         return None
     parts = []
     for r in rows:
-        club = f" ({r['club']})" if r.get("club") else (" (은퇴)" if r.get("retired") else "")
+        club = f" ({r['club']})" if r.get("club") else ""   # [2026-10] 선발 당시 소속(은퇴 표시 없음)
         parts.append(f"{r['rank']}. {r.get('position') or r.get('category') or '-'} {r['display_name']}{club}")
     lbl = QLabel("🗒 후보 탈락 (" + str(len(rows)) + "명 — 출전·메달·병역 혜택 없음): " + "  ·  ".join(parts))
     lbl.setWordWrap(True)
@@ -777,6 +837,173 @@ def _build_squad_roster_panel(starters, bench, on_click=None, height=460,
     scroll.setFrameShape(QFrame.Shape.NoFrame)
     scroll.setStyleSheet("QScrollArea{background:transparent;} QWidget{background:transparent;}")
     return scroll
+
+
+# [2026-10 신설, 신민용 요청: "리그·컵대회·클럽 대항전·국제대회 베스트 11도 세계상 베스트 11처럼 —
+# 좌측 포메이션, 우측 선수, 우측 위 이름 변경·요약 복사·기록 복사"] 세계상 베스트 11
+# (_fill_best_xi_box)이 쓰던 슬롯 배치 규칙을 여기 한 곳으로 옮겨 두 화면이 같이 쓴다(결과 동일).
+_BEST_XI_GROUPS = {"GK": ("GK",), "DF": ("CB", "LB", "RB", "LWB", "RWB"),
+                   "MF": ("CDM", "CM", "CAM", "LM", "RM"), "FW": ("LW", "RW", "ST", "CF")}
+
+
+def _assign_best_xi_slots(rows, formation="4-3-3"):
+    """베스트 11 행(각 행에 position)을 포메이션 슬롯에 배치한다 → (slots, assigned).
+    같은 포지션 그룹 안에서 등록 위치가 같은 슬롯 → 호환 순위가 가까운 슬롯 순으로 채우고,
+    그룹이 넘치면(이론상 없음) 빈 슬롯 아무 데나. 모자란 자리는 None(빈자리)."""
+    from constants import POSITION_COMPAT
+    slots = list(FORMATION_SLOTS[formation])
+
+    def _grp(pos):
+        for g, lst in _BEST_XI_GROUPS.items():
+            if pos in lst:
+                return g
+        return None
+    assigned = [None] * len(slots)
+    pending = list(rows)
+    for exact in (True, False):
+        rest = []
+        for r in pending:
+            pos = r.get("position") or ""
+            g = _grp(pos)
+            cands = [i for i, s in enumerate(slots) if assigned[i] is None and _grp(s) == g]
+            if exact:
+                cands = [i for i in cands if slots[i] == pos]
+            else:
+                comp = POSITION_COMPAT.get(pos, [pos])
+                cands.sort(key=lambda i: comp.index(slots[i]) if slots[i] in comp else 99)
+            if cands:
+                assigned[cands[0]] = r
+            else:
+                rest.append(r)
+        pending = rest
+    for r in pending:
+        for i in range(len(slots)):
+            if assigned[i] is None:
+                assigned[i] = r
+                break
+    return slots, assigned
+
+
+def _is_best_xi_row(r):
+    """대회 개인상 행 중 베스트 11인가(award_kind 기준, 띄어쓰기 표기 차이도 같이 본다)."""
+    return (r.get("award_kind") or "").replace(" ", "") == "베스트11"
+
+
+class _BestXiBlock(QWidget):
+    """[2026-10 신설] 대회 베스트 11 한 묶음 — 제목 줄(제목 + 이름 변경·요약 복사·기록 복사) 아래에
+    좌측 4-3-3 포메이션 그림, 우측 명단. 세계상 베스트 11과 같은 모양·같은 동작이다.
+    owner: WorldBrowserWindow(선수 클릭·기록 복사 하베스터를 빌려 쓴다).
+    on_renamed: 이름 변경 뒤 화면을 다시 그릴 함수(없으면 이 묶음만 다시 그림)."""
+
+    _TITLE_QSS = "color:#ffcc00;font-size:13px;font-weight:bold;margin-top:8px;"
+    _BTN_QSS = ("QPushButton{background:#333;color:#ddd;border:1px solid #4a4a4a;"
+                "border-radius:4px;padding:3px 10px;font-size:11px;margin-top:8px;}"
+                "QPushButton:hover{background:#3d3d3d;}"
+                "QPushButton:disabled{color:#666;}")
+
+    def __init__(self, owner, rows, year, title, formation="4-3-3", on_renamed=None, parent=None):
+        super().__init__(parent)
+        self._owner = owner
+        self._year = year
+        self._title = title
+        self._formation = formation
+        self._on_renamed = on_renamed
+        self._rows = list(rows or [])
+        self._lineup = []      # [(슬롯 포지션, 이름, 팀명, player_id)] — 포메이션 순서
+        self._nat = {}
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 6)
+        v.setSpacing(4)
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        self.title_lbl = QLabel(f"📋 {title} ({formation})")
+        self.title_lbl.setStyleSheet(self._TITLE_QSS)
+        head.addWidget(self.title_lbl, 0)
+        head.addStretch(1)
+        self.rename_btn = QPushButton("✏ 이름 변경")
+        self.rename_btn.setStyleSheet(self._BTN_QSS)
+        self.rename_btn.setToolTip("베스트 11 선수들의 이름을 한 번에 바꿉니다 — 쉼표(,)로 구분해 "
+                                   "오른쪽 명단 위에서부터 순서대로(내 선수 제외)")
+        self.rename_btn.clicked.connect(self._on_rename)
+        head.addWidget(self.rename_btn, 0)
+        self.summary_btn = QPushButton("📋 요약 복사")
+        self.summary_btn.setStyleSheet(self._BTN_QSS)
+        self.summary_btn.setToolTip("베스트 11 선수들의 그 해·작년 기록(클럽·국가대표·개인상)을 "
+                                    "텍스트로 복사합니다(GPT/제미나이 등에 붙여넣기용)")
+        self.summary_btn.clicked.connect(lambda: self._on_copy(summary=True))
+        head.addWidget(self.summary_btn, 0)
+        self.copy_btn = QPushButton("📋 기록 복사")
+        self.copy_btn.setStyleSheet(self._BTN_QSS)
+        self.copy_btn.setToolTip("베스트 11 선수들의 그 해까지 전체 기록(클럽·국가대표·개인상)을 "
+                                 "텍스트로 복사합니다(GPT/제미나이 등에 붙여넣기용)")
+        self.copy_btn.clicked.connect(lambda: self._on_copy(summary=False))
+        head.addWidget(self.copy_btn, 0)
+        for b in (self.rename_btn, self.summary_btn, self.copy_btn):
+            b.setAutoDefault(False)
+            b.setDefault(False)
+        v.addLayout(head)
+        self._body = QHBoxLayout()
+        self._body.setContentsMargins(0, 0, 0, 0)
+        self._body.setSpacing(10)
+        v.addLayout(self._body)
+        self._render()
+
+    def _render(self):
+        while self._body.count():
+            it = self._body.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+        slots, assigned = _assign_best_xi_slots(self._rows, self._formation)
+        slot_players = [(slots[i], (r["name"] if r else "-"), (r["player_id"] if r else None))
+                        for i, r in enumerate(assigned)]
+        _click = getattr(self._owner, "_on_player_click", None)
+        self._body.addWidget(_StaticPitchView(self._formation, slot_players, on_click=_click, slots=slots), 0)
+        starters = [{"position": slots[i],
+                     "display_name": f"{r['name']}  ({r.get('nationality') or '-'}) ({r.get('team_name') or '-'})",
+                     "id": r["player_id"]} for i, r in enumerate(assigned) if r]
+        self._nat = {r.get("player_id"): (r.get("nationality") or "") for r in assigned if r}
+        self._lineup = [(slots[i], r["name"], r.get("team_name"), r.get("player_id"))
+                        for i, r in enumerate(assigned) if r]
+        has = self._year is not None and bool(self._lineup)
+        self.copy_btn.setEnabled(has)
+        self.summary_btn.setEnabled(has)
+        self.rename_btn.setEnabled(any(pid is not None and pid >= 0 for _p, _n, _t, pid in self._lineup))
+        self._body.addWidget(_build_squad_roster_panel(starters, [], on_click=_click), 1)
+
+    def _on_copy(self, summary=True):
+        """세계상 베스트 11 복사와 같은 규칙 — 요약 = 그 해 + 작년(작년이 없으면 그 해만),
+        기록 = 그 해까지 전부. 클럽·국가대표·개인상 모두(그 해 늦게 확정되는 상도 빼지 않음)."""
+        y = self._year
+        ids = [pid for _pos, _n, _t, pid in self._lineup if pid is not None]
+        if y is None or not ids:
+            return
+        if summary:
+            try:
+                _gsy = get_game_start_year()
+            except Exception:
+                _gsy = None
+            years = {y} if (_gsy is not None and y - 1 < _gsy) else {y - 1, y}
+            span = f"{min(years)}~{y}년" if len(years) > 1 else f"{y}년"
+        else:
+            years = None
+            span = f"{y}년까지 전체"
+        head = [f"[{y}년 {self._title} ({self._formation})] — 선수 기록 범위: {span} (클럽·국가대표·개인상 전체)"]
+        for pos, name, team, _pid in self._lineup:
+            head.append(f"  {pos:<4}{name}  ({self._nat.get(_pid) or '-'}) ({team or '-'})")
+        btn, label = ((self.summary_btn, "📋 요약 복사") if summary else (self.copy_btn, "📋 기록 복사"))
+        self._owner._copy_squad_player_records(ids, btn, label, target_years=years, include_stats=not summary,
+                                               prefix_text="\n".join(head), keep_late_awards=True,
+                                               max_year=None if summary else y)
+
+    def _on_rename(self):
+        starters = [{"id": pid} for _pos, _n, _t, pid in self._lineup if pid is not None]
+        if not starters:
+            return
+        changed = open_bulk_rename_dialog(self._owner, starters, [])
+        if not changed:
+            return
+        if self._on_renamed:
+            self._on_renamed()
 
 
 # [2026-09 신설, 신민용 요청: "팀 검색 -> 연도 -> 포메이션 우측 빈 공간에
@@ -5589,7 +5816,8 @@ class WorldBrowserWindow(QDialog):
         QTimer.singleShot(1200, lambda: self.player_full_copy_btn.setText("📋 기록 복사"))
 
     def _format_player_history_text(self, name, d, team_hist, rows, intl_records,
-                                     include_stats=False):
+                                     include_stats=False, comp_stats=False, snapshot_year=None,
+                                     snapshot_rows=None, snapshot_keep_late=False):
         """d(get_ai_player_detail 반환값) + rows(_populate_player_team_box가
         화면 렌더링과 동시에 쌓아둔 연도별 해석 결과: 그 해 나이·소속팀·
         OVR·entry) + intl_records(get_player_intl_records)를 사람이 읽어도,
@@ -5604,6 +5832,29 @@ class WorldBrowserWindow(QDialog):
         False, "기록 복사" 버튼만 True로 호출)."""
         lines = [f"[{name} 선수 기록]"]
 
+        # [2026-10] snapshot_year가 있으면(그 해 기준 복사) 기본 정보 줄·통산 수상을 그 해 값으로.
+        # 나이·포지션·OVR·소속은 [연도별 기록]의 그 해 줄(화면과 같은 값)에서, 통산 수상은 그 해까지의
+        # 연도별 대회 성적에서 선수 검색과 같은 판정(_awards_from_year_rows)으로 다시 센다.
+        if snapshot_year is not None:
+            _src = [r for r in (snapshot_rows if snapshot_rows is not None else rows or [])
+                    if r.get("year") is not None and r["year"] <= snapshot_year]
+            _yr = [r for r in _src if r["year"] == snapshot_year and not r.get("is_retired_row")]
+            _s = _yr[-1] if _yr else None
+            d = dict(d)
+            d["position"] = (_s or {}).get("position") or d.get("position")
+            if _s is not None:
+                d["age"] = _s.get("age") if _s.get("age") is not None else "-"
+                d["ovr"] = _s.get("ovr") or "-"
+            else:
+                d["age"], d["ovr"] = "-", "-"
+            _snap_team = (_s or {}).get("team_name") or "소속 기록 없음"
+            if not snapshot_keep_late:
+                _src = [dict(r, entry=_strip_cutoff_year_cwc(r.get("entry")))
+                        if r["year"] == snapshot_year else r for r in _src]
+            team_hist = dict(team_hist or {}, awards=_awards_from_year_rows(_src))
+        else:
+            _snap_team = None
+
         # ── 기본 정보 한 줄 (player_detail_tbl 맨 위 요약 행과 동일 로직) ──
         # [2026-09 수정, 신민용 요청: "국적이 🇦🇷 아르헨티나 이런식으로
         # 뜨는데 아르헨티나 이렇게 글자만 뜨게 해줘"] 국기 이모지를 뺀다
@@ -5611,7 +5862,9 @@ class WorldBrowserWindow(QDialog):
         # 쓰고 있어(아래 국적 칸 주석 참고) 화면 간 표기도 이걸로 통일된다.
         # 이모지가 빠진 만큼 좌측 국적 칸(_NAT_COL_W)도 같이 좁혔다.
         nat_text = (d.get('nationality') or '').strip() or "국적 미상"
-        if d.get("is_retired"):
+        if _snap_team is not None:
+            team_text = _snap_team
+        elif d.get("is_retired"):
             team_text = f"은퇴함 ({d.get('retirement_year', '-')}년 은퇴, 당시 {d.get('age', '-')}세)"
             if d.get("last_team_name"):
                 team_text += f" — 마지막 소속: {d['last_team_name']}"
@@ -5672,7 +5925,8 @@ class WorldBrowserWindow(QDialog):
             lines.append("(연도별 기록 없음)")
         else:
             for row in rows:
-                lines.extend(self._format_year_row_lines(row, d, include_stats=include_stats))
+                lines.extend(self._format_year_row_lines(row, d, include_stats=include_stats,
+                                                         comp_stats=comp_stats))
         lines.append("")
 
         # ── 국가대표 기록 ──
@@ -5742,7 +5996,7 @@ class WorldBrowserWindow(QDialog):
         return lines
 
     def _format_year_row_lines(self, row, d, include_stats=False,
-                                skip_team_competition_line=False):
+                                skip_team_competition_line=False, comp_stats=False):
         """[2026-09 리팩터] _format_player_history_text의 [연도별 기록]
         루프 본문(연도 한 줄 + 🏆/⚽·🧤/💰 부가 줄)을 그대로 빼서 함수로
         만든 것 — row 하나를 렌더링하는 이 로직 자체는 전혀 안 바꿨다
@@ -5754,7 +6008,11 @@ class WorldBrowserWindow(QDialog):
         skip_team_competition_line=True면 "| 리그: ... | 국내컵: ..." 부분을
         통째로 생략한다 — 팀 단위 요약에서 이미 맨 위에 한 번 보여줬을
         때만 쓴다(기존 _format_player_history_text 호출은 항상 False라
-        동작이 전혀 안 바뀐다)."""
+        동작이 전혀 안 바뀐다).
+
+        [2026-10 신설, 신민용 요청: "주전 요약 복사에 리그 평점이나 골도 표시"]
+        comp_stats=True면 include_stats=False(요약)여도 대회별 ⚽/🧤 평점·골·도움
+        줄만 붙인다 — 💰 연봉 줄은 여전히 include_stats=True일 때만."""
         out = []
         age_txt = f"{row['age']}세" if row.get("age") is not None else "나이 미상"
         if row["is_retired_row"]:
@@ -5791,7 +6049,7 @@ class WorldBrowserWindow(QDialog):
         out.append(" | ".join(parts))
         if row.get("awards"):
             out.append(f"  🏆 " + " · ".join(row["awards"]))
-        if include_stats:
+        if include_stats or comp_stats:
             _comp_stats = entry.get("_comp_stats")
             if _comp_stats:
                 _is_gk_club = (d.get("position") == "GK")
@@ -5813,6 +6071,7 @@ class WorldBrowserWindow(QDialog):
                             out.append(
                                 f"  ⚽ {_label}: 평균평점 {_cs['rating']:.2f}  "
                                 f"{_cs.get('goals', 0)}골 {_cs.get('assists', 0)}A")
+        if include_stats:
             _sal = entry.get("salary")
             # [2026-10 병역] 입대/진급/강등은 연봉 0원이어도 줄을 보여준다("연봉 0원 (계약: 2년) [입대]").
             _mil_tt = entry.get("salary_transfer_type") in ("입대", "진급", "강등")
@@ -7382,10 +7641,16 @@ class WorldBrowserWindow(QDialog):
                     parts.append("올해 대회 전" if y >= cur_y else "대회 없음")
             if r.get("note"):
                 parts.append(r["note"])
+            # [2026-10 신설, 신민용 요청: "대회 결과는 없어도 감독이 전술을 어떻게 짜는지,
+            # 어디에 어떤 선수를 넣었는지(RB: xx LB: xx) 표시"] 복사하는 그 대회의 포메이션과
+            # 선발 배치 — 호출부(_manager_copy_block)가 그 대회 연도 대표팀 줄에만 붙인다.
+            if r["kind"] != "club" and r.get("tactics_parts"):
+                parts.extend(r["tactics_parts"])
             # [2026-10] 기록 복사(전적 포함)에는 그 해 포메이션도 — 화면 연도 펼침과 같은 값.
             if include_records and r["kind"] == "club" and r.get("formation"):
                 parts.append(f"포메이션: {r['formation']}")
-            if include_records and r["kind"] != "club" and r.get("formations"):
+            if include_records and r["kind"] != "club" and r.get("formations") \
+                    and not r.get("tactics_parts"):
                 parts.append("포메이션: " + " / ".join(f"{t_} {f_}" for t_, f_ in r["formations"]))
             lines.append(" | ".join(parts))
         if not data.get("rows"):
@@ -7393,7 +7658,7 @@ class WorldBrowserWindow(QDialog):
         return "\n".join(lines)
 
     def _manager_copy_block(self, manager, include_records=True, target_years=None,
-                            cutoff_year=None, cutoff_window=None):
+                            cutoff_year=None, cutoff_window=None, tactics=None):
         """[2026-10 ③단계, 신민용 확정: "복사에 감독 포함"] 팀/국가 카드 복사
         맨 앞에 붙일 감독 기록. 선수 기록과 같은 연도 규칙을 따른다
         (_copy_squad_player_records 참고):
@@ -7431,8 +7696,40 @@ class WorldBrowserWindow(QDialog):
                 out.append(r)
             rows = out
             snap = cutoff_year
+        # [2026-10 신설] tactics = _intl_tactics_info 결과({"country", "parts"}) — 그 대회
+        # 연도(snap)의 그 나라 대표팀 줄에 포메이션·선발 배치를 붙인다.
+        if tactics and tactics.get("parts") and snap is not None:
+            rows = [dict(r, tactics_parts=list(tactics["parts"]))
+                    if (r.get("kind") in ("nation", "u23") and r.get("year") == snap
+                        and (not tactics.get("country") or r.get("country") == tactics["country"]))
+                    else r for r in rows]
         data = dict(data, rows=rows)
         return self._format_manager_history_text(data, include_records, snapshot_year=snap)
+
+    # 선발 배치 줄 정렬 — 골키퍼부터 수비(왼→오), 미드, 공격 순.
+    _TACTICS_SLOT_ORDER = {"GK": 0, "LWB": 1, "LB": 2, "CB": 3, "RB": 4, "RWB": 5,
+                           "CDM": 6, "LM": 7, "CM": 8, "RM": 9, "CAM": 10,
+                           "LW": 11, "ST": 12, "CF": 12, "RW": 13}
+
+    def _intl_tactics_info(self, tid, country, starters):
+        """[2026-10 신설, 신민용 요청: "감독이 전술을 짤 때 어디에 어떤 선수를 넣었는지
+        RB: xx LB: XX 이런식으로"] 그 대회 대표팀의 포메이션(get_intl_formation)과
+        주전 11명의 자리(intl_squad.slot — 화면 피치와 같은 값, 없는 옛 대회는 주포)를
+        감독 복사 줄에 붙일 조각으로 만든다. 주전이 없으면 None."""
+        placed = [((s.get("slot") or s.get("position") or "-"), (s.get("display_name") or "-"))
+                  for s in (starters or []) if s.get("id") is not None]
+        if not placed:
+            return None
+        placed.sort(key=lambda t: self._TACTICS_SLOT_ORDER.get(t[0], 99))
+        try:
+            formation = wb.get_intl_formation(tid, country)
+        except Exception:
+            formation = ""
+        parts = []
+        if formation:
+            parts.append(f"포메이션: {formation}")
+        parts.append("선발 배치: " + ", ".join(f"{sl}: {nm}" for sl, nm in placed))
+        return {"country": country, "parts": parts}
 
     def _on_copy_manager_clicked(self, include_records, btn, reset_label):
         mid = getattr(self, "_mgr_detail_id", None)
@@ -7648,7 +7945,9 @@ class WorldBrowserWindow(QDialog):
                 _wrap = QWidget()
                 _wl = QVBoxLayout(_wrap)
                 _wl.setContentsMargins(0, 0, 0, 0)
-                if r["kind"] == "nation":   # [2026-10] U-23 줄은 성인 소집 버튼이 없다
+                # [2026-10] U-23 줄도 "최종 인원" 버튼을 단다(올림픽 18명 + 후보 탈락 4명 — 후보 라인은
+                # 선발 당시 경쟁 명단을 아직 저장하지 않아 후속 작업, 신민용 확정).
+                if r["kind"] in ("nation", "u23"):
                     # [2026-10 신민용 요청] 대표팀 줄은 오른쪽에 대회별 "후보 라인 /
                     # 최종 국대 인원" 버튼, 누르면 아래에 그 명단이 펼쳐진다.
                     _wl.setSpacing(0)
@@ -7798,7 +8097,9 @@ class WorldBrowserWindow(QDialog):
             self.open_to_player(pid)
 
     def _manager_year_detail_text(self, b, r):
-        """연도 펼침 줄 글자 — 그 해 전술(감독 스타일 4종)과 주로 쓴 포메이션."""
+        """연도 펼침 줄 글자 — 그 해 전술(감독 스타일 4종), 연봉·계약 기간, 주로 쓴 포메이션.
+        [2026-10 감독 연봉] 연봉·계약 줄은 주 포메이션 앞 — 그 해에 적용된 계약(부임 또는 재계약).
+        승강 조정 조항으로 금액이 바뀐 해는 "(승격 조정)" 같은 비고를 붙인다(manager_salary 참고)."""
         _k = "<span style='color:#c9b6ff;font-weight:bold;'>"
         _v = "<span style='color:#ffffff;font-weight:bold;'>"
         tac = (f"🧠 {_k}전술</span>&nbsp;&nbsp;공격 성향 {_v}{b.get('style_attack_ko') or '-'}</span>"
@@ -7822,7 +8123,20 @@ class WorldBrowserWindow(QDialog):
                     f"{t_} {_v}{f_}</span>" for t_, f_ in fl)
             else:
                 form = f"📋 {_k}포메이션</span>&nbsp;&nbsp;기록 없음"
-        return tac + "<br>" + form
+        pay = r.get("contract_pay")
+        if pay and pay[0]:
+            amt, n_, s_, u_ = pay[:4]
+            _adj = pay[4] if len(pay) > 4 else ""
+            pay_line = (f"💰 {_k}연봉</span>&nbsp;&nbsp;{_v}{fmt_money(amt)}</span>"
+                        + (f" <span style='color:#aaa;'>({_adj})</span>" if _adj else "")
+                        + f" · 계약 {_v}{n_}년</span> ({s_}~{u_})")
+        elif pay:
+            n_, s_, u_ = pay[1:4]
+            pay_line = (f"💰 {_k}연봉</span>&nbsp;&nbsp;기록 없음"
+                        f" · 계약 {_v}{n_}년</span> ({s_}~{u_})")
+        else:
+            pay_line = f"💰 {_k}연봉</span>&nbsp;&nbsp;기록 없음"
+        return tac + "<br>" + pay_line + "<br>" + form
 
     # ── [2026-10 신설, 신민용 요청] 대표팀 연도 펼침: 후보 라인 / 최종 국대 인원 ──
     #   후보 라인 = 그 대회 선발 당시 실제 소집 경쟁(그룹별 숏리스트 → 선발 점수)에
@@ -7842,8 +8156,10 @@ class WorldBrowserWindow(QDialog):
         v = QVBoxLayout(box)
         v.setContentsMargins(0, 6, 0, 6)
         v.setSpacing(4)
+        _u23 = r.get("kind") == "u23"
         try:
-            tours = wb.get_country_year_callup_tournaments(r["country"], r["year"])
+            tours = (wb.get_country_year_olympic_tournaments(r["country"], r["year"]) if _u23
+                     else wb.get_country_year_callup_tournaments(r["country"], r["year"]))
         except Exception:
             tours = []
         if not tours:
@@ -7858,7 +8174,8 @@ class WorldBrowserWindow(QDialog):
             _tl = QLabel(tname)
             _tl.setStyleSheet("color:#ccc;font-size:12px;")
             h.addWidget(_tl)
-            for mode, text in (("pool", "후보 라인"), ("final", "최종 국대 인원")):
+            for mode, text in ((("final", "최종 인원"),) if _u23
+                               else (("pool", "후보 라인"), ("final", "최종 국대 인원"))):
                 b_ = QPushButton(text)
                 b_.setAutoDefault(False)
                 b_.setStyleSheet(self._CALLUP_BTN_ON_QSS if cur == (tid, mode)
@@ -7898,8 +8215,22 @@ class WorldBrowserWindow(QDialog):
             return None
         tid, mode = cur
         country, year = r["country"], r["year"]
-        tname = dict(wb.get_country_year_callup_tournaments(country, year)).get(tid, "")
-        if mode == "pool":
+        _u23 = r.get("kind") == "u23"
+        reserve = []
+        tname = dict(wb.get_country_year_olympic_tournaments(country, year) if _u23
+                     else wb.get_country_year_callup_tournaments(country, year)).get(tid, "")
+        if _u23:
+            # [2026-10] U-23 올림픽 — 최종 18명(주전·교체) + 후보 탈락 4명(선발 당시 저장된 순위).
+            sq = wb.get_country_tournament_squad(tid, country)
+            starters, bench = sq.get("starters") or [], sq.get("bench") or []
+            try:
+                reserve = wb.get_olympic_reserve_cut(tid, country)
+            except Exception:
+                reserve = []
+            players = starters + bench
+            title = f"🏅 {year} {tname} — 최종 인원 ({len(players)}명)"
+            sub = ""
+        elif mode == "pool":
             groups = wb.get_intl_callup_pool(tid, country)
             players = [p_ for _g, lst in groups for p_ in lst]
             starters, bench = players, []
@@ -7923,12 +8254,17 @@ class WorldBrowserWindow(QDialog):
         hdr.addWidget(_t)
         _ids = [p_.get("id") for p_ in players]
         _mgr_fn = (lambda: wb.get_national_manager_for_tournament(tid, country))
-        _prefix = (f"[{year} {tname} {country} 대표팀 후보군]"
+        # [2026-10] 감독 줄에 이 대회 포메이션·선발 배치 — 후보군(pool)은 실제 선발이 아니라 뺀다.
+        _tactics = None if mode == "pool" else self._intl_tactics_info(tid, country, starters)
+        _prefix =(f"[{year} {tname} {country} U-23 최종 인원]" if _u23 else
+                   f"[{year} {tname} {country} 대표팀 후보군]"
                    if mode == "pool" else f"[{year} {tname} {country} 최종 국대 인원]")
         if players:
             rb = QPushButton("✏ 이름 일괄변경")
             rb.setStyleSheet(self._CALLUP_BTN_QSS)
-            rb.clicked.connect(lambda: self._on_bulk_rename_mgr_callup(manager_id, starters, bench))
+            # U-23은 후보 탈락 4명도 같은 화면에 보이므로 이름 변경 대상에 같이 넣는다.
+            rb.clicked.connect(lambda: self._on_bulk_rename_mgr_callup(
+                manager_id, starters, bench + [x for x in reserve if x.get("id") not in (None, wb.MY_PLAYER_ID)]))
             hdr.addWidget(rb)
         hdr.addStretch(1)
         if players:
@@ -7936,14 +8272,15 @@ class WorldBrowserWindow(QDialog):
             cb.setStyleSheet(self._CALLUP_BTN_QSS)
             cb.setToolTip("그 해까지의 기록(국가대표 기록은 그 해 이전까지)")
             cb.clicked.connect(lambda: self._copy_squad_player_records(
-                _ids, cb, "📋 기록 복사", cutoff_year=year, prefix_text=_prefix, manager=_mgr_fn))
+                _ids, cb, "📋 기록 복사", cutoff_year=year, prefix_text=_prefix, manager=_mgr_fn,
+                tactics=_tactics))
             hdr.addWidget(cb)
             sb = QPushButton("📋 요약 복사")
             sb.setStyleSheet(self._CALLUP_BTN_QSS)
             sb.setToolTip("대회 직전 2년 기록만(국가대표 기록은 그 해 이전까지)")
             sb.clicked.connect(lambda: self._copy_squad_player_records(
                 _ids, sb, "📋 요약 복사", include_stats=False, cutoff_year=year, cutoff_window=2,
-                prefix_text=_prefix, manager=_mgr_fn))
+                prefix_text=_prefix, manager=_mgr_fn, tactics=_tactics))
             hdr.addWidget(sb)
         lay.addLayout(hdr)
         if sub:
@@ -7957,6 +8294,17 @@ class WorldBrowserWindow(QDialog):
         import html as _html
         _hard = is_hard_mode()
         _COLS = 5
+        # [2026-10 버그수정, 신민용 리포트: "감독 검색 후보 라인 등에서 지금 OVR이 뜬다 — 그 당시
+        # OVR로(2000년 대회면 지금이 2003년이어도 2000년 OVR)"] 카드의 OVR은 대회 연도 값
+        # (world_browser.get_players_year_ovr — 선수 검색 연도별 OVR과 같은 기준)으로 보여준다.
+        # 그 해 기록이 없는 선수는 지금 값을 대신 쓰지 않고 OVR을 비운다.
+        _year_ovr = {}
+        if not _hard:
+            try:
+                _year_ovr = wb.get_players_year_ovr(
+                    [p_.get("id") for p_ in players + reserve], year)
+            except Exception:
+                _year_ovr = {}
 
         def _link_label(p_, size=14, color="#f2f2f2"):
             nm = _html.escape(p_.get("display_name") or ai_player_code(p_.get("id") or 0))
@@ -8035,10 +8383,11 @@ class WorldBrowserWindow(QDialog):
                     bits = [p_.get("position") or "-"]
                     if not _hard:
                         bits.append(f"점수 {p_.get('score', 0):.1f}")
-                        if p_.get("ovr") is not None:
-                            bits.append(f"지금 OVR {p_['ovr']}")
+                        if _year_ovr.get(p_.get("id")) is not None:
+                            bits.append(f"{year} OVR {_year_ovr[p_.get('id')]}")
                     col_.addWidget(_sub_label(" · ".join(bits)))
-                    _club = (p_.get("club") or "") + (" (은퇴)" if p_.get("retired") else "")
+                    # [2026-10] 소속은 선발 당시 값(world_browser) — 지금 은퇴 여부는 붙이지 않는다.
+                    _club = p_.get("club") or ""
                     if _club.strip():
                         col_.addWidget(_sub_label(_club))
                     row_.addLayout(col_, 1)
@@ -8050,18 +8399,20 @@ class WorldBrowserWindow(QDialog):
         else:
             if not players:
                 lay.addWidget(_sub_label("소집 명단 기록 없음"))
-            for label, lst in (("주전", starters), ("후보", bench)):
+            for label, lst in (("주전", starters), ("후보", bench), ("후보 탈락", reserve)):
                 if not lst:
                     continue
                 lay.addWidget(_section_title(f"{label}  ·  {len(lst)}명"))
                 cells = []
                 for p_ in lst:
                     fr, fl = _card()
-                    fl.addWidget(_link_label(p_))
-                    bits = [p_.get("slot") or p_.get("position") or "-",
-                            f"출전 {p_.get('appearances') or 0}"]
-                    if not _hard and p_.get("ovr") is not None:
-                        bits.append(f"지금 OVR {p_['ovr']}")
+                    fl.addWidget(_link_label(p_, color="#999999" if label == "후보 탈락" else "#f2f2f2"))
+                    bits = ([p_.get("position") or "-", f"{p_.get('rank') or '-'}순위"]
+                            if label == "후보 탈락" else
+                            [p_.get("slot") or p_.get("position") or "-",
+                             f"출전 {p_.get('appearances') or 0}"])
+                    if not _hard and _year_ovr.get(p_.get("id")) is not None:
+                        bits.append(f"{year} OVR {_year_ovr[p_.get('id')]}")
                     fl.addWidget(_sub_label(" · ".join(bits)))
                     if p_.get("club"):
                         fl.addWidget(_sub_label(p_["club"]))
@@ -8311,7 +8662,15 @@ class WorldBrowserWindow(QDialog):
             mh, mv, sp = m.left() + m.right(), m.top() + m.bottom(), max(0, lay.spacing())
         else:
             mh, mv, sp = 0, 0, 0
-        total = mv + sp * (len(labels) - 1)
+        # [2026-10 버그수정, 신민용 리포트: "선수 검색 수상 칸에서 챔스 | 컨퍼 | 유로파 우승이 각각
+        # 있으면 수상 줄의 세로 길이가 길어진다"] 이 함수는 글자들이 위아래로 쌓인 칸(세로 나열)을
+        # 전제로 높이를 "합"했는데, 클럽 대항전·국내컵 수상 칸(_multi_award_summary_cell)은 숫자들이
+        # 옆으로 나란히 놓인 가로 배치라 숫자 개수만큼 높이가 부풀었다(3개면 약 3배). 가로 배치는
+        # 가장 큰 글자 높이 하나만 쓴다(세로 배치는 기존과 완전히 동일). 줄바꿈 글자가 섞인 가로 배치는
+        # 칸 폭을 나눠 쓰는 폭을 여기서 알 수 없어, 잘림 방지를 위해 예전 방식(합)을 그대로 둔다.
+        _horizontal = isinstance(lay, QHBoxLayout) and not any(l.wordWrap() for l in labels)
+        total = mv + (0 if _horizontal else sp * (len(labels) - 1))
+        _row_max = 0
         for l in labels:
             lm = l.contentsMargins()
             w = max(20, width - mh - lm.left() - lm.right() - 2 * l.margin() - 2)
@@ -8323,8 +8682,12 @@ class WorldBrowserWindow(QDialog):
             flags = int(Qt.TextFlag.TextWordWrap) if l.wordWrap() else 0
             h = fm.boundingRect(QRect(0, 0, w, 100000), flags, txt).height()
             h = max(h, l.heightForWidth(w) if l.hasHeightForWidth() else 0)
-            total += h + lm.top() + lm.bottom() + 2 * l.margin()
-        return total
+            _lh = h + lm.top() + lm.bottom() + 2 * l.margin()
+            if _horizontal:
+                _row_max = max(_row_max, _lh)
+            else:
+                total += _lh
+        return total + _row_max
 
     def _make_combo_typable(self, combo):
         """[2026-08 신설, 신민용 요청: "직접 입력하는 칸들도 만들어도
@@ -8922,7 +9285,10 @@ class WorldBrowserWindow(QDialog):
         # ai_players/search_retired_ai_players가 _annotate_natteam으로
         # 채워둔 has_natteam을 그대로 읽는다 — 필터(국가대표 버튼)와
         # 무관하게 항상 적용되는 표시.
-        _name_color = "#4da6ff" if pl.get("has_natteam") else "#eee"
+        # [2026-10 신민용 요청] 올림픽(U-23) 명단에만 든 선수는 녹색 — A매치 명단에도 든 적이
+        # 있으면 파란색이 우선(has_natteam은 올림픽을 뺀 A매치 기준).
+        _name_color = ("#4da6ff" if pl.get("has_natteam")
+                       else ("#33cc66" if pl.get("has_olympic") else "#eee"))
         return [
             {"text": code, "width": self._NAME_COL_W, "color": _name_color, "bold": True},
             {"text": pl.get("position") or "", "width": self._POS_COL_W,
@@ -11240,6 +11606,8 @@ class WorldBrowserWindow(QDialog):
             _year_int = None
         # [2026-10 ③단계] 복사 맨 앞에 이 대회 감독 기록(클릭 시점에 조회).
         _nat_mgr = (lambda: wb.get_national_manager_for_tournament(tid, country))
+        # [2026-10 신설] 감독 줄에 붙일 이 대회 포메이션·선발 배치(RB: xx, LB: xx).
+        _tactics = self._intl_tactics_info(tid, country, starters)
         if starters:
             # [2026-08 신설, 신민용 요청: "복사하기 버튼을 2개 만들건데
             # 1번째는 주전만, 2번째는 지금처럼 스쿼드 전체 — 주전 복사는
@@ -11250,7 +11618,7 @@ class WorldBrowserWindow(QDialog):
             starter_copy_btn.clicked.connect(
                 lambda: self._copy_squad_player_records(
                     _starter_ids, starter_copy_btn, "📋 주전 기록 복사", cutoff_year=_year_int,
-                    manager=_nat_mgr))
+                    manager=_nat_mgr, tactics=_tactics))
             header_row.addWidget(starter_copy_btn)
         if starters or bench:
             squad_copy_btn = QPushButton("📋 스쿼드 기록 복사")
@@ -11258,7 +11626,7 @@ class WorldBrowserWindow(QDialog):
             _ids = [r.get("id") for r in (starters + bench)]
             squad_copy_btn.clicked.connect(
                 lambda: self._copy_squad_player_records(_ids, squad_copy_btn, cutoff_year=_year_int,
-                                                        manager=_nat_mgr))
+                                                        manager=_nat_mgr, tactics=_tactics))
             header_row.addWidget(squad_copy_btn)
             # [2026-08 신설, 신민용 요청: "요약 복사 — 이 대회 연도에
             # 해당하는 선수 기록 부분만 남기고 복사"] year_txt(표의
@@ -11281,7 +11649,7 @@ class WorldBrowserWindow(QDialog):
                         _ids, summary_copy_btn, "📋 요약 복사", target_years=_summary_years,
                         include_stats=False,
                         prefix_text=self._build_country_tournament_summary_text(tid, country),
-                        manager=_nat_mgr))
+                        manager=_nat_mgr, tactics=_tactics))
                 header_row.addWidget(summary_copy_btn)
                 # [2026-09 신설, 신민용 요청: "국가도 주전 요약 복사를
                 # 만들어야 하는데, 요약 복사는 전 포지션 다 포함하고
@@ -11298,9 +11666,9 @@ class WorldBrowserWindow(QDialog):
                 starter_summary_copy_btn.clicked.connect(
                     lambda: self._copy_squad_player_records(
                         _starter_summary_ids, starter_summary_copy_btn, "📋 주전 요약 복사",
-                        target_years=_summary_years, include_stats=False,
+                        target_years=_summary_years, include_stats=False, comp_stats=True,
                         prefix_text=self._build_country_tournament_summary_text(tid, country),
-                        manager=_nat_mgr))
+                        manager=_nat_mgr, tactics=_tactics))
                 header_row.addWidget(starter_summary_copy_btn)
         lay.addLayout(header_row)
         # [2026-10] 그 대회 포메이션(감독 성향으로 고른 값) — 팀 검색 카드와 같은 자리.
@@ -11421,7 +11789,7 @@ class WorldBrowserWindow(QDialog):
     def _copy_squad_player_records(self, ids, btn, reset_label="📋 스쿼드 기록 복사", target_years=None,
                                     include_stats=True, prefix_text="", cutoff_year=None,
                                     cutoff_window=None, manager=None, keep_late_awards=False,
-                                    max_year=None):
+                                    max_year=None, comp_stats=False, tactics=None):
         """[2026-08 신설, 신민용 요청: "이 대회명 써진 줄 우측에 복사하기
         버튼을 놔줘 — 여기 들어간 선수들의 선수 기록을 한꺼번에 복사하는
         용도"] ui/formation_widget.py의 _on_copy_squad_clicked와 완전히
@@ -11507,6 +11875,7 @@ class WorldBrowserWindow(QDialog):
                 team_hist = getattr(harvester, "_player_copy_team_hist", None)
                 rows = getattr(harvester, "_player_copy_rows", [])
                 intl_records = getattr(harvester, "_player_copy_intl_records", [])
+                _all_rows = list(rows or [])
                 if target_years is not None:
                     rows = [r for r in rows if r.get("year") in target_years]
                     intl_records = [r for r in intl_records if r.get("year") in target_years]
@@ -11535,8 +11904,16 @@ class WorldBrowserWindow(QDialog):
                         intl_records = [r for r in intl_records
                                         if r.get("year") is not None and r["year"] >= _min_year]
                     rows, intl_records = _apply_cutoff_year(rows, intl_records, cutoff_year)
+                # [2026-10 신민용 리포트: "2004년에 2000년을 보면 2000년 때 기록으로"] 연도를 정해
+                # 복사하는 경로(target_years/max_year/cutoff_year)는 맨 위 기본 정보 줄(나이·포지션·
+                # OVR·소속)과 통산 수상도 그 해 기준으로 — 지금 값이 섞이지 않게 한다.
+                _snap = (max(target_years) if target_years else
+                         (max_year if max_year is not None else cutoff_year))
+                # [2026-10] comp_stats=True(주전 요약 복사) — 요약 형식 그대로 ⚽ 평점·골·도움만 추가.
                 texts.append(harvester._format_player_history_text(
-                    name, d, team_hist, rows, intl_records, include_stats=include_stats))
+                    name, d, team_hist, rows, intl_records, include_stats=include_stats,
+                    comp_stats=comp_stats, snapshot_year=_snap, snapshot_rows=_all_rows,
+                    snapshot_keep_late=(max_year is not None or keep_late_awards)))
         finally:
             harvester.deleteLater()
         if not texts:
@@ -11550,7 +11927,8 @@ class WorldBrowserWindow(QDialog):
                 manager = None
         _mtxt = self._manager_copy_block(manager, include_records=include_stats,
                                          target_years=target_years, cutoff_year=cutoff_year,
-                                         cutoff_window=cutoff_window) if manager else ""
+                                         cutoff_window=cutoff_window,
+                                         tactics=tactics) if manager else ""
         if _mtxt:
             texts.insert(0, _mtxt)
         final_text = "\n".join(texts)
@@ -11678,6 +12056,15 @@ class WorldBrowserWindow(QDialog):
         h1_order, h2_order = _order(h1_lineup), _order(h2_lineup)
         h1_set, h2_set = set(h1_order), set(h2_order)
         all_ids = list(dict.fromkeys(h1_order + h2_order))
+
+        # [2026-10] "주전 요약 복사" 대상 = 베스트11(핵심·주전) + 로테이션. 역할 기록이 비어
+        # 있어도 그 반기 포메이션 주전 자리에 있었으면 포함한다.
+        _XI_IDS = {p.get("id") for lu in (h1_lineup, h2_lineup)
+                   for p in (lu.get("starters") or []) if p.get("id") is not None}
+        _STARTER_ROLES = ("핵심", "주전", "로테이션")
+
+        def _starter_level(pid, role):
+            return (role in _STARTER_ROLES) or (pid in _XI_IDS)
         if not all_ids:
             conn.close()
             return ""
@@ -11809,9 +12196,19 @@ class WorldBrowserWindow(QDialog):
                 half_row = next((r for r in year_rows if (r.get("entry") or {}).get("_is_half")), None)
                 per_player[pid] = {
                     "name": name, "d": d, "main_row": main_row, "half_row": half_row,
-                    "intl": [r for r in intl_records if r.get("year") == year]}
+                    "intl": [r for r in intl_records if r.get("year") == year],
+                    # [2026-10] 시즌 시작 전(경기 기록 없음) 경로가 직전 시즌 기록을 쓴다.
+                    "all_rows": list(rows), "all_intl": list(intl_records)}
         finally:
             harvester.deleteLater()
+
+        # ── [2026-10 신설] 시즌 시작 전(올해 리그 경기 기록 없음) ──
+        _cur_y = wb.get_current_game_year()
+        _no_games = not ((h2_team_entry or {}).get("league_record")
+                         or (h1_team_entry or {}).get("league_record"))
+        if _cur_y is not None and year == _cur_y and _no_games:
+            return self._build_team_preseason_summary_copy_text(
+                tid, year, team_name, h1_lineup, per_player, starters_only)
 
         # ── 4분류: 나간/들어온/역할변화/변화없음 ──
         left, joined, changed, unchanged = [], [], [], []
@@ -11841,7 +12238,13 @@ class WorldBrowserWindow(QDialog):
                     # 자체가 이미 "중요 장면"이라 역할과 무관하게 그대로
                     # 둔다(로테이션 선수가 주전으로 승격한 "역할변화"도
                     # 당연히 보여야 하므로).
-                    if starters_only and info["main_row"].get("role") != "주전":
+                    # [2026-10 버그수정, 신민용 리포트: "주전 요약 복사는 최소 11명은
+                    # 나와야 하고, 후보 중 로테이션까지 포함돼야 한다"] 예전 조건
+                    # (role != "주전"이면 제외)은 주전 안의 세부 역할 "핵심"(베스트11
+                    # 상위 2~3명, formation_logic.compute_squad_roles)까지 빼버려 GK·
+                    # 핵심 미드·핵심 공격수가 통째로 빠졌다. 베스트11(핵심/주전 또는
+                    # 그 반기 포메이션 주전 자리)과 로테이션은 남긴다.
+                    if starters_only and not _starter_level(pid, info["main_row"].get("role")):
                         continue
                     unchanged.append((pid, info))
 
@@ -11936,6 +12339,100 @@ class WorldBrowserWindow(QDialog):
             final_lines.extend(_emit_player(info, info["main_row"], show_intl=True))
 
         return "\n".join(final_lines)
+
+    def _build_team_preseason_summary_copy_text(self, tid, year, team_name, lineup,
+                                                per_player, starters_only=False):
+        """[2026-10 신설, 신민용 리포트: "시즌 막 시작한 해에 요약 복사를 누르면 [상반기/
+        하반기 팀 기록]에 포메이션·감독만 뜨고 선수가 하나도 없다 — 이때는 경기 기록이
+        없으니 이전 시즌 기록을 2년 단위로(2년이 없으면 1년), 게임 첫 시즌이라 데이터 자체가
+        없으면 선수 OVR 등 지금 수치만이라도 떠야 한다"]
+
+        원인: 선수 줄은 그 해 팀 기록(get_team_history — 경기가 한 번이라도 있어야 생김)에
+        붙어 만들어지는데, 아직 리그 경기가 없는 해는 그 줄 자체가 없어 전원이 걸러졌다.
+
+        형식: 팀 기록 한 번(포메이션·감독·"시즌 진행 전") → 선수마다
+          · 올해 줄: 나이·소속팀·포지션(지금 포메이션 자리)·OVR·역할 + 임대/이적 태그
+          · 직전 두 시즌(없으면 있는 만큼) 기록: 그 시즌 팀 성적·⚽ 평점/골/도움·💰 포함
+          · 그 두 시즌의 국가대표 기록(있을 때만)
+        하반기 블록은 아직 오지 않은 반기라 만들지 않는다. starters_only면 지금 로스터
+        기준 핵심·주전·로테이션만."""
+        starters = [p for p in (lineup.get("starters") or []) if p.get("id") is not None]
+        bench = [p for p in (lineup.get("bench") or []) if p.get("id") is not None]
+        slot_by_id = {p["id"]: p.get("slot") for p in starters}
+        bench_pos = {p["id"]: p.get("position") for p in bench}
+        try:
+            live = wb.get_team_live_player_status(tid, list(slot_by_id))
+        except Exception as _e:
+            print(f"[TEAM-COPY] 올해 역할 계산 실패(역할 '-'로 표시): {_e}")
+            live = {"roles": {}, "loan_from": {}}
+        roles, loan_from = live.get("roles") or {}, live.get("loan_from") or {}
+
+        lines = ["[상반기 팀 기록]"]
+        if lineup.get("formation"):
+            lines.append(f"포메이션: {lineup['formation']}")
+        try:
+            _m = wb.get_team_manager_for_year(tid, year)
+        except Exception:
+            _m = None
+        if _m:
+            _mline = f"감독: {_m.get('display_name') or '-'} ({_m.get('nationality') or '-'}"
+            _mline += ", 외국인 감독)" if _m.get("is_foreign") else ")"
+            if _m.get("style_line"):
+                _mline += f" · {_m['style_line']}"
+            lines.append(_mline)
+        lines.append("리그: 시즌 진행 전 (아직 치른 경기 없음 — 선수별로 직전 시즌 기록 첨부)")
+
+        prev_years = (year - 1, year - 2)
+        order = [p["id"] for p in starters] + [p["id"] for p in bench]
+        for pid in dict.fromkeys(order):
+            if pid == wb.MY_PLAYER_ID:
+                continue
+            info = per_player.get(pid)
+            if not info:
+                continue
+            role = roles.get(pid)
+            if starters_only and not (role in ("핵심", "주전", "로테이션") or pid in slot_by_id):
+                continue
+            d = info["d"]
+            all_rows = info.get("all_rows") or []
+            prev_rows = [r for r in all_rows if r.get("year") in prev_years]
+
+            # 올해 줄 태그 — 임대 중이면 원소속팀, 이번 오프시즌에 온 선수면 직전 팀.
+            tag = ""
+            if pid in loan_from:
+                tag = f" [임대 ← {loan_from[pid]}]"
+            else:
+                _last = next((r for r in all_rows if r.get("year") == year - 1
+                              and not (r.get("entry") or {}).get("_is_half")
+                              and not r.get("is_retired_row")), None)
+                _prev_team = (_last or {}).get("team_name")
+                if _prev_team and _prev_team != team_name:
+                    _label = "이적"
+                    try:
+                        _sh = [h for h in wb.get_ai_player_salary_history(pid) if h[0] == year]
+                        if _sh:
+                            _label = self._simple_transfer_label(_sh[-1][2], _sh[-1][3])
+                    except Exception:
+                        pass
+                    tag = f" [{_label} ← {_prev_team}]"
+
+            nat_text = (d.get("nationality") or "").strip() or "국적 미상"
+            age = d.get("age")
+            pos_now = slot_by_id.get(pid) or bench_pos.get(pid) or d.get("position") or "-"
+            ovr_txt = "-" if is_hard_mode() else (str(d.get("ovr")) if d.get("ovr") else "-")
+            lines.append("")
+            lines.append(f"[{info['name']} 선수 기록]")
+            lines.append(f"국적: {nat_text} | 포지션: {d.get('position') or '-'}")
+            lines.append(" | ".join([
+                f"{year}년 ({age}세)" if age is not None else f"{year}년",
+                f"소속팀: {team_name}", f"포지션: {pos_now}", f"OVR: {ovr_txt}",
+                f"역할: {role or '-'}"]) + tag)
+            for r in prev_rows:
+                lines.extend(self._format_year_row_lines(r, d, include_stats=True))
+            lines.extend(self._format_intl_records_lines(
+                [r for r in (info.get("all_intl") or []) if r.get("year") in prev_years],
+                d, include_stats=True, omit_if_empty=True))
+        return "\n".join(lines)
 
     # ─────────────────────────────────────────
     # 탭2: 컵대회 검색 (2026-07 신설)
@@ -12617,12 +13114,65 @@ class WorldBrowserWindow(QDialog):
         _enable_plain_copy(tbl)
         setattr(self, f"ia_{prefix}_tbl", tbl)
         right_lay.addWidget(tbl, 1)
+        # [2026-10 신설] 베스트 11은 표 대신 맨 아래에 포메이션 묶음(_BestXiBlock)으로 그린다.
+        xi_area, xi_lay = self._ia_make_xi_area()
+        right_lay.addWidget(xi_area, 0)
+        setattr(self, f"ia_{prefix}_xi_area", xi_area)
+        setattr(self, f"ia_{prefix}_xi_lay", xi_lay)
 
-        row.addWidget(right, 1)
+        row.addWidget(self._ia_wrap_scroll(right), 1)
         lay.addLayout(row, 1)
 
         self._refresh_ia_filterable_year_list(prefix)
         return w
+
+    # ── [2026-10 신설] 대회 개인상 베스트 11 공용 도우미 ─────────────────────
+    def _ia_make_xi_area(self):
+        """베스트 11 포메이션 묶음을 담을 빈 칸(처음엔 숨김)."""
+        area = QWidget()
+        lay_ = QVBoxLayout(area)
+        lay_.setContentsMargins(0, 4, 0, 0)
+        lay_.setSpacing(10)
+        area.setVisible(False)
+        return area, lay_
+
+    def _ia_wrap_scroll(self, right):
+        """우측 내용을 세로 스크롤 칸으로 감싼다 — 표 아래에 베스트 11 묶음이 붙어 길어지면
+        화면 전체가 스크롤된다. 묶음이 없으면 표가 예전처럼 남은 높이를 다 쓴다."""
+        sc = QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setFrameShape(QFrame.Shape.NoFrame)
+        sc.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        sc.setWidget(right)
+        return sc
+
+    def _ia_fit_table(self, tbl, fit):
+        """fit=True면 표 높이를 행 수에 딱 맞춰 고정(표 자체 스크롤 없이 아래 묶음과 함께 스크롤),
+        False면 고정을 풀어 예전처럼 늘어나게 한다."""
+        if not fit:
+            tbl.setMinimumHeight(0)
+            tbl.setMaximumHeight(16777215)
+            return
+        h = tbl.horizontalHeader().height() + 2 * tbl.frameWidth() + 2
+        for i in range(tbl.rowCount()):
+            h += tbl.rowHeight(i)
+        if tbl.horizontalScrollBar().isVisible():
+            h += tbl.horizontalScrollBar().height()
+        tbl.setFixedHeight(max(h, 60))
+
+    def _ia_render_xi(self, area, area_lay, xi_rows, year, on_renamed):
+        """베스트 11 행들을 대회(award_type)별로 묶어 포메이션 묶음으로 그린다. 그린 묶음 수를 돌려준다."""
+        while area_lay.count():
+            it = area_lay.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+        groups = {}
+        for r in xi_rows:
+            groups.setdefault(r.get("award_type") or r.get("competition") or "베스트 11", []).append(r)
+        for title, grp in groups.items():
+            area_lay.addWidget(_BestXiBlock(self, grp, year, title, on_renamed=on_renamed))
+        area.setVisible(bool(groups))
+        return len(groups)
 
     def _refresh_ia_filterable_year_list(self, prefix):
         year_list = getattr(self, f"ia_{prefix}_year_list")
@@ -12677,14 +13227,21 @@ class WorldBrowserWindow(QDialog):
         prev = combo.currentText()
         combo.blockSignals(True)
         combo.clear()
-        combo.addItem(_ALL)
         values = spec["get_competitions"](year) if which == "comp" else spec["get_kinds"](year, competition)
+        # [2026-10 신민용 요청: "클럽 대항전 필터에서 대회 전체 없애고 기본을 유럽 챔피언스리그로"]
+        # 클럽 대항전의 "대회"만 전체가 없다 — 처음엔 유럽 챔피언스리그(없으면 첫 대회), 그 뒤엔
+        # 고른 대회가 새 연도에도 있으면 그대로 유지.
+        _club_comp = (prefix == "club" and which == "comp")
+        if not _club_comp:
+            combo.addItem(_ALL)
         for v in values:
             if which == "kind":
                 combo.addItem(_IA_KIND_DISPLAY_OVERRIDE.get(v, v), v)
             else:
                 combo.addItem(v)
         idx = combo.findText(prev)
+        if idx < 0 and _club_comp:
+            idx = combo.findText("유럽 챔피언스리그")
         combo.setCurrentIndex(idx if idx >= 0 else 0)
         combo.blockSignals(False)
 
@@ -12702,8 +13259,16 @@ class WorldBrowserWindow(QDialog):
         kind_filter_text = kind_combo.currentText()
         kind_filter = None if kind_filter_text == _ALL else (kind_combo.currentData() or kind_filter_text)
         rows = spec["get_awards"](
-            year, None if comp_filter == _ALL else comp_filter, kind_filter)
-        self._fill_ia_filterable_table(prefix, rows)
+            year, None if comp_filter in (_ALL, "") else comp_filter, kind_filter)
+        # [2026-10 신설] 베스트 11은 표에서 빼고 맨 아래 포메이션 묶음으로(대회가 전체면 대회마다 하나씩).
+        xi_rows = [r for r in rows if _is_best_xi_row(r)]
+        others = [r for r in rows if not _is_best_xi_row(r)]
+        tbl = getattr(self, f"ia_{prefix}_tbl")
+        n_xi = self._ia_render_xi(getattr(self, f"ia_{prefix}_xi_area"), getattr(self, f"ia_{prefix}_xi_lay"),
+                                  xi_rows, year, lambda p=prefix: self._reload_ia_filterable_table(p))
+        self._fill_ia_filterable_table(prefix, others)
+        tbl.setVisible(bool(others) or not n_xi)
+        self._ia_fit_table(tbl, bool(n_xi) and bool(others))
 
     def _fill_ia_filterable_table(self, prefix, rows):
         """[2026-09 수정, 신민용 지적: "대회/부문, 선수, 국적, 팀, 평점,
@@ -12901,8 +13466,10 @@ class WorldBrowserWindow(QDialog):
         _enable_plain_copy(tbl)
         self.ia_league_tbl = tbl
         right_lay.addWidget(tbl, 1)
+        self.ia_league_xi_area, self.ia_league_xi_lay = self._ia_make_xi_area()
+        right_lay.addWidget(self.ia_league_xi_area, 0)
 
-        row.addWidget(right, 1)
+        row.addWidget(self._ia_wrap_scroll(right), 1)
         lay.addLayout(row, 1)
 
         self._refresh_ia_league_year_list()
@@ -12968,6 +13535,8 @@ class WorldBrowserWindow(QDialog):
         combo.blockSignals(True)
         combo.clear()
         kinds = wb.get_league_award_kinds(year, country, tier) if year is not None else []
+        # [2026-10 신민용 요청: "리그·컵대회 부문에 전체 — 전체면 베스트11은 가장 아래"]
+        combo.addItem(_ALL)
         combo.addItems(kinds)
         idx = combo.findText(prev)
         combo.setCurrentIndex(idx if idx >= 0 else 0)
@@ -12996,32 +13565,51 @@ class WorldBrowserWindow(QDialog):
             return
         country = self.ia_league_country_combo.currentText() or None
         tier = self._ia_league_current_tier()
-        kind = self.ia_league_kind_combo.currentText() or None
+        kind_txt = self.ia_league_kind_combo.currentText() or None
+        kind = None if kind_txt == _ALL else kind_txt
         rows = wb.get_league_awards(year, country, tier, kind)
         tier_label = f"{tier}부" if tier else ""
         self.ia_league_title.setText(
-            f"{country or ''} {tier_label} · {kind or ''}".strip())
-        self._fill_ia_league_table(rows)
+            f"{country or ''} {tier_label} · {kind_txt or ''}".strip())
+        # [2026-10 신설] 베스트 11은 표에서 빼고 맨 아래 포메이션 묶음으로.
+        xi_rows = [r for r in rows if _is_best_xi_row(r)]
+        others = [r for r in rows if not _is_best_xi_row(r)]
+        n_xi = self._ia_render_xi(self.ia_league_xi_area, self.ia_league_xi_lay, xi_rows, year,
+                                  self._reload_ia_league_table)
+        self._fill_ia_league_table(others, show_kind=(kind is None))
+        self.ia_league_tbl.setVisible(bool(others) or not n_xi)
+        self._ia_fit_table(self.ia_league_tbl, bool(n_xi) and bool(others))
 
     def _refresh_ia_league_table_if_selected(self):
         # [2026-09 신설] 이름/국적 변경 시 실시간 반영용 — 이미 골라둔
         # 국가/부/부문 필터는 그대로 두고 표만 다시 그린다(선택 상태를
         # 흔들지 않기 위해 콤보는 재구성하지 않음).
-        if self._ia_league_current_year() is not None and self.ia_league_tbl.isVisible():
+        if self._ia_league_current_year() is not None and (self.ia_league_tbl.isVisible()
+                                                           or self.ia_league_xi_area.isVisible()):
             self._reload_ia_league_table()
 
-    def _fill_ia_league_table(self, rows):
+    def _fill_ia_league_table(self, rows, show_kind=False):
         """[2026-09 확장, 신민용 요청: "키퍼는 선방 실점 이렇게 해서
         보내고"] GK 행은 골/도움 옆에 선방/실점도 같이 보여준다(GK가
-        아니면 "-")."""
-        tbl = self.ia_league_tbl
+        아니면 "-").
+        [2026-10] show_kind=True(부문 "전체")면 맨 앞에 "부문" 칸을 붙인다 — 여러 상이 섞이므로."""
+        self._fill_ia_rank_table(self.ia_league_tbl, rows, show_kind,
+                                 "이 조건에 맞는 리그전 개인상 기록이 없습니다")
+
+    def _fill_ia_rank_table(self, tbl, rows, show_kind, empty_msg):
+        """리그전·컵대회 개인상 표 공용(순위/선수/국적/팀/포지션/평점/골/도움/선방/실점,
+        show_kind면 맨 앞에 부문). 선수 칸(이름)이 늘어나는 칸이고, 선수 id는 첫 칸에 싣는다
+        (_on_ia_player_row_clicked가 첫 칸 UserRole을 읽음)."""
         cols = ["순위", "선수", "국적", "팀", "포지션", "평점", "골", "도움", "선방", "실점"]
+        if show_kind:
+            cols = ["부문"] + cols
+        name_col = cols.index("선수")
         tbl.clear()
         tbl.setRowCount(len(rows))
         tbl.setColumnCount(len(cols))
         tbl.setHorizontalHeaderLabels(cols)
         tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        tbl.horizontalHeader().setSectionResizeMode(name_col, QHeaderView.ResizeMode.Stretch)
         for i, r in enumerate(rows):
             rating = r.get("score_rating")
             is_gk = (r.get("position") or "") == "GK"
@@ -13031,6 +13619,8 @@ class WorldBrowserWindow(QDialog):
                     str(int(r.get("stat_goals") or 0)), str(int(r.get("stat_assists") or 0)),
                     str(int(r.get("stat_saves") or 0)) if is_gk else "-",
                     str(int(r.get("stat_goals_conceded") or 0)) if is_gk else "-"]
+            if show_kind:
+                vals = [r.get("award_kind") or r.get("award_type") or ""] + vals
             for j, v in enumerate(vals):
                 cell = QTableWidgetItem(v)
                 cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -13039,8 +13629,8 @@ class WorldBrowserWindow(QDialog):
                 if r["player_id"] == wb.MY_PLAYER_ID:
                     cell.setForeground(Qt.GlobalColor.green)
                 tbl.setItem(i, j, cell)
-        self._show_empty_state(tbl, rows, "이 조건에 맞는 리그전 개인상 기록이 없습니다", len(cols))
-        self._grow_to_fit(tbl, stretch_col=1)
+        self._show_empty_state(tbl, rows, empty_msg, len(cols))
+        self._grow_to_fit(tbl, stretch_col=name_col)
 
     # [2026-09 신설, 신민용 요청: "개인상에 컵 대회도 추가할려고 해 —
     # 컵 대회를 누르면 좌측에 년도가 뜨고 그걸 누르면 위에 필터에는
@@ -13119,8 +13709,10 @@ class WorldBrowserWindow(QDialog):
         _enable_plain_copy(tbl)
         self.ia_cup_tbl = tbl
         right_lay.addWidget(tbl, 1)
+        self.ia_cup_xi_area, self.ia_cup_xi_lay = self._ia_make_xi_area()
+        right_lay.addWidget(self.ia_cup_xi_area, 0)
 
-        row.addWidget(right, 1)
+        row.addWidget(self._ia_wrap_scroll(right), 1)
         lay.addLayout(row, 1)
 
         self._refresh_ia_cup_year_list()
@@ -13177,6 +13769,8 @@ class WorldBrowserWindow(QDialog):
         combo.blockSignals(True)
         combo.clear()
         kinds = wb.get_cup_award_kinds(year, kind=cup_type, country=country) if year is not None else []
+        # [2026-10 신민용 요청: "리그·컵대회 부문에 전체 — 전체면 베스트11은 가장 아래"]
+        combo.addItem(_ALL)
         combo.addItems(kinds)
         idx = combo.findText(prev)
         combo.setCurrentIndex(idx if idx >= 0 else 0)
@@ -13192,49 +13786,33 @@ class WorldBrowserWindow(QDialog):
             return
         country = self.ia_cup_country_combo.currentText() or None
         cup_type = self._ia_cup_current_type()
-        award_kind = self.ia_cup_kind_combo.currentText() or None
+        kind_txt = self.ia_cup_kind_combo.currentText() or None
+        award_kind = None if kind_txt == _ALL else kind_txt
         rows = wb.get_cup_awards(year, kind=cup_type, country=country, award_kind=award_kind)
         type_label = self.ia_cup_type_combo.currentText()
-        self.ia_cup_title.setText(f"{country or ''} {type_label} · {award_kind or ''}".strip())
-        self._fill_ia_cup_table(rows)
+        self.ia_cup_title.setText(f"{country or ''} {type_label} · {kind_txt or ''}".strip())
+        # [2026-10 신설] 베스트 11은 표에서 빼고 맨 아래 포메이션 묶음으로.
+        xi_rows = [r for r in rows if _is_best_xi_row(r)]
+        others = [r for r in rows if not _is_best_xi_row(r)]
+        n_xi = self._ia_render_xi(self.ia_cup_xi_area, self.ia_cup_xi_lay, xi_rows, year,
+                                  self._reload_ia_cup_table)
+        self._fill_ia_cup_table(others, show_kind=(award_kind is None))
+        self.ia_cup_tbl.setVisible(bool(others) or not n_xi)
+        self._ia_fit_table(self.ia_cup_tbl, bool(n_xi) and bool(others))
 
     def _refresh_ia_cup_table_if_selected(self):
         # [2026-09 신설] 이름/국적 변경 시 실시간 반영용 — 리그전 패널의
         # _refresh_ia_league_table_if_selected와 동일한 원칙(필터는 그대로
         # 두고 표만 다시 그림).
-        if self._ia_cup_current_year() is not None and self.ia_cup_tbl.isVisible():
+        if self._ia_cup_current_year() is not None and (self.ia_cup_tbl.isVisible()
+                                                        or self.ia_cup_xi_area.isVisible()):
             self._reload_ia_cup_table()
 
-    def _fill_ia_cup_table(self, rows):
+    def _fill_ia_cup_table(self, rows, show_kind=False):
         """리그전 패널의 _fill_ia_league_table과 완전히 같은 표 구성
-        (GK는 골/도움 대신 선방/실점)."""
-        tbl = self.ia_cup_tbl
-        cols = ["순위", "선수", "국적", "팀", "포지션", "평점", "골", "도움", "선방", "실점"]
-        tbl.clear()
-        tbl.setRowCount(len(rows))
-        tbl.setColumnCount(len(cols))
-        tbl.setHorizontalHeaderLabels(cols)
-        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        for i, r in enumerate(rows):
-            rating = r.get("score_rating")
-            is_gk = (r.get("position") or "") == "GK"
-            vals = [str(r["rank"]), r["name"], r.get("nationality") or "",
-                    r.get("team_name") or "", r.get("position") or "",
-                    f"{rating:.2f}" if rating else "-",
-                    str(int(r.get("stat_goals") or 0)), str(int(r.get("stat_assists") or 0)),
-                    str(int(r.get("stat_saves") or 0)) if is_gk else "-",
-                    str(int(r.get("stat_goals_conceded") or 0)) if is_gk else "-"]
-            for j, v in enumerate(vals):
-                cell = QTableWidgetItem(v)
-                cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if j == 0:
-                    cell.setData(Qt.ItemDataRole.UserRole, r["player_id"])
-                if r["player_id"] == wb.MY_PLAYER_ID:
-                    cell.setForeground(Qt.GlobalColor.green)
-                tbl.setItem(i, j, cell)
-        self._show_empty_state(tbl, rows, "이 조건에 맞는 컵 대회 개인상 기록이 없습니다", len(cols))
-        self._grow_to_fit(tbl, stretch_col=1)
+        (GK는 골/도움 대신 선방/실점). [2026-10] 부문 "전체"면 맨 앞에 "부문" 칸."""
+        self._fill_ia_rank_table(self.ia_cup_tbl, rows, show_kind,
+                                 "이 조건에 맞는 컵 대회 개인상 기록이 없습니다")
 
     # [2026-09 신설, 신민용 확정: "4열이 아니라 좌측 연도 목록 + 우측
     # 마스터/디테일 2영역 구조"] "세계상" 카테고리의 내용물 — 연도
@@ -13447,11 +14025,34 @@ class WorldBrowserWindow(QDialog):
         _xi_title_row.setContentsMargins(0, 0, 0, 0)
         self.ia_xi_title_lbl = QLabel("📋 FIFA 베스트 11 (4-3-3)")
         self.ia_xi_title_lbl.setStyleSheet("color:#ffcc00;font-size:13px;font-weight:bold;margin-top:8px;")
-        _xi_title_row.addWidget(self.ia_xi_title_lbl, 1)
+        _xi_title_row.addWidget(self.ia_xi_title_lbl, 0)
         _xi_btn_qss = ("QPushButton{background:#333;color:#ddd;border:1px solid #4a4a4a;"
                        "border-radius:4px;padding:3px 10px;font-size:11px;margin-top:8px;}"
                        "QPushButton:hover{background:#3d3d3d;}"
                        "QPushButton:disabled{color:#666;}")
+        # [2026-10 신설, 신민용 요청] 제목 바로 우측 대륙 선택 버튼 FIFA | 유럽 | 아프리카 | 남미 | 북미 |
+        # 아시아(기본 FIFA). 고른 상은 연도를 바꿔도 유지되고, 이름 변경·요약/기록 복사도 지금 보이는
+        # 명단에 적용된다.
+        self._ia_xi_award = _BEST_XI_TABS[0][1]
+        _xi_tab_qss = ("QPushButton{background:#2a2a2a;color:#aaa;border:1px solid #444;"
+                       "border-radius:4px;padding:2px 8px;font-size:11px;margin-top:8px;}"
+                       "QPushButton:hover:!checked{background:#333;}"
+                       "QPushButton:checked{background:#5a4a12;color:#ffcc00;border:1px solid #ffcc00;}")
+        self._ia_xi_tab_group = QButtonGroup(self)
+        self._ia_xi_tab_group.setExclusive(True)
+        self._ia_xi_tab_buttons = {}
+        for _tab_label, _award in _BEST_XI_TABS:
+            _tb = QPushButton(_tab_label)
+            _tb.setCheckable(True)
+            _tb.setAutoDefault(False)
+            _tb.setDefault(False)
+            _tb.setStyleSheet(_xi_tab_qss)
+            _tb.clicked.connect(lambda _checked, a=_award: self._on_best_xi_tab(a))
+            self._ia_xi_tab_group.addButton(_tb)
+            _xi_title_row.addWidget(_tb, 0)
+            self._ia_xi_tab_buttons[_award] = _tb
+        self._ia_xi_tab_buttons[self._ia_xi_award].setChecked(True)
+        _xi_title_row.addStretch(1)
         # [2026-10 신설, 신민용 요청: "베스트11 복사 버튼들 좌측에 이름 변경 — 11명의 닉을 한 번에"]
         # 다른 화면의 "이름 일괄변경"과 같은 창(open_bulk_rename_dialog): 쉼표로 구분한 이름을 오른쪽
         # 명단 위에서부터(GK → DF → MF → FW) 순서대로 배정한다. 내 선수는 대상이 아니다.
@@ -13599,7 +14200,7 @@ class WorldBrowserWindow(QDialog):
         # [2026-10 신설] 골든보이 Top 10 / FIFA 베스트 11(포메이션)
         self._fill_yashin_table(wb.get_season_individual_awards(year, "골든보이"),
                                 tbl=self.ia_gb_tbl, empty_msg="이 해는 골든보이 후보가 없습니다")
-        self._fill_best_xi_box(wb.get_season_individual_awards(year, "FIFA 베스트 11"), year=year)
+        self._fill_best_xi_box(wb.get_season_individual_awards(year, self._ia_xi_award), year=year)
 
         self._apply_ia_secondary_visibility()
 
@@ -13627,7 +14228,7 @@ class WorldBrowserWindow(QDialog):
         else:
             years = None
             span = f"{y}년까지 전체"
-        head = [f"[{y}년 FIFA 베스트 11 (4-3-3)] — 선수 기록 범위: {span} (클럽·국가대표·개인상 전체)"]
+        head = [f"[{y}년 {self._ia_xi_award} (4-3-3)] — 선수 기록 범위: {span} (클럽·국가대표·개인상 전체)"]
         _nat = getattr(self, "_ia_xi_nat", {}) or {}
         for pos, name, team, _pid in lineup:
             head.append(f"  {pos:<4}{name}  ({_nat.get(_pid) or '-'}) ({team or '-'})")
@@ -13648,9 +14249,17 @@ class WorldBrowserWindow(QDialog):
         changed = open_bulk_rename_dialog(self, starters, [])
         if not changed or self._ia_xi_year is None:
             return
-        self._fill_best_xi_box(wb.get_season_individual_awards(self._ia_xi_year, "FIFA 베스트 11"),
+        self._fill_best_xi_box(wb.get_season_individual_awards(self._ia_xi_year, self._ia_xi_award),
                                year=self._ia_xi_year)
 
+
+    def _on_best_xi_tab(self, award):
+        """[2026-10 신설] 베스트 11 대륙 버튼 — 제목을 바꾸고 지금 연도의 그 상 명단을 다시 그린다."""
+        self._ia_xi_award = award
+        self.ia_xi_title_lbl.setText(f"📋 {award} (4-3-3)")
+        if self._ia_xi_year is not None:
+            self._fill_best_xi_box(wb.get_season_individual_awards(self._ia_xi_year, award),
+                                   year=self._ia_xi_year)
 
     def _fill_best_xi_box(self, rows, year=None):
         """[2026-10 신설, 신민용 요청: "베스트 11은 포메이션 그림처럼 보이고 우측에 선수 이름 —
@@ -13667,44 +14276,14 @@ class WorldBrowserWindow(QDialog):
         self.ia_xi_summary_copy_btn.setEnabled(False)
         self.ia_xi_rename_btn.setEnabled(False)
         if not rows:
-            msg = QLabel("이 해는 FIFA 베스트 11 기록이 없습니다")
+            msg = QLabel(f"이 해는 {self._ia_xi_award} 기록이 없습니다")
             msg.setStyleSheet("color:#777;font-size:12px;")
             self._ia_xi_lay.addWidget(msg)
             return
-        from constants import FORMATION_SLOTS, POSITION_COMPAT
-        slots = list(FORMATION_SLOTS["4-3-3"])
-        groups = {"GK": ("GK",), "DF": ("CB", "LB", "RB", "LWB", "RWB"),
-                  "MF": ("CDM", "CM", "CAM", "LM", "RM"), "FW": ("LW", "RW", "ST", "CF")}
-
-        def _grp(pos):
-            for g, lst in groups.items():
-                if pos in lst:
-                    return g
-            return None
-        assigned = [None] * len(slots)
-        pending = list(rows)
-        for exact in (True, False):
-            rest = []
-            for r in pending:
-                pos = r.get("position") or ""
-                g = _grp(pos)
-                cands = [i for i, s in enumerate(slots) if assigned[i] is None and _grp(s) == g]
-                if exact:
-                    cands = [i for i in cands if slots[i] == pos]
-                else:
-                    comp = POSITION_COMPAT.get(pos, [pos])
-                    cands.sort(key=lambda i: comp.index(slots[i]) if slots[i] in comp else 99)
-                if cands:
-                    assigned[cands[0]] = r
-                else:
-                    rest.append(r)
-            pending = rest
-        for r in pending:                 # 그룹이 넘치면(이론상 없음) 빈 슬롯 아무 데나
-            for i in range(len(slots)):
-                if assigned[i] is None:
-                    assigned[i] = r
-                    break
-        slot_players = [(slots[i], (r["name"] if r else None), (r["player_id"] if r else None))
+        # [2026-10] 슬롯 배치 규칙은 대회 베스트 11(_BestXiBlock)과 공용 함수로 옮겼다(결과 동일).
+        slots, assigned = _assign_best_xi_slots(rows, "4-3-3")
+        # [2026-10] 대륙 베스트 11은 그 대륙 후보가 모자란 포지션을 빈자리로 둔다 — "-"로 표시(신민용 확정).
+        slot_players = [(slots[i], (r["name"] if r else "-"), (r["player_id"] if r else None))
                         for i, r in enumerate(assigned)]
         _click = getattr(self, "_on_player_click", None)
         pitch = _StaticPitchView("4-3-3", slot_players, on_click=_click, slots=slots)
@@ -16201,6 +16780,10 @@ class TournamentDetailDialog(QDialog):
             _year = self._wc_year
             _wc_tid = self._wc_lineup_tid()
             _wc_mgr = (lambda: wb.get_national_manager_for_tournament(_wc_tid, country))
+            # [2026-10 신설, 신민용 요청: "그 해 대회 결과 제외 줄에 감독이 짠 전술과
+            # 어디에 어떤 선수를 넣었는지"] 네 복사 버튼 전부 감독 줄에 이 대회 배치를 붙인다.
+            _wc_tactics = (owner._intl_tactics_info(_wc_tid, country, starters)
+                           if hasattr(owner, "_intl_tactics_info") else None)
             # [2026-09 신설, 신민용 리포트: "복사 버튼은 4개야 — 주전
             # 복사/스쿼드 복사/주전 요약 복사/요약 복사"] 국가 검색
             # 카드(_build_country_squad_detail_widget)의 "일반" 복사 두
@@ -16213,7 +16796,7 @@ class TournamentDetailDialog(QDialog):
                 starter_copy_btn.clicked.connect(
                     lambda: owner._copy_squad_player_records(
                         _starter_ids, starter_copy_btn, "📋 주전 기록 복사", cutoff_year=_year,
-                        manager=_wc_mgr))
+                        manager=_wc_mgr, tactics=_wc_tactics))
                 header_row.addWidget(starter_copy_btn)
 
             squad_copy_btn = QPushButton("📋 스쿼드 기록 복사")
@@ -16222,7 +16805,7 @@ class TournamentDetailDialog(QDialog):
             squad_copy_btn.clicked.connect(
                 lambda: owner._copy_squad_player_records(
                     _squad_ids, squad_copy_btn, "📋 스쿼드 기록 복사", cutoff_year=_year,
-                    manager=_wc_mgr))
+                    manager=_wc_mgr, tactics=_wc_tactics))
             header_row.addWidget(squad_copy_btn)
 
             starter_summary_btn = QPushButton("📋 주전 요약 복사")
@@ -16238,7 +16821,8 @@ class TournamentDetailDialog(QDialog):
             starter_summary_btn.clicked.connect(
                 lambda: owner._copy_squad_player_records(
                     _starter_summary_ids, starter_summary_btn, "📋 주전 요약 복사",
-                    include_stats=False, cutoff_year=_year, cutoff_window=2, manager=_wc_mgr))
+                    include_stats=False, comp_stats=True, cutoff_year=_year, cutoff_window=2,
+                    manager=_wc_mgr, tactics=_wc_tactics))
             header_row.addWidget(starter_summary_btn)
 
             summary_btn = QPushButton("📋 요약 복사")
@@ -16247,7 +16831,8 @@ class TournamentDetailDialog(QDialog):
             summary_btn.clicked.connect(
                 lambda: owner._copy_squad_player_records(
                     _all_ids, summary_btn, "📋 요약 복사",
-                    include_stats=False, cutoff_year=_year, cutoff_window=2, manager=_wc_mgr))
+                    include_stats=False, cutoff_year=_year, cutoff_window=2, manager=_wc_mgr,
+                    tactics=_wc_tactics))
             header_row.addWidget(summary_btn)
         lay.addLayout(header_row)
         # [2026-10] 그 대회 포메이션(감독 성향으로 고른 값).

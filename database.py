@@ -195,6 +195,8 @@ _TENURE_RESULT_COLS = (
     # ';'로 이어 붙인다(첫 항목 = 부임 계약, 이후 = 재계약). 서명은 시즌 끝 시장이라
     # 계약 기간 N년 = 만료연도 − 서명연도(다음 시즌부터 N시즌).
     ("contract_log", "TEXT DEFAULT ''"),
+    # [2026-10 감독 연봉] contract_log와 같은 순서의 "서명연도:연봉(천원)" — manager_salary.reconcile이 채운다.
+    ("salary_log", "TEXT DEFAULT ''"),
 )
 
 
@@ -236,6 +238,7 @@ _NAT_MGR_COLS = (
     ("tournaments",    "INTEGER DEFAULT 0"),      # 치른 메이저 대회 수
     ("best_rank",      "INTEGER DEFAULT 0"),      # 이 임기 최고 성적 rank
     ("contract_log",   "TEXT DEFAULT ''"),        # [2026-10] 클럽과 같은 형식(서명:만료;…)
+    ("salary_log",     "TEXT DEFAULT ''"),        # [2026-10 감독 연봉] contract_log와 같은 순서(서명:연봉천원;…)
 )
 _NAT_OBJ_COLS = (
     ("id",             "INTEGER PRIMARY KEY AUTOINCREMENT"),
@@ -1838,6 +1841,11 @@ def load_from_disk() -> bool:
     디스크 직결 모드(USE_MEMORY_DB=False)에서는 항상 False(불필요)."""
     invalidate_intl_apps_cache()   # [2026-09] intl_squad 합계 캐시(새 DB/초기화 시 반드시 버린다)
     invalidate_military_cache()    # [2026-10] 군팀 id 캐시(team_id가 새 판에서 재사용되므로 반드시 버린다)
+    try:
+        import manager_salary as _msal_ld
+        _msal_ld.clear_cache()     # [2026-10 감독 연봉] 리그 기준값 캐시(league_id가 판마다 재사용된다)
+    except Exception:
+        pass
     try:
         import sub_positions as _subp_ld
         _subp_ld.clear()           # [2026-10 주포·부포] 부포 캐시(다른 세이브를 읽으면 다시 읽는다)
@@ -3517,6 +3525,14 @@ def init_db():
         team_id INTEGER PRIMARY KEY,
         lineup_json TEXT DEFAULT '[]',
         bench_json TEXT DEFAULT '[]')""")
+    # [2026-10 신설 — 구단 구매 기본 세팅] 구단 소유·구단 예산·예산 기록(club_owner.py 머리 주석).
+    # team_id 재사용 함정 때문에 reset_game_data 삭제 목록에도 같이 넣었다.
+    import club_owner as _club_owner
+    _club_owner.create_tables(c)
+    # [G2 — 2026-10] 사용자 감독 팀·구단주 구단 경기의 관전 기록(controlled_matches.py 머리 주석).
+    # match_details(내 경기 전용)와 분리 — 새 게임 삭제 목록에도 넣었다.
+    import controlled_matches as _cm
+    _cm.create_tables(c)
     # 마이그레이션: 컬럼 추가
     for migration in [
         "ALTER TABLE career_entries ADD COLUMN position TEXT DEFAULT ''",
@@ -4707,6 +4723,8 @@ def init_db():
         # [2026-10] 대표팀 재임 계약 기록(_NAT_MGR_COLS와 같은 정의 — 새 표는 CREATE로,
         # 기존 세이브는 이 ALTER로). 클럽 쪽은 manager_rep_migrations가 붙인다.
         "ALTER TABLE national_team_managers ADD COLUMN contract_log TEXT DEFAULT ''",
+        # [2026-10 감독 연봉] 재임별 연봉 기록(manager_salary.py) — 클럽 쪽은 _TENURE_RESULT_COLS로 붙는다.
+        "ALTER TABLE national_team_managers ADD COLUMN salary_log TEXT DEFAULT ''",
     # [2026-09 신설 — ③-c] 감독 실적/명성. 정의는 파일 상단
     # _MANAGER_REP_COLS / _TENURE_RESULT_COLS 한 곳에만 있다.
     ] + manager_rep_migrations() + [
@@ -7632,6 +7650,9 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
               "team_managers","managers",
               # [2026-10] 사용자 감독 팀 선발 선택 — team_id 재사용 함정 동일.
               "user_team_plans",
+              # [2026-10] 구단 구매 — 소유·예산·예산 기록도 같은 함정.
+              "club_ownership", "club_budget", "club_budget_log",
+              "spectator_match_details",   # [G2] 관전 기록
               # [2026-09 — ③-d] 대표팀 감독 재임 이력과 목표 스냅샷도 같은
               # 이유로 지운다. country_id/tournament_id 역시 새 게임에서
               # 재사용되므로, 안 지우면 이전 세계관의 대표팀 감독과 목표가
@@ -7885,6 +7906,14 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False):
         _cr.close()
     except Exception as _e:
         print(f"[RESET] 대표팀 감독 능력 기준 표시 실패(계속 진행): {_e}")
+    # [2026-10 감독 연봉] 새 월드 시작 계약(클럽·대표팀)의 연봉 기록 — 리그 기준값 캐시는 이전 판
+    # league_id를 들고 있을 수 있으므로 먼저 비운다. 기록 전용이라 실패해도 진행한다.
+    try:
+        import manager_salary as _msal
+        _msal.clear_cache()
+        _msal.reconcile()
+    except Exception as _e:
+        print(f"[RESET] 감독 연봉 기록 실패(계속 진행): {_e}")
     _rst_mark("감독 재생성")
     # season_state가 방금 통째로 지워졌으므로 get_state() 캐시도 반드시
     # 비워야 한다 — 안 그러면 새 게임 시작 직후에도 이전 플레이의 연도/
@@ -8023,6 +8052,53 @@ def get_ai_player_custom_names(player_ids, conn=None) -> dict:
     if _own:
         conn.close()
     return {r["player_id"]: r["custom_name"] for r in rows}
+
+
+import re as _re
+_AI_CODE_IN_TEXT_RE = _re.compile(r"(?<![0-9A-Za-z])AI[0-9A-Z]{4,7}(?![0-9A-Za-z])")
+
+
+def refresh_ai_codes_in_texts(texts, conn=None):
+    """[2026-10 신설, 신민용 리포트: "경기 로그에 바꾼 이름이 아니라 AI0JP4로 뜬다"] 경기 로그·경기
+    상세 문구는 저장하는 순간의 표시명(이름이 없으면 AI 코드)이 글자로 박힌다 — 그 뒤에 이름을 지어도
+    옛 줄엔 코드가 남는다. 저장된 글은 그대로 두고, 보여줄 때 글 속 AI 코드(AI0JP4 — 선수마다
+    유일하고 id로 정확히 되돌릴 수 있음)를 지금 지어진 이름으로 바꿔 돌려준다. 이름이 아직 없는
+    선수의 코드는 그대로. texts: 문자열 목록(None 허용) → 같은 길이의 새 목록."""
+    texts = list(texts or [])
+    codes = set()
+    for t in texts:
+        if t and "AI" in t:
+            codes.update(_AI_CODE_IN_TEXT_RE.findall(t))
+    if not codes:
+        return texts
+    from constants import ai_player_code, _AI_CODE_DIGITS
+    id_by_code = {}
+    for code in codes:
+        n = 0
+        for ch in code[2:]:
+            n = n * 36 + _AI_CODE_DIGITS.index(ch)
+        if ai_player_code(n) == code:          # 앞자리 0 변형 등 진짜 코드가 아닌 건 제외
+            id_by_code[code] = n
+    ids = sorted(set(id_by_code.values()))
+    names = {}
+    _own = conn is None
+    conn = conn or get_conn()
+    try:
+        for k in range(0, len(ids), 500):
+            chunk = ids[k:k + 500]
+            for r in conn.execute(
+                    f"SELECT player_id, custom_name FROM ai_player_custom_names "
+                    f"WHERE player_id IN ({','.join('?' * len(chunk))})", chunk).fetchall():
+                if (r[1] or "").strip():
+                    names[r[0]] = r[1].strip()
+    finally:
+        if _own:
+            conn.close()
+    rep = {code: names[pid] for code, pid in id_by_code.items() if pid in names}
+    if not rep:
+        return texts
+    return [(_AI_CODE_IN_TEXT_RE.sub(lambda m: rep.get(m.group(0), m.group(0)), t)
+             if (t and "AI" in t) else t) for t in texts]
 
 
 def set_ai_player_custom_name(player_id: int, custom_name: str, conn=None):
@@ -10286,6 +10362,33 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
                 if _my_pos_inh and len(picked) > INTL_SQUAD_TOTAL - 1:
                     picked.sort(key=lambda r: ((r["ovr"] or 0), -(r["age"] or 0)))
                     picked = picked[len(picked) - (INTL_SQUAD_TOTAL - 1):]
+                # [2026-10 신설, 국대 부상 소집 규칙] 예선 명단에 내가 있어서(AI 25명) 본선엔
+                # 내가 없으면(부상 소집 해제·본선 미선발 등) 물려받은 명단이 25명으로 남았다 —
+                # 예선 때 저장한 후보군(intl_callup_pool)에서 내 포지션 그룹 우선으로 채운다.
+                _target_inh = INTL_SQUAD_TOTAL - (1 if _my_pos_inh else 0)
+                if len(picked) < _target_inh:
+                    from intl_engine import _INTL_CALLUP_BUCKET_OF
+                    conn_f = get_conn()
+                    _mp = conn_f.execute("SELECT position FROM my_player WHERE id=1").fetchone()
+                    _my_bucket = _INTL_CALLUP_BUCKET_OF.get((_mp["position"] if _mp else "") or "", "")
+                    _have = {r["id"] for r in picked}
+                    _pool = [r["player_id"] for r in conn_f.execute(
+                        """SELECT cp.player_id FROM intl_callup_pool cp
+                           JOIN ai_players ap ON ap.id = cp.player_id
+                           WHERE cp.tournament_id=? AND cp.country=?
+                           ORDER BY (cp.bucket = ?) DESC, cp.rank ASC, cp.score DESC""",
+                        (_callup_src_tid, country, _my_bucket)).fetchall()
+                        if r["player_id"] not in _have][:_target_inh - len(picked)]
+                    if _pool:
+                        _ph_f = ",".join("?" * len(_pool))
+                        _add = {r["id"]: dict(r) for r in conn_f.execute(
+                            f"""SELECT ap.id, ap.name, ap.position, ap.ovr, ap.age, ap.foot, ap.sub_role, {_stat_cols},
+                                       t.name AS club, t.current_tier AS club_tier, cn.name AS club_country
+                                FROM ai_players ap JOIN teams t ON ap.team_id=t.id
+                                JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
+                                WHERE ap.id IN ({_ph_f})""", _pool).fetchall()}
+                        picked += [_add[i] for i in _pool if i in _add]
+                    conn_f.close()
 
     if picked is None:
         # [2026-09 재설계, 신민용 리포트: "RW 90/83/82가 있어도 최대 1명만
