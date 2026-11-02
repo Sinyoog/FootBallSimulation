@@ -148,7 +148,11 @@ def _colorize(line: str) -> str:
 # 접두사가 없어(예: "🅰🔥 멀티 어시스트!", "극장골!" 등 매번 다름)
 # 블랙리스트로는 새로 추가되는 문구를 놓칠 수 있으므로, 반대로 "남길
 # 것"만 화이트리스트로 정의해 항상 안전하게 걸러지도록 했다.
-_MATCH_RESULT_RE = re.compile(r'\d+\s*-\s*\d+.*\((승|무|패)\)\s*$')
+# [2026-10] 승부차기 경기는 결과 칸이 "승부차기 (5-3) 패배"로 바뀌었다 — 이것도 결과 줄로 인정.
+# 예전 저장 로그("(무)  (승부차기 5-3 패)")도 줄 끝이 "(승|무|패)"가 아니라 "…패)"라서 '경기'
+# 필터에서 결과 줄이 통째로 빠졌다(신민용 리포트: 챔스 4강 승부차기 패배 줄이 안 보임) — 같이 인정한다.
+_MATCH_RESULT_RE = re.compile(
+    r'\d+\s*-\s*\d+.*(\((승|무|패)\)|승부차기 \(\d+-\d+\) (승리|패배)|\(승부차기 [^)]*\))\s*$')
 
 
 def _is_match_core_line(stripped: str) -> bool:
@@ -315,6 +319,11 @@ QPushButton:hover:!checked { background:#2a2a2a; }
 """
 
 
+
+# [2026-10] 앱 전체에서 하나만 띄우는 경기 상세 창 — (match id, 창). LogPanel._on_anchor 참고.
+_OPEN_MATCH_DETAIL = None
+
+
 class LogPanel(QWidget):
     def __init__(self, main_win=None):
         super().__init__()
@@ -413,6 +422,20 @@ class LogPanel(QWidget):
             mid = int(s.split(":", 1)[1])
         except (ValueError, IndexError):
             return
+        # [2026-10 신민용 요청: "경기 상세 보기는 하나만 띄울 수 있게"] 이미 열린 경기 상세 창이
+        # 있으면 — 같은 경기면 그 창을 앞으로 가져오고, 다른 경기면 그 창을 닫고 새로 연다.
+        # 로그 패널이 여러 개여도 앱 전체에서 한 창만 유지한다(모듈 전역 _OPEN_MATCH_DETAIL).
+        global _OPEN_MATCH_DETAIL
+        _cur = _OPEN_MATCH_DETAIL
+        if _cur is not None and _win_alive(_cur[1]):
+            if _cur[0] == mid:
+                _cur[1].show(); _cur[1].raise_(); _cur[1].activateWindow()
+                return
+            try:
+                _cur[1].close()
+            except RuntimeError:
+                pass
+        _OPEN_MATCH_DETAIL = None
         data = get_match_detail(mid)
         if not data:
             return
@@ -428,15 +451,19 @@ class LogPanel(QWidget):
         self._match_detail_wins = [w for w in self._match_detail_wins if _win_alive(w)]
         self._match_detail_wins.append(dlg)
         dlg.finished.connect(lambda *_a, d=dlg: self._on_match_detail_closed(d))
+        _OPEN_MATCH_DETAIL = (mid, dlg)
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
 
     def _on_match_detail_closed(self, dlg):
+        global _OPEN_MATCH_DETAIL
         try:
             self._match_detail_wins.remove(dlg)
         except ValueError:
             pass
+        if _OPEN_MATCH_DETAIL is not None and _OPEN_MATCH_DETAIL[1] is dlg:
+            _OPEN_MATCH_DETAIL = None
 
     def _set_filter_mode(self, mode: str):
         """[2026-08 신설, 로그 필터 버튼] 전체/핵심/경기 버튼 클릭 시

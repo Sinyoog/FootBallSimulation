@@ -1105,13 +1105,28 @@ class MatchDetailDialog(QDialog):
         head = QLabel(f"⚽ {data.get('league_name','')}  ·  "
                       f"{data.get('year','')}년 {data.get('week','')}주차  ({loc})")
         head.setStyleSheet("color:#44ccff;font-size:13px;font-weight:bold;")
+        head.setWordWrap(True)
         root.addWidget(head)
 
-        score = QLabel(f"{data.get('home_name','')}  "
-                       f"{data.get('home_score',0)} - {data.get('away_score',0)}  "
-                       f"{data.get('away_name','')}")
-        score.setStyleSheet("color:#fff;font-size:18px;font-weight:bold;")
-        score.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # [2026-10 신민용 요청: "팀 이름이 길면 잘린다"] 예전엔 "홈 2 - 0 원정"을 한 줄로 이어 써서
+        # 긴 팀명(예: SC 코린치앙스(브라질))이면 창 폭(420)을 넘어 잘렸다. 팀을 위아래 두 줄로
+        # 나누고 점수는 오른쪽 끝에 맞춘다. 그래도 넘치는 이름은 잘리지 않고 줄바꿈된다.
+        from PyQt6.QtWidgets import QGridLayout
+        score = QWidget()
+        sg = QGridLayout(score)
+        sg.setContentsMargins(24, 2, 24, 2)
+        sg.setHorizontalSpacing(16); sg.setVerticalSpacing(2)
+        for _r, (_nm, _sc) in enumerate(((data.get('home_name', ''), data.get('home_score', 0)),
+                                         (data.get('away_name', ''), data.get('away_score', 0)))):
+            _nl = QLabel(str(_nm))
+            _nl.setWordWrap(True)
+            _nl.setStyleSheet("color:#fff;font-size:18px;font-weight:bold;")
+            _sl = QLabel(str(_sc))
+            _sl.setStyleSheet("color:#fff;font-size:18px;font-weight:bold;")
+            _sl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            sg.addWidget(_nl, _r, 0)
+            sg.addWidget(_sl, _r, 1)
+        sg.setColumnStretch(0, 1)
         root.addWidget(score)
 
         if played or _absent_team_view:
@@ -1136,7 +1151,16 @@ class MatchDetailDialog(QDialog):
 
             root.addWidget(btn_row)
 
-        res = QLabel(f"({rs})")
+        # [2026-10 신민용 요청] 승부차기로 끝난 경기는 "(무)" 대신 "승부차기 (5-3) 패배".
+        # 저장된 payload["pso"] = {"won": bool, "score": "5-3"} (game_engine._save_match_detail).
+        _pso = payload.get("pso") or None
+        if isinstance(_pso, dict):
+            from game_engine import pso_result_text
+            _won = bool(_pso.get("won"))
+            res = QLabel(pso_result_text(_pso.get("score"), _won))
+            rs_color = "#4488ff" if _won else "#ff4444"
+        else:
+            res = QLabel(f"({rs})")
         res.setStyleSheet(f"color:{rs_color};font-size:14px;font-weight:bold;")
         res.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(res)
@@ -1151,7 +1175,11 @@ class MatchDetailDialog(QDialog):
             # 사유가 없는 예전 저장분은 부상인지 정지인지 알 수 없어 "결장"으로만 쓴다.
             _reason = payload.get("absence_reason")
             if _reason == "suspension":
-                _txt = "🟥 출전정지로 결장"
+                # [2026-10] 정지 원인(경고 누적 / 퇴장)까지 — 원인 기록이 없는 예전 저장분은 예전 문구.
+                _sc = payload.get("suspension_cause")
+                _txt = ("🟨 출전정지로 결장 (경고 누적)" if _sc == "yellow_accum" else
+                        "🟥 출전정지로 결장 (퇴장 징계)" if _sc in ("red_card", "second_yellow") else
+                        "🟥 출전정지로 결장")
             elif _reason == "injury":
                 _txt = "🚑 부상 결장"
             elif benched or _reason == "bench":

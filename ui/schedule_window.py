@@ -402,17 +402,11 @@ class ScheduleWindow(QDialog):
             # 탭이 안 생긴다. 랭킹 평가전(power_eval)은 예선이 아니라
             # 별도 대회라 자기 탭을 갖는다(예전엔 get_my_tournament의
             # kind 화이트리스트에 없어 어디에도 안 떴다).
-            ("🌍 국제대회", [
-                ("예선 1차", lambda: self._make_intl_tab("groups", qual=True, stage=1), False),
-                ("예선 2차", lambda: self._make_intl_tab("groups", qual=True, stage=2), False),
-                ("예선 플레이오프", lambda: self._make_intl_tab("qual_po", qual=True), False),
-                ("조별리그", lambda: self._make_intl_tab("groups", qual=False), False),
-                ("본선", lambda: self._make_intl_tab("ko", qual=False), False),
-                ("랭킹 평가전", lambda: self._make_intl_tab(
-                    "groups", kinds=("power_eval", "power_eval_extra")), False),
-                ("랭킹 평가전 본선", lambda: self._make_intl_tab(
-                    "ko", kinds=("power_eval",)), False),
-            ]),
+            # [2026-10 재설계, 신민용 리포트: "그 해 국제대회가 다 떠야 하는데 네이션스가 있을 땐
+            # 지역 예선 봤던 게 안 뜨고, 그 예선의 본선이 오면 네이션스 기록이 사라진다"] 단계 탭을
+            # 대회마다 따로 만든다(_intl_sched_subs) — 예전엔 예선 칸·본선 칸이 대회 하나씩만 골라
+            # 같은 해 두 번째 대회가 첫 대회를 밀어냈다.
+            ("🌍 국제대회", self._intl_sched_subs()),
             # [2026-10 4단계] U-23 올림픽 — 예선(월드컵 예선 엔진)·본선(월드컵 본선 일정).
             # 올림픽이 꺼져 있고 기록도 없으면 대분류 자체를 만들지 않는다(아래 _oly_defs).
             *self._oly_sched_defs(),
@@ -461,6 +455,47 @@ class ScheduleWindow(QDialog):
             ]),
         ]
         return defs
+
+    # 대회 하나에 붙는 단계 탭: (단계 라벨, mode, stage).
+    _INTL_QUAL_STAGES = (("예선 1차", "groups", 1), ("예선 2차", "groups", 2),
+                         ("예선 플레이오프", "qual_po", None))
+    _INTL_FINAL_STAGES = (("조별리그", "groups", None), ("본선", "ko", None))
+
+    @staticmethod
+    def _intl_short_name(t):
+        """탭 라벨용 대회 이름 — 앞의 연도("2002 ")는 위 연도 표시와 겹쳐 뺀다."""
+        import re as _re
+        nm = (t.get("name") or "").strip()
+        return _re.sub(r"^\d{4}\s+", "", nm) or nm
+
+    def _intl_sched_subs(self):
+        """🌍 국제대회 대분류의 단계 탭 목록. 그 해 내 대회(intl_engine.get_my_tournaments)마다
+        예선(1차·2차·플레이오프) 또는 본선(조별리그·본선) 탭을 만든다. 대회가 하나뿐인 칸은 예전과
+        같은 라벨("예선 1차" 등), 같은 칸에 대회가 둘 이상이면 "대회명 · 단계"로 구분한다. 랭킹
+        평가전은 예전처럼 자기 탭. 빌더가 None이면(그 단계 경기가 없음) 탭이 안 생기는 건 그대로."""
+        import intl_engine
+        from game_engine import get_state
+        st = get_state()
+        year = st["current_year"] if st else None
+        subs = []
+        try:
+            groups = ((intl_engine.get_my_tournaments(year, qual=True), self._INTL_QUAL_STAGES, True),
+                      (intl_engine.get_my_tournaments(year, qual=False), self._INTL_FINAL_STAGES, False))
+        except Exception:
+            groups = ()
+        for ts, stages, is_qual in groups:
+            multi = len(ts) > 1
+            for t in ts:
+                _short = self._intl_short_name(t)
+                for _lbl, _mode, _stage in stages:
+                    label = f"{_short} · {_lbl}" if multi else _lbl
+                    subs.append((label, (lambda tid=t["id"], m=_mode, sg=_stage, q=is_qual:
+                                         self._make_intl_tab(m, qual=q, stage=sg, tid=tid)), False))
+        subs.append(("랭킹 평가전", lambda: self._make_intl_tab(
+            "groups", kinds=("power_eval", "power_eval_extra")), False))
+        subs.append(("랭킹 평가전 본선", lambda: self._make_intl_tab(
+            "ko", kinds=("power_eval",)), False))
+        return subs
 
     _OLY_CAT = "🏅 U-23 올림픽"
 
@@ -529,11 +564,13 @@ class ScheduleWindow(QDialog):
                 return bool(self._sched_data_cache[1])
             if cat_label == "🌍 국제대회":
                 import intl_engine
-                return any(intl_engine.get_my_tournament(year, qual=q, kinds=k) for q, k in (
+                # [2026-10 버그수정] 내가 참여한 대회만(get_my_schedule_tournament) — 미참가 대회로
+                # 대분류가 칠해지지 않게.
+                return any(intl_engine.get_my_schedule_tournament(year, qual=q, kinds=k) for q, k in (
                     (True, None), (False, None), (None, ("power_eval", "power_eval_extra"))))
             if cat_label == self._OLY_CAT:
                 import intl_engine
-                return any(intl_engine.get_my_tournament(year, kinds=k)
+                return any(intl_engine.get_my_schedule_tournament(year, kinds=k)
                            for k in (("oly_qual",), ("olympic",)))
             if not my_tid:
                 return False
@@ -879,7 +916,7 @@ class ScheduleWindow(QDialog):
 
     # ── 국제대회 탭 ──────────────────────────────
 
-    def _make_intl_tab(self, mode="groups", qual=False, kinds=None, stage=None):
+    def _make_intl_tab(self, mode="groups", qual=False, kinds=None, stage=None, tid=None):
         """[2026-09 확장, 신민용 리포트 19번: "랭킹 평가전은 경기 일정에
         안 뜨며, 월드컵같이 2중으로 예선전 하는 거에서 처음 예선전만 뜬다"]
 
@@ -897,7 +934,13 @@ class ScheduleWindow(QDialog):
         st = get_state()
         if not st:
             return None
-        t = intl_engine.get_my_tournament(st["current_year"], qual=qual, kinds=kinds)
+        if tid is not None:
+            # [2026-10] 대회를 직접 지정(_intl_sched_subs — 같은 해 대회마다 탭을 따로 만든다).
+            t = next((x for x in intl_engine.get_tournaments(st["current_year"]) if x["id"] == tid), None)
+        else:
+            # [2026-10 버그수정] 일정표는 내가 참여한 대회만 — get_my_tournament의 표시용 폴백
+            # (미참가 대회)을 쓰면 안 나간 대회가 탭으로 떴다.
+            t = intl_engine.get_my_schedule_tournament(st["current_year"], qual=qual, kinds=kinds)
         if not t:
             return None
         if qual and mode == "ko":
@@ -2568,9 +2611,57 @@ class ScheduleWindow(QDialog):
         return box
 
     def _make_table(self, data, my_view=True):
+        """리그 일정 표.
+        [2026-10 신설, 신민용 요청: "전체 일정에서 상세 필터로 각 팀들 기록을 확인할 수
+        있게 — 매년 리그에 속한 팀이 바뀌는 것도 생각해야 해 / 내 경기에도 내가 붙었던
+        상대 팀 하나를 고르면 그 팀이랑 붙었던 기록만 뜨게"] 표 위에 팀 필터를 둔다.
+          - 전체 일정: 필터 목록은 teams.league_id(43주 승강 즉시 바뀜)가 아니라 이 탭이
+            보여주는 그 시즌 그 리그의 실제 경기(data)에 나온 팀들로 만든다 — 그래서
+            해마다 승강으로 구성이 바뀌어도, 시즌 막판(44~52주) 승강 직후에도 그 시즌에
+            실제로 뛴 팀만 뜬다. 팀을 고르면 그 팀 경기만 남기고 승패·색은 그 팀 기준.
+          - 내 경기: 목록은 이번 시즌 내가 실제로 만난 상대 팀들. 고르면 그 팀과의
+            경기만 남긴다(승패는 원래대로 내 기준).
+        필터 위에 고른 팀의 전적(치른 경기만: 승·무·패, 득·실, 남은 경기)을 보여준다.
+        "전체"를 고르면 표 내용·색은 예전과 완전히 같다. 고른 팀은 창이 갱신돼
+        표를 다시 만들 때도(하루 진행 등) 유지한다 — 새 목록에 없으면 "전체"로."""
+        from PyQt6.QtWidgets import QComboBox
         w   = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(0,0,0,0)
+
+        # ── 팀 필터 ──
+        my_tid = self.my_team_id
+        names = {}
+        for r in data:
+            names.setdefault(r["home_team_id"], r.get("home_name", "") or "")
+            names.setdefault(r["away_team_id"], r.get("away_name", "") or "")
+        if my_view:
+            opts = sorted(((tid, nm) for tid, nm in names.items() if tid != my_tid),
+                          key=lambda x: x[1])
+            all_label = "전체 상대"
+        else:
+            opts = sorted(names.items(), key=lambda x: x[1])
+            all_label = "전체 팀"
+        bar = QHBoxLayout(); bar.setContentsMargins(0, 0, 0, 4)
+        flbl = QLabel("상대 팀" if my_view else "팀")
+        flbl.setStyleSheet("color:#888;font-size:12px;")
+        combo = QComboBox()
+        combo.setFixedHeight(26)
+        combo.setStyleSheet(
+            "QComboBox{background:#2a2a2a;color:#cccccc;border:1px solid #444;"
+            "border-radius:4px;padding:2px 8px;font-size:12px;min-width:180px;}"
+            "QComboBox:hover{border:1px solid #888;background:#383838;}"
+            "QComboBox::drop-down{border:none;width:18px;}"
+            "QComboBox QAbstractItemView{background:#1e1e1e;color:#ccc;"
+            "selection-background-color:#3a6a3a;border:1px solid #444;outline:none;}")
+        combo.addItem(all_label, None)
+        for tid, nm in opts:
+            combo.addItem(nm, tid)
+        summary = QLabel("")
+        summary.setStyleSheet("color:#bbbbbb;font-size:12px;padding-left:8px;")
+        bar.addWidget(flbl); bar.addWidget(combo); bar.addWidget(summary); bar.addStretch(1)
+        lay.addLayout(bar)
+
         cols = ["날짜", "홈팀", "스코어", "원정팀", "승패"]
-        tbl  = QTableWidget(len(data), len(cols))
+        tbl  = QTableWidget(0, len(cols))
         tbl.setHorizontalHeaderLabels(cols)
         tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         tbl.verticalHeader().setVisible(False)
@@ -2588,49 +2679,97 @@ class ScheduleWindow(QDialog):
         # 파일 맨 위에서 import돼 있어 그대로 재사용하면 되고, constants
         # 쪽 3개만 루프 밖으로 한 번만 꺼내둔다. 결과는 완전히 동일하다.
         from constants import day_to_full_date_str, day_to_week, DAYS_PER_WEEK
+        _st0 = get_state()
+        _fallback_year = _st0["current_year"] if _st0 else 2000
 
-        for i, r in enumerate(data):
-            hs  = r["home_score"]; as_ = r["away_score"]
-            score   = f"{hs} - {as_}" if hs >= 0 else "예정"
-            is_my   = r["home_team_id"]==self.my_team_id or r["away_team_id"]==self.my_team_id
-            played  = hs >= 0
+        def _fill(rows, persp):
+            """rows를 표에 채운다. persp = 승패·색을 매길 기준 팀(기본은 내 팀)."""
+            tbl.setRowCount(len(rows))
+            for i, r in enumerate(rows):
+                hs  = r["home_score"]; as_ = r["away_score"]
+                score   = f"{hs} - {as_}" if hs >= 0 else "예정"
+                is_my   = r["home_team_id"]==persp or r["away_team_id"]==persp
+                played  = hs >= 0
 
-            if not played or not is_my:
-                col_wdl = ""
-                wdl_color = "#555555"
-            else:
-                if r["home_team_id"] == self.my_team_id:
-                    col_wdl = "승" if hs>as_ else ("무" if hs==as_ else "패")
+                if not played or not is_my:
+                    col_wdl = ""
+                    wdl_color = "#555555"
                 else:
-                    col_wdl = "패" if hs>as_ else ("무" if hs==as_ else "승")
-                wdl_color = "#00cc44" if col_wdl=="승" else ("#888888" if col_wdl=="무" else "#cc4444")
+                    if r["home_team_id"] == persp:
+                        col_wdl = "승" if hs>as_ else ("무" if hs==as_ else "패")
+                    else:
+                        col_wdl = "패" if hs>as_ else ("무" if hs==as_ else "승")
+                    wdl_color = "#00cc44" if col_wdl=="승" else ("#888888" if col_wdl=="무" else "#cc4444")
 
-            if not played:
-                row_color = QColor("#555555")
-            elif is_my:
-                if col_wdl == "승":   row_color = QColor("#00cc44")
-                elif col_wdl == "무": row_color = QColor("#888888")
-                else:                  row_color = QColor("#cc4444")
-            else:
-                row_color = QColor("#aaaaaa")
-
-            _day = r["day"] if r["day"] else (r["week"] - 1) * DAYS_PER_WEEK + 1
-            if r["year"]:
-                _base_year = r["year"]
-            else:
-                _st = get_state()
-                _base_year = _st["current_year"] if _st else 2000
-            vals = [day_to_full_date_str(_base_year, _day), r.get("home_name",""), score,
-                    r.get("away_name",""), col_wdl]
-
-            for j, v in enumerate(vals):
-                item = QTableWidgetItem(v)
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if j == 4:
-                    item.setForeground(QColor(wdl_color))
+                if not played:
+                    row_color = QColor("#555555")
+                elif is_my:
+                    if col_wdl == "승":   row_color = QColor("#00cc44")
+                    elif col_wdl == "무": row_color = QColor("#888888")
+                    else:                  row_color = QColor("#cc4444")
                 else:
-                    item.setForeground(row_color)
-                tbl.setItem(i, j, item)
+                    row_color = QColor("#aaaaaa")
+
+                _day = r["day"] if r["day"] else (r["week"] - 1) * DAYS_PER_WEEK + 1
+                _base_year = r["year"] if r["year"] else _fallback_year
+                vals = [day_to_full_date_str(_base_year, _day), r.get("home_name",""), score,
+                        r.get("away_name",""), col_wdl]
+
+                for j, v in enumerate(vals):
+                    item = QTableWidgetItem(v)
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    if j == 4:
+                        item.setForeground(QColor(wdl_color))
+                    else:
+                        item.setForeground(row_color)
+                    tbl.setItem(i, j, item)
+
+        def _record_text(rows, persp, opp=None):
+            """persp 팀의 치른 경기 전적. opp가 있으면 그 상대와의 상대 전적 문구."""
+            w_ = d_ = l_ = gf = ga = left = 0
+            for r in rows:
+                hs = r["home_score"]; as_ = r["away_score"]
+                if hs < 0:
+                    left += 1
+                    continue
+                mine, theirs = (hs, as_) if r["home_team_id"] == persp else (as_, hs)
+                gf += mine; ga += theirs
+                if mine > theirs: w_ += 1
+                elif mine == theirs: d_ += 1
+                else: l_ += 1
+            played = w_ + d_ + l_
+            head = f"상대 전적 {played}경기" if opp is not None else f"{played}경기"
+            txt = f"{head}  {w_}승 {d_}무 {l_}패 · 득 {gf} 실 {ga}"
+            if left:
+                txt += f" · 남은 경기 {left}"
+            return txt
+
+        if not hasattr(self, "_sched_team_filter"):
+            self._sched_team_filter = {}
+
+        def _apply(_idx=None):
+            sel = combo.currentData()
+            self._sched_team_filter[my_view] = sel
+            if sel is None:
+                _fill(data, my_tid)
+                summary.setText("")
+                return
+            rows = [r for r in data if r["home_team_id"] == sel or r["away_team_id"] == sel]
+            if my_view:
+                _fill(rows, my_tid)
+                summary.setText(_record_text(rows, my_tid, opp=sel))
+            else:
+                _fill(rows, sel)
+                summary.setText(_record_text(rows, sel))
+
+        # 직전에 고른 팀 복원(새 목록에 있을 때만) — 시그널 연결 전에 맞춰 두고 한 번만 채운다.
+        _prev = self._sched_team_filter.get(my_view)
+        if _prev is not None:
+            _pi = combo.findData(_prev)
+            if _pi > 0:
+                combo.setCurrentIndex(_pi)
+        _apply()
+        combo.currentIndexChanged.connect(_apply)
 
         # [2026-08 최적화, 신민용 리포트: "43→44→45주, 52→1주 렉 없애자"]
         # ResizeToContents 모드를 행 채우기 "전"에 걸어두면 setItem() 호출

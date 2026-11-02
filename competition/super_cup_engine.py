@@ -423,23 +423,38 @@ def _season_finalists(year, continent):
     적인 경우 이 시점엔 이미 셋 다 끝나 있다)."""
     cl_t = get_tournament(CHAMPIONS_CFG, year, continent)
     el_t = get_tournament(EUROPA_CFG, year, continent)
-    ecl_t = get_tournament(CONFERENCE_CFG, year, continent)
-    if not (cl_t and el_t and ecl_t):
+    # [2026-10 버그수정, 신민용 리포트: "남미 슈퍼컵이 없다"] 남미는 컨퍼런스리그를 아예 열지
+    # 않는다(continental_qualification.CONFERENCE_TEAM_CAP 남미 0 — 실제 CONMEBOL처럼 대회 2개).
+    # 그런데 여기서 컨퍼런스 우승팀을 필수로 요구해서 남미 슈퍼컵이 매년 조용히 건너뛰어졌다.
+    # 컨퍼런스를 열지 않는 대륙은 네 번째 팀을 유로파 준우승팀으로 한다(신민용 확정 — 챔스 1·2위
+    # + 유로파 1·2위, 4팀 대회 형식 그대로).
+    from competition.continental_qualification import CONFERENCE_TEAM_CAP
+    no_conference = CONFERENCE_TEAM_CAP.get(continent, 1) <= 0
+    ecl_t = None if no_conference else get_tournament(CONFERENCE_CFG, year, continent)
+    if not (cl_t and el_t and (ecl_t or no_conference)):
         return None
-    if not (cl_t["status"] == "done" and el_t["status"] == "done" and ecl_t["status"] == "done"):
+    if not (cl_t["status"] == "done" and el_t["status"] == "done"
+            and (no_conference or ecl_t["status"] == "done")):
         return None
 
     cl_champion, cl_runner_up = _finalist_pair("cl_matches", cl_t["id"])
     el_champion = el_t["winner_team_id"] or None
-    ecl_champion = ecl_t["winner_team_id"] or None
-    if not (cl_champion and cl_runner_up and el_champion and ecl_champion):
+    if no_conference:
+        # 결승 상대 = 유로파 우승팀이 아닌 쪽(결승이 두 경기여도 우승팀 기준으로 고른다).
+        _f_win, _f_run = _finalist_pair("el_matches", el_t["id"])
+        fourth = ({_f_win, _f_run} - {el_champion, None}).pop() if el_champion in (_f_win, _f_run) else None
+        fourth_row = (fourth, "el_runner_up", EUROPA_CFG, el_t["id"])
+    else:
+        fourth = ecl_t["winner_team_id"] or None
+        fourth_row = (fourth, "ecl_champion", CONFERENCE_CFG, ecl_t["id"])
+    if not (cl_champion and cl_runner_up and el_champion and fourth):
         return None
 
     raw = [
         (cl_champion, "cl_champion", CHAMPIONS_CFG, cl_t["id"]),
         (cl_runner_up, "cl_runner_up", CHAMPIONS_CFG, cl_t["id"]),
         (el_champion, "el_champion", EUROPA_CFG, el_t["id"]),
-        (ecl_champion, "ecl_champion", CONFERENCE_CFG, ecl_t["id"]),
+        fourth_row,
     ]
     if len({r[0] for r in raw}) != 4:
         return None

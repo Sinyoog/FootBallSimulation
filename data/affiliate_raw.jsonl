@@ -524,9 +524,9 @@
       "parent_team_name": "미요나리오스"
     },
     {
-      "team_name": "후니오르 B",
+      "team_name": "아틀레티코 후니오르 B",
       "tier": 3,
-      "parent_team_name": "후니오르"
+      "parent_team_name": "아틀레티코 후니오르"
     },
     {
       "team_name": "칼리 B",
@@ -681,25 +681,24 @@
       "team_name": "FC 이마바리(2군)",
       "tier": 5,
       "parent_team_name": "FC 이마바리"
-    }
-  ],
-  "review": [
-    {
-      "team_name": "FC 이와키(연계)",
-      "tier": 5,
-      "review_reason": "ambiguous_classification"
-    },
-    {
-      "team_name": "요코하마 SCC(위성)",
-      "tier": 5,
-      "review_reason": "ambiguous_classification"
     },
     {
       "team_name": "알비렉스 니가타(아마)",
       "tier": 5,
-      "review_reason": "ambiguous_classification"
+      "parent_team_name": "알비렉스 니가타"
+    },
+    {
+      "team_name": "FC 이와키(연계)",
+      "tier": 5,
+      "parent_team_name": "이와키 FC"
+    },
+    {
+      "team_name": "요코하마 SCC(위성)",
+      "tier": 5,
+      "parent_team_name": "YSCC 요코하마"
     }
-  ]
+  ],
+  "review": []
 }
 
 {
@@ -796,9 +795,9 @@
   "total_teams": 60,
   "affiliates": [
     {
-      "team_name": "라피드 빈 II",
+      "team_name": "SK 라피트 빈 II",
       "tier": 2,
-      "parent_team_name": "라피드 빈"
+      "parent_team_name": "SK 라피트 빈"
     },
     {
       "team_name": "스투름 그라츠 II",
@@ -902,15 +901,14 @@
       "team_name": "메스 케르만 B",
       "tier": 4,
       "parent_team_name": "메스 케르만"
-    }
-  ],
-  "review": [
+    },
     {
       "team_name": "에스테글랄 노바린",
       "tier": 3,
-      "review_reason": "ambiguous_classification"
+      "parent_team_name": "에스테글랄"
     }
-  ]
+  ],
+  "review": []
 }
 
 {
@@ -2699,15 +2697,14 @@
       "team_name": "KF 아폴로니아 B",
       "tier": 4,
       "parent_team_name": "아폴로니아"
-    }
-  ],
-  "review": [
+    },
     {
       "team_name": "KF 아드리아티쿠 B",
       "tier": 4,
-      "review_reason": "ambiguous_classification"
+      "parent_team_name": "아드리아티쿠"
     }
-  ]
+  ],
+  "review": []
 }
 
 {
@@ -4562,15 +4559,14 @@
       "team_name": "세인트 조지 B",
       "tier": 3,
       "parent_team_name": "세인트 조지 SC"
-    }
-  ],
-  "review": [
+    },
     {
       "team_name": "아다마 시티 유스",
       "tier": 3,
-      "review_reason": "아다마 시티"
+      "parent_team_name": "아다마 시티"
     }
-  ]
+  ],
+  "review": []
 }
 
 {

@@ -14,8 +14,10 @@
   3. 성이 앞인 언어권(일본어·중국어·광둥어·크메르어) → 뒤(이름) 첫 글자 + 앞(성).
      구보 다케후사 → T. 구보
   4. 나머지(이름이 앞) → 첫 단어(이름) 첫 글자 + 마지막 단어(성).
-     티아구 몬테이루 → T. 몬테이루. 성 앞의 반·판·폰·데·드·디·다·델·델라·도스·두
-     같은 연결어는 성에 붙인다(버질 반 다이크 → V. 반 다이크 — 아니면 "V. 다이크").
+     티아구 몬테이루 → T. 몬테이루. 가운데 단어(미들 네임·연결어)는 전부 뺀다
+     [2026-10-31 신민용 요청: "미들 네임은 생략하고 성과 이름만"] — 예전엔
+     반·데·엘 같은 연결어를 성에 붙여 "O. 엘 아르다"처럼 떴다. 이제
+     케난 엘 아르다 → K. 아르다, 버질 반 다이크 → V. 다이크.
   5. 한 피치(한 팀) 안에서 줄인 이름이 겹치면 겹친 선수만 풀네임.
 
 영문 이니셜은 한글 첫 음절의 초성(ㅇ이면 모음)으로 추정한다 — 가상 이름이라
@@ -49,9 +51,6 @@ _LANG_CHO_OVERRIDE = {
     "포르투갈어": {_CHO_HIEUT: "R"},
     "일본어": {_CHO_GIYEOK: "K", _CHO_DIGEUT: "T"},
 }
-# 성 앞에 붙는 연결어(네덜란드·독일·이베리아·이탈리아·프랑스식)
-_SURNAME_PARTICLES = {"반", "판", "폰", "데", "더", "데르", "드", "디", "다", "델", "델라", "도스", "두",
-                      "다스", "덴", "테르", "반데르", "판데르", "엘", "알"}
 _AI_CODE_RE = re.compile(r"^AI(?:[0-9A-Z]{4}| ?\d+)$")
 
 _LANG_BY_COUNTRY = None
@@ -99,10 +98,7 @@ def short_name(name, nationality=""):
         return s
     if lang in _FAMILY_FIRST_LANGS:
         return f"{name_initial(toks[1], lang)}. {toks[0]}"
-    start = len(toks) - 1
-    while start > 1 and toks[start - 1] in _SURNAME_PARTICLES:
-        start -= 1
-    return f"{name_initial(toks[0], lang)}. {' '.join(toks[start:])}"
+    return f"{name_initial(toks[0], lang)}. {toks[-1]}"   # 미들 네임·연결어는 생략
 
 
 def short_names(items):

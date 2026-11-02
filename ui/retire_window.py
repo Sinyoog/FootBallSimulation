@@ -60,7 +60,14 @@ def _loan_in_duration_str(entry_list, idx):
         last = nxt
     ey = last.get("end_year"); ew = last.get("end_week", 52)
     if not (sy and ey):
-        return "진행중"
+        # [2026-10 신민용 요청: "임대 간 기간엔 계약에 '진행중'이 아니라 몇 년 임대인지(1년이면 1년)"]
+        # 진행 중인 임대는 예정 기간을 보여준다. 끝난 임대는 아래처럼 실제로 뛴 기간(예: 11개월).
+        try:
+            import my_loan as _ml
+            _plan = _ml.planned_loan_text(team_id=first.get("team_id"))
+        except Exception:
+            _plan = ""
+        return _plan or "진행중"
     total_weeks = max(1, (ey - sy) * 52 + (ew - sw))
     return _fmt_loan_months(total_weeks)
 
@@ -790,7 +797,13 @@ class RetireWindow(QDialog):
             # 팔림 표시는 안 뜨고 2002년 구매만 뜨는게 맞는듯"] 나가는 쪽 exit_t가
             # "팔림"이면 표시하지 않고(들어오는 쪽 "구매"만 남김), 그 행 자체의
             # in_type으로 대체한다. 방출/이적/계약만료는 그대로 우선 표시.
-            _exit_disp = "" if exit_t == "팔림" else exit_t
+            # [2026-10 신민용 요청: "입대는 이전 구단 줄이 아니라 새 구단(군팀) 줄에 — 2010 대구 → 2011 입대면
+            # 2011년에만 입대"] 입대도 팔림처럼 떠나는 구단 줄에서는 숨긴다(군팀 줄의 들어온 경로 "입대"로만 보임).
+            _exit_disp = "" if exit_t in ("팔림", "입대") else exit_t
+            # [2026-10 신민용 요청: "군대 갔다 오면 이적: 전역"] 제대도 입대처럼 떠나는 군팀 줄에선 숨기고
+            # 돌아간 팀 줄(들어온 경로 "제대" → "전역")에만 보인다. 제대 후 FA라 다음 줄이 없으면 군팀 줄에 남긴다.
+            if exit_t == "제대" and i + 1 < len(visible) and visible[i + 1].get("transfer_type") == "제대":
+                _exit_disp = ""
             # [2026-08 버그수정, 신민용 리포트: "유료로 들어왔다가 곧장 임대
             # 나간 경우, 임대 표시가 이적료 표시를 덮어써서 이적료가 아예
             # 안 보인다"] exit_t가 "임대"인데 이 행 자체가 유료로 들어온
@@ -807,7 +820,11 @@ class RetireWindow(QDialog):
             # 떠야지"] 계약 컬럼은 원소속팀 계약년수를 그대로 보여주고(임대는
             # 새 계약이 아니라 원소속팀 계약 유지), 이적 컬럼에 실제 임대
             # 기간을 "임대(N개월)"처럼 붙인다 — career_window.py와 동일 로직.
-            if t_type in ("임대", "임대 종료"):
+            if in_type == "임대" and exit_t in ("", "임대 종료"):
+                # [2026-10 신민용 요청: "이적 표시는 임대만 — OO에서 임대(11개월) 후 복귀 같은 변화 필요 없다"]
+                # 임대로 온 팀 줄은 진행 중이든 끝났든 "임대"만. 기간은 계약 칸에 있다.
+                t_type = "임대"
+            elif t_type in ("임대", "임대 종료"):
                 # [2026-07 재수정, 신민용 지적: "임대(1년)/임대 종료(1년)만
                 # 뜨면 어느 팀으로 갔는지/어디로 복귀했는지 안 보인다"]
                 # career_window.py와 동일하게 상대팀명을 함께 표시한다.
@@ -839,6 +856,15 @@ class RetireWindow(QDialog):
             if in_type == "임대":
                 c_str = _loan_in_duration_str(visible, i)
                 prev_team = cur_team
+            elif in_type in ("임대 복귀", "제대", "진급", "강등"):
+                # [2026-10 신민용 요청: "임대 복귀 후 계약에 5년이 다시 뜨면 새로 5년 계약한 것처럼 보인다 — -로"]
+                # 복귀·전역은 새 계약이 아니라 원 소속 계약이 이어지는 것(계약 기간은 그동안에도 흘렀다).
+                # 진급·강등도 입대 때의 복무 2년이 이어질 뿐이다.
+                c_str = "—"
+            elif in_type == "입대":
+                # 입대 줄은 원 소속 계약 유지 여부와 무관하게 복무 기간(2년) — 계약 유지면 c_yrs가 원래 계약년수다.
+                from constants import MILITARY_SERVICE_YEARS as _MSY
+                c_str = f"{_MSY}년"
             elif i == 0 or cur_team != visible[i-1].get("team_name"):
                 # 팀이 바뀌었거나 첫 행(임대 아닌 정상 이적/입단) → 계약년수 표시
                 c_str = f"{c_yrs}년" if c_yrs else "—"
@@ -854,6 +880,8 @@ class RetireWindow(QDialog):
             # 사는 쪽(구매/오퍼)에만 금액을 붙여야 한다"] exit_t가 채택된
             # 경우("이 팀을 떠난" 이벤트)는 표시하지 않는다 — 그 이적료는
             # 다음 팀 행(구매 쪽)에 이미 붙는다.
+            if t_type == "제대":   # [2026-10 신민용 요청] 군대 갔다 오면 이적 칸은 "전역"
+                t_type = "전역"
             if not exit_t:
                 _fee = e.get("transfer_fee", 0)
                 if _fee:
@@ -1624,7 +1652,13 @@ class RetireWindow(QDialog):
                 # [2026-08 신설, career_window.py/팀이력 탭과 동일한 신민용
                 # 지적 반영] AI요약도 팀이력 탭과 똑같이 나가는 쪽 "팔림"
                 # 표시는 없애고 들어오는 쪽 "구매"만 남긴다.
-                _exit_disp = "" if exit_t == "팔림" else exit_t
+                # [2026-10 신민용 요청: "입대는 이전 구단 줄이 아니라 새 구단(군팀) 줄에 — 2010 대구 → 2011 입대면
+                # 2011년에만 입대"] 입대도 팔림처럼 떠나는 구단 줄에서는 숨긴다(군팀 줄의 들어온 경로 "입대"로만 보임).
+                _exit_disp = "" if exit_t in ("팔림", "입대") else exit_t
+                # [2026-10 신민용 요청: "군대 갔다 오면 이적: 전역"] 제대도 입대처럼 떠나는 군팀 줄에선 숨기고
+                # 돌아간 팀 줄(들어온 경로 "제대" → "전역")에만 보인다. 제대 후 FA라 다음 줄이 없으면 군팀 줄에 남긴다.
+                if exit_t == "제대" and idx + 1 < len(entries) and entries[idx + 1].get("transfer_type") == "제대":
+                    _exit_disp = ""
                 # [2026-08 버그수정, 신민용 리포트: "유료로 들어왔다가 곧장
                 # 임대 나간 경우, 임대 표시가 이적료 표시를 덮어써서 이적료가
                 # 아예 안 보인다 — 임대는 받는 팀 행에만 표시하면 되는데"]
@@ -1643,7 +1677,11 @@ class RetireWindow(QDialog):
                 # 떠야지"] career_window.py와 동일하게 계약 컬럼은 원소속팀
                 # 계약년수를 그대로 보여주고, 이적란에 실제 임대 기간을
                 # "임대(N개월)"처럼 붙인다.
-                if t_type in ("임대", "임대 종료"):
+                if in_type == "임대" and exit_t in ("", "임대 종료"):
+                    # [2026-10 신민용 요청: "이적 표시는 임대만 — OO에서 임대(11개월) 후 복귀 같은 변화 필요 없다"]
+                    # 임대로 온 팀 줄은 진행 중이든 끝났든 "임대"만. 기간은 계약 칸에 있다.
+                    t_type = "임대"
+                elif t_type in ("임대", "임대 종료"):
                     # [2026-07 재수정, 신민용 지적: "임대(1년)/임대 종료(1년)만
                     # 뜨면 어느 팀으로 갔는지/어디로 복귀했는지 안 보인다"]
                     _partner = e.get("loan_partner_team", "") or ""
@@ -1674,6 +1712,8 @@ class RetireWindow(QDialog):
                 # (팔림/방출/계약만료 등, "이 팀을 떠난" 이벤트)는 그
                 # 팀에서의 이적료가 아니라 다음 팀 행에 이미 붙으므로
                 # 여기서는 표시하지 않는다.
+                if t_type == "제대":   # [2026-10 신민용 요청] 군대 갔다 오면 이적 칸은 "전역"
+                    t_type = "전역"
                 if not exit_t:
                     _fee_disp = e.get("transfer_fee", 0)
                     if _fee_disp:
@@ -1685,6 +1725,15 @@ class RetireWindow(QDialog):
                     # 한다"] 임대 목적지 행은 원소속팀 계약년수 대신 실제
                     # 임대 기간을 보여준다.
                     c_str = _loan_in_duration_str(entries, idx)
+                elif in_type in ("임대 복귀", "제대", "진급", "강등"):
+                    # [2026-10 신민용 요청: "임대 복귀 후 계약에 5년이 다시 뜨면 새로 5년 계약한 것처럼 보인다 — -로"]
+                    # 복귀·전역은 새 계약이 아니라 원 소속 계약이 이어지는 것(계약 기간은 그동안에도 흘렀다).
+                    # 진급·강등도 입대 때의 복무 2년이 이어질 뿐이다.
+                    c_str = "—"
+                elif in_type == "입대":
+                    # 입대 줄은 원 소속 계약 유지 여부와 무관하게 복무 기간(2년) — 계약 유지면 c_yrs가 원래 계약년수다.
+                    from constants import MILITARY_SERVICE_YEARS as _MSY
+                    c_str = f"{_MSY}년"
                 elif idx == 0 or e.get("team_name") != entries[idx-1].get("team_name"):
                     c_str = f"{c_yrs}년" if c_yrs else "—"
                 elif in_type in ("연장", "완전 이적") or t_type == "연장":  # [2026-10] 임대 후 완전 이적 = 같은 팀 새 계약

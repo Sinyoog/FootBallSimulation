@@ -2,8 +2,9 @@
 """sub_positions.py — 주포·부포(부포지션) 획득·저장·조회 공용 모듈.
 
 [2026-10 신설, 신민용 확정 — 주포·부포 ③ 명세]
-  · 부포는 감점 없이 100% 적합(미스매치 0). 주발 적합도는 따로 그대로 적용한다.
-  · 주포를 부포보다 자동으로 우선하지 않는다(선발은 유효값만 본다).
+  · [2026-10 개정, 신민용 확정] 부포 = 주포 OVR −1(constants.SUB_POS_OVR_COST). OVR 97 ST의 부포가 LW이면
+    LW에서는 OVR 96 LW와 같다. 예전 명세(감점 없이 100% 적합)는 폐기. 주발 적합도는 따로 그대로 적용한다.
+  · 선발은 유효값만 본다 — 부포가 −1이라 같은 조건이면 주포 슬롯이 앞선다.
   · 선수당 최대 1개, 한 번 얻으면 영구 유지. GK는 부포를 얻지 못하고, GK 슬롯을 부포로 얻지도 못한다.
   · 처음부터 정해지지 않고 시간이 지나며 생긴다 — 아래 획득 규칙(A안).
   · 적용 범위: AI 클럽(최적 배치·포메이션 선택 적합도·시즌 포지션 기록·경기 중 교체 판단),
@@ -114,15 +115,35 @@ def compat_rank(registered, slot):
     return c.index(slot) if slot in c else None
 
 
+def _tier_rule_on():
+    import constants
+    return bool(getattr(constants, "SUB_POS_TIER_ELIGIBILITY", False))
+
+
+def _tier_of(registered, slot):
+    """포지션 거리 단계(0~4) — constants.POSITION_TIER_PCT 안의 위치."""
+    import formation_logic as _fl
+    from constants import POSITION_TIER_PCT
+    p = _fl._tier_penalty(registered, slot)
+    return POSITION_TIER_PCT.index(p) if p in POSITION_TIER_PCT else 4
+
+
 def eligible(registered, slot, foot):
     """획득 조건 2)~4) — 등록 포지션 registered인 선수가 slot을 부포로 얻을 수 있는 조합인가."""
     if not registered or not slot or registered == slot:
         return False
     if registered == "GK" or slot == "GK" or (registered, slot) in _EQUIV:
         return False
-    r = compat_rank(registered, slot)
-    if r is None or r < 1 or r > _MAX_COMPAT_RANK:
-        return False
+    if _tier_rule_on():
+        # [2026-10 5번 ②, constants.SUB_POS_TIER_ELIGIBILITY] 호환표 1~2순위 대신 포지션 거리 단계
+        # (formation_logic._tier_penalty — 선발 감점과 같은 표) T1~T2 자리. LW→ST처럼 호환표 3순위라
+        # 막혀 있던 인접 자리도 얻을 수 있고, 예전 2순위였지만 거리가 먼(T3) 자리는 더는 못 얻는다.
+        if _tier_of(registered, slot) not in (1, 2):
+            return False
+    else:
+        r = compat_rank(registered, slot)
+        if r is None or r < 1 or r > _MAX_COMPAT_RANK:
+            return False
     want = FOOT_SIDED_SLOTS.get(slot)
     if want is not None and foot and foot != FOOT_BOTH and foot != want:
         return False
@@ -154,8 +175,8 @@ def acquire(c, year):
     if not enabled():
         return 0
     global _CACHE
-    from database import history_drain
-    history_drain()
+    from database import history_drain, history_sync_for_read
+    history_sync_for_read()  # [2026-11-01 비동기 기록 경합 수정] 커밋 + 대기(예전 history_drain)
     have = {int(r[0]): r[1] for r in c.execute(f"SELECT player_id, position FROM {TABLE}").fetchall()}
     # 4개 기록이 모두 같은 슬롯이고 등록 포지션과 다른(= 비주포 슬롯 선발) 현역 선수만 SQL로 먼저
     # 추린 뒤, 호환 순위·주발·GK·ST↔CF는 decide_ai(단위 테스트와 같은 함수)로 판정한다.
@@ -201,14 +222,28 @@ def acquire(c, year):
     return len(new_rows)
 
 
+def sub_mult_penalty(ovr, cap):
+    """[2026-10] 곱셈형 적합도에서 부포 슬롯의 미스매치 — OVR × (1 − 이 값) = OVR − SUB_POS_OVR_COST. cap(호환
+    2순위 감점)보다 커지지 않게 한다(OVR이 아주 낮은 선수 방어)."""
+    from constants import SUB_POS_OVR_COST
+    return min(cap, SUB_POS_OVR_COST / max(1.0, float(ovr or 0)))
+
+
+def sub_abs_penalty(cap):
+    """[2026-10] 절대값형 점수(OVR − 감점)에서 부포 슬롯의 감점 — SUB_POS_OVR_COST, 호환 2순위 감점보다 작게."""
+    from constants import SUB_POS_OVR_COST
+    return min(cap, SUB_POS_OVR_COST)
+
+
 def best_slot(primary, sub, slots):
-    """내 선수 배치 슬롯 — 호환 순위가 가장 좋은 슬롯(부포 슬롯은 순위 0). 동점이면 슬롯 순서(주포 우선 없음).
-    sub가 없으면 예전 get_field_pos 루프와 같은 결과. 호환 슬롯이 하나도 없으면 primary."""
+    """내 선수 배치 슬롯 — 호환 순위가 가장 좋은 슬롯. [2026-10] 부포 슬롯은 SUB_POS_RANK(주포 0과 호환 2순위 1
+    사이 — 부포 = OVR −1). sub가 없으면 예전 get_field_pos 루프와 같은 결과. 호환 슬롯이 하나도 없으면 primary."""
+    from constants import SUB_POS_RANK
     compat = POSITION_COMPAT.get(primary, [primary])
     best, best_rank = primary, 999
     for slot in slots:
         if sub and slot == sub:
-            rank = 0
+            rank = SUB_POS_RANK
         elif slot in compat:
             rank = compat.index(slot)
         else:

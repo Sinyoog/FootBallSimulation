@@ -27,6 +27,72 @@ QPushButton#danger:hover { background-color: #8a2a2a; }
 """
 
 
+class _TableClickToggle:
+    """[2026-10 신설, 신민용 요청: "그리드 상자(표 칸) 클릭하면 빛나는데, 같은 곳을 한 번 더
+    누르면 꺼지게 — 경기 일정·순위표·세계 축구 기록실 전부"] 앱 전체 표(QTableView 계열 —
+    QTableWidget 포함)에 한 번에 적용하는 이벤트 필터. 표마다 고치지 않는다.
+    이미 선택돼 있던 칸을 왼쪽 버튼으로 눌렀다 같은 칸에서 떼면, 기존 클릭 처리(cellClicked 등)가
+    다 끝난 다음 그 표의 선택과 현재 칸 표시를 지운다. 이벤트는 가로채지 않으므로 칸 클릭으로
+    상세 창을 여는 기존 동작은 그대로다. Ctrl/Shift 다중 선택, 드래그, 오른쪽 클릭, 더블클릭의
+    두 번째 누름(Qt가 MouseButtonDblClick으로 따로 보냄)에는 관여하지 않는다."""
+
+    def __init__(self):
+        from PyQt6.QtCore import QObject, QEvent
+
+        outer = self
+
+        class _F(QObject):
+            def eventFilter(self, obj, ev):
+                t = ev.type()
+                if t == QEvent.Type.MouseButtonPress or t == QEvent.Type.MouseButtonRelease:
+                    try:
+                        outer._on_mouse(obj, ev, t == QEvent.Type.MouseButtonPress)
+                    except Exception:
+                        outer._pending = None   # 표시 편의 기능 — 어떤 경우에도 클릭 자체를 막지 않는다
+                return False
+
+        self._pending = None
+        self.filter = _F()
+
+    def _on_mouse(self, obj, ev, is_press):
+        from PyQt6.QtWidgets import QTableView
+        from PyQt6.QtCore import Qt, QTimer
+        view = obj.parent() if obj is not None else None
+        if not isinstance(view, QTableView) or obj is not view.viewport():
+            return
+        if (ev.button() != Qt.MouseButton.LeftButton or
+                ev.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)):
+            self._pending = None
+            return
+        sm = view.selectionModel()
+        idx = view.indexAt(ev.position().toPoint())
+        if is_press:
+            # 누르기 직전(Qt가 선택을 바꾸기 전)에 "선택된 게 이 칸(행 선택 표면 이 행) 하나뿐"이었는지
+            # 기억한다 — 여러 칸을 골라 둔 상태에서 그중 하나를 누르면 Qt 기본대로 그 칸만 남긴다.
+            only_this = False
+            if sm is not None and idx.isValid() and sm.isSelected(idx):
+                sel = sm.selectedIndexes()
+                if view.selectionBehavior() == QTableView.SelectionBehavior.SelectRows:
+                    only_this = {i.row() for i in sel} == {idx.row()}
+                else:
+                    only_this = len(sel) == 1
+            self._pending = (view, idx.row(), idx.column()) if only_this else None
+            return
+        pend, self._pending = self._pending, None
+        if pend is None or not idx.isValid() or pend != (view, idx.row(), idx.column()):
+            return
+
+        def _clear():
+            try:
+                m = view.selectionModel()
+                if m is not None:
+                    m.clearSelection()
+                    m.clearCurrentIndex()
+            except RuntimeError:
+                pass   # 그 사이 창이 닫혀 위젯이 사라진 경우
+        QTimer.singleShot(0, _clear)
+
+
 class SeedCancelled(Exception):
     """진행률 창에서 취소를 눌렀을 때 세계 생성 루프를 중단시키기 위한 신호."""
     pass
@@ -117,6 +183,9 @@ class _SeedProgressWindow(QWidget):
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    # 표 칸 다시 누르면 선택 해제(_TableClickToggle 주석 참고). app에 붙여 두어 수명을 같이 한다.
+    app._table_click_toggle = _TableClickToggle()
+    app.installEventFilter(app._table_click_toggle.filter)
 
     # DB 초기화 (최초 1회 데이터 삽입)
     init_db()

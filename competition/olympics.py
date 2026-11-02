@@ -1433,6 +1433,7 @@ def ballon_award_bonus(c, year):
     """game_engine._get_award_recognition_bonus_map 훅 — 올림픽 개인상 가산점
     {player_id: 점수}. 컨퍼런스리그 개인상(클럽 대항전 MVP·베스트11) 점수의 절반이고, 실버볼·브론즈볼은
     골든볼의 0.5·0.2배(월드컵과 같은 비율). 득점·도움·골든글러브·올해의 수비수는 클럽 대항전과 같이 0."""
+    from database import history_sync_for_read as _hsr; _hsr()   # [2026-11-01 비동기 기록 경합 수정] 아래 hist 조회 전에 본 연결 커밋 + 기록 큐 완료 대기
     out = {}
     if not enabled():
         return out

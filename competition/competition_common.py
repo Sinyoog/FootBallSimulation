@@ -447,6 +447,22 @@ def assign_club_match_days(conn, year, week, pairs, comp, offsets=(2, 5, 3, 4, 1
 
     order = sorted(range(len(pairs)), key=lambda i: (len(_feasible(*pairs[i], busy)), i))
     days = [None] * len(pairs)
+    # [2026-10 신민용 확정] 군팀끼리의 경기(국군컵)는 무조건 수요일 — 군 리그가 토요일(+국군컵 없는 주
+    # 수요일)에만 열리도록 짜여 있어 겹치지 않는다. 군인은 A매치 소집이 없어 금지 기간도 보지 않는다.
+    try:
+        from military_service import get_military_team_ids
+        from constants import MILITARY_MIDWEEK_DOW
+        _mil = get_military_team_ids(conn)
+    except Exception:
+        _mil = frozenset()
+    if _mil:
+        for i in list(order):
+            h, a = pairs[i]
+            if h in _mil and a in _mil:
+                days[i] = ws + MILITARY_MIDWEEK_DOW
+                for t in (h, a):
+                    busy.setdefault(t, set()).add(days[i])
+        order = [i for i in order if days[i] is None]
     for i in order:
         h, a = pairs[i]
         f = _feasible(h, a, busy)
@@ -957,6 +973,105 @@ def match_outcome(h_ovr, a_ovr, neutral=False, h_mgr=0.0, a_mgr=0.0):
     return "away"
 
 
+# ══════════════════════════════════════════════════════════════
+# [2026-10 신설, 신민용 리포트: "프리미어리그 강등권 팀이 챔스 우승을 했다 — 확률이 계속
+# 역배를 이겨서 그런 것 같다. 챔스든 유로파든 컨퍼런스든 현실은 명문팀만 우승했다"]
+# 대륙 클럽대항전 AI 경기(내 팀이 안 낀 경기)의 전력·승부 공식을 리그와 같은 잣대로 맞춘다.
+# 예전: 전력 = 대회 시작 때 고정한 "스쿼드 전체 평균 ±2 무작위", 승부 = 1점당 2.2%p의 완만한
+# 직선 공식, 명문 보정 없음 → 2002 유럽 챔스 실제 참가팀 3,000회 실측에서 우승의 34%가 선발
+# 전력 상위 8팀 밖에서 나왔다(리그는 같은 팀들 사이에 순위가 뚜렷이 갈리는데 — 선발 11명 차이는
+# 1위~8위가 2.8점뿐이라, 리그 순위를 가르는 건 공식 D의 기울기와 명문 보너스다).
+# 단계별 실측(신민용 확정 순서: ① 베스트 11 → ② 공식 D → ③ 명문):
+#   ① 베스트 11만 교체(±2 유지/제거): 상위 8팀 우승 66.7%/67.6% — 거의 그대로
+#   ② + 리그 공식 D: 75.1%, 17위 아래 우승 3.5% → 0.7%
+#   ③ + 명문 절반(리그 1부 경기와 같은 반영): 84.0%, 0.4%
+# 신민용 확정(1번): 챔스 = ③(명문 절반), 유로파·컨퍼런스 = ②(명문 없음 — 넣으면 유로파로
+# 떨어진 빅클럽이 56~67%를 독식). 전력 = 실제 AI 선발 11명(포메이션 최적 배치, 포지션 적합도
+# 반영 — game_engine._team_avg_ovr의 선발 부분과 같은 값, 클럽 강도 제외). 내 팀이 낀 경기
+# (G1/G2 체인 엔진)는 그대로다. 대진 시드(entry ovr)도 그대로.
+# 값 = 명문 보너스(PRESTIGE_LEVEL_MATCH_BONUS) 반영 비율. 이 표에 없는 대회(대륙 슈퍼컵 등)와
+# CONT_AI_LEAGUE_FORMULA=False면 예전 공식 그대로.
+CONT_AI_LEAGUE_FORMULA = True
+CONT_AI_PRESTIGE_WEIGHT = {"cl_matches": 0.5, "el_matches": 0.0, "ecl_matches": 0.0}
+
+# [2026-10-30 신설, 신민용 확정 — 대항전 득점환경(리그 나라별 득점왕 기준과 같은 원리)] 클럽 대항전
+# 득점왕 기준: 6~8골 일반적 / 9~11골 현실적 / 12~14골 매우 뛰어남 / 15~17골 역사적 / 18골+ 극히 이례적.
+# 실측(10시즌 2시드): 대항전 AI 경기는 국가별 득점환경 배율 없이 스코어를 만들어 경기당 3.0~3.5골, 대회별
+# 득점왕 중앙 11~16골(컨퍼런스급 15~16골, 15골+ 50~72%). 리그가 나라별 득점왕 기준 골 수로 배율을 정해
+# 두듯(constants.get_country_goal_mult), 대회(대륙 × 챔스/유로파/컨퍼런스)마다 득점왕 중앙값 10골이 되는
+# 배율을 고정한다 — 기존 경기의 승무패를 그대로 두고 스코어만 다시 뽑아(10회) 산출: 모든 대회에서 득점왕
+# 중앙 10골, 15골+ 4% 이하, 18골+ 1% 이하, 경기당 2.1~2.8골. AI끼리 경기의 스코어(_gen_score goal_mult)에만
+# 곱한다 — 승패 판정·전력·승부차기·내 팀 경기(체인 엔진)·대륙 슈퍼컵·클럽 월드컵·국내컵·국가대표·리그는 그대로.
+# 표에 없는 (대륙, 대회)는 1.0.
+# 검증(10시즌 2시드 OFF/ON): 대회별 득점왕 중앙 13→10, 15골+ 33%→1% 안팎, 18골+ 8~11%→0%, 리그 1부 경기당 골
+# ±0.1%, 국내컵·하부 리그컵·국내 슈퍼컵·국가대표 ±1% 이내, Traceback 0, 시간 −1~−5% → 채택·확정(스위치 없음).
+# 95+ 인원 시즌별 차이가 최대 21(기준 ±20)이었으나 같은 코드끼리(실행 편차로 흐름이 갈라진 대조군)도 최대 21
+# 이라 변경 효과로 단정하지 않음(효과가 없다고 증명한 것도 아님). 대항전 경기당 골은 컨퍼런스급 등에서 리그
+# 1부 평균보다 약간 낮다(2.1~2.3, 참가팀 소속 리그 수준) — 참고 지표.
+CONT_COMP_GOAL_MULT = {
+    ("유럽", "cl_matches"): 0.95, ("유럽", "el_matches"): 0.90, ("유럽", "ecl_matches"): 0.65,
+    ("남미", "cl_matches"): 0.80, ("남미", "el_matches"): 0.80,
+    ("북미", "cl_matches"): 0.75, ("북미", "el_matches"): 0.70, ("북미", "ecl_matches"): 0.65,
+    ("아시아", "cl_matches"): 0.90, ("아시아", "el_matches"): 0.80, ("아시아", "ecl_matches"): 0.65,
+    ("아프리카", "cl_matches"): 0.85, ("아프리카", "el_matches"): 0.80, ("아프리카", "ecl_matches"): 0.70,
+}
+
+
+_CONT_COMP_GOAL_TABLES = frozenset(k[1] for k in CONT_COMP_GOAL_MULT)
+
+
+def cont_comp_goal_mult(t, match_table):
+    """대항전 AI 경기 스코어 배율 — 위 CONT_COMP_GOAL_MULT 주석 참고. 대상 대회(챔스·유로파·컨퍼런스)가
+    아니면 대회 행(t)을 읽지 않고 1.0."""
+    if match_table not in _CONT_COMP_GOAL_TABLES:
+        return 1.0
+    return CONT_COMP_GOAL_MULT.get((t["continent"], match_table), 1.0)
+
+
+def cont_ai_strength(team_id, prestige_w=0.0, conn=None):
+    """대륙 대항전 AI 경기 전력 = 실제 선발 11명 유효 OVR(+ 명문 보너스 × prestige_w).
+    game_engine._team_avg_ovr(세션 캐시, 선발 11명 + 클럽 강도 × 가중치 + 명문 보너스)에서
+    클럽 강도와 명문 몫을 걷어내고 필요한 만큼만 다시 더한다 — 선발 계산을 두 번 하지 않는다."""
+    from game_engine import _team_avg_ovr
+    from constants import CLUB_STRENGTH_MATCH_WEIGHT, PRESTIGE_LEVEL_MATCH_BONUS
+    from data.prestige_clubs import prestige_level
+    _own = conn is None
+    if _own:
+        conn = get_conn()
+    try:
+        cur = conn.cursor()
+        val = _team_avg_ovr(cur, team_id)
+        r = conn.execute("""SELECT t.club_strength AS cs, t.name AS tname, cn.name AS cname
+                            FROM teams t JOIN countries cn ON t.country_id = cn.id
+                            WHERE t.id=?""", (team_id,)).fetchone()
+    finally:
+        if _own:
+            conn.close()
+    if r is None:
+        return val
+    if r["cs"]:
+        val -= r["cs"] * CLUB_STRENGTH_MATCH_WEIGHT
+    lvl = prestige_level(r["cname"], r["tname"])
+    if lvl:
+        val -= (1.0 - prestige_w) * PRESTIGE_LEVEL_MATCH_BONUS.get(lvl, 0.0)
+    return val
+
+
+def cont_ai_outcome(h_str, a_str, neutral=False, h_mgr=0.0, a_mgr=0.0):
+    """리그 공식 D(game_engine._league_win_probs) — 곡선(_league_effective_ovr)은 전력에, 홈 이점
+    (리그와 같은 1.5~4.5, 결승 등 중립 경기는 0)과 감독 보정은 곡선 밖에서 더한다."""
+    from game_engine import _league_effective_ovr, _league_win_probs, _home_advantage
+    diff = (_league_effective_ovr(h_str) - _league_effective_ovr(a_str)
+            + (0.0 if neutral else _home_advantage()) + (h_mgr - a_mgr))
+    hw, dw, _aw = _league_win_probs(diff)
+    roll = random.random()
+    if roll < hw:
+        return "home"
+    if roll < hw + dw:
+        return "draw"
+    return "away"
+
+
 def resolve_pso(h_ovr, a_ovr, neutral=False):
     """champions_engine._resolve_pso와 완전히 동일.
     [2026-08 신설, 신민용 요청: "PSO에서 OVR 차이가 승부차기 결과에 지나치게
@@ -1167,6 +1282,14 @@ def sim_ai_match(cfg, t, m, my_played=False, conn=None, reason="injury", batch=N
                 kind={"유로파리그": "europa", "컨퍼런스리그": "conference", "슈퍼컵": "supercup"}.get(
                     cfg.award_prefix, "cl"),
                 week=m.get("week"), day=m.get("day"), targets=_g2_t)
+        if _cm.covered(cfg.entry_table, cfg.match_table, t["id"]):
+            # [2026-10 A안] 내가 참가하는 대회의 AI 경기 — 엔진으로 돌려 실측 기록(controlled_matches.sim_cover_match)
+            from game_engine import _home_advantage as _ha_cov
+            _g2 = _cm.sim_cover_match(
+                m["home_team_id"], m["away_team_id"],
+                home_adv=(0.0 if _g2_neutral else _ha_cov()), extra_time=is_ko,
+                comp={"sc_tournaments": "sc", "domestic_sc_tournaments": "dsc"}.get(cfg.tournament_table, "cl"),
+                tkey=f"{cfg.tournament_table}:{t['id']}", targets=_g2_t, prior=_g2)
         if _g2 is not None:
             forced = (_g2["hs"], _g2["as"])
     if forced is not None:
@@ -1179,12 +1302,22 @@ def sim_ai_match(cfg, t, m, my_played=False, conn=None, reason="injury", batch=N
             if _g2 is not None:
                 _cm.note_pso(_g2, win_home, pso_score)
     else:
-        outcome = match_outcome(he["ovr"], ae["ovr"], neutral=(m["stage"] in cfg.neutral_stages),
-                                h_mgr=_hm, a_mgr=_am)
+        _neutral = m["stage"] in cfg.neutral_stages
+        _pw = CONT_AI_PRESTIGE_WEIGHT.get(cfg.match_table) if CONT_AI_LEAGUE_FORMULA else None
+        if _pw is not None:
+            # [2026-10] 챔스·유로파·컨퍼런스 AI 경기 — 위 CONT_AI_PRESTIGE_WEIGHT 주석.
+            h_str = cont_ai_strength(m["home_team_id"], _pw, conn)
+            a_str = cont_ai_strength(m["away_team_id"], _pw, conn)
+            outcome = cont_ai_outcome(h_str, a_str, neutral=_neutral, h_mgr=_hm, a_mgr=_am)
+        else:
+            h_str, a_str = he["ovr"], ae["ovr"]
+            outcome = match_outcome(h_str, a_str, neutral=_neutral, h_mgr=_hm, a_mgr=_am)
         if outcome == "draw" and is_ko:
-            win_home, pso_score = resolve_pso(he["ovr"], ae["ovr"], neutral=(m["stage"] in cfg.neutral_stages))
+            win_home, pso_score = resolve_pso(h_str, a_str, neutral=_neutral)
             pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
-        hs, as_ = _gen_score(outcome, he["ovr"] - ae["ovr"])
+        _gm = cont_comp_goal_mult(t, cfg.match_table)   # [2026-10-30] 대항전 득점환경(정의부 주석)
+        hs, as_ = (_gen_score(outcome, h_str - a_str, goal_mult=_gm) if _gm != 1.0
+                   else _gen_score(outcome, h_str - a_str))
 
     # [2026-10 버그수정] 경기마다 날짜가 미리 정해진 대회(슈퍼컵 sc_matches.day)는 그 날을 그대로 둔다 —
     # 예전엔 내 경기를 "그 주 대회 요일"(_week_intl_cl_day)로 덮어써서, 준결승이 끝나면 준결승 날짜가
@@ -1817,6 +1950,14 @@ def sim_my_match_as_ai(cfg, week, p, get_my_match_fn, reason="injury", day=None)
     sim_ai_match(cfg, t, m, my_played=False, reason=reason, forced=_forced)
     from game_engine import update_player, _calc_manager_rel
     update_player(manager_relation=_calc_manager_rel(p, 0, "", played=False, not_played_penalty=2))
+    # [2026-10 신민용 요청] 내가 결장한 이 경기도 경기 상세를 볼 수 있게 — 체인 엔진 기록(나 없음)을 관전 기록으로 저장.
+    import controlled_matches as _cm_abs
+    _kind = {"유로파리그": "europa", "컨퍼런스리그": "conference", "슈퍼컵": "supercup"}.get(cfg.award_prefix, "cup")
+    _cm_abs.save_absent_match(_cs, m["home_team_id"], m["away_team_id"], info.get("is_home"),
+                              t.get("name") or cfg.award_prefix, _kind, week=week, day=m.get("day") or day,
+                              reason=reason,
+                              real_ctx={"comp": {"sc_tournaments": "sc", "domestic_sc_tournaments": "dsc"}.get(cfg.tournament_table, "cl"),
+                                        "tkey": f"{cfg.tournament_table}:{m['tournament_id']}"})
 
 
 def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
@@ -1849,10 +1990,18 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
     is_home = info["is_home"]
 
     _susp_field = cfg.suspension_field
+    if _susp_field == "cl_suspension":
+        # [2026-10 대회별 카드 규칙] 유로파·컨퍼런스도 UEFA 클럽 대회 공통 규정(63조와 같은 구조).
+        try:
+            import card_rules as _cr
+            _cr.prepare_club_europe_match(p, f"{cfg.tournament_table}:{t['id']}", m.get("stage"))
+        except Exception as _cre:
+            print("card_rules 클럽 대항전 경기 준비 오류(예전 규칙으로):", _cre)
     _suspended, _new_susp = _check_suspended(p, field=_susp_field)
     if _suspended:
         update_player(**{_susp_field: _new_susp})
-        add_log(f"🟥 출전정지로 결장{'  (다음 경기부터 복귀)' if _new_susp == 0 else f'  (남은 정지 {_new_susp}경기)'}",
+        from game_engine import suspension_log_text as _susp_log_text
+        add_log(_susp_log_text(_susp_field, _new_susp),
                 "event")
 
     _my_ovr = p.get("ovr", 40)
@@ -1863,7 +2012,7 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
     # 기준은 이 대회에서 실제로 뛰는 "이 팀"(_team_ovr) — 이미 위에서
     # 홈/원정에 맞게 뽑아둔 값을 그대로 넘긴다. 출전정지면 벤치 확률
     # 계산 자체가 무의미하므로 건너뛴다(우선순위: 징계 > 벤치).
-    _benched = (not _suspended) and _check_bench(p, team_avg_ovr=_team_ovr)
+    _benched = (not _suspended) and _check_bench(p, team_avg_ovr=_team_ovr, club_match=True)   # [2026-10 my_loan] 클럽 경기
     if _benched:
         add_log("🪑 교체 명단에서 시작", "event")
     _star = 1.0 + max(0.0, (_my_ovr - 60) / 40.0) ** 1.8 * 3.0
@@ -2059,7 +2208,10 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
     rs = {"win": "승", "draw": "무", "loss": "패"}.get(my_result, "")
     pso_txt = ""
     if pso_winner:
-        pso_txt = f"  (승부차기 {pso_score} {'승' if pso_winner == my_tid else '패'})"
+        # [2026-10 신민용 요청] "(무)  (승부차기 5-3 패)" 대신 "승부차기 (5-3) 패배"로 —
+        # 결과 칸 자체를 바꾼다(로그 '경기' 필터가 줄 끝 결과 표기로 결과 줄을 찾는다).
+        from game_engine import pso_result_text
+        pso_txt = pso_result_text(pso_score, pso_winner == my_tid)
         rs = "무"
 
     comp_name = f"{t['name']} {stage_ko}".strip()
@@ -2072,7 +2224,9 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
         events, not (_suspended or _benched), _benched, detail, pso=pso,
         engine_stats=engine_stats, engine_plog=engine_plog, player_ratings=player_ratings,
         match_extra={"score_90": ([hs90, as90] if hs90 is not None else [hs, as_]),
-                     "went_extra_time": went_et, "subs": _subs})
+                     "went_extra_time": went_et, "subs": _subs},
+        # [2026-10 신설] 이 경기 AI 선수 실측 기록(real_stats)
+        real_ctx={"comp": {"sc_tournaments": "sc", "domestic_sc_tournaments": "dsc"}.get(cfg.tournament_table, "cl"), "tkey": f"{cfg.tournament_table}:{m['tournament_id']}", "home": m["home_team_id"], "away": m["away_team_id"]})
     # [2026-08 신설] 이 함수는 유로파/컨퍼런스/슈퍼컵 3개 대회가 공유하므로
     # (europa_engine.py/conference_engine.py/super_cup_engine.py) 헤더
     # 마커의 kind는 고정 리터럴이 아니라 cfg.award_prefix로 구분한다 —
@@ -2087,7 +2241,7 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
 
     add_log("─" * 44, "sep")
     add_log(f"🏆 {comp_name}  {week}주차{marker}", "match")
-    add_log(f"   {home_disp} {hs}-{as_} {away_disp}  ({rs}){pso_txt}", "match")
+    add_log(f"   {home_disp} {hs}-{as_} {away_disp}  {pso_txt or f'({rs})'}", "match")
     if p.get("position") == "GK":
         add_log(f"   평점 {rating:.1f}  선방 {saves}", "match")
     else:

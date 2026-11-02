@@ -125,6 +125,14 @@ def _is_nations_finals_t(t):
             and is_nations_finals_year(t.get("year")))
 
 
+def _is_euro_qual_year(year):
+    """[2026-10] 그 해 유럽 cont_qual이 유로(EURO) 예선인가 — 지역컵(유로) 주기 해.
+    world_browser._is_euro_cycle_year와 같은 판정(그쪽은 표시용, 이쪽은 생성 시 이름)."""
+    from constants import REGIONAL_CUP_INTERVAL
+    _rs = _tournament_start_years()["regional"]
+    return year is not None and year >= _rs and (year - _rs) % REGIONAL_CUP_INTERVAL == 0
+
+
 def _wc_qual_cfg(t, continent):
     """[2026-10 올림픽] 월드컵 예선 엔진을 쓰는 예선의 대륙 설정. 월드컵 예선은 그 해 체제
     (32/48/64), U-23 올림픽 예선(kind='oly_qual')은 연도와 무관하게 항상 32팀 체제."""
@@ -613,6 +621,76 @@ def get_my_tournament(year=None, qual=None, kinds=None):
     return None
 
 
+def get_my_tournaments(year=None, qual=None, kinds=None):
+    """[2026-10 신설, 신민용 리포트: "경기 일정에서 국제대회는 그 해에 있는 국제대회가 다 떠야
+    하는데, 네이션스가 있을 땐 다른 지역 예선 봤던 게 안 뜨고 네이션스만 떴다가, 예선 봤던 대회
+    본선이 오면 네이션스 기록이 사라진다"] get_my_tournament의 목록판. 예전 경기 일정은 예선 칸·
+    본선 칸마다 대회를 "하나만" 골라서(진행 중인 대회 우선), 한 해에 예선이 둘(월드컵 지역 예선 +
+    네이션스 예선)이거나 본선이 둘(네이션스 본선 + 연말 대륙컵)이면 나중 대회가 앞 대회를
+    밀어냈다. 이 함수는 get_my_tournament가 그 해 어느 시점에든 고를 수 있는 대회를 전부
+    돌려준다 — 출전 확정(1)·발탁 대기(3) 대회 전부 + 표시용(2, 미선발·탈락) 대회 중 내 국적
+    연맹/대륙 대회(_display_continent_filter와 같은 기준). 미선발(0)은 예전처럼 뺀다.
+    필터(qual/kinds) 뜻은 get_my_tournament와 같고, 순서는 생성 순(id)."""
+    if _mil_close_callups():
+        return []
+    from game_engine import get_state, get_player
+    if year is None:
+        st = get_state()
+        if not st:
+            return []
+        year = st["current_year"]
+    ts = get_tournaments(year)
+    if kinds is not None:
+        ts = [t for t in ts if t.get("kind") in kinds]
+    elif qual is True:
+        ts = [t for t in ts if t.get("kind") in ("wc_qual", "cont_qual")]
+    elif qual is False:
+        ts = [t for t in ts if t.get("kind") in ("world", "continent", "region")]
+    if not ts:
+        return []
+    # [2026-10 버그수정, 신민용 리포트: "내가 참여하지 않는 국제대회는 일정표에 안 떠야 하는데
+    # 뜬다"] 예전엔 표시용으로 미참가(2) 대회 중 내 대륙 대회를 같이 돌려줬다 — 그래서 소속팀도
+    # 없는 16세(엘살바도르)에게 "남북미 대륙컵 예선(예선 미참가)"·"U-23 올림픽 북미 예선"이
+    # 일정표에 떴다. 이제 내가 실제로 참여한 대회만 돌려준다(i_took_part).
+    return [t for t in ts if i_took_part(t)]
+
+
+def i_took_part(t):
+    """[2026-10 신설] 일정표에 보여줄 "내가 참여한 대회"인가.
+    출전 확정(1)·발탁 대기(3)는 참여. 닫힌 대회(2)는 실제로 뛰었거나(내 출전 경기 1경기 이상)
+    대회 도중 부상으로 소집 해제된 경우만 참여 — 미선발·국적 미선택·예선 미참가·대회 전 부상
+    제외·입대로 닫힌 발탁은 참여가 아니다. 미선발(0)도 참여가 아니다."""
+    sel = t.get("my_selected")
+    if sel in (1, 3):
+        return True
+    if sel != 2:
+        return False
+    if (t.get("my_result") or "") == INTL_INJURY_RELEASE_RESULT:
+        return True
+    conn = get_conn()
+    try:
+        return bool(conn.execute(
+            "SELECT 1 FROM intl_matches WHERE tournament_id=? AND my_played=1 LIMIT 1",
+            (t["id"],)).fetchone())
+    finally:
+        conn.close()
+
+
+def get_my_schedule_tournament(year=None, qual=None, kinds=None):
+    """[2026-10 신설] 일정표용 get_my_tournament — 같은 우선순위(진행 중인 출전 확정 → 출전 확정 →
+    발탁 대기 → 참여했던 닫힌 대회)로 고르되, 내가 참여한 대회(i_took_part) 중에서만 고른다.
+    get_my_tournament의 "표시용" 폴백(미참가 대회)은 일정표에선 쓰지 않는다."""
+    ts = get_my_tournaments(year, qual=qual, kinds=kinds)
+    for cond in (lambda t: t.get("my_selected") == 1 and t.get("status") != "done",
+                 lambda t: t.get("my_selected") == 1,
+                 lambda t: t.get("my_selected") == 3,
+                 lambda t: True):
+        for t in ts:
+            if cond(t):
+                return t
+    return None
+
+
 def _display_continent_filter(p):
     """[2026-10] get_my_tournament 표시용 폴백 전용 — 대회 t를 보여줘도 되는지 판정하는 함수를
     돌려준다. 대륙이 없는 대회(월드컵 본선·랭킹 평가전 등, continent='')는 항상 통과. 대륙이 있는
@@ -780,28 +858,7 @@ def choose_national_team(tournament_id, nat):
     p = get_player()
 
     # ① 컷오프 체크: 선택한 나라가 예선 풀 자체에 없으면 예선 진출 실패
-    _cut_check = False
-    try:
-        from constants import WC_QUAL_BY_TIER, wc_tier, CONFEDERATIONS
-        _qc2 = get_conn()
-        _trow2 = _qc2.execute("SELECT year, kind, continent FROM intl_tournaments WHERE id=?",
-                               (tournament_id,)).fetchone()
-        _qc2.close()
-        if _trow2 and _trow2["kind"] in ("wc_qual", "cont_qual"):
-            _tyear2 = _trow2["year"]
-            _tconf2 = (_trow2["continent"] or "").strip()
-            if _trow2["kind"] == "cont_qual":
-                from constants import EURO_QUAL
-                _qcfg2 = EURO_QUAL.get(_tconf2, {})
-            else:
-                _qcfg2 = WC_QUAL_BY_TIER[wc_tier(_tyear2 + 1)].get(_tconf2, {})
-            _all_rows2 = sorted(_enrich_countries(_conf_countries(_tconf2), year=_tyear2),
-                                key=lambda r: r["ovr"], reverse=True)
-            _cutoff2 = _qcfg2.get("cutoff_bottom", 0)
-            _cut_names2 = {r["name"] for r in _all_rows2[len(_all_rows2)-_cutoff2:]}
-            _cut_check = nat in _cut_names2
-    except Exception:
-        pass
+    _cut_check, _trow2 = _qual_cutoff_hit(tournament_id, nat)
 
     if _cut_check:
         # 컷오프 → 예선 진출 실패
@@ -943,6 +1000,76 @@ def choose_national_team(tournament_id, nat):
     return {"nat": nat, "selected": True, "qualified": True, "result": "선발", "kind": tkind}
 
 
+def _qual_cutoff_hit(tournament_id, nat):
+    """(컷오프 여부, 대회 행). 예선(wc_qual/cont_qual)에서 nat이 랭킹 하위 컷오프로 예선 풀에 못 든
+    경우 True — choose_national_team ①단계와 발탁 거절 기록 판정(_callup_outcome)이 함께 쓴다."""
+    _trow2 = None
+    try:
+        from constants import WC_QUAL_BY_TIER, wc_tier
+        _qc2 = get_conn()
+        _trow2 = _qc2.execute("SELECT year, kind, continent FROM intl_tournaments WHERE id=?",
+                               (tournament_id,)).fetchone()
+        _qc2.close()
+        if _trow2 and _trow2["kind"] in ("wc_qual", "cont_qual"):
+            _tyear2 = _trow2["year"]
+            _tconf2 = (_trow2["continent"] or "").strip()
+            if _trow2["kind"] == "cont_qual":
+                from constants import EURO_QUAL
+                _qcfg2 = EURO_QUAL.get(_tconf2, {})
+            else:
+                _qcfg2 = WC_QUAL_BY_TIER[wc_tier(_tyear2 + 1)].get(_tconf2, {})
+            _all_rows2 = sorted(_enrich_countries(_conf_countries(_tconf2), year=_tyear2),
+                                key=lambda r: r["ovr"], reverse=True)
+            _cutoff2 = _qcfg2.get("cutoff_bottom", 0)
+            _cut_names2 = {r["name"] for r in _all_rows2[len(_all_rows2)-_cutoff2:]}
+            return nat in _cut_names2, _trow2
+    except Exception:
+        pass
+    return False, _trow2
+
+
+def _callup_outcome(p, tournament_id, nat, kind=""):
+    """[2026-10 버그수정, 신민용 리포트: "2000년 시작하면 '발탁 거절'이 뜨는데 실제로는 안 뽑힌 것"]
+    미고정 선수의 발탁창은 국적 선택을 먼저 받으려고 실력과 무관하게 뜬다(선택 → 컷오프 → 선발 순으로
+    공개 — choose_national_team). 그래서 거절하면 "안 뽑혔을" 나라까지 전부 '발탁 거절'로 남았다.
+    거절 시점에 choose_national_team과 같은 판정을 미리 해 본다: "cut"(예선 진출 실패) / "no"(미선발) /
+    "yes"(선발됐을 것). U-23 올림픽(oly_*)은 olympics.choose_national_team과 같은 판정(예선 풀에 없음 →
+    "cut", 18인 선발 select_squad에 내가 들면 "yes").
+    판정 중 쓰이는 난수(선발 경계 접전 등)가 게임 난수 흐름을 바꾸지 않도록 random 상태를 저장했다가
+    통째로 되돌린다 — 거절 처리 전후로 난수 흐름은 예전과 같다."""
+    _rs = random.getstate()
+    try:
+        return _callup_outcome_inner(p, tournament_id, nat, kind)
+    except Exception:
+        return "yes"       # 판정이 실패하면 예전 동작(거절 기록)으로
+    finally:
+        random.setstate(_rs)
+
+
+def _callup_outcome_inner(p, tournament_id, nat, kind):
+    if kind in ("oly_qual", "olympic"):
+        _c = get_conn()
+        _in = _c.execute("SELECT 1 FROM intl_entries WHERE tournament_id=? AND country=? LIMIT 1",
+                         (tournament_id, nat)).fetchone()
+        _yr = _c.execute("SELECT year FROM intl_tournaments WHERE id=?", (tournament_id,)).fetchone()
+        _c.close()
+        if not _in:
+            return "cut"
+        from competition.olympics import select_squad as _oly_sel
+        _plan = _oly_sel(nat, _yr["year"] if _yr else None, kind, p=p, include_me=True,
+                         allow_flip=True)
+        return "yes" if _plan.get("me_in") else "no"
+    if _qual_cutoff_hit(tournament_id, nat)[0]:
+        return "cut"
+    _c = get_conn()
+    grow = _c.execute("SELECT grade, continent FROM countries WHERE name=?", (nat,)).fetchone()
+    _c.close()
+    sel = _check_selection(p, grow["grade"] if grow else "F", country=nat,
+                           continent=grow["continent"] if grow else "",
+                           tournament_id=tournament_id)
+    return "yes" if sel else "no"
+
+
 def decline_national_team(tournament_id):
     """[복수국적·복수대륙컵] 이번 대표팀 발탁을 거절(보류). 영구 고정하지 않는다.
 
@@ -955,23 +1082,45 @@ def decline_national_team(tournament_id):
       - league_name: '발탁 거절'
       - competition: 대회명(들)
     과거 거절은 나중에 같은 나라 대표로 뛰어도 그대로 남는다(역사 보존)."""
+    from game_engine import get_player as _gp_dec
+    _p_dec = _gp_dec() or {}
     conn = get_conn()
     trow = conn.execute(
         "SELECT year FROM intl_tournaments WHERE id=?", (tournament_id,)).fetchone()
     year = trow["year"] if trow else None
     # 그 해 선택 대기 대회 전부 수집 (후보 국가/대회명 통합 기록용)
+    # [2026-10 버그수정] 대회마다 "실제로 뽑혔을 나라"가 하나라도 있을 때만 '발탁 거절'로 묶고,
+    # 하나도 없으면 그 대회는 미선발(전부 컷오프면 예선 진출 실패)로 따로 기록한다(_callup_outcome).
     cand_all = []
     comp_all = []
+    missed = []      # (대회 id, 대회명, 후보 국가들, 결과)
     if year is not None:
         rows = conn.execute(
-            "SELECT name, cand_nats FROM intl_tournaments WHERE year=? AND my_selected=3",
+            "SELECT id, name, kind, cand_nats FROM intl_tournaments WHERE year=? AND my_selected=3",
             (year,)).fetchall()
+        conn.close()
         for r in rows:
-            if r["name"] and r["name"] not in comp_all:
-                comp_all.append(r["name"])
-            for n in (r["cand_nats"] or "").split(","):
-                if n and n not in cand_all:
-                    cand_all.append(n)
+            _cands = [n for n in (r["cand_nats"] or "").split(",") if n]
+            _outs = {n: _callup_outcome(_p_dec, r["id"], n, r["kind"]) for n in _cands}
+            _yes = [n for n in _cands if _outs[n] == "yes"]
+            if _yes or not _cands:
+                if r["name"] and r["name"] not in comp_all:
+                    comp_all.append(r["name"])
+                for n in _yes:
+                    if n not in cand_all:
+                        cand_all.append(n)
+            else:
+                # 올림픽 미선발은 choose 경로처럼 결과 줄을 남기지 않는다(None)
+                _all_cut = all(_outs[n] == "cut" for n in _cands)
+                _res = ("예선 진출 실패" if _all_cut else
+                        (None if r["kind"] in ("oly_qual", "olympic") else "국가대표 미선발"))
+                missed.append((r["id"], r["name"] or "대표팀", _cands, _res))
+        conn = get_conn()
+        _miss_ids = [m[0] for m in missed]
+        if _miss_ids:
+            _ph = ",".join("?" * len(_miss_ids))
+            conn.execute(f"UPDATE intl_tournaments SET my_nat='', my_selected=0 WHERE id IN ({_ph})",
+                         _miss_ids)
         conn.execute(
             "UPDATE intl_tournaments SET my_nat='', my_selected=2 "
             "WHERE year=? AND my_selected=3", (year,))
@@ -990,9 +1139,13 @@ def decline_national_team(tournament_id):
         pass
 
     if year is not None:
-        nat_str = "/".join(cand_all) if cand_all else "대표팀"
-        comp_str = " / ".join(comp_all) if comp_all else "대륙컵"
-        _save_decline(year, nat_str, comp_str)
+        for _tid_m, _name_m, _cands_m, _res_m in missed:
+            if _res_m:
+                _save_trophy(year, "/".join(_cands_m), _name_m, _res_m)
+        if comp_all:
+            nat_str = "/".join(cand_all) if cand_all else "대표팀"
+            comp_str = " / ".join(comp_all)
+            _save_decline(year, nat_str, comp_str)
     return True
 
 
@@ -1016,11 +1169,17 @@ def decline_national_team_option(tournament_id, nat):
     이 함수는 "거절" 쪽 대칭만 채워 넣으면 된다."""
     conn = get_conn()
     row = conn.execute(
-        "SELECT year, name, cand_nats FROM intl_tournaments WHERE id=?",
+        "SELECT year, name, kind, cand_nats FROM intl_tournaments WHERE id=?",
         (tournament_id,)).fetchone()
     if not row:
         conn.close()
         return False
+    conn.close()
+    # [2026-10 버그수정] 이 나라가 실제로 나를 뽑았을지 먼저 판정(_callup_outcome) — 안 뽑았을
+    # 나라를 빼는 건 '거절'이 아니다.
+    from game_engine import get_player as _gp_opt
+    _out = _callup_outcome(_gp_opt() or {}, tournament_id, nat, row["kind"])
+    conn = get_conn()
     cand = [n for n in (row["cand_nats"] or "").split(",") if n and n != nat]
     if cand:
         # 남은 후보가 있으면 그 나라들만으로 계속 선택 대기 상태 유지
@@ -1028,16 +1187,24 @@ def decline_national_team_option(tournament_id, nat):
                      (",".join(cand), tournament_id))
     else:
         # 이 대회의 후보가 그 나라 하나뿐이었음 → 대회 자체를 닫는다
-        conn.execute("UPDATE intl_tournaments SET my_nat='', my_selected=2, "
-                     "cand_nats=? WHERE id=?", ("", tournament_id))
+        # (안 뽑혔을 나라면 미선발과 같은 상태 my_selected=0)
+        conn.execute("UPDATE intl_tournaments SET my_nat='', my_selected=?, "
+                     "cand_nats=? WHERE id=?", (2 if _out == "yes" else 0, "", tournament_id))
     conn.commit()
     year = row["year"]
     conn.close()
 
     # 거절 기록은 그 나라 하나만 남긴다(decline_national_team의 '전부 통합'
     # 기록과 구분 — 나중에 커리어에서 "잉글랜드 발탁 거절"처럼 개별로 보임).
+    # [2026-10 버그수정] 안 뽑혔을 나라는 '발탁 거절'을 남기지 않는다. 대회가 이걸로 닫히면 그
+    # 대회 결과로 미선발(전부 컷오프면 예선 진출 실패)을 남기고, 다른 후보가 남아 대회가 열려 있으면
+    # 아무것도 남기지 않는다(그 대회의 최종 결과 줄을 _save_trophy가 따로 쓰므로).
     if year is not None:
-        _save_decline(year, nat, row["name"] or "대표팀")
+        if _out == "yes":
+            _save_decline(year, nat, row["name"] or "대표팀")
+        elif not cand and (_out == "cut" or row["kind"] not in ("oly_qual", "olympic")):
+            _save_trophy(year, nat, row["name"] or "대표팀",
+                         "예선 진출 실패" if _out == "cut" else "국가대표 미선발")
     return True
 
 
@@ -1392,9 +1559,16 @@ def start_qualifying_if_needed(year):
         # 사이클에서 미처 소진되지 않고 남아있던 결장/누적이 다음 예선까지
         # 이어지는 걸 막는다(월드컵 본선/기타 국제대회 그룹인 intl_suspension/
         # season_yellow_intl은 여기서 건드리지 않음 — 별도 그룹이라 그대로 유지).
+        # [2026-10 대회별 카드 규칙] 그냥 0으로 지우던 것을 "끝난 대회 정리"로 — 경고·경고누적 정지는 소멸,
+        # 퇴장 정지는 다음 공식 경기로 이월(FIFA 징계규정 69조). 표시용 시즌 누적만 따로 0.
         from game_engine import update_player as _reset_wcq
-        _reset_wcq(wc_qual_suspension=0, season_yellow_wc_qual=0,
-                   yellow_susp_progress_wc_qual=0)
+        try:
+            import card_rules as _cr_q
+            _cr_q.finalize_family("wc_qual")
+            _reset_wcq(season_yellow_wc_qual=0)
+        except Exception:
+            _reset_wcq(wc_qual_suspension=0, season_yellow_wc_qual=0,
+                       yellow_susp_progress_wc_qual=0)
 
         _clear_entry_cache()
         my_nats, nat_info, committed = _gather_nat_context(p)
@@ -2515,6 +2689,62 @@ _INTL_SEL_SHORTLIST_PER_POS = 40
 # 그 표본 통계가 필요하다(_check_selection 참고).
 _INTL_POS_STAT_KEY = "__pos_stat__"
 
+# [2026-10 신설, 신민용 확정 — 13번 ①·② 가안] 소속팀이 바뀐 선수(이적·임대·전역)의 선발 지표.
+# 리포트: "군대에서 핵심이었으면 그 리그 핵심으로 본다 — 국대로 뽑힌 시즌엔 K리그 로테였는데 뽑혔다".
+# 원인: 시즌 중 선발은 출전률·생산성을 "기록이 남은 가장 최근 시즌"(= 지난 시즌)에서 가져오는데,
+#   ① 그 기록이 다른 팀(군팀 등)에서 나온 것이어도 출전률을 그 팀 기준(군팀 최다 출전 대비) 그대로 쓰고,
+#      생산성은 지금 소속팀 리그 배율로 해석했다 — 군팀 핵심의 출전·골이 "K리그 핵심"처럼 읽혔다.
+#   ② 역할만 이번 시즌 값(오프시즌 끝에 미리 정해 둔 hist.ai_player_position_history의 올해 행)이었다.
+# True면 "가장 최근 시즌 기록의 팀 ≠ 지금 소속팀"인 선수만:
+#   · 출전률 = 이번 시즌 역할의 기대 출전률(ai_lifecycle._ROLE_PLAY_RATIO 평균값). 올해 역할이 없으면 기록 없음(0).
+#   · 생산성·최근 폼 = 기록이 나온 그 팀의 리그(국가·부수) 배율로 해석한다(군팀이면 군 리그 기준).
+# 소속팀이 그대로인 선수는 예전과 완전히 같다. False면 예전과 100% 동일.
+INTL_SEL_TEAM_CHANGE_FIX = True
+_INTL_SEL_ROLE_PLAY_FALLBACK = {   # ai_lifecycle._ROLE_PLAY_RATIO 평균값(그쪽을 못 읽을 때만)
+    "핵심": 0.90, "주전": 0.80, "로테이션": 0.54, "대기": 0.28, "전력외": 0.09, "유망주": 0.14,
+}
+
+
+# [2026-10 신설, 신민용 확정 — 13번 ③] "K리그(B급 이하 리그)에서 국대에 뽑히려면 최소 주전은 해야 한다".
+# A대표 선발에서만(U-23 올림픽은 competition/olympics 별도 경로라 무관), B급 이하 리그 소속 선수의 이번
+# 시즌 역할이 로테이션 이하(로테이션·대기·전력외·유망주)면 선발점수에서 아래 값을 뺀다 — 자격을 빼앗는
+# 게 아니라 "같은 포지션에 이 점수 차 안의 주전급 후보가 있으면 주전급을 먼저" 뽑게 하는 우선순위다.
+# 후보가 모자라면(그 나라 그 포지션에 대신할 주전급이 없으면) 그대로 뽑힌다. A급 이상 리그 소속은 제외.
+# 리그 등급은 constants.get_country_league_grade(클럽 리그 등급, 국대 등급 아님). False면 예전과 100% 동일.
+INTL_SEL_LOW_LEAGUE_STARTER_PRIORITY = True
+INTL_SEL_LOW_LEAGUE_GRADES = ("B", "C", "D", "E", "F")
+INTL_SEL_LOW_LEAGUE_NONSTARTER_PENALTY = 5.0
+_INTL_SEL_NONSTARTER_ROLES = ("로테이션", "대기", "전력외", "유망주")
+_intl_low_league_grade_cache: dict = {}
+
+
+def _intl_low_league_nonstarter_penalty(cand, metrics):
+    """13번 ③ — 위 INTL_SEL_LOW_LEAGUE_STARTER_PRIORITY 주석 참고. 반환: 뺄 점수(0 이상)."""
+    if not INTL_SEL_LOW_LEAGUE_STARTER_PRIORITY:
+        return 0.0
+    if ((metrics or {}).get("role") or "") not in _INTL_SEL_NONSTARTER_ROLES:
+        return 0.0
+    cn = cand.get("club_country") or ""
+    g = _intl_low_league_grade_cache.get(cn)
+    if g is None:
+        from constants import get_country_league_grade
+        g = _intl_low_league_grade_cache[cn] = get_country_league_grade(cn) if cn else ""
+    return INTL_SEL_LOW_LEAGUE_NONSTARTER_PENALTY if g in INTL_SEL_LOW_LEAGUE_GRADES else 0.0
+
+
+def _intl_sel_role_play_frac(role):
+    """이번 시즌 역할 → 기대 출전률(없으면 None — 기록 없음과 같다)."""
+    if not role:
+        return None
+    try:
+        from ai_lifecycle import _ROLE_PLAY_RATIO
+        v = _ROLE_PLAY_RATIO.get(role)
+        if v is not None:
+            return v[0]
+    except Exception:
+        pass
+    return _INTL_SEL_ROLE_PLAY_FALLBACK.get(role)
+
 # ── 리그 수준을 어떻게 쓸 것인가 ─────────────────────────────────
 # [2026-09 재설계 2차, 신민용 확정] 두 가지를 분리한다.
 #
@@ -2662,8 +2892,8 @@ def _intl_candidate_metrics(candidates, year=None):
     if not year:
         return {}
     try:
-        from database import history_drain
-        history_drain()   # read-after-write: 43주차 스냅샷이 큐에 남아 있을 수 있다
+        from database import history_drain, history_sync_for_read
+        history_sync_for_read()  # [2026-11-01 비동기 기록 경합 수정] 커밋 + 대기(예전 history_drain)   # read-after-write: 43주차 스냅샷이 큐에 남아 있을 수 있다
     except Exception as _e:
         print(f"[INTL] history_drain 실패(낡은 스냅샷으로 계속 진행): {_e}")
 
@@ -2673,6 +2903,8 @@ def _intl_candidate_metrics(candidates, year=None):
     role_by_id: dict = {}       # pid -> role (가장 최근 연도)
     comp_by_id: dict = {}       # pid -> {"matches":, "ga":}  (대륙대항전, 최근 연도)
     team_year_max: dict = {}    # (team_id, year) -> 그 팀 최다 출전수
+    cur_team_by_id: dict = {}   # [2026-10 13번] pid -> 지금 소속팀
+    team_league: dict = {}      # [2026-10 13번] team_id -> (국가, 부수) — 기록이 나온 팀의 리그
     conn = get_conn()
     try:
         for i in range(0, len(ids), 500):
@@ -2720,6 +2952,22 @@ def _intl_candidate_metrics(candidates, year=None):
                         WHERE team_id IN ({ph}) AND year IN (?,?,?)
                         GROUP BY team_id, year""", (*chunk, *years)):
                 team_year_max[(r["team_id"], r["year"])] = r["mx"] or 0
+        # [2026-10 13번] 지금 소속팀과, 기록이 나온 팀들의 리그(국가·부수) — INTL_SEL_TEAM_CHANGE_FIX 주석 참고.
+        if INTL_SEL_TEAM_CHANGE_FIX:
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                ph = ",".join("?" * len(chunk))
+                for r in conn.execute(f"SELECT id, team_id FROM ai_players WHERE id IN ({ph})", chunk):
+                    cur_team_by_id[r["id"]] = r["team_id"]
+            for i in range(0, len(tids), 500):
+                chunk = tids[i:i + 500]
+                ph = ",".join("?" * len(chunk))
+                for r in conn.execute(
+                        f"""SELECT t.id, t.current_tier AS tier, cn.name AS cname
+                            FROM teams t JOIN leagues l ON t.league_id=l.id
+                            JOIN countries cn ON l.country_id=cn.id
+                            WHERE t.id IN ({ph})""", chunk):
+                    team_league[r["id"]] = (r["cname"], r["tier"] or 1)
     except Exception as _e:
         print(f"[INTL] 선발 지표 조회 실패(OVR 기준으로 진행): {_e}")
         stats_by_id = {}
@@ -2739,14 +2987,26 @@ def _intl_candidate_metrics(candidates, year=None):
         league_w = _intl_sel_league_weight(cand.get("club_country"), cand.get("club_tier"))
         mx = team_year_max.get((s.get("team_id"), latest_y)) or 0
         play_frac = (s["matches"] / mx) if mx > 0 else None
+        prev = per_year.get(latest_y - 1)
+        league_w_prev = league_w
+        # [2026-10 13번 ①·② 가안] 기록의 팀 ≠ 지금 소속팀(이적·임대·전역) — INTL_SEL_TEAM_CHANGE_FIX 주석 참고.
+        _cur_tid = cur_team_by_id.get(pid)
+        if (INTL_SEL_TEAM_CHANGE_FIX and _cur_tid and s.get("team_id")
+                and s["team_id"] != _cur_tid):
+            _ry, _role_now = role_by_id.get(pid) or (0, "")
+            play_frac = _intl_sel_role_play_frac(_role_now) if _ry == year else None
+            _lg = team_league.get(s["team_id"])
+            if _lg:
+                league_w = _intl_sel_league_weight(_lg[0], _lg[1])
+            _lgp = team_league.get(prev.get("team_id")) if prev else None
+            league_w_prev = _intl_sel_league_weight(_lgp[0], _lgp[1]) if _lgp else league_w
         prod = _intl_sel_prod_raw(cand["position"], s["matches"], s["goals"], s["assists"],
                                   s["clean_sheets"], s["saves"], s["goals_conceded"], league_w)
-        prev = per_year.get(latest_y - 1)
         prod_prev = None
         if prev:
             prod_prev = _intl_sel_prod_raw(cand["position"], prev["matches"], prev["goals"],
                                            prev["assists"], prev["clean_sheets"], prev["saves"],
-                                           prev["goals_conceded"], league_w)
+                                           prev["goals_conceded"], league_w_prev)
         base[pid] = {"play_frac": play_frac,
                      "role": (role_by_id.get(pid) or (0, ""))[1],
                      "_prod": prod, "_prod_prev": prod_prev}
@@ -3010,8 +3270,8 @@ def _intl_form_adjustments(candidates):
     if not cur_year:
         return {}
     try:
-        from database import history_drain
-        history_drain()   # 방금 큐에 들어간 43주차 스냅샷까지 읽기 위함(read-after-write)
+        from database import history_drain, history_sync_for_read
+        history_sync_for_read()  # [2026-11-01 비동기 기록 경합 수정] 커밋 + 대기(예전 history_drain)   # 방금 큐에 들어간 43주차 스냅샷까지 읽기 위함(read-after-write)
     except Exception as _e:
         # [2026-09 버그수정, 정적감사] 여기만 read-after-write drain 실패를
         # 통째로 삼키고 있었다(다른 호출부는 전부 전파하거나 최소한 출력함)
@@ -3179,8 +3439,9 @@ def _build_intl_squad_by_group(country, quota_by_group=None, candidates_out=None
         apps_by_id = get_player_total_intl_appearances([c["id"] for c in candidates])
         scored = []
         for c in candidates:
-            base_score = intl_selection_score_v3(
+            base_score = (intl_selection_score_v3(
                 c, _metrics.get(c["id"]), apps_by_id.get(c["id"], 0))
+                - _intl_low_league_nonstarter_penalty(c, _metrics.get(c["id"])))   # [2026-10 13번 ③]
             fit = _intl_group_fit(c["position"], grp)
             scored.append((base_score * fit, c))
             if _cand_best is not None:
@@ -3244,8 +3505,9 @@ def _build_intl_squad_by_group(country, quota_by_group=None, candidates_out=None
             # (포지션별 OVR 상위) 밖 선수는 지표가 없어 OVR 기준으로만
             # 채점된다(여기까지 내려온 건 그 나라 국적자가 26명도 안 되는
             # 소국이라, 어차피 있는 대로 다 뽑히는 경로다).
-            backfill_pool.sort(key=lambda c: -intl_selection_score_v3(
-                c, _metrics.get(c["id"]), apps_by_id.get(c["id"], 0)))
+            backfill_pool.sort(key=lambda c: -(intl_selection_score_v3(
+                c, _metrics.get(c["id"]), apps_by_id.get(c["id"], 0))
+                - _intl_low_league_nonstarter_penalty(c, _metrics.get(c["id"]))))   # [2026-10 13번 ③]
             for c in backfill_pool[:shortfall]:
                 picked.append(c)
                 used_ids.add(c["id"])
@@ -3610,13 +3872,16 @@ def _check_selection(p, my_grade, country="", continent="", tournament_id=None):
                "club_country": _my_club_country(p)}
     # 포지션 적합도 배율도 AI 선발과 같은 방식으로 곱한다(_build_intl_squad_
     # by_group과 동일) — 내가 그 그룹의 핵심 포지션이면 1.00.
+    _my_m = _my_selection_metrics(p, _pos_stat)
     my_score = (intl_selection_score_v3(
-        my_cand, _my_selection_metrics(p, _pos_stat),
+        my_cand, _my_m,
         appearances=_my_total_intl_appearances(),
-    ) - penalty) * _intl_group_fit(my_pos, my_grp)
+    ) - penalty - _intl_low_league_nonstarter_penalty(my_cand, _my_m)) * _intl_group_fit(my_pos, my_grp)
 
+    # [2026-10 13번 ③] AI 후보도 _build_intl_squad_by_group과 같은 규칙으로 채점한다.
     ai_scores = sorted(
-        (intl_selection_score_v3(c, _metrics.get(c["id"]), _apps.get(c["id"], 0))
+        ((intl_selection_score_v3(c, _metrics.get(c["id"]), _apps.get(c["id"], 0))
+          - _intl_low_league_nonstarter_penalty(c, _metrics.get(c["id"])))
          * _intl_group_fit(c["position"], my_grp)
          for c in ai_cands), reverse=True)
 
@@ -4104,7 +4369,17 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
         # 대륙컵(CONF_CUP_NAME) 티어가 아니라 지역컵(REGION_CUP_NAME) 티어
         # 소속이므로 이름은 거기서 가져온다("유럽"→CONF_CUP_NAME의
         # "유럽 네이션스컵", "북미"→REGION_CUP_NAME의 "골드컵").
-        if continent == "북미":
+        # [2026-10 버그수정, 신민용 리포트: "네이션스 예선은 2000년에 했는데 2001년 중간
+        # 비시즌에 네이션스리그 예선을 또 한다"] 홀수 해(유로 주기) 여름의 유럽 cont_qual은
+        # 유로(EURO) 예선인데(통과국 → 같은 해 겨울 유로 본선, qual_results kind='continent'),
+        # 이름만 CONF_CUP_NAME("유럽 네이션스컵")으로 붙어 로그·메인 화면·일정표에
+        # "2001 유럽 네이션스컵 예선"으로 떴다. 세계기록실은 이미 _is_euro_cycle_year로
+        # "유로(EURO) 예선"으로 바꿔 보여주고 있었다(world_browser._country_result_name) —
+        # 저장 이름 자체를 같은 판정으로 맞춘다. 네이션스 예선(짝수 해)은 그대로.
+        if continent == "유럽" and _is_euro_qual_year(year):
+            from constants import EURO_NAME as _EN
+            _cq_cup_name = _EN
+        elif continent == "북미":
             from constants import REGION_CUP_NAME as _RCN
             _cq_cup_name = _RCN.get("북미", "골드컵")
         else:
@@ -4341,7 +4616,9 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
     # (qual_cfg["po_teams"] > 0 인 체제에서만)
 
     # 로그
-    add_log(f"🌐 {name} 예선 조 추첨 완료 ({n_groups}개 조)", "event")
+    # [2026-10] 대회명이 이미 "… 예선"으로 끝나서 "예선 예선 조 추첨"으로 두 번 붙던 표기 정리.
+    _qn = name if str(name).endswith("예선") else f"{name} 예선"
+    add_log(f"🌐 {_qn} 조 추첨 완료 ({n_groups}개 조)", "event")
     if my_sel == 3:
         add_log(f"   발탁 후보: {', '.join(cand_nats_final)}", "event")
     elif my_sel == 1:
@@ -5627,6 +5904,50 @@ def _sim_ai_match(t, m, my_played=False, conn=None, reason="injury", batch=None)
     # [2026-10 F2] 스코어도 승패와 같은 곡선 적용 전력차를 쓴다.
     hs, as_ = _gen_intl_score(outcome, _intl_effective_diff(he["ovr"], ae["ovr"]))
 
+    # [2026-10 A안, 신민용 확정] 내가 대표로 뽑혀 참가하는 대회(my_selected==1)의 경기는 AI끼리
+    # 경기(+내가 결장한 우리나라 경기)도 내 경기와 같은 전술 엔진으로 돌린다 — 그 대회 모든 선수의
+    # 골·도움·평점이 실측(real_stats, comp "intl")이 된다. 출전 수도 엔진 평점표의 실제 출전자로
+    # 올린다. 엔진이 실패하면(명단 8명 미만 등) 위 공식 결과 그대로.
+    # [2026-10 신민용 확정] 예선(월드컵·대륙컵·올림픽 예선)은 제외 — 공식 시뮬레이션 그대로. 엔진으로 돌리면
+    # 평균 골은 같아도 득점 분포가 달라졌다(예선 4개 대회 566경기 비교: 0-0 1.9%→4.1%, 4골 이상
+    # 59.0%→50.6%, 4개 대회 모두 같은 방향 — 리그와 같은 기준으로 복귀). 내가 결장한 우리나라 예선
+    # 경기도 이 함수를 타므로 같이 공식으로 처리된다. 본선은 분포가 같아 엔진 유지.
+    _cov_ids = None
+    if t.get("my_selected") == 1 and t.get("kind") not in ("wc_qual", "cont_qual", "oly_qual"):
+        try:
+            from match_sim.tactical_engine import simulate_tactical_match
+            _hl, _hfm = _intl_tactical_lineup(t["id"], m["home"], he["ovr"])
+            _al, _afm = _intl_tactical_lineup(t["id"], m["away"], ae["ovr"])
+            if _hl is None or _al is None:
+                raise ValueError("intl squad pool too small")
+            _csim = simulate_tactical_match(
+                _hl, _al, home_boost=0.0, away_boost=0.0,
+                home_boost_position=None, away_boost_position=None, home_adv=0.0,
+                home_formation=_hfm, away_formation=_afm,
+                home_bench=_intl_bench(_hl, t["id"], m["home"], he["ovr"]),
+                away_bench=_intl_bench(_al, t["id"], m["away"], ae["ovr"]),
+                extra_time=bool(knockout))
+            _cpr = {"home": _csim.get("home_player_ratings") or [],
+                    "away": _csim.get("away_player_ratings") or []}
+            hs, as_ = _csim["home_score"], _csim["away_score"]
+            outcome = "draw" if hs == as_ else ("home" if hs > as_ else "away")
+            pso_winner, pso_score = "", ""
+            if knockout and outcome == "draw":
+                win_home, pso_score = _resolve_pso(he["ovr"], ae["ovr"], neutral=_neutral)
+                pso_winner = m["home"] if win_home else m["away"]
+            _cov_ids = _intl_participant_ids(_cpr)
+            try:
+                import real_stats as _rs
+                _rc = get_conn()
+                _ry = t.get("year")
+                _rs.record(_rc, {"comp": "intl", "tkey": f"intl:{t['id']}", "home": m["home"], "away": m["away"]},
+                           _cpr, hs, as_, _ry)
+                _rc.commit()
+            except Exception:
+                pass
+        except Exception:
+            _cov_ids = None
+
     # [2026-08 신설, 신민용 요청: "출전을 몇 번 했는지만 표시해줘"] 이 경기의
     # 실제 스타팅 11(양 팀 각각)을 정하고 그 선수들만 intl_squad.appearances를
     # +1 한다. _sim_ai_match는 이 경기(m)가 미진행(home_score=-1)일 때만
@@ -5656,6 +5977,12 @@ def _sim_ai_match(t, m, my_played=False, conn=None, reason="injury", batch=None)
         home_starters = _pick_intl_starters(t["id"], m["home"], he["ovr"])
         away_starters = _pick_intl_starters(t["id"], m["away"], ae["ovr"])
         _strength_diff_home = he["ovr"] - ae["ovr"]
+        if _cov_ids is not None:
+            # [A안] 엔진으로 돈 경기 — 실제 출전자(선발+교체 투입)만 +1 (주전 고정은 위 호출이 이미 함)
+            for _sk, _cn in (("home", m["home"]), ("away", m["away"])):
+                if _cov_ids.get(_sk):
+                    bump_intl_squad_appearances(t["id"], _cn, _cov_ids[_sk])
+            home_starters = away_starters = None
         if home_starters:
             home_pool = get_or_create_intl_squad(t["id"], m["home"], he["ovr"], _INTL_MATCHDAY_FULL_POS)
             home_n_subs = _get_intl_substitution_count(hs, as_, _strength_diff_home)
@@ -5854,16 +6181,34 @@ def simulate_my_match(week, p, day=None):
     # 아시안컵/지역컵 등)는 지금 단계에서 전부 intl_suspension 하나로
     # 유지(신민용+GPT 협의 확정 — 국가대표 대회가 클럽만큼 빈번하지 않아
     # 더 세분화할 실익이 작음).
-    _susp_field = "wc_qual_suspension" if t.get("kind") == "wc_qual" else "intl_suspension"
-    if _is_oly_t:
-        _susp_field = "oly_suspension"   # [2026-10] 성인 대표팀과 따로 센다(예선 퇴장 → 본선 이월)
+    # [2026-10 대회별 카드 규칙, 신민용 확정] 대회 종류마다 카드 묶음을 따로 두고(월드컵 예선/본선, 대륙컵
+    # 예선/본선, 지역컵, 친선전), 공식 규정대로 단계 경계 초기화·끝난 대회 징계 정리·이월을 한다 —
+    # card_rules.prepare_intl_match 참고. 올림픽은 예전 경로(olympics.py가 초기화 담당) 그대로.
+    _prep = None
+    if not _is_oly_t:
+        try:
+            import card_rules as _cr
+            _prep = _cr.prepare_intl_match(p, t, m.get("stage"))
+        except Exception as _cre:
+            print("card_rules 국가대표 경기 준비 오류(예전 규칙으로):", _cre)
+            _prep = None
+    if _prep is not None:
+        _susp_field, _suspended, _cr_log = _prep
+        p = get_player() or p
+        if _suspended and _cr_log:
+            add_log(_cr_log, "event")
+    else:
+        _susp_field = "wc_qual_suspension" if t.get("kind") == "wc_qual" else "intl_suspension"
+        if _is_oly_t:
+            _susp_field = "oly_suspension"   # [2026-10] 성인 대표팀과 따로 센다(예선 퇴장 → 본선 이월)
 
-    # [2026-07 신설] 출전정지 체크 — 퇴장 다음 경기는 강제 결장.
-    _suspended, _new_susp = _check_suspended(p, field=_susp_field)
-    if _suspended:
-        update_player(**{_susp_field: _new_susp})
-        add_log(f"🟥 출전정지로 결장{'  (다음 경기부터 복귀)' if _new_susp == 0 else f'  (남은 정지 {_new_susp}경기)'}",
-                "event")
+        # [2026-07 신설] 출전정지 체크 — 퇴장 다음 경기는 강제 결장.
+        _suspended, _new_susp = _check_suspended(p, field=_susp_field)
+        if _suspended:
+            update_player(**{_susp_field: _new_susp})
+            from game_engine import suspension_log_text as _susp_log_text
+            add_log(_susp_log_text(_susp_field, _new_susp),
+                    "event")
 
     # 내 출전 보너스 (격차 기반 에이스 영향력)
     # [2026-07 통일] 리그(game_engine._simulate_match)와 동일한 볼록가속+
@@ -6101,7 +6446,10 @@ def simulate_my_match(week, p, day=None):
     rs = {"win": "승", "draw": "무", "loss": "패"}.get(my_result, "")
     pso_txt = ""
     if pso_winner:
-        pso_txt = f"  (승부차기 {pso_score} {'승' if pso_winner == nat else '패'})"
+        # [2026-10 신민용 요청] "(무)  (승부차기 5-3 패)" 대신 "승부차기 (5-3) 패배"로 —
+        # 결과 칸 자체를 바꾼다(로그 '경기' 필터가 줄 끝 결과 표기로 결과 줄을 찾는다).
+        from game_engine import pso_result_text
+        pso_txt = pso_result_text(pso_score, pso_winner == nat)
         rs = "무"
     comp_name = f"{t['name']} {stage_ko}{grp_txt}".strip()
     home_disp = f"{he['flag']}{m['home']}"
@@ -6113,7 +6461,9 @@ def simulate_my_match(week, p, day=None):
         events, not (_suspended or _benched), _benched, detail, pso=pso,
         engine_stats=engine_stats, engine_plog=engine_plog, player_ratings=player_ratings,
         match_extra={"score_90": ([hs90, as90] if hs90 is not None else [hs, as_]),
-                     "went_extra_time": went_et, "subs": _subs})
+                     "went_extra_time": went_et, "subs": _subs},
+        # [2026-10 신설] 이 경기 AI 선수 실측 기록(real_stats)
+        real_ctx={"comp": "intl", "tkey": f"intl:{t['id']}", "home": m["home"], "away": m["away"]})
     # [2026-10 4단계] 올림픽 경기는 로그 상자를 은색으로(log_panel "olympic").
     marker = f" [match:{detail_id}:{'olympic' if _is_oly(t) else 'intl'}]" if detail_id else ""
 
@@ -6128,7 +6478,7 @@ def simulate_my_match(week, p, day=None):
     else:
         when_txt = f"{week}주차"
     add_log(f"{_comp_icon(t)} {comp_name}  {when_txt}{marker}", "match")
-    add_log(f"   {home_disp} {hs}-{as_} {away_disp}  ({rs}){pso_txt}", "match")
+    add_log(f"   {home_disp} {hs}-{as_} {away_disp}  {pso_txt or f'({rs})'}", "match")
     if p.get("position") == "GK":
         add_log(f"   평점 {rating:.1f}  선방 {saves}", "match")
     else:
@@ -6881,7 +7231,8 @@ def _save_qual_results(t, continent, qualified_list, set_done=True):
     # 각 대륙 예선 완료 시 무조건 진출국 목록 출력
     if set_done:
         add_log("─" * 44, "sep")
-        add_log(f"🌐 {t['name']} 예선 완료 — {len(qualified_list)}개국 본선 진출", "event")
+        _qn2 = t['name'] if str(t['name']).endswith("예선") else f"{t['name']} 예선"
+        add_log(f"🌐 {_qn2} 완료 — {len(qualified_list)}개국 본선 진출", "event")
         for _q in qualified_list:
             add_log(f"   ✈️  {_q.get('flag','')} {_q['country']}", "event")
 
@@ -7371,8 +7722,14 @@ def _award_intl_awards(t):
     _already_won_young = conn.execute(
         "SELECT 1 FROM awards WHERE is_mine=1 AND award_type=? AND year<?",
         (young_name, year)).fetchone() is not None
+    # [2026-10 신민용 확정: "내 선수 수상 판정을 명단 기준으로 통일"] 월드컵·대륙컵·지역컵의 내
+    # 베스트 11은 여기서 정하지 않는다 — 시즌 종료 때 세계기록실 명단을 만들면서 내가 들었으면
+    # 같은 이름으로 경력에 넣는다(game_engine._compute_intl_individual_awards). 시즌 중 은퇴면
+    # finalize_season_for_retire가 같은 규칙으로 그때 정한다. 그 밖의 대회 종류는 예전 판정 그대로.
+    from game_engine import _MY_XI_FROM_LIST_INTL_KINDS
     for label in _evaluate_extra_awards(pool, my_pos, my_age,
-                                         weight_fn=lambda x: _stage_w(x["country"])):
+                                         weight_fn=lambda x: _stage_w(x["country"]),
+                                         include_best11=t["kind"] not in _MY_XI_FROM_LIST_INTL_KINDS):
         if label == "베스트11":
             awards.append((best11_name, f"{year} {t['name']} {label}"))
         elif not _already_won_young:
@@ -7609,14 +7966,19 @@ def get_my_intl_matches(only_qual=False):
         # 평가전)도 실제로는 예선이 아니라 별도 친선 대회지만, 표시
         # 성격(대회성적 보너스 없음·MatchRating만 반영)이 예선과 같아서
         # 같은 탭에 묶는다.
-        kind_filter = "t.kind IN ('wc_qual', 'cont_qual', 'power_eval')"
+        # [2026-10 신설, 신민용 리포트: "올림픽은 지금까지 내 커리어 국제대회에 기록이 안 된다 —
+        # 예선은 국제전 예선, 본선은 국제전으로. 다만 A매치는 아니니 통산 A매치엔 추가 안 되게"]
+        # U-23 올림픽 예선(oly_qual)도 이 탭에 넣는다. A매치 통산(intl_caps 등)은 경기 처리 쪽에서
+        # 이미 올림픽을 빼고 있고, 화면 요약은 "is_olympic" 표시로 따로 센다.
+        kind_filter = "t.kind IN ('wc_qual', 'cont_qual', 'power_eval', 'oly_qual')"
     else:
         # [2026-08 신설, 신민용 리포트: "지역컵 경기가 국제전 기록에 하나도
         # 안 들어간다"] 3단계 지역컵(kind='region')이 이 화이트리스트에
         # 없어서, 실제로 뛴 지역컵 경기가 커리어/은퇴창 "국제전" 탭에서
         # 통째로 빠지고 있었다 — 개인 통계는 저장되고 있었는데(스탯 컬럼
         # 자체는 kind 무관하게 채워짐) 이 조회 하나가 걸러버린 것.
-        kind_filter = "t.kind IN ('world','continent','region')"
+        # [2026-10] U-23 올림픽 본선(olympic)도 국제전 탭에 — 위 예선 쪽 주석 참고.
+        kind_filter = "t.kind IN ('world','continent','region','olympic')"
     conn = get_conn()
     # [2026-07 재수정, 신민용 지적: "다친 게 아니라 그냥 벤치라 안 뛴
     # 경기도 있는데 그건 빠진다"] my_played=1이거나 absence_reason이
@@ -7633,7 +7995,7 @@ def get_my_intl_matches(only_qual=False):
     # 미선발 대회의 경기까지 전부 "벤치"로 잘못 나왔다 — t.my_selected=1
     # 조건을 추가해서 진짜 선발된 대회만 가져온다.
     rows = [dict(r) for r in conn.execute(
-        f"""SELECT m.*, t.year AS t_year, t.name AS comp
+        f"""SELECT m.*, t.year AS t_year, t.name AS comp, t.kind AS t_kind
            FROM intl_matches m
            JOIN intl_tournaments t ON m.tournament_id = t.id
            WHERE m.is_my = 1 AND m.home_score >= 0 AND {kind_filter}
@@ -7704,6 +8066,8 @@ def get_my_intl_matches(only_qual=False):
             "score": f"{my_s}-{op_s}", "result": result,
             "absence_reason": m.get("my_absence_reason"),
             "my_played": m.get("my_played", 0),
+            # [2026-10] U-23 올림픽(예선·본선) 경기 — A매치가 아니라 통산 A매치 요약에서 뺀다.
+            "is_olympic": m.get("t_kind") in ("oly_qual", "olympic"),
             # [2026-08 신설, PHASE 2: opponent_context_engine] 이 경기가
             # 열린 대회 id — 상대가 그 대회에서 최종적으로 어디까지
             # 갔는지(opponent_context.get_intl_opponent_stage)를 나중에

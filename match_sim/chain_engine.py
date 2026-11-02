@@ -1,1439 +1,2290 @@
 # -*- coding: utf-8 -*-
-"""match_sim/chain_engine.py — 점유 체인 경기 엔진 [2026-10, 신민용 확정 설계 v1.3]
+"""match_sim/tactical_engine.py — 포메이션 매치업 기반 경기 결과 시뮬레이션.
 
-기존 tactical_engine(1분에 결과 하나)과 나란히 두는 새 엔진. 검증이 끝날 때까지 게임 어디에도
-연결하지 않는다 — 채택되면 tactical_engine이 이 엔진만 부르고 분 단위 루프는 지운다(스위치 없음),
-기각되면 이 모듈을 지운다.
+[왜 필요한가]
+기존 game_engine._gen_score()는 "홈-원정 OVR 차이 → 확률표 조회"로 스코어를
+결정했다. 승/무/패 확률과 골 차이가 전부 OVR 차이 하나로만 정해지고, 그
+경기에서 실제로 어느 구역을 누가 장악했는지, 포메이션끼리 어디서 수적/능력치
+우위가 나는지는 전혀 반영되지 않았다 — "3-5-2가 중원에서 4-4-2를 5:4로
+압도한다" 같은 전술적 사실이 결과에 개입할 여지가 구조적으로 없었다.
 
-원리(설계 v1.3)
-  · 경기 = 점유의 연속, 점유 = 행동(패스·드리블·크로스·슈팅 …)의 사슬.
-  · 행동마다 걸리는 시간이 다르고, 경기 재개(스로인·골킥·코너·프리킥·득점 후 킥오프·교체·카드)
-    시간도 시계에 더해진다. 하프는 경기 시계 45:00(연장 15:00)에 정규시간이 끝나고, 그 하프에서
-    쌓인 지연으로 정한 추가시간이 그 뒤에 이어진다.
-  · 모든 경합은 p = sigmoid(logit(기본 성공률) + k·(공격 합성값 − 수비 합성값)/10 + 보정).
-    능력치가 같으면 정확히 기본 성공률이 나온다.
-  · 수비 기록은 실제 경합에서만 생긴다(태클 ↔ 드리블·볼 뺏김, 가로채기 ↔ 패스 실패, 클리어 ↔
-    크로스·롱볼, 블록 ↔ 슈팅, 공중볼 승 ↔ 공중볼 패).
-  · 파울·카드·PK·오프사이드·코너는 기존 설계 A 규칙(확률 상수)을 그대로 쓰고, "언제 판정하느냐"만
-    체인의 실제 장면으로 바뀐다. 오프사이드는 침투 수신 패스에서만, 코너는 블록·선방·크로스 클리어
-    에서만, PK는 박스 안 파울에서만 나온다.
-  · 기록 → 평점: 평점 장부(rating_ledger)는 이 엔진의 사건 기록만 읽는다(가중치 불변).
+이 모듈은 그 자리를 대체한다. 실제로 피치를 3레인(좌/중/우) x 3서드(수비/
+중원/공격)로 나누고, 각 팀의 포메이션이 그 구역에 배치하는 선수들의 실제
+스탯(슈팅/패스/드리블/태클/포지셔닝 등)으로 "이 구역은 어느 팀이 우세한가"를
+계산한 뒤, 그 우세를 따라 볼이 흘러가는 것을 분 단위(90분)로 시뮬레이션해서
+슈팅/코너/파울/골이 그 결과로 자연스럽게 "발생"하게 만든다. 스코어와 팀
+통계(슈팅/유효슈팅/코너/파울/점유율)는 사후에 역산되는 게 아니라 이
+시뮬레이션의 직접적인 산출물이다.
 
-출력은 tactical_engine.simulate_tactical_match와 같은 키(+ "time_info")라 화면·저장·평점 코드를
-고치지 않고 그대로 쓸 수 있다. 사건마다 하프(half)·하프 안 경과 초(sec)를 함께 남긴다 — 45+N 같은
-추가시간 표시는 별도 UI 작업에서 이 값을 읽어 만든다. "min"(내부 분)은 기존 규칙 그대로:
-  전반 1~45(전반 추가시간은 45.99대로 압축) / 후반 46~90, 91~96 = 90+1~6 / 연장 97~112, 113~128.
+[적용 범위 — 중요]
+이건 사용자가 실제로 관전하는 "내 경기"(game_engine._simulate_match)에만
+쓰인다. 리그의 나머지 수십~수백 경기(AI vs AI, _sim_all_ai_matches 등)는
+이 정밀 시뮬레이션을 돌릴 필요가 없고(성능 낭비 + 안 보는 경기라 의미도
+없음), 기존 OVR 차이 기반 확률표(_match_win_probs/_gen_score)를 그대로
+쓴다 — 이 모듈은 그 함수들을 건드리지 않는다.
+
+[개인 서사와의 관계]
+내 선수 개인의 골/도움/선방/평점(game_engine._player_perf)은 이 모듈이
+건드리지 않는다. 그건 여전히 "확정된 팀 스코어에 맞춰 내 개인 기록을
+그럴듯하게 만드는" 별개 로직이고, 이 모듈이 만든 스코어를 입력으로 그대로
+받는다. 대신 이 모듈이 만든 팀 통계(슈팅 수 등)는 game_engine._derive_match_stats
+에서 "내 개인 기록이 하한선"이라는 기존 원칙과 합쳐져 최종 팀 통계가 된다
+(engine이 만든 진짜 값을 기준점으로 쓰되, 내 개인 슈팅이 그보다 많으면
+그쪽을 존중 — 모순이 안 생기게).
 """
 import math
 import random
 
-from match_sim.tactical_engine import (
-    LANES, REG_MINUTES, ET_HALF_MINUTES, _FALLBACK_SLOTS, _POS_XY, _third_of, _assign_zones, _pkey,
-    _pstat, _new_stats_detail, _Stamina, _build_player_ratings, effective_stat,
-    ATT_LANE_AFFINITY, DEF_LANE_AFFINITY, _boost_weights_for, _DEFAULT_BOOST_WEIGHTS,
-    STAMINA_MODEL, SUBS_MAX_PLAYERS, SUBS_MAX_WINDOWS, SUBS_EXTRA_TIME_WINDOWS, SUB_STAMINA_TRIGGER,
-    YELLOW_PER_FOUL, YELLOW_TACTICAL_BONUS, RED_PER_FOUL, RED_DOGSO, BOOKED_CAUTION,
-    OFFSIDE_LINE_MULT, _MATCH_FORM_SIGMA, display_minute)
+LANES = ("L", "C", "R")
 
-D3, M3, A3, BOX = 0, 1, 2, 3          # 공격팀 기준 구역
-_MIRROR = {D3: A3, M3: M3, A3: D3, BOX: D3}
-_ZNAME = {D3: "def", M3: "mid", A3: "att", BOX: "att"}
+# [2026-09 신설] 슈터 풀 확장 스위치. True면 "그 레인 최전방"만이 아니라
+# 같은 레인 미드필더/옆 레인 공격수까지 포지션 배수와 함께 슈터 풀에 넣는다
+# (_prep_side 주석 참고 — 예전엔 4-2-3-1처럼 최전방이 레인당 1명인
+# 포메이션에서 팀 골의 97.6%가 한 선수에게 쏠렸다). False면 예전 동작을
+# 그대로 재현한다 — A/B 계측(tools/scorer_spread_qa.py --legacy) 전용이며
+# 실제 게임에서는 항상 True.
+WIDE_SHOOTER_POOL = True
 
-# ── 행동 선택 기본 비율(설계 3-1) ──────────────────────────────────────
-ACTIONS = ("short", "fwd", "long", "through", "drib", "cross", "shot")
-MIX = {
-    D3:  {"short": 70, "fwd": 20, "long": 8, "drib": 2},
-    M3:  {"short": 58, "fwd": 26, "long": 4, "through": 0.8, "drib": 3.0, "shot": 0.12},
-    A3:  {"short": 38, "fwd": 12, "through": 2, "drib": 5.5, "cross": 28, "shot": 1.7},
-    BOX: {"short": 40, "drib": 12, "shot": 16},
+# ── [2026-09 신설] 경기 내부 체력 / 교체 / 연장전 ────────────────────
+# 신민용 확정 설계(교체·연장전 설계 확정본):
+#   · 체력은 "사용자가 보는 게이지"가 아니라 "AI가 왜 교체했는지를 정하는
+#     변수"다 — 실시간 UI/모션은 전혀 필요 없고, 이 엔진의 1~96분 내부
+#     루프에서만 쓰인다.
+#   · 교체 가능 5명 / 교체 기회 3회, 연장 진입 시 +1회. 하프타임과 연장
+#     하프타임은 기회를 소모하지 않는다(실제 규칙과 동일).
+#   · 연장은 단판 KO에서만. 2차전 합산 방식은 "2차전 90분 종료 후 합산이
+#     동률일 때만" 연장에 들어간다.
+#   · 체력은 90분에 초기화되지 않고 연장에서도 계속 감소한다.
+#
+# [밸런스 원칙] 지금 득점 baseline은 체력 개념 없이 튜닝된 값이다. 그래서
+# 체력이 경기력에 미치는 영향은 의도적으로 약하게 시작한다 —
+# STAMINA_PERF_COEF가 그 세기이고, A/B 계측(tools/stamina_ab_qa.py)으로
+# 기존 득점/평점과 비교한 뒤에만 올린다.
+STAMINA_MODEL = True          # False면 체력/교체를 완전히 끈다(A/B 계측용)
+STAMINA_DRAIN_BASE = 0.62     # 분당 기본 소모(스탯 50 기준 ≈ 0.58/분)
+STAMINA_ET_MULT = 1.15        # 연장전 추가 소모 배수
+STAMINA_FRESH_FLOOR = 75.0    # 이 체력 위에서는 경기력 영향 없음
+STAMINA_PERF_COEF = 0.0022    # FRESH_FLOOR 아래 1점당 경기력 감소분
+STAMINA_PERF_MIN = 0.80       # 경기력 하한(체력 0이어도 이 밑으로는 안 내려감)
+
+# 포지션별 활동량(같은 시간에 체력이 얼마나 더 빠지는가).
+STAMINA_POS_MULT = {
+    "GK": 0.25, "CB": 0.86, "SW": 0.86, "LB": 1.06, "RB": 1.06,
+    "LWB": 1.14, "RWB": 1.14, "CDM": 1.08, "CM": 1.10, "LM": 1.12, "RM": 1.12,
+    "CAM": 1.04, "LW": 1.06, "RW": 1.06, "ST": 0.98, "CF": 0.98, "SS": 0.98,
 }
-BUILDUP_MULT = {   # 감독 빌드업 성향 → 행동 비율 배수
-    "POSSESSION": {"short": 1.25, "fwd": 0.95, "long": 0.5},
-    "MIXED": {},
-    "DIRECT": {"short": 0.75, "fwd": 1.2, "long": 1.9},
+
+SUBS_MAX_PLAYERS = 5          # 한 경기 교체 가능 인원
+SUBS_MAX_WINDOWS = 3          # 경기 중 교체 기회(하프타임 제외)
+SUBS_EXTRA_TIME_WINDOWS = 1   # 연장 진입 시 추가 기회
+SUB_STAMINA_TRIGGER = 62.0    # 이 체력 밑이면 교체 후보
+SUB_EARLIEST_MINUTE = 46      # 하프타임 이전에는 (부상 외) 교체 안 한다
+
+# 연장 구조 — 정규시간은 내부적으로 1~96분(90+추가시간)이고, 연장은 그
+# 뒤에 붙는 별도 구간이다. 표시 분(display_minute)만 91~122로 환산한다.
+REG_MINUTES = 96              # 정규시간(추가시간 포함) 내부 길이
+ET_HALF_MINUTES = 16          # 연장 전/후반 각 내부 길이(15+추가시간)
+
+# ── 득점환경 튜닝 상수 ───────────────────────────────────────────
+# [2026-09 신설, 신민용 리포트: "월드컵 등 국제대회에서 약팀이 강팀을
+# 5대0으로 이기는 경우도 있다 / 포메이션 등 여러 조건에서 뭔가 과하게
+# 가중치를 주는 것 같다"] 이 두 값은 원래 각각 simulate_tactical_match와
+# _resolve_shot 안에 리터럴로 박혀 있었다 — 실측으로 재보정하면서 모듈
+# 상수로 끌어올렸다(한 곳에서만 만지면 되도록).
+#
+# ── 왜 바꿨나: 실측 ──────────────────────────────────────────
+# 이 엔진은 "내가 뛰는 모든 경기"(리그/컵/챔스/클럽월드컵/국가대표)를
+# 담당하는데, AI끼리의 경기는 game_engine._gen_score("득점환경 v1.0",
+# 리그 평균 1.47~1.51골/팀으로 캘리브레이션됨)로 돌아간다. 두 엔진의
+# 득점환경을 처음으로 직접 대조해보니 크게 어긋나 있었다(실측, 잉글랜드
+# 1부 실제 로스터 2000경기 × 3매치업):
+#     이 엔진:    경기당 총 3.75~4.14골, 4골차 이상 15.8~21.0%
+#     AI 리그:    경기당 총 2.85골,      4골차 이상 6.93%
+# 국가대표 경기는 더 심했다(3000경기): 프랑스(97.3) vs 일본(94.1)에서
+# 일본 승 38.0%에 그중 17.7%가 4골차 이상 — 일본 8-0/9-0, 10-2 France
+# 같은 스코어가 실제로 나왔다.
+#
+# 원인 두 가지:
+#  1) _MATCH_FORM_SIGMA(경기 당일 컨디션) 7.0이 국가대표 간 실제 OVR
+#     격차(월드컵 본선급 평균 3.7, 최대 12)보다 크다 — 양 팀 차이로는
+#     표준편차 약 9.9라, 실력 격차가 컨디션 난수에 통째로 묻혔다.
+#     (이 값은 "분 단위 시뮬만으론 이변이 안 난다"는 이유로 도입됐는데,
+#      당시엔 합성 스탯으로만 검증했고 실제 로스터로는 재보지 않았다.)
+#  2) _SHOT_SAVE_BASE 0.63은 슈팅당 득점확률을 약 17%로 만든다(실제
+#     축구는 10~11%). 슈팅 수 자체는 팀당 11~12개로 현실적인데 전환율만
+#     높아서, 총 골이 4골대로 부풀고 그 꼬리(대량득점)가 통째로 두꺼워졌다.
+#
+# 재보정 후 실측은 simulate_tactical_match 정의부 아래 표 참고.
+_MATCH_FORM_SIGMA = 3.5   # 경기 당일 컨디션(팀 전체에 걸리는 가우시안 오차)
+
+# ── [2026-10 신설, 신민용 확정 설계 A — "현실 경기 규칙대로, 통계는 결과로 검증"] ──
+# 파울·카드·퇴장·오프사이드·세트피스를 "선수 단위 사건"으로 만든다. 아래 값은 그 사건이
+# 일어나는 조건의 세기이고, 경기당 평균(파울 약 11·옐로 약 2·오프사이드 약 2·코너 약 5)은
+# 강제 목표가 아니라 검증 때 현실 통계와 나란히 비교하는 결과값이다.
+FOUL_BASE = 0.17              # 볼 없는 쪽이 끊는 파울(공격측 우세할수록 ↑)
+FOUL_PRESSURE = 0.12          # (1 - quality) 대신 quality에 비례 — 밀릴수록 끊는다
+FOUL_ATT_ZONE_BASE = 0.20     # 파울이 공격 진영(프리킥 위협 지역)에서 일어날 기본 확률
+PENALTY_FROM_ATT_FOUL = 0.045 # 공격 진영 파울 중 박스 안(PK)
+DIRECT_FK_SHOT = 0.22         # 공격 진영 프리킥 중 직접 슈팅
+YELLOW_PER_FOUL = 0.13        # 파울 하나당 옐로 기본 확률
+YELLOW_TACTICAL_BONUS = 0.08  # 공격 진영(역습 차단성) 파울 가산
+RED_PER_FOUL = 0.002          # 직접 퇴장(난폭 행위 등)
+RED_DOGSO = 0.02              # 득점 기회 저지(공격 진영 + 공격측 크게 우세)
+BOOKED_CAUTION = 0.35         # 경고를 받은 선수는 무리한 태클을 피한다(파울 관여 비중 배수)
+OFFSIDE_PER_BUILDUP = 0.075   # 빌드업 국면에서 침투 시도가 오프사이드로 끊길 기본 확률
+OFFSIDE_LINE_MULT = {"HIGH_PRESS": 1.35, "MID_BLOCK": 1.0, "LOW_BLOCK": 0.65}   # 수비 라인 높이
+CORNER_FROM_SAVE = 0.30       # GK 선방이 라인 밖으로 나가는 비율
+CORNER_FROM_BLOCK = 0.40      # 수비 블록이 라인 밖으로 나가는 비율
+CORNER_FROM_CROSS = 0.25      # 실패한 크로스가 걷어내져 코너가 되는 비율
+CORNER_SHOT = 0.28            # 코너킥이 슈팅(헤더 등)으로 이어질 확률
+# [2026-10 설계 B-1 재시도 — 신민용 확정: "실제 수비 동작이 확인된 경우에만 수비 기록"] 수비 기록은
+# 공격 시도가 실패한 그 장면에서만 생긴다: 실패한 패스를 수비수가 끊으면 가로채기, 드리블 경합에서
+# 이기면 태클 성공(드리블러는 볼 뺏김), 드리블에 뚫리면 그 수비수는 "돌파 허용", 실패한 크로스를
+# 걷어내면 클리어. 공중볼은 두 선수의 헤딩·점프·몸싸움으로 승자를 정한다.
+PASS_PER_POSS_MIN = (7, 11)       # 볼을 가진 1분당 패스 시도(현실 경기당 팀 패스 약 400~500회)
+INTERCEPT_OF_FAILED_PASS = 0.12   # 실패한 패스 중 수비수가 직접 끊어낸 비율(나머지는 터치라인 밖 등)
+DRIBBLE_P = {"att": 0.40, "mid": 0.18}   # 빌드업 국면 드리블 시도 확률(진영별)
+DRIBBLE_BEATEN_DEF = 0.60         # 성공한 드리블 중 특정 수비수가 붙었다가 뚫린 비율
+DRIBBLE_TACKLED = 0.85            # 실패한 드리블 중 수비수 태클에 뺏긴 비율(나머지는 터치 실수)
+CROSS_P_WIDE = 0.45               # 측면 레인 공격 진영 국면의 크로스 시도 확률
+CROSS_CLEARED = 0.75              # 실패한 크로스 중 수비수가 걷어낸 비율
+DEF_ZONE_TACKLE = 0.45            # 상대가 밀리는 국면(수비 진영)에서 태클 경합이 일어날 확률
+DEF_ZONE_CLEAR = 0.25             # 같은 국면에서 걷어내기
+AERIAL_PER_MIN = 0.36             # 1분당 공중볼 경합(현실 경기당 약 35회)
+
+# 수적 열세 — 한 명 빠질 때마다 그 팀 레인 공격/수비·중원 퀄리티에서 빼는 값(OVR 환산).
+# 레인 퀄리티는 가중평균이라 선수가 빠져도 평균은 거의 안 바뀐다 — 인원 자체의 손해를 따로 준다.
+# 단계 실험(×1.0/1.5/2.0/2.5, 각 8,000경기)에서 ×1.5를 골랐다 — 퇴장 뒤 10명 팀 득점률 약 0.64배,
+# 11명 팀 약 1.39배, 강팀 승률(OVR 차이별)은 배수와 무관하게 그대로.
+MAN_DOWN_ATT = 4.5
+MAN_DOWN_DFN = 5.25
+MAN_DOWN_MID = 7.5
+_SHOT_SAVE_BASE = 0.72    # 유효슈팅이 막힐 기본 확률(_resolve_shot)
+
+# [2026-09 신설, 신민용+GPT 설계: "72→75보다 82→85가, 그보다 92→95가,
+# 92→95보다 95→97이 더 크게 벌어져야 한다"] raw stat(0~99)을 "실질
+# 영향력 값"으로 바꾸는 공통 비선형 변환 — 모든 공격/수비/미드필드/GK/
+# 슈팅 계산이 이 함수 하나만 거치게 통일한다(개별 함수마다 따로 만들면
+# 나중에 한쪽만 고쳐서 어긋나는 사고가 난다). 80 이하는 기울기 1.00(=
+# 항등함수)이라 기존 보정 상수(사igmoid 나눗셈 값 등)와의 하위호환이
+# 그대로 유지된다 — 대다수 선수(80 이하)는 이 변환을 넣기 전과 결과가
+# 똑같고, 오직 80+ 구간에서만 격차가 벌어진다.
+# [2026-09, 신민용+GPT 확정] 99+("신급") 기울기 3.80은 1차 실험값 — 극단
+# 매치업(90 vs 95/99/102) 헤드리스 검증 후 확정 예정.
+_STAT_VALUE_BREAKPOINTS = (
+    (0,  80, 1.00),
+    (80, 90, 1.25),
+    (90, 95, 1.70),
+    (95, 99, 2.80),
+    (99, 999, 3.80),
+)
+
+
+def effective_stat(raw):
+    """raw stat(0~99, 드물게 99+ '신급')을 실질 영향력 값으로 변환.
+    _STAT_VALUE_BREAKPOINTS 정의부 주석 참고."""
+    if raw is None:
+        raw = 50
+    value = 0.0
+    for lo, hi, slope in _STAT_VALUE_BREAKPOINTS:
+        if raw <= lo:
+            break
+        seg = min(raw, hi) - lo
+        value += seg * slope
+    return value
+
+# 포지션 라벨 -> 기준 좌표. x: 0(자기 골문)~1(상대 골문), y: 0(왼쪽)~1(오른쪽).
+# match_sim_viewer._POS_XY와 같은 세계관을 공유하되(같은 좌표계 감각), 이
+# 모듈은 UI 레이어에 의존하면 안 되므로 별도로 갖고 있는 값이다.
+_POS_XY = {
+    "GK":  (0.05, 0.50),
+    "CB":  (0.16, 0.50), "LB": (0.18, 0.14), "RB": (0.18, 0.86),
+    "LWB": (0.28, 0.12), "RWB": (0.28, 0.88),
+    "CDM": (0.34, 0.50), "CM": (0.44, 0.50), "CAM": (0.48, 0.50),
+    "LM":  (0.44, 0.16), "RM": (0.44, 0.84),
+    "LW":  (0.49, 0.14), "RW": (0.49, 0.86),
+    "CF":  (0.50, 0.50), "ST": (0.50, 0.50),
 }
-ATTACK_MULT = {    # 감독 공격 성향 → 행동 비율 배수(약하게)
-    "VERY_ATTACKING": {"shot": 1.12, "through": 1.2, "drib": 1.1, "cross": 1.05},
-    "ATTACKING": {"shot": 1.06, "through": 1.1, "drib": 1.05},
-    "BALANCED": {},
-    "DEFENSIVE": {"through": 0.9, "drib": 0.92, "short": 1.05},
-    "VERY_DEFENSIVE": {"through": 0.8, "drib": 0.85, "short": 1.1},
+_FALLBACK_SLOTS = ["GK", "CB", "CB", "LB", "RB", "LM", "CM", "CM", "RM", "ST", "ST"]
+
+
+def _third_of(bx):
+    """이 팀 자신의 포메이션 상 역할(수비/미드필더/공격수) 분류.
+    [버그 수정] 이 파일의 _POS_XY는 "한 팀이 스스로의 골문(0)을 기준으로
+    갖는 기본 포메이션 형태"만 담고 있어서 x값 범위가 0.05~0.50 정도로
+    좁다(공격수도 하프라인 부근인 0.50이 최댓값 — 원정팀은 이 값이
+    1-bx로 뒤집혀 0.50~0.95가 됨). 그런데 예전 임계값(0.34/0.67)은 피치
+    전체(0~1)를 3등분하는 값이라, 홈팀 공격수는 절대 "ATT"에 못
+    들어가고(bx가 0.67을 못 넘음) 원정팀 수비수는 절대 "DEF"에 못
+    들어갔다(뒤집힌 x가 0.34 밑으로 안 내려감) — 그 결과 _TeamModel의
+    공격/수비 퀄리티가 실제 선수 스탯을 거의 반영하지 못했다.
+    이제 이 함수는 뒤집히지 않은 원래 bx(각 팀 자신의 대형 좌표)만
+    받는다 — "이 선수가 자기 팀 안에서 수비수/미드필더/공격수 중
+    무엇에 가까운가"라는 팀 내부적 역할 분류이지, 피치의 고정된 절대
+    구역이 아니기 때문이다. 임계값도 실제 _POS_XY 값 분포(수비 라인
+    0.05~0.28, 중원 0.34~0.48, 최전방 0.49~0.50)에 맞게 재보정했다."""
+    if bx < 0.30:
+        return "DEF"
+    if bx < 0.485:
+        return "MID"
+    return "ATT"
+
+
+def _sigmoid(x):
+    try:
+        return 1.0 / (1.0 + math.exp(-x))
+    except OverflowError:
+        return 0.0 if x < 0 else 1.0
+
+
+def _assign_zones(lineup, is_home, slot_labels=None):
+    """[{"player":dict, "lane":..., "third":...}, ...]. lineup은
+    FORMATION_SLOTS[formation] 순서와 대응하는 선수 dict 리스트(None 허용).
+    원정팀은 홈팀과 정반대 방향을 보고 뛰므로, 전후좌표(x)뿐 아니라
+    좌우좌표(by)도 함께 뒤집어야(1-by) 홈팀 시점 고정좌표계에서 물리적으로
+    맞는 위치가 된다.
+    [버그 수정] 예전엔 x만 뒤집고 by는 그대로 둬서, 원정팀 왼쪽 수비수가
+    실제로는 홈팀 시점 오른쪽 측면에 있어야 하는데도 그대로 "L" 레인에
+    잡혔다. 매치업 계산(simulate_tactical_match의 atk.att[lane] vs
+    dfn_opp.dfn[lane])이 두 팀을 같은 레인 라벨끼리 비교하는 구조라서,
+    좌우 능력치가 비대칭인 스쿼드(예: 왼쪽 윙어는 강한데 오른쪽 풀백은
+    약한 팀)를 상대할 때 실제로는 안 맞붙어야 할 반대편 선수와 매치업이
+    계산되는 원인이었다.
+
+    [2026-09 버그수정, 신민용 리포트: "우리팀 포메이션은 5-2-3인데
+    라인업 화면엔 무조건 4-2-2-2로 뜬다 — 상대팀도 실제(4-2-1-3)와
+    다르게 뜬다"] slot_labels(그 라인업을 실제로 뽑을 때 쓴
+    FORMATION_SLOTS[formation])를 안 받으면 이 함수가 항상 하드코딩된
+    4-4-2 라벨(_FALLBACK_SLOTS)로 매 선수의 위치를 다시 칠했다 —
+    lineup 자체는 _select_lineup()이 그 팀의 실제 포메이션 슬롯 순서로
+    뽑아주는데, 라벨만 여기서 딴 걸로 덮어써서 실제 배치와 표시/구역
+    계산이 어긋났다. 이 어긋남은 화면 표시뿐 아니라 _third_of(공격/
+    수비/중원 역할 분류)에도 그대로 들어가 매치업 계산 자체에 영향을
+    준다. 이제 호출부(simulate_tactical_match)가 그 라인업을 만들 때
+    쓴 실제 슬롯 리스트를 넘겨주면 그걸 쓰고, 안 넘기면(기존 호출부·
+    국제대회처럼 원래 4-4-2뿐인 경우) 예전과 동일하게 _FALLBACK_SLOTS로
+    폴백한다 — 하위 호환 100% 유지."""
+    labels = slot_labels if slot_labels else _FALLBACK_SLOTS
+    out = []
+    for i, pl in enumerate(lineup):
+        if pl is None:
+            continue
+        label = labels[i] if i < len(labels) else pl.get("position", "CM")
+        bx, by = _POS_XY.get(label, (0.44, 0.5))
+        x = bx if is_home else (1.0 - bx)
+        y = by if is_home else (1.0 - by)
+        lane = "L" if y < 0.34 else ("C" if y < 0.67 else "R")
+        # [버그 수정] third(수비/미드필더/공격수 역할 분류)는 팀 내부적
+        # 역할이라 뒤집힌 x가 아니라 항상 원래 bx로 판정해야 한다(자세한
+        # 이유는 _third_of 문서 참고) — 안 그러면 홈팀 공격수/원정팀
+        # 수비수의 실제 스탯이 att/dfn 계산에 전혀 반영되지 않는다.
+        out.append({"player": pl, "pos": label, "lane": lane, "third": _third_of(bx)})
+    return out
+
+
+def _avg(vals, default=50.0):
+    vals = list(vals)
+    return sum(vals) / len(vals) if vals else default
+
+
+def display_minute(minute):
+    """내부 분 → 화면에 보여줄 분. 정규시간은 그대로, 연장은 91~122로 환산.
+
+    내부: 1..96(정규) / 97..112(연장 전반) / 113..128(연장 후반)
+    표시: 1..96        / 91..106           / 107..122
+    """
+    if minute <= REG_MINUTES:
+        return int(minute)
+    if minute <= REG_MINUTES + ET_HALF_MINUTES:
+        return int(90 + (minute - REG_MINUTES))
+    return int(90 + ET_HALF_MINUTES + (minute - REG_MINUTES - ET_HALF_MINUTES))
+
+
+# ── 경기 상세 타임라인용 분 코드 ──────────────────────────────────
+# [2026-09 신설, 신민용 리포트: "경기 상세에서 전반 후반 여기서 연장이
+# 뜨면 연장 전반 연장 후반 이렇게도 떠야 하는데 안 떠"]
+#
+# 타임라인(ui/match_detail_dialog.py)은 예전부터 자기만의 분 인코딩을
+# 쓴다 — 1~45=전반, 146~155=전반 추가시간(45+1~10), 46~90=후반,
+# 91~100=후반 추가시간(90+1~10). 그런데 display_minute이 돌려주는 연장
+# 분도 91부터 시작한다(연장 전반=91~106, 연장 후반=107~122). 즉 **표시
+# 분만으로는 "후반 추가시간 91분"과 "연장 전반 91분"을 구분할 수 없다**.
+# 그래서 연장 이벤트는 베이스 값을 얹은 별도 코드로 넘긴다 — 구간이
+# 겹치지 않으므로 기존 기록(전부 1000 미만)과도 100% 호환된다.
+TIMELINE_ET1_BASE = 1000      # 연장 전반 → 1000 + 표시분(91~106)
+TIMELINE_ET2_BASE = 2000      # 연장 후반 → 2000 + 표시분(107~122)
+
+
+def _style_edges(my_style, opp_style):
+    """[2026-09 신설 — 감독 시스템 ②단계] 한 팀 관점의 (점유 보정, 기회품질
+    보정)을 OVR 환산치로 돌려준다.
+
+    내 빌드업 성향과 **상대의 압박 성향** 둘 다가 나에게 영향을 준다 —
+    "내가 점유를 하려 해도 상대가 강하게 압박하면 못 한다"가 성립해야
+    감독 매치업이 의미를 갖기 때문이다. 값의 의미와 왜 반대 방향 두 항을
+    같이 주는지는 constants.MANAGER_BUILDUP_POSS_EDGE 위 주석 참고.
+
+    성향이 없으면(감독 표가 없는 구세이브, 국제대회처럼 감독 개념이 없는
+    경기) (0.0, 0.0)을 돌려줘 예전 동작을 그대로 유지한다."""
+    if not my_style and not opp_style:
+        return 0.0, 0.0
+    from constants import (MANAGER_BUILDUP_POSS_EDGE, MANAGER_BUILDUP_CHANCE_EDGE,
+                           MANAGER_PRESS_OPP_POSS_EDGE, MANAGER_PRESS_OPP_CHANCE_EDGE)
+    _b = (my_style or {}).get("style_buildup") or "MIXED"
+    _op = (opp_style or {}).get("style_press") or "MID_BLOCK"
+    poss = (MANAGER_BUILDUP_POSS_EDGE.get(_b, 0.0)
+            + MANAGER_PRESS_OPP_POSS_EDGE.get(_op, 0.0))
+    qual = (MANAGER_BUILDUP_CHANCE_EDGE.get(_b, 0.0)
+            + MANAGER_PRESS_OPP_CHANCE_EDGE.get(_op, 0.0))
+    # [2026-10 — 감독 모드 대비, 자리만] 공격 성향 축. 내 공격 성향 → 내 기회 품질,
+    # 상대 공격 성향 → 내 기회 품질(상대가 라인을 올리면 뒷공간). 표가 전부 0이라
+    # 지금은 결과가 그대로다 — 수치는 전술/관리 성향 효과 실험에서 정한다.
+    from constants import MANAGER_ATTACK_CHANCE_EDGE, MANAGER_ATTACK_OPP_CHANCE_EDGE
+    _a = (my_style or {}).get("style_attack") or "BALANCED"
+    _oa = (opp_style or {}).get("style_attack") or "BALANCED"
+    qual += (MANAGER_ATTACK_CHANCE_EDGE.get(_a, 0.0)
+             + MANAGER_ATTACK_OPP_CHANCE_EDGE.get(_oa, 0.0))
+    return poss, qual
+
+
+def timeline_minute(minute):
+    """내부 분 → 경기 상세 타임라인용 분 코드.
+
+    정규시간(1~96)은 그대로 둔다 — 91~96이 곧 타임라인의 "90+1~6"
+    (후반 추가시간)이라 기존 규칙과 정확히 맞는다. 연장만 위 베이스를
+    얹어서 어느 구간인지 잃어버리지 않게 한다."""
+    try:
+        m = int(minute)
+    except (TypeError, ValueError):
+        return minute
+    if m <= REG_MINUTES:
+        return m
+    if m <= REG_MINUTES + ET_HALF_MINUTES:
+        return TIMELINE_ET1_BASE + display_minute(m)
+    return TIMELINE_ET2_BASE + display_minute(m)
+
+
+def _pkey(p):
+    """선수 dict의 기록 키 — _pstat과 완전히 같은 규칙(id 없으면 파이썬 id)."""
+    k = p.get("id")
+    return k if k is not None else id(p)
+
+
+class _Stamina:
+    """한 경기 동안의 선수별 체력 상태. 선수 dict 자체는 건드리지 않고
+    (국제대회 등 호출부가 공유 dict를 넘길 수 있으므로) 키 기반으로만
+    관리한다. STAMINA_MODEL이 False면 모든 조회가 100/1.0을 돌려주는
+    무동작 모드가 된다 — A/B 계측용."""
+
+    __slots__ = ("val", "enabled")
+
+    def __init__(self, enabled=True):
+        self.val = {}
+        self.enabled = bool(enabled)
+
+    def ensure(self, p, start=100.0):
+        if p is None:
+            return
+        self.val.setdefault(_pkey(p), float(start))
+
+    def get(self, p):
+        if p is None:
+            return 100.0
+        return self.val.get(_pkey(p), 100.0)
+
+    def perf(self, p):
+        """체력이 경기력에 주는 배수(1.0 = 영향 없음)."""
+        if not self.enabled or p is None:
+            return 1.0
+        st = self.val.get(_pkey(p))
+        if st is None or st >= STAMINA_FRESH_FLOOR:
+            return 1.0
+        return max(STAMINA_PERF_MIN,
+                   1.0 - (STAMINA_FRESH_FLOOR - st) * STAMINA_PERF_COEF)
+
+    def drain_minute(self, zoned, had_possession, is_extra):
+        """그 팀 11명의 체력을 1분치 깎는다.
+
+        had_possession: 이번 분에 그 팀이 볼을 가졌는지(공격 가담 쪽이 더
+        소모) — 활동량 반영. is_extra면 연장 배수를 곱한다.
+        """
+        if not self.enabled:
+            return
+        et = STAMINA_ET_MULT if is_extra else 1.0
+        for z in zoned:
+            p = z["player"]
+            if p is None:
+                continue
+            k = _pkey(p)
+            cur = self.val.get(k)
+            if cur is None:
+                cur = 100.0
+            # 체력 능력치가 높으면 덜 빠진다(50 → 0.93, 90 → 0.72, 30 → 1.14).
+            stat = p.get("stamina", 50) or 50
+            mult = max(0.55, 1.35 - 0.007 * float(stat))
+            mult *= STAMINA_POS_MULT.get(z["pos"], 1.0)
+            # 활동량 — 볼을 가진 쪽은 공격 라인이, 없는 쪽은 수비 라인이
+            # 더 많이 뛴다고 본다.
+            third = z["third"]
+            if had_possession:
+                if third in ("ATT", "MID"):
+                    mult *= 1.06
+            else:
+                if third in ("DEF", "MID"):
+                    mult *= 1.06
+            self.val[k] = max(0.0, cur - STAMINA_DRAIN_BASE * mult * et)
+
+
+def _player_attack_value(p):
+    return (p.get("shooting", 50) * 0.35 + p.get("dribbling", 50) * 0.30
+            + p.get("passing", 50) * 0.35)
+
+
+def _player_defense_value(p):
+    return (p.get("tackling", 50) * 0.45 + p.get("positioning", 50) * 0.35
+            + p.get("strength", 50) * 0.20)
+
+
+def _attack_quality(players):
+    return _avg(_player_attack_value(p) for p in players)
+
+
+def _defense_quality(players):
+    return _avg(_player_defense_value(p) for p in players)
+
+
+def _midfield_quality(players, perf=None):
+    return _avg((p.get("passing", 50) * 0.35 + p.get("positioning", 50) * 0.30
+                 + p.get("dribbling", 50) * 0.20 + p.get("stamina", 50) * 0.15)
+                * (perf(p) if perf else 1.0)
+                for p in players)
+
+
+# [2026-09 신설, 신민용+GPT 설계: "포메이션을 11명의 배치로만 보지 말고
+# 팀 능력이 어느 방향(레인)으로 분배되는지를 보라"] 포지션별로 L/C/R
+# 공격·수비 레인에 얼마나 기여하는지 — 공격 기여와 수비 기여를 분리한다
+# (예: LW는 공격은 L에 강하게 기여하지만 수비는 L을 LB만큼 책임지지
+# 않는다). 1차 구현값이라 정확한 숫자는 헤드리스 검증 후 조정 대상.
+# att[ln]/dfn[ln] 계산 시 가중평균(weighted_sum/total_weight)으로 정규화
+# 하므로, 특정 레인에 선수가 몇 명 배치되든 "그 레인 평균 기여도"만
+# 반영되고 인원수 자체가 무한 보너스가 되지는 않는다 — 포메이션 차이는
+# "누가 그 레인에 얼마나 기여하는가"의 가중치 분포 변화로만 나타난다.
+ATT_LANE_AFFINITY = {
+    "LW":  {"L": 1.00, "C": 0.10, "R": 0.00},
+    "RW":  {"L": 0.00, "C": 0.10, "R": 1.00},
+    "ST":  {"L": 0.10, "C": 1.00, "R": 0.10},
+    "CF":  {"L": 0.10, "C": 1.00, "R": 0.10},
+    "CAM": {"L": 0.15, "C": 1.00, "R": 0.15},
+    "LM":  {"L": 0.75, "C": 0.30, "R": 0.00},
+    "RM":  {"L": 0.00, "C": 0.30, "R": 0.75},
+    "CM":  {"L": 0.15, "C": 0.70, "R": 0.15},
+    "CDM": {"L": 0.05, "C": 0.85, "R": 0.05},
+    "LB":  {"L": 0.45, "C": 0.10, "R": 0.00},
+    "RB":  {"L": 0.00, "C": 0.10, "R": 0.45},
+    "LWB": {"L": 0.75, "C": 0.15, "R": 0.00},
+    "RWB": {"L": 0.00, "C": 0.15, "R": 0.75},
+    "CB":  {"L": 0.05, "C": 0.55, "R": 0.05},
+    "GK":  {"L": 0.00, "C": 0.00, "R": 0.00},
 }
-COUNTER_MULT = {"short": 0.45, "fwd": 1.6, "through": 2.2, "drib": 1.4, "long": 0.8}
-GK_SHORT_P = {"POSSESSION": 0.80, "MIXED": 0.60, "DIRECT": 0.30}
 
-# ── 기본 성공률·기울기(설계 3-2, 5-1) ─────────────────────────────────
-B_SHORT, B_FWD, B_LONG_ACC, B_THROUGH, B_DRIB, B_CROSS_ACC = 0.90, 0.74, 0.80, 0.33, 0.55, 0.50
-B_RECV_TACKLE = 0.42          # 압박 속 수신 경합에서 수비가 이길 기본 확률
-K_PASS, K_DUEL, K_SHOT, K_GK = 0.15, 0.25, 0.15, 0.15
-PRESS_PASS_K = 1.2            # 압박 0.5 기준 ±만큼 패스 logit 감소
-ZONE_PASS_ADJ = {D3: 0.3, M3: 0.0, A3: -0.5, BOX: -0.7}   # 상대 진영일수록 공간이 좁다(logit)
-MAN_ADV = 0.18                # 인원 차 1명당 공격 경합 logit
-COUNTER_ADV = 0.35            # 역습(수비 정렬 안 됨) 공격 경합 logit
-AERIAL_DEF_EDGE = 0.25        # 공중볼 — 자리 잡은 수비 쪽 유리
-
-# 압박 강도(수비팀 성향 × 공격팀 기준 구역)
-PRESS_TAB = {
-    "HIGH_PRESS": {D3: 0.75, M3: 0.60, A3: 0.50, BOX: 0.60},
-    "MID_BLOCK":  {D3: 0.35, M3: 0.60, A3: 0.55, BOX: 0.60},
-    "LOW_BLOCK":  {D3: 0.15, M3: 0.40, A3: 0.65, BOX: 0.70},
+DEF_LANE_AFFINITY = {
+    "LB":  {"L": 1.00, "C": 0.10, "R": 0.00},
+    "RB":  {"L": 0.00, "C": 0.10, "R": 1.00},
+    "LWB": {"L": 0.90, "C": 0.15, "R": 0.00},
+    "RWB": {"L": 0.00, "C": 0.15, "R": 0.90},
+    "CB":  {"L": 0.15, "C": 1.00, "R": 0.15},
+    "CDM": {"L": 0.10, "C": 0.75, "R": 0.10},
+    "CM":  {"L": 0.15, "C": 0.55, "R": 0.15},
+    "LM":  {"L": 0.55, "C": 0.25, "R": 0.00},
+    "RM":  {"L": 0.00, "C": 0.25, "R": 0.55},
+    "CAM": {"L": 0.05, "C": 0.25, "R": 0.05},
+    "LW":  {"L": 0.20, "C": 0.05, "R": 0.00},
+    "RW":  {"L": 0.00, "C": 0.05, "R": 0.20},
+    "ST":  {"L": 0.02, "C": 0.10, "R": 0.02},
+    "CF":  {"L": 0.02, "C": 0.10, "R": 0.02},
+    "GK":  {"L": 0.00, "C": 0.00, "R": 0.00},
 }
-RECV_DUEL = 0.005              # 패스를 받는 순간 수비가 태클 경합을 거는 확률(× 압박)
-RECV_FOUL = 0.038             # 받는 순간 밀기·잡아채기 파울(× 압박) — 태클 없는 파울
-# 패스 실패의 결과 — (가로채기, 걷어내기, 볼 회수(기록 없음), 루즈볼, 아웃). 목표 구역별.
-FAIL_SPLIT = {"low": (0.18, 0.00, 0.57, 0.10, 0.15), "high": (0.18, 0.18, 0.39, 0.05, 0.20)}
-
-# ── 사건 확률 ─────────────────────────────────────────────────────────
-FOUL_TACKLE = 0.20            # 태클 경합(드리블·수신 압박)에서 수비가 지거나 무리할 때 파울
-FOUL_AERIAL = 0.05
-TACTICAL_FOUL = 0.06          # 역습 저지용 전술 파울(역습 행동마다)
-BOX_FOUL_MULT = 0.15          # 박스 안에서는 PK를 피하려고 훨씬 조심한다
-OFF_FWD_BOX, OFF_LONG, OFF_THROUGH = 0.035, 0.08, 0.13
-ADV_AFTER_DRIB = {D3: 0.45, M3: 0.45, A3: 0.35}
-BACK_PASS = {M3: 0.12, A3: 0.15}
-GK_CLAIM_CROSS = 0.08
-LONG_AERIAL = 0.40            # 정확한 롱볼 중 공중 경합이 되는 비율
-BOX_PASS_PEN = 0.6            # 박스 안으로 넣는 패스는 수비가 촘촘해 더 어렵다(logit)
-CROSS_AIR_DEF_EDGE = 0.20     # 크로스 공중볼 — 박스 안 수비·GK 위치 이점(추가 logit)
-HEADER_SHOT_P = 0.50          # 크로스 공중볼을 이긴 뒤 바로 헤더 슈팅(나머지는 떨궈 이어감)
-SHORT_CORNER = 0.15
-INJURY_PER_MIN = 0.004
-
-# ── 슈팅(설계 3-2 슈팅) ──────────────────────────────────────────────
-XG_BASE = {"one_v_one": 0.36, "cutback": 0.16, "box_dribble": 0.16, "box": 0.11, "header": 0.10,
-           "corner_header": 0.08, "rebound": 0.28, "long": 0.035, "far": 0.015, "fk": 0.065,
-           "pk": 0.76}
-BLOCK_P = {"one_v_one": 0.05, "cutback": 0.15, "box_dribble": 0.18, "box": 0.22, "header": 0.05,
-           "corner_header": 0.06, "rebound": 0.20, "long": 0.30, "far": 0.30, "fk": 0.22, "pk": 0.0}
-ON_BASE = {"one_v_one": 0.60, "cutback": 0.48, "box_dribble": 0.48, "box": 0.46, "header": 0.37,
-           "corner_header": 0.35, "rebound": 0.47, "long": 0.36, "far": 0.28, "fk": 0.37, "pk": 0.85}
-XG_SCALE = 0.78
-HOME_EDGE = 1.2               # home_adv(기본 3.0) × 이 값만큼 홈 선수 합성값 +
-FORM_SCALE = 0.6
-
-# ── 시간(초) — 설계 4장 ──────────────────────────────────────────────
-T_ACT = {"short": (2, 4.5), "fwd": (3, 6), "long": (4, 7), "through": (3, 6), "drib": (2, 5),
-         "cross": (2, 4), "shot": (1, 2), "loose": (2, 4), "gk": (4, 9)}
-T_DEAD = {"throw": (12, 20), "goalkick": (18, 28), "corner": (25, 35), "fk": (20, 40),
-          "fk_danger": (40, 60), "pk": (45, 70), "goal": (50, 70), "sub": (20, 30), "card": (15, 30),
-          "offside": (15, 25), "injury": (60, 120)}
-HALF_SEC, ET_SEC = 45 * 60, 15 * 60
-
-_SUB_DECISION = (56, 62, 68, 74, 80, 86, REG_MINUTES + 8, REG_MINUTES + ET_HALF_MINUTES + 8)
-_SLOT_PEN = (0, 5, 9, 13, 13)
-_WIDE = ("LB", "RB", "LWB", "RWB", "LM", "RM", "LW", "RW")
-
-# 행동 주체 고르기 — (구역, 역할) 가중치. 역할은 GK/DEF/MID/ATT.
-ATT_ROLE_W = {D3: {"GK": 0.25, "DEF": 1.0, "MID": 0.8, "ATT": 0.15},
-              M3: {"GK": 0.0, "DEF": 0.55, "MID": 1.0, "ATT": 0.45},
-              A3: {"GK": 0.0, "DEF": 0.25, "MID": 0.9, "ATT": 1.0},
-              BOX: {"GK": 0.0, "DEF": 0.12, "MID": 0.6, "ATT": 1.0}}
-DEF_ROLE_W = {D3: {"GK": 0.0, "DEF": 0.15, "MID": 0.7, "ATT": 1.0},
-              M3: {"GK": 0.0, "DEF": 0.5, "MID": 1.0, "ATT": 0.45},
-              A3: {"GK": 0.0, "DEF": 1.0, "MID": 0.8, "ATT": 0.15},
-              BOX: {"GK": 0.0, "DEF": 1.0, "MID": 0.45, "ATT": 0.08}}
 
 
-def _logit(p):
-    p = min(0.999, max(0.001, p))
-    return math.log(p / (1.0 - p))
+def _lane_quality(zoned, ln, affinity_table, value_fn):
+    """affinity_table(포지션→레인 기여도)로 가중평균한 그 레인의 실질
+    퀄리티. affinity가 0인 선수는 그 레인 계산에서 완전히 빠진다(가중치
+    0). 분모(total_w)로 나누는 가중평균이라 그 레인에 선수가 많다고
+    무조건 값이 커지지 않는다 — 포메이션 차이는 "누가 얼마나 기여하는가"
+    분포로만 나타난다."""
+    total_w = 0.0
+    total_val = 0.0
+    for z in zoned:
+        aff = affinity_table.get(z["pos"], {}).get(ln, 0.0)
+        if aff <= 0:
+            continue
+        total_val += value_fn(z["player"]) * aff
+        total_w += aff
+    return total_val / total_w if total_w > 0 else 50.0
 
 
-def _sig(x):
-    if x < -30:
-        return 0.0
-    if x > 30:
-        return 1.0
-    return 1.0 / (1.0 + math.exp(-x))
+def _gk_quality(gk, perf=None):
+    # [2026-09, 신민용+GPT 설계: "증폭이 여러 단계에 중복 적용되면 안 된다"]
+    # 이 함수의 결과는 (a) home.gk_q(현재는 boost 분배에만 쓰임 — 경기
+    # 결과에 미치는 영향이 미미함)와 (b) _resolve_shot의 opp_gk_q(슈터와
+    # 직접 맞대결하는 "결정력의 순간") 두 곳에 쓰인다. 비선형 변환은
+    # (b) 목적에 맞춘 것이므로, 여기서는 원래 raw stat을 그대로 반환하고
+    # _resolve_shot 쪽에서 opp_gk_q에 effective_stat()을 그 자리에서
+    # 적용한다(중복 적용 방지 — 아래 _resolve_shot 주석 참고).
+    if not gk:
+        return 50.0
+    return (gk.get("positioning", 50) * 0.5 + gk.get("concentration", 50) * 0.3
+            + gk.get("jump", 50) * 0.2) * (perf(gk) if perf else 1.0)
 
 
-L_SHORT, L_FWD, L_LONG_ACC, L_THROUGH = _logit(B_SHORT), _logit(B_FWD), _logit(B_LONG_ACC), _logit(B_THROUGH)
-L_DRIB, L_CROSS_ACC, L_RECV_TACKLE = _logit(B_DRIB), _logit(B_CROSS_ACC), _logit(B_RECV_TACKLE)
+# [2026-07 신설] 포지션별 boost(캐리 보너스) 채널 분배. 예전엔 포지션 구분
+# 없이 모든 포지션이 공격 0.6/수비 0.15/중원 0.5/GK 0.1로 똑같이 받아서,
+# 골키퍼가 아무리 OVR이 높아도 보너스의 90%가 공격·중원(본인이 관여 안 함)
+# 으로 새고 정작 세이브 능력(gk_q)엔 10%만 반영되는 문제가 있었다(사용자
+# 실측: OVR92 골키퍼가 팀평균 30후반 리그에서 전혀 안 먹힘). 이제 그
+# 포지션이 실제로 경기에 관여하는 영역에 보너스가 집중되도록 나눈다.
+# 각 값은 서로 다른 채널에 독립적으로 곱해지는 계수라 합이 1일 필요는
+# 없다(기존 방식과 동일한 구조) — 다만 그 포지션의 실제 영향력 분포를
+# 반영해 채널별 비중을 다르게 뒀다.
+POSITION_BOOST_WEIGHTS = {
+    "GK":  {"att": 0.00, "dfn": 0.15, "mid": 0.00, "gk": 0.90},
+    "CB":  {"att": 0.05, "dfn": 0.80, "mid": 0.15, "gk": 0.00},
+    "LB":  {"att": 0.15, "dfn": 0.65, "mid": 0.25, "gk": 0.00},
+    "RB":  {"att": 0.15, "dfn": 0.65, "mid": 0.25, "gk": 0.00},
+    "LWB": {"att": 0.25, "dfn": 0.55, "mid": 0.30, "gk": 0.00},
+    "RWB": {"att": 0.25, "dfn": 0.55, "mid": 0.30, "gk": 0.00},
+    "CDM": {"att": 0.10, "dfn": 0.35, "mid": 0.55, "gk": 0.00},
+    "CM":  {"att": 0.25, "dfn": 0.15, "mid": 0.65, "gk": 0.00},
+    "CAM": {"att": 0.45, "dfn": 0.05, "mid": 0.50, "gk": 0.00},
+    "LM":  {"att": 0.35, "dfn": 0.15, "mid": 0.55, "gk": 0.00},
+    "RM":  {"att": 0.35, "dfn": 0.15, "mid": 0.55, "gk": 0.00},
+    "LW":  {"att": 0.70, "dfn": 0.05, "mid": 0.30, "gk": 0.00},
+    "RW":  {"att": 0.70, "dfn": 0.05, "mid": 0.30, "gk": 0.00},
+    "CF":  {"att": 0.85, "dfn": 0.00, "mid": 0.20, "gk": 0.00},
+    "ST":  {"att": 0.85, "dfn": 0.00, "mid": 0.20, "gk": 0.00},
+}
+# 포지션을 모르거나 표에 없을 때 쓰는 폴백 — 기존(2026-07 이전) 분배값 그대로.
+_DEFAULT_BOOST_WEIGHTS = {"att": 0.6, "dfn": 0.15, "mid": 0.5, "gk": 0.1}
 
 
-def _g(p, k):
-    v = p.get(k)
-    return 50.0 if v is None else float(v)
+def _boost_weights_for(position):
+    return POSITION_BOOST_WEIGHTS.get(position, _DEFAULT_BOOST_WEIGHTS)
 
 
-class _PE:
-    """경기장 위 선수 한 명(그 순간의 합성 능력치 포함)."""
-    __slots__ = ("p", "pos", "lane", "third", "role", "pas", "prg", "run", "drb", "tck", "prs", "air",
-                 "crs", "sht", "hed", "blk", "gkq", "lin", "fk", "wide")
+class _TeamModel:
+    """한 팀의 레인별 공격/수비 퀄리티 + 중원 퀄리티 + GK 퀄리티를 미리
+    계산해 담아두는 그릇. boost는 '내 에이스가 팀을 끌어올리는 효과'를
+    수비/공격/중원 전역에 고르게 얹기 위한 값(game_engine._simulate_match가
+    이미 계산해둔 bonus를 그대로 받는다)."""
 
-    def __init__(self, z, perf, a_add, d_add, g_add):
-        p = self.p = z["player"]
-        self.pos, self.lane, self.third = z["pos"], z["lane"], z["third"]
-        self.role = "GK" if self.pos == "GK" else self.third
-        self.wide = self.pos in _WIDE
-        f = perf
-        pas, posi, conc, conf, ment = _g(p, "passing"), _g(p, "positioning"), _g(p, "concentration"), \
-            _g(p, "confidence"), _g(p, "mental")
-        spd, strg, jump, head = _g(p, "speed"), _g(p, "strength"), _g(p, "jump"), _g(p, "heading")
-        drb, tck, sho, sp = _g(p, "dribbling"), _g(p, "tackling"), _g(p, "shooting"), _g(p, "setpiece")
-        self.pas = (pas * 0.70 + conc * 0.15 + conf * 0.15) * f + a_add
-        self.prg = (pas * 0.60 + ment * 0.20 + posi * 0.20) * f + a_add
-        self.run = (posi * 0.60 + spd * 0.25 + conc * 0.15) * f + a_add
-        self.drb = (drb * 0.55 + spd * 0.25 + conf * 0.10 + strg * 0.10) * f + a_add
-        self.crs = (pas * 0.50 + sp * 0.30 + conc * 0.20) * f + a_add
-        self.sht = (sho * 0.60 + ment * 0.20 + conf * 0.20) * f + a_add
-        self.hed = (head * 0.70 + jump * 0.30) * f + a_add
-        self.fk = sp * f + a_add
-        self.tck = (tck * 0.50 + posi * 0.25 + spd * 0.25) * f + d_add
-        self.prs = (posi * 0.50 + tck * 0.30 + spd * 0.20) * f + d_add
-        self.blk = (posi * 0.60 + conc * 0.20 + strg * 0.20) * f + d_add
-        self.lin = (posi * 0.60 + conc * 0.40) * f + d_add
-        self.air = (head * 0.40 + jump * 0.40 + strg * 0.20) * f + (a_add + d_add) * 0.5
-        self.gkq = (posi * 0.5 + conc * 0.3 + jump * 0.2) * f + g_add
-
-
-class _Side:
-    def __init__(self, name, lineup, slots, bench, boost, bpos, style, form, home_add):
-        self.name = name
-        self.is_home = name == "home"
-        self.cur = list(lineup)
-        self.slots = slots
-        self.bench = [p for p in (bench or []) if p]
-        self.subs, self.used, self.windows, self.appear = [], 0, SUBS_MAX_WINDOWS, {}
-        self.sent = []
-        self.ps = {}
-        self.stats = {"shots": 0, "shots_on": 0, "corners": 0, "fouls": 0, "offsides": 0,
-                      "yellow_cards": 0, "red_cards": 0, "saves": 0}
-        self.detail = _new_stats_detail()
-        self.boost, self.bpos = boost, bpos
-        self.style = style or {}
-        self.buildup = self.style.get("style_buildup") or "MIXED"
-        self.press_style = self.style.get("style_press") or "MID_BLOCK"
-        self.attack = self.style.get("style_attack") or "BALANCED"
-        self.form = form
-        self.home_add = home_add
-        self.ents, self.gk = [], None
-        self.att_tab, self.def_tab = {}, {}
-        self.n_field, self.perf_avg, self.line_q, self.mid_q = 10, 1.0, 50.0, 50.0
-        self.inplay = 0.0
-        self.score = 0
-
-    def labels(self):
-        return self.slots or _FALLBACK_SLOTS
-
-
-def _build_tab(ents, role_w, aff_table, gk_lane_c=0.0):
-    tab = {}
-    for z in (D3, M3, A3, BOX):
-        rw = role_w[z]
+    def __init__(self, lineup, is_home, boost=0.0, boost_position=None, slot_labels=None,
+                 perf=None):
+        # perf: [2026-09 신설] 선수 dict → 체력에 따른 경기력 배수(1.0 = 영향
+        # 없음). 교체/체력 갱신 시점마다 이 모델을 다시 만들어서 그 시점의
+        # 체력이 레인 퀄리티에 반영되게 한다(_Stamina.perf 참고).
+        zoned = _assign_zones(lineup, is_home, slot_labels)
+        self.zoned = zoned
+        self.gk = next((z["player"] for z in zoned if z["pos"] == "GK"), None)
+        w = _boost_weights_for(boost_position) if boost else _DEFAULT_BOOST_WEIGHTS
+        if perf is not None:
+            _atk_fn = lambda _p: _player_attack_value(_p) * perf(_p)   # noqa: E731
+            _dfn_fn = lambda _p: _player_defense_value(_p) * perf(_p)  # noqa: E731
+        else:
+            _atk_fn, _dfn_fn = _player_attack_value, _player_defense_value
+        self.att = {}
+        self.dfn = {}
+        # [2026-09 신설, ATT_LANE_AFFINITY/DEF_LANE_AFFINITY 정의부 주석
+        # 참고] 예전엔 lane+third로 하드 배정된 선수들만 평균냈다(예:
+        # LW는 항상 L-ATT에만 잡히고 수비 계산엔 전혀 안 들어감) — 이제
+        # 전체 11명을 대상으로 포지션별 레인 기여도(affinity)로 가중평균
+        # 한다. third(DEF/MID/ATT) 하드 배정은 슈터 후보 풀 선정(third==
+        # "ATT")에는 그대로 쓰이므로 _assign_zones 자체는 안 바꾼다.
         for ln in LANES:
-            pop, cum, s = [], [], 0.0
-            for e in ents:
-                w = rw.get(e.role, 0.0)
-                if w <= 0:
-                    continue
-                if e.role == "GK":
-                    lw = 1.0 if ln == "C" else gk_lane_c
-                else:
-                    lw = aff_table.get(e.pos, {}).get(ln, 0.05) + 0.12
-                w *= lw
-                if w <= 0:
-                    continue
-                s += w
-                pop.append(e)
-                cum.append(s)
-            if not pop:
-                pop = [e for e in ents if e.role != "GK"] or list(ents)
-                cum = [float(i + 1) for i in range(len(pop))]
-            tab[(z, ln)] = (pop, cum)
-    return tab
+            self.att[ln] = _lane_quality(zoned, ln, ATT_LANE_AFFINITY, _atk_fn) + boost * w["att"]
+            self.dfn[ln] = _lane_quality(zoned, ln, DEF_LANE_AFFINITY, _dfn_fn) + boost * w["dfn"]
+        mid_players = [z["player"] for z in zoned if z["third"] == "MID"]
+        self.mid = _midfield_quality(mid_players, perf=perf) + boost * w["mid"]
+        self.gk_q = _gk_quality(self.gk, perf=perf) + boost * w["gk"]
 
 
-class _ChainMatch:
-    def __init__(self, home_lineup, away_lineup, home_boost, away_boost, home_boost_position,
-                 away_boost_position, home_adv, seed, home_formation, away_formation, home_bench,
-                 away_bench, extra_time, agg_home, agg_away, home_style, away_style, player_mods=None):
-        # 시드가 없으면 전역 random에서 시드를 하나 뽑는다 — 게임 전체 난수 흐름(세이브 재현성)과 이어지게.
-        self.rng = random.Random(seed) if seed is not None else random.Random(random.getrandbits(64))
-        # [G1] 선수별 카드 성향 보정 {선수 id: {"yellow_add", "red_add"}} — 내 선수 성격('폭력적') 등.
-        self.pmods = player_mods or {}
-        r = self.rng
-        from constants import FORMATION_SLOTS
-        hs = FORMATION_SLOTS.get(home_formation) if home_formation else None
-        as_ = FORMATION_SLOTS.get(away_formation) if away_formation else None
-        hf, af = r.gauss(0, _MATCH_FORM_SIGMA), r.gauss(0, _MATCH_FORM_SIGMA)
-        self.H = _Side("home", home_lineup, hs, home_bench, home_boost, home_boost_position, home_style,
-                       hf, HOME_EDGE * float(home_adv or 0.0))
-        self.A = _Side("away", away_lineup, as_, away_bench, away_boost, away_boost_position, away_style,
-                       af, 0.0)
-        self.extra_time, self.agg_home, self.agg_away = extra_time, agg_home, agg_away
-        self.stam = _Stamina(enabled=bool(STAMINA_MODEL))
-        self.plog, self.pass_acc = [], {}
-        self.half, self.sec, self.added = 1, 0.0, None
-        self.reg, self.end, self.whistle, self.half_len = HALF_SEC, None, False, {}
-        self.is_extra = False
-        self.half_delays = {"goals": 0, "subs": 0, "cards": 0, "inj": 0}
-        self.pending_sub_minutes = []
-        self.pending_dead = 0.0
-        self.last_min_int = 0
-        self.bip, self.dead = 0.0, 0.0
-        self.added_log = {}
-        self.next_rebuild_min = 5
-        for sd in (self.H, self.A):
-            labels = sd.labels()
-            for i, p in enumerate(sd.cur):
-                if p is None:
-                    continue
-                self.stam.ensure(p)
-                sd.appear[_pkey(p)] = {"player": p, "slot": (labels[i] if i < len(labels) else
-                                                            p.get("position", "CM")),
-                                       "slot_idx": i, "on": 0, "off": None, "started": True}
-            for p in sd.bench:
-                self.stam.ensure(p)
-        self.rebuild(self.H)
-        self.rebuild(self.A)
-        # 점유 상태
-        self.att = self.H
-        self.zone, self.lane, self.car = M3, "C", None
-        self.counter, self.ctx, self.assist_cand = 0, None, None
-        self.dead_ball = True
+def _pstat(player_stats, p):
+    """[2026-08 신설, 신민용 요청: "경기 시뮬레이션에 다른 선수들의 OVR·
+    스탯도 계산해서 정교한 결과를 뽑고, 경기 상세에서 22명 전원 평점을
+    보여달라"] player_stats(선수 id -> 개인 기록 누적 dict)에서 이 선수의
+    항목을 찾아 반환 — 없으면 0으로 초기화해 새로 만든다. id가 없는(가상
+    폴백) 선수는 객체 자체의 파이썬 id()를 키로 대신 써서 최소한 이번
+    한 경기 안에서는 같은 객체가 같은 기록으로 누적되게 한다."""
+    key = p.get("id")
+    if key is None:
+        key = id(p)
+    rec = player_stats.get(key)
+    if rec is None:
+        rec = {"shots": 0, "shots_on": 0, "goals": 0, "assists": 0,
+               "saves": 0, "goals_conceded": 0,
+               # [2026-10 설계 A] 선수 단위 사건
+               "fouls": 0, "fouled": 0, "yellow": 0, "red": 0, "offsides": 0,
+               "pk_won": 0, "pk_conceded": 0,
+               # [2026-10 설계 B-1] 팀 세부 통계를 선수에게 귀속(합계 = 팀 값)
+               "passes": 0, "passes_ok": 0, "key_passes": 0,
+               "crosses": 0, "crosses_ok": 0, "dribbles": 0, "dribbles_ok": 0,
+               "tackles": 0, "tackles_ok": 0, "interceptions": 0, "clearances": 0,
+               "blocks": 0, "aerials": 0, "aerials_won": 0, "big_chances_missed": 0}
+        player_stats[key] = rec
+    return rec
 
-    # ── 모델(합성 능력치·선택표) ──────────────────────────────────────
-    def other(self, sd):
-        return self.A if sd is self.H else self.H
 
-    def rebuild(self, sd):
-        w = _boost_weights_for(sd.bpos) if sd.boost else _DEFAULT_BOOST_WEIGHTS
-        base = sd.form * FORM_SCALE + sd.home_add
-        a_add = base + sd.boost * w["att"] + sd.boost * w["mid"] * 0.5
-        d_add = base + sd.boost * w["dfn"]
-        g_add = sd.form * 0.5 + sd.home_add + sd.boost * w["gk"]
-        zoned = _assign_zones(sd.cur, sd.is_home, sd.slots)
-        perf = self.stam.perf
-        ents = [_PE(z, perf(z["player"]), a_add, d_add, g_add) for z in zoned if z["player"] is not None]
-        sd.ents = ents
-        sd.gk = next((e for e in ents if e.pos == "GK"), None)
-        field = [e for e in ents if e.pos != "GK"]
-        sd.n_field = len(field)
-        sd.perf_avg = (sum(perf(e.p) for e in field) / len(field)) if field else 1.0
-        dl = [e.lin for e in field if e.third == "DEF"] or [e.lin for e in field] or [50.0]
-        sd.line_q = sum(dl) / len(dl)
-        ml = [e.prs for e in field if e.third == "MID"] or [e.prs for e in field] or [50.0]
-        sd.mid_q = sum(ml) / len(ml)
-        sd.att_tab = _build_tab(ents, ATT_ROLE_W, ATT_LANE_AFFINITY, 0.3)
-        sd.def_tab = _build_tab(ents, DEF_ROLE_W, DEF_LANE_AFFINITY, 0.0)
+def _new_stats_detail():
+    """[2026-09 신설] "표시용" team_stats(점유율/슈팅/유효슈팅/코너/파울/
+    패스성공률/오프사이드/카드/세이브 — 10개, 실제 중계화면 느낌)와 별도로
+    엔진 내부에서 계산해두는 세부 통계 그릇. 화면엔 기본적으로 안 뿌리고
+    (나중에 선수 통계·분석 등에 재활용하기 위해) 같이 저장만 해둔다.
 
-    def pick(self, tab, z, ln, exclude=None):
-        pop, cum = tab[(z, ln)]
-        r = self.rng
-        e = r.choices(pop, cum_weights=cum, k=1)[0]
-        if exclude is not None and e is exclude and len(pop) > 1:
-            for _ in range(3):
-                e = r.choices(pop, cum_weights=cum, k=1)[0]
-                if e is not exclude:
-                    break
+    전부 기존 분당 시뮬레이션 루프(shot_chance/corner_chance/foul_chance로
+    스코어를 결정하는 그 로직)는 손대지 않고, 그 결과에 병렬로 얹어서
+    누적한다 — 경기 결과에 영향을 주지 않으므로 속도·밸런스 둘 다 그대로."""
+    return {
+        "passes": 0, "passes_ok": 0,
+        "crosses": 0, "crosses_ok": 0,
+        "tackles": 0, "tackles_ok": 0,
+        "interceptions": 0, "clearances": 0, "blocks": 0,
+        "aerial_duels": 0, "aerial_duels_ok": 0,
+        "dribbles": 0, "dribbles_ok": 0,
+        "turnovers_won": 0, "turnovers_lost": 0,
+        "final_third_entries": 0, "box_entries": 0,
+        "big_chances": 0, "big_chances_missed": 0,
+        "xg": 0.0, "xa": 0.0,
+        "woodwork": 0, "free_kicks": 0, "penalties": 0,
+        "save_pct": 0.0,
+    }
+
+
+def _resolve_shot(rng, side, lane, minute, shooter_pool, opp_gk, opp_gk_q,
+                   home_stats, away_stats, home_player_stats, away_player_stats, plog,
+                   home_detail, away_detail, shooter_mults=None, perf_of=None,
+                   forced_shooter=None, kind="open", on_corner=None, pick_def=None):
+    """슈팅 하나를 판정해서 team_stats/possession_log/선수별 개인 기록
+    (슈팅·유효슈팅·골·도움·선방·실점)을 함께 갱신한다.
+    반환값: 골이 들어갔으면 "home"/"away", 아니면 None.
+
+    [2026-08 확장] 예전엔 shooter_pool에서 슈팅 스탯 가중으로 슈터를
+    뽑아놓고도 그 신원을 결과에 전혀 남기지 않았다(팀+결과만 기록) —
+    이제 그 선수 개인 기록에 직접 누적한다. 어시스트는 완전한 패스체인
+    시뮬레이션 대신, 골이 들어갔을 때 같은 레인 공격 풀에서 슈터를 뺀
+    나머지를 패스 능력 가중으로 뽑아 일정 확률로 붙이는 근사치다.
+
+    [2026-09 확장, xG/xA] on_target_p(유효슈팅 확률)*(1-save_p)(안 막힐
+    확률)를 "이 슈팅의 결과가 나오기 전 기대 득점(xG)"으로 그대로 쓴다 —
+    이미 계산해두는 값이라 추가 비용이 없다. xA는 신민용 확정 설계대로
+    "그 슈팅의 xG를 마지막 기여자에게 배분": 실제 어시스트가 붙으면 그
+    도움 선수에게, 골로 안 이어진 유효슈팅도 일정 확률로 "키패스"를 굴려
+    같은 방식으로 배분한다(어시스트 기록 없이도 창조적 기여를 평가할 수
+    있게 하기 위함, 향후 개인 스탯 확장 대비)."""
+    stats = home_stats if side == "home" else away_stats
+    detail = home_detail if side == "home" else away_detail
+    opp_detail = away_detail if side == "home" else home_detail
+    my_pstats = home_player_stats if side == "home" else away_player_stats
+    opp_pstats = away_player_stats if side == "home" else home_player_stats
+    stats["shots"] += 1
+    detail["final_third_entries"] += 1
+    detail["box_entries"] += 1
+
+    # [2026-09] shooter_mults는 "이 레인에서 그 선수가 마무리를 맡을 상대적
+    # 빈도"(최전방 같은 레인 1.0 / 같은 레인 미드 0.42 / 옆 레인 공격 0.30 /
+    # 옆 레인 미드 0.12) — _prep_side 주석 참고. 안 넘기면 예전처럼 결정력
+    # 가중만 쓴다. rng.choices 호출 횟수는 그대로다.
+    # [2026-10 설계 A] 세트피스(kind="pk"/"fk"/"corner")는 차는 선수가 정해져 있다 — 호출부가
+    # forced_shooter로 넘기면 무작위로 뽑지 않는다.
+    if forced_shooter is not None:
+        shooter = forced_shooter
+    elif shooter_pool:
+        if shooter_mults and len(shooter_mults) == len(shooter_pool):
+            weights = [max(0.05, effective_stat(p.get("shooting", 50)) * m)
+                       for p, m in zip(shooter_pool, shooter_mults)]
+        else:
+            weights = [max(1.0, effective_stat(p.get("shooting", 50))) for p in shooter_pool]
+        shooter = rng.choices(shooter_pool, weights=weights, k=1)[0]
+    else:
+        shooter = None
+    # [2026-09] 체력은 "결정력의 순간"에도 들어간다 — 지친 공격수의 마무리,
+    # 지친 GK의 선방이 실제로 나빠져야 교체에 의미가 생긴다(perf_of는
+    # _Stamina.perf, 체력 모델이 꺼져 있으면 항상 1.0).
+    _shot_attr = "heading" if kind == "corner" else ("setpiece" if kind in ("fk", "pk") else "shooting")
+    _raw_shot = (shooter.get(_shot_attr) or shooter.get("shooting", 50)) if shooter else 50
+    shot_stat = effective_stat(_raw_shot)
+    if perf_of is not None and shooter is not None:
+        shot_stat *= perf_of(shooter)
+    if shooter is not None:
+        _pstat(my_pstats, shooter)["shots"] += 1
+
+    # [2026-09, 신민용+GPT 설계: "증폭은 한 지점에서만"] opp_gk_q는
+    # _gk_quality()가 raw로 넘겨준 값 — 슈터와 정확히 같은 "결정력의 순간"
+    # 비교이므로 여기서 딱 한 번만 effective_stat을 적용한다(호출부인
+    # _TeamModel.gk_q 자체는 raw로 남겨 boost 분배 등 다른 용도에 중복
+    # 증폭이 새지 않게 한다).
+    eff_gk_q = effective_stat(opp_gk_q)
+    # [2026-09 재조정, 위 lane quality /24.0과 동일한 실측 근거] 150/120도
+    # 같은 이유로 과민했다 — effective_stat 변환(80+ 구간에서 값이 커짐)이
+    # 여기 들어오면서 기존 나눗값 그대로 두면 이중으로 민감해진다. 240/210
+    # 으로 넓혀서 "결정력 격차가 큰 의미를 갖되, 경기가 사실상 결정론이
+    # 되지는 않는" 지점을 실측으로 찾았다(90 vs 105 극단 매치업에서도
+    # 원정 100% 승리는 아님, 85+스타1명 캐리 시나리오도 검증됨).
+    on_target_p = max(0.15, min(0.78, 0.30 + (shot_stat - 50) / 240.0))
+    save_p = max(0.08, min(0.90, _SHOT_SAVE_BASE + (eff_gk_q - shot_stat) / 210.0))
+    # [2026-10 설계 A] 세트피스 슈팅의 성격 — PK는 거의 골문 안으로 가고 막히기 어렵다,
+    # 직접 프리킥은 벽 때문에 골문 안으로 가기 어렵다, 코너 헤더는 정확도가 떨어진다.
+    if kind == "pk":
+        on_target_p = max(0.70, min(0.92, 0.84 + (shot_stat - 50) / 600.0))
+        save_p = max(0.10, min(0.35, 0.22 + (eff_gk_q - shot_stat) / 600.0))
+    elif kind == "fk":
+        on_target_p *= 0.55
+        save_p = min(0.95, save_p + 0.10)
+    elif kind == "corner":
+        on_target_p *= 0.75
+        save_p = min(0.95, save_p + 0.05)
+    _sid = shooter.get("id") if shooter is not None else None
+    _gkid = opp_gk.get("id") if opp_gk is not None else None
+    shot_xg = round(on_target_p * (1.0 - save_p), 4)
+    detail["xg"] += shot_xg
+    is_big_chance = shot_xg >= 0.35
+
+    if rng.random() >= on_target_p:
+        # [세분화] 빗나간 슈팅 중 일부는 "완전히 벗어남"이 아니라 "골대를
+        # 맞고 나감"으로 표시만 더 얹는다 — 유효슈팅/스코어 판정은 그대로.
+        if rng.random() < 0.05:
+            detail["woodwork"] += 1
+        if is_big_chance:
+            detail["big_chances"] += 1
+            detail["big_chances_missed"] += 1
+            if shooter is not None:
+                _pstat(my_pstats, shooter)["big_chances_missed"] += 1
+        plog.append({"min": float(minute), "team": side, "zone": "att", "lane": lane,
+                     "outcome": "shot_off", "me": False, "text": None,
+                     "kind": kind, "shooter_id": _sid, "xg": shot_xg})
+        return None
+
+    stats["shots_on"] += 1
+    if shooter is not None:
+        _pstat(my_pstats, shooter)["shots_on"] += 1
+    if rng.random() < save_p:
+        # 유효슈팅이 막힘 — 그중 일부는 "수비수 블록"으로 더 세분화하고
+        # (상대 수비 기여 스탯), 골로 이어지지 않았어도 그 장면을 만든
+        # 선수에게 키패스/xA를 확률적으로 인정한다.
+        _blocked = rng.random() < 0.30
+        _blocker_id = None
+        if _blocked:
+            opp_detail["blocks"] += 1
+            # [2026-10 설계 B-1] 블록한 수비수(그 레인을 지키는 선수 가중)
+            _bl = pick_def(lane) if pick_def is not None else None
+            if _bl is not None:
+                _pstat(opp_pstats, _bl)["blocks"] += 1
+                _blocker_id = _bl.get("id")
+        if opp_gk is not None:
+            _pstat(opp_pstats, opp_gk)["saves"] += 1
+        if is_big_chance:
+            detail["big_chances"] += 1
+            detail["big_chances_missed"] += 1
+            if shooter is not None:
+                _pstat(my_pstats, shooter)["big_chances_missed"] += 1
+        _kp_id = None
+        if shooter_pool and len(shooter_pool) > 1 and rng.random() < 0.35:
+            detail["xa"] += shot_xg
+            # [2026-10 설계 B-1] 그 장면을 만든 키패스 선수(같은 레인 배수·패스 가중)
+            _kz = [(p_, m_) for p_, m_ in zip(shooter_pool, shooter_mults or [1.0] * len(shooter_pool))
+                   if p_ is not shooter]
+            if _kz:
+                _kp = rng.choices([p_ for p_, _m in _kz],
+                                  weights=[max(0.05, (p_.get("passing") or 50) * _m) for p_, _m in _kz], k=1)[0]
+                _pstat(my_pstats, _kp)["key_passes"] += 1
+                _kp_id = _kp.get("id")
+        plog.append({"min": float(minute), "team": side, "zone": "att", "lane": lane,
+                     "outcome": "save", "me": False, "text": None,
+                     "kind": kind, "shooter_id": _sid, "gk_id": _gkid, "xg": shot_xg,
+                     "big_chance": bool(is_big_chance), "blocker_id": _blocker_id,
+                     "key_pass_id": _kp_id})
+        # [2026-10 설계 A] 막힌 공이 라인 밖으로 나가면 코너킥 — 코너는 이제 "실제 장면의 결과"로 생긴다.
+        if on_corner is not None and rng.random() < (CORNER_FROM_BLOCK if _blocked else CORNER_FROM_SAVE):
+            on_corner(side, lane, minute)
+        return None
+
+    # 골.
+    if is_big_chance:
+        detail["big_chances"] += 1
+    _goal_rec = {"min": float(minute), "team": side, "zone": "att", "lane": lane,
+                 "outcome": "goal", "me": False, "text": None,
+                 "scorer_id": _sid, "kind": kind, "gk_id": _gkid, "xg": shot_xg}
+    plog.append(_goal_rec)
+    if shooter is not None:
+        _pstat(my_pstats, shooter)["goals"] += 1
+    if opp_gk is not None:
+        _pstat(opp_pstats, opp_gk)["goals_conceded"] += 1
+    # PK·직접 프리킥 골엔 도움이 없다(현실 규칙).
+    if kind not in ("pk", "fk") and shooter_pool and len(shooter_pool) > 1 and rng.random() < 0.62:
+        # 도움도 같은 레인 배수를 반영한다 — 안 그러면 옆 레인 미드필더가
+        # 패스 스탯만으로 도움 1위가 되어버린다.
+        _cz = list(zip(shooter_pool, shooter_mults)) if (
+            shooter_mults and len(shooter_mults) == len(shooter_pool)) else [
+            (p, 1.0) for p in shooter_pool]
+        creator_pool = [p for p, _m in _cz if p is not shooter]
+        _cmults = [_m for p, _m in _cz if p is not shooter]
+        if creator_pool:
+            weights2 = [max(0.05, p.get("passing", 50) * m)
+                        for p, m in zip(creator_pool, _cmults)]
+            creator = rng.choices(creator_pool, weights=weights2, k=1)[0]
+            _pstat(my_pstats, creator)["assists"] += 1
+            _pstat(my_pstats, creator)["key_passes"] += 1     # 도움은 곧 키패스
+            detail["xa"] += shot_xg
+            _goal_rec["assist_id"] = creator.get("id")
+    return side
+
+
+def _lineup_avg_ovr(lineup):
+    vals = [p.get("ovr", 50) for p in lineup if p is not None]
+    return sum(vals) / len(vals) if vals else 50.0
+
+
+def _build_player_ratings(lineup, player_stats, gf, ga, gk, rng, slot_labels=None,
+                          appear=None, total_minutes=None, ledger=None):
+    """[2026-08 신설] 경기 종료 후 이 팀 11명 전원(라인업 슬롯 순서 그대로,
+    빈 슬롯은 None)의 개인 기록 + 평점을 만든다.
+
+    평점 공식은 game_engine._player_perf(내 선수 전용 평점)와 같은
+    발상 — 기본값에서 시작해 팀 결과/개인 기여/포지션별 특성을 더하고
+    빼는 방식 — 을 22명 전체로 일반화한 것이다. 다만 이 엔진은 개별
+    수비 액션(태클 성공/실패 등)까지는 분 단위로 추적하지 않으므로,
+    비GK 필드 플레이어의 평점은 "팀 결과 + 그 선수의 골/도움 기여 +
+    그 선수 OVR이 이 라인업 평균보다 얼마나 높은가(에이스는 골이 없어도
+    경기를 지배한 것으로 봄)"를 근거로 삼는다 — 완전한 개인 이벤트
+    로그가 아니라 근사치라는 점은 명확히 해둔다.
+
+    [2026-08 버그수정, 신민용 리포트: "라인업 평점에 뜨는 이름이
+    AI0JP8이 아니라 names.py에서 뽑힌 실제 이름이다"] ai_players.name은
+    data/names.py에서 뽑은 내부 시드값일 뿐, 화면에는 항상 마스킹된
+    표시명(ui/formation_widget._mask_ai_names와 완전히 동일한 규칙 —
+    사용자가 직접 지어준 커스텀 이름이 있으면 그걸, 없으면
+    constants.ai_player_code로 만든 "AI"+코드)을 써야 한다. 이 값은
+    실제로 존재하는 그 선수(가상으로 지어낸 게 아니라 그 팀 로스터에서
+    _select_lineup이 실제로 뽑은 ai_players 레코드)이고, 문제는 이름
+    '표시' 단계뿐이었다.
+
+    [2026-09 버그수정, 신민용 리포트: "포메이션이 5-2-3인데 라인업
+    화면엔 4-2-2-2로 뜬다"] _assign_zones와 같은 이유로, 여기 출력되는
+    각 선수의 "position"도 실제 포메이션과 무관하게 항상 _FALLBACK_SLOTS
+    (4-4-2 라벨)로 찍히고 있었다 — ui/match_detail_dialog.py의 라인업
+    평점·포메이션 시각화가 이 값을 그대로 보여주므로 화면에 실제
+    포메이션과 다른 모양이 떴다. slot_labels(호출부가 이 lineup을 뽑을
+    때 쓴 실제 FORMATION_SLOTS[formation])를 받으면 그걸 쓰고, 안
+    받으면 예전처럼 _FALLBACK_SLOTS로 폴백한다."""
+    labels = slot_labels if slot_labels else _FALLBACK_SLOTS
+    # [2026-09 확장 — 교체 선수 포함] appear가 있으면 "이 경기에 실제로
+    # 나온 모든 선수"(선발 11 + 교체 투입)를 대상으로 만든다. 선발은 슬롯
+    # 순서를 그대로 유지하고(화면의 포메이션 시각화가 인덱스에 의존),
+    # 교체 투입 선수는 그 뒤에 투입 시각 순으로 붙인다.
+    subs_extra = []
+    if appear:
+        subs_extra = sorted(
+            (a for a in appear.values() if not a.get("started")),
+            key=lambda a: (a.get("on") or 0, str(a.get("slot"))))
+    real_ids = [p.get("id") for p in lineup if p is not None and p.get("id") is not None]
+    real_ids += [a["player"].get("id") for a in subs_extra
+                 if a["player"] is not None and a["player"].get("id") is not None]
+    try:
+        from database import get_ai_player_custom_names
+        custom_names = get_ai_player_custom_names(real_ids) if real_ids else {}
+    except Exception:
+        custom_names = {}
+    from constants import ai_player_code
+
+    def _display_name(pl):
+        pid = pl.get("id")
+        if pid is None:
+            return pl.get("name", "") or "AI"
+        # [2026-10 버그수정, 신민용 리포트: "경기 상세에 내 선수 이름이 AI0000으로 뜬다"]
+        # 체인 엔진은 내 선수를 id = MY_SIM_PLAYER_ID(-1)로 넣는데, 음수 id도 AI 코드로
+        # 바꾸면 ai_player_code의 폴백값 "AI0000"이 된다 — 내 선수는 dict의 실제 이름을 쓴다.
+        if pid < 0:
+            return pl.get("name", "") or "나"
+        return custom_names.get(pid) or ai_player_code(pid)
+
+    avg_ovr = _lineup_avg_ovr(lineup)
+    clean_sheet = (ga == 0)
+    result_mod = 0.45 if gf > ga else (-0.35 if gf < ga else 0.0)
+    _tot = max(1, int(total_minutes or REG_MINUTES))
+
+    def _entry(p, label, is_gk, mins, started, on_min, off_min):
+        key = _pkey(p)
+        pstat = player_stats.get(key, {})
+        # [2026-09] 27분만 뛴 교체 선수에게 90분 뛴 선수와 똑같은 팀 결과
+        # 보정(result_mod)·완봉 보너스를 주면 안 된다 — 출전시간 비중으로
+        # 깎는다(골/도움/선방은 실제 기록이므로 그대로 만점 반영).
+        share = max(0.0, min(1.0, mins / float(_tot)))
+        _w = share ** 0.5 if started is False else 1.0
+        base = 6.3 + result_mod * _w
+        base += max(-0.6, min(0.6, (p.get("ovr", 50) - avg_ovr) / 40.0)) * _w
+        base += pstat.get("goals", 0) * 0.75
+        base += pstat.get("assists", 0) * 0.4
+        base += max(0, pstat.get("shots_on", 0) - pstat.get("goals", 0)) * 0.05
+        if is_gk:
+            base += pstat.get("saves", 0) * 0.12
+            conceded = pstat.get("goals_conceded", 0)
+            if clean_sheet:
+                base += 0.5 * _w
+            base -= max(0, conceded - 1) * 0.15
+        elif clean_sheet:
+            # 필드 플레이어도 완봉승엔 소폭 가산(수비 기여를 개인 이벤트
+            # 없이도 어느 정도 반영 — 실제 수비 기여도는 못 따로 추적함).
+            base += 0.15 * _w
+        base += rng.gauss(0, 0.25)
+        e = {
+            "id": p.get("id"), "name": _display_name(p), "position": label,
+            "ovr": p.get("ovr", 50),
+            "goals": pstat.get("goals", 0), "assists": pstat.get("assists", 0),
+            "shots": pstat.get("shots", 0), "shots_on": pstat.get("shots_on", 0),
+            "saves": pstat.get("saves", 0) if is_gk else 0,
+            "is_gk": is_gk,
+            # [2026-10 설계 B-2] 평점 장부(rating_ledger)가 있으면 그 값 — 사건 기록만으로 계산.
+            # 장부에 없는 선수(id 없는 가상 폴백 등)만 예전 근사식.
+            "rating": (ledger[key] if (ledger and key in ledger)
+                       else round(max(3.0, min(10.0, base)), 1)),
+            # [2026-10 설계 A] 선수 단위 사건 — 경기 상세 카드 표시·출전정지 판정이 읽는다.
+            "fouls": pstat.get("fouls", 0), "fouled": pstat.get("fouled", 0),
+            "yellow_cards": pstat.get("yellow", 0), "red_cards": pstat.get("red", 0),
+            "offsides": pstat.get("offsides", 0),
+            # [2026-10 설계 B-1] 귀속된 세부 기록(평점 장부 B-2의 재료)
+            **{k: pstat.get(k, 0) for k in (
+                "passes", "passes_ok", "key_passes", "crosses", "crosses_ok", "dribbles",
+                "dribbles_ok", "tackles", "tackles_ok", "interceptions", "clearances", "blocks",
+                "aerials", "aerials_won", "big_chances_missed", "pk_won", "pk_conceded")},
+        }
+        if appear:
+            _on_d = display_minute(on_min) if on_min else 0
+            _off_d = display_minute(off_min) if off_min is not None else None
+            e["started"] = bool(started)
+            # 출전시간은 "표시 분" 기준으로 센다 — 내부 96분/128분을 90으로
+            # 환산하면 연장 경기에서 120분 뛴 선수가 90분으로 찍힌다.
+            e["minutes"] = max(0, (_off_d if _off_d is not None else 0) - _on_d)
+            e["on_min"] = _on_d
+            e["off_min"] = _off_d
+            e["subbed_in"] = (not started)
+            _so = bool(((appear or {}).get(key) or {}).get("sent_off"))
+            e["sent_off"] = _so
+            # 퇴장은 교체 아웃이 아니다(↓ 표시 대신 레드카드로 보인다).
+            e["subbed_out"] = bool(off_min is not None and off_min < _tot) and not _so
         return e
 
-    def pick_att(self, sd, z, ln, exclude=None):
-        return self.pick(sd.att_tab, z, ln, exclude)
+    out = []
+    for i, p in enumerate(lineup):
+        if p is None:
+            out.append(None)
+            continue
+        label = labels[i] if i < len(labels) else p.get("position", "CM")
+        ap = (appear or {}).get(_pkey(p)) or {}
+        on_min = ap.get("on", 0) or 0
+        off_min = ap.get("off", _tot)
+        if off_min is None:
+            off_min = _tot
+        mins = max(0, off_min - on_min) if appear else _tot
+        out.append(_entry(p, label, (p is gk), mins, True, on_min, off_min))
+    for ap in subs_extra:
+        p = ap["player"]
+        if p is None:
+            continue
+        on_min = ap.get("on", 0) or 0
+        off_min = ap.get("off", _tot)
+        if off_min is None:
+            off_min = _tot
+        out.append(_entry(p, ap.get("slot") or p.get("position", "CM"),
+                          False, max(0, off_min - on_min), False, on_min, off_min))
+    return out
 
-    def pick_def(self, sd, z, ln):
-        return self.pick(sd.def_tab, z, ln)
 
-    def pick_air(self, sd, z, ln, defending):
-        tab = sd.def_tab if defending else sd.att_tab
-        pop, cum = tab[(z, ln)]
-        ws = [max(1.0, e.air) ** 2 for e in pop]
-        return self.rng.choices(pop, weights=ws, k=1)[0]
+def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost=0.0,
+                             home_boost_position=None, away_boost_position=None,
+                             home_adv=3.0, seed=None,
+                             home_formation=None, away_formation=None,
+                             home_bench=None, away_bench=None,
+                             extra_time=False, agg_home=0, agg_away=0,
+                             home_style=None, away_style=None):
+    """포메이션 매치업을 실제로 계산해서 90분(+추가시간, 필요하면 연장)
+    경기를 시뮬레이션한다.
 
-    # ── 시계 ──────────────────────────────────────────────────────────
-    def cur_min(self):
-        """(하프, 경과초) → 내부 분. 정수부는 축구 표기(경과 0:00~0:59 = 1분)와 같다.
-        전반 추가시간은 기존 규칙상 45분 안에 있어야 하므로 45분째(44:00~45:00)를 45.0~45.5,
-        추가시간을 45.5~46으로 압축한다(순서 보존). 연장 후반 추가시간도 같은 방식(127.5~128).
-        휘슬 시각(정규+추가 끝) 그 자체는 마지막 분에 넣는다."""
-        s, h = self.sec, self.half
-        if self.end is not None:
-            s = min(s, self.end - 0.01)
-        if h == 1:
-            if s < HALF_SEC - 60:
-                return 1.0 + s / 60.0
-            if s < HALF_SEC:
-                return 45.0 + (s - (HALF_SEC - 60)) / 120.0
-            return 45.5 + 0.49 * min(1.0, (s - HALF_SEC) / max(1.0, self.added or 1.0))
-        if h == 2:
-            return 46.0 + s / 60.0 if s < HALF_SEC else min(96.999, 91.0 + (s - HALF_SEC) / 60.0)
-        if h == 3:
-            return 97.0 + s / 60.0 if s < ET_SEC else 112.0 + 0.999 * min(1.0, (s - ET_SEC) / max(1.0, self.added or 1.0))
-        if s < ET_SEC - 60:
-            return 113.0 + s / 60.0
-        if s < ET_SEC:
-            return 127.0 + (s - (ET_SEC - 60)) / 120.0
-        return 127.5 + 0.49 * min(1.0, (s - ET_SEC) / max(1.0, self.added or 1.0))
+    [2026-09 확장 — 체력·교체·연장] 신민용 확정 설계:
+        home_bench/away_bench: 교체 후보(벤치) 선수 dict 리스트. 넘기면
+            경기 중 체력 저하/스코어 상황에 따라 AI가 실제로 교체를 한다
+            (5명/3회, 연장 시 +1회, 하프타임·연장 하프타임은 기회 무소모).
+            안 넘기면 교체 없이 기존과 동일하게 동작한다.
+        extra_time: True면 정규시간 종료 시 동점(또는 합산 동률)일 때
+            연장 전반 15분 + 연장 후반 15분을 실제로 더 돌린다. 리그는
+            False, 단판 KO는 True.
+        agg_home/agg_away: 2차전 합산 방식일 때 1차전까지의 누적 스코어.
+            연장 진입 판정은 "이 경기 스코어"가 아니라 "합산"으로 한다 —
+            예: 1차전 A 1-0 B → 2차전에서 agg_home/agg_away를 넘기면
+            2차전 90분 후 합산 동률일 때만 연장.
 
-    def tick(self, secs, inplay=True):
-        """경기 시계를 secs초 진행. 정규시간(45:00/15:00)에 닿는 순간 그 하프의 추가시간을 정하고,
-        정규+추가시간에 닿으면 거기서 시계를 멈춘다(그 뒤 사건은 종료 시각에 찍힌다 — 휘슬)."""
-        if secs <= 0 or self.whistle:
-            return
-        if self.added is None and self.sec + secs >= self.reg:
-            am = self.added_minutes(self.half)
-            self.added = am * 60.0
-            self.added_log[self.half] = am
-            self.end = self.reg + self.added
-        if self.end is not None and self.sec + secs >= self.end:
-            secs = max(0.0, self.end - self.sec)
-            self.whistle = True
-        self.sec += secs
-        if inplay:
-            self.bip += secs
-            self.att.inplay += secs
-        else:
-            self.dead += secs
-        m = int(self.cur_min())
-        while self.last_min_int < m:
-            self.last_min_int += 1
-            self.on_minute(self.last_min_int)
+    Args:
+        home_lineup/away_lineup: FORMATION_SLOTS 순서의 선수 dict 리스트
+            (match_sim.match_flow._select_lineup()의 반환값 그대로 넣으면 됨).
+            None 슬롯 허용(그 자리는 그냥 빈 것으로 취급).
+        home_boost/away_boost: 그 팀에 얹을 전역 보정(내 에이스 효과 등).
+        home_boost_position/away_boost_position: [2026-07 신설] 그 보정을
+            받는 선수(=나)의 포지션. POSITION_BOOST_WEIGHTS로 보정이 실제
+            그 포지션이 영향력을 행사하는 채널(공격/수비/중원/GK)에 집중
+            되도록 분배한다. None이면 기존 방식(포지션 무관 균등 분배)으로
+            폴백.
+        home_adv: 홈 이점(중원 퀄리티에 가산).
+        seed: 지정하면 결정론적 재현.
+        home_formation/away_formation: [2026-09 신설, 신민용 리포트: "포메이션이
+            5-2-3인데 라인업 화면엔 4-2-2-2로 뜬다"] home_lineup/away_lineup을
+            실제로 뽑을 때 쓴 FORMATION_SLOTS 키(예: "5-2-3"). 넘기면 구역
+            계산(_TeamModel/_assign_zones)과 라인업 평점의 포지션 라벨이
+            전부 이 실제 포메이션 기준으로 맞춰진다. None이면(기존 호출부·
+            항상 4-4-2뿐인 국제대회 등) 예전과 동일하게 4-4-2 라벨로
+            폴백한다 — 하위 호환 100% 유지.
 
-    def on_minute(self, m):
-        """경기 1분마다 — 체력, 교체 판단 예약, 부상 지연, 모델 갱신."""
-        if self.stam.enabled:
-            ext = self.half >= 3
-            for sd in (self.H, self.A):
-                zoned = [{"player": e.p, "pos": e.pos, "third": e.third} for e in sd.ents]
-                self.stam.drain_minute(zoned, self.att is sd, ext)
-        if m in _SUB_DECISION:
-            self.pending_sub_minutes.append(m)
-        if self.rng.random() < INJURY_PER_MIN:
-            self.pending_dead += self.rng.uniform(*T_DEAD["injury"])
-            self.half_delays["inj"] += 1
-        if m >= self.next_rebuild_min:
-            self.next_rebuild_min = m + 5
-            self.rebuild(self.H)
-            self.rebuild(self.A)
+    Returns:
+        {"home_score", "away_score", "home_stats", "away_stats",
+         "home_stats_detail", "away_stats_detail", "possession_log", ...}
+        home_stats/away_stats: 실제 중계화면에 보여줄 "표시용" 10개 —
+            {"poss","shots","shots_on","corners","fouls","pass_acc",
+             "offsides","yellow_cards","red_cards","saves"}. pass_acc는
+             실제 패스 시도/성공 집계(0으로 나뉠 일 없이 항상 0.0~1.0
+             사이 값)로 항상 채워진다.
+        home_stats_detail/away_stats_detail: [2026-09 신설] 화면엔 기본
+            노출 안 하고 저장만 해두는 세부 통계 — _new_stats_detail()의
+            키 그대로(총패스/성공패스, 크로스, 태클, 가로채기, 클리어링,
+            블록, 공중볼, 드리블, 볼탈취/상실, 서드·박스 진입, 빅찬스,
+            xG/xA, 골대, 프리킥, PK, 선방률).
+        possession_log: match_flow.generate_possession_log()와 같은 레코드
+            형식([{"min","team","zone","outcome","me","text"}, ...]) — 이번
+            단계에서는 팀 결과(스코어/통계)만 이 로그의 골/슈팅 합계와
+            일치시키고, 화면 재생은 여전히 match_flow가 만드는 필러로
+            채운다(시각화까지 이 로그를 직접 쓰는 건 다음 단계 작업).
+    """
+    rng = random.Random(seed) if seed is not None else random
 
-    def rec(self, outcome, team, zone=None, lane=None, **kw):
-        d = {"min": round(self.cur_min(), 4), "team": team.name,
-             "zone": _ZNAME.get(self.zone if zone is None else zone, "mid"),
-             "lane": self.lane if lane is None else lane,
-             "outcome": outcome, "me": False, "text": None, "half": self.half, "sec": round(self.sec, 1)}
-        d.update(kw)
-        self.plog.append(d)
-        return d
+    home_slots = away_slots = None
+    if home_formation or away_formation:
+        from constants import FORMATION_SLOTS
+        if home_formation:
+            home_slots = FORMATION_SLOTS.get(home_formation)
+        if away_formation:
+            away_slots = FORMATION_SLOTS.get(away_formation)
 
-    def add_pass(self, sd, e, ok):
-        k = (sd.name, int(self.cur_min()))
-        bucket = self.pass_acc.get(k)
-        if bucket is None:
-            bucket = self.pass_acc[k] = {}
-        pid = e.p.get("id")
-        v = bucket.get(pid)
-        if v is None:
-            v = bucket[pid] = [pid, 0, 0]
-        v[1] += 1
-        ps = _pstat(sd.ps, e.p)
-        ps["passes"] += 1
-        sd.detail["passes"] += 1
-        if ok:
-            v[2] += 1
-            ps["passes_ok"] += 1
-            sd.detail["passes_ok"] += 1
+    # [신규 — 경기 당일 컨디션] 매 분마다 실력 평균으로 수렴하는 구조라,
+    # 분 단위 시뮬레이션만으로는 실제 축구의 "약팀이 어쩌다 강팀을 잡는"
+    # 이변이 거의 안 나왔다(실측: OVR 15 차이에도 패배 확률 3%로, 기존
+    # 확률표의 16%보다 훨씬 낮았음). 경기 시작 전에 딱 한 번 양팀에
+    # "그날의 컨디션" 오차를 부여해서, 그 경기 내내 일관되게 유지되는
+    # 변동성을 추가한다 — 매 분 독립적으로 흔들리는 잡음과 달리, 이건
+    # "그 팀이 그날 유독 잘 풀리거나 안 풀리는" 것과 같아서 이변 가능성을
+    # 만들어준다.
+    home_form = rng.gauss(0, _MATCH_FORM_SIGMA)
+    away_form = rng.gauss(0, _MATCH_FORM_SIGMA)
+    # [2026-09 구조변경] 예전엔 여기서 _TeamModel을 한 번 만들고 컨디션을
+    # 얹은 뒤 경기 내내 그대로 썼다. 이제 체력 저하와 교체 때문에 팀 모델이
+    # 경기 중에 바뀌므로, 모델 생성 + 컨디션 가산을 _rebuild_models()로
+    # 묶어서 체크포인트마다 다시 부른다. _TeamModel은 rng를 전혀 쓰지 않으
+    # 므로 생성 시점을 컨디션 추출 뒤로 옮겨도 시드 재현성에는 영향이 없다.
+    home = away = None
 
-    # ── 상황 값 ───────────────────────────────────────────────────────
-    def pressure(self, D, z):
-        pr = PRESS_TAB.get(D.press_style, PRESS_TAB["MID_BLOCK"])[z] * D.perf_avg * (D.n_field / 10.0)
-        if self.counter > 0:
-            pr *= 0.6
-        sc_d, sc_a = D.score, self.other(D).score
-        if sc_d < sc_a and self.cur_min() >= 70:
-            pr += 0.08
-        return max(0.05, min(0.95, pr))
+    home_stats = {"shots": 0, "shots_on": 0, "corners": 0, "fouls": 0,
+                  "offsides": 0, "yellow_cards": 0, "red_cards": 0, "saves": 0}
+    away_stats = {"shots": 0, "shots_on": 0, "corners": 0, "fouls": 0,
+                  "offsides": 0, "yellow_cards": 0, "red_cards": 0, "saves": 0}
+    # [2026-09 신설] "표시용" 10개 옆에 별도로 두는 세부 통계 그릇 —
+    # _new_stats_detail() 참고.
+    home_detail = _new_stats_detail()
+    away_detail = _new_stats_detail()
+    # [2026-08 신설] 선수 id(또는 id 없는 폴백 선수는 파이썬 id()) ->
+    # {"shots","shots_on","goals","assists","saves","goals_conceded"} 누적.
+    # _resolve_shot이 채우고, 경기 종료 후 아래에서 평점으로 환산한다.
+    home_player_stats = {}
+    away_player_stats = {}
+    home_score = away_score = 0
+    plog = []
 
-    def att_mod(self, A, D):
-        m = MAN_ADV * (A.n_field - D.n_field)
-        if self.counter > 0:
-            m += COUNTER_ADV
-        return m
+    home_mid_total = away_mid_total = 0.0
+    home_poss_minutes = 0
+    home_zoned = away_zoned = None
+    p_home_poss = 0.5
 
-    # ── 경기 재개 ─────────────────────────────────────────────────────
-    def dead_time(self, kind):
-        t = self.rng.uniform(*T_DEAD[kind]) + self.pending_dead
-        self.pending_dead = 0.0
-        self.tick(t, inplay=False)
-        self.dead_ball = True
-        if self.pending_sub_minutes:
-            self.pending_sub_minutes = []
-            did = self.try_subs(int(self.cur_min()), False)
-            if did:
-                self.tick(self.rng.uniform(*T_DEAD["sub"]), inplay=False)
+    # 부상시간 포함 대략 96분 정도로(정규시간). 연장은 그 뒤에 별도 구간.
+    total_minutes = REG_MINUTES
 
-    def start_poss(self, sd, z, ln, carrier=None, counter=0, ctx=None):
-        self.att = sd
-        self.zone, self.lane = z, ln
-        self.car = carrier if carrier is not None else self.pick_att(sd, z, ln)
-        self.counter = counter
-        self.ctx = ctx
-        self.assist_cand = None
+    # ── [2026-09 신설] 경기 내부 체력 + 교체 상태 ────────────────────
+    # 체력은 선수 dict를 건드리지 않고 _Stamina가 키 기반으로 따로 관리한다
+    # (호출부가 공유 dict를 넘길 수 있으므로). 벤치를 안 넘긴 호출부는
+    # 교체가 일어나지 않고, 체력 저하만 적용된다.
+    stam = _Stamina(enabled=bool(STAMINA_MODEL))
+    _sides = {
+        "home": {"cur": list(home_lineup), "slots": home_slots, "is_home": True,
+                 "boost": home_boost, "bpos": home_boost_position,
+                 "bench": [p for p in (home_bench or []) if p],
+                 "subs": [], "used": 0, "windows": SUBS_MAX_WINDOWS, "appear": {}},
+        "away": {"cur": list(away_lineup), "slots": away_slots, "is_home": False,
+                 "boost": away_boost, "bpos": away_boost_position,
+                 "bench": [p for p in (away_bench or []) if p],
+                 "subs": [], "used": 0, "windows": SUBS_MAX_WINDOWS, "appear": {}},
+    }
+    for _sk, _sv in _sides.items():
+        _labels = _sv["slots"] or _FALLBACK_SLOTS
+        for _i, _p in enumerate(_sv["cur"]):
+            if _p is None:
+                continue
+            stam.ensure(_p)
+            _sv["appear"][_pkey(_p)] = {
+                "player": _p, "slot": (_labels[_i] if _i < len(_labels) else
+                                       _p.get("position", "CM")),
+                "slot_idx": _i, "on": 0, "off": None, "started": True}
+        for _p in _sv["bench"]:
+            stam.ensure(_p)
 
-    def kickoff(self, sd):
-        self.start_poss(sd, M3, "C")
+    _sent_off = {"home": [], "away": []}      # [2026-10 설계 A] 퇴장당한 선수(수적 열세 계산용)
+    pass_log = []                              # [2026-10 설계 B-1] [분, 팀, [[선수id, 패스, 성공], ...]]
 
-    def throw_in(self, sd, z, ln):
-        self.dead_time("throw")
-        if ln == "C":
-            ln = self.rng.choice(("L", "R"))
-        self.start_poss(sd, z, ln)
+    def _rebuild_models():
+        """현재 라인업/체력/스코어 상황으로 팀 모델과 레인 캐시를 다시 만든다.
 
-    def goal_kick(self, sd):
-        self.dead_time("goalkick")
-        self.gk_ball(sd, from_restart=True)
+        예전엔 경기 시작 전 딱 한 번만 계산해서 루프 내내 재사용했다(성능
+        최적화). 이제 체력 저하·교체 때문에 값이 실제로 변하므로 체크포인트
+        (15분마다 + 교체 직후)에서만 다시 만든다 — 경기당 10회 정도라
+        분당 재계산(96회)으로 되돌아가지는 않는다."""
+        nonlocal home, away, home_zoned, away_zoned
+        nonlocal home_mid_total, away_mid_total, p_home_poss
+        nonlocal home_lanes, home_weights, home_quality_by_lane
+        nonlocal home_pool_by_lane, home_mult_by_lane
+        nonlocal away_lanes, away_weights, away_quality_by_lane
+        nonlocal away_pool_by_lane, away_mult_by_lane
+        home = _TeamModel(_sides["home"]["cur"], True, boost=home_boost,
+                          boost_position=home_boost_position, slot_labels=home_slots,
+                          perf=stam.perf)
+        away = _TeamModel(_sides["away"]["cur"], False, boost=away_boost,
+                          boost_position=away_boost_position, slot_labels=away_slots,
+                          perf=stam.perf)
+        for _ln in LANES:
+            home.att[_ln] += home_form * 0.6
+            home.dfn[_ln] += home_form * 0.6
+            away.att[_ln] += away_form * 0.6
+            away.dfn[_ln] += away_form * 0.6
+        home.mid += home_form
+        away.mid += away_form
+        home.gk_q += home_form * 0.5
+        away.gk_q += away_form * 0.5
+        # [2026-10 설계 A] 퇴장으로 빠진 인원만큼 손해 — 레인 퀄리티는 가중평균이라 한 명이 빠져도
+        # 평균이 거의 안 바뀌므로, 인원 자체의 열세(커버 범위·압박 강도)를 따로 뺀다.
+        for _mdl, _sk in ((home, "home"), (away, "away")):
+            _k = len(_sent_off[_sk])
+            if _k:
+                for _ln in LANES:
+                    _mdl.att[_ln] -= MAN_DOWN_ATT * _k
+                    _mdl.dfn[_ln] -= MAN_DOWN_DFN * _k
+                _mdl.mid -= MAN_DOWN_MID * _k
+        # [2026-09 신설, 신민용 설계: "1골 넣은 후 눕기 위해 수비수 투입,
+        # 지고 있으면 공격 투입"] 교체로 선수만 바꾸는 게 아니라 팀이 실제로
+        # 자세를 바꾸는 부분. 후반 중반 이후 스코어 상황에 따라 공격/수비
+        # 퀄리티를 아주 작게(±1.5) 밀어준다 — 큰 값을 주면 기존 득점
+        # baseline이 흔들리므로 의도적으로 약하게 잡았다.
+        _diff = home_score - away_score
+        if _cur_minute >= 70 and _diff != 0:
+            _chase = "away" if _diff > 0 else "home"     # 지고 있는 쪽
+            _lead = "home" if _diff > 0 else "away"
+            _cm = home if _chase == "home" else away
+            _lm = home if _lead == "home" else away
+            for _ln in LANES:
+                _cm.att[_ln] += 1.5
+                _cm.dfn[_ln] -= 1.5
+                if _cur_minute >= 80:
+                    _lm.att[_ln] -= 1.0
+                    _lm.dfn[_ln] += 1.5
+        home_zoned, away_zoned = home.zoned, away.zoned
+        home_mid_total = home.mid + home_adv
+        away_mid_total = away.mid
+        # [2026-09 — 감독 시스템 ②단계] 감독 성향 보정. _style_edges가
+        # (점유 보정, 기회품질 보정)을 각 팀 관점으로 돌려준다 — 성향이
+        # 없으면(None) 전부 0.0이라 예전과 비트 단위로 같은 경기가 된다.
+        # 점유 보정은 p_home_poss에만, 기회품질 보정은 레인 퀄리티에만
+        # 들어간다(두 축을 섞지 않는다 — 섞으면 "점유율이 올라서 기회도
+        # 좋아지는" 이중 계산이 된다).
+        _h_poss_edge, _h_q_edge = _style_edges(home_style, away_style)
+        _a_poss_edge, _a_q_edge = _style_edges(away_style, home_style)
+        p_home_poss = _sigmoid(
+            (home_mid_total - away_mid_total + _h_poss_edge - _a_poss_edge) / 16.0)
+        (home_lanes, home_weights, home_quality_by_lane, home_pool_by_lane,
+         home_mult_by_lane) = _prep_side(home, away, home_zoned,
+                                         home_mid_total - away_mid_total, _h_q_edge)
+        (away_lanes, away_weights, away_quality_by_lane, away_pool_by_lane,
+         away_mult_by_lane) = _prep_side(away, home, away_zoned,
+                                         away_mid_total - home_mid_total, _a_q_edge)
 
-    def gk_ball(self, sd, from_restart=False):
-        """GK가 볼을 잡았다 — 짧게 굴리거나 길게 찬다(감독 빌드업 성향)."""
-        if sd.gk is None:
-            self.start_poss(sd, D3, "C")
-            return
-        if not from_restart:
-            self.tick(self.rng.uniform(*T_ACT["gk"]))
-        self.start_poss(sd, D3, "C", carrier=sd.gk, ctx="gk")
+    home_lanes = home_weights = home_quality_by_lane = None
+    home_pool_by_lane = home_mult_by_lane = None
+    away_lanes = away_weights = away_quality_by_lane = None
+    away_pool_by_lane = away_mult_by_lane = None
+    _cur_minute = 0
 
-    def loose_ball(self, z, ln, p_att=0.5):
-        """루즈볼 — 공격팀 기준 구역 z에서 누가 따내나."""
-        A, D = self.att, self.other(self.att)
-        self.tick(self.rng.uniform(*T_ACT["loose"]))
-        # 그 구역 양 팀 압박·중원 능력 차로 약간 기울인다
-        diff = (A.mid_q - D.mid_q) / 10.0 * 0.3
-        if self.rng.random() < _sig(_logit(p_att) + diff):
-            self.start_poss(A, z, ln)
-        else:
-            self.start_poss(D, _MIRROR[z], ln)
+    def _prep_side(atk, dfn_opp, zoned_atk, mid_edge, style_q_edge=0.0):
+        lane_scores = {ln: max(1.0, atk.att[ln] - dfn_opp.dfn[ln] + 50.0) for ln in LANES}
+        lanes, weights = zip(*lane_scores.items())
+        # [2026-09 버그수정, 신민용+GPT 실측: "90 vs 99(9점 차)만 돼도
+        # 변환 없이도 원정승 82%·평균 4골 실점 — 극단 매치업이 이미
+        # 결정론적"] /11.0은 raw stat 차이만으로도 이미 과민했다. effective_
+        # stat 변환(아래 _resolve_shot의 결정력 지점)과는 별개 문제 — 이
+        # 레인 퀄리티는 "기회 빈도"를 정하는 곳이라 raw stat을 그대로 쓰되
+        # (증폭은 결정력 지점 한 곳에만 몰아준다는 원칙, effective_stat
+        # 정의부 주석 참고) 나눗값만 24.0으로 넓혀 민감도를 낮췄다 — 실측
+        # 검증(90/95/99/102/105 극단 매치업, 85+스타1명 캐리 시나리오)
+        # 완료.
+        # [2026-09 신설, 신민용+GPT 설계: "미드필드가 점유율만 만들고
+        # 기회 품질엔 안 들어간다"] mid_edge(이 팀 미드필드 - 상대 미드필드)
+        # 를 아주 작은 계수(0.15)로만 diff에 더한다 — "미드필드+10 →
+        # 슈팅확률+30%" 같은 직접 보정은 피하고, 이미 있는 공격/수비 퀄리티
+        # 격차 위에 미드필드 우위만큼만 살짝 얹는다(점유율 배분과는 별개
+        # 경로 — 점유율은 위 p_home_poss가 이미 담당).
+        # style_q_edge: 감독 성향이 이 팀 기회 품질에 주는 보정(OVR 환산).
+        # 성향이 없으면 0.0이라 예전 식과 완전히 동일하다.
+        quality_by_lane = {ln: _sigmoid((atk.att[ln] - dfn_opp.dfn[ln]
+                                         + mid_edge * 0.15 + style_q_edge) / 24.0)
+                           for ln in LANES}
+        att_pool_all = [z["player"] for z in zoned_atk if z["third"] == "ATT"]
+        # [2026-09 버그수정 — 득점자가 한 명에게 몰리는 문제]
+        # 예전 슈터 풀은 "그 레인 + ATT third"뿐이었다. 그런데 4-2-3-1이나
+        # 4-3-3처럼 최전방이 레인마다 1명인 포메이션에선 그 풀의 크기가
+        # 정확히 1이 되어, 그 레인에서 나온 모든 슈팅이 언제나 같은 선수
+        # 것이 됐다. C 레인 가중치가 보통 가장 높으므로 결과적으로 팀 골이
+        # 최전방 한 명에게 거의 전부 쏠렸다 — 실측(tools/scorer_spread_qa.py,
+        # 맨유 200경기): 최다득점 슬롯이 팀 골의 97.6%, 2골 이상 낸 135개
+        # 팀-경기 중 126건이 "득점자 1명". 게다가 풀 크기가 1이면 어시스트
+        # 판정(len(shooter_pool) > 1)도 통째로 건너뛰어져 도움이 거의 안
+        # 붙었다.
+        #
+        # 그래서 풀을 넓히고, 대신 포지션별 가중 배수(mult)를 같이 넘긴다 —
+        # 최전방 같은 레인이 1.0, 같은 레인 미드필더 0.42, 옆 레인 공격수
+        # 0.30, 옆 레인 미드필더 0.12. 슈터 선택은 여전히 결정력(shooting)
+        # 가중이 주도하므로 스트라이커가 최다 득점자인 건 그대로다.
+        # rng 호출 '횟수/순서'는 슈팅 판정 자체에선 그대로다(rng.choices는
+        # 풀 크기와 무관하게 1회) — 어시스트 판정만 이제 제대로 들어간다.
+        _ATT_SAME, _MID_SAME, _ATT_ADJ, _MID_ADJ = 1.0, 0.42, 0.30, 0.12
+        pool_by_lane = {}
+        mult_by_lane = {}
+        for ln in LANES:
+            if not WIDE_SHOOTER_POOL:      # A/B 비교용 — 예전(좁은) 풀 재현
+                pool = [z["player"] for z in zoned_atk
+                        if z["lane"] == ln and z["third"] == "ATT"]
+                pool_by_lane[ln] = pool if pool else att_pool_all
+                mult_by_lane[ln] = None
+                continue
+            pool, mults = [], []
+            for z in zoned_atk:
+                if z["third"] == "ATT":
+                    m = _ATT_SAME if z["lane"] == ln else _ATT_ADJ
+                elif z["third"] == "MID":
+                    m = _MID_SAME if z["lane"] == ln else _MID_ADJ
+                else:
+                    continue   # 수비수는 세트피스 밖에서는 슈터 풀에 안 넣는다
+                pool.append(z["player"])
+                mults.append(m)
+            if not pool:
+                pool, mults = list(att_pool_all), [1.0] * len(att_pool_all)
+            pool_by_lane[ln] = pool
+            mult_by_lane[ln] = mults
+        return lanes, weights, quality_by_lane, pool_by_lane, mult_by_lane
 
-    def turnover(self, new_sd, old_zone, ln, carrier=None, how=None):
-        nz = _MIRROR[old_zone]
-        cnt = 3 if (how in ("interception", "tackle") and old_zone >= A3 and nz <= M3) else 0
-        if how in ("interception", "tackle", "recovery"):
-            new_sd.detail["turnovers_won"] += 1
-            self.other(new_sd).detail["turnovers_lost"] += 1
-        self.start_poss(new_sd, nz, ln, carrier=carrier, counter=cnt)
+    # ── [2026-09 신설] AI 교체 판단 ───────────────────────────────────
+    _SLOT_PEN = (0, 5, 9, 13, 13)
 
-    # ── 파울·카드·퇴장 ────────────────────────────────────────────────
-    def clumsy(self, D, d):
-        c = 1.0 + max(-0.3, min(0.5, (60.0 - _g(d.p, "tackling")) / 80.0))
-        if _pstat(D.ps, d.p).get("yellow"):
-            c *= BOOKED_CAUTION
-        return c
-
-    def foul(self, D, d, A, v, z, ln, tactical=False, dogso=False):
-        """수비 D의 선수 d가 공격 A의 선수 v에게 파울 — 카드 판정 후 프리킥/PK로 재개."""
-        D.stats["fouls"] += 1
-        _pstat(D.ps, d.p)["fouls"] += 1
-        _pstat(A.ps, v.p)["fouled"] += 1
-        pk = (z == BOX)
-        fr = self.rec("foul", D, zone=_MIRROR[z], lane=ln, player_id=d.p.get("id"),
-                      victim_id=v.p.get("id"))
-        if pk:
-            fr["pk"] = True
-            _pstat(A.ps, v.p)["pk_won"] += 1
-            _pstat(D.ps, d.p)["pk_conceded"] += 1
-        r = self.rng.random()
-        p_red = RED_PER_FOUL + (RED_DOGSO if dogso else 0.0)
-        p_y = YELLOW_PER_FOUL + (YELLOW_TACTICAL_BONUS if (tactical or z >= A3) else 0.0)
-        _pm = self.pmods.get(d.p.get("id"))
-        if _pm:
-            p_red += _pm.get("red_add", 0.0)
-            p_y += _pm.get("yellow_add", 0.0)
-        if r < p_red:
-            self.send_off(D, d.p, "red")
-            self.half_delays["cards"] += 1
-            self.pending_dead += self.rng.uniform(*T_DEAD["card"])
-        elif r < p_red + p_y:
-            self.book(D, d.p)
-            self.half_delays["cards"] += 1
-            self.pending_dead += self.rng.uniform(*T_DEAD["card"])
-        if pk:
-            A.detail["penalties"] += 1
-            self.dead_time("pk")
-            taker = max((e for e in A.ents if e.pos != "GK"), key=lambda e: (e.fk, e.sht), default=None)
-            if taker is not None:
-                self.start_poss(A, BOX, "C", carrier=taker)
-                self.shot(A, self.other(A), taker, "pk", kind="pk")
-            return
-        A.detail["free_kicks"] += 1
-        if z == A3:
-            self.dead_time("fk_danger")
-            self.free_kick_danger(A, ln, v)
-        else:
-            self.dead_time("fk")
-            self.start_poss(A, z, ln, carrier=v)
-
-    def free_kick_danger(self, A, ln, v):
-        r = self.rng.random()
-        p_shot = 0.30 if ln == "C" else 0.06
-        p_cross = 0.25 if ln == "C" else 0.60
-        taker = max((e for e in A.ents if e.pos != "GK"), key=lambda e: (e.fk, e.sht), default=v)
-        if r < p_shot:
-            self.start_poss(A, A3, ln, carrier=taker)
-            self.shot(A, self.other(A), taker, "fk", kind="fk")
-        elif r < p_shot + p_cross:
-            self.start_poss(A, A3, "L" if ln == "C" else ln, carrier=taker)
-            self.act_cross(set_piece=True)
-        else:
-            self.start_poss(A, A3, ln, carrier=v)
-
-    def book(self, sd, p):
-        ps = _pstat(sd.ps, p)
-        ps["yellow"] += 1
-        sd.stats["yellow_cards"] += 1
-        self.rec("yellow", sd, player_id=p.get("id"))
-        if ps["yellow"] >= 2:
-            self.send_off(sd, p, "second_yellow")
-
-    def send_off(self, sd, p, reason):
-        idx = next((i for i, q in enumerate(sd.cur) if q is p), None)
-        if idx is None:
-            return
-        labels = sd.labels()
-        slot = labels[idx] if idx < len(labels) else p.get("position", "CM")
-        _pstat(sd.ps, p)["red"] += 1
-        sd.stats["red_cards"] += 1
-        m = self.cur_min()
-        self.rec("red", sd, player_id=p.get("id"), reason=reason)
-        sd.cur[idx] = None
-        ap = sd.appear.get(_pkey(p))
-        if ap is not None:
-            ap["off"] = m
-            ap["sent_off"] = True
-        sd.sent.append(p)
-        if slot == "GK":
-            outs = [(i, q) for i, q in enumerate(sd.cur)
-                    if q is not None and (labels[i] if i < len(labels) else "") != "GK"]
-            bgk = next((b for b in sd.bench if b.get("position") == "GK"), None)
-            if outs and bgk is not None and sd.used < SUBS_MAX_PLAYERS and sd.windows > 0:
-                def _att_rank(t):
-                    _sl = labels[t[0]] if t[0] < len(labels) else "CM"
-                    return (_third_of(_POS_XY.get(_sl, (0.3, 0.5))[0]) == "ATT", -self.stam.get(t[1]))
-                oi, op = max(outs, key=_att_rank)
-                sd.cur[oi] = None
-                oap = sd.appear.get(_pkey(op))
-                if oap is not None:
-                    oap["off"] = m
-                sd.cur[idx] = bgk
-                sd.bench.remove(bgk)
-                sd.used += 1
-                sd.windows -= 1
-                sd.appear[_pkey(bgk)] = {"player": bgk, "slot": "GK", "slot_idx": idx,
-                                         "on": m, "off": None, "started": False}
-                sd.subs.append({"min": int(m), "disp": display_minute(int(m)), "slot": "GK",
-                                "out_id": op.get("id"), "out_name": op.get("name"),
-                                "out_stamina": round(self.stam.get(op), 1),
-                                "in_id": bgk.get("id"), "in_name": bgk.get("name"),
-                                "reason": "gk_sent_off", "extra_time": m > REG_MINUTES})
-                self.rec("sub", sd, zone=M3, lane="C", in_id=bgk.get("id"), out_id=op.get("id"))
-                self.half_delays["subs"] += 1
-            elif outs:
-                oi, op = max(outs, key=lambda t: ((t[1].get("jump") or 0) + (t[1].get("positioning") or 0)))
-                sd.cur[oi] = None
-                sd.cur[idx] = op
-        self.rebuild(sd)
-        # 퇴장으로 볼 가진 선수가 사라졌으면 다시 고른다
-        if self.att is sd and (self.car is None or self.car.p is p):
-            self.car = self.pick_att(sd, self.zone, self.lane)
-
-    # ── 교체(기존 _try_subs와 같은 판단, 실행은 데드볼에서만) ────────────
-    def slot_fit(self, p, slot):
+    def _slot_fit(p, slot):
+        """그 슬롯에서의 실질 경쟁력 — _select_lineup의 점수 계산과 같은
+        발상(포지션 적합도 페널티를 OVR에서 뺀다)."""
         from constants import POSITION_COMPAT
         compat = POSITION_COMPAT.get(p.get("position"), [p.get("position")])
+        if p.get("sub_pos") and p.get("sub_pos") == slot:
+            # [2026-10 주포·부포] 부포 슬롯 = OVR −1(로스터에 sub_pos가 붙은 클럽 선수만)
+            import sub_positions as _subp_t
+            return (p.get("ovr") or 50) - _subp_t.sub_abs_penalty(_SLOT_PEN[1])
         try:
-            idx = 0 if (p.get("sub_pos") and p.get("sub_pos") == slot) else compat.index(slot)
+            idx = compat.index(slot)
         except ValueError:
             idx = len(_SLOT_PEN) - 1
         return (p.get("ovr") or 50) - _SLOT_PEN[min(idx, len(_SLOT_PEN) - 1)]
 
-    def try_subs(self, minute, free_window):
+    def _try_subs(minute, free_window, is_extra):
+        """양 팀의 교체를 한 번 판단한다. 실제로 교체가 일어나면 True.
+
+        판단 근거(신민용 설계): 현재 체력 + 경기 시간 + 포지션 + 스코어
+        상황 + 벤치 선수의 실질 경쟁력. 단순히 "N분이면 무조건 교체"가
+        아니라, 지친 선수를 더 나은/신선한 선수로 바꿀 수 있을 때만 한다.
+        """
         did = False
-        for sd in (self.H, self.A):
-            if not sd.bench or sd.used >= SUBS_MAX_PLAYERS:
+        for sk in ("home", "away"):
+            sv = _sides[sk]
+            if not sv["bench"] or sv["used"] >= SUBS_MAX_PLAYERS:
                 continue
-            if not free_window and sd.windows <= 0:
+            if not free_window and sv["windows"] <= 0:
                 continue
-            labels = sd.labels()
-            diff = sd.score - self.other(sd).score
+            labels = sv["slots"] or _FALLBACK_SLOTS
+            my_sc = home_score if sk == "home" else away_score
+            op_sc = away_score if sk == "home" else home_score
+            diff = my_sc - op_sc
+            # 스코어 상황에 따른 "어느 라인을 바꾸고 싶은가".
             want = None
             if diff < 0 and minute >= 60:
-                want = "attack"
+                want = "attack"      # 지고 있다 → 공격 자원 투입
             elif diff > 0 and minute >= 75:
-                want = "defend"
+                want = "defend"      # 이기고 있다 → 수비/중원 보강
+            # 후보: 체력이 낮은 순. GK는 교체 대상에서 제외(부상 미구현).
             cands = []
-            for i, p in enumerate(sd.cur):
+            for i, p in enumerate(sv["cur"]):
                 if p is None:
                     continue
                 slot = labels[i] if i < len(labels) else p.get("position", "CM")
                 if slot == "GK" or p.get("position") == "GK":
                     continue
-                ap = sd.appear.get(_pkey(p)) or {}
-                if not ap.get("started", True) and minute - (ap.get("on") or 0) < 20:
+                _ap = sv["appear"].get(_pkey(p)) or {}
+                # 방금 투입한 선수를 다시 빼지 않는다(실측에서 62분 투입 →
+                # 68분 교체아웃이 나왔다). 20분은 뛰게 둔다.
+                if not _ap.get("started", True) and minute - (_ap.get("on") or 0) < 20:
                     continue
-                st = self.stam.get(p)
+                st = stam.get(p)
                 third = _third_of(_POS_XY.get(slot, (0.3, 0.5))[0])
                 tired = st < SUB_STAMINA_TRIGGER
                 if not tired:
-                    if not ((want == "attack" and third in ("DEF", "MID")) or (want == "defend" and third == "ATT")):
+                    # 지치지 않은 선수는 "전술적 이유"가 있을 때만 후보다 —
+                    # 지고 있어서 수비/중원을 빼거나, 이기고 있어서 공격수를
+                    # 빼는 경우. 그 외에는 순수 실력 업그레이드만으로
+                    # 멀쩡한 주전을 빼지 않는다.
+                    if want == "attack" and third in ("DEF", "MID"):
+                        pass
+                    elif want == "defend" and third == "ATT":
+                        pass
+                    else:
                         continue
-                urge = SUB_STAMINA_TRIGGER - st
-                if (want == "attack" and third in ("DEF", "MID")) or (want == "defend" and third == "ATT"):
+                urge = (SUB_STAMINA_TRIGGER - st)
+                if want == "attack" and third in ("DEF", "MID"):
+                    urge += 10.0
+                elif want == "defend" and third == "ATT":
                     urge += 10.0
                 cands.append((urge, st, i, p, slot, third, tired))
             cands.sort(key=lambda t: (-t[0], t[1], t[2]))
-            n_this = 0
+            n_this_window = 0
             for urge, st, idx, out_p, slot, third, tired in cands:
-                if n_this >= 2 or sd.used >= SUBS_MAX_PLAYERS:
+                if n_this_window >= 2 or sv["used"] >= SUBS_MAX_PLAYERS:
                     break
-                out_eff = self.slot_fit(out_p, slot) * self.stam.perf(out_p)
-                best_in, best_sc = None, -1e9
-                for cand in sd.bench:
+                out_eff = _slot_fit(out_p, slot) * stam.perf(out_p)
+                best_in, best_score = None, -1e9
+                for cand in sv["bench"]:
                     if cand.get("position") == "GK":
                         continue
-                    sc = self.slot_fit(cand, slot)
-                    if want == "attack" and _third_of(_POS_XY.get(cand.get("position"), (0.3, 0.5))[0]) == "ATT":
-                        sc += 3.0
-                    if sc > best_sc:
-                        best_in, best_sc = cand, sc
+                    sc = _slot_fit(cand, slot)
+                    if want == "attack":
+                        sc += 3.0 * (1.0 if _third_of(
+                            _POS_XY.get(cand.get("position"), (0.3, 0.5))[0]) == "ATT" else 0.0)
+                    if sc > best_score:
+                        best_in, best_score = cand, sc
                 if best_in is None:
                     continue
-                ok = (best_sc >= out_eff - 3.0) if tired else (best_sc > out_eff - 6.0)
+                ok = (best_score >= out_eff - 3.0) if tired else (best_score > out_eff - 6.0)
                 if not ok:
                     continue
-                m = minute
-                sd.cur[idx] = best_in
-                sd.bench.remove(best_in)
-                sd.used += 1
-                n_this += 1
-                ap = sd.appear.get(_pkey(out_p))
+                # 실제 교체 실행.
+                sv["cur"][idx] = best_in
+                sv["bench"].remove(best_in)
+                sv["used"] += 1
+                n_this_window += 1
+                ap = sv["appear"].get(_pkey(out_p))
                 if ap is not None:
-                    ap["off"] = m
-                sd.appear[_pkey(best_in)] = {"player": best_in, "slot": slot, "slot_idx": idx,
-                                             "on": m, "off": None, "started": False}
-                sd.subs.append({"min": int(m), "disp": display_minute(int(m)), "slot": slot,
-                                "out_id": out_p.get("id"), "out_name": out_p.get("name"),
-                                "out_stamina": round(st, 1), "in_id": best_in.get("id"),
-                                "in_name": best_in.get("name"),
-                                "reason": ("tired" if tired else (want or "quality")),
-                                "extra_time": bool(self.half >= 3)})
-                self.rec("sub", sd, zone=M3, lane="C", in_id=best_in.get("id"), out_id=out_p.get("id"))
-                self.half_delays["subs"] += 1
+                    ap["off"] = minute
+                sv["appear"][_pkey(best_in)] = {
+                    "player": best_in, "slot": slot, "slot_idx": idx,
+                    "on": minute, "off": None, "started": False}
+                sv["subs"].append({
+                    "min": int(minute), "disp": display_minute(minute),
+                    "slot": slot,
+                    "out_id": out_p.get("id"), "out_name": out_p.get("name"),
+                    "out_stamina": round(st, 1),
+                    "in_id": best_in.get("id"), "in_name": best_in.get("name"),
+                    "reason": ("tired" if tired else (want or "quality")),
+                    "extra_time": bool(is_extra),
+                })
+                plog.append({"min": float(minute), "team": sk, "zone": "mid", "lane": "C",
+                             "outcome": "sub", "me": False, "text": None,
+                             "in_id": best_in.get("id"), "out_id": out_p.get("id")})
                 did = True
-            if n_this and not free_window:
-                sd.windows -= 1
-            if n_this:
-                self.rebuild(sd)
-                if self.att is sd and self.car is not None and self.car.p not in sd.cur:
-                    self.car = self.pick_att(sd, self.zone, self.lane)
+            if n_this_window and not free_window:
+                sv["windows"] -= 1
         return did
 
-    # ── 행동 ──────────────────────────────────────────────────────────
-    def choose_action(self):
-        A, z = self.att, self.zone
-        if self.ctx == "gk":
-            return "short" if self.rng.random() < GK_SHORT_P.get(A.buildup, 0.6) else "long"
-        if self.ctx == "one_v_one":
-            return "shot"
-        base = MIX[z]
-        # [2026-10 안 A, 신민용 승인] 빌드업 성향은 볼을 전진시키는 구간(자기 진영·중원)에만 적용한다.
-        # 상대 진영·박스의 공격 선택은 공격 성향 축(ATTACK_MULT)의 몫 — 예전엔 두 축이 같은 장면에
-        # 겹쳐 걸려 DIRECT가 박스 투입을 과하게 늘렸다(동전력 승률 +10.2%p).
-        bm = BUILDUP_MULT.get(A.buildup, {}) if z <= M3 else {}
-        am = ATTACK_MULT.get(A.attack, {})
-        late = self.cur_min() >= 75
-        diff = A.score - self.other(A).score
-        acts, ws = [], []
-        for a, w in base.items():
-            if a == "cross" and self.lane == "C":
-                continue
-            w = w * bm.get(a, 1.0) * am.get(a, 1.0)
-            if self.counter > 0:
-                w *= COUNTER_MULT.get(a, 1.0)
-            if late and diff < 0:
-                w *= {"long": 1.5, "cross": 1.4, "shot": 1.25, "short": 0.85}.get(a, 1.0)
-            elif late and diff > 0 and self.cur_min() >= 80:
-                w *= {"short": 1.25, "shot": 0.85, "through": 0.8}.get(a, 1.0)
-            if a == "shot" and self.ctx in ("cutback", "box_dribble"):
-                w *= 1.6
-            acts.append(a)
-            ws.append(w)
-        if z == A3 and self.lane == "C":
-            # 중앙 레인엔 크로스가 없다 — 그 몫을 짧은 패스·스루패스에 나눈다(설계 3-1)
-            pass
-        return self.rng.choices(acts, weights=ws, k=1)[0]
+    # ── [2026-10 설계 A] 선수 단위 사건: 파울·카드·퇴장·세트피스 ─────────────
+    def _stats_of(sk):
+        return home_stats if sk == "home" else away_stats
 
-    def step(self):
-        """현재 점유에서 행동 하나."""
-        self.dead_ball = False
-        A, D = self.att, self.other(self.att)
-        if self.car is None or self.car.p not in A.cur:
-            self.car = self.pick_att(A, self.zone, self.lane)
-        # 역습을 끊는 전술 파울
-        if self.counter > 0 and self.zone in (M3, A3) and self.rng.random() < TACTICAL_FOUL:
-            d = self.pick_def(D, self.zone, self.lane)
-            self.tick(self.rng.uniform(1, 3))
-            self.foul(D, d, A, self.car, self.zone, self.lane, tactical=True,
-                      dogso=(self.zone >= A3 and self.counter > 0))
-            return
-        a = self.choose_action()
-        getattr(self, "act_" + a)()
-        if self.counter > 0:
-            self.counter -= 1
+    def _detail_of(sk):
+        return home_detail if sk == "home" else away_detail
 
-    def after_receive(self, recv, z):
-        """패스를 받은 순간의 압박. True면 볼을 지켰다."""
-        A, D = self.att, self.other(self.att)
-        pr = self.pressure(D, z)
-        u = self.rng.random()
-        bm = BOX_FOUL_MULT if z == BOX else 1.0
-        if u < RECV_FOUL * pr * 2.0 * bm:
-            d = self.pick_def(D, z, self.lane)
-            if self.rng.random() < self.clumsy(D, d):
-                self.foul(D, d, A, recv, z, self.lane)
-                return False
-            return True
-        if u >= (RECV_FOUL + RECV_DUEL) * pr * 2.0:
-            return True
-        d = self.pick_def(D, z, self.lane)
-        p_def = _sig(L_RECV_TACKLE + K_DUEL * (d.tck - recv.drb) / 10.0 - self.att_mod(A, D))
-        _pstat(D.ps, d.p)["tackles"] += 1
-        D.detail["tackles"] += 1
-        if self.rng.random() < FOUL_TACKLE * self.clumsy(D, d) * 0.5 * bm:
-            self.rec("buildup", A, action="duel", actor_id=recv.p.get("id"), ok=True,
-                     def_action="foul", def_actor_id=d.p.get("id"))
-            _pstat(D.ps, d.p)["tackles"] -= 1
-            D.detail["tackles"] -= 1
-            self.foul(D, d, A, recv, z, self.lane)
-            return False
-        if self.rng.random() < p_def:
-            _pstat(D.ps, d.p)["tackles_ok"] += 1
-            D.detail["tackles_ok"] += 1
-            self.rec("buildup", A, action="duel", actor_id=recv.p.get("id"), ok=False,
-                     def_action="tackle", def_actor_id=d.p.get("id"), def_ok=True)
-            self.turnover(D, z, self.lane, carrier=d, how="tackle")
-            return False
-        self.rec("buildup", A, action="duel", actor_id=recv.p.get("id"), ok=True,
-                 def_action="beaten", def_actor_id=d.p.get("id"), def_ok=False)
-        return True
+    def _pstats_of(sk):
+        return home_player_stats if sk == "home" else away_player_stats
 
-    def offside_check(self, base, recv):
-        A, D = self.att, self.other(self.att)
-        line = OFFSIDE_LINE_MULT.get(D.press_style, 1.0)
-        timing = 2.0 * _sig(K_DUEL * (D.line_q - recv.run) / 10.0)
-        if self.rng.random() < base * line * timing:
-            A.stats["offsides"] += 1
-            _pstat(A.ps, recv.p)["offsides"] += 1
-            self.rec("offside", A, zone=A3, player_id=recv.p.get("id"))
-            self.dead_time("offside")
-            D.detail["free_kicks"] += 1
-            self.start_poss(D, D3, self.lane)
-            return True
-        return False
+    def _model_of(sk):
+        return home if sk == "home" else away
 
-    def fail_pass(self, z_target, ln, d):
-        """패스 실패의 결과 — 가로채기(기록) / 걷어내기(기록, 자기 진영) / 볼 회수(기록 없음) /
-        루즈볼 / 아웃. 수비 기록은 수비수가 직접 끊거나 걷어낸 경우에만 남는다."""
-        A, D = self.att, self.other(self.att)
-        p_int, p_clr, p_rec, p_loose, _p_out = FAIL_SPLIT["high" if z_target >= A3 else "low"]
-        r = self.rng.random()
-        if r < p_int:
-            D.detail["interceptions"] += 1
-            _pstat(D.ps, d.p)["interceptions"] += 1
-            self.rec("interception", D, zone=_MIRROR[z_target], lane=ln, player_id=d.p.get("id"))
-            self.turnover(D, z_target, ln, carrier=d, how="interception")
-        elif r < p_int + p_clr:
-            D.detail["clearances"] += 1
-            _pstat(D.ps, d.p)["clearances"] += 1
-            self.rec("buildup", A, zone=z_target, lane=ln, def_action="clearance", def_actor_id=d.p.get("id"))
-            self.zone, self.lane = z_target, ln
-            self.loose_ball(M3, ln, 0.45)
-        elif r < p_int + p_clr + p_rec:
-            self.turnover(D, z_target, ln, carrier=d, how="recovery")
-        elif r < p_int + p_clr + p_rec + p_loose:
-            self.loose_ball(z_target, ln, 0.4)
-        else:
-            if z_target == BOX:
-                self.goal_kick(D)
-            else:
-                self.throw_in(D, _MIRROR[z_target], ln)
+    def _other(sk):
+        return "away" if sk == "home" else "home"
 
-    def act_short(self):
-        A, D = self.att, self.other(self.att)
-        z, c, r = self.zone, self.car, self.rng
-        tz = z
-        if z in BACK_PASS and r.random() < BACK_PASS[z]:
-            tz = z - 1
-        ln = self.lane
-        if r.random() < 0.3:
-            ln = r.choice(("L", "R")) if ln == "C" else "C"
-        self.tick(r.uniform(*T_ACT["short"]))
-        d = self.pick_def(D, z, self.lane)
-        pr = self.pressure(D, z)
-        gk_bonus = 0.8 if self.ctx == "gk" else 0.0
-        p = _sig(L_SHORT + K_PASS * (c.pas - d.prs) / 10.0 - PRESS_PASS_K * (pr - 0.5)
-                 + self.att_mod(A, D) + gk_bonus + ZONE_PASS_ADJ[z])
-        ok = r.random() < p
-        self.add_pass(A, c, ok)
-        if ok:
-            recv = self.pick_att(A, tz, ln, exclude=c)
-            prev_ctx = self.ctx
-            self.zone, self.lane, self.car = tz, ln, recv
-            self.assist_cand = c
-            # 컷백 = 측면에서 박스 안으로 꺾어 준 패스(중앙 레인 패스는 일반 박스 슈팅)
-            self.ctx = "cutback" if (z == BOX and self.lane != "C" and r.random() < 0.6) else None
-            if prev_ctx == "gk":
-                self.ctx = None
-            self.after_receive(recv, tz)
-        else:
-            self.fail_pass(z, self.lane, d)
+    def _add_goal(sk):
+        nonlocal home_score, away_score
+        if sk == "home":
+            home_score += 1
+        elif sk == "away":
+            away_score += 1
 
-    def act_fwd(self):
-        A, D = self.att, self.other(self.att)
-        z, c, r = self.zone, self.car, self.rng
-        if z >= BOX:
-            return self.act_short()
-        tz = z + 1
-        self.tick(r.uniform(*T_ACT["fwd"]))
-        recv = self.pick_att(A, tz, self.lane, exclude=c)
-        if tz == BOX and self.offside_check(OFF_FWD_BOX, recv):
-            self.add_pass(A, c, False)
-            return
-        d = self.pick_def(D, tz, self.lane)
-        pr = self.pressure(D, z)
-        p = _sig(L_FWD + K_PASS * (c.prg - d.prs) / 10.0 - PRESS_PASS_K * 0.7 * (pr - 0.5)
-                 + self.att_mod(A, D) - (BOX_PASS_PEN if tz == BOX else 0.0) + ZONE_PASS_ADJ[z])
-        ok = r.random() < p
-        self.add_pass(A, c, ok)
-        if ok:
-            if tz == A3:
-                A.detail["final_third_entries"] += 1
-            elif tz == BOX:
-                A.detail["box_entries"] += 1
-            self.zone, self.car, self.assist_cand, self.ctx = tz, recv, c, None
-            self.after_receive(recv, tz)
-        else:
-            self.fail_pass(tz, self.lane, d)
+    def _on_pitch(sk):
+        return [p for p in _sides[sk]["cur"] if p is not None]
 
-    def act_long(self):
-        A, D = self.att, self.other(self.att)
-        z, c, r = self.zone, self.car, self.rng
-        if z >= A3:
-            return self.act_fwd()
-        tz = A3 if (z == M3 or r.random() < 0.6) else M3
-        ln = r.choice(LANES)
-        self.tick(r.uniform(*T_ACT["long"]))
-        self.ctx = None
-        recv = self.pick_air(A, tz, ln, defending=False)
-        if tz == A3 and r.random() < 0.5 and self.offside_check(OFF_LONG, recv):
-            self.add_pass(A, c, False)
-            return
-        acc = r.random() < _sig(L_LONG_ACC + K_PASS * (c.prg - 60.0) / 10.0)
-        if not acc:
-            self.add_pass(A, c, False)
-            if r.random() < 0.45:
-                if tz == A3:
-                    self.goal_kick(D)
-                else:
-                    self.throw_in(D, _MIRROR[tz], ln)
-            else:
-                self.start_poss(D, _MIRROR[tz], ln)
-            return
-        if r.random() >= LONG_AERIAL:
-            # 땅볼·가슴 트래핑 — 공중 경합 없이 받는다(수비가 먼저 닿으면 가로채기)
-            d = self.pick_def(D, tz, ln)
-            ok = r.random() < _sig(_logit(0.62) + K_PASS * (recv.run - d.prs) / 10.0)
-            self.add_pass(A, c, ok)
-            if ok:
-                if tz == A3:
-                    A.detail["final_third_entries"] += 1
-                self.zone, self.lane, self.car, self.assist_cand = tz, ln, recv, c
-            else:
-                self.fail_pass(tz, ln, d)
-            return
-        dd = self.pick_air(D, tz, ln, defending=True)
-        won = self.aerial(A, recv, D, dd, tz, ln)
-        if won is None:
-            self.add_pass(A, c, False)
-            return
-        self.add_pass(A, c, won)
-        if won:
-            if tz == A3:
-                A.detail["final_third_entries"] += 1
-            self.zone, self.lane, self.car, self.assist_cand = tz, ln, recv, c
-            if r.random() < 0.5:   # 머리로 떨궈 동료에게
-                self.car = self.pick_att(A, tz, ln, exclude=recv)
-        else:
-            D.detail["clearances"] += 1
-            _pstat(D.ps, dd.p)["clearances"] += 1
-            self.rec("buildup", A, zone=tz, lane=ln, def_action="clearance", def_actor_id=dd.p.get("id"))
-            self.zone, self.lane = tz, ln
-            self.loose_ball(M3, ln, 0.45)
-
-    def aerial(self, A, ea, D, ed, z, ln, extra_edge=0.0):
-        """공중볼 경합. True=공격팀 승, False=수비팀 승, None=파울(재개됨)."""
-        A.detail["aerial_duels"] += 1
-        D.detail["aerial_duels"] += 1
-        _pstat(A.ps, ea.p)["aerials"] += 1
-        _pstat(D.ps, ed.p)["aerials"] += 1
-        if self.rng.random() < FOUL_AERIAL:
-            # 경합 중 파울 — 수비 반칙이면 공격 프리킥, 공격 반칙이면 수비 프리킥. 박스 안 공중볼은
-            # 대개 공격수의 밀기 반칙으로 불린다(수비 반칙 = PK라 수비가 조심한다).
-            if self.rng.random() < (0.15 if z == BOX else 0.55):
-                self.rec("buildup", A, zone=z, lane=ln,
-                         aerial={"def_id": ed.p.get("id"), "att_id": ea.p.get("id"), "won_by": A.name})
-                A.detail["aerial_duels_ok"] += 1
-                _pstat(A.ps, ea.p)["aerials_won"] += 1
-                self.zone, self.lane = z, ln
-                self.foul(D, ed, A, ea, z, ln)
-            else:
-                self.rec("buildup", A, zone=z, lane=ln,
-                         aerial={"def_id": ed.p.get("id"), "att_id": ea.p.get("id"), "won_by": D.name})
-                D.detail["aerial_duels_ok"] += 1
-                _pstat(D.ps, ed.p)["aerials_won"] += 1
-                self.zone, self.lane = _MIRROR[z], ln
-                self.foul(A, ea, D, ed, _MIRROR[z], ln)
+    def _best_taker(sk, attr):
+        """세트피스 키커 — 경기장에 있는 필드 선수 중 그 능력치가 가장 좋은 선수(동점이면 슈팅)."""
+        cands = [p for p in _on_pitch(sk) if p.get("position") != "GK"] or _on_pitch(sk)
+        if not cands:
             return None
-        p = _sig(K_DUEL * (ea.air - ed.air) / 10.0 - AERIAL_DEF_EDGE - extra_edge)
-        won = self.rng.random() < p
-        win_sd, win_e = (A, ea) if won else (D, ed)
-        win_sd.detail["aerial_duels_ok"] += 1
-        _pstat(win_sd.ps, win_e.p)["aerials_won"] += 1
-        self.rec("buildup", A, zone=z, lane=ln,
-                 aerial={"def_id": ed.p.get("id"), "att_id": ea.p.get("id"), "won_by": win_sd.name})
-        return won
+        return max(cands, key=lambda p: ((p.get(attr) or 0), (p.get("shooting") or 0)))
 
-    def act_through(self):
-        A, D = self.att, self.other(self.att)
-        z, c, r = self.zone, self.car, self.rng
-        if z < M3:
-            return self.act_fwd()
-        self.tick(r.uniform(*T_ACT["through"]))
-        pop = [e for e in A.ents if e.role in ("ATT", "MID") and e is not c] or [e for e in A.ents if e is not c]
-        recv = r.choices(pop, weights=[max(1.0, e.run) * (2.0 if e.role == "ATT" else 0.8)
-                                       * (1.5 if e.lane == self.lane else 1.0) for e in pop], k=1)[0]
-        if self.offside_check(OFF_THROUGH, recv):
-            self.add_pass(A, c, False)
+    # ── [2026-10 설계 B-1] 팀 세부 통계를 실제 선수에게 귀속시키는 선택기 ─────────
+    _ROLE_PASS_W = {"GK": 0.35, "DEF": 0.95, "MID": 1.45, "ATT": 0.8}
+    _WIDE = ("LB", "RB", "LWB", "RWB", "LM", "RM", "LW", "RW")
+
+    def _zone_players(sk):
+        return [z for z in _model_of(sk).zoned if z["player"] is not None]
+
+    def _pick_def(sk, lane, attr):
+        """수비 동작(태클·가로채기·클리어·블록) 주체 — 그 레인을 지키는 선수일수록, 그 능력치가
+        좋을수록. GK는 거의 안 고른다."""
+        zs = _zone_players(sk)
+        if not zs:
+            return None
+        w = [(0.02 if z["pos"] == "GK" else
+              (DEF_LANE_AFFINITY.get(z["pos"], {}).get(lane, 0.05) + 0.1))
+             * max(0.3, float(z["player"].get(attr) or 50) / 60.0) for z in zs]
+        return rng.choices(zs, weights=w, k=1)[0]["player"]
+
+    def _pick_att(sk, lane, attr, wide_only=False):
+        """공격 동작(크로스·드리블) 주체 — 그 레인 공격·미드 선수 중 그 능력치 가중."""
+        zs = [z for z in _zone_players(sk) if z["third"] in ("ATT", "MID")]
+        if wide_only:
+            zw = [z for z in zs if z["pos"] in _WIDE and z["lane"] == lane] or \
+                 [z for z in _zone_players(sk) if z["pos"] in _WIDE and z["lane"] == lane]
+            zs = zw or zs
+        if not zs:
+            zs = _zone_players(sk)
+        if not zs:
+            return None
+        w = [max(0.3, float(z["player"].get(attr) or 50) / 60.0) * (1.6 if z["lane"] == lane else 0.6)
+             for z in zs]
+        return rng.choices(zs, weights=w, k=1)[0]["player"]
+
+    def _pick_aerial(sk):
+        zs = [z for z in _zone_players(sk) if z["pos"] != "GK"]
+        if not zs:
+            return None
+        w = [max(1.0, ((z["player"].get("heading") or 50) + (z["player"].get("jump") or 50)) / 2.0)
+             * (1.3 if z["third"] in ("DEF", "ATT") else 0.7) for z in zs]
+        return rng.choices(zs, weights=w, k=1)[0]["player"]
+
+    def _assign_passes(sk, lane, n, n_ok, minute):
+        """이번 분 패스 n회(성공 n_ok)를 경기장 선수에게 나눈다 — 중원·같은 레인·패스 능력 가중.
+        성공은 난수를 더 쓰지 않고 패스 능력이 좋은 선수 순서로 배정(팀 합계는 그대로)."""
+        zs = _zone_players(sk)
+        if not zs or n <= 0:
             return
-        p = _sig(L_THROUGH + K_PASS * (c.prg - D.line_q) / 10.0 + self.att_mod(A, D) * 1.5)
-        ok = r.random() < p
-        self.add_pass(A, c, ok)
-        if ok:
-            A.detail["box_entries"] += 1
-            self.zone, self.car, self.assist_cand, self.ctx = BOX, recv, c, "one_v_one"
-            # 뒤따라온 수비의 마지막 태클(실패하면 파울 → 득점 기회 저지)
-            if r.random() < 0.25:
-                d = self.pick_def(D, BOX, self.lane)
-                _pstat(D.ps, d.p)["tackles"] += 1
-                D.detail["tackles"] += 1
-                if r.random() < FOUL_TACKLE * self.clumsy(D, d):
-                    _pstat(D.ps, d.p)["tackles"] -= 1
-                    D.detail["tackles"] -= 1
-                    self.rec("buildup", A, zone=BOX, action="duel", actor_id=recv.p.get("id"), ok=True,
-                             def_action="foul", def_actor_id=d.p.get("id"))
-                    self.foul(D, d, A, recv, BOX if r.random() < 0.6 else A3, self.lane,
-                              tactical=True, dogso=True)
-                    return
-                if r.random() < _sig(L_RECV_TACKLE + K_DUEL * (d.tck - recv.drb) / 10.0 - 0.4):
-                    _pstat(D.ps, d.p)["tackles_ok"] += 1
-                    D.detail["tackles_ok"] += 1
-                    self.rec("buildup", A, zone=BOX, action="duel", actor_id=recv.p.get("id"), ok=False,
-                             def_action="tackle", def_actor_id=d.p.get("id"), def_ok=True)
-                    self.turnover(D, BOX, self.lane, carrier=d, how="tackle")
-                    return
-                self.rec("buildup", A, zone=BOX, action="duel", actor_id=recv.p.get("id"), ok=True,
-                         def_action="beaten", def_actor_id=d.p.get("id"), def_ok=False)
+        w = [_ROLE_PASS_W.get(z["third"], 1.0) * (1.25 if z["lane"] == lane else 1.0)
+             * max(0.3, float(z["player"].get("passing") or 50) / 60.0) for z in zs]
+        picked = rng.choices(zs, weights=w, k=n)
+        ps = _pstats_of(sk)
+        order = sorted(range(n), key=lambda i: -(picked[i]["player"].get("passing") or 50))
+        ok_set = set(order[:n_ok])
+        _pm = {}
+        for i, z in enumerate(picked):
+            rec = _pstat(ps, z["player"])
+            rec["passes"] += 1
+            pid = z["player"].get("id")
+            e = _pm.setdefault(pid, [pid, 0, 0])
+            e[1] += 1
+            if i in ok_set:
+                rec["passes_ok"] += 1
+                e[2] += 1
+        pass_log.append([float(minute), sk, list(_pm.values())])
+
+    def _send_off(sk, p, minute, reason):
+        """퇴장 — 그 선수를 경기에서 빼고 자리를 비운다(교체로 채울 수 없다 — _try_subs는 경기장에
+        있는 선수만 바꾸므로 빈 자리는 그대로 남는다). GK가 퇴장당하면 현실처럼 예비 GK를 넣고
+        필드 선수 한 명을 빼거나(교체 여유가 있을 때), 여유가 없으면 필드 선수가 골문을 맡는다."""
+        sv = _sides[sk]
+        idx = next((i for i, q in enumerate(sv["cur"]) if q is p), None)
+        if idx is None:
+            return
+        labels = sv["slots"] or _FALLBACK_SLOTS
+        slot = labels[idx] if idx < len(labels) else p.get("position", "CM")
+        _pstat(_pstats_of(sk), p)["red"] += 1
+        _stats_of(sk)["red_cards"] += 1
+        plog.append({"min": float(minute), "team": sk, "zone": "mid", "lane": "C",
+                     "outcome": "red", "me": False, "text": None,
+                     "player_id": p.get("id"), "reason": reason})
+        sv["cur"][idx] = None
+        _ap = sv["appear"].get(_pkey(p))
+        if _ap is not None:
+            _ap["off"] = minute
+            _ap["sent_off"] = True
+        _sent_off[sk].append(p)
+        if slot == "GK":
+            outs = [(i, q) for i, q in enumerate(sv["cur"])
+                    if q is not None and (labels[i] if i < len(labels) else "") != "GK"]
+            bgk = next((b for b in sv["bench"] if b.get("position") == "GK"), None)
+            if outs and bgk is not None and sv["used"] < SUBS_MAX_PLAYERS and sv["windows"] > 0:
+                # 가장 공격적인 자리(공격 3선)의 가장 지친 선수를 빼고 예비 GK 투입.
+                def _att_rank(t):
+                    _sl = labels[t[0]] if t[0] < len(labels) else "CM"
+                    return (_third_of(_POS_XY.get(_sl, (0.3, 0.5))[0]) == "ATT", -stam.get(t[1]))
+                oi, op = max(outs, key=_att_rank)
+                sv["cur"][oi] = None
+                _oap = sv["appear"].get(_pkey(op))
+                if _oap is not None:
+                    _oap["off"] = minute
+                sv["cur"][idx] = bgk
+                sv["bench"].remove(bgk)
+                sv["used"] += 1
+                sv["windows"] -= 1
+                sv["appear"][_pkey(bgk)] = {"player": bgk, "slot": "GK", "slot_idx": idx,
+                                            "on": minute, "off": None, "started": False}
+                sv["subs"].append({"min": int(minute), "disp": display_minute(minute), "slot": "GK",
+                                   "out_id": op.get("id"), "out_name": op.get("name"),
+                                   "out_stamina": round(stam.get(op), 1),
+                                   "in_id": bgk.get("id"), "in_name": bgk.get("name"),
+                                   "reason": "gk_sent_off", "extra_time": minute > REG_MINUTES})
+                plog.append({"min": float(minute), "team": sk, "zone": "mid", "lane": "C",
+                             "outcome": "sub", "me": False, "text": None,
+                             "in_id": bgk.get("id"), "out_id": op.get("id")})
+            elif outs:
+                # 교체 여유가 없다 — 필드 선수 중 점프·포지셔닝이 가장 나은 선수가 골문으로.
+                oi, op = max(outs, key=lambda t: ((t[1].get("jump") or 0) + (t[1].get("positioning") or 0)))
+                sv["cur"][oi] = None
+                sv["cur"][idx] = op
+        _rebuild_models()
+
+    def _book(sk, p, minute):
+        """옐로카드. 같은 경기 두 번째면 경고 누적 퇴장."""
+        ps = _pstat(_pstats_of(sk), p)
+        ps["yellow"] += 1
+        _stats_of(sk)["yellow_cards"] += 1
+        plog.append({"min": float(minute), "team": sk, "zone": "mid", "lane": "C",
+                     "outcome": "yellow", "me": False, "text": None, "player_id": p.get("id")})
+        if ps["yellow"] >= 2:
+            _send_off(sk, p, minute, "second_yellow")
+
+    def _on_corner(atk, lane, minute, allow_shot=True):
+        """코너킥 — 통계·로그에 올리고, 일부는 헤더 등 슈팅으로 이어진다(코너 슈팅에서 다시 코너가
+        나오는 연쇄는 막는다)."""
+        _stats_of(atk)["corners"] += 1
+        _detail_of(atk)["final_third_entries"] += 1
+        plog.append({"min": float(minute), "team": atk, "zone": "att", "lane": lane,
+                     "outcome": "corner", "me": False, "text": None})
+        if not allow_shot or rng.random() >= CORNER_SHOT:
+            return
+        am, dm = _model_of(atk), _model_of(_other(atk))
+        cz = [z for z in am.zoned if z["pos"] != "GK"]
+        if not cz:
+            return
+        # 헤더 경합 — 수비수·최전방이 주로 들어간다(공중볼 능력 가중).
+        w = [max(1.0, ((z["player"].get("heading") or 50) + (z["player"].get("jump") or 50)) / 2.0
+                 * (1.3 if z["third"] in ("DEF", "ATT") else 0.7)) for z in cz]
+        header = rng.choices(cz, weights=w, k=1)[0]["player"]
+        pool = [z["player"] for z in cz]
+        if _resolve_shot(rng, atk, lane, minute, pool, dm.gk, dm.gk_q,
+                         home_stats, away_stats, home_player_stats, away_player_stats, plog,
+                         home_detail, away_detail, forced_shooter=header, kind="corner",
+                         pick_def=lambda ln, _d=_other(atk): _pick_def(_d, ln, "positioning")):
+            _add_goal(atk)
+
+    def _foul(atk, lane, quality, minute):
+        """공격측(atk)의 공격을 수비측이 파울로 끊는다 — 파울한 선수·당한 선수·위치(공격 진영이면
+        프리킥 위협/PK)·카드까지 한 번에 판정한다."""
+        dfn = _other(atk)
+        dm, am = _model_of(dfn), _model_of(atk)
+        _stats_of(dfn)["fouls"] += 1
+        dz = [z for z in dm.zoned if z["player"] is not None]
+        if not dz:
+            return
+        # 그 레인을 지키는 선수일수록, 태클이 서툴수록 파울이 많다(GK는 드물게).
+        fw = []
+        for z in dz:
+            if z["pos"] == "GK":
+                fw.append(0.03)
+                continue
+            aff = DEF_LANE_AFFINITY.get(z["pos"], {}).get(lane, 0.05) + 0.15
+            clumsy = 1.0 + max(-0.3, min(0.5, (60.0 - float(z["player"].get("tackling") or 50)) / 80.0))
+            # 이미 경고를 받은 선수는 조심한다 — 현실에서 2차 경고가 드문 이유.
+            _bk = BOOKED_CAUTION if _pstat(_pstats_of(dfn), z["player"]).get("yellow") else 1.0
+            fw.append(max(0.05, aff * clumsy * _bk))
+        fouler = rng.choices(dz, weights=fw, k=1)[0]["player"]
+        _apool = [z["player"] for z in am.zoned if z["pos"] != "GK"] or [z["player"] for z in am.zoned]
+        if not _apool:
+            return
+        victim = rng.choices(_apool, weights=[max(1.0, float(p.get("dribbling") or 50))
+                                              * (1.4 if p in ((home_pool_by_lane if atk == "home"
+                                                               else away_pool_by_lane) or {}).get(lane, [])
+                                                 else 1.0) for p in _apool], k=1)[0]
+        _pstat(_pstats_of(dfn), fouler)["fouls"] += 1
+        _pstat(_pstats_of(atk), victim)["fouled"] += 1
+        in_att = rng.random() < max(0.05, min(0.60, FOUL_ATT_ZONE_BASE + (quality - 0.5) * 0.9))
+        _frec = {"min": float(minute), "team": dfn, "zone": ("def" if in_att else "mid"), "lane": lane,
+                 "outcome": "foul", "me": False, "text": None,
+                 "player_id": fouler.get("id"), "victim_id": victim.get("id")}
+        plog.append(_frec)
+        # 카드 — 직접 퇴장(난폭/득점 기회 저지) > 옐로(전술적 파울 가산).
+        _r = rng.random()
+        p_red = RED_PER_FOUL + (RED_DOGSO if (in_att and quality > 0.65) else 0.0)
+        p_y = YELLOW_PER_FOUL + (YELLOW_TACTICAL_BONUS if in_att else 0.0) + max(0.0, quality - 0.5) * 0.15
+        if _r < p_red:
+            _send_off(dfn, fouler, minute, "red")
+        elif _r < p_red + p_y:
+            _book(dfn, fouler, minute)
+        # 세트피스 — 공격 진영 파울만 PK/직접 프리킥 위협이 된다.
+        fd = _detail_of(atk)
+        if not in_att:
+            fd["free_kicks"] += 1
+            return
+        _r2 = rng.random()
+        dm = _model_of(dfn)                       # 퇴장(GK 교체 포함) 뒤 최신 모델
+        if _r2 < PENALTY_FROM_ATT_FOUL:
+            fd["penalties"] += 1
+            _frec["pk"] = True              # 평점 장부가 PK 얻음/허용을 이 기록에서 읽는다
+            _pstat(_pstats_of(atk), victim)["pk_won"] += 1
+            _pstat(_pstats_of(dfn), fouler)["pk_conceded"] += 1
+            taker = _best_taker(atk, "setpiece")
+            if taker is not None and _resolve_shot(
+                    rng, atk, lane, minute, None, dm.gk, dm.gk_q,
+                    home_stats, away_stats, home_player_stats, away_player_stats, plog,
+                    home_detail, away_detail, forced_shooter=taker, kind="pk",
+                    on_corner=_on_corner,
+                    pick_def=lambda ln, _d=dfn: _pick_def(_d, ln, "positioning")):
+                _add_goal(atk)
+        elif _r2 < PENALTY_FROM_ATT_FOUL + DIRECT_FK_SHOT:
+            fd["free_kicks"] += 1
+            taker = _best_taker(atk, "setpiece")
+            if taker is not None and _resolve_shot(
+                    rng, atk, lane, minute, None, dm.gk, dm.gk_q,
+                    home_stats, away_stats, home_player_stats, away_player_stats, plog,
+                    home_detail, away_detail, forced_shooter=taker, kind="fk",
+                    on_corner=_on_corner,
+                    pick_def=lambda ln, _d=dfn: _pick_def(_d, ln, "positioning")):
+                _add_goal(atk)
         else:
-            u = r.random()
-            if u < 0.25 and D.gk is not None:
-                self.gk_ball(D)
-            elif u < 0.80:
-                d = self.pick_def(D, BOX, self.lane)
-                D.detail["interceptions"] += 1
-                _pstat(D.ps, d.p)["interceptions"] += 1
-                self.rec("interception", D, zone=D3, player_id=d.p.get("id"))
-                self.turnover(D, BOX, self.lane, carrier=d, how="interception")
-            else:
-                self.goal_kick(D)
+            fd["free_kicks"] += 1
 
-    def act_drib(self):
-        A, D = self.att, self.other(self.att)
-        z, c, r = self.zone, self.car, self.rng
-        self.tick(r.uniform(*T_ACT["drib"]))
-        d = self.pick_def(D, z, self.lane)
-        pr = self.pressure(D, z)
-        p = _sig(L_DRIB + K_DUEL * (c.drb - d.tck) / 10.0 + self.att_mod(A, D) - 0.3 * (pr - 0.5))
-        A.detail["dribbles"] += 1
-        D.detail["tackles"] += 1
-        _pstat(A.ps, c.p)["dribbles"] += 1
-        _pstat(D.ps, d.p)["tackles"] += 1
-        if r.random() < p:
-            A.detail["dribbles_ok"] += 1
-            _pstat(A.ps, c.p)["dribbles_ok"] += 1
-            self.rec("buildup", A, action="dribble", actor_id=c.p.get("id"), ok=True,
-                     def_action="beaten", def_actor_id=d.p.get("id"), def_ok=False)
-            if z < BOX and r.random() < ADV_AFTER_DRIB.get(z, 0.4):
-                self.zone = z + 1
-                if self.zone == A3:
-                    A.detail["final_third_entries"] += 1
-                elif self.zone == BOX:
-                    A.detail["box_entries"] += 1
-            self.ctx = "box_dribble" if self.zone == BOX else None
-            self.assist_cand = None
-            return
-        # 실패 — 무리한 태클이면 파울, 아니면 뺏김(일부는 터치 실수로 아웃)
-        if r.random() < FOUL_TACKLE * self.clumsy(D, d) * (1.0 + 0.6 * (pr - 0.5)) * (BOX_FOUL_MULT if z == BOX else 1.0):
-            # 파울은 태클 기록이 아니다(태클 시도 = 볼에 닿은 태클·뚫린 태클)
-            D.detail["tackles"] -= 1
-            _pstat(D.ps, d.p)["tackles"] -= 1
-            self.rec("buildup", A, action="dribble", actor_id=c.p.get("id"), ok=True,
-                     def_action="foul", def_actor_id=d.p.get("id"))
-            A.detail["dribbles_ok"] += 1
-            _pstat(A.ps, c.p)["dribbles_ok"] += 1
-            self.foul(D, d, A, c, z, self.lane, tactical=self.counter > 0,
-                      dogso=(self.counter > 0 and z >= A3))
-            return
-        if r.random() < 0.88:
-            D.detail["tackles_ok"] += 1
-            _pstat(D.ps, d.p)["tackles_ok"] += 1
-            self.rec("buildup", A, action="dribble", actor_id=c.p.get("id"), ok=False,
-                     def_action="tackle", def_actor_id=d.p.get("id"), def_ok=True)
-            self.turnover(D, z, self.lane, carrier=d, how="tackle")
+    _rebuild_models()
+
+    def _run_phase(lo, hi, is_extra=False):
+        nonlocal home_score, away_score, home_poss_minutes, _cur_minute
+        for minute in range(lo, hi + 1):
+            _cur_minute = minute
+            _minute_body(minute, is_extra)
+
+    def _minute_body(minute, is_extra):
+        nonlocal home_score, away_score, home_poss_minutes
+        poss_home = rng.random() < p_home_poss
+        if poss_home:
+            home_poss_minutes += 1
+            side, dfn_opp = "home", away
+            lanes, weights = home_lanes, home_weights
+            quality_by_lane, pool_by_lane = home_quality_by_lane, home_pool_by_lane
+            mult_by_lane = home_mult_by_lane
         else:
-            # 수비와 닿기 전에 터치가 길었다 — 태클 시도 아님
-            D.detail["tackles"] -= 1
-            _pstat(D.ps, d.p)["tackles"] -= 1
-            self.rec("buildup", A, action="dribble", actor_id=c.p.get("id"), ok=False)
-            if z == BOX:
-                self.goal_kick(D)
-            else:
-                self.throw_in(D, _MIRROR[z], self.lane)
+            side, dfn_opp = "away", home
+            lanes, weights = away_lanes, away_weights
+            quality_by_lane, pool_by_lane = away_quality_by_lane, away_pool_by_lane
+            mult_by_lane = away_mult_by_lane
 
-    def act_cross(self, set_piece=False):
-        A, D = self.att, self.other(self.att)
-        c, r = self.car, self.rng
-        ln = self.lane if self.lane != "C" else r.choice(("L", "R"))
-        self.zone, self.lane = A3, ln
-        if not set_piece:
-            self.tick(r.uniform(*T_ACT["cross"]))
-        d = self.pick_def(D, A3, ln)
-        A.detail["crosses"] += 1
-        _pstat(A.ps, c.p)["crosses"] += 1
-        acc = r.random() < _sig(L_CROSS_ACC + K_PASS * (c.crs - d.blk) / 10.0 + self.att_mod(A, D))
-        if acc and D.gk is not None and r.random() < GK_CLAIM_CROSS:
-            acc = False
-            self.add_pass(A, c, False)
-            self.rec("buildup", A, action="cross", actor_id=c.p.get("id"), ok=False)
-            self.gk_ball(D)
-            return
-        if acc:
-            ra = self.pick_air(A, BOX, "C", defending=False)
-            dd = self.pick_air(D, BOX, "C", defending=True)
-            won = self.aerial(A, ra, D, dd, BOX, "C", extra_edge=CROSS_AIR_DEF_EDGE)
-            if won is None:
-                self.add_pass(A, c, False)
-                return
-            self.add_pass(A, c, won)
-            if won:
-                A.detail["crosses_ok"] += 1
-                A.detail["box_entries"] += 1
-                _pstat(A.ps, c.p)["crosses_ok"] += 1
-                self.rec("buildup", A, action="cross", actor_id=c.p.get("id"), ok=True)
-                self.zone, self.lane, self.car, self.assist_cand = BOX, "C", ra, c
-                if r.random() < HEADER_SHOT_P:
-                    self.shot(A, D, ra, "header")
+        lane = rng.choices(lanes, weights=weights, k=1)[0]
+        quality = quality_by_lane[lane]
+        atk_detail = home_detail if side == "home" else away_detail
+        dfn_detail = away_detail if side == "home" else home_detail
+
+        # [2026-09 신설] 패스는 슈팅/코너/파울/빌드업과 무관하게 "이번 분에
+        # 볼을 가진 팀"이면 항상 몇 번씩 오간다고 보고 매 분 누적한다(기존
+        # shot_chance/corner_chance/foul_chance 판정과는 완전히 별개 —
+        # 결과 결정 로직은 안 건드림). 성공률은 이 레인의 quality(공격측이
+        # 수비를 얼마나 압도하는가)에 연동 — 밀어붙이는 팀일수록 패스가
+        # 더 잘 이어진다는 감각.
+        _pass_n = PASS_PER_POSS_MIN[0] + rng.randrange(0, PASS_PER_POSS_MIN[1] - PASS_PER_POSS_MIN[0] + 1)
+        _pass_p = max(0.55, min(0.95, 0.68 + (quality - 0.5) * 0.35))
+        _pass_ok = int(round(_pass_n * _pass_p + rng.uniform(-0.4, 0.4)))
+        _pass_ok = max(0, min(_pass_n, _pass_ok))
+        atk_detail["passes"] += _pass_n
+        atk_detail["passes_ok"] += _pass_ok
+        _assign_passes(side, lane, _pass_n, _pass_ok, minute)
+        # 실패한 패스 하나하나 — 수비수가 직접 끊었으면 가로채기(그 수비수 기록).
+        for _fp in range(_pass_n - _pass_ok):
+            if rng.random() < INTERCEPT_OF_FAILED_PASS:
+                _ds = _other(side)
+                _ic = _pick_def(_ds, lane, "positioning")
+                dfn_detail["interceptions"] += 1
+                dfn_detail["turnovers_won"] += 1
+                atk_detail["turnovers_lost"] += 1
+                if _ic is not None:
+                    _pstat(_pstats_of(_ds), _ic)["interceptions"] += 1
+                plog.append({"min": float(minute), "team": _ds, "zone": "mid", "lane": lane,
+                             "outcome": "interception", "me": False, "text": None,
+                             "player_id": _ic.get("id") if _ic else None})
+
+        roll = rng.random()
+        shot_chance = 0.075 + quality * 0.23             # 대략 7.5~30.5%
+        corner_chance = 0.02 + quality * 0.035          # 걷어낸 공이 라인 밖으로
+        # [2026-10 설계 A] 수비측이 공격을 파울로 끊는 국면 — 공격측이 우세할수록 끊을 일이 많다.
+        foul_chance = FOUL_BASE + FOUL_PRESSURE * quality
+
+        shooter_pool = pool_by_lane[lane]
+        shooter_mults = mult_by_lane[lane]
+
+        if roll < shot_chance:
+            scorer_side = _resolve_shot(
+                rng, side, lane, minute, shooter_pool, dfn_opp.gk, dfn_opp.gk_q,
+                home_stats, away_stats, home_player_stats, away_player_stats, plog,
+                home_detail, away_detail, shooter_mults=shooter_mults, on_corner=_on_corner,
+                pick_def=lambda ln, _d=_other(side): _pick_def(_d, ln, "positioning"))
+            if scorer_side == "home":
+                home_score += 1
+            elif scorer_side == "away":
+                away_score += 1
+        elif roll < shot_chance + corner_chance:
+            _on_corner(side, lane, minute)
+        elif roll < shot_chance + corner_chance + foul_chance:
+            # [2026-10 설계 A] 파울한 선수·당한 선수·카드·퇴장·PK/직접 프리킥까지 선수 단위로.
+            _foul(side, lane, quality, minute)
+        else:
+            # [신규 — 필러 없는 진짜 로그] 예전엔 이 "특별한 일 없는" 분들이
+            # match_flow의 무작위 필러(최대 24개, 실제 우세와 무관하게
+            # 대충 배분)로 채워졌다. 이제는 이 시뮬레이션이 실제로 계산한
+            # "이번 분에 어느 팀이 어느 레인/서드에서 우세했는가"를 그대로
+            # 기록한다 — 90분 전체가 진짜 매치업 계산의 산출물이 된다.
+            # zone(서드)은 quality(공격측이 그 레인에서 얼마나 우세했는지)
+            # 로 판정: 크게 우세하면 상대 진영 깊숙이(att), 팽팽하면
+            # 중원(mid), 밀리면 자기 진영(def)에 머문 것으로 본다.
+            # [2026-10 설계 A] 국면이 어느 진영에서 펼쳐졌는지는 우세도에 따라 "확률적으로" 정한다.
+            # 예전엔 quality > 0.62 고정 문턱이라, 레인 우세도가 경기 내내 고정값인 비슷한 전력끼리는
+            # 공격 진영 국면이 한 번도 안 나와 크로스·드리블·오프사이드가 통째로 0이 됐다.
+            _u = rng.random()
+            _p_att = max(0.05, min(0.75, 0.25 + (quality - 0.5) * 1.2))
+            _p_def = max(0.05, min(0.75, 0.25 - (quality - 0.5) * 1.2))
+            if _u < _p_att:
+                zone = "att"
+            elif _u < _p_att + _p_def:
+                zone = "def"
+            else:
+                zone = "mid"
+
+            # [2026-10 설계 A] 오프사이드 — 침투 패스 순간 공격수가 수비 라인보다 앞서 있으면 끊긴다.
+            # 상대 수비 라인이 높을수록(전방 압박) 잦고, 공격측이 우세해 침투를 많이 시도할수록 잦다.
+            _offside = False
+            if zone != "def":
+                _dst = (away_style if side == "home" else home_style) or {}
+                _line = OFFSIDE_LINE_MULT.get(_dst.get("style_press") or "MID_BLOCK", 1.0)
+                if rng.random() < OFFSIDE_PER_BUILDUP * _line * (0.7 + 0.6 * quality):
+                    _offside = True
+                    _am = _model_of(side)
+                    _fz = [z["player"] for z in _am.zoned if z["third"] == "ATT"] or \
+                          [z["player"] for z in _am.zoned if z["third"] == "MID"]
+                    if _fz:
+                        _runner = rng.choices(_fz, weights=[max(1.0, float(p.get("speed") or 50))
+                                                            for p in _fz], k=1)[0]
+                        _pstat(_pstats_of(side), _runner)["offsides"] += 1
+                        _rid = _runner.get("id")
+                    else:
+                        _rid = None
+                    _stats_of(side)["offsides"] += 1
+                    plog.append({"min": float(minute), "team": side, "zone": "att", "lane": lane,
+                                 "outcome": "offside", "me": False, "text": None, "player_id": _rid})
+
+            # [2026-09 신설] 이 "특별한 일 없는" 국면도 실제로 무슨 장면
+            # 이었는지 세부 통계로 나눠 둔다 — possession_log 텍스트/필러
+            # 로직도, 위 shot/corner/foul 판정도 안 건드리고 병렬로만
+            # 누적한다.
+            # [2026-10 설계 B-1 재시도] 이 국면의 공격 시도와, 그 시도를 막은(또는 뚫린) 수비수.
+            _act = None
+            _dside = _other(side)
+            _ps_a, _ps_d = _pstats_of(side), _pstats_of(_dside)
+            if zone == "att":
+                atk_detail["final_third_entries"] += 1
+            if zone in ("att", "mid") and not _offside:
+                _did_cross = False
+                if zone == "att" and lane != "C" and rng.random() < CROSS_P_WIDE:
+                    _did_cross = True
+                    atk_detail["crosses"] += 1
+                    _cr = _pick_att(side, lane, "passing", wide_only=True)
+                    _ok = rng.random() < (0.22 + quality * 0.20)
+                    _clr = None
+                    if _cr is not None:
+                        _pstat(_ps_a, _cr)["crosses"] += 1
+                    if _ok:
+                        atk_detail["crosses_ok"] += 1
+                        if _cr is not None:
+                            _pstat(_ps_a, _cr)["crosses_ok"] += 1
+                    elif rng.random() < CROSS_CLEARED:
+                        _clr = _pick_def(_dside, lane, "heading")
+                        dfn_detail["clearances"] += 1
+                        if _clr is not None:
+                            _pstat(_ps_d, _clr)["clearances"] += 1
+                    elif rng.random() < CORNER_FROM_CROSS:
+                        _on_corner(side, lane, minute)      # 걷어내지 못하고 라인 밖으로
+                    _act = {"action": "cross", "actor_id": _cr.get("id") if _cr else None, "ok": _ok,
+                            "def_action": "clearance" if _clr is not None else None,
+                            "def_actor_id": _clr.get("id") if _clr is not None else None, "def_ok": True}
+                if not _did_cross and rng.random() < DRIBBLE_P[zone]:
+                    atk_detail["dribbles"] += 1
+                    _dr = _pick_att(side, lane, "dribbling")
+                    _ok = rng.random() < (0.40 + quality * 0.30)
+                    if _dr is not None:
+                        _pstat(_ps_a, _dr)["dribbles"] += 1
+                    _opp, _dk = None, None
+                    if _ok:
+                        atk_detail["dribbles_ok"] += 1
+                        if _dr is not None:
+                            _pstat(_ps_a, _dr)["dribbles_ok"] += 1
+                        if rng.random() < DRIBBLE_BEATEN_DEF:
+                            # 붙었다가 뚫린 수비수 — 태클 시도 실패로 기록
+                            _opp = _pick_def(_dside, lane, "tackling")
+                            _dk = "beaten"
+                            dfn_detail["tackles"] += 1
+                            if _opp is not None:
+                                _pstat(_ps_d, _opp)["tackles"] += 1
+                    elif rng.random() < DRIBBLE_TACKLED:
+                        _opp = _pick_def(_dside, lane, "tackling")
+                        _dk = "tackle"
+                        dfn_detail["tackles"] += 1
+                        dfn_detail["tackles_ok"] += 1
+                        dfn_detail["turnovers_won"] += 1
+                        atk_detail["turnovers_lost"] += 1
+                        if _opp is not None:
+                            _pstat(_ps_d, _opp)["tackles"] += 1
+                            _pstat(_ps_d, _opp)["tackles_ok"] += 1
+                    _act = {"action": "dribble", "actor_id": _dr.get("id") if _dr else None, "ok": _ok,
+                            "def_action": _dk, "def_actor_id": _opp.get("id") if _opp else None,
+                            "def_ok": _dk == "tackle"}
+            elif zone == "def":
+                # 공격측이 밀리는 국면 — 볼 가진 선수와 수비수의 경합.
+                sub = rng.random()
+                if sub < DEF_ZONE_TACKLE:
+                    dfn_detail["tackles"] += 1
+                    _tk = _pick_def(_dside, lane, "tackling")
+                    _carrier = _pick_att(side, lane, "dribbling")
+                    _ok = rng.random() < (0.45 + (1.0 - quality) * 0.30)
+                    if _tk is not None:
+                        _pstat(_ps_d, _tk)["tackles"] += 1
+                    if _ok:
+                        dfn_detail["tackles_ok"] += 1
+                        dfn_detail["turnovers_won"] += 1
+                        atk_detail["turnovers_lost"] += 1
+                        if _tk is not None:
+                            _pstat(_ps_d, _tk)["tackles_ok"] += 1
+                    _act = {"action": "duel", "actor_id": _carrier.get("id") if _carrier else None,
+                            "ok": not _ok, "def_action": "tackle" if _ok else "beaten",
+                            "def_actor_id": _tk.get("id") if _tk else None, "def_ok": _ok}
+                elif sub < DEF_ZONE_TACKLE + DEF_ZONE_CLEAR:
+                    dfn_detail["clearances"] += 1
+                    _cl = _pick_def(_dside, lane, "heading")
+                    if _cl is not None:
+                        _pstat(_ps_d, _cl)["clearances"] += 1
+                    _act = {"def_action": "clearance", "def_actor_id": _cl.get("id") if _cl else None,
+                            "def_ok": True}
+            _aerial = None
+            if rng.random() < AERIAL_PER_MIN:
+                dfn_detail["aerial_duels"] += 1
+                atk_detail["aerial_duels"] += 1
+                _ad, _aa = _pick_aerial(_dside), _pick_aerial(side)
+                for _sk2, _pp in ((_dside, _ad), (side, _aa)):
+                    if _pp is not None:
+                        _pstat(_pstats_of(_sk2), _pp)["aerials"] += 1
+
+                def _air(p_):
+                    return ((p_.get("heading") or 50) + (p_.get("jump") or 50) + (p_.get("strength") or 50)) / 3.0 \
+                        if p_ is not None else 50.0
+                # 공중볼 승자 — 세 능력치 비교(수비측이 자리를 잡고 있어 약간 유리).
+                if rng.random() < _sigmoid((_air(_ad) - _air(_aa)) / 12.0 + 0.2):
+                    dfn_detail["aerial_duels_ok"] += 1
+                    _win = (_dside, _ad)
                 else:
-                    self.car = self.pick_att(A, BOX, "C", exclude=ra)
-                    self.assist_cand, self.ctx = ra, "cutback"
-                return
-            D.detail["clearances"] += 1
-            _pstat(D.ps, dd.p)["clearances"] += 1
-            self.rec("buildup", A, action="cross", actor_id=c.p.get("id"), ok=False,
-                     def_action="clearance", def_actor_id=dd.p.get("id"), def_ok=True)
-            if r.random() < 0.20:
-                self.corner(A, ln)
-            else:
-                self.loose_ball(M3, ln, 0.45)
-            return
-        self.add_pass(A, c, False)
-        u = r.random()
-        if u < 0.70:
-            D.detail["clearances"] += 1
-            _pstat(D.ps, d.p)["clearances"] += 1
-            self.rec("buildup", A, action="cross", actor_id=c.p.get("id"), ok=False,
-                     def_action="clearance", def_actor_id=d.p.get("id"), def_ok=True)
-            if r.random() < 0.25:
-                self.corner(A, ln)
-            else:
-                self.loose_ball(M3, ln, 0.4)
-        elif u < 0.85 and D.gk is not None:
-            self.rec("buildup", A, action="cross", actor_id=c.p.get("id"), ok=False)
-            self.gk_ball(D)
+                    atk_detail["aerial_duels_ok"] += 1
+                    _win = (side, _aa)
+                if _win[1] is not None:
+                    _pstat(_pstats_of(_win[0]), _win[1])["aerials_won"] += 1
+                _aerial = {"def_id": _ad.get("id") if _ad else None, "att_id": _aa.get("id") if _aa else None,
+                           "won_by": _win[0]}
+
+            _bu = {"min": float(minute), "team": side, "zone": zone, "lane": lane,
+                   "outcome": "buildup", "me": False, "text": None}
+            if _act:
+                _bu.update({k: v for k, v in _act.items() if v is not None})
+            if _aerial:
+                _bu["aerial"] = _aerial
+            plog.append(_bu)
+
+        # ── 분 종료: 체력 소모 → 필요하면 교체/모델 재계산 ──────────
+        if stam.enabled:
+            stam.drain_minute(home_zoned, poss_home, is_extra)
+            stam.drain_minute(away_zoned, not poss_home, is_extra)
+        _need_rebuild = (minute % 15 == 0)
+        if minute in _SUB_DECISION_MINUTES:
+            if _try_subs(minute, minute in _FREE_WINDOW_MINUTES, is_extra):
+                _need_rebuild = True
+        if _need_rebuild:
+            _rebuild_models()
+
+    # 교체를 판단하는 시점. 46분(하프타임)·97분(연장 시작)·113분(연장
+    # 하프타임)은 실제 규칙대로 교체 기회를 소모하지 않는다.
+    _FREE_WINDOW_MINUTES = frozenset({SUB_EARLIEST_MINUTE,
+                                      REG_MINUTES + 1,
+                                      REG_MINUTES + ET_HALF_MINUTES + 1})
+    _SUB_DECISION_MINUTES = frozenset(
+        {SUB_EARLIEST_MINUTE, 56, 62, 68, 74, 80, 86,
+         REG_MINUTES + 1, REG_MINUTES + 8,
+         REG_MINUTES + ET_HALF_MINUTES + 1, REG_MINUTES + ET_HALF_MINUTES + 8})
+
+    # ── 정규시간 ────────────────────────────────────────────────────
+    _run_phase(1, REG_MINUTES, is_extra=False)
+    home_score_90, away_score_90 = home_score, away_score
+
+    # ── 연장전 판정 ─────────────────────────────────────────────────
+    # 신민용 확정 설계: 리그는 연장 없음(extra_time=False). 단판 KO는 이
+    # 경기 스코어가 동점일 때. 2차전 합산 방식은 agg_*를 받아서 "합산이
+    # 동률일 때만" — 2차전 자체가 동점인지를 보는 게 아니다.
+    went_extra_time = False
+    if extra_time:
+        _tot_h = int(agg_home or 0) + home_score
+        _tot_a = int(agg_away or 0) + away_score
+        if _tot_h == _tot_a:
+            went_extra_time = True
+            total_minutes = REG_MINUTES + ET_HALF_MINUTES * 2
+            # 연장 진입 직전 휴식 — 교체 기회 +1회(하프타임처럼 무소모인
+            # 97분 판정과는 별개로, 경기 중 기회 자체를 한 번 더 준다).
+            for _sv in _sides.values():
+                _sv["windows"] += SUBS_EXTRA_TIME_WINDOWS
+            _rebuild_models()
+            _run_phase(REG_MINUTES + 1, REG_MINUTES + ET_HALF_MINUTES, is_extra=True)
+            _run_phase(REG_MINUTES + ET_HALF_MINUTES + 1,
+                       REG_MINUTES + ET_HALF_MINUTES * 2, is_extra=True)
+
+    # 아직 경기장에 남아 있는 선수들의 출전 종료 시각을 확정.
+    for _sv in _sides.values():
+        for _ap in _sv["appear"].values():
+            if _ap["off"] is None:
+                _ap["off"] = total_minutes
+
+    home_poss_pct = round(100.0 * home_poss_minutes / total_minutes)
+    home_poss_pct = max(28, min(72, home_poss_pct))
+    home_stats["poss"] = home_poss_pct
+    away_stats["poss"] = 100 - home_poss_pct
+
+    # [2026-09 신설] pass_acc는 team_stats(표시용)에 반드시 존재해야 하는
+    # 값이라(MatchStatsPanel이 h_st['pass_acc']를 그대로 참조) 0으로
+    # 나누는 경우까지 여기서 안전하게 처리해 확정한다. saves(표시용)는
+    # 이 경기에서 뛴 GK들의 개인 saves 합으로 집계 — GK가 둘 이상 나올
+    # 일은 없지만(교체 미시뮬레이션) 합으로 두면 어떤 경우에도 안전하다.
+    home_stats["pass_acc"] = round(
+        home_detail["passes_ok"] / home_detail["passes"], 3) if home_detail["passes"] else 0.0
+    away_stats["pass_acc"] = round(
+        away_detail["passes_ok"] / away_detail["passes"], 3) if away_detail["passes"] else 0.0
+    home_stats["saves"] = sum(v.get("saves", 0) for v in home_player_stats.values())
+    away_stats["saves"] = sum(v.get("saves", 0) for v in away_player_stats.values())
+
+    # [선방률] 이 팀 GK가 막은 슈팅 / (막은 슈팅 + 실점) — 실점은 상대
+    # 스코어와 동일(우리 골문에 들어간 공 = 상대가 넣은 골).
+    home_conceded = away_score
+    away_conceded = home_score
+    home_detail["save_pct"] = round(
+        home_stats["saves"] / (home_stats["saves"] + home_conceded), 3
+    ) if (home_stats["saves"] + home_conceded) else 0.0
+    away_detail["save_pct"] = round(
+        away_stats["saves"] / (away_stats["saves"] + away_conceded), 3
+    ) if (away_stats["saves"] + away_conceded) else 0.0
+
+    plog.sort(key=lambda r: r["min"])
+    # [2026-08 신설] 22명(양팀 라인업 슬롯 순서, 빈 슬롯은 None) 전원의
+    # 개인 기록 + 평점 — ui/match_detail_dialog.py가 이 값이 있으면
+    # FotMob 스타일 라인업+평점 화면을 보여준다(없으면 기존처럼 팀 단위
+    # 통계만 보여주는 화면으로 자동 폴백).
+    # [2026-10 설계 B-2] 평점은 사건 기록만 읽는 별도 장부(rating_ledger)가 계산한다 — 기록과
+    # 평점을 따로 검증하기 위해 분리. 타임라인(rating_events)은 경기 상세 리플레이가 쓴다.
+    from match_sim import rating_ledger as _rl
+    _ap = {sk: {k: {"slot": a.get("slot"), "on": a.get("on"), "off": a.get("off"),
+                    "sent_off": a.get("sent_off")}
+                for k, a in _sides[sk]["appear"].items()} for sk in ("home", "away")}
+    ledger_ratings, rating_events = _rl.compute(plog, pass_log, _ap, total_minutes,
+                                                {"home": home_score, "away": away_score})
+    home_player_ratings = _build_player_ratings(
+        home_lineup, home_player_stats, home_score, away_score, home.gk, rng, home_slots,
+        appear=_sides["home"]["appear"], total_minutes=total_minutes, ledger=ledger_ratings)
+    away_player_ratings = _build_player_ratings(
+        away_lineup, away_player_stats, away_score, home_score, away.gk, rng, away_slots,
+        appear=_sides["away"]["appear"], total_minutes=total_minutes, ledger=ledger_ratings)
+
+    # [2026-09] 교체 기록의 선수 이름은 ai_players.name(내부 시드값, 보통
+    # 빈 문자열)이 아니라 화면 표시명이어야 한다 — 방금 만든 평점표가 이미
+    # 마스킹된 표시명을 갖고 있으므로 거기서 id로 끌어온다(ui/formation_
+    # widget._mask_ai_names와 완전히 같은 규칙).
+    for _sk, _prs in (("home", home_player_ratings), ("away", away_player_ratings)):
+        _nm = {r["id"]: r["name"] for r in _prs if r and r.get("id") is not None}
+        _rt = {r["id"]: r.get("rating") for r in _prs if r and r.get("id") is not None}
+        for _s in _sides[_sk]["subs"]:
+            _s["out_name"] = _nm.get(_s["out_id"]) or _s.get("out_name") or "?"
+            _s["in_name"] = _nm.get(_s["in_id"]) or _s.get("in_name") or "?"
+            _s["out_rating"] = _rt.get(_s["out_id"])
+            _s["in_rating"] = _rt.get(_s["in_id"])
+    return {
+        "home_score": home_score, "away_score": away_score,
+        # [2026-09 신설] 정규시간 스코어는 연장 결과로 덮어쓰지 않는다 —
+        # 기록실에서 "90분 2-2 / 연장 3-2"로 구분해 보여줄 수 있어야 한다.
+        "home_score_90": home_score_90, "away_score_90": away_score_90,
+        "went_extra_time": went_extra_time,
+        "home_subs": _sides["home"]["subs"], "away_subs": _sides["away"]["subs"],
+        "total_minutes": total_minutes,
+        "home_stats": home_stats, "away_stats": away_stats,
+        "home_stats_detail": home_detail, "away_stats_detail": away_detail,
+        "possession_log": plog,
+        "pass_log": pass_log,
+        "rating_events": rating_events,
+        "home_player_ratings": home_player_ratings,
+        "away_player_ratings": away_player_ratings,
+    }
+
+
+def merge_personal_events(plog, personal_events, my_side):
+    """엔진이 만든 possession_log(전부 text=None)에 내 개인 서사(실제 골/
+    도움/선방/파울/코너 텍스트)를 끼워 넣는다.
+
+    설계 원칙: 실제 개인 이벤트가 벌어진 "분(minute)"은 이미 확정된
+    사실이라 절대 옮기지 않는다 — 대신 같은 team/outcome을 가진 필러
+    레코드 중 그 분에 가장 가까운 것 하나를 그 실제 시각으로 당겨와서
+    text/me를 채운다. 그러면 팀 통계(그 outcome 총 개수)는 그대로 유지
+    되면서, 실제로 있었던 사건은 정확한 순간에 표시된다.
+
+    personal_events: [(minute, text), ...] — game_engine._player_perf가
+    만든 개인 이벤트 목록. match_flow._classify_personal로 분류되는
+    것만 처리하고(골/도움/실점/선방/파울/코너), 그 외 텍스트(부상,
+    카드 등 possession과 무관한 것)는 이 함수가 손대지 않는다 —
+    호출자가 그 텍스트를 timeline에 그대로 유지해야 한다.
+    """
+    from match_sim.match_flow import _classify_personal
+
+    opp_side = "away" if my_side == "home" else "home"
+    out = [dict(r) for r in plog]
+    used_idx = set()
+
+    kind_map = {
+        "goal_for": (my_side, "goal", True),
+        "goal_against": (opp_side, "goal", False),
+        "miss_for": (my_side, "save", True),
+        "save": (opp_side, "save", True),
+    }
+    for m, text in personal_events:
+        kind = _classify_personal(text)
+        if kind in kind_map:
+            side, outcome, me_flag = kind_map[kind]
+        elif kind == "foul":
+            side = my_side if "우리 팀" in text else opp_side
+            outcome, me_flag = "foul", False
+        elif kind == "corner":
+            side = my_side if "우리 팀" in text else opp_side
+            outcome, me_flag = "corner", False
         else:
-            self.rec("buildup", A, action="cross", actor_id=c.p.get("id"), ok=False)
-            self.goal_kick(D)
+            continue
 
-    def corner(self, A, ln):
-        D = self.other(A)
-        r = self.rng
-        A.stats["corners"] += 1
-        A.detail["final_third_entries"] += 1
-        self.rec("corner", A, zone=A3, lane=ln)
-        self.dead_time("corner")
-        self.att, self.zone, self.lane, self.counter = A, A3, ln, 0
-        if r.random() < SHORT_CORNER:
-            self.start_poss(A, A3, ln)
-            return
-        taker = max((e for e in A.ents if e.pos != "GK"), key=lambda e: (e.crs, e.fk), default=None)
-        if D.gk is not None and r.random() < 0.15:
-            self.gk_ball(D)
-            return
-        ra = self.pick_air(A, BOX, "C", defending=False)
-        dd = self.pick_air(D, BOX, "C", defending=True)
-        self.tick(r.uniform(2, 4))
-        won = self.aerial(A, ra, D, dd, BOX, "C", extra_edge=CROSS_AIR_DEF_EDGE)
-        if won is None:
-            return
-        if won:
-            self.start_poss(A, BOX, "C", carrier=ra)
-            self.assist_cand = taker
-            self.shot(A, D, ra, "corner_header", kind="corner")
+        candidates = [i for i, r in enumerate(out)
+                      if i not in used_idx and r["team"] == side and r["outcome"] == outcome
+                      and r["text"] is None]
+        if not candidates:
+            continue
+        best = min(candidates, key=lambda i: abs(out[i]["min"] - float(m)))
+        used_idx.add(best)
+        out[best]["min"] = float(m)
+        out[best]["text"] = text
+        out[best]["me"] = me_flag
+
+    out.sort(key=lambda r: r["min"])
+    return out
+
+
+MY_SIM_PLAYER_ID = -1   # world_browser.MY_PLAYER_ID / game_engine._SIA_MY_PLAYER_ID와 같은 값
+
+
+def _insert_me(lineup, bench, slots, me_pl, field_pos, status):
+    """[G1] 내 선수를 선발(내 배치 포지션 슬롯) 또는 교체 명단에 넣는다. 원본 리스트는 안 건드림.
+
+    선발: 배치 포지션과 라벨이 같은 슬롯 → 내 주 포지션 호환(POSITION_COMPAT) 순서로 슬롯을 찾고,
+    같은 라벨 슬롯이 여럿이면 OVR이 가장 낮은 AI 자리에 들어간다(빈 슬롯이 있으면 그 자리).
+    밀려난 AI는 교체 명단 맨 앞으로 가고, 명단이 길어지면 같은 계열(GK/필드)에서 OVR이 가장 낮은
+    후보 한 명이 빠진다(명단 크기 유지). GK는 GK 슬롯에만.
+    교체 명단: 같은 계열 최저 OVR 후보 한 명과 자리를 바꾼다(명단이 비었으면 그냥 추가).
+    반환: (lineup, bench, 내 슬롯 인덱스 또는 None)"""
+    from constants import POSITION_COMPAT
+    lineup, bench = list(lineup), list(bench or [])
+    n0 = len(bench)
+    is_gk = (me_pl.get("position") == "GK")
+
+    def _drop_weakest(lst, gk, keep=None):
+        c = [q for q in lst if q is not None and q is not keep
+             and ((q.get("position") == "GK") == gk)]
+        if not c:
+            c = [q for q in lst if q is not None and q is not keep]
+        if c:
+            lst.remove(min(c, key=lambda q: (q.get("ovr") or 0)))
+
+    if status == "start":
+        order = [field_pos] if field_pos else []
+        if is_gk:
+            order = ["GK"]
         else:
-            D.detail["clearances"] += 1
-            _pstat(D.ps, dd.p)["clearances"] += 1
-            self.rec("buildup", A, zone=BOX, lane="C", def_action="clearance", def_actor_id=dd.p.get("id"))
-            self.zone = BOX
-            self.loose_ball(M3, ln, 0.4)
+            order += [x for x in POSITION_COMPAT.get(me_pl.get("position"), [me_pl.get("position")])
+                      if x not in order and x != "GK"]
+        idx = None
+        for lab in order:
+            cand = [i for i, lb in enumerate(slots[:len(lineup)]) if lb == lab]
+            if not cand:
+                continue
+            empty = [i for i in cand if lineup[i] is None]
+            idx = empty[0] if empty else min(cand, key=lambda i: ((lineup[i].get("ovr") or 0), i))
+            break
+        if idx is None:   # 호환 슬롯이 하나도 없으면 GK 아닌 자리 중 최저 OVR
+            cand = [i for i, lb in enumerate(slots[:len(lineup)]) if lb != "GK"] if not is_gk else []
+            if not cand:
+                return lineup, bench, None
+            idx = min(cand, key=lambda i: ((lineup[i].get("ovr") or 0) if lineup[i] else -1, i))
+        out = lineup[idx]
+        lineup[idx] = me_pl
+        if out is not None:
+            bench.insert(0, out)
+            if n0 and len(bench) > n0:
+                _drop_weakest(bench, (out.get("position") == "GK"), keep=out)
+        return lineup, bench, idx
+    if status == "bench":
+        if n0:
+            _drop_weakest(bench, is_gk)
+        bench.append(me_pl)
+    return lineup, bench, None
 
-    def act_shot(self):
-        A, D = self.att, self.other(self.att)
-        z = self.zone
-        if self.ctx in XG_BASE and self.ctx not in ("pk", "fk", "header", "corner_header"):
-            ctx = self.ctx
+
+def simulate_my_match(home_team_id, away_team_id, home_formation, away_formation,
+                       home_boost=0.0, away_boost=0.0,
+                       home_boost_position=None, away_boost_position=None,
+                       home_adv=3.0, seed=None,
+                       extra_time=False, agg_home=0, agg_away=0, me=None):
+    """team_id 두 개만 받아서 로스터/포메이션 조회부터 시뮬레이션까지 전부
+    처리하는 편의 함수. 내 소속 클럽의 클럽 대회 경기(리그·컵·하부컵·챔스류·클럽월드컵·
+    국내 슈퍼컵·승강PO)가 모두 여기로 온다. 국가대표 경기는 simulate_tactical_match를 직접
+    부르므로 이 함수와 무관하다(옛 분 단위 엔진 그대로).
+
+    [G1 — 2026-10, 신민용 승인] 이 경로는 포제션 체인 엔진(chain_engine)으로 돈다. 반환 키는
+    simulate_tactical_match과 같다(+ time_info, + me).
+
+    me: None이면 내 선수 없이(결장 경기의 팀 결과용) 돈다. 아니면
+      {"player": 체인용 내 선수 dict(id=-1, position=주 포지션, ovr, 15개 능력치, name),
+       "side": "home"/"away", "status": "start"/"bench"/"out", "field_pos": 배치 포지션,
+       "yellow_add", "red_add": 파울 1건당 카드 확률 가산(성격)}
+    내 선수는 다른 22명과 같은 규칙(경합·체력·교체 판단·카드·퇴장 후 교체 불가)으로 뛰고,
+    캐리 보정(boost)은 쓰지 않는다 — 호출부도 0을 넘긴다.
+    sim["me"]: 내 선수가 실제로 뛴 기록(아래 _me_summary)."""
+    from team_plan import build_team_plan
+    from constants import FORMATION_SLOTS
+    from match_sim.chain_engine import simulate_chain_match
+    hp = build_team_plan(home_team_id, home_formation)
+    ap = build_team_plan(away_team_id, away_formation)
+    home_lineup, away_lineup = list(hp["lineup"]), list(ap["lineup"])
+    home_bench, away_bench = list(hp["bench"] or []), list(ap["bench"] or [])
+    pmods = None
+    my_side = None
+    if me and me.get("status") in ("start", "bench") and me.get("player"):
+        my_side = me.get("side")
+        _form = home_formation if my_side == "home" else away_formation
+        _slots = FORMATION_SLOTS.get(_form) or _FALLBACK_SLOTS
+        if my_side == "home":
+            home_lineup, home_bench, _ = _insert_me(home_lineup, home_bench, _slots, me["player"],
+                                                    me.get("field_pos"), me["status"])
         else:
-            ctx = "box" if z == BOX else ("long" if z == A3 else "far")
-        self.shot(A, D, self.car, ctx)
-
-    def shot(self, A, D, shooter, ctx, kind="open"):
-        r = self.rng
-        self.tick(r.uniform(*T_ACT["shot"]))
-        z = M3 if ctx == "far" else (A3 if ctx in ("long", "fk") else BOX)
-        self.zone = z
-        pr = self.pressure(D, z) if ctx not in ("pk", "fk") else 0.5
-        stat = shooter.hed if ctx in ("header", "corner_header") else (shooter.fk if ctx in ("fk", "pk") else shooter.sht)
-        gkq = D.gk.gkq if D.gk is not None else 30.0
-        xg = _sig(_logit(XG_BASE[ctx] * XG_SCALE) + K_SHOT * (effective_stat(stat) - 60.0) / 10.0
-                  - K_GK * (effective_stat(gkq) - 60.0) / 10.0 - 0.35 * (pr - 0.5)
-                  + (0.0 if ctx in ("pk",) else 0.0))
-        A.stats["shots"] += 1
-        ps = _pstat(A.ps, shooter.p)
-        ps["shots"] += 1
-        A.detail["xg"] += xg
-        big = xg >= 0.35
-        if big:
-            A.detail["big_chances"] += 1
-        sid = shooter.p.get("id")
-        gk_id = D.gk.p.get("id") if D.gk is not None else None
-        kp = self.assist_cand if (self.assist_cand is not None and self.assist_cand is not shooter
-                                 and kind not in ("pk", "fk")) else None
-        kp_id = kp.p.get("id") if kp is not None else None
-        bp = BLOCK_P[ctx] * (1.0 + 0.8 * pr)
-        u = r.random()
-        if u < bp:
-            bl = self.pick_def(D, z, self.lane)
-            D.detail["blocks"] += 1
-            _pstat(D.ps, bl.p)["blocks"] += 1
-            if big:
-                A.detail["big_chances_missed"] += 1
-                ps["big_chances_missed"] += 1
-            if kp is not None:
-                _pstat(A.ps, kp.p)["key_passes"] += 1
-                A.detail["xa"] += xg
-            self.rec("blocked", A, zone=A3, kind=kind, ctx=ctx, shooter_id=sid, blocker_id=bl.p.get("id"),
-                     xg=round(xg, 4), big_chance=big, key_pass_id=kp_id)
-            if r.random() < 0.45:
-                self.corner(A, self.lane if self.lane != "C" else r.choice(("L", "R")))
-            else:
-                self.loose_ball(BOX if z == BOX else A3, self.lane, 0.35)
-            return
-        pg = min(0.97, xg / max(0.05, 1.0 - bp))
-        on_p = max(pg + 0.02, ON_BASE[ctx])
-        v = r.random()
-        if v < pg:
-            A.stats["shots_on"] += 1
-            ps["shots_on"] += 1
-            ps["goals"] += 1
-            if D.gk is not None:
-                _pstat(D.ps, D.gk.p)["goals_conceded"] += 1
-            g = self.rec("goal", A, zone=A3, kind=kind, ctx=ctx, scorer_id=sid, gk_id=gk_id, xg=round(xg, 4))
-            if kp is not None and kind not in ("pk", "fk"):
-                g["assist_id"] = kp_id
-                kps = _pstat(A.ps, kp.p)
-                kps["assists"] += 1
-                kps["key_passes"] += 1
-                A.detail["xa"] += xg
-            A.score += 1
-            self.half_delays["goals"] += 1
-            self.dead_time("goal")
-            self.kickoff(D)
-            return
-        if big:
-            A.detail["big_chances_missed"] += 1
-            ps["big_chances_missed"] += 1
-        if kp is not None:
-            _pstat(A.ps, kp.p)["key_passes"] += 1
-            A.detail["xa"] += xg
-        if v < on_p:
-            A.stats["shots_on"] += 1
-            ps["shots_on"] += 1
-            if D.gk is not None:
-                _pstat(D.ps, D.gk.p)["saves"] += 1
-            self.rec("save", A, zone=A3, kind=kind, ctx=ctx, shooter_id=sid, gk_id=gk_id, xg=round(xg, 4),
-                     big_chance=big, blocker_id=None, key_pass_id=kp_id)
-            w = r.random()
-            if w < 0.30:
-                self.corner(A, self.lane if self.lane != "C" else r.choice(("L", "R")))
-            elif w < 0.45:
-                # 리바운드 — 공격이 먼저 닿으면 바로 재슈팅
-                self.tick(r.uniform(1, 2))
-                if r.random() < 0.45:
-                    reb = self.pick_att(A, BOX, "C")
-                    self.start_poss(A, BOX, "C", carrier=reb)
-                    self.shot(A, D, reb, "rebound")
-                else:
-                    self.start_poss(D, D3, "C")
-            else:
-                self.gk_ball(D)
-            return
-        if r.random() < 0.05:
-            A.detail["woodwork"] += 1
-        self.rec("shot_off", A, zone=A3, kind=kind, ctx=ctx, shooter_id=sid, xg=round(xg, 4))
-        self.goal_kick(D)
-
-    # ── 하프 진행 ─────────────────────────────────────────────────────
-    def added_minutes(self, h):
-        d = self.half_delays
-        ev = d["goals"] * 0.5 + d["subs"] * 0.25 + d["cards"] * 0.25 + d["inj"] * 1.0
-        u = self.rng.uniform(-0.5, 0.5)
-        if h == 1:
-            return max(0, min(5, int(round(0.6 + ev + u))))
-        if h == 2:
-            return max(1, min(6, int(round(1.3 + ev + u))))
-        return max(0, min(3, int(round(0.3 + ev * 0.6 + u))))
-
-    def play_half(self, h, kick_side):
-        self.half, self.sec, self.added, self.end, self.whistle = h, 0.0, None, None, False
-        self.is_extra = h >= 3
-        self.reg = HALF_SEC if h <= 2 else ET_SEC
-        self.half_delays = {"goals": 0, "subs": 0, "cards": 0, "inj": 0}
-        self.last_min_int = int(self.cur_min()) - 1
-        self.kickoff(kick_side)
-        guard = 0
-        while not self.whistle and guard < 20000:
-            guard += 1
-            self.step()
-        self.half_len[h] = self.sec
-        self.whistle = False      # 하프 사이 교체 기록은 다음 하프 시각으로
-        self.pending_dead = 0.0
-        self.pending_sub_minutes = []
-
-    def run(self):
-        H, A = self.H, self.A
-        self.play_half(1, H)
-        self.half, self.sec = 2, 0.0          # 하프타임 교체 — 46분으로 기록
-        self.try_subs(46, True)
-        self.play_half(2, A)
-        hs90, as90 = H.score, A.score
-        total = REG_MINUTES
-        went_et = False
-        if self.extra_time and (int(self.agg_home or 0) + H.score == int(self.agg_away or 0) + A.score):
-            went_et = True
-            total = REG_MINUTES + ET_HALF_MINUTES * 2
-            for sd in (H, A):
-                sd.windows += SUBS_EXTRA_TIME_WINDOWS
-            self.half, self.sec = 3, 0.0
-            self.try_subs(REG_MINUTES + 1, True)
-            first = H if self.rng.random() < 0.5 else A
-            self.play_half(3, first)
-            self.half, self.sec = 4, 0.0
-            self.try_subs(REG_MINUTES + ET_HALF_MINUTES + 1, True)
-            self.play_half(4, self.other(first))
-        return self.finish(hs90, as90, went_et, total)
-
-    def finish(self, hs90, as90, went_et, total):
-        H, A = self.H, self.A
-        end_min = max(float(total), max((x["min"] for x in self.plog), default=0.0))
-        for sd in (H, A):
-            for ap in sd.appear.values():
-                if ap["off"] is None:
-                    ap["off"] = total
-        tot_in = H.inplay + A.inplay
-        hp = round(100.0 * H.inplay / tot_in) if tot_in else 50
-        H.stats["poss"], A.stats["poss"] = hp, 100 - hp
-        for sd in (H, A):
-            d = sd.detail
-            sd.stats["pass_acc"] = round(d["passes_ok"] / d["passes"], 3) if d["passes"] else 0.0
-            sd.stats["saves"] = sum(v.get("saves", 0) for v in sd.ps.values())
-        for sd in (H, A):
-            conc = self.other(sd).score
-            sv = sd.stats["saves"]
-            sd.detail["save_pct"] = round(sv / (sv + conc), 3) if (sv + conc) else 0.0
-            sd.detail["xg"] = round(sd.detail["xg"], 3)
-            sd.detail["xa"] = round(sd.detail["xa"], 3)
-        self.plog.sort(key=lambda x: x["min"])
-        pass_log = []
-        for (sk, m), bucket in sorted(self.pass_acc.items(), key=lambda kv: (kv[0][1], kv[0][0])):
-            pass_log.append([float(m), sk, list(bucket.values())])
-        from match_sim import rating_ledger as _rl
-        ap = {sd.name: {k: {"slot": a.get("slot"), "on": a.get("on"), "off": a.get("off"),
-                            "sent_off": a.get("sent_off")} for k, a in sd.appear.items()}
-              for sd in (H, A)}
-        ledger, rating_events = _rl.compute(self.plog, pass_log, ap, total,
-                                            {"home": H.score, "away": A.score})
-        out_r = {}
-        for sd in (H, A):
-            lineup = [None] * len(sd.labels())
-            for a in sd.appear.values():
-                if a.get("started") and a["slot_idx"] < len(lineup):
-                    lineup[a["slot_idx"]] = a["player"]
-            gk0 = next((a["player"] for a in sd.appear.values() if a.get("started") and a["slot"] == "GK"), None)
-            out_r[sd.name] = _build_player_ratings(lineup, sd.ps, sd.score, self.other(sd).score, gk0, self.rng,
-                                                   sd.slots, appear=sd.appear, total_minutes=total,
-                                                   ledger=ledger)
-        for sd in (H, A):
-            nm = {r_["id"]: r_["name"] for r_ in out_r[sd.name] if r_ and r_.get("id") is not None}
-            rt = {r_["id"]: r_.get("rating") for r_ in out_r[sd.name] if r_ and r_.get("id") is not None}
-            for s in sd.subs:
-                s["out_name"] = nm.get(s["out_id"]) or s.get("out_name") or "?"
-                s["in_name"] = nm.get(s["in_id"]) or s.get("in_name") or "?"
-                s["out_rating"] = rt.get(s["out_id"])
-                s["in_rating"] = rt.get(s["in_id"])
-        return {
-            "home_score": H.score, "away_score": A.score,
-            "home_score_90": hs90, "away_score_90": as90,
-            "went_extra_time": went_et,
-            "home_subs": H.subs, "away_subs": A.subs,
-            "total_minutes": total,
-            "home_stats": H.stats, "away_stats": A.stats,
-            "home_stats_detail": H.detail, "away_stats_detail": A.detail,
-            "possession_log": self.plog,
-            "pass_log": pass_log,
-            "rating_events": rating_events,
-            "home_player_ratings": out_r["home"],
-            "away_player_ratings": out_r["away"],
-            "time_info": {"ball_in_play_s": round(self.bip, 1), "dead_s": round(self.dead, 1),
-                          "added_min": dict(self.added_log), "half_len_s": dict(self.half_len),
-                          "end_min": round(end_min, 3)},
-        }
+            away_lineup, away_bench, _ = _insert_me(away_lineup, away_bench, _slots, me["player"],
+                                                    me.get("field_pos"), me["status"])
+        if me.get("yellow_add") or me.get("red_add"):
+            pmods = {MY_SIM_PLAYER_ID: {"yellow_add": me.get("yellow_add", 0.0),
+                                        "red_add": me.get("red_add", 0.0)}}
+    _hs, _as = hp["style"], ap["style"]
+    sim = simulate_chain_match(home_lineup, away_lineup, home_boost=home_boost,
+                               away_boost=away_boost,
+                               home_boost_position=home_boost_position,
+                               away_boost_position=away_boost_position,
+                               home_adv=home_adv, seed=seed,
+                               home_formation=home_formation,
+                               away_formation=away_formation,
+                               home_bench=home_bench, away_bench=away_bench,
+                               extra_time=extra_time,
+                               agg_home=agg_home, agg_away=agg_away,
+                               home_style=_hs, away_style=_as, player_mods=pmods)
+    sim["me"] = _me_summary(sim, me, my_side)
+    return sim
 
 
-def simulate_chain_match(home_lineup, away_lineup, home_boost=0.0, away_boost=0.0,
-                         home_boost_position=None, away_boost_position=None,
-                         home_adv=3.0, seed=None,
-                         home_formation=None, away_formation=None,
-                         home_bench=None, away_bench=None,
-                         extra_time=False, agg_home=0, agg_away=0,
-                         home_style=None, away_style=None, player_mods=None):
-    """tactical_engine.simulate_tactical_match과 같은 인자·같은 반환 키(+ time_info).
-    player_mods: {선수 id: {"yellow_add", "red_add"}} — 파울 1건당 카드 확률 가산(선수 성격)."""
-    m = _ChainMatch(home_lineup, away_lineup, home_boost, away_boost, home_boost_position,
-                    away_boost_position, home_adv, seed, home_formation, away_formation, home_bench,
-                    away_bench, extra_time, agg_home, agg_away, home_style, away_style, player_mods)
-    return m.run()
+def _me_summary(sim, me, my_side):
+    """[G1] 체인 엔진 결과에서 내 선수(id=-1)의 이번 경기 기록을 뽑는다. 숫자는 전부 엔진이 실제로
+    기록한 사건(possession_log)·선수 기록줄에서 나온다 — 따로 굴리는 난수 없음.
+    내 기록줄(player_ratings)의 이름을 내 이름으로, is_me=True로 고친다."""
+    out = {"appeared": False, "status": (me or {}).get("status", "out"), "side": my_side,
+           "goals": 0, "assists": 0, "saves": 0, "shots": 0, "shots_on": 0,
+           "key_passes": 0, "dribbles": 0, "blocks": 0, "passes": 0, "passes_ok": 0,
+           "pass_acc": 0.0, "rating": 0.0, "minutes": 0, "yellow": 0, "red_reason": None,
+           "started": False, "on_min": None, "off_min": None, "records": []}
+    if not my_side:
+        return out
+    me_id = MY_SIM_PLAYER_ID
+    entry = None
+    for e in sim.get(my_side + "_player_ratings") or []:
+        if e and e.get("id") == me_id:
+            entry = e
+            break
+    if entry is None:
+        return out
+    entry["name"] = (me.get("player") or {}).get("name") or "나"
+    entry["is_me"] = True
+    out["appeared"] = True
+    out["rating"] = float(entry.get("rating") or 0.0)
+    out["minutes"] = entry.get("minutes", 0) or 0
+    out["started"] = bool(entry.get("started", True))
+    out["on_min"], out["off_min"] = entry.get("on_min"), entry.get("off_min")
+    for k in ("key_passes", "passes", "passes_ok"):
+        out[k] = entry.get(k, 0) or 0
+    out["dribbles"] = entry.get("dribbles_ok", 0) or 0
+    out["blocks"] = ((entry.get("tackles_ok", 0) or 0) + (entry.get("interceptions", 0) or 0)
+                     + (entry.get("blocks", 0) or 0))
+    opp = "away" if my_side == "home" else "home"
+    recs = []
+    for r in sim.get("possession_log") or []:
+        o, t = r.get("outcome"), r.get("team")
+        if t == my_side and o in ("goal", "save", "shot_off", "blocked") and \
+                (r.get("scorer_id") == me_id or r.get("shooter_id") == me_id):
+            out["shots"] += 1
+            if o in ("goal", "save"):
+                out["shots_on"] += 1
+            if o == "goal":
+                out["goals"] += 1
+            recs.append(("goal" if o == "goal" else "miss", r))
+        if t == my_side and o == "goal" and r.get("assist_id") == me_id:
+            out["assists"] += 1
+            recs.append(("assist", r))
+        if t == opp and o == "save" and r.get("gk_id") == me_id:
+            out["saves"] += 1
+            recs.append(("save", r))
+        if t == opp and o == "goal":
+            recs.append(("conceded", r))
+        if t == my_side and o == "yellow" and r.get("player_id") == me_id:
+            out["yellow"] += 1
+            recs.append(("yellow", r))
+        if t == my_side and o == "red" and r.get("player_id") == me_id:
+            out["red_reason"] = "second_yellow" if r.get("reason") == "second_yellow" else "red_card"
+            recs.append(("red", r))
+        if t == my_side and o == "sub" and r.get("in_id") == me_id:
+            recs.append(("sub_in", r))
+        if t == my_side and o == "sub" and r.get("out_id") == me_id:
+            recs.append(("sub_out", r))
+    out["pass_acc"] = round(out["passes_ok"] / out["passes"], 3) if out["passes"] else None
+    out["records"] = recs
+    return out

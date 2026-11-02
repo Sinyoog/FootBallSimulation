@@ -421,6 +421,7 @@ def run_initial_enlistment(conn, start_year) -> dict:
     roles = compute_roles_for_teams(conn, [r[1] for r in rows])
 
     plan = {}      # pid -> dict
+    cmap = _team_country_map(conn)
     for pid, tid, age, ovr, pos, cend, loan_from, _nm, _sal in rows:
         rng = _rng_for(conn, f"milinit:{pid}")
         age = age or 0
@@ -431,6 +432,13 @@ def run_initial_enlistment(conn, start_year) -> dict:
             plan[pid] = {"status": MILITARY_STATUS_SERVED, "enlist_age": 0, "type": st_type}
             continue
         ea = sample_enlist_age(rng, st_type, reg)
+        # [2026-10 신민용 확정] 해외파는 지금 복무 중일 수 없다(구단이 입대를 허락하지 않음) — 이미
+        # 다녀온 경우(군필)는 그대로 두고, 아직이면 31세 강제 입대 때까지 미필.
+        _holder = loan_from or tid
+        if (_holder and cmap.get(_holder, MILITARY_TARGET_NATIONALITY) != MILITARY_TARGET_NATIONALITY
+                and ea >= age - 1):
+            plan[pid] = {"status": MILITARY_STATUS_UNSERVED, "enlist_age": MILITARY_FORCED_AGE, "type": st_type}
+            continue
         if ea > age:
             plan[pid] = {"status": MILITARY_STATUS_UNSERVED, "enlist_age": ea, "type": st_type}
         elif ea >= age - 1:
@@ -559,6 +567,7 @@ def run_initial_enlistment(conn, start_year) -> dict:
             "INSERT INTO ai_transfer_log(season, year, player_id, player_name, player_position, player_age, "
             "player_ovr, from_team_id, to_team_id, transfer_type, fee, is_loan, contract_end_year) "
             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", log_rows)
+    stats["abroad_clamped"] = clamp_abroad_unserved_contracts(conn, start_year)
     print(f"[MILITARY-INIT] {start_year}년 초기 병역: 한국 {stats['korean']}명 → 군필 {stats['served']} / "
           f"미필 {stats['unserved']} / 복무 {stats['serving']}(1부 {stats['div1']}·2부 {stats['div2']}) | "
           f"연기(구단상한 {stats['postponed_club']}·전체상한 {stats['postponed_total']}) | "
@@ -569,6 +578,47 @@ def run_initial_enlistment(conn, start_year) -> dict:
 # ══════════════════════════════════════════════════════════════════
 # 4단계: 매년 새해 처리 — 제대 → (진급/강등 맞교환) → 면제 → 유형 재판정 → 입대
 # ══════════════════════════════════════════════════════════════════
+def _team_country_map(conn):
+    """{team_id: 나라 이름} — 해외파 판정용(계약을 가진 구단 = 임대 중이면 원 소속)."""
+    return {tid: cn for tid, cn in conn.execute(
+        "SELECT t.id, cn.name FROM teams t JOIN leagues l ON l.id=t.league_id "
+        "JOIN countries cn ON cn.id=l.country_id").fetchall()}
+
+
+def clamp_abroad_unserved_contracts(conn, season_year):
+    """[2026-10 신민용 확정] 해외 구단 소속 미필 한국 선수(AI)는 31세 1주차 강제 입대(계약 해지)까지
+    입대할 수 없으니 계약도 30세 시즌까지만이다 — 그보다 긴 계약(이적·재계약·보충 생성 등 어느
+    경로로 생겼든)을 30세 시즌으로 자르고, 그 계약을 남긴 이적 기록(ai_transfer_log)의 만료 연도도
+    같이 맞춘다(선수 검색의 "계약: N년" 표시). season_year: 지금 선수 나이가 해당하는 시즌 연도.
+    반환: 자른 인원."""
+    from constants import (MILITARY_STATUS_UNSERVED, MILITARY_FORCED_AGE, MILITARY_ABROAD_LAST_CONTRACT_AGE)
+    if not military_enabled() or not get_military_country_id(conn):
+        return 0
+    mil = get_military_team_ids(conn)
+    cmap = _team_country_map(conn)
+    rows = conn.execute(
+        "SELECT id, age, contract_end_year, team_id, on_loan_from_team_id FROM ai_players "
+        "WHERE nationality=? AND (military_status=? OR military_status='' OR military_status IS NULL) "
+        "AND contract_end_year>0 AND age<?",
+        (MILITARY_TARGET_NATIONALITY, MILITARY_STATUS_UNSERVED, MILITARY_FORCED_AGE)).fetchall()
+    upd, logs = [], []
+    for pid, age, cend, tid, loan_from in rows:
+        holder = loan_from or tid
+        if not holder or tid in mil or holder in mil:
+            continue
+        if cmap.get(holder, MILITARY_TARGET_NATIONALITY) == MILITARY_TARGET_NATIONALITY:
+            continue
+        cap = max(season_year, season_year + MILITARY_ABROAD_LAST_CONTRACT_AGE - (age or 0))
+        if (cend or 0) > cap:
+            upd.append((cap, pid))
+            logs.append((cap, pid, cap, season_year - 1))
+    if upd:
+        conn.executemany("UPDATE ai_players SET contract_end_year=? WHERE id=?", upd)
+        conn.executemany("UPDATE ai_transfer_log SET contract_end_year=? WHERE player_id=? "
+                         "AND contract_end_year>? AND year>=?", logs)
+    return len(upd)
+
+
 def _meta_get(conn, key):
     r = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
     return r[0] if r else None
@@ -694,6 +744,46 @@ def _apply_exemptions(conn, finished_year, stats):
     _oly_exempt(conn, finished_year, stats)
 
 
+def _my_player_military_slot(conn, finished_year, mil, tiers):
+    """_enlist_new_year 전용 — 내 선수가 다음 해 군팀 1자리를 차지하면 (포지션 그룹, 팀 id),
+    아니면 (None, None).
+      · 복무 중이고 이번 시즌 종료에 제대하지 않는다 → 지금 소속 군팀
+        (제대 조건은 game_engine._my_military_year_end와 같다: 입대 연도 + 1 <= 끝난 시즌 연도면 제대)
+      · 병역 대상 미필이고 나이가 강제 입대 연령 이상(나이는 이미 새 시즌 나이) → 이번 시즌 종료에
+        강제 입대할 자리. 2부(없으면 전체)에서 인원이 가장 적은 팀을 비워 둔다(내 강제 입대는
+        1부가 차 있으면 2부로 간다 — game_engine.my_player_military_offer_teams).
+    면제 판정은 내 병역 처리 때 따로 하므로, 면제가 되면 비워 둔 1자리가 그해만 남을 뿐이다."""
+    from constants import MILITARY_STATUS_SERVING, MILITARY_STATUS_UNSERVED, MILITARY_FORCED_AGE
+    conn_row = conn.execute("SELECT * FROM my_player LIMIT 1").fetchone()
+    if not conn_row:
+        return None, None
+    row = dict(conn_row) if hasattr(conn_row, "keys") else None
+    if row is None:
+        cols = [d[1] for d in conn.execute("PRAGMA table_info(my_player)").fetchall()]
+        row = dict(zip(cols, conn_row))
+    if not is_service_target(my_player_nationalities(row)):
+        return None, None
+    st = row.get("military_status") or ""
+    age = row.get("age") or 0
+    g = _pos_group(row.get("position") or "")
+    tid = row.get("current_team_id") or 0
+    if st == MILITARY_STATUS_SERVING:
+        ey = row.get("military_enlist_year") or finished_year
+        if tid in mil and ey + 1 > finished_year:
+            return g, tid
+        return None, None
+    if not st:   # game_engine._my_military_year_end와 같은 첫 판정 — 나이는 이미 +1 됐으므로 이번 시즌 나이(age-1)로
+        st = (MILITARY_STATUS_UNSERVED if (age - 1 < MILITARY_FORCED_AGE or row.get("military_left_unserved"))
+              else "")
+    if st == MILITARY_STATUS_UNSERVED and age >= MILITARY_FORCED_AGE:
+        div2 = [t for t in mil if tiers.get(t) != 1] or list(mil)
+        cnt = {t: n for t, n in conn.execute(
+            f"SELECT team_id, COUNT(*) FROM ai_players WHERE team_id IN ({','.join(map(str, mil))}) "
+            f"GROUP BY team_id").fetchall()}
+        return g, min(div2, key=lambda t: (cnt.get(t, 0), t))
+    return None, None
+
+
 def _enlist_new_year(conn, new_year, stats):
     """미필 한국 선수의 유형을 지금 소속·역할로 다시 판정해 올해 입대 대상을 뽑고
     군팀(정원 26)에 배정한다. 31세(강제 연령)는 정원을 넘어서라도 입대.
@@ -727,6 +817,7 @@ def _enlist_new_year(conn, new_year, stats):
     if not roles:
         roles = compute_roles_for_teams(conn, [r[1] for r in rows])
     upd, cands = [], []
+    cmap = _team_country_map(conn)
     for pid, tid, age, ovr, pos, cend, loan_from, nm, sal, st, ea in rows:
         age = age or 0
         if not st and age >= MILITARY_FORCED_AGE:
@@ -740,11 +831,17 @@ def _enlist_new_year(conn, new_year, stats):
             ea = max(ea or 0, 30)
         elif not ea or not (lo <= ea <= hi):
             ea = sample_enlist_age(_rng_for(conn, f"milage:{pid}:{new_year}"), typ, False)
+        # [2026-10 신민용 확정] 해외파(계약을 가진 구단이 해외)는 구단이 입대를 허락하지 않는다 —
+        # 최대한 늦게, 31세 강제 입대 때만 간다(그때 계약 해지). 국내로 돌아오면 위에서 다시 뽑힌다.
+        _holder = loan_from or tid
+        abroad = bool(_holder) and cmap.get(_holder, MILITARY_TARGET_NATIONALITY) != MILITARY_TARGET_NATIONALITY
+        if abroad:
+            ea = MILITARY_FORCED_AGE
         upd.append((MILITARY_STATUS_UNSERVED, ea, pid))
         if age >= MILITARY_FORCED_AGE or (ea <= age and age >= _MIN_AGE):
             cands.append({"pid": pid, "team": tid, "age": age, "ovr": ovr, "pos": pos, "cend": cend or 0,
                           "loan_from": loan_from or 0, "name": nm, "sal": sal or 0, "lv": lv,
-                          "forced": age >= MILITARY_FORCED_AGE, "ea": ea})
+                          "forced": age >= MILITARY_FORCED_AGE, "ea": ea, "abroad": abroad})
     conn.executemany("UPDATE ai_players SET military_status=?, military_enlist_age=? WHERE id=?", upd)
     if not cands:
         return
@@ -757,6 +854,22 @@ def _enlist_new_year(conn, new_year, stats):
         posc[t][g] = posc[t].get(g, 0) + 1
     k1_line = refs[1] - MILITARY_LEVEL_MARGIN
     cap = MILITARY_ROSTER_RANGE[1]
+    # [2026-10 버그수정, 신민용 리포트: "강제 입대하면 내가 들어가서 한계인 26을 뚫고 27명이 된다 —
+    # 자리가 없으면 2부 군대로 가야지"] 정원(fill)을 ai_players로만 셌다 — 내 선수는 my_player라
+    # 빠져 있었다. 두 가지를 반영한다.
+    #  (1) 내가 군팀에서 다음 해에도 복무하면(이번 시즌 종료에 제대하지 않으면) 그 팀 1자리를 센다
+    #      — 안 그러면 AI 신병이 그 팀을 26명까지 채워 나까지 27명이 됐다.
+    #  (2) 이번 시즌 종료에 내가 강제 입대할 차례(31세+ 미필)면 2부 팀 1자리를 비워 둔다 — 내 병역
+    #      처리(game_engine._my_military_year_end)는 이 함수보다 뒤에 돌아서, 해마다 정원보다 대기가
+    #      많은 지금은 군팀이 전부 26명으로 차 있어 갈 자리가 없었다.
+    try:
+        _my_g, _my_t = _my_player_military_slot(conn, new_year - 1, mil, tiers)
+    except Exception:
+        _my_g, _my_t = None, None
+    if _my_t is not None:
+        fill[_my_t] = fill.get(_my_t, 0) + 1
+        if _my_g:
+            posc[_my_t][_my_g] = posc[_my_t].get(_my_g, 0) + 1
     # [2026-10 신민용 확정: "정원이 부족한 것보다 누가 연기되느냐가 문제"] 22시즌 실측에서
     # 해마다 입대 대기 ≈ 270~290명 > 정원 ≈ 208명/년인데, 예전 정렬(강제 → K1 이상 → 리그
     # 수준 → OVR)은 나이를 전혀 안 봐서 21세 K1 선수가 자리를 차지하고 28~30세 하위 리그
@@ -809,7 +922,7 @@ def _enlist_new_year(conn, new_year, stats):
             pool = list(all_t)
         t = min(pool, key=lambda t: (posc[t].get(g, 0), fill.get(t, 0), t))
         parent = d["loan_from"] or d["team"]
-        if parent and d["cend"] >= new_year + 1:
+        if parent and d["cend"] >= new_year + 1 and not d.get("abroad"):   # [2026-10] 해외 구단은 계약 해지
             loan_from, loan_ret, cend = parent, new_year + 1, d["cend"]
             stats["loan"] += 1
         else:

@@ -133,10 +133,23 @@ class OfferWindow(QDialog):
             # 상태) 시작.
             self.years_target: dict[int, int] = {i: self.offer_years[i] for i in range(len(offers))}
 
+        # [2026-10 신설, 신민용 요청: "중간 비시즌에 이적하면 2년이라 떠도 실제론 2년 6개월"] 계약
+        # N년에 실제로 더 붙는 개월 수(그 시즌 남은 기간) — 소속팀이 있으면 예약 이적, 없으면 즉시 입단.
+        try:
+            from game_engine import contract_extra_months, get_player as _gp_cm
+            _p_cm = _gp_cm() or {}
+            self._extra_months = contract_extra_months(bool(_p_cm.get("current_team_id")))
+        except Exception:
+            self._extra_months = 0
         self._build()
         # 창이 만들어지는 즉시(사용자가 아무것도 안 눌러도) 저장해둔다 —
         # 그래야 이 창을 띄운 직후 바로 꺼져도 다음에 같은 상태로 복원된다.
         self._persist()
+
+    def _yrs_text(self, yrs) -> str:
+        """계약 N년 표시 — 시즌 도중 합류면 "2년 6개월"처럼 실제 기간으로."""
+        from game_engine import contract_period_text
+        return contract_period_text(yrs, getattr(self, "_extra_months", 0))
 
     def _calc_initial_years(self) -> list:
         """오퍼별 구단 측 초기 제시 계약 기간(연봉의 offer_salaries와 같은
@@ -231,7 +244,9 @@ class OfferWindow(QDialog):
         hdr.setStyleSheet("color:#00cc44;font-size:15px;font-weight:bold;")
         root.addWidget(hdr)
 
-        if not self.offers and not self.apply_slots:
+        # [2026-10 버그수정, 신민용 리포트: "1주차에 군대 오퍼가 무조건 와야 하는데 안 온다"] 오퍼 0건 +
+        # 직접지원 칸 0이면 "오퍼가 없습니다"만 띄우고 군팀 카드(_render_cards)를 아예 그리지 않았다.
+        if not self.offers and not self.apply_slots and not self._military_offers():
             lbl = QLabel("오퍼가 없습니다." if self.lang=="ko" else "No offers available.")
             lbl.setObjectName("noOffer")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -317,10 +332,17 @@ class OfferWindow(QDialog):
         div = "1부" if mo.get("tier") == 1 else "2부"
         title = QLabel(f"🪖 {mo['team_name']}")
         title.setStyleSheet("color:#c5e17a;font-weight:bold;font-size:14px;border:none;")
+        # [2026-10 신민용 확정] 계약 처리 — 국내 구단은 계약 유지·복귀, 해외 구단은 계약 해지(제대 후 FA).
+        _plan_txt = {
+            "keep": "원소속 계약 유지 — 제대 후 원소속팀 복귀\n(계약 기간은 복무 중에도 흐릅니다)",
+            "abroad": "해외 구단 소속 — 입대하면 구단과 계약 해지,\n제대 후 FA",
+            "short": "남은 계약이 복무 기간보다 짧아 계약 해지,\n제대 후 FA",
+            "fa": "소속 없음 — 제대 후 FA",
+        }.get(mo.get("contract_plan") or "",
+              "원소속 계약이 복무 기간보다 길면 제대 후 원소속팀 복귀,\n짧으면 계약 해지 → 제대 후 FA")
         info = QLabel(f"군대 · {mo.get('league_name', '')} ({div})\n"
                       "복무 2년 · 연봉 0원 · 복무 중 이적/임대 불가\n"
-                      "원소속 계약이 복무 기간보다 길면 제대 후 원소속팀 복귀,\n"
-                      "짧으면 계약 해지 → 제대 후 FA\n"
+                      f"{_plan_txt}\n"
                       "※ 누르면 바로 입대합니다")
         info.setStyleSheet("color:#cccccc;border:none;")
         info.setWordWrap(True)
@@ -502,9 +524,23 @@ class OfferWindow(QDialog):
         # [2026-08 수정, 신민용 확정: "내가 기간을 직접 입력(선택)하고
         # 협상해야 맞지"] 나이 기반 자동 '희망 연도' 추정 및 그 표시를
         # 없앴다 — 목표 연수는 아래 콤보박스에서 플레이어가 직접 고른다.
-        cl = QLabel(f"📋 {c_yrs}년 계약")
+        cl = QLabel(f"📋 {self._yrs_text(c_yrs)} 계약")
+        if self._extra_months:
+            cl.setToolTip(f"이번 시즌 남은 기간({self._extra_months}개월) + {c_yrs}년 — "
+                          "시즌 도중 합류라 올해 남은 기간이 계약에 더해집니다")
         cl.setStyleSheet("color:#ffcc44; font-size:11px;")
         h3.addStretch(); h3.addWidget(cl)
+        # [2026-10 신설, 신민용 요청: "구단에서 이 선수를 뽑을 때 역할 기준도 표시 — 연봉·계약 줄에, 연봉 계약
+        # 역할 순서로"] 오퍼의 역할(game_engine._enrich_offer가 정한 입단 기용 계획)은 원래부터 입단 시
+        # 적용되고 있었는데(벤치 배율·감독 관계 초기값 등) 화면엔 없었다. 입단 후 실제 출전에 따라 바뀔 수 있다.
+        _role = offer.get("role")
+        if _role:
+            from constants import OFFER_ROLES
+            rl = QLabel(f"🎯 {_role}")
+            rl.setToolTip((OFFER_ROLES.get(_role, {}).get("desc") or "")
+                          + " — 입단 시 기준이며, 팀에서의 활약에 따라 달라질 수 있습니다")
+            rl.setStyleSheet("color:#88ccff; font-size:11px;")
+            h3.addWidget(rl)
         lay.addLayout(h3)
 
         # ── 행4: 성적 ─────────────────────────────────────────
@@ -556,9 +592,20 @@ class OfferWindow(QDialog):
         h4 = QHBoxLayout(); h4.setSpacing(6)
         target_combo = QComboBox()
         target_combo.setObjectName("yearsCombo")
-        for y in range(CONTRACT_YEARS_MIN, CONTRACT_YEARS_MAX + 1):
-            target_combo.addItem(f"{y}년", y)
-        target_combo.setCurrentIndex(target_yrs - CONTRACT_YEARS_MIN)
+        # [2026-10 신민용 확정] 병역 미필 + 해외 구단 → 30세 시즌까지만 계약 가능(희망 기간도 그 안에서).
+        _ymax = CONTRACT_YEARS_MAX
+        try:
+            from game_engine import _my_contract_years_cap
+            _ycap = _my_contract_years_cap(None, offer.get("country"))
+        except Exception:
+            _ycap = None
+        if _ycap is not None:
+            _ymax = max(CONTRACT_YEARS_MIN, min(CONTRACT_YEARS_MAX, _ycap))
+        for y in range(CONTRACT_YEARS_MIN, _ymax + 1):
+            target_combo.addItem(self._yrs_text(y), y)
+        target_combo.setCurrentIndex(max(0, min(target_yrs, _ymax) - CONTRACT_YEARS_MIN))
+        if _ycap is not None:
+            target_combo.setToolTip("병역 미필 — 해외 구단과는 30세 시즌까지만 계약할 수 있습니다")
         # 결렬됐으면 목표를 더 바꿔봐야 소용없으니 잠가둔다.
         target_combo.setEnabled(not years_failed)
         target_combo.currentIndexChanged.connect(
@@ -657,8 +704,16 @@ class OfferWindow(QDialog):
             step = min(delta, abs(target - old_yrs))
             new_yrs = old_yrs + direction * step
             new_yrs = max(CONTRACT_YEARS_MIN, min(CONTRACT_YEARS_MAX, new_yrs))
+            try:   # [2026-10] 병역 미필 + 해외 구단 → 30세 시즌까지
+                from game_engine import _my_contract_years_cap
+                _ycap = _my_contract_years_cap(None, self.offers[idx].get("country"))
+                if _ycap is not None:
+                    new_yrs = max(CONTRACT_YEARS_MIN, min(new_yrs, _ycap))
+            except Exception:
+                pass
             self.offer_years[idx] = new_yrs
-            show_toast(self, f"✅ 기간 협상 성공  {old_yrs}년 → {new_yrs}년", "#006622", 1400)
+            show_toast(self, f"✅ 기간 협상 성공  {self._yrs_text(old_yrs)} → {self._yrs_text(new_yrs)}",
+                       "#006622", 1400)
         else:
             if self.years_used[idx] == 0:
                 self.years_failed.add(idx)

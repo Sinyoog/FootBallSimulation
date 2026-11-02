@@ -871,6 +871,10 @@ def _sim_ai_match(t, m, conn=None, p=None, forced=None):
             _g2 = _cm.sim_target_match(m["home_team_id"], m["away_team_id"], home_adv=0.0, extra_time=True,
                                        comp_name=t["name"], kind="domestic_sc", week=m.get("week"), day=m.get("day"),
                                        targets=_g2_t)
+        if _cm.covered("domestic_sc_entries", "domestic_sc_matches", t["id"]):
+            # [2026-10 A안] 내가 참가하는 대회의 AI 경기 — 엔진으로 돌려 실측 기록(controlled_matches.sim_cover_match)
+            _g2 = _cm.sim_cover_match(m["home_team_id"], m["away_team_id"], home_adv=0.0, extra_time=True,
+                                      comp="dsc", tkey=f"dsc:{t['id']}", targets=_g2_t, prior=_g2)
         if _g2 is not None:
             forced = (_g2["hs"], _g2["as"])
     if forced is not None:   # [G1] 내 팀 경기(내가 결장) — 체인 엔진 스코어(연장 포함)
@@ -922,6 +926,11 @@ def sim_my_domestic_sc_match_as_ai(week, p, reason="injury", day=None):
     _sim_ai_match(t, m, p=p, forced=((_cs["home_score"], _cs["away_score"]) if _cs is not None else None))
     from game_engine import update_player, _calc_manager_rel
     update_player(manager_relation=_calc_manager_rel(p, 0, "", played=False, not_played_penalty=2))
+    # [2026-10 신민용 요청] 내가 결장한 이 경기도 경기 상세를 볼 수 있게 — 체인 엔진 기록(나 없음)을 관전 기록으로 저장.
+    import controlled_matches as _cm_abs
+    _cm_abs.save_absent_match(_cs, m["home_team_id"], m["away_team_id"], info.get("is_home"),
+                              t.get("name") or "국내 슈퍼컵", "domestic_sc", week=week, day=m.get("day") or day,
+                              reason=reason, real_ctx={"comp": "dsc", "tkey": f"dsc:{m['tournament_id']}"})
 
 
 def simulate_my_domestic_sc_match(week, p, day=None):
@@ -953,13 +962,14 @@ def simulate_my_domestic_sc_match(week, p, day=None):
     _suspended, _new_susp = _check_suspended(p, field="domestic_sc_suspension")
     if _suspended:
         update_player(domestic_sc_suspension=_new_susp)
-        add_log(f"🟥 출전정지로 결장{'  (다음 경기부터 복귀)' if _new_susp == 0 else f'  (남은 정지 {_new_susp}경기)'}",
+        from game_engine import suspension_log_text as _susp_log_text
+        add_log(_susp_log_text("domestic_sc_suspension", _new_susp),
                 "event")
 
     _my_ovr = p.get("ovr", 40)
     _team_ovr = he["ovr"] if is_home else ae["ovr"]
     _gap = max(0.0, _my_ovr - _team_ovr)
-    _benched = (not _suspended) and _check_bench(p, team_avg_ovr=_team_ovr)
+    _benched = (not _suspended) and _check_bench(p, team_avg_ovr=_team_ovr, club_match=True)   # [2026-10 my_loan] 클럽 경기
     if _benched:
         add_log("🪑 교체 명단에서 시작", "event")
     _star = 1.0 + max(0.0, (_my_ovr - 60) / 40.0) ** 1.8 * 3.0
@@ -1143,7 +1153,10 @@ def simulate_my_domestic_sc_match(week, p, day=None):
     pso_txt = ""
     my_tid = p.get("current_team_id", 0)
     if pso_winner:
-        pso_txt = f"  (승부차기 {pso_score} {'승' if pso_winner == my_tid else '패'})"
+        # [2026-10 신민용 요청] "(무)  (승부차기 5-3 패)" 대신 "승부차기 (5-3) 패배"로 —
+        # 결과 칸 자체를 바꾼다(로그 '경기' 필터가 줄 끝 결과 표기로 결과 줄을 찾는다).
+        from game_engine import pso_result_text
+        pso_txt = pso_result_text(pso_score, pso_winner == my_tid)
         rs = "무"
 
     comp_name = t["name"]
@@ -1159,12 +1172,14 @@ def simulate_my_domestic_sc_match(week, p, day=None):
         events, not (_suspended or _benched), _benched, detail, pso=pso,
         engine_stats=engine_stats, engine_plog=engine_plog, player_ratings=player_ratings,
         match_extra={"score_90": ([hs90, as90] if hs90 is not None else [hs, as_]),
-                     "went_extra_time": went_et, "subs": _subs})
+                     "went_extra_time": went_et, "subs": _subs},
+        # [2026-10 신설] 이 경기 AI 선수 실측 기록(real_stats)
+        real_ctx={"comp": "dsc", "tkey": f"dsc:{m['tournament_id']}", "home": m["home_team_id"], "away": m["away_team_id"]})
     marker = f" [match:{detail_id}:domestic_sc]" if detail_id else ""
 
     add_log("─" * 44, "sep")
     add_log(f"🏆 {comp_name}  {_day_label(week, day)}{marker}", "match")
-    add_log(f"   {home_disp} {hs}-{as_} {away_disp}  ({rs}){pso_txt}", "match")
+    add_log(f"   {home_disp} {hs}-{as_} {away_disp}  {pso_txt or f'({rs})'}", "match")
     if p.get("position") == "GK":
         add_log(f"   평점 {rating:.1f}  선방 {saves}", "match")
     else:

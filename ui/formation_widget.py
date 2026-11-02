@@ -1157,6 +1157,18 @@ class _FormationCanvas(QWidget):
             # POSITION_COMPAT 기반으로 가장 자연스러운 슬롯 결정
             slots_only = [sp for (_, _, sp, _) in positions_xy]
             my_slot, field_pos, mismatch_rank = _best_slot_for_player(primary_pos, slots_only)
+            # [2026-10 버그수정, 신민용 리포트: "첫 입단 때 메인 화면 포메이션에 내 자리가 이름 없이
+            # 떠 있다 — 후보에 RW가 없어서 내가 주전"] load_my_team이 최적 배치(⑦-c club_fill_slots)로
+            # 정한 내 자리(_slot_idx, 예: RW)를 여기서 주포 기준 자리(예: ST)로 덮어써서, 나는 그 자리
+            # AI에게 덮여 사라지고 원래 내 자리(RW)는 빈 원으로 남았다. 이미 정해진 자리가 있으면 그대로 쓴다.
+            _pre_sidx = me.get("_slot_idx")
+            _pre_vis = next((vi for vi, (_, _, _, sidx) in enumerate(positions_xy)
+                             if sidx == _pre_sidx), None) if _pre_sidx is not None else None
+            if _pre_vis is not None:
+                my_slot = _pre_vis
+                field_pos = positions_xy[_pre_vis][2]
+                _compat = POSITION_COMPAT.get(primary_pos, [primary_pos])
+                mismatch_rank = _compat.index(field_pos) if field_pos in _compat else 4
             # field_pos를 me에 저장 → 경기 퍼포먼스·커리어 기록에 활용
             me["field_pos"] = field_pos
             me["mismatch_rank"] = mismatch_rank
@@ -2306,10 +2318,10 @@ def open_bulk_rename_dialog(parent, starters: list, bench: list) -> list:
         # 상세 패널도 즉시 반영 — _open_rename_dialog(개별 이름변경)가
         # 이미 쓰는 것과 같은 경로. 여러 명이라 순환import 우려 없이
         # 함수 지역 import로 한 번만 가져온다.
+        # [2026-10 성능] 사람마다 기록실 창을 갱신하던 것(26명이면 역대 개인상 26번 재조회)을 마지막에 한 번만.
         try:
-            from ui.world_browser_window import apply_custom_name_live_to_browser
-            for pid, _new_name in changed:
-                apply_custom_name_live_to_browser(pid)
+            from ui.world_browser_window import apply_custom_names_live_to_browser
+            apply_custom_names_live_to_browser([pid for pid, _new_name in changed])
         except Exception:
             pass
     return changed
@@ -3223,7 +3235,8 @@ def _row_key(pos):
 # 통째로 딸려 들어와 PyQt6 없는 헤드리스 환경(headless_runner.py 등)을
 # 깨뜨린다 — 그래서 Qt 의존성 없는 formation_logic.py로 옮기고 여기서는
 # 그걸 import해서 쓴다(로직/동작 완전히 동일, 위치만 이동).
-from formation_logic import _pos_category, _best_slot_for_player, _greedy_fill_slots, formation_row_bands
+from formation_logic import (_pos_category, _best_slot_for_player, _greedy_fill_slots, formation_row_bands,
+                             roster_line_sort_key)
 
 # [2026-08 신설, 신민용 요청: "W/S로 우측 포메이션 기준 위/아래 선수로
 # 이동"] _RosterPanel.set_roster가 "주전(N)" 목록을 그릴 때 쓰는 정렬
@@ -3231,12 +3244,12 @@ from formation_logic import _pos_category, _best_slot_for_player, _greedy_fill_s
 # 함수로 뽑아둔다 — _TeamPanel.get_starters_ordered()도 똑같은 기준을
 # 써야 화면에 보이는 순서와 키보드 이동 순서가 어긋나지 않는다(따로
 # 두면 나중에 한쪽만 고치고 잊어버리기 쉬움).
-_STARTER_CAT_ORDER = {"GK": 0, "DEF": 1, "MID": 2, "ATK": 3}
-
-
+# [2026-10-30 수정, 신민용 리포트: "CB LB RB ST CAM CM CDM ST 이런 식으로 뜬다"] 줄(GK/DF/MF/FW)을 등록
+# 포지션(position)으로 갈랐는데, 주전 버튼에 찍히는 글자는 실제로 뛰는 자리(field_pos)라 다른 자리로
+# 밀려 배정된 선수가 엉뚱한 줄 사이에 끼어 보였다. 이제 화면에 찍힌 그 글자로 줄을 가르고, 같은 줄은 OVR
+# 내림차순, 같으면 고정 난수(formation_logic.roster_line_sort_key — 세계 축구 기록실 명단과 같은 기준).
 def _starter_sort_key(pl: dict):
-    return (_STARTER_CAT_ORDER.get(_pos_category(pl.get("position", "")), 4),
-            -(pl.get("ovr", 0) or 0))
+    return roster_line_sort_key(pl.get("field_pos") or pl.get("position", ""), pl.get("ovr"), pl.get("id"))
 
 
 def _row_priority(k):
@@ -3381,7 +3394,8 @@ class PlayerStatPopup(QDialog):
             ("이름", pl.get('name', '')),
             ("포지션", pl.get('position', '')),
         ]
-        # [2026-10 주포·부포] 부포가 있으면 "부포" 줄(내 선수는 id -1 또는 is_me로 조회).
+        # [2026-10 주포·부포, 신민용 요청: "포메이션에서 ai선수 클릭할 때 주포 부포 이렇게 떠야"]
+        # 부포가 있으면 "포지션" 줄을 "주포 | 부포"(예: ST | LW)로(내 선수는 id -1 또는 is_me로 조회).
         try:
             import sub_positions as _subp
             _pid = pl.get("id")
@@ -3390,7 +3404,7 @@ class PlayerStatPopup(QDialog):
         except Exception:
             _sub = None
         if _sub:
-            info_rows.append(("부포", _sub))
+            info_rows[1] = ("포지션", f"{pl.get('position', '')} | {_sub}")
         if not _hard:
             info_rows.append(("OVR", str(pl.get('ovr', 0))))
         age = pl.get("age")

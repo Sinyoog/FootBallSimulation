@@ -72,6 +72,19 @@ def show_toast(parent, msg, color="#cc4400", duration=1200):
     QTimer.singleShot(duration, lbl.deleteLater)
 
 
+def _card_text(icon, name, mid, bottom):
+    """[2026-10 신민용 요청] 주간 일정 칸 문구 — 대회명 / 단계 / vs 상대 3줄.
+    한 줄로 이어 쓰면 대회명이 긴 날 그 칸만 가로로 길어져 7칸 줄이 무너졌다.
+    단계(mid)가 비면 그 줄은 빼고 2줄로 쓴다."""
+    lines = [f"{icon} {name}".strip()]
+    mid = (mid or "").strip()
+    if mid:
+        lines.append(mid)
+    if bottom:
+        lines.append(bottom)
+    return "\n".join(lines)
+
+
 class _ProcessingOverlay(QWidget):
     """[2026-07 추가] 진행 버튼 클릭 시 무거운 처리(advance_days, 특히
     52→1주 시즌전환)가 도는 동안 화면 전체를 덮는 반투명 오버레이.
@@ -183,6 +196,24 @@ TRAIN_MAP_KO  = {"고강도":"고강도","중강도":"중강도",
 #   콤보박스에서 언제든 자유롭게 바꿀 수 있는 건 그대로다(이건 어디까지나
 #   초기 기본값일 뿐).
 TRAIN_DEFAULTS = ["고강도","휴식","고강도","휴식","고강도","휴식","휴식"]
+
+
+def _mil_duty(d, p):
+    """[2026-10 신민용 확정] 복무 중이면 그날 고정 일정("일과"/"유격"/"혹한기"/"휴식"), 아니면 None."""
+    try:
+        from game_engine import my_military_duty
+        return my_military_duty(d, p)
+    except Exception:
+        return None
+
+
+# 복무 일정 카드 표시(아이콘, 글자색, 배경)
+_MIL_DUTY_STYLE = {
+    "일과":   ("🪖 일과",   "#c5e17a", "#1f2a1a"),
+    "유격":   ("🪖 유격",   "#ffb347", "#3a2a12"),
+    "혹한기": ("❄️ 혹한기", "#a8e0ff", "#16263a"),
+    "휴식":   ("🛌 휴식",   "#88bbff", "#1a243a"),
+}
 # [일 단위 전환] 진행 묶음 크기 = 7일(1주). 기존엔 4주(월 단위) 묶음이었다.
 DAY_BUNDLE_SIZE = 7
 
@@ -360,6 +391,10 @@ class CenterPanel(QWidget):
         p = get_player()
         if p and p.get("loan_buy_proposal_json"):
             self._show_loan_buy_proposal(p)
+        # [2026-10 신설] 구단 임대 추진 제안도 결정 전에 껐으면 다시 띄운다.
+        p = get_player()
+        if p and p.get("club_loan_proposal_json"):
+            self._show_club_loan_proposal(p, force=True)
 
     # ── 빌드 ─────────────────────────────────────
 
@@ -449,6 +484,9 @@ class CenterPanel(QWidget):
             # 경기 있을 때 대체 표시용 라벨
             ml = QLabel("⚽ 경기"); ml.setObjectName("matchLabel")
             ml.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            # [2026-10 신민용 요청: "대회명이 길면 칸이 무너진다"] 대회명/단계/상대를 줄로 나눠
+            # 보여주고, 그래도 긴 팀명은 칸을 넓히지 않고 줄바꿈되게 한다.
+            ml.setWordWrap(True)
             ml.setStyleSheet("color:#ffcc00;font-weight:bold;font-size:12px;"
                              "background:#1a3a1a;border-radius:4px;padding:4px;")
             ml.hide()
@@ -477,7 +515,8 @@ class CenterPanel(QWidget):
             self.week_frames.append(f)
             self.week_combos.append(cb)
             self.week_hints.append(hl)
-            sched_row.addWidget(f)
+            # [2026-10] 7칸을 같은 폭으로 — 글자 길이에 따라 칸 폭이 들쭉날쭉해지지 않게.
+            sched_row.addWidget(f, 1)
 
         self.lay.addLayout(sched_row)
 
@@ -539,9 +578,12 @@ class CenterPanel(QWidget):
         # 액션 버튼 행1
         row1 = QHBoxLayout()
         self.btn_join     = QPushButton("🏟 팀 입단");      self.btn_join.setObjectName("actBtn")
+        # [2026-10 신설, 신민용 확정] 임대 버튼 — 팀 입단과 순위표 사이. 소속팀이 있을 때만
+        # 누를 수 있다(팀 입단 버튼은 무소속일 때만 보이므로 둘이 자연스럽게 맞물린다).
+        self.btn_loan     = QPushButton("🔄 임대 신청");    self.btn_loan.setObjectName("actBtn")
         self.btn_standing = QPushButton("📊 순위표");       self.btn_standing.setObjectName("actBtn")
         self.btn_schedule = QPushButton("📅 경기일정");     self.btn_schedule.setObjectName("actBtn")
-        for b in [self.btn_join, self.btn_standing, self.btn_schedule]:
+        for b in [self.btn_join, self.btn_loan, self.btn_standing, self.btn_schedule]:
             row1.addWidget(b)
         self.lay.addLayout(row1)
 
@@ -554,6 +596,9 @@ class CenterPanel(QWidget):
         # 자발적 관심)과 판매추진 토글(내 구단이 나를 시장에 내놓는 것)은
         # 서로 다른 층위라 별개 버튼으로 둔다.
         self.btn_sale_push_toggle = QPushButton("🏟 판매추진 ON"); self.btn_sale_push_toggle.setObjectName("actBtn")
+        # [2026-10 신설, 신민용 확정] 임대추진 토글 — 판매추진 토글 바로 옆. 판매추진과 같은
+        # "알림만 숨김" 방식이라 OFF여도 구단은 임대를 추진하고, 그 제안은 자동 거부된다.
+        self.btn_loan_push_toggle = QPushButton("🔄 임대추진 ON"); self.btn_loan_push_toggle.setObjectName("actBtn")
         # [2026-08 신설, 신민용 요청: "국대 발탁 자동 거절 버튼"] 22세 이후
         # 대표팀을 스스로 골랐다면, 그 뒤로도 매 대회 발탁 제안이 Yes/No
         # 팝업으로 뜬다(intl_engine._create_tournament의 my_sel=3 경로).
@@ -572,10 +617,20 @@ class CenterPanel(QWidget):
         self.btn_retire = QPushButton("🚪 은퇴");     self.btn_retire.setObjectName("actBtn")
         self.btn_world  = QPushButton("🌍 세계 기록실"); self.btn_world.setObjectName("actBtn")
         for b in [self.btn_agent, self.btn_offer_toggle, self.btn_sale_push_toggle,
+                  self.btn_loan_push_toggle,
                   self.btn_nat_auto_decline, self.btn_nat_retire, self.btn_retire, self.btn_world]:
             row2.addWidget(b)
         row2.addStretch()
         self.lay.addLayout(row2)
+
+        # [2026-10 신설, 신민용 확정] 판매추진·임대추진 OFF 안내 — 끈 상태와 그로 인한 불이익을
+        # 메인 화면에 항상 보여준다(둘 다 ON이면 숨김).
+        self.lbl_push_off = QLabel("")
+        self.lbl_push_off.setWordWrap(True)
+        self.lbl_push_off.setStyleSheet(
+            "color:#ff9966;font-size:12px;padding:2px 4px;")
+        self.lbl_push_off.hide()
+        self.lay.addWidget(self.lbl_push_off)
 
         # 팀 포메이션 (감독 관계는 위젯 내부에 표시)
         from ui.formation_widget import FormationWidget
@@ -584,11 +639,13 @@ class CenterPanel(QWidget):
 
         # 버튼 연결
         self.btn_join.clicked.connect(self._do_join)
+        self.btn_loan.clicked.connect(self._do_loan)
         self.btn_standing.clicked.connect(self._do_standings)
         self.btn_schedule.clicked.connect(self._do_schedule)
         self.btn_agent.clicked.connect(self._do_agent)
         self.btn_offer_toggle.clicked.connect(self._do_toggle_offers)
         self.btn_sale_push_toggle.clicked.connect(self._do_toggle_sale_push)
+        self.btn_loan_push_toggle.clicked.connect(self._do_toggle_loan_push)
         self.btn_nat_auto_decline.clicked.connect(self._do_toggle_nat_auto_decline)
         self.btn_nat_retire.clicked.connect(self._do_toggle_nat_retire)
         self.btn_retire.clicked.connect(self._do_retire)
@@ -1020,7 +1077,7 @@ class CenterPanel(QWidget):
                     hl.setText("")
                     if ml:
                         # [2026-10] 대회별 아이콘(슈퍼컵 🏆) — 없으면 예전처럼 🌍
-                        ml.setText(f"{match_info.get('icon') or '🌍'} {match_info['league_name']} {stage}\n(미정)")
+                        ml.setText(_card_text(match_info.get('icon') or '🌍', match_info['league_name'], stage, "(미정)"))
                         ml.setStyleSheet("color:#999999;font-weight:bold;font-size:12px;"
                                          "background:#2a2a2a;border-radius:4px;padding:4px;")
                         ml.show()
@@ -1040,7 +1097,7 @@ class CenterPanel(QWidget):
                             # [2026-10 4단계, 신민용 확정] U-23 올림픽 — 글자·테두리 은색,
                             # 배경 #1f2533, 아이콘 🏅(예선·본선 공통).
                             from constants import OLYMPIC_UI_COLOR, OLYMPIC_UI_CARD_BG, OLYMPIC_UI_ICON
-                            ml.setText(f"{OLYMPIC_UI_ICON} {match_info['league_name']} {stage}{grp}\nvs {opp}")
+                            ml.setText(_card_text(OLYMPIC_UI_ICON, match_info['league_name'], f"{stage}{grp}", f"vs {opp}"))
                             ml.setStyleSheet(f"color:{OLYMPIC_UI_COLOR};font-weight:bold;font-size:12px;"
                                              f"background:{OLYMPIC_UI_CARD_BG};border:1px solid {OLYMPIC_UI_COLOR};"
                                              "border-radius:4px;padding:4px;")
@@ -1049,7 +1106,7 @@ class CenterPanel(QWidget):
                             _is_main = match_info.get("kind") in ("world", "continent")
                             _txt_c = "#ff3333" if _is_main else "#ff66b2"
                             _bg_c  = "#3a1a1a" if _is_main else "#3a1a2b"
-                            ml.setText(f"🌍 {match_info['league_name']} {stage}{grp}\nvs {opp}")
+                            ml.setText(_card_text("🌍", match_info['league_name'], f"{stage}{grp}", f"vs {opp}"))
                             ml.setStyleSheet(f"color:{_txt_c};font-weight:bold;font-size:12px;"
                                              f"background:{_bg_c};border-radius:4px;padding:4px;")
                             ml.show()
@@ -1073,7 +1130,7 @@ class CenterPanel(QWidget):
                         }
                         _txt_c, _bg_c = _CL_KIND_STYLE.get(
                             match_info.get("cl_kind"), ("#ffd24d", "#3a2f1a"))
-                        ml.setText(f"🏆 {match_info['league_name']} {stage} ({loc})\nvs {opp}")
+                        ml.setText(_card_text("🏆", match_info['league_name'], f"{stage} ({loc})", f"vs {opp}"))
                         ml.setStyleSheet(f"color:{_txt_c};font-weight:bold;font-size:12px;"
                                          f"background:{_bg_c};border-radius:4px;padding:4px;")
                         ml.show()
@@ -1086,7 +1143,7 @@ class CenterPanel(QWidget):
                     loc   = "홈" if match_info.get("is_home") else "원정"
                     hl.setText(f"스트레스 +{self._match_stress_preview(p, match_info.get('is_home', False))}")
                     if ml:
-                        ml.setText(f"🎖️ {match_info['league_name']} {rname} ({loc})\nvs {opp_disp}")
+                        ml.setText(_card_text("🎖️", match_info['league_name'], f"{rname} ({loc})", f"vs {opp_disp}"))
                         ml.setStyleSheet("color:#c48aff;font-weight:bold;font-size:12px;"
                                          "background:#2a1a3a;border-radius:4px;padding:4px;")
                         ml.show()
@@ -1106,7 +1163,7 @@ class CenterPanel(QWidget):
                     loc   = "홈" if match_info.get("is_home") else "원정"
                     hl.setText(f"스트레스 +{self._match_stress_preview(p, match_info.get('is_home', False))}")
                     if ml:
-                        ml.setText(f"🎖️ {match_info['league_name']} {rname} ({loc})\nvs {opp_disp}")
+                        ml.setText(_card_text("🎖️", match_info['league_name'], f"{rname} ({loc})", f"vs {opp_disp}"))
                         ml.setStyleSheet("color:#00A6A6;font-weight:bold;font-size:12px;"
                                          "background:#123333;border-radius:4px;padding:4px;")
                         ml.show()
@@ -1121,7 +1178,7 @@ class CenterPanel(QWidget):
                     loc   = "홈" if match_info.get("is_home") else "원정"
                     hl.setText(f"스트레스 +{self._match_stress_preview(p, match_info.get('is_home', False))}")
                     if ml:
-                        ml.setText(f"🌍 클럽 월드컵 {stage} ({loc})\nvs {opp_disp}")
+                        ml.setText(_card_text("🌍", "클럽 월드컵", f"{stage} ({loc})", f"vs {opp_disp}"))
                         # [2026-08 색상 확정, 신민용 최종 승인] 챔피언스가
                         # 블루(#4466ff)로 바뀌면서 헷갈리지 않게 클럽월드컵은
                         # 더 밝은 하늘색으로 확실히 구분한다.
@@ -1139,7 +1196,7 @@ class CenterPanel(QWidget):
                     loc   = "홈" if match_info.get("is_home") else "원정"
                     hl.setText(f"스트레스 +{self._match_stress_preview(p, match_info.get('is_home', False))}")
                     if ml:
-                        ml.setText(f"⚖ 승강 플레이오프 {stage} ({loc})\nvs {opp}")
+                        ml.setText(_card_text("⚖", "승강 플레이오프", f"{stage} ({loc})", f"vs {opp}"))
                         ml.setStyleSheet("color:#ffee55;font-weight:bold;font-size:12px;"
                                          "background:#3a3315;border-radius:4px;padding:4px;")
                         ml.show()
@@ -1149,7 +1206,9 @@ class CenterPanel(QWidget):
                     stress_val = self._match_stress_preview(p, match_info.get("is_home", False))
                     hl.setText(f"스트레스 +{stress_val}")
                     if ml:
-                        ml.setText(f"⚽ {league_name}\n({loc})")
+                        # [2026-10 신민용 요청] 리그도 둘째 줄에 상대팀.
+                        _lopp = match_info.get("opp", "")
+                        ml.setText(f"⚽ {league_name} ({loc})" + (f"\nvs {_lopp}" if _lopp else ""))
                         # [2026-07 색상 규칙, 신민용 요청] 리그=초록. 예전엔
                         # 배경만 초록이고 글자색은 노란(#ffcc00)이라 다른
                         # 대회(컵=보라/챔스=황금) 색상 규칙과 안 맞았다.
@@ -1208,6 +1267,25 @@ class CenterPanel(QWidget):
                                          "background:#1a243a;border-radius:4px;padding:4px;")
                         ml.show()
                 else:
+                    _duty = _mil_duty(d, p)
+                    if _duty:
+                        # [2026-10 신민용 확정] 복무 중엔 훈련 선택이 잠기고 "일과"(평일)/"휴식"(주말)/
+                        # "유격"(중간 비시즌 가운데 1주)/"혹한기"(51주)로 고정 — 능력치는 훈련·휴식으로 안 변한다.
+                        cb.hide()
+                        _txt, _fg, _bg = _MIL_DUTY_STYLE.get(_duty, _MIL_DUTY_STYLE["일과"])
+                        try:
+                            from game_engine import effective_training_stress as _ets
+                            from constants import MILITARY_DUTY_LOAD_AS as _MDL
+                            _sc = _ets(p, _MDL.get(_duty, "저강도"))
+                            hl.setText(f"스트레스 {_sc:+d} · 능력치 고정")
+                        except Exception:
+                            hl.setText("복무 중 능력치 고정")
+                        if ml:
+                            ml.setText(_txt)
+                            ml.setStyleSheet(f"color:{_fg};font-weight:bold;font-size:12px;"
+                                             f"background:{_bg};border-radius:4px;padding:4px;")
+                            ml.show()
+                        continue
                     if ml: ml.hide()
                     cb.setEnabled(True)
                     hl.setText("")
@@ -1225,7 +1303,9 @@ class CenterPanel(QWidget):
         _min_join_age = p.get("min_join_age") or MIN_JOIN_AGE
         age = p.get("age", 16)
         has_team  = bool(p.get("current_team_id"))
-        can_join  = is_pre and age >= _min_join_age and not has_team and not self._join_used
+        # [2026-11-01 신민용 승인 — 프리시즌 오퍼 1주차 제한] 무소속 입단은 프리시즌 오퍼 구간(1주차)에만 — 프리시즌(1~3주) 판정 is_pre는 다른 곳에서 그대로.
+        from game_engine import preseason_offer_open as _pre_open
+        can_join  = _pre_open(week) and age >= _min_join_age and not has_team and not self._join_used
 
         self.btn_join.setEnabled(can_join)
         self.btn_join.setVisible(not has_team)
@@ -1249,6 +1329,15 @@ class CenterPanel(QWidget):
         has_team = bool(p.get("current_team_id"))
         self.btn_standing.setEnabled(has_team)
         self.btn_schedule.setEnabled(has_team)
+        # [2026-10 신설] 임대 버튼 — 활성 조건·문구는 엔진 상태(my_loan) 그대로.
+        try:
+            from ui.loan_window import loan_button_state, loan_button_label
+            _loan_ok, _loan_tip = loan_button_state(p)
+            self.btn_loan.setEnabled(_loan_ok)
+            self.btn_loan.setToolTip(_loan_tip)
+            self.btn_loan.setText(loan_button_label(p))
+        except Exception as _le:
+            print("임대 버튼 갱신 오류:", _le)
 
         # [오퍼 토글] 시즌 구간과 무관하게 언제든 켜고 끌 수 있다.
         #   OFF여도 '이적 요청' 중이면 오퍼는 계속 뜨므로 라벨로 안내한다.
@@ -1276,6 +1365,34 @@ class CenterPanel(QWidget):
                 "구단의 판매 추진을 억제합니다(리스트 등재·오퍼 증가 없음). "
                 "단, 매우 심각한 상황(강등+계약임박+불화 등 다수 겹침)에서는 "
                 "그래도 구단이 최종 결정을 내릴 수 있습니다.")
+
+        # [2026-10 신설] 임대추진 토글 + 판매·임대추진 OFF 안내 줄.
+        loan_push_on = bool(p.get("allow_club_loan_push", 1))
+        if loan_push_on:
+            self.btn_loan_push_toggle.setText("🔄 임대추진 ON")
+            self.btn_loan_push_toggle.setToolTip(
+                "구단의 임대 제안을 받습니다. 클릭하면 구단 임대 제안을 자동으로 거절합니다.")
+        else:
+            self.btn_loan_push_toggle.setText("🔄 임대추진 OFF")
+            self.btn_loan_push_toggle.setToolTip(
+                "구단의 임대 제안을 창 없이 자동으로 거절합니다. 정리 목적 임대를 거절하면 "
+                "출전 우선순위가 낮아집니다(육성 목적은 영향 없음). 내가 내는 임대 신청은 그대로 가능합니다.")
+        _off_lines = []
+        if not sale_push_on:
+            _off_lines.append("⚠ 판매추진 OFF — 구단 동향 알림을 숨깁니다. "
+                              "매우 심각한 상황의 판매 제안은 그래도 뜹니다.")
+        if not loan_push_on:
+            _off_lines.append("⚠ 임대추진 OFF — 구단의 임대 추진을 자동으로 거절해 불이익을 받을 수 있습니다 "
+                              "(정리 목적 임대 거절 시 출전 기회 감소).")
+        try:
+            import my_loan as _ml
+            if _ml.bench_mult(p) > 1.0:
+                _off_lines.append(f"⚠ 정리 목적 임대 거절로 출전 불이익 적용 중 "
+                                  f"({int(p.get('loan_refused_year') or 0) + 1}년 시즌까지, 팀을 옮기면 해제)")
+        except Exception as _ble:
+            print("임대 불이익 표시 오류:", _ble)
+        self.lbl_push_off.setText("\n".join(_off_lines))
+        self.lbl_push_off.setVisible(bool(_off_lines))
 
         # [국대 발탁 자동거절 토글] 켜져 있으면 대표팀 발탁 제안 Yes/No
         # 팝업 자체를 띄우지 않고 자동으로 거절한다.
@@ -1967,8 +2084,9 @@ class CenterPanel(QWidget):
         # 1주씩/하루씩 모드에서도 똑같이 막을 이유가 없다. 완전히 막는 대신
         # 입단을 잊지 않도록 알림만 띄우고 그대로 진행시킨다(버튼/오퍼는
         # 여전히 정상적으로 뜬다).
+        from game_engine import preseason_offer_open as _pre_open_r   # [2026-11-01 신민용 승인 — 프리시즌 오퍼 1주차 제한]
         if (p["age"] >= _min_join_age and not p.get("current_team_id")
-                and _ps_s <= week <= _ps_e and not getattr(self, "_skip_join_lock", False)
+                and _pre_open_r(week) and not getattr(self, "_skip_join_lock", False)
                 and self._join_reminder_shown_week != week):
             self._join_reminder_shown_week = week
             show_toast(self, "💡 아직 팀이 없습니다 — 입단하지 않고 계속 진행합니다", "#664400", 1800)
@@ -2012,6 +2130,8 @@ class CenterPanel(QWidget):
                         prev_mi = None
                     if prev_mi:
                         ttype = "휴식"
+                    elif _mil_duty(d, p):
+                        ttype = _mil_duty(d, p)   # [2026-10] 복무 중 고정 일정
                     # 강점/약점훈련은 엔진이 스탯을 자동 선별하므로 detail 불필요.
                     sched.append((d, ttype, None))
             return sched
@@ -2046,6 +2166,8 @@ class CenterPanel(QWidget):
                             prev_mi = None
                         if prev_mi:
                             ttype = "휴식"
+                        elif _mil_duty(d, p):
+                            ttype = _mil_duty(d, p)   # [2026-10] 복무 중 고정 일정
                         sched.append((d, ttype, None))
                 self._locked_sched = sched
             # 인덱스 안전 클램프 (혹시라도 범위를 벗어나면 마지막 날로)
@@ -2162,7 +2284,8 @@ class CenterPanel(QWidget):
         # 소속 없으면 입단 안내
         from constants import SEASON_PHASES as _SP4
         _pss, _pse = _SP4["preseason1"]
-        if _pss <= new_week <= _pse and p2.get("age",0) >= (p2.get("min_join_age") or MIN_JOIN_AGE) and not p2.get("current_team_id"):
+        from game_engine import preseason_offer_open as _pre_open4   # [2026-11-01 신민용 승인 — 프리시즌 오퍼 1주차 제한] 입단 안내도 1주차만
+        if _pre_open4(new_week) and p2.get("age",0) >= (p2.get("min_join_age") or MIN_JOIN_AGE) and not p2.get("current_team_id"):
             # 새 시즌 프리시즌 진입 → 작년 '전부 결렬→1년 훈련' 보류를 해제하고
             #   올해 다시 입단(오퍼)에 도전하게 한다.
             self._skip_join_lock = False
@@ -2257,11 +2380,19 @@ class CenterPanel(QWidget):
         if p2.get("loan_buy_proposal_json"):
             self._show_loan_buy_proposal(p2)
 
+        # [2026-10 신설] 구단 임대 추진 제안 — 같은 시점, 제안마다 한 번만 자동으로 띄운다
+        # ("나중에 결정"을 고르면 임대 버튼으로 다시 열 수 있다).
+        if p2.get("club_loan_proposal_json"):
+            self._show_club_loan_proposal(p2)
+
         # 자동 오퍼 팝업은 1주 묶음이 완료됐을 때만
         # (1주씩 본다고 매주 오퍼가 뜨지 않음)
         if bundle_done:
             if p2.get("current_team_id") and in_zone:
                 self._show_auto_offer(new_week)
+            elif p2.get("current_team_id"):
+                # [2026-10] 오퍼 구간 밖이어도(설정이 바뀌어 1·52주가 구간 밖이 되는 경우 포함) 입대 카드는 뜬다.
+                self._show_military_only()
 
         # [2026-08 최적화, 신민용 리포트: "하루씩 진행이 1주씩보다 더 렉걸린다"]
         #   예전엔 여기서 무조건 refresh_all()을 불렀다 — 1주씩 모드는 버튼
@@ -2378,6 +2509,8 @@ class CenterPanel(QWidget):
                     prev_mi = None
                 if prev_mi:
                     ttype = "휴식"
+                elif _mil_duty(d, p):
+                    ttype = _mil_duty(d, p)   # [2026-10] 복무 중 고정 일정
                 sched.append((d, ttype, None))
         return sched
 
@@ -2512,7 +2645,8 @@ class CenterPanel(QWidget):
         _pss_y, _pse_y = _SP_Y["preseason1"]
         st2 = get_state()
         new_week = st2.get("current_week", 0) if st2 else 0
-        if (_pss_y <= new_week <= _pse_y and p2.get("age", 0) >= _min_join_age_y
+        from game_engine import preseason_offer_open as _pre_open_y   # [2026-11-01 신민용 승인 — 프리시즌 오퍼 1주차 제한]
+        if (_pre_open_y(new_week) and p2.get("age", 0) >= _min_join_age_y
                 and not p2.get("current_team_id")):
             self._skip_join_lock = False
             self._join_used = False
@@ -2846,9 +2980,16 @@ class CenterPanel(QWidget):
                     "WHERE league_id=? AND week=? AND day=? "
                     f"AND (home_team_id=? OR away_team_id=?) {_played_clause}AND season=?",
                     (lid, week, day, tid, tid, cur_season)).fetchone()
+                _opp_name = ""
+                if row:
+                    # [2026-10 신민용 요청] 일정 칸에 "vs 상대팀"을 보여주려고 상대 이름도 같이 읽는다.
+                    _oid = row["away_team_id"] if row["home_team_id"] == tid else row["home_team_id"]
+                    _orow = conn.execute("SELECT name FROM teams WHERE id=?", (_oid,)).fetchone()
+                    _opp_name = _orow["name"] if _orow else ""
                 conn.close()
                 if row:
                     return {
+                        "opp":         _opp_name,
                         "home_id":     row["home_team_id"],
                         "away_id":     row["away_team_id"],
                         "league_name": team_row["lname"],
@@ -3022,9 +3163,15 @@ class CenterPanel(QWidget):
             _prob = 0.5
 
         # [2026-08 신설] 협상 상태 — 클로저 안에서 갱신할 수 있게 dict로.
+        # [2026-10-30 신설] 조기 재계약(계약이 남아 있는 상태) — 거절해도 기존 계약 유지, 새 계약은
+        # 기존 계약보다 길어야 한다(game_engine.renewal_min_years).
+        from game_engine import renewal_min_years as _rmin, get_state as _gs_r
+        _early = bool(p.get("_contract_renew_early", 0))
+        _st_r = _gs_r() or {}
+        _min_yrs = _rmin(p, _st_r.get("current_year") or 0, _st_r.get("current_week") or 1) if _early else 1
         state = {
             "sal": p.get("_contract_renew_offer", 0),
-            "yrs": p.get("_contract_renew_years", 0) or 2,   # 안전 기본값
+            "yrs": max(_min_yrs, p.get("_contract_renew_years", 0) or 2),   # 안전 기본값
             "sal_used": roll_negotiation_attempts(_prob),
             "yrs_used": roll_negotiation_attempts(_prob),
             "sal_failed": False,
@@ -3045,6 +3192,10 @@ class CenterPanel(QWidget):
         card = QFrame(); card.setObjectName("dlgCard")
         cl = QVBoxLayout(card); cl.setContentsMargins(14,12,14,12); cl.setSpacing(6)
         cl.addWidget(QLabel(f"<b style='color:#fff'>{team_name}</b><span style='color:#bbb'>에서 재계약을 제안합니다.</span>"))
+        if _early:
+            cl.addWidget(QLabel(f"<span style='color:#88ccff'>조기 재계약 — 기존 계약(~{p.get('contract_end_year')})이 "
+                                f"남아 있습니다. 새 계약은 올해부터 새로 계산되며 최소 {_min_yrs}년, "
+                                f"거절해도 기존 계약은 유지됩니다.</span>"))
         yrs_lbl = QLabel()
         sal_lbl = QLabel()
         cl.addWidget(yrs_lbl); cl.addWidget(sal_lbl)
@@ -3059,9 +3210,10 @@ class CenterPanel(QWidget):
         # ── 기간 협상 행 (목표 콤보박스 + 버튼) ──────────
         yrs_row = QHBoxLayout(); yrs_row.setSpacing(6)
         yrs_combo = QComboBox()
-        for y in range(CONTRACT_YEARS_MIN, CONTRACT_YEARS_MAX + 1):
+        _combo_min = max(CONTRACT_YEARS_MIN, _min_yrs)
+        for y in range(_combo_min, max(CONTRACT_YEARS_MAX, _combo_min) + 1):
             yrs_combo.addItem(f"{y}년", y)
-        yrs_combo.setCurrentIndex(state["target_yrs"] - CONTRACT_YEARS_MIN)
+        yrs_combo.setCurrentIndex(max(0, min(state["target_yrs"] - _combo_min, yrs_combo.count() - 1)))
         yrs_btn = QPushButton(); yrs_btn.setObjectName("negBtn")
         yrs_row.addWidget(QLabel("🎯 희망:")); yrs_row.addWidget(yrs_combo)
         yrs_row.addWidget(yrs_btn); yrs_row.addStretch()
@@ -3159,10 +3311,20 @@ class CenterPanel(QWidget):
             #  - 재계약 팝업은 만료 다음 해 프리시즌(1~3주)에 뜨므로 올해가 1년차 → -1 보정
             #  - 드물게 시즌 중(5주~) 수락이면 올해 미포함 → 보정 없음
             cur_y = st["current_year"]; cur_w = st["current_week"]
-            end = (cur_y + yrs - 1) if cur_w <= 4 else (cur_y + yrs)
+            # [2026-10-30] 새로 N년(남은 기간에 더하지 않음) — 조기 재계약은 기존 계약보다 짧아지지 않게.
+            from game_engine import renewal_contract_end as _rce
+            yrs = max(yrs, _min_yrs)
+            end = _rce(cur_y, cur_w, yrs)
+            # [2026-10 신민용 확정] 해외 구단 + 병역 미필 → 30세 시즌까지만
+            from game_engine import my_clamp_contract_end
+            _end2 = my_clamp_contract_end(end)
+            if _end2 < end:
+                yrs = max(1, yrs - (end - _end2))
+                end = _end2
             from game_engine import update_player as upd
             upd(contract_years=yrs, contract_end_year=end,
-                salary=offer_sal, _contract_renew_offer=0, _contract_renew_years=0)
+                salary=offer_sal, _contract_renew_offer=0, _contract_renew_years=0,
+                _contract_renew_early=0)
             from game_engine import mark_contract_extension
             mark_contract_extension(yrs)
             from game_engine import add_log, fmt_money
@@ -3171,6 +3333,12 @@ class CenterPanel(QWidget):
             if self.main_win: self.main_win.refresh_all()
 
         def _reject():
+            if _early:   # [2026-10-30] 조기 재계약 거절 — 방출하지 않고 기존 계약 유지
+                from game_engine import decline_early_renewal
+                decline_early_renewal()
+                dlg.reject()
+                if self.main_win: self.main_win.refresh_all()
+                return
             from game_engine import update_player as upd, _save_career_entry, get_player
             # [2026-08 신설] 협상 결렬로 거절한 것도 팀 오퍼 냉각기 대상.
             if state["sal_failed"] or state["yrs_failed"]:
@@ -3252,6 +3420,20 @@ class CenterPanel(QWidget):
         cl.addWidget(QLabel(
             f"<span style='color:#bbb'>계약 기간</span>  "
             f"<b style='color:#fff'>{proposal['contract_years']}년</b>"))
+        # [2026-10 신설] 입단 역할(연봉 → 계약 → 역할 순서). 수락하면 이 역할로 입단한다.
+        if proposal.get("role"):
+            cl.addWidget(QLabel(
+                f"<span style='color:#bbb'>역할</span>  "
+                f"<b style='color:#88ccff'>{proposal['role']}</b>"))
+        # [2026-10 신설] 판매 사유(외국인 정원 초과 등) 표시.
+        if proposal.get("reasons"):
+            from game_engine import _SALE_PUSH_REASON_TEXT
+            _rs = [(_SALE_PUSH_REASON_TEXT.get(r) or "") for r in proposal.get("reasons") or []]
+            _rs = [x for x in _rs if x]
+            if _rs:
+                _rl = QLabel("<span style='color:#cc9966;font-size:11px'>" + "<br>".join(_rs) + "</span>")
+                _rl.setWordWrap(True)
+                cl.addWidget(_rl)
         body.addWidget(card, 3)
 
         interest = proposal.get("interest_teams") or []
@@ -3260,6 +3442,9 @@ class CenterPanel(QWidget):
             il = QVBoxLayout(ibox); il.setContentsMargins(10, 10, 10, 10); il.setSpacing(3)
             il.addWidget(QLabel("<span style='color:#888;font-size:11px'>관심 구단</span>"))
             for name in interest:
+                # [2026-10 버그수정] 관심 구단이 팀 정보 dict로 바뀐 뒤(2026-08) 화면엔 dict 문자열이 그대로 찍혔다.
+                if isinstance(name, dict):
+                    name = f"{name.get('flag', '')} {name.get('team_name', '')}".strip()
                 nl = QLabel(f"· {name}")
                 nl.setStyleSheet("color:#999;font-size:11px;")
                 il.addWidget(nl)
@@ -3268,8 +3453,9 @@ class CenterPanel(QWidget):
 
         root.addLayout(body)
 
-        note = QLabel("※ 수락하면 시즌이 끝난 뒤 실제로 이적합니다. "
-                       "조건 협상은 할 수 없습니다.")
+        note = QLabel(("※ 수락하면 이번 시즌 구간이 시작될 때(상반기 시작 주차) 이적합니다. "
+                        if proposal.get("quota") else "※ 수락하면 시즌이 끝난 뒤 실제로 이적합니다. ")
+                       + "조건 협상은 할 수 없습니다.")
         note.setStyleSheet("color:#666;font-size:11px;")
         note.setWordWrap(True)
         root.addWidget(note)
@@ -3296,6 +3482,32 @@ class CenterPanel(QWidget):
         btn_reject.clicked.connect(_reject)
         dlg.exec()
         dlg.deleteLater()
+
+    def _do_loan(self):
+        """[2026-10 신설] 임대 버튼 — 임대 희망 제출, 구단 제안·오퍼·예약 상태 확인."""
+        from ui.loan_window import LoanDialog
+        dlg = LoanDialog(self, _DIALOG_STYLE, "status")
+        dlg.exec()
+        dlg.deleteLater()
+        if self.main_win:
+            self.main_win.refresh_all()
+
+    def _show_club_loan_proposal(self, p, force=False):
+        """[2026-10 신설] 구단 임대 추진 제안 팝업 — 제안(만든 주차)마다 한 번만 자동으로 뜬다."""
+        try:
+            _prop = json.loads(p.get("club_loan_proposal_json") or "{}")
+        except Exception:
+            return
+        _key = tuple(_prop.get("made") or ())
+        if not force and getattr(self, "_club_loan_popup_seen", None) == _key:
+            return
+        self._club_loan_popup_seen = _key
+        from ui.loan_window import LoanDialog
+        dlg = LoanDialog(self, _DIALOG_STYLE, "club")
+        dlg.exec()
+        dlg.deleteLater()
+        if self.main_win:
+            self.main_win.refresh_all()
 
     def _show_loan_buy_proposal(self, p):
         """[2026-10 신설, 신민용 확정] 임대처가 임대 성과를 보고 완전 영입을
@@ -3348,7 +3560,9 @@ class CenterPanel(QWidget):
             f"<b style='color:#fff'>{proposal['contract_years']}년</b>"))
         root.addWidget(card)
 
-        note = QLabel("※ 수락하면 시즌이 끝난 뒤 원 소속팀으로 복귀하지 않고 이 팀으로 "
+        import my_loan as _ml
+        _when = _ml.loan_end_text(p)
+        note = QLabel(f"※ 수락하면 {_when} 원 소속팀으로 복귀하지 않고 이 팀으로 "
                       "완전 이적합니다. 거절하면 예정대로 복귀합니다.")
         note.setStyleSheet("color:#666;font-size:11px;")
         note.setWordWrap(True)
@@ -3780,6 +3994,23 @@ class CenterPanel(QWidget):
                       "#666666", 2500)
         if self.main_win: self.main_win.refresh_all()
 
+    def _do_toggle_loan_push(self):
+        """[2026-10 신설] 임대추진 ON/OFF 토글. OFF여도 구단은 임대를 추진하고, 그 제안은
+        창 없이 자동 거부된다(정리 목적이면 직접 거부와 같은 출전 불이익). 이미 떠 있는
+        제안은 그대로 남아 직접 답해야 한다."""
+        p = get_player()
+        if not p: return
+        from game_engine import update_player
+        cur = bool(p.get("allow_club_loan_push", 1))
+        new_val = 0 if cur else 1
+        update_player(allow_club_loan_push=new_val)
+        if new_val:
+            show_toast(self, "🔄 구단 임대 제안을 받습니다", "#006622", 1500)
+        else:
+            show_toast(self, "🔄 구단 임대 제안을 자동으로 거절합니다  (정리 목적이면 출전 불이익)",
+                      "#666666", 2500)
+        if self.main_win: self.main_win.refresh_all()
+
     def _do_toggle_nat_auto_decline(self):
         """[2026-08 신설] 국대 발탁 자동거절 ON/OFF 토글.
         ON이면 대표팀 발탁 제안(Yes/No 팝업)이 뜨지 않고 자동으로 거절
@@ -3948,12 +4179,51 @@ class CenterPanel(QWidget):
                       transfer_type="입단", offer=dlg.chosen)
             if self.main_win: self.main_win.refresh_all()
 
+    def _military_card_due(self):
+        """[2026-10 버그수정, 신민용 리포트: "대한민국 선수는 군대를 가야 하니 1주차에 입대 오퍼가 무조건
+        와야 하는데 안 온다"] 군팀 입대 카드는 1주차·52주차에 미필 20세 이상이면 오퍼 확률·오퍼 토글과
+        무관하게 반드시 떠야 한다. 이번 주에 이미 띄웠으면 False(같은 주 중복 방지)."""
+        try:
+            from game_engine import my_player_military_offer_teams, military_choice_week_open
+            if not military_choice_week_open():
+                return False
+            st = get_state() or {}
+            if getattr(self, "_mil_card_key", None) == (st.get("current_year"), st.get("current_week")):
+                return False
+            return bool(my_player_military_offer_teams())
+        except Exception:
+            return False
+
+    def _mark_military_card_shown(self):
+        st = get_state() or {}
+        self._mil_card_key = (st.get("current_year"), st.get("current_week"))
+
+    def _show_military_only(self):
+        """[2026-10] 이번 구간 오퍼 창이 이미 지나간 뒤(예: 45주에 오퍼 창 → 52주)에도 입대 카드만 띄운다."""
+        if not self._military_card_due():
+            return
+        self._mark_military_card_shown()
+        p = get_player() or {}
+        from ui.offer_window import OfferWindow
+        dlg = OfferWindow([], p.get("language", "ko"), self, title="🪖 입대", grid=True)
+        dlg.exec()
+        if self.main_win:
+            self.main_win.refresh_all()
+
     def _show_auto_offer(self, week: int):
         """소속 있을 때 자동 오퍼 팝업 (이적시장: 여름 1~3주, 겨울 28~29주)."""
         from game_engine import _offer_probability, load_pending_offer_state
         p = get_player()
         if not p or not p.get("current_team_id"): return
-        if self._auto_offer_shown: return
+        if self._auto_offer_shown:
+            self._show_military_only()   # [2026-10] 오퍼 창은 이미 봤어도 1·52주 입대 카드는 뜬다
+            return
+        # [2026-11-01 신민용 승인 — 프리시즌 오퍼 1주차 제한] 무소속으로 입단한 이적 기간엔 다른 팀 오퍼를 띄우지 않는다(입대 카드는 그대로).
+        from game_engine import joined_this_offer_window
+        if joined_this_offer_window():
+            self._show_military_only()
+            return
+        _mil_due = self._military_card_due()
 
         # [2026-07 신설, 신민용 요청] 저장된 오퍼 상태가 있으면(결정 전에
         # 껐다 켠 경우) 확률/토글 체크를 다시 하지 않고 그대로 복원한다 —
@@ -3966,6 +4236,7 @@ class CenterPanel(QWidget):
             if not p.get("offers_enabled", 1) and not p.get("transfer_requested"):
                 from game_engine import clear_pending_offer_state
                 clear_pending_offer_state()
+                self._show_military_only()
                 return
             offers = restore.get("offers", [])
             from game_engine import refresh_offer_rank_info
@@ -3975,24 +4246,29 @@ class CenterPanel(QWidget):
             #   단, '이적 요청' 중이면 사용자가 명시적으로 이적을 원한다는 뜻이므로
             #   토글과 무관하게 오퍼를 계속 보여준다.
             if not p.get("offers_enabled", 1) and not p.get("transfer_requested"):
+                # [2026-10] 오퍼 토글이 꺼져 있어도 1·52주 입대 카드는 뜬다(일반 오퍼는 그대로 숨김).
+                self._show_military_only()
                 return
 
             prob = _offer_probability(p, week)
             import random
             if random.random() > prob:
-                return  # 이번 구간 오퍼 없음
+                # [2026-10 버그수정] 이번 구간 일반 오퍼가 없어도 1·52주 입대 카드는 반드시 뜬다 —
+                # 예전엔 여기서 바로 return해서 군팀 카드가 오퍼 확률에 같이 걸렸다.
+                if not _mil_due:
+                    return  # 이번 구간 오퍼 없음
+                self._show_military_only()
+                return
 
             offers = generate_offers()
             if not offers:
                 # [2026-10 병역 7단계] 오퍼가 0건이어도 미필 20세 이상이면 군팀 카드만 있는 창을 띄운다.
-                try:
-                    from game_engine import my_player_military_offer_teams, military_choice_week_open
-                    if not (military_choice_week_open() and my_player_military_offer_teams()):
-                        return
-                except Exception:
+                if not _mil_due:
                     return
 
         self._auto_offer_shown = True
+        if _mil_due:
+            self._mark_military_card_shown()   # 이 창 맨 위에 군팀 카드가 같이 뜬다
         from ui.offer_window import OfferWindow
         dlg = OfferWindow(offers, p.get("language","ko"), self, title="✈ 오퍼", grid=True,
                           kind="auto_offer", restore_state=restore)
@@ -4054,6 +4330,11 @@ class CenterPanel(QWidget):
             #   종료했다가, 재시작 전/후 사이에 토글을 껐다면 — 이적 요청 중이
             #   아닌 한 그대로 복원하지 않고 정리한다. (기존엔 무조건 복원)
             if not p.get("offers_enabled", 1) and not p.get("transfer_requested"):
+                clear_pending_offer_state()
+                return
+            # [2026-11-01 신민용 승인 — 프리시즌 오퍼 1주차 제한] 입단한 이적 기간이면 복원하지 않는다(프리시즌 구간이 지난 상태는 load에서 이미 만료).
+            from game_engine import joined_this_offer_window as _jtw_r
+            if _jtw_r():
                 clear_pending_offer_state()
                 return
             self._auto_offer_shown = True

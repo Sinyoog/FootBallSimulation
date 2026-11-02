@@ -61,7 +61,7 @@ def _get_field_pos(p):
         conn.close()
         formation = (row["formation"] if row else None) or "4-4-2"
         slots = FORMATION_SLOTS.get(formation, FORMATION_SLOTS["4-4-2"])
-        # [2026-10 주포·부포] 내 부포 슬롯은 순위 0(클럽 대항전 = 클럽 범위)
+        # [2026-10 주포·부포] 내 부포 슬롯은 순위 SUB_POS_RANK(부포 = OVR −1, 클럽 대항전 = 클럽 범위)
         import sub_positions as _subp
         _my_sub = _subp.my_sub()
         if _my_sub:
@@ -936,6 +936,11 @@ def sim_my_cl_match_as_ai(week, p, reason="injury", day=None):
                   forced=((_cs["home_score"], _cs["away_score"]) if _cs is not None else None))
     from game_engine import update_player, _calc_manager_rel
     update_player(manager_relation=_calc_manager_rel(p, 0, "", played=False, not_played_penalty=2))
+    # [2026-10 신민용 요청] 내가 결장한 이 경기도 경기 상세를 볼 수 있게 — 체인 엔진 기록(나 없음)을 관전 기록으로 저장.
+    import controlled_matches as _cm_abs
+    _cm_abs.save_absent_match(_cs, m["home_team_id"], m["away_team_id"], info.get("is_home"),
+                              t.get("name") or "챔피언스리그", "cl", week=week, day=m.get("day") or day,
+                              reason=reason)
 
 
 def simulate_my_cl_match(week, p, day=None):
@@ -960,11 +965,18 @@ def simulate_my_cl_match(week, p, day=None):
     ae = _entry(t["id"], m["away_team_id"])
     is_home = info["is_home"]
 
+    # [2026-10 대회별 카드 규칙] UEFA 63조 — 3장(이후 홀수)째 정지, 8강 종료 후 누적 소멸.
+    try:
+        import card_rules as _cr
+        _cr.prepare_club_europe_match(p, f"cl_tournaments:{t['id']}", m.get("stage"))
+    except Exception as _cre:
+        print("card_rules 챔스 경기 준비 오류(예전 규칙으로):", _cre)
     # [2026-07 신설] 출전정지 체크 — 퇴장 다음 경기는 강제 결장.
     _suspended, _new_susp = _check_suspended(p, field="cl_suspension")
     if _suspended:
         update_player(cl_suspension=_new_susp)
-        add_log(f"🟥 출전정지로 결장{'  (다음 경기부터 복귀)' if _new_susp == 0 else f'  (남은 정지 {_new_susp}경기)'}",
+        from game_engine import suspension_log_text as _susp_log_text
+        add_log(_susp_log_text("cl_suspension", _new_susp),
                 "event")
 
     # 내 출전 보너스 (클럽 리그 경기와 동일: 격차 기반 에이스 영향력)
@@ -980,7 +992,7 @@ def simulate_my_cl_match(week, p, day=None):
     # 리그(game_engine._check_bench)와 동일 로직 재사용, 비교 기준만 이
     # 경기의 팀 OVR(_team_ovr)로 넘긴다. 출전정지면 벤치 확률은 무의미
     # 하므로 건너뛴다(우선순위: 징계 > 벤치).
-    _benched = (not _suspended) and _check_bench(p, team_avg_ovr=_team_ovr)
+    _benched = (not _suspended) and _check_bench(p, team_avg_ovr=_team_ovr, club_match=True)   # [2026-10 my_loan] 클럽 경기
     if _benched:
         add_log("🪑 교체 명단에서 시작", "event")
     _star = 1.0 + max(0.0, (_my_ovr - 60) / 40.0) ** 1.8 * 3.0
@@ -1193,7 +1205,10 @@ def simulate_my_cl_match(week, p, day=None):
     rs = {"win": "승", "draw": "무", "loss": "패"}.get(my_result, "")
     pso_txt = ""
     if pso_winner:
-        pso_txt = f"  (승부차기 {pso_score} {'승' if pso_winner == my_tid else '패'})"
+        # [2026-10 신민용 요청] "(무)  (승부차기 5-3 패)" 대신 "승부차기 (5-3) 패배"로 —
+        # 결과 칸 자체를 바꾼다(로그 '경기' 필터가 줄 끝 결과 표기로 결과 줄을 찾는다).
+        from game_engine import pso_result_text
+        pso_txt = pso_result_text(pso_score, pso_winner == my_tid)
         rs = "무"
 
     comp_name = f"{t['name']} {stage_ko}".strip()
@@ -1208,12 +1223,14 @@ def simulate_my_cl_match(week, p, day=None):
         events, not (_suspended or _benched), _benched, detail, pso=pso,
         engine_stats=engine_stats, engine_plog=engine_plog, player_ratings=player_ratings,
         match_extra={"score_90": ([hs90, as90] if hs90 is not None else [hs, as_]),
-                     "went_extra_time": went_et, "subs": _subs})
+                     "went_extra_time": went_et, "subs": _subs},
+        # [2026-10 신설] 이 경기 AI 선수 실측 기록(real_stats)
+        real_ctx={"comp": "cl", "tkey": f"cl_tournaments:{m['tournament_id']}", "home": m["home_team_id"], "away": m["away_team_id"]})
     marker = f" [match:{detail_id}:cl]" if detail_id else ""
 
     add_log("─" * 44, "sep")
     add_log(f"🏆 {comp_name}  {week}주차{marker}", "match")
-    add_log(f"   {home_disp} {hs}-{as_} {away_disp}  ({rs}){pso_txt}", "match")
+    add_log(f"   {home_disp} {hs}-{as_} {away_disp}  {pso_txt or f'({rs})'}", "match")
     if p.get("position") == "GK":
         add_log(f"   평점 {rating:.1f}  선방 {saves}", "match")
     else:
@@ -1315,7 +1332,7 @@ def _cl_team_stage_weights(conn, tid):
     return _weight
 
 
-def _award_cl_awards(t, my_tid):
+def _award_cl_awards(t, my_tid, mode="finish"):
     """[2026-07 확장, 신민용 확정] 챔스 득점왕/시즌MVP/베스트11/영플레이어/
     골든글러브. 내 팀이 조기탈락해도(4강까지 못 가도) 대회 전체 기준으로
     별개 판정한다.
@@ -1377,7 +1394,7 @@ def _award_cl_awards(t, my_tid):
     if other_team_ids:
         tph = ",".join("?" * len(other_team_ids))
         rows = conn.execute(
-            f"""SELECT team_id, ovr, position, sub_role, age FROM ai_players
+            f"""SELECT id, team_id, ovr, position, sub_role, age FROM ai_players
                 WHERE team_id IN ({tph}) AND position IN ({ph})
                 ORDER BY team_id, id""",
             (*other_team_ids, *ALL_POS)).fetchall()
@@ -1392,7 +1409,16 @@ def _award_cl_awards(t, my_tid):
             cs = _estimate_ai_clean_sheets(r["position"], r["ovr"], 80, 80, n_games) if r["position"] in GK_POS else 0
             pool.append({"position": r["position"], "goals": g, "assists": a, "rating": rt,
                         "ovr": r["ovr"], "cs": cs, "age": r["age"] or 25, "is_mine": False,
-                        "team_id": e["team_id"]})
+                        "team_id": e["team_id"], "pid": r["id"]})
+    # [2026-10 신설, 신민용 확정] 대회상도 실측 기록으로 — 상대 팀 후보는 나와 붙은 경기만 실측으로 합치고,
+    # 우리 팀 AI 선수(예전엔 후보에서 빠져 있었다)는 실측 기록으로 후보에 넣는다(real_stats.apply_to_award_pool).
+    # 추정치 난수 소비 순서는 위 루프 그대로다.
+    try:
+        import real_stats as _rs
+        pool = _rs.apply_to_award_pool(conn, pool, "cl", f"cl_tournaments:{tid}", "cl_matches", tid, my_tid,
+                                       GK_POS, ALL_POS)
+    except Exception as _rse:
+        print("real_stats 대회상 합산 오류(추정치 유지):", _rse)
 
     _stage_w = _cl_team_stage_weights(conn, tid)
     my_base_score = _position_award_score(my_pos, my_row["g"], my_row["a"], my_row["r"], my_ovr, my_cs)
@@ -1425,8 +1451,13 @@ def _award_cl_awards(t, my_tid):
         awards.append(("챔피언스리그 득점왕", f"{my_row['g']}골"))
     if my_score >= best_ai_mvp_score:
         awards.append(("챔피언스리그 시즌MVP", f"{year} {t['name']} MVP"))
+    # [2026-10 신민용 확정: "내 선수 수상 판정을 명단 기준으로 통일"] 내 챔스 베스트 11은 대회 종료
+    # 때 정하지 않는다 — 시즌 종료 때 세계기록실 명단(game_engine._compute_club_comp_individual_awards)에
+    # 내가 들었으면 같은 이름("챔피언스리그 베스트11")으로 경력에 넣는다. mode="best11_only"는 시즌
+    # 중 은퇴처럼 명단이 끝내 안 만들어지는 경우에만 쓰는 예전 판정(game_engine.
+    # _settle_my_cl_best11_early) — 그때는 베스트11만 넣고 나머지 상은 이미 들어가 있으므로 건너뛴다.
     for label in _evaluate_extra_awards(pool, my_pos, my_age, weight_fn=lambda x: _stage_w(x["team_id"]),
-                                         young_age_cutoff=23):
+                                         young_age_cutoff=23, include_best11=(mode == "best11_only")):
         awards.append((f"챔피언스리그 {label}", f"{year} {t['name']} {label}"))
     if (my_pos in GK_POS and my_cs >= 2
             and _gk_quality_ok(my_row["sv"], my_row["gc"], n_games, n_games, min_play_ratio=0.0)):
@@ -1435,6 +1466,10 @@ def _award_cl_awards(t, my_tid):
         if best_gk and best_gk["is_mine"]:
             awards.append(("챔피언스리그 골든글러브", f"{my_cs} 클린시트"))
 
+    if mode == "best11_only":
+        awards = [a for a in awards if a[0] == "챔피언스리그 베스트11"
+                  and not conn.execute("SELECT 1 FROM awards WHERE year=? AND award_type=? AND league_name=? "
+                                       "AND is_mine=1", (year, a[0], t["name"])).fetchone()]
     for atype, detail in awards:
         add_log(f"🏅 {atype} 수상! ({detail})", "event")
         conn.execute(

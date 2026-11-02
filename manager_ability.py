@@ -271,7 +271,13 @@ def assign_missing_manager_abilities(conn, year=None, verbose=False, mode=None):
         return 0
     if year is None:
         r = conn.execute("SELECT current_year FROM season_state WHERE id=1").fetchone()
-        year = int(r[0]) if r and r[0] else 2000
+        if r and r[0]:
+            year = int(r[0])
+        else:
+            # [2026-10 버그수정] 새 게임 세계 생성 때는 season_state가 비어 있다 — 상수 2000이
+            # 아니라 이번 판 시작 연도(database.reset_game_data가 먼저 확정해 둔다).
+            from database import get_game_start_year
+            year = int(get_game_start_year())
     salt = get_world_salt()
     tovr = team_ovr_map(conn)
     meta = _team_meta(conn)

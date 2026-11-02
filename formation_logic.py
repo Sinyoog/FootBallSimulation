@@ -67,6 +67,22 @@ def _pos_category(pos):
     return _POS_CATEGORY_GET(pos, "ATK")
 
 
+# [2026-10-30 신설, 신민용 요청: "주전이든 후보든 위에서부터 GK - DF - MF - FW 순으로, 같은 줄이면 OVR 높은
+# 순, OVR도 같으면 랜덤"] 메인 화면 포메이션 명단(ui/formation_widget._starter_sort_key)과 세계 축구 기록실
+# 포메이션 창 명단(ui/world_browser_window._build_squad_roster_panel)이 같이 쓰는 정렬 기준. 줄은 화면에
+# 찍힌 포지션 글자로 가른다(_pos_category: GK / DF = CB·LB·RB·LWB·RWB / MF = CDM·CM·CAM·LM·RM / FW = ST·CF·
+# LW·RW). OVR이 같으면 선수 id에서 나온 고정 난수로 섞는다 — 화면을 다시 그릴 때마다 순서가 바뀌지 않게
+# 하고, 게임 난수(random)는 건드리지 않는다. 포지션을 모르는 줄('-'·빈 값)과 OVR을 모르는 선수는 맨 뒤.
+_ROSTER_LINE_ORDER = {"GK": 0, "DEF": 1, "MID": 2, "ATK": 3}
+
+
+def roster_line_sort_key(pos, ovr, pid):
+    import zlib
+    line = _ROSTER_LINE_ORDER[_pos_category(pos)] if pos and pos != "-" else 4
+    return (line, -(ovr if isinstance(ovr, (int, float)) else -1),
+            zlib.crc32(str(pid).encode()) if pid is not None else 0)
+
+
 # ─────────────────────────────────────────────
 # [2026-09 성능] 슬롯 배정 사전계산 표
 # ─────────────────────────────────────────────
@@ -116,14 +132,21 @@ def _pref_for(pref, slots, pos):
 
 
 # ── [2026-10 신설 — 주포·부포, sub_positions.py 참고] ─────────────────────
+from constants import SUB_POS_RANK   # [2026-10] 부포 = OVR −1 (constants.SUB_POS_OVR_COST 주석 참고)
+
+
+def _sub_mult_pen(ovr):
+    import sub_positions as _sp
+    return _sp.sub_mult_penalty(ovr, POSITION_MISMATCH_PENALTY[1])
+
 # 부포(선수 dict의 "sub_pos", prep 묶음의 세 번째 값)가 있는 선수만 아래 경로를 탄다. 부포가 없으면
 # 모든 함수가 예전 값을 그대로 돌려준다 — 스위치 OFF·부포 0명이면 기존 경로 100%.
 _PREF_SUB_CACHE: dict = {}
 
 
 def _pref_sub(slots_key, slots, pos, sub):
-    """부포 보유자의 슬롯 선호 순서 — 부포 슬롯을 순위 0으로 넣은 (순위, 인덱스) 오름차순.
-    주포 슬롯도 순위 0이라 동점이면 슬롯 순서를 따른다(주포 우선 없음)."""
+    """부포 보유자의 슬롯 선호 순서 — 부포 슬롯을 순위 SUB_POS_RANK로 넣은 (순위, 인덱스) 오름차순.
+    [2026-10] 부포 = OVR −1이라 주포 슬롯(0)이 먼저, 호환 2순위(1)보다는 부포가 먼저."""
     key = (slots_key, pos, sub)
     order = _PREF_SUB_CACHE.get(key)
     if order is None:
@@ -131,7 +154,7 @@ def _pref_sub(slots_key, slots, pos, sub):
         tmp = []
         for i, sp in enumerate(slots):
             if sp == sub:
-                tmp.append((0, i))
+                tmp.append((SUB_POS_RANK, i))   # [2026-10] 부포 = OVR −1 → 주포(0)와 2순위(1) 사이
             elif sp in compat:
                 tmp.append((compat.index(sp), i))
         tmp.sort()
@@ -141,10 +164,10 @@ def _pref_sub(slots_key, slots, pos, sub):
 
 
 def slot_rank(pl, slot_pos):
-    """선수 dict 기준 미스매치 순위 — 부포 슬롯이면 0, 아니면 기존 _mismatch_rank(주포, 슬롯)."""
+    """선수 dict 기준 미스매치 순위 — 부포 슬롯이면 SUB_POS_RANK, 아니면 기존 _mismatch_rank(주포, 슬롯)."""
     sub = pl.get("sub_pos")
     if sub and sub == slot_pos:
-        return 0
+        return SUB_POS_RANK
     return _mismatch_rank(pl.get("position") or "CM", slot_pos)
 
 
@@ -303,7 +326,7 @@ def _greedy_fill_slots(candidates, slots_only):
     pref, catslots = _slot_tables(tuple(slots_only), slots_only)
 
     # 1) 정확한 포지션 호환(POSITION_COMPAT) 매치
-    # [2026-10 주포·부포] 부포 보유자만 부포 슬롯을 순위 0으로 넣은 개인 선호 순서를 쓴다.
+    # [2026-10 주포·부포] 부포 보유자만 부포 슬롯을 순위 SUB_POS_RANK로 넣은 개인 선호 순서를 쓴다.
     _slots_key = tuple(slots_only)
     still_left = []
     for pl in remaining:
@@ -773,22 +796,86 @@ def _calc_foot_fit(slot_pos, foot, sub_role):
         return 1.0                      # 양발 / 미배정 → 면제
     want = FOOT_SIDED_SLOTS.get(slot_pos)
     if want is not None:
-        return 1.0 if foot == want else (1.0 - FOOT_MISMATCH_PENALTY)
+        # [2026-10 5번 ③, constants.FOOT_PENALTY_V2_ENABLED] 켜져 있으면 FOOT_MISMATCH_PENALTY_V2(10%).
+        return 1.0 if foot == want else (1.0 - _FOOT_PEN[0])
     inv = FOOT_INVERTED_SLOTS.get(slot_pos)
     if inv is not None and foot != inv and sub_role == "인버티드":
         return 1.0 + FOOT_INVERTED_BONUS
     return 1.0
 
 
+_TIER_PEN_CACHE: dict = {}
+
+
+def _tier_penalty(player_pos, slot_pos):
+    """[2026-10 5번 ①, constants.POSITION_TIER_PENALTY_ENABLED] 포지션 거리 단계 감점(양방향 같은 값).
+    GK가 끼면 예전 _mismatch_penalty 그대로(최적 배치에서 GK↔필드는 따로 사실상 금지)."""
+    key = (player_pos, slot_pos)
+    v = _TIER_PEN_CACHE.get(key)
+    if v is None:
+        import constants as _C
+        pct = _C.POSITION_TIER_PCT
+        a, b = player_pos, slot_pos
+        if a == b:
+            v = pct[0]
+        elif a == "GK" or b == "GK":
+            v = _mismatch_penalty(a, b)
+        else:
+            pair = {(a, b), (b, a)}
+            if pair & set(_C.POSITION_TIER1_PAIRS):
+                v = pct[1]
+            elif pair & set(_C.POSITION_TIER2_PAIRS):
+                v = pct[2]
+            elif pair & set(_C.POSITION_TIER_SAME_FLANK):
+                v = pct[3]
+            elif ((a in _C.POSITION_TIER_DEF_LINE and b in _C.POSITION_TIER_ATT_LINE)
+                  or (b in _C.POSITION_TIER_DEF_LINE and a in _C.POSITION_TIER_ATT_LINE)):
+                v = pct[4]
+            else:
+                v = pct[3]
+        _TIER_PEN_CACHE[key] = v
+    return v
+
+
 def _slot_value(pl, slot_pos):
     """그 선수를 그 슬롯에 뒀을 때의 유효 적합도.
-    [2026-10 주포·부포] 부포 슬롯이면 미스매치 0(주발 배율은 그대로)."""
+    [2026-10 주포·부포] 부포 슬롯이면 OVR −1에 해당하는 미스매치(주발 배율은 그대로).
+    [2026-10 5번 ①] POSITION_TIER_PENALTY_ENABLED면 포지션 거리 단계 감점 + 부포 경로(주포 경로와 부포
+    경로 중 높은 값) — constants 주석 참고. 끄면 예전과 100% 같다."""
     pos = pl.get("position") or "CM"
     _sub = pl.get("sub_pos")
-    return ((pl.get("ovr") or 0)
-            * (1.0 - (0.0 if (_sub and _sub == slot_pos) else _mismatch_penalty(pos, slot_pos)))
-            * foot_fit_mult(slot_pos, pl.get("foot") or "",
-                            pl.get("sub_role") or ""))
+    _ovr = pl.get("ovr") or 0
+    _foot = foot_fit_mult(slot_pos, pl.get("foot") or "", pl.get("sub_role") or "")
+    if _TIER_ON[0]:
+        if _sub and _sub == slot_pos:
+            return _ovr * (1.0 - _sub_mult_pen(_ovr)) * _foot
+        v = _ovr * (1.0 - _tier_penalty(pos, slot_pos))
+        if _sub and _sub != "GK" and slot_pos != "GK":
+            from constants import SUB_POS_OVR_COST
+            v = max(v, (_ovr - SUB_POS_OVR_COST) * (1.0 - _tier_penalty(_sub, slot_pos)))
+        return v * _foot
+    return (_ovr
+            * (1.0 - (_sub_mult_pen(_ovr) if (_sub and _sub == slot_pos)
+                      else _mismatch_penalty(pos, slot_pos)))
+            * _foot)
+
+
+# 스위치 값은 모듈 로딩 때 한 번 읽는다(핫루프). 테스트·러너가 constants를 바꾼 뒤엔 refresh_tier_switch().
+_TIER_ON = [False]
+_FOOT_PEN = [FOOT_MISMATCH_PENALTY]
+
+
+def refresh_tier_switch():
+    import constants as _C
+    _TIER_ON[0] = bool(getattr(_C, "POSITION_TIER_PENALTY_ENABLED", False))
+    _TIER_PEN_CACHE.clear()
+    # [2026-10 5번 ③] 풀백·윙백 자리 반대발 감점 — 스위치가 꺼져 있으면 예전 FOOT_MISMATCH_PENALTY 그대로.
+    _FOOT_PEN[0] = (_C.FOOT_MISMATCH_PENALTY_V2 if getattr(_C, "FOOT_PENALTY_V2_ENABLED", False)
+                    else FOOT_MISMATCH_PENALTY)
+    _FOOT_FIT_CACHE.clear()
+
+
+refresh_tier_switch()
 
 
 def _foot_bench_swap(slot_filled, slots_only, candidates):
@@ -817,7 +904,7 @@ def _foot_bench_swap(slot_filled, slots_only, candidates):
             continue
         if _POS_CATEGORY_GET(si, "ATK") == "GK":
             continue
-        base_rank = slot_rank(a, si)          # [2026-10 주포·부포] 부포 슬롯이면 0
+        base_rank = slot_rank(a, si)          # [2026-10 주포·부포] 부포 슬롯이면 SUB_POS_RANK
         best, best_v = None, _slot_value(a, si)
         for q in pool:
             pq = q.get("position") or "CM"
@@ -1005,11 +1092,11 @@ def formation_fit_penalty_prepped(prepped, slots_key, slots):
     weighted_penalty = 0.0
     _mp = _mismatch_penalty
     if _has_sub:
-        # [2026-10 주포·부포] 부포 슬롯은 미스매치 0. 맞교환 보정은 이 경로의 목적함수
+        # [2026-10 주포·부포] 부포 슬롯은 OVR −1에 해당하는 미스매치. 맞교환 보정은 이 경로의 목적함수
         # (OVR × (1 − 미스매치), 주발 없음)로 따로 돈다 — 실제 경기 배치(_slot_value)와 독립.
         def _pen(pl, slot_pos):
             _s = pl[2] if len(pl) > 2 else None
-            return 0.0 if (_s and _s == slot_pos) else _mp(pl[0], slot_pos)
+            return _sub_mult_pen(pl[1]) if (_s and _s == slot_pos) else _mp(pl[0], slot_pos)
         _value_swap_pass(filled, slots, lambda pl, s: pl[1] * (1.0 - _pen(pl, s)), lambda pl: pl[0],
                          lambda pl: len(pl) > 2 and bool(pl[2]), cap_fn=lambda pl: pl[1])
     else:
@@ -1108,8 +1195,31 @@ def formation_back_family(name):
     return "back3" if slots.count("CB") >= 3 else "back4"
 
 
+def alt_formations(prepped, current_formation, tendency, style=None, family=None,
+                   family_bonus=0.0, k=8):
+    """[2026-10-30 2차, 신민용 승인] 대체 포메이션 — choose_formation_prepped와 같은 점수식
+    (선수단 적합도·감독 성향 가중치·계열 가산)에서 무작위 몫만 기댓값(0.5)으로 고정해 순위를 매긴
+    상위 k개(현재 포메이션 제외). 난수를 쓰지 않는다. 반환: 튜플(점수 높은 순)."""
+    from constants import FORMATION_SLOTS, FORMATION_SCORE_WEIGHTS
+    w = FORMATION_SCORE_WEIGHTS
+    _sa = (style or {}).get("style_attack")
+    _sb = (style or {}).get("style_buildup")
+    _sp = (style or {}).get("style_press")
+    scored = []
+    for name, slots in FORMATION_SLOTS.items():
+        sf = formation_fit_norm(formation_fit_penalty_prepped(prepped, name, slots))
+        tf = manager_style_fit(name, style_attack=_sa, style_buildup=_sb, style_press=_sp,
+                               tendency=tendency)
+        score = w["squad_fit"] * sf + w["tendency_fit"] * tf + w["random"] * 0.5
+        if family is not None and formation_back_family(name) == family:
+            score += family_bonus
+        scored.append((score, name))
+    scored.sort(key=lambda t: -t[0])
+    return tuple(n for _s, n in scored if n != current_formation)[:k]
+
+
 def choose_formation_prepped(prepped, current_formation, tendency, rng=None,
-                             style=None, family=None, family_bonus=0.0):
+                             style=None, family=None, family_bonus=0.0, allowed=None):
     """prep_roster() 결과를 받는 choose_formation. 점수 계산·정렬·후보
     선정·랜덤 소비 순서가 choose_formation과 완전히 동일하다 — 포메이션
     하나당 _rng.random()을 정확히 한 번씩, FORMATION_SLOTS 순서대로
@@ -1127,6 +1237,9 @@ def choose_formation_prepped(prepped, current_formation, tendency, rng=None,
     family/family_bonus: [2026-10 확정] 감독 포메이션 계열("back4"/"back3")과
            그 계열 포메이션에 더할 점수. None이면 가산 없음(대표팀).
            점수 값만 바뀌고 난수 소비 패턴은 그대로다.
+    allowed: [2026-10-30 2차] None이 아니면 이 집합에 든 포메이션만 후보(점수·난수 소비는 20개
+           전부 그대로 계산한 뒤 거른다). 남는 후보가 없으면 현재 포메이션을 그대로 돌려준다
+           (빈 칸이 있는 포메이션을 고르지 않는다). None이면 예전과 같다.
     """
     import random as _random
     from constants import (FORMATION_SLOTS, FORMATION_SCORE_WEIGHTS,
@@ -1150,6 +1263,11 @@ def choose_formation_prepped(prepped, current_formation, tendency, rng=None,
             score += family_bonus
         scored.append((score, name, penalty))
     scored.sort(key=lambda t: -t[0])
+    if allowed is not None:
+        scored = [t for t in scored if t[1] in allowed]
+        if not scored:
+            _cur = current_formation if current_formation in FORMATION_SLOTS else "4-4-2"
+            return _cur, formation_fit_penalty_prepped(prepped, _cur, FORMATION_SLOTS[_cur])
     top = scored[:FORMATION_CANDIDATE_TOP_N] or scored
     weights = [max(0.01, s) for s, _n, _p in top]
     chosen_score, chosen_name, chosen_penalty = _rng.choices(top, weights)[0]
@@ -1236,26 +1354,43 @@ def formation_row_bands(formation, slots):
 
     formation이 FORMATION_SLOTS의 이름이고 slots가 그 포메이션의 슬롯
     리스트와 정확히 같으면 이름의 숫자로 밴드를 나눈다(위 주석 참고).
-    그 외에는 예전 라벨 기반 분류로 폴백한다.
+    [2026-10 버그수정, 신민용 리포트: "2002 월드컵 국가 포메이션이 4-1-2-1-2라고
+    적혀 있는데 그림은 LM·CAM·RM이 한 줄인 4-1-3-2다"] 국제대회 스쿼드는 슬롯
+    구성은 그 포메이션과 같지만 순서가 저장된 주전 순서라 "정확히 같다" 조건에
+    걸리지 않아 라벨 기반 폴백(LM·RM·CAM = 같은 줄)으로 빠졌다. 구성(개수)이
+    같으면 포메이션 정의에서 라벨별 밴드를 읽어 그대로 나눈다 — 20개 포메이션
+    모두 같은 라벨이 두 밴드에 걸치지 않으므로(전수 확인) 라벨만으로 밴드가
+    하나로 정해진다. 구성이 다르면 예전 라벨 기반 분류로 폴백한다.
     """
+    from collections import Counter
     from constants import FORMATION_SLOTS
     slots = list(slots or [])
     if not slots:
         return []
 
     canon = FORMATION_SLOTS.get(formation)
-    if canon is not None and list(canon) == slots:
+    if canon is not None and (list(canon) == slots or Counter(canon) == Counter(slots)):
         import re as _re
         nums = [int(x) for x in _re.findall(r"\d+", str(formation))]
-        gk = [(i, p) for i, p in enumerate(slots) if p == "GK"]
-        rest = [(i, p) for i, p in enumerate(slots) if p != "GK"]
-        if nums and sum(nums) == len(rest):
-            bands = ([gk] if gk else [])
+        canon_rest = [p for p in canon if p != "GK"]
+        if nums and sum(nums) == len(canon_rest):
+            # 포메이션 정의(뒤→앞 순서)를 숫자대로 잘라 라벨 → 밴드 번호를 만든다.
+            band_of = {}
+            ambiguous = False
             cur = 0
-            for n in nums:
-                bands.append(rest[cur:cur + n])
+            for bi, n in enumerate(nums):
+                for p in canon_rest[cur:cur + n]:
+                    if band_of.setdefault(p, bi) != bi:
+                        ambiguous = True
                 cur += n
-            return [b for b in bands if b]
+            if not ambiguous:
+                gk = [(i, p) for i, p in enumerate(slots) if p == "GK"]
+                rest_bands = [[] for _ in nums]
+                for i, p in enumerate(slots):
+                    if p != "GK":
+                        rest_bands[band_of[p]].append((i, p))
+                bands = ([gk] if gk else []) + rest_bands
+                return [b for b in bands if b]
 
     # ── 폴백: 예전 라벨 기반 분류 ──
     rows, order = {}, []

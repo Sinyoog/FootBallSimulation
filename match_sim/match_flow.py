@@ -207,13 +207,18 @@ def _select_lineup(team_id, formation, fixed=None):
 
         def _score(p):
             compat = POSITION_COMPAT.get(p.get("position"), [p.get("position")])
-            try:
-                # [2026-10 주포·부포] 부포 슬롯은 적합도 감점 0
-                idx = 0 if (p.get("sub_pos") and p.get("sub_pos") == slot) else compat.index(slot)
-            except ValueError:
-                idx = len(_LINEUP_POSITION_PENALTY) - 1
-            idx = min(idx, len(_LINEUP_POSITION_PENALTY) - 1)
-            eff = (p.get("ovr") or 50) - _LINEUP_POSITION_PENALTY[idx] - _lineup_age_penalty(p.get("age"))
+            if p.get("sub_pos") and p.get("sub_pos") == slot:
+                # [2026-10 주포·부포] 부포 슬롯 = OVR −1(constants.SUB_POS_OVR_COST)
+                import sub_positions as _subp_m
+                _pen_v = _subp_m.sub_abs_penalty(_LINEUP_POSITION_PENALTY[1])
+            else:
+                try:
+                    idx = compat.index(slot)
+                except ValueError:
+                    idx = len(_LINEUP_POSITION_PENALTY) - 1
+                idx = min(idx, len(_LINEUP_POSITION_PENALTY) - 1)
+                _pen_v = _LINEUP_POSITION_PENALTY[idx]
+            eff = (p.get("ovr") or 50) - _pen_v - _lineup_age_penalty(p.get("age"))
             return -eff  # 오름차순 정렬 → 실질 경쟁력이 높은 순
 
         pool.sort(key=_score)

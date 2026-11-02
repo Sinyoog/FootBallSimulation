@@ -1145,7 +1145,14 @@ def _team_avg_ovr_seed(conn, team_id: int) -> float:
 def compute_league_power(conn, year: int) -> dict:
     """3.1b. 리그별 OVR지표(①, 85%) + 국제실적보정(②, 15%)을 합쳐
     league_id → 리그등급보정 값을 돌려주고 league_power에 캐시한다.
-    "같은 부(tier)끼리만" 기준평균을 비교한다(1부는 1부끼리)."""
+
+    [2026-10 변경(F1), 신민용 확정] 예전엔 "같은 부(tier)끼리만" 기준평균을 비교했다(1부는 세계 1부
+    평균, 2부는 세계 2부 평균과). 세계 2부 평균이 1부보다 크게 낮아서 빅5 2부가 분데스리가 1부와
+    같은 크기의 보정을 받았고(+455~466), 승강 경계 499곳 중 139곳에서 "승격하면 보정이 줄어드는"
+    역전이 생겼다. 이제 부수와 무관하게 모든 리그를 **세계 1부 평균 하나**와 비교한다(F1). 리그 전력
+    지표 구성(평균 50% + 상위 25% 30% + 하위 25% 20%)과 국제실적 15%, 알파·상한은 그대로 — 바뀌는 건
+    비교 기준선뿐이다. 실측(새 월드 4개 시작 시점 + 2개 × 3시즌): 승격 시 보정 역전 139→0곳, 빅5 2부
+    세계 순위 9~12위 → 16~19위, 빅5 1부 서열 불변."""
     leagues = conn.execute("SELECT id, tier FROM leagues").fetchall()
     leagues = _drop_mil_leagues(conn, leagues)   # [2026-10] 군 리그는 리그 파워 계산 제외
     if not leagues:
@@ -1166,23 +1173,20 @@ def compute_league_power(conn, year: int) -> dict:
         avg_bottom = sum(ovrs[-top_n:]) / top_n
         ovr_index[league_id] = avg_all * 0.5 + avg_top * 0.3 + avg_bottom * 0.2
 
-    # 같은 tier끼리 기준 평균
+    # [2026-10 F1] 기준선 = 세계 1부 리그 OVR지표 평균 하나(부수 무관). 1부 리그가 하나도 없는
+    # 비정상 월드면 전체 리그 평균으로 대신한다.
     tier_of = {lid: tier for lid, tier in leagues}
-    tier_baseline = {}
-    for lid, idx in ovr_index.items():
-        if idx is None:
-            continue
-        t = tier_of[lid]
-        tier_baseline.setdefault(t, []).append(idx)
-    tier_baseline = {t: sum(v) / len(v) for t, v in tier_baseline.items()}
+    _top = [idx for lid, idx in ovr_index.items() if idx is not None and tier_of[lid] == 1]
+    _all = [idx for idx in ovr_index.values() if idx is not None]
+    baseline = (sum(_top) / len(_top)) if _top else ((sum(_all) / len(_all)) if _all else None)
 
     # ② 국제실적보정 — 최근 5년 team_b_history 감쇠합, 리그로 분배
     decay_by_age = {1: 1.0, 2: 0.75, 3: 0.5, 4: 0.3, 5: 0.15}
     result = {}
     for lid, idx in ovr_index.items():
         base = 0.0
-        if idx is not None and tier_of[lid] in tier_baseline:
-            base = (idx - tier_baseline[tier_of[lid]]) * LEAGUE_POWER_ALPHA
+        if idx is not None and baseline is not None:
+            base = (idx - baseline) * LEAGUE_POWER_ALPHA
         teams = conn.execute("SELECT id FROM teams WHERE league_id=?", (lid,)).fetchall()
         team_ids = [t[0] for t in teams]
         intl = 0.0
@@ -2697,6 +2701,15 @@ def ensure_league_power_rankings(conn, force: bool = False) -> int:
             "SELECT DISTINCT ranking_year FROM league_power_rankings").fetchall()}
     want = {r[0] for r in conn.execute(
         "SELECT DISTINCT ranking_year FROM team_power_rankings").fetchall()}
+    # [2026-10 버그수정, 신민용 리포트: "이전 순위 최신 연도가 2000으로 뜬다"] 새 게임 초기화
+    # (reset_game_data)가 이 표를 안 비워서 이전 판 연도가 남아 있던 세이브를 자가 치유한다 —
+    # 팀 랭킹에 없는 연도의 리그 행은 이 판의 기록일 수 없다.
+    _orphan = sorted(have - want)
+    if _orphan:
+        conn.executemany("DELETE FROM league_power_rankings WHERE ranking_year=?",
+                         [(y,) for y in _orphan])
+        conn.commit()
+        have -= set(_orphan)
     todo = sorted(want - have)
     if not todo:
         return 0

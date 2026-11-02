@@ -773,7 +773,9 @@ class PlayerPanel(QWidget):
         # 건 %뿐).
         _league_rate = min(100.0, round(sm / _league_total * 100, 1)) if _league_total else 0.0
         _all_played, _all_total = get_season_all_competition_appearances(p)
-        _appear_text = f"{sm}/{_league_total} ({_league_rate}%) · 총 {_all_played}경기"
+        # [2026-10 신설] 리그 선발 출전 수(교체 제외) — 임대 육성 판정의 선발 비율 기준.
+        _starts = p.get("season_league_starts", 0) or 0
+        _appear_text = f"{sm}/{_league_total} ({_league_rate}%) · 선발 {_starts} · 총 {_all_played}경기"
 
         from constants import position_group
         pos = p.get("position","")

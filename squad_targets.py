@@ -22,6 +22,7 @@ ai_lifecycle._gen_topup_rows(연말 인원 보충·오퍼 빈자리 보충)와 �
 import collections
 import functools
 
+import constants as _C
 from constants import FORMATION_SLOTS
 
 TARGET_POSITIONS = ("GK", "CB", "LB", "RB", "CDM", "CM", "CAM", "LW", "RW", "FW")
@@ -105,18 +106,201 @@ def reserve_order(formation):
     return tuple(out)
 
 
+def _gk3():
+    """[2026-10-30 신설] constants.WORLD_SQUAD_BY_FORMATION — 켜져 있으면 목표표 GK 3명.
+    [2026-10-31] SQUAD_BY_FORMATION_V3도 같다(선수단 생성·보충 부분만 떼어 낸 스위치)."""
+    # [2026-11-01] GK 2~3명 규칙(constants.GK_SQUAD_2_3)도 목표표 GK 3명.
+    return bool(getattr(_C, "WORLD_SQUAD_BY_FORMATION", False) or getattr(_C, "SQUAD_BY_FORMATION_V3", False)
+                or getattr(_C, "SQUAD_BY_FORMATION_V31", False) or getattr(_C, "GK_SQUAD_2_3", False))
+
+
+def _v31():
+    """[2026-10-31] constants.SQUAD_BY_FORMATION_V31 — 목표표 중원 배분(_mid_alloc)을 쓴다(기존 스위치가 켜져
+    있으면 그쪽 경로 우선)."""
+    return bool(getattr(_C, "SQUAD_BY_FORMATION_V31", False)) and not getattr(_C, "WORLD_SQUAD_BY_FORMATION", False)
+
+
 @functools.lru_cache(maxsize=None)
-def _targets_cached(formation, n):
+def _mid_alloc(formation, m):
+    """[2026-10-31 신설, 신민용 확정 — V3.1 중원 배분] 중원 합계 m명을 CDM·CM·CAM으로 나눈다(dict).
+      ① 선발  ② 백업: 선발에 있는 종류마다 1명
+      ③ 인접 대비: CM 선발이 있으면 선발에 없는 CDM·CAM 1명씩, CM 선발이 없으면(CDM·CAM 선발이 있을 때) CM 1명
+      ④ 나머지: 인원이 적은 종류부터 1명씩. 동률이면 백업(선발 초과분)이 적은 쪽. 그래도 같으면 남은 자리가
+         동률 수 이상일 때 양쪽에 1명씩(순서 무관), 1자리뿐이면 CM에 준다 — CM은 CDM 칸·CAM 칸 양쪽 대체 명단
+         (POSITION_COMPAT)에 있어 두 칸의 대체 가능 인원이 똑같이 늘고 CDM = CAM 균형이 유지된다.
+    m이 선발보다 적으면(목표표에서는 생기지 않음) 선발 그대로 돌려준다. 난수 없음."""
+    s = starter_counts(formation)
+    out = {p: s[p] for p in _MIDS}
+    left = m - sum(out.values())
+    for p in _MIDS:                                  # ② 백업
+        if s[p] > 0 and left > 0:
+            out[p] += 1
+            left -= 1
+    if s["CM"] > 0:                                  # ③ 인접 대비
+        adj = [p for p in ("CDM", "CAM") if s[p] == 0]
+    else:
+        adj = ["CM"] if (s["CDM"] or s["CAM"]) else []
+    for p in adj:
+        if left > 0:
+            out[p] += 1
+            left -= 1
+    while left > 0:                                  # ④ 부족 종류 우선
+        mn = min(out.values())
+        cand = [p for p in _MIDS if out[p] == mn]
+        if len(cand) > 1:
+            mb = min(out[p] - s[p] for p in cand)
+            cand = [p for p in cand if out[p] - s[p] == mb]
+        if len(cand) > 1:
+            if left >= len(cand):
+                for p in cand:
+                    out[p] += 1
+                left -= len(cand)
+                continue
+            cand = ["CM"] if "CM" not in cand else cand[:1]
+        out[cand[0]] += 1
+        left -= 1
+    return out
+
+
+@functools.lru_cache(maxsize=None)
+def _targets_v31_cached(formation, n):
+    """V3.1 목표표 = V3 목표표(GK 3명)에서 중원 합계는 그대로, 종류만 _mid_alloc으로 다시 나눈 것."""
+    t = dict(_targets_cached(formation, n, True))
+    t.update(_mid_alloc(formation, sum(t[p] for p in _MIDS)))
+    return t
+
+
+@functools.lru_cache(maxsize=None)
+def field_reserve_order(formation):
+    """[2026-10-30 신설] 여유 자리 순서표에서 GK 칸만 뺀 필드 순서(GK 3명 목표표용)."""
+    return tuple(p for p in reserve_order(formation) if p != "GK")
+
+
+@functools.lru_cache(maxsize=None)
+def _order_cached(formation, gk3):
+    """12번째 자리부터의 목표 포지션 순서. GK 3명이면 GK 여유 2명을 맨 앞에 두고 나머지는
+    기존 순서표의 필드 순서 그대로 — 22~28명에서 '(N−1)명 표 + GK 1명'과 같다(단위 테스트 검사)."""
+    if not gk3:
+        return reserve_order(formation)
+    return ("GK", "GK") + field_reserve_order(formation)
+
+
+@functools.lru_cache(maxsize=None)
+def _targets_cached(formation, n, gk3=False):
     t = dict(starter_counts(formation))
-    for p in reserve_order(formation)[:max(0, n - 11)]:
+    for p in _order_cached(formation, gk3)[:max(0, n - 11)]:
         t[p] += 1
     return t
 
 
 def position_targets(formation, n):
-    """N명 팀의 목표 인원(dict). N은 11~28로 자른다."""
+    """N명 팀의 목표 인원(dict). N은 11~28로 자른다.
+    [2026-10-30] constants.WORLD_SQUAD_BY_FORMATION이 켜져 있으면 GK 3명(13명 이상)."""
     n = max(11, min(int(n), MAX_SQUAD))
-    return dict(_targets_cached(_formation(formation), n))
+    if _v31():
+        return dict(_targets_v31_cached(_formation(formation), n))
+    return dict(_targets_cached(_formation(formation), n, _gk3()))
+
+
+def max_targets(formation, n):
+    """[2026-10-30 신설] 월드 생성 포지션 상한 — GK 3 고정, 나머지는 목표+1(목표 0이면 1)."""
+    t = position_targets(formation, n)
+    return {p: (3 if p == "GK" else (t[p] + 1 if t[p] > 0 else 1)) for p in TARGET_POSITIONS}
+
+
+# ── [2026-10-30 2차, 신민용 승인] 대체 포메이션 대비 인원 ─────────────────────────
+# 대체 포메이션 = 포메이션 재검토와 같은 점수식(formation_logic.alt_formations, 상위 8개 —
+# 현재 포메이션 제외)으로 정한다. 이 모듈은 그 결과(alts, 튜플)만 받는다.
+#   A(필수): 주 포메이션 선발에 없는데 대체 포메이션 선발에 있는 포지션 → 1명.
+#   B(여유): 대체 포메이션이 같은 포지션을 더 많이 쓰면(예: 4-2-3-1의 CDM 2) 그 차이 —
+#            주 포메이션 필수 백업(포지션 단위별 1명) 다음 자리에 둬서 인원이 남을 때만 채워진다.
+#   자리 순서: GK 2 → A → 주 포메이션 필수 백업 → B → 나머지 주 포메이션 순서표.
+#   A·B로 이미 채운 포지션은 뒤의 주 포메이션 순서표에서 같은 수만큼 건너뛴다(중복 계산 없음).
+_FIELD = tuple(p for p in TARGET_POSITIONS if p != "GK")
+
+
+@functools.lru_cache(maxsize=None)
+def cover_plan(formation, alts):
+    """(A, B, 대체 포메이션 필요 인원) — 모두 {포지션: 인원}. alts: 대체 포메이션 튜플."""
+    f = _formation(formation)
+    s = starter_counts(f)
+    need = {p: max([starter_counts(_formation(a))[p] for a in alts] + [0]) for p in _FIELD}
+    a_cov = {p: 1 for p in _FIELD if s[p] == 0 and need[p] > 0}
+    ess = field_reserve_order(f)[:_essential_count(f)]
+    ess_cnt = collections.Counter(ess)
+    b_cov = {}
+    for p in _FIELD:
+        extra = need[p] - s[p] - a_cov.get(p, 0) - ess_cnt[p]
+        if extra > 0:
+            b_cov[p] = extra
+    return a_cov, b_cov, need
+
+
+def _essential_count(formation):
+    """필드 순서표 맨 앞의 필수 백업 수 — CB·MID·FW 각 1 + 선발에 있는 측면(LB·RB·LW·RW) 각 1."""
+    s = starter_counts(formation)
+    return 3 + sum(1 for p in _SIDE if s[p] > 0)
+
+
+@functools.lru_cache(maxsize=None)
+def cover_order(formation, alts):
+    """12번째 자리부터의 목표 포지션 순서(GK 3명 + 대비 인원). 길이는 MAX_SQUAD-11 이상."""
+    f = _formation(formation)
+    a_cov, b_cov, _need = cover_plan(f, alts)
+    field = list(field_reserve_order(f))
+    e = _essential_count(f)
+    pre = [p for p in _FIELD for _ in range(a_cov.get(p, 0))]
+    mid = [p for p in _FIELD for _ in range(b_cov.get(p, 0))]
+    skip = collections.Counter(pre) + collections.Counter(mid)
+    order = ["GK", "GK"] + pre + field[:e] + mid
+    for p in field[e:]:
+        if skip[p] > 0:
+            skip[p] -= 1
+            continue
+        order.append(p)
+    return tuple(order)
+
+
+@functools.lru_cache(maxsize=None)
+def _team_targets_cached(formation, n, alts):
+    t = dict(starter_counts(formation))
+    for p in cover_order(formation, alts)[:max(0, n - 11)]:
+        t[p] += 1
+    return t
+
+
+def team_targets(formation, n, alts):
+    """[2026-10-30 2차] 대체 포메이션 대비 인원을 넣은 N명 목표표(GK 3명). alts가 비면 position_targets와 같다."""
+    f = _formation(formation)
+    n = max(11, min(int(n), MAX_SQUAD))
+    alts = tuple(sorted(_formation(a) for a in (alts or ()) if _formation(a) != f))
+    if not alts and _v31():
+        # [2026-10-31 V3.1] 대체 포메이션이 없으면(V3·V3.1 월드 생성은 빈 목록) 중원 배분을 넣은 목표표 그대로 —
+        # 월드 생성(_build_squad_positions_by_formation)·추첨(choose_target_position)이 같은 표를 보게 한다.
+        return position_targets(f, n)
+    return dict(_team_targets_cached(f, n, alts))
+
+
+def team_max(formation, n, alts):
+    """[2026-10-30 2차] 상한 — GK 3 고정, 나머지는 목표+1(목표 0이면 1)."""
+    t = team_targets(formation, n, alts)
+    return {p: (3 if p == "GK" else (t[p] + 1 if t[p] > 0 else 1)) for p in TARGET_POSITIONS}
+
+
+def mandatory_cover(formation, alts):
+    """[2026-10-30 2차] A(필수 대비) 포지션 집합."""
+    f = _formation(formation)
+    alts = tuple(sorted(_formation(a) for a in (alts or ()) if _formation(a) != f))
+    return set(cover_plan(f, alts)[0])
+
+
+def formable(entries, formation):
+    """[2026-10-30 2차] 이 포메이션 선발 11명을 선수 중복 없이 등록 포지션·부포로 채울 수 있는가.
+    entries: [(등록 포지션, 부포 또는 None)]. 칸은 목표 포지션 단위(LM→LW, LWB→LB, ST·CF→FW).
+    held_assign(증가 경로 = 최대 유량)으로 선발 칸 수를 목표로 배정해 모든 칸이 차면 True."""
+    s = starter_counts(_formation(formation))
+    h = held_assign(entries, s)
+    return all(h[p] >= s[p] for p in TARGET_POSITIONS)
 
 
 def held_counter(registered_positions):
@@ -210,25 +394,37 @@ def _weighted_pick(items, rng):
     return items[-1][0]
 
 
-def choose_target_position(formation, n_goal, held, rng, exception_prob):
+def choose_target_position(formation, n_goal, held, rng, exception_prob, max_table=None,
+                           alts=None):
     """보충 1명의 목표 포지션(FW 포함 10종 중 하나, 못 고르면 None). held(Counter)는 바꾸지 않는다.
       · exception_prob 확률: 목표표(N) 비율로 — 28명 목표에 이미 닿은 칸은 후보 제외.
       · 그 외: 목표(N) 대비 부족량 비례.
       · 부족이 없으면: 순서표에서 아직 못 채운 첫 자리(28명 목표에 닿은 칸은 건너뜀).
+    max_table: [2026-10-30 신설, 월드 생성 전용] 주면 그 상한에 닿은 칸도 후보에서 뺀다 —
+      상한에 걸린 추첨은 금지가 아니라 다른 칸으로 넘어간다. 안 주면(None) 예전과 같다.
+    alts: [2026-10-30 2차] 주면(None이 아니면) 대체 포메이션 대비 인원을 넣은 목표표(team_targets)를 쓴다.
     난수: rng.random()을 1번(예외 판정) + 고른 경로에서 1번 쓴다."""
     f = _formation(formation)
-    tgt = position_targets(f, n_goal)
-    cap = position_targets(f, MAX_SQUAD)
+    if alts is not None:
+        tgt = team_targets(f, n_goal, alts)
+        cap = team_targets(f, MAX_SQUAD, alts)
+    else:
+        tgt = position_targets(f, n_goal)
+        cap = position_targets(f, MAX_SQUAD)
     if rng.random() < exception_prob:
-        p = _weighted_pick([(p, tgt[p]) for p in TARGET_POSITIONS if held[p] < cap[p] and tgt[p] > 0], rng)
+        p = _weighted_pick([(p, tgt[p]) for p in TARGET_POSITIONS if held[p] < cap[p] and tgt[p] > 0
+                            and (max_table is None or held[p] < max_table[p])], rng)
         if p is not None:
             return p
     deficit = [(p, tgt[p] - held[p]) for p in TARGET_POSITIONS if tgt[p] > held[p]]
     if deficit:
         return _weighted_pick(deficit, rng)
     count = dict(starter_counts(f))
-    for p in reserve_order(f):
+    _ord = (cover_order(f, tuple(sorted(_formation(a) for a in alts if _formation(a) != f)))
+            if alts is not None else _order_cached(f, _gk3()))
+    for p in _ord:
         count[p] += 1
-        if held[p] < count[p] and held[p] < cap[p]:
+        if (held[p] < count[p] and held[p] < cap[p]
+                and (max_table is None or held[p] < max_table[p])):
             return p
     return None

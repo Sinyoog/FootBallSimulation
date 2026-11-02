@@ -194,7 +194,7 @@ def _events(sim, focus_side):
     return ev
 
 
-def _save_spectator(sim, hid, aid, focus, comp_name, kind, week, day):
+def _save_spectator(sim, hid, aid, focus, comp_name, kind, week, day, absence_reason="spectator"):
     import game_engine as ge
     from database import get_conn
     from match_sim import match_flow
@@ -223,7 +223,8 @@ def _save_spectator(sim, hid, aid, focus, comp_name, kind, week, day):
     random.setstate(_rng)
     payload = {
         "events": [[m, t] for m, t in events], "verdict": "", "played": False, "benched": False,
-        "absence_reason": "spectator", "spectator": True, "focus_team_id": focus, "position": "",
+        "absence_reason": absence_reason, "spectator": absence_reason == "spectator",
+        "focus_team_id": focus, "position": "",
         "pso": None, "detail": {"shots": 0, "shots_on": 0, "key_passes": 0, "dribbles": 0, "blocks": 0,
                                 "pass_acc": 0.0},
         "team_stats": team_stats,
@@ -250,8 +251,9 @@ def _save_spectator(sim, hid, aid, focus, comp_name, kind, week, day):
     conn.close()
     # 로그 — 클릭하면 관전 기록이 열리도록 SPECTATOR_ID_BASE를 더한 id를 마커에 쓴다.
     loc = "홈" if focus_home else "원정"
+    _head = {"spectator": "👀 관전", "injury": "🚑 부상 결장"}.get(absence_reason, "결장")
     ge.add_log("─" * 44, "sep")
-    ge.add_log(f"👀 관전  [{comp_name}]  {ge._day_label(week, day)}  ({loc}) "
+    ge.add_log(f"{_head}  [{comp_name}]  {ge._day_label(week, day)}  ({loc}) "
                f"[match:{SPECTATOR_ID_BASE + did}:{kind}]", "match")
     ge.add_log(f"   {hn} {hs}-{as_} {an}  ({ {'win': '승', 'draw': '무', 'loss': '패'}[result] })", "match")
     try:
@@ -261,3 +263,123 @@ def _save_spectator(sim, hid, aid, focus, comp_name, kind, week, day):
     except Exception:
         pass
     return did
+
+
+def save_absent_match(sim, home_id, away_id, is_home, comp_name, kind, week=None, day=None,
+                      reason="injury", real_ctx=None):
+    """[2026-10 신설, 신민용 요청: "내가 부상을 입었어도 경기 상세는 뜨게 — 다만 라인업에 내가 없어야"]
+    내가 결장한 내 팀 경기(각 대회의 sim_my_*_as_ai)는 이미 체인 엔진으로(나 없이) 결과를 낸다 — 그 경기
+    기록(sim)을 관전 기록 표(spectator_match_details)에 같은 모양으로 저장하고, 로그에 클릭 마커를 남긴다.
+    내 경기 표(match_details)에는 넣지 않는다(감독 관계·커리어·은퇴 스토리가 "내가 뛴 경기"로 읽는 표).
+    경기 상세 화면은 "🚑 부상 결장" + 팀 기록(통계·라인업 평점·양 팀 득점)으로 보여준다(내 선수 없음).
+    저장 실패는 경기 진행에 영향을 주지 않도록 삼킨다. 게임 난수는 쓰지 않는다(_save_spectator 참고)."""
+    if sim is None:
+        return None
+    # [2026-10 신설] 내가 결장한 우리 팀 경기도 실측 기록(real_stats) — 우리 팀 선수 기록이 100% 실측이 되게.
+    if real_ctx:
+        record_sim(sim, real_ctx.get("comp"), real_ctx.get("tkey"), home_id, away_id)
+    focus = home_id if is_home else away_id
+    try:
+        return _save_spectator(sim, home_id, away_id, focus, comp_name, kind, week, day,
+                               absence_reason=reason or "injury")
+    except Exception as e:
+        print(f"[ABSENT-DETAIL] 결장 경기 상세 저장 실패(건너뜀): {e}")
+        return None
+
+# ══════════════════════════════════════════════════════════════
+# [2026-10 신설, 신민용 확정 A안] 내가 참가하는 대회의 AI 경기도 경기 엔진으로 — 실측 기록용
+# ══════════════════════════════════════════════════════════════
+# 내 리그, 우리 팀이 출전한 컵·클럽 대회의 AI 팀끼리 경기를 내 경기와 같은 엔진(simulate_my_match, me=None)으로
+# 돌리고, 그 경기 선수 기록을 real_stats에 쌓는다 — 그 대회 모든 선수의 골·도움·평점이 실측이 된다
+# (real_stats 모듈 docstring). 관전 기록·로그는 남기지 않는다(한 주에 수십 경기라 로그가 넘친다).
+# 스코어는 호출부가 G2와 같은 방식(forced)으로 쓴다 — 팀 전적·순위·진출·승부차기는 기존 경로 그대로.
+_COVER_CACHE = {}
+
+# 대회 종류 → (real_stats comp 키, tkey 접두사) — 내 경기(_save_match_detail real_ctx)와 같은 키여야 한다.
+COVER_KEYS = {
+    "league": ("league", None), "cup": ("cup", "cup"), "lower_cup": ("lower_cup", "lower_cup"),
+    "domestic_sc": ("dsc", "dsc"), "po": ("po", "po"), "cwc": ("cwc", "cwc_tournaments"),
+}
+
+
+def covered(entry_table, match_table, tournament_id, my_tid=None):
+    """우리 팀이 이 대회(tournament_id)에 출전했는가 — 참가 명단(entry_table) 기준, 없으면 경기표 기준."""
+    if my_tid is None:
+        my_tid = my_team_id()
+    if not my_tid or tournament_id is None:
+        return False
+    key = (entry_table, match_table, tournament_id, my_tid)
+    if key in _COVER_CACHE:
+        return _COVER_CACHE[key]
+    from database import get_conn
+    conn = get_conn()
+    v = False
+    try:
+        if entry_table:
+            v = bool(conn.execute(f"SELECT 1 FROM {entry_table} WHERE tournament_id=? AND team_id=? LIMIT 1",
+                                  (tournament_id, my_tid)).fetchone())
+        else:
+            raise LookupError
+    except Exception:
+        try:
+            v = bool(conn.execute(f"SELECT 1 FROM {match_table} WHERE tournament_id=? AND "
+                                  "(home_team_id=? OR away_team_id=?) LIMIT 1",
+                                  (tournament_id, my_tid, my_tid)).fetchone())
+        except Exception:
+            v = False
+    # '참가 아님'은 캐시하지 않는다 — 국내컵(cup_entries)은 상위 부 팀이 뒤 라운드에서 명단에 들어오고,
+    # 경기표 기준은 다음 라운드에 생길 수 있다. 참가가 확인된 뒤(True)만 캐시.
+    if v:
+        _COVER_CACHE[key] = v
+    return v
+
+
+def sim_cover_match(hid, aid, *, home_adv, extra_time=False, agg_home=0, agg_away=0, comp, tkey,
+                    my_tid=None, targets=None, prior=None):
+    """내가 참가하는 대회의 AI 경기 — 엔진으로 돌리고 실측 기록. 반환: None(대상 아님·엔진 실패 → 호출부 공식)
+    또는 {"hs","as","detail_id": None,"sim"}. 내 소속팀 경기(G1)·G2 대상 경기는 여기서 다루지 않는다."""
+    if prior is not None:
+        # G2(감독 팀·구단주 구단) 경기는 이미 엔진으로 돌았다 — 그 결과를 실측으로만 쌓는다.
+        if prior.get("sim"):
+            record_sim(prior["sim"], comp, tkey, hid, aid)
+        return prior
+    if my_tid is None:
+        my_tid = my_team_id()
+    if my_tid and my_tid in (hid, aid):
+        return None
+    if targets and (hid in targets or aid in targets):
+        return None
+    import game_engine as ge
+    try:
+        from match_sim.tactical_engine import simulate_my_match
+        from database import get_conn
+        c0 = get_conn()
+        try:
+            cur = c0.cursor()
+            hf, af = ge._team_formation(cur, hid), ge._team_formation(cur, aid)
+        finally:
+            c0.close()
+        sim = simulate_my_match(hid, aid, hf, af, home_adv=home_adv, extra_time=extra_time,
+                                agg_home=agg_home, agg_away=agg_away, me=None)
+    except Exception as e:
+        ge._chain_note_error("cover", e)
+        return None
+    record_sim(sim, comp, tkey, hid, aid)
+    return {"hs": sim["home_score"], "as": sim["away_score"], "detail_id": None, "sim": sim}
+
+
+def record_sim(sim, comp, tkey, home_key, away_key):
+    """엔진 결과(sim)의 양 팀 선수 기록을 실측 표에 쌓는다. 실패는 경기 진행에 영향 주지 않는다."""
+    if not sim:
+        return
+    try:
+        import real_stats as _rs
+        import game_engine as ge
+        from database import get_conn
+        conn = get_conn()
+        _rs.record(conn, {"comp": comp, "tkey": tkey, "home": home_key, "away": away_key},
+                   {"home": sim.get("home_player_ratings") or [], "away": sim.get("away_player_ratings") or []},
+                   sim.get("home_score"), sim.get("away_score"), (ge.get_state() or {}).get("current_year"))
+        conn.commit()
+    except Exception as e:
+        print("real_stats 기록 오류(건너뜀):", e)

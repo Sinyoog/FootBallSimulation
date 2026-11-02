@@ -1296,9 +1296,12 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
         발상(포지션 적합도 페널티를 OVR에서 뺀다)."""
         from constants import POSITION_COMPAT
         compat = POSITION_COMPAT.get(p.get("position"), [p.get("position")])
+        if p.get("sub_pos") and p.get("sub_pos") == slot:
+            # [2026-10 주포·부포] 부포 슬롯 = OVR −1(로스터에 sub_pos가 붙은 클럽 선수만)
+            import sub_positions as _subp_t
+            return (p.get("ovr") or 50) - _subp_t.sub_abs_penalty(_SLOT_PEN[1])
         try:
-            # [2026-10 주포·부포] 부포 슬롯은 적합도 감점 0(로스터에 sub_pos가 붙은 클럽 선수만)
-            idx = 0 if (p.get("sub_pos") and p.get("sub_pos") == slot) else compat.index(slot)
+            idx = compat.index(slot)
         except ValueError:
             idx = len(_SLOT_PEN) - 1
         return (p.get("ovr") or 50) - _SLOT_PEN[min(idx, len(_SLOT_PEN) - 1)]

@@ -56,6 +56,42 @@ QComboBox QAbstractItemView {
 
 
 
+def _persist_new_world():
+    """[2026-10-30 버그수정, 신민용 승인] 새 게임(월드 생성 + 내 선수 생성)이 끝난 직후 메인 DB를 디스크에 한 번 동기 저장한다.
+    원인: reset_game_data()는 기록 DB(game.history.db)를 그 자리에서 새 파일로 바꾸지만, 메인 DB는 메모리에서만 새 월드가
+    되고 디스크(game.db)엔 첫 자동저장(4주마다)이나 창 닫기 때까지 안 쓰였다. 그 전에 강제 종료·충돌로 꺼지면 다음 실행 때
+    메인은 이전 월드, 기록 DB는 새 월드가 돼 선수 id가 어긋나고 과거 OVR 이력이 전부 "-"로 보였다(재현 확인).
+    순서는 창 닫기(main_window.closeEvent)와 같다: 진행 중 비동기 자동저장 대기 → 기록 DB 큐 비우기 → 메인 커밋 → 메인 저장.
+    flush_to_disk는 임시 파일에 전체 백업한 뒤 원자적으로 바꿔 끼우고, 실패하면 예외를 그대로 올린다(삼키지 않음).
+    저장 뒤 디스크 파일을 읽기 전용으로 열어 선수 수·최대 id가 메모리와 같은지 확인하고, 다르면 예외로 알린다.
+    게임 로직·난수·기존 자동저장 방식은 바꾸지 않는다(저장 시점만 하나 추가)."""
+    import sqlite3
+    import database as _db
+    _db.wait_for_pending_flush(timeout=600)
+    _db.history_drain()
+    _conn = get_conn()
+    _conn.commit()
+    _db.flush_to_disk()
+    if not _db.USE_MEMORY_DB:
+        return
+    _q = "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM ai_players"
+    _mem = tuple(_conn.execute(_q).fetchone())
+    _disk_conn = sqlite3.connect(f"file:{_db.DB_PATH}?mode=ro", uri=True)
+    try:
+        _disk = tuple(_disk_conn.execute(_q).fetchone())
+    finally:
+        _disk_conn.close()
+    if _mem != _disk:
+        raise RuntimeError(f"저장 확인 실패: 메모리 선수 {_mem[0]}명(최대 id {_mem[1]}) / 디스크 {_disk[0]}명(최대 id {_disk[1]})")
+
+
+def _report_new_world_save_failure(parent, err):
+    """새 게임 저장이 실패했을 때 — 정상 완료로 넘어가지 않고 알린다(새 게임 창은 닫지 않는다)."""
+    QMessageBox.critical(parent, "새 게임 저장 실패",
+                         "새 게임을 디스크에 저장하지 못했습니다. 이 상태로 시작하면 다음 실행 때 기록이 어긋날 수 있어 "
+                         "시작하지 않습니다. 다시 시도해 주세요.\n\n" + f"{type(err).__name__}: {err}")
+
+
 def _game_confirm(parent, title: str, message: str) -> bool:
     from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
     from PyQt6.QtCore import Qt
@@ -130,16 +166,19 @@ class CountryPickerDialog(QDialog):
         self._build()
 
     def _load_countries(self):
-        """리그가 있는 국가만 (grade 높은 순 → 이름 순). 대륙 정보 포함."""
+        """리그가 있는 국가만 (grade 높은 순 → 이름 순). 대륙 정보 포함.
+        [2026-10-31 버그수정, 신민용 리포트: "선수 생성 국가 선택에 군대가 뜬다"] 군데스리가의 가상 국가
+        "군대"는 리그가 있어도 국적으로 고를 수 없다(create_player의 무작위 국적도 이미 뺀다)."""
+        from constants import MILITARY_COUNTRY
         conn = get_conn()
         rows = conn.execute(
             """SELECT name, flag, grade, continent FROM countries
-               WHERE id IN (SELECT DISTINCT country_id FROM leagues)
+               WHERE id IN (SELECT DISTINCT country_id FROM leagues) AND name != ?
                ORDER BY
                  CASE grade WHEN 'S' THEN 0 WHEN 'A' THEN 1 WHEN 'B' THEN 2
                             WHEN 'C' THEN 3 WHEN 'D' THEN 4 WHEN 'E' THEN 5
                             ELSE 6 END,
-                 name""").fetchall()
+                 name""", (MILITARY_COUNTRY,)).fetchall()
         conn.close()
         return [(r["name"], r["flag"], r["continent"] or "") for r in rows]
 
@@ -481,7 +520,7 @@ class NewPlayerDialog(QDialog):
         self.setStyleSheet(DARK_STYLE)
         self._build()
 
-    def _regenerate_world_with_progress(self):
+    def _regenerate_world_with_progress(self, start_year=None):
         """[2026-08 신설] "생성"/"랜덤 생성" 버튼을 누른 시점에 실제로
         reset_game_data()(팀 전력·전세계 선수단 재생성)를 실행한다 — 예전엔
         StartScreen._new_game()/MainWindow.do_new_game()이 이 창을 띄우기도
@@ -497,11 +536,15 @@ class NewPlayerDialog(QDialog):
         윈도우가 "(응답 없음)"으로 표시된다 — 실제로는 정상 작동 중인데
         멈춘 것처럼 보이는 상태였다. 이제 창을 닫지 않고 돌려주고,
         호출부가 create_player까지 끝낸 뒤에 닫는다.
+
+        [2026-10 버그수정] start_year: 이번에 고른 시작 연도 — 세계(감독·선수 계약 등)를
+        만들기 전에 확정해야 한다(database.reset_game_data docstring). None이면 기본값.
         """
         win = _WorldRegenProgressWindow(self)
         win.show()
         QApplication.processEvents()
-        reset_game_data(progress_cb=win.report)
+        reset_game_data(progress_cb=win.report,
+                        start_year=start_year if start_year is not None else GAME_START_YEAR)
         win.show_stage("선수 생성 및 전세계 일정 편성 중...",
                         "잠시만 기다려 주세요 (약 5초)")
         return win
@@ -1029,12 +1072,14 @@ class NewPlayerDialog(QDialog):
         폼의 현재 선택과 무관하게 매번 새로 굴린다 — 특정 항목만 미리
         고정하고 싶으면 '✅ 생성' 버튼을 쓰면 된다(그쪽은 선택한 값은
         그대로, 안 고른 값만 랜덤으로 채운다)."""
-        _prog_win = self._regenerate_world_with_progress()
+        # 랜덤 생성은 시작 연도를 넘기지 않는다 → create_player가 GAME_START_YEAR를 쓴다.
+        _prog_win = self._regenerate_world_with_progress(GAME_START_YEAR)
         conn = get_conn()
         c = conn.cursor()
+        from constants import MILITARY_COUNTRY   # [2026-10-31] 랜덤 생성에서도 가상 국가 "군대" 제외
         c.execute("""SELECT id, name, flag FROM countries
-                     WHERE id IN (SELECT DISTINCT country_id FROM leagues)
-                     ORDER BY RANDOM() LIMIT 1""")  # 이름만 국가 제외
+                     WHERE id IN (SELECT DISTINCT country_id FROM leagues) AND name != ?
+                     ORDER BY RANDOM() LIMIT 1""", (MILITARY_COUNTRY,))  # 이름만 국가 제외
         crow = c.fetchone()
         cid, cname, cflag = crow["id"], crow["name"], crow["flag"]
         c.execute("SELECT name FROM player_names WHERE country_id=? ORDER BY RANDOM() LIMIT 1",
@@ -1057,6 +1102,14 @@ class NewPlayerDialog(QDialog):
         create_player(rname, rpos, rrole, cname, cflag,
                       talent_tier=None, personality=None, physical_trait=None,
                       difficulty=rand_difficulty)
+        # [2026-10-30] 새 월드를 바로 디스크에 저장(_persist_new_world 주석). 실패하면 시작하지 않는다.
+        try:
+            _persist_new_world()
+        except Exception as _e:
+            if _prog_win is not None:
+                _prog_win.close()
+            _report_new_world_save_failure(self, _e)
+            return
         # [2026-09] "✅ 생성" 쪽과 같은 이유 — create_player까지 끝난 뒤에 닫는다.
         if _prog_win is not None:
             _prog_win.close()
@@ -1092,7 +1145,11 @@ class NewPlayerDialog(QDialog):
         # 우회 경로(엔터키 등)로 호출되면 여기서 한 번 더 막는다.
         if not self.ok_btn.isEnabled():
             return
-        _prog_win = self._regenerate_world_with_progress()
+        # [2026-10 버그수정] 시작 연도는 세계를 만들기 **전에** 읽어 넘긴다 — 예전엔 세계를
+        # 다 만든 뒤에야 읽어서, 감독·선수 계약이 이전 판(또는 기본값) 연도로 찍혔다.
+        _year_txt0 = self.year_edit.text().strip()
+        _start_year0 = int(_year_txt0) if _year_txt0 else GAME_START_YEAR
+        _prog_win = self._regenerate_world_with_progress(_start_year0)
         name = self.name_edit.text().strip()
         # 국적 먼저 확정 — 이름 자동생성(국적에 맞는 이름 뽑기)에 필요하므로,
         # 국적 선택 안 했으면(랜덤) 여기서 미리 하나 뽑아 이후 create_player
@@ -1102,9 +1159,10 @@ class NewPlayerDialog(QDialog):
             nat_name, nat_flag = self._nat
         else:
             conn = get_conn(); c = conn.cursor()
+            from constants import MILITARY_COUNTRY   # [2026-10-31] 국적 "랜덤"도 가상 국가 "군대" 제외
             c.execute("""SELECT name, flag FROM countries
-                         WHERE id IN (SELECT DISTINCT country_id FROM leagues)
-                         ORDER BY RANDOM() LIMIT 1""")
+                         WHERE id IN (SELECT DISTINCT country_id FROM leagues) AND name != ?
+                         ORDER BY RANDOM() LIMIT 1""", (MILITARY_COUNTRY,))
             crow = c.fetchone()
             conn.close()
             nat_name, nat_flag = (crow["name"], crow["flag"]) if crow else (None, None)
@@ -1148,14 +1206,21 @@ class NewPlayerDialog(QDialog):
         # [2026-08 신설] 비워두면(빈 문자열) None → create_player가 기본값
         # (GAME_START_YEAR/PLAYER_START_AGE) 사용. 입력했으면 QIntValidator가
         # 이미 범위(1986~2020 / 14~28)를 강제해뒀으므로 그대로 정수 변환.
-        year_txt = self.year_edit.text().strip()
         age_txt = self.age_edit.text().strip()
-        start_year = int(year_txt) if year_txt else None
+        start_year = _start_year0        # 위에서 세계 생성에 쓴 값과 반드시 같아야 한다
         start_age = int(age_txt) if age_txt else None
         create_player(name, pos, role, nat_name, nat_flag, talent_tier=tier,
                       personality=personality, physical_trait=trait,
                       start_year=start_year, start_age=start_age,
                       difficulty=self._difficulty)
+        # [2026-10-30] 새 월드를 바로 디스크에 저장(_persist_new_world 주석). 실패하면 시작하지 않는다.
+        try:
+            _persist_new_world()
+        except Exception as _e:
+            if _prog_win is not None:
+                _prog_win.close()
+            _report_new_world_save_failure(self, _e)
+            return
         # [2026-09] 세계 생성 + 선수 생성이 모두 끝난 뒤에야 진행률 창을
         # 닫는다 — 예전엔 reset_game_data 직후에 닫혀서, create_player가
         # 도는 4~5초 동안 아무 창도 없이 "(응답 없음)"으로 보였다.

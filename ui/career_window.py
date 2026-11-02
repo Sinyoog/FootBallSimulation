@@ -69,7 +69,14 @@ def _loan_in_duration_str(entry_list, idx):
         last = nxt
     ey = last.get("end_year"); ew = last.get("end_week", 52)
     if not (sy and ey):
-        return "진행중"
+        # [2026-10 신민용 요청: "임대 간 기간엔 계약에 '진행중'이 아니라 몇 년 임대인지(1년이면 1년)"]
+        # 진행 중인 임대는 예정 기간을 보여준다. 끝난 임대는 아래처럼 실제로 뛴 기간(예: 11개월).
+        try:
+            import my_loan as _ml
+            _plan = _ml.planned_loan_text(team_id=first.get("team_id"))
+        except Exception:
+            _plan = ""
+        return _plan or "진행중"
     total_weeks = max(1, (ey - sy) * 52 + (ew - sw))
     return _fmt_loan_months(total_weeks)
 
@@ -729,7 +736,13 @@ class CareerWindow(QDialog):
             # "팔림"일 때만 없는 것처럼 취급해 그 행 자체의 in_type(원래
             # 어떻게 이 팀에 왔는지)으로 대체한다. 다른 나간 경로(방출/이적/
             # 계약만료)는 그대로 우선 표시한다.
-            _exit_disp = "" if exit_t == "팔림" else exit_t
+            # [2026-10 신민용 요청: "입대는 이전 구단 줄이 아니라 새 구단(군팀) 줄에 — 2010 대구 → 2011 입대면
+            # 2011년에만 입대"] 입대도 팔림처럼 떠나는 구단 줄에서는 숨긴다(군팀 줄의 들어온 경로 "입대"로만 보임).
+            _exit_disp = "" if exit_t in ("팔림", "입대") else exit_t
+            # [2026-10 신민용 요청: "군대 갔다 오면 이적: 전역"] 제대도 입대처럼 떠나는 군팀 줄에선 숨기고
+            # 돌아간 팀 줄(들어온 경로 "제대" → "전역")에만 보인다. 제대 후 FA라 다음 줄이 없으면 군팀 줄에 남긴다.
+            if exit_t == "제대" and i + 1 < len(visible) and visible[i + 1].get("transfer_type") == "제대":
+                _exit_disp = ""
             # [2026-08 버그수정, 신민용 리포트: "유료로 들어왔다가 곧장 임대
             # 나간 경우, 임대 표시가 이적료 표시를 덮어써서 이적료가 아예
             # 안 보인다"] exit_t가 "임대"인데 이 행 자체가 유료로 들어온
@@ -749,7 +762,11 @@ class CareerWindow(QDialog):
             # (임대는 새 계약이 아니라 원소속팀 계약을 유지한 채 팀만 옮기는
             # 것이므로), 대신 "이적" 컬럼 쪽에 실제 임대 기간(개월/년)을
             # "임대(N개월)"처럼 표기한다.
-            if t_type in ("임대", "임대 종료"):
+            if in_type == "임대" and exit_t in ("", "임대 종료"):
+                # [2026-10 신민용 요청: "이적 표시는 임대만 — OO에서 임대(11개월) 후 복귀 같은 변화 필요 없다"]
+                # 임대로 온 팀 줄은 진행 중이든 끝났든 "임대"만. 기간은 계약 칸에 있다.
+                t_type = "임대"
+            elif t_type in ("임대", "임대 종료"):
                 # [2026-07 재수정, 신민용 지적: "임대(1년)/임대 종료(1년)만
                 # 뜨면 어느 팀으로 갔는지/어디로 복귀했는지 안 보인다"]
                 # exit_type='임대'(원소속팀에서 떠나는 행)는 도착지 팀명을
@@ -776,6 +793,8 @@ class CareerWindow(QDialog):
                     # 그 팀 행)으로 계산한다.
                     dur = _loan_out_duration_str(visible, i, _partner, sy, sw)
                     t_type = f"{_partner}에 임대({dur})" if _partner else f"임대({dur})"
+            if t_type == "제대":   # [2026-10 신민용 요청] 군대 갔다 오면 이적 칸은 "전역"
+                t_type = "전역"
             # [2026-07 신설] 이적료 표시 — transfer_type/exit_type(어떻게
             # 왔는지)과 별개 축인 transfer_fee(얼마에 왔는지)를 괄호로
             # 덧붙인다. transfer_fee는 실제 "이적"(유료 이적) 행에만
@@ -810,6 +829,15 @@ class CareerWindow(QDialog):
             if in_type == "임대":
                 c_str = _loan_in_duration_str(visible, i)
                 prev_team = cur_team
+            elif in_type in ("임대 복귀", "제대", "진급", "강등"):
+                # [2026-10 신민용 요청: "임대 복귀 후 계약에 5년이 다시 뜨면 새로 5년 계약한 것처럼 보인다 — -로"]
+                # 복귀·전역은 새 계약이 아니라 원 소속 계약이 이어지는 것(계약 기간은 그동안에도 흘렀다).
+                # 진급·강등도 입대 때의 복무 2년이 이어질 뿐이다.
+                c_str = "—"
+            elif in_type == "입대":
+                # 입대 줄은 원 소속 계약 유지 여부와 무관하게 복무 기간(2년) — 계약 유지면 c_yrs가 원래 계약년수다.
+                from constants import MILITARY_SERVICE_YEARS as _MSY
+                c_str = f"{_MSY}년"
             elif i == 0 or cur_team != entries[i-1].get("team_name"):
                 # 팀이 바뀌었거나 첫 행(임대 아닌 정상 이적/입단) → 계약년수 표시
                 c_str = f"{c_yrs}년" if c_yrs else "—"
@@ -1210,20 +1238,41 @@ class CareerWindow(QDialog):
             lay.addWidget(QLabel("국제전 기록 없음")); return w
 
         # 통산 A매치 요약
+        # [2026-10 신민용 확정: "올림픽은 A매치가 아니니 통산 A매치 기록엔 추가 안 되게"] 올림픽
+        # 경기(is_olympic)는 A매치 요약(선방·실점·평균 평점)에서 빼고 아래에 따로 한 줄로 보여준다.
+        # intl_caps/intl_goals/intl_assists는 경기 처리 쪽에서 이미 올림픽을 안 센다.
+        _a_ms = [m for m in matches if not m.get("is_olympic")]
+        _oly_ms = [m for m in matches if m.get("is_olympic")]
         caps = p.get("intl_caps", 0)
         if p.get("position") == "GK":
-            sv = sum(m["saves"] for m in matches)
-            ga = sum(m["conceded"] for m in matches)
+            sv = sum(m["saves"] for m in _a_ms)
+            ga = sum(m["conceded"] for m in _a_ms)
             summary = f"통산 A매치 {caps}경기  |  선방 {sv}  실점 {ga}"
         else:
             summary = (f"통산 A매치 {caps}경기  |  {p.get('intl_goals',0)}골 "
                        f"{p.get('intl_assists',0)}어시")
-        ratings = [m["rating"] for m in matches if m["rating"]]
+        ratings = [m["rating"] for m in _a_ms if m["rating"]]
         if ratings:
             summary += f"  |  평균 평점 {sum(ratings)/len(ratings):.1f}"
         sl = QLabel(f"🌍 {summary}")
         sl.setStyleSheet("color:#66ccff;font-size:12px;font-weight:bold;padding:4px;")
         lay.addWidget(sl)
+        if _oly_ms:
+            _op = [m for m in _oly_ms if m.get("my_played")]
+            if p.get("position") == "GK":
+                _os = (f"선방 {sum(m['saves'] or 0 for m in _op)}  "
+                       f"실점 {sum(m['conceded'] or 0 for m in _op)}")
+            else:
+                _os = (f"{sum(m['goals'] or 0 for m in _op)}골 "
+                       f"{sum(m['assists'] or 0 for m in _op)}어시")
+            _or = [m["rating"] for m in _op if m["rating"]]
+            _otxt = f"🏅 U-23 올림픽 {len(_op)}경기  |  {_os}"
+            if _or:
+                _otxt += f"  |  평균 평점 {sum(_or)/len(_or):.1f}"
+            _otxt += "  (A매치 아님 — 통산 A매치에 미포함)"
+            ol = QLabel(_otxt)
+            ol.setStyleSheet("color:#C0C0C0;font-size:11px;font-weight:bold;padding:2px 4px;")
+            lay.addWidget(ol)
 
         if _nat_events:
             for _yr, _wk, _act in _nat_events:
