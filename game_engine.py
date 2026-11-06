@@ -22061,8 +22061,9 @@ def enforce_affiliate_children_tier(parent_team_id: int, year: int) -> None:
             continue
         p_tier = prow["current_tier"]
 
-        children = c.execute(
-            "SELECT id, name, current_tier FROM teams WHERE parent_team_id=?", (pid,)).fetchall()
+        # [2026-11-06] 공급원 목록은 database.feeder_sources 한 곳에서 — 이 계기(같은 부수 충돌)는 리그에 속한 산하팀 전용
+        from database import feeder_sources as _feeder_sources, FEEDER_KIND_AFFILIATE as _FK_AFF
+        children = [r for r, _k in _feeder_sources(c, pid, kinds=(_FK_AFF,))]
         for child in children:
             child_tier = child["current_tier"]
             if child_tier > p_tier:
@@ -22087,7 +22088,21 @@ def enforce_affiliate_children_tier(parent_team_id: int, year: int) -> None:
 def _affiliate_callup_from_child(conn, parent_id, child_id,
                                   max_players=3, min_child_remaining=11,
                                   max_pct=0.25, year=None):
-    """[2026-08 재설계, 신민용 확정: "강등 자체를 막으면 안 된다"] 1군(parent_id)이
+    """산하팀 → 1군 콜업(호환용 이름). 실제 처리는 공급원 공통 함수 _callup_from_feeder(kind=산하팀)."""
+    from database import FEEDER_KIND_AFFILIATE
+    return _callup_from_feeder(conn, parent_id, child_id, max_players=max_players,
+                               min_child_remaining=min_child_remaining, max_pct=max_pct, year=year,
+                               kind=FEEDER_KIND_AFFILIATE)
+
+
+def _callup_from_feeder(conn, parent_id, child_id,
+                        max_players=3, min_child_remaining=11,
+                        max_pct=0.25, year=None, kind="affiliate"):
+    """[2026-11-06 공급원 공통화 — database.feeder_sources 주석 참고] child_id = 공급원 팀(지금은 산하팀, 나중엔 U-21 등).
+    포지션 선정·인원 상한·마지막 1명 보호·GK 규칙(ai_lifecycle.feeder_callup_gk_ok)·이적 기록은 공급원 종류와 무관하게 같다.
+    기록 종류만 database.FEEDER_CALLUP_LOG_TYPE[kind].
+
+    [2026-08 재설계, 신민용 확정: "강등 자체를 막으면 안 된다"] 1군(parent_id)이
     강등(정규 시즌 종료 또는 승강 플레이오프)으로 산하팀(child_id)과 같은
     tier가 됐을 때, 예전처럼 산하팀을 강제로 한 티어 더 밀어내리는 대신
     1군이 산하팀 선수단에서 부족한 포지션 위주로 일부를 콜업해 산하팀
@@ -22175,12 +22190,23 @@ def _affiliate_callup_from_child(conn, parent_id, child_id,
     # 한 번에 여러 명(cap 최대 3명)을 데려가므로 카운트를 뽑을 때마다 같이
     # 줄인다 — GK가 2명인 산하팀에서 2명을 다 데려가는 것도 막아야 한다.
     picked = []
+    # [2026-11-06 GK4_NEVER] GK 콜업은 모구단 GK가 3명이 될 때까지만(3명이면 0, 2명이면 최대 1명, 1명이면 최대 2명),
+    # 산하팀은 GK 2명 이상을 남긴다. 필드 선수 콜업은 그대로.
+    import ai_lifecycle as _AL_gk4
+    _gk4_parent = _count_by_pos.get("GK", 0)
+    _gk4_slots = 0   # 막힌 GK도 콜업 자리 하나를 쓴 것으로 센다 — 그 자리를 필드 선수로 채우지 않는다(필드 콜업은 OFF와 같다)
     for r in candidates:
-        if len(picked) >= cap:
+        if len(picked) + _gk4_slots >= cap:
             break
         _g = _CU_GROUP.get(_cu_pos_cat(r["position"]), "MF")
         if _cu_grp_ct.get(_g, 0) <= 1 or _cu_pos_ct.get(r["position"], 0) <= 1:
             continue
+        if r["position"] == "GK" and not _AL_gk4.feeder_callup_gk_ok(_gk4_parent, _cu_pos_ct.get("GK", 0)):
+            _AL_gk4.GK4_PATH_LOG["callup_blocked"] += 1
+            _gk4_slots += 1
+            continue
+        if r["position"] == "GK":
+            _gk4_parent += 1
         _cu_grp_ct[_g] -= 1
         _cu_pos_ct[r["position"]] -= 1
         picked.append(r)
@@ -22204,6 +22230,8 @@ def _affiliate_callup_from_child(conn, parent_id, child_id,
     # 게임 판단 로직(역할 재산정·임대 한도 등)에는 걸리지 않는다.
     if year is not None:
         try:
+            from database import FEEDER_CALLUP_LOG_TYPE as _FCLT
+            _cu_log_type = _FCLT.get(kind, "1군 콜업")
             _cs = c.execute("SELECT current_season FROM season_state WHERE id=1").fetchone()
             _cur_season_cu = _cs["current_season"] if _cs else 1
             _info = {r["id"]: r for r in c.execute(
@@ -22216,7 +22244,7 @@ def _affiliate_callup_from_child(conn, parent_id, child_id,
                     continue
                 _rows.append((_cur_season_cu, year, _pid, _r["name"] or "", _r["position"] or "",
                               _r["age"] or 0, _r["ovr"] or 0, child_id, parent_id,
-                              0, 0, 0.0, 0.0, "1군 콜업", 0, "", 0, 0, 0,
+                              0, 0, 0.0, 0.0, _cu_log_type, 0, "", 0, 0, 0,
                               _r["salary"] or 0, _r["contract_end_year"] or 0))
             if _rows:
                 c.executemany(
@@ -27447,11 +27475,16 @@ def _make_room_on_join(team_id, team_country, tier, year, reason="내 합류로 
     # 내가 합류한 뒤 AI 목표치는 "정원 - 나 1명" — 그걸 넘는 만큼만 방출.
     _ai_target = max(0, ceiling - 1)
     rows = c.execute(
-        "SELECT id, ovr FROM ai_players WHERE team_id=? ORDER BY ovr ASC", (team_id,)).fetchall()
+        "SELECT id, ovr, position FROM ai_players WHERE team_id=? ORDER BY ovr ASC", (team_id,)).fetchall()
     excess = len(rows) - _ai_target
     if excess <= 0:
         conn.close()
         return
+    # [2026-11-03 신민용 확정 — 리그 팀 GK 무조건 3명] GK가 최소 인원(3) 이하인 팀은 GK를 방출 순서 맨 뒤로 돌린다
+    # (OVR 최저가 3번째 GK여도 필드 선수부터 내보낸다 — 인원 상한은 그대로 지킨다).
+    import constants as _gk_cc
+    if sum(1 for r in rows if r["position"] == "GK") <= _gk_cc.SQUAD_TARGET_MIN_AVAILABLE_GK:
+        rows = [r for r in rows if r["position"] != "GK"] + [r for r in rows if r["position"] == "GK"]
     out_ids = [r["id"] for r in rows[:excess]]
     from database import get_ai_player_custom_names
     from constants import ai_player_code

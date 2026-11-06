@@ -8166,6 +8166,8 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False, start_year=None):
     # [2026-10] 대회별 카드 규칙 상태(card_rules) — 대회 id가 새 판에서 재사용된다.
     c.execute("DELETE FROM meta WHERE key LIKE 'card_state:%'")
     c.execute("DELETE FROM meta WHERE key='card_rules_legacy_v1'")
+    # [2026-11-06] GK 2명 연속 판정 기록(ai_lifecycle._GK_SHORT_META_KEY) — team_id가 새 판에서 재사용된다.
+    c.execute("DELETE FROM meta WHERE key='gk_short_after_offseason'")
     # [2026-10] 내 경기 AI 선수 실측 기록 — player_id·tournament_id가 새 판에서 재사용된다.
     for _rt in ("real_match_stats", "real_team_matches",
                 "gerd_muller_goals"):   # [2026-10-30] 게르트 뮐러상 칸별 골 — player_id가 새 판에서 재사용된다
@@ -11563,19 +11565,15 @@ def _build_squad_positions(grade=None, tier=None):
         bench_n = 15   # 11(주전) + 15 = 26명 고정
     else:
         bench_n = random.randint(11, 14)
-    import constants as _C_gk3
-    if getattr(_C_gk3, "GK3_WORLD_GEN_CAP", False):
-        # [2026-11-02 GK 3명 설계안 1] 후보 GK가 이미 2명(선발 포함 3명)이면 GK가 뽑혀도 다시 뽑는다.
-        bench = []
-        _bench_gk = 0
-        for _ in range(bench_n):
+    # [2026-11-02 GK 3명 설계안 1] 후보 GK가 이미 2명(선발 포함 3명)이면 GK가 뽑혀도 다시 뽑는다.
+    bench = []
+    _bench_gk = 0
+    for _ in range(bench_n):
+        _bp = roll_bench_position()
+        while _bp == "GK" and _bench_gk >= 2:
             _bp = roll_bench_position()
-            while _bp == "GK" and _bench_gk >= 2:
-                _bp = roll_bench_position()
-            _bench_gk += (_bp == "GK")
-            bench.append(_bp)
-    else:
-        bench = [roll_bench_position() for _ in range(bench_n)]
+        _bench_gk += (_bp == "GK")
+        bench.append(_bp)
     if "GK" not in bench:
         bench[random.randrange(len(bench))] = "GK"
     return starters + bench
@@ -11584,6 +11582,106 @@ def _build_squad_positions(grade=None, tier=None):
 # [2026-10-30 신설, constants.WORLD_SQUAD_BY_FORMATION 정의부 주석 참고] 포메이션 선발 칸 → 등록 포지션.
 # squad_targets.SLOT_TO_TARGET과 같은 치환이되 ST·CF는 FW로 합치지 않고 그대로 둔다.
 _FORMATION_SLOT_TO_REGISTERED = {"LM": "LW", "RM": "RW", "LWB": "LB", "RWB": "RB"}
+
+
+# [2026-11 신설, 신민용 확정 — 시작 선수단을 포메이션 기준으로 규칙적으로 배열] 예전 시작 생성은 팀 포메이션과
+# 무관하게 선발 = 고정 4-4-2형 배열(GK CB CB LB RB CDM CM CAM LW RW ST), 후보 = 자리마다 독립 추첨(수비 자리는
+# CB·LB·RB 각 1/3)이었다. 실측(새 월드, 약 11,400팀): 26명 팀 GK 2명 68~72%, CB 3명 이하 61%, 풀백이 CB보다
+# 3명+ 많은 팀 27%, 한쪽 풀백 4명+ 27%, 포메이션 선발 칸을 제 포지션으로 못 채우는 팀 45%.
+# 이제 선발 = 그 팀 시드 포메이션의 선발 칸(등록 포지션: LM→LW, RM→RW, LWB→LB, RWB→RB), 후보 = 아래 규칙으로
+# 정한 인원표(난수 없음, 포메이션·인원별로 항상 같다):
+#   · GK는 SEED_RULED_GK명(3) 고정 — 26명 팀은 반드시 3명(전 클럽 GK 3명 원칙).
+#   · 필요 인원: CB = 선발 + 2, 선발에 있는 포지션 = 선발 + 1, 선발에 없는 포지션 = 1(포메이션이 바뀌어도
+#     선발 칸이 비지 않게 — 시즌 중 포메이션 재검토는 선수단 적합도를 본다).
+#   · 남는 자리는 CB → 선발 중원(선발 많은 순) → 없는 중원(2명까지) → FW → LB → RB → LW → RW 순서로 한 명씩,
+#     상한 = max(SEED_RULED_HI_26, 필요 인원)(26명 기준 권장표: CB 4~5, LB·RB 2~3, CDM 2~3, CM 3~4, CAM 2~3,
+#     LW·RW 1~2, ST 2~3 — 신민용 제시).
+#   · 인원이 모자라는 작은 팀(22~25명)은 없는 중원 커버 → FW 백업 → 측면 백업 → 중원 백업 순으로 줄인다.
+#   · 후보 순서(후보 목표 OVR이 순번마다 감쇠): 1번째 백업을 포지션마다 돌아가며 먼저, 3번째 GK는 맨 끝.
+# 총원 규칙(SS·S·A 1부, S·SS 2부 26명 / 나머지 22~25명)과 스타 슬롯·OVR·국적 로직은 그대로다. 스타 가중치는
+# 포메이션 선발 칸 기준 보정(star_slot_weights_calibrated)을 쓴다. 시즌 중 보충·이적시장은 이 스위치와 무관하다
+# (다음 단계). False면 예전 경로 그대로(WORLD_SQUAD_BY_FORMATION 등 기존 스위치도 그대로 우선).
+SEED_SQUAD_RULED_BY_FORMATION = True
+SEED_RULED_GK = 3
+SEED_RULED_HI_26 = {"CB": 5, "LB": 3, "RB": 3, "CDM": 3, "CM": 4, "CAM": 3, "LW": 2, "RW": 2, "FW": 3}
+_RULED_FIELD = ("CB", "LB", "RB", "CDM", "CM", "CAM", "LW", "RW", "FW")
+_RULED_MIDS = ("CDM", "CM", "CAM")
+_RULED_PLAN_CACHE: dict = {}
+import collections   # [2026-11] _ruled_squad_plan
+
+
+def _ruled_squad_plan(formation, n):
+    """(선발 등록 포지션 11개, 후보 포지션 목록) — 위 규칙. 포메이션·총원별 결정론(캐시)."""
+    key = (formation, n)
+    hit = _RULED_PLAN_CACHE.get(key)
+    if hit is not None:
+        return hit
+    starters = [_FORMATION_SLOT_TO_REGISTERED.get(x, x) for x in _FORMATION_SLOTS_FOR_SEED[formation]]
+    s = collections.Counter(("FW" if p in ("ST", "CF") else p) for p in starters if p != "GK")
+    need = {p: (s[p] + 2 if p == "CB" else (s[p] + 1 if s[p] > 0 else 1)) for p in _RULED_FIELD}
+    hi = {p: max(SEED_RULED_HI_26[p], need[p]) for p in _RULED_FIELD}
+    cnt = dict(need)
+    gk_total = max(1, SEED_RULED_GK)
+    field_n = n - gk_total
+    mids_present = sorted([m for m in _RULED_MIDS if s[m] > 0], key=lambda m: (-s[m], _RULED_MIDS.index(m)))
+    mids_absent = [m for m in _RULED_MIDS if s[m] == 0]
+    add_order = ["CB"] + mids_present + mids_absent + ["FW", "LB", "RB", "LW", "RW"]
+    while sum(cnt.values()) < field_n:
+        moved = False
+        for p in add_order:
+            if sum(cnt.values()) >= field_n:
+                break
+            if cnt[p] < hi[p] and not (p in mids_absent and cnt[p] >= 2):
+                cnt[p] += 1
+                moved = True
+        if not moved:                      # 상한이 다 찼으면(이론상 28명 초과) 같은 순서로 그냥 더한다
+            for p in add_order:
+                if sum(cnt.values()) >= field_n:
+                    break
+                cnt[p] += 1
+    floor = {p: (max(s[p] + 1, 3) if p == "CB" else max(s[p], 1)) for p in _RULED_FIELD}
+    for m in mids_absent:
+        floor[m] = 1 if m == "CM" else 0
+    cut_order = mids_absent + ["FW", "LW", "RW"] + mids_present[::-1] + ["LB", "RB", "CB"]
+    while sum(cnt.values()) > field_n:
+        moved = False
+        for p in cut_order:
+            if sum(cnt.values()) <= field_n:
+                break
+            if cnt[p] > floor[p]:
+                cnt[p] -= 1
+                moved = True
+        if not moved:
+            break
+    # 후보 목록 — 선발 인원을 뺀 나머지, 1번째 백업부터 포지션별로 돌아가며. 3번째 GK는 맨 끝.
+    bench_left = {p: cnt[p] - s[p] for p in _RULED_FIELD}
+    gk_bench = gk_total - 1
+    bench = []
+    if gk_bench >= 1:
+        bench.append("GK")
+    order = ["CB"] + mids_present + ["FW", "LB", "RB", "LW", "RW"] + mids_absent
+    while any(v > 0 for v in bench_left.values()):
+        for p in order:
+            if bench_left[p] > 0:
+                bench.append("ST" if p == "FW" else p)
+                bench_left[p] -= 1
+    bench.extend(["GK"] * max(0, gk_bench - 1))
+    out = (starters, bench)
+    _RULED_PLAN_CACHE[key] = out
+    return out
+
+
+def _build_squad_positions_ruled(grade=None, tier=None, formation=None):
+    """[2026-11] 시작 선수단 포지션 목록(선발 11 + 후보) — SEED_SQUAD_RULED_BY_FORMATION 주석 참고.
+    총원 난수(22~25명 팀의 randint)는 _build_squad_positions와 같은 자리에서 한 번만 쓴다."""
+    import squad_targets as _sqt
+    f = _sqt._formation(formation)
+    if (tier == 1 and grade in ("A", "S", "SS")) or (tier == 2 and grade in ("S", "SS")):
+        bench_n = 15
+    else:
+        bench_n = random.randint(11, 14)
+    starters, bench = _ruled_squad_plan(f, TEAM_STARTER_COUNT + bench_n)
+    return list(starters) + list(bench)
 
 
 def _world_squad_by_formation_on():
@@ -11777,7 +11875,10 @@ NAT_TOP_OVR_SOFT_CAP = {"일본": {"cap": 94, "floor": 92, "keep_prob": 0.3}}
 # 정해지는 rare_prob 비율의 선수만 rare_cap까지 허용한다(난수 미사용 — 같은 선수는 항상 같은
 # 판정). 적용 지점: ai_lifecycle._age_and_progress(성장 상한), _apply_intl_breakout(목표 OVR).
 # 이미 상한 위에 있는 선수를 깎지는 않는다(성장만 막음). 빈 딕셔너리면 예전과 100% 동일.
-NAT_OVR_CEILING = {"대한민국": {"cap": 91, "rare_cap": 94, "rare_prob": 0.15}}
+# [2026-11-06 신민용 지시 — 한국 상한 해제] 한국에만 걸린 이 상한 때문에 한국은 95가 구조적으로 불가능했고, 상한이 없는
+# 태국(D급)보다 최상위가 낮게 나오는 역전이 생겼다. 일단 비운다(빈 딕셔너리 = 이 상한이 생기기 전과 같은 동작 — 성장 상한·
+# 브레이크아웃 목표 모두 다른 국가와 같은 규칙). 예전 값: {"대한민국": {"cap": 91, "rare_cap": 94, "rare_prob": 0.15}}
+NAT_OVR_CEILING = {}
 
 
 def nat_ovr_ceiling(nat, pid):
@@ -12000,6 +12101,30 @@ def _lower_stats_to_ovr(pos, stats, ovr, cap):
 _BENCH_FOREIGN_CAP_COUNTRIES = frozenset({"잉글랜드", "스페인", "이탈리아", "독일", "프랑스"})
 
 
+# [2026-11 신설, 신민용 확정 — 월드클래스 인원 "권장 목표"(시작·장기 97+ 35~45, 95+ 150~180, 명문 집중,
+# 95~96 엘리트층 유지)] 게임 시작 직후 97+가 54~71명(5시드 평균 62)·95+ 약 250명. 실측 분해(빅5 1부, 5시드):
+#   명문3(11팀) 97+ 28·95+ 77 / 명문2(4팀) 7·21 / 명문1(10팀) 12·49 / 비명문(71팀) 12·93
+# 원인: ① 월드클래스 자리가 팀 위상과 무관하게 S등급 1부 전 팀 2~3자리, ② 엘리트 자리에도 명문 보너스가
+# 붙어 명문3 엘리트의 약 20%가 97+, ③ 시작 시점 23세 이하 월드클래스 자리 선수(잠재력 = 성인 목표 95~99)가
+# 1~6시즌에 33~35명 97+로 올라와 시즌 중 세대(5시즌째부터 시즌당 약 5명)와 겹쳤다(7~12시즌 50~65명).
+# 1차 시도(명문 몫 밖의 월드클래스 자리를 없애 엘리트로)는 97+는 맞췄지만 95~96이 209 → 124~157명으로
+# 빠져 불채택 — 자리 수는 그대로 두고 "명문 몫 밖"의 월드클래스 자리만 상한을 둔다:
+#   WC_SLOTS_BY_PRESTIGE: 명문 등급 → (기본, 순위 보너스 × team_strength) = 상한 없는 월드클래스 자리 수.
+#       SS/S 1·2부 팀의 월드클래스 자리 중 이 수를 넘는 자리는 WC_CAPPED_OVR(96)에서 자르고 잠재력도
+#       엘리트 기준으로 뽑는다(95~96 "월드클래스 바로 아래" 층이 된다). A 이하·GLOBAL_PRESTIGE 나라는 그대로.
+#   SEED_YOUNG_WC_*: 상한 없는 월드클래스 자리라도 시작 시점 23세 이하면 SEED_YOUNG_WC_KEEP 확률로만 그대로
+#       두고, 나머지는 같은 상한(96·엘리트 잠재력)을 건다 — 시작 세대의 미래 97+ 공급을 시즌 중 세대와
+#       겹치지 않는 수준으로 줄인다.
+#   ELITE_SLOT_OVR_CAP: 엘리트 자리 목표 OVR 상한(엘리트는 월드클래스 바로 아래 — 97+는 월드클래스 자리만).
+# 시즌 중 생성·성장 로직은 건드리지 않는다(원인 분리 실측: 시즌 중 세대 유입 시즌당 4.5~5.6명 × 97+ 유지
+# 약 7년 ≈ 장기 32~40명). 셋 다 None/1.0이면 예전과 같다.
+WC_SLOTS_BY_PRESTIGE = {3: (2, 1), 2: (2, 1), 1: (1, 1), 0: (0, 1)}
+WC_CAPPED_OVR = 94
+SEED_YOUNG_WC_AGE = 23
+SEED_YOUNG_WC_KEEP = 0.85
+ELITE_SLOT_OVR_CAP = 96
+
+
 def _star_counts(grade, team_strength, continent_bonus=0, n_slots=11, tier=1,
                   country=None, prestige_level=0):
     """(월드클래스 슬롯 수, 엘리트 슬롯 수) 반환. SS/S/A 외 등급은 기본
@@ -12139,6 +12264,17 @@ def _star_counts(grade, team_strength, continent_bonus=0, n_slots=11, tier=1,
     return n_world, n_elite
 
 
+def _seed_star_ovr_cap(idx, star_kind_by_slot, wc_capped_slots):
+    """[2026-11 월드클래스 인원] 시작 생성 스타 자리의 최종 OVR 상한 — 목표 OVR만 자르면 스탯 노이즈
+    (_gen_ai_stats, 표준편차 3~4)로 96 목표가 97~98로 나온다. 상한 있는 월드클래스 자리는 WC_CAPPED_OVR,
+    엘리트 자리는 ELITE_SLOT_OVR_CAP. 그 외(상한 없는 월드클래스·일반 자리)는 None."""
+    if idx in wc_capped_slots:
+        return WC_CAPPED_OVR
+    if star_kind_by_slot.get(idx) == "elite":
+        return ELITE_SLOT_OVR_CAP
+    return None
+
+
 def _star_target_ovr(tier_top, kind, el_offset=(6, 14), prestige_bonus=0.0, team_strength=1.0,
                       penalty_max=None):
     """스타 슬롯 하나의 목표 OVR. 리그 상한(tier_top) 바로 아래에서 결정 —
@@ -12172,7 +12308,12 @@ def _star_target_ovr(tier_top, kind, el_offset=(6, 14), prestige_bonus=0.0, team
     if kind == "worldclass":
         return tier_top - random.uniform(0, 4) - strength_penalty + prestige_bonus
     lo, hi = el_offset
-    return tier_top - random.uniform(lo, hi) - strength_penalty + prestige_bonus  # elite
+    _el = tier_top - random.uniform(lo, hi) - strength_penalty + prestige_bonus  # elite
+    # [2026-11 월드클래스 인원] 엘리트 자리는 월드클래스(97+)가 아니다 — ELITE_SLOT_OVR_CAP 주석 참고.
+    # 난수 소비는 그대로(위 uniform 1회), 값만 위에서 자른다.
+    if ELITE_SLOT_OVR_CAP is not None:
+        _el = min(_el, ELITE_SLOT_OVR_CAP)
+    return _el
 
 
 # [2026-08 신설, 신민용 확정 — 국가별 OVR 분포 재조정 2차 실험] 스타 슬롯
@@ -12577,6 +12718,36 @@ def _bench_target_ovr(grade, tier, team_strength, bench_rank, continent_bonus=0,
     return max(30.0, base - BENCH_OVR_DECAY_PER_SLOT * (bench_rank + 1))
 
 
+# [2026-11-06 신설, 신민용 요청 — 선수 공급원(feeder) 바탕] 1군이 선수를 끌어올 수 있는 "공급원"을 종류별로 한 곳에서
+# 정의한다. 지금 있는 종류는 리그에 속한 산하팀(B팀·II·U21처럼 리그 표에 들어가 있는 팀, teams.parent_team_id가 모구단)뿐이다.
+# 나중에 리그 밖 U-21 스쿼드(예: "첼시 U-21")를 넣으면 teams.classification_status=FEEDER_U21_CLASS로 만들고
+# FEEDER_KINDS에 FEEDER_KIND_U21을 추가하면 된다 — 콜업 처리(game_engine._callup_from_feeder)·GK 규칙
+# (ai_lifecycle.feeder_callup_gk_ok)·이적 기록 종류(FEEDER_CALLUP_LOG_TYPE)는 이미 공급원 종류와 무관하게 공통이다.
+# U-21을 넣을 때 따로 정해야 하는 것(지금은 만들지 않음): ① 언제 콜업하나(산하팀은 "모구단 강등으로 같은 부수가 됐을 때"
+# 라는 리그 규칙이 계기 — U-21은 리그가 없으니 부족 포지션 기준 등 별도 계기) ② 산하팀 연령 정리·신인 충원
+# (ai_lifecycle._affiliate_age_cleanup/_affiliate_intake는 지금 AFFILIATE 팀만 본다) ③ GK 인원 규칙을 U-21에도 걸지.
+FEEDER_KIND_AFFILIATE = "affiliate"
+FEEDER_KIND_U21 = "u21"
+FEEDER_U21_CLASS = "U21"
+FEEDER_KINDS = (FEEDER_KIND_AFFILIATE,)          # 켜진 공급원 종류(지금은 산하팀만)
+FEEDER_CALLUP_LOG_TYPE = {FEEDER_KIND_AFFILIATE: "1군 콜업", FEEDER_KIND_U21: "1군 콜업"}
+
+
+def feeder_sources(c, parent_id, kinds=None):
+    """모구단(parent_id)의 공급원 팀 목록 [(row, 종류)] — row는 id·name·current_tier·classification_status.
+    산하팀(affiliate) = parent_team_id가 이 팀인 팀 중 U-21 스쿼드가 아닌 팀(지금은 U-21 스쿼드가 없어 예전 조회와 같다 —
+    순서도 같은 표 순서). U-21(u21) = classification_status가 FEEDER_U21_CLASS인 팀(FEEDER_KINDS에 넣었을 때만)."""
+    kinds = FEEDER_KINDS if kinds is None else kinds
+    out = []
+    for r in c.execute("SELECT id, name, current_tier, classification_status FROM teams WHERE parent_team_id=?",
+                       (parent_id,)).fetchall():
+        is_u21 = (r["classification_status"] or "") == FEEDER_U21_CLASS
+        k = FEEDER_KIND_U21 if is_u21 else FEEDER_KIND_AFFILIATE
+        if k in kinds:
+            out.append((r, k))
+    return out
+
+
 def affiliate_parent_map(c):
     """[2026-10 유스 시스템] {산하팀 id: 모구단 id} — classification_status='AFFILIATE'이고 parent_team_id가
     있는 팀만(부모 미확인 REVIEW 팀은 독립 구단이라 제외)."""
@@ -12653,7 +12824,8 @@ def _generate_all_ai_players(c, progress_cb=None):
     import constants as _Cy
     _YOUTH_GEN_AFF = set(affiliate_parent_map(c)) if _Cy.YOUTH_AGE_RULES else None
     global _GEN_FORMATIONS, _GEN_TENDENCY
-    _GEN_FORMATIONS = _seed_formation_map(c) if _world_squad_by_formation_on() else None
+    _GEN_FORMATIONS = (_seed_formation_map(c)
+                       if (_world_squad_by_formation_on() or SEED_SQUAD_RULED_BY_FORMATION) else None)
     _GEN_TENDENCY = ({r[0]: r[1] for r in c.execute("SELECT id, tactic_tendency FROM teams")}
                      if _world_squad_by_formation_on() else None)
 
@@ -12966,6 +13138,11 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
             (_GEN_TENDENCY or {}).get(team.get("tid")))
         _starter_pos = _wsf_positions[:TEAM_STARTER_COUNT]
         _star_w = star_slot_weights_calibrated(_starter_pos)
+    elif SEED_SQUAD_RULED_BY_FORMATION:
+        # [2026-11] 시작 선수단 포메이션 기준 규칙 배열 — SEED_SQUAD_RULED_BY_FORMATION 주석 참고.
+        _wsf_positions = _build_squad_positions_ruled(grade, tier, (_GEN_FORMATIONS or {}).get(team.get("tid")))
+        _starter_pos = _wsf_positions[:TEAM_STARTER_COUNT]
+        _star_w = star_slot_weights_calibrated(_starter_pos)
     else:
         _starter_pos = _STARTER_POSITIONS_FOR_STAR
         _star_w = star_slot_weights(_starter_pos)
@@ -12978,6 +13155,17 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
     random.shuffle(_rest)
     for i in _rest[:n_elite]:
         star_kind_by_slot[i] = "elite"
+    # [2026-11 월드클래스 인원] 명문 몫 밖의 월드클래스 자리(목표 상한 WC_CAPPED_OVR + 엘리트 잠재력) —
+    # WC_SLOTS_BY_PRESTIGE 정의부 주석 참고. 자리 수·위치·난수 소비는 그대로, 어느 자리가 상한을 받는지만 정한다.
+    # 23세 이하 젊은 월드클래스 자리는 아래 루프에서 나이를 뽑은 뒤 SEED_YOUNG_WC_KEEP로 추가 판정한다.
+    _wc_capped_slots = set()
+    if (WC_SLOTS_BY_PRESTIGE is not None and star_rule_grade(grade) in ("SS", "S") and tier in (1, 2)
+            and team.get("cname", "") not in GLOBAL_PRESTIGE_STAR_CFG):
+        _wb, _wbn = WC_SLOTS_BY_PRESTIGE.get(_plevel or 0, WC_SLOTS_BY_PRESTIGE[0])
+        _wc_full = _wb + round(_wbn * team_strength)
+        if tier == 2:
+            _wc_full = max(0, _wc_full - 2)   # _star_counts의 2부 감산과 같은 폭
+        _wc_capped_slots = set(_world_idx[_wc_full:])
 
     # [2026-07 신설, 버그수정] 역할 순번(role_idx) 랜덤화 — 어느 팀은
     # 스트라이커가, 어느 팀은 센터백이 에이스일 수 있으므로 팀마다 0~10을
@@ -13195,6 +13383,14 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
                 # 87대까지 내려가 "SS/S는 절대 엘리트 미만 없음" 원칙이 깨질 수
                 # 있었다 — 스타 슬롯에도 동일한 바닥을 걸어 항상 88 이상 보장.
                 target = max(target, _elite_floor)
+            # [2026-11 월드클래스 인원] 명문 몫 밖 자리 + 시작 시점 23세 이하 월드클래스 자리 일부는 상한을 둔다.
+            if star_kind_by_slot[idx] == "worldclass" and (
+                    idx in _wc_capped_slots
+                    or (SEED_YOUNG_WC_KEEP < 1.0 and WC_SLOTS_BY_PRESTIGE is not None
+                        and star_rule_grade(grade) in ("SS", "S") and tier in (1, 2)
+                        and age <= SEED_YOUNG_WC_AGE and random.random() >= SEED_YOUNG_WC_KEEP)):
+                _wc_capped_slots.add(idx)
+                target = min(target, WC_CAPPED_OVR)
         else:
             target = _target_ovr(grade, tier, team_strength, role_indices[idx], continent_bonus,
                                  prestige_bonus, team.get("cname", ""))
@@ -13303,6 +13499,9 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
                         pos, stats, ovr,
                         max(_league_hard_min,
                             (_prestige_hard_min or 0) * _age_frac))
+                _scap = _seed_star_ovr_cap(idx, star_kind_by_slot, _wc_capped_slots)
+                if _scap is not None and ovr > _scap:
+                    stats, ovr = _lower_stats_to_ovr(pos, stats, ovr, _scap)
                 sub_role = random.choice(SUB_ROLES.get(pos, ["기본"]))
                 # [2026-09 신설] roll_potential_ovr 정의부 주석 참고 — 이
                 # 분기는 항상 star_kind_by_slot[idx]가 정의된 스타 슬롯이다.
@@ -13330,7 +13529,7 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
                 # 바닥을 걸어준다 — 성인(26세 이상)은 _adult_target_ovr이
                 # 곧 지금 target이라 기존과 사실상 동일하다.
                 potential_ovr = max(ovr, int(round(_adult_target_ovr)),
-                                    roll_potential_ovr(_team_growth_cap, star_kind_by_slot[idx]))
+                                    roll_potential_ovr(_team_growth_cap, "elite" if idx in _wc_capped_slots else star_kind_by_slot[idx]))
                 # [2026-09 재배치] nationality는 이제 루프 맨 위에서 이미
                 # 정해져 있다(_is_foreign_slot 정의부 주석 참고) — 여기서
                 # 다시 뽑으면 같은 슬롯에 난수를 두 번 소비하고 결과가
@@ -13397,6 +13596,9 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
             stats, ovr = _lift_stats_to_ovr(
                 pos, stats, ovr,
                 max(_league_hard_min, (_prestige_hard_min or 0) * _age_frac))
+        _scap = _seed_star_ovr_cap(idx, star_kind_by_slot, _wc_capped_slots)
+        if _scap is not None and ovr > _scap:
+            stats, ovr = _lower_stats_to_ovr(pos, stats, ovr, _scap)
         # [2026-10 신설, 신민용 확정 — A안] 빅5 1부 외국인 벤치: 최종 OVR을 그 팀 성인 주전
         # 최저 이하로. 성인(26세+)은 피크기라 잠재력을 향해 크지 않으므로, 잠재력 계산에
         # 쓰이는 성인 목표(_adult_target_ovr)에도 같은 상한을 건다(26세 미만은 성장 여지가
@@ -13416,7 +13618,7 @@ def _generate_team_players(c, team, team_strength, league_used: set = None, name
         # 이 클램프가 거의 안 걸린다 — 주로 성인 선수에서만 의미 있음).
         # [2026-09] 위 스타 슬롯 분기와 동일 — _adult_target_ovr 바닥.
         potential_ovr = max(ovr, int(round(_adult_target_ovr)),
-                            roll_potential_ovr(_team_growth_cap, star_kind_by_slot.get(idx)))
+                            roll_potential_ovr(_team_growth_cap, "elite" if idx in _wc_capped_slots else star_kind_by_slot.get(idx)))
         # [2026-09 재배치] nationality는 루프 맨 위에서 이미 정해져 있다
         # (_is_foreign_slot 정의부 주석 참고) — 그대로 재사용.
         _rows.append((team["tid"],name,pos,

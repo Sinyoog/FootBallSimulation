@@ -2085,7 +2085,7 @@ _RENAME_SCOPE_BTN_STYLE = (
     "#4caf50;font-weight:bold;}")
 
 
-def open_bulk_rename_dialog(parent, starters: list, bench: list) -> list:
+def open_bulk_rename_dialog(parent, starters: list, bench: list, team_country: str = None) -> list:
     """[2026-08 신설, 신민용 요청: "이름 일괄변경 — 리그명 표시줄 좌우/
     세계기록실 대회명 옆에 버튼을 만들어서, 쉼표로 구분한 이름을 위에서
     부터 순서대로 배정하고 싶다"] 메인 포메이션 화면(FormationWidget)과
@@ -2113,12 +2113,20 @@ def open_bulk_rename_dialog(parent, starters: list, bench: list) -> list:
       넣는 가상 폴백 선수(id<-1)는 이름을 저장할 DB 행 자체가 없어
       대상에서 제외)만 대상으로 한다.
 
+    - [2026-11 신설, 신민용 요청] team_country(그 팀이 속한 나라)를 넘기면 범위 위에
+      "전체 | 내국인 | 외국인 | 외국국가" 줄이 생긴다 — 국적 범위와 위의 전체/주전/후보/미변경을
+      조합해 대상을 고른다(예: 외국인 + 후보 = 후보 중 외국인만, 화면 순서 그대로). "외국국가"는
+      누르면 바로 클립보드에 지금 범위의 외국인 국적을 같은 순서로 띄어쓰기로 이어 복사한다(요약 복사처럼
+      버튼이 1.2초간 "✅ 복사됨"). 국가대표·베스트11처럼
+      팀 단위가 아닌 화면은 team_country를 안 넘겨 이 줄이 없다(대표팀은 전원 같은 국적).
+      외국인 판정은 포메이션 화면 주황 테두리와 같은 규칙(_is_player_foreign — 군팀은 대한민국).
+      국적은 넘어온 dict의 nationality를 쓰고, 없는 선수만 한 번에 조회한다(쿼리 최대 2번).
     반환값: 실제로 바뀐 (player_id, new_name) 쌍 리스트(취소했거나
     아무도 안 바뀌면 빈 리스트) — 호출부가 자기 화면을 어떻게 다시
     그릴지는 스스로 판단해야 하므로(포메이션 화면은 apply_custom_name_live
     로 충분하지만, 세계 기록실의 대회 스쿼드 카드는 그 카드 자체를
     다시 그려야 해서) 새로고침은 각 호출부 책임으로 남긴다."""
-    from database import set_ai_player_custom_name, get_ai_player_custom_name
+    from database import set_ai_player_custom_name, get_ai_player_custom_names
 
     def _nameable(lst):
         return [p for p in lst if p.get("id") is not None and p.get("id") >= 0]
@@ -2134,8 +2142,49 @@ def open_bulk_rename_dialog(parent, starters: list, bench: list) -> list:
     # 선수까지 다시 훑을 필요 없게 — 지금 custom_name이 아예 없는
     # (=화면에 식별코드 그대로 뜨는) 선수만 골라 all_targets와 같은
     # 순서(주전→후보)로 별도 범위를 만든다.
-    unnamed_targets = [p for p in all_targets
-                        if not get_ai_player_custom_name(p.get("id"))]
+    # [2026-11 성능] 선수마다 따로 조회하던 것을 한 번의 쿼리로(get_ai_player_custom_names).
+    _named = get_ai_player_custom_names([p.get("id") for p in all_targets]) or {}
+    unnamed_targets = [p for p in all_targets if not _named.get(p.get("id"))]
+
+    # [2026-11 신설] 국적 범위(전체/내국인/외국인) — docstring 참고. team_country가 없으면 끈다.
+    _nat_on = bool(team_country)
+    _nat_of = {}
+    _foreign_ids = set()
+    if _nat_on:
+        for p in all_targets:
+            if p.get("nationality"):
+                _nat_of[p.get("id")] = p.get("nationality")
+        _need = [p.get("id") for p in all_targets if p.get("id") not in _nat_of]
+        if _need:
+            from database import get_conn as _gc_nat
+            _cn = _gc_nat()
+            try:
+                _ph = ",".join("?" * len(_need))
+                for _r in _cn.execute(f"SELECT id, nationality FROM ai_players WHERE id IN ({_ph})", _need):
+                    _nat_of[_r[0]] = _r[1] or ""
+                _left = [i for i in _need if i not in _nat_of]
+                if _left:
+                    _ph2 = ",".join("?" * len(_left))
+                    for _r in _cn.execute(
+                            f"SELECT id, nationality FROM ai_players_retired WHERE id IN ({_ph2})", _left):
+                        _nat_of[_r[0]] = _r[1] or ""
+            finally:
+                _cn.close()
+        for p in all_targets:
+            _pid = p.get("id")
+            if _is_player_foreign({"nationality": _nat_of.get(_pid, "")}, team_country):
+                _foreign_ids.add(_pid)
+            elif not _nat_of.get(_pid) and p.get("is_foreign"):
+                _foreign_ids.add(_pid)   # 국적을 못 찾았지만 호출부가 외국인으로 표시한 경우
+    _role_lists = {"all": all_targets, "starter": starter_targets,
+                   "bench": bench_targets, "unnamed": unnamed_targets}
+
+    def _filter_nat(lst, nat_key):
+        if nat_key == "dom":
+            return [p for p in lst if p.get("id") not in _foreign_ids]
+        if nat_key == "for":
+            return [p for p in lst if p.get("id") in _foreign_ids]
+        return lst
 
     dlg = QDialog(parent)
     dlg.setWindowTitle("이름 일괄변경")
@@ -2149,15 +2198,40 @@ def open_bulk_rename_dialog(parent, starters: list, bench: list) -> list:
     info_lbl.setStyleSheet("color:#888;font-size:11px;")
     v.addWidget(info_lbl)
 
+    # ── [2026-11] 국적 범위(전체/내국인/외국인) + 외국국가 — 팀 단위 화면에서만
+    nat_btns = {}
+    nat_list_btn = None
+    if _nat_on:
+        nat_row = QHBoxLayout()
+        for key, label in (("all", "전체"), ("dom", "내국인"), ("for", "외국인")):
+            b = QPushButton(label)
+            b.setCheckable(True)
+            b.setStyleSheet(_RENAME_SCOPE_BTN_STYLE)
+            nat_row.addWidget(b)
+            nat_btns[key] = b
+        # 요약 복사처럼 누르면 바로 클립보드로 — 지금 범위의 외국인 국적을 화면 순서대로 띄어쓰기로 잇는다.
+        nat_list_btn = QPushButton("📋 외국국가")
+        nat_list_btn.setStyleSheet(_RENAME_SCOPE_BTN_STYLE)
+        nat_list_btn.setEnabled(bool(_foreign_ids))
+        nat_row.addWidget(nat_list_btn)
+        nat_row.addStretch(1)
+        v.addLayout(nat_row)
+        nat_btns["all"].setChecked(True)
+
+    def _cur_nat():
+        return next((k for k, b in nat_btns.items() if b.isChecked()), "all")
+
     # ── 적용 범위(전체/주전/후보/미변경) 선택 행
     scope_row = QHBoxLayout()
     scope_btns = {}
+    _scope_labels = {}
     for key, label, targets in (
         ("all", "전체", all_targets),
         ("starter", "주전", starter_targets),
         ("bench", "후보", bench_targets),
         ("unnamed", "미변경", unnamed_targets),
     ):
+        _scope_labels[key] = label
         b = QPushButton(f"{label} ({len(targets)}명)")
         b.setCheckable(True)
         b.setStyleSheet(_RENAME_SCOPE_BTN_STYLE)
@@ -2214,11 +2288,20 @@ def open_bulk_rename_dialog(parent, starters: list, bench: list) -> list:
     preview_scroll.setWidget(preview_lbl)
     v.addWidget(preview_scroll)
 
+    def _refresh_labels():
+        _nk = _cur_nat()
+        _rk = next((k for k, b in scope_btns.items() if b.isChecked()), "all")
+        for k, b in scope_btns.items():
+            b.setText(f"{_scope_labels[k]} ({len(_filter_nat(_role_lists[k], _nk))}명)")
+        for k, b in nat_btns.items():
+            _lbl = {"all": "전체", "dom": "내국인", "for": "외국인"}[k]
+            b.setText(f"{_lbl} ({len(_filter_nat(_role_lists[_rk], k))}명)")
+
     def _refresh_preview(*_a):
         import html as _h
         _key = next((k for k, b in scope_btns.items() if b.isChecked()), "all")
-        _targets = {"all": all_targets, "starter": starter_targets,
-                    "bench": bench_targets, "unnamed": unnamed_targets}[_key]
+        _targets = _filter_nat(_role_lists[_key], _cur_nat())
+        _refresh_labels()
         _tid = [p.get("id") for p in _targets]
         _names = [n.strip() for n in edit.toPlainText().split(",") if n.strip()]
         _assign = dict(zip(_tid, _names))
@@ -2240,12 +2323,39 @@ def open_bulk_rename_dialog(parent, starters: list, bench: list) -> list:
             _new = _assign.get(p.get("id"))
             _arrow = (f" → <b style='color:#8fd18f;'>{_h.escape(_new)}</b>" if _new
                       else " <span style='color:#666;'>(그대로)</span>")
-            lines.append(f"{n}. {_h.escape(str(_row_name(p)))}{_arrow}")
+            _ntag = (f" <span style='color:#FF7F00;'>[{_h.escape(_nat_of.get(p.get('id'), '') or '외국인')}]</span>"
+                     if p.get("id") in _foreign_ids else "")
+            lines.append(f"{n}. {_h.escape(str(_row_name(p)))}{_ntag}{_arrow}")
         preview_lbl.setText("<br>".join(lines) if lines else "<span style='color:#666;'>대상 없음</span>")
 
     edit.textChanged.connect(_refresh_preview)
     for _b in scope_btns.values():
         _b.clicked.connect(_refresh_preview)
+
+    def _pick_nat(chosen_key):
+        for k, b in nat_btns.items():
+            b.setChecked(k == chosen_key)
+        _refresh_preview()
+    for k, b in nat_btns.items():
+        b.clicked.connect(lambda _checked, kk=k: _pick_nat(kk))
+    if nat_list_btn is not None:
+        def _copy_nat_list():
+            _rk = next((k for k, b in scope_btns.items() if b.isChecked()), "all")
+            _txt = " ".join(_nat_of.get(p.get("id"), "") or "?"
+                            for p in _filter_nat(_role_lists[_rk], "for"))
+            if not _txt:
+                return
+            QGuiApplication.clipboard().setText(_txt)
+            nat_list_btn.setText("✅ 복사됨")
+            from PyQt6.QtCore import QTimer
+
+            def _reset():
+                try:
+                    nat_list_btn.setText("📋 외국국가")
+                except RuntimeError:      # 1.2초 안에 창을 닫아 버튼이 지워진 경우
+                    pass
+            QTimer.singleShot(1200, _reset)
+        nat_list_btn.clicked.connect(_copy_nat_list)
     _refresh_preview()
 
     btn_row = QHBoxLayout()
@@ -2299,8 +2409,7 @@ def open_bulk_rename_dialog(parent, starters: list, bench: list) -> list:
         return []
 
     scope_key = next((k for k, b in scope_btns.items() if b.isChecked()), "all")
-    target_list = {"all": all_targets, "starter": starter_targets,
-                    "bench": bench_targets, "unnamed": unnamed_targets}[scope_key]
+    target_list = _filter_nat(_role_lists[scope_key], _cur_nat())
     names = [n.strip() for n in _text.split(",") if n.strip()]
 
     changed = []
@@ -2996,7 +3105,9 @@ class FormationWidget(QWidget):
         starters = panel.get_starters_ordered()
         full = panel.get_full_roster_ordered()
         bench = full[len(starters):]
-        open_bulk_rename_dialog(self, starters, bench)
+        # [2026-11] 클럽 화면이면 팀 나라를 넘겨 내국인/외국인 범위를 켠다(국제전은 빈 문자열 → 꺼짐).
+        open_bulk_rename_dialog(self, starters, bench,
+                                team_country=getattr(panel.canvas, "_team_country", "") or None)
 
     def open_player_popup(self, pl: dict, panel: "_TeamPanel"):
         """[2026-08 신설, 신민용 요청: "선수 클릭 시 파란 하이라이트 +

@@ -4574,40 +4574,51 @@ SQUAD_BY_FORMATION_V3 = False
 #       GK는 위 3명 원칙 그대로(팀 목표 가중치와 섞지 않는다).
 SQUAD_BY_FORMATION_V31 = False
 
-# [2026-11-02 신설, 신민용 승인 — GK 3명 설계안 1. 2026-11-02 채택: 월드 상한·유입 제한 켬, 판매 제한은 끔
-#  (10시즌×2시드 통합 검증 — 판매 제한은 GK 이동을 95% 막아 GK 2명 팀이 늘어 불채택)]
-#   V3.1 전체를 켜지 않고 GK 규칙만 떼어 낸 독립 스위치 3개. V3.1이 켜져 있으면 아래 두 이적 스위치는 켜진 것과 같다
-#   (V3.1 동작 그대로). WORLD_SQUAD_BY_FORMATION(_sq2) 경로가 켜져 있으면 그쪽 GK 처리가 우선이라 이적 스위치는 무시.
-#     GK3_WORLD_GEN_CAP — 월드 생성(database._build_squad_positions) GK 최대 3명: 후보 GK가 이미 2명이면 후보 자리에서
-#                         GK가 뽑혀도 다시 뽑는다. 정확히 3명으로 맞추지는 않는다(후보 GK 1명 보장 규칙은 그대로).
-#     GK3_INFLOW_LIMIT  — 유입 제한: GK 3명 이상 팀은 GK를 받는 목적지가 아니다(일반 이적시장·상위리그 발탁·정원 정리
-#                         매각/임대). 일반 이적시장 GK 수요 가중치의 기준 인원 2 → 3(V3.1 수요 GK 행).
-#     GK3_SALE_LIMIT    — 판매 제한: GK 3명 이하 팀의 GK는 일반 판매 후보·상위리그 발탁·은퇴대체 영입 대상이 아니다
-#                         (같은 포지션 맞교환으로만 나감). 일반 이적시장 GK 판매 가중치의 기준 인원 2 → 3(V3.1 판매 GK 행).
-#   V3.1 팀별 목표 가중치(_v31t·_v31m, CF 집계)와 중원 배분은 V3.1에만 남는다.
-GK3_WORLD_GEN_CAP = True
-GK3_INFLOW_LIMIT = True
-GK3_SALE_LIMIT = False
-# [2026-11-02 신설, 신민용 승인 — GK 3명 설계안 2. 2026-11-02 채택(켬)] 사용자 감독 팀·내 소속팀·군팀은 대상 아님.
-#     GK3_LOAN_RETURN — 임대 만기 GK가 돌아오면 원 소속팀 GK가 4명 이상이 되는 경우:
-#                       ① 임대 연장(AI_LOAN_MAX_TOTAL_YEARS 안에서) → ② 상한이면 임대처 GK 3명 이하일 때 임대처로 완전 이적
-#                       → ③ 둘 다 안 되면 그대로 복귀(아래 초과 GK 이동 대상). 기존 연장 사유·완전 이적 판정이 먼저다.
-#     GK3_EXCESS_MOVE — GK 4명 이상 팀의 초과 GK(소유 선수, OVR 낮은 순)를 GK 3명 미만 팀으로 옮긴다. 받는 팀 조건:
-#                       인원 상한 미만·외국인 상한·리그 수준(설계 OVR 하한/상한 — 이적시장과 같은 제외 기준)·산하팀 나이.
-#                       같은 나라 → 같은 대륙 → 다른 대륙, 그 안에서 팀 평균 OVR이 가까운 곳. 받을 팀이 없으면 그대로 보유
-#                       (은퇴·삭제·필드 선수 삭제 없음). 난수 미사용. 오프시즌 스쿼드 보정 직전과 오프시즌 끝에 돈다.
-GK3_LOAN_RETURN = True
-GK3_EXCESS_MOVE = True
+# [2026-11-06 채택 확정, 신민용 승인 — GK 3명 보호 정책(10시즌 × 2시드 검증 통과). 스위치 없음 — 아래가 기본 동작]
+#   리그 팀(군팀 제외) GK는 3명이 기본 구성이다. 4명 이상은 어느 측정 시점에도 없고, 1명 이하도 없으며, 2명은 한
+#   오프시즌까지만(아래 GK_MIN_AVAILABLE·두 오프시즌 연속 금지). GK 보호로 필드 선수를 대신 팔거나 지우지 않는다.
+#     · 월드 생성(database._build_squad_positions): 후보 GK가 이미 2명이면 후보 자리에서 GK가 뽑혀도 다시 뽑는다.
+#     · 유입 제한: GK 3명 이상 팀은 GK를 받는 목적지가 아니다(일반 이적시장·상위리그 발탁·정원 정리 매각/임대).
+#       일반 이적시장 GK 수요 표의 기준 인원 3(ai_lifecycle._DEMAND_W_TABLE_V31 GK 행).
+#     · 판매 보호(취소 방식): GK 3명 이하 팀의 GK는 후보에서 미리 빼지 않고, 일반 이적시장·상위리그 발탁에서 뽑히면
+#       그 이동을 취소한다(다른 필드 선수로 대신 채우지 않는다). 은퇴대체 영입은 GK 그룹 3명 이하 팀에서 빼 오지 않는다.
+#     · 임대 복귀: 돌아오면 원 소속팀 GK가 4명 이상 → ① 임대 연장(AI_LOAN_MAX_TOTAL_YEARS 안에서) → ② 임대처 GK 3명
+#       이하면 임대처로 완전 이적 → ③ 둘 다 안 되면 복귀(바로 아래 초과 GK 정리 대상).
+#     · 초과 GK 정리(ai_lifecycle._gk3_excess_move): 제대 처리 직후·임대 복귀 직후·스쿼드 보충 전·오프시즌 끝·겨울
+#       이적시장 뒤. 내보낼 GK = 그 팀 소유 GK 중 남길 가치(_gk_keep_value)가 가장 낮은 선수, 받는 팀 = GK 3명 미만 팀
+#       (같은 나라 → 같은 대륙 → 다른 대륙, 팀 평균 OVR이 가까운 곳). 못 찾으면 리그 수준 조건만 풀고, 최소 인원 때문에
+#       못 보내면 받는 팀과 1:1 맞교환(받는 팀은 가장 많은 필드 포지션 백업). 보내는 쪽 제외는 군팀·사용자 감독 팀만.
+#       대기 상태·조기은퇴·삭제 없음.
+#     · 경로별 입구 차단: 1군 콜업 GK는 모구단 GK 3명 미만·공급원 GK 3명 이상일 때만(game_engine._callup_from_feeder),
+#       스카우팅 이적료만 주는 GK 영입 취소, 승강 물갈이에서 GK 3명 이하 팀의 GK 방출은 같은 포지션 신인 교체로.
+#     · [2026-11-07 채택] 제대 복귀 정리로 나가는 GK의 이적 기록에 원 소속팀 매각 이적료(economy.estimate_transfer_fee —
+#       정원 정리 매각과 같은 계산, 난수 없음)를 남긴다. 기록의 fee 칸만 — AI 구단 예산·선수 가치는 그대로.
+#     · 보충 GK 상한: 스쿼드 보충 1명을 고를 때 명단 GK(임대 온 선수 포함, 임대 보낸 선수 제외)가 3명 이상이면 GK를
+#       뽑지 않는다(ai_lifecycle._gen_topup_rows).
+#   불채택으로 제거한 것: GK 강제 재분배·마지막 정리(2026-10-30, WORLD_SQUAD_BY_FORMATION 2차), 판매 제한의 "후보에서
+#   빼기" 방식(2026-11-06 — 필드 선수가 대신 팔려 선발 공백이 늘었다).
 # [2026-11-02 신설, 신민용 확정: "모든 팀이 26명까지가 최대 — 27명 이상은 안 된다"] 등급별 최대 인원(S·SS 28, A 27)을
 # 26으로 자른다(ai_lifecycle._squad_min_max — 최소 인원은 그대로). 시즌 도중(겨울 이적시장)엔 26명인 팀이 목적지가
 # 되지 않는다 — 여름 이적시장 중간의 초과는 오프시즌 스쿼드 보정이 시즌 시작 전에 26명으로 정리한다. 2026-11-02 채택(켬).
 SQUAD_MAX_26 = True
-# [2026-11-02 신설, 신민용 승인 — 보충 GK 상한(검증 중 스위치, 기본 꺼짐)] 스쿼드 보충(ai_lifecycle._gen_topup_rows —
+# [2026-11-02 신설, 신민용 승인 — 보충 GK 상한] 스쿼드 보충(ai_lifecycle._gen_topup_rows —
 # 오프시즌 인원 보충·4주차 빈자리·떠난 팀 보충) 1명을 고를 때 실제 명단 GK(임대 온 선수 포함, 임대 보낸 선수 제외)가
 # 3명 이상이면 GK를 후보에서 뺀다: 포지션 추첨에 넘기는 보유 수의 GK만 max(소유 GK, 명단 GK)로 보고, 예비 추첨
 # (roll_bench_position)도 GK가 나오면 다시 뽑는다. 보충 인원·명단 GK 2명 미만 확정 보충·필드 목표/부족량·필수 대비·
 # 포지션 맞바꾸기는 그대로. (원인: 추첨은 소유 기준 GK 목표 2명이라 임대 온 GK로 명단 3명인 팀에 4번째 GK를 만들었다.)
-GK3_TOPUP_CAP = False
+# [2026-11-03 채택, 신민용 확정] 켬 — 20시즌 × 2시드 실측에서 리그 팀 GK 4명 12팀이 전부 이 경로(마지막 오프시즌
+# squad_topup으로 새로 생성된 GK 1명 + 임대로 온 GK 2~3명)였다. [2026-11-06] 스위치 없이 기본 동작(위 GK 3명 보호 정책).
+# [2026-11-03 신설, 신민용 확정 — "리그 팀 GK는 무조건 3명, 처음 만들어질 때도 차후에도(군팀은 예외)"] 시즌 중 가용 GK
+# 최소 인원(명단 기준 — 임대 온 선수 포함, 임대 보낸 선수 제외). 예전엔 포메이션 생성 스위치(V3 계열)가 꺼져 있으면 2라,
+# 이적·임대·입대로 GK가 빠진 팀이 2명에서 멈췄다(20시즌 후 리그 팀 37%가 GK 2명, 세계 GK 필요 인원 대비 약 4,200명 부족).
+# 3이면 오프시즌 보충에서 GK를 먼저 확정 보충하고, 인원이 꽉 찬 팀은 포메이션 목표 대비 가장 초과한 필드 포지션의 최저
+# OVR 선수와 1:1로 맞바꾼다(그 포지션 마지막 1명은 보호 — 기존 맞바꾸기 규칙). 군팀은 보충 대상이 아니다(_drop_mil_teams).
+GK_MIN_AVAILABLE = 3
+# [2026-11-06 신설·채택, 신민용 확정 — GK 2명 두 오프시즌 연속 금지(스위치 없음)] 오프시즌 보충에서 GK를 3명으로 못 채운 팀(자리가 꽉 찼고
+# 포메이션 목표 대비 넘치는 필드 포지션도 없음)은 그 오프시즌엔 2명으로 둔다. 다음 오프시즌에도 3명 미만이면 그때는 무조건
+# 3명 — 기존 추가·맞바꾸기가 다 안 되면 선수가 가장 많은 포지션의 백업 1명(그 포지션 선발 인원 + 백업 1명은 남김)을 GK와
+# 1:1로 맞바꾼다(인원 상한까지 자리가 남아 있으면 그냥 추가). 사용자 구단(감독·구단주)은 강제 맞바꾸기 대상이 아니다.
+# [2026-11-06 2차] "GK 1명 이하 즉시 보충"은 제거 — 오프시즌 끝 1명 이하는 기존 보충·초과 GK 정리가 이미 0팀으로 만든다.
 
 
 def squad_v31_on():
@@ -4625,28 +4636,28 @@ def squad_formation_gen_on():
     return bool(WORLD_SQUAD_BY_FORMATION or squad_v3_family_on())
 
 
-SQUAD_TARGET_MIN_AVAILABLE_GK = 3 if squad_formation_gen_on() else 2   # 현재 가용 GK가 이 수 미만이면 GK 확정 보충·맞바꾸기
+SQUAD_TARGET_MIN_AVAILABLE_GK = 3 if squad_formation_gen_on() else GK_MIN_AVAILABLE   # 현재 가용 GK가 이 수 미만이면 GK 확정 보충·맞바꾸기
 
 
 def set_world_squad_by_formation(on):
     """검증용 — 스위치와 그에 딸린 GK 최소 인원을 함께 바꾼다(실행 중 모듈 속성으로 읽힘)."""
     global WORLD_SQUAD_BY_FORMATION, SQUAD_TARGET_MIN_AVAILABLE_GK
     WORLD_SQUAD_BY_FORMATION = bool(on)
-    SQUAD_TARGET_MIN_AVAILABLE_GK = 3 if squad_formation_gen_on() else 2
+    SQUAD_TARGET_MIN_AVAILABLE_GK = 3 if squad_formation_gen_on() else GK_MIN_AVAILABLE
 
 
 def set_squad_by_formation_v3(on):
     """검증용 — V3 스위치와 그에 딸린 GK 최소 인원을 함께 바꾼다."""
     global SQUAD_BY_FORMATION_V3, SQUAD_TARGET_MIN_AVAILABLE_GK
     SQUAD_BY_FORMATION_V3 = bool(on)
-    SQUAD_TARGET_MIN_AVAILABLE_GK = 3 if squad_formation_gen_on() else 2
+    SQUAD_TARGET_MIN_AVAILABLE_GK = 3 if squad_formation_gen_on() else GK_MIN_AVAILABLE
 
 
 def set_squad_by_formation_v31(on):
     """검증용 — V3.1 스위치와 그에 딸린 GK 최소 인원을 함께 바꾼다."""
     global SQUAD_BY_FORMATION_V31, SQUAD_TARGET_MIN_AVAILABLE_GK
     SQUAD_BY_FORMATION_V31 = bool(on)
-    SQUAD_TARGET_MIN_AVAILABLE_GK = 3 if squad_formation_gen_on() else 2
+    SQUAD_TARGET_MIN_AVAILABLE_GK = 3 if squad_formation_gen_on() else GK_MIN_AVAILABLE
 
 
 MANAGER_FAMILY_BACK3_PCT = 25             # 감독 포메이션 계열: 3백·5백 비율(%)

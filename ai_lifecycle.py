@@ -920,6 +920,7 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
     # 입대자는 빠진다. 기능이 꺼져 있으면 즉시 return(아무것도 안 함).
     from military_service import process_military_new_year as _mil_new_year
     _mil_new_year(c, year)
+    _gk3_excess_move(c, year, "제대 복귀")   # [2026-11-06] 제대(원 소속팀 복귀·FA 입단)로 4명이 된 팀 즉시 정리
     shared_ai_rows = c.execute(
         "SELECT id, team_id, position, age, name, ovr, nationality, quota_local_country, "
         "contract_end_year, last_transfer_year, potential_ovr, on_loan_from_team_id "
@@ -1060,6 +1061,7 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
     # 시점이므로 은퇴 처리 직후, 아래 shared_ai_rows 재조회 "전"에 복귀를
     # 끝낸다 — 그래야 이적시장이 복귀한 선수를 원 소속팀 선수로 본다.
     loan_returned = _process_loan_returns(c, year)
+    _gk3_excess_move(c, year, "임대 복귀")   # [2026-11-06] 임대 복귀 마지막 단계(연장·완전 이적 불가)로 4명이 된 팀 즉시 정리
     # [2026-10 주포·부포] 부포 획득(2시즌 연속 같은 비주포 슬롯 선발) — 이적시장·보충 목표표·다음 시즌
     # 역할 계산이 새 부포를 보도록 여기서. 스위치 OFF면 아무것도 읽거나 쓰지 않는다. 난수 미사용.
     try:
@@ -1148,10 +1150,9 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
         # [2026-10 유스 시스템] 산하팀 연령 초과 정리 → 최소 인원까지 신인 충원(스쿼드 규모 정리 앞)
         _YOUTH_CTX["aff"] = None
         _affiliate_intake(c, year, _affiliate_age_cleanup(c, year))
-    if _sq2_on():   # [2026-10-30 2차] GK 4명 이상 → 3명(초과 GK를 GK 부족 팀으로)
+    if _sq2_on():
         _sq2_reset_log()
-        _gk_excess_redistribute(c, year)
-    _gk3_excess_move(c, year, "보충 전")   # [2026-11-02 GK 3명 설계안 2] 스위치 OFF면 즉시 0
+    _gk3_excess_move(c, year, "보충 전")   # [2026-11-02 GK 3명 설계안 2] GK 4명 이상 팀의 초과 GK → GK 부족 팀
     topped_up, forced_out = _rebalance_squad_sizes(c, year)
     _ta3b = _time_perf.perf_counter()
     # [2026-09 신설, 신민용 요청: "선수의 한계치를 국가별로 최대 2명으로
@@ -1201,9 +1202,10 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
         _mil_clamp(c, year + 1)
     except Exception as _e:
         print(f"[MILITARY] 해외파 계약 상한 처리 실패(계속 진행): {_e}")
-    if _sq2_on():   # [2026-10-30 2차 수정] 선수 이동이 모두 끝난 뒤 전 팀 GK 정확히 3명
-        _gk_final_balance(c, year)
-    _gk3_excess_move(c, year, "오프시즌 끝")   # [2026-11-02 GK 3명 설계안 2] 스위치 OFF면 즉시 0
+    _gk3_excess_move(c, year, "오프시즌 끝")   # [2026-11-02 GK 3명 설계안 2]
+    # [2026-11-06 신민용 확정] 모든 이동·보충이 끝난 이 시점에 GK 3명 미만 팀을 남긴다 — 다음 오프시즌 연속 판정용
+    _GK_SHORT_LAST.clear()
+    _GK_SHORT_LAST.update(_gk_short_record(c, year))
 
     # [2026-09 신설] 이번 오프시즌에 새로 생긴 선수(은퇴 교체 / 스쿼드 보충 /
     # 물갈이)의 주발을 여기서 채운다. 생성 지점마다 넣지 않는 이유는
@@ -1423,6 +1425,9 @@ def run_ai_mid_season_transfer(year, verbose_log=None, my_team_id=None):
             _mil_clamp(c, year)
         except Exception as _e:
             print(f"[MILITARY] 해외파 계약 상한 처리 실패(계속 진행): {_e}")
+        # [2026-11-03 신민용 확정] 겨울 이적시장 뒤에도 GK 4명 팀(임대·제대 복귀 등 불가피한 초과)의 초과 GK를 GK 부족
+        # 팀으로 우선 이동한다(받을 팀이 없으면 그대로 — 조기은퇴·필드 선수 맞교환 없음).
+        _gk3_excess_move(c, year, "겨울 이적시장")
     finally:
         _economy.end_fee_batch()
     conn.commit()
@@ -2457,19 +2462,17 @@ def _process_loan_returns(c, year):
     _extend_reason_ct = {"quota": 0, "host_grp": 0, "host_pos": 0, "cap": 0,
                          "gk_parent": 0, "gk_buy": 0, "gk_return": 0}
     # [2026-11-02 GK 3명 설계안 2] 원 소속팀 GK 인원(지금 명단 기준, 복귀가 처리될 때마다 +1)
-    _gk3_lr = _C_youth_age.GK3_LOAN_RETURN and not _sq2_on()
     _gk3_parent_gk: dict = {}
     _gk3_skip: set = set()
-    if _gk3_lr:
-        _gk3_skip = _gk3_skip_teams(c)
-        _gk_parents = sorted({r["on_loan_from_team_id"] for r in rows
-                              if r["position"] == "GK" and r["on_loan_from_team_id"]})
-        for _k in range(0, len(_gk_parents), 500):
-            _part = _gk_parents[_k:_k + 500]
-            for _r in c.execute(
-                    f"SELECT team_id, COUNT(*) FROM ai_players WHERE position='GK' AND team_id IN "
-                    f"({','.join('?' * len(_part))}) GROUP BY team_id", _part).fetchall():
-                _gk3_parent_gk[_r[0]] = _r[1]
+    _gk3_skip = _gk3_skip_teams(c)
+    _gk_parents = sorted({r["on_loan_from_team_id"] for r in rows
+                          if r["position"] == "GK" and r["on_loan_from_team_id"]})
+    for _k in range(0, len(_gk_parents), 500):
+        _part = _gk_parents[_k:_k + 500]
+        for _r in c.execute(
+                f"SELECT team_id, COUNT(*) FROM ai_players WHERE position='GK' AND team_id IN "
+                f"({','.join('?' * len(_part))}) GROUP BY team_id", _part).fetchall():
+            _gk3_parent_gk[_r[0]] = _r[1]
     for r in rows:
         _parent = r["on_loan_from_team_id"]
         _ext_ok = (_loan_yrs.get((r["id"], _parent, r["team_id"]), AI_LOAN_MAX_TOTAL_YEARS) + 1
@@ -2503,7 +2506,7 @@ def _process_loan_returns(c, year):
         if _bp is not None:
             _bought.append((r, _bp))
             continue
-        if _gk3_lr and r["position"] == "GK" and _parent not in _gk3_skip:
+        if r["position"] == "GK" and _parent not in _gk3_skip:
             # [2026-11-02 GK 3명 설계안 2] 복귀하면 원 소속팀 GK 4명 이상 → 연장 → 임대처 완전 이적 → 복귀
             if _gk3_parent_gk.get(_parent, 0) + 1 >= 4:
                 if _ext_ok:
@@ -2554,7 +2557,7 @@ def _process_loan_returns(c, year):
               f"{_extend_reason_ct['host_grp']} / 임대처 포지션마지막 "
               f"{_extend_reason_ct['host_pos']}) · 2년 상한으로 복귀 {_extend_reason_ct['cap']}"
               + (f" | GK3: 연장 {_extend_reason_ct['gk_parent']} · 임대처 완전 이적 {_extend_reason_ct['gk_buy']}"
-                 f" · 4명+ 복귀 {_extend_reason_ct['gk_return']}" if _gk3_lr else ""))
+                 f" · 4명+ 복귀 {_extend_reason_ct['gk_return']}"))
     _log_loan_buy_stats(year, _buy_ctx, _bought)
     rows = _returning
     if not rows:
@@ -3517,6 +3520,9 @@ def _prestige_scouting(c, year):
             else:
                 _tgt_ceiling = 43
             _swap_ok = not _dst_ceiling_excluded(weak["ovr"] or 0, _tgt_ceiling)
+            if not _swap_ok and target["position"] == "GK":
+                GK4_PATH_LOG["scout_fee_blocked"] += 1   # [2026-11-06 GK4_NEVER] 위 잠재력 발굴 스카우팅과 같은 규칙
+                continue
             if not _swap_ok:
                 _tgt_pos_n = sum(1 for _p in team_players.get(target["team_id"], ())
                                  if _p["position"] == target["position"])
@@ -3809,6 +3815,11 @@ def _prestige_potential_scouting(c, year):
             else:
                 _gem_ceiling = 43
             _swap_ok = (weak["ovr"] or 0) - _gem_ceiling <= _DST_CEIL_HARD_EXCLUDE
+            if not _swap_ok and gem["position"] == "GK":
+                # [2026-11-06 GK4_NEVER] GK는 1:1 GK 맞교환일 때만 — 이적료만 주는 영입은 받는 팀 GK를 늘리고
+                # 보내는 팀 GK를 줄이므로 취소한다(필드 선수로 바꾸지 않는다).
+                GK4_PATH_LOG["scout_fee_blocked"] += 1
+                continue
             if not _swap_ok and _pos_count_by_tid.get(
                     (gem["team_id"], gem["position"]), 0) < 2:
                 continue        # 맞교환도 안 되고, 빼면 그 포지션이 비는 팀 — 건너뛴다
@@ -3907,6 +3918,19 @@ _REPLACEMENT_STAR_PROB = {
 # 몰아주는 구조라, grade 전체 평균은 크게 안 바뀌면서 "어느 팀에 쏠리는가"
 # 만 명문 순서대로 재배치된다.
 _PRESTIGE_STAR_MULT = {3: 4.0, 2: 2.5, 1: 1.5}  # 비명문(레벨0)은 기본 0.5
+
+# [2026-11 신설, 신민용 확정 — 월드클래스 인원 장기 유지(97+ 35~45)] 원인 분리 실측(새 월드 20시즌 × 2시드,
+# 시작 생성 수정 후): 시작 세대 유입은 8시즌째에 끝나고, 시즌 중 세대 유입이 11~20시즌 시즌당 약 8~9명 ×
+# 97+ 유지 약 6.6년(진입 23.8세 → 이탈 30.4세)이라 97+가 20시즌째 53~72명까지 계속 올랐다. 그 유입의 35~40%가
+# 빅5 1부 "비명문" 팀 은퇴대체·보충 신인(월드클래스 재목 확률 0.14 × 0.5 = 7%, 그중 80%가 잠재력 97+)에서
+# 나왔다(명문3 35~40%, 명문1·2 나머지). 하위 리그 원석(와일드카드)은 도달률 3%(138명 중 4명)라 영향 없음,
+# 잠재력 상승 경로도 10시즌 0~3명. 그래서 일괄 인하 대신 비명문 팀의 "월드클래스 재목" 몫만 줄이고 그만큼을
+# 엘리트 재목으로 옮긴다 — 스타 총확률(유망주 생성량)은 그대로, 월드클래스는 명문에 몰린다.
+# 키 = prestige_level(0 = 비명문), 값 = 월드클래스 확률에 곱하는 배율. 표에 없는 등급은 그대로.
+_PRESTIGE_WC_ONLY_MULT = {0: 0.2}
+
+# [2026-11-03 신설] 정상 범위(인원 상한 미만) 팀의 GK 부족은 맞바꾸지 않고 추가 — _rebalance_squad_sizes의 같은 이름 주석.
+GK_ADD_WHEN_ROOM = True
 
 
 # [2026-10 신설, 신민용 확정 — 국적 구조 2단계] 시즌 중 생성 5경로(은퇴대체·스쿼드 보충·
@@ -4145,7 +4169,14 @@ def _prestige_star_prob(grade, plvl):
     from database import star_rule_grade
     p_world, p_elite = _REPLACEMENT_STAR_PROB.get(star_rule_grade(grade), (0.0, 0.0))
     mult = _PRESTIGE_STAR_MULT.get(plvl, 0.5)
-    return min(1.0, p_world * mult), min(1.0, p_elite * mult)
+    pw, pe = min(1.0, p_world * mult), min(1.0, p_elite * mult)
+    # [2026-11 월드클래스 인원] 월드클래스 재목 확률만 명문 등급별로 따로 깎고, 깎은 몫은 엘리트로 옮긴다
+    # (스타 총확률·유망주 층은 그대로) — _PRESTIGE_WC_ONLY_MULT 주석 참고.
+    _wm = _PRESTIGE_WC_ONLY_MULT.get(plvl or 0)
+    if _wm is not None and pw > 0:
+        _cut = pw * (1.0 - _wm)
+        pw, pe = pw - _cut, min(1.0, pe + _cut)
+    return pw, pe
 
 
 def _retire_and_replace(c, year, ai_rows=None):
@@ -7050,9 +7081,8 @@ def _upward_transfer_pull(c, year):
     # 팀별 포지션 인원 — "빼면 그 포지션이 0명이 되는 선수"는 안 건드린다
     # (이 파일이 이적시장에서 이미 지키는 불변식과 같은 원칙).
     pos_n: dict = {}
-    # [2026-11-02 GK 3명 설계안 1] V3.1 GK 3명 원칙을 판매 제한(후보 조건)·유입 제한(목적지 조건)으로 나눈다.
-    _up_gk_sale = _gk3_sale_on()
-    _up_gk_in = _gk3_inflow_on()
+    # [2026-11-02 GK 3명 원칙, 2026-11-06 취소 방식 확정] 판매 보호: GK 3명 이하 팀의 GK가 후보 순위에 올라도 처리 시점에
+    # 이동을 취소한다(후보에서 미리 빼지 않는다). 유입 제한: GK 3명 이상 팀은 GK를 받는 목적지가 아니다.
     for r in rows:
         _k = (r["team_id"], r["position"])
         pos_n[_k] = pos_n.get(_k, 0) + 1
@@ -7087,8 +7117,6 @@ def _upward_transfer_pull(c, year):
             _n_stage_cand += 1
         if pos_n.get((r["team_id"], r["position"]), 0) < 2:
             continue
-        if _up_gk_sale and r["position"] == "GK" and pos_n.get((r["team_id"], "GK"), 0) <= _V31_GK_KEEP:
-            continue    # [2026-10-31 V3.1] GK 3명 이하 팀의 GK는 이 일방 통로로 빼 가지 않는다
         # 점수: 초과분이 주축이고, 거기에 ①이 요구한 나머지 축을 얹는다.
         #  · 출전시간/경기력 — 실제로 뛰면서 증명한 선수를 먼저 데려간다.
         #    기록이 아예 없으면 중립(0) — 갓 생성된 신인을 벌주지 않는다.
@@ -7142,9 +7170,11 @@ def _upward_transfer_pull(c, year):
         src_tid = r["team_id"]
         sm = meta[src_tid]
         _up_is_gk = r["position"] == "GK"
-        _up_gk = (_up_gk_sale or _up_gk_in) and _up_is_gk   # GK 인원 추적이 필요한가
-        if _up_gk_sale and _up_is_gk and pos_n.get((src_tid, "GK"), 0) <= _V31_GK_KEEP:
-            continue    # [2026-10-31 V3.1] 처리 시점에 GK가 3명 이하로 줄었으면 빼 가지 않는다
+        _up_gk = _up_is_gk   # GK 인원 추적이 필요한가
+        if _up_is_gk and pos_n.get((src_tid, "GK"), 0) <= _V31_GK_KEEP:
+            # [2026-11-06] GK 3명 이하 팀의 GK — 이 자리는 비운다(다른 후보로 채우지 않음 — 후보 수는 GK 포함 그대로)
+            GK3_CANCEL_LOG["upward"] += 1
+            continue
         _ovr = r["ovr"] or 0
         _nat = r["nationality"] or ""
         # 이 선수를 소화할 수 있는 팀 = 설계 상한이 선수 OVR 이상.
@@ -7177,7 +7207,7 @@ def _upward_transfer_pull(c, year):
                 continue
             if _taken_dst.get(t, 0) >= 2:
                 continue        # 한 팀이 이 통로로 한 시즌에 3명 이상은 안 받는다
-            if _up_gk_in and _up_is_gk and pos_n.get((t, "GK"), 0) >= _V31_GK_INFLOW_CAP:
+            if _up_is_gk and pos_n.get((t, "GK"), 0) >= _V31_GK_INFLOW_CAP:
                 continue        # [2026-10-31 V3.1] GK 3명 이상 팀은 GK를 받지 않는다
             if _nat and not _fq_can_take(t, _nat):
                 continue
@@ -7388,15 +7418,14 @@ _DEMAND_W_TABLE = _build_pos_weight_table(_fl_position_demand_weight,
                                           POSITION_DEMAND_STRENGTH)
 
 
-# [2026-10-31 신설, 신민용 승인 — V3.1 GK 3명 원칙] GK 기준 인원 2 → 3 표(3번째 GK를 초과 선수로 보지 않는다).
-# 수요 표의 GK 3명 이상 칸은 0 — GK 3명 이상 팀은 일반 이적시장에서 GK를 받는 목적지가 되지 않는다
+# [2026-10-31 신설, 신민용 승인 — V3.1 GK 3명 원칙] GK 기준 인원 2 → 3 수요 표(3번째 GK를 초과 선수로 보지 않는다 —
+# 판매 쪽은 2026-11-06 취소 방식 확정으로 기본 표 그대로). 수요 표의 GK 3명 이상 칸은 0 — GK 3명 이상 팀은 일반 이적시장에서 GK를 받는 목적지가 되지 않는다
 # (_do_one_transfer_cached: 후보 전부 0이면 이적 없음). 맞교환으로 돌아가는 GK는 인원이 그대로라 예외.
 def _v31_gk_row(fn, strength, block_from=None):
     return [(0.0 if (block_from is not None and _c >= block_from) else 1.0 + strength * (fn(_c, 3) - 1.0))
             for _c in range(_POS_CNT_CAP + 1)]
 
 
-_SELL_W_TABLE_V31 = [_v31_gk_row(_fl_position_sell_weight, POSITION_SELL_STRENGTH)] + _SELL_W_TABLE[1:]
 _DEMAND_W_TABLE_V31 = ([_v31_gk_row(_fl_position_demand_weight, POSITION_DEMAND_STRENGTH, block_from=3)]
                        + _DEMAND_W_TABLE[1:])
 _V31_GK_KEEP = 3            # GK 이 인원 이하 팀의 GK는 일반 판매 대상이 아니다
@@ -7409,8 +7438,8 @@ _V31_GK_INFLOW_CAP = 3      # GK 이 인원 이상 팀은 GK 일방 영입 목�
 #   수요  c < t: 1 + 3(t−c)/t (기존과 같음) / c ≥ t: 1 / (1 + 1.5·(c−t+1)/t) — 목표에 도달하면 바로 억제
 #   판매  c ≤ t: max(0.3, c/t) (기존 보호, c=0이면 0.3) / c > t: 1 + (c−t)/t (기존과 같음)
 #   목표 0 포지션: 수요·판매 모두 중립 1.0
-#   강도 계수(POSITION_*_STRENGTH)는 기존과 같다. GK는 이 표를 쓰지 않는다 — V3.1 GK 행(_SELL_W_TABLE_V31[0]·
-#   _DEMAND_W_TABLE_V31[0])과 GK 3명 원칙(판매 후보 제외·영입 목적지 제외·맞교환 예외) 그대로.
+#   강도 계수(POSITION_*_STRENGTH)는 기존과 같다. GK는 이 표를 쓰지 않는다 — GK 수요 행(_DEMAND_W_TABLE_V31[0])과
+#   GK 3명 원칙(판매 보호 = 뽑히면 취소·영입 목적지 제외·맞교환 예외) 그대로.
 #   FW = ST + CF: 인원 집계·1명 남은 포지션 보호·가중치 모두 ST와 CF를 한 칸(FW)으로 본다.
 #   판매 후보 자격·맞교환·다른 이적 경로·생성 규칙은 그대로이고, 목표 초과 선수를 강제로 팔지 않는다.
 _V31_TGT_MAX = 16
@@ -7454,7 +7483,7 @@ def _v31_team_target_vec(formation, n):
 def _grp_keep_min(grp):
     """은퇴대체 영입이 '이 팀에서 빼 오면 안 되는' 포지션 그룹 인원 기준 — 이 수 이하면 후보에서 제외.
     예전엔 모든 그룹 1(마지막 1명 보호). [2026-10-31 V3.1] GK 그룹은 3(GK 3명 원칙)."""
-    return _V31_GK_KEEP if (grp == "GK" and _gk3_sale_on()) else 1   # [2026-11-02] V3.1 → 판매 제한 스위치
+    return _V31_GK_KEEP if grp == "GK" else 1   # [2026-11-02 GK 3명 원칙]
 
 
 # ══════════════════════════════════════════════════════════════
@@ -7737,8 +7766,7 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
     _cnt = [0, 0, 0, 0]
     # [2026-09 신설] 세부 포지션 인원 — 위 _SLOT_POS_ORDER 주석 참고.
     _v31 = _sqv31_on()
-    _gk_in = _gk3_inflow_on()     # [2026-11-02 GK 3명 설계안 1] 유입 제한(V3.1이면 켜짐)
-    _gk_sale = _gk3_sale_on()     # [2026-11-02 GK 3명 설계안 1] 판매 제한(V3.1이면 켜짐)
+    _gk_cancel_ids = ()   # [2026-11-06 GK 판매 보호] GK 3명 이하 팀의 GK — 후보에서 빼지 않고, 뽑히면 이동 취소
     # [2026-10-31 V3.1 팀별 목표] 호출부가 팀 목표 벡터를 넘기면 CF도 FW(ST 칸)로 센다.
     _v31t = _v31 and tgt_by_tid is not None
     _spi = _SLOT_POS_IDX_V31 if _v31t else _SLOT_POS_IDX
@@ -7786,10 +7814,10 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
                 eligible = [p for p in eligible if p["id"] not in _prot_pos_ids]
     # [2026-10-31 V3.1 — GK 3명 원칙] GK 3명 이하 팀의 GK는 일반 판매 후보가 아니다. 이 팀 GK는 같은 포지션
     # 맞교환(이 팀이 GK를 받는 쪽일 때 돌려보내는 선수)으로만 나간다. 후보가 통째로 비면 위와 같이 적용 안 함.
-    if _gk_sale and eligible and _scnt[0] <= _V31_GK_KEEP:
-        _gk_ids = {p["id"] for p in eligible if p["position"] == "GK"}
-        if _gk_ids and len(_gk_ids) < len(eligible):
-            eligible = [p for p in eligible if p["id"] not in _gk_ids]
+    if eligible and _scnt[0] <= _V31_GK_KEEP:
+        # [2026-11-06] 후보·가중치는 판매 보호가 없을 때와 똑같이 두고, 뽑힌 선수가 이 GK면 아래에서 이동을 취소한다
+        # (호출부는 이 자리를 다른 선수로 다시 뽑지 않는다 — 팀별 유출 목표 반복 1회가 그냥 빈다).
+        _gk_cancel_ids = {p["id"] for p in eligible if p["position"] == "GK"}
     # (매우 드문 극단적 예외: 팀 전체가 포지션 그룹당 딱 1명씩이라 위
     # 필터가 eligible을 통째로 비워버리는 경우엔 적용하지 않는다 —
     # 이적 자체가 완전히 멈추는 것보다는 기존 동작이 낫다.)
@@ -7830,8 +7858,7 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
         # 내내 불변이라, 후보마다 표를 두 단계로 타는 대신 여기서 슬롯별
         # 배율을 한 번(10칸)만 펼쳐둔다. 맨 뒤 칸은 중립(1.0)이라
         # _SLOT_TARGETS 밖 포지션은 아래 dict.get 기본값으로 바로 온다.
-        # [2026-11-02] V3.1 판매 표는 GK 행만 다르다(나머지 행은 같은 리스트) → 판매 제한 스위치로 고른다.
-        _sw_tbl = _SELL_W_TABLE_V31 if _gk_sale else _SELL_W_TABLE
+        _sw_tbl = _SELL_W_TABLE
         _sellw = [_sw_tbl[_i][_scnt[_i] if _scnt[_i] <= _POS_CNT_CAP
                               else _POS_CNT_CAP]
                   for _i in range(_N_SLOT_POS)]
@@ -7939,6 +7966,9 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
                     w *= _interp_pts(_SHORTFALL_SELL_PTS, _sf)
             weights[i] = w
         mover = random.choices(eligible, weights=weights, k=1)[0]
+    if _gk_cancel_ids and mover["id"] in _gk_cancel_ids:
+        GK3_CANCEL_LOG["market"] += 1
+        return None   # [2026-11-06 GK 판매 보호] GK 3명 이하 팀의 GK가 뽑혔다 — 다른 선수로 바꾸지 않고 이 이동을 취소
 
     # [2026-08 신설, 신민용 요청: "사우디·미국 1부 위주로 가는 그림"]
     # 나이 든(30세+) 선수가 최상위권 리그를 떠나는 경우, 이 풀이 있으면
@@ -8200,9 +8230,9 @@ def _do_one_transfer_cached(src, dst_pool_tids, team_players, team_avg, year, pr
     _v31_gk_mover = False
     _dtt = None     # [2026-10-31 V3.1 팀별 목표] 목적지 팀 목표 벡터(GK 밖 포지션 mover만)
     if pos_count_by_tid is not None and _mv_si >= 0:
-        # [2026-11-02] V3.1 수요 표도 GK 행만 다르다(나머지 행은 같은 리스트) → 유입 제한 스위치로 고른다.
-        _dw = (_DEMAND_W_TABLE_V31 if _gk_in else _DEMAND_W_TABLE)[_mv_si]
-        _v31_gk_mover = _gk_in and (_mv_si == 0)
+        # [2026-11-02 GK 유입 제한] 수요 표는 GK 행만 다르다(나머지 행은 같은 리스트).
+        _dw = _DEMAND_W_TABLE_V31[_mv_si]
+        _v31_gk_mover = _mv_si == 0
         if _v31t and _mv_si != 0:
             _dtt = tgt_by_tid
         _pc = pos_count_by_tid
@@ -8610,14 +8640,13 @@ def _gen_topup_rows(c, tid, tier, cname, continent, tname, grade, need,
         # [2026-10-30 2차 수정] GK는 실제 명단(임대 온 선수 포함, 임대 보낸 선수 제외) 한 가지로만 센다 —
         # 장기 보유 기준(임대 온 GK 제외)으로 부족분을 뽑으면 명단 GK 3명 팀이 4번째 GK를 뽑았다.
         _sq_have["GK"] = _sq_gk_now
-    _gk3_tc = bool(getattr(_sq_c, "GK3_TOPUP_CAP", False))   # [2026-11-02 보충 GK 상한] 꺼져 있으면 예전과 같다
     for _i in range(need):
         _sq_cov_need = [p for p in _sq_cover if _sq_have[p] == 0]
         if _sq_gk_now < _sq_c.SQUAD_TARGET_MIN_AVAILABLE_GK:
             _tp = "GK"                             # 확정 보충(난수 미소비)
         elif _sq_cov_need:
             _tp = _sq_cov_need[0]                  # [2026-10-30 2차] 필수 대비 확정(난수 미소비)
-        elif _gk3_tc and _sq_gk_now >= 3:
+        elif _sq_gk_now >= 3:
             # [2026-11-02 보충 GK 상한] 명단 GK 3명 이상 — 추첨용 보유 수의 GK만 max(소유, 명단)으로 본다.
             # 계측(GK3_TOPUP_LOG): 같은 난수 상태로 상한 없는 선택을 먼저 계산하고 난수 상태를 되돌린다
             # (실제 난수 흐름은 상한 있는 선택 1번과 같다).
@@ -8644,10 +8673,9 @@ def _gen_topup_rows(c, tid, tier, cname, continent, tname, grade, need,
             pos = roll_bench_position()
             # [2026-10-30 2차 수정] 목표표가 못 고른 예비 추첨도 명단 GK가 3명이면 GK를 뽑지 않는다.
             # [2026-10-31] V3도 같다(4번째 GK를 만들지 않는다).
-            while (alts is not None or _sqv3_on() or _gk3_tc) and pos == "GK" and _sq_gk_now >= 3:
+            while pos == "GK" and _sq_gk_now >= 3:
                 pos = roll_bench_position()
-                if _gk3_tc:
-                    GK3_TOPUP_LOG["fallback_reroll"] += 1   # [2026-11-02 보충 GK 상한]
+                GK3_TOPUP_LOG["fallback_reroll"] += 1   # [2026-11-02 보충 GK 상한]
             if pos == "GK":
                 _sq_gk_now += 1
         elif _tp == "FW":
@@ -8766,6 +8794,90 @@ def _sq_gk_swap_donor(roster, formation, alts=None):
             continue
         if best is None or ex > best[0]:
             best = (ex, min(cands, key=lambda t: t[1]))
+    return best[1] if best else None
+
+
+# [2026-11-06 신설, 신민용 확정] GK 2명 두 오프시즌 연속 금지.
+# meta에 "직전 오프시즌이 끝났을 때 GK가 3명 미만이던 팀"을 {"year": 그 오프시즌 year, "teams": [...]}로 남긴다
+# (reset_game_data가 지운다). 이번 오프시즌(year)에서는 year-1 기록만 "연속"으로 본다.
+_GK_SHORT_META_KEY = "gk_short_after_offseason"
+_GK_SHORT_LAST: dict = {}   # 마지막 오프시즌 끝 GK 3명 미만 분포 {GK 수: 팀 수} — 계측용
+
+
+def _gk_short_prev_teams(c, year):
+    """직전 오프시즌(year-1)이 끝났을 때 GK 3명 미만이던 팀 id 집합. 기록이 없거나 다른 해면 빈 집합."""
+    import json as _json
+    try:
+        row = c.execute("SELECT value FROM meta WHERE key=?", (_GK_SHORT_META_KEY,)).fetchone()
+    except Exception:
+        return set()
+    if not row or not row[0]:
+        return set()
+    try:
+        d = _json.loads(row[0])
+    except Exception:
+        return set()
+    if int(d.get("year", -999)) != int(year) - 1:
+        return set()
+    return {int(t) for t in d.get("teams", [])}
+
+
+def _gk_short_record(c, year):
+    """오프시즌 끝(모든 이동·보충 뒤)에 GK가 GK_MIN_AVAILABLE 미만인 팀을 기록 — 다음 오프시즌 연속 판정용.
+    군팀 제외, 선수 없는 팀 제외, 명단(team_id) 기준. 반환: {GK 수: 팀 수} (계측용)."""
+    import json as _json
+    import constants as _cc
+    mil = set()
+    try:
+        from military_service import get_military_team_ids as _gm
+        mil = set(_gm(c))
+    except Exception:
+        pass
+    gk: dict = {}
+    has: set = set()
+    for r in c.execute("SELECT team_id, position FROM ai_players WHERE team_id IS NOT NULL"):
+        has.add(r[0])
+        if r[1] == "GK":
+            gk[r[0]] = gk.get(r[0], 0) + 1
+    short = sorted(t for t in has if t not in mil and gk.get(t, 0) < _cc.GK_MIN_AVAILABLE)
+    c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
+              (_GK_SHORT_META_KEY, _json.dumps({"year": int(year), "teams": short})))
+    dist: dict = {}
+    for t in short:
+        dist[gk.get(t, 0)] = dist.get(gk.get(t, 0), 0) + 1
+    return dist
+
+
+def _sq_gk_force_donor(roster, formation):
+    """[2026-11-06 신설, GK 2명 연속 금지] 포메이션 목표 초과분이 없어 _sq_gk_swap_donor가 None일 때만 쓰는
+    강제 맞바꾸기 대상 — 선수가 가장 많은 필드 포지션(목표 포지션 기준, FW = ST+CF)에서 그 포지션 선발 인원 +
+    백업 1명을 남기고 남는 백업 중 OVR이 가장 낮은 선수. 동률이면 남길 인원 대비 초과가 큰 포지션, 그다음
+    목표 포지션 순서(CB, LB, RB, CDM, CM, CAM, LW, RW, FW). 등록 포지션 마지막 1명은 빼지 않는다(기존 맞바꾸기와
+    같은 규칙 — 아래 맞바꾸기 루프도 같은 조건으로 거른다). 반환: (pid, ovr, 등록 포지션) 또는 None."""
+    from squad_targets import REGISTERED_TO_TARGET, TARGET_POSITIONS, starter_counts
+    st = starter_counts(formation)
+    have: dict = {}
+    reg_cnt: dict = {}
+    for _pid, _pos, _ovr in roster:
+        reg_cnt[_pos] = reg_cnt.get(_pos, 0) + 1
+        _tp = REGISTERED_TO_TARGET.get(_pos)
+        if _tp:
+            have[_tp] = have.get(_tp, 0) + 1
+    best = None
+    for _i, _tp in enumerate(TARGET_POSITIONS):
+        if _tp == "GK":
+            continue
+        _keep = st.get(_tp, 0) + 1
+        _n = have.get(_tp, 0)
+        if _n <= _keep:
+            continue
+        cands = [(pid, ovr or 0, pos) for pid, pos, ovr in roster
+                 if REGISTERED_TO_TARGET.get(pos) == _tp and reg_cnt.get(pos, 0) > 1]
+        if not cands:
+            continue
+        _key = (_n, _n - _keep, -_i)
+        if best is None or _key > best[0]:
+            best = (_key, min(cands, key=lambda t: (t[1], t[0])))
     return best[1] if best else None
 
 
@@ -9124,8 +9236,7 @@ def _fill_offer_vacancies(year, team_ids=None, mode="vacancy"):
 # constants.WORLD_SQUAD_BY_FORMATION이 켜져 있을 때만 쓴다(꺼지면 예전 경로 그대로).
 #   · GK는 정확히 3명: 인원 상한 미만이면 필드 선수를 내보내지 않고 GK 추가, 꽉 찼으면 맞바꾸기
 #     (대비 인원 포함 목표표의 초과 칸에서만 — 주 포메이션 선발 칸·필수 대비를 비우지 않음).
-#     4명 이상이 된 팀은 자기 소속(임대 온 선수 제외) GK 중 OVR이 가장 낮은 선수를 GK가 3명 미만인
-#     같은 대륙 팀으로 보낸다(_gk_excess_redistribute). 받을 팀이 없으면 조기은퇴 처리.
+#     (4명 이상 팀 강제 재분배·마지막 정리는 불채택으로 제거 — GK 4명 이상 정리는 _gk3_excess_move 하나로 한다.)
 #   · 필수 대비 포지션(대체 포메이션 기준)이 0명이면 같은 방식(여유 있으면 추가, 꽉 찼으면 보호 규칙
 #     안에서 맞바꾸기). 맞바꿀 선수가 없으면 원인만 기록(성공으로 치지 않음).
 SQ2_LOG: dict = {}
@@ -9162,18 +9273,16 @@ def _sqv31_on():
     return bool(getattr(_cw, "SQUAD_BY_FORMATION_V31", False)) and not _sq2_on()
 
 
-def _gk3_inflow_on():
-    """[2026-11-02 GK 3명 설계안 1] 유입 제한 — constants.GK3_INFLOW_LIMIT 또는 V3.1(_sq2 경로가 켜져 있으면 False)."""
-    import constants as _cw
-    return (bool(getattr(_cw, "GK3_INFLOW_LIMIT", False))
-            or bool(getattr(_cw, "SQUAD_BY_FORMATION_V31", False))) and not _sq2_on()
+GK3_CANCEL_LOG = {"market": 0, "upward": 0}   # 이번 호출 단위 계측(취소된 이동 수)
+# [2026-11-06 GK4_NEVER] 입구 차단 계측(누적 — 측정 도구가 읽고 비운다): 1군 콜업 GK 차단, 스카우팅 이적료 영입 GK 차단,
+# 승강 물갈이에서 방출 대신 교체로 돌린 GK.
+GK4_PATH_LOG = {"callup_blocked": 0, "scout_fee_blocked": 0, "turnover_gk_kept": 0}
 
 
-def _gk3_sale_on():
-    """[2026-11-02 GK 3명 설계안 1] 판매 제한 — constants.GK3_SALE_LIMIT 또는 V3.1(_sq2 경로가 켜져 있으면 False)."""
-    import constants as _cw
-    return (bool(getattr(_cw, "GK3_SALE_LIMIT", False))
-            or bool(getattr(_cw, "SQUAD_BY_FORMATION_V31", False))) and not _sq2_on()
+def feeder_callup_gk_ok(parent_gk, source_gk):
+    """[2026-11-06 신설] 공급원(산하팀·나중의 U-21 등) → 1군 콜업에서 GK 1명을 더 올려도 되는가 — 공급원 종류와 무관한
+    공통 규칙: 모구단 GK가 3명 미만이고 공급원에 GK가 3명 이상(올린 뒤 2명 이상 남음)일 때만."""
+    return parent_gk < 3 and source_gk > 2
 
 
 def _sq_alt_map(c, formation_by_team):
@@ -9287,108 +9396,6 @@ def _sq2_fill_team(tid, roster, n, hi_size, formation, alts, grade, tier, cname,
     return rows, dels, gk_added, foreign_ct
 
 
-def _gk_excess_redistribute(c, year):
-    """[2026-10-30 2차] GK 4명 이상 팀 → 자기 소속 GK 중 OVR 최저부터 내보내 3명으로. 받을 곳은 GK 3명 미만
-    팀(같은 나라 → 같은 대륙 순, 그 안에서 팀 평균 OVR이 가까운 곳, 외국인 정원 안에서). 받을 팀이 없으면
-    조기은퇴(아카이브 후 삭제). 난수 미소비, 팀 id 순 결정론. 반환: 이동 수."""
-    if not _sq2_on():
-        return 0
-    from database import get_foreign_quota_range, is_roster_foreign
-    from constants import get_country_league_grade
-    teams = {}
-    for r in c.execute("""SELECT t.id, t.name, t.current_tier, cn.name, cn.continent
-                          FROM teams t JOIN leagues l ON t.league_id=l.id
-                          JOIN countries cn ON l.country_id=cn.id"""):
-        teams[r[0]] = (r[1], r[2] or 1, r[3], r[4] or "유럽")
-    mil = set()
-    try:
-        from military_service import get_military_team_ids as _gm
-        mil |= set(_gm(c))
-    except Exception:
-        pass
-    me = c.execute("SELECT current_team_id FROM my_player WHERE id=1").fetchone()
-    my_tid = me[0] if me and me[0] else None
-    try:
-        import team_plan as _tp
-        user_tids = set(_tp.user_team_ids())
-    except Exception:
-        user_tids = set()
-    gks: dict = {}
-    sums: dict = {}
-    for r in c.execute("SELECT id, team_id, position, ovr, nationality, on_loan_from_team_id, name, age, "
-                       "contract_end_year FROM ai_players WHERE team_id IS NOT NULL"):
-        s = sums.setdefault(r[1], [0, 0]); s[0] += r[3] or 0; s[1] += 1
-        if r[2] == "GK":
-            gks.setdefault(r[1], []).append(r)
-    avg = {t: (s[0] / s[1] if s[1] else 0) for t, s in sums.items()}
-    foreign: dict = {}
-    for r in c.execute("""SELECT ap.team_id, COUNT(*) FROM ai_players ap JOIN teams t ON ap.team_id=t.id
-                          JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
-                          WHERE ap.nationality != '' AND ap.nationality != cn.name GROUP BY ap.team_id"""):
-        foreign[r[0]] = r[1]
-    skip = mil | user_tids | ({my_tid} if my_tid else set())
-    need = {t: 3 - len(gks.get(t, [])) for t in teams if t not in skip and len(gks.get(t, [])) < 3}
-    moves, logs, retire = [], [], []
-    _srow = c.execute("SELECT current_season FROM season_state WHERE id=1").fetchone()
-    _season = _srow[0] if _srow else 1
-    for tid in sorted(teams):
-        if tid in skip:
-            continue
-        lst = gks.get(tid, [])
-        excess = len(lst) - 3
-        if excess <= 0:
-            continue
-        own = sorted([r for r in lst if not r[5]], key=lambda r: (r[3] or 0, r[0]))
-        if len(own) < excess:
-            SQ2_LOG["gk_redist_no_own"] += excess - len(own)
-        _n, _tier, cname, cont = teams[tid]
-        for p in own[:excess]:
-            best = None
-            for dt, nd in need.items():
-                if nd <= 0 or dt == tid:
-                    continue
-                dn, dtier, dcn, dcont = teams[dt]
-                if dcont != cont:
-                    continue
-                if is_roster_foreign(p[4], dcn):
-                    _q = get_foreign_quota_range(dcn, dcont, tier=dtier)[1]
-                    if foreign.get(dt, 0) >= _q:
-                        continue
-                key = (0 if dcn == cname else 1, abs((avg.get(dt, 0)) - (p[3] or 0)), dt)
-                if best is None or key < best[0]:
-                    best = (key, dt)
-            if best is None:
-                retire.append(p[0])
-                SQ2_LOG["gk_redist_retired"] += 1
-                continue
-            dt = best[1]
-            dn, dtier, dcn, dcont = teams[dt]
-            need[dt] -= 1
-            if is_roster_foreign(p[4], dcn):
-                foreign[dt] = foreign.get(dt, 0) + 1
-            _g = get_country_league_grade(dcn)
-            _sal = _calc_ai_salary(_g, dtier, p[3], dcn, dn, dt, year)
-            _cend = max(p[8] or 0, year + 1)
-            moves.append((dt, _sal, _cend, year, p[0]))
-            logs.append((_season, year, p[0], p[6] or "", "GK", p[7] or 0, p[3], tid, dt, 0, 0, 0.0, 0.0,
-                         "GK 정원 정리 이적", 0, "", 0, 0, 0, _sal, _cend))
-            SQ2_LOG["gk_redist_moved"] += 1
-    if moves:
-        c.executemany("UPDATE ai_players SET team_id=?, salary=?, contract_end_year=?, last_transfer_year=? "
-                      "WHERE id=?", moves)
-        c.executemany(
-            """INSERT INTO ai_transfer_log(
-                season, year, player_id, player_name, player_position, player_age, player_ovr,
-                from_team_id, to_team_id, from_team_prestige, to_team_prestige,
-                from_team_avg_ovr, to_team_avg_ovr, transfer_type, is_mid_season, player_role,
-                fee, is_loan, loan_return_year, salary, contract_end_year)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", logs)
-    if retire:
-        _archive_forced_out_players(c, retire, year)
-        c.executemany("DELETE FROM ai_players WHERE id=?", [(i,) for i in retire])
-    return len(moves)
-
-
 def _gk3_skip_teams(c):
     """[2026-11-02 GK 3명 설계안 2] 자동 GK 관리 제외 팀 — 군팀·사용자 감독 팀·내 소속팀."""
     skip = set()
@@ -9409,29 +9416,53 @@ def _gk3_skip_teams(c):
 
 
 GK3_LOG: dict = {}
+GK3_FEE_LOG = {"n": 0, "sum": 0}   # [2026-11-07] 제대 복귀 정리 이적료 기록 계측(측정 도구가 비운다)
 # [2026-11-02 보충 GK 상한 계측] _gen_topup_rows가 쌓는다(로그용 — 동작과 무관). 측정 도구가 읽고 비운다.
 import collections as _collections_gk3
 GK3_TOPUP_LOG = _collections_gk3.Counter()
 
 
+def _gk_keep_value(ovr, age, potential):
+    """[2026-11-03] 초과 GK 정리에서 "이 팀이 남기고 싶은 정도". 현재 OVR이 기본(주전 경쟁력), 23세 이하는 성장 여지
+    ((잠재력 − OVR)/2, 최대 +4), 32세 이상은 한 살마다 −1(최대 −4). 값이 가장 낮은 GK가 이적 후보가 된다."""
+    o = ovr or 0
+    a = age or 0
+    v = float(o)
+    if a <= 23 and potential:
+        v += min(4.0, max(0.0, (potential - o) / 2.0))
+    if a >= 32:
+        v -= min(4.0, float(a - 31))
+    return v
+
+
 def _gk3_excess_move(c, year, stage=""):
-    """[2026-11-02 신설, 신민용 승인 — GK 3명 설계안 2, constants.GK3_EXCESS_MOVE] GK 4명 이상 팀의 초과 GK를
-    GK 3명 미만 팀으로 옮긴다. _gk_excess_redistribute(2차 스위치용)와 달리 받을 곳이 없으면 그대로 보유한다
-    (조기은퇴·삭제 없음). 보내는 선수 = 그 팀 소유 GK(임대로 와 있는 선수 제외) 중 OVR 낮은 순.
+    """[2026-11-02 신설, 신민용 승인 — GK 3명 설계안 2] GK 4명 이상 팀의 초과 GK를
+    GK 3명 미만 팀으로 옮긴다. 받을 곳이 없으면 그대로 보유한다
+    (조기은퇴·삭제 없음). 보내는 선수 = 그 팀 소유 GK(임대로 와 있는 선수 제외) 중 _gk_keep_value 낮은 순
+    (새로 영입한 선수·임대 복귀·제대 복귀 중 누구를 내보낼지 미리 정하지 않는다 — 경쟁력·나이·성장 여지로만 판단).
     받는 팀 = GK 3명 미만 · 인원 상한(_squad_min_max) 미만 · 외국인 상한(진짜 국적 기준) 안 · 리그 수준 맞음
     (설계 OVR 하한보다 _DST_FLOOR_HARD_EXCLUDE 넘게 낮거나 상한보다 _DST_CEIL_HARD_EXCLUDE 넘게 높으면 제외 —
     이적시장과 같은 기준) · 산하팀이면 유스 나이 이하. 우선순위: 같은 나라 → 같은 대륙 → 다른 대륙, 그 안에서
     팀 평균 OVR과 가까운 곳, 팀 id. 군팀·사용자 감독 팀·내 소속팀은 보내는 쪽·받는 쪽 모두 제외. 난수 미사용.
+
+    [2026-11-06 신설, 신민용 확정 — GK4_NEVER, 2026-11-06 채택] "리그 팀 GK 4명 이상은 절대 없음":
+      · 보내는 쪽 제외는 군팀·사용자 감독 팀만(내 소속팀의 AI GK도 정리 대상). 받는 쪽 제외는 그대로.
+      · 위 조건으로 받을 팀이 없으면 리그 수준(설계 OVR 하한·상한) 조건만 풀고 다시 찾는다(인원 상한·외국인 상한·
+        산하팀 나이는 그대로) — "밀린 선수는 다른 리그·하위 부수로 갈 곳이 많다".
+      · 최소 인원 때문에 보내지 못하던 경우(오프시즌 끝·겨울 이적시장 뒤)는 받는 팀과 1:1 맞교환 — 받는 팀은 선수가
+        가장 많은 필드 포지션의 백업(선발 + 백업 1명 남김, _sq_gk_force_donor)을 돌려보낸다. 양쪽 인원 그대로.
+      · 그래도 갈 곳이 없으면 보유하고 unresolved로 센다(조기은퇴·삭제 없음 — 검증에서 0인지 확인).
     반환: 이동 수."""
-    if not (_C_youth_age.GK3_EXCESS_MOVE and not _sq2_on()):
-        return 0
     from database import get_foreign_quota_range, is_roster_foreign
     from constants import get_country_league_grade, get_ovr_range
     # 호출(연도·단계)마다 새로 센다 — 마지막 호출 결과만 남는다(로그용, 동작과 무관).
     log = GK3_LOG[stage or "all"] = {"moved": 0, "kept": 0, "src_teams": 0,
                                      "dst_same_country": 0, "dst_same_cont": 0, "dst_other": 0,
                                      "kept_min": 0}
-    _final = stage == "오프시즌 끝"   # 스쿼드 보충 뒤라 보낸 팀이 최소 인원 밑으로 내려가면 다시 채울 기회가 없다
+    # 스쿼드 보충 뒤라 보낸 팀이 최소 인원 밑으로 내려가면 다시 채울 기회가 없다(겨울 이적시장 뒤도 보충이 없다)
+    _final = stage in ("오프시즌 끝", "겨울 이적시장")
+    _mil_fee = stage == "제대 복귀"   # [2026-11-07 채택] 제대 복귀 정리 이적료 기록
+    log.update({"relaxed": 0, "swapped": 0, "unresolved": 0})
     teams = {}
     for r in c.execute("""SELECT t.id, t.name, t.current_tier, cn.name, cn.continent
                           FROM teams t JOIN leagues l ON t.league_id=l.id
@@ -9444,7 +9475,7 @@ def _gk3_excess_move(c, year, stage=""):
     own_gk: dict = {}
     foreign: dict = {}
     for r in c.execute("SELECT id, team_id, position, ovr, nationality, on_loan_from_team_id, name, age, "
-                       "contract_end_year FROM ai_players WHERE team_id IS NOT NULL"):
+                       "contract_end_year, potential_ovr FROM ai_players WHERE team_id IS NOT NULL"):
         t = r[1]
         size[t] = size.get(t, 0) + 1
         sums[t] = sums.get(t, 0) + (r[3] or 0)
@@ -9458,7 +9489,19 @@ def _gk3_excess_move(c, year, stage=""):
     me = c.execute("SELECT current_team_id FROM my_player WHERE id=1").fetchone()
     if me and me[0] in size:
         size[me[0]] += 1          # 내 선수도 정원 한 자리(다른 정원 판정과 같게)
-    srcs = [t for t in sorted(teams) if t not in skip and gk_n.get(t, 0) >= 4]
+    # [2026-11-06 GK4_NEVER] 보내는 쪽은 군팀·사용자 감독 팀만 제외(내 소속팀 AI GK도 정리)
+    _src_skip = set()
+    try:
+        from military_service import get_military_team_ids as _gm4
+        _src_skip |= set(_gm4(c))
+    except Exception:
+        pass
+    try:
+        import team_plan as _tp4
+        _src_skip |= set(_tp4.user_team_ids())
+    except Exception:
+        pass
+    srcs = [t for t in sorted(teams) if t not in _src_skip and gk_n.get(t, 0) >= 4]
     if not srcs:
         return 0
     aff = _youth_aff(c)
@@ -9476,42 +9519,77 @@ def _gk3_excess_move(c, year, stage=""):
         return v
     dsts = [t for t in sorted(teams) if t not in skip and gk_n.get(t, 0) < 3 and size.get(t, 0) > 0]
     moves, logs = [], []
+    _swap_used: set = set()
+    _formation_of = dict(c.execute("SELECT id, formation FROM teams").fetchall())
+
+    def _nat_of(_pid):
+        _r = c.execute("SELECT nationality FROM ai_players WHERE id=?", (_pid,)).fetchone()
+        return (_r[0] if _r else "") or ""
     _srow = c.execute("SELECT current_season FROM season_state WHERE id=1").fetchone()
     _season = _srow[0] if _srow else 1
     for src in srcs:
         log["src_teams"] += 1
         _sn, _stier, s_cn, s_ct = teams[src]
-        for p in sorted(own_gk.get(src, []), key=lambda r: (r[3] or 0, r[0])):
+        # [2026-11-03 신민용 확정] 누가 나갈지는 미리 정하지 않는다(새로 영입한 선수·복귀한 선수 구분 없음) — 이 팀
+        # GK 중 "남길 가치"(_gk_keep_value: 현재 OVR + 젊은 선수의 성장 여지 − 노장 감점)가 가장 낮은 소유 GK부터.
+        for p in sorted(own_gk.get(src, []), key=lambda r: (_gk_keep_value(r[3], r[7], r[9]), r[0])):
             if gk_n.get(src, 0) <= 3:
                 break
+            _swap = False
             if _final and size.get(src, 0) - 1 < _info(src)[5]:
-                log["kept_min"] += 1   # 오프시즌 끝(보충 뒤): 보내면 최소 인원 미만 → 보유
-                break
+                _swap = True               # [2026-11-06 GK4_NEVER] 최소 인원 → 받는 팀과 1:1 맞교환
             o = p[3] or 0
             nat = p[4]
             age = p[7] or 0
-            best = None
-            for dt in dsts:
-                if gk_n.get(dt, 0) >= 3 or dt == src:
-                    continue
-                d_n, d_tier, d_cn, d_ct = teams[dt]
-                _g, cap, qhi, flo, fhi, _dmin = _info(dt)
-                if size.get(dt, 0) >= cap:
-                    continue
-                if is_roster_foreign(nat, d_cn) and (qhi is None or foreign.get(dt, 0) + 1 > qhi):
-                    continue
-                if flo is not None and (flo - o) > _DST_FLOOR_HARD_EXCLUDE:
-                    continue
-                if _dst_ceiling_excluded(o, fhi):
-                    continue
-                if aff and dt in aff and age > _YMAX:
-                    continue
-                tier_k = 0 if d_cn == s_cn else (1 if d_ct == s_ct else 2)
-                key = (tier_k, abs(sums.get(dt, 0) / max(1, size.get(dt, 1)) - o), dt)
-                if best is None or key < best:
-                    best = key
+
+            def _cands(relax):
+                out = []
+                for dt in dsts:
+                    if gk_n.get(dt, 0) >= 3 or dt == src:
+                        continue
+                    d_n, d_tier, d_cn, d_ct = teams[dt]
+                    _g, cap, qhi, flo, fhi, _dmin = _info(dt)
+                    if not _swap and size.get(dt, 0) >= cap:
+                        continue
+                    if is_roster_foreign(nat, d_cn) and (qhi is None or foreign.get(dt, 0) + 1 > qhi):
+                        continue
+                    if not relax:
+                        if flo is not None and (flo - o) > _DST_FLOOR_HARD_EXCLUDE:
+                            continue
+                        if _dst_ceiling_excluded(o, fhi):
+                            continue
+                    if aff and dt in aff and age > _YMAX:
+                        continue
+                    tier_k = 0 if d_cn == s_cn else (1 if d_ct == s_ct else 2)
+                    out.append((tier_k, abs(sums.get(dt, 0) / max(1, size.get(dt, 1)) - o), dt))
+                return sorted(out)
+
+            def _pick(relax):
+                cs = _cands(relax)
+                if not _swap:
+                    return (cs[0], None) if cs else (None, None)
+                for key in cs:   # 맞교환: 돌려보낼 필드 백업이 있는 첫 팀
+                    _dr = [(r2[0], r2[1], r2[2]) for r2 in c.execute(
+                        "SELECT id, position, ovr FROM ai_players WHERE team_id=?", (key[2],))
+                        if r2[0] not in _swap_used]
+                    _dn = _sq_gk_force_donor(_dr, _formation_of.get(key[2]))
+                    if _dn is None:
+                        continue
+                    _dnat = _nat_of(_dn[0])
+                    if is_roster_foreign(_dnat, s_cn) and (_info(src)[2] is None
+                                                           or foreign.get(src, 0) + 1 > _info(src)[2]):
+                        continue
+                    return key, (_dn, _dnat)
+                return None, None
+
+            best, _donor = _pick(False)
+            if best is None:
+                best, _donor = _pick(True)
+                if best is not None:
+                    log["relaxed"] += 1
             if best is None:
                 log["kept"] += 1
+                log["unresolved"] += 1
                 continue
             dt = best[2]
             log[("dst_same_country", "dst_same_cont", "dst_other")[best[0]]] += 1
@@ -9529,9 +9607,38 @@ def _gk3_excess_move(c, year, stage=""):
             _sal = _calc_ai_salary(_info(dt)[0], d_tier, o, d_cn, d_n, dt, year)
             _cend = max(p[8] or 0, year + 1)
             moves.append((dt, _sal, _cend, year, p[0]))
+            _fee = 0
+            if _mil_fee:
+                # [2026-11-07 채택, 신민용 확정] 제대 복귀 정리 — 원 소속팀 매각 이적료를 기록(정원 정리 매각과 같은
+                # 계산, 난수 없음). 이적 기록 fee 칸만 — AI 구단 예산·선수 가치는 바뀌지 않는다.
+                from economy import estimate_transfer_fee as _etf
+                _fee = _etf(_info(dt)[0], d_tier, o, country=d_cn, position="GK", year=year) or 0
+                GK3_FEE_LOG["n"] += 1
+                GK3_FEE_LOG["sum"] += _fee
             logs.append((_season, year, p[0], p[6] or "", "GK", age, o, src, dt, 0, 0, 0.0, 0.0,
-                         "GK 정원 정리 이적", 0, "", 0, 0, 0, _sal, _cend))
+                         "GK 정원 정리 이적", 0, "", _fee, 0, 0, _sal, _cend))
             log["moved"] += 1
+            if _donor is not None:
+                # [2026-11-06 GK4_NEVER] 맞교환 — 받는 팀 필드 백업이 보낸 팀으로(양쪽 인원 그대로)
+                (_dpid, _dovr, _dpos), _dnat = _donor
+                _swap_used.add(_dpid)
+                _dovr = _dovr or 0
+                size[src] += 1
+                size[dt] -= 1
+                sums[src] += _dovr
+                sums[dt] -= _dovr
+                if is_roster_foreign(_dnat, d_cn):
+                    foreign[dt] = foreign.get(dt, 0) - 1
+                if is_roster_foreign(_dnat, s_cn):
+                    foreign[src] = foreign.get(src, 0) + 1
+                _drow = c.execute("SELECT name, age, contract_end_year FROM ai_players WHERE id=?", (_dpid,)).fetchone()
+                _dsal = _calc_ai_salary(_info(src)[0], _stier, _dovr, s_cn, _sn, src, year)
+                _dcend = max((_drow[2] if _drow else 0) or 0, year + 1)
+                moves.append((src, _dsal, _dcend, year, _dpid))
+                logs.append((_season, year, _dpid, (_drow[0] if _drow else "") or "", _dpos,
+                             (_drow[1] if _drow else 0) or 0, _dovr, dt, src, 0, 0, 0.0, 0.0,
+                             "GK 정원 정리 이적(반대급부)", 0, "", 0, 0, 0, _dsal, _dcend))
+                log["swapped"] += 1
     if moves:
         c.executemany("UPDATE ai_players SET team_id=?, salary=?, contract_end_year=?, last_transfer_year=? "
                       "WHERE id=?", moves)
@@ -9542,108 +9649,9 @@ def _gk3_excess_move(c, year, stage=""):
                 from_team_avg_ovr, to_team_avg_ovr, transfer_type, is_mid_season, player_role,
                 fee, is_loan, loan_return_year, salary, contract_end_year)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", logs)
-    _perf_log(f"[GK3] {year}년 초과 GK 이동({stage}) {len(moves)}명 · 보유 {log['kept']} · 최소인원 보유 {log['kept_min']}")
+    _perf_log(f"[GK3] {year}년 초과 GK 이동({stage}) {len(moves)}명 · 보유 {log['kept']} · 최소인원 보유 {log['kept_min']}"
+              + f" · 수준 완화 {log['relaxed']} · 맞교환 {log['swapped']} · 미해결 {log['unresolved']}")
     return len(moves)
-
-
-def gk_count_violations(c):
-    """[2026-10-30 2차 수정] GK가 정확히 3명이 아닌 팀 [(team_id, GK 수)] — 군팀·사용자 감독 팀 제외,
-    선수가 없는 팀 제외. 명단(team_id) 기준."""
-    mil = set()
-    try:
-        from military_service import get_military_team_ids as _gm
-        mil = set(_gm(c))
-    except Exception:
-        pass
-    try:
-        import team_plan as _tp
-        mil |= set(_tp.user_team_ids())
-    except Exception:
-        pass
-    gk: dict = {}
-    has: set = set()
-    for r in c.execute("SELECT team_id, position FROM ai_players WHERE team_id IS NOT NULL"):
-        has.add(r[0])
-        if r[1] == "GK":
-            gk[r[0]] = gk.get(r[0], 0) + 1
-    return sorted((t, gk.get(t, 0)) for t in has if t not in mil and gk.get(t, 0) != 3)
-
-
-def _gk_final_balance(c, year):
-    """[2026-10-30 2차 수정] 시즌 전환의 선수 이동이 모두 끝난 뒤 전 팀 GK 정확히 3명.
-    ① 4명 이상 → 초과 GK를 GK 부족 팀으로(_gk_excess_redistribute, 받을 팀 없으면 조기은퇴)
-    ② 3명 미만 → 인원 상한 미만이면 GK 추가, 꽉 찼으면 보호 규칙 안에서 맞바꾸기(대비 인원 포함 목표표의
-       초과 칸에서만), 맞바꿀 선수가 없으면 기록. 반환: 남은 위반 팀 수."""
-    from constants import (CONTINENT_OVR_BONUS, COUNTRY_OVR_ADJ, get_country_league_grade,
-                           get_ovr_range, COUNTRY_LEAGUE_OVR_OVERRIDE)
-    from database import get_foreign_quota_range
-    from data.prestige_clubs import prestige_level as _plv
-    _gk_excess_redistribute(c, year)
-    short = [(t, g) for t, g in gk_count_violations(c) if g < 3]
-    if short:
-        info = {r[0]: (r[1], r[2] or 1, r[3], r[4] or "유럽", r[5]) for r in c.execute(
-            """SELECT t.id, t.name, t.current_tier, cn.name, cn.continent, t.formation
-               FROM teams t JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id""")}
-        roster: dict = {}
-        for r in c.execute("SELECT id, team_id, position, ovr FROM ai_players WHERE team_id IS NOT NULL"):
-            roster.setdefault(r[1], []).append((r[0], r[2], r[3]))
-        foreign: dict = {}
-        for r in c.execute("""SELECT ap.team_id, COUNT(*) FROM ai_players ap JOIN teams t ON ap.team_id=t.id
-                              JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
-                              WHERE ap.nationality != '' AND ap.nationality != cn.name GROUP BY ap.team_id"""):
-            foreign[r[0]] = r[1]
-        alts_map = None
-        new_rows, dels = [], []
-        for tid, g in short:
-            if tid not in info:
-                continue
-            tname, tier, cname, cont, form = info[tid]
-            grade = get_country_league_grade(cname)
-            rng = get_ovr_range(grade, tier, cname)
-            if rng:
-                lo, hi = rng
-                if cname not in COUNTRY_LEAGUE_OVR_OVERRIDE:
-                    b = round(CONTINENT_OVR_BONUS.get(cont, 0) + COUNTRY_OVR_ADJ.get(cname, 0))
-                    lo, hi = lo + b, hi + b
-            else:
-                lo, hi = 40, 55
-            ro = roster.get(tid, [])
-            n = len(ro)
-            cap = _squad_min_max(grade, tier)[1]
-            quota = get_foreign_quota_range(cname, cont, tier=tier)[1]
-            fct = foreign.get(tid, 0)
-            for _k in range(3 - g):
-                if n < cap:
-                    n += 1
-                    SQ2_LOG["gk_final_added"] = SQ2_LOG.get("gk_final_added", 0) + 1
-                else:
-                    if alts_map is None:
-                        alts_map = _sq_alt_map(c, {t: (v[4] or "4-4-2") for t, v in info.items()})
-                    donor = _sq_gk_swap_donor(ro, form or "4-4-2", alts_map.get(tid))
-                    if donor is None:
-                        SQ2_LOG["gk_final_no_donor"] = SQ2_LOG.get("gk_final_no_donor", 0) + 1
-                        break
-                    dels.append(donor[0])
-                    ro = [r for r in ro if r[0] != donor[0]]
-                    SQ2_LOG["gk_final_swap"] = SQ2_LOG.get("gk_final_swap", 0) + 1
-                row, fct = _sq_gen_swap_row(tid, "GK", grade, tier, cname, cont, tname, year, rng, lo, hi,
-                                            _plv(cname, tname), fct, quota,
-                                            roster_ovrs=[o for _i, _p, o in ro])
-                new_rows.append(row)
-        if new_rows:
-            c.executemany("""INSERT INTO ai_players
-                (team_id,name,position,stamina,speed,jump,strength,shooting,passing,
-                 dribbling,tackling,heading,positioning,setpiece,
-                 mental,confidence,leadership,concentration,ovr,age,sub_role,nationality,
-                 true_nationality,contract_end_year,last_transfer_year,created_year,potential_ovr,
-                 salary,creation_source)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", new_rows)
-        if dels:
-            _archive_forced_out_players(c, dels, year)
-            c.executemany("DELETE FROM ai_players WHERE id=?", [(i,) for i in dels])
-    left = gk_count_violations(c)
-    SQ2_LOG["gk_final_violations"] = len(left)
-    return len(left)
 
 
 def _rebalance_squad_sizes(c, year):
@@ -9723,7 +9731,55 @@ def _rebalance_squad_sizes(c, year):
     _sq_form, _sq_owned = _squad_target_inputs(c)     # [2026-10 확정] 포메이션·장기 보유 포지션
     import constants as _sq_cc
     _SQ_GK_SWAP_LOG.update({"done": 0, "no_donor": 0, "no_donor_cases": [],
-                            "excess_done": 0, "excess_no_donor": 0, "excess_over_max": 0})
+                            "excess_done": 0, "excess_no_donor": 0, "excess_over_max": 0,
+                            "force_done": 0, "force_no_donor": 0, "force_wait": 0, "force_added": 0,
+                            "force_cases": []})
+    # [2026-11-06 GK 2명 연속 금지] 이번 오프시즌 강제 대상 판정 재료 — 직전 오프시즌 끝 GK 3명 미만 팀,
+    # 사용자 구단(강제 맞바꾸기 제외).
+    _gkf_prev = _gk_short_prev_teams(c, year)
+    _gkf_user = set()
+    try:
+        import team_plan as _gkf_tp
+        _gkf_user = set(_gkf_tp.user_team_ids())
+    except Exception:
+        _gkf_user = set()
+
+    def _gkf_must(_tid):
+        """이번 오프시즌에 GK를 무조건 3명으로 맞춰야 하는 팀인가 — 직전 오프시즌 끝에도 3명 미만이었던 팀만.
+        [2026-11-06 2차, 신민용 확정] "GK 1명 이하 즉시 보충"은 제거 — 기존 보충(확정 보충·자리 있는 추가·맞바꾸기)과
+        오프시즌 끝 초과 GK 정리가 이미 오프시즌 끝 1명 이하 0팀을 만들고 있었고(OFF 실측), 즉시 보충은 새 GK만
+        더 만들어 난수 흐름을 바꿨다(5시즌 × 2시드 1차 검증)."""
+        if _tid in _gkf_user:
+            return False
+        return _tid in _gkf_prev
+
+    def _gkf_extra(_tid, _roster_now, _gk_have, _room, _tag):
+        """이 팀 처리(보충·조기은퇴·기존 맞바꾸기)가 다 끝난 뒤에도 GK가 3명에 못 미치면 (그냥 추가할 GK 수,
+        맞바꿔 내보낼 선수 목록) — 강제 대상 팀만. 인원 상한까지 자리(_room)가 있으면 먼저 추가(필드 선수 그대로),
+        나머지만 맞바꾼다. 첫 오프시즌인 GK 2명 팀은 (0, [])(기록만 — force_wait)."""
+        _need = _sq_cc.SQUAD_TARGET_MIN_AVAILABLE_GK - _gk_have
+        if _need <= 0:
+            return 0, []
+        if not _gkf_must(_tid):
+            _SQ_GK_SWAP_LOG["force_wait"] += 1
+            return 0, []
+        _add = max(0, min(_need, _room))
+        if _add:
+            _SQ_GK_SWAP_LOG["force_added"] = _SQ_GK_SWAP_LOG.get("force_added", 0) + _add
+        _need -= _add
+        _out = []
+        _work = list(_roster_now)
+        while len(_out) < _need:
+            _fd = _sq_gk_force_donor(_work, _sq_form.get(_tid))
+            if _fd is None:
+                _SQ_GK_SWAP_LOG["force_no_donor"] += 1
+                break
+            _out.append(_fd)
+            _work = [x for x in _work if x[0] != _fd[0]]
+            _SQ_GK_SWAP_LOG["force_done"] += 1
+            _SQ_GK_SWAP_LOG["force_cases"].append(
+                (_tid, _gk_have, len(_roster_now), _sq_form.get(_tid), _fd[2], _tag))
+        return _add, _out
     _sq2 = _sq2_on()                                    # [2026-10-30 2차]
     _sq_alts = _sq_alt_map(c, _sq_form) if _sq2 else {}
     topped_up = 0
@@ -9758,6 +9814,7 @@ def _rebalance_squad_sizes(c, year):
     _my_dest_ids = _pending_dest_team_ids(c) - ({_my_team_id} if _my_team_id else set())
 
     for tid, (tier, cname, continent, tname) in team_info.items():
+        _gkf_nr0, _gkf_dl0 = len(new_rows), len(delete_ids)   # [2026-11-06] 이 팀 처리분 시작 위치(아래 GK 강제 정리용)
         n = counts.get(tid, 0)
         grade = get_country_league_grade(cname)
         bonus = round(CONTINENT_OVR_BONUS.get(continent, 0) + COUNTRY_OVR_ADJ.get(cname, 0))
@@ -9781,6 +9838,11 @@ def _rebalance_squad_sizes(c, year):
         if tid == _my_team_id:
             _lo_size -= 1
             _hi_size -= 1
+        # [2026-11-03 신민용 확정 — 리그 팀 GK 무조건 3명] 아래 강팀 오퍼·이적 예정 목적지의 "내 자리 예약"(정원 −1)은
+        # GK 추가(GK_ADD_WHEN_ROOM)에는 적용하지 않는다 — 5시즌 × 2시드 실측에서 남은 GK 2명 팀이 전부 이 예약 팀이었다
+        # (25명/상한 26, 예약 때문에 상한 25로 보여 GK를 못 넣고, 넘치는 필드 포지션도 없어 맞바꾸기도 안 됨).
+        # 예약 자리에 GK가 들어간 뒤 내가 실제로 입단하면 입단 시 정원 정리(game_engine._make_room_on_join)가 맡는다.
+        _hi_size_gk = _hi_size
         if tid in _vacancy_team_ids:
             _lo_size -= 1
             _hi_size -= 1
@@ -9821,7 +9883,10 @@ def _rebalance_squad_sizes(c, year):
             # 후보에서 GK를 뺀다(계측: 조기은퇴가 GK 2명 팀의 GK를 내보내 1명이 되는 사례).
             _sq_gk_ids = {_pid for _pid, _ppos, _povr in roster if _ppos == "GK"}
             # [2026-10-31] V3: GK가 3명 미만으로 내려가지 않게 3명 이하면 보호.
-            if len(_sq_gk_ids) <= (3 if _sqv3_on() else 2):
+            # [2026-11-03 신민용 확정 — 리그 팀 GK 무조건 3명] V3가 꺼져 있어도 가용 GK 최소 인원(이제 3) 이하면 보호한다.
+            # 5시즌 × 2시드 실측: 강팀 오퍼 예약(정원 −1)으로 26명 팀이 1명 초과가 되자 OVR 최저인 3번째 GK가
+            # 조기은퇴로 빠지고, 넘치는 필드 포지션이 없어 GK를 다시 못 채워 2명으로 남았다.
+            if len(_sq_gk_ids) <= max(3 if _sqv3_on() else 2, _sq_cc.SQUAD_TARGET_MIN_AVAILABLE_GK):
                 _protected_max = _protected_max | _sq_gk_ids
             if _sq2:   # [2026-10-30 2차] GK 3명 이하·주 포메이션 선발 칸·필수 대비 포지션 보호
                 if len(_sq_gk_ids) <= 3:
@@ -10007,6 +10072,35 @@ def _rebalance_squad_sizes(c, year):
                 # 부족 포지션으로 지정하고, 포메이션 목표 대비 가장 초과한 필드 포지션의
                 # 최저 OVR 선수와 1:1로 맞바꾼다. 내보낼 선수가 없으면 아무도 빼지 않고 기록만.
                 # 그룹 판정이 이미 GK를 부족으로 잡은 경우(GK 0명 등)는 기존 경로 그대로.
+                # [2026-11-03 신설, 신민용 확정 — 리그 팀 GK 무조건 3명] 정상 범위 팀은 보충이 돌지 않아서, GK가 모자라도
+                # 맞바꿀 필드 선수(포메이션 목표 초과분)가 없으면 2명으로 남았다(5시즌 × 2시드 실측: 시즌마다 0~9팀,
+                # 전부 인원 22~25명 — 자리가 있는데도 못 채움). 인원 상한 미만이면 맞바꾸지 않고 GK를 그냥 추가한다
+                # (필드 선수는 그대로). 상한에 닿은 팀만 아래 기존 맞바꾸기.
+                _gk_have_now = len(group_players["GK"]) + _sq2_gk_added
+                if (GK_ADD_WHEN_ROOM and _gk_have_now < _sq_cc.SQUAD_TARGET_MIN_AVAILABLE_GK
+                        and not any(g == "GK" for g, _x in deficient) and len(roster) < _hi_size_gk):
+                    _ga_rng = get_ovr_range(grade, tier, cname)
+                    if _ga_rng:
+                        _ga_lo, _ga_hi = _ga_rng
+                        if not is_override:
+                            _ga_lo, _ga_hi = _ga_lo + bonus, _ga_hi + bonus
+                    else:
+                        _ga_lo, _ga_hi = 40, 55
+                    _ga_quota = get_foreign_quota_range(cname, continent, tier=tier)[1]
+                    _ga_fc = foreign_now.get(tid, 0)
+                    for _k in range(min(_sq_cc.SQUAD_TARGET_MIN_AVAILABLE_GK - _gk_have_now,
+                                        _hi_size_gk - len(roster))):
+                        _ga_row, _ga_fc = _sq_gen_swap_row(
+                            tid, "GK", grade, tier, cname, continent, tname, year,
+                            _ga_rng, _ga_lo, _ga_hi, _rebal_prestige_level(cname, tname),
+                            _ga_fc, _ga_quota, roster_ovrs=[_o for _pid, _p, _o in roster])
+                        new_rows.append(_ga_row)
+                        topped_up += 1
+                        _sq2_gk_added += 1
+                        _SQ_GK_SWAP_LOG["room_added"] = _SQ_GK_SWAP_LOG.get("room_added", 0) + 1
+                        if len(roster) + _k >= _hi_size:   # 예약 자리에 들어간 GK(계측용 — 동작과 무관)
+                            _SQ_GK_SWAP_LOG["room_added_reserved"] = _SQ_GK_SWAP_LOG.get("room_added_reserved", 0) + 1
+                    foreign_now[tid] = _ga_fc
                 if (len(group_players["GK"]) + _sq2_gk_added < _sq_cc.SQUAD_TARGET_MIN_AVAILABLE_GK
                         and not any(g == "GK" for g, _x in deficient)):
                     _sq_donor = _sq_gk_swap_donor(roster, _sq_form.get(tid),
@@ -10073,6 +10167,43 @@ def _rebalance_squad_sizes(c, year):
                         new_rows.append(_row)
                         topped_up += 1
                         forced_out += 1
+
+        # [2026-11-06 신설, 신민용 확정 — GK 2명 연속 금지] 이 팀 처리(보충·조기은퇴·기존 GK 추가/맞바꾸기·
+        # 포지션 스왑)가 다 끝난 뒤에도 GK가 3명 미만이면: 첫 오프시즌인 2명 팀은 그대로 두고(오프시즌 끝 기록 →
+        # 다음 오프시즌 판정), 직전 오프시즌 끝에도 3명 미만이었던 팀만 선수가 가장 많은 포지션의
+        # 백업(선발 + 백업 1명은 남김)을 모자라는 만큼 GK와 1:1로 맞바꾼다 — 인원 상한까지 자리가 남아 있으면
+        # (예: 최소 인원 보충 분기) 그만큼은 맞바꾸지 않고 그냥 추가한다.
+        _gkf_gone = set(delete_ids[_gkf_dl0:])
+        _gkf_cur = [r for r in roster_by_team.get(tid, []) if r[0] not in _gkf_gone]
+        _gkf_have = (sum(1 for r in _gkf_cur if r[1] == "GK")
+                     + sum(1 for r in new_rows[_gkf_nr0:] if r[2] == "GK"))
+        _gkf_add, _gkf_ds = (_gkf_extra(tid, _gkf_cur, _gkf_have,
+                                        _hi_size_gk - len(_gkf_cur) - (len(new_rows) - _gkf_nr0),
+                                        "n<min" if n < _lo_size else
+                                        ("n>max" if n > _hi_size else "normal"))
+                             if _gkf_have < _sq_cc.SQUAD_TARGET_MIN_AVAILABLE_GK else (0, []))
+        if _gkf_add or _gkf_ds:
+            _gf_rng = get_ovr_range(grade, tier, cname)
+            if _gf_rng:
+                _gf_lo, _gf_hi = _gf_rng
+                if not is_override:
+                    _gf_lo, _gf_hi = _gf_lo + bonus, _gf_hi + bonus
+            else:
+                _gf_lo, _gf_hi = 40, 55
+            _gf_quota = get_foreign_quota_range(cname, continent, tier=tier)[1]
+            _gf_fc = foreign_now.get(tid, 0)
+            for _fd in [None] * _gkf_add + _gkf_ds:   # None = 자리 있는 추가(내보내는 선수 없음)
+                if _fd is not None:
+                    delete_ids.append(_fd[0])
+                    forced_out += 1
+                _gf_row, _gf_fc = _sq_gen_swap_row(
+                    tid, "GK", grade, tier, cname, continent, tname, year,
+                    _gf_rng, _gf_lo, _gf_hi, _rebal_prestige_level(cname, tname),
+                    _gf_fc, _gf_quota,
+                    roster_ovrs=[_o for _pid, _p, _o in roster_by_team.get(tid, [])])
+                new_rows.append(_gf_row)
+                topped_up += 1
+            foreign_now[tid] = _gf_fc
 
     if new_rows:
         # [2026-09 신설, database.true_nationality 컬럼 주석 참고] 포지션
@@ -10415,6 +10546,15 @@ def _snapshot_season_positions(c, year, only_missing=False, rows=None,
         # team_inserts를 만들지 않는다 — 위 주석 참고, 이 시점의 로스터는
         # "그 해 실제로 뛴 팀"이 아니라 이미 이적이 반영된 확정 로스터라
         # 팀 포메이션 스냅샷 용도로 쓰면 안 된다.
+        if preserve_role:
+            # [2026-11-03 신설, 신민용 확정: "팀이 같아도 역할이 바뀌면 상/하반기로 나눠 표시"] 43주차 라인업엔 이
+            # 자리 배치 기준 역할(보존 전 계산값)을 같이 남긴다 — 선수 검색 하반기 줄 표시·연도 분리 판정 전용
+            # (world_browser._lineup_h2_role). 게임 판정용 역할(ai_player_position_history)은 위 보존 규칙 그대로다.
+            for _sp in slots_payload:
+                if _sp["id"] is not None:
+                    _sp["role"] = roles.get(_sp["id"], "")
+            for _bp in bench_payload:
+                _bp["role"] = roles.get(_bp["id"], "")
         if _missing_ids is None:
             team_inserts.append((_team_id, year, formation,
                                   json.dumps(slots_payload), json.dumps(bench_payload)))
@@ -12048,8 +12188,7 @@ def _quota_sale_cleanup(c, year, allow_me=True):
             by_team.setdefault(r["team_id"], []).append(r)
     size = {t: len(v) for t, v in by_team.items()}
     # [2026-10-31 V3.1 — GK 3명 원칙] GK 3명 이상 팀은 정원 정리 매각·임대로 GK를 받지 않는다.
-    _q_gk = ({t: sum(1 for r in v if r["position"] == "GK") for t, v in by_team.items()}
-             if _gk3_inflow_on() else None)   # [2026-11-02] V3.1 → 유입 제한 스위치
+    _q_gk = {t: sum(1 for r in v if r["position"] == "GK") for t, v in by_team.items()}
     cur_f = {}
     for t, v in by_team.items():
         _cn = meta[t]["cname"]
@@ -15017,6 +15156,11 @@ def apply_squad_turnover_after_movement(rescale_jobs, year, turnover_frac=0.25,
             # 이 선수를 (대체자 없이) 방출하면 그룹이나 구체 포지션이
             # 0명이 되는가 — 되면 방출 대신 교체로 돌린다.
             _last_one = (_grp_ct.get(_g0, 0) <= 1 or _pos_ct.get(pos, 0) <= 1)
+            if i < n_release and not _last_one and pos == "GK" and _pos_ct.get("GK", 0) <= 3:
+                # [2026-11-06 GK4_NEVER] GK 3명 이하 팀의 GK는 방출하지 않고 같은 포지션 신인으로 교체(위 마지막 1명
+                # 규칙과 같은 처리 — 방출 몫을 다른 포지션으로 넘기지 않는다, 물갈이 25%·35%·선정 순서는 그대로).
+                _last_one = True
+                GK4_PATH_LOG["turnover_gk_kept"] += 1
             if i < n_release and not _last_one:
                 _grp_ct[_g0] = _grp_ct.get(_g0, 0) - 1
                 _pos_ct[pos] = _pos_ct.get(pos, 0) - 1

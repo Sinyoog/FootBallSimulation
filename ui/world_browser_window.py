@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
     QAbstractItemView, QScrollArea, QGridLayout, QSizePolicy,
     QStyledItemDelegate, QStyle, QMenu, QMessageBox, QSpinBox, QCompleter,
     QButtonGroup, QStackedWidget, QLayout,
-    QApplication, QTextEdit, QPlainTextEdit, QAbstractSpinBox
+    QApplication, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QStyleOptionViewItem
 )
 from PyQt6.QtCore import Qt, QTimer, QRect, QSize, QEvent, QObject
 from PyQt6.QtGui import (QColor, QFont, QFontMetrics, QGuiApplication, QPainter,
@@ -1558,6 +1558,49 @@ _GRADE_COLORS = {
     "SS": "#ff4488", "S": "#ff9900", "A": "#ffcc00", "B": "#00ccff",
     "C": "#00ff66", "D": "#888888", "E": "#888888", "F": "#888888",
 }
+
+
+class _TeamCountryDelegate(QStyledItemDelegate):
+    """[2026-11-03 신설, 신민용 요청: "소속팀 칸도 감독처럼 팀명(크게) 아래 국가명(작게) 두 줄 — 클릭·복사는
+    팀명만"] 선수 연도별 기록 표의 소속팀 칸(일반 표 칸 — 클릭 선택·복사 규칙 _enable_team_col_copy 그대로)을
+    두 줄로 그린다. 칸 글자·폰트·색은 그대로 위 줄에 쓰고(칸 폭에 맞춰 말줄임), _COUNTRY_ROLE에 국가가 있으면
+    그 아래에 감독 연도별 기록(_two_line_cell의 아래 줄)과 같은 10px 회색(#888)으로 쓴다. 국가가 없으면 기본 그리기."""
+    _COUNTRY_ROLE = Qt.ItemDataRole.UserRole + 51
+    _PAD_X = 6
+
+    def paint(self, painter, option, index):
+        country = index.data(self._COUNTRY_ROLE)
+        if not country:
+            super().paint(painter, option, index)
+            return
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        text = opt.text
+        opt.text = ""
+        _style = opt.widget.style() if opt.widget else QApplication.style()
+        _style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
+        r = option.rect.adjusted(self._PAD_X, 2, -self._PAD_X, -2)
+        f1 = QFont(opt.font)
+        f2 = QFont(opt.font)
+        f2.setBold(False)
+        f2.setPixelSize(10)
+        fm1, fm2 = QFontMetrics(f1), QFontMetrics(f2)
+        h = fm1.height() + 1 + fm2.height()
+        top = r.top() + max(0, (r.height() - h) // 2)
+        _fg = index.data(Qt.ItemDataRole.ForegroundRole)
+        _c1 = _fg.color() if hasattr(_fg, "color") else (_fg if isinstance(_fg, QColor) else QColor("#aaddff"))
+        painter.save()
+        painter.setFont(f1)
+        painter.setPen(_c1)
+        painter.drawText(QRect(r.left(), top, r.width(), fm1.height()),
+                         int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                         fm1.elidedText(text, Qt.TextElideMode.ElideRight, r.width()))
+        painter.setFont(f2)
+        painter.setPen(QColor("#888"))
+        painter.drawText(QRect(r.left(), top + fm1.height() + 1, r.width(), fm2.height()),
+                         int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                         fm2.elidedText(str(country), Qt.TextElideMode.ElideRight, r.width()))
+        painter.restore()
 
 
 class _GridRowDelegate(QStyledItemDelegate):
@@ -6335,7 +6378,8 @@ class WorldBrowserWindow(QDialog):
         _half = bool(exp.get("half")) if exp and exp.get("year") == year else False
         data = wb.get_team_season_lineup(tid, year, half=_half)
         starters, bench = data.get("starters") or [], data.get("bench") or []
-        changed = open_bulk_rename_dialog(self, starters, bench)
+        # [2026-11] 팀 검색은 팀 단위 화면 — 팀 나라를 넘겨 내국인/외국인 범위를 켠다.
+        changed = open_bulk_rename_dialog(self, starters, bench, team_country=data.get("team_country") or None)
         if not changed:
             return
         if not exp or exp.get("year") != year:
@@ -10727,6 +10771,8 @@ class WorldBrowserWindow(QDialog):
         # [2026-10 신설, 신민용 요청] "소속팀" 칸(1번)만 클릭해서 복사할 수 있게 한다 — 다른 칸은 예전처럼
         # 선택되지 않는다(연도 칸 클릭 = 펼치기/접기 그대로).
         _enable_team_col_copy(tbl, 1)
+        # [2026-11-03] 소속팀 칸: 팀명 아래 국가(작게) — 복사는 팀명만(_TeamCountryDelegate)
+        tbl.setItemDelegateForColumn(1, _TeamCountryDelegate(tbl))
         return award_tbl, tbl
 
     def _team_name_item(self, text, color="#aaddff", bold=False, clean=None):
@@ -11118,6 +11164,30 @@ class WorldBrowserWindow(QDialog):
         # 끼어들 때마다 밀리므로 별도 카운터로 추적한다.
         row_idx = 0
         _expanded = self._player_team_expanded_years(player_id)
+        # [2026-11-03 신민용 요청] 소속팀 칸 아래 국가 — 팀 id(그 해 줄이 아는 id → 이적 구간 id) 우선, 없으면 이름으로
+        # (같은 이름 팀이 여러 나라에 있으면 이름으로는 안 찾는다). 한 번에 조회.
+        def _team_id_for_entry(_e):
+            if _e.get("_is_half"):
+                return _e.get("_half_team_id")
+            if _e.get("_main_team_id"):
+                return _e.get("_main_team_id")
+            if _e.get("_team_id_for_salary"):
+                return _e.get("_team_id_for_salary")
+            _yy = _e.get("year")
+            if retirement_year and _yy and _yy > retirement_year:
+                return None
+            for _sg in timeline:
+                if (_sg["start_year"] is None or _yy >= _sg["start_year"]) and \
+                   (_sg["end_year"] is None or _yy < _sg["end_year"]):
+                    return _sg.get("team_id")
+            return tid
+        try:
+            _tc_by_id, _tc_by_name = wb.get_team_countries(
+                [_team_id_for_entry(_e) for _e in years],
+                [_sg.get("team_name") for _sg in timeline] + [tname]
+                + [_e.get("_half_team_name") or _e.get("_main_team_name") for _e in years])
+        except Exception:
+            _tc_by_id, _tc_by_name = {}, {}
         for i, entry in enumerate(years):
             age = _age_at(entry["year"])
             # [2026-09 버그수정, 신민용 리포트: "선수 기록복사할 때 받은
@@ -11202,6 +11272,11 @@ class WorldBrowserWindow(QDialog):
                 team_cell = self._team_name_item(
                     _display_name, color="#88ddaa" if is_current else "#aaddff", bold=is_current,
                     clean=player_team_name)
+                _tc = (_tc_by_id.get(_team_id_for_entry(entry))
+                       or _tc_by_name.get(player_team_name))
+                if _tc:
+                    team_cell.setData(_TeamCountryDelegate._COUNTRY_ROLE, _tc)
+                    team_cell.setToolTip(f"{_display_name} ({_tc})\n클릭 후 Ctrl+C(또는 우클릭 → 복사)로 팀명을 복사할 수 있습니다")
             if isinstance(team_cell, QTableWidgetItem):
                 tbl.setItem(row_idx, 1, team_cell)
             else:
@@ -11276,8 +11351,10 @@ class WorldBrowserWindow(QDialog):
             # 눈에 띄는 금색 계열로 둔다.
             _ROLE_COLORS = {"핵심": "#ffcc44", "주전": "#4da6ff", "로테이션": "#88ddaa",
                             "대기": "#cccc66", "유망주": "#cc88ff", "전력외": "#999999"}
+            # [2026-11-03] 팀은 같은데 역할이 바뀌어 두 줄로 나뉜 해는 하반기 줄도 팀 검색 하반기 라인업 기준
+            # 역할(entry["_h2_role"] — world_browser._lineup_h2_role)을 쓴다.
             role_at_year = (entry.get("_half_role") if entry.get("_is_half")
-                             else role_checkpoints.get(entry["year"]))
+                             else entry.get("_h2_role") or role_checkpoints.get(entry["year"]))
             if role_at_year:
                 role_item = QTableWidgetItem(role_at_year)
                 role_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)

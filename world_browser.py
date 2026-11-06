@@ -2106,9 +2106,36 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
     _half_role_by_year = get_ai_player_role_checkpoints_half(player_id)
     _half_pos_by_year = get_ai_player_position_checkpoints_half(player_id)
     _full_role_by_year = get_ai_player_role_checkpoints(player_id)
+    # [2026-11-03 버그수정, 신민용 리포트: "팀 검색에서 상반기엔 주전 라인, 하반기엔 후보 라인인데 선수 검색에선
+    # 그 해가 한 줄로만 뜬다 — 이적하면 상/하반기로 나뉘듯 팀이 같아도 역할이 바뀌면 나눠서 표시해야 한다"]
+    # 원인: 하반기(메인) 줄 역할은 ai_player_position_history.role인데, 이 값은 "역할은 시즌 시작에 정한다"
+    # 원칙(43주차 preserve_role)으로 시즌 시작 값이 그대로 남는다 — 팀 검색 하반기 라인업(43주차 슬롯 재배치)과
+    # 달라서, 하반기에 후보로 밀린 선수도 "주전"으로 남아 나눌 해가 거의 안 잡혔다(5시즌 헤드리스 실측: 잔류
+    # 선수 중 팀 검색 주전↔후보가 바뀐 해 시즌당 약 3,900건 중 나뉜 해 0~3건).
+    # 이제 비교·표시용 하반기 역할은 팀 검색 하반기 라인업(hist.team_season_lineup)에서 그 선수가 실제로 선
+    # 자리 기준 역할(_lineup_h2_role)을 쓴다. 게임 판정용 역할(개인상·평점·국대·이적 — ai_player_position_history)은
+    # 그대로다.
+    _h2_role_by_year = {}
+    _cur_year_wb = None
+    try:
+        _cy = conn.execute("SELECT current_year FROM season_state WHERE id=1").fetchone()
+        _cur_year_wb = _cy[0] if _cy else None
+    except Exception:
+        _cur_year_wb = None
+    if _half_role_by_year:
+        _same_team_by_year = {}
+        for _e0 in out:
+            if _e0.get("year") in _half_role_by_year and _e0.get("year") not in mid_by_year:
+                _same_team_by_year[_e0["year"]] = _e0.get("_team_id_for_salary")
+        for _y0, _t0 in _same_team_by_year.items():
+            if _t0:
+                _r2 = _lineup_h2_role(conn, _t0, _y0, player_id, _cur_year_wb)
+                if _r2:
+                    _h2_role_by_year[_y0] = _r2
     _role_diff_years = {
         y for y, h1 in _half_role_by_year.items()
-        if h1 and _full_role_by_year.get(y) and h1 != _full_role_by_year[y]
+        if h1 and (_h2_role_by_year.get(y) or _full_role_by_year.get(y))
+        and h1 != (_h2_role_by_year.get(y) or _full_role_by_year[y])
         and y not in mid_by_year}  # 팀 자체가 바뀐 해는 위쪽 분기가 전담
 
     if mid_by_year or _role_diff_years:
@@ -2122,6 +2149,9 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
             # 넘긴다는 점만 다르고 그 뒤 흐름은 완전히 동일하다.
             if not from_tid and y in _role_diff_years:
                 from_tid = e.get("_team_id_for_salary")
+                # 하반기(메인) 줄 역할 표시 — 팀 검색 하반기 라인업 기준(위 _h2_role_by_year 주석 참고)
+                if _h2_role_by_year.get(y):
+                    e["_h2_role"] = _h2_role_by_year[y]
                 half_pos = _half_pos_by_year.get(y)
                 half_role = _half_role_by_year.get(y)
             if from_tid:
@@ -2140,7 +2170,8 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
                                "clean_sheets": _lg_comp.get("clean_sheets"),
                                "saves": _lg_comp.get("saves"),
                                "goals_conceded": _lg_comp.get("goals_conceded")},
-                    main_entry=e, full_role=_full_role_by_year.get(y),
+                    main_entry=e, full_role=(_h2_role_by_year.get(y) if y in _role_diff_years
+                                             else None) or _full_role_by_year.get(y),
                     split=(_team_split.get(y) if y in mid_by_year else None))
                 # [2026-09 버그수정, 신민용 리포트: "브라이턴(상반기/원래
                 # 팀) 이때 시작·이적료 이런 게 아예 표시가 안 된다"]
@@ -2196,6 +2227,12 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
                           and _half_src.get("cl_kind") in ("champions", "europa", "conference")):
                         e["cl"] = e["cl_record"] = e["cl_kind"] = None
                         e["cl_champion"] = False
+                        # [2026-11-03 버그수정, 신민용 리포트: "챔스·유로파 이름은 아래(상반기) 줄에 뜨는데 평점·골·어시는
+                        # 위(하반기) 줄에 남는다"] 대회 이름·성적만 상반기 줄로 옮기고 개인 기록(_comp_stats["cl"])은 메인
+                        # 줄에 두고 있었다 — 같이 옮긴다.
+                        _mc = e.get("_comp_stats")
+                        if _mc and "cl" in _mc:
+                            _half_e.setdefault("_comp_stats", {})["cl"] = _mc.pop("cl")
                 # [2026-09 버그수정, 신민용 리포트: "하반기에 이적해 챔스를 안
                 # 뛰었는데 챔스 뛴 걸로 쳐졌다"] 팀 자체가 바뀐 해는 상반기
                 # 대회(클럽 대항전 8~23주차, 국내 슈퍼컵 4주차)의 개인 기록
@@ -2242,6 +2279,70 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
     conn.close()
 
     return {"awards": awards, "years": out}
+
+
+def _lineup_h2_role(conn, team_id, year, player_id, cur_year=None):
+    """[2026-11-03 신설] 팀 검색 하반기 라인업(hist.team_season_lineup — 43주차 슬롯 재배치)에서 이 선수가 그 해
+    실제로 선 자리 기준의 역할. 43주차 스냅샷이 라인업에 같이 남긴 role을 그대로 읽고(ai_lifecycle.
+    _snapshot_season_positions, preserve_role=True 경로), 그 값이 없는 예전 세이브의 지난 시즌은 같은 라인업
+    (주전 11명 + 후보)과 그 해 OVR·나이로 formation_logic.compute_squad_roles를 다시 돌려 구한다.
+    진행 중인 올해(43주차 전)는 아직 하반기 라인업이 없으므로 None. 라인업에 이 선수가 없어도 None."""
+    try:
+        row = conn.execute(
+            "SELECT slots_json, bench_json FROM hist.team_season_lineup WHERE year=? AND team_id=?",
+            (year, team_id)).fetchone()
+    except Exception:
+        return None
+    if not row:
+        return None
+    try:
+        slots = json.loads(row[0] or "[]")
+        bench = json.loads(row[1] or "[]")
+    except Exception:
+        return None
+    started = [x.get("id") for x in slots if x.get("id") is not None]
+    bench_ids = [x.get("id") for x in bench if x.get("id") is not None]
+    if player_id not in started and player_id not in bench_ids:
+        return None
+    for x in slots + bench:
+        if x.get("id") == player_id and x.get("role"):
+            return x["role"]
+    # 예전 세이브(라인업에 role이 없음) — 끝난 시즌만 다시 계산한다.
+    if cur_year is not None and year >= cur_year:
+        return None
+    ids = [i for i in started + bench_ids if isinstance(i, int) and i > 0]
+    if not ids:
+        return None
+    ph = ",".join("?" * len(ids))
+    ovr, pos, age = {}, {}, {}
+    try:
+        for r in conn.execute(f"SELECT player_id, ovr FROM hist.ai_player_ovr_history "
+                              f"WHERE year=? AND player_id IN ({ph})", (year, *ids)):
+            ovr[r[0]] = r[1]
+        for r in conn.execute(f"SELECT id, position, age FROM ai_players WHERE id IN ({ph})", ids):
+            pos[r[0]] = r[1]
+            if r[2] is not None and cur_year is not None:
+                age[r[0]] = r[2] - (cur_year - year)
+        _miss = [i for i in ids if i not in pos]
+        if _miss:
+            ph2 = ",".join("?" * len(_miss))
+            for r in conn.execute(f"SELECT id, position, age, retirement_year FROM ai_players_retired "
+                                  f"WHERE id IN ({ph2})", _miss):
+                pos[r[0]] = r[1]
+                if r[2] is not None and r[3] is not None:
+                    age[r[0]] = r[2] - (r[3] - year)
+    except Exception:
+        return None
+    for x in bench:
+        if x.get("id") in ids and x.get("position"):
+            pos[x["id"]] = x["position"]
+    try:
+        from formation_logic import compute_squad_roles
+        roles = compute_squad_roles([(i, pos.get(i) or "", ovr.get(i) or 0, age.get(i)) for i in ids],
+                                    set(i for i in started if i in ids))
+    except Exception:
+        return None
+    return roles.get(player_id) or None
 
 
 def _half_season_league_entry(conn, team_id, year, half_position=None, half_role=None,
@@ -2302,6 +2403,7 @@ def _half_season_league_entry(conn, team_id, year, half_position=None, half_role
              # 이름을 그대로 쓰라"는 신호로 읽는다 — 같은 연도의 두 줄이
              # 서로 다른 팀 소속임을 정확히 구분해서 보여주기 위함.
              "_is_half": True, "_half_team_name": trow["name"] if trow else "?",
+             "_half_team_id": team_id,   # [2026-11-03] 소속팀 칸 아래 국가 표시용
              "_half_position": half_position or None,
              # [2026-08 신설, 신민용 리포트: "상반기 팀에 역할이 안 뜬다 —
              # 뜨더라도 하반기 팀이랑 완전히 똑같이 뜨는데 실제로는 상반기
@@ -3058,6 +3160,7 @@ def get_my_player_career_history():
         entry = dict(src) if src else {"year": y, "league": None, "cup": None,
                                         "cl": None, "cwc": None, "sc": None, "dsc": None, "cl_kind": None}
         entry["_main_team_name"] = main_st["team_name"]
+        entry["_main_team_id"] = main_st.get("team_id")   # [2026-11-03] 소속팀 칸 아래 국가 표시용
         # [2026-09 신설] 상/하반기 이적이 있었던 해만 등록 여부를 대조한다
         # (이적 없는 해는 main_st가 곧 등록팀이므로 항상 일치 — 굳이
         # 매 연도 추가 쿼리를 돌릴 필요가 없다).
@@ -3188,6 +3291,7 @@ def get_my_player_career_history():
             _half_entry = {"year": y, "league": lg_text, "cup": None, "cl": None,
                         "cwc": None, "sc": None, "cl_kind": None,
                         "_is_half": True, "_half_team_name": prev_st["team_name"],
+                        "_half_team_id": prev_st.get("team_id"),   # [2026-11-03] 소속팀 칸 아래 국가 표시용
                         "_half_position": prev_st.get("position") or None}
             # [2026-09 신설, 신민용 리포트: "레알 마드리드로 올 때 연봉·
             # 이적인지도 안 뜨고 전북 현대일 때 연봉·계약도 안 뜬다"]
@@ -9108,6 +9212,38 @@ def manager_career_span_text(years):
     return f"{len(ys)}년 ({span})"
 
 
+def get_team_countries(team_ids=(), team_names=()):
+    """[2026-11-03 신설, 신민용 요청: "선수 연도별 기록 소속팀 칸도 감독처럼 아래에 그 팀 국가"] 팀 id → 국가명,
+    팀 이름 → 국가명(같은 이름 팀이 여러 나라에 있으면 빠진다 — 호출부는 id를 먼저 쓴다)을 한 번에 돌려준다.
+    반환: (by_id, by_name)."""
+    by_id, by_name = {}, {}
+    ids = sorted({int(i) for i in team_ids if i is not None and int(i) > 0})
+    names = sorted({n for n in team_names if n})
+    if not ids and not names:
+        return by_id, by_name
+    conn = get_conn()
+    try:
+        for k in range(0, len(ids), 500):
+            part = ids[k:k + 500]
+            for r in conn.execute(
+                    f"""SELECT t.id, cn.name FROM teams t JOIN leagues l ON l.id = t.league_id
+                        JOIN countries cn ON cn.id = l.country_id
+                        WHERE t.id IN ({','.join('?' * len(part))})""", part):
+                by_id[r[0]] = r[1]
+        _seen = {}
+        for k in range(0, len(names), 500):
+            part = names[k:k + 500]
+            for r in conn.execute(
+                    f"""SELECT t.name, cn.name FROM teams t JOIN leagues l ON l.id = t.league_id
+                        JOIN countries cn ON cn.id = l.country_id
+                        WHERE t.name IN ({','.join('?' * len(part))})""", part):
+                _seen.setdefault(r[0], set()).add(r[1])
+        by_name = {n: next(iter(cs)) for n, cs in _seen.items() if len(cs) == 1}
+    finally:
+        conn.close()
+    return by_id, by_name
+
+
 def _team_country_name(conn, team_id):
     row = conn.execute(
         """SELECT cn.name FROM teams t JOIN leagues l ON l.id = t.league_id
@@ -10521,7 +10657,7 @@ def get_team_season_lineup(team_id: int, year: int, half: bool = False):
         display_name = (my_name if pid == MY_PLAYER_ID
                         else (custom_names.get(pid) or ai_player_code(pid)))
         starters.append({"slot": s.get("slot", ""), "id": pid, "display_name": display_name,
-                          "is_foreign": _is_foreign(pid)})
+                          "is_foreign": _is_foreign(pid), "nationality": nat_by_id.get(pid, "")})
 
     bench = []
     for b in bench_slots:
@@ -10531,9 +10667,11 @@ def get_team_season_lineup(team_id: int, year: int, half: bool = False):
         display_name = (my_name if pid == MY_PLAYER_ID
                         else (custom_names.get(pid) or ai_player_code(pid)))
         bench.append({"position": b.get("position", ""), "id": pid, "display_name": display_name,
-                       "is_foreign": _is_foreign(pid)})
+                       "is_foreign": _is_foreign(pid), "nationality": nat_by_id.get(pid, "")})
 
-    return {"formation": _formation_out, "starters": starters, "bench": bench, "live": _live}
+    # [2026-11] team_country: 이름 일괄변경의 내국인/외국인 범위용(군팀은 이미 대한민국으로 바뀐 값).
+    return {"formation": _formation_out, "starters": starters, "bench": bench, "live": _live,
+            "team_country": team_country}
 
 
 def get_team_live_player_status(team_id, starter_ids):
