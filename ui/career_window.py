@@ -273,6 +273,9 @@ class CareerWindow(QDialog):
                 "SELECT * FROM awards WHERE is_mine=1 ORDER BY year").fetchall()]
         except Exception:
             self._awards = []
+        # [2026-11 신민용 요청] 발롱도르 2~30위 순위권도 개인 수상 목록에(수상 건수에는 안 셈)
+        from game_engine import merge_ballon_rank_rows
+        self._awards = merge_ballon_rank_rows(self._awards)
         # 내가 그 팀에 실제로 있던 기간의 승강 기록 (공용 헬퍼)
         self._promos = get_my_promotions()
         # [2026-08 신설, 부상 시스템 확장 — 커리어 기록] 부상 이력.
@@ -440,7 +443,8 @@ class CareerWindow(QDialog):
         self._tabs.addTab(self._team_tab(entries),  "팀 이력")
         self._tabs.addTab(self._club_totals_tab(entries), "전체 이력")
         self._tabs.addTab(self._trophy_tab(trophies), f"성적 ({len(trophies)})")
-        self._tabs.addTab(self._award_tab(awards), f"개인 수상 ({len(awards)})")
+        self._tabs.addTab(self._award_tab(awards),
+                          f"개인 수상 ({sum(1 for a in awards if not a.get('is_ballon_rank'))})")
         self._tabs.addTab(self._promo_tab(promos),  f"승강 ({len(promos)})")
         self._tabs.addTab(self._injury_tab(injuries), f"부상 이력 ({len(injuries)})")
 
@@ -855,7 +859,9 @@ class CareerWindow(QDialog):
             # 그냥 숫자만 표시.
             from game_engine import team_matches_played_in_window
             _total_g = team_matches_played_in_window(e.get("team_id", 0), ln, sy, sw, ey, ew)
-            _apps_str = f"{e.get('matches',0)}/{_total_g}" if _total_g else str(e.get("matches", 0))
+            # [2026-11 신민용 요청] 팀 이력 출전 = 리그만 "출전/경기(선발 N)"
+            from game_engine import format_apps_with_starts
+            _apps_str = format_apps_with_starts(e.get("matches", 0), _total_g, e.get("league_starts"))
             vals = ([period, age_str, pos, country_str, league_str, tn,
                      fmt_money(e.get("salary",0)),
                      _apps_str]
@@ -959,7 +965,11 @@ class CareerWindow(QDialog):
                 e.get("team_id", 0), e.get("league_name", ""), sy, sw, ey, ew or 52) or 0
             grand_played = e.get("matches", 0) + extras["matches_played"]
             grand_avail = _league_total + extras["matches_available"]
-            apps_str = f"{grand_played}/{grand_avail}" if grand_avail else str(grand_played)
+            # [2026-11 신민용 요청] 전체 이력 출전 = 모든 대회 "출전/경기(선발 N)". 선발 기록이 없는 예전 기간은 예전 형식.
+            from game_engine import format_apps_with_starts
+            _grand_starts = (None if (e.get("league_starts") is None or extras["starts_unknown"])
+                             else e.get("league_starts") + extras["starts"])
+            apps_str = format_apps_with_starts(grand_played, grand_avail, _grand_starts)
 
             g = e.get("goals", 0) + extras["goals"]
             a = e.get("assists", 0) + extras["assists"]
@@ -1129,7 +1139,8 @@ class CareerWindow(QDialog):
         # 수상 종류별 횟수 요약
         from collections import Counter
         from constants import normalize_award_bucket, award_icon
-        cnt = Counter(normalize_award_bucket(a.get("award_type","")) for a in awards)
+        cnt = Counter(normalize_award_bucket(a.get("award_type","")) for a in awards
+                      if not a.get("is_ballon_rank"))
         order = ["발롱도르","야신상","MVP","득점왕","도움왕","베스트11","골든글러브","영플레이어",
                  "올해의 수비수","구단 올해의 선수",
                  "FIFA 푸스카스상","대회 최고의 골","리그 올해의 골"]
@@ -1137,6 +1148,10 @@ class CareerWindow(QDialog):
         for k in order:
             if cnt.get(k):
                 summary_parts.append(f"{k} {cnt[k]}회")
+        from game_engine import ballon_rank_summary
+        _br = ballon_rank_summary(awards)
+        if _br:
+            summary_parts.append(_br)
         if summary_parts:
             sl = QLabel("  ·  ".join(summary_parts))
             sl.setStyleSheet("color:#ffcc00;font-size:14px;font-weight:bold;padding:6px;")
@@ -1153,6 +1168,8 @@ class CareerWindow(QDialog):
             # 발롱도르/야신상/MVP/득점왕은 강조색
             color = "#ffcc00" if atype in ("발롱도르","야신상","MVP") else (
                     "#00cc44" if atype in ("득점왕","도움왕") else None)
+            if a.get("is_ballon_rank"):   # [2026-11] 발롱도르 순위권(2~30위) — 기록실 발롱 30인과 같은 빨강
+                label, color = f"🏆 {atype}", "#ff6666"
             vals = [str(a.get("year","")), label, a.get("league_name",""), a.get("detail","")]
             for j, v in enumerate(vals):
                 self._set(tbl, i, j, v, color if j == 1 else None)

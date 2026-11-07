@@ -646,6 +646,7 @@ def simulate_my_po_match(week, p, day=None):
     # 챔스/컵과 동일하게 클럽 팀 기준이 맞다. 출전정지면 벤치 확률은
     # 무의미하므로 건너뛴다.
     _benched = (not _suspended) and _check_bench(p, team_avg_ovr=my_ovr_team, club_match=True)   # [2026-10 my_loan] 클럽 경기
+    _my_started_pre = 0 if (_suspended or _benched) else 1   # [2026-11] 경기 전 선발 여부(교체 출전 구분용)
     if _benched:
         add_log("🪑 교체 명단에서 시작", "event")
 
@@ -823,12 +824,12 @@ def simulate_my_po_match(week, p, day=None):
            {ET_SCORE_SET_SQL},
            pso_winner=?, pso_score=?,
            is_my=1, my_played=?, my_position=?, my_saves=?, my_goals=?, my_assists=?, my_rating=?,
-           my_absence_reason=?, my_yellow_cards=?
+           my_absence_reason=?, my_yellow_cards=?, my_started=?
            WHERE id=?""",
         (hs, as_, *et_score_values(hs90, as90, went_et),
          pso_winner, pso_score,
          0 if (_suspended or _benched) else 1, _get_field_pos_safe(p) if not _benched else "",
-         saves, goals, assists, rating, _absence_reason, _yellow_cnt, m["id"]))
+         saves, goals, assists, rating, _absence_reason, _yellow_cnt, _my_started_pre, m["id"]))
     conn.commit()
 
     _update_pop(p, goals, assists, rating)

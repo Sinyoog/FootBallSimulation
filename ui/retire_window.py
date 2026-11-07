@@ -408,6 +408,9 @@ class RetireWindow(QDialog):
                 "SELECT * FROM awards WHERE is_mine=1 ORDER BY year").fetchall()]
         except Exception:
             awards = []
+        # [2026-11 신민용 요청] 발롱도르 2~30위 순위권도 개인 수상 목록에(수상 건수에는 안 셈)
+        from game_engine import merge_ballon_rank_rows, ballon_rank_summary
+        awards = merge_ballon_rank_rows(awards)
         from game_engine import get_my_promotions
         promos   = get_my_promotions()
         # [2026-08 신설, 부상 시스템 확장 — 은퇴 기록] 부상 이력(최신순).
@@ -420,11 +423,14 @@ class RetireWindow(QDialog):
         if awards:
             from collections import Counter
             from constants import normalize_award_bucket
-            cnt = Counter(normalize_award_bucket(a.get("award_type","")) for a in awards)
+            cnt = Counter(normalize_award_bucket(a.get("award_type","")) for a in awards
+                          if not a.get("is_ballon_rank"))
             order = ["발롱도르","야신상","MVP","득점왕","도움왕","베스트11","골든글러브","영플레이어",
                      "올해의 수비수","구단 올해의 선수",
                      "FIFA 푸스카스상","대회 최고의 골","리그 올해의 골"]
             parts = [f"{k} {cnt[k]}회" for k in order if cnt.get(k)]
+            if ballon_rank_summary(awards):
+                parts.append(ballon_rank_summary(awards))
             hl = QLabel("🏅 " + "   ·   ".join(parts))
             hl.setWordWrap(True)
             hl.setStyleSheet("color:#ffcc00;font-size:15px;font-weight:bold;"
@@ -571,7 +577,7 @@ class RetireWindow(QDialog):
         # (awards는 위에서 conn이 열려 있을 때 이미 로드했다. conn.close() 이후
         #  c.execute를 다시 호출하면 예외가 나서 0개로 표시되던 버그 수정 →
         #  앞서 로드한 리스트를 그대로 재사용한다.)
-        t4 = QLabel(f"🥇 개인 수상  ({len(awards)})")
+        t4 = QLabel(f"🥇 개인 수상  ({sum(1 for a in awards if not a.get('is_ballon_rank'))})")
         t4.setObjectName("secTitle")
         lay.addWidget(t4)
         lay.addWidget(self._award_table(awards))
@@ -893,7 +899,9 @@ class RetireWindow(QDialog):
             from game_engine import team_matches_played_in_window, league_total_teams_by_name
             _total_g2 = team_matches_played_in_window(
                 e.get("team_id", 0), e.get("league_name", ""), sy, sw, ey, ew)
-            _apps_str2 = f"{e.get('matches',0)}/{_total_g2}" if _total_g2 else str(e.get("matches", 0))
+            # [2026-11 신민용 요청] 팀 이력 출전 = 리그만 "출전/경기(선발 N)"
+            from game_engine import format_apps_with_starts
+            _apps_str2 = format_apps_with_starts(e.get("matches", 0), _total_g2, e.get("league_starts"))
 
             ln = e.get("league_name", "")
             country_str = team_country.get(e.get("team_id"), "")
@@ -1040,7 +1048,11 @@ class RetireWindow(QDialog):
                 e.get("team_id", 0), e.get("league_name", ""), sy, sw, ey, ew) or 0
             grand_played = e.get("matches", 0) + extras["matches_played"]
             grand_avail = _league_total + extras["matches_available"]
-            apps_str = f"{grand_played}/{grand_avail}" if grand_avail else str(grand_played)
+            # [2026-11 신민용 요청] 전체 이력 출전 = 모든 대회 "출전/경기(선발 N)". 선발 기록이 없는 예전 기간은 예전 형식.
+            from game_engine import format_apps_with_starts
+            _grand_starts = (None if (e.get("league_starts") is None or extras["starts_unknown"])
+                             else e.get("league_starts") + extras["starts"])
+            apps_str = format_apps_with_starts(grand_played, grand_avail, _grand_starts)
 
             g = e.get("goals", 0) + extras["goals"]
             a = e.get("assists", 0) + extras["assists"]
@@ -1178,7 +1190,8 @@ class RetireWindow(QDialog):
         # 수상 종류별 횟수 요약
         from collections import Counter
         from constants import normalize_award_bucket, award_icon
-        cnt = Counter(normalize_award_bucket(a.get("award_type","")) for a in awards)
+        cnt = Counter(normalize_award_bucket(a.get("award_type","")) for a in awards
+                      if not a.get("is_ballon_rank"))
         order = ["발롱도르","야신상","MVP","득점왕","도움왕","베스트11","골든글러브","영플레이어","사모라상",
                  "올해의 수비수","구단 올해의 선수",
                  "FIFA 푸스카스상","대회 최고의 골","리그 올해의 골"]
@@ -1186,6 +1199,9 @@ class RetireWindow(QDialog):
         for k in order:
             if cnt.get(k):
                 summary_parts.append(f"{k} {cnt[k]}회")
+        from game_engine import ballon_rank_summary
+        if ballon_rank_summary(awards):
+            summary_parts.append(ballon_rank_summary(awards))
         
         frame = QFrame()
         fl = QVBoxLayout(frame); fl.setContentsMargins(0,0,0,0)
@@ -1207,6 +1223,8 @@ class RetireWindow(QDialog):
             # 발롱도르/야신상/MVP는 황금색, 주요 상은 녹색
             color = "#ffcc00" if atype in ("발롱도르","야신상","MVP") else (
                     "#00cc44" if atype in ("득점왕","도움왕","베스트11") else None)
+            if a.get("is_ballon_rank"):   # [2026-11] 발롱도르 순위권(2~30위)
+                label, color = f"🏆 {atype}", "#ff6666"
             vals = [str(a.get("year","")), label, a.get("league_name",""), a.get("detail","")]
             for j, v in enumerate(vals):
                 self._set_item_colored(tbl, i, j, v, color if j == 1 else None)
@@ -1763,7 +1781,8 @@ class RetireWindow(QDialog):
                 # 실제로 열린 경기 수로 바꾼다(team_matches_played_in_window).
                 from game_engine import team_matches_played_in_window
                 _total_g = team_matches_played_in_window(e.get("team_id", 0), lg, sy, sw, ey, ew)
-                _apps_str = f"{m}/{_total_g}" if _total_g else str(m)
+                from game_engine import format_apps_with_starts   # [2026-11] 복사 텍스트도 "(선발 N)"
+                _apps_str = format_apps_with_starts(m, _total_g, e.get("league_starts"))
                 head = (f"  • {period} | {pos} | {nation} | {lg_disp} | "
                         f"{e.get('team_name','')} | {salary} | 출전 {_apps_str}")
                 lines.append(head)
@@ -1784,7 +1803,9 @@ class RetireWindow(QDialog):
                     e.get("team_id", 0), lg, sy, sw, ey, ew) or 0
                 _grand_played = m + _extras3["matches_played"]
                 _grand_avail = _league_total3 + _extras3["matches_available"]
-                _apps_str3 = f"{_grand_played}/{_grand_avail}" if _grand_avail else str(_grand_played)
+                _starts3 = (None if (e.get("league_starts") is None or _extras3["starts_unknown"])
+                            else e.get("league_starts") + _extras3["starts"])
+                _apps_str3 = format_apps_with_starts(_grand_played, _grand_avail, _starts3)
                 _grand_g = g + _extras3["goals"]
                 _grand_a = a + _extras3["assists"]
                 # [2026-08 신설, 신민용 리포트: "전체 이력엔 그 해 컵대회/
@@ -1933,15 +1954,22 @@ class RetireWindow(QDialog):
         lines.append("")
 
         # 개인 영예 (득점왕/베스트11/발롱도르 등)
-        lines.append(f"▶ 개인 영예  ({len(awards)}건)")
+        # [2026-11 신민용 요청] 은퇴 후 복사에도 발롱도르 2~30위 순위권(건수에는 안 셈)
+        from game_engine import merge_ballon_rank_rows, ballon_rank_summary
+        if not any(a.get("is_ballon_rank") for a in awards):
+            awards = merge_ballon_rank_rows(awards)
+        lines.append(f"▶ 개인 영예  ({sum(1 for a in awards if not a.get('is_ballon_rank'))}건)")
         if awards:
             from collections import Counter
             from constants import normalize_award_bucket, award_icon
-            cnt = Counter(normalize_award_bucket(a.get("award_type","")) for a in awards)
+            cnt = Counter(normalize_award_bucket(a.get("award_type","")) for a in awards
+                          if not a.get("is_ballon_rank"))
             order = ["발롱도르","야신상","MVP","득점왕","도움왕","베스트11","골든글러브","영플레이어",
                      "올해의 수비수","구단 올해의 선수",
                      "FIFA 푸스카스상","대회 최고의 골","리그 올해의 골"]
             summ = [f"{k} {cnt[k]}회" for k in order if cnt.get(k)]
+            if ballon_rank_summary(awards):
+                summ.append(ballon_rank_summary(awards))
             if summ:
                 lines.append("  ★ " + "  ·  ".join(summ))
             icon = {"득점왕":"⚽","도움왕":"🎯","베스트11":"⭐","MVP":"🏅",
@@ -1949,8 +1977,10 @@ class RetireWindow(QDialog):
                     "올해의 수비수":"🛡️","구단 올해의 선수":"🎖️"}
             for a in awards:
                 at = a.get("award_type","")
-                lines.append(f"  {award_icon(at, icon)} {a.get('year','')}년  {at}  "
-                             f"({a.get('league_name','')}, {a.get('detail','')})")
+                _ic = "🏆" if a.get("is_ballon_rank") else award_icon(at, icon)
+                _ctx = a.get("league_name", "") if a.get("is_ballon_rank") else \
+                    f"{a.get('league_name','')}, {a.get('detail','')}"
+                lines.append(f"  {_ic} {a.get('year','')}년  {at}  ({_ctx})")
         else:
             lines.append("  없음")
         lines.append("")

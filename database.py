@@ -4814,6 +4814,19 @@ def init_db(load=True):
         # [2026-10 신설, 신민용 확정 — 육성 판정 ③] 이번 시즌 리그 선발 출전 수(교체 출전 제외).
         # 육성 판정의 선발 비율 = 리그 선발 경기 수 ÷ 그 기간 팀 리그 경기 수. 시즌·이적 때 0.
         "ALTER TABLE my_player ADD COLUMN season_league_starts INTEGER DEFAULT 0",
+        # [2026-11 신설, 신민용 요청: "커리어 팀 이력·전체 이력 출전을 25/30(선발 22)로"] 선발 출전 수.
+        # career_entries.league_starts = 그 재직 기간 리그 선발 수(season_league_starts 스냅샷).
+        # {대회}_matches.my_started = 그 경기에 선발로 나갔으면 1, 교체 출전·결장이면 0.
+        # DEFAULT 없음(NULL) — 이 컬럼이 생기기 전 기록은 "선발 수를 모름"이라 화면에서 선발 표기를 뺀다.
+        "ALTER TABLE career_entries ADD COLUMN league_starts INTEGER",
+        "ALTER TABLE cup_matches ADD COLUMN my_started INTEGER",
+        "ALTER TABLE cl_matches ADD COLUMN my_started INTEGER",
+        "ALTER TABLE el_matches ADD COLUMN my_started INTEGER",
+        "ALTER TABLE ecl_matches ADD COLUMN my_started INTEGER",
+        "ALTER TABLE sc_matches ADD COLUMN my_started INTEGER",
+        "ALTER TABLE cwc_matches ADD COLUMN my_started INTEGER",
+        "ALTER TABLE po_matches ADD COLUMN my_started INTEGER",
+        "ALTER TABLE intl_matches ADD COLUMN my_started INTEGER",
         # [2026-10 신설, 신민용 확정 — D(나)] 임대 직전 원 소속팀 감독 관계(−1 = 저장 안 됨,
         # 기존 세이브·옛 임대). 29주 복귀·시즌 끝 복귀 때 이 값으로 복원한다.
         "ALTER TABLE my_player ADD COLUMN loan_parent_relation INTEGER DEFAULT -1",

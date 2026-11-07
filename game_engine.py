@@ -1615,11 +1615,11 @@ def _update_career_stats(p, year, week):
         matches=?, goals=?, assists=?, saves=?, goals_against=?,
         avg_rating=?, team_rank=?, wins=?, draws=?, losses=?, clean_sheets=?,
         shots=?, shots_on=?, key_passes=?, dribbles=?, blocks=?, pass_acc=?,
-        team_id=?, league_name=?, tier=?, red_cards=?, yellow_cards=?
+        team_id=?, league_name=?, tier=?, red_cards=?, yellow_cards=?, league_starts=?
         WHERE id=?""",
         (sm, sg, sa, ss, sga, avg_r, rn, tw, td, tl, cs,
          d_sh, d_sho, d_kp, d_drb, d_blk, d_pac, tid,
-         lname, tier, rc_league, yc_league, existing["id"]))
+         lname, tier, rc_league, yc_league, p.get("season_league_starts", 0) or 0, existing["id"]))
     conn.commit()
     conn.close()
 
@@ -1696,12 +1696,14 @@ def _close_career_entry(p, year, week, exit_type=""):
         end_year=?, end_week=?, matches=?, goals=?, assists=?, saves=?, goals_against=?,
         avg_rating=?, team_rank=?, wins=?, draws=?, losses=?, clean_sheets=?,
         shots=?, shots_on=?, key_passes=?, dribbles=?, blocks=?, pass_acc=?,
-        league_name=?, tier=?, salary=?, position=?, team_id=?, exit_type=?, red_cards=?, yellow_cards=?
+        league_name=?, tier=?, salary=?, position=?, team_id=?, exit_type=?, red_cards=?, yellow_cards=?,
+        league_starts=?
         WHERE id=?""",
         (year, week, sm, sg, sa, ss, sga, avg_r, rn, tw, td, tl, cs,
          d_sh, d_sho, d_kp, d_drb, d_blk, d_pac,
          lname, tier, p.get("salary", 0),
-         p.get("position", ""), tid, exit_type, rc_league, yc_league, existing["id"]))
+         p.get("position", ""), tid, exit_type, rc_league, yc_league,
+         p.get("season_league_starts", 0) or 0, existing["id"]))
 
     conn.commit()
     conn.close()
@@ -12254,6 +12256,9 @@ def get_full_history_extras_for_period(team_id, nationality, start_year, end_yea
     # '전체 이력' 표(기간별 합산)는 이 필드를 아예 안 읽고 있었다.
     red_cards = 0
     yellow_cards = 0
+    # [2026-11 신설] 선발 출전 수 — my_started가 NULL(이 컬럼이 생기기 전 경기)이면 모름으로 표시한다.
+    starts = 0
+    starts_unknown = False
     _RED_REASONS = ("red_card", "second_yellow")
     # [2026-07 신설, 신민용 리포트: "전체 이력에 승패 표시가 사라졌어"]
     # 팀 이력의 승무패(e.wins/draws/losses)는 '내가 뛴 경기'가 아니라
@@ -12291,13 +12296,18 @@ def get_full_history_extras_for_period(team_id, nationality, start_year, end_yea
             f"""SELECT m.home_team_id, m.home_score, m.away_score, m.my_goals,
                        m.my_assists, m.my_saves, m.my_rating, m.my_shots,
                        m.my_shots_on, m.my_key_passes, m.my_dribbles,
-                       m.my_blocks, m.my_pass_acc, m.my_absence_reason, m.my_yellow_cards
+                       m.my_blocks, m.my_pass_acc, m.my_absence_reason, m.my_yellow_cards,
+                       m.my_started
                 FROM {tbl} m JOIN {tour_tbl} t ON m.tournament_id=t.id
                 WHERE m.my_played=1 AND (m.home_team_id=? OR m.away_team_id=?)
                   AND t.year BETWEEN ? AND ?""",
             (team_id, team_id, start_year, end_year)).fetchall()
         for r in rows:
             played_m += 1
+            if r["my_started"] is None:
+                starts_unknown = True
+            else:
+                starts += r["my_started"]
             goals += r["my_goals"] or 0
             assists += r["my_assists"] or 0
             if r["my_rating"]:
@@ -12347,13 +12357,18 @@ def get_full_history_extras_for_period(team_id, nationality, start_year, end_yea
 
     rows = c.execute(
         """SELECT m.home_team_id, m.home_score, m.away_score, m.my_goals,
-                   m.my_assists, m.my_saves, m.my_rating, m.my_absence_reason, m.my_yellow_cards
+                   m.my_assists, m.my_saves, m.my_rating, m.my_absence_reason, m.my_yellow_cards,
+                   m.my_started
             FROM po_matches m JOIN po_tournaments t ON m.tournament_id=t.id
             WHERE m.my_played=1 AND (m.home_team_id=? OR m.away_team_id=?)
               AND t.year BETWEEN ? AND ?""",
         (team_id, team_id, start_year, end_year)).fetchall()
     for r in rows:
         played_m += 1
+        if r["my_started"] is None:
+            starts_unknown = True
+        else:
+            starts += r["my_started"]
         goals += r["my_goals"] or 0
         assists += r["my_assists"] or 0
         if r["my_rating"]:
@@ -12392,13 +12407,18 @@ def get_full_history_extras_for_period(team_id, nationality, start_year, end_yea
             """SELECT m.home, m.home_score, m.away_score, m.my_goals,
                       m.my_assists, m.my_saves, m.my_rating, m.my_shots,
                       m.my_shots_on, m.my_key_passes, m.my_dribbles,
-                      m.my_blocks, m.my_pass_acc, m.my_absence_reason, m.my_yellow_cards
+                      m.my_blocks, m.my_pass_acc, m.my_absence_reason, m.my_yellow_cards,
+                      m.my_started
                FROM intl_matches m JOIN intl_tournaments t ON m.tournament_id=t.id
                WHERE m.my_played=1 AND (m.home=? OR m.away=?)
                  AND t.year BETWEEN ? AND ?""",
             (nationality, nationality, start_year, end_year)).fetchall()
         for r in rows:
             played_m += 1
+            if r["my_started"] is None:
+                starts_unknown = True
+            else:
+                starts += r["my_started"]
             goals += r["my_goals"] or 0
             assists += r["my_assists"] or 0
             if r["my_rating"]:
@@ -12430,7 +12450,15 @@ def get_full_history_extras_for_period(team_id, nationality, start_year, end_yea
         "pass_acc_sum": pass_acc_sum, "pass_acc_cnt": pass_acc_cnt,
         "wins": team_w, "draws": team_d, "losses": team_l,
         "red_cards": red_cards, "yellow_cards": yellow_cards,
+        "starts": starts, "starts_unknown": starts_unknown,
     }
+
+
+def format_apps_with_starts(played, total, starts):
+    """[2026-11 신설, 신민용 요청] 커리어 출전 표기 "25/30(선발 22)". total이 0/None이면 분모 없이 "25(선발 22)",
+    starts가 None(선발 기록이 없는 예전 기간)이면 선발 표기 없이 예전 형식 그대로."""
+    base = f"{played}/{total}" if total else str(played)
+    return base if starts is None else f"{base}(선발 {starts})"
 
 
 def get_club_and_total_extras_for_period(team_id, nationality, start_year, end_year):
@@ -13243,6 +13271,39 @@ def _get_my_season_award_rank(year, award_type):
         (year, award_type, _SIA_MY_PLAYER_ID)).fetchone()
     conn.close()
     return row["rank"] if row else None
+
+
+def get_my_ballon_rank_rows(min_rank=2):
+    """[2026-11 신설, 신민용 요청: "발롱도르는 순위 안에 들면 커리어에도 — 은퇴까지"] 내 발롱도르
+    Top30 순위권 기록(기본 2~30위 — 1위는 awards에 이미 "발롱도르" 수상으로 들어가 있다).
+    커리어·은퇴 화면의 개인 수상 목록에 섞어 쓰도록 awards 행과 같은 모양의 dict로 돌려준다
+    (is_ballon_rank=True로 구분 — 수상 건수에는 세지 않는다). 기록실 발롱도르 Top30과 같은 표를 읽는다."""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT year, rank, team_name FROM season_individual_awards "
+            "WHERE award_type='발롱도르' AND player_id=? AND rank>=? ORDER BY year",
+            (_SIA_MY_PLAYER_ID, min_rank)).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    conn.close()
+    return [{"year": r["year"], "award_type": f"발롱도르 {r['rank']}위",
+             "league_name": r["team_name"] or "", "detail": f"{r['year']} 발롱도르 {r['rank']}위",
+             "ballon_rank": r["rank"], "is_ballon_rank": True} for r in rows]
+
+
+def merge_ballon_rank_rows(awards):
+    """awards(내 수상 목록) + 발롱도르 2~30위 순위권 행을 연도순으로 합친다(같은 해는 수상이 먼저)."""
+    return sorted(list(awards) + get_my_ballon_rank_rows(), key=lambda a: a.get("year") or 0)
+
+
+def ballon_rank_summary(rows):
+    """요약 줄용 "발롱도르 순위권 N회 (최고 N위)" — 1위(수상)도 순위권에 센다. 순위권 기록이 없으면 ""."""
+    ranks = [a["ballon_rank"] for a in rows if a.get("is_ballon_rank")]
+    ranks += [1 for a in rows if a.get("award_type") == "발롱도르" and not a.get("is_ballon_rank")]
+    if not ranks:
+        return ""
+    return f"발롱도르 순위권 {len(ranks)}회 (최고 {min(ranks)}위)"
 
 
 def _get_historical_league_rank_points(year, team_id):
@@ -27200,11 +27261,13 @@ def _save_career_entry(p, year, week, force_new=False, transfer_type=None,
             end_year=?, end_week=?, matches=?, goals=?, assists=?, saves=?, goals_against=?,
             avg_rating=?, team_rank=?, wins=?, draws=?, losses=?, clean_sheets=?,
             league_name=?, tier=?, salary=?, position=?, team_id=?, exit_type=?,
-            loan_partner_team=COALESCE(?, loan_partner_team), red_cards=?, yellow_cards=?
+            loan_partner_team=COALESCE(?, loan_partner_team), red_cards=?, yellow_cards=?,
+            league_starts=?
             WHERE id=?""",
             (year, week, sm, sg, sa, ss, sga, avg_r, rn, tw, td, tl, cs,
              season_lname, season_tier, p.get("salary", 0), pos, tid,
-             exit_type, loan_partner_team, rc_league, yc_league, existing["id"]))
+             exit_type, loan_partner_team, rc_league, yc_league,
+             p.get("season_league_starts", 0) or 0, existing["id"]))
     elif not allow_insert:
         # 이미 닫힌 항목만 존재 → 중복 행은 안 만들되, 떠난 경로(exit_type)는
         # 가장 최근에 닫힌 그 팀 항목에 덧칠해 준다 (방출/팔림 표시 누락 방지).
@@ -27271,14 +27334,16 @@ def _save_career_entry(p, year, week, force_new=False, transfer_type=None,
              matches, goals, assists, saves, goals_against,
              avg_rating, team_rank, wins, draws, losses,
              contract_years, transfer_type, clean_sheets, team_id,
-             contract_role, manager_type, club_ambition, exit_type, transfer_fee, red_cards, yellow_cards)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             contract_role, manager_type, club_ambition, exit_type, transfer_fee, red_cards, yellow_cards,
+             league_starts)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (p["age"], pos, team_row["name"], team_row["lname"], saved_tier,
              p.get("salary", 0), cur_year, cur_week,
              year, week, sm, sg, sa, ss, sga, avg_r, rn, tw, td, tl,
              c_yrs_save, pending_tt, cs, tid,
              p.get("contract_role",""), p.get("manager_type",""), p.get("club_ambition",""),
-             exit_type, transfer_fee, rc_league, yc_league))
+             exit_type, transfer_fee, rc_league, yc_league,
+             p.get("season_league_starts", 0) or 0))
 
     conn.commit()
     conn.close()

@@ -1234,6 +1234,7 @@ def simulate_my_cup_match(week, p, day=None):
     # 리그와 동일한 _check_bench 재사용, 비교 기준만 이 대회 팀 OVR로.
     # 출전정지면 벤치 확률은 무의미하므로 건너뛴다(우선순위: 징계 > 벤치).
     _benched = (not _suspended) and _check_bench(p, team_avg_ovr=_team_ovr, club_match=True)   # [2026-10 my_loan] 클럽 경기
+    _my_started_pre = 0 if (_suspended or _benched) else 1   # [2026-11] 경기 전 선발 여부(교체 출전 구분용)
     if _benched:
         add_log("🪑 교체 명단에서 시작", "event")
     _star = 1.0 + max(0.0, (_my_ovr - 60) / 40.0) ** 1.8 * 3.0
@@ -1393,14 +1394,14 @@ def simulate_my_cup_match(week, p, day=None):
                     my_saves=?, my_goals=?, my_assists=?, my_rating=?, day=?,
                     my_shots=?, my_shots_on=?, my_key_passes=?,
                     my_dribbles=?, my_blocks=?, my_pass_acc=?,
-                    my_absence_reason=?, my_yellow_cards=?
+                    my_absence_reason=?, my_yellow_cards=?, my_started=?
                     WHERE id=?""",
                  (hs, as_, *et_score_values(hs90, as90, went_et),
                   pso_winner, pso_score, 0 if (_suspended or _benched) else 1,
                   saves, goals, assists, rating, day,
                   detail["shots"], detail["shots_on"], detail["key_passes"],
                   detail["dribbles"], detail["blocks"], detail["pass_acc"],
-                  _absence_reason, _yellow_cnt, m["id"]))
+                  _absence_reason, _yellow_cnt, _my_started_pre, m["id"]))
     conn.commit()
     conn.close()
 
