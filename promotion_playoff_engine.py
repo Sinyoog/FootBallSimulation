@@ -188,7 +188,7 @@ def _sim_one(conn, m, forced=None) -> None:
                pso_winner=?, pso_score=? WHERE id=?""",
             (1, 1, m["home_team_id"] if winner_home else m["away_team_id"], pso, m["id"]))
         return
-    hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
+    hs, as_ = _gen_score(outcome, h_ovr - a_ovr, top=(h_ovr, a_ovr))
     conn.execute("UPDATE po_matches SET home_score=?, away_score=? WHERE id=?",
                  (hs, as_, m["id"]))
 
@@ -740,7 +740,7 @@ def simulate_my_po_match(week, p, day=None):
         _chain = None
         engine_stats = engine_plog = player_ratings = None
         outcome = _match_outcome(h_ovr, a_ovr)
-        hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
+        hs, as_ = _gen_score(outcome, h_ovr - a_ovr, top=(h_ovr, a_ovr))
 
     pso_winner, pso_score = 0, ""
     if outcome == "draw":

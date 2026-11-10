@@ -1478,10 +1478,22 @@ def compute_awards(t):
         extra = G._pick_comp_extra_winners(pool, stage_factor=stage_f, part_denom=denom,
                                            part_key="stage_key")
         extra["young"] = None                     # 영플레이어상 없음
+        # [2026-11] 베스트11 = 새 채점(그 대회 기록만, game_engine._comp_xi_tournament — 실패하면 예전 명단).
+        _cx_ovr = G._comp_xi_safe(lambda: G._comp_xi_ovr_map(c, year), f"{year} OVR") or {}
+        G._comp_xi_tournament(c, extra, pool, "olympic", _cx_ovr, denom, "stage_key", stage_f, "intl_matches", tid,
+                              f"{year} {name}")
         balls = G._pick_top_n_mvp(pool, 3, stage_f, denom, "stage_key")
+        # [2026-11] 골든·실버·브론즈볼·올해의 수비수 = V11(진출 단계 차이 30% + 출전 분모 = 최다 경기 국가,
+        # game_engine._mvp_v11_apply). 영플레이어상은 없으므로 다시 뽑지 않는다. 실패하면 예전 선정 그대로.
+        _sv_sf, _sv_dn = stage_f, denom
+        _v11 = G._mvp_v11_apply(pool, stage_f, denom, "stage_key", extra, young_age_cutoff=None,
+                                what=f"{year} {name}")
+        if _v11 is not None and _v11[0]:
+            balls = _v11[0][:3]
+            mvp, _sv_sf, _sv_dn = balls[0], _v11[1], _v11[2]
         G._save_club_comp_award_rows(c, year, name, mvp, scorer, category="intl", extra=extra,
                                      kind_rename=OLY_AWARD_RENAME, mvp_extra=balls[1:],
-                                     stage_factor=stage_f, part_denom=denom, part_key="stage_key")
+                                     stage_factor=_sv_sf, part_denom=_sv_dn, part_key="stage_key")
         conn.commit()
         # ── 내 선수 수상(세계 결과에서 그대로) ──
         me = G._SIA_MY_PLAYER_ID

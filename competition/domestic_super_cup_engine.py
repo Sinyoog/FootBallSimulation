@@ -321,6 +321,9 @@ def _neutral_match_outcome(h_ovr, a_ovr):
     aw = max(0.02, min(0.96, half - diff * 0.022))
     tot = hw + dw + aw
     hw, dw, aw = hw / tot, dw / tot, aw / tot
+    # [2026-11] 상위 레벨은 공통 상위 표(game_engine._ai_top_probs) — 중립 경기.
+    from game_engine import _ai_top_blend
+    hw, dw, aw = _ai_top_blend((hw, dw, aw), h_ovr, a_ovr, 0.0)
     roll = random.random()
     if roll < hw:
         return "home"
@@ -887,7 +890,7 @@ def _sim_ai_match(t, m, conn=None, p=None, forced=None):
         pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
         if _g2 is not None:
             _cm.note_pso(_g2, win_home, pso_score)
-    hs, as_ = forced if forced is not None else _gen_score(outcome, he["ovr"] - ae["ovr"])
+    hs, as_ = forced if forced is not None else _gen_score(outcome, he["ovr"] - ae["ovr"], top=(he["ovr"], ae["ovr"]))
 
     _own = conn is None
     if _own:
@@ -1040,7 +1043,7 @@ def simulate_my_domestic_sc_match(week, p, day=None):
         _chain = None
         engine_stats = engine_plog = player_ratings = None
         outcome = _neutral_match_outcome(h_ovr, a_ovr)
-        hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
+        hs, as_ = _gen_score(outcome, h_ovr - a_ovr, top=(h_ovr, a_ovr))
 
     pso_winner, pso_score = 0, ""
     if outcome == "draw":

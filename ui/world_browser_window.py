@@ -663,7 +663,7 @@ _BEST_XI_TABS = (
 )
 
 _YEAR_END_WORLD_AWARD_KINDS = ("발롱도르", "야신상", "FIFA 푸스카스상", "올해의 최고의 골", "골든보이",
-                               "게르트 뮐러상",
+                               "코파 트로피", "게르트 뮐러상",
                                "FIFA 올해의 선수", "UEFA 올해의 선수", "코메볼 올해의 선수",
                                "AFC 올해의 선수", "CAF 올해의 선수", "콩카카프 올해의 선수",
                                "OFC 올해의 선수")
@@ -862,10 +862,11 @@ def _build_squad_roster_panel(starters, bench, on_click=None, height=460,
         name = p.get("display_name") or p.get("name") or "-"
         pid = p.get("id")
         lbl = QLabel(f"{pos}  {name}")
-        # 간단 변경 창이 열 수 있는 선수(id>=0)만 이동 순서에 넣는다 — 내 선수·국제대회 가상 선수는
-        # 클릭해도 간단 변경 창이 아니라 바로 이동이므로 WASD로 지나가면 창이 엉뚱하게 바뀐다.
+        # 간단 변경 창이 열 수 있는 선수만 이동 순서에 넣는다 — 국제대회 가상 선수는 클릭해도 간단 변경 창이
+        # 아니라 바로 이동이므로 WASD로 지나가면 창이 엉뚱하게 바뀐다. [2026-11 신민용 요청] 내 선수
+        # (MY_PLAYER_ID)도 이제 간단 변경 창에 뜨므로(_fetch_quick_player) 이동 순서에 넣는다.
         lbl._wb_player = p   # [2026-10] 간단 변경 창이 그 화면 기준 소속(club 등)을 읽는다
-        if isinstance(pid, int) and pid >= 0:
+        if isinstance(pid, int) and (pid >= 0 or pid == wb.MY_PLAYER_ID):
             _g = "S" if is_starter else "B"
             lbl._wb_nav = (_nav_ctx, _g, len(_nav_ctx[_g]))
             _nav_ctx[_g].append((pid, pos, lbl))
@@ -1884,11 +1885,34 @@ def _fetch_quick_player(player_id):
     ai_players에 없으면 ai_players_retired(은퇴 아카이브)를 한 번 더
     본다 — 은퇴 선수도 이름은 바꿀 수 있어야 하므로(선수 검색 상세의
     _player_detail_pid/_player_detail_stat_pid 구분과 동일한 원칙:
-    이름은 은퇴자도 OK, OVR·국적은 현역 전용). 둘 다 없으면(본인
-    MY_PLAYER_ID, 국제대회 가상 선수 등 id<0) None — 호출부가 기존
-    "바로 이동" 경로로 폴백한다.
+    이름은 은퇴자도 OK, OVR·국적은 현역 전용). 둘 다 없으면(국제대회
+    가상 선수 등 id<0) None — 호출부가 기존 "바로 이동" 경로로 폴백한다.
+    [2026-11] 본인(MY_PLAYER_ID)은 my_player에서 읽어 같은 모양으로 돌려준다.
     """
-    if player_id is None or player_id < 0:
+    if player_id is None:
+        return None
+    if player_id == wb.MY_PLAYER_ID:
+        # [2026-11 신설, 신민용 요청: "플레이어도 그 당시 포지션이나 OVR이 뜨게"] 내 선수도 같은 창으로 —
+        # 이름·국적·나이·주포·부포를 my_player에서 읽는다. 이름·국적 편집 대상은 아니다(load_player가
+        # id < 0이면 편집 칸을 끈다). OVR(당시)는 호출부가 get_players_year_ovr(my_player_ovr_history)로 채운다.
+        conn = get_conn()
+        try:
+            me = conn.execute("SELECT name, position, nationality, age FROM my_player WHERE id=1").fetchone()
+        finally:
+            conn.close()
+        if me is None:
+            return None
+        return {
+            "id": player_id, "is_me": True,
+            "name": me["name"] or "나",
+            "position": me["position"] or "",
+            "nationality": me["nationality"] or "",
+            "is_retired": False,
+            "sub_position": _subp_get(player_id),
+            "age": me["age"],
+            "retirement_year": None,
+        }
+    if player_id < 0:
         return None
     conn = get_conn()
     # [2026-10] age·은퇴 연도는 "나이(당시)" 계산용 — 선수 검색 연도별 기록의 나이와 같은 규칙
@@ -2125,7 +2149,9 @@ class QuickPlayerEditPopup(QDialog):
         # [2026-10 신설, 신민용 요청] 국가대표 대회 화면에서 연 경우만 — 그 대회 소집 당시 소속팀과 그 팀 리그.
         _cc = pl.get("ctx_club")
         if _cc is not None:
-            _lg = _cc.get("league") or ""
+            # [2026-11 변경, 신민용 요청: "리그(당시)를 '프리미어리그 (1부)' 말고 '국가명 (1부)'로"] 리그 이름 대신
+            # 그 리그의 나라 이름. 나라를 모르는 행(은퇴 선수 마지막 팀 등)만 예전처럼 리그 이름.
+            _lg = _cc.get("country") or _cc.get("league") or ""
             _tr = _cc.get("tier")
             if _lg and _tr:
                 _lg_txt = f"{_lg} ({_tr}부)"
@@ -2190,7 +2216,9 @@ class QuickPlayerEditPopup(QDialog):
                 elif label == "소속팀(당시)":
                     label_item.setToolTip("이 대회 소집 당시 이 선수가 뛰던 팀")
                 elif label == "리그(당시)":
-                    label_item.setToolTip("그 팀이 그 해 뛰던 리그(몇 부)")
+                    _lgn = (pl.get("ctx_club") or {}).get("league") or ""
+                    label_item.setToolTip("그 팀이 그 해 뛰던 리그의 나라(몇 부)"
+                                          + (f" — {_lgn}" if _lgn else ""))
                 elif label == "OVR(당시)":
                     value_item.setForeground(QColor("#ffcc00"))
                     _cy = pl.get("ctx_year")
@@ -3221,9 +3249,10 @@ class WorldBrowserWindow(QDialog):
                 except (TypeError, ValueError):
                     pl["ctx_age"] = None
         if pl is None:
-            # ai_players/ai_players_retired 어디에도 없는 id — 본인
-            # (MY_PLAYER_ID)이나 국제대회 가상 선수. 이런 선수는 애초에
-            # 이름·OVR·국적 편집 대상이 아니므로 예전 동작으로 폴백한다.
+            # ai_players/ai_players_retired 어디에도 없는 id — 국제대회 가상
+            # 선수 등. 이런 선수는 애초에 이름·OVR·국적 편집 대상이 아니므로
+            # 예전 동작으로 폴백한다. ([2026-11] 본인(MY_PLAYER_ID)은 이제
+            # _fetch_quick_player가 my_player에서 읽어 이 창에 띄운다.)
             self._quick_nav_pending = None
             _QUICK_NAV_HINT["widget"] = None
             self.open_to_player(player_id)
@@ -3247,7 +3276,7 @@ class WorldBrowserWindow(QDialog):
             _src = None
         if isinstance(_src, dict) and "club" in _src and _src.get("id") == player_id:
             pl["ctx_club"] = {"club": _src.get("club") or "", "league": _src.get("club_league") or "",
-                              "tier": _src.get("club_tier")}
+                              "tier": _src.get("club_tier"), "country": _src.get("club_country") or ""}
         popup = getattr(self, "_quick_popup", None)
         if popup is not None:
             try:
@@ -14976,7 +15005,7 @@ class WorldBrowserWindow(QDialog):
         # 탭(4-3-3 포메이션 그림 + 우측 명단)으로 분리, 골든보이(Top 10) 탭을 새로 둔다.
         for key, label in (("야신상", "🥅 야신상"), ("푸스카스상", "⚽ 푸스카스상"),
                            ("올해의 선수", "🏆 올해의 선수"), ("게르트 뮐러상", "⚽ 게르트 뮐러상"),
-                           ("골든보이", "🌟 골든보이"),
+                           ("골든보이", "🌟 골든보이"), ("코파 트로피", "🏅 코파 트로피"),
                            ("베스트 11", "📋 베스트 11")):
             btn = QPushButton(label)
             btn.setCheckable(True)
@@ -15058,7 +15087,8 @@ class WorldBrowserWindow(QDialog):
         _enable_plain_copy(self.ia_gm_tbl)
         right_lay.addWidget(self.ia_gm_tbl, 2)
 
-        # [2026-10 신설] 골든보이 Top 10 — 야신상과 같은 채점 컬럼(발롱도르 점수 공식).
+        # [2026-10 신설] 골든보이 Top 10 — 제목은 그 해 행 형식에 맞춰 _fill_golden_boy_table이 바꾼다
+        # (2026-11 새 채점 행은 발롱도르 새 형식과 같은 열).
         self.ia_gb_title = QLabel("🌟 골든보이 Top 10 (유럽 1부 · 20세 이하 · 1위가 수상)")
         self.ia_gb_title.setStyleSheet("color:#ffcc00;font-size:13px;font-weight:bold;margin-top:8px;")
         self.ia_gb_title.setVisible(False)
@@ -15071,6 +15101,21 @@ class WorldBrowserWindow(QDialog):
         self.ia_gb_tbl.setVisible(False)
         _enable_plain_copy(self.ia_gb_tbl)
         right_lay.addWidget(self.ia_gb_tbl, 2)
+
+        # [2026-11 신설, 신민용 확정] 코파 트로피 Top 10 — 골든보이와 같은 열(전 대륙 · 반복 수상 허용).
+        self.ia_kopa_title = QLabel("🏅 코파 트로피 Top 10 (전 대륙 SS/S/A 1부 · 20세 이하 · 리그 출전 50% 이상 · "
+                                    "1위가 수상, 여러 번 수상 가능)")
+        self.ia_kopa_title.setStyleSheet("color:#ffcc00;font-size:13px;font-weight:bold;margin-top:8px;")
+        self.ia_kopa_title.setVisible(False)
+        right_lay.addWidget(self.ia_kopa_title)
+        self.ia_kopa_tbl = QTableWidget(0, 0)
+        self.ia_kopa_tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.ia_kopa_tbl.verticalHeader().setVisible(False)
+        self.ia_kopa_tbl.cellDoubleClicked.connect(
+            lambda row, col: self._on_ia_player_row_clicked(self.ia_kopa_tbl, row))
+        self.ia_kopa_tbl.setVisible(False)
+        _enable_plain_copy(self.ia_kopa_tbl)
+        right_lay.addWidget(self.ia_kopa_tbl, 2)
 
         # [2026-10 신설] FIFA 베스트 11 — 4-3-3 포메이션 그림 + 우측 명단. 선수 클릭은 다른
         # 포메이션 카드와 같은 라우팅(간단 변경이면 이름 변경 창, 바로 이동이면 선수 검색).
@@ -15176,6 +15221,7 @@ class WorldBrowserWindow(QDialog):
             "올해의 선수": (self.ia_fifa_title, self.ia_fifa_tbl),
             "게르트 뮐러상": (self.ia_gm_title, self.ia_gm_tbl),
             "골든보이": (self.ia_gb_title, self.ia_gb_tbl),
+            "코파 트로피": (self.ia_kopa_title, self.ia_kopa_tbl),
             "베스트 11": (self.ia_xi_title, self.ia_xi_box),
         }
         for key, (title, tbl) in _panels.items():
@@ -15257,8 +15303,12 @@ class WorldBrowserWindow(QDialog):
         # 같은 원칙으로 미리 채워둔다 — 토글 전환 시 재조회 없음.
         self._fill_fifa_table(wb.get_world_poty_awards(year, wb.WORLD_POTY_ONLY_AWARD_TYPES))
         # [2026-10 신설] 골든보이 Top 10 / FIFA 베스트 11(포메이션)
-        self._fill_yashin_table(wb.get_season_individual_awards(year, "골든보이"),
-                                tbl=self.ia_gb_tbl, empty_msg="이 해는 골든보이 후보가 없습니다")
+        self._fill_golden_boy_table(wb.get_season_individual_awards(year, "골든보이"))
+        self._fill_ballon_table_v2(   # [2026-11 신설] 코파 트로피 — 처음부터 새 형식(kopa_v1)뿐
+            wb.get_season_individual_awards(year, "코파 트로피"), tbl=self.ia_kopa_tbl,
+            empty_msg="이 해는 코파 트로피 기록이 없습니다",
+            part_tip="리그 출전 비율 50% → 0점, 100% → 0.5점",
+            team_tip="리그 순위 0.4(× 리그 출전 비율) + 국내컵 0.1 + 대륙대회 0.5 (1.5점 만점, 리그 수준·난이도 반영)")
         self._fill_gerd_muller_table(wb.get_gerd_muller_rows(year))   # [2026-10-30 신설]
         self._fill_best_xi_box(wb.get_season_individual_awards(year, self._ia_xi_award), year=year)
 
@@ -15389,6 +15439,14 @@ class WorldBrowserWindow(QDialog):
                  f"  합계            {r.get('score_trophy') or 0:.2f}")
 
     def _fill_ballon_table(self, rows):
+        # [2026-11 신민용 확정] 발롱도르 새 채점 행(xi_formation == "ballon_v2")은 전용 열로 보여준다 —
+        # 그 전 시즌 행은 아래 예전 열 구성 그대로. 한 해에 두 형식이 섞이면(정상적으로는 없음) 예전 표로 보이고 경고를 남긴다.
+        _forms = {r.get("xi_formation") for r in rows}
+        if rows and _forms == {"ballon_v2"}:
+            return self._fill_ballon_table_v2(rows)
+        if "ballon_v2" in _forms:
+            print(f"[경고] 발롱도르 표: 한 해에 새·예전 채점 행이 섞여 있습니다 ({sorted(map(str, _forms))}) — 예전 표로 표시",
+                  file=sys.stderr)
         tbl = self.ia_ballon_tbl
         cols = ["순위", "선수", "국적", "팀", "포지션", "트로피", "평점", "생산성", "포지션보정", "총점"]
         tbl.clear()
@@ -15421,6 +15479,67 @@ class WorldBrowserWindow(QDialog):
                     cell.setForeground(Qt.GlobalColor.green)
                 tbl.setItem(i, j, cell)
         self._show_empty_state(tbl, rows, "이 해는 발롱도르 후보가 없습니다", len(cols))
+        self._grow_to_fit(tbl, stretch_col=1)
+
+    def _fill_golden_boy_table(self, rows):
+        """[2026-11 신설] 골든보이 표 — 새 채점 행(xi_formation == "golden_v2")은 발롱도르 새 형식과 같은 열(10점 만점,
+        출전·팀 성적 설명만 골든보이 규칙), 그 전 시즌 행은 예전 열 구성(_fill_yashin_table) 그대로."""
+        _forms = {r.get("xi_formation") for r in rows}
+        if rows and _forms == {"golden_v2"}:
+            self.ia_gb_title.setText("🌟 골든보이 Top 10 (유럽 SS/S/A 1부 · 20세 이하 · 리그 출전 50% 이상 · 1위가 수상)")
+            return self._fill_ballon_table_v2(
+                rows, tbl=self.ia_gb_tbl, empty_msg="이 해는 골든보이 후보가 없습니다",
+                part_tip="리그 출전 비율 50% → 0점, 100% → 0.5점",
+                team_tip="리그 순위 0.4(× 리그 출전 비율) + 국내컵 0.1 + 대륙대회 0.5 (1.5점 만점, 리그 수준·난이도 반영)")
+        if "golden_v2" in _forms:
+            print(f"[경고] 골든보이 표: 한 해에 새·예전 채점 행이 섞여 있습니다 ({sorted(map(str, _forms))}) — 예전 표로 표시",
+                  file=sys.stderr)
+        self.ia_gb_title.setText("🌟 골든보이 Top 10 (유럽 1부 · 20세 이하 · 1위가 수상)")
+        self._fill_yashin_table(rows, tbl=self.ia_gb_tbl, empty_msg="이 해는 골든보이 후보가 없습니다")
+
+    def _fill_ballon_table_v2(self, rows, tbl=None, empty_msg=None, part_tip=None, team_tip=None):
+        """[2026-11 신설] 발롱도르 새 채점(game_engine._save_ballon_dor_top30 / ballon_award.py) 표 — 10점 만점.
+        능력(1.75) = 시즌 시작 OVR · 생산성(5.25) = 포지션 기대 대비 + 공격 포인트 양(GK·수비는 실점·선방 포함) ·
+        출전(0.5) · 팀 성적(1.5) = 리그 0.4 + 국내컵 0.1 + 대륙대회 0.5 · 국제대회(1.0). 골·도움 칸은 리그 기록.
+        [2026-11] 골든보이 새 형식 행도 이 표를 쓴다(tbl·안내 문구만 넘김 — 기본값이면 발롱도르 그대로)."""
+        tbl = tbl or self.ia_ballon_tbl
+        cols = ["순위", "선수", "국적", "팀", "포지션", "골·도움(리그)", "능력", "생산성", "출전",
+                "팀 성적", "국제대회", "총점"]
+        tips = {6: "시즌 시작 OVR (1.75점 만점)",
+                7: "포지션 기대 대비 생산성 + 공격 포인트 양 — 모든 공식 대회, 리그 수준·득점 환경 보정 (5.25점 만점)",
+                8: part_tip or "리그 출전 비율 70% → 0점, 100% → 0.5점",
+                9: team_tip or "리그 순위 0.4 + 국내컵 0.1 + 대륙대회 0.5 (1.5점 만점, 리그 수준·난이도 반영)",
+                10: "월드컵·대륙컵·올림픽·예선 등 국가대표 성과 (1.0점 만점)"}
+        tbl.clear()
+        tbl.setRowCount(len(rows))
+        tbl.setColumnCount(len(cols))
+        tbl.setHorizontalHeaderLabels(cols)
+        for j, t in tips.items():
+            h = tbl.horizontalHeaderItem(j)
+            if h is not None:
+                h.setToolTip(t)
+        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for i, r in enumerate(rows):
+            ga = f"{r.get('stat_goals') or 0} · {r.get('stat_assists') or 0}"
+            vals = [str(r["rank"]), r["name"], r.get("nationality") or "", r.get("team_name") or "",
+                    r.get("position") or "", ga,
+                    f"{r.get('score_rating') or 0:.2f}", f"{r.get('score_goals_assists') or 0:.2f}",
+                    f"{r.get('score_position_adj') or 0:.2f}", f"{r.get('team_trophy') or 0:.2f}",
+                    f"{r.get('national_trophy') or 0:.2f}", f"{r.get('total_score') or 0:.2f}"]
+            _tip = (f"팀 성적 {r.get('team_trophy') or 0:.2f} + 국제대회 {r.get('national_trophy') or 0:.2f}"
+                    f" = {r.get('score_trophy') or 0:.2f}")
+            for j, v in enumerate(vals):
+                cell = QTableWidgetItem(v)
+                cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if j == 0:
+                    cell.setData(Qt.ItemDataRole.UserRole, r["player_id"])
+                if j in (9, 10):
+                    cell.setToolTip(_tip)
+                if r["player_id"] == wb.MY_PLAYER_ID:
+                    cell.setForeground(Qt.GlobalColor.green)
+                tbl.setItem(i, j, cell)
+        self._show_empty_state(tbl, rows, empty_msg or "이 해는 발롱도르 후보가 없습니다", len(cols))
         self._grow_to_fit(tbl, stretch_col=1)
 
     def _fill_puskas_table(self, rows):
@@ -15462,6 +15581,10 @@ class WorldBrowserWindow(QDialog):
         # (game_engine._save_yashin_trophy_top10 참고 — GK 전용 채점을
         # 재사용할 뿐 breakdown 필드 자체는 동일) — _fill_ballon_table과
         # 같은 컬럼 레이아웃을 그대로 쓰되 대상 표만 ia_yashin_tbl로 분리.
+        # [2026-11 신민용 확정] 야신상 새 채점 행(xi_formation == "yashin_v2")은 전용 열로 보여준다 — 그 전 시즌 행과
+        # 골든보이 표(tbl을 넘겨 이 함수를 같이 씀)는 아래 예전 열 구성 그대로.
+        if tbl is None and rows and all(r.get("xi_formation") == "yashin_v2" for r in rows):
+            return self._fill_yashin_table_v2(rows, empty_msg)
         tbl = tbl or self.ia_yashin_tbl
         cols = ["순위", "선수", "국적", "팀", "포지션", "트로피", "평점", "생산성", "포지션보정", "총점"]
         tbl.clear()
@@ -15478,6 +15601,45 @@ class WorldBrowserWindow(QDialog):
                      f"{r.get('score_trophy') or 0:.1f}", f"{r.get('score_rating') or 0:.1f}",
                      f"{r.get('score_goals_assists') or 0:.1f}", f"{r.get('score_position_adj') or 0:.1f}",
                      f"{r.get('total_score') or 0:.1f}"]
+            for j, v in enumerate(vals):
+                cell = QTableWidgetItem(v)
+                cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if j == 0:
+                    cell.setData(Qt.ItemDataRole.UserRole, r["player_id"])
+                if r["player_id"] == wb.MY_PLAYER_ID:
+                    cell.setForeground(Qt.GlobalColor.green)
+                tbl.setItem(i, j, cell)
+        self._show_empty_state(tbl, rows, empty_msg or "이 해는 야신상 후보가 없습니다", len(cols))
+        self._grow_to_fit(tbl, stretch_col=1)
+
+    def _fill_yashin_table_v2(self, rows, empty_msg=None):
+        """[2026-11 신설] 야신상 새 채점(game_engine._save_yashin_trophy_top10 / yashin_award.py) 표 — 10점 만점.
+        선방(6.0) = 상대 공격진 보정 선방률 · 실점·CS(1.5) = 경기당 실점 + 클린시트율 · 출전(0.5) = 리그 출전 비율 ·
+        팀 성적(1.0) = 리그·국내컵·대륙대회 · 국제대회(1.0) = 월드컵·대륙컵. 선방률 칸은 실제 리그 선방률."""
+        tbl = self.ia_yashin_tbl
+        cols = ["순위", "선수", "국적", "팀", "선방률", "선방", "실점·CS", "출전", "팀 성적", "국제대회", "총점"]
+        tips = {5: "상대 공격진 수준을 표준 환경으로 맞춘 선방률 점수 (6.0점 만점)",
+                6: "경기당 실점 0.75 + 클린시트율 0.75 (1.5점 만점, 실제 출전 경기 기준)",
+                7: "리그 출전 비율 70% → 0점, 100% → 0.5점",
+                8: "리그 순위 0.5 + 국내컵 0.2 + 대륙대회 0.3 (1.0점 만점, 그 대회 출전 비율 반영)",
+                9: "월드컵·대륙컵 중 높은 쪽 (1.0점 만점, 출전 비율 반영)"}
+        tbl.clear()
+        tbl.setRowCount(len(rows))
+        tbl.setColumnCount(len(cols))
+        tbl.setHorizontalHeaderLabels(cols)
+        for j, t in tips.items():
+            h = tbl.horizontalHeaderItem(j)
+            if h is not None:
+                h.setToolTip(t)
+        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for i, r in enumerate(rows):
+            sv, gc = r.get("stat_saves") or 0, r.get("stat_goals_conceded") or 0
+            sr = f"{100.0 * sv / (sv + gc):.1f}%" if (sv + gc) > 0 else "-"
+            vals = [str(r["rank"]), r["name"], r.get("nationality") or "", r.get("team_name") or "", sr,
+                    f"{r.get('score_rating') or 0:.2f}", f"{r.get('score_goals_assists') or 0:.2f}",
+                    f"{r.get('score_position_adj') or 0:.2f}", f"{r.get('team_trophy') or 0:.2f}",
+                    f"{r.get('national_trophy') or 0:.2f}", f"{r.get('total_score') or 0:.2f}"]
             for j, v in enumerate(vals):
                 cell = QTableWidgetItem(v)
                 cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -15545,12 +15707,17 @@ class WorldBrowserWindow(QDialog):
             _aw = r.get("award_type") or ""
             _aw_label = "" if _aw == _prev_award else _aw
             _prev_award = _aw
+            # [2026-11] 대륙별 올해의 선수 새 채점 행(cont_poty_v1) — 발롱도르 새 채점과 같은 눈금(약 10점 만점)이라
+            # 소수 둘째 자리까지, 총점 칸에 설명. FIFA 올해의 선수 등 예전 행은 예전 그대로.
+            _v2 = r.get("xi_formation") == "cont_poty_v1"
             vals = [_aw_label, r["name"], r.get("nationality") or "",
                      r.get("team_name") or "", r.get("position") or "",
-                     f"{r.get('total_score') or 0:.1f}"]
+                     f"{r.get('total_score') or 0:.2f}" if _v2 else f"{r.get('total_score') or 0:.1f}"]
             for j, v in enumerate(vals):
                 cell = QTableWidgetItem(v)
                 cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if _v2 and j == 5:
+                    cell.setToolTip("발롱도르 새 채점 + 자기 대륙 국가대표 대회(대륙 선수권·코파·골드컵·지역컵) 1.5배")
                 if j == 0:
                     cell.setData(Qt.ItemDataRole.UserRole, r["player_id"])
                 if r["player_id"] == wb.MY_PLAYER_ID:

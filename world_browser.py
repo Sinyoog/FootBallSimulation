@@ -4793,7 +4793,9 @@ def get_season_individual_awards(year, award_type):
                   -- 발롱도르 표의 "트로피" 칸 툴팁이 쓴다.
                   team_trophy, national_trophy, individual_trophy,
                   -- [2026-10] 베스트 11 가변 포메이션(예전 행은 NULL → 화면이 4-3-3에 배치).
-                  xi_formation, xi_slot
+                  xi_formation, xi_slot,
+                  -- [2026-11] 야신상 표의 선방률 칸 · 발롱도르 새 표의 리그 골·도움 칸
+                  stat_saves, stat_goals_conceded, stat_goals, stat_assists
            FROM hist.season_individual_awards
            WHERE year=? AND award_type=? ORDER BY rank""",
         (year, award_type)).fetchall()]
@@ -5117,7 +5119,7 @@ def _award_row_label(r):
         _jr, _tied = _gerd_muller_joint_rank(r["year"], r["player_id"] if "player_id" in r.keys() else None,
                                              r["rank"])
         return f"{r['award_type']} {'공동 ' if _tied else ''}{_jr}위"
-    if kind in ("발롱도르", "야신상", "FIFA 푸스카스상", "올해의 최고의 골", "골든보이", "게르트 뮐러상"):
+    if kind in ("발롱도르", "야신상", "FIFA 푸스카스상", "올해의 최고의 골", "골든보이", "코파 트로피", "게르트 뮐러상"):
         return f"{r['award_type']} {r['rank']}위"
     if kind == "베스트11":
         return f"{r['award_type']}" + (f" ({r['position']})" if r["position"] else "")
@@ -7010,6 +7012,29 @@ def _players_club_at(conn, player_ids, year, week):
     return out
 
 
+def _my_club_at_year(conn, year):
+    """[2026-11 신설] 내 선수의 그 해 소속(커리어 기록 career_entries — 그 해에 걸친 마지막 재직 기록) →
+    {"team_id": None, "club", "club_tier", "club_country", "club_league"} 또는 None. 나라는 그 팀이 속한 리그의
+    나라(teams → leagues → countries — 팀 id가 없는 옛 기록이면 None). 예전 두 호출부(국가대표 소집 당시
+    소속·대회 명단의 내 선수 줄)가 따로 하던 조회를 합친 것 — 팀 이름·몇 부는 예전과 같은 값."""
+    _ce = conn.execute(
+        "SELECT team_id, team_name, tier, league_name FROM career_entries "
+        "WHERE start_year<=? AND (end_year IS NULL OR end_year=0 OR end_year>=?) "
+        "ORDER BY id DESC LIMIT 1", (year, year)).fetchone()
+    if not _ce:
+        return None
+    country = None
+    if _ce["team_id"]:
+        try:
+            _r = conn.execute("SELECT cn.name FROM teams t JOIN leagues l ON l.id = t.league_id "
+                              "JOIN countries cn ON cn.id = l.country_id WHERE t.id=?", (_ce["team_id"],)).fetchone()
+            country = _r[0] if _r else None
+        except Exception:
+            country = None
+    return {"team_id": None, "club": _ce["team_name"] or "", "club_tier": _ce["tier"],
+            "club_country": country, "club_league": _ce["league_name"] or ""}
+
+
 def get_intl_squad_clubs_at_selection(tournament_id, country_name, player_ids):
     """{선수 id: 소집 당시 소속 dict} — _players_club_at 참고. 내 선수(MY_PLAYER_ID)는 커리어
     기록(career_entries)의 그 해 소속."""
@@ -7021,13 +7046,9 @@ def get_intl_squad_clubs_at_selection(tournament_id, country_name, player_ids):
         out = _players_club_at(conn, player_ids, pt[0], pt[1])
         if MY_PLAYER_ID in set(player_ids or []):
             try:
-                _ce = conn.execute(
-                    "SELECT team_name, tier FROM career_entries "
-                    "WHERE start_year<=? AND (end_year IS NULL OR end_year=0 OR end_year>=?) "
-                    "ORDER BY id DESC LIMIT 1", (pt[0], pt[0])).fetchone()
-                if _ce:
-                    out[MY_PLAYER_ID] = {"team_id": None, "club": _ce["team_name"] or "",
-                                         "club_tier": _ce["tier"], "club_country": None}
+                _me = _my_club_at_year(conn, pt[0])
+                if _me:
+                    out[MY_PLAYER_ID] = _me
             except Exception:
                 pass
         return out
@@ -7563,15 +7584,14 @@ def _my_intl_squad_entry(c, tournament_id, country_name):
     # 아니라 start_year~end_year 구간으로 저장되므로 그 구간에 걸치는 항목을
     # 찾는다(end_year=0/NULL은 "아직 진행 중"). 못 찾으면 빈 값으로 두고
     # 화면은 이름만 보여준다(AI 선수 dict와 키 구성만 맞추면 된다).
-    club = club_country = None
+    club = club_country = club_league = None
     club_tier = None
-    _ce = c.execute(
-        "SELECT team_name, tier FROM career_entries "
-        "WHERE start_year<=? AND (end_year IS NULL OR end_year=0 OR end_year>=?) "
-        "ORDER BY id DESC LIMIT 1", (year, year)).fetchone()
+    _ce = _my_club_at_year(c, year)
     if _ce:
-        club = _ce["team_name"]
-        club_tier = _ce["tier"]
+        club = _ce["club"]
+        club_tier = _ce["club_tier"]
+        club_country = _ce["club_country"]   # [2026-11] 간단 변경 창 "리그(당시)" = 나라 (몇 부)
+        club_league = _ce["club_league"]
 
     _age = me["age"]
     try:   # [2026-10] 나이도 그 대회 당시
@@ -7580,7 +7600,7 @@ def _my_intl_squad_entry(c, tournament_id, country_name):
         pass
     return {"id": MY_PLAYER_ID, "name": me["name"], "position": pos,
             "ovr": ovr, "age": _age, "club": club, "club_tier": club_tier,
-            "club_country": club_country, "appearances": apps,
+            "club_country": club_country, "club_league": club_league, "appearances": apps,
             # 실제로 한 경기라도 뛰었으면 주전으로 본다(안 뛰었으면 후보).
             "starter": apps > 0, "display_name": me["name"] or "나"}
 

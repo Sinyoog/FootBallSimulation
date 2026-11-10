@@ -965,6 +965,10 @@ def match_outcome(h_ovr, a_ovr, neutral=False, h_mgr=0.0, a_mgr=0.0):
         aw = max(0.02, 1.0 - hw - dw)
     tot = hw + dw + aw
     hw, dw, aw = hw / tot, dw / tot, aw / tot
+    # [2026-11] 상위 레벨은 공통 상위 표(game_engine._ai_top_probs). 비중립이면 고정 홈 이점.
+    from game_engine import _ai_top_blend, _AI_TOP_HOME_FIXED
+    hw, dw, aw = _ai_top_blend((hw, dw, aw), h_ovr, a_ovr,
+                               (0.0 if neutral else _AI_TOP_HOME_FIXED) + (h_mgr - a_mgr))
     roll = random.random()
     if roll < hw:
         return "home"
@@ -1063,7 +1067,8 @@ def cont_ai_outcome(h_str, a_str, neutral=False, h_mgr=0.0, a_mgr=0.0):
     from game_engine import _league_effective_ovr, _league_win_probs, _home_advantage
     diff = (_league_effective_ovr(h_str) - _league_effective_ovr(a_str)
             + (0.0 if neutral else _home_advantage()) + (h_mgr - a_mgr))
-    hw, dw, _aw = _league_win_probs(diff)
+    # [2026-11] 상위 레벨은 공통 상위 표(game_engine._ai_top_probs) — 리그와 같은 diff 그대로.
+    hw, dw, _aw = _league_win_probs(diff, max(h_str, a_str))
     roll = random.random()
     if roll < hw:
         return "home"
@@ -1316,8 +1321,8 @@ def sim_ai_match(cfg, t, m, my_played=False, conn=None, reason="injury", batch=N
             win_home, pso_score = resolve_pso(h_str, a_str, neutral=_neutral)
             pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
         _gm = cont_comp_goal_mult(t, cfg.match_table)   # [2026-10-30] 대항전 득점환경(정의부 주석)
-        hs, as_ = (_gen_score(outcome, h_str - a_str, goal_mult=_gm) if _gm != 1.0
-                   else _gen_score(outcome, h_str - a_str))
+        hs, as_ = (_gen_score(outcome, h_str - a_str, goal_mult=_gm, top=(h_str, a_str)) if _gm != 1.0
+                   else _gen_score(outcome, h_str - a_str, top=(h_str, a_str)))
 
     # [2026-10 버그수정] 경기마다 날짜가 미리 정해진 대회(슈퍼컵 sc_matches.day)는 그 날을 그대로 둔다 —
     # 예전엔 내 경기를 "그 주 대회 요일"(_week_intl_cl_day)로 덮어써서, 준결승이 끝나면 준결승 날짜가
@@ -2083,7 +2088,7 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
         _chain = None
         engine_stats = engine_plog = player_ratings = None
         outcome = match_outcome(h_ovr, a_ovr, neutral=_neutral_stage)
-        hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
+        hs, as_ = _gen_score(outcome, h_ovr - a_ovr, top=(h_ovr, a_ovr))
 
     pso_winner, pso_score = 0, ""
     is_ko = (m["stage"] != "league")

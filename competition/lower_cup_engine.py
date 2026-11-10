@@ -1179,7 +1179,7 @@ def simulate_my_lower_cup_match(week, p, day=None):
         _chain = None
         engine_stats = engine_plog = player_ratings = None
         outcome = _match_outcome(h_ovr, a_ovr)
-        hs, as_ = _gen_score(outcome, h_ovr - a_ovr, allow_extreme=True)
+        hs, as_ = _gen_score(outcome, h_ovr - a_ovr, allow_extreme=True, top=(h_ovr, a_ovr))
 
     pso_winner, pso_score = 0, ""
     if outcome == "draw":

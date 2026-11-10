@@ -265,6 +265,7 @@ class OfferWindow(QDialog):
                 self.cards_lay.setSpacing(8)
             scroll.setWidget(inner)
             root.addWidget(scroll)
+            self._scroll, self._inner = scroll, inner   # [2026-11] _fit_width가 내용 폭을 잰다
             self._render_cards()
 
         close = QPushButton("닫기" if self.lang=="ko" else "Close")
@@ -312,6 +313,32 @@ class OfferWindow(QDialog):
             for j in range(empty_slots):
                 self.cards_lay.addWidget(self._make_apply_slot_card())
             self.cards_lay.addStretch()
+        self._fit_width()
+
+    def _fit_width(self):
+        """[2026-11 신설, 신민용 리포트: "오퍼 창 가로 길이가 안의 글자에 맞춰 커지게 — 지금은 카드 오른쪽이 잘린다"]
+        카드 줄(연봉·이적료·계약, 팀 평균 OVR 등)이 가장 긴 카드의 글자 폭만큼 창 가로를 넓힌다. 카드 안 글자는
+        줄바꿈하지 않는 라벨이라 내용 영역의 최소 폭(minimumSizeHint)이 곧 "안 잘리는 폭"이다 — 거기에 세로
+        스크롤바·여백만큼 더한다. 넓히기만 하고 줄이지는 않는다(사용자가 키운 창, 협상 뒤 다시 그릴 때 들쭉날쭉
+        방지). 화면보다 넓어야 하면 화면 폭까지만 키우고 나머지는 예전처럼 가로 스크롤."""
+        scroll = getattr(self, "_scroll", None)
+        inner = getattr(self, "_inner", None)
+        if scroll is None or inner is None:
+            return
+        try:
+            inner.layout().activate()
+            need = inner.minimumSizeHint().width()
+            vbar = scroll.verticalScrollBar().sizeHint().width()
+            m = self.layout().contentsMargins() if self.layout() is not None else None
+            pad = (m.left() + m.right()) if m is not None else 22
+            want = need + vbar + pad + 2 * scroll.frameWidth() + 4
+            scr = self.screen() or (self.parentWidget().screen() if self.parentWidget() else None)
+            if scr is not None:
+                want = min(want, scr.availableGeometry().width() - 40)
+            if want > self.width():
+                self.resize(want, self.height())
+        except RuntimeError:
+            pass
 
     # ── [2026-10 병역 시스템 7단계] 20세부터 오퍼 아래에 군팀 2곳 ──────────────
     def _military_offers(self):

@@ -5364,6 +5364,10 @@ def _match_outcome(h_ovr, a_ovr, knockout, neutral=False, h_mgr=0.0, a_mgr=0.0):
     # [2026-10 6번 ③-1 대표팀] 감독 능력 보정은 곡선 뒤(기본 0 = 예전과 같음).
     diff = diff + (h_mgr - a_mgr)
     hw, dw, aw = _intl_outcome_probs(diff, neutral)
+    # [2026-11] 상위 레벨은 공통 상위 표(game_engine._ai_top_probs). 예선(비중립)은 고정 홈 이점.
+    from game_engine import _ai_top_blend, _AI_TOP_HOME_FIXED
+    hw, dw, aw = _ai_top_blend((hw, dw, aw), h_ovr, a_ovr,
+                               (0.0 if neutral else _AI_TOP_HOME_FIXED) + (h_mgr - a_mgr))
     roll = random.random()
     if roll < hw:
         return "home"
@@ -5372,7 +5376,7 @@ def _match_outcome(h_ovr, a_ovr, knockout, neutral=False, h_mgr=0.0, a_mgr=0.0):
     return "away"
 
 
-def _gen_intl_score(outcome, diff=0.0):
+def _gen_intl_score(outcome, diff=0.0, top=None):
     """[2026-09 수정, 신민용 요청: "오스트레일리아 31-0 아메리칸사모아,
     대한민국 16-0 네팔 같은 A매치 역사적 대승이 재현 가능해야 한다"]
     allow_extreme=True로 넘겨 game_engine._gen_score의 극초압도 구간
@@ -5416,8 +5420,9 @@ def _gen_intl_score(outcome, diff=0.0):
         diff로는 전 세계 최대 격차(약 50점)로도 80에 도달할 수 없어서
         이 구간이 여태 도달 불가능한 죽은 코드였다."""
     from game_engine import _gen_score
+    # [2026-11 2단계] top=(홈 전력, 원정 전력)이면 상위 레벨은 공통 상위 점수 표(game_engine._ai_score_weights).
     return _gen_score(outcome, (diff or 0.0) * _INTL_MARGIN_DIFF_SCALE,
-                      allow_extreme=True)
+                      allow_extreme=True, top=top)
 
 
 def _resolve_pso(h_ovr, a_ovr, neutral=False):
@@ -5902,7 +5907,7 @@ def _sim_ai_match(t, m, my_played=False, conn=None, reason="injury", batch=None)
     # cup_engine은 이미 diff를 넘기고 있었는데 국제대회 조별/예선 AI 매치만
     # 빠져 있었음.
     # [2026-10 F2] 스코어도 승패와 같은 곡선 적용 전력차를 쓴다.
-    hs, as_ = _gen_intl_score(outcome, _intl_effective_diff(he["ovr"], ae["ovr"]))
+    hs, as_ = _gen_intl_score(outcome, _intl_effective_diff(he["ovr"], ae["ovr"]), top=(he["ovr"], ae["ovr"]))
 
     # [2026-10 A안, 신민용 확정] 내가 대표로 뽑혀 참가하는 대회(my_selected==1)의 경기는 AI끼리
     # 경기(+내가 결장한 우리나라 경기)도 내 경기와 같은 전술 엔진으로 돌린다 — 그 대회 모든 선수의
@@ -6296,7 +6301,7 @@ def simulate_my_match(week, p, day=None):
         # 타야 한다 — _gen_score를 직접 부르면 국가대표 전력차 스케일
         # 환산(_gen_intl_score 주석 참고)이 빠져 같은 매치업인데도
         # 경로에 따라 스코어 분포가 달라진다.
-        hs, as_ = _gen_intl_score(outcome, _intl_effective_diff(h_ovr, a_ovr))   # [2026-10 F2]
+        hs, as_ = _gen_intl_score(outcome, _intl_effective_diff(h_ovr, a_ovr), top=(h_ovr, a_ovr))   # [2026-10 F2]
 
     pso_winner, pso_score = "", ""
     if knockout and outcome == "draw":
@@ -7051,7 +7056,7 @@ def _finalize_qual_po(t):
                 _hs, _as = 1, 1
                 _pso_w = home["country"] if _win_home else away["country"]
             else:
-                _hs, _as = _gen_intl_score(_outcome, _intl_effective_diff(home["ovr"], away["ovr"]))   # [2026-10 F2]
+                _hs, _as = _gen_intl_score(_outcome, _intl_effective_diff(home["ovr"], away["ovr"]), top=(home["ovr"], away["ovr"]))   # [2026-10 F2]
             _conn_fix = get_conn()
             _conn_fix.execute(
                 """UPDATE intl_matches SET home_score=?, away_score=?,
@@ -7742,6 +7747,13 @@ def _award_intl_awards(t):
         if best_gk and best_gk["is_mine"]:
             awards.append((glove_name, f"{my_cs} 클린시트"))
 
+    # [2026-11 신민용 확정: "내 선수 경력 수상을 세계 기록실 명단과 통일"] 월드컵·대륙컵·지역컵의 MVP(골든·
+    # 실버·브론즈볼, MVP 2·3위)·영플레이어상은 베스트 11처럼 시즌 종료 때 세계기록실 명단으로 정한다
+    # (game_engine._compute_intl_individual_awards → _my_intl_list_awards, 시즌 중 은퇴면
+    # _settle_my_intl_best11_early가 같은 규칙으로) — 여기서는 뺀다. 그 밖의 대회 종류는 예전 판정 그대로.
+    if t["kind"] in _MY_XI_FROM_LIST_INTL_KINDS:
+        _list_kinds = {mvp_name, mvp2_name, mvp3_name, young_name}
+        awards = [a for a in awards if a[0] not in _list_kinds]
     for atype, detail in awards:
         add_log(f"🏅 {atype} 수상! ({detail})", "event")
         conn.execute(

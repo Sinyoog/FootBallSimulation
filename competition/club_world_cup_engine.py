@@ -300,7 +300,7 @@ def _sim_one(conn, m, forced=None):
                pso_winner=?, pso_score=? WHERE id=?""",
             (hs, as_, m["home_team_id"] if winner_home else m["away_team_id"], pso, m["id"]))
         return
-    hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
+    hs, as_ = _gen_score(outcome, h_ovr - a_ovr, top=(h_ovr, a_ovr))
     conn.execute("UPDATE cwc_matches SET home_score=?, away_score=? WHERE id=?",
                  (hs, as_, m["id"]))
 
@@ -689,7 +689,7 @@ def _cwc_team_stage_weights(conn, tid):
     return _weight
 
 
-def _award_cwc_awards(conn, tid, year, my_tid):
+def _award_cwc_awards(conn, tid, year, my_tid, mode="finish"):
     """[2026-07 확장, 신민용 확정] 클럽월드컵 MVP/득점왕/베스트11/영플레이어/
     골든글러브. 리그 상 시스템의 공용 함수(_position_award_score,
     _evaluate_extra_awards)를 그대로 재사용.
@@ -803,6 +803,18 @@ def _award_cwc_awards(conn, tid, year, my_tid):
         if best_gk and best_gk["is_mine"]:
             awards.append(("클럽 월드컵 골든글러브", f"{my_cs} 클린시트"))
 
+    # [2026-11 신민용 확정: "내 선수 경력 수상을 세계 기록실 명단과 통일"] MVP·영플레이어·득점왕·골든글러브는
+    # (득점왕·골든글러브는 위 판정이 AI 기록을 추정치로 비교해 명단과 어긋났다) 시즌 종료 때
+    # 세계기록실 명단으로 정한다(game_engine._compute_club_comp_individual_awards → _my_club_list_awards) —
+    # 대회 종료 판정("finish")에서는 빼고, 명단이 끝내 안 만들어지는 시즌 중 은퇴(mode="list_early",
+    # game_engine._settle_my_cwc_awards_early)에서만 예전 판정으로 그 상들만 넣는다.
+    _list_kinds = ("클럽 월드컵 MVP", "클럽 월드컵 영플레이어", "클럽 월드컵 득점왕", "클럽 월드컵 골든글러브")
+    if mode == "list_early":
+        awards = [a for a in awards if a[0] in _list_kinds
+                  and not conn.execute("SELECT 1 FROM awards WHERE year=? AND award_type=? AND is_mine=1",
+                                       (year, a[0])).fetchone()]
+    else:
+        awards = [a for a in awards if a[0] not in _list_kinds]
     for atype, detail in awards:
         add_log(f"🏅 {atype} 수상! ({detail})", "event")
         conn.execute(
@@ -1297,7 +1309,7 @@ def simulate_my_cwc_match(week, p, day=None):
         _chain = None
         engine_stats = engine_plog = player_ratings = None
         outcome = _match_outcome(h_ovr, a_ovr, neutral=_neutral_stage)
-        hs, as_ = _gen_score(outcome, h_ovr - a_ovr)
+        hs, as_ = _gen_score(outcome, h_ovr - a_ovr, top=(h_ovr, a_ovr))
 
     pso_winner, pso_score = 0, ""
     is_ko = (m["stage"] != "group")

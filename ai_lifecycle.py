@@ -10961,6 +10961,12 @@ def _snapshot_season_ratings(c, year, team_goals_for=None, include_league=True, 
         rows_by_team.setdefault(tid, []).append(_i)
 
     team_avg = {tid: team_ovr_sum[tid] / team_ovr_n[tid] for tid in team_ovr_sum}
+    # [2026-11] GK 기록 정합용 — 팀별 상대 공격진 값(_gk_attack_rating, 아래 _GK_* 주석)
+    _att_by_team = {}
+    for _pid_a, _pos_a, _ovr_a, _sub_a, _tid_a, _lid_a in rows:
+        if _pos_a in _GK_ATT_POS:
+            _att_by_team.setdefault(_tid_a, []).append(_ovr_a)
+    _team_att = {_t: _gk_attack_rating(_v) for _t, _v in _att_by_team.items()}
     league_avg = {lid: league_ovr_sum[lid] / league_ovr_n[lid] for lid in league_ovr_sum}
     # game_engine._league_full_season_matches와 동일 공식(팀 수-1 × 다전제).
     league_matches = {}
@@ -11102,6 +11108,34 @@ def _snapshot_season_ratings(c, year, team_goals_for=None, include_league=True, 
         # 실측 + 나머지 경기 비율만큼 추정치(real_stats 모듈 docstring). 추정 단계·난수는 그대로 두고 마지막에만 합친다.
         _blend_real_rows(c, raw, "league", year, team_col=2, team_totals=_fsm_l, by_team=True,
                          split_of=_split_of)
+        # [2026-11] GK 기록 정합 — 팀 실제 리그 실점·무실점 경기(그 해 리그 경기 결과)에 맞춘다(위 _GK_* 주석).
+        try:
+            _lga, _lcs, _lmn, _tlg, _lgsum, _lml = {}, {}, {}, {}, {}, {}
+            for _tbl in ("match_results", "match_results_archive"):
+                for _r in c.execute(
+                        f"""SELECT home_team_id, away_team_id, home_score, away_score, league_id FROM {_tbl}
+                            WHERE year=? AND home_score>=0 AND away_score>=0""", (year,)).fetchall():
+                    for _t, _conc, _opp in ((_r[0], _r[3], _r[1]), (_r[1], _r[2], _r[0])):
+                        _lga[_t] = _lga.get(_t, 0) + _conc
+                        _lcs[_t] = _lcs.get(_t, 0) + (1 if _conc == 0 else 0)
+                        _lmn[_t] = _lmn.get(_t, 0) + 1
+                        _tlg[_t] = _r[4]
+                        _lml.setdefault(_t, []).append((_conc, _opp))
+                    _x = _lgsum.setdefault(_r[4], [0, 0])
+                    _x[0] += _r[2] + _r[3]; _x[1] += 2
+                if _lga:
+                    break
+            _lgpm = {_l: (_v[0] / _v[1] if _v[1] else 1.3) for _l, _v in _lgsum.items()}
+            _gk_by_team = {}
+            for _i in range(len(raw)):
+                if _row_meta[_i][1] == "GK":
+                    _gk_by_team.setdefault(raw[_i][2], []).append(_i)
+            _gk_align_rows(raw, _gk_by_team, _lga, _lcs, _lmn,
+                           lambda _t: [(_g, _team_att.get(_o, team_avg.get(_o, 70.0))) for _g, _o in _lml.get(_t, ())],
+                           "club", f"league:{year}", 3, 7, 8, 9, lambda _i: _row_meta[_i][2],
+                           skip_teams=_gk_real_full_teams(c, "league", year, _lmn))
+        except Exception as _gke:
+            print("GK 기록 정합(리그) 오류(추정치 유지):", _gke)
 
         from database import history_enqueue
         if _split_of:
@@ -11173,6 +11207,21 @@ def _snapshot_season_ratings(c, year, team_goals_for=None, include_league=True, 
     # domestic_sc_tournaments도 다른 대회들과 컬럼 구성이 100% 같아서
     # (home_team_id/away_team_id/home_score/away_score/tournament_id,
     # tournaments.year) 헬퍼 함수 수정 없이 표 이름만 바꿔 끼우면 된다.
+    def _team_comp_ga_cs(table_matches, table_tournaments, ga, csn, mn=None, tot=None, ml=None):
+        # [2026-11] GK 기록 정합용 — 팀별 실제 실점·무실점 경기(승부차기 제외, 정규·연장 스코어 기준)
+        for _r in c.execute(
+                f"""SELECT m.home_team_id, m.away_team_id, m.home_score, m.away_score
+                    FROM {table_matches} m JOIN {table_tournaments} t ON m.tournament_id = t.id
+                    WHERE t.year=? AND m.home_score>=0 AND m.away_score>=0""", (year,)).fetchall():
+            for _t, _conc, _opp in ((_r[0], _r[3], _r[1]), (_r[1], _r[2], _r[0])):
+                ga[_t] = ga.get(_t, 0) + _conc
+                csn[_t] = csn.get(_t, 0) + (1 if _conc == 0 else 0)
+                if mn is not None:
+                    mn[_t] = mn.get(_t, 0) + 1
+                if ml is not None:
+                    ml.setdefault(_t, []).append((_conc, _opp))
+            if tot is not None:
+                tot[0] += _r[2] + _r[3]; tot[1] += 2
     _COMP_TABLES = {
         "cup": ("cup_matches", "cup_tournaments"),
         "cl":  None,     # cl/el/ecl 셋을 합친다(아래) — 위 워터폴 주석 참고
@@ -11394,6 +11443,24 @@ def _snapshot_season_ratings(c, year, team_goals_for=None, include_league=True, 
         # [2026-10 신설] 내 경기 실측 합산(리그 블록과 같은 규칙). 팀 경기 수 = 그 팀이 이 대회에서 치른 경기 수.
         _blend_real_rows(c, comp_raw, comp, year, team_col=10,
                          team_totals=[counts.get(r[10], 0) for r in comp_raw])
+        # [2026-11] GK 기록 정합 — 그 대회 팀별 실제 실점·무실점 경기에 맞춘다(위 _GK_* 주석).
+        try:
+            _cga, _ccs, _cmn, _ctot, _cml = {}, {}, {}, [0, 0], {}
+            if comp == "cl":
+                for _prefix in ("cl", "el", "ecl"):
+                    _team_comp_ga_cs(f"{_prefix}_matches", f"{_prefix}_tournaments", _cga, _ccs, _cmn, _ctot, _cml)
+            elif _COMP_TABLES.get(comp):
+                _team_comp_ga_cs(*_COMP_TABLES[comp], _cga, _ccs, _cmn, _ctot, _cml)
+            _cgk = {}
+            for _i, _m in enumerate(comp_meta):
+                if _m[0] == "GK":
+                    _cgk.setdefault(comp_raw[_i][10], []).append(_i)
+            _gk_align_rows(comp_raw, _cgk, _cga, _ccs, _cmn,
+                           lambda _t: [(_g, _team_att.get(_o, team_avg.get(_o, 70.0))) for _g, _o in _cml.get(_t, ())],
+                           "club", f"{comp}:{year}", 3, 7, 8, 9, lambda _i: comp_meta[_i][1],
+                           skip_teams=_gk_real_full_teams(c, comp, year, counts))
+        except Exception as _gke:
+            print(f"GK 기록 정합({comp}) 오류(추정치 유지):", _gke)
 
         by_comp_inserts.extend(tuple(row[:10]) for row in comp_raw)
 
@@ -11483,6 +11550,157 @@ def _split_mid_season_movers(c, year, rows, raw, fsm_list):
         _n = _lg_n.get(_fl, 0)
         fsm_list.append(max(1, (_n - 1) * legs_for_team_count(_n)) if _n > 1 else m1 * 2)
     return split_of, piece_role
+
+
+# ==============================================================
+# [2026-11 신설, 신민용 리포트: "크로아티아는 월드컵 5경기 8실점인데 5경기 다 뛴 GK 기록은 2실점",
+#  "좋은 키퍼는 70~80%, 야신상 1위는 70% 후반~80% 초반"] AI 골키퍼 기록 정합.
+# 예전에는 GK 실점·선방·클린시트가 전부 OVR 기반 추정치(game_engine._estimate_ai_gk_saves)라
+# 팀의 실제 실점과 따로 놀았고, 선방률은 OVR로 거의 정해졌다(OVR 99 → 약 88%).
+# 이제 (팀, 대회) 단위로:
+#   · 클럽 GK 출전 수: 한 경기에 GK는 한 명이므로 팀 GK 출전 합을 팀 경기 수에 맞춘다(출전이 많은
+#     GK부터 채움 — 예전 추정치는 백업 GK 출전이 과해 합이 팀 경기 수의 약 1.7배였다).
+#   · 실점 합 = 그 팀이 그 대회에서 실제로 내준 실점. GK가 여럿이면 출전 수 비율로 정수 배분.
+#     (AI끼리 경기는 라인업 기록이 없어 어느 GK가 어느 경기에 나왔는지 모른다 — 경기별 연결은 불가)
+#   · 클린시트 합 = 실제 무실점 경기 수, 출전 수 비율로 배분(각자 출전 수 이하).
+#   · 선방률은 경기마다 "GK 대 상대 공격진" 대결로 정한다(신민용 확정: OVR 구간표가 아니라 능력 차이 중심).
+#     그 경기 기대 선방률 p = 72.5% + 0.2%p × (두 쪽 평균 − 75) + 격차 항(GK가 강하면 1점당 +0.5%p,
+#     약하면 1점당 −0.75%p). 상대 공격진 = 그 팀 공격 자원(ST·CF·LW·RW·CAM·LM·RM) 상위 4명 OVR의
+#     가중평균(0.35·0.25·0.2·0.2). 시즌 선방률 = 그 팀이 치른 경기들의 기대치 평균 + 운(실제 피유효슈팅
+#     수에 맞는 크기, 단기 대회일수록 크다). 선방 = 시즌 실점 × p / (1 − p). 경기당 유효슈팅은 클럽
+#     1.8~8개, 국가대표 2~9개 안으로 묶는다.
+#     상한은 클럽 88%, 국가대표(단기 대회) 95%. 야신상 1위 78~82%는 결과 검증용 목표로만 쓴다.
+#   · 내 선수 경기 실측이 그 팀 경기를 전부 덮으면(우리 팀) 실측 그대로 둔다.
+#   · 전역 난수를 쓰지 않는다(팀·연도·대회 고정 시드) — 월드 진행(경기 결과·이적 등)과 무관.
+# ==============================================================
+_GK_MIN_SOT = {"club": 1.8, "intl": 2.0}      # 경기당 최소 유효슈팅(실점이 아주 적은 GK의 선방 수 하한)
+_GK_MAX_SOT = {"club": 8.0, "intl": 9.0}      # 경기당 최대 유효슈팅(선방 폭주 방지)
+_GK_SAVE_CAP = {"club": 0.88, "intl": 0.95}   # 선방률 상한(국가대표는 단기 대회라 높게)
+_GK_LUCK_MIN = 0.015     # 시즌 운 편차 하한(표준편차) — 실제로는 √(p(1−p)/피유효슈팅)
+_GK_LUCK_K = 1.0
+_GK_ATT_POS = ("ST", "CF", "LW", "RW", "CAM", "LM", "RM")
+_GK_ATT_W = (0.35, 0.25, 0.2, 0.2)
+
+
+def _gk_match_save(gk_ovr, att_ovr, cap):
+    """한 경기 기대 선방률 — GK OVR 대 상대 공격진 OVR."""
+    g = float(gk_ovr or 50); a = float(att_ovr or 50)
+    d = g - a
+    p = 0.725 + 0.002 * ((g + a) / 2.0 - 75.0) + (0.005 * d if d > 0 else 0.0075 * d)
+    return max(0.40, min(cap, p))
+
+
+def _gk_attack_rating(ovrs):
+    """공격 자원 OVR 목록 → 상대 공격진 값(상위 4명 가중평균, 모자라면 있는 만큼)."""
+    top = sorted((o or 0 for o in ovrs), reverse=True)[:len(_GK_ATT_W)]
+    if not top:
+        return None
+    w = _GK_ATT_W[:len(top)]
+    return sum(x * y for x, y in zip(top, w)) / sum(w)
+
+
+def _gk_alloc(total, weights, caps=None):
+    """total을 weights 비율로 정수 배분(최대 잔여). caps가 있으면 각자 상한."""
+    n = len(weights)
+    if total <= 0 or n == 0:
+        return [0] * n
+    sw = float(sum(weights))
+    if sw <= 0:
+        weights, sw = [1.0] * n, float(n)
+    raw = [total * w / sw for w in weights]
+    out = [int(x) for x in raw]
+    if caps is not None:
+        out = [min(o, cp) for o, cp in zip(out, caps)]
+    left = total - sum(out)
+    order = sorted(range(n), key=lambda j: -(raw[j] - int(raw[j])))
+    while left > 0:
+        moved = False
+        for j in order:
+            if left <= 0:
+                break
+            if caps is None or out[j] < caps[j]:
+                out[j] += 1
+                left -= 1
+                moved = True
+        if not moved:
+            break
+    return out
+
+
+def _gk_align_team(entries, ga, cs_n, team_matches, match_list, kind, seed_key):
+    """한 (팀, 대회)의 GK 행들 — entries: [{"apps", "ovr", "gc"}]. ga/cs_n/team_matches = 그 팀의 실제
+    실점·무실점 경기·경기 수, match_list = [(그 경기 실점, 상대 공격진 OVR)].
+    클럽은 GK 출전 수 합을 팀 경기 수에 맞춘다. 반환: [(출전, 실점, 클린시트, 선방)] (entries 순서)."""
+    import math
+    import random as _random
+    rng = _random.Random(f"gk:{seed_key}")
+    apps = [max(0, int(e["apps"] or 0)) for e in entries]
+    cur = [max(0, int(e["gc"] or 0)) for e in entries]
+    tm = max(1, int(team_matches or 0))
+    if kind == "club" and sum(apps) > tm:
+        # 한 경기에 GK는 한 명 — 추정 출전 수 합이 팀 경기 수를 넘으면(백업 GK 출전 과다 추정)
+        # 출전이 많은 GK부터 채우고 남는 경기만 다음 GK에게 준다.
+        left = tm
+        new_apps = [0] * len(apps)
+        for j in sorted(range(len(apps)), key=lambda j: (-apps[j], j)):
+            new_apps[j] = min(apps[j], left)
+            left -= new_apps[j]
+        apps = new_apps
+    w = apps if sum(apps) > 0 else cur
+    gcs = _gk_alloc(max(0, int(ga or 0)), w)
+    css = _gk_alloc(min(max(0, int(cs_n or 0)), sum(apps)), apps, caps=apps)
+    cap, min_sot = _GK_SAVE_CAP[kind], _GK_MIN_SOT[kind]
+    sw = float(sum(w)) or 1.0
+    out = []
+    for e, ap, gc, cs, wi in zip(entries, apps, gcs, css, w):
+        if ap <= 0 and gc <= 0:
+            out.append((ap, 0, 0, 0))
+            continue
+        # 시즌 기대 선방률 = 그 팀이 치른 경기들의 "GK 대 상대 공격진" 기대치 평균
+        if match_list:
+            p = sum(_gk_match_save(e["ovr"], att, cap) for _g, att in match_list) / len(match_list)
+        else:
+            p = _gk_match_save(e["ovr"], e["ovr"], cap)
+        shots = (gc / (1.0 - p)) if gc > 0 else (min_sot * max(1, ap))
+        sd = max(_GK_LUCK_MIN, _GK_LUCK_K * math.sqrt(max(1e-6, p * (1.0 - p)) / max(1.0, shots)))
+        p = max(0.35, min(cap, p + rng.gauss(0.0, sd)))
+        if gc > 0:
+            sv = int(round(gc * p / (1.0 - p)))
+        else:
+            sv = int(round(min_sot * max(1, ap) * p))
+        _ap1 = max(1, ap)
+        sv = max(sv, int(round(min_sot * _ap1)) - gc)          # 경기당 최소 유효슈팅
+        sv = min(sv, max(0, int(_GK_MAX_SOT[kind] * _ap1) - gc))   # 경기당 최대 유효슈팅
+        if gc > 0 and sv / float(sv + gc) > cap:
+            sv = int(math.floor(gc * cap / (1.0 - cap)))
+        out.append((ap, gc, min(cs, ap), max(0, sv)))
+    return out
+
+
+def _gk_align_rows(rows_list, gk_idx_by_team, ga_by_team, cs_by_team, mn_by_team, matches_of, kind, seed_prefix,
+                   col_apps, col_cs, col_sv, col_gc, ovr_of, skip_teams=()):
+    """rows_list 제자리 수정. gk_idx_by_team: {팀 키: [GK 행 인덱스]}, ovr_of(i) -> GK OVR,
+    matches_of(팀 키) -> [(그 경기 실점, 상대 공격진 OVR)].
+    실제 경기 기록(ga_by_team)이 없는 팀은 그대로 둔다(아직 안 치른 대회 등)."""
+    for tk, idxs in gk_idx_by_team.items():
+        if tk in skip_teams or tk not in ga_by_team:
+            continue
+        ents = [{"apps": rows_list[i][col_apps], "ovr": ovr_of(i), "gc": rows_list[i][col_gc]} for i in idxs]
+        for i, (ap, gc, cs, sv) in zip(idxs, _gk_align_team(ents, ga_by_team.get(tk, 0), cs_by_team.get(tk, 0),
+                                                        mn_by_team.get(tk, 0), matches_of(tk),
+                                                        kind, f"{seed_prefix}:{tk}")):
+            rows_list[i][col_apps] = ap
+            rows_list[i][col_gc], rows_list[i][col_cs], rows_list[i][col_sv] = gc, cs, sv
+
+
+def _gk_real_full_teams(c, comp, year, team_totals_by_team, tkey=None):
+    """내 선수 경기 실측이 그 팀의 그 대회 경기를 전부 덮는 팀 — GK 기록을 실측 그대로 둔다."""
+    try:
+        import real_stats as _rs
+        tc = _rs.team_counts_tkey(c, comp, tkey) if tkey else _rs.team_counts(c, comp, year)
+    except Exception:
+        return set()
+    return {t for t, n in team_totals_by_team.items() if n and tc.get(str(t), 0) >= n}
 
 
 def _blend_real_rows(c, rows_list, comp, year, team_col, team_totals, by_team=False, split_of=None):
@@ -11676,6 +11894,49 @@ def _snapshot_intl_ratings_rows(c, rows):
             u[0], u[1], u[2], u[3], u[4], u[5] = rt, g, a, cs, sv, gc
     except Exception as _rse:
         print("real_stats 국가대표 합산 오류(추정치 유지):", _rse)
+
+    # [2026-11] GK 기록 정합 — 그 나라가 그 대회에서 실제로 기록한 실점·무실점 경기에 맞춘다
+    # (위 _GK_* 주석). 단기 대회라 선방률 상한은 95%.
+    try:
+        _iga, _ics, _imn, _itot, _iml = {}, {}, {}, {}, {}
+        for _t in _tids:
+            for _m in c.execute(
+                    """SELECT home, away, home_score, away_score FROM intl_matches
+                       WHERE tournament_id=? AND home_score>=0 AND away_score>=0""", (_t,)).fetchall():
+                for _nat, _conc, _opp in ((_m["home"], _m["away_score"], _m["away"]), (_m["away"], _m["home_score"], _m["home"])):
+                    _k = (_t, _nat)
+                    _iga[_k] = _iga.get(_k, 0) + (_conc or 0)
+                    _ics[_k] = _ics.get(_k, 0) + (1 if (_conc or 0) == 0 else 0)
+                    _imn[_k] = _imn.get(_k, 0) + 1
+                    _iml.setdefault(_k, []).append((_conc or 0, (_t, _opp)))
+                _x = _itot.setdefault(_t, [0, 0])
+                _x[0] += (_m["home_score"] or 0) + (_m["away_score"] or 0); _x[1] += 2
+        _iatt_l = {}
+        for r in rows:
+            if r["position"] in _GK_ATT_POS:
+                _iatt_l.setdefault((r["tournament_id"], r["country"]), []).append(r["ovr"] or 0)
+        _iatt = {_k: _gk_attack_rating(_v) for _k, _v in _iatt_l.items()}
+        _igk = {}
+        for _i, (u, r) in enumerate(zip(updates, rows)):
+            if r["position"] == "GK":
+                _igk.setdefault((u[6], u[7]), []).append(_i)
+        _iupd = [[u[0], u[1], u[2], u[3], u[4], u[5], rows[_i]["appearances"] or 0] for _i, u in enumerate(updates)]
+        _iskip = set()
+        try:
+            import real_stats as _rs2
+            for _k in _igk:
+                _n = _played.get(_k, 0)
+                if _n and _rs2.team_counts_tkey(c, "intl", f"intl:{_k[0]}").get(str(_k[1]), 0) >= _n:
+                    _iskip.add(_k)
+        except Exception:
+            pass
+        _gk_align_rows(_iupd, _igk, _iga, _ics, _imn,
+                       lambda _k: [(_g, _iatt.get(_ok) or team_avg.get(_ok, 60.0)) for _g, _ok in _iml.get(_k, ())],
+                       "intl", "intl", 6, 3, 4, 5, lambda _i: rows[_i]["ovr"] or 0, skip_teams=_iskip)
+        for _i, u in enumerate(updates):
+            u[3], u[4], u[5] = _iupd[_i][3], _iupd[_i][4], _iupd[_i][5]
+    except Exception as _gke:
+        print("GK 기록 정합(국가대표) 오류(추정치 유지):", _gke)
 
     updates = [tuple(u) for u in updates]
     updates.sort(key=lambda t: (t[6], t[7], t[8]))

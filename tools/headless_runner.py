@@ -93,10 +93,25 @@ def run(n_seasons: int, seed: int = 12345, restriction: bool = False,
 
     p = ge.get_player()
     if not p:
+        # [2026-11 수정] 시드 템플릿(game.db)은 국가·리그·팀만 있고 선수가 없다 — 게임의 새 게임 흐름과 같은
+        # 순서(reset_game_data → create_player)로 세계를 먼저 만든다. 예전엔 선수 없는 세계로 진행하다
+        # team_power_rating 표가 없어 첫 주에 멈췄다. 이미 선수가 있는 DB(예전 방식)는 그대로 둔다.
+        if not c.execute("SELECT 1 FROM ai_players LIMIT 1").fetchone():
+            from constants import GAME_START_YEAR
+            database.reset_game_data(start_year=GAME_START_YEAR)
+        # [2026-11] DUMMY_NAT(예: 대한민국)를 주면 더미 선수 국적을 고정한다 — 없으면 예전처럼 무작위
+        # (SQLite RANDOM()이라 시드로 고정되지 않음). 검증 런은 반드시 고정한다.
+        _nat = os.environ.get("DUMMY_NAT")
+        _kw = {}
+        if _nat:
+            _row = database.get_conn().execute("SELECT name, flag FROM countries WHERE name=?", (_nat,)).fetchone()
+            if _row:
+                _kw = {"nationality": _row["name"], "flag": _row["flag"]}
         ge.create_player(
             name="Headless Dummy",
             position="CM",
             sub_role="",
+            **_kw,
         )
         p = ge.get_player()
     print(f"[runner] 더미 플레이어 준비 완료 (id={p['id']}, team={p.get('current_team_id')})")
@@ -135,14 +150,22 @@ def run(n_seasons: int, seed: int = 12345, restriction: bool = False,
         print(f"[runner] {i+1}/{n_seasons}시즌 진행 완료 "
               f"(season {cur_season_before} -> {cur_season_after})")
 
-    database.flush_to_disk()
+    # [2026-11 수정] 앱 종료(ui/main_window.closeEvent)와 같은 순서로 마지막 저장 — 진행 중인 자동저장(비동기)을
+    # 기다리고 → 기록 DB 쓰기 큐를 비우고 → 한 번에 저장. 예전엔 바로 flush_to_disk()를 불러 시즌 전환 직후
+    # 자동저장과 같은 임시 파일(.tmp)을 동시에 써서 disk I/O error로 끝나는 일이 있었다(세이브는 자동저장본이 남음).
+    database.wait_for_pending_flush(timeout=1800)
+    database.history_drain()
+    database.flush_to_disk(final=True)
 
     print("\n[runner] === 종료 후 무결성 재검사 ===")
-    result = run_all_checks(c)
+    # [2026-11 수정] 진행 중 커넥션이 교체돼 시작 때 만든 커서(c)가 닫혀 있을 수 있다 — 지금 커넥션으로 새로 연다.
+    result = run_all_checks(database.get_conn().cursor())
     print("[runner] 통과 여부:", result["passed"])
     return result
 
 
 if __name__ == "__main__":
+    # python tools/headless_runner.py [시즌 수] [시드]   (시드 생략 시 12345 — 예전과 같음)
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 1
-    run(n)
+    seed = int(sys.argv[2]) if len(sys.argv) > 2 else 12345
+    run(n, seed=seed)

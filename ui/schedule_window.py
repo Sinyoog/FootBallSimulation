@@ -193,6 +193,25 @@ def _intl_third_qualified(t):
     return {r["country"] for r in thirds[:n_adv]}
 
 
+
+def _my_group_of(match_rows, nat, groups=None):
+    """[2026-11 신설] 조별리그 경기 목록(grp·home·away)에서 내 나라(nat)가 뛰는 조. 못 찾으면 None."""
+    if not nat:
+        return None
+    for m in match_rows or ():
+        g = m.get("grp")
+        if g and nat in (m.get("home"), m.get("away")) and (groups is None or g in groups):
+            return g
+    return None
+
+
+def _my_group_first(groups, my_grp):
+    """[2026-11 신설, 신민용 요청] 조 목록에서 내 조를 맨 앞으로 — 나머지는 원래 순서(D조면 D A B C)."""
+    groups = list(groups or [])
+    if my_grp in groups:
+        return [my_grp] + [g for g in groups if g != my_grp]
+    return groups
+
 class ScheduleWindow(QDialog):
     def __init__(self, league_id, my_team_id, season, lang="ko", parent=None):
         super().__init__(parent)
@@ -1103,7 +1122,10 @@ class ScheduleWindow(QDialog):
             # 각각 따로 계산했다(그룹당 2번) — 결과는 똑같은데 계산만 중복.
             # 여기서 한 번 계산해서 캐싱해두고 아래 3위 팀 루프에서 재사용한다.
             _group_rows_cache = {}
-            for g in groups:
+            # [2026-11 신민용 요청: "조별리그에서 내가 속한 조가 맨 위 — D조면 D A B C, 옆 경기 일정도 같은 순서"]
+            # 내 나라가 있는 조를 맨 위로(나머지는 원래 A→Z 순서). 아래 2위·3위 비교표는 성적순이라 그대로.
+            _my_grp = _my_group_of(grp_match_rows, nat, groups)
+            for g in _my_group_first(groups, _my_grp):
                 _it_gs0 = _time_it.perf_counter()
                 if _is_qual:
                     rows = intl_engine._qual_group_standings(t["id"], g, stage=_grp_stage)
@@ -1484,7 +1506,7 @@ class ScheduleWindow(QDialog):
             right_lay.addWidget(lbl_sched)
             right_lay.addWidget(self._build_grouped_fixture_column(
                 grp_match_rows, flags, nat, p, t["year"],
-                group_key="grp", group_label_fmt="{}조 일정"))
+                group_key="grp", group_label_fmt="{}조 일정", first_key=_my_grp))
             right_lay.addStretch()
 
             left_widget.setMinimumWidth(_max_left_w)
@@ -1947,7 +1969,10 @@ class ScheduleWindow(QDialog):
         # 폭을 요구하게 하고, 그 폭에 맞춰 왼쪽 컬럼과 창을 넓힌다 —
         # _build_grouped_fixture_column에서 이미 쓰던 것과 동일한 패턴.
         _max_left_w = 0
-        for g in groups:
+        # [2026-11 신민용 요청] 내 팀이 있는 조를 맨 위로(옆 경기 일정도 같은 순서) — 국가대표 조별리그와 같은 규칙.
+        _my_grp = next((m["grp"] for m in grp_match_rows
+                        if my_tid and my_tid in (m["home_team_id"], m["away_team_id"])), None)
+        for g in _my_group_first(groups, _my_grp):
             rows = cwe.get_cwc_group_standings(t["id"], g)
             gt = QTableWidget(len(rows), 7)
             gt.setHorizontalHeaderLabels([f"{g}조", "경기", "승", "무", "패", "득실", "승점"])
@@ -2009,7 +2034,7 @@ class ScheduleWindow(QDialog):
             })
         right_lay.addWidget(self._build_grouped_fixture_column(
             fixture_rows, {}, None, p, t["year"],
-            group_key="grp", group_label_fmt="{}조 일정"))
+            group_key="grp", group_label_fmt="{}조 일정", first_key=_my_grp))
         right_lay.addStretch()
 
         split_row.addWidget(left_widget, 0)
@@ -2523,7 +2548,7 @@ class ScheduleWindow(QDialog):
         return outer
 
     def _build_grouped_fixture_column(self, rows, flags, nat, p, year,
-                                       group_key="grp", group_label_fmt="{}조"):
+                                       group_key="grp", group_label_fmt="{}조", first_key=None):
         """[2026-07 개편] '경기 일정'을 좌측 조별 순위표와 같은 톤으로,
         그룹(또는 라운드)별 카드로 나눠서 보여준다. 예전엔 표 하나에
         모든 그룹이 뒤섞여 있어서 좌측과 스타일이 안 맞고 알아보기
@@ -2541,7 +2566,8 @@ class ScheduleWindow(QDialog):
         for m in rows:
             by_group.setdefault(m.get(group_key), []).append(m)
 
-        for key in sorted(by_group.keys(), key=lambda k: (k is None, k)):
+        # [2026-11] first_key(내가 속한 조)가 있으면 그 조를 맨 위로 — 나머지는 예전 순서.
+        for key in sorted(by_group.keys(), key=lambda k: (first_key is None or k != first_key, k is None, k)):
             group_rows = by_group[key]
             label_txt = group_label_fmt.format(key) if key not in (None, "") else "일정"
             lbl = QLabel(label_txt)

@@ -1024,7 +1024,8 @@ def _match_outcome(h_ovr, a_ovr, h_mgr=0.0, a_mgr=0.0):
     #    (0.24, 0.009)을 그대로 둔다 — 단판 토너먼트의 변동성은 이 무승부·
     #    승부차기 구간이 남겨준다.
     # 3·4부 국내컵(lower_cup_engine)도 이 함수를 그대로 쓴다.
-    diff = _cup_effective_diff(h_ovr, a_ovr, random.uniform(1.5, 4.5))
+    _ha = random.uniform(1.5, 4.5)
+    diff = _cup_effective_diff(h_ovr, a_ovr, _ha)
     # [2026-10 6번 ③-1] 감독 능력 보정 — 곡선 뒤에 더한다(기본 0 = 예전과 같음).
     diff = diff + (h_mgr - a_mgr)
     dw = max(0.05, 0.24 - abs(diff) * 0.009)
@@ -1033,6 +1034,9 @@ def _match_outcome(h_ovr, a_ovr, h_mgr=0.0, a_mgr=0.0):
     aw = max(0.02, 1.0 - hw - dw)
     tot = hw + dw + aw
     hw, dw, aw = hw / tot, dw / tot, aw / tot
+    # [2026-11] 상위 레벨은 공통 상위 표(game_engine._ai_top_probs) — 같은 홈 이점 값을 그대로 쓴다.
+    from game_engine import _ai_top_blend
+    hw, dw, aw = _ai_top_blend((hw, dw, aw), h_ovr, a_ovr, _ha + (h_mgr - a_mgr))
     roll = random.random()
     if roll < hw:
         return "home"
@@ -1108,7 +1112,7 @@ def _sim_ai_match(t, m, conn=None, reason="injury", batch=None, forced=None):
     # 역사적 대량득점(예: FA컵 이변경기 대참사)이 가능해야 한다"]
     # allow_extreme=True로 game_engine._gen_score의 극초압도 구간(adv>=80)을
     # 이 컵대회에 한해 열어준다 — 리그는 기본값(False)이라 그대로.
-    hs, as_ = forced if forced is not None else _gen_score(outcome, he["ovr"] - ae["ovr"], allow_extreme=True)
+    hs, as_ = forced if forced is not None else _gen_score(outcome, he["ovr"] - ae["ovr"], allow_extreme=True, top=(he["ovr"], ae["ovr"]))
 
     # [2026-07 신설] 실제 진행 날짜 저장 (커리어/은퇴창 표시용).
     # [2026-07 성능 수정] 이 값은 get_my_cup_matches()가 my_played=1인
@@ -1295,7 +1299,7 @@ def simulate_my_cup_match(week, p, day=None):
         _chain = None
         engine_stats = engine_plog = player_ratings = None
         outcome = _match_outcome(h_ovr, a_ovr)
-        hs, as_ = _gen_score(outcome, h_ovr - a_ovr, allow_extreme=True)
+        hs, as_ = _gen_score(outcome, h_ovr - a_ovr, allow_extreme=True, top=(h_ovr, a_ovr))
 
     pso_winner, pso_score = 0, ""
     if outcome == "draw":

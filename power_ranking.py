@@ -836,6 +836,13 @@ def ensure_power_ranking_tables(conn):
     c.execute("""CREATE TABLE IF NOT EXISTS league_power(
         league_id INTEGER, year INTEGER, power REAL,
         PRIMARY KEY(league_id, year))""")
+    # [2026-11 신설, 신민용 확정] 세계 생성 직후의 초기 리그 파워(시작 연도−1) — 첫 시즌 개인상(골든보이)이 "그
+    # 시즌 동안 걸려 있는 리그 순위"로 쓴다. league_power의 같은 연도 행은 처음 필요할 때(파워랭킹 화면을 열거나
+    # 첫 연말 갱신) 그 시점 선수단으로 다시 계산·덮어써져 값이 시점마다 달라질 수 있어, 생성 직후 값만 따로 둔다.
+    # create_player(새 게임)만 쓰고, 연말 갱신·화면 조회는 이 표를 건드리지 않는다(store_initial_league_power).
+    c.execute("""CREATE TABLE IF NOT EXISTS league_power_initial(
+        league_id INTEGER, year INTEGER, power REAL,
+        PRIMARY KEY(league_id, year))""")
     # 팀별 레이어B 획득 이력(리그파워 국제실적보정 ②용, 최근 5년 조회)
     # [2026-09 DB 분리 2차] 위 team_power_rankings와 같은 이유·같은 규모
     # (실측 168,525행, 매년 +11,393)로 같이 hist에 둔다.
@@ -1142,9 +1149,10 @@ def _team_avg_ovr_seed(conn, team_id: int) -> float:
     return row[0] if row and row[0] else 45.0
 
 
-def compute_league_power(conn, year: int) -> dict:
+def compute_league_power(conn, year: int, store: bool = True) -> dict:
     """3.1b. 리그별 OVR지표(①, 85%) + 국제실적보정(②, 15%)을 합쳐
     league_id → 리그등급보정 값을 돌려주고 league_power에 캐시한다.
+    [2026-11] store=False면 계산만 하고 league_power에 쓰지 않는다(store_initial_league_power 전용). 기본값은 예전과 같다.
 
     [2026-10 변경(F1), 신민용 확정] 예전엔 "같은 부(tier)끼리만" 기준평균을 비교했다(1부는 세계 1부
     평균, 2부는 세계 2부 평균과). 세계 2부 평균이 1부보다 크게 낮아서 빅5 2부가 분데스리가 1부와
@@ -1205,11 +1213,35 @@ def compute_league_power(conn, year: int) -> dict:
         intl = max(-LEAGUE_POWER_INTL_CAP, min(LEAGUE_POWER_INTL_CAP, intl))
         final = base * (1 - LEAGUE_POWER_INTL_SHARE) + intl * LEAGUE_POWER_INTL_SHARE
         result[lid] = final
-        conn.execute("""INSERT INTO league_power(league_id, year, power) VALUES(?,?,?)
-                         ON CONFLICT(league_id, year) DO UPDATE SET power=excluded.power""",
-                     (lid, year, final))
-    conn.commit()
+        if store:
+            conn.execute("""INSERT INTO league_power(league_id, year, power) VALUES(?,?,?)
+                             ON CONFLICT(league_id, year) DO UPDATE SET power=excluded.power""",
+                         (lid, year, final))
+    if store:
+        conn.commit()
     return result
+
+
+def store_initial_league_power(conn) -> int:
+    """[2026-11 신설, 신민용 확정] 세계 생성 직후(create_player 끝) 초기 리그 파워(시작 연도−1)를 league_power_initial에
+    한 번 저장한다 — 새 게임마다 지우고 다시 쓴다. 계산은 compute_league_power와 같고(store=False라 league_power·팀 파워
+    시드는 건드리지 않음) 난수를 쓰지 않는다. 저장한 리그 수를 돌려준다."""
+    ensure_power_ranking_tables(conn)
+    year = get_game_start_year() - 1
+    pw = compute_league_power(conn, year, store=False)
+    conn.execute("DELETE FROM league_power_initial")
+    conn.executemany("INSERT INTO league_power_initial(league_id, year, power) VALUES(?,?,?)",
+                     [(lid, year, p) for lid, p in pw.items()])
+    conn.commit()
+    return len(pw)
+
+
+def get_initial_league_power(conn, year: int) -> dict:
+    """{league_id: 초기 리그 파워} (league_power_initial의 그 연도 행). 표·행이 없으면(이 기능 전의 세이브) 빈 dict."""
+    try:
+        return dict(conn.execute("SELECT league_id, power FROM league_power_initial WHERE year=?", (year,)).fetchall())
+    except Exception:
+        return {}
 
 
 def _team_seed_ab(conn, team_id: int, league_power_cache: dict) -> tuple:

@@ -1758,6 +1758,123 @@ _INTL_CONTINENT_CONF_MAP = {
 }
 
 
+_SIA_UNIQUE_INDEX = "uq_sia_year_type_rank_country"
+
+
+def _migrate_sia_unique_country():
+    """[2026-11 신설, 신민용 확정 A안: "화면 대회명은 그대로, DB에서 상을 구분·저장하는 기준만
+    바꾼다"] 개인상 표(hist.season_individual_awards)의 중복 판정을
+    표 제약 UNIQUE(year, award_type, rank) → 유니크 인덱스
+    (year, award_type, rank, IFNULL(league_country,''))로 바꾼다.
+
+    ── 왜 ────────────────────────────────────────────────────
+    award_type은 "대회명 상이름"(예: "프리메라 디비시온 MVP")이라 나라가 다른데 이름이 같은
+    대회(프리메라 디비시온 6개국·리가 1 3개국·쿠프 데 리그 16개국 등)는 INSERT OR IGNORE가
+    먼저 들어온 나라 것만 남기고 나머지 상을 조용히 버렸다. 실측(10시즌×2시드): 리그 1부 5.2%·
+    2부 이하 10.2%·하부컵 27.5% 대회의 상이 통째로 빠졌다. 같은 나라 안에서 이름이 겹치는
+    리그는 없고(실측 0), 리그·국내컵·하부컵 행은 이미 league_country를 저장한다 —
+    클럽 대항전·국가대표·세계상은 league_country가 NULL이라 IFNULL('')로 예전과 똑같이 판정된다.
+    "먼저 들어온 행이 이긴다"(재계산 중복 방지·FIFO 기록 순서)는 그대로다.
+
+    ── 무엇을 하나 ───────────────────────────────────────────
+    SQLite는 표 제약을 지울 수 없어서 표를 다시 만든다: 같은 컬럼(id 포함)으로 새 표 → 전 행 복사
+    → 행 수 + 양방향 EXCEPT 대조 → 원본 DROP → RENAME → 기존 보조 인덱스 재생성 →
+    AUTOINCREMENT 순번 유지 → 새 유니크 인덱스. 전부 SAVEPOINT 하나 안에서 하므로 중간에
+    실패하면 원본이 그대로 남는다(예전 제약 그대로 동작, 다음 실행에 재시도).
+    예전 제약이 없는 표(새 세이브 — CREATE에서 뺐다)는 인덱스만 만든다. 이미 끝난 세이브는
+    sqlite_master 조회 두 번으로 끝난다. 버려졌던 지난 시즌 상은 애초에 계산 결과가 저장되지
+    않았으므로 되살리지 못한다 — 고친 뒤 시즌부터 전부 저장된다."""
+    import re as _re
+    import time as _t_mig
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        tbl = c.execute("SELECT 1 FROM hist.sqlite_master WHERE type='table' "
+                        "AND name='season_individual_awards'").fetchone()
+    except sqlite3.OperationalError:
+        return
+    if not tbl:
+        return
+    info = list(c.execute("PRAGMA hist.table_info(season_individual_awards)"))
+    if "league_country" not in [r["name"] for r in info]:
+        print("[MIGRATE-SIA] league_country 컬럼이 없어 건너뜀")
+        return
+    has_old = c.execute(
+        "SELECT 1 FROM hist.sqlite_master WHERE type='index' AND tbl_name='season_individual_awards' "
+        "AND name LIKE 'sqlite_autoindex_season_individual_awards%'").fetchone() is not None
+    uq_sql = (f"CREATE UNIQUE INDEX IF NOT EXISTS hist.{_SIA_UNIQUE_INDEX} ON season_individual_awards("
+              "year, award_type, rank, IFNULL(league_country, ''))")
+    if not has_old:
+        if not c.execute("SELECT 1 FROM hist.sqlite_master WHERE type='index' AND name=?",
+                         (_SIA_UNIQUE_INDEX,)).fetchone():
+            c.execute(uq_sql)
+            conn.commit()
+        return
+
+    _t0 = _t_mig.perf_counter()
+    cols = [r["name"] for r in info]
+    defs = []
+    for r in info:
+        if r["name"] == "id":
+            defs.append("id INTEGER PRIMARY KEY AUTOINCREMENT")
+            continue
+        d = f"{r['name']} {r['type'] or ''}".strip()
+        if r["notnull"]:
+            d += " NOT NULL"
+        if r["dflt_value"] is not None:
+            d += f" DEFAULT {r['dflt_value']}"
+        defs.append(d)
+    idx_sqls = [r["sql"] for r in c.execute(
+        "SELECT sql FROM hist.sqlite_master WHERE type='index' AND tbl_name='season_individual_awards' "
+        "AND sql IS NOT NULL")]
+    seq_row = c.execute("SELECT seq FROM hist.sqlite_sequence WHERE name='season_individual_awards'").fetchone()
+    old_seq = seq_row["seq"] if seq_row else None
+    collist = ", ".join(cols)
+    tmp = "_sia_uq_mig"
+    conn.commit()
+    c.execute("SAVEPOINT sia_uq_mig")
+    try:
+        c.execute(f"DROP TABLE IF EXISTS hist.{tmp}")
+        c.execute(f"CREATE TABLE hist.{tmp}({', '.join(defs)})")
+        c.execute(f"INSERT INTO hist.{tmp}({collist}) SELECT {collist} FROM hist.season_individual_awards ORDER BY id")
+        n_old = c.execute("SELECT COUNT(*) FROM hist.season_individual_awards").fetchone()[0]
+        n_new = c.execute(f"SELECT COUNT(*) FROM hist.{tmp}").fetchone()[0]
+        miss = c.execute(f"SELECT COUNT(*) FROM (SELECT {collist} FROM hist.season_individual_awards "
+                         f"EXCEPT SELECT {collist} FROM hist.{tmp})").fetchone()[0]
+        extra = c.execute(f"SELECT COUNT(*) FROM (SELECT {collist} FROM hist.{tmp} "
+                          f"EXCEPT SELECT {collist} FROM hist.season_individual_awards)").fetchone()[0]
+        if n_old != n_new or miss or extra:
+            raise RuntimeError(f"대조 실패: 행수 {n_old}→{n_new}, 누락 {miss}, 초과 {extra}")
+        c.execute("DROP TABLE hist.season_individual_awards")
+        c.execute(f"ALTER TABLE hist.{tmp} RENAME TO season_individual_awards")
+        for s in idx_sqls:
+            # sqlite_master의 sql은 스키마 이름·IF NOT EXISTS 없이 저장된다 — hist.를 붙여 다시 만든다.
+            s2 = _re.sub(r"(?is)^\s*CREATE\s+(UNIQUE\s+)?INDEX\s+(IF\s+NOT\s+EXISTS\s+)?(hist\.)?",
+                         lambda m: f"CREATE {m.group(1) or ''}INDEX IF NOT EXISTS hist.", s, count=1)
+            c.execute(s2)
+        if old_seq is not None:
+            if c.execute("SELECT 1 FROM hist.sqlite_sequence WHERE name='season_individual_awards'").fetchone():
+                c.execute("UPDATE hist.sqlite_sequence SET seq=MAX(seq, ?) WHERE name='season_individual_awards'",
+                          (old_seq,))
+            else:
+                c.execute("INSERT INTO hist.sqlite_sequence(name, seq) VALUES('season_individual_awards', ?)",
+                          (old_seq,))
+        c.execute(uq_sql)
+        c.execute("RELEASE sia_uq_mig")
+        conn.commit()
+    except Exception as e:
+        try:
+            c.execute("ROLLBACK TO sia_uq_mig")
+            c.execute("RELEASE sia_uq_mig")
+            conn.commit()
+        except sqlite3.Error:
+            pass
+        print(f"[MIGRATE-SIA] 건너뜀(원본 그대로, 다음 실행에 재시도): {e}")
+        return
+    print(f"[MIGRATE-SIA] 개인상 표 재구축 완료 {n_new:,}행 (중복 판정에 나라 포함, 전 행 대조 통과) "
+          f"{_t_mig.perf_counter() - _t0:.2f}s")
+
+
 def _migrate_backfill_intl_continent():
     """[2026-09 신설, 신민용 리포트: "AFCON 우승한 세네갈 선수가 발롱도르
     트로피 0점" — 원인 규명 결과 intl_engine._create_one_tournament()이
@@ -2792,9 +2909,13 @@ def init_db(load=True):
     # 노출할 세부 점수 breakdown(트로피/평점/생산성/포지션보정) — 후보
     # 게이트(등급/국제무대 증명)는 이 표에 안 남고 game_engine.py의
     # _get_ballon_candidates가 계산 시점에만 걸러낸다.
-    # UNIQUE(year, award_type, rank)는 계산 재실행 시 중복 INSERT를 막는
-    # 안전망(1차 방어는 game_engine._compute_season_individual_awards의
-    # award_type별 완료 체크).
+    # 중복 INSERT 안전망(1차 방어는 game_engine._compute_season_individual_awards의
+    # award_type별 완료 체크)은 [2026-11] 표 제약이 아니라 유니크 인덱스
+    # (year, award_type, rank, IFNULL(league_country,''))다 — 아래
+    # _migrate_sia_unique_country()가 만든다(league_country 컬럼이 ALTER로 붙은 뒤라야
+    # 만들 수 있어서 여기 CREATE에는 넣지 않는다). 예전 표 제약 UNIQUE(year, award_type,
+    # rank)는 나라가 달라도 대회명이 같으면(프리메라 디비시온·리가 1·쿠프 데 리그 등)
+    # 먼저 저장된 나라 것만 남기고 나머지 상을 조용히 버렸다(신민용 확정 A안).
     c.execute("""CREATE TABLE IF NOT EXISTS hist.season_individual_awards(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         year INTEGER NOT NULL,
@@ -2812,8 +2933,7 @@ def init_db(load=True):
         score_goals_assists REAL,
         score_position_adj REAL,
         goal_event_id INTEGER,
-        category TEXT DEFAULT 'world',
-        UNIQUE(year, award_type, rank))""")
+        category TEXT DEFAULT 'world')""")
     c.execute("""CREATE INDEX IF NOT EXISTS hist.idx_sia_year_award
                ON season_individual_awards(year, award_type, rank)""")
     c.execute("""CREATE INDEX IF NOT EXISTS hist.idx_sia_player
@@ -5492,6 +5612,7 @@ def init_db(load=True):
     _migrate_manager_tier_scale_v1()   # [2026-10] 부수 배수 6~8부 분리 — 무직 감독 자리 수준 1회 옮김
     _migrate_backfill_career_years()  # career_years 컬럼 1회성 백필 (아래 참고)
     _migrate_backfill_award_kind_competition()  # 개인상 award_kind/competition 1회성 백필 (아래 참고)
+    _migrate_sia_unique_country()   # [2026-11] 개인상 중복 판정에 나라 포함 — 같은 이름 대회 상 누락 (1회성, 아래 참고)
     _migrate_backfill_intl_continent()   # 대륙컵 continent 컬럼 1회성 백필 (1회성, 아래 참고)
     _migrate_phantom_career_entries()   # 유령 재직기록(길이0·0경기) 정리 (1회성, 아래 참고)
     _migrate_orphaned_ai_players()   # 이름 지어놓고 통째로 사라진 고아 ai_players 복구 (1회성, 아래 참고)
@@ -8010,6 +8131,8 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False, start_year=None):
               "team_league_streak","country_regional_streak",
               # [2026-09 DB 분리 2차] team_b_history는 hist로 이전됨.
               "league_power","hist.team_b_history",
+              # [2026-11] 세계 생성 직후 초기 리그 파워(power_ranking.store_initial_league_power) — 새 판에서 다시 쓴다.
+              "league_power_initial",
               # [2026-08 v3.2 신설] 리그 상대강도 임시 테이블도 새 게임
               # 시작 시 당연히 비워야 한다(어차피 시즌 종료마다 자체
               # 정리되지만, 게임 중간에 리셋할 수도 있으므로 안전하게 포함).
@@ -11877,7 +12000,13 @@ SEED_OVR_WITHIN_GROWTH_CAP = True
 # 10~14명. 국대 등급·J1 범위·수출 배율(EXPORTER_STRENGTH/STAR_EXPORTER_STRENGTH)은 그대로 —
 # 바뀌는 건 "생성 직후 최상위 구간"뿐이다. 시즌 중 새로 생기는 선수(은퇴대체 등)에는 적용
 # 안 됨. 빈 딕셔너리면 예전과 100% 동일.
-NAT_TOP_OVR_SOFT_CAP = {"일본": {"cap": 94, "floor": 92, "keep_prob": 0.3}}
+NAT_TOP_OVR_SOFT_CAP = {"일본": {"cap": 94, "floor": 92, "keep_prob": 0.3},
+                        # [2026-11 신설, 신민용 확정 — 미국 OVR 밸런스 3단계] 미국은 일본보다 느슨하게: 자연적인
+                        # 95+는 남기고 시작 월드에서 튀는 경우(실측 10월드 중 한 곳 95+ 7명)만 줄인다. keep_prob는
+                        # 시작 월드 12개 비교로 정함(사전 기준: 95+ 평균 ≤1.2, 4명+ 월드 ≤1, 97+ ≤1 전 월드, 90~94 ≥12,
+                        # 상위11 ≥91.0 — 통과하는 가장 높은 값): 0.5는 97+ 2명 월드(98·97)·90~94 11.6으로 미달,
+                        # 0.3 통과(95+ 평균 0.25, 97+ 최대 1, 90~94 12.3, 상위11 92.1).
+                        "미국": {"cap": 94, "floor": 92, "keep_prob": 0.3}}
 
 # [2026-10 신설, 신민용 확정 — 한국 최상위층 기준] 목표: 95+ 0명(역사적 예외도 기본값으론 없음),
 # 92~94 0~1명(세계적 스타급), 90~91 1~3명(대표팀 핵심·유럽 상위권 경쟁력), 85~89 여러 명.
