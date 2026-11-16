@@ -77,6 +77,9 @@ STAMINA_POS_MULT = {
 SUBS_MAX_PLAYERS = 5          # 한 경기 교체 가능 인원
 SUBS_MAX_WINDOWS = 3          # 경기 중 교체 기회(하프타임 제외)
 SUBS_EXTRA_TIME_WINDOWS = 1   # 연장 진입 시 추가 기회
+# [2026-11 신설, 신민용 확정: "교체가 5장, 연장 가면 6장"] 연장 진입 시 교체 가능 인원 +1(5 → 6).
+# 이 엔진(simulate_tactical_match)은 게임에서 국가대표 경기만 쓴다 — 클럽 경기(체인 엔진)는 그대로.
+SUBS_EXTRA_TIME_PLAYERS = 1
 SUB_STAMINA_TRIGGER = 62.0    # 이 체력 밑이면 교체 후보
 SUB_EARLIEST_MINUTE = 46      # 하프타임 이전에는 (부상 외) 교체 안 한다
 
@@ -1119,11 +1122,11 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
         "home": {"cur": list(home_lineup), "slots": home_slots, "is_home": True,
                  "boost": home_boost, "bpos": home_boost_position,
                  "bench": [p for p in (home_bench or []) if p],
-                 "subs": [], "used": 0, "windows": SUBS_MAX_WINDOWS, "appear": {}},
+                 "subs": [], "used": 0, "max": SUBS_MAX_PLAYERS, "windows": SUBS_MAX_WINDOWS, "appear": {}},
         "away": {"cur": list(away_lineup), "slots": away_slots, "is_home": False,
                  "boost": away_boost, "bpos": away_boost_position,
                  "bench": [p for p in (away_bench or []) if p],
-                 "subs": [], "used": 0, "windows": SUBS_MAX_WINDOWS, "appear": {}},
+                 "subs": [], "used": 0, "max": SUBS_MAX_PLAYERS, "windows": SUBS_MAX_WINDOWS, "appear": {}},
     }
     for _sk, _sv in _sides.items():
         _labels = _sv["slots"] or _FALLBACK_SLOTS
@@ -1316,7 +1319,7 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
         did = False
         for sk in ("home", "away"):
             sv = _sides[sk]
-            if not sv["bench"] or sv["used"] >= SUBS_MAX_PLAYERS:
+            if not sv["bench"] or sv["used"] >= sv["max"]:
                 continue
             if not free_window and sv["windows"] <= 0:
                 continue
@@ -1366,7 +1369,7 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
             cands.sort(key=lambda t: (-t[0], t[1], t[2]))
             n_this_window = 0
             for urge, st, idx, out_p, slot, third, tired in cands:
-                if n_this_window >= 2 or sv["used"] >= SUBS_MAX_PLAYERS:
+                if n_this_window >= 2 or sv["used"] >= sv["max"]:
                     break
                 out_eff = _slot_fit(out_p, slot) * stam.perf(out_p)
                 best_in, best_score = None, -1e9
@@ -1535,7 +1538,7 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
             outs = [(i, q) for i, q in enumerate(sv["cur"])
                     if q is not None and (labels[i] if i < len(labels) else "") != "GK"]
             bgk = next((b for b in sv["bench"] if b.get("position") == "GK"), None)
-            if outs and bgk is not None and sv["used"] < SUBS_MAX_PLAYERS and sv["windows"] > 0:
+            if outs and bgk is not None and sv["used"] < sv["max"] and sv["windows"] > 0:
                 # 가장 공격적인 자리(공격 3선)의 가장 지친 선수를 빼고 예비 GK 투입.
                 def _att_rank(t):
                     _sl = labels[t[0]] if t[0] < len(labels) else "CM"
@@ -1962,6 +1965,7 @@ def simulate_tactical_match(home_lineup, away_lineup, home_boost=0.0, away_boost
             # 97분 판정과는 별개로, 경기 중 기회 자체를 한 번 더 준다).
             for _sv in _sides.values():
                 _sv["windows"] += SUBS_EXTRA_TIME_WINDOWS
+                _sv["max"] += SUBS_EXTRA_TIME_PLAYERS   # [2026-11] 연장 6번째 교체
             _rebuild_models()
             _run_phase(REG_MINUTES + 1, REG_MINUTES + ET_HALF_MINUTES, is_extra=True)
             _run_phase(REG_MINUTES + ET_HALF_MINUTES + 1,
@@ -2166,11 +2170,65 @@ def _insert_me(lineup, bench, slots, me_pl, field_pos, status):
     return lineup, bench, None
 
 
+# ══════════════════════════════════════════════════════════════
+# [2026-11 전력 기준 통일, 신민용 확정 "1번"] 내 팀 경기(체인 엔진)의 팀 전력을 같은 대회의 AI끼리 경기와
+# 같은 기준으로 맞춘다. 예전엔 체인 엔진이 선발 11명 평균만 봐서, AI 아스널(선발 94.8 + 클럽 강도 + 명문
+# 절반 = 리그 전력 97.7)이 내 경기에서는 94.8로 싸웠다 — 아스널 vs 노팅엄 AI 66.5% / 내 경기 50.3%.
+# 규칙(대회별 AI 경기 전력 그대로, 선발 11명 위에 얹는 몫만):
+#   "league"    : 클럽 강도 × CLUB_STRENGTH_MATCH_WEIGHT + 명문 보너스 × (1부 0.5 / 그 밖 1.0) + 감독 보정
+#                 (game_engine._league_formula_score · _league_prestige_cut과 같은 값)
+#   "cup"/"lower_cup": 클럽 강도 × W + 명문 보너스 전부 + 감독 보정 (참가팀 ovr = _team_avg_ovr)
+#   "dom_super" : 클럽 강도 × W + 명문 보너스 전부 (감독 보정 없음 — AI 경기도 없음)
+#   ("cont", pw): 명문 보너스 × pw + 감독 보정 (competition_common.cont_ai_strength — 챔스 0.5, 유로파·컨퍼 0)
+#   None        : 가산 없음(클럽 월드컵·대륙 슈퍼컵·승강 PO — AI 경기가 스쿼드 평균만 쓴다)
+# 사용자 팀이든 AI 팀이든 같은 규칙. 명문 보너스·클럽 강도 값 자체는 바꾸지 않는다.
+_STRENGTH_RULES = {"league": ("league", True), "cup": ("full", True), "lower_cup": ("full", True),
+                   "dom_super": ("full", False)}
+
+
+def club_match_strength_extra(team_id, rule):
+    """선발 11명 평균 위에 얹을 팀 전력 가산(OVR 단위) — 위 _STRENGTH_RULES 주석."""
+    if not rule or team_id is None:
+        return 0.0
+    from database import get_conn
+    from constants import CLUB_STRENGTH_MATCH_WEIGHT, PRESTIGE_LEVEL_MATCH_BONUS
+    from data.prestige_clubs import prestige_level
+    conn = get_conn()
+    try:
+        r = conn.execute("""SELECT t.name AS tname, t.club_strength AS cs, cn.name AS cname, l.tier AS tier
+                            FROM teams t JOIN countries cn ON cn.id = t.country_id
+                            LEFT JOIN leagues l ON l.id = t.league_id WHERE t.id=?""", (team_id,)).fetchone()
+    finally:
+        conn.close()
+    if r is None:
+        return 0.0
+    lvl = prestige_level(r["cname"], r["tname"])
+    pb = PRESTIGE_LEVEL_MATCH_BONUS.get(lvl, 0.0) if lvl else 0.0
+    cs = (r["cs"] * CLUB_STRENGTH_MATCH_WEIGHT) if r["cs"] else 0.0
+    if isinstance(rule, tuple) and rule and rule[0] == "cont":
+        return pb * float(rule[1])
+    kind = _STRENGTH_RULES.get(rule, (None, False))[0]
+    if kind == "league":
+        from game_engine import _LEAGUE_PRESTIGE_WEIGHT
+        return cs + pb * (_LEAGUE_PRESTIGE_WEIGHT if r["tier"] == 1 else 1.0)
+    if kind == "full":
+        return cs + pb
+    return 0.0
+
+
+def _strength_rule_uses_mgr(rule):
+    # ("cont", 명문 비율[, 감독 보정]) — 3번째 값이 없으면 예전처럼 True(챔스·유로파·컨퍼런스 AI 경기는 감독 보정을 쓴다).
+    # 클럽월드컵·대륙 슈퍼컵은 AI 경기에 감독 보정이 없어서 False로 넘어온다.
+    if isinstance(rule, tuple) and rule and rule[0] == "cont":
+        return bool(rule[2]) if len(rule) > 2 else True
+    return _STRENGTH_RULES.get(rule, (None, False))[1]
+
+
 def simulate_my_match(home_team_id, away_team_id, home_formation, away_formation,
                        home_boost=0.0, away_boost=0.0,
                        home_boost_position=None, away_boost_position=None,
                        home_adv=3.0, seed=None,
-                       extra_time=False, agg_home=0, agg_away=0, me=None):
+                       extra_time=False, agg_home=0, agg_away=0, me=None, strength_rule=None):
     """team_id 두 개만 받아서 로스터/포메이션 조회부터 시뮬레이션까지 전부
     처리하는 편의 함수. 내 소속 클럽의 클럽 대회 경기(리그·컵·하부컵·챔스류·클럽월드컵·
     국내 슈퍼컵·승강PO)가 모두 여기로 온다. 국가대표 경기는 simulate_tactical_match를 직접
@@ -2185,7 +2243,8 @@ def simulate_my_match(home_team_id, away_team_id, home_formation, away_formation
        "yellow_add", "red_add": 파울 1건당 카드 확률 가산(성격)}
     내 선수는 다른 22명과 같은 규칙(경합·체력·교체 판단·카드·퇴장 후 교체 불가)으로 뛰고,
     캐리 보정(boost)은 쓰지 않는다 — 호출부도 0을 넘긴다.
-    sim["me"]: 내 선수가 실제로 뛴 기록(아래 _me_summary)."""
+    sim["me"]: 내 선수가 실제로 뛴 기록(아래 _me_summary).
+    strength_rule: [2026-11] 팀 전력 가산 규칙(위 _STRENGTH_RULES 주석). None이면 예전과 같다."""
     from team_plan import build_team_plan
     from constants import FORMATION_SLOTS
     from match_sim.chain_engine import simulate_chain_match
@@ -2209,6 +2268,23 @@ def simulate_my_match(home_team_id, away_team_id, home_formation, away_formation
             pmods = {MY_SIM_PLAYER_ID: {"yellow_add": me.get("yellow_add", 0.0),
                                         "red_add": me.get("red_add", 0.0)}}
     _hs, _as = hp["style"], ap["style"]
+    _hsa = club_match_strength_extra(home_team_id, strength_rule)
+    _asa = club_match_strength_extra(away_team_id, strength_rule)
+    _mgr = 0.0
+    _hma = _ama = 0.0
+    if strength_rule and _strength_rule_uses_mgr(strength_rule):
+        try:
+            from game_engine import _mgr_match_bonus_pair
+            from constants import MANAGER_MATCH_REL
+            _hm, _am = _mgr_match_bonus_pair(None, home_team_id, away_team_id)
+            if MANAGER_MATCH_REL:
+                # [2026-11 상대 비교형] 감독 가산 = 팀 전력 단위 — 체인이 팀 전력과 선수 경합에 넣는다
+                # (chain_engine.MANAGER_CONTEST_SHARE).
+                _hma, _ama = float(_hm or 0.0), float(_am or 0.0)
+            else:
+                _mgr = float(_hm or 0.0) - float(_am or 0.0)
+        except Exception:
+            _mgr = 0.0
     sim = simulate_chain_match(home_lineup, away_lineup, home_boost=home_boost,
                                away_boost=away_boost,
                                home_boost_position=home_boost_position,
@@ -2219,7 +2295,9 @@ def simulate_my_match(home_team_id, away_team_id, home_formation, away_formation
                                home_bench=home_bench, away_bench=away_bench,
                                extra_time=extra_time,
                                agg_home=agg_home, agg_away=agg_away,
-                               home_style=_hs, away_style=_as, player_mods=pmods)
+                               home_style=_hs, away_style=_as, player_mods=pmods,
+                               home_str_add=_hsa, away_str_add=_asa, mgr_diff=_mgr,
+                               home_mgr_add=_hma, away_mgr_add=_ama)
     sim["me"] = _me_summary(sim, me, my_side)
     return sim
 

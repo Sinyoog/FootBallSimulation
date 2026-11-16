@@ -1599,7 +1599,8 @@ def _age_and_progress(c):
     # r[19]/r[20]/r[21](ovr/peak_ovr/ovr_user_locked) 인덱스는 그대로 둔다.
     rows = rows.execute(
         "SELECT id, position, age, team_id, " + _STAT_COLS +
-        ", ovr, peak_ovr, ovr_user_locked, potential_ovr, true_nationality FROM ai_players").fetchall()   # [2026-10] r[23]=국적(NAT_OVR_CEILING)
+        ", ovr, peak_ovr, ovr_user_locked, potential_ovr, true_nationality, "
+        "COALESCE(military_status, '') FROM ai_players").fetchall()   # [2026-10] r[23]=국적(NAT_OVR_CEILING), [2026-11] r[24]=병역 상태
     _ap_t2 = _time_ap.perf_counter()
     if not rows:
         return 0, 0
@@ -1654,6 +1655,26 @@ def _indexes_off_for_mass_update(c):
                 c.execute(_sql)
             except Exception:
                 pass   # 인덱스는 성능용이라 재생성에 실패해도 게임은 정상 동작
+
+
+# [2026-11 신설, 신민용 확정: "군대는 OVR 고정 — 기량 상승은 불가, 나이에 의한 하락만 가능"]
+# 복무 중(military_status == serving)인 AI 선수는 성장기(다음 나이 25세 이하)·피크기(26~29세 ±1 변동)
+# 둘 다 동결한다(능력치·OVR 그대로, 나이만 +1). 30세 이상 노화(전성기 OVR × 나이별 하락률 — 리그와
+# 무관)는 평소와 똑같이 적용한다. 예전엔 군팀 상한이 99라 복무 2시즌 동안 잠재력까지 평소처럼 자라
+# 입대 전보다 크게 오른 채 제대했다.
+# 계산은 평소대로 다 돌린 뒤 복무자 결과만 되돌린다 — 난수 소비 순서가 그대로라 같은 시즌 전환에서
+# 복무자가 아닌 선수의 결과는 예전과 100% 같다. 시즌 전환 순서상 성장(_age_and_progress)이 병역 처리
+# (입대·제대)보다 먼저 돌아서, 입대 직후 전환과 제대하는 전환 두 번이 정확히 동결된다.
+# 검증(2026-11, 원본·수정 × 시드 12345·777 10시즌): 복무 중 OVR 상승 0건(원본 1,155·1,212건), 30세 미만 하락
+# 0건, 입대→제대 OVR 차이 −0.04~−0.05(원본 +0.84~+1.05, 최대 +33·+36 — 소속팀 상한에 눌려 있던 하위 리그
+# 선수가 군팀 상한 99에서 잠재력까지 한 번에 자랐다), 제대 후 성장기 선수 성장 재개 확인.
+
+
+def _military_freeze_rows(rows, new_age_of):
+    """동결할 행 번호 목록 — 복무 중이고 다음 나이가 노화 시작(30세) 전인 선수."""
+    from constants import MILITARY_STATUS_SERVING as _MSS
+    return [i for i, r in enumerate(rows)
+            if len(r) > 24 and r[24] == _MSS and new_age_of(r) <= _AI_PEAK_END]
 
 
 def _growth_gain_guard_np(rows_vals, wv, wsum, chosen, cur, cap, gain):
@@ -1713,6 +1734,9 @@ def _age_and_progress_np(c, rows, team_cap, orphan_fallback):
     _flat = [v for r in rows for v in r[4:19]]
     raw = np.array(_flat, dtype=np.float64).reshape(N, _N_STATS)
     vals_arr = np.where(np.isnan(raw) | (raw == 0), 50.0, raw).astype(np.int64)
+    # [2026-11] 군 복무 동결 대상 — _military_freeze_rows 정의부 주석 참고(계산 후 되돌림).
+    _frz_idx = np.array(_military_freeze_rows(rows, lambda r: (r[2] or 20) + 1), dtype=np.int64)
+    _frz_vals = vals_arr[_frz_idx].copy() if len(_frz_idx) else None
 
     # [2026-07 최적화, 신민용 리포트: "일정 진행이 갈수록 오래 걸린다" — 실측
     # 결과 이 함수가 "벡터화 버전"이라면서 여기 한 곳만 순수 파이썬 for문으로
@@ -1956,6 +1980,9 @@ def _age_and_progress_np(c, rows, team_cap, orphan_fallback):
                 cur = vals_arr[a_idx, chosen]
                 vals_arr[a_idx, chosen] = np.maximum(15, cur - dec)
 
+    if _frz_vals is not None:
+        vals_arr[_frz_idx] = _frz_vals   # [2026-11] 군 복무 동결 — 성장기·피크기 결과를 되돌린다
+
     # ── OVR 재계산 (포지션별 가중치 벡터와 행렬곱, 5.9만 명 순회 없이 일괄 처리) ──
     ovr_out = np.empty(N, dtype=np.int64)
     for pos in unique_positions:
@@ -1964,6 +1991,9 @@ def _age_and_progress_np(c, rows, team_cap, orphan_fallback):
         wsum = _WEIGHT_SUMS.get(pos, _WEIGHT_SUMS["CM"])
         total = vals_arr[mask] @ wv / wsum
         ovr_out[mask] = np.clip(np.round(total), 1, 100).astype(np.int64)
+    if _frz_vals is not None:
+        # 저장된 OVR을 그대로 둔다(재계산 반올림으로 1 오르는 일도 막는다). 0이면 재계산값.
+        ovr_out[_frz_idx] = np.where(cur_ovr_arr[_frz_idx] > 0, cur_ovr_arr[_frz_idx], ovr_out[_frz_idx])
 
     # [최적화] (age, *stats, ovr, peak_ovr, id) 튜플을 파이썬 루프로 만드는
     # 대신 column_stack으로 한 번에 이어붙여 tolist() — sqlite3.executemany는
@@ -2021,8 +2051,10 @@ def _age_and_progress_py(c, rows, team_cap, orphan_fallback):
     _randint = random.randint
     _choice = random.choice
     _random = random.random
+    # [2026-11] 군 복무 동결 대상(_military_freeze_rows 정의부 주석 참고 — 계산 후 되돌림)
+    _frz_set = set(_military_freeze_rows(rows, lambda r: (r[2] or 20) + 1))
 
-    for r in rows:
+    for _ri, r in enumerate(rows):
         pid = r[0]
         pos = r[1]
         new_age = (r[2] or 20) + 1
@@ -2125,6 +2157,9 @@ def _age_and_progress_py(c, rows, team_cap, orphan_fallback):
             aged += 1
 
         new_ovr = calc_ovr_from_list(pos, vals)
+        if _ri in _frz_set:
+            vals = [v or 50 for v in r[4:19]]
+            new_ovr = cur_ovr_val or calc_ovr_from_list(pos, vals)
         updates.append((new_age, *vals, new_ovr, peak_ovr_val, pid))
 
     set_clause = ", ".join(f"{s}=?" for s in ALL_STATS)
@@ -4338,6 +4373,19 @@ def _retire_and_replace(c, year, ai_rows=None):
     if NEW_PLAYER_NAT_LIKE_SEED:
         for r in rows:
             _team_ovrs_rr.setdefault(r["team_id"], []).append(r["ovr"])
+    # [2026-11-14 검증 스위치, constants.NEW_GK_BACKUP_REPLACE_ON 주석 참고] 은퇴 전 명단 기준 팀 내 GK 순번
+    # (OVR 내림차순, 동률은 id) — 역할 기록이 없는 은퇴 GK의 백업 판정용. 난수 미사용.
+    _gk_bk_on = bool(getattr(_CyY, "NEW_GK_BACKUP_REPLACE_ON", False))
+    _gk_rank_rr: dict = {}
+    if _gk_bk_on:
+        _gk_by_team_rr: dict = {}
+        for r in rows:
+            if r["position"] == "GK":
+                _gk_by_team_rr.setdefault(r["team_id"], []).append((r["ovr"] or 0, r["id"]))
+        for _gl in _gk_by_team_rr.values():
+            _gl.sort(key=lambda x: (-x[0], x[1]))
+            for _gi, (_go, _gpid) in enumerate(_gl):
+                _gk_rank_rr[_gpid] = _gi + 1
     retire_deletes = []  # 은퇴자 DELETE용
     retire_archives = []  # [2026-08 신설] 은퇴자 ai_players_retired 아카이브용
     new_rows = []         # 신인 INSERT용
@@ -8963,11 +9011,31 @@ def _sq_gen_swap_row(tid, _pos, grade, tier, cname, continent, tname, year,
     return _row, _foreign_ct
 
 
-def _squad_target_inputs(c):
+def _squad_target_inputs(c, with_roster=False):
     """[2026-10 확정] 포메이션 목표표 보충용 입력 — (팀별 현재 포메이션, 팀별 장기 보유
-    등록 포지션 목록). 장기 보유 = 자기 선수(임대 온 선수 제외) + 임대 보낸 선수."""
+    등록 포지션 목록). 장기 보유 = 자기 선수(임대 온 선수 제외) + 임대 보낸 선수.
+
+    [2026-11 성능] with_roster=True면 세 번째 값으로 팀별 명단 {팀: [(id, 포지션, OVR), ...]}도 같이
+    돌려준다. 스쿼드 보충(_rebalance_squad_sizes)·유스 영입(_affiliate_intake)은 이 함수 바로 앞에서
+    "SELECT id, team_id, position, ovr FROM ai_players"로 선수 전체를 한 번 읽고, 여기서 같은 표를
+    또 한 번 전부 읽었다(그 사이 쓰기 없음). 둘 다 조건·정렬 없는 전체 읽기라 행 순서가 같으므로
+    한 번만 읽어 두 목록을 같은 순서로 만든다 — 목록 내용·순서·dict 키 순서 모두 예전과 같다."""
     formation_by_team = {r[0]: r[1] for r in c.execute("SELECT id, formation FROM teams")}
     owned: dict = {}
+    if with_roster:
+        roster_by_team: dict = {}
+        if _subp_active():
+            from sub_positions import get as _subp_get
+            for r in c.execute("""SELECT team_id, COALESCE(on_loan_from_team_id, 0), position, id, ovr
+                                  FROM ai_players"""):
+                roster_by_team.setdefault(r[0], []).append((r[3], r[2], r[4]))
+                owned.setdefault(r[1] or r[0], []).append((r[2], _subp_get(r[3])))
+        else:
+            for r in c.execute("""SELECT team_id, COALESCE(on_loan_from_team_id, 0), position, id, ovr
+                                  FROM ai_players"""):
+                roster_by_team.setdefault(r[0], []).append((r[3], r[2], r[4]))
+                owned.setdefault(r[1] or r[0], []).append(r[2])
+        return formation_by_team, owned, roster_by_team
     if _subp_active():
         # [2026-10 주포·부포] 부포 보유자가 있을 때만 (등록 포지션, 부포) 쌍 — _gen_topup_rows가
         # squad_targets.held_assign으로 선수 1명을 정확히 1칸에 배정한다. 부포가 없으면 아래 예전 경로.
@@ -9469,6 +9537,26 @@ def _gk3_excess_move(c, year, stage=""):
                           JOIN countries cn ON l.country_id=cn.id"""):
         teams[r[0]] = (r[1], r[2] or 1, r[3], r[4] or "유럽")
     skip = _gk3_skip_teams(c)
+    # [2026-11 성능] 보내는 팀(GK 4명 이상)이 하나도 없으면 아래에서 선수 27만 명을 전부 읽고도 그대로
+    # 0을 돌려주고 끝났다(오프시즌 4회 중 2회·겨울 1회가 이 경우). GK 행만 먼저 세어 같은 판정
+    # (군팀·사용자 감독 팀이 아니고 GK 4명 이상인 팀이 있는가)을 미리 하고, 없으면 여기서 끝낸다.
+    # 있으면 아래 예전 경로를 한 줄도 안 바꾸고 그대로 탄다. 읽기만 하고 난수는 쓰지 않는다.
+    _pre_gk: dict = {}
+    for r in c.execute("SELECT team_id FROM ai_players WHERE position='GK' AND team_id IS NOT NULL"):
+        _pre_gk[r[0]] = _pre_gk.get(r[0], 0) + 1
+    _pre_skip = set()
+    try:
+        from military_service import get_military_team_ids as _gm4p
+        _pre_skip |= set(_gm4p(c))
+    except Exception:
+        pass
+    try:
+        import team_plan as _tp4p
+        _pre_skip |= set(_tp4p.user_team_ids())
+    except Exception:
+        pass
+    if not any((t not in _pre_skip and _pre_gk.get(t, 0) >= 4) for t in teams):
+        return 0
     size: dict = {}
     sums: dict = {}
     gk_n: dict = {}
@@ -9708,9 +9796,9 @@ def _rebalance_squad_sizes(c, year):
     # 수비수가 0명"] 원인은 AI 이적(_transfer_market)이 포지션을 전혀
     # 안 보고 OVR/나이/계약만으로 사고팔기 때문(내 팀 소속 AI 동료도
     # 예외 없음) — 아래 그룹별 스냅샷은 이 편향을 잡아내기 위한 자료.
-    roster_by_team: dict = {}
-    for r in c.execute("SELECT id, team_id, position, ovr FROM ai_players").fetchall():
-        roster_by_team.setdefault(r["team_id"], []).append((r["id"], r["position"], r["ovr"]))
+    # [2026-11 성능] 선수 전체 읽기 2회 → 1회(_squad_target_inputs 주석). 아래 _squad_target_inputs
+    # 자리까지의 조회는 읽기뿐이라 여기서 같이 읽어도 보는 내용이 같다.
+    _sq_form, _sq_owned, roster_by_team = _squad_target_inputs(c, with_roster=True)
     # [2026-09 버그수정, 신민용 리포트: "5명 한계인데 8명으로 뚫었잖아"]
     # 팀별 현재 외국인 수(진짜 국적 기준) — 아래 인원 보충(_gen_topup_rows)
     # 과 포지션 교체 생성이 이 값에서 이어 세도록 넘긴다. 0에서 시작하면
@@ -9728,7 +9816,6 @@ def _rebalance_squad_sizes(c, year):
     _add_my_foreign_slot(c, foreign_now)   # [2026-10] 내 선수도 외국인 한 자리
 
     name_cache = _build_name_cache(c)
-    _sq_form, _sq_owned = _squad_target_inputs(c)     # [2026-10 확정] 포메이션·장기 보유 포지션
     import constants as _sq_cc
     _SQ_GK_SWAP_LOG.update({"done": 0, "no_donor": 0, "no_donor_cases": [],
                             "excess_done": 0, "excess_no_donor": 0, "excess_over_max": 0,
@@ -12329,6 +12416,11 @@ _STAR_FLOOR_ALT = {
 }
 
 
+# [2026-11] 군 복무 동결(_military_freeze_rows 주석)과 같은 원칙 — 복무 중인 선수는 95+/90+ 최소 인원
+# 보장 승격 대상에서 뺀다(복무 중 기량 상승 불가). 쿼리 끝에 붙이는 조건이라 앞뒤 공백 유지.
+_MIL_FREEZE_SQL = "AND COALESCE(military_status,'')!='serving' "
+
+
 def _ensure_top_grade_star_floor(c, year):
     from database import rescale_ai_player_to_target_ovr
     from constants import get_country_grade
@@ -12348,7 +12440,7 @@ def _ensure_top_grade_star_floor(c, year):
         row = c.execute(
             "SELECT id, ovr, peak_ovr, potential_ovr FROM ai_players "
             "WHERE true_nationality=? AND age BETWEEN 22 AND ? "
-            "AND COALESCE(ovr_user_locked,0)=0 "
+            "AND COALESCE(ovr_user_locked,0)=0 " + _MIL_FREEZE_SQL +
             "ORDER BY ovr DESC, age ASC LIMIT 1", (nat, _AI_PEAK_END)).fetchone()
         if not row:
             continue
@@ -12371,7 +12463,7 @@ def _ensure_top_grade_star_floor(c, year):
             continue
         rows = c.execute(
             "SELECT id FROM ai_players WHERE true_nationality=? AND age BETWEEN 22 AND ? "
-            "AND COALESCE(ovr_user_locked,0)=0 AND ovr BETWEEN ? AND ? "
+            "AND COALESCE(ovr_user_locked,0)=0 AND ovr BETWEEN ? AND ? " + _MIL_FREEZE_SQL +
             "ORDER BY ovr DESC, age ASC LIMIT ?",
             (nat, _AI_PEAK_END, cfg["min_src_ovr"], cfg["floor"] - 1, need)).fetchall()
         for row in rows:
@@ -13033,9 +13125,8 @@ def _affiliate_intake(c, year, departed):
     counts = {}
     for r in c.execute("SELECT team_id, COUNT(*) n FROM ai_players GROUP BY team_id").fetchall():
         counts[r["team_id"]] = r["n"]
-    roster_by_team = {}
-    for r in c.execute("SELECT id, team_id, position, ovr FROM ai_players").fetchall():
-        roster_by_team.setdefault(r["team_id"], []).append((r["id"], r["position"], r["ovr"]))
+    # [2026-11 성능] 선수 전체 읽기 2회 → 1회(_squad_target_inputs 주석). 사이의 조회는 읽기뿐이다.
+    _sq_form, _sq_owned, roster_by_team = _squad_target_inputs(c, with_roster=True)
     foreign_now = {}
     for r in c.execute(
             """SELECT ap.team_id AS tid, COUNT(*) AS n FROM ai_players ap
@@ -13047,7 +13138,6 @@ def _affiliate_intake(c, year, departed):
         foreign_now[r["tid"]] = r["n"]
     _add_my_foreign_slot(c, foreign_now)
     name_cache = _build_name_cache(c)
-    _sq_form, _sq_owned = _squad_target_inputs(c)
     new_rows = []
     for r in team_rows:
         if r["tid"] not in aff:
@@ -13697,6 +13787,16 @@ _LAST_MANAGER_MARKET = {}
 
 
 def _manager_turnover(c, year, season=None):
+    # [2026-11 성능] 이 구간 안에서만 팀 상위 11명 평균 OVR 집계를 재사용한다(manager_ability._TOVR_SCOPE 주석).
+    import manager_ability as _mab_scope
+    _mab_scope.tovr_scope_begin()
+    try:
+        return _manager_turnover_run(c, year, season)
+    finally:
+        _mab_scope.tovr_scope_end()
+
+
+def _manager_turnover_run(c, year, season=None):
     """[2026-09 재설계 — 감독 시스템 ③-b] 시즌 종료 시 감독 **직업 시장**을
     한 번 돌린다.
 
@@ -13827,6 +13927,7 @@ def _manager_turnover(c, year, season=None):
     mrng = random.Random(zlib.crc32(f"mkt:{salt}:{year}".encode("utf-8")))
 
     amb_updates = []        # (ambition, team_id)
+    season_amb_rows = []    # [2026-11-15] (year, team_id, 이번 시즌 판정 목표, basis) — 감독 상세 표시용 기록
     tenure_updates = []     # (이번시즌 우승수, 리그순위, link_id) — ③-c 임기 누적
     ends = []               # (end_year, end_reason, link_id)
     renews = []             # (contract_until, manager_id)
@@ -13835,6 +13936,7 @@ def _manager_turnover(c, year, season=None):
              "rehired": 0, "rookie": 0, "retired_age": 0, "retired_jobless": 0,
              "stretched": 0, "rookie_forced": 0}
     _club_season = {}       # [6번 ④] 감독 id -> (그 시즌 팀, 그 시즌 성적 −1~+1)
+    _job_ab_eval = None     # [2026-11] 재계약 판정용 자리 요구 능력(처음 필요할 때 만든다)
 
     # ══ ①~④ 현직 평가: 재계약 / 계약 종료 / 경질 / 잔류 ══════════
     for tid, (rank, total) in ranks.items():
@@ -13856,6 +13958,11 @@ def _manager_turnover(c, year, season=None):
         else:
             amb = "중위권 안정"
         amb_updates.append((amb, tid))
+        # [2026-11-15] 이번 시즌 목표 기록(아래 judge_amb와 같은 값 — 감독이 없는 팀도 남긴다).
+        if t["amb"] in MANAGER_AMBITION_TARGET_PCT:
+            season_amb_rows.append((year, tid, t["amb"], "start"))
+        else:
+            season_amb_rows.append((year, tid, amb, "derived"))
 
         link = cur_mgr.get(tid)
         if not link:
@@ -13971,6 +14078,13 @@ def _manager_turnover(c, year, season=None):
         # 안 할 뿐"이라 감독은 경질 낙인 없이 자유계약이 된다.
         rprob = MANAGER_RENEW_BASE + (target - pct) * MANAGER_RENEW_PERF_SLOPE
         rprob = max(MANAGER_RENEW_MIN, min(MANAGER_RENEW_MAX, rprob))
+        # [2026-11 재계약 — 현재 능력·최근 성적] 난수 소비는 그대로(1회).
+        if _job_ab_eval is None:
+            import manager_ability as _mab_r
+            _job_ab_eval = _mab_r.JobAbility(c)
+        import manager_ability as _mab_r
+        rprob *= _mab_r.renew_ability_mult(m.get("manager_ability"), _job_ab_eval.club(tid, t["level"]),
+                                           m.get("recent_perf"))
         if rng.random() < rprob:
             renews.append((year + rng.randint(MANAGER_CONTRACT_YEARS_MIN,
                                               MANAGER_CONTRACT_YEARS_MAX),
@@ -14600,6 +14714,9 @@ def _manager_turnover(c, year, season=None):
                     # (constants.OLY_MGR_PROMO_MIN_GAIN) — 같은 급·아래 클럽으로 옮기는 건 승진이 아니다.
                     if mid in _u23_promo and lv < float(mm.get("recent_level") or 0.0) + _u23_gain:
                         continue
+                    # [2026-11 상위 자리 하한] 요구 능력보다 15 넘게 낮으면 상한 무시 패스(최후 수단)에서만.
+                    if not no_ceiling and not _mab.ability_floor_ok(mm.get("manager_ability"), _req_ab):
+                        continue
                     ok, step, bonus = _manager_job_fit(
                         lv - cap_slack, "club", mm, year,
                         base_level=base_lv, jobless_years=jl_years,
@@ -14957,6 +15074,13 @@ def _manager_turnover(c, year, season=None):
     # ══ DB 반영 ═══════════════════════════════════════════════════
     if amb_updates:
         c.executemany("UPDATE teams SET club_ambition=? WHERE id=?", amb_updates)
+    if season_amb_rows:
+        # [2026-11-15] 표시 전용 기록 — 같은 해를 다시 돌려도 덮어쓰기만 한다. 표가 없는 구세이브는 건너뛴다.
+        try:
+            c.executemany("INSERT OR REPLACE INTO team_season_ambition(year, team_id, ambition, basis) "
+                          "VALUES (?,?,?,?)", season_amb_rows)
+        except Exception:
+            pass
     # [③-c] 이번 시즌 실적/명성 누적. 거취(경질·이직·재계약)와 무관하게
     # 먼저 써야 한다 — 경질된 감독도 그 시즌을 치렀고, 그 실적이 다음
     # 직장을 구하는 근거가 된다.

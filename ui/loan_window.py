@@ -25,7 +25,7 @@ def _return_text(o):
     ry, rh = o.get("return_year"), o.get("return_half")
     if not ry:
         return ""
-    return f"{ry}년 {'하반기 시작(29주)' if rh == 1 else '시즌 끝'} 복귀"
+    return f"{ry}년 {'겨울 이동 시점(27주)' if rh == 1 else '시즌 끝'} 복귀"
 
 
 def _move_text(o):
@@ -260,7 +260,7 @@ class LoanDialog(QDialog):
     def _build_idle(self, st):
         self._header("🔄 임대 희망")
         self._note("출전 기회를 얻기 위해 구단에 임대를 요청합니다. 구단이 허락하면 관심 구단의 "
-                   "임대 오퍼가 들어오고, 수락하면 다음 이동 시점(상반기 시작 4주 / 하반기 시작 29주)에 "
+                   "임대 오퍼가 들어오고, 수락하면 다음 이동 시점(프리시즌 2주 / 겨울 27주)에 "
                    "합류합니다. 연봉·계약은 원 소속팀 그대로입니다.", "#bbb")
         if not st["can_submit"]:
             self._note(f"⚠ {st['block_reason']}", "#ff8866")

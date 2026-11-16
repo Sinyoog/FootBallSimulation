@@ -208,12 +208,28 @@ def _nat_mgr_bonus(country):
             rows = []
         finally:
             conn.close()
+        from constants import MANAGER_MATCH_REL as _REL
         for cn, ab in rows:
+            if _REL:
+                # [2026-11 상대 비교형] 나라별 감독 능력만 — 가산은 _nat_mgr_pair가 두 나라로 계산.
+                if ab:
+                    _nat_mgr_bonus_cache[cn] = float(ab)
+                continue
             b = manager_match_bonus(ab, _get_real_squad_ovr(cn)) if ab else 0.0
             if b:
                 _nat_mgr_bonus_cache[cn] = b
         _nat_mgr_bonus_cache["__built__"] = True
     return _nat_mgr_bonus_cache.get(country, 0.0)
+
+
+def _nat_mgr_pair(home, away):
+    """[2026-11 상대 비교형] (홈 가산, 원정 가산) — 두 나라 대표팀 감독 능력 차이(constants.manager_rel_pair).
+    MANAGER_MATCH_REL이 꺼져 있으면 예전 한쪽형 그대로."""
+    from constants import MANAGER_MATCH_REL, manager_rel_pair
+    if not MANAGER_MATCH_REL:
+        return _nat_mgr_bonus(home), _nat_mgr_bonus(away)
+    _nat_mgr_bonus(home)      # 캐시 채우기(스위치·국가 검사 포함)
+    return manager_rel_pair(_nat_mgr_bonus_cache.get(home, 0.0), _nat_mgr_bonus_cache.get(away, 0.0))
 
 
 def _get_real_squad_ovr(country):
@@ -2513,6 +2529,76 @@ def _intl_tier_penalty(tier):
     return {2: -4.0, 3: -9.0, 4: -15.0}.get(t, -18.0)
 
 
+# [2026-11-15 채택, 신민용 확정 — 국대 선발 M1(리그 역전 탈락) 해결] 부수 감점 면제.
+# 조사: 기존 선발의 M1(더 높은 OVR·같거나 높은 역할·리그 파워 +30 이상인데 탈락) 쌍의 77%가 부수 감점 때문이었다 —
+# 부수 감점은 리그 강도와 무관하게 부수 번호만 보고 깎아서, 자국 1부보다 훨씬 강한 해외 하위리그(예: 잉글랜드 2부)
+# 핵심 선수도 약한 자국 1부 선수에게 밀렸다. 자국 1부보다 리그 파워가 30 이상 높은 리그의 핵심·주전만 부수 감점을
+# 0으로 한다(로테이션 이하·파워 없음은 그대로). 정적 비교(5개 스냅샷)·1시즌·10시즌×2시드 검증 통과
+# (M1 34~36%, 약한 하위리그 발탁 비율 오히려 감소, 리그 쏠림·출전 기회·발롱 분포 허용 범위 안).
+_TIER_EXEMPT_MARGIN = 30.0
+_TIER_EXEMPT_ROLES = ("핵심", "주전")
+_intl_lp_cache: dict = {"year": None, "lid": {}, "power": {}}
+
+
+def _intl_league_power_tables(year=None):
+    """(나라, 부수) -> 리그 id, 리그 id -> 리그 파워. 리그 파워 = league_power 표에서 (올해−1) 이하 가장 최근
+    연도 값, 없으면 league_power_initial의 가장 최근 값 — M1 측정과 같은 출처. 연도가 바뀔 때만 다시 읽는다."""
+    if year is None:
+        try:
+            from game_engine import get_state
+            year = (get_state() or {}).get("current_year")
+        except Exception:
+            year = None
+    if year is None:
+        return {}, {}
+    if _intl_lp_cache["year"] == year:
+        return _intl_lp_cache["lid"], _intl_lp_cache["power"]
+    lid, power = {}, {}
+    conn = get_conn()
+    try:
+        for r in conn.execute("SELECT l.id, cn.name, l.tier FROM leagues l JOIN countries cn ON cn.id = l.country_id"):
+            lid[(r[1], r[2] or 1)] = r[0]
+        try:
+            _py = conn.execute("SELECT MAX(year) FROM league_power WHERE year <= ?", (int(year) - 1,)).fetchone()[0]
+            if _py is not None:
+                power = dict(conn.execute("SELECT league_id, power FROM league_power WHERE year=?", (_py,)).fetchall())
+        except Exception:
+            power = {}
+        if not power:
+            try:
+                _py = conn.execute("SELECT MAX(year) FROM league_power_initial").fetchone()[0]
+                if _py is not None:
+                    power = dict(conn.execute("SELECT league_id, power FROM league_power_initial WHERE year=?",
+                                              (_py,)).fetchall())
+            except Exception:
+                power = {}
+    finally:
+        conn.close()
+    _intl_lp_cache.update(year=year, lid=lid, power=power)
+    return lid, power
+
+
+def _intl_league_power(country, tier=1):
+    lid, power = _intl_league_power_tables()
+    k = lid.get((country, tier or 1))
+    return power.get(k) if k is not None else None
+
+
+def _intl_tier_penalty_for(cand, metrics, nat):
+    """부수 감점 — 소속 리그가 2부 이하이고, 역할이 핵심·주전이고, 소속 리그 파워가 자국(nat = 지금 선발 중인 대표팀의
+    나라 — 선수 개인 국적이 아님) 1부 파워 + 30 이상이면 0(면제). 둘 중 하나라도 리그 파워가 없으면 면제하지 않는다. 그 밖은 _intl_tier_penalty 그대로."""
+    pen = _intl_tier_penalty(cand.get("club_tier"))
+    if pen == 0.0 or not nat:
+        return pen
+    if ((metrics or {}).get("role") or "") not in _TIER_EXEMPT_ROLES:
+        return pen
+    p_club = _intl_league_power(cand.get("club_country"), cand.get("club_tier"))
+    p_home = _intl_league_power(nat, 1)
+    if p_club is None or p_home is None:
+        return pen
+    return 0.0 if p_club >= p_home + _TIER_EXEMPT_MARGIN else pen
+
+
 # [2026-09 재설계, 신민용 확정: "나이 가중치를 넣을 이유가 거의 없다 —
 # 국대 선발 점수는 OVR + 폼 보정 + 경험 보너스 + 리그 보정으로 끝내고,
 # 모르는 정보는 0으로 두고 있는 정보만 가산한다"]
@@ -2943,15 +3029,12 @@ def _intl_candidate_metrics(candidates, year=None):
         team_years = {(v["team_id"], y) for m in stats_by_id.values()
                       for y, v in m.items() if v.get("team_id")}
         tids = sorted({t for t, _y in team_years})
-        for i in range(0, len(tids), 500):
-            chunk = tids[i:i + 500]
-            ph = ",".join("?" * len(chunk))
-            for r in conn.execute(
-                    f"""SELECT team_id, year, MAX(matches) AS mx
-                        FROM hist.ai_player_season_stats
-                        WHERE team_id IN ({ph}) AND year IN (?,?,?)
-                        GROUP BY team_id, year""", (*chunk, *years)):
-                team_year_max[(r["team_id"], r["year"])] = r["mx"] or 0
+        # [2026-11 성능] 예전엔 나라마다 "WHERE team_id IN (...)"로 이 표를 통째로 훑었다(team_id 인덱스가
+        # 없어 시즌이 쌓일수록 나라당 수백 ms — 34시즌에서 나라당 0.5초). 값은 (팀, 연도)별 최댓값이라
+        # 어느 나라가 물어도 같으므로 세 연도치를 한 번만 훑어 재사용한다(_team_year_max_map).
+        # 아래에서 .get((팀, 연도))로만 쓰므로 요청하지 않은 팀의 값이 같이 들어 있어도 결과는 같다.
+        if tids:
+            team_year_max = _team_year_max_map(conn, years)
         # [2026-10 13번] 지금 소속팀과, 기록이 나온 팀들의 리그(국가·부수) — INTL_SEL_TEAM_CHANGE_FIX 주석 참고.
         if INTL_SEL_TEAM_CHANGE_FIX:
             for i in range(0, len(ids), 500):
@@ -3009,7 +3092,7 @@ def _intl_candidate_metrics(candidates, year=None):
                                            prev["goals_conceded"], league_w_prev)
         base[pid] = {"play_frac": play_frac,
                      "role": (role_by_id.get(pid) or (0, ""))[1],
-                     "_prod": prod, "_prod_prev": prod_prev}
+                     "_prod": prod, "_prod_prev": prod_prev, "_m": s.get("matches") or 0}
         if prod is not None:
             prod_by_pos.setdefault(cand["position"], []).append(prod)
 
@@ -3045,6 +3128,10 @@ def _intl_candidate_metrics(candidates, year=None):
             if b["_prod_prev"] is not None:
                 dz = (b["_prod"] - b["_prod_prev"]) / sd
                 form_adj = max(-_INTL_SEL_FORM_MAX, min(_INTL_SEL_FORM_MAX, dz))
+            # [2026-11 v4] 표본 보정(양방향) — intl_squad_v4.V4_SHRINK_K 주석
+            _k = _v4_shrink(b.get("_m"))
+            prod_adj *= _k
+            form_adj *= _k
         cm = comp_by_id.get(pid)
         big_adj = 0.0
         if cm:
@@ -3060,11 +3147,201 @@ def _intl_candidate_metrics(candidates, year=None):
 
 _intl_metrics_cache: dict = {}   # (country, year) -> {pid: metrics}
 
+# [2026-11 성능] (팀, 연도) → 그 팀 그 시즌 최다 출전수. hist.ai_player_season_stats가 바뀌면
+# (database.apss_generation의 세대가 오르면) 다시 훑는다 — 값은 매번 표에서 직접 읽던 것과 같다.
+_team_year_max_state: dict = {"gen": None, "years": None, "map": None}
+
+
+def _team_year_max_map(conn, years):
+    from database import apss_generation
+    st = _team_year_max_state
+    gen = apss_generation(watch=True)
+    if st["map"] is None or st["gen"] != gen or st["years"] != tuple(years):
+        m = {}
+        for r in conn.execute(
+                """SELECT team_id, year, MAX(matches) AS mx
+                   FROM hist.ai_player_season_stats
+                   WHERE year IN (?,?,?)
+                   GROUP BY team_id, year""", tuple(years)):
+            m[(r["team_id"], r["year"])] = r["mx"] or 0
+        st["gen"] = apss_generation(watch=True)
+        st["years"] = tuple(years)
+        st["map"] = m
+    return st["map"]
+
 
 def _invalidate_intl_metrics_cache():
     """시즌전환/리맵 시점에 game_engine._invalidate_team_ovr_cache가 호출
     (_invalidate_real_squad_ovr_cache와 같은 타이밍·같은 이유)."""
     _intl_metrics_cache.clear()
+    _v4_cand_cache.clear()
+    _team_year_max_state["map"] = None
+    _intl_lp_cache["year"] = None     # [2026-11-15] 부수 감점 면제용 리그 파워 표도 다시 읽게
+
+
+# ══════════════════════════════════════════════════════════════════════
+# [2026-11 국가대표 선발 v4, 신민용 확정] — 설계는 intl_squad_v4.py 머리 주석.
+# 고정 정원(INTL_SQUAD_GROUP_QUOTA)·OVR−나이 주전 선정 대신: 선발 점수 × 자리 적합도로 포메이션별 베스트 11
+# → 포메이션(전력 85 + 감독 성향 15) → 주전 → 중복 없는 백업 → 나머지 점수순. 내 선수도 같은 후보 목록·같은
+# 점수식으로 들어간다(발탁 = 그 26명 안에 드는가).
+# ══════════════════════════════════════════════════════════════════════
+_v4_cand_cache: dict = {}   # (country, year) -> [후보 dict(_score 포함)]
+
+
+# [2026-11 성능] intl_squad_v4 모듈이 없으면(지금 상태) import가 호출마다 실패하는데, 파이썬은 실패한
+# import를 기억하지 않아 매번 폴더를 다시 뒤진다(한 시즌 약 14만 번). 없다는 걸 한 번 확인하면 기억한다 —
+# 동작은 같다(없으면 False). 모듈이 있으면 예전 그대로 매번 V4_ENABLED를 읽는다.
+_v4_module_missing = False
+
+
+def _v4_on():
+    global _v4_module_missing
+    if _v4_module_missing:
+        return False
+    try:
+        import intl_squad_v4 as _v4
+        return bool(_v4.V4_ENABLED)
+    except ImportError:
+        _v4_module_missing = True
+        return False
+    except Exception:
+        return False
+
+
+def _v4_shrink(matches):
+    """생산성·최근폼 표본 보정 배율 = 출전 ÷ (출전 + K). v4가 꺼져 있으면 1.0(예전과 같다)."""
+    if not _v4_on():
+        return 1.0
+    import intl_squad_v4 as _v4
+    m = float(matches or 0)
+    return m / (m + _v4.V4_SHRINK_K) if m > 0 else 0.0
+
+
+def _v4_candidates(country, year=None):
+    """그 나라 후보(포지션별 숏리스트, 정원 없음) — 각 dict에 _score(intl_selection_score_v3 − 하위리그 비주전
+    감점, 포지션 적합도 배율 없음 — 적합도는 자리마다 intl_squad_v4가 곱한다). (나라, 연도)당 1회 계산."""
+    from game_engine import get_state
+    if year is None:
+        try:
+            year = (get_state() or {}).get("current_year")
+        except Exception:
+            year = None
+    key = (country, year)
+    if key in _v4_cand_cache:
+        return _v4_cand_cache[key]
+    from database import get_country_nationals_by_position, get_player_total_intl_appearances
+    nat_by_pos = get_country_nationals_by_position(country)
+    metrics = _intl_metrics_for_country(country, nat_by_pos, year=year)
+    cands = []
+    for _pos in sorted(nat_by_pos):
+        lst = sorted(nat_by_pos[_pos], key=lambda c: -(c["ovr"] or 0))[:_INTL_SEL_SHORTLIST_PER_POS]
+        cands.extend(dict(c) for c in lst)
+    apps = get_player_total_intl_appearances([c["id"] for c in cands])
+    try:
+        import sub_positions as _subp
+        _subp.attach(cands)
+    except Exception:
+        pass
+    for c in cands:
+        m = metrics.get(c["id"])
+        c["_score"] = (intl_selection_score_v3(c, m, apps.get(c["id"], 0), nat=country)
+                       - _intl_low_league_nonstarter_penalty(c, m))
+    _v4_cand_cache[key] = cands
+    return cands
+
+
+def _v4_my_candidate(p, nat, tournament_id=None):
+    """내 선수 후보 dict(id = -1) — AI와 같은 점수식(intl_selection_score_v3 + 표본 보정) − 기록에 안 남는
+    감점(부상·감독불화, 기존 _check_selection과 같다). 대회 기준 부상 제외면 None."""
+    if not p:
+        return None
+    penalty = 0.0
+    if p.get("injured") and tournament_id:
+        _inj_st, _inj_pen = _tournament_injury_eval(tournament_id, nat, _my_injury_return_day(p))
+        if _inj_st == "exclude":
+            return None
+        penalty += _inj_pen
+    rel = p.get("manager_relation", 50)
+    if rel < 30:
+        penalty += 8.0
+    elif rel < 50:
+        penalty += 3.0
+    _metrics = _intl_metrics_for_country(nat) if nat else {}
+    _pos_stat = _metrics.get(_INTL_POS_STAT_KEY) or {}
+    cand = {"id": -1, "name": p.get("name") or "ME", "position": p.get("position", "ST"),
+            "ovr": p.get("ovr", 0), "age": p.get("age", 25), "foot": p.get("foot") or "",
+            "sub_role": p.get("sub_role") or "", "club_tier": p.get("current_tier", 1),
+            "club_country": _my_club_country(p)}
+    try:
+        import sub_positions as _subp
+        _ms = _subp.my_sub()
+        if _ms:
+            cand["sub_pos"] = _ms
+    except Exception:
+        pass
+    _my_m = _my_selection_metrics(p, _pos_stat)
+    cand["_score"] = (intl_selection_score_v3(cand, _my_m, appearances=_my_total_intl_appearances(), nat=nat)
+                      - penalty - _intl_low_league_nonstarter_penalty(cand, _my_m))
+    return cand
+
+
+def _v4_style(country, tournament_id=None):
+    """그 나라 대표팀 감독 성향 3축(대회 감독 → 현재 감독). 없으면 None."""
+    try:
+        conn = get_conn()
+        try:
+            return _intl_manager_style(conn, tournament_id or 0, country)[1]
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
+def _v4_build(country, size, me=None, tournament_id=None):
+    """v4 26인 — 반환 intl_squad_v4.build_squad 결과. me가 있으면 후보에 넣고 반드시 포함(이미 발탁된 경우)."""
+    import intl_squad_v4 as _v4
+    cands = list(_v4_candidates(country))
+    force = ()
+    if me is not None:
+        cands = cands + [me]
+        force = (me["id"],)
+    return _v4.build_squad(cands, size, style=_v4_style(country, tournament_id), force_ids=force)
+
+
+def _v4_squad_for_group_builder(country, quota_by_group, candidates_out):
+    """_build_intl_squad_by_group의 v4 경로 — AI 명단(dict 목록)을 돌려준다. 정원 합계가 26보다 작으면(내가
+    발탁돼 한 자리를 비운 경우) 나를 넣어 26명을 짠 뒤 나를 뺀다(나와 AI가 한 기준으로 경쟁)."""
+    from constants import INTL_SQUAD_TOTAL
+    total = sum((quota_by_group or {}).values()) or INTL_SQUAD_TOTAL
+    me = None
+    if total < INTL_SQUAD_TOTAL:
+        try:
+            from game_engine import get_player
+            p = get_player()
+            me = _v4_my_candidate(p, country) if p else None
+        except Exception:
+            me = None
+    res = _v4_build(country, total + (1 if me is not None else 0), me=me)
+    picked = [c for c in res["squad"] if c["id"] != -1][:total]
+    if candidates_out is not None:
+        used = {c["id"] for c in picked}
+        by_b = {}
+        for c in _v4_candidates(country):
+            _b = _INTL_CALLUP_BUCKET_OF.get(c.get("position") or "")
+            if _b:
+                by_b.setdefault(_b, []).append(c)
+        for _b in INTL_CALLUP_BUCKETS:
+            lst = sorted(by_b.get(_b, ()), key=lambda x: (-x["_score"], x["id"]))
+            keep = [c for c in lst if c["id"] in used] + [c for c in lst if c["id"] not in used][:INTL_CALLUP_POOL_PER_BUCKET]
+            keep.sort(key=lambda x: (-x["_score"], x["id"]))
+            for rk, c in enumerate(keep, 1):
+                candidates_out.append({"bucket": _b, "rank": rk, "id": c["id"], "score": c["_score"],
+                                       "position": c.get("position") or "", "picked": c["id"] in used})
+    out = []
+    for c in picked:
+        d = {k: v for k, v in c.items() if not k.startswith("_")}
+        out.append(d)
+    return out
 
 
 def _intl_metrics_for_country(country, nat_by_pos=None, year=None):
@@ -3083,7 +3360,7 @@ def _intl_metrics_for_country(country, nat_by_pos=None, year=None):
             year = (get_state() or {}).get("current_year")
         except Exception:
             year = None
-    key = (country, year)
+    key = (country, year, _v41_phase(year)[1] if _v4_on() else "")
     if key in _intl_metrics_cache:
         return _intl_metrics_cache[key]
     if nat_by_pos is None:
@@ -3093,12 +3370,13 @@ def _intl_metrics_for_country(country, nat_by_pos=None, year=None):
     for _pos, lst in nat_by_pos.items():
         ranked = sorted(lst, key=lambda c: -(c["ovr"] or 0))
         shortlist.extend(ranked[:_INTL_SEL_SHORTLIST_PER_POS])
-    val = _intl_candidate_metrics(shortlist, year=year)
+    val = (_v41_candidate_metrics(shortlist, year) if _v4_on()      # [2026-11 v4.1] 평가 기간 통일
+           else _intl_candidate_metrics(shortlist, year=year))
     _intl_metrics_cache[key] = val
     return val
 
 
-def intl_selection_score_v3(cand, metrics=None, appearances=0, national_grade=None):
+def intl_selection_score_v3(cand, metrics=None, appearances=0, national_grade=None, nat=None):
     """국가대표 선발점수 v3 — 위 섹션 주석의 구조 그대로.
     cand: 후보 dict(ovr/position/club_tier/club_country 필요 —
           database.get_country_nationals_by_position의 행 형식).
@@ -3124,10 +3402,17 @@ def intl_selection_score_v3(cand, metrics=None, appearances=0, national_grade=No
             + (m.get("big_adj") or 0.0)
             + exp_bonus
             + _intl_sel_multipos_adj(cand.get("position"))
-            + _intl_tier_penalty(cand.get("club_tier")))
+            + _intl_tier_penalty_for(cand, m, nat))
 
 
 def _my_selection_metrics(p, pos_stat=None, year=None):
+    """[2026-11 v4.1] v4가 켜져 있으면 AI와 같은 기간·범위(_v41_my_metrics). 아니면 아래 v3 그대로."""
+    if _v4_on():
+        return _v41_my_metrics(p, pos_stat, year)
+    return _my_selection_metrics_v3(p, pos_stat, year)
+
+
+def _my_selection_metrics_v3(p, pos_stat=None, year=None):
     """[2026-09 신설, 국가대표 선발 v3] 내 선수의 선발 지표를 AI 후보와
     **완전히 같은 형식**(_intl_candidate_metrics의 metrics dict)으로 만든다.
     _check_selection이 나와 AI를 한 점수 척도에서 비교할 수 있게 하는 어댑터다.
@@ -3216,6 +3501,10 @@ def _my_selection_metrics(p, pos_stat=None, year=None):
         if prod_prev is not None:
             dz = (prod - prod_prev) / sd
             form_adj = max(-_INTL_SEL_FORM_MAX, min(_INTL_SEL_FORM_MAX, dz))
+        # [2026-11 v4] AI 후보와 같은 표본 보정(양방향)
+        _k = _v4_shrink(matches)
+        prod_adj *= _k
+        form_adj *= _k
     big_adj = min(_INTL_SEL_BIGGAME_MAX, my_cl_matches * 0.10)
     return {"play_frac": play_frac, "role": role, "prod_adj": prod_adj,
             "form_adj": form_adj, "big_adj": big_adj}
@@ -3345,7 +3634,7 @@ _INTL_CALLUP_BUCKET_OF = {"GK": "GK", "CB": "CB", "LB": "LB", "RB": "RB", "CDM":
 INTL_CALLUP_POOL_PER_BUCKET = 5
 
 
-def _build_intl_squad_by_group(country, quota_by_group=None, candidates_out=None):
+def _build_intl_squad_by_group(country, quota_by_group=None, candidates_out=None, role_out=None):
     """[2026-09 신설, 신민용+advisor 확정] database.get_country_squad_
     by_group이 하던 "그룹별 SQL ORDER BY(순수 OVR-나이 intl_score) LIMIT"을
     대체 — 그룹별 진짜 국적자 후보 전원을 가져와(database.
@@ -3370,6 +3659,8 @@ def _build_intl_squad_by_group(country, quota_by_group=None, candidates_out=None
     from database import get_country_nationals_by_position, get_player_total_intl_appearances
 
     quota_by_group = quota_by_group or INTL_SQUAD_GROUP_QUOTA
+    if _v4_on():    # [2026-11 v4] 고정 정원 대신 포메이션·자리 적합도 기반(위 v4 섹션)
+        return _v4_squad_for_group_builder(country, quota_by_group, candidates_out)
 
     # [2026-09 성능] 그룹마다 get_country_nationals_for_positions를 따로 부르면
     # 같은 나라 국적자를 (그룹별 후보 포지션이 겹치므로) 2~3번씩 다시 조회하게
@@ -3387,6 +3678,11 @@ def _build_intl_squad_by_group(country, quota_by_group=None, candidates_out=None
 
     picked = []
     used_ids: set = set()
+    # [2026-11-15 신설, 신민용 요청: "후보 라인의 LB 6명은 주포가 LB인 6명이 아니라, 주포가 CB든 어디든 국대에서
+    # 그 자리로 쓸 후보"] role_out(리스트)을 넘기면 선발 그룹(GK/CB/FB/CM/AM/WG/ST)마다 실제로 그 그룹 경쟁에
+    # 들어온 후보(주포가 달라도 적합도>0이면 포함, 점수 = 선발 점수 × 그 그룹 적합도)를 남긴다 — 표시 전용,
+    # 선발 결과·난수 소비 불변.
+    _role_groups = [] if role_out is not None else None
     # [2026-10 신설 — 대표팀 후보군] candidates_out(리스트)을 넘기면 그룹 숏리스트에서
     # 실제로 선발 점수를 받은 선수의 최고 점수를 모아 둔다(선발 결과·난수 불변).
     _cand_best = {} if candidates_out is not None else None
@@ -3440,7 +3736,7 @@ def _build_intl_squad_by_group(country, quota_by_group=None, candidates_out=None
         scored = []
         for c in candidates:
             base_score = (intl_selection_score_v3(
-                c, _metrics.get(c["id"]), apps_by_id.get(c["id"], 0))
+                c, _metrics.get(c["id"]), apps_by_id.get(c["id"], 0), nat=country)
                 - _intl_low_league_nonstarter_penalty(c, _metrics.get(c["id"])))   # [2026-10 13번 ③]
             fit = _intl_group_fit(c["position"], grp)
             scored.append((base_score * fit, c))
@@ -3477,6 +3773,8 @@ def _build_intl_squad_by_group(country, quota_by_group=None, candidates_out=None
         for c in _take[:n]:
             picked.append(c)
             used_ids.add(c["id"])
+        if _role_groups is not None:
+            _role_groups.append((grp, n, scored, [c["id"] for c in _take[:n]]))
 
     # [2026-09 버그수정, 신민용 리포트: "국대는 무조건 26명 뽑는데 24명
     # 뽑힌 곳도 있다"] 위 루프는 그룹별로 딱 quota_by_group[grp]명씩만
@@ -3493,6 +3791,7 @@ def _build_intl_squad_by_group(country, quota_by_group=None, candidates_out=None
     # 되면(극단적으로 작은 나라) 있는 만큼만 뽑힌다 — 그 경우는 정상.
     target_total = sum(quota_by_group.values())
     shortfall = target_total - len(picked)
+    _role_backfill = []
     if shortfall > 0:
         all_positions = list(INTL_POSITION_TO_GROUP.keys())
         # 위 그룹 루프와 같은 이유·같은 순서 재현(이미 읽어둔 _nat_by_pos 재사용).
@@ -3506,11 +3805,15 @@ def _build_intl_squad_by_group(country, quota_by_group=None, candidates_out=None
             # 채점된다(여기까지 내려온 건 그 나라 국적자가 26명도 안 되는
             # 소국이라, 어차피 있는 대로 다 뽑히는 경로다).
             backfill_pool.sort(key=lambda c: -(intl_selection_score_v3(
-                c, _metrics.get(c["id"]), apps_by_id.get(c["id"], 0))
+                c, _metrics.get(c["id"]), apps_by_id.get(c["id"], 0), nat=country)
                 - _intl_low_league_nonstarter_penalty(c, _metrics.get(c["id"]))))   # [2026-10 13번 ③]
             for c in backfill_pool[:shortfall]:
                 picked.append(c)
                 used_ids.add(c["id"])
+                if _role_groups is not None:
+                    _role_backfill.append(c)
+    if _role_groups is not None:
+        _intl_collect_role_pool(_role_groups, _role_backfill, used_ids, role_out)
     if _cand_best is not None:
         # [2026-10 개정, 신민용 요청: "후보 라인에서 뽑힌 선수는 이름만 금색"] 그룹마다
         # 최종 명단에 든 선수 전원 + 빠진 선수 점수 상위 INTL_CALLUP_POOL_PER_BUCKET명을
@@ -3537,6 +3840,98 @@ def _build_intl_squad_by_group(country, quota_by_group=None, candidates_out=None
                 candidates_out.append({"bucket": _b, "rank": _rk, "id": _pid, "score": _sc,
                                        "position": _c.get("position") or "", "picked": _pk})
     return picked
+
+
+def _intl_collect_role_pool(role_groups, backfill, used_ids, out):
+    """[2026-11-15 신설] 선발 그룹별 후보 라인(표시 전용) — _build_intl_squad_by_group의 role_out.
+    그룹마다: 그 그룹에서 뽑힌 선수 전원 + 최종적으로 어디에도 안 뽑힌 후보 중 점수 상위
+    INTL_CALLUP_POOL_PER_BUCKET명. 다른 그룹에서 뽑힌 선수는 넣지 않는다(그 그룹 카드에 뽑힘으로 나온다).
+    정원이 모자라 포지션 무관으로 채운 선수(backfill)는 자기 포지션 그룹 카드에 "보충"으로 넣는다.
+    [2026-11-15 개정, 신민용 요청: "LB·RB는 따로, 카드 = 국대에서 쓰는 자리(주포가 RW여도 ST로 뽑히면 ST)"]
+    카드는 그룹이 아니라 자리(card) 단위 — _intl_role_card 참고. 뽑힌 선수 전원 + 안 뽑힌 후보 중 자리별 점수 상위
+    INTL_CALLUP_POOL_PER_BUCKET명.
+    out에 dict(grp, card, quota, rank, id, score, position, fit, picked, via)를 쌓는다."""
+    from constants import INTL_POSITION_TO_GROUP
+    cards = {}      # card -> {"grp", "quota", "rows": [...], "cut": [...]}
+    for grp, n, scored, picked_ids in role_groups:
+        _pk = set(picked_ids)
+        for sc, c in scored:
+            if c["id"] in _pk:
+                k = "rows"
+            elif c["id"] not in used_ids:
+                k = "cut"
+            else:
+                continue
+            cd = cards.setdefault(_intl_role_card(grp, c), {"grp": grp, "quota": n, "rows": [], "cut": []})
+            cd[k].append((sc, c, k == "rows", ""))
+    for c in backfill:
+        grp = INTL_POSITION_TO_GROUP.get(c.get("position") or "")
+        if not grp:
+            continue
+        cd = cards.setdefault(_intl_role_card(grp, c), {"grp": grp, "quota": 0, "rows": [], "cut": []})
+        cd["rows"] = [x for x in cd["rows"] if x[1]["id"] != c["id"]]
+        cd["cut"] = [x for x in cd["cut"] if x[1]["id"] != c["id"]]
+        cd["rows"].append((0.0, c, True, "backfill"))
+    for card, cd in cards.items():
+        cut = sorted(cd["cut"], key=lambda x: (-x[0], x[1]["id"]))[:INTL_CALLUP_POOL_PER_BUCKET]
+        rows = sorted(cd["rows"] + cut, key=lambda x: (x[3] == "backfill", -x[0], x[1]["id"]))
+        for rk, (sc, c, pk, via) in enumerate(rows, 1):
+            out.append({"grp": cd["grp"], "card": card, "quota": cd["quota"], "rank": rk, "id": c["id"],
+                        "score": sc, "position": c.get("position") or "",
+                        "fit": _intl_group_fit(c.get("position") or "", cd["grp"]),
+                        "picked": pk, "via": via})
+
+
+def intl_my_callup_role_row(country):
+    """[2026-11-15 신설, 신민용 리포트: "최종 국대 인원엔 플레이어가 있는데 후보 라인엔 없다"] 내 선수가 이
+    대회 대표팀에 뽑혀 26인을 짤 때 후보 라인에 넣을 내 줄 — 표시 전용. 점수는 내 발탁 판정(_check_selection)과
+    같은 식(선발 점수 − 하위리그 비주전 감점 − 감독 관계 감점, × 그 그룹 적합도 — 부상 판정은 대회 일정이 필요해
+    여기선 빼고), 자리는 AI와 같은 카드 규칙(_intl_role_card). 내 선수가 없거나 실패하면 None."""
+    try:
+        from game_engine import get_player
+        from constants import INTL_POSITION_TO_GROUP
+        p = get_player()
+        if not p:
+            return None
+        my_pos = p.get("position", "ST")
+        grp = INTL_POSITION_TO_GROUP.get(my_pos) or next(
+            (g for g, tbl in INTL_GROUP_FIT.items() if my_pos in tbl), "CM")
+        from database import get_country_nationals_by_position
+        _metrics = _intl_metrics_for_country(country, get_country_nationals_by_position(country))
+        _pos_stat = _metrics.get(_INTL_POS_STAT_KEY) or {}
+        cand = {"ovr": p.get("ovr", 0), "position": my_pos, "club_tier": p.get("current_tier", 1),
+                "club_country": _my_club_country(p)}
+        _m = _my_selection_metrics(p, _pos_stat)
+        rel = p.get("manager_relation", 50)
+        pen = 8.0 if rel < 30 else (3.0 if rel < 50 else 0.0)
+        fit = _intl_group_fit(my_pos, grp)
+        score = (intl_selection_score_v3(cand, _m, appearances=_my_total_intl_appearances(), nat=country)
+                 - pen - _intl_low_league_nonstarter_penalty(cand, _m)) * fit
+        return {"grp": grp, "card": _intl_role_card(grp, {"position": my_pos, "foot": p.get("foot")}),
+                "quota": 0, "rank": 0, "id": -1, "score": score, "position": my_pos, "fit": fit,
+                "picked": True, "via": ""}
+    except Exception:
+        return None
+
+
+# [2026-11-15] 선발 그룹 → 후보 라인 카드(국대에서 쓰는 자리). 좌우가 묶인 그룹은 자기 포지션이 그 그룹의 핵심
+# 포지션이면 그 자리, 아니면(예: CB가 풀백 경쟁, ST가 윙 경쟁) 주발로 왼쪽/오른쪽(왼발 → 왼쪽, 오른발·양발 → 오른쪽).
+_INTL_ROLE_CARD_SINGLE = {"GK": "GK", "CB": "CB", "AM": "CAM", "ST": "ST"}
+_INTL_ROLE_CARD_SIDES = {"FB": ("LB", "RB"), "WG": ("LW", "RW")}
+
+
+def _intl_role_card(grp, c):
+    pos = c.get("position") or ""
+    if grp in _INTL_ROLE_CARD_SINGLE:
+        return _INTL_ROLE_CARD_SINGLE[grp]
+    if grp in _INTL_ROLE_CARD_SIDES:
+        left, right = _INTL_ROLE_CARD_SIDES[grp]
+        if pos in (left, right):
+            return pos
+        return left if (c.get("foot") or "") == "왼발" else right
+    if grp == "CM":
+        return "CDM" if pos == "CDM" else "CM"
+    return grp
 
 
 def _intl_ovr_gap_penalty(ovr, real_squad_ovr):
@@ -3810,6 +4205,17 @@ def _check_selection(p, my_grade, country="", continent="", tournament_id=None):
 
     nat = country or p.get("nationality", "")
 
+    if _v4_on() and nat:
+        # [2026-11 v4] AI 26인과 같은 후보 목록·같은 점수식·같은 구성 규칙으로 26명을 짜서, 내가 들면 발탁.
+        _me = _v4_my_candidate(p, nat, tournament_id)
+        if _me is None:
+            return False
+        import intl_squad_v4 as _v4
+        from constants import INTL_SQUAD_TOTAL
+        _res = _v4.build_squad(list(_v4_candidates(nat)) + [_me], INTL_SQUAD_TOTAL,
+                               style=_v4_style(nat, tournament_id))
+        return any(c["id"] == -1 for c in _res["squad"])
+
     quota = INTL_SQUAD_GROUP_QUOTA.get(my_grp, 4)
 
     # ── [2026-09 재설계 v3] AI 26인 선발과 같은 기준으로 통일 ──────────
@@ -3875,12 +4281,12 @@ def _check_selection(p, my_grade, country="", continent="", tournament_id=None):
     _my_m = _my_selection_metrics(p, _pos_stat)
     my_score = (intl_selection_score_v3(
         my_cand, _my_m,
-        appearances=_my_total_intl_appearances(),
+        appearances=_my_total_intl_appearances(), nat=nat,
     ) - penalty - _intl_low_league_nonstarter_penalty(my_cand, _my_m)) * _intl_group_fit(my_pos, my_grp)
 
     # [2026-10 13번 ③] AI 후보도 _build_intl_squad_by_group과 같은 규칙으로 채점한다.
     ai_scores = sorted(
-        ((intl_selection_score_v3(c, _metrics.get(c["id"]), _apps.get(c["id"], 0))
+        ((intl_selection_score_v3(c, _metrics.get(c["id"]), _apps.get(c["id"], 0), nat=nat)
           - _intl_low_league_nonstarter_penalty(c, _metrics.get(c["id"])))
          * _intl_group_fit(c["position"], my_grp)
          for c in ai_cands), reverse=True)
@@ -5360,6 +5766,10 @@ def _match_outcome(h_ovr, a_ovr, knockout, neutral=False, h_mgr=0.0, a_mgr=0.0):
     줄어드는 꼬리로 바꿨다 — 실제 계산은 _intl_outcome_probs. 감독 보정·
     곡선·기울기·난수 소비(random.random() 1회)는 그대로다.
     """
+    from constants import MANAGER_MATCH_REL
+    if MANAGER_MATCH_REL and (h_mgr or a_mgr):
+        # [2026-11 상대 비교형] 감독 가산은 팀 전력 단위 — 곡선 앞에서 더한다.
+        h_ovr, a_ovr, h_mgr, a_mgr = h_ovr + h_mgr, a_ovr + a_mgr, 0.0, 0.0
     diff = _intl_effective_diff(h_ovr, a_ovr)
     # [2026-10 6번 ③-1 대표팀] 감독 능력 보정은 곡선 뒤(기본 0 = 예전과 같음).
     diff = diff + (h_mgr - a_mgr)
@@ -5510,23 +5920,7 @@ def _intl_formation_for(tournament_id, country, pool):
         if row and row[0] in FORMATION_SLOTS:
             _intl_formation_cache[key] = row[0]
             return row[0]
-        try:
-            _done = [r[0] for r in conn.execute(
-                "SELECT slot FROM intl_squad WHERE tournament_id=? AND country=? "
-                "AND starter=1 AND COALESCE(slot,'')<>''", (tournament_id, country))]
-        except Exception:
-            _done = []
-        name = _formation_from_slots(_done)
-        mgr_id, style = _intl_manager_style(conn, tournament_id, country)
-        if not name:
-            from formation_logic import prep_roster, choose_formation_prepped
-            import zlib as _z
-            from database import get_world_salt
-            rng = random.Random(_z.crc32(
-                f"intlform:{get_world_salt()}:{tournament_id}:{country}".encode("utf-8")))
-            name, _pen = choose_formation_prepped(
-                prep_roster(pool), "4-4-2", (style or {}).get("style_attack") or "BALANCED",
-                rng=rng, style=style)
+        name, mgr_id = _intl_formation_compute(conn, tournament_id, country, pool)
         try:
             conn.execute(
                 "INSERT OR REPLACE INTO intl_formations(tournament_id, country, formation, "
@@ -5538,6 +5932,108 @@ def _intl_formation_for(tournament_id, country, pool):
         conn.close()
     _intl_formation_cache[key] = name
     return name
+
+
+def _intl_formation_compute(conn, tournament_id, country, pool):
+    """_intl_formation_for의 "아직 저장값이 없을 때 고르는" 부분만 떼어 낸 것(저장·캐시 없음) —
+    (포메이션 이름, 감독 id). 전역 random을 쓰지 않는다(파생 Random만). [2026-11-13] 화면 미리보기
+    (preview_intl_lineup)가 DB에 아무것도 쓰지 않고 같은 값을 얻으려고 분리했다 — 계산 내용은 예전 그대로."""
+    try:
+        _done = [r[0] for r in conn.execute(
+            "SELECT slot FROM intl_squad WHERE tournament_id=? AND country=? "
+            "AND starter=1 AND COALESCE(slot,'')<>''", (tournament_id, country))]
+    except Exception:
+        _done = []
+    name = _formation_from_slots(_done)
+    mgr_id, style = _intl_manager_style(conn, tournament_id, country)
+    if not name and _v4_on():
+        # [2026-11 v4] 26인(+ 발탁된 나) 선발 점수 × 자리 적합도로 포메이션별 베스트 11 → 전력 85 + 성향 15.
+        import intl_squad_v4 as _v4
+        name = _v4.choose_formation(_v4_pool_with_scores(tournament_id, country, pool), style)[0]
+    if not name:
+        from formation_logic import prep_roster, choose_formation_prepped
+        import zlib as _z
+        from database import get_world_salt
+        rng = random.Random(_z.crc32(
+            f"intlform:{get_world_salt()}:{tournament_id}:{country}".encode("utf-8")))
+        name, _pen = choose_formation_prepped(
+            prep_roster(pool), "4-4-2", (style or {}).get("style_attack") or "BALANCED",
+            rng=rng, style=style)
+    return name, mgr_id
+
+
+def preview_intl_lineup(tournament_id, country, pool):
+    """[2026-11-13 신설, 신민용 리포트: "메인 화면 좌측 국대 포메이션은 4-4-2인데 경기 상세·기록실은 4-3-3"]
+    화면(메인 포메이션 위젯) 전용 — 그 대회 그 나라가 실제 경기에서 쓰는 포메이션과 선발 11명
+    (_intl_tactical_lineup과 같은 재료·규칙: 대회 포메이션 + 나이 보정 점수 _greedy_fill_slots)을 돌려준다.
+    pool은 호출부가 이미 받아 둔 get_or_create_intl_squad 결과(26인). **DB에 아무것도 쓰지 않는다** —
+    포메이션이 아직 저장되지 않은 대회(첫 경기 전)는 저장 없이 같은 계산으로 미리 보여 주고, 실제 저장은
+    예전처럼 경기 쪽(_intl_formation_for)이 한다(화면을 열었는지와 무관하게 경기 결과가 같다).
+    반환: (포메이션 이름, FORMATION_SLOTS 순서 라인업[행 dict 또는 None]) — 풀이 8명 미만이면 (None, None)."""
+    from constants import FORMATION_SLOTS
+    from formation_logic import _greedy_fill_slots
+    if not pool or len(pool) < 8:
+        return None, None
+    key = (tournament_id, country)
+    formation = _intl_formation_cache.get(key)
+    if formation not in FORMATION_SLOTS:
+        from database import get_conn
+        conn = get_conn()
+        try:
+            try:
+                row = conn.execute(
+                    "SELECT formation FROM intl_formations WHERE tournament_id=? AND country=?",
+                    (tournament_id, country)).fetchone()
+            except Exception:
+                row = None
+            if row and row[0] in FORMATION_SLOTS:
+                formation = row[0]
+            else:
+                # 월드 salt는 처음 읽힐 때 meta에 확정된다(database.get_world_salt) — 화면이 그 시점을
+                # 앞당기면 안 되므로, 아직 확정 전이면 미리보기를 하지 않는다(호출부가 예전 표시로 폴백).
+                try:
+                    import database as _db
+                    _salt_ready = (_db._world_salt_cache is not None or conn.execute(
+                        "SELECT 1 FROM meta WHERE key='world_salt' AND COALESCE(value,'')<>''").fetchone())
+                except Exception:
+                    _salt_ready = False
+                if not _salt_ready:
+                    return None, None
+                formation = _intl_formation_compute(conn, tournament_id, country, pool)[0]
+        finally:
+            conn.close()
+    slot_order = FORMATION_SLOTS.get(formation, _INTL_MATCHDAY_STARTER_POS)
+
+    def _score(r):
+        return r["ovr"] - abs(r.get("age", 27) - 27) * 0.3
+
+    id_to_row = {r["id"]: r for r in pool}
+    placed = _greedy_fill_slots([dict(r, ovr=_score(r)) for r in pool], slot_order)
+    return formation, [id_to_row[p["id"]] if p is not None else None for p in placed]
+
+
+def _v4_pool_with_scores(tournament_id, country, pool):
+    """26인 풀에 v4 선발 점수(_score)를 붙인 복사본 — 후보 점수표(_v4_candidates)에서 찾고, 없으면 OVR.
+    이 대회에 내가 발탁돼 있으면 나도 넣는다(포메이션은 나까지 포함한 명단 기준)."""
+    sc = {c["id"]: c for c in _v4_candidates(country)}
+    out = []
+    for r in pool:
+        d = dict(r)
+        src = sc.get(r["id"])
+        d["_score"] = src["_score"] if src else float(r.get("ovr") or 0)
+        if src and src.get("sub_pos") and not d.get("sub_pos"):
+            d["sub_pos"] = src["sub_pos"]
+        out.append(d)
+    try:
+        from database import _my_player_intl_slot
+        if _my_player_intl_slot(tournament_id, country):
+            from game_engine import get_player
+            me = _v4_my_candidate(get_player(), country)
+            if me is not None:
+                out.append(me)
+    except Exception:
+        pass
+    return out
 
 
 def _formation_from_slots(slots):
@@ -5638,6 +6134,22 @@ def _pick_intl_starters(tournament_id, country, avg_ovr):
     # 맞는 이름있는 포메이션(_intl_formation_for)의 슬롯 순서로 뽑는다.
     from constants import FORMATION_SLOTS
     formation = _intl_formation_for(tournament_id, country, pool)
+    if _v4_on():
+        # [2026-11 v4] 주전 = 선발 점수 × 자리 적합도 최적 배정(OVR−나이 대신). AI 26인 풀 기준(내 선수 기용은
+        # 경기 쪽 기존 규칙 그대로).
+        import intl_squad_v4 as _v4
+        _sp = [c for c in _v4_pool_with_scores(tournament_id, country, pool) if c["id"] != -1]
+        _asg, _m = _v4.best_xi(list(FORMATION_SLOTS.get(formation, _INTL_MATCHDAY_STARTER_POS)), _sp)
+        id_to_row = {r["id"]: r for r in pool}
+        starters, _slots = [], {}
+        for _s, _c in _asg:
+            if _c is not None and _c["id"] in id_to_row:
+                starters.append(id_to_row[_c["id"]])
+                _slots[_c["id"]] = _s
+        for r in starters:
+            r["slot"] = _slots.get(r["id"], "")
+        set_intl_squad_starters(tournament_id, country, [r["id"] for r in starters], slots=_slots)
+        return starters
     slot_order = FORMATION_SLOTS.get(formation, _INTL_MATCHDAY_STARTER_POS)
     scored_pool = [dict(r, ovr=_score(r)) for r in pool]
     id_to_row = {r["id"]: r for r in pool}
@@ -5714,91 +6226,75 @@ def resolve_intl_starter_slots(tournament_id, country, squad_rows):
     return _fill_intl_starter_slots(tournament_id, country, squad_rows, starters)
 
 
-# [2026-09 신설, 신민용 리포트: "지금은 월드컵 기준 주전들만 7/7 이렇게
-# 뜨고 그 외에는 다 0/7 이렇게 뜨거든? 근데 알다시피 교체되는 카드들도
-# 있고 그러잖아"] _pick_intl_starters가 뽑는 11명은 대회 내내 완전히
-# 고정되고(의도된 설계 — 매 경기 다시 경쟁시키면 실제 대표팀과 다르게
-# 너무 자주 바뀜), bump_intl_squad_appearances는 그 고정 11명한테만
-# 출전 카운트를 올려서 벤치 15명은 영원히 0으로 남았다 — 실제로는
-# 교체 투입되는 선수가 있는데 그게 전혀 반영이 안 된 것.
-#
-# [위험 회피] 26인 전체에 매번 출전을 올려버리면 "전원 N/N"이 되는
-# 정반대 버그가 생긴다(신민용이 명시적으로 우려한 지점) — 그래서 이
-# 함수는 "이번 한 경기에 한정해" 벤치에서 소수만 무작위로 골라 반환할
-# 뿐, intl_squad에 아무것도 직접 쓰지 않는다(저장은 호출부가
-# bump_intl_squad_appearances로 starters와 합쳐서 한 번에 처리).
-#
-# [2026-09 재설계, 신민용+advisor 확정 — "④교체, 몇 명 vs 누가를
-# 분리하라"] "몇 명 교체할지"는 더 이상 이 함수가 정하지 않는다 — 그건
-# 아래 _get_intl_substitution_count(경기 결과+전력차 기반 사후 근사)의
-# 몫이고, 이 함수는 "그 인원만큼 누구를 넣을지"만 담당한다(호출부가
-# n_subs를 명시적으로 넘긴다). 후보 선정 로직 자체(GK 제외, OVR 가중
-# 무작위)는 신민용 요청대로 그대로 재사용 — "완전히 버릴 필요는 없다,
-# 앞단의 인원수 결정 부분만 결과 기반으로 바꾸면 된다".
-def _pick_intl_substitutes(starters, pool, n_subs):
-    """이번 경기에 한해 벤치에서 교체 투입되는 선수 n_subs명을 뽑는다
-    (매 경기 다시 추첨 — 고정되는 starters와 다름). GK는 제외, OVR이
-    높을수록 더 자주 뽑히는 가중치(에이스급 백업이 더 자주 교체 투입).
-    intl_squad에 아무것도 쓰지 않는 순수 함수: 호출부가 반환값을
-    starters와 합쳐 bump_intl_squad_appearances에 넘긴다."""
+# [2026-11 신설, 신민용 확정: "국대 교체가 5장(연장 6장)인데 1/3 출전이 한 명뿐 — 교체한 애들도 1이
+# 올라가야 한다"] 공식 경로(내가 안 뽑힌 대회·모든 예선 — 실제 교체 이벤트가 없는 경로)의 교체 인원과
+# 투입 선수. 예전 _get_intl_substitution_count는 "점수차 × 0.9"라 무승부면 0명, 팀당 경기 평균 0.9~1.4명
+# 이었고, _pick_intl_substitutes는 포지션과 무관하게 벤치 상위 OVR에만 몰렸다.
+#   · 인원: 경기 엔진 경로(실제 교체 기록) 실측 분포 — 5명 93% / 4명 7%(팀당 4.93명). 연장까지 간
+#     토너먼트 경기(공식 경로에서는 녹아웃 무승부 → 승부차기)만 +1명(최대 6명).
+#   · 누가 나가나(교체 우선순위): 공격수·윙어 > 미드필더 > 풀백 > CB 가중 추첨, GK 제외.
+#   · 누가 들어가나(포지션 적합성, 우선순위와 따로 계산): 나간 선수 자리에 ① 같은 포지션(주포·부포)
+#     ② 그 자리를 소화할 수 있는 포지션(POSITION_COMPAT) ③ 그 밖의 선수 순으로 후보를 좁히고, 그 안에서
+#     자리 적합도(formation_logic._slot_value) 순위 가중(1/(순위+1)) 추첨. GK 제외.
+# 주전 11명은 그대로 대회 내내 고정(N/N) — 교체로 나간 주전도 출전이다.
+# 검증(2026-11, 원본·수정 × 시드 12345·777 10시즌): 공식 경로 팀당 일반 4.93명(최대 5)·연장 5.92~5.95명(최대 6),
+# 7명 이상 0건, 주전 N/N 위반 0건, 투입 선수 같은 포지션 60%·소화 가능 36%·대체 4%.
+_INTL_FORMULA_SUB_DIST = ((5, 0.93), (4, 0.07))
+_INTL_FORMULA_ET_EXTRA_SUBS = 1
+_INTL_SUB_OFF_LINE = {"ST": "ATT", "CF": "ATT", "LW": "ATT", "RW": "ATT",
+                      "CAM": "MID", "CM": "MID", "CDM": "MID", "LM": "MID", "RM": "MID",
+                      "LB": "FB", "RB": "FB", "LWB": "FB", "RWB": "FB", "CB": "CB"}
+_INTL_SUB_OFF_WEIGHT = {"ATT": 3.0, "MID": 2.0, "FB": 1.2, "CB": 0.6}
+
+
+def _intl_formula_sub_count(went_extra_time):
+    """공식 경로 한 팀의 이번 경기 교체 인원(일반 4~5명, 연장 경기만 +1)."""
+    r = random.random()
+    acc = 0.0
+    n = _INTL_FORMULA_SUB_DIST[-1][0]
+    for k, p in _INTL_FORMULA_SUB_DIST:
+        acc += p
+        if r < acc:
+            n = k
+            break
+    return n + (_INTL_FORMULA_ET_EXTRA_SUBS if went_extra_time else 0)
+
+
+def _pick_intl_substitutes_v2(starters, pool, n_subs):
+    """이번 경기 교체 투입 선수 n_subs명 — 위 주석 규칙. [(나간 주전, 들어간 선수, 자리)] 목록을 돌려주며
+    intl_squad에는 아무것도 쓰지 않는다(호출부가 starters와 합쳐 bump_intl_squad_appearances)."""
     if n_subs <= 0:
         return []
+    from constants import POSITION_COMPAT
+    from formation_logic import _slot_value
     starter_ids = {r["id"] for r in starters}
+    on_field = [r for r in starters
+                if r.get("position") != "GK" and (r.get("slot") or r.get("position")) != "GK"]
     bench = [r for r in pool if r["id"] not in starter_ids and r.get("position") != "GK"]
-    if not bench:
-        return []
-    n_subs = min(n_subs, len(bench))
-    bench_sorted = sorted(bench, key=lambda r: -(r.get("ovr") or 0))
-    candidates = list(bench_sorted)
-    weights = [1.0 / (idx + 1) for idx in range(len(candidates))]
-    chosen = []
+    out = []
     for _ in range(n_subs):
-        if not candidates:
+        if not on_field or not bench:
             break
-        pick = random.choices(candidates, weights=weights, k=1)[0]
-        idx = candidates.index(pick)
-        candidates.pop(idx)
-        weights.pop(idx)
-        chosen.append(pick)
-    return chosen
+        w_off = [_INTL_SUB_OFF_WEIGHT.get(_INTL_SUB_OFF_LINE.get(r.get("slot") or r.get("position") or "CM", "MID"), 2.0)
+                 for r in on_field]
+        off = random.choices(on_field, weights=w_off, k=1)[0]
+        on_field.remove(off)
+        slot = off.get("slot") or off.get("position") or "CM"
+        compat = list(POSITION_COMPAT.get(slot, [slot]))
 
-
-# [2026-09 신설, 신민용+advisor 확정 — "④교체 인원 수는 경기 결과+전력차
-# 기반 사후 근사로"] 현재 국제 AI 매치(_sim_ai_match)는 승/무/패 판정 →
-# 최종 스코어 생성이 전부라 "몇 분에 몇 대 몇" 같은 경기 중 상태 자체가
-# 없다(이벤트 단위 시뮬레이션 없음) — 그래서 "지는 중이라 공격수 투입"
-# 같은 실시간 교체 AI는 지금 구조로는 못 만든다(advisor 확인). 대신
-# "경기가 끝난 뒤, 그 결과가 어땠는지"만으로 이번 경기에 교체가 몇 명
-# 있었을지 근사한다 — 대승/대패처럼 결과가 뚜렷할수록 교체가 많고,
-# 접전일수록 적다는 게 기본 축. 여기에 "그 결과가 전력차 대비 얼마나
-# 뜻밖이었는지"(surprise)를 얹어 감쇠시킨다 — 강팀이 예상대로 크게
-# 이기면 안심하고 로테이션을 돌리지만, 약팀이 뜻밖에 크게 이기거나
-# 강팀이 뜻밖에 졌을 때는 그 결과가 불안정해 보여서 오히려 손을 덜
-# 댄다(신민용 예시: "3:0 + 전력차-5(의외의 대승) → 약간의 로테이션만").
-def _get_intl_substitution_count(my_score, opp_score, my_strength_diff, max_subs=5):
-    """이 팀 관점 최종 스코어(my_score/opp_score)와 전력차(my_strength_
-    diff, 양수=내가 우세)로 이번 경기의 교체 인원(0~max_subs)을 근사한다.
-    확률적 요소가 있어 같은 입력이어도 매 경기 조금씩 다를 수 있다."""
-    margin = my_score - opp_score
-    # 전력차 10점당 대략 골 1개 차이가 "예상되는 결과"라는 거친 환산 —
-    # 정밀한 모델이 아니라 사후 근사이므로 이 정도 선형 근사면 충분하다.
-    expected_margin = my_strength_diff / 10.0
-    surprise = abs(margin - expected_margin)
-
-    # 결과 자체의 "결정적임" 정도 — 대승이든 대패든 큰 점수차일수록
-    # 로테이션/교체 유인이 커진다(0골차 접전은 거의 안 건드림).
-    decisiveness = min(abs(margin), 4)
-    base = decisiveness * 0.9
-
-    # 결과가 전력차 대비 뜻밖일수록(예상 밖 대승/예상 밖 대패 모두) 감쇠
-    # — 최소 0.3배는 유지해 "그래도 아예 안 바꾸진 않는다"를 보장.
-    surprise_damp = max(0.3, 1.0 - surprise * 0.12)
-
-    raw = base * surprise_damp
-    n = int(raw)
-    if random.random() < (raw - n):
-        n += 1
-    return max(0, min(n, max_subs))
+        def _tier(c):
+            if c.get("position") == slot or (c.get("sub_pos") or "") == slot:
+                return 0
+            if c.get("position") in compat or (c.get("sub_pos") or "") in compat:
+                return 1
+            return 2
+        best_t = min(_tier(c) for c in bench)
+        cands = sorted((c for c in bench if _tier(c) == best_t),
+                       key=lambda c: (-_slot_value(c, slot), c["id"]))
+        pick = random.choices(cands, weights=[1.0 / (i + 1) for i in range(len(cands))], k=1)[0]
+        bench.remove(pick)
+        out.append((off, pick, slot))
+    return out
 
 
 def _intl_tactical_lineup(tournament_id, country, avg_ovr):
@@ -5836,6 +6332,18 @@ def _intl_tactical_lineup(tournament_id, country, avg_ovr):
     slot_order = FORMATION_SLOTS.get(formation, _INTL_MATCHDAY_STARTER_POS)
     scored_pool = [dict(r, ovr=_score(r)) for r in pool]
     id_to_row = {r["id"]: r for r in pool}
+    if _v4_on():
+        # [2026-11 v4] 주전·자리는 _pick_intl_starters가 저장한 값 그대로(같은 라벨 자리는 순서대로).
+        _st = _pick_intl_starters(tournament_id, country, avg_ovr) or []
+        _by_slot = {}
+        for r in _st:
+            _by_slot.setdefault(r.get("slot") or "", []).append(r)
+        lineup = []
+        for s in slot_order:
+            lst = _by_slot.get(s) or []
+            lineup.append(id_to_row.get(lst.pop(0)["id"]) if lst else None)
+        if sum(1 for x in lineup if x is not None) >= min(11, len(_st)) and _st:
+            return lineup, formation
     placed = _greedy_fill_slots(scored_pool, slot_order)
     lineup = [id_to_row[p["id"]] if p is not None else None for p in placed]
     return lineup, formation
@@ -5891,10 +6399,10 @@ def _sim_ai_match(t, m, my_played=False, conn=None, reason="injury", batch=None)
     # [2026-10] U-23 올림픽은 성인 대표팀 감독 보정 대신 U-23 감독 보정(같은 식, 기준 = 그 대회
     # U-23 명단 전력 — competition/oly_manager.match_bonus).
     if not (bool(m["is_my"]) and t.get("my_selected") == 1) and not _is_oly(t):   # 실제 내 경기만 제외(아래 _really_mine과 같은 판정)
-        _hm, _am = _nat_mgr_bonus(m["home"]), _nat_mgr_bonus(m["away"])
+        _hm, _am = _nat_mgr_pair(m["home"], m["away"])
     elif not (bool(m["is_my"]) and t.get("my_selected") == 1):
-        from competition.oly_manager import match_bonus as _oly_mb
-        _hm, _am = _oly_mb(t["id"], m["home"], he["ovr"]), _oly_mb(t["id"], m["away"], ae["ovr"])
+        from competition.oly_manager import match_pair as _oly_mp
+        _hm, _am = _oly_mp(t["id"], m["home"], he["ovr"], m["away"], ae["ovr"])
     outcome = _match_outcome(he["ovr"], ae["ovr"], knockout, neutral=_neutral,
                              h_mgr=_hm, a_mgr=_am)
     pso_winner, pso_score = "", ""
@@ -5988,16 +6496,19 @@ def _sim_ai_match(t, m, my_played=False, conn=None, reason="injury", batch=None)
                 if _cov_ids.get(_sk):
                     bump_intl_squad_appearances(t["id"], _cn, _cov_ids[_sk])
             home_starters = away_starters = None
+        # [2026-11] 공식 경로 교체 — _intl_formula_sub_count 정의부 주석 참고. 공식 경로의 "연장까지 간
+        # 경기"는 녹아웃 무승부(→ 승부차기)뿐이다(연장 골을 따로 만들지 않는다).
+        _went_et = bool(knockout) and hs == as_
         if home_starters:
             home_pool = get_or_create_intl_squad(t["id"], m["home"], he["ovr"], _INTL_MATCHDAY_FULL_POS)
-            home_n_subs = _get_intl_substitution_count(hs, as_, _strength_diff_home)
-            home_subs = _pick_intl_substitutes(home_starters, home_pool, home_n_subs)
+            home_subs = [x[1] for x in _pick_intl_substitutes_v2(
+                home_starters, home_pool, _intl_formula_sub_count(_went_et))]
             bump_intl_squad_appearances(
                 t["id"], m["home"], [r["id"] for r in home_starters] + [r["id"] for r in home_subs])
         if away_starters:
             away_pool = get_or_create_intl_squad(t["id"], m["away"], ae["ovr"], _INTL_MATCHDAY_FULL_POS)
-            away_n_subs = _get_intl_substitution_count(as_, hs, -_strength_diff_home)
-            away_subs = _pick_intl_substitutes(away_starters, away_pool, away_n_subs)
+            away_subs = [x[1] for x in _pick_intl_substitutes_v2(
+                away_starters, away_pool, _intl_formula_sub_count(_went_et))]
             bump_intl_squad_appearances(
                 t["id"], m["away"], [r["id"] for r in away_starters] + [r["id"] for r in away_subs])
     except Exception:
@@ -7635,7 +8146,8 @@ def _award_intl_awards(t):
         (tid, my_nat, my_nat)).fetchone()["c"]
 
     pool = [{"position": my_pos, "goals": my_row["g"], "assists": my_row["a"], "rating": my_row["r"],
-             "ovr": my_ovr, "cs": my_cs, "age": my_age, "is_mine": True, "country": my_nat}]
+             "ovr": my_ovr, "cs": my_cs, "age": my_age, "is_mine": True, "country": my_nat,
+             "matches": n_games}]
 
     # [2026-09 재설계, 신민용 요청: "월드컵 등 대회 상도 이젠 수치가 있으니
     # 그거에 맞춰서 짜자"] AI 후보를 즉석 추정(_estimate_ai_season, team_avg/
@@ -7650,14 +8162,16 @@ def _award_intl_awards(t):
             continue
         rows = conn.execute(
             """SELECT ap.position AS position, ap.age AS age, ap.ovr AS ovr,
-                      s.rating AS rating, s.goals AS goals, s.assists AS assists, s.clean_sheets AS cs
+                      s.rating AS rating, s.goals AS goals, s.assists AS assists, s.clean_sheets AS cs,
+                      s.appearances AS matches
                FROM intl_squad s JOIN ai_players ap ON ap.id = s.player_id
                WHERE s.tournament_id=? AND s.country=? AND s.appearances > 0""",
             (tid, e["country"])).fetchall()
         for r in rows:
             pool.append({"position": r["position"], "goals": r["goals"] or 0, "assists": r["assists"] or 0,
                         "rating": r["rating"] or 0, "ovr": r["ovr"], "cs": r["cs"] or 0,
-                        "age": r["age"] or 25, "is_mine": False, "country": e["country"]})
+                        "age": r["age"] or 25, "is_mine": False, "country": e["country"],
+                        "matches": r["matches"] or 0})
 
     # [2026-07 신설] 국가 진출 라운드 가중치 — 골든볼(MVP)/베스트11/영플레이어에만 적용
     _stage_w = _intl_country_stage_weights(tid)
@@ -7685,7 +8199,11 @@ def _award_intl_awards(t):
     # sorted()로 순위 전체를 매겨서 2위(실버)·3위(브론즈)까지 판정한다.
     # 비용은 max()→sorted() 수준이라 거의 없다. 실제로도 월드컵은 골든볼/
     # 실버볼/브론즈볼, 골든부트/실버부트/브론즈부트를 전부 시상한다.
-    _ai_scorer_scores = sorted((x["goals"] for x in others), reverse=True)
+    # [2026-11-13 신민용 확정] 골든부트(득점왕) 동률 순위 = 골 → 도움 → 출전 경기 수가 적은 쪽 → 평점
+    # (game_engine._scorer_key(boot=True)와 같은 순서 — 기록실 명단과 내 경력이 같은 사람을 고르게).
+    def _boot_key(x):
+        return ((x.get("goals") or 0), (x.get("assists") or 0), -(x.get("matches") or 0), (x.get("rating") or 0))
+    _ai_scorer_scores = sorted((_boot_key(x) for x in others), reverse=True)
     _ai_mvp_scores = sorted((x["rating"] * _stage_w(x["country"]) for x in others), reverse=True)
 
     # [2026-09 통일] 순위 계산은 game_engine._rank_among_ai(도메스틱 베스트11
@@ -7706,7 +8224,7 @@ def _award_intl_awards(t):
     boot3_name = "브론즈부트" if is_wc else f"{t['name']} 득점 3위"
     awards = []
     if my_row["g"] > 0:
-        _scorer_rank = _my_rank(my_row["g"], _ai_scorer_scores)
+        _scorer_rank = _my_rank(_boot_key(next(x for x in pool if x.get("is_mine"))), _ai_scorer_scores)
         if _scorer_rank == 1:
             awards.append((boot_name, f"{my_row['g']}골"))
         elif _scorer_rank == 2:
@@ -8255,3 +8773,345 @@ def start_power_eval_if_needed(year):
     conn.close()
     for band in bands:
         _create_power_eval_tournament(year, band, p, my_nats)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# [2026-11 국가대표 선발 v4.1 — 평가 기간 통일, 신민용 확정]
+#   예전: AI = 가장 최근 확정 시즌(43주차 리그 추정치), 나 = 이번 시즌 진행분 리그 기록 → 같은 대회인데 기간이 달랐다
+#   (28주 예선이면 AI는 작년, 나는 올해 상반기).
+#   이제 둘 다 같은 기간·같은 범위:
+#     · 시즌 중 대회(44주 이전: 25~26주 평가전, 28~31주 예선) — 올해 상반기 60% + 작년 전체 40%
+#     · 시즌 종료 후 대회(44~52주 본선) — 올해 전체 60% + 작년 전체 40%
+#     · 범위 = 리그 + 국내컵 + 하부컵 + 대륙대회(챔스·유로파·컨퍼런스). 국가대표 경기는 경험 보너스로 따로.
+#     · 출전 수 신뢰도 r = 출전 ÷ (출전 + 10) — 기간마다 따로. 생산성 z = (0.6·r올해·z올해 + 0.4·r작년·z작년),
+#       최근폼 = (z올해 − z작년) × min(r올해, r작년). 출전이 적은 기간은 영향이 줄어 OVR 쪽으로 끌려간다.
+#   AI 상반기 기록: AI 선수는 경기별 기록이 없어서(시즌 기록은 43주차 추정치뿐) 그 해 처음 필요할 때(25주 또는 28주)
+#   후보에 한해 상반기 추정치를 만들어 intl_half_stats에 저장한다 — 그 해 안에서는 같은 값을 다시 쓴다.
+#   출전 = 소속팀이 그때까지 치른 경기 수(리그+국내컵+하부컵+대륙대회 실측) × 역할 출전률, 골·도움 = 시즌 추정과 같은
+#   식(_estimate_ai_season의 포지션·팀 강도 기준치, 꼬리 난수는 (월드 salt, 선수, 연도) 고정)을 출전 비율로 나눈 값,
+#   GK = 소속팀 실제 무실점·실점 × 출전 비율과 선방 추정.
+# ══════════════════════════════════════════════════════════════════════
+V41_W_THIS = 0.6
+V41_W_LAST = 0.4
+
+
+def _v41_phase(year=None):
+    """(연도, 'half'|'full') — 44주 이후면 시즌 종료 후 대회."""
+    from game_engine import get_state
+    from constants import INTL_OFFSEASON_WEEK_START
+    st = get_state() or {}
+    y = year if year is not None else st.get("current_year")
+    wk = int(st.get("current_week") or 0)
+    return y, ("full" if wk >= INTL_OFFSEASON_WEEK_START else "half")
+
+
+def _v41_team_so_far(conn, team_ids, year):
+    """팀별 (그 해 지금까지 치른 경기 수, 무실점 경기 수, 실점) — 리그 + 국내컵 + 하부컵 + 대륙대회 실측."""
+    out = {t: [0, 0, 0] for t in team_ids}
+    if not team_ids:
+        return out
+    tids = list(team_ids)
+    srcs = [("match_results", "year=?", (year,))]
+    for tb, tt in (("cup_matches", "cup_tournaments"), ("lower_cup_matches", "lower_cup_tournaments"),
+                   ("cl_matches", "cl_tournaments"), ("el_matches", "el_tournaments"),
+                   ("ecl_matches", "ecl_tournaments")):
+        srcs.append((tb, f"tournament_id IN (SELECT id FROM {tt} WHERE year=?)", (year,)))
+    for tb, cond, args in srcs:
+        for i in range(0, len(tids), 400):
+            ch = tids[i:i + 400]
+            ph = ",".join("?" * len(ch))
+            try:
+                rows = conn.execute(
+                    f"""SELECT home_team_id, away_team_id, home_score, away_score FROM {tb}
+                        WHERE {cond} AND home_score >= 0
+                          AND (home_team_id IN ({ph}) OR away_team_id IN ({ph}))""",
+                    (*args, *ch, *ch)).fetchall()
+            except Exception:
+                rows = []
+            for r in rows:
+                for side, opp in ((r[0], r[3]), (r[1], r[2])):
+                    if side in out:
+                        o = out[side]
+                        o[0] += 1
+                        o[1] += 1 if (opp or 0) == 0 else 0
+                        o[2] += opp or 0
+    return out
+
+
+def _v41_ai_half_stats(candidates, year):
+    """후보 AI 선수의 그 해 상반기 추정 기록 {pid: dict(team_id, matches, goals, assists, clean_sheets, saves,
+    goals_conceded)} — 저장돼 있으면 그대로, 없으면 만들어 저장(위 섹션 주석)."""
+    import zlib
+    if not candidates or not year:
+        return {}
+    conn = get_conn()
+    try:
+        conn.execute("""CREATE TABLE IF NOT EXISTS intl_half_stats(
+            player_id INTEGER, year INTEGER, team_id INTEGER, matches INTEGER, goals INTEGER, assists INTEGER,
+            clean_sheets INTEGER, saves INTEGER, goals_conceded INTEGER, PRIMARY KEY(player_id, year))""")
+        ids = [c["id"] for c in candidates]
+        have = {}
+        for i in range(0, len(ids), 500):
+            ch = ids[i:i + 500]
+            ph = ",".join("?" * len(ch))
+            for r in conn.execute(f"SELECT * FROM intl_half_stats WHERE year=? AND player_id IN ({ph})",
+                                  (year, *ch)):
+                have[r["player_id"]] = dict(r)
+        need = [c for c in candidates if c["id"] not in have]
+        if need:
+            from game_engine import (_SUB_ROLE_MATCH_MOD, _POS_TEAM_STRENGTH_COEF, _DEFAULT_TEAM_STRENGTH_COEF,
+                                     _tailed_season_mult)
+            from constants import EST_POS_GOAL, EST_POS_ASSIST, get_goal_env_mult, legs_for_team_count
+            from database import get_world_salt
+            salt = get_world_salt()
+            nid = [c["id"] for c in need]
+            info = {}
+            for i in range(0, len(nid), 500):
+                ch = nid[i:i + 500]
+                ph = ",".join("?" * len(ch))
+                for r in conn.execute(
+                        f"""SELECT ap.id, ap.team_id, t.league_id, cn.name AS lcountry FROM ai_players ap
+                            JOIN teams t ON t.id = ap.team_id JOIN leagues l ON l.id = t.league_id
+                            JOIN countries cn ON cn.id = l.country_id WHERE ap.id IN ({ph})""", ch):
+                    info[r[0]] = (r[1], r[2], r[3])
+            tids = {v[0] for v in info.values()}
+            lids = {v[1] for v in info.values()}
+            tavg, lavg, lsize = {}, {}, {}
+            for t in tids:
+                v = conn.execute("SELECT AVG(ovr) FROM ai_players WHERE team_id=?", (t,)).fetchone()[0]
+                tavg[t] = float(v or 60)
+            for l in lids:
+                v = conn.execute("""SELECT AVG(ap.ovr), COUNT(DISTINCT t.id) FROM ai_players ap
+                                    JOIN teams t ON t.id = ap.team_id WHERE t.league_id=?""", (l,)).fetchone()
+                lavg[l] = float(v[0] or 60)
+                lsize[l] = int(v[1] or 20)
+            so_far = _v41_team_so_far(conn, tids, year)
+            # 역할(가장 최근 연도) → 출전률
+            roles = {}
+            try:
+                for i in range(0, len(nid), 500):
+                    ch = nid[i:i + 500]
+                    ph = ",".join("?" * len(ch))
+                    for r in conn.execute(
+                            f"""SELECT player_id, year, role FROM hist.ai_player_position_history
+                                WHERE player_id IN ({ph}) AND year IN (?,?)""", (*ch, year, year - 1)):
+                        if r[0] not in roles or r[1] > roles[r[0]][0]:
+                            roles[r[0]] = (r[1], r[2] or "")
+            except Exception:
+                pass
+            rows = []
+            for c in need:
+                if c["id"] not in info:
+                    continue
+                t, l, lc = info[c["id"]]
+                tm, tcs, tconc = so_far.get(t, [0, 0, 0])
+                share = _intl_sel_role_play_frac((roles.get(c["id"]) or (0, ""))[1])
+                share = 0.6 if share is None else share
+                m = int(round(tm * share))
+                rr = random.Random(zlib.crc32(f"half:{salt}:{c['id']}:{year}".encode("utf-8")))
+                pos = c.get("position") or "CM"
+                full = max(1, (lsize.get(l, 20) - 1) * legs_for_team_count(lsize.get(l, 20)))
+                g = a = cs = sv = gc = 0
+                if pos == "GK":
+                    cs = int(round(tcs * share))
+                    gc = int(round(tconc * share))
+                    # 선방 = 실점 × 선방률/(1−선방률) — 선방률은 시즌 추정(_estimate_ai_gk_saves)과 같은 기준식(난수 없음,
+                    # 전역 난수를 건드리지 않는다)
+                    _sp = 0.60 + max(0, min(50, (c.get("ovr") or 60) - 50)) / 50.0 * 0.28 + (tavg[t] - lavg[l]) * 0.001
+                    _sp = max(0.45, min(0.92, _sp))
+                    sv = int(round(gc * _sp / (1.0 - _sp)))
+                elif m > 0:
+                    _m = _SUB_ROLE_MATCH_MOD.get((pos, c.get("sub_role") or ""))
+                    _gd, _ad = _POS_TEAM_STRENGTH_COEF.get(pos, _DEFAULT_TEAM_STRENGTH_COEF)
+                    d = tavg[t] - lavg[l]
+                    scale = (full / 38.0) ** 0.35
+                    gm = get_goal_env_mult(lc)
+                    gb = max(0.0, (EST_POS_GOAL.get(pos, 1) + d * _gd) * scale * gm * ((_m or {}).get("g_mult", 1.0)))
+                    ab = max(0.0, (EST_POS_ASSIST.get(pos, 1) + d * _ad) * scale * gm * ((_m or {}).get("a_mult", 1.0)))
+                    frac = m / float(full)
+                    g = int(round(gb * _tailed_season_mult(rr.random()) * frac))
+                    a = int(round(ab * _tailed_season_mult(rr.random()) * frac))
+                rows.append((c["id"], year, t, m, g, a, cs, sv, gc))
+                have[c["id"]] = {"player_id": c["id"], "year": year, "team_id": t, "matches": m, "goals": g,
+                                 "assists": a, "clean_sheets": cs, "saves": sv, "goals_conceded": gc}
+            conn.executemany("INSERT OR REPLACE INTO intl_half_stats VALUES(?,?,?,?,?,?,?,?,?)", rows)
+            conn.commit()
+        return have
+    finally:
+        conn.close()
+
+
+def _v41_full_stats(conn, ids, year):
+    """{pid: 합계 dict} — 그 해 전체(리그 hist.ai_player_season_stats + 대회별 cup·lower_cup·cl)."""
+    out = {}
+    for i in range(0, len(ids), 500):
+        ch = ids[i:i + 500]
+        ph = ",".join("?" * len(ch))
+        try:
+            for r in conn.execute(
+                    f"""SELECT player_id, team_id, matches, goals, assists, clean_sheets, saves, goals_conceded
+                        FROM hist.ai_player_season_stats WHERE year=? AND player_id IN ({ph})""", (year, *ch)):
+                out[r[0]] = {"team_id": r[1], "matches": r[2] or 0, "goals": r[3] or 0, "assists": r[4] or 0,
+                             "clean_sheets": r[5] or 0, "saves": r[6] or 0, "goals_conceded": r[7] or 0}
+            for r in conn.execute(
+                    f"""SELECT player_id, SUM(matches), SUM(goals), SUM(assists), SUM(clean_sheets), SUM(saves),
+                               SUM(goals_conceded) FROM hist.ai_player_season_stats_by_comp
+                        WHERE year=? AND player_id IN ({ph}) AND competition IN ('cup','lower_cup','cl')
+                        GROUP BY player_id""", (year, *ch)):
+                o = out.setdefault(r[0], {"team_id": None, "matches": 0, "goals": 0, "assists": 0,
+                                          "clean_sheets": 0, "saves": 0, "goals_conceded": 0})
+                o["matches"] += r[1] or 0
+                o["goals"] += r[2] or 0
+                o["assists"] += r[3] or 0
+                # GK 무실점·선방·실점도 같은 범위(리그+컵+대륙) — 출전 수와 분모를 맞춘다(내 선수 기록과 같은 범위)
+                o["clean_sheets"] += r[4] or 0
+                o["saves"] += r[5] or 0
+                o["goals_conceded"] += r[6] or 0
+        except Exception:
+            pass
+    return out
+
+
+def _v41_rel(m):
+    m = float(m or 0)
+    return m / (m + 10.0) if m > 0 else 0.0
+
+
+def _v41_prod(pos, s, league_w):
+    if not s:
+        return None
+    return _intl_sel_prod_raw(pos, s.get("matches"), s.get("goals"), s.get("assists"), s.get("clean_sheets"),
+                              s.get("saves"), s.get("goals_conceded"), league_w)
+
+
+def _v41_pos_stat(prods):
+    import statistics as _stats
+    out = {}
+    for pos, vals in prods.items():
+        if len(vals) < _INTL_SEL_PROD_MIN_POOL:
+            continue
+        mean = _stats.fmean(vals)
+        sd = _stats.pstdev(vals) if len(vals) > 1 else 0.0
+        out[pos] = (mean, max(sd, _INTL_SEL_PROD_SD_FLOOR))
+    return out
+
+
+def _v41_combine(pos, prod_t, prod_l, m_t, m_l, ps_t, ps_l):
+    """(prod_adj, form_adj) — 위 섹션 주석의 60/40 + 출전 신뢰도."""
+    z_t = z_l = None
+    if prod_t is not None and pos in ps_t:
+        z_t = (prod_t - ps_t[pos][0]) / ps_t[pos][1]
+    if prod_l is not None and pos in ps_l:
+        z_l = (prod_l - ps_l[pos][0]) / ps_l[pos][1]
+    r_t, r_l = _v41_rel(m_t), _v41_rel(m_l)
+    z = V41_W_THIS * r_t * (z_t or 0.0) + V41_W_LAST * r_l * (z_l or 0.0)
+    prod_adj = max(-_INTL_SEL_PROD_MAX, min(_INTL_SEL_PROD_MAX, z * _INTL_SEL_PROD_PER_SD))
+    form_adj = 0.0
+    if z_t is not None and z_l is not None:
+        form_adj = max(-_INTL_SEL_FORM_MAX, min(_INTL_SEL_FORM_MAX, z_t - z_l)) * min(r_t, r_l)
+    return prod_adj, form_adj
+
+
+def _v41_candidate_metrics(candidates, year):
+    """v4.1 AI 후보 지표 — _intl_candidate_metrics와 같은 키(play_frac/role/prod_adj/form_adj/big_adj) +
+    _INTL_POS_STAT_KEY에 {"t": 올해 기간 분포, "l": 작년 분포, "phase": ...}(내 선수가 같은 척도로 쓴다)."""
+    if not candidates:
+        return {}
+    y, phase = _v41_phase(year)
+    # 역할·대륙대회·작년 팀 최다출전 등은 예전 함수가 이미 잘 만든다 — 그대로 받아 쓴다(생산성·폼만 새로).
+    base = _intl_candidate_metrics(candidates, year=y)
+    try:
+        from database import history_sync_for_read
+        history_sync_for_read()
+    except Exception:
+        pass
+    ids = [c["id"] for c in candidates]
+    conn = get_conn()
+    try:
+        last = _v41_full_stats(conn, ids, y - 1)
+        this = _v41_full_stats(conn, ids, y) if phase == "full" else {}
+        tl = {}
+        tids = sorted({v.get("team_id") for v in list(last.values()) + list(this.values()) if v.get("team_id")})
+        for i in range(0, len(tids), 500):
+            ch = tids[i:i + 500]
+            ph = ",".join("?" * len(ch))
+            for r in conn.execute(f"""SELECT t.id, t.current_tier, cn.name FROM teams t JOIN leagues l ON t.league_id=l.id
+                                      JOIN countries cn ON l.country_id=cn.id WHERE t.id IN ({ph})""", ch):
+                tl[r[0]] = (r[2], r[1] or 1)
+    finally:
+        conn.close()
+    if phase == "half":
+        this = _v41_ai_half_stats(candidates, y)
+    prods_t, prods_l, per = {}, {}, {}
+    for c in candidates:
+        pid, pos = c["id"], c["position"]
+        def _lw(s):
+            lg = tl.get((s or {}).get("team_id"))
+            return (_intl_sel_league_weight(lg[0], lg[1]) if lg
+                    else _intl_sel_league_weight(c.get("club_country"), c.get("club_tier")))
+        st, sl = this.get(pid), last.get(pid)
+        pt = _v41_prod(pos, st, _lw(st)) if st else None
+        pl = _v41_prod(pos, sl, _lw(sl)) if sl else None
+        per[pid] = (pt, pl, (st or {}).get("matches", 0), (sl or {}).get("matches", 0))
+        if pt is not None:
+            prods_t.setdefault(pos, []).append(pt)
+        if pl is not None:
+            prods_l.setdefault(pos, []).append(pl)
+    ps_t, ps_l = _v41_pos_stat(prods_t), _v41_pos_stat(prods_l)
+    out = {_INTL_POS_STAT_KEY: {"t": ps_t, "l": ps_l, "phase": phase}}
+    for c in candidates:
+        pid = c["id"]
+        b = dict(base.get(pid) or {"play_frac": None, "role": "", "big_adj": 0.0})
+        pt, pl, mt, ml = per[pid]
+        b["prod_adj"], b["form_adj"] = _v41_combine(c["position"], pt, pl, mt, ml, ps_t, ps_l)
+        if phase == "half" and this.get(pid):
+            # 올해 상반기 출전률(소속팀이 치른 경기 대비) — 작년 기준보다 이 기간을 쓴다
+            _tm = this[pid]
+            _fr = _intl_sel_role_play_frac(b.get("role"))
+            b["play_frac"] = _fr if _fr is not None else b.get("play_frac")
+        out[pid] = b
+    return out
+
+
+def _v41_my_records(year):
+    """내 선수 그 해 기록(리그 + 국내컵 + 하부컵 + 대륙대회 — match_details, 국가대표·올림픽·슈퍼컵·클럽월드컵 제외)."""
+    conn = get_conn()
+    try:
+        rows = conn.execute("""SELECT league_name, is_home, home_score, away_score, rating, goals, assists, saves
+                               FROM match_details WHERE year=?""", (year,)).fetchall()
+    except Exception:
+        rows = []
+    finally:
+        conn.close()
+    tot = {"matches": 0, "goals": 0, "assists": 0, "clean_sheets": 0, "saves": 0, "goals_conceded": 0}
+    for r in rows:
+        nm = r[0] or ""
+        if any(k in nm for k in ("올림픽", "월드컵", "네이션스", "대륙컵", "예선", "평가전", "슈퍼컵", "클럽 월드컵",
+                                  "골드컵", "아시안컵", "코파", "AFCON", "유로")) and not any(
+                k in nm for k in ("챔피언스리그", "유로파", "컨퍼런스")):
+            continue
+        if not (r[4] and float(r[4]) > 0):
+            continue
+        tot["matches"] += 1
+        tot["goals"] += r[5] or 0
+        tot["assists"] += r[6] or 0
+        tot["saves"] += r[7] or 0
+        conc = (r[3] if r[1] else r[2]) or 0
+        tot["goals_conceded"] += conc
+        tot["clean_sheets"] += 1 if conc == 0 else 0
+    return tot
+
+
+def _v41_my_metrics(p, pos_stat=None, year=None):
+    """v4.1 내 선수 지표 — AI와 같은 기간·범위·결합식(_v41_combine). 출전률·역할·강한상대는 예전 그대로."""
+    base = _my_selection_metrics_v3(p, None, year)
+    y, phase = _v41_phase(year)
+    ps = pos_stat or {}
+    ps_t, ps_l = (ps.get("t") or {}), (ps.get("l") or {})
+    pos = p.get("position", "ST")
+    league_w = _intl_sel_league_weight(_my_club_country(p), p.get("current_tier", 1))
+    st, sl = _v41_my_records(y), _v41_my_records(y - 1)
+    pt = _v41_prod(pos, st, league_w) if st["matches"] else None
+    pl = _v41_prod(pos, sl, league_w) if sl["matches"] else None
+    base["prod_adj"], base["form_adj"] = _v41_combine(pos, pt, pl, st["matches"], sl["matches"], ps_t, ps_l)
+    return base

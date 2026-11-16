@@ -865,6 +865,44 @@ _TIER_ON = [False]
 _FOOT_PEN = [FOOT_MISMATCH_PENALTY]
 
 
+# [2026-11 성능 2차] _slot_value 재사용 — 전 팀 선발 배치(team_plan.optimal_lineup_slots)가 한 번 돌 때마다
+# 팀당 "슬롯 11개 × 선수 약 25명"으로 _slot_value를 부른다(전 세계 한 바퀴 약 300만 번, 1년에 다섯 바퀴 이상).
+# _slot_value의 답은 선수의 다섯 값(포지션·부포·OVR·주발·세부역할)과 슬롯 이름만으로 정해지므로, 그 여섯 값이
+# 같으면 예전에 구한 값을 그대로 쓴다. 값 자체는 아래 slot_value_by_key가 _slot_value를 그대로 불러서 구한다
+# (식을 따로 베껴 두지 않는다 — 식이 바뀌면 같이 바뀐다).
+#   · 선수 키: slot_value_key(pl) — _slot_value가 읽는 필드 전부, 읽는 방식(기본값)도 같다.
+#   · 설정이 바뀌면(스위치·감점 상수) 통째로 버린다: refresh_tier_switch()와 slot_value_memo()의 서명 검사.
+_SLOT_VALUE_MEMO: dict = {}      # (선수 키, 슬롯) → _slot_value
+_SLOT_KEY_INTERN: dict = {}      # 선수 키 → 같은 내용의 대표 튜플(배치 재사용 키의 메모리를 줄인다)
+_SLOT_VALUE_SIG = [None]
+
+
+def slot_value_key(pl):
+    """_slot_value(pl, 슬롯)가 선수 dict에서 읽는 값 전부. 이 키가 같은 두 선수는 어느 슬롯에서든 값이 같다."""
+    k = (pl.get("position") or "CM", pl.get("sub_pos"), pl.get("ovr") or 0,
+         pl.get("foot") or "", pl.get("sub_role") or "")
+    return _SLOT_KEY_INTERN.setdefault(k, k)
+
+
+def slot_value_memo():
+    """(선수 키, 슬롯) → 값 dict. 설정이 지난번과 다르면 비워서 돌려준다(True = 방금 비웠다)."""
+    import constants as _C
+    sig = (_TIER_ON[0], _FOOT_PEN[0], _C.SUB_POS_OVR_COST, POSITION_MISMATCH_PENALTY[1],
+           getattr(_C, "POSITION_TIER_PCT", None))
+    if sig != _SLOT_VALUE_SIG[0]:
+        _SLOT_VALUE_MEMO.clear()
+        _SLOT_KEY_INTERN.clear()
+        _SLOT_VALUE_SIG[0] = sig
+        return _SLOT_VALUE_MEMO, True
+    return _SLOT_VALUE_MEMO, False
+
+
+def slot_value_by_key(k, slot_pos):
+    """선수 키로 _slot_value를 그대로 계산한다(재사용 값이 없을 때만 불린다)."""
+    return _slot_value({"position": k[0], "sub_pos": k[1], "ovr": k[2], "foot": k[3], "sub_role": k[4]},
+                       slot_pos)
+
+
 def refresh_tier_switch():
     import constants as _C
     _TIER_ON[0] = bool(getattr(_C, "POSITION_TIER_PENALTY_ENABLED", False))
@@ -873,6 +911,9 @@ def refresh_tier_switch():
     _FOOT_PEN[0] = (_C.FOOT_MISMATCH_PENALTY_V2 if getattr(_C, "FOOT_PENALTY_V2_ENABLED", False)
                     else FOOT_MISMATCH_PENALTY)
     _FOOT_FIT_CACHE.clear()
+    _SLOT_VALUE_MEMO.clear()        # [2026-11 성능 2차] 스위치가 바뀌면 _slot_value 값도 달라진다
+    _SLOT_KEY_INTERN.clear()
+    _SLOT_VALUE_SIG[0] = None
 
 
 refresh_tier_switch()

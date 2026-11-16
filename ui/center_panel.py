@@ -19,6 +19,12 @@ from game_engine import (
 from constants import TRAINING_CONFIG, FOCUS_TRAIN_STATS, ALL_STATS, MATCH_STRESS
 
 
+# [2026-11-15 신설, 신민용 리포트: "슈퍼컵이 메인 화면에서 리그 색이랑 같다"] 국내(리그) 슈퍼컵은 카드 분기가
+# 없어 마지막 else(리그 초록)로 떨어졌다. 대륙 슈퍼컵(골드 #ffd700)과 구분되는 브론즈로 분리한다.
+_DSC_TXT_COLOR = "#d9955b"
+_DSC_BG_COLOR = "#33241a"
+
+
 def _match_card_color(mi):
     """[2026-08 신설, 신민용 리포트: "다음주 미리보기 박스 색이 가운데
     일정 카드 색이랑 다르게 뜬다(예: 네이션스컵 예선이 카드에선 핑크인데
@@ -45,6 +51,8 @@ def _match_card_color(mi):
             "super_cup":  "#ffd700",
         }
         return _CL_KIND_COLOR.get(mi.get("cl_kind"), "#ffd24d")
+    if mi.get("domestic_sc"):
+        return _DSC_TXT_COLOR
     if mi.get("cup"):
         return "#c48aff"
     if mi.get("lower_cup"):
@@ -1133,6 +1141,16 @@ class CenterPanel(QWidget):
                         ml.setText(_card_text("🏆", match_info['league_name'], f"{stage} ({loc})", f"vs {opp}"))
                         ml.setStyleSheet(f"color:{_txt_c};font-weight:bold;font-size:12px;"
                                          f"background:{_bg_c};border-radius:4px;padding:4px;")
+                        ml.show()
+                elif match_info.get("domestic_sc"):
+                    # [2026-11-15 신설] 국내(리그) 슈퍼컵 — 단판 결승. 브론즈(대륙 슈퍼컵 골드와 구분).
+                    opp   = f"{match_info.get('opp_flag','')}{match_info.get('opp','')}"
+                    loc   = "홈" if match_info.get("is_home") else "원정"
+                    hl.setText(f"스트레스 +{self._match_stress_preview(p, match_info.get('is_home', False))}")
+                    if ml:
+                        ml.setText(_card_text("🏵", match_info['league_name'], f"결승 ({loc})", f"vs {opp}"))
+                        ml.setStyleSheet(f"color:{_DSC_TXT_COLOR};font-weight:bold;font-size:12px;"
+                                         f"background:{_DSC_BG_COLOR};border-radius:4px;padding:4px;")
                         ml.show()
                 elif match_info.get("cup"):
                     # [2026-07 신설] 국내 컵대회(FA컵식)

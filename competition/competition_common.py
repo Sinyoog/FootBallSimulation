@@ -70,6 +70,10 @@ class CompetitionConfig:
     # [2026-10 6번 ③-1 확장] 감독 능력 경기 보정을 이 대회 AI 경기에 넣을지 —
     # 챔스·유로파·컨퍼런스만 True(대륙 슈퍼컵 등은 아직 범위 밖).
     manager_bonus: bool = False
+    # [2026-11-13 신설, 신민용 확정] 홈·원정 2경기 토너먼트 — {stage: (1차전 주, 2차전 주)} / 단판은 (주,).
+    # None이면 예전 단판 형식(대륙 슈퍼컵 등). 챔스·유로파·컨퍼런스만 채운다. 실제로 2경기로 치르는지는
+    # 대회 행의 ko_legs(새로 만드는 대회 = 2)로 판정한다 — is_two_leg() 참고.
+    ko_leg_weeks: dict = None
 
 
 # ─────────────────────────────────────────────
@@ -949,6 +953,10 @@ def match_outcome(h_ovr, a_ovr, neutral=False, h_mgr=0.0, a_mgr=0.0):
     호출부는 CompetitionConfig.neutral_stages에 그 경기의 stage가
     들어있는지로 이 플래그를 결정한다(sim_ai_match/simulate_my_match가
     자동으로 계산해서 넘긴다 — 호출자가 매번 판단할 필요 없음)."""
+    from constants import MANAGER_MATCH_REL
+    if MANAGER_MATCH_REL and (h_mgr or a_mgr):
+        # [2026-11 상대 비교형] 감독 가산은 팀 전력 단위 — 곡선 앞에서 더한다.
+        h_ovr, a_ovr, h_mgr, a_mgr = h_ovr + h_mgr, a_ovr + a_mgr, 0.0, 0.0
     h_eff = _tournament_effective_ovr(h_ovr)
     a_eff = _tournament_effective_ovr(a_ovr)
     # [2026-10 6번 ③-1 확장] 감독 능력 보정은 대회 곡선 **뒤에** 더한다(리그·국내컵과
@@ -996,7 +1004,14 @@ def match_outcome(h_ovr, a_ovr, neutral=False, h_mgr=0.0, a_mgr=0.0):
 # 값 = 명문 보너스(PRESTIGE_LEVEL_MATCH_BONUS) 반영 비율. 이 표에 없는 대회(대륙 슈퍼컵 등)와
 # CONT_AI_LEAGUE_FORMULA=False면 예전 공식 그대로.
 CONT_AI_LEAGUE_FORMULA = True
-CONT_AI_PRESTIGE_WEIGHT = {"cl_matches": 0.5, "el_matches": 0.0, "ecl_matches": 0.0}
+CONT_AI_PRESTIGE_WEIGHT = {"cl_matches": 0.5, "el_matches": 0.0, "ecl_matches": 0.0,
+                           # [2026-11 신민용 확정] 클럽월드컵도 같은 공식(선발 11명 + 리그 공식 D), 명문 없음 —
+                           # 대륙이 섞여 있어 명문 등급을 넣으면 비명문 유럽 팀 vs 비유럽 명문에서 약한 쪽이
+                           # 가산을 받는다. 예전: 스쿼드 전체 평균 ±2 무작위 + 1점당 2.2%p 직선(약팀 90분 승 ~14%).
+                           # club_world_cup_engine._sim_one이 읽는다(sim_ai_match 경로가 아님).
+                           "cwc_matches": 0.0,
+                           # [2026-11 신민용 확정] 대륙 슈퍼컵도 클럽월드컵과 같은 기준(명문 없음). sim_ai_match 경로.
+                           "sc_matches": 0.0}
 
 # [2026-10-30 신설, 신민용 확정 — 대항전 득점환경(리그 나라별 득점왕 기준과 같은 원리)] 클럽 대항전
 # 득점왕 기준: 6~8골 일반적 / 9~11골 현실적 / 12~14골 매우 뛰어남 / 15~17골 역사적 / 18골+ 극히 이례적.
@@ -1061,10 +1076,30 @@ def cont_ai_strength(team_id, prestige_w=0.0, conn=None):
     return val
 
 
+def cont_strength_rule(cfg):
+    """[2026-11 전력 기준 통일, 신민용 확정] 내 팀 대륙 대항전 경기(체인 엔진)의 팀 전력 가산 규칙 —
+    같은 대회 AI 경기(위 cont_ai_strength)와 같은 명문 반영 비율. 표에 없는 대회(대륙 슈퍼컵 등)나
+    CONT_AI_LEAGUE_FORMULA=False면 None(가산 없음 — AI 경기도 참가팀 ovr만 쓴다)."""
+    _pw = CONT_AI_PRESTIGE_WEIGHT.get(cfg.match_table) if CONT_AI_LEAGUE_FORMULA else None
+    # 3번째 값 = 감독 보정 사용 여부 — 그 대회 AI 경기(sim_ai_match)와 같게 cfg.manager_bonus.
+    return None if _pw is None else ("cont", _pw, bool(getattr(cfg, "manager_bonus", False)))
+
+
+def cwc_strength_rule():
+    """[2026-11] 클럽월드컵 체인 경기(내 경기·참가 대회 AI 경기)의 전력 가산 규칙 — AI 경기
+    (club_world_cup_engine._sim_one)와 같은 명문 비율(CONT_AI_PRESTIGE_WEIGHT["cwc_matches"] = 0), 감독 보정 없음."""
+    _pw = CONT_AI_PRESTIGE_WEIGHT.get("cwc_matches") if CONT_AI_LEAGUE_FORMULA else None
+    return None if _pw is None else ("cont", _pw, False)
+
+
 def cont_ai_outcome(h_str, a_str, neutral=False, h_mgr=0.0, a_mgr=0.0):
     """리그 공식 D(game_engine._league_win_probs) — 곡선(_league_effective_ovr)은 전력에, 홈 이점
     (리그와 같은 1.5~4.5, 결승 등 중립 경기는 0)과 감독 보정은 곡선 밖에서 더한다."""
     from game_engine import _league_effective_ovr, _league_win_probs, _home_advantage
+    from constants import MANAGER_MATCH_REL
+    if MANAGER_MATCH_REL and (h_mgr or a_mgr):
+        # [2026-11 상대 비교형] 감독 가산은 팀 전력 단위 — 곡선 앞에서 더한다.
+        h_str, a_str, h_mgr, a_mgr = h_str + h_mgr, a_str + a_mgr, 0.0, 0.0
     diff = (_league_effective_ovr(h_str) - _league_effective_ovr(a_str)
             + (0.0 if neutral else _home_advantage()) + (h_mgr - a_mgr))
     # [2026-11] 상위 레벨은 공통 상위 표(game_engine._ai_top_probs) — 리그와 같은 diff 그대로.
@@ -1109,6 +1144,166 @@ def winner_of(m):
     if m["pso_winner"]:
         return m["pso_winner"]
     return m["home_team_id"] if m["home_score"] > m["away_score"] else m["away_team_id"]
+
+
+# ─────────────────────────────────────────────
+# [2026-11-13 신설, 신민용 확정] 홈·원정 2경기 토너먼트(챔스·유로파·컨퍼런스)
+#   · 녹아웃 PO~4강은 1·2차전, 결승만 중립 단판, 3·4위전 없음.
+#   · 1차전에서는 진출팀을 정하지 않는다(5:0이어도 미정). 2차전이 끝나야 합산으로 정한다.
+#   · 합산 동점 → 2차전 연장 → 그래도 동점이면 2차전 승부차기. 원정 다득점 없음.
+#   · 경기 행은 경기마다 따로(개별 스코어·개인 기록), 합산·진출팀은 2차전 행의 별도 칸
+#     (agg_home_score/agg_away_score/winner_team_id) — 개인 출전·득점 기록이 겹치지 않는다.
+#   · leg=0인 행은 예전 단판 기록(또는 리그 스테이지·결승) — 읽는 쪽은 그대로 한 경기로 다룬다.
+# ─────────────────────────────────────────────
+LEG_KO = {1: "1차전", 2: "2차전"}
+
+
+def leg_of(m) -> int:
+    """경기 행의 leg(0/1/2). 컬럼이 없는 표(슈퍼컵 등)·옛 행은 0."""
+    try:
+        return int(m["leg"] or 0)
+    except (KeyError, IndexError, TypeError, ValueError):
+        return 0
+
+
+def stage_label(stage_text, leg) -> str:
+    """"16강" + leg → "16강 1차전" / "16강 2차전" (단판이면 그대로)."""
+    leg = int(leg or 0)
+    return f"{stage_text} {LEG_KO[leg]}" if leg in LEG_KO else stage_text
+
+
+def is_two_leg(cfg, t) -> bool:
+    """이 대회(t)가 홈·원정 2경기 형식인가 — cfg에 ko_leg_weeks가 있고 대회 행 ko_legs가 2일 때만.
+    예전 단판 형식으로 만들어진 대회(ko_legs=1)는 끝까지 예전 규칙으로 읽힌다."""
+    if not getattr(cfg, "ko_leg_weeks", None) or not t:
+        return False
+    try:
+        return int(t["ko_legs"] or 1) == 2
+    except (KeyError, IndexError, TypeError, ValueError):
+        return False
+
+
+def insert_tie(c, cfg, tid, stage, slot, top, bottom, my_tid, weeks):
+    """대진 하나를 경기 행으로 만든다. weeks가 (1차전 주, 2차전 주)면 1차전은 하위 시드(bottom) 홈,
+    2차전은 상위 시드(top) 홈. 한 주(결승)면 단판 한 줄(leg=0, 홈=top)."""
+    if len(weeks) == 2:
+        legs = ((1, weeks[0], bottom, top), (2, weeks[1], top, bottom))
+    else:
+        legs = ((0, weeks[0], top, bottom),)
+    for leg, wk, h, a in legs:
+        is_my = 1 if my_tid in (h, a) else 0
+        c.execute(f"""INSERT INTO {cfg.match_table}
+                     (tournament_id, stage, week, home_team_id, away_team_id,
+                      home_score, away_score, is_my, slot, my_team_id, leg)
+                     VALUES(?,?,?,?,?,-1,-1,?,?,?,?)""",
+                  (tid, stage, wk, h, a, is_my, slot, my_tid if is_my else 0, leg))
+
+
+def leg1_row(conn, cfg, m):
+    """2차전 행 m의 짝인 1차전 행(dict) — 없으면 None."""
+    r = conn.execute(
+        f"""SELECT * FROM {cfg.match_table} WHERE tournament_id=? AND stage=? AND slot=? AND leg=1
+            ORDER BY id LIMIT 1""", (m["tournament_id"], m["stage"], m["slot"])).fetchone()
+    return dict(r) if r else None
+
+
+def agg_before(conn, cfg, m):
+    """2차전 경기 m의 홈/원정팀 기준 1차전 스코어(= 2차전 전까지의 합산) — (agg_home, agg_away).
+    2차전이 아니거나 1차전 기록이 없으면 (0, 0). 2차전 홈팀 = 1차전 원정팀."""
+    if leg_of(m) != 2:
+        return 0, 0
+    l1 = leg1_row(conn, cfg, m)
+    if not l1 or l1["home_score"] is None or l1["home_score"] < 0:
+        return 0, 0
+    if l1["away_team_id"] == m["home_team_id"]:
+        return int(l1["away_score"]), int(l1["home_score"])
+    return int(l1["home_score"]), int(l1["away_score"])
+
+
+def needs_decider(leg, hs, as_, agg=(0, 0)) -> bool:
+    """이 경기 뒤에 연장·승부차기로 승자를 가려야 하는가(토너먼트 경기 기준).
+    1차전은 늘 False(무승부로 끝난다), 2차전은 합산 동점일 때, 단판은 그 경기 동점일 때."""
+    leg = int(leg or 0)
+    if leg == 1:
+        return False
+    if leg == 2:
+        return (agg[0] + hs) == (agg[1] + as_)
+    return hs == as_
+
+
+def group_ties(rows):
+    """토너먼트 경기 행들을 (stage, slot)별 대진으로 묶는다 — {(stage, slot): [행...]}(leg 순)."""
+    out = collections.OrderedDict()
+    for m in rows:
+        out.setdefault((m["stage"], m["slot"]), []).append(dict(m))
+    for k in out:
+        out[k].sort(key=lambda r: (leg_of(r), r.get("id") or 0))
+    return out
+
+
+def tie_result(rows):
+    """대진 하나(1·2차전 또는 단판)의 결과. 반환 dict:
+      team_a/team_b : 2차전 홈팀(=상위 시드)/원정팀 (단판이면 그 경기 홈/원정)
+      agg_a/agg_b   : 합산 득점 (단판이면 그 경기 스코어)
+      winner/loser  : 진출팀/탈락팀 — 아직 다 안 끝났으면 None
+      legs          : 경기 행 목록(leg 순)
+    1차전만 끝난 상태에서는 winner가 None이다(1차전으로 승자를 확정하지 않는다)."""
+    rows = sorted((dict(r) for r in rows), key=lambda r: (leg_of(r), r.get("id") or 0))
+    l1 = next((r for r in rows if leg_of(r) == 1), None)
+    l2 = next((r for r in rows if leg_of(r) == 2), None)
+    if l2 is None or l1 is None:
+        m = rows[-1]
+        a, b = m["home_team_id"], m["away_team_id"]
+        done = m["home_score"] is not None and m["home_score"] >= 0
+        w = winner_of(m) if done else None
+        return {"team_a": a, "team_b": b, "agg_a": m["home_score"], "agg_b": m["away_score"],
+                "winner": w, "loser": (None if w is None else (b if w == a else a)), "legs": rows}
+    a, b = l2["home_team_id"], l2["away_team_id"]
+    done1 = l1["home_score"] is not None and l1["home_score"] >= 0
+    done2 = l2["home_score"] is not None and l2["home_score"] >= 0
+    ga = (l2["home_score"] if done2 else 0) + ((l1["away_score"] if l1["away_team_id"] == a else l1["home_score"]) if done1 else 0)
+    gb = (l2["away_score"] if done2 else 0) + ((l1["home_score"] if l1["away_team_id"] == a else l1["away_score"]) if done1 else 0)
+    w = None
+    if done1 and done2:
+        if ga != gb:
+            w = a if ga > gb else b
+        else:
+            w = l2.get("pso_winner") or l2.get("winner_team_id") or None
+    return {"team_a": a, "team_b": b, "agg_a": ga, "agg_b": gb,
+            "winner": w, "loser": (None if w is None else (b if w == a else a)), "legs": rows}
+
+
+def finalize_ties(cfg, t, conn=None):
+    """두 경기가 다 끝난 대진의 2차전 행에 합산 스코어·진출팀을, 끝난 결승(단판) 행에 우승팀을 적는다.
+    1차전 행은 건드리지 않는다(진출팀 미정 = 0). 2경기 형식 대회만 — 예전 기록 행은 그대로 둔다. 멱등."""
+    if not is_two_leg(cfg, t):
+        return 0
+    own = conn is None
+    if own:
+        conn = get_conn()
+    rows = [dict(r) for r in conn.execute(
+        f"""SELECT * FROM {cfg.match_table} WHERE tournament_id=? AND stage!='league'
+            AND home_score>=0 AND COALESCE(winner_team_id,0)=0 AND leg IN (0,2)""",
+        (t["id"],)).fetchall()]
+    n = 0
+    for m in rows:
+        if leg_of(m) == 2:
+            ah, aa = agg_before(conn, cfg, m)
+            th, ta = ah + m["home_score"], aa + m["away_score"]
+            if th != ta:
+                w = m["home_team_id"] if th > ta else m["away_team_id"]
+            else:
+                w = m["pso_winner"] or 0
+            conn.execute(f"""UPDATE {cfg.match_table} SET agg_home_score=?, agg_away_score=?,
+                             winner_team_id=? WHERE id=?""", (th, ta, w, m["id"]))
+        else:
+            conn.execute(f"UPDATE {cfg.match_table} SET winner_team_id=? WHERE id=?",
+                         (winner_of(m), m["id"]))
+        n += 1
+    if own:
+        conn.commit()
+        conn.close()
+    return n
 
 
 def first_stage_for(n):
@@ -1245,6 +1440,9 @@ def build_tournament(cfg, year, continent, entries, my_tid, team_cap, games):
                              VALUES(?,?,?,?,?,-1,-1,?,0,?)""", match_rows)
     c.execute(f"UPDATE {cfg.tournament_table} SET status='league', first_stage='league' WHERE id=?",
               (tid,))
+    if getattr(cfg, "ko_leg_weeks", None):
+        # [2026-11-13] 새로 만드는 대회는 홈·원정 2경기 형식. 예전 대회 행(ko_legs=1)은 그대로 단판으로 읽힌다.
+        c.execute(f"UPDATE {cfg.tournament_table} SET ko_legs=2 WHERE id=?", (tid,))
     conn.commit()
     conn.close()
     return tid
@@ -1272,6 +1470,16 @@ def sim_ai_match(cfg, t, m, my_played=False, conn=None, reason="injury", batch=N
         _hm, _am = _mgr_match_bonus_pair(None, m["home_team_id"], m["away_team_id"])
     pso_winner, pso_score = 0, ""
     is_ko = (m["stage"] != "league")
+    # [2026-11-13] 홈·원정 2경기: 1차전은 연장·승부차기 없이 끝나고, 2차전은 "합산" 동점일 때만 연장→승부차기.
+    _leg = leg_of(m)
+    _agg = (0, 0)
+    if _leg == 2:
+        _own_c = conn is None
+        _cc = get_conn() if _own_c else conn
+        _agg = agg_before(_cc, cfg, m)
+        if _own_c:
+            _cc.close()
+    _et = is_ko and _leg != 1
     _g2 = None
     if forced is None:
         # [G2] 사용자 감독 팀·구단주 구단 경기 → 체인 엔진(controlled_matches). 대상이 아니면 None.
@@ -1282,27 +1490,38 @@ def sim_ai_match(cfg, t, m, my_played=False, conn=None, reason="injury", batch=N
             from game_engine import _home_advantage
             _g2 = _cm.sim_target_match(
                 m["home_team_id"], m["away_team_id"],
-                home_adv=(0.0 if _g2_neutral else _home_advantage()), extra_time=is_ko,
-                comp_name=f"{t['name']} {cfg.stage_ko.get(m['stage'], '')}".strip(),
+                home_adv=(0.0 if _g2_neutral else _home_advantage()), extra_time=_et,
+                agg_home=_agg[0], agg_away=_agg[1],
+                comp_name=stage_label(f"{t['name']} {cfg.stage_ko.get(m['stage'], '')}".strip(), _leg),
                 kind={"유로파리그": "europa", "컨퍼런스리그": "conference", "슈퍼컵": "supercup"}.get(
                     cfg.award_prefix, "cl"),
-                week=m.get("week"), day=m.get("day"), targets=_g2_t)
+                week=m.get("week"), day=m.get("day"), targets=_g2_t,
+                strength_rule=cont_strength_rule(cfg))   # [2026-11] 대회별 전력 가산(D)
         if _cm.covered(cfg.entry_table, cfg.match_table, t["id"]):
             # [2026-10 A안] 내가 참가하는 대회의 AI 경기 — 엔진으로 돌려 실측 기록(controlled_matches.sim_cover_match)
             from game_engine import _home_advantage as _ha_cov
             _g2 = _cm.sim_cover_match(
                 m["home_team_id"], m["away_team_id"],
-                home_adv=(0.0 if _g2_neutral else _ha_cov()), extra_time=is_ko,
+                home_adv=(0.0 if _g2_neutral else _ha_cov()), extra_time=_et,
+                agg_home=_agg[0], agg_away=_agg[1],
                 comp={"sc_tournaments": "sc", "domestic_sc_tournaments": "dsc"}.get(cfg.tournament_table, "cl"),
-                tkey=f"{cfg.tournament_table}:{t['id']}", targets=_g2_t, prior=_g2)
+                tkey=f"{cfg.tournament_table}:{t['id']}", targets=_g2_t, prior=_g2,
+                strength_rule=cont_strength_rule(cfg))   # [2026-11] 대회별 전력 가산(D)
         if _g2 is not None:
             forced = (_g2["hs"], _g2["as"])
     if forced is not None:
         # [G1] 내 팀 경기(내가 결장) — 체인 엔진이 낸 스코어(연장 포함)를 그대로 쓴다.
         # 연장 후에도 비기면 승부차기는 예전과 같은 resolve_pso.
         hs, as_ = forced
-        if hs == as_ and is_ko:
-            win_home, pso_score = resolve_pso(he["ovr"], ae["ovr"], neutral=(m["stage"] in cfg.neutral_stages))
+        if is_ko and needs_decider(_leg, hs, as_, _agg):
+            # [2026-11] 승부차기도 경기 전력(아래 AI 경로와 같은 cont_ai_strength) — 참가 명단 ovr는 대진 시드 값.
+            _pw_f = CONT_AI_PRESTIGE_WEIGHT.get(cfg.match_table) if CONT_AI_LEAGUE_FORMULA else None
+            if _pw_f is not None:
+                _ph, _pa = (cont_ai_strength(m["home_team_id"], _pw_f, conn),
+                            cont_ai_strength(m["away_team_id"], _pw_f, conn))
+            else:
+                _ph, _pa = he["ovr"], ae["ovr"]
+            win_home, pso_score = resolve_pso(_ph, _pa, neutral=(m["stage"] in cfg.neutral_stages))
             pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
             if _g2 is not None:
                 _cm.note_pso(_g2, win_home, pso_score)
@@ -1317,12 +1536,16 @@ def sim_ai_match(cfg, t, m, my_played=False, conn=None, reason="injury", batch=N
         else:
             h_str, a_str = he["ovr"], ae["ovr"]
             outcome = match_outcome(h_str, a_str, neutral=_neutral, h_mgr=_hm, a_mgr=_am)
-        if outcome == "draw" and is_ko:
+        if outcome == "draw" and is_ko and _leg == 0:
             win_home, pso_score = resolve_pso(h_str, a_str, neutral=_neutral)
             pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
         _gm = cont_comp_goal_mult(t, cfg.match_table)   # [2026-10-30] 대항전 득점환경(정의부 주석)
         hs, as_ = (_gen_score(outcome, h_str - a_str, goal_mult=_gm, top=(h_str, a_str)) if _gm != 1.0
                    else _gen_score(outcome, h_str - a_str, top=(h_str, a_str)))
+        if _leg == 2 and needs_decider(2, hs, as_, _agg):
+            # [2026-11-13] 2차전 합산 동점 → 승부차기(AI 확률표 경로는 예전 단판처럼 연장 구간 없이 바로)
+            win_home, pso_score = resolve_pso(h_str, a_str, neutral=_neutral)
+            pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
 
     # [2026-10 버그수정] 경기마다 날짜가 미리 정해진 대회(슈퍼컵 sc_matches.day)는 그 날을 그대로 둔다 —
     # 예전엔 내 경기를 "그 주 대회 요일"(_week_intl_cl_day)로 덮어써서, 준결승이 끝나면 준결승 날짜가
@@ -1348,8 +1571,10 @@ def sim_ai_match(cfg, t, m, my_played=False, conn=None, reason="injury", batch=N
     if m["is_my"]:
         my_tid = p.get("current_team_id", 0) if p else 0
         if my_tid in (m["home_team_id"], m["away_team_id"]):
-            stage_ko = cfg.stage_ko.get(m["stage"], "")
+            stage_ko = stage_label(cfg.stage_ko.get(m["stage"], ""), _leg)
             pso_txt = f"  (승부차기 {pso_score})" if pso_winner else ""
+            if _leg == 2:   # [2026-11-13] 2차전은 합산 스코어도 같이
+                pso_txt = f"  (합계 {_agg[0] + hs}-{_agg[1] + as_})" + pso_txt
             add_log(f"🏆 {t['name']} {stage_ko}  "
                     f"{he['flag']}{he['team_name']} {hs}-{as_} {ae['flag']}{ae['team_name']}{pso_txt}",
                     "match")
@@ -1418,7 +1643,12 @@ def finalize_league_phase(cfg, t, direct_cut, po_pool, playoff_week, start_knock
     po_pairs = list(zip(seeded, reversed(unseeded)))
 
     if po_pairs:
+        _two = is_two_leg(cfg, t)
         for slot, (home, away) in enumerate(po_pairs):
+            if _two:   # [2026-11-13] 홈·원정 2경기(1차전 하위 시드 홈)
+                insert_tie(c, cfg, tid, "PO", slot, home["team_id"], away["team_id"], my_tid,
+                           cfg.ko_leg_weeks["PO"])
+                continue
             is_my = 1 if my_tid in (home["team_id"], away["team_id"]) else 0
             c.execute(f"""INSERT INTO {cfg.match_table}
                          (tournament_id, stage, week, home_team_id, away_team_id,
@@ -1464,10 +1694,18 @@ def finalize_playoff(cfg, t, start_knockout_fn):
     my_tid = p.get("current_team_id", 0) if p else 0
 
     winners, losers = [], []
+    if is_two_leg(cfg, t):
+        # [2026-11-13] 1·2차전 합산으로 진출팀(2차전이 끝나야 확정)
+        finalize_ties(cfg, t)
+        _results = [(res["winner"], res["loser"])
+                    for res in (tie_result(rows) for rows in group_ties(po_matches).values())]
+    else:
+        _results = []
+        for m in po_matches:
+            w = winner_of(m)
+            _results.append((w, m["away_team_id"] if w == m["home_team_id"] else m["home_team_id"]))
     conn = get_conn(); c = conn.cursor()
-    for m in po_matches:
-        w = winner_of(m)
-        l = m["away_team_id"] if w == m["home_team_id"] else m["home_team_id"]
+    for w, l in _results:
         winners.append(w)
         losers.append(l)
         c.execute(f"UPDATE {cfg.entry_table} SET alive=0 WHERE tournament_id=? AND team_id=?", (tid, l))
@@ -1477,7 +1715,7 @@ def finalize_playoff(cfg, t, start_knockout_fn):
             conn = get_conn(); c = conn.cursor()
     conn.commit(); conn.close()
 
-    po_team_ids = {m["home_team_id"] for m in po_matches} | {m["away_team_id"] for m in po_matches}
+    po_team_ids = {m["home_team_id"] for m in po_matches} | {m["away_team_id"] for m in po_matches}   # 2경기여도 같은 두 팀
     direct_only = [tid_ for tid_ in direct_ids if tid_ not in po_team_ids]
     qualifiers = direct_only + winners
 
@@ -1512,7 +1750,11 @@ def start_knockout(cfg, t, qualifier_ids, round_weeks, direct_ids=None, winner_i
     my_tid = p.get("current_team_id", 0) if p else 0
 
     conn = get_conn(); c = conn.cursor()
+    _two = is_two_leg(cfg, t)
     for slot, (home, away) in enumerate(pairs):
+        if _two:   # [2026-11-13] 홈·원정 2경기(1차전 하위 시드 홈, 2차전 상위 시드 홈)
+            insert_tie(c, cfg, tid, first_stage, slot, home, away, my_tid, cfg.ko_leg_weeks[first_stage])
+            continue
         is_my = 1 if my_tid in (home, away) else 0
         c.execute(f"""INSERT INTO {cfg.match_table}
                      (tournament_id, stage, week, home_team_id, away_team_id,
@@ -1543,17 +1785,27 @@ def advance_round(cfg, t, cur_stage, next_stage, round_weeks):
     cur_stage_ko = cfg.stage_ko.get(cur_stage, "")
     next_week = round_weeks[next_stage]
 
-    is_sf = (cur_stage == "SF")
+    _two = is_two_leg(cfg, t)
+    # [2026-11-13] 2경기 형식은 3·4위전이 없다 — 4강 패자도 여기서 바로 탈락("4강") 처리.
+    is_sf = (cur_stage == "SF") and not _two
+
+    if _two:
+        finalize_ties(cfg, t)
+        _results = [(slot, res["winner"], res["loser"])
+                    for (_stg, slot), res in ((k, tie_result(v)) for k, v in group_ties(cur).items())]
+    else:
+        _results = []
+        for m in cur:
+            w = winner_of(m)
+            _results.append((m["slot"], w, m["away_team_id"] if w == m["home_team_id"] else m["home_team_id"]))
 
     winners = []
     losers  = []
     conn = get_conn()
     c = conn.cursor()
     exit_label = cur_stage_ko
-    for m in cur:
-        w = winner_of(m)
-        loser = m["away_team_id"] if w == m["home_team_id"] else m["home_team_id"]
-        winners.append((m["slot"], w))
+    for _slot, w, loser in _results:
+        winners.append((_slot, w))
         if not is_sf:
             c.execute(f"UPDATE {cfg.entry_table} SET alive=0 WHERE tournament_id=? AND team_id=?",
                       (tid, loser))
@@ -1569,6 +1821,9 @@ def advance_round(cfg, t, cur_stage, next_stage, round_weeks):
         if slot + 1 >= len(winners):
             break
         home, away = winners[slot][1], winners[slot + 1][1]
+        if _two:   # [2026-11-13] 다음 라운드도 홈·원정 2경기(결승만 단판) — 대진 위쪽 팀이 2차전 홈
+            insert_tie(c, cfg, tid, next_stage, slot // 2, home, away, my_tid, cfg.ko_leg_weeks[next_stage])
+            continue
         is_my = 1 if my_tid in (home, away) else 0
         c.execute(f"""INSERT INTO {cfg.match_table}
                      (tournament_id, stage, week, home_team_id, away_team_id,
@@ -1756,14 +2011,20 @@ def process_one(cfg, t, week, league_end_week, playoff_week, round_weeks, stage_
            WHERE tournament_id=? AND week<=? AND home_score=-1 ORDER BY id""",
         (t["id"], week)).fetchall()]
 
-    _batch = []
-    for m in pending:
-        sim_ai_match(cfg, t, m, batch=_batch, p=p)
-    if _batch:
-        conn.executemany(
-            f"""UPDATE {cfg.match_table} SET home_score=?, away_score=?,
-               pso_winner=?, pso_score=?, day=?, my_absence_reason=? WHERE id=?""",
-            _batch)
+    # [2026-11-13] 2차전은 1차전 결과(합산)가 있어야 치를 수 있으므로, 같은 호출에 둘 다 남아 있으면
+    # 1차전·단판 경기를 먼저 저장한 뒤 2차전을 돌린다(2경기 형식이 아니면 2차전이 없어 예전과 같다).
+    _phases = ([m for m in pending if leg_of(m) != 2], [m for m in pending if leg_of(m) == 2])
+    for _ph in _phases:
+        _batch = []
+        for m in _ph:
+            sim_ai_match(cfg, t, m, batch=_batch, p=p)
+        if _batch:
+            conn.executemany(
+                f"""UPDATE {cfg.match_table} SET home_score=?, away_score=?,
+                   pso_winner=?, pso_score=?, day=?, my_absence_reason=? WHERE id=?""",
+                _batch)
+        conn.commit()
+    finalize_ties(cfg, t, conn)   # 2차전·결승 행에 합산·진출팀 기록(2경기 형식만)
     conn.commit()
     conn.close()
 
@@ -1788,7 +2049,10 @@ def process_one(cfg, t, week, league_end_week, playoff_week, round_weeks, stage_
         conn.close()
         if total > 0 and remain == 0:
             finalize_playoff_fn(t)
-        return
+            return
+        if total > 0:
+            return
+        # [2026-11-13] PO가 없는 대회면 같은 주가 32강 마감 주일 수 있다(2경기 형식: 둘 다 16·17주) — 아래로.
 
     cur_stage = None
     for stg, wk in round_weeks.items():
@@ -1916,7 +2180,9 @@ def get_my_match(cfg, week, day=None, p=None, st=None):
         "tournament_id": t["id"],
         "league_name": t["name"],
         "stage": m["stage"],
-        "stage_ko": cfg.stage_ko.get(m["stage"], m["stage"]),
+        # [2026-11-13] 홈·원정 2경기면 "16강 1차전"/"16강 2차전" — 메인 일정·다음 일정·경기 화면이 이 값을 쓴다.
+        "stage_ko": stage_label(cfg.stage_ko.get(m["stage"], m["stage"]), leg_of(m)),
+        "leg": leg_of(m),
         "grp": m["grp"] if "grp" in m.keys() else "",
         "opp": oe["team_name"] if oe else "?",
         "opp_flag": oe["flag"] if oe else "",
@@ -1948,9 +2214,17 @@ def sim_my_match_as_ai(cfg, week, p, get_my_match_fn, reason="injury", day=None)
         return
     # [G1] 내 팀 경기는 내가 결장해도 체인 엔진(나 없이)으로 결과를 낸다.
     from game_engine import _chain_team_score, _home_advantage
+    _leg = leg_of(m)
+    _agg = (0, 0)
+    if _leg == 2:   # [2026-11-13] 2차전은 합산 동점일 때만 연장
+        _ca = get_conn()
+        _agg = agg_before(_ca, cfg, m)
+        _ca.close()
     _cs = _chain_team_score(m["home_team_id"], m["away_team_id"],
                             0.0 if m["stage"] in cfg.neutral_stages else _home_advantage(),
-                            extra_time=(m["stage"] != "league"))
+                            extra_time=(m["stage"] != "league" and _leg != 1),
+                            agg_home=_agg[0], agg_away=_agg[1],
+                            strength_rule=cont_strength_rule(cfg))
     _forced = (_cs["home_score"], _cs["away_score"]) if _cs is not None else None
     sim_ai_match(cfg, t, m, my_played=False, reason=reason, forced=_forced)
     from game_engine import update_player, _calc_manager_rel
@@ -1958,8 +2232,11 @@ def sim_my_match_as_ai(cfg, week, p, get_my_match_fn, reason="injury", day=None)
     # [2026-10 신민용 요청] 내가 결장한 이 경기도 경기 상세를 볼 수 있게 — 체인 엔진 기록(나 없음)을 관전 기록으로 저장.
     import controlled_matches as _cm_abs
     _kind = {"유로파리그": "europa", "컨퍼런스리그": "conference", "슈퍼컵": "supercup"}.get(cfg.award_prefix, "cup")
+    finalize_ties(cfg, t)   # [2026-11-13] 2차전이면 합산·진출팀 기록
     _cm_abs.save_absent_match(_cs, m["home_team_id"], m["away_team_id"], info.get("is_home"),
-                              t.get("name") or cfg.award_prefix, _kind, week=week, day=m.get("day") or day,
+                              (stage_label(f"{t.get('name') or cfg.award_prefix} {cfg.stage_ko.get(m['stage'], '')}", _leg)
+                               if _leg else (t.get("name") or cfg.award_prefix)), _kind,
+                              week=week, day=m.get("day") or day,
                               reason=reason,
                               real_ctx={"comp": {"sc_tournaments": "sc", "domestic_sc_tournaments": "dsc"}.get(cfg.tournament_table, "cl"),
                                         "tkey": f"{cfg.tournament_table}:{m['tournament_id']}"})
@@ -1993,6 +2270,13 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
     he = entry(cfg, t["id"], m["home_team_id"])
     ae = entry(cfg, t["id"], m["away_team_id"])
     is_home = info["is_home"]
+    # [2026-11-13] 홈·원정 2경기 — 1차전은 연장 없음, 2차전은 1차전 스코어(합산)를 엔진에 넘긴다.
+    _leg = leg_of(m)
+    _agg = (0, 0)
+    if _leg == 2:
+        _ca = get_conn()
+        _agg = agg_before(_ca, cfg, m)
+        _ca.close()
 
     _susp_field = cfg.suspension_field
     if _susp_field == "cl_suspension":
@@ -2070,8 +2354,10 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
         sim = _sim_tactical(
             m["home_team_id"], m["away_team_id"], home_formation, away_formation,
             home_adv=(0.0 if _neutral_stage else _home_advantage()),
-            extra_time=(m["stage"] != "league"),
-            me=_chain_me_spec(p, is_home, _my_status))
+            extra_time=(m["stage"] != "league" and _leg != 1),
+            agg_home=_agg[0], agg_away=_agg[1],
+            me=_chain_me_spec(p, is_home, _my_status),
+            strength_rule=cont_strength_rule(cfg))   # [2026-11 전력 기준 통일]
         _chain = sim
         hs, as_ = sim["home_score"], sim["away_score"]
         hs90, as90 = sim.get("home_score_90", hs), sim.get("away_score_90", as_)
@@ -2092,7 +2378,7 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
 
     pso_winner, pso_score = 0, ""
     is_ko = (m["stage"] != "league")
-    if outcome == "draw" and is_ko:
+    if is_ko and needs_decider(_leg, hs, as_, _agg):   # [2026-11-13] 2차전은 합산 동점일 때
         win_home, pso_score = resolve_pso(h_ovr, a_ovr, neutral=_neutral_stage)
         pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
 
@@ -2190,6 +2476,7 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
                   my_conceded, day_val, _absence_reason, _yellow_cnt, _my_started_pre, m["id"]))
     conn.commit()
     conn.close()
+    finalize_ties(cfg, t)   # [2026-11-13] 2차전이면 합산·진출팀 기록(2경기 형식 대회만)
 
     update_player(
         total_shots=p.get("total_shots", 0) + detail["shots"],
@@ -2218,9 +2505,12 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
         # 결과 칸 자체를 바꾼다(로그 '경기' 필터가 줄 끝 결과 표기로 결과 줄을 찾는다).
         from game_engine import pso_result_text
         pso_txt = pso_result_text(pso_score, pso_winner == my_tid)
-        rs = "무"
+        if hs == as_:   # [2026-11-13] 2차전은 이 경기에서 이기고도 합산 동점이라 승부차기일 수 있다
+            rs = "무"
 
-    comp_name = f"{t['name']} {stage_ko}".strip()
+    comp_name = stage_label(f"{t['name']} {stage_ko}".strip(), _leg)
+    if _leg == 2:   # [2026-11-13] 2차전 결과 줄에 합계 스코어
+        pso_txt = f"합계 {_agg[0] + hs}-{_agg[1] + as_}" + (f"  {pso_txt}" if pso_txt else f"  ({rs})")
     home_disp = f"{he['flag']}{he['team_name']}({he.get('country','?')})"
     away_disp = f"{ae['flag']}{ae['team_name']}({ae.get('country','?')})"
     pso = {"won": pso_winner == my_tid, "score": pso_score} if pso_winner else None
@@ -2322,6 +2612,9 @@ def get_my_matches_for_schedule(cfg, year):
             "pso_winner": pso_name, "pso_score": m["pso_score"],
             "stage": cfg.stage_ko.get(m["stage"], m["stage"]), "week": m["week"],
             "stage_raw": m["stage"], "grp": m["grp"] if "grp" in m.keys() else "",
+            # [2026-11-13] 홈·원정 2경기 — 대진표는 (stage_raw, slot)으로 1·2차전을 한 칸으로 묶는다.
+            "leg": leg_of(m), "slot": m["slot"],
+            "stage_label": stage_label(cfg.stage_ko.get(m["stage"], m["stage"]), leg_of(m)),
         })
     return out
 
@@ -2462,7 +2755,9 @@ def get_my_matches(cfg):
         out.append({
             "year": m["t_year"], "week": m["week"], "date": date_str,
             "position": m["my_position"], "team": my_name, "team_flag": my_flag,
-            "comp": m["comp"], "stage": cfg.stage_ko.get(m["stage"], m["stage"]),
+            "comp": m["comp"],
+            # [2026-11-13] 커리어 경기 목록: "16강 1차전"/"16강 2차전"(예전 단판 기록은 그대로)
+            "stage": stage_label(cfg.stage_ko.get(m["stage"], m["stage"]), leg_of(m)),
             "opp": opp_name, "opp_flag": opp_flag,
             "goals": m["my_goals"], "assists": m["my_assists"],
             "saves": m["my_saves"], "conceded": op_s,

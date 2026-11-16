@@ -41,6 +41,7 @@ CONFERENCE_CFG = CompetitionConfig(
     stage_order=_cl._STAGE_ORDER,
     neutral_stages=("F", "TP"),
     manager_bonus=True,   # [2026-10 6번 ③-1 확장] 감독 능력 경기 보정
+    ko_leg_weeks=_cl.CL_ROUND_LEG_WEEKS,   # [2026-11-13] 홈·원정 2경기 토너먼트(챔스와 같은 주차)
 )
 
 

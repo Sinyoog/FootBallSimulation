@@ -559,11 +559,12 @@ def _evaluate(conn, tid):
              "resigned": 0, "appointed": 0, "caretaker": 0, "promoted": 0,
              "rep_up": 0, "rep_down": 0, "retired": 0, "caretaker_created": 0}
 
+    _nat_job_ab = [None]   # [2026-11] 재계약 판정용 JobAbility(처음 필요할 때)
     cur = {}       # country_id -> national_team_managers 행
     for r in conn.execute(
             """SELECT ntm.*, m.reputation, m.recent_perf, m.recent_level,
                       m.career_best_level, m.best_level_year, m.titles_intl,
-                      m.birth_year, m.retired
+                      m.birth_year, m.retired, COALESCE(m.manager_ability, 0) AS manager_ability
                FROM national_team_managers ntm
                JOIN managers m ON m.id = ntm.manager_id
                WHERE ntm.end_year IS NULL"""):
@@ -732,6 +733,15 @@ def _evaluate(conn, tid):
         # 계약 만료 → 재계약 협상. **경질이 아니다.** 신민용 강조: "월드컵
         # 8강 후 계약 종료로 재계약하지 않고 무직이 되는 건 실패가 아니야."
         rprob = nat_renew_prob(orank, rrank)
+        # [2026-11 재계약 — 현재 능력·최근 성적] 요구 능력 = 국대 베스트11(시장과 같은 기준). 난수 소비 그대로.
+        try:
+            import manager_ability as _mab_r
+            if _nat_job_ab[0] is None:
+                _nat_job_ab[0] = _mab_r.JobAbility(conn)
+            rprob *= _mab_r.renew_ability_mult(link.get("manager_ability"), _nat_job_ab[0].nation(cn),
+                                               link.get("recent_perf"))
+        except Exception:
+            pass
         if leaving >= leave_budget:
             _ob["cap_force_renew"] += 1
         # [실험 D 관찰] 만료 판정을 받은 감독 — 단계 차이별 판정 수·재계약 수(상한 강제 재계약 제외)
@@ -1022,6 +1032,11 @@ def _fill_vacancy(conn, country_id, year, salt, stats, job_ab=None):
         for x in _ex_scored[:int(_dp_topn)]:
             (free_c if x[2]["status"] == "free" else club_c).append(x)
 
+    # [2026-11 상위 자리 하한] 요구 능력보다 15 넘게 낮은 후보 — 하한을 넘는 후보가 하나라도 있으면 뺀다.
+    _flok = (lambda x_: _mab.ability_floor_ok(x_[2].get("manager_ability"), _req_ab))
+    if any(_flok(x_) for x_ in free_c + club_c):
+        free_c = [x_ for x_ in free_c if _flok(x_)]
+        club_c = [x_ for x_ in club_c if _flok(x_)]
     from constants import MANAGER_NT_HIRE_TRACE as _trace_on
     _obs_ctx = {"path": None, "pool": None}
 

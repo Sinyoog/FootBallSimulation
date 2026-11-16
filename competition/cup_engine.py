@@ -1025,6 +1025,10 @@ def _match_outcome(h_ovr, a_ovr, h_mgr=0.0, a_mgr=0.0):
     #    승부차기 구간이 남겨준다.
     # 3·4부 국내컵(lower_cup_engine)도 이 함수를 그대로 쓴다.
     _ha = random.uniform(1.5, 4.5)
+    from constants import MANAGER_MATCH_REL
+    if MANAGER_MATCH_REL and (h_mgr or a_mgr):
+        # [2026-11 상대 비교형] 감독 가산은 팀 전력 단위 — 곡선 앞에서 더한다.
+        h_ovr, a_ovr, h_mgr, a_mgr = h_ovr + h_mgr, a_ovr + a_mgr, 0.0, 0.0
     diff = _cup_effective_diff(h_ovr, a_ovr, _ha)
     # [2026-10 6번 ③-1] 감독 능력 보정 — 곡선 뒤에 더한다(기본 0 = 예전과 같음).
     diff = diff + (h_mgr - a_mgr)
@@ -1091,11 +1095,12 @@ def _sim_ai_match(t, m, conn=None, reason="injury", batch=None, forced=None):
         if _g2_t and (m["home_team_id"] in _g2_t or m["away_team_id"] in _g2_t):
             _g2 = _cm.sim_target_match(m["home_team_id"], m["away_team_id"], home_adv=0.0, extra_time=True,
                                        comp_name=f"{t['name']} {m.get('round_name') or ''}".strip(), kind="cup", week=m.get("week"), day=m.get("day"),
-                                       targets=_g2_t)
+                                       targets=_g2_t, strength_rule="cup")   # [2026-11] 대회별 전력 가산(D)
         if _cm.covered("cup_entries", "cup_matches", t["id"]):
             # [2026-10 A안] 내가 참가하는 대회의 AI 경기 — 엔진으로 돌려 실측 기록(controlled_matches.sim_cover_match)
             _g2 = _cm.sim_cover_match(m["home_team_id"], m["away_team_id"], home_adv=0.0, extra_time=True,
-                                      comp="cup", tkey=f"cup:{t['id']}", targets=_g2_t, prior=_g2)
+                                      comp="cup", tkey=f"cup:{t['id']}", targets=_g2_t, prior=_g2,
+                                      strength_rule="cup")   # [2026-11] 대회별 전력 가산(D)
         if _g2 is not None:
             forced = (_g2["hs"], _g2["as"])
     if forced is not None:   # [G1] 내 팀 경기(내가 결장) — 체인 엔진 스코어(연장 포함)
@@ -1182,7 +1187,8 @@ def sim_my_cup_match_as_ai(week, p, reason="injury", day=None):
     if m["home_score"] != -1:
         return  # 이미 처리됨(멱등)
     from game_engine import _chain_team_score
-    _cs = _chain_team_score(m["home_team_id"], m["away_team_id"], 0.0, extra_time=True)
+    _cs = _chain_team_score(m["home_team_id"], m["away_team_id"], 0.0, extra_time=True,
+                            strength_rule="cup")   # [2026-11 전력 기준 통일]
     _sim_ai_match(t, m, reason=reason,
                   forced=((_cs["home_score"], _cs["away_score"]) if _cs is not None else None))
     from game_engine import update_player, _calc_manager_rel
@@ -1282,7 +1288,8 @@ def simulate_my_cup_match(week, p, day=None):
             m["home_team_id"], m["away_team_id"], home_formation, away_formation,
             home_adv=0.0,
             extra_time=True,
-            me=_chain_me_spec(p, is_home, "out" if _suspended else ("bench" if _benched else "start")))
+            me=_chain_me_spec(p, is_home, "out" if _suspended else ("bench" if _benched else "start")),
+            strength_rule="cup")   # [2026-11 전력 기준 통일] AI 경기와 같은 전력
         hs, as_ = sim["home_score"], sim["away_score"]
         hs90, as90 = sim.get("home_score_90", hs), sim.get("away_score_90", as_)
         went_et = bool(sim.get("went_extra_time"))

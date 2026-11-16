@@ -9,7 +9,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPainter, QBrush, QColor, QPen
 
 from game_engine import (get_player, get_team_rank, get_team_rank_with_zone_color, fmt_money,
-                         is_hard_mode, get_season_all_competition_appearances,
+                         is_hard_mode, is_easy_mode, get_season_all_competition_appearances,
                          _get_season_total_matches, team_matches_played_in_window, get_state)
 from constants import (ALL_STATS, STAT_KO, STAT_EN, _LEGACY_TALENT_ALIAS,
                        TALENT_TIER_KO, TALENT_TIER_EN, MANAGER_TYPES)
@@ -178,10 +178,11 @@ class PlayerPanel(QWidget):
         self.lbl_state = QLabel(""); self.lbl_state.setObjectName("injBadge")
         self.lbl_state.setWordWrap(True)         # 부상 상세 텍스트가 길어도 잘리지 않고 줄바꿈
 
+        # [2026-11-13 신민용 요청] 이름 옆엔 병역(군필·미필·면제·복무중), OVR 옆엔 재능 등급(★ 신 등) — 예전과 자리 맞바꿈.
         name_row = QHBoxLayout()
         name_row.setContentsMargins(0, 0, 0, 0)
         name_row.addWidget(self.lbl_name, 1)     # 이름이 늘어나면 이 쪽이 먼저 넓어짐
-        name_row.addWidget(self.lbl_talent, 0)
+        name_row.addWidget(self.lbl_mil, 0)
         self.lay.addLayout(name_row)
 
         # 탭 버튼 행 (OVR 뱃지 바로 위)
@@ -206,7 +207,7 @@ class PlayerPanel(QWidget):
         badge_row = QHBoxLayout()
         badge_row.setContentsMargins(0, 2, 0, 0)
         badge_row.addWidget(self.lbl_ovr, 0)
-        badge_row.addWidget(self.lbl_mil, 0)
+        badge_row.addWidget(self.lbl_talent, 0)
         badge_row.addWidget(self.lbl_state, 1)   # 부상 텍스트가 길면 이 라벨이 줄바꿈되며 늘어남
         self.lay.addLayout(badge_row)
         self._div()
@@ -389,6 +390,14 @@ class PlayerPanel(QWidget):
         self._sync_tab_buttons()
         self._rebuild_content()
         self._save_order()
+        self._request_fit()
+
+    def _request_fit(self):
+        """[2026-11-13] 보이는 탭이 바뀌면 좌측 패널 폭을 내용에 다시 맞춘다(main_window._fit_left_panel)."""
+        fn = getattr(self.window(), "_fit_left_panel", None)
+        if fn is not None:
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(0, fn)
 
     def _on_click_tab(self, key):
         if key in self._order:
@@ -398,6 +407,7 @@ class PlayerPanel(QWidget):
         self._sync_tab_buttons()
         self._rebuild_content()
         self._save_order()
+        self._request_fit()
 
     def _sync_tab_buttons(self):
         for k, b in self.tab_buttons.items():
@@ -489,7 +499,12 @@ class PlayerPanel(QWidget):
         else:
             self.lbl_ovr.show()
             self.lbl_talent.show()
-            self.lbl_ovr.setText(f"OVR {p['ovr']}")
+            # [2026-11-13 신민용 요청] 쉬움 난이도는 OVR 옆에 이 선수의 OVR 한계(재능 상한)도 — "OVR 44/101".
+            # 한계 = talent_cap(신 등급은 그대로 100~105, 그 외는 OVR이 99를 못 넘으므로 min(99, cap)).
+            if is_easy_mode(p):
+                self.lbl_ovr.setText(f"OVR {p['ovr']}/{_ovr_limit(p)}")
+            else:
+                self.lbl_ovr.setText(f"OVR {p['ovr']}")
 
             # [신규] 재능 등급 뱃지. 구버전 세이브의 예전 티어명은
             # _LEGACY_TALENT_ALIAS로 새 이름으로 변환한 뒤 표시한다.
@@ -831,12 +846,15 @@ class PlayerPanel(QWidget):
         # 신체 스탯도 안떠야 해") — 상대 선수든 내 선수든 예외 없음.
         for sl in self.stat_section_labels:
             sl.setVisible(not _hard)
+        _easy = is_easy_mode(p)
         for s, row in self.stat_rows.items():
             row.setVisible(not _hard)
             if not _hard:
                 cur = p.get(s,40)
                 mx  = p.get(f"{s}_max",80)
-                row.update(sn.get(s,s), cur, mx)
+                # [2026-11-13 신민용 요청] 쉬움 난이도는 "현재/지금 천장 | 한계"(한계 = 고강도 훈련으로 끝까지
+                # 끌어올릴 수 있는 그 스탯의 최대치 — _stat_limit).
+                row.update(sn.get(s,s), cur, mx, lim=(_stat_limit(p, s, mx) if _easy else None))
 
         # [2026-08] 어려움 난이도에서는 스탯 바가 전부 숨겨지므로 "스탯" 탭
         # 버튼 자체도 숨긴다. 이미 선택돼 있었다면 표시 목록에서도 뺀다.
@@ -970,6 +988,16 @@ def _fame(fame, lang):
     return "무명" if lang=="ko" else "Unknown"
 
 
+def _fmt_stat(v):
+    """[2026-11-16 신민용 리포트: "상세 스탯에 105.80000000001처럼 나온다"] 스탯 값 표시 — 소수 계산 오차를
+    없애려고 소수 첫째 자리로 반올림하고, 정수면 소수점 없이 보인다(105.8 / 72). 값 자체는 바꾸지 않는다(표시 전용)."""
+    try:
+        f = round(float(v), 1)
+    except (TypeError, ValueError):
+        return str(v)
+    return str(int(f)) if f.is_integer() else f"{f:.1f}"
+
+
 class StatRow(QWidget):
     def __init__(self, stat_key):
         super().__init__()
@@ -984,13 +1012,50 @@ class StatRow(QWidget):
         self.lbl_val = QLabel("0/0"); self.lbl_val.setFixedWidth(58)
         self.lbl_val.setAlignment(Qt.AlignmentFlag.AlignRight)
         self.lbl_val.setStyleSheet("color:#aaaaaa;font-size:11px;")
+        # [2026-11-13 신설, 신민용 요청] 쉬움 난이도 전용 "| 한계" 칸 — 다른 난이도에선 숨긴다.
+        self.lbl_lim = QLabel(""); self.lbl_lim.setFixedWidth(36)
+        self.lbl_lim.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.lbl_lim.setStyleSheet("color:#7fb8ff;font-size:11px;")
+        self.lbl_lim.setToolTip("한계 — 고강도 훈련으로 끝까지 끌어올릴 수 있는 이 스탯의 최대치")
+        self.lbl_lim.hide()
 
         lay.addWidget(self.lbl_name); lay.addWidget(self.bar_widget); lay.addWidget(self.lbl_val)
+        lay.addWidget(self.lbl_lim)
 
-    def update(self, name, cur, mx):
+    def update(self, name, cur, mx, lim=None):
         self.lbl_name.setText(name)
         self.bar_widget.set_values(cur, mx)
-        self.lbl_val.setText(f"{cur}/{mx}")
+        self.lbl_val.setText(f"{_fmt_stat(cur)}/{_fmt_stat(mx)}")
+        if lim is None:
+            self.lbl_lim.hide()
+        else:
+            self.lbl_lim.setText(f"| {_fmt_stat(lim)}")
+            self.lbl_lim.show()
+
+
+def _ovr_limit(p):
+    """[2026-11-13] 이 선수 OVR의 한계 — 신 등급은 talent_cap(100~105) 그대로, 그 외 등급은 OVR이 99로
+    클램프되므로(game_engine 훈련 처리) min(99, talent_cap)."""
+    cap = int(p.get("talent_cap") or 0) or 99
+    return cap if p.get("talent_tier") == "god" else min(99, cap)
+
+
+def _stat_limit(p, stat, mx):
+    """[2026-11-13] 스탯 하나의 한계 — 고강도 훈련으로 이 선수가 그 스탯을 끌어올릴 수 있는 최대치
+    (game_engine.stat_break_cap: 주특기 재능+12 / 평범 재능+2 / 약점 재능−6). 지금 _max가 이미 더 높으면
+    (규칙 변경 전에 오른 값) _max. 신체 스탯은 나이별 신체 상한(35세+)이 있으면 그 아래로."""
+    from constants import PHYSICAL_STATS, get_physical_age_cap, get_physical_age_cap_god
+    from game_engine import stat_break_cap
+    lim = stat_break_cap(p.get("position"), p.get("body_type"), stat, p.get("talent_cap"))
+    if stat in PHYSICAL_STATS:
+        _pc = (get_physical_age_cap_god(p.get("age") or 0) if p.get("talent_tier") == "god"
+               else get_physical_age_cap(p.get("age") or 0))
+        if _pc is not None:
+            lim = min(lim, _pc)
+    try:
+        return int(max(round(float(mx)), lim))
+    except (TypeError, ValueError):
+        return lim
 
 
 class StatBar(QWidget):

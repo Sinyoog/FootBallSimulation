@@ -714,6 +714,7 @@ def get_my_domestic_sc_match(week, day=None, p=None, st=None):
     t = get_domestic_sc_tournament(st["current_year"], cid)
     if not t or t["status"] == "done":
         return None
+    t = _lazy_resync(t, tid, p, st["current_year"], cid)
     reg_tid = t.get("my_team_id", 0)
     if not reg_tid or reg_tid != tid:
         return None
@@ -769,6 +770,8 @@ def get_my_domestic_sc_matches_for_schedule(year):
         return []
     cid = _my_country_id(p)
     t = get_domestic_sc_tournament(year, cid)
+    if t:
+        t = _lazy_resync(t, p.get("current_team_id", 0), p, year, cid)
     if not t or not t.get("my_in"):
         return []
     reg_tid = t.get("my_team_id", 0)
@@ -801,6 +804,24 @@ def get_my_domestic_sc_matches_for_schedule(year):
             "stage": "", "week": m["week"], "stage_raw": "F", "grp": "",
         })
     return out
+
+
+def _lazy_resync(t, tid, p, year, cid):
+    """[2026-11-15 버그수정, 신민용 리포트: "방금 이적한 팀이 국내 슈퍼컵이 있는데 내 메인 일정에 안 떴다"]
+    대회는 새해(1주차)에 만들어지며 그때 소속팀으로 my_team_id가 박힌다. 프리시즌(1~3주) 이적 뒤엔
+    등록이 옛 팀 그대로라 내 경기·일정 조회가 전부 빈손이었다(resync 함수는 있었지만 아무 데서도 안
+    불렸다). 조회 시점에 '지금 소속 기준 등록값'과 다르면 그 자리에서 고친다 — 같으면 추가 조회·쓰기 없음."""
+    if t.get("status") == "done":
+        return t
+    want = tid if (tid and tid in (t.get("home_team_id"), t.get("away_team_id"))) else 0
+    if (t.get("my_team_id") or 0) == want:
+        return t
+    try:
+        if resync_my_domestic_sc_registration(p=p, year=year):
+            return get_domestic_sc_tournament(year, cid) or t
+    except Exception as _e:
+        print("[DSC] resync 실패(건너뜀):", _e, flush=True)
+    return t
 
 
 def resync_my_domestic_sc_registration(p=None, year=None):
@@ -873,11 +894,12 @@ def _sim_ai_match(t, m, conn=None, p=None, forced=None):
         if _g2_t and (m["home_team_id"] in _g2_t or m["away_team_id"] in _g2_t):
             _g2 = _cm.sim_target_match(m["home_team_id"], m["away_team_id"], home_adv=0.0, extra_time=True,
                                        comp_name=t["name"], kind="domestic_sc", week=m.get("week"), day=m.get("day"),
-                                       targets=_g2_t)
+                                       targets=_g2_t, strength_rule="dom_super")   # [2026-11] 대회별 전력 가산(D)
         if _cm.covered("domestic_sc_entries", "domestic_sc_matches", t["id"]):
             # [2026-10 A안] 내가 참가하는 대회의 AI 경기 — 엔진으로 돌려 실측 기록(controlled_matches.sim_cover_match)
             _g2 = _cm.sim_cover_match(m["home_team_id"], m["away_team_id"], home_adv=0.0, extra_time=True,
-                                      comp="dsc", tkey=f"dsc:{t['id']}", targets=_g2_t, prior=_g2)
+                                      comp="dsc", tkey=f"dsc:{t['id']}", targets=_g2_t, prior=_g2,
+                                      strength_rule="dom_super")   # [2026-11] 대회별 전력 가산(D)
         if _g2 is not None:
             forced = (_g2["hs"], _g2["as"])
     if forced is not None:   # [G1] 내 팀 경기(내가 결장) — 체인 엔진 스코어(연장 포함)
@@ -925,7 +947,8 @@ def sim_my_domestic_sc_match_as_ai(week, p, reason="injury", day=None):
     if m["home_score"] != -1:
         return
     from game_engine import _chain_team_score
-    _cs = _chain_team_score(m["home_team_id"], m["away_team_id"], 0.0, extra_time=True)
+    _cs = _chain_team_score(m["home_team_id"], m["away_team_id"], 0.0, extra_time=True,
+                            strength_rule="dom_super")   # [2026-11 전력 기준 통일]
     _sim_ai_match(t, m, p=p, forced=((_cs["home_score"], _cs["away_score"]) if _cs is not None else None))
     from game_engine import update_player, _calc_manager_rel
     update_player(manager_relation=_calc_manager_rel(p, 0, "", played=False, not_played_penalty=2))
@@ -1026,7 +1049,8 @@ def simulate_my_domestic_sc_match(week, p, day=None):
             m["home_team_id"], m["away_team_id"], home_formation, away_formation,
             home_adv=0.0,
             extra_time=True,
-            me=_chain_me_spec(p, is_home, "out" if _suspended else ("bench" if _benched else "start")))
+            me=_chain_me_spec(p, is_home, "out" if _suspended else ("bench" if _benched else "start")),
+            strength_rule="dom_super")   # [2026-11 전력 기준 통일] AI 경기와 같은 전력
         hs, as_ = sim["home_score"], sim["away_score"]
         hs90, as90 = sim.get("home_score_90", hs), sim.get("away_score_90", as_)
         went_et = bool(sim.get("went_extra_time"))
@@ -1295,6 +1319,11 @@ def process_domestic_sc_week(week):
     if not st:
         return
     year = st["current_year"]
+    # [2026-11-15] cup_engine.process_cup_week처럼 주 처리 전에 내 등록을 지금 소속으로 맞춘다.
+    try:
+        resync_my_domestic_sc_registration(year=year)
+    except Exception as _e:
+        print("[DSC] resync_my_domestic_sc_registration 실패(건너뜀):", _e, flush=True)
 
     conn = get_conn()
     pending = [dict(r) for r in conn.execute(

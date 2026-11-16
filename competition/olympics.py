@@ -297,7 +297,7 @@ validate_squad_tables()
 # ══════════════════════════════════════════════════════════════════
 # 후보 풀 · 점수
 # ══════════════════════════════════════════════════════════════════
-def _score_candidates(cands, year):
+def _score_candidates(cands, year, country=None):
     """성인 대표팀과 같은 선발 점수(intl_selection_score_v3). 반환: 포지션 통계(내 선수용)."""
     if not cands:
         return {}
@@ -311,10 +311,18 @@ def _score_candidates(cands, year):
     for _pos in sorted(by_pos):
         lst = sorted(by_pos[_pos], key=lambda c: (-(c["ovr"] or 0), c["id"]))
         shortlist.extend(lst[:_INTL_SEL_SHORTLIST_PER_POS])
-    metrics = _intl_candidate_metrics(shortlist, year=year) if shortlist else {}
+    # [2026-11 v4.1] 성인 대표와 같은 평가 기간·범위(_v41_candidate_metrics) — 내 선수 지표(_my_selection_metrics)가
+    # v4에선 v4.1 기간 통일 경로를 쓰므로 AI도 같은 경로여야 같은 척도다(올림픽 예선 = 상반기, 본선 = 시즌 전체).
+    from intl_engine import _v4_on, _v41_candidate_metrics
+    if not shortlist:
+        metrics = {}
+    elif _v4_on():
+        metrics = _v41_candidate_metrics(shortlist, year)
+    else:
+        metrics = _intl_candidate_metrics(shortlist, year=year)
     apps = get_player_total_intl_appearances([c["id"] for c in cands])
     for c in cands:
-        c["_score"] = intl_selection_score_v3(c, metrics.get(c["id"]), apps.get(c["id"], 0))
+        c["_score"] = intl_selection_score_v3(c, metrics.get(c["id"]), apps.get(c["id"], 0), nat=country)
     return metrics.get(_INTL_POS_STAT_KEY) or {}
 
 
@@ -335,7 +343,7 @@ def _my_candidate(p, country, year, pos_stat):
         penalty += 3.0
     cand["_score"] = intl_selection_score_v3(
         cand, _my_selection_metrics(p, pos_stat, year=year),
-        appearances=_my_total_intl_appearances()) - penalty
+        appearances=_my_total_intl_appearances(), nat=country) - penalty
     return cand
 
 
@@ -352,7 +360,7 @@ def build_pool(country, year, p=None, include_me=False):
     all_rows = [c for _pos in sorted(nat_by_pos) for c in nat_by_pos[_pos]]
     max_age = C.OLYMPIC_MAX_AGE
     pool = [c for c in all_rows if (c.get("age") or 0) <= max_age]
-    pos_stat = _score_candidates(pool, year)
+    pos_stat = _score_candidates(pool, year, country)
     me = None
     if include_me and p:
         me = _my_candidate(p, country, year, pos_stat)
@@ -370,7 +378,7 @@ def build_pool(country, year, p=None, include_me=False):
         while (n_gk < C.OLYMPIC_GK or len(pool) < C.OLYMPIC_SQUAD_SIZE) and age <= max_seen:
             at_age = [c for c in older if (c.get("age") or 0) == age]
             if at_age:
-                _score_candidates([c for c in at_age if not c.get("is_me")], year)
+                _score_candidates([c for c in at_age if not c.get("is_me")], year, country)
                 at_age.sort(key=lambda c: (-c["_score"], c["id"]))
                 added = []
                 need_gk = max(0, C.OLYMPIC_GK - n_gk)
@@ -1309,148 +1317,17 @@ def on_finish(t):
 #     즉시 한 번 계산해 세계 기록(season_individual_awards, category='intl', 대회명
 #     "U-23 올림픽")에 남기고, 내 선수 수상도 그 결과에서 그대로 꺼낸다 — 세계 기록실과
 #     내 수상 목록이 어긋나지 않는다(월드컵·대륙컵은 예전 방식 그대로).
-#   · 발롱도르: 대회 성적 점수 = 유럽 컨퍼런스리그(대륙 무관 기준)의 절반,
-#     개인상 점수 = 컨퍼런스리그 개인상(클럽 대항전 MVP·베스트11)의 절반.
-#     대회 성적은 국제대회 가산점(intl_bonus, 국적 내 순위 감쇠 적용) 경로로 들어가고,
-#     A급 리그 "국제무대 증명" 게이트에는 인정하지 않는다.
+#   · 발롱도르 등 성인 개인상: [2026-11 제거, 신민용 확정] 올림픽은 넣지 않는다. 예전 성적·개인상
+#     가산 함수(ballon_intl_bonus·my_ballon_trophy_points·ballon_award_bonus·ballon_result_points)는
+#     호출부가 없어져 2026-11 정리 때 함께 지웠다. 올림픽 대회 위상(constants.OLYMPIC_COMP_WEIGHT)은
+#     골든보이·코파 트로피 채점(game_engine._ballon_comp_level)에만 쓰인다.
 # ══════════════════════════════════════════════════════════════════
 OLY_AWARD_RENAME = {"MVP": "골든볼", "득점왕": "골든부트"}
 _BALL_NAMES = ("골든볼", "실버볼", "브론즈볼")
-# 올림픽 성적 → 클럽 대항전 진출 단계 라벨(_CLUB_COMP_STAGE_WEIGHT의 키). 동메달·4위는
-# 클럽 대항전과 같이 "4강" 하나로 본다(클럽 대항전에도 3위 구분이 없다).
-_STAGE_OF_RESULT = {"금메달": "우승", "은메달": "준우승", "동메달": "4강", "4위": "4강",
-                    "8강 탈락": "8강", "16강 탈락": "16강", "조별리그 탈락": "조별탈락"}
-
-
 def _finals_row(conn, year):
     return conn.execute("SELECT id, name, winner, my_selected, my_result, my_nat FROM intl_tournaments "
                         "WHERE year=? AND kind=? AND status='done' ORDER BY id LIMIT 1",
                         (year, OLY_KIND)).fetchone()
-
-
-def country_stage(conn, tid, country):
-    """그 나라가 올림픽 본선에서 간 단계 — 클럽 대항전 단계 라벨('우승'…'조별탈락') 또는 None."""
-    gold, silver, _bronze = medalists(conn, tid)
-    if country == gold:
-        return "우승"
-    if country == silver:
-        return "준우승"
-    stages = {r[0] for r in conn.execute(
-        "SELECT DISTINCT stage FROM intl_matches WHERE tournament_id=? AND (home=? OR away=?) "
-        "AND home_score>=0", (tid, country, country)).fetchall()}
-    for st, label in (("TP", "4강"), ("SF", "4강"), ("QF", "8강"), ("R16", "16강")):
-        if st in stages:
-            return label
-    return "조별탈락" if stages else None
-
-
-def ballon_result_points(stage_label):
-    """올림픽 성적의 발롱도르 대회 점수 = 유럽 컨퍼런스리그 같은 단계 점수 × 0.5."""
-    if not stage_label:
-        return 0.0
-    import game_engine as G
-    comp_w = G._CLUB_COMP_WEIGHT.get(C.OLYMPIC_BALLON_REF, 0.0) * C.OLYMPIC_BALLON_RATIO
-    return comp_w * G._CLUB_COMP_STAGE_WEIGHT.get(stage_label, 0.0) * 10.0
-
-
-_BALLON_CTX = {}   # (DB 경로, 연도, 대회 id, 우승국, 경기 결과 요약) → {나라: (단계, 그 나라 본선 경기 수)}
-
-
-def _ballon_ctx(conn, year):
-    import database
-    t = _finals_row(conn, year)
-    if not t:
-        return None, None
-    # 경기 결과 요약까지 키에 넣는다 — 같은 경로의 다른 세이브를 불러와 같은 해를 다시 치러도
-    # 예전 결과를 재사용하지 않게(후보마다 한 번 도는 가벼운 집계 한 줄).
-    sig = tuple(conn.execute("SELECT COUNT(*), COALESCE(SUM(home_score*37+away_score),0) FROM intl_matches "
-                             "WHERE tournament_id=? AND home_score>=0", (t["id"],)).fetchone())
-    key = (database.DB_PATH, int(year), t["id"], t["winner"], sig)
-    ctx = _BALLON_CTX.get(key)
-    if ctx is None:
-        ctx = {}
-        for (country,) in conn.execute("SELECT country FROM intl_entries WHERE tournament_id=?",
-                                       (t["id"],)).fetchall():
-            n = conn.execute("SELECT COUNT(*) FROM intl_matches WHERE tournament_id=? AND (home=? OR "
-                             "away=?) AND home_score>=0", (t["id"], country, country)).fetchone()[0]
-            ctx[country] = (country_stage(conn, t["id"], country), n)
-        _BALLON_CTX[key] = ctx
-    return t, ctx
-
-
-def ballon_intl_bonus(conn, year, player_id, my_id):
-    """game_engine._get_player_intl_bonus 훅 — 그 해 올림픽 본선 성적 점수 × 개인 기여.
-    개인 기여 = 국제대회와 같은 출전 비율 3단계(_intl_participation_factor) × 평점 배율이고,
-    평점 배율 상한은 컨퍼런스리그와 같은 값(_CLUB_COMP_QUALITY_CAP)이다. 나라는 국적이 아니라
-    실제로 뛴 올림픽 나라(복수국적 미고정 선수). 올림픽이 없거나 꺼져 있으면 0."""
-    if not enabled():
-        return 0.0
-    t, ctx = _ballon_ctx(conn, year)
-    if not t:
-        return 0.0
-    if player_id == my_id:
-        if t["my_selected"] != 1:
-            return 0.0
-        country = t["my_nat"] or ""
-        row = conn.execute("SELECT COUNT(*) AS m, AVG(my_rating) AS r FROM intl_matches "
-                           "WHERE tournament_id=? AND my_played=1", (t["id"],)).fetchone()
-        matches, rating = (row["m"] or 0), row["r"]
-    else:
-        row = conn.execute("SELECT country, appearances, rating FROM intl_squad "
-                           "WHERE tournament_id=? AND player_id=?", (t["id"], player_id)).fetchone()
-        if not row:
-            return 0.0
-        country, matches, rating = row["country"], (row["appearances"] or 0), row["rating"]
-    if not matches:
-        return 0.0
-    stage, team_n = ctx.get(country, (None, matches))
-    pts = ballon_result_points(stage)
-    if not pts:
-        return 0.0
-    import game_engine as G
-    part = G._intl_participation_factor(matches, team_n or matches)
-    cap = G._CLUB_COMP_QUALITY_CAP.get(C.OLYMPIC_BALLON_REF, 1.0)
-    quality = max(0.2, min(cap, 1.0 + ((rating if rating is not None else 0.0) - 6.0) / 1.5))
-    return pts * part * quality
-
-
-def my_ballon_trophy_points(year):
-    """game_engine._get_ballon_trophy_bonus(내 선수 예전 판정 경로) 훅 — 그 경로가 클럽 대항전을
-    단계 점수 그대로 더하는 것과 같이, 내 올림픽 성적 점수를 그대로 돌려준다(뽑혔을 때만)."""
-    if not enabled():
-        return 0.0
-    conn = get_conn()
-    try:
-        t = _finals_row(conn, year)
-    finally:
-        conn.close()
-    if not t or t["my_selected"] != 1:
-        return 0.0
-    return ballon_result_points(_STAGE_OF_RESULT.get((t["my_result"] or "").strip()))
-
-
-def ballon_award_bonus(c, year):
-    """game_engine._get_award_recognition_bonus_map 훅 — 올림픽 개인상 가산점
-    {player_id: 점수}. 컨퍼런스리그 개인상(클럽 대항전 MVP·베스트11) 점수의 절반이고, 실버볼·브론즈볼은
-    골든볼의 0.5·0.2배(월드컵과 같은 비율). 득점·도움·골든글러브·올해의 수비수는 클럽 대항전과 같이 0."""
-    from database import history_sync_for_read as _hsr; _hsr()   # [2026-11-01 비동기 기록 경합 수정] 아래 hist 조회 전에 본 연결 커밋 + 기록 큐 완료 대기
-    out = {}
-    if not enabled():
-        return out
-    import game_engine as G
-    for r in c.execute(
-            """SELECT sia.player_id AS player_id, sia.award_kind AS award_kind, sia.rank AS rank
-               FROM season_individual_awards sia
-               JOIN intl_tournaments it ON it.year = sia.year AND it.name = sia.competition
-               WHERE sia.year=? AND sia.category='intl' AND it.kind=?
-               ORDER BY sia.award_type, sia.rank""", (year, OLY_KIND)).fetchall():
-        kind = {"골든볼": "MVP"}.get(r["award_kind"], r["award_kind"])
-        base = G._BALLON_AWARD_BONUS.get(("club", kind), 0.0) * C.OLYMPIC_BALLON_RATIO
-        if kind == "MVP":
-            base *= G._BALLON_BALL_RANK_RATIO.get(r["rank"], 0.0)   # 실버볼 0.5 · 브론즈볼 0.2(월드컵과 같은 비율)
-        if base:
-            out[r["player_id"]] = round(out.get(r["player_id"], 0.0) + base, 4)
-    return out
 
 
 def compute_awards(t):
@@ -1474,7 +1351,8 @@ def compute_awards(t):
             return
         stage_f = G._tournament_stage_factor_for(c, "intl_matches", tid, trow["winner"])
         denom = G._country_intl_match_counts(c, tid)
-        mvp, scorer = G._pick_club_comp_mvp_and_scorer(pool, stage_f, denom, "stage_key")
+        mvp, scorer = G._pick_club_comp_mvp_and_scorer(pool, stage_f, denom, "stage_key",
+                                                        boot=True)   # [2026-11-13] 골든부트 동률 규칙
         extra = G._pick_comp_extra_winners(pool, stage_factor=stage_f, part_denom=denom,
                                            part_key="stage_key")
         extra["young"] = None                     # 영플레이어상 없음

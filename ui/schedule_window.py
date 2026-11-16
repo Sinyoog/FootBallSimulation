@@ -451,8 +451,11 @@ class ScheduleWindow(QDialog):
             ]),
             # 슈퍼컵은 리그 스테이지가 없는 4팀 다이렉트 토너먼트 —
             # 예전과 같이 대진표 한 장뿐이다(색상도 기존 버건디 유지).
+            # [2026-11-15 신민용 요청: "리그 슈퍼컵 | 대륙 슈퍼컵 이렇게 2개로 — 안 나간 대회는 안 뜨게"]
+            # 국내(리그) 슈퍼컵 탭을 앞에 둔다. 각 빌더는 내가 그 대회에 없으면 None → 탭이 안 생긴다.
             ("🏵 슈퍼컵", [
-                ("대진표", lambda: self._make_champions_tab(
+                ("리그 슈퍼컵", lambda: self._make_domestic_sc_tab(), False),
+                ("대륙 슈퍼컵", lambda: self._make_champions_tab(
                     "ko", engine=super_cup_engine, comp_title="슈퍼컵",
                     header_color="#800020"), False),
             ]),
@@ -593,6 +596,10 @@ class ScheduleWindow(QDialog):
                            for k in (("oly_qual",), ("olympic",)))
             if not my_tid:
                 return False
+            if cat_label == "🏵 슈퍼컵":
+                from competition import domestic_super_cup_engine as _dsc
+                if _dsc.get_my_domestic_sc_matches_for_schedule(year):
+                    return True
             if cat_label in ("🏆 챔피언스리그", "🥈 유로파리그", "🥉 컨퍼런스리그", "🏵 슈퍼컵"):
                 from competition import champions_engine, europa_engine, conference_engine, super_cup_engine
                 engine = {"🏆 챔피언스리그": champions_engine, "🥈 유로파리그": europa_engine,
@@ -1797,7 +1804,8 @@ class ScheduleWindow(QDialog):
                 })
             right_lay.addWidget(self._build_grouped_fixture_column(
                 fixture_rows, {}, None, p, st["current_year"],
-                group_key="week", group_label_fmt="{}주차"))
+                group_key="week", group_label_fmt="{}주차 전체 경기",
+                my_first_label="◼ 내 경기"))
             right_lay.addStretch()
 
             split_row.addWidget(left_widget, 0)
@@ -1829,14 +1837,50 @@ class ScheduleWindow(QDialog):
                         "결승": 5, "3/4위전": 5}
 
         bracket_matches = []
+        # [2026-11-13 신설, 홈·원정 2경기] 1·2차전은 대진표에서 한 칸으로 합친다 — 2차전 홈팀(상위 시드)을
+        # 위, 스코어는 합산, 진출팀은 합산(동점이면 2차전 승부차기)으로. 1차전만 끝났으면 1차전까지의
+        # 합산만 보여주고 승자는 비워 둔다(1차전으로 진출팀을 정하지 않는다).
+        _legs = {}
         for m in matches:
+            if m.get("leg") in (1, 2) and m.get("stage_raw") != "league":
+                _legs.setdefault((m.get("stage_raw"), m.get("slot")), {})[m["leg"]] = m
+        _merged = []
+        _seen = set()
+        for m in matches:
+            if m.get("leg") not in (1, 2) or m.get("stage_raw") == "league":
+                _merged.append(m)
+                continue
+            key = (m.get("stage_raw"), m.get("slot"))
+            if key in _seen:
+                continue
+            _seen.add(key)
+            l1, l2 = _legs[key].get(1), _legs[key].get(2)
+            if not l1 or not l2:
+                _merged.append(m)
+                continue
+            d1 = l1["home_score"] is not None and l1["home_score"] >= 0
+            d2 = l2["home_score"] is not None and l2["home_score"] >= 0
+            ga = (l2["home_score"] if d2 else 0) + (l1["away_score"] if d1 else 0)
+            gb = (l2["away_score"] if d2 else 0) + (l1["home_score"] if d1 else 0)
+            mm = dict(l2)
+            mm["week"] = l1["week"]
+            mm["home_score"], mm["away_score"] = (ga, gb) if (d1 or d2) else (-1, -1)
+            mm["pso_winner"] = l2["pso_winner"] if d2 else ""
+            # [2026-11-15 신민용 요청: "1차전 A팀/B팀, 2차전 B팀/A팀으로 — '1차 1-1 · 2차 1-3'은 안 쓰게"]
+            # 대진표 칸을 1차전 두 줄 + 2차전 두 줄로 그린다(각 줄 = 그 경기 홈/원정과 그 경기 스코어).
+            mm["_legs"] = (l1 if d1 else dict(l1, home_score=-1, away_score=-1),
+                           l2 if d2 else dict(l2, home_score=-1, away_score=-1))
+            mm["_note"] = ""
+            mm["_undecided"] = not (d1 and d2)
+            _merged.append(mm)
+        for m in _merged:
             # 리그 스테이지는 위에서 이미 순위표로 보여줬으니 브래킷에서는 제외.
             # 플레이오프(PO)부터는 진짜 토너먼트라 브래킷에 포함한다.
             if m.get("stage_raw") == "league" or m["stage"] == "리그 스테이지":
                 continue
             hs, as_ = m["home_score"], m["away_score"]
             played  = hs is not None and hs >= 0
-            if played:
+            if played and not m.get("_undecided"):
                 winner = m["pso_winner"] or (m["home_name"] if hs > as_ else m["away_name"])
             else:
                 winner = ""
@@ -1854,19 +1898,34 @@ class ScheduleWindow(QDialog):
                 home_nm = f"{home_nm} ({h_ctry})"
             if a_ctry:
                 away_nm = f"{away_nm} ({a_ctry})"
-            if played:
+            if played and winner:
                 if winner == m["away_name"]:
                     winner = away_nm
                 else:
                     winner = home_nm
-            bracket_matches.append({
+            _bm = {
                 "stage": m["stage"], "week": m["week"],
                 "home": home_nm, "away": away_nm,
                 "home_flag": "", "away_flag": "",
                 "hs": hs if played else -1, "as_": as_ if played else -1,
                 "winner": winner, "pso": m["pso_score"] if m["pso_winner"] else "",
                 "my_side": my_side,
-            })
+                "note": m.get("_note", ""),
+            }
+            if m.get("_legs"):
+                # [2026-11-15] 1·2차전 줄 — 이름은 위 home_nm/away_nm과 같은 표기("팀명 (국가)")라 승자 색칠·
+                # 다음 라운드 연결(이름 매칭)이 그대로 맞는다. 칸의 home/away(이름 매칭용)는 2차전 기준 그대로.
+                def _disp(_nm, _lg):
+                    return f"{_nm} ({_lg})" if _lg else _nm
+                _bm["legs"] = [
+                    {"label": f"{_i}차전",
+                     "home": _disp(_l["home_name"], _l.get("home_league", "")),
+                     "away": _disp(_l["away_name"], _l.get("away_league", "")),
+                     "hs": _l["home_score"] if (_l["home_score"] is not None and _l["home_score"] >= 0) else -1,
+                     "as_": _l["away_score"] if (_l["home_score"] is not None and _l["home_score"] >= 0) else -1,
+                     "home_mine": _l["home_id"] == my_team_id, "away_mine": _l["away_id"] == my_team_id}
+                    for _i, _l in ((1, m["_legs"][0]), (2, m["_legs"][1]))]
+            bracket_matches.append(_bm)
 
         if mode == "ko" and not bracket_matches:
             return None
@@ -1880,6 +1939,60 @@ class ScheduleWindow(QDialog):
             lay.addWidget(bracket)
             self._fit_to_bracket(bracket)
 
+        lay.addStretch()
+        outer.setWidget(body)
+        return outer
+
+    def _make_domestic_sc_tab(self):
+        """[2026-11-15 신설] 🏵 슈퍼컵 > 리그 슈퍼컵 — 국내 슈퍼컵(리그 우승팀 vs 컵 우승팀 단판 결승).
+        내 팀이 그 해 우리나라 대회에 없으면 None(탭 안 생김)."""
+        from competition import domestic_super_cup_engine as _dsc
+        from game_engine import get_state, get_player
+        st = get_state(); p = get_player()
+        if not st or not p or not p.get("current_team_id"):
+            return None
+        year = st["current_year"]
+        matches = _dsc.get_my_domestic_sc_matches_for_schedule(year)
+        if not matches:
+            return None
+        t = _dsc.get_domestic_sc_tournament(year, _dsc._my_country_id(p)) or {}
+        my_team_id = p["current_team_id"]
+
+        from PyQt6.QtWidgets import QScrollArea
+        outer = QScrollArea()
+        outer.setWidgetResizable(True)
+        outer.setStyleSheet("QScrollArea{border:none;background:#1e1e1e;}")
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(10)
+        hdr = QLabel(f"🏵 {year}년 {t.get('name') or '리그 슈퍼컵'}")
+        hdr.setStyleSheet("color:#d9955b;font-size:14px;font-weight:bold;")
+        lay.addWidget(hdr)
+
+        bracket_matches = []
+        for m in matches:
+            hs, as_ = m["home_score"], m["away_score"]
+            played = hs is not None and hs >= 0
+            winner = ""
+            if played:
+                winner = m["pso_winner"] or (m["home_name"] if hs > as_ else m["away_name"])
+            my_side = "home" if m["home_id"] == my_team_id else ("away" if m["away_id"] == my_team_id else None)
+            bracket_matches.append({
+                "stage": "결승", "week": m["week"],
+                "home": m["home_name"], "away": m["away_name"],
+                "home_flag": "", "away_flag": "",
+                "hs": hs if played else -1, "as_": as_ if played else -1,
+                "winner": winner, "pso": m["pso_score"] if m["pso_winner"] else "",
+                "my_side": my_side, "note": "",
+            })
+        lbl_t = QLabel("◼ 결승 (단판)")
+        lbl_t.setStyleSheet("color:#00cc44;font-weight:bold;font-size:12px;")
+        lay.addWidget(lbl_t)
+        from ui.bracket_widget import BracketWidget, build_rounds_from_matches
+        bracket = BracketWidget(build_rounds_from_matches(bracket_matches, {"결승": 0}))
+        lay.addWidget(bracket)
+        self._fit_to_bracket(bracket)
         lay.addStretch()
         outer.setWidget(body)
         return outer
@@ -2548,7 +2661,8 @@ class ScheduleWindow(QDialog):
         return outer
 
     def _build_grouped_fixture_column(self, rows, flags, nat, p, year,
-                                       group_key="grp", group_label_fmt="{}조", first_key=None):
+                                       group_key="grp", group_label_fmt="{}조", first_key=None,
+                                       my_first_label=None):
         """[2026-07 개편] '경기 일정'을 좌측 조별 순위표와 같은 톤으로,
         그룹(또는 라운드)별 카드로 나눠서 보여준다. 예전엔 표 하나에
         모든 그룹이 뒤섞여 있어서 좌측과 스타일이 안 맞고 알아보기
@@ -2567,11 +2681,23 @@ class ScheduleWindow(QDialog):
             by_group.setdefault(m.get(group_key), []).append(m)
 
         # [2026-11] first_key(내가 속한 조)가 있으면 그 조를 맨 위로 — 나머지는 예전 순서.
+        _groups = []
         for key in sorted(by_group.keys(), key=lambda k: (first_key is None or k != first_key, k is None, k)):
-            group_rows = by_group[key]
-            label_txt = group_label_fmt.format(key) if key not in (None, "") else "일정"
+            _groups.append((group_label_fmt.format(key) if key not in (None, "") else "일정",
+                            by_group[key], False))
+        # [2026-11-15 신민용 요청: "챔스처럼 리그 스테이지가 있으면 맨 위에 내 경기만 모아둔 일정, 그 아래 모든
+        # 팀 일정"] my_first_label이 오면 내 팀 경기만 날짜순으로 모은 표를 맨 위에 하나 더 둔다(아래 주차별
+        # 전체 일정은 그대로 — 내 경기도 거기 같이 남는다).
+        if my_first_label:
+            _mine = sorted((m for m in rows if m.get("is_my")),
+                           key=lambda m: (m.get("week") or 0, m.get("day") or 0))
+            if _mine:
+                _groups.insert(0, (my_first_label, _mine, True))
+
+        for label_txt, group_rows, _is_mine_box in _groups:
             lbl = QLabel(label_txt)
-            lbl.setStyleSheet("color:#888;font-size:11px;font-weight:bold;")
+            lbl.setStyleSheet("color:#66ccff;font-size:12px;font-weight:bold;" if _is_mine_box
+                              else "color:#888;font-size:11px;font-weight:bold;")
             col.addWidget(lbl)
 
             tbl = QTableWidget(len(group_rows), 4)

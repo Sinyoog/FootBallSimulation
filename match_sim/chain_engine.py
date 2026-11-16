@@ -248,7 +248,32 @@ T_DEAD = {"throw": (12, 20), "goalkick": (18, 28), "corner": (25, 35), "fk": (20
 HALF_SEC, ET_SEC = 45 * 60, 15 * 60
 
 _SUB_DECISION = (56, 62, 68, 74, 80, 86, REG_MINUTES + 8, REG_MINUTES + ET_HALF_MINUTES + 8)
-_SLOT_PEN = (0, 5, 9, 13, 13)
+_SLOT_PEN = (0, 5, 9, 13, 13)    # [2026-11] 더는 쓰지 않음(자리 적합도는 formation_logic._slot_value) — 참고용으로 남김
+
+# [2026-11 팀 전력 정식화, 신민용 확정] 클럽 강도·명문 같은 "가상 가산"(home_str_add/away_str_add)의 일부를
+# 선수 경합(team_add)에도 넣는다. 예전엔 팀 격차 보정 곡선으로만 들어가 명문팀이 AI 공식보다 덜 이겼다
+# (G2 빅5 상위 3팀 −0.10점/경기, 가산 상관 −0.36). 0.25/0.35/0.4/0.5 비교(G2 17,520경기 + 실제 맞대결
+# 6쌍 × 1,000경기)에서 0.35가 잔차 SD 0.088(최저)·가산 상관 −0.01·상위 3팀 +0.00 → 확정.
+CONTEST_STR_SHARE = 0.35
+# [2026-11 감독 능력 → 경기, 신민용 확정] 감독 가산(양 팀 감독 능력 차, 팀 전력 단위 — constants.manager_rel_pair)은
+# 명문·클럽 강도와 달리 "실제로 팀이 그만큼 잘 뛴다"는 값이라 선수 경합에도 전부 넣는다. 0.35면 노팅엄 vs 팰리스
+# 감독 90 vs 60(+3)의 홈 승 변화가 +7.3%p뿐(AI 리그 공식 +17.6%p), 1.0이면 +19.5%p.
+MANAGER_CONTEST_SHARE = 1.0
+# [2026-11 B안, 신민용 확정] 감독 곡선 상한을 3.0 → 4.5로 올리면서, 3.0을 넘는 몫은 팀 단위(팀 전력 tmean)에는
+# 전부, 선수 경합에는 MANAGER_CONTEST_EXTRA_SHARE(명문·클럽 강도와 같은 0.35)만 넣는다 — 감독이 팀을 망치는 것과
+# 선수 개인 기록 감소를 구분한다(시즌 내내 리그 최악 감독일 때 105 ST 득점 감소 −21~28% 유지가 목표).
+# 특정 선수 보호가 아니라 양 팀 선수 전원에 같은 규칙.
+MANAGER_CONTEST_FULL_CAP = 3.0
+MANAGER_CONTEST_EXTRA_SHARE = 0.35
+
+
+def _mgr_contest_add(v):
+    """감독 가산(팀 전력 단위) → 선수 경합 가산 — 위 B안 주석."""
+    v = float(v or 0.0)
+    if v <= MANAGER_CONTEST_FULL_CAP:
+        return MANAGER_CONTEST_SHARE * v
+    return (MANAGER_CONTEST_SHARE * MANAGER_CONTEST_FULL_CAP
+            + MANAGER_CONTEST_EXTRA_SHARE * (v - MANAGER_CONTEST_FULL_CAP))
 _WIDE = ("LB", "RB", "LWB", "RWB", "LM", "RM", "LW", "RW")
 
 # 행동 주체 고르기 — (구역, 역할) 가중치. 역할은 GK/DEF/MID/ATT.
@@ -470,7 +495,8 @@ def _build_tab(ents, role_w, aff_table, gk_lane_c=0.0):
 class _ChainMatch:
     def __init__(self, home_lineup, away_lineup, home_boost, away_boost, home_boost_position,
                  away_boost_position, home_adv, seed, home_formation, away_formation, home_bench,
-                 away_bench, extra_time, agg_home, agg_away, home_style, away_style, player_mods=None):
+                 away_bench, extra_time, agg_home, agg_away, home_style, away_style, player_mods=None,
+                 home_str_add=0.0, away_str_add=0.0, mgr_diff=0.0, home_mgr_add=0.0, away_mgr_add=0.0):
         # 시드가 없으면 전역 random에서 시드를 하나 뽑는다 — 게임 전체 난수 흐름(세이브 재현성)과 이어지게.
         self.rng = random.Random(seed) if seed is not None else random.Random(random.getrandbits(64))
         # [G1] 선수별 카드 성향 보정 {선수 id: {"yellow_add", "red_add"}} — 내 선수 성격('폭력적') 등.
@@ -485,13 +511,36 @@ class _ChainMatch:
         self.A = _Side("away", away_lineup, as_, away_bench, away_boost, away_boost_position, away_style,
                        af, 0.0)
         self.extra_time, self.agg_home, self.agg_away = extra_time, agg_home, agg_away
-        # [A안] 팀 단위 격차 보정 — 선발 11명 평균 OVR(내 선수 포함)로 경기 시작 때 한 번 정한다.
+        # [A안] 팀 단위 격차 보정 — 선발 11명 평균(내 선수 포함)으로 경기 시작 때 한 번 정한다.
+        # [2026-11 팀 전력 정식화] OVR 그대로가 아니라 그 자리 적합도(slot_fit = AI 선발 전력과 같은 규칙)의
+        # 평균 — 제자리가 아닌 선수가 많은 팀(예: 3-5-1-1 팰리스 92.91 → 92.15)을 실제보다 강하게 보지 않는다.
+        # 포메이션 정보가 없으면(labels 없음) 예전처럼 OVR 그대로.
         for sd in (self.H, self.A):
-            _xi = [float(p.get("ovr") or 50) for p in sd.cur if p is not None]
+            try:
+                _lb = sd.labels()
+            except Exception:
+                _lb = None
+            if _lb:
+                _xi = [float(self.slot_fit(p, lb)) for p, lb in zip(sd.cur, _lb) if p is not None]
+            else:
+                _xi = [float(p.get("ovr") or 50) for p in sd.cur if p is not None]
             sd.tmean = sum(_xi) / len(_xi) if _xi else 50.0
-        _hr, _tb = team_gap_bonus_home(self.H.tmean, self.A.tmean, float(home_adv or 0.0))
+        # [2026-11 전력 기준 통일, 신민용 확정] 팀 전력 = 선발 평균 + AI 경기와 같은 가산(클럽 강도·명문).
+        # tmean은 팀 단위 계산(격차 보정·동점 압박·주포 슈팅 선택)에만 쓰인다 — 선수 개인 경합·스타 판정은
+        # 실제 OVR 그대로.
+        # [2026-11 B'안] 체인에서는 팀 전력(tmean)도 선수 경합으로 이어지므로(격차 보정 → team_add) 감독 가산을
+        # 팀 전력에도 같은 B안 변환으로 넣는다 — 3.0 초과분은 0.35. AI 공식은 4.5 그대로.
+        self.H.tmean += float(home_str_add or 0.0) + _mgr_contest_add(home_mgr_add)
+        self.A.tmean += float(away_str_add or 0.0) + _mgr_contest_add(away_mgr_add)
+        _hr, _tb = team_gap_bonus_home(self.H.tmean, self.A.tmean, float(home_adv or 0.0) + float(mgr_diff or 0.0))
         self.H.home_add = _hr      # HOME_EDGE × home_adv 대신(위 홈 이점 주석)
         self.H.team_add, self.A.team_add = _tb / 2.0, -_tb / 2.0
+        # [2026-11 팀 전력 정식화] 가상 가산의 CONTEST_STR_SHARE만큼 선수 경합에도(위 상수 주석)
+        self.H.team_add += CONTEST_STR_SHARE * float(home_str_add or 0.0)
+        self.A.team_add += CONTEST_STR_SHARE * float(away_str_add or 0.0)
+        # [2026-11] 감독 가산 — 팀 전력(위 tmean)에는 전부, 선수 경합에는 _mgr_contest_add(B안)
+        self.H.team_add += _mgr_contest_add(home_mgr_add)
+        self.A.team_add += _mgr_contest_add(away_mgr_add)
         self.stam = _Stamina(enabled=bool(STAMINA_MODEL))
         self.plog, self.pass_acc = [], {}
         self.half, self.sec, self.added = 1, 0.0, None
@@ -890,18 +939,13 @@ class _ChainMatch:
 
     # ── 교체(기존 _try_subs와 같은 판단, 실행은 데드볼에서만) ────────────
     def slot_fit(self, p, slot):
-        from constants import POSITION_COMPAT
-        compat = POSITION_COMPAT.get(p.get("position"), [p.get("position")])
-        if p.get("sub_pos") and p.get("sub_pos") == slot:
-            # [2026-10 주포·부포] 부포 슬롯 = OVR −1(로스터에 sub_pos가 붙은 클럽 선수만) — tactical_engine과 같은
-            # 규칙(v0.26.0에서 바뀐 sub_positions 명세). [2026-11 복구] v0.25.1 체인 엔진에 그대로 맞춰 넣음.
-            import sub_positions as _subp_t
-            return (p.get("ovr") or 50) - _subp_t.sub_abs_penalty(_SLOT_PEN[1])
-        try:
-            idx = compat.index(slot)
-        except ValueError:
-            idx = len(_SLOT_PEN) - 1
-        return (p.get("ovr") or 50) - _SLOT_PEN[min(idx, len(_SLOT_PEN) - 1)]
+        """그 선수를 그 자리에 뒀을 때의 유효 OVR.
+        [2026-11 팀 전력 정식화] AI 선발 전력(team_plan.lineup_strength)과 같은 함수 formation_logic._slot_value
+        — 포지션 거리 단계(3/8/15/25%) + 부포 경로 + 주발. 예전 v0.25.1 표(호환 순위 −5/−9/−13)는 v0.26.0
+        규칙과 달라 같은 선발이 AI보다 최대 0.9 약하게 계산됐다(노팅엄 LW→LM −5 vs AI ≈0).
+        쓰이는 곳: 팀 전력(tmean)과 교체 판단. 선수 개인 경합은 예전처럼 OVR 그대로."""
+        import formation_logic as _fl
+        return _fl._slot_value(p, slot)
 
     def try_subs(self, minute, free_window):
         did = False
@@ -1712,10 +1756,17 @@ def simulate_chain_match(home_lineup, away_lineup, home_boost=0.0, away_boost=0.
                          home_formation=None, away_formation=None,
                          home_bench=None, away_bench=None,
                          extra_time=False, agg_home=0, agg_away=0,
-                         home_style=None, away_style=None, player_mods=None):
+                         home_style=None, away_style=None, player_mods=None,
+                         home_str_add=0.0, away_str_add=0.0, mgr_diff=0.0, home_mgr_add=0.0, away_mgr_add=0.0):
     """tactical_engine.simulate_tactical_match과 같은 인자·같은 반환 키(+ time_info).
-    player_mods: {선수 id: {"yellow_add", "red_add"}} — 파울 1건당 카드 확률 가산(선수 성격)."""
+    home_mgr_add/away_mgr_add: [2026-11] 감독 가산(팀 전력 단위, 우위 팀에만 — constants.manager_rel_pair).
+    player_mods: {선수 id: {"yellow_add", "red_add"}} — 파울 1건당 카드 확률 가산(선수 성격).
+    home_str_add/away_str_add: [2026-11 전력 기준 통일] 선발 11명 평균에 더할 팀 전력 가산(OVR 단위) —
+      AI끼리 경기가 그 대회에서 쓰는 클럽 강도·명문 보너스 몫(tactical_engine.club_match_strength_extra).
+    mgr_diff: 감독 보정 차(홈 − 원정, 곡선 단위) — AI 경기처럼 곡선 밖에서 홈 이점과 같이 더한다.
+    셋 다 0이면 예전과 비트 단위로 같다."""
     m = _ChainMatch(home_lineup, away_lineup, home_boost, away_boost, home_boost_position,
                     away_boost_position, home_adv, seed, home_formation, away_formation, home_bench,
-                    away_bench, extra_time, agg_home, agg_away, home_style, away_style, player_mods)
+                    away_bench, extra_time, agg_home, agg_away, home_style, away_style, player_mods,
+                    home_str_add, away_str_add, mgr_diff, home_mgr_add, away_mgr_add)
     return m.run()

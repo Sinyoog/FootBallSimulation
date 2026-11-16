@@ -45,8 +45,41 @@ def _rng(salt, mid, tag):
     return random.Random(zlib.crc32(f"{tag}:{salt}:{mid}".encode("utf-8")))
 
 
+# [2026-11 성능] 감독 시장(ai_lifecycle._manager_turnover) 한 번 안에서 이 집계가 4번(자리 요구 능력 3번 +
+# 신인 능력치 1번) 똑같이 다시 돌았다 — 그 사이 선수 표(ai_players)는 바뀌지 않는다. 시장이 도는 동안
+# (tovr_scope_begin ~ end)에만, 선수 표 쓰기 세대(database.aip_generation)가 그대로일 때 직전 결과의
+# 사본을 돌려준다. 구간 밖(국가대표 감독·새 게임·화면 등)은 예전처럼 매번 계산한다.
+_TOVR_SCOPE = {"depth": 0, "gen": None, "val": None}
+
+
+def tovr_scope_begin():
+    _TOVR_SCOPE["depth"] += 1
+    if _TOVR_SCOPE["depth"] == 1:
+        _TOVR_SCOPE["gen"] = None
+        _TOVR_SCOPE["val"] = None
+
+
+def tovr_scope_end():
+    _TOVR_SCOPE["depth"] = max(0, _TOVR_SCOPE["depth"] - 1)
+    if _TOVR_SCOPE["depth"] == 0:
+        _TOVR_SCOPE["gen"] = None
+        _TOVR_SCOPE["val"] = None
+
+
 def team_ovr_map(conn):
     """팀 id → 상위 11명 평균 OVR(팀 전력 눈금)."""
+    if _TOVR_SCOPE["depth"] > 0:
+        from database import aip_generation as _aip_gen
+        if _TOVR_SCOPE["val"] is not None and _TOVR_SCOPE["gen"] == _aip_gen(watch=True):
+            return dict(_TOVR_SCOPE["val"])
+        out = _team_ovr_map_query(conn)
+        _TOVR_SCOPE["gen"] = _aip_gen(watch=True)
+        _TOVR_SCOPE["val"] = dict(out)
+        return out
+    return _team_ovr_map_query(conn)
+
+
+def _team_ovr_map_query(conn):
     out = {}
     for tid, v in conn.execute(
             """SELECT team_id, AVG(ovr) FROM (
@@ -150,7 +183,13 @@ def ability_fit_bonus(ability, job_ability):
     if ab <= 0.0 or job_ability is None:
         return 0.0
     d = ab - float(job_ability)
-    pts = _C.MANAGER_ABILITY_FIT_POINTS
+    if getattr(_C, "MANAGER_ABILITY_FIT_V2", False):
+        # [2026-11] V2 — 아래쪽 상한 없음(constants 감독 시장 재설계 ①).
+        pts = _C.MANAGER_ABILITY_FIT_POINTS_V2
+        if d <= pts[0][0]:
+            return float(pts[0][1]) - (pts[0][0] - d) * float(_C.MANAGER_ABILITY_FIT_LOW_SLOPE)
+    else:
+        pts = _C.MANAGER_ABILITY_FIT_POINTS
     if d <= pts[0][0]:
         return float(pts[0][1])
     if d >= pts[-1][0]:
@@ -159,6 +198,39 @@ def ability_fit_bonus(ability, job_ability):
         if d <= x1:
             return y0 + (y1 - y0) * (d - x0) / max(1e-9, x1 - x0)
     return float(pts[-1][1])
+
+
+def ability_floor_ok(ability, job_ability):
+    """[2026-11 상위 자리 하한] 요구 능력이 MANAGER_ABILITY_FLOOR_MIN_REQ 이상인 자리에서 능력이 요구 능력보다
+    MANAGER_ABILITY_FLOOR_GAP 넘게 낮으면 False. 능력·요구치를 모르면 True(판정 안 함)."""
+    import constants as _C
+    if not getattr(_C, "MANAGER_ABILITY_FIT_V2", False):
+        return True
+    try:
+        ab = float(ability or 0.0)
+        req = float(job_ability) if job_ability is not None else None
+    except (TypeError, ValueError):
+        return True
+    if ab <= 0.0 or req is None or req < float(_C.MANAGER_ABILITY_FLOOR_MIN_REQ):
+        return True
+    return ab >= req - float(_C.MANAGER_ABILITY_FLOOR_GAP)
+
+
+def renew_ability_mult(ability, job_ability, recent_perf):
+    """[2026-11 재계약] 능력이 요구 능력보다 MANAGER_RENEW_ABILITY_GAP 넘게 낮으면 재계약 확률 배율
+    MANAGER_RENEW_LOW_ABILITY_MULT — 최근 성적이 MANAGER_RENEW_PERF_EXEMPT 이상이면 1.0(예외)."""
+    import constants as _C
+    if not getattr(_C, "MANAGER_ABILITY_FIT_V2", False):
+        return 1.0
+    try:
+        ab = float(ability or 0.0)
+        req = float(job_ability) if job_ability is not None else None
+        rp = float(recent_perf or 0.0)
+    except (TypeError, ValueError):
+        return 1.0
+    if ab <= 0.0 or req is None or rp >= float(_C.MANAGER_RENEW_PERF_EXEMPT):
+        return 1.0
+    return float(_C.MANAGER_RENEW_LOW_ABILITY_MULT) if ab < req - float(_C.MANAGER_RENEW_ABILITY_GAP) else 1.0
 
 
 def nation_job_ability(conn, country, lv2ovr=None):

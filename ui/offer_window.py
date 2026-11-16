@@ -138,9 +138,14 @@ class OfferWindow(QDialog):
         try:
             from game_engine import contract_extra_months, get_player as _gp_cm
             _p_cm = _gp_cm() or {}
-            self._extra_months = contract_extra_months(bool(_p_cm.get("current_team_id")))
+            self._reserved = bool(_p_cm.get("current_team_id"))   # [2026-11-13] 계약 만료 연도 계산에도 쓴다
+            self._extra_months = contract_extra_months(self._reserved)
         except Exception:
+            self._reserved = False
             self._extra_months = 0
+        # [2026-11-13 신민용: "기회 1번 남으면 무조건 실패하는 것 같다"] 협상 굴림은 이 창 전용 난수를 쓴다 —
+        # 게임 전역 random(시뮬레이션이 같이 쓰는 흐름)과 섞이지 않게. 확률 자체는 예전과 같다(매 시도 동일).
+        self._neg_rng = random.Random()
         self._build()
         # 창이 만들어지는 즉시(사용자가 아무것도 안 눌러도) 저장해둔다 —
         # 그래야 이 창을 띄운 직후 바로 꺼져도 다음에 같은 상태로 복원된다.
@@ -258,8 +263,8 @@ class OfferWindow(QDialog):
             if self.grid:
                 self.cards_lay = QGridLayout(inner)
                 self.cards_lay.setSpacing(8)
-                self.cards_lay.setColumnStretch(0, 1)
-                self.cards_lay.setColumnStretch(1, 1)
+                # [2026-11-13] 카드는 폭 고정(_card_width) — 남는 가로는 오른쪽 빈 칸이 먹는다.
+                self.cards_lay.setColumnStretch(self._GRID_COLS, 1)
             else:
                 self.cards_lay = QVBoxLayout(inner)
                 self.cards_lay.setSpacing(8)
@@ -285,6 +290,13 @@ class OfferWindow(QDialog):
         close.clicked.connect(self.reject)
         root.addWidget(close)
 
+    # [2026-11-13 재설계, 신민용 요청: "오퍼창이든 입단창이든 좀 더럽다 — 세로 카드로, 1줄에 6개씩, 창은
+    # 가장 긴 카드에 맞추고 너무 길면 2줄로"] 한 줄 카드 수와 카드 폭 범위. 카드 폭은 모든 카드 중 "줄바꿈
+    # 없이 한 줄로 그렸을 때" 가장 넓은 줄에 맞추되(_card_need) 이 범위로 자르고, 그보다 긴 글자는 줄바꿈.
+    _GRID_COLS = 6
+    _CARD_W_MIN = 200
+    _CARD_W_MAX = 270
+
     def _render_cards(self):
         while self.cards_lay.count():
             item = self.cards_lay.takeAt(0)
@@ -292,35 +304,52 @@ class OfferWindow(QDialog):
         empty_slots = max(0, self.apply_slots - self._applied_count)
         # [2026-10 병역 7단계, 신민용 요청] 군팀 입대 카드는 팀 입단·오퍼 창 모두 맨 위에.
         mil = self._military_offers()
+        cards = []   # (widget, 칸 번호) — 칸 번호는 grid에서만 쓴다
+        n = self._GRID_COLS
+        for k, mo in enumerate(mil):
+            cards.append((self._make_military_card(mo), k))
+        start = -(-len(mil) // n) * n   # 군팀 줄은 따로 한 줄(이상) 차지
+        for i, offer in enumerate(self.offers):
+            cards.append((self._make_card(i, offer), start + i))
+        base = start + len(self.offers)
+        for j in range(empty_slots):
+            cards.append((self._make_apply_slot_card(), base + j))
+        w = self._card_width([c for c, _k in cards])
+        top = Qt.AlignmentFlag.AlignTop
+        for c, k in cards:
+            c.setFixedWidth(w)
+            if self.grid:
+                row, col = divmod(k, n)
+                self.cards_lay.addWidget(c, row, col, top | Qt.AlignmentFlag.AlignLeft)
+            else:
+                self.cards_lay.addWidget(c, 0, Qt.AlignmentFlag.AlignHCenter)
         if self.grid:
-            for k, mo in enumerate(mil):
-                row, col = divmod(k, 2)
-                self.cards_lay.addWidget(self._make_military_card(mo), row, col)
-            start = len(mil) + (len(mil) % 2)   # 군팀 줄은 따로 한 줄 차지
-            for i, offer in enumerate(self.offers):
-                row, col = divmod(start + i, 2)
-                self.cards_lay.addWidget(self._make_card(i, offer), row, col)
-            base = start + len(self.offers)
-            for j in range(empty_slots):
-                row, col = divmod(base + j, 2)
-                self.cards_lay.addWidget(self._make_apply_slot_card(), row, col)
             self.cards_lay.setRowStretch(self.cards_lay.rowCount(), 1)
         else:
-            for mo in mil:
-                self.cards_lay.addWidget(self._make_military_card(mo))
-            for i, offer in enumerate(self.offers):
-                self.cards_lay.addWidget(self._make_card(i, offer))
-            for j in range(empty_slots):
-                self.cards_lay.addWidget(self._make_apply_slot_card())
             self.cards_lay.addStretch()
         self._fit_width()
 
+    def _card_width(self, cards) -> int:
+        """모든 카드 공통 폭 — 가장 긴 카드 줄(한 줄로 그렸을 때 폭)에 맞추고 _CARD_W_MIN~MAX로 자른다.
+        화면이 좁으면 6장이 한 화면에 들어가는 폭까지 줄이되 _CARD_W_MIN 아래로는 안 내린다(그땐 가로 스크롤)."""
+        need = max([getattr(c, "_card_need", 0) for c in cards] or [0])
+        cap = self._CARD_W_MAX
+        try:
+            scr = self.screen() or (self.parentWidget().screen() if self.parentWidget() else None)
+            if scr is not None and self.grid:
+                sp = self.cards_lay.spacing() if hasattr(self, "cards_lay") else 8
+                cap = min(cap, (scr.availableGeometry().width() - 110 - sp * (self._GRID_COLS - 1))
+                          // self._GRID_COLS)
+        except RuntimeError:
+            pass
+        return int(max(self._CARD_W_MIN, min(cap, need)))
+
     def _fit_width(self):
         """[2026-11 신설, 신민용 리포트: "오퍼 창 가로 길이가 안의 글자에 맞춰 커지게 — 지금은 카드 오른쪽이 잘린다"]
-        카드 줄(연봉·이적료·계약, 팀 평균 OVR 등)이 가장 긴 카드의 글자 폭만큼 창 가로를 넓힌다. 카드 안 글자는
-        줄바꿈하지 않는 라벨이라 내용 영역의 최소 폭(minimumSizeHint)이 곧 "안 잘리는 폭"이다 — 거기에 세로
-        스크롤바·여백만큼 더한다. 넓히기만 하고 줄이지는 않는다(사용자가 키운 창, 협상 뒤 다시 그릴 때 들쭉날쭉
-        방지). 화면보다 넓어야 하면 화면 폭까지만 키우고 나머지는 예전처럼 가로 스크롤."""
+        카드 줄 전체 폭(카드 폭은 _card_width로 모두 같다)만큼 창 가로를 넓힌다 — 내용 영역의 최소 폭
+        (minimumSizeHint)에 세로 스크롤바·여백만큼 더한다. [2026-11-13] 세로 카드가 되면서 세로도 같은 식으로
+        (화면 높이까지) 넓힌다. 넓히기만 하고 줄이지는 않는다(사용자가 키운 창, 협상 뒤 다시 그릴 때 들쭉날쭉
+        방지). 화면보다 커야 하면 화면 크기까지만 키우고 나머지는 스크롤."""
         scroll = getattr(self, "_scroll", None)
         inner = getattr(self, "_inner", None)
         if scroll is None or inner is None:
@@ -335,10 +364,22 @@ class OfferWindow(QDialog):
             scr = self.screen() or (self.parentWidget().screen() if self.parentWidget() else None)
             if scr is not None:
                 want = min(want, scr.availableGeometry().width() - 40)
-            if want > self.width():
-                self.resize(want, self.height())
+            want_h = self.height()
+            _hdr = self.height() - scroll.height()   # 제목·닫기 버튼 등 스크롤 밖 높이
+            _need_h = inner.sizeHint().height() + _hdr + 2 * scroll.frameWidth() + 4
+            if scr is not None:
+                _need_h = min(_need_h, scr.availableGeometry().height() - 60)
+            if _need_h > want_h and self.isVisible():
+                want_h = _need_h
+            if want > self.width() or want_h > self.height():
+                self.resize(max(want, self.width()), want_h)
         except RuntimeError:
             pass
+
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        # 처음 뜰 때 세로 크기는 레이아웃이 실제 높이를 가진 뒤에야 잴 수 있다.
+        QTimer.singleShot(0, self._fit_width)
 
     # ── [2026-10 병역 시스템 7단계] 20세부터 오퍼 아래에 군팀 2곳 ──────────────
     def _military_offers(self):
@@ -410,6 +451,8 @@ class OfferWindow(QDialog):
         btn.setEnabled(left > 0)
         btn.clicked.connect(self._open_apply_search)
         lay.addWidget(btn)
+        btn.ensurePolished()
+        card._card_need = btn.sizeHint().width() + 26   # [2026-11-13] 카드 공통 폭 재료
         return card
 
     def _open_team_info(self, tid, tname):
@@ -459,167 +502,262 @@ class OfferWindow(QDialog):
             self._persist()
         self._render_cards()
 
+    # ── [2026-11-13 재설계] 세로 오퍼 카드 ─────────────────────────────────────
+    # 신민용 요청 순서: 팀 이름 | 리그명 | 최근 성적 버튼 | 팀 평균 OVR | 연봉 | 이적료 | 계약 날짜 | 팀에서
+    # 원하는 역할 | 지난 시즌 성적 | 연봉 협상 | 기간 협상 | 기간 합의 완료 | 입단. 맨 위 국기 이모지는 뺀다.
+    _GRADE_COLOR = {"SS": "#ff4488", "S": "#ff9900", "A": "#ffcc00", "B": "#00ccff", "C": "#00ff66"}
+    # 지난 시즌 결과 → (표시 글자, 색). 색은 세계 기록실(world_browser.league_text_color)과 같은 계열.
+    _SEASON_RESULT = {
+        "promo":      ("직행 승격",     "#4da6ff"),
+        "po_promo":   ("승강 PO 승격",  "#4da6ff"),
+        "releg":      ("직행 강등",     "#ff5555"),
+        "po_releg":   ("승강 PO 강등",  "#ff5555"),
+        "po_fail":    ("승격 PO 탈락",  "#ffa040"),
+        "po_survive": ("강등 PO 생존",  "#ff9e9e"),
+    }
+
+    @staticmethod
+    def _measured(widget, need: list, extra: int = 0):
+        """줄바꿈을 켜기 전(한 줄일 때) 폭을 재서 need에 넣는다 — 카드 공통 폭(_card_width)의 재료."""
+        widget.ensurePolished()
+        need.append(widget.sizeHint().width() + extra)
+        return widget
+
+    def _wrap_label(self, text, style, need, align=None, rich=False, extra=0):
+        lb = QLabel(text)
+        lb.setTextFormat(Qt.TextFormat.RichText if rich else Qt.TextFormat.PlainText)
+        lb.setStyleSheet(style)
+        if align is not None:
+            lb.setAlignment(align)
+        self._measured(lb, need, extra)
+        lb.setWordWrap(True)
+        return lb
+
+    def _game_week_year(self):
+        try:
+            from game_engine import get_state
+            st = get_state() or {}
+            return int(st.get("current_week") or 1), int(st.get("current_year") or 0)
+        except Exception:
+            return 1, 0
+
+    def _contract_end_year(self, yrs: int):
+        """계약 N년의 만료 연도 — game_engine.join_team 규칙과 같다(그 해 시즌이 끝날 때 만료).
+          무소속(즉시 입단): 프리시즌(1~3주) 체결이면 올해가 1년차 → 올해+N-1, 그 뒤면 올해+N.
+          소속팀 있음(예약 이적): 2주 이동이면 올해+N-1, 27주 이동이면 올해+N, 시즌 뒤(45주~)에
+          수락하면 다음 해 2주 이동 → 다음 해+N-1 = 올해+N."""
+        week, year = self._game_week_year()
+        if not year:
+            return None
+        from constants import SEASON_PHASES, MY_PRESEASON_MOVE_WEEK, MY_WINTER_MOVE_WEEK
+        if getattr(self, "_reserved", False):
+            if week < MY_PRESEASON_MOVE_WEEK:
+                return year + yrs - 1
+            if week < MY_WINTER_MOVE_WEEK:
+                return year + yrs
+            return year + yrs
+        return year + yrs - 1 if week <= SEASON_PHASES["preseason1"][1] else year + yrs
+
+    def _last_season_result(self, team_id):
+        """지난(끝난) 시즌 리그 성적 — 리그가 끝난 뒤(44주~)면 올해, 아니면 작년. 창마다 팀별로 1번만 계산."""
+        cache = self.__dict__.setdefault("_season_res_cache", {})
+        if team_id in cache:
+            return cache[team_id]
+        res = None
+        week, year = self._game_week_year()
+        if team_id is not None and year:
+            from constants import SEASON_PHASES
+            y = year if week >= SEASON_PHASES["postseason"][0] else year - 1
+            try:
+                from world_browser import get_team_season_result
+                res = get_team_season_result(team_id, y)
+                if res is not None:
+                    res["year"] = y
+            except Exception:
+                res = None
+        cache[team_id] = res
+        return res
+
+    def _kv_row(self, grid, r, key, value, need, val_style="color:#dddddd;font-size:12px;",
+                rich=False, tip=""):
+        # [2026-11-13 신민용: "좌측 칸 가운데 정렬, 색을 굳이 회색으로 할 필요 없다"] 키 칸은 값(두 줄일 수
+        # 있음) 높이 기준 가운데, 글자색은 본문과 같은 밝은 색.
+        k = QLabel(key)
+        k.setStyleSheet("color:#d8d8d8;font-size:11px;font-weight:bold;")
+        k.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._measured(k, [])
+        kw = k.sizeHint().width()
+        v = self._wrap_label(value, val_style, need, rich=rich, extra=kw + 10)
+        v.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+        if tip:
+            k.setToolTip(tip); v.setToolTip(tip)
+        grid.addWidget(k, r, 0)
+        grid.addWidget(v, r, 1)
+
     def _make_card(self, idx, offer):
         card = QFrame(); card.setObjectName("offerCard")
-        lay  = QVBoxLayout(card); lay.setContentsMargins(12,10,12,10); lay.setSpacing(5)
+        lay  = QVBoxLayout(card); lay.setContentsMargins(12, 12, 12, 12); lay.setSpacing(6)
+        need: list = []
+        center = Qt.AlignmentFlag.AlignHCenter
 
-        # ── 행1: 팀명 + 등급 + 티어 ──────────────────────────
-        h1 = QHBoxLayout(); h1.setSpacing(6)
-        tl = QLabel(f"{offer['flag']}  {offer['team_name']}")
-        tl.setStyleSheet("font-size:14px;font-weight:bold;color:#e0e0e0;")
-        gl  = QLabel(f"[{offer['grade']}급]"); gl.setObjectName(f"grade_{offer['grade']}")
-        trl = QLabel(f"{offer['tier']}부");    trl.setObjectName(f"tier{offer['tier']}")
-        h1.addWidget(tl); h1.addWidget(gl); h1.addWidget(trl)
-        _zone = offer.get("_zone")
-        _zone_txt = {"domestic": "🏠 자국", "prev_league": "🏟 직전리그",
-                     "hometown": "🌍 고향", "foreign": "✈ 해외",
-                     "applied": "🔎 직접 지원", "youth_scout": "🌟 유스 스카우트"}.get(_zone)
+        # ── 팀 이름 (국기 이모지 없이) + 등급·구분 배지 ──────────────────────
+        lay.addWidget(self._wrap_label(offer.get("team_name", ""),
+                                       "font-size:15px;font-weight:bold;color:#f0f0f0;", need, center))
+        _g = offer.get("grade") or ""
+        _zone_txt = {"domestic": "자국", "prev_league": "직전 리그", "hometown": "고향", "foreign": "해외",
+                     "applied": "직접 지원", "youth_scout": "유스 스카우트"}.get(offer.get("_zone"))
+        _badge = []
+        if _g:
+            _badge.append(f"<span style='color:{self._GRADE_COLOR.get(_g, '#aaaaaa')};font-weight:bold'>"
+                          f"{_g}급</span>")
         if _zone_txt:
-            zl = QLabel(_zone_txt)
-            zl.setStyleSheet("color:#888; font-size:10px; background:#2a2a2a;"
-                             "border-radius:3px; padding:1px 5px;")
-            h1.addWidget(zl)
-        h1.addStretch()
-        # [2026-08 신설, 신민용 요청: "입단/오퍼 창을 띄운 채로 팀 작년
-        # 성적 같은 걸 비교하고 싶다"] 이 창은 exec()로 열려 진행(next day)을
-        # 막는 용도라 dlg.exec() 자체는 그대로 두되(그 목적은 시간 진행
-        # 정합성 문제라 여기와 무관), 카드마다 이 버튼으로 그 팀의 세계
-        # 기록실(WorldBrowserWindow, 비모달)을 새로 띄워서 열어둔 채 계속
-        # 비교할 수 있게 한다 — 창을 닫지 않아도 됨.
+            _badge.append(f"<span style='color:#888888'>{_zone_txt}</span>")
+        if _badge:
+            lay.addWidget(self._wrap_label("<span style='color:#555'> · </span>".join(_badge),
+                                           "font-size:10px;", need, center, rich=True))
+
+        # ── 리그명 (나라 › 리그 (N부)) — 길면 두 줄 ─────────────────────────
+        from html import escape as _esc
+        _lg = (f"<span style='color:#aaddff;font-weight:bold'>{_esc(offer.get('country', ''))}</span>"
+               f"<span style='color:#555555'> › </span>"
+               f"<span style='color:#cccccc'>{_esc(offer.get('league_name', ''))}</span>"
+               f"<span style='color:#888888'> ({offer.get('tier', '?')}부)</span>")
+        lay.addWidget(self._wrap_label(_lg, "font-size:11px;", need, center, rich=True))
+
+        # ── 📊 최근 성적 — 이 창을 띄운 채 그 팀 세계 기록실(비모달)을 연다 ────────
         info_btn = QPushButton("📊 최근 성적")
         info_btn.setObjectName("infoBtn")
         info_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         info_btn.clicked.connect(
             lambda _, tid=offer.get("team_id"), tname=offer.get("team_name"):
                 self._open_team_info(tid, tname))
-        h1.addWidget(info_btn)
-        lay.addLayout(h1)
+        lay.addWidget(self._measured(info_btn, need))
 
-        # ── 행2: 국가 | 리그명 (분리) ────────────────────────
-        h2 = QHBoxLayout(); h2.setSpacing(0)
-        country_flag = offer.get("flag", "")
-        country_name = offer.get("country", "")
-        league_name  = offer.get("league_name", "")
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color:#333333;background:#333333;max-height:1px;border:none;")
+        lay.addWidget(sep)
 
-        country_lbl = QLabel(f"{country_flag} {country_name}")
-        country_lbl.setStyleSheet(
-            "color:#aaddff; font-size:11px; font-weight:bold;"
-            "background:#1a2a3a; border-radius:3px; padding:1px 5px;")
-        sep_lbl = QLabel("  ›  ")
-        sep_lbl.setStyleSheet("color:#555555; font-size:11px;")
-        league_lbl = QLabel(f"🏆 {league_name}")
-        league_lbl.setStyleSheet("color:#cccccc; font-size:11px;")
-        h2.addWidget(country_lbl); h2.addWidget(sep_lbl); h2.addWidget(league_lbl)
-        # [2026-08 신설, 신민용 요청: "난이도 쉬움일 때는 팀 입단에서 그
-        # 팀의 현재 OVR도 보여달라"] 어려움/보통 난이도는 "누가 강팀인지"
-        # 정보를 최대한 숨기는 기존 설계(apply_window.py의 평균OVR 컬럼도
-        # 어려움에서만 뺌)와 다르게, 여기는 쉬움 전용으로 한정한다 — 오퍼
-        # 자체에 이미 team_avg_ovr이 계산돼 있어(game_engine._enrich_offer)
-        # 재조회 없이 바로 쓴다.
+        # ── 키: 값 줄들 ────────────────────────────────────────────────────
+        kv = QGridLayout(); kv.setHorizontalSpacing(10); kv.setVerticalSpacing(5)
+        kv.setColumnStretch(1, 1)
+        r = 0
+        # [2026-08 신설] 쉬움 난이도 전용 — 팀 평균 OVR(오퍼에 이미 계산돼 있음).
         if get_difficulty() == "easy" and offer.get("team_avg_ovr") is not None:
-            ovr_lbl = QLabel(f"⚽ 팀 평균 OVR {offer['team_avg_ovr']:.1f}")
-            ovr_lbl.setStyleSheet(
-                "color:#ffd700; font-size:11px; font-weight:bold;"
-                "background:#332b00; border-radius:3px; padding:1px 5px; margin-left:6px;")
-            h2.addWidget(ovr_lbl)
-        h2.addStretch()
-        lay.addLayout(h2)
-
-        # ── 행3: 연봉 + 이적료 + 계약 기간 ────────────────────
-        # [2026-08 수정, 신민용 확정] 예전엔 카드를 다시 그릴 때마다
-        # _calc_contract_years를 매번 새로 굴려서 협상 버튼을 누를 때마다
-        # 계약 기간 표시가 조용히 랜덤으로 바뀌었다 — 이제 __init__에서
-        # 1회만 굴려 고정한 self.offer_years[idx]만 읽는다(기간 협상으로만
-        # 바뀜). 나이 기반 자동 '희망 연도' 추정도 없앴다 — 목표는 아래
-        # 콤보박스에서 플레이어가 직접 고른다.
-        from constants import CONTRACT_YEARS_MIN, CONTRACT_YEARS_MAX
-        c_yrs = self.offer_years[idx]
-        h3 = QHBoxLayout(); h3.setSpacing(8)
+            self._kv_row(kv, r, "OVR", f"{offer['team_avg_ovr']:.1f}", need,
+                         "color:#ffd700;font-size:12px;font-weight:bold;"); r += 1
         _sal = self.offer_salaries[idx]
-        _sal_txt = "💰 무급" if _sal == 0 else (
-            f"💰 연 {fmt_money(_sal)}  [주 {fmt_money(max(1, _sal // 52))}]")
-        sl = QLabel(_sal_txt)
-        sl.setStyleSheet("color:#00cc44;")
-        h3.addWidget(sl)
-        # [2026-07 신설] 이적료 표시 — 무소속(FA) 지원이면 0이라 아예 안
-        # 보여주고, 계약 중인데 오퍼가 왔으면(=유료 이적) 표시한다.
+        # [2026-11-13 신민용] "연 5.1천만원 / (주 98만원)" 두 줄로 — 저절로 줄바꿈되면 괄호 중간에서 끊겼다.
+        _sal_txt = "무급" if _sal == 0 else f"연 {fmt_money(_sal)}\n(주 {fmt_money(max(1, _sal // 52))})"
+        self._kv_row(kv, r, "연봉", _sal_txt, need, "color:#00cc44;font-size:12px;font-weight:bold;"); r += 1
+        # [2026-07] 이적료 — 무소속(FA)이면 0이라 줄 자체를 안 그린다.
         _fee = offer.get("transfer_fee", 0)
         if _fee:
-            fl = QLabel(f"🔄 이적료 {fmt_money(_fee)}")
-            fl.setStyleSheet("color:#66aaff; font-size:11px;")
-            h3.addWidget(fl)
-        # [2026-08 수정, 신민용 확정: "내가 기간을 직접 입력(선택)하고
-        # 협상해야 맞지"] 나이 기반 자동 '희망 연도' 추정 및 그 표시를
-        # 없앴다 — 목표 연수는 아래 콤보박스에서 플레이어가 직접 고른다.
-        cl = QLabel(f"📋 {self._yrs_text(c_yrs)} 계약")
+            self._kv_row(kv, r, "이적료", fmt_money(_fee), need, "color:#66aaff;font-size:12px;"); r += 1
+        # [2026-08] 계약 기간은 self.offer_years[idx](오퍼 생성 때 1회 고정, 기간 협상으로만 바뀜).
+        # [2026-11-13 신민용 요청: "계약 날짜 — 기간 합의 완료하면 위에 표시된 날짜도 바뀌어야"] 만료 연도를
+        # 같이 보여주고, 카드는 협상마다 다시 그려지므로 합의된 기간이 곧바로 반영된다.
+        c_yrs = self.offer_years[idx]
+        _end = self._contract_end_year(c_yrs)
+        _ctr = self._yrs_text(c_yrs) + (f" · {_end}년 만료" if _end else "")
+        _ctip = f"{_end}년 시즌이 끝나면 계약이 끝납니다" if _end else ""
         if self._extra_months:
-            cl.setToolTip(f"이번 시즌 남은 기간({self._extra_months}개월) + {c_yrs}년 — "
-                          "시즌 도중 합류라 올해 남은 기간이 계약에 더해집니다")
-        cl.setStyleSheet("color:#ffcc44; font-size:11px;")
-        h3.addStretch(); h3.addWidget(cl)
-        # [2026-10 신설, 신민용 요청: "구단에서 이 선수를 뽑을 때 역할 기준도 표시 — 연봉·계약 줄에, 연봉 계약
-        # 역할 순서로"] 오퍼의 역할(game_engine._enrich_offer가 정한 입단 기용 계획)은 원래부터 입단 시
-        # 적용되고 있었는데(벤치 배율·감독 관계 초기값 등) 화면엔 없었다. 입단 후 실제 출전에 따라 바뀔 수 있다.
+            _ctip += (f"\n이번 시즌 남은 기간({self._extra_months}개월) + {c_yrs}년 — "
+                      "시즌 도중 합류라 올해 남은 기간이 계약에 더해집니다")
+        self._kv_row(kv, r, "계약", _ctr, need, "color:#ffcc44;font-size:12px;", tip=_ctip.strip()); r += 1
+        # [2026-10] 팀에서 원하는 역할 — 입단 시 기준(활약에 따라 바뀔 수 있음).
         _role = offer.get("role")
         if _role:
             from constants import OFFER_ROLES
-            rl = QLabel(f"🎯 {_role}")
-            rl.setToolTip((OFFER_ROLES.get(_role, {}).get("desc") or "")
-                          + " — 입단 시 기준이며, 팀에서의 활약에 따라 달라질 수 있습니다")
-            rl.setStyleSheet("color:#88ccff; font-size:11px;")
-            h3.addWidget(rl)
-        lay.addLayout(h3)
+            self._kv_row(kv, r, "역할", _role, need, "color:#88ccff;font-size:12px;",
+                         tip=(OFFER_ROLES.get(_role, {}).get("desc") or "")
+                         + " — 입단 시 기준이며, 팀에서의 활약에 따라 달라질 수 있습니다"); r += 1
+        lay.addLayout(kv)
 
-        # ── 행4: 성적 ─────────────────────────────────────────
-        rank_info = offer.get("rank_info", "")
-        if rank_info:
-            lines = rank_info.split("\n")
-            rank_lbl = QLabel(f"📊 {lines[0]}")
-            rank_lbl.setStyleSheet("color:#aaaaaa; font-size:11px;")
-            lay.addWidget(rank_lbl)
-            if len(lines) > 1:
-                promo_lbl = QLabel(f"   {lines[1].strip()}")
-                promo_lbl.setStyleSheet("color:#888866; font-size:10px;")
-                lay.addWidget(promo_lbl)
+        # ── 지난 시즌 성적 — 순위 + 직행/PO 승격·강등 색 ─────────────────────────
+        # [2026-11-13 신민용 요청: "승격 (EFL 챔피언십)만 뜨는데 성적도 — 직행이면 파란색 순위, 승강 플레이오프면
+        # 그에 맞게, 강등도"] 예전 rank_info 글자(오퍼 생성 때 만든 것)는 이 팀이 그 시즌 다른 리그에 있었으면
+        # 승격/강등 사실만 남았다. 이제 세계 기록실과 같은 계산으로 그 시즌 실제로 뛴 리그의 순위를 직접 구한다.
+        res = self._last_season_result(offer.get("team_id"))
+        ttl = QLabel("지난 시즌" if not res else f"지난 시즌 ({res['year']})")
+        ttl.setStyleSheet("color:#888888;font-size:11px;")
+        lay.addWidget(ttl)
+        if res:
+            _tag, _col = self._SEASON_RESULT.get(res.get("result") or "", ("", "#dddddd"))
+            if res.get("champion"):
+                _tag, _col = "리그 우승", "#ffd700"
+            lay.addWidget(self._wrap_label(
+                f"{_esc(res.get('league_name') or '')} ({res.get('league_tier')}부)",
+                "color:#aaaaaa;font-size:11px;", need))
+            _line = (f"<span style='color:{_col};font-weight:bold;font-size:13px'>{res['rank']}위</span>"
+                     f"<span style='color:#777777'> / {res.get('teams') or '?'}팀</span>")
+            _rec = res.get("record")
+            if _rec:
+                _line += f"<span style='color:#aaaaaa'>  ·  {_esc(_rec)}"
+                if res.get("pts") is not None:
+                    _line += f" {res['pts']}점"
+                _line += "</span>"
+            lay.addWidget(self._wrap_label(_line, "font-size:11px;", need, rich=True))
+            if _tag:
+                _dest = res.get("dest")
+                lay.addWidget(self._wrap_label(
+                    f"<span style='color:{_col};font-weight:bold'>{_tag}</span>"
+                    + (f"<span style='color:#888888'> → {_esc(_dest)}</span>" if _dest else ""),
+                    "font-size:11px;", need, rich=True))
+        else:
+            _ri = (offer.get("rank_info") or "").split("\n")[0].strip()
+            lay.addWidget(self._wrap_label(_ri or "기록 없음", "color:#888888;font-size:11px;", need))
+        # 겨울(시즌 도중) 오퍼면 이번 시즌 지금까지 성적(오퍼 생성 때 만든 rank_info)도 아래에 작게.
+        _wk, _yr = self._game_week_year()
+        from constants import FIRST_HALF_START, SEASON_PHASES as _SP
+        if FIRST_HALF_START < _wk <= _SP["second_half"][1]:
+            _cur = (offer.get("rank_info") or "").split("\n")[0].strip()
+            if _cur and "작년" not in _cur:
+                lay.addWidget(self._wrap_label(f"이번 시즌  {_cur}", "color:#777777;font-size:10px;", need))
 
-        h3 = QHBoxLayout()
+        lay.addStretch(1)
+        sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.HLine)
+        sep2.setStyleSheet("color:#333333;background:#333333;max-height:1px;border:none;")
+        lay.addWidget(sep2)
+
+        # ── 협상·입단 버튼 ─────────────────────────────────────────────────
+        from constants import CONTRACT_YEARS_MIN, CONTRACT_YEARS_MAX
         failed   = idx in self.neg_failed
         neg_left = self.neg_used.get(idx, 0)
         is_safe  = bool(offer.get("safe")) and self._force
-        # [2026-08 신설] 기간 협상은 연봉 협상과 완전히 독립된 트랙.
-        # 목표 연수는 플레이어가 콤보박스로 직접 고른 self.years_target.
+        # [2026-08] 기간 협상은 연봉 협상과 완전히 독립된 트랙 — 목표는 콤보박스로 직접 고른 years_target.
         years_failed = idx in self.years_failed
         years_left   = self.years_used.get(idx, 0)
         target_yrs   = self.years_target.get(idx, c_yrs)
         years_agreed = (c_yrs == target_yrs)
-
-        # 최종 계약은 "연봉·기간 둘 다 결렬 없이" 끝나야 성사된다 — 둘 중
-        # 하나라도 마지막 시도에서 실패하면 이 오퍼 전체가 결렬(안전망
-        # 오퍼는 예외적으로 결렬돼도 입단 가능).
-        join_btn = QPushButton(("✅ 입단" if self.lang=="ko" else "✅ Join")
-                                + (" (보장)" if is_safe and self.lang=="ko" else
-                                   " (Guaranteed)" if is_safe else ""))
-        join_btn.setObjectName("selectBtn")
-        join_btn.setEnabled(is_safe or not (failed or years_failed))
-        join_btn.clicked.connect(lambda _, i=idx: self._select(i))
+        # [2026-11-13 신민용: "기회 1번 남으면 무조건 실패하는 것 같다 — 성공 확률은 이전이랑 같아야"] 코드상
+        # 마지막 기회도 똑같은 확률로 굴린다(_negotiate). 쉬움 난이도에선 회당 성공 확률을 버튼에 같이 보여준다.
+        _easy = get_difficulty() == "easy"
+        _pct = ""
+        if _easy:
+            from game_engine import negotiation_success_prob
+            _pct = f" · {round(negotiation_success_prob(self._offer_join_prob(idx)) * 100)}%"
+        _ptip = "회당 성공 확률은 매 시도 같습니다(마지막 기회도 동일)." if _easy else ""
+        # [2026-11-13 신민용: "어려움은 협상 남은 기회도 안 뜨게 — 기간 협상도"] 어려움에선 남은 횟수를 숨긴다.
+        _hard = get_difficulty() == "hard"
+        _neg_cnt = "" if _hard else f" ({neg_left}회{_pct})"
+        _yrs_cnt = "" if _hard else f" ({years_left}회{_pct})"
 
         if failed:
-            neg_btn = QPushButton("❌ 협상 결렬 (연봉 유지)" if is_safe else "❌ 협상 결렬")
+            neg_btn = QPushButton("❌ 연봉 협상 결렬 (연봉 유지)" if is_safe else "❌ 연봉 협상 결렬")
             neg_btn.setObjectName("negBtn"); neg_btn.setEnabled(False)
         else:
-            neg_btn = QPushButton(f"💬 연봉 협상 ({neg_left}회)")
+            neg_btn = QPushButton(f"💬 연봉 협상{_neg_cnt}")
             neg_btn.setObjectName("negBtn")
             neg_btn.setEnabled(neg_left > 0)
             neg_btn.clicked.connect(lambda _, i=idx: self._negotiate(i))
+            if _ptip:
+                neg_btn.setToolTip(_ptip)
+        lay.addWidget(self._measured(neg_btn, need))
 
-        h3.addWidget(join_btn); h3.addWidget(neg_btn); h3.addStretch()
-        lay.addLayout(h3)
-
-        # ── 행5: 기간 협상 — 목표 연수 선택(콤보박스, 1~6년) + 협상 버튼 ──
+        # 희망 기간(콤보) — [2026-10] 병역 미필 + 해외 구단 → 30세 시즌까지만.
         h4 = QHBoxLayout(); h4.setSpacing(6)
         target_combo = QComboBox()
         target_combo.setObjectName("yearsCombo")
-        # [2026-10 신민용 확정] 병역 미필 + 해외 구단 → 30세 시즌까지만 계약 가능(희망 기간도 그 안에서).
         _ymax = CONTRACT_YEARS_MAX
         try:
             from game_engine import _my_contract_years_cap
@@ -633,26 +771,51 @@ class OfferWindow(QDialog):
         target_combo.setCurrentIndex(max(0, min(target_yrs, _ymax) - CONTRACT_YEARS_MIN))
         if _ycap is not None:
             target_combo.setToolTip("병역 미필 — 해외 구단과는 30세 시즌까지만 계약할 수 있습니다")
-        # 결렬됐으면 목표를 더 바꿔봐야 소용없으니 잠가둔다.
-        target_combo.setEnabled(not years_failed)
+        target_combo.setEnabled(not years_failed)   # 결렬됐으면 목표를 바꿔도 소용없다
         target_combo.currentIndexChanged.connect(
             lambda _, i=idx, cb=target_combo: self._on_years_target_changed(i, cb))
-        h4.addWidget(QLabel("🎯 희망:"))
-        h4.addWidget(target_combo)
+        _hl = QLabel("희망 기간")
+        _hl.setStyleSheet("color:#888888;font-size:11px;")
+        h4.addWidget(_hl); h4.addWidget(target_combo, 1)
+        self._measured(_hl, [])
+        self._measured(target_combo, [])
+        need.append(_hl.sizeHint().width() + target_combo.sizeHint().width() + 6)
+        lay.addLayout(h4)
 
         if years_failed:
             yrs_btn = QPushButton("❌ 기간 협상 결렬 (기간 유지)" if is_safe else "❌ 기간 협상 결렬")
             yrs_btn.setObjectName("negBtn"); yrs_btn.setEnabled(False)
-        elif years_agreed:
-            yrs_btn = QPushButton("✅ 기간 합의 완료")
-            yrs_btn.setObjectName("negBtn"); yrs_btn.setEnabled(False)
         else:
-            yrs_btn = QPushButton(f"📋 기간 협상 ({years_left}회)")
+            yrs_btn = QPushButton(f"📋 기간 협상{_yrs_cnt}")
             yrs_btn.setObjectName("negBtn")
-            yrs_btn.setEnabled(years_left > 0)
+            yrs_btn.setEnabled(years_left > 0 and not years_agreed)
             yrs_btn.clicked.connect(lambda _, i=idx: self._negotiate_years(i))
-        h4.addWidget(yrs_btn); h4.addStretch()
-        lay.addLayout(h4)
+            if _ptip:
+                yrs_btn.setToolTip(_ptip)
+        lay.addWidget(self._measured(yrs_btn, need))
+
+        # 기간 합의 상태 — 합의되면 초록, 아니면 지금 제시/희망 기간을 흐리게.
+        if years_failed:
+            _st, _sc = "기간 협상 결렬", "color:#cc5555;background:#2a1a1a;"
+        elif years_agreed:
+            _st, _sc = "✅ 기간 합의 완료", "color:#66dd88;background:#1a2a1e;"
+        else:
+            _st = f"기간 합의 전 (제시 {self._yrs_text(c_yrs)} / 희망 {self._yrs_text(target_yrs)})"
+            _sc = "color:#777777;background:#222222;"
+        st_lbl = self._wrap_label(_st, _sc + "border:1px solid #333;border-radius:4px;padding:4px;"
+                                  "font-size:11px;", need, center)
+        lay.addWidget(st_lbl)
+
+        # 최종 계약은 "연봉·기간 둘 다 결렬 없이" 끝나야 성사(안전망 오퍼는 결렬돼도 입단 가능).
+        join_btn = QPushButton(("✅ 입단" if self.lang == "ko" else "✅ Join")
+                               + (" (보장)" if is_safe and self.lang == "ko" else
+                                  " (Guaranteed)" if is_safe else ""))
+        join_btn.setObjectName("selectBtn")
+        join_btn.setEnabled(is_safe or not (failed or years_failed))
+        join_btn.clicked.connect(lambda _, i=idx: self._select(i))
+        lay.addWidget(self._measured(join_btn, need))
+
+        card._card_need = max(need or [0]) + 24 + 2
         return card
 
     def _on_years_target_changed(self, idx, combo):
@@ -680,11 +843,11 @@ class OfferWindow(QDialog):
             return
         self.neg_used[idx] -= 1
         old_sal = self.offer_salaries[idx]
-        delta   = random.randint(10, 30)
+        delta   = self._neg_rng.randint(10, 30)
         # [2026-08 재설계] 성공확률도 고정값이 아니라 실제 입단 성공확률
         # (join_prob) 기반 — 직접 지원 화면의 "성공 가능성"과 같은 기준.
         from game_engine import negotiation_success_prob
-        success = random.random() < negotiation_success_prob(self._offer_join_prob(idx))
+        success = self._neg_rng.random() < negotiation_success_prob(self._offer_join_prob(idx))
 
         if success:
             new_sal = int(old_sal * (1 + delta/100))
@@ -702,7 +865,8 @@ class OfferWindow(QDialog):
                 _record_team_offer_cooldown(self.offers[idx]["team_id"])
                 show_toast(self, "❌ 협상 결렬  입단 불가", "#cc0000", 1400)
             else:
-                show_toast(self, f"협상 실패  남은 기회: {self.neg_used[idx]}회", "#cc4400", 1200)
+                show_toast(self, "협상 실패" if get_difficulty() == "hard"   # 어려움: 남은 횟수 숨김
+                           else f"협상 실패  남은 기회: {self.neg_used[idx]}회", "#cc4400", 1200)
 
         self._after_negotiate_round()
 
@@ -724,7 +888,7 @@ class OfferWindow(QDialog):
         tier    = self.offers[idx].get("tier", 3)
         delta   = _contract_years_neg_delta(tier)
         # [2026-08 재설계] 연봉 협상과 동일하게 실제 입단 성공확률 기반.
-        success = random.random() < negotiation_success_prob(self._offer_join_prob(idx))
+        success = self._neg_rng.random() < negotiation_success_prob(self._offer_join_prob(idx))
 
         if success and old_yrs != target:
             direction = 1 if target > old_yrs else -1
@@ -747,7 +911,8 @@ class OfferWindow(QDialog):
                 _record_team_offer_cooldown(self.offers[idx]["team_id"])
                 show_toast(self, "❌ 기간 협상 결렬  입단 불가", "#cc0000", 1400)
             else:
-                show_toast(self, f"기간 협상 실패  남은 기회: {self.years_used[idx]}회",
+                show_toast(self, "기간 협상 실패" if get_difficulty() == "hard"   # 어려움: 남은 횟수 숨김
+                           else f"기간 협상 실패  남은 기회: {self.years_used[idx]}회",
                            "#cc4400", 1200)
 
         self._after_negotiate_round()

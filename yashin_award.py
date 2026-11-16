@@ -156,3 +156,104 @@ def sort_key(e):
     """최종 정렬 — 총점 → 축소된 표준 환경 선방률 → 경기당 실점(적을수록) → 선수 번호. DB 조회 순서와 무관."""
     gcpm = e.get("gc_per_match")
     return (-e["total"], -(e.get("shrunk") or 0.0), gcpm if gcpm is not None else 99.0, e["player_id"])
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════════
+# [2026-11-16 신설, 신민용 확정] 야신상 상위 3명 경쟁 — Top10 채점·명단은 그대로 두고 상위 3명 자리만 다시 정한다.
+#   경쟁 점수 = 기존 총점(10점 체계 그대로) + X × 우승 가산점(0~1). X = 0.5.
+#   우승 가산점 = 주요 성과 항목의 합(1.0 상한) — 주요 성과가 아니면 0(가산점 대상 = 주요 성과 GK, 같은 집합).
+#     클럽: 5대 리그 1부 우승 0.6 × 리그 수준 × 리그 출전 비율(후보 자체가 리그 70% 이상이라 별도 출전 조건 없음) ·
+#           유럽 챔스 우승 1.0 / 준우승 0.5 / 4강 0.35 · 유로파 우승 0.6 · 리베르타도레스(남미 챔스) 우승 0.6
+#           × 대륙대회 출전 비율 — [A안] 대륙대회 출전 50% 미만이면 주요 성과도 아니고 가산점도 0.
+#     국가대표: 대회 출전 50% 이상인 대회 중 가장 높은 하나만(남북미 대륙컵·코파 아메리카 중복 없음) × 출전 비율 —
+#           월드컵 우승 1.0 / 준우승 0.6 / 3·4위 0.45 · 유로 우승 0.8 / 준우승 0.5 / 3·4위 0.35 ·
+#           코파 아메리카 우승 0.75 / 준우승 0.45 · 남북미 대륙컵 우승 0.75 · 아프리카 네이션스컵 우승 0.55 ·
+#           아시안컵·골드컵 우승 0.5. 유럽 네이션스컵·그 밖 지역컵은 없음.
+#     (이 가산점은 상위 3명 경쟁에만 쓴다 — 기존 국제대회 칸 ⑤에는 코파·골드컵이 없다, C1 불채택.)
+#   경쟁 후보 = 기존 상위 3명 + 4~10위 중 개인 점수 ≥ (상위 3명 최저 개인 점수 − X). 주요 성과가 없는 GK도 범위 안이면
+#     넣는다(가산점 0이라 오르지 못하고 보호 대상으로만 들어간다).
+#   정렬 = 기존 순서에서 시작해 인접한 두 후보만 비교 — 아래 후보가 경쟁 점수가 더 높고(9자리 반올림, 같으면 안 바꿈)
+#     두 사람 개인 점수 차가 X 미만일 때만 자리를 바꾼다(정확히 X면 안 바꿈). 바뀔 게 없을 때까지 반복 → 앞 3명이
+#     새 상위 3명. 나머지 Top10은 기존 순서, 11위 이후는 그대로. 순서가 뒤집힌 모든 쌍은 직접 이 조건을 통과했으므로
+#     개인 점수가 X 이상 앞선 GK는 역전되지 않는다.
+#   검증(2026-11-16): 기존 40시즌 오프라인 재채점에서 X=0.5 합격(YT1 1·YT3 6·R1 0·R3 0·보호 위반 0).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════════
+CONTEST_X = 0.5
+CONTEST_TOP = 3
+CONTEST_POOL = 10
+CONTEST_MIN_PART = 0.5
+CONTEST_BIG5 = ("잉글랜드", "스페인", "이탈리아", "독일", "프랑스")
+CONTEST_LEAGUE_WIN = 0.6
+CONTEST_CL = {"우승": 1.0, "준우승": 0.5, "4강": 0.35}          # 유럽 챔스(유럽, cl)
+CONTEST_CONT_WIN = {("유럽", "el"): 0.6, ("남미", "cl"): 0.6}    # 우승만
+CONTEST_INTL = {"월드컵": {"우승": 1.0, "준우승": 0.6, "3위": 0.45, "4위": 0.45},
+                "유로(EURO)": {"우승": 0.8, "준우승": 0.5, "3위": 0.35, "4위": 0.35},
+                "코파 아메리카": {"우승": 0.75, "준우승": 0.45}, "남북미 대륙컵": {"우승": 0.75},
+                "아프리카 네이션스컵": {"우승": 0.55}, "아시안컵": {"우승": 0.5}, "골드컵": {"우승": 0.5}}
+
+
+def _r9(v):
+    return round(v, 9)
+
+
+def contest_items(e):
+    """[(항목 이름, 출전 반영 값)] — 주요 성과 항목만(값 > 0). e 입력(game_engine._yashin_contest_inputs):
+    c_league(국가, 부), league_rank, relegated, league_level, share, cl_comp(단계 라벨, 대륙, 대회 tier),
+    cl_part(대륙대회 출전 비율 0~1), intl_stages[(대회 이름, 단계 라벨, 출전 비율)]."""
+    out = []
+    lg = e.get("c_league") or (None, None)
+    if lg[0] in CONTEST_BIG5 and lg[1] == 1 and e.get("league_rank") == 1 and not e.get("relegated"):
+        lvl = e.get("league_level")
+        lvl = 1.0 if lvl is None else lvl
+        out.append(("리그 우승", CONTEST_LEAGUE_WIN * lvl * max(0.0, min(1.0, e.get("share") or 0.0))))
+    st, cont, tier = (tuple(e.get("cl_comp") or ()) + (None, None, None))[:3]
+    cp = max(0.0, min(1.0, e.get("cl_part") or 0.0))
+    if cp >= CONTEST_MIN_PART:
+        if (cont, tier) == ("유럽", "cl") and st in CONTEST_CL:
+            out.append(("챔스 " + st, CONTEST_CL[st] * cp))
+        elif st == "우승" and (cont, tier) in CONTEST_CONT_WIN:
+            out.append(("유로파 우승" if cont == "유럽" else "리베르타도레스 우승", CONTEST_CONT_WIN[(cont, tier)] * cp))
+    best = None
+    for name, stage, part in e.get("intl_stages") or ():
+        v = CONTEST_INTL.get(name, {}).get(stage)
+        p = max(0.0, min(1.0, part or 0.0))
+        if v is not None and p >= CONTEST_MIN_PART and (best is None or v * p > best[1]):
+            best = (f"{name} {stage}", v * p)
+    if best:
+        out.append(best)
+    return [x for x in out if x[1] > 0]
+
+
+def contest_bonus(e):
+    """우승 가산점 0~1 = 주요 성과 항목 합(상한 1.0)."""
+    return max(0.0, min(1.0, sum(v for _n, v in contest_items(e))))
+
+
+def contest_top3(top, x=CONTEST_X):
+    """기존 Top10(총점 순, sort_key·팀당 상한 적용 뒤) → 상위 3명만 다시 정한 새 리스트. 각 entry에 contest_bonus·
+    contest(경쟁 점수 — 후보만)와 contest_moved(순위가 바뀐 선수 True)를 남긴다. top 자체 순서는 바꾸지 않는다."""
+    lst = list(top)
+    for e in lst:
+        e["contest_moved"] = False
+    if len(lst) <= 1:
+        return lst
+    head = lst[:CONTEST_TOP]
+    floor = min(e["personal"] for e in head)
+    pool = list(head) + [e for e in lst[CONTEST_TOP:CONTEST_POOL] if _r9(e["personal"]) >= _r9(floor - x)]
+    for e in pool:
+        e["contest_bonus"] = contest_bonus(e)
+        e["contest"] = _r9(e["total"] + x * e["contest_bonus"])
+    order, moved = list(pool), True
+    while moved:
+        moved = False
+        for i in range(len(order) - 1):
+            a, b = order[i], order[i + 1]
+            if b["contest"] > a["contest"] and _r9(a["personal"] - b["personal"]) < _r9(x):
+                order[i], order[i + 1] = b, a
+                moved = True
+    win = order[:CONTEST_TOP]
+    wid = {id(e) for e in win}
+    new = win + [e for e in lst[:CONTEST_POOL] if id(e) not in wid] + lst[CONTEST_POOL:]
+    for i, e in enumerate(new):
+        e["contest_moved"] = e is not lst[i]
+    return new

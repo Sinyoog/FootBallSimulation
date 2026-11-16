@@ -21,6 +21,9 @@ ui/bracket_widget.py  ─  토너먼트 대진표(브래킷) 위젯
                     "winner": "첼시",            # 미정이면 ""
                     "pso": "",                   # 승부차기 스코어 문자열(있을 때만)
                     "my_side": "home",           # 내 팀이 home/away/None
+                    # [2026-11-15] 홈·원정 2경기면 legs(선택) — 칸을 1차전 2줄 + 2차전 2줄로 그린다.
+                    #   [{"label": "1차전", "home", "away", "hs", "as_", "home_mine", "away_mine"}, {... 2차전}]
+                    #   home/away/winner(위)는 이름 매칭·승자 색칠용으로 그대로 쓴다.
                 },
                 ...
             ],
@@ -55,9 +58,18 @@ class BracketWidget(QWidget):
     PAD        = 16       # 바깥 여백
     HDR_H      = 30       # 라운드 제목 높이
 
+    LEG_LBL_W  = 46       # [2026-11-15] 2경기 칸 왼쪽 "1차전/2차전" 글자 칸 너비
+
     def __init__(self, rounds, parent=None):
         super().__init__(parent)
         self._rounds = rounds or []
+        # [2026-11-15 홈·원정 2경기] 2경기 칸이 하나라도 있으면 칸 높이를 4줄(1차전 2 + 2차전 2)로, 너비를
+        # "1차전/2차전" 글자 칸만큼 넓힌다(인스턴스 값 — 단판만 있는 대진표는 예전 그대로). 단판 칸(결승 등)은
+        # 2줄 높이로 같은 중심에 그린다.
+        self._has_legs = any(m.get("legs") for r in self._rounds for m in r.get("matches", []))
+        if self._has_legs:
+            self.MATCH_H = self.SLOT_H * 4
+            self.BOX_W = BracketWidget.BOX_W + self.LEG_LBL_W
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         # 경기 박스들의 중심 y좌표를 라운드별로 계산해 둔다.
         self._layout_done = False
@@ -310,7 +322,10 @@ class BracketWidget(QWidget):
                 if mi >= len(centers):
                     break
                 cy = centers[mi]
-                top_y = cy - self.MATCH_H / 2
+                if m.get("legs"):
+                    self._draw_two_leg_match(qp, x, cy - self.SLOT_H * 2, m, f_team, f_score)
+                    continue
+                top_y = cy - self.SLOT_H       # 단판 칸은 항상 2줄 높이(2경기 대진표에서도 같은 중심)
                 self._draw_match(qp, x, top_y, m, f_team, f_score)
 
         qp.end()
@@ -329,83 +344,132 @@ class BracketWidget(QWidget):
         # 박스 배경
         qp.setPen(QPen(_C_BOX_LINE, 1))
         qp.setBrush(QBrush(_C_BOX))
-        qp.drawRoundedRect(QRectF(x, top_y, self.BOX_W, self.MATCH_H), 4, 4)
+        qp.drawRoundedRect(QRectF(x, top_y, self.BOX_W, self.SLOT_H * 2), 4, 4)
         # 가운데 구분선
         qp.setPen(QPen(_C_BOX_LINE, 1))
         qp.drawLine(int(x), int(top_y + self.SLOT_H),
                     int(x + self.BOX_W), int(top_y + self.SLOT_H))
 
-        score_w = 26
-        name_pad = 8
         for k, (side, flag, name, sc) in enumerate(rows):
             ry = top_y + k * self.SLOT_H
             is_winner = bool(winner) and (name == winner)
             is_mine   = (my_side == side)
+            self._draw_slot(qp, x, ry, self.BOX_W, flag, name, sc, played, is_winner, is_mine,
+                            f_team, f_score)
 
-            if is_mine:
-                col = _C_MINE
-            elif is_winner:
-                col = _C_WIN
-            elif played:
-                col = _C_DIM
-            else:
-                col = _C_TEXT
+        self._draw_pso_note(qp, x, top_y, m, f_team)
 
-            # 팀명 + 국가명 2줄 표기.
-            #   name 형식: "팀명 (국가명)" → 윗줄=국기+팀명, 아랫줄=(국가명)
-            #   국가명이 길어 옆으로 잘리던 문제를 줄바꿈으로 해결한다.
-            country = ""
-            team_only = name
-            if name.endswith(")") and " (" in name:
-                base, _, ctry = name.rpartition(" (")
-                team_only = base
-                country = ctry[:-1]   # 끝 ')' 제거
+    def _draw_two_leg_match(self, qp, x, top_y, m, f_team, f_score):
+        """[2026-11-15 신민용 요청] 홈·원정 2경기 칸:
+              1차전 | A팀 (1차전 홈)   스코어
+                    | B팀 (1차전 원정) 스코어
+              2차전 | B팀 (2차전 홈)   스코어
+                    | A팀 (2차전 원정) 스코어
+        스코어는 그 경기 것, 초록 = 합산(동점이면 승부차기)으로 올라간 팀, 하늘색 = 내 팀."""
+        legs = m.get("legs") or []
+        winner = m.get("winner", "")
+        h = self.SLOT_H * 4
+        qp.setPen(QPen(_C_BOX_LINE, 1))
+        qp.setBrush(QBrush(_C_BOX))
+        qp.drawRoundedRect(QRectF(x, top_y, self.BOX_W, h), 4, 4)
+        lw = self.LEG_LBL_W
+        # 칸 나눔: 글자 칸 세로선, 경기 안 홈/원정 사이 옅은 선, 1·2차전 사이 진한 선
+        qp.setPen(QPen(_C_BOX_LINE, 1))
+        qp.drawLine(int(x + lw), int(top_y), int(x + lw), int(top_y + h))
+        for k in (1, 3):
+            qp.drawLine(int(x + lw), int(top_y + k * self.SLOT_H),
+                        int(x + self.BOX_W), int(top_y + k * self.SLOT_H))
+        qp.setPen(QPen(_C_LINE.lighter(150), 1.4))
+        qp.drawLine(int(x), int(top_y + 2 * self.SLOT_H),
+                    int(x + self.BOX_W), int(top_y + 2 * self.SLOT_H))
+        f_lbl = QFont(f_team)
+        f_lbl.setBold(True)
+        for li, lg in enumerate(legs[:2]):
+            ly = top_y + li * 2 * self.SLOT_H
+            qp.setFont(f_lbl)
+            qp.setPen(_C_STAGE)
+            qp.drawText(QRectF(x, ly, lw, self.SLOT_H * 2),
+                        Qt.AlignmentFlag.AlignCenter, lg.get("label") or f"{li + 1}차전")
+            played = lg.get("hs") is not None and lg.get("hs", -1) >= 0
+            for k, (nm, sc, mine) in enumerate(((lg.get("home", "?"), lg.get("hs", -1), lg.get("home_mine")),
+                                                (lg.get("away", "?"), lg.get("as_", -1), lg.get("away_mine")))):
+                self._draw_slot(qp, x + lw, ly + k * self.SLOT_H, self.BOX_W - lw, "", nm, sc,
+                                played, bool(winner) and nm == winner, bool(mine), f_team, f_score)
+        self._draw_pso_note(qp, x, top_y, m, f_team)
 
-            avail = self.BOX_W - name_pad - score_w
-            fm = QFontMetrics(f_team)
+    def _draw_slot(self, qp, x, ry, box_w, flag, name, sc, played, is_winner, is_mine,
+                   f_team, f_score):
+        """칸 한 줄(팀 하나) — 팀명(+국가명 아랫줄)과 스코어. x·box_w = 이 줄이 차지하는 가로 범위."""
+        score_w = 26
+        name_pad = 8
+        if is_mine:
+            col = _C_MINE
+        elif is_winner:
+            col = _C_WIN
+        elif played:
+            col = _C_DIM
+        else:
+            col = _C_TEXT
 
-            if country:
-                # 윗줄: 국기+팀명 (위쪽 절반), 아랫줄: 국가명 (작고 흐리게)
-                line1 = fm.elidedText(f"{flag}{team_only}",
-                                      Qt.TextElideMode.ElideRight, avail)
-                qp.setFont(f_team)
-                qp.setPen(col)
-                qp.drawText(QRectF(x + name_pad, ry + 2, avail, self.SLOT_H / 2),
-                            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, line1)
+        # 팀명 + 국가명 2줄 표기.
+        #   name 형식: "팀명 (국가명)" → 윗줄=국기+팀명, 아랫줄=(국가명)
+        #   국가명이 길어 옆으로 잘리던 문제를 줄바꿈으로 해결한다.
+        country = ""
+        team_only = name
+        if name.endswith(")") and " (" in name:
+            base, _, ctry = name.rpartition(" (")
+            team_only = base
+            country = ctry[:-1]   # 끝 ')' 제거
 
-                fm2 = QFontMetrics(self._f_country)
-                line2 = fm2.elidedText(f"({country})",
-                                       Qt.TextElideMode.ElideRight, avail)
-                qp.setFont(self._f_country)
-                qp.setPen(_C_DIM)
-                qp.drawText(QRectF(x + name_pad, ry + self.SLOT_H / 2 - 2,
-                                   avail, self.SLOT_H / 2),
-                            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, line2)
-            else:
-                # 국가명 없으면 기존처럼 한 줄 중앙 정렬
-                qp.setFont(f_team)
-                qp.setPen(col)
-                label = fm.elidedText(f"{flag}{name}",
-                                      Qt.TextElideMode.ElideRight, avail)
-                qp.drawText(QRectF(x + name_pad, ry, avail, self.SLOT_H),
-                            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, label)
+        avail = box_w - name_pad - score_w
+        fm = QFontMetrics(f_team)
 
-            # 스코어
-            if played:
-                qp.setFont(f_score)
-                qp.setPen(_C_WIN if is_winner else col)
-                qp.drawText(QRectF(x + self.BOX_W - score_w, ry, score_w - 4, self.SLOT_H),
-                            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
-                            str(sc))
+        if country:
+            # 윗줄: 국기+팀명 (위쪽 절반), 아랫줄: 국가명 (작고 흐리게)
+            line1 = fm.elidedText(f"{flag}{team_only}",
+                                  Qt.TextElideMode.ElideRight, avail)
+            qp.setFont(f_team)
+            qp.setPen(col)
+            qp.drawText(QRectF(x + name_pad, ry + 2, avail, self.SLOT_H / 2),
+                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, line1)
 
-        # 승부차기 표기 (박스 우상단 작게)
+            fm2 = QFontMetrics(self._f_country)
+            line2 = fm2.elidedText(f"({country})",
+                                   Qt.TextElideMode.ElideRight, avail)
+            qp.setFont(self._f_country)
+            qp.setPen(_C_DIM)
+            qp.drawText(QRectF(x + name_pad, ry + self.SLOT_H / 2 - 2,
+                               avail, self.SLOT_H / 2),
+                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, line2)
+        else:
+            # 국가명 없으면 기존처럼 한 줄 중앙 정렬
+            qp.setFont(f_team)
+            qp.setPen(col)
+            label = fm.elidedText(f"{flag}{name}",
+                                  Qt.TextElideMode.ElideRight, avail)
+            qp.drawText(QRectF(x + name_pad, ry, avail, self.SLOT_H),
+                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, label)
+
+        # 스코어
+        if played:
+            qp.setFont(f_score)
+            qp.setPen(_C_WIN if is_winner else col)
+            qp.drawText(QRectF(x + box_w - score_w, ry, score_w - 4, self.SLOT_H),
+                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+                        str(sc))
+
+    def _draw_pso_note(self, qp, x, top_y, m, f_team):
+        """승부차기 표기(박스 우상단 작게). note가 있으면 note를 대신 적는다.
+        [2026-11-15] 홈·원정 2경기 칸은 1·2차전 스코어를 줄마다 직접 보여주므로 note를 비워 두고
+        승부차기("PSO 5-4")만 남는다."""
         pso = m.get("pso", "")
-        if pso:
+        note = m.get("note", "")
+        if note or pso:
             qp.setFont(f_team)
             qp.setPen(_C_DIM)
-            qp.drawText(QRectF(x, top_y - 1, self.BOX_W - 4, 14),
+            qp.drawText(QRectF(x - 40, top_y - 1, self.BOX_W + 36, 14),
                         Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop,
-                        f"PSO {pso}")
+                        note or f"PSO {pso}")
 
 
 def build_rounds_from_matches(matches, stage_order, my_names=None):

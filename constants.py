@@ -281,11 +281,29 @@ def club_day_from_virtual(vday, week_weights=None, year=None) -> int:
     2 이상이 보장된다(가중치가 전부 1 이하이므로)."""
     if _vcal_identity(week_weights, year):
         return vday
+    # [2026-11 성능] 일정 생성이 경기마다(한 시즌 약 40만 번) 이 함수를 부르는데, 매번 1일부터 훑어 찾았다
+    # (일정계산 약 4초의 대부분). 답은 (금지 구간, 주 가중치, 가상일)만으로 정해지므로 _vcal과 같은 키로
+    # 기억해 둔다 — 처음 한 번은 아래 예전 계산 그대로다.
+    key = (tuple(_norm_blackouts(year)), tuple(sorted((week_weights or {}).items())))
+    memo = _CDFV_CACHE.get(key)
+    if memo is None:
+        if len(_CDFV_CACHE) > 4096:
+            _CDFV_CACHE.clear()
+        memo = _CDFV_CACHE[key] = {}
+    hit = memo.get(vday)
+    if hit is not None:
+        return hit
     V = _vcal(week_weights, year)
+    out = 364
     for d in range(1, 366):
         if V[d] >= vday - 1e-9 and not is_club_blackout_day(d, year):
-            return d
-    return 364
+            out = d
+            break
+    memo[vday] = out
+    return out
+
+
+_CDFV_CACHE = {}
 
 # [2026-09 신설, 신민용 요청 32번] 귀화(복수국적 획득)에 필요한 "그 나라
 # **1부 리그**에서 뛴 시즌 수". 예전엔 game_engine에 2가 그냥 박혀 있었고
@@ -746,9 +764,16 @@ POWER_EVAL_GROUP_START_DAY = week_to_day(26)   # 176
 # 입단·이적이 다시 열리면 "1주차 입단 → 2주차 다른 팀 오퍼 수락"으로 밀려난 AI 선수만 사라지고
 # 팀 간 이동만 남는 꼬임이 생긴다. 겨울 이적시장·국제 오프시즌 구간은 그대로.
 PRESEASON_OFFER_LAST_WEEK = 1
+# [2026-11-13 신민용 확정: "시즌 시작 전에 미리 합류해 팀과 합 맞출 시간을"] 내 선수 예약 이적·임대가 실제로
+# 실행되는 주(이동 시점). 예전엔 상반기 시작(4주)·하반기 시작(29주)이었다.
+#   · 프리시즌: 오퍼·입단은 1주차뿐이라 그 바로 다음 주(2주)에 이동.
+#   · 겨울: 오퍼 수락은 25~26주까지(아래 OFFER_ZONES), 27주에 이동 — 하반기(29주) 전 2주 합류.
+# 반 시즌 임대의 상반기 끝 복귀도 27주. AI 겨울 이적시장(29주)·상/하반기 기록 분리는 그대로.
+MY_PRESEASON_MOVE_WEEK = PRESEASON_OFFER_LAST_WEEK + 1   # 2
+MY_WINTER_MOVE_WEEK = 27
 OFFER_ZONES = [
     (day_to_week(CLUB_PRESEASON_START_DAY), PRESEASON_OFFER_LAST_WEEK),                # 프리시즌(오퍼·입단은 1주차만)
-    (day_to_week(WINTER_OFFER_START_DAY),   day_to_week(WINTER_OFFER_END_DAY)),        # 중간 휴식기
+    (day_to_week(WINTER_OFFER_START_DAY),   MY_WINTER_MOVE_WEEK - 1),                  # 중간 휴식기(오퍼 수락 25~26주, 27주 이동)
     (INTL_CALLUP_WEEK,                       52),                                        # 국제 오프시즌(PO 다음 주부터)
 ]
 
@@ -4279,7 +4304,7 @@ MY_LOAN_WISH_OFFER_COUNT_W = (3, 4, 3)   # 오퍼 1/2/3개 비중(조건 통과 
 MY_LOAN_WISH_APPROVE = (0.35, 0.6, 0.004, 0.15, 0.85)
 MY_LOAN_FRUSTRATION_STREAK = 2        # 임대 희망 거절 연속 시즌 수 → 임대 불만
 MY_LOAN_FRUSTRATION_YEARS = 3         # 임대 불만 유지 기간(기존 거절 카운터 감쇠와 같은 3시즌)
-MY_LOAN_BUY_WINTER_WEEKS = (25, 28)   # 29주 복귀 임대의 완전 영입 판정 주차(겨울 휴식기)
+MY_LOAN_BUY_WINTER_WEEKS = (25, MY_WINTER_MOVE_WEEK - 1)   # 반 시즌 임대(27주 복귀)의 완전 영입 판정 주차(겨울 휴식기, 이동 전까지)
 MY_LOAN_REJUDGE_WEEK = 44             # 시즌 끝(리그 종료 다음 주) 정리 목적 거부 보정 재판정
 
 # [2026-10 개정, 신민용 확정: "AI 쪽만 평점 분포에 맞춰 재해석"] AI 평점은
@@ -5920,6 +5945,17 @@ STAR_POSITION_WEIGHT_FALLBACK = {
     "RWB": 6.0, "LWB": 6.0,
 }
 STAR_POSITION_WEIGHT_DEFAULT = 9.0   # 완전히 처음 보는 포지션
+
+# [2026-11-14 검증용 임시 스위치 — 채택 시 스위치 없이 확정 반영, 폐기 시 제거]
+# 백업 GK 은퇴 대체 신인(ai_lifecycle._retire_and_replace, 영입 대체 실패 후 신인 생성)에게 명문팀 특혜를 주지 않는다.
+# 실측(OFF 4개 월드 10시즌): 명문 S급+1부 GK 은퇴의 ≈100%가 신인 대체이고 그중 2·3번 은퇴가 86%인데, 역할과
+# 무관하게 명문 목표 OVR(평균 97.4)·명문 스타 추첨을 받아 대체 신인 잠재력 97+ 64~78% — 월드 생성 직후 명문
+# 2·3번 GK는 97+ 0~2%. 켜면 백업 판정(지난 시즌 역할 로테이션·대기·전력외·유망주, 역할 기록이 없으면 은퇴 직전
+# 팀 내 GK 순번 2위 이하) GK 은퇴의 대체 신인만:
+#   ① 목표 범위 중간~상단 85% 편향 없음(일반 팀처럼 하단~중간) ② 명문 등급 가산(PRESTIGE_LEVEL_OVR_BONUS) 없음
+#   ③ 스타 추첨 결과를 일반(None)으로 — 일반 추첨·1.5% 와일드카드는 그대로 ④ 외국인 주전급 하한 끌어올림 없음.
+# 구단 전력·정체 가산, 나이 조정·유망주 하한·리그/명문 OVR 하한, 영입 대체 시도, 주전 GK·필드 선수 대체는 그대로.
+NEW_GK_BACKUP_REPLACE_ON = False
 
 
 def star_position_weight(pos) -> float:
@@ -7975,6 +8011,49 @@ MANAGER_MATCH_BONUS_DOWN = 0.03      # 능력 < 팀 OVR일 때 1점당
 MANAGER_MATCH_BONUS_RANGE = (-0.5, 2.0)
 
 
+# ════════════════════════════════════════════════════════════════
+# [2026-11 감독 능력 → 경기 재설계, 신민용 확정] 상대 비교형 — 위 한쪽형을 대체한다.
+#   한쪽형의 문제(15시즌 실측): 감독 능력 평균 87 vs 팀 OVR 93이라 빅5 1부 보정이 평균 −0.16,
+#   범위 −0.43~+0.23 — 사실상 0. 능력이 결과에 안 나타나니 약한 감독이 경질되지 않고, 노화로
+#   능력이 떨어져도 빅클럽 자리를 지켰다(레알 85→78, 도르트문트 80→76).
+#   이제: 양 팀 감독 능력 차이 d → 우위 팀에만 MANAGER_REL_POINTS 곡선 값(사이는 선형, 끝 밖은 상한).
+#     [2026-11 확정] 10 → 1.0(정상 범위, 1점당 0.1), 20 → 2.5, 30 이상 → 4.5. 90은 5대 리그 중상위권을 맡는
+#     명장, 60은 K리그 감독도 쉽지 않은 수준 — 같은 선수단이면 강한 감독 쪽 중립 승률 ≈ 65~68%.
+#     빅5 1부 리그 대진에서 감독 차 20 이상은 0.1%(15시즌 실측) — 리그 밸런스는 거의 그대로, 대표팀·컵의
+#     극단 대진에서만 크게 작동한다. 한쪽에만 — 격차가 두 배로 벌어지지 않는다.
+#   단위 = 팀 전력(선발 11명 OVR) — 리그·컵·대항전·대표팀 곡선 **앞**에서 그 팀 전력에 더한다(예전 한쪽형은
+#   곡선 뒤라 고레벨에서 OVR 0.5 정도 값이었다). 체인 엔진은 같은 값을 팀 전력 가산(home_str_add)으로 받는다.
+#   감독 능력이 없는(0) 쪽이 있거나 사용자 감독 팀이면 0. 내 팀 경기도 같은 규칙(신민용 확정).
+# ════════════════════════════════════════════════════════════════
+MANAGER_MATCH_REL = True
+MANAGER_REL_PER_POINT = 0.1      # (참고) 차이 10 이내 기울기 — 실제 계산은 아래 MANAGER_REL_POINTS
+MANAGER_REL_POINTS = ((0.0, 0.0), (10.0, 1.0), (20.0, 2.5), (30.0, 4.5))
+MANAGER_REL_MAX = 4.5
+
+
+def manager_rel_pair(home_ability, away_ability):
+    """(홈 가산, 원정 가산) — 팀 전력 단위, 우위 팀에만. 어느 한쪽 능력이 없으면 (0, 0)."""
+    try:
+        h = float(home_ability or 0.0)
+        a = float(away_ability or 0.0)
+    except (TypeError, ValueError):
+        return 0.0, 0.0
+    if h <= 0.0 or a <= 0.0:
+        return 0.0, 0.0
+    d = abs(h - a)
+    pts = MANAGER_REL_POINTS
+    if d >= pts[-1][0]:
+        v = pts[-1][1]
+    else:
+        v = 0.0
+        for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+            if d <= x1:
+                v = y0 + (y1 - y0) * (d - x0) / (x1 - x0)
+                break
+    v = min(MANAGER_REL_MAX, v)
+    return (v, 0.0) if h > a else ((0.0, v) if a > h else (0.0, 0.0))
+
+
 def manager_match_bonus(ability, team_ovr):
     """감독 능력·팀 OVR → 경기 전력 보정(곡선 뒤에 더하는 값). 능력이 없으면 0."""
     try:
@@ -8008,6 +8087,34 @@ MANAGER_ABILITY_FIT_POINTS = ((-15.0, -8.0), (-10.0, -5.0), (-5.0, -2.0), (0.0, 
                               (5.0, 2.0), (10.0, 5.0), (15.0, 8.0))
 # 기준선 비교용 스위치 — False면 시장 점수가 이 작업 이전과 비트 단위로 같다.
 MANAGER_ABILITY_FIT_ENABLED = True
+
+# ════════════════════════════════════════════════════════════════
+# [2026-11 감독 시장 재설계, 신민용 확정 — "현재 능력 중심, 경력은 상한"]
+#   15시즌 실측: 상위 300 클럽의 능력 65 미만 감독 17명 중 16명이 "경력 최고 수준 100"인 경력자 —
+#   큰 자리를 한 번 맡으면 후보 창(경력 수준 칸)에 계속 들어가고, 능력 감점은 −8에서 막혀
+#   57과 80이 같았다. 노화로 68→59가 돼도 재계약됐다.
+#   ① 능력 적합도 V2 — 아래 표, −15 아래로도 1점당 MANAGER_ABILITY_FIT_LOW_SLOPE씩 계속 감점(상한 없음).
+#      위쪽은 완만하게(+6에서 멈춤) — 명장이 작은 자리로 몰리지 않게(하향 폭 규칙도 그대로).
+#   ② 상위 자리 하한 — 요구 능력(팀 선발 OVR)이 MANAGER_ABILITY_FLOOR_MIN_REQ 이상인 자리는 요구 능력보다
+#      MANAGER_ABILITY_FLOOR_GAP 넘게 낮은 후보를 원칙적으로 뺀다. 클럽: 상한 무시 패스(최후 수단)에서만 허용,
+#      그래도 없으면 기존처럼 신인(능력 = 요구 능력 근처). 대표팀: 하한을 넘는 후보가 하나라도 있으면 뺀다.
+#   ③ 재계약 — 계약 만료 시 능력이 요구 능력보다 MANAGER_RENEW_ABILITY_GAP 넘게 낮으면 재계약 확률 ×
+#      MANAGER_RENEW_LOW_ABILITY_MULT. 최근 성적(recent_perf, −1~+1)이 MANAGER_RENEW_PERF_EXEMPT 이상이면 예외.
+#      계약 중 경질 판정은 그대로(능력이 떨어졌다고 즉시 경질하지 않는다).
+#   ④ 은퇴 — MANAGER_RETIRE_OLD_AGE세 이상은 나이 은퇴 확률 × MANAGER_RETIRE_OLD_MULT(강제 은퇴가 아니라 확률).
+#   경력 최고 수준·명성·우승 기록은 그대로 남는다(상한 검사에 계속 쓰인다).
+# ════════════════════════════════════════════════════════════════
+MANAGER_ABILITY_FIT_V2 = True
+MANAGER_ABILITY_FIT_POINTS_V2 = ((-15.0, -15.0), (-10.0, -9.0), (-5.0, -4.0), (0.0, 0.0),
+                                 (5.0, 2.0), (10.0, 4.0), (15.0, 6.0))
+MANAGER_ABILITY_FIT_LOW_SLOPE = 1.2
+MANAGER_ABILITY_FLOOR_GAP = 15.0
+MANAGER_ABILITY_FLOOR_MIN_REQ = 85.0
+MANAGER_RENEW_ABILITY_GAP = 10.0
+MANAGER_RENEW_LOW_ABILITY_MULT = 0.25
+MANAGER_RENEW_PERF_EXEMPT = 0.5
+MANAGER_RETIRE_OLD_AGE = 70
+MANAGER_RETIRE_OLD_MULT = 1.5
 
 
 # ════════════════════════════════════════════════════════════════
@@ -8758,7 +8865,10 @@ def manager_retire_prob(age):
     if MANAGER_RETIRE_CURVE == "hazard":
         if age >= MANAGER_RETIRE_HAZARD_HARD:
             return 1.0
-        return float(MANAGER_RETIRE_HAZARD.get(age, 0.0))
+        p = float(MANAGER_RETIRE_HAZARD.get(age, 0.0))
+        if age >= MANAGER_RETIRE_OLD_AGE:      # [2026-11] 70세 이상 은퇴 압력(위 감독 시장 재설계 ④)
+            p = min(1.0, p * MANAGER_RETIRE_OLD_MULT)
+        return p
     if age >= MANAGER_RETIRE_AGE_HARD:
         return 1.0
     if age > MANAGER_RETIRE_AGE_START:
@@ -9436,11 +9546,14 @@ OLYMPIC_EXCEPTION_MAX = 2
 # 본선 성적 표시 — 메달권은 메달, 나머지는 "8강 탈락" 식(조별리그는 "조별리그 탈락").
 OLYMPIC_RESULT_LABEL = {"우승": "금메달", "준우승": "은메달", "3위": "동메달", "4위": "4위",
                         "8강": "8강 탈락", "16강": "16강 탈락"}
-# [2026-10 3단계] 발롱도르 — 올림픽 대회 성적 점수 = 컨퍼런스리그(유럽 기준, 대륙 무관)의 절반,
-# 올림픽 개인상 점수 = 컨퍼런스리그 개인상(클럽 대항전 MVP·베스트11)의 절반.
-# 대회 성적은 국제대회 가산점 경로(국적 내 순위 감쇠 적용)로 들어가고 "국제무대 증명" 게이트엔 불인정.
-OLYMPIC_BALLON_REF = ("유럽", "ecl")
-OLYMPIC_BALLON_RATIO = 0.5
+# [2026-11 분리, 신민용 확정] 올림픽 대회 위상 = 0.26 독립 고정값(클럽대회 위상표 _CLUB_COMP_WEIGHT와
+# 같은 이름 체계). 예전엔 "유럽 컨퍼런스리그 위상(game_engine._CLUB_COMP_WEIGHT[("유럽","ecl")]) × 0.5"로
+# 정의돼 있어서, 클럽대회 점수표를 고치면 올림픽 위상도 저절로 따라 움직였다(컨퍼런스 0.52→0.46 조정 때
+# 발견). 클럽대회 위상과 국가대표 대회 위상은 별개 설계 결정이라 연결을 끊고 분리 직전 값(0.52 × 0.5)을
+# 그대로 고정한다. 쓰이는 곳은 골든보이·코파 트로피 채점의 올림픽 경기 수준(game_engine._ballon_comp_level)
+# 하나뿐이다 — 올림픽은 성인 개인상(발롱도르·FIFA 올해의 선수 등)에 들어가지 않는다. 예전 성인 개인상용
+# 올림픽 가산 함수와 그 전용 상수(평점 배율 상한·개인상 비율)는 호출부가 없어 2026-11 정리 때 지웠다.
+OLYMPIC_COMP_WEIGHT = 0.26
 # [2026-10 4단계] 화면 — 글자·테두리 은색, 메인 일정 카드 배경, 아이콘. 로그 상자·다음주 미리보기는
 # 테두리·글자만 은색이고 배경은 각 영역의 원래 배경 그대로.
 OLYMPIC_UI_COLOR = "#C0C0C0"

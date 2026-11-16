@@ -393,25 +393,66 @@ def _roster_sort_key(p):
     return (1, 0, str(i))
 
 
+# [2026-11 성능 2차, 신민용 확정: "동일한 계산을 여러 번 하는 부분을 찾아 제거"] 전 팀 선발 배치 재사용.
+# 배치 결과(어느 슬롯에 로스터의 몇 번째 선수)는 "슬롯 목록 + id 순으로 정렬한 선수들의 _slot_value 키"만으로
+# 정해진다 — 비용 행렬의 모든 칸이 그 값들에서만 나오고(formation_logic.slot_value_key 주석), 헝가리안은
+# 행렬만 본다. 그래서
+#   ① 같은 슬롯 이름(예: CB 둘, CM 둘)의 비용 행은 한 번만 만들고,
+#   ② 칸 값은 (선수 키, 슬롯)으로 한 번 구한 _slot_value를 다시 쓰고,
+#   ③ 슬롯 목록과 선수 키 열이 통째로 같은 팀은 헝가리안까지 건너뛰고 지난 배치(인덱스 열)를 다시 쓴다
+#      (연도전환 때 포지션 스냅샷 직후의 전력 기록, 전력 캐시가 비워진 뒤의 재계산처럼 로스터가 그대로인 경우).
+# 어느 경우든 예전과 같은 행렬 → 같은 헝가리안 → 같은 배치다(동률 처리 포함). 돌려주는 것도 예전처럼
+# 이번 호출이 받은 선수 dict 그대로다.
+_ASSIGN_MEMO: dict = {}          # (슬롯 튜플, 선수 키 튜플) → 헝가리안 결과(행별 열 인덱스 튜플)
+_ASSIGN_MEMO_OLD: dict = {}      # 한 세대 전 — 크기 제한용(두 세대만 들고 있는다)
+_ASSIGN_MEMO_MAX = 16000         # 전 세계 한 바퀴(11,411팀)가 한 세대에 들어가는 크기
+
+
 def optimal_lineup_slots(roster, slots):
     """optimal_lineup과 같은 최적 배치를 슬롯 이름 목록(slots)으로 받는다."""
+    global _ASSIGN_MEMO, _ASSIGN_MEMO_OLD
     import formation_logic as _fl
     ro = sorted((p for p in roster if p), key=_roster_sort_key)
     if not ro:
         return [None] * len(slots)
-    n_dummy = max(0, len(slots) - len(ro))
-    cost = []
-    for s in slots:
-        s_gk = (s == "GK")
-        row = []
-        for pl in ro:
-            c = -_fl._slot_value(pl, s)
-            if s_gk != ((pl.get("position") or "") == "GK"):
-                c += _CROSS_GK_COST
-            row.append(c)
-        row.extend([0.0] * n_dummy)        # 선수 부족분 — 빈 자리
-        cost.append(row)
-    assign = _hungarian(cost)
+    memo, _cleared = _fl.slot_value_memo()
+    if not _cleared and len(memo) > 600000:      # 평소 10만 칸 안팎 — 혹시 커지면 버리고 다시 채운다
+        memo.clear()
+    if _cleared:
+        _ASSIGN_MEMO = {}
+        _ASSIGN_MEMO_OLD = {}
+    _key_of = _fl.slot_value_key
+    keys = tuple([_key_of(pl) for pl in ro])
+    akey = (tuple(slots), keys)
+    assign = _ASSIGN_MEMO.get(akey)
+    if assign is None:
+        assign = _ASSIGN_MEMO_OLD.get(akey)
+        if assign is None:
+            n_dummy = max(0, len(slots) - len(ro))
+            _by_key = _fl.slot_value_by_key
+            cost = []
+            rows = {}
+            for s in slots:
+                row = rows.get(s)
+                if row is None:
+                    s_gk = (s == "GK")
+                    row = []
+                    for k in keys:
+                        v = memo.get((k, s))
+                        if v is None:
+                            v = memo[(k, s)] = _by_key(k, s)
+                        c = -v
+                        if s_gk != (k[0] == "GK"):
+                            c += _CROSS_GK_COST
+                        row.append(c)
+                    row.extend([0.0] * n_dummy)        # 선수 부족분 — 빈 자리
+                    rows[s] = row
+                cost.append(row)                       # 같은 슬롯 이름은 같은 행(헝가리안은 읽기만 한다)
+            assign = tuple(_hungarian(cost))
+        if len(_ASSIGN_MEMO) >= _ASSIGN_MEMO_MAX:
+            _ASSIGN_MEMO_OLD = _ASSIGN_MEMO
+            _ASSIGN_MEMO = {}
+        _ASSIGN_MEMO[akey] = assign
     return [ro[j] if (j is not None and j < len(ro)) else None for j in assign]
 
 
@@ -468,8 +509,18 @@ def quick_strength(c, team_id, formation):
         if up and up.get("lineup_ids"):
             return lineup_strength(_resolve_lineup(team_id, formation, up["lineup_ids"]),
                                    formation)
-    roster = [dict(r) for r in c.execute(
-        "SELECT * FROM ai_players WHERE team_id=?", (team_id,)).fetchall()]
+    # [2026-11 성능 2차] 예전엔 SELECT *로 48개 컬럼을 전부 dict로 만들었다(전 세계 한 바퀴 27만 행). 선발 배치와
+    # 전력 계산이 읽는 것은 id(정렬·부포 조회)·position·ovr·foot·sub_role뿐이라 그 다섯 개만 읽는다 —
+    # ai_players에는 sub_pos 컬럼이 없고(부포는 아래 attach가 붙인다), 배치는 id 순으로 정렬한 뒤 풀기 때문에
+    # 읽는 순서와도 무관하다. 컬럼이 없는 구세이브에서는 예전 조회 그대로.
+    try:
+        roster = [{"id": r[0], "position": r[1], "ovr": r[2], "foot": r[3], "sub_role": r[4]}
+                  for r in c.execute(
+                      "SELECT id, position, ovr, foot, sub_role FROM ai_players WHERE team_id=?",
+                      (team_id,)).fetchall()]
+    except sqlite3.OperationalError:
+        roster = [dict(r) for r in c.execute(
+            "SELECT * FROM ai_players WHERE team_id=?", (team_id,)).fetchall()]
     import sub_positions as _subp
     _subp.attach(roster)        # [2026-10 주포·부포] 부포 슬롯은 미스매치 0 — 부포가 없으면 무동작
     return lineup_strength(optimal_lineup(roster, formation), formation)

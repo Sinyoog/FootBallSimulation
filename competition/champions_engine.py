@@ -102,18 +102,27 @@ from constants import generate_round_robin  # 리그 스테이지 대진(원형�
 # 있다 — 리그 스테이지 9~17주(최대 9경기), 18주 플레이오프, 19~23주
 # 토너먼트(32강은 남미/북미만). 국내컵은 이 구간(8~23주)을 피해 뒤(30주~)
 # 로 밀려 있다.
-CL_START_WEEK = 8             # 추첨 (직전 시즌 최종 순위 기준)
-CL_LEAGUE_WEEKS = (9, 17)     # 리그 스테이지 최대 구간(9~17주, 실제 사용 주차 수는 대륙별로 다름)
-CL_PLAYOFF_WEEK = 18          # 플레이오프 (단판)
-CL_ROUND_WEEKS = {
-    "R32":  19,  # 남미/북미(32팀)만 여기서 시작. 다른 대륙은 이 라운드 자체가 없음(정상).
-    "R16":  20,
-    "QF":   21,
-    "SF":   22,
-    "F":    23,
-    "TP":   23,  # 3/4위전: 결승과 같은 주차
+#
+# [2026-11-13 개편, 신민용 확정 — 홈·원정 2경기] 토너먼트(녹아웃 PO~4강)를 1·2차전으로 치르고 결승만
+# 중립 단판, 3·4위전 폐지. 9주가 필요해 일정을 1주 앞당긴다(실측: 새로 생기는 일정 충돌 없음 —
+# 대항전 팀 한 주 최다 경기 3경기 그대로, 결승 24주는 국대 예선(25주)·겨울 오퍼(25~26주) 앞).
+#   추첨 7 · 리그 스테이지 8~15 · PO 16·17 · 16강 18·19 · 8강 20·21 · 4강 22·23 · 결승 24
+CL_START_WEEK = 7             # 추첨 (직전 시즌 최종 순위 기준)
+CL_LEAGUE_WEEKS = (8, 15)     # 리그 스테이지 구간(8경기 = 8~15주)
+# 라운드별 경기 주차 — 2개면 (1차전, 2차전), 1개면 단판. 32강은 지금 규모(직행 8 + PO 승자 8 = 16팀)
+# 에서는 생기지 않지만, 생기면 PO 자리(16·17주)를 쓴다(PO와 32강은 한 대회에 같이 열리지 않는다).
+CL_ROUND_LEG_WEEKS = {
+    "PO":  (16, 17),
+    "R32": (16, 17),
+    "R16": (18, 19),
+    "QF":  (20, 21),
+    "SF":  (22, 23),
+    "F":   (24,),
 }
-CL_END_WEEK = 23
+CL_PLAYOFF_WEEK = CL_ROUND_LEG_WEEKS["PO"][-1]   # PO가 끝나는 주(2차전) — 16강 진출팀 확정
+# 라운드가 "끝나는" 주(마지막 경기 주) — process_one이 이 주에 라운드를 마감한다.
+CL_ROUND_WEEKS = {s: w[-1] for s, w in CL_ROUND_LEG_WEEKS.items() if s != "PO"}
+CL_END_WEEK = CL_ROUND_LEG_WEEKS["F"][-1]
 
 CL_TEAMS = 36                # 기본(유럽) 리그 스테이지 참가 규모
 
@@ -324,7 +333,7 @@ def _clear_entry_cache():
     from competition.competition_common import clear_entry_cache
     clear_entry_cache()
 
-STAGE_KO = {"league": "리그 스테이지", "PO": "플레이오프",
+STAGE_KO = {"league": "리그 스테이지", "PO": "플레이오프",   # TP: 예전 단판 형식 기록 표시용
             "R32": "32강", "R16": "16강", "QF": "8강", "SF": "4강", "F": "결승", "TP": "3/4위전"}
 # 토너먼트 라운드 진행 순서 (플레이오프 다음부터)
 # [2026-07] R32 추가 — 북남미(48팀)만 여기서 시작하고 다른 대륙은
@@ -378,6 +387,7 @@ CHAMPIONS_CFG = CompetitionConfig(
     # _STAGE_ORDER처럼 이 모듈 값을 재사용).
     neutral_stages=("F", "TP"),
     manager_bonus=True,   # [2026-10 6번 ③-1 확장] 감독 능력 경기 보정
+    ko_leg_weeks=CL_ROUND_LEG_WEEKS,   # [2026-11-13] 홈·원정 2경기 토너먼트
 )
 
 # 결과별 보상 (명성, 인기, 행복도) - 클럽 대회는 국가대표보다 약간 낮게
@@ -488,7 +498,9 @@ def get_my_cl_match(week, day=None, p=None, st=None):
         "tournament_id": t["id"],
         "league_name": t["name"],         # 대회명 (UI 호환 위해 league_name 키 사용)
         "stage": m["stage"],
-        "stage_ko": STAGE_KO.get(m["stage"], m["stage"]),
+        # [2026-11-13] 홈·원정 2경기면 "16강 1차전"/"16강 2차전"
+        "stage_ko": _stage_label(STAGE_KO.get(m["stage"], m["stage"]), _leg_of(m)),
+        "leg": _leg_of(m),
         "grp": m["grp"] if "grp" in m.keys() else "",
         "opp": oe["team_name"] if oe else "?",
         "opp_flag": oe["flag"] if oe else "",
@@ -764,104 +776,14 @@ def process_cl_week(week):
 
 
 def _process_one(t, week):
-    """단일 대회: 이번 주차 이하 미진행 경기 AI 시뮬 → 라운드/스테이지 마감."""
-    conn = get_conn()
-    pending = [dict(r) for r in conn.execute(
-        """SELECT * FROM cl_matches
-           WHERE tournament_id=? AND week<=? AND home_score=-1 ORDER BY id""",
-        (t["id"], week)).fetchall()]
+    """단일 대회: 이번 주차 이하 미진행 경기 AI 시뮬 → 라운드/스테이지 마감.
 
-    # pending 경기를 한 커넥션·한 트랜잭션으로 일괄 시뮬(경기마다 개폐하던 것을 1회로).
-    # [2026-07 성능 최적화] 개별 execute() 대신 batch에 모아 executemany()로
-    # 한 번에 반영 — "1주 진행" 시 챔스 라운드가 큰 주차(리그페이즈 등)일수록
-    # 체감 지연이 줄어든다. game_engine._sim_all_ai_matches와 동일한 패턴.
-    _batch = []
-    for m in pending:
-        _sim_ai_match(t, m, batch=_batch)
-    if _batch:
-        conn.executemany(
-            """UPDATE cl_matches SET home_score=?, away_score=?,
-               pso_winner=?, pso_score=?, day=?, my_absence_reason=? WHERE id=?""",
-            _batch)
-    conn.commit()
-    conn.close()
-
-    # 리그 스테이지 마지막 주차(대륙마다 다름 - games만큼) → 순위 확정
+    [2026-11-13] 유로파·컨퍼런스가 쓰는 competition_common.process_one과 본문이 완전히 같던 복사본이라,
+    홈·원정 2경기 처리(1차전 먼저 저장 → 2차전, 합산·진출팀 기록)를 한 곳에서 관리하도록 위임한다."""
+    from competition.competition_common import process_one
     league_end_week = CL_LEAGUE_WEEKS[0] + _cl_league_games(t["continent"]) - 1
-    if week == league_end_week:
-        conn = get_conn()
-        remain = conn.execute(
-            "SELECT COUNT(*) AS n FROM cl_matches WHERE tournament_id=? AND stage='league' AND home_score=-1",
-            (t["id"],)).fetchone()["n"]
-        conn.close()
-        if remain == 0:
-            _finalize_league_phase(t)
-        return
-
-    # 플레이오프 주차 → 16강(또는 8강) 진출팀 확정
-    if week == CL_PLAYOFF_WEEK:
-        conn = get_conn()
-        total = conn.execute(
-            "SELECT COUNT(*) AS n FROM cl_matches WHERE tournament_id=? AND stage='PO'",
-            (t["id"],)).fetchone()["n"]
-        remain = conn.execute(
-            "SELECT COUNT(*) AS n FROM cl_matches WHERE tournament_id=? AND stage='PO' AND home_score=-1",
-            (t["id"],)).fetchone()["n"]
-        conn.close()
-        if total > 0 and remain == 0:
-            _finalize_playoff(t)
-        return
-
-    # 토너먼트 라운드 주차 확인
-    cur_stage = None
-    for stg, wk in CL_ROUND_WEEKS.items():
-        if wk == week:
-            cur_stage = stg
-            break
-    if cur_stage is None:
-        return
-
-    # [버그 수정] 대륙마다 대회 규모가 달라(16강부터/8강부터 등) 첫 토너먼트
-    # 라운드 이름이 다르다. 이 주차에 해당하는 스테이지(cur_stage) 경기가
-    # 이 대회엔 애초에 없을 수도 있다 — 그 경우 '이미 진행 완료'가 아니라
-    # '이 대회는 이 라운드를 안 치른다'는 뜻이므로, 잘못 다음 라운드로
-    # 진행시키지 않고 그냥 넘어간다.
-    conn = get_conn()
-    total = conn.execute(
-        "SELECT COUNT(*) AS n FROM cl_matches WHERE tournament_id=? AND stage=?",
-        (t["id"], cur_stage)).fetchone()["n"]
-    if total == 0:
-        conn.close()
-        return
-    remain = conn.execute(
-        "SELECT COUNT(*) AS n FROM cl_matches WHERE tournament_id=? AND stage=? AND home_score=-1",
-        (t["id"], cur_stage)).fetchone()["n"]
-    conn.close()
-    if remain > 0:
-        return
-
-    if cur_stage == "F":
-        # TP(3/4위전)도 같은 주차 — 둘 다 완료된 후 _finish_tournament 호출
-        conn2 = get_conn()
-        tp_remain = conn2.execute(
-            "SELECT COUNT(*) AS n FROM cl_matches WHERE tournament_id=? AND stage='TP' AND home_score=-1",
-            (t["id"],)).fetchone()["n"]
-        conn2.close()
-        if tp_remain == 0:   # TP도 끝났거나 TP 경기 자체가 없으면 바로 종료
-            _finish_tournament(t)
-        # tp_remain > 0 이면 TP 완료 시 다시 이 함수가 호출됨
-    elif cur_stage == "TP":
-        # 3/4위전 완료 → 결승도 끝났는지 확인 후 같이 종료
-        conn2 = get_conn()
-        f_remain = conn2.execute(
-            "SELECT COUNT(*) AS n FROM cl_matches WHERE tournament_id=? AND stage='F' AND home_score=-1",
-            (t["id"],)).fetchone()["n"]
-        conn2.close()
-        if f_remain == 0:
-            _finish_tournament(t)
-    else:
-        nxt = _STAGE_ORDER[_STAGE_ORDER.index(cur_stage) + 1]
-        _advance_round(t, cur_stage, nxt)
+    process_one(CHAMPIONS_CFG, t, week, league_end_week, CL_PLAYOFF_WEEK, CL_ROUND_WEEKS, _STAGE_ORDER,
+                _finalize_league_phase, _finalize_playoff, _advance_round, _finish_tournament)
 
 
 # ─────────────────────────────────────────────
@@ -889,12 +811,30 @@ def _resolve_pso(h_ovr, a_ovr, neutral=False):
     return resolve_pso(h_ovr, a_ovr, neutral=neutral)
 
 
+def _cont_rule(cfg):
+    """[2026-11 전력 기준 통일] 내 팀 경기 전력 가산 규칙 — competition_common.cont_strength_rule."""
+    from competition.competition_common import cont_strength_rule
+    return cont_strength_rule(cfg)
+
+
 def _sim_ai_match(t, m, my_played=False, conn=None, reason="injury", batch=None, forced=None):
     """[2026-08 리팩터링] competition_common.sim_ai_match로 이동
     (완전 동일 로직) — 위임만. forced: [G1] 내 팀 경기 체인 엔진 스코어(내가 결장)."""
     from competition.competition_common import sim_ai_match
     sim_ai_match(CHAMPIONS_CFG, t, m, my_played=my_played, conn=conn, reason=reason, batch=batch,
                  forced=forced)
+
+
+def _leg_of(m):
+    """[2026-11-13] 경기 행의 leg(0 단판/1 1차전/2 2차전) — competition_common.leg_of."""
+    from competition.competition_common import leg_of
+    return leg_of(m)
+
+
+def _stage_label(stage_text, leg):
+    """[2026-11-13] "16강" → "16강 1차전" 등 — competition_common.stage_label."""
+    from competition.competition_common import stage_label
+    return stage_label(stage_text, leg)
 
 
 def _winner_of(m):
@@ -929,17 +869,29 @@ def sim_my_cl_match_as_ai(week, p, reason="injury", day=None):
     if m["home_score"] != -1:
         return  # 이미 처리됨(멱등)
     from game_engine import _chain_team_score, _home_advantage
+    from competition.competition_common import agg_before, finalize_ties
+    _leg = _leg_of(m)
+    _agg = (0, 0)
+    if _leg == 2:   # [2026-11-13] 2차전은 합산 동점일 때만 연장
+        _ca = get_conn()
+        _agg = agg_before(_ca, CHAMPIONS_CFG, m)
+        _ca.close()
     _cs = _chain_team_score(m["home_team_id"], m["away_team_id"],
                             0.0 if m["stage"] in CHAMPIONS_CFG.neutral_stages else _home_advantage(),
-                            extra_time=(m["stage"] != "league"))
+                            extra_time=(m["stage"] != "league" and _leg != 1),
+                            agg_home=_agg[0], agg_away=_agg[1],
+                            strength_rule=_cont_rule(CHAMPIONS_CFG))
     _sim_ai_match(t, m, my_played=False, reason=reason,
                   forced=((_cs["home_score"], _cs["away_score"]) if _cs is not None else None))
     from game_engine import update_player, _calc_manager_rel
     update_player(manager_relation=_calc_manager_rel(p, 0, "", played=False, not_played_penalty=2))
     # [2026-10 신민용 요청] 내가 결장한 이 경기도 경기 상세를 볼 수 있게 — 체인 엔진 기록(나 없음)을 관전 기록으로 저장.
     import controlled_matches as _cm_abs
+    finalize_ties(CHAMPIONS_CFG, t)   # [2026-11-13] 2차전이면 합산·진출팀 기록
     _cm_abs.save_absent_match(_cs, m["home_team_id"], m["away_team_id"], info.get("is_home"),
-                              t.get("name") or "챔피언스리그", "cl", week=week, day=m.get("day") or day,
+                              (_stage_label(f"{t.get('name') or '챔피언스리그'} {STAGE_KO.get(m['stage'], '')}", _leg)
+                               if _leg else (t.get("name") or "챔피언스리그")), "cl",
+                              week=week, day=m.get("day") or day,
                               reason=reason)
 
 
@@ -964,6 +916,14 @@ def simulate_my_cl_match(week, p, day=None):
     he = _entry(t["id"], m["home_team_id"])
     ae = _entry(t["id"], m["away_team_id"])
     is_home = info["is_home"]
+    # [2026-11-13] 홈·원정 2경기 — 1차전은 연장 없음, 2차전은 1차전 스코어(합산)를 엔진에 넘긴다.
+    from competition.competition_common import agg_before, needs_decider, finalize_ties
+    _leg = _leg_of(m)
+    _agg = (0, 0)
+    if _leg == 2:
+        _ca = get_conn()
+        _agg = agg_before(_ca, CHAMPIONS_CFG, m)
+        _ca.close()
 
     # [2026-10 대회별 카드 규칙] UEFA 63조 — 3장(이후 홀수)째 정지, 8강 종료 후 누적 소멸.
     try:
@@ -1047,8 +1007,10 @@ def simulate_my_cl_match(week, p, day=None):
         sim = simulate_my_match(
             m["home_team_id"], m["away_team_id"], home_formation, away_formation,
             home_adv=(0.0 if _neutral_stage else _home_advantage()),
-            extra_time=(m["stage"] != "league"),
-            me=_chain_me_spec(p, is_home, "out" if _suspended else ("bench" if _benched else "start")))
+            extra_time=(m["stage"] != "league" and _leg != 1),
+            agg_home=_agg[0], agg_away=_agg[1],
+            me=_chain_me_spec(p, is_home, "out" if _suspended else ("bench" if _benched else "start")),
+            strength_rule=_cont_rule(CHAMPIONS_CFG))   # [2026-11 전력 기준 통일]
         hs, as_ = sim["home_score"], sim["away_score"]
         hs90, as90 = sim.get("home_score_90", hs), sim.get("away_score_90", as_)
         went_et = bool(sim.get("went_extra_time"))
@@ -1069,7 +1031,7 @@ def simulate_my_cl_match(week, p, day=None):
 
     pso_winner, pso_score = 0, ""
     is_ko = (m["stage"] != "league")  # [2026-07 버그 수정] 조별리그->리그 스테이지 개편 후 남아있던 옛 스테이지명 비교
-    if outcome == "draw" and is_ko:
+    if is_ko and needs_decider(_leg, hs, as_, _agg):   # [2026-11-13] 2차전은 합산 동점일 때
         win_home, pso_score = _resolve_pso(h_ovr, a_ovr, neutral=_neutral_stage)
         pso_winner = m["home_team_id"] if win_home else m["away_team_id"]
 
@@ -1177,6 +1139,7 @@ def simulate_my_cl_match(week, p, day=None):
                   my_conceded, day, _absence_reason, _yellow_cnt, _my_started_pre, m["id"]))
     conn.commit()
     conn.close()
+    finalize_ties(CHAMPIONS_CFG, t)   # [2026-11-13] 2차전이면 합산·진출팀 기록
 
     # [세부 지표] 통산(total_*)에도 누적 → 커리어 통합 통계에 챔스 경기 반영
     update_player(
@@ -1210,9 +1173,12 @@ def simulate_my_cl_match(week, p, day=None):
         # 결과 칸 자체를 바꾼다(로그 '경기' 필터가 줄 끝 결과 표기로 결과 줄을 찾는다).
         from game_engine import pso_result_text
         pso_txt = pso_result_text(pso_score, pso_winner == my_tid)
-        rs = "무"
+        if hs == as_:   # [2026-11-13] 2차전은 이 경기에서 이기고도 합산 동점이라 승부차기일 수 있다
+            rs = "무"
 
-    comp_name = f"{t['name']} {stage_ko}".strip()
+    comp_name = _stage_label(f"{t['name']} {stage_ko}".strip(), _leg)
+    if _leg == 2:   # [2026-11-13] 2차전 결과 줄에 합계 스코어
+        pso_txt = f"합계 {_agg[0] + hs}-{_agg[1] + as_}" + (f"  {pso_txt}" if pso_txt else f"  ({rs})")
     # [2026-07 신민용 요청] 챔피언스리그는 국제대회라 팀명만으론 어느 나라
     # 소속인지 안 보여서, 팀명 옆에 (국가)를 붙인다.
     home_disp = f"{he['flag']}{he['team_name']}({he.get('country','?')})"
@@ -1611,6 +1577,9 @@ def get_my_champions_matches(year):
             "pso_winner": pso_name, "pso_score": m["pso_score"],
             "stage": STAGE_KO.get(m["stage"], m["stage"]), "week": m["week"],
             "stage_raw": m["stage"], "grp": m["grp"] if "grp" in m.keys() else "",
+            # [2026-11-13] 홈·원정 2경기 — 대진표는 (stage_raw, slot)으로 1·2차전을 한 칸으로 묶는다.
+            "leg": _leg_of(m), "slot": m["slot"],
+            "stage_label": _stage_label(STAGE_KO.get(m["stage"], m["stage"]), _leg_of(m)),
         })
     return out
 
@@ -1697,7 +1666,9 @@ def get_my_cl_matches():
         out.append({
             "year": m["t_year"], "week": m["week"], "date": date_str,
             "position": m["my_position"], "team": my_name, "team_flag": my_flag,
-            "comp": m["comp"], "stage": STAGE_KO.get(m["stage"], m["stage"]),
+            "comp": m["comp"],
+            # [2026-11-13] 커리어 경기 목록: "16강 1차전"/"16강 2차전"(예전 단판 기록은 그대로 "16강")
+            "stage": _stage_label(STAGE_KO.get(m["stage"], m["stage"]), _leg_of(m)),
             "opp": opp_name, "opp_flag": opp_flag,
             "goals": m["my_goals"], "assists": m["my_assists"],
             "saves": m["my_saves"], "conceded": op_s,

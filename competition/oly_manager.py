@@ -199,6 +199,40 @@ def manager_for_tournament(tournament_id, country, conn=None):
             conn.close()
 
 
+_ab_cache = {}
+
+
+def _match_ability(tournament_id, country):
+    """그 대회 U-23 감독 능력(없으면 0)."""
+    key = (int(tournament_id), country)
+    if key not in _ab_cache:
+        ab = 0
+        conn = get_conn()
+        try:
+            mid = manager_for_tournament(tournament_id, country, conn)
+            if mid:
+                r = conn.execute("SELECT COALESCE(manager_ability,0) FROM managers WHERE id=?",
+                                 (mid,)).fetchone()
+                ab = int(r[0] or 0) if r else 0
+        except Exception:
+            ab = 0
+        finally:
+            conn.close()
+        _ab_cache[key] = ab
+    return _ab_cache[key]
+
+
+def match_pair(tournament_id, home, home_ovr, away, away_ovr):
+    """[2026-11 상대 비교형] (홈 가산, 원정 가산) — 두 나라 U-23 감독 능력 차이(constants.manager_rel_pair).
+    MANAGER_MATCH_REL이 꺼져 있으면 예전 한쪽형(match_bonus) 그대로."""
+    from constants import MANAGER_MATCH_BONUS_ENABLED, MANAGER_MATCH_REL, manager_rel_pair
+    if not MANAGER_MATCH_REL:
+        return (match_bonus(tournament_id, home, home_ovr), match_bonus(tournament_id, away, away_ovr))
+    if not MANAGER_MATCH_BONUS_ENABLED or not home or not away:
+        return 0.0, 0.0
+    return manager_rel_pair(_match_ability(tournament_id, home), _match_ability(tournament_id, away))
+
+
 def match_bonus(tournament_id, country, squad_ovr):
     """U-23 감독 능력 경기 보정 — 성인 대표팀(intl_engine._nat_mgr_bonus)과 같은 식
     (constants.manager_match_bonus)을 그 대회 U-23 명단 전력(intl_entries.ovr)에 건다."""

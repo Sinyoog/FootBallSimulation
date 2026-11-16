@@ -4494,6 +4494,24 @@ def has_lower_cup_data_bulk():
 # 일반화했다 — el_*/ecl_* 스키마가 cl_*와 완전히 동일하므로 로직은
 # 한 글자도 안 바뀐다.
 # ─────────────────────────────────────────
+# [2026-11-13 신설, 신민용 확정] 챔스·유로파·컨퍼런스는 3·4위전이 없어졌다 — 기록실의 3·4번째 자리는
+# "4강 탈락 두 팀"이다. 예전 단판 형식 기록(3·4위전이 있던 해)도 3위·4위를 따로 두지 않고 4강으로 통합한다
+# (3·4위전 두 팀 = 4강 패자 두 팀이므로 같은 팀이 나온다). 대륙 슈퍼컵(sc_matches)은 3·4위 그대로.
+_SEMIS_MERGE_TABLES = ("cl_matches", "el_matches", "ecl_matches")
+
+
+def _semi_losers(sf_rows):
+    """4강 경기 행(단판 또는 1·2차전)에서 4강 탈락 두 팀(대진 순서대로). 판정은 competition_common.tie_result
+    (2차전 합산, 동점이면 2차전 승부차기) — 단판 행(leg=0)은 그 경기 승패 그대로."""
+    from competition.competition_common import group_ties, tie_result
+    out = []
+    for _k, rows in sorted(group_ties(sf_rows).items(), key=lambda kv: (kv[0][1] or 0)):
+        res = tie_result(rows)
+        if res["loser"]:
+            out.append(res["loser"])
+    return (out + [None, None])[:2]
+
+
 def _get_cl_placements(tournament_id, conn, match_table="cl_matches"):
     """결승(F)+3/4위전(TP) 결과로 1~4위 team_id를 도출.
     intl_engine 쪽 _get_placements와 동일한 패턴, team_id(정수) 기준만 다름.
@@ -4510,6 +4528,11 @@ def _get_cl_placements(tournament_id, conn, match_table="cl_matches"):
     runner_up = fm["away_team_id"] if winner == fm["home_team_id"] else fm["home_team_id"]
 
     third = fourth = None
+    if match_table in _SEMIS_MERGE_TABLES:   # [2026-11-13] 3·4위 대신 4강 두 팀
+        third, fourth = _semi_losers([dict(r) for r in conn.execute(
+            f"SELECT * FROM {match_table} WHERE tournament_id=? AND stage='SF' AND home_score>=0",
+            (tournament_id,)).fetchall()])
+        return {"winner": winner, "runner_up": runner_up, "third": third, "fourth": fourth}
     tp = conn.execute(
         f"SELECT * FROM {match_table} WHERE tournament_id=? AND stage='TP' "
         f"AND home_score>=0 ORDER BY id DESC LIMIT 1", (tournament_id,)).fetchone()
@@ -4530,12 +4553,17 @@ def _batch_cl_placements(tournament_ids, conn, match_table="cl_matches"):
     if not tournament_ids:
         return {}
     ph = ",".join("?" * len(tournament_ids))
+    _merge = match_table in _SEMIS_MERGE_TABLES   # [2026-11-13] 3·4위 대신 4강 두 팀
     rows = conn.execute(
         f"""SELECT * FROM {match_table} WHERE tournament_id IN ({ph})
-            AND stage IN ('F','TP') AND home_score>=0
+            AND stage IN ({"'F','SF'" if _merge else "'F','TP'"}) AND home_score>=0
             ORDER BY id""", list(tournament_ids)).fetchall()
     latest = {}
+    sf_by_tid = {}
     for r in rows:
+        if r["stage"] == "SF":
+            sf_by_tid.setdefault(r["tournament_id"], []).append(dict(r))
+            continue
         latest[(r["tournament_id"], r["stage"])] = dict(r)
 
     out = {}
@@ -4546,10 +4574,13 @@ def _batch_cl_placements(tournament_ids, conn, match_table="cl_matches"):
         winner = _winner_of(fm)
         runner_up = fm["away_team_id"] if winner == fm["home_team_id"] else fm["home_team_id"]
         third = fourth = None
-        tp = latest.get((tid, "TP"))
-        if tp:
-            third = _winner_of(tp)
-            fourth = tp["away_team_id"] if third == tp["home_team_id"] else tp["home_team_id"]
+        if _merge:
+            third, fourth = _semi_losers(sf_by_tid.get(tid, []))
+        else:
+            tp = latest.get((tid, "TP"))
+            if tp:
+                third = _winner_of(tp)
+                fourth = tp["away_team_id"] if third == tp["home_team_id"] else tp["home_team_id"]
         out[tid] = {"winner": winner, "runner_up": runner_up, "third": third, "fourth": fourth}
     return out
 
@@ -4639,10 +4670,21 @@ def get_super_cup_history(continent=None, limit=100000):
 # 이유가 없다).
 def get_cl_style_rank_leaders(continent=None, tournament_table="cl_tournaments",
                                match_table="cl_matches"):
+    """최다 순위. [2026-11-13 신민용 확정] 챔스·유로파·컨퍼런스는 1위·2위·4강 3칸 — "semi"는 4강 탈락
+    횟수(그 해 3·4번째 자리 두 팀 모두, 예전 3·4위 기록 포함). 슈퍼컵은 1~4위 그대로."""
     rows = get_cl_history(continent=continent, limit=999999,
                            tournament_table=tournament_table, match_table=match_table)
-    return _rank_leaders_from_rows(rows, ("winner", "runner_up", "third", "fourth"),
-                                    "{key}_name", "{key}_country")
+    out = _rank_leaders_from_rows(rows, ("winner", "runner_up", "third", "fourth"),
+                                   "{key}_name", "{key}_country")
+    if match_table in _SEMIS_MERGE_TABLES:
+        from collections import Counter
+        cnt = Counter()
+        for k in ("third", "fourth"):
+            for e in out.get(k) or []:
+                cnt[(e["name"], e.get("country") or "")] += e["count"]
+        out["semi"] = [{"name": n, "country": (c or None), "count": v}
+                       for (n, c), v in sorted(cnt.items(), key=lambda x: (-x[1], x[0]))]
+    return out
 
 
 def get_super_cup_rank_leaders(continent=None):
@@ -5536,9 +5578,16 @@ def get_league_award_kinds(year, country=None, tier=None):
 
 def get_league_awards(year, country=None, tier=None, award_kind=None):
     """그 해 리그전 개인상 — country(국가명)/tier(몇부)/award_kind로
-    좁힐 수 있다."""
-    return _get_category_awards(
+    좁힐 수 있다.
+
+    [2026-11-13 버그수정, 신민용 리포트: "리그전에서 대한민국은 구단 올해의 선수 하나가 따로 위에 있다"]
+    award_type 글자순 정렬이라 "구단 올해의 선수"(award_type = "팀명 구단 올해의 선수")가 팀 이름에
+    따라 리그 상("K리그1 MVP" 등) 사이사이로 흩어졌다 — "FC 서울"은 "K리그1"보다 앞 글자라 혼자 맨 위로
+    갔다. 리그 전체 상은 예전 순서 그대로 먼저, 구단 올해의 선수는 맨 뒤에 팀 이름순으로 모은다."""
+    rows = _get_category_awards(
         year, "league", award_kind=award_kind, league_country=country, league_tier=tier)
+    rows.sort(key=lambda r: 1 if (r.get("award_kind") == "구단 올해의 선수") else 0)   # 안정 정렬
+    return rows
 
 
 # [2026-09 신설, 신민용 요청: "개인상에 컵 대회도 추가할려고 해 — 컵
@@ -6739,17 +6788,61 @@ def get_intl_callup_pool(tournament_id, country_name):
     from database import get_ai_player_custom_names
     from intl_engine import INTL_CALLUP_BUCKETS
     conn = get_conn(); c = conn.cursor()
+    # [2026-11-15 신민용 요청: "LB 후보 = 주포가 LB인 선수가 아니라 국대에서 그 자리로 쓸 후보"] 선발 그룹별
+    # 후보 라인(intl_callup_role_pool)이 있으면 그걸 보여준다 — 그룹 = 실제 선발 경쟁 단위(GK/CB/풀백/중앙
+    # 미드/공격형 미드/윙어/스트라이커), 주포가 달라도 그 그룹 경쟁에 들어온 선수 포함. 이 기록이 생기기 전
+    # 대회는 예전 표(주포 기준 intl_callup_pool)로.
+    _role_mode = False
+    rows = []
     try:
-        rows = [dict(r) for r in c.execute(
-            "SELECT bucket, rank, player_id, score, position FROM intl_callup_pool "
-            "WHERE tournament_id=? AND country=? ORDER BY bucket, rank",
-            (tournament_id, country_name)).fetchall()]
+        try:
+            rows = [dict(r) for r in c.execute(
+                "SELECT COALESCE(NULLIF(card, ''), grp) AS bucket, grp, quota, rank, player_id, score, position, "
+                "fit, via FROM intl_callup_role_pool WHERE tournament_id=? AND country=? ORDER BY bucket, rank",
+                (tournament_id, country_name)).fetchall()]
+        except Exception:      # card 칸이 생기기 전 표(같은 날 앞선 버전)
+            rows = [dict(r) for r in c.execute(
+                "SELECT grp AS bucket, grp, quota, rank, player_id, score, position, fit, via "
+                "FROM intl_callup_role_pool WHERE tournament_id=? AND country=? ORDER BY grp, rank",
+                (tournament_id, country_name)).fetchall()]
+        _role_mode = bool(rows)
     except Exception:
         rows = []
     if not rows:
+        try:
+            rows = [dict(r) for r in c.execute(
+                "SELECT bucket, rank, player_id, score, position FROM intl_callup_pool "
+                "WHERE tournament_id=? AND country=? ORDER BY bucket, rank",
+                (tournament_id, country_name)).fetchall()]
+        except Exception:
+            rows = []
+    # [2026-11-15 신민용 리포트: "최종 국대 인원엔 플레이어가 있는데 후보 라인엔 없다"] 내 선수(MY_PLAYER_ID)는
+    # intl_squad가 아니라 my_player로 관리된다 — 이 대회에 실제로 뽑혔는지는 _my_intl_squad_entry로 본다.
+    # 선발 그룹 기록에 내 줄이 있으면 그대로, 없는데 뽑혔으면(예선 후보 라인을 물려받은 본선 등) 내 주포 카드
+    # 맨 끝에 점수 없이 붙인다.
+    _me_entry = None
+    if _role_mode:
+        try:
+            _me_entry = _my_intl_squad_entry(conn, tournament_id, country_name)
+        except Exception:
+            _me_entry = None
+        if _me_entry and not any(r["player_id"] == MY_PLAYER_ID for r in rows):
+            try:
+                from intl_engine import _intl_role_card
+                from constants import INTL_POSITION_TO_GROUP
+                _mp = conn.execute("SELECT position, foot FROM my_player WHERE id=1").fetchone()
+                _mpos = (_mp["position"] if _mp else "") or "CM"
+                _g = INTL_POSITION_TO_GROUP.get(_mpos) or "CM"
+                _card = _intl_role_card(_g, {"position": _mpos, "foot": _mp["foot"] if _mp else ""})
+                _rk = 1 + max([r["rank"] for r in rows if r["bucket"] == _card] or [0])
+                rows.append({"bucket": _card, "grp": _g, "quota": 0, "rank": _rk, "player_id": MY_PLAYER_ID,
+                             "score": None, "position": _mpos, "fit": 1.0, "via": "me_noscore"})
+            except Exception:
+                pass
+    if not rows:
         conn.close()
         return []
-    ids = [r["player_id"] for r in rows]
+    ids = list(dict.fromkeys(r["player_id"] for r in rows))   # 선발 그룹 모드는 한 선수가 두 그룹에 나올 수 있다
     ph = ",".join("?" * len(ids))
     info = {r["id"]: dict(r) for r in c.execute(
         f"""SELECT ap.id, ap.ovr, t.name AS club FROM ai_players ap
@@ -6779,14 +6872,56 @@ def get_intl_callup_pool(tournament_id, country_name):
     conn.close()
     names = get_ai_player_custom_names(ids)
     by_b = {}
+    _quota = {}
+    _grp_of = {}
     for r in rows:
         inf = info.get(r["player_id"], {})
+        if _role_mode:
+            _quota[r["bucket"]] = r.get("quota") or 0
+            _grp_of[r["bucket"]] = r.get("grp") or r["bucket"]
+        if r["player_id"] == MY_PLAYER_ID:
+            # 내 선수 — 뽑혔는지는 이 대회 실제 발탁, 이름·소속은 그 대회 당시 값(_my_intl_squad_entry).
+            by_b.setdefault(r["bucket"], []).append({
+                "id": MY_PLAYER_ID, "picked": _me_entry is not None,
+                "display_name": (_me_entry or {}).get("display_name") or "나",
+                "position": r["position"] or "", "score": r["score"] or 0.0, "rank": r["rank"],
+                "fit": r.get("fit"), "via": r.get("via") or "", "ovr": (_me_entry or {}).get("ovr"),
+                "club": (_me_entry or {}).get("club") or "", "retired": False, "is_me": True})
+            continue
         by_b.setdefault(r["bucket"], []).append({
             "id": r["player_id"], "picked": r["player_id"] in _picked,
             "display_name": names.get(r["player_id"]) or ai_player_code(r["player_id"]),
             "position": r["position"] or "", "score": r["score"] or 0.0, "rank": r["rank"],
+            "fit": r.get("fit"), "via": r.get("via") or "",
             "ovr": inf.get("ovr"), "club": inf.get("club") or "", "retired": bool(inf.get("retired"))})
+    if _role_mode:
+        # [2026-11-15 개정, 신민용 요청] 카드 = 국대에서 쓰는 자리(GK/CB/LB/RB/CDM/CM/CAM/LW/RW/ST). 한 자리가
+        # 한 선발 그룹이면 "ST (정원 2)", 좌우·CDM/CM처럼 두 자리가 한 그룹 정원을 나눠 쓰면 뽑힌 수만 "LB (선발 2)"
+        # (그룹 정원은 표시하지 않는다 — 신민용 요청).
+        out = []
+        _keys = [k for k in INTL_CALLUP_ROLE_CARDS if k in by_b] + \
+                [k for k in by_b if k not in INTL_CALLUP_ROLE_CARDS]
+        for k in _keys:
+            lst = sorted(by_b[k], key=lambda x: x["rank"])
+            _q = _quota.get(k) or 0
+            _g = _grp_of.get(k, k)
+            if _g in INTL_CALLUP_SPLIT_GROUPS and k in INTL_CALLUP_ROLE_CARDS:
+                _n = sum(1 for x in lst if x["picked"])
+                label = f"{k} (선발 {_n})"
+            else:
+                label = (k if k in INTL_CALLUP_ROLE_CARDS else INTL_CALLUP_ROLE_LABEL.get(k, k)) + \
+                        (f" (정원 {_q})" if _q else "")
+            out.append((label, lst))
+        return out
     return [(b, sorted(by_b[b], key=lambda x: x["rank"])) for b in INTL_CALLUP_BUCKETS if b in by_b]
+
+
+# [2026-11-15] 선발 그룹별 후보 라인 표시 순서·이름(constants.INTL_POSITION_GROUPS의 그룹 → 국대 자리).
+INTL_CALLUP_ROLE_GROUPS = ("GK", "CB", "FB", "CM", "AM", "WG", "ST")
+INTL_CALLUP_ROLE_CARDS = ("GK", "CB", "LB", "RB", "CDM", "CM", "CAM", "LW", "RW", "ST")
+INTL_CALLUP_SPLIT_GROUPS = ("FB", "CM", "WG")   # 두 자리가 한 그룹 정원을 나눠 쓰는 그룹
+INTL_CALLUP_ROLE_LABEL = {"GK": "GK", "CB": "CB", "FB": "LB·RB", "CM": "CDM·CM", "AM": "CAM",
+                          "WG": "LW·RW", "ST": "ST·CF"}
 
 
 def _ovr_hist_is_season_start():
@@ -7816,6 +7951,39 @@ def get_country_tournament_squad(tournament_id, country_name):
         # 사라진다. 내가 실제로 뛴 경기 수만큼 누군가는 안 뛴 것이므로,
         # 출전 횟수가 가장 적은(동률이면 OVR이 낮은) AI 주전부터 후보로
         # 내려 11명을 맞춘다 — 나 자신은 절대 내리지 않는다.
+        # [2026-11-13 버그수정, 신민용 리포트: "국대 포메이션이 감독 설명(4-3-2-1·4-3-3·4-3-1-2)과 달리
+        # 전부 4-2-1-3으로 뜨고, 포지션(당시)도 국대에서 맡은 자리가 아니다"] AI 주전은 그 대회 포메이션
+        # 자리(intl_squad.slot)가 저장돼 있는데 나(이 표에 없는 별도 선수)만 자리가 비어 있었다 — 화면은
+        # "주전 전원에 자리가 있을 때만" 저장 배치를 그리므로, 내가 뛴 대회는 늘 고정 임시 배치
+        # (_INTL_MATCHDAY_STARTER_POS = 4-3-3-ATT 모양)로 떨어졌다. 실제 경기도 AI 11명 라인업에서
+        # 내 포지션에 맞는 자리 하나를 내가 대신 맡는 방식(competition_common.merge_my_slot)이므로,
+        # 같은 원칙으로 AI 주전 자리 중 내 포지션에 가장 맞는 자리(같은 등급이면 출전이 적은·OVR이 낮은
+        # 쪽 = 나 때문에 빠진 선수)를 내 자리로 하고, 그 선수를 후보로 내린다.
+        _me_st = next((r for r in starters if r["id"] == MY_PLAYER_ID), None)
+        _ai_slotted = [r for r in starters if r["id"] != MY_PLAYER_ID and (r.get("slot") or "")]
+        if (_me_st is not None and not (_me_st.get("slot") or "")
+                and _ai_slotted and len(_ai_slotted) == len(starters) - 1):
+            from collections import Counter as _Ctr
+            from formation_logic import _mismatch_rank
+            from constants import FORMATION_SLOTS as _FS
+            _my_pos = _me_st.get("position") or "CM"
+
+            def _fit(slot_):
+                return -1 if slot_ == _my_pos else _mismatch_rank(_my_pos, slot_)
+            # AI 주전이 11명보다 적으면(대회 중 은퇴 등) 포메이션에서 빈 자리를 먼저 쓴다.
+            try:
+                _fs = _FS.get(get_intl_formation(tournament_id, country_name)) or []
+            except Exception:
+                _fs = []
+            _free = list((_Ctr(_fs) - _Ctr(r["slot"] for r in _ai_slotted)).elements())
+            if len(starters) <= 11 and _free:
+                _me_st["slot"] = min(_free, key=_fit)
+            elif len(starters) > 11:
+                _rep = min(_ai_slotted, key=lambda r: (_fit(r["slot"]), (r["appearances"] or 0),
+                                                        (r["ovr"] or 0)))
+                _me_st["slot"] = _rep["slot"]
+                bench = [_rep] + bench
+                starters = [r for r in starters if r is not _rep]
         if len(starters) > 11:
             _demote = sorted((r for r in starters if r["id"] != MY_PLAYER_ID),
                               key=lambda r: ((r["appearances"] or 0), (r["ovr"] or 0)))
@@ -8237,9 +8405,9 @@ def get_cl_tournament_detail(tournament_id, entry_table="cl_entries",
         r["gd"] = r["gf"] - r["ga"]
     league_standings.sort(key=lambda r: (-r["pts"], -r["gd"], -r["gf"]))
 
+    # [2026-11-13] SELECT * — 홈·원정 2경기 기록(leg/slot/합산)도 같이. 슈퍼컵 표엔 leg가 없어 leg_of가 0으로 읽는다.
     ko_rows = c.execute(
-        f"SELECT stage, home_team_id, away_team_id, home_score, away_score, "
-        f"pso_winner, pso_score FROM {match_table} WHERE tournament_id=? AND "
+        f"SELECT * FROM {match_table} WHERE tournament_id=? AND "
         f"stage NOT IN ('league') AND home_score>=0 ORDER BY id",
         (tournament_id,)).fetchall()
 
@@ -8254,11 +8422,24 @@ def get_cl_tournament_detail(tournament_id, entry_table="cl_entries",
         m["home_info"] = team_info.get(m["home_team_id"], {})
         m["away_info"] = team_info.get(m["away_team_id"], {})
         ko_by_stage.setdefault(m["stage"], []).append(m)
-    knockout = [{"stage": s, "stage_ko": STAGE_KO.get(s, s), "matches": ko_by_stage[s]}
+    # [2026-11-13] 1·2차전 행은 대진(slot)별로 1차전→2차전 순서로 붙여 둔다(화면이 두 줄씩 묶어 그린다).
+    from competition.competition_common import leg_of
+    _two_leg = False
+    for _s, _ms in ko_by_stage.items():
+        for _m in _ms:
+            _m["leg"] = leg_of(_m)
+            if _m["leg"]:
+                _two_leg = True
+        if any(_m["leg"] for _m in _ms):
+            _ms.sort(key=lambda r: (r.get("slot") or 0, r["leg"], r.get("id") or 0))
+    knockout = [{"stage": s, "stage_ko": STAGE_KO.get(s, s), "matches": ko_by_stage[s],
+                 "two_leg": any(_m["leg"] for _m in ko_by_stage[s])}
                 for s in _CL_KO_STAGE_ORDER if s in ko_by_stage]
 
     return {"groups": {}, "league_standings": league_standings, "knockout": knockout,
-            "continent": continent, "comp_kind": _comp_kind_from_entry_table(entry_table)}
+            "continent": continent, "comp_kind": _comp_kind_from_entry_table(entry_table),
+            # [2026-11-13] 챔스·유로파·컨퍼런스: 3·4위 대신 4강(예전 기록 포함) / 2경기 형식 대회 여부
+            "semis_merge": match_table in _SEMIS_MERGE_TABLES, "two_leg": _two_leg}
 
 
 def _comp_kind_from_entry_table(entry_table: str) -> str:
@@ -8595,6 +8776,26 @@ def _po_sides_for_year(conn, year):
     return out
 
 
+def get_team_season_result(team_id, year):
+    """[2026-11-13 신설, 신민용 요청: "오퍼·입단 카드에 승격만 뜨지 말고 성적도 — 직행이면 파란색 순위, 승강
+    플레이오프면 그에 맞게, 강등도"] 그 팀의 그 해 리그 성적 한 줄(get_team_history와 같은 계산·캐시).
+    반환 {league_name, league_tier, rank, teams, record, pts, result, dest, champion} 또는 None(기록 없음).
+    result: "promo"(직행 승격) / "po_promo"(PO 승격) / "releg"(직행 강등) / "po_releg"(PO 강등) /
+    "po_fail"(승격 PO 탈락) / "po_survive"(강등 PO 생존) / None."""
+    try:
+        rows = (get_team_history(int(team_id), year_range=(int(year), int(year) + 1)) or {}).get("years") or []
+    except Exception:
+        return None
+    for e in rows:
+        if e.get("league_rank"):
+            return {"league_name": e.get("league_name"), "league_tier": e.get("league_tier"),
+                    "rank": e.get("league_rank"), "teams": e.get("league_teams"),
+                    "record": e.get("league_record"), "pts": e.get("league_pts"),
+                    "result": e.get("league_result"), "dest": e.get("league_dest"),
+                    "champion": bool(e.get("league_champion"))}
+    return None
+
+
 def league_text_color(text, champion=False):
     """[2026-10 18번] 리그 칸 글자색 — 팀 검색·선수 커리어·감독 커리어가 같이 쓴다.
     실제 승격(파랑) > 실제 강등(빨강) > 승격 PO 탈락(귤색) > 강등 PO 생존(연한 빨강) >
@@ -8766,17 +8967,29 @@ def get_team_history(team_id: int, year_range=None):
                          AND pl.league_name=?""",
                     (_cid, year, team_name, lg["tier"], lg["name"])).fetchone()
             move_txt = ""
+            # [2026-11-13 신설] 화면이 글자를 다시 파싱하지 않도록 구조화한 값도 같이 싣는다 — 오퍼·입단 카드의
+            # "지난 시즌 성적"(순위 + 직행/PO 승격·강등 색)이 쓴다. 기존 "league" 글자는 그대로.
+            _sides = _po_sides_for_year(conn, year).get(int(team_id)) or ()
+            _in_po = bool(_sides)
+            entry["league_name"], entry["league_tier"] = lg["name"], lg["tier"]
+            entry["league_rank"], entry["league_teams"] = rank, len(standings)
+            entry["league_pts"] = my_row["pts"] if (my_row and "pts" in my_row.keys()) else None
+            entry["league_result"] = None
             if move:
                 kind = "승격" if move["to_tier"] < lg["tier"] else "강등"
                 move_txt = f"  [{move['dest_name']}({move['to_tier']}부)로 {kind}]"
+                entry["league_result"] = (("po_promo" if _in_po else "promo") if kind == "승격"
+                                          else ("po_releg" if _in_po else "releg"))
+                entry["league_dest"] = move["dest_name"]
             else:
                 # [2026-10 18번] 승강 PO에 나갔지만 부수가 그대로인 팀 — 아래 리그 쪽(승격 도전)
                 # 이면 승격 PO 탈락, 위 리그 쪽(강등 위기)이면 강등 PO 생존.
-                _sides = _po_sides_for_year(conn, year).get(int(team_id)) or ()
                 if any(lo == league_id for _up, lo in _sides):
                     move_txt = f"  {PO_FAIL_TAG}"
+                    entry["league_result"] = "po_fail"
                 elif any(up == league_id for up, _lo in _sides):
                     move_txt = f"  {PO_SURVIVE_TAG}"
+                    entry["league_result"] = "po_survive"
             entry["league"] = f"{lg['name']}({lg['tier']}부) [{rank}등/{len(standings)}팀]{move_txt}"
             # [2026-08 신설] 1부 우승만 "리그 우승"으로 친다 — 하위 부수
             # 1등은 보통 승격이라 이미 승격색(파란색)이 우선 표시되고,
@@ -10073,6 +10286,25 @@ def get_manager_career(manager_id):
             # "재계약 (N년)". 기록이 없는 예전 재임은 예전처럼 "부임"만.
             _first_n, _renew_at = _contract_notes(t["contract_log"], years[0])
             _pay = _contract_pay(t["contract_log"], t["salary_log"], years[0])
+            # [2026-11-15 신민용 요청] 그 해 구단 목표 — 끝난 시즌은 감독 시장이 남긴 기록(team_season_ambition),
+            # 진행 중인 올해는 지금 팀 목표(teams.club_ambition — 지난 시즌 끝에 정해진 올해 목표).
+            _amb_by_year = {}
+            try:
+                for _ar in conn.execute(
+                        "SELECT year, ambition, basis FROM team_season_ambition "
+                        "WHERE team_id=? AND year BETWEEN ? AND ?",
+                        (t["team_id"], years[0], years[-1])):
+                    _amb_by_year[int(_ar[0])] = (_ar[1] or "", _ar[2] or "start")
+            except Exception:
+                pass
+            if years[-1] >= cur_year and cur_year not in _amb_by_year:
+                try:
+                    _ar = conn.execute("SELECT club_ambition FROM teams WHERE id=?",
+                                       (t["team_id"],)).fetchone()
+                    _cur_amb = ((_ar[0] if _ar else "") or "").strip()
+                except Exception:
+                    _cur_amb = ""
+                _amb_by_year[cur_year] = (_cur_amb, "live" if _cur_amb else "first")
             for y in years:
                 e = hist.get(y, {})
                 notes = []
@@ -10102,6 +10334,8 @@ def get_manager_career(manager_id):
                     "cl_champion": bool(e.get("cl_champion")),
                     "note": " · ".join(notes), "is_foreign": is_foreign,
                     "contract_pay": _pay.get(y),
+                    # [2026-11-15] (목표 문구, basis) — basis: start/derived/live/first. 기록 없으면 None.
+                    "club_objective": _amb_by_year.get(y),
                     # 이 해에 끝난 재임의 마지막 줄 — 같은 해 시즌 후 부임한 대표팀 줄보다 아래로.
                     "ended_this_year": t["end_year"] is not None and y == t["end_year"],
                 })

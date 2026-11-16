@@ -130,6 +130,33 @@ def et_score_values(hs90, as90, went_et):
     return (int(hs90), int(as90), 1 if went_et else 0)
 
 
+# ════════════════════════════════════════════════════════════════
+# [2026-11-13 신설, 신민용 확정 — 클럽 대항전 홈·원정 2경기] 챔스·유로파·컨퍼런스 토너먼트(결승 제외)를
+# 1·2차전으로 치른다. 컬럼 의미:
+#   {cl,el,ecl}_matches.leg            : 0 = 단판(과거 기록·리그 스테이지·결승), 1 = 1차전, 2 = 2차전
+#   {cl,el,ecl}_matches.agg_home_score : 2차전 행에만 — 이 경기 홈팀 기준 1·2차전 합산 득점(-1 = 미정)
+#   {cl,el,ecl}_matches.agg_away_score : 같은 기준, 원정팀 합산 득점
+#   {cl,el,ecl}_matches.winner_team_id : 진출(우승)팀 — 2차전·결승에만. 1차전은 승자를 정하지 않으므로 늘 0
+#   {cl,el,ecl}_tournaments.ko_legs    : 1 = 예전 단판 형식, 2 = 홈·원정 2경기 형식(새로 만드는 대회)
+# 경기별 득점·출전 기록은 경기 행 그대로(1차전·2차전 각각) — 합산은 별도 칸이라 개인 기록이 겹치지 않는다.
+# 기본값(0/-1/0/1)이 곧 하위호환 — 이 컬럼이 생기기 전 기록은 전부 "단판 형식"으로 읽힌다.
+# ════════════════════════════════════════════════════════════════
+TWO_LEG_MATCH_TABLES = ("cl_matches", "el_matches", "ecl_matches")
+TWO_LEG_TOURNAMENT_TABLES = ("cl_tournaments", "el_tournaments", "ecl_tournaments")
+_TWO_LEG_MATCH_COLS = (
+    ("leg", "INTEGER DEFAULT 0"),
+    ("agg_home_score", "INTEGER DEFAULT -1"),
+    ("agg_away_score", "INTEGER DEFAULT -1"),
+    ("winner_team_id", "INTEGER DEFAULT 0"),
+)
+
+
+def two_leg_migrations():
+    return ([f"ALTER TABLE {_t} ADD COLUMN {_n} {_d}"
+             for _t in TWO_LEG_MATCH_TABLES for _n, _d in _TWO_LEG_MATCH_COLS]
+            + [f"ALTER TABLE {_t} ADD COLUMN ko_legs INTEGER DEFAULT 1" for _t in TWO_LEG_TOURNAMENT_TABLES])
+
+
 def et_score_migrations():
     """ET 스코어 컬럼 ALTER TABLE 문 목록 — CREATE TABLE과 같은 정의
     (_ET_SCORE_COLS)에서 생성하므로 둘이 어긋날 수 없다."""
@@ -561,7 +588,61 @@ def set_match_results_write_hook(fn):
     _MR_WRITE_HOOK = fn
 
 
+# [2026-11 성능] hist.ai_player_season_stats "쓰기 세대" — 국가대표 선발 지표(intl_engine)가 이 표를
+# 나라마다 통째로 훑던 것을 한 번 훑은 결과로 재사용할 때, 표가 바뀌었는지 알아내는 용도다. 이 표에
+# 쓰는 길은 (1) 기록 DB 쓰기 큐(history_enqueue) (2) 풀 커넥션으로 직접 실행하는 SQL 두 가지뿐이라
+# 두 곳에서 세대를 올린다. 감시는 재사용 값이 실제로 만들어져 있는 동안에만 켜져(_APSS_WATCH) 평소
+# 핫패스 비용은 불리언 검사 하나다. 표 이름 부분일치(…_by_comp 포함)로 넉넉히 버린다 — 더 자주
+# 다시 훑을 뿐 결과는 같다.
+_APSS_GEN = 0
+_APSS_WATCH = False
+
+
+def apss_generation(watch=False):
+    """hist.ai_player_season_stats 쓰기 세대. watch=True면 다음 쓰기부터 세대가 오르게 감시를 켠다."""
+    global _APSS_WATCH
+    if watch:
+        _APSS_WATCH = True
+    return _APSS_GEN
+
+
+def _apss_bump():
+    global _APSS_GEN, _APSS_WATCH
+    _APSS_GEN += 1
+    _APSS_WATCH = False
+
+
+# [2026-11 성능] ai_players "쓰기 세대" — 위 _APSS_GEN과 같은 방식. 감독 시장 한 번 안에서 같은 "팀
+# 상위 11명 평균 OVR" 집계(manager_ability.team_ovr_map)를 4번 다시 계산하던 것을 재사용할 때, 그 사이
+# 선수 표가 바뀌었는지 알아내는 용도다. 표 이름 부분일치(ai_players_retired 등 포함)로 넉넉히 올린다 —
+# 더 자주 다시 계산할 뿐 결과는 같다. 감시는 재사용 값이 있는 동안에만 켜진다.
+_AIP_GEN = 0
+_AIP_WATCH = False
+
+
+def aip_generation(watch=False):
+    """ai_players 쓰기 세대. watch=True면 다음 쓰기부터 세대가 오르게 감시를 켠다."""
+    global _AIP_WATCH
+    if watch:
+        _AIP_WATCH = True
+    return _AIP_GEN
+
+
+def _aip_bump():
+    global _AIP_GEN, _AIP_WATCH
+    _AIP_GEN += 1
+    _AIP_WATCH = False
+
+
 def _maybe_invalidate_sql_caches(sql):
+    if _AIP_WATCH and isinstance(sql, str) and "ai_players" in sql:
+        _hp = sql.lstrip()[:1]
+        if _hp in _SQL_WRITE_HEADS or _hp in ("C", "c", "A", "a"):     # 쓰기·표 구조 변경
+            _aip_bump()
+    if _APSS_WATCH and isinstance(sql, str) and "ai_player_season_stats" in sql:
+        _ha = sql.lstrip()[:1]
+        if _ha in _SQL_WRITE_HEADS or _ha in ("C", "c", "A", "a"):     # 쓰기·표 구조 변경
+            _apss_bump()
     if _MR_WRITE_HOOK is not None and isinstance(sql, str):
         _h = sql[:1]
         if _h in (" ", "\n", "\t", "\r"):
@@ -640,6 +721,10 @@ class _PooledCursor:
         return self
     def executescript(self, *a, **kw):
         invalidate_intl_apps_cache()
+        if _APSS_WATCH:
+            _apss_bump()        # [2026-11 성능] 스크립트는 내용을 개별 판정할 수 없어 무조건 버린다
+        if _AIP_WATCH:
+            _aip_bump()
         # [2026-09] 스크립트는 통째로 실행돼 내용을 개별 판정할 수 없으니
         # match_results 쪽 캐시(league_day_map)도 무조건 버린다.
         if _MR_WRITE_HOOK is not None:
@@ -734,6 +819,8 @@ class _PooledConn:
     def executescript(self, *a, **kw):
         real = object.__getattribute__(self, "_real")
         invalidate_intl_apps_cache()
+        if _AIP_WATCH:
+            _aip_bump()         # [2026-11 성능] 스크립트는 내용을 개별 판정할 수 없어 무조건 올린다
         real_c = _retry_sqlite_op(real.executescript, *a, **kw)
         return _PooledCursor(real_c)
     def __getattr__(self, name):
@@ -1805,6 +1892,16 @@ def _migrate_sia_unique_country():
     uq_sql = (f"CREATE UNIQUE INDEX IF NOT EXISTS hist.{_SIA_UNIQUE_INDEX} ON season_individual_awards("
               "year, award_type, rank, IFNULL(league_country, ''))")
     if not has_old:
+        # [2026-11-13] 잠깐 배포됐던 "공동 득점왕·도움왕" 인덱스(…_v2)가 있으면 — 공동 1위 대신 동률 순위 규칙
+        # (득점왕: 골→도움→평점 등)으로 바꿔 한 명만 받게 됐다 — 그 사이 저장된 공동 1위 줄은 먼저 들어온
+        # 줄만 남기고 지운 뒤 예전 인덱스로 되돌린다.
+        if c.execute("SELECT 1 FROM hist.sqlite_master WHERE type='index' AND name=?",
+                     (_SIA_UNIQUE_INDEX + "_v2",)).fetchone():
+            c.execute("""DELETE FROM hist.season_individual_awards WHERE id NOT IN (
+                         SELECT MIN(id) FROM hist.season_individual_awards
+                         GROUP BY year, award_type, rank, IFNULL(league_country, ''))""")
+            c.execute(f"DROP INDEX IF EXISTS hist.{_SIA_UNIQUE_INDEX}_v2")
+            conn.commit()
         if not c.execute("SELECT 1 FROM hist.sqlite_master WHERE type='index' AND name=?",
                          (_SIA_UNIQUE_INDEX,)).fetchone():
             c.execute(uq_sql)
@@ -1994,6 +2091,8 @@ def load_from_disk() -> bool:
     이 경우 init_db()가 빈 인메모리 DB에 새 스키마를 만든다.
     디스크 직결 모드(USE_MEMORY_DB=False)에서는 항상 False(불필요)."""
     _clear_load_caches()
+    _apss_bump()        # [2026-11 성능] 다른 세이브를 읽으면 기록 DB 내용이 통째로 바뀐다 — 재사용 값 폐기
+    _aip_bump()
     if not USE_MEMORY_DB or not os.path.exists(DB_PATH):
         return False
     _ensure_mem_anchor()
@@ -2250,6 +2349,15 @@ def flush_to_disk(final=False):
     if not USE_MEMORY_DB:
         return
     _ensure_mem_anchor()
+    # [2026-11 성능] 같은 임시 파일(.tmp)을 두 저장이 동시에 쓰지 않게 직렬화한다(아래
+    # _flush_to_disk_via_memory_copy 주석). 이 경로는 "지금 상태"를 읽어 바로 쓰므로 순번을 여기서 받는다.
+    with _disk_write_lock:
+        _seq = _next_save_seq()
+        _flush_to_disk_locked(final)
+        _mark_save_written(_seq)
+
+
+def _flush_to_disk_locked(final):
     tmp_path = DB_PATH + ".tmp"
     if os.path.exists(tmp_path):
         _retry_on_windows_lock(os.remove, tmp_path)
@@ -2284,6 +2392,74 @@ def flush_to_disk(final=False):
         dst.close()
         src_snapshot.close()
     _retry_on_windows_lock(os.replace, tmp_path, DB_PATH)
+
+
+# [2026-11 성능, 신민용 리포트: "1년 돌리는 게 너무 오래 걸리고 데이터가 쌓일수록 더 걸린다"]
+# 자동저장(비동기)이 끝날 때까지 메인 쪽 DB 조회가 통째로 멈추던 문제(34시즌 세이브에서 4주마다 약 5초,
+# 1년 13회 = 약 65초 — 로그의 [진행 총계] 밖 빈 구간).
+#   · 원인: 저장 스레드가 "라이브 메모리 DB → 디스크 파일"을 직접 복사하는 동안 소스(공유 캐시 메모리 DB)를
+#     계속 쥐고 있었다. pages=1000/sleep=0.005 청크 백업은 조각 사이에 양보하려는 의도였지만 실측상 그렇게
+#     동작하지 않는다 — 파이썬 backup()의 sleep은 "잠금 충돌이 났을 때"만 쉬고 조각 사이에는 쉬지 않아서
+#     저장 스레드가 곧바로 다음 조각을 집는다(실측: 400MB 복사 내내 메인 스레드 조회 1건이 끝까지 대기).
+#     조각 사이에 실제로 쉬게 고치는 방법은 쓸 수 없다 — 메모리 DB는 백업 도중 다른 커밋이 끼면 SQLite가
+#     백업을 처음부터 다시 시작하므로, 게임이 진행 중이면 저장이 끝나지 않는다.
+#   · 수정: 자동저장만 두 단계로 나눈다. ① 라이브 메모리 DB → 저장 스레드 전용 메모리 사본(메모리끼리라
+#     디스크 속도와 무관하게 짧다 — 이 동안만 게임이 기다린다) ② 그 사본 → 디스크 파일(.tmp) → 원자적
+#     치환. ②는 게임이 쓰는 DB를 전혀 건드리지 않아 게임이 그대로 진행된다.
+#   · 저장되는 내용은 예전과 같은 "한 시점의 전체 스냅샷"이다(커밋 중간 상태는 백업 API가 거부·재시도).
+#     종료 시 마지막 저장(final=True)·동기 저장 경로는 그대로다.
+#   · 메모리: ②가 끝날 때까지 본 DB 크기만큼 더 쓴다. 사본을 못 만들면(메모리 부족 등) 예전 방식으로 저장.
+#   · 순서 보장: 디스크 쓰기는 _disk_write_lock으로 한 번에 하나만. 각 저장은 "소스를 읽기 시작한 순서"대로
+#     순번을 받고, 더 새 저장이 이미 디스크에 반영됐으면 낡은 사본은 쓰지 않는다(종료 직전 마지막 저장이
+#     뒤늦게 끝난 자동저장 사본에 덮이는 일을 막는다).
+_disk_write_lock = threading.Lock()
+_save_seq_lock = threading.Lock()
+_save_seq = 0            # 소스를 읽기 시작한 순서
+_save_written_seq = 0    # 디스크에 반영된 가장 최근 순번
+
+
+def _next_save_seq():
+    global _save_seq
+    with _save_seq_lock:
+        _save_seq += 1
+        return _save_seq
+
+
+def _mark_save_written(seq):
+    global _save_written_seq
+    with _save_seq_lock:
+        if seq > _save_written_seq:
+            _save_written_seq = seq
+
+
+def _flush_to_disk_via_memory_copy():
+    """자동저장 전용 — 위 주석의 두 단계 저장. 실패하면 예외를 그대로 올린다(호출부가 예전 방식으로 대체)."""
+    if not USE_MEMORY_DB:
+        return
+    _ensure_mem_anchor()
+    snap = sqlite3.connect(":memory:", timeout=30, check_same_thread=False)
+    try:
+        seq = _next_save_seq()
+        src = sqlite3.connect(_MEM_URI, uri=True, timeout=30)
+        try:
+            src.backup(snap, sleep=0.005)      # ① 한 번에 통째로(메모리 → 메모리)
+        finally:
+            src.close()
+        with _disk_write_lock:                 # ② 사본 → 디스크. 게임 DB와 무관
+            if seq < _save_written_seq:
+                return                         # 더 새 저장이 이미 디스크에 있다
+            tmp_path = DB_PATH + ".tmp"
+            if os.path.exists(tmp_path):
+                _retry_on_windows_lock(os.remove, tmp_path)
+            dst = sqlite3.connect(tmp_path, timeout=30)
+            try:
+                snap.backup(dst)
+            finally:
+                dst.close()
+            _retry_on_windows_lock(os.replace, tmp_path, DB_PATH)
+            _mark_save_written(seq)
+    finally:
+        snap.close()
 
 
 # [2026-08 신설, 신민용 리포트: "진행 버튼 누를 때 4주마다 한 번씩 0.7~1초
@@ -2325,7 +2501,11 @@ def flush_to_disk_async():
                 # 서로를 기다리는 순환 의존 없이 한 방향(hist→main)으로만
                 # 기다린다.
                 history_drain()
-                flush_to_disk()
+                try:
+                    _flush_to_disk_via_memory_copy()     # [2026-11 성능] 게임을 막는 시간을 메모리 복사로 줄임
+                except Exception as _e2:
+                    _history_log(f"[AUTOSAVE] 메모리 사본 저장 실패 — 예전 방식으로 저장합니다: {_e2!r}")
+                    flush_to_disk()
             except Exception as _e:
                 _history_log(f"[AUTOSAVE] 이번 자동저장을 건너뜁니다: {_e!r}")
         _flush_thread = threading.Thread(target=_worker, daemon=True,
@@ -2517,6 +2697,8 @@ def history_enqueue(kind, rows):
             "먼저 오류를 확인해야 합니다") from _history_worker_error
     rows = tuple(rows)   # 호출부가 이후 원본 리스트를 재사용/변경해도
                           # 안전하도록 이 시점 내용으로 스냅샷 고정(불변식 2)
+    if _APSS_WATCH and "ai_player_season_stats" in kind:
+        _apss_bump()        # [2026-11 성능] 위 _APSS_GEN 주석 — 큐로 들어오는 쓰기
     global _history_seq_counter, _history_pending, _history_max_pending_seen
     with _history_seq_lock:
         _history_seq_counter += 1
@@ -3352,6 +3534,20 @@ def init_db(load=True):
         PRIMARY KEY(tournament_id, country, player_id))""")
     c.execute("""CREATE INDEX IF NOT EXISTS idx_intl_callup_pool_player
         ON intl_callup_pool(player_id)""")
+    # [2026-11-15 신설, 신민용 요청: "후보 라인의 LB 후보는 주포가 아니라 국대에서 그 자리로 쓸 후보"] 선발 그룹
+    # (GK/CB/FB/CM/AM/WG/ST)별 후보 라인 — 표시 전용(감독 검색 후보 라인). 한 선수가 여러 그룹 경쟁에 들어갈
+    # 수 있어(예: CB가 CB 그룹과 FB 그룹) 키에 grp가 들어간다. 위 intl_callup_pool(주포 기준, 부상 대체 소집·
+    # 후보탈락 기록이 읽는 표)은 그대로 둔다. fit = 그 그룹 포지션 적합도, via = 'backfill'(정원 보충) 또는 ''.
+    c.execute("""CREATE TABLE IF NOT EXISTS intl_callup_role_pool(
+        tournament_id INTEGER, country TEXT, grp TEXT, quota INTEGER DEFAULT 0, rank INTEGER,
+        player_id INTEGER, score REAL DEFAULT 0, position TEXT DEFAULT '', fit REAL DEFAULT 1,
+        picked INTEGER DEFAULT 0, via TEXT DEFAULT '',
+        PRIMARY KEY(tournament_id, country, grp, player_id))""")
+    # [2026-11-15 개정] 카드 = 국대에서 쓰는 자리(LB/RB, CDM/CM, LW/RW 분리) — 이 칸이 비어 있는 행은 그룹 카드로 표시.
+    try:
+        c.execute("ALTER TABLE intl_callup_role_pool ADD COLUMN card TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
     # [2026-10-27 신설, 신민용 확정 — 국가대표 은퇴] AI 선수의 국가대표 출전 경력 요약 + 국대 은퇴 기록.
     # 연도 전환 때 ai_lifecycle._nt_retirement_pass가 그 해 실제 출전(intl_squad.appearances > 0 — A매치·
     # 예선·평가전·올림픽 모두)으로 갱신하고, 미출전 연수(올해 − last_app_year)와 나이로 은퇴를 판정한다.
@@ -3745,6 +3941,14 @@ def init_db(load=True):
                  ON national_objectives(tournament_id, country)""")
     c.execute("""CREATE INDEX IF NOT EXISTS idx_nat_obj_year
                  ON national_objectives(year, country)""")
+    # [2026-11-15 신설, 신민용 요청: "감독 검색 연도 펼침에 그 당시 구단이 목표했던 내용"] 시즌별 구단 목표
+    # 기록. teams.club_ambition은 시즌 끝마다 다음 시즌 목표로 덮어써져 지난 시즌 목표가 남지 않았다 —
+    # 감독 시장(ai_lifecycle._manager_turnover_run)이 그 시즌 경질 판정에 쓴 목표를 (연도, 팀)으로 남긴다.
+    # basis: 'start' = 시즌 시작 때 정해져 있던 목표 / 'derived' = 시작 목표가 비어(새 게임 첫 시즌) 시즌
+    # 결과로 산정한 목표. 읽기 전용 기록이라 게임 진행 결과에는 영향이 없다.
+    c.execute("""CREATE TABLE IF NOT EXISTS team_season_ambition(
+        year INTEGER, team_id INTEGER, ambition TEXT DEFAULT '', basis TEXT DEFAULT 'start',
+        PRIMARY KEY(year, team_id))""")
     c.execute("""CREATE TABLE IF NOT EXISTS offer_refused(
         team_id INTEGER, year INTEGER)""")
     # [2026-10 신설 — 감독 모드 대비 최소 조치] 사용자 감독 팀의 선발/벤치 선택.
@@ -5020,7 +5224,7 @@ def init_db(load=True):
     # military_service.MILITARY_*_COLS 한 곳에만 있다.
     # [2026-10 신설] U-23 올림픽 표·컬럼(competition/olympics.py) — OLYMPICS_ENABLED가 꺼져 있으면
     # 빈 목록이라 스키마가 하나도 안 바뀐다.
-    ] + et_score_migrations() + military_migrations() + _oly_migrations() + _card_rule_migrations() + _real_stats_migrations():
+    ] + et_score_migrations() + two_leg_migrations() + military_migrations() + _oly_migrations() + _card_rule_migrations() + _real_stats_migrations():
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,
         #  그 외 진짜 버그로 인한 예외는 숨기지 않는다. 동작은 기존과 동일.)
@@ -7970,6 +8174,8 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False, start_year=None):
     삭제는 그대로 다 수행). 실제 선수단 재생성은 그 다음 사용자가
     "새 게임"→"생성"/"랜덤 생성"을 눌러 reset_game_data()가 (skip 없이)
     다시 호출되는 시점에 진행률 창과 함께 정식으로 일어난다."""
+    _apss_bump()        # [2026-11 성능] 새 게임 — 기록 DB 재사용 값 폐기
+    _aip_bump()
     invalidate_intl_apps_cache()   # [2026-09] intl_squad 합계 캐시(새 DB/초기화 시 반드시 버린다)
     invalidate_military_cache()    # [2026-10] 군팀 id 캐시(team_id가 새 판에서 재사용되므로 반드시 버린다)
     _clear_world_browser_caches()   # [2026-09] 이전 판 팀 기록 캐시 제거
@@ -8058,6 +8264,7 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False, start_year=None):
               "intl_history","intl_tournaments","intl_entries","intl_matches","intl_squad","intl_formations","nat_generation",
               # [2026-10 신설] 대표팀 후보군(소집 경쟁에 포함됐으나 최종 명단에서 탈락).
               "intl_callup_pool",
+              "intl_callup_role_pool",   # [2026-11-15] 선발 그룹별 후보 라인(표시 전용)
               # [2026-10-27 신설] 국가대표 출전 경력·국대 은퇴 기록(player_id가 새 게임에서 재사용된다).
               "ai_nt_career",
               "cl_tournaments","cl_entries","cl_matches","cl_history",
@@ -8113,6 +8320,8 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False, start_year=None):
               # 재사용되므로, 안 지우면 이전 세계관의 대표팀 감독과 목표가
               # 새 게임에 그대로 남는다(위 team_managers와 똑같은 함정).
               "national_team_managers","national_objectives",
+              # [2026-11-15] 시즌별 구단 목표 기록 — team_id 재사용 함정 동일.
+              "team_season_ambition",
               # [2026-08 버그수정, 신민용 리포트: "새 게임(2000년) 시작했는데
               # 2001년 파워랭킹이 남아있다"] power_ranking.py의 8개 테이블
               # (레이팅 원본 2개 + 연도별 스냅샷 2개 + 연속우승 카운터 2개 +
@@ -10899,6 +11108,7 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
     picked = None
     _callup_src_tid = None      # [2026-10] 예선 명단을 물려받으면 그 예선의 후보군도 물려받는다
     _callup_cands = None        # [2026-10] 이번에 새로 뽑으면 그때의 후보군
+    _callup_roles = None        # [2026-11-15] 이번에 새로 뽑으면 그때의 선발 그룹별 후보 라인
     if trow and trow["kind"] not in ("wc_qual", "cont_qual"):
         conn_s = get_conn()
         srow = conn_s.execute(
@@ -10995,9 +11205,27 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
                 _biggest = max(_quota, key=_quota.get)
                 _quota[_biggest] = max(0, _quota[_biggest] - 1)
         _callup_cands = []
+        _callup_roles = []
         _callup_src_tid = None
         picked = _build_intl_squad_by_group(country, quota_by_group=_quota,
-                                            candidates_out=_callup_cands)
+                                            candidates_out=_callup_cands,
+                                            role_out=_callup_roles)
+        # [2026-11-15 신민용 리포트] 내가 뽑힌 대회면 후보 라인(선발 그룹 카드)에도 내 줄을 넣고, 그 카드 순위를
+        # 점수순으로 다시 매긴다(표시 전용 — AI 명단·순서는 그대로).
+        if _my_pos:
+            try:
+                from intl_engine import intl_my_callup_role_row
+                _me_row = intl_my_callup_role_row(country)
+            except Exception:
+                _me_row = None
+            if _me_row:
+                _same = [r_ for r_ in _callup_roles if r_.get("card") == _me_row["card"]]
+                _me_row["quota"] = (_same[0]["quota"] if _same else 0)
+                _same.append(_me_row)
+                _same.sort(key=lambda r_: (r_.get("via") == "backfill", -float(r_.get("score") or 0), r_["id"]))
+                for _rk, r_ in enumerate(_same, 1):
+                    r_["rank"] = _rk
+                _callup_roles.append(_me_row)
     if not picked:
         return []
     # [2026-09 신설, 신민용 요청: "국가 등급은 90+ 선수를 얼마나 자주
@@ -11043,6 +11271,26 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
                 "player_id, score, position) SELECT ?, country, bucket, rank, player_id, score, "
                 "position FROM intl_callup_pool WHERE tournament_id=? AND country=?",
                 (tournament_id, _callup_src_tid, country))
+        # [2026-11-15] 선발 그룹별 후보 라인(표시 전용) — 새로 뽑았으면 그때 값, 예선 명단을 물려받았으면
+        # 그 예선의 후보 라인을 그대로 물려받는다(후보군 표와 같은 규칙). 표가 없는 구세이브는 건너뛴다.
+        try:
+            if _callup_roles:
+                conn3.executemany(
+                    "INSERT OR IGNORE INTO intl_callup_role_pool(tournament_id, country, grp, quota, rank, "
+                    "player_id, score, position, fit, picked, via, card) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    [(tournament_id, country, rd["grp"], rd["quota"], rd["rank"], rd["id"],
+                      round(float(rd["score"]), 2), rd.get("position") or "", float(rd.get("fit") or 0),
+                      1 if rd.get("picked") else 0, rd.get("via") or "", rd.get("card") or "")
+                     for rd in _callup_roles])
+            elif _callup_src_tid is not None and _callup_cands is None:
+                conn3.execute(
+                    "INSERT OR IGNORE INTO intl_callup_role_pool(tournament_id, country, grp, quota, rank, "
+                    "player_id, score, position, fit, picked, via, card) SELECT ?, country, grp, quota, rank, "
+                    "player_id, score, position, fit, picked, via, card FROM intl_callup_role_pool "
+                    "WHERE tournament_id=? AND country=?",
+                    (tournament_id, _callup_src_tid, country))
+        except sqlite3.OperationalError:
+            pass
         conn3.commit()
     finally:
         _INTL_APPS_SUPPRESS = False

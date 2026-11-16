@@ -148,14 +148,41 @@ class MainWindow(QMainWindow):
 
         # 좌측 선수 패널: 박스 레이아웃 + 복수국적/긴 팀명 등 긴 텍스트를 수용하도록
         #   최소/최대폭을 넉넉히. (글자가 길면 이 범위 안에서 스플리터로 넓힐 수 있음)
-        splitter.addWidget(scroll(self.player_panel, 250, 380))
+        # [2026-11-13 변경, 신민용 요청: "플레이어 패널이 약간 잘릴 때가 있다 — 좌측 화면(패널 폭)을 지금 뜬
+        #   내용이 다 보이는 폭에 맞춰라(최대로 늘린 폭이 기준이 아니라)"] 폭을 _fit_left_panel이 내용 폭으로
+        #   정한다(패널을 갱신하거나 탭을 바꿀 때마다). 창을 키워도 좌측은 늘어나지 않고 가운데가 받는다.
+        self._left_scroll = scroll(self.player_panel, 250, 380)
+        self._left_fit_w = 0
+        splitter.addWidget(self._left_scroll)
         splitter.addWidget(scroll(self.center_panel, 400, 9999))
         splitter.addWidget(scroll(self.log_panel,    240, 340))
-        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 5)
         splitter.setStretchFactor(2, 3)
 
         vlay.addWidget(splitter)
+
+    def _fit_left_panel(self):
+        """[2026-11-13 신설] 좌측 선수 패널 폭 = 지금 보이는 내용이 잘리지 않는 폭(내용의 sizeHint + 세로
+        스크롤바·테두리). 250px 아래로는 안 줄이고, 화면을 지나치게 먹지 않게 560px에서 자른다(그보다 긴
+        내용은 예전처럼 줄바꿈·가로 스크롤). 폭이 바뀔 때만 다시 정한다."""
+        s = getattr(self, "_left_scroll", None)
+        if s is None:
+            return
+        try:
+            pp = self.player_panel
+            if pp.layout() is not None:
+                pp.layout().activate()
+            need = max(pp.sizeHint().width(), pp.minimumSizeHint().width())
+            need += s.verticalScrollBar().sizeHint().width() + 2 * s.frameWidth() + 2
+            need = max(250, min(560, need))
+            if abs(need - self._left_fit_w) <= 2:
+                return
+            self._left_fit_w = need
+            s.setMinimumWidth(need)
+            s.setMaximumWidth(need)
+        except RuntimeError:
+            pass
 
     def _make_top_bar(self):
         bar = QFrame()
@@ -281,6 +308,8 @@ class MainWindow(QMainWindow):
         갱신해야 화면이 밀리지 않는다."""
         self._update_top()
         self.player_panel.refresh()
+        from PyQt6.QtCore import QTimer as _QT_fit
+        _QT_fit.singleShot(0, self._fit_left_panel)   # [2026-11-13] 좌측 폭을 내용에 맞춘다
         self.center_panel.refresh()
         self.log_panel.refresh()
         # [2026-08 신설] 순위표만 매일 갱신 — _refresh_aux_window가 창이

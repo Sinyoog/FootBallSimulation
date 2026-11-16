@@ -229,6 +229,38 @@ def _make_intl_persistent_players(tournament_id, country: str, avg_ovr: float):
     return _intl_players_from_rows(picked)
 
 
+def _make_intl_persistent_team(tournament_id, country: str, avg_ovr: float):
+    """[2026-11-13 신설, 신민용 리포트: "국대 포메이션이 화면마다 다르다"] _make_intl_persistent_players와 같은
+    26인에, 실제 경기에서 쓰는 대회 포메이션과 선발 11명(intl_engine.preview_intl_lineup — DB에 쓰지 않는
+    미리보기)을 같이 돌려준다 — 우측 상대국 포메이션도 4-4-2 고정이 아니라 경기 상세와 같은 모양이 되게.
+    반환: (players 또는 None, 포메이션 이름 또는 None, 자리 순서 선수 id 목록 또는 None)."""
+    if not tournament_id:
+        return _make_intl_real_players(country, avg_ovr), None, None
+    from database import get_or_create_intl_squad
+    picked = get_or_create_intl_squad(tournament_id, country, avg_ovr, _INTL_FULL_SQUAD_POSITIONS)
+    if len(picked) < 8:
+        return None, None, None
+    form, lineup = None, None
+    try:
+        from intl_engine import preview_intl_lineup
+        form, lineup = preview_intl_lineup(tournament_id, country, picked)
+    except Exception:
+        form, lineup = None, None
+    if lineup is None or form not in FORMATION_SLOTS:
+        return _intl_players_from_rows(picked), None, None
+    return (_intl_players_from_rows(picked), form,
+            [(r["id"] if r is not None else None) for r in lineup])
+
+
+def _intl_lineup_avg(players, slot_ids):
+    """[2026-11-13] 자리 순서 선발(slot_ids)이 있으면 그 11명 평균 — 없으면 None(호출부가 예전 4-4-2 평균)."""
+    if not slot_ids:
+        return None
+    by_id = {pl.get("id"): pl for pl in (players or [])}
+    filled = [by_id[i] for i in slot_ids if i is not None and i in by_id]
+    return _avg_ovr(filled) if filled else None
+
+
 def _make_intl_real_players(country: str, avg_ovr: float):
     """[2026-07 재조정, 신민용 지적: "8명 미만 나라는 자국 1부나 남의 나라
     2부에서도 채울 수 있다"] database.get_country_squad_players()의
@@ -295,8 +327,11 @@ def _fetch_intl_opponents(tournament_id, my_nat, grp=None):
     result = []
     for r in rows:
         avg = r["ovr"] or 50
-        players = _make_intl_persistent_players(tournament_id, r["country"], avg) or _make_intl_virtual_players(avg)
-        avg = _intl_starters_avg(players) or avg
+        # [2026-11-13] 상대국도 실제 경기의 대회 포메이션·선발 11명(_make_intl_persistent_team).
+        players, _form, _slot_ids = _make_intl_persistent_team(tournament_id, r["country"], avg)
+        if not players:
+            players, _form, _slot_ids = _make_intl_virtual_players(avg), None, None
+        avg = _intl_lineup_avg(players, _slot_ids) or _intl_starters_avg(players) or avg
         # [2026-08 재수정, 신민용 명확화: "국대는 합을 맞춰본 선수들이
         # 아니니 팀 전체 OVR은 계산치(포메이션/케미 반영)로 가는 게
         # 맞고, 대신 실제 11명은 각자 소속팀에서 잘하는 진짜 선수여야
@@ -314,8 +349,9 @@ def _fetch_intl_opponents(tournament_id, my_nat, grp=None):
             "name":      r["country"],
             "flag":      r["flag"] or "",
             "avg_ovr":   round(avg, 1),
-            "formation": "4-4-2",
+            "formation": _form or "4-4-2",
             "players":   players,
+            "slot_lineup": _slot_ids,
         })
     return result
 
@@ -342,13 +378,16 @@ def _fetch_intl_ko_opp(tournament_id, my_nat, week):
     # 대진용인 이 함수만 그 수정이 안 들어가 있어서 항상 가상 선수
     # (_make_intl_virtual_players, 정확히 11명만·후보 없음·전 스탯이
     # OVR과 동일)로 직행하고 있었다 — 같은 패턴으로 통일한다.
-    players = _make_intl_persistent_players(tournament_id, opp, avg) or _make_intl_virtual_players(avg)
-    avg = _intl_starters_avg(players) or avg
+    players, _form, _slot_ids = _make_intl_persistent_team(tournament_id, opp, avg)
+    if not players:
+        players, _form, _slot_ids = _make_intl_virtual_players(avg), None, None
+    avg = _intl_lineup_avg(players, _slot_ids) or _intl_starters_avg(players) or avg
     return [{"team_id": None, "name": opp,
              "flag": fr["flag"] if fr else "",
              "avg_ovr": round(avg, 1),
-             "formation": "4-4-2",
-             "players": players}]
+             "formation": _form or "4-4-2",
+             "players": players,
+             "slot_lineup": _slot_ids}]
 
 # [2026-08 신설, 신민용 리포트: "우측 상대팀 포메이션 확인 기능이 월드컵
 # 외 국제대회(클럽 월드컵)에서는 안 뜬다"] _resolve_opponents가 intl/cl만
@@ -716,7 +755,28 @@ class _FormationCanvas(QWidget):
             # 결정)만 비우고 나머지 슬롯 각각에 그 슬롯의 실제 포지션을
             # 가진 AI를 만든다 — 슬롯 인덱스(_slot_idx)를 그대로 태그해서
             # paintEvent가 순서에 의존하지 않고 원본 슬롯으로 직접 매칭한다.
-            slots_only = FORMATION_SLOTS["4-4-2"]
+            # [2026-11-13 버그수정, 신민용 리포트: "메인 화면 좌측 국대 포메이션은 4-4-2인데, 경기 상세·세계 축구
+            # 기록실은 4-3-3(감독 설명의 대회 포메이션)으로 뜬다"] 여기만 포메이션을 "4-4-2"로 고정하고 선발도
+            # 따로 뽑았다. 대회 문맥이 있으면 26인을 먼저 받아, 실제 경기와 같은 대회 포메이션·같은 선발 11명
+            # (intl_engine.preview_intl_lineup — DB에 쓰지 않는 미리보기)을 쓴다. 미리보기가 안 되는 경우
+            # (문맥 없음·풀 8명 미만 등)만 예전처럼 4-4-2.
+            from database import get_country_squad_players, get_or_create_intl_squad, get_ai_player_custom_names
+            from constants import ai_player_code
+            _pre_picked = None
+            _nt_lineup = None
+            if intl_nat and tournament_id:
+                _pre_picked = get_or_create_intl_squad(
+                    tournament_id, intl_nat, avg_ovr, _INTL_FULL_SQUAD_POSITIONS)
+                try:
+                    from intl_engine import preview_intl_lineup
+                    _nt_form, _nt_lineup = preview_intl_lineup(tournament_id, intl_nat, _pre_picked)
+                except Exception:
+                    _nt_form, _nt_lineup = None, None
+                if _nt_lineup is not None and _nt_form in FORMATION_SLOTS:
+                    self.formation = _nt_form
+                else:
+                    _nt_lineup = None
+            slots_only = FORMATION_SLOTS.get(self.formation, FORMATION_SLOTS["4-4-2"])
             my_pos = p.get("position", "CM") if p else "CM"
             my_slot_idx, my_field_pos, _mismatch = _best_slot_for_player(my_pos, slots_only)
 
@@ -751,9 +811,10 @@ class _FormationCanvas(QWidget):
             # (명단 패널에만 표시, 필드엔 안 나감)로 나눠서 쓴다.
             remaining_slots = [(i, sp) for i, sp in enumerate(slots_only)
                                 if not (p and i == my_slot_idx)]
-            from database import get_country_squad_players, get_or_create_intl_squad, get_ai_player_custom_names
-            from constants import ai_player_code
-            if intl_nat and tournament_id:
+            if _pre_picked is not None:
+                # [2026-11-13] 위에서 대회 포메이션을 정하느라 이미 받아 둔 같은 26인 풀.
+                picked = _pre_picked
+            elif intl_nat and tournament_id:
                 # [2026-08 신설] 대회 내내 고정되는 26인 풀(상대팀과 동일
                 # 소스) — 나(me)는 이 풀에 아예 없으므로(ai_players가
                 # 아니라 별도 존재) 그대로 써도 "나를 뺀 25명 고정"이
@@ -817,9 +878,17 @@ class _FormationCanvas(QWidget):
                 # 타지 않는 평소 경로에서는 아래쪽 slot_filled = _greedy_fill_slots(...)
                 # 가 UnboundLocalError로 죽는다. 이 파일 맨 아래에 이미
                 # 모듈 수준 import가 있으므로 그대로 쓰면 된다.
-                _cand = [{"_i": k, "position": r["position"], "ovr": r["ovr"] or 0}
-                         for k, r in enumerate(pool)]
-                _placed = _greedy_fill_slots(_cand, [sp for _, sp in remaining_slots])
+                if _nt_lineup is not None:
+                    # [2026-11-13] 실제 경기 라인업(대회 포메이션 자리 순서) 그대로 — 내 자리에 서 있던
+                    # AI 한 명만 빠져 후보로 간다(경기에서도 그 자리를 내가 대신 맡는다).
+                    _k_of = {r["id"]: k for k, r in enumerate(pool)}
+                    _placed = [({"_i": _k_of[_nt_lineup[i]["id"]]}
+                                if (_nt_lineup[i] is not None and _nt_lineup[i]["id"] in _k_of) else None)
+                               for i, _sp in remaining_slots]
+                else:
+                    _cand = [{"_i": k, "position": r["position"], "ovr": r["ovr"] or 0}
+                             for k, r in enumerate(pool)]
+                    _placed = _greedy_fill_slots(_cand, [sp for _, sp in remaining_slots])
                 starter_picked = [pool[c["_i"]] if c is not None else None for c in _placed]
                 _used_idx = {c["_i"] for c in _placed if c is not None}
                 # 주전 배정에 안 쓰인 나머지 전부가 후보(원래 풀 순서 유지)
@@ -1092,11 +1161,21 @@ class _FormationCanvas(QWidget):
         _fill_candidates = full_squad if full_squad else raw_players
         # [2026-08 버그수정] 배정은 _greedy_fill_slots가 담당 — 자세한 설명은
         # 그 함수 주석 참고(포지션 몰린 스쿼드에서의 연쇄 오배치 수정).
+        _slot_ids = team.get("slot_lineup")
         if full_squad:
             # [⑦-c] 실제 클럽팀 — 통일 스위치가 켜지면 경기 전력과 같은 최적 배치(꺼져 있으면
             # club_fill_slots가 예전 _greedy_fill_slots를 그대로 부른다).
             from team_plan import club_fill_slots as _club_fill_o
             slot_filled = _club_fill_o(_fill_candidates, slots_only)
+        elif _slot_ids and len(_slot_ids) == len(slots_only):
+            # [2026-11-13] 국가대표 상대국 — 실제 경기 선발(대회 포메이션 자리 순서, _make_intl_persistent_team).
+            _by_id = {pl.get("id"): pl for pl in raw_players}
+            slot_filled = []
+            for _si, _pid in enumerate(_slot_ids):
+                _pl = _by_id.get(_pid) if _pid is not None else None
+                if _pl is not None:
+                    _pl["_slot_idx"] = _si    # _greedy_fill_slots와 같이 그 dict에 바로 태깅(명단 패널이 같이 봄)
+                slot_filled.append(_pl)
         else:
             slot_filled = _greedy_fill_slots(_fill_candidates, slots_only)
         # [2026-08 버그수정, 신민용 리포트: "주전 명단에 GK가 2명 뜬다"]

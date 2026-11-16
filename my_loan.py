@@ -6,8 +6,8 @@
     핵심 → 임대 희망 거절. 같은 선수에게 판매·임대를 동시에 추진하지 않는다.
   - 구단 임대 추진은 22주(상반기 출전)·40주(시즌 출전) 두 번 판정, 제안 창에서 수락/거부.
   - 임대 희망은 언제든 제출 → 다음 주 구단 승인/거절 → 승인되면 2~6주에 걸쳐 오퍼 0~3개.
-  - 실제 이동은 예약 후 처음 오는 이동 시점(4주 상반기 시작 / 29주 하반기 시작)에만.
-  - 기간은 6개월 단위(6개월~2년). 복귀는 29주(상반기 끝) 또는 시즌 끝.
+  - 실제 이동은 예약 후 처음 오는 이동 시점(2주 프리시즌 / 27주 겨울 — 2026-11-13, 예전 4주·29주)에만.
+  - 기간은 6개월 단위(6개월~2년). 복귀는 27주(상반기 끝, 예전 29주) 또는 시즌 끝.
   - 같은 두 구단 사이 누적 임대는 반 시즌 단위로 최대 2년, 계약 잔여 안에서만.
   - 임대 희망 거절이 두 시즌 연속이면 "임대 불만"(기존 transfer_rejection_count와 별개).
   - 정리 목적 임대를 거부하면 그 시즌·다음 시즌 벤치 확률 보정(시즌 끝 재판정으로 해제).
@@ -27,6 +27,7 @@ from constants import (FIRST_HALF_START, SECOND_HALF_START, MILITARY_COUNTRY,
                        MY_LOAN_WISH_OFFER_COUNT_W, MY_LOAN_WISH_APPROVE,
                        MY_LOAN_FRUSTRATION_STREAK, MY_LOAN_FRUSTRATION_YEARS,
                        MY_LOAN_BUY_WINTER_WEEKS, MY_LOAN_REJUDGE_WEEK)
+from constants import MY_PRESEASON_MOVE_WEEK as MOVE_W1, MY_WINTER_MOVE_WEEK as MOVE_W2   # [2026-11-13] 이동 시점 2·27주
 
 
 def _ge():
@@ -64,18 +65,19 @@ def _abs(y, w):
 # ── 시간 규칙 ────────────────────────────────────────────────────
 def next_window(year, week):
     """예약 시점(year, week) 이후 처음 오는 이동 시점. 그 주차의 이동 처리는 이미
-    끝난 것으로 본다(29주에 예약하면 다음 해 4주)."""
-    if week < FIRST_HALF_START:
-        return (year, FIRST_HALF_START)
-    if week < SECOND_HALF_START:
-        return (year, SECOND_HALF_START)
-    return (year + 1, FIRST_HALF_START)
+    끝난 것으로 본다(27주에 예약하면 다음 해 2주).
+    [2026-11-13 신민용 확정] 이동 시점 4·29주 → 2·27주(constants.MY_PRESEASON_MOVE_WEEK / MY_WINTER_MOVE_WEEK)."""
+    if week < MOVE_W1:
+        return (year, MOVE_W1)
+    if week < MOVE_W2:
+        return (year, MOVE_W2)
+    return (year + 1, MOVE_W1)
 
 
 def loan_return_point(exec_year, exec_week, halves):
-    """이동 시점 + 반 시즌 수 → (복귀 연도, 복귀 반기). 반기 1 = 그 해 29주 복귀(상반기 끝),
+    """이동 시점 + 반 시즌 수 → (복귀 연도, 복귀 반기). 반기 1 = 그 해 27주 복귀(상반기 끝),
     반기 2 = 그 해 시즌 끝 복귀."""
-    h0 = exec_year * 2 + (0 if exec_week == FIRST_HALF_START else 1)
+    h0 = exec_year * 2 + (0 if exec_week == MOVE_W1 else 1)
     he = h0 + int(halves) - 1
     return he // 2, (he % 2) + 1
 
@@ -157,7 +159,7 @@ def planned_loan_text(p=None, team_id=None):
     sy, sw = p.get("loan_start_year") or 0, p.get("loan_start_week") or 0
     ey = p.get("loan_end_year") or 0
     if sy and ey:
-        h0 = sy * 2 + (0 if sw <= FIRST_HALF_START else 1)
+        h0 = sy * 2 + (0 if sw <= FIRST_HALF_START else 1)   # 시작 주 2(새 규칙)·4(예전 기록) 모두 상반기
         he = ey * 2 + (0 if (p.get("loan_end_half") or 2) == 1 else 1)
         return halves_text(max(1, he - h0 + 1))
     return ""
@@ -762,7 +764,7 @@ def _execute_pending_loan(year, week):
     _sync_new_league(host, host["id"], year, week)
     ge.add_log(f"🔄 {host['name']}로 임대!  {host['lname']}({host['tier']}부)  |  연봉·계약은 "
                f"원소속팀 그대로  |  기간 {halves_text(halves)} "
-               f"({ry}년 {'29주' if rh == 1 else '시즌 끝'} 복귀)  |  {wage_split_text(_split)}",
+               f"({ry}년 {'27주' if rh == 1 else '시즌 끝'} 복귀)  |  {wage_split_text(_split)}",
                "event", year, week)
     return True
 
@@ -773,7 +775,7 @@ def _is_new_loan(p):
 
 
 def _midseason_loan_end(year, week):
-    """29주: 상반기 끝에 끝나는 임대(반기 1) — 완전 영입 수락분은 이적, 아니면 복귀."""
+    """27주(겨울 이동 시점): 상반기 끝에 끝나는 임대(반기 1) — 완전 영입 수락분은 이적, 아니면 복귀."""
     ge = _ge()
     p = ge.get_player() or {}
     if not (_is_new_loan(p) and p.get("loan_end_half") == 1
@@ -853,14 +855,14 @@ def _midseason_loan_buy(p, year, week, proposal):
 
 
 def loan_end_text(p):
-    """임대가 끝나는 시점 문구 — 29주 복귀 새 임대는 "하반기가 시작되면", 그 외 "시즌이 끝나면"."""
+    """임대가 끝나는 시점 문구 — 27주 복귀 새 임대는 "겨울 이동 시점(27주)에", 그 외 "시즌이 끝나면"."""
     if _is_new_loan(p or {}) and (p or {}).get("loan_end_half") == 1:
-        return "하반기가 시작되면(29주)"
+        return "겨울 이동 시점(27주)에"
     return "시즌이 끝나면"
 
 
 def loan_buy_window_ok(p, year, week):
-    """임대처 완전 영입 판정 시점 — 반기 1 복귀(29주)는 겨울 휴식기, 그 외는 기존 규칙."""
+    """임대처 완전 영입 판정 시점 — 반기 1 복귀(27주)는 겨울 휴식기(25~26주), 그 외는 기존 규칙."""
     if _is_new_loan(p) and p.get("loan_end_half") == 1:
         lo, hi = MY_LOAN_BUY_WINTER_WEEKS
         return (p.get("loan_end_year") or 0) == year and lo <= week <= hi
@@ -913,9 +915,9 @@ def _expire(year, week):
 
 # ── 엔진 연결 지점 ───────────────────────────────────────────────
 def window_hook(year, week):
-    """_advance_week가 4주·29주에 진입할 때, 기존 예약 이적 실행보다 먼저 부른다.
+    """_advance_week가 이동 시점(2주·27주)에 진입할 때, 기존 예약 이적 실행보다 먼저 부른다.
     순서: 반기 1 임대 종료(완전 영입/복귀) → 새 임대 실행 → 만료 정리."""
-    if week == SECOND_HALF_START:
+    if week == MOVE_W2:
         _midseason_loan_end(year, week)
     _execute_pending_loan(year, week)
     _expire(year, week)

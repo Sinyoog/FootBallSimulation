@@ -48,6 +48,7 @@
 내 선수와 AI 선수는 같은 입력(대회별 골·도움·출전, 시즌 OVR)으로 같은 공식을 쓴다 — 이 모듈에는 선수 종류를 가르는
 분기가 없다. 내 선수만 가진 태클·키패스·실제 경기 평점은 입력에 없다."""
 
+import math
 from constants import EST_POS_GOAL, EST_POS_ASSIST
 import yashin_award as _Y
 
@@ -336,3 +337,356 @@ def score_continent(entries, mult=CONT_INTL_MULT):
     """[2026-11 신설] 대륙 올해의 선수 채점 — 발롱도르와 같은 후보·같은 score_season에 continental_entries만 거친 것.
     총점 내림차순 정렬 리스트(국적 대륙별 1위는 호출부가 고른다)."""
     return score_season(continental_entries(entries, mult))
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════════
+# [2026-11 신설, 신민용 확정] 발롱도르 1위 최소 자격 — 점수와 분리된 1위 선정 필터(점수·Top30 구성·2위 이하 상대 순서 불변).
+#   Top30을 지금처럼 확정한 뒤, 아래 경로 중 하나 이상을 충족한 선수 중 점수가 가장 높은 선수를 1위로 올린다(나머지는
+#   원래 순서 그대로 한 칸씩 뒤로). Top30 안에 자격자가 없으면 기존 1위 유지(공석·Top30 밖 추가 없음). 2위 이하엔 적용 안 함.
+#   A  소속팀(시즌 중 이적생은 대륙대회를 뛴 상반기 팀) — 유럽 챔피언스리그 4강 이상 · 유럽 유로파리그 우승 ·
+#      남미 챔피언스리그(코파 리베르타도레스) 우승. 아시아·아프리카·북미 챔스는 단독 인정 안 함.
+#      [2026-11-15 개정, 신민용 확정: 2004 유로파 우승 + 리그 MVP 78골 시즌이 1위에서 막힌 사례]
+#   B  국가대표 대회 — 대회별 인정 성적(TOP1_INTL_RULES) + 그 대회 전체 경기(최다 경기 팀 기준)의 50% 이상 출전.
+#      [2026-11-15 개정] 월드컵·유로 4강 이상 / 코파 아메리카 결승 / 남북미 대륙컵·아시안컵·아프리카 네이션스컵·골드컵
+#      우승. 유럽 네이션스컵·오세아니아컵·그 밖 지역컵은 제외.
+#      예외: 인정 성적 미달이라도 그 대회 MVP(월드컵 골든볼) 또는 득점왕(골든부트) — 월드컵·유로·코파만, 출전 50% 그대로.
+#   C  1부 리그 + 소속팀 유럽 챔스 8강 이상 +
+#      C-1 리그 MVP + (리그 공격포인트 1위 또는 리그 평점 1위)
+#      C-2 리그 득점왕 또는 도움왕 + 리그 공격포인트 1위 + 리그 평점 3위 이내
+#      순위는 같은 리그에서 리그 출전 70% 이상 선수끼리(더 높은 선수 수 + 1 — 동률은 같은 순위).
+#   D  [2026-11-15 신설] 5대 리그(잉글랜드·스페인·이탈리아·독일·프랑스) 1부 우승팀 소속 + 그 리그 MVP 또는 득점왕
+#      (대륙대회 성적은 안 본다 — 리그 MVP·득점왕 자체가 리그 출전 70% 이상이 조건이라 추가 출전 조건은 두지 않는다).
+#   MVP·득점왕은 자격 판정에만 쓰고 점수에는 넣지 않는다(발롱 점수엔 개인상 가산점이 없다).
+#   리그 MVP 선정 방식이 바뀌면 C-1을 다시 검증한다(40시즌 조사: 기존 1위 40명 중 32명 유지, 8명 변경).
+# ════════════════════════════════════════════════════════════════════════════════════════════════════════
+TOP1_CL_SF = ("4강", "준우승", "우승")
+TOP1_CL_QF = ("8강",) + TOP1_CL_SF
+TOP1_INTL_NAMES = ("월드컵", "유로(EURO)", "코파 아메리카")   # B-예외(MVP·득점왕) 대상 · 발롱 ②예외 대상(그대로)
+TOP1_INTL_SF = ("4강", "3위", "4위", "준우승", "우승")
+TOP1_INTL_FINAL = ("준우승", "우승")
+TOP1_INTL_WIN = ("우승",)
+# [2026-11-15 개정, 신민용 확정] B 경로 대회별 인정 성적(대회 이름 → 인정 단계 라벨).
+TOP1_INTL_RULES = {
+    "월드컵": TOP1_INTL_SF, "유로(EURO)": TOP1_INTL_SF,
+    "코파 아메리카": TOP1_INTL_FINAL,
+    "남북미 대륙컵": TOP1_INTL_WIN, "아시안컵": TOP1_INTL_WIN, "아프리카 네이션스컵": TOP1_INTL_WIN, "골드컵": TOP1_INTL_WIN,
+}
+TOP1_BIG5 = ("잉글랜드", "스페인", "이탈리아", "독일", "프랑스")
+TOP1_PATH_DESC = {
+    "A": "A 클럽 대회(챔스 4강↑ · 유로파 우승 · 남미 챔스 우승)",
+    "B": "B 국가대표 대회 성적",
+    "B-예외": "B 예외(월드컵·유로·코파 MVP 또는 득점왕)",
+    "C-1": "C-1 리그 MVP + 공격P/평점 1위 + 챔스 8강↑",
+    "C-2": "C-2 리그 득점·도움왕 + 공격P 1위·평점 3위↑ + 챔스 8강↑",
+    "D": "D 5대 리그 우승 + 리그 MVP/득점왕",
+}
+
+
+def top1_paths(g):
+    """1위 자격 경로 목록(빈 목록 = 자격 없음). g(없으면 미충족):
+      cl_stage  유럽 챔스 단계 라벨('우승'·'준우승'·'4강'·'8강'·…) — 유럽 챔스가 아니면 None
+      el_win    유럽 유로파리그 우승 · sa_cl_win 남미 챔피언스리그 우승 (bool)
+      intl      [{"name": 대회 이름, "stage": 국가 단계 라벨, "apps": 출전, "n": 대회 최다 경기 수, "mvp": bool,
+                  "scorer": bool}] (TOP1_INTL_RULES 대회만 — name이 없으면 예전 규칙(4강 이상·예외 허용)으로 본다)
+      big5_champ  5대 리그 1부 우승팀 소속인가
+      tier1     소속 리그가 1부인가 · league_awards {'MVP', '득점왕', '도움왕'} 중 받은 것
+      ga_rank / rt_rank  리그 공격포인트·평점 순위(1부터)"""
+    out = []
+    cl = g.get("cl_stage")
+    if cl in TOP1_CL_SF or g.get("el_win") or g.get("sa_cl_win"):
+        out.append("A")
+    for t in g.get("intl") or ():
+        n, apps = t.get("n") or 0, t.get("apps") or 0
+        if n <= 0 or apps * 2 < n:              # 출전 50% 미만(정수 비교)
+            continue
+        nm = t.get("name")
+        ok = TOP1_INTL_RULES.get(nm, TOP1_INTL_SF) if nm else TOP1_INTL_SF
+        if nm and nm not in TOP1_INTL_RULES:
+            continue
+        if t.get("stage") in ok:
+            out.append("B")
+            break
+        if (not nm or nm in TOP1_INTL_NAMES) and (t.get("mvp") or t.get("scorer")):
+            out.append("B-예외")
+            break
+    aw = set(g.get("league_awards") or ())
+    if g.get("tier1") and cl in TOP1_CL_QF:
+        ga, rt = g.get("ga_rank"), g.get("rt_rank")
+        if "MVP" in aw and (ga == 1 or rt == 1):
+            out.append("C-1")
+        elif aw & {"득점왕", "도움왕"} and ga == 1 and rt is not None and rt <= 3:
+            out.append("C-2")
+    if g.get("big5_champ") and aw & {"MVP", "득점왕"}:
+        out.append("D")
+    return out
+
+
+def apply_top1_gate(top, paths_of):
+    """Top30(점수 순) → (새 순서 리스트, 1위의 자격 경로 목록). paths_of(entry) = top1_paths 결과.
+    1위가 자격이 있으면 그대로, 없으면 자격자 중 가장 앞(점수 최고)을 맨 앞으로 — 나머지 순서 유지.
+    자격자가 아무도 없으면 그대로(경로 목록 빈 값). top은 바꾸지 않는다."""
+    lst = list(top)
+    for i, e in enumerate(lst):
+        p = paths_of(e)
+        if p:
+            if i == 0:
+                return lst, p
+            return [e] + lst[:i] + lst[i + 1:], p
+    return lst, []
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════════
+# [2026-11 신설, 신민용 확정] 발롱도르 전용 채점 — score_season_bd. 기존 score_season(대륙 올해의 선수·골든보이 등이
+# 쓰는 공용 채점)은 그대로 두고 발롱도르 Top30만 이 경로로 채점한다. 40시즌 읽기 전용 실험(V7a + E안 + (라))으로 정한 값.
+#  ① 생산성(V7a): 공격량 척도가 꺾이는 지점(VOL_BAND 상한) 위에서 멈추지 않고 로그 곡선으로 계속 오른다(꺾임 지점
+#     기울기의 절반에서 시작). 미드필더(CAM·CM·LM·RM)는 미드필더 공격량 상위 0.5%(BD_MF_VOL_KNEE)부터 같은 세기의
+#     로그 가산을 더한다. 꺾임 아래 점수·기대 대비 척도·DF 팀 수비·GK는 기존과 같다.
+#  ② 국가대표 기록((라)): 주요 대회(월드컵·대륙 선수권·코파·골드컵 — 국대 'world'·'continent', 수준 0.27 이상 'region')
+#     골·도움은 생산성에서 빼고 국대 개인 활약 칸에서만 센다. 단, 그 대회들의 실제 골+도움이 기대치보다 적으면 기대 대비
+#     척도는 지금처럼 대회 경기를 넣어 계산해 부진 감점을 남긴다(공격량에는 넣지 않음 — 두 번 세지 않게). 예선·소규모
+#     지역컵은 생산성에 그대로.
+#  ③ 국대 개인 활약(E안): 국대 팀 성적 칸(W_INTL, 1.0)은 그대로 두고 개인 활약 칸(BD_IND_W, 1.0)을 따로 더한다.
+#     대회마다 0~1(포지션 기대 대비 + 공격량, DF는 팀 실점 30%, GK는 선방·클린시트·실점) → 대회·포지션별 최저선
+#     (4강 이상 팀 주전 중앙값) 아래는 0 → 출전 비율 × 대회 위상(_ballon_comp_level) → MVP 25%(개인 활약 칸의 7.5%),
+#     그 해 주요 8개 대회 중 가장 높은 값. 대회 평점은 쓰지 않는다(OVR과 상관 0.91). 득점왕은 골로 이미 반영.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════════
+BD_VOL_LOG_K = 0.5                 # 꺾임 뒤 로그 곡선 시작 기울기 = 꺾임 지점 직선 기울기 × 0.5
+BD_MF_POS = ("CAM", "CM", "LM", "RM")
+BD_MF_VOL_KNEE = 30.353409981827   # 미드필더(CAM·CM·LM·RM) 공격량 상위 0.5% — 40시즌 후보 분포
+BD_MF_LOG_K = 0.5
+BD_IND_W = 1.0                     # 국대 개인 활약 칸 배점(국대 팀 성적 W_INTL과 별도)
+BD_IND_MVP = 0.25                  # MVP 반영 비율(100% = 개인 활약 칸의 30%)
+BD_IND_MVP_SHARE = 0.30
+BD_IND_MAIN = ("월드컵", "유로(EURO)", "코파 아메리카", "유럽 네이션스컵", "남북미 대륙컵", "아프리카 네이션스컵",
+               "아시안컵", "골드컵")
+BD_IND_SHRINK = 2.0                # 대회 기대 대비 축소 상수(짧은 대회)
+BD_IND_REL = (1.0, 2.375)          # 대회 기대 대비: 기대만큼 → 0, 주요 대회 출전 50%+ 필드 선수 상위 1% → 1
+BD_IND_VOL = (0.0, 8.75)           # 대회 공격량(골 + 0.75 × 도움): 0 → 0, 상위 1% → 1
+BD_IND_GK = ((0.65, 0.85), (0.1, 0.6), (2.0, 0.5))   # GK 선방률(축소)·클린시트율·경기당 실점 구간
+BD_IND_DF_TGC = (2.0, 0.5)         # DF 팀 경기당 실점 구간(낮을수록 1)
+BD_IND_GK_POS = ("GK",)
+BD_IND_DF_POS = ("CB", "LB", "RB", "LWB", "RWB")
+BD_IND_FW_POS = ("ST", "CF", "LW", "RW", "SS")
+# 최저선 = 대회·포지션 그룹별 '4강 이상 팀, 출전 50%+, MVP 아닌 선수' 개인 기록 중앙값(40시즌; 표본 15 미만은 그룹 전체 중앙값)
+BD_IND_FLOOR = {
+    ("월드컵", "FW"): 0.15714285714285714, ("월드컵", "MF"): 0.15714285714285714,
+    ("월드컵", "DF"): 0.2571428571428571, ("월드컵", "GK"): 0.5758008658008658,
+    ("유로(EURO)", "FW"): 0.26153846153846155, ("유로(EURO)", "MF"): 0.1,
+    ("유로(EURO)", "DF"): 0.2571428571428571, ("유로(EURO)", "GK"): 0.5954808590102707,
+    ("코파 아메리카", "FW"): 0.23807500910304644, ("코파 아메리카", "MF"): 0.10982800982800989,
+    ("코파 아메리카", "DF"): 0.26666666666666666, ("코파 아메리카", "GK"): 0.6740873015873017,
+    ("유럽 네이션스컵", "FW"): 0.19285714285714284, ("유럽 네이션스컵", "MF"): 0.1,
+    ("유럽 네이션스컵", "DF"): 0.2571428571428571, ("유럽 네이션스컵", "GK"): 0.6469747899159661,
+    ("남북미 대륙컵", "FW"): 0.26153846153846155, ("남북미 대륙컵", "MF"): 0.22532467532467532,
+    ("남북미 대륙컵", "DF"): 0.36621789032610674, ("남북미 대륙컵", "GK"): 0.7143223443223444,
+    ("아프리카 네이션스컵", "FW"): 0.17142857142857143, ("아프리카 네이션스컵", "MF"): 0.22532467532467532,
+    ("아프리카 네이션스컵", "DF"): 0.36621789032610674, ("아프리카 네이션스컵", "GK"): 0.8614800514800517,
+    ("아시안컵", "FW"): 0.36811521811521813, ("아시안컵", "MF"): 0.2538985359210078,
+    ("아시안컵", "DF"): 0.3767797944418969, ("아시안컵", "GK"): 0.6885714285714286,
+    ("골드컵", "FW"): 0.21428571428571427, ("골드컵", "MF"): 0.21103896103896103,
+    ("골드컵", "DF"): 0.433487228099527, ("골드컵", "GK"): 0.6771602787456446,
+}
+BD_IND_FLOOR_GROUP = {"FW": 0.21428571428571427, "MF": 0.18211143695014664, "DF": 0.3, "GK": 0.6771602787456446}
+
+
+def is_main_intl_row(r):
+    """생산성 comps 행 중 국대 개인 활약 칸이 대신 세는 주요 대회 행인가((라) 처리 대상)."""
+    return r.get("kind") == "intl" and (r.get("sub") in ("world", "continent")
+                                        or (r.get("sub") == "region" and (r.get("level") or 0) >= 0.27))
+
+
+def vol_band_bd(x, pos):
+    """V7a 공격량 0~(1 초과 가능): 꺾임 아래는 soft_band와 같은 직선, 위는 로그 곡선. 미드필더는 BD_MF_VOL_KNEE부터 로그 가산."""
+    if x is None:
+        return 0.0
+    lo, hi = VOL_BAND
+    slope = SOFT_KNEE / (hi - lo)
+    v = SOFT_KNEE * max(0.0, (x - lo) / (hi - lo)) if x <= hi else SOFT_KNEE + BD_VOL_LOG_K * slope * hi * math.log(x / hi)
+    if pos in BD_MF_POS and x > BD_MF_VOL_KNEE:
+        v += BD_MF_LOG_K * slope * BD_MF_VOL_KNEE * math.log(x / BD_MF_VOL_KNEE)
+    return v
+
+
+def productivity_bd(e):
+    """발롱도르 전용 생산성(V7a + (라)). 반환은 productivity와 같은 키 + intl_short(주요 대회 기대 미달 — 부진 감점 유지)."""
+    pos = e.get("position") or ""
+    comps = e.get("comps") or ()
+    main = [r for r in comps if is_main_intl_row(r)]
+    e_wo = dict(e)
+    e_wo["comps"] = [r for r in comps if not is_main_intl_row(r)]
+    p_wo = productivity(e_wo)
+    short = False
+    rel_rate = p_wo["rel_rate"]
+    if main:
+        pm = league_per_match(pos, e.get("full_season"), e.get("goal_env") or 1.0)
+        act = sum(COMP_IMP["intl"] * max(0.0, r.get("level") or 0) * ((r.get("goals") or 0) + (r.get("assists") or 0))
+                  for r in main)
+        exp = sum(COMP_IMP["intl"] * max(0.0, r.get("level") or 0) * pm * (r.get("env") or 1.0) * (r.get("matches") or 0)
+                  for r in main)
+        if act < exp:
+            short = True
+            rel_rate = productivity(e)["rel_rate"]
+    if pos in GK_POS:
+        return dict(p_wo, intl_short=short)          # GK 기대 대비는 선방률 — 대회 골·도움과 무관, 공격량도 사실상 0
+    rel = soft_band(rel_rate, *REL_BAND)
+    vol = vol_band_bd(p_wo["vol_raw"], pos)
+    prod = PROD_MIX * rel + (1 - PROD_MIX) * vol
+    if pos in DF_POS:
+        prod = (1 - DEF_TEAM_SHARE) * prod + DEF_TEAM_SHARE * p_wo["tdef"]
+    return dict(p_wo, rel_rate=rel_rate, rel=rel, vol=vol, prod=prod, intl_short=short)
+
+
+def _lin(x, lo, hi):
+    return 0.0 if x is None else max(0.0, min(1.0, (x - lo) / (hi - lo)))
+
+
+def _ind_group(pos):
+    return ("GK" if pos in BD_IND_GK_POS else "DF" if pos in BD_IND_DF_POS else "FW" if pos in BD_IND_FW_POS else "MF")
+
+
+def intl_tournament_perf(t):
+    """대회 하나의 개인 기록 0~1(최저선·출전 비율 적용 전). t: pos(대표팀 포지션)·apps·g·a·sv·gc·cs·tgc(팀 경기당 실점)."""
+    pos = t.get("pos") or ""
+    apps = t.get("apps") or 0
+    if apps <= 0:
+        return 0.0
+    g, a = t.get("g") or 0, t.get("a") or 0
+    if pos in BD_IND_GK_POS:
+        sv, gc = t.get("sv") or 0, t.get("gc") or 0
+        (s_lo, s_hi), (c_lo, c_hi), (g_lo, g_hi) = BD_IND_GK
+        return (0.6 * _lin((sv + 10 * 0.70) / (sv + gc + 10), s_lo, s_hi) + 0.2 * _lin((t.get("cs") or 0) / apps, c_lo, c_hi)
+                + 0.2 * _lin(gc / apps, g_lo, g_hi))
+    pm = league_per_match(pos, 38, 1.0)
+    rel = (g + a + BD_IND_SHRINK) / (pm * apps + BD_IND_SHRINK)
+    v = 0.5 * _lin(rel, *BD_IND_REL) + 0.5 * _lin(g + ASSIST_W * a, *BD_IND_VOL)
+    if pos in BD_IND_DF_POS:
+        v = 0.7 * v + 0.3 * _lin(t.get("tgc"), *BD_IND_DF_TGC)
+    return v
+
+
+def intl_individual(rows):
+    """국대 개인 활약 0~1 — rows: 그 해 주요 대회별 dict(name·w(대회 위상)·n(대회 최다 경기 수)·mvp + intl_tournament_perf 입력).
+    대회마다 최저선 위만 → × 출전 비율 → MVP 25% 섞기 → × 대회 위상, 그중 가장 높은 값."""
+    best = 0.0
+    for t in rows or ():
+        n = t.get("n") or 0
+        if t.get("name") not in BD_IND_MAIN or not n:
+            continue
+        pr = intl_tournament_perf(t)
+        grp = _ind_group(t.get("pos") or "")
+        f = BD_IND_FLOOR.get((t["name"], grp), BD_IND_FLOOR_GROUP[grp])
+        pr = max(0.0, (pr - f) / (1 - f))
+        m = BD_IND_MVP
+        v = (t.get("w") or 0.0) * ((1 - BD_IND_MVP_SHARE * m) * pr * min(1.0, (t.get("apps") or 0) / n)
+                                   + BD_IND_MVP_SHARE * m * (1.0 if t.get("mvp") else 0.0))
+        best = max(best, v)
+    return best
+
+
+def personal_bd(e):
+    p = productivity_bd(e)
+    s_ovr = W_PERSONAL * OVR_SHARE * band(e.get("ovr"), *OVR_BAND)
+    s_prod = W_PERSONAL * (1 - OVR_SHARE) * p["prod"]
+    s_part = W_PART * band(e.get("share"), *PART_BAND)
+    return dict(p, s_ovr=s_ovr, s_prod=s_prod, s_part=s_part, personal=s_ovr + s_prod + s_part)
+
+
+def score_season_bd(entries):
+    """발롱도르 전용 채점(제자리 갱신) → 총점 내림차순. score_season과 같은 팀 안 배분·정렬에 personal_bd와
+    국대 개인 활약(e['bd_intl'] — 없으면 0)을 쓴다. s_intl = 국대 팀 성적 + 국대 개인 활약(s_intl_team·s_intl_ind로도 남김)."""
+    for e in entries:
+        e.update(personal_bd(e))
+        e["league_v"], e["cup_lv"], e["cont_lv"] = team_parts(e)
+        e["team_v"] = team_value(e["league_v"], e["cup_lv"], e["cont_lv"])
+        e["s_intl_team"] = W_INTL * max(0.0, min(1.0, e.get("intl_v") or 0.0))
+        e["s_intl_ind"] = BD_IND_W * intl_individual(e.get("bd_intl"))
+        e["s_intl"] = e["s_intl_team"] + e["s_intl_ind"]
+    by_team = {}
+    for e in entries:
+        by_team.setdefault(e.get("team_id"), []).append(e)
+    for members in by_team.values():
+        rk = decay_ranks(members)
+        for e in members:
+            e["team_rank_in_team"] = rk[id(e)]
+            e["decay"] = DECAY[min(rk[id(e)], len(DECAY) - 1)]
+            e["s_team"] = W_TEAM * e["team_v"] * e["decay"]
+    for e in entries:
+        e["trophy"] = e["s_team"] + e["s_intl"]
+        e["total"] = e["personal"] + e["trophy"]
+    return sorted(entries, key=sort_key)
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════════
+# [2026-11-16 신설, 신민용 확정 — 설계안 E] 발롱도르 상위 3명 경쟁(클럽 성과 반영). 발롱도르 전용.
+#   조사(40시즌): 상위 후보끼리 개인 활약이 비슷하면 클럽 팀 성과가 순위를 거의 못 바꿨다(성과별 소속팀 성적 폭이
+#   더블 1.27 ↔ 무관 0.65 정도로 압축, 국대 점수가 더 큰 지렛대). 점수를 모든 후보에 키우면(A+B+C) 강팀 조연이
+#   상위 10명 끝으로 올라오고(R2 불합격), 상위 10명 전체를 다시 줄 세우면(D) 원칙과 지표가 충돌했다.
+#   E: Top30·상위 10명 구성과 4~10위 순서는 기존 총점 그대로. 상위 3명 자리만 —
+#     후보 = 기존 1~3위 + 4~10위 중 '팀 에이스'(상위 10명 안 같은 팀 개인 점수 1순위)이면서 개인 점수가 기존 1~3위 중
+#            가장 낮은 선수와 BD_E_CHALLENGE_GAP 이내인 선수.
+#     경쟁 점수 = 개인 점수 + 국제대회(둘 다 기존 그대로) + 클럽 성과(BD_E_W_CLUB × 단계표 BD_E_* · 우승 후보 할인 없음,
+#                × 상위 10명 안 같은 팀 개인 점수 순위 배분 BD_E_DECAY 100/50/0).
+#     경쟁 점수 상위 3명이 1~3위, 나머지 후보는 4위부터 기존 총점 순서. 1위 최소 자격(apply_top1_gate)은 그 뒤에 적용.
+#   오프라인(40시즌) 판정 통과: T3 37→14 · T1 5→1 · R1 0 · R2 3 · R3 1 · R4 4. 저장 총점(total)은 기존 값 그대로 둔다.
+# ════════════════════════════════════════════════════════════════════════════════════════════════════════
+BD_E_W_CLUB = 2.5
+BD_E_LEAGUE_FIXED = {1: 1.0, 2: 0.65, 3: 0.5, 4: 0.4}
+BD_E_LEAGUE_TAIL = ((0.30, 0.3), (0.50, 0.2), (0.75, 0.1))
+BD_E_LEAGUE_BOTTOM = 0.05
+BD_E_CONT_STAGE = {"우승": 1.0, "준우승": 0.7, "4강": 0.5, "8강": 0.35, "16강": 0.2, "플레이오프": 0.1, "리그페이즈": 0.05}
+BD_E_DECAY = (1.0, 0.5, 0.0)
+BD_E_CHALLENGE_GAP = 0.5
+BD_E_TOP, BD_E_POOL = 3, 10
+
+
+def e_league_rank_value(rank, n_teams, relegated=False):
+    """E 리그 순위 점수 — 1위와 그 아래 차이를 키운 표(강등 0)."""
+    if relegated or not rank or not n_teams:
+        return 0.0
+    if rank in BD_E_LEAGUE_FIXED:
+        return BD_E_LEAGUE_FIXED[rank]
+    p = rank / float(n_teams)
+    for cut, v in BD_E_LEAGUE_TAIL:
+        if p <= cut:
+            return v
+    return BD_E_LEAGUE_BOTTOM
+
+
+def e_club_value(e):
+    """E 클럽 성과 0~1 = 리그 0.4 + 국내컵 0.1 + 대륙대회 0.5. 리그 = E 순위 점수 × 리그 수준(우승 난이도 없음),
+    국내컵 = 기존 단계 점수 × 리그 수준, 대륙대회 = E 단계표 × (대회 가중치 × 출전 비율 = cont_wp)."""
+    lvl = e.get("league_level")
+    lvl = 1.0 if lvl is None else lvl
+    lv = e_league_rank_value(e.get("league_rank"), e.get("league_n"), e.get("relegated")) * lvl
+    cont = BD_E_CONT_STAGE.get(e.get("cont_stage"), 0.0) * max(0.0, e.get("cont_wp") or 0.0)
+    return team_value(lv, (e.get("cup_v") or 0.0) * lvl, cont)
+
+
+def contest_top3(top):
+    """Top30(기존 총점 순) → 상위 3명만 E 경쟁으로 정한 새 순서(새 리스트). 각 entry에 contest(경쟁 점수, 후보만)와
+    contest_moved(E로 순위가 바뀐 선수 True)를 남긴다. top 자체 순서는 바꾸지 않는다."""
+    lst = list(top)
+    if len(lst) <= 1:
+        return lst
+    top10 = lst[:BD_E_POOL]
+    by = {}
+    for e in top10:
+        by.setdefault(e.get("team_id"), []).append(e)
+    rank_in = {}
+    for members in by.values():
+        members = sorted(members, key=lambda e: (-round(e["personal"], 9), e["player_id"]))
+        for i, e in enumerate(members):
+            rank_in[id(e)] = i
+    head = top10[:BD_E_TOP]
+    floor = min(e["personal"] for e in head)
+    pool = list(head) + [e for e in top10[BD_E_TOP:]
+                         if rank_in[id(e)] == 0 and e["personal"] >= floor - BD_E_CHALLENGE_GAP - 1e-12]
+    for e in pool:
+        d = BD_E_DECAY[min(rank_in[id(e)], len(BD_E_DECAY) - 1)]
+        e["contest"] = e["personal"] + (e.get("s_intl") or 0.0) + BD_E_W_CLUB * e_club_value(e) * d
+    win = sorted(pool, key=lambda e: (-round(e["contest"], 9), -round(e["personal"], 9), e["player_id"]))[:BD_E_TOP]
+    wid = {id(e) for e in win}
+    new = win + [e for e in top10 if id(e) not in wid] + lst[BD_E_POOL:]
+    for i, e in enumerate(new):
+        e["contest_moved"] = e is not lst[i]
+    return new

@@ -253,7 +253,27 @@ def start_club_world_cup(year: int):
 # 주차 진행
 # ─────────────────────────────────────────────
 
+def _cwc_rule():
+    """[2026-11] 클럽월드컵 체인 경기의 전력 가산 규칙(competition_common.cwc_strength_rule — 명문 0, 감독 보정 없음)."""
+    from competition.competition_common import cwc_strength_rule
+    return cwc_strength_rule()
+
+
+def _match_strengths(conn, m, h_ovr, a_ovr):
+    """[2026-11 신민용 확정] 실제 경기 전력 — 대진 시드(cwc_entries.ovr = 스쿼드 평균 ±2, 조 편성용)와 분리.
+    competition_common.CONT_AI_PRESTIGE_WEIGHT["cwc_matches"]가 있으면 챔스 AI 경기와 같은 cont_ai_strength
+    (실제 선발 11명 유효 OVR, 명문 × 그 비율), 없으면(스위치 끔) 예전처럼 시드 값."""
+    from competition.competition_common import (CONT_AI_LEAGUE_FORMULA, CONT_AI_PRESTIGE_WEIGHT,
+                                                cont_ai_strength)
+    _pw = CONT_AI_PRESTIGE_WEIGHT.get("cwc_matches") if CONT_AI_LEAGUE_FORMULA else None
+    if _pw is None:
+        return h_ovr, a_ovr, False
+    return (cont_ai_strength(m["home_team_id"], _pw, conn),
+            cont_ai_strength(m["away_team_id"], _pw, conn), True)
+
+
 def _sim_one(conn, m, forced=None):
+    # cwc_entries.ovr는 대진 시드(조 편성) 값 — 경기 승부에는 아래 _match_strengths를 쓴다.
     h_ovr = conn.execute("SELECT ovr FROM cwc_entries WHERE tournament_id=? AND team_id=?",
                           (m["tournament_id"], m["home_team_id"])).fetchone()["ovr"]
     a_ovr = conn.execute("SELECT ovr FROM cwc_entries WHERE tournament_id=? AND team_id=?",
@@ -269,20 +289,22 @@ def _sim_one(conn, m, forced=None):
             from game_engine import _home_advantage
             _g2 = _cm.sim_target_match(m["home_team_id"], m["away_team_id"], home_adv=(0.0 if _neutral else _home_advantage()), extra_time=(m["stage"] != "group"),
                                        comp_name="클럽 월드컵 " + {"group": "조별리그", "R16": "16강", "QF": "8강", "SF": "4강", "TP": "3·4위전", "F": "결승"}.get(m["stage"], ""), kind="cwc", week=m.get("week"), day=m.get("day"),
-                                       targets=_g2_t)
+                                       targets=_g2_t, strength_rule=_cwc_rule())   # [2026-11] 대회별 전력 가산(D)
         if _cm.covered("cwc_entries", "cwc_matches", m["tournament_id"]):
             # [2026-10 A안] 내가 참가하는 대회의 AI 경기 — 엔진으로 돌려 실측 기록(controlled_matches.sim_cover_match)
             from game_engine import _home_advantage as _ha_cov
             _g2 = _cm.sim_cover_match(m["home_team_id"], m["away_team_id"],
                                       home_adv=(0.0 if _neutral else _ha_cov()), extra_time=(m["stage"] != "group"),
-                                      comp="cwc", tkey=f"cwc_tournaments:{m['tournament_id']}", targets=_g2_t, prior=_g2)
+                                      comp="cwc", tkey=f"cwc_tournaments:{m['tournament_id']}", targets=_g2_t, prior=_g2,
+                                      strength_rule=_cwc_rule())   # [2026-11] 대회별 전력 가산(D)
         if _g2 is not None:
             forced = (_g2["hs"], _g2["as"])
     if forced is not None:   # [G1] 내 팀 경기(내가 결장) — 체인 엔진 스코어(연장 포함)
         hs, as_ = forced
         pw, pso = 0, ""
         if hs == as_ and m["stage"] != "group":
-            winner_home, pso = _resolve_pso(h_ovr, a_ovr, neutral=_neutral)
+            _hs_, _as_, _ = _match_strengths(conn, m, h_ovr, a_ovr)   # [2026-11] 승부차기도 경기 전력
+            winner_home, pso = _resolve_pso(_hs_, _as_, neutral=_neutral)
             pw = m["home_team_id"] if winner_home else m["away_team_id"]
             if _g2 is not None:
                 _cm.note_pso(_g2, winner_home, pso)
@@ -291,16 +313,22 @@ def _sim_one(conn, m, forced=None):
                pso_winner=?, pso_score=? WHERE id=?""",
             (hs, as_, pw, pso, m["id"]))
         return
-    outcome = _match_outcome(h_ovr, a_ovr, neutral=_neutral)
+    # [2026-11 신민용 확정] 챔스 AI 경기와 같은 전력(선발 11명)·승부(리그 공식 D — cont_ai_outcome).
+    h_str, a_str, _new = _match_strengths(conn, m, h_ovr, a_ovr)
+    if _new:
+        from competition.competition_common import cont_ai_outcome
+        outcome = cont_ai_outcome(h_str, a_str, neutral=_neutral)
+    else:
+        outcome = _match_outcome(h_str, a_str, neutral=_neutral)
     if outcome == "draw" and m["stage"] != "group":
-        winner_home, pso = _resolve_pso(h_ovr, a_ovr, neutral=_neutral)
+        winner_home, pso = _resolve_pso(h_str, a_str, neutral=_neutral)
         hs, as_ = (1, 1)   # 스코어는 동점으로 표기, 승자는 pso_winner로 별도 기록
         conn.execute(
             """UPDATE cwc_matches SET home_score=?, away_score=?,
                pso_winner=?, pso_score=? WHERE id=?""",
             (hs, as_, m["home_team_id"] if winner_home else m["away_team_id"], pso, m["id"]))
         return
-    hs, as_ = _gen_score(outcome, h_ovr - a_ovr, top=(h_ovr, a_ovr))
+    hs, as_ = _gen_score(outcome, h_str - a_str, top=(h_str, a_str))
     conn.execute("UPDATE cwc_matches SET home_score=?, away_score=? WHERE id=?",
                  (hs, as_, m["id"]))
 

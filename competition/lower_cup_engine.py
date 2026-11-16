@@ -732,11 +732,12 @@ def _sim_ai_lower_cup_match(c, m, forced=None):
         if _g2_t and (m["home_team_id"] in _g2_t or m["away_team_id"] in _g2_t):
             _g2 = _cm.sim_target_match(m["home_team_id"], m["away_team_id"], home_adv=0.0, extra_time=True,
                                        comp_name=_g2_cn(c, m), kind="lower_cup", week=m.get("week"), day=m.get("day"),
-                                       targets=_g2_t)
+                                       targets=_g2_t, strength_rule="lower_cup")   # [2026-11] 대회별 전력 가산(D)
         if _cm.covered("lower_cup_entries", "lower_cup_matches", m["tournament_id"]):
             # [2026-10 A안] 내가 참가하는 대회의 AI 경기 — 엔진으로 돌려 실측 기록(controlled_matches.sim_cover_match)
             _g2 = _cm.sim_cover_match(m["home_team_id"], m["away_team_id"], home_adv=0.0, extra_time=True,
-                                      comp="lower_cup", tkey=f"lower_cup:{m['tournament_id']}", targets=_g2_t, prior=_g2)
+                                      comp="lower_cup", tkey=f"lower_cup:{m['tournament_id']}", targets=_g2_t, prior=_g2,
+                                      strength_rule="lower_cup")   # [2026-11] 대회별 전력 가산(D)
         if _g2 is not None:
             forced = (_g2["hs"], _g2["as"])
     outcome = None if forced is not None else _match_outcome(h_ovr, a_ovr, _hm, _am)
@@ -1057,7 +1058,8 @@ def sim_my_lower_cup_match_as_ai(week, p, reason="injury", day=None):
     if m["home_score"] != -1:
         return  # 이미 처리됨(멱등)
     from game_engine import _chain_team_score
-    _cs = _chain_team_score(m["home_team_id"], m["away_team_id"], 0.0, extra_time=True)
+    _cs = _chain_team_score(m["home_team_id"], m["away_team_id"], 0.0, extra_time=True,
+                            strength_rule="lower_cup")   # [2026-11 전력 기준 통일]
     _sim_ai_lower_cup_match(get_conn().cursor(), m,
                             forced=((_cs["home_score"], _cs["away_score"]) if _cs is not None else None))
     get_conn().commit()
@@ -1162,7 +1164,8 @@ def simulate_my_lower_cup_match(week, p, day=None):
             m["home_team_id"], m["away_team_id"], home_formation, away_formation,
             home_adv=0.0,
             extra_time=True,
-            me=_chain_me_spec(p, is_home, "out" if _suspended else ("bench" if _benched else "start")))
+            me=_chain_me_spec(p, is_home, "out" if _suspended else ("bench" if _benched else "start")),
+            strength_rule="lower_cup")   # [2026-11 전력 기준 통일] AI 경기와 같은 전력
         hs, as_ = sim["home_score"], sim["away_score"]
         hs90, as90 = sim.get("home_score_90", hs), sim.get("away_score_90", as_)
         went_et = bool(sim.get("went_extra_time"))

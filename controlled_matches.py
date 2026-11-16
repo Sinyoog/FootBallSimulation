@@ -87,8 +87,10 @@ def focus_of(hid, aid, targets=None, my_tid=None, conn=None):
 
 
 def sim_target_match(hid, aid, *, home_adv, extra_time=False, comp_name="", kind="league", week=None,
-                     day=None, is_league=False, agg_home=0, agg_away=0, targets=None, my_tid=None):
+                     day=None, is_league=False, agg_home=0, agg_away=0, targets=None, my_tid=None,
+                     strength_rule=None):
     """G2 대상 경기면 체인 엔진으로 돌리고 관전 기록을 저장한다.
+    strength_rule: [2026-11 신민용 확정] 그 대회 AI 경기와 같은 팀 전력 가산(tactical_engine._STRENGTH_RULES).
     반환: None(대상 아님 — 호출부는 기존 AI 공식) 또는 {"hs","as","detail_id","sim"}.
     엔진 예외는 game_engine._chain_note_error로 남기고 None(호출부 공식 폴백)."""
     focus = focus_of(hid, aid, targets, my_tid)
@@ -105,7 +107,7 @@ def sim_target_match(hid, aid, *, home_adv, extra_time=False, comp_name="", kind
         finally:
             c0.close()
         sim = simulate_my_match(hid, aid, hf, af, home_adv=home_adv, extra_time=extra_time,
-                                agg_home=agg_home, agg_away=agg_away, me=None)
+                                agg_home=agg_home, agg_away=agg_away, me=None, strength_rule=strength_rule)
     except Exception as e:
         ge._chain_note_error("g2", e)
         return None
@@ -335,9 +337,11 @@ def covered(entry_table, match_table, tournament_id, my_tid=None):
 
 
 def sim_cover_match(hid, aid, *, home_adv, extra_time=False, agg_home=0, agg_away=0, comp, tkey,
-                    my_tid=None, targets=None, prior=None):
+                    my_tid=None, targets=None, prior=None, strength_rule=None):
     """내가 참가하는 대회의 AI 경기 — 엔진으로 돌리고 실측 기록. 반환: None(대상 아님·엔진 실패 → 호출부 공식)
-    또는 {"hs","as","detail_id": None,"sim"}. 내 소속팀 경기(G1)·G2 대상 경기는 여기서 다루지 않는다."""
+    또는 {"hs","as","detail_id": None,"sim"}. 내 소속팀 경기(G1)·G2 대상 경기는 여기서 다루지 않는다.
+    strength_rule: [2026-11 신민용 확정] 그 대회 AI 경기·내 경기와 같은 팀 전력 가산 — 같은 대회에서 내 경기·AI 공식
+    경기·AI끼리 체인 경기가 서로 다른 전력 계산을 쓰지 않게 한다. None이면 가산 없음(예전과 같음)."""
     if prior is not None:
         # G2(감독 팀·구단주 구단) 경기는 이미 엔진으로 돌았다 — 그 결과를 실측으로만 쌓는다.
         if prior.get("sim"):
@@ -360,7 +364,7 @@ def sim_cover_match(hid, aid, *, home_adv, extra_time=False, agg_home=0, agg_awa
         finally:
             c0.close()
         sim = simulate_my_match(hid, aid, hf, af, home_adv=home_adv, extra_time=extra_time,
-                                agg_home=agg_home, agg_away=agg_away, me=None)
+                                agg_home=agg_home, agg_away=agg_away, me=None, strength_rule=strength_rule)
     except Exception as e:
         ge._chain_note_error("cover", e)
         return None
