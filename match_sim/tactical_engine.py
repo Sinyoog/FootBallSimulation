@@ -947,7 +947,7 @@ def _build_player_ratings(lineup, player_stats, gf, ga, gk, rng, slot_labels=Non
             # [2026-10 설계 B-2] 평점 장부(rating_ledger)가 있으면 그 값 — 사건 기록만으로 계산.
             # 장부에 없는 선수(id 없는 가상 폴백 등)만 예전 근사식.
             "rating": (ledger[key] if (ledger and key in ledger)
-                       else round(max(3.0, min(10.0, base)), 1)),
+                       else round(max(4.0, min(10.0, base)), 1)),
             # [2026-10 설계 A] 선수 단위 사건 — 경기 상세 카드 표시·출전정지 판정이 읽는다.
             "fouls": pstat.get("fouls", 0), "fouled": pstat.get("fouled", 0),
             "yellow_cards": pstat.get("yellow", 0), "red_cards": pstat.get("red", 0),
@@ -2258,7 +2258,23 @@ def simulate_my_match(home_team_id, away_team_id, home_formation, away_formation
         my_side = me.get("side")
         _form = home_formation if my_side == "home" else away_formation
         _slots = FORMATION_SLOTS.get(_form) or _FALLBACK_SLOTS
-        if my_side == "home":
+        # [2026-11-17 신민용 확정 — 선발 경로 통일] 선발이면 메인 화면 포메이션과 같은 함수(team_plan.club_lineup_with_me)
+        # 로 나를 처음부터 후보에 넣어 11명을 고른다(예전: AI 11명을 먼저 뽑고 내 자리의 최저 OVR AI를 밀어냄 —
+        # 메인 화면과 다른 선수가 빠질 수 있었다). 사용자 감독 팀은 예전 그대로.
+        _my_plan = hp if my_side == "home" else ap
+        _my_tid = home_team_id if my_side == "home" else away_team_id
+        from team_plan import CONTROLLER_AI as _CAI
+        if me["status"] == "start" and _my_plan.get("controller") == _CAI:
+            from team_plan import club_lineup_with_me
+            from match_sim.match_flow import _fetch_roster, select_bench
+            _placed, _, _ = club_lineup_with_me(_fetch_roster(_my_tid), _slots, me["player"], "start")
+            _lu = list(_placed)
+            _bn = select_bench(_my_tid, _lu)
+            if my_side == "home":
+                home_lineup, home_bench = _lu, _bn
+            else:
+                away_lineup, away_bench = _lu, _bn
+        elif my_side == "home":
             home_lineup, home_bench, _ = _insert_me(home_lineup, home_bench, _slots, me["player"],
                                                     me.get("field_pos"), me["status"])
         else:

@@ -18,7 +18,8 @@ from PyQt6.QtGui import QColor
 
 import world_browser as wb
 from game_engine import (
-    get_apply_attempts_left, get_apply_player_context, calc_apply_prob_with_context,
+    get_apply_attempts_left, get_apply_player_context, calc_apply_prob_with_context, direct_apply_view,
+    direct_apply_scale,
     apply_to_team, DIRECT_APPLY_MAX, is_hard_mode,
 )
 from ui.center_panel import show_toast
@@ -47,7 +48,7 @@ _PROB_BANDS = [
 ]
 
 
-def _prob_label(prob: float, blocked):
+def _prob_label(prob: float, blocked, scale: float = 1.0):
     """[2026-09 확장, 신민용 리포트 17번] blocked가 이제 사유 문자열이다
     (game_engine.calc_apply_prob_with_context 참고) — "full"은 로스터 정원
     마감, 그 외 참(예전 True / "talent")은 재능 미달. 둘은 플레이어가
@@ -55,10 +56,18 @@ def _prob_label(prob: float, blocked):
     한다) 라벨을 구분해줘야 한다."""
     if blocked == "full":
         return "⛔ 정원 마감 (불가)", "#888888"
+    if blocked == "youth_age":    # [2026-11-18] 산하팀은 19세까지만 지원
+        return "⛔ 유스 입단 연령 초과 (불가)", "#888888"
+    if blocked == "youth":        # [2026-11-18] 유스 오퍼 자격(모구단 하한·산하팀 재능·역할) 미달
+        return "⛔ 유스 자격 미달 (불가)", "#888888"
+    if blocked == "applied":      # [2026-11-18] 같은 구단은 한 지원 기간에 1번
+        return "⛔ 이미 지원함 (이번 기간)", "#888888"
     if blocked:
         return "⛔ 재능 부족 (불가)", "#888888"
+    # [2026-11-18, DIRECT_APPLY_HARDER] 첫 입단 단계는 확률이 배율만큼 낮아졌으니 구간도 같은 배율로(28% / 16% / 6%) —
+    # scale = game_engine.direct_apply_scale(ctx)(커리어 중 FA는 1.0 → 기존 구간).
     for th, label, color in _PROB_BANDS:
-        if prob >= th:
+        if prob >= th * scale:
             return label, color
     return _PROB_BANDS[-1][1], _PROB_BANDS[-1][2]
 
@@ -281,8 +290,8 @@ class ApplyWindow(QDialog):
                 prob_col = None
             else:
                 avg_ovr = r.get("avg_ovr") or 0
-                prob, blocked = calc_apply_prob_with_context(r["id"], ctx)
-                label, color = _prob_label(prob, blocked)
+                prob, blocked = direct_apply_view(r["id"], ctx)
+                label, color = _prob_label(prob, blocked, direct_apply_scale(ctx))
                 vals = [
                     f"{r.get('flag','')} {r['country']}", r["name"],
                     f"{r['tier']}부", r["grade"],
@@ -322,8 +331,8 @@ class ApplyWindow(QDialog):
             self.detail_lbl.setText(f"{r['name']} ({r['country']}, {r['tier']}부)")
         else:
             ctx = get_apply_player_context()
-            prob, blocked = calc_apply_prob_with_context(r["id"], ctx)
-            label, _ = _prob_label(prob, blocked)
+            prob, blocked = direct_apply_view(r["id"], ctx)
+            label, _ = _prob_label(prob, blocked, direct_apply_scale(ctx))
             self.detail_lbl.setText(f"{r['name']} ({r['country']}, {r['grade']}급 {r['tier']}부) "
                                      f"— 예상 성공 가능성: {label} (약 {prob*100:.0f}%)")
         self.apply_btn.setEnabled(get_apply_attempts_left() > 0)

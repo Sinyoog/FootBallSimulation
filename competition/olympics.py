@@ -958,6 +958,17 @@ def _create_qual(year, conf, p, my_nats, nat_info, committed):
     for r in top_rows:
         # 내가 후보였던 나라는 AI만으로 다시 짜서 저장(plans 쪽은 내 OVR 반영 전력 계산용).
         store_squad(tid, r["name"], None if r["name"] in cand_nats else plans[r["name"]])
+    # [2026-11 국가대표 평가 v2] U-23 예선 목표 — 예선 명단 전력(oly_squad_meta)으로 굳힌다.
+    try:
+        import national_eval as _nev
+        if _nev.enabled():
+            _cq = get_conn()
+            try:
+                _nev.fix_qual_objectives(_cq, tid)
+            finally:
+                _cq.close()
+    except Exception as _e:
+        print(f"[NAT-V2] U-23 예선 목표 고정 실패: {_e}")
     add_log(f"🏅 {name} 조 추첨 완료 ({n_groups}개 조)", "event")
     if my_sel == 3:
         add_log(f"   🏅 U-23 올림픽 대표팀 발탁 후보: {', '.join(cand_final)}", "event")

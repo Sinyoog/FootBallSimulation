@@ -183,6 +183,25 @@ class OfferWindow(QDialog):
             offer["join_prob"] = prob
         return prob
 
+    def _sal_market_cap(self, idx):
+        """[2026-11-17 신설, 신민용 확정 — 재계약과 같은 연봉 협상 규칙] 오퍼 idx 구단 기준 내 선수 시장
+        연봉 M과 협상 상한 C(game_engine.my_salary_market_and_cap). 구단별로 1회만 계산해 둔다.
+        계산 실패·판정 불가면 (0, 0) → 상한 없이 격차 배율도 안 건다."""
+        tid = self.offers[idx].get("team_id")
+        cache = self.__dict__.setdefault("_sal_mc_cache", {})
+        if tid not in cache:
+            try:
+                from game_engine import my_salary_market_and_cap
+                cache[tid] = my_salary_market_and_cap(team_id=tid) if tid else (0, 0)
+            except Exception as e:
+                print(f"[OFFER] 시장 연봉 계산 실패(상한 없음): {e}")
+                cache[tid] = (0, 0)
+        return cache[tid]
+
+    def _sal_at_cap(self, idx) -> bool:
+        _m, cap = self._sal_market_cap(idx)
+        return cap > 0 and self.offer_salaries[idx] >= cap
+
     def _roll_attempts(self, idx) -> int:
         """[2026-08 신설] 오퍼 idx에 대해 협상(연봉·기간 공통) 시도 횟수를
         실제 입단 성공확률 기반으로 굴린다. 연봉/기간은 각각 독립적으로
@@ -329,17 +348,44 @@ class OfferWindow(QDialog):
             self.cards_lay.addStretch()
         self._fit_width()
 
+    def _bound_rect(self):
+        """[2026-11-16 신설, 신민용 요청: "오퍼 창이 전체 화면으로 뜨는데 게임 창 가운데에 맞춰서 뜨게"] 이 창이 들어갈
+        영역 — 게임(부모) 창 안쪽에서 사방 여백(창 크기의 7%, 최소 40px)을 뺀 사각형. 부모가 없으면 화면 작업 영역에서
+        같은 여백. 화면 밖으로는 나가지 않게 화면 작업 영역과 겹치는 부분만 쓴다. 못 구하면 None."""
+        try:
+            scr = self.screen() or (self.parentWidget().screen() if self.parentWidget() else None)
+            avail = scr.availableGeometry() if scr is not None else None
+            pw = self.parentWidget()
+            base = pw.window().geometry() if pw is not None else avail
+            if base is None:
+                return None
+            if avail is not None:
+                base = base.intersected(avail) if base.intersects(avail) else avail
+            mx = max(40, int(base.width() * 0.07))
+            my = max(40, int(base.height() * 0.07))
+            return base.adjusted(mx, my, -mx, -my)
+        except RuntimeError:
+            return None
+
+    def _center_in_bound(self):
+        """창을 _bound_rect의 가운데로 옮긴다(창 테두리 포함 크기 기준)."""
+        r = self._bound_rect()
+        if r is None:
+            return
+        fg = self.frameGeometry()
+        fg.moveCenter(r.center())
+        self.move(fg.topLeft())
+
     def _card_width(self, cards) -> int:
         """모든 카드 공통 폭 — 가장 긴 카드 줄(한 줄로 그렸을 때 폭)에 맞추고 _CARD_W_MIN~MAX로 자른다.
         화면이 좁으면 6장이 한 화면에 들어가는 폭까지 줄이되 _CARD_W_MIN 아래로는 안 내린다(그땐 가로 스크롤)."""
         need = max([getattr(c, "_card_need", 0) for c in cards] or [0])
         cap = self._CARD_W_MAX
         try:
-            scr = self.screen() or (self.parentWidget().screen() if self.parentWidget() else None)
-            if scr is not None and self.grid:
+            r = self._bound_rect()      # [2026-11-16] 화면 전체가 아니라 게임 창 안쪽 영역 기준
+            if r is not None and self.grid:
                 sp = self.cards_lay.spacing() if hasattr(self, "cards_lay") else 8
-                cap = min(cap, (scr.availableGeometry().width() - 110 - sp * (self._GRID_COLS - 1))
-                          // self._GRID_COLS)
+                cap = min(cap, (r.width() - 70 - sp * (self._GRID_COLS - 1)) // self._GRID_COLS)
         except RuntimeError:
             pass
         return int(max(self._CARD_W_MIN, min(cap, need)))
@@ -361,18 +407,31 @@ class OfferWindow(QDialog):
             m = self.layout().contentsMargins() if self.layout() is not None else None
             pad = (m.left() + m.right()) if m is not None else 22
             want = need + vbar + pad + 2 * scroll.frameWidth() + 4
-            scr = self.screen() or (self.parentWidget().screen() if self.parentWidget() else None)
-            if scr is not None:
-                want = min(want, scr.availableGeometry().width() - 40)
+            # [2026-11-16] 크기 상한 = 게임 창 안쪽 영역(_bound_rect) — 예전엔 화면 전체(−40/−60)라 거의 전체 화면으로 떴다.
+            r = self._bound_rect()
+            fw = self.frameGeometry().width() - self.width()     # 창 테두리·제목줄
+            fh = self.frameGeometry().height() - self.height()
+            if r is not None:
+                want = min(want, r.width() - fw)
             want_h = self.height()
             _hdr = self.height() - scroll.height()   # 제목·닫기 버튼 등 스크롤 밖 높이
             _need_h = inner.sizeHint().height() + _hdr + 2 * scroll.frameWidth() + 4
-            if scr is not None:
-                _need_h = min(_need_h, scr.availableGeometry().height() - 60)
+            if r is not None:
+                _need_h = min(_need_h, r.height() - fh)
             if _need_h > want_h and self.isVisible():
                 want_h = _need_h
+            if r is not None:       # 최소 크기가 영역보다 크면 영역에 맞춘다
+                self.setMinimumSize(min(self.minimumWidth(), max(200, r.width() - fw)),
+                                    min(self.minimumHeight(), max(200, r.height() - fh)))
+            _first = self.isVisible() and not getattr(self, "_centered_once", False)
             if want > self.width() or want_h > self.height():
                 self.resize(max(want, self.width()), want_h)
+                if self.isVisible():
+                    self._center_in_bound()     # 커졌으면 게임 창 가운데로 다시 맞춘다
+                    self._centered_once = True
+            elif _first:
+                self._center_in_bound()         # 처음 뜰 때 한 번은 가운데로
+                self._centered_once = True
         except RuntimeError:
             pass
 
@@ -606,6 +665,11 @@ class OfferWindow(QDialog):
         _g = offer.get("grade") or ""
         _zone_txt = {"domestic": "자국", "prev_league": "직전 리그", "hometown": "고향", "foreign": "해외",
                      "applied": "직접 지원", "youth_scout": "유스 스카우트"}.get(offer.get("_zone"))
+        # [2026-11-18 FJ2] 유스(산하팀 입단)·유망주 계약 표시 — 모구단 명의
+        if offer.get("contract_kind") == "youth" and offer.get("youth_parent_name"):
+            _zone_txt = f"{offer['youth_parent_name']} 유스"
+        elif offer.get("contract_kind") == "prospect":
+            _zone_txt = (_zone_txt + " · " if _zone_txt else "") + "유망주 계약"
         _badge = []
         if _g:
             _badge.append(f"<span style='color:{self._GRADE_COLOR.get(_g, '#aaaaaa')};font-weight:bold'>"
@@ -667,7 +731,8 @@ class OfferWindow(QDialog):
         # [2026-10] 팀에서 원하는 역할 — 입단 시 기준(활약에 따라 바뀔 수 있음).
         _role = offer.get("role")
         if _role:
-            from constants import OFFER_ROLES
+            from constants import OFFER_ROLES, normalize_contract_role
+            _role = normalize_contract_role(_role)
             self._kv_row(kv, r, "역할", _role, need, "color:#88ccff;font-size:12px;",
                          tip=(OFFER_ROLES.get(_role, {}).get("desc") or "")
                          + " — 입단 시 기준이며, 팀에서의 활약에 따라 달라질 수 있습니다"); r += 1
@@ -734,15 +799,26 @@ class OfferWindow(QDialog):
         _easy = get_difficulty() == "easy"
         _pct = ""
         if _easy:
-            from game_engine import negotiation_success_prob
-            _pct = f" · {round(negotiation_success_prob(self._offer_join_prob(idx)) * 100)}%"
+            # [2026-11-17] 연봉 협상 성공 확률은 시장 격차에 따라 달라진다 — 기본 인상폭(3%) 기준으로 표시.
+            from game_engine import salary_negotiation_success_prob
+            _mk, _cp = self._sal_market_cap(idx)
+            _prop = int(self.offer_salaries[idx] * 1.03)
+            if _cp > 0:
+                _prop = min(_prop, _cp)
+            _pct = f" · {round(salary_negotiation_success_prob(self._offer_join_prob(idx), _prop, _mk) * 100)}%"
         _ptip = "회당 성공 확률은 매 시도 같습니다(마지막 기회도 동일)." if _easy else ""
         # [2026-11-13 신민용: "어려움은 협상 남은 기회도 안 뜨게 — 기간 협상도"] 어려움에선 남은 횟수를 숨긴다.
         _hard = get_difficulty() == "hard"
         _neg_cnt = "" if _hard else f" ({neg_left}회{_pct})"
         _yrs_cnt = "" if _hard else f" ({years_left}회{_pct})"
 
-        if failed:
+        _at_cap = self._sal_at_cap(idx)
+        if _at_cap:
+            # [2026-11-17 신설] 협상 상한(시장 연봉 ×1.2·국가 상한)에 닿으면 연봉 협상을 더 못 한다. 카드끼리
+            # 버튼 줄 높이가 어긋나지 않게 자리는 남기고, 누를 수 없는 "한도" 표시로 바꾼다.
+            neg_btn = QPushButton("📈 연봉 협상 한도")
+            neg_btn.setObjectName("negBtn"); neg_btn.setEnabled(False)
+        elif failed:
             neg_btn = QPushButton("❌ 연봉 협상 결렬 (연봉 유지)" if is_safe else "❌ 연봉 협상 결렬")
             neg_btn.setObjectName("negBtn"); neg_btn.setEnabled(False)
         else:
@@ -841,32 +917,32 @@ class OfferWindow(QDialog):
     def _negotiate(self, idx):
         if self.neg_used[idx] <= 0 or idx in self.neg_failed:
             return
+        if self._sal_at_cap(idx):
+            return
         self.neg_used[idx] -= 1
         old_sal = self.offer_salaries[idx]
-        delta   = self._neg_rng.randint(10, 30)
-        # [2026-08 재설계] 성공확률도 고정값이 아니라 실제 입단 성공확률
-        # (join_prob) 기반 — 직접 지원 화면의 "성공 가능성"과 같은 기준.
-        from game_engine import negotiation_success_prob
-        success = self._neg_rng.random() < negotiation_success_prob(self._offer_join_prob(idx))
+        # [2026-11-17 재설계, 신민용 확정 — 재계약 팝업과 같은 규칙] 성공 1회 +2~5%(기본 3%), 상한 C(시장
+        # 연봉 ×1.2·국가 상한) 안에서만. 실패해도 연봉은 그대로이고 연봉 협상으로는 결렬되지 않는다(기간
+        # 협상 결렬 규칙은 그대로). 회당 성공확률 = 입단 성공확률 기반 값 × 시장 격차 배율.
+        from game_engine import roll_salary_raise_pct, salary_negotiation_success_prob
+        _mkt, _cap = self._sal_market_cap(idx)
+        delta    = roll_salary_raise_pct(self._neg_rng)
+        proposed = int(old_sal * (1 + delta/100))
+        if _cap > 0:
+            proposed = min(proposed, _cap)
+        success = self._neg_rng.random() < salary_negotiation_success_prob(
+            self._offer_join_prob(idx), proposed, _mkt)
 
         if success:
-            new_sal = int(old_sal * (1 + delta/100))
+            new_sal = max(old_sal, proposed)
             self.offer_salaries[idx] = new_sal
+            _real = (new_sal / old_sal - 1) * 100 if old_sal > 0 else delta
             # 팝업 없이 토스트만
-            show_toast(self, f"✅ +{delta}%  {fmt_money(old_sal)} → {fmt_money(new_sal)}", "#006622", 1400)
+            show_toast(self, f"✅ +{_real:.1f}%  {fmt_money(old_sal)} → {fmt_money(new_sal)}"
+                             + ("  (협상 한도)" if self._sal_at_cap(idx) else ""), "#006622", 1400)
         else:
-            if self.neg_used[idx] == 0:
-                self.neg_failed.add(idx)
-                # [2026-08 신설, 신민용 확정] 협상 결렬이 뜨면 그 팀은
-                # 연도 기준 냉각기(거절연도+2년차까지 차단)에 들어간다.
-                # join(입단 강제)/auto_offer(일반 오퍼) 양쪽 다 이 창을
-                # 같이 쓰므로 여기 한 곳만 훅해도 두 경로 모두 커버된다.
-                from game_engine import _record_team_offer_cooldown
-                _record_team_offer_cooldown(self.offers[idx]["team_id"])
-                show_toast(self, "❌ 협상 결렬  입단 불가", "#cc0000", 1400)
-            else:
-                show_toast(self, "협상 실패" if get_difficulty() == "hard"   # 어려움: 남은 횟수 숨김
-                           else f"협상 실패  남은 기회: {self.neg_used[idx]}회", "#cc4400", 1200)
+            show_toast(self, "협상 실패 — 연봉 유지" if get_difficulty() == "hard"   # 어려움: 남은 횟수 숨김
+                       else f"협상 실패 — 연봉 유지  남은 기회: {self.neg_used[idx]}회", "#cc4400", 1200)
 
         self._after_negotiate_round()
 

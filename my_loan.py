@@ -217,10 +217,12 @@ def club_plan(p, year, week):
     ge = _ge()
     if not p or not p.get("current_team_id") or p.get("loan_from_team_id") or _serving(p):
         return "", {}
-    role = p.get("contract_role") or ""
+    from constants import normalize_contract_role
+    role = normalize_contract_role(p.get("contract_role"), default="")
     rank_cat = ge._my_team_rank_category(p)
     info = {"rank_cat": rank_cat, "role": role}
-    if role in ("핵심 선수", "주전 보장") or rank_cat in ("에이스", "핵심"):
+    # [2026-11-16 C] 옛 "핵심 선수"·"주전 보장"은 normalize로 핵심·주전이 된다(constants.LEGACY_CONTRACT_ROLE)
+    if role in ("핵심", "주전") or rank_cat in ("에이스", "핵심"):
         return "핵심", info
     ratio, n = season_play_ratio(p, year, week)
     info.update(ratio=ratio, team_matches=n)
@@ -850,7 +852,7 @@ def _midseason_loan_buy(p, year, week, proposal):
                      loan_start_tid=0, loan_parent_relation=-1, transfer_requested=0,
                      club_tenure_seasons=1, **_SEASON_STAT_RESET)
     ge.add_log(f"✍ {proposal.get('team_name', '')} 완전 이적 확정!  |  이적료 {ge.fmt_money(fee)}  "
-               f"|  {c_yrs}년 6개월 계약", "event", year, week)
+               f"|  {c_yrs}년 6개월 계약", "news", year, week)
     return True
 
 

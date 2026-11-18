@@ -230,11 +230,46 @@ def is_easy_mode(p=None) -> bool:
     return get_difficulty(p) == "easy"
 
 
+# [2026-11-16 신설, 신민용 리포트: "플레이어가 들어가면 원래 핵심이던 선수가 로테이션 등으로 바뀌어야 하는데 안 된다"]
+# 팀 역할(핵심·주전·로테이션…)은 시즌 시작 때(연도 전환) 한 번 정하는데, 내 선수는 그 뒤(프리시즌 이적 주차·시즌 중
+# 입단·임대)에 팀을 옮기는 경우가 많아 새 팀 역할에 내가 빠진 채로 시즌 내내 갔다 — 내가 차지한 자리의 원래 주인이
+# 계속 "핵심"으로 남아 출전·평점·이적 판단까지 그 역할대로 돌았다. 내 소속팀이 바뀌면 들어간 팀·떠난 팀의 올해 역할을
+# 다시 정한다. update_player 안에서 바로 하지 않고 모아 두었다가 안전한 시점(flush_log_buffer — 다른 연결의 쓰기가 다
+# 끝난 하루·처리 단위 끝)에 한 번에 처리한다.
+_PENDING_ROLE_TEAMS = set()
+
+
+def _process_pending_role_refresh():
+    """모아 둔 팀(_PENDING_ROLE_TEAMS)의 올해 역할을 다시 정한다. 클럽 시즌이 끝난 뒤(CLUB_SEASON_END_DAY 이후 —
+    하반기 스냅샷이 이미 찍힘)면 그 해 역할은 기록이므로 건드리지 않는다 — 다음 시즌 역할은 연도 전환 때 지금
+    소속 그대로(나 포함) 정해진다."""
+    if not _PENDING_ROLE_TEAMS:
+        return
+    teams = {t for t in _PENDING_ROLE_TEAMS if t}
+    _PENDING_ROLE_TEAMS.clear()
+    if not teams:
+        return
+    try:
+        from constants import CLUB_SEASON_END_DAY
+        st = get_state()
+        if (st.get("current_day") or 0) >= CLUB_SEASON_END_DAY:
+            return
+        from ai_lifecycle import refresh_team_roles
+        refresh_team_roles(teams, st["current_year"])
+    except Exception as _e:
+        add_log(f"[역할 재산정 오류] {_e}", "normal")
+
+
 def update_player(**kw):
     if not kw:
         return
     conn = get_conn()
     c = conn.cursor()
+    if "current_team_id" in kw:
+        _old_t = c.execute("SELECT current_team_id FROM my_player WHERE id=1").fetchone()
+        _old_t = (_old_t[0] if _old_t else 0) or 0
+        if _old_t != (kw["current_team_id"] or 0):
+            _PENDING_ROLE_TEAMS.update((_old_t, kw["current_team_id"] or 0))
     if "ovr" in kw and "peak_ovr" not in kw:
         # [전성기 OVR] ovr이 바뀔 때마다 역대 최고치를 peak_ovr에 함께 기록.
         #   read-before-write 없이 SQL의 max()로 원자적 처리(추가 왕복 없음).
@@ -590,6 +625,7 @@ def flush_log_buffer():
     conn.executemany("INSERT INTO game_log(entry,log_type,year,week) VALUES(?,?,?,?)", rows)
     conn.commit()
     conn.close()
+    _process_pending_role_refresh()     # [2026-11-16] 내 소속이 바뀐 팀 역할 재산정(위 주석)
 
 
 def get_logs(since_id=0):
@@ -1310,6 +1346,7 @@ def create_player(name: str, position: str, sub_role: str,
     # 전 세계 모든 리그가 동일하게 그 해부터 기록을 갖게 한다.
     _generate_all_league_schedules(1, _start_year)
     _snapshot_expected_strength(_start_year)   # [2026-10 6번 ③-2] 새 게임 첫 시즌도(연도 전환 훅만으론 안 걸림)
+    _plan_club_goals(_start_year)   # [2026-11 구단 목표 2단계] 첫 시즌 목표도 경기 시작 전에(club_goals.py)
     _cp_mark("전세계 일정 편성")
 
     # [2026-09 버그수정, 신민용 리포트: "시작 연도 국내슈퍼컵 대회 자체가
@@ -2026,6 +2063,9 @@ def _ensure_career_entry(p, st):
         tt_e    = ""
     tier_e   = p.get("current_tier") or team_row["tier"]
     role_e   = p.get("contract_role", "")
+    if role_e:
+        from constants import normalize_contract_role
+        role_e = normalize_contract_role(role_e)
     mgr_e    = p.get("manager_type", "")
     amb_e    = p.get("club_ambition", "")
 
@@ -2851,6 +2891,39 @@ def _snapshot_expected_strength(year):
         print(f"[MGR-REP] 시즌 시작 전력 기록 실패(평판은 시즌 말 전력으로 대신): {_e}")
     finally:
         conn.close()
+
+
+def _plan_club_goals(year):
+    """[2026-11 구단 목표 2단계 — 신민용 확정 명세] 시즌 시작 구단 목표를 정한다(club_goals.plan_season_goals).
+    새 게임·연도 전환에서 _snapshot_expected_strength 직후에만 부른다 — 세이브 불러오기·시즌 중엔 부르지
+    않는다. 이미 그해 목표가 있는 팀은 건드리지 않으므로 두 번 불려도 결과가 같다. 끝나면 내 선수의 구단
+    목표(my_player.club_ambition)를 소속팀 목표에 맞춘다. 실패해도 진행을 막지 않는다(그 팀들은 레거시 평가)."""
+    try:
+        import club_goals as _cg
+        conn = get_conn()
+        try:
+            _cg.plan_season_goals(conn, year)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as _e:
+        print(f"[CLUB-GOAL] {year} 시즌 목표 생성 실패(해당 팀은 레거시 평가): {_e}")
+        return
+    try:
+        p = get_player() or {}
+        tid = p.get("current_team_id") or 0
+        if tid:
+            conn = get_conn()
+            try:
+                r = conn.execute("SELECT club_ambition FROM teams WHERE id=?", (tid,)).fetchone()
+            finally:
+                conn.close()
+            amb = ((r[0] if r else "") or "").strip()
+            if amb and amb != p.get("club_ambition"):
+                update_player(club_ambition=amb)
+                add_log(f"🎯 {year} 시즌 구단 목표: {amb}", "normal", year, 1)
+    except Exception as _e:
+        print(f"[CLUB-GOAL] 내 선수 구단 목표 동기화 실패: {_e}")
 
 
 def _build_mgr_match_bonus_cache(c):
@@ -4591,7 +4664,7 @@ def _simulate_match(p, week, info: dict, day=None):
             goals, assists, saves = _cr["goals"], _cr["assists"], _cr["saves"]
             rating, events, detail = _cr["rating"], _cr["events"], _cr["detail"]
             if p.get("slump"):
-                rating = round(max(3.0, rating + SLUMP_RATING_PENALTY), 1)
+                rating = round(max(min(4.0, rating), rating + SLUMP_RATING_PENALTY), 1)
         else:
             played = False
             if _my_status == "bench":
@@ -4623,7 +4696,7 @@ def _simulate_match(p, week, info: dict, day=None):
         goals, assists, saves, rating, events, detail = _player_perf(
             p, outcome, is_home, hs, as_, c=c, opp_ovr=_opp_ovr, opp_sot=_opp_sot)
         if p.get("slump"):
-            rating = round(max(3.0, rating + SLUMP_RATING_PENALTY), 1)
+            rating = round(max(min(4.0, rating), rating + SLUMP_RATING_PENALTY), 1)
         # [2026-07 신설 → 2026-08 확장(옐로카드)] 카드 판정 — 스트레이트
         # 레드/경고누적 2차 옐로면 그 경기 활약(골/도움/평점)을 조기 강판
         # 처리로 덮어쓰고 다음 경기 출전정지를 건다. 단독 옐로 1장이면
@@ -5317,10 +5390,11 @@ def _pending_transfer_bench_mult(p) -> float:
         원칙을 반영."""
     if not p.get("pending_sale_transfer_json"):
         return 1.0
-    role = p.get("contract_role", "주전 경쟁")
+    from constants import normalize_contract_role
+    role = normalize_contract_role(p.get("contract_role"))
     team_avg = _my_team_avg_ovr(p)
     my_ovr = p.get("ovr", 40)
-    if role == "핵심 선수" and team_avg <= my_ovr:
+    if role == "핵심" and team_avg <= my_ovr:
         return 1.0   # 뚜렷한 대체자가 없음 — 시즌 끝까지 계속 기용 가능
 
     cur_week = p.get("current_week", 1)
@@ -5360,8 +5434,8 @@ def _check_bench(p, team_avg_ovr=None, club_match=False):
         base *= 1.3
 
     # [기능1] 계약 역할 보정
-    from constants import OFFER_ROLES, MANAGER_TYPES
-    role = p.get("contract_role", "주전 경쟁")
+    from constants import OFFER_ROLES, MANAGER_TYPES, normalize_contract_role
+    role = normalize_contract_role(p.get("contract_role"))
     base *= OFFER_ROLES.get(role, {}).get("bench_mult", 1.0)
 
     # [기능2] 감독 성향 보정
@@ -5397,7 +5471,11 @@ def _check_bench(p, team_avg_ovr=None, club_match=False):
 # 함수들을 재사용한다(다른 통일 작업들과 동일한 방식).
 # ══════════════════════════════════════════════════════════════
 BASE_RED_CARD_CHANCE = 0.012   # 평균적인 선수의 경기당 기본 퇴장 확률 (약 1/80경기)
-RED_CARD_RATING = 3.2          # 퇴장 시 그 경기 평점은 고정(활약 무관 — 조기 강판이라 활약을 못 냄)
+RED_CARD_RATING = 3.2          # 퇴장 시 그 경기 평점(예전 고정값 — 아래 시간 기반 공식의 15분 기준점으로 남김)
+# [2026-11] 체인 엔진이 없는 예외 경로의 퇴장 평점: 경기 결과를 모르니 퇴장 시간만 본다 —
+# 15분 퇴장 ≈ 3.3, 85분 ≈ 4.6, ±0.3 흔들림(3.0~4.9). 결과·실점까지 보는 정식 경로는 rating_ledger.
+RED_CARD_RATING_LATE = 4.6
+RED_CARD_RATING_NOISE = 0.3
 
 
 def _roll_red_card(p):
@@ -5500,7 +5578,10 @@ def _apply_red_card_dismissal(p, field="red_card_suspension", reason="red_card")
         _rc_updates["season_red_cards_league"] = p.get("season_red_cards_league", 0) + 1
     update_player(**_rc_updates)
     _set_susp_cause(field, "second_yellow" if reason == "second_yellow" else "red_card")
-    return 0, 0, 0, RED_CARD_RATING, events, detail
+    _rm = events[0][0]
+    _rr = RED_CARD_RATING + 0.1 + (RED_CARD_RATING_LATE - RED_CARD_RATING - 0.1) * max(0.0, min(1.0, (_rm - 15) / 70.0))
+    _rr += random.uniform(-RED_CARD_RATING_NOISE, RED_CARD_RATING_NOISE)
+    return 0, 0, 0, round(max(3.0, min(4.9, _rr)), 1), events, detail
 
 
 # ══════════════════════════════════════════════════════════════
@@ -5699,13 +5780,9 @@ def _chain_me_spec(p, is_home, status):
           "position": p.get("position", "CM") or "CM", "ovr": p.get("ovr", 40), "age": p.get("age", 25)}
     for _s in ALL_STATS:
         pl[_s] = p.get(_s, 40)
-    try:
-        import sub_positions as _subp
-        _sp = _subp.my_sub()
-        if _sp:
-            pl["sub_pos"] = _sp
-    except Exception:
-        pass
+    # [2026-11-17 선발 경로 통일] 배치 점수가 읽는 값(포지션·부포·OVR·주발·세부역할)을 메인 화면과 같은 함수로 채운다.
+    from team_plan import my_lineup_candidate
+    pl = my_lineup_candidate(p, base=pl)
     _pe = PERSONALITY_EFFECTS.get(p.get("personality", ""), {})
     return {"player": pl, "side": ("home" if is_home else "away"), "status": status,
             "field_pos": get_field_pos(p),
@@ -5807,6 +5884,7 @@ def _chain_me_result(p, sim, is_home, field):
     my_score, opp_score = (hs, as_) if is_home else (as_, hs)
     _pe = PERSONALITY_EFFECTS.get(p.get("personality", ""), {})
     rating = float(me.get("rating") or 6.0)
+    _r_floor = min(4.0, rating)   # [2026-11] 장부가 4.0 아래(퇴장)를 줬으면 그 값이 바닥 — 끌어올리지 않음
     # 예전 _player_perf의 최종 평점 단계에 있던 성격 보정(승부욕·홈보이)은 그대로 유지한다 —
     # 경기 결과를 바꾸는 보정이 아니라 평점 표시 보정이다.
     if my_score < opp_score and "losing_rating" in _pe:
@@ -5815,7 +5893,7 @@ def _chain_me_result(p, sim, is_home, field):
         rating += _pe["home_rating"]
     elif not is_home and "away_rating" in _pe:
         rating += _pe["away_rating"]
-    res["rating"] = max(3.0, min(10.0, round(rating, 1)))
+    res["rating"] = max(_r_floor, min(10.0, round(rating, 1)))
     res["goals"], res["assists"], res["saves"] = me.get("goals", 0), me.get("assists", 0), me.get("saves", 0)
     _pa = me.get("pass_acc")
     if _pa is None:   # 패스 0개(짧은 교체 출전 등) — 그 경기 우리 팀 패스 성공률로 대신
@@ -7179,7 +7257,7 @@ def _player_perf(p, outcome, is_home, hs, as_, c=None, opp_ovr=None, opp_sot=Non
         _over = _raw_rating - _SOFT_CAP_START
         _raw_rating = _SOFT_CAP_START + _over * _SOFT_CAP_COMPRESS
 
-    rating = max(3.0, min(10.0, round(_raw_rating, 1)))
+    rating = max(4.0, min(10.0, round(_raw_rating, 1)))
 
     return goals, assists, saves, rating, events, detail
 
@@ -7456,7 +7534,8 @@ def _calc_manager_rel(p, rating, result, played, not_played_penalty=1) -> int:
     gain_m = mt.get("rel_gain_mult", 1.0)
     loss_m = mt.get("rel_loss_mult", 1.0)
 
-    role = p.get("contract_role", "주전 경쟁")
+    from constants import normalize_contract_role
+    role = normalize_contract_role(p.get("contract_role"))
     role_press = OFFER_ROLES.get(role, {}).get("press", 1.0)
     amb_press = OFFER_AMBITION.get(p.get("club_ambition", "중위권 안정"), {}).get("press", 1.0)
     exp_mult = max(0.75, min(1.35, role_press * _salary_press(p) * amb_press))
@@ -9961,7 +10040,7 @@ def accept_sale_push_proposal(team_id=None):
                   sale_push_active=0, sale_push_refused_count=0,
                   sale_push_low_score_weeks=0)
     add_log(f"✅ {proposal['team_name']}로의 이적 제안을 수락했습니다 — "
-            f"시즌이 끝나면 이적이 진행됩니다.", "event")
+            f"시즌이 끝나면 이적이 진행됩니다.", "news")
     return True
 
 
@@ -10031,6 +10110,12 @@ def _top_up_left_team(old_tid, year, include_fixed26=False):
         add_log(f"⚠ 떠난 팀 인원 보충 오류: {_e}", "event")
 
 
+def _my_joined(team_id):
+    """[2026-11] join_team 뒤 내 선수 소속이 정말 그 팀으로 바뀌었는지(구단 거절 등으로 이적이 안 된 경우 False)."""
+    _p = get_player()
+    return bool(_p) and _p.get("current_team_id") == team_id
+
+
 def _execute_pending_sale_transfer(p, year):
     """[2026-08 신설, 3단계] 비시즌 전환 시점(_end_of_season)에 호출 —
     판매 제안을 수락해 예약해둔 이적이 있으면 실제로 실행한다."""
@@ -10046,7 +10131,7 @@ def _execute_pending_sale_transfer(p, year):
     update_player(pending_sale_transfer_json="")
     # [2026-10 병역 버그수정] 예약 이적이 남은 채 입대했으면 실행하지 않는다(복무 중 이적 불가).
     if _my_is_serving(p):
-        add_log(f"🪖 복무 중이라 {proposal.get('team_name', '')} 예약 이적이 취소됐습니다.", "event", year, 52)
+        add_log(f"🪖 복무 중이라 {proposal.get('team_name', '')} 예약 이적이 취소됐습니다.", "news", year, 52)
         return
     offer = {"transfer_fee": proposal.get("transfer_fee", 0),
              "contract_years": proposal.get("contract_years")}
@@ -10055,9 +10140,13 @@ def _execute_pending_sale_transfer(p, year):
     _old_tid = p.get("current_team_id") or 0
     join_team(proposal["team_id"], proposal.get("salary", 0),
               transfer_type="판매추진", offer=offer)
+    if not _my_joined(proposal["team_id"]):   # [2026-11] 위 예약 이적과 같은 확인(성사 안 됐으면 성공 처리 안 함)
+        add_log(f"↩ 예약 이적 무산 — {proposal.get('team_name', '')} 이적이 성사되지 않았습니다. 현 소속팀에 남습니다.",
+                "news", year, 52)
+        return
     _top_up_left_team(_old_tid, year)
     add_log(f"💼 예약 이적 실행 — {proposal['team_name']}로 이적했습니다  "
-            f"(판매금액 {fmt_money(proposal.get('transfer_fee', 0))})", "event", year, 52)
+            f"(판매금액 {fmt_money(proposal.get('transfer_fee', 0))})", "news", year, 52)
 
 
 def reserve_join_transfer(team_id, salary, team_name, transfer_type="오퍼", offer=None):
@@ -10074,7 +10163,7 @@ def reserve_join_transfer(team_id, salary, team_name, transfer_type="오퍼", of
     if transfer_type == "오퍼" and joined_this_offer_window():
         _st0 = get_state() or {}
         add_log(f"⛔ 입단한 이적 기간에는 다른 팀 오퍼를 수락할 수 없습니다 — {team_name} 예약 취소",
-                "event", _st0.get("current_year"), _st0.get("current_week"))
+                "news", _st0.get("current_year"), _st0.get("current_week"))
         return False
     proposal = {"team_id": team_id, "salary": salary, "team_name": team_name,
                 "transfer_type": transfer_type, "offer": offer or {}}
@@ -10092,7 +10181,7 @@ def reserve_join_transfer(team_id, salary, team_name, transfer_type="오퍼", of
         join_team(team_id, salary, transfer_type=transfer_type, offer=offer)
         return
     add_log(f"📋 {team_name} 이적 확정 — 다음 시즌 구간이 시작되면 실제로 이적합니다",
-            "event", st.get("current_year"), st.get("current_week"))
+            "news", st.get("current_year"), st.get("current_week"))
 
 
 def _execute_pending_join_transfer(p, year, week):
@@ -10113,12 +10202,20 @@ def _execute_pending_join_transfer(p, year, week):
     update_player(pending_join_transfer_json="")
     # [2026-10 병역 버그수정] 오퍼를 수락해 예약해둔 뒤 입대했으면 실행하지 않는다.
     if _my_is_serving(p):
-        add_log(f"🪖 복무 중이라 {proposal.get('team_name', '')} 예약 이적이 취소됐습니다.", "event", year, week)
+        add_log(f"🪖 복무 중이라 {proposal.get('team_name', '')} 예약 이적이 취소됐습니다.", "news", year, week)
         return
     _old_tid = p.get("current_team_id") or 0
     join_team(proposal["team_id"], proposal.get("salary", 0),
               transfer_type=proposal.get("transfer_type", "오퍼"),
               offer=proposal.get("offer") or None)
+    # [2026-11 버그수정, 신민용 리포트: "구단이 이적 제안을 거절했는데 '✅ 예약 이적 실행 — 아스널에 입단했습니다'가
+    # 뜬다"] join_team은 원 소속 구단이 거절하면(오퍼 판매 승인 게이트) 이적 없이 그냥 돌아오는데, 예전엔 그 결과를
+    # 안 보고 무조건 성공 로그를 남기고 떠난 팀 인원 보충(_top_up_left_team)까지 돌렸다 — 실제로는 안 떠난 팀에
+    # AI가 한 명 더 들어갈 수 있었다. 이제 소속이 실제로 바뀐 경우에만 성공 처리한다.
+    if not _my_joined(proposal["team_id"]):
+        add_log(f"↩ 예약 이적 무산 — {proposal.get('team_name', '')} 이적이 성사되지 않았습니다. 현 소속팀에 남습니다.",
+                "news", year, week)
+        return
     # [2026-10] 연도 전환을 거친 프리시즌 실행: 고정 팀은 뒤이은 4주차 빈자리 마감 보충이 맡는다.
     # [2026-11-13] 이동 시점이 4·29주 → 2·27주(constants.MY_PRESEASON_MOVE_WEEK / MY_WINTER_MOVE_WEEK).
     from constants import MY_PRESEASON_MOVE_WEEK, MY_WINTER_MOVE_WEEK
@@ -10130,7 +10227,7 @@ def _execute_pending_join_transfer(p, year, week):
     elif week == MY_WINTER_MOVE_WEEK:
         _top_up_left_team(_old_tid, year, include_fixed26=True)
     add_log(f"✅ 예약 이적 실행 — {proposal['team_name']}에 입단했습니다",
-            "event", year, week)
+            "news", year, week)
 
 
 def _advance_week(p, base_week, n_weeks=4, progress_cb=None):
@@ -10183,6 +10280,7 @@ def _advance_week(p, base_week, n_weeks=4, progress_cb=None):
         # 실시간으로 채우므로 더 이상 연말에 몰아서 처리할 필요가 없다.
         _generate_all_league_schedules(new_season, new_year)
         _snapshot_expected_strength(new_year)   # [2026-10 6번 ③-2] 감독 평판 예상 순위 기준
+        _plan_club_goals(new_year)   # [2026-11 구단 목표 2단계] 전력 스냅샷 직후 새 시즌 목표(club_goals.py)
         _t3 = _time_perf.perf_counter()
         # [2026-08 신설, 파워랭킹 기반] _generate_all_league_schedules() 안에서
         # archive_old_seasons()가 이미 실행돼 league_season_standings에
@@ -11746,7 +11844,7 @@ def _apply_squad_depth_decay(rows, key_fn):
         # "주전이 항상 에이스 배율을 받는다"를 보장하고, 같은 역할
         # 안에서만 OVR로 세부 순위를 매긴다. role을 안 넘기는 기존
         # 호출부(월드컵 등)는 100% 그대로 동작한다.
-        _role_rank = {"핵심": 0, "주전": 1, "로테이션": 2, "대기": 3,
+        _role_rank = {"핵심": 0, "주전": 1, "준주전": 1.5, "로테이션": 2, "대기": 3,
                       "전력외": 4, "유망주": 5}
         _sk = lambda x: (_role_rank.get(x.get("role"), 2), -(x["ovr"] or 0))
     elif rows and "apps" in rows[0]:
@@ -13772,6 +13870,7 @@ def _get_award_role(year, player_id):
 _ROLE_PARTICIPATION = {
     "핵심": 1.0,
     "주전": 1.0,
+    "준주전": 0.6957,     # [2026-11-16] 주전(1.0)·로테이션(0.3913) 중간
     "로테이션": 0.3913,
     "대기": 0.1565,
     "전력외": 0.0609,
@@ -22233,6 +22332,14 @@ def _end_of_season(p, year, progress_cb=None):
         f"[PERF]   _end_of_season 전반부(AI생애주기 이전) 세부: "
         f"평점스냅샷 {_te1-_te0:.2f}s | 국대평점스냅샷 {_te2-_te1:.2f}s | "
         f"개인수상산정 {_te3-_te2:.2f}s | 그 외(수상처리·스탯정리 등) {_tp1-_te3:.2f}s")
+    # [2026-11 국가대표 평가 v2] 성인 대표팀 감독 연말 종합 평가 — 클럽 감독 시장(아래 run_ai_offseason)보다 먼저
+    # 해야 여기서 무직이 된 감독이 같은 해 클럽 시장 후보가 된다. 꺼져 있으면 아무것도 안 한다.
+    try:
+        import national_eval as _nev
+        _nev.evaluate_year(year)
+    except Exception as _e:
+        import traceback as _tb_n
+        print(f"[NAT-V2] 연말 평가 오류 {year}년: {_e}"); _tb_n.print_exc()
     try:
         from ai_lifecycle import run_ai_offseason
         # [2026-09 신설] 위 1.4단계에서 이번 시즌 세계기록실 스냅샷을 이미
@@ -22329,6 +22436,10 @@ def _end_of_season(p, year, progress_cb=None):
     # 않도록).
     _execute_pending_sale_transfer(p, year)
     p = get_player() or p   # 이적으로 소속이 바뀌었을 수 있으니 다시 최신화
+
+    # [2026-11-18 신설] 유스 계약 유지 나이(산하팀 소속 내 선수) — 방출 판정보다 먼저.
+    if _my_youth_age_exit(p, year):
+        p = get_player() or p
 
     _check_forced_release(p, year,
                            prior_season_matches=_prior_season_matches,
@@ -22739,6 +22850,53 @@ def _apply_rank_happiness(p, year):
         add_log(f"   {msg}", "event", year, 52)
 
 
+def _my_youth_age_exit(p, year):
+    """[2026-11-18 신설, constants.MY_YOUTH_AGE_RULES] 산하팀 소속 내 선수의 유스 계약 유지 나이. 시즌 말(나이 먹기 뒤,
+    AI 오프시즌 정리 뒤) 방출 판정보다 먼저 부른다. 판정은 AI 정리(ai_lifecycle._v2_cleanup)가 남긴 결과를 쓰고,
+    없으면(정리가 안 돌았을 때) 지금 남은 24~25세 AI와 같은 순서로 다시 판정한다. 만료면 무소속으로. 반환: 만료 여부."""
+    import constants as _Cm
+    if not (getattr(_Cm, "MY_YOUTH_AGE_RULES", False) and _Cm.YOUTH_AGE_RULES):
+        return False
+    tid = p.get("current_team_id") or 0
+    if not tid or p.get("loan_from_team_id"):
+        return False
+    if (p.get("military_status") or "") == _Cm.MILITARY_STATUS_SERVING:
+        return False
+    age = p.get("age") or 0
+    if age <= _Cm.YOUTH_MAX_AGE:
+        return False
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT classification_status FROM teams WHERE id=?", (tid,)).fetchone()
+        if not row or row["classification_status"] != "AFFILIATE":
+            return False
+        import ai_lifecycle as _al
+        d = _al.MY_YOUTH_AGE_DECISION
+        if d.get("team") == tid and d.get("age") == age:
+            keep = bool(d.get("keep"))
+        else:
+            soft = sorted(conn.execute(
+                "SELECT id, age, ovr, potential_ovr FROM ai_players WHERE team_id=? AND age>? AND age<? "
+                "AND COALESCE(on_loan_from_team_id,0)=0", (tid, _Cm.YOUTH_MAX_AGE, _Cm.YOUTH_HARD_OUT_AGE)).fetchall(),
+                key=_al._youth_soft_key)
+            keep, _o = _al._my_youth_slot({"team": tid, "age": age, "pot": p.get("talent_cap") or 0,
+                                           "ovr": p.get("ovr") or 0}, soft)
+    finally:
+        conn.close()
+    if keep:
+        add_log(f"🧒 유스 연령 예외 자리(팀당 {_Cm.YOUTH_OVERAGE_MAX}명)에 남습니다.  {year}년 ({age}세)", "event", year, 52)
+        return False
+    _why = (f"{_Cm.YOUTH_HARD_OUT_AGE}세 이상" if age >= _Cm.YOUTH_HARD_OUT_AGE
+            else f"24~25세 예외 자리(팀당 {_Cm.YOUTH_OVERAGE_MAX}명) 없음")
+    add_log(f"📋 유스 계약 만료 — 산하팀 연령 기준 초과({_why}). 무소속이 됩니다.  {year}년 ({age}세)",
+            "event", year, 52)
+    _save_career_entry(p, year, 52, transfer_type="방출", allow_insert=False, exit_type="계약만료")
+    update_player(current_team_id=0, current_league_id=0,
+                  salary=0, manager_relation=50,
+                  contract_years=0, contract_end_year=0, apply_attempts_used=0)
+    return True
+
+
 def _check_forced_release(p, year, prior_season_matches=None,
                            prior_season_rating_sum=None, prior_season_rating_cnt=None):
     """방출 조건: 팀 평균OVR(본인 제외) 대비 격차가 리그등급 기준 이상 AND 감독관계 30 미만.
@@ -22882,10 +23040,10 @@ def _check_forced_release(p, year, prior_season_matches=None,
         if _contract_already_over:
             _exit_label = "계약만료"
             add_log(f"📋 계약 만료. {reason}으로 재계약하지 않습니다.  {year}년  "
-                    f"(평점 {avg_rating}, 감독관계 {rel}, 수준격차 {gap:+.0f})", "event", year, 52)
+                    f"(평점 {avg_rating:.1f}, 감독관계 {rel}, 수준격차 {gap:+.0f})", "event", year, 52)
         else:
             _exit_label = "방출"
-            add_log(f"😡 {reason}으로 방출!  {year}년  (평점 {avg_rating}, 감독관계 {rel}, 수준격차 {gap:+.0f})", "event", year, 52)
+            add_log(f"😡 {reason}으로 방출!  {year}년  (평점 {avg_rating:.1f}, 감독관계 {rel}, 수준격차 {gap:+.0f})", "event", year, 52)
         _save_career_entry(p, year, 52, transfer_type="방출", allow_insert=False,
                            exit_type=_exit_label)
         update_player(current_team_id=0, current_league_id=0,
@@ -23354,7 +23512,7 @@ def _my_military_enlist(p, year, team_row, forced=False, enlist_age=None):
     add_log(f"🪖 {'강제 ' if forced else ''}입대! {tname} ({'1부' if tier == 1 else '2부'})  |  복무 2년 · 연봉 0원"
             f"  |  {_plan_txt}", "event", year, 52)
     for _tn in _cancel:
-        add_log(f"🪖 입대로 {_tn + ' ' if _tn else ''}예약 이적이 취소됐습니다.", "event", year, 52)
+        add_log(f"🪖 입대로 {_tn + ' ' if _tn else ''}예약 이적이 취소됐습니다.", "news", year, 52)
 
 
 def _my_military_discharge(p, year):
@@ -23703,7 +23861,7 @@ def accept_loan_buy_proposal():
     update_player(loan_buy_proposal_json="", pending_loan_buy_json=raw)
     import my_loan as _ml
     add_log(f"✅ {proposal['team_name']} 완전 이적 제안을 수락했습니다 — "
-            f"{_ml.loan_end_text(p)} 원 소속팀 복귀 대신 이적합니다.", "event")
+            f"{_ml.loan_end_text(p)} 원 소속팀 복귀 대신 이적합니다.", "news")
     return True
 
 
@@ -23720,7 +23878,7 @@ def reject_loan_buy_proposal():
     update_player(loan_buy_proposal_json="")
     import my_loan as _ml
     add_log(f"🚫 {_name} 완전 이적 제안을 거절했습니다 — {_ml.loan_end_text(p)} 원 소속팀으로 복귀합니다.",
-            "event")
+            "news")
     return True
 
 
@@ -23744,7 +23902,7 @@ def _execute_loan_buy(p, year) -> bool:
     if (_my_is_serving(p) or not p.get("loan_from_team_id")
             or p.get("current_team_id") != proposal.get("team_id")):
         add_log(f"⚠️ {proposal.get('team_name', '')} 완전 이적 예약이 취소됐습니다(소속 변경).",
-                "event", year, 52)
+                "news", year, 52)
         return False
     conn = get_conn()
     try:
@@ -23779,7 +23937,7 @@ def _execute_loan_buy(p, year) -> bool:
                   transfer_requested=0, club_tenure_seasons=1)
     add_log(f"✍ {team_row['name']} 완전 이적 확정!  {team_row['lname']}({team_row['tier']}부)  "
             f"|  이적료 {fmt_money(fee)}  |  {c_yrs}년 계약  |  "
-            f"월 {fmt_money(int(proposal.get('salary') or 0)//12)}", "event", year, 52)
+            f"월 {fmt_money(int(proposal.get('salary') or 0)//12)}", "news", year, 52)
     return True
 
 
@@ -25446,6 +25604,12 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
                 elif season_avg_rating >= 6.5: mult = 1.65
                 else:                          mult = 1.50
                 new_sal = int(old_sal * mult)
+                # [2026-11-17 신설, 신민용 확정 — 승격 인상을 시장 연봉과 연결] 배율(×1.5~2.0)은 그대로
+                # 두되 승격한 리그 기준 협상 상한 C(시장 연봉 ×1.2·국가 상한)를 넘지 않게 하고, 이미 C를
+                # 넘은 연봉은 깎지 않고 그대로 둔다(협상·승격 인상이 복리로 쌓이던 경로 차단).
+                _, _cap_up = my_salary_market_and_cap(p_up, year)
+                if _cap_up > 0:
+                    new_sal = max(old_sal, min(new_sal, _cap_up))
                 # [버그수정 2026-07, 신민용 지적] old_sal*mult(최대 2.00배)로
                 # 새 연봉을 만들 뿐 _calc_salary를 안 거쳐서 등급 캡이 안
                 # 걸렸다 — teams.league_id는 이 지점 이전에 이미 새 리그로
@@ -25455,9 +25619,13 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
                 if gt_p:
                     g_wealth, g_tier, g_country = gt_p
                     new_sal = _clamp_salary_to_cap(new_sal, g_wealth, g_country, g_tier, year=year)
-                _pct = int(round((mult - 1) * 100))
-                add_log(f"💰 승격 연봉 인상! {fmt_money(old_sal)} → {fmt_money(new_sal)} "
-                        f"(+{_pct}%, 평균평점 {season_avg_rating:.2f})", "event", year, 52)
+                _pct = int(round((new_sal / old_sal - 1) * 100)) if old_sal > 0 else int(round((mult - 1) * 100))
+                if new_sal <= old_sal:
+                    add_log(f"💰 승격 — 연봉이 이미 승격 리그 시장 연봉 상한 이상이라 {fmt_money(old_sal)} "
+                            f"그대로입니다 (평균평점 {season_avg_rating:.1f})", "event", year, 52)
+                else:
+                    add_log(f"💰 승격 연봉 인상! {fmt_money(old_sal)} → {fmt_money(new_sal)} "
+                            f"(+{_pct}%, 평균평점 {season_avg_rating:.1f})", "event", year, 52)
             elif new_tier > old_tier:
                 if   season_avg_rating >= 7.0: cut = 0.30
                 elif season_avg_rating >= 6.5: cut = 0.40
@@ -25466,7 +25634,7 @@ def _process_promotion_relegation(year, season_avg_rating=6.0):
                 new_sal = int(old_sal * (1 - cut))
                 _pct = int(round(cut * 100))
                 add_log(f"💸 강등 연봉 삭감. {fmt_money(old_sal)} → {fmt_money(new_sal)} "
-                        f"(-{_pct}%, 평균평점 {season_avg_rating:.2f})", "event", year, 52)
+                        f"(-{_pct}%, 평균평점 {season_avg_rating:.1f})", "event", year, 52)
             else:
                 new_sal = old_sal
             update_player(current_league_id=my_new_league,
@@ -26205,20 +26373,160 @@ def _calc_offer_salary(p, grade, tier, ovr, country, team_name, year=None,
                               eff_ovr=calc_effective_ovr(p, ovr=ovr), adj_mult=adj)
 
 
-def generate_offers(count=5, force=False) -> list:
-    """[2026-07 재설계] count 파라미터는 더 이상 총 개수를 결정하지 않는다
-    (하위호환을 위해 시그니처만 유지) — 실제 개수는 상황별로 아래 상수에
-    고정되어 있다. 자세한 이유는 아래 주석 참고.
+_O1_LAST_STATS = {}     # [2026-11-16 O-1] 직전 generate_offers의 단계별 통계(관심 → 적합성 → 연결 → 표시)
+_O1_DRAW_SALT = ""      # [O-1] 관심·연결 추첨 키에 붙는 추가 문자열(테스트에서 창을 바꿔 가며 측정할 때만 쓴다)
 
-    [2026-07 버그수정, 신민용 리포트: "계약만료 이후 팀 입단할 때 왜
-    아무것도 안떠?"] center_panel.py의 "🔔 오퍼 ON/OFF" 버튼 툴팁엔 원래
-    "팀 입단(무소속 강제 입단)에는 영향 없음"이라고 명시돼 있었는데, 정작
-    이 함수는 그 구분 없이 offers_enabled=0이면 무조건 빈 리스트를
-    돌려줬다 — 그래서 평소 오퍼 알림을 꺼둔 사람이 계약만료로 무소속이
-    되면, 강제 입단 창(_do_join)조차 자동 오퍼가 0개로 떠서 "직접 지원"
-    슬롯 4개만 덩그러니 보이는 문제가 있었다. force=True면(강제 입단
-    호출 전용) offers_enabled 뮤트를 무시하고 항상 생성한다."""
-    # [2026-10 병역 7단계] 복무 중엔 오퍼가 오지 않는다(이적·임대 불가).
+
+def _o1_u(*parts) -> float:
+    """[2026-11-16 O-1] 관심·연결 전용 난수 — 전역 random을 쓰지 않는 해시 균등값 [0,1). 키 = (월드 솔트, 오퍼 창,
+    선수, 단계, 구단 id)라 같은 조건이면 구단 순회 순서와 무관하게 같은 결과, 다른 시스템의 난수 흐름은 건드리지 않는다."""
+    import hashlib
+    h = hashlib.blake2b("|".join(str(x) for x in parts).encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(h, "big") / 18446744073709551616.0
+
+
+def _fj2_first_join_picks(p, conn, rows, draw_key, my_nats, my_continent, team_avg, full_fn, floor_ref,
+                          role_fn, stats):
+    """[2026-11-18 FJ2, 신민용 확정] 첫 입단 오퍼 후보 선정 — constants FJ2_* 주석 참고.
+    rows: 팀 행(id·name·lid·lname·tier·country·flag·grade·continent·cls). 반환: [(입단 팀 행, 계약 형태, 역할,
+    모구단 행 또는 None, 자국 여부)] — 그룹당 최대 1개. 난수는 해시(_o1_u)만 쓴다(전역 random 미사용)."""
+    import math as _m
+    from constants import (FJ2_TARGET_BY_TALENT, FJ2_FOREIGN_PROB, FJ2_EARLY_SENIOR_TALENTS,
+                           FJ2_EARLY_SENIOR_MIN_OVR, FJ2_PROSPECT_MIN_AGE, FJ2_YOUTH_MAX_AGE, FJ2_FIXED_ROLE,
+                           OFFER_TEAM_FLOOR_DOMESTIC, OFFER_TEAM_FLOOR_FOREIGN, OFFER_ALLOWED_ROLES,
+                           O1_FIRST_FOR_BASE, O1_PRESTIGE_MULT, O1_TALENT_CLASS, get_country_league_grade)
+    from data.prestige_clubs import prestige_level as _pl
+    age = p.get("age", 17) or 17
+    ovr = p.get("ovr", 40) or 40
+    tt = p.get("talent_tier") or ""
+    cap = p.get("talent_cap", 0) or 0
+    early = tt in FJ2_EARLY_SENIOR_TALENTS and ovr >= FJ2_EARLY_SENIOR_MIN_OVR
+    by_id = {r["id"]: r for r in rows}
+    kids = {}
+    for (_aid, _pid) in conn.execute(
+            "SELECT id, parent_team_id FROM teams WHERE classification_status='AFFILIATE' AND parent_team_id>0"):
+        if _aid in by_id and _pid in by_id:
+            kids.setdefault(_pid, []).append(by_id[_aid])
+    for _pid in kids:
+        kids[_pid].sort(key=lambda r: ((r["tier"] or 99), -(team_avg.get(r["id"]) or 0.0), r["id"]))
+    gate_memo = {}
+    country_top = {}
+    for r in rows:
+        if (r["cls"] or "") != "AFFILIATE" and team_avg.get(r["id"]) is not None:
+            country_top[r["country"]] = max(country_top.get(r["country"], 0.0), team_avg[r["id"]])
+
+    def _gate_ok(r):
+        k = (r["country"], r["tier"])
+        if k not in gate_memo:
+            _g = get_country_league_grade(r["country"], r["grade"])
+            gate_memo[k] = dynamic_talent_gate(r["country"], r["tier"], _gate_grade_for_tier(_g, r["tier"]))
+        return cap >= gate_memo[k]
+
+    def _floor_ok(r, dom):
+        _ta = team_avg.get(r["id"])
+        if _ta is None:
+            return True
+        if dom:
+            return _ta >= min(floor_ref, country_top.get(r["country"], floor_ref)) - OFFER_TEAM_FLOOR_DOMESTIC
+        return _ta >= floor_ref - OFFER_TEAM_FLOOR_FOREIGN
+
+    def _role_ok(r):
+        if full_fn(r):
+            return None
+        _ro = role_fn(r["id"])
+        return _ro if _ro in OFFER_ALLOWED_ROLES else None
+
+    def _youth_pick(parent):
+        for a in kids.get(parent["id"], []):
+            if _gate_ok(a) and _role_ok(a):
+                return a
+        return None
+
+    def _evaluate(r, dom):
+        """그룹 대표 행 r(모구단 또는 산하팀 없는 구단) → (입단 팀 행, 형태, 역할, 모구단) 또는 None."""
+        has_kids = r["id"] in kids
+        if has_kids:
+            if not _floor_ok(r, dom):
+                return None
+            if early or age > FJ2_YOUTH_MAX_AGE:
+                _ro = _role_ok(r) if _gate_ok(r) else None
+                if _ro:
+                    return (r, "senior", _ro, None)
+                if age > FJ2_YOUTH_MAX_AGE:
+                    return None
+            a = _youth_pick(r)
+            return (a, "youth", FJ2_FIXED_ROLE, r) if a is not None else None
+        if not early and age < FJ2_PROSPECT_MIN_AGE:
+            return None
+        if not (_gate_ok(r) and _floor_ok(r, dom)):
+            return None
+        _ro = _role_ok(r)
+        if not _ro:
+            return None
+        if early or age > FJ2_YOUTH_MAX_AGE:
+            return (r, "senior", _ro, None)
+        return (r, "prospect", FJ2_FIXED_ROLE, None)
+
+    groups_dom, groups_for = [], []
+    for r in rows:
+        if (r["cls"] or "") == "AFFILIATE":
+            continue          # 산하팀은 모구단 그룹으로만 다룬다
+        (groups_dom if r["country"] in my_nats else groups_for).append(r)
+    picks = []
+    # ④ 자국
+    elig = []
+    for r in groups_dom:
+        ev = _evaluate(r, True)
+        if ev:
+            elig.append((r, ev))
+    target = FJ2_TARGET_BY_TALENT.get(tt, 1.0)
+    p_dom = min(1.0, target / len(elig)) if elig else 0.0
+    for r, ev in elig:
+        if _o1_u(*draw_key, "fj2_dom", r["id"]) < p_dom:
+            picks.append((ev[0], ev[1], ev[2], ev[3], True))
+    # ⑤ 해외
+    p_for = FJ2_FOREIGN_PROB.get(tt, 0.0)
+    for_pick = None
+    if p_for > 0 and _o1_u(*draw_key, "fj2_for", 0) < p_for:
+        _hi = O1_TALENT_CLASS.get(tt, "일반") in ("매우 높음", "신급")
+        keyed = []
+        for r in groups_for:
+            w = O1_FIRST_FOR_BASE["same_continent" if r["continent"] == my_continent else "other"]
+            if _hi:
+                w *= O1_PRESTIGE_MULT.get(_pl(r["country"], r["name"]), 1.0)
+            u = max(1e-300, _o1_u(*draw_key, "fj2_pick", r["id"]))
+            keyed.append((_m.log(u) / w, r["id"], r))      # 가중 무작위 순서(Efraimidis–Spirakis)
+        keyed.sort(key=lambda x: (-x[0], x[1]))
+        for _k, _i, r in keyed:
+            ev = _evaluate(r, False)
+            if ev:
+                for_pick = (ev[0], ev[1], ev[2], ev[3], False)
+                break
+        if for_pick:
+            picks.append(for_pick)
+    stats.update({"fj2": True, "fj2_early": early, "fj2_target": target, "fj2_dom_eligible": len(elig),
+                  "fj2_p_dom": p_dom, "fj2_dom_eligible_ids": [r["id"] for r, _ev in elig],
+                  "fj2_dom_kinds": [ev[1] for _r, ev in elig], "fj2_p_for": p_for,
+                  "fj2_for_pick": for_pick[0]["id"] if for_pick else None})
+    return picks
+
+
+def generate_offers(count=5, force=False) -> list:
+    """[2026-11-16 O-1] 오퍼 생성은 전역 난수 상태를 소비하지 않는다(시작 전 상태를 저장해 끝나면 되돌림) —
+    오퍼를 몇 개 만들든 이적·경기·선수 생성 등 다른 시스템의 난수 결과가 바뀌지 않게. 본체는 _generate_offers_impl."""
+    _st = random.getstate()
+    try:
+        return _generate_offers_impl(count=count, force=force)
+    finally:
+        random.setstate(_st)
+
+
+def _generate_offers_impl(count=5, force=False) -> list:
+    """[2026-11-17 재설계, 신민용 확정 — O-1·O-2] 패시브 오퍼(자동 오퍼 창·무소속 입단 창) 생성.
+    관심(구단이 선수를 아는가·원하는가) → 적합성(팀 평균 하한·정원·역할) → 연결(에이전트 등급) 순서 —
+    constants의 O1_*/O2_* 주석 참고. 개수는 정해져 있지 않고(관심이 생긴 구단 수만큼), 화면에는 최대
+    O1_DISPLAY_CAP개. count 인자는 하위호환용(쓰지 않음).
+    force=True면(무소속 강제 입단 창 전용) offers_enabled 뮤트를 무시한다."""
     from constants import MILITARY_STATUS_SERVING as _MSS
     _gp = get_player()
     if _gp and (_gp.get("military_status") or "") == _MSS:
@@ -26249,29 +26557,8 @@ def generate_offers(count=5, force=False) -> list:
     #       직전리그 8 + 자국 3 + 기타 4 = 15
     #     직전 리그가 자국이었다면(또는 커리어 기록 없음)
     #       자국 10 + 기타 5 = 15
-    from constants import TRANSFER_REQUEST_OFFER_BONUS, get_league_relative_margin, get_passive_offer_rank_weight
     transfer_req = bool(p.get("transfer_requested"))
-    _bonus = TRANSFER_REQUEST_OFFER_BONUS if transfer_req else 0
-
-    FIRST_JOIN_DOMESTIC = 10
-    FIRST_JOIN_FOREIGN  = 6
-
-    NO_TEAM_DOMESTIC_SAME = 10   # 자유계약, 직전 리그 = 자국(또는 정보 없음)
-    NO_TEAM_FOREIGN_SAME  = 5
-    NO_TEAM_PREV_LEAGUE   = 8    # 자유계약, 직전 리그가 해외였던 경우
-    NO_TEAM_HOMETOWN      = 3
-    NO_TEAM_OTHER_FOREIGN = 4
-
-    HAS_TEAM_LEAGUE_COUNTRY = 4
-    HAS_TEAM_HOMETOWN       = 3
-    HAS_TEAM_FOREIGN        = 5 + _bonus   # 이적요청이면 +2 → 계약중12→이적요청14
-
-    # [2026-07 신설, 구단판매추진 설계 확정] 판매추진 점수에 따라 오퍼
-    # 개수(확률의 대리 지표)를 배율로 늘린다: 2점=x1.2, 3점=x1.5, 4점+=x1.7.
-    # 판매추진 비활성/토글 꺼짐이면 배율 1.0(영향 없음).
-    # [2026-09 재조정, 신민용 지적: "x2.0은 꽤 강하다"] 4점+ 상한을
-    # 2.0->1.7로 낮춤 — 판매추진 자체는 유지(구단이 적극적으로 팔려는
-    # 행동이라 선수 시장가치를 왜곡하는 건 아니라는 원래 설계는 그대로).
+    # 구단 판매 추진 신호 — 관심 배율(O-1, 기존 점수표 그대로)
     _sale_push_mult = 1.0
     if p.get("sale_push_active") and p.get("allow_club_sale_push", 1):
         _sp_score, _ = _calc_sale_push_score(p, p.get("current_year", 0))
@@ -26281,10 +26568,6 @@ def generate_offers(count=5, force=False) -> list:
             _sale_push_mult = 1.5
         elif _sp_score == 2:
             _sale_push_mult = 1.2
-    if _sale_push_mult != 1.0:
-        HAS_TEAM_LEAGUE_COUNTRY = max(HAS_TEAM_LEAGUE_COUNTRY, round(HAS_TEAM_LEAGUE_COUNTRY * _sale_push_mult))
-        HAS_TEAM_HOMETOWN = max(HAS_TEAM_HOMETOWN, round(HAS_TEAM_HOMETOWN * _sale_push_mult))
-        HAS_TEAM_FOREIGN = max(HAS_TEAM_FOREIGN, round(HAS_TEAM_FOREIGN * _sale_push_mult))
 
     conn = get_conn()
     c = conn.cursor()
@@ -26293,22 +26576,10 @@ def generate_offers(count=5, force=False) -> list:
     age         = p.get("age", 17)
     agent       = p.get("agent_grade", AGENT_NONE)
     nationality = p.get("nationality", "")
-    # [2026-08 신설, 15-7-1] 해외 자동 오퍼(_fill_foreign_pool) 후보국
-    # 가중치용 — 직접 지원(calc_apply_prob_with_context)에만 걸려있던
-    # 대륙 접근성 보정을 패시브 오퍼에도 연결하기 위해 미리 구해둔다.
     _my_continent = get_country_continent(nationality)
     has_team    = bool(p.get("current_team_id", 0))
     my_tid      = p.get("current_team_id", 0)
-    # [2026-08 버그수정, 신민용 리포트: "오퍼를 수락해서 이적을 확정했는데
-    # (reserve_join_transfer로 예약되고, 다음 상/하반기 시작 시점에
-    # _execute_pending_join_transfer가 실제로 실행 — 시즌 도중 소속이
-    # 바뀌는 정합성 문제를 막기 위한 의도된 지연) 정작 그 사이(예약~
-    # 실제 실행 전, 시즌 종료~다음 시즌 시작 구간)에 오퍼창이 다시 열리면
-    # 방금 합류하기로 확정한 그 팀이 또 오퍼로 뜬다"] 원인: 예약 이적은
-    # 실행 전까지 current_team_id를 그대로 옛 팀으로 유지하는데, 아래
-    # 후보 필터링은 전부 "현재 팀만"(r['id'] != my_tid) 제외해서 '이미
-    # 합류하기로 확정한 다음 팀'은 제외 대상에서 빠져 있었다. 예약된
-    # 이적이 있으면 그 목적지 팀도 같이 제외 대상에 넣는다.
+    # [2026-11-13] 이미 이적이 예약된 팀(pending_join_transfer_json)도 현 소속팀처럼 오퍼 대상에서 뺀다.
     _pending_dest_tid = 0
     _pending_raw_gen = p.get("pending_join_transfer_json") or ""
     if _pending_raw_gen:
@@ -26317,130 +26588,15 @@ def generate_offers(count=5, force=False) -> list:
         except Exception:
             _pending_dest_tid = 0
     _self_team_ids = {my_tid, _pending_dest_tid} - {0}
-    grades      = _suitable_grades(ovr, agent, passive_offer=True)
-    # [2026-07 버그수정, 신민용 지적: "인기도/명성이 직접 지원엔 반영되는데
-    # 자동 오퍼엔 전혀 안 쓰인다"] calc_apply_prob_with_context()는 이미
-    # pop_mod/fame_mod를 반영하는데, 자동 오퍼(_team_fits_me)는 순수 OVR
-    # 갭 대비 마진만 봐서 같은 선수인데도 "직접 지원하면 화제성이 통하고
-    # 오퍼는 안 통하는" 불일치가 있었다. 동일한 곡선(_apply_pop_mod/
-    # _apply_fame_mod)으로 계산해 오퍼 쪽 마진에도 더해준다 — 화제성/명성이
-    # 높을수록 살짝 더 높은 수준의 팀에서도 오퍼가 뜰 수 있게.
-    # [2026-09 재설계, 신민용 지적: "인기도가 실력 부족을 팀 마진으로
-    #   직접 상쇄하는 건 이상하다 — 인기 선수는 여러 팀에서 연락이 많이
-    #   오는 거지, 실력보다 훨씬 높은 팀에서 연락이 오는 게 되면 안 된다"]
-    #   popularity는 마진(팀 급)에서 완전히 빼고 대신 _offer_probability
-    #   (오퍼가 뜨는지 자체)에 반영한다. fame(커리어 업적)만 마진에 남기되
-    #   상한도 기존(합산 4.0, 사실상 fame 단독으로도 거의 다 채웠음)보다
-    #   낮춘다 — popularity가 아직 자체 공식이 골/도움 편중이라 손볼 예정
-    #   이라, 이번엔 fame 쪽 상한만 보수적으로 좁힌다.
-    _fame_bonus = min(2.5, _apply_fame_mod(p.get("fame", 0)) / 3.0)
-
-    # [2026-08 신설, 신민용 요청: "대륙별 전문 에이전트 — 아시아 에이전트는
-    # 아시아 팀에 대한 보정을 준다"] 계약한 에이전트의 전문 대륙
-    # (agent_continent, ui/agent_window.py에서 저장)과 팀의 소속 국가
-    # 대륙이 일치하면 마진에 소폭 보너스를 준다.
-    _agent_continent = p.get("agent_continent", "") or ""
-    _AGENT_CONTINENT_BONUS = 2.0
-
-    # [2026-08 신설, 밸런스 조정] 해외 팀 오퍼 마진 페널티 — 자국 마진과
-    # 동일 기준을 쓰면 "K리그 평점 6.4가 유럽 2부 오퍼를 받는다" 처럼
-    # 현실보다 해외 진출이 쉬워진다. 팀 소속국이 내 보유 국적(귀화 등
-    # 복수국적 포함) 중 어디에도 안 속하면 마진에서 이 값을 뺀다.
-    from constants import FOREIGN_OFFER_MARGIN_PENALTY, get_foreign_offer_age_mult
     _my_nat_names = {p.get(k) for k in ("nationality", "nationality2", "nationality3", "nationality4")
                       if p.get(k)}
 
-    # [2026-08 재설계, 15-3: _form_margin_mult → effective_ovr로 대체]
-    # 기존엔 form이 나쁘면 "마진(허용 갭)"만 좁혔는데, 비교 기준인 ovr
-    # 자체가 그대로라서 원래 OVR이 높은 선수는 마진이 좁아져도 여전히
-    # 갭 안에 들어와 상위팀 오퍼가 뜨는 문제가 있었다(신민용 리포트:
-    # 부상으로 0경기 뛴 시즌 직후에도 최상위권 오퍼가 옴). 이제 공통
-    # helper calc_effective_ovr()로 "시장 평가용 OVR"을 구해서 비교
-    # 기준 자체를 낮춘다 — 실제 ovr 컬럼은 건드리지 않는다. 팀이
-    # 없으면(첫 입단/자유계약) 이번 시즌 활약 자체가 없으므로 보정 없이
-    # ovr 그대로 반환된다(calc_effective_ovr 내부 처리).
-    # [단계적 적용, 15-3] 이번 단계는 _team_fits_me()에만 적용한다.
-    # 연봉/이적료/오퍼 우선순위는 이 단계가 검증된 뒤 순차 적용 예정.
-    # [2026-10 오퍼 생성 결함 수정] 여름 이적시장(1~3주차)엔 이번 시즌 기록이
-    # 막 리셋돼 전원이 0경기 → 직전 시즌 기록으로 평가한다(_summer_market_form_view).
+    # 시장 평가 OVR(폼 반영) — 적합성(팀 평균 하한·만석 예외) 판정에만 쓴다. 여름 이적시장엔 직전 시즌 기록으로.
     _p_mkt, _mkt_total = _summer_market_form_view(p)
     if _p_mkt is None:
         _p_mkt, _mkt_total = p, None
     _effective_ovr = calc_effective_ovr(_p_mkt, ovr=ovr, total_matches=_mkt_total)
 
-    # [2026-08 신설, 15-6 사전조치, 신민용 리포트: "5부리그 입단 직후
-    # 경기도 안 했는데 스페인 1부/2부에서 오퍼가 온다(OVR94 신급 재능)"]
-    # calc_season_form_score()는 0경기(rating_cnt=0)를 "데이터 없음"으로
-    # 보고 평점을 중립값(6.0)으로 폴백한다 — 이건 "부상으로 시즌을 통째로
-    # 날린 기존 검증된 선수"를 부당하게 벌하지 않기 위한 설계인데, 문제는
-    # "이제 막 입단해 커리어 자체가 없는 신인"에게도 똑같이 적용돼 OVR이
-    # 높으면 effective_ovr도 여전히 높게 나와(예: 94->89.45) 상위팀 오퍼가
-    # 그대로 뚫린다. "부상 등으로 잠깐 증명 못한 기존 선수"와 "한 번도
-    # 증명한 적 없는 신인"은 시장이 다르게 봐야 하므로, 현재 소속팀에서
-    # 뛴 경기 수가 매우 적으면(검증 안 됨) OVR/effective_ovr과 무관하게
-    # 마진 자체를 좁게 캡을 씌운다 — 실전 경기 기록이 쌓일수록(선발/교체
-    # 상관없이 season_rating_cnt로 집계) 이 캡이 풀리며 원래 마진으로
-    # 되돌아간다.
-    _UNPROVEN_MIN_MATCHES = 6
-    _UNPROVEN_MARGIN_CAP = 3.0
-    _proven_matches = _p_mkt.get("season_rating_cnt", 0) if my_tid else _UNPROVEN_MIN_MATCHES
-    _unproven_margin_cap = None
-    if my_tid and _proven_matches < _UNPROVEN_MIN_MATCHES:
-        # 경기 수가 쌓일수록 캡을 선형으로 풀어준다(0경기=3.0 그대로,
-        # 5경기=거의 원래 마진에 근접) — 완전히 하드 컷 대신 완만한 전환.
-        _t = _proven_matches / _UNPROVEN_MIN_MATCHES
-        _unproven_margin_cap = _UNPROVEN_MARGIN_CAP + (20.0 - _UNPROVEN_MARGIN_CAP) * _t
-
-    # [2026-08 신설, 15-6 사전조치 2단계, 신민용 리포트: "OVR94 신급 재능이
-    # 5부리그 입단 직후(0경기) 스페인 1부/2부에서 오퍼가 온다"] 위
-    # _unproven_margin_cap만으로는 이 케이스를 못 막는다 — _team_fits_me의
-    # 갭 체크(team_avg - effective_ovr <= margin)는 "선수가 팀보다 약할 때"
-    # 만 막는 구조라서, 애초에 선수가 팀 평균보다 훨씬 강하면(신급 재능이
-    # 5부/2부/1부 평균보다 다 위) margin과 무관하게 무조건 통과해버린다.
-    # 진짜 원인은 그 이전 단계 — _fill_country_pool()이 후보 tier 자체를
-    # tier_weights_by_ovr_n(ovr, ...)으로 뽑는데, 이건 순수 OVR 기준이라
-    # 경기 기록과 무관하게 OVR94면 처음부터 1부가 최우선 후보로 뽑힌다.
-    # 그래서 후보 tier 폭 자체를 여기서 제한한다: 검증 안 된 선수는 현재
-    # 소속팀 tier보다 최대 _UNPROVEN_TIER_REACH단계 위까지만 후보로 허용
-    # (예: 5부 소속 0경기면 후보는 4부까지만 — 경기 수가 쌓이면 해제).
-    _my_cur_tier = None
-    if my_tid:
-        _row_mt = c.execute("SELECT current_tier FROM teams WHERE id=?", (my_tid,)).fetchone()
-        _my_cur_tier = _row_mt["current_tier"] if _row_mt else None
-    _unproven_tier_floor = None  # 이 값보다 좋은(작은 숫자) tier는 후보에서 제외
-    if my_tid and _my_cur_tier and _proven_matches < _UNPROVEN_MIN_MATCHES:
-        _UNPROVEN_TIER_REACH = 1
-        _reach = _UNPROVEN_TIER_REACH + int(round(2 * (_proven_matches / _UNPROVEN_MIN_MATCHES)))
-        _unproven_tier_floor = max(1, _my_cur_tier - _reach)
-
-    from constants import ALL_STATS
-    avg_stat = sum(p.get(s, 40) for s in ALL_STATS) / len(ALL_STATS)
-
-    # 자국 country_id + 등급 조회 (force_max_tier 계산에 필요해 먼저 선언)
-    my_country_id = None
-    my_country_grade = None
-    if nationality:
-        row_c = c.execute("SELECT id, grade FROM countries WHERE name=?", (nationality,)).fetchone()
-        if row_c:
-            my_country_id = row_c["id"]
-            my_country_grade = row_c["grade"]
-    my_join_margin = CLUB_JOIN_MARGIN_BY_GRADE.get(my_country_grade, CLUB_JOIN_MARGIN)
-
-    # 자국 리그 최대 tier (없으면 3 기본값)
-    def _country_max_tier(cid):
-        if not cid: return 3
-        row_mt = c.execute("SELECT MAX(tier) as mt FROM leagues WHERE country_id=?", (cid,)).fetchone()
-        return int(row_mt["mt"]) if row_mt and row_mt["mt"] else 3
-
-    my_max_tier = _country_max_tier(my_country_id)
-    # 17세 이하 저능력 선수는 가장 하위 리그(max_tier)만 허용
-    force_max_tier = (age <= 17 and avg_stat < 50)
-
-    # [최적화] 전체 팀 평균 OVR을 1회 SELECT → dict 캐시 (기존: 루프마다 SELECT 최대 120회)
-    # [2026-09 신설, 신민용+GPT 협업 확정: "강팀 오퍼가 너무 잦다"] 같은
-    # 쿼리·같은 테이블 스캔에 COUNT(*)만 더 얹어서 팀별 현재 AI 인원수도
-    # 같이 캐시한다 — 아래 _team_fits_me()가 "SS/S(1·2부)·A(1부) 26명
-    # 고정 팀인데 이미 26명 꽉 찼는지"를 추가 쿼리 없이 바로 판정한다.
     _team_avg_cache_offers: dict = {}
     _team_headcount_cache_offers: dict = {}
     for r in c.execute(
@@ -26450,58 +26606,18 @@ def generate_offers(count=5, force=False) -> list:
         if r["avg_ovr"] is not None:
             _team_avg_cache_offers[r["team_id"]] = r["avg_ovr"]
 
-    # [밸런스 조정 2026-07, 현실성 검토 반영] 마진 기준을 "그 나라 등급"에서
-    #   "그 팀이 자기 리그 안에서 몇 등급이냐(상대적 위치)"로 변경.
-    #   기존엔 F급 국가면 무조건 마진 7(팀 평균보다 7 낮아도 입단) 처럼
-    #   나라 하나로 퉁쳤는데, 실제로는 같은 나라 안에서도 우승권 팀은
-    #   깐깐하고 강등권 팀은 관대해야 자연스럽다. 그래서 같은 리그 소속팀들
-    #   끼리 평균 OVR 백분위를 매겨 명문(상위 20%, 마진1)~최하위(하위 20%,
-    #   마진5)로 나눈다.
-    _team_league_map: dict = {
-        r["id"]: r["league_id"]
-        for r in c.execute("SELECT id, league_id FROM teams").fetchall()
-    }
-    _league_avgs: dict = {}
-    for _tid, _avg in _team_avg_cache_offers.items():
-        _lid = _team_league_map.get(_tid)
-        if _lid is None:
-            continue
-        _league_avgs.setdefault(_lid, []).append(_avg)
-    for _lid in _league_avgs:
-        _league_avgs[_lid].sort(reverse=True)  # 내림차순: 앞쪽 = 리그 내 강팀
-
-    def _team_relative_margin(team_row) -> int:
-        """팀이 속한 리그 내 평균 OVR 백분위로 마진(1~5) 결정.
-           명문(상위20%)=1 ~ 최하위(하위20%)=5. 리그 정보가 없으면 하위호환
-           기본값(CLUB_JOIN_MARGIN)으로 폴백."""
-        tid = team_row["id"]
-        team_avg = _team_avg_cache_offers.get(tid)
-        peers = _league_avgs.get(_team_league_map.get(tid))
-        if team_avg is None or not peers or len(peers) < 2:
-            return CLUB_JOIN_MARGIN
-        rank = sum(1 for v in peers if v >= team_avg)  # 1=리그 최강팀
-        pct = rank / len(peers)
-        return get_league_relative_margin(pct)
-
-    _team_floor_on = [True]   # 무소속 안전망이 끌 수 있게 리스트로 둔다
-
-    # [2026-10 버그수정, 신민용 리포트: "OVR 105인데 오퍼가 아예 안 온다"] 세계 상위 팀 스쿼드
-    # 평균(_elite_team_avg) — "팀이 너무 약함" 하한의 기준 OVR 상한(constants OFFER_FLOOR_REF_TOPN 주석).
-    # 만석 팀 예외는 _team_full_fixed26(OFFER_STAR_FULL_BYPASS_GAP).
+    _team_floor_on = [True]   # 첫 입단이면 끈다(아래 O-1 블록)
     from constants import OFFER_FLOOR_REF_TOPN, OFFER_STAR_FULL_BYPASS_GAP
     _top_avgs = sorted(_team_avg_cache_offers.values(), reverse=True)[:OFFER_FLOOR_REF_TOPN]
     _elite_team_avg = (sum(_top_avgs) / len(_top_avgs)) if _top_avgs else _effective_ovr
     _floor_ref_ovr = min(_effective_ovr, _elite_team_avg)
 
     def _team_full_fixed26(team_row) -> bool:
-        """SS/S(1·2부)·A(1부) 26명 고정 팀인데 이미 26명이면 True — 오퍼
-        후보가 될 수 없는(구조적으로 자리가 없는) 팀. [2026-10] _team_fits_me
-        에 인라인으로 있던 판정을 해외 성사 확률 분모 계산에도 쓰려고 뺐다."""
+        """26명 고정 리그(SS/S 1·2부, A 1부) 팀인데 이미 26명이면 True — 자리가 없는 팀. 단 팀 평균이 내 시장 평가
+        OVR보다 OFFER_STAR_FULL_BYPASS_GAP 이상 낮으면(나보다 확실히 약한 팀) 만석이어도 자리를 비워 제안한다."""
         from ai_lifecycle import _is_fixed26
         _fixed_grade = get_country_league_grade(team_row["country"], team_row["grade"])
         if _is_fixed26(_fixed_grade, team_row["tier"]):
-            # [2026-10 버그수정] 나보다 확실히 약한 팀(평균이 나보다 GAP 이상 낮음)은 만석이어도
-            # 자리를 비워 제안한다 — 이 규칙의 원래 목적(강팀 오퍼 과다 방지)과 무관한 팀이다.
             _ta = _team_avg_cache_offers.get(team_row["id"])
             if _ta is not None and _effective_ovr >= _ta + OFFER_STAR_FULL_BYPASS_GAP:
                 return False
@@ -26509,9 +26625,8 @@ def generate_offers(count=5, force=False) -> list:
         return False
 
     def _team_below_floor(team_row) -> bool:
-        """[2026-10 오퍼 생성 결함 수정] "팀이 너무 약함" 하한 — 팀 평균 OVR이
-        (내 시장 평가 OVR - 하한) 미만이면 True. 국내(내 보유 국적 나라) 12·해외 10.
-        무소속인데 이 하한 때문에 오퍼가 하나도 안 남으면 무소속 안전망이 끈다."""
+        """"팀이 너무 약함" 하한 — 팀 평균 OVR이 (기준 OVR − 하한) 미만이면 True. 국내(내 보유 국적 나라) 12·
+        해외 10, 기준 OVR = min(시장 평가 OVR, 세계 상위 팀 평균). 첫 입단은 적용하지 않는다(O-1 확정)."""
         if not _team_floor_on[0]:
             return False
         team_avg = _team_avg_cache_offers.get(team_row["id"])
@@ -26519,648 +26634,232 @@ def generate_offers(count=5, force=False) -> list:
             return False
         _floor = (OFFER_TEAM_FLOOR_DOMESTIC if team_row["country"] in _my_nat_names
                   else OFFER_TEAM_FLOOR_FOREIGN)
-        return team_avg < _floor_ref_ovr - _floor      # [2026-10 버그수정] 기준 OVR 상한(_elite_team_avg)
+        return team_avg < _floor_ref_ovr - _floor
 
-    def _team_fits_me(team_row) -> bool:
-        """팀 평균 OVR 대비 내 effective_ovr 차이가 '그 팀의 리그 내
-           상대적 위치별 마진(+ 명성 보너스)' 이내면 True. 명문 팀일수록
-           마진이 작아(빡빡) 검증된 선수만 입단 가능, 하위권/강등권
-           팀일수록 관대하다. 명성(커리어 업적)이 높으면 약간 더 높은
-           수준의 팀에서도 오퍼가 뜰 수 있다.
-           [2026-09 재설계] 인기도(popularity)는 여기서 뺐다 — 화제성이
-           팀 급을 직접 올려주는 건 이상해서, 대신 _offer_probability의
-           오퍼 발생 확률 쪽으로 옮겼다(_fame_bonus는 fame 전용).
-           [2026-08 재설계, 15-3] 이번 시즌 활약이 나쁘면 비교 기준
-           자체(_effective_ovr)가 낮아져 명문팀은 사실상 배제되고,
-           하위권팀은 그래도 어느 정도 갭을 허용한다 — margin은 더 이상
-           form으로 줄이지 않는다(이중 반영 방지).
-           [2026-08 신설, 15-6 사전조치] 소속팀에서 실전 경기를 거의
-           안 뛴 신인은 OVR/effective_ovr과 무관하게 마진 자체를 좁게
-           캡(_unproven_margin_cap)한다 — 자세한 이유는 위 계산부 주석
-           참고.
-           [2026-09 신설, 신민용+GPT 협업 확정: "강팀 오퍼가 너무 잦다"]
-           SS/S(1·2부)·A(1부) 26명 고정 팀은 이미 26명 꽉 찼으면(=이번
-           시즌 오퍼 빈자리 로또에 안 뽑혔거나 이미 다른 경로로 채워짐)
-           OVR 마진과 무관하게 오퍼 후보에서 제외한다 — ai_lifecycle.
-           _roll_offer_vacancy_teams가 리그마다 일부 팀만 1자리 비워두므로,
-           이 체크 하나로 "정원 다 찬 강팀은 오퍼 안 옴"이 자동으로
-           성립한다(4주차 지나면 빈자리도 강제로 채워지므로 그 뒤엔 이
-           등급 전체가 패시브 오퍼 후보에서 빠지는 게 정상)."""
-        if _team_full_fixed26(team_row):
-            return False
-        team_avg = _team_avg_cache_offers.get(team_row["id"])
-        if team_avg is None:
-            return True
-        _is_home_nat = team_row["country"] in _my_nat_names
-        if _team_below_floor(team_row):
-            return False
-        margin = _team_relative_margin(team_row) + _fame_bonus
-        if _unproven_margin_cap is not None:
-            margin = min(margin, _unproven_margin_cap)
-        if _agent_continent and get_country_continent(team_row["country"]) == _agent_continent:
-            margin += _AGENT_CONTINENT_BONUS
-        if not _is_home_nat:
-            margin -= FOREIGN_OFFER_MARGIN_PENALTY
-        return (team_avg - _effective_ovr) <= margin
+    from constants import OFFER_ALLOWED_ROLES
+    _role_memo = {}
+
+    def _offer_role_ok(team_row):
+        """[2026-11-16 C] 그 팀에 입단했을 때의 실제 역할(my_offer_role)과 그 역할로 오퍼할 수 있는지(대기·전력외는
+        오퍼 안 함). 관심을 받고 하한·만석을 통과한 구단에만 계산한다(계산이 무거워서)."""
+        tid = team_row["id"]
+        if tid not in _role_memo:
+            _role_memo[tid] = my_offer_role(tid, p, conn)
+        r = _role_memo[tid]
+        return r, r in OFFER_ALLOWED_ROLES
 
     # [2026-10 버그수정, 신민용 리포트: "팀 입단창에 3개팀만 뜨고 국적이 대한민국인데 자국팀이 하나도
     # 안 뜬다"] 시작 나이를 14~28세로 고를 수 있게 된 뒤로 첫 입단이 19세 이상일 수 있는데, 판정이
     # 나이(<=18)만 봐서 프로 경력이 없는 신인도 "계약만료 자유계약" 분기로 빠졌다 — 그쪽은 "팀이 너무
     # 약함" 하한이 켜져 있어(예: OVR 90이면 K1 평균 76 < 90-12) 자국팀이 전부 걸러지고 해외 5칸
     # (확률 성사)에서 3개만 남았다. 프로 경력(career_entries 팀 기록)이 없으면 나이와 무관하게 첫 입단.
-    first_join = (not has_team and (age <= 18 or _apply_reference_is_rookie()))
-    # [2026-10 R1, 신민용 확정] 첫 입단(17~18세 데뷔)은 "팀이 너무 약함" 하한을 적용하지 않는다 —
-    # 데뷔 선수가 자국 1부보다 약한 리그에서 시작하는 건 자연스럽다(OVR 99 17세에게 K1이 전부
-    # 하한에 걸려 자국 오퍼가 비고, 시도 횟수가 소진돼 16개 중 6개만 뜨던 회귀). 자국·해외 정규 오퍼
-    # 모두 해당, 첫 입단이 아닌 오퍼는 그대로.
+    # ── [2026-11-16 신설, 신민용 확정 — O-1] 관심 → 적합성 → 연결 (constants O1_* 주석 참고) ──────────────
+    from constants import (O1_REL_BASE, O1_ACT_FLOOR, O1_MIN_MATCHES, O1_RATING_BASE, O1_RATING_SPAN,
+                           O1_INTL_MULT, O1_TRANSFER_REQ_MULT, O1_FIRST_DOM_BASE, O1_FIRST_DOM_BASE_LOW,
+                           O1_FIRST_FOR_BASE, O1_TALENT_CLASS, O1_TALENT_DOM_MULT, O1_TALENT_FOR_MULT,
+                           O1_PRESTIGE_MULT, O1_FIRST_AGE_MULT, O1_FIRST_AGE_MULT_OLD, O1_INTEREST_CAP,
+                           O2_CONN, O2_SPECIALTY_GRADES, O2_SPECIALTY_MULT, O2_CONN_CAP,
+                           O2_BEST_GUARANTEE_GRADES, get_contract_urgency_mult)
+    from data.prestige_clubs import prestige_level as _prestige_level
+    from database import get_world_salt
+    # 첫 입단 = 프로 경력(career_entries 팀 기록) 없음. 나이와 무관.
+    first_join = (not has_team) and _apply_reference_is_rookie()
+    # [2026-10 R1, 신민용 확정 — 유지] 첫 입단은 "팀이 너무 약함" 하한을 적용하지 않는다.
     if first_join:
         _team_floor_on[0] = False
-
     offers = []
-    tried  = 0
+    _st_o1 = get_state() or {}
+    _wkey = offer_window_key(_st_o1.get("current_year"), _st_o1.get("current_week")) \
+        or f"{_st_o1.get('current_year')}:{_st_o1.get('current_week')}"
+    _draw_key = (get_world_salt(), _wkey, _O1_DRAW_SALT, p.get("name") or "", p.get("current_year") or 0)
 
-    # [2026-07 신설, 신민용 요청: "국가가 여러 개인 경우도 있잖아 — 이럴 땐
-    # 최소한 각 국가마다 1개씩은 보장"] 귀화 등으로 nationality/nationality2/
-    # nationality3/nationality4에 국적이 여러 개 실려 있을 수 있다. 지금까지는
-    # '자국' 풀을 전부 nationality(주 국적) 하나로만 채워서, 두 번째·세 번째
-    # 국적은 오퍼 목록에 전혀 반영이 안 됐다. 보유 국적 전부를 모아두고,
-    # 자국 풀을 채울 때 국적 수만큼(슬롯이 허용하는 한) 1개씩 먼저 보장한다.
-    def _all_my_nationality_ids():
-        names = []
-        for k in ("nationality", "nationality2", "nationality3", "nationality4"):
-            v = p.get(k)
-            if v and v not in names:
-                names.append(v)
-        ids = []
-        for nm in names:
-            row = c.execute("SELECT id FROM countries WHERE name=?", (nm,)).fetchone()
-            if row and row["id"] not in ids:
-                ids.append(row["id"])
-        return ids
+    # 내 리그 맥락(프로): 소속팀 리그, 무소속이면 마지막 소속팀 리그
+    _ref_tid = my_tid
+    if not _ref_tid and not first_join:
+        _r_last = c.execute("SELECT team_id FROM career_entries WHERE team_id>0 ORDER BY id DESC LIMIT 1").fetchone()
+        _ref_tid = _r_last["team_id"] if _r_last else 0
+    _me_lid = _me_country = _me_tier = _me_cont = None
+    if _ref_tid:
+        _r_me = c.execute("SELECT l.id AS lid, l.tier AS tier, cn.name AS country, cn.continent AS cont "
+                          "FROM teams t JOIN leagues l ON l.id=t.league_id JOIN countries cn ON cn.id=l.country_id "
+                          "WHERE t.id=?", (_ref_tid,)).fetchone()
+        if _r_me:
+            _me_lid, _me_country, _me_tier, _me_cont = _r_me["lid"], _r_me["country"], _r_me["tier"], _r_me["cont"]
 
-    _my_nat_ids = _all_my_nationality_ids()
+    # 선수 노출도(프로) — OVR 미포함
+    _act = None
+    if not first_join:
+        _cnt = _p_mkt.get("season_rating_cnt", 0) or 0
+        _rsum = _p_mkt.get("season_rating_sum", 0.0) or 0.0
+        _lid_for = _me_lid
+        if _cnt < O1_MIN_MATCHES:
+            _prev = c.execute("SELECT team_id, matches, rating FROM my_player_season_stats WHERE year<? "
+                              "ORDER BY year DESC LIMIT 1", (p.get("current_year") or 0,)).fetchone()
+            if _prev and (_prev["matches"] or 0) > _cnt:
+                _cnt = _prev["matches"] or 0
+                _rsum = (_prev["rating"] or 0.0) * _cnt
+                _r_pl = c.execute("SELECT league_id FROM teams WHERE id=?", (_prev["team_id"],)).fetchone()
+                _lid_for = _r_pl["league_id"] if _r_pl else _me_lid
+        _full = _my_league_full_matches(c, _lid_for) if _lid_for else 0
+        _ratio = min(1.0, _cnt / _full) if _full else 0.0
+        _rat = (_rsum / _cnt) if _cnt else O1_RATING_BASE
+        _ridx = max(0.0, min(1.0, (_rat - O1_RATING_BASE) / O1_RATING_SPAN))
+        _act = O1_ACT_FLOOR + (1.0 - O1_ACT_FLOOR) * (0.5 * _ratio + 0.5 * _ridx)
+    _fame_m = 1.0 + (p.get("fame", 0) or 0) / 100.0
+    _caps = p.get("intl_caps", 0) or 0
+    _intl_m = next((m for n, m in O1_INTL_MULT if _caps >= n), 1.0)
+    _cur_y = p.get("current_year", GAME_START_YEAR)
+    _end_y = p.get("contract_end_year", 0)
+    _cur_w = _st_o1.get("current_week", 1) or 1
+    _wl = max(0, ((_end_y - _cur_y) * 52 + (52 - _cur_w))) if (_end_y and has_team) else 999
+    _signal_m = (get_contract_urgency_mult(_wl) if has_team else 1.0) \
+        * (O1_TRANSFER_REQ_MULT if transfer_req else 1.0) * _sale_push_mult
+    # 첫 입단 스카우팅
+    _tclass = O1_TALENT_CLASS.get(p.get("talent_tier") or "", "일반")
+    _age_m = next((m for a, m in O1_FIRST_AGE_MULT if age <= a), O1_FIRST_AGE_MULT_OLD)
+    from constants import O1_K_PRO as _K_PRO, O1_K_FIRST as _K_FIRST
 
-    # [팀입단 확장] 자국/고향/타국 국가풀에서 팀을 채우는 공용 헬퍼.
-    #   exclude_ids: 이미 뽑힌 team_id 집합(중복 방지, 호출부에서 관리).
-    def _fill_country_pool(country_id, want, exclude_ids, max_tier_cap=None):
-        pool = []
-        if not country_id or want <= 0:
-            return pool
-        _max_t = max_tier_cap or _country_max_tier(country_id)
-        _tiers = list(range(1, _max_t + 1))
-        _weights = tier_weights_by_ovr_n(ovr, _max_t)
-        # [2026-08 신설, 15-6 사전조치 2단계] 검증 안 된 선수(현 소속팀
-        # 경기 기록 부족)는 원래 OVR 기준 tier 가중치가 아무리 상위 tier를
-        # 밀어줘도, 후보 tier 자체를 현재 tier - reach까지만 허용한다.
-        # _unproven_tier_floor보다 좋은(숫자가 작은) tier는 후보 목록에서
-        # 완전히 제외 — _team_fits_me()의 OVR 갭 체크만으로는 "재능은
-        # 뛰어난데 아직 아무도 못 본 신인"을 못 걸러내기 때문에 여기서
-        # 원천 차단한다.
-        if _unproven_tier_floor is not None and _unproven_tier_floor <= _max_t:
-            _tiers = list(range(_unproven_tier_floor, _max_t + 1))
-            _weights = tier_weights_by_ovr_n(ovr, _max_t)[_unproven_tier_floor - 1:]
-            # [2026-08 버그수정, 시나리오 테스트 중 발견: "ValueError: Total
-            # of weights must be greater than zero"] tier_weights_by_ovr는
-            # 고OVR일수록 뒷쪽(하위) tier 가중치가 0으로 떨어지는 표다
-            # (예: OVR95는 [88,10,2,0,0,0,0]). unproven_tier_floor가 딱
-            # 그 0-가중치 구간만 남기고 잘라버리면(예: 7부 소속 미검증
-            # OVR95가 6~7부로만 후보 제한) 슬라이스 합이 0이 되어
-            # random.choices가 죽는다 — 이 버그는 이번 15-7-1 변경 이전에도
-            # OVR80대에서 이미 존재했다(단지 못 뛴 신인이 드물어 안 걸렸을
-            # 뿐). 전부 0이면 허용된 tier 안에서 균등 추첨으로 폴백한다 —
-            # "검증 안 된 신인은 후보 tier 폭 자체를 좁힌다"는 원래 설계
-            # 의도(높은 OVR이 그 좁은 범위 안에서까지 상위쪽으로 쏠릴
-            # 필요는 없음)와도 자연스럽게 맞는다.
-            if sum(_weights) <= 0:
-                _weights = [1] * len(_tiers)
-        _tr = 0
-        while len(pool) < want and _tr < 60:
-            _tr += 1
-            tier = _max_t if force_max_tier else random.choices(_tiers, _weights)[0]
-            c.execute("""SELECT t.id,t.name,l.id as lid,l.name as lname,l.tier,
-                                cn.name as country,cn.flag,cn.grade
-                         FROM teams t
-                         JOIN leagues l ON t.league_id=l.id
-                         JOIN countries cn ON l.country_id=cn.id
-                         WHERE cn.id=? AND l.tier=?
-                         ORDER BY RANDOM() LIMIT 20""", (country_id, tier))
-            # [상위권 우선 가중치 추첨 2026-07, 신민용 설계+GPT 검토] 후보를
-            #   넉넉히 뽑아 마진 통과한 것들만 남긴 뒤, 팀 평균 OVR이 높은
-            #   순서로 줄 세워 순위별 가중치로 추첨한다. 마진(들어갈 수
-            #   있는지)은 그대로 두고 '그 안에서 어떤 팀을 보여줄지'만
-            #   상위권 쪽에 무게를 실어서, 매번 같은 1~2팀만 고정되지 않게
-            #   한다 — 하위권은 어차피 직접 지원으로도 갈 수 있어 패시브
-            #   오퍼 슬롯을 거기 쓸 이유가 없다.
-            cands = [r for r in c.fetchall()
-                     if r["id"] not in exclude_ids and r["id"] not in _self_team_ids and _team_fits_me(r)]
-            if not cands:
-                continue
-            cands.sort(key=lambda r: _team_avg_cache_offers.get(r["id"], 0), reverse=True)
-            _w = [get_passive_offer_rank_weight(i + 1) for i in range(len(cands))]
-            row = random.choices(cands, _w)[0]
-            _wealth_g = get_league_grade(row["country"], row["grade"])
-            salary = _calc_offer_salary(p, _wealth_g, tier, ovr, row["country"], row["name"],
-                                         year=p.get("current_year"), team_id=row["id"],
-                                         talent_tier=p.get("talent_tier"), rand_range=(0.85, 1.15))
-            pool.append(_build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary))
-            exclude_ids.add(row["id"])
-        return pool
+    from military_service import get_military_team_ids as _mil_ids_fn
+    try:
+        _mil_ids = _mil_ids_fn(conn)
+    except Exception:
+        _mil_ids = frozenset()
+    _all_rows = c.execute(
+        """SELECT t.id, t.name, l.id AS lid, l.name AS lname, l.tier, cn.name AS country, cn.flag, cn.grade,
+                  cn.continent AS continent, t.classification_status AS cls
+           FROM teams t JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id""").fetchall()
+    # [2026-11-18 FJ2] 첫 입단은 새 선정(_fj2_first_join_picks)으로 — 아래 관심 루프는 건너뛴다(행을 비움).
+    from constants import FJ2_ON as _FJ2_ON
+    _fj2 = bool(first_join and _FJ2_ON)
+    _fj2_rows = [r for r in _all_rows if r["id"] not in _self_team_ids and r["id"] not in _mil_ids] if _fj2 else []
+    if _fj2:
+        _all_rows = []
 
-    def _fill_home_pool_multi(want, exclude_ids, nat_ids=None):
-        """자국(고향) 풀을 채우되, 보유 국적이 여러 개면 want가 허용하는
-        한도 내에서 국적마다 최소 1개씩 먼저 보장하고, 남는 슬롯은 주
-        국적(가장 앞) 위주로 채운다. nat_ids를 안 주면 _my_nat_ids 전체 사용."""
-        pool = []
-        ids = nat_ids if nat_ids is not None else _my_nat_ids
-        if not ids or want <= 0:
-            return pool
-        guaranteed = ids[:want]
-        for cid in guaranteed:
-            pool.extend(_fill_country_pool(cid, 1, exclude_ids))
-        remaining = want - len(pool)
-        if remaining > 0:
-            pool.extend(_fill_country_pool(ids[0], remaining, exclude_ids))
-        return pool
-
-    def _fill_foreign_pool(want, exclude_country_ids, exclude_ids):
-        pool = []
-        if want <= 0:
-            return pool
-
-        _f_tiers   = [1, 2, 3]
-        _f_weights = tier_weights_by_ovr_n(ovr, 3)
-        # [2026-08 버그수정, 검증 테스트 중 발견: "17세 미검증 OVR95가 7부
-        # 소속인데 해외 1부 오퍼가 계속 뜬다"] _unproven_tier_floor/
-        # _unproven_margin_cap은 원래 "OVR94 신급 재능이 0경기로 스페인
-        # 1부/2부 오퍼를 받는다"는 리포트(15-6 사전조치 2단계 주석 참고)를
-        # 막으려고 만든 장치인데, 실제 구현은 _fill_country_pool(국내/
-        # 고향/직전리그처럼 특정 국가 하나를 지정해서 채우는 풀)에만
-        # 적용돼 있었고, 정작 "국가 등급으로 무작위 해외국을 고르는" 이
-        # _fill_foreign_pool엔 전혀 연결이 안 돼 있었다 — 그래서 정확히
-        # 그 버그가 해외 오퍼 경로로는 여전히 재현된다(margin 체크만으론
-        # 못 걸러짐: OVR95는 이미 웬만한 팀 평균보다 높아 margin cap이
-        # 3.0이어도 거의 항상 통과). _fill_country_pool과 동일한 원리로
-        # 후보 tier 폭 자체를 제한한다 — 미검증 선수는 원래 해외 후보
-        # tier인 [1,2,3]과 "국내 tier - reach" 범위의 교집합만 허용한다.
-        if _unproven_tier_floor is not None:
-            _f_tiers_allowed = [t for t in _f_tiers if t >= _unproven_tier_floor]
-            if not _f_tiers_allowed:
-                return pool   # 미검증 + 국내 최하위권 → 해외 1~3부 후보 자체가 없음(정상)
-            _idx = [_f_tiers.index(t) for t in _f_tiers_allowed]
-            _f_tiers = _f_tiers_allowed
-            _f_weights = [_f_weights[i] for i in _idx]
-            if sum(_f_weights) <= 0:
-                _f_weights = [1] * len(_f_tiers)
-        # [2026-08 재설계, 신민용 지적 — 총 4차에 걸쳐 확정] 처음엔 (등급,
-        # tier)를 완전 무작위로 재추첨하며 want를 채울 때까지 최대 80회
-        # 재시도했다(→ 등급마다 재시도 횟수 제한으로 1차 수정, → tier를
-        # 매 시도 재추첨하지 않고 등급당 1회 고정으로 2차 수정, → 무작위
-        # 표본 대신 전체 모집단을 조회하는 것으로 3차 수정) — 그런데도
-        # 매 단계 어블레이션(페널티 0/2/3/4, LIMIT 20/3, 전체조회)에도
-        # 결과가 거의 그대로였다(60회 전부 2.97~3.00/회). 3차까지 마친
-        # 뒤에야 진짜 원인이 드러났다: 250~400개 팀짜리 등급·tier
-        # 버킷엔 항상 예외적으로 약한 팀이 몇십 개씩 섞여 있어서,
-        # "통과하는 팀이 하나라도 있으면 성사"인 한 마진을 아무리
-        # 조여도(A1 기준 최약체 팀조차 내 수준보다 -7.1 낮은 정도라
-        # -30 가까이 가야) 실패가 안 나온다. 4차 최종 수정: '있다/없다'가
-        # 아니라 '전체 중 얼마나 되는가(pass_fraction)'로 성사를
-        # 확률적으로 정한다 — 통과 비율이 낮으면(예외적으로만 맞음)
-        # 낮은 확률로만, 높으면(전반적으로 맞음) 높은 확률로 성사된다.
-        # 이제야 FOREIGN_OFFER_MARGIN_PENALTY가 통과 비율 자체를 낮춰
-        # 실제 성사 확률에 직접 영향을 준다. tier 선택 가중치
-        # (_f_weights, OVR 기반)는 그대로 유지.
-        _grade_order = list(grades)
-        random.shuffle(_grade_order)
-        # [2026-10 오퍼 생성 결함 수정] 후보 나라를 국대 등급(countries.grade)이
-        # 아니라 리그 등급으로 고른다 — 2026-09에 발롱도르·푸스카스 쪽에서 같은
-        # 버그를 고칠 때 만든 _country_ids_by_league_grade(군대 제외·캐시)를 재사용.
-        # 국대 SS가 0개국이라 OVR 90+의 SS 시도가 늘 비고, 이탈리아(리그 S·국대 A)는
-        # 90+ 후보에서 빠지고, 사우디(리그 A·국대 C)는 OVR 65~74에게만 걸렸다.
-        _excl_cids = {cid for cid in exclude_country_ids if cid}
-
-        def _weighted_tier_order():
-            """부수 시도 순서 — 첫 부수는 기존과 같은 OVR 가중치로 뽑고, 그 부수에
-            받아줄 팀이 아예 없을 때만 남은 부수를 같은 가중치로 이어서 시도한다."""
-            if force_max_tier:
-                return [3]
-            _pool = [(t, w) for t, w in zip(_f_tiers, _f_weights) if w > 0] \
-                or [(t, 1) for t in _f_tiers]
-            _order = []
-            while _pool:
-                _t = random.choices([x[0] for x in _pool], [x[1] for x in _pool])[0]
-                _order.append(_t)
-                _pool = [x for x in _pool if x[0] != _t]
-            return _order
-
-        for _grade_filter in _grade_order:
-            if want <= 0:
-                break
-            _cids = sorted(cid for cid in _country_ids_by_league_grade(c, (_grade_filter,))
-                           if cid not in _excl_cids)
-            if not _cids:
-                continue
-            _ph_c = ",".join("?" * len(_cids))
-            for tier in _weighted_tier_order():
-                # [2026-08 재설계 3차, 신민용 지적] 2차 수정(등급당 tier 1회
-                # 고정)도 결과가 거의 그대로였다(60회 전부 2.97~3.00/회) —
-                # LIMIT을 20→3으로 낮춰 재실측해도 마찬가지였다. 계산해보면
-                # 원인이 명확하다: 개별 팀 통과율이 16~20%만 되어도 "무작위
-                # 표본 N개 중 하나라도 통과하면 성사" 방식에서는 시도 횟수 ×
-                # 표본 크기(예: 3회×LIMIT3=9번 추첨)만으로 성사 확률이
-                # 80~87%까지 뛴다 — 표본 크기를 줄이는 정도로는 이 구조를
-                # 못 이긴다. 진짜 필요한 건 "무작위 표본 중 하나 걸리면
-                # 통과"가 아니라 "그 등급·tier에 실제로 맞는 팀이 있는가"를
-                # 정확히 묻는 것. _team_avg_cache_offers(전체 팀 평균 OVR)가
-                # 이미 계산돼 있으므로, 무작위 LIMIT 표본을 버리고 해당
-                # (등급,tier)의 팀 전체를 가져와 마진 통과 여부를 정확히
-                # 판정한다 — 전체를 다 보고도 통과하는 팀이 하나도 없으면
-                # 그 등급은 진짜로 실패(모집단 전체가 기준이므로 재시도해도
-                # 결과가 똑같아 attempts 재시도 루프 자체가 불필요해졌다).
-                c.execute(f"""SELECT t.id,t.name,l.id as lid,l.name as lname,l.tier,
-                                    cn.name as country,cn.flag,cn.grade
-                             FROM teams t
-                             JOIN leagues l ON t.league_id=l.id
-                             JOIN countries cn ON l.country_id=cn.id
-                             WHERE cn.id IN ({_ph_c}) AND l.tier=?""",
-                          tuple(_cids) + (tier,))
-                # [2026-10 오퍼 생성 결함 수정] 성사 확률(pass_fraction)의 분모에서
-                # 구조적으로 자리가 없는 팀(26명 고정 + 만석)을 뺀다 — 기존엔 만석
-                # 강팀이 분모에 그대로 남아 OVR이 높을수록(=후보가 26명 고정 리그일수록)
-                # 해외 오퍼가 사라졌다(OVR 90·95 여름 해외 0개 75%).
-                # 같은 이유로 "너무 약해서 애초에 후보가 아닌 팀"(_team_below_floor)도
-                # 분모에서 뺀다 — 하한은 비현실적 목적지를 없애려는 것이지, 내 수준에
-                # 맞는 팀의 성사 확률까지 깎으려는 게 아니다.
-                _all_rows = [r for r in c.fetchall()
-                             if r["id"] not in exclude_ids and r["id"] not in _self_team_ids
-                             and not _team_full_fixed26(r) and not _team_below_floor(r)]
-                if not _all_rows:
-                    continue   # 이 부수엔 자리 있는 팀 자체가 없음 → 다음 부수 재시도
-                cands = [r for r in _all_rows if _team_fits_me(r)]
-                if not cands:
-                    continue   # 자리는 있지만 내 수준에 맞는 팀이 없음 → 다음 부수 재시도
-                # [2026-08 재설계, 신민용 지적: "그래도 3부는 이례적으로 약한
-                # 팀이 항상 몇 개는 있다"] 모집단 전체를 봐도 통과하는 팀이
-                # '있기만 하면' 무조건 오퍼가 성사되는 것도 비현실적이다 —
-                # 250~400개 팀짜리 등급에서 예외적으로 약한 팀 몇십 개가
-                # 항상 섞여 있기 때문에, 마진을 아무리 조여도(심지어 -30
-                # 수준까지 가야) "한 팀도 없음"이 나오질 않는다(실측: A1
-                # 기준 최약체 팀도 내 수준보다 겨우 -7.1 낮음). 통과하는
-                # 팀이 '있다/없다'가 아니라 '전체 중 얼마나 되는가'로 성사
-                # 여부를 확률적으로 정한다 — 통과 비율이 낮은(예외적으로만
-                # 맞는 팀이 있는) 등급·tier는 그만큼 낮은 확률로만 오퍼가
-                # 성사되고, 통과 비율이 높은(전반적으로 내 수준과 맞는)
-                # 등급·tier는 높은 확률로 성사된다. 이러면 이제 FOREIGN_
-                # OFFER_MARGIN_PENALTY가 통과 비율 자체를 낮춰 실제 성사
-                # 확률에 직접 영향을 준다.
-                pass_fraction = len(cands) / len(_all_rows)
-                # [2026-08 신설, 신민용 지적] 나이 보정 — 이미 effective_ovr/
-                # 출전량/평점/인기/지역 보정이 시장성을 결정하므로 나이는
-                # pass_fraction에 약하게 곱하는 정도로만 얹는다(선수 한 명에게
-                # 동일한 값이라 _w가 아니라 여기가 실제 효과를 내는 지점).
-                # [2026-10 신설, 신민용 확정] 에이전트 등급 배율(해외 성사 확률에만, 국내
-                # 오퍼·직접 지원엔 미적용). 순서: 통과 비율 × 나이 배율 × 에이전트 배율 →
-                # 마지막에 1.0 상한. 이미 통과 비율이 높은 시장(1.0/배율 이상)에선 상한에
-                # 걸려 에이전트 차이가 사라진다 — "어차피 성사될 오퍼"엔 연줄이 필요 없다는 뜻.
-                pass_fraction = min(1.0, pass_fraction
-                                    * get_foreign_offer_age_mult(age, p.get("talent_tier"))
-                                    * AGENT_FOREIGN_OFFER_MULT.get(agent, 1.0))
-                if random.random() >= pass_fraction:
-                    break      # 맞는 팀은 있지만 비중이 작아 이번엔 불발 — 이 등급은 끝
-                cands.sort(key=lambda r: _team_avg_cache_offers.get(r["id"], 0), reverse=True)
-                # [2026-08 신설, 15-7-1, 신민용+GPT 검토: "패시브 해외 오퍼가
-                # 국가 등급만 보고 완전 무작위로 나라를 골라서, 같은 대륙끼리
-                # 오퍼가 많아야 한다는 현실감이 전혀 없다"] 순위 가중치(_w)에
-                # foreign_pool_region_weight()를 한 번 더 곱한다 — 마진 스케일
-                # (+4/-6/-10)을 그대로 배수로 쓰지 않고, 별도로 0.35~1.5 사이로
-                # 압축된 완만한 가중치만 적용한다(값 자체는 transfer_region_mod
-                # 재사용, 변환은 별개 — 값 정의 이원화 방지). 마진 게이트
-                # (_team_fits_me)는 그대로이므로 오퍼 총량/성사 여부엔 영향 없고,
-                # "같은 후보군 안에서 어느 나라가 더 자주 뽑히는가"만 바뀐다.
-                # [2026-08 신설, 15-7-2] EXPORT_MARKET_BONUS(수출국 배수)를
-                # foreign_pool_region_weight(대륙 배수)와 별개의 곱셈 항으로
-                # 유지한다 — 신민용 지적대로 두 개를 한 줄에 뭉쳐버리면 나중에
-                # "이 나라가 해외 후보에 과도하게 뽑히는 게 대륙 때문인지
-                # 수출국 보정 때문인지" 구분이 안 된다. 각 항을 별도 리스트로
-                # 먼저 만들고 마지막에 합치는 방식으로 분리해둔다(둘 중 하나만
-                # 끄고 테스트하기도 쉬워진다).
-                _rank_w   = [get_passive_offer_rank_weight(i + 1) for i in range(len(cands))]
-                _region_w = [foreign_pool_region_weight(_my_continent, get_country_continent(r["country"]))
-                             for r in cands]
-                _export_w = [export_market_weight(r["country"]) for r in cands]
-                _w = [a * b * e for a, b, e in zip(_rank_w, _region_w, _export_w)]
-                row = random.choices(cands, _w)[0]
-                _wealth_g = get_league_grade(row["country"], row["grade"])
-                salary = _calc_offer_salary(p, _wealth_g, tier, ovr, row["country"], row["name"],
-                                             year=p.get("current_year"), team_id=row["id"],
-                                             talent_tier=p.get("talent_tier"), rand_range=(0.85, 1.15))
-                pool.append(_build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary))
-                exclude_ids.add(row["id"])
-                want -= 1
-                break
-        return pool
-
-    def _interleave(*groups):
-        """그룹들을 리스트로 받아 행(row) 우선으로 지그재그 배치.
-           예: _interleave([d1,d2,d3],[h1,h2,h3],[f1,f2,f3,f4])
-               -> [d1,h1,d2,h2,d3,h3,f1,f2,f3,f4]
-           (마지막 그룹은 남는 슬롯 전체를 그대로 뒤에 이어붙임 = 하단 풀행)"""
-        result = []
-        head_groups = groups[:-1]
-        tail_group  = groups[-1] if groups else []
-        max_len = max((len(g) for g in head_groups), default=0)
-        for i in range(max_len):
-            for g in head_groups:
-                if i < len(g):
-                    result.append(g[i])
-        result.extend(tail_group)
-        return result
-
-    if first_join and my_country_id:
-        # ── [자국 보장] 첫 입단은 자국 리그에서 최소 1~2개는 반드시 온다 ──
-        #   현실 반영: 유스 출신은 우선 자국에서 데뷔 제안을 받는다.
-        #
-        #   [핵심 설계] '내 평균 수준으로 어느 티어가 입단 가능한지'를 먼저 판정하고,
-        #   그 가능한 티어들 중에서만 1부10%/2부30%/3부60% 비중으로 뽑는다.
-        #     - 이탈리아처럼 1부가 매우 높은 자국이면, 17세 신인은 1·2부가 수준
-        #       미달이라 애초에 후보에서 빠지고 3부만 가능 → 사실상 100% 3부.
-        #     - 한국처럼 1부가 약하면 1부도 후보에 들어 10% 확률로 1부 데뷔 가능.
-        #   판정 기준은 일반 슬롯과 동일한 _team_fits_me (팀 평균 OVR - 내 OVR ≤ 8).
-        guarantee = random.choice([1, 2])
-
-        def _tier_fittable(tier) -> bool:
-            """자국 해당 티어에 '내 수준에 맞는' 팀이 하나라도 존재하면 True.
-               (가장 약한 팀 기준: 그 리그 최저 팀 평균 OVR이 내 +8 이내면 가능)"""
-            c2 = conn.cursor()
-            c2.execute("""SELECT MIN(ta.avg_ovr) AS min_avg
-                          FROM teams t
-                          JOIN leagues l ON t.league_id=l.id
-                          JOIN (SELECT team_id, AVG(ovr) AS avg_ovr
-                                  FROM ai_players GROUP BY team_id) ta
-                                ON ta.team_id=t.id
-                          WHERE l.country_id=? AND l.tier=?""",
-                       (my_country_id, tier))
-            r = c2.fetchone()
-            if not r or r["min_avg"] is None:
-                # 그 티어 자체가 자국에 없거나 선수 데이터 없음 → 후보 아님
-                return False
-            return (r["min_avg"] - ovr) <= my_join_margin
-
-        def _try_domestic(tier, relax=False):
-            """자국 특정 티어에서 '수준 맞는' 팀 1개 탐색.
-               relax=True면 _team_fits_me 무시하고 아무 팀이나(데뷔 보장용)."""
-            if relax:
-                c.execute("""SELECT t.id,t.name,l.id as lid,l.name as lname,l.tier,
-                                    cn.name as country,cn.flag,cn.grade
-                             FROM teams t
-                             JOIN leagues l ON t.league_id=l.id
-                             JOIN countries cn ON l.country_id=cn.id
-                             WHERE cn.id=? AND l.tier=?
-                             ORDER BY RANDOM() LIMIT 1""", (my_country_id, tier))
-                row = c.fetchone()
-                if not row: return False
+    def _o1_interest(r):
+        """구단 r의 관심 확률(0~O1_INTEREST_CAP). 산식에 OVR 없음."""
+        dom = r["country"] in _my_nat_names
+        if first_join:
+            if dom:
+                b = O1_FIRST_DOM_BASE.get(r["tier"], O1_FIRST_DOM_BASE_LOW) * O1_TALENT_DOM_MULT[_tclass]
             else:
-                # 팀 평균 OVR - 내 OVR <= CLUB_JOIN_MARGIN 인 팀들 중 무작위 1팀.
-                #   (_tier_fittable 와 동일 기준으로, 판정-선택 불일치를 없앤다)
-                c.execute(f"""SELECT t.id,t.name,l.id as lid,l.name as lname,l.tier,
-                                    cn.name as country,cn.flag,cn.grade
-                             FROM teams t
-                             JOIN leagues l ON t.league_id=l.id
-                             JOIN countries cn ON l.country_id=cn.id
-                             JOIN (SELECT team_id, AVG(ovr) AS avg_ovr
-                                     FROM ai_players GROUP BY team_id) ta
-                                   ON ta.team_id=t.id
-                             WHERE cn.id=? AND l.tier=? AND (ta.avg_ovr - ?) <= {int(my_join_margin)}
-                             ORDER BY RANDOM() LIMIT 1""", (my_country_id, tier, ovr))
-                row = c.fetchone()
-                if not row: return False
-            if any(o["team_id"] == row["id"] for o in offers): return False
-            if row["id"] in _self_team_ids: return False
-            _wealth_g = get_league_grade(row["country"], row["grade"])
-            salary = _calc_offer_salary(p, _wealth_g, tier, ovr, row["country"], row["name"],
-                                         year=p.get("current_year"), team_id=row["id"],
-                                         talent_tier=p.get("talent_tier"), rand_range=(0.85, 1.15))
-            offers.append(_build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary))
-            return True
-
-        # [1단계] 내 수준으로 가능한 자국 티어 확정.
-        #   force_max_tier(저능력 17세)이면 무조건 최하위 부만.
-        if force_max_tier:
-            fittable = [my_max_tier] if _tier_fittable(my_max_tier) else []
+                rel = "same_continent" if r["continent"] == _my_continent else "other"
+                b = O1_FIRST_FOR_BASE[rel] * O1_TALENT_FOR_MULT[_tclass]
+                if b and _tclass in ("매우 높음", "신급"):
+                    b *= O1_PRESTIGE_MULT.get(_prestige_level(r["country"], r["name"]), 1.0)
+            v = _K_FIRST * b * _age_m
         else:
-            fittable = [t for t in range(1, my_max_tier + 1) if _tier_fittable(t)]
+            if _me_lid is not None and r["lid"] == _me_lid:
+                rel = "same_league"
+            elif _me_country is not None and r["country"] == _me_country:
+                rel = "same_country_1" if abs((r["tier"] or 1) - (_me_tier or 1)) <= 1 else "same_country_2p"
+            elif dom:
+                rel = "same_country_2p"
+            elif _me_cont is not None and r["continent"] == _me_cont:
+                rel = "same_continent"
+            else:
+                rel = "other"
+            v = _K_PRO * O1_REL_BASE[rel] * _act * _fame_m * (1.0 if dom else _intl_m) * _signal_m
+        return min(O1_INTEREST_CAP, max(0.0, v))
 
-        # [2026-07 크래시 수정, 신민용 리포트: "KeyError: 6" — generate_offers
-        # 에서 죽음] TIER_W가 1~5부 가중치만 정의돼 있었는데, 빅6(잉글랜드/
-        # 스페인/이탈리아/독일/프랑스/브라질 — SS·S급)는 실제 리그 데이터가
-        # 6부까지 있다(data/leagues.py). 이 나라 출신 선수가 자국 최하위
-        # 티어(6부)까지 들어갈 수 있는 상황(주로 저능력 유망주)에서
-        # `TIER_W[6]`을 찾다가 KeyError로 그대로 죽었다. 6부 가중치를
-        # 추가하고, 혹시 나중에 7부 이상이 생겨도 죽지 않도록 .get()
-        # 폴백(6부와 동일한 최저 비중)으로 방어한다.
-        TIER_W = {1: 5, 2: 20, 3: 40, 4: 25, 5: 8, 6: 2}
-        # [2026-10 D1, 신민용 확정] 고정 비율(TIER_W)은 OVR과 무관해서 OVR 99도 4부로 데뷔했다 —
-        # 일반 오퍼와 같은 OVR 기준 부수 가중치(tier_weights_by_ovr_n)를 쓴다. 가능 부수의 가중치가
-        # 전부 0이면(극단 조합) 예전 고정 비율로 되돌린다.
-        _dbg_w = tier_weights_by_ovr_n(ovr, my_max_tier)
-        _guar_w = {t: _dbg_w[t - 1] for t in range(1, my_max_tier + 1)}
-        if fittable and sum(_guar_w.get(t, 0) for t in fittable) <= 0:
-            _guar_w = TIER_W
-        for _ in range(guarantee):
-            placed = False
-            if fittable:
-                # 가능 티어만 남긴 가중치로 뽑기 → 매 시도 새로 뽑아 비중 유지
-                for _ in range(8):
-                    weights = [_guar_w.get(t, 2) for t in fittable]
-                    pick_tier = random.choices(fittable, weights)[0]
-                    if _try_domestic(pick_tier):
-                        placed = True; break
-            # [예외 보강] 가능 티어가 없거나(자국 1·2·3부 모두 수준 초과) 못 채웠으면
-            #   3부에서 기준 완화해서라도 데뷔 기회 1개는 보장.
-            if not placed:
-                for _ in range(10):
-                    if _try_domestic(my_max_tier, relax=True):
-                        placed = True; break
-            # 자국에 3부 리그 자체가 없으면 더는 강제하지 않음
-
-        # 자국 팀 중 내 수준에 맞는 것만 우선
-        # [2026-07 재설계 v2] 자국 10 + 타국 6 = 16 고정.
-        domestic_count = FIRST_JOIN_DOMESTIC
-        _seen_ids_fj = {o["team_id"] for o in offers}
-        # [2026-07 신설] 보유 국적이 여러 개면(귀화 등) 주 국적 외 나머지도
-        # 슬롯이 허용하는 한 1개씩 먼저 보장한다.
-        for _cid in _my_nat_ids[1:]:
-            if len(offers) >= domestic_count:
-                break
-            offers.extend(_fill_country_pool(_cid, 1, _seen_ids_fj))
-        _dom_tiers = list(range(1, my_max_tier + 1))
-        _dom_weights = tier_weights_by_ovr_n(ovr, my_max_tier)
-        while len(offers) < domestic_count and tried < 80:
-            tried += 1
-            _grade_filter = random.choice(grades)   # DB 쿼리 필터용
-            tier  = my_max_tier if force_max_tier else random.choices(_dom_tiers, _dom_weights)[0]
-            c.execute("""SELECT t.id,t.name,l.id as lid,l.name as lname,l.tier,
-                                cn.name as country,cn.flag,cn.grade
-                         FROM teams t
-                         JOIN leagues l ON t.league_id=l.id
-                         JOIN countries cn ON l.country_id=cn.id
-                         WHERE cn.id=? AND l.tier=?
-                         ORDER BY RANDOM() LIMIT 1""", (my_country_id, tier))
-            row = c.fetchone()
-            if not row: continue
-            if any(o["team_id"] == row["id"] for o in offers): continue
-            if row["id"] in _self_team_ids: continue
-            if not _team_fits_me(row): continue
-            _wealth_g = get_league_grade(row["country"], row["grade"])
-            salary = _calc_offer_salary(p, _wealth_g, tier, ovr, row["country"], row["name"],
-                                         year=p.get("current_year"), team_id=row["id"],
-                                         talent_tier=p.get("talent_tier"), rand_range=(0.85, 1.15))
-            offers.append(_build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary))
-
-        # 자국에서 못 채웠거나 해외 슬롯이 남은 경우 → 타국으로 채움
-        # [2026-07 수정] 보유 국적 전부를 제외한다(주 국적 하나만 빼면
-        # 두 번째 국적 나라가 '타국' 풀에 또 중복으로 나올 수 있었다).
-        _no_team_total = domestic_count + FIRST_JOIN_FOREIGN
-        _nat_excl = _my_nat_ids or ([my_country_id] if my_country_id else [])
-        if len(offers) < _no_team_total:
-            tried2 = 0
-            # [2026-10 오퍼 생성 결함 수정] 국대 등급(cn.grade)이 아니라 리그 등급 기준.
-            while len(offers) < _no_team_total and tried2 < 60:
-                tried2 += 1
-                _grade_filter = random.choice(grades)   # DB 쿼리 필터용
-                _foreign_max = _country_max_tier(None)
-                _f_tiers = list(range(1, _foreign_max + 1))
-                _f_weights = tier_weights_by_ovr_n(ovr, _foreign_max)
-                tier  = _foreign_max if force_max_tier else random.choices(_f_tiers, _f_weights)[0]
-                # [2026-10 R2, 신민용 확정] 첫 입단 정규 해외 오퍼는 SS·S 리그 1부를 내지 않는다 —
-                # 빅클럽은 재능을 보고 데려가는 유스 스카우트 경로(_try_youth_scout_offer)로만 온다.
-                # 1부가 뽑히면 같은 등급의 2부 이하로 다시 뽑아 시도 횟수를 낭비하지 않는다.
-                if tier == 1 and _grade_filter in ("SS", "S") and len(_f_tiers) > 1:
-                    _lw = _f_weights[1:] if sum(_f_weights[1:]) > 0 else [1] * (len(_f_tiers) - 1)
-                    tier = random.choices(_f_tiers[1:], _lw)[0]
-                _cids_fj = sorted(cid for cid in _country_ids_by_league_grade(c, (_grade_filter,))
-                                  if cid not in _nat_excl)
-                if not _cids_fj:
-                    continue
-                _ph = ",".join("?" * len(_cids_fj))
-                c.execute(f"""SELECT t.id,t.name,l.id as lid,l.name as lname,l.tier,
-                                    cn.name as country,cn.flag,cn.grade
-                             FROM teams t
-                             JOIN leagues l ON t.league_id=l.id
-                             JOIN countries cn ON l.country_id=cn.id
-                             WHERE cn.id IN ({_ph}) AND l.tier=?
-                             ORDER BY RANDOM() LIMIT 1""",
-                          tuple(_cids_fj) + (tier,))
-                row = c.fetchone()
-                if not row: continue
-                if any(o["team_id"] == row["id"] for o in offers): continue
-                if row["id"] in _self_team_ids: continue
-                if not _team_fits_me(row): continue
-                _wealth_g = get_league_grade(row["country"], row["grade"])
-                salary = _calc_offer_salary(p, _wealth_g, tier, ovr, row["country"], row["name"],
-                                             year=p.get("current_year"), team_id=row["id"],
-                                             talent_tier=p.get("talent_tier"), rand_range=(0.85, 1.15))
-                offers.append(_build_offer(row, get_league_grade(row["country"], row["grade"]), tier, salary))
-
-        # [그리드 배치] 자국(좌열) / 타국(우열)이 매 행마다 번갈아 오도록 재정렬 + 구역 태그
-        # [2026-10 D3] 예전엔 앞 10개를 무조건 "국내"로 잘라서, 국내 오퍼가 모자라면 해외 오퍼가
-        # 국내 칸에 표시됐다 — 내 보유 국적 나라인지로 나눈다(순서는 그대로).
-        _dom_group = [o for o in offers if o["country"] in _my_nat_names]
-        _for_group = [o for o in offers if o["country"] not in _my_nat_names]
-        for o in _dom_group: o["_zone"] = "domestic"
-        for o in _for_group: o["_zone"] = "foreign"
-        offers = _interleave(_dom_group, _for_group, [])
-
-        # [2026-07 신설, 신민용 요청: "해외파는 보통 유스 때부터 가는 건데
-        # 지금은 성인 이적시장 논리로만 해외 진출을 판정한다"] 지금까지
-        # 모든 해외 오퍼는 '현재 OVR vs 팀 평균' 마진으로만 걸러졌다 — 그런데
-        # 17~18세 신인이 명문 아카데미에 스카우트되는 건 '지금 얼마나 잘하는지'
-        # 가 아니라 '재능 상한(잠재력, talent_cap)'을 보고 데려가는 것이다
-        # (손흥민 함부르크 유스, 이강인 발렌시아 유스처럼 실제로도 그렇다).
-        # 낮은 확률·엘리트급 이상 재능 한정으로, 재능상한 기준 마진을 통과한
-        # 유스 스카우트 오퍼를 하나 추가한다 — 절대다수는 여전히 못 받고
-        # (실제로도 극소수만 해당), 받으면 눈에 띄는 이벤트가 된다.
-        _ys_offer = _try_youth_scout_offer(c, p, ovr, offers, _team_avg_cache_offers, my_country_id)
-        if _ys_offer:
-            offers.append(_ys_offer)
-
-    elif not has_team:
-        # ── [2026-07 재설계 v2, 신민용 최종안] 17세 이후 계약종료/방출 등으로
-        #    소속이 사라져 '오퍼'가 아닌 '팀 입단'으로 새 팀을 찾는 경우.
-        #    has_team(이적 오퍼) 분기가 '현재 리그 국가'를 기준으로 삼는 것과
-        #    같은 원리 — 무소속 분기는 '현재'가 없으니 career_entries의 가장
-        #    마지막 기록(계약 만료 직전 소속) 리그 국가를 그 자리에 쓴다.
-        #    직전 리그가 해외였으면: 직전리그 8 + 자국 3 + 기타 4 = 15
-        #    직전 리그가 자국이었으면(또는 커리어 기록 없음): 자국 10 + 기타 5 = 15
-        #    "무소속은 계약 중보다 제안이 확실히 많아야 자유계약 시장에
-        #    나온 느낌이 산다"는 설계 원칙.
-        _prev_country_id = _last_played_country_id(p)
-        if _prev_country_id and _prev_country_id != my_country_id:
-            PREV_LEAGUE_COUNT = NO_TEAM_PREV_LEAGUE
-            HOMETOWN_COUNT    = NO_TEAM_HOMETOWN
-            OTHER_FOREIGN_COUNT = NO_TEAM_OTHER_FOREIGN + _bonus
+    import hashlib as _hl
+    _dig = _hl.blake2b(digest_size=8)     # 관심 확률 전체의 지문(U1: OVR만 바꿔도 같아야 한다)
+    _stt = {"first_join": first_join, "interest_sum": 0.0, "interest_sum_for": 0.0, "interested": 0, "interested_dom": 0,
+            "interested_for": 0, "fail_floor": 0, "fail_full": 0, "fail_role": 0, "feasible": 0,
+            "connected": 0, "connected_dom": 0, "connected_for": 0, "roles": {},
+            "interested_ids": [], "feasible_ids": [], "connected_ids": [], "best_id": None,
+            "conn_groups": {}}     # [O-2] 묶음별 (적합성 통과 수, 연결 수) — 보장 팀 제외
+    _agent_g = agent if agent in O2_CONN else AGENT_NONE
+    _rate_dom, _rate_for = O2_CONN[_agent_g]
+    _agent_cont = (p.get("agent_continent") or "") if _agent_g in O2_SPECIALTY_GRADES else ""
+    _feas = []
+    for r in _all_rows:
+        tid = r["id"]
+        if tid in _self_team_ids or tid in _mil_ids or (r["cls"] or "") == "AFFILIATE":
+            continue    # 산하(유스)팀은 O-3(입단 형태)에서 모구단 단위로 다룬다
+        pi = _o1_interest(r)
+        if pi <= 0.0:
+            continue
+        _dig.update(f"{tid}:{pi:.12g};".encode())
+        _stt["interest_sum"] += pi
+        if r["country"] not in _my_nat_names:
+            _stt["interest_sum_for"] += pi
+        if _o1_u(*_draw_key, "int", tid) >= pi:
+            continue
+        dom = r["country"] in _my_nat_names
+        _stt["interested"] += 1
+        _stt["interested_dom" if dom else "interested_for"] += 1
+        _stt["interested_ids"].append(tid)
+        if _team_below_floor(r):
+            _stt["fail_floor"] += 1
+            continue
+        if _team_full_fixed26(r):
+            _stt["fail_full"] += 1
+            continue
+        _role, _ok = _offer_role_ok(r)
+        if not _ok:
+            _stt["fail_role"] += 1
+            continue
+        _stt["feasible"] += 1
+        _stt["feasible_ids"].append(tid)
+        _feas.append((r, dom, _role))
+    # [2026-11-17 O-2] 연결 — 같은 해시 난수 u를 등급별 연결률과 비교(높은 등급의 연결 집합 ⊇ 낮은 등급).
+    _best = None
+    if _agent_g in O2_BEST_GUARANTEE_GRADES and _feas:
+        _best = max(_feas, key=lambda x: (_team_avg_cache_offers.get(x[0]["id"], 0),
+                                          _prestige_level(x[0]["country"], x[0]["name"]),
+                                          -(x[0]["tier"] or 99), -x[0]["id"]))[0]["id"]
+        _stt["best_id"] = _best
+    for r, dom, _role in _feas:
+        tid = r["id"]
+        if dom:
+            _g, _rate = "domestic", _rate_dom
+        elif _agent_cont and r["continent"] == _agent_cont:
+            _g, _rate = "foreign_specialty", min(O2_CONN_CAP, _rate_for * O2_SPECIALTY_MULT)
         else:
-            _prev_country_id = None  # 자국과 같으면 굳이 따로 안 나눔
-            PREV_LEAGUE_COUNT = 0
-            HOMETOWN_COUNT    = NO_TEAM_DOMESTIC_SAME
-            OTHER_FOREIGN_COUNT = NO_TEAM_FOREIGN_SAME + _bonus
+            _g, _rate = "foreign", _rate_for
+        _hit = _o1_u(*_draw_key, "conn", tid) < _rate
+        if tid == _best:
+            _cg = _stt["conn_groups"].setdefault("guaranteed", [0, 0])
+            _cg[0] += 1; _cg[1] += 1
+        else:
+            _cg = _stt["conn_groups"].setdefault(_g, [0, 0])
+            _cg[0] += 1; _cg[1] += int(_hit)
+            if not _hit:
+                continue
+        _stt["connected_ids"].append(tid)
+        _stt["connected"] += 1
+        _stt["connected_dom" if dom else "connected_for"] += 1
+        _stt["roles"][_role] = _stt["roles"].get(_role, 0) + 1
+        _wealth_g = get_league_grade(r["country"], r["grade"])
+        salary = _calc_offer_salary(p, _wealth_g, r["tier"], ovr, r["country"], r["name"],
+                                     year=p.get("current_year"), team_id=tid,
+                                     talent_tier=p.get("talent_tier"), rand_range=(0.85, 1.15))
+        o = _build_offer(r, _wealth_g, r["tier"], salary, role=_role)
+        o["_zone"] = "domestic" if dom else "foreign"
+        offers.append(o)
+    if _fj2:
+        for _jr, _kind, _jrole, _parent, _jdom in _fj2_first_join_picks(
+                p, conn, _fj2_rows, _draw_key, _my_nat_names, _my_continent, _team_avg_cache_offers,
+                _team_full_fixed26, _floor_ref_ovr, lambda _t: my_offer_role(_t, p, conn), _stt):
+            _wealth_g = get_league_grade(_jr["country"], _jr["grade"])
+            salary = _calc_offer_salary(p, _wealth_g, _jr["tier"], ovr, _jr["country"], _jr["name"],
+                                         year=p.get("current_year"), team_id=_jr["id"],
+                                         talent_tier=p.get("talent_tier"), rand_range=(0.85, 1.15))
+            o = _build_offer(_jr, _wealth_g, _jr["tier"], salary, role=_jrole)
+            o["_zone"] = "youth" if _kind == "youth" else ("domestic" if _jdom else "foreign")
+            o["contract_kind"] = _kind
+            if _parent is not None:
+                o["youth_parent_id"] = _parent["id"]
+                o["youth_parent_name"] = _parent["name"]
+            offers.append(o)
+            _stt["connected"] += 1
+            _stt["connected_dom" if _jdom else "connected_for"] += 1
+            _stt["connected_ids"].append(_jr["id"])
+            _stt["roles"][_jrole] = _stt["roles"].get(_jrole, 0) + 1
+    _stt["interest_digest"] = _dig.hexdigest()
+    _O1_LAST_STATS.clear()
+    _O1_LAST_STATS.update(_stt)
 
-        _seen_ids = {o["team_id"] for o in offers}
-        _prev_group = _fill_country_pool(_prev_country_id, PREV_LEAGUE_COUNT, _seen_ids) \
-            if PREV_LEAGUE_COUNT else []
-        # [2026-07 신설] 자국(고향) 슬롯도 보유 국적이 여러 개면 국적마다
-        # 1개씩 먼저 보장한다(_fill_home_pool_multi).
-        _home_group = _fill_home_pool_multi(HOMETOWN_COUNT, _seen_ids) if HOMETOWN_COUNT else []
-        _exclude_countries = {cid for cid in ([_prev_country_id] + _my_nat_ids) if cid}
-        _for_group = _fill_foreign_pool(OTHER_FOREIGN_COUNT, _exclude_countries, _seen_ids)
-        # [2026-10 오퍼 생성 결함 수정] 무소속 안전망 — "팀이 너무 약함" 하한
-        # (OFFER_TEAM_FLOOR_*) 때문에 갈 곳이 하나도 안 남으면(예: 자국 리그가 약한
-        # 고OVR 자유계약 선수) 하한을 끄고 자국 풀만 다시 채운다. 소속 선수는 오퍼가
-        # 줄어드는 게 정상이지만, 무소속은 입단할 곳 자체가 사라지면 안 된다.
-        if not (_prev_group or _home_group or _for_group):
-            _team_floor_on[0] = False
-            _home_group = _fill_home_pool_multi(max(HOMETOWN_COUNT, 3), _seen_ids)
-
-        for o in _prev_group: o["_zone"] = "prev_league"
-        for o in _home_group: o["_zone"] = "domestic" if not PREV_LEAGUE_COUNT else "hometown"
-        for o in _for_group:  o["_zone"] = "foreign"
-        offers = _interleave(_prev_group, _home_group, _for_group)
-    else:
-        # [2026-07 재설계, 신민용 요청] 일반 이적 오퍼(계약 중, 이적시즌 트리거는
-        # 기존 호출부(_auto_offer_shown/_offer_probability) 그대로 유지) — 예전엔
-        # "현재 리그 국가 1~2개 + (35세 이상이면) 자국 1개 + 나머지 완전 무작위"
-        # 였는데, 이제 첫 입단/무소속 재취업과 같은 3-분류 패턴으로 통일한다:
-        #   현재 뛰는 리그의 국가 4 + 고향(대표국적) 3 + 그 외 타국 5 = 12
-        #   (이적요청 중이면 타국에 보너스 +2 → 14).
-        cur_league_id = p.get("current_league_id", 0)
-        league_country_id = None
-        if cur_league_id:
-            row_lg = c.execute(
-                "SELECT country_id FROM leagues WHERE id=?", (cur_league_id,)
-            ).fetchone()
-            if row_lg:
-                league_country_id = row_lg["country_id"]
-        if not league_country_id:
-            league_country_id = my_country_id
-
-        _seen_ids = {o["team_id"] for o in offers}
-        _league_group = _fill_country_pool(league_country_id, HAS_TEAM_LEAGUE_COUNTRY, _seen_ids)
-        # 고향(대표국적)이 현재 리그 국가와 같으면(외국인이 아니라 자국 리그에서
-        # 뛰는 경우) 굳이 같은 나라를 두 번 채울 필요 없이 그만큼 타국으로 돌린다.
-        _home_target = HAS_TEAM_HOMETOWN if my_country_id != league_country_id else 0
-        # [2026-07 신설] 보유 국적이 여러 개면 국적마다 1개씩 먼저 보장.
-        _home_group = _fill_home_pool_multi(_home_target, _seen_ids) if _home_target else []
-        _exclude_countries = {cid for cid in ([league_country_id] + _my_nat_ids) if cid}
-        _foreign_target = HAS_TEAM_FOREIGN + (HAS_TEAM_HOMETOWN - len(_home_group) if not _home_target else 0)
-        _for_group = _fill_foreign_pool(_foreign_target, _exclude_countries, _seen_ids)
-
-        for o in _league_group: o["_zone"] = "domestic"      # 현재 리그 국가
-        for o in _home_group:   o["_zone"] = "hometown"
-        for o in _for_group:    o["_zone"] = "foreign"
-        offers = _interleave(_league_group, _home_group, _for_group)
-
-    # [17세 첫 입단 안전망] 협상을 모두 실패해도 입단할 곳이 사라지지 않도록,
-    #   생성된 오퍼 중 연봉(=등급·티어와 직결)이 가장 낮은 1곳은 항상 입단 가능하게 표시.
-    #   협상 자체는 그대로 가능(성공 시 연봉 인상), 실패해도 '결렬'로 막히지 않을 뿐.
     if not has_team and offers:
         safe_offer = min(offers, key=lambda o: o["salary"])
         safe_offer["safe"] = True
@@ -27225,6 +26924,8 @@ def generate_offers(count=5, force=False) -> list:
         _blocked = _blocked_offer_team_ids(p.get("current_year", 0))
         if _blocked:
             offers = [o for o in offers if o["team_id"] not in _blocked]
+        # [2026-11-16 C] 대기·전력외 역할로는 오퍼하지 않는다(어느 경로로 뽑힌 팀이든).
+        offers = [o for o in offers if o.get("role") in OFFER_ALLOWED_ROLES]
 
     # [기능3] 이적 요청 플래그 소비 (오퍼가 생성됐으면 리셋)
     if transfer_req and offers:
@@ -27261,6 +26962,12 @@ def generate_offers(count=5, force=False) -> list:
                       or _my_contract_years_cap(None, o.get("country")) >= 1)]
     except Exception:
         pass
+    # [2026-11-16 O-1] 표시 상한 — 오퍼 창 크기(16) 호환. 상한 전 수·팀 평균을 통계로 남긴다(편향 확인용).
+    from constants import O1_DISPLAY_CAP
+    _O1_LAST_STATS["final_pre_cap"] = len(offers)
+    _O1_LAST_STATS["pre_cap_team_avg"] = [round(_team_avg_cache_offers.get(o["team_id"], 0), 1) for o in offers]
+    offers = offers[:O1_DISPLAY_CAP]
+    _O1_LAST_STATS["final_shown"] = len(offers)
     return offers
 
 
@@ -27614,6 +27321,76 @@ def get_apply_player_context(p=None):
     }
 
 
+def _youth_apply_block(team_id, ctx, conn):
+    """[2026-11-18 신설, constants.YOUTH_APPLY_RULES] 산하팀 직접 지원 자격. 반환: None(대상 아님·통과) 또는 사유
+    ("youth_age" 20세 이상 / "youth" 유스 오퍼 자격 미달). 판정 재료는 ctx에 한 번만 만들어 둔다(검색 목록 재사용)."""
+    from constants import (YOUTH_APPLY_RULES, FJ2_YOUTH_MAX_AGE, OFFER_TEAM_FLOOR_DOMESTIC, OFFER_TEAM_FLOOR_FOREIGN,
+                           OFFER_ALLOWED_ROLES, OFFER_FLOOR_REF_TOPN, get_country_league_grade)
+    if not YOUTH_APPLY_RULES:
+        return None
+    t = conn.execute(
+        """SELECT t.id, t.classification_status AS cls, t.parent_team_id AS pid, l.tier, cn.name AS country,
+                  cn.grade AS cgrade FROM teams t JOIN leagues l ON t.league_id=l.id
+           JOIN countries cn ON l.country_id=cn.id WHERE t.id=?""", (team_id,)).fetchone()
+    if not t or t["cls"] != "AFFILIATE" or not t["pid"]:
+        return None
+    y = ctx.get("_youth")
+    if y is None:
+        p = get_player() or {}
+        _ovr = p.get("ovr", 40)
+        _p_mkt, _mkt_total = _summer_market_form_view(p)
+        if _p_mkt is None:
+            _p_mkt, _mkt_total = p, None
+        _eff = calc_effective_ovr(_p_mkt, ovr=_ovr, total_matches=_mkt_total)
+        avg = {r["team_id"]: r["a"] for r in conn.execute(
+            "SELECT team_id, AVG(ovr) AS a FROM ai_players GROUP BY team_id") if r["a"] is not None}
+        _top = sorted(avg.values(), reverse=True)[:OFFER_FLOOR_REF_TOPN]
+        _elite = (sum(_top) / len(_top)) if _top else _eff
+        try:
+            from military_service import get_military_team_ids as _mf
+            _mil = set(_mf(conn))
+        except Exception:
+            _mil = set()
+        _mine = p.get("current_team_id") or 0
+        ctop = {}
+        for r in conn.execute("""SELECT t.id, cn.name AS country, COALESCE(t.classification_status,'') AS cls
+                                  FROM teams t JOIN leagues l ON t.league_id=l.id
+                                  JOIN countries cn ON l.country_id=cn.id"""):
+            if r["cls"] == "AFFILIATE" or r["id"] in _mil or r["id"] == _mine or r["id"] not in avg:
+                continue
+            ctop[r["country"]] = max(ctop.get(r["country"], 0.0), avg[r["id"]])
+        y = ctx["_youth"] = {"age": p.get("age", 17) or 17, "mine": _mine, "avg": avg, "ctop": ctop,
+                             "floor_ref": min(_eff, _elite), "p": p,
+                             "nats": {p.get(k) for k in ("nationality", "nationality2", "nationality3", "nationality4")
+                                      if p.get(k)}}
+    if team_id == y["mine"]:
+        return None
+    if y["age"] > FJ2_YOUTH_MAX_AGE:
+        return "youth_age"
+    par = conn.execute("""SELECT cn.name AS country FROM teams t JOIN leagues l ON t.league_id=l.id
+                          JOIN countries cn ON l.country_id=cn.id WHERE t.id=?""", (t["pid"],)).fetchone()
+    if not par:
+        return "youth"
+    _pa = y["avg"].get(t["pid"])
+    if _pa is not None:
+        if par["country"] in y["nats"]:
+            _ref = min(y["floor_ref"], y["ctop"].get(par["country"], y["floor_ref"]))
+            if _pa < _ref - OFFER_TEAM_FLOOR_DOMESTIC:
+                return "youth"
+        elif _pa < y["floor_ref"] - OFFER_TEAM_FLOOR_FOREIGN:
+            return "youth"
+    _g = get_country_league_grade(t["country"], t["cgrade"])
+    if (ctx.get("talent_cap") or 0) < dynamic_talent_gate(t["country"], t["tier"], _gate_grade_for_tier(_g, t["tier"])):
+        return "youth"
+    from ai_lifecycle import _is_fixed26
+    if _is_fixed26(get_league_grade(t["country"], t["cgrade"]), t["tier"]) and \
+            (conn.execute("SELECT COUNT(*) FROM ai_players WHERE team_id=?", (team_id,)).fetchone()[0] or 0) >= 26:
+        return "youth"
+    if my_offer_role(team_id, y["p"], conn) not in OFFER_ALLOWED_ROLES:
+        return "youth"
+    return None
+
+
 def calc_apply_prob_with_context(team_id, ctx):
     """get_apply_player_context()로 미리 뽑은 컨텍스트를 재사용해 팀 하나에
     대한 확률만 계산 — 검색 결과 목록을 순회할 때 이걸 쓴다."""
@@ -27629,6 +27406,11 @@ def calc_apply_prob_with_context(team_id, ctx):
         conn.close()
         return 0.0, True
     grade = get_league_grade(row["country"], row["cgrade"])
+    # [2026-11-18 신설] 산하팀 직접 지원 — 19세까지 + 유스 오퍼 자격(constants.YOUTH_APPLY_RULES).
+    _yb = _youth_apply_block(team_id, ctx, conn)
+    if _yb:
+        conn.close()
+        return 0.0, _yb
 
     # [2026-09 버그수정, 신민용 리포트 17번: "지금 설계는 새로운 선수를 뽑는
     # 중에 선수가 25로 되어있는 팀만 가능하잖아. 근데 직접 지원하면 선수가
@@ -27889,6 +27671,69 @@ def clear_pending_offer_state():
     update_player(pending_offer_state="")
 
 
+_DIRECT_APPLY_TEAMS_META = "my_direct_apply_teams"
+
+
+def _direct_applied_teams(p=None):
+    """[2026-11-18 신설, DIRECT_APPLY_HARDER] 이번 지원 기간에 이미 지원한 구단 id 집합. 지원 횟수가 0이면(새 무소속
+    기간) 비어 있는 것으로 본다 — 예전 기간 기록은 다음 첫 지원 때 지워진다."""
+    p = p or get_player() or {}
+    if not (p.get("apply_attempts_used") or 0):
+        return set()
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key=?", (_DIRECT_APPLY_TEAMS_META,)).fetchone()
+    finally:
+        conn.close()
+    try:
+        return set(int(x) for x in json.loads(row["value"])) if row and row["value"] else set()
+    except Exception:
+        return set()
+
+
+def _record_direct_apply_team(team_id, fresh):
+    conn = get_conn()
+    try:
+        ids = [] if fresh else sorted(_direct_applied_teams())
+        if team_id not in ids:
+            ids.append(team_id)
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", (_DIRECT_APPLY_TEAMS_META, json.dumps(ids)))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def direct_apply_view(team_id, ctx, p=None):
+    """[2026-11-18 신설, constants.DIRECT_APPLY_HARDER] 직접 지원 화면·실행이 쓰는 최종 (확률, 막힘 사유). 기존
+    calc_apply_prob_with_context(오퍼 협상도 쓰는 공용 함수 — 그대로 둔다) 결과에 배율·상한을 걸고, 이번 기간에 이미
+    지원한 구단은 "applied"로 막는다. 스위치가 꺼지면 calc_apply_prob_with_context와 같다."""
+    prob, blocked = calc_apply_prob_with_context(team_id, ctx)
+    from constants import DIRECT_APPLY_HARDER, DIRECT_APPLY_CAP
+    if not DIRECT_APPLY_HARDER:
+        return prob, blocked
+    if team_id in _direct_applied_teams(p):
+        return 0.0, "applied"
+    sc = direct_apply_scale(ctx)
+    if sc >= 1.0:
+        return prob, blocked          # 커리어 중 FA — 기존 확률 그대로
+    return min(DIRECT_APPLY_CAP, prob * sc), blocked
+
+
+def direct_apply_scale(ctx=None):
+    """[2026-11-18] 직접 지원 확률 배율 — 첫 입단 단계(프로 경력 없음)면 DIRECT_APPLY_SCALE, 커리어 중 FA·스위치 꺼짐이면 1.0.
+    화면 확률 구간도 이 값으로 맞춘다. ctx가 있으면 판정을 한 번만 해 둔다."""
+    from constants import DIRECT_APPLY_HARDER, DIRECT_APPLY_SCALE
+    if not DIRECT_APPLY_HARDER:
+        return 1.0
+    if ctx is not None and "_rookie" in ctx:
+        rk = ctx["_rookie"]
+    else:
+        rk = _apply_reference_is_rookie()
+        if ctx is not None:
+            ctx["_rookie"] = rk
+    return DIRECT_APPLY_SCALE if rk else 1.0
+
+
 def apply_to_team(team_id):
     """직접 지원 실행 — 시도 1회 소진(성공/실패 무관), 성공하면 그 팀
     오퍼 dict를, 실패하면 None을 반환. 반환: (success, prob, offer)."""
@@ -27915,7 +27760,10 @@ def apply_to_team(team_id):
     except ImportError:
         pass
 
-    prob, blocked = calc_apply_success_prob(team_id)
+    # [2026-11-18, DIRECT_APPLY_HARDER] 판정 확률 = 화면 표시 확률(direct_apply_view). 협상 기준은 기존 확률(raw) 그대로.
+    _ctx_ap = get_apply_player_context()
+    prob_raw, _b_raw = calc_apply_prob_with_context(team_id, _ctx_ap)
+    prob, blocked = direct_apply_view(team_id, _ctx_ap, p)
     # [2026-09 버그수정, 신민용 리포트 17번] 이 함수는 blocked를 통째로
     # 무시하고 prob만 굴렸다 — 그래서 "재능 부족(불가)"으로 표시된 팀도
     # 0.5% 확률로는 붙었고, 정원이 꽉 찬 팀은 애초에 걸러지지도 않았다.
@@ -27924,8 +27772,11 @@ def apply_to_team(team_id):
     # "⛔ 정원 마감(불가)"으로 보이므로 실수로 눌렀을 때 시도만 날리는
     # 일이 없어야 한다). 재능 미달은 기존 동작(시도 소모 + 0.5% 도박)을
     # 그대로 유지한다 — 그건 "확률이 아주 낮다"는 설계였다.
-    if blocked == "full":
+    if blocked in ("full", "youth_age", "youth", "applied"):   # [2026-11-18] 유스 자격 미달·같은 구단 재지원도 시도 소모 없이 거절
         return False, 0.0, None
+    from constants import DIRECT_APPLY_HARDER as _DAH
+    if _DAH:
+        _record_direct_apply_team(team_id, fresh=not (p.get("apply_attempts_used") or 0))
     update_player(apply_attempts_used=p.get("apply_attempts_used", 0) + 1)
 
     if random.random() >= prob:
@@ -27954,8 +27805,22 @@ def apply_to_team(team_id):
     salary = _calc_offer_salary(p, grade, tier, ovr, row["country"], row["name"],
                                  year=p.get("current_year"), team_id=row["id"],
                                  talent_tier=p.get("talent_tier"), rand_range=(0.95, 1.15))
-    offer = _build_offer(row, grade, tier, salary, join_prob=prob)
+    # [2026-11-18 신설, YOUTH_APPLY_RULES] 산하팀 지원 성공 = 유스 계약(역할 유망주 고정, 모구단 명의).
+    _yp = None
+    from constants import YOUTH_APPLY_RULES as _YAR, FJ2_FIXED_ROLE as _FJR
+    if _YAR:
+        _yc = get_conn()
+        try:
+            _yp = _yc.execute("""SELECT p.id, p.name FROM teams t JOIN teams p ON p.id=t.parent_team_id
+                                 WHERE t.id=? AND t.classification_status='AFFILIATE'""", (team_id,)).fetchone()
+        finally:
+            _yc.close()
+    offer = _build_offer(row, grade, tier, salary, join_prob=prob_raw, role=(_FJR if _yp else None))
     offer["_zone"] = "applied"
+    if _yp:
+        offer["contract_kind"] = "youth"
+        offer["youth_parent_id"] = _yp["id"]
+        offer["youth_parent_name"] = _yp["name"]
     _rank_conn = get_conn()
     offer["rank_info"] = _get_team_rank_info(_rank_conn.cursor(), team_id)
     _rank_conn.close()
@@ -28085,143 +27950,62 @@ def negotiation_success_prob(prob: float) -> float:
     return max(NEG_SUCCESS_PROB_MIN, min(NEG_SUCCESS_PROB_MAX, scaled))
 
 
-def _offer_probability(p, week: int) -> float:
-    agent_base = {
-        AGENT_NONE: 0.45,  # old F
-        "F": 0.55,         # old E
-        "E": 0.65,         # old D
-        "D": 0.75,         # old C
-        "C": 0.85,         # old B
-        "B": 0.92,         # old A
-        "A": 0.97,         # old S
-        "S": 0.99,         # 신설
-    }
-    base = agent_base.get(p.get("agent_grade", AGENT_NONE), 0.45)
-    if 1 <= week <= 3:
-        # 여름(프리시즌) 이적시장: 작년 풀시즌 평점 사용
-        conn2 = get_conn()
-        row2  = conn2.execute(
-            "SELECT avg_rating FROM career_entries WHERE end_year>0 ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        conn2.close()
-        rating = row2["avg_rating"] if row2 and row2["avg_rating"] else 6.0
+def my_salary_market_and_cap(p=None, year=None, team_id=None):
+    """[2026-11-17 신설, 신민용 확정 — 재계약 연봉 복리 상승 차단] 지금 팀 기준 내 선수 시장 연봉 M과
+    연봉 협상 상한 C = min(M × SALARY_NEG_CAP_MULT, 국가 절대 상한)을 돌려준다. M은 _my_fair_salary
+    (새 계약 규칙, 랜덤·폼 없음)로 계산한다. 소속 팀이 없으면 (0, 0) — 호출부는 0을 "상한 없음"이 아니라
+    "판정 불가"로 보고 기존 값을 그대로 둔다. 순수 계산(난수·DB 쓰기 없음).
+    team_id: 주어지면 지금 팀 대신 그 팀 기준(이적·입단 오퍼 협상, ui/offer_window)."""
+    from constants import SALARY_NEG_CAP_MULT
+    if p is None:
+        p = get_player()
+    if not p:
+        return (0, 0)
+    if team_id:
+        p = dict(p)
+        p["current_team_id"] = team_id
+    if year is None:
+        year = (get_state() or {}).get("current_year")
+    gt = _my_grade_tier(p)
+    if not gt:
+        return (0, 0)
+    wealth, tier, country = gt
+    tid = p.get("current_team_id")
+    c = get_conn()
+    try:
+        row = c.execute("SELECT name FROM teams WHERE id=?", (tid,)).fetchone()
+    finally:
+        c.close()
+    market = int(_my_fair_salary(p, wealth, tier, country, row["name"] if row else None, tid, year) or 0)
+    nat_cap = int(_clamp_salary_to_cap(10 ** 15, wealth, country, tier, ovr=p.get("ovr"), year=year))
+    if market <= 0:
+        return (0, nat_cap)
+    return (market, min(int(market * SALARY_NEG_CAP_MULT), nat_cap))
+
+
+def salary_negotiation_success_prob(prob: float, proposed: int, market: int) -> float:
+    """[2026-11-17 신설] 재계약 연봉 협상 회당 성공확률 — 기존 negotiation_success_prob(prob)에 시장 격차
+    배율을 곱한다(제안 연봉 / 시장 연봉 비율이 클수록 하락, constants SALARY_NEG_GAP_* 참고)."""
+    from constants import SALARY_NEG_GAP_FULL, SALARY_NEG_GAP_END, SALARY_NEG_GAP_MIN_FACTOR
+    base = negotiation_success_prob(prob)
+    if not market or market <= 0:
+        return base
+    r = proposed / market
+    if r <= SALARY_NEG_GAP_FULL:
+        f = 1.0
     else:
-        # 겨울 이적시장: 겨울 창 진입 직전 스냅샷한 평점 사용
-        rating = p.get("first_half_rating", 0)
-        if not rating:
-            rc = p.get("season_rating_cnt",0); rs = p.get("season_rating_sum",0.0)
-            rating = round(rs/rc,2) if rc else 6.0
-    ovr = p.get("ovr",40)
-    # 포지션군별 평점 기준선: 수비/GK는 기대평점이 낮으므로 기준점을 낮춰 공정화
-    pos_grp = POS_GROUP.get(p.get("position","CM"), "미드")
-    baseline = RENEW_RATING.get(pos_grp, 6.3)
-    # baseline을 5.0 위치로 매핑 → 기준선 이상이면 양수 점수
-    r_s = max(0.0, min(1.0, (rating - (baseline - 1.0)) / 4.0))
-    o_s = max(0.0, min(1.0, (ovr-30)/70))
-    perf = r_s*0.6 + o_s*0.4
-
-    # [밸런스 재설계 2026-07, GPT 검토+상수화 확정] 등급별 최소 보장 확률.
-    #   기존 40%~70%는 "경기 못 뛰고 평점 낮아도 이적시장 두 번이면 거의
-    #   반드시 온다"는 체감이었음 — 에이전트 등급에 따라 "일 잘하는 에이전트
-    #   (S) vs 거의 못 구해주는 에이전트(F)" 격차가 드러나도록 낮췄다.
-    #   실제확률 = max(하한선, 퍼포먼스 기반 확률).
-    from constants import AGENT_MIN_OFFER_PROB, get_contract_urgency_mult
-    guaranteed = AGENT_MIN_OFFER_PROB.get(p.get("agent_grade", AGENT_NONE), AGENT_MIN_OFFER_PROB[AGENT_NONE])
-
-    # [밸런스 재설계 2026-07] 계약 만료 임박 보너스를 연 단위 대신 "게임 내
-    #   남은 주 수" 단위로 세분화(보스만 룰 현실 반영: 3개월/6개월/1년
-    #   이하일수록 관심 급증). 시즌=52주 고정 구조 확인 완료.
-    cur_year = p.get("current_year", GAME_START_YEAR)
-    end_year = p.get("contract_end_year", 0)
-    cur_week = get_state().get("current_week", 1)
-    weeks_left = ((end_year - cur_year) * 52 + (52 - cur_week)) if end_year else 999
-    weeks_left = max(0, weeks_left)
-    contract_mult = get_contract_urgency_mult(weeks_left)
-
-    # [2026-09 재설계, 신민용 지적: "인기도가 팀 마진(어느 급 팀이 오냐)을
-    #   상쇄하는 건 이상하다 — 인기 선수는 여러 팀에서 연락이 많이 오는
-    #   거지, 실력보다 훨씬 높은 팀에서 연락이 오는 게 되면 안 된다"]
-    #   popularity의 역할을 마진(generate_offers의 _fame_bonus, fame
-    #   전용으로 분리)에서 여기(오퍼가 뜨는지 자체)로 옮겼다 — "화제성
-    #   있으면 팀 급이 오르는" 대신 "화제성 있으면 관심 자체가 늘어난다"는
-    #   원칙. popularity 공식(_calc_pop) 자체는 아직 골/도움 편중이라
-    #   추후 별도로 손볼 예정 — 이번엔 오퍼 로직만 정리.
-    pop_bonus = 0.15 * (p.get("popularity", 0) / 100.0)
-
-    calculated = base * perf * contract_mult + pop_bonus
-    return min(0.95, max(guaranteed, calculated))
+        t = min(1.0, (r - SALARY_NEG_GAP_FULL) / (SALARY_NEG_GAP_END - SALARY_NEG_GAP_FULL))
+        f = 1.0 - t * (1.0 - SALARY_NEG_GAP_MIN_FACTOR)
+    return max(0.0, min(1.0, base * f))
 
 
-YOUTH_SCOUT_PROB = 0.35
-# [2026-08 수정, 신민용 확정: 9단계 확장] 예전엔 최상위가 worldclass였지만
-# 이제 그 위에 슈퍼스타/신이 새로 생겼다 — 여기 안 넣으면 오히려 가장
-# 뛰어난 유망주가 해외 유스 스카우트 대상에서 빠지는 역전이 생긴다.
-YOUTH_SCOUT_TALENT_TIERS = ("god", "worldclass", "superstar", "elite")
-
-
-def _try_youth_scout_offer(c, p, ovr, existing_offers, team_avg_cache, my_country_id):
-    """[2026-07 신설] 17~18세 첫 입단 한정, 낮은 확률로 재능상한(talent_cap)
-    기준 해외 유스 스카우트 오퍼 하나를 만들어 반환한다(조건 미충족·실패 시
-    None). 일반 해외 오퍼(_fill_foreign_pool 등)는 '현재 OVR'로 마진을
-    판정하지만, 이건 '재능상한'으로 판정한다는 게 핵심 차이 — 아직 다
-    안 큰 유망주를 잠재력만 보고 데려가는 유스 스카우팅을 반영한다.
-    대상은 실제로 해외 유스 스카우팅이 활발한 축구 강국(S/SS급)으로
-    한정한다(약소국 하위리그가 해외 10대를 스카우트하러 다니는 경우는
-    현실적으로 드묾). 곧바로 그 나라 1부 1군으로 데뷔하는 일은 드무니
-    2~3부 쪽에 가중치를 둔다."""
-    if p.get("talent_tier") not in YOUTH_SCOUT_TALENT_TIERS:
-        return None
-    if random.random() >= YOUTH_SCOUT_PROB:
-        return None
-    talent_cap_v = p.get("talent_cap", ovr)
-    tiers = [1, 2, 3]
-    weights = [1, 3, 4]
-    exist_ids = {o["team_id"] for o in existing_offers}
-    # [2026-10 오퍼 생성 결함 수정] 국대 등급엔 SS가 0개국이라 SS 추첨이 늘 비었다 —
-    # 리그 등급(SS=잉글랜드, S=5대 리그 나머지) 기준으로 나라를 고른다.
-    for _ in range(20):
-        grade = random.choice(["SS", "S"])
-        tier = random.choices(tiers, weights)[0]
-        _cids_ys = sorted(_country_ids_by_league_grade(c, (grade,)))
-        if not _cids_ys:
-            continue
-        _ph_ys = ",".join("?" * len(_cids_ys))
-        c.execute(f"""SELECT t.id,t.name,l.id as lid,l.name as lname,l.tier,
-                            cn.id as cid, cn.name as country,cn.flag,cn.grade
-                     FROM teams t
-                     JOIN leagues l ON t.league_id=l.id
-                     JOIN countries cn ON l.country_id=cn.id
-                     WHERE cn.id IN ({_ph_ys}) AND l.tier=?
-                     ORDER BY RANDOM() LIMIT 20""", tuple(_cids_ys) + (tier,))
-        cands = [r for r in c.fetchall()
-                 if r["id"] not in exist_ids and r["cid"] != my_country_id]
-        if not cands:
-            continue
-        fit = []
-        for r in cands:
-            r_avg = team_avg_cache.get(r["id"])
-            if r_avg is None:
-                continue
-            # SS(리그 등급, 2026-10부터 실제로 뽑힘)는 표에 없어 기본값 3으로 새지 않게 S 기준을 쓴다.
-            margin = CLUB_JOIN_MARGIN_BY_GRADE.get("S" if grade == "SS" else grade, CLUB_JOIN_MARGIN)
-            if (r_avg - talent_cap_v) <= margin:
-                fit.append(r)
-        if not fit:
-            continue
-        row = random.choice(fit)
-        wealth_g = get_league_grade(row["country"], row["grade"])
-        # [2026-08 재정리, 15-4] 다른 오퍼 경로와 동일하게 공통 helper로
-        # 통일. 유스 스카우트 대상은 보통 첫 입단(소속팀 없음)이라
-        # calc_effective_ovr()가 폼 보정 없이 ovr을 그대로 돌려주므로
-        # 실질적으로는 기존과 동일하게 동작한다 — 향후 소속팀이 있는
-        # 케이스로 확장돼도 자동으로 일관되게 처리된다.
-        salary = _calc_offer_salary(p, wealth_g, tier, ovr, row["country"], row["name"],
-                                     year=p.get("current_year"), team_id=row["id"],
-                                     talent_tier=p.get("talent_tier"), rand_range=(0.7, 0.9))
-        offer = _build_offer(row, wealth_g, tier, salary)
-        offer["_zone"] = "youth_scout"
-        return offer
-    return None
+def roll_salary_raise_pct(rng=None) -> int:
+    """[2026-11-17 신설] 연봉 협상(재계약·이적/입단 오퍼 공통) 성공 1회 인상폭(%) — SALARY_NEG_RAISE_STEPS
+    가중 추첨. rng를 주면 그 난수원(오퍼 창의 전용 _neg_rng)으로 뽑는다."""
+    from constants import SALARY_NEG_RAISE_STEPS
+    steps = [s for s, _ in SALARY_NEG_RAISE_STEPS]
+    weights = [w for _, w in SALARY_NEG_RAISE_STEPS]
+    return (rng or random).choices(steps, weights=weights)[0]
 
 
 def _infer_team_ambition(c, team_id, team_name, season, year):
@@ -28300,35 +28084,71 @@ def _infer_team_ambition(c, team_id, team_name, season, year):
         return "중위권 안정"
 
 
-def _offer_role_by_gap(gap, my_age):
-    """오퍼 역할(입단 시 구단이 정한 기용 계획) — '팀 평균 OVR - 내 OVR' 격차와 나이로 정한다.
-    [2026-10 리팩터] _enrich_offer 안에 있던 식을 그대로 뺐다(판매추진 제안에도 같은 기준을 쓰려고)."""
-    from constants import ROLE_AGE_THRESHOLD, ROLE_YOUNG_PROSPECT_MAX_AGE
-    if gap <= -6:
-        return "주전 보장"
-    if gap <= 3:
-        return "로테이션" if (gap >= 0 and my_age >= ROLE_AGE_THRESHOLD) else "주전 경쟁"
-    return "유망주 영입" if my_age <= ROLE_YOUNG_PROSPECT_MAX_AGE else "로테이션"
+def my_offer_role(team_id, p=None, conn=None):
+    """[2026-11-16 신설, 신민용 확정 — C] 그 팀에 지금 입단하면 받게 될 실제 팀 역할(역할 7단계). 로스터에 나를 넣고
+    ai_lifecycle.my_role_in_team(= 시즌 역할 기록 snapshot_my_player_position과 같은 계산)으로 정한다.
+    지금 소속팀이 아니면 입단 때 로스터가 바뀌는 두 가지를 저장점(SAVEPOINT) 안에서 똑같이 해 본 뒤 계산하고 되돌린다:
+      ① 정원 초과 방출(_join_release_ids — _make_room_on_join과 같은 목록)
+      ② 내가 외국인이 돼 쿼터를 넘기면 AI 외국인 맞교환(_enforce_foreign_quota_on_join과 같은 함수)
+    → 오퍼 표시 역할 = 입단 직후 역할. 난수는 쓰지 않는다(둘 다 결정적)·DB는 그대로 남는다."""
+    p = p or get_player() or {}
+    _own = conn is None
+    conn = conn or get_conn()
+    try:
+        c = conn.cursor()
+        me = {"position": p.get("position", "CM"), "ovr": p.get("ovr", 40), "age": p.get("age", 17),
+              "foot": p.get("foot") or "", "sub_role": p.get("sub_role") or ""}
+        from ai_lifecycle import my_role_in_team
+        if team_id == (p.get("current_team_id") or 0):
+            return my_role_in_team(c, team_id, me)[0] or "준주전"
+        tr = c.execute("SELECT cn.name AS country, l.tier AS tier FROM teams t JOIN leagues l ON l.id=t.league_id "
+                       "JOIN countries cn ON cn.id=l.country_id WHERE t.id=?", (team_id,)).fetchone()
+        if not tr:
+            return my_role_in_team(c, team_id, me)[0] or "준주전"
+        c.execute("SAVEPOINT offer_role_sim")
+        try:
+            _out = _join_release_ids(c, team_id, tr["country"], tr["tier"])
+            if _out:
+                c.executemany("DELETE FROM ai_players WHERE id=?", [(i,) for i in _out])
+            c.execute("UPDATE my_player SET current_team_id=? WHERE id=1", (team_id,))
+            from database import my_roster_foreign_team, get_foreign_quota_range, is_roster_foreign
+            _q = None
+            if my_roster_foreign_team(conn) == team_id:
+                # 쿼터를 실제로 넘길 때만 전 세계 정리 함수를 돌린다(같은 판정: AI 외국인 + 나 > 상한) — 속도용 사전 판정
+                _q = c.execute("SELECT t.current_tier AS tier, cn.name AS cname, cn.continent AS continent FROM teams t "
+                               "JOIN leagues l ON l.id=t.league_id JOIN countries cn ON cn.id=l.country_id WHERE t.id=?",
+                               (team_id,)).fetchone()
+            _hi = get_foreign_quota_range(_q["cname"], _q["continent"], tier=_q["tier"])[1] if _q else None
+            if _hi is not None and sum(
+                    1 for (_n,) in c.execute("SELECT nationality FROM ai_players WHERE team_id=? AND nationality!=''",
+                                             (team_id,)).fetchall()
+                    if is_roster_foreign(_n, _q["cname"])) + 1 > _hi:
+                from ai_lifecycle import _enforce_foreign_quota_worldwide
+                _enforce_foreign_quota_worldwide(c, (get_state() or {}).get("current_year") or 0,
+                                                 only_tids={team_id}, mid_season=0)
+            return my_role_in_team(c, team_id, me)[0] or "준주전"
+        finally:
+            c.execute("ROLLBACK TO offer_role_sim")
+            c.execute("RELEASE offer_role_sim")
+    finally:
+        if _own:
+            conn.close()
 
 
 def _offer_role_for_team(team_id, p=None):
-    """그 팀이 지금 나를 데려갈 때의 역할 — _enrich_offer와 같은 기준(팀 평균 OVR 대비 내 OVR, 나이)."""
-    p = p or get_player() or {}
-    my_ovr = p.get("ovr", 40)
-    conn = get_conn()
-    r = conn.execute("SELECT AVG(ovr) AS a FROM ai_players WHERE team_id=?", (team_id,)).fetchone()
-    conn.close()
-    team_avg = r["a"] if r and r["a"] else my_ovr
-    return _offer_role_by_gap(team_avg - my_ovr, p.get("age", 17))
+    """그 팀이 지금 나를 데려갈 때의 역할 — 오퍼와 같은 기준(my_offer_role)."""
+    return my_offer_role(team_id, p)
 
 
-def _build_offer(row, grade, tier, salary, join_prob=None) -> dict:
+def _build_offer(row, grade, tier, salary, join_prob=None, role=None) -> dict:
     o = dict(
         team_id=row["id"], team_name=row["name"],
         league_id=row["lid"], league_name=row["lname"],
         tier=row["tier"], country=row["country"],
         flag=row["flag"], grade=grade, salary=salary,
     )
+    if role:
+        o["role"] = role      # [2026-11-16 C] 후보를 고를 때 이미 계산한 실제 역할
     _enrich_offer(o, row, join_prob=join_prob)
     return o
 
@@ -28336,10 +28156,8 @@ def _build_offer(row, grade, tier, salary, join_prob=None) -> dict:
 def _enrich_offer(o: dict, row, join_prob=None) -> dict:
     """[기능1] 오퍼에 역할/감독관심도/구단야망/계약보너스/감독성향 부여.
 
-    역할은 '팀 평균 OVR - 내 OVR' 격차로 결정한다:
-      - 내가 팀 수준을 크게 상회 → 주전 보장
-      - 비슷 → 주전 경쟁
-      - 내가 부족 → 로테이션 / (어리면)유망주 영입
+    역할은 [2026-11-16 C] 그 팀에 입단했을 때의 실제 팀 역할(my_offer_role — 역할 7단계 중 핵심·주전·준주전·
+    로테이션·유망주). 후보를 고를 때 이미 계산했으면 o["role"]을 그대로 쓴다.
     """
     from constants import (OFFER_ROLES, OFFER_INTEREST, OFFER_AMBITION,
                            offer_bonus_by_tier, MANAGER_TYPE_LIST, MANAGER_TYPE_WEIGHTS)
@@ -28375,13 +28193,14 @@ def _enrich_offer(o: dict, row, join_prob=None) -> dict:
     #   높음)'에만 적용한다. 격차가 음수로 큰 경우(내가 팀보다 확실히
     #   나음)는 나이와 무관하게 주전 경쟁 이상을 유지 — "OVR 84, 팀평균 80,
     #   31세인데 로테이션"처럼 실력이 나은데도 나이만으로 강등되는 걸 방지.
-    role = _offer_role_by_gap(gap, my_age)
+    # [2026-11-16 C] 역할 = 입단했을 때의 실제 팀 역할(my_offer_role) — 예전 '팀 평균 − 내 OVR 격차 + 나이' 공식은 폐기.
+    role = o.get("role") or my_offer_role(row["id"], p)
     o["role"] = role
 
-    # 감독 관심도 (가중 랜덤, 단 주전보장이면 직접지명 확률↑)
+    # 감독 관심도 (가중 랜덤, 단 핵심·주전이면 직접지명 확률↑)
     int_keys = list(OFFER_INTEREST.keys())
     int_w = [OFFER_INTEREST[k]["weight"] for k in int_keys]
-    if role == "주전 보장":
+    if role in ("핵심", "주전"):
         int_w[int_keys.index("감독 직접 지명")] += 30
     o["interest"] = random.choices(int_keys, int_w)[0]
 
@@ -28392,7 +28211,16 @@ def _enrich_offer(o: dict, row, join_prob=None) -> dict:
     _cur_season = st_now.get("current_season", 1) if st_now else 1
     _cur_year = st_now.get("current_year", GAME_START_YEAR) if st_now else GAME_START_YEAR
     conn2 = get_conn(); c2 = conn2.cursor()
-    _inferred = _infer_team_ambition(c2, row["id"], row["name"], _cur_season - 1, _cur_year - 1)
+    # [2026-11 구단 목표 2단계] 그 팀의 올 시즌 목표(시즌 시작에 정해진 plan)가 있으면 그걸 보여준다 —
+    # 입단하면 실제로 받게 될 목표. 없을 때(레거시 시즌 등)만 예전 추론.
+    _inferred = None
+    try:
+        import club_goals as _cg_o
+        _inferred = _cg_o.current_goal(c2, row["id"], _cur_year)
+    except Exception:
+        _inferred = None
+    if _inferred is None:
+        _inferred = _infer_team_ambition(c2, row["id"], row["name"], _cur_season - 1, _cur_year - 1)
     if _inferred is None:
         _inferred = _infer_team_ambition(c2, row["id"], row["name"], _cur_season, _cur_year)
     conn2.close()
@@ -28893,7 +28721,9 @@ def _min_accept_extra_pct(p, offer, my_team_importance_ratio, competing_offer_co
         extra -= 0.15
 
     # 구단 야망 ★★★☆☆ (club_ambition 필드 재사용 — _infer_team_ambition 결과)
-    ambition = p.get("club_ambition", "")
+    # [2026-11 구단 목표 2단계] 새 목표 이름(승격 도전·잔류·하위권 탈출)은 기존 4단계 대응값으로 본다.
+    from club_goals import legacy_equiv as _cg_leq
+    ambition = _cg_leq(p.get("club_ambition", ""))
     if ambition == "우승 도전":
         extra += 0.15
     elif ambition == "강등 회피":
@@ -29443,6 +29273,26 @@ def _enforce_foreign_quota_on_join(team_id, team_country, my_nationality):
         add_log(f"📋 외국인 쿼터 조정(나 포함) — {' · '.join(_parts)}", "event")
 
 
+def _join_release_ids(c, team_id, team_country, tier):
+    """[2026-11-16 신설 — C] 내가 team_id에 입단하면 정원 초과로 방출될 AI id 목록(_make_room_on_join과 같은 규칙:
+    정원(등급별 26명 고정 기준) − 1을 넘는 만큼 OVR 최저부터, GK가 최소 인원 이하면 GK는 맨 뒤로). 읽기 전용 —
+    오퍼 역할 계산(my_offer_role)도 같은 목록을 빼고 계산해 입단 직후 역할과 맞춘다."""
+    from constants import get_country_league_grade
+    from ai_lifecycle import _squad_min_max
+    grade = get_country_league_grade(team_country)
+    _, ceiling = _squad_min_max(grade, tier)
+    _ai_target = max(0, ceiling - 1)
+    rows = c.execute(
+        "SELECT id, ovr, position FROM ai_players WHERE team_id=? ORDER BY ovr ASC", (team_id,)).fetchall()
+    excess = len(rows) - _ai_target
+    if excess <= 0:
+        return []
+    import constants as _gk_cc
+    if sum(1 for r in rows if r["position"] == "GK") <= _gk_cc.SQUAD_TARGET_MIN_AVAILABLE_GK:
+        rows = [r for r in rows if r["position"] != "GK"] + [r for r in rows if r["position"] == "GK"]
+    return [r["id"] for r in rows[:excess]]
+
+
 def _make_room_on_join(team_id, team_country, tier, year, reason="내 합류로 자리를 마련했습니다.", log_week=None):
     """[2026-09 신설, 신민용 지적: "내가 이미 26명 꽉 찬 팀에 들어가면
     27명이 되는 거 아니냐 — 그럼 원래 있던 애는 어떻게 되는건데? 자리가
@@ -29463,22 +29313,12 @@ def _make_room_on_join(team_id, team_country, tier, year, reason="내 합류로 
     from ai_lifecycle import _squad_min_max, _archive_forced_out_players
     conn = get_conn()
     c = conn.cursor()
-    grade = get_country_league_grade(team_country)
-    _, ceiling = _squad_min_max(grade, tier)
-    # 내가 합류한 뒤 AI 목표치는 "정원 - 나 1명" — 그걸 넘는 만큼만 방출.
-    _ai_target = max(0, ceiling - 1)
-    rows = c.execute(
-        "SELECT id, ovr, position FROM ai_players WHERE team_id=? ORDER BY ovr ASC", (team_id,)).fetchall()
-    excess = len(rows) - _ai_target
-    if excess <= 0:
+    _, ceiling = _squad_min_max(get_country_league_grade(team_country), tier)
+    # [2026-11-16 C] 방출 대상 계산은 _join_release_ids 하나로(오퍼 역할 계산과 같은 목록)
+    out_ids = _join_release_ids(c, team_id, team_country, tier)
+    if not out_ids:
         conn.close()
         return
-    # [2026-11-03 신민용 확정 — 리그 팀 GK 무조건 3명] GK가 최소 인원(3) 이하인 팀은 GK를 방출 순서 맨 뒤로 돌린다
-    # (OVR 최저가 3번째 GK여도 필드 선수부터 내보낸다 — 인원 상한은 그대로 지킨다).
-    import constants as _gk_cc
-    if sum(1 for r in rows if r["position"] == "GK") <= _gk_cc.SQUAD_TARGET_MIN_AVAILABLE_GK:
-        rows = [r for r in rows if r["position"] != "GK"] + [r for r in rows if r["position"] == "GK"]
-    out_ids = [r["id"] for r in rows[:excess]]
     from database import get_ai_player_custom_names
     from constants import ai_player_code
     _custom = get_ai_player_custom_names(out_ids)
@@ -29547,19 +29387,19 @@ def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None
                 f"🚫 구단이 이적 제안을 거절했습니다. ({_buyer_name}[{_buyer_grade}급] 제안 "
                 f"{fmt_money(offer.get('transfer_fee',0))} "
                 f"< 최소 요구 {fmt_money(int(detail['base_fee']*detail['min_accept_mult']))})",
-                "event")
+                "news")
             return
         elif decision == "forced_sale":
             add_log(
                 f"💰 구단은 잔류를 원했으나, 기록적인 제안({fmt_money(offer.get('transfer_fee',0))})을 "
-                f"거절할 수 없어 이적을 승인했습니다.", "event")
+                f"거절할 수 없어 이적을 승인했습니다.", "news")
             _reset_offer_rejection()
         else:
             if detail.get("negotiated"):
                 add_log(
                     f"🤝 구단이 다소 부족한 제안이었지만 협상 끝에 이적을 승인했습니다. "
                     f"({fmt_money(offer.get('transfer_fee',0))}, 최소 요구 대비 "
-                    f"{detail['shortfall_pct']*100:.1f}% 부족)", "event")
+                    f"{detail['shortfall_pct']*100:.1f}% 부족)", "news")
             _reset_offer_rejection()
 
     conn = get_conn()
@@ -29705,7 +29545,10 @@ def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None
 
     # ── [기능1+2] 오퍼 맥락 반영 ─────────────────────────────
     from constants import OFFER_ROLES, OFFER_INTEREST, MANAGER_TYPE_LIST, MANAGER_TYPE_WEIGHTS
-    role        = (offer or {}).get("role", "주전 경쟁")
+    from constants import normalize_contract_role
+    # [2026-11-16 C] 오퍼 역할(입단했을 때의 실제 역할). 오퍼에 역할이 없으면(직접 입단 등) 지금 계산한다.
+    role        = (normalize_contract_role((offer or {}).get("role"), default="")
+                   or my_offer_role(team_id, p))
     interest    = (offer or {}).get("interest", "명단 후보")
     ambition    = (offer or {}).get("ambition", "중위권 안정")
     # [2026-10 버그수정] 성향은 오퍼에 적힌 값이 아니라 **입단 시점** 그 팀 실제 감독 기준 — 오퍼
@@ -29789,7 +29632,7 @@ def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None
     icon = {"입단":"⭐","오퍼":"✈","방출":"😡"}.get(transfer_type,"⭐")
     add_log(f"{icon} {row['name']} {transfer_type}!  {row['lname']}({row['tier']}부)"
             f"  |  {contract_period_text(c_yrs, contract_extra_months(False, cur_week))} 계약"
-            f"  |  월 {fmt_money(salary//12)}{_cap_note}", "event")
+            f"  |  월 {fmt_money(salary//12)}{_cap_note}", "news")
     add_log(f"   ↳ 역할: {role} | 감독: {mgr_type} | 구단 목표: {ambition} | 관심: {interest}", "normal")
     if _mgr_changed_msg:   # [2026-10] 오퍼 이후 감독 교체 이력
         add_log(_mgr_changed_msg, "event")

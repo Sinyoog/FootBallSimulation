@@ -10,7 +10,19 @@
     무게가 다르다(수비수의 가로채기 ≠ 공격수의 가로채기). OVR은 쓰지 않는다 — 현실 평점처럼
     "그 경기에서 한 일"만 본다.
   · 경기 종료 때 팀 결과(승/무/패)와 무실점을 출전 시간 비중만큼 더한다.
-  · 최종값은 3.0~10.0, 소수 첫째 자리.
+  · 최종값은 4.0~10.0, 소수 첫째 자리.
+  · [2026-11 평점 눈금 재조정, 신민용 확정 기준표] 10.0 역대급 / 9.5 경이로움 / 9.0 월드클래스 /
+    8.5 최우수 / 8.0 탁월함 / 7.5 훌륭함 / 7.0 좋음 / 6.5 평균 이상 / 6.0 보통 / 5.5 아쉬움 /
+    5.0 부진 / 4.5 매우 부진 / 4.0 최악에 가까움. "5.0 미만은 정말 못해야 뜬다" — 그래서
+      ① 실점 책임: 실점으로 이어진 공격 흐름에서 뚫린(드리블 허용·공중볼 패배) 수비 선수를
+        따로 깎는다(전원 공통 "실점"과 별개) — 같은 대패에서도 책임 있는 선수만 4점대로 간다.
+      ② 점수 차: 패배 폭이 클수록 패배 보정이 커진다(1골 차 패배는 예전과 같음).
+      ③ 눈금: 6.0 아래는 1.15배로 늘리고(부진이 5점대 초반까지 실제로 내려가게),
+        4.6 아래는 절반으로 눌러 4.0에서 멈춘다(퇴장 안 당한 선수는 3점대 없음).
+      ④ 퇴장: 상황에 따라 4점대~2점대 — 일찍 퇴장할수록 더 깎고(남은 시간 비중), 퇴장 뒤 팀이
+        먹은 실점도 그 선수 몫으로 깎는다(수적 열세의 책임). 퇴장 선수만 바닥이 2.0이고,
+        4.0 아래는 0.7배로 눌러서 2점대는 "일찍 퇴장 + PK 허용 + 대패" 같은 최악에서만 나온다.
+    6.0 이상 쪽(좋은 경기·골·해트트릭)은 손대지 않았다.
 
 반환: compute(...) → (ratings, events)
   ratings: {선수키: 최종 평점}
@@ -19,7 +31,7 @@
 """
 
 START = 6.0
-MIN_R, MAX_R = 3.0, 10.0
+MIN_R, MAX_R = 4.0, 10.0
 
 # 포지션 묶음: GK / DEF / MID / ATT
 _GROUP = {
@@ -63,11 +75,15 @@ W = {
     "foul":            (-0.05, -0.05, -0.05, -0.05),
     "pk_conceded":     (-0.40, -0.40, -0.40, -0.40),
     "yellow":          (-0.30, -0.30, -0.30, -0.30),
-    "red":             (-1.30, -1.30, -1.30, -1.30),
+    "red":             (-0.60, -0.60, -0.60, -0.60),   # 기본 몫 — 일찍 퇴장한 만큼 RED_EARLY가 더 붙는다
+    "after_red":       (-0.18, -0.18, -0.18, -0.18),   # [2026-11] 퇴장 뒤 팀 실점 1개당(퇴장 선수 본인)
     "save":            (0.15, 0.0, 0.0, 0.0),
     "save_big":        (0.30, 0.0, 0.0, 0.0),
     "conceded":        (-0.25, -0.10, -0.05, -0.02),   # 실점 순간 경기장에 있던 선수 전원
     "team_goal":       (0.03, 0.04, 0.05, 0.05),       # 득점 순간 경기장에 있던 선수 전원(득점자 제외)
+    # [2026-11] 실점 책임 — 실점으로 이어진 상대 공격 흐름에서 드리블에 뚫렸거나 공중볼을 진 선수(골 1개당 1번).
+    # 수비수가 가장 무겁다(본업). PK 실점은 pk_conceded가 따로 있어 여기선 세지 않는다.
+    "goal_blame":      (0.0, -0.30, -0.22, -0.15),
 }
 # 패스(15분 묶음): 성공 1회당, 실패 1회당 — 엔진 패스량이 현실 수준(경기당 팀 400~500회)이 된 뒤
 # 원래 값으로 되돌렸다(패스 많이 한 선수가 과하게 유리해지지 않게).
@@ -75,9 +91,40 @@ PASS_OK = (0.004, 0.005, 0.006, 0.005)
 PASS_FAIL = (-0.012, -0.015, -0.015, -0.012)
 # 경기 종료(출전 시간 비중을 곱한다)
 RESULT = {"win": 0.30, "draw": 0.0, "loss": -0.30}
+# [2026-11] 패배 폭 — 2골 차부터 1골 더 질 때마다 이만큼 더 깎는다(최대 LOSS_MARGIN_CAP골 차까지).
+# (GK, DEF, MID, ATT) — GK는 실점 1개마다 이미 크게 깎이므로(conceded −0.25) 0.
+LOSS_MARGIN_STEP = (0.0, 0.10, 0.10, 0.08)
+LOSS_MARGIN_CAP = 4
+# [2026-11] 실점 책임을 찾을 때 골 직전 몇 분까지 거슬러 올라가는지(상대 공격 흐름이 끊기면 거기서 멈춘다).
+BLAME_WINDOW_MIN = 0.8
+# [2026-11] 눈금: PIVOT 아래 편차를 LOW_STRETCH배, FLOOR_KNEE 아래는 FLOOR_SOFT배로 눌러 MIN_R에서 멈춘다.
+PIVOT = 6.0
+LOW_STRETCH = 1.15
+FLOOR_KNEE = 4.6
+FLOOR_SOFT = 0.5
+# [2026-11] 퇴장 — 남은 시간 비중 × RED_EARLY를 기본 몫에 더한다(10분 퇴장 ≈ −1.6, 85분 ≈ −0.7).
+RED_EARLY = -1.10
+RED_MIN_R = 2.0          # 퇴장 선수만 이 바닥
+RED_FLOOR_KNEE = 4.0     # 퇴장 선수는 여기 아래를 RED_FLOOR_SOFT배로 누른다
+RED_FLOOR_SOFT = 0.70
 CLEAN_SHEET = (0.50, 0.30, 0.10, 0.0)
 CLEAN_SHEET_MIN_SHARE = 0.65   # 이만큼 이상 뛴 선수만 무실점 가산
 _GI = {"GK": 0, "DEF": 1, "MID": 2, "ATT": 3}
+
+
+def scale(raw, sent_off=False):
+    """장부 합계(raw) → 화면 평점. 6.0 이상은 그대로, 아래는 늘리고 바닥 근처는 누른다.
+    퇴장 안 당한 선수는 4.0에서 멈추고, 퇴장 선수는 2.0까지 내려갈 수 있다."""
+    v = float(raw)
+    if v < PIVOT:
+        v = PIVOT - (PIVOT - v) * LOW_STRETCH
+    if sent_off:
+        if v < RED_FLOOR_KNEE:
+            v = RED_FLOOR_KNEE - (RED_FLOOR_KNEE - v) * RED_FLOOR_SOFT
+        return round(max(RED_MIN_R, min(MAX_R, v)), 1)
+    if v < FLOOR_KNEE:
+        v = FLOOR_KNEE - (FLOOR_KNEE - v) * FLOOR_SOFT
+    return round(max(MIN_R, min(MAX_R, v)), 1)
 
 
 def compute(plog, pass_log, appear, total_minutes, score):
@@ -86,8 +133,11 @@ def compute(plog, pass_log, appear, total_minutes, score):
     score: {"home": 득점, "away": 득점}."""
     tot = float(max(1, total_minutes))
     side_of, grp, on_min, off_min = {}, {}, {}, {}
+    sent_off, red_min = set(), {}
     for sk in ("home", "away"):
         for k, a in (appear.get(sk) or {}).items():
+            if a.get("sent_off"):
+                sent_off.add(k)
             side_of[k] = sk
             grp[k] = group_of(a.get("slot"))
             on_min[k] = float(a.get("on") or 0)
@@ -109,7 +159,36 @@ def compute(plog, pass_log, appear, total_minutes, score):
         return [k for k, s in side_of.items()
                 if s == sk and on_min[k] <= minute <= off_min[k]]
 
-    for x in plog or []:
+    _plog = list(plog or [])
+
+    def blame_for_goal(gi):
+        """gi번째 골 직전, 같은 공격 흐름에서 뚫린 수비 선수들(중복 없이)."""
+        g = _plog[gi]
+        gs, gm = g.get("team"), float(g.get("min", 0))
+        out = []
+        j = gi - 1
+        while j >= 0:
+            y = _plog[j]
+            if gm - float(y.get("min", 0)) > BLAME_WINDOW_MIN:
+                break
+            yo = y.get("outcome")
+            if y.get("team") != gs and yo not in ("foul", "yellow", "red", "sub"):
+                break                                   # 상대(수비 팀)가 공을 가졌다 — 흐름 끊김
+            if y.get("team") == gs and yo == "buildup":
+                if y.get("def_action") == "beaten" and y.get("def_actor_id") is not None:
+                    out.append(y.get("def_actor_id"))
+                ae = y.get("aerial")
+                if ae and ae.get("won_by") == gs and ae.get("def_id") is not None:
+                    out.append(ae.get("def_id"))
+            j -= 1
+        seen, res = set(), []
+        for k in out:
+            if k not in seen:
+                seen.add(k)
+                res.append(k)
+        return res
+
+    for xi, x in enumerate(_plog):
         o = x.get("outcome")
         m = float(x.get("min", 0))
         sk = x.get("team")
@@ -123,6 +202,13 @@ def compute(plog, pass_log, appear, total_minutes, score):
             opp = "away" if sk == "home" else "home"
             for k in on_pitch(opp, m):
                 add(m, k, "conceded")
+            for k, rm in red_min.items():                # 퇴장 뒤 실점 — 퇴장당한 그 팀 선수 몫
+                if side_of.get(k) == opp and m >= rm:
+                    add(m, k, "after_red")
+            if x.get("kind") != "pk":
+                for k in blame_for_goal(xi):
+                    if side_of.get(k) == opp:
+                        add(m, k, "goal_blame")
         elif o == "save":
             add(m, x.get("shooter_id"), "big_miss" if x.get("big_chance") else "shot_on")
             add(m, x.get("gk_id"), "save_big" if x.get("big_chance") else "save")
@@ -146,7 +232,11 @@ def compute(plog, pass_log, appear, total_minutes, score):
         elif o == "yellow":
             add(m, x.get("player_id"), "yellow")
         elif o == "red":
-            add(m, x.get("player_id"), "red")
+            rk = x.get("player_id")
+            if rk in rating and rk not in red_min:
+                red_min[rk] = m
+                add(m, rk, "red")
+                add(m, rk, "red_early", round(RED_EARLY * max(0.0, min(1.0, (tot - m) / tot)), 3))
         elif o == "interception":
             add(m, x.get("player_id"), "interception")      # 실패한 패스를 직접 끊은 수비수
         elif o == "buildup":
@@ -190,10 +280,19 @@ def compute(plog, pass_log, appear, total_minutes, score):
         share = max(0.0, min(1.0, (off_min[k] - on_min[k]) / tot))
         gf, ga = score.get(sk, 0), score.get("away" if sk == "home" else "home", 0)
         res = "win" if gf > ga else ("loss" if gf < ga else "draw")
-        add(tot, k, "result", round(RESULT[res] * share, 3))
+        r_d = RESULT[res]
+        if res == "loss":
+            r_d -= LOSS_MARGIN_STEP[_GI[grp.get(k, "MID")]] * (min(ga - gf, LOSS_MARGIN_CAP) - 1)
+        add(tot, k, "result", round(r_d * share, 3))
         if ga == 0 and share >= CLEAN_SHEET_MIN_SHARE:
             add(tot, k, "clean_sheet", CLEAN_SHEET[_GI[grp.get(k, "MID")]] * share)
 
-    final = {k: round(max(MIN_R, min(MAX_R, v)), 1) for k, v in rating.items()}
+    # 눈금 — 바뀐 몫은 경기 끝 "scale" 한 줄로 타임라인에 넣는다(사건 합계 = 최종 평점 − 6.0 유지).
+    final = {}
+    for k, v in rating.items():
+        f = scale(v, sent_off=(k in sent_off or k in red_min))
+        if abs(f - v) >= 0.0005:
+            events.append([round(tot, 1), k, round(f - v, 3), "scale"])
+        final[k] = f
     events.sort(key=lambda e: e[0])
     return final, events

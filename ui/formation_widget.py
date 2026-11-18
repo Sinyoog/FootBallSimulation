@@ -982,35 +982,36 @@ class _FormationCanvas(QWidget):
                 # [⑦-c 2026-10, 신민용 확정 A안] 통일 스위치가 켜지면 나도 다른 선수와 똑같이
                 # 후보로 넣어 경기 전력과 같은 최적 배치(team_plan.club_fill_slots)로 고른다 —
                 # 시즌 주전 기록(_snapshot_season_positions)과 같은 기준. 꺼져 있으면 예전 그대로.
-                from constants import LINEUP_UNIFY_ENABLED as _lu_on
-                _me_slot = None
-                if _lu_on:
-                    from team_plan import club_fill_slots as _club_fill
-                    _me_cand = {"id": -1, "position": p.get("position", "MF"),
-                                "ovr": p.get("ovr", 40), "foot": p.get("foot", "") or "",
-                                "sub_role": p.get("sub_role", "") or ""}
-                    _placed_all = _club_fill(all_ai + [_me_cand], slots_only)
-                    _me_slot = next((i for i, x in enumerate(_placed_all) if x is _me_cand), None)
-                    slot_filled = [None if x is _me_cand else x for x in _placed_all]
-                else:
-                    slot_filled = _greedy_fill_slots(all_ai, slots_only)
-                # [2026-08 버그수정, 신민용 리포트: "주전 명단에 GK가 2명
-                # 뜬다"] _greedy_fill_slots는 각 선수에 _slot_idx만 태깅하고
-                # 등록 포지션(position)은 그대로 둔다 — 명단 패널(_make_
-                # player_button)이 실제 배정 자리를 보여줄 수 있도록,
-                # 여기서 슬롯 배정이 끝난 즉시 그 자리의 실제 포지션을
-                # field_pos로 같이 태깅해둔다.
-                for _pl in slot_filled:
-                    if _pl is not None:
-                        _pl["field_pos"] = slots_only[_pl["_slot_idx"]]
+                # [2026-11-17 신민용 확정 — 선발 경로 통일] 실제 내 경기와 같은 함수(team_plan.my_team_lineup — 경기
+                # 엔진과 같은 로스터 조회·부포 포함, 같은 내 후보 값)로 고른다. 예전엔 여기만 AI 부포를 빼고 배치했고,
+                # 경기는 AI 11명을 먼저 뽑은 뒤 내 자리의 최저 OVR AI를 밀어내서 두 화면의 선발이 달라질 수 있었다.
+                # 화면은 다음 경기 선발 여부를 미리 알 수 없으므로: 최적 배치(나 포함)가 나를 고르면 그 배치, 고르지
+                # 않으면 이번 시즌 실제 출전율이 과반일 때만(아래 _actual_starter, 예전과 같은 기준) 경기와 같은 "선발"
+                # 규칙(주포 자리 고정 + 나머지 10자리 재배치), 그 외에는 AI만 배치하고 나는 벤치.
+                # [2026-08 신설, 신민용 리포트: "39/44경기 뛰었는데 화면엔 벤치로 나온다"] 출전율 과반 규칙의 근거는
+                # 예전 주석 그대로 — 화면은 "지금 이 순간의 가정"이 아니라 "실제로 뛰고 있는 선수"를 보여준다.
+                _played = p.get("season_matches", 0)
+                _total_sn = (_played + p.get("season_bench_matches_missed", 0)
+                             + p.get("season_injury_matches_missed", 0)
+                             + p.get("season_suspension_matches_missed", 0))
+                _actual_starter = _total_sn >= 5 and (_played / _total_sn) >= 0.5
+                from team_plan import my_team_lineup as _my_team_lineup
+                _placed, _me_slot, _forced, _ = _my_team_lineup(team_id, self.formation, p, "start")
+                if _forced and not _actual_starter:
+                    _placed, _me_slot, _forced, _ = _my_team_lineup(team_id, self.formation, p, "bench")
+                _by_id = {r.get("id"): r for r in all_ai}
+                slot_filled = []
+                for _i, _q in enumerate(_placed):
+                    _r = None if (_q is None or _q.get("id") == -1) else _by_id.get(_q.get("id"))
+                    if _r is not None:
+                        _r["_slot_idx"] = _i
+                        _r["field_pos"] = slots_only[_i]
+                    slot_filled.append(_r)
 
-                # 2) 내 포지션에 맞는 슬롯을 찾아, 그 자리의 기존 선수와 OVR 비교
                 my_slot_idx, field_pos, mismatch_rank = _best_slot_for_player(
                     p.get("position", "MF"), slots_only)
                 if _me_slot is not None:
-                    # [⑦-c] 최적 배치가 나를 골랐다 — 그 자리가 내 자리(그 칸은 비워 뒀다).
                     my_slot_idx, field_pos = _me_slot, slots_only[_me_slot]
-                rival = slot_filled[my_slot_idx] if my_slot_idx < len(slot_filled) else None
 
                 me = {"id": -1, "name": p.get("name", "나"),
                       "position": p.get("position", "MF"), "_slot_idx": my_slot_idx,
@@ -1027,33 +1028,9 @@ class _FormationCanvas(QWidget):
                       "nationality4": p.get("nationality4", ""),
                       **{s: p.get(s, 0) for s in ALL_STATS}}
 
-                # [2026-08 신설, 신민용 리포트: "39/44경기 뛰었는데 화면엔
-                # 벤치로 나온다"] 예전엔 "그 순간 이 자리 최고 OVR 선수 1명과
-                # 비교"만으로 주전/벤치를 정했는데, 실제 경기 출전 여부는
-                # 이거랑 완전히 다른 확률 판정(_check_bench, 팀평균OVR격차+
-                # 감독관계 등 종합)을 따른다 — 그래서 실제로는 시즌 내내
-                # 거의 다 뛴 선수도 화면 여는 순간의 미세한 OVR 역전 하나로
-                # 벤치로 표시되는 불일치가 있었다. 이번 시즌 실제 출전율이
-                # 뚜렷하게 높으면(과반 이상, 최소 5경기 이상 표본) OVR
-                # 스냅샷 비교와 무관하게 주전으로 표시한다 — 화면이 "지금
-                # 이 순간의 가정"이 아니라 "실제로 뛰고 있는 선수"를 보여
-                # 주는 게 맞다는 원칙.
-                _played = p.get("season_matches", 0)
-                _total_sn = (_played + p.get("season_bench_matches_missed", 0)
-                             + p.get("season_injury_matches_missed", 0)
-                             + p.get("season_suspension_matches_missed", 0))
-                _actual_starter = _total_sn >= 5 and (_played / _total_sn) >= 0.5
-
-                # [⑦-c] 통일 스위치가 켜지면 "그 자리 선수와 OVR 비교"는 쓰지 않는다 — 최적 배치가
-                # 나를 고르지 않았으면 벤치(이번 시즌 실제 출전율 과반 규칙은 그대로 우선).
-                _beats_rival = (not _lu_on) and rival is not None and me["ovr"] > rival["ovr"]
-                if rival is None or _beats_rival or _actual_starter:
-                    # 내가 그 자리 주전보다 낫다 (또는 빈 자리, 또는 실제로
-                    # 이번 시즌 주전급으로 뛰어왔다) → 선발 출전
-                    rest = [pl for pl in slot_filled if pl is not None and pl is not rival]
-                    self.players = [me] + rest
+                if _me_slot is not None:
+                    self.players = [me] + [pl for pl in slot_filled if pl is not None]
                 else:
-                    # 그 자리 주전이 나보다 낫다 → 벤치 (베스트11 그대로 표시, 나는 제외)
                     self.players = [pl for pl in slot_filled if pl is not None]
                 # [2026-08 신설] 명단 패널용 — 전체 스쿼드(all_ai) + 나(me)를
                 # 합친 게 "우리 팀 전체 명단"이다. 주전 여부는 self.players
@@ -3582,7 +3559,7 @@ class PlayerStatPopup(QDialog):
         _hard = is_hard_mode()
         info_rows = [
             ("이름", pl.get('name', '')),
-            ("포지션", pl.get('position', '')),
+            ("주포", pl.get('position', '')),
         ]
         # [2026-10 주포·부포, 신민용 요청: "포메이션에서 ai선수 클릭할 때 주포 부포 이렇게 떠야"]
         # 부포가 있으면 "포지션" 줄을 "주포 | 부포"(예: ST | LW)로(내 선수는 id -1 또는 is_me로 조회).
@@ -3593,8 +3570,10 @@ class PlayerStatPopup(QDialog):
                                          else (_subp.get(_pid) if isinstance(_pid, int) else None))
         except Exception:
             _sub = None
+        # [2026-11-17 변경, 신민용 요청: "RB | LWB 한 줄 말고 주포 RB, 그 아래 줄에 부포 LWB로"] 주포·부포를 두 줄로 나눈다.
+        # 부포가 없으면 주포 줄만 보인다. (행 위치는 아래 표를 그릴 때 라벨로 찾으므로 줄이 늘어도 편집 동작은 그대로.)
         if _sub:
-            info_rows[1] = ("포지션", f"{pl.get('position', '')} | {_sub}")
+            info_rows.insert(2, ("부포", _sub))
         if not _hard:
             info_rows.append(("OVR", str(pl.get('ovr', 0))))
         age = pl.get("age")

@@ -1076,7 +1076,7 @@ def simulate_my_cl_match(week, p, day=None):
     # 대회 자체가 빅매치 성격이라(국내컵과 달리 결승 한정이 아니라) 모든
     # 경기에 적용한다.
     if not (_suspended or _benched) and "big_match_rating" in _pe:
-        rating = max(3.0, min(10.0, round(rating + _pe["big_match_rating"], 1)))
+        rating = max(min(4.0, rating), min(10.0, round(rating + _pe["big_match_rating"], 1)))   # 이미 4.0 아래(퇴장)면 끌어올리지 않음
 
     # [2026-08 신설, 신민용 요청: "챔스도 라인업 평점이 떠야지"]
     # game_engine._simulate_match과 완전히 동일한 패턴 — 전술엔진이 뽑은

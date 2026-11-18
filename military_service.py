@@ -290,7 +290,7 @@ def judge_service_type(level, role, refs, national_regular=False) -> str:
     if level is None:
         return "세미"
     if level >= refs[1] + GAP:
-        return "엘리트" if starter else ("애매함" if role == "로테이션" else "평범")
+        return "엘리트" if starter else ("애매함" if role in ("준주전", "로테이션") else "평범")
     if level >= refs[1] - M:
         return "엘리트" if role == "핵심" else ("애매함" if starter else "평범")
     if level >= refs[2] - M:

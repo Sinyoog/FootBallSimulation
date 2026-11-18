@@ -84,6 +84,10 @@ COLOR_THIRD     = QColor("#ffaa00")   # 3위 진출권 경쟁 중 (주황) — �
 COLOR_THIRD_OK  = QColor("#88dd44")   # 3위 중 진출 확정 (연두)
 COLOR_ELIM      = QColor("#888888")   # 탈락/미진출 (회색)
 COLOR_PENDING   = QColor("#555555")   # 경기 미진행
+# [2026-11] 내 경기 결과 색 — 리그 일정 표(_make_table)와 같은 값. 무승부는 흰색(신민용 요청: 반투명으로 남지 않게).
+COLOR_RESULT_WIN  = QColor("#00cc44")
+COLOR_RESULT_LOSS = QColor("#cc4444")
+COLOR_RESULT_DRAW = QColor("#ffffff")
 
 
 def _intl_advance_count(t):
@@ -1801,6 +1805,9 @@ class ScheduleWindow(QDialog):
                     "home_score": m["home_score"], "away_score": m["away_score"],
                     "pso_winner": m["pso_winner"],
                     "is_my": m["home_id"] == my_team_id or m["away_id"] == my_team_id,
+                    # [2026-11] 맨 위 "내 경기" 표의 승패 색용(내 팀이 홈/원정 어느 쪽인지)
+                    "my_side": ("home" if m["home_id"] == my_team_id else
+                                ("away" if m["away_id"] == my_team_id else None)),
                 })
             right_lay.addWidget(self._build_grouped_fixture_column(
                 fixture_rows, {}, None, p, st["current_year"],
@@ -2735,13 +2742,31 @@ class ScheduleWindow(QDialog):
                 day = m.get("day") or _week_intl_cl_day(m["week"], p)
                 date_str = day_to_full_date_str(year, day)
                 vals = [date_str, f"{home_flag}{home}", score, f"{away_flag}{away}"]
+                # [2026-11 신민용 요청: "맨 위 내 경기는 어차피 다 내 경기라 따로 표시할 필요가 없으니, 경기 전엔
+                # 리그처럼 반투명, 결과에 따라 승리 초록·패배 빨강·무승부 흰색"] 맨 위 내 경기 표만 결과 색 —
+                # 아래 주차별 전체 일정 표에서는 예전처럼 내 경기를 청록으로 구분한다.
+                _row_fg = None
+                if _is_mine_box:
+                    _side = m.get("my_side")
+                    if not played or _side is None:
+                        _row_fg = COLOR_PENDING
+                    else:
+                        _mine, _opp = (hs, as_) if _side == "home" else (as_, hs)
+                        if _mine == _opp and m.get("pso_winner"):
+                            _won = str(m["pso_winner"]) in str(home if _side == "home" else away)
+                            _row_fg = COLOR_RESULT_WIN if _won else COLOR_RESULT_LOSS
+                        else:
+                            _row_fg = (COLOR_RESULT_WIN if _mine > _opp else
+                                       (COLOR_RESULT_LOSS if _mine < _opp else COLOR_RESULT_DRAW))
+                elif is_my:
+                    _row_fg = COLOR_MY
+                elif not played:
+                    _row_fg = COLOR_PENDING
                 for j, v in enumerate(vals):
                     item = QTableWidgetItem(v)
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                    if is_my:
-                        item.setForeground(COLOR_MY)
-                    elif not played:
-                        item.setForeground(COLOR_PENDING)
+                    if _row_fg is not None:
+                        item.setForeground(_row_fg)
                     tbl.setItem(i, j, item)
             tbl.setFixedHeight(tbl.verticalHeader().defaultSectionSize() * max(len(group_rows), 1) + 28)
             tbl.resizeColumnsToContents()
@@ -2851,13 +2876,14 @@ class ScheduleWindow(QDialog):
                         col_wdl = "승" if hs>as_ else ("무" if hs==as_ else "패")
                     else:
                         col_wdl = "패" if hs>as_ else ("무" if hs==as_ else "승")
-                    wdl_color = "#00cc44" if col_wdl=="승" else ("#888888" if col_wdl=="무" else "#cc4444")
+                    # [2026-11 신민용 요청] 무승부는 반투명(회색)으로 남지 않게 흰색
+                    wdl_color = "#00cc44" if col_wdl=="승" else ("#ffffff" if col_wdl=="무" else "#cc4444")
 
                 if not played:
                     row_color = QColor("#555555")
                 elif is_my:
                     if col_wdl == "승":   row_color = QColor("#00cc44")
-                    elif col_wdl == "무": row_color = QColor("#888888")
+                    elif col_wdl == "무": row_color = QColor("#ffffff")
                     else:                  row_color = QColor("#cc4444")
                 else:
                     row_color = QColor("#aaaaaa")

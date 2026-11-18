@@ -289,6 +289,24 @@ def _ddl(cols):
     return ",\n        ".join(f"{_n} {_t}" for _n, _t in cols)
 
 
+def _club_goal_migrations():
+    """[2026-11 구단 목표 2단계] 시즌 시작 목표 산정 근거 칸·대륙대회 목표 표·기존 평가 입력 칸(club_goals.py)."""
+    try:
+        import club_goals
+        return club_goals.club_goal_migrations()
+    except Exception:
+        return []
+
+
+def _nat_eval_migrations():
+    """[2026-11 국가대표 평가 v2] 예선 목표 표(national_eval.py)."""
+    try:
+        import national_eval
+        return national_eval.migrations()
+    except Exception:
+        return []
+
+
 def _real_stats_migrations():
     """[2026-10 신설] 내 경기 AI 선수 실측 기록 표(real_stats)."""
     try:
@@ -2575,8 +2593,8 @@ _HISTORY_TASK_SQL = {
         "(team_id, year, formation, slots_json, bench_json) VALUES (?,?,?,?,?)",
     "ai_player_season_stats":
         "INSERT OR REPLACE INTO ai_player_season_stats"
-        "(player_id, year, team_id, matches, goals, assists, rating, clean_sheets, saves, goals_conceded) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "(player_id, year, team_id, matches, goals, assists, rating, clean_sheets, saves, goals_conceded, starts_est) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
     "ai_player_season_team_stats":
         "INSERT OR REPLACE INTO ai_player_season_team_stats"
         "(player_id, year, team_id, half, matches, goals, assists, rating, clean_sheets, saves, goals_conceded) "
@@ -4071,7 +4089,7 @@ def init_db(load=True):
         "ALTER TABLE my_player ADD COLUMN talent_cap INTEGER DEFAULT 88",
         "ALTER TABLE my_player ADD COLUMN talent_tier TEXT DEFAULT 'normal'",
         # [기능1] 이적 오퍼 맥락 — 입단 시 확정된 계약 조건 저장
-        "ALTER TABLE my_player ADD COLUMN contract_role TEXT DEFAULT '주전 경쟁'",
+        "ALTER TABLE my_player ADD COLUMN contract_role TEXT DEFAULT '준주전'",   # [2026-11-16 C] 옛 기본값 '주전 경쟁' → 새 이름
         "ALTER TABLE my_player ADD COLUMN club_ambition TEXT DEFAULT '중위권 안정'",
         "ALTER TABLE my_player ADD COLUMN appearance_bonus_k INTEGER DEFAULT 0",
         "ALTER TABLE my_player ADD COLUMN goal_bonus_k INTEGER DEFAULT 0",
@@ -4081,6 +4099,13 @@ def init_db(load=True):
         "ALTER TABLE my_player ADD COLUMN transfer_requested INTEGER DEFAULT 0",
         # [커리어 보강] 각 소속의 역할·감독성향·구단야망 기록 → AI 요약 서사 재료
         "ALTER TABLE career_entries ADD COLUMN contract_role TEXT DEFAULT ''",
+        # [2026-11-16 C] 옛 계약 역할 이름 → 역할 7단계(constants.LEGACY_CONTRACT_ROLE와 같은 대응, 멱등)
+        "UPDATE my_player SET contract_role = CASE contract_role WHEN '주전 보장' THEN '주전' "
+        "WHEN '주전 경쟁' THEN '준주전' WHEN '유망주 영입' THEN '유망주' WHEN '핵심 선수' THEN '핵심' "
+        "ELSE contract_role END WHERE contract_role IN ('주전 보장','주전 경쟁','유망주 영입','핵심 선수')",
+        "UPDATE career_entries SET contract_role = CASE contract_role WHEN '주전 보장' THEN '주전' "
+        "WHEN '주전 경쟁' THEN '준주전' WHEN '유망주 영입' THEN '유망주' WHEN '핵심 선수' THEN '핵심' "
+        "ELSE contract_role END WHERE contract_role IN ('주전 보장','주전 경쟁','유망주 영입','핵심 선수')",
         "ALTER TABLE career_entries ADD COLUMN manager_type TEXT DEFAULT ''",
         "ALTER TABLE career_entries ADD COLUMN club_ambition TEXT DEFAULT ''",
         # [나간 경로] 그 팀에서 어떻게 떠났는지: ''(재직중/정상) / '팔림' / '방출' / '이적' / '계약만료'
@@ -4956,6 +4981,9 @@ def init_db(load=True):
         # saves/(saves+goals_conceded)로 계산 — 저장된 값끼리 항상 정확히
         # 맞물리게). 클럽 시즌기록 2종+국가대표(intl_squad) 전부 동일.
         "ALTER TABLE hist.ai_player_season_stats ADD COLUMN saves INTEGER DEFAULT 0",
+        # [2026-11-16 신설, 신민용 확정] 선발 수 **추정치**(출전 수 × 역할별 선발 비율) — 경기마다 기록한 값이 아니다.
+        # 내 선수 실측 선발 수(my_player.season_league_starts)와 출처를 구분하려고 이름에 _est를 붙인다.
+        "ALTER TABLE hist.ai_player_season_stats ADD COLUMN starts_est INTEGER DEFAULT NULL",
         "ALTER TABLE hist.ai_player_season_stats ADD COLUMN goals_conceded INTEGER DEFAULT 0",
         "ALTER TABLE hist.ai_player_season_stats_by_comp ADD COLUMN saves INTEGER DEFAULT 0",
         "ALTER TABLE hist.ai_player_season_stats_by_comp ADD COLUMN goals_conceded INTEGER DEFAULT 0",
@@ -5224,7 +5252,7 @@ def init_db(load=True):
     # military_service.MILITARY_*_COLS 한 곳에만 있다.
     # [2026-10 신설] U-23 올림픽 표·컬럼(competition/olympics.py) — OLYMPICS_ENABLED가 꺼져 있으면
     # 빈 목록이라 스키마가 하나도 안 바뀐다.
-    ] + et_score_migrations() + two_leg_migrations() + military_migrations() + _oly_migrations() + _card_rule_migrations() + _real_stats_migrations():
+    ] + et_score_migrations() + two_leg_migrations() + military_migrations() + _oly_migrations() + _card_rule_migrations() + _real_stats_migrations() + _club_goal_migrations() + _nat_eval_migrations():
         # [정리] bare except → sqlite3.OperationalError로 좁힘.
         # (ALTER TABLE 재실행 시 "duplicate column" 등 예상된 실패만 무시하고,
         #  그 외 진짜 버그로 인한 예외는 숨기지 않는다. 동작은 기존과 동일.)
@@ -6889,8 +6917,20 @@ def _migrate_history_pk_year_first():
 
     # ── 2~3. 표별 재구축 + 전 행 대조 ─────────────────────────
     for tbl, newpk, coldef in todo:
-        cols = [r["name"] for r in c.execute(f"PRAGMA hist.table_info({tbl})")]
+        _info = c.execute(f"PRAGMA hist.table_info({tbl})").fetchall()
+        cols = [r["name"] for r in _info]
         collist = ", ".join(cols)
+        # [2026-11-17 버그수정, 신민용 리포트: "table hist._pkmig_ai_player_season_stats has no column named
+        # starts_est"] 위 TARGETS의 컬럼 정의는 이 마이그레이션을 만들 때의 스키마로 고정돼 있어서, 그 뒤 ALTER로
+        # 추가된 컬럼(예: 2026-11-16 starts_est)이 있는 예전 세이브에서는 새 표에 그 컬럼이 없어 INSERT가 죽었다.
+        # 원본 표에 있는데 정의에 없는 컬럼은 원본의 타입·기본값 그대로 새 표에 덧붙인다(값은 그대로 옮겨진다).
+        _defined = {seg.strip().split()[0].lower() for seg in coldef.split(",") if seg.strip()}
+        for r in _info:
+            if r["name"].lower() not in _defined:
+                _extra = f'{r["name"]} {r["type"] or ""}'.rstrip()
+                if r["dflt_value"] is not None:
+                    _extra += f' DEFAULT {r["dflt_value"]}'
+                coldef = f"{coldef}, {_extra}"
         tmp = f"_pkmig_{tbl}"
         c.execute(f"DROP TABLE IF EXISTS hist.{tmp}")
         c.execute(f"CREATE TABLE hist.{tmp}({coldef}, PRIMARY KEY({newpk})) WITHOUT ROWID")
@@ -8322,6 +8362,8 @@ def reset_game_data(progress_cb=None, skip_ai_regen=False, start_year=None):
               "national_team_managers","national_objectives",
               # [2026-11-15] 시즌별 구단 목표 기록 — team_id 재사용 함정 동일.
               "team_season_ambition",
+              "team_season_cont_goal",   # [2026-11 구단 목표 2단계] 대륙대회 목표 — 같은 함정
+              "national_qual_objectives",   # [2026-11 국가대표 평가 v2] 예선 목표
               # [2026-08 버그수정, 신민용 리포트: "새 게임(2000년) 시작했는데
               # 2001년 파워랭킹이 남아있다"] power_ranking.py의 8개 테이블
               # (레이팅 원본 2개 + 연도별 스냅샷 2개 + 연속우승 카운터 2개 +
@@ -11077,16 +11119,25 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
         if _my_pos:
             from constants import INTL_SQUAD_TOTAL
             _target = INTL_SQUAD_TOTAL - 1
-            _cut = [r for r in result if not r["appearances"]]
-            _cut.sort(key=lambda r: ((r["ovr"] or 0), -(r["age"] or 0)))
-            _drop_ids = set()
-            while len(result) - len(_drop_ids) > _target and _cut:
-                _drop_ids.add(_cut.pop(0)["id"])
+            # [2026-11-16 국대 측면 2:2 고정] 내 자리가 측면 칸이면 그 칸 AI 중에서, 아니면 측면 칸이 아닌 AI 중에서
+            # (둘 다 아직 안 뛴 선수만) OVR 최하위를 뺀다 — 좌우 칸 정원(LB·RB·LW·RW 각 2)을 깨지 않는다.
+            from intl_engine import intl_inherit_side_cards, intl_my_join_drops
+            _cs = get_conn()
+            _sc = intl_inherit_side_cards(_cs, tournament_id, country, result)
+            _cs.close()
+            _dl, _ok_side = intl_my_join_drops(result, _sc, _my_pos, _target)
+            _drop_ids = set(_dl)
             if _drop_ids:
                 conn_d = get_conn()
                 conn_d.executemany(
                     "DELETE FROM intl_squad WHERE tournament_id=? AND country=? AND player_id=?",
                     [(tournament_id, country, pid) for pid in _drop_ids])
+                try:
+                    conn_d.executemany(
+                        "UPDATE intl_callup_role_pool SET picked=0 WHERE tournament_id=? AND country=? AND player_id=?",
+                        [(tournament_id, country, pid) for pid in _drop_ids])
+                except sqlite3.OperationalError:
+                    pass
                 conn_d.commit(); conn_d.close()
                 result = [r for r in result if r["id"] not in _drop_ids]
         return result
@@ -11106,6 +11157,7 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
         return get_or_create_intl_squad(tournament_id, country, avg_ovr, positions) if _n_chk else []
 
     picked = None
+    _inh_drop_all, _inh_add_all = [], []     # [2026-11-16] 승계 명단 측면 칸 보정(후보 라인 기록용)
     _callup_src_tid = None      # [2026-10] 예선 명단을 물려받으면 그 예선의 후보군도 물려받는다
     _callup_cands = None        # [2026-10] 이번에 새로 뽑으면 그때의 후보군
     _callup_roles = None        # [2026-11-15] 이번에 새로 뽑으면 그때의 선발 그룹별 후보 라인
@@ -11145,9 +11197,17 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
                 # 기준으로 삼는다.
                 _my_pos_inh = _my_player_intl_slot(tournament_id, country)
                 from constants import INTL_SQUAD_TOTAL
+                # [2026-11-16 신설, 국대 측면 2:2 고정] 승계 명단의 측면 칸(원 예선 후보 라인 기준) — 줄이거나
+                # 채울 때 좌우 칸 정원(LB·RB·LW·RW 각 2, 내가 그쪽이면 1)을 깨지 않는다.
+                from intl_engine import (intl_inherit_side_cards, intl_inherit_trim, intl_inherit_vacancies,
+                                         intl_pick_refill)
+                _cs = get_conn()
+                _side_cards_inh = intl_inherit_side_cards(_cs, _callup_src_tid, country, picked)
+                _cs.close()
+                _inh_drop, _inh_add = [], []      # 후보 라인 보정용(뺀 선수, (넣은 선수, 칸))
                 if _my_pos_inh and len(picked) > INTL_SQUAD_TOTAL - 1:
-                    picked.sort(key=lambda r: ((r["ovr"] or 0), -(r["age"] or 0)))
-                    picked = picked[len(picked) - (INTL_SQUAD_TOTAL - 1):]
+                    picked, _inh_drop = intl_inherit_trim(picked, _side_cards_inh, _my_pos_inh,
+                                                          INTL_SQUAD_TOTAL - 1)
                 # [2026-10 신설, 국대 부상 소집 규칙] 예선 명단에 내가 있어서(AI 25명) 본선엔
                 # 내가 없으면(부상 소집 해제·본선 미선발 등) 물려받은 명단이 25명으로 남았다 —
                 # 예선 때 저장한 후보군(intl_callup_pool)에서 내 포지션 그룹 우선으로 채운다.
@@ -11158,13 +11218,26 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
                     _mp = conn_f.execute("SELECT position FROM my_player WHERE id=1").fetchone()
                     _my_bucket = _INTL_CALLUP_BUCKET_OF.get((_mp["position"] if _mp else "") or "", "")
                     _have = {r["id"] for r in picked}
-                    _pool = [r["player_id"] for r in conn_f.execute(
-                        """SELECT cp.player_id FROM intl_callup_pool cp
+                    _cp_rows = [dict(r) for r in conn_f.execute(
+                        """SELECT cp.player_id, cp.bucket, cp.rank, cp.score FROM intl_callup_pool cp
                            JOIN ai_players ap ON ap.id = cp.player_id
                            WHERE cp.tournament_id=? AND cp.country=?
                            ORDER BY (cp.bucket = ?) DESC, cp.rank ASC, cp.score DESC""",
                         (_callup_src_tid, country, _my_bucket)).fetchall()
-                        if r["player_id"] not in _have][:_target_inh - len(picked)]
+                        if r["player_id"] not in _have]
+                    # [2026-11-16] 빈 측면 칸부터(같은 쪽 전문 → 없을 때만 대체), 나머지는 측면 버킷을 뺀 예전 순서.
+                    _pool = []
+                    for _slot in intl_inherit_vacancies(picked, _side_cards_inh, _my_pos_inh):
+                        if len(picked) + len(_pool) >= _target_inh:
+                            break
+                        _got = intl_pick_refill([r for r in _cp_rows if r["player_id"] not in _pool], _slot)
+                        if _got:
+                            _pool.append(_got[0])
+                            _inh_add.append((_got[0], _slot))
+                    _need = _target_inh - len(picked) - len(_pool)
+                    if _need > 0:
+                        _pool += intl_pick_refill([r for r in _cp_rows if r["player_id"] not in _pool], None,
+                                                  my_bucket=_my_bucket, n=_need)
                     if _pool:
                         _ph_f = ",".join("?" * len(_pool))
                         _add = {r["id"]: dict(r) for r in conn_f.execute(
@@ -11175,6 +11248,8 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
                                 WHERE ap.id IN ({_ph_f})""", _pool).fetchall()}
                         picked += [_add[i] for i in _pool if i in _add]
                     conn_f.close()
+                _inh_drop_all, _inh_add_all = list(_inh_drop), [(pid, sl) for pid, sl in _inh_add
+                                                                 if any(r["id"] == pid for r in picked)]
 
     if picked is None:
         # [2026-09 재설계, 신민용 리포트: "RW 90/83/82가 있어도 최대 1명만
@@ -11209,7 +11284,8 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
         _callup_src_tid = None
         picked = _build_intl_squad_by_group(country, quota_by_group=_quota,
                                             candidates_out=_callup_cands,
-                                            role_out=_callup_roles)
+                                            role_out=_callup_roles,
+                                            my_side=(_my_pos if _my_pos in ("LB", "RB", "LW", "RW") else None))
         # [2026-11-15 신민용 리포트] 내가 뽑힌 대회면 후보 라인(선발 그룹 카드)에도 내 줄을 넣고, 그 카드 순위를
         # 점수순으로 다시 매긴다(표시 전용 — AI 명단·순서는 그대로).
         if _my_pos:
@@ -11289,6 +11365,20 @@ def get_or_create_intl_squad(tournament_id, country, avg_ovr, positions):
                     "player_id, score, position, fit, picked, via, card FROM intl_callup_role_pool "
                     "WHERE tournament_id=? AND country=?",
                     (tournament_id, _callup_src_tid, country))
+                # [2026-11-16] 승계하며 뺀 선수는 뽑힘 해제, 빈 측면 칸을 채운 선수는 그 칸 카드에 추가.
+                if _inh_drop_all:
+                    conn3.executemany(
+                        "UPDATE intl_callup_role_pool SET picked=0 WHERE tournament_id=? AND country=? AND player_id=?",
+                        [(tournament_id, country, pid) for pid in _inh_drop_all])
+                if _inh_add_all:
+                    _pos_of = {r["id"]: (r.get("position") or "") for r in picked}
+                    conn3.executemany(
+                        "INSERT INTO intl_callup_role_pool(tournament_id, country, grp, quota, rank, "
+                        "player_id, score, position, fit, picked, via, card) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+                        "ON CONFLICT(tournament_id, country, grp, player_id) DO UPDATE SET picked=1, "
+                        "via=excluded.via, card=excluded.card, quota=excluded.quota",
+                        [(tournament_id, country, "FB" if slot_ in ("LB", "RB") else "WG", 2, 99, pid, 0.0,
+                          _pos_of.get(pid, ""), None, 1, "inherit_fill", slot_) for pid, slot_ in _inh_add_all])
         except sqlite3.OperationalError:
             pass
         conn3.commit()

@@ -548,6 +548,20 @@ def start_all_continental_competitions(year, season):
         if len(alloc["conference"]) >= 4:
             conference_engine.build_from_qualification(year, cont, alloc["conference"], this_my_tid)
 
+    # [2026-11 구단 목표 2단계] 참가가 확정된 지금 참가팀별 대륙대회 목표를 정한다(없을 때만 넣기,
+    # 그해 리그 plan이 없는 레거시 시즌이면 만들지 않음 — club_goals.plan_cont_goals).
+    try:
+        import club_goals as _cg
+        from database import get_conn as _gc
+        _cc = _gc()
+        try:
+            _cg.plan_cont_goals(_cc, year)
+            _cc.commit()
+        finally:
+            _cc.close()
+    except Exception as _e:
+        print(f"[CLUB-GOAL] {year} 대륙대회 목표 생성 실패: {_e}")
+
     add_log("─" * 44, "sep")
     add_log(f"🏆 {year}년 클럽 대항전(챔피언스리그/유로파리그/컨퍼런스리그) 개막!", "event")
 

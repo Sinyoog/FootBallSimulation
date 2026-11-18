@@ -185,10 +185,45 @@ def _order_cached(formation, gk3):
     return ("GK", "GK") + field_reserve_order(formation)
 
 
+_SIDE_PAIRS = (("LB", "RB"), ("LW", "RW"))
+_SIDE_PAIR_FALLBACK = {"LB": "CB", "RB": "CB", "LW": "FW", "RW": "FW"}
+
+
+def _side_balance_on():
+    return bool(getattr(_C, "SIDE_BALANCE_ENABLED", False))
+
+
+def _balanced_take(order, k):
+    """[2026-11-18 신설, 신민용 확정 — 클럽 측면 좌우 균형] 순서표 앞 k자리(12번째 자리부터)를 고르되 측면 칸
+    (LB·RB, LW·RW)은 좌우 같은 수로 맞춘다. 한쪽이 많으면 그 쪽의 마지막 자리를 빼고, 그 자리는 순서표에서 아직 안 쓴
+    다음 중앙 칸(측면·GK 제외)에 준다 — 홀수 자리는 측면 대신 중앙으로. 쓸 중앙 칸이 순서표에 더 없으면 풀백 짝은 CB,
+    윙 짝은 FW. 선발은 모든 포메이션이 좌우 대칭이라(FORMATION_SLOTS) 여기서 맞추면 목표표 전체가 대칭이다.
+    스위치(SIDE_BALANCE_ENABLED)가 꺼져 있으면 예전처럼 앞 k자리 그대로."""
+    take = list(order[:max(0, k)])
+    if not _side_balance_on():
+        return take
+    rest = list(order[max(0, k):])
+    for a, b in _SIDE_PAIRS:
+        while True:
+            ca, cb = take.count(a), take.count(b)
+            if ca == cb:
+                break
+            big = a if ca > cb else b
+            idx = len(take) - 1 - take[::-1].index(big)
+            take.pop(idx)
+            rep = next((p for p in rest if p not in _SIDE and p != "GK"), None)
+            if rep is None:
+                rep = _SIDE_PAIR_FALLBACK[big]
+            else:
+                rest.remove(rep)
+            take.append(rep)
+    return take
+
+
 @functools.lru_cache(maxsize=None)
 def _targets_cached(formation, n, gk3=False):
     t = dict(starter_counts(formation))
-    for p in _order_cached(formation, gk3)[:max(0, n - 11)]:
+    for p in _balanced_take(_order_cached(formation, gk3), n - 11):
         t[p] += 1
     return t
 
@@ -264,7 +299,7 @@ def cover_order(formation, alts):
 @functools.lru_cache(maxsize=None)
 def _team_targets_cached(formation, n, alts):
     t = dict(starter_counts(formation))
-    for p in cover_order(formation, alts)[:max(0, n - 11)]:
+    for p in _balanced_take(cover_order(formation, alts), n - 11):   # [2026-11-18] 측면 좌우 균형
         t[p] += 1
     return t
 

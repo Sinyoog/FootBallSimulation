@@ -6,7 +6,7 @@ import json
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QComboBox, QFrame, QMessageBox,
-    QGraphicsDropShadowEffect, QMenu, QProgressBar
+    QGraphicsDropShadowEffect, QMenu, QProgressBar, QGridLayout
 )
 from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QThread, pyqtSignal
 from PyQt6.QtGui import QColor, QAction
@@ -249,7 +249,11 @@ QComboBox:disabled { color:#666; background-color:#222; }
 #modeBtn[switchable="true"] { background-color:#1a4d8f; color:#ffffff; border:1px solid #3a7fd5; }
 #modeBtn[switchable="true"]:hover { background-color:#2360ad; }
 #modeBtn:disabled { background-color:#2a2a2a; color:#555; border:1px solid #3a3a3a; }
-#previewBox { background-color:#252525; border:1px solid #333; border-radius:6px; }
+#previewBox { background-color:#3a3a3a; border:none; border-radius:4px; }
+#pvHead     { background-color:#2e2e2e; color:#dddddd; font-weight:bold;
+              padding:5px 8px; }
+#pvKey      { background-color:#262626; color:#bbbbbb; padding:4px 8px; }
+#pvVal      { background-color:#202020; color:#eeeeee; padding:4px 8px; }
 #actBtn     { background-color:#2a2a2a; color:#cccccc;
               border:1px solid #444; border-radius:4px; padding:6px; font-size:12px; }
 #actBtn:hover { background-color:#383838; }
@@ -544,19 +548,53 @@ class CenterPanel(QWidget):
         self.lay.addLayout(adv_row)
 
         # 예상 변화 박스
+        # [2026-11 레이아웃 변경, 신민용 요청: "이번 주 예상 변화가 한 줄을 다
+        # 차지하는데, 좌측에 칸(표)으로 깔끔하게 밀어두고 우측에 다른 걸 만들
+        # 공간을 비워줘"] 예전엔 QVBoxLayout에 "예상 스트레스: +0" 문장 라벨을
+        # 세로로 쌓아 가로폭을 전부 썼다. 이제는 [항목 | 값] 2열 표를 좌측
+        # 고정폭으로 두고, 그 오른쪽은 self.preview_side_lay(빈 영역)로 남겨
+        # 이후 기능(구단 구매 등)을 붙일 수 있게 한다.
+        # 표의 칸 구분선은 frame 배경(#3a3a3a)을 1px grid 간격으로 비치게 해서 그린다.
+        pv_row = QHBoxLayout(); pv_row.setSpacing(10)
         pvbox = QFrame(); pvbox.setObjectName("previewBox")
-        pvlay = QVBoxLayout(pvbox); pvlay.setContentsMargins(12,8,12,8)
-        pvlay.addWidget(QLabel("이번 주 예상 변화"))
-        self.lbl_pv_stress = QLabel("예상 스트레스: 0")
-        self.lbl_pv_happy  = QLabel("예상 행복도: +0")
+        pvbox.setFixedWidth(230)
+        pvgrid = QGridLayout(pvbox)
+        pvgrid.setContentsMargins(1, 1, 1, 1)
+        pvgrid.setSpacing(1)
+        pvgrid.setColumnStretch(0, 3)
+        pvgrid.setColumnStretch(1, 2)
+
+        pv_head = QLabel("이번 주 예상 변화"); pv_head.setObjectName("pvHead")
+        pv_head.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pvgrid.addWidget(pv_head, 0, 0, 1, 2)
+
+        def _pv_row(r, name, init):
+            k = QLabel(name); k.setObjectName("pvKey")
+            v = QLabel(init); v.setObjectName("pvVal")
+            v.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            pvgrid.addWidget(k, r, 0); pvgrid.addWidget(v, r, 1)
+            return k, v
+
+        # lbl_pv_* 는 이제 '값' 칸만 가리킨다(텍스트는 "+3"처럼 숫자만).
+        # 하드모드 숨김은 행 단위여야 해서 항목명 칸(_key)도 따로 들고 있는다.
+        self.lbl_pv_stress_key, self.lbl_pv_stress = _pv_row(1, "스트레스", "+0")
+        self.lbl_pv_happy_key,  self.lbl_pv_happy  = _pv_row(2, "행복도", "+0")
         # [2026-08 신설, 신민용 확정: "예상 스트레스/예상 행복도는 있는데
         # 예상 신체부담 수치는 없어"] 신체 부담(injury_load)도 같은 자리에
         # 같은 형태로 미리보기 추가.
-        self.lbl_pv_load   = QLabel("예상 신체부담: +0")
-        self.lbl_pv_match  = QLabel("경기 수: 0경기")
-        for w in [self.lbl_pv_stress, self.lbl_pv_happy, self.lbl_pv_load, self.lbl_pv_match]:
-            pvlay.addWidget(w)
-        self.lay.addWidget(pvbox)
+        self.lbl_pv_load_key,   self.lbl_pv_load   = _pv_row(3, "신체부담", "+0")
+        self.lbl_pv_match_key,  self.lbl_pv_match  = _pv_row(4, "경기 수", "0경기")
+        # refresh()의 주간 카드 루프에서 실제 경기일 수를 세어 여기에 담는다.
+        self._pv_match_count = 0
+        pv_row.addWidget(pvbox, 0, Qt.AlignmentFlag.AlignTop)
+
+        # 우측 빈 영역 — 이후 기능 배치용 자리(현재는 비어 있음).
+        self.preview_side = QWidget()
+        self.preview_side_lay = QVBoxLayout(self.preview_side)
+        self.preview_side_lay.setContentsMargins(0, 0, 0, 0)
+        self.preview_side_lay.setSpacing(6)
+        pv_row.addWidget(self.preview_side, 1)
+        self.lay.addLayout(pv_row)
 
         # [2026-07 신설, 신민용 요청: "8강(예정)/4강(예정)처럼 참가팀이
         # 아직 안 정해진 다음 라운드도 메인 화면에 미리 보이면 좋겠다"]
@@ -1010,6 +1048,9 @@ class CenterPanel(QWidget):
         self._update_next_po_preview(bundle_start, p)
 
         day_labels_kr = ["월", "화", "수", "목", "금", "토", "일"]
+        # [2026-11 버그수정] "경기 수" 칸은 만들어만 두고 갱신하는 곳이 없어 항상
+        # 0경기였다. 아래 루프에서 실제 경기 카드(미정·부상일 제외)를 센다.
+        self._pv_match_count = 0
         for i, (f, cb) in enumerate(zip(self.week_frames, self.week_combos)):
             d  = bundle_start + i
             w_of_d = day_to_week(d)
@@ -1075,6 +1116,8 @@ class CenterPanel(QWidget):
 
             if match_info:
                 cb.hide()
+                if not match_info.get("pending"):
+                    self._pv_match_count += 1
                 if match_info.get("pending"):
                     # [2026-07 신설, 신민용 요청: "8강 날짜가 되면 이기기
                     # 전까지는 미정으로 떠야 한다"] 아직 대진이 안 정해진
@@ -1773,9 +1816,11 @@ class CenterPanel(QWidget):
         # 같은 원칙 — 하드모드에서는 내부 컨디션 수치를 여기서도 숨긴다.
         # 경기 수(lbl_pv_match)는 일정 정보일 뿐 컨디션이 아니라서 계속 표시.
         _hard = is_hard_mode(p)
-        self.lbl_pv_stress.setVisible(not _hard)
-        self.lbl_pv_happy.setVisible(not _hard)
-        self.lbl_pv_load.setVisible(not _hard)
+        # 표 형태라 항목명 칸(_key)과 값 칸을 같이 숨겨야 행이 통째로 빠진다.
+        for _w in (self.lbl_pv_stress, self.lbl_pv_stress_key,
+                   self.lbl_pv_happy,  self.lbl_pv_happy_key,
+                   self.lbl_pv_load,   self.lbl_pv_load_key):
+            _w.setVisible(not _hard)
         for i, cb in enumerate(self.week_combos):
             if not cb.isVisible():
                 # [2026-07 버그수정, 신민용 리포트: "경기일엔 스트레스 +8이
@@ -1802,15 +1847,16 @@ class CenterPanel(QWidget):
             self.week_hints[i].setText(f"스트레스 {sign}{s_chg}")
 
         ss = "+" if total_stress >= 0 else ""
-        self.lbl_pv_stress.setText(f"예상 스트레스: {ss}{total_stress}")
+        self.lbl_pv_stress.setText(f"{ss}{total_stress}")
         ls = "+" if total_load >= 0 else ""
-        self.lbl_pv_load.setText(f"예상 신체부담: {ls}{total_load}")
+        self.lbl_pv_load.setText(f"{ls}{total_load}")
         if rest_count:
             # 휴식 1회당 +4~8 → 합산 범위로 표시
             self.lbl_pv_happy.setText(
-                f"예상 행복도: +{rest_count*4}~{rest_count*8}")
+                f"+{rest_count*4}~{rest_count*8}")
         else:
-            self.lbl_pv_happy.setText("예상 행복도: +0")
+            self.lbl_pv_happy.setText("+0")
+        self.lbl_pv_match.setText(f"{getattr(self, '_pv_match_count', 0)}경기")
 
         # 콤보(훈련 선택)가 바뀌었으니 세이브에 반영.
         self._save_ui_state()
@@ -3158,7 +3204,8 @@ class CenterPanel(QWidget):
         from game_engine import (join_team, update_player, get_state, get_conn,
                                   _contract_years_neg_delta, _record_team_offer_cooldown,
                                   roll_negotiation_attempts, negotiation_success_prob,
-                                  calc_apply_success_prob)
+                                  calc_apply_success_prob, my_salary_market_and_cap,
+                                  salary_negotiation_success_prob, roll_salary_raise_pct)
         from constants import CONTRACT_YEARS_MIN, CONTRACT_YEARS_MAX
         import random
 
@@ -3196,6 +3243,15 @@ class CenterPanel(QWidget):
             "yrs_failed": False,
         }
         state["target_yrs"] = state["yrs"]   # 콤보박스 기본값 = 초기 제시와 동일
+        # [2026-11-17 신설, 신민용 확정 — 재계약 연봉 복리 상승 차단] 시장 연봉 M과 협상 상한 C.
+        # C에 닿으면(또는 처음부터 넘으면) 연봉 협상 버튼을 없앤다. 판정 불가(0)면 상한 없이 기존처럼.
+        try:
+            _mkt, _sal_cap = my_salary_market_and_cap(p, _st_r.get("current_year"))
+        except Exception as _mc_e:
+            print(f"[RENEW] 시장 연봉 계산 실패(상한 없음): {_mc_e}")
+            _mkt, _sal_cap = 0, 0
+        def _at_cap():
+            return _sal_cap > 0 and state["sal"] >= _sal_cap
 
         dlg = QDialog(self)
         dlg.setWindowTitle("📋 재계약 제안")
@@ -3247,9 +3303,12 @@ class CenterPanel(QWidget):
             yrs_lbl.setText(f"<span style='color:#bbb'>제시 조건</span>  "
                              f"<b style='color:#ffcc33'>{state['yrs']}년 계약</b>")
             sal_lbl.setText(f"<span style='color:#bbb'>제시 연봉</span>  "
-                             f"<b style='color:#00cc66'>{fmt_money(state['sal'])} / 년</b>")
+                             f"<b style='color:#00cc66'>{fmt_money(state['sal'])} / 년</b>"
+                             + ("  <span style='color:#888'>(협상 한도)</span>" if _at_cap() else ""))
 
-            if state["sal_failed"]:
+            if _at_cap():
+                sal_btn.setVisible(False)
+            elif state["sal_failed"]:
                 sal_btn.setText("❌ 연봉 협상 결렬"); sal_btn.setEnabled(False)
             else:
                 sal_btn.setText(f"💬 연봉 협상 ({state['sal_used']}회)")
@@ -3282,19 +3341,24 @@ class CenterPanel(QWidget):
         def _negotiate_sal():
             if state["sal_used"] <= 0 or state["sal_failed"]:
                 return
+            if _at_cap():
+                return
             state["sal_used"] -= 1
             old_sal = state["sal"]
-            delta = random.randint(10, 30)
-            if random.random() < negotiation_success_prob(_prob):
-                state["sal"] = int(old_sal * (1 + delta/100))
-                show_toast(self, f"✅ +{delta}%  {fmt_money(old_sal)} → {fmt_money(state['sal'])}",
+            # [2026-11-17 재설계, 신민용 확정] 성공 1회 +2~5%(기본 3%), 상한 C 안에서만. 실패해도 연봉은
+            # 그대로이고 결렬되지 않는다. 회당 성공확률은 시장 연봉보다 높게 부를수록 떨어진다.
+            delta = roll_salary_raise_pct()
+            proposed = int(old_sal * (1 + delta/100))
+            if _sal_cap > 0:
+                proposed = min(proposed, _sal_cap)
+            if random.random() < salary_negotiation_success_prob(_prob, proposed, _mkt):
+                state["sal"] = max(old_sal, proposed)
+                _real = (state["sal"] / old_sal - 1) * 100 if old_sal > 0 else delta
+                show_toast(self, f"✅ +{_real:.1f}%  {fmt_money(old_sal)} → {fmt_money(state['sal'])}"
+                                 + ("  (협상 한도)" if _at_cap() else ""),
                           "#006622", 1400)
             else:
-                if state["sal_used"] == 0:
-                    state["sal_failed"] = True
-                    show_toast(self, "❌ 연봉 협상 결렬", "#cc0000", 1400)
-                else:
-                    show_toast(self, f"협상 실패  남은 기회: {state['sal_used']}회", "#cc4400", 1200)
+                show_toast(self, f"협상 실패 — 연봉 유지  남은 기회: {state['sal_used']}회", "#cc4400", 1200)
             _refresh()
 
         def _negotiate_yrs():
@@ -3563,7 +3627,7 @@ class CenterPanel(QWidget):
             f"{proposal['tier']}부)</span>"))
         cl.addWidget(QLabel(
             f"<span style='color:#888;font-size:11px'>이번 임대 시즌: 평균평점 "
-            f"{proposal.get('rating', 0):.2f} · 출전 {int(round(proposal.get('play_ratio', 0)*100))}%</span>"))
+            f"{proposal.get('rating', 0):.1f} · 출전 {int(round(proposal.get('play_ratio', 0)*100))}%</span>"))
         cl.addWidget(QLabel(""))
         cl.addWidget(QLabel(
             f"<span style='color:#bbb'>제시 연봉</span>  "
@@ -4230,7 +4294,7 @@ class CenterPanel(QWidget):
 
     def _show_auto_offer(self, week: int):
         """소속 있을 때 자동 오퍼 팝업 (이적시장: 여름 1~3주, 겨울 28~29주)."""
-        from game_engine import _offer_probability, load_pending_offer_state
+        from game_engine import load_pending_offer_state
         p = get_player()
         if not p or not p.get("current_team_id"): return
         if self._auto_offer_shown:
@@ -4268,16 +4332,8 @@ class CenterPanel(QWidget):
                 self._show_military_only()
                 return
 
-            prob = _offer_probability(p, week)
-            import random
-            if random.random() > prob:
-                # [2026-10 버그수정] 이번 구간 일반 오퍼가 없어도 1·52주 입대 카드는 반드시 뜬다 —
-                # 예전엔 여기서 바로 return해서 군팀 카드가 오퍼 확률에 같이 걸렸다.
-                if not _mil_due:
-                    return  # 이번 구간 오퍼 없음
-                self._show_military_only()
-                return
-
+            # [2026-11-16 O-1] 창 확률 게이트(_offer_probability) 폐기 — 오퍼가 생길지는 구단 관심·연결이 정한다.
+            # 관심이 생긴 구단이 없으면 빈 목록 → 아래에서 창 없이 끝난다(입대 카드는 그대로).
             offers = generate_offers()
             if not offers:
                 # [2026-10 병역 7단계] 오퍼가 0건이어도 미필 20세 이상이면 군팀 카드만 있는 창을 띄운다.

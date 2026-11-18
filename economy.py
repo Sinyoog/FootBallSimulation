@@ -32,11 +32,224 @@ GOD_TIER_SALARY_MULT = 1.6
 _ECONOMY_INDEX_MEMO = {}
 
 
+# [실험 v2.1] 실제 축구 경제 지수 — 연봉(5대 리그 연봉 총액)과 이적료(5대 리그 이적 지출)를 분리.
+# 게임 연도 Y = 달력연도 Y(이적 창 1월·여름). 값마다 (지수, 구분): 관측·계산·보간·추정·정규화 기준.
+# 2026 = 정규화 기준(관측 아님). 2027~2040 미래: 연봉 연 2.5%, 이적료 연 1.5%. 2040 이후는 정책 미정 → 2040 값 유지.
+WAGE_INDEX_V21 = {1986: (0.0354, '추정'), 1987: (0.0400, '추정'), 1988: (0.0452, '추정'), 1989: (0.0511, '추정'), 1990: (0.0577, '추정'), 1991: (0.0652, '추정'), 1992: (0.0737, '추정'), 1993: (0.0811, '계산'), 1994: (0.0869, '보간'), 1995: (0.0931, '보간'), 1996: (0.0997, '보간'), 1997: (0.1140, '계산'), 1998: (0.1389, '보간'), 1999: (0.1693, '보간'), 2000: (0.2064, '보간'), 2001: (0.2334, '계산'), 2002: (0.2450, '보간'), 2003: (0.2572, '보간'), 2004: (0.2669, '계산'), 2005: (0.2739, '보간'), 2006: (0.2811, '보간'), 2007: (0.3120, '계산'), 2008: (0.3523, '계산'), 2009: (0.3771, '관측'), 2010: (0.3952, '계산'), 2011: (0.4111, '관측'), 2012: (0.4371, '보간'), 2013: (0.4647, '보간'), 2014: (0.5025, '계산'), 2015: (0.5518, '관측'), 2016: (0.6050, '보간'), 2017: (0.6635, '보간'), 2018: (0.7276, '보간'), 2019: (0.7640, '계산'), 2020: (0.7922, '계산'), 2021: (0.8470, '보간'), 2022: (0.8969, '관측'), 2023: (0.9256, '계산'), 2024: (0.9504, '관측'), 2025: (0.9780, '추정'), 2026: (1.0000, '정규화 기준')}
+FEE_INDEX_V21 = {1986: (0.0128, '추정'), 1987: (0.0143, '추정'), 1988: (0.0160, '추정'), 1989: (0.0179, '추정'), 1990: (0.0201, '추정'), 1991: (0.0225, '추정'), 1992: (0.0252, '추정'), 1993: (0.0282, '추정'), 1994: (0.0316, '계산'), 1995: (0.0412, '보간'), 1996: (0.0563, '보간'), 1997: (0.0768, '보간'), 1998: (0.1048, '보간'), 1999: (0.1311, '계산'), 2000: (0.1514, '보간'), 2001: (0.1730, '보간'), 2002: (0.1354, '보간'), 2003: (0.1355, '보간'), 2004: (0.1555, '보간'), 2005: (0.1586, '계산'), 2006: (0.1897, '보간'), 2007: (0.2424, '보간'), 2008: (0.3098, '보간'), 2009: (0.2716, '보간'), 2010: (0.1948, '관측'), 2011: (0.2949, '관측'), 2012: (0.2469, '관측'), 2013: (0.3429, '관측'), 2014: (0.3668, '관측'), 2015: (0.4864, '관측'), 2016: (0.5348, '관측'), 2017: (0.7659, '관측'), 2018: (0.7334, '관측'), 2019: (0.8364, '관측'), 2020: (0.6344, '보간'), 2021: (0.4811, '계산'), 2022: (0.7831, '관측'), 2023: (0.8690, '계산'), 2024: (0.7705, '추정'), 2025: (0.9852, '계산'), 2026: (1.0000, '정규화 기준')}
+WAGE_FUTURE_GROWTH = 0.025
+FEE_FUTURE_GROWTH = 0.015
+INDEX_POLICY_END_YEAR = 2040
+
+
+def _index_lookup(table, growth, year):
+    y = int(year)
+    if y < 1986:
+        y = 1986
+    if y in table:
+        return table[y][0]
+    y = min(y, INDEX_POLICY_END_YEAR)
+    return table[2026][0] * (1 + growth) ** (y - 2026)
+
+
+def wage_index(year) -> float:
+    """[실험 v2.1] 연봉 시대 배율."""
+    return _index_lookup(WAGE_INDEX_V21, WAGE_FUTURE_GROWTH, year)
+
+
+def fee_index(year) -> float:
+    """[실험 v2.1] 이적 시장(총액) 시대 배율 — 선수별 이적료엔 fee_era_mult로 가격대별 β를 거쳐 적용."""
+    return _index_lookup(FEE_INDEX_V21, FEE_FUTURE_GROWTH, year)
+
+
+FEE_BETA_MID_EOK = 800.0     # 이 값(2026년 기준 가격, 억원) 이하는 β=1.0 — 평균 이적료는 총액과 같은 속도로 성장
+FEE_BETA_TOP_EOK = 2400.0    # 이 값 이상은 β=0.4 — 최고가 거래는 총액 지수의 약 0.4제곱만큼만 움직임
+FEE_BETA_TOP = 0.4
+
+
+def fee_beta(price_2026_eok: float) -> float:
+    """[실험 v2.1] 가격대별 β — 2026년 기준 가격(억원)에 따라 1.0(≤800) → 로그 직선 → 0.4(≥2400).
+    β는 최종 이적료가 아니라 시대 지수에 거는 지수다: 시대 배율 = fee_index(year) ** β."""
+    import math
+    v = float(price_2026_eok or 0)
+    if v <= FEE_BETA_MID_EOK:
+        return 1.0
+    if v >= FEE_BETA_TOP_EOK:
+        return FEE_BETA_TOP
+    t = math.log(v / FEE_BETA_MID_EOK) / math.log(FEE_BETA_TOP_EOK / FEE_BETA_MID_EOK)
+    return 1.0 - t * (1.0 - FEE_BETA_TOP)
+
+
+def fee_era_mult(year, price_2026_eok: float) -> float:
+    if year is None:
+        return 1.0
+    return fee_index(year) ** fee_beta(price_2026_eok)
+
+
+# ───────────────────────── [실험 2차] B-보정: 세계 순위 기반 선수 가치 ─────────────────────────
+# 1~100위: Transfermarkt 시장가치 기준점 6개(관측), 100위 아래: 8개 리그 총액·K리그 1위/50위로 역산한 꼬리(계산).
+# 값은 €m, 게임 내부 환율 €1 = 1,600원(€1m = 16억). GK는 별도 분포(관측 3점 + GK 958명 평균 €2.9m로 역산한 꼬리),
+# 101위 아래 GK는 기존 공식 × 연결 배율 s_gk(소수 OVR 보간으로 연도 간 연속).
+# 적용: 그 구매 구단 기준 기존 2026 가격 × [순위 가치 ÷ 5대 리그 1부 최고 구매가(같은 OVR·포지션)].
+#   → 리그·구매 구단 계수와 나이·계약 계수는 기존 공식 그대로 남고, 최고 구매 구단에서의 값 = 순위 가치.
+# β(시대 배율 지수): 필드 1~10위 0.4, 10~100위 로그 직선, 100위 이하 1.0. GK는 최고 €45m(필드 약 118위 수준)이라 1.0.
+FX_KRW_PER_EUR = 1600
+EOK_PER_EURM = FX_KRW_PER_EUR * 1_000_000 / 100_000_000
+RANK_FIELD_POINTS = [(1, 220.0), (4, 180.0), (10, 130.0), (22, 100.0), (50, 70.0), (100, 50.0),
+                     (300, 25.1274), (1000, 15.9653), (3000, 9.3671), (10000, 1.4677), (30000, 0.2839), (100000, 0.0479)]
+RANK_GK_POINTS = [(1, 45.0), (4, 40.0), (10, 28.0)]
+RANK_GK_TAIL_SLOPE = -0.7425788
+RANK_GK_LINK = 101
+RANK_TABLE = {"key": "unset"}
+RANK_STATS = {"builds": 0, "errors": 0, "no_rating": 0}
+_E_BEST_CACHE = {}
+
+
+def _loglog_points(points, r, tail_slope=None):
+    import math
+    r = max(1.0, float(r))
+    if r <= points[0][0]:
+        return points[0][1]
+    for (r1, v1), (r2, v2) in zip(points, points[1:]):
+        if r <= r2:
+            t = math.log(r / r1) / math.log(r2 / r1)
+            return math.exp(math.log(v1) + t * (math.log(v2) - math.log(v1)))
+    (ra, va), (rb, vb) = points[-2], points[-1]
+    s = tail_slope if tail_slope is not None else math.log(vb / va) / math.log(rb / ra)
+    return vb * (r / rb) ** s
+
+
+def rank_value_eurm(rank, is_gk):
+    if is_gk:
+        return _loglog_points(RANK_GK_POINTS, rank, RANK_GK_TAIL_SLOPE)
+    return _loglog_points(RANK_FIELD_POINTS, rank)
+
+
+def rank_beta(rank, is_gk):
+    import math
+    if is_gk:
+        return 1.0
+    if rank <= 10:
+        return 0.4
+    if rank >= 100:
+        return 1.0
+    return 0.4 + 0.6 * math.log(rank / 10.0) / math.log(10.0)
+
+
+def _big5_buyers():
+    from database import get_conn
+    c = get_conn()
+    try:
+        return [(r[0], r[1], r[2]) for r in c.execute(
+            """SELECT cn.name, cn.grade, t.name FROM teams t JOIN leagues l ON t.league_id=l.id
+               JOIN countries cn ON l.country_id=cn.id
+               WHERE l.tier=1 AND cn.name IN ('잉글랜드','스페인','이탈리아','독일','프랑스')""").fetchall()]
+    finally:
+        c.close()
+
+
+def _e_best(ovr, position, key):
+    k = (key, ovr, position)
+    v = _E_BEST_CACHE.get(k)
+    if v is None:
+        buyers = RANK_TABLE.get("buyers") or []
+        v = max((estimate_transfer_fee(g, 1, ovr, country=cn, team_name=tn, position=position, _raw_2026=True)
+                 for cn, g, tn in buyers), default=0.0)
+        _E_BEST_CACHE[k] = v
+    return v
+
+
+def _build_rank_table(year):
+    import math
+    from database import get_conn
+    c = get_conn()
+    try:
+        try:
+            rows = c.execute("""SELECT p.id, p.ovr, p.position, p.potential_ovr, s.rating FROM ai_players p
+                LEFT JOIN hist.ai_player_season_stats s ON s.player_id=p.id AND s.year=?
+                WHERE p.team_id>0""", ((year or 0) - 1,)).fetchall()
+        except Exception:
+            RANK_STATS["no_rating"] += 1
+            rows = [(r[0], r[1], r[2], r[3], None) for r in c.execute(
+                "SELECT id, ovr, position, potential_ovr FROM ai_players WHERE team_id>0").fetchall()]
+    finally:
+        c.close()
+    T = {"key": year, "rank_of": {}, "block": {}, "above": {}, "buyers": _big5_buyers()}
+    for gk in (False, True):
+        pool = [r for r in rows if (r[2] == "GK") == gk]
+        # 같은 OVR 안 순서: 지난 시즌 평점 → 잠재력 → id
+        pool.sort(key=lambda r: (-(r[1] or 0), -(r[4] or 0.0), -(r[3] or r[1] or 0), r[0]))
+        for i, r in enumerate(pool, 1):
+            T["rank_of"][r[0]] = (i, r[1], gk)
+            b = T["block"].get((gk, r[1]))
+            T["block"][(gk, r[1])] = (i, i) if b is None else (b[0], i)
+        T[("n", gk)] = len(pool)
+        if not gk:
+            # [실험 3차] 포지션 계수 정규화: 세계 상위 2,000명(필드)의 기존 포지션 계수 평균
+            top = pool[:2000]
+            T["pos_pbar"] = (sum(POSITION_MARKET_MULT.get(r[2], 1.0) for r in top) / len(top)) if top else 1.0
+    _E_BEST_CACHE.clear()
+    RANK_TABLE.clear(); RANK_TABLE.update(T)
+    # GK 연결 배율: 101위가 속한 OVR 묶음 안 위치로 소수 OVR → 기존 최고 구매가 로그 보간
+    gk_pool_ovr = sorted(((v[0], v[1]) for v in T["rank_of"].values() if v[2]), key=lambda x: x[0])
+    s_gk = None
+    if len(gk_pool_ovr) >= RANK_GK_LINK:
+        oK = gk_pool_ovr[RANK_GK_LINK - 1][1]
+        first, last = T["block"][(True, oK)]
+        o_eff = oK - 0.5 + (last - RANK_GK_LINK + 0.5) / (last - first + 1)
+        lo = math.floor(o_eff); t = o_eff - lo
+        e_lo = _e_best(lo, "GK", year); e_hi = _e_best(lo + 1, "GK", year) or e_lo
+        if e_lo > 0 and e_hi > 0:
+            e_eff = math.exp(math.log(e_lo) * (1 - t) + math.log(e_hi) * t)
+            s_gk = rank_value_eurm(RANK_GK_LINK, True) * EOK_PER_EURM / e_eff
+    RANK_TABLE["s_gk"] = s_gk
+    RANK_STATS["builds"] += 1
+
+
+def _midrank(gk, ovr):
+    b = RANK_TABLE["block"].get((gk, ovr))
+    if b:
+        return (b[0] + b[1]) / 2.0
+    # 그 OVR이 세계에 없으면 그보다 높은 OVR 인원 + 1위(묶음 맨 위)로 본다
+    above = sum(last - first + 1 for (g, o), (first, last) in RANK_TABLE["block"].items() if g == gk and o > ovr)
+    return above + 1.0
+
+
+def rank_adjust(ovr, position, player_id, year):
+    """{'mult', 'beta', 'rank', 'value_eok'} — 기존 2026 가격에 곱할 순위 배율."""
+    if RANK_TABLE.get("key") != year:
+        _build_rank_table(year)
+    gk = (position == "GK")
+    info = RANK_TABLE["rank_of"].get(player_id) if player_id is not None else None
+    rank = info[0] if (info and info[1] == ovr and info[2] == gk) else _midrank(gk, ovr)
+    if gk and rank > RANK_GK_LINK:
+        s = RANK_TABLE.get("s_gk")
+        if s is None:
+            return None
+        # 연결 지점(101위)과 같은 OVR 묶음의 나머지 선수가 101위 값보다 비싸지지 않게 상한(같은 해 안 연속성).
+        eb = _e_best(ovr, position, year)
+        if eb:
+            s = min(s, rank_value_eurm(RANK_GK_LINK, True) * EOK_PER_EURM / eb)
+        return {"mult": s, "beta": 1.0, "rank": rank, "value_eok": None}
+    eb = _e_best(ovr, position, year)
+    if not eb:
+        return None
+    v = rank_value_eurm(rank, gk) * EOK_PER_EURM
+    if not gk:
+        # [실험 3차] 포지션 계수 복원 — 같은 순위면 기존 포지션 계수 비율만큼 차이(상위 2,000명 평균으로 정규화)
+        v *= POSITION_MARKET_MULT.get(position, 1.0) / (RANK_TABLE.get("pos_pbar") or 1.0)
+    return {"mult": v / eb, "beta": rank_beta(rank, gk), "rank": rank, "value_eok": v}
+
+
+FEE_TRACE = None   # [실험 v2.1] 리스트를 넣으면 estimate_transfer_fee가 산출 경로를 기록한다(실험 계측 전용)
+
+
 def economy_index(year: int) -> float:
+    """[실험 v2.1] 연봉 계열이 쓰는 시대 배율 = wage_index. 이적료는 estimate_transfer_fee가 fee_era_mult를 쓴다."""
     _v = _ECONOMY_INDEX_MEMO.get(year)
     if _v is not None:
         return _v
-    _v = _ECONOMY_INDEX_MEMO[year] = _economy_index_uncached(year)
+    _v = _ECONOMY_INDEX_MEMO[year] = wage_index(year)
     return _v
 
 
@@ -530,7 +743,7 @@ def estimate_transfer_fee(grade, tier, ovr, country=None, team_name=None,
                           position=None, exit_type=None, age=None,
                           talent_cap=None, contract_remaining_years=None,
                           year=None, team_id=None, season=None, debug=False,
-                          form_score=None, effective_ovr=None):
+                          form_score=None, effective_ovr=None, player_id=None, _raw_2026=False):
     """선수 시장가치(이적료 추정치, 천원 단위).
 
     exit_type: [11차 신설] "계약만료"면 진짜 FA — 다른 계수 계산 없이
@@ -598,9 +811,15 @@ def estimate_transfer_fee(grade, tier, ovr, country=None, team_name=None,
         # [2026-08 성능수정] strength_mult는 위에서 이미 구해뒀다 — 그대로
         # 넘겨서 _fee_affordability_cap 내부의 중복 DB 조회를 없앤다
         # (반환값은 기존과 동일).
-        _afford_cap = _fee_affordability_cap(country, tier, team_name, team_id, year,
+        # [실험 v2.1] 상한도 2026년 기준 가격으로(연도 None = 시대 배율 1.0) — 예전엔 그해 연봉(경제지수
+        # 반영)으로 상한을 만든 뒤 마지막에 경제지수를 또 곱해 최상위 거래가 지수 제곱만큼 깎였다.
+        _afford_cap = _fee_affordability_cap(country, tier, team_name, team_id, None,
                                               strength_mult=strength_mult)
+        _pre_cap_2026 = val_eok
         val_eok = _apply_fee_affordability(val_eok, _afford_cap)
+    else:
+        _afford_cap = None
+        _pre_cap_2026 = val_eok
     # [2026-08 신설, 신민용+GPT 검토 확정] 소프트캡을 통과해도 극단적으로
     # 조건이 몰리면(명문+고club_strength+어린나이+큰잠재력+긴계약이 전부
     # 겹치는 등) 여전히 크게 튈 수 있어서, "2026년 기준" 절대 상한을 하나
@@ -617,7 +836,24 @@ def estimate_transfer_fee(grade, tier, ovr, country=None, team_name=None,
     # 전부 2026년 기준이라, 시대감을 살리기 위해 곱한다. 연봉과 동일하게
     # 지수 없이 그대로 적용(2차 검토에서 ^0.8 지수를 시도했으나 2003년
     # 값이 여전히 과하다는 3차 검토를 반영해 1.0으로 통일 — v4 문서 참고).
-    eidx = economy_index(year) if year is not None else 1.0
+    # [실험 v2.1] 시대 배율은 여기서 단 한 번 — 2026년 기준 가격(상한·절대상한·하부 리그 배율까지 반영한
+    # 값)에 fee_index(year) ** β(가격대). 이후 상한을 다시 걸지 않는다.
+    if _raw_2026:
+        return val_eok          # [실험 2차] 순위 보정 전 기존 2026 가격(억) — _e_best 계산용
+    # [실험 2차] B-보정: 세계 순위 가치로 맞춘다(그 구매 구단 기준 가격 × 순위 가치 ÷ 최고 구매가).
+    _rk = None
+    try:
+        _rk = rank_adjust(ovr, position, player_id, year)
+    except Exception:
+        RANK_STATS["errors"] += 1
+    if _rk is not None:
+        val_eok *= _rk["mult"]
+        _beta = _rk["beta"]
+    else:
+        RANK_STATS["errors"] += 1
+        _beta = 1.0
+    _price_2026 = val_eok
+    eidx = (fee_index(year) ** _beta) if year is not None else 1.0
     val_eok *= eidx
 
     final = int(val_eok * 100_000)  # 억원 -> 천원 단위(_calc_salary와 통일)
@@ -647,8 +883,13 @@ def estimate_transfer_fee(grade, tier, ovr, country=None, team_name=None,
     _MIN_FEE_RATIO_OF_SALARY = 1.0
     ref_salary = _calc_salary(grade, tier, ovr, country, team_name, year=year)
     fee_floor = int(ref_salary * _MIN_FEE_RATIO_OF_SALARY)
+    _floored = final < fee_floor
     if final < fee_floor:
         final = fee_floor
+    if FEE_TRACE is not None:
+        FEE_TRACE.append((year, ovr, round(_pre_cap_2026, 3), (round(_afford_cap, 3) if _afford_cap else None),
+                          round(_price_2026, 3), round(_beta, 4), round(eidx, 5), final, int(_floored),
+                          (_rk["rank"] if _rk else None), (round(_rk["mult"], 5) if _rk else None)))
 
     if debug:
         return {"fee": final, "debug": {
@@ -660,6 +901,10 @@ def estimate_transfer_fee(grade, tier, ovr, country=None, team_name=None,
             "effective_ovr": effective_ovr, "form_mult": _fee_form_mult(ovr, effective_ovr),
             "affordability_cap": _fee_affordability_cap(country, tier, team_name, team_id, year, strength_mult=strength_mult) if country and tier else None,
             "capped_mult": capped_mult, "economy_index": eidx,
+            "pre_cap_2026_eok": _pre_cap_2026, "afford_cap_2026_eok": _afford_cap,
+            "price_2026_eok": _price_2026, "beta": _beta, "era_mult": eidx, "floored": _floored,
+            "rank": (_rk["rank"] if _rk else None), "rank_mult": (_rk["mult"] if _rk else None),
+            "rank_value_eok": (_rk["value_eok"] if _rk else None),
         }}
     return final
 
@@ -904,7 +1149,11 @@ def _calc_salary(grade, tier, ovr, country=None, team_name=None, year=None, team
         # 씌워야 한다. 단 캡 값 자체는 2026년 기준 앵커라서 시대 배율
         # (economy_index)만은 캡에도 같이 적용한다 — 안 그러면 2040년대
         # 최상위 구간이 2026년 캡에 통째로 눌려 평평해진다.
-        _final = max(0, int(_apply_prestige(sal) * strength_mult * eidx))
+        # [2026-11-17 확정, 신민용 승인 — 연봉 0 절삭 수정] 경제지수를 곱한 뒤 정수로 바꾸면 하위 리그의 1~2천원 연봉이 0으로 잘렸다(10시즌 원본 3시드 vs 수정 5시드 검증: 절삭 0건, 연봉 0 비율 9.1%→6.6%, AI 거래·연봉 지표 대조군 범위 안). 지수 곱하기 전 값이 양수면 최소 1천원을 남긴다.
+        _pre_idx = _apply_prestige(sal) * strength_mult
+        _final = max(0, int(_pre_idx * eidx))
+        if _final == 0 and _pre_idx > 0:
+            _final = 1
         # [2026-08 신설] god 등급 전용 프리미엄 — 아래 일반 분기와 동일한
         # 로직(_calc_salary docstring의 talent_tier 설명 참고).
         if talent_tier == "god":
@@ -1114,7 +1363,11 @@ def _calc_salary(grade, tier, ovr, country=None, team_name=None, year=None, team
     # 이미 다 통과한 최종값에, god 등급일 때만 추가 프리미엄을 곱한다.
     # my_player가 아니면(talent_tier=None, AI 선수 경로는 이 함수 자체를
     # 안 부름) 전혀 영향 없음 — 완전히 하위호환.
-    _final = max(0, int(_apply_prestige(sal) * strength_mult * eidx))
+    # [2026-11-17 확정, 신민용 승인 — 연봉 0 절삭 수정] 경제지수를 곱한 뒤 정수로 바꾸면 하위 리그의 1~2천원 연봉이 0으로 잘렸다(10시즌 원본 3시드 vs 수정 5시드 검증: 절삭 0건, 연봉 0 비율 9.1%→6.6%, AI 거래·연봉 지표 대조군 범위 안). 지수 곱하기 전 값이 양수면 최소 1천원을 남긴다.
+    _pre_idx = _apply_prestige(sal) * strength_mult
+    _final = max(0, int(_pre_idx * eidx))
+    if _final == 0 and _pre_idx > 0:
+        _final = 1
     if talent_tier == "god":
         _final = int(_final * GOD_TIER_SALARY_MULT)
     # [2026-08 버그수정, 신민용 지적: "연봉 3천억"] 위 커브 분기와 같은

@@ -898,6 +898,13 @@ def choose_national_team(tournament_id, nat):
 
     selected = _check_selection(p, grade, country=nat, continent=nat_continent,
                                 tournament_id=tournament_id)
+    # [2026-11-16 신민용 확정 — 국대 측면 2:2 고정] 이미 확정된 명단의 내 측면 칸 AI가 모두 이 대회에서 뛰었으면
+    # 자리를 비울 수 없어 발탁하지 않는다.
+    if selected and not intl_my_join_ok(tournament_id, nat, p.get("position")):
+        selected = False
+        from game_engine import add_log as _add_log_side
+        _add_log_side(f"⚠ {nat} 대표팀 명단이 이미 확정돼 있고 {p.get('position')} 자리 선수가 모두 이 대회에 출전해, "
+                      f"자리를 비울 수 없어 발탁되지 않았습니다.", "event")
     if not selected and p.get("injured") and _tournament_injury_eval(
             tournament_id, nat, _my_injury_return_day(p))[0] == "exclude":
         from game_engine import add_log as _add_log_inj
@@ -1034,8 +1041,7 @@ def _qual_cutoff_hit(tournament_id, nat):
                 _qcfg2 = EURO_QUAL.get(_tconf2, {})
             else:
                 _qcfg2 = WC_QUAL_BY_TIER[wc_tier(_tyear2 + 1)].get(_tconf2, {})
-            _all_rows2 = sorted(_enrich_countries(_conf_countries(_tconf2), year=_tyear2),
-                                key=lambda r: r["ovr"], reverse=True)
+            _all_rows2 = _rank_rows_by_power(_enrich_countries(_conf_countries(_tconf2), year=_tyear2))
             _cutoff2 = _qcfg2.get("cutoff_bottom", 0)
             _cut_names2 = {r["name"] for r in _all_rows2[len(_all_rows2)-_cutoff2:]}
             return nat in _cut_names2, _trow2
@@ -2736,7 +2742,7 @@ _INTL_SEL_BENCH_RELIEF = 0.35
 # 역할 — formation_logic.compute_squad_roles가 내는 다섯 값 + 핵심.
 # 요구사항의 "에이스/핵심주전/일반주전/로테이션"에 그대로 대응한다.
 _INTL_SEL_ROLE_ADJ = {
-    "핵심": 1.0, "주전": 0.5, "로테이션": 0.0,
+    "핵심": 1.0, "주전": 0.5, "준주전": 0.25, "로테이션": 0.0,     # [2026-11-16] 준주전 = 주전·로테 중간
     "대기": -0.9, "전력외": -1.8,
     # 유망주는 10대 육성 대상이라 출전이 적은 게 정상 — 출전 보정에서
     # 이미 크게 깎이므로 역할로 또 깎지 않는다(이중 감점 방지).
@@ -2787,7 +2793,7 @@ _INTL_POS_STAT_KEY = "__pos_stat__"
 # 소속팀이 그대로인 선수는 예전과 완전히 같다. False면 예전과 100% 동일.
 INTL_SEL_TEAM_CHANGE_FIX = True
 _INTL_SEL_ROLE_PLAY_FALLBACK = {   # ai_lifecycle._ROLE_PLAY_RATIO 평균값(그쪽을 못 읽을 때만)
-    "핵심": 0.90, "주전": 0.80, "로테이션": 0.54, "대기": 0.28, "전력외": 0.09, "유망주": 0.14,
+    "핵심": 0.90, "주전": 0.80, "준주전": 0.67, "로테이션": 0.54, "대기": 0.28, "전력외": 0.09, "유망주": 0.14,
 }
 
 
@@ -2800,7 +2806,7 @@ _INTL_SEL_ROLE_PLAY_FALLBACK = {   # ai_lifecycle._ROLE_PLAY_RATIO 평균값(그
 INTL_SEL_LOW_LEAGUE_STARTER_PRIORITY = True
 INTL_SEL_LOW_LEAGUE_GRADES = ("B", "C", "D", "E", "F")
 INTL_SEL_LOW_LEAGUE_NONSTARTER_PENALTY = 5.0
-_INTL_SEL_NONSTARTER_ROLES = ("로테이션", "대기", "전력외", "유망주")
+_INTL_SEL_NONSTARTER_ROLES = ("준주전", "로테이션", "대기", "전력외", "유망주")   # [2026-11-16] 준주전도 선발 11명 밖
 _intl_low_league_grade_cache: dict = {}
 
 
@@ -3472,7 +3478,8 @@ def _my_selection_metrics_v3(p, pos_stat=None, year=None):
     role = ""
     if play_frac is not None:
         role = ("핵심" if play_frac >= 0.85 else
-                "주전" if play_frac >= 0.68 else
+                "주전" if play_frac >= 0.735 else      # [2026-11-16] 주전·준주전 출전률 중간
+                "준주전" if play_frac >= 0.605 else    # 준주전·로테이션 출전률 중간
                 "로테이션" if play_frac >= 0.42 else
                 "대기" if play_frac >= 0.20 else "전력외")
 
@@ -3634,7 +3641,290 @@ _INTL_CALLUP_BUCKET_OF = {"GK": "GK", "CB": "CB", "LB": "LB", "RB": "RB", "CDM":
 INTL_CALLUP_POOL_PER_BUCKET = 5
 
 
-def _build_intl_squad_by_group(country, quota_by_group=None, candidates_out=None, role_out=None):
+# ── [2026-11-16 신설, 신민용 확정 — 국대 측면 2:2 고정 + 26명 밖 대체] ─────────────────────────────
+# 풀백·윙어 그룹은 그룹 루프(기존 선발 순서·정원 그대로)를 다 돌린 뒤, 마지막에 측면 8칸(LB·RB·LW·RW 각 2칸)만
+# 다시 채운다 — GK·CB·CM·AM·ST 그룹의 선발 결과는 기존과 완전히 같다(윙어 그룹이 ST 그룹보다 먼저 뽑으므로
+# 루프 안에서 바꾸면 ST 그룹까지 달라진다 — 그래서 2단계).
+#   · 칸마다 그 자리 주포 전문 후보 최고 vs 허용 대체 후보 최고를 배치 점수(선발 점수 × 엔진 배치 배율 =
+#     formation_logic._slot_value / OVR — 포지션 거리·반대발·부포 경로 포함)로 비교해, 대체 후보가 1.0점
+#     넘게 높을 때만 대체 후보를 뽑는다. 반대쪽 풀백·윙어는 후보가 아니다(점수와 무관 — 좌우 2:2가 선발
+#     점수보다 우선하는 제약).
+#   · 대체 후보 = 비측면 그룹에 뽑히지 않은(26명 밖) CB(풀백 칸) / ST·CF·CAM·CM(윙 칸). 이미 다른 자리에
+#     뽑힌 선수는 다시 가져오지 않는다.
+#   · 한 칸을 채운 뒤 남은 후보끼리 다시 비교하고, 네 칸 중 고른 선수의 배치 점수가 가장 높은 칸부터 채운다
+#     (CB가 LB·RB 둘 다 되면 더 높은 쪽). 내 선수가 그쪽이면 그 칸 하나는 내가 차지한 것으로 친다.
+#   · 후보 = 포지션별 OVR 상위 _INTL_SEL_SHORTLIST_PER_POS명(선발 지표 계산 대상과 같다). 난수 미소비.
+#   · 정적 비교(5개 시점 × 211개국, C1·C2 위반 0건)와 같은 규칙.
+_INTL_SIDE_SLOTS = {"FB": ("LB", "RB"), "WG": ("LW", "RW")}
+INTL_SIDE_SUBS = {"FB": ("CB",), "WG": ("ST", "CF", "CAM", "CM")}
+INTL_SIDE_SUB_MARGIN = 1.0
+INTL_SIDE_PER_SLOT = 2
+_INTL_SIDE_GROUP_OF = {s: g for g, ss in _INTL_SIDE_SLOTS.items() for s in ss}
+# 측면 칸을 다시 채울 때(예선 승계 보충·소집 해제 대체)의 후보군(intl_callup_pool) 버킷 — 같은 쪽 전문 버킷이
+# 비었을 때만 대체 버킷. 반대쪽·다른 측면 버킷은 쓰지 않는다.
+_INTL_SIDE_REFILL_SUB_BUCKETS = {"FB": ("CB",), "WG": ("ST", "AM", "CM")}
+INTL_SIDE_STATS = {"fail": 0}   # 측면 칸을 규칙으로 못 채운 횟수(계측 전용 — 정적 비교에선 0)
+
+
+def _intl_side_place(d, slot, base):
+    """배치 점수 = 선발 점수 × (그 칸 엔진 유효값 / OVR). 반환 (배치 점수, 배율)."""
+    o = d.get("ovr") or 0
+    if o <= 0:
+        return 0.0, 0.0
+    from formation_logic import _slot_value
+    m = _slot_value(d, slot) / o
+    return base * m, m
+
+
+def _intl_side_fill(grp, cands, blocked_ids, open_slots):
+    """측면 칸 채우기. cands = [(선발 점수, 선수 사본)], open_slots = {칸: 남은 수}.
+    반환 (rows, 실패 칸 또는 None) — rows = [(칸, 선수, 배치 점수, 배율, 대체 여부)] (채운 순서)."""
+    left, right = _INTL_SIDE_SLOTS[grp]
+    subs_pos = INTL_SIDE_SUBS[grp]
+    open_ = {left: open_slots.get(left, 0), right: open_slots.get(right, 0)}
+    used = set(blocked_ids)
+    out = []
+    while any(v > 0 for v in open_.values()):
+        best = None
+        for side, k in open_.items():
+            if k <= 0:
+                continue
+            bs = bu = None
+            for b, d in cands:
+                if d["id"] in used:
+                    continue
+                pos = d.get("position")
+                if pos == side:
+                    ps, m = _intl_side_place(d, side, b)
+                    if bs is None or (ps, -d["id"]) > (bs[0], -bs[2]["id"]):
+                        bs = (ps, m, d)
+                elif pos in subs_pos:
+                    ps, m = _intl_side_place(d, side, b)
+                    if bu is None or (ps, -d["id"]) > (bu[0], -bu[2]["id"]):
+                        bu = (ps, m, d)
+            if bs is None and bu is None:
+                return out, side
+            if bu is not None and (bs is None or bu[0] > bs[0] + INTL_SIDE_SUB_MARGIN):
+                ch = (side, bu[2], bu[0], bu[1], True)
+            else:
+                ch = (side, bs[2], bs[0], bs[1], False)
+            if best is None or (ch[2], -ch[1]["id"]) > (best[2], -best[1]["id"]):
+                best = ch
+        out.append(best)
+        used.add(best[1]["id"])
+        open_[best[0]] -= 1
+    return out, None
+
+
+def _intl_rebuild_side_groups(country, quota_by_group, my_side, grp_picks, nat_by_pos, metrics, role_rows):
+    """_build_intl_squad_by_group 2단계 — 측면 그룹(FB/WG) 선발을 버리고 측면 칸을 다시 채운다.
+    grp_picks = {그룹: [기존 선발 선수]}. 반환 ({그룹: [선수(원본 dict), 채운 순서]}, {선수 id: 배치 점수}) 또는
+    None(측면 그룹 정원이 없음). role_rows(리스트)를 넘기면 측면 카드 후보 라인 행을 쌓는다(표시 전용)."""
+    from database import get_player_total_intl_appearances
+    import sub_positions as _subp
+    side_grps = [g for g in quota_by_group if g in _INTL_SIDE_SLOTS and (quota_by_group.get(g) or 0) > 0]
+    if not side_grps:
+        return None
+    blocked = {c["id"] for g, lst in grp_picks.items() if g not in _INTL_SIDE_SLOTS for c in lst}
+    need = set()
+    for g in side_grps:
+        need |= set(_INTL_SIDE_SLOTS[g]) | set(INTL_SIDE_SUBS[g])
+    orig, pool = {}, []
+    for pos in sorted(need):
+        for x in sorted(nat_by_pos.get(pos, ()), key=lambda x: -(x["ovr"] or 0))[:_INTL_SEL_SHORTLIST_PER_POS]:
+            if x["id"] not in orig:
+                orig[x["id"]] = x
+                pool.append(dict(x))
+    for g in side_grps:     # 기존 측면 선발(숏리스트 밖에서 뽑힌 경우 포함)도 후보
+        for x in grp_picks.get(g, ()):
+            if x["id"] not in orig:
+                orig[x["id"]] = x
+                pool.append(dict(x))
+    apps = get_player_total_intl_appearances([d["id"] for d in pool])
+    _subp.attach(pool)
+    cands = [((intl_selection_score_v3(d, metrics.get(d["id"]), apps.get(d["id"], 0), nat=country)
+               - _intl_low_league_nonstarter_penalty(d, metrics.get(d["id"]))), d) for d in pool]
+    new, place, filled = {}, {}, {}
+    used = set(blocked)
+    for g in side_grps:
+        left, right = _INTL_SIDE_SLOTS[g]
+        open_slots = {left: INTL_SIDE_PER_SLOT, right: INTL_SIDE_PER_SLOT}
+        if my_side in open_slots:
+            open_slots[my_side] -= 1
+        rows, err = _intl_side_fill(g, cands, used, open_slots)
+        if err:
+            INTL_SIDE_STATS["fail"] += 1
+        filled[g] = rows
+        new[g] = [orig[r[1]["id"]] for r in rows]
+        for r in rows:
+            used.add(r[1]["id"])
+            place[r[1]["id"]] = r[2]
+    if role_rows is not None:
+        for g in side_grps:
+            subs_pos = INTL_SIDE_SUBS[g]
+            # 안 뽑힌 후보는 배치 점수가 더 높은 칸 카드 하나에만 넣는다(후보 라인 표의 키가 그룹+선수라서 —
+            # CB가 LB·RB 둘 다 후보면 한 칸에만).
+            _best_card = {}
+            for side in _INTL_SIDE_SLOTS[g]:
+                for b, d in cands:
+                    if d["id"] in used or not (d.get("position") == side or d.get("position") in subs_pos):
+                        continue
+                    ps, m = _intl_side_place(d, side, b)
+                    if d["id"] not in _best_card or ps > _best_card[d["id"]][0]:
+                        _best_card[d["id"]] = (ps, side)
+            for side in _INTL_SIDE_SLOTS[g]:
+                rk = 0
+                for slot, d, ps, m, is_sub in filled[g]:
+                    if slot != side:
+                        continue
+                    rk += 1
+                    role_rows.append({"grp": g, "card": side, "quota": INTL_SIDE_PER_SLOT, "rank": rk,
+                                      "id": d["id"], "score": ps, "position": d.get("position") or "",
+                                      "fit": m, "picked": True, "via": "side_sub" if is_sub else "side"})
+                cut = []
+                for b, d in cands:
+                    if d["id"] in used or not (d.get("position") == side or d.get("position") in subs_pos):
+                        continue
+                    if _best_card[d["id"]][1] != side:
+                        continue
+                    ps, m = _intl_side_place(d, side, b)
+                    cut.append((ps, m, d))
+                cut.sort(key=lambda t: (-t[0], t[2]["id"]))
+                for ps, m, d in cut[:INTL_CALLUP_POOL_PER_BUCKET]:
+                    rk += 1
+                    role_rows.append({"grp": g, "card": side, "quota": INTL_SIDE_PER_SLOT, "rank": rk,
+                                      "id": d["id"], "score": ps, "position": d.get("position") or "",
+                                      "fit": m, "picked": False,
+                                      "via": "side" if d.get("position") == side else "side_sub"})
+    return new, place
+
+
+def intl_side_refill_tiers(slot):
+    """측면 칸(slot) 하나를 후보군(intl_callup_pool)에서 다시 채울 때의 버킷 순서 — [[같은 쪽 전문], [대체]].
+    측면 칸이 아니면 None."""
+    g = _INTL_SIDE_GROUP_OF.get(slot or "")
+    if not g:
+        return None
+    return [[_INTL_CALLUP_BUCKET_OF[slot]], list(_INTL_SIDE_REFILL_SUB_BUCKETS[g])]
+
+
+INTL_SIDE_BUCKETS = ("LB", "RB", "LW", "RW")
+
+
+def intl_pick_refill(cands, slot, my_bucket=None, n=1):
+    """후보군 행(dict: player_id, bucket, rank, score — 이미 명단에 있는 선수는 미리 빼서 넘긴다)에서 n명을 고른다.
+    slot이 측면 칸이면 같은 쪽 전문 버킷 → (그게 비었을 때만) 대체 버킷 순. 아니면 측면 버킷을 빼고 예전 순서
+    (my_bucket 우선, 순위 오름차순, 점수 내림차순). 반환 player_id 목록."""
+    tiers = intl_side_refill_tiers(slot)
+    key = lambda r: (r["rank"], -(r["score"] or 0))
+    if tiers:
+        for t in tiers:
+            got = sorted([r for r in cands if r["bucket"] in t], key=key)
+            if got:
+                return [r["player_id"] for r in got[:n]]
+        return []
+    got = sorted([r for r in cands if r["bucket"] not in INTL_SIDE_BUCKETS],
+                 key=lambda r: (r["bucket"] != (my_bucket or ""), r["rank"], -(r["score"] or 0)))
+    return [r["player_id"] for r in got[:n]]
+
+
+def intl_inherit_side_cards(conn, src_tid, country, players):
+    """예선 명단 승계 — 측면 칸 배정 {선수 id: 칸}. 원 대회 후보 라인(측면 카드, 뽑힘)에서 읽고, 기록이 없으면
+    (구세이브) 주포가 LB·RB·LW·RW인 선수를 그 칸으로 본다."""
+    cards = {}
+    try:
+        for r in conn.execute(
+                "SELECT player_id, card FROM intl_callup_role_pool WHERE tournament_id=? AND country=? "
+                "AND picked=1 AND grp IN ('FB','WG') AND card IN ('LB','RB','LW','RW')",
+                (src_tid, country)).fetchall():
+            cards[r[0]] = r[1]
+    except Exception:
+        cards = {}
+    ids = {p["id"] for p in players}
+    cards = {k: v for k, v in cards.items() if k in ids}
+    if not cards:
+        cards = {p["id"]: p["position"] for p in players if (p.get("position") or "") in INTL_SIDE_BUCKETS}
+    return cards
+
+
+def intl_inherit_trim(picked, side_cards, my_pos, target):
+    """예선 명단 승계 + 본선에 내가 새로 들어옴 — 명단을 target명으로 줄인다. 각 측면 칸 정원(2, 내가 그쪽이면 1)을
+    넘는 쪽에서 OVR 최하위부터, 그래도 많으면 측면 칸이 아닌 선수 중 OVR 최하위부터 뺀다. 순서는 예전과 같이
+    (OVR, −나이) 오름차순. 반환 (남은 명단, 뺀 선수 id 목록)."""
+    keyf = lambda r: ((r["ovr"] or 0), -(r["age"] or 0))
+    picked = sorted(picked, key=keyf)
+    cap = {s: INTL_SIDE_PER_SLOT for s in INTL_SIDE_BUCKETS}
+    if my_pos in cap:
+        cap[my_pos] -= 1
+    drop = []
+    for s in INTL_SIDE_BUCKETS:
+        holders = [r for r in picked if side_cards.get(r["id"]) == s and r["id"] not in drop]
+        while len(picked) - len(drop) > target and len(holders) > cap[s]:
+            drop.append(holders.pop(0)["id"])
+    rest = [r for r in picked if r["id"] not in drop and r["id"] not in side_cards]
+    while len(picked) - len(drop) > target and rest:
+        drop.append(rest.pop(0)["id"])
+    return [r for r in picked if r["id"] not in drop], drop
+
+
+def intl_my_join_drops(result, side_cards, my_pos, target):
+    """이미 확정된 이 대회 명단에 내가 나중에 발탁될 때 뺄 AI(아직 이 대회에서 안 뛴 선수만, OVR 최하위부터).
+    ① 내 자리가 측면 칸이면 그 칸 AI가 1명 남을 때까지 그 칸에서 뺀다(총원과 무관 — 좌우 칸 정원 우선).
+    ② 그래도 target명보다 많으면 측면 칸이 아닌 AI에서 뺀다(측면 칸은 건드리지 않는다).
+    반환 (뺄 선수 id 목록, 내 칸 정원을 맞출 수 있는가)."""
+    keyf = lambda r: ((r["ovr"] or 0), -(r["age"] or 0))
+    rs = sorted(result, key=keyf)
+    drop = []
+    if my_pos in INTL_SIDE_BUCKETS:
+        holders = [r for r in rs if side_cards.get(r["id"]) == my_pos]
+        need = len(holders) - (INTL_SIDE_PER_SLOT - 1)
+        free = [r for r in holders if not r.get("appearances")]
+        if need > len(free):
+            return [], False        # 발탁 자체를 하지 않는 경우(intl_my_join_ok) — 아무도 빼지 않는다
+        drop += [r["id"] for r in free[:max(0, need)]]
+    rest = [r for r in rs if r["id"] not in side_cards and not r.get("appearances")]
+    while len(rs) - len(drop) > target and rest:
+        drop.append(rest.pop(0)["id"])
+    return drop, True
+
+
+def intl_my_join_ok(tournament_id, country, my_pos):
+    """[2026-11-16 신민용 확정] 이 대회 명단이 이미 확정돼 있고 내 자리가 측면 칸인데, 그 칸 AI가 모두 이미 이 대회에서
+    뛰어 자리를 비울 수 없으면 발탁하지 않는다(False) — 출전 기록이 있는 선수를 빼지 않고, 다른 칸·비측면 선수를 빼서
+    좌우 칸 정원을 깨지도 않는다. 명단이 아직 없거나 측면 칸이 아니면 True."""
+    if my_pos not in INTL_SIDE_BUCKETS:
+        return True
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT s.player_id AS id, s.appearances, ap.position, ap.ovr, ap.age FROM intl_squad s "
+            "JOIN ai_players ap ON ap.id = s.player_id WHERE s.tournament_id=? AND s.country=?",
+            (tournament_id, country)).fetchall()
+        if not rows:
+            return True
+        result = [dict(r) for r in rows]
+        sc = intl_inherit_side_cards(conn, tournament_id, country, result)
+    finally:
+        conn.close()
+    from constants import INTL_SQUAD_TOTAL
+    return intl_my_join_drops(result, sc, my_pos, INTL_SQUAD_TOTAL - 1)[1]
+
+
+def intl_inherit_vacancies(picked, side_cards, my_pos):
+    """승계 명단의 빈 측면 칸 목록(칸 이름을 빈 수만큼) — 각 칸 정원 2, 내가 그쪽이면 1."""
+    cap = {s: INTL_SIDE_PER_SLOT for s in INTL_SIDE_BUCKETS}
+    if my_pos in cap:
+        cap[my_pos] -= 1
+    ids = {r["id"] for r in picked}
+    out = []
+    for s in INTL_SIDE_BUCKETS:
+        have = sum(1 for pid, c in side_cards.items() if c == s and pid in ids)
+        out.extend([s] * max(0, cap[s] - have))
+    return out
+
+
+def _build_intl_squad_by_group(country, quota_by_group=None, candidates_out=None, role_out=None,
+                               my_side=None):
     """[2026-09 신설, 신민용+advisor 확정] database.get_country_squad_
     by_group이 하던 "그룹별 SQL ORDER BY(순수 OVR-나이 intl_score) LIMIT"을
     대체 — 그룹별 진짜 국적자 후보 전원을 가져와(database.
@@ -3653,7 +3943,9 @@ def _build_intl_squad_by_group(country, quota_by_group=None, candidates_out=None
     아주 크지 않은 한 핵심 포지션 후보가 자연히 이긴다 — 예: ST 95
     (적합도 0.45)가 RW 88(적합도 1.00) 자리를 차지하려면 기본 선발점수
     차이가 적합도 격차(0.55배)를 뒤집을 만큼 압도적이어야 한다(기본값은
-    반대 — 핵심 포지션이 이긴다)."""
+    반대 — 핵심 포지션이 이긴다).
+    [2026-11-16 신설] 풀백·윙어 그룹은 루프가 끝난 뒤 측면 8칸으로 다시 채운다(_intl_rebuild_side_groups —
+    위 "국대 측면 2:2 고정" 주석). my_side = 내 선수가 차지한 측면 칸(LB/RB/LW/RW, 아니면 None)."""
     from constants import (INTL_POSITION_GROUPS, INTL_GROUP_FIT, INTL_SQUAD_GROUP_QUOTA,
                            INTL_POSITION_TO_GROUP, INTL_GROUP_SIDES)
     from database import get_country_nationals_by_position, get_player_total_intl_appearances
@@ -3686,6 +3978,7 @@ def _build_intl_squad_by_group(country, quota_by_group=None, candidates_out=None
     # [2026-10 신설 — 대표팀 후보군] candidates_out(리스트)을 넘기면 그룹 숏리스트에서
     # 실제로 선발 점수를 받은 선수의 최고 점수를 모아 둔다(선발 결과·난수 불변).
     _cand_best = {} if candidates_out is not None else None
+    _grp_picks = {}     # [2026-11-16] 그룹별 선발(측면 재구성 전)
     for grp, n in quota_by_group.items():
         if n <= 0:
             continue
@@ -3773,6 +4066,7 @@ def _build_intl_squad_by_group(country, quota_by_group=None, candidates_out=None
         for c in _take[:n]:
             picked.append(c)
             used_ids.add(c["id"])
+        _grp_picks[grp] = list(_take[:n])
         if _role_groups is not None:
             _role_groups.append((grp, n, scored, [c["id"] for c in _take[:n]]))
 
@@ -3789,6 +4083,27 @@ def _build_intl_squad_by_group(country, quota_by_group=None, candidates_out=None
     # 뒤라 포지션 적합도 배율은 적용하지 않는다(포지션이 조금 겹치더라도
     # 26명을 채우는 쪽이 우선). 그래도 그 나라 전체 국적자가 26명이 안
     # 되면(극단적으로 작은 나라) 있는 만큼만 뽑힌다 — 그 경우는 정상.
+    # [2026-11-16 신설] 2단계 — 측면 8칸 재구성. 비측면 그룹 선발은 그대로, 명단 순서도 그룹 순서 그대로.
+    _side_rows = [] if _role_groups is not None else None
+    _side = _intl_rebuild_side_groups(country, quota_by_group, my_side, _grp_picks, _nat_by_pos, _metrics,
+                                      _side_rows)
+    if _side is not None:
+        _side_new, _side_place = _side
+        picked = []
+        for grp in quota_by_group:
+            if grp in _side_new:
+                picked.extend(_side_new[grp])
+            else:
+                picked.extend(_grp_picks.get(grp, ()))
+        used_ids = {c["id"] for c in picked}
+        if _role_groups is not None:
+            _role_groups = [rg for rg in _role_groups if rg[0] not in _side_new]
+        if _cand_best is not None:
+            for _c in picked:
+                _ps = _side_place.get(_c["id"])
+                if _ps is not None and (_c["id"] not in _cand_best or _ps > _cand_best[_c["id"]][0]):
+                    _cand_best[_c["id"]] = (_ps, _c)
+
     target_total = sum(quota_by_group.values())
     shortfall = target_total - len(picked)
     _role_backfill = []
@@ -3814,6 +4129,8 @@ def _build_intl_squad_by_group(country, quota_by_group=None, candidates_out=None
                     _role_backfill.append(c)
     if _role_groups is not None:
         _intl_collect_role_pool(_role_groups, _role_backfill, used_ids, role_out)
+        if _side_rows:
+            role_out.extend(_side_rows)
     if _cand_best is not None:
         # [2026-10 개정, 신민용 요청: "후보 라인에서 뽑힌 선수는 이름만 금색"] 그룹마다
         # 최종 명단에 든 선수 전원 + 빠진 선수 점수 상위 INTL_CALLUP_POOL_PER_BUCKET명을
@@ -4087,7 +4404,7 @@ def _injury_replacement_callup(conn, tournament_id, nat, my_position):
         return None
     bucket = _INTL_CALLUP_BUCKET_OF.get(my_position or "")
     cands = conn.execute(
-        """SELECT cp.player_id, cp.bucket, cp.rank, ap.name, ap.position, ap.ovr
+        """SELECT cp.player_id, cp.bucket, cp.rank, cp.score, ap.name, ap.position, ap.ovr
            FROM intl_callup_pool cp JOIN ai_players ap ON ap.id = cp.player_id
            WHERE cp.tournament_id=? AND cp.country=?
              AND cp.player_id NOT IN (SELECT player_id FROM intl_squad WHERE tournament_id=? AND country=?)
@@ -4095,12 +4412,29 @@ def _injury_replacement_callup(conn, tournament_id, nat, my_position):
         (tournament_id, nat, tournament_id, nat, bucket or "")).fetchall()
     if not cands:
         return None
-    r = dict(cands[0])
+    # [2026-11-16] 내 자리가 측면 칸이면 같은 쪽 전문 → (없을 때만) 대체 버킷, 아니면 측면 버킷 제외(좌우 2:2 유지).
+    _c_rows = [dict(r) for r in cands]
+    _pick = intl_pick_refill(_c_rows, my_position, my_bucket=bucket, n=1)
+    if not _pick:
+        return None
+    r = next(x for x in _c_rows if x["player_id"] == _pick[0])
     conn.execute("INSERT OR IGNORE INTO intl_squad(tournament_id, country, player_id, appearances, position) "
                  "VALUES (?,?,?,0,?)", (tournament_id, nat, r["player_id"], r["position"] or ""))
     # 후보군 표에서는 뺀다 — 이제 "후보 탈락"이 아니라 최종 명단이다.
     conn.execute("DELETE FROM intl_callup_pool WHERE tournament_id=? AND country=? AND player_id=?",
                  (tournament_id, nat, r["player_id"]))
+    # [2026-11-16] 측면 칸을 채웠으면 후보 라인 그 칸 카드에도 남긴다(표시·검증용).
+    if my_position in INTL_SIDE_BUCKETS:
+        try:
+            conn.execute(
+                "INSERT INTO intl_callup_role_pool(tournament_id, country, grp, quota, rank, player_id, "
+                "score, position, fit, picked, via, card) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(tournament_id, country, grp, player_id) DO UPDATE SET picked=1, via=excluded.via, "
+                "card=excluded.card, quota=excluded.quota",
+                (tournament_id, nat, _INTL_SIDE_GROUP_OF[my_position], INTL_SIDE_PER_SLOT, 99, r["player_id"],
+                 0.0, r.get("position") or "", None, 1, "injury_fill", my_position))
+        except Exception:
+            pass
     return r
 
 
@@ -4699,6 +5033,23 @@ def _enrich_countries(rows, year=None):
     return rows
 
 
+def _rank_rows_by_power(rows):
+    """[2026-11 신설, 신민용 확정: "국제대회 참가국은 대륙별 국가 파워랭킹 순서대로"] 예선 컷오프용
+    정렬 — 국가 파워랭킹 레이팅(레이어A+B, 연말 갱신값) 내림차순. 레이팅이 전 세계 공통 척도라
+    통합 연맹(아시아+오세아니아, 남미+북미)도 대륙별 순위를 따로 매기지 않고 세계 순위 순서 그대로
+    한 줄로 선다(예: 호주 세계 36위·대한민국 세계 45위면 호주가 위). 동점이면 기존 순서(OVR 정렬 전
+    입력 순서) 유지. 각 행에 "power_rating"을 남긴다(디버그용)."""
+    from power_ranking import country_selection_ratings
+    conn = get_conn()
+    try:
+        pr = country_selection_ratings(conn, [r.get("name", "") for r in rows])
+    finally:
+        conn.close()
+    for r in rows:
+        r["power_rating"] = pr.get(r.get("name", ""), 0.0)
+    return sorted(rows, key=lambda r: r["power_rating"], reverse=True)
+
+
 def _apply_my_ovr_to_qual_rows(rows, p, my_nats, nat_info):
     """[2026-08 신설, 신민용 요청: "내가 국대로 뽑혔을 때는 내 OVR도
     예선 컷오프 기준 국가 OVR 계산에 반영되게 해달라"] _enrich_countries는
@@ -4822,8 +5173,9 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
     # [2026-08 신설] 내가 후보국 대표팀에 뽑힐 실력이면 그 나라 OVR에도 반영
     _apply_my_ovr_to_qual_rows(all_rows, p, my_nats, nat_info)
 
-    # FIFA 랭크(ovr) 기준 정렬
-    all_rows.sort(key=lambda r: r["ovr"], reverse=True)
+    # [2026-11 변경, 신민용 확정] 예선 참가 자격(하위 컷오프)은 스쿼드 OVR이 아니라 국가 파워랭킹
+    # 순서로 정한다(_rank_rows_by_power). ovr은 그대로 경기 전력·조 편성 포트에만 쓴다.
+    all_rows = _rank_rows_by_power(all_rows)
 
     # ─── 1차 예선 컷오프: 실제 경기 없이 하위국 제외 ───
     # 하위국은 조별리그 진출 실패로 성적에만 기록 (대륙컵 예선 미참가 방식과 동일)
@@ -5017,6 +5369,18 @@ def _create_qual_tournament(year, qual_kind, continent, p, my_nats, nat_info, co
                            1 if is_my_match else 0, 0))
 
     conn.commit(); conn.close()
+
+    # [2026-11 국가대표 평가 v2] 참가국·조가 확정되고 경기는 0개인 지금 예선 목표를 굳힌다(national_eval).
+    try:
+        import national_eval as _nev
+        if _nev.enabled():
+            _cq = get_conn()
+            try:
+                _nev.fix_qual_objectives(_cq, tid)
+            finally:
+                _cq.close()
+    except Exception as _e:
+        print(f"[NAT-V2] 예선 목표 고정 실패: {_e}")
 
     # 플레이오프 주차(25주차) 레코드는 _finalize_qual이 조별 완료 시 생성
     # (qual_cfg["po_teams"] > 0 인 체제에서만)
@@ -6846,7 +7210,7 @@ def simulate_my_match(week, p, day=None):
     # [2026-07 신설] '소심함' 성격의 big_match_rating 연결 — 국가대표 경기는
     # 전부 빅매치 성격이라(챔스와 동일 기준) 모든 경기에 적용한다.
     if not (_suspended or _benched) and "big_match_rating" in _pe:
-        rating = max(3.0, min(10.0, round(rating + _pe["big_match_rating"], 1)))
+        rating = max(min(4.0, rating), min(10.0, round(rating + _pe["big_match_rating"], 1)))   # 이미 4.0 아래(퇴장)면 끌어올리지 않음
 
     # [2026-08 신설, 신민용 요청] champions_engine과 동일한 "나" 슬롯
     # 바꿔치기 — 26인 소집 명단엔 "나"가 없으므로(따로 my_player 관리)

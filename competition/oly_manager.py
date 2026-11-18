@@ -348,6 +348,27 @@ def _olympic_results(conn, year, salt_stats):
             q_ovr[r[0]] = float(r[1] or 0.0)
             q_conf[r[0]] = q["continent"] or ""
             q_tid[r[0]] = int(q["id"])
+    # [2026-11 국가대표 평가 v2] 켜져 있으면 예선 탈락국은 예선 단계 목표(national_eval)로 평가한다.
+    import national_eval as _nev
+    if q_ovr and _nev.enabled():
+        _ranks = _nev.u23_absent_ranks(conn, year)
+        _world = sorted(q_ovr, key=lambda cn: (-q_ovr[cn], cn))
+        _wr = {cn: i for i, cn in enumerate(_world, 1)}
+        _cids = {r[1]: int(r[0]) for r in conn.execute("SELECT id, name FROM countries")}
+        _ins = []
+        for cn in sorted(q_ovr):
+            if cn in objs or cn not in _ranks:
+                continue
+            oname, orank, rrank = _ranks[cn]
+            orank, rrank = int(round(orank)), int(round(rrank))
+            out[cn] = (oname, orank, "예선탈락", rrank, _wr[cn] / float(len(_world)))
+            _ins.append((q_tid[cn], int(year), cn, _cids.get(cn, 0), q_ovr[cn], _wr[cn], oname, orank,
+                         "예선탈락", rrank, manager_for_tournament(q_tid[cn], cn, conn)))
+        conn.executemany(
+            """INSERT OR REPLACE INTO oly_objectives(tournament_id, year, country, country_id,
+                   squad_ovr, field_rank, objective, objective_rank, result, result_rank, manager_id)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""", _ins)
+        return out
     if q_ovr:
         main_stages = {r[0] for r in conn.execute(
             "SELECT DISTINCT stage FROM intl_matches WHERE tournament_id=?", (tid,))} or _default_stages()

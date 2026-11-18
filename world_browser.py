@@ -2188,6 +2188,16 @@ def get_ai_player_career_history(player_id, current_team_id, retirement_year=Non
                 _assign_salary_fields(_half_e, from_tid, y,
                                        is_loan_default=False,
                                        strict_before=bool(y in mid_by_year))
+                # [2026-11-17 버그수정, 신민용 리포트: "2003년 레알 임대(2년) → 2005년 레알 완전 이적, 2005년에
+                # 역할이 바뀌어 두 줄로 나뉘었는데 상반기 줄이 '레알 마드리드 (임대)'로 뜨고 이적·연봉·이적료·계약이
+                # 위(하반기) 줄에도 찍힌다"] 역할만 바뀐 해(팀 그대로)는 두 줄이 같은 계약을 공유한다 —
+                # ① UI가 이 줄의 임대 여부를 "그 해에 끝나는 구간"(겨울 이적용)이 아니라 "그 해를 포함하는 구간"으로
+                # 보도록 표시한다(같은 팀의 직전 임대 구간이 잡히던 원인). ② 이 해에 발효된 계약(오프시즌 이적·재계약)은
+                # 시즌 시작부터의 이야기라 아래(상반기) 줄에만 한 번 보여주고 위(하반기) 줄에서는 뺀다.
+                if y not in mid_by_year:
+                    _half_e["_half_same_team"] = True
+                    if _half_e.get("salary_is_first_year") and e.get("salary_is_first_year"):
+                        e["salary_is_first_year"] = False
                 # [2026-09 신설, 신민용 요청: "챔스/유로파/컨퍼런스는
                 # 상반기에 끝나니까 상반기 줄에 기록돼야 한다 — 3부/4부
                 # 컵대회는 하반기에 하니 하반기가 맞고, 전체 국내컵(1·2부)
@@ -2389,6 +2399,7 @@ def _half_season_league_entry(conn, team_id, year, half_position=None, half_role
     # 핵심 선수의 반기 배분이 오히려 가장 불리해진다. 실제 출전률 비
     # (핵심 0.90 : 주전 0.80)를 주전 가중치에 곱한 값으로 둔다.
     _ROLE_WEIGHT["핵심"] = round(_ROLE_WEIGHT.get("주전", 40) * 0.90 / 0.80)
+    _ROLE_WEIGHT["준주전"] = round(_ROLE_WEIGHT.get("주전", 40) * 0.67 / 0.80)   # [2026-11-16] 같은 출전률 비 방식
     _DEFAULT_ROLE_WEIGHT = _ROLE_WEIGHT.get("대기", 25)  # 역할 정보가 없을 때(과거 데이터 공백 등) 중간값 폴백
     trow = conn.execute("SELECT name FROM teams WHERE id=?", (team_id,)).fetchone()
     entry = {"year": year, "league": None, "cup": None, "cl": None, "cwc": None, "sc": None,
@@ -10305,6 +10316,12 @@ def get_manager_career(manager_id):
                 except Exception:
                     _cur_amb = ""
                 _amb_by_year[cur_year] = (_cur_amb, "live" if _cur_amb else "first")
+            # [2026-11 구단 목표 2단계, 신민용 요청] 그 해 클럽 대항전 목표 — 기록 없으면 "--".
+            try:
+                import club_goals as _cg_wb
+                _cont_by_year = _cg_wb.cont_goal_texts(conn, t["team_id"], years)
+            except Exception:
+                _cont_by_year = {}
             for y in years:
                 e = hist.get(y, {})
                 notes = []
@@ -10336,6 +10353,7 @@ def get_manager_career(manager_id):
                     "contract_pay": _pay.get(y),
                     # [2026-11-15] (목표 문구, basis) — basis: start/derived/live/first. 기록 없으면 None.
                     "club_objective": _amb_by_year.get(y),
+                    "club_cont_objective": _cont_by_year.get(y, "--"),   # [2026-11] 클럽 대항전 목표
                     # 이 해에 끝난 재임의 마지막 줄 — 같은 해 시즌 후 부임한 대표팀 줄보다 아래로.
                     "ended_this_year": t["end_year"] is not None and y == t["end_year"],
                 })
@@ -10617,7 +10635,8 @@ def get_world_population_stats(conn=None):
 
 
 # [2026-10-31 신설, 신민용 요청: "포메이션 4-3-1-2 글 우측에 GK 몇 명, DF 전체 몇 명·세부 몇 명, MF 전체·세부,
-# FW 전체·세부를 표시 — 각 팀 그 해 상반기·하반기마다 다르게"] 그 반기 명단(주전+후보) 등록 포지션 집계.
+# FW 전체·세부를 표시 — 각 팀 그 해 상반기·하반기마다 다르게"] 그 반기 명단(주전+후보) 당시 포지션 집계
+# ([2026-11] 등록 포지션 → 당시 포지션: 주전 = 배치 칸, 후보 = 팀이 요구한 자리).
 # 줄 구분은 명단 정렬·판매 보호와 같은 formation_logic._pos_category(GK/DEF/MID/ATK — LW·RW는 FW 줄).
 _LINEUP_BREAKDOWN_ORDER = {"GK": ("GK",), "DF": ("CB", "LB", "RB", "LWB", "RWB"),
                            "MF": ("CDM", "CM", "CAM", "LM", "RM"), "FW": ("LW", "RW", "ST", "CF")}
@@ -10625,9 +10644,10 @@ _LINEUP_BREAKDOWN_ORDER = {"GK": ("GK",), "DF": ("CB", "LB", "RB", "LWB", "RWB")
 
 def get_lineup_position_breakdown(starters, bench):
     """get_team_season_lineup의 starters/bench → {"GK": (총원, [(포지션, 인원), ...]), "DF": …, "MF": …, "FW": …}.
-    후보는 스냅샷에 그때 등록 포지션이 있어 그대로 쓰고, 주전은 스냅샷에 칸(slot)만 있으므로 선수 id로 등록
-    포지션을 찾는다 — AI 선수 등록 포지션은 게임 중 바뀌지 않으므로(현역 ai_players → 은퇴 ai_players_retired
-    순) 그 해 값과 같다. 내 선수(-1)는 my_player의 지금 포지션. 공석(id 없음)은 세지 않는다."""
+    [2026-11 변경, 신민용 요청: "주포로 세는 게 아니라 당시 포지션으로"] 주전은 그 해 배치된 칸(slot — 피치에
+    보이는 자리), 후보는 그 해 팀이 요구한 포지션(get_team_season_lineup이 채운 position — 부포로 쓰였으면
+    부포)으로 센다. 주전 칸이 비어 있는 옛 기록만 예전처럼 선수 id로 등록 포지션을 찾는다(현역 ai_players →
+    은퇴 ai_players_retired 순, 내 선수(-1)는 my_player). 공석(id 없음)은 세지 않는다."""
     import collections
     from formation_logic import _pos_category
     pos_by_id = {}
@@ -10640,7 +10660,11 @@ def get_lineup_position_breakdown(starters, bench):
         else:
             need.append(b["id"])
     for s in starters or []:
-        if s.get("id") is not None and s["id"] not in pos_by_id:
+        if s.get("id") is None:
+            continue
+        if s.get("slot"):
+            pos_by_id[s["id"]] = s["slot"]
+        elif s["id"] not in pos_by_id:
             need.append(s["id"])
     if need:
         conn = get_conn()
@@ -10923,9 +10947,85 @@ def get_team_season_lineup(team_id: int, year: int, half: bool = False):
         bench.append({"position": b.get("position", ""), "id": pid, "display_name": display_name,
                        "is_foreign": _is_foreign(pid), "nationality": nat_by_id.get(pid, "")})
 
+    # [2026-11 신설, 신민용 요청: "후보도 주전처럼 팀에서 쓰이는 포지션(당시)으로 — 주포 LB·부포 CB인데 팀이 CB로
+    # 쓰면 당시 CB"] 후보 position = 그 해 팀이 요구한 자리(_bench_ctx_positions), 등록 포지션은 reg_position에 남긴다.
+    try:
+        _ctx = _bench_ctx_positions(year, _formation_out, starters, bench)
+        for b in bench:
+            b["reg_position"] = b.get("position", "")
+            if b.get("id") in _ctx:
+                b["position"] = _ctx[b["id"]]
+    except Exception as _e_ctx:
+        print(f"[팀 라인업] 후보 당시 포지션 계산 실패(등록 포지션 그대로 표시): {_e_ctx}")
+
     # [2026-11] team_country: 이름 일괄변경의 내국인/외국인 범위용(군팀은 이미 대한민국으로 바뀐 값).
     return {"formation": _formation_out, "starters": starters, "bench": bench, "live": _live,
             "team_country": team_country}
+
+
+def _bench_ctx_positions(year, formation, starters, bench):
+    """[2026-11 신설, 신민용 요청] 후보 선수별 "그 해 팀이 요구한 포지션"(당시 포지션) — {선수 id: 포지션}
+    (등록 포지션과 다른 선수만 담는다).
+
+    규칙(게임이 스쿼드 보충에 쓰는 배정과 같은 함수 — squad_targets.held_assign, 선수 1명 = 주포 칸 또는 부포 칸 하나):
+      1) 목표 인원 = squad_targets.team_targets(포메이션, 명단 인원, 대체 포메이션 없음).
+      2) 주전이 채운 칸(슬롯 → 목표 칸: LM→LW, LWB→LB, ST·CF→FW)을 빼고 남은 목표를 후보에게 배정한다.
+      3) 후보가 부포 칸으로 배정되면 부포, 아니면 등록 포지션(주포).
+         부포는 그 해에 이미 갖고 있던 것만 센다(gained_year < 그 해 — 오프시즌에 얻어 다음 시즌부터 쓰인다).
+      4) [2026-11 신민용 요청: "4-1-4-1에서 LM·RM을 쓰면 LW·RW 후보는 당시 LM·RM"] 그 칸을 이 포메이션이
+         다른 이름의 자리로만 쓰면(목표 칸 LW → 포메이션 자리 LM뿐) 그 자리 이름으로 바꾼다 — 주전이 LM
+         자리에 서면 LM으로 뜨는 것과 같은 기준. LB→LWB, RB→RWB, ST↔CF도 같다. 포메이션에 그 칸 자리가
+         아예 없거나(예: 3-5-2의 LW 후보) 자기 이름 자리가 있으면 그대로 둔다."""
+    from squad_targets import (team_targets, held_assign, SLOT_TO_TARGET, REGISTERED_TO_TARGET,
+                               TARGET_POSITIONS, _formation)
+    from constants import FORMATION_SLOTS
+    blist = [b for b in bench if b.get("id") is not None]
+    if not blist:
+        return {}
+    f = _formation(formation or "")
+    # 목표 칸 → 이 포메이션이 그 칸에 쓰는 자리 이름들(4-1-4-1: LW → {LM})
+    slot_names = {}
+    for sl in FORMATION_SLOTS.get(f, ()):
+        t = SLOT_TO_TARGET.get(sl)
+        if t:
+            slot_names.setdefault(t, set()).add(sl)
+    sub = {}
+    if _subp_enabled() and year:
+        ids = [b["id"] for b in blist]
+        conn = get_conn()
+        try:
+            for k in range(0, len(ids), 500):
+                part = ids[k:k + 500]
+                for r in conn.execute(
+                        f"SELECT player_id, position FROM ai_player_sub_positions "
+                        f"WHERE gained_year < ? AND player_id IN ({','.join('?' * len(part))})",
+                        [int(year)] + part).fetchall():
+                    sub[int(r[0])] = r[1]
+        except Exception:
+            sub = {}
+        finally:
+            conn.close()
+    entries = [((b.get("position") or ""), sub.get(b["id"])) for b in blist]
+    if sub:
+        real_starters = [x for x in starters if x.get("id") is not None]
+        tg = dict(team_targets(f, len(real_starters) + len(blist), ()))
+        for x in real_starters:
+            t = SLOT_TO_TARGET.get(x.get("slot") or "")
+            if t:
+                tg[t] = tg.get(t, 0) - 1
+        residual = {t: max(0, tg.get(t, 0)) for t in TARGET_POSITIONS}
+        _cnt, assign = held_assign(entries, residual, return_assignment=True)
+    else:
+        assign = [REGISTERED_TO_TARGET.get(reg) for reg, _sp in entries]
+    out = {}
+    for b, (reg, sp), a in zip(blist, entries, assign):
+        label = sp if (sp and a and a != REGISTERED_TO_TARGET.get(reg)) else reg
+        names = slot_names.get(a) if a else None
+        if names and label not in names and len(names) == 1:
+            label = next(iter(names))
+        if label and label != reg:
+            out[b["id"]] = label
+    return out
 
 
 def get_team_live_player_status(team_id, starter_ids):

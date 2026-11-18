@@ -1256,6 +1256,18 @@ def _team_seed_ab(conn, team_id: int, league_power_cache: dict) -> tuple:
     return (ps, 0.0)
 
 
+def _seed_country_ps(conn, country: str) -> float:
+    """국가 초기 시드 레이팅(읽기 전용) — _seed_country_ab 설명 참고."""
+    row = conn.execute(
+        "SELECT continent, fifa_rank FROM countries WHERE name=?", (country,)).fetchone()
+    continent = row[0] if row else ""
+    fifa_rank = row[1] if row and row[1] else 100
+    bonus = COUNTRY_CONTINENT_BONUS.get(continent, 0)
+    # (211-fifa_rank)가 0(최하위)~210(1위)로 움직이도록 뒤집고, OVR 스케일
+    # (60~99, 39점 폭)과 비슷한 체감 폭이 나오게 계수를 맞췄다. TUNE LATER.
+    return SEED_BASE + (211 - fifa_rank) * (SEED_OVR_COEF * 39.0 / 210.0) + bonus
+
+
 def _seed_country_ab(conn, country: str) -> tuple:
     """[2026-08 수정, 신민용 명시적 확정 — 국가 초기 시드는 반드시
     countries.py의 다섯 번째 값(fifa_rank)을 그대로 순위로 써야 한다]
@@ -1264,14 +1276,7 @@ def _seed_country_ab(conn, country: str) -> tuple:
     없어(스쿼드가 아직 안 갖춰진 나라가 많음) 엉뚱한 순서(예: 체코 1위,
     스코틀랜드 2위)가 나왔다 — fifa_rank는 항상 존재하고 신뢰할 수 있는
     값이므로 이것을 그대로 초기 강함의 척도로 쓴다. 대륙보정은 유지."""
-    row = conn.execute(
-        "SELECT continent, fifa_rank FROM countries WHERE name=?", (country,)).fetchone()
-    continent = row[0] if row else ""
-    fifa_rank = row[1] if row and row[1] else 100
-    bonus = COUNTRY_CONTINENT_BONUS.get(continent, 0)
-    ps = SEED_BASE + (211 - fifa_rank) * (SEED_OVR_COEF * 39.0 / 210.0) + bonus
-    # (211-fifa_rank)가 0(최하위)~210(1위)로 움직이도록 뒤집고, OVR 스케일
-    # (60~99, 39점 폭)과 비슷한 체감 폭이 나오게 계수를 맞췄다. TUNE LATER.
+    ps = _seed_country_ps(conn, country)
     conn.execute("""INSERT INTO country_power_rating(country, a_rating, b_rating, last_updated_year)
                      VALUES(?,?,0,0) ON CONFLICT(country) DO NOTHING""", (country, ps))
     return (ps, 0.0)
@@ -2121,32 +2126,48 @@ def apply_team_season_regression(conn, evaluation_year: int, league_power_cache:
     conn.commit()
 
 
-def _country_last_intl_year(conn, country: str, upto_year: int) -> Optional[int]:
-    row = conn.execute(
-        """SELECT MAX(t.year) FROM intl_entries e JOIN intl_tournaments t ON e.tournament_id=t.id
-           WHERE e.country=? AND t.year<=?
-             AND t.kind NOT IN ('oly_qual','olympic')""", (country, upto_year)).fetchone()   # [2026-10] 올림픽 제외
-    return row[0] if row and row[0] else None
-
-
 def apply_country_season_regression(conn, evaluation_year: int):
+    """시즌 전환 처리 — 레이어B(대회 성적 보너스)만 COUNTRY_B_DECAY_RATE로 옅게 한다.
+
+    [2026-11 변경, 신민용 확정: "FIFA 초기 시드는 출발점으로만 쓰고 이후에는 실제 국제경기 결과로
+    국가 파워랭킹을 움직이게"] 예전엔 레이어A(경기 결과 레이팅)를 매년 초기 시드(countries.py
+    fifa_rank 기반, _seed_country_ab) 쪽으로 15~45%씩(국제경기를 오래 안 할수록 강하게) 되돌렸다.
+    그래서 예선 컷 밖 나라는 4년에 한 번 친선전(랭킹 평가전)으로 올린 점수도 다시 시드 쪽으로
+    끌려가 순위가 사실상 고정됐다(10시즌 기준선: 아시아 순위의 시드 순서 상관 0.974). 레이어A는
+    이제 경기 결과로만 움직인다 — 경기를 안 하면 그대로 유지되고, 오래된 결과는 새 경기 결과(엘로식
+    갱신)로 덮인다. 랭킹 평가전에 전 세계 국가가 4년마다 참가하므로 4년보다 오래된 레이팅이 그대로
+    남는 나라는 없다. 레이어B 감쇠는 예전 그대로다. 팀(클럽) 리그레션은 별개(위 함수)."""
     from constants import COUNTRY_B_DECAY_RATE
     countries = conn.execute("SELECT name FROM countries").fetchall()
     countries = _drop_mil_countries(countries)   # [2026-10] 군대 제외
     for (country,) in countries:
         a, b = _get_country_ab(conn, country)
-        seed_ps, _ = _seed_country_ab(conn, country)
-        last_year = _country_last_intl_year(conn, country, evaluation_year)
-        if last_year is None:
-            convergence = 0.45
-        else:
-            gap = evaluation_year - last_year
-            convergence = {0: 0.15, 1: 0.25, 2: 0.35}.get(gap, 0.45 if gap >= 3 else 0.15)
-        new_a = _regress_a(a, seed_ps, convergence)
         new_b = _decay_b(b, COUNTRY_B_DECAY_RATE)
         conn.execute("""UPDATE country_power_rating SET a_rating=?, b_rating=?, last_updated_year=?
-                         WHERE country=?""", (new_a, new_b, evaluation_year, country))
+                         WHERE country=?""", (a, new_b, evaluation_year, country))
     conn.commit()
+
+
+def country_selection_ratings(conn, countries) -> dict:
+    """[2026-11 신설] 국제대회 예선 참가 자격용 국가 레이팅(레이어A+B) — {나라: 레이팅}.
+    country_power_rating 값 그대로(연말 갱신 기준), 아직 행이 없는 나라(새 게임 첫해 등)는 초기 시드
+    값을 쓴다. 읽기 전용 — 시드 행을 새로 INSERT하지 않는다(대회 생성 중 DB 상태를 바꾸지 않기 위해).
+    레이팅은 전 세계 공통 척도라, 통합 연맹(아시아+오세아니아, 남미+북미)도 이 값 순서로 한 줄로
+    세우면 세계 순위 순서 그대로가 된다."""
+    have = {}
+    try:
+        for name, a, b in conn.execute(
+                "SELECT country, a_rating, b_rating FROM country_power_rating").fetchall():
+            have[name] = (a or 0.0) + (b or 0.0)
+    except Exception:
+        pass
+    out = {}
+    for name in countries:
+        if name in have:
+            out[name] = have[name]
+        else:
+            out[name] = _seed_country_ps(conn, name)
+    return out
 
 
 # ══════════════════════════════════════════════════════════════

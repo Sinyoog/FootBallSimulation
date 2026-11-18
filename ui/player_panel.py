@@ -598,17 +598,18 @@ class PlayerPanel(QWidget):
             ("국적",   _nat_str),
             ("소속",   team_name),
             ("리그",   league_name),
-            ("주요 포지션", p["position"]),
+            ("주포",       p["position"]),
             ("현 포지션",   _cur_field_pos),
         ]
-        # [2026-10 주포·부포] 내 부포가 있으면 "부 포지션" 줄을 주요 포지션 바로 아래에 넣는다.
+        # [2026-10 주포·부포] 내 부포를 주포 바로 아래 줄에 넣는다.
+        # [2026-11-17 변경, 신민용 요청: "플레이어 패널에도 주포 부포"] 포메이션 선수 창과 같은 이름(주포·부포)으로
+        # 맞추고, 부포가 없어도 줄은 보이게 한다("—") — 예전엔 부포가 있을 때만 줄이 생겨서 평소엔 안 보였다.
         try:
             import sub_positions as _subp
             _my_sub = _subp.my_sub()
         except Exception:
             _my_sub = None
-        if _my_sub:
-            rows.insert(5, ("부 포지션", _my_sub))
+        rows.insert(5, ("부포", _my_sub or "—"))
         # [2026-08 신설, 난이도 시스템] 성격/신체특징(부상·성장 관련 숨겨진
         # 특성)/감독관계는 어려움 난이도에서 비표시 — 키/몸무게/체형처럼
         # 겉으로 관찰 가능한 정보가 아니라 원래 내부 수치이기 때문에
@@ -667,9 +668,16 @@ class PlayerPanel(QWidget):
         # 옮겨 씀) 별도 라벨 매핑 없이 값 그대로 쓴다. 소속팀이 없으면
         # 감독관계와 동일하게 "-"로 표시(어려움 난이도에서는 감독관계와
         # 같은 취급으로 같이 숨김).
+        # [2026-11 구단 목표 2단계, 신민용 요청] 구단 목표를 두 줄로 — 리그 목표 아래에 클럽 대항전 목표.
+        # 대항전은 7주차 추첨으로 참가가 확정된 뒤에 생기고, 미참가·추첨 전이면 "--".
+        _cont_txt = _my_cont_goal_text(p) if (_has_team and not _hard) else "--"
         if not _hard:
             _amb_txt = p.get("club_ambition", "") if _has_team else "-"
-            self.info_lay.addWidget(_info_row("구단 목표", _amb_txt or "-"))
+            if _has_team:
+                self.info_lay.addWidget(_info_row("구단 목표", f"리그 : {_amb_txt or '-'}"))
+                self.info_lay.addWidget(_info_row("", f"클럽 대항전 : {_cont_txt}"))
+            else:
+                self.info_lay.addWidget(_info_row("구단 목표", "-"))
 
         # [2026-08 신설] 시즌 탭 상단 요약(소속팀/리그(몇부)/연봉/감독관계).
         _clear_layout(self.season_top_lay)
@@ -700,7 +708,11 @@ class PlayerPanel(QWidget):
         # "감독관계 아래 / 순위 위" 자리에 들어간다.
         if not _hard:
             _amb2_txt = p.get("club_ambition", "") if _has_team else "-"
-            self.season_top_lay.addWidget(_info_row("구단 목표", _amb2_txt or "-"))
+            if _has_team:
+                self.season_top_lay.addWidget(_info_row("구단 목표", f"리그 : {_amb2_txt or '-'}"))
+                self.season_top_lay.addWidget(_info_row("", f"클럽 대항전 : {_cont_txt}"))
+            else:
+                self.season_top_lay.addWidget(_info_row("구단 목표", "-"))
 
 
         # 순위
@@ -912,6 +924,25 @@ def _manager_tactic_texts(team_id):
     if prs:
         _tip_lines.append(f"수비 라인: {prs}")
     return short, "\n".join(_tip_lines)
+
+
+def _my_cont_goal_text(p):
+    """[2026-11 구단 목표 2단계] 내 소속팀의 올해 클럽 대항전 목표 문구(club_goals.cont_goal_text). 실패하면 '--'."""
+    try:
+        import club_goals as _cg
+        from database import get_conn as _gc
+        from game_engine import get_state as _gs
+        tid = (p or {}).get("current_team_id") or 0
+        yr = (_gs() or {}).get("current_year")
+        if not tid or not yr:
+            return "--"
+        conn = _gc()
+        try:
+            return _cg.cont_goal_text(conn, tid, yr)
+        finally:
+            conn.close()
+    except Exception:
+        return "--"
 
 
 def _info_row(key, val):

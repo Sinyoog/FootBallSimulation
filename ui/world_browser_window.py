@@ -2273,9 +2273,10 @@ class QuickPlayerEditPopup(QDialog):
             ("이름", _name),
             ("국적", pl.get("nationality", "") or "-"),
             ("나이(당시)", f"{_ctx_age}세" if _ctx_age is not None else "-"),
+            # [2026-11 신민용 요청] 순서: 포지션(당시) → 포지션(주포) → 포지션(부포).
+            ("포지션(당시)", (pl.get("ctx_position", "") or "").strip() or "-"),
             ("포지션(주포)", _pos or "-"),
             ("포지션(부포)", pl.get("sub_position") or "-"),
-            ("포지션(당시)", (pl.get("ctx_position", "") or "").strip() or "-"),
         ]
         if not is_hard_mode():
             _ctx_ovr = pl.get("ctx_ovr")
@@ -5811,7 +5812,7 @@ class WorldBrowserWindow(QDialog):
         추정치이므로, 선방률도 같은 방식으로 추정 가능하다는 게 핵심).
         선방률은 저장된 saves/goals_conceded로 그때그때 계산해 항상
         정확히 맞물리게 한다."""
-        main_text = f"⭐ {stat['rating']:.2f}"
+        main_text = f"⭐ {stat['rating']:.1f}"
         if is_gk:
             _sv = stat.get("saves", 0) or 0
             _gc = stat.get("goals_conceded", 0) or 0
@@ -6460,7 +6461,7 @@ class WorldBrowserWindow(QDialog):
                     _bd_cell(str(_tot), "color:#ffffff;font-weight:bold;")
                     if _g != "GK":
                         _bd_cell("·".join(f"{_p} {_n}" for _p, _n in _detail) or "–", "color:#cfcfcf;")
-                _bd_box.setToolTip("이 반기 명단(주전+후보)의 등록 포지션 인원 — GK / DF / MF / FW(LW·RW 포함)\n"
+                _bd_box.setToolTip("이 반기 명단(주전+후보)의 당시 포지션 인원(주전 = 배치 자리, 후보 = 팀이 요구한 자리) — GK / DF / MF / FW(LW·RW 포함)\n"
                                    + wb.format_lineup_position_breakdown(_bd))
                 _form_row.addSpacing(14)
                 _form_row.addWidget(_bd_box, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -6945,9 +6946,9 @@ class WorldBrowserWindow(QDialog):
                     gc = rec.get("goals_conceded", 0) or 0
                     shots = sv + gc
                     pct = f"{(sv / shots * 100):.1f}%" if shots else "-"
-                    stat_text = f"⭐{rating:.2f}  🧤선방{sv}실점{gc}({pct})"
+                    stat_text = f"⭐{rating:.1f}  🧤선방{sv}실점{gc}({pct})"
                 else:
-                    stat_text = f"⭐{rating:.2f}  ⚽{rec.get('goals', 0)}골 🅰{rec.get('assists', 0)}A"
+                    stat_text = f"⭐{rating:.1f}  ⚽{rec.get('goals', 0)}골 🅰{rec.get('assists', 0)}A"
             else:
                 stat_text = "-"
             lines.append(
@@ -7026,11 +7027,11 @@ class WorldBrowserWindow(QDialog):
                             _shots = _sv + _gc
                             _pct = f"{(_sv / _shots * 100):.1f}%" if _shots else "-"
                             out.append(
-                                f"  🧤 {_label}: 평균평점 {_cs['rating']:.2f}  "
+                                f"  🧤 {_label}: 평균평점 {_cs['rating']:.1f}  "
                                 f"선방{_sv} 실점{_gc} 선방률{_pct}")
                         else:
                             out.append(
-                                f"  ⚽ {_label}: 평균평점 {_cs['rating']:.2f}  "
+                                f"  ⚽ {_label}: 평균평점 {_cs['rating']:.1f}  "
                                 f"{_cs.get('goals', 0)}골 {_cs.get('assists', 0)}A")
         if include_stats:
             _sal = entry.get("salary")
@@ -8654,7 +8655,9 @@ class WorldBrowserWindow(QDialog):
             # [2026-10] 기록 복사(전적 포함)에는 그 해 포메이션도 — 화면 연도 펼침과 같은 값.
             # [2026-11-15] 기록 복사에는 그 시즌 구단 목표도 — 화면 연도 펼침 첫 줄과 같은 값.
             if include_records and r["kind"] == "club" and (r.get("club_objective") or ("",))[0]:
-                parts.append(f"구단 목표: {r['club_objective'][0]}")
+                # [2026-11 신민용 요청] 리그 목표와 클럽 대항전 목표를 한 줄에.
+                parts.append(f"구단 목표: 리그 : {r['club_objective'][0]} | "
+                             f"클럽 대항전 : {r.get('club_cont_objective') or '--'}")
             if include_records and r["kind"] == "club" and r.get("formation"):
                 parts.append(f"포메이션: {r['formation']}")
             if include_records and r["kind"] != "club" and r.get("formations") \
@@ -9181,10 +9184,15 @@ class WorldBrowserWindow(QDialog):
             _obj = r.get("club_objective")
             _ot, _ob = (_obj or ("", ""))[:2]
             if _ot:
-                goal = (f"🎯 {_k}구단 목표</span>&nbsp;&nbsp;{_v}{_ot}</span>"
+                # [2026-11 신민용 요청] "리그 : 우승 도전 | 클럽 대항전 : --" 형식.
+                _ct = _html_esc(r.get("club_cont_objective") or "--")
+                goal = (f"🎯 {_k}구단 목표</span>&nbsp;&nbsp;리그 : {_v}{_html_esc(_ot)}</span>"
+                        f"&nbsp;&nbsp;|&nbsp;&nbsp;클럽 대항전 : {_v}{_ct}</span>"
                         + (f"&nbsp;&nbsp;{_dim}(첫 시즌 — 시작 목표가 없어 시즌 결과로 산정)</span>"
                            if _ob == "derived" else
-                           f"&nbsp;&nbsp;{_dim}(올 시즌 목표)</span>" if _ob == "live" else ""))
+                           f"&nbsp;&nbsp;{_dim}(올 시즌 목표)</span>"
+                           if _ob == "live" or (_ob == "plan" and r["year"] >= wb.get_current_game_year())
+                           else ""))
             elif _ob == "first":
                 goal = (f"🎯 {_k}구단 목표</span>&nbsp;&nbsp;{_dim}첫 시즌 — 시즌이 끝나야 정해집니다</span>")
             else:
@@ -9338,8 +9346,8 @@ class WorldBrowserWindow(QDialog):
             # [2026-11-15 신민용 요청] 선발 그룹 기록(fit 있음)이면 카드 = 국대에서 그 자리로 쓸 후보(주포 무관).
             _role_pool = any(p_.get("fit") is not None for p_ in players)
             sub = ("카드 = 국대에서 쓰는 자리, 이름 아래 = 그 선수의 주포 — 주포가 달라도 그 자리로 경쟁했으면 포함"
-                   "(예: 주포 RW가 ST 경쟁 → ST 카드). 좌우·CDM/CM은 한 그룹 정원을 나눠 쓴다. 점수 = 선발 점수 × "
-                   "그 자리 적합도, 카드 안 순위" if _role_pool else
+                   "(예: 주포 RW가 ST 경쟁 → ST 카드). LB·RB·LW·RW는 각 2칸 고정(측면 칸 점수 = 원래 점수 → 그 칸 "
+                   "배치 점수), CDM/CM은 한 그룹 정원을 나눠 쓴다. 점수 = 선발 점수 × 그 자리 적합도, 카드 안 순위" if _role_pool else
                    "선발 당시 소집 경쟁에 들어온 선수(주포 기준 그룹 안 선발 점수 순위)")
         else:
             sq = wb.get_country_tournament_squad(tid, country)
@@ -9492,12 +9500,22 @@ class WorldBrowserWindow(QDialog):
                     bits = [p_.get("position") or "-"]
                     # [2026-11-15] 주포가 그 자리 핵심 포지션이 아니면 적합도, 정원 보충으로 들어왔으면 표시.
                     _fit = p_.get("fit")
-                    if p_.get("via") == "backfill":
+                    _via = p_.get("via") or ""
+                    # [2026-11-16 신민용 확정] 측면 칸(LB·RB·LW·RW) 카드는 "주포 · 원래 점수 → 배치 점수" —
+                    # 배치 점수는 선발에 쓴 엔진 배치 계산값 그대로(표시용으로 따로 계산하지 않는다).
+                    _side_row = _via in ("side", "side_sub")
+                    if _via == "backfill":
                         bits.append("정원 보충")
-                    elif _fit is not None and _fit < 0.999:
+                    elif _via == "inherit_fill":
+                        bits.append("예선 명단 보충")
+                    elif _via == "injury_fill":
+                        bits.append("대체 발탁")
+                    elif _fit is not None and _fit < 0.999 and not _side_row:
                         bits.append(f"적합도 {round(_fit * 100)}%")
                     if not _hard:
-                        if p_.get("via") not in ("backfill", "me_noscore"):   # me_noscore = 점수 기록 없는 내 줄
+                        if _side_row and _fit and _fit < 0.999:
+                            bits.append(f"점수 {p_.get('score', 0) / _fit:.1f} → {p_.get('score', 0):.1f}")
+                        elif _via not in ("backfill", "me_noscore", "inherit_fill", "injury_fill"):   # me_noscore = 점수 기록 없는 내 줄
                             bits.append(f"점수 {p_.get('score', 0):.1f}")
                         if _year_ovr.get(p_.get("id")) is not None:
                             bits.append(f"{year} OVR {_year_ovr[p_.get('id')]}")
@@ -10649,9 +10667,9 @@ class WorldBrowserWindow(QDialog):
                     _gc = rec.get("goals_conceded", 0) or 0
                     _shots = _sv + _gc
                     _pct = f"{(_sv / _shots * 100):.1f}%" if _shots else "-"
-                    _stat_text = f"⭐{_rating:.2f}  🧤선방{_sv}실점{_gc}({_pct})"
+                    _stat_text = f"⭐{_rating:.1f}  🧤선방{_sv}실점{_gc}({_pct})"
                 else:
-                    _stat_text = f"⭐{_rating:.2f}  ⚽{rec.get('goals', 0)}골 🅰{rec.get('assists', 0)}A"
+                    _stat_text = f"⭐{_rating:.1f}  ⚽{rec.get('goals', 0)}골 🅰{rec.get('assists', 0)}A"
             else:
                 _stat_text = "-"
             cells = [str(rec["year"]), rec.get("name") or "?", rec.get("country") or "?",
@@ -11306,7 +11324,7 @@ class WorldBrowserWindow(QDialog):
                     return seg["team_name"]
             return tname
 
-        def _is_loan_for_year(year, is_half=False, half_team_name=None):
+        def _is_loan_for_year(year, is_half=False, half_team_name=None, half_same_team=False):
             # [2026-09 신설, 신민용 요청: "세계 축구 기록실에 이제는 임대
             # 이적도 표시하는거지"] _team_name_for_year와 완전히 같은
             # 구간 탐색이지만 반환값만 다르다 — 팀명 문자열 자체엔 손을
@@ -11343,7 +11361,11 @@ class WorldBrowserWindow(QDialog):
                 # 그 줄의 팀명이 일치하는 세그먼트만 인정해 (a)/(b)를 가른다 —
                 # 오프시즌 이적 직후 해의 (b)에서 "그 해에 끝나는 이전 팀
                 # 세그먼트"를 잘못 집는 것도 같이 막는다.
-                for seg in timeline:
+                # [2026-11-17 버그수정, 신민용 리포트: "레알 임대(2003~) → 2005년 레알 완전 이적 후 역할이 바뀐
+                # 2005년 상반기 줄이 '레알 마드리드 (임대)'로 뜬다"] (b)인데 직전 구간도 같은 팀이면(임대 → 같은 팀
+                # 완전 이적) 팀명만으로는 (a)/(b)가 안 갈려 그 해에 끝나는 임대 구간을 집었다. 데이터 쪽에서 (b)라고
+                # 알려준 줄(_half_same_team)은 바로 "그 해를 포함하는 구간"으로 간다.
+                for seg in ([] if half_same_team else timeline):
                     if seg["end_year"] == year and (
                             half_team_name is None or seg.get("team_name") == half_team_name):
                         return bool(seg.get("is_loan"))
@@ -11551,7 +11573,8 @@ class WorldBrowserWindow(QDialog):
                 _display_name = player_team_name
                 if _is_loan_for_year(entry["year"], is_half=bool(entry.get("_is_half")),
                                      half_team_name=(entry.get("_half_team_name")
-                                                     if entry.get("_is_half") else None)):
+                                                     if entry.get("_is_half") else None),
+                                     half_same_team=bool(entry.get("_half_same_team"))):
                     _display_name = f"{player_team_name} (임대)"
                 # [2026-10 신민용 요청: "맨 위 표처럼 아래 연도별 소속팀도 클릭해서 복붙"] 예전엔 QLabel
                 # (_col_label)을 칸 위에 얹어 그려서 선택·복사가 안 됐다 — 같은 모양(색·굵기·말줄임·
@@ -11637,7 +11660,7 @@ class WorldBrowserWindow(QDialog):
             # [2026-09 확장] "핵심"(주전 내부 상위층) 추가 — 색이 없으면
             # 기본 회색으로 떨어져 버그처럼 보인다. 주전(파랑)보다 한 단계
             # 눈에 띄는 금색 계열로 둔다.
-            _ROLE_COLORS = {"핵심": "#ffcc44", "주전": "#4da6ff", "로테이션": "#88ddaa",
+            _ROLE_COLORS = {"핵심": "#ffcc44", "주전": "#4da6ff", "준주전": "#66d9e8", "로테이션": "#88ddaa",
                             "대기": "#cccc66", "유망주": "#cc88ff", "전력외": "#999999"}
             # [2026-11-03] 팀은 같은데 역할이 바뀌어 두 줄로 나뉜 해는 하반기 줄도 팀 검색 하반기 라인업 기준
             # 역할(entry["_h2_role"] — world_browser._lineup_h2_role)을 쓴다.
@@ -13355,7 +13378,7 @@ class WorldBrowserWindow(QDialog):
         # 있어도 그 반기 포메이션 주전 자리에 있었으면 포함한다.
         _XI_IDS = {p.get("id") for lu in (h1_lineup, h2_lineup)
                    for p in (lu.get("starters") or []) if p.get("id") is not None}
-        _STARTER_ROLES = ("핵심", "주전", "로테이션")
+        _STARTER_ROLES = ("핵심", "주전", "준주전", "로테이션")
 
         def _starter_level(pid, role):
             return (role in _STARTER_ROLES) or (pid in _XI_IDS)
@@ -13684,7 +13707,7 @@ class WorldBrowserWindow(QDialog):
             if not info:
                 continue
             role = roles.get(pid)
-            if starters_only and not (role in ("핵심", "주전", "로테이션") or pid in slot_by_id):
+            if starters_only and not (role in ("핵심", "주전", "준주전", "로테이션") or pid in slot_by_id):
                 continue
             d = info["d"]
             all_rows = info.get("all_rows") or []
@@ -14804,7 +14827,7 @@ class WorldBrowserWindow(QDialog):
                 v = r.get(key)
                 return "-" if v is None else str(int(v))
             vals = [award_label, name, nat, team, r.get("position") or "-",
-                    f"{rating:.2f}" if rating else "-",
+                    f"{rating:.1f}" if rating else "-",
                     _num("stat_goals"), _num("stat_assists"),
                     _num("stat_saves") if is_gk else "-",
                     _num("stat_goals_conceded") if is_gk else "-"]
@@ -15089,7 +15112,7 @@ class WorldBrowserWindow(QDialog):
             is_gk = (r.get("position") or "") == "GK"
             vals = [r["name"], r.get("nationality") or "",
                     r.get("team_name") or "", r.get("position") or "",
-                    f"{rating:.2f}" if rating else "-",
+                    f"{rating:.1f}" if rating else "-",
                     str(int(r.get("stat_goals") or 0)), str(int(r.get("stat_assists") or 0)),
                     str(int(r.get("stat_saves") or 0)) if is_gk else "-",
                     str(int(r.get("stat_goals_conceded") or 0)) if is_gk else "-"]

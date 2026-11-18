@@ -1381,7 +1381,7 @@ def simulate_my_cwc_match(week, p, day=None):
         elif _yellow_ev:
             events = list(events) + _yellow_ev
     if not (_suspended or _benched) and "big_match_rating" in _pe:
-        rating = max(3.0, min(10.0, round(rating + _pe["big_match_rating"], 1)))
+        rating = max(min(4.0, rating), min(10.0, round(rating + _pe["big_match_rating"], 1)))   # 이미 4.0 아래(퇴장)면 끌어올리지 않음
 
     # [2026-08 신설, 신민용 요청] champions_engine과 동일한 "나" 슬롯 바꿔치기.
     # [2026-09 버그수정, 신민용 리포트: "2대0인데 골이 3개 어시가 3개"]

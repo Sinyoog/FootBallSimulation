@@ -566,6 +566,11 @@ def compute_slot_deficiencies(current_positions):
 # 로스터로 과거 연도를 되짚어 계산하면 그 사이 이적으로 로스터 자체가
 # 달라져 있어 부정확함).
 _ROLE_TIER_WEIGHTS = [("주전", 40), ("로테이션", 30), ("대기", 25), ("유망주", 15)]
+# [2026-11-16 신설, 신민용 확정 — 역할 7단계] 선발 11명 밖 선수의 구간: 준주전 30%(팀 전체 인원 기준, 포지션 그룹에
+# 비례 배분), 나머지 70%는 팀 전체 기준 로테이션 30 : 대기 25 : 유망주 15(유망주는 19세 이하만 — 아니면 전력외).
+# 선발 11명은 예전 그대로 핵심·주전. 선발 정보가 없는 경로(군팀 등 started_ids 없음)는 예전 _ROLE_TIER_WEIGHTS 그대로.
+_ROLE_NONXI_WEIGHTS = [("준주전", 30), ("로테이션", 30), ("대기", 25), ("유망주", 15)]
+_SEMI_STARTER_SHARE = 0.30      # 선발 밖 인원 중 준주전 비율(팀 전체 기준, compute_squad_roles ③)
 _ROLE_YOUNG_MAX_AGE = 19
 
 
@@ -673,7 +678,9 @@ def compute_squad_roles(pool, started_ids=None):
         if _n_core > 0:
             _starters = [(pid, ovr, age) for pid, pos, ovr, age in pool
                          if pid in started_ids]
-            _starters.sort(key=lambda t: (-((t[1] or 0) - role_age_penalty(t[2])), t[0]))
+            # [2026-11-16 버그수정] 동점 순서: id끼리 비교하되 내 선수("__ME__", 문자열)와 AI(정수)가 동점이면
+            # 비교가 TypeError로 죽었다(내 역할 기록·오퍼 역할 계산 실패) — 종류(정수 먼저) → id 순. AI끼리 순서는 그대로.
+            _starters.sort(key=lambda t: (-((t[1] or 0) - role_age_penalty(t[2])), isinstance(t[0], str), t[0]))
             for _pid_c, _o_c, _a_c in _starters[:_n_core]:
                 result[_pid_c] = "핵심"
 
@@ -703,12 +710,54 @@ def compute_squad_roles(pool, started_ids=None):
                 label = "전력외"
             result[pid] = label
 
-    for _cat, members in by_cat.items():
-        if started_ids:
-            rest = [(pid, ovr, age) for pid, ovr, age in members if pid not in started_ids]
-            _assign(rest, _ROLE_TIER_WEIGHTS[1:])
-        else:
+    if not started_ids:
+        for _cat, members in by_cat.items():
             _assign(members, _ROLE_TIER_WEIGHTS)
+        return result
+
+    # [2026-11-16 신설, 신민용 확정 — 역할 7단계 ③] 선발 11명 밖 선수:
+    #   1) 준주전 인원 K = 팀 전체 선발 밖 인원의 30%(반올림).
+    #   2) K를 포지션 그룹(_pos_category) 인원에 비례해 나눈다 — 계통 반올림(아래 주석). 그룹 합 = K로 정확히 맞는다.
+    #   3) 각 그룹에서 나이 보정 OVR(아래 _assign과 같은 축) 상위부터 준주전.
+    #   4) 나머지는 팀 전체 한 줄로 로테이션 30 : 대기 25 : 유망주 15(유망주는 19세 이하만, 아니면 전력외 — _assign).
+    # 예전처럼 포지션 그룹마다 따로 구간을 나누면 그룹이 2~4명뿐이라(선발 밖 선수의 69%) 등수 그대로 구간이 매겨져
+    # 작은 그룹 선수가 거의 전부 한 칸씩 위 역할로 올라갔다(단위 테스트에서 확인).
+    _eff = lambda t: (t[1] or 0) - role_age_penalty(t[2])
+    _groups = {}
+    for _cat, members in by_cat.items():
+        rest = [(pid, ovr, age) for pid, ovr, age in members if pid not in started_ids]
+        if rest:
+            _groups[_cat] = sorted(rest, key=lambda t: -_eff(t))     # 안정 정렬 — _assign과 같은 순서
+    _n_all = sum(len(v) for v in _groups.values())
+    if _n_all == 0:
+        return result
+    _k_semi = int(_n_all * _SEMI_STARTER_SHARE + 0.5)
+    # 그룹 배분 = 계통 반올림(systematic rounding) — 그룹 이름 순으로 정확 비례 몫(K × 그룹 인원 / 선발 밖 인원)을
+    # 누적하고, 0~1 사이 오프셋 u를 더해 정수 경계를 넘는 수만큼 그 그룹 자리로 준다. 합계는 항상 정확히 K이고,
+    # u가 팀마다 고르게 퍼지면 그룹별 기대 자리 = 정확 비례 몫이라 특정 포지션으로 쏠리지 않는다. u는 난수가 아니라
+    # 선발 11명 id로 만든 결정적 값이다(같은 로스터면 늘 같은 결과, 전역 난수 미소비).
+    # [단위 테스트] 정수 몫 + 최대 나머지·생-라게는 둘 다 GK(선발 밖 대개 2명 → 몫 0.6 안팎)를 거의 늘 1자리로 올려
+    # GK 준주전이 정확 비례보다 +40~53% 많았다 — 팀마다 같은 몫이 반복되면 결정적 반올림은 한쪽으로만 치우친다.
+    _names = sorted(_groups)
+    _h = 0
+    for _x in sorted(int(x) for x in started_ids if isinstance(x, int)):
+        _h = (_h * 1000003 + _x) & 0xFFFFFFFF
+    _u = ((_h * 2654435761) & 0xFFFFFFFF) / 4294967296.0
+    _quota = {}
+    _cum = 0
+    _prev = 0
+    for g in _names:
+        _cum += _k_semi * len(_groups[g])                    # 누적 몫 × 선발 밖 인원(정수)
+        _edge = int(_cum / _n_all + _u) if _cum < _k_semi * _n_all else _k_semi
+        _quota[g] = min(len(_groups[g]), _edge - _prev)
+        _prev = _edge
+    _semi_ids = set()
+    for g, v in _groups.items():
+        for pid, _o, _a in v[:_quota[g]]:
+            result[pid] = "준주전"
+            _semi_ids.add(pid)
+    _rest_all = [t for v in _groups.values() for t in v if t[0] not in _semi_ids]
+    _assign(_rest_all, _ROLE_NONXI_WEIGHTS[1:])
     return result
 
 
@@ -1313,6 +1362,40 @@ def choose_formation_prepped(prepped, current_formation, tendency, rng=None,
     weights = [max(0.01, s) for s, _n, _p in top]
     chosen_score, chosen_name, chosen_penalty = _rng.choices(top, weights)[0]
     return chosen_name, chosen_penalty
+
+
+def formation_candidate_set(prepped, current_formation, tendency, style=None, family=None, family_bonus=0.0,
+                            allowed=None):
+    """[2026-11 신설, 신민용 확정 — 노장 이적 규칙 1 "최종 포메이션 후보"] 오프시즌 끝(_shuffle_formations)에
+    이 팀이 쓸 포메이션 후보 — 현재 포메이션(재검토에 안 걸리면 유지) ∪ choose_formation_prepped의 상위
+    FORMATION_CANDIDATE_TOP_N 후보(랜덤 항을 기댓값으로 둔 점수 순 = 결정론 점수 순). 랜덤 항 때문에 상위 N에
+    "들 수도 있는" 포메이션까지 넣으면 팀당 평균 13.8개(20개 중)가 돼, 가장 불리한 후보 기준 판정이 사실상
+    "하나라도 주전 미만이면 거절"이 된다(신민용: 지나치게 보수적이라 쓰지 않음) — 그래서 게임의 후보 정의
+    (상위 N) 그대로 쓴다. 점수 계산은 choose_formation_prepped와 같고 **난수를 쓰지 않는다**."""
+    from constants import (FORMATION_SLOTS, FORMATION_SCORE_WEIGHTS,
+                           FORMATION_CANDIDATE_TOP_N)
+    w = FORMATION_SCORE_WEIGHTS
+    _w_squad, _w_tend, _w_rand = w["squad_fit"], w["tendency_fit"], w["random"]
+    _sa = (style or {}).get("style_attack")
+    _sb = (style or {}).get("style_buildup")
+    _sp = (style or {}).get("style_press")
+    det = []
+    for name, slots in FORMATION_SLOTS.items():
+        if allowed is not None and name not in allowed:
+            continue
+        penalty = formation_fit_penalty_prepped(prepped, name, slots)
+        score = (_w_squad * formation_fit_norm(penalty)
+                 + _w_tend * manager_style_fit(name, style_attack=_sa, style_buildup=_sb,
+                                               style_press=_sp, tendency=tendency))
+        if family is not None and formation_back_family(name) == family:
+            score += family_bonus
+        det.append((score, name))
+    cur = current_formation if current_formation in FORMATION_SLOTS else "4-4-2"
+    out = {cur}
+    if det:
+        det.sort(key=lambda t: (-t[0], t[1]))
+        out.update(name for _sc, name in det[:FORMATION_CANDIDATE_TOP_N])
+    return out
 
 
 def choose_formation(roster, current_formation, tendency, rng=None, style=None):

@@ -13,6 +13,14 @@ from game_engine import get_player, fmt_money, add_log, get_state, _save_career_
 from constants import format_result_with_absence
 
 
+def _r1(v):
+    """평점 표시 — 0.1 단위(소수 첫째 자리). 숫자가 아니면 그대로 문자열로."""
+    try:
+        return f"{float(v):.1f}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
 def _fmt_loan_months(total_weeks):
     """주 단위 기간을 '1년', '1년 3개월', '3개월'처럼 사람이 읽는 형태로."""
     months = max(1, round(total_weeks / 4.33))
@@ -1839,7 +1847,9 @@ class RetireWindow(QDialog):
                                  + (f"  🟥{_grand_rc}" if _grand_rc else ""))
                 # 역할/감독/구단야망
                 ctx = []
-                if e.get("contract_role"):  ctx.append(f"역할 {e['contract_role']}")
+                if e.get("contract_role"):
+                    from constants import normalize_contract_role
+                    ctx.append(f"역할 {normalize_contract_role(e['contract_role'])}")
                 if e.get("manager_type"):   ctx.append(f"감독 {e['manager_type']}")
                 if e.get("club_ambition"):  ctx.append(f"구단목표 {e['club_ambition']}")
                 if ctx:
@@ -1889,10 +1899,10 @@ class RetireWindow(QDialog):
                 ch = clhist.get((yr, comp))
                 if ch and ch.get("caps", 0) > 0:
                     if p.get("position") == "GK":
-                        line += f"  | {ch['caps']}경기 출전, 평점 {ch.get('rating', 0)}"
+                        line += f"  | {ch['caps']}경기 출전, 평점 {_r1(ch.get('rating', 0))}"
                     else:
                         line += (f"  | {ch['caps']}경기 {ch.get('goals',0)}골 "
-                                 f"{ch.get('assists',0)}어시, 평점 {ch.get('rating', 0)}")
+                                 f"{ch.get('assists',0)}어시, 평점 {_r1(ch.get('rating', 0))}")
                 lines.append(line)
         else:
             lines.append("  없음")
@@ -1921,7 +1931,7 @@ class RetireWindow(QDialog):
                 ch = cuphist.get((yr, team))
                 if ch and ch.get("caps", 0) > 0:
                     line += (f"  | {ch['caps']}경기 {ch.get('goals',0)}골 "
-                             f"{ch.get('assists',0)}어시, 평점 {ch.get('rating', 0)}")
+                             f"{ch.get('assists',0)}어시, 평점 {_r1(ch.get('rating', 0))}")
                 lines.append(line)
         else:
             lines.append("  없음")
@@ -1947,7 +1957,7 @@ class RetireWindow(QDialog):
                 ch = dschist.get((yr, team))
                 if ch and ch.get("caps", 0) > 0:
                     line += (f"  | {ch['caps']}경기 {ch.get('goals',0)}골 "
-                             f"{ch.get('assists',0)}어시, 평점 {ch.get('rating', 0)}")
+                             f"{ch.get('assists',0)}어시, 평점 {_r1(ch.get('rating', 0))}")
                 lines.append(line)
         else:
             lines.append("  없음")
@@ -2020,10 +2030,10 @@ class RetireWindow(QDialog):
                 ih = hist.get((yr, comp))
                 if ih and ih.get("caps", 0) > 0:
                     if p.get("position") == "GK":
-                        line += f"  | {ih['caps']}경기 출전, 평점 {ih.get('rating', 0)}"
+                        line += f"  | {ih['caps']}경기 출전, 평점 {_r1(ih.get('rating', 0))}"
                     else:
                         line += (f"  | {ih['caps']}경기 {ih.get('goals',0)}골 "
-                                 f"{ih.get('assists',0)}어시, 평점 {ih.get('rating', 0)}")
+                                 f"{ih.get('assists',0)}어시, 평점 {_r1(ih.get('rating', 0))}")
                 lines.append(line)
         else:
             lines.append("  없음")
@@ -2131,7 +2141,7 @@ class RetireWindow(QDialog):
                 if um.get("absence_reason") or not um.get("my_played", 1):
                     line_body = _match_line_str(um)
                 else:
-                    line_body = f"{um['goals']}골 {um['assists']}어시  평점 {um['rating']}"
+                    line_body = f"{um['goals']}골 {um['assists']}어시  평점 {_r1(um['rating'])}"
                 lines.append(f"  • {um['date']}  "
                              f"{um['comp']} {um['stage']}  vs {opp}  ─  "
                              f"{line_body}  "
@@ -2165,7 +2175,7 @@ class RetireWindow(QDialog):
                     lines.append(f"  • {pm['year']}년  {pm['team_name']} vs {pm['opp_name']}  ─  {_reason}")
                 else:
                     lines.append(f"  • {pm['year']}년  {pm['team_name']} vs {pm['opp_name']}  ─  "
-                                 f"{pm['result']}  (골 {pm['goals']} 어시 {pm['assists']} 평점 {pm['rating']})")
+                                 f"{pm['result']}  (골 {pm['goals']} 어시 {pm['assists']} 평점 {_r1(pm['rating'])})")
         else:
             lines.append("  없음")
         lines.append("")

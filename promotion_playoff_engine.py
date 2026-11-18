@@ -786,7 +786,7 @@ def simulate_my_po_match(week, p, day=None):
         elif _yellow_ev:
             events = list(events) + _yellow_ev
     if not (_suspended or _benched) and "big_match_rating" in _pe:
-        rating = max(3.0, min(10.0, round(rating + _pe["big_match_rating"], 1)))
+        rating = max(min(4.0, rating), min(10.0, round(rating + _pe["big_match_rating"], 1)))   # 이미 4.0 아래(퇴장)면 끌어올리지 않음
 
     # [2026-09 신설] "나" 슬롯 바꿔치기 — 전술엔진 로스터엔 "나"가 없으므로
     # 포지션이 같은 슬롯을 방금 계산된 내 실제 기록으로 덮어쓰고, 그 직후

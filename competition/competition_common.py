@@ -624,8 +624,9 @@ def _bump_rating(entry, d_goals=0, d_assists=0):
         r = float(entry.get("rating") or 6.3)
     except (TypeError, ValueError):
         r = 6.3
+    _r_floor = min(4.0, r)   # [2026-11] 이미 4.0 아래(퇴장)면 그 값이 바닥
     r += d_goals * _RATING_PER_GOAL + d_assists * _RATING_PER_ASSIST
-    entry["rating"] = round(max(3.0, min(10.0, r)), 1)
+    entry["rating"] = round(max(_r_floor, min(10.0, r)), 1)
 
 
 def reconcile_side_stats(lst, my_idx, team_score):
@@ -2421,7 +2422,7 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
         elif _yellow_ev:
             events = list(events) + _yellow_ev
     if not (_suspended or _benched) and "big_match_rating" in _pe:
-        rating = max(3.0, min(10.0, round(rating + _pe["big_match_rating"], 1)))
+        rating = max(min(4.0, rating), min(10.0, round(rating + _pe["big_match_rating"], 1)))   # 이미 4.0 아래(퇴장)면 끌어올리지 않음
 
     # [2026-08 신설, 신민용 요청] champions_engine과 동일한 "나" 슬롯
     # 바꿔치기 — 전술엔진 로스터엔 "나"가 없으므로 포지션이 같은 슬롯을

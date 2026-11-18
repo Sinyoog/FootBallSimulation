@@ -487,7 +487,11 @@ def _evaluate(conn, tid):
     #     못 왔다고 평가하면 안 된다).
     absent = []
     kind = (t["kind"] or "")
-    if kind in ("world", "continent", "region"):
+    # [2026-11 국가대표 평가 v2] 켜져 있으면 예선 탈락국 평가·경질·재계약은 연말 종합 평가(national_eval)가 한다 —
+    # 여기서는 본선 결과 기록·명성·임시 감독 정리·은퇴만.
+    import constants as _C2
+    _v2 = bool(getattr(_C2, "NAT_EVAL_V2", False))
+    if kind in ("world", "continent", "region") and not _v2:
         if kind == "world":
             q = ("SELECT c.id, c.name FROM countries c "
                  "WHERE c.id IN (SELECT country_id FROM national_team_managers "
@@ -668,6 +672,8 @@ def _evaluate(conn, tid):
 
         # ── 명성 갱신 ────────────────────────────────────────────
         delta = national_result_rep(key, orank, rrank, wp, is_world_cup=is_wc)
+        if _v2 and kind == "region":
+            delta *= float(getattr(_C2, "NAT_V2_REGION_REP_MULT", 1.0))   # 지역컵 명성은 따로·작게
         rep = max(0.0, min(100.0, float(link["reputation"] or 0.0) + delta))
         if delta > 0:
             stats["rep_up"] += 1
@@ -694,6 +700,8 @@ def _evaluate(conn, tid):
             changed.add(cid)
             _ob["caretaker_end"] += 1
             continue
+        if _v2:
+            continue        # 경질·재계약은 연말 종합 평가(national_eval.evaluate_year)
         # [실험 C 관찰] 분모 = 실제 평가된 정식 감독(skipped_fresh·공석·임시 제외)
         _ob["eval_full"] += 1
         _ob["evaluated_links"].append(int(link["id"]))

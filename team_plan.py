@@ -477,6 +477,85 @@ def club_fill_slots(candidates, slots_only):
     return placed
 
 
+MY_LINEUP_ID = -1   # 내 선수 후보 id(tactical_engine.MY_SIM_PLAYER_ID·game_engine._SIA_MY_PLAYER_ID와 같은 값)
+
+
+def my_lineup_candidate(p, base=None):
+    """[2026-11-17 신설, 신민용 확정 — 선발 경로 통일] 선발 배치에 넣을 내 선수 후보. 메인 화면과 실제 경기가
+    반드시 이 함수로 만든다 — 배치 점수가 읽는 값(포지션·부포·OVR·주발·세부역할)이 두 경로에서 같아야 결과가 같다.
+    base: 경기 엔진용 선수 dict(능력치 포함)처럼 이미 있는 dict에 값을 채워 넣을 때."""
+    d = dict(base) if base else {}
+    d["id"] = MY_LINEUP_ID
+    d["position"] = p.get("position", "CM") or "CM"
+    d["ovr"] = p.get("ovr", 40)
+    d["foot"] = p.get("foot") or ""
+    d["sub_role"] = p.get("sub_role") or ""
+    d.pop("sub_pos", None)
+    try:
+        import sub_positions as _subp
+        _sp = _subp.my_sub()
+        if _sp:
+            d["sub_pos"] = _sp
+    except Exception:
+        pass
+    return d
+
+
+def _forced_my_slot(me, slots):
+    """선발 출전 판정인데 최적 배치에서 빠졌을 때 내가 설 자리: 주포와 같은 이름의 첫 자리, 없으면 내 점수가
+    가장 높은 자리(GK는 GK 자리만, 필드 선수는 GK 자리 제외)."""
+    import formation_logic as _fl
+    pos = me.get("position")
+    for i, s in enumerate(slots):
+        if s == pos:
+            return i
+    is_gk = (pos == "GK")
+    cand = [i for i, s in enumerate(slots) if (s == "GK") == is_gk] or list(range(len(slots)))
+    return max(cand, key=lambda i: (_fl._slot_value(me, slots[i]), -i))
+
+
+def club_lineup_with_me(ai_roster, slots, me=None, status="out"):
+    """[2026-11-17 신설, 신민용 확정 — 선발 경로 통일] 내 소속팀 선발 11명. 메인 화면 포메이션과 실제 내 경기가
+    같이 쓴다. 반환 (placed, my_idx, forced) — placed는 슬롯 순서 리스트(빈 자리 None, 배정 선수에 _slot_idx 태깅).
+      · status != "start"(벤치·결장) 또는 me 없음: AI 선수만 최적 배치(예전 경기 선발과 같다).
+      · "start"이고 최적 배치(나 포함)가 나를 고르면: 그 배치 그대로(forced=False).
+      · "start"인데 최적 배치에서 빠지면: 나를 주포 자리에 고정하고 나머지 10자리를 AI 선수로 다시 최적 배치(forced=True)."""
+    ai = [q for q in (ai_roster or []) if q]
+    if me is None or status != "start":
+        return club_fill_slots(ai, slots), None, False
+    placed = club_fill_slots(ai + [me], slots)
+    for i, q in enumerate(placed):
+        if q is me:
+            return placed, i, False
+    idx = _forced_my_slot(me, slots)
+    rest_slots = [s for j, s in enumerate(slots) if j != idx]
+    rest = club_fill_slots(ai, rest_slots)
+    out, k = [], 0
+    for j in range(len(slots)):
+        if j == idx:
+            me["_slot_idx"] = j
+            out.append(me)
+        else:
+            q = rest[k] if k < len(rest) else None
+            k += 1
+            if q is not None:
+                q["_slot_idx"] = j
+            out.append(q)
+    return out, idx, True
+
+
+def my_team_lineup(team_id, formation, p, status, me_base=None):
+    """[2026-11-17 신설] team_id(내 소속팀) 로스터를 경기 엔진과 같은 방식(match_flow._fetch_roster — 부포 포함)으로
+    읽어 club_lineup_with_me를 부른다. 반환 (placed, my_idx, forced, roster)."""
+    from constants import FORMATION_SLOTS
+    from match_sim.match_flow import _fetch_roster
+    slots = FORMATION_SLOTS.get(formation, FORMATION_SLOTS["4-4-2"])
+    roster = _fetch_roster(team_id)
+    me = my_lineup_candidate(p, me_base) if p else None
+    placed, idx, forced = club_lineup_with_me(roster, slots, me, status)
+    return placed, idx, forced, roster
+
+
 def lineup_strength(lineup, formation):
     """선발 11명의 유효 OVR 평균(빈 자리는 제외). 선수가 하나도 없으면 None."""
     from constants import FORMATION_SLOTS
