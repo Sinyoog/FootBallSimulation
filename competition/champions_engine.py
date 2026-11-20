@@ -811,10 +811,11 @@ def _resolve_pso(h_ovr, a_ovr, neutral=False):
     return resolve_pso(h_ovr, a_ovr, neutral=neutral)
 
 
-def _cont_rule(cfg):
-    """[2026-11 전력 기준 통일] 내 팀 경기 전력 가산 규칙 — competition_common.cont_strength_rule."""
+def _cont_rule(cfg, t=None):
+    """[2026-11 전력 기준 통일] 내 팀 경기 전력 가산 규칙 — competition_common.cont_strength_rule.
+    t(대회 행)를 넘기면 그 대회 득점 배율까지 붙는다([2026-11 득점 환경])."""
     from competition.competition_common import cont_strength_rule
-    return cont_strength_rule(cfg)
+    return cont_strength_rule(cfg, t)
 
 
 def _sim_ai_match(t, m, my_played=False, conn=None, reason="injury", batch=None, forced=None):
@@ -880,7 +881,7 @@ def sim_my_cl_match_as_ai(week, p, reason="injury", day=None):
                             0.0 if m["stage"] in CHAMPIONS_CFG.neutral_stages else _home_advantage(),
                             extra_time=(m["stage"] != "league" and _leg != 1),
                             agg_home=_agg[0], agg_away=_agg[1],
-                            strength_rule=_cont_rule(CHAMPIONS_CFG))
+                            strength_rule=_cont_rule(CHAMPIONS_CFG, t))
     _sim_ai_match(t, m, my_played=False, reason=reason,
                   forced=((_cs["home_score"], _cs["away_score"]) if _cs is not None else None))
     from game_engine import update_player, _calc_manager_rel
@@ -1010,7 +1011,7 @@ def simulate_my_cl_match(week, p, day=None):
             extra_time=(m["stage"] != "league" and _leg != 1),
             agg_home=_agg[0], agg_away=_agg[1],
             me=_chain_me_spec(p, is_home, "out" if _suspended else ("bench" if _benched else "start")),
-            strength_rule=_cont_rule(CHAMPIONS_CFG))   # [2026-11 전력 기준 통일]
+            strength_rule=_cont_rule(CHAMPIONS_CFG, t))   # [2026-11 전력 기준 통일] + 득점 배율
         hs, as_ = sim["home_score"], sim["away_score"]
         hs90, as90 = sim.get("home_score_90", hs), sim.get("away_score_90", as_)
         went_et = bool(sim.get("went_extra_time"))

@@ -306,17 +306,37 @@ def _news_group_html(g) -> str:
     return _box_html(_PLAIN_BOX_COLOR, "<br>".join(_colorize_news(y, w, t) for y, w, t in g["lines"]))
 
 
-# 필터 버튼 3종의 공통 스타일 — "로그" 라벨 옆 작은 토글 버튼.
+# 필터 버튼 공통 스타일 — "로그" 칸 옆 토글 버튼.
+# [2026-11 변경] 버튼이 줄을 꽉 채우도록(같은 폭으로 늘어남) 좌우 여백을 없애고, 플레이어 패널
+# 탭 버튼(전체/기본/시즌/신체/스탯)처럼 11px 굵게. 색(선택=파랑)은 예전 그대로.
+_LOG_HEADER_H = 26
 _LOG_MODE_BTN_QSS = """
 QPushButton {
     background:#232323; color:#999; border:1px solid #333;
-    border-radius:4px; padding:1px 8px; font-size:10px;
+    border-radius:4px; padding:0px 2px; font-size:11px; font-weight:bold;
 }
 QPushButton:checked {
     background:#2d4a6b; color:#eee; border:1px solid #4a7ab0;
 }
-QPushButton:hover:!checked { background:#2a2a2a; }
+QPushButton:hover:!checked { background:#2a2a2a; color:#bbb; }
 """
+# [2026-11 신설] 정렬 토글 — 켜짐(아래에서 위로)은 필터 선택(파랑)과 헷갈리지 않게 호박색.
+_LOG_SORT_BTN_QSS = """
+QPushButton {
+    background:#232323; color:#999; border:1px solid #333;
+    border-radius:4px; padding:0px 2px; font-size:11px; font-weight:bold;
+}
+QPushButton:checked {
+    background:#5a4614; color:#fff; border:1px solid #c9a227;
+}
+QPushButton:hover:!checked { background:#2a2a2a; color:#bbb; }
+"""
+# [2026-11 신설] "로그" 제목 칸 — 줄 높이에 맞춘 큰 글자 + 플레이어 패널 정보칸 같은 테두리 상자.
+_LOG_TITLE_QSS = (
+    "color:#d0d0d0; font-size:16px; font-weight:bold;"
+    "background-color:#262626; border:1px solid #3a3a3a; border-radius:4px;"
+    "padding:0px 2px;"
+)
 
 
 
@@ -373,24 +393,44 @@ class LogPanel(QWidget):
 
         lay = QVBoxLayout(self); lay.setContentsMargins(8,8,8,8); lay.setSpacing(4)
 
+        # [2026-11 신설, 신민용 요청: "로그 정렬(오름차순/내림차순) 버튼 — 끄면 지금처럼 위에서
+        # 아래, 켜면 아래에서 위로. 글자를 뒤집는 게 아니라 상자로 묶인 덩어리의 순서만 반대로"]
+        # 켜면 날짜(뉴스는 주차) 상자의 순서만 거꾸로 — 최신 상자가 맨 위에 오고, 상자 안 줄 순서는
+        # 그대로다. 필터 모드처럼 meta 표에 저장해 다음 실행 때도 유지한다.
+        self._sort_desc = self._load_saved_sort_desc()
+
+        # [2026-11 레이아웃 변경, 신민용 요청: "로그 글자가 잘 안 보인다 — 줄 높이만큼 키우고
+        # 그리드 상자로 감싸고, 버튼들이 줄을 꽉 채우게(플레이어 패널의 전체/기본/시즌/신체/스탯처럼)"]
+        # [로그 | 정렬 | 전체 | 핵심 | 경기 | 뉴스] 6칸을 같은 높이·같은 폭으로 나란히 둔다.
         header_w = QWidget()
         header_w.setStyleSheet("border-bottom:1px solid #2a2a2a;")
         header_row = QHBoxLayout(header_w)
         header_row.setContentsMargins(0, 0, 0, 4)
-        header_row.setSpacing(4)
+        header_row.setSpacing(3)
         t = QLabel("로그")
-        t.setStyleSheet("color:#888;font-size:11px;border:none;")
-        header_row.addWidget(t)
-        header_row.addStretch(1)
+        t.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        t.setFixedHeight(_LOG_HEADER_H)
+        t.setStyleSheet(_LOG_TITLE_QSS)
+        header_row.addWidget(t, 1)
+
+        self._sort_btn = QPushButton("정렬")
+        self._sort_btn.setCheckable(True)
+        self._sort_btn.setFixedHeight(_LOG_HEADER_H)
+        self._sort_btn.setStyleSheet(_LOG_SORT_BTN_QSS)
+        self._sort_btn.setChecked(self._sort_desc)
+        self._update_sort_tooltip()
+        self._sort_btn.clicked.connect(self._set_sort_desc)
+        header_row.addWidget(self._sort_btn, 1)
+
         self._mode_buttons = {}
         for mode_key, mode_label in (("all", "전체"), ("core", "핵심"), ("match", "경기"), ("news", "뉴스")):
             btn = QPushButton(mode_label)
             btn.setCheckable(True)
             btn.setAutoExclusive(True)
-            btn.setFixedHeight(20)
+            btn.setFixedHeight(_LOG_HEADER_H)
             btn.setStyleSheet(_LOG_MODE_BTN_QSS)
             btn.clicked.connect(lambda _checked, m=mode_key: self._set_filter_mode(m))
-            header_row.addWidget(btn)
+            header_row.addWidget(btn, 1)
             self._mode_buttons[mode_key] = btn
         self._mode_buttons[self._filter_mode].setChecked(True)
         lay.addWidget(header_w)
@@ -509,6 +549,56 @@ class LogPanel(QWidget):
         except Exception:
             pass
 
+    # ── 정렬(아래에서 위로) 저장/복원 ─────────────── [2026-11 신설]
+    _SORT_META_KEY = "ui_log_panel_sort_desc"
+
+    def _load_saved_sort_desc(self) -> bool:
+        try:
+            from database import get_conn
+            row = get_conn().execute(
+                "SELECT value FROM meta WHERE key=?", (self._SORT_META_KEY,)).fetchone()
+            return bool(row) and row["value"] == "1"
+        except Exception:
+            return False
+
+    def _save_sort_desc(self):
+        try:
+            from database import get_conn
+            conn = get_conn()
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                         (self._SORT_META_KEY, "1" if self._sort_desc else "0"))
+            conn.commit()
+        except Exception:
+            pass
+
+    def _update_sort_tooltip(self):
+        self._sort_btn.setToolTip(
+            "정렬: 최신이 맨 위 (아래에서 위로) — 누르면 원래대로(위에서 아래로)" if self._sort_desc
+            else "정렬: 최신이 맨 아래 (위에서 아래로) — 누르면 최신이 맨 위로")
+
+    def _set_sort_desc(self, checked: bool):
+        """정렬 버튼 클릭 — 상자 순서만 뒤집어 다시 그린다(필터 모드 전환과 같은 비용)."""
+        checked = bool(checked)
+        if checked == self._sort_desc:
+            return
+        self._sort_desc = checked
+        self._save_sort_desc()
+        self._update_sort_tooltip()
+        if self._initialized:
+            self._render_full()
+
+    def _add_groups_html(self, chunk_html: str):
+        """증분 갱신으로 새로 생긴 상자들을 화면에 붙인다.
+        기본(위→아래): 끝에 append. 정렬 켜짐(아래→위): 맨 앞에 끼워 넣는다 — 이미 그려진
+        내용은 다시 그리지 않아 증분 갱신 성능 원칙은 그대로다."""
+        if not self._sort_desc:
+            self.te.append(chunk_html)
+            return
+        from PyQt6.QtGui import QTextCursor
+        cur = QTextCursor(self.te.document())
+        cur.movePosition(QTextCursor.MoveOperation.Start)
+        cur.insertHtml(chunk_html)
+
     def _render_full(self):
         """self._year_entries 전체를 현재 필터 모드로 걸러 setHtml로
         다시 그린다 — 연도 경계(새해)나 필터 모드 변경 시 사용.
@@ -518,21 +608,34 @@ class LogPanel(QWidget):
         줄 앞에 연도를 붙인다(_colorize_news) — 그 외 모드는 기존과
         동일."""
         # [2026-10] 같은 날짜(뉴스는 같은 주차) 줄을 대회 색 테두리 상자로 묶어 그린다.
+        # [2026-11] 정렬이 켜져 있으면 상자 순서만 거꾸로(최신 상자가 맨 위) 그린다. "마지막 상자"
+        # 상태(_last_group/_last_news_key)는 정렬과 무관하게 항상 시간상 마지막 상자를 가리킨다.
         if self._filter_mode == "news":
             groups, _ = _group_news(self._news_entries)
-            chunk_html = "".join(_news_group_html(g) for g in groups)
+            shown = reversed(groups) if self._sort_desc else groups
+            chunk_html = "".join(_news_group_html(g) for g in shown)
             self._last_news_key = groups[-1]["key"] if groups else None
         else:
             texts = [text for text, log_type in self._year_entries
                      if _passes_filter(text, log_type, self._filter_mode)]
             groups, _ = _group_day_lines(texts)
-            chunk_html = "".join(_day_group_html(g) for g in groups)
+            shown = reversed(groups) if self._sort_desc else groups
+            chunk_html = "".join(_day_group_html(g) for g in shown)
             self._last_group = groups[-1] if groups else None
         self.te.setHtml(f'<div style="font-family:\'Malgun Gothic\',monospace;'
                         f'font-size:12px;">{chunk_html}</div>')
         self._scroll_to_bottom()
 
     def _scroll_to_bottom(self):
+        """최신 쪽 끝으로 스크롤 — 기본은 맨 아래, 정렬이 켜져 있으면 맨 위."""
+        if getattr(self, "_sort_desc", False):
+            from PyQt6.QtCore import QTimer
+            sb = self.te.verticalScrollBar()
+            QTimer.singleShot(0, lambda: sb.setValue(sb.minimum()))
+            return
+        self._scroll_to_bottom_raw()
+
+    def _scroll_to_bottom_raw(self):
         # [2026-08 버그수정, 신민용 리포트: "패널을 나갔다 들어오면 로그가
         # 맨 아래가 아니라 위쪽에서 시작한다"] setHtml()/append() 직후
         # 곧바로 verticalScrollBar().setValue(maximum())을 부르면, 그
@@ -631,13 +734,16 @@ class LogPanel(QWidget):
             self._render_full()
             return
         if groups:
+            # [2026-11] 정렬이 켜져 있으면 새 상자들도 거꾸로 이어 붙여 맨 앞에 끼워 넣는다.
+            shown = list(reversed(groups)) if self._sort_desc else groups
             if self._filter_mode == "news":
-                chunk_html = "".join(_news_group_html(g) for g in groups)
+                chunk_html = "".join(_news_group_html(g) for g in shown)
                 self._last_news_key = groups[-1]["key"]
             else:
-                chunk_html = "".join(_day_group_html(g) for g in groups)
+                chunk_html = "".join(_day_group_html(g) for g in shown)
                 self._last_group = groups[-1]
             # QTextBrowser.append()은 기존 내용을 다시 파싱/렌더링하지 않고
             # 끝에 새 블록만 덧붙인다 — 여기가 "증분" 갱신의 핵심.
-            self.te.append(chunk_html)
+            # (정렬 켜짐이면 맨 앞에 끼워 넣는다 — _add_groups_html)
+            self._add_groups_html(chunk_html)
             self._scroll_to_bottom()

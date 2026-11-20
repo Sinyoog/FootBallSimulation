@@ -1077,13 +1077,21 @@ def cont_ai_strength(team_id, prestige_w=0.0, conn=None):
     return val
 
 
-def cont_strength_rule(cfg):
+def cont_strength_rule(cfg, t=None):
     """[2026-11 전력 기준 통일, 신민용 확정] 내 팀 대륙 대항전 경기(체인 엔진)의 팀 전력 가산 규칙 —
     같은 대회 AI 경기(위 cont_ai_strength)와 같은 명문 반영 비율. 표에 없는 대회(대륙 슈퍼컵 등)나
-    CONT_AI_LEAGUE_FORMULA=False면 None(가산 없음 — AI 경기도 참가팀 ovr만 쓴다)."""
+    CONT_AI_LEAGUE_FORMULA=False면 None(가산 없음 — AI 경기도 참가팀 ovr만 쓴다).
+    t(대회 행): [2026-11 득점 환경, 신민용 확정] 넘기면 4번째 값으로 그 대회 AI 경기 득점 배율
+    (cont_comp_goal_mult — 챔스·유로파·컨퍼런스만)을 붙인다. 체인 엔진이 같은 배율(× 기본 보정)을
+    슈팅 xG에 곱한다(tactical_engine.chain_goal_mult) — 리그 배율과 겹치지 않는다."""
     _pw = CONT_AI_PRESTIGE_WEIGHT.get(cfg.match_table) if CONT_AI_LEAGUE_FORMULA else None
     # 3번째 값 = 감독 보정 사용 여부 — 그 대회 AI 경기(sim_ai_match)와 같게 cfg.manager_bonus.
-    return None if _pw is None else ("cont", _pw, bool(getattr(cfg, "manager_bonus", False)))
+    if _pw is None:
+        return None
+    rule = ("cont", _pw, bool(getattr(cfg, "manager_bonus", False)))
+    if t is not None and cfg.match_table in _CONT_COMP_GOAL_TABLES:
+        rule = rule + (cont_comp_goal_mult(t, cfg.match_table),)
+    return rule
 
 
 def cwc_strength_rule():
@@ -1497,7 +1505,7 @@ def sim_ai_match(cfg, t, m, my_played=False, conn=None, reason="injury", batch=N
                 kind={"유로파리그": "europa", "컨퍼런스리그": "conference", "슈퍼컵": "supercup"}.get(
                     cfg.award_prefix, "cl"),
                 week=m.get("week"), day=m.get("day"), targets=_g2_t,
-                strength_rule=cont_strength_rule(cfg))   # [2026-11] 대회별 전력 가산(D)
+                strength_rule=cont_strength_rule(cfg, t))   # [2026-11] 대회별 전력 가산(D) + 득점 배율
         if _cm.covered(cfg.entry_table, cfg.match_table, t["id"]):
             # [2026-10 A안] 내가 참가하는 대회의 AI 경기 — 엔진으로 돌려 실측 기록(controlled_matches.sim_cover_match)
             from game_engine import _home_advantage as _ha_cov
@@ -1507,7 +1515,7 @@ def sim_ai_match(cfg, t, m, my_played=False, conn=None, reason="injury", batch=N
                 agg_home=_agg[0], agg_away=_agg[1],
                 comp={"sc_tournaments": "sc", "domestic_sc_tournaments": "dsc"}.get(cfg.tournament_table, "cl"),
                 tkey=f"{cfg.tournament_table}:{t['id']}", targets=_g2_t, prior=_g2,
-                strength_rule=cont_strength_rule(cfg))   # [2026-11] 대회별 전력 가산(D)
+                strength_rule=cont_strength_rule(cfg, t))   # [2026-11] 대회별 전력 가산(D) + 득점 배율
         if _g2 is not None:
             forced = (_g2["hs"], _g2["as"])
     if forced is not None:
@@ -2225,7 +2233,7 @@ def sim_my_match_as_ai(cfg, week, p, get_my_match_fn, reason="injury", day=None)
                             0.0 if m["stage"] in cfg.neutral_stages else _home_advantage(),
                             extra_time=(m["stage"] != "league" and _leg != 1),
                             agg_home=_agg[0], agg_away=_agg[1],
-                            strength_rule=cont_strength_rule(cfg))
+                            strength_rule=cont_strength_rule(cfg, t))   # + 득점 배율(정의부 주석)
     _forced = (_cs["home_score"], _cs["away_score"]) if _cs is not None else None
     sim_ai_match(cfg, t, m, my_played=False, reason=reason, forced=_forced)
     from game_engine import update_player, _calc_manager_rel
@@ -2358,7 +2366,7 @@ def simulate_my_match(cfg, week, p, get_my_match_fn, day=None):
             extra_time=(m["stage"] != "league" and _leg != 1),
             agg_home=_agg[0], agg_away=_agg[1],
             me=_chain_me_spec(p, is_home, _my_status),
-            strength_rule=cont_strength_rule(cfg))   # [2026-11 전력 기준 통일]
+            strength_rule=cont_strength_rule(cfg, t))   # [2026-11 전력 기준 통일] + 득점 배율
         _chain = sim
         hs, as_ = sim["home_score"], sim["away_score"]
         hs90, as90 = sim.get("home_score_90", hs), sim.get("away_score_90", as_)

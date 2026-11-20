@@ -547,6 +547,22 @@ class CenterPanel(QWidget):
         adv_row.addWidget(self.btn_mode)
         self.lay.addLayout(adv_row)
 
+        # [2026-11 신설, 신민용 요청: "키보드 엔터를 누르면 다음주(진행 버튼)를 클릭할 수 있게"]
+        # 메인 창이 활성 창일 때 Enter(본체 Return·숫자패드 Enter 둘 다)를 누르면 진행 버튼을
+        # 누른 것과 똑같이 동작한다(버튼에 떠 있는 모드 그대로 — 이번 주/하루/1년 넘기기).
+        #   - WindowShortcut: 다른 창(경기 상세, 세계 기록실, 확인 창 등)이 앞에 있으면 그 창이
+        #     Enter를 받고 여기선 반응하지 않는다. 콤보 목록이 펼쳐져 있을 때도 마찬가지.
+        #   - 버튼이 비활성(진행 중)이면 무시 → 진행 중에 Enter를 눌러도 두 번 돌지 않는다.
+        #   - setAutoRepeat(False): Enter를 꾹 누르고 있어도 한 번만 진행한다.
+        from PyQt6.QtGui import QShortcut, QKeySequence
+        self._enter_shortcuts = []
+        for _key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            _sc = QShortcut(QKeySequence(_key), self)
+            _sc.setContext(Qt.ShortcutContext.WindowShortcut)
+            _sc.setAutoRepeat(False)
+            _sc.activated.connect(self._on_enter_advance)
+            self._enter_shortcuts.append(_sc)
+
         # 예상 변화 박스
         # [2026-11 레이아웃 변경, 신민용 요청: "이번 주 예상 변화가 한 줄을 다
         # 차지하는데, 좌측에 칸(표)으로 깔끔하게 밀어두고 우측에 다른 걸 만들
@@ -2089,6 +2105,16 @@ class CenterPanel(QWidget):
     def _hide_processing_overlay(self):
         if self._proc_overlay is not None:
             self._proc_overlay.hide()
+
+    def _on_enter_advance(self):
+        """[2026-11 신설] Enter 단축키 → 진행 버튼 클릭(버튼이 보이고 눌릴 수 있을 때만)."""
+        btn = getattr(self, "adv_btn", None)
+        if btn is None or not btn.isVisible() or not btn.isEnabled():
+            return
+        from PyQt6.QtWidgets import QApplication
+        if QApplication.activeModalWidget() is not None or QApplication.activePopupWidget() is not None:
+            return
+        btn.click()
 
     def _advance(self):
         if self._year_mode:

@@ -66,6 +66,24 @@ GK_SHORT_P = {"POSSESSION": 0.80, "MIXED": 0.60, "DIRECT": 0.30}
 B_SHORT, B_FWD, B_LONG_ACC, B_THROUGH, B_DRIB, B_CROSS_ACC = 0.90, 0.74, 0.80, 0.33, 0.55, 0.50
 B_RECV_TACKLE = 0.42          # 압박 속 수신 경합에서 수비가 이길 기본 확률
 K_PASS, K_DUEL, K_SHOT, K_GK = 0.15, 0.25, 0.15, 0.15
+# [2026-11 GK 캐리 과잉(토너먼트), 신민용 확정 — 'N1 단독'(M=2.8)] GK 선방 능력의 실효값만,
+#   effective_stat 곡선의 99 이상 구간 기울기를 3.8 → 2.8로 완화한 곡선으로 계산한다(팀 가산을 더한
+#   선방 능력 그대로 — 가산 처리 방식은 예전과 같다). 선방 능력+가산이 99 이하인 GK(일반 GK, 수비수
+#   팀 프리미엄이 우리 GK를 거쳐 들어가는 경로 포함)는 예전과 완전히 같다. 슈터 쪽 실효 계산은 그대로.
+#   비교 측정(테스트 복사본): 팀 가산을 곡선 뒤로 빼는 A안(+N1)은 클럽 CB·LB 캐리를 절반 가까이
+#   깎아서 제외(팰리스 LB 리그 우승 14.9% → 6.1%), 가산 증폭 상한 1.7도 부족(→ 8.1%), 이 안은 보존
+#   (→ 12.3%, 표본 오차 안). 국대 GK105/ST105: 한국 월드컵 0.93 → 0.84, 베트남 아시아 예선 0.88 → 0.81,
+#   베트남 월드컵 1.95 → 1.59(약팀 GK 영웅 현상 — 허용). False로 두면 예전과 완전히 같다.
+GK_SAVE_SOFT_TOP = True
+GK_SAVE_TOP_FROM = 99.0
+GK_SAVE_TOP_SLOPE = 2.8
+
+
+def _gk_save_value(gkq):
+    """GK 선방 능력(팀 가산 포함)의 실효값 — 위 GK_SAVE_* 주석."""
+    if not GK_SAVE_SOFT_TOP or gkq <= GK_SAVE_TOP_FROM:
+        return effective_stat(gkq)
+    return effective_stat(GK_SAVE_TOP_FROM) + (gkq - GK_SAVE_TOP_FROM) * GK_SAVE_TOP_SLOPE
 PRESS_PASS_K = 1.2            # 압박 0.5 기준 ±만큼 패스 logit 감소
 ZONE_PASS_ADJ = {D3: 0.3, M3: 0.0, A3: -0.5, BOX: -0.7}   # 상대 진영일수록 공간이 좁다(logit)
 MAN_ADV = 0.18                # 인원 차 1명당 공격 경합 logit
@@ -590,7 +608,8 @@ class _ChainMatch:
                  away_boost_position, home_adv, seed, home_formation, away_formation, home_bench,
                  away_bench, extra_time, agg_home, agg_away, home_style, away_style, player_mods=None,
                  home_str_add=0.0, away_str_add=0.0, mgr_diff=0.0, home_mgr_add=0.0, away_mgr_add=0.0,
-                 home_prem_scale=1.0, away_prem_scale=1.0):
+                 home_prem_scale=1.0, away_prem_scale=1.0, goal_mult=1.0):
+        self.goal_mult = float(goal_mult or 1.0)   # [2026-11 득점 환경] shot()의 xG 배율
         # 시드가 없으면 전역 random에서 시드를 하나 뽑는다 — 게임 전체 난수 흐름(세이브 재현성)과 이어지게.
         self.rng = random.Random(seed) if seed is not None else random.Random(random.getrandbits(64))
         # [G1] 선수별 카드 성향 보정 {선수 id: {"yellow_add", "red_add"}} — 내 선수 성격('폭력적') 등.
@@ -1724,8 +1743,12 @@ class _ChainMatch:
         stat = shooter.hed if ctx in ("header", "corner_header") else (shooter.fk if ctx in ("fk", "pk") else shooter.sht)
         gkq = D.gk.gkq if D.gk is not None else 30.0
         xg = _sig(_logit(XG_BASE[ctx] * XG_SCALE) + K_SHOT * (effective_stat(stat) - 60.0) / 10.0
-                  - K_GK * (effective_stat(gkq) - 60.0) / 10.0 - 0.35 * (pr - 0.5)
+                  - K_GK * (_gk_save_value(gkq) - 60.0) / 10.0 - 0.35 * (pr - 0.5)
                   + (0.0 if ctx in ("pk",) else 0.0))
+        if self.goal_mult != 1.0:
+            # [2026-11 득점 환경, 신민용 확정 방향] 그 대회 AI 경기와 같은 득점 배율을 슈팅 단계에서 반영 —
+            # 최종 스코어를 나중에 깎지 않고, 슈팅 하나하나의 득점 확률(xG)에 곱한다.
+            xg = min(0.95, xg * self.goal_mult)
         A.stats["shots"] += 1
         ps = _pstat(A.ps, shooter.p)
         ps["shots"] += 1
@@ -1936,8 +1959,10 @@ def simulate_chain_match(home_lineup, away_lineup, home_boost=0.0, away_boost=0.
                          extra_time=False, agg_home=0, agg_away=0,
                          home_style=None, away_style=None, player_mods=None,
                          home_str_add=0.0, away_str_add=0.0, mgr_diff=0.0, home_mgr_add=0.0, away_mgr_add=0.0,
-                         home_prem_scale=1.0, away_prem_scale=1.0):
+                         home_prem_scale=1.0, away_prem_scale=1.0, goal_mult=1.0):
     """tactical_engine.simulate_tactical_match과 같은 인자·같은 반환 키(+ time_info).
+    goal_mult: [2026-11 득점 환경] 그 대회 AI끼리 경기가 쓰는 득점 배율(리그 = 국가 득점 배율) —
+      슈팅 xG에 곱한다(아래 _ChainMatch.shot). 1.0이면 예전과 비트 단위로 같다.
     home_prem_scale/away_prem_scale: [2026-11 스타 프리미엄 v2] 팀 프리미엄 기본 전력 감쇠 배율
       (tactical_engine.star_prem_base_scale). 1.0이면 감쇠 없음.
     home_mgr_add/away_mgr_add: [2026-11] 감독 가산(팀 전력 단위, 우위 팀에만 — constants.manager_rel_pair).
@@ -1950,5 +1975,5 @@ def simulate_chain_match(home_lineup, away_lineup, home_boost=0.0, away_boost=0.
                     away_boost_position, home_adv, seed, home_formation, away_formation, home_bench,
                     away_bench, extra_time, agg_home, agg_away, home_style, away_style, player_mods,
                     home_str_add, away_str_add, mgr_diff, home_mgr_add, away_mgr_add,
-                    home_prem_scale, away_prem_scale)
+                    home_prem_scale, away_prem_scale, goal_mult)
     return m.run()

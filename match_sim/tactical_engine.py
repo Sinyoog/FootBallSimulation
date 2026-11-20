@@ -2244,6 +2244,57 @@ def star_prem_base_scale(team_id):
     return 1.0 - (1.0 - _ce.STAR_PREM_BASE_FLOOR) * g
 
 
+# [2026-11 득점 환경, 신민용 확정] 체인 엔진 경기(내 경기·내가 결장한 내 팀 경기·사용자 통제 팀 경기)도 그 대회
+# AI끼리 경기와 같은 득점 배율을 쓴다 — 예전엔 어느 리그든 체인 경기만 국가 득점 배율이 빠져서, 득점이 적은
+# 나라(한국 0.74·웨일스 0.83 등)에서는 내 팀과 상대 팀 골이 리그 다른 경기보다 많이(K리그1 +43%), 득점이 많은
+# 나라(네덜란드 1.04)에서는 적게 쌓였다. 리그 경기 = game_engine._get_league_goal_mult(그 리그 국가 배율, AI
+# 리그 경기 _gen_score와 같은 값). 대륙 대항전은 호출부가 대회 배율(competition_common.cont_comp_goal_mult)을
+# 직접 넘긴다. 국내컵·국가대표는 AI 경기도 배율이 없어(1.0) 그대로. False면 예전과 같다.
+CHAIN_GOAL_ENV = True
+# [2026-11 득점 환경 2단계, 신민용 확정] 체인 기본 득점 보정 — 국가 배율을 맞춘 뒤에도 체인 리그 경기가 AI 공식
+# 리그 경기보다 평균 약 6% 적게 득점했다(리그 18개 × 1,000경기, 시즌 경기 수 가중 AI ÷ 체인 = 1.064). 리그 경기와
+# 대륙 대항전 경기(호출부가 넘기는 대회 배율)에 한 번만 곱한다. 국내컵은 체인과 AI 컵 공식 득점이 이미 같아
+# (잉글랜드·한국·독일·브라질 컵 평균 비율 ≈ 1.0) 곱하지 않고, 국가대표도 곱하지 않는다.
+# [대항전] 대륙 대항전은 대회 배율(챔스 0.95·유로파 0.90·컨퍼런스 0.65 등)만 곱하고 기본 보정은 곱하지 않는다 —
+# 배율 1.0일 때 체인과 AI 대항전 공식의 기본 득점이 이미 같았다(아래 chain_goal_mult 주석).
+# 검증: 전체 경기당 골 AI 2.65 / 체인 2.65, 무승부 21.5% / 21.8%, 5골 이상 11.8% / 12.4%. 리그별 잔여
+# 오차(K리그 +6~9%, 브라질 −11% 등)는 따로 보정하지 않는다(신민용 확정).
+CHAIN_GOAL_BASE = 1.07
+
+
+def chain_goal_mult(home_team_id, strength_rule, goal_mult=None):
+    """체인 경기의 득점 배율(위 CHAIN_GOAL_ENV·CHAIN_GOAL_BASE 주석).
+    리그 = 국가 배율 × 기본 보정, 대륙 대항전 = 대회 배율(strength_rule 4번째 값)만, 그 밖(국내컵·국가대표 등) = 1.0.
+    goal_mult를 직접 넘기면 그 값 × 기본 보정(지금 게임 코드에는 이렇게 부르는 곳이 없다). 어느 경우든 대회 배율과
+    기본 보정은 한 번씩만 곱해진다."""
+    if not CHAIN_GOAL_ENV:
+        return 1.0
+    if goal_mult is not None:
+        return float(goal_mult) * CHAIN_GOAL_BASE
+    if isinstance(strength_rule, tuple) and strength_rule and strength_rule[0] == "cont":
+        # 대륙 대항전 — competition_common.cont_strength_rule(cfg, t)가 4번째 값으로 붙인 대회 배율.
+        # 배율이 없는 대항전(대륙 슈퍼컵 등, AI 경기도 1.0)은 1.0.
+        # 기본 보정(CHAIN_GOAL_BASE)은 곱하지 않는다 — 대항전 체인 경기는 배율 1.0에서 이미 AI 대항전 공식과
+        # 기본 득점이 같았다(챔스 수준 대진 800경기: 배율을 걷어낸 기본 득점 체인 2.79 / AI 2.79).
+        return float(strength_rule[3]) if len(strength_rule) > 3 else 1.0
+    if strength_rule != "league" or home_team_id is None:
+        return 1.0
+    try:
+        from database import get_conn
+        from game_engine import _get_league_goal_mult
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            r = cur.execute("SELECT league_id FROM teams WHERE id=?", (home_team_id,)).fetchone()
+            if not r or r[0] is None:
+                return 1.0
+            return float(_get_league_goal_mult(cur, r[0])) * CHAIN_GOAL_BASE
+        finally:
+            conn.close()
+    except Exception:
+        return 1.0
+
+
 def _strength_rule_uses_mgr(rule):
     # ("cont", 명문 비율[, 감독 보정]) — 3번째 값이 없으면 예전처럼 True(챔스·유로파·컨퍼런스 AI 경기는 감독 보정을 쓴다).
     # 클럽월드컵·대륙 슈퍼컵은 AI 경기에 감독 보정이 없어서 False로 넘어온다.
@@ -2256,7 +2307,8 @@ def simulate_my_match(home_team_id, away_team_id, home_formation, away_formation
                        home_boost=0.0, away_boost=0.0,
                        home_boost_position=None, away_boost_position=None,
                        home_adv=3.0, seed=None,
-                       extra_time=False, agg_home=0, agg_away=0, me=None, strength_rule=None):
+                       extra_time=False, agg_home=0, agg_away=0, me=None, strength_rule=None,
+                       goal_mult=None):
     """team_id 두 개만 받아서 로스터/포메이션 조회부터 시뮬레이션까지 전부
     처리하는 편의 함수. 내 소속 클럽의 클럽 대회 경기(리그·컵·하부컵·챔스류·클럽월드컵·
     국내 슈퍼컵·승강PO)가 모두 여기로 온다. 국가대표 경기는 simulate_tactical_match를 직접
@@ -2343,7 +2395,8 @@ def simulate_my_match(home_team_id, away_team_id, home_formation, away_formation
                                home_str_add=_hsa, away_str_add=_asa, mgr_diff=_mgr,
                                home_mgr_add=_hma, away_mgr_add=_ama,
                                home_prem_scale=star_prem_base_scale(home_team_id),
-                               away_prem_scale=star_prem_base_scale(away_team_id))
+                               away_prem_scale=star_prem_base_scale(away_team_id),
+                               goal_mult=chain_goal_mult(home_team_id, strength_rule, goal_mult))
     sim["me"] = _me_summary(sim, me, my_side)
     return sim
 
