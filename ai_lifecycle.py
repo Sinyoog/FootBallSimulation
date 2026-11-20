@@ -1211,6 +1211,7 @@ def run_ai_offseason(year, verbose_log=None, progress_cb=None, my_team_id=None, 
         _mil_clamp(c, year + 1)
     except Exception as _e:
         print(f"[MILITARY] 해외파 계약 상한 처리 실패(계속 진행): {_e}")
+    _gk_swap_market(c, year)   # [2026-11-19 GK 교환 이적] 5대리그 1부 GK 약점 팀 ↔ 다른 팀 GK 1:1(GK 인원 그대로)
     _gk3_excess_move(c, year, "오프시즌 끝")   # [2026-11-02 GK 3명 설계안 2]
     # [2026-11-06 신민용 확정] 모든 이동·보충이 끝난 이 시점에 GK 3명 미만 팀을 남긴다 — 다음 오프시즌 연속 판정용
     _GK_SHORT_LAST.clear()
@@ -4596,6 +4597,20 @@ def _retire_and_replace(c, year, ai_rows=None):
         else:
             _new_star_kind = None
         _new_potential_ovr = roll_potential_ovr(_new_growth_cap, _new_star_kind)
+        # [2026-11-19 GK 희귀도] 이 은퇴 대체 신인이 목표 OVR 하한을 받는가 — constants.GK_RETIRE_FLOOR_P 주석.
+        _floor_on = True
+        if r["position"] == "GK" and getattr(_CyY, "GK_RETIRE_FLOOR_P_ON", False):
+            _fl_ti = team_info.get(r["team_id"])
+            if _fl_ti and prestige_level(_fl_ti[3], _fl_ti[5]) >= 1:
+                _fl_cls = "명문"
+            elif _fl_ti and _fl_ti[1] == 1 and _fl_ti[0] in ("SS", "S"):
+                _fl_cls = "S급1부"
+            else:
+                _fl_cls = "그외"
+            _fl_p = float((getattr(_CyY, "GK_RETIRE_FLOOR_P", {}) or {}).get(_fl_cls, 1.0))
+            import zlib as _zl_fl
+            _fl_u = (_zl_fl.crc32(f"gkfloor:{r['id']}:{year}".encode("utf-8")) & 0xFFFFFFFF) / 4294967296.0
+            _floor_on = _fl_u < _fl_p
         # [2026-09 신설, "중위권 정체 탈출" momentum] 이 팀이 지금 그
         # momentum이 활성 상태인지 — constants.STAGNATION_TARGET_OVR_BONUS/
         # STAGNATION_BUY_PROB_BONUS 정의부 주석 참고. club_strength 보너스와
@@ -4970,7 +4985,8 @@ def _retire_and_replace(c, year, ai_rows=None):
         # 동일한 이유(신민용 리포트 23번)] 이 신인이 자라서 도달해야 할
         # 성인 기준 목표(target)보다 잠재력이 낮으면 설계 수준에조차
         # 못 간다 — 최소한 자기 목표까지는 클 수 있게 바닥을 건다.
-        _new_potential_ovr = max(new_ovr, int(round(target)), _new_potential_ovr)
+        # [2026-11-19] 하한도 99를 넘지 않는다(잠재력 추첨 roll_potential_ovr과 같은 상한 — 예전엔 명문 가산으로 100~102).
+        _new_potential_ovr = max(new_ovr, (min(99, int(round(target))) if _floor_on else 0), _new_potential_ovr)
         # [2026-08 신설, 진단용] 추적 대상 팀이면 이번에 생성된 신인 OVR을 기록.
         if DEBUG_PRESTIGE_TRACKING and r["team_id"] in _dbg:
             _dbg[r["team_id"]]["retired"] += 1
@@ -4984,7 +5000,7 @@ def _retire_and_replace(c, year, ai_rows=None):
                                                               r["position"], new_nat, target, new_age, stats, new_ovr,
                                                               star_kind=_new_star_kind)
         if _ff_t != target or new_ovr > _new_potential_ovr:
-            _new_potential_ovr = max(_new_potential_ovr, new_ovr, int(round(_ff_t)))
+            _new_potential_ovr = max(_new_potential_ovr, new_ovr, (min(99, int(round(_ff_t))) if _floor_on else 0))
         foreign_count_by_team[tid] = cur_foreign
         name = ""      # [2026-09] AI 실명 폐지 — _build_name_cache 주석 참고
         # [2026-08 버그수정, 신민용 리포트: "AI5가 은퇴하면 AI5가 다시
@@ -7207,6 +7223,261 @@ def _transfer_market(c, year, ai_rows=None, verbose_log=None, my_team_id=None,
 # 뉴스에 아예 안 떴다. 오프시즌 이동이 전부 끝난 뒤 ai_transfer_log(이번 창구 행)로 경로를
 # 이어 붙여, 최종 행선지까지 한 줄에 보여 준다. 표시 전용 — 이적 판정·난수와 무관.
 _NEWS_SKIP_TRANSFER_TYPES = frozenset(("임대 복귀", "임대 연장", "연장", "입대", "제대", "1군 콜업"))
+
+
+# ══════════════════════════════════════════════════════════════
+# [2026-11-19 신설, 신민용 확정 — GK 교환 이적] constants.GK_SWAP_ON 주석 참고.
+# GK 3명 원칙(판매 보호·유입 제한) 때문에 일반 이적시장·상향 이적에서 GK가 사실상 안 움직인다
+# (실측 20시즌: GK 연간 팀 이동률 0.1%, 필드 31.5%). 남은 90+ GK 이동은 거의 전부 명문팀 스카우팅이라
+# 5대리그 비명문 주전 자리로 가는 길이 없었다. 이 단계는 5대리그 1부에서 주전 GK가 팀 수준보다 확실히
+# 약한 팀만 골라, 다른 팀의 GK와 1:1로 바꾼다 — 양쪽 GK 인원이 그대로라 GK 3명 원칙과 충돌하지 않고,
+# 보충·방출을 새로 만들지 않는다. 일반 이적시장·상향 이적·스카우팅 규칙은 건드리지 않는다.
+# 난수는 전역 random을 쓰지 않는다(선수·팀 id + 연도 해시) — 이 단계를 꺼도 켜도 앞뒤 난수 흐름이 같다.
+GK_SWAP_LOG = {}
+GK_SWAP_TYPE = "GK 교환 이적"
+GK_SWAP_TYPE_BACK = "GK 교환 이적(반대급부)"
+
+
+def _gk_swap_u(key):
+    import zlib as _zl_gs
+    return (_zl_gs.crc32(key.encode("utf-8")) & 0xFFFFFFFF) / 4294967296.0
+
+
+def _gk_swap_market(c, year):
+    """5대리그 1부 GK 약점 팀 ↔ 다른 팀 GK 1:1 교환. 반환: 성사 건수.
+    사는 팀: SS·S급 1부, (주전 필드 10명 평균 − GK_SWAP_EXPECT_MINUS) − 1순위 GK ≥ GK_SWAP_GAP.
+    파는 쪽 후보: (가) 소속팀 GK 2·3순위(명문은 90+ GK가 GK_SWAP_PRESTIGE_90_MIN명 이상일 때 그중 최하위 90+만)
+                  (나) 소속팀 1순위 GK — 사는 팀 무대가 확실히 더 높을 때만(명문 주전은 명문으로만).
+    돌려보내는 GK: (가) 사는 팀 최하위 GK, (나) 사는 팀 기존 1순위 GK. 검사 하나라도 실패하면 그 교환은 통째로 없다."""
+    if not getattr(_CyY, "GK_SWAP_ON", False):
+        return 0
+    from constants import get_country_league_grade, get_ovr_range
+    from economy import LEAGUE_GRADE_RANK, estimate_transfer_fee
+    from data.prestige_clubs import prestige_level as _gs_plvl
+    _gap_need = float(getattr(_CyY, "GK_SWAP_GAP", 3))
+    _exp_minus = float(getattr(_CyY, "GK_SWAP_EXPECT_MINUS", 3))
+    _min_up = int(getattr(_CyY, "GK_SWAP_MIN_UP", 3))
+    _age_a = int(getattr(_CyY, "GK_SWAP_MAX_AGE_BACKUP", 34))
+    _age_b = int(getattr(_CyY, "GK_SWAP_MAX_AGE_STARTER", 32))
+    _cap = int(getattr(_CyY, "GK_SWAP_SEASON_CAP", 60))
+    _grades = tuple(getattr(_CyY, "GK_SWAP_BUYER_GRADES", ("SS", "S")))
+    _p90_min = int(getattr(_CyY, "GK_SWAP_PRESTIGE_90_MIN", 3))
+    _no_ret = int(getattr(_CyY, "GK_SWAP_NO_RETURN_YEARS", 3))
+    log = {"buyers": 0, "deals": 0, "a": 0, "b": 0, "no_cand": 0, "skip_used": 0}
+
+    team_rows = c.execute(
+        """SELECT t.id AS tid, t.name AS tname, t.current_tier AS tier, cn.name AS cname,
+                  cn.continent AS continent
+           FROM teams t JOIN leagues l ON t.league_id=l.id JOIN countries cn ON l.country_id=cn.id
+           ORDER BY t.id""").fetchall()
+    team_rows = _drop_mil_teams(c, team_rows, "tid")
+    meta = {}
+    for t in team_rows:
+        g = get_country_league_grade(t["cname"])
+        tier = t["tier"] or 1
+        rng = get_ovr_range(g, tier, t["cname"])
+        meta[t["tid"]] = {
+            "grade": g, "tier": tier, "cname": t["cname"], "tname": t["tname"],
+            "continent": t["continent"] or "", "plvl": _gs_plvl(t["cname"], t["tname"]),
+            "lvl": LEAGUE_GRADE_RANK.get(g, 4) * 100 - tier,
+            "ceil": (rng[1] if rng else 43), "floor_ref": _league_ovr_floor_ref(g, tier, t["cname"]),
+        }
+    rows = c.execute(
+        "SELECT id, team_id, position, age, ovr, name, nationality, on_loan_from_team_id, "
+        "last_transfer_year, contract_end_year FROM ai_players ORDER BY id").fetchall()
+    rows = [dict(r) for r in rows if r["team_id"] in meta]
+    gks = {}
+    fd = {}
+    for r in rows:
+        if r["position"] == "GK":
+            gks.setdefault(r["team_id"], []).append(r)
+        else:
+            fd.setdefault(r["team_id"], []).append(r["ovr"] or 0)
+    _key = lambda p: (-(p["ovr"] or 0), p["id"])
+    for v in gks.values():
+        v.sort(key=_key)
+
+    # 사는 팀 목록 — 시작 시점 상태로 한 번 고정(공백 큰 팀부터, 동률은 팀 id). 거래 직전에 현재 상태로 다시 판정한다.
+    def _gap_of(tid):
+        g_ = gks.get(tid)
+        f_ = sorted(fd.get(tid, ()), reverse=True)[:10]
+        if not g_ or len(f_) < 10:
+            return None
+        return (sum(f_) / 10.0 - _exp_minus) - (g_[0]["ovr"] or 0)
+
+    buyers = []
+    for tid, m in meta.items():
+        if m["tier"] != 1 or m["grade"] not in _grades:
+            continue
+        gp = _gap_of(tid)
+        if gp is not None and gp >= _gap_need:
+            buyers.append((-gp, tid))
+    buyers.sort()
+    log["buyers"] = len(buyers)
+    if not buyers:
+        GK_SWAP_LOG.clear(); GK_SWAP_LOG.update(log)
+        return 0
+
+    # 왕복 방지 — 최근 N년 안에 떠난 팀으로는 다시 안 가고, 최근 N년 안에 이 경로로 GK를 바꾼 두 팀은 다시 안 바꾼다
+    left = {}
+    pairs = set()
+    try:
+        for pid, ft, tt, ty in c.execute(
+                "SELECT player_id, from_team_id, to_team_id, transfer_type FROM ai_transfer_log "
+                "WHERE player_position='GK' AND year>?", (year - _no_ret,)).fetchall():
+            if ft is not None:
+                left.setdefault(pid, set()).add(ft)
+            if ty == GK_SWAP_TYPE and ft is not None and tt is not None:
+                pairs.add(frozenset((ft, tt)))
+    except Exception:
+        pass
+
+    _fq_now, _fq_can_take, _fq_note = _build_foreign_quota_gate(c)
+    _vfdb = _VetFitDB(c, year)
+    _season_row = c.execute("SELECT current_season FROM season_state WHERE id=1").fetchone()
+    _cur_season = _season_row["current_season"] if _season_row else 1
+    _hard = _DST_FLOOR_HARD_EXCLUDE
+    used_t = set()
+    used_p = set()
+    updates = []
+    log_rows = []
+
+    def _back_ok(back, s, p):
+        ms = meta[s]
+        if back["on_loan_from_team_id"]:
+            return False
+        if _dst_ceiling_excluded(back["ovr"] or 0, ms["ceil"]):
+            return False
+        if ms["floor_ref"] - (back["ovr"] or 0) > _hard:
+            return False
+        if _vfdb.eu_blocked(back["age"], back["nationality"], back["team_id"], s):
+            return False
+        if (back["age"] or 0) >= _VET_FIT_AGE and not _vfdb.ok(back["age"], back["ovr"], "GK", s, (p["id"],)):
+            return False
+        return True
+
+    for _ng, b in buyers:
+        if len(log_rows) // 2 >= _cap:
+            break
+        if b in used_t:
+            log["skip_used"] += 1
+            continue
+        gp = _gap_of(b)
+        if gp is None or gp < _gap_need:
+            continue
+        mb = meta[b]
+        bg = gks[b]
+        g1 = bg[0]
+        need = (g1["ovr"] or 0) + _min_up
+        cands = []
+        for s, sg in gks.items():
+            if s == b or s in used_t or s not in meta or frozenset((b, s)) in pairs:
+                continue
+            ms = meta[s]
+            n90 = [q for q in sg if (q["ovr"] or 0) >= 90]
+            for rk, p in enumerate(sg):
+                po = p["ovr"] or 0
+                if po < need:
+                    break
+                if p["id"] in used_p or p["on_loan_from_team_id"] or p["last_transfer_year"] == year:
+                    continue
+                if b in left.get(p["id"], ()):
+                    continue
+                age = p["age"] or 25
+                if rk == 0:
+                    kind = "b"
+                    if age > _age_b or mb["lvl"] <= ms["lvl"]:
+                        continue
+                    if ms["plvl"] >= 1 and mb["plvl"] < 1:
+                        continue
+                    back = g1
+                else:
+                    kind = "a"
+                    if age > _age_a:
+                        continue
+                    if ms["plvl"] >= 1 and not (len(n90) >= _p90_min and n90 and p is n90[-1]):
+                        continue
+                    back = bg[-1]
+                if len(bg) == 1:
+                    back = g1
+                if _dst_ceiling_excluded(po, mb["ceil"]) or mb["floor_ref"] - po > _hard:
+                    continue
+                if _vfdb.eu_blocked(age, p["nationality"], s, b):
+                    continue
+                if not _back_ok(back, s, p):
+                    continue
+                if not (_fq_can_take(b, p["nationality"], back["nationality"])
+                        and _fq_can_take(s, back["nationality"], p["nationality"])):
+                    continue
+                rem = (p["contract_end_year"] or year) - year
+                w = float(po - (g1["ovr"] or 0))
+                w *= 1.5 if rem <= 1 else (1.0 if rem == 2 else 0.6)
+                w *= 1.3 if kind == "a" else 1.0
+                if age > 30:
+                    w *= max(0.3, 1.0 - 0.15 * (age - 30))
+                if ms["continent"] == mb["continent"]:
+                    w *= 1.15
+                cands.append((p["id"], w, p, back, s, kind))
+        if not cands:
+            log["no_cand"] += 1
+            continue
+        cands.sort(key=lambda x: x[0])
+        tot = sum(x[1] for x in cands)
+        u = _gk_swap_u(f"gkswap:{b}:{year}") * tot
+        acc = 0.0
+        pick = cands[-1]
+        for x in cands:
+            acc += x[1]
+            if u < acc:
+                pick = x
+                break
+        _pid, _w, p, back, s, kind = pick
+        ms = meta[s]
+        # 원자적 처리 — 아래는 검사가 끝난 뒤라 실패할 일이 없다. 두 선수 갱신·기록을 같이 넣는다.
+        p_sal = _calc_ai_salary(mb["grade"], mb["tier"], p["ovr"], mb["cname"], mb["tname"], b, year)
+        bk_sal = _calc_ai_salary(ms["grade"], ms["tier"], back["ovr"], ms["cname"], ms["tname"], s, year)
+        f_in = estimate_transfer_fee(mb["grade"], mb["tier"], p["ovr"], country=mb["cname"],
+                                     position="GK", year=year, player_id=p["id"]) or 0
+        # 돌려보내는 GK도 사는 팀 시장 기준으로 값을 매긴다 — 같은 잣대의 차액만 사는 팀이 낸다
+        f_back = estimate_transfer_fee(mb["grade"], mb["tier"], back["ovr"], country=mb["cname"],
+                                       position="GK", year=year, player_id=back["id"]) or 0
+        fee = max(0, int(f_in) - int(f_back))
+        p_cend = year + 3 + int(_gk_swap_u(f"gkswap-c:{p['id']}:{year}") * 3)
+        bk_cend = year + 3 + int(_gk_swap_u(f"gkswap-c:{back['id']}:{year}") * 3)
+        updates.append((b, p_cend, year, p_sal, p["id"]))
+        updates.append((s, bk_cend, year, bk_sal, back["id"]))
+        log_rows.append((_cur_season, year, p["id"], p["name"], "GK", p["age"] or 25, p["ovr"], s, b,
+                         ms["plvl"], mb["plvl"], 0.0, 0.0, GK_SWAP_TYPE, 0, "", fee, 0, 0, p_sal, p_cend))
+        log_rows.append((_cur_season, year, back["id"], back["name"], "GK", back["age"] or 25, back["ovr"], b, s,
+                         mb["plvl"], ms["plvl"], 0.0, 0.0, GK_SWAP_TYPE_BACK, 0, "", 0, 0, 0, bk_sal, bk_cend))
+        _fq_note(b, p["nationality"], back["nationality"])
+        _fq_note(s, back["nationality"], p["nationality"])
+        # 메모리 상태 갱신(같은 오프시즌 다음 판정용) — 두 팀은 이번 오프시즌 더 거래하지 않는다
+        gks[s].remove(p); gks[b].remove(back)
+        p["team_id"], back["team_id"] = b, s
+        p["last_transfer_year"] = back["last_transfer_year"] = year
+        gks[b].append(p); gks[s].append(back)
+        gks[b].sort(key=_key); gks[s].sort(key=_key)
+        used_t.update((b, s)); used_p.update((p["id"], back["id"]))
+        log[kind] += 1
+    if updates:
+        c.executemany(
+            "UPDATE ai_players SET team_id=?, contract_end_year=?, last_transfer_year=?, salary=? WHERE id=?",
+            updates)
+    if log_rows:
+        c.executemany(
+            """INSERT INTO ai_transfer_log(
+                season, year, player_id, player_name, player_position, player_age, player_ovr,
+                from_team_id, to_team_id, from_team_prestige, to_team_prestige,
+                from_team_avg_ovr, to_team_avg_ovr, transfer_type, is_mid_season, player_role,
+                fee, is_loan, loan_return_year, salary, contract_end_year)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            log_rows)
+    log["deals"] = len(log_rows) // 2
+    GK_SWAP_LOG.clear(); GK_SWAP_LOG.update(log)
+    print(f"[GK-SWAP] {year}년 사는 팀 {log['buyers']} · 성사 {log['deals']}(후보→주전 {log['a']} · 주전 상향 {log['b']})"
+          f" · 후보 없음 {log['no_cand']} · 이미 거래한 팀 {log['skip_used']}")
+    return log["deals"]
 
 
 def _build_offseason_transfer_news(c, start_id, market_range, news_sink, my_team_id):

@@ -6,6 +6,7 @@ game.db-shm
 game.history.db-wal
 game.history.db-shm
 game.history.db.pre_pk_migration.bak
+game.history.db.pre_pk_migration.bak2
 
 # ── 실행 산출물 / 로그 ───────────────────────
 *.log

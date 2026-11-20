@@ -1360,8 +1360,8 @@ class CenterPanel(QWidget):
         is_post = _os_s <= week <= _os_e
         is_off  = is_pre or is_post
 
-        from constants import MIN_JOIN_AGE
-        _min_join_age = p.get("min_join_age") or MIN_JOIN_AGE
+        from game_engine import my_effective_min_join_age as _eff_mja   # [2026-11-19 MY_AGE16_RULES] 성인팀 16세(뛰어난 선수 14세)
+        _min_join_age = _eff_mja(p)
         age = p.get("age", 16)
         has_team  = bool(p.get("current_team_id"))
         # [2026-11-01 신민용 승인 — 프리시즌 오퍼 1주차 제한] 무소속 입단은 프리시즌 오퍼 구간(1주차)에만 — 프리시즌(1~3주) 판정 is_pre는 다른 곳에서 그대로.
@@ -2137,8 +2137,9 @@ class CenterPanel(QWidget):
         week = st["current_week"]
         from constants import DAYS_PER_WEEK
         day  = st.get("current_day") or ((week - 1) * DAYS_PER_WEEK + 1)
-        from constants import MIN_JOIN_AGE, SEASON_PHASES
-        _min_join_age = p.get("min_join_age") or MIN_JOIN_AGE
+        from constants import SEASON_PHASES
+        from game_engine import my_effective_min_join_age as _eff_mja   # [2026-11-19 MY_AGE16_RULES]
+        _min_join_age = _eff_mja(p)
         _ps_s, _ps_e = SEASON_PHASES["preseason1"]
 
         # [2026-08 변경, 신민용 요청: "팀 없을 때는 진행 못 하는데 이때도
@@ -2325,7 +2326,7 @@ class CenterPanel(QWidget):
 
         p2 = get_player(); st2 = get_state()
         new_week = st2["current_week"]
-        from constants import MIN_JOIN_AGE
+        from game_engine import my_effective_min_join_age as _eff_mja4   # [2026-11-19 MY_AGE16_RULES]
 
         # 구간 경계 진입 시 자동 오퍼 플래그 리셋
         from constants import OFFER_ZONES
@@ -2349,7 +2350,7 @@ class CenterPanel(QWidget):
         from constants import SEASON_PHASES as _SP4
         _pss, _pse = _SP4["preseason1"]
         from game_engine import preseason_offer_open as _pre_open4   # [2026-11-01 신민용 승인 — 프리시즌 오퍼 1주차 제한] 입단 안내도 1주차만
-        if _pre_open4(new_week) and p2.get("age",0) >= (p2.get("min_join_age") or MIN_JOIN_AGE) and not p2.get("current_team_id"):
+        if _pre_open4(new_week) and p2.get("age",0) >= _eff_mja4(p2) and not p2.get("current_team_id"):
             # 새 시즌 프리시즌 진입 → 작년 '전부 결렬→1년 훈련' 보류를 해제하고
             #   올해 다시 입단(오퍼)에 도전하게 한다.
             self._skip_join_lock = False
@@ -2704,8 +2705,9 @@ class CenterPanel(QWidget):
         # 때 딱 여기 도달) 입단 잠금을 풀어준다 — 이 리셋을 안 하면 1년
         # 넘기기 후에도 입단 버튼이 계속 잠긴 채로 남는다
         # (_on_advance_finished의 동일 로직 참고).
-        from constants import SEASON_PHASES as _SP_Y, MIN_JOIN_AGE as _MJA_Y
-        _min_join_age_y = p2.get("min_join_age") or _MJA_Y
+        from constants import SEASON_PHASES as _SP_Y
+        from game_engine import my_effective_min_join_age as _eff_mja_y   # [2026-11-19 MY_AGE16_RULES]
+        _min_join_age_y = _eff_mja_y(p2)
         _pss_y, _pse_y = _SP_Y["preseason1"]
         st2 = get_state()
         new_week = st2.get("current_week", 0) if st2 else 0
@@ -4180,8 +4182,8 @@ class CenterPanel(QWidget):
         if p.get("current_team_id"):
             show_toast(self, "⚠  소속 팀이 있을 때는 오퍼를 기다리세요")
             return
-        from constants import MIN_JOIN_AGE
-        _min_join_age = p.get("min_join_age") or MIN_JOIN_AGE
+        from game_engine import my_effective_min_join_age as _eff_mja   # [2026-11-19 MY_AGE16_RULES]
+        _min_join_age = _eff_mja(p)
         if p["age"] < _min_join_age:
             show_toast(self, f"⚠  {_min_join_age}살부터 팀에 입단할 수 있습니다")
             return

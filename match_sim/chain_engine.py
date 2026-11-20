@@ -219,6 +219,94 @@ STAR_SHOT_POS = {"ST": 1.0, "CF": 1.0, "LW": 0.8, "RW": 0.8, "CAM": 0.6, "LM": 0
 STAR_CREATE_POS = {"CAM": 1.0, "CM": 1.0, "CDM": 0.6, "LM": 0.8, "RM": 0.8, "LW": 0.6, "RW": 0.6,
                    "LWB": 0.5, "RWB": 0.5, "LB": 0.4, "RB": 0.4, "ST": 0.3, "CF": 0.4}
 
+# ── [2026-11 스타 프리미엄 v2 — 1단계, 신민용 확정] 상대 기준 캐리 + 팀 프리미엄 ──────────────────────
+# 문제(실측, 팰리스·맨시티·K리그 인천): ① 캐리 시작점이 절대값 96이라 최대 82인 K리그에 90·95가 가도 캐리 0,
+#   100에서 갑자기 폭발 ② 스타는 선발 평균에 1/11로만 들어가 실점이 안 줄었다(105 ST 혼자 팰리스 63점·우승 0.1%)
+#   ③ 조력자를 늘려도 팀 격차 보정 상한(12)에 막혀 효과가 거의 없었다.
+# 1단계 범위: 체인 엔진만. AI 공식·팀 격차 보정(상한 12)·OVR 곡선·승부차기는 그대로(2단계 몫).
+#   · 기준 수준 B = max(나를 뺀 우리 선발 평균, 상대 선발 평균) — 그 경기 22명 중 얼마나 튀느냐.
+#   · 격차 e = max(0, V(OVR) − V(B + 2.5)). V는 "수준이 높을수록 OVR 1점이 무겁다"는 가치 눈금
+#     (90 대 80 차이 > 60 대 40 차이 — 신민용 기준). 95 이상은 1점 = 1. 100+ 별도 가산 없음.
+#   · e는 예전 el_e 자리(볼 몫·실력 가산·지휘자/앵커)에 그대로 들어간다. ST·CF·윙어의 절대 기준(강팀 주포,
+#     STAR_FIN_*)은 강팀 득점 기준(97 25~35골 등) 때문에 그대로 두고 상대 기준과 큰 쪽을 쓴다.
+#   · 팀 프리미엄 P = K × Σ(순위 가중 × e^POW) — 1등 1.0, 2등 0.7, 3등 0.5 … (조력자 누적, 점점 완만),
+#     팀 합계 상한 STAR_PREM_CAP. 팀 격차 보정 상한(12) 밖의 별도 항.
+#     포지션별로 "우리 공격 / 우리 수비" 몫을 나눠, 우리 공격 몫은 우리 공격 +½·상대 수비 −½, 수비 몫은 우리
+#     수비(GK 포함) +½·상대 공격 −½. 양 팀 프리미엄은 서로 상쇄된다.
+#   · 내 선수 전용이 아니다 — AI 스타도 같은 규칙. 기준을 넘는 선수가 양 팀 모두 없으면 예전과 같다(e=0, P=0)
+#     — 단, 예전의 절대 96 하한이 사라졌으므로 하위 리그의 "동료·상대보다 2.5+ 높은" AI 선수는 이제 캐리한다.
+STAR_REL_ENABLED = True
+STAR_REL_MARGIN = 2.5
+# 가치 눈금 V의 기울기(OVR → 1점의 무게). 구간 사이는 선형, 양 끝 밖은 끝값 유지.
+STAR_VALUE_SLOPE = ((40.0, 0.25), (60.0, 0.35), (80.0, 0.70), (90.0, 0.90), (95.0, 1.00))
+STAR_PREM_K = 1.0
+STAR_PREM_POW = 1.15
+STAR_PREM_RANK_W = (1.0, 0.7, 0.5, 0.35, 0.25)
+STAR_PREM_CAP = 24.0
+# 포지션별 프리미엄 배율 — 수비수·GK는 개인 경로(볼 몫·슈팅)가 작아 같은 e라도 팀에 닿는 몫이 작다(실측: 배율 없이
+# 105 혼자 CB 66점·LB 62점 vs ST·CM 82점). 그 차이를 팀 프리미엄 쪽에서 메운다(신민용 확정 2.0).
+STAR_PREM_POS_MULT = {"CB": 2.0, "LB": 2.0, "RB": 2.0, "LWB": 1.67, "RWB": 1.67, "GK": 2.0}
+# [2026-11-20 2단계 ①, 신민용 확정 — 스타가 있는 약팀의 팀 격차 열세 완화] 분해 측정(사우샘프턴 ST 105 챔스
+# 16강~ 1,000회)에서 팀 격차 보정의 열세가 가장 큰 제약이었다(열세 ½ → +12.5%p, 0 → +30.6%p, 기준 B·승부차기보다 큼).
+# 전체 열세를 줄이면 스타 없는 약팀까지 강해지므로, 경기에서 밀리는 쪽의 팀 프리미엄(공격+수비 몫 합, 기본 전력 감쇠
+# 반영)에 비례해서만 열세를 덜어준다: 완화율 = MAX × min(1, 프리미엄 / PFULL). 105 혼자 약팀이면 최대 35%.
+# 대회 구분 없음(리그 포함), 우세 팀·스타 없는 팀은 0(예전과 같음), AI 공식은 그대로. 경기 시작 선수 기준 1회.
+# 실측: 사우샘프턴 105 ST 챔스 9.9→17.2%·리그 80.7→83.7점, CB 챔스 8.9→15.2%, 맨시티 43.5→43.4%.
+STAR_GAP_RELIEF_MAX = 0.35
+STAR_GAP_RELIEF_PFULL = 12.0
+# [순차이 우선, 신민용 확정] True면 양 팀 프리미엄을 각각 공격·수비에 넣지 않고 차이만 앞선 팀 비율로 넣는다
+# (star_premium 주석). False면 A3 검증 때 방식 — 동급 스타끼리 서로의 공격을 눌러 저득점이 됐다.
+STAR_PREM_NET_FIRST = True
+# 포지션별 (우리 공격 몫, 우리 수비 몫)
+# 개인 경로(볼 몫·실력 가산·지휘자/앵커)에 쓰는 e 상한 — 하위 리그에서 e가 커져도 개인 득점이 폭증하지 않게
+# (예전 최대 e = 105 − 96 = 9와 같은 눈금). 팀 프리미엄은 상한 없이 e 그대로(팀 합계 상한은 따로).
+STAR_IND_E_CAP = 9.0
+# [기본 전력 감쇠, 신민용 확정 A3] 팀 자체의 강함 rel = AI 공식과 같은 팀 전력(game_engine._team_avg_ovr — 선발
+# 전력 + 클럽 강도 + 명문, 내 선수 제외) − 그 팀 리그 평균. rel이 FROM을 넘으면 프리미엄 ×
+# (1 − (1 − FLOOR) × min(1, (rel − FROM) / (FULL − FROM))). 경기 상대·대회와 무관하게 팀마다 하나 — 리그 최상위
+# 팀(맨시티 +6.1 등)이 상위권 상대로도 프리미엄을 다 받던 것을 막는다(경기별 전력 차 감쇠는 상위권끼리 붙으면
+# 거의 안 걸려 맨시티 + 105 ST 우승 99.8%). 약팀·중위권(팰리스 −1.8)은 감쇠 없음 → 약팀 캐리·조력자 효과 보존.
+# 계산은 tactical_engine.star_prem_base_scale(호출부)이 해서 home_prem_scale/away_prem_scale로 넘긴다.
+# 실측(EPL·K리그 20시즌): 팰리스 105 ST 혼자 33% / 조력자 1명 48% / 3명 84% / 맨시티 93%(기준선 93%).
+STAR_PREM_BASE_DAMP = True
+STAR_PREM_BASE_FROM = 3.0
+STAR_PREM_BASE_FULL = 6.0
+STAR_PREM_BASE_FLOOR = 0.05
+# 경기별 전력 차 감쇠(시험 후 미채택 — A1). 켜면 우리 팀 전력(tmean)이 상대보다 d만큼 앞설 때 프리미엄 ×
+# (1 − (1 − DAMP_FLOOR) × min(1, d / DAMP_FULL)). 약팀이 약체 상대로도 감쇠돼 혼자·조력자 1명 구간이 목표 미달.
+STAR_PREM_MATCH_DAMP = False
+STAR_PREM_DAMP_FULL = 5.0
+STAR_PREM_DAMP_FLOOR = 0.2
+STAR_PREM_SPLIT = {"ST": (0.3, 0.7), "CF": (0.3, 0.7), "LW": (0.3, 0.7), "RW": (0.3, 0.7), "CAM": (0.3, 0.7),
+                   "LM": (0.4, 0.6), "RM": (0.4, 0.6), "CM": (0.5, 0.5), "CDM": (0.5, 0.5),
+                   "LWB": (0.25, 0.75), "RWB": (0.25, 0.75), "CB": (0.2, 0.68), "LB": (0.2, 0.8),
+                   "RB": (0.2, 0.8), "GK": (0.0, 0.7)}
+# ↑ GK 수비 몫 0.7(실효 배율 2.0 × 0.7 = 1.4, 신민용 확정) — 1.0이면 GK 105 혼자 팀이 시즌 실점 11골·챔스 우승 37%
+#   (같은 조건 ST 18%)로 토너먼트를 지배했다. 0.7에서 리그 9%·챔스 19%(ST와 같은 수준), 0.5는 리그 캐리가 거의 사라짐.
+#   몫 합이 1 미만이면 그만큼 프리미엄 자체가 줄어든다. 대회별 별도 보정은 두지 않는다(리그·대회 기준 통일).
+# ↑ CB 수비 몫 0.68(신민용 확정) — 0.8이면 CB 105 혼자 챔스 27%(ST 18%), 0.56이면 혼자 리그 8%(목표 10~20% 미달).
+#   0.68에서 혼자 리그 16%·챔스 17%. LB·RB는 공격 전개 관여가 달라 0.8 유지(따로 측정).
+
+
+def _star_value(o):
+    """가치 눈금 V(o) = ∫ 기울기 — STAR_VALUE_SLOPE(구간 선형)의 적분."""
+    o = float(o)
+    pts = STAR_VALUE_SLOPE
+    if o <= pts[0][0]:
+        return pts[0][1] * o
+    v = pts[0][1] * pts[0][0]
+    for (x0, s0), (x1, s1) in zip(pts, pts[1:]):
+        if o <= x1:
+            s_o = s0 + (s1 - s0) * (o - x0) / (x1 - x0)
+            return v + (s0 + s_o) / 2.0 * (o - x0)
+        v += (s0 + s1) / 2.0 * (x1 - x0)
+    return v + pts[-1][1] * (o - pts[-1][0])
+
+
+def star_rel_gap(o, base):
+    """상대 기준 격차 e = max(0, V(o) − V(base + 여유))."""
+    return max(0.0, _star_value(o) - _star_value(float(base) + STAR_REL_MARGIN))
+
 
 
 
@@ -451,6 +539,11 @@ class _Side:
         self.team_add = 0.0       # 팀 단위 격차 보정(합성값)
         self.maestro = 0.0
         self.anchor = 0.0
+        self.rel_e = {}           # [v2] id(선수 dict) → 상대 기준 격차 e
+        self.prem_att = 0.0       # [v2] 팀 프리미엄 순가산(우리 공격 합성값)
+        self.prem_def = 0.0       # [v2] 팀 프리미엄 순가산(우리 수비·GK 합성값)
+        self.prem = (0.0, 0.0)    # [v2] 이 팀 프리미엄 (공격 몫, 수비 몫) — 검증용
+        self.prem_scale = 1.0     # [v2] 기본 전력 감쇠 배율(호출부가 정함)
 
     def labels(self):
         return self.slots or _FALLBACK_SLOTS
@@ -496,7 +589,8 @@ class _ChainMatch:
     def __init__(self, home_lineup, away_lineup, home_boost, away_boost, home_boost_position,
                  away_boost_position, home_adv, seed, home_formation, away_formation, home_bench,
                  away_bench, extra_time, agg_home, agg_away, home_style, away_style, player_mods=None,
-                 home_str_add=0.0, away_str_add=0.0, mgr_diff=0.0, home_mgr_add=0.0, away_mgr_add=0.0):
+                 home_str_add=0.0, away_str_add=0.0, mgr_diff=0.0, home_mgr_add=0.0, away_mgr_add=0.0,
+                 home_prem_scale=1.0, away_prem_scale=1.0):
         # 시드가 없으면 전역 random에서 시드를 하나 뽑는다 — 게임 전체 난수 흐름(세이브 재현성)과 이어지게.
         self.rng = random.Random(seed) if seed is not None else random.Random(random.getrandbits(64))
         # [G1] 선수별 카드 성향 보정 {선수 id: {"yellow_add", "red_add"}} — 내 선수 성격('폭력적') 등.
@@ -511,6 +605,8 @@ class _ChainMatch:
         self.A = _Side("away", away_lineup, as_, away_bench, away_boost, away_boost_position, away_style,
                        af, 0.0)
         self.extra_time, self.agg_home, self.agg_away = extra_time, agg_home, agg_away
+        self.H.prem_scale = float(home_prem_scale if home_prem_scale is not None else 1.0)
+        self.A.prem_scale = float(away_prem_scale if away_prem_scale is not None else 1.0)
         # [A안] 팀 단위 격차 보정 — 선발 11명 평균(내 선수 포함)으로 경기 시작 때 한 번 정한다.
         # [2026-11 팀 전력 정식화] OVR 그대로가 아니라 그 자리 적합도(slot_fit = AI 선발 전력과 같은 규칙)의
         # 평균 — 제자리가 아닌 선수가 많은 팀(예: 3-5-1-1 팰리스 92.91 → 92.15)을 실제보다 강하게 보지 않는다.
@@ -566,6 +662,17 @@ class _ChainMatch:
                 self.stam.ensure(p)
         self.rebuild(self.H)
         self.rebuild(self.A)
+        # [2026-11-20 2단계 ①, 신민용 확정] 스타가 있는 약팀의 팀 격차 열세 완화(STAR_GAP_RELIEF_* 주석).
+        # 프리미엄은 위 rebuild에서 계산된 경기 시작 선수 기준. 완화가 0이면(스타 없음·우세 팀) 예전과 같다.
+        if STAR_REL_ENABLED and STAR_GAP_RELIEF_MAX > 0 and _tb != 0:
+            _weak = self.A if _tb > 0 else self.H
+            _r = STAR_GAP_RELIEF_MAX * min(1.0, sum(_weak.prem) / STAR_GAP_RELIEF_PFULL)
+            if _r > 0:
+                _d = -_tb * _r                    # 열세를 줄이는 방향(약팀 쪽으로)
+                self.H.team_add += _d / 2.0
+                self.A.team_add -= _d / 2.0
+                self.rebuild(self.H)
+                self.rebuild(self.A)
         # 점유 상태
         self.att = self.H
         self.zone, self.lane, self.car = M3, "C", None
@@ -576,12 +683,81 @@ class _ChainMatch:
     def other(self, sd):
         return self.A if sd is self.H else self.H
 
+    def star_premium(self):
+        """[v2] 양 팀 선수의 상대 기준 격차 e와 팀 프리미엄 순가산을 갱신한다(위 STAR_REL_* 주석).
+        현재 그라운드 위 선수(sd.cur) 기준이라 교체·퇴장이 바로 반영된다. 난수 없음.
+        결과는 양 팀 그라운드 위 선수 구성에만 달려 있으므로, 구성이 그대로면 다시 계산하지 않는다(성능)."""
+        sides = (self.H, self.A)
+        _key = (tuple(id(q) for q in self.H.cur), tuple(id(q) for q in self.A.cur))
+        if _key == getattr(self, "_prem_key", None):
+            return
+        self._prem_key = _key
+        info = []
+        for sd in sides:
+            pl = [q for q in sd.cur if q is not None]
+            ov = [float(q.get("ovr") or 50) for q in pl]
+            info.append((pl, ov, sum(ov), len(ov)))
+        prem = []
+        for i, sd in enumerate(sides):
+            pl, ov, tot, n = info[i]
+            _, _, otot, on = info[1 - i]
+            opp_mean = otot / on if on else 50.0
+            sd.rel_e = {}
+            contrib = []
+            for q, o in zip(pl, ov):
+                # 우리 쪽 기준 = 나보다 강하지 않은 동료 평균(나 제외) — 조력자가 더 강한 스타 때문에 기준이
+                # 올라가 자기 몫이 사라지지 않게. 가장 강한 선수는 예전처럼 나를 뺀 동료 전체 평균.
+                _low = [x for x in ov if x <= o]
+                _ls, _ln = sum(_low) - o, len(_low) - 1
+                own = _ls / _ln if _ln > 0 else ((tot - o) / (n - 1) if n > 1 else o)
+                e = star_rel_gap(o, max(own, opp_mean))
+                if e > 0:
+                    sd.rel_e[id(q)] = e
+                    contrib.append((e, q.get("position") or "CM"))
+            contrib.sort(key=lambda t: -t[0])
+            pa = pd = 0.0
+            for r, (e, pos) in enumerate(contrib):
+                wr = STAR_PREM_RANK_W[r] if r < len(STAR_PREM_RANK_W) else STAR_PREM_RANK_W[-1]
+                c = STAR_PREM_K * wr * STAR_PREM_POS_MULT.get(pos, 1.0) * e ** STAR_PREM_POW
+                sa, sdf = STAR_PREM_SPLIT.get(pos, (0.5, 0.5))
+                pa += c * sa
+                pd += c * sdf
+            t = pa + pd
+            if t > STAR_PREM_CAP:
+                pa, pd = pa * STAR_PREM_CAP / t, pd * STAR_PREM_CAP / t
+            pa, pd = pa * sd.prem_scale, pd * sd.prem_scale
+            _d = sd.tmean - sides[1 - i].tmean
+            if STAR_PREM_MATCH_DAMP and _d > 0:
+                _f = 1.0 - (1.0 - STAR_PREM_DAMP_FLOOR) * min(1.0, _d / STAR_PREM_DAMP_FULL)
+                pa, pd = pa * _f, pd * _f
+            sd.prem = (pa, pd)
+            prem.append((pa, pd))
+        (ha, hd), (aa, ad) = prem
+        if STAR_PREM_NET_FIRST:
+            # [순차이 우선] 양 팀 프리미엄 합의 차이만 쓴다 — 앞선 팀의 (공격, 수비) 비율로 나눠 앞선 팀 공격 +½·
+            # 상대 수비 −½, 앞선 팀 수비 +½·상대 공격 −½. 동급 스타끼리(105 대 105)는 0 → 양 팀 득점이 같이
+            # 줄지 않는다. 한쪽만 프리미엄이 있으면 예전 식과 같다.
+            ph, pa_ = ha + hd, aa + ad
+            net = ph - pa_
+            hp_, ap_ = (self.H, self.A) if net >= 0 else (self.A, self.H)
+            la, ld = (ha, hd) if net >= 0 else (aa, ad)
+            net = abs(net)
+            lt = la + ld
+            ra, rd = ((la / lt), (ld / lt)) if lt > 0 else (0.5, 0.5)
+            hp_.prem_att, hp_.prem_def = net * ra / 2.0, net * rd / 2.0
+            ap_.prem_att, ap_.prem_def = -net * rd / 2.0, -net * ra / 2.0
+        else:
+            self.H.prem_att, self.H.prem_def = (ha - ad) / 2.0, (hd - aa) / 2.0
+            self.A.prem_att, self.A.prem_def = (aa - hd) / 2.0, (ad - ha) / 2.0
+
     def rebuild(self, sd):
+        if STAR_REL_ENABLED:
+            self.star_premium()
         w = _boost_weights_for(sd.bpos) if sd.boost else _DEFAULT_BOOST_WEIGHTS
         base = sd.form * FORM_SCALE + sd.home_add + sd.team_add
-        a_add = base + sd.boost * w["att"] + sd.boost * w["mid"] * 0.5
-        d_add = base + sd.boost * w["dfn"]
-        g_add = sd.form * 0.5 + sd.home_add + sd.team_add + sd.boost * w["gk"]
+        a_add = base + sd.boost * w["att"] + sd.boost * w["mid"] * 0.5 + sd.prem_att
+        d_add = base + sd.boost * w["dfn"] + sd.prem_def
+        g_add = sd.form * 0.5 + sd.home_add + sd.team_add + sd.boost * w["gk"] + sd.prem_def
         zoned = _assign_zones(sd.cur, sd.is_home, sd.slots)
         perf = self.stam.perf
         # [등급별 캐리] 시작점 = max(STAR_BASE, 나를 뺀 선발 동료 평균 + STAR_TEAM_MARGIN)
@@ -589,6 +765,8 @@ class _ChainMatch:
         _sum, _n = sum(float(q.get("ovr") or 50) for q in _pl), len(_pl)
 
         def _star_start(q):
+            if STAR_REL_ENABLED:          # [v2] 상대 기준 — el_e = OVR − 시작점 = e
+                return float(q.get("ovr") or 50) - min(STAR_IND_E_CAP, sd.rel_e.get(id(q), 0.0))
             if _n < 2:
                 return STAR_BASE
             _o = float(q.get("ovr") or 50)
@@ -1757,8 +1935,11 @@ def simulate_chain_match(home_lineup, away_lineup, home_boost=0.0, away_boost=0.
                          home_bench=None, away_bench=None,
                          extra_time=False, agg_home=0, agg_away=0,
                          home_style=None, away_style=None, player_mods=None,
-                         home_str_add=0.0, away_str_add=0.0, mgr_diff=0.0, home_mgr_add=0.0, away_mgr_add=0.0):
+                         home_str_add=0.0, away_str_add=0.0, mgr_diff=0.0, home_mgr_add=0.0, away_mgr_add=0.0,
+                         home_prem_scale=1.0, away_prem_scale=1.0):
     """tactical_engine.simulate_tactical_match과 같은 인자·같은 반환 키(+ time_info).
+    home_prem_scale/away_prem_scale: [2026-11 스타 프리미엄 v2] 팀 프리미엄 기본 전력 감쇠 배율
+      (tactical_engine.star_prem_base_scale). 1.0이면 감쇠 없음.
     home_mgr_add/away_mgr_add: [2026-11] 감독 가산(팀 전력 단위, 우위 팀에만 — constants.manager_rel_pair).
     player_mods: {선수 id: {"yellow_add", "red_add"}} — 파울 1건당 카드 확률 가산(선수 성격).
     home_str_add/away_str_add: [2026-11 전력 기준 통일] 선발 11명 평균에 더할 팀 전력 가산(OVR 단위) —
@@ -1768,5 +1949,6 @@ def simulate_chain_match(home_lineup, away_lineup, home_boost=0.0, away_boost=0.
     m = _ChainMatch(home_lineup, away_lineup, home_boost, away_boost, home_boost_position,
                     away_boost_position, home_adv, seed, home_formation, away_formation, home_bench,
                     away_bench, extra_time, agg_home, agg_away, home_style, away_style, player_mods,
-                    home_str_add, away_str_add, mgr_diff, home_mgr_add, away_mgr_add)
+                    home_str_add, away_str_add, mgr_diff, home_mgr_add, away_mgr_add,
+                    home_prem_scale, away_prem_scale)
     return m.run()

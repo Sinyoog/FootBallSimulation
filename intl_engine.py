@@ -6944,11 +6944,13 @@ def _sim_ai_match(t, m, my_played=False, conn=None, reason="injury", batch=None)
 
 def _intl_participant_ids(player_ratings):
     """전술엔진 평점표(선발 + 교체 투입, 빈 슬롯 None)에서 AI 출전자 id만 — {"home": [...], "away": [...]}.
-    내 선수(id None)는 빠진다. 평점표가 없으면(전술엔진 폴백 경로) None."""
+    내 선수(id None)는 빠진다. 평점표가 없으면(전술엔진 폴백 경로) None.
+    [2026-11 국대 체인 이식] 체인 엔진 경기는 내가 id -1(tactical_engine.MY_SIM_PLAYER_ID)로 평점표에
+    들어가 있다 — AI 출전 집계에 섞이지 않게 같이 뺀다."""
     if not player_ratings:
         return None
     return {sk: [r["id"] for r in (player_ratings.get(sk) or [])
-                 if r and r.get("id") is not None]
+                 if r and r.get("id") is not None and r.get("id") != _MY_SIM_ID]
             for sk in ("home", "away")}
 
 
@@ -7010,6 +7012,46 @@ def sim_my_match_as_ai(week, p, reason="injury", day=None):
     _sim_ai_match(t, m, my_played=False, reason=reason)
 
 
+# [2026-11 국대 체인 이식, 신민용 확정] 내가 뛰는 국가대표 경기를 클럽 내 경기와 같은 포제션 체인
+# 엔진(match_sim.chain_engine)으로 돌린다 — 챔피언스리그 G1 이식과 같은 구조:
+#   · 예전 캐리 보너스(격차 × 별점 공식, 30 소프트캡)는 체인 경로에서 0 — 내 능력치가 체인 경합에
+#     직접 들어가고, 스타 캐리는 클럽과 같은 규칙(스타 프리미엄 v2 + 35% 완화)이 그대로 걸린다.
+#     국대 전용 캐리 배율은 두지 않는다.
+#   · 팀 프리미엄 기본 전력 감쇠: 클럽 A3와 같은 모양(+3부터, +6에서 하한 0.05), 기준은 월드컵 본선
+#     참가국 평균(실측 89.7)으로 고정 — 모든 국대 경기 공통. 대륙 평균(아시아 66.9처럼 약소국에 끌려
+#     내려가 베트남급까지 감쇠됨)·대회별 참가국 평균(같은 나라가 예선/본선에서 달라짐)은 쓰지 않는다.
+#   · 체인 시뮬레이션(라인업 구성 + 엔진)이 실패하면 아무 기록도 남지 않은 상태에서 예전 경로 전체
+#     (분 단위 엔진 + 보너스 + _player_perf)로 돌아간다. 시뮬레이션이 성공하면 체인 경로로 확정 —
+#     그 뒤로 _player_perf·_roll_card_events는 부르지 않는다.
+#   · AI끼리 국대 경기·내가 결장해 AI로 처리되는 경기(_sim_ai_match)는 바꾸지 않는다.
+# False로 두면 예전과 완전히 같은 경로.
+INTL_MY_CHAIN = True
+INTL_PREM_BASE_REF = 89.7
+INTL_PREM_BASE_FROM = 3.0
+INTL_PREM_BASE_FULL = 6.0
+INTL_PREM_BASE_FLOOR = 0.05
+_MY_SIM_ID = -1   # tactical_engine.MY_SIM_PLAYER_ID와 같은 값
+
+
+def _intl_prem_scale(country):
+    """[2026-11 국대 체인 이식] 팀 프리미엄 기본 전력 감쇠 배율(tactical_engine.star_prem_base_scale의
+    국대판). 팀 전력 = 대표팀 OVR 상위 11명 평균(내 선수 제외 — _get_real_squad_ovr), 기준 =
+    INTL_PREM_BASE_REF 고정. 실패하면 1.0(감쇠 없음)."""
+    try:
+        from match_sim import chain_engine as _ce
+        if not (_ce.STAR_REL_ENABLED and _ce.STAR_PREM_BASE_DAMP):
+            return 1.0
+        v = _get_real_squad_ovr(country)
+        if v is None:
+            return 1.0
+        rel = float(v) - INTL_PREM_BASE_REF
+        span = max(0.01, INTL_PREM_BASE_FULL - INTL_PREM_BASE_FROM)
+        g = min(1.0, max(0.0, (rel - INTL_PREM_BASE_FROM) / span))
+        return 1.0 - (1.0 - INTL_PREM_BASE_FLOOR) * g
+    except Exception:
+        return 1.0
+
+
 def simulate_my_match(week, p, day=None):
     """내가 출전하는 국가대표 경기."""
     from game_engine import (add_log, get_player, update_player,
@@ -7034,22 +7076,9 @@ def simulate_my_match(week, p, day=None):
     # [2026-10] U-23 올림픽은 A매치가 아니다 — 국적 고정(cap-tie)·캡·A매치 골 집계에서 뺀다.
     _is_oly_t = _is_oly(t)
     # [복수국적] A매치 첫 출전 → 그 나라로 영구 고정(cap-tie). (본선만)
-    # 이후 대회부터는 이 나라로만 차출된다.
-    if (not _is_qual) and (not _is_oly_t) and nat and not (p.get("intl_committed", "") or ""):
-        from game_engine import update_player as _upd
-        _upd(intl_committed=nat)
-        # [국적 연혁] A매치 첫 출전으로 자동 고정된 경우도 commit 기록
-        try:
-            from game_engine import add_nat_history, get_state
-            _st = get_state() or {}
-            _fl = ""
-            for _nk, _fk in (("nationality","flag"),("nationality2","flag2"),("nationality3","flag3")):
-                if (p.get(_nk,"") or "") == nat:
-                    _fl = p.get(_fk,"") or ""; break
-            add_nat_history("commit", nat, _fl,
-                            _st.get("current_year"), _st.get("current_week"))
-        except Exception:
-            pass
+    # [2026-11 신민용 확정] 예전엔 여기(경기 시작 시점)에서 출전 여부와 무관하게 고정했다 — 벤치에서
+    # 끝까지 못 뛴 경기도 고정됐다. 이제 경기 결과에서 실제 출전(선발·교체)이 확인된 뒤 고정한다
+    # (아래 _commit_cap_tie 호출부).
     he = _entry(t["id"], m["home"])
     ae = _entry(t["id"], m["away"])
     is_home = info["is_home"]
@@ -7137,53 +7166,121 @@ def simulate_my_match(week, p, day=None):
     hs90 = as90 = None
     went_et = False
     _subs = {"home": [], "away": []}
-    try:
-        from match_sim.tactical_engine import simulate_tactical_match
-        home_lineup, home_formation = _intl_tactical_lineup(t["id"], m["home"], he["ovr"])
-        away_lineup, away_formation = _intl_tactical_lineup(t["id"], m["away"], ae["ovr"])
-        if home_lineup is None or away_lineup is None:
-            raise ValueError("intl squad pool too small")
-        # [2026-09 버그수정] home_formation/away_formation을 넘겨야
-        # tactical_engine이 실제 포메이션 기준으로 구역·포지션 라벨을
-        # 계산한다(_intl_formation_for 주석 참고) — 이게 빠져 있어서
-        # 국가대표 경기만 항상 같은 애매한 모양으로 떴었다.
-        sim = simulate_tactical_match(
-            home_lineup, away_lineup,
-            home_boost=(bonus if is_home else 0.0),
-            away_boost=(bonus if not is_home else 0.0),
-            home_boost_position=(my_position if is_home else None),
-            away_boost_position=(my_position if not is_home else None),
-            home_adv=0.0,
-            home_formation=home_formation, away_formation=away_formation,
-            # [2026-09] 국가대표는 26인 소집 명단이 그대로 벤치 풀이다 —
-            # 선발 11명을 뺀 나머지를 교체 후보로 넘긴다. 연장은 녹아웃
-            # 단계에서만(조별리그/예선 조별리그는 무승부 허용).
-            home_bench=_intl_bench(home_lineup, t["id"], m["home"], he["ovr"]),
-            away_bench=_intl_bench(away_lineup, t["id"], m["away"], ae["ovr"]),
-            extra_time=bool(knockout))
-        hs, as_ = sim["home_score"], sim["away_score"]
-        hs90, as90 = sim.get("home_score_90", hs), sim.get("away_score_90", as_)
-        went_et = bool(sim.get("went_extra_time"))
-        _subs = {"home": sim.get("home_subs") or [], "away": sim.get("away_subs") or []}
-        engine_stats = {"home": sim["home_stats"], "away": sim["away_stats"]}
-        engine_plog = sim["possession_log"]
-        player_ratings = {"home": sim.get("home_player_ratings") or [],
-                          "away": sim.get("away_player_ratings") or []}
+    # [2026-11 국대 체인 이식] 체인 엔진 먼저. 이 블록(라인업 구성 + 시뮬레이션)은 DB에 기록을 남기지
+    # 않는다(26인 명단·대회 포메이션 고정은 예전 경로도 똑같이 하는 멱등 작업) — 실패하면 아래 예전
+    # 경로가 처음부터 그대로 돈다.
+    _chain = None
+    if INTL_MY_CHAIN:
+        try:
+            from match_sim.tactical_engine import simulate_my_intl_match
+            from game_engine import _chain_me_spec
+            _hl, _hfm = _intl_tactical_lineup(t["id"], m["home"], he["ovr"])
+            _al, _afm = _intl_tactical_lineup(t["id"], m["away"], ae["ovr"])
+            if _hl is None or _al is None:
+                raise ValueError("intl squad pool too small")
+            _me_spec = _chain_me_spec(p, is_home, "out" if _suspended else ("bench" if _benched else "start"))
+            if _me_spec.get("player"):
+                # 배치 포지션 = 주포지션(= 이 대회 대표팀 배정 자리). get_field_pos(소속 클럽 포메이션 기준)는
+                # 국대 경기에 쓰지 않는다 — 대표팀 포메이션에 그 자리가 없을 때만 _insert_me가 호환 자리로 보낸다.
+                _me_spec["field_pos"] = my_position or None
+            _csim = simulate_my_intl_match(
+                _hl, _al, _hfm, _afm,
+                home_bench=_intl_bench(_hl, t["id"], m["home"], he["ovr"]),
+                away_bench=_intl_bench(_al, t["id"], m["away"], ae["ovr"]),
+                extra_time=bool(knockout), me=_me_spec,
+                home_prem_scale=_intl_prem_scale(m["home"]),
+                away_prem_scale=_intl_prem_scale(m["away"]))
+            _chain = _csim
+        except Exception as _e_chain:
+            from game_engine import _chain_note_error
+            _chain_note_error("intl", _e_chain)
+            _chain = None
+    if _chain is not None:
+        bonus = 0.0   # 캐리 보정 없음 — 승부차기 전력에도 안 들어간다(챔스 G1과 같다)
+        h_ovr, a_ovr = he["ovr"], ae["ovr"]
+        hs, as_ = _chain["home_score"], _chain["away_score"]
+        hs90, as90 = _chain.get("home_score_90", hs), _chain.get("away_score_90", as_)
+        went_et = bool(_chain.get("went_extra_time"))
+        _subs = {"home": _chain.get("home_subs") or [], "away": _chain.get("away_subs") or []}
+        engine_stats = {"home": _chain["home_stats"], "away": _chain["away_stats"]}
+        engine_plog = _chain["possession_log"]
+        player_ratings = {"home": _chain.get("home_player_ratings") or [],
+                          "away": _chain.get("away_player_ratings") or []}
         outcome = "draw" if hs == as_ else ("home" if hs > as_ else "away")
-    except Exception:
-        outcome = _match_outcome(h_ovr, a_ovr, knockout, neutral=(not _is_qual))
-        # [2026-09 수정] 전술엔진 폴백도 AI 경기와 같은 스코어 생성기를
-        # 타야 한다 — _gen_score를 직접 부르면 국가대표 전력차 스케일
-        # 환산(_gen_intl_score 주석 참고)이 빠져 같은 매치업인데도
-        # 경로에 따라 스코어 분포가 달라진다.
-        hs, as_ = _gen_intl_score(outcome, _intl_effective_diff(h_ovr, a_ovr), top=(h_ovr, a_ovr))   # [2026-10 F2]
+    else:
+        try:
+            from match_sim.tactical_engine import simulate_tactical_match
+            home_lineup, home_formation = _intl_tactical_lineup(t["id"], m["home"], he["ovr"])
+            away_lineup, away_formation = _intl_tactical_lineup(t["id"], m["away"], ae["ovr"])
+            if home_lineup is None or away_lineup is None:
+                raise ValueError("intl squad pool too small")
+            # [2026-09 버그수정] home_formation/away_formation을 넘겨야
+            # tactical_engine이 실제 포메이션 기준으로 구역·포지션 라벨을
+            # 계산한다(_intl_formation_for 주석 참고) — 이게 빠져 있어서
+            # 국가대표 경기만 항상 같은 애매한 모양으로 떴었다.
+            sim = simulate_tactical_match(
+                home_lineup, away_lineup,
+                home_boost=(bonus if is_home else 0.0),
+                away_boost=(bonus if not is_home else 0.0),
+                home_boost_position=(my_position if is_home else None),
+                away_boost_position=(my_position if not is_home else None),
+                home_adv=0.0,
+                home_formation=home_formation, away_formation=away_formation,
+                # [2026-09] 국가대표는 26인 소집 명단이 그대로 벤치 풀이다 —
+                # 선발 11명을 뺀 나머지를 교체 후보로 넘긴다. 연장은 녹아웃
+                # 단계에서만(조별리그/예선 조별리그는 무승부 허용).
+                home_bench=_intl_bench(home_lineup, t["id"], m["home"], he["ovr"]),
+                away_bench=_intl_bench(away_lineup, t["id"], m["away"], ae["ovr"]),
+                extra_time=bool(knockout))
+            hs, as_ = sim["home_score"], sim["away_score"]
+            hs90, as90 = sim.get("home_score_90", hs), sim.get("away_score_90", as_)
+            went_et = bool(sim.get("went_extra_time"))
+            _subs = {"home": sim.get("home_subs") or [], "away": sim.get("away_subs") or []}
+            engine_stats = {"home": sim["home_stats"], "away": sim["away_stats"]}
+            engine_plog = sim["possession_log"]
+            player_ratings = {"home": sim.get("home_player_ratings") or [],
+                              "away": sim.get("away_player_ratings") or []}
+            outcome = "draw" if hs == as_ else ("home" if hs > as_ else "away")
+        except Exception:
+            outcome = _match_outcome(h_ovr, a_ovr, knockout, neutral=(not _is_qual))
+            # [2026-09 수정] 전술엔진 폴백도 AI 경기와 같은 스코어 생성기를
+            # 타야 한다 — _gen_score를 직접 부르면 국가대표 전력차 스케일
+            # 환산(_gen_intl_score 주석 참고)이 빠져 같은 매치업인데도
+            # 경로에 따라 스코어 분포가 달라진다.
+            hs, as_ = _gen_intl_score(outcome, _intl_effective_diff(h_ovr, a_ovr), top=(h_ovr, a_ovr))   # [2026-10 F2]
 
     pso_winner, pso_score = "", ""
     if knockout and outcome == "draw":
         win_home, pso_score = _resolve_pso(h_ovr, a_ovr, neutral=(not _is_qual))
         pso_winner = m["home"] if win_home else m["away"]
 
-    if _suspended or _benched:
+    # [2026-11 국대 체인 이식] _played = 이 경기에 실제로 경기장에 들어갔는가(선발·교체). 캡·A매치 골/도움·
+    # 국적 영구 고정·출전 표시가 전부 이 값 하나를 따른다.
+    _played = not (_suspended or _benched)
+    if _chain is not None:
+        # 체인 경로 — 내 기록은 체인 엔진이 실제로 기록한 사건 그대로(카드 카운터도 _chain_me_result가
+        # 한 번만 반영). _player_perf·_roll_card_events는 이 경로에서 부르지 않는다.
+        goals, assists, saves, rating = 0, 0, 0, 0.0
+        events, detail = [], {"shots": 0, "shots_on": 0, "key_passes": 0,
+                              "dribbles": 0, "blocks": 0, "pass_acc": 0.0}
+        _absence_reason = "suspension" if _suspended else None
+        _yellow_cnt = 0
+        _played = False
+        if not _suspended:
+            from game_engine import _chain_me_result, _chain_note_error
+            _cr = _chain_me_result(p, _chain, is_home, _susp_field)
+            if _cr["appeared"]:
+                _benched = False          # 벤치에서 교체로 들어갔으면 출전
+                _played = True
+                goals, assists, saves, rating = _cr["goals"], _cr["assists"], _cr["saves"], _cr["rating"]
+                events, detail = _cr["events"], _cr["detail"]
+                _absence_reason = _cr["red_reason"]
+                _yellow_cnt = _cr["yellow"]
+            elif not _benched:
+                # 선발인데 출전 기록이 없다(정상이라면 나올 수 없음) — 결장으로 처리하고 오류만 남긴다.
+                _chain_note_error("intl", RuntimeError("선발인데 출전 기록 없음"))
+                _my_started_pre = 0
+    elif _suspended or _benched:
         goals, assists, saves, rating = 0, 0, 0, 0.0
         events, detail = [], {"shots": 0, "shots_on": 0, "key_passes": 0,
                               "dribbles": 0, "blocks": 0, "pass_acc": 0.0}
@@ -7209,7 +7306,7 @@ def simulate_my_match(week, p, day=None):
             events = list(events) + _yellow_ev
     # [2026-07 신설] '소심함' 성격의 big_match_rating 연결 — 국가대표 경기는
     # 전부 빅매치 성격이라(챔스와 동일 기준) 모든 경기에 적용한다.
-    if not (_suspended or _benched) and "big_match_rating" in _pe:
+    if _played and "big_match_rating" in _pe:
         rating = max(min(4.0, rating), min(10.0, round(rating + _pe["big_match_rating"], 1)))   # 이미 4.0 아래(퇴장)면 끌어올리지 않음
 
     # [2026-08 신설, 신민용 요청] champions_engine과 동일한 "나" 슬롯
@@ -7226,26 +7323,39 @@ def simulate_my_match(week, p, day=None):
     from competition.competition_common import (merge_my_slot,
                                                 augment_team_goal_events)
     events = augment_team_goal_events(
-        p, is_home, hs, as_, goals, assists, not (_suspended or _benched),
+        p, is_home, hs, as_, goals, assists, _played,
         events, engine_plog, player_ratings)
     # [2026-10 버그수정] 내 슬롯 치환 "전" 출전자(선발 + 교체 투입) — 내가 결장한 경기면
     # 내 자리의 AI가 실제로 뛴 것이므로 이 목록을 그대로 출전으로 센다(아래 _record_my_intl_squad).
     _pre_ids = _intl_participant_ids(player_ratings)
-    _side_key, _idx = merge_my_slot(
-        player_ratings, is_home, my_position,
-        {"id": None, "name": p.get("name") or "나",
-         "position": None, "ovr": p.get("ovr", 40),
-         "goals": goals, "assists": assists,
-         "shots": detail.get("shots", 0),
-         "shots_on": detail.get("shots_on", 0),
-         "saves": saves, "is_gk": (my_position == "GK"),
-         "rating": rating, "is_me": True},
-        hs, as_, played=not (_suspended or _benched))
+    if _chain is None:   # [2026-11 국대 체인 이식] 체인 경기는 내가 이미 선수 기록줄에 있다(치환 없음)
+        _side_key, _idx = merge_my_slot(
+            player_ratings, is_home, my_position,
+            {"id": None, "name": p.get("name") or "나",
+             "position": None, "ovr": p.get("ovr", 40),
+             "goals": goals, "assists": assists,
+             "shots": detail.get("shots", 0),
+             "shots_on": detail.get("shots_on", 0),
+             "saves": saves, "is_gk": (my_position == "GK"),
+             "rating": rating, "is_me": True},
+            hs, as_, played=_played)
     _record_my_intl_squad(t, m, he, ae, _pre_ids, player_ratings,
-                          played=not (_suspended or _benched), is_home=is_home)
+                          played=_played, is_home=is_home)
 
     my_result = _my_result(outcome, is_home)
     my_conceded = (as_ if is_home else hs)
+    # [2026-11 국대 출전 포지션 기록, 신민용 확정] 예전엔 _get_field_pos(p)(소속 클럽 포메이션 기준 배치)를
+    # 저장해서, 대표팀에서 실제로 선 자리와 기록이 달라질 수 있었다. 이제 이 경기 선수 기록줄에서 내가 실제로
+    # 맡은 자리(체인: 엔진 배치·교체 투입 자리 / 예전 경로: merge_my_slot이 고른 자리)를 저장하고, 못 뛴 경기면
+    # 주포지션(= 대표팀 배정 자리)을 저장한다.
+    _my_pos_rec = my_position or "CM"
+    try:
+        for _e in (player_ratings or {}).get("home" if is_home else "away") or []:
+            if _e and _e.get("is_me"):
+                _my_pos_rec = _e.get("position") or _my_pos_rec
+                break
+    except Exception:
+        pass
 
     # [2026-07 재수정] 실제 진행 날짜는 Phase 2가 생성 시점에 이미
     # 정확히 배정해뒀다 — _week_intl_cl_day로 다시 계산하면 그 값을
@@ -7269,7 +7379,7 @@ def simulate_my_match(week, p, day=None):
                     WHERE id=?""",
                  (hs, as_, *et_score_values(hs90, as90, went_et),
                   pso_winner, pso_score,
-                  0 if (_suspended or _benched) else 1, nat, _get_field_pos(p),
+                  1 if _played else 0, nat, _my_pos_rec,
                   saves, goals, assists, rating,
                   detail["shots"], detail["shots_on"], detail["key_passes"],
                   detail["dribbles"], detail["blocks"], detail["pass_acc"],
@@ -7281,6 +7391,10 @@ def simulate_my_match(week, p, day=None):
     #  [cap-tie] 본선 무대를 밟으면 그 나라로 영구 고정. 단 예선은 고정 안 함.
     if _is_oly_t:
         pass   # [2026-10] 올림픽 — 캡·A매치 골/도움 미반영(기록은 intl_matches·intl_history에 남는다)
+    elif not _played:
+        # [2026-11 신민용 확정] 실제로 경기장에 들어간 경기(선발·교체)만 캡·A매치 골/도움·국적 고정 —
+        # 예전엔 출전정지·벤치 미출전 경기도 캡이 +1 됐다.
+        pass
     elif _is_qual:
         # 예선: caps/goals/assists 누적만, capped/committed 미설정 (국적 변경 자유)
         update_player(
@@ -7297,6 +7411,20 @@ def simulate_my_match(week, p, day=None):
             intl_committed=(p.get("intl_committed", "") or nat),
             qual_pledged_nat="",   # 본선 출전으로 영구고정됐으니 pledge 정리
         )
+        # [국적 연혁] A매치 첫 출전으로 자동 고정된 경우 commit 기록 — [2026-11] 예전엔 경기 시작
+        # 시점(출전 여부 확인 전)에 했다. 이제 실제 출전이 확인된 이 자리에서 한 번만.
+        if nat and not (p.get("intl_committed", "") or ""):
+            try:
+                from game_engine import add_nat_history, get_state
+                _st = get_state() or {}
+                _fl = ""
+                for _nk, _fk in (("nationality","flag"),("nationality2","flag2"),("nationality3","flag3")):
+                    if (p.get(_nk,"") or "") == nat:
+                        _fl = p.get(_fk,"") or ""; break
+                add_nat_history("commit", nat, _fl,
+                                _st.get("current_year"), _st.get("current_week"))
+            except Exception:
+                pass
     # [세부 지표] 통산(total_*)에도 누적 → 커리어 통합 통계에 A매치 반영
     p2 = get_player()
     update_player(
@@ -7339,7 +7467,7 @@ def simulate_my_match(week, p, day=None):
     detail_id = _save_match_detail(
         p, week, comp_name, is_home, home_disp, away_disp,
         hs, as_, my_result, goals, assists, saves, rating,
-        events, not (_suspended or _benched), _benched, detail, pso=pso,
+        events, _played, _benched, detail, pso=pso,
         engine_stats=engine_stats, engine_plog=engine_plog, player_ratings=player_ratings,
         match_extra={"score_90": ([hs90, as90] if hs90 is not None else [hs, as_]),
                      "went_extra_time": went_et, "subs": _subs},

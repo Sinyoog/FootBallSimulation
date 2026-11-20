@@ -890,6 +890,8 @@ class NewPlayerDialog(QDialog):
             f"비워두면 기본값({PLAYER_START_AGE}세)으로 시작합니다.",
             "",
             "팀 입단은 선택한 나이 다음 해(선택한 나이+1세)부터 가능합니다.",
+            "단, 성인팀(1군·리그 소속 산하팀)은 16세부터 입단할 수 있습니다.",
+            "재능이 월드클래스·신급인 선수만 14~15세에 자국 구단의 산하 유스팀에 입단할 수 있습니다.",
             "국가대표 발탁은 나이와 무관하게 17세부터 가능합니다.",
         ]
         return self._note_html(f"시작 나이 — {PLAYER_START_AGE_MIN}~{PLAYER_START_AGE_MAX}세", lines)

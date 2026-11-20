@@ -2216,6 +2216,34 @@ def club_match_strength_extra(team_id, rule):
     return 0.0
 
 
+def star_prem_base_scale(team_id):
+    """[2026-11 스타 프리미엄 v2] 팀 프리미엄 기본 전력 감쇠 배율(chain_engine.STAR_PREM_BASE_* 주석).
+    팀 자체의 강함 = AI 공식과 같은 팀 전력(game_engine._team_avg_ovr — 선발 전력 + 클럽 강도 + 명문, 내 선수 제외)
+    − 그 팀 리그 평균. 대회와 무관하게 팀마다 하나(국내 리그 기준). 실패하면 1.0(감쇠 없음)."""
+    from match_sim import chain_engine as _ce
+    if team_id is None or not (_ce.STAR_REL_ENABLED and _ce.STAR_PREM_BASE_DAMP):
+        return 1.0
+    try:
+        from database import get_conn
+        from game_engine import _team_avg_ovr
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            r = cur.execute("SELECT league_id FROM teams WHERE id=?", (team_id,)).fetchone()
+            if not r or r[0] is None:
+                return 1.0
+            ids = [x[0] for x in cur.execute("SELECT id FROM teams WHERE league_id=?", (r[0],)).fetchall()]
+            vals = [float(_team_avg_ovr(cur, t)) for t in ids]
+            rel = float(_team_avg_ovr(cur, team_id)) - (sum(vals) / len(vals) if vals else 0.0)
+        finally:
+            conn.close()
+    except Exception:
+        return 1.0
+    span = max(0.01, _ce.STAR_PREM_BASE_FULL - _ce.STAR_PREM_BASE_FROM)
+    g = min(1.0, max(0.0, (rel - _ce.STAR_PREM_BASE_FROM) / span))
+    return 1.0 - (1.0 - _ce.STAR_PREM_BASE_FLOOR) * g
+
+
 def _strength_rule_uses_mgr(rule):
     # ("cont", 명문 비율[, 감독 보정]) — 3번째 값이 없으면 예전처럼 True(챔스·유로파·컨퍼런스 AI 경기는 감독 보정을 쓴다).
     # 클럽월드컵·대륙 슈퍼컵은 AI 경기에 감독 보정이 없어서 False로 넘어온다.
@@ -2313,7 +2341,52 @@ def simulate_my_match(home_team_id, away_team_id, home_formation, away_formation
                                agg_home=agg_home, agg_away=agg_away,
                                home_style=_hs, away_style=_as, player_mods=pmods,
                                home_str_add=_hsa, away_str_add=_asa, mgr_diff=_mgr,
-                               home_mgr_add=_hma, away_mgr_add=_ama)
+                               home_mgr_add=_hma, away_mgr_add=_ama,
+                               home_prem_scale=star_prem_base_scale(home_team_id),
+                               away_prem_scale=star_prem_base_scale(away_team_id))
+    sim["me"] = _me_summary(sim, me, my_side)
+    return sim
+
+
+def simulate_my_intl_match(home_lineup, away_lineup, home_formation, away_formation,
+                           home_bench=None, away_bench=None, extra_time=False, me=None,
+                           home_prem_scale=1.0, away_prem_scale=1.0, seed=None):
+    """[2026-11 국대 체인 이식, 신민용 확정] 내가 뛰는 국가대표 경기(intl_engine.simulate_my_match)를
+    클럽 내 경기와 같은 포제션 체인 엔진으로 돌린다. 국가대표는 team_id 기반 로스터가 없어서 위
+    simulate_my_match(클럽용)를 못 쓰고, 호출부가 이 대회에 고정된 26인 명단으로 만든 라인업·벤치를
+    그대로 받는다(intl_engine._intl_tactical_lineup / _intl_bench).
+
+    · 내 선수: 대회 내내 고정된 AI 주전 11명 안에 _insert_me로 넣는다(배치 포지션 = me["field_pos"] —
+      호출부가 주포지션을 넘긴다. 클럽 포메이션 기준 get_field_pos는 쓰지 않는다). 밀려난 AI는 벤치 맨 앞.
+    · 국가대표는 중립 경기 — 홈 이점 0, 클럽 강도·명문 가산 0, 감독 가산 0(예전 국대 내 경기와 같다).
+    · 캐리: 클럽과 같은 스타 캐리 규칙(chain_engine 그대로). 팀 프리미엄 기본 전력 감쇠 배율만 호출부가
+      국대 기준(intl_engine._intl_prem_scale)으로 넘긴다.
+    · 이 함수와 체인 엔진은 DB에 아무것도 쓰지 않는다 — 호출부가 실패 시 옛 경로로 그대로 돌아갈 수 있다.
+    반환: simulate_chain_match 결과 + sim["me"](_me_summary)."""
+    from constants import FORMATION_SLOTS
+    from match_sim.chain_engine import simulate_chain_match
+    home_lineup, away_lineup = list(home_lineup), list(away_lineup)
+    home_bench, away_bench = list(home_bench or []), list(away_bench or [])
+    pmods = None
+    my_side = None
+    if me and me.get("status") in ("start", "bench") and me.get("player"):
+        my_side = me.get("side")
+        _form = home_formation if my_side == "home" else away_formation
+        _slots = FORMATION_SLOTS.get(_form) or _FALLBACK_SLOTS
+        if my_side == "home":
+            home_lineup, home_bench, _ = _insert_me(home_lineup, home_bench, _slots, me["player"],
+                                                    me.get("field_pos"), me["status"])
+        else:
+            away_lineup, away_bench, _ = _insert_me(away_lineup, away_bench, _slots, me["player"],
+                                                    me.get("field_pos"), me["status"])
+        if me.get("yellow_add") or me.get("red_add"):
+            pmods = {MY_SIM_PLAYER_ID: {"yellow_add": me.get("yellow_add", 0.0),
+                                        "red_add": me.get("red_add", 0.0)}}
+    sim = simulate_chain_match(home_lineup, away_lineup, home_adv=0.0, seed=seed,
+                               home_formation=home_formation, away_formation=away_formation,
+                               home_bench=home_bench, away_bench=away_bench,
+                               extra_time=extra_time, player_mods=pmods,
+                               home_prem_scale=home_prem_scale, away_prem_scale=away_prem_scale)
     sim["me"] = _me_summary(sim, me, my_side)
     return sim
 

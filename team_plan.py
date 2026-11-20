@@ -514,11 +514,54 @@ def _forced_my_slot(me, slots):
     return max(cand, key=lambda i: (_fl._slot_value(me, slots[i]), -i))
 
 
+# [2026-11-19 신민용 확정 — 내 선수 주포 우선 배치] 최적 배치가 나를 선발로 고르더라도 내 주포와 이름이 같은 자리가
+# 포메이션에 있으면 그 자리에 세운다(나머지 10자리는 AI 선수로 다시 최적 배치). 예전엔 배치 점수 합만 보고
+# 105 LB를 CB 자리(팰리스)나 반대쪽 RB 자리(맨시티)에 세웠다. 주포 자리가 없는 포메이션(예: 4-4-2의 LW)이면 예전
+# 최적 배치 그대로. 나를 뽑지 않은 경우(선발 강제)·AI 선발은 바뀌지 않는다. False면 예전과 비트 단위로 같다.
+MY_LINEUP_MAIN_POS_FIRST = True
+
+
+def _relocate_me_to_main_pos(ai, slots, me, cur_idx):
+    """최적 배치에서 내가 cur_idx 자리에 섰을 때, 주포 이름과 같은 자리로 옮긴 배치를 돌려준다 (placed, idx).
+    이미 주포 자리거나 포메이션에 주포 자리가 없으면 None(예전 배치 유지). 주포 자리가 여럿이면(CB·CB, ST·ST)
+    나머지 10명의 배치 점수 합이 가장 큰 자리(같으면 앞 자리)."""
+    import formation_logic as _fl
+    pos = me.get("position")
+    if not pos or slots[cur_idx] == pos:
+        return None
+    cands = [j for j, s in enumerate(slots) if s == pos]
+    if not cands:
+        return None
+    best = None
+    for idx in cands:
+        rest_slots = [s for j, s in enumerate(slots) if j != idx]
+        rest = club_fill_slots(ai, rest_slots)
+        score = sum(_fl._slot_value(q, s) for q, s in zip(rest, rest_slots) if q is not None)
+        if best is None or score > best[0]:
+            best = (score, idx, rest)
+    _, idx, rest = best
+    for q in ai:                      # 앞선 배치 호출이 남긴 자리 표시 정리(최종 배치에서 다시 붙인다)
+        q.pop("_slot_idx", None)
+    out, k = [], 0
+    for j in range(len(slots)):
+        if j == idx:
+            me["_slot_idx"] = j
+            out.append(me)
+        else:
+            q = rest[k] if k < len(rest) else None
+            k += 1
+            if q is not None:
+                q["_slot_idx"] = j
+            out.append(q)
+    return out, idx
+
+
 def club_lineup_with_me(ai_roster, slots, me=None, status="out"):
     """[2026-11-17 신설, 신민용 확정 — 선발 경로 통일] 내 소속팀 선발 11명. 메인 화면 포메이션과 실제 내 경기가
     같이 쓴다. 반환 (placed, my_idx, forced) — placed는 슬롯 순서 리스트(빈 자리 None, 배정 선수에 _slot_idx 태깅).
       · status != "start"(벤치·결장) 또는 me 없음: AI 선수만 최적 배치(예전 경기 선발과 같다).
-      · "start"이고 최적 배치(나 포함)가 나를 고르면: 그 배치 그대로(forced=False).
+      · "start"이고 최적 배치(나 포함)가 나를 고르면: 그 배치 그대로(forced=False). 단 MY_LINEUP_MAIN_POS_FIRST면
+        내 주포 이름의 자리로 옮긴다(_relocate_me_to_main_pos — 주포 자리가 없으면 그대로, forced는 여전히 False).
       · "start"인데 최적 배치에서 빠지면: 나를 주포 자리에 고정하고 나머지 10자리를 AI 선수로 다시 최적 배치(forced=True)."""
     ai = [q for q in (ai_roster or []) if q]
     if me is None or status != "start":
@@ -526,6 +569,10 @@ def club_lineup_with_me(ai_roster, slots, me=None, status="out"):
     placed = club_fill_slots(ai + [me], slots)
     for i, q in enumerate(placed):
         if q is me:
+            if MY_LINEUP_MAIN_POS_FIRST:
+                moved = _relocate_me_to_main_pos(ai, slots, me, i)
+                if moved is not None:
+                    return moved[0], moved[1], False
             return placed, i, False
     idx = _forced_my_slot(me, slots)
     rest_slots = [s for j, s in enumerate(slots) if j != idx]

@@ -2231,7 +2231,34 @@ def _repair_future_hist_data(conn):
         _start_year = int(_sy_row[0]) if (_sy_row and _sy_row[0]) else None
     except (sqlite3.OperationalError, TypeError, ValueError):
         _start_year = None
+    # [2026-11 버그수정 — 국제대회 개인상이 불러오기 때 지워지던 문제] U-23 올림픽 개인상은 연도전환이
+    # 아니라 본선이 끝나는 즉시(competition/olympics.compute_awards) season_individual_awards에 그 해
+    # 행으로 저장되고, 연말 개인상 계산(_compute_intl_individual_awards)은 올림픽을 다시 계산하지 않는다.
+    # 그런데 아래 규칙은 이 표의 현재 연도 행을 전부 "미래 기록"으로 지워서, 본선이 끝난 뒤 연도전환 전에
+    # 저장·불러오기를 하면 그 해 올림픽 개인상이 영구히 사라졌다(실측: 2000년 358일 세이브 → 18행 삭제).
+    # main이 "그 대회는 끝났다(status='done')"고 말하는 올림픽의 개인상만 정당한 현재 연도 행으로 남긴다.
+    # 그 밖의 현재 연도 행(연말에 계산되는 상)은 예전처럼 지운다.
+    try:
+        _oly_done = [r[0] for r in conn.execute(
+            "SELECT name FROM main.intl_tournaments WHERE year=? AND kind='olympic' AND status='done'",
+            (cutoff_year,)).fetchall()]
+    except sqlite3.OperationalError:
+        _oly_done = []   # 올림픽 이전 세이브 — 예전 규칙 그대로
     for tbl in _HIST_YEAR_TABLES_FOR_REPAIR:
+        if tbl == "season_individual_awards" and _oly_done:
+            try:
+                _ph = ",".join("?" * len(_oly_done))
+                cur = conn.execute(
+                    f"""DELETE FROM hist.season_individual_awards
+                        WHERE year > ? OR (year = ? AND NOT (category = 'intl' AND competition IN ({_ph})))""",
+                    (cutoff_year, cutoff_year, *_oly_done))
+                if cur.rowcount:
+                    removed_any = True
+                    print(f"[HIST-REPAIR] hist.{tbl}: year>={cutoff_year} {cur.rowcount}행 삭제"
+                          f"(끝난 올림픽 개인상은 보존 — main/hist 시점 불일치 복구)")
+            except sqlite3.OperationalError:
+                pass
+            continue
         # [2026-09 버그수정, 96차 — 헤드리스 세이브를 불러오다 발견] 이 복구는
         # "hist의 현재 연도 행 = 아직 안 끝난 해의 미래 기록"이라는 전제로
         # 만들어졌는데, 그 뒤 스냅샷 타이밍이 현재 연도 도중으로 옮겨졌다

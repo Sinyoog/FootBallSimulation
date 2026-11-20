@@ -60,6 +60,10 @@ def _prob_label(prob: float, blocked, scale: float = 1.0):
         return "⛔ 유스 입단 연령 초과 (불가)", "#888888"
     if blocked == "youth":        # [2026-11-18] 유스 오퍼 자격(모구단 하한·산하팀 재능·역할) 미달
         return "⛔ 유스 자격 미달 (불가)", "#888888"
+    if blocked == "age_min":      # [2026-11-19 MY_AGE16_RULES] 16세 미만은 성인팀 불가(뛰어난 선수만 자국 산하팀)
+        return "⛔ 16세부터 입단 가능 (불가)", "#888888"
+    if blocked == "age_foreign":  # [2026-11-19 MY_AGE16_RULES] 16세 미만 해외 산하팀 불가
+        return "⛔ 16세 미만 해외 입단 불가", "#888888"
     if blocked == "applied":      # [2026-11-18] 같은 구단은 한 지원 기간에 1번
         return "⛔ 이미 지원함 (이번 기간)", "#888888"
     if blocked:

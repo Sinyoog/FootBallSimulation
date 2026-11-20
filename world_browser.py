@@ -10963,6 +10963,74 @@ def get_team_season_lineup(team_id: int, year: int, half: bool = False):
             "team_country": team_country}
 
 
+def get_slot_effective_ovrs(entries, year, ovr_by_id=None):
+    """[2026-11 신설, 신민용 요청: "포지션 때문에 깎인 OVR을 세계 기록실 포메이션에도"] 선발 선수의 그 해 그 자리
+    유효 OVR — {선수 id: float}. 메인 화면(ui/formation_widget._effective_ovr)·경기 팀 전력과 같은 함수
+    formation_logic._slot_value(포지션 거리 단계 감점 + 부포 경로 + 주발)를 그 해 기준 재료로 부른다.
+      · OVR: 그 해 OVR(ovr_by_id — 호출부가 get_players_year_ovr로 이미 구한 값, 없으면 지금 OVR)
+      · 주포: ai_players.position(등록 포지션은 바뀌지 않는 값) / 은퇴 선수는 ai_players_retired / 나는 my_player
+      · 부포: 그 해에 이미 갖고 있던 것만(gained_year < 그 해 — _bench_ctx_positions와 같은 규칙)
+      · 주발·세부역할: 현역·내 선수는 그 값, 은퇴 선수 표엔 없어 빈 값(= 주발 감점 없음)
+    entries: [(선수 id, 그 자리 슬롯 이름)]. 계산할 수 없는 선수는 빠진다. 읽기 전용."""
+    import formation_logic as _fl
+    ents = [(pid, slot) for pid, slot in (entries or []) if isinstance(pid, int) and slot]
+    if not ents:
+        return {}
+    ovr_by_id = ovr_by_id or {}
+    ids = sorted({pid for pid, _s in ents})
+    ai_ids = [i for i in ids if i >= 0]
+    info = {}
+    conn = get_conn()
+    try:
+        for k in range(0, len(ai_ids), 500):
+            part = ai_ids[k:k + 500]
+            ph = ",".join("?" * len(part))
+            for r in conn.execute(f"SELECT id, position, ovr, foot, sub_role FROM ai_players WHERE id IN ({ph})",
+                                  part):
+                info[r[0]] = (r[1], r[2], r[3] or "", r[4] or "")
+            left = [i for i in part if i not in info]
+            if left:
+                ph2 = ",".join("?" * len(left))
+                for r in conn.execute(f"SELECT id, position, ovr FROM ai_players_retired WHERE id IN ({ph2})", left):
+                    info[r[0]] = (r[1], r[2], "", "")
+        if MY_PLAYER_ID in ids:
+            r = conn.execute("SELECT position, ovr, foot, sub_role FROM my_player WHERE id=1").fetchone()
+            if r:
+                info[MY_PLAYER_ID] = (r[0], r[1], r[2] or "", r[3] or "")
+        sub = {}
+        if _subp_enabled() and year:
+            for k in range(0, len(ids), 500):
+                part = ids[k:k + 500]
+                try:
+                    for r in conn.execute(
+                            f"SELECT player_id, position FROM ai_player_sub_positions "
+                            f"WHERE gained_year < ? AND player_id IN ({','.join('?' * len(part))})",
+                            [int(year)] + part):
+                        sub[int(r[0])] = r[1]
+                except Exception:
+                    break
+    finally:
+        conn.close()
+    out = {}
+    for pid, slot in ents:
+        row = info.get(pid)
+        if not row:
+            continue
+        ovr = ovr_by_id.get(pid)
+        if ovr is None:
+            ovr = row[1]
+        if not ovr:
+            continue
+        d = {"position": row[0] or "CM", "ovr": float(ovr), "foot": row[2], "sub_role": row[3]}
+        if sub.get(pid):
+            d["sub_pos"] = sub[pid]
+        try:
+            out[pid] = _fl._slot_value(d, slot)
+        except Exception:
+            continue
+    return out
+
+
 def _bench_ctx_positions(year, formation, starters, bench):
     """[2026-11 신설, 신민용 요청] 후보 선수별 "그 해 팀이 요구한 포지션"(당시 포지션) — {선수 id: 포지션}
     (등록 포지션과 다른 선수만 담는다).
@@ -11214,10 +11282,19 @@ def _finance_attach_market_value(conn, team_id, year, entries):
     if not entries:
         return
     try:
-        from economy import estimate_transfer_fee
+        from economy import estimate_transfer_fee, display_rank_scope
         from constants import get_country_league_grade
     except Exception:
         return
+    # [2026-11 성능·격리] 과거 연도 몸값을 구할 때 게임의 세계 순위표를 그 연도로 다시 짓지 않게
+    # 화면 전용 범위에서 계산한다(economy.display_rank_scope 주석 참고).
+    with display_rank_scope():
+        _finance_attach_market_value_inner(conn, team_id, year, entries,
+                                           estimate_transfer_fee, get_country_league_grade)
+
+
+def _finance_attach_market_value_inner(conn, team_id, year, entries,
+                                       estimate_transfer_fee, get_country_league_grade):
     # 몸값은 부가 정보다 — 여기서 실패해도 패널의 나머지(영입/판매/연봉)는
     # 그대로 떠야 하므로 조회 실패를 삼키고 조용히 빠진다.
     try:
@@ -11383,6 +11460,40 @@ def format_finance_money(v):
     return ("-" + s) if neg else s
 
 
+def _finance_manager_salary(conn, team_id, year):
+    """[2026-11 버그수정, 신민용 리포트: "연봉 지출에 감독도 포함해서 나가야 하는데 감독은
+    안 나가는 것 같아"] 그 해 그 팀을 실제로 지휘한 감독의 연봉(천원, 1년치). 없으면 0.
+
+    · "그 해 감독"은 감독 커리어 화면과 같은 _pick_tenure_for_year 규칙 — 시즌 끝 시장에서
+      부임한 감독의 start_year(끝난 해)는 전임자 몫이라 한 해에 감독은 정확히 한 명이다.
+    · 금액은 manager_salary가 계약 때 남긴 salary_log를 contract_salary_by_year로 읽는다
+      (감독 커리어 화면 연봉 칸과 같은 값 — 재계약·승강 조정도 그 해 적용분 그대로).
+    · 기록이 없는 예전 임기(salary_log 이전 세이브)는 0 — 추정값을 지어내지 않는다.
+    · 읽기 전용·난수 없음 — 월드 진행에 영향 없다."""
+    try:
+        rows = conn.execute(
+            "SELECT id, manager_id, start_year, end_year,"
+            " COALESCE(contract_log,'') AS contract_log, COALESCE(salary_log,'') AS salary_log"
+            " FROM team_managers WHERE team_id=?", (team_id,)).fetchall()
+    except Exception:
+        return 0
+    t = _pick_tenure_for_year(rows, year)
+    if not t:
+        return 0
+    try:
+        r = conn.execute("SELECT current_year FROM season_state WHERE id=1").fetchone()
+        cur_year = int(r[0]) if r else int(year)
+    except Exception:
+        cur_year = int(year)
+    last = t["end_year"] if t["end_year"] is not None else max(cur_year, int(year))
+    first = next((y for y in range(t["start_year"], last + 1)
+                  if (_pick_tenure_for_year(rows, y) or {"id": None})["id"] == t["id"]), None)
+    if first is None:
+        return 0
+    pay = _contract_pay(t["contract_log"], t["salary_log"], first).get(int(year))
+    return int(pay[0]) if pay and pay[0] else 0
+
+
 def get_team_season_finance(team_id, year, mode="second", conn=None):
     """그 해 그 팀이 쓴 금액. mode: first(상반기)/second(하반기)/both(총합).
 
@@ -11468,6 +11579,18 @@ def get_team_season_finance(team_id, year, mode="second", conn=None):
     else:
         _one = sum(e.get("salary") or 0 for e in sal)
         total_salary = int(round(_one * 0.5))
+    # [2026-11 버그수정] 감독 연봉도 인건비 — 선수 연봉과 같은 반기 규칙으로 더한다.
+    #   상반기/하반기 = 연봉 × 0.5, 총합 = 1년치.
+    # 선수 쪽이 "그 반기 스냅샷이 있을 때만" 잡히므로(아직 안 지난 반기는 0) 감독도
+    # 그 반기 로스터 연봉이 잡혔을 때만 더한다 — 지출 줄끼리 기간 기준이 어긋나지 않게.
+    # (총합에서 한쪽 반기 스냅샷만 있는 해는 선수 쪽이 그 반기를 1년치로 보므로 감독도 1년치.)
+    _mgr_salary_year = _finance_manager_salary(conn, team_id, year)
+    if mode == "both":
+        _mgr_salary = _mgr_salary_year if total_salary else 0
+    else:
+        _mgr_salary = int(round(_mgr_salary_year * 0.5)) if sal else 0
+    _player_salary = total_salary
+    total_salary += _mgr_salary
     _spend = total_salary + total_in + _loan_in_fee
     _income = total_out + _loan_out_fee
     return {
@@ -11478,8 +11601,12 @@ def get_team_season_finance(team_id, year, mode="second", conn=None):
         "구단 순수익": {"value": _income - _spend},
         # 건수는 "그 기간에 연봉을 받은 선수 수" — mode="both"는 두 반기
         # 스냅샷을 합쳐 읽으므로 같은 선수가 두 번 세지지 않게 id로 묶는다.
+        # [2026-11] 연봉 지출 = 선수 + 감독. 건수도 연봉을 받은 인원(선수 + 감독 1).
         "연봉 지출": {"value": total_salary,
-                      "n": len({e.get("player_id") for e in sal})},
+                      "n": len({e.get("player_id") for e in sal}) + (1 if _mgr_salary else 0)},
+        # 화면 요약 줄(FINANCE_SUMMARY_SECTIONS)에는 없고, 내역이 필요한 곳(구단 구매 등)용.
+        "선수 연봉": {"value": _player_salary},
+        "감독 연봉": {"value": _mgr_salary},
         "총 영입": {"value": total_in, "n": len(buys)},
         "총 판매": {"value": total_out, "n": len(sells)},
         "이적 순수익": {"value": total_out - total_in},

@@ -85,11 +85,30 @@ def _ovr_tier(ovr: int) -> str:
     if ovr >= 54: return "T5"
     return "T6"
 
+# [2026-11-20 신민용 리포트: "에이전트 계약금이 고정된 느낌 — 연봉은 연도에 따라 달라지는데"] 위 표는
+# 2026년 기준 금액이다(연봉·시장가치 앵커와 같은 기준). 연봉과 같은 시대 배율(economy.economy_index =
+# 연봉 지수, 2001 ≈ 0.23 / 2026 = 1.00 / 이후 연 2.5%)을 곱해 그해 금액으로 바꾼다. False면 예전처럼 고정.
+AGENT_COST_ECONOMY_SCALE = True
+
+
+def _agent_cost_year_mult(year=None) -> float:
+    """에이전트 계약금 시대 배율 — 연봉과 같은 economy_index(year). year가 없으면 현재 게임 연도."""
+    if not AGENT_COST_ECONOMY_SCALE:
+        return 1.0
+    try:
+        from economy import economy_index
+        if year is None:
+            year = (get_state() or {}).get("current_year")
+        return float(economy_index(int(year))) if year else 1.0
+    except Exception:
+        return 1.0
+
+
 def _calc_agent_cost(agent_grade: str, ovr_tier: str) -> int:
-    """에이전트 계약금: 내 OVR(시장가치) 구간 기반 + ±30% 랜덤."""
+    """에이전트 계약금: 내 OVR(시장가치) 구간 기반 + ±30% 랜덤, 그해 시대 배율 적용."""
     if agent_grade == AGENT_NONE:
         return 0
-    base = _BASE_COST.get(agent_grade, {}).get(ovr_tier, 1000)
+    base = _BASE_COST.get(agent_grade, {}).get(ovr_tier, 1000) * _agent_cost_year_mult()
     # ±30% 랜덤 (50천원 단위 반올림)
     varied = int(base * random.uniform(0.70, 1.30))
     return max(10, round(varied / 50) * 50)
@@ -181,7 +200,8 @@ def _gen_one_offer(cur_grade: str, ovr_tier: str, my_cont: str, taken=None) -> d
             g, cont = random.choice(free)
     taken.add((g, cont))
     cost, fee, label = _make_variant(g, ovr_tier)
-    return {"grade": g, "continent": cont, "cost": cost, "fee": fee, "label": label}
+    return {"grade": g, "continent": cont, "cost": cost, "fee": fee, "label": label,
+            "eco": 1 if AGENT_COST_ECONOMY_SCALE else 0}   # eco: 시대 배율 적용된 금액(위 _load_or_generate_offer_pool)
 
 
 def _dedupe_offer_pool(pool, cur_grade, ovr_tier, my_cont):
@@ -216,6 +236,16 @@ def _load_or_generate_offer_pool(p) -> list:
         try:
             data = json.loads(pool_json)
             if isinstance(data, list) and data:
+                # [2026-11-20] 시대 배율 도입 전에 저장된 올해 풀(항목에 "eco" 표시 없음)은 계약금만 올해 배율로
+                # 고쳐 저장한다 — 등급·대륙·수수료·협상 스타일은 그대로(다음 비시즌까지 기다리지 않게).
+                if AGENT_COST_ECONOMY_SCALE and any(isinstance(o, dict) and not o.get("eco") for o in data):
+                    _m = _agent_cost_year_mult(cur_year)
+                    for o in data:
+                        if isinstance(o, dict) and not o.get("eco"):
+                            if o.get("cost"):
+                                o["cost"] = max(10, round(int(o["cost"] * _m) / 50) * 50)
+                            o["eco"] = 1
+                    update_player(agent_offer_pool_json=json.dumps(data))
                 # [2026-10] 이 수정 전에 저장된 풀에 같은 등급·대륙이 겹쳐 있으면 겹친 칸만 바꿔 저장.
                 data, _chg = _dedupe_offer_pool(data, p.get("agent_grade", AGENT_NONE),
                                                 _ovr_tier(p.get("ovr", 40)), _my_continent(p))

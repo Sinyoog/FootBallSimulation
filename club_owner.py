@@ -147,6 +147,14 @@ def owned_team_ids(conn=None):
 def club_price(team_id, year=None, conn=None):
     """구단 가격(천원) = 지금 선수단(AI 선수 + 소속이면 내 선수) 추정 몸값 합 × CLUB_PRICE_MULT.
     몸값은 재정 화면 "최고/최저 몸값"과 같은 economy.estimate_transfer_fee(난수 없음)."""
+    from economy import display_rank_scope
+    # [2026-11] 가격 계산이 게임의 세계 순위표를 건드리지 않게 화면 전용 범위에서 계산한다
+    # (그 해 게임 순위표가 이미 있으면 그것을 그대로 쓰므로 값은 예전과 같다).
+    with display_rank_scope():
+        return _club_price(team_id, year, conn)
+
+
+def _club_price(team_id, year, conn):
     from economy import estimate_transfer_fee
     from constants import get_country_league_grade
     conn, own = _with_conn(conn)

@@ -27,6 +27,7 @@ _ovr_cache_invalidated: bool = False
 # 두고 바로 꺼내 쓴다. 약한 참조라 창이 닫히면 알아서 빠진다.
 import weakref as _weakref
 import pitch_names as _pn   # [2026-10] 피치 이름 축약 표기(T. 몬테이루) + 폭 맞춤 그리기
+from ui.roster_row import install_player_columns, set_player_columns, set_column_color   # [2026-11] 명단 줄 칸 나누기
 _LIVE_TEAM_PANELS: "_weakref.WeakSet" = _weakref.WeakSet()
 
 
@@ -649,7 +650,10 @@ class _FormationCanvas(QWidget):
             except (TypeError, ValueError):
                 v = 0
             if 1 <= v <= 100:   # 비정상값 제외
-                ovrs.append(v)
+                # [2026-11 신민용 요청: "내 팀 평균 OVR도 깎인 OVR로"] 그 자리 유효 OVR(경기 팀 전력과 같은 값).
+                # 자리가 없는(배치 전) 선수만 원래 OVR.
+                _e = _effective_ovr(p)
+                ovrs.append(_e if _e is not None else v)
         if not ovrs: return 0
         precise = round(sum(ovrs) / len(ovrs), 2)   # 내부 계산은 항상 소수 2자리
         return round(precise, ndigits) if ndigits else round(precise)
@@ -788,6 +792,8 @@ class _FormationCanvas(QWidget):
                       "ovr": p.get("ovr", 40), "is_me": True,
                       "injured": bool(p.get("injured")),
                       "age": p.get("age", 0), "nationality": p.get("nationality", ""),
+                      # [2026-11] 유효 OVR(_effective_ovr)이 경기와 같은 입력을 쓰도록(team_plan.my_lineup_candidate)
+                      "foot": p.get("foot") or "", "sub_role": p.get("sub_role") or "",
                       **{s: p.get(s, 0) for s in ALL_STATS}}
                 players.append(me)
 
@@ -923,6 +929,10 @@ class _FormationCanvas(QWidget):
                         continue
                     players.append({"id": r["id"], "name": custom_names.get(r["id"]) or ai_player_code(r["id"]),
                                      "position": sp, "_slot_idx": i, "field_pos": sp,
+                                     # [2026-11] 원래 주포·주발·세부역할 — 유효 OVR·팝업 '포지션(주포)'용
+                                     # (position은 예전부터 자리 이름이라 그대로 둔다)
+                                     "main_pos": r.get("position") or sp,
+                                     "foot": r.get("foot") or "", "sub_role": r.get("sub_role") or "",
                                      "ovr": r["ovr"], "is_me": False,
                                      "club": r["club"], "club_tier": r.get("club_tier"),
                                      "club_country": r.get("club_country"),
@@ -1026,6 +1036,8 @@ class _FormationCanvas(QWidget):
                       "nationality2": p.get("nationality2", ""),
                       "nationality3": p.get("nationality3", ""),
                       "nationality4": p.get("nationality4", ""),
+                      # [2026-11] 유효 OVR(_effective_ovr)이 경기와 같은 입력을 쓰도록(team_plan.my_lineup_candidate)
+                      "foot": p.get("foot") or "", "sub_role": p.get("sub_role") or "",
                       **{s: p.get(s, 0) for s in ALL_STATS}}
 
                 if _me_slot is not None:
@@ -1456,13 +1468,85 @@ def _player_button_label(pl: dict, hard: bool) -> str:
     없는 후보는 등록 포지션을 보여준다.
     [2026-08 수정 이력, 신민용 리포트: "어려움 난이도인데 OVR 숫자가
     그대로 뜬다"] 어려움에서는 OVR 대신 포지션/나이/국적을 보여준다."""
-    _pos_label = pl.get("field_pos") or pl.get("position", "")
+    _pos_label = _shown_pos(pl)
     if hard:
         _age = pl.get("age") or 0
         _nat = pl.get("nationality") or ""
         _detail = f"{_pos_label}" + (f", {_age}세" if _age else "") + (f", {_nat}" if _nat else "")
         return f"{pl.get('name','')[:6]} ({_detail})"
     return f"{pl.get('name','')[:6]} ({_pos_label} {pl.get('ovr',0)})"
+
+
+# ── [2026-11 신설, 신민용 요청: "포지션에 따라 깎인 OVR을 명단에 빨간색으로, 클릭하면 '원래 OVR - 깎인 수치',
+# 내 팀 평균 OVR도 깎인 OVR로"] ─────────────────────────────────────────────────────────────
+# "깎인 OVR" = 경기 엔진이 팀 전력으로 쓰는 바로 그 값 — formation_logic._slot_value(선수, 그 자리).
+#   · AI 선발 전력(team_plan.lineup_strength)과 체인 엔진 팀 전력(chain_engine.slot_fit)이 같은 함수다.
+#   · 포지션 거리 단계 감점(같은 자리 0 / 3·8·15·25%) + 부포 경로(부포 자리 = OVR −1) + 주발(풀백·윙백 반대발).
+#   · 입력도 경기와 같게: 주포·부포(AI는 sub_positions, 나는 team_plan.my_lineup_candidate와 같은 my_sub)·주발·세부역할.
+# 선발(그 자리에 배치된 선수)만 대상 — 후보는 자리가 없으니 원래 OVR 그대로다.
+def _effective_ovr(pl: dict, slot=None):
+    """선수의 그 자리 유효 OVR(float). slot을 안 주면 선발 자리(field_pos). 자리가 없거나 계산할 수 없으면 None."""
+    slot = slot or pl.get("field_pos")
+    if not slot:
+        return None
+    try:
+        base = float(pl.get("ovr") or 0)
+    except (TypeError, ValueError):
+        return None
+    if base <= 0:
+        return None
+    try:
+        import sub_positions as _subp
+        import formation_logic as _fl
+        _pid = pl.get("id")
+        if pl.get("is_me"):
+            _sub = _subp.my_sub()
+        else:
+            _sub = pl.get("sub_pos") or (_subp.get(_pid) if isinstance(_pid, int) and _pid > 0 else None)
+        d = {"position": pl.get("main_pos") or pl.get("position") or "CM", "ovr": base,
+             "foot": pl.get("foot") or "", "sub_role": pl.get("sub_role") or ""}
+        if _sub:
+            d["sub_pos"] = _sub
+        return _fl._slot_value(d, slot)
+    except Exception:
+        return None
+
+
+def _ovr_delta(pl: dict, is_starter: bool):
+    """(원래 OVR 정수, 화면 OVR 정수, 차이) — 차이 = 화면 − 원래(음수면 깎임).
+    선발은 배치된 자리, 후보는 명단에 찍힌 당시 포지션(_shown_pos — 팀이 요구한 자리, 없으면 등록 포지션) 기준.
+    [2026-11 신민용 요청: "주포 LW·부포 없는 후보가 LM으로 들어가 있으면 후보도 깎인 숫자를 빨간색으로"]"""
+    try:
+        base = int(round(float(pl.get("ovr") or 0)))
+    except (TypeError, ValueError):
+        base = 0
+    eff = _effective_ovr(pl) if is_starter else _effective_ovr(pl, _shown_pos(pl))
+    if eff is None:
+        return base, base, 0
+    shown = int(round(eff))
+    return base, shown, shown - base
+
+
+OVR_DOWN_COLOR = "#ff5a5a"     # 깎인 OVR(빨강)
+OVR_UP_COLOR = "#5fd38a"       # 인버티드 보너스 등으로 오른 OVR(초록)
+
+
+def _player_button_parts(pl: dict, hard: bool, is_starter: bool = False):
+    """[2026-11 신민용 요청: "포지션 | 이름 | OVR 3칸"] 명단 줄 칸 글자 (포지션, 이름, OVR, OVR 글자색).
+    포지션은 _player_button_label과 같은 규칙(슬롯 배정된 자리 우선). 어려움 난이도는 OVR 칸을
+    비우고, 예전처럼 나이·국적을 이름 칸 뒤에 붙인다(이름 칸이 모자라면 …로 줄어든다).
+    이름은 예전 6글자 자르기 대신 칸 폭만큼 보인다.
+    [2026-11] 선발은 OVR 칸에 그 자리 유효 OVR(_effective_ovr)을 보이고, 깎였으면 빨간색."""
+    _pos_label = _shown_pos(pl) or "-"
+    _name = pl.get("name", "") or ""
+    if hard:
+        _age = pl.get("age") or 0
+        _nat = pl.get("nationality") or ""
+        _extra = ", ".join(x for x in ((f"{_age}세" if _age else ""), _nat) if x)
+        return _pos_label, (f"{_name} ({_extra})" if _extra else _name), "", None
+    _base, _shown, _d = _ovr_delta(pl, is_starter)
+    _color = OVR_DOWN_COLOR if _d < 0 else (OVR_UP_COLOR if _d > 0 else None)
+    return _pos_label, _name, (_shown if _d else pl.get("ovr", 0)), _color
 
 
 class _RosterPanel(QScrollArea):
@@ -1508,12 +1592,14 @@ class _RosterPanel(QScrollArea):
         (보라색, 외국인 감독이면 주황 테두리, 글자 "이름 · 국적"). 누르면
         FormationWidget.open_manager_popup — 기록실과 같은 간단 변경 팝업(이름 |
         국적 | 스타일)을 연다."""
-        from ui.world_browser_window import _MGR_ROW_QSS, _manager_row_text
-        btn = QPushButton(_manager_row_text(mgr))
+        from ui.world_browser_window import _MGR_ROW_QSS, install_manager_row
+        # [2026-11] 감독 줄도 이름 | OVR | 국적 칸(ui/roster_row.py) — 클릭은 버튼 하나.
+        btn = QPushButton()
+        install_manager_row(btn, mgr, 10)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         btn.setMinimumHeight(29)
-        style = _MGR_ROW_QSS.replace("font-size:11px", "font-size:10px")
+        style = _MGR_ROW_QSS.replace("font-size:11px", "font-size:10px").replace("padding:5px 8px;", "padding:0px;")
         if mgr.get("is_foreign"):
             style += "border:1px solid #FF7F00;"
         btn.setStyleSheet(style + "text-align:left;")
@@ -1545,13 +1631,13 @@ class _RosterPanel(QScrollArea):
         btn = self._mgr_btn
         if btn is None or not self._manager or self._manager.get("id") != (mgr or {}).get("id"):
             return False
-        from ui.world_browser_window import _MGR_ROW_QSS, _manager_row_text
+        from ui.world_browser_window import _MGR_ROW_QSS, update_manager_row
         self._manager.update({k: mgr[k] for k in ("display_name", "custom_name",
                                                   "nationality", "is_foreign", "ability")
                               if k in mgr})
         try:
-            btn.setText(_manager_row_text(self._manager))
-            style = _MGR_ROW_QSS.replace("font-size:11px", "font-size:10px")
+            update_manager_row(btn, self._manager)        # [2026-11] 칸 나눈 감독 줄
+            style = _MGR_ROW_QSS.replace("font-size:11px", "font-size:10px").replace("padding:5px 8px;", "padding:0px;")
             if self._manager.get("is_foreign"):
                 style += "border:1px solid #FF7F00;"
             btn._base_qss = style
@@ -1602,7 +1688,13 @@ class _RosterPanel(QScrollArea):
         # 실제로 뛰는 포지션(field_pos, load_my_team/load_opp_team이 슬롯
         # 배정 직후 태깅)을 우선 보여주고, 슬롯 배정 자체가 없는 후보
         # 선수만 기존처럼 등록 포지션을 보여준다.
-        btn = QPushButton(_player_button_label(pl, hard))
+        # [2026-11] 버튼 글자는 비우고 포지션 | 이름 | OVR 칸을 얹는다(ui/roster_row.py) — 클릭·선택은
+        # 예전처럼 버튼 하나. 툴팁엔 예전 한 줄 글자를 둔다.
+        btn = QPushButton()
+        _pp = _player_button_parts(pl, hard, is_starter)
+        install_player_columns(btn, *_pp[:3], 10)
+        set_column_color(btn, "ovr", _pp[3])
+        btn.setToolTip(_player_button_label(pl, hard))
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         # [2026-08 신설, 신민용 요청: "우측 상자들 크기를 최대한 우측
         # 크기에 맞춰서 키우고 세로 길이도 1.2배 정도"] 가로는 부모
@@ -1614,23 +1706,23 @@ class _RosterPanel(QScrollArea):
             # [2026-08 신설, 신민용 요청: "부상당해서 못 나갈 때는
             # 금색 말고 빨간색으로"] 포메이션 캔버스와 동일한 규칙.
             style = ("background:#4a1414;color:#ffb0b0;border:1px solid #cc2222;"
-                     "border-radius:4px;padding:5px 8px;font-size:10px;font-weight:bold;")
+                     "border-radius:4px;padding:0px;font-size:10px;font-weight:bold;")
         elif is_me:
             # 나는 주전/벤치와 무관하게 항상 노란색으로 — 포메이션
             # 캔버스에서 "나"를 표시하는 색과 통일.
             style = ("background:#4a3a00;color:#ffe066;border:1px solid #ffcc00;"
-                     "border-radius:4px;padding:5px 8px;font-size:10px;font-weight:bold;")
+                     "border-radius:4px;padding:0px;font-size:10px;font-weight:bold;")
         elif is_starter:
             # 주전 — 상자를 녹색으로.
             style = ("background:#1e4a1e;color:#eaffea;border:1px solid #3fae3f;"
-                     "border-radius:4px;padding:5px 8px;font-size:10px;font-weight:bold;")
+                     "border-radius:4px;padding:0px;font-size:10px;font-weight:bold;")
         else:
             # [2026-08 수정, 신민용 요청: "후보 선수는 색 없이"] 그룹 구분은
             # 위 "후보" 헤더가 이미 담당하므로, 개별 벤치 선수 행은 주전
             # (녹색)과 구분되는 무채색 스타일로 — 파란 글자로 강조하던
             # 기존 스타일을 폐기.
             style = ("background:#1c1c1c;color:#aaa;border:1px solid #333;"
-                     "border-radius:4px;padding:5px 8px;font-size:10px;")
+                     "border-radius:4px;padding:0px;font-size:10px;")
         # [2026-09 신설, 신민용 요청: "메인 화면 포메이션(우측 명단)도
         # 외국인 용병은 겉부분을 #FF7F00으로 강조 — 파란 선택 하이라이트가
         # 우선"] 배경/글자색은 그대로 두고 테두리 선언만 뒤에 덧붙인다 —
@@ -1686,6 +1778,7 @@ class _RosterPanel(QScrollArea):
         self._selected_id = None
         self._mgr_btn = None
         self._manager = dict(manager) if manager else None
+        self._starter_set = set(starter_ids or ())   # [2026-11] 이름만 다시 쓸 때 선발 여부(유효 OVR) 판정용
         _hard = is_hard_mode()   # [2026-08 최적화] 버튼마다 DB 재조회하지 않도록 한 번만
         # 기존 버튼/라벨 정리
         while self._grid.count():
@@ -1746,7 +1839,11 @@ class _RosterPanel(QScrollArea):
         if btn is None or pl is None:
             return False
         try:
-            btn.setText(_player_button_label(pl, is_hard_mode()))
+            _hard = is_hard_mode()
+            _pp = _player_button_parts(pl, _hard, player_id in getattr(self, "_starter_set", ()))
+            set_player_columns(btn, *_pp[:3])   # [2026-11] 칸 나눈 줄
+            set_column_color(btn, "ovr", _pp[3])
+            btn.setToolTip(_player_button_label(pl, _hard))
         except RuntimeError:
             return False   # 이미 삭제된 버튼(방어적 처리)
         return True
@@ -1820,6 +1917,7 @@ class _TeamPanel(QWidget):
         # [2026-09 신설] 캔버스가 이미 구해둔 team_country를 그대로
         # 넘긴다 — 명단 패널 쪽 테두리 강조가 캔버스와 항상 같은 기준을
         # 쓰게 하기 위함(둘이 각자 조회하면 어긋날 위험이 있음).
+        _apply_bench_ctx_positions(self.canvas)   # [2026-11] 후보도 팀이 요구한 자리(당시 포지션)로
         self.roster.set_roster(self.canvas._roster, self.canvas._starter_ids,
                                 team_country=self.canvas._team_country,
                                 manager=self.manager)
@@ -3416,7 +3514,42 @@ from formation_logic import (_pos_category, _best_slot_for_player, _greedy_fill_
 # 밀려 배정된 선수가 엉뚱한 줄 사이에 끼어 보였다. 이제 화면에 찍힌 그 글자로 줄을 가르고, 같은 줄은 OVR
 # 내림차순, 같으면 고정 난수(formation_logic.roster_line_sort_key — 세계 축구 기록실 명단과 같은 기준).
 def _starter_sort_key(pl: dict):
-    return roster_line_sort_key(pl.get("field_pos") or pl.get("position", ""), pl.get("ovr"), pl.get("id"))
+    # [2026-11] 후보는 당시 포지션(ctx_pos)으로 줄을 가른다 — 세계 기록실 명단과 같은 기준(화면 글자 = 정렬 기준)
+    return roster_line_sort_key(_shown_pos(pl), pl.get("ovr"), pl.get("id"))
+
+
+def _shown_pos(pl: dict) -> str:
+    """명단·팝업 '포지션(당시)'에 찍히는 자리 — 선발은 배치된 자리(field_pos), 후보는 팀이 요구한 자리(ctx_pos,
+    _apply_bench_ctx_positions), 둘 다 없으면 등록 포지션."""
+    return pl.get("field_pos") or pl.get("ctx_pos") or pl.get("position", "") or ""
+
+
+def _apply_bench_ctx_positions(canvas):
+    """[2026-11 신설, 신민용 리포트: "메인 화면 주전은 LW가 LM처럼 자리에 맞춰 뜨는데 후보는 안 된다"]
+    세계 기록실 팀 연도 포메이션과 같은 함수(world_browser._bench_ctx_positions)로 후보마다 "팀이 요구한 자리"를
+    구해 ctx_pos에 둔다 — 예: LM·RM만 쓰는 포메이션이면 LW·RW 후보는 LM·RM, 부포로 쓰이는 후보는 부포.
+    등록 포지션(position)은 건드리지 않는다(팝업 '포지션(주포)'는 그대로). 표시 전용 — 선발·경기와 무관."""
+    roster = getattr(canvas, "_roster", None) or []
+    ids = getattr(canvas, "_starter_ids", None) or set()
+    for pl in roster:
+        pl.pop("ctx_pos", None)
+    bench = [pl for pl in roster if pl.get("id") not in ids and pl.get("id") is not None]
+    if not bench or not getattr(canvas, "formation", ""):
+        return
+    try:
+        import world_browser as _wb
+        from game_engine import get_state
+        _yr = (get_state() or {}).get("current_year")
+        st = [{"id": pl.get("id"), "slot": pl.get("field_pos") or pl.get("position")}
+              for pl in roster if pl.get("id") in ids]
+        bn = [{"id": pl.get("id"), "position": pl.get("main_pos") or pl.get("position", "")} for pl in bench]
+        ctx = _wb._bench_ctx_positions(_yr, canvas.formation, st, bn)
+    except Exception as _e:
+        print(f"[포메이션] 후보 당시 포지션 계산 실패(등록 포지션 그대로 표시): {_e}")
+        return
+    for pl in bench:
+        if pl.get("id") in ctx:
+            pl["ctx_pos"] = ctx[pl["id"]]
 
 
 def _row_priority(k):
@@ -3557,9 +3690,23 @@ class PlayerStatPopup(QDialog):
         # 어려움 난이도는 OVR 행 자체를 아예 안 넣는다(신원 식별용 4개
         # 항목 — 이름/포지션/나이/국적 — 만 남긴다).
         _hard = is_hard_mode()
-        info_rows = [
-            ("이름", pl.get('name', '')),
-            ("주포", pl.get('position', '')),
+        # [2026-11 변경, 신민용 요청: "메인 화면 선수 클릭 시 순서가 이름 | OVR | 포지션(당시) | 포지션(주포) |
+        # 포지션(부포) | 나이 | 국적이어야"] 예전엔 이름 → 주포 → (부포) → OVR → 나이 → 국적. 항목 이름도 세계 기록실
+        # 간단 변경 창과 같은 "포지션(…)"으로 맞춘다. 포지션(당시) = 지금 이 포메이션에서 맡은 자리 — 명단 줄의 포지션
+        # 칸과 같은 값(슬롯 배정된 자리 field_pos, 후보는 등록 포지션). 부포가 없으면 "-"(기록실과 같다).
+        # 어려움 난이도는 예전처럼 OVR 줄 자체를 뺀다. 이름·OVR·국적 줄의 클릭 편집은 라벨로 찾으므로 그대로 동작한다.
+        info_rows = [("이름", pl.get('name', ''))]
+        # [2026-11 신민용 요청: "클릭하면 OVR에 '원래 OVR - 깎인 수치'"] 선발이 자리 때문에 깎였으면 "97 - 5"
+        # (명단 OVR 칸의 빨간 숫자 = 97 − 5 = 92). 오른 경우(인버티드 보너스)는 "97 + 1". 후보·안 깎인 선발은 숫자 하나.
+        _starters = getattr(getattr(panel or self._panel, "canvas", None), "_starter_ids", None) or set()
+        _ob, _os, _od = _ovr_delta(pl, pl.get("id") in _starters)
+        self._ovr_delta = _od
+        if not _hard:
+            info_rows.append(("OVR", f"{_ob} - {-_od}" if _od < 0 else (f"{_ob} + {_od}" if _od > 0
+                                                                         else str(pl.get('ovr', 0)))))
+        info_rows += [
+            ("포지션(당시)", _shown_pos(pl) or "-"),
+            ("포지션(주포)", pl.get("main_pos") or pl.get('position', '') or "-"),
         ]
         # [2026-10 주포·부포, 신민용 요청: "포메이션에서 ai선수 클릭할 때 주포 부포 이렇게 떠야"]
         # 부포가 있으면 "포지션" 줄을 "주포 | 부포"(예: ST | LW)로(내 선수는 id -1 또는 is_me로 조회).
@@ -3572,10 +3719,7 @@ class PlayerStatPopup(QDialog):
             _sub = None
         # [2026-11-17 변경, 신민용 요청: "RB | LWB 한 줄 말고 주포 RB, 그 아래 줄에 부포 LWB로"] 주포·부포를 두 줄로 나눈다.
         # 부포가 없으면 주포 줄만 보인다. (행 위치는 아래 표를 그릴 때 라벨로 찾으므로 줄이 늘어도 편집 동작은 그대로.)
-        if _sub:
-            info_rows.insert(2, ("부포", _sub))
-        if not _hard:
-            info_rows.append(("OVR", str(pl.get('ovr', 0))))
+        info_rows.append(("포지션(부포)", _sub or "-"))
         age = pl.get("age")
         if age:
             info_rows.append(("나이", f"{age}세"))
@@ -3681,7 +3825,9 @@ class PlayerStatPopup(QDialog):
                 # 라벨 칸을 파란색+굵게로 눈에 띄게 하고, 아니면 평범하게.
                 self._ovr_row_idx = i
                 self._ovr_value_item = value_item
-                value_item.setForeground(QColor("#ccc"))
+                # [2026-11] 자리 때문에 깎였으면 빨강(명단 OVR 칸과 같은 색), 올랐으면 초록
+                value_item.setForeground(QColor(OVR_DOWN_COLOR if self._ovr_delta < 0
+                                                else (OVR_UP_COLOR if self._ovr_delta > 0 else "#ccc")))
                 if self._ovr_edit_pid is not None:
                     lf = label_item.font(); lf.setBold(True); label_item.setFont(lf)
                     label_item.setForeground(QColor("#4da6ff"))
@@ -4003,7 +4149,8 @@ class PlayerStatPopup(QDialog):
         # 정보는 새로 조회한 dict에 없으므로 옮겨 붙인다).
         fresh = _fetch_single_ai_player(pid)
         if fresh is not None:
-            for k in ("club", "club_country", "club_tier"):
+            # [2026-11] 자리(field_pos 등)도 옮겨 붙여야 새 OVR 기준 "원래 - 깎인 수치"가 그대로 보인다
+            for k in ("club", "club_country", "club_tier", "field_pos", "_slot_idx", "main_pos"):
                 if k in self._pl and k not in fresh:
                     fresh[k] = self._pl[k]
             self.load_player(fresh)

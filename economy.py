@@ -188,13 +188,29 @@ def _build_rank_table(year):
             # [실험 3차] 포지션 계수 정규화: 세계 상위 2,000명(필드)의 기존 포지션 계수 평균
             top = pool[:2000]
             T["pos_pbar"] = (sum(POSITION_MARKET_MULT.get(r[2], 1.0) for r in top) / len(top)) if top else 1.0
+    _install_rank_table(T, year)
+
+
+def _install_rank_table(T, year):
+    """완성된 순위표 T를 RANK_TABLE로 올리고 GK 연결 배율(s_gk)을 계산한다 — 전체 빌드와
+    화면용 경량 빌드(_build_rank_table_light)가 같이 쓴다(s_gk는 OVR 묶음 표만 읽는다)."""
+    import math
     _E_BEST_CACHE.clear()
     RANK_TABLE.clear(); RANK_TABLE.update(T)
     # GK 연결 배율: 101위가 속한 OVR 묶음 안 위치로 소수 OVR → 기존 최고 구매가 로그 보간
-    gk_pool_ovr = sorted(((v[0], v[1]) for v in T["rank_of"].values() if v[2]), key=lambda x: x[0])
     s_gk = None
-    if len(gk_pool_ovr) >= RANK_GK_LINK:
-        oK = gk_pool_ovr[RANK_GK_LINK - 1][1]
+    if T["rank_of"]:
+        # 전체 빌드(게임 진행 경로) — 예전 코드 그대로: 101위 GK의 OVR을 순위 정렬에서 읽는다.
+        gk_pool_ovr = sorted(((v[0], v[1]) for v in T["rank_of"].values() if v[2]), key=lambda x: x[0])
+        oK = gk_pool_ovr[RANK_GK_LINK - 1][1] if len(gk_pool_ovr) >= RANK_GK_LINK else None
+    else:
+        # [2026-11] 화면용 경량 빌드엔 rank_of가 없다 — 101위를 담은 OVR 묶음에서 읽는다
+        # (경량 빌드는 OVR이 전부 정수일 때만 쓰므로 묶음 구간이 겹치지 않아 같은 값이다).
+        oK = None
+        if T.get(("n", True), 0) >= RANK_GK_LINK:
+            oK = next((o for (g, o), (f, l) in T["block"].items()
+                       if g and f <= RANK_GK_LINK <= l), None)
+    if oK is not None:
         first, last = T["block"][(True, oK)]
         o_eff = oK - 0.5 + (last - RANK_GK_LINK + 0.5) / (last - first + 1)
         lo = math.floor(o_eff); t = o_eff - lo
@@ -204,6 +220,152 @@ def _build_rank_table(year):
             s_gk = rank_value_eurm(RANK_GK_LINK, True) * EOK_PER_EURM / e_eff
     RANK_TABLE["s_gk"] = s_gk
     RANK_STATS["builds"] += 1
+
+
+def _build_rank_table_light(year):
+    """[2026-11 신설, 화면 전용] 선수별 순위(rank_of) 없이 OVR 묶음·포지션 정규화·GK 연결 배율만
+    만든다 — player_id 없이 부르는 화면 표시(재정 패널 '최고/최저 몸값', 구단 가격)에는 이것만 쓰인다.
+    전체 빌드는 27만 명을 평점과 조인·정렬해 약 1초가 걸리지만, 이건 OVR별 인원 집계 +
+    상위 2,000명 경계 묶음만 읽는다. 결과(block / ("n",gk) / pos_pbar / s_gk)는 전체 빌드와 같다:
+      · block: 정렬 1순위가 OVR이므로 OVR별 인원을 높은 OVR부터 누적하면 같은 구간이 나온다.
+      · pos_pbar: 상위 2,000명을 전체 빌드와 같은 정렬 키로 SQL에서 뽑아 같은 순서로 더한다.
+    OVR이 비었거나(NULL) 0 이하인 선수가 있으면(전체 빌드에선 0과 섞여 묶음이 겹칠 수 있음) 전체 빌드로 넘긴다."""
+    from database import get_conn
+    c = get_conn()
+    try:
+        # OVR별 인원은 연도와 무관(지금 세계 상태만 본다) — 화면 범위 안에선 게임 시계가 바뀌기 전까지 재사용.
+        # '+team_id'는 team_id 인덱스를 쓰지 않게 하는 SQLite 문법이다 — team_id>0은 거의 전원이라
+        # 인덱스로 27만 번 찾아가는 것보다 표를 한 번 훑는 게 빠르다(실측 약 200ms → 130ms).
+        counts = _DISPLAY.get("counts") if _DISPLAY["depth"] else None
+        if counts is None:
+            counts = [tuple(r) for r in c.execute(
+                "SELECT COALESCE(position,'')='GK', ovr, COUNT(*) FROM ai_players WHERE +team_id>0 "
+                "GROUP BY 1, 2").fetchall()]
+            if _DISPLAY["depth"]:
+                _DISPLAY["counts"] = counts
+        if any(r[1] is None or r[1] <= 0 for r in counts):
+            c.close(); c = None
+            return _build_rank_table(year)
+        T = {"key": year, "rank_of": {}, "block": {}, "above": {}, "buyers": _big5_buyers(), "light": True}
+        for gk in (False, True):
+            i = 0
+            for o, n in sorted(((r[1], r[2]) for r in counts if bool(r[0]) == gk), key=lambda x: -x[0]):
+                T["block"][(gk, o)] = (i + 1, i + n)
+                i += n
+            T[("n", gk)] = i
+        # 상위 2,000명(필드) — 경계 OVR 이상만 평점과 조인해 전체 빌드와 같은 키로 정렬
+        cut, acc = None, 0
+        for o, n in sorted(((r[1], r[2]) for r in counts if not r[0]), key=lambda x: -x[0]):
+            acc += n; cut = o
+            if acc >= 2000:
+                break
+        top = []
+        if cut is not None:
+            _sql = """SELECT p.position FROM ai_players p {join}
+                WHERE +p.team_id>0 AND COALESCE(p.position,'')<>'GK' AND p.ovr>=?
+                ORDER BY p.ovr DESC, {rat} DESC, COALESCE(NULLIF(p.potential_ovr,0), p.ovr) DESC, p.id
+                LIMIT 2000"""
+            try:
+                top = [r[0] for r in c.execute(_sql.format(
+                    join="LEFT JOIN hist.ai_player_season_stats s ON s.player_id=p.id AND s.year=?",
+                    rat="COALESCE(s.rating,0.0)"), ((year or 0) - 1, cut)).fetchall()]
+            except Exception:
+                RANK_STATS["no_rating"] += 1
+                top = [r[0] for r in c.execute(_sql.format(join="", rat="0.0"), (cut,)).fetchall()]
+        T["pos_pbar"] = (sum(POSITION_MARKET_MULT.get(p, 1.0) for p in top) / len(top)) if top else 1.0
+    finally:
+        if c is not None:
+            c.close()
+    _install_rank_table(T, year)
+
+
+# ───────── [2026-11 신설] 화면 표시용 순위표 격리 ─────────
+# 신민용 리포트: "세계 축구 기록실 → 팀 검색 → 역대 기록 연도 클릭(포메이션 보기)에서 딜레이".
+# 원인: 재정 패널의 '최고/최저 몸값'이 그 해(year=과거 연도)로 estimate_transfer_fee를 불러,
+# 연도 1개만 담는 RANK_TABLE을 그 연도로 다시 지었다(27만 명 조인·정렬 ≈ 1초, 연도 바꿀 때마다).
+# 더 큰 문제: 그 재빌드가 게임 진행이 쓰던 순위표를 덮어써서, 다음 게임 쪽 이적료 계산이 그 시점 DB로
+# 순위표를 새로 지었다 — 기록실을 보기만 해도 이후 이적료(=진행 결과)가 달라질 수 있었다.
+# 해결: 화면 호출은 display_rank_scope() 안에서 부른다.
+#   · 들어갈 때 게임 순위표를 통째로 보관하고, 나올 때 그대로 되돌린다(RANK_STATS 계측값도) —
+#     게임 진행 경로는 화면을 몇 번 열든 열지 않은 것과 같다.
+#   · 안에서 다른 연도가 필요하면 경량 빌드 + 연도별 캐시(게임 시계가 바뀌면 비움, 최대 _DISPLAY_MAX개).
+#   · 게임 순위표가 이미 있는 연도는 그걸 그대로 쓴다(화면 값 = 게임이 쓰는 값).
+_DISPLAY = {"depth": 0, "stamp": None, "cache": {}, "counts": None}
+_DISPLAY_MAX = 6
+
+
+def _game_clock_stamp():
+    try:
+        from database import get_conn
+        c = get_conn()
+        try:
+            r = c.execute("SELECT current_year, current_week, current_day FROM season_state WHERE id=1").fetchone()
+            return tuple(r) if r else None
+        finally:
+            c.close()
+    except Exception:
+        return None
+
+
+class display_rank_scope:
+    """with display_rank_scope(): ...  — 화면 표시용 estimate_transfer_fee 호출을 감싼다(중첩 가능)."""
+
+    def __enter__(self):
+        d = _DISPLAY
+        d["depth"] += 1
+        if d["depth"] > 1:
+            return self
+        stamp = _game_clock_stamp()
+        if stamp != d["stamp"] or stamp is None:
+            d["cache"].clear()
+            d["counts"] = None
+            d["stamp"] = stamp
+        self._saved = (dict(RANK_TABLE), dict(_E_BEST_CACHE), dict(RANK_STATS))
+        k = RANK_TABLE.get("key")
+        if k != "unset" and "block" in RANK_TABLE:
+            d["cache"][k] = self._saved[:2]          # 게임 순위표 연도는 그것을 그대로 쓴다
+        return self
+
+    def __exit__(self, *exc):
+        d = _DISPLAY
+        d["depth"] -= 1
+        if d["depth"] > 0:
+            return False
+        k = RANK_TABLE.get("key")
+        if "block" in RANK_TABLE and (k != self._saved[0].get("key") or k in d["cache"]):
+            d["cache"][k] = (dict(RANK_TABLE), dict(_E_BEST_CACHE))
+            while len(d["cache"]) > _DISPLAY_MAX:
+                d["cache"].pop(next(iter(d["cache"])))
+        T, E, S = self._saved
+        RANK_TABLE.clear(); RANK_TABLE.update(T)
+        _E_BEST_CACHE.clear(); _E_BEST_CACHE.update(E)
+        RANK_STATS.clear(); RANK_STATS.update(S)
+        return False
+
+
+def _ensure_rank_table(year, player_id):
+    """rank_adjust 앞단 — 게임 경로(화면 범위 밖)는 예전과 똑같이 연도가 다를 때만 전체 빌드."""
+    if not _DISPLAY["depth"]:
+        if RANK_TABLE.get("key") != year:
+            _build_rank_table(year)
+        return
+    need_full = player_id is not None
+    if RANK_TABLE.get("key") == year and not (need_full and RANK_TABLE.get("light")):
+        return
+    # 지금 올라가 있는 연도 표를 내리기 전에, 그동안 _e_best가 채운 값까지 캐시에 넣어 둔다.
+    _cur = RANK_TABLE.get("key")
+    if _cur in _DISPLAY["cache"] and "block" in RANK_TABLE:
+        _DISPLAY["cache"][_cur] = (dict(RANK_TABLE), dict(_E_BEST_CACHE))
+    hit = _DISPLAY["cache"].get(year)
+    if hit and not (need_full and hit[0].get("light")):
+        RANK_TABLE.clear(); RANK_TABLE.update(hit[0])
+        _E_BEST_CACHE.clear(); _E_BEST_CACHE.update(hit[1])
+        return
+    if need_full:
+        _build_rank_table(year)
+    else:
+        _build_rank_table_light(year)
+    _DISPLAY["cache"][year] = (dict(RANK_TABLE), dict(_E_BEST_CACHE))
 
 
 def _midrank(gk, ovr):
@@ -217,8 +379,7 @@ def _midrank(gk, ovr):
 
 def rank_adjust(ovr, position, player_id, year):
     """{'mult', 'beta', 'rank', 'value_eok'} — 기존 2026 가격에 곱할 순위 배율."""
-    if RANK_TABLE.get("key") != year:
-        _build_rank_table(year)
+    _ensure_rank_table(year, player_id)
     gk = (position == "GK")
     info = RANK_TABLE["rank_of"].get(player_id) if player_id is not None else None
     rank = info[0] if (info and info[1] == ovr and info[2] == gk) else _midrank(gk, ovr)

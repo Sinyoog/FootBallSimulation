@@ -9770,6 +9770,8 @@ def _check_sale_push_forced_sale(p, cur_year, cur_week):
         return
     if p.get("sale_push_proposal_json"):
         return  # 이미 대기 중인 제안이 있음 — 플레이어 결정을 기다림
+    if my_under_adult_age(p):
+        return  # [2026-11-19 MY_AGE16_RULES] 16세 미만은 타 구단(성인팀) 판매 제안을 만들지 않는다
     import my_loan as _my_loan
     if _my_loan.loan_push_active(p):
         return  # [2026-10 my_loan] 임대 제안 대기·임대 예약 중엔 판매 제안을 만들지 않는다
@@ -10165,6 +10167,26 @@ def reserve_join_transfer(team_id, salary, team_name, transfer_type="오퍼", of
         add_log(f"⛔ 입단한 이적 기간에는 다른 팀 오퍼를 수락할 수 없습니다 — {team_name} 예약 취소",
                 "news", _st0.get("current_year"), _st0.get("current_week"))
         return False
+    # [2026-11-20 신민용 요청: "오퍼 넣었을 때 거절했으면 바로 뜨게"] 원 소속 구단의 판매 승인을 수락하는
+    # 이 순간에 판정한다(_offer_sale_gate — 예전엔 실제 이동 주차에 처음 판정). 거절이면 예약하지 않고,
+    # 이미 잡아둔 예약(이전에 수락한 다른 팀)·임대 예약은 그대로 둔다. 승인이면 그 결과를 예약에 실어
+    # 실제 이동 때 다시 판정하지 않는다. 무소속 입단 등 원 소속 구단이 없는 경우는 예전과 같다.
+    if transfer_type == "오퍼" and offer is not None:
+        _p0 = get_player()
+        if _p0 and _p0.get("current_team_id"):
+            if not _offer_sale_gate(_p0, offer):
+                _prev = _p0.get("pending_join_transfer_json") or ""
+                if _prev:
+                    try:
+                        _prev_name = json.loads(_prev).get("team_name", "")
+                    except Exception:
+                        _prev_name = ""
+                    if _prev_name:
+                        add_log(f"📋 이전에 확정한 {_prev_name} 이적 예약은 그대로 유지됩니다", "news")
+                return False
+            offer = dict(offer)
+            offer["_sale_gate_ok"] = True
+            offer["_sale_gate_from"] = _p0.get("current_team_id")
     proposal = {"team_id": team_id, "salary": salary, "team_name": team_name,
                 "transfer_type": transfer_type, "offer": offer or {}}
     st = get_state() or {}
@@ -22084,6 +22106,21 @@ def _end_of_season(p, year, progress_cb=None):
     # 작다).
     from database import history_drain
     history_drain()
+    # [2026-11-20 버그수정, 신민용 리포트: "16세에 1부 28골·리그 MVP인데 골든보이 후보에도 없다"] 개인상의 내 역할
+    # 게이트(_AWARD_EXCLUDED_ROLES — 대기·전력외·유망주)는 my_player_position_history의 그 해 행을 읽는데, 그 해 실제
+    # 출전으로 보정한 역할 스냅샷(snapshot_my_player_position)은 이 함수 뒤쪽(개인상 계산 다음)에서야 찍혔다. 그래서
+    # 개인상은 입단 순간 OVR로 정한 역할(16세 입단 = 유망주)을 그대로 읽어, 한 시즌 내내 주전으로 뛴 선수도 골든보이·
+    # 코파 트로피·발롱도르·세계 베스트 11 후보에서 빠졌다. 같은 스냅샷을 개인상 계산 직전에 한 번 더 찍는다(그 해
+    # 시즌 기록 my_player_season_stats는 위에서 이미 저장됨). 뒤쪽 원래 호출은 그대로 둔다(같은 계산을 다시 저장).
+    # 전역 난수는 건드리지 않게 상태를 되돌린다.
+    _rs_snap = random.getstate()
+    try:
+        from ai_lifecycle import snapshot_my_player_position as _snap_my_pos
+        _snap_my_pos(year)
+    except Exception as _e:
+        print(f"[내 포지션 아카이브 오류(개인상 전)] {year}년: {_e}")
+    finally:
+        random.setstate(_rs_snap)
     _compute_season_individual_awards(year, my_ctx=_my_ctx)
     # [2026-09 신설, 히스토리 비동기 writer] _process_awards(바로 아래)는
     # "이 결과를 조회만 함"(위 _compute_season_individual_awards docstring
@@ -26385,6 +26422,66 @@ def _o1_u(*parts) -> float:
     return int.from_bytes(h, "big") / 18446744073709551616.0
 
 
+def my_is_early_youth_talent(p) -> bool:
+    """[2026-11-19 신설, constants.MY_AGE16_RULES] 14~15세 조기 유스 입단이 되는 '뛰어난 선수'인가 — OVR이 아니라
+    생성 시 재능 등급(talent_tier)으로 판정한다."""
+    from constants import MY_EARLY_YOUTH_TALENTS
+    return ((p or {}).get("talent_tier") or "") in MY_EARLY_YOUTH_TALENTS
+
+
+def my_under_adult_age(p) -> bool:
+    """[2026-11-19 신설, constants.MY_AGE16_RULES] 성인팀 입단 나이(16세) 미만인가. 스위치가 꺼져 있으면 항상 False."""
+    from constants import MY_AGE16_RULES, MY_ADULT_JOIN_MIN_AGE
+    if not MY_AGE16_RULES:
+        return False
+    return ((p or {}).get("age", 17) or 17) < MY_ADULT_JOIN_MIN_AGE
+
+
+def my_effective_min_join_age(p) -> int:
+    """[2026-11-19 신설, constants.MY_AGE16_RULES] 내 선수가 팀 입단(입단 버튼·입단 기간 안내)을 할 수 있는 나이.
+    하한은 예전처럼 선수별 min_join_age(시작 나이+1, 옛 세이브는 MIN_JOIN_AGE). 규칙이 켜져 있으면 여기에
+    일반 선수 16세 / 뛰어난 선수(재능 등급) 14세를 건다. 스위치가 꺼져 있으면 예전 값 그대로."""
+    from constants import MIN_JOIN_AGE, MY_AGE16_RULES, MY_ADULT_JOIN_MIN_AGE, MY_EARLY_YOUTH_MIN_AGE
+    p = p or {}
+    base = p.get("min_join_age") or MIN_JOIN_AGE
+    if not MY_AGE16_RULES:
+        return base
+    floor = MY_EARLY_YOUTH_MIN_AGE if my_is_early_youth_talent(p) else MY_ADULT_JOIN_MIN_AGE
+    return max(base, floor)
+
+
+def _my_age_apply_block(team_id, ctx, p=None):
+    """[2026-11-19 신설, constants.MY_AGE16_RULES] 직접 지원 나이 규칙. 반환: None(통과) 또는 사유
+    ("age_min" 16세 미만은 성인팀 지원 불가 / "age_foreign" 16세 미만 해외 산하팀 지원 불가).
+    16세 미만이 지원할 수 있는 곳은 재능이 뛰어난 선수의 자국 구단 리그 소속 산하팀뿐이다(그 뒤 유스 자격은 기존 판정)."""
+    p = p if p is not None else (ctx.get("_age16_p") if ctx is not None and "_age16_p" in ctx else None)
+    if p is None:
+        p = get_player() or {}
+        if ctx is not None:
+            ctx["_age16_p"] = p
+    if not my_under_adult_age(p):
+        return None
+    if team_id and team_id == (p.get("current_team_id") or 0):
+        return None
+    if not my_is_early_youth_talent(p):
+        return "age_min"
+    conn = get_conn()
+    try:
+        t = conn.execute(
+            """SELECT t.classification_status AS cls, t.parent_team_id AS pid, cn.name AS pcountry
+               FROM teams t LEFT JOIN teams pt ON pt.id=t.parent_team_id
+               LEFT JOIN leagues pl ON pl.id=pt.league_id LEFT JOIN countries cn ON cn.id=pl.country_id
+               WHERE t.id=?""", (team_id,)).fetchone()
+    finally:
+        conn.close()
+    if not t or (t["cls"] or "") != "AFFILIATE" or not t["pid"]:
+        return "age_min"
+    nats = {p.get(k) for k in ("nationality", "nationality2", "nationality3", "nationality4") if p.get(k)}
+    if t["pcountry"] not in nats:
+        return "age_foreign"
+    return None
+
+
 def _fj2_first_join_picks(p, conn, rows, draw_key, my_nats, my_continent, team_avg, full_fn, floor_ref,
                           role_fn, stats):
     """[2026-11-18 FJ2, 신민용 확정] 첫 입단 오퍼 후보 선정 — constants FJ2_* 주석 참고.
@@ -26442,9 +26539,20 @@ def _fj2_first_join_picks(p, conn, rows, draw_key, my_nats, my_continent, team_a
                 return a
         return None
 
+    from constants import MY_AGE16_RULES as _A16, MY_ADULT_JOIN_MIN_AGE as _ADULT_AGE
+    # [2026-11-19 MY_AGE16_RULES] 16세 미만: 재능이 뛰어난 선수의 자국 구단 산하팀 유스 계약만(1군·유망주·해외 불가).
+    _u16 = my_under_adult_age(p)
+    _u16_ok = _u16 and my_is_early_youth_talent(p)
+    _prospect_min = max(FJ2_PROSPECT_MIN_AGE, _ADULT_AGE) if _A16 else FJ2_PROSPECT_MIN_AGE
+
     def _evaluate(r, dom):
         """그룹 대표 행 r(모구단 또는 산하팀 없는 구단) → (입단 팀 행, 형태, 역할, 모구단) 또는 None."""
         has_kids = r["id"] in kids
+        if _u16:
+            if not (_u16_ok and dom and has_kids and _floor_ok(r, dom)):
+                return None
+            a = _youth_pick(r)
+            return (a, "youth", FJ2_FIXED_ROLE, r) if a is not None else None
         if has_kids:
             if not _floor_ok(r, dom):
                 return None
@@ -26456,7 +26564,7 @@ def _fj2_first_join_picks(p, conn, rows, draw_key, my_nats, my_continent, team_a
                     return None
             a = _youth_pick(r)
             return (a, "youth", FJ2_FIXED_ROLE, r) if a is not None else None
-        if not early and age < FJ2_PROSPECT_MIN_AGE:
+        if not early and age < _prospect_min:
             return None
         if not (_gate_ok(r) and _floor_ok(r, dom)):
             return None
@@ -26607,6 +26715,9 @@ def _generate_offers_impl(count=5, force=False) -> list:
             _team_avg_cache_offers[r["team_id"]] = r["avg_ovr"]
 
     _team_floor_on = [True]   # 첫 입단이면 끈다(아래 O-1 블록)
+    _brk_full_ok = [False]    # [2026-11-20 O1_BRK B] 유망주 만석 예외 대상인가(아래 O-1 블록에서 정함)
+    _brk_me_country = [None]  # 지금 리그 나라(예외는 다른 나라 리그 구단만)
+    _stt_brk = [0]            # 예외로 만석을 통과한 구단 수(통계)
     from constants import OFFER_FLOOR_REF_TOPN, OFFER_STAR_FULL_BYPASS_GAP
     _top_avgs = sorted(_team_avg_cache_offers.values(), reverse=True)[:OFFER_FLOOR_REF_TOPN]
     _elite_team_avg = (sum(_top_avgs) / len(_top_avgs)) if _top_avgs else _effective_ovr
@@ -26621,7 +26732,13 @@ def _generate_offers_impl(count=5, force=False) -> list:
             _ta = _team_avg_cache_offers.get(team_row["id"])
             if _ta is not None and _effective_ovr >= _ta + OFFER_STAR_FULL_BYPASS_GAP:
                 return False
-            return _team_headcount_cache_offers.get(team_row["id"], 0) >= 26
+            _full = _team_headcount_cache_offers.get(team_row["id"], 0) >= 26
+            # [2026-11-20 O1_BRK B] 유망주 만석 예외 — 다른 나라 리그 구단만(constants O1_BRK_* 주석).
+            if _full and _brk_full_ok[0] and team_row["country"] not in _my_nat_names \
+                    and team_row["country"] != _brk_me_country[0]:
+                _stt_brk[0] += 1
+                return False
+            return _full
         return False
 
     def _team_below_floor(team_row) -> bool:
@@ -26717,6 +26834,35 @@ def _generate_offers_impl(count=5, force=False) -> list:
     # 첫 입단 스카우팅
     _tclass = O1_TALENT_CLASS.get(p.get("talent_tier") or "", "일반")
     _age_m = next((m for a, m in O1_FIRST_AGE_MULT if age <= a), O1_FIRST_AGE_MULT_OLD)
+    # [2026-11-20 신설, 신민용 확정 — O1_BRK A+B] 돌풍 배율(다른 나라 리그 구단 관심)·유망주 만석 예외. 프로만.
+    from constants import (O1_BRK_ON, O1_BRK_ACT0, O1_BRK_SPAN, O1_BRK_AGE_MAX, O1_BRK_FULL_MAX_AGE,
+                           O1_BRK_FULL_TALENT, O1_BRK_FULL_MIN_B)
+    _brk_b = 0.0
+    _brk_mult = 1.0
+    if O1_BRK_ON and _act is not None:
+        _brk_b = max(0.0, min(1.0, (_act - O1_BRK_ACT0) / O1_BRK_SPAN))
+        _brk_max = next((m for a, m in O1_BRK_AGE_MAX if (age or 99) <= a), 1.0)
+        _brk_mult = 1.0 + _brk_b * (_brk_max - 1.0)
+        _brk_full_ok[0] = ((age or 99) <= O1_BRK_FULL_MAX_AGE and _tclass in O1_BRK_FULL_TALENT
+                           and _brk_b >= O1_BRK_FULL_MIN_B)
+        _brk_me_country[0] = _me_country
+    # [2026-11-20 O1_BRK ① 재측정안] A는 "내 리그보다 등급이 높은 리그의 1부 구단"에만. 등급 = 클럽 리그 등급
+    # (get_country_league_grade), SS와 S는 같은 등급으로 본다(기존 원칙 "SS랑 S는 동급").
+    from economy import LEAGUE_GRADE_RANK as _LGR
+    _brk_rank = lambda _g: min(_LGR.get(_g or "", 0), _LGR["S"])
+    _brk_my_rank = None
+    if _brk_mult > 1.0 and _me_country is not None:
+        _r_mg = c.execute("SELECT grade FROM countries WHERE name=?", (_me_country,)).fetchone()
+        _brk_my_rank = _brk_rank(get_country_league_grade(_me_country, _r_mg["grade"] if _r_mg else None))
+    _brk_grade_memo = {}
+
+    def _brk_applies(r):
+        if _brk_my_rank is None or (r["tier"] or 0) != 1:
+            return False
+        _k = r["country"]
+        if _k not in _brk_grade_memo:
+            _brk_grade_memo[_k] = _brk_rank(get_country_league_grade(r["country"], r["grade"]))
+        return _brk_grade_memo[_k] > _brk_my_rank
     from constants import O1_K_PRO as _K_PRO, O1_K_FIRST as _K_FIRST
 
     from military_service import get_military_team_ids as _mil_ids_fn
@@ -26733,6 +26879,9 @@ def _generate_offers_impl(count=5, force=False) -> list:
     _fj2 = bool(first_join and _FJ2_ON)
     _fj2_rows = [r for r in _all_rows if r["id"] not in _self_team_ids and r["id"] not in _mil_ids] if _fj2 else []
     if _fj2:
+        _all_rows = []
+    elif my_under_adult_age(p):
+        # [2026-11-19 MY_AGE16_RULES] 16세 미만(산하팀 유스 소속 등)에게는 타 구단 1군 오퍼를 만들지 않는다.
         _all_rows = []
 
     def _o1_interest(r):
@@ -26759,6 +26908,8 @@ def _generate_offers_impl(count=5, force=False) -> list:
             else:
                 rel = "other"
             v = _K_PRO * O1_REL_BASE[rel] * _act * _fame_m * (1.0 if dom else _intl_m) * _signal_m
+            if rel in ("same_continent", "other") and _brk_applies(r):
+                v *= _brk_mult     # [2026-11-20 O1_BRK A] 다른 나라·더 높은 등급 리그의 1부 구단만(국적국·지금 리그 나라 불변)
         return min(O1_INTEREST_CAP, max(0.0, v))
 
     import hashlib as _hl
@@ -26857,6 +27008,8 @@ def _generate_offers_impl(count=5, force=False) -> list:
             _stt["connected_ids"].append(_jr["id"])
             _stt["roles"][_jrole] = _stt["roles"].get(_jrole, 0) + 1
     _stt["interest_digest"] = _dig.hexdigest()
+    _stt["brk_b"], _stt["brk_mult"], _stt["brk_full_ok"], _stt["brk_full_bypass"] = (
+        round(_brk_b, 4), round(_brk_mult, 4), bool(_brk_full_ok[0]), _stt_brk[0])   # [2026-11-20 O1_BRK]
     _O1_LAST_STATS.clear()
     _O1_LAST_STATS.update(_stt)
 
@@ -27707,6 +27860,10 @@ def direct_apply_view(team_id, ctx, p=None):
     """[2026-11-18 신설, constants.DIRECT_APPLY_HARDER] 직접 지원 화면·실행이 쓰는 최종 (확률, 막힘 사유). 기존
     calc_apply_prob_with_context(오퍼 협상도 쓰는 공용 함수 — 그대로 둔다) 결과에 배율·상한을 걸고, 이번 기간에 이미
     지원한 구단은 "applied"로 막는다. 스위치가 꺼지면 calc_apply_prob_with_context와 같다."""
+    # [2026-11-19 MY_AGE16_RULES] 16세 미만 지원 나이 규칙 — 오퍼 협상도 쓰는 공용 함수 대신 직접 지원에만 건다.
+    _ab = _my_age_apply_block(team_id, ctx, p)
+    if _ab:
+        return 0.0, _ab
     prob, blocked = calc_apply_prob_with_context(team_id, ctx)
     from constants import DIRECT_APPLY_HARDER, DIRECT_APPLY_CAP
     if not DIRECT_APPLY_HARDER:
@@ -27772,7 +27929,8 @@ def apply_to_team(team_id):
     # "⛔ 정원 마감(불가)"으로 보이므로 실수로 눌렀을 때 시도만 날리는
     # 일이 없어야 한다). 재능 미달은 기존 동작(시도 소모 + 0.5% 도박)을
     # 그대로 유지한다 — 그건 "확률이 아주 낮다"는 설계였다.
-    if blocked in ("full", "youth_age", "youth", "applied"):   # [2026-11-18] 유스 자격 미달·같은 구단 재지원도 시도 소모 없이 거절
+    if blocked in ("full", "youth_age", "youth", "applied",
+                   "age_min", "age_foreign"):   # [2026-11-18] 유스 자격 미달·같은 구단 재지원도 / [2026-11-19] 16세 미만 나이 규칙도 시도 소모 없이 거절
         return False, 0.0, None
     from constants import DIRECT_APPLY_HARDER as _DAH
     if _DAH:
@@ -29353,6 +29511,55 @@ def _make_room_on_return(team_id, year, reason):
         _enforce_foreign_quota_on_join(team_id, row[0], "")
 
 
+def _offer_sale_gate(p, offer):
+    """[2026-11-20 분리, 신민용 요청: "오퍼 넣었을 때 거절했으면 바로 뜨게"] 원 소속 구단의 판매 승인 게이트
+    (예전 join_team 안 코드 그대로 — 판정·거절 기록·재협상 사다리·로그). 반환 True = 승인(강제 판매·협상 승인
+    포함), False = 거절. 이제 오퍼를 수락하는 순간(reserve_join_transfer) 한 번 판정하고, 승인된 예약은 실제
+    이동(join_team) 때 다시 판정하지 않는다(_sale_gate_ok) — 예전엔 이동 주차(2·27주)에 처음 판정해서
+    "이적 확정" 로그 뒤 한 주 늦게 거절이 떴고, 그 사이 덮어쓴 이전 예약도 사라졌다."""
+    decision, detail = evaluate_offer_decision(
+        p, offer, competing_offer_count=offer.get("competing_offer_count", 1))
+    cur_year_for_log = p.get("current_year", GAME_START_YEAR)
+    if decision == "reject":
+        _record_offer_rejection(p, cur_year_for_log)
+        # [2026-08 신설] 이 팀 전용 거절 횟수를 올려둔다 — 다음 번
+        # 이 팀이 다시 제안할 때(_enrich_offer) 이 값을 보고 얼마나
+        # 더 올려서 부를지 정한다(재협상 사다리).
+        try:
+            _hist2 = json.loads(p.get("offer_history_json") or "{}")
+            _tk2 = str(offer.get("team_id", ""))
+            _entry2 = _hist2.get(_tk2)
+            if isinstance(_entry2, dict):
+                _entry2["rejects"] = _entry2.get("rejects", 0) + 1
+            else:
+                _entry2 = {"fee": offer.get("transfer_fee", 0), "rejects": 1}
+            _hist2[_tk2] = _entry2
+            update_player(offer_history_json=json.dumps(_hist2))
+        except Exception:
+            pass
+        _buyer_name = offer.get("team_name", "")
+        _buyer_grade = offer.get("grade", "?")
+        add_log(
+            f"🚫 구단이 이적 제안을 거절했습니다. ({_buyer_name}[{_buyer_grade}급] 제안 "
+            f"{fmt_money(offer.get('transfer_fee',0))} "
+            f"< 최소 요구 {fmt_money(int(detail['base_fee']*detail['min_accept_mult']))})",
+            "news")
+        return False
+    elif decision == "forced_sale":
+        add_log(
+            f"💰 구단은 잔류를 원했으나, 기록적인 제안({fmt_money(offer.get('transfer_fee',0))})을 "
+            f"거절할 수 없어 이적을 승인했습니다.", "news")
+        _reset_offer_rejection()
+    else:
+        if detail.get("negotiated"):
+            add_log(
+                f"🤝 구단이 다소 부족한 제안이었지만 협상 끝에 이적을 승인했습니다. "
+                f"({fmt_money(offer.get('transfer_fee',0))}, 최소 요구 대비 "
+                f"{detail['shortfall_pct']*100:.1f}% 부족)", "news")
+        _reset_offer_rejection()
+    return True
+
+
 def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None):
     p = get_player()
 
@@ -29361,46 +29568,11 @@ def join_team(team_id, salary, transfer_type: str = "입단", offer: dict = None
     # 게이트를 건다 — 입단(FA)·로 등은 애초에 원 소속 구단이 없거나
     # 이적료 개념이 아니라서 대상이 아니다.
     if transfer_type == "오퍼" and offer and p and p.get("current_team_id"):
-        decision, detail = evaluate_offer_decision(
-            p, offer, competing_offer_count=offer.get("competing_offer_count", 1))
-        cur_year_for_log = p.get("current_year", GAME_START_YEAR)
-        if decision == "reject":
-            _record_offer_rejection(p, cur_year_for_log)
-            # [2026-08 신설] 이 팀 전용 거절 횟수를 올려둔다 — 다음 번
-            # 이 팀이 다시 제안할 때(_enrich_offer) 이 값을 보고 얼마나
-            # 더 올려서 부를지 정한다(재협상 사다리).
-            try:
-                _hist2 = json.loads(p.get("offer_history_json") or "{}")
-                _tk2 = str(offer.get("team_id", ""))
-                _entry2 = _hist2.get(_tk2)
-                if isinstance(_entry2, dict):
-                    _entry2["rejects"] = _entry2.get("rejects", 0) + 1
-                else:
-                    _entry2 = {"fee": offer.get("transfer_fee", 0), "rejects": 1}
-                _hist2[_tk2] = _entry2
-                update_player(offer_history_json=json.dumps(_hist2))
-            except Exception:
-                pass
-            _buyer_name = offer.get("team_name", "")
-            _buyer_grade = offer.get("grade", "?")
-            add_log(
-                f"🚫 구단이 이적 제안을 거절했습니다. ({_buyer_name}[{_buyer_grade}급] 제안 "
-                f"{fmt_money(offer.get('transfer_fee',0))} "
-                f"< 최소 요구 {fmt_money(int(detail['base_fee']*detail['min_accept_mult']))})",
-                "news")
-            return
-        elif decision == "forced_sale":
-            add_log(
-                f"💰 구단은 잔류를 원했으나, 기록적인 제안({fmt_money(offer.get('transfer_fee',0))})을 "
-                f"거절할 수 없어 이적을 승인했습니다.", "news")
-            _reset_offer_rejection()
-        else:
-            if detail.get("negotiated"):
-                add_log(
-                    f"🤝 구단이 다소 부족한 제안이었지만 협상 끝에 이적을 승인했습니다. "
-                    f"({fmt_money(offer.get('transfer_fee',0))}, 최소 요구 대비 "
-                    f"{detail['shortfall_pct']*100:.1f}% 부족)", "news")
-            _reset_offer_rejection()
+        # [2026-11-20] 수락 시점(reserve_join_transfer)에 이미 승인된 예약이면 다시 판정하지 않는다 —
+        # 같은 원 소속팀에서 떠날 때만(그 사이 소속이 바뀌었으면 다시 판정).
+        if not (offer.get("_sale_gate_ok") and offer.get("_sale_gate_from") == p.get("current_team_id")):
+            if not _offer_sale_gate(p, offer):
+                return
 
     conn = get_conn()
     c = conn.cursor()

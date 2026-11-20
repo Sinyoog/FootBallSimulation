@@ -253,6 +253,8 @@ def _busy_reason(p):
         return "이미 임대 중입니다."
     if _serving(p):
         return "복무 중에는 임대할 수 없습니다."
+    if _ge().my_under_adult_age(p):   # [2026-11-19 constants.MY_AGE16_RULES] 성인팀은 16세부터
+        return "16세 미만은 임대할 수 없습니다."
     if p.get("pending_join_transfer_json") or p.get("pending_sale_transfer_json"):
         return "이미 예약된 이적이 있습니다."
     if p.get("pending_loan_json"):

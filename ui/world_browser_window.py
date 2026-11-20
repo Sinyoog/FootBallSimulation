@@ -74,6 +74,9 @@ from ui.formation_widget import (
 # 파생돼야 하므로(라벨 기준으론 4-2-3-1과 4-3-3의 LW/RW를 구분할 수 없다)
 # Qt 의존성 없는 공용 모듈의 함수를 쓴다 — formation_row_bands 주석 참고.
 from formation_logic import formation_row_bands, roster_line_sort_key
+# [2026-11] 포메이션 명단 줄 칸 나누기(포지션 | 이름 | OVR / 감독: 이름 | OVR | 국적)
+from ui.roster_row import (install_player_columns, set_player_columns,
+                           install_manager_columns, set_manager_columns, set_column_color)
 import pitch_names as _pn   # [2026-10] 피치 이름 축약 표기(T. 몬테이루) + 폭 맞춤 그리기
 
 # [2026-08 신설, 신민용 리포트: "복사하면 국기/국가/부수까지 같이 복사된다,
@@ -634,6 +637,26 @@ def _manager_style_line(mgr):
     return (mgr.get("style_line_nt") if _manager_nat_ctx(mgr) else mgr.get("style_line")) or ""
 
 
+def _manager_row_parts(mgr):
+    """[2026-11] 감독 줄 칸 글자 (이름, 능력치 또는 "", 국적) — 어려움 난이도에서는 능력치를 숨긴다."""
+    nat = (mgr or {}).get("nationality") or "-"
+    ab = int((mgr or {}).get("ability") or 0)
+    return ((mgr or {}).get("display_name") or "-", (ab if (ab and not is_hard_mode()) else ""), nat)
+
+
+def install_manager_row(host, mgr, font_px):
+    """감독 줄(host)에 이름 | OVR | 국적 칸을 얹는다(ui/roster_row.py)."""
+    n, o, nat = _manager_row_parts(mgr)
+    install_manager_columns(host, n, o, nat, font_px)
+    host._roster_font_px = font_px
+
+
+def update_manager_row(host, mgr):
+    """칸을 얹은 감독 줄의 글자만 다시 쓴다(이름·국적 변경 직후)."""
+    n, o, nat = _manager_row_parts(mgr)
+    set_manager_columns(host, n, o, nat, getattr(host, "_roster_font_px", 11))
+
+
 def _manager_row_text(mgr):
     """명단 감독 줄 글자 — "MG08YX (74)  ·  보스니아 헤르체고비나".
     [2026-10 6번 1단계] 괄호 안은 감독 능력치(팀 OVR 눈금) — 선수 줄의
@@ -815,7 +838,7 @@ def _olympic_reserve_cut_label(tournament_id, country):
 
 
 def _build_squad_roster_panel(starters, bench, on_click=None, height=460,
-                              manager=None, on_manager_click=None, year=None):
+                              manager=None, on_manager_click=None, year=None, slot_ovr=False):
     """[2026-08 재작업, 신민용 리포트: "좌측에 포메이션을 저렇게 박으면
     우측에 후보 선수들의 이름을 나열해야지 — 주전들은 초록색으로, 후보들은
     아래에 색이 없는 원래 상태로 나열"] 예전엔 후보만 피치 아래에 칩으로
@@ -863,6 +886,20 @@ def _build_squad_roster_panel(starters, bench, on_click=None, height=460,
         return roster_line_sort_key(_pos, _o if _o is not None else p.get("ovr"), p.get("id"))
     starters = sorted(starters, key=_line_key)
     bench = sorted(bench, key=_line_key)
+    # [2026-11 신설, 신민용 요청: "포지션 때문에 깎인 OVR을 세계 기록실에도 — 명단은 깎인 수치 빨간색, 클릭하면
+    # OVR(당시)에 '원래 - 깎인 수치'"] slot_ovr=True(실제 경기 선발: 팀 연도 포메이션·대회 스쿼드·클럽 라인업)이면
+    # 주전 OVR 칸에 그 해 그 자리 유효 OVR(wb.get_slot_effective_ovrs — 메인 화면·경기 팀 전력과 같은 식).
+    # 베스트 11(수상 명단)은 경기 선발이 아니라서 넘기지 않는다. 어려움 난이도는 OVR을 안 보이므로 계산도 안 한다.
+    _eff = {}
+    if slot_ovr and year is not None and not is_hard_mode():
+        try:
+            # [2026-11 신민용 요청] 후보도 명단에 찍힌 당시 포지션(팀이 요구한 자리) 기준으로 깎인 수치를 보인다.
+            _eff = wb.get_slot_effective_ovrs(
+                [(p.get("id"), p.get("slot") or p.get("position")) for p in list(starters) + list(bench)],
+                int(year), _yovr)
+        except Exception as _e_eff:
+            print(f"[명단] 자리 유효 OVR 계산 실패(원래 OVR 표시): {_e_eff}")
+            _eff = {}
     panel = QWidget()
     cols_lay = QHBoxLayout(panel)
     cols_lay.setContentsMargins(0, 0, 4, 0)
@@ -877,11 +914,29 @@ def _build_squad_roster_panel(starters, bench, on_click=None, height=460,
 
     _nav_ctx = {"S": [], "B": []}   # [2026-10 WASD] 위 _QUICK_NAV_HINT 주석 참고
 
+    # [2026-11 신민용 요청: "포지션 | 이름 | OVR 3칸으로 깔끔하게 — 선택은 한 줄로 묶여서"] 줄 자체는 예전
+    # 그대로 QLabel 하나(클릭·하이라이트·WASD·이름 변경이 이 라벨을 찾는다)이고, 그 안에 칸 라벨만 얹는다
+    # (ui/roster_row.py). OVR은 정렬과 같은 값(그 해 OVR, 없으면 행의 ovr) — 어려움 난이도는 감독 줄처럼 숨긴다.
+    _hard_ui = is_hard_mode()
+
     def _row(p, is_starter):
         pos = p.get("position") or p.get("slot") or p.get("pos") or "-"
         name = p.get("display_name") or p.get("name") or "-"
         pid = p.get("id")
-        lbl = QLabel(f"{pos}  {name}")
+        _o = _yovr.get(pid)
+        if _o is None:
+            _o = p.get("ovr")
+        lbl = QLabel()
+        _shown, _color = ("" if (_hard_ui or _o is None) else int(_o)), None
+        if _o is not None and pid in _eff and not _hard_ui:
+            _base_i, _eff_i = int(round(float(_o))), int(round(_eff[pid]))
+            if _eff_i != _base_i:
+                _shown = _eff_i
+                _color = "#ff5a5a" if _eff_i < _base_i else "#5fd38a"   # 메인 화면 명단과 같은 색
+            lbl._wb_ovr_view = (_base_i, _eff_i)   # 간단 변경 창 OVR(당시) "원래 - 깎인 수치"용
+        install_player_columns(lbl, pos, name, _shown, 11)
+        set_column_color(lbl, "ovr", _color)
+        lbl.setMinimumHeight(27)
         # 간단 변경 창이 열 수 있는 선수만 이동 순서에 넣는다 — 국제대회 가상 선수는 클릭해도 간단 변경 창이
         # 아니라 바로 이동이므로 WASD로 지나가면 창이 엉뚱하게 바뀐다. [2026-11 신민용 요청] 내 선수
         # (MY_PLAYER_ID)도 이제 간단 변경 창에 뜨므로(_fetch_quick_player) 이동 순서에 넣는다.
@@ -892,10 +947,10 @@ def _build_squad_roster_panel(starters, bench, on_click=None, height=460,
             _nav_ctx[_g].append((pid, pos, lbl))
         if is_starter:
             style = ("background:#1e4a1e;color:#eaffea;border:1px solid #3fae3f;"
-                      "border-radius:4px;padding:5px 8px;font-size:11px;font-weight:bold;")
+                      "border-radius:4px;padding:0px;font-size:11px;font-weight:bold;")
         else:
             style = ("background:#1c1c1c;color:#aaa;border:1px solid #333;"
-                      "border-radius:4px;padding:5px 8px;font-size:11px;")
+                      "border-radius:4px;padding:0px;font-size:11px;")
         # [2026-09 신설, 신민용 요청: "팀 검색 포메이션에서 외국인 용병은
         # 겉부분을 #FF7F00으로 강조해달라 — 상자 색(주전 초록/후보 무채색)은
         # 그대로 두고 테두리만"] world_browser.get_team_season_lineup이
@@ -943,8 +998,11 @@ def _build_squad_roster_panel(starters, bench, on_click=None, height=460,
     _starter_col = _build_column(starters, True, "주전")
     if manager:
         _sv = _starter_col.layout()
-        _mrow = QLabel(_manager_row_text(manager))
-        _mqss = _MGR_ROW_QSS + ("border:1px solid #FF7F00;" if manager.get("is_foreign") else "")
+        _mrow = QLabel()
+        install_manager_row(_mrow, manager, 11)
+        _mrow.setMinimumHeight(27)
+        _mqss = _MGR_ROW_QSS.replace("padding:5px 8px;", "padding:0px;") + (
+            "border:1px solid #FF7F00;" if manager.get("is_foreign") else "")
         _mrow.setStyleSheet(_mqss)
         _mrow._base_qss = _mqss
         _mrow.setToolTip(_manager_style_line(manager))
@@ -2280,7 +2338,13 @@ class QuickPlayerEditPopup(QDialog):
         ]
         if not is_hard_mode():
             _ctx_ovr = pl.get("ctx_ovr")
-            info_rows.append(("OVR(당시)", str(_ctx_ovr) if _ctx_ovr else "-"))
+            # [2026-11] 그 자리 때문에 깎였으면 "원래 - 깎인 수치"(명단의 빨간 숫자 = 원래 − 깎인 수치)
+            _v = pl.get("ctx_ovr_view")
+            if _ctx_ovr and _v and _v[1] != _v[0]:
+                _txt = f"{_v[0]} - {_v[0] - _v[1]}" if _v[1] < _v[0] else f"{_v[0]} + {_v[1] - _v[0]}"
+            else:
+                _txt = str(_ctx_ovr) if _ctx_ovr else "-"
+            info_rows.append(("OVR(당시)", _txt))
         # [2026-10 신설, 신민용 요청] 국가대표 대회 화면에서 연 경우만 — 그 대회 소집 당시 소속팀과 그 팀 리그.
         _cc = pl.get("ctx_club")
         if _cc is not None:
@@ -2355,7 +2419,11 @@ class QuickPlayerEditPopup(QDialog):
                     label_item.setToolTip("그 팀이 그 해 뛰던 리그의 나라(몇 부)"
                                           + (f" — {_lgn}" if _lgn else ""))
                 elif label == "OVR(당시)":
-                    value_item.setForeground(QColor("#ffcc00"))
+                    # [2026-11] 자리 때문에 깎였으면 빨강, 올랐으면 초록(명단 OVR 칸과 같은 색), 아니면 예전 노랑
+                    _vv = pl.get("ctx_ovr_view")
+                    value_item.setForeground(QColor(
+                        "#ff5a5a" if (_vv and _vv[1] < _vv[0]) else
+                        ("#5fd38a" if (_vv and _vv[1] > _vv[0]) else "#ffcc00")))
                     _cy = pl.get("ctx_year")
                     label_item.setToolTip(
                         (f"{_cy}년 시즌 시작 OVR — 지금 OVR이 아니라 그 해 기록입니다"
@@ -3374,6 +3442,23 @@ class WorldBrowserWindow(QDialog):
                     pl["ctx_ovr"] = wb.get_players_year_ovr([player_id], int(ctx_year)).get(player_id)
                 except (TypeError, ValueError):
                     pl["ctx_ovr"] = None
+            # [2026-11] 명단 줄이 자리 때문에 깎인/오른 OVR을 보이고 있으면(_wb_ovr_view) 그 값을 같이 싣는다 —
+            # OVR(당시) 줄이 "원래 - 깎인 수치"로 보인다. 마우스로 연 줄(_QUICK_NAV_HINT) 또는 WASD로 갈 줄.
+            pl["ctx_ovr_view"] = None
+            _src_lbl = _hint_w
+            _pend = getattr(self, "_quick_nav_pending", None)
+            if _pend:
+                try:
+                    _src_lbl = _pend[0][_pend[1]][_pend[2]][2]
+                except Exception:
+                    pass
+            try:
+                _v = getattr(_src_lbl, "_wb_ovr_view", None) if _src_lbl is not None else None
+                if (_v and _src_lbl.property(_SQUAD_LABEL_PID_PROP) == player_id
+                        and pl.get("ctx_ovr") is not None and int(round(float(pl["ctx_ovr"]))) == _v[0]):
+                    pl["ctx_ovr_view"] = _v
+            except RuntimeError:
+                pass
             # [2026-10] 나이(당시) — 선수 검색 연도별 기록(_populate_player_team_box._age_at)과 같은 규칙.
             pl["ctx_age"] = None
             if ctx_year is not None and pl.get("age") is not None:
@@ -3575,8 +3660,11 @@ class WorldBrowserWindow(QDialog):
         for _lbl in self.findChildren(QLabel):
             if _lbl.property(_SQUAD_LABEL_PID_PROP) != player_id:
                 continue
-            _pos = _lbl.property(_SQUAD_LABEL_POS_PROP) or "-"
-            _lbl.setText(f"{_pos}  {new_name}")
+            if getattr(_lbl, "_roster_cols", None):
+                set_player_columns(_lbl, name=new_name)      # [2026-11] 칸 나눈 줄 — 이름 칸만
+            else:
+                _pos = _lbl.property(_SQUAD_LABEL_POS_PROP) or "-"
+                _lbl.setText(f"{_pos}  {new_name}")
         # 이미 열려 있는 다른 기록실 창(및 이 창의 "선수 검색"/"역대
         # 개인상" 탭이 이미 지어져 있다면 그쪽)도 같이 맞춘다 — 탭이 아직
         # 안 지어졌으면 이 함수 안에서 조용히 넘어가므로 비용이 없다.
@@ -3644,7 +3732,10 @@ class WorldBrowserWindow(QDialog):
             if _lbl.property(_SQUAD_LABEL_MGR_PROP) != mid:
                 continue
             try:
-                _lbl.setText(_manager_row_text(manager))
+                if getattr(_lbl, "_roster_cols", None):
+                    update_manager_row(_lbl, manager)        # [2026-11] 칸 나눈 감독 줄
+                else:
+                    _lbl.setText(_manager_row_text(manager))
             except RuntimeError:
                 pass
 
@@ -5789,6 +5880,7 @@ class WorldBrowserWindow(QDialog):
             "명문팀 스카우팅": "이적",
             "은퇴대체 영입": "입단",
             "명문팀 스카우팅(반대급부)": "자유이적",
+            "GK 교환 이적": "이적", "GK 교환 이적(반대급부)": "이적",   # [2026-11-19] GK 1:1 교환은 양쪽 다 이적
             "임대 복귀": "복귀",
             "제대": "전역",   # [2026-10 신민용 요청] 군대 갔다 오면 "전역"
             "완전 이적": "완전 이적",   # [2026-10] 임대처가 그대로 완전 영입
@@ -6515,7 +6607,8 @@ class WorldBrowserWindow(QDialog):
         # 감독은 시즌 끝에만 바뀐다. 연도 해석 규칙은 world_browser 주석 참고).
         _mgr = wb.get_team_manager_for_year(tid, year)
         roster = _build_squad_roster_panel(_real_starters, bench, on_click=self._player_click_at_year(year),
-                                           manager=_mgr, on_manager_click=self._on_manager_click, year=year)
+                                           manager=_mgr, on_manager_click=self._on_manager_click, year=year,
+                                           slot_ovr=True)
         content_row.addWidget(roster, 1)
         # [2026-09 신설] 피치(좌)/명단(중) 오른쪽 끝(표의 마지막 컬럼
         # "국내슈퍼컵" 아래)에 재정 패널을 붙인다. 명단이 stretch=1로
@@ -13047,7 +13140,7 @@ class WorldBrowserWindow(QDialog):
         _mgr = wb.get_national_manager_for_tournament(tid, country)
         roster = _build_squad_roster_panel(_starters_disp, bench, on_click=_squad_click,
                                            manager=_mgr, on_manager_click=self._on_manager_click,
-                                           year=wb.get_intl_tournament_year(tid))
+                                           year=wb.get_intl_tournament_year(tid), slot_ovr=True)
         content_row.addWidget(roster, 1)
         lay.addLayout(content_row)
         _oly_cut_lbl = _olympic_reserve_cut_label(tid, country)   # [2026-10] U-23 올림픽 후보 탈락 4명
@@ -18638,7 +18731,8 @@ class TournamentDetailDialog(QDialog):
         _mgr_click = getattr(owner, "_on_manager_click", None)
         roster = _build_squad_roster_panel(_starters_disp, bench, on_click=_on_click,
                                            manager=_mgr, on_manager_click=_mgr_click,
-                                           year=wb.get_intl_tournament_year(self._wc_lineup_tid()))
+                                           year=wb.get_intl_tournament_year(self._wc_lineup_tid()),
+                                           slot_ovr=True)
         content_row.addWidget(roster, 1)
         lay.addLayout(content_row)
         _oly_cut_lbl = _olympic_reserve_cut_label(self._wc_lineup_tid(), country)   # [2026-10] U-23 올림픽 후보 탈락 4명
@@ -18836,7 +18930,7 @@ class TournamentDetailDialog(QDialog):
         _mgr_click = getattr(owner, "_on_manager_click", None)
         content_row.addWidget(_build_squad_roster_panel(_real_starters, bench, on_click=_on_click,
                                                         manager=_mgr, on_manager_click=_mgr_click,
-                                                        year=year), 1)
+                                                        year=year, slot_ovr=True), 1)
         lay.addLayout(content_row)
         return box
 
